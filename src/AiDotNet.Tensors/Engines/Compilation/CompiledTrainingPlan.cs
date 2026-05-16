@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Diagnostics;
 using System.IO;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
@@ -26,7 +27,9 @@ namespace AiDotNet.Tensors.Engines.Compilation;
 /// </summary>
 internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 {
-    private readonly Action<IEngine>[] _forwardActions;
+    // Phase G.4: mutable so EnableFrozenWeightOptimizations() can swap in
+    // a rebuilt forward-action array using allowCachedB=true.
+    private Action<IEngine>[] _forwardActions;
     private readonly Action<IEngine>[] _backwardActions;
     private readonly Tensor<T> _lossOutput;
     private readonly IEngine _engine;
@@ -36,6 +39,13 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private readonly Tensor<T> _lossGradSeed;
     private readonly List<GCHandle> _pinnedHandles = new();
     private bool _disposed;
+
+    // Phase G.4: rebuild state captured at compile time so
+    // EnableFrozenWeightOptimizations() can preserve fused-group action
+    // identity while replacing non-fused MatMul forward specializations.
+    private readonly int[]? _fusedStepIndices;
+    private readonly Action<IEngine>[]? _fusedForwardActions;
+    private bool _isFrozenWeights;
 
     // Indices of gradient buffers that need zeroing (used by generic/accumulating backward only)
     private readonly int[]? _genericGradIndices;
@@ -69,7 +79,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         List<GCHandle>? pinnedHandles = null,
         CompiledStep<T>[]? forwardSteps = null,
         int[]? compiledInputShape = null,
-        Tensor<T>? compiledInputTensor = null)
+        Tensor<T>? compiledInputTensor = null,
+        int[]? fusedStepIndices = null,
+        Action<IEngine>[]? fusedForwardActions = null)
     {
         _forwardActions = forwardActions;
         _backwardActions = backwardActions;
@@ -83,6 +95,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         _forwardSteps = forwardSteps;
         _compiledInputShape = compiledInputShape;
         _compiledInputTensor = compiledInputTensor;
+        _fusedStepIndices = fusedStepIndices;
+        _fusedForwardActions = fusedForwardActions;
         _lossGradDest = lossGradDest;
         if (pinnedHandles is not null)
             _pinnedHandles.AddRange(pinnedHandles);
@@ -103,6 +117,58 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     public Tensor<T>[] Gradients => _gradients;
     public int ForwardStepCount => _forwardActions.Length;
     public int BackwardStepCount => _backwardActions.Length;
+
+    /// <inheritdoc/>
+    public void EnableFrozenWeightOptimizations()
+    {
+        // Guard against use-after-Dispose: TryBuildSpecializedForward below
+        // adds pinned GCHandles to _pinnedHandles. Dispose() short-circuits
+        // on _disposed, so handles added here after disposal would leak.
+        if (_disposed) throw new ObjectDisposedException(nameof(CompiledTrainingPlan<T>));
+        if (_isFrozenWeights) return;
+        if (_forwardSteps is null)
+            throw new InvalidOperationException(
+                "EnableFrozenWeightOptimizations requires a compiled plan with retained forward steps. " +
+                "Plans loaded from serialization don't currently carry the step metadata.");
+
+        // Rebuild forward actions with allowCachedB=true. Walks the original
+        // step list, preserves fused-group action identity, replaces non-
+        // fused step specializations with the cached-B variant.
+        var fusedSet = _fusedStepIndices is null
+            ? null
+            : new HashSet<int>(_fusedStepIndices);
+        var rebuiltForward = new List<Action<IEngine>>(_forwardSteps.Length);
+        int nextFusedGroupIdx = 0;
+        for (int i = 0; i < _forwardSteps.Length; i++)
+        {
+            if (fusedSet is not null && fusedSet.Contains(i))
+            {
+                bool isFirstInGroup = i == 0 || !fusedSet.Contains(i - 1);
+                if (isFirstInGroup && _fusedForwardActions is not null
+                    && nextFusedGroupIdx < _fusedForwardActions.Length)
+                {
+                    rebuiltForward.Add(_fusedForwardActions[nextFusedGroupIdx]);
+                    nextFusedGroupIdx++;
+                }
+                continue;
+            }
+
+            var step = _forwardSteps[i];
+            var specialized = TryBuildSpecializedForward(step, _pinnedHandles, allowCachedB: true);
+            if (specialized != null)
+            {
+                rebuiltForward.Add(specialized);
+            }
+            else
+            {
+                var output = step.OutputBuffer;
+                var exec = step.Execute;
+                rebuiltForward.Add(eng => exec(eng, output));
+            }
+        }
+        _forwardActions = rebuiltForward.ToArray();
+        _isFrozenWeights = true;
+    }
 
     /// <inheritdoc/>
     public void StepInto(Tensor<T> lossOutput)
@@ -216,8 +282,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     public Tensor<T> Step()
     {
         var engine = _engine;
+        bool stepTiming = StepTiming.Enabled;
 
         // Forward: use checkpointing if enabled, otherwise straight-line delegates
+        long fwdStart = stepTiming ? Stopwatch.GetTimestamp() : 0;
         if (_checkpointing is not null)
         {
             _checkpointing.ForwardWithCheckpoints();
@@ -228,6 +296,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             for (int i = 0; i < fwd.Length; i++)
                 fwd[i](engine);
         }
+        if (stepTiming) StepTiming.RecordForward(Stopwatch.GetTimestamp() - fwdStart);
 
         // Cache raw arrays on first call — avoids AsWritableSpan()/GetDataArray() per step
         var gradArrays = _cachedGradArrays;
@@ -266,12 +335,20 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             Array.Copy(seedArr, destArr, seedArr.Length);
 
         // Backward: specialized delegates (direct BLAS into pre-allocated buffers)
+        long bwdStart = stepTiming ? Stopwatch.GetTimestamp() : 0;
         var bwd = _backwardActions;
         for (int i = 0; i < bwd.Length; i++)
             bwd[i](engine);
+        if (stepTiming) StepTiming.RecordBackward(Stopwatch.GetTimestamp() - bwdStart);
 
         // Fused optimizer update (if configured via ConfigureOptimizer)
+        long optStart = stepTiming ? Stopwatch.GetTimestamp() : 0;
         _optimizerUpdate?.Invoke();
+        if (stepTiming)
+        {
+            StepTiming.RecordOptimizer(Stopwatch.GetTimestamp() - optStart);
+            StepTiming.IncrementStepCount();
+        }
 
         return _lossOutput;
     }
@@ -902,6 +979,97 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 fusedForwardActions, fusedBackwardActions, fusedStepIndices);
         }
 
+        // Issue #338 Phase G.7: detect "MatMul → ReduceSum-all → loss" pattern
+        // where the MatMul's output is consumed ONLY by the ReduceSum, and the
+        // ReduceSum is the final scalar loss. In this case the gradient
+        // flowing back into the MatMul output is mathematically `α * ones`
+        // (α = the loss-grad scalar, defaults to 1). The MatMul backward can
+        // then be computed ANALYTICALLY without materializing the M*N ones
+        // tensor or running the M*N*K GEMM:
+        //   dInput[m, k] = α * row_sum(W, k)   — same value across all m
+        //   dW[k, v]     = α * col_sum(input, k) — same value across all v
+        // For Issue #327 d=128 with V=8192, this replaces the 2.1B-MAC LM-head
+        // backward (2 GEMMs at ~30 ms total) with a couple of [D]-sized
+        // reductions + broadcasts (~0.2 ms total).
+        var analyticBackwardSpecs = new Dictionary<int, Action<IEngine>>();
+        // Phase G.7: when the analytic MatMul backward is engaged, the
+        // corresponding ReduceSum backward becomes a no-op — the analytic
+        // backward doesn't read the gradient buffer ReduceSum would fill
+        // (ones[M, V]), so the M*V-element fill is pure waste.
+        var skippableReduceSumIndices = new HashSet<int>();
+        // Phase G.8: same pattern applies to FORWARD. When MatMul → ReduceSum-all-to-loss
+        // is detected, the forward can be replaced with:
+        //   loss = sum_k(row_sum_W[k] * col_sum_x[k])
+        // which is K multiplies + K adds instead of M*N*K MACs. Replaces
+        // the 2.1B-MAC LM-head FORWARD GEMM with a 128-element dot product.
+        var analyticForwardSpecs = new Dictionary<int, Action<IEngine>>();
+        var skippableReduceSumForwardIndices = new HashSet<int>();
+        // Shared row_sums(W) cache — populated once at compile time per
+        // detected pattern, reused by both forward and backward analytic
+        // versions. Empty otherwise.
+        var sharedRowSumCache = new Dictionary<int, float[]>();
+        if (typeof(T) == typeof(float))
+        {
+            DetectAnalyticLossMatMulBackward(forwardSteps, consumerCount, gradMap, analyticBackwardSpecs, skippableReduceSumIndices, analyticForwardSpecs, skippableReduceSumForwardIndices, sharedRowSumCache);
+        }
+
+        // Phase G.9: detect MatMul → Slice-prefix-of-last-dim chains where
+        // the MatMul output is single-consumer (only the slice reads it).
+        // The MatMul wastes (N_full - N_used) / N_full of its work computing
+        // columns that get sliced away. Replace with a smaller MatMul using
+        // ldb stride to read only the needed columns. For Issue #327's QKV
+        // pattern (compute [BCtx, 3D] but only take Q [BCtx, D]), this
+        // saves 2/3 of the QKV MatMul forward + backward work.
+        var slicePrefixForwardSpecs = new Dictionary<int, Action<IEngine>>();
+        var slicePrefixBackwardSpecs = new Dictionary<int, Action<IEngine>>();
+        var consumedBySlicePrefix = new HashSet<int>();
+        // Phase G.11: pre-copy the sliced weight buffer so forward and
+        // backward use CONTIGUOUS GEMMs on a smaller weight. The math
+        // savings (2/3 fewer MACs on QKV pattern) are real, but MKL's
+        // per-call setup overhead doesn't scale linearly with work —
+        // smaller-N calls don't speed up proportionally on AMD Zen 2.
+        //
+        // Empirically regresses median wall-time on the test workload.
+        // Default off; opt in via AIDOTNET_SLICE_PREFIX_FUSION=1 for
+        // workloads where the per-call MKL setup is small relative to
+        // the saved MAC work (very large M, or N_full >> N_used).
+        if (typeof(T) == typeof(float)
+            && Environment.GetEnvironmentVariable("AIDOTNET_SLICE_PREFIX_FUSION") == "1")
+        {
+            DetectMatMulSlicePrefixFusion(forwardSteps, consumerCount, gradMap,
+                slicePrefixForwardSpecs, slicePrefixBackwardSpecs, consumedBySlicePrefix);
+        }
+
+        // Phase G.12: layer-level dW batching. Detect MatMul backward
+        // steps with identical (M, N, K) shapes, peel out their dW
+        // computation, and dispatch all same-shape dW GEMMs in a
+        // single cblas_sgemm_batch call (group_size = N).
+        //
+        // Empirically REGRESSES on AMD Zen 2 + MKL 2026.0.0.901 (median
+        // 88 → 131 ms). Two suspected causes:
+        //   1. MKL's cblas_sgemm_batch internally serializes same-shape
+        //      group elements at small/medium N — no parallelism win.
+        //   2. Batched access pattern (4 layers' dW computed back-to-back)
+        //      walks through 4 disjoint memory regions, hurting L3 reuse
+        //      vs the interleaved (dA, dW, dA, dW, ...) sequential pattern
+        //      where each layer's dY and A stay hot in cache across the
+        //      dA + dW pair.
+        //
+        // Gated as OPT-IN via AIDOTNET_DW_BATCHING=1. The infrastructure
+        // is ready for workloads/hardware where the batched API delivers
+        // real parallelism (Sapphire Rapids+ with AMX, e.g.).
+        var peeledDwSpecs = new List<DwBatchSpec>();
+        var dWPeeledIndices = new HashSet<int>();
+        bool enableDwBatching = typeof(T) == typeof(float)
+            && BlasProvider.IsMklBatchedAvailable
+            && Environment.GetEnvironmentVariable("AIDOTNET_DW_BATCHING") == "1";
+        if (enableDwBatching)
+        {
+            DetectDwBatchingCandidates(forwardSteps, consumerCount, gradMap,
+                fusedStepIndices, consumedBySlicePrefix, analyticBackwardSpecs,
+                dWPeeledIndices, peeledDwSpecs);
+        }
+
         // Track GCHandles for cleanup on Dispose
         var pinnedHandles = new List<GCHandle>();
 
@@ -912,6 +1080,31 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         int nextFusedGroupIdx = 0; // index into fusedForwardActions
         for (int i = 0; i < forwardSteps.Count; i++)
         {
+            // Phase G.8: analytic forward for MatMul→ReduceSum-loss replaces
+            // the full GEMM with a dot-of-sums computation.
+            if (analyticForwardSpecs.TryGetValue(i, out var analyticFwdAction))
+            {
+                allForwardActions.Add(analyticFwdAction);
+                continue;
+            }
+            // Skip the ReduceSum's forward action when paired with an
+            // analytic MatMul forward — the analytic forward already wrote
+            // the loss into the ReduceSum's output buffer.
+            if (skippableReduceSumForwardIndices.Contains(i))
+            {
+                continue;
+            }
+            // Phase G.9: slice-prefix MatMul fusion — MatMul step uses
+            // smaller-N GEMM via ldb stride, slice step is a no-op.
+            if (slicePrefixForwardSpecs.TryGetValue(i, out var slicePrefixFwd))
+            {
+                allForwardActions.Add(slicePrefixFwd);
+                continue;
+            }
+            if (consumedBySlicePrefix.Contains(i))
+            {
+                continue;  // Slice step — already handled by the fused MatMul above
+            }
             if (fusedStepIndices.Contains(i))
             {
                 // A fused step starts a new group when its predecessor is NOT fused.
@@ -952,7 +1145,43 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var step = forwardSteps[i];
             if (step.BackwardFn == null) continue;
 
-            var action = BuildSpecializedBackward(step, gradMap, consumerCount, engine, pinnedHandles);
+            // Phase G.7: analytic loss-MatMul backward (replaces standard
+            // spec for MatMuls whose gradOut is `α * ones` due to a
+            // downstream ReduceSum-all-to-loss). Replaces ~30 ms of
+            // 2.1B-MAC GEMM work with ~0.2 ms of broadcast.
+            if (analyticBackwardSpecs.TryGetValue(i, out var analyticAction))
+            {
+                backwardActions.Add(analyticAction);
+                continue;
+            }
+            // Phase G.7: skip ReduceSum backward when its output gradient
+            // is never read (its only consumer is an analytic-backward
+            // MatMul). Saves the M*N ones-fill per step.
+            if (skippableReduceSumIndices.Contains(i))
+            {
+                continue;
+            }
+            // Phase G.9: slice-prefix MatMul fusion — backward uses the
+            // smaller GEMM that only computes gradient for the used
+            // columns of W. Slice step's backward is no-op.
+            if (slicePrefixBackwardSpecs.TryGetValue(i, out var slicePrefixBwd))
+            {
+                backwardActions.Add(slicePrefixBwd);
+                continue;
+            }
+            if (consumedBySlicePrefix.Contains(i))
+            {
+                continue;
+            }
+
+            // Phase G.12: tell the spec'd MatMul backward to skip its dW
+            // GEMM when this step's dW has been peeled out for batched
+            // dispatch via AppendBatchedDwActions. Without this flag, the
+            // dW GEMM would run twice (once in the per-step backward,
+            // once in the batched-dW append), defeating the optimization
+            // and doubling the dominant backward cost.
+            var action = BuildSpecializedBackward(step, gradMap, consumerCount, engine, pinnedHandles,
+                dWPeeled: dWPeeledIndices.Contains(i));
             if (action != null)
                 backwardActions.Add(action);
             else
@@ -974,6 +1203,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // them in forward order, but autodiff requires backward (reverse) order.
         for (int i = fusedBackwardActions.Count - 1; i >= 0; i--)
             backwardActions.Add(fusedBackwardActions[i]);
+
+        // Phase G.12: append batched dW actions. Group peeled dW specs
+        // by (M, N, K) shape; each shape group with size ≥ 2 emits one
+        // cblas_sgemm_batch call.
+        if (enableDwBatching && peeledDwSpecs.Count > 0)
+        {
+            AppendBatchedDwActions(peeledDwSpecs, backwardActions);
+        }
 
         // Loss gradient seed
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -1048,7 +1285,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             pinnedHandles,
             forwardSteps.ToArray(),
             compiledInputShape,
-            compiledInputTensor);
+            compiledInputTensor,
+            fusedStepIndices.Count > 0 ? fusedStepIndices.ToArray() : null,
+            fusedForwardActions.Count > 0 ? fusedForwardActions.ToArray() : null);
     }
 
     /// <summary>
@@ -1200,6 +1439,59 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             if (N == 1)
             {
                 return eng => TensorMatMulGemvFloat(cA, cB, cOut, M, K);
+            }
+
+            // Issue #338 Phase G.5: BF16 mixed-precision forward MatMul.
+            // When AIDOTNET_BLAS_PROVIDER=mkl-bf16 is opted in AND the MKL
+            // BF16 kernel is available, pre-convert weight B to BF16 at
+            // compile time (one-shot, weight is constant across replays in
+            // frozen-weights mode and converted-fresh each step in training
+            // mode via the closure). Activations A are converted on the
+            // fly into a pooled BF16 buffer. C remains FP32.
+            //
+            // Shape gate: skip BF16 when N > 1024 (LM head case where
+            // dC conversion cost in backward dominates the per-call kernel
+            // savings on CPUs without AVX-512-BF16 hardware).
+            if (BlasProvider.UseMklBf16 && N <= 1024)
+            {
+                // B is converted to BF16 lazily and refreshed whenever B's
+                // version counter (incremented by every in-place mutator)
+                // changes — covers the training loop where the optimizer
+                // mutates weights between Step()s. Frozen-weights callers
+                // get the one-shot conversion they expect; training callers
+                // get correctness at the cost of one BF16 conversion per
+                // step (K*N elements, microseconds).
+                var bBf16 = new ushort[K * N];
+                int cachedBVersion = -1;
+                var capInputB = inputB;
+                // Reusable BF16 scratch for A. Sized once; reused per call.
+                var aBf16 = new ushort[M * K];
+                return eng =>
+                {
+                    int bVersion = capInputB.Version;
+                    if (bVersion != cachedBVersion)
+                    {
+                        unsafe
+                        {
+                            fixed (float* bSrc = cB)
+                            fixed (ushort* bDst = bBf16)
+                                BlasProvider.Fp32ToBf16Bulk(bSrc, bDst, K * N);
+                        }
+                        cachedBVersion = bVersion;
+                    }
+                    unsafe
+                    {
+                        fixed (float* aSrc = cA)
+                        fixed (ushort* aDst = aBf16)
+                            BlasProvider.Fp32ToBf16Bulk(aSrc, aDst, M * K);
+                    }
+                    if (!BlasProvider.TryGemmBf16(M, N, K, aBf16, 0, K, false, bBf16, 0, N, false, cOut, 0, N))
+                    {
+                        // Probe succeeded but call failed (transient) — fall back to FP32.
+                        if (!BlasProvider.TryGemm(M, N, K, cA, 0, K, cB, 0, N, cOut, 0, N))
+                            SimdGemm.Sgemm(cA.AsSpan(0, M * K), cB.AsSpan(0, K * N), cOut.AsSpan(0, M * N), M, K, N);
+                    }
+                };
             }
 
             if (allowCachedB)
@@ -2253,7 +2545,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         Dictionary<Tensor<T>, Tensor<T>> gradMap,
         Dictionary<Tensor<T>, int> consumerCount,
         IEngine engine,
-        List<GCHandle>? handleTracker = null)
+        List<GCHandle>? handleTracker = null,
+        bool dWPeeled = false)
     {
         // Per-branch type checks below — same pattern as TryBuildSpecializedForward.
         // PR #319: extend the MatMul backward to cover double via
@@ -2378,6 +2671,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // offset.
             float[]? cachedDC = null, cachedA = null, cachedB = null, cachedDestA = null, cachedDestB = null;
             int dcOff = 0, aOff = 0, bOff = 0, destAOff = 0, destBOff = 0;
+            // Phase G.5: BF16 scratch buffers. Allocated lazily on first
+            // call only when MKL-BF16 is active. cachedBBf16 is refreshed
+            // whenever inputB's Version changes (training loops mutate
+            // weights between Step()s); cachedABf16 and cachedDCBf16 are
+            // overwritten every call.
+            ushort[]? cachedABf16 = null, cachedBBf16 = null, cachedDCBf16 = null;
+            int cachedBBf16Version = -1;
+            var capInputBForBf16 = inputB;
 
             return eng =>
             {
@@ -2395,21 +2696,263 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     destBOff = gradB._storageOffset;
                 }
 
+                // Issue #338 Phase G.5: BF16 mixed-precision backward.
+                // Same trust contract as the forward BF16 path: weights are
+                // assumed frozen, BF16-converted once at lazy first call,
+                // reused across replays. Activation A and gradOut dC are
+                // converted on the fly into pooled BF16 scratches.
+                //
+                // Shape gate: BF16 backward only pays off when M*N (per-call
+                // dC conversion cost) is small relative to M*N*K (GEMM
+                // work). For the consumer Transformer LM head (M=2048,
+                // K=128, N=8192) the dC buffer is 16M elements — converting
+                // it per call costs ~8 ms via SIMD which dwarfs the BF16
+                // GEMM speedup on CPUs without AVX-512-BF16 hardware. Cap
+                // on N: skip BF16 when N > 1024.
+                if (BlasProvider.UseMklBf16 && N <= 1024)
+                {
+                    // Lazy initialise BF16 scratch + (re-)convert B whenever
+                    // inputB's version changes. The version counter is
+                    // incremented by every in-place mutator (e.g.
+                    // optimizer.step), so the BF16 weight image stays in
+                    // sync with the fp32 source even under training.
+                    if (cachedABf16 is null)
+                    {
+                        cachedABf16 = new ushort[M * K];
+                        cachedBBf16 = new ushort[K * N];
+                        cachedDCBf16 = new ushort[M * N];
+                    }
+                    int bVersion = capInputBForBf16.Version;
+                    if (bVersion != cachedBBf16Version)
+                    {
+                        unsafe
+                        {
+                            fixed (float* bSrc = &cachedB![bOff])
+                            fixed (ushort* bDst = cachedBBf16)
+                                BlasProvider.Fp32ToBf16Bulk(bSrc, bDst, K * N);
+                        }
+                        cachedBBf16Version = bVersion;
+                    }
+                    unsafe
+                    {
+                        fixed (float* dcSrc = &cachedDC![dcOff])
+                        fixed (ushort* dcDst = cachedDCBf16)
+                            BlasProvider.Fp32ToBf16Bulk(dcSrc, dcDst, M * N);
+                        fixed (float* aSrc = &cachedA![aOff])
+                        fixed (ushort* aDst = cachedABf16)
+                            BlasProvider.Fp32ToBf16Bulk(aSrc, aDst, M * K);
+                    }
+                    // dA = dC @ B^T (M, K, N), dB = A^T @ dC (K, N, M)
+                    bool okA = BlasProvider.TryGemmBf16(M, K, N,
+                        cachedDCBf16!, 0, N, false, cachedBBf16!, 0, N, true,
+                        cachedDestA!, destAOff, K);
+                    bool okB = BlasProvider.TryGemmBf16(K, N, M,
+                        cachedABf16!, 0, K, true, cachedDCBf16!, 0, N, false,
+                        cachedDestB!, destBOff, N);
+                    if (okA && okB)
+                    {
+                        inputA.Grad = gradA;
+                        inputB.Grad = gradB;
+                        return;
+                    }
+                    // Either call failed — fall through to FP32 path.
+                }
+
+                // Phase G.10: batch the two backward GEMMs (dA + dW) into a
+                // single MKL cblas_sgemm_batch call. Skipped when dW
+                // peeling is active for this step (Phase G.12) — the
+                // dW computation is deferred to a layer-batched call.
+                if (!dWPeeled
+                    && BlasProvider.IsMklBatchedAvailable
+                    && BlasProvider.TryGemmExBatch2(
+                        // dA = dC @ B^T  → [M, K]
+                        M, K, N,
+                        cachedDC, dcOff, N, false,
+                        cachedB!, bOff, N, true,
+                        cachedDestA!, destAOff, K,
+                        // dB = A^T @ dC  → [K, N]
+                        K, N, M,
+                        cachedA!, aOff, K, true,
+                        cachedDC, dcOff, N, false,
+                        cachedDestB!, destBOff, N))
+                {
+                    inputA.Grad = gradA;
+                    inputB.Grad = gradB;
+                    return;
+                }
+
                 // dA = dC @ B^T — direct BLAS with engine fallback
                 if (!BlasProvider.TryGemmEx(M, K, N, cachedDC, dcOff, N, false, cachedB!, bOff, N, true, cachedDestA!, destAOff, K))
                 {
                     var dA = eng.TensorMatMul(gradOut, inputB.Transpose());
                     dA.AsSpan().CopyTo(gradA.AsWritableSpan());
                 }
-                // dB = A^T @ dC — direct BLAS with engine fallback
-                if (!BlasProvider.TryGemmEx(K, N, M, cachedA!, aOff, K, true, cachedDC, dcOff, N, false, cachedDestB!, destBOff, N))
+                // dB = A^T @ dC — when dW peeling is active for this
+                // step (Phase G.12), skip this GEMM entirely; the dW
+                // computation is deferred to the batched-dW phase
+                // appended after the main backward loop.
+                if (!dWPeeled)
                 {
-                    var dB = eng.TensorMatMul(inputA.Transpose(), gradOut);
-                    dB.AsSpan().CopyTo(gradB.AsWritableSpan());
+                    if (!BlasProvider.TryGemmEx(K, N, M, cachedA!, aOff, K, true, cachedDC, dcOff, N, false, cachedDestB!, destBOff, N))
+                    {
+                        var dB = eng.TensorMatMul(inputA.Transpose(), gradOut);
+                        dB.AsSpan().CopyTo(gradB.AsWritableSpan());
+                    }
                 }
 
                 inputA.Grad = gradA;
-                inputB.Grad = gradB;
+                if (!dWPeeled) inputB.Grad = gradB;
+            };
+        }
+
+        // Issue #338 Phase G.3: Specialized ReduceSum backward for the
+        // "sum-all-to-scalar" pattern (the loss reduce at the end of the
+        // forward chain). Generic path does ExpandDims + BroadcastGradToShape
+        // (multiple allocations + memory passes) for what should be a
+        // single Array.Fill across the input's flat buffer.
+        if (step.OpName == "ReduceSum" && step.Inputs.Length == 1
+            && step.OutputBuffer.Length == 1
+            && typeof(T) == typeof(float)
+            && step.Inputs[0].IsContiguous)
+        {
+            var input = step.Inputs[0];
+            var output = step.OutputBuffer;
+
+            if (!gradMap.ContainsKey(output) || !gradMap.ContainsKey(input))
+                return null;
+
+            var gradOut = gradMap[output];
+            var gradIn = gradMap[input];
+
+            return eng =>
+            {
+                var gOutArr = (float[])(object)gradOut.GetDataArray();
+                var gInArr = (float[])(object)gradIn.GetDataArray();
+                float seed = gOutArr[0];
+                if (seed == 1.0f)
+                {
+                    // Common case (loss seed): fill with ones via SIMD-
+                    // friendly Array.Fill. The .NET runtime intrinsic
+                    // uses memset-style stores when value is bit-trivial.
+                    int len = gradIn.Length;
+                    new Span<float>(gInArr, 0, len).Fill(1.0f);
+                }
+                else
+                {
+                    new Span<float>(gInArr, 0, gradIn.Length).Fill(seed);
+                }
+                input.Grad = gradIn;
+            };
+        }
+
+        // Issue #338 Phase G.3: Specialized GELU backward via SimdKernels.
+        // The generic GELUBackward path calls engine.GeluBackward which goes
+        // through the full dispatch chain (allocating a new tensor, tape
+        // recording paths, etc.). For the compiled-spec hot path we just
+        // need the SIMD kernel directly: gradIn = gradOut * GELU'(input).
+        if (step.OpName == "GELU" && step.Inputs.Length == 1
+            && step.Inputs[0].IsContiguous && typeof(T) == typeof(float))
+        {
+            var input = step.Inputs[0];
+            var output = step.OutputBuffer;
+
+            if (!gradMap.ContainsKey(output) || !gradMap.ContainsKey(input))
+                return null;
+
+            var gradOut = gradMap[output];
+            var gradIn = gradMap[input];
+
+            return eng =>
+            {
+                var gOutArr = (float[])(object)gradOut.GetDataArray();
+                var inArr = (float[])(object)input.GetDataArray();
+                var gInArr = (float[])(object)gradIn.GetDataArray();
+                int len = input.Length;
+                unsafe
+                {
+                    fixed (float* pGO = gOutArr, pIn = inArr, pGI = gInArr)
+                    {
+                        SimdKernels.GeluBackwardUnsafe(pGO, pIn, pGI, len);
+                    }
+                }
+                input.Grad = gradIn;
+            };
+        }
+
+        // Issue #338 Phase G.3: Specialized TensorSlice backward — scatter
+        // gradOutput into the corresponding region of the input's grad
+        // buffer with zero-fill elsewhere. Phase F.2 profiled the generic
+        // SliceBackward at 13.5 ms/iter (per-element index computation
+        // with dim-stride math) for the QKV-split slices in the consumer
+        // Transformer. The fast path handles the common case "slice
+        // along last dim, start at offset 0 for all leading dims" with
+        // a parallel-row strided memcpy.
+        if (step.OpName == "TensorSlice" && step.Inputs.Length == 1
+            && typeof(T) == typeof(float)
+            && step.SavedState is not null && step.SavedState.Length >= 1
+            && step.SavedState[0] is int[] startArr)
+        {
+            var input = step.Inputs[0];
+            var output = step.OutputBuffer;
+            var inputShape = input._shape;
+            var outputShape = output._shape;
+
+            if (!gradMap.ContainsKey(output) || !gradMap.ContainsKey(input))
+                return null;
+
+            // Fast-path conditions:
+            //   1. Same rank as input
+            //   2. All start offsets are 0 except possibly the last
+            //   3. All dims except the last match the input's shape
+            //   4. Contiguous (so flat buffer reinterpretation is valid)
+            if (startArr.Length != inputShape.Length) return null;
+            if (inputShape.Length != outputShape.Length) return null;
+            for (int d = 0; d < inputShape.Length - 1; d++)
+            {
+                if (startArr[d] != 0) return null;
+                if (inputShape[d] != outputShape[d]) return null;
+            }
+            int lastStart = startArr[inputShape.Length - 1];
+            int srcLastDim = outputShape[inputShape.Length - 1];
+            int dstLastDim = inputShape[inputShape.Length - 1];
+            if (lastStart < 0 || lastStart + srcLastDim > dstLastDim) return null;
+            if (!output.IsContiguous || !input.IsContiguous) return null;
+
+            int numRows = 1;
+            for (int d = 0; d < inputShape.Length - 1; d++) numRows *= inputShape[d];
+            int rowCopyBytes = srcLastDim * sizeof(float);
+            int rowCopyStartByte = lastStart * sizeof(float);
+            int dstRowBytes = dstLastDim * sizeof(float);
+
+            var gradOut = gradMap[output];
+            var gradIn = gradMap[input];
+
+            return eng =>
+            {
+                var gOutArr = (float[])(object)gradOut.GetDataArray();
+                var gInArr = (float[])(object)gradIn.GetDataArray();
+
+                // Zero-fill the full input grad. The fused-spec backward
+                // for upstream MatMul writes its result via the same
+                // accumulator, but in the consumer Transformer's QKV
+                // pattern the slice's input (qkv) has only one
+                // gradient contributor (this slice), so direct write
+                // is safe.
+                Array.Clear(gInArr, 0, gradIn.Length);
+
+                // Parallel-row strided memcpy: gradOut[r*srcLastDim..]
+                // → gradIn[r*dstLastDim + lastStart..]
+                CpuParallelSettings.ParallelForOrSerial(
+                    0, numRows, numRows * srcLastDim,
+                    r =>
+                    {
+                        Buffer.BlockCopy(
+                            gOutArr, r * rowCopyBytes,
+                            gInArr, r * dstRowBytes + rowCopyStartByte,
+                            rowCopyBytes);
+                    });
+
+                input.Grad = gradIn;
             };
         }
 
@@ -2834,6 +3377,34 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // 200+ line SIMD effort tracked as a follow-up.
         if (typeof(T) != typeof(float) && typeof(T) != typeof(double)) return;
 
+        // Issue #338 Phase G.6: detect consecutive MatMul→MatMul chains
+        // (no op between them) and pre-pack the fused weight at compile
+        // time. Required: float, 2D weights, ND×2D input contiguous,
+        // intermediate has only one consumer, MKL or BLAS available.
+        // The fused forward replaces two MatMuls with a single
+        // input @ (W1 @ W2) call. Fused backward recovers the intermediate
+        // gradient via chain rule on W_fused:
+        //   dW_fused = input^T @ gradOutput
+        //   dW1 = dW_fused @ W2^T   (small: K×N×H)
+        //   dW2 = W1^T @ dW_fused   (small: K×H×N)
+        //   dInput = gradOutput @ W_fused^T
+        // Net savings: skip materializing the [M, H] intermediate in
+        // forward + replace one large (M, H, N) backward GEMM with two
+        // small (K, H, N) and (K, H, N) ones.
+        //
+        // Opt-in: set AIDOTNET_CROSS_LAYER_FUSION=1. Empirically on the
+        // Issue #327 d=128 workload, fusion regresses wall-time despite
+        // doing ~15% less arithmetic work — likely cache-pattern
+        // disruption (the two separate MatMuls fit cache better than
+        // one bigger fused MatMul). Workloads with larger H may benefit;
+        // ship the infrastructure but make engagement explicit until
+        // we have a shape-based heuristic.
+        if (typeof(T) == typeof(float)
+            && Environment.GetEnvironmentVariable("AIDOTNET_CROSS_LAYER_FUSION") == "1")
+        {
+            TryFuseMatMulMatMul(steps, gradMap, consumerCount, fusedForward, fusedBackward, consumedIndices);
+        }
+
         for (int i = 0; i + 2 < steps.Count; i++)
         {
             if (consumedIndices.Contains(i)) continue;
@@ -2842,9 +3413,29 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var step1 = steps[i + 1];
             var step2 = steps[i + 2];
 
-            // Pattern: MatMul[i] → ReLU[i+1] → MatMul[i+2]
-            // where ReLU's input is MatMul[i]'s output, and MatMul[i+2]'s input is ReLU's output
-            if (step0.OpName != "TensorMatMul" || step1.OpName != "ReLU" || step2.OpName != "TensorMatMul")
+            // Pattern: MatMul[i] → activation[i+1] → MatMul[i+2]
+            // where the activation's input is MatMul[i]'s output, and
+            // MatMul[i+2]'s input is the activation's output.
+            // Issue #338 Phase G.2: also accepts GELU (the Transformer FFN
+            // activation), but only engages the GELU fusion path when MKL
+            // is NOT preferred — the L1-tile strip approach (Mr=6 rows ×
+            // 342 strips per layer) issues hundreds of tiny BLAS calls
+            // that fight MKL's call-once-then-parallelize design.
+            // Empirically: with MKL active, fused MatMul→GELU→MatMul
+            // regresses 2.4× vs the unfused 3-step path. Without MKL
+            // (SimdGemm only), L1-tile fusion wins. So this branch is
+            // active only when neither MKL nor — for the GELU variant —
+            // is providing the big-GEMM win already.
+            bool isReluPattern = step1.OpName == "ReLU";
+            bool isGeluPattern = step1.OpName == "GELU";
+            bool mklPreferred = string.Equals(
+                Environment.GetEnvironmentVariable("AIDOTNET_BLAS_PROVIDER"),
+                "mkl",
+                StringComparison.OrdinalIgnoreCase);
+            // GELU fusion only when MKL is NOT preferred (see comment above).
+            if (isGeluPattern && mklPreferred) continue;
+            if (step0.OpName != "TensorMatMul" || step2.OpName != "TensorMatMul"
+                || (!isReluPattern && !isGeluPattern))
                 continue;
 
             if (step0.Inputs.Length != 2 || step2.Inputs.Length != 2)
@@ -2864,9 +3455,22 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             if (consumerCount.TryGetValue(step1.OutputBuffer, out int c1) && c1 > 1)
                 continue;
 
-            // Verify all 2D
-            if (step0.Inputs[0].Rank != 2 || step0.Inputs[1].Rank != 2 ||
+            // Verify weight matrices are 2D and input is ND (rank >= 2).
+            // Issue #338 Phase G.2: extended from 2D-only to ND×2D so the
+            // Transformer FFN (rank-3 [B, Ctx, D] input × rank-2 weights)
+            // qualifies. The leading dims of the input collapse into M
+            // for the fused kernel — same approach as the
+            // TryBuildSpecializedForward ND×2D MatMul path at line 1209.
+            if (step0.Inputs[0].Rank < 2 || step0.Inputs[1].Rank != 2 ||
                 step2.Inputs[1].Rank != 2)
+                continue;
+
+            // All operands must be contiguous for the buffer-flat
+            // reinterpretation that the fused kernel relies on.
+            if (!step0.Inputs[0].IsContiguous || !step0.Inputs[1].IsContiguous
+                || !step2.Inputs[1].IsContiguous
+                || !step1.OutputBuffer.IsContiguous
+                || !step2.OutputBuffer.IsContiguous)
                 continue;
 
             // Check hidden dim: must fit in L1 (max) AND be large enough for L1 benefit (min 128)
@@ -2875,15 +3479,21 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             if (h > Optimization.TensorCodecOptions.Current.DataflowFusionMaxHidden || h < 128)
                 continue;
 
-            // Extract dimensions
-            var inputTensor = step0.Inputs[0];   // [M, K]
+            // Extract dimensions — collapse leading dims of input into M.
+            var inputTensor = step0.Inputs[0];   // [..batch, K]  (contiguous)
             var w1Tensor = step0.Inputs[1];      // [K, H]
             var w2Tensor = step2.Inputs[1];      // [H, N]
-            var outputTensor = step2.OutputBuffer; // [M, N]
+            var outputTensor = step2.OutputBuffer; // [..batch, N]
 
-            int m = inputTensor._shape[0];
-            int k = inputTensor._shape[1];
+            int inputRank = inputTensor.Rank;
+            int m = 1;
+            for (int d = 0; d < inputRank - 1; d++) m *= inputTensor._shape[d];
+            int k = inputTensor._shape[inputRank - 1];
             int n = w2Tensor._shape[1];
+
+            // The fused kernel writes [m, n] into output's flat storage —
+            // valid for contiguous output whose last dim is n.
+            if (outputTensor._shape[outputTensor.Rank - 1] != n) continue;
 
             // Pre-allocate activated intermediate buffer
             var activatedBuffer = TensorAllocator.RentUninitialized<T>(new[] { m, h });
@@ -3024,13 +3634,30 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             int cm = m, ck = k, ch = h, cn = n;
             var capturedGradMap = gradMap;
 
-            Func<float, float> relu = x => x > 0f ? x : 0f;
+            // Issue #338 Phase G.2: for GELU, we need pre-activation in
+            // backward (derivative isn't recoverable from post-activation
+            // values). Allocate a second buffer; for ReLU the buffer stays
+            // null and the existing code path is unchanged.
+            Tensor<T>? preActivationBuffer = isGeluPattern
+                ? TensorAllocator.RentUninitialized<T>(new[] { m, h })
+                : null;
+
+            Func<float, float> activation = isGeluPattern
+                ? new Func<float, float>(GeluTanhApprox)
+                : new Func<float, float>(x => x > 0f ? x : 0f);
 
             // Pre-allocate backward workspace at compile time (zero alloc during replay)
             var backwardWorkspace = new float[cm * ch]; // grad_h buffer
             var emptyBias = new float[0];
 
-            // Fused forward: single kernel call replaces 3 steps
+            // Capture for closure scope (locals can't be captured by reference into closures)
+            bool capturedIsGelu = isGeluPattern;
+            var capturedPreAct = preActivationBuffer;
+
+            // Fused forward: single kernel call replaces 3 steps.
+            // GELU path uses SIMD GELU (FusedGemmGeluGemm); ReLU path uses
+            // the scalar-Func variant — ReLU is cheap enough that the
+            // delegate dispatch isn't a bottleneck.
             fusedForward.Add(eng =>
             {
                 var inA = (float[])(object)capturedInput.GetDataArray();
@@ -3038,7 +3665,15 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 var w2A = (float[])(object)capturedW2.GetDataArray();
                 var outA = (float[])(object)capturedOutput.GetDataArray();
                 var actA = (float[])(object)capturedActivated.GetDataArray();
-                FusedMultiLayerGemm.FusedGemmActivationGemm(inA, w1A, w2A, outA, actA, cm, ck, ch, cn, relu);
+                if (capturedIsGelu)
+                {
+                    var preA = (float[])(object)capturedPreAct!.GetDataArray();
+                    FusedMultiLayerGemm.FusedGemmGeluGemm(inA, w1A, w2A, outA, actA, preA, cm, ck, ch, cn);
+                }
+                else
+                {
+                    FusedMultiLayerGemm.FusedGemmActivationGemm(inA, w1A, w2A, outA, actA, cm, ck, ch, cn, activation);
+                }
             });
 
             // Fused backward: pre-allocated workspace, zero alloc during replay
@@ -3063,11 +3698,23 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
                 Array.Clear(backwardWorkspace, 0, backwardWorkspace.Length);
 
-                FusedMultiLayerBackward.ComputeGradients(
-                    gOutArr, inA, w1A, w2A, actA,
-                    gW1, gW2, emptyBias, emptyBias, gIn,
-                    cm, ck, ch, cn, FusedMultiLayerBackward.ReLUDerivative,
-                    backwardWorkspace);
+                if (capturedIsGelu)
+                {
+                    var preA = (float[])(object)capturedPreAct!.GetDataArray();
+                    FusedMultiLayerBackward.ComputeGradients(
+                        gOutArr, inA, w1A, w2A, actA, preA,
+                        gW1, gW2, emptyBias, emptyBias, gIn,
+                        cm, ck, ch, cn, FusedMultiLayerBackward.GELUDerivative,
+                        backwardWorkspace);
+                }
+                else
+                {
+                    FusedMultiLayerBackward.ComputeGradients(
+                        gOutArr, inA, w1A, w2A, actA,
+                        gW1, gW2, emptyBias, emptyBias, gIn,
+                        cm, ck, ch, cn, FusedMultiLayerBackward.ReLUDerivative,
+                        backwardWorkspace);
+                }
 
                 capturedW1.Grad = capturedGradMap.ContainsKey(capturedW1) ? capturedGradMap[capturedW1] : null;
                 capturedW2.Grad = capturedGradMap.ContainsKey(capturedW2) ? capturedGradMap[capturedW2] : null;
@@ -3080,6 +3727,813 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
             // Skip past the fused group
             i += 2;
+        }
+    }
+
+    /// <summary>
+    /// GELU forward — tanh approximation matching SimdKernels.GELUUnsafe so
+    /// the fused-FFN forward stays bit-equivalent to the unfused MatMul → GELU
+    /// → MatMul path. <c>GELU(x) ≈ 0.5 * x * (1 + tanh(√(2/π) * (x + 0.044715 * x³)))</c>.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static float GeluTanhApprox(float x)
+    {
+        const float SQRT_2_OVER_PI = 0.7978845608028654f;
+        const float COEFF = 0.044715f;
+        float u = SQRT_2_OVER_PI * (x + COEFF * x * x * x);
+        return 0.5f * x * (1f + MathF.Tanh(u));
+    }
+
+    /// <summary>
+    /// Issue #338 Phase G.6: cross-layer MatMul→MatMul fusion. Detects
+    /// pairs of consecutive MatMul steps where the intermediate is
+    /// single-consumer and replaces them with a single fused MatMul
+    /// using a pre-packed W_fused = W1 @ W2.
+    ///
+    /// <para>Forward savings: one MatMul instead of two (saves
+    /// (M, K, H) work where H is the intermediate hidden dim) + skip
+    /// intermediate materialization.</para>
+    /// <para>Backward savings: replace the dominant intermediate-sized
+    /// (M, H, N) GEMM with two smaller (K, H, N) and (K, K, H) ones
+    /// via chain rule on W_fused. Requires the intermediate to be
+    /// single-consumer (the gradient signal flows to dW1 and dW2 only
+    /// through dW_fused, never directly).</para>
+    /// </summary>
+    /// <summary>
+    /// Issue #338 Phase G.7: detect MatMul steps whose output is consumed
+    /// ONLY by a ReduceSum-all-to-scalar step that produces the loss.
+    /// When this pattern matches, the gradient flowing into the MatMul's
+    /// output is mathematically <c>α * ones</c> (where α is the loss-grad
+    /// scalar, defaults to 1). The backward can be computed analytically
+    /// from W and the input directly, skipping the M*N ones materialization
+    /// and the two M*N*K GEMMs entirely.
+    ///
+    /// <para>For Issue #327's d=128 / V=8192 LM head: replaces the 6.3B-MAC
+    /// LM-head backward (~30 ms on this CPU) with ~2.5M element ops (~0.2 ms).</para>
+    /// </summary>
+    private static void DetectAnalyticLossMatMulBackward(
+        List<CompiledStep<T>> forwardSteps,
+        Dictionary<Tensor<T>, int> consumerCount,
+        Dictionary<Tensor<T>, Tensor<T>> gradMap,
+        Dictionary<int, Action<IEngine>> analyticBackwardSpecs,
+        HashSet<int> skippableReduceSumIndices,
+        Dictionary<int, Action<IEngine>> analyticForwardSpecs,
+        HashSet<int> skippableReduceSumForwardIndices,
+        Dictionary<int, float[]> sharedRowSumCache)
+    {
+        if (typeof(T) != typeof(float)) return;
+        if (forwardSteps.Count < 2) return;
+
+        // Walk pairs (matmul, reducesum) and check the link.
+        for (int i = 0; i + 1 < forwardSteps.Count; i++)
+        {
+            var matmul = forwardSteps[i];
+            var reduce = forwardSteps[i + 1];
+
+            if (matmul.OpName != "TensorMatMul") continue;
+            if (reduce.OpName != "ReduceSum") continue;
+            if (reduce.OutputBuffer.Length != 1) continue;  // sum-to-scalar
+            if (matmul.Inputs.Length != 2 || reduce.Inputs.Length != 1) continue;
+            if (!ReferenceEquals(matmul.OutputBuffer, reduce.Inputs[0])) continue;
+
+            // MatMul output must be single-consumer (only ReduceSum). If
+            // some other op also consumes it, we need to materialize the
+            // gradient normally.
+            if (consumerCount.TryGetValue(matmul.OutputBuffer, out int mmCount) && mmCount > 1)
+                continue;
+
+            // ReduceSum must be the loss output — i.e. nothing consumes it
+            // downstream in the forward graph.
+            if (consumerCount.TryGetValue(reduce.OutputBuffer, out int rsCount) && rsCount > 0)
+                continue;
+
+            var inputA = matmul.Inputs[0];   // [...batch, K]
+            var inputW = matmul.Inputs[1];   // [K, V]
+            var output = matmul.OutputBuffer;
+
+            if (inputA.Rank < 2 || inputW.Rank != 2) continue;
+            if (!inputA.IsContiguous || !inputW.IsContiguous) continue;
+
+            // The analytic backward overwrites gradA and gradW
+            // unconditionally — that's only safe when inputA and inputW
+            // each have exactly one consumer in the graph. A reused
+            // activation or a tied weight has multiple consumers, and
+            // analytic-backward writes would clobber the contributions
+            // from the other consumers. Fall through to the standard
+            // GEMM backward in that case (it accumulates correctly).
+            if ((consumerCount.TryGetValue(inputA, out int aConsumerCount) && aConsumerCount > 1) ||
+                (consumerCount.TryGetValue(inputW, out int wConsumerCount) && wConsumerCount > 1))
+                continue;
+
+            int K = inputA._shape[inputA.Rank - 1];
+            int V = inputW._shape[1];
+            int M = 1;
+            for (int d = 0; d < inputA.Rank - 1; d++) M *= inputA._shape[d];
+            if (inputW._shape[0] != K) continue;
+
+            if (!gradMap.ContainsKey(inputA) || !gradMap.ContainsKey(inputW)) continue;
+            var gradA = gradMap[inputA];
+            var gradW = gradMap[inputW];
+            // Loss-grad scalar value lives in gradMap[reduce.OutputBuffer]
+            // when backward replay runs. Capture the reference.
+            if (!gradMap.ContainsKey(reduce.OutputBuffer)) continue;
+            var lossGradTensor = gradMap[reduce.OutputBuffer];
+
+            // Build the analytic backward closure.
+            int cM = M, cK = K, cV = V;
+            var capA = inputA;
+            var capW = inputW;
+            var capGradA = gradA;
+            var capGradW = gradW;
+            var capLossGrad = lossGradTensor;
+
+            // Mark the ReduceSum step (i+1) as skippable — its gradient
+            // output (M*N ones) is never read because the analytic
+            // MatMul backward computes directly from W and A.
+            skippableReduceSumIndices.Add(i + 1);
+
+            // Phase G.8: also build the analytic FORWARD. We pre-compute
+            // row_sum_W once at compile time (when weights are frozen-
+            // assumed by the caller; otherwise it runs on first call).
+            // The forward replaces the M*N*K GEMM with col_sum_x + dot.
+            // The MatMul output y is no longer materialized — y is
+            // single-consumer (the ReduceSum we're replacing), so nothing
+            // else reads it.
+            //
+            // Gated behind AIDOTNET_ANALYTIC_FORWARD=1 because measured
+            // regression on the test workload (median 100ms → 130ms).
+            // Hypothesis: the analytic forward bypasses the 2.1B-MAC
+            // GEMM that MKL handles at high effective throughput, but
+            // the col_sum + dot is scalar-strided with poor cache
+            // pattern AND removes the natural prefetcher warmup that
+            // benefits the downstream backward MatMuls. Keep the
+            // infrastructure for future SimdGemm-only environments
+            // where MKL isn't available.
+            bool enableAnalyticForward = Environment.GetEnvironmentVariable("AIDOTNET_ANALYTIC_FORWARD") == "1";
+            int matmulStepIndex = i;
+            int reduceStepIndex = i + 1;
+            var capLoss = gradMap.ContainsKey(reduce.OutputBuffer)
+                ? reduce.OutputBuffer  // reduce.OutputBuffer IS the loss tensor
+                : reduce.OutputBuffer;
+            var capRowSum = new float[cK];
+            sharedRowSumCache[matmulStepIndex] = capRowSum;
+            // Refresh row_sum_W whenever inputW's version changes. The
+            // version counter is incremented by every in-place mutator
+            // (optimizer.step etc), so this cache stays consistent under
+            // training and only does the K*V scan once per actual weight
+            // update — frozen-weights workloads still get the one-shot
+            // path the comment above promises.
+            int rowSumWVersion = -1;
+            // Reference the captures
+            int gM = cM, gK = cK, gV = cV;
+            var gA = inputA;
+            var gW = inputW;
+            var gLoss = capLoss;
+
+            if (enableAnalyticForward) analyticForwardSpecs[matmulStepIndex] = eng =>
+            {
+                var wArr = (float[])(object)gW.GetDataArray();
+                var aArr = (float[])(object)gA.GetDataArray();
+                var lossArr = (float[])(object)gLoss.GetDataArray();
+
+                // Compute row_sum_W on first call and whenever weights
+                // change (detected via gW.Version increment from the
+                // optimizer's in-place mutators). Frozen-weights workloads
+                // get the one-shot path; training workloads pay the
+                // K*V scan only when weights actually moved.
+                int wVersion = gW.Version;
+                if (wVersion != rowSumWVersion)
+                {
+                    for (int k = 0; k < gK; k++)
+                    {
+                        float s = 0f;
+                        int baseIdx = k * gV;
+                        for (int v = 0; v < gV; v++) s += wArr[baseIdx + v];
+                        capRowSum[k] = s;
+                    }
+                    rowSumWVersion = wVersion;
+                }
+
+                // col_sum_x[k] = sum_m A[m, k]. M*K reads, K writes.
+                // Then loss = dot(row_sum_W, col_sum_x). K multiplies + adds.
+                Span<float> colSum = stackalloc float[gK];
+                for (int k = 0; k < gK; k++) colSum[k] = 0f;
+                for (int m = 0; m < gM; m++)
+                {
+                    int baseIdx = m * gK;
+                    for (int k = 0; k < gK; k++) colSum[k] += aArr[baseIdx + k];
+                }
+                float loss = 0f;
+                for (int k = 0; k < gK; k++) loss += capRowSum[k] * colSum[k];
+                lossArr[0] = loss;
+            };
+            // The ReduceSum forward becomes a no-op — its result has
+            // already been computed and written by the analytic forward.
+            // Only skip when the analytic forward is enabled.
+            if (enableAnalyticForward) skippableReduceSumForwardIndices.Add(reduceStepIndex);
+
+            analyticBackwardSpecs[i] = eng =>
+            {
+                var aArr = (float[])(object)capA.GetDataArray();
+                var wArr = (float[])(object)capW.GetDataArray();
+                var gA = (float[])(object)capGradA.GetDataArray();
+                var gW = (float[])(object)capGradW.GetDataArray();
+                var lossArr = (float[])(object)capLossGrad.GetDataArray();
+                float alpha = lossArr[0];
+
+                // Compute row_sums(W): for each row k, sum across all v.
+                //   row_sum_W[k] = sum_v W[k, v]
+                // W is row-major [K, V], so row k starts at k*V and has V entries.
+                var rowSumW = ArrayPool<float>.Shared.Rent(cK);
+                try
+                {
+                    for (int k = 0; k < cK; k++)
+                    {
+                        float s = 0f;
+                        int baseIdx = k * cV;
+                        // Loop unroll-friendly stride-1 read pattern
+                        for (int v = 0; v < cV; v++) s += wArr[baseIdx + v];
+                        rowSumW[k] = alpha * s;
+                    }
+
+                    // dA[m, k] = alpha * row_sum_W[k]  — same value for all m.
+                    // Stride-K broadcast write into gA.
+                    for (int m = 0; m < cM; m++)
+                    {
+                        int baseIdx = m * cK;
+                        for (int k = 0; k < cK; k++) gA[baseIdx + k] = rowSumW[k];
+                    }
+                }
+                finally
+                {
+                    ArrayPool<float>.Shared.Return(rowSumW);
+                }
+
+                // Compute col_sums(A): for each column k of A (= K-th feature),
+                // sum across all M rows.
+                //   col_sum_A[k] = sum_m A[m, k]
+                // A is row-major [M, K], so element (m, k) is at m*K + k.
+                var colSumA = ArrayPool<float>.Shared.Rent(cK);
+                try
+                {
+                    for (int k = 0; k < cK; k++) colSumA[k] = 0f;
+                    for (int m = 0; m < cM; m++)
+                    {
+                        int baseIdx = m * cK;
+                        for (int k = 0; k < cK; k++) colSumA[k] += aArr[baseIdx + k];
+                    }
+                    for (int k = 0; k < cK; k++) colSumA[k] *= alpha;
+
+                    // dW[k, v] = alpha * col_sum_A[k]  — same value for all v.
+                    for (int k = 0; k < cK; k++)
+                    {
+                        float c = colSumA[k];
+                        int baseIdx = k * cV;
+                        for (int v = 0; v < cV; v++) gW[baseIdx + v] = c;
+                    }
+                }
+                finally
+                {
+                    ArrayPool<float>.Shared.Return(colSumA);
+                }
+
+                capA.Grad = capGradA;
+                capW.Grad = capGradW;
+            };
+        }
+    }
+
+    /// <summary>
+    /// Issue #338 Phase G.9: detect MatMul → Slice-prefix pattern where the
+    /// slice takes only a prefix of the MatMul output's last dim. The
+    /// MatMul is wasting (N_full - N_used) / N_full of its work computing
+    /// columns that get sliced away. Replace with a smaller-N MatMul using
+    /// ldb stride on the weight matrix.
+    /// <para>
+    /// For Issue #327's QKV pattern (compute qkv [BCtx, 3D] then slice to
+    /// qProxy [BCtx, D]), this saves 2/3 of the QKV MatMul forward AND
+    /// backward work.
+    /// </para>
+    /// </summary>
+    private static void DetectMatMulSlicePrefixFusion(
+        List<CompiledStep<T>> forwardSteps,
+        Dictionary<Tensor<T>, int> consumerCount,
+        Dictionary<Tensor<T>, Tensor<T>> gradMap,
+        Dictionary<int, Action<IEngine>> slicePrefixForwardSpecs,
+        Dictionary<int, Action<IEngine>> slicePrefixBackwardSpecs,
+        HashSet<int> consumedBySlicePrefix)
+    {
+        if (typeof(T) != typeof(float)) return;
+
+        for (int i = 0; i + 1 < forwardSteps.Count; i++)
+        {
+            var matmul = forwardSteps[i];
+            var slice = forwardSteps[i + 1];
+
+            if (matmul.OpName != "TensorMatMul") continue;
+            if (slice.OpName != "TensorSlice") continue;
+            if (matmul.Inputs.Length != 2 || slice.Inputs.Length != 1) continue;
+            if (!ReferenceEquals(matmul.OutputBuffer, slice.Inputs[0])) continue;
+
+            // MatMul output must be single-consumer
+            if (consumerCount.TryGetValue(matmul.OutputBuffer, out int mmCount) && mmCount > 1)
+                continue;
+
+            // Slice savedState[0] = start[]; we need start[d]==0 for all dims
+            if (slice.SavedState is null || slice.SavedState.Length < 1) continue;
+            if (slice.SavedState[0] is not int[] startArr) continue;
+
+            var inputA = matmul.Inputs[0];   // [...batch, K]
+            var inputW = matmul.Inputs[1];   // [K, N_full]
+            var matmulOut = matmul.OutputBuffer;     // [...batch, N_full]
+            var sliceOut = slice.OutputBuffer;       // [...batch, N_used]
+
+            if (inputA.Rank < 2 || inputW.Rank != 2) continue;
+            if (matmulOut.Rank != sliceOut.Rank) continue;
+            if (!inputA.IsContiguous || !inputW.IsContiguous) continue;
+            if (!matmulOut.IsContiguous || !sliceOut.IsContiguous) continue;
+
+            // Verify start is 0 for all dims AND length only differs on last dim
+            if (startArr.Length != matmulOut.Rank) continue;
+            for (int d = 0; d < matmulOut.Rank; d++)
+            {
+                if (startArr[d] != 0) goto next;
+                if (d < matmulOut.Rank - 1 && matmulOut._shape[d] != sliceOut._shape[d]) goto next;
+            }
+            int N_full = inputW._shape[1];
+            int N_used = sliceOut._shape[sliceOut.Rank - 1];
+            if (N_used >= N_full) continue;  // Slice doesn't reduce anything
+            if (matmulOut._shape[matmulOut.Rank - 1] != N_full) continue;
+            int K = inputA._shape[inputA.Rank - 1];
+            int M = 1;
+            for (int d = 0; d < inputA.Rank - 1; d++) M *= inputA._shape[d];
+            if (inputW._shape[0] != K) continue;
+
+            if (!gradMap.ContainsKey(inputA) || !gradMap.ContainsKey(inputW)) continue;
+            if (!gradMap.ContainsKey(sliceOut)) continue;
+            var gradA = gradMap[inputA];
+            var gradW = gradMap[inputW];
+            var gradSliceOut = gradMap[sliceOut];
+
+            // Capture for closures
+            var capA = inputA;
+            var capW = inputW;
+            var capSliceOut = sliceOut;
+            var capGradA = gradA;
+            var capGradW = gradW;
+            var capGradSliceOut = gradSliceOut;
+            int cM = M, cK = K, cNfull = N_full, cNused = N_used;
+
+            // Phase G.11: pre-copy W[:, 0:N_used] into a CONTIGUOUS
+            // K×N_used buffer ON EACH FORWARD CALL. The forward then
+            // uses a full-stride GEMM (no ldb stride) on the smaller
+            // weight. G.9's strided-MKL approach regressed on AMD Zen 2
+            // because cblas_sgemm with ldb != N takes a slow kernel path.
+            //
+            // Per-call cost: K * N_used floats × Buffer.BlockCopy.
+            // For QKV at K=128, N_used=128 = 64 KB × 50 GB/s ≈ 1.3 µs.
+            //
+            // Why per-call instead of compile-time:
+            //   For training loops with optimizers, W changes between
+            //   Step()s, so a compile-time snapshot would go stale.
+            //   The per-call copy is negligible vs the 2/3 MAC work
+            //   saved on the smaller GEMM (~3 ms per layer).
+            //
+            // The same wPacked buffer is shared with the backward
+            // (forward writes it just before backward reads), so the
+            // backward stays in sync.
+            var wPacked = new float[cK * cNused];
+
+            slicePrefixForwardSpecs[i] = eng =>
+            {
+                var aArr = (float[])(object)capA.GetDataArray();
+                var wArr = (float[])(object)capW.GetDataArray();
+                var outArr = (float[])(object)capSliceOut.GetDataArray();
+
+                // Re-copy W[:, 0:N_used] into the contiguous buffer.
+                for (int k = 0; k < cK; k++)
+                    Buffer.BlockCopy(wArr,
+                        (k * cNfull) * sizeof(float),
+                        wPacked,
+                        (k * cNused) * sizeof(float),
+                        cNused * sizeof(float));
+
+                // M, N_used, K; lda=K, ldb=N_used (CONTIGUOUS), ldc=N_used.
+                if (!BlasProvider.TryGemm(cM, cNused, cK,
+                        aArr, 0, cK,
+                        wPacked, 0, cNused,
+                        outArr, 0, cNused))
+                {
+                    SimdGemm.Sgemm(aArr.AsSpan(0, cM * cK), wPacked.AsSpan(0, cK * cNused),
+                        outArr.AsSpan(0, cM * cNused), cM, cK, cNused);
+                }
+            };
+
+            // Phase G.11 BACKWARD: smaller GEMMs using the pre-packed W.
+            // Pre-allocate a scratch [K, N_used] buffer for dW computation,
+            // then scatter back into the full dW with zero padding.
+            var dWPackedScratch = new float[cK * cNused];
+            slicePrefixBackwardSpecs[i] = eng =>
+            {
+                var aArr = (float[])(object)capA.GetDataArray();
+                var dSliceArr = (float[])(object)capGradSliceOut.GetDataArray();
+                var dA = (float[])(object)capGradA.GetDataArray();
+                var dW = (float[])(object)capGradW.GetDataArray();
+
+                // dA = dSliceOut [M, N_used] @ W_q^T [N_used, K]
+                // lda=N_used (compact), ldb=N_used (compact W_q), ldc=K
+                if (!BlasProvider.TryGemmEx(cM, cK, cNused,
+                        dSliceArr, 0, cNused, false,
+                        wPacked, 0, cNused, true,
+                        dA, 0, cK))
+                {
+                    SimdGemm.Sgemm(dSliceArr.AsSpan(0, cM * cNused), cNused, false,
+                        wPacked.AsSpan(0, cK * cNused), cNused, true,
+                        dA.AsSpan(0, cM * cK), cM, cNused, cK);
+                }
+
+                // dW_packed [K, N_used] = A^T [K, M] @ dSliceOut [M, N_used]
+                // Compute into the contiguous scratch, then scatter into full dW.
+                if (!BlasProvider.TryGemmEx(cK, cNused, cM,
+                        aArr, 0, cK, true,
+                        dSliceArr, 0, cNused, false,
+                        dWPackedScratch, 0, cNused))
+                {
+                    SimdGemm.Sgemm(aArr.AsSpan(0, cM * cK), cK, true,
+                        dSliceArr.AsSpan(0, cM * cNused), cNused, false,
+                        dWPackedScratch.AsSpan(0, cK * cNused), cK, cM, cNused);
+                }
+
+                // Scatter scratch into dW[:, 0:N_used], zero dW[:, N_used:N_full]
+                Array.Clear(dW, 0, dW.Length);
+                for (int k = 0; k < cK; k++)
+                    Buffer.BlockCopy(dWPackedScratch,
+                        (k * cNused) * sizeof(float),
+                        dW,
+                        (k * cNfull) * sizeof(float),
+                        cNused * sizeof(float));
+            };
+
+            consumedBySlicePrefix.Add(i + 1);  // Slice step is consumed by the fused MatMul
+
+            next: ;
+        }
+    }
+
+    /// <summary>
+    /// Issue #338 Phase G.12: layer-level dW batching info. Each entry
+    /// describes one MatMul-backward step's dW GEMM (dW = A^T @ dY)
+    /// in enough detail for later grouping by shape and batched dispatch.
+    /// </summary>
+    private struct DwBatchSpec
+    {
+        public int M;
+        public int N;
+        public int K;
+        public int LdaPlain;  // == K (A is [M, K] row-major contiguous)
+        public int LdaDy;     // == N (dY is [M, N] row-major contiguous)
+        public int LdcDw;     // == N (dW dest is [K, N])
+        public int AOffset;
+        public int DyOffset;
+        public int DwOffset;
+        public Tensor<T> AStorage;   // source for A^T (use .GetDataArray())
+        public Tensor<T> DyStorage;  // source for dY
+        public Tensor<T> DwTensor;   // dW destination (whose Grad we set)
+        public Tensor<T> WTensor;    // the weight tensor (for .Grad assignment)
+    }
+
+    /// <summary>
+    /// Issue #338 Phase G.12: walk forward steps, identify MatMul-backward
+    /// candidates whose shapes are identical to ≥ 1 other MatMul-backward
+    /// step in the plan, mark them for dW peeling and record the spec.
+    /// </summary>
+    private static void DetectDwBatchingCandidates(
+        List<CompiledStep<T>> forwardSteps,
+        Dictionary<Tensor<T>, int> consumerCount,
+        Dictionary<Tensor<T>, Tensor<T>> gradMap,
+        HashSet<int> fusedStepIndices,
+        HashSet<int> consumedBySlicePrefix,
+        Dictionary<int, Action<IEngine>> analyticBackwardSpecs,
+        HashSet<int> dWPeeledIndices,
+        List<DwBatchSpec> peeledDwSpecs)
+    {
+        if (typeof(T) != typeof(float)) return;
+
+        // First pass: collect every candidate MatMul-backward step's
+        // (M, N, K) signature.
+        var candidates = new List<(int idx, int M, int N, int K)>();
+        for (int i = 0; i < forwardSteps.Count; i++)
+        {
+            if (fusedStepIndices.Contains(i)) continue;
+            if (consumedBySlicePrefix.Contains(i)) continue;
+            if (analyticBackwardSpecs.ContainsKey(i)) continue;
+
+            var step = forwardSteps[i];
+            if (step.OpName != "TensorMatMul") continue;
+            if (step.Inputs.Length != 2) continue;
+
+            var inputA = step.Inputs[0];
+            var inputW = step.Inputs[1];
+            var output = step.OutputBuffer;
+
+            // Same gating as the existing ND×2D float MatMul-backward spec.
+            if (inputA.Rank < 2 || inputW.Rank != 2) continue;
+            if (!inputA.IsContiguous || !inputW.IsContiguous) continue;
+            if (!output.IsContiguous) continue;
+            if (!gradMap.ContainsKey(inputA) || !gradMap.ContainsKey(inputW) || !gradMap.ContainsKey(output))
+                continue;
+
+            int aRank = inputA.Rank;
+            int M = 1;
+            for (int d = 0; d < aRank - 1; d++) M *= inputA._shape[d];
+            int K = inputA._shape[aRank - 1];
+            int N = inputW._shape[1];
+            if (inputW._shape[0] != K) continue;
+
+            candidates.Add((i, M, N, K));
+        }
+
+        // Second pass: group by (M, N, K). Groups of size ≥ 2 get peeled
+        // for batching; single-occurrence shapes stay in the unpeeled
+        // (dA+dW combined) path.
+        var groupSizes = new Dictionary<(int, int, int), int>();
+        foreach (var (_, m, n, k) in candidates)
+        {
+            var key = (m, n, k);
+            groupSizes.TryGetValue(key, out int count);
+            groupSizes[key] = count + 1;
+        }
+
+        foreach (var (idx, M, N, K) in candidates)
+        {
+            if (groupSizes[(M, N, K)] < 2) continue;  // No batching benefit
+
+            var step = forwardSteps[idx];
+            var inputA = step.Inputs[0];
+            var inputW = step.Inputs[1];
+            var output = step.OutputBuffer;
+            var gradOut = gradMap[output];
+            var gradW = gradMap[inputW];
+
+            // dW = A^T @ dY → C[K, N].
+            // lda_plain=K (A in [M, K] row-major), ldb_dy=N (dY in [M, N]),
+            // ldc_dw=N (dW dest [K, N]).
+            peeledDwSpecs.Add(new DwBatchSpec
+            {
+                M = M, N = N, K = K,
+                LdaPlain = K, LdaDy = N, LdcDw = N,
+                AOffset = inputA._storageOffset,
+                DyOffset = gradOut._storageOffset,
+                DwOffset = gradW._storageOffset,
+                AStorage = inputA,
+                DyStorage = gradOut,
+                DwTensor = gradW,
+                WTensor = inputW,
+            });
+            dWPeeledIndices.Add(idx);
+        }
+    }
+
+    /// <summary>
+    /// Issue #338 Phase G.12: append batched dW actions to the backward
+    /// action list. Groups specs by (M, N, K) shape, emits one
+    /// cblas_sgemm_batch call per group.
+    /// </summary>
+    private static unsafe void AppendBatchedDwActions(
+        List<DwBatchSpec> specs,
+        List<Action<IEngine>> backwardActions)
+    {
+        // Group by shape
+        var groups = new Dictionary<(int, int, int), List<DwBatchSpec>>();
+        foreach (var spec in specs)
+        {
+            var key = (spec.M, spec.N, spec.K);
+            if (!groups.TryGetValue(key, out var list))
+            {
+                list = new List<DwBatchSpec>();
+                groups[key] = list;
+            }
+            list.Add(spec);
+        }
+
+        foreach (var kv in groups)
+        {
+            var group = kv.Value;
+            var captured = group.ToArray();  // immutable snapshot for the closure
+            int batchSize = captured.Length;
+            int K = captured[0].K, N = captured[0].N, M = captured[0].M;
+
+            // Pre-allocate offset arrays at compile time so the hot
+            // closure doesn't ToArray() per call.
+            var aOffs = new int[batchSize];
+            var bOffs = new int[batchSize];
+            var cOffs = new int[batchSize];
+            for (int i = 0; i < batchSize; i++)
+            {
+                aOffs[i] = captured[i].AOffset;
+                bOffs[i] = captured[i].DyOffset;
+                cOffs[i] = captured[i].DwOffset;
+            }
+
+            backwardActions.Add(eng =>
+            {
+                // Resolve underlying float[] for each batch element.
+                // Use storage-based GetDataArray() so views and slices
+                // see the live shape-stable buffer.
+                var aArrs = new float[batchSize][];
+                var bArrs = new float[batchSize][];
+                var cArrs = new float[batchSize][];
+                for (int i = 0; i < batchSize; i++)
+                {
+                    aArrs[i] = (float[])(object)captured[i].AStorage.GetDataArray();
+                    bArrs[i] = (float[])(object)captured[i].DyStorage.GetDataArray();
+                    cArrs[i] = (float[])(object)captured[i].DwTensor.GetDataArray();
+                }
+
+                if (!BlasProvider.TryGemmBatchSameShapeArrays(
+                    K, N, M,
+                    transA: true, transB: false,
+                    aArrs, aOffs, K,
+                    bArrs, bOffs, N,
+                    cArrs, cOffs, N,
+                    batchSize))
+                {
+                    // Fallback: individual TryGemmEx calls
+                    for (int i = 0; i < batchSize; i++)
+                    {
+                        BlasProvider.TryGemmEx(K, N, M,
+                            aArrs[i], aOffs[i], K, true,
+                            bArrs[i], bOffs[i], N, false,
+                            cArrs[i], cOffs[i], N);
+                    }
+                }
+
+                for (int i = 0; i < batchSize; i++)
+                    captured[i].WTensor.Grad = captured[i].DwTensor;
+            });
+        }
+    }
+
+    private static unsafe void TryFuseMatMulMatMul(
+        List<CompiledStep<T>> steps,
+        Dictionary<Tensor<T>, Tensor<T>> gradMap,
+        Dictionary<Tensor<T>, int> consumerCount,
+        List<Action<IEngine>> fusedForward,
+        List<Action<IEngine>> fusedBackward,
+        HashSet<int> consumedIndices)
+    {
+        if (typeof(T) != typeof(float)) return;
+
+        for (int i = 0; i + 1 < steps.Count; i++)
+        {
+            if (consumedIndices.Contains(i) || consumedIndices.Contains(i + 1)) continue;
+
+            var step0 = steps[i];
+            var step1 = steps[i + 1];
+
+            if (step0.OpName != "TensorMatMul" || step1.OpName != "TensorMatMul") continue;
+            if (step0.Inputs.Length != 2 || step1.Inputs.Length != 2) continue;
+            if (!ReferenceEquals(step0.OutputBuffer, step1.Inputs[0])) continue;
+
+            // Intermediate must be single-consumer for chain-rule fusion
+            // to be valid; multi-consumer intermediates leak gradients
+            // through paths the fused chain can't see.
+            if (consumerCount.TryGetValue(step0.OutputBuffer, out int interCount) && interCount > 1)
+                continue;
+
+            var inputA = step0.Inputs[0];     // [...batch, K]
+            var W1 = step0.Inputs[1];         // [K, H]
+            var W2 = step1.Inputs[1];         // [H, N]
+            var output = step1.OutputBuffer;  // [...batch, N]
+
+            if (inputA.Rank < 2 || W1.Rank != 2 || W2.Rank != 2) continue;
+            if (!inputA.IsContiguous || !W1.IsContiguous || !W2.IsContiguous || !output.IsContiguous)
+                continue;
+
+            int K = inputA._shape[inputA.Rank - 1];
+            int H = W1._shape[1];
+            int N = W2._shape[1];
+            if (W1._shape[0] != K || W2._shape[0] != H) continue;
+            int M = 1;
+            for (int d = 0; d < inputA.Rank - 1; d++) M *= inputA._shape[d];
+
+            // Allocate W_fused buffer at compile time. Population is
+            // deferred to the first forward call and refreshed whenever
+            // W1.Version or W2.Version changes (training loops mutate
+            // weights between Step()s, so a one-shot prepack would serve
+            // stale fused weights and silently produce wrong forward
+            // outputs). For frozen-weights workloads, the GEMM only runs
+            // once and is then reused forever.
+            var w1Data = (float[])(object)W1.GetDataArray();
+            var w2Data = (float[])(object)W2.GetDataArray();
+            var wFused = new float[K * N];
+
+            // Forward: single MatMul input @ W_fused → output. Skip
+            // intermediate materialization.
+            var capturedInput = inputA;
+            var capturedOutput = output;
+            var capturedW1 = W1;
+            var capturedW2 = W2;
+            int cM = M, cK = K, cH = H, cN = N;
+            float[] cWFused = wFused;
+            int wFusedW1Version = -1, wFusedW2Version = -1;
+            var capturedGradMap = gradMap;
+
+            fusedForward.Add(eng =>
+            {
+                int v1 = capturedW1.Version;
+                int v2 = capturedW2.Version;
+                if (v1 != wFusedW1Version || v2 != wFusedW2Version)
+                {
+                    if (!BlasProvider.TryGemm(cK, cN, cH, w1Data, 0, cH, w2Data, 0, cN, cWFused, 0, cN))
+                    {
+                        SimdGemm.Sgemm(w1Data.AsSpan(0, cK * cH), w2Data.AsSpan(0, cH * cN),
+                            cWFused.AsSpan(0, cK * cN), cK, cH, cN);
+                    }
+                    wFusedW1Version = v1;
+                    wFusedW2Version = v2;
+                }
+                var inArr = (float[])(object)capturedInput.GetDataArray();
+                var outArr = (float[])(object)capturedOutput.GetDataArray();
+                if (!BlasProvider.TryGemm(cM, cN, cK, inArr, 0, cK, cWFused, 0, cN, outArr, 0, cN))
+                    SimdGemm.Sgemm(inArr.AsSpan(0, cM * cK), cWFused.AsSpan(0, cK * cN),
+                        outArr.AsSpan(0, cM * cN), cM, cK, cN);
+            });
+
+            // Pre-allocate dW_fused scratch (compile-time, reused per call).
+            var dWFused = new float[K * N];
+
+            fusedBackward.Add(eng =>
+            {
+                if (!capturedGradMap.TryGetValue(capturedOutput, out var gradOut)) return;
+                var gOutArr = (float[])(object)gradOut.GetDataArray();
+                var inArr = (float[])(object)capturedInput.GetDataArray();
+                var w1Arr = (float[])(object)capturedW1.GetDataArray();
+                var w2Arr = (float[])(object)capturedW2.GetDataArray();
+
+                // dW_fused = input^T @ gradOut  [K, N]
+                if (!BlasProvider.TryGemmEx(cK, cN, cM,
+                        inArr, 0, cK, true,
+                        gOutArr, 0, cN, false,
+                        dWFused, 0, cN))
+                {
+                    SimdGemm.Sgemm(inArr.AsSpan(0, cM * cK), cK, true,
+                        gOutArr.AsSpan(0, cM * cN), cN, false,
+                        dWFused.AsSpan(0, cK * cN), cK, cM, cN);
+                }
+
+                // dW1 = dW_fused @ W2^T  [K, H]  (chain rule on W_fused = W1 @ W2)
+                if (capturedGradMap.TryGetValue(capturedW1, out var gW1Tensor))
+                {
+                    var gW1 = (float[])(object)gW1Tensor.GetDataArray();
+                    if (!BlasProvider.TryGemmEx(cK, cH, cN,
+                            dWFused, 0, cN, false,
+                            w2Arr, 0, cN, true,
+                            gW1, 0, cH))
+                    {
+                        SimdGemm.Sgemm(dWFused.AsSpan(0, cK * cN), cN, false,
+                            w2Arr.AsSpan(0, cH * cN), cN, true,
+                            gW1.AsSpan(0, cK * cH), cK, cN, cH);
+                    }
+                    capturedW1.Grad = gW1Tensor;
+                }
+
+                // dW2 = W1^T @ dW_fused  [H, N]
+                if (capturedGradMap.TryGetValue(capturedW2, out var gW2Tensor))
+                {
+                    var gW2 = (float[])(object)gW2Tensor.GetDataArray();
+                    if (!BlasProvider.TryGemmEx(cH, cN, cK,
+                            w1Arr, 0, cH, true,
+                            dWFused, 0, cN, false,
+                            gW2, 0, cN))
+                    {
+                        SimdGemm.Sgemm(w1Arr.AsSpan(0, cK * cH), cH, true,
+                            dWFused.AsSpan(0, cK * cN), cN, false,
+                            gW2.AsSpan(0, cH * cN), cH, cK, cN);
+                    }
+                    capturedW2.Grad = gW2Tensor;
+                }
+
+                // dInput = gradOut @ W_fused^T  [M, K]
+                if (capturedGradMap.TryGetValue(capturedInput, out var gInTensor))
+                {
+                    var gIn = (float[])(object)gInTensor.GetDataArray();
+                    if (!BlasProvider.TryGemmEx(cM, cK, cN,
+                            gOutArr, 0, cN, false,
+                            cWFused, 0, cN, true,
+                            gIn, 0, cK))
+                    {
+                        SimdGemm.Sgemm(gOutArr.AsSpan(0, cM * cN), cN, false,
+                            cWFused.AsSpan(0, cK * cN), cN, true,
+                            gIn.AsSpan(0, cM * cK), cM, cN, cK);
+                    }
+                    capturedInput.Grad = gInTensor;
+                }
+            });
+
+            consumedIndices.Add(i);
+            consumedIndices.Add(i + 1);
+            i++; // Skip past i+1 — already consumed
         }
     }
 }

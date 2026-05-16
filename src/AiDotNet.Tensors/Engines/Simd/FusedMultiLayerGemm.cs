@@ -42,13 +42,106 @@ internal static class FusedMultiLayerGemm
     /// <param name="h">Hidden features</param>
     /// <param name="n">Output features</param>
     /// <param name="applyActivation">Activation function to apply element-wise</param>
+    /// <summary>
+    /// Issue #338 Phase G.2 — fused MatMul → GELU → MatMul with SIMD GELU
+    /// on the [Mr, H] tile (matches SimdKernels.GELUUnsafe's tanh-approx
+    /// kernel for bit-equivalence with the unfused engine.GELU path).
+    /// Saves the GEMM1 output (pre-activation) into <paramref name="preActivation"/>
+    /// before applying GELU — backward needs it for derivative computation.
+    /// </summary>
+    [MethodImpl(Hot)]
+    internal static unsafe void FusedGemmGeluGemm(
+        float[] input, float[] w1, float[] w2,
+        float[] output, float[] activated, float[] preActivation,
+        int m, int k, int h, int n)
+    {
+        int gtileBytes = Mr * h * sizeof(float);
+        bool ghasFma = false;
+#if NET5_0_OR_GREATER
+        ghasFma = Fma.IsSupported;
+#endif
+        if (gtileBytes > 28_000 || !ghasFma)
+        {
+            // Fallback path: separate GEMM + SIMD GELU + GEMM. No L1 win,
+            // but at least vectorized GELU.
+            Array.Clear(activated, 0, m * h);
+            if (!BlasProvider.TryGemm(m, h, k, input, 0, k, w1, 0, h, activated, 0, h))
+                SimdGemm.Sgemm(input.AsSpan(0, m * k), w1.AsSpan(0, k * h), activated.AsSpan(0, m * h), m, k, h);
+            Buffer.BlockCopy(activated, 0, preActivation, 0, m * h * sizeof(float));
+            fixed (float* pAct = activated)
+                SimdKernels.GELUUnsafe(pAct, pAct, m * h);
+            Array.Clear(output, 0, m * n);
+            if (!BlasProvider.TryGemm(m, n, h, activated, 0, h, w2, 0, n, output, 0, n))
+                SimdGemm.Sgemm(activated.AsSpan(0, m * h), w2.AsSpan(0, h * n), output.AsSpan(0, m * n), m, h, n);
+            return;
+        }
+
+        Array.Clear(output, 0, m * n);
+        var gtile = ArrayPool<float>.Shared.Rent(Mr * h);
+        int gnrBlocks = (n + Nr - 1) / Nr;
+        float[] gpackedW2 = Array.Empty<float>();
+        bool gw2Packed = false;
+
+        try
+        {
+            for (int ic = 0; ic < m; ic += Mr)
+            {
+                int mr = Math.Min(Mr, m - ic);
+
+                // GEMM1 strip → tile[mr, h]
+                Array.Clear(gtile, 0, mr * h);
+                if (!BlasProvider.TryGemm(mr, h, k, input, ic * k, k, w1, 0, h, gtile, 0, h))
+                    SimdGemm.Sgemm(input.AsSpan(ic * k, mr * k), w1.AsSpan(0, k * h), gtile.AsSpan(0, mr * h), mr, k, h);
+
+                // Save pre-activation rows to preActivation[ic..ic+mr, :]
+                Buffer.BlockCopy(gtile, 0, preActivation, ic * h * sizeof(float), mr * h * sizeof(float));
+
+                // SIMD GELU on the tile in-place. Tile is contiguous mr*h
+                // floats — matches the contract of SimdKernels.GELUUnsafe
+                // (input pointer, output pointer, length).
+                fixed (float* pt = gtile)
+                    SimdKernels.GELUUnsafe(pt, pt, mr * h);
+
+                // Save post-activation rows to activated[ic..ic+mr, :]
+                Buffer.BlockCopy(gtile, 0, activated, ic * h * sizeof(float), mr * h * sizeof(float));
+
+                // GEMM2 strip: output[ic..ic+mr] += tile @ W2
+                if (!BlasProvider.TryGemm(mr, n, h, gtile, 0, h, w2, 0, n, output, ic * n, n))
+                {
+                    if (!gw2Packed)
+                    {
+                        gpackedW2 = ArrayPool<float>.Shared.Rent(h * ((gnrBlocks * Nr) + Nr));
+                        PackBRowMajor(w2, gpackedW2, h, n);
+                        gw2Packed = true;
+                    }
+                    ComputeGemm2FromTile(gtile, gpackedW2, output, ic, mr, h, n);
+                }
+            }
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(gtile);
+            if (gw2Packed)
+                ArrayPool<float>.Shared.Return(gpackedW2);
+        }
+    }
+
     [MethodImpl(Hot)]
     internal static unsafe void FusedGemmActivationGemm(
         float[] input, float[] w1, float[] w2,
         float[] output, float[] activated,
         int m, int k, int h, int n,
-        Func<float, float> applyActivation)
+        Func<float, float> applyActivation,
+        float[]? preActivation = null)
     {
+        // Issue #338 Phase G.2: optional preActivation buffer captures the
+        // GEMM1 output BEFORE activation is applied. Required for GELU
+        // backward (whose derivative is not recoverable from post-activation
+        // values), unused for ReLU (where pre and post give the same
+        // derivative). Passing null restores the original ReLU-only
+        // behaviour — existing callers in tests + DataflowFusionPass +
+        // FusedGemmActivationGemmJit are unaffected.
+
         // Check if hidden dim fits in L1 for the fused path
         // Mr rows * H columns * 4 bytes must fit in L1 (32KB)
         int tileBytes = Mr * h * sizeof(float);
@@ -59,7 +152,7 @@ internal static class FusedMultiLayerGemm
         if (tileBytes > 28_000 || !hasFma)
         {
             // Fallback: separate GEMM + activation + GEMM
-            FallbackSeparate(input, w1, w2, output, activated, m, k, h, n, applyActivation);
+            FallbackSeparate(input, w1, w2, output, activated, m, k, h, n, applyActivation, preActivation);
             return;
         }
 
@@ -87,16 +180,33 @@ internal static class FusedMultiLayerGemm
                 if (!BlasProvider.TryGemm(mr, h, k, input, ic * k, k, w1, 0, h, tile, 0, h))
                     SimdGemm.Sgemm(input.AsSpan(ic * k, mr * k), w1.AsSpan(0, k * h), tile.AsSpan(0, mr * h), mr, k, h);
 
-                // Step 2: Apply activation in-place on tile AND save to activated buffer
+                // Step 2: Apply activation in-place on tile AND save to activated buffer.
+                // When preActivation is provided (Phase G.2 for GELU), capture the
+                // pre-activation GEMM1 output into preActivation BEFORE applying
+                // the activation — backward needs it for derivative computation.
                 for (int row = 0; row < mr; row++)
                 {
                     int tileRowOff = row * h;
                     int actRowOff = (ic + row) * h;
-                    for (int j = 0; j < h; j++)
+                    if (preActivation is not null)
                     {
-                        float val = applyActivation(tile[tileRowOff + j]);
-                        tile[tileRowOff + j] = val;
-                        activated[actRowOff + j] = val;
+                        for (int j = 0; j < h; j++)
+                        {
+                            float pre = tile[tileRowOff + j];
+                            preActivation[actRowOff + j] = pre;
+                            float val = applyActivation(pre);
+                            tile[tileRowOff + j] = val;
+                            activated[actRowOff + j] = val;
+                        }
+                    }
+                    else
+                    {
+                        for (int j = 0; j < h; j++)
+                        {
+                            float val = applyActivation(tile[tileRowOff + j]);
+                            tile[tileRowOff + j] = val;
+                            activated[actRowOff + j] = val;
+                        }
                     }
                 }
 
@@ -267,11 +377,16 @@ internal static class FusedMultiLayerGemm
         float[] input, float[] w1, float[] w2,
         float[] output, float[] activated,
         int m, int k, int h, int n,
-        Func<float, float> applyActivation)
+        Func<float, float> applyActivation,
+        float[]? preActivation = null)
     {
         // GEMM1: hidden = input @ W1 (reuse activated buffer as scratch — same size [m*h])
         Array.Clear(activated, 0, m * h);
         SimdGemm.Sgemm(input.AsSpan(0, m * k), w1.AsSpan(0, k * h), activated.AsSpan(0, m * h), m, k, h);
+
+        // Capture pre-activation if requested (Phase G.2 GELU support)
+        if (preActivation is not null)
+            Buffer.BlockCopy(activated, 0, preActivation, 0, m * h * sizeof(float));
 
         // Activation in-place on activated buffer
         for (int i = 0; i < m * h; i++)

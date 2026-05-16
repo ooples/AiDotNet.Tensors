@@ -491,8 +491,12 @@ public sealed class GradientTape<T> : IDisposable
                 // Validate that no input tensor was mutated after recording
                 entry.ValidateInputVersions();
 
-                // Invoke the backward function
+                // Invoke the backward function. Phase A (#338) timing
+                // wrapper records per-op ticks when AIDOTNET_BWD_TIMING=1.
+                long _bwdStart = BackwardTiming.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
                 entry.Backward(gradOutput, inputsArray, entry.Output, entry.SavedState ?? Array.Empty<object>(), engine, grads);
+                if (BackwardTiming.Enabled)
+                    BackwardTiming.Record(entry.Backward.Method.Name, System.Diagnostics.Stopwatch.GetTimestamp() - _bwdStart);
 
                 // Performance profiling (only when explicitly enabled)
                 // Timing wraps the backward call above — the Stopwatch overhead
