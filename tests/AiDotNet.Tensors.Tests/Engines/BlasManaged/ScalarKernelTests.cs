@@ -151,4 +151,36 @@ public class ScalarKernelTests
         Assert.Equal(0L, stats.PackCacheMisses);
         Assert.Equal(0L, stats.PackCacheBytes);
     }
+
+    [Fact]
+    public void ScalarFp64_4x4_Computes_4x4_Tile_From_Packed_Inputs()
+    {
+        // Packed-A layout: 4 rows × Kc=2 columns, K-contiguous within row.
+        //   packedA[row*Kc + k] = A[row, k]
+        // For a single stripe with Mr=4 rows and Kc=2:
+        //   row 0: [1, 2]
+        //   row 1: [3, 4]
+        //   row 2: [5, 6]
+        //   row 3: [7, 8]
+        double[] packedA = { 1, 2,   3, 4,   5, 6,   7, 8 };
+
+        // Packed-B layout: Kc=2 × Nr=4 cols, col-contiguous within k.
+        //   packedB[k*Nr + col] = B[k, col]
+        // For Kc=2:
+        //   k=0: [1, 0, 0, 0]
+        //   k=1: [0, 1, 0, 0]
+        double[] packedB = { 1, 0, 0, 0,   0, 1, 0, 0 };
+
+        double[] c = new double[4 * 4];  // C tile, ldc = 4, pre-zeroed by new[]
+        int ldc = 4;
+
+        ScalarFp64_4x4.Run(packedA, packedB, c, ldc, kc: 2);
+
+        // C[row, col] = sum_k A[row, k] · B[k, col]
+        // A = [[1,2],[3,4],[5,6],[7,8]],  B = [[1,0,0,0],[0,1,0,0]]
+        // → C = [[1,2,0,0],[3,4,0,0],[5,6,0,0],[7,8,0,0]]
+        double[] expected = { 1, 2, 0, 0,   3, 4, 0, 0,   5, 6, 0, 0,   7, 8, 0, 0 };
+        for (int i = 0; i < expected.Length; i++)
+            Assert.Equal(expected[i], c[i], precision: 12);
+    }
 }
