@@ -34,6 +34,15 @@ internal sealed class LazyNode<T> : ILazyNode
     public readonly BackwardFunction<T>? BackwardFn;
     public readonly object[]? SavedState;
 
+    // ═══ External prerequisite (in-place ops) ═══
+    // When an in-place op records itself as Input0=target=Output=target, the
+    // resulting GetInputNodes() lookup would resolve Input0.LazySource back to
+    // THIS node (self-loop), and the prior producer of `target` would be lost.
+    // RecordInPlace captures that prior producer here so topo-sort/DCE/fusion
+    // see a real predecessor edge instead of a self-cycle, and so RealizeInputs
+    // visits the prior producer before mutating its output buffer.
+    private readonly ILazyNode? _externalPrerequisite;
+
     // ═══ Graph metadata ═══
     public bool IsRealized { get; set; }
     public int TopologicalIndex { get; set; } = -1;
@@ -92,7 +101,8 @@ internal sealed class LazyNode<T> : ILazyNode
         Tensor<T> output,
         Action<IEngine, Tensor<T>> execute,
         BackwardFunction<T>? backwardFn = null,
-        object[]? savedState = null)
+        object[]? savedState = null,
+        ILazyNode? externalPrerequisite = null)
     {
         OpType = opType;
         OpName = opName;
@@ -113,6 +123,11 @@ internal sealed class LazyNode<T> : ILazyNode
         Execute = execute;
         BackwardFn = backwardFn;
         SavedState = savedState;
+        // Snapshot the prior producer of an in-place target BEFORE the caller
+        // overwrites target.LazySource with this node. See _externalPrerequisite
+        // docstring above. Self-references (rare; happens when caller passes
+        // `this` after construction) are filtered out at query time.
+        _externalPrerequisite = externalPrerequisite;
     }
 
     /// <summary>Materialize this node's output by executing the operation.</summary>
@@ -153,24 +168,35 @@ internal sealed class LazyNode<T> : ILazyNode
 
     private void RealizeInputs(IEngine engine)
     {
-        if (Input0.LazySource is ILazyNode n0 && !n0.IsRealized) n0.Realize(engine);
-        if (Input1?.LazySource is ILazyNode n1 && !n1.IsRealized) n1.Realize(engine);
-        if (Input2?.LazySource is ILazyNode n2 && !n2.IsRealized) n2.Realize(engine);
+        // Realize the external prerequisite first when present. For in-place
+        // ops this is the prior producer of `target` captured at record time —
+        // resolving via Input0.LazySource alone would return THIS node after
+        // RecordInPlace overwrites target.LazySource (self-loop).
+        if (_externalPrerequisite is { IsRealized: false } pre && !ReferenceEquals(pre, this))
+            pre.Realize(engine);
+        if (Input0.LazySource is ILazyNode n0 && !n0.IsRealized && !ReferenceEquals(n0, this)) n0.Realize(engine);
+        if (Input1?.LazySource is ILazyNode n1 && !n1.IsRealized && !ReferenceEquals(n1, this)) n1.Realize(engine);
+        if (Input2?.LazySource is ILazyNode n2 && !n2.IsRealized && !ReferenceEquals(n2, this)) n2.Realize(engine);
         if (InputsOverflow != null)
             foreach (var inp in InputsOverflow)
-                if (inp.LazySource is ILazyNode n && !n.IsRealized) n.Realize(engine);
+                if (inp.LazySource is ILazyNode n && !n.IsRealized && !ReferenceEquals(n, this)) n.Realize(engine);
     }
 
     /// <summary>Get input nodes for graph traversal.</summary>
     public ILazyNode[] GetInputNodes()
     {
         var nodes = new List<ILazyNode>();
-        if (Input0.LazySource is ILazyNode n0) nodes.Add(n0);
-        if (Input1?.LazySource is ILazyNode n1) nodes.Add(n1);
-        if (Input2?.LazySource is ILazyNode n2) nodes.Add(n2);
+        // External prerequisite first (when present) — see _externalPrerequisite
+        // docstring. Filter out self-references so DCE / topo-sort / fusion do
+        // not see a phantom self-edge for in-place ops where Input0 == Output.
+        if (_externalPrerequisite is ILazyNode pre && !ReferenceEquals(pre, this))
+            nodes.Add(pre);
+        if (Input0.LazySource is ILazyNode n0 && !ReferenceEquals(n0, this)) nodes.Add(n0);
+        if (Input1?.LazySource is ILazyNode n1 && !ReferenceEquals(n1, this)) nodes.Add(n1);
+        if (Input2?.LazySource is ILazyNode n2 && !ReferenceEquals(n2, this)) nodes.Add(n2);
         if (InputsOverflow != null)
             foreach (var inp in InputsOverflow)
-                if (inp.LazySource is ILazyNode n) nodes.Add(n);
+                if (inp.LazySource is ILazyNode n && !ReferenceEquals(n, this)) nodes.Add(n);
         return nodes.ToArray();
     }
 

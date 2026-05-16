@@ -191,17 +191,36 @@ internal sealed class LazyTensorScope : IDisposable
         string opName,
         Tensor<T> target,
         Tensor<T>[] otherInputs,
-        Action<IEngine, Tensor<T>> execute)
+        Action<IEngine, Tensor<T>> execute,
+        BackwardFunction<T>? backwardFn = null,
+        object[]? savedState = null)
     {
         // Build inputs array with target as the first input so the dependency
         // graph correctly orders this node after whatever produced target.
         var inputs = new Tensor<T>[1 + otherInputs.Length];
         inputs[0] = target;
         for (int i = 0; i < otherInputs.Length; i++) inputs[i + 1] = otherInputs[i];
+        // CRITICAL: snapshot the prior producer of `target` BEFORE we
+        // overwrite target.LazySource on line below. Without this snapshot,
+        // GetInputNodes()/RealizeInputs() would resolve Input0.LazySource
+        // back to THIS node (self-loop), and:
+        //   - DCE would count phantom self-consumption
+        //   - OperationReorderingPass would compute inDegree=1 for this node,
+        //     never schedule it, and silently DROP the in-place op from the
+        //     compiled list
+        //   - subsequent in-place ops on the same target would resolve all
+        //     earlier in-place node's "input producer" to the LATEST one
+        // The LazyNode's externalPrerequisite slot captures the real prior
+        // producer so the graph compiler sees a correct linear chain.
+        var prevProducer = target.LazySource;
         // Output = target itself (shared storage). Subsequent ops that
         // consume target see this node as the source, ensuring topological
         // order keeps the in-place mutation before its consumers.
-        var node = new LazyNode<T>(opType, opName, inputs, target, execute);
+        var node = new LazyNode<T>(
+            opType, opName, inputs, target, execute,
+            backwardFn: backwardFn,
+            savedState: savedState,
+            externalPrerequisite: prevProducer);
         target.LazySource = node;
         _nodes.Add(node);
     }

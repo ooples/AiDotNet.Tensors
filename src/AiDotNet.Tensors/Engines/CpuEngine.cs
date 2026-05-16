@@ -2937,6 +2937,7 @@ public partial class CpuEngine : ITensorLevelEngine
             if (scope != null)
             {
                 var ca = a; var cb = b;
+                scope.BindEngineIfUnset(this);
                 scope.RecordInPlace(LazyNodeType.Custom, "TensorAddInPlace", a, new[] { b },
                     (eng, _) => eng.TensorAddInPlace(ca, cb));
                 return;
@@ -3467,6 +3468,7 @@ public partial class CpuEngine : ITensorLevelEngine
             if (scope != null)
             {
                 var ca = a; var cb = b;
+                scope.BindEngineIfUnset(this);
                 scope.RecordInPlace(LazyNodeType.Custom, "TensorBroadcastAddInPlace", a, new[] { b },
                     (eng, _) => eng.TensorBroadcastAddInPlace(ca, cb));
                 return;
@@ -3608,6 +3610,7 @@ public partial class CpuEngine : ITensorLevelEngine
             if (scope != null)
             {
                 var ct = tensor;
+                scope.BindEngineIfUnset(this);
                 scope.RecordInPlace(LazyNodeType.Custom, "SwishInPlace", tensor, Array.Empty<Tensor<T>>(),
                     (eng, _) => eng.SwishInPlace(ct));
                 return;
@@ -3665,6 +3668,7 @@ public partial class CpuEngine : ITensorLevelEngine
             if (scope != null)
             {
                 var ct = tensor;
+                scope.BindEngineIfUnset(this);
                 scope.RecordInPlace(LazyNodeType.Custom, "GELUInPlace", tensor, Array.Empty<Tensor<T>>(),
                     (eng, _) => eng.GELUInPlace(ct));
                 return;
@@ -3720,6 +3724,7 @@ public partial class CpuEngine : ITensorLevelEngine
             if (scope != null)
             {
                 var ct = tensor;
+                scope.BindEngineIfUnset(this);
                 scope.RecordInPlace(LazyNodeType.Custom, "TanhInPlace", tensor, Array.Empty<Tensor<T>>(),
                     (eng, _) => eng.TanhInPlace(ct));
                 return;
@@ -3775,6 +3780,7 @@ public partial class CpuEngine : ITensorLevelEngine
             if (scope != null)
             {
                 var ct = tensor;
+                scope.BindEngineIfUnset(this);
                 scope.RecordInPlace(LazyNodeType.Custom, "MishInPlace", tensor, Array.Empty<Tensor<T>>(),
                     (eng, _) => eng.MishInPlace(ct));
                 return;
@@ -3826,6 +3832,7 @@ public partial class CpuEngine : ITensorLevelEngine
             if (scope != null)
             {
                 var ct = tensor; var ca = alpha;
+                scope.BindEngineIfUnset(this);
                 scope.RecordInPlace(LazyNodeType.Custom, "LeakyReLUInPlace", tensor, Array.Empty<Tensor<T>>(),
                     (eng, _) => eng.LeakyReLUInPlace(ct, ca));
                 return;
@@ -4693,6 +4700,7 @@ public partial class CpuEngine : ITensorLevelEngine
             if (scope != null)
             {
                 var ca = a; var cb = b;
+                scope.BindEngineIfUnset(this);
                 scope.RecordInPlace(LazyNodeType.Custom, "TensorMultiplyInPlace", a, new[] { b },
                     (eng, _) => eng.TensorMultiplyInPlace(ca, cb));
                 return;
@@ -4875,6 +4883,7 @@ public partial class CpuEngine : ITensorLevelEngine
             if (scope != null)
             {
                 var ca = a; var cb = b;
+                scope.BindEngineIfUnset(this);
                 scope.RecordInPlace(LazyNodeType.Custom, "TensorSubtractInPlace", a, new[] { b },
                     (eng, _) => eng.TensorSubtractInPlace(ca, cb));
                 return;
@@ -4991,6 +5000,7 @@ public partial class CpuEngine : ITensorLevelEngine
             if (scope != null)
             {
                 var ca = a; var csc = scalar;
+                scope.BindEngineIfUnset(this);
                 scope.RecordInPlace(LazyNodeType.Custom, "TensorMultiplyScalarInPlace", a, Array.Empty<Tensor<T>>(),
                     (eng, _) => eng.TensorMultiplyScalarInPlace(ca, csc));
                 return;
@@ -9274,6 +9284,7 @@ public partial class CpuEngine : ITensorLevelEngine
             if (scope != null)
             {
                 var ct = tensor;
+                scope.BindEngineIfUnset(this);
                 scope.RecordInPlace(LazyNodeType.Custom, "SigmoidInPlace", tensor, Array.Empty<Tensor<T>>(),
                     (eng, _) => eng.SigmoidInPlace(ct));
                 return;
@@ -9324,6 +9335,7 @@ public partial class CpuEngine : ITensorLevelEngine
             if (scope != null)
             {
                 var ct = tensor;
+                scope.BindEngineIfUnset(this);
                 scope.RecordInPlace(LazyNodeType.Custom, "SigmoidInPlace", tensor, Array.Empty<Tensor<T>>(),
                     (eng, _) => eng.SigmoidInPlace(ct));
                 return;
@@ -9624,6 +9636,7 @@ public partial class CpuEngine : ITensorLevelEngine
             if (scope != null)
             {
                 var ct = tensor;
+                scope.BindEngineIfUnset(this);
                 scope.RecordInPlace(LazyNodeType.Custom, "ReLUInPlace", tensor, Array.Empty<Tensor<T>>(),
                     (eng, _) => eng.ReLUInPlace(ct));
                 return;
@@ -9674,6 +9687,7 @@ public partial class CpuEngine : ITensorLevelEngine
             if (scope != null)
             {
                 var ct = tensor;
+                scope.BindEngineIfUnset(this);
                 scope.RecordInPlace(LazyNodeType.Custom, "ReLUInPlace", tensor, Array.Empty<Tensor<T>>(),
                     (eng, _) => eng.ReLUInPlace(ct));
                 return;
@@ -12471,6 +12485,9 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
         if (!kernel.IsContiguous) kernel = kernel.Contiguous();
         if (inputShape == null || inputShape.Length != 4) throw new ArgumentException("inputShape must be array of 4 elements", nameof(inputShape));
+        if (stride == null || stride.Length != 2) throw new ArgumentException("stride must be array of 2 elements", nameof(stride));
+        if (padding == null || padding.Length != 2) throw new ArgumentException("padding must be array of 2 elements", nameof(padding));
+        if (dilation == null || dilation.Length != 2) throw new ArgumentException("dilation must be array of 2 elements", nameof(dilation));
         if (gradOutput.Rank != 4) throw new ArgumentException($"requires 4D gradOutput. Got rank {gradOutput.Rank}.", nameof(gradOutput));
         if (kernel.Rank != 4) throw new ArgumentException($"requires 4D kernel. Got rank {kernel.Rank}.", nameof(kernel));
         if (!ShapesMatch(dest._shape, inputShape)) throw new ArgumentException("dest shape must match inputShape");
@@ -12650,14 +12667,23 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // Generic fallback for non-float, non-double types — wrap the existing
         // public method and copy/add. Slow path, only used for BFloat16 etc.
+        // tmp is allocated from the pool via TensorAllocator.Rent; return it
+        // after the merge to avoid pool exhaustion on this hot backward path.
         var tmp = Conv2DBackwardInput(gradOutput, kernel, inputShape, stride, padding, dilation);
-        if (accumulate)
+        try
         {
-            TensorAddInto(dest, dest, tmp);
+            if (accumulate)
+            {
+                TensorAddInto(dest, dest, tmp);
+            }
+            else
+            {
+                tmp.AsSpan().CopyTo(dest.AsWritableSpan());
+            }
         }
-        else
+        finally
         {
-            tmp.AsSpan().CopyTo(dest.AsWritableSpan());
+            Helpers.TensorAllocator.Return(tmp);
         }
     }
 
@@ -12920,6 +12946,9 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
         if (!input.IsContiguous) input = input.Contiguous();
         if (kernelShape == null || kernelShape.Length != 4) throw new ArgumentException("kernelShape must be array of 4 elements", nameof(kernelShape));
+        if (stride == null || stride.Length != 2) throw new ArgumentException("stride must be array of 2 elements", nameof(stride));
+        if (padding == null || padding.Length != 2) throw new ArgumentException("padding must be array of 2 elements", nameof(padding));
+        if (dilation == null || dilation.Length != 2) throw new ArgumentException("dilation must be array of 2 elements", nameof(dilation));
         if (gradOutput.Rank != 4) throw new ArgumentException($"requires 4D gradOutput. Got rank {gradOutput.Rank}.", nameof(gradOutput));
         if (input.Rank != 4) throw new ArgumentException($"requires 4D input. Got rank {input.Rank}.", nameof(input));
         if (!ShapesMatch(dest._shape, kernelShape)) throw new ArgumentException("dest shape must match kernelShape");
@@ -13117,14 +13146,22 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         // Generic fallback for non-float, non-double types.
+        // Pool-allocated by Conv2DBackwardKernel → return after merging.
         var tmp = Conv2DBackwardKernel(gradOutput, input, kernelShape, stride, padding, dilation);
-        if (accumulate)
+        try
         {
-            TensorAddInto(dest, dest, tmp);
+            if (accumulate)
+            {
+                TensorAddInto(dest, dest, tmp);
+            }
+            else
+            {
+                tmp.AsSpan().CopyTo(dest.AsWritableSpan());
+            }
         }
-        else
+        finally
         {
-            tmp.AsSpan().CopyTo(dest.AsWritableSpan());
+            Helpers.TensorAllocator.Return(tmp);
         }
     }
 
@@ -19039,18 +19076,30 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!destGradBeta.IsContiguous) throw new InvalidOperationException("destGradBeta must be contiguous.");
 
         var gi = BatchNormBackward(gradOutput, input, gamma, mean, variance, epsilon, out var gg, out var gb);
+        try
+        {
+            // Merge gi → destGradInput
+            if (accumulateInput) TensorAddInto(destGradInput, destGradInput, gi);
+            else gi.AsSpan().CopyTo(destGradInput.AsWritableSpan());
 
-        // Merge gi → destGradInput
-        if (accumulateInput) TensorAddInto(destGradInput, destGradInput, gi);
-        else gi.AsSpan().CopyTo(destGradInput.AsWritableSpan());
+            // Merge gg → destGradGamma
+            if (accumulateGamma) TensorAddInto(destGradGamma, destGradGamma, gg);
+            else gg.AsSpan().CopyTo(destGradGamma.AsWritableSpan());
 
-        // Merge gg → destGradGamma
-        if (accumulateGamma) TensorAddInto(destGradGamma, destGradGamma, gg);
-        else gg.AsSpan().CopyTo(destGradGamma.AsWritableSpan());
-
-        // Merge gb → destGradBeta
-        if (accumulateBeta) TensorAddInto(destGradBeta, destGradBeta, gb);
-        else gb.AsSpan().CopyTo(destGradBeta.AsWritableSpan());
+            // Merge gb → destGradBeta
+            if (accumulateBeta) TensorAddInto(destGradBeta, destGradBeta, gb);
+            else gb.AsSpan().CopyTo(destGradBeta.AsWritableSpan());
+        }
+        finally
+        {
+            // BatchNormBackward rents gi/gg/gb from the pool; return them after
+            // merging into the caller-owned destination buffers so the compiled
+            // training plan replay does not leak one BN-shaped allocation per
+            // layer per step.
+            Helpers.TensorAllocator.Return(gi);
+            Helpers.TensorAllocator.Return(gg);
+            Helpers.TensorAllocator.Return(gb);
+        }
     }
 
 

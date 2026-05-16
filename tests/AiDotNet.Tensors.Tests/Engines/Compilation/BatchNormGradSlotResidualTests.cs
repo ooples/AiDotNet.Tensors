@@ -30,6 +30,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 /// trainable parameters are gamma + beta of a BatchNorm op must move every
 /// channel of gamma in the same direction the eager-mode equivalent does.
 /// </summary>
+[Collection("CompiledTrainingPlanProbeSerial")]
 public class BatchNormGradSlotResidualTests
 {
     /// <summary>
@@ -213,7 +214,7 @@ public class BatchNormGradSlotResidualTests
             double dDiffSpan = System.Math.Abs(diffE[i] - diffF_viaSpan[i]);
             double dDiffArr = System.Math.Abs(diffE[i] - diffF_viaArray[i]);
             double dSq = System.Math.Abs(sqE[i] - sqF[i]);
-            if (dBn > 0 || dDiff > 0 || dDiffGC > 0 || dDiffBar > 0 || dDiffSpan > 0 || dDiffArr > 0) any = true;
+            if (dBn > 0 || dDiff > 0 || dDiffGC > 0 || dDiffBar > 0 || dDiffSpan > 0 || dDiffArr > 0 || dSq > 0) any = true;
             lines.Add($"  [{i}]  bn={dBn:E3} diff(idx)={dDiff:E3} diff(gc)={dDiffGC:E3} diff(bar)={dDiffBar:E3} diff(span)={dDiffSpan:E3} diff(arr)={dDiffArr:E3} sq={dSq:E3}");
         }
         // Read SubFwdDiag via reflection
@@ -378,10 +379,12 @@ public class BatchNormGradSlotResidualTests
         probeProp.SetValue(null, probe);
         try
         {
-            plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.0f);
-            plan.Step();
-            probeLog.Add($"  AFTER-STEP-BEFORE-DISPOSE              diffF[12]={diffF[12]:F18}");
-            plan.Dispose();
+            using (plan)
+            {
+                plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.0f);
+                plan.Step();
+                probeLog.Add($"  AFTER-STEP-BEFORE-DISPOSE              diffF[12]={diffF[12]:F18}");
+            }
             probeLog.Add($"  AFTER-DISPOSE                          diffF[12]={diffF[12]:F18}");
         }
         finally

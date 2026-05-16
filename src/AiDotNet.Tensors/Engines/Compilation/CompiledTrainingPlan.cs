@@ -409,12 +409,21 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // Global gradient L2-norm clipping. Applied between backward and the
         // fused optimizer update so the optimizer sees the clipped gradients.
         // Mirrors PyTorch's torch.nn.utils.clip_grad_norm_ semantics: one
-        // global norm across all parameter gradients, scaled collectively
-        // when over the threshold. No-op when SetMaxGradNorm wasn't called
-        // (or was called with 0).
-        if (_maxGradNorm > 0.0 && _cachedGradArrays != null)
+        // global norm across all PARAMETER gradients (not intermediate-tensor
+        // grads), scaled collectively when over the threshold. No-op when
+        // SetMaxGradNorm wasn't called (or was called with 0).
+        //
+        // Note: `gradArrays` indexes into `_preAllocatedGrads`, which contains
+        // a gradient buffer for EVERY tensor in the traced graph — parameters
+        // PLUS every intermediate input/output. Clipping over that whole set
+        // both (a) folds non-trainable buffers into the norm (wrong scale) and
+        // (b) summing `arr.Length` reads the pool-padded backing length, whose
+        // tail bytes are uninitialised (Array.Clear only zeros up to the
+        // logical Length at lines 354/361). Clip over `_gradients` (the
+        // parameter-grad set) with each tensor's logical Length instead.
+        if (_maxGradNorm > 0.0)
         {
-            ClipGradArraysGlobalL2(gradArrays, _maxGradNorm);
+            ClipGradientsGlobalL2(_gradients, _maxGradNorm);
         }
 
         if (bwdProbe != null) bwdProbe("BEGIN-OPT");
@@ -2491,26 +2500,30 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     }
 
     /// <summary>
-    /// Applies global L2-norm clipping across all gradient arrays in place.
-    /// Mirrors PyTorch's <c>torch.nn.utils.clip_grad_norm_</c>: computes
-    /// the total norm across all tensors, scales every element by
+    /// Applies global L2-norm clipping across the supplied parameter-gradient
+    /// tensors in place. Mirrors PyTorch's
+    /// <c>torch.nn.utils.clip_grad_norm_</c>: computes the total norm across
+    /// all tensors using each tensor's LOGICAL length (not the pool-padded
+    /// backing-array length), then scales every element by
     /// <c>maxNorm / (totalNorm + 1e-6)</c> when totalNorm exceeds maxNorm.
     /// </summary>
-    private static void ClipGradArraysGlobalL2(T[][] gradArrays, double maxNorm)
+    private static void ClipGradientsGlobalL2(Tensor<T>[] gradients, double maxNorm)
     {
-        if (gradArrays.Length == 0) return;
+        if (gradients.Length == 0) return;
 
-        // Step 1: total L2 norm across all gradient arrays. Reads through the
-        // `T` element type so float and double both work without per-type
+        // Step 1: total L2 norm across all parameter gradients. Reads through
+        // the `T` element type so float and double both work without per-type
         // duplication; the inner loop is dominated by the L1-resident array
-        // accesses, not the conversion arithmetic.
+        // accesses, not the conversion arithmetic. Uses logical Length so the
+        // uninitialised pool-padding tail does not leak into the norm.
         var numOps = MathHelper.GetNumericOperations<T>();
         double totalNormSq = 0.0;
-        for (int p = 0; p < gradArrays.Length; p++)
+        for (int p = 0; p < gradients.Length; p++)
         {
-            var arr = gradArrays[p];
-            if (arr == null) continue;
-            int len = arr.Length;
+            var tensor = gradients[p];
+            if (tensor == null) continue;
+            var arr = tensor.GetLiveBackingArrayAllowingPaddingOrNull() ?? tensor.GetDataArray();
+            int len = tensor.Length;
             for (int i = 0; i < len; i++)
             {
                 double v = numOps.ToDouble(arr[i]);
@@ -2523,11 +2536,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
         // Step 2: scale every gradient by maxNorm / (totalNorm + 1e-6).
         T scale = numOps.FromDouble(maxNorm / (totalNorm + 1e-6));
-        for (int p = 0; p < gradArrays.Length; p++)
+        for (int p = 0; p < gradients.Length; p++)
         {
-            var arr = gradArrays[p];
-            if (arr == null) continue;
-            int len = arr.Length;
+            var tensor = gradients[p];
+            if (tensor == null) continue;
+            var arr = tensor.GetLiveBackingArrayAllowingPaddingOrNull() ?? tensor.GetDataArray();
+            int len = tensor.Length;
             for (int i = 0; i < len; i++)
                 arr[i] = numOps.Multiply(arr[i], scale);
         }
@@ -3189,12 +3203,26 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     // can't bind; the runtime check + cast is the standard
                     // pattern used by other specialized branches in this
                     // file — see TensorMatMulGemvFloat caller above).
-                    if (typeof(T) == typeof(double))
+                    // GetDataArray() returns a fresh COPY for pool-padded tensors;
+                    // writing into it would leave the LIVE backing (which the
+                    // optimizer reads in the next pass) untouched. Prefer the
+                    // live-backing accessor and fall back to the generic reduce
+                    // path when the layout does not expose one. Source array can
+                    // safely use GetDataArray() — we only read from it.
+                    var dstLiveT = gradInputB.GetLiveBackingArrayAllowingPaddingOrNull();
+                    if (dstLiveT is null)
                     {
-                        var srcArrT = gradOut.GetDataArray();
-                        var dstArrT = gradInputB.GetDataArray();
+                        var reducedGeneric = eng.ReduceSum(gradOut, reduceAxesArr, keepDims: true);
+                        if (reducedGeneric._shape.Length != inputBShape.Length)
+                            reducedGeneric = eng.Reshape(reducedGeneric, inputBShape);
+                        if (accumB) eng.TensorAddInto(gradInputB, gradInputB, reducedGeneric);
+                        else reducedGeneric.AsSpan().CopyTo(gradInputB.AsWritableSpan());
+                    }
+                    else if (typeof(T) == typeof(double))
+                    {
+                        var srcArrT = gradOut.GetLiveBackingArrayAllowingPaddingOrNull() ?? gradOut.GetDataArray();
                         var src = System.Runtime.CompilerServices.Unsafe.As<T[], double[]>(ref srcArrT);
-                        var dst = System.Runtime.CompilerServices.Unsafe.As<T[], double[]>(ref dstArrT);
+                        var dst = System.Runtime.CompilerServices.Unsafe.As<T[], double[]>(ref dstLiveT);
                         for (int c = 0; c < C; c++)
                         {
                             double sum = 0.0;
@@ -3210,10 +3238,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     }
                     else if (typeof(T) == typeof(float))
                     {
-                        var srcArrT = gradOut.GetDataArray();
-                        var dstArrT = gradInputB.GetDataArray();
+                        var srcArrT = gradOut.GetLiveBackingArrayAllowingPaddingOrNull() ?? gradOut.GetDataArray();
                         var src = System.Runtime.CompilerServices.Unsafe.As<T[], float[]>(ref srcArrT);
-                        var dst = System.Runtime.CompilerServices.Unsafe.As<T[], float[]>(ref dstArrT);
+                        var dst = System.Runtime.CompilerServices.Unsafe.As<T[], float[]>(ref dstLiveT);
                         for (int c = 0; c < C; c++)
                         {
                             float sum = 0f;
