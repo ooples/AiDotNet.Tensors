@@ -313,4 +313,35 @@ public class ScalarKernelTests
             }
         }
     }
+
+    [Fact]
+    public void PackA_Transposed_FP32_MatchesLogicalLayout()
+    {
+        // Logical A is 8×4 but stored transposed [K=4, M=8] row-major:
+        //   a[k * M + m] = logical A[m, k].
+        int m = 8, k = 4;
+        float[] a = new float[k * m];
+        for (int r = 0; r < m; r++)
+            for (int c = 0; c < k; c++)
+                a[c * m + r] = r * k + c + 1f;  // logical A[r, c] = r*k + c + 1
+
+        int mc = 8, kc = 4, mr = 4;
+        float[] packed = new float[mc * kc];
+        ScalarPack.PackA<float>(a, lda: m, transA: true, packed, mc, kc, mr);
+
+        for (int stripe = 0; stripe < mc / mr; stripe++)
+        {
+            for (int kk = 0; kk < kc; kk++)
+            {
+                for (int row = 0; row < mr; row++)
+                {
+                    int packedIndex = stripe * kc * mr + kk * mr + row;
+                    int logicalRow = stripe * mr + row;
+                    int logicalCol = kk;
+                    float expectedLogical = logicalRow * k + logicalCol + 1f;
+                    Assert.Equal(expectedLogical, packed[packedIndex]);
+                }
+            }
+        }
+    }
 }
