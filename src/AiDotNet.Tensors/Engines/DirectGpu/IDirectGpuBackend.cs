@@ -3090,6 +3090,24 @@ public interface IDirectGpuBackend : IDisposable
         int batch, int numSamples, int numGammaBands, int gammaIdx);
 
     #endregion
+
+    #region Mixed-Precision Capability Discovery (Issue #337)
+
+    /// <summary>
+    /// Typed accessor to this backend's mixed-precision convolution
+    /// surface, when supported. Returns <c>null</c> for backends that
+    /// don't ship cuDNN-equivalent half/bfloat16 conv (Vulkan, WebGpu,
+    /// Metal MPSGraph, HIP, OpenCL).
+    /// <para>
+    /// Folds the capability into the engine contract instead of forcing
+    /// consumers to <c>backend as IGpuMixedPrecisionConvBackend</c>
+    /// downcasts — matches the established engine-extension pattern
+    /// used for stream-scheduler access in PR #344.
+    /// </para>
+    /// </summary>
+    AiDotNet.Tensors.Engines.Gpu.IGpuMixedPrecisionConvBackend? MixedPrecisionConv { get; }
+
+    #endregion
 }
 
 /// <summary>

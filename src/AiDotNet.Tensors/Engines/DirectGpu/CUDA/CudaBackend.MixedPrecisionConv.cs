@@ -15,6 +15,13 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 public sealed partial class CudaBackend : IGpuMixedPrecisionConvBackend
 {
     /// <summary>
+    /// IDirectGpuBackend.MixedPrecisionConv: CUDA ships the cuDNN-backed
+    /// mixed-precision conv surface, so the typed accessor returns
+    /// `this`. Backends without cuDNN-equivalent paths return null.
+    /// </summary>
+    public IGpuMixedPrecisionConvBackend? MixedPrecisionConv => this;
+
+    /// <summary>
     /// True when cuDNN is available and the cuDNN convolution helper has
     /// been initialised. FP16 conv is supported on every cuDNN release —
     /// no compute-capability floor here, unlike Hgemm's Maxwell+ floor.

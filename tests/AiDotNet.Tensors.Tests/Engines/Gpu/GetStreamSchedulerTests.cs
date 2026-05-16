@@ -107,12 +107,21 @@ public class GetStreamSchedulerTests
         if (backend is not AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend cudaBackend) return;
 
         const int M = 16, N = 16, K = 8, batchCount = 4;
-        // ValidateBatchedGemmArgs is fp32-centric: bufA.Size must be
-        // >= M*K*batchCount. Allocate at fp32-element count even though
-        // the actual fp16 elements occupy half that bytewise — the
-        // extra space is unused.
-        using var aFp16 = backend.AllocateBuffer(M * K * batchCount);
-        using var bFp16 = backend.AllocateBuffer(K * N * batchCount);
+        // BatchedGemmExFanout now uses the byte-aware validator
+        // (ValidateBatchedGemmArgsBytes) which checks SizeInBytes against
+        // the actual fp16 (2-byte) requirement, not the fp32-element
+        // requirement. We can allocate the MINIMAL byte footprint —
+        // AllocateBuffer(N) reserves N*4 bytes (fp32 surface), so
+        // allocating (M*K*batchCount / 2) fp32-elements gives the
+        // M*K*batchCount * 2 bytes that fp16 actually needs. The
+        // production fix in CudaBackend.ValidateBatchedGemmArgsBytes
+        // makes this the canonical minimal-storage path; a regression
+        // that re-introduces the fp32-element check would surface here
+        // as an undersized-buffer ArgumentException.
+        int fp16ByteElems = (M * K * batchCount) / 2;     // fp16 bytes / 4 (fp32-elem stride)
+        int fp16ByteElemsBN = (K * N * batchCount) / 2;
+        using var aFp16 = backend.AllocateBuffer(fp16ByteElems);
+        using var bFp16 = backend.AllocateBuffer(fp16ByteElemsBN);
         using var cFp32 = backend.AllocateBuffer(M * N * batchCount);
 
         try
@@ -140,9 +149,12 @@ public class GetStreamSchedulerTests
         var backend = engine.GetBackend();
         if (backend is not AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend cudaBackend) return;
 
-        if (backend is AiDotNet.Tensors.Engines.Gpu.IGpuMixedPrecisionConvBackend mp
-            && mp.SupportsBFloat16Conv)
-            return; // BF16 actually supported — skip rejection test.
+        // Gate on the fanout-path's own BF16 capability, NOT the cuDNN
+        // conv surface. An Ampere+ host with cuDNN conv disabled would
+        // otherwise take the pre-Ampere branch here and fail spuriously
+        // — BF16 GEMM works fine there.
+        if (cudaBackend.SupportsBFloat16GemmFanout)
+            return; // BF16 GEMM actually supported — skip rejection test.
 
         using var a = backend.AllocateBuffer(64);
         using var b = backend.AllocateBuffer(64);
@@ -361,8 +373,10 @@ public class GetStreamSchedulerTests
         var backend = engine.GetBackend();
         if (backend is not AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend cudaBackend) return;
 
-        // Pre-Ampere hosts only — skip if BF16 is actually supported.
-        if (backend is AiDotNet.Tensors.Engines.Gpu.IGpuMixedPrecisionConvBackend mp && mp.SupportsBFloat16Conv)
+        // Pre-Ampere hosts only — gate on the MHA fanout's own BF16
+        // capability, NOT the cuDNN conv surface (same reasoning as
+        // BatchedGemmExFanout_BFloat16PreAmpere_Throws above).
+        if (cudaBackend.SupportsBFloat16GemmFanout)
             return;
 
         using var q = backend.AllocateBuffer(64);
@@ -554,7 +568,29 @@ public class GetStreamSchedulerTests
                 return;
             throw;
         }
-        // Reaching here means the fan-out + synchronize completed cleanly.
+
+        // Prove the scheduler ACTUALLY fans out across multiple streams.
+        // Without this assertion the test passes even when every launch
+        // serializes onto a single stream — which is the PR #335 regression
+        // mode the scheduler exists to prevent. Run a probe dispatch with
+        // batchCount no-op launches and record the distinct IGpuStream
+        // instances each launch saw; assert >1 stream participated.
+        var seenStreams = new System.Collections.Generic.HashSet<IGpuStream>();
+        var probeLock = new object();
+        var probeLaunches = new System.Collections.Generic.List<System.Action<IGpuStream>>(batchCount);
+        for (int i = 0; i < batchCount; i++)
+        {
+            probeLaunches.Add(stream =>
+            {
+                lock (probeLock) { seenStreams.Add(stream); }
+            });
+        }
+        using (var probeBatch = scheduler.Dispatch(probeLaunches))
+        {
+            scheduler.SynchronizeEvents(probeBatch);
+        }
+        Assert.True(seenStreams.Count > 1,
+            $"Scheduler used only {seenStreams.Count} stream(s) for {batchCount} fanout launches on a multi-stream host — fanout is single-stream-serialized, defeating PR #335.");
     }
 
     [Fact]
@@ -594,11 +630,18 @@ public class GetStreamSchedulerTests
             }
 
             var launches = new System.Collections.Generic.List<System.Action<IGpuStream>>(numLaunches);
+            // Record which IGpuStream instances the scheduler hands each
+            // launch — proves fan-out across multiple streams, not just
+            // that every launch completed (single-stream serialization
+            // would also pass a completion-only check).
+            var seenStreams = new System.Collections.Generic.HashSet<IGpuStream>();
+            var streamLock = new object();
             for (int i = 0; i < numLaunches; i++)
             {
                 int idx = i;
                 launches.Add(stream =>
                 {
+                    lock (streamLock) { seenStreams.Add(stream); }
                     // The scheduler binds cuBLAS to the lease's stream just
                     // before invoking the launch callback (see
                     // GpuStreamScheduler.Dispatch). MatMul on this backend
@@ -612,6 +655,8 @@ public class GetStreamSchedulerTests
             Assert.NotEqual(0, batch.Count);
             Assert.Equal(numLaunches, cBufs.Count);
             scheduler.SynchronizeEvents(batch);
+            Assert.True(seenStreams.Count > 1,
+                $"Scheduler used only {seenStreams.Count} stream(s) for {numLaunches} fan-out MatMul launches — the launches serialized onto one stream, defeating PR #335.");
         }
         finally
         {

@@ -78,6 +78,18 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     private IntPtr _wmmaModule;
     private int _ccMajor;
     private int _ccMinor;
+
+    /// <summary>
+    /// True when this device supports the bfloat16 GEMM / MHA fanout
+    /// paths (BatchedGemmExFanout(useBFloat16:true) and
+    /// MultiHeadAttentionScoresFanoutMixed(useBFloat16:true)). Requires
+    /// compute capability ≥ 8.0 (Ampere+), where the BF16 tensor cores
+    /// live. Distinct from IGpuMixedPrecisionConvBackend's BF16 conv
+    /// surface: a host can have BF16 GEMM/MHA support without cuDNN
+    /// (or with cuDNN-conv disabled), which is what makes a single
+    /// capability flag wrong for cross-cutting test gates.
+    /// </summary>
+    public bool SupportsBFloat16GemmFanout => IsAvailable && _ccMajor >= 8;
     private int _clockRateKHz;
     private bool _hasWmmaSupport;
 
@@ -1234,6 +1246,28 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         long perBatchS = perHeadS * numHeads;
         long elemBytes = sizeof(float);
 
+        // Validate buffer capacity BEFORE the per-head offset math. Without
+        // this, an undersized Q/K/scores buffer silently produces device
+        // pointers past the allocation, which cuBLAS will read/write into —
+        // typically a use-after-free or another tensor's data. The required
+        // element count is (batch * perBatchX); IGpuBuffer.Size returns the
+        // element count, so we compare directly.
+        long requiredQ = (long)batch * perBatchQ;
+        long requiredK = (long)batch * perBatchK;
+        long requiredS = (long)batch * perBatchS;
+        if (Q.Size < requiredQ)
+            throw new ArgumentException(
+                $"Q buffer too small: capacity={Q.Size} elements, required={requiredQ} for shape [B={batch}, H={numHeads}, S={seqLen}, D={headDim}].",
+                nameof(Q));
+        if (K.Size < requiredK)
+            throw new ArgumentException(
+                $"K buffer too small: capacity={K.Size} elements, required={requiredK} for shape [B={batch}, H={numHeads}, S={seqLen}, D={headDim}].",
+                nameof(K));
+        if (scores.Size < requiredS)
+            throw new ArgumentException(
+                $"scores buffer too small: capacity={scores.Size} elements, required={requiredS} for shape [B={batch}, H={numHeads}, S={seqLen}].",
+                nameof(scores));
+
         var launches = new System.Collections.Generic.List<System.Action<AiDotNet.Tensors.Engines.Gpu.IGpuStream>>(batch * numHeads);
         for (int bi = 0; bi < batch; bi++)
         {
@@ -1295,6 +1329,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (K is null) throw new ArgumentNullException(nameof(K));
         if (scores is null) throw new ArgumentNullException(nameof(scores));
         if (scheduler is null) throw new ArgumentNullException(nameof(scheduler));
+        // Restore the positive-dimension guards the fp32 sister method has —
+        // without these, a zero or negative dim flows straight into the
+        // launches-list `Count` sizing and the perHead/perBatch offset math.
+        if (batch <= 0) throw new ArgumentOutOfRangeException(nameof(batch));
+        if (numHeads <= 0) throw new ArgumentOutOfRangeException(nameof(numHeads));
+        if (seqLen <= 0) throw new ArgumentOutOfRangeException(nameof(seqLen));
+        if (headDim <= 0) throw new ArgumentOutOfRangeException(nameof(headDim));
         if (useBFloat16 && _ccMajor < 8)
             throw new NotSupportedException(
                 $"BFloat16 MHA requires compute capability >= 8.0 (Ampere+); device reports {_ccMajor}.{_ccMinor}.");
@@ -1306,6 +1347,24 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         long perBatchS = perHeadScoreElems * numHeads;
         long elemBytesIn = 2;        // fp16 / bf16
         long elemBytesOut = sizeof(float);
+
+        // Validate buffer capacity BEFORE per-head offset math. Q/K are
+        // 2-byte (fp16/bf16) so SizeInBytes is the right surface here;
+        // scores is fp32 so element count suffices.
+        long requiredQkBytes = (long)batch * perBatchQK * elemBytesIn;
+        long requiredS = (long)batch * perBatchS;
+        if (Q.SizeInBytes < requiredQkBytes)
+            throw new ArgumentException(
+                $"Q buffer too small: capacity={Q.SizeInBytes} bytes, required={requiredQkBytes} for mixed-precision shape [B={batch}, H={numHeads}, S={seqLen}, D={headDim}].",
+                nameof(Q));
+        if (K.SizeInBytes < requiredQkBytes)
+            throw new ArgumentException(
+                $"K buffer too small: capacity={K.SizeInBytes} bytes, required={requiredQkBytes} for mixed-precision shape [B={batch}, H={numHeads}, S={seqLen}, D={headDim}].",
+                nameof(K));
+        if (scores.Size < requiredS)
+            throw new ArgumentException(
+                $"scores buffer too small: capacity={scores.Size} elements, required={requiredS} for shape [B={batch}, H={numHeads}, S={seqLen}].",
+                nameof(scores));
 
         var launches = new System.Collections.Generic.List<System.Action<AiDotNet.Tensors.Engines.Gpu.IGpuStream>>(batch * numHeads);
         for (int bi = 0; bi < batch; bi++)
@@ -1386,6 +1445,24 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         long perBatchO = perHeadO * numHeads;
         long elemBytes = sizeof(float);
 
+        // Validate buffer capacity BEFORE the per-head offset math (see
+        // MultiHeadAttentionScoresFanout for the rationale).
+        long requiredA = (long)batch * perBatchA;
+        long requiredV = (long)batch * perBatchV;
+        long requiredO = (long)batch * perBatchO;
+        if (attention.Size < requiredA)
+            throw new ArgumentException(
+                $"attention buffer too small: capacity={attention.Size} elements, required={requiredA} for shape [B={batch}, H={numHeads}, S={seqLen}].",
+                nameof(attention));
+        if (V.Size < requiredV)
+            throw new ArgumentException(
+                $"V buffer too small: capacity={V.Size} elements, required={requiredV} for shape [B={batch}, H={numHeads}, S={seqLen}, D={headDim}].",
+                nameof(V));
+        if (output.Size < requiredO)
+            throw new ArgumentException(
+                $"output buffer too small: capacity={output.Size} elements, required={requiredO} for shape [B={batch}, H={numHeads}, S={seqLen}, D={headDim}].",
+                nameof(output));
+
         var launches = new System.Collections.Generic.List<System.Action<AiDotNet.Tensors.Engines.Gpu.IGpuStream>>(batch * numHeads);
         for (int bi = 0; bi < batch; bi++)
         {
@@ -1446,7 +1523,11 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     {
         if (!IsAvailable) throw new InvalidOperationException("CUDA backend is not available.");
         if (scheduler is null) throw new ArgumentNullException(nameof(scheduler));
-        ValidateBatchedGemmArgs(A, B, C, M, N, K, batchCount);
+        // A/B are 2-byte (fp16/bf16); C is fp32. Use the byte-aware
+        // validator — the element-count overload would interpret A.Size
+        // as float elements and accept undersized half buffers.
+        ValidateBatchedGemmArgsBytes(A, B, C, M, N, K, batchCount,
+            elemBytesA: 2, elemBytesB: 2, elemBytesC: sizeof(float));
 
         if (useBFloat16 && _ccMajor < 8)
             throw new NotSupportedException(
@@ -1506,7 +1587,11 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     {
         if (!IsAvailable) throw new InvalidOperationException("CUDA backend is not available.");
         if (scheduler is null) throw new ArgumentNullException(nameof(scheduler));
-        ValidateBatchedGemmArgs(A, B, C, M, N, K, batchCount);
+        // All three buffers are fp64 (8-byte). The fp32-shaped validator
+        // would underestimate the byte requirement by 2× and accept a
+        // half-sized double buffer that then overruns inside cublasDgemm.
+        ValidateBatchedGemmArgsBytes(A, B, C, M, N, K, batchCount,
+            elemBytesA: sizeof(double), elemBytesB: sizeof(double), elemBytesC: sizeof(double));
 
         long strideA = (long)M * K;
         long strideB = (long)K * N;
@@ -3598,6 +3683,11 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     private static void ValidateBatchedGemmArgs(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, int batchCount)
     {
+        // Element-count overload — assumes 4-byte float layout via
+        // IGpuBuffer.Size's semantics. Mixed-precision (fp16/bf16) and
+        // fp64 callers MUST use the byte-aware overload below instead;
+        // their per-element strides differ from the float assumption
+        // baked into ValidateGemmArgs / A.Size comparisons.
         if (batchCount <= 0)
             throw new ArgumentException("batchCount must be positive.");
 
@@ -3616,6 +3706,50 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             throw new ArgumentException("Buffer B is too small for the specified batch dimensions.");
         if (C.Size < requiredC)
             throw new ArgumentException("Buffer C is too small for the specified batch dimensions.");
+    }
+
+    /// <summary>
+    /// Byte-aware batched-GEMM validator for mixed-precision and fp64
+    /// fanout paths where the per-buffer element stride differs from the
+    /// 4-byte float assumption that <see cref="IGpuBuffer.Size"/>'s
+    /// element-count semantics bakes in. Compares against
+    /// <see cref="IGpuBuffer.SizeInBytes"/> so an undersized half/bfloat16
+    /// or double buffer can't pass validation and then walk past its
+    /// allocation inside cublasGemmEx / cublasDgemm.
+    /// </summary>
+    private static void ValidateBatchedGemmArgsBytes(
+        IGpuBuffer A, IGpuBuffer B, IGpuBuffer C,
+        int M, int N, int K, int batchCount,
+        int elemBytesA, int elemBytesB, int elemBytesC)
+    {
+        if (batchCount <= 0)
+            throw new ArgumentException("batchCount must be positive.");
+        if (M <= 0 || N <= 0 || K <= 0)
+            throw new ArgumentException("GEMM dimensions M, N, K must be positive.");
+        if (A is null) throw new ArgumentNullException(nameof(A));
+        if (B is null) throw new ArgumentNullException(nameof(B));
+        if (C is null) throw new ArgumentNullException(nameof(C));
+
+        long requiredAElems = (long)batchCount * M * K;
+        long requiredBElems = (long)batchCount * K * N;
+        long requiredCElems = (long)batchCount * M * N;
+
+        long requiredABytes = requiredAElems * elemBytesA;
+        long requiredBBytes = requiredBElems * elemBytesB;
+        long requiredCBytes = requiredCElems * elemBytesC;
+
+        if (A.SizeInBytes < requiredABytes)
+            throw new ArgumentException(
+                $"Buffer A too small: capacity={A.SizeInBytes} bytes, required={requiredABytes} bytes ({requiredAElems} elements × {elemBytesA}).",
+                nameof(A));
+        if (B.SizeInBytes < requiredBBytes)
+            throw new ArgumentException(
+                $"Buffer B too small: capacity={B.SizeInBytes} bytes, required={requiredBBytes} bytes ({requiredBElems} elements × {elemBytesB}).",
+                nameof(B));
+        if (C.SizeInBytes < requiredCBytes)
+            throw new ArgumentException(
+                $"Buffer C too small: capacity={C.SizeInBytes} bytes, required={requiredCBytes} bytes ({requiredCElems} elements × {elemBytesC}).",
+                nameof(C));
     }
 
     #region Convolution Operations

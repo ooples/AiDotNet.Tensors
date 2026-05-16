@@ -5,15 +5,25 @@ using AiDotNet.Tensors.Engines.DirectGpu;
 namespace AiDotNet.Tensors.Engines.Gpu;
 
 /// <summary>
-/// Issue #337: optional capability interface for backends that ship
+/// Issue #337: capability interface for backends that ship
 /// mixed-precision cuDNN convolution / batch-norm / softmax kernels.
-/// Consumers downcast a backend reference to this interface to access the
-/// FP16 / BF16 variants without forcing every backend to implement them.
 /// <para>
-/// Not a member of <see cref="IDirectGpuBackend"/> directly because most
-/// backends (Vulkan, WebGpu, Metal MPSGraph, HIP, OpenCL) don't ship cuDNN-
-/// equivalent half-precision conv/BN/softmax — making it part of the base
-/// interface would force every backend to throw <c>NotSupportedException</c>.
+/// <b>Discovery:</b> consumers reach this surface through
+/// <see cref="IDirectGpuBackend.MixedPrecisionConv"/> instead of
+/// downcasting. Backends that don't ship cuDNN-equivalent paths return
+/// <c>null</c>; the CUDA backend returns <c>this</c>. This follows the
+/// established engine-extension pattern (see also PR #344's
+/// stream-scheduler promotion) — capability surfaces live on the engine
+/// contract, not on standalone probe interfaces.
+/// </para>
+/// <para>
+/// <b>Why a separate interface rather than folded into IDirectGpuBackend
+/// methods directly:</b> Vulkan, WebGpu, Metal MPSGraph, HIP, and OpenCL
+/// don't have cuDNN-equivalent half/bfloat conv yet. Pushing the methods
+/// onto every backend would either force every implementation to throw
+/// <c>NotSupportedException</c> or block all backends until they ship
+/// their own mixed-precision adapter. The typed accessor lets callers
+/// null-check once and skip the whole path cleanly.
 /// </para>
 /// <para>
 /// The element type is passed through as a <see cref="GpuMixedPrecisionDataType"/>

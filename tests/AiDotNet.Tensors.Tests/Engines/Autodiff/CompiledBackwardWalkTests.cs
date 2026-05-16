@@ -9,12 +9,24 @@ using Xunit;
 namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 
 /// <summary>
+/// Serializes tests that mutate process-wide engine + compiled-walker
+/// state (AiDotNetEngine.Current, CompiledBackwardWalk&lt;T&gt;'s test
+/// override flag, and the per-thread compiled-chain cache). Without
+/// this, xUnit's default parallel runner can interleave classes that
+/// each assume exclusive ownership of those globals — surfaces as
+/// flaky test failures that vanish on rerun.
+/// </summary>
+[CollectionDefinition("EngineCurrentGlobalState", DisableParallelization = true)]
+public sealed class EngineCurrentGlobalStateCollection { }
+
+/// <summary>
 /// Issue #338 Item 3: validates the compiled-IL backward integration
 /// scaffolding. The walker compilation today is a passthrough; future
 /// commits replace it with a JIT-emitted DynamicMethod. These tests pin
 /// the API contract + register/lookup semantics so that future IL work
 /// can replace the passthrough without breaking the integration.
 /// </summary>
+[Collection("EngineCurrentGlobalState")]
 public class CompiledBackwardWalkTests
 {
     /// <summary>
@@ -498,6 +510,18 @@ public class CompiledBackwardWalkTests
             float[] secondDA2 = RunAndGetGradA(engine, (a, b) =>
                 engine.TensorMultiply(a, b));
             for (int i = 0; i < 3; i++) Assert.Equal(refDA2[i], secondDA2[i], 4);
+
+            // Pattern 3 (the comment claims it's tested here too — finish
+            // the assertion). Without this, a regression where the third
+            // graph shape aliases an existing cache entry would still pass
+            // since we'd only see patterns 1 + 2 hit the cache.
+            float[] secondDA3 = RunAndGetGradA(engine, (a, b) =>
+                engine.TensorMultiply(engine.TensorAdd(a, b), a));
+            for (int i = 0; i < 3; i++) Assert.Equal(refDA3[i], secondDA3[i], 4);
+
+            // Cache size must be exactly 3 distinct walker entries — one per
+            // pattern. Aliasing would show up as a count < 3 here.
+            Assert.Equal(3, (int)countProp.GetValue(null)!);
         }
         finally
         {

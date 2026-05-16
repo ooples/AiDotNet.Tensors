@@ -18,7 +18,17 @@ public class CuDnnActivationGpuTests
     {
         if (!CuDnnAvailable) return;
         CuDnnContext? ctx = null;
-        try { ctx = new CuDnnContext(); } catch { return; }
+        try { ctx = new CuDnnContext(); }
+        catch (InvalidOperationException ex) when (
+            ex.Message.Contains("NotSupported", StringComparison.Ordinal) ||
+            ex.Message.Contains("ArchMismatch", StringComparison.Ordinal) ||
+            ex.Message.Contains("not available", StringComparison.OrdinalIgnoreCase))
+        {
+            // Skip on machines without cuDNN or with an unsupported
+            // arch; rethrow anything else so a real init regression
+            // doesn't silently turn into a passing test.
+            return;
+        }
 
         using (ctx)
         using (var act = new CuDnnActivation(ctx))
@@ -43,7 +53,17 @@ public class CuDnnActivationGpuTests
     {
         if (!CuDnnAvailable) return;
         CuDnnContext? ctx = null;
-        try { ctx = new CuDnnContext(); } catch { return; }
+        try { ctx = new CuDnnContext(); }
+        catch (InvalidOperationException ex) when (
+            ex.Message.Contains("NotSupported", StringComparison.Ordinal) ||
+            ex.Message.Contains("ArchMismatch", StringComparison.Ordinal) ||
+            ex.Message.Contains("not available", StringComparison.OrdinalIgnoreCase))
+        {
+            // Skip on machines without cuDNN or with an unsupported
+            // arch; rethrow anything else so a real init regression
+            // doesn't silently turn into a passing test.
+            return;
+        }
 
         using (ctx)
         using (var act = new CuDnnActivation(ctx))
@@ -75,7 +95,17 @@ public class CuDnnActivationGpuTests
     {
         if (!CuDnnAvailable) return;
         CuDnnContext? ctx = null;
-        try { ctx = new CuDnnContext(); } catch { return; }
+        try { ctx = new CuDnnContext(); }
+        catch (InvalidOperationException ex) when (
+            ex.Message.Contains("NotSupported", StringComparison.Ordinal) ||
+            ex.Message.Contains("ArchMismatch", StringComparison.Ordinal) ||
+            ex.Message.Contains("not available", StringComparison.OrdinalIgnoreCase))
+        {
+            // Skip on machines without cuDNN or with an unsupported
+            // arch; rethrow anything else so a real init regression
+            // doesn't silently turn into a passing test.
+            return;
+        }
 
         using (ctx)
         using (var act = new CuDnnActivation(ctx))

@@ -28,6 +28,13 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 /// </remarks>
 public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKernels
 {
+    /// <summary>
+    /// Metal MPSGraph has half/bfloat conv support but it's not wired
+    /// through IGpuMixedPrecisionConvBackend yet — returns null so the
+    /// capability is reported as absent until the Metal adapter lands.
+    /// </summary>
+    public AiDotNet.Tensors.Engines.Gpu.IGpuMixedPrecisionConvBackend? MixedPrecisionConv => null;
+
     private readonly MetalDevice _device;
     private readonly MetalCommandQueue _commandQueue;
     private readonly MetalShaderLibrary _shaderLibrary;

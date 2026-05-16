@@ -20,14 +20,25 @@ public class IGpuMixedPrecisionConvBackendTests
         if (backend is null)
             return; // CPU-only host — interface unreachable
 
-        var mp = backend as IGpuMixedPrecisionConvBackend;
-        if (mp is null)
-            return; // Non-CUDA backend; interface is CUDA-specific today
+        // Prefer the IDirectGpuBackend.MixedPrecisionConv accessor (the
+        // canonical engine-extension discovery path) but also probe the
+        // downcast — both must point to the same instance on CUDA.
+        var mp = backend.MixedPrecisionConv;
+        bool isCudaBackend = backend.GetType().Name.Contains("Cuda", System.StringComparison.Ordinal);
+        if (isCudaBackend)
+        {
+            Assert.NotNull(mp);
+            Assert.Same(backend, mp); // CUDA backend returns `this` from MixedPrecisionConv
+        }
+        else if (mp is null)
+        {
+            return; // Truly non-CUDA backend; interface is CUDA-only today.
+        }
 
         // SupportsHalfConv tracks UseCudnnForConv; not strictly required to
         // be true (the policy may be disabled), but if cuDNN is on this
         // backend then half conv is available.
-        Assert.True(mp.SupportsHalfConv || !AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaDispatchPolicy.UseCudnnForConv,
+        Assert.True(mp!.SupportsHalfConv || !AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaDispatchPolicy.UseCudnnForConv,
             "When UseCudnnForConv is true, SupportsHalfConv must also be true (cuDNN supports fp16 conv on every release).");
     }
 

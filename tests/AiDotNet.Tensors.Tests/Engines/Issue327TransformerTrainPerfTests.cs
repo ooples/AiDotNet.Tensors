@@ -16,6 +16,11 @@ using Xunit.Abstractions;
 
 namespace AiDotNet.Tensors.Tests.Engines;
 
+// Shares EngineCurrentGlobalState (defined in CompiledBackwardWalkTests.cs)
+// so the two classes can't interleave their AiDotNetEngine.Current pins +
+// CompiledBackwardWalk override toggles + walker-cache state on xUnit's
+// parallel runner.
+[Collection("EngineCurrentGlobalState")]
 public class Issue327TransformerTrainPerfTests
 {
     private readonly ITestOutputHelper _output;
