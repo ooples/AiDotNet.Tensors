@@ -925,6 +925,66 @@ public class ScalarKernelTests
             Assert.Equal(expected[i], actual[i], precision: 4);
     }
 
+    // ── D1: AVX-512 FP64 8x16 microkernel test ───────────────────────────────
+
+    [Fact]
+    public void Avx512Fp64_8x16_MatchesScalarReference()
+    {
+        if (!Avx512Fp64_8x16.IsSupported) return;
+
+        int kc = 16;
+        int Mr = 8, Nr = 16;
+
+        var rng = new Random(42);
+        double[] packedA = new double[Mr * kc];
+        double[] packedB = new double[kc * Nr];
+        for (int i = 0; i < packedA.Length; i++) packedA[i] = rng.NextDouble() * 2 - 1;
+        for (int i = 0; i < packedB.Length; i++) packedB[i] = rng.NextDouble() * 2 - 1;
+
+        // Reference: 8 calls to ScalarFp64_4x4 covering the 8×16 output (2 row-blocks × 4 col-blocks).
+        // ScalarFp64_4x4 has Mr=4, Nr=4. The 8×16 grid splits into 2×4=8 quadrants.
+        // Slice packed-A into rows 0..3 and 4..7. Slice packed-B into 4-col chunks: [0..3, 4..7, 8..11, 12..15].
+        double[] packedA_top = new double[kc * 4];
+        double[] packedA_bot = new double[kc * 4];
+        double[][] packedB_chunks = new double[4][];
+        for (int c = 0; c < 4; c++) packedB_chunks[c] = new double[kc * 4];
+
+        for (int k = 0; k < kc; k++)
+        {
+            for (int r = 0; r < 4; r++)
+            {
+                packedA_top[k * 4 + r] = packedA[k * Mr + r];
+                packedA_bot[k * 4 + r] = packedA[k * Mr + 4 + r];
+            }
+            for (int c = 0; c < 4; c++)
+            {
+                for (int col = 0; col < 4; col++)
+                {
+                    packedB_chunks[c][k * 4 + col] = packedB[k * Nr + c * 4 + col];
+                }
+            }
+        }
+
+        double[] cRef = new double[8 * 16];
+        int ldc = 16;
+        // Top row-block (rows 0..3): 4 calls covering cols 0..15
+        for (int c = 0; c < 4; c++)
+        {
+            ScalarFp64_4x4.Run(packedA_top, packedB_chunks[c], cRef.AsSpan(c * 4), ldc, kc);
+        }
+        // Bottom row-block (rows 4..7): 4 calls covering cols 0..15
+        for (int c = 0; c < 4; c++)
+        {
+            ScalarFp64_4x4.Run(packedA_bot, packedB_chunks[c], cRef.AsSpan(4 * ldc + c * 4), ldc, kc);
+        }
+
+        double[] cAvx = new double[8 * 16];
+        Avx512Fp64_8x16.Run(packedA, packedB, cAvx.AsSpan(), ldc, kc);
+
+        for (int i = 0; i < cRef.Length; i++)
+            Assert.Equal(cRef[i], cAvx[i], precision: 12);
+    }
+
     // ── B5 helpers ────────────────────────────────────────────────────────────
 
     private static (double[] a, double[] b) GenerateRandomMatrices(int m, int n, int k, bool transA, bool transB, int seed)
