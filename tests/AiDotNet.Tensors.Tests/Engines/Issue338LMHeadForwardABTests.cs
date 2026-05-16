@@ -55,11 +55,17 @@ public class Issue338LMHeadForwardABTests
 
         bool blasAvail = BlasProvider.IsAvailable;
         _output.WriteLine($"# BlasProvider.IsAvailable={blasAvail}, BackendName={BlasProvider.BackendName}");
+        if (!blasAvail)
+        {
+            _output.WriteLine("# Skip GEMM A/B: no BLAS provider loaded.");
+            return;
+        }
 
         // Warmup both paths
         for (int wi = 0; wi < 5; wi++)
         {
-            BlasProvider.TryGemm(M, V, K, x, 0, K, w, 0, V, y, 0, V);
+            Assert.True(BlasProvider.TryGemm(M, V, K, x, 0, K, w, 0, V, y, 0, V),
+                "BlasProvider.TryGemm failed in warmup; speedup numbers would be meaningless");
             // Sum y to scalar
             float ls = 0;
             for (int i = 0; i < y.Length; i++) ls += y[i];
@@ -79,7 +85,8 @@ public class Issue338LMHeadForwardABTests
         var sw = Stopwatch.StartNew();
         for (int it = 0; it < iters; it++)
         {
-            BlasProvider.TryGemm(M, V, K, x, 0, K, w, 0, V, y, 0, V);
+            Assert.True(BlasProvider.TryGemm(M, V, K, x, 0, K, w, 0, V, y, 0, V),
+                "BlasProvider.TryGemm failed in timed loop; speedup measurement aborted");
             float ls = 0;
             for (int i = 0; i < y.Length; i++) ls += y[i];
         }

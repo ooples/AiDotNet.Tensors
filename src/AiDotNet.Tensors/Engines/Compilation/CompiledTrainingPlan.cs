@@ -121,6 +121,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// <inheritdoc/>
     public void EnableFrozenWeightOptimizations()
     {
+        // Guard against use-after-Dispose: TryBuildSpecializedForward below
+        // adds pinned GCHandles to _pinnedHandles. Dispose() short-circuits
+        // on _disposed, so handles added here after disposal would leak.
+        if (_disposed) throw new ObjectDisposedException(nameof(CompiledTrainingPlan<T>));
         if (_isFrozenWeights) return;
         if (_forwardSteps is null)
             throw new InvalidOperationException(
@@ -1170,7 +1174,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 continue;
             }
 
-            var action = BuildSpecializedBackward(step, gradMap, consumerCount, engine, pinnedHandles);
+            // Phase G.12: tell the spec'd MatMul backward to skip its dW
+            // GEMM when this step's dW has been peeled out for batched
+            // dispatch via AppendBatchedDwActions. Without this flag, the
+            // dW GEMM would run twice (once in the per-step backward,
+            // once in the batched-dW append), defeating the optimization
+            // and doubling the dominant backward cost.
+            var action = BuildSpecializedBackward(step, gradMap, consumerCount, engine, pinnedHandles,
+                dWPeeled: dWPeeledIndices.Contains(i));
             if (action != null)
                 backwardActions.Add(action);
             else
@@ -1443,24 +1454,31 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // savings on CPUs without AVX-512-BF16 hardware).
             if (BlasProvider.UseMklBf16 && N <= 1024)
             {
-                // Pre-convert B at compile time. NOTE: this assumes B
-                // doesn't change between Step() calls; for the standard
-                // training loop (weight updates between steps) the BF16
-                // mode would need re-conversion. We gate the entire
-                // mkl-bf16 path on the assumption that the caller knows
-                // their workload — same trust contract as
-                // EnableFrozenWeightOptimizations().
+                // B is converted to BF16 lazily and refreshed whenever B's
+                // version counter (incremented by every in-place mutator)
+                // changes — covers the training loop where the optimizer
+                // mutates weights between Step()s. Frozen-weights callers
+                // get the one-shot conversion they expect; training callers
+                // get correctness at the cost of one BF16 conversion per
+                // step (K*N elements, microseconds).
                 var bBf16 = new ushort[K * N];
-                unsafe
-                {
-                    fixed (float* bSrc = cB)
-                    fixed (ushort* bDst = bBf16)
-                        BlasProvider.Fp32ToBf16Bulk(bSrc, bDst, K * N);
-                }
+                int cachedBVersion = -1;
+                var capInputB = inputB;
                 // Reusable BF16 scratch for A. Sized once; reused per call.
                 var aBf16 = new ushort[M * K];
                 return eng =>
                 {
+                    int bVersion = capInputB.Version;
+                    if (bVersion != cachedBVersion)
+                    {
+                        unsafe
+                        {
+                            fixed (float* bSrc = cB)
+                            fixed (ushort* bDst = bBf16)
+                                BlasProvider.Fp32ToBf16Bulk(bSrc, bDst, K * N);
+                        }
+                        cachedBVersion = bVersion;
+                    }
                     unsafe
                     {
                         fixed (float* aSrc = cA)
@@ -2654,11 +2672,13 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             float[]? cachedDC = null, cachedA = null, cachedB = null, cachedDestA = null, cachedDestB = null;
             int dcOff = 0, aOff = 0, bOff = 0, destAOff = 0, destBOff = 0;
             // Phase G.5: BF16 scratch buffers. Allocated lazily on first
-            // call only when MKL-BF16 is active. cachedBBf16 is converted
-            // once and reused (B is assumed frozen across replays under
-            // the mkl-bf16 trust contract); cachedABf16 and cachedDCBf16
-            // are reused as activations and grads change each step.
+            // call only when MKL-BF16 is active. cachedBBf16 is refreshed
+            // whenever inputB's Version changes (training loops mutate
+            // weights between Step()s); cachedABf16 and cachedDCBf16 are
+            // overwritten every call.
             ushort[]? cachedABf16 = null, cachedBBf16 = null, cachedDCBf16 = null;
+            int cachedBBf16Version = -1;
+            var capInputBForBf16 = inputB;
 
             return eng =>
             {
@@ -2691,18 +2711,27 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 // on N: skip BF16 when N > 1024.
                 if (BlasProvider.UseMklBf16 && N <= 1024)
                 {
-                    // Lazy initialise BF16 scratch + pre-convert B
+                    // Lazy initialise BF16 scratch + (re-)convert B whenever
+                    // inputB's version changes. The version counter is
+                    // incremented by every in-place mutator (e.g.
+                    // optimizer.step), so the BF16 weight image stays in
+                    // sync with the fp32 source even under training.
                     if (cachedABf16 is null)
                     {
                         cachedABf16 = new ushort[M * K];
                         cachedBBf16 = new ushort[K * N];
                         cachedDCBf16 = new ushort[M * N];
+                    }
+                    int bVersion = capInputBForBf16.Version;
+                    if (bVersion != cachedBBf16Version)
+                    {
                         unsafe
                         {
                             fixed (float* bSrc = &cachedB![bOff])
                             fixed (ushort* bDst = cachedBBf16)
                                 BlasProvider.Fp32ToBf16Bulk(bSrc, bDst, K * N);
                         }
+                        cachedBBf16Version = bVersion;
                     }
                     unsafe
                     {
@@ -3785,6 +3814,17 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             if (inputA.Rank < 2 || inputW.Rank != 2) continue;
             if (!inputA.IsContiguous || !inputW.IsContiguous) continue;
 
+            // The analytic backward overwrites gradA and gradW
+            // unconditionally — that's only safe when inputA and inputW
+            // each have exactly one consumer in the graph. A reused
+            // activation or a tied weight has multiple consumers, and
+            // analytic-backward writes would clobber the contributions
+            // from the other consumers. Fall through to the standard
+            // GEMM backward in that case (it accumulates correctly).
+            if ((consumerCount.TryGetValue(inputA, out int aConsumerCount) && aConsumerCount > 1) ||
+                (consumerCount.TryGetValue(inputW, out int wConsumerCount) && wConsumerCount > 1))
+                continue;
+
             int K = inputA._shape[inputA.Rank - 1];
             int V = inputW._shape[1];
             int M = 1;
@@ -3837,7 +3877,13 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 : reduce.OutputBuffer;
             var capRowSum = new float[cK];
             sharedRowSumCache[matmulStepIndex] = capRowSum;
-            bool rowSumComputed = false;
+            // Refresh row_sum_W whenever inputW's version changes. The
+            // version counter is incremented by every in-place mutator
+            // (optimizer.step etc), so this cache stays consistent under
+            // training and only does the K*V scan once per actual weight
+            // update — frozen-weights workloads still get the one-shot
+            // path the comment above promises.
+            int rowSumWVersion = -1;
             // Reference the captures
             int gM = cM, gK = cK, gV = cV;
             var gA = inputA;
@@ -3850,11 +3896,13 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 var aArr = (float[])(object)gA.GetDataArray();
                 var lossArr = (float[])(object)gLoss.GetDataArray();
 
-                // Compute row_sum_W on first call (or whenever weights might
-                // have changed — for the FrozenWeights opt-in this stays
-                // cached forever). For non-frozen training the cost is K*V
-                // reads per Step, dominated by memory bandwidth (~1ms).
-                if (!rowSumComputed)
+                // Compute row_sum_W on first call and whenever weights
+                // change (detected via gW.Version increment from the
+                // optimizer's in-place mutators). Frozen-weights workloads
+                // get the one-shot path; training workloads pay the
+                // K*V scan only when weights actually moved.
+                int wVersion = gW.Version;
+                if (wVersion != rowSumWVersion)
                 {
                     for (int k = 0; k < gK; k++)
                     {
@@ -3863,7 +3911,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         for (int v = 0; v < gV; v++) s += wArr[baseIdx + v];
                         capRowSum[k] = s;
                     }
-                    rowSumComputed = true;
+                    rowSumWVersion = wVersion;
                 }
 
                 // col_sum_x[k] = sum_m A[m, k]. M*K reads, K writes.
@@ -4369,16 +4417,16 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             int M = 1;
             for (int d = 0; d < inputA.Rank - 1; d++) M *= inputA._shape[d];
 
-            // Pre-pack W_fused = W1 @ W2 at compile time. Allocated here
-            // so the closure captures a stable reference. ONE pre-pack
-            // cost (compile-time, never replayed).
+            // Allocate W_fused buffer at compile time. Population is
+            // deferred to the first forward call and refreshed whenever
+            // W1.Version or W2.Version changes (training loops mutate
+            // weights between Step()s, so a one-shot prepack would serve
+            // stale fused weights and silently produce wrong forward
+            // outputs). For frozen-weights workloads, the GEMM only runs
+            // once and is then reused forever.
             var w1Data = (float[])(object)W1.GetDataArray();
             var w2Data = (float[])(object)W2.GetDataArray();
             var wFused = new float[K * N];
-            if (!BlasProvider.TryGemm(K, N, H, w1Data, 0, H, w2Data, 0, N, wFused, 0, N))
-            {
-                SimdGemm.Sgemm(w1Data.AsSpan(0, K * H), w2Data.AsSpan(0, H * N), wFused.AsSpan(0, K * N), K, H, N);
-            }
 
             // Forward: single MatMul input @ W_fused → output. Skip
             // intermediate materialization.
@@ -4388,10 +4436,23 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var capturedW2 = W2;
             int cM = M, cK = K, cH = H, cN = N;
             float[] cWFused = wFused;
+            int wFusedW1Version = -1, wFusedW2Version = -1;
             var capturedGradMap = gradMap;
 
             fusedForward.Add(eng =>
             {
+                int v1 = capturedW1.Version;
+                int v2 = capturedW2.Version;
+                if (v1 != wFusedW1Version || v2 != wFusedW2Version)
+                {
+                    if (!BlasProvider.TryGemm(cK, cN, cH, w1Data, 0, cH, w2Data, 0, cN, cWFused, 0, cN))
+                    {
+                        SimdGemm.Sgemm(w1Data.AsSpan(0, cK * cH), w2Data.AsSpan(0, cH * cN),
+                            cWFused.AsSpan(0, cK * cN), cK, cH, cN);
+                    }
+                    wFusedW1Version = v1;
+                    wFusedW2Version = v2;
+                }
                 var inArr = (float[])(object)capturedInput.GetDataArray();
                 var outArr = (float[])(object)capturedOutput.GetDataArray();
                 if (!BlasProvider.TryGemm(cM, cN, cK, inArr, 0, cK, cWFused, 0, cN, outArr, 0, cN))

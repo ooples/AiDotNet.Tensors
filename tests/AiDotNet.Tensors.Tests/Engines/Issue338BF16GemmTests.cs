@@ -129,10 +129,12 @@ public class Issue338BF16GemmTests
             BlasProvider.TryGemmBf16(M, N, K, aBf16, 0, K, false, bBf16, 0, N, false, cBf16, 0, N);
         }
 
-        // FP32 measurement
+        // FP32 measurement — assert success so a dispatch miss can't be
+        // reported as a misleadingly fast "GEMM" timing.
         var sw = Stopwatch.StartNew();
         for (int i = 0; i < iters; i++)
-            BlasProvider.TryGemm(M, N, K, a, 0, K, b, 0, N, cFp32, 0, N);
+            Assert.True(BlasProvider.TryGemm(M, N, K, a, 0, K, b, 0, N, cFp32, 0, N),
+                "BlasProvider.TryGemm failed during timed FP32 measurement");
         sw.Stop();
         double fp32Ms = sw.Elapsed.TotalMilliseconds / iters;
 
@@ -140,7 +142,8 @@ public class Issue338BF16GemmTests
         // the realistic in-context cost when weights are pre-cached).
         sw = Stopwatch.StartNew();
         for (int i = 0; i < iters; i++)
-            BlasProvider.TryGemmBf16(M, N, K, aBf16, 0, K, false, bBf16, 0, N, false, cBf16, 0, N);
+            Assert.True(BlasProvider.TryGemmBf16(M, N, K, aBf16, 0, K, false, bBf16, 0, N, false, cBf16, 0, N),
+                "BlasProvider.TryGemmBf16 failed during timed BF16 measurement");
         sw.Stop();
         double bf16Ms = sw.Elapsed.TotalMilliseconds / iters;
 

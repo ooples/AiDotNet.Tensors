@@ -55,7 +55,12 @@ internal static class FusedMultiLayerBackward
                 gradOutput, 0, n, false,
                 gradW2, 0, n))
         {
-            // Fallback: manual transposed matmul
+            // Fallback: manual transposed matmul. Zero gradW2 first —
+            // SimdGemm.Sgemm uses beta=0 semantically but doesn't zero
+            // the destination internally for transposed-A paths; the
+            // caller's gradW2 may be reused across steps and carry stale
+            // values from a previous backward.
+            Array.Clear(gradW2, 0, h * n);
             SimdGemm.Sgemm(
                 activated.AsSpan(), h, true,
                 gradOutput.AsSpan(), n, false,
@@ -88,6 +93,8 @@ internal static class FusedMultiLayerBackward
                 w2, 0, n, true,
                 grad_h, 0, h))
         {
+            // workspace may be reused across steps; clear before fallback.
+            Array.Clear(grad_h, 0, requiredSize);
             SimdGemm.Sgemm(
                 gradOutput.AsSpan(), n, false,
                 w2.AsSpan(), n, true,
@@ -108,6 +115,7 @@ internal static class FusedMultiLayerBackward
                 grad_h, 0, h, false,
                 gradW1, 0, h))
         {
+            Array.Clear(gradW1, 0, k * h);
             SimdGemm.Sgemm(
                 input.AsSpan(), k, true,
                 grad_h.AsSpan(), h, false,
@@ -137,6 +145,7 @@ internal static class FusedMultiLayerBackward
                     w1, 0, h, true,
                     gradInput, 0, k))
             {
+                Array.Clear(gradInput, 0, m * k);
                 SimdGemm.Sgemm(
                     grad_h.AsSpan(), h, false,
                     w1.AsSpan(), h, true,
@@ -167,11 +176,25 @@ internal static class FusedMultiLayerBackward
     {
         const float SQRT_2_OVER_PI = 0.7978845608028654f;
         const float COEFF = 0.044715f;
+
+        // NaN in → NaN out (propagate).
+        if (float.IsNaN(x)) return float.NaN;
+
         float xx = x * x;
+        // Large |x| overflows xx and duDx to ±∞ while tanhU saturates at
+        // ±1; the literal formula then evaluates ∞ * 0 → NaN. Return the
+        // asymptotic limit (1 for large positive, 0 for large negative)
+        // before the unstable products fire.
+        if (float.IsInfinity(xx))
+            return x > 0f ? 1f : 0f;
+
         float u = SQRT_2_OVER_PI * (x + COEFF * xx * x);
         float tanhU = MathF.Tanh(u);
         float sech2U = 1f - tanhU * tanhU;
         float duDx = SQRT_2_OVER_PI * (1f + 3f * COEFF * xx);
+        if (float.IsInfinity(u) || float.IsInfinity(duDx))
+            return x > 0f ? 1f : 0f;
+
         return 0.5f * (1f + tanhU) + 0.5f * x * sech2U * duDx;
     }
 
@@ -206,6 +229,10 @@ internal static class FusedMultiLayerBackward
                 gradOutput, 0, n, false,
                 gradW2, 0, n))
         {
+            // SimdGemm.Sgemm assumes beta=0 destination; gradW2 is caller-
+            // owned and may carry values from a previous backward. Clear
+            // before writing.
+            Array.Clear(gradW2, 0, h * n);
             SimdGemm.Sgemm(
                 activated.AsSpan(), h, true,
                 gradOutput.AsSpan(), n, false,
@@ -237,6 +264,8 @@ internal static class FusedMultiLayerBackward
                 w2, 0, n, true,
                 grad_h, 0, h))
         {
+            // workspace may be reused across steps; clear before fallback.
+            Array.Clear(grad_h, 0, requiredSize);
             SimdGemm.Sgemm(
                 gradOutput.AsSpan(), n, false,
                 w2.AsSpan(), n, true,
@@ -258,6 +287,7 @@ internal static class FusedMultiLayerBackward
                 grad_h, 0, h, false,
                 gradW1, 0, h))
         {
+            Array.Clear(gradW1, 0, k * h);
             SimdGemm.Sgemm(
                 input.AsSpan(), k, true,
                 grad_h.AsSpan(), h, false,
@@ -287,6 +317,7 @@ internal static class FusedMultiLayerBackward
                     w1, 0, h, true,
                     gradInput, 0, k))
             {
+                Array.Clear(gradInput, 0, m * k);
                 SimdGemm.Sgemm(
                     grad_h.AsSpan(), h, false,
                     w1.AsSpan(), h, true,

@@ -374,11 +374,23 @@ internal static class BlasProvider
         catch { return false; }
     }
 
-    /// <summary>True iff <c>AIDOTNET_BLAS_PROVIDER=mkl-bf16</c> at process start.</summary>
-    private static readonly bool _preferMklBf16 = string.Equals(
-        Environment.GetEnvironmentVariable("AIDOTNET_BLAS_PROVIDER"),
-        "mkl-bf16",
-        StringComparison.OrdinalIgnoreCase);
+    /// <summary>
+    /// True iff <c>AIDOTNET_BLAS_PROVIDER=mkl-bf16</c> OR
+    /// <c>mkl-bf16-force</c> at process start. The force variant also
+    /// flips this on — without that, ProbeMklBf16Library's leading
+    /// `if (!_preferMklBf16) return false;` guard short-circuits before
+    /// the force bypass deeper in the probe can engage, and UseMklBf16
+    /// stays false forever.
+    /// </summary>
+    private static readonly bool _preferMklBf16 =
+        string.Equals(
+            Environment.GetEnvironmentVariable("AIDOTNET_BLAS_PROVIDER"),
+            "mkl-bf16",
+            StringComparison.OrdinalIgnoreCase)
+        || string.Equals(
+            Environment.GetEnvironmentVariable("AIDOTNET_BLAS_PROVIDER"),
+            "mkl-bf16-force",
+            StringComparison.OrdinalIgnoreCase);
 
     /// <summary>Resolved lazily on first use — probes mkl_rt.3 BF16 GEMM once.</summary>
     private static readonly Lazy<bool> _mklBf16Available = new(ProbeMklBf16Library);
@@ -560,7 +572,13 @@ internal static class BlasProvider
                 1, 1, 1, 1.0f, &a, 1, &b, 1, 0.0f, &c, 1);
             if (Math.Abs(c - 6.0f) > 0.01f) return false;
 
-            // Force-on bypass for testing on slow CPUs.
+            // Force-on bypass for testing on slow CPUs. Also the
+            // supported workaround for minimal-deploy scenarios that
+            // exclude Microsoft.ML.Mkl.Redist (MklImports.dll) — the
+            // FP32 speed gate below imports cblas_sgemm from MklImports,
+            // so without that DLL the speed gate's `mkl_cblas_sgemm_ptr`
+            // call throws DllNotFoundException. mkl-bf16-force bypasses
+            // the speed comparison entirely and trusts mkl_rt.3 alone.
             if (string.Equals(
                 Environment.GetEnvironmentVariable("AIDOTNET_BLAS_PROVIDER"),
                 "mkl-bf16-force",
@@ -569,47 +587,73 @@ internal static class BlasProvider
                 return true;
             }
 
-            // Speed smoke test: 256×256×256 GEMM, FP32 vs BF16.
-            const int K = 256;
-            var aFp32 = new float[K * K];
-            var bFp32 = new float[K * K];
-            for (int i = 0; i < K * K; i++) { aFp32[i] = 0.001f * (i & 0xff); bFp32[i] = 0.002f * (i & 0xff); }
-            var aBf = new ushort[K * K];
-            var bBf = new ushort[K * K];
-            fixed (float* aSrc = aFp32) fixed (ushort* aDst = aBf) Fp32ToBf16Bulk(aSrc, aDst, K * K);
-            fixed (float* bSrc = bFp32) fixed (ushort* bDst = bBf) Fp32ToBf16Bulk(bSrc, bDst, K * K);
-            var cOut = new float[K * K];
-
-            // Warmup
-            for (int w = 0; w < 3; w++)
+            // Speed smoke test: 256×256×256 GEMM, FP32 vs BF16. The FP32
+            // side imports from MklImports (Microsoft.ML.Mkl.Redist). When
+            // that DLL is absent (minimal-deploy: only mkl_rt.3 / full
+            // intelmkl.redist shipped), the speed gate can't run — but
+            // BF16 itself is fully functional from mkl_rt.3. In that case
+            // we still enable BF16: the user has explicitly opted in via
+            // `mkl-bf16`, and the absent FP32 baseline is precisely the
+            // configuration where BF16 is the only fast option anyway.
+            try
             {
-                fixed (float* pa = aFp32) fixed (float* pb = bFp32) fixed (float* pc = cOut)
-                    mkl_cblas_sgemm_ptr(CblasRowMajor, CblasNoTrans, CblasNoTrans, K, K, K, 1f, pa, K, pb, K, 0f, pc, K);
-                fixed (ushort* pa = aBf) fixed (ushort* pb = bBf) fixed (float* pc = cOut)
-                    mkl_cblas_gemm_bf16bf16f32_ptr(CblasRowMajor, CblasNoTrans, CblasNoTrans, K, K, K, 1f, pa, K, pb, K, 0f, pc, K);
+                const int K = 256;
+                var aFp32 = new float[K * K];
+                var bFp32 = new float[K * K];
+                for (int i = 0; i < K * K; i++) { aFp32[i] = 0.001f * (i & 0xff); bFp32[i] = 0.002f * (i & 0xff); }
+                var aBf = new ushort[K * K];
+                var bBf = new ushort[K * K];
+                fixed (float* aSrc = aFp32) fixed (ushort* aDst = aBf) Fp32ToBf16Bulk(aSrc, aDst, K * K);
+                fixed (float* bSrc = bFp32) fixed (ushort* bDst = bBf) Fp32ToBf16Bulk(bSrc, bDst, K * K);
+                var cOut = new float[K * K];
+
+                // Warmup
+                for (int w = 0; w < 3; w++)
+                {
+                    fixed (float* pa = aFp32) fixed (float* pb = bFp32) fixed (float* pc = cOut)
+                        mkl_cblas_sgemm_ptr(CblasRowMajor, CblasNoTrans, CblasNoTrans, K, K, K, 1f, pa, K, pb, K, 0f, pc, K);
+                    fixed (ushort* pa = aBf) fixed (ushort* pb = bBf) fixed (float* pc = cOut)
+                        mkl_cblas_gemm_bf16bf16f32_ptr(CblasRowMajor, CblasNoTrans, CblasNoTrans, K, K, K, 1f, pa, K, pb, K, 0f, pc, K);
+                }
+
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                for (int i = 0; i < 20; i++)
+                    fixed (float* pa = aFp32) fixed (float* pb = bFp32) fixed (float* pc = cOut)
+                        mkl_cblas_sgemm_ptr(CblasRowMajor, CblasNoTrans, CblasNoTrans, K, K, K, 1f, pa, K, pb, K, 0f, pc, K);
+                sw.Stop();
+                double fp32Ms = sw.Elapsed.TotalMilliseconds;
+
+                sw = System.Diagnostics.Stopwatch.StartNew();
+                for (int i = 0; i < 20; i++)
+                    fixed (ushort* pa = aBf) fixed (ushort* pb = bBf) fixed (float* pc = cOut)
+                        mkl_cblas_gemm_bf16bf16f32_ptr(CblasRowMajor, CblasNoTrans, CblasNoTrans, K, K, K, 1f, pa, K, pb, K, 0f, pc, K);
+                sw.Stop();
+                double bf16Ms = sw.Elapsed.TotalMilliseconds;
+
+                // Require BF16 to be ≥1.3× faster than FP32. On AVX-512-BF16
+                // capable Intel CPUs this gate passes easily; on CPUs without
+                // dedicated BF16 hardware it fails and we fall back to FP32.
+                bool fastEnough = bf16Ms * 1.3 < fp32Ms;
+                if (Environment.GetEnvironmentVariable("AIDOTNET_BF16_PROBE_DEBUG") == "1")
+                    Console.WriteLine($"[BF16 Probe] FP32={fp32Ms:F2}ms, BF16={bf16Ms:F2}ms, 1.3× gate: {fastEnough} (need BF16 × 1.3 < FP32)");
+                return fastEnough;
             }
-
-            var sw = System.Diagnostics.Stopwatch.StartNew();
-            for (int i = 0; i < 20; i++)
-                fixed (float* pa = aFp32) fixed (float* pb = bFp32) fixed (float* pc = cOut)
-                    mkl_cblas_sgemm_ptr(CblasRowMajor, CblasNoTrans, CblasNoTrans, K, K, K, 1f, pa, K, pb, K, 0f, pc, K);
-            sw.Stop();
-            double fp32Ms = sw.Elapsed.TotalMilliseconds;
-
-            sw = System.Diagnostics.Stopwatch.StartNew();
-            for (int i = 0; i < 20; i++)
-                fixed (ushort* pa = aBf) fixed (ushort* pb = bBf) fixed (float* pc = cOut)
-                    mkl_cblas_gemm_bf16bf16f32_ptr(CblasRowMajor, CblasNoTrans, CblasNoTrans, K, K, K, 1f, pa, K, pb, K, 0f, pc, K);
-            sw.Stop();
-            double bf16Ms = sw.Elapsed.TotalMilliseconds;
-
-            // Require BF16 to be ≥1.3× faster than FP32. On AVX-512-BF16
-            // capable Intel CPUs this gate passes easily; on CPUs without
-            // dedicated BF16 hardware it fails and we fall back to FP32.
-            bool fastEnough = bf16Ms * 1.3 < fp32Ms;
-            if (Environment.GetEnvironmentVariable("AIDOTNET_BF16_PROBE_DEBUG") == "1")
-                Console.WriteLine($"[BF16 Probe] FP32={fp32Ms:F2}ms, BF16={bf16Ms:F2}ms, 1.3× gate: {fastEnough} (need BF16 × 1.3 < FP32)");
-            return fastEnough;
+            catch (DllNotFoundException)
+            {
+                // MklImports.dll absent — minimal-deploy scenario. BF16
+                // itself (probed above via mkl_rt.3) is fine; honour the
+                // user's explicit opt-in. Equivalent to mkl-bf16-force
+                // without requiring the env var change.
+                if (Environment.GetEnvironmentVariable("AIDOTNET_BF16_PROBE_DEBUG") == "1")
+                    Console.WriteLine("[BF16 Probe] FP32 baseline unavailable (MklImports missing); enabling BF16 unconditionally.");
+                return true;
+            }
+            catch (EntryPointNotFoundException)
+            {
+                if (Environment.GetEnvironmentVariable("AIDOTNET_BF16_PROBE_DEBUG") == "1")
+                    Console.WriteLine("[BF16 Probe] FP32 entry point missing; enabling BF16 unconditionally.");
+                return true;
+            }
         }
         catch (DllNotFoundException) { return false; }
         catch (EntryPointNotFoundException) { return false; }
@@ -620,11 +664,23 @@ internal static class BlasProvider
     /// FP32 → BF16 conversion: take the top 16 bits of the float bit pattern.
     /// Uses round-to-nearest-even for better numerical accuracy than naive
     /// truncation. Matches the IEEE 754 BF16 (8-bit exp, 7-bit mantissa).
+    /// NaN inputs are preserved as BF16 NaN (not silently rounded into ±∞)
+    /// so numerical failure semantics carry through the BF16 path.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static unsafe ushort Fp32ToBf16(float x)
     {
         uint bits = *(uint*)&x;
+        // NaN preservation: round-to-nearest-even on a bit pattern like
+        // 0x7F800001 (smallest signalling NaN) carries into the exponent
+        // and turns it into 0x7F80 — a BF16 infinity. Special-case NaNs
+        // (abs(bits) > 0x7F800000) before rounding: keep the sign bit
+        // and top-16 of the source, force a non-zero mantissa bit
+        // (0x0040 — the BF16 quiet-NaN bit) so the result remains NaN.
+        uint abs = bits & 0x7FFFFFFFu;
+        if (abs > 0x7F800000u)
+            return (ushort)((bits >> 16) | 0x0040u);
+
         // Round to nearest even: add half-ULP plus odd-bit detector.
         uint rounding_bias = 0x7FFFu + ((bits >> 16) & 1u);
         uint rounded = bits + rounding_bias;
@@ -648,8 +704,12 @@ internal static class BlasProvider
             // Vector128<ushort>. The conversion is "take top 16 bits with
             // round-to-nearest-even" — vectorized as:
             //   r = (bits + 0x7FFF + ((bits >> 16) & 1)) >> 16
+            // with a NaN-preservation overlay matching scalar Fp32ToBf16.
             var c7fff = System.Runtime.Intrinsics.Vector256.Create((int)0x7FFF);
             var c1 = System.Runtime.Intrinsics.Vector256.Create((int)1);
+            var cAbsMask = System.Runtime.Intrinsics.Vector256.Create((int)0x7FFFFFFF);
+            var cInfBits = System.Runtime.Intrinsics.Vector256.Create((int)0x7F800000);
+            var cQuietNan = System.Runtime.Intrinsics.Vector256.Create((int)0x0040);
             for (; i + 8 <= count; i += 8)
             {
                 var bits = System.Runtime.Intrinsics.X86.Avx.LoadVector256((int*)(src + i));
@@ -658,10 +718,21 @@ internal static class BlasProvider
                 var bias = System.Runtime.Intrinsics.X86.Avx2.Add(c7fff, oddBit);
                 var rounded = System.Runtime.Intrinsics.X86.Avx2.Add(bits, bias);
                 var hi16 = System.Runtime.Intrinsics.X86.Avx2.ShiftRightLogical(rounded, 16);
+
+                // NaN mask: abs(bits) > 0x7F800000. AVX2 CompareGreaterThan
+                // is signed only — abs strips the sign so the comparison is
+                // safe on non-negative results.
+                var absBits = System.Runtime.Intrinsics.X86.Avx2.And(bits, cAbsMask);
+                var nanMask = System.Runtime.Intrinsics.X86.Avx2.CompareGreaterThan(absBits, cInfBits);
+                // BF16-NaN preserve: top-16 of source OR'd with the quiet
+                // bit, narrowed below alongside hi16. Blend lane-wise.
+                var nanHi16 = System.Runtime.Intrinsics.X86.Avx2.Or(shifted, cQuietNan);
+                var merged = System.Runtime.Intrinsics.X86.Avx2.BlendVariable(hi16, nanHi16, nanMask);
+
                 // Pack 8 ints (low 16 bits each) into 8 ushorts via shuffle.
                 // PackUnsignedSaturate handles the narrowing.
-                var lo = System.Runtime.Intrinsics.Vector256.GetLower(hi16);
-                var hi = System.Runtime.Intrinsics.Vector256.GetUpper(hi16);
+                var lo = System.Runtime.Intrinsics.Vector256.GetLower(merged);
+                var hi = System.Runtime.Intrinsics.Vector256.GetUpper(merged);
                 var packed = System.Runtime.Intrinsics.X86.Sse41.PackUnsignedSaturate(lo, hi);
                 System.Runtime.Intrinsics.X86.Sse2.Store(dst + i, packed);
             }

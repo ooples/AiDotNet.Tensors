@@ -117,10 +117,18 @@ public class Issue338PhaseGCoverageTests
         var name = BlasProvider.BackendName;
         Assert.False(string.IsNullOrEmpty(name));
         // IsAvailable should match the BackendName's "loaded" form.
-        // Both states are valid; just verify they're consistent.
+        // Both OpenBLAS and MKL (Phase G.1 routing) are valid backends;
+        // accept either rather than hard-coding to OpenBLAS, which would
+        // fail in MKL-enabled CI matrices.
         bool available = BlasProvider.IsAvailable;
         if (available)
-            Assert.Contains("OpenBLAS", name, StringComparison.OrdinalIgnoreCase);
+        {
+            bool isKnownBackend =
+                name.Contains("OpenBLAS", StringComparison.OrdinalIgnoreCase) ||
+                name.Contains("MKL", StringComparison.OrdinalIgnoreCase);
+            Assert.True(isKnownBackend,
+                $"Unexpected available BLAS backend name: '{name}'.");
+        }
     }
 
     /// <summary>

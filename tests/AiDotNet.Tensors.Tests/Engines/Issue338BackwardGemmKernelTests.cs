@@ -68,8 +68,15 @@ public class Issue338BackwardGemmKernelTests
             var sw = Stopwatch.StartNew();
             for (int i = 0; i < iters; i++)
             {
-                BlasProvider.TryGemmEx(M, K, N, dC, 0, N, false, Bg, 0, N, true, gradA, 0, K);
-                BlasProvider.TryGemmEx(K, N, M, Ag, 0, K, true, dC, 0, N, false, gradB, 0, N);
+                // Fail fast on a dispatch miss — otherwise the timer reports
+                // the cost of returning false instead of GEMM work, which
+                // makes the kernel-comparison numbers misleading.
+                Assert.True(
+                    BlasProvider.TryGemmEx(M, K, N, dC, 0, N, false, Bg, 0, N, true, gradA, 0, K),
+                    "BlasProvider.TryGemmEx (dA = dC @ B^T) failed during timed measurement");
+                Assert.True(
+                    BlasProvider.TryGemmEx(K, N, M, Ag, 0, K, true, dC, 0, N, false, gradB, 0, N),
+                    "BlasProvider.TryGemmEx (dB = A^T @ dC) failed during timed measurement");
             }
             sw.Stop();
             blasMsPerIter = sw.Elapsed.TotalMilliseconds / iters;
