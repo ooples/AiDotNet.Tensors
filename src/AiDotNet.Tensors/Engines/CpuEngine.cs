@@ -13493,12 +13493,32 @@ public partial class CpuEngine : ITensorLevelEngine
         // VAE decoder — directly in the #162 timing-out list — plus diffusion
         // UNet upsample decoder blocks hit this op in every forward pass.
         // ────────────────────────────────────────────────────────────────────
+        // ────────────────────────────────────────────────────────────────────
+        // BLAS GEMM + Col2Im fast path. ConvTranspose2D is the adjoint of
+        // Conv2D, so the forward decomposes into a dense GEMM
+        // (kernel^T @ input) followed by Col2ImAccumulate — the same
+        // im2col+GEMM machinery as forward Conv2D, with the scatter step
+        // doing inverse spatial indexing. Dispatches to MKL/OpenBLAS at
+        // ~5-10 GFLOPS instead of the naive 7-nested loop at <1 GFLOPS.
+        // Falls through to the naive path if BLAS is unavailable.
+        // ────────────────────────────────────────────────────────────────────
         if (typeof(T) == typeof(float))
         {
             var fInput = (float[])(object)inputData;
             var fKernel = (float[])(object)kernelData;
             var fOutput = (float[])(object)outputData;
 
+            if (Helpers.Im2ColHelper.TryConvTranspose2DWithGemm(
+                    fInput, fKernel, fOutput,
+                    batch, inChannels, height, width,
+                    outChannels, kernelHeight, kernelWidth,
+                    strideH, strideW, padH, padW,
+                    outputHeight, outputWidth))
+            {
+                // BLAS path succeeded — skip the naive fallback.
+            }
+            else
+            {
             CpuParallelSettings.ParallelForOrSerial(0, batch * outChannels, fOutput.Length, idx =>
             {
                 int b = idx / outChannels;
@@ -13533,6 +13553,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     }
                 }
             });
+            }
         }
         else if (typeof(T) == typeof(double))
         {
@@ -13540,6 +13561,17 @@ public partial class CpuEngine : ITensorLevelEngine
             var dKernel = (double[])(object)kernelData;
             var dOutput = (double[])(object)outputData;
 
+            if (Helpers.Im2ColHelper.TryConvTranspose2DWithGemm(
+                    dInput, dKernel, dOutput,
+                    batch, inChannels, height, width,
+                    outChannels, kernelHeight, kernelWidth,
+                    strideH, strideW, padH, padW,
+                    outputHeight, outputWidth))
+            {
+                // BLAS path succeeded — skip the naive fallback.
+            }
+            else
+            {
             CpuParallelSettings.ParallelForOrSerial(0, batch * outChannels, dOutput.Length, idx =>
             {
                 int b = idx / outChannels;
@@ -13574,6 +13606,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     }
                 }
             });
+            }
         }
         else
         {
@@ -13669,147 +13702,22 @@ public partial class CpuEngine : ITensorLevelEngine
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
         if (input == null) throw new ArgumentNullException(nameof(input));
 
-        var numOps = MathHelper.GetNumericOperations<T>();
-
-        int batch = input._shape[0];
-        int inChannels = input._shape[1];
-        int height = input._shape[2];
-        int width = input._shape[3];
-
-        int outChannels = kernelShape[1];
-        int kernelHeight = kernelShape[2];
-        int kernelWidth = kernelShape[3];
-
-        int strideH = stride[0], strideW = stride[1];
-        int padH = padding[0], padW = padding[1];
-
-        int outputHeight = gradOutput._shape[2];
-        int outputWidth = gradOutput._shape[3];
-
-        var gradKernel = new T[inChannels * outChannels * kernelHeight * kernelWidth];
-        var gradOutputData = gradOutput.GetFlattenedData();
-        var inputData = input.GetFlattenedData();
-
-        // Parallelize over inChannels*outChannels since each (ic, oc) pair writes
-        // a disjoint [kernelHeight × kernelWidth] kernel slice. Primitive fast
-        // paths skip virtual dispatch for float/double.
-        int pairs = inChannels * outChannels;
-
-        if (typeof(T) == typeof(float))
-        {
-            var fGradOut = (float[])(object)gradOutputData;
-            var fInput = (float[])(object)inputData;
-            var fGradKernel = (float[])(object)gradKernel;
-            CpuParallelSettings.ParallelForOrSerial(0, pairs, fGradKernel.Length, pair =>
-            {
-                int ic = pair / outChannels;
-                int oc = pair % outChannels;
-                for (int kh = 0; kh < kernelHeight; kh++)
-                {
-                    for (int kw = 0; kw < kernelWidth; kw++)
-                    {
-                        float sum = 0f;
-                        for (int b = 0; b < batch; b++)
-                        {
-                            for (int ih = 0; ih < height; ih++)
-                            {
-                                int oh = ih * strideH - padH + kh;
-                                if (oh < 0 || oh >= outputHeight) continue;
-                                for (int iw = 0; iw < width; iw++)
-                                {
-                                    int ow = iw * strideW - padW + kw;
-                                    if (ow < 0 || ow >= outputWidth) continue;
-                                    int gradOutIdx = ((b * outChannels + oc) * outputHeight + oh) * outputWidth + ow;
-                                    int inputIdx = ((b * inChannels + ic) * height + ih) * width + iw;
-                                    sum += fGradOut[gradOutIdx] * fInput[inputIdx];
-                                }
-                            }
-                        }
-                        int kernelIdx = ((ic * outChannels + oc) * kernelHeight + kh) * kernelWidth + kw;
-                        fGradKernel[kernelIdx] = sum;
-                    }
-                }
-            });
-        }
-        else if (typeof(T) == typeof(double))
-        {
-            var dGradOut = (double[])(object)gradOutputData;
-            var dInput = (double[])(object)inputData;
-            var dGradKernel = (double[])(object)gradKernel;
-            CpuParallelSettings.ParallelForOrSerial(0, pairs, dGradKernel.Length, pair =>
-            {
-                int ic = pair / outChannels;
-                int oc = pair % outChannels;
-                for (int kh = 0; kh < kernelHeight; kh++)
-                {
-                    for (int kw = 0; kw < kernelWidth; kw++)
-                    {
-                        double sum = 0.0;
-                        for (int b = 0; b < batch; b++)
-                        {
-                            for (int ih = 0; ih < height; ih++)
-                            {
-                                int oh = ih * strideH - padH + kh;
-                                if (oh < 0 || oh >= outputHeight) continue;
-                                for (int iw = 0; iw < width; iw++)
-                                {
-                                    int ow = iw * strideW - padW + kw;
-                                    if (ow < 0 || ow >= outputWidth) continue;
-                                    int gradOutIdx = ((b * outChannels + oc) * outputHeight + oh) * outputWidth + ow;
-                                    int inputIdx = ((b * inChannels + ic) * height + ih) * width + iw;
-                                    sum += dGradOut[gradOutIdx] * dInput[inputIdx];
-                                }
-                            }
-                        }
-                        int kernelIdx = ((ic * outChannels + oc) * kernelHeight + kh) * kernelWidth + kw;
-                        dGradKernel[kernelIdx] = sum;
-                    }
-                }
-            });
-        }
-        else
-        {
-            for (int i = 0; i < gradKernel.Length; i++)
-                gradKernel[i] = numOps.Zero;
-
-            for (int ic = 0; ic < inChannels; ic++)
-            {
-                for (int oc = 0; oc < outChannels; oc++)
-                {
-                    for (int kh = 0; kh < kernelHeight; kh++)
-                    {
-                        for (int kw = 0; kw < kernelWidth; kw++)
-                        {
-                            T sum = numOps.Zero;
-
-                            for (int b = 0; b < batch; b++)
-                            {
-                                for (int ih = 0; ih < height; ih++)
-                                {
-                                    for (int iw = 0; iw < width; iw++)
-                                    {
-                                        int oh = ih * strideH - padH + kh;
-                                        int ow = iw * strideW - padW + kw;
-
-                                        if (oh >= 0 && oh < outputHeight && ow >= 0 && ow < outputWidth)
-                                        {
-                                            int gradOutIdx = ((b * outChannels + oc) * outputHeight + oh) * outputWidth + ow;
-                                            int inputIdx = ((b * inChannels + ic) * height + ih) * width + iw;
-                                            sum = numOps.Add(sum, numOps.Multiply(gradOutputData[gradOutIdx], inputData[inputIdx]));
-                                        }
-                                    }
-                                }
-                            }
-
-                            int kernelIdx = ((ic * outChannels + oc) * kernelHeight + kh) * kernelWidth + kw;
-                            gradKernel[kernelIdx] = sum;
-                        }
-                    }
-                }
-            }
-        }
-
-        return TensorAllocator.Rent<T>(kernelShape, gradKernel);
+        // ConvTranspose2D is the adjoint of Conv2D — its backward-w.r.t.-kernel
+        // is mathematically identical to Conv2DBackwardKernel with input and
+        // gradOutput swapped. Concretely both reduce to:
+        //   gradK[c_small, c_big, kh, kw] =
+        //     Σ_b Σ_(h,w in SMALL spatial) small[b, c_small, h, w] *
+        //                                  big[b, c_big, h*s-p+kh, w*s-p+kw]
+        // where SMALL is ConvTrans-input / Conv2D-gradOutput and BIG is
+        // ConvTrans-gradOutput / Conv2D-input. The forward shape relationship
+        // is consistent in both directions (ConvTrans gradOutH = (inH-1)*s-2p+kH
+        // ⇔ Conv2D outH = (inH+2p-kH)/s+1), so the same indices line up.
+        // Delegating reuses Conv2DBackwardKernel's im2col + GEMM-with-transpose
+        // fast path (MKL/OpenBLAS-dispatched for float and double) instead of
+        // the previous 6-nested naive loop. The result tensor shape is
+        // [outChannels=Ci_trans, inChannels=Co_trans, kH, kW] — exactly the
+        // ConvTranspose kernel layout the caller expects.
+        return Conv2DBackwardKernel(input, gradOutput, kernelShape, stride, padding, new[] { 1, 1 });
     }
 
     #region Deformable Convolution Operations
