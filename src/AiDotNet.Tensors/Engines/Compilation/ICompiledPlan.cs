@@ -471,6 +471,31 @@ public interface ICompiledTrainingPlan<T> : IDisposable
         float weightDecay = 0f);
 
     /// <summary>
+    /// Issue #338 Phase G.4: Enables pre-packed-B caching on the forward
+    /// MatMul fast paths. The compiled training plan defaults to
+    /// <c>allowCachedB=false</c> (PackB on every call) because the
+    /// standard training loop mutates weights in-place between
+    /// <see cref="Step"/> calls and a cached pre-pack would serve stale
+    /// data. Callers that hold weights frozen (evaluation passes, inference
+    /// loops, fine-tuning that freezes a subset of parameters, benchmark
+    /// rigs) can opt into the pre-pack cache to amortise PackB cost across
+    /// replays.
+    /// <para>
+    /// MUST be called BEFORE the first <see cref="Step"/> on a fresh plan.
+    /// After this is set, <b>any in-place weight mutation invalidates the
+    /// cached pack and produces wrong forward outputs</b> — opt-in is
+    /// purely an unsafe contract with the caller.
+    /// </para>
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>BINARY/SOURCE-BREAKING CHANGE WARNING (issue #338):</b> same
+    /// rationale as <see cref="EnableCheckpointing"/>.
+    /// </para>
+    /// </remarks>
+    void EnableFrozenWeightOptimizations();
+
+    /// <summary>
     /// Enables gradient checkpointing for this plan, reducing activation memory from
     /// O(N) to O(sqrt(N)) at the cost of ~33% more compute (each segment's forward
     /// runs twice during backward). Call once after compilation, before the training loop.

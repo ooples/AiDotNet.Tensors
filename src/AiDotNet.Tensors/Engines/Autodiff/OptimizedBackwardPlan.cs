@@ -107,10 +107,15 @@ internal sealed class OptimizedBackwardPlan<T>
                 if (TryOptimizedMatMulBackward(ref entry, gradOutput, cse, grads))
                     continue;
 
-                // Default path: use the original backward function
+                // Default path: use the original backward function.
+                // Phase A (#338) timing wrapper records per-op ticks when
+                // AIDOTNET_BWD_TIMING=1.
                 var inputsArray = entry.GetInputsArray();
+                long _bwdStart = BackwardTiming.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
                 entry.Backward(gradOutput, inputsArray, entry.Output,
                     entry.SavedState ?? Array.Empty<object>(), _engine, grads);
+                if (BackwardTiming.Enabled)
+                    BackwardTiming.Record(entry.Backward.Method.Name, System.Diagnostics.Stopwatch.GetTimestamp() - _bwdStart);
             }
         }
         finally

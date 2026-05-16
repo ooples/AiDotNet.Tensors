@@ -32,9 +32,20 @@ internal static class BackwardTiming
 
     internal static void DumpAndReset()
     {
+        DumpAndReset(Console.WriteLine);
+    }
+
+    /// <summary>
+    /// Phase A profiling (#338): emits the per-op breakdown via the
+    /// caller-supplied writer in table format. Default Console writer
+    /// preserves the legacy behaviour; tests can pass an xUnit
+    /// <c>ITestOutputHelper.WriteLine</c>-style delegate.
+    /// </summary>
+    internal static void DumpAndReset(Action<string> writer)
+    {
         if (!_enabled || _aggregator is null) return;
-        Console.WriteLine();
-        Console.WriteLine($"{"Backward op",-40}{"calls",10}{"total ms",14}{"avg µs",14}");
+        writer(string.Empty);
+        writer($"{"Backward op",-40}{"calls",10}{"total ms",14}{"avg µs",14}");
         long totalTicks = 0;
         int totalCalls = 0;
         foreach (var kv in _aggregator) { totalTicks += kv.Value.ticks; totalCalls += kv.Value.calls; }
@@ -45,9 +56,34 @@ internal static class BackwardTiming
         {
             double ms = ticks * 1000.0 / Stopwatch.Frequency;
             double us = ticks * 1_000_000.0 / Stopwatch.Frequency / calls;
-            Console.WriteLine($"{op,-40}{calls,10}{ms,14:F3}{us,14:F1}");
+            writer($"{op,-40}{calls,10}{ms,14:F3}{us,14:F1}");
         }
-        Console.WriteLine($"{"TOTAL",-40}{totalCalls,10}{totalTicks * 1000.0 / Stopwatch.Frequency,14:F3}");
+        writer($"{"TOTAL",-40}{totalCalls,10}{totalTicks * 1000.0 / Stopwatch.Frequency,14:F3}");
+        _aggregator.Clear();
+    }
+
+    /// <summary>
+    /// Phase A profiling (#338): emits the per-op breakdown as CSV
+    /// rows. Format: <c>function,calls,total_ticks,total_ms,pct_of_total</c>.
+    /// Sorted by total_ticks descending. The aggregator is RESET after
+    /// emission (consistent with <see cref="DumpAndReset()"/>).
+    /// </summary>
+    internal static void DumpAndResetCsv(Action<string> writer)
+    {
+        if (!_enabled || _aggregator is null) return;
+        long totalTicks = 0;
+        foreach (var kv in _aggregator) totalTicks += kv.Value.ticks;
+        writer("function,calls,total_ticks,total_ms,pct_of_total");
+        var sorted = new List<(string op, long ticks, int calls)>();
+        foreach (var kv in _aggregator) sorted.Add((kv.Key, kv.Value.ticks, kv.Value.calls));
+        sorted.Sort((a, b) => b.ticks.CompareTo(a.ticks));
+        double freqMs = 1000.0 / Stopwatch.Frequency;
+        foreach (var (op, ticks, calls) in sorted)
+        {
+            double ms = ticks * freqMs;
+            double pct = totalTicks > 0 ? 100.0 * ticks / totalTicks : 0.0;
+            writer($"{op},{calls},{ticks},{ms:F3},{pct:F2}");
+        }
         _aggregator.Clear();
     }
 }

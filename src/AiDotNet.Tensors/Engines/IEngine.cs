@@ -5472,6 +5472,26 @@ public interface IEngine
         where TIndex : unmanaged;
 
     /// <summary>
+    /// AiDotNet#1331 variant of <see cref="TensorEmbeddingLookup{TValue, TIndex}"/> that takes
+    /// indices as a <see cref="Tensor{T}"/> of the SAME numeric type as <paramref name="embeddings"/>.
+    /// Indices are converted to integers (via rounding) at the moment of read — under
+    /// <see cref="Compilation.GraphMode"/> this happens on every <c>plan.Step()</c> replay, so a
+    /// compiled training plan that updates the captured float-input tensor's data in place
+    /// (the canonical multi-batch <c>Train(input_k, target_k)</c> pattern) will see fresh
+    /// integer indices on every step. The standard <c>TensorEmbeddingLookup&lt;TValue, TIndex&gt;</c>
+    /// snapshots indices at trace time and is therefore unsafe for that pattern when the
+    /// indices tensor itself isn't a graph-tracked leaf.
+    /// </summary>
+    /// <typeparam name="T">Numeric type of embeddings and float-indices.</typeparam>
+    /// <param name="embeddings">Embedding table of shape [vocab_size, embedding_dim].</param>
+    /// <param name="floatIndices">Index tensor whose values are interpreted as integers
+    /// after rounding. Captured by reference under GraphMode; the caller must keep the
+    /// tensor alive and update its data in place between plan.Step calls if dynamic
+    /// indices are required.</param>
+    /// <returns>Tensor of shape [*floatIndices.shape, embedding_dim] holding the gathered rows.</returns>
+    Tensor<T> TensorEmbeddingLookupFromFloatIndices<T>(Tensor<T> embeddings, Tensor<T> floatIndices);
+
+    /// <summary>
     /// Performs embedding lookup backward pass - scatters gradients back to embedding table.
     /// </summary>
     /// <typeparam name="TValue">The numeric type of gradient and embedding values.</typeparam>

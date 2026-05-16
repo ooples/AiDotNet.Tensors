@@ -16,6 +16,11 @@ using Xunit.Abstractions;
 
 namespace AiDotNet.Tensors.Tests.Engines;
 
+// Shares EngineCurrentGlobalState (defined in CompiledBackwardWalkTests.cs)
+// so the two classes can't interleave their AiDotNetEngine.Current pins +
+// CompiledBackwardWalk override toggles + walker-cache state on xUnit's
+// parallel runner.
+[Collection("EngineCurrentGlobalState")]
 public class Issue327TransformerTrainPerfTests
 {
     private readonly ITestOutputHelper _output;
@@ -197,6 +202,362 @@ public class Issue327TransformerTrainPerfTests
             Assert.True(msPerIter <= 500.0,
                 $"Issue #327 catastrophic regression: fresh-tape Train step is {msPerIter:F2} ms (> 500 ms). "
                 + "Backward walk likely has a quadratic / runaway bug.");
+        }
+        finally
+        {
+            AiDotNetEngine.Current = priorEngine;
+        }
+    }
+
+    /// <summary>
+    /// Issue #338 Item 3: compares the IL-emitted compiled-backward walker
+    /// against the reference dispatcher on the same fresh-tape workload.
+    /// Runs both with-override-off and with-override-on, asserts the IL
+    /// walker version is NOT slower than the reference (within 30%
+    /// tolerance for JIT warmup and timing noise).
+    /// <para>
+    /// This is the hardware-independent regression gate. The absolute
+    /// wall-time target (≤100ms close, ≤50ms stretch) requires manual
+    /// benchmarking on a 16-core x64 reference box — see the issue
+    /// body's close criteria.
+    /// </para>
+    /// </summary>
+    [Fact]
+    [Trait("Category", "Perf")]
+    public void Issue338_Item3_CompiledIL_NotSlowerThanReference()
+    {
+        if (Environment.GetEnvironmentVariable("AIDOTNET_RUN_PERF_GATES") != "1")
+        {
+            _output.WriteLine("Skip: AIDOTNET_RUN_PERF_GATES != 1.");
+            return;
+        }
+
+        var priorEngine = AiDotNetEngine.Current;
+        var engine = new CpuEngine();
+        AiDotNetEngine.Current = engine;
+
+        var walkerType = typeof(CompiledBackwardWalk<>).MakeGenericType(typeof(float));
+        var overrideField = walkerType.GetField("_testEnabledOverride",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)!;
+        var resetMethod = walkerType.GetMethod("ResetForTests",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)!;
+
+        try
+        {
+            var input = MakeFloatTensor(new[] { B, Ctx, D }, new Random(42));
+            var weights = MakeWeights(Layers);
+
+            // Warmup with override off
+            overrideField.SetValue(null, false);
+            for (int i = 0; i < 3; i++)
+            {
+                using var warmTape = new GradientTape<float>();
+                var y = ForwardL(engine, input, weights);
+                var loss = engine.ReduceSum(y, axes: null, keepDims: false);
+                warmTape.ComputeGradients(loss, weights);
+            }
+
+            // Reference timing
+            const int iters = 5;
+            var refSw = Stopwatch.StartNew();
+            for (int i = 0; i < iters; i++)
+            {
+                using var tape = new GradientTape<float>();
+                var y = ForwardL(engine, input, weights);
+                var loss = engine.ReduceSum(y, axes: null, keepDims: false);
+                tape.ComputeGradients(loss, weights);
+            }
+            refSw.Stop();
+            double refMsPerIter = refSw.Elapsed.TotalMilliseconds / iters;
+
+            // Reset walker cache + flip override on, then warm again so
+            // the IL walker compiles + JITs before timing.
+            resetMethod.Invoke(null, null);
+            overrideField.SetValue(null, true);
+            for (int i = 0; i < 3; i++)
+            {
+                using var warmTape = new GradientTape<float>();
+                var y = ForwardL(engine, input, weights);
+                var loss = engine.ReduceSum(y, axes: null, keepDims: false);
+                warmTape.ComputeGradients(loss, weights);
+            }
+
+            var ilSw = Stopwatch.StartNew();
+            for (int i = 0; i < iters; i++)
+            {
+                using var tape = new GradientTape<float>();
+                var y = ForwardL(engine, input, weights);
+                var loss = engine.ReduceSum(y, axes: null, keepDims: false);
+                tape.ComputeGradients(loss, weights);
+            }
+            ilSw.Stop();
+            double ilMsPerIter = ilSw.Elapsed.TotalMilliseconds / iters;
+
+            _output.WriteLine($"Reference dispatcher: {refMsPerIter:F2} ms/iter");
+            _output.WriteLine($"Compiled-IL walker:   {ilMsPerIter:F2} ms/iter");
+            _output.WriteLine($"IL walker overhead:   {(ilMsPerIter - refMsPerIter):F2} ms/iter "
+                + $"({(ilMsPerIter / refMsPerIter - 1.0) * 100:F1}%)");
+
+            // 30% tolerance — JIT warmup variance + thread-scheduling
+            // noise. The IL walker should be at LEAST as fast as the
+            // reference in steady state; a 30% slowdown gate catches
+            // genuine emission regressions without flapping on noise.
+            Assert.True(ilMsPerIter <= refMsPerIter * 1.3,
+                $"Compiled-IL walker is {(ilMsPerIter / refMsPerIter - 1.0) * 100:F1}% slower than reference "
+                + $"({ilMsPerIter:F2} ms vs {refMsPerIter:F2} ms). "
+                + "Expected the IL walker to be at most 30% slower; an emission regression is likely.");
+        }
+        finally
+        {
+            overrideField.SetValue(null, null);
+            resetMethod.Invoke(null, null);
+            AiDotNetEngine.Current = priorEngine;
+        }
+    }
+
+    /// <summary>
+    /// Phase A (#338): captures the per-backward-function wall-time
+    /// breakdown so subsequent phases target the actual dominant
+    /// functions. Opt-in via AIDOTNET_BWD_TIMING=1 (alongside the
+    /// existing AIDOTNET_RUN_PERF_GATES=1 + 16-core x64 gates).
+    /// Output is emitted to xUnit's <c>ITestOutputHelper</c> as CSV; to
+    /// capture it for tracking, run:
+    /// <code>
+    /// AIDOTNET_BWD_TIMING=1 AIDOTNET_RUN_PERF_GATES=1 dotnet test \
+    ///   tests/AiDotNet.Tensors.Tests \
+    ///   --filter "FullyQualifiedName~Issue338_PhaseA_BackwardProfile"
+    ///   --logger "console;verbosity=detailed"
+    /// </code>
+    /// and copy the CSV section into <c>BENCHMARK_RESULTS.md</c>.
+    /// </summary>
+    [Fact]
+    [Trait("Category", "Perf")]
+    public void Issue338_PhaseA_BackwardProfile_CaptureBreakdown()
+    {
+        if (Environment.GetEnvironmentVariable("AIDOTNET_RUN_PERF_GATES") != "1")
+        {
+            _output.WriteLine("Skip: AIDOTNET_RUN_PERF_GATES != 1.");
+            return;
+        }
+        if (Environment.GetEnvironmentVariable("AIDOTNET_BWD_TIMING") != "1")
+        {
+            _output.WriteLine("Skip: AIDOTNET_BWD_TIMING != 1.");
+            return;
+        }
+        if (Environment.ProcessorCount < 16)
+        {
+            _output.WriteLine($"Skip: ProcessorCount={Environment.ProcessorCount} < 16 (issue scope).");
+            return;
+        }
+        if (RuntimeInformation.ProcessArchitecture != Architecture.X64)
+        {
+            _output.WriteLine($"Skip: ProcessArchitecture={RuntimeInformation.ProcessArchitecture} (issue scope is X64).");
+            return;
+        }
+
+        var priorEngine = AiDotNetEngine.Current;
+        var engine = new CpuEngine();
+        AiDotNetEngine.Current = engine;
+        try
+        {
+            var input = MakeFloatTensor(new[] { B, Ctx, D }, new Random(42));
+            var weights = MakeWeights(Layers);
+
+            // Warmup — discard the timing for the first 2 passes so JIT +
+            // arena settle. BackwardTiming aggregates across calls so
+            // discard means reset after warmup.
+            for (int i = 0; i < 2; i++)
+            {
+                using var warmTape = new GradientTape<float>();
+                var y = ForwardL(engine, input, weights);
+                var loss = engine.ReduceSum(y, axes: null, keepDims: false);
+                warmTape.ComputeGradients(loss, weights);
+            }
+            // Discard warmup accumulator. The CSV dump below resets it
+            // too, but we want the timed window to start clean.
+            BackwardTiming.DumpAndReset(_ => { /* discard */ });
+
+            const int iters = 20;
+            var sw = Stopwatch.StartNew();
+            for (int i = 0; i < iters; i++)
+            {
+                using var tape = new GradientTape<float>();
+                var y = ForwardL(engine, input, weights);
+                var loss = engine.ReduceSum(y, axes: null, keepDims: false);
+                tape.ComputeGradients(loss, weights);
+            }
+            sw.Stop();
+
+            double msPerIter = sw.Elapsed.TotalMilliseconds / iters;
+            _output.WriteLine($"# Issue #338 Phase A baseline ({iters} iters after 2 warmup)");
+            _output.WriteLine($"# wall_time_ms_per_iter={msPerIter:F2}");
+            _output.WriteLine($"# host_processor_count={Environment.ProcessorCount}");
+            _output.WriteLine($"# host_arch={RuntimeInformation.ProcessArchitecture}");
+            _output.WriteLine($"# config_d={D}_L={Layers}_B={B}_ctx={Ctx}");
+            _output.WriteLine(string.Empty);
+            _output.WriteLine("```csv");
+            BackwardTiming.DumpAndResetCsv(line => _output.WriteLine(line));
+            _output.WriteLine("```");
+        }
+        finally
+        {
+            AiDotNetEngine.Current = priorEngine;
+        }
+    }
+
+    /// <summary>
+    /// Phase E feasibility test (#338): measures whether enabling
+    /// TensorCodecOptions optimization passes (DataflowFusion +
+    /// AlgebraicBackward) further accelerates CompiledModelCache.
+    /// Phase D measured 188 ms median; this experiment tests whether
+    /// the existing optimization passes can drive that lower.
+    /// </summary>
+    [Fact]
+    [Trait("Category", "Perf")]
+    public void Issue338_PhaseE_CompiledModelCache_WithOptimizationPasses()
+    {
+        if (Environment.GetEnvironmentVariable("AIDOTNET_RUN_PERF_GATES") != "1")
+        {
+            _output.WriteLine("Skip: AIDOTNET_RUN_PERF_GATES != 1.");
+            return;
+        }
+        if (Environment.ProcessorCount < 16) { _output.WriteLine("Skip: ProcessorCount<16."); return; }
+        if (RuntimeInformation.ProcessArchitecture != Architecture.X64) { _output.WriteLine("Skip: not X64."); return; }
+
+        var priorEngine = AiDotNetEngine.Current;
+        var engine = new CpuEngine();
+        AiDotNetEngine.Current = engine;
+        var prevOpts = AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions.Current;
+        AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions.SetCurrent(new AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions
+        {
+            EnableDataflowFusion = true,
+            EnableAlgebraicBackward = true,
+            EnableSpectralDecomposition = false,
+        });
+
+        try
+        {
+            var input = MakeFloatTensor(new[] { B, Ctx, D }, new Random(42));
+            var weights = MakeWeights(Layers);
+
+            using var cache = new AiDotNet.Tensors.Engines.Compilation.CompiledModelCache<float>();
+            var plan = cache.GetOrCompileTraining(
+                inputShape: input._shape,
+                forwardAndLoss: () =>
+                {
+                    var y = ForwardL(engine, input, weights);
+                    return engine.ReduceSum(y, axes: null, keepDims: false);
+                },
+                parameters: weights);
+
+            for (int i = 0; i < 2; i++) plan.Step();
+
+            const int iters = 20;
+            var sw = Stopwatch.StartNew();
+            for (int i = 0; i < iters; i++) plan.Step();
+            sw.Stop();
+            double msPerIter = sw.Elapsed.TotalMilliseconds / iters;
+            _output.WriteLine($"# Issue #338 Phase E — CompiledModelCache + optimization passes");
+            _output.WriteLine($"# wall_time_ms_per_iter={msPerIter:F2}");
+            _output.WriteLine($"# baseline_phase_d_ms_per_iter=~188");
+            _output.WriteLine($"# delta_vs_phase_d={msPerIter - 188:F2} ms");
+        }
+        finally
+        {
+            AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions.SetCurrent(prevOpts);
+            AiDotNetEngine.Current = priorEngine;
+        }
+    }
+
+    /// <summary>
+    /// Phase D feasibility test (#338): measures whether the existing
+    /// CompiledModelCache.GetOrCompileTraining API delivers wall-time
+    /// reduction on the #327 fresh-tape workload. The persistent-tape
+    /// path achieves ~58 ms/iter via this compilation; if the cache
+    /// behaves correctly for the same forward pattern across iterations,
+    /// fresh-tape callers could migrate to this API and unlock the same
+    /// speedup.
+    /// </summary>
+    [Fact]
+    [Trait("Category", "Perf")]
+    public void Issue338_PhaseD_CompiledModelCache_WallTime()
+    {
+        if (Environment.GetEnvironmentVariable("AIDOTNET_RUN_PERF_GATES") != "1")
+        {
+            _output.WriteLine("Skip: AIDOTNET_RUN_PERF_GATES != 1.");
+            return;
+        }
+        if (Environment.ProcessorCount < 16)
+        {
+            _output.WriteLine($"Skip: ProcessorCount={Environment.ProcessorCount} < 16.");
+            return;
+        }
+        if (RuntimeInformation.ProcessArchitecture != Architecture.X64)
+        {
+            _output.WriteLine($"Skip: ProcessArchitecture={RuntimeInformation.ProcessArchitecture}.");
+            return;
+        }
+
+        var priorEngine = AiDotNetEngine.Current;
+        var engine = new CpuEngine();
+        AiDotNetEngine.Current = engine;
+        try
+        {
+            var input = MakeFloatTensor(new[] { B, Ctx, D }, new Random(42));
+            var weights = MakeWeights(Layers);
+
+            using var cache = new AiDotNet.Tensors.Engines.Compilation.CompiledModelCache<float>();
+
+            // Compile (cache miss on first call, hit on subsequent).
+            var plan = cache.GetOrCompileTraining(
+                inputShape: input._shape,
+                forwardAndLoss: () =>
+                {
+                    var y = ForwardL(engine, input, weights);
+                    return engine.ReduceSum(y, axes: null, keepDims: false);
+                },
+                parameters: weights);
+
+            // Issue #338 Phase G.4: opt into pre-packed B cache. This test
+            // does NOT update weights between Step() calls (no optimizer
+            // configured), so the cached pre-pack of B stays valid across
+            // replays. Saves PackB cost on every forward MatMul call.
+            // Opt-out gate: set AIDOTNET_FROZEN_WEIGHTS=0 to skip the opt-in
+            // (used for A/B-comparing wall-time with vs without).
+            if (System.Environment.GetEnvironmentVariable("AIDOTNET_FROZEN_WEIGHTS") != "0")
+                plan.EnableFrozenWeightOptimizations();
+
+            // Warmup
+            for (int i = 0; i < 2; i++)
+            {
+                plan.Step();
+            }
+
+            const int iters = 20;
+            var sw = Stopwatch.StartNew();
+            for (int i = 0; i < iters; i++)
+            {
+                plan.Step();
+            }
+            sw.Stop();
+
+            double msPerIter = sw.Elapsed.TotalMilliseconds / iters;
+            _output.WriteLine($"# Issue #338 Phase D — CompiledModelCache wall-time");
+            _output.WriteLine($"# wall_time_ms_per_iter={msPerIter:F2}");
+            _output.WriteLine($"# config_d={D}_L={Layers}_B={B}_ctx={Ctx}");
+            _output.WriteLine($"# baseline_fresh_tape_ms_per_iter=~266 (from Phase A)");
+            _output.WriteLine($"# expected_persistent_tape_ms_per_iter=~58 (per issue body)");
+            if (msPerIter < 100)
+                _output.WriteLine("# SOFT TARGET (≤100ms) HIT — Phase D premise validated.");
+            else if (msPerIter < 200)
+                _output.WriteLine("# HARD FLOOR (≤200ms) HIT — Phase D delivers but not yet at soft target.");
+            else
+                _output.WriteLine("# Phase D premise INVALID — CompiledModelCache does not deliver expected speedup on this workload.");
+
+            // Phase F.1: forward/backward/optimizer split when AIDOTNET_STEP_TIMING=1
+            AiDotNet.Tensors.Engines.Compilation.StepTiming.DumpAndReset(_output.WriteLine);
+            // Phase F.2: per-op backward breakdown on the compiled path when AIDOTNET_BWD_TIMING=1
+            AiDotNet.Tensors.Engines.Autodiff.BackwardTiming.DumpAndReset(_output.WriteLine);
         }
         finally
         {

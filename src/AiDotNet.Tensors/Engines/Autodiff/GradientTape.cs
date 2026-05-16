@@ -519,8 +519,12 @@ public sealed class GradientTape<T> : IDisposable
                 // Validate that no input tensor was mutated after recording
                 entry.ValidateInputVersions();
 
-                // Invoke the backward function
+                // Invoke the backward function. Phase A (#338) timing
+                // wrapper records per-op ticks when AIDOTNET_BWD_TIMING=1.
+                long _bwdStart = BackwardTiming.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
                 entry.Backward(gradOutput, inputsArray, entry.Output, entry.SavedState ?? Array.Empty<object>(), engine, grads);
+                if (BackwardTiming.Enabled)
+                    BackwardTiming.Record(entry.Backward.Method.Name, System.Diagnostics.Stopwatch.GetTimestamp() - _bwdStart);
 
                 // Performance profiling (only when explicitly enabled)
                 // Timing wraps the backward call above — the Stopwatch overhead
@@ -829,6 +833,27 @@ public sealed class GradientTape<T> : IDisposable
                 SetCurrentTape(null);
                 try
                 {
+                    // Issue #338 Item 3: compiled-IL backward walker. When
+                    // AIDOTNET_COMPILED_BACKWARD is enabled, route through
+                    // the pattern-keyed walker cache. The walker today is
+                    // a passthrough (same dispatch logic, just hoisted out
+                    // of the cache module); future commits replace each
+                    // walker with a DynamicMethod whose IL bakes in the
+                    // index sequence + backward delegate signatures.
+                    if (CompiledBackwardWalk<T>.Enabled)
+                    {
+                        var walker = CompiledBackwardWalk<T>.TryGetWalker(lookupHash);
+                        if (walker is not null)
+                        {
+                            var compiledResult = walker(_entries, loss, sources, _engine);
+                            if (compiledResult is not null)
+                            {
+                                CleanupAfterCachedReplay(compiledResult, sources);
+                                return compiledResult;
+                            }
+                        }
+                    }
+
                     var cached = RebindablePlanCache<T>.TryExecute(lookupHash, _entries, loss, sources, _engine);
                     if (cached is not null)
                     {
@@ -1007,7 +1032,7 @@ public sealed class GradientTape<T> : IDisposable
                     if (writeIdx < reverseTopoIndices.Length)
                         Array.Resize(ref reverseTopoIndices, writeIdx);
 
-                    RebindablePlanCache<T>.Store(patternHash, _entries.Count, reverseTopoIndices);
+                    RebindablePlanCache<T>.Store(patternHash, _entries.Count, reverseTopoIndices, _entries);
                 }
             }
 

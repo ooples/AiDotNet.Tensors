@@ -7,6 +7,16 @@ using Xunit;
 namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 
 /// <summary>
+/// Serializes tests that mutate process-wide compilation state
+/// (GraphMode scope, GradientTape.Current, CompiledTrainingPlan.StepProbe).
+/// Without this, xUnit's parallel runner can interleave classes that each
+/// assume exclusive ownership of those statics — surfaces as flaky tests
+/// that pass on rerun.
+/// </summary>
+[CollectionDefinition("CompilationGlobalState", DisableParallelization = true)]
+public sealed class CompilationGlobalStateCollection { }
+
+/// <summary>
 /// Issue #350 third-order residual: PR #351's two-bug repair landed but the
 /// AiDotNet GraFPrint min-repro (testconsole/BnFusedGradDiff.cs in
 /// ooples/AiDotNet branch fix/pr-1290-cluster-4-5) still shows a
@@ -30,7 +40,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 /// trainable parameters are gamma + beta of a BatchNorm op must move every
 /// channel of gamma in the same direction the eager-mode equivalent does.
 /// </summary>
-[Collection("CompiledTrainingPlanProbeSerial")]
+[Collection("CompilationGlobalState")]
 public class BatchNormGradSlotResidualTests
 {
     /// <summary>

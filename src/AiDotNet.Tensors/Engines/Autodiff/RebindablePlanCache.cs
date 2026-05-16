@@ -65,12 +65,68 @@ internal static class RebindablePlanCache<T>
     /// <summary>
     /// Stores the reverse-topo entry-index sequence for the most recent
     /// forward pattern on this thread.
+    /// <para>
+    /// When <see cref="CompiledBackwardWalk{T}.Enabled"/> is true, also
+    /// captures each entry's static backward <see cref="System.Reflection.MethodInfo"/>
+    /// from <paramref name="entries"/> and registers a per-op-specialised
+    /// IL walker for the pattern (issue #338 Item 3). The captured methods
+    /// are baked into the walker's emitted IL as direct <c>call</c> targets
+    /// — no <c>BackwardFunction&lt;T&gt;.Invoke</c> dispatch indirection
+    /// at replay time.
+    /// </para>
     /// </summary>
-    internal static void Store(long patternHash, int recordedEntryCount, int[] reverseTopoIndices)
+    internal static void Store(long patternHash, int recordedEntryCount, int[] reverseTopoIndices, TapeEntryArena<T>? entries = null)
     {
         _cachedPatternHash = patternHash;
         _cachedRecordedEntryCount = recordedEntryCount;
         _cachedReverseTopoIndices = reverseTopoIndices;
+
+        // Issue #338 Item 3: also register a compiled-backward walker
+        // keyed by the same pattern hash so the
+        // GradientTape.ComputeGradientsViaGraphCore IL-walker fast path
+        // (gated on AIDOTNET_COMPILED_BACKWARD) finds it.
+        if (CompiledBackwardWalk<T>.Enabled)
+        {
+            System.Reflection.MethodInfo[]? methods = null;
+            if (entries is not null)
+                methods = ExtractBackwardMethods(entries, reverseTopoIndices);
+
+            CompiledBackwardWalk<T>.Register(
+                patternHash,
+                CompiledBackwardWalk<T>.Compile(reverseTopoIndices, methods));
+        }
+    }
+
+    /// <summary>
+    /// Walks the entry arena along the reverse-topo index sequence and
+    /// extracts each entry's backward <see cref="System.Reflection.MethodInfo"/>
+    /// (from its <c>Backward</c> delegate's <see cref="System.Delegate.Method"/>).
+    /// Returns null when ANY entry's backward delegate is non-static —
+    /// the IL specialisation path requires static methods, and a null
+    /// return tells <see cref="CompiledBackwardWalk{T}.Compile(int[], System.Reflection.MethodInfo[]?)"/>
+    /// to take the non-specialised helper-dispatch path.
+    /// </summary>
+    private static System.Reflection.MethodInfo[]? ExtractBackwardMethods(
+        TapeEntryArena<T> entries, int[] reverseTopoIndices)
+    {
+        var methods = new System.Reflection.MethodInfo[reverseTopoIndices.Length];
+        for (int i = 0; i < reverseTopoIndices.Length; i++)
+        {
+            int idx = reverseTopoIndices[i];
+            if ((uint)idx >= (uint)entries.Count) return null;
+            ref var entry = ref entries[idx];
+            if (entry.Backward is null) return null;
+            var m = entry.Backward.Method;
+            if (!m.IsStatic) return null;
+            // A null Target on a static-method delegate means no captured
+            // closure object. Lambdas with captures synthesize a static
+            // method whose first arg is the closure; .Target holds that
+            // closure. Direct `call` IL would skip the closure arg and
+            // crash. Refuse those — fallback path handles them safely.
+            if (entry.Backward.Target is not null) return null;
+            methods[i] = m;
+        }
+        return methods;
     }
 
     /// <summary>

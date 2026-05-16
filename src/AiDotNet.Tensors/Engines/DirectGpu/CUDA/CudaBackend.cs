@@ -78,6 +78,18 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     private IntPtr _wmmaModule;
     private int _ccMajor;
     private int _ccMinor;
+
+    /// <summary>
+    /// True when this device supports the bfloat16 GEMM / MHA fanout
+    /// paths (BatchedGemmExFanout(useBFloat16:true) and
+    /// MultiHeadAttentionScoresFanoutMixed(useBFloat16:true)). Requires
+    /// compute capability ≥ 8.0 (Ampere+), where the BF16 tensor cores
+    /// live. Distinct from IGpuMixedPrecisionConvBackend's BF16 conv
+    /// surface: a host can have BF16 GEMM/MHA support without cuDNN
+    /// (or with cuDNN-conv disabled), which is what makes a single
+    /// capability flag wrong for cross-cutting test gates.
+    /// </summary>
+    public bool SupportsBFloat16GemmFanout => IsAvailable && _ccMajor >= 8;
     private int _clockRateKHz;
     private bool _hasWmmaSupport;
 
@@ -1115,6 +1127,553 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                 C.Handle, N, strideC,
                 batchCount),
             "cublasSgemmStridedBatched");
+    }
+
+    /// <summary>
+    /// Issue #335 items 3+4 production wiring: fans <paramref name="batchCount"/>
+    /// independent SGEMMs of identical shape across the supplied
+    /// scheduler's stream pool. Each slice runs on its own stream, so
+    /// the cuBLAS launches overlap rather than serialising on the
+    /// default stream.
+    /// <para>
+    /// Use this in preference to <see cref="BatchedGemm"/> when:
+    /// <list type="bullet">
+    ///   <item>Per-slice work is small (M·N·K is at the attention-shape
+    ///   scale e.g. 256·256·64 — small enough that cuBLAS strided-batched
+    ///   doesn't saturate the GPU)</item>
+    ///   <item>The caller already has a <see cref="GpuStreamScheduler"/>
+    ///   live (e.g., MHA per-head dispatch, parallel ResNet branches)</item>
+    /// </list>
+    /// For large per-slice work, <see cref="BatchedGemm"/>'s strided-
+    /// batched path remains faster because the in-slice parallelism
+    /// already saturates the SMs.
+    /// </para>
+    /// </summary>
+    /// <param name="scheduler">Stream scheduler whose pool provides the
+    /// per-slice streams. Caller owns lifetime — see
+    /// <see cref="DirectGpuTensorEngine.GetStreamScheduler"/>.</param>
+    public void BatchedGemmFanout(
+        IGpuBuffer A, IGpuBuffer B, IGpuBuffer C,
+        int M, int N, int K, int batchCount,
+        AiDotNet.Tensors.Engines.Gpu.GpuStreamScheduler scheduler,
+        float alpha = 1.0f, float beta = 0.0f)
+    {
+        if (!IsAvailable) throw new InvalidOperationException("CUDA backend is not available.");
+        if (scheduler is null) throw new ArgumentNullException(nameof(scheduler));
+        ValidateBatchedGemmArgs(A, B, C, M, N, K, batchCount);
+
+        long strideA = (long)M * K;
+        long strideB = (long)K * N;
+        long strideC = (long)M * N;
+        long elemBytesA = sizeof(float);
+
+        // Build one launch action per slice. Each captures its slice
+        // offsets; the scheduler binds cuBLAS to the lease stream before
+        // calling each lambda, so each cublasSgemm queues onto the
+        // assigned stream.
+        var launches = new System.Collections.Generic.List<System.Action<AiDotNet.Tensors.Engines.Gpu.IGpuStream>>(batchCount);
+        for (int b = 0; b < batchCount; b++)
+        {
+            int slice = b;
+            launches.Add(_ =>
+            {
+                // The scheduler binds cuBLAS to this stream prior to
+                // invoking the lambda (see GpuStreamScheduler.Dispatch's
+                // per-lease cublasSetStream call). We just issue the
+                // launch — it queues onto the bound stream.
+                float aVal = alpha, bVal = beta;
+                IntPtr aPtr = (IntPtr)((long)A.Handle + slice * strideA * elemBytesA);
+                IntPtr bPtr = (IntPtr)((long)B.Handle + slice * strideB * elemBytesA);
+                IntPtr cPtr = (IntPtr)((long)C.Handle + slice * strideC * elemBytesA);
+                CuBlasNative.CheckCublasStatus(
+                    CuBlasNative.cublasSgemm(
+                        _cublasHandle,
+                        CublasOperation.None,
+                        CublasOperation.None,
+                        N, M, K,
+                        ref aVal,
+                        bPtr, N,
+                        aPtr, K,
+                        ref bVal,
+                        cPtr, N),
+                    $"cublasSgemm slice {slice}");
+            });
+        }
+
+        using var batch = scheduler.Dispatch(launches);
+        scheduler.SynchronizeEvents(batch);
+    }
+
+    /// <summary>
+    /// Issue #335 item 4: Multi-head attention scoring fanout. Computes
+    /// scores[h] = Q[h] · K[h]^T for each of <paramref name="numHeads"/>
+    /// attention heads, with each head's GEMM running on its own stream
+    /// from the scheduler's pool. Use the result tensor as input to a
+    /// scaled-softmax + value projection pipeline.
+    /// <para>
+    /// Shapes (NCHW-style packed):
+    /// <list type="bullet">
+    ///   <item><paramref name="Q"/> packed as [batch, numHeads, seqLen, headDim]</item>
+    ///   <item><paramref name="K"/> packed as [batch, numHeads, seqLen, headDim]</item>
+    ///   <item><paramref name="scores"/> output packed as [batch, numHeads, seqLen, seqLen]</item>
+    /// </list>
+    /// One head per stream = numHeads concurrent SGEMMs of shape
+    /// [seqLen, headDim] · [headDim, seqLen]. The cuBLAS launches overlap
+    /// rather than serialising on the default stream.
+    /// </para>
+    /// </summary>
+    public void MultiHeadAttentionScoresFanout(
+        IGpuBuffer Q, IGpuBuffer K, IGpuBuffer scores,
+        int batch, int numHeads, int seqLen, int headDim,
+        AiDotNet.Tensors.Engines.Gpu.GpuStreamScheduler scheduler,
+        float alpha = 1.0f, float beta = 0.0f)
+    {
+        if (!IsAvailable) throw new InvalidOperationException("CUDA backend is not available.");
+        if (Q is null) throw new ArgumentNullException(nameof(Q));
+        if (K is null) throw new ArgumentNullException(nameof(K));
+        if (scores is null) throw new ArgumentNullException(nameof(scores));
+        if (scheduler is null) throw new ArgumentNullException(nameof(scheduler));
+        if (batch <= 0) throw new ArgumentOutOfRangeException(nameof(batch));
+        if (numHeads <= 0) throw new ArgumentOutOfRangeException(nameof(numHeads));
+        if (seqLen <= 0) throw new ArgumentOutOfRangeException(nameof(seqLen));
+        if (headDim <= 0) throw new ArgumentOutOfRangeException(nameof(headDim));
+
+        // Compute capacity math inside a `checked` block so an overflow
+        // (e.g. seqLen=65536, headDim=65536 wrapping past long.MaxValue)
+        // throws OverflowException instead of silently producing a
+        // negative `required*` that would bypass the buffer guards below
+        // and feed overflowed offsets into the raw cuBLAS pointer math.
+        long perHeadQ, perHeadK, perHeadS, perBatchQ, perBatchK, perBatchS;
+        long requiredQ, requiredK, requiredS;
+        try
+        {
+            checked
+            {
+                perHeadQ = (long)seqLen * headDim;
+                perHeadK = (long)seqLen * headDim;
+                perHeadS = (long)seqLen * seqLen;
+                perBatchQ = perHeadQ * numHeads;
+                perBatchK = perHeadK * numHeads;
+                perBatchS = perHeadS * numHeads;
+                requiredQ = (long)batch * perBatchQ;
+                requiredK = (long)batch * perBatchK;
+                requiredS = (long)batch * perBatchS;
+            }
+        }
+        catch (OverflowException)
+        {
+            throw new ArgumentException(
+                $"MHA shape too large for fanout dispatch: B={batch}, H={numHeads}, S={seqLen}, D={headDim}.");
+        }
+        long elemBytes = sizeof(float);
+
+        // Validate buffer capacity BEFORE the per-head offset math. Without
+        // this, an undersized Q/K/scores buffer silently produces device
+        // pointers past the allocation, which cuBLAS will read/write into —
+        // typically a use-after-free or another tensor's data. The required
+        // element count is (batch * perBatchX); IGpuBuffer.Size returns the
+        // element count, so we compare directly.
+        if (Q.Size < requiredQ)
+            throw new ArgumentException(
+                $"Q buffer too small: capacity={Q.Size} elements, required={requiredQ} for shape [B={batch}, H={numHeads}, S={seqLen}, D={headDim}].",
+                nameof(Q));
+        if (K.Size < requiredK)
+            throw new ArgumentException(
+                $"K buffer too small: capacity={K.Size} elements, required={requiredK} for shape [B={batch}, H={numHeads}, S={seqLen}, D={headDim}].",
+                nameof(K));
+        if (scores.Size < requiredS)
+            throw new ArgumentException(
+                $"scores buffer too small: capacity={scores.Size} elements, required={requiredS} for shape [B={batch}, H={numHeads}, S={seqLen}].",
+                nameof(scores));
+
+        var launches = new System.Collections.Generic.List<System.Action<AiDotNet.Tensors.Engines.Gpu.IGpuStream>>(batch * numHeads);
+        for (int bi = 0; bi < batch; bi++)
+        {
+            for (int h = 0; h < numHeads; h++)
+            {
+                int batchIdx = bi, headIdx = h;
+                launches.Add(_ =>
+                {
+                    float aVal = alpha, bVal = beta;
+                    IntPtr qPtr = (IntPtr)((long)Q.Handle
+                        + (batchIdx * perBatchQ + headIdx * perHeadQ) * elemBytes);
+                    IntPtr kPtr = (IntPtr)((long)K.Handle
+                        + (batchIdx * perBatchK + headIdx * perHeadK) * elemBytes);
+                    IntPtr sPtr = (IntPtr)((long)scores.Handle
+                        + (batchIdx * perBatchS + headIdx * perHeadS) * elemBytes);
+
+                    // scores[h] = Q[h] · K[h]^T
+                    // cuBLAS is column-major; for row-major Q · K^T we
+                    // ask cuBLAS for K^T_col · Q_col which is K_row · Q_row^T.
+                    // Result is stored in column-major scores; reading
+                    // it as row-major gives the row-major Q · K^T we want.
+                    CuBlasNative.CheckCublasStatus(
+                        CuBlasNative.cublasSgemm(
+                            _cublasHandle,
+                            CublasOperation.Transpose,  // K^T
+                            CublasOperation.None,        // Q
+                            seqLen, seqLen, headDim,
+                            ref aVal,
+                            kPtr, headDim,
+                            qPtr, headDim,
+                            ref bVal,
+                            sPtr, seqLen),
+                        $"cublasSgemm MHA score batch={batchIdx} head={headIdx}");
+                });
+            }
+        }
+
+        using var b1 = scheduler.Dispatch(launches);
+        scheduler.SynchronizeEvents(b1);
+    }
+
+    /// <summary>
+    /// Mixed-precision MHA scoring fanout via <c>cublasGemmEx</c>: input
+    /// Q / K are fp16 (or bf16), accumulator + output are fp32 — the
+    /// standard AMP pattern. Combines #335 multi-stream dispatch with
+    /// #337 mixed precision in one call.
+    /// </summary>
+    /// <param name="useBFloat16">When true, treats Q / K as bfloat16
+    /// instead of fp16. Requires compute capability >= 8.0 (Ampere+).</param>
+    public unsafe void MultiHeadAttentionScoresFanoutMixed(
+        IGpuBuffer Q, IGpuBuffer K, IGpuBuffer scores,
+        int batch, int numHeads, int seqLen, int headDim,
+        AiDotNet.Tensors.Engines.Gpu.GpuStreamScheduler scheduler,
+        bool useBFloat16 = false,
+        float alpha = 1.0f, float beta = 0.0f)
+    {
+        if (!IsAvailable) throw new InvalidOperationException("CUDA backend is not available.");
+        if (Q is null) throw new ArgumentNullException(nameof(Q));
+        if (K is null) throw new ArgumentNullException(nameof(K));
+        if (scores is null) throw new ArgumentNullException(nameof(scores));
+        if (scheduler is null) throw new ArgumentNullException(nameof(scheduler));
+        // Restore the positive-dimension guards the fp32 sister method has —
+        // without these, a zero or negative dim flows straight into the
+        // launches-list `Count` sizing and the perHead/perBatch offset math.
+        if (batch <= 0) throw new ArgumentOutOfRangeException(nameof(batch));
+        if (numHeads <= 0) throw new ArgumentOutOfRangeException(nameof(numHeads));
+        if (seqLen <= 0) throw new ArgumentOutOfRangeException(nameof(seqLen));
+        if (headDim <= 0) throw new ArgumentOutOfRangeException(nameof(headDim));
+        if (useBFloat16 && _ccMajor < 8)
+            throw new NotSupportedException(
+                $"BFloat16 MHA requires compute capability >= 8.0 (Ampere+); device reports {_ccMajor}.{_ccMinor}.");
+
+        int inDtype = useBFloat16 ? CuBlasNative.CUDA_R_16BF : CuBlasNative.CUDA_R_16F;
+        // Checked arithmetic — see MultiHeadAttentionScoresFanout for the
+        // overflow-mode rationale. Mixed-precision adds a *elemBytesIn
+        // factor that can also overflow on huge shapes.
+        long perHeadElems, perHeadScoreElems, perBatchQK, perBatchS;
+        long requiredQkBytes, requiredS;
+        long elemBytesIn = 2;        // fp16 / bf16
+        long elemBytesOut = sizeof(float);
+        try
+        {
+            checked
+            {
+                perHeadElems = (long)seqLen * headDim;
+                perHeadScoreElems = (long)seqLen * seqLen;
+                perBatchQK = perHeadElems * numHeads;
+                perBatchS = perHeadScoreElems * numHeads;
+                requiredQkBytes = (long)batch * perBatchQK * elemBytesIn;
+                requiredS = (long)batch * perBatchS;
+            }
+        }
+        catch (OverflowException)
+        {
+            throw new ArgumentException(
+                $"Mixed-precision MHA shape too large for fanout dispatch: B={batch}, H={numHeads}, S={seqLen}, D={headDim}.");
+        }
+
+        // Validate buffer capacity BEFORE per-head offset math. Q/K are
+        // 2-byte (fp16/bf16) so SizeInBytes is the right surface here;
+        // scores is fp32 so element count suffices.
+        if (Q.SizeInBytes < requiredQkBytes)
+            throw new ArgumentException(
+                $"Q buffer too small: capacity={Q.SizeInBytes} bytes, required={requiredQkBytes} for mixed-precision shape [B={batch}, H={numHeads}, S={seqLen}, D={headDim}].",
+                nameof(Q));
+        if (K.SizeInBytes < requiredQkBytes)
+            throw new ArgumentException(
+                $"K buffer too small: capacity={K.SizeInBytes} bytes, required={requiredQkBytes} for mixed-precision shape [B={batch}, H={numHeads}, S={seqLen}, D={headDim}].",
+                nameof(K));
+        if (scores.Size < requiredS)
+            throw new ArgumentException(
+                $"scores buffer too small: capacity={scores.Size} elements, required={requiredS} for shape [B={batch}, H={numHeads}, S={seqLen}].",
+                nameof(scores));
+
+        var launches = new System.Collections.Generic.List<System.Action<AiDotNet.Tensors.Engines.Gpu.IGpuStream>>(batch * numHeads);
+        for (int bi = 0; bi < batch; bi++)
+        {
+            for (int h = 0; h < numHeads; h++)
+            {
+                int batchIdx = bi, headIdx = h;
+                launches.Add(_ =>
+                {
+                    float aVal = alpha, bVal = beta;
+                    IntPtr alphaPtr = (IntPtr)(&aVal);
+                    IntPtr betaPtr = (IntPtr)(&bVal);
+                    IntPtr qPtr = (IntPtr)((long)Q.Handle
+                        + (batchIdx * perBatchQK + headIdx * perHeadElems) * elemBytesIn);
+                    IntPtr kPtr = (IntPtr)((long)K.Handle
+                        + (batchIdx * perBatchQK + headIdx * perHeadElems) * elemBytesIn);
+                    IntPtr sPtr = (IntPtr)((long)scores.Handle
+                        + (batchIdx * perBatchS + headIdx * perHeadScoreElems) * elemBytesOut);
+
+                    CuBlasNative.CheckCublasStatus(
+                        CuBlasNative.cublasGemmEx(
+                            _cublasHandle,
+                            CublasOperation.Transpose, CublasOperation.None,
+                            seqLen, seqLen, headDim,
+                            alphaPtr,
+                            kPtr, inDtype, headDim,
+                            qPtr, inDtype, headDim,
+                            betaPtr,
+                            sPtr, CuBlasNative.CUDA_R_32F, seqLen,
+                            CuBlasNative.CUBLAS_COMPUTE_32F,
+                            0 /* CUBLAS_GEMM_DEFAULT */),
+                        $"cublasGemmEx MHA score batch={batchIdx} head={headIdx}");
+                });
+            }
+        }
+
+        using var b1 = scheduler.Dispatch(launches);
+        scheduler.SynchronizeEvents(b1);
+    }
+
+    /// <summary>
+    /// Multi-head attention output projection fanout: for each head,
+    /// computes <c>output[h] = attention[h] · V[h]</c>. Companion to
+    /// <see cref="MultiHeadAttentionScoresFanout"/>; the two together
+    /// cover the bracketing GEMMs of the MHA pipeline (the middle
+    /// softmax+scaling step is element-wise and stream-parallel via the
+    /// existing Softmax helper).
+    /// <para>
+    /// Shapes (NCHW-style packed):
+    /// <list type="bullet">
+    ///   <item><paramref name="attention"/> packed as [batch, numHeads, seqLen, seqLen]</item>
+    ///   <item><paramref name="V"/> packed as [batch, numHeads, seqLen, headDim]</item>
+    ///   <item><paramref name="output"/> packed as [batch, numHeads, seqLen, headDim]</item>
+    /// </list>
+    /// </para>
+    /// </summary>
+    public void MultiHeadAttentionOutputFanout(
+        IGpuBuffer attention, IGpuBuffer V, IGpuBuffer output,
+        int batch, int numHeads, int seqLen, int headDim,
+        AiDotNet.Tensors.Engines.Gpu.GpuStreamScheduler scheduler,
+        float alpha = 1.0f, float beta = 0.0f)
+    {
+        if (!IsAvailable) throw new InvalidOperationException("CUDA backend is not available.");
+        if (attention is null) throw new ArgumentNullException(nameof(attention));
+        if (V is null) throw new ArgumentNullException(nameof(V));
+        if (output is null) throw new ArgumentNullException(nameof(output));
+        if (scheduler is null) throw new ArgumentNullException(nameof(scheduler));
+        if (batch <= 0) throw new ArgumentOutOfRangeException(nameof(batch));
+        if (numHeads <= 0) throw new ArgumentOutOfRangeException(nameof(numHeads));
+        if (seqLen <= 0) throw new ArgumentOutOfRangeException(nameof(seqLen));
+        if (headDim <= 0) throw new ArgumentOutOfRangeException(nameof(headDim));
+
+        // Checked arithmetic — see MultiHeadAttentionScoresFanout for the
+        // overflow-mode rationale.
+        long perHeadA, perHeadV, perHeadO, perBatchA, perBatchV, perBatchO;
+        long requiredA, requiredV, requiredO;
+        try
+        {
+            checked
+            {
+                perHeadA = (long)seqLen * seqLen;
+                perHeadV = (long)seqLen * headDim;
+                perHeadO = (long)seqLen * headDim;
+                perBatchA = perHeadA * numHeads;
+                perBatchV = perHeadV * numHeads;
+                perBatchO = perHeadO * numHeads;
+                requiredA = (long)batch * perBatchA;
+                requiredV = (long)batch * perBatchV;
+                requiredO = (long)batch * perBatchO;
+            }
+        }
+        catch (OverflowException)
+        {
+            throw new ArgumentException(
+                $"MHA output shape too large for fanout dispatch: B={batch}, H={numHeads}, S={seqLen}, D={headDim}.");
+        }
+        long elemBytes = sizeof(float);
+
+        // Validate buffer capacity BEFORE the per-head offset math (see
+        // MultiHeadAttentionScoresFanout for the rationale).
+        if (attention.Size < requiredA)
+            throw new ArgumentException(
+                $"attention buffer too small: capacity={attention.Size} elements, required={requiredA} for shape [B={batch}, H={numHeads}, S={seqLen}].",
+                nameof(attention));
+        if (V.Size < requiredV)
+            throw new ArgumentException(
+                $"V buffer too small: capacity={V.Size} elements, required={requiredV} for shape [B={batch}, H={numHeads}, S={seqLen}, D={headDim}].",
+                nameof(V));
+        if (output.Size < requiredO)
+            throw new ArgumentException(
+                $"output buffer too small: capacity={output.Size} elements, required={requiredO} for shape [B={batch}, H={numHeads}, S={seqLen}, D={headDim}].",
+                nameof(output));
+
+        var launches = new System.Collections.Generic.List<System.Action<AiDotNet.Tensors.Engines.Gpu.IGpuStream>>(batch * numHeads);
+        for (int bi = 0; bi < batch; bi++)
+        {
+            for (int h = 0; h < numHeads; h++)
+            {
+                int batchIdx = bi, headIdx = h;
+                launches.Add(_ =>
+                {
+                    float aVal = alpha, bVal = beta;
+                    IntPtr aPtr = (IntPtr)((long)attention.Handle
+                        + (batchIdx * perBatchA + headIdx * perHeadA) * elemBytes);
+                    IntPtr vPtr = (IntPtr)((long)V.Handle
+                        + (batchIdx * perBatchV + headIdx * perHeadV) * elemBytes);
+                    IntPtr oPtr = (IntPtr)((long)output.Handle
+                        + (batchIdx * perBatchO + headIdx * perHeadO) * elemBytes);
+
+                    // output[h] = attention[h] · V[h]
+                    // Row-major attention [seqLen, seqLen] · V [seqLen, headDim] = output [seqLen, headDim].
+                    // For cuBLAS column-major: V_col^T · attention_col^T -> output_col^T (which reads as row-major output).
+                    CuBlasNative.CheckCublasStatus(
+                        CuBlasNative.cublasSgemm(
+                            _cublasHandle,
+                            CublasOperation.None,
+                            CublasOperation.None,
+                            headDim, seqLen, seqLen,
+                            ref aVal,
+                            vPtr, headDim,
+                            aPtr, seqLen,
+                            ref bVal,
+                            oPtr, headDim),
+                        $"cublasSgemm MHA output batch={batchIdx} head={headIdx}");
+                });
+            }
+        }
+
+        using var b1 = scheduler.Dispatch(launches);
+        scheduler.SynchronizeEvents(b1);
+    }
+
+    /// <summary>
+    /// Mixed-precision counterpart to <see cref="BatchedGemmFanout"/>:
+    /// fp16 / bf16 input A, B + fp32 accumulator output C. Routes each
+    /// slice through <c>cublasGemmEx</c> with <c>COMPUTE_32F</c> on its
+    /// own pool stream.
+    /// <para>
+    /// Combines #335 multi-stream dispatch with #337 mixed precision —
+    /// the standard AMP attention pattern in transformer backbones.
+    /// </para>
+    /// </summary>
+    /// <param name="useBFloat16">When true, A/B are bfloat16 (CUDA_R_16BF).
+    /// Otherwise fp16 (CUDA_R_16F). BF16 requires Ampere+ (cc >= 8.0).</param>
+    public unsafe void BatchedGemmExFanout(
+        IGpuBuffer A, IGpuBuffer B, IGpuBuffer C,
+        int M, int N, int K, int batchCount,
+        AiDotNet.Tensors.Engines.Gpu.GpuStreamScheduler scheduler,
+        bool useBFloat16 = false,
+        float alpha = 1.0f, float beta = 0.0f)
+    {
+        if (!IsAvailable) throw new InvalidOperationException("CUDA backend is not available.");
+        if (scheduler is null) throw new ArgumentNullException(nameof(scheduler));
+        // A/B are 2-byte (fp16/bf16); C is fp32. Use the byte-aware
+        // validator — the element-count overload would interpret A.Size
+        // as float elements and accept undersized half buffers.
+        ValidateBatchedGemmArgsBytes(A, B, C, M, N, K, batchCount,
+            elemBytesA: 2, elemBytesB: 2, elemBytesC: sizeof(float));
+
+        if (useBFloat16 && _ccMajor < 8)
+            throw new NotSupportedException(
+                $"BFloat16 GEMM requires compute capability >= 8.0 (Ampere+); device reports {_ccMajor}.{_ccMinor}.");
+
+        int inDtype = useBFloat16 ? CuBlasNative.CUDA_R_16BF : CuBlasNative.CUDA_R_16F;
+        long strideA = (long)M * K;
+        long strideB = (long)K * N;
+        long strideC = (long)M * N;
+        long elemBytesIn = 2;
+        long elemBytesOut = sizeof(float);
+
+        var launches = new System.Collections.Generic.List<System.Action<AiDotNet.Tensors.Engines.Gpu.IGpuStream>>(batchCount);
+        for (int b = 0; b < batchCount; b++)
+        {
+            int slice = b;
+            launches.Add(_ =>
+            {
+                float aVal = alpha, bVal = beta;
+                IntPtr alphaPtr = (IntPtr)(&aVal);
+                IntPtr betaPtr = (IntPtr)(&bVal);
+                IntPtr aPtr = (IntPtr)((long)A.Handle + slice * strideA * elemBytesIn);
+                IntPtr bPtr = (IntPtr)((long)B.Handle + slice * strideB * elemBytesIn);
+                IntPtr cPtr = (IntPtr)((long)C.Handle + slice * strideC * elemBytesOut);
+
+                CuBlasNative.CheckCublasStatus(
+                    CuBlasNative.cublasGemmEx(
+                        _cublasHandle,
+                        CublasOperation.None, CublasOperation.None,
+                        N, M, K,
+                        alphaPtr,
+                        bPtr, inDtype, N,
+                        aPtr, inDtype, K,
+                        betaPtr,
+                        cPtr, CuBlasNative.CUDA_R_32F, N,
+                        CuBlasNative.CUBLAS_COMPUTE_32F,
+                        0 /* CUBLAS_GEMM_DEFAULT */),
+                    $"cublasGemmEx slice {slice}");
+            });
+        }
+
+        using var batch = scheduler.Dispatch(launches);
+        scheduler.SynchronizeEvents(batch);
+    }
+
+    /// <summary>
+    /// Double-precision counterpart to <see cref="BatchedGemmFanout"/>.
+    /// Fans <paramref name="batchCount"/> independent <c>cublasDgemm</c>
+    /// launches across the scheduler's stream pool — same pattern as the
+    /// fp32 variant but for <c>double</c> input/output buffers.
+    /// </summary>
+    public void BatchedDgemmFanout(
+        IGpuBuffer A, IGpuBuffer B, IGpuBuffer C,
+        int M, int N, int K, int batchCount,
+        AiDotNet.Tensors.Engines.Gpu.GpuStreamScheduler scheduler,
+        double alpha = 1.0, double beta = 0.0)
+    {
+        if (!IsAvailable) throw new InvalidOperationException("CUDA backend is not available.");
+        if (scheduler is null) throw new ArgumentNullException(nameof(scheduler));
+        // All three buffers are fp64 (8-byte). The fp32-shaped validator
+        // would underestimate the byte requirement by 2× and accept a
+        // half-sized double buffer that then overruns inside cublasDgemm.
+        ValidateBatchedGemmArgsBytes(A, B, C, M, N, K, batchCount,
+            elemBytesA: sizeof(double), elemBytesB: sizeof(double), elemBytesC: sizeof(double));
+
+        long strideA = (long)M * K;
+        long strideB = (long)K * N;
+        long strideC = (long)M * N;
+        long elemBytes = sizeof(double);
+
+        var launches = new System.Collections.Generic.List<System.Action<AiDotNet.Tensors.Engines.Gpu.IGpuStream>>(batchCount);
+        for (int b = 0; b < batchCount; b++)
+        {
+            int slice = b;
+            launches.Add(_ =>
+            {
+                double aVal = alpha, bVal = beta;
+                IntPtr aPtr = (IntPtr)((long)A.Handle + slice * strideA * elemBytes);
+                IntPtr bPtr = (IntPtr)((long)B.Handle + slice * strideB * elemBytes);
+                IntPtr cPtr = (IntPtr)((long)C.Handle + slice * strideC * elemBytes);
+                CuBlasNative.CheckCublasStatus(
+                    CuBlasNative.cublasDgemm(
+                        _cublasHandle,
+                        CublasOperation.None,
+                        CublasOperation.None,
+                        N, M, K,
+                        ref aVal,
+                        bPtr, N,
+                        aPtr, K,
+                        ref bVal,
+                        cPtr, N),
+                    $"cublasDgemm slice {slice}");
+            });
+        }
+
+        using var batch = scheduler.Dispatch(launches);
+        scheduler.SynchronizeEvents(batch);
     }
 
     public IGpuBuffer GemmBiasRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
@@ -3173,6 +3732,11 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     private static void ValidateBatchedGemmArgs(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, int batchCount)
     {
+        // Element-count overload — assumes 4-byte float layout via
+        // IGpuBuffer.Size's semantics. Mixed-precision (fp16/bf16) and
+        // fp64 callers MUST use the byte-aware overload below instead;
+        // their per-element strides differ from the float assumption
+        // baked into ValidateGemmArgs / A.Size comparisons.
         if (batchCount <= 0)
             throw new ArgumentException("batchCount must be positive.");
 
@@ -3191,6 +3755,69 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             throw new ArgumentException("Buffer B is too small for the specified batch dimensions.");
         if (C.Size < requiredC)
             throw new ArgumentException("Buffer C is too small for the specified batch dimensions.");
+    }
+
+    /// <summary>
+    /// Byte-aware batched-GEMM validator for mixed-precision and fp64
+    /// fanout paths where the per-buffer element stride differs from the
+    /// 4-byte float assumption that <see cref="IGpuBuffer.Size"/>'s
+    /// element-count semantics bakes in. Compares against
+    /// <see cref="IGpuBuffer.SizeInBytes"/> so an undersized half/bfloat16
+    /// or double buffer can't pass validation and then walk past its
+    /// allocation inside cublasGemmEx / cublasDgemm.
+    /// </summary>
+    private static void ValidateBatchedGemmArgsBytes(
+        IGpuBuffer A, IGpuBuffer B, IGpuBuffer C,
+        int M, int N, int K, int batchCount,
+        int elemBytesA, int elemBytesB, int elemBytesC)
+    {
+        if (batchCount <= 0)
+            throw new ArgumentException("batchCount must be positive.");
+        if (M <= 0 || N <= 0 || K <= 0)
+            throw new ArgumentException("GEMM dimensions M, N, K must be positive.");
+        if (A is null) throw new ArgumentNullException(nameof(A));
+        if (B is null) throw new ArgumentNullException(nameof(B));
+        if (C is null) throw new ArgumentNullException(nameof(C));
+
+        // Overflow-safe checked arithmetic — the element-count overload
+        // had an `> int.MaxValue` upper-bound guard but this byte-aware
+        // overload doesn't, and an unchecked long * long multiplication
+        // can wrap negative (e.g. batchCount=1B × M=1B × K=4 = ~4×10^18,
+        // past long.MaxValue / 2). A wrapped requiredXBytes would let an
+        // impossibly small buffer pass validation and walk into wrapped
+        // pointer math inside cuBLAS.
+        long requiredAElems, requiredBElems, requiredCElems;
+        long requiredABytes, requiredBBytes, requiredCBytes;
+        try
+        {
+            checked
+            {
+                requiredAElems = (long)batchCount * M * K;
+                requiredBElems = (long)batchCount * K * N;
+                requiredCElems = (long)batchCount * M * N;
+                requiredABytes = requiredAElems * elemBytesA;
+                requiredBBytes = requiredBElems * elemBytesB;
+                requiredCBytes = requiredCElems * elemBytesC;
+            }
+        }
+        catch (OverflowException)
+        {
+            throw new ArgumentException(
+                $"Batched GEMM dimensions too large for fanout dispatch: M={M}, N={N}, K={K}, batchCount={batchCount}.");
+        }
+
+        if (A.SizeInBytes < requiredABytes)
+            throw new ArgumentException(
+                $"Buffer A too small: capacity={A.SizeInBytes} bytes, required={requiredABytes} bytes ({requiredAElems} elements × {elemBytesA}).",
+                nameof(A));
+        if (B.SizeInBytes < requiredBBytes)
+            throw new ArgumentException(
+                $"Buffer B too small: capacity={B.SizeInBytes} bytes, required={requiredBBytes} bytes ({requiredBElems} elements × {elemBytesB}).",
+                nameof(B));
+        if (C.SizeInBytes < requiredCBytes)
+            throw new ArgumentException(
+                $"Buffer C too small: capacity={C.SizeInBytes} bytes, required={requiredCBytes} bytes ({requiredCElems} elements × {elemBytesC}).",
+                nameof(C));
     }
 
     #region Convolution Operations
