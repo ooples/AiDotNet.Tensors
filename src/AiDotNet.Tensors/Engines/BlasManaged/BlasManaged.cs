@@ -9,8 +9,10 @@ namespace AiDotNet.Tensors.Engines.BlasManaged;
 public static class BlasManaged
 {
     /// <summary>
-    /// Computes C = alpha * op(A) * op(B) + beta * C where op(X) is X or X^T.
-    /// alpha = 1, beta = 0 by default; epilogue may modify the output.
+    /// Computes C = alpha*op(A)*op(B) + beta*C where op(X) is X or X^T.
+    /// Scalars alpha and beta and an optional fused epilogue (bias, activation, skip,
+    /// dropout, output scale) are specified via <see cref="BlasOptions{T}"/>. Defaults
+    /// when options are omitted: alpha = 1, beta = 0, no epilogue.
     /// </summary>
     public static void Gemm<T>(
         ReadOnlySpan<T> a, int lda, bool transA,

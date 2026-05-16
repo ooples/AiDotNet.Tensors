@@ -3,7 +3,7 @@ using Xunit;
 using BlasManagedLib = AiDotNet.Tensors.Engines.BlasManaged.BlasManaged;
 using AiDotNet.Tensors.Engines.BlasManaged;
 
-namespace AiDotNet.Tensors.Tests.BlasManaged;
+namespace AiDotNet.Tensors.Tests.Engines.BlasManaged;
 
 public class ScalarKernelTests
 {

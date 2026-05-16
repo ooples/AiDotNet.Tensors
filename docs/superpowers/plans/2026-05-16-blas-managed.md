@@ -128,7 +128,7 @@ src/AiDotNet.Tensors/Helpers/Autotune/AutotuneCache.cs            # Add MachineI
 ### Test files
 
 ```
-tests/AiDotNet.Tensors.Tests/BlasManaged/
+tests/AiDotNet.Tensors.Tests/Engines/BlasManaged/
   ScalarKernelTests.cs            # Per-microkernel unit tests (Phase B)
   Avx2KernelTests.cs              # AVX2 vs scalar parity (Phase C)
   Avx512KernelTests.cs            # AVX-512 vs scalar parity (Phase D)
@@ -160,12 +160,12 @@ Creates the project skeleton, stubs the public API, defines all data types. Comp
 
 **Files:**
 - Create: `src/AiDotNet.Tensors/Engines/BlasManaged/BlasManaged.cs`
-- Test: `tests/AiDotNet.Tensors.Tests/BlasManaged/ScalarKernelTests.cs`
+- Test: `tests/AiDotNet.Tensors.Tests/Engines/BlasManaged/ScalarKernelTests.cs`
 
 - [ ] **Step 1: Write the failing test**
 
 ```csharp
-// tests/AiDotNet.Tensors.Tests/BlasManaged/ScalarKernelTests.cs
+// tests/AiDotNet.Tensors.Tests/Engines/BlasManaged/ScalarKernelTests.cs
 using System;
 using AiDotNet.Tensors.Engines.BlasManaged;
 using Xunit;
@@ -251,7 +251,7 @@ Expected: PASS — the call throws `NotImplementedException` as asserted.
 ```
 git add src/AiDotNet.Tensors/Engines/BlasManaged/BlasManaged.cs \
         src/AiDotNet.Tensors/Engines/BlasManaged/BlasOptions.cs \
-        tests/AiDotNet.Tensors.Tests/BlasManaged/ScalarKernelTests.cs
+        tests/AiDotNet.Tensors.Tests/Engines/BlasManaged/ScalarKernelTests.cs
 git commit -m "feat(#358): BlasManaged stub — Gemm<T> entry point throws NotImplemented"
 ```
 
@@ -263,7 +263,7 @@ git commit -m "feat(#358): BlasManaged stub — Gemm<T> entry point throws NotIm
 - [ ] **Step 1: Write the failing test**
 
 ```csharp
-// tests/AiDotNet.Tensors.Tests/BlasManaged/ScalarKernelTests.cs (add to existing class)
+// tests/AiDotNet.Tensors.Tests/Engines/BlasManaged/ScalarKernelTests.cs (add to existing class)
 [Fact]
 public void PackingMode_HasFiveValues()
 {
@@ -340,7 +340,7 @@ Expected: PASS.
 - [ ] **Step 5: Commit**
 
 ```
-git add src/AiDotNet.Tensors/Engines/BlasManaged/BlasOptions.cs tests/AiDotNet.Tensors.Tests/BlasManaged/ScalarKernelTests.cs
+git add src/AiDotNet.Tensors/Engines/BlasManaged/BlasOptions.cs tests/AiDotNet.Tensors.Tests/Engines/BlasManaged/ScalarKernelTests.cs
 git commit -m "feat(#358): BlasManaged enums — PackingMode + ActivationType"
 ```
 
@@ -516,7 +516,7 @@ Expected: PASS.
 ```
 git add src/AiDotNet.Tensors/Engines/BlasManaged/BlasOptions.cs \
         src/AiDotNet.Tensors/Engines/BlasManaged/WeightPackHandle.cs \
-        tests/AiDotNet.Tensors.Tests/BlasManaged/ScalarKernelTests.cs
+        tests/AiDotNet.Tensors.Tests/Engines/BlasManaged/ScalarKernelTests.cs
 git commit -m "feat(#358): BlasOptions<T> + Epilogue<T> + WeightPackHandle scaffolding"
 ```
 
@@ -658,7 +658,7 @@ Expected: PASS.
 git add src/AiDotNet.Tensors/Engines/BlasManaged/Jit/KernelKey.cs \
         src/AiDotNet.Tensors/Engines/BlasManaged/Microkernels/IMicrokernel.cs \
         src/AiDotNet.Tensors/Engines/BlasManaged/BlasManagedStats.cs \
-        tests/AiDotNet.Tensors.Tests/BlasManaged/ScalarKernelTests.cs
+        tests/AiDotNet.Tensors.Tests/Engines/BlasManaged/ScalarKernelTests.cs
 git commit -m "feat(#358): BlasManaged KernelKey + IMicrokernel + Stats"
 ```
 
@@ -798,7 +798,7 @@ Expected: PASS.
 
 ```
 git add src/AiDotNet.Tensors/Engines/BlasManaged/Microkernels/Scalar/ScalarFp64_4x4.cs \
-        tests/AiDotNet.Tensors.Tests/BlasManaged/ScalarKernelTests.cs
+        tests/AiDotNet.Tensors.Tests/Engines/BlasManaged/ScalarKernelTests.cs
 git commit -m "feat(#358): scalar FP64 4x4 microkernel (ground truth)"
 ```
 
@@ -1196,12 +1196,12 @@ End state: all 4 gates from Section 10 of the spec pass in CI.
 
 **Tasks:**
 
-- **L1: ConvTranspose2D L2 perf gate (Gate 1)** — `tests/AiDotNet.Tensors.Tests/BlasManaged/ConvTranspose2DL2PerfTest.cs`. Runs `BlasManaged.Gemm<double>(M=4096, N=16, K=512, transA=true)` 100 iters post-warmup, asserts median ≤ 1 ms on AVX-512, ≤ 5 ms on AVX2-only, ≤ 5 ms on Neon. Skips on other arches with `[SkippableFact]`.
+- **L1: ConvTranspose2D L2 perf gate (Gate 1)** — `tests/AiDotNet.Tensors.Tests/Engines/BlasManaged/ConvTranspose2DL2PerfTest.cs`. Runs `BlasManaged.Gemm<double>(M=4096, N=16, K=512, transA=true)` 100 iters post-warmup, asserts median ≤ 1 ms on AVX-512, ≤ 5 ms on AVX2-only, ≤ 5 ms on Neon. Skips on other arches with `[SkippableFact]`.
 - **L2: Existing benchmark baseline (Gate 2)** — `tests/AiDotNet.Tensors.Benchmarks/baselines/preBlasManaged.json`. Captured BEFORE Phase K caller migration (i.e., at end of Phase J). Holds median ns/op for each pre-existing benchmark.
-- **L3: No-regression CI step** — `tests/AiDotNet.Tensors.Tests/BlasManaged/RegressionBaselineTests.cs`. Compares current benchmark medians to baseline; fails if any > 5% slower.
+- **L3: No-regression CI step** — `tests/AiDotNet.Tensors.Tests/Engines/BlasManaged/RegressionBaselineTests.cs`. Compares current benchmark medians to baseline; fails if any > 5% slower.
 - **L4: DeterminismTests** — already drafted in G7; finalize the 12-shape representative set.
 - **L5: NativeAOT smoke test** — separate AOT-published sub-project under `tests/AiDotNet.Tensors.NativeAotSmoke/`. Calls `BlasManaged.Gemm` on a half-dozen shapes; binary publish via `dotnet publish -c Release -r win-x64 -p:PublishAot=true`. CI step runs the AOT binary and asserts exit code 0 + expected output.
-- **L6: Pack-cache invalidation test** — `tests/AiDotNet.Tensors.Tests/BlasManaged/WeightPackInvalidationTests.cs`. End-to-end Allocate → Gemm → mutate weight → MarkDirty → Gemm → assert. (Already drafted in F7.)
+- **L6: Pack-cache invalidation test** — `tests/AiDotNet.Tensors.Tests/Engines/BlasManaged/WeightPackInvalidationTests.cs`. End-to-end Allocate → Gemm → mutate weight → MarkDirty → Gemm → assert. (Already drafted in F7.)
 - **L7: DCGAN companion PR (Gate 4)** — separate PR in sibling `..\AiDotNet` repo enabling `DCGANTests.MoreData_ShouldNotDegrade` with 60 s budget. This PR's CI step runs against the BlasManaged branch's locally-built `AiDotNet.Tensors`.
 - **L8: Phase L green-CI checkpoint** — all 4 gates green in CI.
 
