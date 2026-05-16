@@ -182,4 +182,32 @@ public class ScalarKernelTests
         for (int i = 0; i < expected.Length; i++)
             Assert.Equal(expected[i], c[i], precision: 12);
     }
+
+    [Fact]
+    public void ScalarFp32_4x4_Computes_4x4_Tile_From_Packed_Inputs()
+    {
+        // Packed-A vpanel layout: [Kc × Mr]. Mr-contiguous within each k-slice.
+        //   packedA[k*Mr + row] = A[row, k]
+        // For a single stripe with Mr=4 rows and Kc=2 K-steps:
+        //   k=0 slice: A[0,0]=1, A[1,0]=3, A[2,0]=5, A[3,0]=7
+        //   k=1 slice: A[0,1]=2, A[1,1]=4, A[2,1]=6, A[3,1]=8
+        float[] packedA = { 1f, 3f, 5f, 7f,   2f, 4f, 6f, 8f };
+
+        // Packed-B layout: [Kc × Nr] row-major. Nr-contiguous within each k.
+        //   packedB[k*Nr + col] = B[k, col]
+        float[] packedB = { 1f, 0f, 0f, 0f,   0f, 1f, 0f, 0f };
+
+        float[] c = new float[4 * 4];  // pre-zeroed by new[]
+        int ldc = 4;
+
+        ScalarFp32_4x4.Run(packedA, packedB, c, ldc, kc: 2);
+
+        // C[row, col] = sum_k A[row, k] · B[k, col]
+        // A = [[1,2],[3,4],[5,6],[7,8]], B = [[1,0,0,0],[0,1,0,0]]
+        // → C = [[1,2,0,0],[3,4,0,0],[5,6,0,0],[7,8,0,0]]
+        float[] expected = { 1f, 2f, 0f, 0f,   3f, 4f, 0f, 0f,   5f, 6f, 0f, 0f,   7f, 8f, 0f, 0f };
+        // FP32 has ~7 significant decimal digits; precision: 6 leaves margin for FMA reordering.
+        for (int i = 0; i < expected.Length; i++)
+            Assert.Equal(expected[i], c[i], precision: 6);
+    }
 }
