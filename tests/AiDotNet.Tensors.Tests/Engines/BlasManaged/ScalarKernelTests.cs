@@ -866,6 +866,64 @@ public class ScalarKernelTests
         }
     }
 
+    // ── C7: AVX2 dispatch end-to-end tests ───────────────────────────────────
+
+    [Theory]
+    [InlineData(8, 8, 8, false, false)]    // tile multiple of AVX2 (mr=4, nr=8 for FP64)
+    [InlineData(16, 16, 16, false, false)]
+    [InlineData(16, 8, 64, true, false)]   // L2-shape-style
+    public void Gemm_AvxPath_FP64_MatchesScalar(int m, int n, int k, bool transA, bool transB)
+    {
+        var (a, b) = GenerateRandomMatrices(m, n, k, transA, transB, seed: 42);
+        int aRows = transA ? k : m;
+        int aCols = transA ? m : k;
+        int bRows = transB ? n : k;
+        int bCols = transB ? k : n;
+
+        double[] expected = NaiveGemm(a, aRows, aCols, transA, b, bRows, bCols, transB);
+
+        double[] actual = new double[m * n];
+        BlasManagedLib.Gemm<double>(
+            a, lda: aCols, transA,
+            b, ldb: bCols, transB,
+            actual, ldc: n,
+            m, n, k);
+
+        for (int i = 0; i < expected.Length; i++)
+            Assert.Equal(expected[i], actual[i], precision: 10);
+    }
+
+    [Fact]
+    public void Gemm_AvxPath_FP32_MatchesScalar()
+    {
+        int m = 16, n = 16, k = 16;
+        var rng = new Random(42);
+        float[] a = new float[m * k];
+        float[] b = new float[k * n];
+        for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < b.Length; i++) b[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        // Reference: naive triple-loop FP32 GEMM.
+        float[] expected = new float[m * n];
+        for (int i = 0; i < m; i++)
+            for (int j = 0; j < n; j++)
+            {
+                float sum = 0;
+                for (int kk = 0; kk < k; kk++) sum += a[i * k + kk] * b[kk * n + j];
+                expected[i * n + j] = sum;
+            }
+
+        float[] actual = new float[m * n];
+        BlasManagedLib.Gemm<float>(
+            a, lda: k, transA: false,
+            b, ldb: n, transB: false,
+            actual, ldc: n,
+            m, n, k);
+
+        for (int i = 0; i < expected.Length; i++)
+            Assert.Equal(expected[i], actual[i], precision: 4);
+    }
+
     // ── B5 helpers ────────────────────────────────────────────────────────────
 
     private static (double[] a, double[] b) GenerateRandomMatrices(int m, int n, int k, bool transA, bool transB, int seed)

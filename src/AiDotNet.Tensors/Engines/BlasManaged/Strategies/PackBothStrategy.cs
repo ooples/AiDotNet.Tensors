@@ -109,7 +109,8 @@ internal static class PackBothStrategy
                                 packA.AsSpan(packedAStripeOff, effectiveKc * mr),
                                 packB.AsSpan(packedBStripeOff, effectiveKc * nr),
                                 c.Slice(cTileOff),
-                                ldc, effectiveKc);
+                                ldc, effectiveKc,
+                                mr, nr);
                         }
                     }
                 }
@@ -118,34 +119,60 @@ internal static class PackBothStrategy
     }
 
     /// <summary>
-    /// Routes to the scalar microkernel matching T. For Phase B (scalar
-    /// reference), both float and double dispatch into a 4×4 microkernel.
-    /// Later phases add AVX2/AVX-512/Neon paths here without changing the
-    /// outer loop structure.
+    /// Routes to the appropriate microkernel for T based on (mr, nr) and
+    /// runtime AVX2/FMA availability. When AVX2 is available and (mr, nr)
+    /// match the AVX2 tile size, the AVX2 microkernel is used; otherwise the
+    /// scalar 4×4 reference kernel is used.
     /// </summary>
     private static void DispatchMicrokernel<T>(
         ReadOnlySpan<T> packedA, ReadOnlySpan<T> packedB,
-        Span<T> c, int ldc, int kc) where T : unmanaged
+        Span<T> c, int ldc, int kc,
+        int mr, int nr) where T : unmanaged
     {
         if (typeof(T) == typeof(double))
         {
-            ScalarFp64_4x4.Run(
-                MemoryMarshal.Cast<T, double>(packedA),
-                MemoryMarshal.Cast<T, double>(packedB),
-                MemoryMarshal.Cast<T, double>(c),
-                ldc, kc);
+            if (mr == 4 && nr == 8 && Avx2Fp64_4x8.IsSupported)
+            {
+                Avx2Fp64_4x8.Run(
+                    MemoryMarshal.Cast<T, double>(packedA),
+                    MemoryMarshal.Cast<T, double>(packedB),
+                    MemoryMarshal.Cast<T, double>(c),
+                    ldc, kc);
+                return;
+            }
+            if (mr == 4 && nr == 4)
+            {
+                ScalarFp64_4x4.Run(
+                    MemoryMarshal.Cast<T, double>(packedA),
+                    MemoryMarshal.Cast<T, double>(packedB),
+                    MemoryMarshal.Cast<T, double>(c),
+                    ldc, kc);
+                return;
+            }
+            throw new NotSupportedException($"Unsupported FP64 microkernel shape Mr={mr} Nr={nr}");
         }
-        else if (typeof(T) == typeof(float))
+        if (typeof(T) == typeof(float))
         {
-            ScalarFp32_4x4.Run(
-                MemoryMarshal.Cast<T, float>(packedA),
-                MemoryMarshal.Cast<T, float>(packedB),
-                MemoryMarshal.Cast<T, float>(c),
-                ldc, kc);
+            if (mr == 8 && nr == 8 && Avx2Fp32_8x8.IsSupported)
+            {
+                Avx2Fp32_8x8.Run(
+                    MemoryMarshal.Cast<T, float>(packedA),
+                    MemoryMarshal.Cast<T, float>(packedB),
+                    MemoryMarshal.Cast<T, float>(c),
+                    ldc, kc);
+                return;
+            }
+            if (mr == 4 && nr == 4)
+            {
+                ScalarFp32_4x4.Run(
+                    MemoryMarshal.Cast<T, float>(packedA),
+                    MemoryMarshal.Cast<T, float>(packedB),
+                    MemoryMarshal.Cast<T, float>(c),
+                    ldc, kc);
+                return;
+            }
+            throw new NotSupportedException($"Unsupported FP32 microkernel shape Mr={mr} Nr={nr}");
         }
-        else
-        {
-            throw new NotSupportedException($"PackBothStrategy does not support T={typeof(T).Name}.");
-        }
+        throw new NotSupportedException($"PackBothStrategy does not support T={typeof(T).Name}.");
     }
 }

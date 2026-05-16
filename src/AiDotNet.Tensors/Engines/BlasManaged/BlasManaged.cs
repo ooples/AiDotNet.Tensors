@@ -1,4 +1,5 @@
 using System;
+using System.Runtime.InteropServices;
 
 namespace AiDotNet.Tensors.Engines.BlasManaged;
 
@@ -65,6 +66,16 @@ public static class BlasManaged
         if (strategy == PackingMode.ForcePackAOnly && transB)
             strategy = PackingMode.ForcePackBoth;
 
+        // Pick AVX2-aware (mr, nr) for PackBoth. Fall back to (4, 4) scalar when
+        // the shape is not an exact multiple of the AVX2 tile — tail handling added
+        // in Phase G. PackAOnly always uses scalar (4, 4) because its strided-B path
+        // has no AVX2 RunStridedB variant yet (deferred to Phase Cx).
+        var (mr, nr) = PickMicrokernelTile<T>();
+        if (m % mr != 0 || n % nr != 0)
+        {
+            mr = 4; nr = 4;
+        }
+
         switch (strategy)
         {
             case PackingMode.ForcePackBoth:
@@ -74,9 +85,11 @@ public static class BlasManaged
                     c, ldc,
                     m, n, k,
                     mc: 64, nc: 64, kc: 64,
-                    mr: 4, nr: 4);
+                    mr: mr, nr: nr);
                 break;
             case PackingMode.ForcePackAOnly:
+                // PackAOnly currently has no AVX2 strided-B kernel; always scalar Mr=Nr=4.
+                // TODO(Phase Cx): add Avx2 RunStridedB variants and wire them here.
                 PackAOnlyStrategy.Run<T>(
                     a, lda, transA,
                     b, ldb,
@@ -86,6 +99,7 @@ public static class BlasManaged
                     mr: 4, nr: 4);
                 break;
             case PackingMode.ForceStreaming:
+                // Streaming dispatches AVX2 internally — no Mr/Nr tiling parameter.
                 StreamingStrategy.Run<T>(
                     a, lda, transA,
                     b, ldb, transB,
@@ -105,7 +119,7 @@ public static class BlasManaged
                     switch (fallback)
                     {
                         case PackingMode.ForcePackBoth:
-                            PackBothStrategy.Run<T>(a, lda, transA, b, ldb, transB, c, ldc, m, n, k, 64, 64, 64, 4, 4);
+                            PackBothStrategy.Run<T>(a, lda, transA, b, ldb, transB, c, ldc, m, n, k, 64, 64, 64, mr, nr);
                             break;
                         case PackingMode.ForcePackAOnly:
                             PackAOnlyStrategy.Run<T>(a, lda, transA, b, ldb, c, ldc, m, n, k, 64, 64, 4, 4);
@@ -121,5 +135,25 @@ public static class BlasManaged
             default:
                 throw new NotSupportedException($"Unknown PackingMode: {strategy}");
         }
+    }
+
+    /// <summary>
+    /// Pick the microkernel (mr, nr) tile widths based on element type and
+    /// runtime AVX2/FMA availability. Returns the scalar 4×4 fallback when
+    /// AVX2 isn't usable. This selection drives the layout of packed-A and
+    /// packed-B, so it must match the microkernel the strategy ultimately
+    /// dispatches to.
+    /// </summary>
+    private static (int Mr, int Nr) PickMicrokernelTile<T>() where T : unmanaged
+    {
+        if (typeof(T) == typeof(double))
+        {
+            return Avx2Fp64_4x8.IsSupported ? (4, 8) : (4, 4);
+        }
+        if (typeof(T) == typeof(float))
+        {
+            return Avx2Fp32_8x8.IsSupported ? (8, 8) : (4, 4);
+        }
+        return (4, 4);
     }
 }

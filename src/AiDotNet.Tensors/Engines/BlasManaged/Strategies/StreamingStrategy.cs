@@ -4,15 +4,14 @@ using System.Runtime.InteropServices;
 namespace AiDotNet.Tensors.Engines.BlasManaged;
 
 /// <summary>
-/// Streaming strategy — no packing. Dispatches the scalar streaming microkernel
+/// Streaming strategy — no packing. Dispatches the streaming microkernel
 /// directly over the full (M, N, K) shape. Used by <see cref="BlasManaged.Gemm{T}"/>
 /// for small K (typically &lt; 32) where the pack cost in <see cref="PackBothStrategy"/>
 /// or <see cref="PackAOnlyStrategy"/> would exceed the GEMM compute time.
 ///
 /// <para>
-/// Phase B uses a single scalar microkernel parameterized by trans flags.
-/// AVX2/AVX-512/Neon phases may split this into 4 trans-specialized kernels
-/// where SIMD load patterns differ.
+/// Routes to <see cref="Avx2Streaming"/> when AVX2 + FMA are available at
+/// runtime, otherwise falls back to the scalar reference kernel.
 /// </para>
 /// </summary>
 internal static class StreamingStrategy
@@ -30,19 +29,41 @@ internal static class StreamingStrategy
     {
         if (typeof(T) == typeof(double))
         {
-            ScalarStreaming.RunFp64(
-                MemoryMarshal.Cast<T, double>(a), lda, transA,
-                MemoryMarshal.Cast<T, double>(b), ldb, transB,
-                MemoryMarshal.Cast<T, double>(c), ldc,
-                m, n, k);
+            if (Avx2Streaming.IsSupported)
+            {
+                Avx2Streaming.RunFp64(
+                    MemoryMarshal.Cast<T, double>(a), lda, transA,
+                    MemoryMarshal.Cast<T, double>(b), ldb, transB,
+                    MemoryMarshal.Cast<T, double>(c), ldc,
+                    m, n, k);
+            }
+            else
+            {
+                ScalarStreaming.RunFp64(
+                    MemoryMarshal.Cast<T, double>(a), lda, transA,
+                    MemoryMarshal.Cast<T, double>(b), ldb, transB,
+                    MemoryMarshal.Cast<T, double>(c), ldc,
+                    m, n, k);
+            }
         }
         else if (typeof(T) == typeof(float))
         {
-            ScalarStreaming.RunFp32(
-                MemoryMarshal.Cast<T, float>(a), lda, transA,
-                MemoryMarshal.Cast<T, float>(b), ldb, transB,
-                MemoryMarshal.Cast<T, float>(c), ldc,
-                m, n, k);
+            if (Avx2Streaming.IsSupported)
+            {
+                Avx2Streaming.RunFp32(
+                    MemoryMarshal.Cast<T, float>(a), lda, transA,
+                    MemoryMarshal.Cast<T, float>(b), ldb, transB,
+                    MemoryMarshal.Cast<T, float>(c), ldc,
+                    m, n, k);
+            }
+            else
+            {
+                ScalarStreaming.RunFp32(
+                    MemoryMarshal.Cast<T, float>(a), lda, transA,
+                    MemoryMarshal.Cast<T, float>(b), ldb, transB,
+                    MemoryMarshal.Cast<T, float>(c), ldc,
+                    m, n, k);
+            }
         }
         else
         {
