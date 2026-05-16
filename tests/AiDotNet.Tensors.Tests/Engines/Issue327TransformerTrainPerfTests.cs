@@ -16,6 +16,11 @@ using Xunit.Abstractions;
 
 namespace AiDotNet.Tensors.Tests.Engines;
 
+// Shares EngineCurrentGlobalState (defined in CompiledBackwardWalkTests.cs)
+// so the two classes can't interleave their AiDotNetEngine.Current pins +
+// CompiledBackwardWalk override toggles + walker-cache state on xUnit's
+// parallel runner.
+[Collection("EngineCurrentGlobalState")]
 public class Issue327TransformerTrainPerfTests
 {
     private readonly ITestOutputHelper _output;
@@ -200,6 +205,112 @@ public class Issue327TransformerTrainPerfTests
         }
         finally
         {
+            AiDotNetEngine.Current = priorEngine;
+        }
+    }
+
+    /// <summary>
+    /// Issue #338 Item 3: compares the IL-emitted compiled-backward walker
+    /// against the reference dispatcher on the same fresh-tape workload.
+    /// Runs both with-override-off and with-override-on, asserts the IL
+    /// walker version is NOT slower than the reference (within 30%
+    /// tolerance for JIT warmup and timing noise).
+    /// <para>
+    /// This is the hardware-independent regression gate. The absolute
+    /// wall-time target (≤100ms close, ≤50ms stretch) requires manual
+    /// benchmarking on a 16-core x64 reference box — see the issue
+    /// body's close criteria.
+    /// </para>
+    /// </summary>
+    [Fact]
+    [Trait("Category", "Perf")]
+    public void Issue338_Item3_CompiledIL_NotSlowerThanReference()
+    {
+        if (Environment.GetEnvironmentVariable("AIDOTNET_RUN_PERF_GATES") != "1")
+        {
+            _output.WriteLine("Skip: AIDOTNET_RUN_PERF_GATES != 1.");
+            return;
+        }
+
+        var priorEngine = AiDotNetEngine.Current;
+        var engine = new CpuEngine();
+        AiDotNetEngine.Current = engine;
+
+        var walkerType = typeof(CompiledBackwardWalk<>).MakeGenericType(typeof(float));
+        var overrideField = walkerType.GetField("_testEnabledOverride",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)!;
+        var resetMethod = walkerType.GetMethod("ResetForTests",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)!;
+
+        try
+        {
+            var input = MakeFloatTensor(new[] { B, Ctx, D }, new Random(42));
+            var weights = MakeWeights(Layers);
+
+            // Warmup with override off
+            overrideField.SetValue(null, false);
+            for (int i = 0; i < 3; i++)
+            {
+                using var warmTape = new GradientTape<float>();
+                var y = ForwardL(engine, input, weights);
+                var loss = engine.ReduceSum(y, axes: null, keepDims: false);
+                warmTape.ComputeGradients(loss, weights);
+            }
+
+            // Reference timing
+            const int iters = 5;
+            var refSw = Stopwatch.StartNew();
+            for (int i = 0; i < iters; i++)
+            {
+                using var tape = new GradientTape<float>();
+                var y = ForwardL(engine, input, weights);
+                var loss = engine.ReduceSum(y, axes: null, keepDims: false);
+                tape.ComputeGradients(loss, weights);
+            }
+            refSw.Stop();
+            double refMsPerIter = refSw.Elapsed.TotalMilliseconds / iters;
+
+            // Reset walker cache + flip override on, then warm again so
+            // the IL walker compiles + JITs before timing.
+            resetMethod.Invoke(null, null);
+            overrideField.SetValue(null, true);
+            for (int i = 0; i < 3; i++)
+            {
+                using var warmTape = new GradientTape<float>();
+                var y = ForwardL(engine, input, weights);
+                var loss = engine.ReduceSum(y, axes: null, keepDims: false);
+                warmTape.ComputeGradients(loss, weights);
+            }
+
+            var ilSw = Stopwatch.StartNew();
+            for (int i = 0; i < iters; i++)
+            {
+                using var tape = new GradientTape<float>();
+                var y = ForwardL(engine, input, weights);
+                var loss = engine.ReduceSum(y, axes: null, keepDims: false);
+                tape.ComputeGradients(loss, weights);
+            }
+            ilSw.Stop();
+            double ilMsPerIter = ilSw.Elapsed.TotalMilliseconds / iters;
+
+            _output.WriteLine($"Reference dispatcher: {refMsPerIter:F2} ms/iter");
+            _output.WriteLine($"Compiled-IL walker:   {ilMsPerIter:F2} ms/iter");
+            _output.WriteLine($"IL walker overhead:   {(ilMsPerIter - refMsPerIter):F2} ms/iter "
+                + $"({(ilMsPerIter / refMsPerIter - 1.0) * 100:F1}%)");
+
+            // 30% tolerance — JIT warmup variance + thread-scheduling
+            // noise. The IL walker should be at LEAST as fast as the
+            // reference in steady state; a 30% slowdown gate catches
+            // genuine emission regressions without flapping on noise.
+            Assert.True(ilMsPerIter <= refMsPerIter * 1.3,
+                $"Compiled-IL walker is {(ilMsPerIter / refMsPerIter - 1.0) * 100:F1}% slower than reference "
+                + $"({ilMsPerIter:F2} ms vs {refMsPerIter:F2} ms). "
+                + "Expected the IL walker to be at most 30% slower; an emission regression is likely.");
+        }
+        finally
+        {
+            overrideField.SetValue(null, null);
+            resetMethod.Invoke(null, null);
             AiDotNetEngine.Current = priorEngine;
         }
     }

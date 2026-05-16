@@ -33,6 +33,13 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
     public sealed partial class OpenClBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     {
         /// <summary>
+        /// OpenCL has no cuDNN-equivalent half/bfloat16 conv path —
+        /// returns null so IDirectGpuBackend's mixed-precision discovery
+        /// surface (Issue #337) correctly reports the capability as absent.
+        /// </summary>
+        public AiDotNet.Tensors.Engines.Gpu.IGpuMixedPrecisionConvBackend? MixedPrecisionConv => null;
+
+        /// <summary>
         /// Controls whether initialization and diagnostic output is written to Console.
         /// Set to false to suppress GPU diagnostics for rich terminal UI or batch processing.
         /// Controlled via AIDOTNET_GPU_VERBOSE environment variable (accepts true/false/1/0/yes/no/on/off).

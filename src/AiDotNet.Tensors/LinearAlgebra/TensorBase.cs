@@ -519,6 +519,15 @@ public abstract class TensorBase<T> : IDisposable
         return null;
     }
 
+    /// <summary>
+    /// Alias for <see cref="TryGetGpuBuffer"/> matching the
+    /// <c>AsGpuBuffer&lt;T&gt;()</c> name from issue #336's body. The
+    /// behaviour is identical — returns the non-owning IGpuBuffer view
+    /// when one exists, or <c>null</c>. Kept as a thin forwarder so
+    /// callers can use either spelling.
+    /// </summary>
+    public Engines.DirectGpu.IGpuBuffer? AsGpuBuffer() => TryGetGpuBuffer();
+
     /// <summary>Element byte size for the tensor's T parameter — used by
     /// <see cref="TryGetGpuBuffer"/> when wrapping a device pointer for
     /// callers that need the byte count without round-tripping through

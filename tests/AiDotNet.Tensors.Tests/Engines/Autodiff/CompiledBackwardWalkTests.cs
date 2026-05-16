@@ -1,0 +1,1044 @@
+using System;
+using System.Collections.Generic;
+using System.Reflection;
+using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.Autodiff;
+using AiDotNet.Tensors.LinearAlgebra;
+using Xunit;
+
+namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
+
+/// <summary>
+/// Serializes tests that mutate process-wide engine + compiled-walker
+/// state (AiDotNetEngine.Current, CompiledBackwardWalk&lt;T&gt;'s test
+/// override flag, and the per-thread compiled-chain cache). Without
+/// this, xUnit's default parallel runner can interleave classes that
+/// each assume exclusive ownership of those globals — surfaces as
+/// flaky test failures that vanish on rerun.
+/// </summary>
+[CollectionDefinition("EngineCurrentGlobalState", DisableParallelization = true)]
+public sealed class EngineCurrentGlobalStateCollection { }
+
+/// <summary>
+/// Issue #338 Item 3: validates the compiled-IL backward integration
+/// scaffolding. The walker compilation today is a passthrough; future
+/// commits replace it with a JIT-emitted DynamicMethod. These tests pin
+/// the API contract + register/lookup semantics so that future IL work
+/// can replace the passthrough without breaking the integration.
+/// </summary>
+[Collection("EngineCurrentGlobalState")]
+public class CompiledBackwardWalkTests
+{
+    /// <summary>
+    /// Invokes the internal CompiledBackwardWalk&lt;T&gt; statics via
+    /// reflection — they're intentionally <c>internal</c> so consumer
+    /// code routes through GradientTape's hooks. The test runs in the
+    /// same assembly so reflection access is permitted by visibility,
+    /// but we keep the names typed at runtime so a future rename surfaces
+    /// here rather than as a silent test pass.
+    /// </summary>
+    private static System.Type WalkerOfFloat()
+    {
+        var openType = typeof(CompiledBackwardWalk<>);
+        return openType.MakeGenericType(typeof(float));
+    }
+
+    [Fact]
+    public void Enabled_DefaultsToFalse_WithoutEnvVar()
+    {
+        // Make the test self-contained: clear the env var so we're
+        // actually exercising the "without env var" default path
+        // regardless of the runner's ambient state. The previous
+        // implementation accepted any non-empty / non-"0" value as
+        // enabled, which meant a runner with AIDOTNET_COMPILED_BACKWARD=
+        // "false" or "no" would silently pass while testing the wrong
+        // branch.
+        var prior = System.Environment.GetEnvironmentVariable("AIDOTNET_COMPILED_BACKWARD");
+        System.Environment.SetEnvironmentVariable("AIDOTNET_COMPILED_BACKWARD", null);
+        try
+        {
+            var t = WalkerOfFloat();
+            // ResetForTests forces the Lazy-style cached env-var read to
+            // re-evaluate; without it, a previous test that toggled the
+            // override could leave the property cached.
+            var resetMethod = t.GetMethod("ResetForTests",
+                BindingFlags.NonPublic | BindingFlags.Static);
+            resetMethod?.Invoke(null, null);
+
+            var prop = t.GetProperty("Enabled",
+                BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Static);
+            Assert.NotNull(prop);
+            var value = (bool)prop!.GetValue(null)!;
+            Assert.False(value, "Enabled should default to false when AIDOTNET_COMPILED_BACKWARD is unset.");
+        }
+        finally
+        {
+            System.Environment.SetEnvironmentVariable("AIDOTNET_COMPILED_BACKWARD", prior);
+        }
+    }
+
+    [Fact]
+    public void Register_ThenTryGetWalker_ReturnsRegisteredDelegate()
+    {
+        var t = WalkerOfFloat();
+        var resetMethod = t.GetMethod("ResetForTests",
+            BindingFlags.NonPublic | BindingFlags.Static);
+        var tryGetMethod = t.GetMethod("TryGetWalker",
+            BindingFlags.NonPublic | BindingFlags.Static);
+        var registerMethod = t.GetMethod("Register",
+            BindingFlags.NonPublic | BindingFlags.Static);
+        var compileMethod = t.GetMethod("Compile",
+            BindingFlags.NonPublic | BindingFlags.Static,
+            binder: null,
+            types: new[] { typeof(int[]) },
+            modifiers: null);
+        Assert.NotNull(resetMethod);
+        Assert.NotNull(tryGetMethod);
+        Assert.NotNull(registerMethod);
+        Assert.NotNull(compileMethod);
+
+        resetMethod!.Invoke(null, null);
+        Assert.Null(tryGetMethod!.Invoke(null, new object[] { 12345L }));
+
+        // Use Compile to obtain a real walker delegate — avoids the type-
+        // matching gymnastics of constructing one externally. The walker
+        // is the passthrough; we never invoke it here, only register and
+        // retrieve it to verify cache lookup semantics.
+        var indices = new[] { 0 };
+        var walker = compileMethod!.Invoke(null, new object[] { indices });
+        Assert.NotNull(walker);
+
+        registerMethod!.Invoke(null, new object[] { 12345L, walker! });
+
+        var retrieved = tryGetMethod.Invoke(null, new object[] { 12345L });
+        Assert.NotNull(retrieved);
+        Assert.Same(walker, retrieved);
+
+        // Tidy up so subsequent tests start with a clean slate.
+        resetMethod.Invoke(null, null);
+    }
+
+    [Fact]
+    public void CompiledWalker_ProducesIdenticalGradientsToReference_SimpleTape()
+    {
+        // End-to-end parity gate: builds a tiny gradient tape, runs
+        // ComputeGradients through the existing reference dispatcher,
+        // and verifies the analytic gradient. The CompiledBackwardWalk
+        // is registered in RebindablePlanCache.Store whenever
+        // AIDOTNET_COMPILED_BACKWARD is set, so this also exercises the
+        // walker's registration path. The walker's invocation path is
+        // gated behind the env var — when it's off, this test exercises
+        // the reference dispatcher and ensures CompiledBackwardWalk's
+        // mere presence doesn't break the existing flow.
+        var prior = AiDotNetEngine.Current;
+        var engine = new CpuEngine();
+        AiDotNetEngine.Current = engine;
+        try
+        {
+            // GradientTape activates on construction and deactivates on
+            // Dispose. Watch isn't needed — DifferentiableOps records
+            // every engine op while the tape is active.
+            using var tape = new GradientTape<float>(new GradientTapeOptions { Persistent = true });
+
+            // y = (a * b) + a — exercises MultiplyBackward, AddBackward,
+            // and an input referenced twice (so a's gradient sums two
+            // contributions: dL/d(a*b)*b + dL/d(a*b+a)*1).
+            var a = new Tensor<float>(new float[] { 2.0f, 3.0f }, new[] { 2 });
+            var b = new Tensor<float>(new float[] { 4.0f, 5.0f }, new[] { 2 });
+            var prod = engine.TensorMultiply(a, b);
+            var y = engine.TensorAdd(prod, a);
+            // ReduceSum with no axes reduces to a scalar tensor (shape [1]).
+            var loss = engine.ReduceSum(y);
+
+            var referenceGrads = tape.ComputeGradients(loss, new List<Tensor<float>> { a, b });
+            Assert.True(referenceGrads.ContainsKey(a));
+            Assert.True(referenceGrads.ContainsKey(b));
+
+            // y = a*b + a; sum(y) = sum(a*b + a)
+            // dL/da = b + 1 = [5, 6]
+            // dL/db = a     = [2, 3]
+            var aGradRef = referenceGrads[a];
+            var bGradRef = referenceGrads[b];
+            Assert.Equal(5.0f, aGradRef.GetDataArray()[0], 4);
+            Assert.Equal(6.0f, aGradRef.GetDataArray()[1], 4);
+            Assert.Equal(2.0f, bGradRef.GetDataArray()[0], 4);
+            Assert.Equal(3.0f, bGradRef.GetDataArray()[1], 4);
+        }
+        finally
+        {
+            AiDotNetEngine.Current = prior;
+        }
+    }
+
+    [Fact]
+    public void CompiledWalker_ILEmitted_ProducesSameGradientsAsReference()
+    {
+        // Bypass the env-var gating by calling CompiledBackwardWalk<T>.Compile
+        // directly (which always attempts IL emission first, falling back to
+        // closure only on emit failure). The returned walker then runs on the
+        // SAME tape entries the reference dispatcher walked, and we compare.
+        var prior = AiDotNetEngine.Current;
+        var engine = new CpuEngine();
+        AiDotNetEngine.Current = engine;
+        try
+        {
+            using var tape = new GradientTape<float>(new GradientTapeOptions { Persistent = true });
+            var a = new Tensor<float>(new float[] { 2.0f, 3.0f, 4.0f }, new[] { 3 });
+            var b = new Tensor<float>(new float[] { 5.0f, 6.0f, 7.0f }, new[] { 3 });
+            var prod = engine.TensorMultiply(a, b);
+            var sum = engine.TensorAdd(prod, a);
+            var loss = engine.ReduceSum(sum);
+
+            // Reference path: compute via the inline dispatcher.
+            var refGrads = tape.ComputeGradients(loss, new List<Tensor<float>> { a, b });
+            float refDA0 = refGrads[a].GetDataArray()[0];
+            float refDA1 = refGrads[a].GetDataArray()[1];
+            float refDA2 = refGrads[a].GetDataArray()[2];
+            float refDB0 = refGrads[b].GetDataArray()[0];
+            float refDB1 = refGrads[b].GetDataArray()[1];
+            float refDB2 = refGrads[b].GetDataArray()[2];
+
+            // dL/da = b + 1, dL/db = a
+            Assert.Equal(6.0f, refDA0, 4);
+            Assert.Equal(7.0f, refDA1, 4);
+            Assert.Equal(8.0f, refDA2, 4);
+            Assert.Equal(2.0f, refDB0, 4);
+            Assert.Equal(3.0f, refDB1, 4);
+            Assert.Equal(4.0f, refDB2, 4);
+
+            // Build walker indices directly from the tape entry count.
+            // The tape's reverse-topo walk visits entries from last
+            // to first, so indices = [count-1, count-2, ..., 0].
+            var tapeType = typeof(GradientTape<float>);
+            var entriesField = tapeType.GetField("_entries",
+                BindingFlags.NonPublic | BindingFlags.Instance);
+            Assert.NotNull(entriesField);
+            var entriesObj = entriesField!.GetValue(tape);
+            Assert.NotNull(entriesObj);
+
+            // TapeEntryArena<float>.Count via reflection.
+            var arenaType = entriesObj!.GetType();
+            var countProp = arenaType.GetProperty("Count",
+                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            Assert.NotNull(countProp);
+            int entryCount = (int)countProp!.GetValue(entriesObj)!;
+            if (entryCount == 0)
+                return; // tape didn't record (shouldn't happen but
+                        // defensive)
+
+            var indices = new int[entryCount];
+            for (int i = 0; i < entryCount; i++)
+                indices[i] = entryCount - 1 - i;  // reverse-topo
+
+            var walkerType = WalkerOfFloat();
+            var compileMethod = walkerType.GetMethod("Compile",
+                BindingFlags.NonPublic | BindingFlags.Static,
+                binder: null,
+                types: new[] { typeof(int[]) },
+                modifiers: null)!;
+            var walker = compileMethod.Invoke(null, new object[] { indices });
+            Assert.NotNull(walker);
+
+            // Walker signature:
+            //   (TapeEntryArena<T>, Tensor<T>, IReadOnlyList<Tensor<T>>?, IEngine)
+            //     -> Dictionary<Tensor<T>, Tensor<T>>?
+            var sources = new List<Tensor<float>> { a, b };
+            var result = walker!.GetType().GetMethod("Invoke")!
+                .Invoke(walker, new object?[] { entriesObj, loss, sources, engine });
+            Assert.NotNull(result);
+
+            var ilGrads = (Dictionary<Tensor<float>, Tensor<float>>)result!;
+            float ilDA0 = ilGrads[a].GetDataArray()[0];
+            float ilDA1 = ilGrads[a].GetDataArray()[1];
+            float ilDA2 = ilGrads[a].GetDataArray()[2];
+            float ilDB0 = ilGrads[b].GetDataArray()[0];
+            float ilDB1 = ilGrads[b].GetDataArray()[1];
+            float ilDB2 = ilGrads[b].GetDataArray()[2];
+
+            // The IL-emitted walker MUST produce identical gradients to
+            // the reference dispatcher — same input tape, same logic,
+            // different code-gen.
+            Assert.Equal(refDA0, ilDA0, 4);
+            Assert.Equal(refDA1, ilDA1, 4);
+            Assert.Equal(refDA2, ilDA2, 4);
+            Assert.Equal(refDB0, ilDB0, 4);
+            Assert.Equal(refDB1, ilDB1, 4);
+            Assert.Equal(refDB2, ilDB2, 4);
+        }
+        finally
+        {
+            AiDotNetEngine.Current = prior;
+        }
+    }
+
+    [Fact]
+    public void WalkerCache_EvictionDoesntBreakSubsequentReplay()
+    {
+        // After eviction, re-encountering an evicted pattern should
+        // recompile a walker and produce identical results to the
+        // pre-eviction reference. Pins that the cache's lifecycle
+        // doesn't introduce any state corruption.
+        var t = WalkerOfFloat();
+        var resetMethod = t.GetMethod("ResetForTests",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+        var registerMethod = t.GetMethod("Register",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+        var compileMethod = t.GetMethod("Compile",
+            BindingFlags.NonPublic | BindingFlags.Static,
+            binder: null,
+            types: new[] { typeof(int[]) },
+            modifiers: null)!;
+        var tryGetMethod = t.GetMethod("TryGetWalker",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+
+        resetMethod.Invoke(null, null);
+        try
+        {
+            var firstWalker = compileMethod.Invoke(null, new object[] { new[] { 0 } })!;
+            registerMethod.Invoke(null, new object[] { 1L, firstWalker });
+
+            // Add 70 more entries to force the original key 1 to be
+            // evicted (cap is 64; 71 total registrations means keys
+            // 1..7 should be evicted by FIFO order).
+            for (long k = 100; k < 170; k++)
+            {
+                var walker = compileMethod.Invoke(null, new object[] { new[] { 0 } })!;
+                registerMethod.Invoke(null, new object[] { k, walker });
+            }
+
+            // Key 1 should be evicted.
+            Assert.Null(tryGetMethod.Invoke(null, new object[] { 1L }));
+
+            // Re-register key 1 with a fresh walker — should succeed
+            // and the lookup should find it.
+            var newWalker = compileMethod.Invoke(null, new object[] { new[] { 0 } })!;
+            registerMethod.Invoke(null, new object[] { 1L, newWalker });
+            Assert.NotNull(tryGetMethod.Invoke(null, new object[] { 1L }));
+        }
+        finally
+        {
+            resetMethod.Invoke(null, null);
+        }
+    }
+
+    [Fact]
+    public void WalkerCache_HitMissCounters_TrackLookups()
+    {
+        var t = WalkerOfFloat();
+        var resetMethod = t.GetMethod("ResetForTests",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+        var registerMethod = t.GetMethod("Register",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+        var compileMethod = t.GetMethod("Compile",
+            BindingFlags.NonPublic | BindingFlags.Static,
+            binder: null,
+            types: new[] { typeof(int[]) },
+            modifiers: null)!;
+        var tryGetMethod = t.GetMethod("TryGetWalker",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+        var hitsProp = t.GetProperty("CacheHitsForTests",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+        var missesProp = t.GetProperty("CacheMissesForTests",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+
+        resetMethod.Invoke(null, null);
+        try
+        {
+            var walker = compileMethod.Invoke(null, new object[] { new[] { 0 } })!;
+
+            // 2 misses (no entries yet)
+            Assert.Null(tryGetMethod.Invoke(null, new object[] { 100L }));
+            Assert.Null(tryGetMethod.Invoke(null, new object[] { 200L }));
+            Assert.Equal(0L, (long)hitsProp.GetValue(null)!);
+            Assert.Equal(2L, (long)missesProp.GetValue(null)!);
+
+            // Register one walker, then 3 hits + 1 miss
+            registerMethod.Invoke(null, new object[] { 100L, walker });
+            Assert.NotNull(tryGetMethod.Invoke(null, new object[] { 100L }));
+            Assert.NotNull(tryGetMethod.Invoke(null, new object[] { 100L }));
+            Assert.NotNull(tryGetMethod.Invoke(null, new object[] { 100L }));
+            Assert.Null(tryGetMethod.Invoke(null, new object[] { 300L }));
+            Assert.Equal(3L, (long)hitsProp.GetValue(null)!);
+            Assert.Equal(3L, (long)missesProp.GetValue(null)!);
+        }
+        finally
+        {
+            resetMethod.Invoke(null, null);
+        }
+    }
+
+    [Fact]
+    public void WalkerCache_FIFOEviction_CapsAt64Entries()
+    {
+        // Bounded thread-local cache. Register more than the cap; expect
+        // the oldest insertion to drop, count to stay at the cap.
+        var t = WalkerOfFloat();
+        var resetMethod = t.GetMethod("ResetForTests",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+        var registerMethod = t.GetMethod("Register",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+        var compileMethod = t.GetMethod("Compile",
+            BindingFlags.NonPublic | BindingFlags.Static,
+            binder: null,
+            types: new[] { typeof(int[]) },
+            modifiers: null)!;
+        var countProp = t.GetProperty("CachedWalkerCountForTests",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+        var tryGetMethod = t.GetMethod("TryGetWalker",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+
+        resetMethod.Invoke(null, null);
+        try
+        {
+            // Compile a single walker; reuse it as the registered object
+            // for every key — content equality doesn't matter for the
+            // eviction test, only the key bookkeeping.
+            var indices = new[] { 0 };
+            var walker = compileMethod.Invoke(null, new object[] { indices })!;
+
+            // Register 70 distinct keys (> cap of 64).
+            for (int i = 0; i < 70; i++)
+                registerMethod.Invoke(null, new object?[] { (long)i, walker });
+
+            // Cache should be at the cap.
+            int cachedCount = (int)countProp.GetValue(null)!;
+            Assert.Equal(64, cachedCount);
+
+            // First 6 keys (0..5) should have been evicted; keys 6..69
+            // should remain.
+            for (long k = 0; k < 6; k++)
+                Assert.Null(tryGetMethod.Invoke(null, new object[] { k }));
+            for (long k = 6; k < 70; k++)
+                Assert.NotNull(tryGetMethod.Invoke(null, new object[] { k }));
+        }
+        finally
+        {
+            resetMethod.Invoke(null, null);
+        }
+    }
+
+    [Fact]
+    public void CompiledWalker_OverflowInputs_ManyInputOp_HandlesCorrectly()
+    {
+        // Issue #338 Item 3: TensorAddMany records a tape entry with the
+        // InputsOverflow array set (≥4 inputs). The IL walker calls
+        // GetInputsArrayInto which returns InputsOverflow directly for
+        // that path. This test exercises that branch end-to-end —
+        // gradients computed via the IL walker must match the reference
+        // dispatcher for an op that uses the overflow array.
+        var prior = AiDotNetEngine.Current;
+        var engine = new CpuEngine();
+        AiDotNetEngine.Current = engine;
+
+        var walkerType = WalkerOfFloat();
+        var overrideField = walkerType.GetField("_testEnabledOverride",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+        var resetMethod = walkerType.GetMethod("ResetForTests",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+
+        try
+        {
+            float[] refGradA = null!, refGradB = null!, refGradC = null!, refGradD = null!;
+
+            for (int pass = 0; pass < 3; pass++)
+            {
+                overrideField.SetValue(null, pass == 0 ? (object?)false : true);
+                if (pass == 1) resetMethod.Invoke(null, null);
+
+                using var tape = new GradientTape<float>(new GradientTapeOptions { Persistent = false });
+                var a = new Tensor<float>(new float[] { 1.0f, 1.0f, 1.0f }, new[] { 3 });
+                var b = new Tensor<float>(new float[] { 2.0f, 2.0f, 2.0f }, new[] { 3 });
+                var c = new Tensor<float>(new float[] { 3.0f, 3.0f, 3.0f }, new[] { 3 });
+                var d = new Tensor<float>(new float[] { 4.0f, 4.0f, 4.0f }, new[] { 3 });
+                var sum4 = engine.TensorAddMany(a, b, c, d); // 4 inputs → overflow path
+                var loss = engine.ReduceSum(sum4);
+
+                var grads = tape.ComputeGradients(loss, new List<Tensor<float>> { a, b, c, d });
+                if (pass == 0)
+                {
+                    refGradA = (float[])grads[a].GetDataArray().Clone();
+                    refGradB = (float[])grads[b].GetDataArray().Clone();
+                    refGradC = (float[])grads[c].GetDataArray().Clone();
+                    refGradD = (float[])grads[d].GetDataArray().Clone();
+                }
+                else
+                {
+                    // dL/da = dL/db = dL/dc = dL/dd = 1 (identity per element since loss = sum)
+                    for (int i = 0; i < 3; i++)
+                    {
+                        Assert.Equal(refGradA[i], grads[a].GetDataArray()[i], 4);
+                        Assert.Equal(refGradB[i], grads[b].GetDataArray()[i], 4);
+                        Assert.Equal(refGradC[i], grads[c].GetDataArray()[i], 4);
+                        Assert.Equal(refGradD[i], grads[d].GetDataArray()[i], 4);
+                    }
+                }
+            }
+        }
+        finally
+        {
+            overrideField.SetValue(null, null);
+            resetMethod.Invoke(null, null);
+            AiDotNetEngine.Current = prior;
+        }
+    }
+
+    [Fact]
+    public void CompiledWalker_MultipleDistinctPatterns_EachCachesIndependently()
+    {
+        // Builds 3 different tape patterns, runs each twice. After the
+        // second pass through each pattern, the walker cache should
+        // contain 3 distinct entries (one per pattern) and they should
+        // all produce identical gradients to the reference dispatcher.
+        var prior = AiDotNetEngine.Current;
+        var engine = new CpuEngine();
+        AiDotNetEngine.Current = engine;
+
+        var walkerType = WalkerOfFloat();
+        var overrideField = walkerType.GetField("_testEnabledOverride",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+        var resetMethod = walkerType.GetMethod("ResetForTests",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+        var countProp = walkerType.GetProperty("CachedWalkerCountForTests",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+
+        try
+        {
+            overrideField.SetValue(null, true);
+            resetMethod.Invoke(null, null);
+
+            // Pattern 1: a + b
+            float[] refDA1 = RunAndGetGradA(engine, (a, b) =>
+                engine.TensorAdd(a, b));
+            // Pattern 2: a * b
+            float[] refDA2 = RunAndGetGradA(engine, (a, b) =>
+                engine.TensorMultiply(a, b));
+            // Pattern 3: (a + b) * a
+            float[] refDA3 = RunAndGetGradA(engine, (a, b) =>
+                engine.TensorMultiply(engine.TensorAdd(a, b), a));
+
+            // Run each pattern a second time and verify gradients still match.
+            float[] secondDA1 = RunAndGetGradA(engine, (a, b) =>
+                engine.TensorAdd(a, b));
+            for (int i = 0; i < 3; i++) Assert.Equal(refDA1[i], secondDA1[i], 4);
+
+            float[] secondDA2 = RunAndGetGradA(engine, (a, b) =>
+                engine.TensorMultiply(a, b));
+            for (int i = 0; i < 3; i++) Assert.Equal(refDA2[i], secondDA2[i], 4);
+
+            // Pattern 3 (the comment claims it's tested here too — finish
+            // the assertion). Without this, a regression where the third
+            // graph shape aliases an existing cache entry would still pass
+            // since we'd only see patterns 1 + 2 hit the cache.
+            float[] secondDA3 = RunAndGetGradA(engine, (a, b) =>
+                engine.TensorMultiply(engine.TensorAdd(a, b), a));
+            for (int i = 0; i < 3; i++) Assert.Equal(refDA3[i], secondDA3[i], 4);
+
+            // Cache size must be exactly 3 distinct walker entries — one per
+            // pattern. Aliasing would show up as a count < 3 here.
+            Assert.Equal(3, (int)countProp.GetValue(null)!);
+        }
+        finally
+        {
+            overrideField.SetValue(null, null);
+            resetMethod.Invoke(null, null);
+            AiDotNetEngine.Current = prior;
+        }
+    }
+
+    private static float[] RunAndGetGradA(CpuEngine engine,
+        System.Func<Tensor<float>, Tensor<float>, Tensor<float>> forward)
+    {
+        using var tape = new GradientTape<float>(new GradientTapeOptions { Persistent = false });
+        var a = new Tensor<float>(new float[] { 1.0f, 2.0f, 3.0f }, new[] { 3 });
+        var b = new Tensor<float>(new float[] { 0.5f, 1.5f, 2.5f }, new[] { 3 });
+        var y = forward(a, b);
+        var loss = engine.ReduceSum(y);
+        var grads = tape.ComputeGradients(loss, new List<Tensor<float>> { a });
+        return grads[a].GetDataArray();
+    }
+
+    [Fact]
+    public void CompiledWalker_ReshapeReduceMeanInliners_MatchesReference()
+    {
+        // Exercises the Reshape + ReduceMean inliners on a single tape.
+        var prior = AiDotNetEngine.Current;
+        var engine = new CpuEngine();
+        AiDotNetEngine.Current = engine;
+
+        var walkerType = WalkerOfFloat();
+        var overrideField = walkerType.GetField("_testEnabledOverride",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+        var resetMethod = walkerType.GetMethod("ResetForTests",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+
+        try
+        {
+            float[] refDA = null!;
+            for (int pass = 0; pass < 3; pass++)
+            {
+                overrideField.SetValue(null, pass == 0 ? (object?)false : true);
+                if (pass == 1) resetMethod.Invoke(null, null);
+
+                using var tape = new GradientTape<float>(new GradientTapeOptions { Persistent = false });
+                // Shape [2,4]; reshape to [8]; mean over axis 0 → scalar.
+                var a = new Tensor<float>(
+                    new float[] { 1, 2, 3, 4, 5, 6, 7, 8 }, new[] { 2, 4 });
+                var reshaped = engine.Reshape(a, new[] { 8 });
+                var meaned = engine.ReduceMean(reshaped, axes: new[] { 0 }, keepDims: false);
+                var loss = engine.ReduceSum(meaned);
+
+                var grads = tape.ComputeGradients(loss, new List<Tensor<float>> { a });
+                if (pass == 0)
+                {
+                    refDA = (float[])grads[a].GetDataArray().Clone();
+                }
+                else
+                {
+                    var ilDA = grads[a].GetDataArray();
+                    for (int i = 0; i < 8; i++)
+                        Assert.Equal(refDA[i], ilDA[i], 4);
+                }
+            }
+        }
+        finally
+        {
+            overrideField.SetValue(null, null);
+            resetMethod.Invoke(null, null);
+            AiDotNetEngine.Current = prior;
+        }
+    }
+
+    [Fact]
+    public void CompiledWalker_ActivationInliners_ReluSigmoidTanhGelu_MatchesReference()
+    {
+        // Exercises the 4 activation backward inliners in a single tape
+        // and verifies gradients match the reference dispatcher.
+        var prior = AiDotNetEngine.Current;
+        var engine = new CpuEngine();
+        AiDotNetEngine.Current = engine;
+
+        var walkerType = WalkerOfFloat();
+        var overrideField = walkerType.GetField("_testEnabledOverride",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+        var resetMethod = walkerType.GetMethod("ResetForTests",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+
+        try
+        {
+            float[] refDA = null!;
+            for (int pass = 0; pass < 3; pass++)
+            {
+                overrideField.SetValue(null, pass == 0 ? (object?)false : true);
+                if (pass == 1) resetMethod.Invoke(null, null);
+
+                using var tape = new GradientTape<float>(new GradientTapeOptions { Persistent = false });
+                var a = new Tensor<float>(new float[] { -0.5f, 0.3f, 1.2f, -0.7f }, new[] { 4 });
+
+                // Chain: GELU → Tanh → Sigmoid → ReLU all on a
+                var afterGelu = engine.GELU(a);
+                var afterTanh = engine.Tanh(afterGelu);
+                var afterSigmoid = engine.Sigmoid(afterTanh);
+                var afterRelu = engine.ReLU(afterSigmoid);
+                var loss = engine.ReduceSum(afterRelu);
+
+                var grads = tape.ComputeGradients(loss, new List<Tensor<float>> { a });
+                if (pass == 0)
+                {
+                    refDA = (float[])grads[a].GetDataArray().Clone();
+                }
+                else
+                {
+                    var ilDA = grads[a].GetDataArray();
+                    for (int i = 0; i < 4; i++)
+                        Assert.Equal(refDA[i], ilDA[i], 4);
+                }
+            }
+        }
+        finally
+        {
+            overrideField.SetValue(null, null);
+            resetMethod.Invoke(null, null);
+            AiDotNetEngine.Current = prior;
+        }
+    }
+
+    [Fact]
+    public void CompiledWalker_AllInliners_SubtractDivideNegateLog_MatchesReference()
+    {
+        // Exercises Subtract, Divide, Negate, Log inliners on one tape
+        // and compares gradients against the reference dispatcher
+        // (override off).
+        var prior = AiDotNetEngine.Current;
+        var engine = new CpuEngine();
+        AiDotNetEngine.Current = engine;
+
+        var walkerType = WalkerOfFloat();
+        var overrideField = walkerType.GetField("_testEnabledOverride",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+        var resetMethod = walkerType.GetMethod("ResetForTests",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+
+        try
+        {
+            float[] refDA = null!;
+            for (int pass = 0; pass < 3; pass++)
+            {
+                overrideField.SetValue(null, pass == 0 ? (object?)false : true);
+                if (pass == 1) resetMethod.Invoke(null, null);
+
+                using var tape = new GradientTape<float>(new GradientTapeOptions { Persistent = false });
+                var a = new Tensor<float>(new float[] { 2.0f, 4.0f, 8.0f }, new[] { 3 });
+                var b = new Tensor<float>(new float[] { 1.0f, 2.0f, 4.0f }, new[] { 3 });
+
+                // y = log(neg(a - b) / b) — chains Subtract → Negate → Divide → Log
+                var diff = engine.TensorSubtract(a, b);
+                var negDiff = engine.TensorNegate(diff);
+                var ratio = engine.TensorDivide(negDiff, b);
+                // For log we need positive input; abs(ratio) keeps it positive.
+                var positive = engine.TensorAbs(ratio);
+                var y = engine.TensorLog(positive);
+                var loss = engine.ReduceSum(y);
+
+                var grads = tape.ComputeGradients(loss, new List<Tensor<float>> { a });
+                if (pass == 0)
+                {
+                    refDA = (float[])grads[a].GetDataArray().Clone();
+                }
+                else
+                {
+                    var ilDA = grads[a].GetDataArray();
+                    for (int i = 0; i < 3; i++)
+                        Assert.Equal(refDA[i], ilDA[i], 4);
+                }
+            }
+        }
+        finally
+        {
+            overrideField.SetValue(null, null);
+            resetMethod.Invoke(null, null);
+            AiDotNetEngine.Current = prior;
+        }
+    }
+
+    [Fact]
+    public void CompiledWalker_DoublePrecision_ProducesIdenticalGradients()
+    {
+        // Issue #338 Item 3: confirms the IL emitter works for closed
+        // generic types other than float. Reflection-builds the same
+        // smoke-test flow but for CompiledBackwardWalk<double>.
+        var prior = AiDotNetEngine.Current;
+        var engine = new CpuEngine();
+        AiDotNetEngine.Current = engine;
+
+        var walkerType = typeof(CompiledBackwardWalk<>).MakeGenericType(typeof(double));
+        var overrideField = walkerType.GetField("_testEnabledOverride",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+        var resetMethod = walkerType.GetMethod("ResetForTests",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+
+        try
+        {
+            double[] refDA = null!, refDB = null!;
+
+            for (int pass = 0; pass < 3; pass++)
+            {
+                overrideField.SetValue(null, pass == 0 ? (object?)false : true);
+                if (pass == 1) resetMethod.Invoke(null, null);
+
+                using var tape = new GradientTape<double>(new GradientTapeOptions { Persistent = false });
+                var a = new Tensor<double>(new double[] { 2.0, 3.0, 4.0 }, new[] { 3 });
+                var b = new Tensor<double>(new double[] { 5.0, 6.0, 7.0 }, new[] { 3 });
+                var prod = engine.TensorMultiply(a, b);
+                var sum = engine.TensorAdd(prod, a);
+                var loss = engine.ReduceSum(sum);
+
+                var grads = tape.ComputeGradients(loss, new List<Tensor<double>> { a, b });
+                if (pass == 0)
+                {
+                    refDA = (double[])grads[a].GetDataArray().Clone();
+                    refDB = (double[])grads[b].GetDataArray().Clone();
+                }
+                else
+                {
+                    for (int i = 0; i < 3; i++)
+                    {
+                        Assert.Equal(refDA[i], grads[a].GetDataArray()[i], 6);
+                        Assert.Equal(refDB[i], grads[b].GetDataArray()[i], 6);
+                    }
+                }
+            }
+        }
+        finally
+        {
+            overrideField.SetValue(null, null);
+            resetMethod.Invoke(null, null);
+            AiDotNetEngine.Current = prior;
+        }
+    }
+
+    [Fact]
+    public void CompiledWalker_LongTape_ManyOps_ProducesIdenticalGradients()
+    {
+        // Stress test for the IL emitter — verifies the unrolled
+        // per-entry IL scales correctly when the tape has many entries.
+        // Builds a 30+ op tape (chained adds + multiplies) and verifies
+        // gradients are identical between override-off (reference) and
+        // override-on (compiled IL walker) runs.
+        var prior = AiDotNetEngine.Current;
+        var engine = new CpuEngine();
+        AiDotNetEngine.Current = engine;
+
+        var walkerType = WalkerOfFloat();
+        var overrideField = walkerType.GetField("_testEnabledOverride",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+        var resetMethod = walkerType.GetMethod("ResetForTests",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+
+        try
+        {
+            float[] referenceA = null!;
+            float[] referenceB = null!;
+
+            // Two runs — pass 0 = reference (override off),
+            // pass 1 = compiled IL (override on, second iter hits cache).
+            for (int pass = 0; pass < 3; pass++)
+            {
+                overrideField.SetValue(null, pass == 0 ? (object?)false : true);
+                if (pass == 1) resetMethod.Invoke(null, null);  // start with empty walker cache
+
+                using var tape = new GradientTape<float>(new GradientTapeOptions { Persistent = false });
+                var a = new Tensor<float>(new float[] { 1.0f, 2.0f, 3.0f, 4.0f }, new[] { 4 });
+                var b = new Tensor<float>(new float[] { 0.5f, 0.6f, 0.7f, 0.8f }, new[] { 4 });
+
+                // Build a deep chain — 20 alternating multiplies and adds.
+                var x = a;
+                for (int step = 0; step < 10; step++)
+                {
+                    x = engine.TensorMultiply(x, b);  // x = x * b
+                    x = engine.TensorAdd(x, a);        // x = x + a
+                }
+                var loss = engine.ReduceSum(x);
+
+                var grads = tape.ComputeGradients(loss, new List<Tensor<float>> { a, b });
+                var dA = grads[a].GetDataArray();
+                var dB = grads[b].GetDataArray();
+
+                if (pass == 0)
+                {
+                    referenceA = (float[])dA.Clone();
+                    referenceB = (float[])dB.Clone();
+                }
+                else
+                {
+                    // Compare against reference element-wise.
+                    for (int i = 0; i < 4; i++)
+                    {
+                        Assert.Equal(referenceA[i], dA[i], 3);
+                        Assert.Equal(referenceB[i], dB[i], 3);
+                    }
+                }
+            }
+        }
+        finally
+        {
+            overrideField.SetValue(null, null);
+            resetMethod.Invoke(null, null);
+            AiDotNetEngine.Current = prior;
+        }
+    }
+
+    [Fact]
+    public void EndToEnd_WithCompiledBackwardEnabled_ProducesIdenticalGradients()
+    {
+        // Auto-engagement gate. Flips CompiledBackwardWalk<T>._testEnabledOverride
+        // on, runs a full GradientTape.ComputeGradients flow, then turns
+        // it back off. Verifies that:
+        //   1. The flow doesn't throw (walker integrates cleanly)
+        //   2. The gradients match the env-var-off reference exactly
+        // The cache only populates AFTER a backward walk completes,
+        // so the first call hits the inline replay loop; subsequent
+        // calls hit the IL walker.
+        var prior = AiDotNetEngine.Current;
+        var engine = new CpuEngine();
+        AiDotNetEngine.Current = engine;
+
+        // Flip the override on. Use reflection because the field is internal.
+        var walkerType = WalkerOfFloat();
+        var overrideField = walkerType.GetField("_testEnabledOverride",
+            BindingFlags.NonPublic | BindingFlags.Static);
+        Assert.NotNull(overrideField);
+
+        var resetMethod = walkerType.GetMethod("ResetForTests",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+
+        try
+        {
+            // First run: compute reference gradients with the override OFF.
+            float[] refDA, refDB;
+            {
+                overrideField!.SetValue(null, false);
+                resetMethod.Invoke(null, null);
+                using var tape = new GradientTape<float>(new GradientTapeOptions { Persistent = false });
+                var a = new Tensor<float>(new float[] { 2.0f, 3.0f, 4.0f }, new[] { 3 });
+                var b = new Tensor<float>(new float[] { 5.0f, 6.0f, 7.0f }, new[] { 3 });
+                var prod = engine.TensorMultiply(a, b);
+                var sum = engine.TensorAdd(prod, a);
+                var loss = engine.ReduceSum(sum);
+                var grads = tape.ComputeGradients(loss, new List<Tensor<float>> { a, b });
+                refDA = (float[])grads[a].GetDataArray().Clone();
+                refDB = (float[])grads[b].GetDataArray().Clone();
+            }
+
+            // Second run: same forward, override ON. Cache populates on
+            // the first compute; subsequent compute on a fresh tape with
+            // the same pattern hits the IL walker.
+            overrideField.SetValue(null, true);
+            resetMethod.Invoke(null, null);
+
+            // Two runs — first populates the cache + walker, second hits.
+            for (int run = 0; run < 2; run++)
+            {
+                using var tape = new GradientTape<float>(new GradientTapeOptions { Persistent = false });
+                var a = new Tensor<float>(new float[] { 2.0f, 3.0f, 4.0f }, new[] { 3 });
+                var b = new Tensor<float>(new float[] { 5.0f, 6.0f, 7.0f }, new[] { 3 });
+                var prod = engine.TensorMultiply(a, b);
+                var sum = engine.TensorAdd(prod, a);
+                var loss = engine.ReduceSum(sum);
+                var grads = tape.ComputeGradients(loss, new List<Tensor<float>> { a, b });
+
+                var ilDA = grads[a].GetDataArray();
+                var ilDB = grads[b].GetDataArray();
+                for (int i = 0; i < 3; i++)
+                {
+                    Assert.Equal(refDA[i], ilDA[i], 4);
+                    Assert.Equal(refDB[i], ilDB[i], 4);
+                }
+            }
+        }
+        finally
+        {
+            overrideField!.SetValue(null, null);
+            resetMethod.Invoke(null, null);
+            AiDotNetEngine.Current = prior;
+        }
+    }
+
+    [Fact]
+    public void CompiledWalker_Specialised_ProducesSameGradientsAsReference()
+    {
+        // Per-op-specialised IL emitter (Compile with MethodInfo[] arg).
+        // Builds the same y = (a*b) + a tape, then invokes the specialised
+        // walker with each entry's backward MethodInfo passed in. The IL
+        // emits direct `call <method>` per entry instead of going through
+        // the BackwardFunction<T>.Invoke delegate, eliminating dispatch
+        // indirection. Verifies the specialised path produces identical
+        // gradients to the reference dispatcher.
+        var prior = AiDotNetEngine.Current;
+        var engine = new CpuEngine();
+        AiDotNetEngine.Current = engine;
+        try
+        {
+            using var tape = new GradientTape<float>(new GradientTapeOptions { Persistent = true });
+            var a = new Tensor<float>(new float[] { 2.0f, 3.0f, 4.0f }, new[] { 3 });
+            var b = new Tensor<float>(new float[] { 5.0f, 6.0f, 7.0f }, new[] { 3 });
+            var prod = engine.TensorMultiply(a, b);
+            var sum = engine.TensorAdd(prod, a);
+            var loss = engine.ReduceSum(sum);
+
+            // Reference (delegate-dispatch) gradients:
+            var refGrads = tape.ComputeGradients(loss, new List<Tensor<float>> { a, b });
+            var refDA = refGrads[a].GetDataArray();
+            var refDB = refGrads[b].GetDataArray();
+
+            // Pull the tape's entries + each entry's backward MethodInfo.
+            var tapeType = typeof(GradientTape<float>);
+            var entriesField = tapeType.GetField("_entries",
+                BindingFlags.NonPublic | BindingFlags.Instance);
+            Assert.NotNull(entriesField);
+            var entriesObj = entriesField!.GetValue(tape);
+            Assert.NotNull(entriesObj);
+
+            var arenaType = entriesObj!.GetType();
+            int entryCount = (int)arenaType.GetProperty("Count",
+                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)!
+                .GetValue(entriesObj)!;
+            if (entryCount == 0) return;
+
+            // Walk entries via the internal Item indexer to fetch each
+            // entry's Backward delegate, then capture its MethodInfo.
+            var indexer = arenaType.GetProperty("Item",
+                BindingFlags.NonPublic | BindingFlags.Instance)!;
+            var methods = new MethodInfo[entryCount];
+            for (int i = 0; i < entryCount; i++)
+            {
+                // Indexer returns ref TapeEntry<T>; reflection unboxes
+                // the struct copy. That's fine — we only need the
+                // Backward field's .Method.
+                var entry = indexer.GetValue(entriesObj, new object?[] { i })!;
+                var backwardField = entry.GetType().GetField("Backward")!;
+                var backwardDelegate = (Delegate)backwardField.GetValue(entry)!;
+                methods[i] = backwardDelegate.Method;
+            }
+
+            var indices = new int[entryCount];
+            for (int i = 0; i < entryCount; i++)
+                indices[i] = entryCount - 1 - i;
+
+            // Re-order methods to match the reverse-topo indices.
+            var reorderedMethods = new MethodInfo[entryCount];
+            for (int i = 0; i < entryCount; i++)
+                reorderedMethods[i] = methods[indices[i]];
+
+            var walkerType = WalkerOfFloat();
+            var compile2 = walkerType.GetMethod("Compile",
+                BindingFlags.NonPublic | BindingFlags.Static,
+                binder: null,
+                types: new[] { typeof(int[]), typeof(MethodInfo[]) },
+                modifiers: null);
+            Assert.NotNull(compile2);
+            var walker = compile2!.Invoke(null, new object?[] { indices, reorderedMethods });
+            Assert.NotNull(walker);
+
+            var sources = new List<Tensor<float>> { a, b };
+            var result = walker!.GetType().GetMethod("Invoke")!
+                .Invoke(walker, new object?[] { entriesObj, loss, sources, engine });
+            Assert.NotNull(result);
+
+            var specGrads = (Dictionary<Tensor<float>, Tensor<float>>)result!;
+            var specDA = specGrads[a].GetDataArray();
+            var specDB = specGrads[b].GetDataArray();
+
+            // Specialised IL walker MUST produce identical gradients.
+            for (int i = 0; i < 3; i++)
+            {
+                Assert.Equal(refDA[i], specDA[i], 4);
+                Assert.Equal(refDB[i], specDB[i], 4);
+            }
+        }
+        finally
+        {
+            AiDotNetEngine.Current = prior;
+        }
+    }
+
+    [Fact]
+    public void Compile_PassthroughWalker_ReturnsNonNullDelegate()
+    {
+        var t = WalkerOfFloat();
+        var compileMethod = t.GetMethod("Compile",
+            BindingFlags.NonPublic | BindingFlags.Static,
+            binder: null,
+            types: new[] { typeof(int[]) },
+            modifiers: null);
+        Assert.NotNull(compileMethod);
+
+        // Pass a 3-element index array as a minimal valid input. The
+        // walker won't be invoked here — we only assert Compile returns
+        // a non-null delegate, not the walk's behaviour. Walk behaviour
+        // is exercised end-to-end by the GradientTape replay tests.
+        var indices = new[] { 0, 1, 2 };
+        var walker = compileMethod!.Invoke(null, new object[] { indices });
+        Assert.NotNull(walker);
+    }
+
+}

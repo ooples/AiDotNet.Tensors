@@ -33,6 +33,9 @@ public class DelegatingGpuBackend : IDirectGpuBackend
     public virtual bool IsAvailable => Inner.IsAvailable;
 
     /// <inheritdoc/>
+    public virtual IGpuMixedPrecisionConvBackend? MixedPrecisionConv => Inner.MixedPrecisionConv;
+
+    /// <inheritdoc/>
     public virtual string BackendName => Inner.BackendName;
     public virtual TensorDevice DeviceType => Inner.DeviceType;
 

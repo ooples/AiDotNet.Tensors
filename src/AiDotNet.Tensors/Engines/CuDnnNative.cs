@@ -1414,6 +1414,114 @@ public sealed class CuDnnActivationDescriptor : IDisposable
 }
 
 /// <summary>
+/// High-level cuDNN activation operations helper. Provides FP16/BF16
+/// GPU-pointer entry points for ReLU / Sigmoid / Tanh / Clipped-ReLU
+/// activations. Closes the activation gap in #337's mixed-precision
+/// coverage — the other ops (Conv2D, BatchNorm, Softmax, Pool2D) all
+/// have dtype-parameterised helpers; activations now do too.
+/// </summary>
+public sealed class CuDnnActivation : IDisposable
+{
+    private readonly CuDnnContext _context;
+    private readonly bool _ownsContext;
+    private bool _disposed;
+
+    public CuDnnActivation(CuDnnContext context)
+    {
+        _context = context ?? throw new ArgumentNullException(nameof(context));
+        _ownsContext = false;
+    }
+
+    public CuDnnActivation()
+    {
+        _context = new CuDnnContext();
+        _ownsContext = true;
+    }
+
+    public static bool IsAvailable => CuDnnContext.IsAvailable;
+
+    /// <summary>
+    /// Activation forward y = act(x). Operates element-wise; input and
+    /// output tensors share shape. Uses fp32 compute for half / bfloat16
+    /// data — cuDNN's accuracy-preserving mixed-precision convention.
+    /// </summary>
+    public void ForwardGpu(
+        IntPtr inputDevPtr, IntPtr outputDevPtr,
+        int n, int c, int h, int w,
+        CuDnnNative.CudnnActivationMode mode,
+        double coef = 0.0,
+        CuDnnNative.CudnnDataType dataType = CuDnnNative.CudnnDataType.Float)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(CuDnnActivation));
+        using var inputDesc = new CuDnnTensorDescriptor();
+        using var outputDesc = new CuDnnTensorDescriptor();
+        using var actDesc = new CuDnnActivationDescriptor();
+
+        inputDesc.Set4D(dataType, n, c, h, w);
+        outputDesc.Set4D(dataType, n, c, h, w);
+        actDesc.Set(mode, coef);
+
+        float alpha = 1.0f;
+        float beta = 0.0f;
+        var status = CuDnnNative.cudnnActivationForward(
+            _context.Handle, actDesc.Handle,
+            ref alpha,
+            inputDesc.Handle, inputDevPtr,
+            ref beta,
+            outputDesc.Handle, outputDevPtr);
+        CuDnnContext.CheckStatus(status, "ActivationForwardGpu");
+    }
+
+    /// <summary>
+    /// Activation backward dX = dY * act'(x). Takes the forward output Y,
+    /// dY, and the original input X — cuDNN's signature requires all
+    /// three for most activation modes' gradient computation.
+    /// </summary>
+    public void BackwardGpu(
+        IntPtr outputDevPtr, IntPtr gradOutputDevPtr,
+        IntPtr inputDevPtr, IntPtr gradInputDevPtr,
+        int n, int c, int h, int w,
+        CuDnnNative.CudnnActivationMode mode,
+        double coef = 0.0,
+        CuDnnNative.CudnnDataType dataType = CuDnnNative.CudnnDataType.Float)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(CuDnnActivation));
+        using var inputDesc = new CuDnnTensorDescriptor();
+        using var outputDesc = new CuDnnTensorDescriptor();
+        using var actDesc = new CuDnnActivationDescriptor();
+
+        inputDesc.Set4D(dataType, n, c, h, w);
+        outputDesc.Set4D(dataType, n, c, h, w);
+        actDesc.Set(mode, coef);
+
+        float alpha = 1.0f;
+        float beta = 0.0f;
+        var status = CuDnnNative.cudnnActivationBackward(
+            _context.Handle, actDesc.Handle,
+            ref alpha,
+            outputDesc.Handle, outputDevPtr,
+            outputDesc.Handle, gradOutputDevPtr,
+            inputDesc.Handle, inputDevPtr,
+            ref beta,
+            inputDesc.Handle, gradInputDevPtr);
+        CuDnnContext.CheckStatus(status, "ActivationBackwardGpu");
+    }
+
+    public void Dispose()
+    {
+        if (_disposed) return;
+        if (_ownsContext) _context.Dispose();
+        _disposed = true;
+        GC.SuppressFinalize(this);
+    }
+
+    ~CuDnnActivation()
+    {
+        Dispose();
+    }
+}
+
+/// <summary>
 /// High-level cuDNN convolution operations helper.
 /// Provides simplified API for neural network convolutional layers.
 /// </summary>
@@ -1576,11 +1684,20 @@ public sealed class CuDnnConvolution : IDisposable
     /// device memory and sizing — we only set descriptors, pick an
     /// algorithm, and launch.
     /// </summary>
-    /// <param name="inputDevPtr">Device pointer to NCHW input [n, c, h, w] floats.</param>
-    /// <param name="filterDevPtr">Device pointer to NCHW filter [k, c, fh, fw] floats.</param>
-    /// <param name="outputDevPtr">Device pointer to NCHW output [n, k, oh, ow] floats — caller allocates.</param>
+    /// <param name="inputDevPtr">Device pointer to NCHW input [n, c, h, w] in <paramref name="dataType"/> elements.</param>
+    /// <param name="filterDevPtr">Device pointer to NCHW filter [k, c, fh, fw] in <paramref name="dataType"/> elements.</param>
+    /// <param name="outputDevPtr">Device pointer to NCHW output [n, k, oh, ow] in <paramref name="dataType"/> elements — caller allocates.</param>
     /// <param name="outputHeight">Expected output height; used to sanity-check against cuDNN's shape calc.</param>
     /// <param name="outputWidth">Expected output width.</param>
+    /// <param name="dataType">cuDNN tensor element type for input / filter / output buffers.
+    /// Defaults to <see cref="CuDnnNative.CudnnDataType.Float"/> for source compatibility.
+    /// <list type="bullet">
+    ///   <item><see cref="CuDnnNative.CudnnDataType.Float"/> — fp32 data, fp32 compute. Original behaviour.</item>
+    ///   <item><see cref="CuDnnNative.CudnnDataType.Half"/> — fp16 data, fp32 compute (mixed-precision via tensor cores on Volta+, ~2× over fp32 on Ampere+).</item>
+    ///   <item><see cref="CuDnnNative.CudnnDataType.BFloat16"/> — bf16 data, fp32 compute (mixed-precision, no loss scaling needed; Ampere+).</item>
+    /// </list>
+    /// Compute type is always fp32 — matches cuDNN's accuracy-preserving mixed-precision convention.
+    /// Closes #337's "FP16/BF16 kernel variants" requirement for Conv2D forward.</param>
     public void Conv2DForwardGpu(
         IntPtr inputDevPtr, IntPtr filterDevPtr, IntPtr outputDevPtr,
         int n, int c, int h, int w,
@@ -1588,7 +1705,8 @@ public sealed class CuDnnConvolution : IDisposable
         int outputHeight, int outputWidth,
         int padH = 0, int padW = 0,
         int strideH = 1, int strideW = 1,
-        int dilationH = 1, int dilationW = 1)
+        int dilationH = 1, int dilationW = 1,
+        CuDnnNative.CudnnDataType dataType = CuDnnNative.CudnnDataType.Float)
     {
         if (_disposed) throw new ObjectDisposedException(nameof(CuDnnConvolution));
 
@@ -1597,8 +1715,12 @@ public sealed class CuDnnConvolution : IDisposable
         using var convDesc = new CuDnnConvolutionDescriptor();
         using var outputDesc = new CuDnnTensorDescriptor();
 
-        inputDesc.Set4D(CuDnnNative.CudnnDataType.Float, n, c, h, w);
-        filterDesc.Set4D(CuDnnNative.CudnnDataType.Float, k, c, filterH, filterW);
+        inputDesc.Set4D(dataType, n, c, h, w);
+        filterDesc.Set4D(dataType, k, c, filterH, filterW);
+        // Compute type stays fp32 for half / bfloat16 — cuDNN's recommended
+        // accuracy-preserving mixed-precision setting. For fp32 data, compute
+        // is also fp32 (TF32 on Ampere+ is governed orthogonally by cuBLAS's
+        // math mode — see CudaDispatchPolicy.AllowTF32).
         convDesc.Set2D(padH, padW, strideH, strideW, dilationH, dilationW, CuDnnNative.CudnnDataType.Float);
 
         // Verify output shape agrees with cuDNN's internal shape calc.
@@ -1614,7 +1736,7 @@ public sealed class CuDnnConvolution : IDisposable
                 $"cuDNN output shape {cudnnOutN}x{cudnnOutC}x{cudnnOutH}x{cudnnOutW} " +
                 $"disagrees with caller's expected {n}x{k}x{outputHeight}x{outputWidth}.");
 
-        outputDesc.Set4D(CuDnnNative.CudnnDataType.Float, cudnnOutN, cudnnOutC, cudnnOutH, cudnnOutW);
+        outputDesc.Set4D(dataType, cudnnOutN, cudnnOutC, cudnnOutH, cudnnOutW);
 
         // Algorithm selection — use ImplicitPrecompGemm as a stable default;
         // fall back to Gemm if workspace query fails on this size. A future
@@ -1663,6 +1785,152 @@ public sealed class CuDnnConvolution : IDisposable
                 ref beta,
                 outputDesc.Handle, outputDevPtr);
             CuDnnContext.CheckStatus(status, "ConvolutionForward");
+        }
+    }
+
+    /// <summary>
+    /// GPU-pointer Conv2D backward-data: computes the gradient with respect to
+    /// the input, given the gradient with respect to the output and the
+    /// filter. Mirrors <see cref="Conv2DForwardGpu"/>'s descriptor + workspace
+    /// pattern; produces dX[n, c, h, w].
+    /// </summary>
+    /// <param name="filterDevPtr">Filter tensor [k, c, fh, fw] in <paramref name="dataType"/> elements.</param>
+    /// <param name="gradOutputDevPtr">dY tensor [n, k, oh, ow] in <paramref name="dataType"/> elements.</param>
+    /// <param name="gradInputDevPtr">dX tensor [n, c, h, w] — caller allocates.</param>
+    /// <param name="dataType">cuDNN element type for filter / dY / dX buffers.
+    /// Compute type stays fp32 — accuracy-preserving mixed-precision convention.</param>
+    public void Conv2DBackwardDataGpu(
+        IntPtr filterDevPtr, IntPtr gradOutputDevPtr, IntPtr gradInputDevPtr,
+        int n, int c, int h, int w,
+        int k, int filterH, int filterW,
+        int outputHeight, int outputWidth,
+        int padH = 0, int padW = 0,
+        int strideH = 1, int strideW = 1,
+        int dilationH = 1, int dilationW = 1,
+        CuDnnNative.CudnnDataType dataType = CuDnnNative.CudnnDataType.Float)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(CuDnnConvolution));
+
+        using var filterDesc = new CuDnnFilterDescriptor();
+        using var gradOutputDesc = new CuDnnTensorDescriptor();
+        using var convDesc = new CuDnnConvolutionDescriptor();
+        using var gradInputDesc = new CuDnnTensorDescriptor();
+
+        filterDesc.Set4D(dataType, k, c, filterH, filterW);
+        gradOutputDesc.Set4D(dataType, n, k, outputHeight, outputWidth);
+        gradInputDesc.Set4D(dataType, n, c, h, w);
+        convDesc.Set2D(padH, padW, strideH, strideW, dilationH, dilationW, CuDnnNative.CudnnDataType.Float);
+
+        // Algo0 is the safe default — supported for every shape across cuDNN
+        // versions. Algo1 (precomp-GEMM) is faster but its workspace query
+        // can return NotSupported for irregular shapes; fall back on failure.
+        var algo = CuDnnNative.CudnnConvolutionBwdDataAlgo.Algo1;
+        ulong workspaceSize;
+        var status = CuDnnNative.cudnnGetConvolutionBackwardDataWorkspaceSize(
+            _context.Handle, filterDesc.Handle, gradOutputDesc.Handle,
+            convDesc.Handle, gradInputDesc.Handle, algo, out workspaceSize);
+        if (status != CuDnnNative.CudnnStatus.Success)
+        {
+            algo = CuDnnNative.CudnnConvolutionBwdDataAlgo.Algo0;
+            status = CuDnnNative.cudnnGetConvolutionBackwardDataWorkspaceSize(
+                _context.Handle, filterDesc.Handle, gradOutputDesc.Handle,
+                convDesc.Handle, gradInputDesc.Handle, algo, out workspaceSize);
+            CuDnnContext.CheckStatus(status, "GetConvolutionBackwardDataWorkspaceSize");
+        }
+
+        lock (_workspaceLock)
+        {
+            IntPtr workspace = IntPtr.Zero;
+            if (workspaceSize > 0)
+            {
+                EnsureWorkspaceUnlocked(workspaceSize);
+                workspace = _workspace;
+            }
+
+            float alpha = 1.0f;
+            float beta = 0.0f;
+            status = CuDnnNative.cudnnConvolutionBackwardData(
+                _context.Handle,
+                ref alpha,
+                filterDesc.Handle, filterDevPtr,
+                gradOutputDesc.Handle, gradOutputDevPtr,
+                convDesc.Handle,
+                algo,
+                workspace, workspaceSize,
+                ref beta,
+                gradInputDesc.Handle, gradInputDevPtr);
+            CuDnnContext.CheckStatus(status, "ConvolutionBackwardData");
+        }
+    }
+
+    /// <summary>
+    /// GPU-pointer Conv2D backward-filter: computes the gradient with respect
+    /// to the filter, given the input and the gradient with respect to the
+    /// output. Produces dW[k, c, fh, fw].
+    /// </summary>
+    /// <param name="inputDevPtr">Input tensor [n, c, h, w] in <paramref name="dataType"/> elements.</param>
+    /// <param name="gradOutputDevPtr">dY tensor [n, k, oh, ow] in <paramref name="dataType"/> elements.</param>
+    /// <param name="gradFilterDevPtr">dW tensor [k, c, fh, fw] — caller allocates.</param>
+    /// <param name="dataType">cuDNN element type for input / dY / dW buffers.
+    /// Compute type stays fp32.</param>
+    public void Conv2DBackwardFilterGpu(
+        IntPtr inputDevPtr, IntPtr gradOutputDevPtr, IntPtr gradFilterDevPtr,
+        int n, int c, int h, int w,
+        int k, int filterH, int filterW,
+        int outputHeight, int outputWidth,
+        int padH = 0, int padW = 0,
+        int strideH = 1, int strideW = 1,
+        int dilationH = 1, int dilationW = 1,
+        CuDnnNative.CudnnDataType dataType = CuDnnNative.CudnnDataType.Float)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(CuDnnConvolution));
+
+        using var inputDesc = new CuDnnTensorDescriptor();
+        using var gradOutputDesc = new CuDnnTensorDescriptor();
+        using var convDesc = new CuDnnConvolutionDescriptor();
+        using var gradFilterDesc = new CuDnnFilterDescriptor();
+
+        inputDesc.Set4D(dataType, n, c, h, w);
+        gradOutputDesc.Set4D(dataType, n, k, outputHeight, outputWidth);
+        gradFilterDesc.Set4D(dataType, k, c, filterH, filterW);
+        convDesc.Set2D(padH, padW, strideH, strideW, dilationH, dilationW, CuDnnNative.CudnnDataType.Float);
+
+        var algo = CuDnnNative.CudnnConvolutionBwdFilterAlgo.Algo1;
+        ulong workspaceSize;
+        var status = CuDnnNative.cudnnGetConvolutionBackwardFilterWorkspaceSize(
+            _context.Handle, inputDesc.Handle, gradOutputDesc.Handle,
+            convDesc.Handle, gradFilterDesc.Handle, algo, out workspaceSize);
+        if (status != CuDnnNative.CudnnStatus.Success)
+        {
+            algo = CuDnnNative.CudnnConvolutionBwdFilterAlgo.Algo0;
+            status = CuDnnNative.cudnnGetConvolutionBackwardFilterWorkspaceSize(
+                _context.Handle, inputDesc.Handle, gradOutputDesc.Handle,
+                convDesc.Handle, gradFilterDesc.Handle, algo, out workspaceSize);
+            CuDnnContext.CheckStatus(status, "GetConvolutionBackwardFilterWorkspaceSize");
+        }
+
+        lock (_workspaceLock)
+        {
+            IntPtr workspace = IntPtr.Zero;
+            if (workspaceSize > 0)
+            {
+                EnsureWorkspaceUnlocked(workspaceSize);
+                workspace = _workspace;
+            }
+
+            float alpha = 1.0f;
+            float beta = 0.0f;
+            status = CuDnnNative.cudnnConvolutionBackwardFilter(
+                _context.Handle,
+                ref alpha,
+                inputDesc.Handle, inputDevPtr,
+                gradOutputDesc.Handle, gradOutputDevPtr,
+                convDesc.Handle,
+                algo,
+                workspace, workspaceSize,
+                ref beta,
+                gradFilterDesc.Handle, gradFilterDevPtr);
+            CuDnnContext.CheckStatus(status, "ConvolutionBackwardFilter");
         }
     }
 
@@ -1828,6 +2096,83 @@ public sealed class CuDnnPooling : IDisposable
         }
     }
 
+    /// <summary>
+    /// GPU-pointer Pool2D forward. Mirrors the host-array
+    /// <see cref="MaxPool2DForward"/> / <see cref="AvgPool2DForward"/> but
+    /// takes device pointers directly. Defaults to fp32; pass
+    /// <see cref="CuDnnNative.CudnnDataType.Half"/> /
+    /// <see cref="CuDnnNative.CudnnDataType.BFloat16"/> for mixed-precision.
+    /// </summary>
+    public void ForwardGpu(
+        IntPtr inputDevPtr, IntPtr outputDevPtr,
+        int n, int c, int h, int w,
+        int outputH, int outputW,
+        int windowH, int windowW,
+        int padH, int padW,
+        int strideH, int strideW,
+        CuDnnNative.CudnnPoolingMode mode,
+        CuDnnNative.CudnnDataType dataType = CuDnnNative.CudnnDataType.Float)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(CuDnnPooling));
+        using var inputDesc = new CuDnnTensorDescriptor();
+        using var outputDesc = new CuDnnTensorDescriptor();
+        using var poolDesc = new CuDnnPoolingDescriptor();
+
+        inputDesc.Set4D(dataType, n, c, h, w);
+        outputDesc.Set4D(dataType, n, c, outputH, outputW);
+        poolDesc.Set2D(mode, windowH, windowW, padH, padW, strideH, strideW);
+
+        float alpha = 1.0f;
+        float beta = 0.0f;
+        var status = CuDnnNative.cudnnPoolingForward(
+            _context.Handle,
+            poolDesc.Handle,
+            ref alpha,
+            inputDesc.Handle, inputDevPtr,
+            ref beta,
+            outputDesc.Handle, outputDevPtr);
+        CuDnnContext.CheckStatus(status, "PoolingForwardGpu");
+    }
+
+    /// <summary>
+    /// GPU-pointer Pool2D backward. Produces dX from the forward output Y,
+    /// dY, and the original input X (cuDNN's pooling-backward signature
+    /// needs all three because of MaxPool's argmax tracking).
+    /// </summary>
+    public void BackwardGpu(
+        IntPtr outputDevPtr, IntPtr gradOutputDevPtr,
+        IntPtr inputDevPtr, IntPtr gradInputDevPtr,
+        int n, int c, int h, int w,
+        int outputH, int outputW,
+        int windowH, int windowW,
+        int padH, int padW,
+        int strideH, int strideW,
+        CuDnnNative.CudnnPoolingMode mode,
+        CuDnnNative.CudnnDataType dataType = CuDnnNative.CudnnDataType.Float)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(CuDnnPooling));
+        using var inputDesc = new CuDnnTensorDescriptor();
+        using var outputDesc = new CuDnnTensorDescriptor();
+        using var poolDesc = new CuDnnPoolingDescriptor();
+
+        inputDesc.Set4D(dataType, n, c, h, w);
+        outputDesc.Set4D(dataType, n, c, outputH, outputW);
+        poolDesc.Set2D(mode, windowH, windowW, padH, padW, strideH, strideW);
+
+        float alpha = 1.0f;
+        float beta = 0.0f;
+        var status = CuDnnNative.cudnnPoolingBackward(
+            _context.Handle,
+            poolDesc.Handle,
+            ref alpha,
+            outputDesc.Handle, outputDevPtr,
+            outputDesc.Handle, gradOutputDevPtr,
+            inputDesc.Handle, inputDevPtr,
+            ref beta,
+            inputDesc.Handle, gradInputDevPtr);
+        CuDnnContext.CheckStatus(status, "PoolingBackwardGpu");
+    }
+
     public void Dispose()
     {
         if (_disposed) return;
@@ -1951,13 +2296,14 @@ public sealed class CuDnnBatchNorm : IDisposable
         IntPtr inputDevPtr, IntPtr outputDevPtr,
         IntPtr scaleDevPtr, IntPtr biasDevPtr,
         IntPtr runningMeanDevPtr, IntPtr runningVarDevPtr,
-        int n, int c, int h, int w, double epsilon = 1e-5)
+        int n, int c, int h, int w, double epsilon = 1e-5,
+        CuDnnNative.CudnnDataType dataType = CuDnnNative.CudnnDataType.Float)
     {
         if (_disposed) throw new ObjectDisposedException(nameof(CuDnnBatchNorm));
         using var xDesc = new CuDnnTensorDescriptor();
         using var bnDesc = new CuDnnTensorDescriptor();
 
-        xDesc.Set4D(CuDnnNative.CudnnDataType.Float, n, c, h, w);
+        xDesc.Set4D(dataType, n, c, h, w);
         var dStatus = CuDnnNative.cudnnDeriveBNTensorDescriptor(
             bnDesc.Handle, xDesc.Handle, CuDnnNative.CudnnBatchNormMode.Spatial);
         CuDnnContext.CheckStatus(dStatus, "DeriveBNTensorDescriptor");
@@ -1979,19 +2325,24 @@ public sealed class CuDnnBatchNorm : IDisposable
     /// <summary>
     /// GPU-pointer training-mode BatchNorm. Writes saved mean / inv-var
     /// for the backward pass and updates running stats in place.
+    /// Pass <paramref name="dataType"/> = <see cref="CuDnnNative.CudnnDataType.Half"/>
+    /// or <see cref="CuDnnNative.CudnnDataType.BFloat16"/> for mixed-precision
+    /// training; scale/bias/running-stats remain fp32 per
+    /// <see cref="CuDnnNative.cudnnDeriveBNTensorDescriptor"/>'s convention.
     /// </summary>
     public void ForwardTrainingGpu(
         IntPtr inputDevPtr, IntPtr outputDevPtr,
         IntPtr scaleDevPtr, IntPtr biasDevPtr,
         IntPtr runningMeanDevPtr, IntPtr runningVarDevPtr,
         IntPtr saveMeanDevPtr, IntPtr saveInvVarDevPtr,
-        int n, int c, int h, int w, double epsilon = 1e-5, double momentum = 0.1)
+        int n, int c, int h, int w, double epsilon = 1e-5, double momentum = 0.1,
+        CuDnnNative.CudnnDataType dataType = CuDnnNative.CudnnDataType.Float)
     {
         if (_disposed) throw new ObjectDisposedException(nameof(CuDnnBatchNorm));
         using var xDesc = new CuDnnTensorDescriptor();
         using var bnDesc = new CuDnnTensorDescriptor();
 
-        xDesc.Set4D(CuDnnNative.CudnnDataType.Float, n, c, h, w);
+        xDesc.Set4D(dataType, n, c, h, w);
         var dStatus = CuDnnNative.cudnnDeriveBNTensorDescriptor(
             bnDesc.Handle, xDesc.Handle, CuDnnNative.CudnnBatchNormMode.Spatial);
         CuDnnContext.CheckStatus(dStatus, "DeriveBNTensorDescriptor");
@@ -2020,13 +2371,14 @@ public sealed class CuDnnBatchNorm : IDisposable
         IntPtr inputDevPtr, IntPtr gradOutputDevPtr, IntPtr gradInputDevPtr,
         IntPtr scaleDevPtr, IntPtr gradScaleDevPtr, IntPtr gradBiasDevPtr,
         IntPtr savedMeanDevPtr, IntPtr savedInvVarDevPtr,
-        int n, int c, int h, int w, double epsilon = 1e-5)
+        int n, int c, int h, int w, double epsilon = 1e-5,
+        CuDnnNative.CudnnDataType dataType = CuDnnNative.CudnnDataType.Float)
     {
         if (_disposed) throw new ObjectDisposedException(nameof(CuDnnBatchNorm));
         using var xDesc = new CuDnnTensorDescriptor();
         using var bnDesc = new CuDnnTensorDescriptor();
 
-        xDesc.Set4D(CuDnnNative.CudnnDataType.Float, n, c, h, w);
+        xDesc.Set4D(dataType, n, c, h, w);
         var dStatus = CuDnnNative.cudnnDeriveBNTensorDescriptor(
             bnDesc.Handle, xDesc.Handle, CuDnnNative.CudnnBatchNormMode.Spatial);
         CuDnnContext.CheckStatus(dStatus, "DeriveBNTensorDescriptor");
@@ -2133,6 +2485,75 @@ public sealed class CuDnnSoftmax : IDisposable
         {
             return null;
         }
+    }
+
+    /// <summary>
+    /// GPU-pointer Softmax forward (channel-mode, accurate algorithm).
+    /// Mirrors <see cref="Forward(float[], int, int, int, int)"/> but
+    /// takes device pointers directly — no host round-trip.
+    /// </summary>
+    /// <param name="inputDevPtr">Input [n, c, h, w] in <paramref name="dataType"/> elements.</param>
+    /// <param name="outputDevPtr">Output [n, c, h, w] — caller allocates.</param>
+    /// <param name="dataType">cuDNN element type. Compute is implicit per cuDNN's
+    /// Softmax contract (fp32 accumulators for fp16 inputs).</param>
+    public void ForwardGpu(
+        IntPtr inputDevPtr, IntPtr outputDevPtr,
+        int n, int c, int h = 1, int w = 1,
+        CuDnnNative.CudnnDataType dataType = CuDnnNative.CudnnDataType.Float)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(CuDnnSoftmax));
+        using var inputDesc = new CuDnnTensorDescriptor();
+        using var outputDesc = new CuDnnTensorDescriptor();
+
+        inputDesc.Set4D(dataType, n, c, h, w);
+        outputDesc.Set4D(dataType, n, c, h, w);
+
+        float alpha = 1.0f;
+        float beta = 0.0f;
+        var status = CuDnnNative.cudnnSoftmaxForward(
+            _context.Handle,
+            CuDnnNative.CudnnSoftmaxAlgorithm.Accurate,
+            CuDnnNative.CudnnSoftmaxMode.Channel,
+            ref alpha,
+            inputDesc.Handle, inputDevPtr,
+            ref beta,
+            outputDesc.Handle, outputDevPtr);
+        CuDnnContext.CheckStatus(status, "SoftmaxForwardGpu");
+    }
+
+    /// <summary>
+    /// GPU-pointer Softmax backward: computes dX given the forward output Y
+    /// and dY. cuDNN's softmax-backward takes Y (not X) per its API contract.
+    /// </summary>
+    /// <param name="outputDevPtr">Forward output Y [n, c, h, w].</param>
+    /// <param name="gradOutputDevPtr">dY [n, c, h, w].</param>
+    /// <param name="gradInputDevPtr">dX [n, c, h, w] — caller allocates.</param>
+    public void BackwardGpu(
+        IntPtr outputDevPtr, IntPtr gradOutputDevPtr, IntPtr gradInputDevPtr,
+        int n, int c, int h = 1, int w = 1,
+        CuDnnNative.CudnnDataType dataType = CuDnnNative.CudnnDataType.Float)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(CuDnnSoftmax));
+        using var yDesc = new CuDnnTensorDescriptor();
+        using var dyDesc = new CuDnnTensorDescriptor();
+        using var dxDesc = new CuDnnTensorDescriptor();
+
+        yDesc.Set4D(dataType, n, c, h, w);
+        dyDesc.Set4D(dataType, n, c, h, w);
+        dxDesc.Set4D(dataType, n, c, h, w);
+
+        float alpha = 1.0f;
+        float beta = 0.0f;
+        var status = CuDnnNative.cudnnSoftmaxBackward(
+            _context.Handle,
+            CuDnnNative.CudnnSoftmaxAlgorithm.Accurate,
+            CuDnnNative.CudnnSoftmaxMode.Channel,
+            ref alpha,
+            yDesc.Handle, outputDevPtr,
+            dyDesc.Handle, gradOutputDevPtr,
+            ref beta,
+            dxDesc.Handle, gradInputDevPtr);
+        CuDnnContext.CheckStatus(status, "SoftmaxBackwardGpu");
     }
 
     public void Dispose()
