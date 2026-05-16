@@ -2923,6 +2923,27 @@ public partial class CpuEngine : ITensorLevelEngine
                 $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
         }
 
+        // GraphMode: record only — DO NOT eagerly mutate (see
+        // LazyTensorScope.RecordInPlace docstring on initial-condition
+        // pollution). Trace-time downstream consumers that read `a` get
+        // the unmodified value; replay applies the actual mutation. For
+        // STATEFUL accumulators (BN running stats, optimizer momentums)
+        // this is exactly the right semantics — they were initialized to
+        // a known starting condition (zeros / ones / etc.) and replay-1
+        // must accumulate FROM that condition, not from a polluted one.
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ca = a; var cb = b;
+                scope.BindEngineIfUnset(this);
+                scope.RecordInPlace(LazyNodeType.Custom, "TensorAddInPlace", a, new[] { b },
+                    (eng, _) => eng.TensorAddInPlace(ca, cb));
+                return;
+            }
+        }
+
         // Save input before mutation when tape is active (for backward pass)
         Tensor<T>? savedA = null;
         var tape = GradientTape<T>.Current;
@@ -3439,6 +3460,21 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
+
+        // Issue #350 v3 (GraphMode-aware in-place op — record-only).
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ca = a; var cb = b;
+                scope.BindEngineIfUnset(this);
+                scope.RecordInPlace(LazyNodeType.Custom, "TensorBroadcastAddInPlace", a, new[] { b },
+                    (eng, _) => eng.TensorBroadcastAddInPlace(ca, cb));
+                return;
+            }
+        }
+
         var aOrig = a;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!a.IsContiguous) a = a.Contiguous();
         var bOrig = b;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
@@ -3567,6 +3603,20 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public void SwishInPlace<T>(Tensor<T> tensor)
     {
+        // Issue #350 v3 (GraphMode-aware in-place op).
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ct = tensor;
+                scope.BindEngineIfUnset(this);
+                scope.RecordInPlace(LazyNodeType.Custom, "SwishInPlace", tensor, Array.Empty<Tensor<T>>(),
+                    (eng, _) => eng.SwishInPlace(ct));
+                return;
+            }
+        }
+
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -3611,6 +3661,20 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public void GELUInPlace<T>(Tensor<T> tensor)
     {
+        // Issue #350 v3 (GraphMode-aware in-place op).
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ct = tensor;
+                scope.BindEngineIfUnset(this);
+                scope.RecordInPlace(LazyNodeType.Custom, "GELUInPlace", tensor, Array.Empty<Tensor<T>>(),
+                    (eng, _) => eng.GELUInPlace(ct));
+                return;
+            }
+        }
+
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -3653,6 +3717,20 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public void TanhInPlace<T>(Tensor<T> tensor)
     {
+        // Issue #350 v3 (GraphMode-aware in-place op).
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ct = tensor;
+                scope.BindEngineIfUnset(this);
+                scope.RecordInPlace(LazyNodeType.Custom, "TanhInPlace", tensor, Array.Empty<Tensor<T>>(),
+                    (eng, _) => eng.TanhInPlace(ct));
+                return;
+            }
+        }
+
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -3695,6 +3773,20 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public void MishInPlace<T>(Tensor<T> tensor)
     {
+        // Issue #350 v3 (GraphMode-aware in-place op).
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ct = tensor;
+                scope.BindEngineIfUnset(this);
+                scope.RecordInPlace(LazyNodeType.Custom, "MishInPlace", tensor, Array.Empty<Tensor<T>>(),
+                    (eng, _) => eng.MishInPlace(ct));
+                return;
+            }
+        }
+
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -3733,6 +3825,20 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual void LeakyReLUInPlace<T>(Tensor<T> tensor, T alpha)
     {
+        // Issue #350 v3 (GraphMode-aware in-place op).
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ct = tensor; var ca = alpha;
+                scope.BindEngineIfUnset(this);
+                scope.RecordInPlace(LazyNodeType.Custom, "LeakyReLUInPlace", tensor, Array.Empty<Tensor<T>>(),
+                    (eng, _) => eng.LeakyReLUInPlace(ct, ca));
+                return;
+            }
+        }
+
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -4587,6 +4693,20 @@ public partial class CpuEngine : ITensorLevelEngine
                 $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
         }
 
+        // Issue #350 v3 (GraphMode-aware in-place op — record-only).
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ca = a; var cb = b;
+                scope.BindEngineIfUnset(this);
+                scope.RecordInPlace(LazyNodeType.Custom, "TensorMultiplyInPlace", a, new[] { b },
+                    (eng, _) => eng.TensorMultiplyInPlace(ca, cb));
+                return;
+            }
+        }
+
         Tensor<T>? savedA = null;
         var mulTape = GradientTape<T>.Current;
         if (mulTape is not null && mulTape.Options.RecordInPlace)
@@ -4756,6 +4876,20 @@ public partial class CpuEngine : ITensorLevelEngine
                 $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
         }
 
+        // Issue #350 v3 (GraphMode-aware in-place op — record-only).
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ca = a; var cb = b;
+                scope.BindEngineIfUnset(this);
+                scope.RecordInPlace(LazyNodeType.Custom, "TensorSubtractInPlace", a, new[] { b },
+                    (eng, _) => eng.TensorSubtractInPlace(ca, cb));
+                return;
+            }
+        }
+
         Tensor<T>? savedASub = null;
         var subTape = GradientTape<T>.Current;
         if (subTape is not null && subTape.Options.RecordInPlace)
@@ -4857,6 +4991,21 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (!a.IsContiguous) throw new InvalidOperationException("In-place scalar multiply requires contiguous tensor.");
+
+        // Issue #350 v3 (GraphMode-aware in-place op — record-only, see
+        // LazyTensorScope.RecordInPlace docstring).
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ca = a; var csc = scalar;
+                scope.BindEngineIfUnset(this);
+                scope.RecordInPlace(LazyNodeType.Custom, "TensorMultiplyScalarInPlace", a, Array.Empty<Tensor<T>>(),
+                    (eng, _) => eng.TensorMultiplyScalarInPlace(ca, csc));
+                return;
+            }
+        }
 
         int length = a.Length;
 
@@ -9127,6 +9276,21 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
+
+        // Issue #350 v3 (GraphMode-aware in-place op).
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ct = tensor;
+                scope.BindEngineIfUnset(this);
+                scope.RecordInPlace(LazyNodeType.Custom, "SigmoidInPlace", tensor, Array.Empty<Tensor<T>>(),
+                    (eng, _) => eng.SigmoidInPlace(ct));
+                return;
+            }
+        }
+
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
@@ -9163,6 +9327,21 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
+
+        // Issue #350 v3 (GraphMode-aware in-place op).
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ct = tensor;
+                scope.BindEngineIfUnset(this);
+                scope.RecordInPlace(LazyNodeType.Custom, "SigmoidInPlace", tensor, Array.Empty<Tensor<T>>(),
+                    (eng, _) => eng.SigmoidInPlace(ct));
+                return;
+            }
+        }
+
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
@@ -9449,6 +9628,21 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
+
+        // Issue #350 v3 (GraphMode-aware in-place op).
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ct = tensor;
+                scope.BindEngineIfUnset(this);
+                scope.RecordInPlace(LazyNodeType.Custom, "ReLUInPlace", tensor, Array.Empty<Tensor<T>>(),
+                    (eng, _) => eng.ReLUInPlace(ct));
+                return;
+            }
+        }
+
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
@@ -9485,6 +9679,21 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
+
+        // Issue #350 v3 (GraphMode-aware in-place op).
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ct = tensor;
+                scope.BindEngineIfUnset(this);
+                scope.RecordInPlace(LazyNodeType.Custom, "ReLUInPlace", tensor, Array.Empty<Tensor<T>>(),
+                    (eng, _) => eng.ReLUInPlace(ct));
+                return;
+            }
+        }
+
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
@@ -11978,6 +12187,37 @@ public partial class CpuEngine : ITensorLevelEngine
         long perImageCost = (long)outC * K * N;
         bool parallelBatch = batch > 1 && perImageCost < 50_000_000L;
 
+        // 1×1 conv fast path (matches the float side at line 8805): when
+        // the kernel is 1×1 with stride=1, pad=0, dilation=1, Im2Col is
+        // an identity copy of the input — the "expanded" matrix has the
+        // same layout as the input slice. Skip the Im2Col rent + memcpy
+        // and feed the input pointer directly to dgemm. GraFPrint has 17
+        // of 19 conv layers that are 1×1, so eliminating this per-call
+        // 64-128KB allocation + scalar im2col pass is load-bearing for
+        // the small-batch training loop budget.
+        bool isPointwise = (kH == 1 && kW == 1 && sH == 1 && sW == 1
+            && padH == 0 && padW == 0 && dH == 1 && dW == 1);
+
+        void ProcessImagePointwise(int b)
+        {
+            int inOff = b * inputSliceSize;
+            int outOff = b * outC * N;
+            bool usedBlas = Helpers.BlasProvider.TryGemm(
+                outC, N, K,
+                kernel.AsSpan(0, outC * K), K,
+                input.AsSpan(inOff, inputSliceSize), N,
+                output.AsSpan(outOff, outC * N), N);
+
+            if (!usedBlas)
+            {
+                Helpers.Im2ColHelper.MultiplyMatrixBlockedDouble(
+                    kernel.AsSpan(0, outC * K),
+                    input.AsSpan(inOff, inputSliceSize),
+                    output.AsSpan(outOff, outC * N),
+                    outC, K, N);
+            }
+        }
+
         void ProcessImage(int b)
         {
             var col = System.Buffers.ArrayPool<double>.Shared.Rent(K * N);
@@ -12010,14 +12250,16 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        Action<int> body = isPointwise ? ProcessImagePointwise : ProcessImage;
+
         if (parallelBatch)
         {
             CpuParallelSettings.ParallelForOrSerial(0, batch,
-                (long)batch * outC * oH * oW, ProcessImage);
+                (long)batch * outC * oH * oW, body);
         }
         else
         {
-            for (int b = 0; b < batch; b++) ProcessImage(b);
+            for (int b = 0; b < batch; b++) body(b);
         }
     }
 
@@ -12243,6 +12485,9 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
         if (!kernel.IsContiguous) kernel = kernel.Contiguous();
         if (inputShape == null || inputShape.Length != 4) throw new ArgumentException("inputShape must be array of 4 elements", nameof(inputShape));
+        if (stride == null || stride.Length != 2) throw new ArgumentException("stride must be array of 2 elements", nameof(stride));
+        if (padding == null || padding.Length != 2) throw new ArgumentException("padding must be array of 2 elements", nameof(padding));
+        if (dilation == null || dilation.Length != 2) throw new ArgumentException("dilation must be array of 2 elements", nameof(dilation));
         if (gradOutput.Rank != 4) throw new ArgumentException($"requires 4D gradOutput. Got rank {gradOutput.Rank}.", nameof(gradOutput));
         if (kernel.Rank != 4) throw new ArgumentException($"requires 4D kernel. Got rank {kernel.Rank}.", nameof(kernel));
         if (!ShapesMatch(dest._shape, inputShape)) throw new ArgumentException("dest shape must match inputShape");
@@ -12322,6 +12567,69 @@ public partial class CpuEngine : ITensorLevelEngine
                 Array.Clear(destD, destOff, batch * inChannels * height * width);
             var gradOutputD = (double[])(object)gradOutput.GetFlattenedData();
             var kernelD = (double[])(object)kernel.GetFlattenedData();
+
+            // 1×1 conv fast path: when k=1×1 with stride=1, pad=0, dilation=1,
+            // Col2Im is an identity copy. The backward-input collapses to
+            //   gradInput_b = kernel^T @ gradOutput_b   (one GEMM per batch).
+            // GraFPrint has 17 of 19 conv layers that are 1×1, so eliminating
+            // the per-call kernelT transpose + Im2Col pool rent + scalar
+            // Col2ImAccumulate pass is load-bearing for the small-batch
+            // training loop budget. The output spatial layout (H*W = N)
+            // matches the destination's NCHW slice directly, so we can write
+            // straight into destD without a colBuf intermediate.
+            if (kernelHeight == 1 && kernelWidth == 1 && strideH == 1 && strideW == 1
+                && padH == 0 && padW == 0 && dilationH == 1 && dilationW == 1)
+            {
+                int N = outputHeight * outputWidth; // == height*width when 1×1 stride=1 pad=0
+                int inputSliceSize = inChannels * N;
+                int gradSliceSize = outChannels * N;
+                CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * inChannels * outChannels * N, b =>
+                {
+                    int gradOutOff = b * gradSliceSize;
+                    int destSliceOff = destOff + b * inputSliceSize;
+                    // gradInput_b = kernel^T (inC × outC) @ gradOut_b (outC × N)
+                    // Use TryGemmEx with TransA=true so kernel is consumed
+                    // in its natural [outC, inC] row-major layout.
+                    bool usedBlas = Helpers.BlasProvider.TryGemmExBeta(
+                        inChannels, N, outChannels,
+                        kernelD, 0, inChannels, true,        // A = kernel [outC × inC] transposed
+                        gradOutputD, gradOutOff, N, false,   // B = gradOut_b [outC × N]
+                        destD, destSliceOff, N,              // C := α A @ B + β C
+                        alpha: 1.0,
+                        beta: accumulate ? 1.0 : 0.0);
+                    if (!usedBlas)
+                    {
+                        // Fallback: build transposed kernel once on demand
+                        // (rare path — only when BLAS is unavailable). Per-batch
+                        // alloc is fine here since this is the cold path.
+                        var kT = System.Buffers.ArrayPool<double>.Shared.Rent(inChannels * outChannels);
+                        try
+                        {
+                            for (int r = 0; r < outChannels; r++)
+                                for (int c = 0; c < inChannels; c++)
+                                    kT[c * outChannels + r] = kernelD[r * inChannels + c];
+                            var dstSpan = new Span<double>(destD, destSliceOff, inputSliceSize);
+                            if (!accumulate) dstSpan.Clear();
+                            // dstSpan += kT[inC, outC] @ gradOut_b[outC, N]
+                            for (int ic = 0; ic < inChannels; ic++)
+                            {
+                                int kRowBase = ic * outChannels;
+                                int dRowBase = ic * N;
+                                for (int n = 0; n < N; n++)
+                                {
+                                    double sum = 0.0;
+                                    for (int oc = 0; oc < outChannels; oc++)
+                                        sum += kT[kRowBase + oc] * gradOutputD[gradOutOff + oc * N + n];
+                                    dstSpan[dRowBase + n] += sum;
+                                }
+                            }
+                        }
+                        finally { System.Buffers.ArrayPool<double>.Shared.Return(kT); }
+                    }
+                });
+                return;
+            }
+
             var kernelTD = new double[colH * outChannels];
             for (int r = 0; r < outChannels; r++)
                 for (int c = 0; c < colH; c++)
@@ -12359,14 +12667,23 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // Generic fallback for non-float, non-double types — wrap the existing
         // public method and copy/add. Slow path, only used for BFloat16 etc.
+        // tmp is allocated from the pool via TensorAllocator.Rent; return it
+        // after the merge to avoid pool exhaustion on this hot backward path.
         var tmp = Conv2DBackwardInput(gradOutput, kernel, inputShape, stride, padding, dilation);
-        if (accumulate)
+        try
         {
-            TensorAddInto(dest, dest, tmp);
+            if (accumulate)
+            {
+                TensorAddInto(dest, dest, tmp);
+            }
+            else
+            {
+                tmp.AsSpan().CopyTo(dest.AsWritableSpan());
+            }
         }
-        else
+        finally
         {
-            tmp.AsSpan().CopyTo(dest.AsWritableSpan());
+            Helpers.TensorAllocator.Return(tmp);
         }
     }
 
@@ -12629,6 +12946,9 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
         if (!input.IsContiguous) input = input.Contiguous();
         if (kernelShape == null || kernelShape.Length != 4) throw new ArgumentException("kernelShape must be array of 4 elements", nameof(kernelShape));
+        if (stride == null || stride.Length != 2) throw new ArgumentException("stride must be array of 2 elements", nameof(stride));
+        if (padding == null || padding.Length != 2) throw new ArgumentException("padding must be array of 2 elements", nameof(padding));
+        if (dilation == null || dilation.Length != 2) throw new ArgumentException("dilation must be array of 2 elements", nameof(dilation));
         if (gradOutput.Rank != 4) throw new ArgumentException($"requires 4D gradOutput. Got rank {gradOutput.Rank}.", nameof(gradOutput));
         if (input.Rank != 4) throw new ArgumentException($"requires 4D input. Got rank {input.Rank}.", nameof(input));
         if (!ShapesMatch(dest._shape, kernelShape)) throw new ArgumentException("dest shape must match kernelShape");
@@ -12716,10 +13036,57 @@ public partial class CpuEngine : ITensorLevelEngine
             int totalLen = outChannels * colH;
             var destD = (double[])(object)dest._storage.GetDataArray();
             int destOff = dest._storageOffset;
-            var gradKernelD = new double[totalLen];
             var gradOutputD = (double[])(object)gradOutput.GetFlattenedData();
             var inputD = (double[])(object)input.GetFlattenedData();
             int inputSliceSize = inChannels * height * width;
+
+            // 1×1 conv fast path: kH=kW=1, stride=1, pad=0, dil=1 ⇒ Im2Col
+            // is identity and totalLen == outC*inC. The per-batch GEMM becomes
+            //   gradKernel += gradOut_b @ input_b^T
+            // We sequentially accumulate into destD with β=1 (first batch's β
+            // depends on the caller-supplied accumulate flag). This avoids the
+            // per-batch new double[totalLen] allocations + final merge pass
+            // that the general path does. With 17 of 19 1×1 convs on
+            // GraFPrint, eliminating that B×totalLen allocation footprint is
+            // the dominant backward-pass perf bottleneck at small batch.
+            if (kernelHeight == 1 && kernelWidth == 1 && strideH == 1 && strideW == 1
+                && padH == 0 && padW == 0 && dilationH == 1 && dilationW == 1)
+            {
+                int N = outputHeight * outputWidth;
+                for (int b = 0; b < batch; b++)
+                {
+                    double betaThis = (b == 0) ? (accumulate ? 1.0 : 0.0) : 1.0;
+                    int gradOutOff = b * outChannels * N;
+                    int inOff = b * inChannels * N;
+                    bool usedBlas = Helpers.BlasProvider.TryGemmExBeta(
+                        outChannels, inChannels, N,
+                        gradOutputD, gradOutOff, N, false,   // A = gradOut_b [outC × N]
+                        inputD, inOff, N, true,              // B = input_b^T [N × inC] (logical), via TransB
+                        destD, destOff, inChannels,
+                        alpha: 1.0, beta: betaThis);
+                    if (!usedBlas)
+                    {
+                        // No-BLAS scalar fallback (very cold path).
+                        if (b == 0 && !accumulate)
+                            Array.Clear(destD, destOff, totalLen);
+                        for (int oc = 0; oc < outChannels; oc++)
+                        {
+                            for (int ic = 0; ic < inChannels; ic++)
+                            {
+                                double sum = 0.0;
+                                int goRowBase = gradOutOff + oc * N;
+                                int inRowBase = inOff + ic * N;
+                                for (int n = 0; n < N; n++)
+                                    sum += gradOutputD[goRowBase + n] * inputD[inRowBase + n];
+                                destD[destOff + oc * inChannels + ic] += sum;
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+
+            var gradKernelD = new double[totalLen];
             var perBatchGradsD = new double[batch][];
             var kPoolD = System.Buffers.ArrayPool<double>.Shared;
             CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * colH * colW, b =>
@@ -12779,14 +13146,22 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         // Generic fallback for non-float, non-double types.
+        // Pool-allocated by Conv2DBackwardKernel → return after merging.
         var tmp = Conv2DBackwardKernel(gradOutput, input, kernelShape, stride, padding, dilation);
-        if (accumulate)
+        try
         {
-            TensorAddInto(dest, dest, tmp);
+            if (accumulate)
+            {
+                TensorAddInto(dest, dest, tmp);
+            }
+            else
+            {
+                tmp.AsSpan().CopyTo(dest.AsWritableSpan());
+            }
         }
-        else
+        finally
         {
-            tmp.AsSpan().CopyTo(dest.AsWritableSpan());
+            Helpers.TensorAllocator.Return(tmp);
         }
     }
 
@@ -17702,7 +18077,10 @@ public partial class CpuEngine : ITensorLevelEngine
                 scope.BindEngineIfUnset(this);
                 // AiDotNet#1331: capture mean/variance refs so the lazy
                 // replay below can refresh them on every plan.Step (training
-                // mean/variance evolve with the data).
+                // mean/variance evolve with the data). PR #359 review (Thread
+                // 13): BatchNorm rents eagerResult/freshMean/freshVar from the
+                // pool; return them after copying their contents so the BN
+                // GraphMode path does not leak three tensors per replay.
                 var capturedMean = mean; var capturedVar = variance;
                 // Record in graph so compiled plan captures the dependency
                 var lazyResult = scope.RecordVariadic(LazyNodeType.Custom, "BatchNorm",
@@ -17710,12 +18088,22 @@ public partial class CpuEngine : ITensorLevelEngine
                     (eng, output) =>
                     {
                         var r = eng.BatchNorm(ci, cg, cb, ce, out var freshMean, out var freshVar);
-                        r.AsSpan().CopyTo(output.AsWritableSpan());
-                        freshMean.AsSpan().CopyTo(capturedMean.AsWritableSpan());
-                        freshVar.AsSpan().CopyTo(capturedVar.AsWritableSpan());
+                        try
+                        {
+                            r.AsSpan().CopyTo(output.AsWritableSpan());
+                            freshMean.AsSpan().CopyTo(capturedMean.AsWritableSpan());
+                            freshVar.AsSpan().CopyTo(capturedVar.AsWritableSpan());
+                        }
+                        finally
+                        {
+                            Helpers.TensorAllocator.Return(r);
+                            Helpers.TensorAllocator.Return(freshMean);
+                            Helpers.TensorAllocator.Return(freshVar);
+                        }
                     },
                     BackwardFunctions<T>.BatchNormBackward, new object[] { mean, variance, epsilon });
                 eagerResult.AsSpan().CopyTo(lazyResult.AsWritableSpan());
+                Helpers.TensorAllocator.Return(eagerResult);
                 return lazyResult;
             }
         }
@@ -17921,14 +18309,15 @@ public partial class CpuEngine : ITensorLevelEngine
             return (Tensor<T>)(object)TensorAllocator.Rent<T>(input._shape, (Vector<T>)(object)Vector<float>.FromMemory(outF));
         }
 
-        // Double fast path — mirrors the float kernel structure with direct
-        // double arithmetic and per-channel parallelization. Without this
-        // branch, BatchNorm4D forward for double walks the generic numOps
-        // fallback below: ~6 virtual-call interface dispatches per output
-        // element, dominating BatchNorm wall time on ResNet50 training when
-        // the activation tape is enabled (BatchNorm4D forward runs on EVERY
-        // train pass, both as a primary op and inside Conv2D-fused-with-BN
-        // forward graphs).
+        // Double fast path — mirrors the float kernel's fused single-sweep
+        // (sum + sumSq via Var[X] = E[X²] - E[X]²) plus AVX2+FMA SIMD on
+        // Vector256<double> (4 lanes). Without this, BN forward for double
+        // walked a scalar inner loop that dominated GraFPrint's batch=8
+        // Predict wall (18 BN layers × scalar inner loop ≈ 70% of forward
+        // cost). The 4-way unroll (16 doubles per iter) saturates both FMA
+        // ports on Zen 2 / Intel Skylake+; scalar tail handles non-multiple
+        // spatialSize. Falls back to the original scalar loop when AVX/FMA
+        // aren't available (net471 / non-x86).
         if (inputData is double[] inD && gammaData is double[] gamD && betaData is double[] betD)
         {
             double epsD = numOps.ToDouble(eps);
@@ -17940,45 +18329,7 @@ public partial class CpuEngine : ITensorLevelEngine
 #else
             var outDArr = new double[logicalLength];
 #endif
-            int spD = spatialSize;
-            int epcD = elementsPerChannel;
-            CpuParallelSettings.ParallelForOrSerial(0, channels, (long)channels * epcD, c =>
-            {
-                double sum = 0;
-                for (int n = 0; n < batch; n++)
-                {
-                    int offset = n * channels * spD + c * spD;
-                    for (int s = 0; s < spD; s++)
-                        sum += inD[offset + s];
-                }
-                double meanC = sum / epcD;
-                meanDArr[c] = meanC;
-
-                double sumSq = 0;
-                for (int n = 0; n < batch; n++)
-                {
-                    int offset = n * channels * spD + c * spD;
-                    for (int s = 0; s < spD; s++)
-                    {
-                        double diff = inD[offset + s] - meanC;
-                        sumSq += diff * diff;
-                    }
-                }
-                double varC = sumSq / epcD;
-                varDArr[c] = varC;
-
-                double invStd = 1.0 / System.Math.Sqrt(varC + epsD);
-                double g = gamD[c], b2 = betD[c];
-                for (int n = 0; n < batch; n++)
-                {
-                    int offset = n * channels * spD + c * spD;
-                    for (int s = 0; s < spD; s++)
-                    {
-                        int idx = offset + s;
-                        outDArr[idx] = g * (inD[idx] - meanC) * invStd + b2;
-                    }
-                }
-            });
+            BatchNorm4DDouble(inD, gamD, betD, epsD, batch, channels, spatialSize, meanDArr, varDArr, outDArr);
             mean = (Tensor<T>)(object)TensorAllocator.Rent<T>(new[] { channels }, (Vector<T>)(object)new Vector<double>(meanDArr));
             variance = (Tensor<T>)(object)TensorAllocator.Rent<T>(new[] { channels }, (Vector<T>)(object)new Vector<double>(varDArr));
             return (Tensor<T>)(object)TensorAllocator.Rent<T>(input._shape, (Vector<T>)(object)new Vector<double>(outDArr));
@@ -18271,6 +18622,262 @@ public partial class CpuEngine : ITensorLevelEngine
         }
     }
 
+    /// <summary>
+    /// Double-precision AVX2+FMA SIMD kernel for BatchNorm4D forward —
+    /// mirrors the float fused-pass kernel structure on Vector256&lt;double&gt;
+    /// (4 doubles per vector, 4-way unrolled = 16 doubles per iter). Replaces
+    /// the per-channel scalar inner loops that dominated double-precision
+    /// forward wall on convnet pyramids (18 BN layers × scalar inner loop
+    /// owned ~70% of GraFPrint's Predict cost at batch=8). Parallelizes
+    /// across channels via PersistentParallelExecutor — same dispatch path
+    /// the float kernel uses.
+    /// </summary>
+    private static unsafe void BatchNorm4DDouble(double[] input, double[] gamma, double[] beta, double eps,
+        int batch, int channels, int spatialSize, double[] meanOut, double[] varOut, double[] output)
+    {
+        int elementsPerChannel = batch * spatialSize;
+        double invCount = 1.0 / elementsPerChannel;
+        long totalWork = (long)batch * channels * spatialSize;
+
+        // Use the same dispatcher the original scalar path used so we benchmark
+        // apples-to-apples (PersistentParallelExecutor empirically regresses
+        // for small-spatialSize / many-channel BN shapes typical of small-
+        // batch convnets — its per-task wakeup overhead exceeds the SIMD
+        // savings on per-channel work below ~10µs).
+        CpuParallelSettings.ParallelForOrSerial(0, channels, totalWork, c =>
+        {
+            BatchNorm4DDoubleChannel(input, gamma, beta, eps, batch, channels, spatialSize,
+                invCount, c, meanOut, varOut, output);
+        });
+    }
+
+    private static unsafe void BatchNorm4DDoubleChannel(double[] input, double[] gamma, double[] beta, double eps,
+        int batch, int channels, int spatialSize, double invCount, int c,
+        double[] meanOut, double[] varOut, double[] output)
+    {
+#if NET5_0_OR_GREATER
+        if (System.Runtime.Intrinsics.X86.Fma.IsSupported && spatialSize >= 16)
+        {
+            // Pin once for all passes — avoids per-pass pinning overhead.
+            fixed (double* inp = input, outp = output)
+            {
+                // FUSED Pass 1+2: simultaneous sum AND sum-of-squares via
+                //   Var[X] = E[X²] - E[X]²
+                // Cuts input reads from 3× to 2× — saves one full sweep
+                // over the per-channel data. 4-way unrolled (16 doubles per
+                // iter, two 256-bit loads × 4) to saturate both FMA ports.
+                double sum = 0.0;
+                double sumSq = 0.0;
+                var vsum0 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var vsum1 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var vsum2 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var vsum3 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var vsq0 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var vsq1 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var vsq2 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var vsq3 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                for (int n = 0; n < batch; n++)
+                {
+                    int offset = n * channels * spatialSize + c * spatialSize;
+                    double* ptr = inp + offset;
+                    int s = 0;
+                    int simdLen = spatialSize & ~15;
+                    for (; s < simdLen; s += 16)
+                    {
+                        var v0 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(ptr + s);
+                        var v1 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(ptr + s + 4);
+                        var v2v = System.Runtime.Intrinsics.X86.Avx.LoadVector256(ptr + s + 8);
+                        var v3 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(ptr + s + 12);
+                        vsum0 = System.Runtime.Intrinsics.X86.Avx.Add(vsum0, v0);
+                        vsum1 = System.Runtime.Intrinsics.X86.Avx.Add(vsum1, v1);
+                        vsum2 = System.Runtime.Intrinsics.X86.Avx.Add(vsum2, v2v);
+                        vsum3 = System.Runtime.Intrinsics.X86.Avx.Add(vsum3, v3);
+                        vsq0 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(v0, v0, vsq0);
+                        vsq1 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(v1, v1, vsq1);
+                        vsq2 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(v2v, v2v, vsq2);
+                        vsq3 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(v3, v3, vsq3);
+                    }
+                    for (; s < spatialSize; s++)
+                    {
+                        double x = ptr[s];
+                        sum += x;
+                        sumSq += x * x;
+                    }
+                }
+                vsum0 = System.Runtime.Intrinsics.X86.Avx.Add(System.Runtime.Intrinsics.X86.Avx.Add(vsum0, vsum1), System.Runtime.Intrinsics.X86.Avx.Add(vsum2, vsum3));
+                sum += HorizontalSumD(vsum0);
+                vsq0 = System.Runtime.Intrinsics.X86.Avx.Add(System.Runtime.Intrinsics.X86.Avx.Add(vsq0, vsq1), System.Runtime.Intrinsics.X86.Avx.Add(vsq2, vsq3));
+                sumSq += HorizontalSumD(vsq0);
+
+                double channelMean = sum * invCount;
+                meanOut[c] = channelMean;
+                var vmean = System.Runtime.Intrinsics.Vector256.Create(channelMean);
+                // Variance via E[X²] - E[X]². Numerical-safety clamp:
+                // catastrophic cancellation can drive this slightly negative
+                // for near-uniform channels — clamp to 0 (matches float
+                // kernel; gives invStd → ∞ producing zero output for
+                // zero-variance channels, the correct degenerate result).
+                double channelVar = sumSq * invCount - channelMean * channelMean;
+                if (channelVar < 0.0) channelVar = 0.0;
+                varOut[c] = channelVar;
+                double invStd = 1.0 / System.Math.Sqrt(channelVar + eps);
+                double g = gamma[c];
+                double b = beta[c];
+
+                // Pass 3: Normalize with 4× unrolled FMA: out = γ*(x - μ)*invStd + β
+                var vscale = System.Runtime.Intrinsics.Vector256.Create(g * invStd);
+                var vbias = System.Runtime.Intrinsics.Vector256.Create(b);
+                for (int n = 0; n < batch; n++)
+                {
+                    int offset = n * channels * spatialSize + c * spatialSize;
+                    double* pi = inp + offset;
+                    double* po = outp + offset;
+                    int s = 0;
+                    int simdLen = spatialSize & ~15;
+                    for (; s < simdLen; s += 16)
+                    {
+                        var d0 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(pi + s), vmean);
+                        var d1 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(pi + s + 4), vmean);
+                        var d2 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(pi + s + 8), vmean);
+                        var d3 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(pi + s + 12), vmean);
+                        System.Runtime.Intrinsics.X86.Avx.Store(po + s, System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(d0, vscale, vbias));
+                        System.Runtime.Intrinsics.X86.Avx.Store(po + s + 4, System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(d1, vscale, vbias));
+                        System.Runtime.Intrinsics.X86.Avx.Store(po + s + 8, System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(d2, vscale, vbias));
+                        System.Runtime.Intrinsics.X86.Avx.Store(po + s + 12, System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(d3, vscale, vbias));
+                    }
+                    for (; s < spatialSize; s++)
+                        outp[offset + s] = g * (inp[offset + s] - channelMean) * invStd + b;
+                }
+            }
+            return;
+        }
+        else if (System.Runtime.Intrinsics.X86.Avx2.IsSupported && spatialSize >= 4)
+        {
+            // AVX2 path without FMA — Skylake-era doubles get 4-lane SIMD.
+            fixed (double* inp = input, outp = output)
+            {
+                double sum = 0.0;
+                for (int n = 0; n < batch; n++)
+                {
+                    int offset = n * channels * spatialSize + c * spatialSize;
+                    double* ptr = inp + offset;
+                    var vsum = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                    int s = 0;
+                    int simdLen = spatialSize & ~3;
+                    for (; s < simdLen; s += 4)
+                        vsum = System.Runtime.Intrinsics.X86.Avx.Add(vsum, System.Runtime.Intrinsics.X86.Avx.LoadVector256(ptr + s));
+                    sum += HorizontalSumD(vsum);
+                    for (; s < spatialSize; s++)
+                        sum += ptr[s];
+                }
+                double channelMean = sum * invCount;
+                meanOut[c] = channelMean;
+
+                double sumSq = 0.0;
+                var vmean = System.Runtime.Intrinsics.Vector256.Create(channelMean);
+                for (int n = 0; n < batch; n++)
+                {
+                    int offset = n * channels * spatialSize + c * spatialSize;
+                    double* ptr = inp + offset;
+                    var vsumSq = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                    int s = 0;
+                    int simdLen = spatialSize & ~3;
+                    for (; s < simdLen; s += 4)
+                    {
+                        var diff = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(ptr + s), vmean);
+                        vsumSq = System.Runtime.Intrinsics.X86.Avx.Add(vsumSq, System.Runtime.Intrinsics.X86.Avx.Multiply(diff, diff));
+                    }
+                    sumSq += HorizontalSumD(vsumSq);
+                    for (; s < spatialSize; s++)
+                    {
+                        double diff = ptr[s] - channelMean;
+                        sumSq += diff * diff;
+                    }
+                }
+                double channelVar = sumSq * invCount;
+                if (channelVar < 0.0) channelVar = 0.0;
+                varOut[c] = channelVar;
+                double invStd = 1.0 / System.Math.Sqrt(channelVar + eps);
+                double g = gamma[c];
+                double b = beta[c];
+
+                var vscale = System.Runtime.Intrinsics.Vector256.Create(g * invStd);
+                var vbias = System.Runtime.Intrinsics.Vector256.Create(b);
+                for (int n = 0; n < batch; n++)
+                {
+                    int offset = n * channels * spatialSize + c * spatialSize;
+                    double* pi = inp + offset;
+                    double* po = outp + offset;
+                    int s = 0;
+                    int simdLen = spatialSize & ~3;
+                    for (; s < simdLen; s += 4)
+                    {
+                        var diff = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(pi + s), vmean);
+                        System.Runtime.Intrinsics.X86.Avx.Store(po + s, System.Runtime.Intrinsics.X86.Avx.Add(System.Runtime.Intrinsics.X86.Avx.Multiply(diff, vscale), vbias));
+                    }
+                    for (; s < spatialSize; s++)
+                        outp[offset + s] = g * (inp[offset + s] - channelMean) * invStd + b;
+                }
+            }
+            return;
+        }
+#endif
+        // Scalar fallback (net471 / non-x86)
+        {
+            double sum = 0.0;
+            for (int n = 0; n < batch; n++)
+            {
+                int offset = n * channels * spatialSize + c * spatialSize;
+                for (int s = 0; s < spatialSize; s++)
+                    sum += input[offset + s];
+            }
+            double channelMean = sum * invCount;
+            meanOut[c] = channelMean;
+
+            double sumSq = 0.0;
+            for (int n = 0; n < batch; n++)
+            {
+                int offset = n * channels * spatialSize + c * spatialSize;
+                for (int s = 0; s < spatialSize; s++)
+                {
+                    double diff = input[offset + s] - channelMean;
+                    sumSq += diff * diff;
+                }
+            }
+            double channelVar = sumSq * invCount;
+            varOut[c] = channelVar;
+            double invStd = 1.0 / System.Math.Sqrt(channelVar + eps);
+            double g = gamma[c];
+            double b = beta[c];
+
+            for (int n = 0; n < batch; n++)
+            {
+                int offset = n * channels * spatialSize + c * spatialSize;
+                for (int s = 0; s < spatialSize; s++)
+                    output[offset + s] = g * (input[offset + s] - channelMean) * invStd + b;
+            }
+        }
+    }
+
+#if NET5_0_OR_GREATER
+    /// <summary>
+    /// Horizontal sum of a Vector256&lt;double&gt; (4 lanes) — used by the
+    /// BN4D-double SIMD kernels. The float HorizontalSum in SimdKernels
+    /// works on Vector256&lt;float&gt; (8 lanes), so we need a typed double
+    /// variant.
+    /// </summary>
+    private static double HorizontalSumD(System.Runtime.Intrinsics.Vector256<double> v)
+    {
+        var lo = v.GetLower();
+        var hi = v.GetUpper();
+        var sum128 = System.Runtime.Intrinsics.X86.Sse2.Add(lo, hi);
+        // sum128 = [a, b]; need a + b
+        var shuf = System.Runtime.Intrinsics.X86.Sse2.UnpackHigh(sum128, sum128);
+        var result = System.Runtime.Intrinsics.X86.Sse2.AddScalar(sum128, shuf);
+        return result.ToScalar();
+    }
+#endif
+
     /// <inheritdoc/>
     public Tensor<T> BatchNormBackward<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> gamma, Tensor<T> mean, Tensor<T> variance, double epsilon, out Tensor<T> gradGamma, out Tensor<T> gradBeta)
     {
@@ -18408,18 +19015,42 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!destGradBeta.IsContiguous) throw new InvalidOperationException("destGradBeta must be contiguous.");
 
         var gi = BatchNormBackward(gradOutput, input, gamma, mean, variance, epsilon, out var gg, out var gb);
+        try
+        {
+            // PR #359 review (Thread 14): the overwrite-path uses Span.CopyTo,
+            // which silently no-ops shape mismatches when destination is
+            // larger and corrupts when destination is smaller. The
+            // accumulate-path shape-checks through TensorAddInto already, so
+            // only the overwrite path needs explicit guarding.
+            if (!accumulateInput && !ShapesMatch(destGradInput._shape, gi._shape))
+                throw new ArgumentException("destGradInput shape must match input shape", nameof(destGradInput));
+            if (!accumulateGamma && !ShapesMatch(destGradGamma._shape, gg._shape))
+                throw new ArgumentException("destGradGamma shape must match gamma shape", nameof(destGradGamma));
+            if (!accumulateBeta && !ShapesMatch(destGradBeta._shape, gb._shape))
+                throw new ArgumentException("destGradBeta shape must match gamma shape", nameof(destGradBeta));
 
-        // Merge gi → destGradInput
-        if (accumulateInput) TensorAddInto(destGradInput, destGradInput, gi);
-        else gi.AsSpan().CopyTo(destGradInput.AsWritableSpan());
+            // Merge gi → destGradInput
+            if (accumulateInput) TensorAddInto(destGradInput, destGradInput, gi);
+            else gi.AsSpan().CopyTo(destGradInput.AsWritableSpan());
 
-        // Merge gg → destGradGamma
-        if (accumulateGamma) TensorAddInto(destGradGamma, destGradGamma, gg);
-        else gg.AsSpan().CopyTo(destGradGamma.AsWritableSpan());
+            // Merge gg → destGradGamma
+            if (accumulateGamma) TensorAddInto(destGradGamma, destGradGamma, gg);
+            else gg.AsSpan().CopyTo(destGradGamma.AsWritableSpan());
 
-        // Merge gb → destGradBeta
-        if (accumulateBeta) TensorAddInto(destGradBeta, destGradBeta, gb);
-        else gb.AsSpan().CopyTo(destGradBeta.AsWritableSpan());
+            // Merge gb → destGradBeta
+            if (accumulateBeta) TensorAddInto(destGradBeta, destGradBeta, gb);
+            else gb.AsSpan().CopyTo(destGradBeta.AsWritableSpan());
+        }
+        finally
+        {
+            // PR #359 review (Thread 11): BatchNormBackward rents gi/gg/gb
+            // from the pool; return them after merging into the caller-owned
+            // destination buffers so the compiled training plan replay does
+            // not leak one BN-shaped allocation per layer per step.
+            Helpers.TensorAllocator.Return(gi);
+            Helpers.TensorAllocator.Return(gg);
+            Helpers.TensorAllocator.Return(gb);
+        }
     }
 
 
@@ -18497,13 +19128,13 @@ public partial class CpuEngine : ITensorLevelEngine
             return TensorAllocator.Rent<T>(input._shape, (Vector<T>)(object)new Vector<float>(giF));
         }
 
-        // Double fast path — mirrors the float branch directly above. ResNet50 /
-        // VGG / every CNN trained at double precision spends a significant
-        // fraction of backward time in BatchNorm; the generic numOps path below
-        // does ~10 virtual-call-per-element interface dispatches and pays an
-        // allocation per .Add/.Multiply call. Direct double arithmetic is
-        // 4-8× faster, matching the float branch's measured win on the same
-        // BDN sweep.
+        // Double fast path — replaces the per-channel scalar inner loops with
+        // an AVX2+FMA SIMD kernel on Vector256<double>. Algorithmic note:
+        // the original scalar code computed redundant accumulators (gGamma =
+        // sumGradX*invStd, gBeta = sumGrad) — collapsed here so each element
+        // contributes to only two reductions (sumGrad, sumGradX). Per-channel
+        // parallelization unchanged; SIMD inner loops 4-way unrolled (16
+        // doubles per iter) saturate both FMA ports.
         if (typeof(T) == typeof(double)
             && gradOutputData is double[] goD && inputData is double[] inD
             && gammaData is double[] gaD && meanData is double[] meD && varData is double[] vaD)
@@ -18513,46 +19144,9 @@ public partial class CpuEngine : ITensorLevelEngine
             var gbD = new double[channels];
             var giD = new double[input.Length];
             double elemD = elementsPerChannel;
-
-            CpuParallelSettings.ParallelForOrSerial(0, channels, (long)channels * elementsPerChannel, c =>
-            {
-                double invStd = 1.0 / System.Math.Sqrt(vaD[c] + epsD);
-                double mean_c = meD[c];
-                double gGamma = 0, gBeta = 0, sumGrad = 0, sumGradX = 0;
-
-                for (int n = 0; n < batch; n++)
-                {
-                    int baseIdx = (n * channels + c) * spatialSize;
-                    for (int s = 0; s < spatialSize; s++)
-                    {
-                        int idx = baseIdx + s;
-                        double diff = inD[idx] - mean_c;
-                        gGamma += goD[idx] * diff * invStd;
-                        gBeta += goD[idx];
-                        sumGrad += goD[idx];
-                        sumGradX += goD[idx] * diff;
-                    }
-                }
-
-                ggD[c] = gGamma;
-                gbD[c] = gBeta;
-                double gamma_c = gaD[c];
-                double gammaSumGrad = gamma_c * sumGrad;
-                double gammaSumGradX = gamma_c * sumGradX;
-
-                for (int n = 0; n < batch; n++)
-                {
-                    int baseIdx2 = (n * channels + c) * spatialSize;
-                    for (int s = 0; s < spatialSize; s++)
-                    {
-                        int idx = baseIdx2 + s;
-                        double normalized = (inD[idx] - mean_c) * invStd;
-                        double gradNorm = gamma_c * goD[idx];
-                        giD[idx] = invStd / elemD * (elemD * gradNorm - gammaSumGrad - normalized * invStd * gammaSumGradX);
-                    }
-                }
-            });
-
+            BatchNormBackward4DDouble(goD, inD, gaD, meD, vaD, epsD,
+                batch, channels, spatialSize, elemD,
+                ggD, gbD, giD);
             gradGamma = TensorAllocator.Rent<T>([channels], (Vector<T>)(object)new Vector<double>(ggD));
             gradBeta = TensorAllocator.Rent<T>([channels], (Vector<T>)(object)new Vector<double>(gbD));
             return TensorAllocator.Rent<T>(input._shape, (Vector<T>)(object)new Vector<double>(giD));
@@ -18633,6 +19227,186 @@ public partial class CpuEngine : ITensorLevelEngine
         gradGamma = TensorAllocator.Rent<T>([channels], gradGammaData);
         gradBeta = TensorAllocator.Rent<T>([channels], gradBetaData);
         return TensorAllocator.Rent<T>(input._shape, gradInputData);
+    }
+
+    /// <summary>
+    /// Double-precision AVX2+FMA SIMD kernel for BatchNorm4D backward.
+    /// Two-pass per-channel: (1) FMA-fused reductions for sumGrad / sumGradX,
+    /// (2) FMA-fused gradInput write using the standard BN-backward formula
+    /// <c>dx = (γ · invStd / N) · (N · dy − Σdy − norm · invStd · Σ(dy·diff))</c>.
+    /// 4-way unrolled (16 doubles per iter) to saturate both FMA ports.
+    /// Falls back to a scalar inner loop when AVX/FMA aren't available.
+    /// </summary>
+    private static unsafe void BatchNormBackward4DDouble(
+        double[] gradOutput, double[] input, double[] gamma, double[] mean, double[] variance,
+        double eps,
+        int batch, int channels, int spatialSize, double elemN,
+        double[] gradGammaOut, double[] gradBetaOut, double[] gradInputOut)
+    {
+        long totalWork = (long)batch * channels * spatialSize;
+        CpuParallelSettings.ParallelForOrSerial(0, channels, totalWork, c =>
+        {
+            BatchNormBackward4DDoubleChannel(gradOutput, input, gamma, mean, variance, eps,
+                batch, channels, spatialSize, elemN, c, gradGammaOut, gradBetaOut, gradInputOut);
+        });
+    }
+
+    private static unsafe void BatchNormBackward4DDoubleChannel(
+        double[] gradOutput, double[] input, double[] gamma, double[] mean, double[] variance,
+        double eps,
+        int batch, int channels, int spatialSize, double elemN, int c,
+        double[] gradGammaOut, double[] gradBetaOut, double[] gradInputOut)
+    {
+        double invStd = 1.0 / System.Math.Sqrt(variance[c] + eps);
+        double mean_c = mean[c];
+        double gamma_c = gamma[c];
+
+#if NET5_0_OR_GREATER
+        if (System.Runtime.Intrinsics.X86.Fma.IsSupported && spatialSize >= 16)
+        {
+            fixed (double* inp = input, gop = gradOutput, gip = gradInputOut)
+            {
+                // ── Pass 1: reductions for sumGrad and sumGradX ─────────────
+                double sumGrad = 0.0;
+                double sumGradX = 0.0;
+                var vmean = System.Runtime.Intrinsics.Vector256.Create(mean_c);
+                var vsg0 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var vsg1 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var vsg2 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var vsg3 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var vsgx0 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var vsgx1 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var vsgx2 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var vsgx3 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                for (int n = 0; n < batch; n++)
+                {
+                    int baseIdx = (n * channels + c) * spatialSize;
+                    double* xp = inp + baseIdx;
+                    double* yp = gop + baseIdx;
+                    int s = 0;
+                    int simdLen = spatialSize & ~15;
+                    for (; s < simdLen; s += 16)
+                    {
+                        var y0 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(yp + s);
+                        var y1 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(yp + s + 4);
+                        var y2v = System.Runtime.Intrinsics.X86.Avx.LoadVector256(yp + s + 8);
+                        var y3 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(yp + s + 12);
+                        var d0 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(xp + s), vmean);
+                        var d1 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(xp + s + 4), vmean);
+                        var d2 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(xp + s + 8), vmean);
+                        var d3 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(xp + s + 12), vmean);
+                        vsg0 = System.Runtime.Intrinsics.X86.Avx.Add(vsg0, y0);
+                        vsg1 = System.Runtime.Intrinsics.X86.Avx.Add(vsg1, y1);
+                        vsg2 = System.Runtime.Intrinsics.X86.Avx.Add(vsg2, y2v);
+                        vsg3 = System.Runtime.Intrinsics.X86.Avx.Add(vsg3, y3);
+                        vsgx0 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(y0, d0, vsgx0);
+                        vsgx1 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(y1, d1, vsgx1);
+                        vsgx2 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(y2v, d2, vsgx2);
+                        vsgx3 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(y3, d3, vsgx3);
+                    }
+                    for (; s < spatialSize; s++)
+                    {
+                        double y = yp[s];
+                        double diff = xp[s] - mean_c;
+                        sumGrad += y;
+                        sumGradX += y * diff;
+                    }
+                }
+                vsg0 = System.Runtime.Intrinsics.X86.Avx.Add(System.Runtime.Intrinsics.X86.Avx.Add(vsg0, vsg1), System.Runtime.Intrinsics.X86.Avx.Add(vsg2, vsg3));
+                sumGrad += HorizontalSumD(vsg0);
+                vsgx0 = System.Runtime.Intrinsics.X86.Avx.Add(System.Runtime.Intrinsics.X86.Avx.Add(vsgx0, vsgx1), System.Runtime.Intrinsics.X86.Avx.Add(vsgx2, vsgx3));
+                sumGradX += HorizontalSumD(vsgx0);
+
+                gradGammaOut[c] = sumGradX * invStd;
+                gradBetaOut[c] = sumGrad;
+
+                // ── Pass 2: gradInput write ─────────────────────────────────
+                // Per element: gi = invStd/N * (N*γ*y − γ*sumGrad − norm*invStd*γ*sumGradX)
+                // Rearrange to a 3-term FMA chain on (y, diff):
+                //   gi = (γ*invStd) * y                                  [a]
+                //      − (γ*invStd*sumGrad/N)                            [b]
+                //      − (γ*invStd*invStd*invStd*sumGradX/N) * diff      [c]
+                // Constants are scalar precomputed; a is γ·invStd·y, c
+                // contributes via FMA with diff.
+                double gammaInv = gamma_c * invStd;
+                double termB = gammaInv * sumGrad / elemN;
+                double termCcoef = gammaInv * invStd * invStd * sumGradX / elemN;
+                var vgammaInv = System.Runtime.Intrinsics.Vector256.Create(gammaInv);
+                var vtermB = System.Runtime.Intrinsics.Vector256.Create(termB);
+                var vtermCcoef = System.Runtime.Intrinsics.Vector256.Create(termCcoef);
+                for (int n = 0; n < batch; n++)
+                {
+                    int baseIdx = (n * channels + c) * spatialSize;
+                    double* xp = inp + baseIdx;
+                    double* yp = gop + baseIdx;
+                    double* gp = gip + baseIdx;
+                    int s = 0;
+                    int simdLen = spatialSize & ~15;
+                    for (; s < simdLen; s += 16)
+                    {
+                        var y0 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(yp + s);
+                        var y1 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(yp + s + 4);
+                        var y2v = System.Runtime.Intrinsics.X86.Avx.LoadVector256(yp + s + 8);
+                        var y3 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(yp + s + 12);
+                        var d0 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(xp + s), vmean);
+                        var d1 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(xp + s + 4), vmean);
+                        var d2 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(xp + s + 8), vmean);
+                        var d3 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(xp + s + 12), vmean);
+                        // tmp = γ·invStd·y − termB
+                        var t0 = System.Runtime.Intrinsics.X86.Fma.MultiplySubtract(y0, vgammaInv, vtermB);
+                        var t1 = System.Runtime.Intrinsics.X86.Fma.MultiplySubtract(y1, vgammaInv, vtermB);
+                        var t2 = System.Runtime.Intrinsics.X86.Fma.MultiplySubtract(y2v, vgammaInv, vtermB);
+                        var t3 = System.Runtime.Intrinsics.X86.Fma.MultiplySubtract(y3, vgammaInv, vtermB);
+                        // gi = tmp − termCcoef·diff   (= FNMA(termCcoef, diff, tmp))
+                        System.Runtime.Intrinsics.X86.Avx.Store(gp + s, System.Runtime.Intrinsics.X86.Fma.MultiplyAddNegated(d0, vtermCcoef, t0));
+                        System.Runtime.Intrinsics.X86.Avx.Store(gp + s + 4, System.Runtime.Intrinsics.X86.Fma.MultiplyAddNegated(d1, vtermCcoef, t1));
+                        System.Runtime.Intrinsics.X86.Avx.Store(gp + s + 8, System.Runtime.Intrinsics.X86.Fma.MultiplyAddNegated(d2, vtermCcoef, t2));
+                        System.Runtime.Intrinsics.X86.Avx.Store(gp + s + 12, System.Runtime.Intrinsics.X86.Fma.MultiplyAddNegated(d3, vtermCcoef, t3));
+                    }
+                    for (; s < spatialSize; s++)
+                    {
+                        double y = yp[s];
+                        double diff = xp[s] - mean_c;
+                        gp[s] = gammaInv * y - termB - termCcoef * diff;
+                    }
+                }
+            }
+            return;
+        }
+#endif
+        // Scalar fallback (net471 / non-x86)
+        {
+            double sumGrad = 0.0;
+            double sumGradX = 0.0;
+            for (int n = 0; n < batch; n++)
+            {
+                int baseIdx = (n * channels + c) * spatialSize;
+                for (int s = 0; s < spatialSize; s++)
+                {
+                    int idx = baseIdx + s;
+                    double y = gradOutput[idx];
+                    double diff = input[idx] - mean_c;
+                    sumGrad += y;
+                    sumGradX += y * diff;
+                }
+            }
+            gradGammaOut[c] = sumGradX * invStd;
+            gradBetaOut[c] = sumGrad;
+            double gammaInv = gamma_c * invStd;
+            double termB = gammaInv * sumGrad / elemN;
+            double termCcoef = gammaInv * invStd * invStd * sumGradX / elemN;
+            for (int n = 0; n < batch; n++)
+            {
+                int baseIdx = (n * channels + c) * spatialSize;
+                for (int s = 0; s < spatialSize; s++)
+                {
+                    int idx = baseIdx + s;
+                    double y = gradOutput[idx];
+                    double diff = input[idx] - mean_c;
+                    gradInputOut[idx] = gammaInv * y - termB - termCcoef * diff;
+                }
+            }
+        }
     }
 
     /// <summary>
@@ -33934,8 +34708,19 @@ public partial class CpuEngine : ITensorLevelEngine
                 var ci = input; double cdr = dropoutRate; bool ct = training;
                 var savedScope = GraphMode.Current;
                 GraphMode.SetCurrent(null);
-                var eagerResult = Dropout(ci, cdr, ct, out mask);
-                GraphMode.SetCurrent(savedScope);
+                Tensor<T> eagerResult;
+                try
+                {
+                    // PR #359 review (Thread 15): try/finally restores
+                    // GraphMode.Current even if Dropout throws — without this,
+                    // a failure here would leave GraphMode disabled and
+                    // subsequent ops would silently escape the trace.
+                    eagerResult = Dropout(ci, cdr, ct, out mask);
+                }
+                finally
+                {
+                    GraphMode.SetCurrent(savedScope);
+                }
                 // AiDotNet#1331: refresh mask on every plan.Step so backward
                 // sees the SAME mask as forward (compile-time mask is stale).
                 var capturedMask = mask;

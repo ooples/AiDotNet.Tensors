@@ -410,6 +410,15 @@ public interface ICompiledTrainingPlan<T> : IDisposable
         float weightDecay = 0f);
 
     /// <summary>
+    /// Configures global gradient L2-norm clipping for the fused training
+    /// path. The clip is applied across all trainable-parameter gradients
+    /// collectively (one global norm), not per-tensor — matching PyTorch's
+    /// <c>torch.nn.utils.clip_grad_norm_(params, max_norm)</c>. Pass
+    /// <c>0</c> (the default when this method is never called) to disable.
+    /// </summary>
+    void SetMaxGradNorm(double maxNorm);
+
+    /// <summary>
     /// Configures fused optimizer updates with a per-step
     /// <see cref="LrSchedule"/>. Equivalent to
     /// <see cref="ConfigureOptimizer(OptimizerType, float, float, float, float, float)"/>

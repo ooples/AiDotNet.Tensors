@@ -147,6 +147,84 @@ internal sealed class LazyTensorScope : IDisposable
         return view;
     }
 
+    /// <summary>
+    /// Records an IN-PLACE operation that mutates an already-existing tensor.
+    /// Unlike <see cref="RecordUnary"/> / <see cref="RecordBinary"/> /
+    /// <see cref="RecordVariadic"/>, the "output" of the lazy node IS the
+    /// target tensor itself (shared storage, no allocation). The recorded
+    /// execute action mutates <paramref name="target"/>'s data buffer
+    /// in-place during replay so subsequent forward replays see the
+    /// accumulated effect of all earlier in-place ops on the same tensor —
+    /// the property that makes EMAs (BatchNorm running stats), accumulators,
+    /// and other stateful update patterns produce the right values across
+    /// repeated <c>plan.Step()</c> calls.
+    ///
+    /// <para>CRITICAL semantic note: the caller MUST NOT have mutated
+    /// <paramref name="target"/> at trace time before invoking this method.
+    /// The replay action depends on <paramref name="target"/>'s STATE AT
+    /// THE START OF REPLAY 1 being identical to its state when the trace
+    /// captured it. If a trace-time eager mutation pollutes
+    /// <paramref name="target"/>'s data, the first replay starts from the
+    /// polluted state instead of the original (initial-condition) state, and
+    /// every replay-N onward inherits that pollution. For per-step state
+    /// accumulators (BN running mean/variance, optimizer momentums, etc.)
+    /// the consequence is initial-condition drift that compounds into a
+    /// substantial offset — manifests as test flakiness (40% pass) on
+    /// GraFPrint Training_ShouldReduceLoss because the running stats end up
+    /// some pool-state-dependent fraction off from the true EMA, and BN
+    /// inference's <c>1/sqrt(var+eps)</c> amplifies the offset.</para>
+    ///
+    /// <para>Issue #350 v3: in-place ops (TensorAddInPlace,
+    /// TensorMultiplyScalarInPlace, TensorMultiplyInPlace,
+    /// TensorSubtractInPlace, TensorBroadcastAddInPlace, the in-place
+    /// activations Swish/GELU/Tanh/Mish/LeakyReLU/Sigmoid/ReLU) previously
+    /// had ZERO GraphMode handling — every one of them executed eagerly
+    /// during compile-time trace and its effect was NEVER replayed. This
+    /// silently broke any caller that mixed in-place updates with the
+    /// rest of the lazy graph (most visibly: BatchNormalizationLayer's
+    /// running-stat EMA when invoked under CompiledTrainingPlan, which
+    /// is what made GraFPrint Training_ShouldReduceLoss diverge after
+    /// the engine-side savedState fix landed).</para>
+    /// </summary>
+    internal void RecordInPlace<T>(
+        LazyNodeType opType,
+        string opName,
+        Tensor<T> target,
+        Tensor<T>[] otherInputs,
+        Action<IEngine, Tensor<T>> execute,
+        BackwardFunction<T>? backwardFn = null,
+        object[]? savedState = null)
+    {
+        // Build inputs array with target as the first input so the dependency
+        // graph correctly orders this node after whatever produced target.
+        var inputs = new Tensor<T>[1 + otherInputs.Length];
+        inputs[0] = target;
+        for (int i = 0; i < otherInputs.Length; i++) inputs[i + 1] = otherInputs[i];
+        // CRITICAL: snapshot the prior producer of `target` BEFORE we
+        // overwrite target.LazySource on line below. Without this snapshot,
+        // GetInputNodes()/RealizeInputs() would resolve Input0.LazySource
+        // back to THIS node (self-loop), and:
+        //   - DCE would count phantom self-consumption
+        //   - OperationReorderingPass would compute inDegree=1 for this node,
+        //     never schedule it, and silently DROP the in-place op from the
+        //     compiled list
+        //   - subsequent in-place ops on the same target would resolve all
+        //     earlier in-place node's "input producer" to the LATEST one
+        // The LazyNode's externalPrerequisite slot captures the real prior
+        // producer so the graph compiler sees a correct linear chain.
+        var prevProducer = target.LazySource;
+        // Output = target itself (shared storage). Subsequent ops that
+        // consume target see this node as the source, ensuring topological
+        // order keeps the in-place mutation before its consumers.
+        var node = new LazyNode<T>(
+            opType, opName, inputs, target, execute,
+            backwardFn: backwardFn,
+            savedState: savedState,
+            externalPrerequisite: prevProducer);
+        target.LazySource = node;
+        _nodes.Add(node);
+    }
+
     /// <summary>Records a variadic operation as a lazy node.</summary>
     internal Tensor<T> RecordVariadic<T>(
         LazyNodeType opType,
