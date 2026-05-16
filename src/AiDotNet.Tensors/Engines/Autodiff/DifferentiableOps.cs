@@ -283,6 +283,48 @@ internal static class DifferentiableOps
     }
 
     /// <summary>
+    /// Issue #338 Phase B.2: same semantics as <see cref="AccumulateGrad{T}"/>
+    /// but returns <c>true</c> when the supplied <paramref name="grad"/> was
+    /// consumed by an in-place add (and thus safe to pool-return). Returns
+    /// <c>false</c> when <paramref name="grad"/> was stored as the slot's
+    /// owning gradient or referenced for a future tape pass; in those cases
+    /// the caller MUST NOT pool-return <paramref name="grad"/>.
+    /// <para>
+    /// Lets backward functions pool local intermediate gradient buffers
+    /// (like <c>engine.TensorNegate(gradOut)</c> in SubtractBackward) when
+    /// they're guaranteed to be consumed by accumulation, without leaking
+    /// when they end up as the first-write slot.
+    /// </para>
+    /// </summary>
+    internal static bool AccumulateGradPoolable<T>(
+        Dictionary<Tensor<T>, Tensor<T>> grads,
+        Tensor<T> tensor,
+        Tensor<T> grad,
+        IEngine engine)
+    {
+        bool needsOutOfPlace = _isBackwardCreateGraph;
+        int idx = tensor._gradIndex;
+        if (idx >= 0 && _indexedGrads != null && idx < _indexedGrads.Length
+            && _indexedGrads[idx] != null)
+        {
+            // Has existing → accumulation will occur.
+            AccumulateGrad(grads, tensor, grad, engine);
+            // In-place add consumes grad; out-of-place (createGraph) keeps
+            // it linked into the recorded TensorAdd's input chain — DO NOT
+            // pool in that case.
+            return !needsOutOfPlace;
+        }
+        if (grads.ContainsKey(tensor))
+        {
+            AccumulateGrad(grads, tensor, grad, engine);
+            return !needsOutOfPlace;
+        }
+        // First-write: grad becomes the stored slot. Don't pool.
+        AccumulateGrad(grads, tensor, grad, engine);
+        return false;
+    }
+
+    /// <summary>
     /// Accumulates a gradient for a tensor in the gradient dictionary.
     /// If the tensor already has a gradient, the new gradient is added to it.
     /// </summary>
