@@ -872,6 +872,7 @@ public class ScalarKernelTests
     [InlineData(8, 8, 8, false, false)]    // tile multiple of AVX2 (mr=4, nr=8 for FP64)
     [InlineData(16, 16, 16, false, false)]
     [InlineData(16, 8, 64, true, false)]   // L2-shape-style
+    [InlineData(16, 16, 128, false, false)] // k>=128 → PackBoth AVX2 microkernel
     public void Gemm_AvxPath_FP64_MatchesScalar(int m, int n, int k, bool transA, bool transB)
     {
         var (a, b) = GenerateRandomMatrices(m, n, k, transA, transB, seed: 42);
