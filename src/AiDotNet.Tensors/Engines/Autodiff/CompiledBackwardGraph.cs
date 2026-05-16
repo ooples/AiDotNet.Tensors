@@ -197,8 +197,11 @@ public sealed class CompiledBackwardGraph<T>
 
                 entry.ValidateInputVersions();
                 var inputsArray = entry.GetInputsArray();
+                long _bwdStart = BackwardTiming.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
                 entry.Backward(gradOutput, inputsArray, entry.Output,
                     entry.SavedState ?? Array.Empty<object>(), _engine, grads);
+                if (BackwardTiming.Enabled)
+                    BackwardTiming.Record(entry.Backward.Method.Name, System.Diagnostics.Stopwatch.GetTimestamp() - _bwdStart);
             }
         }
         finally
