@@ -62,4 +62,56 @@ internal static class ScalarPack
             }
         }
     }
+
+    /// <summary>
+    /// Pack a logical Kc-row × Nc-col panel of B into BLIS stripe layout
+    /// <c>[Nc/Nr, Kc, Nr]</c> — linearized as
+    /// <c>packed[stripe * Kc * Nr + k * Nr + col]</c>.
+    ///
+    /// <para>
+    /// When <paramref name="transB"/> is <c>false</c>, B is stored row-major
+    /// <c>[K, N]</c> with leading dimension <paramref name="ldb"/>: the pack
+    /// routine reads <c>b[k * ldb + logicalCol]</c>.
+    /// </para>
+    /// <para>
+    /// When <paramref name="transB"/> is <c>true</c>, B is stored row-major
+    /// <c>[N, K]</c> with leading dimension <paramref name="ldb"/>: the pack
+    /// routine reads <c>b[logicalCol * ldb + k]</c>. The transposition is
+    /// absorbed by the pack — the microkernel reads packed-B as if B had
+    /// never been transposed.
+    /// </para>
+    ///
+    /// <para>
+    /// This implementation handles <c>nc</c> exactly divisible by <c>nr</c>.
+    /// Tail handling for <c>nc % nr != 0</c> is added in Phase G.
+    /// </para>
+    /// </summary>
+    /// <param name="b">Source B buffer, length ≥ ldb × (transB ? N : K).</param>
+    /// <param name="ldb">Leading dimension of B.</param>
+    /// <param name="transB">True if B is stored as B^T (logical [K, N] view from [N, K] memory).</param>
+    /// <param name="packed">Destination stripe buffer, length ≥ nc × kc.</param>
+    /// <param name="nc">Cols of B to pack (must be ≤ Nc panel size, exactly divisible by nr).</param>
+    /// <param name="kc">Rows of B to pack (one Kc block).</param>
+    /// <param name="nr">Microkernel column-tile width (e.g., 4 for ScalarFp64_4x4).</param>
+    public static void PackB<T>(
+        ReadOnlySpan<T> b, int ldb, bool transB,
+        Span<T> packed, int nc, int kc, int nr) where T : unmanaged
+    {
+        int numStripes = nc / nr;
+        for (int stripe = 0; stripe < numStripes; stripe++)
+        {
+            int packedOff = stripe * kc * nr;
+            for (int k = 0; k < kc; k++)
+            {
+                for (int col = 0; col < nr; col++)
+                {
+                    int logicalCol = stripe * nr + col;
+                    T value = transB
+                        ? b[logicalCol * ldb + k]            // B stored [N, K], read K-stride
+                        : b[k * ldb + logicalCol];           // B stored [K, N], read N-stride
+                    packed[packedOff + k * nr + col] = value;
+                }
+            }
+        }
+    }
 }

@@ -344,4 +344,126 @@ public class ScalarKernelTests
             }
         }
     }
+
+    [Fact]
+    public void PackB_NonTransposed_FP64_MatchesLogicalLayout()
+    {
+        // Logical B is 4×8 row-major [K=4, N=8]:
+        //   row 0: [1, 2, 3, 4, 5, 6, 7, 8]
+        //   row 1: [9, 10, ..., 16]
+        //   ...
+        int k = 4, n = 8;
+        double[] b = new double[k * n];
+        for (int r = 0; r < k; r++)
+            for (int c = 0; c < n; c++)
+                b[r * n + c] = r * n + c + 1;
+
+        int kc = 4, nc = 8, nr = 4;
+        double[] packed = new double[kc * nc];
+        ScalarPack.PackB<double>(b, ldb: n, transB: false, packed, nc, kc, nr);
+
+        for (int stripe = 0; stripe < nc / nr; stripe++)
+        {
+            for (int kk = 0; kk < kc; kk++)
+            {
+                for (int col = 0; col < nr; col++)
+                {
+                    int packedIndex = stripe * kc * nr + kk * nr + col;
+                    int logicalRow = kk;
+                    int logicalCol = stripe * nr + col;
+                    double expected = b[logicalRow * n + logicalCol];
+                    Assert.Equal(expected, packed[packedIndex]);
+                }
+            }
+        }
+    }
+
+    [Fact]
+    public void PackB_Transposed_FP64_MatchesLogicalLayout()
+    {
+        // Logical B is 4×8 but stored transposed [N=8, K=4] row-major:
+        //   b[c * K + r] = logical B[r, c].
+        int k = 4, n = 8;
+        double[] b = new double[n * k];
+        for (int r = 0; r < k; r++)
+            for (int c = 0; c < n; c++)
+                b[c * k + r] = r * n + c + 1;
+
+        int kc = 4, nc = 8, nr = 4;
+        double[] packed = new double[kc * nc];
+        ScalarPack.PackB<double>(b, ldb: k, transB: true, packed, nc, kc, nr);
+
+        for (int stripe = 0; stripe < nc / nr; stripe++)
+        {
+            for (int kk = 0; kk < kc; kk++)
+            {
+                for (int col = 0; col < nr; col++)
+                {
+                    int packedIndex = stripe * kc * nr + kk * nr + col;
+                    int logicalRow = kk;
+                    int logicalCol = stripe * nr + col;
+                    double expectedLogical = logicalRow * n + logicalCol + 1;
+                    Assert.Equal(expectedLogical, packed[packedIndex]);
+                }
+            }
+        }
+    }
+
+    [Fact]
+    public void PackB_NonTransposed_FP32_MatchesLogicalLayout()
+    {
+        int k = 4, n = 8;
+        float[] b = new float[k * n];
+        for (int r = 0; r < k; r++)
+            for (int c = 0; c < n; c++)
+                b[r * n + c] = r * n + c + 1f;
+
+        int kc = 4, nc = 8, nr = 4;
+        float[] packed = new float[kc * nc];
+        ScalarPack.PackB<float>(b, ldb: n, transB: false, packed, nc, kc, nr);
+
+        for (int stripe = 0; stripe < nc / nr; stripe++)
+        {
+            for (int kk = 0; kk < kc; kk++)
+            {
+                for (int col = 0; col < nr; col++)
+                {
+                    int packedIndex = stripe * kc * nr + kk * nr + col;
+                    int logicalRow = kk;
+                    int logicalCol = stripe * nr + col;
+                    float expected = b[logicalRow * n + logicalCol];
+                    Assert.Equal(expected, packed[packedIndex]);
+                }
+            }
+        }
+    }
+
+    [Fact]
+    public void PackB_Transposed_FP32_MatchesLogicalLayout()
+    {
+        int k = 4, n = 8;
+        float[] b = new float[n * k];
+        for (int r = 0; r < k; r++)
+            for (int c = 0; c < n; c++)
+                b[c * k + r] = r * n + c + 1f;
+
+        int kc = 4, nc = 8, nr = 4;
+        float[] packed = new float[kc * nc];
+        ScalarPack.PackB<float>(b, ldb: k, transB: true, packed, nc, kc, nr);
+
+        for (int stripe = 0; stripe < nc / nr; stripe++)
+        {
+            for (int kk = 0; kk < kc; kk++)
+            {
+                for (int col = 0; col < nr; col++)
+                {
+                    int packedIndex = stripe * kc * nr + kk * nr + col;
+                    int logicalRow = kk;
+                    int logicalCol = stripe * nr + col;
+                    float expectedLogical = logicalRow * n + logicalCol + 1f;
+                    Assert.Equal(expectedLogical, packed[packedIndex]);
+                }
+            }
+        }
+    }
 }
