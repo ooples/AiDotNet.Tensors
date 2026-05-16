@@ -526,6 +526,51 @@ public class ScalarKernelTests
         }
     }
 
+    [Fact]
+    public void Avx2Fp64_4x8_MatchesScalarReference()
+    {
+        // Skip if AVX2/FMA not available at runtime.
+        if (!Avx2Fp64_4x8.IsSupported)
+            return;
+
+        int kc = 16;
+        int Mr = 4, Nr = 8;
+
+        // Build deterministic packed inputs.
+        double[] packedA = new double[Mr * kc];
+        double[] packedB = new double[kc * Nr];
+        var rng = new Random(42);
+        for (int i = 0; i < packedA.Length; i++) packedA[i] = rng.NextDouble() * 2 - 1;
+        for (int i = 0; i < packedB.Length; i++) packedB[i] = rng.NextDouble() * 2 - 1;
+
+        // Reference: ScalarFp64_4x4 run TWICE (once for cols 0..3, once for cols 4..7).
+        // ScalarFp64_4x4.Run uses Nr=4 and expects packed-B [Kc × 4]. We need to
+        // build two scalar packed-B slices from the AVX2 packed-B [Kc × 8].
+        double[] packedB_lo = new double[kc * 4];
+        double[] packedB_hi = new double[kc * 4];
+        for (int k = 0; k < kc; k++)
+        {
+            for (int col = 0; col < 4; col++)
+            {
+                packedB_lo[k * 4 + col] = packedB[k * 8 + col];
+                packedB_hi[k * 4 + col] = packedB[k * 8 + 4 + col];
+            }
+        }
+
+        double[] cRef = new double[4 * 8];  // ldc = 8
+        int ldc = 8;
+        ScalarFp64_4x4.Run(packedA, packedB_lo, cRef.AsSpan(), ldc, kc);
+        // Run scalar on the hi 4 cols — offset C by 4.
+        ScalarFp64_4x4.Run(packedA, packedB_hi, cRef.AsSpan(4), ldc, kc);
+
+        // AVX2: single call with packedB [Kc × 8].
+        double[] cAvx = new double[4 * 8];
+        Avx2Fp64_4x8.Run(packedA, packedB, cAvx.AsSpan(), ldc, kc);
+
+        for (int i = 0; i < cRef.Length; i++)
+            Assert.Equal(cRef[i], cAvx[i], precision: 12);
+    }
+
     // ── B5 helpers ────────────────────────────────────────────────────────────
 
     private static (double[] a, double[] b) GenerateRandomMatrices(int m, int n, int k, bool transA, bool transB, int seed)
