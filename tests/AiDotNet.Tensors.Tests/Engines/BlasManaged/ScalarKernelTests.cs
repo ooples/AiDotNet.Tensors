@@ -633,6 +633,78 @@ public class ScalarKernelTests
             Assert.Equal(cRef[i], cAvx[i], precision: 4);
     }
 
+    // ── C3: Avx2Pack tests ────────────────────────────────────────────────────
+
+    [Fact]
+    public void Avx2Pack_PackA_Fp64_Transposed_MatchesScalarBitIdentical()
+    {
+        // Skip when AVX2 is unavailable at runtime.
+        if (!Avx2Pack.IsSupported) return;
+
+        int m = 8, k = 16;
+        int mc = 8, kc = 16, mr = 4;
+
+        // A stored row-major [K=16, M=8] (transA=true case).
+        var rng = new Random(42);
+        double[] a = new double[k * m];
+        for (int i = 0; i < a.Length; i++) a[i] = rng.NextDouble() * 2 - 1;
+
+        double[] packedScalar = new double[mc * kc];
+        double[] packedAvx    = new double[mc * kc];
+
+        ScalarPack.PackA<double>(a, lda: m, transA: true, packedScalar, mc, kc, mr);
+        Avx2Pack.PackA_Fp64(a, lda: m, transA: true, packedAvx, mc, kc, mr);
+
+        // Bit-identical assertion: we are copying bits, not computing — no FP rounding occurs.
+        for (int i = 0; i < packedScalar.Length; i++)
+            Assert.Equal(packedScalar[i], packedAvx[i]);
+    }
+
+    [Fact]
+    public void Avx2Pack_PackA_Fp64_NonTransposed_DelegatesToScalarBitIdentical()
+    {
+        if (!Avx2Pack.IsSupported) return;
+
+        int m = 8, k = 16;
+        int mc = 8, kc = 16, mr = 4;
+
+        // A stored row-major [M=8, K=16] (transA=false case).
+        var rng = new Random(42);
+        double[] a = new double[m * k];
+        for (int i = 0; i < a.Length; i++) a[i] = rng.NextDouble() * 2 - 1;
+
+        double[] packedScalar = new double[mc * kc];
+        double[] packedAvx    = new double[mc * kc];
+
+        ScalarPack.PackA<double>(a, lda: k, transA: false, packedScalar, mc, kc, mr);
+        Avx2Pack.PackA_Fp64(a, lda: k, transA: false, packedAvx, mc, kc, mr);
+
+        for (int i = 0; i < packedScalar.Length; i++)
+            Assert.Equal(packedScalar[i], packedAvx[i]);
+    }
+
+    [Fact]
+    public void Avx2Pack_PackA_Fp32_Transposed_MatchesScalarBitIdentical()
+    {
+        if (!Avx2Pack.IsSupported) return;
+
+        int m = 16, k = 16;
+        int mc = 16, kc = 16, mr = 8;
+
+        var rng = new Random(42);
+        float[] a = new float[k * m];
+        for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        float[] packedScalar = new float[mc * kc];
+        float[] packedAvx    = new float[mc * kc];
+
+        ScalarPack.PackA<float>(a, lda: m, transA: true, packedScalar, mc, kc, mr);
+        Avx2Pack.PackA_Fp32(a, lda: m, transA: true, packedAvx, mc, kc, mr);
+
+        for (int i = 0; i < packedScalar.Length; i++)
+            Assert.Equal(packedScalar[i], packedAvx[i]);
+    }
+
     // ── B5 helpers ────────────────────────────────────────────────────────────
 
     private static (double[] a, double[] b) GenerateRandomMatrices(int m, int n, int k, bool transA, bool transB, int seed)
