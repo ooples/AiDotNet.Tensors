@@ -46,11 +46,33 @@ public sealed class SimdRandom
         }
     }
 
-    private static int _seedCounter = Environment.TickCount;
+    // Issue #350 v3 (in-process determinism): start from a fixed counter
+    // (was Environment.TickCount). The previous TickCount-seeded form made
+    // every process invocation initialize layer weights from a different
+    // seed, so the same test running twice produced different trained
+    // models. Tests of training stability — most visibly the GraFPrint
+    // 53-layer pyramid Training_ShouldReduceLoss — saw their initial-
+    // weight-state differ across runs and the deep-network amplified the
+    // divergence into ~10× per-iter loss swings. The cryptographically-
+    // secure non-reproducible RNG path is still available via
+    // RandomHelper.CreateSecureRandom for callers that genuinely need
+    // unpredictable sequences (most don't — weight init, dropout masks,
+    // data augmentation are the entire SimdRandom client base, and ALL
+    // benefit from reproducibility). Per-call seed uniqueness within a
+    // process is preserved by the Interlocked.Increment below.
+    private static int _seedCounter = 0;
 
     /// <summary>
-    /// Creates a new SIMD random generator with a unique random seed.
-    /// Each call produces a different seed via atomic increment.
+    /// Creates a new SIMD random generator with a counter-derived seed.
+    /// Each call produces a unique seed via atomic increment, and the
+    /// counter starts at a fixed value at process startup so the same
+    /// sequence of construction calls in two different process
+    /// invocations produces the same sequence of seeds — and therefore
+    /// the same generated random sequences. Pass an explicit seed to
+    /// the <see cref="SimdRandom(int)"/> overload when reproducibility
+    /// must survive across construction-order changes; use
+    /// <see cref="AiDotNet.Tensors.Helpers.RandomHelper.CreateSecureRandom"/>
+    /// when cryptographic non-predictability is required.
     /// </summary>
     public SimdRandom() : this(System.Threading.Interlocked.Increment(ref _seedCounter)) { }
 

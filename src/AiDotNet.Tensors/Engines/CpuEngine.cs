@@ -2923,6 +2923,26 @@ public partial class CpuEngine : ITensorLevelEngine
                 $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
         }
 
+        // GraphMode: record only — DO NOT eagerly mutate (see
+        // LazyTensorScope.RecordInPlace docstring on initial-condition
+        // pollution). Trace-time downstream consumers that read `a` get
+        // the unmodified value; replay applies the actual mutation. For
+        // STATEFUL accumulators (BN running stats, optimizer momentums)
+        // this is exactly the right semantics — they were initialized to
+        // a known starting condition (zeros / ones / etc.) and replay-1
+        // must accumulate FROM that condition, not from a polluted one.
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ca = a; var cb = b;
+                scope.RecordInPlace(LazyNodeType.Custom, "TensorAddInPlace", a, new[] { b },
+                    (eng, _) => eng.TensorAddInPlace(ca, cb));
+                return;
+            }
+        }
+
         // Save input before mutation when tape is active (for backward pass)
         Tensor<T>? savedA = null;
         var tape = GradientTape<T>.Current;
@@ -3439,6 +3459,20 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
+
+        // Issue #350 v3 (GraphMode-aware in-place op — record-only).
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ca = a; var cb = b;
+                scope.RecordInPlace(LazyNodeType.Custom, "TensorBroadcastAddInPlace", a, new[] { b },
+                    (eng, _) => eng.TensorBroadcastAddInPlace(ca, cb));
+                return;
+            }
+        }
+
         var aOrig = a;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!a.IsContiguous) a = a.Contiguous();
         var bOrig = b;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
@@ -3567,6 +3601,19 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public void SwishInPlace<T>(Tensor<T> tensor)
     {
+        // Issue #350 v3 (GraphMode-aware in-place op).
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ct = tensor;
+                scope.RecordInPlace(LazyNodeType.Custom, "SwishInPlace", tensor, Array.Empty<Tensor<T>>(),
+                    (eng, _) => eng.SwishInPlace(ct));
+                return;
+            }
+        }
+
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -3611,6 +3658,19 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public void GELUInPlace<T>(Tensor<T> tensor)
     {
+        // Issue #350 v3 (GraphMode-aware in-place op).
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ct = tensor;
+                scope.RecordInPlace(LazyNodeType.Custom, "GELUInPlace", tensor, Array.Empty<Tensor<T>>(),
+                    (eng, _) => eng.GELUInPlace(ct));
+                return;
+            }
+        }
+
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -3653,6 +3713,19 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public void TanhInPlace<T>(Tensor<T> tensor)
     {
+        // Issue #350 v3 (GraphMode-aware in-place op).
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ct = tensor;
+                scope.RecordInPlace(LazyNodeType.Custom, "TanhInPlace", tensor, Array.Empty<Tensor<T>>(),
+                    (eng, _) => eng.TanhInPlace(ct));
+                return;
+            }
+        }
+
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -3695,6 +3768,19 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public void MishInPlace<T>(Tensor<T> tensor)
     {
+        // Issue #350 v3 (GraphMode-aware in-place op).
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ct = tensor;
+                scope.RecordInPlace(LazyNodeType.Custom, "MishInPlace", tensor, Array.Empty<Tensor<T>>(),
+                    (eng, _) => eng.MishInPlace(ct));
+                return;
+            }
+        }
+
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -3733,6 +3819,19 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual void LeakyReLUInPlace<T>(Tensor<T> tensor, T alpha)
     {
+        // Issue #350 v3 (GraphMode-aware in-place op).
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ct = tensor; var ca = alpha;
+                scope.RecordInPlace(LazyNodeType.Custom, "LeakyReLUInPlace", tensor, Array.Empty<Tensor<T>>(),
+                    (eng, _) => eng.LeakyReLUInPlace(ct, ca));
+                return;
+            }
+        }
+
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -4587,6 +4686,19 @@ public partial class CpuEngine : ITensorLevelEngine
                 $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
         }
 
+        // Issue #350 v3 (GraphMode-aware in-place op — record-only).
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ca = a; var cb = b;
+                scope.RecordInPlace(LazyNodeType.Custom, "TensorMultiplyInPlace", a, new[] { b },
+                    (eng, _) => eng.TensorMultiplyInPlace(ca, cb));
+                return;
+            }
+        }
+
         Tensor<T>? savedA = null;
         var mulTape = GradientTape<T>.Current;
         if (mulTape is not null && mulTape.Options.RecordInPlace)
@@ -4756,6 +4868,19 @@ public partial class CpuEngine : ITensorLevelEngine
                 $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
         }
 
+        // Issue #350 v3 (GraphMode-aware in-place op — record-only).
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ca = a; var cb = b;
+                scope.RecordInPlace(LazyNodeType.Custom, "TensorSubtractInPlace", a, new[] { b },
+                    (eng, _) => eng.TensorSubtractInPlace(ca, cb));
+                return;
+            }
+        }
+
         Tensor<T>? savedASub = null;
         var subTape = GradientTape<T>.Current;
         if (subTape is not null && subTape.Options.RecordInPlace)
@@ -4857,6 +4982,20 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (!a.IsContiguous) throw new InvalidOperationException("In-place scalar multiply requires contiguous tensor.");
+
+        // Issue #350 v3 (GraphMode-aware in-place op — record-only, see
+        // LazyTensorScope.RecordInPlace docstring).
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ca = a; var csc = scalar;
+                scope.RecordInPlace(LazyNodeType.Custom, "TensorMultiplyScalarInPlace", a, Array.Empty<Tensor<T>>(),
+                    (eng, _) => eng.TensorMultiplyScalarInPlace(ca, csc));
+                return;
+            }
+        }
 
         int length = a.Length;
 
@@ -9127,6 +9266,20 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
+
+        // Issue #350 v3 (GraphMode-aware in-place op).
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ct = tensor;
+                scope.RecordInPlace(LazyNodeType.Custom, "SigmoidInPlace", tensor, Array.Empty<Tensor<T>>(),
+                    (eng, _) => eng.SigmoidInPlace(ct));
+                return;
+            }
+        }
+
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
@@ -9163,6 +9316,20 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
+
+        // Issue #350 v3 (GraphMode-aware in-place op).
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ct = tensor;
+                scope.RecordInPlace(LazyNodeType.Custom, "SigmoidInPlace", tensor, Array.Empty<Tensor<T>>(),
+                    (eng, _) => eng.SigmoidInPlace(ct));
+                return;
+            }
+        }
+
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
@@ -9449,6 +9616,20 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
+
+        // Issue #350 v3 (GraphMode-aware in-place op).
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ct = tensor;
+                scope.RecordInPlace(LazyNodeType.Custom, "ReLUInPlace", tensor, Array.Empty<Tensor<T>>(),
+                    (eng, _) => eng.ReLUInPlace(ct));
+                return;
+            }
+        }
+
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
@@ -9485,6 +9666,20 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
+
+        // Issue #350 v3 (GraphMode-aware in-place op).
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ct = tensor;
+                scope.RecordInPlace(LazyNodeType.Custom, "ReLUInPlace", tensor, Array.Empty<Tensor<T>>(),
+                    (eng, _) => eng.ReLUInPlace(ct));
+                return;
+            }
+        }
+
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
@@ -17749,13 +17944,47 @@ public partial class CpuEngine : ITensorLevelEngine
                 // results would be GPU-routed at Step time and diverge from
                 // the CPU eager-time output).
                 scope.BindEngineIfUnset(this);
-                // Record in graph so compiled plan captures the dependency
+                // Issue #350 v2: capture stable savedState tensor refs whose
+                // CONTENTS get refreshed on every replay. The eager call above
+                // ran on whatever data the lazy `ci` happened to have at trace
+                // time — under CompiledTrainingPlan that is the placeholder /
+                // zero-init backing, so the eager `mean` and `variance` here
+                // are the stats of an all-zeros tensor (= zero / zero). Two
+                // downstream consequences would corrupt training:
+                // (1) the lazy backward divides by sqrt(0+eps), producing
+                //     1e137-class gradient amplification through a deep BN
+                //     stack (the GraFPrint-Training_ShouldReduceLoss explosion).
+                // (2) callers store the OUT mean/variance and feed them into
+                //     running-stat EMA (BatchNormalizationLayer.cs:558+) — with
+                //     zero batch stats every step, running_mean / running_var
+                //     decay to zero, and inference (BatchNormInference at
+                //     Predict() time) divides by sqrt(0+eps), blowing up
+                //     network output by ~316× per BN layer.
+                //
+                // Fix: allocate stable savedState tensors here and have the
+                // forward replay action overwrite them with the per-replay
+                // batch statistics. RETURN those same tensors as OUT params so
+                // the caller's downstream lazy ops (TensorMultiplyScalar +
+                // TensorAdd for the EMA) capture references that auto-update.
+                int channelsForSaved = mean.Length;
+                var savedMean = new Tensor<T>(new[] { channelsForSaved });
+                var savedVariance = new Tensor<T>(new[] { channelsForSaved });
+                mean.AsSpan().CopyTo(savedMean.AsWritableSpan());
+                variance.AsSpan().CopyTo(savedVariance.AsWritableSpan());
                 var lazyResult = scope.RecordVariadic(LazyNodeType.Custom, "BatchNorm",
                     new[] { input, gamma, beta }, eagerResult._shape,
-                    (eng, output) => { var r = eng.BatchNorm(ci, cg, cb, ce, out _, out _); r.AsSpan().CopyTo(output.AsWritableSpan()); },
-                    BackwardFunctions<T>.BatchNormBackward, new object[] { mean, variance, epsilon });
-                // Copy eager data into lazy output
+                    (eng, output) =>
+                    {
+                        var r = eng.BatchNorm(ci, cg, cb, ce, out var freshMean, out var freshVar);
+                        r.AsSpan().CopyTo(output.AsWritableSpan());
+                        freshMean.AsSpan().CopyTo(savedMean.AsWritableSpan());
+                        freshVar.AsSpan().CopyTo(savedVariance.AsWritableSpan());
+                    },
+                    BackwardFunctions<T>.BatchNormBackward,
+                    new object[] { savedMean, savedVariance, epsilon });
                 eagerResult.AsSpan().CopyTo(lazyResult.AsWritableSpan());
+                mean = savedMean;
+                variance = savedVariance;
                 return lazyResult;
             }
         }
@@ -33646,9 +33875,23 @@ public partial class CpuEngine : ITensorLevelEngine
                 GraphMode.SetCurrent(null);
                 var eagerResult = Dropout(ci, cdr, ct, out mask);
                 GraphMode.SetCurrent(savedScope);
+                // Issue #350 v2: same-shape stable savedState mask; the replay
+                // forward generates a fresh random mask, then writes it into
+                // savedMask so the backward uses the SAME mask the forward
+                // applied. Without this refresh, every Step() runs forward
+                // with a fresh random mask but backward multiplies gradients
+                // by the trace-time mask — different drops chosen for each
+                // direction, so gradients no longer match the loss surface.
+                var savedMask = new Tensor<T>((int[])mask._shape.Clone());
+                mask.AsSpan().CopyTo(savedMask.AsWritableSpan());
                 var lazyResult = scope.RecordUnary(LazyNodeType.Custom, "Dropout", input, eagerResult._shape,
-                    (eng, output) => { var r = eng.Dropout(ci, cdr, ct, out _); r.AsSpan().CopyTo(output.AsWritableSpan()); },
-                    BackwardFunctions<T>.DropoutBackward, new object[] { mask, dropoutRate });
+                    (eng, output) =>
+                    {
+                        var r = eng.Dropout(ci, cdr, ct, out var freshMask);
+                        r.AsSpan().CopyTo(output.AsWritableSpan());
+                        freshMask.AsSpan().CopyTo(savedMask.AsWritableSpan());
+                    },
+                    BackwardFunctions<T>.DropoutBackward, new object[] { savedMask, dropoutRate });
                 eagerResult.AsSpan().CopyTo(lazyResult.AsWritableSpan());
                 return lazyResult;
             }

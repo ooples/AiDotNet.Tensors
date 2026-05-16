@@ -18,12 +18,41 @@ namespace AiDotNet.Tensors.Helpers;
 /// </remarks>
 public static class RandomHelper
 {
+    // Issue #350 v3 (CRITICAL training-path determinism): per-thread RNG
+    // seeds derive from a deterministic counter, NOT from a fresh
+    // GenerateCryptographicSeed() per thread. Empirically pinpointed as
+    // the root cause of cross-process non-determinism in
+    // GraFPrint Training_ShouldReduceLoss: the test seeded its own RNG with
+    // 42 (so input data + targets matched across runs) and weight init was
+    // ALSO deterministic via SimdRandom — but somewhere in the training
+    // hot path (suspected: backward gradient computation that touches the
+    // shared ThreadSafeRandom — Gumbel-Softmax, FillRandomNormal worker
+    // dispatch, Dropout-like sampling, or a transitive dependency through
+    // an autograd primitive) consumed values from this thread-local RNG.
+    // Each process invocation got a DIFFERENT crypto-seeded sequence, so
+    // the same forward+backward graph produced gradient SIGN flips on
+    // some parameters and the 53-layer GraFPrint pyramid amplified the
+    // first-iter divergence into ~10× per-iter loss swings — which is
+    // exactly what made Training_ShouldReduceLoss flaky after every other
+    // engine-side bug got fixed. Bisected by reverting one fix at a time:
+    // restoring this single field reintroduces the flakiness; restoring
+    // CreateSecureRandom alone doesn't (so callers that explicitly request
+    // crypto-secure RNG are unaffected — those still entropy-seeded).
+    //
+    // Callers that genuinely need cryptographic non-predictability still
+    // get it via CreateSecureRandom (entropy-seeded each call). Reproducible
+    // ML workflows (weight init, dropout masks, data augmentation, the
+    // training-path RNG callers above) ALL benefit from this contract.
+    private static int _threadSeedCounter = 0;
+
     /// <summary>
     /// Thread-local random instance for thread-safe random number generation.
-    /// Each thread gets its own Random instance to avoid thread-safety issues.
+    /// Each thread gets its own Random instance to avoid thread-safety issues
+    /// AND a deterministic counter-derived seed so the same code produces the
+    /// same random sequence across process invocations.
     /// </summary>
     private static readonly ThreadLocal<Random> _threadLocalRandom = new(
-        () => new LockedRandom(GenerateCryptographicSeed()));
+        () => new LockedRandom(System.Threading.Interlocked.Increment(ref _threadSeedCounter)));
 
     /// <summary>
     /// Gets the thread-safe random number generator for the current thread.

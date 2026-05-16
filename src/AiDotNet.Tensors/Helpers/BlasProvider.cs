@@ -76,6 +76,32 @@ internal static class BlasProvider
         double* b, int ldb,
         double beta, double* c, int ldc);
 
+    /// <summary>
+    /// OpenBLAS thread-count knob. Setting to 1 forces single-threaded GEMM
+    /// kernel dispatch — required for bit-exact reproducibility because
+    /// OpenBLAS multi-threaded GEMM partitions the K-dimension across threads
+    /// and sums the partial products in (thread-completion-order, not
+    /// fixed-order), so floating-point non-associativity makes the same
+    /// inputs produce different outputs across runs.
+    /// </summary>
+    [DllImport("libopenblas", EntryPoint = "openblas_set_num_threads", CallingConvention = CallingConvention.Cdecl)]
+    private static extern void openblas_set_num_threads_native(int num_threads);
+
+    private static int _openblasThreadCount = -1; // -1 = unset
+
+    /// <summary>
+    /// Sets the OpenBLAS internal thread count. Pass 1 to force deterministic
+    /// single-threaded GEMM. Caller must verify <see cref="HasNativeDgemm"/>
+    /// is true before calling, otherwise the P/Invoke will throw.
+    /// </summary>
+    internal static void TrySetOpenBlasThreads(int n)
+    {
+        if (!_nativeAvailable.Value) return;
+        if (_openblasThreadCount == n) return;
+        try { openblas_set_num_threads_native(n); _openblasThreadCount = n; }
+        catch { /* libopenblas symbol missing — earlier OpenBLAS builds may lack it. Tolerate. */ }
+    }
+
     /// <summary>True iff <c>AIDOTNET_USE_BLAS=1</c>|<c>true</c>|<c>yes</c> at process start.</summary>
     private static readonly bool _blasOptIn = ReadOptIn();
 
@@ -199,6 +225,12 @@ internal static class BlasProvider
     public static void SetDeterministicMode(bool deterministic)
     {
         _deterministicMode = deterministic;
+        // Force OpenBLAS to single-threaded mode so its multi-threaded GEMM
+        // partial-sum reduction order doesn't reintroduce non-determinism
+        // on top of the managed-side determinism the SimdGemm fallback
+        // already guarantees. Restoring multi-threading on disable lets
+        // perf go back up for callers that re-enter non-deterministic mode.
+        TrySetOpenBlasThreads(deterministic ? 1 : 0);
     }
 
     /// <summary>True iff <c>AIDOTNET_USE_BLAS=1</c> is set AND libopenblas loaded successfully.</summary>
