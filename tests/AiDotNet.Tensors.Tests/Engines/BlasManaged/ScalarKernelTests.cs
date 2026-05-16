@@ -821,6 +821,63 @@ public class ScalarKernelTests
         return c;
     }
 
+    // ── C5: Avx2Streaming tests ───────────────────────────────────────────────
+
+    [Theory]
+    [InlineData(8, 8, 8, false, false)]    // NN
+    [InlineData(8, 8, 8, true, false)]     // TN (the L2-shape pattern)
+    [InlineData(8, 8, 8, false, true)]     // NT (falls back to scalar)
+    [InlineData(8, 8, 8, true, true)]      // TT (falls back to scalar)
+    [InlineData(8, 16, 8, false, false)]   // multi-block N
+    [InlineData(8, 8, 4, false, false)]    // small K
+    [InlineData(8, 8, 24, false, false)]   // larger K
+    [InlineData(8, 12, 8, false, false)]   // N tail (n=12 → nBlocks=3, nTail=0 for nr=4; not really a tail)
+    [InlineData(8, 14, 8, false, false)]   // N tail (n=14 → nBlocks=3, nTail=2)
+    public void Avx2Streaming_Fp64_MatchesScalarReference(int m, int n, int k, bool transA, bool transB)
+    {
+        if (!Avx2Streaming.IsSupported) return;
+
+        int aCols = transA ? m : k;
+        int lda = aCols;
+        int bCols = transB ? k : n;
+        int ldb = bCols;
+
+        var (a, b) = GenerateRandomMatrices(m, n, k, transA, transB, seed: 42);
+
+        // Reference: ScalarStreaming (already proven correct in B6).
+        double[] cScalar = new double[m * n];
+        ScalarStreaming.RunFp64(a, lda, transA, b, ldb, transB, cScalar, ldc: n, m, n, k);
+
+        double[] cAvx = new double[m * n];
+        Avx2Streaming.RunFp64(a, lda, transA, b, ldb, transB, cAvx, ldc: n, m, n, k);
+
+        // FMA reordering may produce tiny differences; allow ULP-scale tolerance.
+        for (int i = 0; i < cScalar.Length; i++)
+            Assert.Equal(cScalar[i], cAvx[i], precision: 10);
+    }
+
+    [Fact]
+    public void Avx2Streaming_Fp32_NN_MatchesScalarReference()
+    {
+        if (!Avx2Streaming.IsSupported) return;
+
+        int m = 8, n = 16, k = 8;
+        var rng = new Random(42);
+        float[] a = new float[m * k];
+        float[] b = new float[k * n];
+        for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < b.Length; i++) b[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        float[] cScalar = new float[m * n];
+        ScalarStreaming.RunFp32(a, lda: k, transA: false, b, ldb: n, transB: false, cScalar, ldc: n, m, n, k);
+
+        float[] cAvx = new float[m * n];
+        Avx2Streaming.RunFp32(a, lda: k, transA: false, b, ldb: n, transB: false, cAvx, ldc: n, m, n, k);
+
+        for (int i = 0; i < cScalar.Length; i++)
+            Assert.Equal(cScalar[i], cAvx[i], precision: 4);
+    }
+
     [Theory]
     [InlineData(8, 8, 8, false, false)]   // NN
     [InlineData(8, 8, 8, true, false)]    // TN
