@@ -1,10 +1,22 @@
 using System;
+using AiDotNet.Tensors.Engines;  // for FusedActivationType
 
 namespace AiDotNet.Tensors.Engines.BlasManaged;
 
 public readonly ref struct BlasOptions<T> where T : unmanaged
 {
-    // Fields filled in by Task A3.
+    public PackingMode PackingMode { get; init; }
+    public Epilogue<T> Epilogue { get; init; }
+    public Span<byte> Workspace { get; init; }
+    public WeightPackHandle? PackedA { get; init; }
+    public WeightPackHandle? PackedB { get; init; }
+
+    /// <summary>0 = autotune; -1 = single-thread (deterministic); positive = pin to N.</summary>
+    public int NumThreads { get; init; }
+    /// <summary>0 = derive from shape; nonzero = caller-supplied autotune key.</summary>
+    public ulong AutotuneKey { get; init; }
+    /// <summary>0 = use process default (64 MB).</summary>
+    public long MaxJitCacheBytes { get; init; }
 }
 
 public enum PackingMode
@@ -23,4 +35,17 @@ public enum PackingMode
     ForceStreaming,
     /// <summary>Use cached autotune choice if present; never benchmark on first call.</summary>
     DisableAutotune,
+}
+
+public readonly ref struct Epilogue<T> where T : unmanaged
+{
+    /// <summary>Bias vector of length N. Empty = no bias.</summary>
+    public ReadOnlySpan<T> BiasN { get; init; }
+    public FusedActivationType Activation { get; init; }
+    /// <summary>Skip-connection tensor of shape (M, N) in row-major. Empty = no skip.</summary>
+    public ReadOnlySpan<T> SkipMxN { get; init; }
+    /// <summary>Dropout RNG state. 0 = no dropout (inference).</summary>
+    public uint DropoutMask { get; init; }
+    /// <summary>Output scale. 0 (default) is interpreted as 1.0 by the dispatcher.</summary>
+    public T OutputScale { get; init; }
 }
