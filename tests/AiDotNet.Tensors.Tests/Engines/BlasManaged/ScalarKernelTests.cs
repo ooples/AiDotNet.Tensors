@@ -9,25 +9,84 @@ namespace AiDotNet.Tensors.Tests.Engines.BlasManaged;
 public class ScalarKernelTests
 {
     [Fact]
-    public void Gemm_StubExistsButNotImplemented_ThrowsNotImplemented()
+    public void Gemm_DispatchesToScalarPath_SmallShape_MatchesNaive()
     {
-        // Span<T> and readonly ref struct cannot be captured by lambdas (CS8175),
-        // so we call Gemm directly and catch the expected NotImplementedException.
-        var threw = false;
-        try
-        {
-            double[] cArr = new double[4];
-            var options = new BlasOptions<double>();
-            BlasManagedLib.Gemm<double>(
-                new ReadOnlySpan<double>(new double[2]), 2, false,
-                new ReadOnlySpan<double>(new double[2]), 2, false,
-                cArr.AsSpan(), 2, 1, 2, 2, options);
-        }
-        catch (NotImplementedException)
-        {
-            threw = true;
-        }
-        Assert.True(threw, "Expected NotImplementedException from BlasManaged.Gemm stub.");
+        int m = 8, n = 8, k = 8;
+        var (a, b) = GenerateRandomMatrices(m, n, k, transA: false, transB: false, seed: 42);
+        double[] expected = NaiveGemm(a, m, k, false, b, k, n, false);
+
+        double[] actual = new double[m * n];
+        BlasManagedLib.Gemm<double>(
+            a, lda: k, transA: false,
+            b, ldb: n, transB: false,
+            actual, ldc: n,
+            m, n, k);
+
+        for (int i = 0; i < expected.Length; i++)
+            Assert.Equal(expected[i], actual[i], precision: 10);
+    }
+
+    [Fact]
+    public void Gemm_DispatchesToStreaming_ForSmallK()
+    {
+        // K=8 is below the Streaming threshold (K<32 OR M*N<1024).
+        int m = 8, n = 8, k = 8;
+        var (a, b) = GenerateRandomMatrices(m, n, k, transA: false, transB: false, seed: 42);
+        double[] expected = NaiveGemm(a, m, k, false, b, k, n, false);
+
+        double[] actual = new double[m * n];
+        BlasManagedLib.Gemm<double>(
+            a, lda: k, transA: false,
+            b, ldb: n, transB: false,
+            actual, ldc: n,
+            m, n, k);
+
+        for (int i = 0; i < expected.Length; i++)
+            Assert.Equal(expected[i], actual[i], precision: 10);
+    }
+
+    [Theory]
+    [InlineData(PackingMode.ForcePackBoth)]
+    [InlineData(PackingMode.ForcePackAOnly)]
+    [InlineData(PackingMode.ForceStreaming)]
+    public void Gemm_AllForcedStrategies_ProduceMatchingResults(PackingMode mode)
+    {
+        int m = 16, n = 16, k = 16;
+        var (a, b) = GenerateRandomMatrices(m, n, k, transA: false, transB: false, seed: 42);
+        double[] expected = NaiveGemm(a, m, k, false, b, k, n, false);
+
+        double[] actual = new double[m * n];
+        var options = new BlasOptions<double> { PackingMode = mode };
+        BlasManagedLib.Gemm<double>(
+            a, lda: k, transA: false,
+            b, ldb: n, transB: false,
+            actual, ldc: n,
+            m, n, k,
+            options);
+
+        for (int i = 0; i < expected.Length; i++)
+            Assert.Equal(expected[i], actual[i], precision: 10);
+    }
+
+    [Fact]
+    public void Gemm_L2ShapeStandIn_TransA_MatchesNaive()
+    {
+        // Stand-in for ConvTranspose2D L2-shape (M=4096, N=16, K=512 transA=true).
+        // Test at smaller dims to keep the suite fast; full perf gate is Phase L.
+        int m = 32, n = 16, k = 64;
+        var (a, b) = GenerateRandomMatrices(m, n, k, transA: true, transB: false, seed: 42);
+        double[] expected = NaiveGemm(a, k, m, transA: true, b, k, n, transB: false);
+
+        double[] actual = new double[m * n];
+        BlasManagedLib.Gemm<double>(
+            a, lda: m, transA: true,
+            b, ldb: n, transB: false,
+            actual, ldc: n,
+            m, n, k);
+
+        // Phase B perf is not the target — correctness only. Phase L gates perf.
+        for (int i = 0; i < expected.Length; i++)
+            Assert.Equal(expected[i], actual[i], precision: 10);
     }
 
     [Fact]
