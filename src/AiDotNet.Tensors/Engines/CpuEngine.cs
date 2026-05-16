@@ -12173,6 +12173,37 @@ public partial class CpuEngine : ITensorLevelEngine
         long perImageCost = (long)outC * K * N;
         bool parallelBatch = batch > 1 && perImageCost < 50_000_000L;
 
+        // 1×1 conv fast path (matches the float side at line 8805): when
+        // the kernel is 1×1 with stride=1, pad=0, dilation=1, Im2Col is
+        // an identity copy of the input — the "expanded" matrix has the
+        // same layout as the input slice. Skip the Im2Col rent + memcpy
+        // and feed the input pointer directly to dgemm. GraFPrint has 17
+        // of 19 conv layers that are 1×1, so eliminating this per-call
+        // 64-128KB allocation + scalar im2col pass is load-bearing for
+        // the small-batch training loop budget.
+        bool isPointwise = (kH == 1 && kW == 1 && sH == 1 && sW == 1
+            && padH == 0 && padW == 0 && dH == 1 && dW == 1);
+
+        void ProcessImagePointwise(int b)
+        {
+            int inOff = b * inputSliceSize;
+            int outOff = b * outC * N;
+            bool usedBlas = Helpers.BlasProvider.TryGemm(
+                outC, N, K,
+                kernel.AsSpan(0, outC * K), K,
+                input.AsSpan(inOff, inputSliceSize), N,
+                output.AsSpan(outOff, outC * N), N);
+
+            if (!usedBlas)
+            {
+                Helpers.Im2ColHelper.MultiplyMatrixBlockedDouble(
+                    kernel.AsSpan(0, outC * K),
+                    input.AsSpan(inOff, inputSliceSize),
+                    output.AsSpan(outOff, outC * N),
+                    outC, K, N);
+            }
+        }
+
         void ProcessImage(int b)
         {
             var col = System.Buffers.ArrayPool<double>.Shared.Rent(K * N);
@@ -12205,14 +12236,16 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        Action<int> body = isPointwise ? ProcessImagePointwise : ProcessImage;
+
         if (parallelBatch)
         {
             CpuParallelSettings.ParallelForOrSerial(0, batch,
-                (long)batch * outC * oH * oW, ProcessImage);
+                (long)batch * outC * oH * oW, body);
         }
         else
         {
-            for (int b = 0; b < batch; b++) ProcessImage(b);
+            for (int b = 0; b < batch; b++) body(b);
         }
     }
 
@@ -12517,6 +12550,69 @@ public partial class CpuEngine : ITensorLevelEngine
                 Array.Clear(destD, destOff, batch * inChannels * height * width);
             var gradOutputD = (double[])(object)gradOutput.GetFlattenedData();
             var kernelD = (double[])(object)kernel.GetFlattenedData();
+
+            // 1×1 conv fast path: when k=1×1 with stride=1, pad=0, dilation=1,
+            // Col2Im is an identity copy. The backward-input collapses to
+            //   gradInput_b = kernel^T @ gradOutput_b   (one GEMM per batch).
+            // GraFPrint has 17 of 19 conv layers that are 1×1, so eliminating
+            // the per-call kernelT transpose + Im2Col pool rent + scalar
+            // Col2ImAccumulate pass is load-bearing for the small-batch
+            // training loop budget. The output spatial layout (H*W = N)
+            // matches the destination's NCHW slice directly, so we can write
+            // straight into destD without a colBuf intermediate.
+            if (kernelHeight == 1 && kernelWidth == 1 && strideH == 1 && strideW == 1
+                && padH == 0 && padW == 0 && dilationH == 1 && dilationW == 1)
+            {
+                int N = outputHeight * outputWidth; // == height*width when 1×1 stride=1 pad=0
+                int inputSliceSize = inChannels * N;
+                int gradSliceSize = outChannels * N;
+                CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * inChannels * outChannels * N, b =>
+                {
+                    int gradOutOff = b * gradSliceSize;
+                    int destSliceOff = destOff + b * inputSliceSize;
+                    // gradInput_b = kernel^T (inC × outC) @ gradOut_b (outC × N)
+                    // Use TryGemmEx with TransA=true so kernel is consumed
+                    // in its natural [outC, inC] row-major layout.
+                    bool usedBlas = Helpers.BlasProvider.TryGemmExBeta(
+                        inChannels, N, outChannels,
+                        kernelD, 0, inChannels, true,        // A = kernel [outC × inC] transposed
+                        gradOutputD, gradOutOff, N, false,   // B = gradOut_b [outC × N]
+                        destD, destSliceOff, N,              // C := α A @ B + β C
+                        alpha: 1.0,
+                        beta: accumulate ? 1.0 : 0.0);
+                    if (!usedBlas)
+                    {
+                        // Fallback: build transposed kernel once on demand
+                        // (rare path — only when BLAS is unavailable). Per-batch
+                        // alloc is fine here since this is the cold path.
+                        var kT = System.Buffers.ArrayPool<double>.Shared.Rent(inChannels * outChannels);
+                        try
+                        {
+                            for (int r = 0; r < outChannels; r++)
+                                for (int c = 0; c < inChannels; c++)
+                                    kT[c * outChannels + r] = kernelD[r * inChannels + c];
+                            var dstSpan = new Span<double>(destD, destSliceOff, inputSliceSize);
+                            if (!accumulate) dstSpan.Clear();
+                            // dstSpan += kT[inC, outC] @ gradOut_b[outC, N]
+                            for (int ic = 0; ic < inChannels; ic++)
+                            {
+                                int kRowBase = ic * outChannels;
+                                int dRowBase = ic * N;
+                                for (int n = 0; n < N; n++)
+                                {
+                                    double sum = 0.0;
+                                    for (int oc = 0; oc < outChannels; oc++)
+                                        sum += kT[kRowBase + oc] * gradOutputD[gradOutOff + oc * N + n];
+                                    dstSpan[dRowBase + n] += sum;
+                                }
+                            }
+                        }
+                        finally { System.Buffers.ArrayPool<double>.Shared.Return(kT); }
+                    }
+                });
+                return;
+            }
+
             var kernelTD = new double[colH * outChannels];
             for (int r = 0; r < outChannels; r++)
                 for (int c = 0; c < colH; c++)
@@ -12911,10 +13007,57 @@ public partial class CpuEngine : ITensorLevelEngine
             int totalLen = outChannels * colH;
             var destD = (double[])(object)dest._storage.GetDataArray();
             int destOff = dest._storageOffset;
-            var gradKernelD = new double[totalLen];
             var gradOutputD = (double[])(object)gradOutput.GetFlattenedData();
             var inputD = (double[])(object)input.GetFlattenedData();
             int inputSliceSize = inChannels * height * width;
+
+            // 1×1 conv fast path: kH=kW=1, stride=1, pad=0, dil=1 ⇒ Im2Col
+            // is identity and totalLen == outC*inC. The per-batch GEMM becomes
+            //   gradKernel += gradOut_b @ input_b^T
+            // We sequentially accumulate into destD with β=1 (first batch's β
+            // depends on the caller-supplied accumulate flag). This avoids the
+            // per-batch new double[totalLen] allocations + final merge pass
+            // that the general path does. With 17 of 19 1×1 convs on
+            // GraFPrint, eliminating that B×totalLen allocation footprint is
+            // the dominant backward-pass perf bottleneck at small batch.
+            if (kernelHeight == 1 && kernelWidth == 1 && strideH == 1 && strideW == 1
+                && padH == 0 && padW == 0 && dilationH == 1 && dilationW == 1)
+            {
+                int N = outputHeight * outputWidth;
+                for (int b = 0; b < batch; b++)
+                {
+                    double betaThis = (b == 0) ? (accumulate ? 1.0 : 0.0) : 1.0;
+                    int gradOutOff = b * outChannels * N;
+                    int inOff = b * inChannels * N;
+                    bool usedBlas = Helpers.BlasProvider.TryGemmExBeta(
+                        outChannels, inChannels, N,
+                        gradOutputD, gradOutOff, N, false,   // A = gradOut_b [outC × N]
+                        inputD, inOff, N, true,              // B = input_b^T [N × inC] (logical), via TransB
+                        destD, destOff, inChannels,
+                        alpha: 1.0, beta: betaThis);
+                    if (!usedBlas)
+                    {
+                        // No-BLAS scalar fallback (very cold path).
+                        if (b == 0 && !accumulate)
+                            Array.Clear(destD, destOff, totalLen);
+                        for (int oc = 0; oc < outChannels; oc++)
+                        {
+                            for (int ic = 0; ic < inChannels; ic++)
+                            {
+                                double sum = 0.0;
+                                int goRowBase = gradOutOff + oc * N;
+                                int inRowBase = inOff + ic * N;
+                                for (int n = 0; n < N; n++)
+                                    sum += gradOutputD[goRowBase + n] * inputD[inRowBase + n];
+                                destD[destOff + oc * inChannels + ic] += sum;
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+
+            var gradKernelD = new double[totalLen];
             var perBatchGradsD = new double[batch][];
             var kPoolD = System.Buffers.ArrayPool<double>.Shared;
             CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * colH * colW, b =>

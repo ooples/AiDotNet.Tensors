@@ -450,6 +450,67 @@ internal static class BlasProvider
         catch { return false; }
     }
 
+    /// <summary>
+    /// Double-precision GEMM with explicit α/β scalars: C = αAB + βC.
+    /// Used by the 1×1 conv backward fast paths to write directly into the
+    /// pre-allocated gradient destination with β=1 (accumulating mode)
+    /// without an intermediate buffer + sum-loop.
+    /// </summary>
+    internal static bool TryGemmExBeta(int m, int n, int k,
+        double[] a, int aOffset, int lda, bool transA,
+        double[] b, int bOffset, int ldb, bool transB,
+        double[] c, int cOffset, int ldc,
+        double alpha, double beta)
+    {
+        if (!_nativeAvailable.Value) return false;
+        try
+        {
+            int cblasTA = transA ? 112 : CblasNoTrans;
+            int cblasTB = transB ? 112 : CblasNoTrans;
+            unsafe
+            {
+                fixed (double* pa = &a[aOffset])
+                fixed (double* pb = &b[bOffset])
+                fixed (double* pc = &c[cOffset])
+                {
+                    cblas_dgemm_ptr(CblasRowMajor, cblasTA, cblasTB,
+                        m, n, k, alpha, pa, lda, pb, ldb, beta, pc, ldc);
+                }
+            }
+            return true;
+        }
+        catch { return false; }
+    }
+
+    /// <summary>
+    /// Float counterpart of <see cref="TryGemmExBeta(int, int, int, double[], int, int, bool, double[], int, int, bool, double[], int, int, double, double)"/>.
+    /// </summary>
+    internal static bool TryGemmExBeta(int m, int n, int k,
+        float[] a, int aOffset, int lda, bool transA,
+        float[] b, int bOffset, int ldb, bool transB,
+        float[] c, int cOffset, int ldc,
+        float alpha, float beta)
+    {
+        if (!_nativeAvailable.Value) return false;
+        try
+        {
+            int cblasTA = transA ? 112 : CblasNoTrans;
+            int cblasTB = transB ? 112 : CblasNoTrans;
+            unsafe
+            {
+                fixed (float* pa = &a[aOffset])
+                fixed (float* pb = &b[bOffset])
+                fixed (float* pc = &c[cOffset])
+                {
+                    cblas_sgemm_ptr(CblasRowMajor, cblasTA, cblasTB,
+                        m, n, k, alpha, pa, lda, pb, ldb, beta, pc, ldc);
+                }
+            }
+            return true;
+        }
+        catch { return false; }
+    }
+
     // ────────────────────────────────────────────────────────────────────
     // Direct-dispatch hot paths. Historically these skipped the Try* gate
     // when the caller had already verified availability (via HasRawSgemm /
