@@ -29,7 +29,7 @@ dotnet run -c Release --project tests/AiDotNet.Tensors.Benchmarks -- --filter "*
 ```
 src/AiDotNet.Tensors/Engines/BlasManaged/
   BlasManaged.cs                   # Public Gemm<T> entry point + dispatcher driver
-  BlasOptions.cs                   # BlasOptions<T> + Epilogue<T> + PackingMode + ActivationType
+  BlasOptions.cs                   # BlasOptions<T> + Epilogue<T> + PackingMode
   BlasManagedStats.cs              # Diagnostics struct
   WeightPackHandle.cs              # Pre-pack handle (Layer 3 cache)
   Dispatcher/
@@ -255,7 +255,7 @@ git add src/AiDotNet.Tensors/Engines/BlasManaged/BlasManaged.cs \
 git commit -m "feat(#358): BlasManaged stub — Gemm<T> entry point throws NotImplemented"
 ```
 
-### Task A2: Define PackingMode + ActivationType enums
+### Task A2: Define PackingMode enum
 
 **Files:**
 - Modify: `src/AiDotNet.Tensors/Engines/BlasManaged/BlasOptions.cs`
@@ -276,36 +276,26 @@ public void PackingMode_HasFiveValues()
     Assert.Contains(PackingMode.DisableAutotune, values);
 }
 
-[Fact]
-public void ActivationType_HasEightValues()
-{
-    var values = Enum.GetValues<ActivationType>();
-    Assert.Equal(8, values.Length);
-    Assert.Contains(ActivationType.None, values);
-    Assert.Contains(ActivationType.ReLU, values);
-    Assert.Contains(ActivationType.GELU, values);
-    Assert.Contains(ActivationType.Sigmoid, values);
-    Assert.Contains(ActivationType.Tanh, values);
-    Assert.Contains(ActivationType.Swish, values);
-    Assert.Contains(ActivationType.Mish, values);
-    Assert.Contains(ActivationType.LeakyReLU, values);
-}
 ```
 
 - [ ] **Step 2: Run tests to verify they fail (undefined enums)**
 
 ```
-dotnet test tests/AiDotNet.Tensors.Tests --framework net10.0 --filter "PackingMode_HasFiveValues|ActivationType_HasEightValues"
+dotnet test tests/AiDotNet.Tensors.Tests --framework net10.0 --filter "PackingMode_HasFiveValues"
 ```
-Expected: build fails — enums undefined.
+Expected: build fails — enum undefined.
 
-- [ ] **Step 3: Add the enums to BlasOptions.cs**
+- [ ] **Step 3: Add the PackingMode enum to BlasOptions.cs**
 
 ```csharp
 // Append to src/AiDotNet.Tensors/Engines/BlasManaged/BlasOptions.cs
 public enum PackingMode
 {
-    /// <summary>Dispatcher picks best strategy per shape via autotune cache.</summary>
+    /// <summary>
+    /// Dispatcher selects a strategy per shape via built-in heuristics
+    /// (K-size thresholds, M·N work cutoff). Once Phase H lands, an autotune
+    /// cache will further refine the choice based on measured per-shape timings.
+    /// </summary>
     Auto,
     /// <summary>Always pack both A and B. Forces the 3-level Goto loop nest.</summary>
     ForcePackBoth,
@@ -316,24 +306,15 @@ public enum PackingMode
     /// <summary>Use cached autotune choice if present; never benchmark on first call.</summary>
     DisableAutotune,
 }
-
-public enum ActivationType
-{
-    None,
-    ReLU,
-    GELU,
-    Sigmoid,
-    Tanh,
-    Swish,
-    Mish,
-    LeakyReLU,
-}
 ```
+
+Note: `ActivationType` is **not** defined here. Task A3's `Epilogue<T>.Activation` field uses the existing
+`FusedActivationType` enum at `src/AiDotNet.Tensors/Engines/FusedActivationType.cs` (14 members, full XML docs).
 
 - [ ] **Step 4: Run tests to verify they pass**
 
 ```
-dotnet test tests/AiDotNet.Tensors.Tests --framework net10.0 --filter "PackingMode_HasFiveValues|ActivationType_HasEightValues"
+dotnet test tests/AiDotNet.Tensors.Tests --framework net10.0 --filter "PackingMode_HasFiveValues"
 ```
 Expected: PASS.
 
@@ -341,7 +322,7 @@ Expected: PASS.
 
 ```
 git add src/AiDotNet.Tensors/Engines/BlasManaged/BlasOptions.cs tests/AiDotNet.Tensors.Tests/Engines/BlasManaged/ScalarKernelTests.cs
-git commit -m "feat(#358): BlasManaged enums — PackingMode + ActivationType"
+git commit -m "feat(#358): BlasManaged enums — PackingMode"
 ```
 
 ### Task A3: Define BlasOptions<T> + Epilogue<T> full surface
@@ -359,7 +340,7 @@ public void BlasOptions_DefaultValues_AreSafe()
 {
     var options = new BlasOptions<double>();
     Assert.Equal(PackingMode.Auto, options.PackingMode);
-    Assert.Equal(ActivationType.None, options.Epilogue.Activation);
+    Assert.Equal(FusedActivationType.None, options.Epilogue.Activation);
     Assert.True(options.Epilogue.BiasN.IsEmpty);
     Assert.True(options.Epilogue.SkipMxN.IsEmpty);
     Assert.Equal(0u, options.Epilogue.DropoutMask);
@@ -383,7 +364,7 @@ public void BlasOptions_CanSetAllFields()
         Epilogue = new Epilogue<double>
         {
             BiasN = bias,
-            Activation = ActivationType.ReLU,
+            Activation = FusedActivationType.ReLU,
             OutputScale = 2.0,
         },
         Workspace = ws,
@@ -392,7 +373,7 @@ public void BlasOptions_CanSetAllFields()
         MaxJitCacheBytes = 1024L * 1024,
     };
     Assert.Equal(PackingMode.ForcePackBoth, options.PackingMode);
-    Assert.Equal(ActivationType.ReLU, options.Epilogue.Activation);
+    Assert.Equal(FusedActivationType.ReLU, options.Epilogue.Activation);
     Assert.Equal(2.0, options.Epilogue.OutputScale);
     Assert.Equal(-1, options.NumThreads);
 }
@@ -462,18 +443,6 @@ public enum PackingMode
     DisableAutotune,
 }
 
-public enum ActivationType
-{
-    None,
-    ReLU,
-    GELU,
-    Sigmoid,
-    Tanh,
-    Swish,
-    Mish,
-    LeakyReLU,
-}
-
 public readonly ref struct BlasOptions<T> where T : unmanaged
 {
     public PackingMode PackingMode { get; init; }
@@ -494,7 +463,7 @@ public readonly ref struct Epilogue<T> where T : unmanaged
 {
     /// <summary>Bias vector of length N. Empty = no bias.</summary>
     public ReadOnlySpan<T> BiasN { get; init; }
-    public ActivationType Activation { get; init; }
+    public FusedActivationType Activation { get; init; }
     /// <summary>Skip-connection tensor of shape (M, N) in row-major. Empty = no skip.</summary>
     public ReadOnlySpan<T> SkipMxN { get; init; }
     /// <summary>Dropout RNG state. 0 = no dropout (inference).</summary>
@@ -1139,7 +1108,7 @@ End state: bias + activation + skip + dropout + output-scale all fuse into the m
 
 - **I1: EpilogueFlags bit-pack** — `Epilogue/EpilogueFlags.cs`. 8-bit flags: `HasBias | HasActivation(3 bits) | HasSkip | HasDropout | HasScale`.
 - **I2: BiasEpilogue** — `Epilogue/BiasEpilogue.cs`. Adds `bias[n..n+Nr]` to each row of the C tile in-register.
-- **I3: ActivationEpilogue** — `Epilogue/ActivationEpilogue.cs`. Switch on `ActivationType`. ReLU = `Vector.Max(acc, Zero)`; GELU = approximate per the codebase's existing GELU helper; etc.
+- **I3: ActivationEpilogue** — `Epilogue/ActivationEpilogue.cs`. Switch on `FusedActivationType` (from `Engines/FusedActivationType.cs`). ReLU = `Vector.Max(acc, Zero)`; GELU = approximate per the codebase's existing GELU helper; etc.
 - **I4: SkipEpilogue** — `Epilogue/SkipEpilogue.cs`. Adds `skip[m..m+Mr, n..n+Nr]` to C in-register.
 - **I5: DropoutEpilogue** — `Epilogue/DropoutEpilogue.cs`. Multiplies C by a dropout mask derived from `Epilogue.DropoutMask` seed via a per-tile PRG (e.g., xoshiro256**). Bit-deterministic given the seed.
 - **I6: OutputScaleEpilogue** — `Epilogue/OutputScaleEpilogue.cs`. Scalar multiply on C tile.

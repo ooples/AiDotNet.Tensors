@@ -100,14 +100,10 @@ public enum PackingMode {
 
 public readonly ref struct Epilogue<T> where T : unmanaged {
     public ReadOnlySpan<T> BiasN     { get; init; } // empty = no bias  (length = N)
-    public ActivationType Activation { get; init; }
+    public FusedActivationType Activation { get; init; }
     public ReadOnlySpan<T> SkipMxN   { get; init; } // empty = no skip-connection
     public uint DropoutMask          { get; init; } // 0 = no dropout
     public T OutputScale             { get; init; } // 1 = no scale
-}
-
-public enum ActivationType {
-    None, ReLU, GELU, Sigmoid, Tanh, Swish, Mish, LeakyReLU
 }
 
 public sealed class WeightPackHandle : IDisposable {

@@ -9,7 +9,11 @@ public readonly ref struct BlasOptions<T> where T : unmanaged
 
 public enum PackingMode
 {
-    /// <summary>Dispatcher picks best strategy per shape via autotune cache.</summary>
+    /// <summary>
+    /// Dispatcher selects a strategy per shape via built-in heuristics
+    /// (K-size thresholds, M·N work cutoff). Once Phase H lands, an autotune
+    /// cache will further refine the choice based on measured per-shape timings.
+    /// </summary>
     Auto,
     /// <summary>Always pack both A and B. Forces the 3-level Goto loop nest.</summary>
     ForcePackBoth,
@@ -19,16 +23,4 @@ public enum PackingMode
     ForceStreaming,
     /// <summary>Use cached autotune choice if present; never benchmark on first call.</summary>
     DisableAutotune,
-}
-
-public enum ActivationType
-{
-    None,
-    ReLU,
-    GELU,
-    Sigmoid,
-    Tanh,
-    Swish,
-    Mish,
-    LeakyReLU,
 }
