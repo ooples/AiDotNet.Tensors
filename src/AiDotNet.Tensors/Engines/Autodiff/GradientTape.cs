@@ -49,7 +49,8 @@ public sealed class GradientTape<T> : IDisposable
     private readonly GradientTape<T>? _parent;
     private readonly TapeEntryArena<T> _entries;
     private readonly GradientTapeOptions _options;
-    private readonly IEngine _engine;
+    private IEngine _engine;
+    private bool _engineExplicitlyBound;
     private readonly bool _savedReplayMode; // Saved ReplayMode from outer scope for nested tapes
     private bool _disposed;
 
@@ -84,6 +85,21 @@ public sealed class GradientTape<T> : IDisposable
     public IEngine Engine => _engine;
 
     /// <summary>
+    /// Binds this tape to <paramref name="engine"/> if no engine has yet been
+    /// explicitly bound. Idempotent — once bound, subsequent calls are
+    /// no-ops. Engine recording paths (e.g. <see cref="CpuEngine.BatchNorm{T}"/>)
+    /// call this with <c>this</c> so the backward walk dispatches to the same
+    /// engine instance the user invoked the forward op on. Closes #350.
+    /// </summary>
+    public void BindEngineIfUnset(IEngine engine)
+    {
+        if (_engineExplicitlyBound) return;
+        if (engine is null) return;
+        _engine = engine;
+        _engineExplicitlyBound = true;
+    }
+
+    /// <summary>
     /// Gets whether this tape has been disposed.
     /// </summary>
     public bool IsDisposed => _disposed;
@@ -109,7 +125,19 @@ public sealed class GradientTape<T> : IDisposable
         _entries = _cachedArena ?? new TapeEntryArena<T>();
         _cachedArena = null; // Take ownership — will return on Dispose
         _entries.Reset();
+        // Default to AiDotNetEngine.Current; the first op recorded onto the
+        // tape rebinds via BindEngineIfUnset to the engine instance the user
+        // actually invoked the op on. Same rationale as LazyTensorScope's
+        // engine binding (see issue #350): on auto-detect-GPU systems
+        // AiDotNetEngine.Current is DirectGpuTensorEngine, but tests or
+        // production code that explicitly creates a new CpuEngine() and
+        // calls operations on it expects backward to also run on CPU. Without
+        // this rebind the eager-tape backward and compiled backward dispatch
+        // to different engines, producing per-element double-precision
+        // divergences in the 1e-7 range that look like FMA noise but are
+        // actually two distinct backward kernels racing on different devices.
         _engine = AiDotNetEngine.Current;
+        _engineExplicitlyBound = false;
         _parent = _current;
         _savedReplayMode = Compilation.AutoTrainingCompiler.ReplayMode;
 

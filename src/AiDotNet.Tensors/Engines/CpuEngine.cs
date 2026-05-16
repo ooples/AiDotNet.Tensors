@@ -2763,6 +2763,7 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentException(
                 $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
         }
+        AiDotNet.Tensors.Engines.Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
 
         // Lazy graph mode: record and return placeholder
         if (GraphMode.IsActive)
@@ -2770,6 +2771,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var scope = GraphMode.Current;
             if (scope != null)
             {
+                scope.BindEngineIfUnset(this);
                 var capturedA = a;
                 var capturedB = b;
                 return scope.RecordBinary(LazyNodeType.Add, "TensorAdd", a, b, a._shape,
@@ -4303,6 +4305,16 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentException(
                 $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
         }
+        // Pin the active gradient tape (if any) to THIS engine — same
+        // reasoning as the scope.BindEngineIfUnset call below, but for the
+        // eager-tape path. Without this, an active tape constructed before
+        // any explicit engine instantiation defaults to AiDotNetEngine.Current
+        // (DirectGpuTensorEngine on auto-detect-GPU systems), and the
+        // backward walk would dispatch through the GPU engine's
+        // TensorSubtractInto / TensorAddInPlace which run in single precision
+        // on consumer GPUs — silently truncating gradient values to float
+        // ULPs even though the user explicitly opted into a CpuEngine.
+        AiDotNet.Tensors.Engines.Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
 
         // Lazy graph mode: record and return placeholder
         if (GraphMode.IsActive)
@@ -4310,6 +4322,16 @@ public partial class CpuEngine : ITensorLevelEngine
             var scope = GraphMode.Current;
             if (scope != null)
             {
+                // Bind THIS engine to the scope so the compiled plan replays
+                // on the same engine instance the user invoked the op on.
+                // See LazyTensorScope.BindEngineIfUnset for the full
+                // rationale (issue #350): without this, on auto-detect-GPU
+                // hosts where AiDotNetEngine.Current is DirectGpuTensorEngine,
+                // the lazy execute would dispatch to the GPU's
+                // TensorSubtractInto which computes in single precision on
+                // consumer GPUs and silently produces float-precision-rounded
+                // results in a Tensor<double>'s buffer.
+                scope.BindEngineIfUnset(this);
                 var capturedA = a;
                 var capturedB = b;
                 return scope.RecordBinary(LazyNodeType.Subtract, "TensorSubtract", a, b, a._shape,
@@ -4433,6 +4455,7 @@ public partial class CpuEngine : ITensorLevelEngine
             // Shapes don't match — fall through to broadcasting (NumPy/PyTorch behavior)
             return TensorBroadcastMultiply(a, b);
         }
+        AiDotNet.Tensors.Engines.Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
 
         // Lazy graph mode: record and return placeholder
         if (GraphMode.IsActive)
@@ -4440,6 +4463,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var scope = GraphMode.Current;
             if (scope != null)
             {
+                scope.BindEngineIfUnset(this);
                 var capturedA = a;
                 var capturedB = b;
                 return scope.RecordBinary(LazyNodeType.Multiply, "TensorMultiply", a, b, a._shape,
@@ -6640,6 +6664,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         using var _opScope = AiDotNet.Tensors.Engines.Profiling.Profiler.OpScope("ReduceSum");
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        AiDotNet.Tensors.Engines.Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
 
         // Lazy graph mode: record and return placeholder
         if (GraphMode.IsActive)
@@ -6647,6 +6672,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var scope = GraphMode.Current;
             if (scope != null)
             {
+                scope.BindEngineIfUnset(this);
                 // Compute output shape eagerly
                 int[] outShape;
                 if (axes == null || axes.Length == 0)
@@ -12191,6 +12217,159 @@ public partial class CpuEngine : ITensorLevelEngine
         return TensorAllocator.Rent<T>(inputShape, gradInput);
     }
 
+    /// <summary>
+    /// Conv2D backward (gradient w.r.t. input) writing into a pre-allocated
+    /// destination tensor. Used by <see cref="Compilation.CompiledTrainingPlan{T}"/>
+    /// to skip the result-tensor allocation + the AccumulateGrad chained ops
+    /// that the public <see cref="Conv2DBackwardInput{T}"/> entry pays per call.
+    /// On a 19-Conv-layer network like GraFPrint this saves ~10 ms per Conv
+    /// backward (allocator pressure + chained ops in BackwardFunctions.Conv2DBackward).
+    /// <para>
+    /// <paramref name="accumulate"/>: when <c>true</c>, adds the computed
+    /// gradInput into <paramref name="dest"/> (consumer-count > 1 case in the
+    /// graph). When <c>false</c>, overwrites — the destination is zeroed first
+    /// because the inner col2im algorithm is accumulating-only.
+    /// </para>
+    /// </summary>
+    public void Conv2DBackwardInputInto<T>(
+        Tensor<T> dest, Tensor<T> gradOutput, Tensor<T> kernel,
+        int[] inputShape, int[] stride, int[] padding, int[] dilation,
+        bool accumulate)
+    {
+        if (dest == null) throw new ArgumentNullException(nameof(dest));
+        if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
+        if (kernel == null) throw new ArgumentNullException(nameof(kernel));
+        if (!dest.IsContiguous) throw new InvalidOperationException("dest must be contiguous.");
+        if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
+        if (!kernel.IsContiguous) kernel = kernel.Contiguous();
+        if (inputShape == null || inputShape.Length != 4) throw new ArgumentException("inputShape must be array of 4 elements", nameof(inputShape));
+        if (gradOutput.Rank != 4) throw new ArgumentException($"requires 4D gradOutput. Got rank {gradOutput.Rank}.", nameof(gradOutput));
+        if (kernel.Rank != 4) throw new ArgumentException($"requires 4D kernel. Got rank {kernel.Rank}.", nameof(kernel));
+        if (!ShapesMatch(dest._shape, inputShape)) throw new ArgumentException("dest shape must match inputShape");
+
+        int batch = inputShape[0];
+        int inChannels = inputShape[1];
+        int height = inputShape[2];
+        int width = inputShape[3];
+        int outChannels = kernel._shape[0];
+        int kernelHeight = kernel._shape[2];
+        int kernelWidth = kernel._shape[3];
+        int strideH = stride[0], strideW = stride[1];
+        int padH = padding[0], padW = padding[1];
+        int dilationH = dilation[0], dilationW = dilation[1];
+        int outputHeight = gradOutput._shape[2];
+        int outputWidth = gradOutput._shape[3];
+
+        if (typeof(T) == typeof(float))
+        {
+            int colH = inChannels * kernelHeight * kernelWidth;
+            int colW = outputHeight * outputWidth;
+            // Write directly into dest's live backing — skip the temp gradInputF
+            // allocation + FromFloatSpan copy that Conv2DBackwardInput's
+            // public path pays. The plan's pre-allocated dest is contiguous +
+            // CPU-resident; getting its array via _storage.GetDataArray()
+            // hands back the live float[] (no copy).
+            var destF = (float[])(object)dest._storage.GetDataArray();
+            int destOff = dest._storageOffset;
+            // Col2ImAccumulate is accumulating — for overwrite mode, zero the
+            // destination region first.
+            if (!accumulate)
+                Array.Clear(destF, destOff, batch * inChannels * height * width);
+            var gradOutputF = (float[])(object)gradOutput.GetFlattenedData();
+            var kernelF = (float[])(object)kernel.GetFlattenedData();
+            var kernelT = new float[colH * outChannels];
+            for (int r = 0; r < outChannels; r++)
+                for (int c = 0; c < colH; c++)
+                    kernelT[c * outChannels + r] = kernelF[r * colH + c];
+            var pool = System.Buffers.ArrayPool<float>.Shared;
+            CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * colH * colW, b =>
+            {
+                var colBuf = pool.Rent(colW * colH);
+                try
+                {
+                    int gradOutOff = b * outChannels * colW;
+                    if (!Helpers.BlasProvider.TryGemm(colH, colW, outChannels,
+                        kernelT, 0, outChannels,
+                        gradOutputF, gradOutOff, colW,
+                        colBuf, 0, colW))
+                    {
+                        Simd.SimdGemm.Sgemm(
+                            new ReadOnlySpan<float>(kernelT),
+                            new ReadOnlySpan<float>(gradOutputF, gradOutOff, outChannels * colW),
+                            new Span<float>(colBuf, 0, colH * colW),
+                            colH, outChannels, colW);
+                    }
+                    int imgOff = destOff + b * inChannels * height * width;
+                    Im2ColHelper.Col2ImAccumulate(
+                        new ReadOnlySpan<float>(colBuf, 0, colW * colH),
+                        new Span<float>(destF, imgOff, inChannels * height * width),
+                        inChannels, height, width,
+                        kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW,
+                        outputHeight, outputWidth);
+                }
+                finally { pool.Return(colBuf); }
+            });
+            return;
+        }
+
+        if (typeof(T) == typeof(double))
+        {
+            int colH = inChannels * kernelHeight * kernelWidth;
+            int colW = outputHeight * outputWidth;
+            var destD = (double[])(object)dest._storage.GetDataArray();
+            int destOff = dest._storageOffset;
+            if (!accumulate)
+                Array.Clear(destD, destOff, batch * inChannels * height * width);
+            var gradOutputD = (double[])(object)gradOutput.GetFlattenedData();
+            var kernelD = (double[])(object)kernel.GetFlattenedData();
+            var kernelTD = new double[colH * outChannels];
+            for (int r = 0; r < outChannels; r++)
+                for (int c = 0; c < colH; c++)
+                    kernelTD[c * outChannels + r] = kernelD[r * colH + c];
+            var poolD = System.Buffers.ArrayPool<double>.Shared;
+            CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * colH * colW, b =>
+            {
+                var colBuf = poolD.Rent(colW * colH);
+                try
+                {
+                    int gradOutOff = b * outChannels * colW;
+                    if (!Helpers.BlasProvider.TryGemm(colH, colW, outChannels,
+                        kernelTD, 0, outChannels,
+                        gradOutputD, gradOutOff, colW,
+                        colBuf, 0, colW))
+                    {
+                        Helpers.Im2ColHelper.MultiplyMatrixBlockedDouble(
+                            new ReadOnlySpan<double>(kernelTD),
+                            new ReadOnlySpan<double>(gradOutputD, gradOutOff, outChannels * colW),
+                            new Span<double>(colBuf, 0, colH * colW),
+                            colH, outChannels, colW);
+                    }
+                    int imgOff = destOff + b * inChannels * height * width;
+                    Helpers.Im2ColHelper.Col2ImAccumulate(
+                        new ReadOnlySpan<double>(colBuf, 0, colW * colH),
+                        new Span<double>(destD, imgOff, inChannels * height * width),
+                        inChannels, height, width,
+                        kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW,
+                        outputHeight, outputWidth);
+                }
+                finally { poolD.Return(colBuf); }
+            });
+            return;
+        }
+
+        // Generic fallback for non-float, non-double types — wrap the existing
+        // public method and copy/add. Slow path, only used for BFloat16 etc.
+        var tmp = Conv2DBackwardInput(gradOutput, kernel, inputShape, stride, padding, dilation);
+        if (accumulate)
+        {
+            TensorAddInto(dest, dest, tmp);
+        }
+        else
+        {
+            tmp.AsSpan().CopyTo(dest.AsWritableSpan());
+        }
+    }
+
     /// <inheritdoc/>
     public Tensor<T> Conv2DBackwardKernel<T>(Tensor<T> gradOutput, Tensor<T> input, int[] kernelShape, int[] stride, int[] padding, int[] dilation)
     {
@@ -12423,6 +12602,192 @@ public partial class CpuEngine : ITensorLevelEngine
         });
 
         return TensorAllocator.Rent<T>(kernelShape, gradKernel);
+    }
+
+    /// <summary>
+    /// Conv2D backward (gradient w.r.t. kernel) writing into a pre-allocated
+    /// destination tensor. Companion to <see cref="Conv2DBackwardInputInto{T}"/>;
+    /// used by <see cref="Compilation.CompiledTrainingPlan{T}"/> to skip the
+    /// result-tensor allocation + the AccumulateGrad chained ops that the
+    /// public <see cref="Conv2DBackwardKernel{T}"/> entry pays per call.
+    /// <para>
+    /// <paramref name="accumulate"/>: when <c>true</c>, adds the computed
+    /// gradKernel into <paramref name="dest"/>. When <c>false</c>, overwrites.
+    /// The inner per-batch im2col×gradOut^T accumulation is unaffected — only
+    /// the merge step at the end conditions on the flag.
+    /// </para>
+    /// </summary>
+    public void Conv2DBackwardKernelInto<T>(
+        Tensor<T> dest, Tensor<T> gradOutput, Tensor<T> input,
+        int[] kernelShape, int[] stride, int[] padding, int[] dilation,
+        bool accumulate)
+    {
+        if (dest == null) throw new ArgumentNullException(nameof(dest));
+        if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (!dest.IsContiguous) throw new InvalidOperationException("dest must be contiguous.");
+        if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
+        if (!input.IsContiguous) input = input.Contiguous();
+        if (kernelShape == null || kernelShape.Length != 4) throw new ArgumentException("kernelShape must be array of 4 elements", nameof(kernelShape));
+        if (gradOutput.Rank != 4) throw new ArgumentException($"requires 4D gradOutput. Got rank {gradOutput.Rank}.", nameof(gradOutput));
+        if (input.Rank != 4) throw new ArgumentException($"requires 4D input. Got rank {input.Rank}.", nameof(input));
+        if (!ShapesMatch(dest._shape, kernelShape)) throw new ArgumentException("dest shape must match kernelShape");
+
+        int batch = input._shape[0];
+        int inChannels = input._shape[1];
+        int height = input._shape[2];
+        int width = input._shape[3];
+        int outChannels = kernelShape[0];
+        int kernelHeight = kernelShape[2];
+        int kernelWidth = kernelShape[3];
+        int strideH = stride[0], strideW = stride[1];
+        int padH = padding[0], padW = padding[1];
+        int dilationH = dilation[0], dilationW = dilation[1];
+        int outputHeight = gradOutput._shape[2];
+        int outputWidth = gradOutput._shape[3];
+
+        if (typeof(T) == typeof(float))
+        {
+            int colH = inChannels * kernelHeight * kernelWidth;
+            int colW = outputHeight * outputWidth;
+            int totalLen = outChannels * colH;
+            var destF = (float[])(object)dest._storage.GetDataArray();
+            int destOff = dest._storageOffset;
+            // Local accumulator: per-batch BLAS writes into localGrad; merge into dest at end.
+            var gradKernelF = new float[totalLen];
+            var gradOutputF = (float[])(object)gradOutput.GetFlattenedData();
+            var inputF = (float[])(object)input.GetFlattenedData();
+            int inputSliceSize = inChannels * height * width;
+            var perBatchGrads = new float[batch][];
+            var kPool = System.Buffers.ArrayPool<float>.Shared;
+            CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * colH * colW, b =>
+            {
+                var im2colBuf = kPool.Rent(colH * colW);
+                var localGrad = kPool.Rent(totalLen);
+                try
+                {
+                    Array.Clear(localGrad, 0, totalLen);
+                    Im2ColHelper.Im2Col(
+                        new ReadOnlySpan<float>(inputF, b * inputSliceSize, inputSliceSize),
+                        new Span<float>(im2colBuf),
+                        1, inChannels, height, width,
+                        kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW);
+                    int gradOutOff = b * outChannels * colW;
+                    if (!Helpers.BlasProvider.TryGemmEx(
+                        outChannels, colH, colW,
+                        gradOutputF, gradOutOff, colW, false,
+                        im2colBuf, 0, colW, true,
+                        localGrad, 0, colH))
+                    {
+                        Simd.SimdGemm.Sgemm(
+                            new ReadOnlySpan<float>(gradOutputF, gradOutOff, outChannels * colW), colW, false,
+                            new ReadOnlySpan<float>(im2colBuf, 0, colH * colW), colW, true,
+                            new Span<float>(localGrad, 0, totalLen),
+                            outChannels, colW, colH);
+                    }
+                    var gradCopy = new float[totalLen];
+                    Array.Copy(localGrad, gradCopy, totalLen);
+                    perBatchGrads[b] = gradCopy;
+                }
+                finally
+                {
+                    kPool.Return(im2colBuf);
+                    kPool.Return(localGrad);
+                }
+            });
+            for (int b = 0; b < batch; b++)
+            {
+                var lg = perBatchGrads[b];
+                for (int i = 0; i < gradKernelF.Length; i++)
+                    gradKernelF[i] += lg[i];
+            }
+            // Merge into dest with accumulate flag honoured.
+            if (accumulate)
+                for (int i = 0; i < totalLen; i++) destF[destOff + i] += gradKernelF[i];
+            else
+                Array.Copy(gradKernelF, 0, destF, destOff, totalLen);
+            return;
+        }
+
+        if (typeof(T) == typeof(double))
+        {
+            int colH = inChannels * kernelHeight * kernelWidth;
+            int colW = outputHeight * outputWidth;
+            int totalLen = outChannels * colH;
+            var destD = (double[])(object)dest._storage.GetDataArray();
+            int destOff = dest._storageOffset;
+            var gradKernelD = new double[totalLen];
+            var gradOutputD = (double[])(object)gradOutput.GetFlattenedData();
+            var inputD = (double[])(object)input.GetFlattenedData();
+            int inputSliceSize = inChannels * height * width;
+            var perBatchGradsD = new double[batch][];
+            var kPoolD = System.Buffers.ArrayPool<double>.Shared;
+            CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * colH * colW, b =>
+            {
+                var im2colBuf = kPoolD.Rent(colH * colW);
+                var localGrad = kPoolD.Rent(totalLen);
+                try
+                {
+                    Array.Clear(localGrad, 0, totalLen);
+                    Helpers.Im2ColHelper.Im2Col(
+                        new ReadOnlySpan<double>(inputD, b * inputSliceSize, inputSliceSize),
+                        new Span<double>(im2colBuf),
+                        1, inChannels, height, width,
+                        kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW);
+                    int gradOutOff = b * outChannels * colW;
+                    if (!Helpers.BlasProvider.TryGemmEx(
+                        outChannels, colH, colW,
+                        gradOutputD, gradOutOff, colW, false,
+                        im2colBuf, 0, colW, true,
+                        localGrad, 0, colH))
+                    {
+                        var im2colT = kPoolD.Rent(colW * colH);
+                        try
+                        {
+                            for (int r = 0; r < colH; r++)
+                                for (int c = 0; c < colW; c++)
+                                    im2colT[c * colH + r] = im2colBuf[r * colW + c];
+                            Helpers.Im2ColHelper.MultiplyMatrixBlockedDouble(
+                                new ReadOnlySpan<double>(gradOutputD, gradOutOff, outChannels * colW),
+                                new ReadOnlySpan<double>(im2colT, 0, colW * colH),
+                                new Span<double>(localGrad, 0, totalLen),
+                                outChannels, colW, colH);
+                        }
+                        finally { kPoolD.Return(im2colT); }
+                    }
+                    var gradCopy = new double[totalLen];
+                    Array.Copy(localGrad, gradCopy, totalLen);
+                    perBatchGradsD[b] = gradCopy;
+                }
+                finally
+                {
+                    kPoolD.Return(im2colBuf);
+                    kPoolD.Return(localGrad);
+                }
+            });
+            for (int b = 0; b < batch; b++)
+            {
+                var lg = perBatchGradsD[b];
+                for (int i = 0; i < gradKernelD.Length; i++)
+                    gradKernelD[i] += lg[i];
+            }
+            if (accumulate)
+                for (int i = 0; i < totalLen; i++) destD[destOff + i] += gradKernelD[i];
+            else
+                Array.Copy(gradKernelD, 0, destD, destOff, totalLen);
+            return;
+        }
+
+        // Generic fallback for non-float, non-double types.
+        var tmp = Conv2DBackwardKernel(gradOutput, input, kernelShape, stride, padding, dilation);
+        if (accumulate)
+        {
+            TensorAddInto(dest, dest, tmp);
+        }
+        else
+        {
+            tmp.AsSpan().CopyTo(dest.AsWritableSpan());
+        }
     }
 
     /// <inheritdoc/>
@@ -17388,6 +17753,14 @@ public partial class CpuEngine : ITensorLevelEngine
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (gamma == null) throw new ArgumentNullException(nameof(gamma));
         if (beta == null) throw new ArgumentNullException(nameof(beta));
+        // Pin the active gradient tape (if any) to THIS engine so the backward
+        // walk replays on the same engine instance the user invoked forward
+        // on. Without this, an active tape constructed before any explicit
+        // engine instantiation defaults to AiDotNetEngine.Current — which on
+        // auto-detect-GPU systems is DirectGpuTensorEngine — and the backward
+        // pass dispatches to a different engine than the forward pass. See
+        // BindEngineIfUnset's docstring for the full rationale (issue #350).
+        AiDotNet.Tensors.Engines.Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
 
         // GraphMode: execute eagerly (out params), but record result in graph for compiled plan
         if (GraphMode.IsActive)
@@ -17398,10 +17771,32 @@ public partial class CpuEngine : ITensorLevelEngine
                 var ci = input; var cg = gamma; var cb = beta; double ce = epsilon;
                 var savedScope = GraphMode.Current;
                 GraphMode.SetCurrent(null);
-                var eagerResult = BatchNorm(ci, cg, cb, ce, out mean, out variance);
-                GraphMode.SetCurrent(savedScope);
-                // AiDotNet#1331: refresh mean/variance on every plan.Step.
+                Tensor<T> eagerResult;
+                try
+                {
+                    eagerResult = BatchNorm(ci, cg, cb, ce, out mean, out variance);
+                }
+                finally
+                {
+                    // PR #352: try/finally ensures GraphMode is restored even
+                    // if the eager BatchNorm throws — without this, a failure
+                    // here would leave GraphMode disabled and subsequent
+                    // graph-mode ops would silently degrade to eager.
+                    GraphMode.SetCurrent(savedScope);
+                }
+                // PR #352: bind THIS engine to the scope so the compiled plan
+                // replays on the same engine the user called the op on (issue
+                // #350: scope captures AiDotNetEngine.Current at scope-
+                // construction time, which on auto-detect-GPU systems is
+                // DirectGpuTensorEngine — wrong if the user explicitly calls
+                // a CPU instance, since BN results would be GPU-routed at
+                // Step time and diverge from the CPU eager-time output).
+                scope.BindEngineIfUnset(this);
+                // AiDotNet#1331: capture mean/variance refs so the lazy
+                // replay below can refresh them on every plan.Step (training
+                // mean/variance evolve with the data).
                 var capturedMean = mean; var capturedVar = variance;
+                // Record in graph so compiled plan captures the dependency
                 var lazyResult = scope.RecordVariadic(LazyNodeType.Custom, "BatchNorm",
                     new[] { input, gamma, beta }, eagerResult._shape,
                     (eng, output) =>
@@ -18065,6 +18460,58 @@ public partial class CpuEngine : ITensorLevelEngine
         gradGamma = TensorAllocator.Rent<T>([features], gradGammaData);
         gradBeta = TensorAllocator.Rent<T>([features], gradBetaData);
         return TensorAllocator.Rent<T>(input._shape, gradInputData);
+    }
+
+    /// <summary>
+    /// BatchNorm backward writing into pre-allocated destination tensors,
+    /// with per-output accumulate flags. Used by
+    /// <see cref="Compilation.CompiledTrainingPlan{T}"/> to skip the 3 fresh
+    /// tensor allocations + 3 chained AccumulateGrad calls that
+    /// <c>BackwardFunctions.BatchNormBackward</c> pays per BN layer. On the
+    /// 18-BN-layer GraFPrint pyramid this saves ~3-5 ms per BN backward.
+    /// <para>
+    /// Internally this routes through the existing rank-aware
+    /// <see cref="BatchNormBackward{T}"/> dispatcher (which already has a
+    /// double-arithmetic fast path for the 4D case at line 18458) and then
+    /// merges the temporary results into the caller's buffers — accumulate
+    /// or overwrite. The merge cost is one SIMD pass per output (cheaper
+    /// than the AccumulateGrad chain it replaces because the destination
+    /// is known a priori; no dictionary lookup, no IsContiguous check, no
+    /// virtual dispatch through TensorAddInPlace).
+    /// </para>
+    /// <para>
+    /// A future Tier 2 fused-Conv-BN-Activation backward will inline this
+    /// path; this Into variant is the Tier 1 stepping stone that eliminates
+    /// the orchestration overhead while keeping the existing engine kernels
+    /// in place.
+    /// </para>
+    /// </summary>
+    public void BatchNormBackwardInto<T>(
+        Tensor<T> destGradInput, Tensor<T> destGradGamma, Tensor<T> destGradBeta,
+        Tensor<T> gradOutput, Tensor<T> input, Tensor<T> gamma,
+        Tensor<T> mean, Tensor<T> variance, double epsilon,
+        bool accumulateInput, bool accumulateGamma, bool accumulateBeta)
+    {
+        if (destGradInput == null) throw new ArgumentNullException(nameof(destGradInput));
+        if (destGradGamma == null) throw new ArgumentNullException(nameof(destGradGamma));
+        if (destGradBeta == null) throw new ArgumentNullException(nameof(destGradBeta));
+        if (!destGradInput.IsContiguous) throw new InvalidOperationException("destGradInput must be contiguous.");
+        if (!destGradGamma.IsContiguous) throw new InvalidOperationException("destGradGamma must be contiguous.");
+        if (!destGradBeta.IsContiguous) throw new InvalidOperationException("destGradBeta must be contiguous.");
+
+        var gi = BatchNormBackward(gradOutput, input, gamma, mean, variance, epsilon, out var gg, out var gb);
+
+        // Merge gi → destGradInput
+        if (accumulateInput) TensorAddInto(destGradInput, destGradInput, gi);
+        else gi.AsSpan().CopyTo(destGradInput.AsWritableSpan());
+
+        // Merge gg → destGradGamma
+        if (accumulateGamma) TensorAddInto(destGradGamma, destGradGamma, gg);
+        else gg.AsSpan().CopyTo(destGradGamma.AsWritableSpan());
+
+        // Merge gb → destGradBeta
+        if (accumulateBeta) TensorAddInto(destGradBeta, destGradBeta, gb);
+        else gb.AsSpan().CopyTo(destGradBeta.AsWritableSpan());
     }
 
 

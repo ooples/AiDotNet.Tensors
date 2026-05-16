@@ -278,10 +278,66 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         _checkpointing = new GradientCheckpointing<T>(wrappedSteps, _engine, segmentSize);
     }
 
+    // Per-phase profiling counters — wall time accumulators in microseconds
+    // collected when AIDOTNET_PROFILE_STEP=1 is set in the environment. Read
+    // them from a test/diag harness via the static accessors below to break
+    // down where Step's wall time is going (forward / grad-zero / backward /
+    // optimizer). Zero overhead in hot path when disabled — single env-var
+    // read at static init, then a single bool check per Step.
+    private static readonly bool _profileStepEnabled =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_PROFILE_STEP") == "1";
+    private static long _profForwardUs, _profGradZeroUs, _profBackwardUs, _profOptimUs;
+    private static int _profStepCount;
+    private static long[]? _profPerStepUs;
+    private static string[]? _profBackwardStepNames;
+    public static long[] ProfPerStepUs => _profPerStepUs ?? Array.Empty<long>();
+    public static string[] ProfBackwardStepNames => _profBackwardStepNames ?? Array.Empty<string>();
+    public static long ProfForwardUs => System.Threading.Interlocked.Read(ref _profForwardUs);
+    public static long ProfGradZeroUs => System.Threading.Interlocked.Read(ref _profGradZeroUs);
+    public static long ProfBackwardUs => System.Threading.Interlocked.Read(ref _profBackwardUs);
+    public static long ProfOptimUs => System.Threading.Interlocked.Read(ref _profOptimUs);
+    public static int ProfStepCount => System.Threading.Interlocked.CompareExchange(ref _profStepCount, 0, 0);
+    public static void ResetProf()
+    {
+        System.Threading.Interlocked.Exchange(ref _profForwardUs, 0);
+        System.Threading.Interlocked.Exchange(ref _profGradZeroUs, 0);
+        System.Threading.Interlocked.Exchange(ref _profBackwardUs, 0);
+        System.Threading.Interlocked.Exchange(ref _profOptimUs, 0);
+        System.Threading.Interlocked.Exchange(ref _profStepCount, 0);
+        var ps = _profPerStepUs;
+        if (ps != null) System.Array.Clear(ps, 0, ps.Length);
+        // Drop the previous plan's backward-step name table. Without this,
+        // a fresh ResetProf-then-rebuild cycle (e.g. test reruns) leaves
+        // the stale name array around and any future Step() that reads
+        // it can mis-attribute timings to the wrong delegate.
+        _profBackwardStepNames = null;
+    }
+
+
+    /// <summary>
+    /// Diagnostic hook for tracing per-step buffer mutations. When set,
+    /// fires after each forward and each backward delegate with the phase
+    /// label and the step's OpName. Used by the
+    /// Pinpoint_DOUBLE_TensorSubtract_Forward bisect test to locate which
+    /// specific backward delegate corrupts a target tensor's buffer.
+    /// Reset to null after use to avoid debug overhead in normal runs.
+    /// </summary>
+    public static System.Action<string>? StepProbe { get; set; }
+
+    /// <summary>Diagnostic capture: TensorSubtract specialized forward writes
+    /// here when AIDOTNET_DEBUG_SUB=1. Used by Pinpoint tests to inspect
+    /// what the kernel sees vs writes.</summary>
+    public static string SubFwdDiag = "";
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public Tensor<T> Step()
     {
         var engine = _engine;
+        // Two independent profile surfaces: PR #352's per-step
+        // ProfForward/ProfBackward via _profileStepEnabled, and main's
+        // Phase F StepTiming aggregator via StepTiming.Enabled. Both
+        // capture timestamps so kept on the hot path.
+        long t0 = _profileStepEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         bool stepTiming = StepTiming.Enabled;
 
         // Forward: use checkpointing if enabled, otherwise straight-line delegates
@@ -293,9 +349,24 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         else
         {
             var fwd = _forwardActions;
-            for (int i = 0; i < fwd.Length; i++)
-                fwd[i](engine);
+            var probe = StepProbe;
+            if (probe != null)
+            {
+                probe("BEGIN-FWD");
+                for (int i = 0; i < fwd.Length; i++)
+                {
+                    fwd[i](engine);
+                    var name = i < (_forwardSteps?.Length ?? 0) ? _forwardSteps![i].OpName : $"#{i}";
+                    probe($"AFTER-FWD-{i}:{name}");
+                }
+            }
+            else
+            {
+                for (int i = 0; i < fwd.Length; i++)
+                    fwd[i](engine);
+            }
         }
+        long t1 = _profileStepEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         if (stepTiming) StepTiming.RecordForward(Stopwatch.GetTimestamp() - fwdStart);
 
         // Cache raw arrays on first call — avoids AsWritableSpan()/GetDataArray() per step
@@ -334,16 +405,64 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         if (seedArr != null && destArr != null)
             Array.Copy(seedArr, destArr, seedArr.Length);
 
+        long t2 = _profileStepEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+
         // Backward: specialized delegates (direct BLAS into pre-allocated buffers)
         long bwdStart = stepTiming ? Stopwatch.GetTimestamp() : 0;
         var bwd = _backwardActions;
-        for (int i = 0; i < bwd.Length; i++)
-            bwd[i](engine);
+        var bwdProbe = StepProbe;
+        if (bwdProbe != null) bwdProbe("BEGIN-BWD");
+        if (_profileStepEnabled)
+        {
+            // Per-delegate timing — accumulates into _profPerStepUs[i] across calls.
+            var perStep = _profPerStepUs;
+            if (perStep == null || perStep.Length != bwd.Length)
+            {
+                perStep = new long[bwd.Length];
+                _profPerStepUs = perStep;
+            }
+            double tickToUsLocal = 1_000_000.0 / System.Diagnostics.Stopwatch.Frequency;
+            for (int i = 0; i < bwd.Length; i++)
+            {
+                long si = System.Diagnostics.Stopwatch.GetTimestamp();
+                bwd[i](engine);
+                long ei = System.Diagnostics.Stopwatch.GetTimestamp();
+                perStep[i] += (long)((ei - si) * tickToUsLocal);
+                if (bwdProbe != null)
+                {
+                    var name = i < (_profBackwardStepNames?.Length ?? 0) ? _profBackwardStepNames![i] : $"#{i}";
+                    bwdProbe($"AFTER-BWD-{i}:{name}");
+                }
+            }
+        }
+        else
+        {
+            for (int i = 0; i < bwd.Length; i++)
+            {
+                bwd[i](engine);
+                if (bwdProbe != null) bwdProbe($"AFTER-BWD-{i}");
+            }
+        }
+        long t3 = _profileStepEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         if (stepTiming) StepTiming.RecordBackward(Stopwatch.GetTimestamp() - bwdStart);
 
+        if (bwdProbe != null) bwdProbe("BEGIN-OPT");
         // Fused optimizer update (if configured via ConfigureOptimizer)
         long optStart = stepTiming ? Stopwatch.GetTimestamp() : 0;
         _optimizerUpdate?.Invoke();
+        if (bwdProbe != null) bwdProbe("END-OPT");
+        long t4 = _profileStepEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+
+        if (_profileStepEnabled)
+        {
+            // Stopwatch.Frequency is ticks/sec; we want microseconds
+            double tickToUs = 1_000_000.0 / System.Diagnostics.Stopwatch.Frequency;
+            System.Threading.Interlocked.Add(ref _profForwardUs,  (long)((t1 - t0) * tickToUs));
+            System.Threading.Interlocked.Add(ref _profGradZeroUs, (long)((t2 - t1) * tickToUs));
+            System.Threading.Interlocked.Add(ref _profBackwardUs, (long)((t3 - t2) * tickToUs));
+            System.Threading.Interlocked.Add(ref _profOptimUs,    (long)((t4 - t3) * tickToUs));
+            System.Threading.Interlocked.Increment(ref _profStepCount);
+        }
         if (stepTiming)
         {
             StepTiming.RecordOptimizer(Stopwatch.GetTimestamp() - optStart);
@@ -934,6 +1053,27 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     typed.GetInputsArray(),
                     typed.BackwardFn,
                     typed.SavedState));
+                // CRITICAL (issue #350 root cause): clear LazySource on every
+                // forward-step output BEFORE the plan starts executing. Each
+                // call to plan.Step() runs the lazy execute via the
+                // pre-compiled forward delegate, writing the correct output
+                // to typed.Output's buffer. But the LazyNode's own
+                // RecordingEngine field captured AiDotNetEngine.Current at
+                // record time — typically DirectGpuTensorEngine on
+                // auto-detect-GPU systems. Without clearing LazySource here,
+                // any subsequent caller-side read via tensor.GetFlat / [i] /
+                // .AsSpan() triggers TensorBase.EnsureMaterialized →
+                // node.Realize(node.RecordingEngine) → re-runs Execute on
+                // the GPU engine, OVERWRITING the correct double values the
+                // plan wrote with float-precision-rounded values from the
+                // GPU's TensorXxxInto kernels (consumer GPUs throttle double
+                // precision, so the kernels do float math under the hood).
+                // The plan's own forward loop runs Execute via its captured
+                // engine reference (correctly bound by BindEngineIfUnset),
+                // so clearing LazySource doesn't lose anything — the plan
+                // owns the materialization lifecycle from this point on.
+                typed.IsRealized = true;
+                typed.Output.LazySource = null;
             }
         }
 
@@ -1138,6 +1278,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
         // Build backward actions: specialized per-step + fused backward for fused groups
         var backwardActions = new List<Action<IEngine>>();
+        var backwardStepNames = new List<string>();
         int genericBackwardCount = 0;
         for (int i = forwardSteps.Count - 1; i >= 0; i--)
         {
@@ -1183,10 +1324,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var action = BuildSpecializedBackward(step, gradMap, consumerCount, engine, pinnedHandles,
                 dWPeeled: dWPeeledIndices.Contains(i));
             if (action != null)
+            {
                 backwardActions.Add(action);
+                backwardStepNames.Add($"specialized:{step.OpName}");
+            }
             else
             {
                 genericBackwardCount++;
+                backwardStepNames.Add($"generic:{step.OpName}");
                 var stepCopy = step;
                 var gradAcc = gradMap;
                 backwardActions.Add(eng =>
@@ -1202,7 +1347,15 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // Append fused backward actions in reverse order — TryFuseForwardBackward records
         // them in forward order, but autodiff requires backward (reverse) order.
         for (int i = fusedBackwardActions.Count - 1; i >= 0; i--)
+        {
             backwardActions.Add(fusedBackwardActions[i]);
+            backwardStepNames.Add($"fused-backward-{i}");
+        }
+        // Name publication is deferred until AFTER BackwardPruningPass
+        // runs (line below) — Prune is a no-op today, but it's allowed
+        // to shrink the actions list, and publishing here would leave
+        // names indexed against the un-pruned position while Step()
+        // walks the pruned array.
 
         // Phase G.12: append batched dW actions. Group peeled dW specs
         // by (M, N, K) shape; each shape group with size ≥ 2 emits one
@@ -1244,6 +1397,24 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // Phase 6.3: Backward pruning — skip gradient computation for non-trainable tensors
         var paramSet = new HashSet<Tensor<T>>(parameters);
         backwardActions = BackwardPruningPass.Prune(backwardActions, forwardSteps, parameters, gradMap);
+
+        // Publish names AFTER pruning so they index 1:1 with the actually-
+        // replayed delegate array. Defensive count check: if Prune ever
+        // starts removing entries, fall back to numeric labels rather
+        // than serving stale labels that point at the wrong delegates.
+        if (_profileStepEnabled)
+        {
+            if (backwardActions.Count == backwardStepNames.Count)
+            {
+                _profBackwardStepNames = backwardStepNames.ToArray();
+            }
+            else
+            {
+                var fallback = new string[backwardActions.Count];
+                for (int i = 0; i < fallback.Length; i++) fallback[i] = $"#{i}";
+                _profBackwardStepNames = fallback;
+            }
+        }
 
         // If all backward steps are specialized (overwrite), we can skip gradient zeroing entirely
         int[]? genericGradIndices = genericBackwardCount == 0 ? new int[0] : null;
@@ -2061,8 +2232,44 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
         // BatchNorm inference: direct SIMD kernel (bypasses all allocation)
         // Lazy node records: Inputs = [input, gamma, beta], SavedState = [mean, variance, epsilon]
+        //
+        // The FusedKernels.BatchNormInferenceUnsafe kernel assumes the layout
+        // [channels, spatial] — that is, all elements of channel `c` are
+        // contiguous at offset `c * spatialSize`, where `spatialSize = length
+        // / channels`. That assumption holds for:
+        //   • Rank-3 [C, H, W] inputs (channel c's data is contiguous at
+        //     c*H*W, by row-major flatten)
+        //   • Rank-4 [1, C, H, W] inputs with N=1 (degenerates to rank-3 case
+        //     once the leading singleton is collapsed)
+        //
+        // It DOES NOT hold for:
+        //   • Rank-2 [batch, features] inputs — features are the FAST axis;
+        //     element [b, f] sits at flat index b*F + f, so channel f's data
+        //     is interleaved at stride F, not contiguous at offset f * batch.
+        //     Applying this kernel to 2D input picks up neighbour channels'
+        //     mean/var per batch row, which gives off-diagonal corruption
+        //     (the off-diagonal-only divergence pattern that surfaced in
+        //     ooples/AiDotNet branch fix/pr-1290-cluster-4-5 — testconsole
+        //     `BnFusedGradDiff` isolated the failure to a 4-feature, batch-4
+        //     case where every off-diagonal element diverged from eager but
+        //     diagonal elements [b, b] matched coincidentally because
+        //     channel b's mean happens to apply to element [b, b]).
+        //   • Rank-4 [N>1, C, H, W] inputs — for N>1, channel c's elements
+        //     are interleaved across batches, not laid out as [c*N*H*W ..
+        //     (c+1)*N*H*W).
+        //
+        // Restrict the specialization to ranks where the channels-first
+        // layout assumption is actually true. Other ranks fall through to
+        // the generic execute delegate (which calls back into the engine's
+        // correct rank-aware BN forward).
+        bool layoutIsChannelsFirstContiguous =
+            step.Inputs.Length > 0 &&
+            (step.Inputs[0]._shape.Length == 3
+             || (step.Inputs[0]._shape.Length == 4 && step.Inputs[0]._shape[0] == 1));
+
         if (step.OpType == OpType.BatchNorm && typeof(T) == typeof(float)
             && step.Inputs.Length >= 3 && step.Inputs[0].IsContiguous
+            && layoutIsChannelsFirstContiguous
             && step.SavedState is { Length: >= 2 }
             && step.SavedState[0] is Tensor<T> meanTensor
             && step.SavedState[1] is Tensor<T> varTensor)
@@ -3161,6 +3368,209 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
                 inputA.Grad = gradA;
                 inputB.Grad = gradB;
+            };
+        }
+
+        // Conv2D backward: writes gradInput + gradKernel directly into the
+        // pre-allocated gradient buffers via Conv2DBackwardInputInto /
+        // Conv2DBackwardKernelInto — skips the 2 fresh tensor allocations +
+        // 2 chained AccumulateGrad calls that BackwardFunctions.Conv2DBackward
+        // pays per call. On a 19-Conv-layer net like GraFPrint this saves
+        // ~10 ms per Conv backward (allocator pressure + dispatch overhead).
+        // Tier 1.2 of the compile-mode backward perf overhaul (plan in
+        // ~/.claude/plans/misty-wandering-moth.md).
+        if (step.OpType == OpType.Conv2D && step.Inputs.Length == 2
+            && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous)
+        {
+            var input = step.Inputs[0];
+            var kernel = step.Inputs[1];
+            var output = step.OutputBuffer;
+            if (!gradMap.ContainsKey(output) || !gradMap.ContainsKey(input) || !gradMap.ContainsKey(kernel))
+                return null;
+            // Saved state shape mirrors what BackwardFunctions.Conv2DBackward
+            // expects: [stride: int[], padding: int[], dilation: int[]].
+            // Some call paths extend savedState past index 2; same as the
+            // Conv2D forward specialization we tolerate that.
+            var savedState = step.SavedState;
+            if (savedState == null || savedState.Length < 3
+                || savedState[0] is not int[] stride
+                || savedState[1] is not int[] padding
+                || savedState[2] is not int[] dilation)
+                return null;
+            var gradOut = gradMap[output];
+            var gradInput = gradMap[input];
+            var gradKernel = gradMap[kernel];
+            bool accumInput = consumerCount.ContainsKey(input) && consumerCount[input] > 1;
+            bool accumKernel = consumerCount.ContainsKey(kernel) && consumerCount[kernel] > 1;
+            // Capture shapes so the closure doesn't walk Tensor.Shape every
+            // Step (microoptimization but matters at 19+ Conv calls per iter).
+            var inShape = (int[])input._shape.Clone();
+            var kShape = (int[])kernel._shape.Clone();
+            var capStride = stride;
+            var capPadding = padding;
+            var capDilation = dilation;
+            return eng =>
+            {
+                if (eng is CpuEngine cpu)
+                {
+                    cpu.Conv2DBackwardInputInto(gradInput, gradOut, kernel, inShape,
+                        capStride, capPadding, capDilation, accumInput);
+                    cpu.Conv2DBackwardKernelInto(gradKernel, gradOut, input, kShape,
+                        capStride, capPadding, capDilation, accumKernel);
+                }
+                else
+                {
+                    // Non-CpuEngine fallback — match the eager path semantics.
+                    var gi = eng.Conv2DBackwardInput(gradOut, kernel, inShape, capStride, capPadding, capDilation);
+                    if (accumInput) eng.TensorAddInto(gradInput, gradInput, gi);
+                    else gi.AsSpan().CopyTo(gradInput.AsWritableSpan());
+                    var gk = eng.Conv2DBackwardKernel(gradOut, input, kShape, capStride, capPadding, capDilation);
+                    if (accumKernel) eng.TensorAddInto(gradKernel, gradKernel, gk);
+                    else gk.AsSpan().CopyTo(gradKernel.AsWritableSpan());
+                }
+                input.Grad = gradInput;
+                kernel.Grad = gradKernel;
+            };
+        }
+
+        // BatchNorm backward: writes gradInput / gradGamma / gradBeta directly
+        // into pre-allocated buffers via BatchNormBackwardInto — skips the 3
+        // fresh tensor allocations + 3 chained AccumulateGrad calls that
+        // BackwardFunctions.BatchNormBackward pays per layer.
+        // GraFPrint has 18 BatchNorm layers; this saves ~3-5 ms per layer
+        // (allocator pressure + AccumulateGrad orchestration).
+        // Tier 1.4 of the compile-mode backward perf overhaul.
+        if (step.OpType == OpType.BatchNorm && step.Inputs.Length >= 3
+            && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous && step.Inputs[2].IsContiguous)
+        {
+            var input = step.Inputs[0];
+            var gammaT = step.Inputs[1];
+            var betaT = step.Inputs[2];
+            var output = step.OutputBuffer;
+            if (!gradMap.ContainsKey(output)
+                || !gradMap.ContainsKey(input)
+                || !gradMap.ContainsKey(gammaT)
+                || !gradMap.ContainsKey(betaT)) return null;
+            var savedState = step.SavedState;
+            // Saved state from BatchNorm GraphMode recording (CpuEngine.cs:17723):
+            // new object[] { mean, variance, epsilon }
+            if (savedState == null || savedState.Length < 3
+                || savedState[0] is not Tensor<T> meanT
+                || savedState[1] is not Tensor<T> varianceT
+                || savedState[2] is not double epsilonD)
+                return null;
+            var gradOut = gradMap[output];
+            var gradInput = gradMap[input];
+            var gradGamma = gradMap[gammaT];
+            var gradBeta = gradMap[betaT];
+            bool accumInput = consumerCount.ContainsKey(input) && consumerCount[input] > 1;
+            bool accumGamma = consumerCount.ContainsKey(gammaT) && consumerCount[gammaT] > 1;
+            bool accumBeta = consumerCount.ContainsKey(betaT) && consumerCount[betaT] > 1;
+            return eng =>
+            {
+                if (eng is CpuEngine cpu)
+                {
+                    cpu.BatchNormBackwardInto(gradInput, gradGamma, gradBeta,
+                        gradOut, input, gammaT, meanT, varianceT, epsilonD,
+                        accumInput, accumGamma, accumBeta);
+                }
+                else
+                {
+                    var gi = eng.BatchNormBackward(gradOut, input, gammaT, meanT, varianceT, epsilonD,
+                        out var gg, out var gb);
+                    if (accumInput) eng.TensorAddInto(gradInput, gradInput, gi);
+                    else gi.AsSpan().CopyTo(gradInput.AsWritableSpan());
+                    if (accumGamma) eng.TensorAddInto(gradGamma, gradGamma, gg);
+                    else gg.AsSpan().CopyTo(gradGamma.AsWritableSpan());
+                    if (accumBeta) eng.TensorAddInto(gradBeta, gradBeta, gb);
+                    else gb.AsSpan().CopyTo(gradBeta.AsWritableSpan());
+                }
+                input.Grad = gradInput;
+                gammaT.Grad = gradGamma;
+                betaT.Grad = gradBeta;
+            };
+        }
+
+        // Dropout backward: gradInput = mask * gradOutput * (1 / (1 - p))
+        // (the eager engine.DropoutBackward already applies the inverse-keep
+        // scale; we just write its result into the pre-allocated buffer).
+        // Tier 1.5 — saves the temp-tensor allocation + 1x AccumulateGrad
+        // per Dropout layer (7 in GraFPrint). Gated on OpName because
+        // Dropout doesn't have a dedicated OpType discriminant — it parses
+        // to OpType.Unknown via OpTypeParser.cs:158.
+        if (step.OpName == "Dropout" && step.Inputs.Length == 1)
+        {
+            var input = step.Inputs[0];
+            var output = step.OutputBuffer;
+            if (!gradMap.ContainsKey(output) || !gradMap.ContainsKey(input)) return null;
+            var savedState = step.SavedState;
+            // CpuEngine.Dropout savedState: { mask, dropoutRate }
+            if (savedState == null || savedState.Length < 2
+                || savedState[0] is not Tensor<T> dropMask
+                || savedState[1] is not double dropRate)
+                return null;
+            var gradOut = gradMap[output];
+            var gradIn = gradMap[input];
+            bool accum = consumerCount.ContainsKey(input) && consumerCount[input] > 1;
+            return eng =>
+            {
+                var grad = eng.DropoutBackward(gradOut, dropMask, dropRate);
+                if (accum) eng.TensorAddInto(gradIn, gradIn, grad);
+                else grad.AsSpan().CopyTo(gradIn.AsWritableSpan());
+                input.Grad = gradIn;
+            };
+        }
+
+        // MaxPool2D backward: scatter gradOutput into gradInput at saved
+        // max-index positions. Tier 1.5 — saves the alloc + AccumulateGrad
+        // per MaxPool layer.
+        if (step.OpType == OpType.MaxPool2D && step.Inputs.Length == 1)
+        {
+            var input = step.Inputs[0];
+            var output = step.OutputBuffer;
+            if (!gradMap.ContainsKey(output) || !gradMap.ContainsKey(input)) return null;
+            var savedState = step.SavedState;
+            // CpuEngine.MaxPool2D savedState: { maxIndices (int[,,,,]), poolSize (int[]), stride (int[]) }
+            if (savedState == null || savedState.Length < 3
+                || savedState[0] is not int[,,,,] maxIndices
+                || savedState[1] is not int[] poolSize
+                || savedState[2] is not int[] poolStride)
+                return null;
+            var gradOut = gradMap[output];
+            var gradIn = gradMap[input];
+            bool accum = consumerCount.ContainsKey(input) && consumerCount[input] > 1;
+            var capInShape = (int[])input._shape.Clone();
+            return eng =>
+            {
+                var grad = eng.MaxPool2DBackward(gradOut, maxIndices, capInShape, poolSize, poolStride);
+                if (accum) eng.TensorAddInto(gradIn, gradIn, grad);
+                else grad.AsSpan().CopyTo(gradIn.AsWritableSpan());
+                input.Grad = gradIn;
+            };
+        }
+
+        // AvgPool2D backward: distribute gradOutput / (poolH*poolW) across
+        // input positions. Tier 1.5.
+        if (step.OpType == OpType.AvgPool2D && step.Inputs.Length == 1)
+        {
+            var input = step.Inputs[0];
+            var output = step.OutputBuffer;
+            if (!gradMap.ContainsKey(output) || !gradMap.ContainsKey(input)) return null;
+            var savedState = step.SavedState;
+            if (savedState == null || savedState.Length < 2
+                || savedState[0] is not int[] poolSize
+                || savedState[1] is not int[] poolStride)
+                return null;
+            var gradOut = gradMap[output];
+            var gradIn = gradMap[input];
+            bool accum = consumerCount.ContainsKey(input) && consumerCount[input] > 1;
+            var capInShape = (int[])input._shape.Clone();
+            return eng =>
+            {
+                var grad = eng.AvgPool2DBackward(gradOut, capInShape, poolSize, poolStride);
+                if (accum) eng.TensorAddInto(gradIn, gradIn, grad);
+                else grad.AsSpan().CopyTo(gradIn.AsWritableSpan());
+                input.Grad = gradIn;
             };
         }
 

@@ -17,14 +17,42 @@ internal sealed class LazyTensorScope : IDisposable
 {
     private readonly LazyTensorScope? _parent;
     private readonly List<ILazyNode> _nodes = new();
-    private readonly IEngine _engine;
+    private IEngine _engine;
+    private bool _engineExplicitlyBound;
     private bool _disposed;
     private bool _realized;
 
     internal LazyTensorScope(LazyTensorScope? parent)
     {
         _parent = parent;
+        // Default to AiDotNetEngine.Current; the first op recorded into the
+        // scope will rebind via BindEngineIfUnset to the engine instance the
+        // user actually invoked the op on. This matters because the global
+        // ambient engine on auto-detect-GPU systems is DirectGpuTensorEngine,
+        // but a test or production code that explicitly creates a new
+        // CpuEngine() and calls operations on it expects the compiled plan to
+        // replay on CPU — not on the (potentially mismatched) ambient engine.
+        // See issue #350: T=double rank-3 BatchNorm compile-replay diverged
+        // on hosts where the auto-detected GPU engine doesn't have a faithful
+        // CPU-tensor BatchNorm path.
         _engine = AiDotNetEngine.Current;
+        _engineExplicitlyBound = false;
+    }
+
+    /// <summary>
+    /// Binds this scope to <paramref name="engine"/> if no engine has yet
+    /// been explicitly bound. Called by each engine's GraphMode-recording
+    /// branch (e.g. <see cref="CpuEngine.BatchNorm{T}"/>) so the compiled
+    /// plan replays on the engine the user actually invoked the op on,
+    /// not on the global ambient engine. Idempotent — subsequent calls with
+    /// any engine are no-ops once the first binding lands.
+    /// </summary>
+    internal void BindEngineIfUnset(IEngine engine)
+    {
+        if (_engineExplicitlyBound) return;
+        if (engine is null) return;
+        _engine = engine;
+        _engineExplicitlyBound = true;
     }
 
     /// <summary>Number of lazy operations recorded.</summary>
