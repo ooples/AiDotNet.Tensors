@@ -272,7 +272,17 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// (<c>NeuralNetworkBase.TrainWithTape</c>) applies the same clip
     /// independently — both paths agree when given the same threshold.
     /// </remarks>
-    public void SetMaxGradNorm(double maxNorm) => _maxGradNorm = maxNorm;
+    public void SetMaxGradNorm(double maxNorm)
+    {
+        if (double.IsNaN(maxNorm) || double.IsInfinity(maxNorm) || maxNorm < 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(maxNorm),
+                maxNorm,
+                "Gradient norm threshold must be finite and non-negative.");
+        }
+        _maxGradNorm = maxNorm;
+    }
 
     // Gradient checkpointing (Phase 5.3)
     private GradientCheckpointing<T>? _checkpointing;
