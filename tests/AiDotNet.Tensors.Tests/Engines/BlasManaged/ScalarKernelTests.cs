@@ -466,4 +466,89 @@ public class ScalarKernelTests
             }
         }
     }
+
+    // ── B5 helpers ────────────────────────────────────────────────────────────
+
+    private static (double[] a, double[] b) GenerateRandomMatrices(int m, int n, int k, bool transA, bool transB, int seed)
+    {
+        var rng = new Random(seed);
+        // a holds either [M, K] (transA=false, length m*k) or [K, M] (transA=true, length k*m).
+        int aLen = m * k;  // same length either way
+        var a = new double[aLen];
+        for (int i = 0; i < aLen; i++) a[i] = rng.NextDouble() * 2 - 1;  // [-1, 1)
+        // b holds either [K, N] (transB=false) or [N, K] (transB=true).
+        int bLen = k * n;
+        var b = new double[bLen];
+        for (int i = 0; i < bLen; i++) b[i] = rng.NextDouble() * 2 - 1;
+        return (a, b);
+    }
+
+    private static double[] NaiveGemm(
+        double[] a, int aRows, int aCols, bool transA,
+        double[] b, int bRows, int bCols, bool transB)
+    {
+        // Logical shapes: op(A) is m×k, op(B) is k×n; result is m×n.
+        // When transA=true: aRows is K, aCols is M (logical M = aCols, K = aRows).
+        // When transA=false: aRows is M, aCols is K.
+        int m = transA ? aCols : aRows;
+        int kA = transA ? aRows : aCols;
+        int kB = transB ? bCols : bRows;
+        int n = transB ? bRows : bCols;
+        if (kA != kB) throw new ArgumentException($"Inner dim mismatch: A K={kA}, B K={kB}");
+        int k = kA;
+
+        var c = new double[m * n];
+        for (int i = 0; i < m; i++)
+        {
+            for (int j = 0; j < n; j++)
+            {
+                double sum = 0;
+                for (int kk = 0; kk < k; kk++)
+                {
+                    double aval = transA ? a[kk * aCols + i] : a[i * aCols + kk];
+                    double bval = transB ? b[j * bCols + kk] : b[kk * bCols + j];
+                    sum += aval * bval;
+                }
+                c[i * n + j] = sum;
+            }
+        }
+        return c;
+    }
+
+    [Theory]
+    [InlineData(8, 8, 8, false, false)]    // square, no trans
+    [InlineData(8, 8, 8, true, false)]     // transA
+    [InlineData(8, 8, 8, false, true)]     // transB
+    [InlineData(8, 8, 8, true, true)]      // both
+    [InlineData(16, 4, 8, false, false)]   // rectangular, multi-iter on M
+    [InlineData(4, 16, 8, false, false)]   // rectangular, multi-iter on N
+    public void PackBoth_MatchesNaiveReference(int m, int n, int k, bool transA, bool transB)
+    {
+        // For transA=false: a stored [m, k] with lda=k.
+        // For transA=true:  a stored [k, m] with lda=m.
+        int aRows = transA ? k : m;
+        int aCols = transA ? m : k;
+        int lda = aCols;
+        // For transB=false: b stored [k, n] with ldb=n.
+        // For transB=true:  b stored [n, k] with ldb=k.
+        int bRows = transB ? n : k;
+        int bCols = transB ? k : n;
+        int ldb = bCols;
+
+        var (a, b) = GenerateRandomMatrices(m, n, k, transA, transB, seed: 42);
+        double[] expected = NaiveGemm(a, aRows, aCols, transA, b, bRows, bCols, transB);
+
+        double[] actual = new double[m * n];
+
+        PackBothStrategy.Run<double>(
+            a, lda, transA,
+            b, ldb, transB,
+            actual, ldc: n,
+            m, n, k,
+            mc: 8, nc: 8, kc: 8,
+            mr: 4, nr: 4);
+
+        for (int i = 0; i < expected.Length; i++)
+            Assert.Equal(expected[i], actual[i], precision: 10);
+    }
 }
