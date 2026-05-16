@@ -571,6 +571,68 @@ public class ScalarKernelTests
             Assert.Equal(cRef[i], cAvx[i], precision: 12);
     }
 
+    [Fact]
+    public void Avx2Fp32_8x8_MatchesScalarReference()
+    {
+        if (!Avx2Fp32_8x8.IsSupported)
+            return;
+
+        int kc = 16;
+        int Mr = 8, Nr = 8;
+
+        float[] packedA = new float[Mr * kc];
+        float[] packedB = new float[kc * Nr];
+        var rng = new Random(42);
+        for (int i = 0; i < packedA.Length; i++) packedA[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < packedB.Length; i++) packedB[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        // Reference: 4 calls to ScalarFp32_4x4 covering the 8×8 output.
+        // ScalarFp32_4x4 has Mr=4, Nr=4. To cover 8×8 = 4 quadrants:
+        //   (rows 0..3, cols 0..3), (rows 0..3, cols 4..7),
+        //   (rows 4..7, cols 0..3), (rows 4..7, cols 4..7).
+        //
+        // The packed-A for the 8x8 kernel is [Kc × Mr=8]; the scalar kernel
+        // expects [Kc × Mr=4]. We need to slice packedA into rows 0..3 and rows 4..7
+        // per k-step.
+        float[] packedA_top = new float[kc * 4];      // rows 0..3
+        float[] packedA_bottom = new float[kc * 4];   // rows 4..7
+        float[] packedB_left = new float[kc * 4];     // cols 0..3
+        float[] packedB_right = new float[kc * 4];    // cols 4..7
+        for (int k = 0; k < kc; k++)
+        {
+            for (int r = 0; r < 4; r++)
+            {
+                packedA_top[k * 4 + r] = packedA[k * 8 + r];
+                packedA_bottom[k * 4 + r] = packedA[k * 8 + 4 + r];
+            }
+            for (int col = 0; col < 4; col++)
+            {
+                packedB_left[k * 4 + col] = packedB[k * 8 + col];
+                packedB_right[k * 4 + col] = packedB[k * 8 + 4 + col];
+            }
+        }
+
+        float[] cRef = new float[8 * 8];  // ldc = 8
+        int ldc = 8;
+        // (rows 0..3, cols 0..3)
+        ScalarFp32_4x4.Run(packedA_top, packedB_left, cRef.AsSpan(), ldc, kc);
+        // (rows 0..3, cols 4..7) — offset C by 4
+        ScalarFp32_4x4.Run(packedA_top, packedB_right, cRef.AsSpan(4), ldc, kc);
+        // (rows 4..7, cols 0..3) — offset C by 4*ldc
+        ScalarFp32_4x4.Run(packedA_bottom, packedB_left, cRef.AsSpan(4 * ldc), ldc, kc);
+        // (rows 4..7, cols 4..7) — offset C by 4*ldc + 4
+        ScalarFp32_4x4.Run(packedA_bottom, packedB_right, cRef.AsSpan(4 * ldc + 4), ldc, kc);
+
+        // AVX2 single call with full packed-A [Kc × 8] and packed-B [Kc × 8].
+        float[] cAvx = new float[8 * 8];
+        Avx2Fp32_8x8.Run(packedA, packedB, cAvx.AsSpan(), ldc, kc);
+
+        // FP32 precision: 16 K-step accumulations of [-1,1) values, ~16 * eps_f = 1.9e-6.
+        // precision: 4 is safe (loose enough to accommodate FMA reordering).
+        for (int i = 0; i < cRef.Length; i++)
+            Assert.Equal(cRef[i], cAvx[i], precision: 4);
+    }
+
     // ── B5 helpers ────────────────────────────────────────────────────────────
 
     private static (double[] a, double[] b) GenerateRandomMatrices(int m, int n, int k, bool transA, bool transB, int seed)
