@@ -28,4 +28,31 @@ public class ScalarKernelTests
         }
         Assert.True(threw, "Expected NotImplementedException from BlasManaged.Gemm stub.");
     }
+
+    [Fact]
+    public void PackingMode_HasFiveValues()
+    {
+        var values = Enum.GetValues(typeof(PackingMode));
+        Assert.Equal(5, values.Length);
+        Assert.True(Enum.IsDefined(typeof(PackingMode), PackingMode.Auto));
+        Assert.True(Enum.IsDefined(typeof(PackingMode), PackingMode.ForcePackBoth));
+        Assert.True(Enum.IsDefined(typeof(PackingMode), PackingMode.ForcePackAOnly));
+        Assert.True(Enum.IsDefined(typeof(PackingMode), PackingMode.ForceStreaming));
+        Assert.True(Enum.IsDefined(typeof(PackingMode), PackingMode.DisableAutotune));
+    }
+
+    [Fact]
+    public void ActivationType_HasEightValues()
+    {
+        var values = Enum.GetValues(typeof(ActivationType));
+        Assert.Equal(8, values.Length);
+        Assert.True(Enum.IsDefined(typeof(ActivationType), ActivationType.None));
+        Assert.True(Enum.IsDefined(typeof(ActivationType), ActivationType.ReLU));
+        Assert.True(Enum.IsDefined(typeof(ActivationType), ActivationType.GELU));
+        Assert.True(Enum.IsDefined(typeof(ActivationType), ActivationType.Sigmoid));
+        Assert.True(Enum.IsDefined(typeof(ActivationType), ActivationType.Tanh));
+        Assert.True(Enum.IsDefined(typeof(ActivationType), ActivationType.Swish));
+        Assert.True(Enum.IsDefined(typeof(ActivationType), ActivationType.Mish));
+        Assert.True(Enum.IsDefined(typeof(ActivationType), ActivationType.LeakyReLU));
+    }
 }
