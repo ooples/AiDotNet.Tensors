@@ -1121,28 +1121,59 @@ internal static class Im2ColHelper
         int hw   = inputHeight * inputWidth;          // GEMM N
         int outSliceSize = outChannels * outputHeight * outputWidth;
         int inSliceSize  = inChannels * inputHeight * inputWidth;
+        int kernelSize   = inChannels * kmkn;
+
+        // See the double overload below for the heuristic derivation. The cutoff is
+        // the same — float-precision GEMM has the same large-kernel + tiny-N pathology
+        // in MKL/OpenBLAS' transA=true codepath.
+        bool useTranspose = kernelSize <= 524288 && hw >= 32 && hw <= 256;
 
         var pool = ArrayPool<float>.Shared;
         float[] tempBuffer = pool.Rent(kmkn * hw);
+        float[]? kernelT = useTranspose ? pool.Rent(kernelSize) : null;
         try
         {
+            if (useTranspose && kernelT != null)
+            {
+                for (int ci = 0; ci < inChannels; ci++)
+                {
+                    int srcOff = ci * kmkn;
+                    for (int j = 0; j < kmkn; j++)
+                        kernelT[j * inChannels + ci] = kernel[srcOff + j];
+                }
+            }
+
             for (int b = 0; b < batch; b++)
             {
                 int inputOffset  = b * inSliceSize;
                 int outputOffset = b * outSliceSize;
 
-                // GEMM with transA=true: kernel stored as [C_in, C_out*kH*kW] (lda = C_out*kH*kW).
-                // transA gives logical A^T of shape [C_out*kH*kW, C_in], multiplied by
-                // B of shape [C_in, H_in*W_in] → C of shape [C_out*kH*kW, H_in*W_in].
-                bool usedBlas = BlasProvider.TryGemmEx(
-                    m: kmkn, n: hw, k: inChannels,
-                    a: kernel, aOffset: 0, lda: kmkn, transA: true,
-                    b: input, bOffset: inputOffset, ldb: hw, transB: false,
-                    c: tempBuffer, cOffset: 0, ldc: hw);
+                bool usedBlas;
+                if (useTranspose && kernelT != null)
+                {
+                    // kernelT laid out as [C_out*kH*kW, C_in] row-major (lda = C_in).
+                    usedBlas = BlasProvider.TryGemmEx(
+                        m: kmkn, n: hw, k: inChannels,
+                        a: kernelT, aOffset: 0, lda: inChannels, transA: false,
+                        b: input, bOffset: inputOffset, ldb: hw, transB: false,
+                        c: tempBuffer, cOffset: 0, ldc: hw);
+                }
+                else
+                {
+                    // GEMM with transA=true: kernel stored as [C_in, C_out*kH*kW] (lda = C_out*kH*kW).
+                    // transA gives logical A^T of shape [C_out*kH*kW, C_in], multiplied by
+                    // B of shape [C_in, H_in*W_in] → C of shape [C_out*kH*kW, H_in*W_in].
+                    usedBlas = BlasProvider.TryGemmEx(
+                        m: kmkn, n: hw, k: inChannels,
+                        a: kernel, aOffset: 0, lda: kmkn, transA: true,
+                        b: input, bOffset: inputOffset, ldb: hw, transB: false,
+                        c: tempBuffer, cOffset: 0, ldc: hw);
+                }
 
                 if (!usedBlas)
                 {
                     pool.Return(tempBuffer);
+                    if (kernelT != null) pool.Return(kernelT);
                     return false;
                 }
 
@@ -1171,6 +1202,7 @@ internal static class Im2ColHelper
         finally
         {
             pool.Return(tempBuffer);
+            if (kernelT != null) pool.Return(kernelT);
         }
     }
 
@@ -1200,25 +1232,66 @@ internal static class Im2ColHelper
         int hw   = inputHeight * inputWidth;
         int outSliceSize = outChannels * outputHeight * outputWidth;
         int inSliceSize  = inChannels * inputHeight * inputWidth;
+        int kernelSize   = inChannels * kmkn;
+
+        // Heuristic: pre-transpose the kernel into [kmkn, inChannels] layout and dispatch
+        // a non-transposed GEMM when it's empirically faster than transA=true. The win
+        // depends on three things:
+        //   (1) kernel size — the transpose itself reads+writes kernelSize doubles, so
+        //       when the kernel is large (>4MB) the transpose cost can exceed the GEMM
+        //       speedup. Measured on M=4096 N=16 K=512 (16MB kernel): transA=true is
+        //       215ms vs transposed=368ms — the transpose loses.
+        //   (2) N (spatial inH*inW) — when N is very small (≤16) MKL's transA path
+        //       hits its fast small-N codepath that the explicit transpose can't beat.
+        //   (3) N moderately small (~32-256) with smaller kernels — here MKL's transA
+        //       path picks the slow generic kernel and the explicit transpose wins big.
+        //       Measured on M=2048 N=64 K=256 (4MB kernel): transA=60ms vs transposed=25ms.
+        // The empirical cutoff that matches DCGAN's deconv stack: enable transpose when
+        // kernel ≤ 4MB AND N is in the "moderate" range (32-256).
+        bool useTranspose = kernelSize <= 524288 && hw >= 32 && hw <= 256;
 
         var pool = ArrayPool<double>.Shared;
         double[] tempBuffer = pool.Rent(kmkn * hw);
+        double[]? kernelT = useTranspose ? pool.Rent(kernelSize) : null;
         try
         {
+            if (useTranspose && kernelT != null)
+            {
+                for (int ci = 0; ci < inChannels; ci++)
+                {
+                    int srcOff = ci * kmkn;
+                    for (int j = 0; j < kmkn; j++)
+                        kernelT[j * inChannels + ci] = kernel[srcOff + j];
+                }
+            }
+
             for (int b = 0; b < batch; b++)
             {
                 int inputOffset  = b * inSliceSize;
                 int outputOffset = b * outSliceSize;
 
-                bool usedBlas = BlasProvider.TryGemmEx(
-                    m: kmkn, n: hw, k: inChannels,
-                    a: kernel, aOffset: 0, lda: kmkn, transA: true,
-                    b: input, bOffset: inputOffset, ldb: hw, transB: false,
-                    c: tempBuffer, cOffset: 0, ldc: hw);
+                bool usedBlas;
+                if (useTranspose && kernelT != null)
+                {
+                    usedBlas = BlasProvider.TryGemmEx(
+                        m: kmkn, n: hw, k: inChannels,
+                        a: kernelT, aOffset: 0, lda: inChannels, transA: false,
+                        b: input, bOffset: inputOffset, ldb: hw, transB: false,
+                        c: tempBuffer, cOffset: 0, ldc: hw);
+                }
+                else
+                {
+                    usedBlas = BlasProvider.TryGemmEx(
+                        m: kmkn, n: hw, k: inChannels,
+                        a: kernel, aOffset: 0, lda: kmkn, transA: true,
+                        b: input, bOffset: inputOffset, ldb: hw, transB: false,
+                        c: tempBuffer, cOffset: 0, ldc: hw);
+                }
 
                 if (!usedBlas)
                 {
                     pool.Return(tempBuffer);
+                    if (kernelT != null) pool.Return(kernelT);
                     return false;
                 }
 
@@ -1241,6 +1314,7 @@ internal static class Im2ColHelper
         finally
         {
             pool.Return(tempBuffer);
+            if (kernelT != null) pool.Return(kernelT);
         }
     }
 

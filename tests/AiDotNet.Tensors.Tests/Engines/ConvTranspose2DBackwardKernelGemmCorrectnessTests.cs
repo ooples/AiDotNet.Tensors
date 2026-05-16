@@ -107,7 +107,11 @@ public class ConvTranspose2DBackwardKernelGemmCorrectnessTests
             gradOutT, inputT, kernelShape,
             new[] { stride, stride }, new[] { padding, padding });
 
-        Assert.Equal(kernelShape, actualT.Shape);
+        // .ToArray() needed for net471 — TensorShape implicitly converts to
+        // ReadOnlySpan<int> on .NET 6+ which Assert.Equal accepts via the
+        // IEnumerable<int> overload, but net471's xUnit/MS-Test surface
+        // doesn't have that path.
+        Assert.Equal(kernelShape, actualT.Shape.ToArray());
 
         var actualSpan = actualT.Data.Span;
         double maxDiff = 0;
