@@ -579,6 +579,36 @@ public class ScalarKernelTests
     }
 
     [Theory]
+    [InlineData(8, 8, 8, false)]     // square, no transA
+    [InlineData(8, 8, 8, true)]      // transA
+    [InlineData(16, 4, 8, false)]    // multi-iter M
+    [InlineData(4, 16, 8, false)]    // multi-iter N (uses jc loop)
+    [InlineData(8, 8, 16, false)]    // larger K
+    public void PackAOnly_MatchesNaiveReference_FP64(int m, int n, int k, bool transA)
+    {
+        // PackAOnly is transB=false only (Phase B limitation).
+        int aCols = transA ? m : k;
+        int lda = aCols;
+        int ldb = n;  // B is [K, N] row-major
+
+        var (a, b) = GenerateRandomMatrices(m, n, k, transA, transB: false, seed: 42);
+        int aRows = transA ? k : m;
+        double[] expected = NaiveGemm(a, aRows, aCols, transA, b, k, n, transB: false);
+
+        double[] actual = new double[m * n];
+        PackAOnlyStrategy.Run<double>(
+            a, lda, transA,
+            b, ldb,
+            actual, ldc: n,
+            m, n, k,
+            mc: 8, kc: 8,
+            mr: 4, nr: 4);
+
+        for (int i = 0; i < expected.Length; i++)
+            Assert.Equal(expected[i], actual[i], precision: 10);
+    }
+
+    [Theory]
     [InlineData(8, 8, 8, false, false)]    // square, no trans
     [InlineData(8, 8, 8, true, false)]     // transA
     [InlineData(8, 8, 8, false, true)]     // transB

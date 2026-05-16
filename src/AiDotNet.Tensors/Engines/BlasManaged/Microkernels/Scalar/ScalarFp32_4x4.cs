@@ -66,4 +66,58 @@ internal static class ScalarFp32_4x4
         c[2 * ldc + 0] = c20; c[2 * ldc + 1] = c21; c[2 * ldc + 2] = c22; c[2 * ldc + 3] = c23;
         c[3 * ldc + 0] = c30; c[3 * ldc + 1] = c31; c[3 * ldc + 2] = c32; c[3 * ldc + 3] = c33;
     }
+
+    /// <summary>
+    /// Variant of <see cref="Run"/> that reads B directly from caller-supplied
+    /// memory with stride <paramref name="ldb"/> instead of from a packed B
+    /// stripe. Used by the PackAOnly strategy when packing B is not worthwhile.
+    ///
+    /// This variant supports only transB=false: B must be laid out as [K, N]
+    /// row-major. For transB=true B, callers must pre-transpose or use a
+    /// different strategy. The caller passes a slice of B positioned at the
+    /// (pc, jc) corner of the current panel; the kernel reads
+    /// b[k * ldb + col] for col in [0, Nr).
+    /// </summary>
+    /// <param name="packedA">Packed-A vpanel, layout [Kc × Mr] row-major.</param>
+    /// <param name="b">Source B buffer. Caller passes a slice positioned at the (pc, jc) corner of the current panel.</param>
+    /// <param name="ldb">Leading dimension of B (cols of full B for transB=false).</param>
+    /// <param name="c">Output buffer; reads + writes C[0..Mr, 0..Nr] tile.</param>
+    /// <param name="ldc">Leading dimension of C.</param>
+    /// <param name="kc">Number of K-steps to accumulate.</param>
+    public static void RunStridedB(
+        ReadOnlySpan<float> packedA,
+        ReadOnlySpan<float> b,
+        int ldb,
+        Span<float> c,
+        int ldc,
+        int kc)
+    {
+        float c00 = c[0 * ldc + 0], c01 = c[0 * ldc + 1], c02 = c[0 * ldc + 2], c03 = c[0 * ldc + 3];
+        float c10 = c[1 * ldc + 0], c11 = c[1 * ldc + 1], c12 = c[1 * ldc + 2], c13 = c[1 * ldc + 3];
+        float c20 = c[2 * ldc + 0], c21 = c[2 * ldc + 1], c22 = c[2 * ldc + 2], c23 = c[2 * ldc + 3];
+        float c30 = c[3 * ldc + 0], c31 = c[3 * ldc + 1], c32 = c[3 * ldc + 2], c33 = c[3 * ldc + 3];
+
+        for (int k = 0; k < kc; k++)
+        {
+            float a0 = packedA[k * Mr + 0];
+            float a1 = packedA[k * Mr + 1];
+            float a2 = packedA[k * Mr + 2];
+            float a3 = packedA[k * Mr + 3];
+
+            float b0 = b[k * ldb + 0];
+            float b1 = b[k * ldb + 1];
+            float b2 = b[k * ldb + 2];
+            float b3 = b[k * ldb + 3];
+
+            c00 += a0 * b0;  c01 += a0 * b1;  c02 += a0 * b2;  c03 += a0 * b3;
+            c10 += a1 * b0;  c11 += a1 * b1;  c12 += a1 * b2;  c13 += a1 * b3;
+            c20 += a2 * b0;  c21 += a2 * b1;  c22 += a2 * b2;  c23 += a2 * b3;
+            c30 += a3 * b0;  c31 += a3 * b1;  c32 += a3 * b2;  c33 += a3 * b3;
+        }
+
+        c[0 * ldc + 0] = c00; c[0 * ldc + 1] = c01; c[0 * ldc + 2] = c02; c[0 * ldc + 3] = c03;
+        c[1 * ldc + 0] = c10; c[1 * ldc + 1] = c11; c[1 * ldc + 2] = c12; c[1 * ldc + 3] = c13;
+        c[2 * ldc + 0] = c20; c[2 * ldc + 1] = c21; c[2 * ldc + 2] = c22; c[2 * ldc + 3] = c23;
+        c[3 * ldc + 0] = c30; c[3 * ldc + 1] = c31; c[3 * ldc + 2] = c32; c[3 * ldc + 3] = c33;
+    }
 }
