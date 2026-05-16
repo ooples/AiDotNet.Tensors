@@ -705,6 +705,74 @@ public class ScalarKernelTests
             Assert.Equal(packedScalar[i], packedAvx[i]);
     }
 
+    // ── C4: Avx2Pack Pack-B tests ─────────────────────────────────────────────
+
+    [Fact]
+    public void Avx2Pack_PackB_Fp64_NonTransposed_MatchesScalarBitIdentical()
+    {
+        if (!Avx2Pack.IsSupported) return;
+
+        int k = 8, n = 16;
+        int kc = 8, nc = 16, nr = 8;
+
+        var rng = new Random(42);
+        double[] b = new double[k * n];
+        for (int i = 0; i < b.Length; i++) b[i] = rng.NextDouble() * 2 - 1;
+
+        double[] packedScalar = new double[kc * nc];
+        double[] packedAvx = new double[kc * nc];
+
+        ScalarPack.PackB<double>(b, ldb: n, transB: false, packedScalar, nc, kc, nr);
+        Avx2Pack.PackB_Fp64(b, ldb: n, transB: false, packedAvx, nc, kc, nr);
+
+        for (int i = 0; i < packedScalar.Length; i++)
+            Assert.Equal(packedScalar[i], packedAvx[i]);
+    }
+
+    [Fact]
+    public void Avx2Pack_PackB_Fp64_Transposed_DelegatesToScalarBitIdentical()
+    {
+        if (!Avx2Pack.IsSupported) return;
+
+        int k = 8, n = 16;
+        int kc = 8, nc = 16, nr = 8;
+
+        var rng = new Random(42);
+        double[] b = new double[n * k];
+        for (int i = 0; i < b.Length; i++) b[i] = rng.NextDouble() * 2 - 1;
+
+        double[] packedScalar = new double[kc * nc];
+        double[] packedAvx = new double[kc * nc];
+
+        ScalarPack.PackB<double>(b, ldb: k, transB: true, packedScalar, nc, kc, nr);
+        Avx2Pack.PackB_Fp64(b, ldb: k, transB: true, packedAvx, nc, kc, nr);
+
+        for (int i = 0; i < packedScalar.Length; i++)
+            Assert.Equal(packedScalar[i], packedAvx[i]);
+    }
+
+    [Fact]
+    public void Avx2Pack_PackB_Fp32_NonTransposed_MatchesScalarBitIdentical()
+    {
+        if (!Avx2Pack.IsSupported) return;
+
+        int k = 8, n = 16;
+        int kc = 8, nc = 16, nr = 8;
+
+        var rng = new Random(42);
+        float[] b = new float[k * n];
+        for (int i = 0; i < b.Length; i++) b[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        float[] packedScalar = new float[kc * nc];
+        float[] packedAvx = new float[kc * nc];
+
+        ScalarPack.PackB<float>(b, ldb: n, transB: false, packedScalar, nc, kc, nr);
+        Avx2Pack.PackB_Fp32(b, ldb: n, transB: false, packedAvx, nc, kc, nr);
+
+        for (int i = 0; i < packedScalar.Length; i++)
+            Assert.Equal(packedScalar[i], packedAvx[i]);
+    }
+
     // ── B5 helpers ────────────────────────────────────────────────────────────
 
     private static (double[] a, double[] b) GenerateRandomMatrices(int m, int n, int k, bool transA, bool transB, int seed)

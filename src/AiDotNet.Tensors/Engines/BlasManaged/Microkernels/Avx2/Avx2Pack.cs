@@ -146,6 +146,157 @@ internal static class Avx2Pack
             }
         }
     }
+
+    /// <summary>
+    /// Pack a logical Kc-row × Nc-col panel of B into BLIS stripe layout.
+    /// Output is bit-identical to <see cref="ScalarPack.PackB{T}"/> for T=double.
+    ///
+    /// <para>
+    /// When <paramref name="transB"/> is <c>false</c> and <paramref name="nr"/> is 8,
+    /// each k-step's Nr=8 consecutive source doubles span two Vector256&lt;double&gt;
+    /// (4 doubles each), so two loads and two stores are used per (stripe, k) pair —
+    /// no arithmetic, bit-identical to scalar.
+    /// </para>
+    ///
+    /// <para>
+    /// When <paramref name="transB"/> is <c>false</c> and <paramref name="nr"/> is 4,
+    /// exactly one Vector256&lt;double&gt; load/store suffices per (stripe, k) pair.
+    /// </para>
+    ///
+    /// <para>
+    /// transB=true requires gathering Nr values from Nr different rows — not
+    /// SIMD-friendly without vgatherdpd. This case delegates to
+    /// <see cref="ScalarPack.PackB{T}"/>. SIMD gather optimization is deferred.
+    /// </para>
+    /// </summary>
+    /// <param name="b">Source B buffer, stored row-major [K, N] when transB=false or [N, K] when transB=true.</param>
+    /// <param name="ldb">Leading dimension of B (number of columns in the stored layout).</param>
+    /// <param name="transB">True if B is stored as B^T (logical [K, N] view from [N, K] memory).</param>
+    /// <param name="packed">Destination panel buffer, length ≥ nc × kc.</param>
+    /// <param name="nc">Cols of B to pack (must be exactly divisible by nr).</param>
+    /// <param name="kc">Rows of B to pack (one Kc block).</param>
+    /// <param name="nr">Microkernel col-tile width; must be 8 or 4 for the AVX2 FP64 SIMD path.</param>
+    public static unsafe void PackB_Fp64(
+        ReadOnlySpan<double> b, int ldb, bool transB,
+        Span<double> packed, int nc, int kc, int nr)
+    {
+        if (!IsSupported)
+            throw new PlatformNotSupportedException("Avx2Pack requires AVX2.");
+
+        // transB=true requires a Nr-row strided gather — not SIMD-friendly without
+        // vgatherdpd. Phase C falls back to scalar; SIMD gather optimization deferred.
+        if (transB)
+        {
+            ScalarPack.PackB<double>(b, ldb, transB, packed, nc, kc, nr);
+            return;
+        }
+
+        // transB=false SIMD path: B is row-major [K, N]. For each (stripe, k) pair,
+        // copy Nr consecutive doubles starting at B[k, stripe*Nr] to packed.
+        if (nr == 8)
+        {
+            // Nr=8: two Vector256<double> loads/stores per k-step (4 doubles each).
+            int numStripes = nc / nr;
+            fixed (double* bPtr = b)
+            fixed (double* pPtr = packed)
+            {
+                for (int stripe = 0; stripe < numStripes; stripe++)
+                {
+                    int srcCol = stripe * nr;
+                    double* packedStripe = pPtr + stripe * kc * nr;
+                    for (int k = 0; k < kc; k++)
+                    {
+                        Vector256<double> lo = Avx.LoadVector256(bPtr + k * ldb + srcCol);
+                        Vector256<double> hi = Avx.LoadVector256(bPtr + k * ldb + srcCol + 4);
+                        Avx.Store(packedStripe + k * nr, lo);
+                        Avx.Store(packedStripe + k * nr + 4, hi);
+                    }
+                }
+            }
+        }
+        else if (nr == 4)
+        {
+            // Nr=4: one Vector256<double> load/store per k-step.
+            int numStripes = nc / nr;
+            fixed (double* bPtr = b)
+            fixed (double* pPtr = packed)
+            {
+                for (int stripe = 0; stripe < numStripes; stripe++)
+                {
+                    int srcCol = stripe * nr;
+                    double* packedStripe = pPtr + stripe * kc * nr;
+                    for (int k = 0; k < kc; k++)
+                    {
+                        Vector256<double> row = Avx.LoadVector256(bPtr + k * ldb + srcCol);
+                        Avx.Store(packedStripe + k * nr, row);
+                    }
+                }
+            }
+        }
+        else
+        {
+            ScalarPack.PackB<double>(b, ldb, transB, packed, nc, kc, nr);
+        }
+    }
+
+    /// <summary>
+    /// FP32 mirror of <see cref="PackB_Fp64"/>. Nr=8 fits exactly in a
+    /// Vector256&lt;float&gt; — single load/store per k-step.
+    ///
+    /// <para>
+    /// When <paramref name="transB"/> is <c>false</c> and <paramref name="nr"/> is 8,
+    /// each k-step's Nr=8 consecutive source floats fit in one Vector256&lt;float&gt;
+    /// (32 bytes), so one load and one store suffice — bit-identical to scalar.
+    /// </para>
+    ///
+    /// <para>
+    /// transB=true and all other nr values delegate to <see cref="ScalarPack.PackB{T}"/>.
+    /// </para>
+    /// </summary>
+    /// <param name="b">Source B buffer, stored row-major [K, N] when transB=false or [N, K] when transB=true.</param>
+    /// <param name="ldb">Leading dimension of B (number of columns in the stored layout).</param>
+    /// <param name="transB">True if B is stored as B^T (logical [K, N] view from [N, K] memory).</param>
+    /// <param name="packed">Destination panel buffer, length ≥ nc × kc.</param>
+    /// <param name="nc">Cols of B to pack (must be exactly divisible by nr).</param>
+    /// <param name="kc">Rows of B to pack (one Kc block).</param>
+    /// <param name="nr">Microkernel col-tile width; must be 8 for the AVX2 FP32 SIMD path.</param>
+    public static unsafe void PackB_Fp32(
+        ReadOnlySpan<float> b, int ldb, bool transB,
+        Span<float> packed, int nc, int kc, int nr)
+    {
+        if (!IsSupported)
+            throw new PlatformNotSupportedException("Avx2Pack requires AVX2.");
+
+        if (transB)
+        {
+            ScalarPack.PackB<float>(b, ldb, transB, packed, nc, kc, nr);
+            return;
+        }
+
+        if (nr == 8)
+        {
+            // Nr=8: exactly one Vector256<float> (8 floats = 32 bytes) per k-step.
+            int numStripes = nc / nr;
+            fixed (float* bPtr = b)
+            fixed (float* pPtr = packed)
+            {
+                for (int stripe = 0; stripe < numStripes; stripe++)
+                {
+                    int srcCol = stripe * nr;
+                    float* packedStripe = pPtr + stripe * kc * nr;
+                    for (int k = 0; k < kc; k++)
+                    {
+                        Vector256<float> row = Avx.LoadVector256(bPtr + k * ldb + srcCol);
+                        Avx.Store(packedStripe + k * nr, row);
+                    }
+                }
+            }
+        }
+        else
+        {
+            ScalarPack.PackB<float>(b, ldb, transB, packed, nc, kc, nr);
+        }
+    }
 #else
     /// <summary>Runtime support gate (always false on net471 — no Vector256&lt;T&gt; intrinsics).</summary>
     public static bool IsSupported => false;
@@ -165,5 +316,21 @@ internal static class Avx2Pack
         ReadOnlySpan<float> a, int lda, bool transA,
         Span<float> packed, int mc, int kc, int mr) =>
         ScalarPack.PackA<float>(a, lda, transA, packed, mc, kc, mr);
+
+    /// <summary>
+    /// net471 stub: delegates to <see cref="ScalarPack.PackB{T}"/> (no AVX2 available).
+    /// </summary>
+    public static void PackB_Fp64(
+        ReadOnlySpan<double> b, int ldb, bool transB,
+        Span<double> packed, int nc, int kc, int nr) =>
+        ScalarPack.PackB<double>(b, ldb, transB, packed, nc, kc, nr);
+
+    /// <summary>
+    /// net471 stub: delegates to <see cref="ScalarPack.PackB{T}"/> (no AVX2 available).
+    /// </summary>
+    public static void PackB_Fp32(
+        ReadOnlySpan<float> b, int ldb, bool transB,
+        Span<float> packed, int nc, int kc, int nr) =>
+        ScalarPack.PackB<float>(b, ldb, transB, packed, nc, kc, nr);
 #endif
 }
