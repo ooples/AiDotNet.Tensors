@@ -773,6 +773,99 @@ public class ScalarKernelTests
             Assert.Equal(packedScalar[i], packedAvx[i]);
     }
 
+    // ── C6: Avx2Tail tests ───────────────────────────────────────────────────
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    [InlineData(4)]
+    [InlineData(5)]
+    [InlineData(6)]
+    [InlineData(7)]
+    public void Avx2Tail_RunFp64_4xN_MaskedStore_PreservesUnmaskedColumns(int effectiveNr)
+    {
+        if (!Avx2Tail.IsSupported) return;
+
+        int kc = 8;
+        var rng = new Random(42);
+        double[] packedA = new double[4 * kc];
+        double[] packedB = new double[kc * 8];
+        for (int i = 0; i < packedA.Length; i++) packedA[i] = rng.NextDouble() * 2 - 1;
+        for (int i = 0; i < packedB.Length; i++) packedB[i] = rng.NextDouble() * 2 - 1;
+
+        // Pre-fill C with a sentinel value so we can verify unmasked columns are preserved.
+        double[] c = new double[4 * 8];
+        for (int i = 0; i < c.Length; i++) c[i] = 999.0;
+
+        Avx2Tail.RunFp64_4xN(packedA, packedB, c.AsSpan(), ldc: 8, kc, effectiveNr);
+
+        // Reference: full 4×8 microkernel into a separate buffer.
+        double[] cRef = new double[4 * 8];
+        for (int i = 0; i < cRef.Length; i++) cRef[i] = 999.0;
+        Avx2Fp64_4x8.Run(packedA, packedB, cRef.AsSpan(), ldc: 8, kc);
+
+        // For each row, columns [0, effectiveNr) should match the full kernel;
+        // columns [effectiveNr, 8) should retain the sentinel value 999.
+        for (int row = 0; row < 4; row++)
+        {
+            for (int col = 0; col < 8; col++)
+            {
+                double actual = c[row * 8 + col];
+                if (col < effectiveNr)
+                {
+                    Assert.Equal(cRef[row * 8 + col], actual, precision: 12);
+                }
+                else
+                {
+                    Assert.Equal(999.0, actual);
+                }
+            }
+        }
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(3)]
+    [InlineData(5)]
+    [InlineData(7)]
+    public void Avx2Tail_RunFp32_8xN_MaskedStore_PreservesUnmaskedColumns(int effectiveNr)
+    {
+        if (!Avx2Tail.IsSupported) return;
+
+        int kc = 8;
+        var rng = new Random(42);
+        float[] packedA = new float[8 * kc];
+        float[] packedB = new float[kc * 8];
+        for (int i = 0; i < packedA.Length; i++) packedA[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < packedB.Length; i++) packedB[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        float[] c = new float[8 * 8];
+        for (int i = 0; i < c.Length; i++) c[i] = 999f;
+
+        Avx2Tail.RunFp32_8xN(packedA, packedB, c.AsSpan(), ldc: 8, kc, effectiveNr);
+
+        float[] cRef = new float[8 * 8];
+        for (int i = 0; i < cRef.Length; i++) cRef[i] = 999f;
+        Avx2Fp32_8x8.Run(packedA, packedB, cRef.AsSpan(), ldc: 8, kc);
+
+        for (int row = 0; row < 8; row++)
+        {
+            for (int col = 0; col < 8; col++)
+            {
+                float actual = c[row * 8 + col];
+                if (col < effectiveNr)
+                {
+                    Assert.Equal(cRef[row * 8 + col], actual, precision: 4);
+                }
+                else
+                {
+                    Assert.Equal(999f, actual);
+                }
+            }
+        }
+    }
+
     // ── B5 helpers ────────────────────────────────────────────────────────────
 
     private static (double[] a, double[] b) GenerateRandomMatrices(int m, int n, int k, bool transA, bool transB, int seed)
