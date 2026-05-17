@@ -1,4 +1,5 @@
 using System;
+using System.Runtime.InteropServices;
 
 namespace AiDotNet.Tensors.Engines.BlasManaged;
 
@@ -135,6 +136,128 @@ public static class BlasManaged
             default:
                 throw new NotSupportedException($"Unknown PackingMode: {strategy}");
         }
+    }
+
+    /// <summary>
+    /// Pre-pack the A matrix into BLIS vpanel layout, returning a handle
+    /// that subsequent <see cref="Gemm{T}"/> calls can reuse via
+    /// <see cref="BlasOptions{T}.PackedA"/>. Eliminates the pack step on
+    /// every iteration of a training loop (PyTorch CPU re-packs every call;
+    /// this is the PyTorch-surpassing feature).
+    ///
+    /// <para>
+    /// Call <see cref="WeightPackHandle.MarkDirty"/> after mutating the
+    /// underlying weight tensor (e.g., from an optimizer step); the next
+    /// Gemm call will re-pack before use.
+    /// </para>
+    /// </summary>
+    /// <typeparam name="T">Element type. Must be float or double.</typeparam>
+    /// <param name="a">Source A buffer, length depends on lda × M or lda × K (depending on transA).</param>
+    /// <param name="lda">Leading dimension of A.</param>
+    /// <param name="transA">True if A is stored as A^T.</param>
+    /// <param name="m">Logical M dimension (rows of op(A)).</param>
+    /// <param name="k">Logical K dimension (cols of op(A)).</param>
+    /// <param name="options">Options — currently used for <see cref="BlasOptions{T}.PackingMode"/> selection.</param>
+    public static WeightPackHandle PrePackA<T>(
+        ReadOnlySpan<T> a, int lda, bool transA,
+        int m, int k,
+        in BlasOptions<T> options = default) where T : unmanaged
+    {
+        var (mr, _) = PickMicrokernelTile<T>();
+        int mc = 64;
+        int kc = 64;
+        // Don't pack at a Kc larger than k.
+        if (kc > k) kc = k;
+        // Don't pack at an Mc larger than m, rounded down to mr.
+        if (mc > m) mc = (m / mr) * mr;
+        if (mc <= 0)
+            throw new ArgumentException($"M={m} smaller than microkernel Mr={mr}; pre-pack not supported.", nameof(m));
+
+        int elemSize = Marshal.SizeOf<T>();
+        int packedBytes = mc * kc * elemSize;
+
+        var key = (mc, kc, transA, options.PackingMode, typeof(T));
+        var handle = WeightPackCache.Allocate(packedBytes, key, isForA: true);
+
+        // Initial pack: write the source weight into handle.PackedBuffer.
+        if (typeof(T) == typeof(double))
+        {
+            var packedSpan = MemoryMarshal.Cast<byte, double>(handle.PackedBuffer.AsSpan());
+            ScalarPack.PackA<double>(
+                MemoryMarshal.Cast<T, double>(a),
+                lda, transA,
+                packedSpan, mc, kc, mr);
+        }
+        else if (typeof(T) == typeof(float))
+        {
+            var packedSpan = MemoryMarshal.Cast<byte, float>(handle.PackedBuffer.AsSpan());
+            ScalarPack.PackA<float>(
+                MemoryMarshal.Cast<T, float>(a),
+                lda, transA,
+                packedSpan, mc, kc, mr);
+        }
+        else
+        {
+            throw new NotSupportedException($"PrePackA does not support T={typeof(T).Name}.");
+        }
+
+        WeightPackCache.MarkCacheCurrent(handle);
+        return handle;
+    }
+
+    /// <summary>
+    /// Pre-pack the B matrix into BLIS stripe layout. See <see cref="PrePackA{T}"/>
+    /// for the broader rationale.
+    /// </summary>
+    /// <typeparam name="T">Element type. Must be float or double.</typeparam>
+    /// <param name="b">Source B buffer, length depends on ldb × K or ldb × N (depending on transB).</param>
+    /// <param name="ldb">Leading dimension of B.</param>
+    /// <param name="transB">True if B is stored as B^T.</param>
+    /// <param name="k">Logical K dimension (rows of op(B)).</param>
+    /// <param name="n">Logical N dimension (cols of op(B)).</param>
+    /// <param name="options">Options — currently used for <see cref="BlasOptions{T}.PackingMode"/> selection.</param>
+    public static WeightPackHandle PrePackB<T>(
+        ReadOnlySpan<T> b, int ldb, bool transB,
+        int k, int n,
+        in BlasOptions<T> options = default) where T : unmanaged
+    {
+        var (_, nr) = PickMicrokernelTile<T>();
+        int nc = 64;
+        int kc = 64;
+        if (kc > k) kc = k;
+        if (nc > n) nc = (n / nr) * nr;
+        if (nc <= 0)
+            throw new ArgumentException($"N={n} smaller than microkernel Nr={nr}; pre-pack not supported.", nameof(n));
+
+        int elemSize = Marshal.SizeOf<T>();
+        int packedBytes = nc * kc * elemSize;
+
+        var key = (nc, kc, transB, options.PackingMode, typeof(T));
+        var handle = WeightPackCache.Allocate(packedBytes, key, isForA: false);
+
+        if (typeof(T) == typeof(double))
+        {
+            var packedSpan = MemoryMarshal.Cast<byte, double>(handle.PackedBuffer.AsSpan());
+            ScalarPack.PackB<double>(
+                MemoryMarshal.Cast<T, double>(b),
+                ldb, transB,
+                packedSpan, nc, kc, nr);
+        }
+        else if (typeof(T) == typeof(float))
+        {
+            var packedSpan = MemoryMarshal.Cast<byte, float>(handle.PackedBuffer.AsSpan());
+            ScalarPack.PackB<float>(
+                MemoryMarshal.Cast<T, float>(b),
+                ldb, transB,
+                packedSpan, nc, kc, nr);
+        }
+        else
+        {
+            throw new NotSupportedException($"PrePackB does not support T={typeof(T).Name}.");
+        }
+
+        WeightPackCache.MarkCacheCurrent(handle);
+        return handle;
     }
 
     /// <summary>

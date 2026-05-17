@@ -13,8 +13,19 @@ namespace AiDotNet.Tensors.Engines.BlasManaged;
 /// <remarks>
 /// The handle owns a byte buffer holding the packed weight in BLIS-style
 /// stripe layout (see Section 5 of the design spec). The dispatcher honours
-/// the cached pack if the handle's <c>Version</c> matches the
-/// last-packed-version; otherwise re-packs and bumps the cached version.
+/// the cached pack if the handle's <c>Version</c> matches
+/// <c>LastPackedVersion</c>; otherwise re-packs and updates
+/// <c>LastPackedVersion</c> to the current <c>Version</c>.
+///
+/// <para>
+/// <c>Version</c> is atomically incremented by <see cref="MarkDirty"/> each
+/// time the underlying weight is mutated (e.g., from an optimizer step).
+/// <c>LastPackedVersion</c> is written by the dispatch path after a
+/// successful pack and records the <c>Version</c> at which the buffer was
+/// last filled. When <c>Version == LastPackedVersion</c> the packed buffer
+/// is current and the pack step can be skipped.
+/// </para>
+///
 /// Optimizer-step paths must call <see cref="MarkDirty"/> after mutating the
 /// underlying weight so the next Gemm call re-packs before use.
 /// </remarks>
@@ -22,6 +33,14 @@ public sealed class WeightPackHandle : IDisposable
 {
     internal byte[] PackedBuffer;
     internal long Version;
+    /// <summary>
+    /// The <see cref="Version"/> value at which <see cref="PackedBuffer"/> was
+    /// last successfully written. Initialized to 0; <see cref="Version"/>
+    /// starts at 1, so the very first Gemm call always triggers a pack.
+    /// Written only from the dispatch/pack path (single-writer); read
+    /// atomically by <see cref="WeightPackCache.IsCacheCurrent"/>.
+    /// </summary>
+    internal long LastPackedVersion;  // 0 = never packed; Version starts at 1
     internal (int Mc, int Kc, bool TransA, PackingMode Mode, Type ElemType) Key;
     internal bool IsForA;  // true = pre-packed A; false = pre-packed B
 
@@ -32,6 +51,7 @@ public sealed class WeightPackHandle : IDisposable
     {
         PackedBuffer = packedBuffer;
         Version = 1;
+        LastPackedVersion = 0;
         Key = key;
         IsForA = isForA;
     }

@@ -2094,4 +2094,87 @@ public class ScalarKernelTests
         for (int i = 0; i < span.Length; i++) span[i] = (byte)i;
         for (int i = 0; i < span.Length; i++) Assert.Equal((byte)i, span[i]);
     }
+
+    // -------------------------------------------------------------------------
+    // F3: WeightPackCache + BlasManaged.PrePackA / PrePackB
+    // -------------------------------------------------------------------------
+
+    [Fact]
+    public void WeightPackCache_IsCacheCurrent_TrueAfterMarkCurrent()
+    {
+        var handle = WeightPackCache.Allocate(
+            1024,
+            (Mc: 8, Kc: 8, TransA: false, Mode: PackingMode.Auto, ElemType: typeof(double)),
+            isForA: true);
+        // Initial state: Version=1, LastPackedVersion=0 → not current.
+        Assert.False(WeightPackCache.IsCacheCurrent(handle));
+
+        WeightPackCache.MarkCacheCurrent(handle);
+        Assert.True(WeightPackCache.IsCacheCurrent(handle));
+    }
+
+    [Fact]
+    public void WeightPackCache_MarkDirty_InvalidatesCache()
+    {
+        var handle = WeightPackCache.Allocate(
+            1024,
+            (Mc: 8, Kc: 8, TransA: false, Mode: PackingMode.Auto, ElemType: typeof(double)),
+            isForA: true);
+        WeightPackCache.MarkCacheCurrent(handle);
+        Assert.True(WeightPackCache.IsCacheCurrent(handle));
+
+        handle.MarkDirty();
+        Assert.False(WeightPackCache.IsCacheCurrent(handle));
+    }
+
+    [Fact]
+    public void BlasManaged_PrePackA_FP64_ProducesUsableHandle()
+    {
+        int m = 8, k = 16;
+        var rng = new Random(42);
+        double[] a = new double[m * k];
+        for (int i = 0; i < a.Length; i++) a[i] = rng.NextDouble() * 2 - 1;
+
+        var handle = BlasManagedLib.PrePackA<double>(a, lda: k, transA: false, m, k);
+        Assert.NotNull(handle);
+        Assert.True(handle.PackedBuffer.Length > 0);
+        Assert.True(WeightPackCache.IsCacheCurrent(handle));
+        // The packed buffer should contain non-zero values matching the source weights.
+        var packedAsDouble = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, double>(handle.PackedBuffer.AsSpan());
+        // At least one element of the source should match somewhere in the packed buffer.
+        Assert.Contains(packedAsDouble.ToArray(), d => Math.Abs(d - a[0]) < 1e-12);
+
+        handle.Dispose();
+    }
+
+    [Fact]
+    public void BlasManaged_PrePackB_FP32_ProducesUsableHandle()
+    {
+        int k = 8, n = 16;
+        var rng = new Random(42);
+        float[] b = new float[k * n];
+        for (int i = 0; i < b.Length; i++) b[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        var handle = BlasManagedLib.PrePackB<float>(b, ldb: n, transB: false, k, n);
+        Assert.NotNull(handle);
+        Assert.True(handle.PackedBuffer.Length > 0);
+        Assert.True(WeightPackCache.IsCacheCurrent(handle));
+
+        handle.Dispose();
+    }
+
+    [Fact]
+    public void BlasManaged_PrePack_AfterMarkDirty_InvalidatesCache()
+    {
+        int m = 8, k = 16;
+        var rng = new Random(42);
+        double[] a = new double[m * k];
+        for (int i = 0; i < a.Length; i++) a[i] = rng.NextDouble() * 2 - 1;
+
+        var handle = BlasManagedLib.PrePackA<double>(a, lda: k, transA: false, m, k);
+        Assert.True(WeightPackCache.IsCacheCurrent(handle));
+
+        handle.MarkDirty();
+        Assert.False(WeightPackCache.IsCacheCurrent(handle));
+    }
 }
