@@ -1680,4 +1680,74 @@ public class ScalarKernelTests
         for (int i = 0; i < cRef.Length; i++)
             Assert.Equal(cRef[i], cNeon[i], precision: 4);
     }
+
+    // -------------------------------------------------------------------------
+    // E3: NeonPack tests
+    // -------------------------------------------------------------------------
+
+    [Fact]
+    public void NeonPack_PackA_Fp64_Transposed_MatchesScalarBitIdentical()
+    {
+        if (!NeonPack.IsSupported) return;
+
+        int m = 8, k = 16;
+        int mc = 8, kc = 16, mr = 4;
+
+        var rng = new Random(42);
+        double[] a = new double[k * m];
+        for (int i = 0; i < a.Length; i++) a[i] = rng.NextDouble() * 2 - 1;
+
+        double[] packedScalar = new double[mc * kc];
+        double[] packedNeon = new double[mc * kc];
+
+        ScalarPack.PackA<double>(a, lda: m, transA: true, packedScalar, mc, kc, mr);
+        NeonPack.PackA_Fp64(a, lda: m, transA: true, packedNeon, mc, kc, mr);
+
+        for (int i = 0; i < packedScalar.Length; i++)
+            Assert.Equal(packedScalar[i], packedNeon[i]);
+    }
+
+    [Fact]
+    public void NeonPack_PackA_Fp64_NonTransposed_DelegatesToScalar()
+    {
+        if (!NeonPack.IsSupported) return;
+
+        int m = 8, k = 16;
+        int mc = 8, kc = 16, mr = 4;
+
+        var rng = new Random(42);
+        double[] a = new double[m * k];
+        for (int i = 0; i < a.Length; i++) a[i] = rng.NextDouble() * 2 - 1;
+
+        double[] packedScalar = new double[mc * kc];
+        double[] packedNeon = new double[mc * kc];
+
+        ScalarPack.PackA<double>(a, lda: k, transA: false, packedScalar, mc, kc, mr);
+        NeonPack.PackA_Fp64(a, lda: k, transA: false, packedNeon, mc, kc, mr);
+
+        for (int i = 0; i < packedScalar.Length; i++)
+            Assert.Equal(packedScalar[i], packedNeon[i]);
+    }
+
+    [Fact]
+    public void NeonPack_PackA_Fp32_Transposed_MatchesScalarBitIdentical()
+    {
+        if (!NeonPack.IsSupported) return;
+
+        int m = 16, k = 16;
+        int mc = 16, kc = 16, mr = 8;
+
+        var rng = new Random(42);
+        float[] a = new float[k * m];
+        for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        float[] packedScalar = new float[mc * kc];
+        float[] packedNeon = new float[mc * kc];
+
+        ScalarPack.PackA<float>(a, lda: m, transA: true, packedScalar, mc, kc, mr);
+        NeonPack.PackA_Fp32(a, lda: m, transA: true, packedNeon, mc, kc, mr);
+
+        for (int i = 0; i < packedScalar.Length; i++)
+            Assert.Equal(packedScalar[i], packedNeon[i]);
+    }
 }
