@@ -874,6 +874,13 @@ internal static partial class SimdGemm
     /// Computes C = A * B where A is [m,k], B is [k,n], C is [m,n].
     /// All matrices are in row-major order. C is cleared before computation.
     /// </summary>
+    /// <remarks>
+    /// K1 (#358): forwarded to <see cref="AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.Gemm{T}"/>
+    /// so all ~30 call sites migrate transparently. BlasManaged handles clearing C,
+    /// picks (mr, nr) based on AVX availability, and dispatches the right strategy.
+    /// The full-trans overload and SgemmAdd/SgemmSequential remain on the old path
+    /// (per-call-site migration in later K tasks).
+    /// </remarks>
     [MethodImpl(Hot)]
     public static void Sgemm(
         ReadOnlySpan<float> a,
@@ -883,36 +890,18 @@ internal static partial class SimdGemm
         int k,
         int n)
     {
-        c.Clear();
-        // B1 fast-path: Avx512Sgemm.CanUse checks CPU + TFM. When the AVX-512
-        // kernel is available we route there (its internal dispatcher handles
-        // its own parallelism decision) and bypass the autotune resolution
-        // below, which is for the SgemmAddInternal fallback path only.
-        if (Avx512Sgemm.CanUse)
-        {
-            Avx512Sgemm.SgemmBlocked(a, k, false, b, n, false, c, m, k, n, allowParallel: true);
-            return;
-        }
-        // Autotune dispatch: if the cache has a winning variant for this
-        // (KernelId, shape) combination, honour it. Today the catalog
-        // covers "sequential" vs "parallel" — falling back to the default
-        // UseParallelGemm toggle when no cached choice is present. Threaded
-        // into both the AVX-512 and AVX2 paths so autotuner decisions apply
-        // uniformly.
-        bool allowParallel = ResolveParallelFromAutotune(m, n, k);
-
-        // B1: single gate. Avx512Sgemm.CanUse checks CPU + TFM. Falls back
-        // to the AVX2 path internally for small / misaligned shapes, so the
-        // gate is safe even when the 16×16 kernel wouldn't qualify.
-        if (Avx512Sgemm.CanUse)
-        {
-            Avx512Sgemm.SgemmBlocked(a, k, false, b, n, false, c, m, k, n, allowParallel: allowParallel);
-            return;
-        }
-
-        // Iter 39: signal "we just cleared C" so the small-matmul fast path
-        // can use store-only kernels (saves 12 loads + 12 adds per micro-tile).
-        SgemmAddInternal(a, k, false, b, n, false, c, m, k, n, allowParallel: allowParallel, clearedOutput: true);
+        // DisableAutotune: use the static heuristic directly, no autotune cache
+        // read/write and no global stats increment. The shim path is a transparent
+        // pass-through; autotune learning belongs in callers that call Gemm<T> directly.
+        AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.Gemm<float>(
+            a, lda: k, transA: false,
+            b, ldb: n, transB: false,
+            c, ldc: n,
+            m, n, k,
+            new AiDotNet.Tensors.Engines.BlasManaged.BlasOptions<float>
+            {
+                PackingMode = AiDotNet.Tensors.Engines.BlasManaged.PackingMode.DisableAutotune
+            });
     }
 
     /// <summary>

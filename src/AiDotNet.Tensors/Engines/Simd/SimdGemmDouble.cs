@@ -31,24 +31,30 @@ internal static partial class SimdGemm
     /// Uses AVX2 Vector256&lt;double&gt; FMA when available, scalar
     /// fallback otherwise. Parallelizes over the 2D (M, N) block grid.
     /// </summary>
+    /// <remarks>
+    /// K1 (#358): forwarded to <see cref="AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.Gemm{T}"/>
+    /// so all double-precision call sites migrate transparently alongside the float path.
+    /// BlasManaged handles clearing C, picks tile sizes, and dispatches the right strategy.
+    /// <see cref="DgemmSequential"/> remains on the old path (per-call-site migration later).
+    /// </remarks>
     internal static void Dgemm(
         ReadOnlySpan<double> a,
         ReadOnlySpan<double> b,
         Span<double> c,
         int m, int k, int n)
     {
-        if (m <= 0 || n <= 0) return;
-        c.Clear();
-        if (k <= 0) return;
-
-#if NET5_0_OR_GREATER
-        if (Avx2.IsSupported && Fma.IsSupported)
-        {
-            DgemmAvx2(a, b, c, m, k, n, allowParallel: true);
-            return;
-        }
-#endif
-        DgemmScalar(a, b, c, m, k, n);
+        // DisableAutotune: use the static heuristic directly, no autotune cache
+        // read/write and no global stats increment. The shim path is a transparent
+        // pass-through; autotune learning belongs in callers that call Gemm<T> directly.
+        AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.Gemm<double>(
+            a, lda: k, transA: false,
+            b, ldb: n, transB: false,
+            c, ldc: n,
+            m, n, k,
+            new AiDotNet.Tensors.Engines.BlasManaged.BlasOptions<double>
+            {
+                PackingMode = AiDotNet.Tensors.Engines.BlasManaged.PackingMode.DisableAutotune
+            });
     }
 
     /// <summary>
