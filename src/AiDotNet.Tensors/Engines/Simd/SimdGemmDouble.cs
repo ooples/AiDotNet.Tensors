@@ -43,6 +43,10 @@ internal static partial class SimdGemm
         Span<double> c,
         int m, int k, int n)
     {
+        // Match original contract: m<=0 or n<=0 → no-op; k<=0 → clear C and return.
+        if (m <= 0 || n <= 0) return;
+        if (k <= 0) { c.Clear(); return; }
+
         // DisableAutotune: use the static heuristic directly, no autotune cache
         // read/write and no global stats increment. The shim path is a transparent
         // pass-through; autotune learning belongs in callers that call Gemm<T> directly.

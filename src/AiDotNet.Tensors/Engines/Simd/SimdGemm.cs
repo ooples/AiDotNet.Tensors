@@ -890,6 +890,11 @@ internal static partial class SimdGemm
         int k,
         int n)
     {
+        // Match original contract: unconditional c.Clear() before any early return
+        // so callers always receive a zeroed C (even for k=0 / degenerate shapes).
+        c.Clear();
+        if (m <= 0 || n <= 0 || k <= 0) return;
+
         // DisableAutotune: use the static heuristic directly, no autotune cache
         // read/write and no global stats increment. The shim path is a transparent
         // pass-through; autotune learning belongs in callers that call Gemm<T> directly.
