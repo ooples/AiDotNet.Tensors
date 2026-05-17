@@ -3121,4 +3121,80 @@ public class ScalarKernelTests
         // At least 9 hits.
         Assert.True(after.AutotuneHits >= 9, $"Expected at least 9 hits, got {after.AutotuneHits}");
     }
+
+    // -------------------------------------------------------------------------
+    // Task I1: EpilogueFlags bit-pack + Compute helper
+    // -------------------------------------------------------------------------
+
+    [Fact]
+    public void EpilogueFlags_DefaultEpilogue_IsNone()
+    {
+        var ep = new Epilogue<double>();
+        var flags = EpilogueFlagsCompute.Compute(in ep);
+        Assert.Equal(EpilogueFlags.None, flags);
+    }
+
+    [Fact]
+    public void EpilogueFlags_BiasOnly_SetsHasBias()
+    {
+        Span<double> bias = stackalloc double[4] { 1, 2, 3, 4 };
+        var ep = new Epilogue<double> { BiasN = bias };
+        var flags = EpilogueFlagsCompute.Compute(in ep);
+        Assert.Equal(EpilogueFlags.HasBias, flags);
+    }
+
+    [Fact]
+    public void EpilogueFlags_ActivationOnly_SetsHasActivation()
+    {
+        var ep = new Epilogue<double> { Activation = AiDotNet.Tensors.Engines.FusedActivationType.ReLU };
+        var flags = EpilogueFlagsCompute.Compute(in ep);
+        Assert.Equal(EpilogueFlags.HasActivation, flags);
+    }
+
+    [Fact]
+    public void EpilogueFlags_OutputScale_NonZero_SetsFlag()
+    {
+        var ep = new Epilogue<double> { OutputScale = 2.5 };
+        var flags = EpilogueFlagsCompute.Compute(in ep);
+        Assert.Equal(EpilogueFlags.HasOutputScale, flags);
+    }
+
+    [Fact]
+    public void EpilogueFlags_OutputScale_Zero_DoesNotSetFlag()
+    {
+        // OutputScale=0 is the sentinel for "use 1.0" — flag must NOT be set.
+        var ep = new Epilogue<double> { OutputScale = 0.0 };
+        var flags = EpilogueFlagsCompute.Compute(in ep);
+        Assert.Equal(EpilogueFlags.None, flags);
+    }
+
+    [Fact]
+    public void EpilogueFlags_FullChain_SetsAllFlags()
+    {
+        Span<double> bias = stackalloc double[4] { 1, 2, 3, 4 };
+        Span<double> skip = stackalloc double[16];
+        var ep = new Epilogue<double>
+        {
+            BiasN = bias,
+            Activation = AiDotNet.Tensors.Engines.FusedActivationType.GELU,
+            SkipMxN = skip,
+            DropoutMask = 0xDEADBEEF,
+            OutputScale = 0.5,
+        };
+        var flags = EpilogueFlagsCompute.Compute(in ep);
+        Assert.True(flags.HasFlag(EpilogueFlags.HasBias));
+        Assert.True(flags.HasFlag(EpilogueFlags.HasActivation));
+        Assert.True(flags.HasFlag(EpilogueFlags.HasSkip));
+        Assert.True(flags.HasFlag(EpilogueFlags.HasDropout));
+        Assert.True(flags.HasFlag(EpilogueFlags.HasOutputScale));
+    }
+
+    [Fact]
+    public void EpilogueFlags_FP32_Works()
+    {
+        Span<float> bias = stackalloc float[4] { 1f, 2f, 3f, 4f };
+        var ep = new Epilogue<float> { BiasN = bias };
+        var flags = EpilogueFlagsCompute.Compute(in ep);
+        Assert.Equal(EpilogueFlags.HasBias, flags);
+    }
 }
