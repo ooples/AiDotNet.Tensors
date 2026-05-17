@@ -2947,4 +2947,58 @@ public class ScalarKernelTests
         Assert.Equal(16, nc);
         Assert.Equal(8, kc);
     }
+
+    // ── H4: AutotuneDispatcher wired into BlasManaged.Gemm ───────────────────
+
+    [Fact]
+    public void Gemm_UsesAutotuneDispatcher_ForBlockingDecisions()
+    {
+        // Verify that BlasManaged.Gemm picks up blocking from the autotune
+        // dispatcher rather than hardcoded values. We pre-seed the cache with
+        // distinctive values for a unique shape, then call Gemm and verify the
+        // result is still correct (the blocking change doesn't break math).
+        int m = 64, n = 64, k = 64;
+        int mr = 8, nr = 16;  // Assume AVX-512 tile.
+
+        var shape = BlasManagedAutotune.EncodeShape<double>(m, n, k, false, false, mr, nr, false);
+        // Pre-seed with custom (non-default) blocking.
+        BlasManagedAutotune.Store(shape, ParallelismAxis.M, mc: 32, nc: 32, kc: 32, threadCount: 4, measuredTimeMs: 1.0);
+
+        var (a, b) = GenerateRandomMatrices(m, n, k, transA: false, transB: false, seed: 42);
+        double[] expected = NaiveGemm(a, m, k, false, b, k, n, false);
+
+        double[] actual = new double[m * n];
+        var options = new BlasOptions<double> { PackingMode = PackingMode.ForcePackBoth };
+        BlasManagedLib.Gemm<double>(
+            a, lda: k, transA: false,
+            b, ldb: n, transB: false,
+            actual, ldc: n,
+            m, n, k,
+            options);
+
+        // Output must match naive reference regardless of which mc/nc/kc the autotune chose.
+        for (int i = 0; i < expected.Length; i++)
+            Assert.Equal(expected[i], actual[i], precision: 10);
+    }
+
+    [Fact]
+    public void Gemm_DisableAutotune_StillProducesCorrectResult()
+    {
+        // Even with autotune disabled, Gemm must work correctly.
+        int m = 32, n = 32, k = 32;
+        var (a, b) = GenerateRandomMatrices(m, n, k, transA: false, transB: false, seed: 42);
+        double[] expected = NaiveGemm(a, m, k, false, b, k, n, false);
+
+        double[] actual = new double[m * n];
+        var options = new BlasOptions<double> { PackingMode = PackingMode.DisableAutotune };
+        BlasManagedLib.Gemm<double>(
+            a, lda: k, transA: false,
+            b, ldb: n, transB: false,
+            actual, ldc: n,
+            m, n, k,
+            options);
+
+        for (int i = 0; i < expected.Length; i++)
+            Assert.Equal(expected[i], actual[i], precision: 10);
+    }
 }

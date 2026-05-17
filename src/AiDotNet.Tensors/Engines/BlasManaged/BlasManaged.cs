@@ -1,5 +1,6 @@
 using System;
 using System.Runtime.InteropServices;
+using AiDotNet.Tensors.Helpers;
 
 namespace AiDotNet.Tensors.Engines.BlasManaged;
 
@@ -80,6 +81,26 @@ public static class BlasManaged
             mr = 4; nr = 4;
         }
 
+        // Consult the autotune dispatcher for blocking parameters. The axis is
+        // informational for now — strategy integration is a future task.
+        bool hasEpilogue = options.Epilogue.Activation != AiDotNet.Tensors.Engines.FusedActivationType.None
+            || !options.Epilogue.BiasN.IsEmpty
+            || !options.Epilogue.SkipMxN.IsEmpty;
+        int procs = options.NumThreads > 0 ? options.NumThreads : Environment.ProcessorCount;
+        var (_, autotuneMc, autotuneNc, autotuneKc, _) =
+            AutotuneDispatcher.Decide<T>(
+                m, n, k,
+                transA, transB,
+                mr, nr,
+                procs,
+                BlasProvider.IsDeterministicMode,
+                hasEpilogue,
+                options.PackingMode);
+
+        int mcFromAutotune = autotuneMc;
+        int ncFromAutotune = autotuneNc;
+        int kcFromAutotune = autotuneKc;
+
         switch (strategy)
         {
             case PackingMode.ForcePackBoth:
@@ -88,7 +109,7 @@ public static class BlasManaged
                     b, ldb, transB,
                     c, ldc,
                     m, n, k,
-                    mc: 64, nc: 64, kc: 64,
+                    mc: mcFromAutotune, nc: ncFromAutotune, kc: kcFromAutotune,
                     mr: mr, nr: nr,
                     options);
                 break;
@@ -100,7 +121,7 @@ public static class BlasManaged
                     b, ldb,
                     c, ldc,
                     m, n, k,
-                    mc: 64, kc: 64,
+                    mc: mcFromAutotune, kc: kcFromAutotune,
                     mr: 4, nr: 4,
                     options);
                 break;
@@ -114,9 +135,9 @@ public static class BlasManaged
                 break;
             case PackingMode.DisableAutotune:
                 // DisableAutotune is a power-user override that bypasses the
-                // cache (relevant in Phase H). In Phase B with no autotune
-                // cache, it falls through to the default heuristic for the
-                // current Auto-mode choice.
+                // autotune cache. The autotune dispatcher already returns the
+                // heuristic decision when DisableAutotune is set, so mc/nc/kc
+                // are already populated from the heuristic above.
                 {
                     var defaultedOptions = new BlasOptions<T> { PackingMode = PackingMode.Auto };
                     PackingMode fallback = Dispatcher.SelectStrategy(m, n, k, defaultedOptions);
@@ -125,10 +146,10 @@ public static class BlasManaged
                     switch (fallback)
                     {
                         case PackingMode.ForcePackBoth:
-                            PackBothStrategy.Run<T>(a, lda, transA, b, ldb, transB, c, ldc, m, n, k, 64, 64, 64, mr, nr, options);
+                            PackBothStrategy.Run<T>(a, lda, transA, b, ldb, transB, c, ldc, m, n, k, mcFromAutotune, ncFromAutotune, kcFromAutotune, mr, nr, options);
                             break;
                         case PackingMode.ForcePackAOnly:
-                            PackAOnlyStrategy.Run<T>(a, lda, transA, b, ldb, c, ldc, m, n, k, 64, 64, 4, 4, options);
+                            PackAOnlyStrategy.Run<T>(a, lda, transA, b, ldb, c, ldc, m, n, k, mcFromAutotune, kcFromAutotune, 4, 4, options);
                             break;
                         case PackingMode.ForceStreaming:
                             StreamingStrategy.Run<T>(a, lda, transA, b, ldb, transB, c, ldc, m, n, k);
