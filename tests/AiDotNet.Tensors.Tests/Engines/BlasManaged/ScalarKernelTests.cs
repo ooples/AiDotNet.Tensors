@@ -2486,4 +2486,125 @@ public class ScalarKernelTests
         for (int i = 0; i < expected.Length; i++)
             Assert.Equal(expected[i], actual[i], precision: 10);
     }
+
+    [Fact]
+    public void KAxisDriver_PartitionsEvenly_WhenKDivisibleByNumThreads()
+    {
+        var (s0, l0) = KAxisDriver.GetThreadRange(k: 16, numThreads: 4, threadIndex: 0);
+        var (s1, l1) = KAxisDriver.GetThreadRange(k: 16, numThreads: 4, threadIndex: 1);
+        var (s2, l2) = KAxisDriver.GetThreadRange(k: 16, numThreads: 4, threadIndex: 2);
+        var (s3, l3) = KAxisDriver.GetThreadRange(k: 16, numThreads: 4, threadIndex: 3);
+
+        Assert.Equal((0, 4), (s0, l0));
+        Assert.Equal((4, 4), (s1, l1));
+        Assert.Equal((8, 4), (s2, l2));
+        Assert.Equal((12, 4), (s3, l3));
+
+        // Total coverage equals K.
+        Assert.Equal(16, l0 + l1 + l2 + l3);
+    }
+
+    [Fact]
+    public void KAxisDriver_PartitionsWithRemainder()
+    {
+        // K=17, numThreads=4 → first 1 thread gets 5, remaining 3 get 4 each (1+5 + 3*4 = 17).
+        var (s0, l0) = KAxisDriver.GetThreadRange(k: 17, numThreads: 4, threadIndex: 0);
+        var (s1, l1) = KAxisDriver.GetThreadRange(k: 17, numThreads: 4, threadIndex: 1);
+        var (s2, l2) = KAxisDriver.GetThreadRange(k: 17, numThreads: 4, threadIndex: 2);
+        var (s3, l3) = KAxisDriver.GetThreadRange(k: 17, numThreads: 4, threadIndex: 3);
+
+        Assert.Equal((0, 5), (s0, l0));
+        Assert.Equal((5, 4), (s1, l1));
+        Assert.Equal((9, 4), (s2, l2));
+        Assert.Equal((13, 4), (s3, l3));
+
+        Assert.Equal(17, l0 + l1 + l2 + l3);
+    }
+
+    [Fact]
+    public void KAxisDriver_RoundUpToPowerOfTwo()
+    {
+        Assert.Equal(1, KAxisDriver.RoundUpToPowerOfTwo(1));
+        Assert.Equal(2, KAxisDriver.RoundUpToPowerOfTwo(2));
+        Assert.Equal(4, KAxisDriver.RoundUpToPowerOfTwo(3));
+        Assert.Equal(4, KAxisDriver.RoundUpToPowerOfTwo(4));
+        Assert.Equal(8, KAxisDriver.RoundUpToPowerOfTwo(5));
+        Assert.Equal(16, KAxisDriver.RoundUpToPowerOfTwo(16));
+        Assert.Equal(32, KAxisDriver.RoundUpToPowerOfTwo(17));
+    }
+
+    [Fact]
+    public void ReductionTree_TwoPartials_FP64_Sums()
+    {
+        double[] p0 = { 1.0, 2.0, 3.0, 4.0 };
+        double[] p1 = { 10.0, 20.0, 30.0, 40.0 };
+        Memory<double>[] partials = { p0.AsMemory(), p1.AsMemory() };
+
+        ReductionTree.ReducePairwiseFp64(partials, elementCount: 4);
+
+        Assert.Equal(11.0, partials[0].Span[0]);
+        Assert.Equal(22.0, partials[0].Span[1]);
+        Assert.Equal(33.0, partials[0].Span[2]);
+        Assert.Equal(44.0, partials[0].Span[3]);
+    }
+
+    [Fact]
+    public void ReductionTree_FourPartials_FP64_TreeReduces()
+    {
+        double[] p0 = { 1.0 };
+        double[] p1 = { 2.0 };
+        double[] p2 = { 3.0 };
+        double[] p3 = { 4.0 };
+        Memory<double>[] partials = { p0.AsMemory(), p1.AsMemory(), p2.AsMemory(), p3.AsMemory() };
+
+        ReductionTree.ReducePairwiseFp64(partials, elementCount: 1);
+
+        Assert.Equal(10.0, partials[0].Span[0]);
+    }
+
+    [Fact]
+    public void ReductionTree_OddCount_FP64_HandlesRemainder()
+    {
+        // 3 partials: pair (0+1), then (0+2).
+        double[] p0 = { 1.0 };
+        double[] p1 = { 2.0 };
+        double[] p2 = { 4.0 };
+        Memory<double>[] partials = { p0.AsMemory(), p1.AsMemory(), p2.AsMemory() };
+
+        ReductionTree.ReducePairwiseFp64(partials, elementCount: 1);
+
+        Assert.Equal(7.0, partials[0].Span[0]);
+    }
+
+    [Fact]
+    public void ReductionTree_DeterministicAcrossOrderingsInRepeats()
+    {
+        // The same input must produce the same bit pattern across multiple invocations.
+        double[] p0Run1 = { 1e16, 1.0, -1e16 };
+        double[] p1Run1 = { 1.0, 1.0, 1.0 };
+        Memory<double>[] run1 = { p0Run1.AsMemory(), p1Run1.AsMemory() };
+        ReductionTree.ReducePairwiseFp64(run1, elementCount: 3);
+
+        double[] p0Run2 = { 1e16, 1.0, -1e16 };
+        double[] p1Run2 = { 1.0, 1.0, 1.0 };
+        Memory<double>[] run2 = { p0Run2.AsMemory(), p1Run2.AsMemory() };
+        ReductionTree.ReducePairwiseFp64(run2, elementCount: 3);
+
+        // Bit-identical (no precision argument).
+        for (int i = 0; i < 3; i++)
+            Assert.Equal(run1[0].Span[i], run2[0].Span[i]);
+    }
+
+    [Fact]
+    public void ReductionTree_FP32_BasicSum()
+    {
+        float[] p0 = { 1.0f, 2.0f };
+        float[] p1 = { 3.0f, 4.0f };
+        Memory<float>[] partials = { p0.AsMemory(), p1.AsMemory() };
+
+        ReductionTree.ReducePairwiseFp32(partials, elementCount: 2);
+
+        Assert.Equal(4.0f, partials[0].Span[0]);
+        Assert.Equal(6.0f, partials[0].Span[1]);
+    }
 }
