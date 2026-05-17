@@ -1183,6 +1183,59 @@ public class ScalarKernelTests
             Assert.Equal(packedScalar[i], packedAvx[i]);
     }
 
+    // ── D5: Avx512Streaming tests ─────────────────────────────────────────────
+
+    [Theory]
+    [InlineData(8, 16, 8, false, false)]   // NN, n=16 (2 fp64 blocks)
+    [InlineData(8, 16, 8, true, false)]    // TN
+    [InlineData(8, 16, 8, false, true)]    // NT (scalar fallback)
+    [InlineData(8, 16, 8, true, true)]     // TT (scalar fallback)
+    [InlineData(4, 8, 16, false, false)]   // single block
+    [InlineData(8, 24, 8, false, false)]   // 3 blocks
+    [InlineData(8, 10, 8, false, false)]   // 1 block + tail (n=10)
+    public void Avx512Streaming_Fp64_MatchesScalarReference(int m, int n, int k, bool transA, bool transB)
+    {
+        if (!Avx512Streaming.IsSupported) return;
+
+        int aCols = transA ? m : k;
+        int lda = aCols;
+        int bCols = transB ? k : n;
+        int ldb = bCols;
+
+        var (a, b) = GenerateRandomMatrices(m, n, k, transA, transB, seed: 42);
+
+        double[] cScalar = new double[m * n];
+        ScalarStreaming.RunFp64(a, lda, transA, b, ldb, transB, cScalar, ldc: n, m, n, k);
+
+        double[] cAvx = new double[m * n];
+        Avx512Streaming.RunFp64(a, lda, transA, b, ldb, transB, cAvx, ldc: n, m, n, k);
+
+        for (int i = 0; i < cScalar.Length; i++)
+            Assert.Equal(cScalar[i], cAvx[i], precision: 10);
+    }
+
+    [Fact]
+    public void Avx512Streaming_Fp32_NN_MatchesScalarReference()
+    {
+        if (!Avx512Streaming.IsSupported) return;
+
+        int m = 8, n = 32, k = 8;  // n=32 = 2 FP32 blocks
+        var rng = new Random(42);
+        float[] a = new float[m * k];
+        float[] b = new float[k * n];
+        for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < b.Length; i++) b[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        float[] cScalar = new float[m * n];
+        ScalarStreaming.RunFp32(a, lda: k, transA: false, b, ldb: n, transB: false, cScalar, ldc: n, m, n, k);
+
+        float[] cAvx = new float[m * n];
+        Avx512Streaming.RunFp32(a, lda: k, transA: false, b, ldb: n, transB: false, cAvx, ldc: n, m, n, k);
+
+        for (int i = 0; i < cScalar.Length; i++)
+            Assert.Equal(cScalar[i], cAvx[i], precision: 4);
+    }
+
     // ── B5 helpers ────────────────────────────────────────────────────────────
 
     private static (double[] a, double[] b) GenerateRandomMatrices(int m, int n, int k, bool transA, bool transB, int seed)
