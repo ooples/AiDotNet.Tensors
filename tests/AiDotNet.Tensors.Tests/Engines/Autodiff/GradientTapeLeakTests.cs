@@ -1260,6 +1260,104 @@ public class GradientTapeLeakTests
         }
     }
 
+    /// <summary>
+    /// Issue AiDotNet#1340 — 2-encoder-block Transformer chain (mirroring the
+    /// PAPER-A Path B consumer config: dModel=128, dFf=256, heads=2, ctxLen=64,
+    /// V=256, 164k params) does NOT leak more than 20 KB/call after 500 Train()
+    /// iterations under <c>GradientTapeOptions.Default</c> (Persistent=true).
+    ///
+    /// <para>Before the fix in this PR: ~79 KB/call retention (CompiledDelegateChain's
+    /// BackwardStep&lt;T&gt;[] held forward intermediates via SavedState even after
+    /// tape disposal). After the fix: chain.Clear() in GradientTape.Dispose()
+    /// drops the retained refs immediately. The 20 KB/call threshold leaves
+    /// headroom for engine-side jit/cache warmup noise while still catching any
+    /// future regression that re-introduces per-step retention.</para>
+    /// </summary>
+    [Fact]
+    public void TrainStep_Transformer_L2_PersistentTape_Issue1340_RetentionUnder20KbPerCall()
+    {
+        var engine = AiDotNetEngine.Current;
+        const int Batch = 1, Seq = 64, Dim = 128, FF = 256;
+        AiDotNet.Tensors.Helpers.AutoTensorCache.Clear();
+        AiDotNet.Tensors.Engines.Autodiff.TensorPool<float>.Clear();
+
+        // L=2 chain weights — survives across the loop. Each encoder block has
+        // {Wq, Wk, Wv, Wo, W1, W2, γ, β} = 8 trainable tensors.
+        var w_l0 = new[] {
+            MakeTensor(new[] { Dim, Dim }, 0.1f, 11), MakeTensor(new[] { Dim, Dim }, 0.1f, 12),
+            MakeTensor(new[] { Dim, Dim }, 0.1f, 13), MakeTensor(new[] { Dim, Dim }, 0.1f, 14),
+            MakeTensor(new[] { Dim, FF }, 0.1f, 15),  MakeTensor(new[] { FF, Dim }, 0.1f, 16),
+        };
+        var w_l1 = new[] {
+            MakeTensor(new[] { Dim, Dim }, 0.1f, 21), MakeTensor(new[] { Dim, Dim }, 0.1f, 22),
+            MakeTensor(new[] { Dim, Dim }, 0.1f, 23), MakeTensor(new[] { Dim, Dim }, 0.1f, 24),
+            MakeTensor(new[] { Dim, FF }, 0.1f, 25),  MakeTensor(new[] { FF, Dim }, 0.1f, 26),
+        };
+        var sources = new List<Tensor<float>>(w_l0); sources.AddRange(w_l1);
+
+        // Warmup — let the persistent-tape compiler cache compile the chain
+        // pattern, JIT compile delegates, and stabilize allocations.
+        for (int w = 0; w < 5; w++) Step();
+        StableForcedGc();
+
+        long start = LiveBytes();
+        const int Iters = 500;
+        for (int i = 0; i < Iters; i++) Step();
+        StableForcedGc();
+        long end = LiveBytes();
+
+        long perCall = (end - start) / Iters;
+        _output.WriteLine($"AiDotNet#1340 L=2 Transformer leak: {perCall} B/call (start={start} end={end} iters={Iters})");
+
+        // 20 KB/call: pre-fix was ~79 KB/call; the fix should bring it
+        // close to 0 KB/call modulo engine cache/jit noise. 20 KB gives
+        // ~4× headroom for noise on the L=2 chain. CI hosts with
+        // different .NET versions show ~±2 KB jitter.
+        Assert.True(perCall < 20_000,
+            $"Per-call retention {perCall} B/call exceeds 20 KB/call budget. " +
+            $"Start={start} End={end} Iters={Iters}. AiDotNet#1340 regression — " +
+            $"CompiledDelegateChain.Clear() must be called from GradientTape.Dispose().");
+
+        void Step()
+        {
+            // Per-iteration scratch input + target (the typical training-loop
+            // pattern). These should not survive past the using scope.
+            var x = MakeTensor(new[] { Batch * Seq, Dim }, 1.0f, 99);
+            using var tape = new GradientTape<float>();
+            // Layer 0: QKV + scaled-dot-product + output projection + FFN(ReLU).
+            var x0 = EncoderBlock(engine, x, w_l0[0], w_l0[1], w_l0[2], w_l0[3], w_l0[4], w_l0[5]);
+            // Layer 1: same structure on layer 0's output.
+            var x1 = EncoderBlock(engine, x0, w_l1[0], w_l1[1], w_l1[2], w_l1[3], w_l1[4], w_l1[5]);
+            var loss = engine.ReduceSum(x1, null);
+            var grads = tape.ComputeGradients(loss, sources: sources);
+            Assert.True(grads.ContainsKey(w_l0[0]));
+            Assert.True(grads.ContainsKey(w_l1[5]));
+        }
+    }
+
+    /// <summary>
+    /// A single Vaswani encoder block (single-head): MHA-style scaled-dot-product
+    /// attention + output projection + FFN(ReLU). Used by the issue #1340 test
+    /// to construct a realistic 2-layer chain with the same op composition as
+    /// AiDotNet's MultiHeadAttentionLayer + DenseLayer pair that consumers hit.
+    /// </summary>
+    private static Tensor<float> EncoderBlock(
+        IEngine engine, Tensor<float> x,
+        Tensor<float> wq, Tensor<float> wk, Tensor<float> wv, Tensor<float> wo,
+        Tensor<float> w1, Tensor<float> w2)
+    {
+        var q = engine.TensorMatMul(x, wq);
+        var k = engine.TensorMatMul(x, wk);
+        var v = engine.TensorMatMul(x, wv);
+        var scores = engine.TensorMatMulTransposed(q, k);
+        var attn = engine.Softmax(scores, axis: -1);
+        var ctx = engine.TensorMatMul(attn, v);
+        var proj = engine.TensorMatMul(ctx, wo);
+        var h1 = engine.TensorMatMul(proj, w1);
+        var h2 = engine.ReLU(h1);
+        return engine.TensorMatMul(h2, w2);
+    }
+
     private static Tensor<float> MakeTensor(int[] shape, float scale, int seed)
     {
         var rng = new Random(seed);
