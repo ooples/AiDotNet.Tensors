@@ -2051,4 +2051,47 @@ public class ScalarKernelTests
         Assert.Equal(0, empty.Length);
         Assert.True(empty.IsEmpty);
     }
+
+    // -------------------------------------------------------------------------
+    // F2: ArrayPoolOverflow tests
+    // -------------------------------------------------------------------------
+
+    [Fact]
+    public void ArrayPoolOverflow_Rent_ReturnsBufferOfRequestedSize()
+    {
+        using var rent = ArrayPoolOverflow.Rent(2048);
+        Assert.Equal(2048, rent.Span.Length);
+    }
+
+    [Fact]
+    public void ArrayPoolOverflow_Rent_ZeroBytes_ReturnsEmpty()
+    {
+        using var rent = ArrayPoolOverflow.Rent(0);
+        Assert.True(rent.Span.IsEmpty);
+    }
+
+    [Fact]
+    public void ArrayPoolOverflow_Rent_NegativeBytes_ReturnsEmpty()
+    {
+        using var rent = ArrayPoolOverflow.Rent(-100);
+        Assert.True(rent.Span.IsEmpty);
+    }
+
+    [Fact]
+    public void ArrayPoolOverflow_DoubleDispose_IsIdempotent()
+    {
+        var rent = ArrayPoolOverflow.Rent(1024);
+        rent.Dispose();
+        rent.Dispose();  // Must not throw.
+        Assert.True(rent.Span.IsEmpty);  // After dispose, span is empty.
+    }
+
+    [Fact]
+    public void ArrayPoolOverflow_SpanIsWritable()
+    {
+        using var rent = ArrayPoolOverflow.Rent(64);
+        var span = rent.Span;
+        for (int i = 0; i < span.Length; i++) span[i] = (byte)i;
+        for (int i = 0; i < span.Length; i++) Assert.Equal((byte)i, span[i]);
+    }
 }
