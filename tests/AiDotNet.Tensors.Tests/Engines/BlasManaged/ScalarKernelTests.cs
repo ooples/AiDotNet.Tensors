@@ -3085,4 +3085,40 @@ public class ScalarKernelTests
         Assert.Equal(0L, after.AutotuneHits);
         Assert.Equal(0L, after.AutotuneMisses);
     }
+
+    [Fact]
+    public void AutotuneDispatcher_CallSameShape10Times_LaterCallsHitCache()
+    {
+        BlasManagedLib.ClearCaches();
+        var initial = BlasManagedLib.GetStats();
+        Assert.Equal(0L, initial.AutotuneHits);
+        Assert.Equal(0L, initial.AutotuneMisses);
+
+        // Use a unique shape (primes) so the first call is guaranteed-likely a miss.
+        // (If the test ran before on this dev machine, the on-disk cache may already
+        // have this entry; in that case all 10 calls are hits — still a valid result.)
+        int m = 1009, n = 1013, k = 1019;  // distinct primes
+        int mr = 8, nr = 16;
+
+        for (int i = 0; i < 10; i++)
+        {
+            AutotuneDispatcher.Decide<double>(
+                m, n, k,
+                transA: false, transB: false,
+                mr: mr, nr: nr,
+                procs: 8,
+                isDeterministic: false,
+                hasEpilogue: false,
+                packingMode: PackingMode.Auto);
+        }
+
+        var after = BlasManagedLib.GetStats();
+
+        // Total dispatches = hits + misses = 10.
+        Assert.Equal(10L, after.AutotuneHits + after.AutotuneMisses);
+        // At most 1 miss (the first call). On a cached-from-prior-run scenario, 0 misses.
+        Assert.True(after.AutotuneMisses <= 1, $"Expected at most 1 miss, got {after.AutotuneMisses}");
+        // At least 9 hits.
+        Assert.True(after.AutotuneHits >= 9, $"Expected at least 9 hits, got {after.AutotuneHits}");
+    }
 }
