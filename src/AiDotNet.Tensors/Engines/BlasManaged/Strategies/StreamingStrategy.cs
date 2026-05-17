@@ -12,6 +12,7 @@ namespace AiDotNet.Tensors.Engines.BlasManaged;
 /// <para>
 /// Routes to <see cref="Avx512Streaming"/> when AVX-512 is available,
 /// then <see cref="Avx2Streaming"/> when AVX2 + FMA are available,
+/// then <see cref="NeonStreaming"/> on ARM64 hosts,
 /// otherwise falls back to the scalar reference kernel.
 /// </para>
 /// </summary>
@@ -48,6 +49,15 @@ internal static class StreamingStrategy
                     m, n, k);
                 return;
             }
+            if (NeonStreaming.IsSupported)
+            {
+                NeonStreaming.RunFp64(
+                    MemoryMarshal.Cast<T, double>(a), lda, transA,
+                    MemoryMarshal.Cast<T, double>(b), ldb, transB,
+                    MemoryMarshal.Cast<T, double>(c), ldc,
+                    m, n, k);
+                return;
+            }
             ScalarStreaming.RunFp64(
                 MemoryMarshal.Cast<T, double>(a), lda, transA,
                 MemoryMarshal.Cast<T, double>(b), ldb, transB,
@@ -69,6 +79,15 @@ internal static class StreamingStrategy
             if (Avx2Streaming.IsSupported)
             {
                 Avx2Streaming.RunFp32(
+                    MemoryMarshal.Cast<T, float>(a), lda, transA,
+                    MemoryMarshal.Cast<T, float>(b), ldb, transB,
+                    MemoryMarshal.Cast<T, float>(c), ldc,
+                    m, n, k);
+                return;
+            }
+            if (NeonStreaming.IsSupported)
+            {
+                NeonStreaming.RunFp32(
                     MemoryMarshal.Cast<T, float>(a), lda, transA,
                     MemoryMarshal.Cast<T, float>(b), ldb, transB,
                     MemoryMarshal.Cast<T, float>(c), ldc,

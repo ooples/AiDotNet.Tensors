@@ -65,7 +65,7 @@ public static class BlasManaged
         if (strategy == PackingMode.ForcePackAOnly && transB)
             strategy = PackingMode.ForcePackBoth;
 
-        // Pick SIMD-aware (mr, nr) for PackBoth using the AVX-512 → AVX2 → scalar
+        // Pick SIMD-aware (mr, nr) for PackBoth using the AVX-512 → AVX2 → Neon → scalar
         // hierarchy. Fall back to (4, 4) scalar when the shape is not an exact
         // multiple of the chosen tile — tail handling added in Phase G.
         // PackAOnly always uses scalar (4, 4) because its strided-B path has no
@@ -139,12 +139,19 @@ public static class BlasManaged
 
     /// <summary>
     /// Pick the microkernel (mr, nr) tile widths based on element type and
-    /// runtime SIMD availability. The selection follows a three-tier hierarchy
-    /// — AVX-512 → AVX2 → scalar — so the widest available vector ISA is used:
+    /// runtime SIMD availability. The selection follows a four-tier hierarchy
+    /// — AVX-512 → AVX2 → Neon → scalar — so the widest available vector ISA
+    /// is used. On any host only one of {AVX-512, AVX2, Neon} can be active:
+    /// AVX paths are x64-only; Neon is ARM64-only.
     /// <list type="bullet">
-    ///   <item>FP64: (8, 16) AVX-512 → (4, 8) AVX2 → (4, 4) scalar.</item>
-    ///   <item>FP32: (16, 16) AVX-512 → (8, 8) AVX2 → (4, 4) scalar.</item>
+    ///   <item>FP64: (8, 16) AVX-512 → (4, 8) AVX2 → (4, 4) Neon or scalar.</item>
+    ///   <item>FP32: (16, 16) AVX-512 → (8, 8) AVX2 → (8, 4) Neon → (4, 4) scalar.</item>
     /// </list>
+    /// For FP64 the Neon tile (Mr=4, Nr=4) is identical to the scalar tile, so
+    /// no new branch is needed — <see cref="PackBothStrategy"/> picks between
+    /// <see cref="NeonFp64_4x4"/> and <see cref="ScalarFp64_4x4"/> at dispatch time.
+    /// For FP32 the Neon tile (Mr=8, Nr=4) differs from scalar (4, 4) so it
+    /// requires its own branch here.
     /// This selection drives the layout of packed-A and packed-B, so it must
     /// match the microkernel the strategy ultimately dispatches to.
     /// </summary>
@@ -154,12 +161,14 @@ public static class BlasManaged
         {
             if (Avx512Fp64_8x16.IsSupported) return (8, 16);
             if (Avx2Fp64_4x8.IsSupported) return (4, 8);
+            // Neon FP64 uses (4, 4) — same as scalar; DispatchMicrokernel picks the right kernel.
             return (4, 4);
         }
         if (typeof(T) == typeof(float))
         {
             if (Avx512Fp32_16x16.IsSupported) return (16, 16);
             if (Avx2Fp32_8x8.IsSupported) return (8, 8);
+            if (NeonFp32_8x4.IsSupported) return (8, 4);
             return (4, 4);
         }
         return (4, 4);

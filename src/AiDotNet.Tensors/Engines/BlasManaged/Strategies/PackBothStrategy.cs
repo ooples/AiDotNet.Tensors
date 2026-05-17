@@ -11,11 +11,13 @@ namespace AiDotNet.Tensors.Engines.BlasManaged;
 /// inner loops.
 ///
 /// <para>
-/// Microkernel dispatch follows an AVX-512 → AVX2 → scalar hierarchy:
+/// Microkernel dispatch follows an AVX-512 → AVX2 → Neon → scalar hierarchy:
 /// FP64 prefers <see cref="Avx512Fp64_8x16"/> (Mr=8, Nr=16), falls back to
-/// <see cref="Avx2Fp64_4x8"/> (Mr=4, Nr=8), then <see cref="ScalarFp64_4x4"/>;
+/// <see cref="Avx2Fp64_4x8"/> (Mr=4, Nr=8), then <see cref="NeonFp64_4x4"/>
+/// (Mr=4, Nr=4) on ARM64, then <see cref="ScalarFp64_4x4"/>;
 /// FP32 prefers <see cref="Avx512Fp32_16x16"/> (Mr=16, Nr=16), falls back to
-/// <see cref="Avx2Fp32_8x8"/> (Mr=8, Nr=8), then <see cref="ScalarFp32_4x4"/>.
+/// <see cref="Avx2Fp32_8x8"/> (Mr=8, Nr=8), then <see cref="NeonFp32_8x4"/>
+/// (Mr=8, Nr=4) on ARM64, then <see cref="ScalarFp32_4x4"/>.
 /// </para>
 ///
 /// <para>
@@ -121,7 +123,7 @@ internal static class PackBothStrategy
 
     /// <summary>
     /// Routes to the appropriate microkernel for T based on (mr, nr) and
-    /// runtime SIMD availability. Dispatch order: AVX-512 → AVX2 → scalar 4×4,
+    /// runtime SIMD availability. Dispatch order: AVX-512 → AVX2 → Neon → scalar,
     /// so the widest available ISA is always selected.
     /// </summary>
     private static void DispatchMicrokernel<T>(
@@ -151,6 +153,15 @@ internal static class PackBothStrategy
             }
             if (mr == 4 && nr == 4)
             {
+                if (NeonFp64_4x4.IsSupported)
+                {
+                    NeonFp64_4x4.Run(
+                        MemoryMarshal.Cast<T, double>(packedA),
+                        MemoryMarshal.Cast<T, double>(packedB),
+                        MemoryMarshal.Cast<T, double>(c),
+                        ldc, kc);
+                    return;
+                }
                 ScalarFp64_4x4.Run(
                     MemoryMarshal.Cast<T, double>(packedA),
                     MemoryMarshal.Cast<T, double>(packedB),
@@ -180,6 +191,18 @@ internal static class PackBothStrategy
                     ldc, kc);
                 return;
             }
+            // Neon FP32 uses Mr=8 Nr=4. PickMicrokernelTile returns (8, 4) on ARM64
+            // hosts where Neon is available but AVX is not.
+            if (mr == 8 && nr == 4 && NeonFp32_8x4.IsSupported)
+            {
+                NeonFp32_8x4.Run(
+                    MemoryMarshal.Cast<T, float>(packedA),
+                    MemoryMarshal.Cast<T, float>(packedB),
+                    MemoryMarshal.Cast<T, float>(c),
+                    ldc, kc);
+                return;
+            }
+            // (4, 4) is only reached when no SIMD is available (no AVX, no Neon).
             if (mr == 4 && nr == 4)
             {
                 ScalarFp32_4x4.Run(

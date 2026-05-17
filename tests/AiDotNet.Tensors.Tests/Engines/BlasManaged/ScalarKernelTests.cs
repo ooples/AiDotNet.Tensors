@@ -1870,4 +1870,72 @@ public class ScalarKernelTests
         for (int i = 0; i < cScalar.Length; i++)
             Assert.Equal(cScalar[i], cNeon[i], precision: 4);
     }
+
+    // ── E6: Neon dispatch wired into BlasManaged.Gemm ────────────────────────
+
+    /// <summary>
+    /// On ARM64 hosts this exercises the Neon dispatch path (NeonFp64_4x4 in
+    /// PackBothStrategy, NeonStreaming in StreamingStrategy). On x64 hosts the
+    /// same shapes run through AVX-512/AVX2/scalar. Either way the output must
+    /// match the naive reference so the test is unconditional and portable.
+    /// </summary>
+    [Fact]
+    public void Gemm_NeonPath_FP64_SmallShape_MatchesNaive()
+    {
+        // (8, 8) is an exact multiple of Neon FP64 tile (Mr=4, Nr=4) so the
+        // PackBoth path won't fall back to scalar tile selection. K=8 triggers
+        // the Streaming strategy (K < 32), exercising NeonStreaming as well.
+        int m = 8, n = 8, k = 8;
+        var (a, b) = GenerateRandomMatrices(m, n, k, transA: false, transB: false, seed: 42);
+        double[] expected = NaiveGemm(a, m, k, false, b, k, n, false);
+
+        double[] actual = new double[m * n];
+        BlasManagedLib.Gemm<double>(
+            a, lda: k, transA: false,
+            b, ldb: n, transB: false,
+            actual, ldc: n,
+            m, n, k);
+
+        for (int i = 0; i < expected.Length; i++)
+            Assert.Equal(expected[i], actual[i], precision: 10);
+    }
+
+    /// <summary>
+    /// Exercises the Neon FP32 (Mr=8, Nr=4) tile via PackBothStrategy on ARM64.
+    /// On x64 it runs through AVX-512/AVX2/scalar. Shape (8, 4) is an exact
+    /// multiple of the Neon FP32 tile so no fallback to scalar tile occurs.
+    /// Large K (k=128) triggers the PackBoth strategy, exercising NeonFp32_8x4.
+    /// </summary>
+    [Fact]
+    public void Gemm_NeonPath_FP32_NeonFriendlyShape_MatchesNaive()
+    {
+        // (8, 4) is exact multiple of Neon FP32 tile (Mr=8, Nr=4).
+        // K=128 ≥ 128 → PackBoth strategy, exercises NeonFp32_8x4 on ARM64.
+        int m = 8, n = 4, k = 128;
+        var rng = new Random(43);
+        float[] a = new float[m * k];
+        float[] b = new float[k * n];
+        for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < b.Length; i++) b[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        // Naive reference.
+        float[] expected = new float[m * n];
+        for (int i = 0; i < m; i++)
+            for (int j = 0; j < n; j++)
+            {
+                float sum = 0;
+                for (int kk = 0; kk < k; kk++) sum += a[i * k + kk] * b[kk * n + j];
+                expected[i * n + j] = sum;
+            }
+
+        float[] actual = new float[m * n];
+        BlasManagedLib.Gemm<float>(
+            a, lda: k, transA: false,
+            b, ldb: n, transB: false,
+            actual, ldc: n,
+            m, n, k);
+
+        for (int i = 0; i < expected.Length; i++)
+            Assert.Equal(expected[i], actual[i], precision: 4);
+    }
 }
