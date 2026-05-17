@@ -1609,4 +1609,33 @@ public class ScalarKernelTests
         for (int i = 0; i < expected.Length; i++)
             Assert.Equal(expected[i], actual[i], precision: 9);
     }
+
+    // ── E1: ARM64 Neon FP64 4×4 microkernel ──────────────────────────────────
+    // On x64 hosts IsSupported=false and the test skips via early-return.
+    // On ARM64 hosts the Neon path is exercised and must match the scalar reference.
+
+    [Fact]
+    public void NeonFp64_4x4_MatchesScalarReference()
+    {
+        if (!NeonFp64_4x4.IsSupported) return;
+
+        int kc = 16;
+        int Mr = 4, Nr = 4;
+
+        var rng = new Random(42);
+        double[] packedA = new double[Mr * kc];
+        double[] packedB = new double[kc * Nr];
+        for (int i = 0; i < packedA.Length; i++) packedA[i] = rng.NextDouble() * 2 - 1;
+        for (int i = 0; i < packedB.Length; i++) packedB[i] = rng.NextDouble() * 2 - 1;
+
+        // Reference: ScalarFp64_4x4 (which uses the SAME Mr=4 Nr=4 layout).
+        double[] cRef = new double[4 * 4];
+        ScalarFp64_4x4.Run(packedA, packedB, cRef.AsSpan(), ldc: 4, kc);
+
+        double[] cNeon = new double[4 * 4];
+        NeonFp64_4x4.Run(packedA, packedB, cNeon.AsSpan(), ldc: 4, kc);
+
+        for (int i = 0; i < cRef.Length; i++)
+            Assert.Equal(cRef[i], cNeon[i], precision: 12);
+    }
 }
