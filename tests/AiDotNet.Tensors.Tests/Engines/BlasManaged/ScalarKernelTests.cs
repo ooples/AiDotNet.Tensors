@@ -2290,4 +2290,133 @@ public class ScalarKernelTests
         // Zero-byte carve must not consume any workspace.
         Assert.Equal(100, carver.RemainingBytes);
     }
+
+    // -------------------------------------------------------------------------
+    // F7: WeightPackHandle invalidation tests (MarkDirty correctness)
+    // -------------------------------------------------------------------------
+
+    [Fact]
+    public void Gemm_WithPackedAHandle_MatchesUnpackedGemm()
+    {
+        // Sanity test: when caller supplies a pre-packed handle, the result must
+        // still match the unpacked Gemm.
+        int m = 8, n = 8, k = 8;
+        var (a, b) = GenerateRandomMatrices(m, n, k, transA: false, transB: false, seed: 42);
+
+        double[] expected = NaiveGemm(a, m, k, transA: false, b, k, n, transB: false);
+
+        // First Gemm WITHOUT pre-pack handle.
+        double[] actualNoHandle = new double[m * n];
+        BlasManagedLib.Gemm<double>(
+            a, lda: k, transA: false,
+            b, ldb: n, transB: false,
+            actualNoHandle, ldc: n,
+            m, n, k);
+        for (int i = 0; i < expected.Length; i++)
+            Assert.Equal(expected[i], actualNoHandle[i], precision: 10);
+
+        // Now Gemm WITH a pre-pack handle for A. Result should be identical.
+        var handle = BlasManagedLib.PrePackA<double>(a, lda: k, transA: false, m, k);
+        var options = new BlasOptions<double> { PackedA = handle, PackingMode = PackingMode.ForcePackBoth };
+
+        double[] actualWithHandle = new double[m * n];
+        BlasManagedLib.Gemm<double>(
+            a, lda: k, transA: false,
+            b, ldb: n, transB: false,
+            actualWithHandle, ldc: n,
+            m, n, k,
+            options);
+
+        for (int i = 0; i < expected.Length; i++)
+            Assert.Equal(expected[i], actualWithHandle[i], precision: 10);
+
+        handle.Dispose();
+    }
+
+    [Fact]
+    public void Gemm_MutatedWeight_AfterMarkDirty_ReflectsMutation()
+    {
+        // The PyTorch-surpassing correctness test: mutate the underlying weight,
+        // call MarkDirty, and verify the next Gemm returns the new result (not
+        // a stale cached one).
+        int m = 8, n = 8, k = 8;
+        var (a, b) = GenerateRandomMatrices(m, n, k, transA: false, transB: false, seed: 42);
+
+        // Initial Gemm with pre-pack handle.
+        var handle = BlasManagedLib.PrePackA<double>(a, lda: k, transA: false, m, k);
+        var options = new BlasOptions<double> { PackedA = handle, PackingMode = PackingMode.ForcePackBoth };
+
+        double[] firstResult = new double[m * n];
+        BlasManagedLib.Gemm<double>(
+            a, lda: k, transA: false,
+            b, ldb: n, transB: false,
+            firstResult, ldc: n,
+            m, n, k,
+            options);
+
+        // Mutate the underlying weight in-place: add 10.0 to every element.
+        for (int i = 0; i < a.Length; i++) a[i] += 10.0;
+        handle.MarkDirty();
+
+        // Second Gemm — must reflect the mutated weight.
+        double[] secondResult = new double[m * n];
+        BlasManagedLib.Gemm<double>(
+            a, lda: k, transA: false,
+            b, ldb: n, transB: false,
+            secondResult, ldc: n,
+            m, n, k,
+            options);
+
+        // Reference: compute the expected result from the MUTATED a.
+        double[] expectedMutated = NaiveGemm(a, m, k, transA: false, b, k, n, transB: false);
+
+        for (int i = 0; i < expectedMutated.Length; i++)
+            Assert.Equal(expectedMutated[i], secondResult[i], precision: 10);
+
+        // Sanity: the two results should differ (mutation had an effect).
+        bool anyDifferent = false;
+        for (int i = 0; i < firstResult.Length; i++)
+        {
+            if (Math.Abs(firstResult[i] - secondResult[i]) > 1e-6) { anyDifferent = true; break; }
+        }
+        Assert.True(anyDifferent, "Expected the mutated weight to produce a different Gemm result.");
+
+        handle.Dispose();
+    }
+
+    [Fact]
+    public void Gemm_WithoutMarkDirty_UsesCachedPackedBuffer()
+    {
+        // When the handle is current (no MarkDirty), the strategy uses the cached
+        // packed buffer regardless of what's in the source `a` array. This is the
+        // intended behavior — the caller is promising the source matches the
+        // cache. We verify this by mutating `a` WITHOUT calling MarkDirty: the
+        // Gemm result must match the ORIGINAL weight (the one captured in PrePackA),
+        // not the mutated one.
+        int m = 8, n = 8, k = 8;
+        var (a, b) = GenerateRandomMatrices(m, n, k, transA: false, transB: false, seed: 42);
+        double[] aOriginal = (double[])a.Clone();
+
+        var handle = BlasManagedLib.PrePackA<double>(aOriginal, lda: k, transA: false, m, k);
+        var options = new BlasOptions<double> { PackedA = handle, PackingMode = PackingMode.ForcePackBoth };
+
+        // Mutate `a` AFTER PrePackA, but do NOT call MarkDirty.
+        for (int i = 0; i < a.Length; i++) a[i] += 100.0;
+
+        double[] result = new double[m * n];
+        BlasManagedLib.Gemm<double>(
+            a, lda: k, transA: false,
+            b, ldb: n, transB: false,
+            result, ldc: n,
+            m, n, k,
+            options);
+
+        // Expected: Gemm uses the ORIGINAL a (captured in handle's PackedBuffer).
+        double[] expectedOriginal = NaiveGemm(aOriginal, m, k, transA: false, b, k, n, transB: false);
+
+        for (int i = 0; i < expectedOriginal.Length; i++)
+            Assert.Equal(expectedOriginal[i], result[i], precision: 10);
+
+        handle.Dispose();
+    }
 }
