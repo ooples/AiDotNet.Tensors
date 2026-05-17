@@ -826,7 +826,9 @@ internal static partial class SimdGemm
         System.ReadOnlySpan<float> a, float[] b, System.Span<float> c,
         int m, int k, int n)
     {
+#pragma warning disable CS0618 // Self-call to the [Obsolete] no-trans shim — SgemmWithCachedB is a net471 wrapper that legitimately delegates here.
         Sgemm(a, b.AsSpan(), c, m, k, n);
+#pragma warning restore CS0618
     }
 #endif
 
@@ -881,6 +883,8 @@ internal static partial class SimdGemm
     /// The full-trans overload and SgemmAdd/SgemmSequential remain on the old path
     /// (per-call-site migration in later K tasks).
     /// </remarks>
+    [Obsolete("Use BlasManaged.Gemm<float>() directly. This no-trans shim forwards to it transparently and will be removed one release after v" +
+              "1.0. See docs/superpowers/specs/2026-05-16-blas-managed-design.md for migration guidance.")]
     [MethodImpl(Hot)]
     public static void Sgemm(
         ReadOnlySpan<float> a,

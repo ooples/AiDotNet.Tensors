@@ -37,6 +37,8 @@ internal static partial class SimdGemm
     /// BlasManaged handles clearing C, picks tile sizes, and dispatches the right strategy.
     /// <see cref="DgemmSequential"/> remains on the old path (per-call-site migration later).
     /// </remarks>
+    [Obsolete("Use BlasManaged.Gemm<double>() directly. This no-trans shim forwards to it transparently and will be removed one release after v" +
+              "1.0. See docs/superpowers/specs/2026-05-16-blas-managed-design.md for migration guidance.")]
     internal static void Dgemm(
         ReadOnlySpan<double> a,
         ReadOnlySpan<double> b,
