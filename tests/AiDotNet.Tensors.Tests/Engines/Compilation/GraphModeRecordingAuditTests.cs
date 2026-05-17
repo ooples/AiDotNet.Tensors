@@ -174,4 +174,35 @@ public class GraphModeRecordingAuditTests
 
         Assert.NotNull(output.LazySource);
     }
+
+    /// <summary>
+    /// FlashAttention — Q/K/V multi-head, out-param softmaxStats saved
+    /// into savedState for backward. Same pattern as LayerNorm
+    /// (mean/variance recomputed on replay). Pre-fix the eager fast
+    /// path produced a materialised tensor with no LazySource, and the
+    /// downstream Permute/Reshape ops in the calling FlashAttentionLayer
+    /// captured the FA output as a frozen compile-time constant —
+    /// breaking gradient flow to the upstream Q/K/V projections in the
+    /// fused compiled training path (HarmonicEngine PathB reproducer
+    /// at dModel=128 / L=2 / ctx=64 / 10KB WikiText-2 byte-LM:
+    /// top-1 0% / top-5 100% / ppl=V uniform + 3.76× slowdown vs MHA).
+    /// </summary>
+    [Fact]
+    public void FlashAttention_UnderGraphMode_RecordsLazyNode()
+    {
+        var engine = new CpuEngine();
+        const int batch = 1, heads = 2, seqQ = 4, headDim = 8;
+        var query = Tensor<float>.CreateRandom([batch, heads, seqQ, headDim]);
+        var key   = Tensor<float>.CreateRandom([batch, heads, seqQ, headDim]);
+        var value = Tensor<float>.CreateRandom([batch, heads, seqQ, headDim]);
+
+        using var scope = GraphMode.Enable();
+        var output = engine.FlashAttention<float>(
+            query, key, value,
+            scale: null,
+            isCausal: false,
+            out _);
+
+        Assert.NotNull(output.LazySource);
+    }
 }

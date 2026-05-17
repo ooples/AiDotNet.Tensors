@@ -22345,6 +22345,88 @@ public partial class CpuEngine : ITensorLevelEngine
         int headDim = query._shape[3];
         int seqK = key._shape[2];
 
+        // ────────────────────────────────────────────────────────────────────
+        // Lazy graph mode: record + return placeholder. Mirror of LayerNorm's
+        // GraphMode branch (this file, line ~19498). FlashAttention was
+        // previously the ONLY tape-recorded Engine op missing this branch —
+        // the eager fast paths (FlashAttentionFloat / FlashAttentionDouble)
+        // ran at compile time and returned a materialised Tensor<T>, which
+        // downstream lazy ops captured as a frozen constant. plan.Step()
+        // replayed everything EXCEPT FlashAttention with fresh Q/K/V (so the
+        // Q/K/V projection matmuls saw updated weights and produced new
+        // tensors), but the lazy graph node for the next op consumed the
+        // compile-time FA output — gradients never flowed back to Q/K/V/O,
+        // and the output of the network stayed near the compile-time random-
+        // init result no matter how long training ran.
+        //
+        // Consumer impact (HarmonicEngine PathB at dModel=128 / L=2 /
+        // ctx=64 / 10KB WikiText-2 byte-LM): top-1 0% / top-5 100% / ppl=V
+        // uniform output + 3.76× slower than MHA (compile-time eager FA fired
+        // every plan.Step on every layer instance).
+        //
+        // savedState parity: softmaxStats from the compile-time eager call
+        // is stale once the lazy graph replays, exactly as LayerNorm's
+        // mean/variance (AiDotNet#1331). The execute callback below
+        // recomputes FA via the out-param overload and copies fresh stats
+        // into the same Tensor<T> instances the savedState slot holds, so
+        // FlashAttentionBackward reads up-to-date softmax statistics on
+        // every plan.Step.
+        // ────────────────────────────────────────────────────────────────────
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                // Compute eager once OUTSIDE the graph scope so the lazy graph
+                // sees a registered node, not nested record calls.
+                var savedScope = GraphMode.Current;
+                GraphMode.SetCurrent(null);
+                var eagerOutput = FlashAttention(query, key, value, scale, isCausal, out var eagerStats, attentionBias);
+                GraphMode.SetCurrent(savedScope);
+
+                softmaxStats = eagerStats; // expose to caller (savedState references this object)
+                var capturedQuery = query;
+                var capturedKey = key;
+                var capturedValue = value;
+                var capturedBias = attentionBias;
+                var capturedScale = scale;
+                var capturedIsCausal = isCausal;
+                var capturedStats = eagerStats;
+
+                var inputs = attentionBias is null
+                    ? new[] { query, key, value }
+                    : new[] { query, key, value, attentionBias };
+
+                var lazyResult = scope.RecordVariadic(
+                    LazyNodeType.Custom, "FlashAttention",
+                    inputs, eagerOutput._shape,
+                    (eng, output) =>
+                    {
+                        // Recompute FA with the latest Q/K/V coming through
+                        // the replayed graph. The out-param softmaxStats is
+                        // copied back into the SAME tensor instance the
+                        // savedState holds so the backward kernel reads fresh
+                        // log-sum-exp values.
+                        var freshOut = eng.FlashAttention(
+                            capturedQuery, capturedKey, capturedValue,
+                            capturedScale, capturedIsCausal, out var freshStats, capturedBias);
+                        freshOut.AsSpan().CopyTo(output.AsWritableSpan());
+                        freshStats.AsSpan().CopyTo(capturedStats.AsWritableSpan());
+                    },
+                    BackwardFunctions<T>.FlashAttentionBackward,
+                    capturedBias is null
+                        ? new object[] { capturedStats, capturedScale ?? 1.0 / Math.Sqrt(headDim), capturedIsCausal }
+                        : new object[] { capturedStats, capturedScale ?? 1.0 / Math.Sqrt(headDim), capturedIsCausal, capturedBias });
+
+                // Mirror eager output bytes into the lazy result so any caller
+                // that uses the returned tensor's data BEFORE plan.Step() sees
+                // the eager values (matches LayerNorm's eagerResult.AsSpan
+                // copy-into-lazy pattern).
+                eagerOutput.AsSpan().CopyTo(lazyResult.AsWritableSpan());
+                return lazyResult;
+            }
+        }
+
         // Validate bias shape *before* the float fast-path branch below. The
         // fast path (FlashAttentionFloat) trusts its caller to hand it a
         // correctly-shaped bias, so the rank/dimension check has to run here
