@@ -1638,4 +1638,46 @@ public class ScalarKernelTests
         for (int i = 0; i < cRef.Length; i++)
             Assert.Equal(cRef[i], cNeon[i], precision: 12);
     }
+
+    // ── E2: ARM64 Neon FP32 8×4 microkernel ──────────────────────────────────
+    // On x64 hosts IsSupported=false and the test skips via early-return.
+    // On ARM64 hosts the Neon path is exercised and must match the scalar reference.
+
+    [Fact]
+    public void NeonFp32_8x4_MatchesScalarReference()
+    {
+        if (!NeonFp32_8x4.IsSupported) return;
+
+        int kc = 16;
+        int Mr = 8, Nr = 4;
+
+        var rng = new Random(42);
+        float[] packedA = new float[Mr * kc];
+        float[] packedB = new float[kc * Nr];
+        for (int i = 0; i < packedA.Length; i++) packedA[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < packedB.Length; i++) packedB[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        // Reference: 2 ScalarFp32_4x4 calls covering rows 0..3 and 4..7.
+        float[] packedA_top = new float[kc * 4];
+        float[] packedA_bot = new float[kc * 4];
+        for (int k = 0; k < kc; k++)
+        {
+            for (int r = 0; r < 4; r++)
+            {
+                packedA_top[k * 4 + r] = packedA[k * Mr + r];
+                packedA_bot[k * 4 + r] = packedA[k * Mr + 4 + r];
+            }
+        }
+
+        float[] cRef = new float[8 * 4];
+        int ldc = 4;
+        ScalarFp32_4x4.Run(packedA_top, packedB, cRef.AsSpan(), ldc, kc);
+        ScalarFp32_4x4.Run(packedA_bot, packedB, cRef.AsSpan(4 * ldc), ldc, kc);
+
+        float[] cNeon = new float[8 * 4];
+        NeonFp32_8x4.Run(packedA, packedB, cNeon.AsSpan(), ldc, kc);
+
+        for (int i = 0; i < cRef.Length; i++)
+            Assert.Equal(cRef[i], cNeon[i], precision: 4);
+    }
 }
