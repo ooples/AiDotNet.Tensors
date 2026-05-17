@@ -1661,10 +1661,17 @@ public sealed class GradientTape<T> : IDisposable
         System.Threading.Interlocked.Decrement(ref DifferentiableOps._anyTapeActive);
         DifferentiableOps._threadTapeDepth--;
         SetCurrentTape(_parent);
-        // Defensively null the cached delegate chain. For non-persistent
-        // tapes it's already null; this protects against any path that
-        // sets it (e.g. a future code change that caches across a
-        // re-execute call) from leaking BackwardStep[] across Dispose.
+        // AiDotNet#1340: explicitly clear the cached delegate chain's
+        // per-step references (Output / Inputs / SavedState / Backward)
+        // BEFORE nulling the chain pointer. Without this, if any external
+        // reference path retains the chain instance (finalizer ordering,
+        // async continuations, BackwardScratch pool entries), the
+        // `_steps[]` array continues to pin 30+ tensor references per
+        // backward step — measured at ~79 KB/call retention on a 164k-param
+        // Transformer L=2 chain, projecting to ~3.8 GB at 50k Train calls.
+        // The Clear() walk zeros each BackwardStep<T> in-place; the chain
+        // becomes safe-to-not-execute (no-op) once cleared.
+        _cachedDelegateChain?.Clear();
         _cachedDelegateChain = null;
 
         // Issue #283 fix: invalidate ONLY this tape's forward-recorded
