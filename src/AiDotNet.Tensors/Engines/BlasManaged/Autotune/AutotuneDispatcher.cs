@@ -54,10 +54,12 @@ internal static class AutotuneDispatcher
         var cached = BlasManagedAutotune.TryLookup(shape);
         if (cached.HasValue)
         {
+            BlasManagedStatsTracker.IncrementAutotuneHit();
             return cached.Value;
         }
 
         // Cache miss — use heuristic, store the decision.
+        BlasManagedStatsTracker.IncrementAutotuneMiss();
         var result = FallbackToHeuristic(m, n, k, mr, nr, procs, isDeterministic);
         try
         {

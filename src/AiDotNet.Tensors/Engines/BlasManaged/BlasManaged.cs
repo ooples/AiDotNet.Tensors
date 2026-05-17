@@ -287,6 +287,23 @@ public static class BlasManaged
     }
 
     /// <summary>
+    /// Returns a snapshot of process-wide BlasManaged diagnostic counters
+    /// (autotune hits/misses, JIT cache stats, weight pre-pack cache stats).
+    /// </summary>
+    public static BlasManagedStats GetStats() => BlasManagedStatsTracker.Snapshot();
+
+    /// <summary>
+    /// Reset diagnostic counters AND clear in-memory caches. The on-disk
+    /// autotune cache persists across calls — this clears the counters only.
+    /// </summary>
+    public static void ClearCaches()
+    {
+        BlasManagedStatsTracker.Reset();
+        // Future: clear JIT cache (Phase J) and weight pre-pack cache (Layer 3)
+        // entries that are still in memory.
+    }
+
+    /// <summary>
     /// Pick the microkernel (mr, nr) tile widths based on element type and
     /// runtime SIMD availability. The selection follows a four-tier hierarchy
     /// — AVX-512 → AVX2 → Neon → scalar — so the widest available vector ISA

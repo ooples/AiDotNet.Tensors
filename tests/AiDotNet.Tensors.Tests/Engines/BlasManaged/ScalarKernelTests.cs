@@ -3001,4 +3001,88 @@ public class ScalarKernelTests
         for (int i = 0; i < expected.Length; i++)
             Assert.Equal(expected[i], actual[i], precision: 10);
     }
+
+    // ── H5: BlasManagedStatsTracker + GetStats/ClearCaches ──────────────────
+
+    [Fact]
+    public void BlasManaged_GetStats_TracksAutotuneHitsAndMisses()
+    {
+        BlasManagedLib.ClearCaches();  // Reset counters.
+        var initial = BlasManagedLib.GetStats();
+        Assert.Equal(0L, initial.AutotuneHits);
+        Assert.Equal(0L, initial.AutotuneMisses);
+
+        // Trigger an autotune call with a unique prime-shaped call (likely unseen).
+        int m = 9967, n = 9967, k = 9967;
+
+        AutotuneDispatcher.Decide<double>(
+            m, n, k,
+            transA: false, transB: false,
+            mr: 8, nr: 16,
+            procs: 8,
+            isDeterministic: false,
+            hasEpilogue: false,
+            packingMode: PackingMode.Auto);
+
+        var afterFirst = BlasManagedLib.GetStats();
+        // Either hit or miss happened; one of the counters incremented.
+        Assert.True(afterFirst.AutotuneHits + afterFirst.AutotuneMisses >= 1);
+
+        // Second call to same shape — should be a cache hit now.
+        AutotuneDispatcher.Decide<double>(
+            m, n, k,
+            transA: false, transB: false,
+            mr: 8, nr: 16,
+            procs: 8,
+            isDeterministic: false,
+            hasEpilogue: false,
+            packingMode: PackingMode.Auto);
+
+        var afterSecond = BlasManagedLib.GetStats();
+        // Total calls = 2; hits + misses ≥ 2.
+        Assert.True(afterSecond.AutotuneHits + afterSecond.AutotuneMisses >= 2);
+        // And the second call should have been a hit.
+        Assert.True(afterSecond.AutotuneHits > afterFirst.AutotuneHits);
+    }
+
+    [Fact]
+    public void BlasManaged_GetStats_DisableAutotune_DoesNotIncrementCounters()
+    {
+        BlasManagedLib.ClearCaches();
+        var initial = BlasManagedLib.GetStats();
+
+        AutotuneDispatcher.Decide<double>(
+            m: 64, n: 64, k: 64,
+            transA: false, transB: false,
+            mr: 8, nr: 16,
+            procs: 4,
+            isDeterministic: false,
+            hasEpilogue: false,
+            packingMode: PackingMode.DisableAutotune);
+
+        var after = BlasManagedLib.GetStats();
+        Assert.Equal(initial.AutotuneHits, after.AutotuneHits);
+        Assert.Equal(initial.AutotuneMisses, after.AutotuneMisses);
+    }
+
+    [Fact]
+    public void BlasManaged_ClearCaches_ResetsCounters()
+    {
+        // Trigger an autotune call.
+        AutotuneDispatcher.Decide<double>(
+            m: 64, n: 64, k: 64,
+            transA: false, transB: false,
+            mr: 8, nr: 16,
+            procs: 4,
+            isDeterministic: false,
+            hasEpilogue: false,
+            packingMode: PackingMode.Auto);
+        var before = BlasManagedLib.GetStats();
+        Assert.True(before.AutotuneHits + before.AutotuneMisses >= 1);
+
+        BlasManagedLib.ClearCaches();
+        var after = BlasManagedLib.GetStats();
+        Assert.Equal(0L, after.AutotuneHits);
+        Assert.Equal(0L, after.AutotuneMisses);
+    }
 }
