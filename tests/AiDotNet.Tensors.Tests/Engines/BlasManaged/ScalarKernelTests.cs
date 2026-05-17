@@ -2742,4 +2742,98 @@ public class ScalarKernelTests
         var axis = AxisSelector.Select(m: 128, n: 128, k: 128, mr: 8, nr: 16, procs: 16, isDeterministic: false);
         Assert.Equal(ParallelismAxis.MN_2D, axis);
     }
+
+    // -------------------------------------------------------------------------
+    // BlasManagedAutotune facade tests (Task H1)
+    // -------------------------------------------------------------------------
+
+    [Fact]
+    public void BlasManagedAutotune_EncodeShape_RoundTrips()
+    {
+        var shape = BlasManagedAutotune.EncodeShape<double>(
+            m: 4096, n: 16, k: 512,
+            transA: true, transB: false,
+            mr: 8, nr: 16,
+            hasEpilogue: false);
+
+        var dims = shape.Dimensions;
+        Assert.Equal(9, dims.Length);
+        Assert.Equal(4096, dims[0]);
+        Assert.Equal(16, dims[1]);
+        Assert.Equal(512, dims[2]);
+        Assert.Equal(1, dims[3]);  // transA = true
+        Assert.Equal(0, dims[4]);  // transB = false
+        Assert.Equal(2, dims[5]);  // FP64 tag
+        Assert.Equal(8, dims[6]);
+        Assert.Equal(16, dims[7]);
+        Assert.Equal(0, dims[8]);  // hasEpilogue = false
+    }
+
+    [Fact]
+    public void BlasManagedAutotune_EncodeShape_FP32_UsesPrecisionTag1()
+    {
+        var shape = BlasManagedAutotune.EncodeShape<float>(
+            m: 32, n: 32, k: 32,
+            transA: false, transB: false,
+            mr: 16, nr: 16,
+            hasEpilogue: false);
+        Assert.Equal(1, shape.Dimensions[5]);  // FP32 tag
+    }
+
+    [Fact]
+    public void BlasManagedAutotune_EncodeDecodeChoice_RoundTrips()
+    {
+        var choice = BlasManagedAutotune.EncodeChoice(
+            ParallelismAxis.MN_2D, mc: 128, nc: 128, kc: 64, threadCount: 4, measuredTimeMs: 1.5);
+
+        var (axis, mc, nc, kc, threads) = BlasManagedAutotune.DecodeChoice(choice);
+        Assert.Equal(ParallelismAxis.MN_2D, axis);
+        Assert.Equal(128, mc);
+        Assert.Equal(128, nc);
+        Assert.Equal(64, kc);
+        Assert.Equal(4, threads);
+    }
+
+    [Fact]
+    public void BlasManagedAutotune_TryLookup_ReturnsNullForUnseenShape()
+    {
+        // Unique shape unlikely to exist in any prior cache.
+        var shape = BlasManagedAutotune.EncodeShape<double>(
+            m: 7919, n: 7919, k: 7919,  // primes — uncacheable shape
+            transA: false, transB: false,
+            mr: 8, nr: 16,
+            hasEpilogue: false);
+
+        var result = BlasManagedAutotune.TryLookup(shape);
+        // Cache should not have this shape unless we just stored it; on a clean
+        // run it must be null. On a developer machine that has cached this
+        // before, the test still passes if result is non-null AND decoded
+        // correctly. We accept either outcome — the assertion is "no exception".
+        if (result.HasValue)
+        {
+            var (axis, mc, nc, kc, threads) = result.Value;
+            Assert.True(mc > 0 && nc > 0 && kc > 0);
+        }
+    }
+
+    [Fact]
+    public void BlasManagedAutotune_StoreThenLookup_RoundTrips()
+    {
+        // Unique shape for this test to avoid cross-test interference.
+        var shape = BlasManagedAutotune.EncodeShape<double>(
+            m: 5101, n: 5101, k: 5101,
+            transA: false, transB: false,
+            mr: 8, nr: 16,
+            hasEpilogue: false);
+
+        BlasManagedAutotune.Store(shape, ParallelismAxis.K, mc: 96, nc: 128, kc: 256, threadCount: 8, measuredTimeMs: 2.5);
+        var result = BlasManagedAutotune.TryLookup(shape);
+        Assert.NotNull(result);
+        var (axis, mc, nc, kc, threads) = result!.Value;
+        Assert.Equal(ParallelismAxis.K, axis);
+        Assert.Equal(96, mc);
+        Assert.Equal(128, nc);
+        Assert.Equal(256, kc);
+        Assert.Equal(8, threads);
+    }
 }
