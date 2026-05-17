@@ -1,6 +1,7 @@
 using System;
 using System.Buffers;
 using System.Threading.Tasks;
+using AiDotNet.Tensors.Engines.BlasManaged;
 
 namespace AiDotNet.Tensors.Helpers;
 
@@ -1151,23 +1152,34 @@ internal static class Im2ColHelper
                 bool usedBlas;
                 if (useTranspose && kernelT != null)
                 {
-                    // kernelT laid out as [C_out*kH*kW, C_in] row-major (lda = C_in).
-                    usedBlas = BlasProvider.TryGemmEx(
-                        m: kmkn, n: hw, k: inChannels,
-                        a: kernelT, aOffset: 0, lda: inChannels, transA: false,
-                        b: input, bOffset: inputOffset, ldb: hw, transB: false,
-                        c: tempBuffer, cOffset: 0, ldc: hw);
+                    // PHASE K5: BlasManaged.Gemm<float> fast path. kernelT is [kmkn, inChannels]
+                    // row-major so transA=false; dispatches to AVX-512 16×16 microkernel on x64.
+                    BlasManaged.Gemm<float>(
+                        a: kernelT.AsSpan(0, kernelSize),
+                        lda: inChannels, transA: false,
+                        b: input.AsSpan(inputOffset, inChannels * hw),
+                        ldb: hw, transB: false,
+                        c: tempBuffer.AsSpan(0, kmkn * hw),
+                        ldc: hw,
+                        m: kmkn, n: hw, k: inChannels);
+                    usedBlas = true;
                 }
                 else
                 {
-                    // GEMM with transA=true: kernel stored as [C_in, C_out*kH*kW] (lda = C_out*kH*kW).
-                    // transA gives logical A^T of shape [C_out*kH*kW, C_in], multiplied by
-                    // B of shape [C_in, H_in*W_in] → C of shape [C_out*kH*kW, H_in*W_in].
-                    usedBlas = BlasProvider.TryGemmEx(
-                        m: kmkn, n: hw, k: inChannels,
-                        a: kernel, aOffset: 0, lda: kmkn, transA: true,
-                        b: input, bOffset: inputOffset, ldb: hw, transB: false,
-                        c: tempBuffer, cOffset: 0, ldc: hw);
+                    // PHASE K5: BlasManaged.Gemm<float> fast path. kernel is [inChannels, kmkn]
+                    // row-major; transA=true gives op(A) of shape [kmkn, inChannels], which is
+                    // the L2-shape pathology (M=large, N=small, K=medium) that hits OpenBLAS/MKL's
+                    // slow generic transA=true path. BlasManaged routes to the AVX-512 16×16
+                    // microkernel via PackBothStrategy for this shape (closes issue #358).
+                    BlasManaged.Gemm<float>(
+                        a: kernel.AsSpan(0, kernelSize),
+                        lda: kmkn, transA: true,
+                        b: input.AsSpan(inputOffset, inChannels * hw),
+                        ldb: hw, transB: false,
+                        c: tempBuffer.AsSpan(0, kmkn * hw),
+                        ldc: hw,
+                        m: kmkn, n: hw, k: inChannels);
+                    usedBlas = true;
                 }
 
                 if (!usedBlas)
@@ -1277,19 +1289,35 @@ internal static class Im2ColHelper
                 bool usedBlas;
                 if (useTranspose && kernelT != null)
                 {
-                    usedBlas = BlasProvider.TryGemmEx(
-                        m: kmkn, n: hw, k: inChannels,
-                        a: kernelT, aOffset: 0, lda: inChannels, transA: false,
-                        b: input, bOffset: inputOffset, ldb: hw, transB: false,
-                        c: tempBuffer, cOffset: 0, ldc: hw);
+                    // PHASE K5: BlasManaged.Gemm<double> fast path. kernelT is [kmkn, inChannels]
+                    // row-major so transA=false; dispatches to AVX-512 8×16 FP64 microkernel.
+                    BlasManaged.Gemm<double>(
+                        a: kernelT.AsSpan(0, kernelSize),
+                        lda: inChannels, transA: false,
+                        b: input.AsSpan(inputOffset, inChannels * hw),
+                        ldb: hw, transB: false,
+                        c: tempBuffer.AsSpan(0, kmkn * hw),
+                        ldc: hw,
+                        m: kmkn, n: hw, k: inChannels);
+                    usedBlas = true;
                 }
                 else
                 {
-                    usedBlas = BlasProvider.TryGemmEx(
-                        m: kmkn, n: hw, k: inChannels,
-                        a: kernel, aOffset: 0, lda: kmkn, transA: true,
-                        b: input, bOffset: inputOffset, ldb: hw, transB: false,
-                        c: tempBuffer, cOffset: 0, ldc: hw);
+                    // PHASE K5: BlasManaged.Gemm<double> fast path. kernel is [inChannels, kmkn]
+                    // row-major; transA=true gives op(A) of shape [kmkn, inChannels]. This is
+                    // exactly the L2-shape (M=4096 N=16 K=512 transA=true) that took 215ms via
+                    // OpenBLAS and 559ms via MKL. BlasManaged routes to the AVX-512 8×16 FP64
+                    // microkernel via PackBothStrategy and handles the transpose internally
+                    // without the per-call BLAS overhead (closes issue #358).
+                    BlasManaged.Gemm<double>(
+                        a: kernel.AsSpan(0, kernelSize),
+                        lda: kmkn, transA: true,
+                        b: input.AsSpan(inputOffset, inChannels * hw),
+                        ldb: hw, transB: false,
+                        c: tempBuffer.AsSpan(0, kmkn * hw),
+                        ldc: hw,
+                        m: kmkn, n: hw, k: inChannels);
+                    usedBlas = true;
                 }
 
                 if (!usedBlas)
