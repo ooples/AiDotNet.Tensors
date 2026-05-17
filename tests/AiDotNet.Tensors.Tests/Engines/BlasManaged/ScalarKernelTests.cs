@@ -2223,4 +2223,71 @@ public class ScalarKernelTests
         Span<byte> result = ArenaIntegration.TryRentBytes(1024);
         Assert.True(result.IsEmpty);
     }
+
+    // -------------------------------------------------------------------------
+    // F5: WorkspaceCarver (Layer 5 allocator)
+    // -------------------------------------------------------------------------
+
+    [Fact]
+    public void WorkspaceCarver_TryCarve_ReturnsRequestedSize()
+    {
+        byte[] ws = new byte[1024];
+        var carver = new WorkspaceCarver(ws.AsSpan());
+        var slice = carver.TryCarve(256);
+        Assert.Equal(256, slice.Length);
+    }
+
+    [Fact]
+    public void WorkspaceCarver_SuccessiveCarves_DoNotOverlap()
+    {
+        byte[] ws = new byte[1024];
+        var carver = new WorkspaceCarver(ws.AsSpan());
+
+        var first = carver.TryCarve(256);
+        var second = carver.TryCarve(256);
+
+        Assert.Equal(256, first.Length);
+        Assert.Equal(256, second.Length);
+
+        // Write into the first; the second must remain zero.
+        for (int i = 0; i < first.Length; i++) first[i] = 0xFF;
+        foreach (var b in second) Assert.Equal(0, b);
+    }
+
+    [Fact]
+    public void WorkspaceCarver_RunsOutOfSpace_ReturnsEmpty()
+    {
+        byte[] ws = new byte[100];
+        var carver = new WorkspaceCarver(ws.AsSpan());
+
+        var first = carver.TryCarve(80);  // OK, 20 remaining
+        Assert.Equal(80, first.Length);
+
+        var second = carver.TryCarve(50);  // Not enough — returns empty.
+        Assert.True(second.IsEmpty);
+
+        // RemainingBytes should reflect that we didn't consume more after the failed carve.
+        Assert.Equal(20, carver.RemainingBytes);
+    }
+
+    [Fact]
+    public void WorkspaceCarver_EmptyWorkspace_HasNoWorkspace()
+    {
+        var carver = new WorkspaceCarver(Span<byte>.Empty);
+        Assert.False(carver.HasWorkspace);
+        Assert.Equal(0, carver.TotalBytes);
+        Assert.Equal(0, carver.RemainingBytes);
+        Assert.True(carver.TryCarve(1).IsEmpty);
+    }
+
+    [Fact]
+    public void WorkspaceCarver_ZeroByteCarve_ReturnsEmpty()
+    {
+        byte[] ws = new byte[100];
+        var carver = new WorkspaceCarver(ws.AsSpan());
+        var slice = carver.TryCarve(0);
+        Assert.True(slice.IsEmpty);
+        // Zero-byte carve must not consume any workspace.
+        Assert.Equal(100, carver.RemainingBytes);
+    }
 }
