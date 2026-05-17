@@ -155,6 +155,130 @@ internal static class NeonPack
             }
         }
     }
+
+    /// <summary>
+    /// Pack a logical Kc-row × Nc-col panel of B into BLIS stripe layout.
+    /// Output is bit-identical to <see cref="ScalarPack.PackB{T}"/>.
+    ///
+    /// <para>
+    /// When <paramref name="transB"/> is <c>false</c> and <paramref name="nr"/> is 4,
+    /// B is stored row-major [K, N]. Each k-step's Nr=4 source values at
+    /// addresses B[k, stripe*4 .. stripe*4+3] are contiguous and span exactly
+    /// two Vector128&lt;double&gt; (2 doubles each). Two loads and two stores per
+    /// k-step — no arithmetic, bit-identical to scalar.
+    /// </para>
+    ///
+    /// <para>
+    /// transB=true (strided gather) and all other nr values delegate to
+    /// <see cref="ScalarPack.PackB{T}"/> for correctness.
+    /// </para>
+    /// </summary>
+    /// <param name="b">Source B buffer, stored row-major [K, N] when transB=false or [N, K] when transB=true.</param>
+    /// <param name="ldb">Leading dimension of B (number of columns in the stored layout).</param>
+    /// <param name="transB">True if B is stored as B^T (logical [K, N] view from [N, K] memory).</param>
+    /// <param name="packed">Destination stripe buffer, length ≥ nc × kc.</param>
+    /// <param name="nc">Cols of B to pack (must be exactly divisible by nr).</param>
+    /// <param name="kc">Rows of B to pack (one Kc block).</param>
+    /// <param name="nr">Microkernel col-tile width; must be 4 for the Neon FP64 SIMD path.</param>
+    public static unsafe void PackB_Fp64(
+        ReadOnlySpan<double> b, int ldb, bool transB,
+        Span<double> packed, int nc, int kc, int nr)
+    {
+        if (!IsSupported)
+            throw new PlatformNotSupportedException("NeonPack requires ARM64 AdvSimd.");
+
+        if (transB)
+        {
+            ScalarPack.PackB<double>(b, ldb, transB, packed, nc, kc, nr);
+            return;
+        }
+
+        if (nr == 4)
+        {
+            int numStripes = nc / nr;
+            fixed (double* bPtr = b)
+            fixed (double* pPtr = packed)
+            {
+                for (int stripe = 0; stripe < numStripes; stripe++)
+                {
+                    int srcCol = stripe * nr;
+                    double* packedStripe = pPtr + stripe * kc * nr;
+                    for (int k = 0; k < kc; k++)
+                    {
+                        Vector128<double> lo = AdvSimd.LoadVector128(bPtr + k * ldb + srcCol + 0);
+                        Vector128<double> hi = AdvSimd.LoadVector128(bPtr + k * ldb + srcCol + 2);
+                        AdvSimd.Store(packedStripe + k * nr + 0, lo);
+                        AdvSimd.Store(packedStripe + k * nr + 2, hi);
+                    }
+                }
+            }
+        }
+        else
+        {
+            ScalarPack.PackB<double>(b, ldb, transB, packed, nc, kc, nr);
+        }
+    }
+
+    /// <summary>
+    /// FP32 mirror of <see cref="PackB_Fp64"/>. The Neon FP32 microkernel uses Nr=4,
+    /// which requires one Vector128&lt;float&gt; (4 floats × 16 bytes) per k-step.
+    ///
+    /// <para>
+    /// When <paramref name="transB"/> is <c>false</c> and <paramref name="nr"/> is 4,
+    /// B is stored row-major [K, N]. Each k-step's Nr=4 source values at
+    /// addresses B[k, stripe*4 .. stripe*4+3] are contiguous and fit in one
+    /// Vector128&lt;float&gt;. One load and one store per k-step — no arithmetic,
+    /// bit-identical to <see cref="ScalarPack.PackB{T}"/> for T=float.
+    /// </para>
+    ///
+    /// <para>
+    /// transB=true and all other nr values delegate to <see cref="ScalarPack.PackB{T}"/>
+    /// for correctness.
+    /// </para>
+    /// </summary>
+    /// <param name="b">Source B buffer, stored row-major [K, N] when transB=false or [N, K] when transB=true.</param>
+    /// <param name="ldb">Leading dimension of B (number of columns in the stored layout).</param>
+    /// <param name="transB">True if B is stored as B^T (logical [K, N] view from [N, K] memory).</param>
+    /// <param name="packed">Destination stripe buffer, length ≥ nc × kc.</param>
+    /// <param name="nc">Cols of B to pack (must be exactly divisible by nr).</param>
+    /// <param name="kc">Rows of B to pack (one Kc block).</param>
+    /// <param name="nr">Microkernel col-tile width; must be 4 for the Neon FP32 SIMD path.</param>
+    public static unsafe void PackB_Fp32(
+        ReadOnlySpan<float> b, int ldb, bool transB,
+        Span<float> packed, int nc, int kc, int nr)
+    {
+        if (!IsSupported)
+            throw new PlatformNotSupportedException("NeonPack requires ARM64 AdvSimd.");
+
+        if (transB)
+        {
+            ScalarPack.PackB<float>(b, ldb, transB, packed, nc, kc, nr);
+            return;
+        }
+
+        if (nr == 4)
+        {
+            int numStripes = nc / nr;
+            fixed (float* bPtr = b)
+            fixed (float* pPtr = packed)
+            {
+                for (int stripe = 0; stripe < numStripes; stripe++)
+                {
+                    int srcCol = stripe * nr;
+                    float* packedStripe = pPtr + stripe * kc * nr;
+                    for (int k = 0; k < kc; k++)
+                    {
+                        Vector128<float> row = AdvSimd.LoadVector128(bPtr + k * ldb + srcCol);
+                        AdvSimd.Store(packedStripe + k * nr, row);
+                    }
+                }
+            }
+        }
+        else
+        {
+            ScalarPack.PackB<float>(b, ldb, transB, packed, nc, kc, nr);
+        }
+    }
 #else
     /// <summary>Runtime support gate (always false on net471 — no ARM64 AdvSimd intrinsics).</summary>
     public static bool IsSupported => false;
@@ -174,5 +298,21 @@ internal static class NeonPack
         ReadOnlySpan<float> a, int lda, bool transA,
         Span<float> packed, int mc, int kc, int mr) =>
         ScalarPack.PackA<float>(a, lda, transA, packed, mc, kc, mr);
+
+    /// <summary>
+    /// net471 stub: delegates to <see cref="ScalarPack.PackB{T}"/> (no ARM64 AdvSimd available).
+    /// </summary>
+    public static void PackB_Fp64(
+        ReadOnlySpan<double> b, int ldb, bool transB,
+        Span<double> packed, int nc, int kc, int nr) =>
+        ScalarPack.PackB<double>(b, ldb, transB, packed, nc, kc, nr);
+
+    /// <summary>
+    /// net471 stub: delegates to <see cref="ScalarPack.PackB{T}"/> (no ARM64 AdvSimd available).
+    /// </summary>
+    public static void PackB_Fp32(
+        ReadOnlySpan<float> b, int ldb, bool transB,
+        Span<float> packed, int nc, int kc, int nr) =>
+        ScalarPack.PackB<float>(b, ldb, transB, packed, nc, kc, nr);
 #endif
 }

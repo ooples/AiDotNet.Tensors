@@ -1750,4 +1750,72 @@ public class ScalarKernelTests
         for (int i = 0; i < packedScalar.Length; i++)
             Assert.Equal(packedScalar[i], packedNeon[i]);
     }
+
+    // ── E4: NeonPack Pack-B tests ─────────────────────────────────────────────
+
+    [Fact]
+    public void NeonPack_PackB_Fp64_NonTransposed_MatchesScalarBitIdentical()
+    {
+        if (!NeonPack.IsSupported) return;
+
+        int k = 8, n = 16;
+        int kc = 8, nc = 16, nr = 4;
+
+        var rng = new Random(42);
+        double[] b = new double[k * n];
+        for (int i = 0; i < b.Length; i++) b[i] = rng.NextDouble() * 2 - 1;
+
+        double[] packedScalar = new double[kc * nc];
+        double[] packedNeon = new double[kc * nc];
+
+        ScalarPack.PackB<double>(b, ldb: n, transB: false, packedScalar, nc, kc, nr);
+        NeonPack.PackB_Fp64(b, ldb: n, transB: false, packedNeon, nc, kc, nr);
+
+        for (int i = 0; i < packedScalar.Length; i++)
+            Assert.Equal(packedScalar[i], packedNeon[i]);
+    }
+
+    [Fact]
+    public void NeonPack_PackB_Fp64_Transposed_DelegatesToScalar()
+    {
+        if (!NeonPack.IsSupported) return;
+
+        int k = 8, n = 16;
+        int kc = 8, nc = 16, nr = 4;
+
+        var rng = new Random(42);
+        double[] b = new double[n * k];
+        for (int i = 0; i < b.Length; i++) b[i] = rng.NextDouble() * 2 - 1;
+
+        double[] packedScalar = new double[kc * nc];
+        double[] packedNeon = new double[kc * nc];
+
+        ScalarPack.PackB<double>(b, ldb: k, transB: true, packedScalar, nc, kc, nr);
+        NeonPack.PackB_Fp64(b, ldb: k, transB: true, packedNeon, nc, kc, nr);
+
+        for (int i = 0; i < packedScalar.Length; i++)
+            Assert.Equal(packedScalar[i], packedNeon[i]);
+    }
+
+    [Fact]
+    public void NeonPack_PackB_Fp32_NonTransposed_MatchesScalarBitIdentical()
+    {
+        if (!NeonPack.IsSupported) return;
+
+        int k = 8, n = 16;
+        int kc = 8, nc = 16, nr = 4;
+
+        var rng = new Random(42);
+        float[] b = new float[k * n];
+        for (int i = 0; i < b.Length; i++) b[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        float[] packedScalar = new float[kc * nc];
+        float[] packedNeon = new float[kc * nc];
+
+        ScalarPack.PackB<float>(b, ldb: n, transB: false, packedScalar, nc, kc, nr);
+        NeonPack.PackB_Fp32(b, ldb: n, transB: false, packedNeon, nc, kc, nr);
+
+        for (int i = 0; i < packedScalar.Length; i++)
+            Assert.Equal(packedScalar[i], packedNeon[i]);
+    }
 }
