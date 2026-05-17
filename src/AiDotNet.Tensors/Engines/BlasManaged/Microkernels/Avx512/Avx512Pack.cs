@@ -159,6 +159,133 @@ internal static class Avx512Pack
             ScalarPack.PackA<float>(a, lda, transA, packed, mc, kc, mr);
         }
     }
+
+    /// <summary>
+    /// Pack a logical Kc-row × Nc-col panel of B into BLIS stripe layout.
+    /// Output is bit-identical to <see cref="ScalarPack.PackB{T}"/>.
+    ///
+    /// <para>
+    /// When <paramref name="transB"/> is <c>false</c> and <paramref name="nr"/> is 16,
+    /// each k-step's Nr=16 consecutive column values are split across TWO
+    /// <see cref="Vector512{T}"/> loads (8+8=16 doubles = 128 bytes) and stored
+    /// into the packed stripe. This is the SIMD-accelerated path.
+    /// </para>
+    ///
+    /// <para>
+    /// An additional SIMD path handles nr=8 (one 512-bit load per k-step).
+    /// All other cases delegate to <see cref="ScalarPack.PackB{T}"/> for correctness.
+    /// transB=true requires a gather pattern and is deferred to scalar.
+    /// </para>
+    /// </summary>
+    public static unsafe void PackB_Fp64(
+        ReadOnlySpan<double> b, int ldb, bool transB,
+        Span<double> packed, int nc, int kc, int nr)
+    {
+        if (!IsSupported)
+            throw new PlatformNotSupportedException("Avx512Pack requires Avx512F.");
+
+        if (transB)
+        {
+            ScalarPack.PackB<double>(b, ldb, transB, packed, nc, kc, nr);
+            return;
+        }
+
+        if (nr == 16)
+        {
+            int numStripes = nc / nr;
+            fixed (double* bPtr = b)
+            fixed (double* pPtr = packed)
+            {
+                for (int stripe = 0; stripe < numStripes; stripe++)
+                {
+                    int srcCol = stripe * nr;
+                    double* packedStripe = pPtr + stripe * kc * nr;
+                    for (int k = 0; k < kc; k++)
+                    {
+                        Vector512<double> lo = Avx512F.LoadVector512(bPtr + k * ldb + srcCol);
+                        Vector512<double> hi = Avx512F.LoadVector512(bPtr + k * ldb + srcCol + 8);
+                        Avx512F.Store(packedStripe + k * nr, lo);
+                        Avx512F.Store(packedStripe + k * nr + 8, hi);
+                    }
+                }
+            }
+        }
+        else if (nr == 8)
+        {
+            // Secondary path for nr=8 (covers AVX2 microkernel width too if used here).
+            int numStripes = nc / nr;
+            fixed (double* bPtr = b)
+            fixed (double* pPtr = packed)
+            {
+                for (int stripe = 0; stripe < numStripes; stripe++)
+                {
+                    int srcCol = stripe * nr;
+                    double* packedStripe = pPtr + stripe * kc * nr;
+                    for (int k = 0; k < kc; k++)
+                    {
+                        Vector512<double> row = Avx512F.LoadVector512(bPtr + k * ldb + srcCol);
+                        Avx512F.Store(packedStripe + k * nr, row);
+                    }
+                }
+            }
+        }
+        else
+        {
+            ScalarPack.PackB<double>(b, ldb, transB, packed, nc, kc, nr);
+        }
+    }
+
+    /// <summary>
+    /// FP32 mirror of <see cref="PackB_Fp64"/>. The AVX-512 FP32 microkernel uses Nr=16,
+    /// which is exactly one <see cref="Vector512{T}"/> (16 floats = 64 bytes) wide.
+    ///
+    /// <para>
+    /// When <paramref name="transB"/> is <c>false</c> and <paramref name="nr"/> is 16,
+    /// each k-step reads one Vector512&lt;float&gt; from the source row and stores it
+    /// into the packed stripe — bit-identical to <see cref="ScalarPack.PackB{T}"/>
+    /// for T=float.
+    /// </para>
+    ///
+    /// <para>
+    /// All other cases delegate to <see cref="ScalarPack.PackB{T}"/> for correctness.
+    /// </para>
+    /// </summary>
+    public static unsafe void PackB_Fp32(
+        ReadOnlySpan<float> b, int ldb, bool transB,
+        Span<float> packed, int nc, int kc, int nr)
+    {
+        if (!IsSupported)
+            throw new PlatformNotSupportedException("Avx512Pack requires Avx512F.");
+
+        if (transB)
+        {
+            ScalarPack.PackB<float>(b, ldb, transB, packed, nc, kc, nr);
+            return;
+        }
+
+        if (nr == 16)
+        {
+            int numStripes = nc / nr;
+            fixed (float* bPtr = b)
+            fixed (float* pPtr = packed)
+            {
+                for (int stripe = 0; stripe < numStripes; stripe++)
+                {
+                    int srcCol = stripe * nr;
+                    float* packedStripe = pPtr + stripe * kc * nr;
+                    for (int k = 0; k < kc; k++)
+                    {
+                        Vector512<float> row = Avx512F.LoadVector512(bPtr + k * ldb + srcCol);
+                        Avx512F.Store(packedStripe + k * nr, row);
+                    }
+                }
+            }
+        }
+        else
+        {
+            ScalarPack.PackB<float>(b, ldb, transB, packed, nc, kc, nr);
+        }
+    }
 #else
     /// <summary>Runtime support gate (always false on net471 — no Vector512&lt;T&gt; intrinsics).</summary>
     public static bool IsSupported => false;
@@ -178,5 +305,21 @@ internal static class Avx512Pack
         ReadOnlySpan<float> a, int lda, bool transA,
         Span<float> packed, int mc, int kc, int mr) =>
         ScalarPack.PackA<float>(a, lda, transA, packed, mc, kc, mr);
+
+    /// <summary>
+    /// net471 stub: delegates to <see cref="ScalarPack.PackB{T}"/> (no AVX-512 available).
+    /// </summary>
+    public static void PackB_Fp64(
+        ReadOnlySpan<double> b, int ldb, bool transB,
+        Span<double> packed, int nc, int kc, int nr) =>
+        ScalarPack.PackB<double>(b, ldb, transB, packed, nc, kc, nr);
+
+    /// <summary>
+    /// net471 stub: delegates to <see cref="ScalarPack.PackB{T}"/> (no AVX-512 available).
+    /// </summary>
+    public static void PackB_Fp32(
+        ReadOnlySpan<float> b, int ldb, bool transB,
+        Span<float> packed, int nc, int kc, int nr) =>
+        ScalarPack.PackB<float>(b, ldb, transB, packed, nc, kc, nr);
 #endif
 }
