@@ -9041,7 +9041,7 @@ public partial class CpuEngine : ITensorLevelEngine
         return result;
     }
 
-    public unsafe Tensor<T> Tanh<T>(Tensor<T> tensor)
+    public virtual unsafe Tensor<T> Tanh<T>(Tensor<T> tensor)
     {
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
@@ -9052,6 +9052,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var scope = GraphMode.Current;
             if (scope != null)
             {
+                scope.BindEngineIfUnset(this);
                 var captured = tensor;
                 return scope.RecordUnary(LazyNodeType.Tanh, "Tanh", tensor, tensor._shape,
                     (eng, output) => eng.TanhInto(output, captured),
@@ -10793,6 +10794,32 @@ public partial class CpuEngine : ITensorLevelEngine
         for (int d = 0; d < a.Rank - 2; d++) outShape[d] = a._shape[d];
         outShape[a.Rank - 2] = M;
         outShape[a.Rank - 1] = N;
+
+        // Lazy graph mode: record and return placeholder. MUST be checked
+        // BEFORE the float/double fast paths below — they execute eagerly
+        // and would silently bypass the compiled training plan, leaving the
+        // result as a frozen compile-time constant with no LazySource. The
+        // generic fallback (TensorTranspose + TensorMatMul) is composed of
+        // GraphMode-aware primitives so it would be safe, but the fast paths
+        // are not. Same failure mode the FlashAttention forward had before
+        // PR #362 — fixed here for #365.
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                scope.BindEngineIfUnset(this);
+                var capturedA = a;
+                var capturedB = b;
+                return scope.RecordBinary(LazyNodeType.MatMul, "TensorMatMulTransposed", a, b, outShape,
+                    (eng, output) =>
+                    {
+                        var eager = eng.TensorMatMulTransposed(capturedA, capturedB);
+                        eager.AsSpan().CopyTo(output.AsWritableSpan());
+                    },
+                    BackwardFunctions<T>.MatMulTransposedBackward);
+            }
+        }
 
         // Float fast path via SimdGemm.Sgemm with transB=true. Skips the
         // ~70%-of-the-time-spent-on-the-transpose materialization that the
@@ -13336,6 +13363,10 @@ public partial class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> AvgPool2D<T>(Tensor<T> input, int[] poolSize, int[] stride)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
+        if (poolSize == null || poolSize.Length != 2) throw new ArgumentException("poolSize must be array of 2 elements", nameof(poolSize));
+        if (stride == null || stride.Length != 2) throw new ArgumentException("stride must be array of 2 elements", nameof(stride));
+        if (input.Rank != 4)
+            throw new ArgumentException($"AvgPool2D requires a 4D tensor [batch, channels, height, width]. Got rank {input.Rank}.");
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
@@ -13355,6 +13386,37 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (outputHeight <= 0 || outputWidth <= 0)
             throw new ArgumentException($"Invalid output dimensions ({outputHeight}x{outputWidth}). Check pool size and stride.");
+
+        // Lazy graph mode: record and return placeholder. Without this branch,
+        // compiled training plans that route through this int[] overload would
+        // execute eagerly and the result would have no LazySource — downstream
+        // ops would capture it as a frozen compile-time constant and gradients
+        // would silently drop through this op. The sibling int-scalar overload
+        // at line ~7980 already has this recording; this overload was the gap
+        // identified in #365.
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                scope.BindEngineIfUnset(this);
+                var outShape = new[] { batch, channels, outputHeight, outputWidth };
+                var capturedInput = input;
+                var capturedPool = (int[])poolSize.Clone();
+                var capturedStride = (int[])stride.Clone();
+                return scope.RecordUnary(LazyNodeType.Custom, "AvgPool2D", input, outShape,
+                    (eng, output) =>
+                    {
+                        // poolH == poolW and strideH == strideW is the common case;
+                        // when they differ this overload's semantics are kernel-rect,
+                        // which the int-scalar AvgPool2D doesn't support. Compute
+                        // via the int[] path on replay to preserve rect semantics.
+                        var r = eng.AvgPool2D(capturedInput, capturedPool, capturedStride);
+                        r.AsSpan().CopyTo(output.AsWritableSpan());
+                    },
+                    BackwardFunctions<T>.AvgPool2DBackward, new object[] { capturedPool, capturedStride });
+            }
+        }
 
         var inputData = input.GetFlattenedData();
         var outputData = new T[batch * channels * outputHeight * outputWidth];
@@ -28313,6 +28375,32 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentException(
                 $"Output length ({output.Length}) does not match input length ({tensor.Length}).");
 
+        // Lazy graph mode: record the write-into as an in-place op. Without
+        // this, the eager dense-walk below runs at trace time and the lazy
+        // graph never sees the permute — downstream ops that consume `output`
+        // would resolve to whatever uninitialized rented buffer it carries.
+        // Mirrors the TensorPermute (non-Into) recording at line ~28486.
+        // See #365 — this is the "void Into method, no GraphMode handling"
+        // entry in the owner's audit.
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                scope.BindEngineIfUnset(this);
+                var capturedSrc = tensor;
+                var capturedAxes = (int[])axes.Clone();
+                scope.RecordInPlace(LazyNodeType.Custom, "TensorPermuteInto", output, new[] { tensor },
+                    (eng, dst) =>
+                    {
+                        if (eng is CpuEngine cpuEng) cpuEng.TensorPermuteInto(dst, capturedSrc, capturedAxes);
+                        else { var r = eng.TensorPermute(capturedSrc, capturedAxes).Contiguous(); r.AsSpan().CopyTo(dst.AsWritableSpan()); }
+                    },
+                    BackwardFunctions<T>.PermuteBackward, new object[] { capturedAxes });
+                return;
+            }
+        }
+
         // Rank-0 short-circuit: a 0-d tensor permutes trivially via a single
         // scalar copy. Without this, the contiguous-stride init below indexes
         // srcStrides[rank - 1] which is out of bounds.
@@ -31294,6 +31382,24 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentException(
                 $"MaskedSelect requires mask shape [{string.Join(", ", mask._shape)}] " +
                 $"to match tensor shape [{string.Join(", ", tensor._shape)}].");
+
+        // MaskedSelect's output shape is data-dependent (= count of true bits
+        // in the mask), so it cannot be recorded as a static-shape lazy node:
+        // the placeholder allocation in RecordUnary needs the output shape at
+        // trace time, which is impossible without materializing the mask.
+        // PyTorch fences this off the same way for torch.compile / TorchScript.
+        // Fail loudly here rather than silently returning a frozen eager copy
+        // that downstream ops would capture as a compile-time constant — the
+        // failure mode #365 was filed to fix.
+        if (GraphMode.IsActive && GraphMode.Current is not null)
+        {
+            throw new NotSupportedException(
+                "TensorMaskedSelect has a data-dependent output shape (the count " +
+                "of true bits in the mask is not known at trace time), so it cannot " +
+                "be recorded inside a compiled training plan / GraphMode trace. " +
+                "Materialize the result outside the trace, or restructure the model " +
+                "to use TensorWhere (static-shape masking) instead.");
+        }
 
         // Preserve the original tensor/mask for autograd binding so gradients
         // flow back to the caller's input, not to transient contiguous copies.
