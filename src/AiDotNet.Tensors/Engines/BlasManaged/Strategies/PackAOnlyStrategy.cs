@@ -1,4 +1,5 @@
 using System;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
 namespace AiDotNet.Tensors.Engines.BlasManaged;
@@ -35,15 +36,29 @@ internal static class PackAOnlyStrategy
     /// <param name="kc">K blocking factor (Kc); each packed panel covers kc K-steps.</param>
     /// <param name="mr">Microkernel row-tile width (Mr). Must divide mc exactly (Phase G adds tail).</param>
     /// <param name="nr">Microkernel column-tile width (Nr). Must divide n exactly (Phase G adds tail).</param>
+    /// <param name="options">Allocator options: workspace buffer, pre-pack handles, packing mode.</param>
     public static void Run<T>(
         ReadOnlySpan<T> a, int lda, bool transA,
         ReadOnlySpan<T> b, int ldb,
         Span<T> c, int ldc,
         int m, int n, int k,
         int mc, int kc,
-        int mr, int nr) where T : unmanaged
+        int mr, int nr,
+        in BlasOptions<T> options = default) where T : unmanaged
     {
-        T[] packA = new T[mc * kc];
+        // Compute byte size for the worst-case pack-A panel buffer.
+        int elemSize = Unsafe.SizeOf<T>();
+        int packABytes = mc * kc * elemSize;
+
+        // Layer 5 → 4 → 1 selection for pack-A byte buffer.
+        // Layer 3 (pre-pack handle) is checked per-iteration inside the loops.
+        var carver = new WorkspaceCarver(options.Workspace);
+
+        Span<byte> packABytesSpan = carver.HasWorkspace ? carver.TryCarve(packABytes) : Span<byte>.Empty;
+        if (packABytesSpan.IsEmpty) packABytesSpan = ArenaIntegration.TryRentBytes(packABytes);
+        if (packABytesSpan.IsEmpty) packABytesSpan = PerThreadPool.Current.RentPackA(packABytes);
+
+        Span<T> packA = MemoryMarshal.Cast<byte, T>(packABytesSpan).Slice(0, mc * kc);
 
         for (int pc = 0; pc < k; pc += kc)
         {
@@ -53,14 +68,27 @@ internal static class PackAOnlyStrategy
             {
                 int effectiveMc = Math.Min(mc, m - ic);
 
-                // Pack A[ic..ic+effectiveMc, pc..pc+effectiveKc] into packA.
-                // transA=false: A is [M, K] row-major, panel starts at a[ic * lda + pc].
-                // transA=true:  A is [K, M] row-major, panel starts at a[pc * lda + ic].
-                int aSliceOffset = transA ? pc * lda + ic : ic * lda + pc;
-                ScalarPack.PackA<T>(
-                    a: a.Slice(aSliceOffset), lda, transA,
-                    packed: packA.AsSpan(0, effectiveMc * effectiveKc),
-                    mc: effectiveMc, kc: effectiveKc, mr);
+                // Layer 3: short-circuit pack-A when pre-pack handle is current.
+                bool packAFromPrePack = false;
+                Span<T> activePackA = packA;
+                if (options.PackedA != null && WeightPackCache.IsCacheCurrent(options.PackedA)
+                    && options.PackedA.PackedBuffer.Length >= packABytes)
+                {
+                    activePackA = MemoryMarshal.Cast<byte, T>(options.PackedA.PackedBuffer.AsSpan(0, packABytes));
+                    packAFromPrePack = true;
+                }
+
+                if (!packAFromPrePack)
+                {
+                    // Pack A[ic..ic+effectiveMc, pc..pc+effectiveKc] into packA.
+                    // transA=false: A is [M, K] row-major, panel starts at a[ic * lda + pc].
+                    // transA=true:  A is [K, M] row-major, panel starts at a[pc * lda + ic].
+                    int aSliceOffset = transA ? pc * lda + ic : ic * lda + pc;
+                    ScalarPack.PackA<T>(
+                        a: a.Slice(aSliceOffset), lda, transA,
+                        packed: activePackA.Slice(0, effectiveMc * effectiveKc),
+                        mc: effectiveMc, kc: effectiveKc, mr);
+                }
 
                 // Iterate microkernel tiles. B is read in-place at (pc, jc).
                 for (int jc = 0; jc < n; jc += nr)
@@ -78,7 +106,7 @@ internal static class PackAOnlyStrategy
                         int bSliceOffset = pc * ldb + jc;
 
                         DispatchStridedMicrokernel<T>(
-                            packA.AsSpan(packedAStripeOff, effectiveKc * mr),
+                            activePackA.Slice(packedAStripeOff, effectiveKc * mr),
                             b.Slice(bSliceOffset), ldb,
                             c.Slice(cTileOff), ldc, effectiveKc);
                     }

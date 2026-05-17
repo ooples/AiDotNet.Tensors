@@ -86,7 +86,8 @@ public static class BlasManaged
                     c, ldc,
                     m, n, k,
                     mc: 64, nc: 64, kc: 64,
-                    mr: mr, nr: nr);
+                    mr: mr, nr: nr,
+                    options);
                 break;
             case PackingMode.ForcePackAOnly:
                 // PackAOnly currently has no AVX2 strided-B kernel; always scalar Mr=Nr=4.
@@ -97,7 +98,8 @@ public static class BlasManaged
                     c, ldc,
                     m, n, k,
                     mc: 64, kc: 64,
-                    mr: 4, nr: 4);
+                    mr: 4, nr: 4,
+                    options);
                 break;
             case PackingMode.ForceStreaming:
                 // Streaming dispatches AVX2 internally — no Mr/Nr tiling parameter.
@@ -120,10 +122,10 @@ public static class BlasManaged
                     switch (fallback)
                     {
                         case PackingMode.ForcePackBoth:
-                            PackBothStrategy.Run<T>(a, lda, transA, b, ldb, transB, c, ldc, m, n, k, 64, 64, 64, mr, nr);
+                            PackBothStrategy.Run<T>(a, lda, transA, b, ldb, transB, c, ldc, m, n, k, 64, 64, 64, mr, nr, options);
                             break;
                         case PackingMode.ForcePackAOnly:
-                            PackAOnlyStrategy.Run<T>(a, lda, transA, b, ldb, c, ldc, m, n, k, 64, 64, 4, 4);
+                            PackAOnlyStrategy.Run<T>(a, lda, transA, b, ldb, c, ldc, m, n, k, 64, 64, 4, 4, options);
                             break;
                         case PackingMode.ForceStreaming:
                             StreamingStrategy.Run<T>(a, lda, transA, b, ldb, transB, c, ldc, m, n, k);
