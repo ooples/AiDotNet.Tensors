@@ -1577,4 +1577,36 @@ public class ScalarKernelTests
         for (int i = 0; i < expected.Length; i++)
             Assert.Equal(expected[i], actual[i], precision: 9);
     }
+
+    // ── D8: PackBoth + AVX-512 end-to-end coverage ───────────────────────────
+    // These shapes have M*N >= 1024 and K >= 128, which routes through PackBoth.
+    // On AVX-512 hardware the (8,16) FP64 tile is chosen; on AVX2 the (4,8) tile;
+    // on scalar the (4,4) tile. All three produce numerically correct results.
+
+    [Theory]
+    [InlineData(64, 32, 128, false, false)]    // m*n=2048 → PackBoth; FP64 AVX-512 tile (8,16) divides (64,32)
+    [InlineData(32, 32, 128, false, false)]    // m*n=1024 → PackBoth (exactly at threshold)
+    [InlineData(32, 32, 128, true, false)]     // transA
+    public void Gemm_PackBoth_AVX512_FP64_MatchesNaive(int m, int n, int k, bool transA, bool transB)
+    {
+        int aCols = transA ? m : k;
+        int lda = aCols;
+        int bCols = transB ? k : n;
+        int ldb = bCols;
+
+        var (a, b) = GenerateRandomMatrices(m, n, k, transA, transB, seed: 42);
+        int aRows = transA ? k : m;
+        int bRows = transB ? n : k;
+        double[] expected = NaiveGemm(a, aRows, aCols, transA, b, bRows, bCols, transB);
+
+        double[] actual = new double[m * n];
+        BlasManagedLib.Gemm<double>(
+            a, lda, transA,
+            b, ldb, transB,
+            actual, ldc: n,
+            m, n, k);
+
+        for (int i = 0; i < expected.Length; i++)
+            Assert.Equal(expected[i], actual[i], precision: 9);
+    }
 }
