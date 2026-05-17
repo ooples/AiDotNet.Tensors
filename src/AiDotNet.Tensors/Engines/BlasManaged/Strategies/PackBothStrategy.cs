@@ -1,6 +1,8 @@
 using System;
+using System.Buffers;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using AiDotNet.Tensors.Helpers;
 
 namespace AiDotNet.Tensors.Engines.BlasManaged;
 
@@ -53,7 +55,7 @@ internal static class PackBothStrategy
     /// <param name="mr">Microkernel row-tile width (Mr). Must divide mc exactly (Phase G adds tail).</param>
     /// <param name="nr">Microkernel column-tile width (Nr). Must divide nc exactly (Phase G adds tail).</param>
     /// <param name="options">Allocator options: workspace buffer, pre-pack handles, packing mode.</param>
-    public static void Run<T>(
+    public static unsafe void Run<T>(
         ReadOnlySpan<T> a, int lda, bool transA,
         ReadOnlySpan<T> b, int ldb, bool transB,
         Span<T> c, int ldc,
@@ -67,22 +69,90 @@ internal static class PackBothStrategy
         int packABytes = mc * kc * elemSize;
         int packBBytes = kc * nc * elemSize;
 
-        // Layer 5 → 4 → 1 selection for pack-A and pack-B byte buffers.
-        // Layer 2 (ArrayPool overflow) is deferred to a future task.
-        // Layer 3 (pre-pack handles) is checked per-iteration inside the loops.
-        var carver = new WorkspaceCarver(options.Workspace);
+        // When a caller-supplied workspace is present (Layer 5), we cannot split it
+        // safely across threads. Run serial: workspace carved for both pack-A and pack-B.
+        // When no workspace is supplied, the ic loop is parallelized across threads:
+        // each thread rents its own pack-A from PerThreadPool.Current ([ThreadStatic]),
+        // while pack-B is shared (read-only inside the parallel region).
+        bool hasWorkspace = !options.Workspace.IsEmpty;
 
-        Span<byte> packABytesSpan = carver.HasWorkspace ? carver.TryCarve(packABytes) : Span<byte>.Empty;
-        if (packABytesSpan.IsEmpty) packABytesSpan = ArenaIntegration.TryRentBytes(packABytes);
-        if (packABytesSpan.IsEmpty) packABytesSpan = PerThreadPool.Current.RentPackA(packABytes);
+        if (hasWorkspace)
+        {
+            // ── Serial path (workspace-backed) ──────────────────────────────────────
+            var carver = new WorkspaceCarver(options.Workspace);
+            Span<byte> packABytesSpan = carver.TryCarve(packABytes);
+            if (packABytesSpan.IsEmpty) packABytesSpan = ArenaIntegration.TryRentBytes(packABytes);
+            if (packABytesSpan.IsEmpty) packABytesSpan = PerThreadPool.Current.RentPackA(packABytes);
 
-        Span<byte> packBBytesSpan = carver.HasWorkspace ? carver.TryCarve(packBBytes) : Span<byte>.Empty;
-        if (packBBytesSpan.IsEmpty) packBBytesSpan = ArenaIntegration.TryRentBytes(packBBytes);
-        if (packBBytesSpan.IsEmpty) packBBytesSpan = PerThreadPool.Current.RentPackB(packBBytes);
+            Span<byte> packBBytesSpan = carver.TryCarve(packBBytes);
+            if (packBBytesSpan.IsEmpty) packBBytesSpan = ArenaIntegration.TryRentBytes(packBBytes);
+            if (packBBytesSpan.IsEmpty) packBBytesSpan = PerThreadPool.Current.RentPackB(packBBytes);
 
-        Span<T> packA = MemoryMarshal.Cast<byte, T>(packABytesSpan).Slice(0, mc * kc);
-        Span<T> packB = MemoryMarshal.Cast<byte, T>(packBBytesSpan).Slice(0, kc * nc);
+            Span<T> packA = MemoryMarshal.Cast<byte, T>(packABytesSpan).Slice(0, mc * kc);
+            Span<T> packB = MemoryMarshal.Cast<byte, T>(packBBytesSpan).Slice(0, kc * nc);
 
+            RunSerial<T>(a, lda, transA, b, ldb, transB, c, ldc, m, n, k, mc, nc, kc, mr, nr,
+                packA, packB, in options, elemSize);
+        }
+        else
+        {
+            // ── Parallel path (no workspace) ────────────────────────────────────────
+            // Pack-B is allocated once on the calling thread (shared, read-only during
+            // the parallel region). We use ArrayPool<byte> so the backing byte[] can be
+            // captured by the parallel lambda without violating the Span<T>-is-stack-only rule.
+            // Pack-A is NOT pre-allocated here: each parallel icIdx body calls
+            // PerThreadPool.Current.RentPackA ([ThreadStatic]) → every thread gets its own
+            // buffer with zero cross-thread contention.
+            //
+            // a, b, c are pinned via `fixed` before entering the parallel region so the GC
+            // cannot relocate them while worker threads hold raw pointers into them.
+            byte[]? packBArray = null;
+            try
+            {
+                Span<byte> packBBytesSpan = ArenaIntegration.TryRentBytes(packBBytes);
+                if (packBBytesSpan.IsEmpty)
+                {
+                    packBArray = ArrayPool<byte>.Shared.Rent(packBBytes);
+                    packBBytesSpan = packBArray.AsSpan(0, packBBytes);
+                }
+
+                // Pin a, b, c for the duration of RunParallelUnsafe.
+                // `fixed` on a Span<T> obtained from a managed array is supported in C# 7.3+.
+                fixed (T* aPtr = a)
+                fixed (T* bPtr = b)
+                fixed (T* cPtr = c)
+                {
+                    RunParallelUnsafe<T>(
+                        aPtr, a.Length, lda, transA,
+                        bPtr, b.Length, ldb, transB,
+                        cPtr, c.Length, ldc,
+                        m, n, k, mc, nc, kc, mr, nr,
+                        packBBytesSpan, in options, elemSize);
+                }
+            }
+            finally
+            {
+                if (packBArray != null)
+                    ArrayPool<byte>.Shared.Return(packBArray);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Serial execution of the 3-level Goto loop nest. Used when the caller
+    /// provides a workspace buffer (Layer 5) that cannot be split across threads.
+    /// Pack-A and pack-B buffers are already allocated by the caller.
+    /// </summary>
+    private static void RunSerial<T>(
+        ReadOnlySpan<T> a, int lda, bool transA,
+        ReadOnlySpan<T> b, int ldb, bool transB,
+        Span<T> c, int ldc,
+        int m, int n, int k,
+        int mc, int nc, int kc,
+        int mr, int nr,
+        Span<T> packA, Span<T> packB,
+        in BlasOptions<T> options, int elemSize) where T : unmanaged
+    {
         for (int jc = 0; jc < n; jc += nc)
         {
             int effectiveNc = Math.Min(nc, n - jc);
@@ -92,7 +162,6 @@ internal static class PackBothStrategy
                 int effectiveKc = Math.Min(kc, k - pc);
 
                 // Layer 3: short-circuit pack-B when pre-pack handle is current.
-                // Caller is responsible for the handle covering the full Kc × Nc panel.
                 // Use effective tile bytes, not nominal, because PrePackB clamps Kc/Nc to
                 // the actual matrix dimensions (small matrices produce smaller handles).
                 int effectivePackBBytes = effectiveKc * effectiveNc * elemSize;
@@ -169,6 +238,166 @@ internal static class PackBothStrategy
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Parallel execution of the 3-level Goto loop nest (M-axis split on the ic loop).
+    /// a, b, c are passed as raw pointers (pinned by the caller via <c>fixed</c>).
+    ///
+    /// <para>
+    /// Pack-B is packed once on the calling thread, then shared across all ic threads as
+    /// a read-only <c>byte[]</c> captured by the parallel lambda. Pack-A is rented per-thread
+    /// from <see cref="PerThreadPool.Current"/> (<c>[ThreadStatic]</c>), providing each
+    /// worker thread its own dedicated buffer with zero cross-thread contention.
+    /// C writes are disjoint — each icIdx block owns rows [ic, ic+effectiveMc) — so no
+    /// synchronization is needed on the C matrix.
+    /// </para>
+    ///
+    /// <para>
+    /// Note on allocator bypass for pack-A under parallelism:
+    /// - Workspace (Layer 5): a single buffer carved by <see cref="WorkspaceCarver"/> cannot
+    ///   be split safely across threads. Bypassed; caller routes workspace callers to serial.
+    /// - Arena (Layer 4): <c>[ThreadStatic]</c> — only the calling thread may have an arena
+    ///   active; worker threads do not inherit it. Bypassed for pack-A.
+    /// - PerThreadPool (Layer 1): always used. Each worker thread's <c>[ThreadStatic]</c>
+    ///   pool instance is lazily created on first access, ensuring isolation.
+    /// </para>
+    /// </summary>
+    private static unsafe void RunParallelUnsafe<T>(
+        T* aPtr, int aLen, int lda, bool transA,
+        T* bPtr, int bLen, int ldb, bool transB,
+        T* cPtr, int cLen, int ldc,
+        int m, int n, int k,
+        int mc, int nc, int kc,
+        int mr, int nr,
+        Span<byte> packBBytesSpan,
+        in BlasOptions<T> options, int elemSize) where T : unmanaged
+    {
+        // Snapshot options fields: BlasOptions<T> is a ref struct and cannot be captured.
+        WeightPackHandle? packedA = options.PackedA;
+        WeightPackHandle? packedB = options.PackedB;
+
+        // Convert pinned pointers to nint (platform int) so they can be captured by the lambda.
+        // Worker threads reconstruct spans from these captured pointers.
+        nint aPtrInt = (nint)aPtr;
+        nint bPtrInt = (nint)bPtr;
+        nint cPtrInt = (nint)cPtr;
+
+        // Pack-B backing array: capturable by the lambda as a managed byte[].
+        // The bytes are shared across all ic-parallel iterations (read-only after packing).
+        byte[] packBArr = new byte[packBBytesSpan.Length];
+
+        for (int jc = 0; jc < n; jc += nc)
+        {
+            int effectiveNc = Math.Min(nc, n - jc);
+
+            for (int pc = 0; pc < k; pc += kc)
+            {
+                int effectiveKc = Math.Min(kc, k - pc);
+
+                // ── Pack B (shared, single calling-thread, before the parallel ic region) ──
+                int effectivePackBBytes = effectiveKc * effectiveNc * elemSize;
+                bool packBFromPrePack = false;
+                if (packedB != null && WeightPackCache.IsCacheCurrent(packedB)
+                    && packedB.PackedBuffer.Length >= effectivePackBBytes)
+                {
+                    // Layer 3: pre-packed B is already in byte[] form — copy into packBArr
+                    // so the parallel lambda reads from a stable, capturable byte[].
+                    packedB.PackedBuffer.AsSpan(0, effectivePackBBytes)
+                           .CopyTo(packBArr.AsSpan(0, effectivePackBBytes));
+                    packBFromPrePack = true;
+                }
+
+                if (!packBFromPrePack)
+                {
+                    // Pack B[pc..pc+effectiveKc, jc..jc+effectiveNc] into packBArr.
+                    // transB=false: panel starts at b[pc * ldb + jc].
+                    // transB=true:  panel starts at b[jc * ldb + pc].
+                    int bSliceOffset = transB ? jc * ldb + pc : pc * ldb + jc;
+                    ReadOnlySpan<T> bSlice = new ReadOnlySpan<T>((T*)bPtrInt + bSliceOffset, bLen - bSliceOffset);
+                    Span<T> packBTemp = MemoryMarshal.Cast<byte, T>(packBArr.AsSpan(0, effectivePackBBytes));
+                    ScalarPack.PackB<T>(
+                        b: bSlice, ldb, transB,
+                        packed: packBTemp,
+                        nc: effectiveNc, kc: effectiveKc, nr);
+                }
+
+                // ── M-axis parallel split on the ic loop ──────────────────────────────────
+                // Each icIdx body owns disjoint C rows [ic, ic+effectiveMc) → no sync on C.
+                int numIcBlocks = (m + mc - 1) / mc;
+                // Grain-size estimate: mc × effectiveNc × effectiveKc multiplied by
+                // numIcBlocks gives total MACs across all parallel iterations.
+                long totalWork = (long)mc * effectiveNc * effectiveKc * numIcBlocks;
+
+                // Capture loop-iteration locals (int/nint are value-type, safe to capture).
+                int jc_cap = jc, pc_cap = pc;
+                int effectiveNc_cap = effectiveNc, effectiveKc_cap = effectiveKc;
+                int effectivePackBBytes_cap = effectivePackBBytes;
+                byte[] packBArr_cap = packBArr;
+
+                CpuParallelSettings.ParallelForOrSerial(0, numIcBlocks, totalWork, icIdx =>
+                {
+                    int ic = icIdx * mc;
+                    int effectiveMc = Math.Min(mc, m - ic);
+
+                    // ── Pack A (per-thread, from PerThreadPool.Current) ────────────────
+                    int effectivePackABytes = effectiveMc * effectiveKc_cap * elemSize;
+                    Span<T> activePackA;
+                    if (packedA != null && WeightPackCache.IsCacheCurrent(packedA)
+                        && packedA.PackedBuffer.Length >= effectivePackABytes)
+                    {
+                        // Layer 3: pre-packed A is a read-only byte[]. Create span from it.
+                        activePackA = MemoryMarshal.Cast<byte, T>(
+                            packedA.PackedBuffer.AsSpan(0, effectivePackABytes));
+                    }
+                    else
+                    {
+                        // Layer 1: per-thread pool — [ThreadStatic] ensures each worker
+                        // thread rents from its own PerThreadPool instance.
+                        // Workspace (Layer 5) and Arena (Layer 4) are intentionally bypassed:
+                        //   Workspace: single caller buffer, not thread-partitionable.
+                        //   Arena: [ThreadStatic] — worker threads may have no arena active.
+                        Span<byte> packABytesSpan_inner = PerThreadPool.Current.RentPackA(effectivePackABytes);
+                        activePackA = MemoryMarshal.Cast<byte, T>(packABytesSpan_inner)
+                                                   .Slice(0, effectiveMc * effectiveKc_cap);
+
+                        int aSliceOffset = transA ? pc_cap * lda + ic : ic * lda + pc_cap;
+                        ReadOnlySpan<T> aSlice = new ReadOnlySpan<T>((T*)aPtrInt + aSliceOffset, aLen - aSliceOffset);
+                        ScalarPack.PackA<T>(
+                            a: aSlice, lda, transA,
+                            packed: activePackA,
+                            mc: effectiveMc, kc: effectiveKc_cap, mr);
+                    }
+
+                    // Shared pack-B: reconstruct span from captured byte[] (read-only).
+                    Span<T> activePackB = MemoryMarshal.Cast<byte, T>(
+                        packBArr_cap.AsSpan(0, effectivePackBBytes_cap));
+
+                    // ── Inner microkernel loop (jr, ir) ────────────────────────────────
+                    for (int jr = 0; jr < effectiveNc_cap; jr += nr)
+                    {
+                        for (int ir = 0; ir < effectiveMc; ir += mr)
+                        {
+                            // Stripe offsets into packed panels.
+                            // Stripe layout: [numStripes, Kc, Mr/Nr] → stripe * Kc * Mr/Nr.
+                            int packedAStripeOff = (ir / mr) * effectiveKc_cap * mr;
+                            int packedBStripeOff = (jr / nr) * effectiveKc_cap * nr;
+
+                            // C tile: rows [ic+ir, ic+ir+mr), cols [jc_cap+jr, jc_cap+jr+nr).
+                            // Disjoint from all other icIdx values → no write synchronization.
+                            int cTileOff = (ic + ir) * ldc + (jc_cap + jr);
+                            Span<T> cTile = new Span<T>((T*)cPtrInt + cTileOff, cLen - cTileOff);
+                            DispatchMicrokernel<T>(
+                                activePackA.Slice(packedAStripeOff, effectiveKc_cap * mr),
+                                activePackB.Slice(packedBStripeOff, effectiveKc_cap * nr),
+                                cTile,
+                                ldc, effectiveKc_cap,
+                                mr, nr);
+                        }
+                    }
+                });
             }
         }
     }

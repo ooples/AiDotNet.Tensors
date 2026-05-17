@@ -2419,4 +2419,37 @@ public class ScalarKernelTests
 
         handle.Dispose();
     }
+
+    // ── G1: M-axis parallel split in PackBothStrategy ─────────────────────────
+    // These test cases exercise the new parallel ic-loop path introduced in Task G1.
+    // Shapes are chosen to push total work (m × n × k) well above the serial grain-size
+    // threshold (32 768 elements), so ParallelForOrSerial dispatches to Parallel.For
+    // on multi-core machines. On single-core or low-core machines the serial fallback
+    // runs instead — both paths must produce results identical to the naïve reference.
+    // The correctness gate is precision: 9 decimal places (double has ~15 sig figs;
+    // M-axis splits write disjoint C rows, so there is no cross-thread accumulation
+    // that could introduce FMA reordering errors).
+
+    [Theory]
+    [InlineData(64, 64, 256)]   // 1M MACs — above grain-size, 1 ic-block (mc=64)
+    [InlineData(128, 32, 256)]  // 1M MACs — 2 ic-blocks (m=128, mc=64)
+    [InlineData(32, 128, 256)]  // 1M MACs — 1 ic-block, wide N
+    [InlineData(64, 64, 512)]   // 2M MACs — 4 kc-iterations (k=512, kc=64)
+    public void Gemm_PackBoth_ParallelMAxis_MatchesNaive(int m, int n, int k)
+    {
+        var (a, b) = GenerateRandomMatrices(m, n, k, transA: false, transB: false, seed: 42);
+        double[] expected = NaiveGemm(a, m, k, false, b, k, n, false);
+
+        double[] actual = new double[m * n];
+        var options = new BlasOptions<double> { PackingMode = PackingMode.ForcePackBoth };
+        BlasManagedLib.Gemm<double>(
+            a, lda: k, transA: false,
+            b, ldb: n, transB: false,
+            actual, ldc: n,
+            m, n, k,
+            options);
+
+        for (int i = 0; i < expected.Length; i++)
+            Assert.Equal(expected[i], actual[i], precision: 9);
+    }
 }
