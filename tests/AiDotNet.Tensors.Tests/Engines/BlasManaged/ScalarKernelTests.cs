@@ -1470,4 +1470,82 @@ public class ScalarKernelTests
         for (int i = 0; i < expected.Length; i++)
             Assert.Equal(expected[i], actual[i], precision: 10);
     }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(3)]
+    [InlineData(7)]
+    [InlineData(8)]
+    [InlineData(9)]
+    [InlineData(15)]
+    public void Avx512Tail_RunFp64_8xN_MaskedStore_PreservesUnmaskedColumns(int effectiveNr)
+    {
+        if (!Avx512Tail.IsSupported) return;
+
+        int kc = 8;
+        var rng = new Random(42);
+        double[] packedA = new double[8 * kc];
+        double[] packedB = new double[kc * 16];
+        for (int i = 0; i < packedA.Length; i++) packedA[i] = rng.NextDouble() * 2 - 1;
+        for (int i = 0; i < packedB.Length; i++) packedB[i] = rng.NextDouble() * 2 - 1;
+
+        double[] c = new double[8 * 16];
+        for (int i = 0; i < c.Length; i++) c[i] = 999.0;
+
+        Avx512Tail.RunFp64_8xN(packedA, packedB, c.AsSpan(), ldc: 16, kc, effectiveNr);
+
+        double[] cRef = new double[8 * 16];
+        for (int i = 0; i < cRef.Length; i++) cRef[i] = 999.0;
+        Avx512Fp64_8x16.Run(packedA, packedB, cRef.AsSpan(), ldc: 16, kc);
+
+        for (int row = 0; row < 8; row++)
+        {
+            for (int col = 0; col < 16; col++)
+            {
+                double actual = c[row * 16 + col];
+                if (col < effectiveNr)
+                    Assert.Equal(cRef[row * 16 + col], actual, precision: 12);
+                else
+                    Assert.Equal(999.0, actual);
+            }
+        }
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(7)]
+    [InlineData(11)]
+    [InlineData(15)]
+    public void Avx512Tail_RunFp32_16xN_MaskedStore_PreservesUnmaskedColumns(int effectiveNr)
+    {
+        if (!Avx512Tail.IsSupported) return;
+
+        int kc = 8;
+        var rng = new Random(42);
+        float[] packedA = new float[16 * kc];
+        float[] packedB = new float[kc * 16];
+        for (int i = 0; i < packedA.Length; i++) packedA[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < packedB.Length; i++) packedB[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        float[] c = new float[16 * 16];
+        for (int i = 0; i < c.Length; i++) c[i] = 999f;
+
+        Avx512Tail.RunFp32_16xN(packedA, packedB, c.AsSpan(), ldc: 16, kc, effectiveNr);
+
+        float[] cRef = new float[16 * 16];
+        for (int i = 0; i < cRef.Length; i++) cRef[i] = 999f;
+        Avx512Fp32_16x16.Run(packedA, packedB, cRef.AsSpan(), ldc: 16, kc);
+
+        for (int row = 0; row < 16; row++)
+        {
+            for (int col = 0; col < 16; col++)
+            {
+                float actual = c[row * 16 + col];
+                if (col < effectiveNr)
+                    Assert.Equal(cRef[row * 16 + col], actual, precision: 4);
+                else
+                    Assert.Equal(999f, actual);
+            }
+        }
+    }
 }
