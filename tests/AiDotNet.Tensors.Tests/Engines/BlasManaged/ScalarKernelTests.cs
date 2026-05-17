@@ -2177,4 +2177,50 @@ public class ScalarKernelTests
         handle.MarkDirty();
         Assert.False(WeightPackCache.IsCacheCurrent(handle));
     }
+
+    // -------------------------------------------------------------------------
+    // F4: ArenaIntegration (Layer 4 allocator)
+    // -------------------------------------------------------------------------
+
+    [Fact]
+    public void ArenaIntegration_NoActiveArena_ReturnsEmpty()
+    {
+        // Ensure no arena is active (caller may have set one earlier).
+        Assert.False(ArenaIntegration.IsArenaActive,
+            "Test precondition failed: an arena is already active. Make sure prior tests dispose their arenas.");
+
+        Span<byte> result = ArenaIntegration.TryRentBytes(1024);
+        Assert.True(result.IsEmpty);
+    }
+
+    [Fact]
+    public void ArenaIntegration_ActiveArena_ReturnsArenaBuffer()
+    {
+        using var arena = AiDotNet.Tensors.Helpers.TensorArena.Create();
+        Assert.True(ArenaIntegration.IsArenaActive);
+
+        Span<byte> result = ArenaIntegration.TryRentBytes(2048);
+        Assert.Equal(2048, result.Length);
+    }
+
+    [Fact]
+    public void ArenaIntegration_ZeroBytes_ReturnsEmpty()
+    {
+        using var arena = AiDotNet.Tensors.Helpers.TensorArena.Create();
+        Span<byte> result = ArenaIntegration.TryRentBytes(0);
+        Assert.True(result.IsEmpty);
+    }
+
+    [Fact]
+    public void ArenaIntegration_ArenaScopeRespected()
+    {
+        // After arena disposal, TryRentBytes should fall through (empty).
+        {
+            using var arena = AiDotNet.Tensors.Helpers.TensorArena.Create();
+            Assert.True(ArenaIntegration.IsArenaActive);
+        }
+        Assert.False(ArenaIntegration.IsArenaActive);
+        Span<byte> result = ArenaIntegration.TryRentBytes(1024);
+        Assert.True(result.IsEmpty);
+    }
 }
