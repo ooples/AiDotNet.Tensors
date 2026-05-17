@@ -3294,4 +3294,157 @@ public class ScalarKernelTests
         OutputScaleEpilogue.Apply<float>(c.AsSpan(), ldc: 2, m: 2, n: 2, scale: 0.5f);
         Assert.Equal(new float[] { 0.5f, 1.0f, 1.5f, 2.0f }, c);
     }
+
+    // ── I7/I8: EpilogueChain orchestration + strategy integration ────────────
+
+    [Fact]
+    public void EpilogueChain_NoFlags_IsNoOp()
+    {
+        double[] c = { 1, 2, 3, 4 };
+        var epilogue = new Epilogue<double>();
+        EpilogueChain.Apply<double>(c.AsSpan(), ldc: 2, m: 2, n: 2, in epilogue);
+        Assert.Equal(new double[] { 1, 2, 3, 4 }, c);
+    }
+
+    [Fact]
+    public void EpilogueChain_BiasAndReLU_ApplyInOrder()
+    {
+        // C[i,j] = original, then C += bias, then ReLU.
+        double[] c = { -5, 0, 1, 2 };  // 2x2
+        double[] bias = { -1, 3 };
+
+        var epilogue = new Epilogue<double>
+        {
+            BiasN = bias,
+            Activation = FusedActivationType.ReLU,
+        };
+        EpilogueChain.Apply<double>(c.AsSpan(), ldc: 2, m: 2, n: 2, in epilogue);
+
+        // After bias: { -6, 3, 0, 5 }
+        // After ReLU: { 0, 3, 0, 5 }
+        Assert.Equal(new double[] { 0, 3, 0, 5 }, c);
+    }
+
+    [Fact]
+    public void EpilogueChain_FullChain_BiasActivationSkipDropoutScale()
+    {
+        // Verify all five stages run in correct order. Use simple values to make
+        // the math hand-checkable.
+        double[] c = { 0, 0, 0, 0 };  // 2x2, starts at zero
+        double[] bias = { 2, 4 };
+        double[] skip = { 1, 1, 1, 1 };
+
+        var epilogue = new Epilogue<double>
+        {
+            BiasN = bias,
+            Activation = FusedActivationType.ReLU,
+            SkipMxN = skip,
+            OutputScale = 0.5,
+            // Skip dropout in this test (it's tested separately) — leave DropoutMask = 0.
+        };
+        EpilogueChain.Apply<double>(c.AsSpan(), ldc: 2, m: 2, n: 2, in epilogue);
+
+        // After bias: { 2, 4, 2, 4 }
+        // After ReLU: { 2, 4, 2, 4 } (already non-negative)
+        // After skip: { 3, 5, 3, 5 }
+        // After scale (×0.5): { 1.5, 2.5, 1.5, 2.5 }
+        Assert.Equal(new double[] { 1.5, 2.5, 1.5, 2.5 }, c);
+    }
+
+    [Fact]
+    public void Gemm_WithBiasEpilogue_MatchesUnfusedTwoPass()
+    {
+        int m = 8, n = 8, k = 8;
+        var (a, b) = GenerateRandomMatrices(m, n, k, transA: false, transB: false, seed: 42);
+        double[] bias = new double[n];
+        for (int j = 0; j < n; j++) bias[j] = (j + 1) * 0.1;
+
+        // Two-pass reference: Gemm then Bias.
+        double[] expected = NaiveGemm(a, m, k, false, b, k, n, false);
+        for (int i = 0; i < m; i++)
+            for (int j = 0; j < n; j++)
+                expected[i * n + j] += bias[j];
+
+        // Fused chain: BlasManaged.Gemm with bias in epilogue.
+        double[] actual = new double[m * n];
+        var options = new BlasOptions<double>
+        {
+            PackingMode = PackingMode.ForcePackBoth,
+            Epilogue = new Epilogue<double> { BiasN = bias },
+        };
+        BlasManagedLib.Gemm<double>(
+            a, lda: k, transA: false,
+            b, ldb: n, transB: false,
+            actual, ldc: n,
+            m, n, k,
+            options);
+
+        for (int i = 0; i < expected.Length; i++)
+            Assert.Equal(expected[i], actual[i], precision: 10);
+    }
+
+    [Fact]
+    public void Gemm_WithReLUEpilogue_MatchesUnfusedTwoPass()
+    {
+        int m = 8, n = 8, k = 8;
+        var (a, b) = GenerateRandomMatrices(m, n, k, transA: false, transB: false, seed: 42);
+
+        // Two-pass reference.
+        double[] expected = NaiveGemm(a, m, k, false, b, k, n, false);
+        for (int i = 0; i < expected.Length; i++)
+            if (expected[i] < 0) expected[i] = 0;
+
+        double[] actual = new double[m * n];
+        var options = new BlasOptions<double>
+        {
+            PackingMode = PackingMode.ForcePackBoth,
+            Epilogue = new Epilogue<double> { Activation = FusedActivationType.ReLU },
+        };
+        BlasManagedLib.Gemm<double>(
+            a, lda: k, transA: false,
+            b, ldb: n, transB: false,
+            actual, ldc: n,
+            m, n, k,
+            options);
+
+        for (int i = 0; i < expected.Length; i++)
+            Assert.Equal(expected[i], actual[i], precision: 10);
+    }
+
+    [Fact]
+    public void Gemm_WithBiasAndReLU_MatchesUnfusedThreePass()
+    {
+        int m = 8, n = 8, k = 8;
+        var (a, b) = GenerateRandomMatrices(m, n, k, transA: false, transB: false, seed: 42);
+        double[] bias = new double[n];
+        for (int j = 0; j < n; j++) bias[j] = (j - 4) * 0.5;  // mix of positive + negative
+
+        // Three-pass reference.
+        double[] expected = NaiveGemm(a, m, k, false, b, k, n, false);
+        for (int i = 0; i < m; i++)
+            for (int j = 0; j < n; j++)
+                expected[i * n + j] += bias[j];
+        for (int i = 0; i < expected.Length; i++)
+            if (expected[i] < 0) expected[i] = 0;
+
+        double[] actual = new double[m * n];
+        var options = new BlasOptions<double>
+        {
+            PackingMode = PackingMode.ForcePackBoth,
+            Epilogue = new Epilogue<double>
+            {
+                BiasN = bias,
+                Activation = FusedActivationType.ReLU,
+            },
+        };
+        BlasManagedLib.Gemm<double>(
+            a, lda: k, transA: false,
+            b, ldb: n, transB: false,
+            actual, ldc: n,
+            m, n, k,
+            options);
+
+        for (int i = 0; i < expected.Length; i++)
+            Assert.Equal(expected[i], actual[i], precision: 10);
+    }
 }

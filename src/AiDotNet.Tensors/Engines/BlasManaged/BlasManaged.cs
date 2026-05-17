@@ -162,6 +162,12 @@ public static class BlasManaged
             default:
                 throw new NotSupportedException($"Unknown PackingMode: {strategy}");
         }
+
+        // Apply fused epilogue chain (post-pass). Fast-path when no stages are active.
+        // Copy epilogue to a local so we can pass it by-ref (ref structs cannot be passed
+        // in from a property of another in ref struct directly).
+        var epilogue = options.Epilogue;
+        EpilogueChain.Apply<T>(c, ldc, m, n, in epilogue);
     }
 
     /// <summary>
