@@ -1548,4 +1548,33 @@ public class ScalarKernelTests
             }
         }
     }
+
+    [Fact]
+    public void Gemm_L2ShapeScaled_TransA_FP64_MatchesNaive()
+    {
+        // Scaled-down L2 shape (M=4096 → 32, N=16, K=512 → 128, transA=true).
+        // The real L2 from issue #358 has M=4096 but takes too long for unit tests;
+        // 32 exercises the same dispatch path (PackBoth + AVX-512 if available).
+        // Phase L (Gate 1) runs the full M=4096 shape under the perf benchmark.
+        int m = 32, n = 16, k = 128;
+        bool transA = true, transB = false;
+
+        int aCols = transA ? m : k;
+        int lda = aCols;
+        int ldb = n;
+
+        var (a, b) = GenerateRandomMatrices(m, n, k, transA, transB, seed: 42);
+        int aRows = transA ? k : m;
+        double[] expected = NaiveGemm(a, aRows, aCols, transA, b, k, n, transB);
+
+        double[] actual = new double[m * n];
+        BlasManagedLib.Gemm<double>(
+            a, lda, transA,
+            b, ldb, transB,
+            actual, ldc: n,
+            m, n, k);
+
+        for (int i = 0; i < expected.Length; i++)
+            Assert.Equal(expected[i], actual[i], precision: 9);
+    }
 }

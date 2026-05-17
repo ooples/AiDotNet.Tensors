@@ -65,10 +65,11 @@ public static class BlasManaged
         if (strategy == PackingMode.ForcePackAOnly && transB)
             strategy = PackingMode.ForcePackBoth;
 
-        // Pick AVX2-aware (mr, nr) for PackBoth. Fall back to (4, 4) scalar when
-        // the shape is not an exact multiple of the AVX2 tile — tail handling added
-        // in Phase G. PackAOnly always uses scalar (4, 4) because its strided-B path
-        // has no AVX2 RunStridedB variant yet (deferred to Phase Cx).
+        // Pick SIMD-aware (mr, nr) for PackBoth using the AVX-512 → AVX2 → scalar
+        // hierarchy. Fall back to (4, 4) scalar when the shape is not an exact
+        // multiple of the chosen tile — tail handling added in Phase G.
+        // PackAOnly always uses scalar (4, 4) because its strided-B path has no
+        // AVX2/AVX-512 RunStridedB variant yet (deferred to Phase Cx).
         var (mr, nr) = PickMicrokernelTile<T>();
         if (m % mr != 0 || n % nr != 0)
         {
@@ -138,20 +139,28 @@ public static class BlasManaged
 
     /// <summary>
     /// Pick the microkernel (mr, nr) tile widths based on element type and
-    /// runtime AVX2/FMA availability. Returns the scalar 4×4 fallback when
-    /// AVX2 isn't usable. This selection drives the layout of packed-A and
-    /// packed-B, so it must match the microkernel the strategy ultimately
-    /// dispatches to.
+    /// runtime SIMD availability. The selection follows a three-tier hierarchy
+    /// — AVX-512 → AVX2 → scalar — so the widest available vector ISA is used:
+    /// <list type="bullet">
+    ///   <item>FP64: (8, 16) AVX-512 → (4, 8) AVX2 → (4, 4) scalar.</item>
+    ///   <item>FP32: (16, 16) AVX-512 → (8, 8) AVX2 → (4, 4) scalar.</item>
+    /// </list>
+    /// This selection drives the layout of packed-A and packed-B, so it must
+    /// match the microkernel the strategy ultimately dispatches to.
     /// </summary>
     private static (int Mr, int Nr) PickMicrokernelTile<T>() where T : unmanaged
     {
         if (typeof(T) == typeof(double))
         {
-            return Avx2Fp64_4x8.IsSupported ? (4, 8) : (4, 4);
+            if (Avx512Fp64_8x16.IsSupported) return (8, 16);
+            if (Avx2Fp64_4x8.IsSupported) return (4, 8);
+            return (4, 4);
         }
         if (typeof(T) == typeof(float))
         {
-            return Avx2Fp32_8x8.IsSupported ? (8, 8) : (4, 4);
+            if (Avx512Fp32_16x16.IsSupported) return (16, 16);
+            if (Avx2Fp32_8x8.IsSupported) return (8, 8);
+            return (4, 4);
         }
         return (4, 4);
     }

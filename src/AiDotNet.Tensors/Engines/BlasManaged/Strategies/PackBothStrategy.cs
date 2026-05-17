@@ -11,10 +11,11 @@ namespace AiDotNet.Tensors.Engines.BlasManaged;
 /// inner loops.
 ///
 /// <para>
-/// This is the scalar-baseline strategy: it dispatches to
-/// <see cref="ScalarFp64_4x4"/> or <see cref="ScalarFp32_4x4"/> based on the
-/// runtime element type. AVX2/AVX-512/Neon strategies in later phases mirror
-/// this loop structure with their own microkernels.
+/// Microkernel dispatch follows an AVX-512 → AVX2 → scalar hierarchy:
+/// FP64 prefers <see cref="Avx512Fp64_8x16"/> (Mr=8, Nr=16), falls back to
+/// <see cref="Avx2Fp64_4x8"/> (Mr=4, Nr=8), then <see cref="ScalarFp64_4x4"/>;
+/// FP32 prefers <see cref="Avx512Fp32_16x16"/> (Mr=16, Nr=16), falls back to
+/// <see cref="Avx2Fp32_8x8"/> (Mr=8, Nr=8), then <see cref="ScalarFp32_4x4"/>.
 /// </para>
 ///
 /// <para>
@@ -120,9 +121,8 @@ internal static class PackBothStrategy
 
     /// <summary>
     /// Routes to the appropriate microkernel for T based on (mr, nr) and
-    /// runtime AVX2/FMA availability. When AVX2 is available and (mr, nr)
-    /// match the AVX2 tile size, the AVX2 microkernel is used; otherwise the
-    /// scalar 4×4 reference kernel is used.
+    /// runtime SIMD availability. Dispatch order: AVX-512 → AVX2 → scalar 4×4,
+    /// so the widest available ISA is always selected.
     /// </summary>
     private static void DispatchMicrokernel<T>(
         ReadOnlySpan<T> packedA, ReadOnlySpan<T> packedB,
@@ -131,6 +131,15 @@ internal static class PackBothStrategy
     {
         if (typeof(T) == typeof(double))
         {
+            if (mr == 8 && nr == 16 && Avx512Fp64_8x16.IsSupported)
+            {
+                Avx512Fp64_8x16.Run(
+                    System.Runtime.InteropServices.MemoryMarshal.Cast<T, double>(packedA),
+                    System.Runtime.InteropServices.MemoryMarshal.Cast<T, double>(packedB),
+                    System.Runtime.InteropServices.MemoryMarshal.Cast<T, double>(c),
+                    ldc, kc);
+                return;
+            }
             if (mr == 4 && nr == 8 && Avx2Fp64_4x8.IsSupported)
             {
                 Avx2Fp64_4x8.Run(
@@ -153,6 +162,15 @@ internal static class PackBothStrategy
         }
         if (typeof(T) == typeof(float))
         {
+            if (mr == 16 && nr == 16 && Avx512Fp32_16x16.IsSupported)
+            {
+                Avx512Fp32_16x16.Run(
+                    System.Runtime.InteropServices.MemoryMarshal.Cast<T, float>(packedA),
+                    System.Runtime.InteropServices.MemoryMarshal.Cast<T, float>(packedB),
+                    System.Runtime.InteropServices.MemoryMarshal.Cast<T, float>(c),
+                    ldc, kc);
+                return;
+            }
             if (mr == 8 && nr == 8 && Avx2Fp32_8x8.IsSupported)
             {
                 Avx2Fp32_8x8.Run(

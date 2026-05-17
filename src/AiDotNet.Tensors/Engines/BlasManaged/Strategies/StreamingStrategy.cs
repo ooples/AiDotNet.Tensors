@@ -10,8 +10,9 @@ namespace AiDotNet.Tensors.Engines.BlasManaged;
 /// or <see cref="PackAOnlyStrategy"/> would exceed the GEMM compute time.
 ///
 /// <para>
-/// Routes to <see cref="Avx2Streaming"/> when AVX2 + FMA are available at
-/// runtime, otherwise falls back to the scalar reference kernel.
+/// Routes to <see cref="Avx512Streaming"/> when AVX-512 is available,
+/// then <see cref="Avx2Streaming"/> when AVX2 + FMA are available,
+/// otherwise falls back to the scalar reference kernel.
 /// </para>
 /// </summary>
 internal static class StreamingStrategy
@@ -29,6 +30,15 @@ internal static class StreamingStrategy
     {
         if (typeof(T) == typeof(double))
         {
+            if (Avx512Streaming.IsSupported)
+            {
+                Avx512Streaming.RunFp64(
+                    MemoryMarshal.Cast<T, double>(a), lda, transA,
+                    MemoryMarshal.Cast<T, double>(b), ldb, transB,
+                    MemoryMarshal.Cast<T, double>(c), ldc,
+                    m, n, k);
+                return;
+            }
             if (Avx2Streaming.IsSupported)
             {
                 Avx2Streaming.RunFp64(
@@ -36,18 +46,26 @@ internal static class StreamingStrategy
                     MemoryMarshal.Cast<T, double>(b), ldb, transB,
                     MemoryMarshal.Cast<T, double>(c), ldc,
                     m, n, k);
+                return;
             }
-            else
-            {
-                ScalarStreaming.RunFp64(
-                    MemoryMarshal.Cast<T, double>(a), lda, transA,
-                    MemoryMarshal.Cast<T, double>(b), ldb, transB,
-                    MemoryMarshal.Cast<T, double>(c), ldc,
-                    m, n, k);
-            }
+            ScalarStreaming.RunFp64(
+                MemoryMarshal.Cast<T, double>(a), lda, transA,
+                MemoryMarshal.Cast<T, double>(b), ldb, transB,
+                MemoryMarshal.Cast<T, double>(c), ldc,
+                m, n, k);
+            return;
         }
-        else if (typeof(T) == typeof(float))
+        if (typeof(T) == typeof(float))
         {
+            if (Avx512Streaming.IsSupported)
+            {
+                Avx512Streaming.RunFp32(
+                    MemoryMarshal.Cast<T, float>(a), lda, transA,
+                    MemoryMarshal.Cast<T, float>(b), ldb, transB,
+                    MemoryMarshal.Cast<T, float>(c), ldc,
+                    m, n, k);
+                return;
+            }
             if (Avx2Streaming.IsSupported)
             {
                 Avx2Streaming.RunFp32(
@@ -55,19 +73,15 @@ internal static class StreamingStrategy
                     MemoryMarshal.Cast<T, float>(b), ldb, transB,
                     MemoryMarshal.Cast<T, float>(c), ldc,
                     m, n, k);
+                return;
             }
-            else
-            {
-                ScalarStreaming.RunFp32(
-                    MemoryMarshal.Cast<T, float>(a), lda, transA,
-                    MemoryMarshal.Cast<T, float>(b), ldb, transB,
-                    MemoryMarshal.Cast<T, float>(c), ldc,
-                    m, n, k);
-            }
+            ScalarStreaming.RunFp32(
+                MemoryMarshal.Cast<T, float>(a), lda, transA,
+                MemoryMarshal.Cast<T, float>(b), ldb, transB,
+                MemoryMarshal.Cast<T, float>(c), ldc,
+                m, n, k);
+            return;
         }
-        else
-        {
-            throw new NotSupportedException($"StreamingStrategy does not support T={typeof(T).Name}.");
-        }
+        throw new NotSupportedException($"StreamingStrategy does not support T={typeof(T).Name}.");
     }
 }
