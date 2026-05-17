@@ -305,8 +305,8 @@ public static class BlasManaged
     public static void ClearCaches()
     {
         BlasManagedStatsTracker.Reset();
-        // Future: clear JIT cache (Phase J) and weight pre-pack cache (Layer 3)
-        // entries that are still in memory.
+        JittedKernelCache.Clear();
+        // Future: clear weight pre-pack cache entries that are still in memory.
     }
 
     /// <summary>

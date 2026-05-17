@@ -3447,4 +3447,106 @@ public class ScalarKernelTests
         for (int i = 0; i < expected.Length; i++)
             Assert.Equal(expected[i], actual[i], precision: 10);
     }
+
+    // -------------------------------------------------------------------------
+    // J1 + J6 + J9 — JittedKernelCache infrastructure + NativeAOT detector
+    // -------------------------------------------------------------------------
+
+    [Fact]
+    public void NativeAotDetector_IsDynamicCodeSupported_TrueOnNormalRuntime()
+    {
+        // On normal .NET (not NativeAOT-published), dynamic code is supported.
+        Assert.True(NativeAotDetector.IsDynamicCodeSupported);
+    }
+
+    [Fact]
+    public void JittedKernelCache_EmptyAtStartup_TryGetReturnsNull()
+    {
+        JittedKernelCache.Clear();
+        var key = new KernelKey
+        {
+            M = 4, N = 4, K = 4, Lda = 4, Ldb = 4, Ldc = 4,
+            TransA = false, TransB = false,
+            Packing = PackingMode.Auto,
+            EpilogueFlags = 0,
+            ElemType = typeof(double),
+            Arch = CpuArch.Avx512,
+        };
+        Assert.Null(JittedKernelCache.TryGetJittedKernel(key));
+    }
+
+    [Fact]
+    public void JittedKernelCache_StoreThenLookup_ReturnsCachedDelegate()
+    {
+        JittedKernelCache.Clear();
+        var key = new KernelKey
+        {
+            M = 16, N = 16, K = 16, Lda = 16, Ldb = 16, Ldc = 16,
+            TransA = true, TransB = false,
+            Packing = PackingMode.ForcePackBoth,
+            EpilogueFlags = 0,
+            ElemType = typeof(double),
+            Arch = CpuArch.Avx512,
+        };
+        Action testDelegate = () => { };  // Placeholder delegate.
+        JittedKernelCache.Store(key, testDelegate);
+
+        var result = JittedKernelCache.TryGetJittedKernel(key);
+        Assert.Same(testDelegate, result);
+    }
+
+    [Fact]
+    public void JittedKernelCache_DifferentKeys_StoreSeparately()
+    {
+        JittedKernelCache.Clear();
+        var key1 = new KernelKey { M = 4, N = 4, K = 4, ElemType = typeof(double), Arch = CpuArch.Scalar };
+        var key2 = new KernelKey { M = 8, N = 4, K = 4, ElemType = typeof(double), Arch = CpuArch.Scalar };
+        Action d1 = () => { };
+        Action d2 = () => { };
+        JittedKernelCache.Store(key1, d1);
+        JittedKernelCache.Store(key2, d2);
+
+        Assert.Same(d1, JittedKernelCache.TryGetJittedKernel(key1));
+        Assert.Same(d2, JittedKernelCache.TryGetJittedKernel(key2));
+        Assert.Equal(2, JittedKernelCache.Count);
+    }
+
+    [Fact]
+    public void JittedKernelCache_Clear_EmptiesCache()
+    {
+        var key = new KernelKey { M = 4, N = 4, K = 4, ElemType = typeof(double) };
+        JittedKernelCache.Store(key, (Action)(() => { }));
+        Assert.True(JittedKernelCache.Count > 0);
+        JittedKernelCache.Clear();
+        Assert.Equal(0, JittedKernelCache.Count);
+        Assert.Null(JittedKernelCache.TryGetJittedKernel(key));
+    }
+
+    [Fact]
+    public void JittedKernelCache_HitIncrementsStats()
+    {
+        BlasManagedLib.ClearCaches();
+        var key = new KernelKey { M = 4, N = 4, K = 4, ElemType = typeof(double) };
+
+        // Capture baseline BEFORE Store so that both Store (emission) and
+        // TryGetJittedKernel (cache hit) produce visible deltas.
+        var before = BlasManagedLib.GetStats();
+        JittedKernelCache.Store(key, (Action)(() => { }));  // increments JitEmissions
+        JittedKernelCache.TryGetJittedKernel(key);          // increments JitCacheHits
+        var after = BlasManagedLib.GetStats();
+
+        Assert.True(after.JitCacheHits > before.JitCacheHits);
+        Assert.True(after.JitEmissions > before.JitEmissions);  // Store counted as emission.
+    }
+
+    [Fact]
+    public void BlasManaged_ClearCaches_ClearsJitCache()
+    {
+        var key = new KernelKey { M = 4, N = 4, K = 4, ElemType = typeof(double) };
+        JittedKernelCache.Store(key, (Action)(() => { }));
+        Assert.True(JittedKernelCache.Count > 0);
+
+        BlasManagedLib.ClearCaches();
+        Assert.Equal(0, JittedKernelCache.Count);
+    }
 }
