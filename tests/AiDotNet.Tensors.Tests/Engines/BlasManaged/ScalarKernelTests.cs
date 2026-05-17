@@ -985,6 +985,68 @@ public class ScalarKernelTests
             Assert.Equal(cRef[i], cAvx[i], precision: 12);
     }
 
+    // ── D2: AVX-512 FP32 16x16 microkernel test ──────────────────────────────
+
+    [Fact]
+    public void Avx512Fp32_16x16_MatchesScalarReference()
+    {
+        if (!Avx512Fp32_16x16.IsSupported) return;
+
+        int kc = 16;
+        int Mr = 16, Nr = 16;
+
+        var rng = new Random(42);
+        float[] packedA = new float[Mr * kc];
+        float[] packedB = new float[kc * Nr];
+        for (int i = 0; i < packedA.Length; i++) packedA[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < packedB.Length; i++) packedB[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        // Reference: 16 ScalarFp32_4x4 calls covering 16×16 = 4 row-blocks × 4 col-blocks.
+        // Need to slice packedA into 4 row-blocks (rows 0..3, 4..7, 8..11, 12..15) and
+        // packedB into 4 col-blocks (cols 0..3, 4..7, 8..11, 12..15).
+        float[][] packedA_blocks = new float[4][];
+        float[][] packedB_blocks = new float[4][];
+        for (int r = 0; r < 4; r++) packedA_blocks[r] = new float[kc * 4];
+        for (int c = 0; c < 4; c++) packedB_blocks[c] = new float[kc * 4];
+
+        for (int k = 0; k < kc; k++)
+        {
+            for (int rb = 0; rb < 4; rb++)
+            {
+                for (int r = 0; r < 4; r++)
+                {
+                    packedA_blocks[rb][k * 4 + r] = packedA[k * Mr + rb * 4 + r];
+                }
+            }
+            for (int cb = 0; cb < 4; cb++)
+            {
+                for (int col = 0; col < 4; col++)
+                {
+                    packedB_blocks[cb][k * 4 + col] = packedB[k * Nr + cb * 4 + col];
+                }
+            }
+        }
+
+        float[] cRef = new float[16 * 16];
+        int ldc = 16;
+        for (int rb = 0; rb < 4; rb++)
+        {
+            for (int cb = 0; cb < 4; cb++)
+            {
+                int offset = rb * 4 * ldc + cb * 4;
+                ScalarFp32_4x4.Run(packedA_blocks[rb], packedB_blocks[cb], cRef.AsSpan(offset), ldc, kc);
+            }
+        }
+
+        float[] cAvx = new float[16 * 16];
+        Avx512Fp32_16x16.Run(packedA, packedB, cAvx.AsSpan(), ldc, kc);
+
+        // FP32 precision: 16 K-step accumulations of [-1,1) values, ~16 * eps_f = 1.9e-6.
+        // precision: 4 is safe (loose enough to accommodate FMA reordering).
+        for (int i = 0; i < cRef.Length; i++)
+            Assert.Equal(cRef[i], cAvx[i], precision: 4);
+    }
+
     // ── B5 helpers ────────────────────────────────────────────────────────────
 
     private static (double[] a, double[] b) GenerateRandomMatrices(int m, int n, int k, bool transA, bool transB, int seed)
