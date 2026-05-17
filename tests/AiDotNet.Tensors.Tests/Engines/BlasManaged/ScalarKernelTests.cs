@@ -1818,4 +1818,56 @@ public class ScalarKernelTests
         for (int i = 0; i < packedScalar.Length; i++)
             Assert.Equal(packedScalar[i], packedNeon[i]);
     }
+
+    // ── E5: NeonStreaming tests ───────────────────────────────────────────────
+
+    [Theory]
+    [InlineData(8, 8, 8, false, false)]    // NN
+    [InlineData(8, 8, 8, true, false)]     // TN
+    [InlineData(8, 8, 8, false, true)]     // NT scalar fallback
+    [InlineData(8, 8, 8, true, true)]      // TT scalar fallback
+    [InlineData(4, 6, 8, false, false)]    // n=6, 3 FP64 blocks
+    [InlineData(8, 8, 4, false, false)]    // small K
+    public void NeonStreaming_Fp64_MatchesScalarReference(int m, int n, int k, bool transA, bool transB)
+    {
+        if (!NeonStreaming.IsSupported) return;
+
+        int aCols = transA ? m : k;
+        int lda = aCols;
+        int bCols = transB ? k : n;
+        int ldb = bCols;
+
+        var (a, b) = GenerateRandomMatrices(m, n, k, transA, transB, seed: 42);
+
+        double[] cScalar = new double[m * n];
+        ScalarStreaming.RunFp64(a, lda, transA, b, ldb, transB, cScalar, ldc: n, m, n, k);
+
+        double[] cNeon = new double[m * n];
+        NeonStreaming.RunFp64(a, lda, transA, b, ldb, transB, cNeon, ldc: n, m, n, k);
+
+        for (int i = 0; i < cScalar.Length; i++)
+            Assert.Equal(cScalar[i], cNeon[i], precision: 10);
+    }
+
+    [Fact]
+    public void NeonStreaming_Fp32_NN_MatchesScalarReference()
+    {
+        if (!NeonStreaming.IsSupported) return;
+
+        int m = 8, n = 12, k = 8;  // n=12 = 3 FP32 blocks
+        var rng = new Random(42);
+        float[] a = new float[m * k];
+        float[] b = new float[k * n];
+        for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < b.Length; i++) b[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        float[] cScalar = new float[m * n];
+        ScalarStreaming.RunFp32(a, lda: k, transA: false, b, ldb: n, transB: false, cScalar, ldc: n, m, n, k);
+
+        float[] cNeon = new float[m * n];
+        NeonStreaming.RunFp32(a, lda: k, transA: false, b, ldb: n, transB: false, cNeon, ldc: n, m, n, k);
+
+        for (int i = 0; i < cScalar.Length; i++)
+            Assert.Equal(cScalar[i], cNeon[i], precision: 4);
+    }
 }
