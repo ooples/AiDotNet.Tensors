@@ -93,12 +93,15 @@ internal static class PackBothStrategy
 
                 // Layer 3: short-circuit pack-B when pre-pack handle is current.
                 // Caller is responsible for the handle covering the full Kc × Nc panel.
+                // Use effective tile bytes, not nominal, because PrePackB clamps Kc/Nc to
+                // the actual matrix dimensions (small matrices produce smaller handles).
+                int effectivePackBBytes = effectiveKc * effectiveNc * elemSize;
                 bool packBFromPrePack = false;
                 Span<T> activePackB = packB;
                 if (options.PackedB != null && WeightPackCache.IsCacheCurrent(options.PackedB)
-                    && options.PackedB.PackedBuffer.Length >= packBBytes)
+                    && options.PackedB.PackedBuffer.Length >= effectivePackBBytes)
                 {
-                    activePackB = MemoryMarshal.Cast<byte, T>(options.PackedB.PackedBuffer.AsSpan(0, packBBytes));
+                    activePackB = MemoryMarshal.Cast<byte, T>(options.PackedB.PackedBuffer.AsSpan(0, effectivePackBBytes));
                     packBFromPrePack = true;
                 }
 
@@ -119,12 +122,15 @@ internal static class PackBothStrategy
                     int effectiveMc = Math.Min(mc, m - ic);
 
                     // Layer 3: short-circuit pack-A when pre-pack handle is current.
+                    // Use effective tile bytes, not nominal, because PrePackA clamps Mc/Kc to
+                    // the actual matrix dimensions (small matrices produce smaller handles).
+                    int effectivePackABytes = effectiveMc * effectiveKc * elemSize;
                     bool packAFromPrePack = false;
                     Span<T> activePackA = packA;
                     if (options.PackedA != null && WeightPackCache.IsCacheCurrent(options.PackedA)
-                        && options.PackedA.PackedBuffer.Length >= packABytes)
+                        && options.PackedA.PackedBuffer.Length >= effectivePackABytes)
                     {
-                        activePackA = MemoryMarshal.Cast<byte, T>(options.PackedA.PackedBuffer.AsSpan(0, packABytes));
+                        activePackA = MemoryMarshal.Cast<byte, T>(options.PackedA.PackedBuffer.AsSpan(0, effectivePackABytes));
                         packAFromPrePack = true;
                     }
 

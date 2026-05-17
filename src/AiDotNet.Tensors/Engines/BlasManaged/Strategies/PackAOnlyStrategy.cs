@@ -69,12 +69,15 @@ internal static class PackAOnlyStrategy
                 int effectiveMc = Math.Min(mc, m - ic);
 
                 // Layer 3: short-circuit pack-A when pre-pack handle is current.
+                // Use effective tile bytes, not nominal, because PrePackA clamps Mc/Kc to
+                // the actual matrix dimensions (small matrices produce smaller handles).
+                int effectivePackABytes = effectiveMc * effectiveKc * elemSize;
                 bool packAFromPrePack = false;
                 Span<T> activePackA = packA;
                 if (options.PackedA != null && WeightPackCache.IsCacheCurrent(options.PackedA)
-                    && options.PackedA.PackedBuffer.Length >= packABytes)
+                    && options.PackedA.PackedBuffer.Length >= effectivePackABytes)
                 {
-                    activePackA = MemoryMarshal.Cast<byte, T>(options.PackedA.PackedBuffer.AsSpan(0, packABytes));
+                    activePackA = MemoryMarshal.Cast<byte, T>(options.PackedA.PackedBuffer.AsSpan(0, effectivePackABytes));
                     packAFromPrePack = true;
                 }
 
