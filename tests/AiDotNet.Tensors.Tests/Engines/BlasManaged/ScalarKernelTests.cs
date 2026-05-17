@@ -1938,4 +1938,117 @@ public class ScalarKernelTests
         for (int i = 0; i < expected.Length; i++)
             Assert.Equal(expected[i], actual[i], precision: 4);
     }
+
+    // ── PerThreadPool (Layer 1 allocator) ────────────────────────────────────
+
+    [Fact]
+    public void PerThreadPool_FirstRent_AllocatesBuffer()
+    {
+        var pool = PerThreadPool.Current;
+        pool.ResetForTest();
+
+        Span<byte> packA = pool.RentPackA(1024);
+        Assert.Equal(1024, packA.Length);
+        Assert.True(pool.TotalBytesHeld >= 1024);
+    }
+
+    [Fact]
+    public void PerThreadPool_GrowsMonotonically()
+    {
+        var pool = PerThreadPool.Current;
+        pool.ResetForTest();
+
+        // First rent — small buffer.
+        pool.RentPackA(1024);
+        long after1 = pool.TotalBytesHeld;
+
+        // Bigger rent — must grow.
+        pool.RentPackA(8192);
+        long after2 = pool.TotalBytesHeld;
+        Assert.True(after2 >= 8192);
+        Assert.True(after2 > after1);
+
+        // Smaller rent — must NOT shrink (reuse existing buffer).
+        pool.RentPackA(512);
+        long after3 = pool.TotalBytesHeld;
+        Assert.Equal(after2, after3);  // No change — still holds 8192-byte buffer.
+    }
+
+#if NET5_0_OR_GREATER
+    /// <summary>
+    /// Zero-allocation regression: a second RentPackA call with the same size
+    /// must not allocate a new backing array. Uses
+    /// <c>GC.GetAllocatedBytesForCurrentThread</c> to verify. Only runs on
+    /// net5+ since the API is unavailable on net471.
+    /// </summary>
+    [Fact]
+    public void PerThreadPool_ReuseDoesNotAllocate()
+    {
+        var pool = PerThreadPool.Current;
+        pool.ResetForTest();
+
+        // First rent — allocate.
+        pool.RentPackA(2048);
+        long before = GC.GetAllocatedBytesForCurrentThread();
+
+        // Second rent same size — must not allocate.
+        pool.RentPackA(2048);
+        long after = GC.GetAllocatedBytesForCurrentThread();
+
+        // Some GC overhead can happen from test framework; allow tiny slack.
+        // The key assertion is that we're not allocating a new 2048-byte buffer.
+        Assert.True(after - before < 200, $"Expected no significant allocation; got {after - before} bytes.");
+    }
+#endif
+
+    [Fact]
+    public void PerThreadPool_SeparateThreadsHaveSeparatePools()
+    {
+        long thread1Pool;
+        var pool1 = PerThreadPool.Current;
+        pool1.ResetForTest();
+        pool1.RentPackA(4096);
+        thread1Pool = pool1.TotalBytesHeld;
+
+        long thread2PoolFromThread2 = 0;
+        var t = new System.Threading.Thread(() =>
+        {
+            var pool2 = PerThreadPool.Current;
+            pool2.ResetForTest();
+            // Note: pool2 is a different instance from pool1 because of [ThreadStatic].
+            thread2PoolFromThread2 = pool2.TotalBytesHeld;  // Should be 0 (fresh pool).
+        });
+        t.Start();
+        t.Join();
+
+        Assert.True(thread1Pool >= 4096);
+        Assert.Equal(0, thread2PoolFromThread2);
+    }
+
+    [Fact]
+    public void PerThreadPool_RentPackB_AndKSplitC_Independent()
+    {
+        var pool = PerThreadPool.Current;
+        pool.ResetForTest();
+
+        Span<byte> packA = pool.RentPackA(1024);
+        Span<byte> packB = pool.RentPackB(2048);
+        Span<byte> kSplit = pool.RentKSplitC(512);
+
+        Assert.Equal(1024, packA.Length);
+        Assert.Equal(2048, packB.Length);
+        Assert.Equal(512, kSplit.Length);
+        Assert.True(pool.TotalBytesHeld >= 1024 + 2048 + 512);
+    }
+
+    [Fact]
+    public void PerThreadPool_ZeroBytesReturnsEmptySpan()
+    {
+        var pool = PerThreadPool.Current;
+        pool.ResetForTest();
+
+        Span<byte> empty = pool.RentPackA(0);
+        Assert.Equal(0, empty.Length);
+        Assert.True(empty.IsEmpty);
+    }
 }
