@@ -3197,4 +3197,101 @@ public class ScalarKernelTests
         var flags = EpilogueFlagsCompute.Compute(in ep);
         Assert.Equal(EpilogueFlags.HasBias, flags);
     }
+
+    // ── I2-I6 epilogue post-pass tests ──────────────────────────────────────
+
+    [Fact]
+    public void BiasEpilogue_AddsPerColumnBias()
+    {
+        double[] c = { 1, 2, 3, 4, 5, 6 };  // 2x3
+        double[] bias = { 10, 20, 30 };
+        BiasEpilogue.Apply<double>(c.AsSpan(), ldc: 3, m: 2, n: 3, bias);
+        Assert.Equal(new double[] { 11, 22, 33, 14, 25, 36 }, c);
+    }
+
+    [Fact]
+    public void ActivationEpilogue_ReLU_ZeroesNegatives()
+    {
+        double[] c = { 1, -2, 3, -4 };
+        ActivationEpilogue.Apply<double>(c.AsSpan(), ldc: 2, m: 2, n: 2, AiDotNet.Tensors.Engines.FusedActivationType.ReLU);
+        Assert.Equal(new double[] { 1, 0, 3, 0 }, c);
+    }
+
+    [Fact]
+    public void ActivationEpilogue_Sigmoid_TransformsValues()
+    {
+        double[] c = { 0, 1 };
+        ActivationEpilogue.Apply<double>(c.AsSpan(), ldc: 2, m: 1, n: 2, AiDotNet.Tensors.Engines.FusedActivationType.Sigmoid);
+        Assert.Equal(0.5, c[0], precision: 6);            // sigmoid(0) = 0.5
+        Assert.Equal(0.7310586, c[1], precision: 6);      // sigmoid(1)
+    }
+
+    [Fact]
+    public void ActivationEpilogue_Tanh_TransformsValues()
+    {
+        double[] c = { 0, 1 };
+        ActivationEpilogue.Apply<double>(c.AsSpan(), ldc: 2, m: 1, n: 2, AiDotNet.Tensors.Engines.FusedActivationType.Tanh);
+        Assert.Equal(0.0, c[0], precision: 6);
+        Assert.Equal(Math.Tanh(1), c[1], precision: 6);
+    }
+
+    [Fact]
+    public void ActivationEpilogue_None_NoChange()
+    {
+        double[] c = { -1, 0, 1, 2 };
+        double[] expected = (double[])c.Clone();
+        ActivationEpilogue.Apply<double>(c.AsSpan(), ldc: 2, m: 2, n: 2, AiDotNet.Tensors.Engines.FusedActivationType.None);
+        Assert.Equal(expected, c);
+    }
+
+    [Fact]
+    public void SkipEpilogue_AddsSkipMatrix()
+    {
+        double[] c = { 1, 2, 3, 4 };
+        double[] skip = { 10, 20, 30, 40 };
+        SkipEpilogue.Apply<double>(c.AsSpan(), ldc: 2, m: 2, n: 2, skip);
+        Assert.Equal(new double[] { 11, 22, 33, 44 }, c);
+    }
+
+    [Fact]
+    public void DropoutEpilogue_Deterministic_SameSeedSameResult()
+    {
+        double[] c1 = { 1, 2, 3, 4, 5, 6, 7, 8 };
+        double[] c2 = (double[])c1.Clone();
+
+        DropoutEpilogue.Apply<double>(c1.AsSpan(), ldc: 4, m: 2, n: 4, seed: 42);
+        DropoutEpilogue.Apply<double>(c2.AsSpan(), ldc: 4, m: 2, n: 4, seed: 42);
+
+        Assert.Equal(c1, c2);
+    }
+
+    [Fact]
+    public void DropoutEpilogue_RoughlyHalfZero()
+    {
+        // For a 100-element matrix, ~50 elements should be zero (50% dropout).
+        double[] c = new double[100];
+        for (int i = 0; i < c.Length; i++) c[i] = 1.0;
+        DropoutEpilogue.Apply<double>(c.AsSpan(), ldc: 10, m: 10, n: 10, seed: 12345);
+
+        int zeros = 0;
+        foreach (var v in c) if (v == 0.0) zeros++;
+        // Allow 30-70 zeros (random distribution variance).
+        Assert.InRange(zeros, 30, 70);
+    }
+
+    [Fact]
+    public void OutputScaleEpilogue_MultipliesByScalar()
+    {
+        double[] c = { 1, 2, 3, 4 };
+        OutputScaleEpilogue.Apply<double>(c.AsSpan(), ldc: 2, m: 2, n: 2, scale: 2.5);
+        Assert.Equal(new double[] { 2.5, 5.0, 7.5, 10.0 }, c);
+    }
+
+    [Fact]
+    public void OutputScaleEpilogue_FP32()
+    {
+        float[] c = { 1f, 2f, 3f, 4f };
+        OutputScaleEpilogue.Apply<float>(c.AsSpan(), ldc: 2, m: 2, n: 2, scale: 0.5f);
+        Assert.Equal(new float[] { 0.5f, 1.0f, 1.5f, 2.0f }, c);
+    }
 }
