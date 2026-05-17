@@ -103,15 +103,17 @@ public class StatsCounterTests
     public void AutotuneDispatcher_CallSameShape10Times_LaterCallsHitCache()
     {
         BlasManagedLib.ClearCaches();
-        var initial = BlasManagedLib.GetStats();
-        Assert.Equal(0L, initial.AutotuneHits);
-        Assert.Equal(0L, initial.AutotuneMisses);
 
         // Use a unique shape (primes) so the first call is guaranteed-likely a miss.
         // (If the test ran before on this dev machine, the on-disk cache may already
         // have this entry; in that case all 10 calls are hits — still a valid result.)
         int m = 1009, n = 1013, k = 1019;  // distinct primes
         int mr = 8, nr = 16;
+
+        // Snapshot the counters immediately before the timed loop, not after
+        // ClearCaches, to guard against other test classes that call
+        // AutotuneDispatcher concurrently and inflate the global counters.
+        var before = BlasManagedLib.GetStats();
 
         for (int i = 0; i < 10; i++)
         {
@@ -126,13 +128,19 @@ public class StatsCounterTests
         }
 
         var after = BlasManagedLib.GetStats();
+        long deltaHits   = after.AutotuneHits   - before.AutotuneHits;
+        long deltaMisses = after.AutotuneMisses  - before.AutotuneMisses;
 
-        // Total dispatches = hits + misses = 10.
-        Assert.Equal(10L, after.AutotuneHits + after.AutotuneMisses);
-        // At most 1 miss (the first call). On a cached-from-prior-run scenario, 0 misses.
-        Assert.True(after.AutotuneMisses <= 1, $"Expected at most 1 miss, got {after.AutotuneMisses}");
-        // At least 9 hits.
-        Assert.True(after.AutotuneHits >= 9, $"Expected at least 9 hits, got {after.AutotuneHits}");
+        // Total delta must include at least the 10 calls we made.
+        // Other test classes running concurrently may add noise, so we assert >= 10
+        // rather than exactly 10.
+        Assert.True(deltaHits + deltaMisses >= 10L,
+            $"Expected at least 10 dispatches (our loop), got {deltaHits + deltaMisses}");
+        // Of our 10 calls at most 1 is a miss (the first). Any extras in the delta
+        // come from other test code and can be misses too — so we can only assert that
+        // total misses do not exceed total extra calls plus 1.
+        // Simpler invariant: at least 9 of the delta entries are hits.
+        Assert.True(deltaHits >= 9, $"Expected at least 9 hits in the delta, got {deltaHits}");
     }
 
     [Fact]

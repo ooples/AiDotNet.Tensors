@@ -21,6 +21,11 @@ namespace AiDotNet.Tensors.Tests.Engines.BlasManaged;
 /// output via the same paths an AOT build would use.
 /// </para>
 /// </summary>
+/// <summary>
+/// Serialized with StatsCounterTests so that JittedKernelCache global state
+/// is not contaminated by concurrent test classes on net471's parallel runner.
+/// </summary>
+[Collection("BlasManaged-Stats-Serial")]
 public class NativeAotCompatibilityTest
 {
     private readonly ITestOutputHelper _output;

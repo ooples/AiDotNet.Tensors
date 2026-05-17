@@ -6,6 +6,12 @@ using AiDotNet.Tensors.Engines;
 
 namespace AiDotNet.Tensors.Tests.Engines.BlasManaged;
 
+/// <summary>
+/// Serialized with StatsCounterTests and NativeAotCompatibilityTest so that
+/// JittedKernelCache and BlasManagedStatsTracker global state is not
+/// contaminated by concurrent test classes on net471's parallel runner.
+/// </summary>
+[Collection("BlasManaged-Stats-Serial")]
 public class ScalarKernelTests
 {
     [Fact]
