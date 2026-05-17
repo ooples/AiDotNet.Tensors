@@ -2607,4 +2607,59 @@ public class ScalarKernelTests
         Assert.Equal(4.0f, partials[0].Span[0]);
         Assert.Equal(6.0f, partials[0].Span[1]);
     }
+
+    // ── G4: MN2DDriver ──────────────────────────────────────────────────────
+
+    [Fact]
+    public void MN2DDriver_UnflattenIndex_FirstRow()
+    {
+        // numNBlocks=4, so first 4 items are (0,0), (0,1), (0,2), (0,3).
+        Assert.Equal((0, 0), MN2DDriver.UnflattenIndex(0, numNBlocks: 4));
+        Assert.Equal((0, 1), MN2DDriver.UnflattenIndex(1, numNBlocks: 4));
+        Assert.Equal((0, 3), MN2DDriver.UnflattenIndex(3, numNBlocks: 4));
+    }
+
+    [Fact]
+    public void MN2DDriver_UnflattenIndex_SecondRow()
+    {
+        Assert.Equal((1, 0), MN2DDriver.UnflattenIndex(4, numNBlocks: 4));
+        Assert.Equal((1, 1), MN2DDriver.UnflattenIndex(5, numNBlocks: 4));
+        Assert.Equal((2, 3), MN2DDriver.UnflattenIndex(11, numNBlocks: 4));
+    }
+
+    [Fact]
+    public void MN2DDriver_TotalItems()
+    {
+        Assert.Equal(12, MN2DDriver.TotalItems(3, 4));
+        Assert.Equal(0, MN2DDriver.TotalItems(0, 5));
+        Assert.Equal(0, MN2DDriver.TotalItems(5, 0));
+    }
+
+    [Fact]
+    public void MN2DDriver_ShouldUse2DGrid_PrefersMAxisWhenEnoughBlocks()
+    {
+        // procs=4, numMBlocks=4: M alone fills cores → use 1D.
+        Assert.False(MN2DDriver.ShouldUse2DGrid(numMBlocks: 4, numNBlocks: 4, procs: 4));
+    }
+
+    [Fact]
+    public void MN2DDriver_ShouldUse2DGrid_PicksGridWhenMUnderutilizes()
+    {
+        // procs=16, numMBlocks=2 (M*2=4 < 16), numNBlocks=4: M alone underutilizes → 2D.
+        Assert.True(MN2DDriver.ShouldUse2DGrid(numMBlocks: 2, numNBlocks: 4, procs: 16));
+    }
+
+    [Fact]
+    public void MN2DDriver_ShouldUse2DGrid_NoGridWhenSingleNBlock()
+    {
+        // No N parallelism possible — 1D M-axis only.
+        Assert.False(MN2DDriver.ShouldUse2DGrid(numMBlocks: 1, numNBlocks: 1, procs: 16));
+        Assert.False(MN2DDriver.ShouldUse2DGrid(numMBlocks: 2, numNBlocks: 1, procs: 16));
+    }
+
+    [Fact]
+    public void MN2DDriver_ShouldUse2DGrid_NoParallelOnSingleCore()
+    {
+        Assert.False(MN2DDriver.ShouldUse2DGrid(numMBlocks: 4, numNBlocks: 4, procs: 1));
+    }
 }
