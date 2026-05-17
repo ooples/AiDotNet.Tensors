@@ -2452,4 +2452,38 @@ public class ScalarKernelTests
         for (int i = 0; i < expected.Length; i++)
             Assert.Equal(expected[i], actual[i], precision: 9);
     }
+
+    // ── G2: N-tail handling via Avx2Tail/Avx512Tail kernels ──────────────────
+    // These test cases verify that shapes with M divisible by mr but N NOT divisible
+    // by nr use the SIMD tile for full N-blocks and the tail kernel (Avx2Tail or
+    // Avx512Tail) for the last partial-N column-block.
+    // On machines without AVX2/AVX-512 support the scalar fallback in
+    // DispatchMicrokernelWithTail handles the partial tile.
+
+    [Theory]
+    [InlineData(16, 14, 16, false, false)]   // N=14, not divisible by AVX-512 nr=16
+    [InlineData(32, 12, 16, false, false)]   // N=12
+    [InlineData(16, 17, 32, false, false)]   // N=17 (partial tile in second jr iteration)
+    [InlineData(8, 9, 16, false, false)]     // FP64 AVX2: nr=8, n=9 (single tail col)
+    public void Gemm_PartialNTile_MatchesNaive(int m, int n, int k, bool transA, bool transB)
+    {
+        var (a, b) = GenerateRandomMatrices(m, n, k, transA, transB, seed: 42);
+        int aRows = transA ? k : m;
+        int aCols = transA ? m : k;
+        double[] expected = NaiveGemm(a, aRows, aCols, transA, b, k, n, transB);
+
+        int lda = aCols;
+        int ldb = transB ? k : n;
+        double[] actual = new double[m * n];
+        var options = new BlasOptions<double> { PackingMode = PackingMode.ForcePackBoth };
+        BlasManagedLib.Gemm<double>(
+            a, lda, transA,
+            b, ldb, transB,
+            actual, ldc: n,
+            m, n, k,
+            options);
+
+        for (int i = 0; i < expected.Length; i++)
+            Assert.Equal(expected[i], actual[i], precision: 10);
+    }
 }

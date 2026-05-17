@@ -67,12 +67,15 @@ public static class BlasManaged
             strategy = PackingMode.ForcePackBoth;
 
         // Pick SIMD-aware (mr, nr) for PackBoth using the AVX-512 → AVX2 → Neon → scalar
-        // hierarchy. Fall back to (4, 4) scalar when the shape is not an exact
-        // multiple of the chosen tile — tail handling added in Phase G.
+        // hierarchy. Fall back to (4, 4) scalar only when the shape is too small for
+        // the SIMD tile to even start (m < mr or n < nr), or when m is not an exact
+        // multiple of mr (M-tail kernels deferred to a future phase).
+        // When m % mr == 0 but n % nr != 0, PackBothStrategy handles the partial-N
+        // column-block via Avx2Tail/Avx512Tail (Task G2).
         // PackAOnly always uses scalar (4, 4) because its strided-B path has no
         // AVX2/AVX-512 RunStridedB variant yet (deferred to Phase Cx).
         var (mr, nr) = PickMicrokernelTile<T>();
-        if (m % mr != 0 || n % nr != 0)
+        if (m < mr || n < nr || m % mr != 0)
         {
             mr = 4; nr = 4;
         }

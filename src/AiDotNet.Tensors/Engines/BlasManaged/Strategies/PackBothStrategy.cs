@@ -165,6 +165,11 @@ internal static class PackBothStrategy
                 // Use effective tile bytes, not nominal, because PrePackB clamps Kc/Nc to
                 // the actual matrix dimensions (small matrices produce smaller handles).
                 int effectivePackBBytes = effectiveKc * effectiveNc * elemSize;
+                // Round up Nc to the next multiple of Nr so the last partial-N stripe
+                // is zero-padded into a full Nr-wide row (Task G2). The packed buffer
+                // (packBBytes = kc * nc * elemSize) always has room for this extra padding.
+                int packedNc = ((effectiveNc + nr - 1) / nr) * nr;
+                int packedBElemCount = effectiveKc * packedNc;
                 bool packBFromPrePack = false;
                 Span<T> activePackB = packB;
                 if (options.PackedB != null && WeightPackCache.IsCacheCurrent(options.PackedB)
@@ -179,10 +184,12 @@ internal static class PackBothStrategy
                     // Pack B[pc..pc+effectiveKc, jc..jc+effectiveNc] into packB.
                     // transB=false: B is [K, N] row-major, panel starts at b[pc * ldb + jc].
                     // transB=true:  B is [N, K] row-major, panel starts at b[jc * ldb + pc].
+                    // Pass a padded slice (packedBElemCount) so ScalarPack.PackB can
+                    // zero-pad the partial tail stripe when effectiveNc % nr != 0.
                     int bSliceOffset = transB ? jc * ldb + pc : pc * ldb + jc;
                     ScalarPack.PackB<T>(
                         b: b.Slice(bSliceOffset), ldb, transB,
-                        packed: activePackB.Slice(0, effectiveKc * effectiveNc),
+                        packed: activePackB.Slice(0, packedBElemCount),
                         nc: effectiveNc, kc: effectiveKc, nr);
                 }
 
@@ -218,8 +225,15 @@ internal static class PackBothStrategy
                     // Iterate microkernel tiles within this Mc × Nc panel.
                     for (int jr = 0; jr < effectiveNc; jr += nr)
                     {
+                        // Partial-N tile on the last jr iteration when effectiveNc % nr != 0.
+                        int effectiveNr = Math.Min(nr, effectiveNc - jr);
                         for (int ir = 0; ir < effectiveMc; ir += mr)
                         {
+                            // M-tail: skip partial rows — caller guarantees m % mr == 0
+                            // (BlasManaged.cs falls back to scalar otherwise). Guard here
+                            // in case effectiveMc is not a multiple of mr for any reason.
+                            if (ir + mr > effectiveMc) break;
+
                             // Offset into packA for the current Mr-stripe (ir/mr th stripe).
                             // Stripe layout: [numStripes, Kc, Mr] → stripe * Kc * Mr.
                             int packedAStripeOff = (ir / mr) * effectiveKc * mr;
@@ -229,12 +243,12 @@ internal static class PackBothStrategy
 
                             // C tile starts at row (ic + ir), col (jc + jr) in the full C matrix.
                             int cTileOff = (ic + ir) * ldc + (jc + jr);
-                            DispatchMicrokernel<T>(
+                            DispatchMicrokernelWithTail<T>(
                                 activePackA.Slice(packedAStripeOff, effectiveKc * mr),
                                 activePackB.Slice(packedBStripeOff, effectiveKc * nr),
                                 c.Slice(cTileOff),
                                 ldc, effectiveKc,
-                                mr, nr);
+                                mr, nr, effectiveNr);
                         }
                     }
                 }
@@ -299,6 +313,12 @@ internal static class PackBothStrategy
 
                 // ── Pack B (shared, single calling-thread, before the parallel ic region) ──
                 int effectivePackBBytes = effectiveKc * effectiveNc * elemSize;
+                // Round up Nc to the next multiple of Nr so the last partial-N stripe
+                // is zero-padded into a full Nr-wide row (Task G2). The backing byte[]
+                // (packBBytesSpan.Length = kc * nc * elemSize) always has room for this padding.
+                int packedNc = ((effectiveNc + nr - 1) / nr) * nr;
+                int packedBElemCount = effectiveKc * packedNc;
+                int packedBByteCount = packedBElemCount * elemSize;
                 bool packBFromPrePack = false;
                 if (packedB != null && WeightPackCache.IsCacheCurrent(packedB)
                     && packedB.PackedBuffer.Length >= effectivePackBBytes)
@@ -315,9 +335,11 @@ internal static class PackBothStrategy
                     // Pack B[pc..pc+effectiveKc, jc..jc+effectiveNc] into packBArr.
                     // transB=false: panel starts at b[pc * ldb + jc].
                     // transB=true:  panel starts at b[jc * ldb + pc].
+                    // Pass a padded slice (packedBByteCount) so ScalarPack.PackB can
+                    // zero-pad the partial tail stripe when effectiveNc % nr != 0.
                     int bSliceOffset = transB ? jc * ldb + pc : pc * ldb + jc;
                     ReadOnlySpan<T> bSlice = new ReadOnlySpan<T>((T*)bPtrInt + bSliceOffset, bLen - bSliceOffset);
-                    Span<T> packBTemp = MemoryMarshal.Cast<byte, T>(packBArr.AsSpan(0, effectivePackBBytes));
+                    Span<T> packBTemp = MemoryMarshal.Cast<byte, T>(packBArr.AsSpan(0, packedBByteCount));
                     ScalarPack.PackB<T>(
                         b: bSlice, ldb, transB,
                         packed: packBTemp,
@@ -334,7 +356,7 @@ internal static class PackBothStrategy
                 // Capture loop-iteration locals (int/nint are value-type, safe to capture).
                 int jc_cap = jc, pc_cap = pc;
                 int effectiveNc_cap = effectiveNc, effectiveKc_cap = effectiveKc;
-                int effectivePackBBytes_cap = effectivePackBBytes;
+                int packedBByteCount_cap = packedBByteCount;
                 byte[] packBArr_cap = packBArr;
 
                 CpuParallelSettings.ParallelForOrSerial(0, numIcBlocks, totalWork, icIdx =>
@@ -372,14 +394,23 @@ internal static class PackBothStrategy
                     }
 
                     // Shared pack-B: reconstruct span from captured byte[] (read-only).
+                    // Use packedBByteCount_cap (Nr-padded size) so the tail stripe
+                    // (packed by ScalarPack.PackB with zero-padding) is accessible.
                     Span<T> activePackB = MemoryMarshal.Cast<byte, T>(
-                        packBArr_cap.AsSpan(0, effectivePackBBytes_cap));
+                        packBArr_cap.AsSpan(0, packedBByteCount_cap));
 
                     // ── Inner microkernel loop (jr, ir) ────────────────────────────────
                     for (int jr = 0; jr < effectiveNc_cap; jr += nr)
                     {
+                        // Partial-N tile on the last jr iteration when effectiveNc % nr != 0.
+                        int effectiveNr = Math.Min(nr, effectiveNc_cap - jr);
                         for (int ir = 0; ir < effectiveMc; ir += mr)
                         {
+                            // M-tail: skip partial rows — caller guarantees m % mr == 0
+                            // (BlasManaged.cs falls back to scalar otherwise). Guard here
+                            // in case effectiveMc is not a multiple of mr for any reason.
+                            if (ir + mr > effectiveMc) break;
+
                             // Stripe offsets into packed panels.
                             // Stripe layout: [numStripes, Kc, Mr/Nr] → stripe * Kc * Mr/Nr.
                             int packedAStripeOff = (ir / mr) * effectiveKc_cap * mr;
@@ -389,12 +420,12 @@ internal static class PackBothStrategy
                             // Disjoint from all other icIdx values → no write synchronization.
                             int cTileOff = (ic + ir) * ldc + (jc_cap + jr);
                             Span<T> cTile = new Span<T>((T*)cPtrInt + cTileOff, cLen - cTileOff);
-                            DispatchMicrokernel<T>(
+                            DispatchMicrokernelWithTail<T>(
                                 activePackA.Slice(packedAStripeOff, effectiveKc_cap * mr),
                                 activePackB.Slice(packedBStripeOff, effectiveKc_cap * nr),
                                 cTile,
                                 ldc, effectiveKc_cap,
-                                mr, nr);
+                                mr, nr, effectiveNr);
                         }
                     }
                 });
@@ -496,5 +527,105 @@ internal static class PackBothStrategy
             throw new NotSupportedException($"Unsupported FP32 microkernel shape Mr={mr} Nr={nr}");
         }
         throw new NotSupportedException($"PackBothStrategy does not support T={typeof(T).Name}.");
+    }
+
+    /// <summary>
+    /// Routes to the appropriate microkernel for T, handling a partial-N tile
+    /// (<paramref name="effectiveNr"/> &lt; <paramref name="nr"/>). When
+    /// <paramref name="effectiveNr"/> equals <paramref name="nr"/> the full
+    /// <see cref="DispatchMicrokernel{T}"/> path is taken. For partial tiles,
+    /// the matching Avx512Tail or Avx2Tail kernel is preferred; if no matching
+    /// SIMD tail kernel exists, a scalar column-by-column fallback is used.
+    /// </summary>
+    private static void DispatchMicrokernelWithTail<T>(
+        ReadOnlySpan<T> packedA, ReadOnlySpan<T> packedB,
+        Span<T> c, int ldc, int kc,
+        int mr, int nr, int effectiveNr) where T : unmanaged
+    {
+        if (effectiveNr == nr)
+        {
+            // Full tile — use the regular (non-tail) microkernel.
+            DispatchMicrokernel<T>(packedA, packedB, c, ldc, kc, mr, nr);
+            return;
+        }
+
+        // Partial-N tile: dispatch to a tail kernel or scalar fallback.
+        if (typeof(T) == typeof(double))
+        {
+            if (mr == 8 && nr == 16 && Avx512Tail.IsSupported)
+            {
+                Avx512Tail.RunFp64_8xN(
+                    System.Runtime.InteropServices.MemoryMarshal.Cast<T, double>(packedA),
+                    System.Runtime.InteropServices.MemoryMarshal.Cast<T, double>(packedB),
+                    System.Runtime.InteropServices.MemoryMarshal.Cast<T, double>(c),
+                    ldc, kc, effectiveNr);
+                return;
+            }
+            if (mr == 4 && nr == 8 && Avx2Tail.IsSupported)
+            {
+                Avx2Tail.RunFp64_4xN(
+                    System.Runtime.InteropServices.MemoryMarshal.Cast<T, double>(packedA),
+                    System.Runtime.InteropServices.MemoryMarshal.Cast<T, double>(packedB),
+                    System.Runtime.InteropServices.MemoryMarshal.Cast<T, double>(c),
+                    ldc, kc, effectiveNr);
+                return;
+            }
+            // Scalar fallback: process column-by-column.
+            var packedAd = System.Runtime.InteropServices.MemoryMarshal.Cast<T, double>(packedA);
+            var packedBd = System.Runtime.InteropServices.MemoryMarshal.Cast<T, double>(packedB);
+            var cd = System.Runtime.InteropServices.MemoryMarshal.Cast<T, double>(c);
+            for (int col = 0; col < effectiveNr; col++)
+            {
+                for (int row = 0; row < mr; row++)
+                {
+                    double sum = cd[row * ldc + col];
+                    for (int kk = 0; kk < kc; kk++)
+                    {
+                        sum += packedAd[kk * mr + row] * packedBd[kk * nr + col];
+                    }
+                    cd[row * ldc + col] = sum;
+                }
+            }
+            return;
+        }
+        if (typeof(T) == typeof(float))
+        {
+            if (mr == 16 && nr == 16 && Avx512Tail.IsSupported)
+            {
+                Avx512Tail.RunFp32_16xN(
+                    System.Runtime.InteropServices.MemoryMarshal.Cast<T, float>(packedA),
+                    System.Runtime.InteropServices.MemoryMarshal.Cast<T, float>(packedB),
+                    System.Runtime.InteropServices.MemoryMarshal.Cast<T, float>(c),
+                    ldc, kc, effectiveNr);
+                return;
+            }
+            if (mr == 8 && nr == 8 && Avx2Tail.IsSupported)
+            {
+                Avx2Tail.RunFp32_8xN(
+                    System.Runtime.InteropServices.MemoryMarshal.Cast<T, float>(packedA),
+                    System.Runtime.InteropServices.MemoryMarshal.Cast<T, float>(packedB),
+                    System.Runtime.InteropServices.MemoryMarshal.Cast<T, float>(c),
+                    ldc, kc, effectiveNr);
+                return;
+            }
+            // Scalar fallback
+            var packedAf = System.Runtime.InteropServices.MemoryMarshal.Cast<T, float>(packedA);
+            var packedBf = System.Runtime.InteropServices.MemoryMarshal.Cast<T, float>(packedB);
+            var cf = System.Runtime.InteropServices.MemoryMarshal.Cast<T, float>(c);
+            for (int col = 0; col < effectiveNr; col++)
+            {
+                for (int row = 0; row < mr; row++)
+                {
+                    float sum = cf[row * ldc + col];
+                    for (int kk = 0; kk < kc; kk++)
+                    {
+                        sum += packedAf[kk * mr + row] * packedBf[kk * nr + col];
+                    }
+                    cf[row * ldc + col] = sum;
+                }
+            }
+            return;
+        }
+        throw new NotSupportedException($"DispatchMicrokernelWithTail does not support T={typeof(T).Name}.");
     }
 }

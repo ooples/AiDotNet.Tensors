@@ -65,7 +65,7 @@ internal static class ScalarPack
 
     /// <summary>
     /// Pack a logical Kc-row × Nc-col panel of B into BLIS stripe layout
-    /// <c>[Nc/Nr, Kc, Nr]</c> — linearized as
+    /// <c>[ceil(Nc/Nr), Kc, Nr]</c> — linearized as
     /// <c>packed[stripe * Kc * Nr + k * Nr + col]</c>.
     ///
     /// <para>
@@ -82,23 +82,28 @@ internal static class ScalarPack
     /// </para>
     ///
     /// <para>
-    /// This implementation handles <c>nc</c> exactly divisible by <c>nr</c>.
-    /// Tail handling for <c>nc % nr != 0</c> is added in Phase G.
+    /// When <c>nc % nr != 0</c>, the last (partial) stripe is packed with
+    /// zero-padding in the unused lane positions so the packed buffer always
+    /// uses full <c>Nr</c>-wide stripes. The caller must allocate
+    /// <c>ceil(nc / nr) * nr * kc</c> elements in <paramref name="packed"/>.
     /// </para>
     /// </summary>
     /// <param name="b">Source B buffer, length ≥ ldb × (transB ? N : K).</param>
     /// <param name="ldb">Leading dimension of B.</param>
     /// <param name="transB">True if B is stored as B^T (logical [K, N] view from [N, K] memory).</param>
-    /// <param name="packed">Destination stripe buffer, length ≥ nc × kc.</param>
-    /// <param name="nc">Cols of B to pack (must be ≤ Nc panel size, exactly divisible by nr).</param>
+    /// <param name="packed">Destination stripe buffer, length ≥ ceil(nc / nr) × nr × kc.</param>
+    /// <param name="nc">Cols of B to pack (must be ≤ Nc panel size).</param>
     /// <param name="kc">Rows of B to pack (one Kc block).</param>
     /// <param name="nr">Microkernel column-tile width (e.g., 4 for ScalarFp64_4x4).</param>
     public static void PackB<T>(
         ReadOnlySpan<T> b, int ldb, bool transB,
         Span<T> packed, int nc, int kc, int nr) where T : unmanaged
     {
-        int numStripes = nc / nr;
-        for (int stripe = 0; stripe < numStripes; stripe++)
+        int numFullStripes = nc / nr;
+        int tailCols = nc % nr;         // 0 when nc is divisible by nr
+
+        // Pack full Nr-wide stripes.
+        for (int stripe = 0; stripe < numFullStripes; stripe++)
         {
             int packedOff = stripe * kc * nr;
             for (int k = 0; k < kc; k++)
@@ -110,6 +115,31 @@ internal static class ScalarPack
                         ? b[logicalCol * ldb + k]            // B stored [N, K], read K-stride
                         : b[k * ldb + logicalCol];           // B stored [K, N], read N-stride
                     packed[packedOff + k * nr + col] = value;
+                }
+            }
+        }
+
+        // Pack the partial tail stripe with zero-padding (Task G2).
+        // The packed layout always uses Nr-wide rows so tail kernels can read
+        // packedB[k * nr + col] safely for col in [0, effectiveNr).
+        if (tailCols > 0)
+        {
+            int tailStripe = numFullStripes;
+            int tailPackedOff = tailStripe * kc * nr;
+            int tailBaseCol = tailStripe * nr;
+            for (int k = 0; k < kc; k++)
+            {
+                for (int col = 0; col < nr; col++)
+                {
+                    int logicalCol = tailBaseCol + col;
+                    T value = default;
+                    if (col < tailCols)
+                    {
+                        value = transB
+                            ? b[logicalCol * ldb + k]
+                            : b[k * ldb + logicalCol];
+                    }
+                    packed[tailPackedOff + k * nr + col] = value;
                 }
             }
         }
