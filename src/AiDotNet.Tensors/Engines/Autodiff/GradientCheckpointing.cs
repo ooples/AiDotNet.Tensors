@@ -137,14 +137,30 @@ public static class GradientCheckpointing<T>
                     }
                     else
                     {
-                        // The segment was a no-op w.r.t. its input (e.g. the
-                        // recomputed forward never touched reInput). Fall back
-                        // to passing the upstream gradient through unchanged
-                        // only when its shape matches the input — otherwise we
-                        // would re-introduce the very broadcast mismatch this
-                        // fix is intended to prevent. When shapes differ, the
-                        // gradient is zero w.r.t. this segment's input.
-                        if (ShapesEqual(gradOutput._shape, inputs[0]._shape))
+                        // The segment was disconnected from its input — the
+                        // recomputed forward never touched reInput, so the
+                        // mathematical VJP is ZERO regardless of whether the
+                        // output happens to share a shape with the input.
+                        //
+                        // The earlier shape-equality fallback (CodeRabbit
+                        // feedback on PR #361) incorrectly turned input-
+                        // independent same-shape segments into an identity
+                        // backward by passing gradOutput through whenever the
+                        // shapes lined up. That's only correct when the
+                        // segment is literally a no-op (reOutput IS reInput
+                        // by reference), which is the only case where the
+                        // segment trivially passes gradients through. For
+                        // every other shape-equal but input-independent
+                        // segment, the correct gradient is zero, and we
+                        // achieve that by simply NOT calling
+                        // DifferentiableOps.AccumulateGrad — grads already
+                        // contains zero for inputs[0] by initialization.
+                        //
+                        // Reference-equality is the only safe alias predicate:
+                        // it covers the identity case (reInput == reOutput,
+                        // such as when the segment was empty / no-op) without
+                        // false positives on shape-coincidence.
+                        if (ReferenceEquals(reOutput, reInput))
                         {
                             DifferentiableOps.AccumulateGrad(grads, inputs[0], gradOutput, eng);
                         }
