@@ -2836,4 +2836,115 @@ public class ScalarKernelTests
         Assert.Equal(256, kc);
         Assert.Equal(8, threads);
     }
+
+    [Fact]
+    public void AutotuneDispatcher_CacheHit_ReturnsCachedChoice()
+    {
+        // Use a unique shape (primes) to isolate this test from any prior cache entries.
+        int m = 3137, n = 3137, k = 3137;
+        int mr = 8, nr = 16;
+
+        // First, store a specific known choice.
+        var shape = BlasManagedAutotune.EncodeShape<double>(m, n, k, false, false, mr, nr, false);
+        BlasManagedAutotune.Store(shape, ParallelismAxis.N, mc: 96, nc: 96, kc: 96, threadCount: 4, measuredTimeMs: 1.0);
+
+        // Dispatch should return the cached choice.
+        var (axis, mc, nc, kc, threads) = AutotuneDispatcher.Decide<double>(
+            m, n, k,
+            transA: false, transB: false,
+            mr: mr, nr: nr,
+            procs: 16,
+            isDeterministic: false,
+            hasEpilogue: false,
+            packingMode: PackingMode.Auto);
+
+        Assert.Equal(ParallelismAxis.N, axis);
+        Assert.Equal(96, mc);
+        Assert.Equal(96, nc);
+        Assert.Equal(96, kc);
+        Assert.Equal(4, threads);
+    }
+
+    [Fact]
+    public void AutotuneDispatcher_DisableAutotune_BypassesCache()
+    {
+        // Use the same unique shape from previous test (cache has N + 96/96/96 stored).
+        int m = 3137, n = 3137, k = 3137;
+        int mr = 8, nr = 16;
+
+        // With DisableAutotune, heuristic runs regardless of cache contents.
+        var (axis, mc, nc, kc, threads) = AutotuneDispatcher.Decide<double>(
+            m, n, k,
+            transA: false, transB: false,
+            mr: mr, nr: nr,
+            procs: 16,
+            isDeterministic: false,
+            hasEpilogue: false,
+            packingMode: PackingMode.DisableAutotune);
+
+        // The heuristic for this large shape with M=3137 and procs=16:
+        // procs*mr*2 = 256, m=3137 > 256 → M-axis.
+        // Defaults: mc=64, nc=64, kc=64.
+        Assert.Equal(ParallelismAxis.M, axis);
+        Assert.Equal(64, mc);
+        Assert.Equal(64, nc);
+        Assert.Equal(64, kc);
+    }
+
+    [Fact]
+    public void AutotuneDispatcher_CacheMiss_UsesHeuristicAndStores()
+    {
+        // Brand-new shape (won't be in any prior cache).
+        int m = 4099, n = 4099, k = 4099;  // primes
+        int mr = 8, nr = 16;
+
+        // Force a miss by storing nothing for this shape (using prime numbers ensures uniqueness).
+        var (axis1, mc1, nc1, kc1, threads1) = AutotuneDispatcher.Decide<double>(
+            m, n, k,
+            transA: false, transB: false,
+            mr: mr, nr: nr,
+            procs: 8,
+            isDeterministic: false,
+            hasEpilogue: false,
+            packingMode: PackingMode.Auto);
+
+        // Now the cache should have an entry. Second call returns same values.
+        var (axis2, mc2, nc2, kc2, threads2) = AutotuneDispatcher.Decide<double>(
+            m, n, k,
+            transA: false, transB: false,
+            mr: mr, nr: nr,
+            procs: 8,
+            isDeterministic: false,
+            hasEpilogue: false,
+            packingMode: PackingMode.Auto);
+
+        Assert.Equal(axis1, axis2);
+        Assert.Equal(mc1, mc2);
+        Assert.Equal(nc1, nc2);
+        Assert.Equal(kc1, kc2);
+    }
+
+    [Fact]
+    public void AutotuneDispatcher_BlocksRoundedToMrNrAlignment()
+    {
+        // Tiny shape: m=8 < default mc=64. Heuristic should clamp mc to m, then
+        // round down to mr alignment. For m=8, mr=8 → mc=8.
+        int m = 8, n = 8, k = 8;
+        int mr = 8, nr = 16;
+
+        var (_, mc, nc, kc, _) = AutotuneDispatcher.Decide<double>(
+            m, n, k,
+            transA: false, transB: false,
+            mr: mr, nr: nr,
+            procs: 8,
+            isDeterministic: false,
+            hasEpilogue: false,
+            packingMode: PackingMode.DisableAutotune);  // skip cache for determinism
+
+        // m=8 → mc=8 (mr-aligned).
+        Assert.Equal(8, mc);
+        // n=8 < nr=16 → mc would be 0; the safeguard floors it to nr.
+        Assert.Equal(16, nc);
+        Assert.Equal(8, kc);
+    }
 }
