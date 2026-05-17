@@ -2662,4 +2662,84 @@ public class ScalarKernelTests
     {
         Assert.False(MN2DDriver.ShouldUse2DGrid(numMBlocks: 4, numNBlocks: 4, procs: 1));
     }
+
+    // -------------------------------------------------------------------------
+    // G5 — AxisSelector tests
+    // -------------------------------------------------------------------------
+
+    [Fact]
+    public void AxisSelector_BelowWorkThreshold_ReturnsNone()
+    {
+        // m*n*k = 8*8*8 = 512 < threshold.
+        var axis = AxisSelector.Select(m: 8, n: 8, k: 8, mr: 4, nr: 4, procs: 8, isDeterministic: false);
+        Assert.Equal(ParallelismAxis.None, axis);
+    }
+
+    [Fact]
+    public void AxisSelector_SingleProcessor_ReturnsNone()
+    {
+        var axis = AxisSelector.Select(m: 4096, n: 16, k: 512, mr: 8, nr: 16, procs: 1, isDeterministic: false);
+        Assert.Equal(ParallelismAxis.None, axis);
+    }
+
+    [Fact]
+    public void AxisSelector_L2Shape_PicksMAxis()
+    {
+        // L2-shape: M=4096, N=16, K=512, mr=8, nr=16, procs=8.
+        // m=4096 >= procs*mr*2 = 128. k=512 > 256 but not deterministic → still M.
+        var axis = AxisSelector.Select(m: 4096, n: 16, k: 512, mr: 8, nr: 16, procs: 8, isDeterministic: false);
+        Assert.Equal(ParallelismAxis.M, axis);
+    }
+
+    [Fact]
+    public void AxisSelector_LargeKDeterministic_FallsThroughFromM()
+    {
+        // m=4096 >= procs*mr*2 = 128, BUT k=300 > 256 AND deterministic → skip M.
+        // n=16 vs procs*nr*2 = 128 → skip N.
+        // k=300 < 512 → skip K.
+        // m*n = 4096*16 = 65536, procs*mr*nr*4 = 8*8*16*4 = 4096 → 2D-grid eligible.
+        var axis = AxisSelector.Select(m: 4096, n: 16, k: 300, mr: 8, nr: 16, procs: 8, isDeterministic: true);
+        Assert.Equal(ParallelismAxis.MN_2D, axis);
+    }
+
+    [Fact]
+    public void AxisSelector_NHeavyShape_PicksNAxis()
+    {
+        // m=4, n=4096, k=512. M-axis needs m >= 8*4*2 = 64 — no.
+        // N-axis: n=4096 >= 8*4*2 = 64 — yes.
+        var axis = AxisSelector.Select(m: 4, n: 4096, k: 512, mr: 4, nr: 4, procs: 8, isDeterministic: false);
+        Assert.Equal(ParallelismAxis.N, axis);
+    }
+
+    [Fact]
+    public void AxisSelector_TallThinShape_NonDeterministic_PicksKAxis()
+    {
+        // m=4, n=8, k=2048. M, N too small. K=2048 >= 512 → K-axis (non-deterministic).
+        // Workload check: m*n*k = 65536 >= threshold.
+        var axis = AxisSelector.Select(m: 4, n: 8, k: 2048, mr: 4, nr: 4, procs: 8, isDeterministic: false);
+        Assert.Equal(ParallelismAxis.K, axis);
+    }
+
+    [Fact]
+    public void AxisSelector_TallThinShape_Deterministic_FallsBackToMaxis()
+    {
+        // Same shape as above but deterministic: K-axis forbidden.
+        // m=4, n=8, k=2048. M needs m >= 8*4*2 = 64 — no. N needs n >= 8*4*2 = 64 — no.
+        // K-axis disabled (deterministic). 2D: m*n = 32 < procs*mr*nr*4 = 512 — no.
+        // Fallback → M-axis.
+        var axis = AxisSelector.Select(m: 4, n: 8, k: 2048, mr: 4, nr: 4, procs: 8, isDeterministic: true);
+        Assert.Equal(ParallelismAxis.M, axis);
+    }
+
+    [Fact]
+    public void AxisSelector_BalancedLargeShape_Picks2DGrid()
+    {
+        // m=128, n=128, k=128, mr=8, nr=16, procs=16.
+        // M-axis: m=128 < procs*mr*2 = 256 — no.
+        // N-axis: n=128 < procs*nr*2 = 512 — no.
+        // K-axis: k=128 < 512 — no.
+        // 2D: m*n = 16384 >= procs*mr*nr*4 = 8192 — yes.
+        var axis = AxisSelector.Select(m: 128, n: 128, k: 128, mr: 8, nr: 16, procs: 16, isDeterministic: false);
+        Assert.Equal(ParallelismAxis.MN_2D, axis);
+    }
 }
