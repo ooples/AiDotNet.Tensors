@@ -20,12 +20,14 @@ This map identifies every file the sprint creates or modifies. Each sub-issue ow
 
 ### New files (created during sprint)
 
+> **Note (2026-05-17 update):** the Sub-issue A catalog/harness types live in the Tests project, not the Benchmarks project. Reason: `tests/AiDotNet.Tensors.Tests` multi-targets `net10.0;net471`, while `tests/AiDotNet.Tensors.Benchmarks` is a net10.0-only Exe. A cross-project reference would break the net471 build. Existing convention (e.g., `ComparativeBenchmark.cs`) keeps BlasManaged bench code in the Tests project alongside the unit tests.
+
 | File | Owned by | Responsibility |
 |------|----------|----------------|
-| `tests/AiDotNet.Tensors.Benchmarks/BlasManaged/ShapeCatalog.cs` | A | Static list of 50–80 (M,N,K,trans,dtype,freq,source) records |
-| `tests/AiDotNet.Tensors.Benchmarks/BlasManaged/PerfHarness.cs` | A | Median+p95 measurement runner; writes JSON to `artifacts/perf/` |
-| `tests/AiDotNet.Tensors.Benchmarks/BlasManaged/ShapeInstrumenter.cs` | A | Logs shapes seen during test suite to JSON dedupe file |
-| `tests/AiDotNet.Tensors.Benchmarks/BlasManaged/WorkloadShapes.cs` | A | Curated BERT/ResNet/GPT/MobileNet shape lists |
+| `tests/AiDotNet.Tensors.Tests/Engines/BlasManaged/Catalog/ShapeCatalog.cs` | A | Static list of 50–80 (M,N,K,trans,dtype,freq,source) records |
+| `tests/AiDotNet.Tensors.Tests/Engines/BlasManaged/Catalog/PerfHarness.cs` | A | Median+p95 measurement runner; writes JSON to `artifacts/perf/` |
+| `tests/AiDotNet.Tensors.Tests/Engines/BlasManaged/Catalog/ShapeInstrumenter.cs` | A | Logs shapes seen during test suite to JSON dedupe file |
+| `tests/AiDotNet.Tensors.Tests/Engines/BlasManaged/Catalog/WorkloadShapes.cs` | A | Curated BERT/ResNet/GPT/MobileNet shape lists |
 | `artifacts/perf/baseline.json` | A | First full-bench result; committed as the reference point |
 | `artifacts/perf/instrumented-shapes.json` | A | Deduped shapes from running the test suite with instrumenter |
 | `tests/AiDotNet.Tensors.Tests/Engines/BlasManaged/PerfBar.cs` | A | Win-rate / max-loss constants written by project owner |
