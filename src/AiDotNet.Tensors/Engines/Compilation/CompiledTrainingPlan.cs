@@ -251,6 +251,40 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private Action? _optimizerUpdate;
     private int _optimizerStep;
 
+    /// <summary>
+    /// Global gradient L2-norm clip threshold. When &gt; 0, applied inside
+    /// <see cref="Step"/> between the backward pass and the fused optimizer
+    /// update — same semantics as PyTorch's
+    /// <c>torch.nn.utils.clip_grad_norm_</c>. When 0 (default), no clipping
+    /// is applied. Configured via <see cref="SetMaxGradNorm"/>.
+    /// </summary>
+    private double _maxGradNorm;
+
+    /// <summary>
+    /// Configures global gradient L2-norm clipping for the fused training
+    /// path. The clip is applied across <em>all</em> trainable-parameter
+    /// gradients collectively (one global norm), not per-tensor — matching
+    /// PyTorch's <c>clip_grad_norm_</c> contract. Pass 0 to disable.
+    /// </summary>
+    /// <remarks>
+    /// Without this clip, deep networks with batch-norm at small batch sizes
+    /// can produce single-step Adam explosions that drive loss up by orders
+    /// of magnitude on the very first iteration. The eager training path
+    /// (<c>NeuralNetworkBase.TrainWithTape</c>) applies the same clip
+    /// independently — both paths agree when given the same threshold.
+    /// </remarks>
+    public void SetMaxGradNorm(double maxNorm)
+    {
+        if (double.IsNaN(maxNorm) || double.IsInfinity(maxNorm) || maxNorm < 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(maxNorm),
+                maxNorm,
+                "Gradient norm threshold must be finite and non-negative.");
+        }
+        _maxGradNorm = maxNorm;
+    }
+
     // Gradient checkpointing (Phase 5.3)
     private GradientCheckpointing<T>? _checkpointing;
 
@@ -376,10 +410,26 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             gradArrays = new T[_preAllocatedGrads.Length][];
             for (int i = 0; i < _preAllocatedGrads.Length; i++)
-                gradArrays[i] = _preAllocatedGrads[i].GetDataArray();
+            {
+                // Issue #350 v2: must cache the LIVE pool-padded backing.
+                // GetDataArray() returns a fresh COPY whenever storage.Length
+                // (pool bucket) > Length (logical) — see TensorBase.cs:1308.
+                // Zeroing the COPY leaves the LIVE backing as uninitialized
+                // ArrayPool memory; backward's TensorAddInPlace then ADDS
+                // the correct gradient ONTO ~1e137 garbage bits, and the
+                // fused optimizer (which reads the same LIVE backing) sees
+                // the garbage. Manifested as immediate loss explosion on
+                // the first Step() of any double-precision compiled plan
+                // whose parameters happen to round-up the bucket (e.g.
+                // GraFPrint's 53-layer BN pyramid).
+                gradArrays[i] = _preAllocatedGrads[i].GetLiveBackingArrayAllowingPaddingOrNull()
+                    ?? _preAllocatedGrads[i].GetDataArray();
+            }
             _cachedGradArrays = gradArrays;
-            _cachedLossGradSeedArray = _lossGradSeed.GetDataArray();
-            _cachedLossGradDestArray = _lossGradDest?.GetDataArray();
+            _cachedLossGradSeedArray = _lossGradSeed.GetLiveBackingArrayAllowingPaddingOrNull()
+                ?? _lossGradSeed.GetDataArray();
+            _cachedLossGradDestArray = _lossGradDest?.GetLiveBackingArrayAllowingPaddingOrNull()
+                ?? _lossGradDest?.GetDataArray();
         }
 
         // Only zero gradient buffers used by generic (accumulating) backward delegates.
@@ -446,6 +496,22 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         }
         long t3 = _profileStepEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         if (stepTiming) StepTiming.RecordBackward(Stopwatch.GetTimestamp() - bwdStart);
+
+        // Global gradient L2-norm clipping. Applied between backward and the
+        // fused optimizer update so the optimizer sees the clipped gradients.
+        // Mirrors PyTorch's torch.nn.utils.clip_grad_norm_ semantics: one
+        // global norm across all PARAMETER gradients (not intermediate-tensor
+        // grads), scaled collectively when over the threshold. No-op when
+        // SetMaxGradNorm wasn't called (or was called with 0). Clipping over
+        // _gradients (parameter-grad set) with each tensor's LOGICAL Length
+        // — not over _preAllocatedGrads (which contains a grad buffer per
+        // every traced tensor) and not using arr.Length (which is the
+        // pool-padded backing-array length whose tail bytes Array.Clear
+        // leaves uninitialised).
+        if (_maxGradNorm > 0.0)
+        {
+            ClipGradientsGlobalL2(_gradients, _maxGradNorm);
+        }
 
         if (bwdProbe != null) bwdProbe("BEGIN-OPT");
         // Fused optimizer update (if configured via ConfigureOptimizer)
@@ -881,7 +947,6 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             {
                 if (gradArrays[p].Length == 0) continue;
                 int len = lengths[p];
-
                 fixed (double* pParam = paramArrays[p], pGrad = gradArrays[p],
                        pM = m[p], pV = v[p])
                 {
@@ -2714,6 +2779,54 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         return null;
     }
 
+    /// <summary>
+    /// Applies global L2-norm clipping across the supplied parameter-gradient
+    /// tensors in place. Mirrors PyTorch's
+    /// <c>torch.nn.utils.clip_grad_norm_</c>: computes the total norm across
+    /// all tensors using each tensor's LOGICAL length (not the pool-padded
+    /// backing-array length), then scales every element by
+    /// <c>maxNorm / (totalNorm + 1e-6)</c> when totalNorm exceeds maxNorm.
+    /// </summary>
+    private static void ClipGradientsGlobalL2(Tensor<T>[] gradients, double maxNorm)
+    {
+        if (gradients.Length == 0) return;
+
+        // Step 1: total L2 norm across all parameter gradients. Reads through
+        // the `T` element type so float and double both work without per-type
+        // duplication; the inner loop is dominated by the L1-resident array
+        // accesses, not the conversion arithmetic. Uses logical Length so the
+        // uninitialised pool-padding tail does not leak into the norm.
+        var numOps = MathHelper.GetNumericOperations<T>();
+        double totalNormSq = 0.0;
+        for (int p = 0; p < gradients.Length; p++)
+        {
+            var tensor = gradients[p];
+            if (tensor == null) continue;
+            var arr = tensor.GetLiveBackingArrayAllowingPaddingOrNull() ?? tensor.GetDataArray();
+            int len = tensor.Length;
+            for (int i = 0; i < len; i++)
+            {
+                double v = numOps.ToDouble(arr[i]);
+                totalNormSq += v * v;
+            }
+        }
+        if (totalNormSq == 0.0) return;
+        double totalNorm = Math.Sqrt(totalNormSq);
+        if (totalNorm <= maxNorm) return;
+
+        // Step 2: scale every gradient by maxNorm / (totalNorm + 1e-6).
+        T scale = numOps.FromDouble(maxNorm / (totalNorm + 1e-6));
+        for (int p = 0; p < gradients.Length; p++)
+        {
+            var tensor = gradients[p];
+            if (tensor == null) continue;
+            var arr = tensor.GetLiveBackingArrayAllowingPaddingOrNull() ?? tensor.GetDataArray();
+            int len = tensor.Length;
+            for (int i = 0; i < len; i++)
+                arr[i] = numOps.Multiply(arr[i], scale);
+        }
+    }
+
     private static void TensorMatMulGemvFloat(float[] matrix, float[] vector, float[] output, int rows, int cols)
     {
         const int parallelThreshold = 128 * 1024;
@@ -3519,6 +3632,178 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 if (accum) eng.TensorAddInto(gradIn, gradIn, grad);
                 else grad.AsSpan().CopyTo(gradIn.AsWritableSpan());
                 input.Grad = gradIn;
+            };
+        }
+
+        // BroadcastAdd backward: gradA = gradOut, gradB = ReduceSum over the
+        // broadcasted axes. This is the single biggest unspecialized cost in
+        // the compiled training path for typical convnets — every Conv layer
+        // emits a `Conv2D + Reshape(bias) + BroadcastAdd(conv, biasReshaped)`
+        // chain whose backward through the generic ReduceGradToShape +
+        // AccumulateGrad path costs 30+ ms per call on the GraFPrint pyramid
+        // (top per-step offender at 7 instances × ~14 ms = ~99 ms/step).
+        // The specialized version writes gradA in-place (or accumulates) and
+        // computes gradB via a direct reduce into the pre-allocated bias-grad
+        // buffer, skipping both the temp-tensor allocation and the chained
+        // AccumulateGrad orchestration.
+        if (step.OpType == OpType.TensorBroadcastAdd && step.Inputs.Length == 2)
+        {
+            var inputA = step.Inputs[0];
+            var inputB = step.Inputs[1];
+            var output = step.OutputBuffer;
+            if (!gradMap.ContainsKey(output)
+                || !gradMap.ContainsKey(inputA)
+                || !gradMap.ContainsKey(inputB)) return null;
+            // Specialization only handles the case where output and inputA
+            // have the same shape (the broadcast goes one direction:
+            // inputB is broadcast TO inputA's shape). This is the dominant
+            // pattern for bias add: inputA = [B, C, H, W], inputB =
+            // [1, C, 1, 1], output = [B, C, H, W]. Skip the rare
+            // bidirectional-broadcast case.
+            if (output._shape.Length != inputA._shape.Length) return null;
+            bool sameShape = true;
+            for (int d = 0; d < output._shape.Length; d++)
+                if (output._shape[d] != inputA._shape[d]) { sameShape = false; break; }
+            if (!sameShape) return null;
+            // Reduce-axis derivation: every axis where inputB has size 1 but
+            // output has size > 1 is a broadcast axis that must be summed
+            // over. Captured at compile time so the closure doesn't rebuild
+            // it every Step.
+            int rank = output._shape.Length;
+            var reduceAxes = new System.Collections.Generic.List<int>();
+            int[] bShape = new int[rank];
+            // Pad inputB shape with leading 1s if it's lower-rank than inputA.
+            int bRankDiff = rank - inputB._shape.Length;
+            for (int d = 0; d < rank; d++)
+                bShape[d] = d < bRankDiff ? 1 : inputB._shape[d - bRankDiff];
+            for (int d = 0; d < rank; d++)
+                if (bShape[d] == 1 && output._shape[d] > 1)
+                    reduceAxes.Add(d);
+            var reduceAxesArr = reduceAxes.ToArray();
+
+            var gradOut = gradMap[output];
+            var gradInputA = gradMap[inputA];
+            var gradInputB = gradMap[inputB];
+            bool accumA = consumerCount.ContainsKey(inputA) && consumerCount[inputA] > 1;
+            bool accumB = consumerCount.ContainsKey(inputB) && consumerCount[inputB] > 1;
+            int[] inputBShape = (int[])inputB._shape.Clone();
+            int[] outShape = (int[])output._shape.Clone();
+
+            // Detect the NCHW→[1,C,1,1] bias-add pattern: reduce axes are
+            // exactly {0, 2, 3} (batch + both spatial dims) AND output is
+            // rank-4 NCHW. This is what every Conv-bias-add chain in a
+            // standard convnet looks like. Specializing it avoids the
+            // generic ReduceSum n-dim fallback (whose tight-loop walks the
+            // tensor index helper per element — orders of magnitude slower
+            // than a tight per-channel sum over the contiguous spatial run).
+            bool isNchwChannelReduce =
+                outShape.Length == 4
+                && reduceAxesArr.Length == 3
+                && reduceAxesArr[0] == 0 && reduceAxesArr[1] == 2 && reduceAxesArr[2] == 3
+                && inputBShape.Length == 4 && inputBShape[0] == 1 && inputBShape[2] == 1 && inputBShape[3] == 1
+                && inputBShape[1] == outShape[1];
+
+            return eng =>
+            {
+                // gradInputA: identity copy (or in-place add) of gradOut.
+                if (accumA) eng.TensorAddInto(gradInputA, gradInputA, gradOut);
+                else gradOut.AsSpan().CopyTo(gradInputA.AsWritableSpan());
+                inputA.Grad = gradInputA;
+
+                // gradInputB: reduce-sum gradOut over the broadcast axes.
+                if (reduceAxesArr.Length == 0)
+                {
+                    if (accumB) eng.TensorAddInto(gradInputB, gradInputB, gradOut);
+                    else gradOut.AsSpan().CopyTo(gradInputB.AsWritableSpan());
+                }
+                else if (isNchwChannelReduce)
+                {
+                    // Fast path: NCHW→[1,C,1,1] reduction directly into
+                    // the bias gradient buffer. Per-channel tight loop over
+                    // the contiguous (batch × spatial) run, no AutoTensorCache
+                    // allocation, no n-dim index unwinding, no per-element
+                    // virtual dispatch — just an inner sum.
+                    int B = outShape[0];
+                    int C = outShape[1];
+                    int H = outShape[2];
+                    int W = outShape[3];
+                    int spatial = H * W;
+                    int perChannel = B * spatial; // logical count per output channel
+                    // Type-dispatched fast paths via Unsafe.As reinterpret
+                    // (T isn't constrained as struct so MemoryMarshal.Cast
+                    // can't bind; the runtime check + cast is the standard
+                    // pattern used by other specialized branches in this
+                    // file — see TensorMatMulGemvFloat caller above).
+                    // GetDataArray() returns a fresh COPY for pool-padded tensors;
+                    // writing into it would leave the LIVE backing (which the
+                    // optimizer reads in the next pass) untouched. Prefer the
+                    // live-backing accessor and fall back to the generic reduce
+                    // path when the layout does not expose one. Source array can
+                    // safely use GetDataArray() — we only read from it.
+                    var dstLiveT = gradInputB.GetLiveBackingArrayAllowingPaddingOrNull();
+                    if (dstLiveT is null)
+                    {
+                        var reducedGeneric = eng.ReduceSum(gradOut, reduceAxesArr, keepDims: true);
+                        if (reducedGeneric._shape.Length != inputBShape.Length)
+                            reducedGeneric = eng.Reshape(reducedGeneric, inputBShape);
+                        if (accumB) eng.TensorAddInto(gradInputB, gradInputB, reducedGeneric);
+                        else reducedGeneric.AsSpan().CopyTo(gradInputB.AsWritableSpan());
+                    }
+                    else if (typeof(T) == typeof(double))
+                    {
+                        var srcArrT = gradOut.GetLiveBackingArrayAllowingPaddingOrNull() ?? gradOut.GetDataArray();
+                        var src = System.Runtime.CompilerServices.Unsafe.As<T[], double[]>(ref srcArrT);
+                        var dst = System.Runtime.CompilerServices.Unsafe.As<T[], double[]>(ref dstLiveT);
+                        for (int c = 0; c < C; c++)
+                        {
+                            double sum = 0.0;
+                            for (int b = 0; b < B; b++)
+                            {
+                                int baseIdx = b * C * spatial + c * spatial;
+                                for (int s = 0; s < spatial; s++)
+                                    sum += src[baseIdx + s];
+                            }
+                            if (accumB) dst[c] += sum;
+                            else dst[c] = sum;
+                        }
+                    }
+                    else if (typeof(T) == typeof(float))
+                    {
+                        var srcArrT = gradOut.GetLiveBackingArrayAllowingPaddingOrNull() ?? gradOut.GetDataArray();
+                        var src = System.Runtime.CompilerServices.Unsafe.As<T[], float[]>(ref srcArrT);
+                        var dst = System.Runtime.CompilerServices.Unsafe.As<T[], float[]>(ref dstLiveT);
+                        for (int c = 0; c < C; c++)
+                        {
+                            float sum = 0f;
+                            for (int b = 0; b < B; b++)
+                            {
+                                int baseIdx = b * C * spatial + c * spatial;
+                                for (int s = 0; s < spatial; s++)
+                                    sum += src[baseIdx + s];
+                            }
+                            if (accumB) dst[c] += sum;
+                            else dst[c] = sum;
+                        }
+                    }
+                    else
+                    {
+                        var reducedGeneric = eng.ReduceSum(gradOut, reduceAxesArr, keepDims: true);
+                        if (reducedGeneric._shape.Length != inputBShape.Length)
+                            reducedGeneric = eng.Reshape(reducedGeneric, inputBShape);
+                        if (accumB) eng.TensorAddInto(gradInputB, gradInputB, reducedGeneric);
+                        else reducedGeneric.AsSpan().CopyTo(gradInputB.AsWritableSpan());
+                    }
+                }
+                else
+                {
+                    // Generic multi-axis reduce fallback for non-NCHW patterns.
+                    var reduced = eng.ReduceSum(gradOut, reduceAxesArr, keepDims: true);
+                    if (reduced._shape.Length != inputBShape.Length)
+                        reduced = eng.Reshape(reduced, inputBShape);
+                    if (accumB) eng.TensorAddInto(gradInputB, gradInputB, reduced);
+                    else reduced.AsSpan().CopyTo(gradInputB.AsWritableSpan());
+                }
+                inputB.Grad = gradInputB;
             };
         }
 

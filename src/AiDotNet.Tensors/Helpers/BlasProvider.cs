@@ -76,6 +76,33 @@ internal static class BlasProvider
         double* b, int ldb,
         double beta, double* c, int ldc);
 
+    /// <summary>
+    /// OpenBLAS thread-count knob. Setting to 1 forces single-threaded GEMM
+    /// kernel dispatch — required for bit-exact reproducibility because
+    /// OpenBLAS multi-threaded GEMM partitions the K-dimension across threads
+    /// and sums the partial products in (thread-completion-order, not
+    /// fixed-order), so floating-point non-associativity makes the same
+    /// inputs produce different outputs across runs.
+    /// </summary>
+    [DllImport("libopenblas", EntryPoint = "openblas_set_num_threads", CallingConvention = CallingConvention.Cdecl)]
+    private static extern void openblas_set_num_threads_native(int num_threads);
+
+    private static int _openblasThreadCount = -1; // -1 = unset
+
+    /// <summary>
+    /// Sets the OpenBLAS internal thread count. Pass 1 to force deterministic
+    /// single-threaded GEMM. Caller must verify <see cref="HasNativeDgemm"/>
+    /// is true before calling, otherwise the P/Invoke will throw.
+    /// </summary>
+    internal static void TrySetOpenBlasThreads(int n)
+    {
+        if (!_nativeAvailable.Value) return;
+        if (_openblasThreadCount == n) return;
+        try { openblas_set_num_threads_native(n); _openblasThreadCount = n; }
+        catch { /* libopenblas symbol missing — earlier OpenBLAS builds may lack it. Tolerate. */ }
+    }
+
+
     // ─────────────────────────────────────────────────────────────────────
     // Issue #338 Phase G.1 — Intel MKL via Microsoft.ML.Mkl.Redist.
     // MklImports.dll exports cblas_sgemm/cblas_dgemm directly (verified
@@ -840,6 +867,12 @@ internal static class BlasProvider
     public static void SetDeterministicMode(bool deterministic)
     {
         _deterministicMode = deterministic;
+        // Force OpenBLAS to single-threaded mode so its multi-threaded GEMM
+        // partial-sum reduction order doesn't reintroduce non-determinism
+        // on top of the managed-side determinism the SimdGemm fallback
+        // already guarantees. Restoring multi-threading on disable lets
+        // perf go back up for callers that re-enter non-deterministic mode.
+        TrySetOpenBlasThreads(deterministic ? 1 : 0);
     }
 
     /// <summary>True iff <c>AIDOTNET_USE_BLAS=1</c> is set AND libopenblas loaded successfully.</summary>
@@ -1055,6 +1088,67 @@ internal static class BlasProvider
                 {
                     cblas_dgemm_ptr(CblasRowMajor, cblasTA, cblasTB,
                         m, n, k, 1.0, pa, lda, pb, ldb, 0.0, pc, ldc);
+                }
+            }
+            return true;
+        }
+        catch { return false; }
+    }
+
+    /// <summary>
+    /// Double-precision GEMM with explicit α/β scalars: C = αAB + βC.
+    /// Used by the 1×1 conv backward fast paths to write directly into the
+    /// pre-allocated gradient destination with β=1 (accumulating mode)
+    /// without an intermediate buffer + sum-loop.
+    /// </summary>
+    internal static bool TryGemmExBeta(int m, int n, int k,
+        double[] a, int aOffset, int lda, bool transA,
+        double[] b, int bOffset, int ldb, bool transB,
+        double[] c, int cOffset, int ldc,
+        double alpha, double beta)
+    {
+        if (!_nativeAvailable.Value) return false;
+        try
+        {
+            int cblasTA = transA ? 112 : CblasNoTrans;
+            int cblasTB = transB ? 112 : CblasNoTrans;
+            unsafe
+            {
+                fixed (double* pa = &a[aOffset])
+                fixed (double* pb = &b[bOffset])
+                fixed (double* pc = &c[cOffset])
+                {
+                    cblas_dgemm_ptr(CblasRowMajor, cblasTA, cblasTB,
+                        m, n, k, alpha, pa, lda, pb, ldb, beta, pc, ldc);
+                }
+            }
+            return true;
+        }
+        catch { return false; }
+    }
+
+    /// <summary>
+    /// Float counterpart of <see cref="TryGemmExBeta(int, int, int, double[], int, int, bool, double[], int, int, bool, double[], int, int, double, double)"/>.
+    /// </summary>
+    internal static bool TryGemmExBeta(int m, int n, int k,
+        float[] a, int aOffset, int lda, bool transA,
+        float[] b, int bOffset, int ldb, bool transB,
+        float[] c, int cOffset, int ldc,
+        float alpha, float beta)
+    {
+        if (!_nativeAvailable.Value) return false;
+        try
+        {
+            int cblasTA = transA ? 112 : CblasNoTrans;
+            int cblasTB = transB ? 112 : CblasNoTrans;
+            unsafe
+            {
+                fixed (float* pa = &a[aOffset])
+                fixed (float* pb = &b[bOffset])
+                fixed (float* pc = &c[cOffset])
+                {
+                    cblas_sgemm_ptr(CblasRowMajor, cblasTA, cblasTB,
+                        m, n, k, alpha, pa, lda, pb, ldb, beta, pc, ldc);
                 }
             }
             return true;
