@@ -42,6 +42,40 @@ public class PerfBarTest
         Assert.Equal(PerfBar.CatalogShapeCount, ShapeCatalog.All.Count);
     }
 
+    /// <summary>
+    /// One-shot baseline generator: sweeps the full catalog through
+    /// <see cref="PerfHarness"/> and writes the JSON to <c>artifacts/perf/baseline.json</c>
+    /// (or to <c>AIDOTNET_BASELINE_OUT</c> if set). Gated by env var
+    /// <c>AIDOTNET_GENERATE_BASELINE=1</c> so it doesn't run on normal test invocations
+    /// (it's slow — full catalog sweep can take minutes).
+    /// </summary>
+    [Fact]
+    public void Generate_Baseline_From_Full_Catalog()
+    {
+        if (Environment.GetEnvironmentVariable("AIDOTNET_GENERATE_BASELINE") != "1") return;
+
+        var outPath = Environment.GetEnvironmentVariable("AIDOTNET_BASELINE_OUT");
+        if (string.IsNullOrWhiteSpace(outPath))
+        {
+            // Default: walk up to find repo root, write to artifacts/perf/baseline.json.
+            var dir = AppContext.BaseDirectory;
+            for (int i = 0; i < 10 && dir != null; i++)
+            {
+                if (Directory.Exists(Path.Combine(dir, ".git")) ||
+                    Directory.Exists(Path.Combine(dir, "artifacts")))
+                {
+                    outPath = Path.Combine(dir, "artifacts", "perf", "baseline.json");
+                    break;
+                }
+                dir = Path.GetDirectoryName(dir);
+            }
+        }
+        Assert.False(string.IsNullOrWhiteSpace(outPath), "Could not resolve baseline output path");
+
+        PerfHarness.RunAll(ShapeCatalog.All, outPath!);
+        Assert.True(File.Exists(outPath), $"Expected baseline at {outPath}");
+    }
+
     [Fact]
     public void WinRate_And_MaxLoss_Meet_PerfBar()
     {
@@ -52,16 +86,10 @@ public class PerfBarTest
             return;
         }
 
-        if (PerfBar.TargetHardwareFingerprint == "<runner-fingerprint>")
-        {
-            // Bar not yet codified by project owner (A.7 placeholder still in place).
-            // Don't fail spuriously; surface what's expected.
-            return;
-        }
-
         if (HardwareFingerprint.Current.ToString() != PerfBar.TargetHardwareFingerprint)
         {
-            // Wrong hardware — skip.
+            // Wrong hardware — skip. The bar is calibrated for
+            // PerfBar.TargetHardwareFingerprint only.
             return;
         }
 

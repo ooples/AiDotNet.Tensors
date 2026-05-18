@@ -32,17 +32,18 @@ public static class PerfBar
 {
     /// <summary>
     /// Target win rate: BlasManaged must beat OpenBLAS on at least this percentage
-    /// of catalog shapes. <b>Placeholder value</b> — actual bar set by project owner
-    /// after baseline.json inspection.
+    /// of catalog shapes. Set against the 2026-05-18 baseline that showed 0% wins
+    /// (median 23.5× slower than OpenBLAS, worst 381× on Tiny_8x6x4). The 80% bar
+    /// is what closes Sub-issue G (#375 — native BLAS removal).
     /// </summary>
-    public const int MinWinRatePercent = 80;  // PLACEHOLDER — SET BY PROJECT OWNER (#369 A.7)
+    public const int MinWinRatePercent = 80;
 
     /// <summary>
     /// Ceiling for the worst remaining loss. No shape may be more than this
-    /// multiple of OpenBLAS slower. <b>Placeholder value</b> — actual bar set by
-    /// project owner after baseline.json inspection.
+    /// multiple of OpenBLAS slower. 1.20 = within the noise floor of repeated
+    /// measurement. Sub-issue G can only merge when every shape clears this.
     /// </summary>
-    public const double MaxLossMultiple = 1.20;  // PLACEHOLDER — SET BY PROJECT OWNER (#369 A.7)
+    public const double MaxLossMultiple = 1.20;
 
     /// <summary>
     /// <see cref="Catalog.ShapeCatalog.All"/> size as of A.4 commit (37 workload +
@@ -53,10 +54,10 @@ public static class PerfBar
     public const int CatalogShapeCount = 54;
 
     /// <summary>
-    /// Hardware fingerprint of the authoritative runner. The perf test skips
-    /// when running on a different host (numbers aren't comparable across hardware).
-    /// <b>Placeholder value</b> — actual fingerprint captured from
-    /// <c>HardwareFingerprint.Current.ToString()</c> on the runner.
+    /// Hardware fingerprint of the authoritative runner where the bar was set.
+    /// The perf test skips when running on a different host because perf numbers
+    /// aren't comparable across hardware. Captured from
+    /// <c>HardwareFingerprint.Current.ToString()</c> on 2026-05-18.
     /// </summary>
-    public const string TargetHardwareFingerprint = "<runner-fingerprint>";  // PLACEHOLDER — SET BY PROJECT OWNER (#369 A.7)
+    public const string TargetHardwareFingerprint = "x64-amd-avx2-cpu16";
 }
