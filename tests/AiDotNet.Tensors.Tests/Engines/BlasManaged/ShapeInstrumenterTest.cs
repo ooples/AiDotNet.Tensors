@@ -15,12 +15,25 @@ namespace AiDotNet.Tensors.Tests.Engines.BlasManaged;
 /// Lives in the BlasManaged-Stats-Serial collection because ShapeInstrumenter's
 /// state (Enabled flag, counts dictionary, BlasProvider.ShapeLogHook) is process-wide.
 /// </para>
+///
+/// <para>
+/// <b>Harvest-mode skip:</b> when <c>AIDOTNET_INSTRUMENT_SHAPES=1</c> is set,
+/// <see cref="ShapeInstrumenterBootstrap"/> has globally installed the hook and
+/// started recording. These mechanical tests would clobber that state (via their
+/// per-test reset + null-out), so they no-op during the harvest pass. The instrumenter
+/// mechanics are still verified on every normal test run.
+/// </para>
 /// </summary>
 [Collection("BlasManaged-Stats-Serial")]
 public class ShapeInstrumenterTest
 {
+    private static bool HarvestModeActive
+        => Environment.GetEnvironmentVariable("AIDOTNET_INSTRUMENT_SHAPES") == "1";
+
     public ShapeInstrumenterTest()
     {
+        if (HarvestModeActive) return;
+
         // Each test starts from a clean slate. The hook is wired by the test bodies
         // that need it (so other tests in the same serial collection don't pay for
         // a recorded null-check on every BlasProvider call).
@@ -32,6 +45,7 @@ public class ShapeInstrumenterTest
     [Fact]
     public void Instrumenter_Captures_Shape_From_TryGemm()
     {
+        if (HarvestModeActive) return;
         WireHook();
         ShapeInstrumenter.Enabled = true;
         try
@@ -49,15 +63,14 @@ public class ShapeInstrumenterTest
         }
         finally
         {
-            ShapeInstrumenter.Enabled = false;
-            BlasProvider.ShapeLogHook = null;
-            ShapeInstrumenter.Reset();
+            RestoreCleanState();
         }
     }
 
     [Fact]
     public void Instrumenter_Captures_Trans_Flags_From_TryGemmEx()
     {
+        if (HarvestModeActive) return;
         WireHook();
         ShapeInstrumenter.Enabled = true;
         try
@@ -76,15 +89,14 @@ public class ShapeInstrumenterTest
         }
         finally
         {
-            ShapeInstrumenter.Enabled = false;
-            BlasProvider.ShapeLogHook = null;
-            ShapeInstrumenter.Reset();
+            RestoreCleanState();
         }
     }
 
     [Fact]
     public void Instrumenter_Deduplicates_Identical_Shapes_And_Counts_Frequency()
     {
+        if (HarvestModeActive) return;
         WireHook();
         ShapeInstrumenter.Enabled = true;
         try
@@ -101,15 +113,14 @@ public class ShapeInstrumenterTest
         }
         finally
         {
-            ShapeInstrumenter.Enabled = false;
-            BlasProvider.ShapeLogHook = null;
-            ShapeInstrumenter.Reset();
+            RestoreCleanState();
         }
     }
 
     [Fact]
     public void Instrumenter_Records_Nothing_When_Disabled()
     {
+        if (HarvestModeActive) return;
         WireHook();
         ShapeInstrumenter.Enabled = false;
         try
@@ -123,14 +134,14 @@ public class ShapeInstrumenterTest
         }
         finally
         {
-            BlasProvider.ShapeLogHook = null;
-            ShapeInstrumenter.Reset();
+            RestoreCleanState();
         }
     }
 
     [Fact]
     public void Instrumenter_Distinguishes_Single_From_Double_Dtype()
     {
+        if (HarvestModeActive) return;
         WireHook();
         ShapeInstrumenter.Enabled = true;
         try
@@ -152,9 +163,7 @@ public class ShapeInstrumenterTest
         }
         finally
         {
-            ShapeInstrumenter.Enabled = false;
-            BlasProvider.ShapeLogHook = null;
-            ShapeInstrumenter.Reset();
+            RestoreCleanState();
         }
     }
 
@@ -163,5 +172,16 @@ public class ShapeInstrumenterTest
         BlasProvider.ShapeLogHook = (m, n, k, transA, transB, dtype) =>
             ShapeInstrumenter.Record(m, n, k, transA, transB,
                 dtype == typeof(float) ? DType.Single : DType.Double);
+    }
+
+    private static void RestoreCleanState()
+    {
+        // In harvest mode we never reached here (guard at top of each test), but
+        // double-check defensively to make absolutely sure we never nuke the
+        // bootstrap-installed hook.
+        if (HarvestModeActive) return;
+        ShapeInstrumenter.Enabled = false;
+        BlasProvider.ShapeLogHook = null;
+        ShapeInstrumenter.Reset();
     }
 }

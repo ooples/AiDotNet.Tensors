@@ -68,6 +68,28 @@ public static class WorkloadShapes
 
         // ── Tiny shapes (LSTM cell, embedding lookup) ───────────────────
         new Shape("LSTM_cell_1x256x256",            1,    256,  256,  false, false, DType.Single, 0, "workload:LSTM cell per-timestep"),
+        new Shape("LSTM_cell_1x512x512",            1,    512,  512,  false, false, DType.Single, 0, "workload:LSTM cell large"),
+        new Shape("GRU_cell_1x768x768",             1,    768,  768,  false, false, DType.Single, 0, "workload:GRU cell"),
         new Shape("Embedding_proj_8x768x768",       8,    768,  768,  false, false, DType.Single, 0, "workload:Embedding projection"),
+
+        // ── BERT batch variants (inference sequence-1, training batch-32) ──
+        new Shape("BERT_inf_seq1_1x768x768",        1,    768,  768,  false, false, DType.Single, 0, "workload:BERT inference seq-1"),
+        new Shape("BERT_train_b32_4096x3072x768",   4096, 3072, 768,  false, false, DType.Single, 0, "workload:BERT training batch-32"),
+
+        // ── BERT-large (hidden=1024) ────────────────────────────────────
+        new Shape("BERTlarge_FFN_up_1024x4096x1024",   1024, 4096, 1024, false, false, DType.Single, 0, "workload:BERT-large FFN up"),
+        new Shape("BERTlarge_Attn_QKV_1024x1024x1024", 1024, 1024, 1024, false, false, DType.Single, 0, "workload:BERT-large attention QKV"),
+
+        // ── GPT-2 small (hidden=768) ────────────────────────────────────
+        new Shape("GPT2sm_FFN_up_512x3072x768",     512,  3072, 768,  false, false, DType.Single, 0, "workload:GPT-2 small FFN up"),
+        new Shape("GPT2sm_Attn_proj_512x768x768",   512,  768,  768,  false, false, DType.Single, 0, "workload:GPT-2 small attention proj"),
+
+        // ── Vision Transformer (ViT-Base, 14x14 patches = 196, +1 cls = 197) ──
+        new Shape("ViT_patch_proj_196x768x768",     196,  768,  768,  false, false, DType.Single, 0, "workload:ViT-Base patch projection"),
+        new Shape("ViT_Attn_QKV_197x2304x768",      197,  2304, 768,  false, false, DType.Single, 0, "workload:ViT-Base attention QKV (3*768)"),
+
+        // ── Pure compute-bound large shapes (stress test) ───────────────
+        new Shape("LargeSquare_2048sq",             2048, 2048, 2048, false, false, DType.Single, 0, "workload:large square FP32"),
+        new Shape("LargeSquare_FP64_1024sq",        1024, 1024, 1024, false, false, DType.Double, 0, "workload:large square FP64"),
     };
 }

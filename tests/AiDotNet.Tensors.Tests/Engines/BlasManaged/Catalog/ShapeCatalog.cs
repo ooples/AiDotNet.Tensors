@@ -1,4 +1,8 @@
+using System;
 using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text.Json;
 
 namespace AiDotNet.Tensors.Tests.Engines.BlasManaged.Catalog;
 
@@ -38,17 +42,77 @@ public record Shape(
 
 /// <summary>
 /// Sub-issue A (#369) deliverable: the unified shape catalog for the BlasManaged
-/// perf bench. Starts empty until A.2 (instrumented shapes) and A.3 (workload shapes)
-/// land, then A.4 merges them. Once populated, <see cref="ShapeCatalogTest"/>'s count
-/// assertion passes.
+/// perf bench. Merges curated workload shapes (always kept, force coverage) with
+/// the top-N most-frequent instrumented shapes (when <c>artifacts/perf/instrumented-shapes.json</c>
+/// is present). Final catalog size is bounded to 50-80 by the <see cref="ShapeCatalogTest"/>
+/// gate.
 /// </summary>
 public static class ShapeCatalog
 {
     /// <summary>
-    /// All shapes used by the perf harness. Empty until A.2/A.3/A.4 land — the count
-    /// assertion in <see cref="ShapeCatalogTest.Catalog_Has_Between_50_And_80_Shapes"/>
-    /// is the intentional gate that forces those tasks to land before downstream
-    /// sub-issues (B/C/D/E/F/G) can claim they're measured against this catalog.
+    /// Maximum number of shapes in the catalog. <see cref="ShapeCatalogTest"/>'s
+    /// in-range assertion is (50, 80) — 80 is the hard upper.
     /// </summary>
-    public static IReadOnlyList<Shape> All { get; } = new List<Shape>();
+    internal const int MaxCatalogSize = 80;
+
+    /// <summary>
+    /// All shapes used by the perf harness. Lazy-initialized from <see cref="WorkloadShapes"/>
+    /// (always) plus the top-N instrumented shapes by frequency (when the JSON harvest
+    /// exists). Deduplicated by (M, N, K, TransA, TransB, Dtype); when a shape appears
+    /// in both sources the workload version wins (richer <see cref="Shape.Source"/>).
+    /// </summary>
+    public static IReadOnlyList<Shape> All { get; } = LoadCatalog();
+
+    private static IReadOnlyList<Shape> LoadCatalog()
+    {
+        var result = new List<Shape>(WorkloadShapes.All);
+
+        // Load instrumented shapes if the harvest file exists. Resolved by walking up
+        // from the test binary directory to find the repo root.
+        var instrumentedPath = FindInstrumentedJson();
+        if (instrumentedPath is not null)
+        {
+            try
+            {
+                var json = File.ReadAllText(instrumentedPath);
+                var instrumented = JsonSerializer.Deserialize<List<Shape>>(json) ?? new List<Shape>();
+
+                int slots = MaxCatalogSize - result.Count;
+                if (slots > 0)
+                    result.AddRange(instrumented.Take(slots));
+            }
+            catch
+            {
+                // Malformed JSON or IO failure — fall back to workload-only catalog.
+                // The shape-count test will fail, which is the correct gate.
+            }
+        }
+
+        // Dedupe by (M, N, K, TransA, TransB, Dtype). Workload entries win when the
+        // same shape is also instrumented — their Source field is more informative.
+        var deduped = result
+            .GroupBy(s => (s.M, s.N, s.K, s.TransA, s.TransB, s.Dtype))
+            .Select(g => g.OrderBy(s => s.Source.StartsWith("workload:") ? 0 : 1).First())
+            .ToList();
+
+        return deduped;
+    }
+
+    private static string? FindInstrumentedJson()
+    {
+        // First honour explicit env override (matches the bootstrap's output path resolution).
+        var envOverride = Environment.GetEnvironmentVariable("AIDOTNET_INSTRUMENT_OUT");
+        if (!string.IsNullOrWhiteSpace(envOverride) && File.Exists(envOverride))
+            return envOverride;
+
+        // Walk up from the test binary directory looking for artifacts/perf/instrumented-shapes.json.
+        var dir = AppContext.BaseDirectory;
+        for (int i = 0; i < 10 && dir != null; i++)
+        {
+            var candidate = Path.Combine(dir, "artifacts", "perf", "instrumented-shapes.json");
+            if (File.Exists(candidate)) return candidate;
+            dir = Path.GetDirectoryName(dir);
+        }
+        return null;
+    }
 }
