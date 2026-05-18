@@ -77,6 +77,22 @@ public readonly ref struct Epilogue<T> where T : unmanaged
     public ReadOnlySpan<T> SkipMxN { get; init; }
     /// <summary>Dropout RNG state. 0 = no dropout (inference).</summary>
     public uint DropoutMask { get; init; }
-    /// <summary>Output scale. 0 (default) is interpreted as 1.0 by the dispatcher.</summary>
+    /// <summary>
+    /// Output scale. When <see cref="HasOutputScale"/> is <c>false</c> (default),
+    /// <c>OutputScale = default(T)</c> means "disabled" and a non-default value
+    /// implicitly enables scaling. Set <see cref="HasOutputScale"/> to <c>true</c>
+    /// to opt in to explicit scaling — including <c>OutputScale = 0</c>, which
+    /// otherwise (and as PR #366 / copilot review pointed out) is indistinguishable
+    /// from "disabled" and so previously couldn't be used to intentionally zero
+    /// the output (useful for masking / debug).
+    /// </summary>
     public T OutputScale { get; init; }
+    /// <summary>
+    /// Explicit opt-in for output scaling. When <c>true</c>, the dispatcher always
+    /// applies <see cref="OutputScale"/> (including 0); when <c>false</c>, scaling
+    /// is enabled only when <see cref="OutputScale"/> is non-default. Defaults to
+    /// <c>false</c> so existing callers that set <see cref="OutputScale"/> to a
+    /// non-zero value continue to work without changes.
+    /// </summary>
+    public bool HasOutputScale { get; init; }
 }
