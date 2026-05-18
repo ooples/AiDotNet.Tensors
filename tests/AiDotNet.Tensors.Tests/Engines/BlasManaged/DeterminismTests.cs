@@ -14,6 +14,7 @@ using BlasManagedLib = AiDotNet.Tensors.Engines.BlasManaged.BlasManaged;
 
 namespace AiDotNet.Tensors.Tests.Engines.BlasManaged;
 
+[Collection("BlasManaged-Stats-Serial")]
 public class DeterminismTests
 {
     // 12 representative shapes covering the spec's Gate 3 set:

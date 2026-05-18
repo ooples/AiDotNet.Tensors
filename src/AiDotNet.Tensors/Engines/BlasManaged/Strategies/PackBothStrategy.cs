@@ -170,12 +170,19 @@ internal static class PackBothStrategy
                 // (packBBytes = kc * nc * elemSize) always has room for this extra padding.
                 int packedNc = ((effectiveNc + nr - 1) / nr) * nr;
                 int packedBElemCount = effectiveKc * packedNc;
+                int packedBByteCount = packedBElemCount * elemSize;
                 bool packBFromPrePack = false;
                 Span<T> activePackB = packB;
+                // CodeRabbit #366: DispatchMicrokernelWithTail reads
+                // `effectiveKc * nr` per stripe, so the cached handle must
+                // hold the PADDED byte count (packedBByteCount), not the
+                // dense effectivePackBBytes. Without this, partial-N tiles
+                // would slice past activePackB or pick up stale padding from
+                // a previous (jc, pc) iteration.
                 if (options.PackedB != null && WeightPackCache.IsCacheCurrent(options.PackedB)
-                    && options.PackedB.PackedBuffer.Length >= effectivePackBBytes)
+                    && options.PackedB.PackedBuffer.Length >= packedBByteCount)
                 {
-                    activePackB = MemoryMarshal.Cast<byte, T>(options.PackedB.PackedBuffer.AsSpan(0, effectivePackBBytes));
+                    activePackB = MemoryMarshal.Cast<byte, T>(options.PackedB.PackedBuffer.AsSpan(0, packedBByteCount));
                     packBFromPrePack = true;
                 }
 
@@ -301,7 +308,14 @@ internal static class PackBothStrategy
 
         // Pack-B backing array: capturable by the lambda as a managed byte[].
         // The bytes are shared across all ic-parallel iterations (read-only after packing).
-        byte[] packBArr = new byte[packBBytesSpan.Length];
+        // CodeRabbit #366: was `new byte[packBBytesSpan.Length]`, defeating the
+        // allocator hierarchy (Layer 5/4/1) and adding a full managed alloc on
+        // every parallel GEMM call. Rent from the shared array pool instead and
+        // return in finally; capacity is bounded by packBBytesSpan.Length which
+        // itself caps at kc*nc*elemSize.
+        byte[] packBArr = System.Buffers.ArrayPool<byte>.Shared.Rent(packBBytesSpan.Length);
+        try
+        {
 
         for (int jc = 0; jc < n; jc += nc)
         {
@@ -320,13 +334,15 @@ internal static class PackBothStrategy
                 int packedBElemCount = effectiveKc * packedNc;
                 int packedBByteCount = packedBElemCount * elemSize;
                 bool packBFromPrePack = false;
+                // CodeRabbit #366: gate on the PADDED byte count and copy the
+                // full padded region — see the serial path for rationale.
                 if (packedB != null && WeightPackCache.IsCacheCurrent(packedB)
-                    && packedB.PackedBuffer.Length >= effectivePackBBytes)
+                    && packedB.PackedBuffer.Length >= packedBByteCount)
                 {
                     // Layer 3: pre-packed B is already in byte[] form — copy into packBArr
                     // so the parallel lambda reads from a stable, capturable byte[].
-                    packedB.PackedBuffer.AsSpan(0, effectivePackBBytes)
-                           .CopyTo(packBArr.AsSpan(0, effectivePackBBytes));
+                    packedB.PackedBuffer.AsSpan(0, packedBByteCount)
+                           .CopyTo(packBArr.AsSpan(0, packedBByteCount));
                     packBFromPrePack = true;
                 }
 
@@ -430,6 +446,12 @@ internal static class PackBothStrategy
                     }
                 });
             }
+        }
+
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<byte>.Shared.Return(packBArr);
         }
     }
 

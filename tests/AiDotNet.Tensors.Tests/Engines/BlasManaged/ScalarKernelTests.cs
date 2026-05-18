@@ -2115,7 +2115,11 @@ public class ScalarKernelTests
         // Initial state: Version=1, LastPackedVersion=0 → not current.
         Assert.False(WeightPackCache.IsCacheCurrent(handle));
 
-        WeightPackCache.MarkCacheCurrent(handle);
+        // CodeRabbit #366: MarkCacheCurrent now requires the snapshot taken
+        // before packing started. Callers (PrePackA/B/dispatch path) Read
+        // handle.Version before doing the pack work, then pass that snapshot.
+        long packedVersion = System.Threading.Interlocked.Read(ref handle.Version);
+        WeightPackCache.MarkCacheCurrent(handle, packedVersion);
         Assert.True(WeightPackCache.IsCacheCurrent(handle));
     }
 
@@ -2126,7 +2130,8 @@ public class ScalarKernelTests
             1024,
             (Mc: 8, Kc: 8, TransA: false, Mode: PackingMode.Auto, ElemType: typeof(double)),
             isForA: true);
-        WeightPackCache.MarkCacheCurrent(handle);
+        long packedVersion = System.Threading.Interlocked.Read(ref handle.Version);
+        WeightPackCache.MarkCacheCurrent(handle, packedVersion);
         Assert.True(WeightPackCache.IsCacheCurrent(handle));
 
         handle.MarkDirty();
@@ -2949,8 +2954,10 @@ public class ScalarKernelTests
 
         // m=8 → mc=8 (mr-aligned).
         Assert.Equal(8, mc);
-        // n=8 < nr=16 → mc would be 0; the safeguard floors it to nr.
-        Assert.Equal(16, nc);
+        // n=8 < nr=16 → alignment rounding drives nc to 0. CodeRabbit #366
+        // fixed the safeguard to clamp to min(nr, n) instead of unconditionally
+        // setting nc = nr, which previously made nc exceed n on tiny shapes.
+        Assert.Equal(8, nc);
         Assert.Equal(8, kc);
     }
 

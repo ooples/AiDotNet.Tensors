@@ -89,8 +89,14 @@ internal static class AutotuneDispatcher
         // Round mc down to mr alignment, nc down to nr alignment.
         if (mr > 0) mc = (mc / mr) * mr;
         if (nr > 0) nc = (nc / nr) * nr;
-        if (mc <= 0) mc = mr;
-        if (nc <= 0) nc = nr;
+        // CodeRabbit #366: alignment rounding can drive mc/nc to 0 on tiny
+        // shapes (e.g., m < mr); clamping back to mr/nr alone can then make
+        // mc > m or nc > n. Clamp to the actual dimension as well so drivers
+        // never see a block bigger than the matrix.
+        if (mc <= 0) mc = Math.Min(Math.Max(1, mr), m);
+        if (nc <= 0) nc = Math.Min(Math.Max(1, nr), n);
+        mc = Math.Min(mc, m);
+        nc = Math.Min(nc, n);
 
         int threadCount = procs;  // Default to all available cores.
         return (axis, mc, nc, kc, threadCount);

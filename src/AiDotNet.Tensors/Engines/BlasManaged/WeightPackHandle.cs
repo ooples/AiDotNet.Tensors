@@ -37,8 +37,10 @@ public sealed class WeightPackHandle : IDisposable
     /// The <see cref="Version"/> value at which <see cref="PackedBuffer"/> was
     /// last successfully written. Initialized to 0; <see cref="Version"/>
     /// starts at 1, so the very first Gemm call always triggers a pack.
-    /// Written only from the dispatch/pack path (single-writer); read
-    /// atomically by <see cref="WeightPackCache.IsCacheCurrent"/>.
+    /// Accessed atomically via <see cref="ReadLastPackedVersion"/> /
+    /// <see cref="WriteLastPackedVersion"/> — torn 64-bit reads on 32-bit
+    /// runtimes (net471 on x86) would otherwise produce stale cache-current
+    /// decisions even though only one thread writes at a time.
     /// </summary>
     internal long LastPackedVersion;  // 0 = never packed; Version starts at 1
     internal (int Mc, int Kc, bool TransA, PackingMode Mode, Type ElemType) Key;
@@ -62,6 +64,19 @@ public sealed class WeightPackHandle : IDisposable
     /// before use.
     /// </summary>
     public void MarkDirty() => Interlocked.Increment(ref Version);
+
+    /// <summary>
+    /// Atomic read of <see cref="LastPackedVersion"/>. Pairs with
+    /// <see cref="WriteLastPackedVersion"/> to keep reads/writes torn-free on
+    /// 32-bit runtimes (CodeRabbit #366 thread on this file).
+    /// </summary>
+    internal long ReadLastPackedVersion() => Interlocked.Read(ref LastPackedVersion);
+
+    /// <summary>
+    /// Atomic write of <see cref="LastPackedVersion"/>. Used by the pack path
+    /// after a successful pack completes.
+    /// </summary>
+    internal void WriteLastPackedVersion(long version) => Interlocked.Exchange(ref LastPackedVersion, version);
 
     /// <summary>
     /// Release the packed buffer back to the pool. Idempotent.

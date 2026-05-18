@@ -894,10 +894,16 @@ internal static partial class SimdGemm
         int k,
         int n)
     {
-        // Match original contract: unconditional c.Clear() before any early return
-        // so callers always receive a zeroed C (even for k=0 / degenerate shapes).
-        c.Clear();
-        if (m <= 0 || n <= 0 || k <= 0) return;
+        // Match original contract for degenerate shapes (k=0 etc.) where
+        // BlasManaged isn't called: callers expect a zeroed C. On the normal
+        // forwarding path BlasManaged.Gemm<float> owns overwrite semantics,
+        // so a pre-dispatch Clear() would write C twice — wasted memory
+        // bandwidth on the hot path (CodeRabbit #366).
+        if (m <= 0 || n <= 0 || k <= 0)
+        {
+            c.Clear();
+            return;
+        }
 
         // DisableAutotune: use the static heuristic directly, no autotune cache
         // read/write and no global stats increment. The shim path is a transparent

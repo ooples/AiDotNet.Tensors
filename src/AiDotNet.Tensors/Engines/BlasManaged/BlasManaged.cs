@@ -1,5 +1,6 @@
 using System;
 using System.Runtime.InteropServices;
+using System.Threading;
 using AiDotNet.Tensors.Helpers;
 
 namespace AiDotNet.Tensors.Engines.BlasManaged;
@@ -196,8 +197,20 @@ public static class BlasManaged
         in BlasOptions<T> options = default) where T : unmanaged
     {
         var (mr, _) = PickMicrokernelTile<T>();
-        int mc = 64;
-        int kc = 64;
+        const int PanelMc = 64;
+        const int PanelKc = 64;
+        // CodeRabbit #366: this routine currently packs a single Mc×Kc panel.
+        // Silently truncating larger weights would produce wrong GEMM results
+        // when the handle is reused, so reject m > PanelMc / k > PanelKc until
+        // multi-panel packing lands. Callers below PanelMc / PanelKc are the
+        // common training-loop case (linear projections, attention heads).
+        if (m > PanelMc || k > PanelKc)
+            throw new NotSupportedException(
+                $"PrePackA currently supports only single-panel weights up to {PanelMc}×{PanelKc} " +
+                $"(got m={m}, k={k}). Multi-panel pre-packing is tracked as follow-up work; " +
+                $"call Gemm directly without a pre-pack handle for larger weights.");
+        int mc = PanelMc;
+        int kc = PanelKc;
         // Don't pack at a Kc larger than k.
         if (kc > k) kc = k;
         // Don't pack at an Mc larger than m, rounded down to mr.
@@ -210,6 +223,10 @@ public static class BlasManaged
 
         var key = (mc, kc, transA, options.PackingMode, typeof(T));
         var handle = WeightPackCache.Allocate(packedBytes, key, isForA: true);
+
+        // Snapshot Version BEFORE packing so a concurrent MarkDirty doesn't
+        // race the post-pack MarkCacheCurrent and mark stale data current.
+        long packedVersion = Interlocked.Read(ref handle.Version);
 
         // Initial pack: write the source weight into handle.PackedBuffer.
         if (typeof(T) == typeof(double))
@@ -233,7 +250,7 @@ public static class BlasManaged
             throw new NotSupportedException($"PrePackA does not support T={typeof(T).Name}.");
         }
 
-        WeightPackCache.MarkCacheCurrent(handle);
+        WeightPackCache.MarkCacheCurrent(handle, packedVersion);
         return handle;
     }
 
@@ -254,8 +271,17 @@ public static class BlasManaged
         in BlasOptions<T> options = default) where T : unmanaged
     {
         var (_, nr) = PickMicrokernelTile<T>();
-        int nc = 64;
-        int kc = 64;
+        const int PanelNc = 64;
+        const int PanelKc = 64;
+        // CodeRabbit #366: same single-panel limit as PrePackA — see that
+        // method for rationale. Reject larger weights up front.
+        if (n > PanelNc || k > PanelKc)
+            throw new NotSupportedException(
+                $"PrePackB currently supports only single-panel weights up to {PanelKc}×{PanelNc} " +
+                $"(got k={k}, n={n}). Multi-panel pre-packing is tracked as follow-up work; " +
+                $"call Gemm directly without a pre-pack handle for larger weights.");
+        int nc = PanelNc;
+        int kc = PanelKc;
         if (kc > k) kc = k;
         if (nc > n) nc = (n / nr) * nr;
         if (nc <= 0)
@@ -266,6 +292,9 @@ public static class BlasManaged
 
         var key = (nc, kc, transB, options.PackingMode, typeof(T));
         var handle = WeightPackCache.Allocate(packedBytes, key, isForA: false);
+
+        // Snapshot Version BEFORE packing — see PrePackA for rationale.
+        long packedVersion = Interlocked.Read(ref handle.Version);
 
         if (typeof(T) == typeof(double))
         {
@@ -288,7 +317,7 @@ public static class BlasManaged
             throw new NotSupportedException($"PrePackB does not support T={typeof(T).Name}.");
         }
 
-        WeightPackCache.MarkCacheCurrent(handle);
+        WeightPackCache.MarkCacheCurrent(handle, packedVersion);
         return handle;
     }
 

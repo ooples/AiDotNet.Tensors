@@ -46,6 +46,25 @@ internal static class PackAOnlyStrategy
         int mr, int nr,
         in BlasOptions<T> options = default) where T : unmanaged
     {
+        // CodeRabbit #366: this strategy currently has no tail handling —
+        // the `jc` loop drops the final `n % nr` columns and the `ir` loop
+        // dispatches a full Mr kernel even when `effectiveMc` has a row
+        // remainder, slicing past `activePackA`. Until tail support lands,
+        // fail loudly on non-aligned shapes so callers can't silently get
+        // truncated results.
+        if (mr <= 0 || nr <= 0)
+            throw new ArgumentException($"mr and nr must be positive (mr={mr}, nr={nr}).");
+        if ((m % mr) != 0)
+            throw new NotSupportedException(
+                $"PackAOnlyStrategy requires m to be a multiple of mr (m={m}, mr={mr}). " +
+                "Tail row handling is tracked as follow-up work; callers should pad m " +
+                "or route to a strategy that handles remainders.");
+        if ((n % nr) != 0)
+            throw new NotSupportedException(
+                $"PackAOnlyStrategy requires n to be a multiple of nr (n={n}, nr={nr}). " +
+                "Tail column handling is tracked as follow-up work; callers should pad n " +
+                "or route to a strategy that handles remainders.");
+
         // Compute byte size for the worst-case pack-A panel buffer.
         int elemSize = Unsafe.SizeOf<T>();
         int packABytes = mc * kc * elemSize;

@@ -53,20 +53,23 @@ internal static class WeightPackCache
     /// </summary>
     internal static bool IsCacheCurrent(WeightPackHandle handle)
     {
-        // Atomic read of Version. LastPackedVersion is only written from the
-        // pack path which is in this class, so a non-atomic read is fine
-        // (single-writer pattern).
+        // Both fields atomic so net471 / x86 doesn't tear the 64-bit read.
         long current = Interlocked.Read(ref handle.Version);
-        return current == handle.LastPackedVersion;
+        long packed = handle.ReadLastPackedVersion();
+        return current == packed;
     }
 
     /// <summary>
-    /// Mark the handle's cache as current after a successful pack. Call this
-    /// from the dispatch path after writing fresh packed data into
-    /// <c>handle.PackedBuffer</c>.
+    /// Mark the handle's cache as current after a successful pack. Callers
+    /// MUST snapshot <c>Interlocked.Read(ref handle.Version)</c> BEFORE
+    /// starting the pack and pass it here. Reading Version after the pack
+    /// would race with a concurrent <see cref="WeightPackHandle.MarkDirty"/>
+    /// and mark stale packed data as current (CodeRabbit #366 race).
     /// </summary>
-    internal static void MarkCacheCurrent(WeightPackHandle handle)
+    /// <param name="handle">The weight pack handle.</param>
+    /// <param name="packedVersion">The Version snapshot taken before packing.</param>
+    internal static void MarkCacheCurrent(WeightPackHandle handle, long packedVersion)
     {
-        handle.LastPackedVersion = Interlocked.Read(ref handle.Version);
+        handle.WriteLastPackedVersion(packedVersion);
     }
 }

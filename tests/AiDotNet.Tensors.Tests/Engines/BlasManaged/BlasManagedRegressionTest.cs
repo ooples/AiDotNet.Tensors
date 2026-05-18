@@ -41,13 +41,24 @@ public class BlasManagedRegressionTest
     public void BlasManaged_RepresentativeShapes_NoRegressionFromBaseline()
     {
         // Locate the baseline JSON. It's deployed alongside the test assembly.
-        string assemblyDir = Path.GetDirectoryName(typeof(BlasManagedRegressionTest).Assembly.Location)!;
-        string baselinePath = Path.Combine(assemblyDir, "baselines", "blas-managed-baseline.json");
+        // Use AppContext.BaseDirectory (not Assembly.Location) because the
+        // net471 test runner shadow-copies assemblies but not their adjacent
+        // content files — Assembly.Location points at the shadow dir, where
+        // the baseline doesn't follow. AppContext.BaseDirectory always points
+        // at the actual output directory.
+        string baseDir = AppContext.BaseDirectory;
+        string baselinePath = Path.Combine(baseDir, "baselines", "blas-managed-baseline.json");
 
         if (!File.Exists(baselinePath))
         {
-            _output.WriteLine($"Baseline file not found at {baselinePath} — skipping regression check.");
-            return;
+            // CodeRabbit #366: silent skip disables the regression gate when
+            // a packaging/copy step breaks. Fail loudly instead so missing
+            // baseline assets surface immediately in CI.
+            throw new FileNotFoundException(
+                $"Baseline file not found at {baselinePath}. " +
+                "Performance regression check cannot run without the baseline asset; " +
+                "verify the build copies tests/.../baselines/blas-managed-baseline.json next to the test DLL.",
+                baselinePath);
         }
 
         string json = File.ReadAllText(baselinePath);

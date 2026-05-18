@@ -58,31 +58,28 @@ internal static class ReductionTree
                 for (int e = 0; e < elementCount; e++)
                     dst[e] += src[e];
             }
-            // Odd remainder: the last slot moves to slot `half` if active was odd.
+            // CodeRabbit #366: compact merged pairs FIRST. The previous
+            // version copied the odd remainder into partials[half] before
+            // compaction; for active=5 (half=2) that overwrites slot 2,
+            // which still held the merged (2+3) pair, silently dropping it
+            // from the reduction.
+            // Compact merged values from even indices 0,2,...,2*(half-1)
+            // into contiguous slots 0,1,...,half-1.
+            for (int i = 1; i < half; i++)
+            {
+                partials[i] = partials[2 * i];
+            }
             if (active % 2 == 1)
             {
-                // Move partials[active-1] into the new slot [half]. The new slot
-                // [half] was previously written by the even-pair loop (since half
-                // pairs touch even indices 0,2,...,2*(half-1)), so partials[half]
-                // is a free slot at this point. Copy data into it.
-                var src = partials[active - 1].Span;
-                var dst = partials[half].Span;
-                for (int e = 0; e < elementCount; e++)
-                    dst[e] = src[e];
-                // After this copy the active windows are: partials[0], partials[2],
-                // partials[4], ..., partials[2*(half-1)], partials[half].
-                // We compact them to partials[0..active] below.
+                // Rebind slot `half` to the lone odd's Memory<T> handle — a
+                // reference copy, not a span copy. Safe now because
+                // compaction has already moved any pair away from slot half.
+                partials[half] = partials[active - 1];
                 active = half + 1;
             }
             else
             {
                 active = half;
-            }
-            // Compact: merged values sit at even indices 0,2,...,2*(half-1).
-            // Move them to contiguous slots 0,1,...,half-1 for the next pass.
-            for (int i = 1; i < half; i++)
-            {
-                partials[i] = partials[2 * i];
             }
         }
     }
@@ -113,21 +110,20 @@ internal static class ReductionTree
                 for (int e = 0; e < elementCount; e++)
                     dst[e] += src[e];
             }
+            // CodeRabbit #366: same compact-before-rebind ordering fix as
+            // the FP64 path — see ReducePairwiseFp64 for rationale.
+            for (int i = 1; i < half; i++)
+            {
+                partials[i] = partials[2 * i];
+            }
             if (active % 2 == 1)
             {
-                var src = partials[active - 1].Span;
-                var dst = partials[half].Span;
-                for (int e = 0; e < elementCount; e++)
-                    dst[e] = src[e];
+                partials[half] = partials[active - 1];
                 active = half + 1;
             }
             else
             {
                 active = half;
-            }
-            for (int i = 1; i < half; i++)
-            {
-                partials[i] = partials[2 * i];
             }
         }
     }

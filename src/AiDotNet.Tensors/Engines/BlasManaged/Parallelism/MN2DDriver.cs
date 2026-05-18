@@ -41,7 +41,13 @@ internal static class MN2DDriver
     {
         if (numMBlocks < 0) throw new ArgumentOutOfRangeException(nameof(numMBlocks));
         if (numNBlocks < 0) throw new ArgumentOutOfRangeException(nameof(numNBlocks));
-        return numMBlocks * numNBlocks;
+        // CodeRabbit #366: int*int can wrap silently and corrupt scheduling.
+        // Promote to long, check the int32 ceiling, then cast back.
+        long total = (long)numMBlocks * numNBlocks;
+        if (total > int.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(numMBlocks),
+                $"TotalItems ({numMBlocks} × {numNBlocks} = {total}) exceeds Int32.MaxValue.");
+        return (int)total;
     }
 
     /// <summary>

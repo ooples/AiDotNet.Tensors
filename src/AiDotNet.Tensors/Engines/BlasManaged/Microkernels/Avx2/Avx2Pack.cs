@@ -213,6 +213,11 @@ internal static class Avx2Pack
                     }
                 }
             }
+            // CodeRabbit #366: zero-pad the partial tail stripe so kernels
+            // can safely read packedB[k*nr + col] for col in [0, effectiveNr).
+            // ScalarPack.PackB does this for the full path; the SIMD path
+            // dropped the tail silently before this guard.
+            PackBTailFp64(b, ldb, packed, numStripes, nc - numStripes * nr, kc, nr);
         }
         else if (nr == 4)
         {
@@ -232,10 +237,33 @@ internal static class Avx2Pack
                     }
                 }
             }
+            PackBTailFp64(b, ldb, packed, numStripes, nc - numStripes * nr, kc, nr);
         }
         else
         {
             ScalarPack.PackB<double>(b, ldb, transB, packed, nc, kc, nr);
+        }
+    }
+
+    /// <summary>
+    /// Zero-pads the final partial-N stripe for the AVX2 FP64 transB=false
+    /// PackB paths. Mirrors the tail loop in <see cref="ScalarPack.PackB{T}"/>.
+    /// </summary>
+    private static void PackBTailFp64(
+        ReadOnlySpan<double> b, int ldb, Span<double> packed,
+        int numFullStripes, int tailCols, int kc, int nr)
+    {
+        if (tailCols <= 0) return;
+        int tailPackedOff = numFullStripes * kc * nr;
+        int tailBaseCol = numFullStripes * nr;
+        for (int k = 0; k < kc; k++)
+        {
+            for (int col = 0; col < nr; col++)
+            {
+                int logicalCol = tailBaseCol + col;
+                double value = col < tailCols ? b[k * ldb + logicalCol] : 0.0;
+                packed[tailPackedOff + k * nr + col] = value;
+            }
         }
     }
 
@@ -291,10 +319,34 @@ internal static class Avx2Pack
                     }
                 }
             }
+            // CodeRabbit #366: zero-pad the partial tail stripe — see
+            // PackBTailFp64 for rationale.
+            PackBTailFp32(b, ldb, packed, numStripes, nc - numStripes * nr, kc, nr);
         }
         else
         {
             ScalarPack.PackB<float>(b, ldb, transB, packed, nc, kc, nr);
+        }
+    }
+
+    /// <summary>
+    /// FP32 mirror of <see cref="PackBTailFp64"/>.
+    /// </summary>
+    private static void PackBTailFp32(
+        ReadOnlySpan<float> b, int ldb, Span<float> packed,
+        int numFullStripes, int tailCols, int kc, int nr)
+    {
+        if (tailCols <= 0) return;
+        int tailPackedOff = numFullStripes * kc * nr;
+        int tailBaseCol = numFullStripes * nr;
+        for (int k = 0; k < kc; k++)
+        {
+            for (int col = 0; col < nr; col++)
+            {
+                int logicalCol = tailBaseCol + col;
+                float value = col < tailCols ? b[k * ldb + logicalCol] : 0f;
+                packed[tailPackedOff + k * nr + col] = value;
+            }
         }
     }
 #else

@@ -8,6 +8,7 @@ using BlasManagedLib = AiDotNet.Tensors.Engines.BlasManaged.BlasManaged;
 
 namespace AiDotNet.Tensors.Tests.Engines.BlasManaged;
 
+[Collection("BlasManaged-Perf-Serial")]
 public class ConvTranspose2DL2PerfTest
 {
     private readonly ITestOutputHelper _output;
