@@ -384,4 +384,50 @@ public class GraphModeRecordingAuditTests
         using var scope = GraphMode.Enable();
         Assert.Throws<NotSupportedException>(() => engine.TensorMaskedSelect<float>(input, mask));
     }
+
+    /// <summary>
+    /// PR #367 copilot review: the per-op equivalence tests above all force
+    /// materialization AFTER leaving the GraphMode scope. The recording
+    /// delegates call back into GraphMode-aware public APIs on replay, so a
+    /// realistic regression case is forcing materialization WHILE GraphMode
+    /// is still active — that catches re-entry / re-recording bugs and any
+    /// in-place output that the lazy node failed to actually write. We use
+    /// TensorMatMulTransposed since it's the highest-impact fix in this PR
+    /// (every attention QKᵀ goes through it).
+    ///
+    /// On Realize, LazyTensorScope flips GraphMode to null around each
+    /// node's execute delegate so the eager path runs (see
+    /// LazyTensorScope.Realize). Accessing .AsSpan() inside the using block
+    /// must therefore still produce correct values without recursive
+    /// re-recording.
+    /// </summary>
+    [Fact]
+    public void TensorMatMulTransposed_GraphMode_MaterializesCorrectlyInsideActiveScope()
+    {
+        var engine = new CpuEngine();
+        var a = Tensor<float>.CreateRandom([4, 8]);
+        var b = Tensor<float>.CreateRandom([6, 8]);
+
+        // Eager reference (no GraphMode active).
+        var eager = engine.TensorMatMulTransposed<float>(a, b);
+        var eagerSnapshot = eager.AsSpan().ToArray();
+
+        // Materialize INSIDE the active scope — this is the regression case
+        // the per-op equivalence tests above don't cover.
+        float[] insideSnapshot;
+        using (var scope = GraphMode.Enable())
+        {
+            var lazyOutput = engine.TensorMatMulTransposed<float>(a, b);
+            Assert.NotNull(lazyOutput.LazySource);
+            // Force materialization while the scope is still active. If the
+            // execute delegate tries to re-record into the live scope or
+            // leaves the output buffer unwritten, this read either throws or
+            // returns garbage that fails the equality check below.
+            insideSnapshot = lazyOutput.AsSpan().ToArray();
+        }
+
+        Assert.Equal(eagerSnapshot.Length, insideSnapshot.Length);
+        for (int i = 0; i < eagerSnapshot.Length; i++)
+            Assert.Equal(eagerSnapshot[i], insideSnapshot[i], precision: 3);
+    }
 }
