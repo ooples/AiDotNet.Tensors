@@ -41,4 +41,29 @@ public class ShapeCatalogTest
         var names = ShapeCatalog.All.Select(s => s.Name).ToList();
         Assert.Equal(names.Count, names.Distinct().Count());
     }
+
+    [Fact]
+    public void WorkloadShapes_Cover_Bert_Resnet_Gpt_MobileNet()
+    {
+        var w = WorkloadShapes.All;
+        Assert.Contains(w, s => s.Source.Contains("BERT"));
+        Assert.Contains(w, s => s.Source.Contains("ResNet"));
+        Assert.Contains(w, s => s.Source.Contains("GPT"));
+        Assert.Contains(w, s => s.Source.Contains("MobileNet"));
+    }
+
+    [Fact]
+    public void WorkloadShapes_Include_Both_Single_And_Double_Precision()
+    {
+        var w = WorkloadShapes.All;
+        Assert.Contains(w, s => s.Dtype == DType.Single);
+        Assert.Contains(w, s => s.Dtype == DType.Double);
+    }
+
+    [Fact]
+    public void WorkloadShapes_Include_Transposed_Backward_Shapes()
+    {
+        var w = WorkloadShapes.All;
+        Assert.Contains(w, s => s.TransA || s.TransB);
+    }
 }
