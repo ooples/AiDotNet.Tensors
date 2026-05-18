@@ -1,3 +1,4 @@
+using System;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -204,5 +205,183 @@ public class GraphModeRecordingAuditTests
             out _);
 
         Assert.NotNull(output.LazySource);
+    }
+
+    // ====================================================================
+    // Issue #365: ops with silent gradient-drop on the compiled training
+    // plan path. Each op below was verified to lack a GraphMode.IsActive
+    // recording branch in CpuEngine.cs at the time #365 was filed. The
+    // tests assert (a) LazySource is non-null (minimum recording invariant)
+    // and (b) for numerical ops, the materialized result equals the
+    // eager-mode reference — proving the recorded execute delegate
+    // actually computes the right values on replay, not just registers
+    // a placeholder.
+    // ====================================================================
+
+    /// <summary>
+    /// TensorMatMulTransposed — the float and double fast paths (SimdGemm
+    /// with transB=true / BLAS cblas_dgemm with transB=true) bypassed the
+    /// GraphMode guard and computed eagerly, returning a tensor with no
+    /// LazySource. Every transformer attention's Q·Kᵀ runs through this op,
+    /// so the bug silently froze attention gradients across the entire
+    /// compiled training plan.
+    /// </summary>
+    [Fact]
+    public void TensorMatMulTransposed_UnderGraphMode_RecordsLazyNode()
+    {
+        var engine = new CpuEngine();
+        var a = Tensor<float>.CreateRandom([4, 8]);   // [M, K]
+        var b = Tensor<float>.CreateRandom([6, 8]);   // [N, K] (transposed-storage)
+
+        using var scope = GraphMode.Enable();
+        var output = engine.TensorMatMulTransposed<float>(a, b);
+
+        Assert.NotNull(output.LazySource);
+    }
+
+    /// <summary>
+    /// TensorMatMulTransposed numerical equivalence — proves the recorded
+    /// execute delegate computes the right matmul-transposed when realized,
+    /// not just registers a placeholder. The eager reference is computed
+    /// outside any GraphMode scope.
+    /// </summary>
+    [Fact]
+    public void TensorMatMulTransposed_GraphMode_MaterializesToSameValuesAsEager()
+    {
+        var engine = new CpuEngine();
+        var a = Tensor<float>.CreateRandom([4, 8]);
+        var b = Tensor<float>.CreateRandom([6, 8]);
+
+        // Eager reference, no GraphMode active.
+        var eager = engine.TensorMatMulTransposed<float>(a, b);
+
+        Tensor<float> lazyOutput;
+        using (var scope = GraphMode.Enable())
+        {
+            lazyOutput = engine.TensorMatMulTransposed<float>(a, b);
+            Assert.NotNull(lazyOutput.LazySource);
+        }
+
+        // Force materialization by reading the data. The lazy graph's
+        // Realize runs the recorded execute delegate.
+        var eagerSpan = eager.AsSpan();
+        var lazySpan = lazyOutput.AsSpan();
+        Assert.Equal(eagerSpan.Length, lazySpan.Length);
+        for (int i = 0; i < eagerSpan.Length; i++)
+            Assert.Equal(eagerSpan[i], lazySpan[i], precision: 3);
+    }
+
+    /// <summary>
+    /// AvgPool2D (int[] poolSize, int[] stride) overload — the int-scalar
+    /// sibling already had GraphMode recording; this overload was a gap.
+    /// Public virtual method that consumers can hit directly.
+    /// </summary>
+    [Fact]
+    public void AvgPool2DIntArray_UnderGraphMode_RecordsLazyNode()
+    {
+        var engine = new CpuEngine();
+        var input = Tensor<float>.CreateRandom([2, 3, 8, 8]);
+
+        using var scope = GraphMode.Enable();
+        var output = engine.AvgPool2D<float>(input, new[] { 2, 2 }, new[] { 2, 2 });
+
+        Assert.NotNull(output.LazySource);
+    }
+
+    /// <summary>
+    /// AvgPool2D int[] overload numerical equivalence.
+    /// </summary>
+    [Fact]
+    public void AvgPool2DIntArray_GraphMode_MaterializesToSameValuesAsEager()
+    {
+        var engine = new CpuEngine();
+        var input = Tensor<float>.CreateRandom([2, 3, 8, 8]);
+
+        var eager = engine.AvgPool2D<float>(input, new[] { 2, 2 }, new[] { 2, 2 });
+
+        Tensor<float> lazyOutput;
+        using (var scope = GraphMode.Enable())
+        {
+            lazyOutput = engine.AvgPool2D<float>(input, new[] { 2, 2 }, new[] { 2, 2 });
+            Assert.NotNull(lazyOutput.LazySource);
+        }
+
+        var eagerSpan = eager.AsSpan();
+        var lazySpan = lazyOutput.AsSpan();
+        Assert.Equal(eagerSpan.Length, lazySpan.Length);
+        for (int i = 0; i < eagerSpan.Length; i++)
+            Assert.Equal(eagerSpan[i], lazySpan[i], precision: 4);
+    }
+
+    /// <summary>
+    /// TensorPermuteInto — void Into method that wrote directly into the
+    /// caller's pre-allocated output with no lazy recording. Under
+    /// GraphMode the write happened eagerly and downstream consumers of
+    /// output captured whatever uninitialized rented buffer it carried.
+    /// The fix records via scope.RecordInPlace so output gets a LazySource
+    /// pointing at the permute op.
+    /// </summary>
+    [Fact]
+    public void TensorPermuteInto_UnderGraphMode_RecordsOutputLazySource()
+    {
+        var engine = new CpuEngine();
+        var input = Tensor<float>.CreateRandom([2, 3, 4, 5]);
+        // Permute (0,1,2,3) -> (0,2,1,3): [2,3,4,5] -> [2,4,3,5]
+        var output = new Tensor<float>(new[] { 2, 4, 3, 5 });
+
+        using var scope = GraphMode.Enable();
+        engine.TensorPermuteInto<float>(output, input, new[] { 0, 2, 1, 3 });
+
+        Assert.NotNull(output.LazySource);
+    }
+
+    /// <summary>
+    /// TensorPermuteInto numerical equivalence on replay.
+    /// </summary>
+    [Fact]
+    public void TensorPermuteInto_GraphMode_MaterializesToSameValuesAsEager()
+    {
+        var engine = new CpuEngine();
+        var input = Tensor<float>.CreateRandom([2, 3, 4, 5]);
+        var axes = new[] { 0, 2, 1, 3 };
+
+        // Eager reference.
+        var eagerOut = new Tensor<float>(new[] { 2, 4, 3, 5 });
+        engine.TensorPermuteInto<float>(eagerOut, input, axes);
+
+        // Lazy path.
+        var lazyOut = new Tensor<float>(new[] { 2, 4, 3, 5 });
+        using (var scope = GraphMode.Enable())
+        {
+            engine.TensorPermuteInto<float>(lazyOut, input, axes);
+            Assert.NotNull(lazyOut.LazySource);
+        }
+
+        var eagerSpan = eagerOut.AsSpan();
+        var lazySpan = lazyOut.AsSpan();
+        Assert.Equal(eagerSpan.Length, lazySpan.Length);
+        for (int i = 0; i < eagerSpan.Length; i++)
+            Assert.Equal(eagerSpan[i], lazySpan[i], precision: 5);
+    }
+
+    /// <summary>
+    /// TensorMaskedSelect has a data-dependent output shape (count of true
+    /// bits in mask), so it cannot be recorded as a static-shape lazy node.
+    /// Under GraphMode the op MUST throw NotSupportedException rather than
+    /// silently producing a frozen eager copy (the failure mode #365 was
+    /// filed to fix). Callers must materialize outside the trace or use
+    /// TensorWhere (static-shape) instead.
+    /// </summary>
+    [Fact]
+    public void TensorMaskedSelect_UnderGraphMode_ThrowsNotSupportedException()
+    {
+        var engine = new CpuEngine();
+        var input = Tensor<float>.CreateRandom([8]);
+        var mask = new Tensor<Bit>(new[] { 8 });
+        var maskSpan = mask.AsWritableSpan();
+        for (int i = 0; i < maskSpan.Length; i++) maskSpan[i] = i % 2 == 0;
+
+        using var scope = GraphMode.Enable();
+        Assert.Throws<NotSupportedException>(() => engine.TensorMaskedSelect<float>(input, mask));
     }
 }
