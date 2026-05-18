@@ -38,9 +38,9 @@ internal static class EpilogueFlagsCompute
     ///   <item>HasActivation: Activation != FusedActivationType.None</item>
     ///   <item>HasSkip: SkipMxN.Length &gt; 0</item>
     ///   <item>HasDropout: DropoutMask != 0</item>
-    ///   <item>HasOutputScale: OutputScale not equal to default(T) — interpreted as "non-zero".
-    ///         For T=double, default=0 means "use 1.0" per the BlasOptions convention,
-    ///         so OutputScale=0 → flag NOT set; OutputScale=1 or any non-zero → flag SET.</item>
+    ///   <item>HasOutputScale: <see cref="Epilogue{T}.HasOutputScale"/> is true (explicit opt-in,
+    ///         lets callers request scale=0) OR <see cref="Epilogue{T}.OutputScale"/> is non-default
+    ///         (backward-compat with the old "default=disabled" convention).</item>
     /// </list>
     /// </summary>
     public static EpilogueFlags Compute<T>(in Epilogue<T> epilogue) where T : unmanaged
@@ -59,11 +59,18 @@ internal static class EpilogueFlagsCompute
         if (epilogue.DropoutMask != 0)
             flags |= EpilogueFlags.HasDropout;
 
-        // OutputScale = default(T) (zero for numeric types) means "use 1.0";
-        // any non-zero value activates the scale stage. We can't compare a
-        // generic T to a literal 1 directly, so we check against default(T).
-        if (!System.Collections.Generic.EqualityComparer<T>.Default.Equals(epilogue.OutputScale, default))
+        // OutputScale resolution (per PR #366 copilot review):
+        //  - Explicit opt-in via HasOutputScale=true → always apply, even scale=0
+        //    (used for intentionally zeroing the output for masking/debug).
+        //  - Backward-compat: HasOutputScale=false AND OutputScale != default(T)
+        //    still activates the stage so existing callers that just set
+        //    `OutputScale = 2.0` continue to work.
+        //  - HasOutputScale=false AND OutputScale == default(T) → stage inactive.
+        if (epilogue.HasOutputScale
+            || !System.Collections.Generic.EqualityComparer<T>.Default.Equals(epilogue.OutputScale, default))
+        {
             flags |= EpilogueFlags.HasOutputScale;
+        }
 
         return flags;
     }

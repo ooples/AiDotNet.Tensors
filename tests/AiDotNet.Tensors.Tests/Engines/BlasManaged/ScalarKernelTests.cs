@@ -3055,10 +3055,32 @@ public class ScalarKernelTests
     [Fact]
     public void EpilogueFlags_OutputScale_Zero_DoesNotSetFlag()
     {
-        // OutputScale=0 is the sentinel for "use 1.0" — flag must NOT be set.
+        // OutputScale=0 without explicit opt-in is the sentinel for "disabled"
+        // — flag must NOT be set. Backward-compat with the original convention.
         var ep = new Epilogue<double> { OutputScale = 0.0 };
         var flags = EpilogueFlagsCompute.Compute(in ep);
         Assert.Equal(EpilogueFlags.None, flags);
+    }
+
+    [Fact]
+    public void EpilogueFlags_OutputScale_ExplicitZeroWithHasFlag_SetsFlag()
+    {
+        // PR #366 copilot review: HasOutputScale=true lets callers explicitly
+        // request scale=0 (intentionally zero the output for masking/debug),
+        // which the old default(T)-as-sentinel convention couldn't express.
+        var ep = new Epilogue<double> { OutputScale = 0.0, HasOutputScale = true };
+        var flags = EpilogueFlagsCompute.Compute(in ep);
+        Assert.Equal(EpilogueFlags.HasOutputScale, flags);
+    }
+
+    [Fact]
+    public void EpilogueFlags_OutputScale_ExplicitWithNonZero_StillSetsFlag()
+    {
+        // HasOutputScale=true with a non-zero value behaves the same as the
+        // backward-compat path (flag set, value applied).
+        var ep = new Epilogue<double> { OutputScale = 2.0, HasOutputScale = true };
+        var flags = EpilogueFlagsCompute.Compute(in ep);
+        Assert.Equal(EpilogueFlags.HasOutputScale, flags);
     }
 
     [Fact]
