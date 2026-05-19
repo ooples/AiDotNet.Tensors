@@ -617,30 +617,33 @@ __kernel void grouped_query_attention_backward_gradq_deterministic(
     const int gOffset = bqh * seqQ * headDim + qi * headDim;
     const int wOffset = bqh * seqQ * seqK + qi * seqK;
 
-    if (d == 0) {
-        // dotProduct = sum_ki weights * (gradOutput @ V_ki)
-        float dotProduct = 0.0f;
-        for (int ki = 0; ki < seqK; ki++) {
-            float w = attentionWeights[wOffset + ki];
-            float gw = 0.0f;
-            for (int dd = 0; dd < headDim; dd++) {
-                gw += gradOutput[gOffset + dd] * value[vOffset + ki * headDim + dd];
-            }
-            dotProduct += w * gw;
+    // Each work-item owns one output cell gradQuery[qOffset + d].
+    // dotProduct depends only on (qi, bqh) and is recomputed locally per
+    // work-item — this trades headDim-x extra arithmetic for true
+    // parallelism over d (the prior `if (d == 0)` gating wasted
+    // headDim - 1 threads doing nothing). Writes are bit-deterministic:
+    // each cell has a unique owner and uses `=`, not `+=`.
+    float dotProduct = 0.0f;
+    for (int ki = 0; ki < seqK; ki++) {
+        float w = attentionWeights[wOffset + ki];
+        float gw = 0.0f;
+        for (int dd = 0; dd < headDim; dd++) {
+            gw += gradOutput[gOffset + dd] * value[vOffset + ki * headDim + dd];
         }
-
-        for (int ki = 0; ki < seqK; ki++) {
-            float w = attentionWeights[wOffset + ki];
-            float gw = 0.0f;
-            for (int dd = 0; dd < headDim; dd++) {
-                gw += gradOutput[gOffset + dd] * value[vOffset + ki * headDim + dd];
-            }
-            float gradScore = w * (gw - dotProduct) * scale;
-            for (int dd = 0; dd < headDim; dd++) {
-                gradQuery[qOffset + dd] += gradScore * key[kOffset + ki * headDim + dd];
-            }
-        }
+        dotProduct += w * gw;
     }
+
+    float acc = 0.0f;
+    for (int ki = 0; ki < seqK; ki++) {
+        float w = attentionWeights[wOffset + ki];
+        float gw = 0.0f;
+        for (int dd = 0; dd < headDim; dd++) {
+            gw += gradOutput[gOffset + dd] * value[vOffset + ki * headDim + dd];
+        }
+        float gradScore = w * (gw - dotProduct) * scale;
+        acc += gradScore * key[kOffset + ki * headDim + d];
+    }
+    gradQuery[qOffset + d] = acc;
 }
 
 __kernel void grouped_query_attention_backward_gradkv_deterministic(

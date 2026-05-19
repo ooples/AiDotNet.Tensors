@@ -235,7 +235,10 @@ extern ""C"" __global__ __launch_bounds__(256) void global_avgpool2d_backward(
 }
 
 // Global Max Pooling 2D Backward with indices.
-// NON-DETERMINISTIC (issue #382); see global_maxpool2d_backward_deterministic.
+// Each (b, c) has a unique inputOffset and exactly one maxIdx, so although
+// this variant uses atomicAdd it is in fact race-free (one writer per slot).
+// The deterministic variant below removes the atomic and uses `=` directly
+// to make the lack of collision explicit (per issue #382).
 extern ""C"" __global__ __launch_bounds__(256) void global_maxpool2d_backward(
     const float* gradOutput, const int* indices, float* gradInput,
     int batch, int channels, int height, int width)
@@ -261,6 +264,12 @@ extern ""C"" __global__ __launch_bounds__(256) void global_maxpool2d_backward(
     atomicAdd(&gradInput[inputOffset + maxIdx], grad);
 }
 
+// global_maxpool2d_backward — bit-deterministic variant (issue #382).
+// Each (b, c) has exactly one output and one maxIdx, and inputOffset is
+// derived from (b, c) — so every thread owns a unique gradInput slot. The
+// 1D launch (one thread per (b, c) output cell) writes its grad with `=`,
+// no atomic and no race. Caller pre-zeros gradInput; non-maxIdx positions
+// stay zero by construction.
 extern ""C"" __global__ __launch_bounds__(256) void global_maxpool2d_backward_deterministic(
     const float* gradOutput, const int* indices, float* gradInput,
     int batch, int channels, int height, int width)
@@ -278,7 +287,7 @@ extern ""C"" __global__ __launch_bounds__(256) void global_maxpool2d_backward_de
     if (maxIdx < 0 || maxIdx >= spatialSize) return;
 
     int inputOffset = (b * channels + c) * spatialSize;
-    gradInput[inputOffset + maxIdx] += grad;
+    gradInput[inputOffset + maxIdx] = grad;
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void adaptive_avgpool2d(

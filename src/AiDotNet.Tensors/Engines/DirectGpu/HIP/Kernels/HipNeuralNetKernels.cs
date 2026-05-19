@@ -1441,14 +1441,19 @@ extern ""C"" __global__ __launch_bounds__(256) void embedding_forward(
     }
 }
 
+// HIP AllocateIntBuffer uploads true int32 (see HipBackend.AllocateIntBuffer(int[])).
+// Declaring indices as int* (not float*) ensures correct reads; the prior signature
+// of const float* with a (int) cast would float-interpret the int's bit pattern
+// (denormal for small ints) and truncate to 0 — a long-standing bug surfaced by
+// PR #390 review (issue #382).
 extern ""C"" __global__ __launch_bounds__(256) void embedding_backward(
-    const float* gradOutput, const float* indices, float* gradEmbedding,
+    const float* gradOutput, const int* indices, float* gradEmbedding,
     int numIndices, int embeddingDim)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= numIndices) return;
 
-    int idx = (int)indices[i];
+    int idx = indices[i];
     for (int d = 0; d < embeddingDim; d++) {
         // NON-DETERMINISTIC (issue #382); see embedding_backward_deterministic below.
         atomicAdd(&gradEmbedding[idx * embeddingDim + d], gradOutput[i * embeddingDim + d]);
@@ -1458,7 +1463,7 @@ extern ""C"" __global__ __launch_bounds__(256) void embedding_backward(
 // Embedding backward — bit-deterministic variant (issue #382).
 // One thread per (v, d) output cell scans numIndices in fixed ascending order.
 extern ""C"" __global__ __launch_bounds__(256) void embedding_backward_deterministic(
-    const float* gradOutput, const float* indices, float* gradEmbedding,
+    const float* gradOutput, const int* indices, float* gradEmbedding,
     int numIndices, int embeddingDim, int vocabSize)
 {
     int v = blockIdx.y * blockDim.y + threadIdx.y;
@@ -1467,7 +1472,7 @@ extern ""C"" __global__ __launch_bounds__(256) void embedding_backward_determini
 
     float sum = 0.0f;
     for (int i = 0; i < numIndices; i++) {
-        if ((int)indices[i] == v) {
+        if (indices[i] == v) {
             sum += gradOutput[i * embeddingDim + d];
         }
     }

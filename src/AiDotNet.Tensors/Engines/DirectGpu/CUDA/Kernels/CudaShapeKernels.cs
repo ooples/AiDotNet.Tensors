@@ -299,9 +299,11 @@ extern ""C"" __global__ __launch_bounds__(256) void crop_2d_backward(
 }
 
 // crop_2d_backward — bit-deterministic variant (issue #382).
-// Iterates per input cell in the cropped region and writes a single grad_output value
-// (direct read, no atomic). Inverts the parallelization: one thread per (b, c, ih, iw)
-// of the cropped subregion of grad_input.
+// Same parallelization as the atomic version (one thread per output cell), but
+// the (output -> input) mapping is one-to-one across the cropped subregion, so
+// every thread owns a unique grad_input slot and a plain `=` write replaces the
+// over-defensive atomicAdd. Bit-identical across re-runs; caller is expected
+// to pre-zero grad_input — the non-cropped region is intentionally untouched.
 extern ""C"" __global__ __launch_bounds__(256) void crop_2d_backward_deterministic(
     const float* __restrict__ grad_output, float* __restrict__ grad_input,
     int batch, int channels, int inH, int inW,
@@ -318,7 +320,7 @@ extern ""C"" __global__ __launch_bounds__(256) void crop_2d_backward_determinist
     int c = temp % channels;
     int b = temp / channels;
 
-    grad_input[((b * channels + c) * inH + (h + offsetH)) * inW + (w + offsetW)] += grad_output[idx];
+    grad_input[((b * channels + c) * inH + (h + offsetH)) * inW + (w + offsetW)] = grad_output[idx];
 }
 
 // ============================================================================

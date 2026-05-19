@@ -1247,7 +1247,12 @@ __kernel void embedding_backward(
     const int idx = get_global_id(0);
     if (idx >= numIndices) return;
 
-    int index = (int)indices[idx];
+    // OpenCL AllocateIntBuffer bit-packs int32 indices into the float buffer via
+    // BitConverter (see OpenClBackend.AllocateIntBuffer(int[])). Use as_int() to
+    // bit-reinterpret back to int; a numeric `(int)` cast would truncate the
+    // float interpretation of the bit pattern (e.g. int 1 stored as denormal
+    // ~1.4e-45 would truncate to 0).
+    int index = as_int(indices[idx]);
 
     for (int d = 0; d < embeddingDim; d++) {
         // Use atomic add for thread safety when multiple indices point to same embedding
@@ -1279,7 +1284,9 @@ __kernel void embedding_backward_deterministic(
 
     float sum = 0.0f;
     for (int i = 0; i < numIndices; i++) {
-        if ((int)indices[i] == v) {
+        // as_int() bit-reinterprets the float storage back to int (see comment in
+        // the atomic variant above).
+        if (as_int(indices[i]) == v) {
             sum += gradOutput[i * embeddingDim + d];
         }
     }

@@ -4,10 +4,21 @@
 
 using System;
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
+
+/// <summary>
+/// xUnit collection grouping all tests that mutate the process-wide
+/// <see cref="AiDotNetEngine.Current"/> and / or
+/// <see cref="AiDotNetEngine.SetDeterministicMode(bool)"/> static state. Tests
+/// in this collection are serialized, so a parallel test cannot observe a
+/// half-applied engine swap.
+/// </summary>
+[CollectionDefinition("AiDotNetEngineGlobalState")]
+public class AiDotNetEngineGlobalStateCollection { }
 
 /// <summary>
 /// Closed-loop regression test for issue #382. Verifies that when the global
@@ -23,11 +34,12 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// collisions (multiple input positions targeting the same vocab row) so the atomic
 /// kernel's nondeterminism is maximally exercised.
 ///
-/// Mutates a process-wide static flag (DeterministicMode), so the test joins the
-/// existing BlasGlobalState collection to serialize against other deterministic-mode
-/// tests in the suite.
+/// Mutates the process-wide <see cref="AiDotNetEngine.Current"/> and the
+/// <see cref="AiDotNetEngine.SetDeterministicMode(bool)"/> static flag, so the
+/// test joins the dedicated <c>AiDotNetEngineGlobalState</c> collection to
+/// serialize against any other test that touches those statics.
 /// </summary>
-[Collection("BlasGlobalState")]
+[Collection("AiDotNetEngineGlobalState")]
 public class GpuDeterminismRegressionTests
 {
     private readonly bool _isDirectGpuAvailable;
@@ -50,13 +62,24 @@ public class GpuDeterminismRegressionTests
     {
         Skip.IfNot(_isDirectGpuAvailable, "DirectGPU backend (CUDA/OpenCL/HIP) not available on this host");
 
-        bool originalDet = AiDotNetEngine.DeterministicMode;
+        // Capture the *raw* thread-local override (null = "no override"), not the
+        // merged effective value from AiDotNetEngine.DeterministicMode. Restoring
+        // the merged value would erase the distinction between "no override" and
+        // "override = process-wide value", which behave differently when the
+        // process-wide flag is later flipped by an unrelated test.
+        bool? originalThreadLocalDet = BlasProvider.GetThreadLocalDeterministicMode();
+        bool originalProcessDet = AiDotNetEngine.DeterministicMode;
         IEngine originalEngine = AiDotNetEngine.Current;
+        // Holds the DirectGpuTensorEngine we install so it can be disposed in
+        // `finally` after Current is restored — otherwise the native GPU context
+        // leaks across tests.
+        DirectGpuTensorEngine? installedEngine = null;
 
         try
         {
             AiDotNetEngine.SetDeterministicMode(true);
-            AiDotNetEngine.Current = new DirectGpuTensorEngine();
+            installedEngine = new DirectGpuTensorEngine();
+            AiDotNetEngine.Current = installedEngine;
 
             // Shape chosen so multiple input positions target the same vocab row —
             // this is exactly the collision pattern that triggered the atomic
@@ -93,19 +116,27 @@ public class GpuDeterminismRegressionTests
                 for (int i = 0; i < vocabSize * embeddingDim; i++) snapshots[run][i] = result[i];
             }
 
-            // Run 0 is reference; runs 1-3 must be byte-equal.
+            // Run 0 is reference; runs 1-3 must be bit-equal. Compare the raw IEEE-754
+            // payload (single-precision word) so +0/-0 differ — Assert.Equal(float, float)
+            // treats them as equal — and so NaN payload differences are caught.
+            // Uses BitConverter.GetBytes/ToInt32 (works on both net471 and net10.0) in
+            // place of SingleToInt32Bits (net6.0+ only).
             for (int run = 1; run < 4; run++)
             {
                 for (int i = 0; i < vocabSize * embeddingDim; i++)
                 {
-                    Assert.Equal(snapshots[0][i], snapshots[run][i]);
+                    int refBits = BitConverter.ToInt32(BitConverter.GetBytes(snapshots[0][i]), 0);
+                    int runBits = BitConverter.ToInt32(BitConverter.GetBytes(snapshots[run][i]), 0);
+                    Assert.Equal(refBits, runBits);
                 }
             }
         }
         finally
         {
             AiDotNetEngine.Current = originalEngine;
-            AiDotNetEngine.SetDeterministicMode(originalDet);
+            installedEngine?.Dispose();
+            AiDotNetEngine.SetDeterministicMode(originalProcessDet);
+            BlasProvider.SetThreadLocalDeterministicMode(originalThreadLocalDet);
         }
     }
 }

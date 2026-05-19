@@ -8454,11 +8454,17 @@ KERNEL VARIANTS (A/B testing):
                 k1.Execute1D(sourceSize, Math.Min(256, sourceSize));
             }
 
+            // scatter_mean_divide expects flat output element count (kernel guards
+            // `idx < outputSize` and indexes `output[idx]`), so pass outputSize *
+            // featureSize as the flat element count. Pre-existing bug surfaced
+            // by PR #390 review: prior code passed row count and dispatched only
+            // `outputSize` work-items, normalizing just the first row.
+            int outputFlat = outputSize * featureSize;
             var k2 = _kernelCache["scatter_mean_divide"]; uint arg2 = 0;
             k2.SetArg(arg2++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
             k2.SetArg(arg2++, ((DirectOpenClGpuBuffer)counts).Buffer.Handle);
-            k2.SetArg(arg2++, outputSize); k2.SetArg(arg2++, featureSize);
-            k2.Execute1D(outputSize, Math.Min(256, outputSize));
+            k2.SetArg(arg2++, outputFlat); k2.SetArg(arg2++, featureSize);
+            k2.Execute1D(outputFlat, Math.Min(256, outputFlat));
         }
 
         public void L1Loss(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numFeatures)

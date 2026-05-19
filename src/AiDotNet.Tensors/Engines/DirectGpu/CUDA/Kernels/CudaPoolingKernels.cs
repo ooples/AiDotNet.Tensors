@@ -293,9 +293,11 @@ extern ""C"" __global__ __launch_bounds__(256) void global_maxpool2d_backward(
 }
 
 // global_maxpool2d_backward — bit-deterministic variant (issue #382).
-// Since each (b, c) has exactly one output and one maxIdx, the atomic in the original
-// is technically only needed when the dispatch reuses a buffer. The deterministic
-// variant is the trivial direct write — one thread per (b, c) output cell.
+// Each (b, c) has exactly one output and one maxIdx, and inputOffset is
+// derived from (b, c) — so every thread owns a unique gradInput slot. The
+// 1D launch (one thread per (b, c) output cell) writes its grad with `=`,
+// no atomic and no race. Caller pre-zeros gradInput; non-maxIdx positions
+// stay zero by construction.
 extern ""C"" __global__ __launch_bounds__(256) void global_maxpool2d_backward_deterministic(
     const float* __restrict__ gradOutput, const int* __restrict__ indices, float* __restrict__ gradInput,
     int batch, int channels, int height, int width)
@@ -313,7 +315,7 @@ extern ""C"" __global__ __launch_bounds__(256) void global_maxpool2d_backward_de
     if (maxIdx < 0 || maxIdx >= spatialSize) return;
 
     int inputOffset = (b * channels + c) * spatialSize;
-    gradInput[inputOffset + maxIdx] += grad;
+    gradInput[inputOffset + maxIdx] = grad;
 }
 
 // Adaptive Average Pooling 2D
