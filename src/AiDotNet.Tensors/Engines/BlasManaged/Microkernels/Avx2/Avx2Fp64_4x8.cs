@@ -39,6 +39,14 @@ internal static class Avx2Fp64_4x8
     public static bool IsSupported => Avx2.IsSupported && Fma.IsSupported;
 
     /// <summary>
+    /// Sub-O (#405): K-iteration prefetch distance. FP64 4×8 consumes 32 bytes
+    /// of A (4 doubles) and 64 bytes of B (8 doubles) per K-step — one cache
+    /// line of B per iter. Prefetching 8 iters ahead pulls in ~4 cache lines
+    /// of A and 8 of B, hiding L2→L1 latency on the consume side.
+    /// </summary>
+    private const int PrefetchDistance = 8;
+
+    /// <summary>
     /// Accumulate packedA · packedB into the C[0..Mr, 0..Nr] tile, summing over
     /// kc K-steps. C is read-modify-write; caller is responsible for zero-init
     /// if a fresh result is desired. When kc is 0 the kernel reads + writes C
@@ -77,6 +85,14 @@ internal static class Avx2Fp64_4x8
             {
                 for (int k = 0; k < kc; k++)
                 {
+                    // Sub-O (#405): prefetch A + B PrefetchDistance iters ahead.
+                    if (k + PrefetchDistance < kc)
+                    {
+                        Sse.Prefetch0(aPtr + (k + PrefetchDistance) * Mr);
+                        Sse.Prefetch0(bPtr + (k + PrefetchDistance) * Nr);
+                        Sse.Prefetch0(bPtr + (k + PrefetchDistance) * Nr + 4);
+                    }
+
                     // Load B row: 8 doubles = 2 Vector256 halves.
                     Vector256<double> bRow_lo = Avx.LoadVector256(bPtr + k * Nr + 0);
                     Vector256<double> bRow_hi = Avx.LoadVector256(bPtr + k * Nr + 4);
@@ -142,6 +158,14 @@ internal static class Avx2Fp64_4x8
             {
                 for (int k = 0; k < kc; k++)
                 {
+                    // Sub-O (#405): prefetch A + strided-B PrefetchDistance iters ahead.
+                    if (k + PrefetchDistance < kc)
+                    {
+                        Sse.Prefetch0(aPtr + (k + PrefetchDistance) * Mr);
+                        Sse.Prefetch0(bPtr + (k + PrefetchDistance) * ldb);
+                        Sse.Prefetch0(bPtr + (k + PrefetchDistance) * ldb + 4);
+                    }
+
                     // Strided B: row at b[k*ldb], 8 doubles = 2 Vector256 halves.
                     Vector256<double> bRow_lo = Avx.LoadVector256(bPtr + k * ldb + 0);
                     Vector256<double> bRow_hi = Avx.LoadVector256(bPtr + k * ldb + 4);

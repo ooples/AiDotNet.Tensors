@@ -48,6 +48,16 @@ internal static class Avx2Fp32_8x8
     /// <param name="c">Output buffer; reads + writes C[0..Mr, 0..Nr] tile.</param>
     /// <param name="ldc">Leading dimension of C.</param>
     /// <param name="kc">Number of K-steps to accumulate.</param>
+    /// <summary>
+    /// Sub-O (#405): software-prefetch distance in K-iterations. Each K-step
+    /// consumes 32 bytes of A (8 floats) and 32 bytes of B (8 floats); a prefetch
+    /// 8 iterations ahead pulls in the next 4 cache lines of each. Tuned for
+    /// Zen-class L1 latency (~4 cycles) vs FMA latency (~4 cycles) — keeps the
+    /// load front-end one issue ahead of the compute. PrefetchDistance > kc just
+    /// becomes a no-op via the in-loop bounds check.
+    /// </summary>
+    private const int PrefetchDistance = 8;
+
     public static unsafe void Run(
         ReadOnlySpan<float> packedA,
         ReadOnlySpan<float> packedB,
@@ -75,6 +85,14 @@ internal static class Avx2Fp32_8x8
             {
                 for (int k = 0; k < kc; k++)
                 {
+                    // Sub-O: prefetch the K-iteration `PrefetchDistance` ahead.
+                    // Hides L2→L1 fetch latency for both A and B streams.
+                    if (k + PrefetchDistance < kc)
+                    {
+                        Sse.Prefetch0(aPtr + (k + PrefetchDistance) * Mr);
+                        Sse.Prefetch0(bPtr + (k + PrefetchDistance) * Nr);
+                    }
+
                     // One vector load gives the full 8-col B row.
                     Vector256<float> bRow = Avx.LoadVector256(bPtr + k * Nr);
 
@@ -148,6 +166,13 @@ internal static class Avx2Fp32_8x8
             {
                 for (int k = 0; k < kc; k++)
                 {
+                    // Sub-O (#405): prefetch A + B `PrefetchDistance` iters ahead.
+                    if (k + PrefetchDistance < kc)
+                    {
+                        Sse.Prefetch0(aPtr + (k + PrefetchDistance) * Mr);
+                        Sse.Prefetch0(bPtr + (k + PrefetchDistance) * ldb);
+                    }
+
                     // ONE difference vs Run: stride is ldb (caller-supplied), not Nr.
                     Vector256<float> bRow = Avx.LoadVector256(bPtr + k * ldb);
 
