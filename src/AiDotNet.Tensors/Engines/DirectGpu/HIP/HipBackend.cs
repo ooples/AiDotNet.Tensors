@@ -3119,9 +3119,6 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (!IsAvailable)
             throw new InvalidOperationException("HIP backend is not available.");
 
-        if (!_kernelCache.TryGetValue("scatter_add_edges", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: scatter_add_edges");
-
         if (!_kernelCache.TryGetValue("zero_buffer", out var zeroKernel))
             throw new InvalidOperationException("HIP kernel not found: zero_buffer");
 
@@ -3132,15 +3129,23 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         LaunchKernel1D(zeroKernel, zeroGrid, DefaultBlockSize, outputHandle, outputSize);
         Synchronize();
 
-        // Launch scatter-add kernel
-        int gridX = numEdges;
-        int gridY = (features + DefaultBlockSize - 1) / DefaultBlockSize;
-
         var inputHandle = ((HipGpuBuffer)input).Handle;
         var sourceHandle = ((HipGpuBuffer)sourceIndices).Handle;
         var targetHandle = ((HipGpuBuffer)targetIndices).Handle;
         var edgeValuesHandle = edgeValues is not null ? ((HipGpuBuffer)edgeValues).Handle : IntPtr.Zero;
         int hasEdgeValues = edgeValues is not null ? 1 : 0;
+
+        // Issue #382: route to atomic-free variant — per-target-node thread scans edges.
+        string kernelName = GpuDeterminism.IsActive
+            ? "scatter_add_edges_deterministic"
+            : "scatter_add_edges";
+        if (!_kernelCache.TryGetValue(kernelName, out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: " + kernelName);
+
+        // Deterministic variant: gridX = numNodes (one thread per target node).
+        // Atomic variant: gridX = numEdges (one thread per edge).
+        int gridX = GpuDeterminism.IsActive ? numNodes : numEdges;
+        int gridY = (features + DefaultBlockSize - 1) / DefaultBlockSize;
 
         LaunchScatterAddKernel(kernel, gridX, gridY, DefaultBlockSize, 1,
             inputHandle, sourceHandle, targetHandle, edgeValuesHandle, outputHandle,
@@ -8223,37 +8228,81 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth,
         int paddingMode = 0, bool alignCorners = false)
     {
+        IntPtr _p0 = gradOutput.Handle;
+        IntPtr _p1 = input.Handle;
+        IntPtr _p2 = grid.Handle;
+        IntPtr _p3 = gradInput.Handle;
+        IntPtr _p4 = gradGrid.Handle;
+        int alignCornersInt = alignCorners ? 1 : 0;
+
+        if (GpuDeterminism.IsActive)
+        {
+            // Issue #382: split into gradGrid (per output pos) + gradInput (per input cell).
+            if (!_kernelCache.TryGetValue("grid_sample_backward_grad_grid_deterministic", out var krnlG))
+                throw new InvalidOperationException("HIP kernel not found: grid_sample_backward_grad_grid_deterministic");
+
+            void** argsG = stackalloc void*[12];
+            argsG[0] = &_p0;
+            argsG[1] = &_p1;
+            argsG[2] = &_p2;
+            argsG[3] = &_p4;
+            argsG[4] = &batch;
+            argsG[5] = &channels;
+            argsG[6] = &inHeight;
+            argsG[7] = &inWidth;
+            argsG[8] = &outHeight;
+            argsG[9] = &outWidth;
+            argsG[10] = &paddingMode;
+            argsG[11] = &alignCornersInt;
+            uint gGX = (uint)((outWidth + 15) / 16);
+            uint gGY = (uint)((outHeight + 15) / 16);
+            uint gGZ = (uint)batch;
+            LaunchKernel3D(krnlG, gGX, gGY, gGZ, 16, 16, 1, argsG);
+
+            if (!_kernelCache.TryGetValue("grid_sample_backward_grad_input_deterministic", out var krnlI))
+                throw new InvalidOperationException("HIP kernel not found: grid_sample_backward_grad_input_deterministic");
+
+            void** argsI = stackalloc void*[10];
+            argsI[0] = &_p0;
+            argsI[1] = &_p2;
+            argsI[2] = &_p3;
+            argsI[3] = &batch;
+            argsI[4] = &channels;
+            argsI[5] = &inHeight;
+            argsI[6] = &inWidth;
+            argsI[7] = &outHeight;
+            argsI[8] = &outWidth;
+            argsI[9] = &alignCornersInt;
+            uint gIX = (uint)((inWidth + 15) / 16);
+            uint gIY = (uint)((inHeight + 15) / 16);
+            uint gIZ = (uint)(batch * channels);
+            LaunchKernel3D(krnlI, gIX, gIY, gIZ, 16, 16, 1, argsI);
+            Synchronize();
+            return;
+        }
+
         if (!_kernelCache.TryGetValue("grid_sample_backward", out var krnl))
             throw new InvalidOperationException("HIP kernel not found: grid_sample_backward");
 
-            {
-            IntPtr _p0 = gradOutput.Handle;
-            IntPtr _p1 = input.Handle;
-            IntPtr _p2 = grid.Handle;
-            IntPtr _p3 = gradInput.Handle;
-            IntPtr _p4 = gradGrid.Handle;
-            void** args = stackalloc void*[13];
-            args[0] = &_p0;
-            args[1] = &_p1;
-            args[2] = &_p2;
-            args[3] = &_p3;
-            args[4] = &_p4;
-            args[5] = &batch;
-            args[6] = &channels;
-            args[7] = &inHeight;
-            args[8] = &inWidth;
-            args[9] = &outHeight;
-            args[10] = &outWidth;
-            args[11] = &paddingMode;
-            int alignCornersInt = alignCorners ? 1 : 0;
-            args[12] = &alignCornersInt;
-
-                uint gridX = (uint)((outWidth + 15) / 16);
-                uint gridY = (uint)((outHeight + 15) / 16);
-                uint gridZ = (uint)batch;
-                LaunchKernel3D(krnl, gridX, gridY, gridZ, 16, 16, 1, args);
-                Synchronize();
-            }
+        void** args = stackalloc void*[13];
+        args[0] = &_p0;
+        args[1] = &_p1;
+        args[2] = &_p2;
+        args[3] = &_p3;
+        args[4] = &_p4;
+        args[5] = &batch;
+        args[6] = &channels;
+        args[7] = &inHeight;
+        args[8] = &inWidth;
+        args[9] = &outHeight;
+        args[10] = &outWidth;
+        args[11] = &paddingMode;
+        args[12] = &alignCornersInt;
+        uint gridX = (uint)((outWidth + 15) / 16);
+        uint gridY = (uint)((outHeight + 15) / 16);
+        uint gridZ = (uint)batch;
+        LaunchKernel3D(krnl, gridX, gridY, gridZ, 16, 16, 1, args);
+        Synchronize();
     }
 
     public unsafe void BroadcastMultiplyLastAxis(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int outerSize, int innerSize)
