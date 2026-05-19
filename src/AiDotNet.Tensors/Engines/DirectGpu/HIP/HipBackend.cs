@@ -5207,25 +5207,45 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe void EmbeddingBackward(IGpuBuffer gradOutput, IGpuBuffer indices, IGpuBuffer gradEmbedding, int numIndices, int embeddingDim, int vocabSize)
     {
+        IntPtr _p0 = gradOutput.Handle;
+        IntPtr _p1 = indices.Handle;
+        IntPtr _p2 = gradEmbedding.Handle;
+
+        if (GpuDeterminism.IsActive)
+        {
+            // Issue #382: atomicAdd in embedding_backward is FP-non-deterministic
+            // across runs. Route to the atomic-free variant — one thread per (v, d).
+            if (!_kernelCache.TryGetValue("embedding_backward_deterministic", out var krnlD))
+                throw new InvalidOperationException("HIP kernel not found: embedding_backward_deterministic");
+
+            void** argsD = stackalloc void*[6];
+            argsD[0] = &_p0;
+            argsD[1] = &_p1;
+            argsD[2] = &_p2;
+            argsD[3] = &numIndices;
+            argsD[4] = &embeddingDim;
+            argsD[5] = &vocabSize;
+
+            uint gridX = (uint)((embeddingDim + 15) / 16);
+            uint gridY = (uint)((vocabSize + 15) / 16);
+            LaunchKernel2D(krnlD, gridX, gridY, 16, 16, argsD);
+            Synchronize();
+            return;
+        }
+
         if (!_kernelCache.TryGetValue("embedding_backward", out var krnl))
             throw new InvalidOperationException("HIP kernel not found: embedding_backward");
 
-            {
-            IntPtr _p0 = gradOutput.Handle;
-            IntPtr _p1 = indices.Handle;
-            IntPtr _p2 = gradEmbedding.Handle;
-            void** args = stackalloc void*[5];
-            args[0] = &_p0;
-            args[1] = &_p1;
-            args[2] = &_p2;
-            args[3] = &numIndices;
-            args[4] = &embeddingDim;
+        void** args = stackalloc void*[5];
+        args[0] = &_p0;
+        args[1] = &_p1;
+        args[2] = &_p2;
+        args[3] = &numIndices;
+        args[4] = &embeddingDim;
 
-
-            uint grid = (uint)((numIndices + DefaultBlockSize - 1) / DefaultBlockSize);
-            LaunchKernel(krnl, grid, DefaultBlockSize, args);
-            Synchronize();
-            }
+        uint grid = (uint)((numIndices + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(krnl, grid, DefaultBlockSize, args);
+        Synchronize();
     }
 
     public IGpuBuffer AllocateIntBuffer(int size)
@@ -5850,50 +5870,107 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal,
         IGpuBuffer? attentionBias = null, int biasBatchStride = 0)
     {
-        if (!_kernelCache.TryGetValue("flash_attention_backward", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: flash_attention_backward");
-
         int causalFlag = isCausal ? 1 : 0;
         int hasBias = attentionBias is not null ? 1 : 0;
         IntPtr biasPtr = attentionBias is not null ? attentionBias.Handle : IntPtr.Zero;
-            {
-            IntPtr _p0 = gradOutput.Handle;
-            IntPtr _p1 = query.Handle;
-            IntPtr _p2 = key.Handle;
-            IntPtr _p3 = value.Handle;
-            IntPtr _p4 = output.Handle;
-            IntPtr _p5 = softmaxStats.Handle;
-            IntPtr _p6 = gradQuery.Handle;
-            IntPtr _p7 = gradKey.Handle;
-            IntPtr _p8 = gradValue.Handle;
-            void** args = stackalloc void*[19];
-            args[0] = &_p0;
-            args[1] = &_p1;
-            args[2] = &_p2;
-            args[3] = &_p3;
-            args[4] = &_p4;
-            args[5] = &_p5;
-            args[6] = &_p6;
-            args[7] = &_p7;
-            args[8] = &_p8;
-            args[9] = &batch;
-            args[10] = &numHeads;
-            args[11] = &seqQ;
-            args[12] = &seqK;
-            args[13] = &headDim;
-            args[14] = &scale;
-            args[15] = &causalFlag;
-            args[16] = &biasPtr;
-            args[17] = &hasBias;
-            args[18] = &biasBatchStride;
 
+        IntPtr _p0 = gradOutput.Handle;
+        IntPtr _p1 = query.Handle;
+        IntPtr _p2 = key.Handle;
+        IntPtr _p3 = value.Handle;
+        IntPtr _p4 = output.Handle;
+        IntPtr _p5 = softmaxStats.Handle;
+        IntPtr _p6 = gradQuery.Handle;
+        IntPtr _p7 = gradKey.Handle;
+        IntPtr _p8 = gradValue.Handle;
 
-            uint gridX = (uint)((seqQ + 31) / 32);
-            uint gridY = (uint)(batch * numHeads);
-            uint sharedBytes = (uint)(2 * 32 * headDim * sizeof(float));
-            LaunchKernel2D(krnl, gridX, gridY, 32, 1, args, sharedBytes);
+        if (GpuDeterminism.IsActive)
+        {
+            // Issue #382: split into atomic-free gradq + gradkv kernels.
+            if (!_kernelCache.TryGetValue("flash_attention_backward_gradq_deterministic", out var krnlQ))
+                throw new InvalidOperationException("HIP kernel not found: flash_attention_backward_gradq_deterministic");
+            void** argsQ = stackalloc void*[17];
+            argsQ[0] = &_p0;
+            argsQ[1] = &_p1;
+            argsQ[2] = &_p2;
+            argsQ[3] = &_p3;
+            argsQ[4] = &_p4;
+            argsQ[5] = &_p5;
+            argsQ[6] = &_p6;
+            argsQ[7] = &batch;
+            argsQ[8] = &numHeads;
+            argsQ[9] = &seqQ;
+            argsQ[10] = &seqK;
+            argsQ[11] = &headDim;
+            argsQ[12] = &scale;
+            argsQ[13] = &causalFlag;
+            argsQ[14] = &biasPtr;
+            argsQ[15] = &hasBias;
+            argsQ[16] = &biasBatchStride;
+
+            uint gQX = (uint)((seqQ + 63) / 64);
+            uint gQY = (uint)(batch * numHeads);
+            LaunchKernel2D(krnlQ, gQX, gQY, 64, 1, argsQ);
+
+            if (!_kernelCache.TryGetValue("flash_attention_backward_gradkv_deterministic", out var krnlKV))
+                throw new InvalidOperationException("HIP kernel not found: flash_attention_backward_gradkv_deterministic");
+            void** argsKV = stackalloc void*[18];
+            argsKV[0] = &_p0;
+            argsKV[1] = &_p1;
+            argsKV[2] = &_p2;
+            argsKV[3] = &_p3;
+            argsKV[4] = &_p4;
+            argsKV[5] = &_p5;
+            argsKV[6] = &_p7;
+            argsKV[7] = &_p8;
+            argsKV[8] = &batch;
+            argsKV[9] = &numHeads;
+            argsKV[10] = &seqQ;
+            argsKV[11] = &seqK;
+            argsKV[12] = &headDim;
+            argsKV[13] = &scale;
+            argsKV[14] = &causalFlag;
+            argsKV[15] = &biasPtr;
+            argsKV[16] = &hasBias;
+            argsKV[17] = &biasBatchStride;
+
+            uint gKVX = (uint)((headDim + 15) / 16);
+            uint gKVY = (uint)((seqK + 3) / 4);
+            uint gKVZ = (uint)(batch * numHeads);
+            LaunchKernel3D(krnlKV, gKVX, gKVY, gKVZ, 16, 4, 1, argsKV);
             Synchronize();
-            }
+            return;
+        }
+
+        if (!_kernelCache.TryGetValue("flash_attention_backward", out var krnl))
+            throw new InvalidOperationException("HIP kernel not found: flash_attention_backward");
+
+        void** args = stackalloc void*[19];
+        args[0] = &_p0;
+        args[1] = &_p1;
+        args[2] = &_p2;
+        args[3] = &_p3;
+        args[4] = &_p4;
+        args[5] = &_p5;
+        args[6] = &_p6;
+        args[7] = &_p7;
+        args[8] = &_p8;
+        args[9] = &batch;
+        args[10] = &numHeads;
+        args[11] = &seqQ;
+        args[12] = &seqK;
+        args[13] = &headDim;
+        args[14] = &scale;
+        args[15] = &causalFlag;
+        args[16] = &biasPtr;
+        args[17] = &hasBias;
+        args[18] = &biasBatchStride;
+
+        uint gridX = (uint)((seqQ + 31) / 32);
+        uint gridY = (uint)(batch * numHeads);
+        uint sharedBytes = (uint)(2 * 32 * headDim * sizeof(float));
+        LaunchKernel2D(krnl, gridX, gridY, 32, 1, args, sharedBytes);
+        Synchronize();
     }
 
     public unsafe void GroupedQueryAttention(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
@@ -5944,45 +6021,93 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         IGpuBuffer gradQuery, IGpuBuffer gradKey, IGpuBuffer gradValue,
         int batch, int numQHeads, int numKVHeads, int seqQ, int seqK, int headDim, float scale)
     {
+        int queriesPerKV = numQHeads / numKVHeads;
+
+        IntPtr _p0 = gradOutput.Handle;
+        IntPtr _p1 = query.Handle;
+        IntPtr _p2 = key.Handle;
+        IntPtr _p3 = value.Handle;
+        IntPtr _p4 = attentionWeights.Handle;
+        IntPtr _p5 = gradQuery.Handle;
+        IntPtr _p6 = gradKey.Handle;
+        IntPtr _p7 = gradValue.Handle;
+
+        if (GpuDeterminism.IsActive)
+        {
+            // Issue #382: split into atomic-free gradq + gradkv kernels.
+            if (!_kernelCache.TryGetValue("grouped_query_attention_backward_gradq_deterministic", out var kQg))
+                throw new InvalidOperationException("HIP kernel not found: grouped_query_attention_backward_gradq_deterministic");
+            void** argsQg = stackalloc void*[14];
+            argsQg[0] = &_p0;
+            argsQg[1] = &_p1;
+            argsQg[2] = &_p2;
+            argsQg[3] = &_p3;
+            argsQg[4] = &_p4;
+            argsQg[5] = &_p5;
+            argsQg[6] = &batch;
+            argsQg[7] = &numQHeads;
+            argsQg[8] = &numKVHeads;
+            argsQg[9] = &queriesPerKV;
+            argsQg[10] = &seqQ;
+            argsQg[11] = &seqK;
+            argsQg[12] = &headDim;
+            argsQg[13] = &scale;
+            uint gqX = (uint)((seqQ + 63) / 64);
+            uint gqY = (uint)(batch * numQHeads);
+            LaunchKernel2D(kQg, gqX, gqY, 64, 1, argsQg);
+
+            if (!_kernelCache.TryGetValue("grouped_query_attention_backward_gradkv_deterministic", out var kKVg))
+                throw new InvalidOperationException("HIP kernel not found: grouped_query_attention_backward_gradkv_deterministic");
+            void** argsKVg = stackalloc void*[15];
+            argsKVg[0] = &_p0;
+            argsKVg[1] = &_p1;
+            argsKVg[2] = &_p2;
+            argsKVg[3] = &_p3;
+            argsKVg[4] = &_p4;
+            argsKVg[5] = &_p6;
+            argsKVg[6] = &_p7;
+            argsKVg[7] = &batch;
+            argsKVg[8] = &numQHeads;
+            argsKVg[9] = &numKVHeads;
+            argsKVg[10] = &queriesPerKV;
+            argsKVg[11] = &seqQ;
+            argsKVg[12] = &seqK;
+            argsKVg[13] = &headDim;
+            argsKVg[14] = &scale;
+            uint gkvX = (uint)((headDim + 15) / 16);
+            uint gkvY = (uint)((seqK + 3) / 4);
+            uint gkvZ = (uint)(batch * numKVHeads);
+            LaunchKernel3D(kKVg, gkvX, gkvY, gkvZ, 16, 4, 1, argsKVg);
+            Synchronize();
+            return;
+        }
+
         if (!_kernelCache.TryGetValue("grouped_query_attention_backward", out var krnl))
             throw new InvalidOperationException("HIP kernel not found: grouped_query_attention_backward");
 
-        int queriesPerKV = numQHeads / numKVHeads;
+        void** args = stackalloc void*[16];
+        args[0] = &_p0;
+        args[1] = &_p1;
+        args[2] = &_p2;
+        args[3] = &_p3;
+        args[4] = &_p4;
+        args[5] = &_p5;
+        args[6] = &_p6;
+        args[7] = &_p7;
+        args[8] = &batch;
+        args[9] = &numQHeads;
+        args[10] = &numKVHeads;
+        args[11] = &queriesPerKV;
+        args[12] = &seqQ;
+        args[13] = &seqK;
+        args[14] = &headDim;
+        args[15] = &scale;
 
-            {
-            IntPtr _p0 = gradOutput.Handle;
-            IntPtr _p1 = query.Handle;
-            IntPtr _p2 = key.Handle;
-            IntPtr _p3 = value.Handle;
-            IntPtr _p4 = attentionWeights.Handle;
-            IntPtr _p5 = gradQuery.Handle;
-            IntPtr _p6 = gradKey.Handle;
-            IntPtr _p7 = gradValue.Handle;
-            void** args = stackalloc void*[16];
-            args[0] = &_p0;
-            args[1] = &_p1;
-            args[2] = &_p2;
-            args[3] = &_p3;
-            args[4] = &_p4;
-            args[5] = &_p5;
-            args[6] = &_p6;
-            args[7] = &_p7;
-            args[8] = &batch;
-            args[9] = &numQHeads;
-            args[10] = &numKVHeads;
-            args[11] = &queriesPerKV;
-            args[12] = &seqQ;
-            args[13] = &seqK;
-            args[14] = &headDim;
-            args[15] = &scale;
-
-
-            uint gridX = (uint)((seqQ + 31) / 32);
-            uint gridY = (uint)(batch * numQHeads);
-            uint sharedBytes = (uint)(2 * 32 * headDim * sizeof(float));
-            LaunchKernel2D(krnl, gridX, gridY, 32, 1, args, sharedBytes);
-            Synchronize();
-            }
+        uint gridX = (uint)((seqQ + 31) / 32);
+        uint gridY = (uint)(batch * numQHeads);
+        uint sharedBytes = (uint)(2 * 32 * headDim * sizeof(float));
+        LaunchKernel2D(krnl, gridX, gridY, 32, 1, args, sharedBytes);
+        Synchronize();
     }
 
     #endregion
