@@ -4860,8 +4860,41 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
             uint grid = (uint)((totalSize + DefaultBlockSize - 1) / DefaultBlockSize);
 
-            // Pass 1: Compute sums for gradient correction
-                {
+            // Pass 1: Compute sums.
+            // Issue #382: under DeterministicMode, dispatch to the per-output-cell
+            // split kernels (per-channel for gradGamma/gradBeta, per-instance for
+            // sumDy/sumDyXhat). Each owns one output cell — no atomics.
+            if (GpuDeterminism.IsActive
+                && _kernelCache.TryGetValue("instancenorm_backward_sums_per_channel_deterministic", out var sumsPerChannelD)
+                && _kernelCache.TryGetValue("instancenorm_backward_sums_per_instance_deterministic", out var sumsPerInstanceD))
+            {
+                IntPtr _p0 = gradOutput.Handle;
+                IntPtr _p1 = input.Handle;
+                IntPtr _p2 = saveMean.Handle;
+                IntPtr _p3 = saveInvVar.Handle;
+                IntPtr _p4 = gradGamma.Handle;
+                IntPtr _p5 = gradBeta.Handle;
+                void** argsPc = stackalloc void*[10];
+                argsPc[0] = &_p0; argsPc[1] = &_p1; argsPc[2] = &_p2; argsPc[3] = &_p3;
+                argsPc[4] = &_p4; argsPc[5] = &_p5;
+                argsPc[6] = &N; argsPc[7] = &C; argsPc[8] = &H; argsPc[9] = &W;
+                uint gridPc = (uint)((C + DefaultBlockSize - 1) / DefaultBlockSize);
+                LaunchKernel(sumsPerChannelD, gridPc, DefaultBlockSize, argsPc);
+
+                IntPtr _gPtr = gamma.Handle;
+                IntPtr _sdyPtr = sumDy.Handle;
+                IntPtr _sdyxhatPtr = sumDyXhat.Handle;
+                void** argsPi = stackalloc void*[11];
+                argsPi[0] = &_p0; argsPi[1] = &_p1; argsPi[2] = &_p2; argsPi[3] = &_p3;
+                argsPi[4] = &_gPtr; argsPi[5] = &_sdyPtr; argsPi[6] = &_sdyxhatPtr;
+                argsPi[7] = &N; argsPi[8] = &C; argsPi[9] = &H; argsPi[10] = &W;
+                int nc = N * C;
+                uint gridPi = (uint)((nc + DefaultBlockSize - 1) / DefaultBlockSize);
+                LaunchKernel(sumsPerInstanceD, gridPi, DefaultBlockSize, argsPi);
+                Synchronize();
+            }
+            else
+            {
                 IntPtr _p0 = gradOutput.Handle;
                 IntPtr _p1 = input.Handle;
                 IntPtr _p2 = saveMean.Handle;
@@ -4889,7 +4922,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
                 LaunchKernel(sumsKernel, grid, DefaultBlockSize, args1);
                 Synchronize();
-                }
+            }
 
             // Pass 2: Compute final input gradients
                 {
