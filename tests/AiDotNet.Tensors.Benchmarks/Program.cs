@@ -67,6 +67,30 @@ class Program
             return;
         }
 
+        // Issue #403 Phase A.3: per-substep allocation profile + shape catalog
+        // for one pass through the DCGAN-step probe substeps. Cheap to run
+        // (one call per substep) so reviewers can compare alloc shape against
+        // the issue's hypothesis without spinning up a full BDN run.
+        if (args[0] == "--dcgan-probe")
+        {
+            var profile = DCGANStepProbe.RunAllocationProfile();
+            Console.WriteLine(profile.Format());
+
+            Console.WriteLine();
+            using (var shapes = new AiDotNet.Tensors.Helpers.ShapeInstrumenter())
+            {
+                var probe = new DCGANStepProbe();
+                probe.Setup();
+                probe.Conv2DForward_Fp64();
+                probe.Conv2DBackwardInput_Fp64();
+                probe.Conv2DBackwardKernel_Fp64();
+                probe.BatchNormForward_Fp64();
+                probe.BatchNormBackward_Fp64();
+                shapes.PrintCatalog();
+            }
+            return;
+        }
+
 #if NET8_0_OR_GREATER
         // Issue #294 acceptance criterion #6: PyTorch CPU parity
         // benchmark — matmul, FlashAttention, LayerNorm, BCE
