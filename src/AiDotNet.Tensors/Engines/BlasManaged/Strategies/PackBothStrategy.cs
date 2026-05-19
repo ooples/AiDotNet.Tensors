@@ -382,7 +382,23 @@ internal static class PackBothStrategy
         // every parallel GEMM call. Rent from the shared array pool instead and
         // return in finally; capacity is bounded by packBBytesSpan.Length which
         // itself caps at kc*nc*elemSize.
-        byte[] packBArr = System.Buffers.ArrayPool<byte>.Shared.Rent(packBBytesSpan.Length);
+        //
+        // Sub-P (#406): over-rent by 31 bytes so we can slice the pack buffer at
+        // a 32-byte-aligned offset — required for Avx2Pack's non-temporal-store
+        // fast path. Without alignment the NT path silently falls back to
+        // regular cached stores (still correct, just no perf win).
+        const int PackBAlignment = 32;
+        byte[] packBArr = System.Buffers.ArrayPool<byte>.Shared.Rent(packBBytesSpan.Length + PackBAlignment - 1);
+        int packBAlignedOffset;
+        unsafe
+        {
+            fixed (byte* pbPtr = packBArr)
+            {
+                nuint addr = (nuint)pbPtr;
+                nuint mask = PackBAlignment - 1;
+                packBAlignedOffset = (int)((PackBAlignment - (uint)(addr & mask)) & mask);
+            }
+        }
         try
         {
 
@@ -420,7 +436,7 @@ internal static class PackBothStrategy
                         if (!tile.IsEmpty && tile.Length >= packedBByteCount)
                         {
                             tile.Slice(0, packedBByteCount)
-                                .CopyTo(packBArr.AsSpan(0, packedBByteCount));
+                                .CopyTo(packBArr.AsSpan(packBAlignedOffset, packedBByteCount));
                             packBFromPrePack = true;
                         }
                     }
@@ -429,7 +445,7 @@ internal static class PackBothStrategy
                         // Legacy single-panel: pre-packed B is already in byte[] form — copy
                         // into packBArr so the parallel lambda reads from a stable, capturable byte[].
                         packedB.PackedBuffer.AsSpan(0, packedBByteCount)
-                               .CopyTo(packBArr.AsSpan(0, packedBByteCount));
+                               .CopyTo(packBArr.AsSpan(packBAlignedOffset, packedBByteCount));
                         packBFromPrePack = true;
                     }
                 }
@@ -487,7 +503,7 @@ internal static class PackBothStrategy
                                 ReadOnlySpan<T> bSliceLocal = new ReadOnlySpan<T>((T*)bPtrInt + srcAdjustedOffset, bLen_cap - srcAdjustedOffset);
                                 int packedStripeOffElems = stripeStart * effectiveKc_packB_cap * nr;
                                 Span<T> packBSliceLocal = MemoryMarshal.Cast<byte, T>(
-                                    packBArr.AsSpan(packedStripeOffElems * elemSize,
+                                    packBArr.AsSpan(packBAlignedOffset + packedStripeOffElems * elemSize,
                                                     numStripesInChunk * effectiveKc_packB_cap * nr * elemSize));
                                 Avx2Pack.PackBStripeRange<T>(
                                     bSliceLocal, ldb, transB,
@@ -503,7 +519,7 @@ internal static class PackBothStrategy
                         // Pass a padded slice (packedBByteCount) so ScalarPack.PackB can
                         // zero-pad the partial tail stripe when effectiveNc % nr != 0.
                         ReadOnlySpan<T> bSlice = new ReadOnlySpan<T>((T*)bPtrInt + bSliceOffset, bLen - bSliceOffset);
-                        Span<T> packBTemp = MemoryMarshal.Cast<byte, T>(packBArr.AsSpan(0, packedBByteCount));
+                        Span<T> packBTemp = MemoryMarshal.Cast<byte, T>(packBArr.AsSpan(packBAlignedOffset, packedBByteCount));
                         Avx2Pack.PackB<T>(
                             b: bSlice, ldb, transB,
                             packed: packBTemp,
@@ -523,6 +539,7 @@ internal static class PackBothStrategy
                 int effectiveNc_cap = effectiveNc, effectiveKc_cap = effectiveKc;
                 int packedBByteCount_cap = packedBByteCount;
                 byte[] packBArr_cap = packBArr;
+                int packBAlignedOffset_cap = packBAlignedOffset;
 
                 CpuParallelSettings.ParallelForOrSerial(0, numIcBlocks, totalWork, icIdx =>
                 {
@@ -586,7 +603,7 @@ internal static class PackBothStrategy
                     // Use packedBByteCount_cap (Nr-padded size) so the tail stripe
                     // (packed by ScalarPack.PackB with zero-padding) is accessible.
                     Span<T> activePackB = MemoryMarshal.Cast<byte, T>(
-                        packBArr_cap.AsSpan(0, packedBByteCount_cap));
+                        packBArr_cap.AsSpan(packBAlignedOffset_cap, packedBByteCount_cap));
 
                     // ── Inner microkernel loop (jr, ir) ────────────────────────────────
                     for (int jr = 0; jr < effectiveNc_cap; jr += nr)

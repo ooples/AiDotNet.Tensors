@@ -197,19 +197,44 @@ internal static class Avx2Pack
         {
             // Nr=8: two Vector256<double> loads/stores per k-step (4 doubles each).
             int numStripes = nc / nr;
+            // Sub-P (#406): NT stores when the buffer is 32-byte aligned AND
+            // pack size > L2 threshold. Same rationale as the FP32 path.
+            long packBytes = (long)numStripes * kc * nr * sizeof(double);
+            const long NonTemporalThresholdBytes = 256 * 1024;
             fixed (double* bPtr = b)
             fixed (double* pPtr = packed)
             {
-                for (int stripe = 0; stripe < numStripes; stripe++)
+                bool packAligned = ((nuint)pPtr & 31) == 0;
+                bool useNonTemporal = packAligned && packBytes >= NonTemporalThresholdBytes;
+                if (useNonTemporal)
                 {
-                    int srcCol = stripe * nr;
-                    double* packedStripe = pPtr + stripe * kc * nr;
-                    for (int k = 0; k < kc; k++)
+                    for (int stripe = 0; stripe < numStripes; stripe++)
                     {
-                        Vector256<double> lo = Avx.LoadVector256(bPtr + k * ldb + srcCol);
-                        Vector256<double> hi = Avx.LoadVector256(bPtr + k * ldb + srcCol + 4);
-                        Avx.Store(packedStripe + k * nr, lo);
-                        Avx.Store(packedStripe + k * nr + 4, hi);
+                        int srcCol = stripe * nr;
+                        double* packedStripe = pPtr + stripe * kc * nr;
+                        for (int k = 0; k < kc; k++)
+                        {
+                            Vector256<double> lo = Avx.LoadVector256(bPtr + k * ldb + srcCol);
+                            Vector256<double> hi = Avx.LoadVector256(bPtr + k * ldb + srcCol + 4);
+                            Avx.StoreAlignedNonTemporal(packedStripe + k * nr, lo);
+                            Avx.StoreAlignedNonTemporal(packedStripe + k * nr + 4, hi);
+                        }
+                    }
+                    Sse.StoreFence();
+                }
+                else
+                {
+                    for (int stripe = 0; stripe < numStripes; stripe++)
+                    {
+                        int srcCol = stripe * nr;
+                        double* packedStripe = pPtr + stripe * kc * nr;
+                        for (int k = 0; k < kc; k++)
+                        {
+                            Vector256<double> lo = Avx.LoadVector256(bPtr + k * ldb + srcCol);
+                            Vector256<double> hi = Avx.LoadVector256(bPtr + k * ldb + srcCol + 4);
+                            Avx.Store(packedStripe + k * nr, lo);
+                            Avx.Store(packedStripe + k * nr + 4, hi);
+                        }
                     }
                 }
             }
@@ -315,17 +340,46 @@ internal static class Avx2Pack
         {
             // Nr=8: exactly one Vector256<float> (8 floats = 32 bytes) per k-step.
             int numStripes = nc / nr;
+            // Sub-P (#406): when the pack buffer is 32-byte aligned AND the total
+            // write size exceeds L2 (~256 KB threshold), use non-temporal stores
+            // to skip the write-allocate cache traffic. The microkernel reads from
+            // DRAM anyway when the pack is bigger than L2, so NT saves ~33% of
+            // pack-step memory bandwidth. Below the threshold, regular cached
+            // stores win (microkernel reads from L2/L1, fast).
+            long packBytes = (long)numStripes * kc * nr * sizeof(float);
+            const long NonTemporalThresholdBytes = 256 * 1024;
             fixed (float* bPtr = b)
             fixed (float* pPtr = packed)
             {
-                for (int stripe = 0; stripe < numStripes; stripe++)
+                bool packAligned = ((nuint)pPtr & 31) == 0;
+                bool useNonTemporal = packAligned && packBytes >= NonTemporalThresholdBytes;
+                if (useNonTemporal)
                 {
-                    int srcCol = stripe * nr;
-                    float* packedStripe = pPtr + stripe * kc * nr;
-                    for (int k = 0; k < kc; k++)
+                    for (int stripe = 0; stripe < numStripes; stripe++)
                     {
-                        Vector256<float> row = Avx.LoadVector256(bPtr + k * ldb + srcCol);
-                        Avx.Store(packedStripe + k * nr, row);
+                        int srcCol = stripe * nr;
+                        float* packedStripe = pPtr + stripe * kc * nr;
+                        for (int k = 0; k < kc; k++)
+                        {
+                            Vector256<float> row = Avx.LoadVector256(bPtr + k * ldb + srcCol);
+                            Avx.StoreAlignedNonTemporal(packedStripe + k * nr, row);
+                        }
+                    }
+                    // Sub-P: NT stores are weakly ordered — sfence ensures the
+                    // following microkernel reads see the packed data.
+                    Sse.StoreFence();
+                }
+                else
+                {
+                    for (int stripe = 0; stripe < numStripes; stripe++)
+                    {
+                        int srcCol = stripe * nr;
+                        float* packedStripe = pPtr + stripe * kc * nr;
+                        for (int k = 0; k < kc; k++)
+                        {
+                            Vector256<float> row = Avx.LoadVector256(bPtr + k * ldb + srcCol);
+                            Avx.Store(packedStripe + k * nr, row);
+                        }
                     }
                 }
             }
