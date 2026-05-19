@@ -4837,19 +4837,42 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         int kernelH, int kernelW,
         int strideH, int strideW, int padH, int padW)
     {
-        if (!_kernelCache.TryGetValue("maxpool2d_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: maxpool2d_backward");
-
         using var _ = PushContext();
         const int blockSize = 16;
-        uint gridX = (uint)((outWidth + blockSize - 1) / blockSize);
-        uint gridY = (uint)((outHeight + blockSize - 1) / blockSize);
-        uint gridZ = (uint)(batch * channels);
-
         IntPtr gradOutPtr = gradOutput.Handle;
         IntPtr indicesPtr = indices.Handle;
         IntPtr gradInPtr = gradInput.Handle;
         int outW = outWidth;
+
+        if (GpuDeterminism.IsActive)
+        {
+            // Issue #382: route to atomic-free variant.
+            if (!_kernelCache.TryGetValue("maxpool2d_backward_deterministic", out var kernelD))
+                throw new InvalidOperationException("CUDA kernel not found: maxpool2d_backward_deterministic");
+            void** argsD = stackalloc void*[8];
+            argsD[0] = &gradOutPtr;
+            argsD[1] = &indicesPtr;
+            argsD[2] = &gradInPtr;
+            argsD[3] = &batch;
+            argsD[4] = &channels;
+            argsD[5] = &inHeight;
+            argsD[6] = &inWidth;
+            argsD[7] = &outW;
+            // Deterministic variant grid: per (b, c, ih, iw) input cell.
+            uint gridDX = (uint)((inWidth + blockSize - 1) / blockSize);
+            uint gridDY = (uint)((inHeight + blockSize - 1) / blockSize);
+            uint gridDZ = (uint)(batch * channels);
+            LaunchKernel2D(kernelD, gridDX, gridDY, gridDZ, (uint)blockSize, (uint)blockSize, argsD);
+            return;
+        }
+
+        if (!_kernelCache.TryGetValue("maxpool2d_backward", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: maxpool2d_backward");
+
+        uint gridX = (uint)((outWidth + blockSize - 1) / blockSize);
+        uint gridY = (uint)((outHeight + blockSize - 1) / blockSize);
+        uint gridZ = (uint)(batch * channels);
+
         void** args = stackalloc void*[8];
         args[0] = &gradOutPtr;
         args[1] = &indicesPtr;
@@ -5019,11 +5042,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void GlobalMaxPool2DBackward(IGpuBuffer gradOutput, IGpuBuffer indices, IGpuBuffer gradInput, int batch, int channels, int height, int width)
     {
-        if (!_kernelCache.TryGetValue("global_maxpool2d_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: global_maxpool2d_backward");
-
         using var _ = PushContext();
-        // First zero out the gradient input
         Fill(gradInput, 0f, batch * channels * height * width);
 
         int totalOutputs = batch * channels;
@@ -5039,6 +5058,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         args[4] = &channels;
         args[5] = &height;
         args[6] = &width;
+
+        string kernelName = GpuDeterminism.IsActive
+            ? "global_maxpool2d_backward_deterministic"
+            : "global_maxpool2d_backward";
+        if (!_kernelCache.TryGetValue(kernelName, out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: " + kernelName);
+
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
@@ -5116,15 +5142,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         int inDepth, int inHeight, int inWidth,
         int outDepth, int outHeight, int outWidth)
     {
-        if (!_kernelCache.TryGetValue("maxpool3d_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: maxpool3d_backward");
-
         using var _ = PushContext();
         const int blockSize = 8;
-        uint gridX = (uint)((outWidth + blockSize - 1) / blockSize);
-        uint gridY = (uint)((outHeight + blockSize - 1) / blockSize);
-        uint gridZ = (uint)(batch * channels * outDepth);
-
         IntPtr gradOutPtr = gradOutput.Handle;
         IntPtr indicesPtr = indices.Handle;
         IntPtr gradInPtr = gradInput.Handle;
@@ -5142,6 +5161,24 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         args[9] = &outHeight;
         args[10] = &outWidth;
 
+        if (GpuDeterminism.IsActive)
+        {
+            // Issue #382: deterministic kernel parallelizes per input cell (iw, ih, b*c*id).
+            if (!_kernelCache.TryGetValue("maxpool3d_backward_deterministic", out var kernelD))
+                throw new InvalidOperationException("CUDA kernel not found: maxpool3d_backward_deterministic");
+            uint gridDX = (uint)((inWidth + blockSize - 1) / blockSize);
+            uint gridDY = (uint)((inHeight + blockSize - 1) / blockSize);
+            uint gridDZ = (uint)(batch * channels * inDepth);
+            LaunchKernel2D(kernelD, gridDX, gridDY, gridDZ, (uint)blockSize, (uint)blockSize, args);
+            return;
+        }
+
+        if (!_kernelCache.TryGetValue("maxpool3d_backward", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: maxpool3d_backward");
+
+        uint gridX = (uint)((outWidth + blockSize - 1) / blockSize);
+        uint gridY = (uint)((outHeight + blockSize - 1) / blockSize);
+        uint gridZ = (uint)(batch * channels * outDepth);
         LaunchKernel2D(kernel, gridX, gridY, gridZ, (uint)blockSize, (uint)blockSize, args);
     }
 
@@ -5186,21 +5223,44 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         int inDepth, int inHeight, int inWidth,
         int scaleD, int scaleH, int scaleW)
     {
+        using var _ = PushContext();
+        const int blockSize = 8;
+        IntPtr gradOutPtr = gradOutput.Handle;
+        IntPtr gradInPtr = gradInput.Handle;
+
+        if (GpuDeterminism.IsActive)
+        {
+            // Issue #382: per-input-cell scan of scale-cube output cells.
+            if (!_kernelCache.TryGetValue("nearest_upsample3d_backward_deterministic", out var kernelD))
+                throw new InvalidOperationException("CUDA kernel not found: nearest_upsample3d_backward_deterministic");
+            void** argsD = stackalloc void*[10];
+            argsD[0] = &gradOutPtr;
+            argsD[1] = &gradInPtr;
+            argsD[2] = &batch;
+            argsD[3] = &channels;
+            argsD[4] = &inDepth;
+            argsD[5] = &inHeight;
+            argsD[6] = &inWidth;
+            argsD[7] = &scaleD;
+            argsD[8] = &scaleH;
+            argsD[9] = &scaleW;
+            uint gridDX = (uint)((inWidth + blockSize - 1) / blockSize);
+            uint gridDY = (uint)((inHeight + blockSize - 1) / blockSize);
+            uint gridDZ = (uint)(batch * channels * inDepth);
+            LaunchKernel2D(kernelD, gridDX, gridDY, gridDZ, (uint)blockSize, (uint)blockSize, argsD);
+            return;
+        }
+
         if (!_kernelCache.TryGetValue("nearest_upsample3d_backward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: nearest_upsample3d_backward");
 
-        using var _ = PushContext();
         int outDepth = inDepth * scaleD;
         int outHeight = inHeight * scaleH;
         int outWidth = inWidth * scaleW;
 
-        const int blockSize = 8;
         uint gridX = (uint)((outWidth + blockSize - 1) / blockSize);
         uint gridY = (uint)((outHeight + blockSize - 1) / blockSize);
         uint gridZ = (uint)(batch * channels * outDepth);
-
-        IntPtr gradOutPtr = gradOutput.Handle;
-        IntPtr gradInPtr = gradInput.Handle;
 
         void** args = stackalloc void*[10];
         args[0] = &gradOutPtr;
@@ -7402,17 +7462,33 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         // Initialize output and counts to zero before accumulation
         Fill(output, 0f, outputSize * featureSize);
         Fill(counts, 0f, outputSize);
-        // Step 1: scatter-add and count
-        if (!_kernelCache.TryGetValue("scatter_mean", out var scatterKernel))
-            throw new InvalidOperationException("CUDA kernel not found: scatter_mean");
-        uint grid1 = (uint)((sourceSize + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr sPtr = source.Handle, idxPtr = indices.Handle, oPtr = output.Handle, cPtr = counts.Handle;
-        void** args1 = stackalloc void*[6];
-        args1[0] = &sPtr; args1[1] = &idxPtr; args1[2] = &oPtr; args1[3] = &cPtr;
-        args1[4] = &sourceSize; args1[5] = &featureSize;
-        LaunchKernel(scatterKernel, grid1, DefaultBlockSize, args1);
 
-        // Step 2: divide by counts
+        if (GpuDeterminism.IsActive)
+        {
+            // Issue #382: route to atomic-free variant — per (dstRow, col) output cell.
+            if (!_kernelCache.TryGetValue("scatter_mean_activation_deterministic", out var kernelD))
+                throw new InvalidOperationException("CUDA kernel not found: scatter_mean_activation_deterministic");
+            void** argsD = stackalloc void*[7];
+            argsD[0] = &sPtr; argsD[1] = &idxPtr; argsD[2] = &oPtr; argsD[3] = &cPtr;
+            argsD[4] = &sourceSize; argsD[5] = &outputSize; argsD[6] = &featureSize;
+            const int blockSize = 16;
+            uint gridDX = (uint)((featureSize + blockSize - 1) / blockSize);
+            uint gridDY = (uint)((outputSize + blockSize - 1) / blockSize);
+            LaunchKernel2D(kernelD, gridDX, gridDY, (uint)blockSize, (uint)blockSize, argsD);
+        }
+        else
+        {
+            if (!_kernelCache.TryGetValue("scatter_mean", out var scatterKernel))
+                throw new InvalidOperationException("CUDA kernel not found: scatter_mean");
+            uint grid1 = (uint)((sourceSize + DefaultBlockSize - 1) / DefaultBlockSize);
+            void** args1 = stackalloc void*[6];
+            args1[0] = &sPtr; args1[1] = &idxPtr; args1[2] = &oPtr; args1[3] = &cPtr;
+            args1[4] = &sourceSize; args1[5] = &featureSize;
+            LaunchKernel(scatterKernel, grid1, DefaultBlockSize, args1);
+        }
+
+        // Step 2: divide by counts (deterministic by construction — one thread per cell)
         if (!_kernelCache.TryGetValue("scatter_mean_divide", out var divideKernel))
             throw new InvalidOperationException("CUDA kernel not found: scatter_mean_divide");
         uint grid2 = (uint)((outputSize + DefaultBlockSize - 1) / DefaultBlockSize);
