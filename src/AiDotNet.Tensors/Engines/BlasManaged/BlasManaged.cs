@@ -43,6 +43,21 @@ public static class BlasManaged
     public static bool PreferManaged { get; set; } = false;
 
     /// <summary>
+    /// Sub-F3 (#374 follow-up): when true, <see cref="Helpers.BlasProvider.TryGemmEx"/>
+    /// consults <see cref="PrefersManagedCache"/> on each call. The cache measures
+    /// both managed and native paths once per (shape, hardware) tuple and routes
+    /// future calls to the winner.
+    ///
+    /// <para>
+    /// Defaults to <see langword="false"/> (no autotune routing).
+    /// <see cref="PreferManaged"/> takes precedence — when both are true,
+    /// every call routes managed regardless of autotune. This lets supply-chain
+    /// deployments override autotune (forcing managed dispatch unconditionally).
+    /// </para>
+    /// </summary>
+    public static bool AutotuneRouting { get; set; } = false;
+
+    /// <summary>
     /// Computes C = op(A) · op(B), where op(X) is X or X^T.
     ///
     /// <para>

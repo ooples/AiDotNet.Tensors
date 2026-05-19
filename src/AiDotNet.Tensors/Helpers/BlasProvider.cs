@@ -1103,6 +1103,20 @@ internal static class BlasProvider
                 m, n, k);
             return true;
         }
+        // Sub-F3 (#374 follow-up): per-shape autotune routing.
+        // BypassAutotune is a ThreadStatic flag the PrefersManagedCache flips
+        // during its measurement probe so the nested call goes to native.
+        if (Engines.BlasManaged.BlasManaged.AutotuneRouting
+            && !Engines.BlasManaged.PrefersManagedCache.BypassAutotune
+            && Engines.BlasManaged.PrefersManagedCache.PrefersManaged(m, n, k, transA, transB, typeof(float)))
+        {
+            Engines.BlasManaged.BlasManaged.Gemm<float>(
+                new ReadOnlySpan<float>(a, aOffset, a.Length - aOffset), lda, transA,
+                new ReadOnlySpan<float>(b, bOffset, b.Length - bOffset), ldb, transB,
+                new Span<float>(c, cOffset, c.Length - cOffset), ldc,
+                m, n, k);
+            return true;
+        }
         // Phase G.1: when AIDOTNET_BLAS_PROVIDER=mkl, the static-ctor
         // resolver redirects libopenblas → MklImports; the call below
         // then dispatches into MKL's cblas_sgemm transparently.
@@ -1139,6 +1153,17 @@ internal static class BlasProvider
     {
         ShapeLogHook?.Invoke(m, n, k, transA, transB, typeof(double));
         if (Engines.BlasManaged.BlasManaged.PreferManaged)
+        {
+            Engines.BlasManaged.BlasManaged.Gemm<double>(
+                new ReadOnlySpan<double>(a, aOffset, a.Length - aOffset), lda, transA,
+                new ReadOnlySpan<double>(b, bOffset, b.Length - bOffset), ldb, transB,
+                new Span<double>(c, cOffset, c.Length - cOffset), ldc,
+                m, n, k);
+            return true;
+        }
+        if (Engines.BlasManaged.BlasManaged.AutotuneRouting
+            && !Engines.BlasManaged.PrefersManagedCache.BypassAutotune
+            && Engines.BlasManaged.PrefersManagedCache.PrefersManaged(m, n, k, transA, transB, typeof(double)))
         {
             Engines.BlasManaged.BlasManaged.Gemm<double>(
                 new ReadOnlySpan<double>(a, aOffset, a.Length - aOffset), lda, transA,
