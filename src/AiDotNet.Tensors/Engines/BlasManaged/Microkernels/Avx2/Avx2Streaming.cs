@@ -84,8 +84,15 @@ internal static class Avx2Streaming
     }
 
     /// <summary>
-    /// FP32 mirror of <see cref="RunFp64"/>. Uses Vector256&lt;float&gt; (8 lanes)
-    /// and processes 8-col blocks per inner loop iteration.
+    /// FP32 mirror of <see cref="RunFp64"/>. Uses Vector256&lt;float&gt; (8 lanes).
+    ///
+    /// <para>
+    /// <b>Sub-D6 (#372 follow-up):</b> processes 4 col-blocks (32 cols) per inner
+    /// iteration using 4 accumulators in parallel. The FMA latency (4-5 cycles on
+    /// Zen3) is hidden by the independent accumulators — peak throughput becomes
+    /// ~1 FMA/cycle instead of 1 FMA per 4 cycles. Per-iter K-loop cost is the
+    /// same (4 FMAs + 4 B-loads + 1 broadcast), but pipelined.
+    /// </para>
     /// </summary>
     public static unsafe void RunFp32(
         ReadOnlySpan<float> a, int lda, bool transA,
@@ -102,7 +109,11 @@ internal static class Avx2Streaming
             return;
         }
 
-        int nBlocks = n / 8;
+        // Process 32 cols per outer iter using 4 Vector256<float> accumulators.
+        // Each iter advances j by 32.
+        int nBig = (n / 32) * 32;  // largest multiple of 32 ≤ n
+        int nBlocks = n / 8;        // 8-col blocks for the [nBig, n & ~7) tail
+        int nBig8 = nBig / 8;       // already covered by the big loop
 
         fixed (float* aPtr = a)
         fixed (float* bPtr = b)
@@ -110,7 +121,34 @@ internal static class Avx2Streaming
         {
             for (int i = 0; i < m; i++)
             {
-                for (int jb = 0; jb < nBlocks; jb++)
+                // ── 4-acc SIMD path: 32 cols per iter ──────────────────────────
+                for (int jStart = 0; jStart < nBig; jStart += 32)
+                {
+                    Vector256<float> acc0 = Avx.LoadVector256(cPtr + i * ldc + jStart + 0);
+                    Vector256<float> acc1 = Avx.LoadVector256(cPtr + i * ldc + jStart + 8);
+                    Vector256<float> acc2 = Avx.LoadVector256(cPtr + i * ldc + jStart + 16);
+                    Vector256<float> acc3 = Avx.LoadVector256(cPtr + i * ldc + jStart + 24);
+                    for (int kk = 0; kk < k; kk++)
+                    {
+                        float aval = transA ? aPtr[kk * lda + i] : aPtr[i * lda + kk];
+                        Vector256<float> aVec = Vector256.Create(aval);
+                        float* bRow = bPtr + kk * ldb + jStart;
+                        Vector256<float> b0 = Avx.LoadVector256(bRow + 0);
+                        Vector256<float> b1 = Avx.LoadVector256(bRow + 8);
+                        Vector256<float> b2 = Avx.LoadVector256(bRow + 16);
+                        Vector256<float> b3 = Avx.LoadVector256(bRow + 24);
+                        acc0 = Fma.MultiplyAdd(aVec, b0, acc0);
+                        acc1 = Fma.MultiplyAdd(aVec, b1, acc1);
+                        acc2 = Fma.MultiplyAdd(aVec, b2, acc2);
+                        acc3 = Fma.MultiplyAdd(aVec, b3, acc3);
+                    }
+                    Avx.Store(cPtr + i * ldc + jStart + 0, acc0);
+                    Avx.Store(cPtr + i * ldc + jStart + 8, acc1);
+                    Avx.Store(cPtr + i * ldc + jStart + 16, acc2);
+                    Avx.Store(cPtr + i * ldc + jStart + 24, acc3);
+                }
+                // ── 1-acc SIMD path: remaining 8-col blocks in [nBig, nBlocks*8) ──
+                for (int jb = nBig8; jb < nBlocks; jb++)
                 {
                     int jStart = jb * 8;
                     Vector256<float> acc = Avx.LoadVector256(cPtr + i * ldc + jStart);
@@ -123,6 +161,7 @@ internal static class Avx2Streaming
                     }
                     Avx.Store(cPtr + i * ldc + jStart, acc);
                 }
+                // ── Scalar n tail (n % 8) ──────────────────────────────────────
                 for (int j = nBlocks * 8; j < n; j++)
                 {
                     float sum = cPtr[i * ldc + j];
