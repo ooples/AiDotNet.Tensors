@@ -11258,6 +11258,40 @@ public partial class CpuEngine : ITensorLevelEngine
             return result;
         }
 
+        // Sub-E (#373): auto-adopt pre-packed weight when B is registered in
+        // FrozenWeightRegistry. Inference paths that register the model's
+        // weights once (e.g., FrozenWeightRegistry.Register(layer.Weight) at
+        // model-load time) get pack-B amortization on every TensorMatMul call
+        // through this method — no API surface change at the call sites.
+        if (typeof(T) == typeof(float) || typeof(T) == typeof(double))
+        {
+            var handle = Engines.BlasManaged.FrozenWeightRegistry.TryGetHandle(b);
+            if (handle != null && Engines.BlasManaged.WeightPackCache.IsCacheCurrent(handle)
+                && a.IsContiguous && b.IsContiguous)
+            {
+                if (typeof(T) == typeof(float))
+                {
+                    var aArr = (float[])(object)a.GetDataArray();
+                    var bArr = (float[])(object)b.GetDataArray();
+                    var rArr = (float[])(object)result.GetDataArray();
+                    var opts = new Engines.BlasManaged.BlasOptions<float> { PackedB = handle };
+                    Engines.BlasManaged.BlasManaged.Gemm<float>(
+                        aArr, n, false, bArr, p, false, rArr, p, m, p, n, opts);
+                    return result;
+                }
+                else
+                {
+                    var aArr = (double[])(object)a.GetDataArray();
+                    var bArr = (double[])(object)b.GetDataArray();
+                    var rArr = (double[])(object)result.GetDataArray();
+                    var opts = new Engines.BlasManaged.BlasOptions<double> { PackedB = handle };
+                    Engines.BlasManaged.BlasManaged.Gemm<double>(
+                        aArr, n, false, bArr, p, false, rArr, p, m, p, n, opts);
+                    return result;
+                }
+            }
+        }
+
         // Try BLAS-accelerated path for float/double tensors
         if (MatrixMultiplyHelper.TryGemm(a.Data, 0, b.Data, 0, result.Data, 0, m, n, p))
         {

@@ -1,0 +1,149 @@
+using System;
+using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.BlasManaged;
+using AiDotNet.Tensors.LinearAlgebra;
+using Xunit;
+using Xunit.Abstractions;
+using BlasManagedLib = AiDotNet.Tensors.Engines.BlasManaged.BlasManaged;
+
+namespace AiDotNet.Tensors.Tests.Engines.BlasManaged;
+
+/// <summary>
+/// Sub-E (#373) end-to-end adoption — verify that registering a frozen weight
+/// via <see cref="FrozenWeightRegistry"/> causes <c>CpuEngine.TensorMatMul</c>
+/// to auto-consume the pre-pack handle without any caller-side API change.
+/// This is the "real adoption" wiring; <c>TensorMatMul2DWithPrePackedB</c> is
+/// the opt-in escape hatch for callers that prefer explicit handles.
+/// </summary>
+[Collection("BlasManaged-Stats-Serial")]
+public class FrozenWeightRegistryTest
+{
+    private readonly ITestOutputHelper _output;
+
+    public FrozenWeightRegistryTest(ITestOutputHelper output)
+    {
+        _output = output;
+    }
+
+    [Fact]
+    public void Registered_Weight_Causes_TensorMatMul_To_Consume_PrePack()
+    {
+        const int M = 32, K = 128, N = 64;
+        var rng = new Random(42);
+        var a = new float[M * K];
+        var b = new float[K * N];
+        for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < b.Length; i++) b[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        var refResult = new float[M * N];
+        for (int i = 0; i < M; i++)
+            for (int j = 0; j < N; j++)
+            {
+                float sum = 0;
+                for (int kk = 0; kk < K; kk++) sum += a[i * K + kk] * b[kk * N + j];
+                refResult[i * N + j] = sum;
+            }
+
+        var aT = new Tensor<float>(a, new[] { M, K });
+        var bT = new Tensor<float>(b, new[] { K, N });
+        var engine = new CpuEngine();
+
+        // Adoption is automatic — no engine API change. Register once, every
+        // future TensorMatMul with bT as B operand consumes the pre-pack.
+        BlasManagedLib.ClearCaches();
+        FrozenWeightRegistry.Register(bT);
+        try
+        {
+            var statsBefore = BlasManagedLib.GetStats();
+            var result = engine.TensorMatMul(aT, bT);
+            var statsAfter = BlasManagedLib.GetStats();
+
+            // Correctness
+            double maxDelta = 0;
+            for (int i = 0; i < refResult.Length; i++)
+                maxDelta = Math.Max(maxDelta, Math.Abs(refResult[i] - result.Data.Span[i]));
+            Assert.True(maxDelta < 1e-3,
+                $"Registered-weight TensorMatMul produced drift {maxDelta:G6} > 1e-3");
+
+            // The cache-hit counter MUST have ticked. If it didn't, the
+            // adoption isn't wired — TensorMatMul went through the regular
+            // BLAS path that doesn't consume the handle.
+            long hits = statsAfter.PackCacheHits - statsBefore.PackCacheHits;
+            Assert.True(hits > 0,
+                $"Expected PackCacheHits to increase after TensorMatMul with registered weight; got {hits}");
+            _output.WriteLine($"PackCacheHits delta: {hits}");
+        }
+        finally
+        {
+            FrozenWeightRegistry.Unregister(bT);
+        }
+    }
+
+    [Fact]
+    public void Unregistered_Weight_Skips_PrePack_Consume()
+    {
+        const int M = 32, K = 128, N = 64;
+        var rng = new Random(11);
+        var a = new float[M * K];
+        var b = new float[K * N];
+        for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < b.Length; i++) b[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        var aT = new Tensor<float>(a, new[] { M, K });
+        var bT = new Tensor<float>(b, new[] { K, N });
+        var engine = new CpuEngine();
+
+        BlasManagedLib.ClearCaches();
+        var statsBefore = BlasManagedLib.GetStats();
+        var _ = engine.TensorMatMul(aT, bT);  // not registered
+        var statsAfter = BlasManagedLib.GetStats();
+
+        // Without registration the path doesn't allocate a handle and doesn't
+        // consume one, so both counters stay at 0.
+        Assert.Equal(0, statsAfter.PackCacheHits - statsBefore.PackCacheHits);
+        Assert.Equal(0, statsAfter.PackCacheMisses - statsBefore.PackCacheMisses);
+    }
+
+    [Fact]
+    public void MarkDirty_Through_Registry_Forces_RePack()
+    {
+        const int M = 32, K = 64, N = 64;
+        var rng = new Random(99);
+        var a = new float[M * K];
+        var b = new float[K * N];
+        for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < b.Length; i++) b[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        var aT = new Tensor<float>(a, new[] { M, K });
+        var bT = new Tensor<float>(b, new[] { K, N });
+        var engine = new CpuEngine();
+
+        BlasManagedLib.ClearCaches();
+        FrozenWeightRegistry.Register(bT);
+        try
+        {
+            // Warm: first TensorMatMul ticks the hit counter.
+            _ = engine.TensorMatMul(aT, bT);
+            var statsAfterWarm = BlasManagedLib.GetStats();
+
+            // Mutate weight in place and signal dirty.
+            for (int i = 0; i < b.Length; i++) b[i] *= 2.0f;
+            FrozenWeightRegistry.MarkDirty(bT);
+
+            // Next call should fall through to the non-pre-pack path because
+            // the handle's IsCacheCurrent check fails — hit counter does NOT
+            // increase further (note: it might tick PackCacheMisses inside
+            // the BlasManaged.Gemm consume sites if Gemm runs, but the
+            // CpuEngine wiring checks IsCacheCurrent at the entry guard and
+            // skips the managed path entirely).
+            _ = engine.TensorMatMul(aT, bT);
+            var statsAfterDirty = BlasManagedLib.GetStats();
+
+            Assert.Equal(statsAfterWarm.PackCacheHits, statsAfterDirty.PackCacheHits);
+        }
+        finally
+        {
+            FrozenWeightRegistry.Unregister(bT);
+        }
+    }
+}
