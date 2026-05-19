@@ -373,8 +373,17 @@ public sealed partial class MetalBackend : IParity210Backend
     {
         ThrowIfDisposed();
         RequireMetal3(output, indicesInt32, source, out var oBuf, out var idxBuf, out var sBuf);
-        int total = outerSize * idxLen * innerSize;
-        var pipeline = GetParity210Pipeline("parity210_index_add");
+
+        // Issue #382: route to atomic-free variant when GpuDeterminism.IsActive.
+        // Atomic variant: total = outerSize * idxLen * innerSize (one thread per
+        // (outer, i, inner) of source). Deterministic variant: total = outerSize
+        // * dstAxis * innerSize (one thread per output cell scans idxLen).
+        bool deterministic = GpuDeterminism.IsActive;
+        string kernelName = deterministic ? "parity210_index_add_deterministic" : "parity210_index_add";
+        int total = deterministic
+            ? outerSize * dstAxis * innerSize
+            : outerSize * idxLen * innerSize;
+        var pipeline = GetParity210Pipeline(kernelName);
         var (tgr, tpg) = pipeline.Calculate1DDispatch(total);
         using var encoder = _commandQueue.CreateScopedComputeEncoder();
         encoder.SetPipelineState(pipeline.Handle);
