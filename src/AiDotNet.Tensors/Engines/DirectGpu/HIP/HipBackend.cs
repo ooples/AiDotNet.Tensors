@@ -7794,29 +7794,30 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         const int blockSize = 256;
         int gridSize = (size + blockSize - 1) / blockSize;
 
-        // Step 1: Compute mean via GPU reduction
+        // Step 1: Compute mean via GPU reduction.
+        // Issue #382: deterministic variant is single-block strided reduce and writes
+        // mean/size directly; atomic variant writes raw sum (caller divides).
         float mean;
-        if (_kernelCache.TryGetValue("reduce_mean_kernel", out var meanKernel))
+        string meanKernelName = GpuDeterminism.IsActive ? "reduce_mean_kernel_deterministic" : "reduce_mean_kernel";
+        if (_kernelCache.TryGetValue(meanKernelName, out var meanKernel))
         {
             var zeroData = new float[1];
             using var meanBuffer = AllocateBuffer(zeroData);
 
-                {
-                IntPtr _p0 = input.Handle;
-                IntPtr _p1 = meanBuffer.Handle;
-                void** meanArgs = stackalloc void*[3];
-                meanArgs[0] = &_p0;
-                meanArgs[1] = &_p1;
-                meanArgs[2] = &size;
+            IntPtr _p0 = input.Handle;
+            IntPtr _p1 = meanBuffer.Handle;
+            void** meanArgs = stackalloc void*[3];
+            meanArgs[0] = &_p0;
+            meanArgs[1] = &_p1;
+            meanArgs[2] = &size;
 
-
-                uint sharedBytes = (uint)(blockSize * sizeof(float));
-                LaunchKernelWithSharedMem(meanKernel, (uint)gridSize, (uint)blockSize, sharedBytes, meanArgs);
-                Synchronize();
-                }
+            uint sharedBytes = (uint)(blockSize * sizeof(float));
+            uint launchGrid = GpuDeterminism.IsActive ? 1u : (uint)gridSize;
+            LaunchKernelWithSharedMem(meanKernel, launchGrid, (uint)blockSize, sharedBytes, meanArgs);
+            Synchronize();
 
             float[] meanResult = DownloadBuffer(meanBuffer);
-            mean = meanResult[0] / size;
+            mean = GpuDeterminism.IsActive ? meanResult[0] : (meanResult[0] / size);
         }
         else
         {
@@ -7825,25 +7826,24 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
         // Step 2: Compute variance via GPU reduction
         float variance;
-        if (_kernelCache.TryGetValue("reduce_variance_kernel", out var varKernel))
+        string varKernelName = GpuDeterminism.IsActive ? "reduce_variance_kernel_deterministic" : "reduce_variance_kernel";
+        if (_kernelCache.TryGetValue(varKernelName, out var varKernel))
         {
             var zeroData = new float[1];
             using var varianceBuffer = AllocateBuffer(zeroData);
 
-                {
-                IntPtr _p0 = input.Handle;
-                IntPtr _p1 = varianceBuffer.Handle;
-                void** varArgs = stackalloc void*[4];
-                varArgs[0] = &_p0;
-                varArgs[1] = &_p1;
-                varArgs[2] = &mean;
-                varArgs[3] = &size;
+            IntPtr _p0 = input.Handle;
+            IntPtr _p1 = varianceBuffer.Handle;
+            void** varArgs = stackalloc void*[4];
+            varArgs[0] = &_p0;
+            varArgs[1] = &_p1;
+            varArgs[2] = &mean;
+            varArgs[3] = &size;
 
-
-                uint sharedBytes = (uint)(blockSize * sizeof(float));
-                LaunchKernelWithSharedMem(varKernel, (uint)gridSize, (uint)blockSize, sharedBytes, varArgs);
-                Synchronize();
-                }
+            uint sharedBytes = (uint)(blockSize * sizeof(float));
+            uint launchGrid = GpuDeterminism.IsActive ? 1u : (uint)gridSize;
+            LaunchKernelWithSharedMem(varKernel, launchGrid, (uint)blockSize, sharedBytes, varArgs);
+            Synchronize();
 
             float[] varResult = DownloadBuffer(varianceBuffer);
             variance = varResult[0] / size;
