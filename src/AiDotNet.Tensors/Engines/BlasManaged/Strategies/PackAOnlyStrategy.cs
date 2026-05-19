@@ -189,7 +189,7 @@ internal static class PackAOnlyStrategy
                 if (!packAFromPrePack)
                 {
                     int aSliceOffset = transA ? pc * lda + ic : ic * lda + pc;
-                    ScalarPack.PackA<T>(
+                    Avx2Pack.PackA<T>(
                         a: a.Slice(aSliceOffset), lda, transA,
                         packed: activePackA.Slice(0, effectiveMc * effectiveKc),
                         mc: effectiveMc, kc: effectiveKc, mr);

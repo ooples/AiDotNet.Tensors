@@ -385,4 +385,68 @@ internal static class Avx2Pack
         Span<float> packed, int nc, int kc, int nr) =>
         ScalarPack.PackB<float>(b, ldb, transB, packed, nc, kc, nr);
 #endif
+
+    /// <summary>
+    /// Sub-D5 (#372 follow-up): generic dispatcher matching <see cref="ScalarPack.PackA{T}"/>.
+    /// Routes to the AVX2 SIMD path when supported AND dtype matches; falls back
+    /// to <see cref="ScalarPack.PackA{T}"/> otherwise. Drop-in replacement.
+    /// </summary>
+    public static void PackA<T>(
+        ReadOnlySpan<T> a, int lda, bool transA,
+        Span<T> packed, int mc, int kc, int mr) where T : unmanaged
+    {
+        if (IsSupported)
+        {
+            if (typeof(T) == typeof(float))
+            {
+                PackA_Fp32(
+                    System.Runtime.InteropServices.MemoryMarshal.Cast<T, float>(a),
+                    lda, transA,
+                    System.Runtime.InteropServices.MemoryMarshal.Cast<T, float>(packed),
+                    mc, kc, mr);
+                return;
+            }
+            if (typeof(T) == typeof(double))
+            {
+                PackA_Fp64(
+                    System.Runtime.InteropServices.MemoryMarshal.Cast<T, double>(a),
+                    lda, transA,
+                    System.Runtime.InteropServices.MemoryMarshal.Cast<T, double>(packed),
+                    mc, kc, mr);
+                return;
+            }
+        }
+        ScalarPack.PackA<T>(a, lda, transA, packed, mc, kc, mr);
+    }
+
+    /// <summary>
+    /// Sub-D5 (#372 follow-up): generic dispatcher matching <see cref="ScalarPack.PackB{T}"/>.
+    /// </summary>
+    public static void PackB<T>(
+        ReadOnlySpan<T> b, int ldb, bool transB,
+        Span<T> packed, int nc, int kc, int nr) where T : unmanaged
+    {
+        if (IsSupported)
+        {
+            if (typeof(T) == typeof(float))
+            {
+                PackB_Fp32(
+                    System.Runtime.InteropServices.MemoryMarshal.Cast<T, float>(b),
+                    ldb, transB,
+                    System.Runtime.InteropServices.MemoryMarshal.Cast<T, float>(packed),
+                    nc, kc, nr);
+                return;
+            }
+            if (typeof(T) == typeof(double))
+            {
+                PackB_Fp64(
+                    System.Runtime.InteropServices.MemoryMarshal.Cast<T, double>(b),
+                    ldb, transB,
+                    System.Runtime.InteropServices.MemoryMarshal.Cast<T, double>(packed),
+                    nc, kc, nr);
+                return;
+            }
+        }
+        ScalarPack.PackB<T>(b, ldb, transB, packed, nc, kc, nr);
+    }
 }

@@ -194,7 +194,7 @@ internal static class PackBothStrategy
                     // Pass a padded slice (packedBElemCount) so ScalarPack.PackB can
                     // zero-pad the partial tail stripe when effectiveNc % nr != 0.
                     int bSliceOffset = transB ? jc * ldb + pc : pc * ldb + jc;
-                    ScalarPack.PackB<T>(
+                    Avx2Pack.PackB<T>(
                         b: b.Slice(bSliceOffset), ldb, transB,
                         packed: activePackB.Slice(0, packedBElemCount),
                         nc: effectiveNc, kc: effectiveKc, nr);
@@ -223,7 +223,7 @@ internal static class PackBothStrategy
                         // transA=false: A is [M, K] row-major, panel starts at a[ic * lda + pc].
                         // transA=true:  A is [K, M] row-major, panel starts at a[pc * lda + ic].
                         int aSliceOffset = transA ? pc * lda + ic : ic * lda + pc;
-                        ScalarPack.PackA<T>(
+                        Avx2Pack.PackA<T>(
                             a: a.Slice(aSliceOffset), lda, transA,
                             packed: activePackA.Slice(0, effectiveMc * effectiveKc),
                             mc: effectiveMc, kc: effectiveKc, mr);
@@ -356,7 +356,7 @@ internal static class PackBothStrategy
                     int bSliceOffset = transB ? jc * ldb + pc : pc * ldb + jc;
                     ReadOnlySpan<T> bSlice = new ReadOnlySpan<T>((T*)bPtrInt + bSliceOffset, bLen - bSliceOffset);
                     Span<T> packBTemp = MemoryMarshal.Cast<byte, T>(packBArr.AsSpan(0, packedBByteCount));
-                    ScalarPack.PackB<T>(
+                    Avx2Pack.PackB<T>(
                         b: bSlice, ldb, transB,
                         packed: packBTemp,
                         nc: effectiveNc, kc: effectiveKc, nr);
@@ -403,7 +403,7 @@ internal static class PackBothStrategy
 
                         int aSliceOffset = transA ? pc_cap * lda + ic : ic * lda + pc_cap;
                         ReadOnlySpan<T> aSlice = new ReadOnlySpan<T>((T*)aPtrInt + aSliceOffset, aLen - aSliceOffset);
-                        ScalarPack.PackA<T>(
+                        Avx2Pack.PackA<T>(
                             a: aSlice, lda, transA,
                             packed: activePackA,
                             mc: effectiveMc, kc: effectiveKc_cap, mr);
