@@ -50,8 +50,12 @@ public class FrozenWeightRegistryTest
 
         // Adoption is automatic — no engine API change. Register once, every
         // future TensorMatMul with bT as B operand consumes the pre-pack.
+        // Force managed routing for this test — by default native BLAS wins
+        // on most shapes, in which case the registry consult is bypassed.
         BlasManagedLib.ClearCaches();
         FrozenWeightRegistry.Register(bT);
+        bool prevPreferManaged = BlasManagedLib.PreferManaged;
+        BlasManagedLib.PreferManaged = true;
         try
         {
             var statsBefore = BlasManagedLib.GetStats();
@@ -75,6 +79,7 @@ public class FrozenWeightRegistryTest
         }
         finally
         {
+            BlasManagedLib.PreferManaged = prevPreferManaged;
             FrozenWeightRegistry.Unregister(bT);
         }
     }
@@ -138,6 +143,8 @@ public class FrozenWeightRegistryTest
 
         BlasManagedLib.ClearCaches();
         FrozenWeightRegistry.Register(bT);
+        bool prevPreferManaged = BlasManagedLib.PreferManaged;
+        BlasManagedLib.PreferManaged = true;
         try
         {
             var statsBefore = BlasManagedLib.GetStats();
@@ -154,6 +161,64 @@ public class FrozenWeightRegistryTest
             Assert.True(hits > 0,
                 $"ND × 2D path should fire registry adoption; PackCacheHits delta={hits}");
             _output.WriteLine($"ND × 2D PackCacheHits delta: {hits}");
+        }
+        finally
+        {
+            BlasManagedLib.PreferManaged = prevPreferManaged;
+            FrozenWeightRegistry.Unregister(bT);
+        }
+    }
+
+    [Fact]
+    public void Registered_FFN_128x768x768_Inference_Loop_Faster_Than_Unregistered()
+    {
+        // End-to-end inference replay at the issue #373 spec shape via the
+        // public TensorMatMul API. Models a transformer FFN layer being called
+        // many times with a stable weight (the "batched inference" scenario
+        // the spec named). Measures wall-clock of the loop with vs. without
+        // registry adoption.
+        const int M = 128, N = 768, K = 768;
+        const int iterations = 60;
+        const int warmup = 8;
+        var rng = new Random(317);
+        var a = new float[M * K];
+        var b = new float[K * N];
+        for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < b.Length; i++) b[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        var aT = new Tensor<float>(a, new[] { M, K });
+        var bT = new Tensor<float>(b, new[] { K, N });
+        var engine = new CpuEngine();
+
+        // Unregistered baseline.
+        for (int w = 0; w < warmup; w++) _ = engine.TensorMatMul(aT, bT);
+        var sw1 = System.Diagnostics.Stopwatch.StartNew();
+        for (int it = 0; it < iterations; it++) _ = engine.TensorMatMul(aT, bT);
+        sw1.Stop();
+        double unregUs = (sw1.Elapsed.TotalMilliseconds * 1000.0) / iterations;
+
+        // Registered: same call, registry consults the handle automatically.
+        FrozenWeightRegistry.Register(bT);
+        try
+        {
+            for (int w = 0; w < warmup; w++) _ = engine.TensorMatMul(aT, bT);
+            var sw2 = System.Diagnostics.Stopwatch.StartNew();
+            for (int it = 0; it < iterations; it++) _ = engine.TensorMatMul(aT, bT);
+            sw2.Stop();
+            double regUs = (sw2.Elapsed.TotalMilliseconds * 1000.0) / iterations;
+
+            double speedup = unregUs / Math.Max(regUs, 1e-9);
+            _output.WriteLine($"FFN inference loop (M={M} N={N} K={K}, {iterations} iters):");
+            _output.WriteLine($"  unregistered (legacy path):    {unregUs:F1} us/call");
+            _output.WriteLine($"  registered (auto-pre-pack):    {regUs:F1} us/call");
+            _output.WriteLine($"  speedup:                       {speedup:F2}x");
+
+            // Sanity gate: registration must not slow inference down. This
+            // catches a regression where the registry consult is in the hot
+            // path with no benefit (e.g., handle gets ignored downstream and
+            // the consult is pure overhead).
+            Assert.True(speedup >= 0.95,
+                $"Registered path should not be slower than unregistered baseline; got {speedup:F2}x");
         }
         finally
         {
@@ -177,6 +242,8 @@ public class FrozenWeightRegistryTest
 
         BlasManagedLib.ClearCaches();
         FrozenWeightRegistry.Register(bT);
+        bool prevPreferManaged = BlasManagedLib.PreferManaged;
+        BlasManagedLib.PreferManaged = true;
         try
         {
             // Warm: first TensorMatMul ticks the hit counter.
@@ -200,6 +267,7 @@ public class FrozenWeightRegistryTest
         }
         finally
         {
+            BlasManagedLib.PreferManaged = prevPreferManaged;
             FrozenWeightRegistry.Unregister(bT);
         }
     }

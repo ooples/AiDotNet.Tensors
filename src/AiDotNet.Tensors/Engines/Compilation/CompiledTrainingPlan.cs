@@ -1738,24 +1738,28 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 // B is constant across inference calls (allowCachedB=true).
                 //
                 // Sources for the handle, in priority order:
-                //   1. Caller pre-registered inputB via FrozenWeightRegistry —
-                //      use that handle directly (no double-allocation).
-                //   2. Otherwise pre-pack here at compile time, but only when
-                //      the replay will actually route managed (PreferManaged OR
-                //      AutotuneRouting + PrefersManaged for this shape).
-                // When neither fires, no pre-pack happens and the legacy
-                // TryGemm / SgemmWithCachedB path stays intact.
-                Engines.BlasManaged.WeightPackHandle? prePackedB =
-                    Engines.BlasManaged.FrozenWeightRegistry.TryGetHandle(inputB);
+                //   1. Caller pre-registered inputB via FrozenWeightRegistry AND
+                //      managed wins for this shape — use the registry handle.
+                //   2. Caller didn't register but managed wins anyway — pre-pack
+                //      here at compile time.
+                //   3. Otherwise no pre-pack — legacy TryGemm/SgemmWithCachedB
+                //      stays intact (native BLAS is faster than managed at this
+                //      shape; routing managed despite the pre-pack regresses
+                //      end-to-end perf — see the regression test
+                //      Registered_FFN_128x768x768_Inference_Loop_Faster_Than_Unregistered).
+                bool willRouteManaged =
+                    Engines.BlasManaged.BlasManaged.PreferManaged
+                    || !Helpers.BlasProvider.IsAvailable
+                    || (Engines.BlasManaged.BlasManaged.AutotuneRouting
+                        && Engines.BlasManaged.PrefersManagedCache.PrefersManaged(
+                            M, N, K, transA: false, transB: false, dtype: typeof(float)));
 
-                if (prePackedB == null)
+                Engines.BlasManaged.WeightPackHandle? prePackedB = null;
+                if (willRouteManaged)
                 {
-                    bool willRouteManaged =
-                        Engines.BlasManaged.BlasManaged.PreferManaged
-                        || (Engines.BlasManaged.BlasManaged.AutotuneRouting
-                            && Engines.BlasManaged.PrefersManagedCache.PrefersManaged(
-                                M, N, K, transA: false, transB: false, dtype: typeof(float)));
-                    if (willRouteManaged)
+                    // Prefer the caller's registered handle so we don't double-allocate.
+                    prePackedB = Engines.BlasManaged.FrozenWeightRegistry.TryGetHandle(inputB);
+                    if (prePackedB == null)
                     {
                         prePackedB = Engines.BlasManaged.BlasManaged.PrePackB<float>(
                             new ReadOnlySpan<float>(cB), N, transB: false, k: K, n: N);

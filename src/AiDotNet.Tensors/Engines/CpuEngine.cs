@@ -11259,15 +11259,18 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         // Sub-E (#373): auto-adopt pre-packed weight when B is registered in
-        // FrozenWeightRegistry. Inference paths that register the model's
-        // weights once (e.g., FrozenWeightRegistry.Register(layer.Weight) at
-        // model-load time) get pack-B amortization on every TensorMatMul call
-        // through this method — no API surface change at the call sites.
+        // FrozenWeightRegistry AND the autotune routing decision says managed
+        // wins for this shape. The second check matters because at many shapes
+        // (M*N*K compute-bound) native BLAS is 4-6× faster than BlasManaged
+        // even with a pre-pack — routing managed unconditionally there makes
+        // adoption ANTI-helpful. The gate is the same one BlasProvider.TryGemmEx
+        // uses, so behavior is consistent with the rest of the dispatcher.
         if (typeof(T) == typeof(float) || typeof(T) == typeof(double))
         {
             var handle = Engines.BlasManaged.FrozenWeightRegistry.TryGetHandle(b);
             if (handle != null && Engines.BlasManaged.WeightPackCache.IsCacheCurrent(handle)
-                && a.IsContiguous && b.IsContiguous)
+                && a.IsContiguous && b.IsContiguous
+                && ShouldRouteManagedForPrePackedB<T>(m, p, n))
             {
                 if (typeof(T) == typeof(float))
                 {
@@ -11379,6 +11382,39 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // Fallback for non-float/double: ignore the handle and run the regular path.
         return TensorMatMul(a, b);
+    }
+
+    /// <summary>
+    /// Sub-E (#373): decide whether a pre-packed-B fast path should route the
+    /// call to <see cref="Engines.BlasManaged.BlasManaged.Gemm{T}"/> (managed)
+    /// or fall through to <see cref="Helpers.MatrixMultiplyHelper.TryGemm"/>
+    /// (native BLAS). Mirrors the routing decision made by
+    /// <see cref="Helpers.BlasProvider.TryGemmEx"/> so the pre-pack adoption
+    /// only fires when managed is actually competitive — otherwise routing
+    /// managed for a faster native shape regresses end-to-end perf even
+    /// after pre-pack savings (see the regression caught by
+    /// <c>Registered_FFN_128x768x768_Inference_Loop_Faster_Than_Unregistered</c>
+    /// where managed was 5.7× slower than native).
+    /// </summary>
+    private static bool ShouldRouteManagedForPrePackedB<T>(int m, int n, int k)
+    {
+        // Force-managed mode (supply-chain) — always route managed.
+        if (Engines.BlasManaged.BlasManaged.PreferManaged) return true;
+
+        // Native BLAS unavailable — managed is the only option.
+        if (!Helpers.BlasProvider.IsAvailable) return true;
+
+        // Autotune-based per-shape routing — only when the cache says managed wins.
+        if (Engines.BlasManaged.BlasManaged.AutotuneRouting)
+        {
+            Type dtype = typeof(T) == typeof(float) ? typeof(float) : typeof(double);
+            return Engines.BlasManaged.PrefersManagedCache.PrefersManaged(
+                m, n, k, transA: false, transB: false, dtype: dtype);
+        }
+
+        // No routing flag set: prefer native — pre-pack savings don't outweigh
+        // the BlasManaged-vs-native compute gap at most production shapes.
+        return false;
     }
 
     private static bool TryTensorMatMulGemv<T>(Tensor<T> a, Tensor<T> b, Tensor<T> result, int m, int k)
@@ -11529,18 +11565,18 @@ public partial class CpuEngine : ITensorLevelEngine
         if (a.IsContiguous && b.IsContiguous)
         {
             // Sub-E (#373): collapsed ND × 2D path — when B is registered in
-            // FrozenWeightRegistry (the transformer-inference hot path), route
-            // the single big GEMM through BlasManaged with the pre-pack handle.
-            // The big-GEMM dim is (batchSize*m, n) × (n, p); pack-B amortizes
-            // across every batch slice in a single call, not just across
-            // separate calls — the consolidation already wins here, pre-pack
-            // adds the additional pack-cost amortization.
+            // FrozenWeightRegistry AND managed wins for this shape, route the
+            // single big GEMM through BlasManaged with the pre-pack handle.
+            // Gate is identical to the 2D path's ShouldRouteManagedForPrePackedB
+            // to keep behavior consistent (and avoid the 5.7× regression that
+            // unconditional managed routing produced at FFN_128×768×768).
             if (typeof(T) == typeof(float) || typeof(T) == typeof(double))
             {
+                int bigM = batchSize * m;
                 var handle = Engines.BlasManaged.FrozenWeightRegistry.TryGetHandle(b);
-                if (handle != null && Engines.BlasManaged.WeightPackCache.IsCacheCurrent(handle))
+                if (handle != null && Engines.BlasManaged.WeightPackCache.IsCacheCurrent(handle)
+                    && ShouldRouteManagedForPrePackedB<T>(bigM, p, n))
                 {
-                    int bigM = batchSize * m;
                     if (typeof(T) == typeof(float))
                     {
                         var aArr = (float[])(object)aData;
