@@ -46,6 +46,22 @@ public sealed class WeightPackHandle : IDisposable
     internal (int Mc, int Kc, bool TransA, PackingMode Mode, Type ElemType) Key;
     internal bool IsForA;  // true = pre-packed A; false = pre-packed B
 
+    /// <summary>
+    /// Sub-E (#373) — full weight dimensions and the (Mc, Kc) tiling used during
+    /// pack. <see cref="MultiPanelStride"/> tells consumers how many bytes to
+    /// advance per (icIdx, pcIdx) tile in the flat <see cref="PackedBuffer"/>.
+    /// All zero when the handle was packed via the legacy single-panel path
+    /// (pre-Sub-E) — consumers gate on <c>MultiPanelStride &gt; 0</c> to detect
+    /// the new layout.
+    /// </summary>
+    internal int FullM;
+    internal int FullK;
+    internal int TileMc;
+    internal int TileKc;
+    internal int NumIcBlocks;
+    internal int NumPcBlocks;
+    internal int MultiPanelStride;  // bytes per tile in PackedBuffer
+
     internal WeightPackHandle(
         byte[] packedBuffer,
         (int Mc, int Kc, bool TransA, PackingMode Mode, Type ElemType) key,
@@ -77,6 +93,28 @@ public sealed class WeightPackHandle : IDisposable
     /// after a successful pack completes.
     /// </summary>
     internal void WriteLastPackedVersion(long version) => Interlocked.Exchange(ref LastPackedVersion, version);
+
+    /// <summary>
+    /// Sub-E (#373): get the byte slice for a specific (icIdx, pcIdx) tile when
+    /// this handle is multi-panel. Returns empty span for legacy single-panel
+    /// handles (consumers fall back to the old offset-0 path).
+    /// </summary>
+    internal Span<byte> GetTileSlice(int icIdx, int pcIdx)
+    {
+        if (MultiPanelStride <= 0) return Span<byte>.Empty;  // legacy single-panel
+        if (icIdx < 0 || icIdx >= NumIcBlocks) return Span<byte>.Empty;
+        if (pcIdx < 0 || pcIdx >= NumPcBlocks) return Span<byte>.Empty;
+        int offset = (icIdx * NumPcBlocks + pcIdx) * MultiPanelStride;
+        return PackedBuffer.AsSpan(offset, MultiPanelStride);
+    }
+
+    /// <summary>
+    /// Returns true if this multi-panel handle's (TileMc, TileKc) match the
+    /// caller's (mc, kc) blocking parameters. Required for the strategy to
+    /// consume the pre-packed tiles directly.
+    /// </summary>
+    internal bool TilingMatches(int mc, int kc) =>
+        MultiPanelStride > 0 && TileMc == mc && TileKc == kc;
 
     /// <summary>
     /// Release the packed buffer back to the pool. Idempotent.

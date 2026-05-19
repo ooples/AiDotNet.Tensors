@@ -396,57 +396,79 @@ public static class BlasManaged
         in BlasOptions<T> options = default) where T : unmanaged
     {
         var (mr, _) = PickMicrokernelTile<T>();
-        const int PanelMc = 64;
-        const int PanelKc = 64;
-        // CodeRabbit #366: this routine currently packs a single Mc×Kc panel.
-        // Silently truncating larger weights would produce wrong GEMM results
-        // when the handle is reused, so reject m > PanelMc / k > PanelKc until
-        // multi-panel packing lands. Callers below PanelMc / PanelKc are the
-        // common training-loop case (linear projections, attention heads).
-        if (m > PanelMc || k > PanelKc)
-            throw new NotSupportedException(
-                $"PrePackA currently supports only single-panel weights up to {PanelMc}×{PanelKc} " +
-                $"(got m={m}, k={k}). Multi-panel pre-packing is tracked as follow-up work; " +
-                $"call Gemm directly without a pre-pack handle for larger weights.");
-        int mc = PanelMc;
-        int kc = PanelKc;
-        // Don't pack at a Kc larger than k.
+
+        // Sub-E (#373): multi-panel pre-pack. Pack the entire weight into
+        // (numIcBlocks × numPcBlocks) tiles, each of size Mc × Kc. Strategies
+        // index by (ic/Mc, pc/Kc) at runtime via the new MultiPanelStride
+        // metadata on the handle.
+        //
+        // Tile dimensions: default Mc=128, Kc=256 (matches typical autotune
+        // choices on x64-amd-avx2-cpu16). For tiny weights where m < Mc or
+        // k < Kc, clamp to fit while keeping mr-alignment for Mc.
+        int mc = 128;
+        int kc = 256;
+        if (mc > m) mc = ((m + mr - 1) / mr) * mr;  // round UP to mr multiple, capped at m
+        if (mc > m) mc = m;
         if (kc > k) kc = k;
-        // Don't pack at an Mc larger than m, rounded down to mr.
-        if (mc > m) mc = (m / mr) * mr;
         if (mc <= 0)
             throw new ArgumentException($"M={m} smaller than microkernel Mr={mr}; pre-pack not supported.", nameof(m));
 
+        int numIcBlocks = (m + mc - 1) / mc;
+        int numPcBlocks = (k + kc - 1) / kc;
         int elemSize = Marshal.SizeOf<T>();
-        int packedBytes = mc * kc * elemSize;
+        int tileBytes = mc * kc * elemSize;
+        int packedBytes = numIcBlocks * numPcBlocks * tileBytes;
 
         var key = (mc, kc, transA, options.PackingMode, typeof(T));
         var handle = WeightPackCache.Allocate(packedBytes, key, isForA: true);
+        handle.FullM = m;
+        handle.FullK = k;
+        handle.TileMc = mc;
+        handle.TileKc = kc;
+        handle.NumIcBlocks = numIcBlocks;
+        handle.NumPcBlocks = numPcBlocks;
+        handle.MultiPanelStride = tileBytes;
 
         // Snapshot Version BEFORE packing so a concurrent MarkDirty doesn't
         // race the post-pack MarkCacheCurrent and mark stale data current.
         long packedVersion = Interlocked.Read(ref handle.Version);
 
-        // Initial pack: write the source weight into handle.PackedBuffer.
-        if (typeof(T) == typeof(double))
+        // Pack each (icIdx, pcIdx) tile at its offset in the multi-panel buffer.
+        for (int icIdx = 0; icIdx < numIcBlocks; icIdx++)
         {
-            var packedSpan = MemoryMarshal.Cast<byte, double>(handle.PackedBuffer.AsSpan());
-            ScalarPack.PackA<double>(
-                MemoryMarshal.Cast<T, double>(a),
-                lda, transA,
-                packedSpan, mc, kc, mr);
-        }
-        else if (typeof(T) == typeof(float))
-        {
-            var packedSpan = MemoryMarshal.Cast<byte, float>(handle.PackedBuffer.AsSpan());
-            ScalarPack.PackA<float>(
-                MemoryMarshal.Cast<T, float>(a),
-                lda, transA,
-                packedSpan, mc, kc, mr);
-        }
-        else
-        {
-            throw new NotSupportedException($"PrePackA does not support T={typeof(T).Name}.");
+            int ic = icIdx * mc;
+            int effectiveMc = Math.Min(mc, m - ic);
+            for (int pcIdx = 0; pcIdx < numPcBlocks; pcIdx++)
+            {
+                int pc = pcIdx * kc;
+                int effectiveKc = Math.Min(kc, k - pc);
+
+                int tileOffsetBytes = (icIdx * numPcBlocks + pcIdx) * tileBytes;
+                int aSliceOffset = transA ? pc * lda + ic : ic * lda + pc;
+
+                if (typeof(T) == typeof(double))
+                {
+                    var packedSpan = MemoryMarshal.Cast<byte, double>(
+                        handle.PackedBuffer.AsSpan(tileOffsetBytes, tileBytes));
+                    ScalarPack.PackA<double>(
+                        MemoryMarshal.Cast<T, double>(a).Slice(aSliceOffset),
+                        lda, transA,
+                        packedSpan, effectiveMc, effectiveKc, mr);
+                }
+                else if (typeof(T) == typeof(float))
+                {
+                    var packedSpan = MemoryMarshal.Cast<byte, float>(
+                        handle.PackedBuffer.AsSpan(tileOffsetBytes, tileBytes));
+                    ScalarPack.PackA<float>(
+                        MemoryMarshal.Cast<T, float>(a).Slice(aSliceOffset),
+                        lda, transA,
+                        packedSpan, effectiveMc, effectiveKc, mr);
+                }
+                else
+                {
+                    throw new NotSupportedException($"PrePackA does not support T={typeof(T).Name}.");
+                }
+            }
         }
 
         WeightPackCache.MarkCacheCurrent(handle, packedVersion);
@@ -470,50 +492,71 @@ public static class BlasManaged
         in BlasOptions<T> options = default) where T : unmanaged
     {
         var (_, nr) = PickMicrokernelTile<T>();
-        const int PanelNc = 64;
-        const int PanelKc = 64;
-        // CodeRabbit #366: same single-panel limit as PrePackA — see that
-        // method for rationale. Reject larger weights up front.
-        if (n > PanelNc || k > PanelKc)
-            throw new NotSupportedException(
-                $"PrePackB currently supports only single-panel weights up to {PanelKc}×{PanelNc} " +
-                $"(got k={k}, n={n}). Multi-panel pre-packing is tracked as follow-up work; " +
-                $"call Gemm directly without a pre-pack handle for larger weights.");
-        int nc = PanelNc;
-        int kc = PanelKc;
+
+        // Sub-E (#373): multi-panel pre-pack — see PrePackA above for the same
+        // mechanism applied to A. Pack the whole B matrix into (numJcBlocks ×
+        // numPcBlocks) tiles of size Kc × Nc.
+        int nc = 512;
+        int kc = 256;
+        if (nc > n) nc = ((n + nr - 1) / nr) * nr;
+        if (nc > n) nc = n;
         if (kc > k) kc = k;
-        if (nc > n) nc = (n / nr) * nr;
         if (nc <= 0)
             throw new ArgumentException($"N={n} smaller than microkernel Nr={nr}; pre-pack not supported.", nameof(n));
 
+        int numJcBlocks = (n + nc - 1) / nc;
+        int numPcBlocks = (k + kc - 1) / kc;
         int elemSize = Marshal.SizeOf<T>();
-        int packedBytes = nc * kc * elemSize;
+        int tileBytes = kc * nc * elemSize;
+        int packedBytes = numJcBlocks * numPcBlocks * tileBytes;
 
         var key = (nc, kc, transB, options.PackingMode, typeof(T));
         var handle = WeightPackCache.Allocate(packedBytes, key, isForA: false);
+        handle.FullM = n;          // B-side: store n in FullM slot
+        handle.FullK = k;
+        handle.TileMc = nc;        // B-side: store nc in TileMc slot
+        handle.TileKc = kc;
+        handle.NumIcBlocks = numJcBlocks;  // B-side: jc-blocks live in NumIcBlocks slot
+        handle.NumPcBlocks = numPcBlocks;
+        handle.MultiPanelStride = tileBytes;
 
-        // Snapshot Version BEFORE packing — see PrePackA for rationale.
         long packedVersion = Interlocked.Read(ref handle.Version);
 
-        if (typeof(T) == typeof(double))
+        for (int jcIdx = 0; jcIdx < numJcBlocks; jcIdx++)
         {
-            var packedSpan = MemoryMarshal.Cast<byte, double>(handle.PackedBuffer.AsSpan());
-            ScalarPack.PackB<double>(
-                MemoryMarshal.Cast<T, double>(b),
-                ldb, transB,
-                packedSpan, nc, kc, nr);
-        }
-        else if (typeof(T) == typeof(float))
-        {
-            var packedSpan = MemoryMarshal.Cast<byte, float>(handle.PackedBuffer.AsSpan());
-            ScalarPack.PackB<float>(
-                MemoryMarshal.Cast<T, float>(b),
-                ldb, transB,
-                packedSpan, nc, kc, nr);
-        }
-        else
-        {
-            throw new NotSupportedException($"PrePackB does not support T={typeof(T).Name}.");
+            int jc = jcIdx * nc;
+            int effectiveNc = Math.Min(nc, n - jc);
+            for (int pcIdx = 0; pcIdx < numPcBlocks; pcIdx++)
+            {
+                int pc = pcIdx * kc;
+                int effectiveKc = Math.Min(kc, k - pc);
+
+                int tileOffsetBytes = (jcIdx * numPcBlocks + pcIdx) * tileBytes;
+                int bSliceOffset = transB ? jc * ldb + pc : pc * ldb + jc;
+
+                if (typeof(T) == typeof(double))
+                {
+                    var packedSpan = MemoryMarshal.Cast<byte, double>(
+                        handle.PackedBuffer.AsSpan(tileOffsetBytes, tileBytes));
+                    ScalarPack.PackB<double>(
+                        MemoryMarshal.Cast<T, double>(b).Slice(bSliceOffset),
+                        ldb, transB,
+                        packedSpan, effectiveNc, effectiveKc, nr);
+                }
+                else if (typeof(T) == typeof(float))
+                {
+                    var packedSpan = MemoryMarshal.Cast<byte, float>(
+                        handle.PackedBuffer.AsSpan(tileOffsetBytes, tileBytes));
+                    ScalarPack.PackB<float>(
+                        MemoryMarshal.Cast<T, float>(b).Slice(bSliceOffset),
+                        ldb, transB,
+                        packedSpan, effectiveNc, effectiveKc, nr);
+                }
+                else
+                {
+                    throw new NotSupportedException($"PrePackB does not support T={typeof(T).Name}.");
+                }
+            }
         }
 
         WeightPackCache.MarkCacheCurrent(handle, packedVersion);

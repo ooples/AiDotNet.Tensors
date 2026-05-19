@@ -205,20 +205,39 @@ internal static class PackBothStrategy
                 // dense effectivePackBBytes. Without this, partial-N tiles
                 // would slice past activePackB or pick up stale padding from
                 // a previous (jc, pc) iteration.
-                if (options.PackedB != null && WeightPackCache.IsCacheCurrent(options.PackedB)
-                    && options.PackedB.PackedBuffer.Length >= packedBByteCount)
+                // Sub-E (#373): pre-pack consumption supports both legacy single-panel
+                // and the new multi-panel layout. Multi-panel requires the handle's
+                // (TileMc, TileKc) to match this call's (mc, kc); else fall back to
+                // live pack to avoid reading a misaligned tile.
+                if (options.PackedB != null && WeightPackCache.IsCacheCurrent(options.PackedB))
                 {
-                    activePackB = MemoryMarshal.Cast<byte, T>(options.PackedB.PackedBuffer.AsSpan(0, packedBByteCount));
-                    packBFromPrePack = true;
+                    var pkdB = options.PackedB;
+                    if (pkdB.MultiPanelStride > 0)
+                    {
+                        // Multi-panel: jc-blocks live in NumIcBlocks slot for PackedB.
+                        if (pkdB.TileMc == nc && pkdB.TileKc == kc)
+                        {
+                            int jcIdx = jc / nc;
+                            int pcIdx = pc / kc;
+                            var tile = pkdB.GetTileSlice(jcIdx, pcIdx);
+                            if (!tile.IsEmpty)
+                            {
+                                activePackB = MemoryMarshal.Cast<byte, T>(tile);
+                                packBFromPrePack = true;
+                            }
+                        }
+                    }
+                    else if (pkdB.PackedBuffer.Length >= packedBByteCount)
+                    {
+                        // Legacy single-panel.
+                        activePackB = MemoryMarshal.Cast<byte, T>(pkdB.PackedBuffer.AsSpan(0, packedBByteCount));
+                        packBFromPrePack = true;
+                    }
                 }
 
                 if (!packBFromPrePack)
                 {
                     // Pack B[pc..pc+effectiveKc, jc..jc+effectiveNc] into packB.
-                    // transB=false: B is [K, N] row-major, panel starts at b[pc * ldb + jc].
-                    // transB=true:  B is [N, K] row-major, panel starts at b[jc * ldb + pc].
-                    // Pass a padded slice (packedBElemCount) so ScalarPack.PackB can
-                    // zero-pad the partial tail stripe when effectiveNc % nr != 0.
                     int bSliceOffset = transB ? jc * ldb + pc : pc * ldb + jc;
                     Avx2Pack.PackB<T>(
                         b: b.Slice(bSliceOffset), ldb, transB,
@@ -230,17 +249,31 @@ internal static class PackBothStrategy
                 {
                     int effectiveMc = Math.Min(mc, m - ic);
 
-                    // Layer 3: short-circuit pack-A when pre-pack handle is current.
-                    // Use effective tile bytes, not nominal, because PrePackA clamps Mc/Kc to
-                    // the actual matrix dimensions (small matrices produce smaller handles).
                     int effectivePackABytes = effectiveMc * effectiveKc * elemSize;
                     bool packAFromPrePack = false;
                     Span<T> activePackA = packA;
-                    if (options.PackedA != null && WeightPackCache.IsCacheCurrent(options.PackedA)
-                        && options.PackedA.PackedBuffer.Length >= effectivePackABytes)
+                    if (options.PackedA != null && WeightPackCache.IsCacheCurrent(options.PackedA))
                     {
-                        activePackA = MemoryMarshal.Cast<byte, T>(options.PackedA.PackedBuffer.AsSpan(0, effectivePackABytes));
-                        packAFromPrePack = true;
+                        var pkdA = options.PackedA;
+                        if (pkdA.MultiPanelStride > 0)
+                        {
+                            if (pkdA.TileMc == mc && pkdA.TileKc == kc)
+                            {
+                                int icIdx = ic / mc;
+                                int pcIdx = pc / kc;
+                                var tile = pkdA.GetTileSlice(icIdx, pcIdx);
+                                if (!tile.IsEmpty)
+                                {
+                                    activePackA = MemoryMarshal.Cast<byte, T>(tile);
+                                    packAFromPrePack = true;
+                                }
+                            }
+                        }
+                        else if (pkdA.PackedBuffer.Length >= effectivePackABytes)
+                        {
+                            activePackA = MemoryMarshal.Cast<byte, T>(pkdA.PackedBuffer.AsSpan(0, effectivePackABytes));
+                            packAFromPrePack = true;
+                        }
                     }
 
                     if (!packAFromPrePack)
@@ -409,12 +442,34 @@ internal static class PackBothStrategy
                     // ── Pack A (per-thread, from PerThreadPool.Current) ────────────────
                     int effectivePackABytes = effectiveMc * effectiveKc_cap * elemSize;
                     Span<T> activePackA;
-                    if (packedA != null && WeightPackCache.IsCacheCurrent(packedA)
-                        && packedA.PackedBuffer.Length >= effectivePackABytes)
+                    bool prePackHitParallel = false;
+                    Span<byte> packAByteSlice = default;
+                    if (packedA != null && WeightPackCache.IsCacheCurrent(packedA))
                     {
-                        // Layer 3: pre-packed A is a read-only byte[]. Create span from it.
-                        activePackA = MemoryMarshal.Cast<byte, T>(
-                            packedA.PackedBuffer.AsSpan(0, effectivePackABytes));
+                        if (packedA.MultiPanelStride > 0)
+                        {
+                            // Sub-E: multi-panel. Tile sizes must match this call's mc/kc.
+                            if (packedA.TileMc == mc && packedA.TileKc == effectiveKc_cap)
+                            {
+                                int icIdxLocal = ic / mc;
+                                int pcIdxLocal = pc_cap / effectiveKc_cap;
+                                var tile = packedA.GetTileSlice(icIdxLocal, pcIdxLocal);
+                                if (!tile.IsEmpty)
+                                {
+                                    packAByteSlice = tile;
+                                    prePackHitParallel = true;
+                                }
+                            }
+                        }
+                        else if (packedA.PackedBuffer.Length >= effectivePackABytes)
+                        {
+                            packAByteSlice = packedA.PackedBuffer.AsSpan(0, effectivePackABytes);
+                            prePackHitParallel = true;
+                        }
+                    }
+                    if (prePackHitParallel)
+                    {
+                        activePackA = MemoryMarshal.Cast<byte, T>(packAByteSlice);
                     }
                     else
                     {
