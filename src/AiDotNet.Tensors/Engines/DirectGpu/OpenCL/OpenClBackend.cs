@@ -8229,13 +8229,35 @@ KERNEL VARIANTS (A/B testing):
             // Initialize output and counts to zero before accumulation
             Fill(output, 0f, outputSize * featureSize);
             Fill(counts, 0f, outputSize);
-            var k1 = _kernelCache["scatter_mean"]; uint arg1 = 0;
-            k1.SetArg(arg1++, ((DirectOpenClGpuBuffer)source).Buffer.Handle);
-            k1.SetArg(arg1++, ((DirectOpenClGpuBuffer)indices).Buffer.Handle);
-            k1.SetArg(arg1++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
-            k1.SetArg(arg1++, ((DirectOpenClGpuBuffer)counts).Buffer.Handle);
-            k1.SetArg(arg1++, sourceSize); k1.SetArg(arg1++, featureSize);
-            k1.Execute1D(sourceSize, Math.Min(256, sourceSize));
+
+            if (GpuDeterminism.IsActive)
+            {
+                // Issue #382: atomic accumulation is FP-non-deterministic across runs;
+                // dispatch to the variant that pins one work-item per (dstRow, col)
+                // and scans source rows in fixed order.
+                var k1d = _kernelCache["scatter_mean_deterministic"]; uint a1d = 0;
+                k1d.SetArg(a1d++, ((DirectOpenClGpuBuffer)source).Buffer.Handle);
+                k1d.SetArg(a1d++, ((DirectOpenClGpuBuffer)indices).Buffer.Handle);
+                k1d.SetArg(a1d++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+                k1d.SetArg(a1d++, ((DirectOpenClGpuBuffer)counts).Buffer.Handle);
+                k1d.SetArg(a1d++, sourceSize);
+                k1d.SetArg(a1d++, outputSize);
+                k1d.SetArg(a1d++, featureSize);
+                int lDx = Math.Min(8, outputSize);
+                int lDy = Math.Min(16, featureSize);
+                k1d.Execute2D(outputSize, featureSize, lDx, lDy);
+            }
+            else
+            {
+                var k1 = _kernelCache["scatter_mean"]; uint arg1 = 0;
+                k1.SetArg(arg1++, ((DirectOpenClGpuBuffer)source).Buffer.Handle);
+                k1.SetArg(arg1++, ((DirectOpenClGpuBuffer)indices).Buffer.Handle);
+                k1.SetArg(arg1++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+                k1.SetArg(arg1++, ((DirectOpenClGpuBuffer)counts).Buffer.Handle);
+                k1.SetArg(arg1++, sourceSize); k1.SetArg(arg1++, featureSize);
+                k1.Execute1D(sourceSize, Math.Min(256, sourceSize));
+            }
+
             var k2 = _kernelCache["scatter_mean_divide"]; uint arg2 = 0;
             k2.SetArg(arg2++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
             k2.SetArg(arg2++, ((DirectOpenClGpuBuffer)counts).Buffer.Handle);
