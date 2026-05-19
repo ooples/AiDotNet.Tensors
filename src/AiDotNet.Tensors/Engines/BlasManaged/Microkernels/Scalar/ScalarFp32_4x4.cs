@@ -38,22 +38,29 @@ internal static class ScalarFp32_4x4
         int ldc,
         int kc)
     {
-        float c00 = c[0 * ldc + 0], c01 = c[0 * ldc + 1], c02 = c[0 * ldc + 2], c03 = c[0 * ldc + 3];
-        float c10 = c[1 * ldc + 0], c11 = c[1 * ldc + 1], c12 = c[1 * ldc + 2], c13 = c[1 * ldc + 3];
-        float c20 = c[2 * ldc + 0], c21 = c[2 * ldc + 1], c22 = c[2 * ldc + 2], c23 = c[2 * ldc + 3];
-        float c30 = c[3 * ldc + 0], c31 = c[3 * ldc + 1], c32 = c[3 * ldc + 2], c33 = c[3 * ldc + 3];
+        // Accumulate in FP64 to keep summation error O(eps_fp64 * K) ≈ 1e-14
+        // for K=64 — well below FP32 epsilon. Without this, sequential FP32
+        // accumulation drifts by O(eps_fp32 * K) ≈ 8e-6 relative which can
+        // exceed parity-check tolerances against OpenBLAS's tree-reduced
+        // SIMD path even when both are "correct". Cast back to FP32 only at
+        // write-back. This is the production fix for the routing-shim drift
+        // failure surfaced on net471 (no AVX2 intrinsics → scalar path).
+        double c00 = c[0 * ldc + 0], c01 = c[0 * ldc + 1], c02 = c[0 * ldc + 2], c03 = c[0 * ldc + 3];
+        double c10 = c[1 * ldc + 0], c11 = c[1 * ldc + 1], c12 = c[1 * ldc + 2], c13 = c[1 * ldc + 3];
+        double c20 = c[2 * ldc + 0], c21 = c[2 * ldc + 1], c22 = c[2 * ldc + 2], c23 = c[2 * ldc + 3];
+        double c30 = c[3 * ldc + 0], c31 = c[3 * ldc + 1], c32 = c[3 * ldc + 2], c33 = c[3 * ldc + 3];
 
         for (int k = 0; k < kc; k++)
         {
-            float a0 = packedA[k * Mr + 0];
-            float a1 = packedA[k * Mr + 1];
-            float a2 = packedA[k * Mr + 2];
-            float a3 = packedA[k * Mr + 3];
+            double a0 = packedA[k * Mr + 0];
+            double a1 = packedA[k * Mr + 1];
+            double a2 = packedA[k * Mr + 2];
+            double a3 = packedA[k * Mr + 3];
 
-            float b0 = packedB[k * Nr + 0];
-            float b1 = packedB[k * Nr + 1];
-            float b2 = packedB[k * Nr + 2];
-            float b3 = packedB[k * Nr + 3];
+            double b0 = packedB[k * Nr + 0];
+            double b1 = packedB[k * Nr + 1];
+            double b2 = packedB[k * Nr + 2];
+            double b3 = packedB[k * Nr + 3];
 
             c00 += a0 * b0;  c01 += a0 * b1;  c02 += a0 * b2;  c03 += a0 * b3;
             c10 += a1 * b0;  c11 += a1 * b1;  c12 += a1 * b2;  c13 += a1 * b3;
@@ -61,10 +68,10 @@ internal static class ScalarFp32_4x4
             c30 += a3 * b0;  c31 += a3 * b1;  c32 += a3 * b2;  c33 += a3 * b3;
         }
 
-        c[0 * ldc + 0] = c00; c[0 * ldc + 1] = c01; c[0 * ldc + 2] = c02; c[0 * ldc + 3] = c03;
-        c[1 * ldc + 0] = c10; c[1 * ldc + 1] = c11; c[1 * ldc + 2] = c12; c[1 * ldc + 3] = c13;
-        c[2 * ldc + 0] = c20; c[2 * ldc + 1] = c21; c[2 * ldc + 2] = c22; c[2 * ldc + 3] = c23;
-        c[3 * ldc + 0] = c30; c[3 * ldc + 1] = c31; c[3 * ldc + 2] = c32; c[3 * ldc + 3] = c33;
+        c[0 * ldc + 0] = (float)c00; c[0 * ldc + 1] = (float)c01; c[0 * ldc + 2] = (float)c02; c[0 * ldc + 3] = (float)c03;
+        c[1 * ldc + 0] = (float)c10; c[1 * ldc + 1] = (float)c11; c[1 * ldc + 2] = (float)c12; c[1 * ldc + 3] = (float)c13;
+        c[2 * ldc + 0] = (float)c20; c[2 * ldc + 1] = (float)c21; c[2 * ldc + 2] = (float)c22; c[2 * ldc + 3] = (float)c23;
+        c[3 * ldc + 0] = (float)c30; c[3 * ldc + 1] = (float)c31; c[3 * ldc + 2] = (float)c32; c[3 * ldc + 3] = (float)c33;
     }
 
     /// <summary>
@@ -92,22 +99,23 @@ internal static class ScalarFp32_4x4
         int ldc,
         int kc)
     {
-        float c00 = c[0 * ldc + 0], c01 = c[0 * ldc + 1], c02 = c[0 * ldc + 2], c03 = c[0 * ldc + 3];
-        float c10 = c[1 * ldc + 0], c11 = c[1 * ldc + 1], c12 = c[1 * ldc + 2], c13 = c[1 * ldc + 3];
-        float c20 = c[2 * ldc + 0], c21 = c[2 * ldc + 1], c22 = c[2 * ldc + 2], c23 = c[2 * ldc + 3];
-        float c30 = c[3 * ldc + 0], c31 = c[3 * ldc + 1], c32 = c[3 * ldc + 2], c33 = c[3 * ldc + 3];
+        // Same FP64-accumulator strategy as Run — see that method's comment.
+        double c00 = c[0 * ldc + 0], c01 = c[0 * ldc + 1], c02 = c[0 * ldc + 2], c03 = c[0 * ldc + 3];
+        double c10 = c[1 * ldc + 0], c11 = c[1 * ldc + 1], c12 = c[1 * ldc + 2], c13 = c[1 * ldc + 3];
+        double c20 = c[2 * ldc + 0], c21 = c[2 * ldc + 1], c22 = c[2 * ldc + 2], c23 = c[2 * ldc + 3];
+        double c30 = c[3 * ldc + 0], c31 = c[3 * ldc + 1], c32 = c[3 * ldc + 2], c33 = c[3 * ldc + 3];
 
         for (int k = 0; k < kc; k++)
         {
-            float a0 = packedA[k * Mr + 0];
-            float a1 = packedA[k * Mr + 1];
-            float a2 = packedA[k * Mr + 2];
-            float a3 = packedA[k * Mr + 3];
+            double a0 = packedA[k * Mr + 0];
+            double a1 = packedA[k * Mr + 1];
+            double a2 = packedA[k * Mr + 2];
+            double a3 = packedA[k * Mr + 3];
 
-            float b0 = b[k * ldb + 0];
-            float b1 = b[k * ldb + 1];
-            float b2 = b[k * ldb + 2];
-            float b3 = b[k * ldb + 3];
+            double b0 = b[k * ldb + 0];
+            double b1 = b[k * ldb + 1];
+            double b2 = b[k * ldb + 2];
+            double b3 = b[k * ldb + 3];
 
             c00 += a0 * b0;  c01 += a0 * b1;  c02 += a0 * b2;  c03 += a0 * b3;
             c10 += a1 * b0;  c11 += a1 * b1;  c12 += a1 * b2;  c13 += a1 * b3;
@@ -115,9 +123,9 @@ internal static class ScalarFp32_4x4
             c30 += a3 * b0;  c31 += a3 * b1;  c32 += a3 * b2;  c33 += a3 * b3;
         }
 
-        c[0 * ldc + 0] = c00; c[0 * ldc + 1] = c01; c[0 * ldc + 2] = c02; c[0 * ldc + 3] = c03;
-        c[1 * ldc + 0] = c10; c[1 * ldc + 1] = c11; c[1 * ldc + 2] = c12; c[1 * ldc + 3] = c13;
-        c[2 * ldc + 0] = c20; c[2 * ldc + 1] = c21; c[2 * ldc + 2] = c22; c[2 * ldc + 3] = c23;
-        c[3 * ldc + 0] = c30; c[3 * ldc + 1] = c31; c[3 * ldc + 2] = c32; c[3 * ldc + 3] = c33;
+        c[0 * ldc + 0] = (float)c00; c[0 * ldc + 1] = (float)c01; c[0 * ldc + 2] = (float)c02; c[0 * ldc + 3] = (float)c03;
+        c[1 * ldc + 0] = (float)c10; c[1 * ldc + 1] = (float)c11; c[1 * ldc + 2] = (float)c12; c[1 * ldc + 3] = (float)c13;
+        c[2 * ldc + 0] = (float)c20; c[2 * ldc + 1] = (float)c21; c[2 * ldc + 2] = (float)c22; c[2 * ldc + 3] = (float)c23;
+        c[3 * ldc + 0] = (float)c30; c[3 * ldc + 1] = (float)c31; c[3 * ldc + 2] = (float)c32; c[3 * ldc + 3] = (float)c33;
     }
 }

@@ -42,7 +42,12 @@ internal static class ScalarStreaming
     }
 
     /// <summary>
-    /// FP32 mirror of <see cref="RunFp64"/>.
+    /// FP32 mirror of <see cref="RunFp64"/>. Accumulates in FP64 internally so
+    /// the bit-exact contract with <see cref="ScalarFp32_4x4"/>'s output is
+    /// preserved (both microkernels must produce the same C for the
+    /// TinyShapeBypassTest "bypass matches forced full path" guarantee).
+    /// FP64 internal accumulators also keep summation error to O(eps_fp64 · K),
+    /// well below the routing-shim test's correctness bound.
     /// </summary>
     public static void RunFp32(
         ReadOnlySpan<float> a, int lda, bool transA,
@@ -54,14 +59,14 @@ internal static class ScalarStreaming
         {
             for (int j = 0; j < n; j++)
             {
-                float sum = c[i * ldc + j];
+                double sum = c[i * ldc + j];
                 for (int kk = 0; kk < k; kk++)
                 {
-                    float aval = transA ? a[kk * lda + i] : a[i * lda + kk];
-                    float bval = transB ? b[j * ldb + kk] : b[kk * ldb + j];
+                    double aval = transA ? a[kk * lda + i] : a[i * lda + kk];
+                    double bval = transB ? b[j * ldb + kk] : b[kk * ldb + j];
                     sum += aval * bval;
                 }
-                c[i * ldc + j] = sum;
+                c[i * ldc + j] = (float)sum;
             }
         }
     }

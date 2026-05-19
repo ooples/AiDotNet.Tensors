@@ -66,22 +66,34 @@ public class RoutingShimTest
             for (int i = 0; i < cManaged.Length; i++) if (cManaged[i] != 0) { anyNonZero = true; break; }
             Assert.True(anyNonZero, "Managed path produced all-zero output");
 
-            // If native ran, compare. Tolerance: relaxed because BlasManaged uses FMA
-            // (in Fast mode default) which differs from non-FMA scalar by 1 ULP.
-            // Actually, the default Mode is Deterministic — should be bit-exact with
-            // OpenBLAS on non-FMA paths. But OpenBLAS may use FMA too, in which case
-            // results may differ by ULPs. Use relative tolerance.
+            // If native ran, verify BOTH paths produce correct GEMM output by
+            // comparing each against an FP64 ground-truth computed from the same
+            // FP32 inputs. Each FP32 path is "correct" if it's within K·eps_fp32
+            // of truth (K=64, eps_fp32≈1.2e-7 → absolute bound ≈ 8e-6 per cell,
+            // doubled to 1.6e-5 for slack). Comparing two FP32 paths against each
+            // other directly is the wrong assertion: at small-magnitude output
+            // cells the relative drift between two correct implementations can
+            // exceed the per-implementation error bound (1/cell_magnitude scaling).
             if (nativeOk)
             {
-                double maxRelDelta = 0;
-                for (int i = 0; i < cNative.Length; i++)
+                var cTruth = new double[M * N];
+                for (int i = 0; i < M; i++)
+                    for (int j = 0; j < N; j++)
+                    {
+                        double sum = 0;
+                        for (int kk = 0; kk < K; kk++) sum += (double)a[i * K + kk] * b[kk * N + j];
+                        cTruth[i * N + j] = sum;
+                    }
+
+                const double maxAbsErr = 1.6e-5;  // 2 · K · eps_fp32 abs slack
+                double nativeMaxErr = 0, managedMaxErr = 0;
+                for (int i = 0; i < cTruth.Length; i++)
                 {
-                    float n_ = cNative[i], m_ = cManaged[i];
-                    if (n_ == 0 && m_ == 0) continue;
-                    double rel = Math.Abs(n_ - m_) / Math.Max(Math.Abs(n_), Math.Abs(m_));
-                    if (rel > maxRelDelta) maxRelDelta = rel;
+                    nativeMaxErr = Math.Max(nativeMaxErr, Math.Abs(cTruth[i] - cNative[i]));
+                    managedMaxErr = Math.Max(managedMaxErr, Math.Abs(cTruth[i] - cManaged[i]));
                 }
-                Assert.True(maxRelDelta < 1e-4, $"Routed managed path drift vs native: {maxRelDelta:G6}");
+                Assert.True(nativeMaxErr < maxAbsErr, $"Native path absolute error vs FP64 truth: {nativeMaxErr:G6} (bound {maxAbsErr})");
+                Assert.True(managedMaxErr < maxAbsErr, $"Routed managed path absolute error vs FP64 truth: {managedMaxErr:G6} (bound {maxAbsErr})");
             }
         }
         finally
