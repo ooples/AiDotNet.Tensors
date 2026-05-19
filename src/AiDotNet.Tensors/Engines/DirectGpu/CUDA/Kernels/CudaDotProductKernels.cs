@@ -13,7 +13,9 @@ internal static class CudaDotProductKernels
     public static string[] GetKernelNames() =>
     [
         "dot_product",
+        "dot_product_deterministic",
         "strided_dot_product",
+        "strided_dot_product_deterministic",
         "batched_dot_product",
         "tensor_slice_dot"
     ];
@@ -68,8 +70,23 @@ extern ""C"" __global__ __launch_bounds__(256) void dot_product(
     sum = blockReduceSum(sum);
 
     if (threadIdx.x == 0) {
+        // NON-DETERMINISTIC (issue #382); see dot_product_deterministic below.
         atomicAdd(result, sum);
     }
+}
+
+// dot_product — bit-deterministic variant (issue #382).
+// Single-block strided reduction; no inter-block atomic.
+extern ""C"" __global__ __launch_bounds__(256) void dot_product_deterministic(
+    const float* __restrict__ a, const float* __restrict__ b,
+    float* __restrict__ result, int size)
+{
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < size; i += blockDim.x) {
+        sum += a[i] * b[i];
+    }
+    sum = blockReduceSum(sum);
+    if (threadIdx.x == 0) *result = sum;
 }
 
 // Strided dot product: result = sum(a[i] * b[bOffset + i * bStride])
@@ -89,8 +106,24 @@ extern ""C"" __global__ __launch_bounds__(256) void strided_dot_product(
     sum = blockReduceSum(sum);
 
     if (threadIdx.x == 0) {
+        // NON-DETERMINISTIC (issue #382); see strided_dot_product_deterministic.
         atomicAdd(result, sum);
     }
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void strided_dot_product_deterministic(
+    const float* __restrict__ a, const float* __restrict__ b,
+    float* __restrict__ result, int aSize, int bSize, int bOffset, int bStride)
+{
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < aSize; i += blockDim.x) {
+        int bIdx = bOffset + i * bStride;
+        if (bIdx >= 0 && bIdx < bSize) {
+            sum += a[i] * b[bIdx];
+        }
+    }
+    sum = blockReduceSum(sum);
+    if (threadIdx.x == 0) *result = sum;
 }
 
 // Batched dot product: compute dot products for multiple pairs

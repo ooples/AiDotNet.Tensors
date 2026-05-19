@@ -99,8 +99,31 @@ extern ""C"" __global__ __launch_bounds__(256) void mesh_pool_backward(
 
     float gradVal = gradOutput[keptIdx * inputChannels + channel];
 
-    // Atomic add to handle potential duplicate indices
+    // Atomic add to handle potential duplicate indices.
+    // NON-DETERMINISTIC (issue #382); see mesh_pool_backward_deterministic below.
     atomicAdd(&gradInput[origIdx * inputChannels + channel], gradVal);
+}
+
+// mesh_pool_backward — bit-deterministic variant (issue #382).
+// One thread per (origIdx, channel) of gradInput scans every keptIndex in fixed
+// ascending order and accumulates contributions where keptIndices[k] == origIdx.
+extern ""C"" __global__ __launch_bounds__(256) void mesh_pool_backward_deterministic(
+    const float* gradOutput,
+    const int* keptIndices,
+    float* gradInput,
+    int numKept, int numEdges, int inputChannels)
+{
+    int origIdx = blockIdx.y * blockDim.y + threadIdx.y;
+    int channel = blockIdx.x * blockDim.x + threadIdx.x;
+    if (origIdx >= numEdges || channel >= inputChannels) return;
+
+    float sum = 0.0f;
+    for (int k = 0; k < numKept; k++) {
+        if (keptIndices[k] == origIdx) {
+            sum += gradOutput[k * inputChannels + channel];
+        }
+    }
+    gradInput[origIdx * inputChannels + channel] += sum;
 }
 
 // Backward pass: compute gradient for importance weights
@@ -420,7 +443,29 @@ extern ""C"" __global__ __launch_bounds__(256) void mesh_pool_weighted_backward(
     float weight = scores[origIdx];
     float gradVal = gradOutput[keptIdx * inputChannels + channel] * weight;
 
+    // NON-DETERMINISTIC (issue #382); see mesh_pool_weighted_backward_deterministic.
     atomicAdd(&gradInput[origIdx * inputChannels + channel], gradVal);
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void mesh_pool_weighted_backward_deterministic(
+    const float* gradOutput,
+    const float* scores,
+    const int* keptIndices,
+    float* gradInput,
+    int numKept, int numEdges, int inputChannels)
+{
+    int origIdx = blockIdx.y * blockDim.y + threadIdx.y;
+    int channel = blockIdx.x * blockDim.x + threadIdx.x;
+    if (origIdx >= numEdges || channel >= inputChannels) return;
+
+    float sum = 0.0f;
+    for (int k = 0; k < numKept; k++) {
+        if (keptIndices[k] == origIdx) {
+            float w = scores[origIdx];
+            sum += gradOutput[k * inputChannels + channel] * w;
+        }
+    }
+    gradInput[origIdx * inputChannels + channel] += sum;
 }
 
 // Backward pass for scores: compute gradient of importance scores
@@ -474,6 +519,7 @@ extern ""C"" __global__ __launch_bounds__(256) void mesh_pool_scores_backward(
             "mesh_pool_compute_scores",
             "mesh_pool_gather",
             "mesh_pool_backward",
+            "mesh_pool_backward_deterministic",
             "mesh_pool_importance_backward",
             "mesh_pool_zero_grad",
             // Multi-kernel softmax approach (for large numEdges)
@@ -486,6 +532,7 @@ extern ""C"" __global__ __launch_bounds__(256) void mesh_pool_scores_backward(
             "mesh_pool_softmax_scores",
             "mesh_pool_weighted_gather",
             "mesh_pool_weighted_backward",
+            "mesh_pool_weighted_backward_deterministic",
             "mesh_pool_scores_backward"
         };
     }
