@@ -9534,13 +9534,36 @@ KERNEL VARIANTS (A/B testing):
 
         public void ScatterAdd(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer destination, int sourceSize, int destSize)
         {
-            var k = _kernelCache["scatter_add"];
+            // Issue #382: route to atomic-free variant when deterministic mode is set.
+            // The dispatch name in this file was previously "scatter_add" (a kernel
+            // that doesn't exist by that bare name in OpenCL); both variants now
+            // route to the proper kernel names ("scatter_add_kernel" / its
+            // deterministic counterpart) which take (source, indices, dst, srcSize,
+            // featureSize) with featureSize=1 here since ScatterAdd is per-element.
+            int featureSize = 1;
+            if (GpuDeterminism.IsActive)
+            {
+                var kd = _kernelCache["scatter_add_kernel_deterministic"];
+                uint argD = 0;
+                kd.SetArg(argD++, ((DirectOpenClGpuBuffer)source).Buffer.Handle);
+                kd.SetArg(argD++, ((DirectOpenClGpuBuffer)indices).Buffer.Handle);
+                kd.SetArg(argD++, ((DirectOpenClGpuBuffer)destination).Buffer.Handle);
+                kd.SetArg(argD++, sourceSize);
+                kd.SetArg(argD++, destSize);
+                kd.SetArg(argD++, featureSize);
+                int lDx = Math.Min(8, destSize);
+                int lDy = Math.Min(1, featureSize);
+                kd.Execute2D(destSize, featureSize, lDx, lDy);
+                return;
+            }
+
+            var k = _kernelCache["scatter_add_kernel"];
             uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)source).Buffer.Handle);
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)indices).Buffer.Handle);
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)destination).Buffer.Handle);
             k.SetArg(arg++, sourceSize);
-            k.SetArg(arg++, destSize);
+            k.SetArg(arg++, featureSize);
 
             k.Execute1D(sourceSize, Math.Min(256, sourceSize));
         }
