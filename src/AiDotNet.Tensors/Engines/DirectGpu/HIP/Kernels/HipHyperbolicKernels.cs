@@ -321,12 +321,48 @@ extern ""C"" __global__ __launch_bounds__(256) void hyperbolic_linear_backward_w
     float riemannianGrad = gradOut * conformalFactor;
 
     // Use atomic add to accumulate gradient from all batch elements
-    // Note: i is already guarded to be < MAX_DIM above
+    // Note: i is already guarded to be < MAX_DIM above.
+    // NON-DETERMINISTIC (issue #382); see hyperbolic_linear_backward_weights_deterministic.
     atomicAdd(&gradWeights[o * inputFeatures + i], riemannianGrad * projectedInput[i]);
+}
+
+// hyperbolic_linear_backward_weights — bit-deterministic variant (issue #382).
+// One thread per (o, i) weight cell scans all batch elements in fixed ascending order
+// and accumulates contributions.
+extern ""C"" __global__ __launch_bounds__(256) void hyperbolic_linear_backward_weights_deterministic(
+    const float* gradOutput,
+    const float* input,
+    float* gradWeights,
+    int batch, int inputFeatures, int outputFeatures, float curvature)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int o = blockIdx.y * blockDim.y + threadIdx.y;
+    if (i >= inputFeatures || o >= outputFeatures) return;
+    if (i >= MAX_DIM) return;
+
+    float c = fabsf(curvature);
+    if (c < EPSILON_DIV) c = 1.0f;
+    int safeDim = safe_dim(inputFeatures);
+
+    float sum = 0.0f;
+    for (int b = 0; b < batch; b++) {
+        float projectedInput[MAX_DIM];
+        for (int j = 0; j < safeDim; j++) projectedInput[j] = input[b * inputFeatures + j];
+        project_to_ball(projectedInput, safeDim, c);
+        float squaredNorm = compute_norm_sq(projectedInput, safeDim);
+        float cNormSquared = c * squaredNorm;
+        float oneMinusCNorm = 1.0f - cNormSquared;
+        float conformalFactor = (oneMinusCNorm * oneMinusCNorm) / 4.0f;
+        float gradOut = gradOutput[b * outputFeatures + o];
+        float riemannianGrad = gradOut * conformalFactor;
+        sum += riemannianGrad * projectedInput[i];
+    }
+    gradWeights[o * inputFeatures + i] += sum;
 }
 
 // Parallelized bias gradient kernel - each thread handles one (batch, output, input) element
 // and uses atomicAdd for accumulation. Caller must zero gradBiases before invoking.
+// NON-DETERMINISTIC (issue #382); see hyperbolic_linear_backward_biases_deterministic.
 extern ""C"" __global__ __launch_bounds__(256) void hyperbolic_linear_backward_biases(
     const float* gradOutput,
     const float* input,
@@ -369,6 +405,38 @@ extern ""C"" __global__ __launch_bounds__(256) void hyperbolic_linear_backward_b
     // Use atomic add to accumulate gradient from all batch elements
     // Bias gradient is distributed across input features
     atomicAdd(&gradBiases[o * inputFeatures + i], riemannianGrad / (float)inputFeatures);
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void hyperbolic_linear_backward_biases_deterministic(
+    const float* gradOutput,
+    const float* input,
+    float* gradBiases,
+    int batch, int inputFeatures, int outputFeatures, float curvature)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int o = blockIdx.y * blockDim.y + threadIdx.y;
+    if (i >= inputFeatures || o >= outputFeatures) return;
+    if (i >= MAX_DIM) return;
+
+    float c = fabsf(curvature);
+    if (c < EPSILON_DIV) c = 1.0f;
+    int safeDim = safe_dim(inputFeatures);
+    float invIn = 1.0f / (float)inputFeatures;
+
+    float sum = 0.0f;
+    for (int b = 0; b < batch; b++) {
+        float projectedInput[MAX_DIM];
+        for (int j = 0; j < safeDim; j++) projectedInput[j] = input[b * inputFeatures + j];
+        project_to_ball(projectedInput, safeDim, c);
+        float squaredNorm = compute_norm_sq(projectedInput, safeDim);
+        float cNormSquared = c * squaredNorm;
+        float oneMinusCNorm = 1.0f - cNormSquared;
+        float conformalFactor = (oneMinusCNorm * oneMinusCNorm) / 4.0f;
+        float gradOut = gradOutput[b * outputFeatures + o];
+        float riemannianGrad = gradOut * conformalFactor;
+        sum += riemannianGrad * invIn;
+    }
+    gradBiases[o * inputFeatures + i] += sum;
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void hyperbolic_mobius_add_backward(
@@ -771,7 +839,9 @@ extern ""C"" __global__ __launch_bounds__(256) void hyperbolic_log_map_backward(
             "hyperbolic_linear_forward",
             "hyperbolic_linear_backward_input",
             "hyperbolic_linear_backward_weights",
+            "hyperbolic_linear_backward_weights_deterministic",
             "hyperbolic_linear_backward_biases",
+            "hyperbolic_linear_backward_biases_deterministic",
             "hyperbolic_mobius_add_backward",
             "hyperbolic_exp_map_backward",
             "hyperbolic_log_map_backward"

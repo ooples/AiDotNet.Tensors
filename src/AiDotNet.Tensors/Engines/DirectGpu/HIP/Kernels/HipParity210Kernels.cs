@@ -19,7 +19,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.HIP.Kernels
             "parity210_cumsum_axis","parity210_cumprod_axis","parity210_cummax_axis",
             "parity210_cummin_axis","parity210_logcumsumexp_axis",
             "parity210_cumsum_block_hillis_steele",
-            "parity210_take_linear","parity210_take_along_dim","parity210_index_add",
+            "parity210_take_linear","parity210_take_along_dim","parity210_index_add","parity210_index_add_deterministic",
             "parity210_index_copy","parity210_index_fill","parity210_masked_scatter",
             "parity210_hypot","parity210_copysign","parity210_fmod","parity210_remainder",
             "parity210_float_power","parity210_log_add_exp","parity210_log_add_exp2",
@@ -312,6 +312,7 @@ extern ""C"" __global__ __launch_bounds__(256) void parity210_take_along_dim(
     output[idx] = (target >= 0 && target < srcAxis) ? input[srcIdx] : 0.0f;
 }
 
+// NON-DETERMINISTIC (issue #382); see parity210_index_add_deterministic.
 extern ""C"" __global__ __launch_bounds__(256) void parity210_index_add(
     float* output, const int* indices, const float* source,
     int outerSize, int dstAxis, int innerSize, int idxLen)
@@ -330,6 +331,30 @@ extern ""C"" __global__ __launch_bounds__(256) void parity210_index_add(
     int dstPos = (outer * dstAxis + target) * innerSize + inner;
     int srcPos = (outer * idxLen + i) * innerSize + inner;
     atomicAdd(&output[dstPos], source[srcPos]);
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void parity210_index_add_deterministic(
+    float* output, const int* indices, const float* source,
+    int outerSize, int dstAxis, int innerSize, int idxLen)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = outerSize * dstAxis * innerSize;
+    if (idx >= total) return;
+
+    int inner = idx % innerSize;
+    int tmp = idx / innerSize;
+    int dstTarget = tmp % dstAxis;
+    int outer = tmp / dstAxis;
+
+    float sum = 0.0f;
+    for (int i = 0; i < idxLen; i++) {
+        if (indices[i] == dstTarget) {
+            int srcPos = (outer * idxLen + i) * innerSize + inner;
+            sum += source[srcPos];
+        }
+    }
+    int dstPos = (outer * dstAxis + dstTarget) * innerSize + inner;
+    output[dstPos] += sum;
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void parity210_index_copy(

@@ -16,6 +16,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.HIP.Kernels
             "cavity_bounce_inplace",
             "wideband_log_bin_pool",
             "pac_phase_bin_mi",
+            "pac_phase_bin_mi_deterministic",
             "mel_filterbank_apply",
             "mfcc_log1p",
         };
@@ -282,6 +283,62 @@ void pac_phase_bin_mi(const float* __restrict__ thetaPhase,
             for (int k = 0; k < NUM_PHASE_BINS; k++) {
                 float c = sdata[NUM_PHASE_BINS + k];
                 float avg = (c > 0.0f) ? (sdata[k] / c) : 0.0f;
+                float p = avg / totalAmp;
+                if (p > 1e-12f) entropy -= p * logf(p);
+            }
+            mi = (logf((float)NUM_PHASE_BINS) - entropy) / logf((float)NUM_PHASE_BINS);
+        }
+        output[b * numGammaBands + gammaIdx] = mi;
+    }
+}
+
+// pac_phase_bin_mi — bit-deterministic variant (issue #382).
+// Parallelize per (b, bin) instead of per sample. Each thread owns one histogram bin.
+extern ""C"" __global__ __launch_bounds__(18)
+void pac_phase_bin_mi_deterministic(const float* __restrict__ thetaPhase,
+                                    const float* __restrict__ gammaAmp,
+                                    float* __restrict__ output,
+                                    int batch, int numSamples, int numGammaBands, int gammaIdx)
+{
+    __shared__ float sumsD[18];
+    __shared__ float countsD[18];
+    const int NUM_PHASE_BINS = 18;
+
+    int b = blockIdx.x;
+    int tid = threadIdx.x;
+    if (b >= batch || tid >= NUM_PHASE_BINS) return;
+
+    int sampleOff = b * numSamples;
+    int gammaOff = (gammaIdx * batch + b) * numSamples;
+
+    float mySum = 0.0f;
+    float myCount = 0.0f;
+    for (int i = 0; i < numSamples; i++) {
+        float phase = thetaPhase[sampleOff + i];
+        float amp = gammaAmp[gammaOff + i];
+        float fbin = (phase + 3.14159265358979f) / (2.0f * 3.14159265358979f) * (float)NUM_PHASE_BINS;
+        int bin = (int)fbin;
+        if (bin < 0) bin = 0;
+        if (bin >= NUM_PHASE_BINS) bin = NUM_PHASE_BINS - 1;
+        if (bin == tid) { mySum += amp; myCount += 1.0f; }
+    }
+    sumsD[tid] = mySum;
+    countsD[tid] = myCount;
+    __syncthreads();
+
+    if (tid == 0) {
+        float totalAmp = 0.0f;
+        for (int k = 0; k < NUM_PHASE_BINS; k++) {
+            float c = countsD[k];
+            float avg = (c > 0.0f) ? (sumsD[k] / c) : 0.0f;
+            totalAmp += avg;
+        }
+        float mi = 0.0f;
+        if (totalAmp > 0.0f) {
+            float entropy = 0.0f;
+            for (int k = 0; k < NUM_PHASE_BINS; k++) {
+                float c = countsD[k];
+                float avg = (c > 0.0f) ? (sumsD[k] / c) : 0.0f;
                 float p = avg / totalAmp;
                 if (p > 1e-12f) entropy -= p * logf(p);
             }

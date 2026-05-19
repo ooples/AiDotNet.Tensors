@@ -159,7 +159,33 @@ extern ""C"" __global__ __launch_bounds__(256) void scatter_add_edges(
         value *= edgeValues[edge];
     }
 
+    // NON-DETERMINISTIC (issue #382); see scatter_add_edges_deterministic.
     atomicAdd(&output[tgt * features + feat], value);
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void scatter_add_edges_deterministic(
+    const float* __restrict__ input,
+    const int* __restrict__ sourceIndices,
+    const int* __restrict__ targetIndices,
+    const float* __restrict__ edgeValues,
+    float* __restrict__ output,
+    int numNodes, int numEdges, int features,
+    int hasEdgeValues)
+{
+    int tgt = blockIdx.x;
+    int feat = blockIdx.y * blockDim.x + threadIdx.x;
+    if (tgt >= numNodes || feat >= features) return;
+
+    float sum = 0.0f;
+    for (int edge = 0; edge < numEdges; edge++) {
+        if (targetIndices[edge] == tgt) {
+            int src = sourceIndices[edge];
+            float value = input[src * features + feat];
+            if (hasEdgeValues) value *= edgeValues[edge];
+            sum += value;
+        }
+    }
+    output[tgt * features + feat] += sum;
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void gather_source_features(
@@ -207,6 +233,21 @@ extern ""C"" __global__ __launch_bounds__(256) void segment_sum(
     atomicAdd(&output[segment * features + feat], input[item * features + feat]);
 }
 
+extern ""C"" __global__ __launch_bounds__(256) void segment_sum_deterministic(
+    const float* __restrict__ input,
+    const int* __restrict__ segmentIds,
+    float* __restrict__ output,
+    int numItems, int numSegments, int features)
+{
+    int segment = blockIdx.x;
+    int feat = blockIdx.y * blockDim.x + threadIdx.x;
+    if (segment >= numSegments || feat >= features) return;
+    float sum = 0.0f;
+    for (int item = 0; item < numItems; item++)
+        if (segmentIds[item] == segment) sum += input[item * features + feat];
+    output[segment * features + feat] += sum;
+}
+
 extern ""C"" __global__ __launch_bounds__(256) void segment_mean(
     const float* __restrict__ input,
     const int* __restrict__ segmentIds,
@@ -225,6 +266,25 @@ extern ""C"" __global__ __launch_bounds__(256) void segment_mean(
     {
         atomicAdd(&output[segment * features + feat], input[item * features + feat] / (float)size);
     }
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void segment_mean_deterministic(
+    const float* __restrict__ input,
+    const int* __restrict__ segmentIds,
+    const int* __restrict__ segmentSizes,
+    float* __restrict__ output,
+    int numItems, int numSegments, int features)
+{
+    int segment = blockIdx.x;
+    int feat = blockIdx.y * blockDim.x + threadIdx.x;
+    if (segment >= numSegments || feat >= features) return;
+    int size = segmentSizes[segment];
+    if (size <= 0) return;
+    float invSize = 1.0f / (float)size;
+    float sum = 0.0f;
+    for (int item = 0; item < numItems; item++)
+        if (segmentIds[item] == segment) sum += input[item * features + feat] * invSize;
+    output[segment * features + feat] += sum;
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void segment_max(
@@ -278,9 +338,35 @@ extern ""C"" __global__ __launch_bounds__(256) void csr_spmm_backward_b(
         {
             int colA = csrColIndices[i];
             float valA = csrValues[i];
+            // NON-DETERMINISTIC (issue #382); see csr_spmm_backward_b_deterministic.
             atomicAdd(&gradB[colA * N + col], valA * gradVal);
         }
     }
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void csr_spmm_backward_b_deterministic(
+    const float* __restrict__ csrValues,
+    const int* __restrict__ csrColIndices,
+    const int* __restrict__ csrRowPointers,
+    const float* __restrict__ gradOutput,
+    float* __restrict__ gradB,
+    int M, int K, int N, int nnz)
+{
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    int bRow = blockIdx.y;
+    if (col >= N || bRow >= K) return;
+
+    float sum = 0.0f;
+    for (int row = 0; row < M; row++) {
+        float gradVal = gradOutput[row * N + col];
+        if (gradVal == 0.0f) continue;
+        int rowStart = csrRowPointers[row];
+        int rowEnd = csrRowPointers[row + 1];
+        for (int i = rowStart; i < rowEnd; i++) {
+            if (csrColIndices[i] == bRow) sum += csrValues[i] * gradVal;
+        }
+    }
+    gradB[bRow * N + col] += sum;
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void csr_spmm_backward_values(
@@ -381,12 +467,16 @@ extern ""C"" __global__ __launch_bounds__(256) void symmetric_degree_normalize(
             "csr_spmm_bias",
             "csr_spmm_bias_relu",
             "scatter_add_edges",
+            "scatter_add_edges_deterministic",
             "gather_source_features",
             "gather_target_features",
             "segment_sum",
+            "segment_sum_deterministic",
             "segment_mean",
+            "segment_mean_deterministic",
             "segment_max",
             "csr_spmm_backward_b",
+            "csr_spmm_backward_b_deterministic",
             "csr_spmm_backward_values",
             "zero_buffer",
             "init_neg_inf",

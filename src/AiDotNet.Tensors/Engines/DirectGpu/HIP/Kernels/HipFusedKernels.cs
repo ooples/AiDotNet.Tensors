@@ -1006,8 +1006,31 @@ extern ""C"" __global__ __launch_bounds__(256) void reduce_mean_kernel(
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1)
         sum += __shfl_down(sum, offset);
+    // NON-DETERMINISTIC (issue #382); see reduce_mean_kernel_deterministic.
     if (tid == 0)
         atomicAdd(output, sum);
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void reduce_mean_kernel_deterministic(
+    const float* __restrict__ input, float* __restrict__ output, int size)
+{
+    extern __shared__ float sdata_dm[];
+    int tid = threadIdx.x;
+    float sum = 0.0f;
+    for (int i = tid; i < size; i += blockDim.x) sum += input[i];
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down(sum, offset);
+    int lane = tid & 31;
+    int warpId = tid >> 5;
+    if (lane == 0) sdata_dm[warpId] = sum;
+    __syncthreads();
+    int numWarps = (blockDim.x + 31) >> 5;
+    sum = (tid < numWarps) ? sdata_dm[tid] : 0.0f;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down(sum, offset);
+    if (tid == 0) *output = sum / (float)size;
 }
 
 // Compute variance given a known mean, using parallel reduction
@@ -1045,8 +1068,34 @@ extern ""C"" __global__ __launch_bounds__(256) void reduce_variance_kernel(
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1)
         sum += __shfl_down(sum, offset);
+    // NON-DETERMINISTIC (issue #382); see reduce_variance_kernel_deterministic.
     if (tid == 0)
         atomicAdd(output, sum);
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void reduce_variance_kernel_deterministic(
+    const float* __restrict__ input, float* __restrict__ output, float mean, int size)
+{
+    extern __shared__ float sdata_dv[];
+    int tid = threadIdx.x;
+    float sum = 0.0f;
+    for (int i = tid; i < size; i += blockDim.x) {
+        float diff = input[i] - mean;
+        sum += diff * diff;
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down(sum, offset);
+    int lane = tid & 31;
+    int warpId = tid >> 5;
+    if (lane == 0) sdata_dv[warpId] = sum;
+    __syncthreads();
+    int numWarps = (blockDim.x + 31) >> 5;
+    sum = (tid < numWarps) ? sdata_dv[tid] : 0.0f;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down(sum, offset);
+    if (tid == 0) *output = sum;
 }
 ";
     }
@@ -1080,7 +1129,9 @@ extern ""C"" __global__ __launch_bounds__(256) void reduce_variance_kernel(
             "lerp_fused",
             "add_scaled",
             "reduce_mean_kernel",
-            "reduce_variance_kernel"
+            "reduce_mean_kernel_deterministic",
+            "reduce_variance_kernel",
+            "reduce_variance_kernel_deterministic"
         };
     }
 }

@@ -764,6 +764,7 @@ extern ""C"" __global__ __launch_bounds__(256) void prelu_backward_input(const f
     gradInput[idx] = x >= 0.0f ? gradOutput[idx] : a * gradOutput[idx];
 }
 
+// NON-DETERMINISTIC (issue #382); see prelu_backward_alpha_deterministic.
 extern ""C"" __global__ __launch_bounds__(256) void prelu_backward_alpha(const float* gradOutput, const float* input, float* gradAlpha, int size, int alphaSize)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -773,6 +774,18 @@ extern ""C"" __global__ __launch_bounds__(256) void prelu_backward_alpha(const f
         int alphaIdx = idx % alphaSize;
         atomicAdd(&gradAlpha[alphaIdx], x * gradOutput[idx]);
     }
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void prelu_backward_alpha_deterministic(const float* gradOutput, const float* input, float* gradAlpha, int size, int alphaSize)
+{
+    int alphaIdx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (alphaIdx >= alphaSize) return;
+    float sum = 0.0f;
+    for (int idx = alphaIdx; idx < size; idx += alphaSize) {
+        float x = input[idx];
+        if (x < 0.0f) sum += x * gradOutput[idx];
+    }
+    gradAlpha[alphaIdx] += sum;
 }
 
 // RReLU
@@ -925,6 +938,7 @@ extern ""C"" __global__ __launch_bounds__(256) void bilinear_upsample2d(const fl
     output[idx] = (1.0f-hd)*(1.0f-wd)*input[base_idx+h0*inW+w0] + (1.0f-hd)*wd*input[base_idx+h0*inW+w1] + hd*(1.0f-wd)*input[base_idx+h1*inW+w0] + hd*wd*input[base_idx+h1*inW+w1];
 }
 
+// NON-DETERMINISTIC (issue #382); see scatter_mean_activation_deterministic.
 extern ""C"" __global__ __launch_bounds__(256) void scatter_mean(const float* source, const int* indices, float* output, int* counts, int sourceSize, int featureSize)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -933,6 +947,26 @@ extern ""C"" __global__ __launch_bounds__(256) void scatter_mean(const float* so
     int targetRow = indices[row];
     atomicAdd(&output[targetRow * featureSize + col], source[idx]);
     if (col == 0) atomicAdd(&counts[targetRow], 1);
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void scatter_mean_activation_deterministic(
+    const float* source, const int* indices, float* output, int* counts,
+    int sourceSize, int outputSize, int featureSize)
+{
+    int dstRow = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (dstRow >= outputSize || col >= featureSize) return;
+    int numSrcRows = sourceSize / featureSize;
+    float sum = 0.0f;
+    int cnt = 0;
+    for (int srcRow = 0; srcRow < numSrcRows; srcRow++) {
+        if (indices[srcRow] == dstRow) {
+            sum += source[srcRow * featureSize + col];
+            if (col == 0) cnt++;
+        }
+    }
+    output[dstRow * featureSize + col] = sum;
+    if (col == 0) counts[dstRow] = cnt;
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void scatter_mean_divide(float* output, const int* counts, int outputSize, int featureSize)
@@ -1170,14 +1204,14 @@ extern ""C"" __global__ __launch_bounds__(256) void max_vectors_vec4(const float
             "mish_backward", "softplus_backward", "hardswish_backward",
             "selu_backward", "hardsigmoid_backward", "hardtanh_backward",
             "relu6", "relu6_backward",
-            "prelu", "prelu_backward_input", "prelu_backward_alpha",
+            "prelu", "prelu_backward_input", "prelu_backward_alpha", "prelu_backward_alpha_deterministic",
             "rrelu", "rrelu_backward",
             "threshold_forward", "threshold_backward",
             "reciprocal_backward",
             "var_backward", "std_backward", "masked_fill_backward",
             "where_backward", "norm_backward", "logsumexp_backward",
             "avg_pool1d", "max_pool1d", "bilinear_upsample2d",
-            "scatter_mean", "scatter_mean_divide",
+            "scatter_mean", "scatter_mean_activation_deterministic", "scatter_mean_divide",
             "reduce_sum", "reduce_max", "reduce_min", "sum_axis", "bias_add",
             "conv2d_bias_add",
             // Vectorized (float4) unary
