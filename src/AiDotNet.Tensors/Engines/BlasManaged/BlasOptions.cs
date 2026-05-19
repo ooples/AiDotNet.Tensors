@@ -37,6 +37,14 @@ public readonly ref struct BlasOptions<T> where T : unmanaged
     public ulong AutotuneKey { get; init; }
     /// <summary>0 = use process default (64 MB).</summary>
     public long MaxJitCacheBytes { get; init; }
+
+    /// <summary>
+    /// Execution mode. Default <see cref="BlasMode.Deterministic"/> preserves bit-exact
+    /// cross-thread-count reproducibility (Gate 3). <see cref="BlasMode.Fast"/> opts into
+    /// non-associative reduction, FMA-on-FP32, and instruction reorder for higher
+    /// throughput at the cost of ±1-2 ULP cross-thread variability.
+    /// </summary>
+    public BlasMode Mode { get; init; }
 }
 
 public enum PackingMode

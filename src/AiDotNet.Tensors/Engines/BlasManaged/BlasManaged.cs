@@ -12,6 +12,15 @@ namespace AiDotNet.Tensors.Engines.BlasManaged;
 public static class BlasManaged
 {
     /// <summary>
+    /// Process-wide default execution mode. Applied when a caller's
+    /// <see cref="BlasOptions{T}.Mode"/> equals <see cref="BlasMode.Deterministic"/>
+    /// (the field default) — i.e., when the caller didn't explicitly opt in to
+    /// <see cref="BlasMode.Fast"/>. Set once at process start by the routing
+    /// shim (Sub-issue F, #374); otherwise stays <see cref="BlasMode.Deterministic"/>.
+    /// </summary>
+    public static BlasMode DefaultMode { get; set; } = BlasMode.Deterministic;
+
+    /// <summary>
     /// Computes C = op(A) · op(B), where op(X) is X or X^T.
     ///
     /// <para>
