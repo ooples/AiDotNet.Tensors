@@ -12419,10 +12419,40 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     }
 
     // --- Reductions ---
-    public void ReduceMean(IGpuBuffer input, IGpuBuffer output, int size) => LaunchFusedUnary("reduce_mean", input, output, size);
+    // Issue #382: when GpuDeterminism.IsActive, route to single-block strided
+    // deterministic variants (no inter-block atomic combine).
+    public unsafe void ReduceMean(IGpuBuffer input, IGpuBuffer output, int size)
+        => LaunchFusedUnaryReduce(
+            GpuDeterminism.IsActive ? "reduce_mean_deterministic" : "reduce_mean",
+            input, output, size, GpuDeterminism.IsActive);
     public void ReduceProduct(IGpuBuffer input, IGpuBuffer output, int size) => LaunchFusedUnary("reduce_product", input, output, size);
-    public void ReduceNormL2(IGpuBuffer input, IGpuBuffer output, int size) => LaunchFusedUnary("reduce_norm_l2", input, output, size);
-    public void ReduceSumOfSquares(IGpuBuffer input, IGpuBuffer output, int size) => LaunchFusedUnary("reduce_sum_of_squares", input, output, size);
+    public unsafe void ReduceNormL2(IGpuBuffer input, IGpuBuffer output, int size)
+        => LaunchFusedUnaryReduce(
+            GpuDeterminism.IsActive ? "reduce_norm_l2_deterministic" : "reduce_norm_l2",
+            input, output, size, GpuDeterminism.IsActive);
+    public unsafe void ReduceSumOfSquares(IGpuBuffer input, IGpuBuffer output, int size)
+        => LaunchFusedUnaryReduce(
+            GpuDeterminism.IsActive ? "reduce_sum_of_squares_deterministic" : "reduce_sum_of_squares",
+            input, output, size, GpuDeterminism.IsActive);
+
+    /// <summary>
+    /// Issue #382: variant of LaunchFusedUnary for scalar reductions that
+    /// honors deterministic mode. When deterministic=true, launches a single block
+    /// (the deterministic kernels do a strided reduce in one block) and pre-zeros
+    /// the output (the kernel does a direct write, not an atomic accumulate).
+    /// </summary>
+    private unsafe void LaunchFusedUnaryReduce(string kernelName, IGpuBuffer input, IGpuBuffer output, int size, bool deterministic)
+    {
+        if (!_kernelCache.TryGetValue(kernelName, out var kernel))
+            throw new InvalidOperationException($"CUDA kernel not found: {kernelName}");
+        using var _ = PushContext();
+        if (deterministic) Fill(output, 0f, 1);
+        IntPtr inPtr = input.Handle, outPtr = output.Handle;
+        void** args = stackalloc void*[3];
+        args[0] = &inPtr; args[1] = &outPtr; args[2] = &size;
+        uint grid = deterministic ? 1u : (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
     public void ReduceMaxMagnitude(IGpuBuffer input, IGpuBuffer output, int size) => LaunchFusedUnary("reduce_max_magnitude", input, output, size);
     public void ReduceMinMagnitude(IGpuBuffer input, IGpuBuffer output, int size) => LaunchFusedUnary("reduce_min_magnitude", input, output, size);
 
