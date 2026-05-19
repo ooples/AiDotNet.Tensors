@@ -43,10 +43,15 @@ internal static class Avx2Streaming
             return;
         }
 
-        // NN and TN: B is contiguous along N. We process the C output in 4-wide
-        // column blocks. For each output row i and each col-block jb (4 cols),
-        // accumulate over k using Vector256<double> loads from B.
-        int nBlocks = n / 4;
+        // Sub-D8 — multi-accumulator FP64 streaming. Two SIMD tiers:
+        //   4-acc loop: 16 cols per iter (4 Vector256<double> accumulators)
+        //   1-acc loop: 4-col tail
+        // Then scalar tail for n % 4.
+        // FP64 vec width = 4 doubles, so 4-acc covers 16 cols which is the sweet
+        // spot for Zen3 FMA pipelining (needs 5+ acc, but 4 + B-load chain is close).
+        int nBig = (n / 16) * 16;     // largest multiple of 16 ≤ n
+        int nBlocks = n / 4;           // 4-col blocks for the tail
+        int nBig4_blocks = nBig / 4;   // covered by the 4-acc loop
 
         fixed (double* aPtr = a)
         fixed (double* bPtr = b)
@@ -54,8 +59,30 @@ internal static class Avx2Streaming
         {
             for (int i = 0; i < m; i++)
             {
-                // Process 4-col blocks via SIMD.
-                for (int jb = 0; jb < nBlocks; jb++)
+                // ── 4-acc SIMD path: 16 cols per iter ──────────────────────────
+                for (int jStart = 0; jStart < nBig; jStart += 16)
+                {
+                    Vector256<double> acc0 = Avx.LoadVector256(cPtr + i * ldc + jStart + 0);
+                    Vector256<double> acc1 = Avx.LoadVector256(cPtr + i * ldc + jStart + 4);
+                    Vector256<double> acc2 = Avx.LoadVector256(cPtr + i * ldc + jStart + 8);
+                    Vector256<double> acc3 = Avx.LoadVector256(cPtr + i * ldc + jStart + 12);
+                    for (int kk = 0; kk < k; kk++)
+                    {
+                        double aval = transA ? aPtr[kk * lda + i] : aPtr[i * lda + kk];
+                        Vector256<double> aVec = Vector256.Create(aval);
+                        double* bRow = bPtr + kk * ldb + jStart;
+                        acc0 = Fma.MultiplyAdd(aVec, Avx.LoadVector256(bRow + 0), acc0);
+                        acc1 = Fma.MultiplyAdd(aVec, Avx.LoadVector256(bRow + 4), acc1);
+                        acc2 = Fma.MultiplyAdd(aVec, Avx.LoadVector256(bRow + 8), acc2);
+                        acc3 = Fma.MultiplyAdd(aVec, Avx.LoadVector256(bRow + 12), acc3);
+                    }
+                    Avx.Store(cPtr + i * ldc + jStart + 0, acc0);
+                    Avx.Store(cPtr + i * ldc + jStart + 4, acc1);
+                    Avx.Store(cPtr + i * ldc + jStart + 8, acc2);
+                    Avx.Store(cPtr + i * ldc + jStart + 12, acc3);
+                }
+                // ── 1-acc SIMD path: remaining 4-col blocks ──
+                for (int jb = nBig4_blocks; jb < nBlocks; jb++)
                 {
                     int jStart = jb * 4;
                     Vector256<double> acc = Avx.LoadVector256(cPtr + i * ldc + jStart);
