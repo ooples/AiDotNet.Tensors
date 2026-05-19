@@ -102,6 +102,14 @@ internal static class BlasProvider
         catch { /* libopenblas symbol missing — earlier OpenBLAS builds may lack it. Tolerate. */ }
     }
 
+    /// <summary>
+    /// Returns the cached OpenBLAS thread count last set by <see cref="TrySetOpenBlasThreads(int)"/>,
+    /// or <c>-1</c> if no override has been applied this process. Used by callers that
+    /// run an outer parallel-for around BLAS calls and need to scope OpenBLAS down to
+    /// 1 thread (avoid oversubscription) then restore the prior value on exit.
+    /// </summary>
+    internal static int GetOpenBlasThreadCount() => _openblasThreadCount;
+
 
     // ─────────────────────────────────────────────────────────────────────
     // Issue #338 Phase G.1 — Intel MKL via Microsoft.ML.Mkl.Redist.

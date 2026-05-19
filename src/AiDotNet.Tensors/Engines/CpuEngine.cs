@@ -23002,6 +23002,22 @@ public partial class CpuEngine : ITensorLevelEngine
 
         int scoresLen = bhCount * seqQ * seqK;
         var scoresData = System.Buffers.ArrayPool<double>.Shared.Rent(scoresLen);
+
+        // #1305: avoid OpenBLAS thread oversubscription against our outer
+        // batch*heads parallel-for. Each per-head GEMM is tiny
+        // (M=seqQ, K=headDim≤128, N=seqK) — multi-threaded OpenBLAS gives no
+        // wall-time benefit over a sequential kernel at this size, and on a
+        // 32-core host an 8-head outer parallel-for × 32-thread inner DGEMM
+        // produces ~256-thread oversubscription that takes the call from
+        // ~30 ms to >600 s (>20,000× slower). Force OpenBLAS to 1 thread for
+        // the duration of the parallel-for and restore the prior count.
+        int savedBlasThreads = Helpers.BlasProvider.GetOpenBlasThreadCount();
+        bool blasScoped = false;
+        if (Helpers.BlasProvider.IsAvailable && savedBlasThreads != 1)
+        {
+            Helpers.BlasProvider.TrySetOpenBlasThreads(1);
+            blasScoped = true;
+        }
         try
         {
             var weightsData = new double[scoresLen];
@@ -23113,6 +23129,14 @@ public partial class CpuEngine : ITensorLevelEngine
         finally
         {
             System.Buffers.ArrayPool<double>.Shared.Return(scoresData, clearArray: false);
+            // #1305: restore the prior OpenBLAS thread count. savedBlasThreads = -1
+            // means "never set this process" — passing 0 restores the OpenBLAS auto/
+            // OMP_NUM_THREADS default. SetDeterministicMode flips this to 1 globally;
+            // we honor that by only restoring when we ourselves changed it.
+            if (blasScoped)
+            {
+                Helpers.BlasProvider.TrySetOpenBlasThreads(savedBlasThreads < 0 ? 0 : savedBlasThreads);
+            }
         }
     }
 
