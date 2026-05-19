@@ -2584,17 +2584,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (!IsAvailable)
             throw new InvalidOperationException("CUDA backend is not available.");
 
-        if (!_kernelCache.TryGetValue("scatter_add_edges", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: scatter_add_edges");
-
         using var _ = PushContext();
 
         // First zero the output buffer
         ZeroBuffer(output, numNodes * features);
-
-        // Launch configuration: edges x ceil(features/blockSize) grid
-        uint gridX = (uint)numEdges;
-        uint gridY = (uint)((features + DefaultBlockSize - 1) / DefaultBlockSize);
 
         IntPtr inputPtr = input.Handle;
         IntPtr sourcePtr = sourceIndices.Handle;
@@ -2603,17 +2596,6 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         IntPtr outputPtr = output.Handle;
         int hasEdgeValues = edgeValues is not null ? 1 : 0;
 
-        void** args = stackalloc void*[8];
-        args[0] = &inputPtr;
-        args[1] = &sourcePtr;
-        args[2] = &targetPtr;
-        args[3] = &edgeValuesPtr;
-        args[4] = &outputPtr;
-        args[5] = &numNodes;
-        args[6] = &numEdges;
-        args[7] = &features;
-
-        // Note: hasEdgeValues is passed as part of the kernel argument structure
         void** args2 = stackalloc void*[9];
         args2[0] = &inputPtr;
         args2[1] = &sourcePtr;
@@ -2625,6 +2607,22 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         args2[7] = &features;
         args2[8] = &hasEdgeValues;
 
+        if (GpuDeterminism.IsActive)
+        {
+            // Issue #382: per-target-node thread scans edges in fixed order.
+            if (!_kernelCache.TryGetValue("scatter_add_edges_deterministic", out var krnlD))
+                throw new InvalidOperationException("CUDA kernel not found: scatter_add_edges_deterministic");
+            uint gridDX = (uint)numNodes;
+            uint gridDY = (uint)((features + DefaultBlockSize - 1) / DefaultBlockSize);
+            LaunchKernel2D(krnlD, gridDX, gridDY, (uint)DefaultBlockSize, 1, args2);
+            return;
+        }
+
+        if (!_kernelCache.TryGetValue("scatter_add_edges", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: scatter_add_edges");
+
+        uint gridX = (uint)numEdges;
+        uint gridY = (uint)((features + DefaultBlockSize - 1) / DefaultBlockSize);
         LaunchKernel2D(kernel, gridX, gridY, (uint)DefaultBlockSize, 1, args2);
     }
 
@@ -12746,14 +12744,20 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void Crop2DBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput, int batch, int channels, int inH, int inW, int outH, int outW, int offsetH, int offsetW)
     {
-        if (!_kernelCache.TryGetValue("crop_2d_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: crop_2d_backward");
         using var _ = PushContext();
         IntPtr goPtr = gradOutput.Handle, giPtr = gradInput.Handle;
         void** args = stackalloc void*[10];
         args[0] = &goPtr; args[1] = &giPtr; args[2] = &batch; args[3] = &channels;
         args[4] = &inH; args[5] = &inW; args[6] = &outH; args[7] = &outW; args[8] = &offsetH; args[9] = &offsetW;
         uint total = (uint)(batch * channels * outH * outW);
+
+        // Issue #382: original uses atomicAdd defensively (mapping is one-to-one
+        // per launch). Deterministic variant uses direct +=.
+        string kernelName = GpuDeterminism.IsActive
+            ? "crop_2d_backward_deterministic"
+            : "crop_2d_backward";
+        if (!_kernelCache.TryGetValue(kernelName, out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: " + kernelName);
         LaunchKernel(kernel, (total + DefaultBlockSize - 1) / DefaultBlockSize, DefaultBlockSize, args);
     }
 
