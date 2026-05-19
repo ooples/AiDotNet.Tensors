@@ -444,15 +444,71 @@ internal static class PackBothStrategy
                     // Pack B[pc..pc+effectiveKc, jc..jc+effectiveNc] into packBArr.
                     // transB=false: panel starts at b[pc * ldb + jc].
                     // transB=true:  panel starts at b[jc * ldb + pc].
-                    // Pass a padded slice (packedBByteCount) so ScalarPack.PackB can
-                    // zero-pad the partial tail stripe when effectiveNc % nr != 0.
                     int bSliceOffset = transB ? jc * ldb + pc : pc * ldb + jc;
-                    ReadOnlySpan<T> bSlice = new ReadOnlySpan<T>((T*)bPtrInt + bSliceOffset, bLen - bSliceOffset);
-                    Span<T> packBTemp = MemoryMarshal.Cast<byte, T>(packBArr.AsSpan(0, packedBByteCount));
-                    Avx2Pack.PackB<T>(
-                        b: bSlice, ldb, transB,
-                        packed: packBTemp,
-                        nc: effectiveNc, kc: effectiveKc, nr);
+                    int totalNumStripes = (effectiveNc + nr - 1) / nr;
+
+                    // Sub-N (#404): parallelize pack-B across stripes when the
+                    // buffer is large enough to amortize Parallel.For overhead.
+                    // Each stripe writes a disjoint region of packBArr
+                    // ([stripeIdx, Kc, Nr]) — no synchronization needed.
+                    // Threshold: ≥4 stripes AND ≥procs threads available AND
+                    // ≥256 KB of pack work — below that, serial wins.
+                    int packBStripeSize = effectiveKc * nr * elemSize;
+                    int procsLocal = options.NumThreads > 0 ? options.NumThreads : Environment.ProcessorCount;
+                    if (options.NumThreads < 0) procsLocal = 1;
+                    bool packBParallelWorthwhile =
+                        totalNumStripes >= 4
+                        && procsLocal >= 2
+                        && (long)packBStripeSize * totalNumStripes >= 256 * 1024;
+
+                    int bSliceOffset_cap = bSliceOffset;
+                    int effectiveKc_packB_cap = effectiveKc;
+                    int effectiveNc_packB_cap = effectiveNc;
+                    int bLen_cap = bLen;
+
+                    if (packBParallelWorthwhile)
+                    {
+                        // Partition stripes across procs threads. Each thread packs
+                        // [chunkStart, chunkEnd) stripes into its own slice of packBArr.
+                        int chunkSize = Math.Max(1, (totalNumStripes + procsLocal - 1) / procsLocal);
+                        int numChunks = (totalNumStripes + chunkSize - 1) / chunkSize;
+                        long packTotalWork = (long)packBStripeSize * totalNumStripes;
+
+                        CpuParallelSettings.ParallelForOrSerial(0, numChunks, packTotalWork, chunkIdx =>
+                        {
+                            int stripeStart = chunkIdx * chunkSize;
+                            int stripeEnd = Math.Min(stripeStart + chunkSize, totalNumStripes);
+                            int numStripesInChunk = stripeEnd - stripeStart;
+                            if (numStripesInChunk <= 0) return;
+
+                            unsafe
+                            {
+                                int srcAdjustedOffset = bSliceOffset_cap;  // base for the (jc, pc) panel
+                                ReadOnlySpan<T> bSliceLocal = new ReadOnlySpan<T>((T*)bPtrInt + srcAdjustedOffset, bLen_cap - srcAdjustedOffset);
+                                int packedStripeOffElems = stripeStart * effectiveKc_packB_cap * nr;
+                                Span<T> packBSliceLocal = MemoryMarshal.Cast<byte, T>(
+                                    packBArr.AsSpan(packedStripeOffElems * elemSize,
+                                                    numStripesInChunk * effectiveKc_packB_cap * nr * elemSize));
+                                Avx2Pack.PackBStripeRange<T>(
+                                    bSliceLocal, ldb, transB,
+                                    packBSliceLocal,
+                                    stripeStart, numStripesInChunk,
+                                    effectiveNc_packB_cap, effectiveKc_packB_cap, nr);
+                            }
+                        });
+                    }
+                    else
+                    {
+                        // Serial pack — buffer too small or single-thread context.
+                        // Pass a padded slice (packedBByteCount) so ScalarPack.PackB can
+                        // zero-pad the partial tail stripe when effectiveNc % nr != 0.
+                        ReadOnlySpan<T> bSlice = new ReadOnlySpan<T>((T*)bPtrInt + bSliceOffset, bLen - bSliceOffset);
+                        Span<T> packBTemp = MemoryMarshal.Cast<byte, T>(packBArr.AsSpan(0, packedBByteCount));
+                        Avx2Pack.PackB<T>(
+                            b: bSlice, ldb, transB,
+                            packed: packBTemp,
+                            nc: effectiveNc, kc: effectiveKc, nr);
+                    }
                 }
 
                 // ── M-axis parallel split on the ic loop ──────────────────────────────────

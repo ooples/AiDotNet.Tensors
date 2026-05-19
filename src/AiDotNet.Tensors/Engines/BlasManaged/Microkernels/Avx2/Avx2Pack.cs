@@ -558,4 +558,37 @@ internal static class Avx2Pack
         }
         ScalarPack.PackB<T>(b, ldb, transB, packed, nc, kc, nr);
     }
+
+    /// <summary>
+    /// Sub-N (#404): pack a single (stripeStart … stripeStart+numStripes) range
+    /// of B-stripes into the packed buffer at the matching stripe offset. Each
+    /// stripe occupies <c>kc * nr</c> elements at <c>(stripeIdx - stripeStart) * kc * nr</c>
+    /// when caller passes the packed-buffer slice rooted at <c>stripeStart * kc * nr</c>.
+    /// Used by PackBothStrategy.RunParallelUnsafe to parallelize the pack-B
+    /// step across nc-stripes — disjoint write regions, no synchronization.
+    /// </summary>
+    /// <param name="b">Source B with the SAME logical position as the full PackB call.</param>
+    /// <param name="packedStripeSlice">Pre-sliced packed buffer rooted at <c>stripeStart * kc * nr</c>.</param>
+    /// <param name="stripeStart">First stripe index to pack (inclusive).</param>
+    /// <param name="numStripes">Number of stripes to pack.</param>
+    /// <param name="totalNc">Original full <c>nc</c> for the call (for tail-stripe zero-pad).</param>
+    public static void PackBStripeRange<T>(
+        ReadOnlySpan<T> b, int ldb, bool transB,
+        Span<T> packedStripeSlice,
+        int stripeStart, int numStripes,
+        int totalNc, int kc, int nr) where T : unmanaged
+    {
+        // Compute the source slice offset for this stripe range. PackB's source
+        // walking starts at column 0 (transB=false) or row 0 (transB=true) of the
+        // caller-supplied b. To pack only stripes [stripeStart, stripeStart+numStripes),
+        // we advance the source by stripeStart*nr in N (transB=false: cols) or in K
+        // (transB=true: rows-of-Bᵀ which are N).
+        int srcOffset = transB ? stripeStart * nr * ldb : stripeStart * nr;
+        var bSlice = b.Slice(srcOffset);
+        // Effective Nc for this range is min(numStripes * nr, totalNc - stripeStart * nr)
+        // so the last (possibly partial) stripe gets zero-padded by the underlying PackB.
+        int effectiveNc = Math.Min(numStripes * nr, totalNc - stripeStart * nr);
+        if (effectiveNc <= 0) return;
+        PackB<T>(bSlice, ldb, transB, packedStripeSlice, effectiveNc, kc, nr);
+    }
 }
