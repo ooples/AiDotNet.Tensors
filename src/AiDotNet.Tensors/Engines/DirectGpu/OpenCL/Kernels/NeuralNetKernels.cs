@@ -1319,7 +1319,9 @@ __kernel void gather_kernel(
 }
 
 // ScatterAdd operation
-// Uses atomic operations for thread safety when indices collide
+// Uses atomic operations for thread safety when indices collide.
+// Non-deterministic across runs (issue #382). DeterministicMode dispatches to
+// scatter_add_kernel_deterministic below.
 __kernel void scatter_add_kernel(
     __global const float* source,
     __global const float* indices,
@@ -1335,6 +1337,29 @@ __kernel void scatter_add_kernel(
         // Use atomic add for thread safety when multiple sources scatter to same destination
         atomic_add_float(&destination[destIdx * featureSize + f], source[idx * featureSize + f]);
     }
+}
+
+// ScatterAdd — bit-deterministic variant (issue #382).
+// One work-item per (dstRow, f) cell; scans source rows in fixed ascending order.
+__kernel void scatter_add_kernel_deterministic(
+    __global const float* source,
+    __global const float* indices,
+    __global float* destination,
+    const int sourceSize,
+    const int destSize,
+    const int featureSize)
+{
+    const int dstRow = get_global_id(0);
+    const int f = get_global_id(1);
+    if (dstRow >= destSize || f >= featureSize) return;
+
+    float sum = 0.0f;
+    for (int i = 0; i < sourceSize; i++) {
+        if ((int)indices[i] == dstRow) {
+            sum += source[i * featureSize + f];
+        }
+    }
+    destination[dstRow * featureSize + f] += sum;
 }
 
 // ===========================================================================
@@ -1574,6 +1599,28 @@ __kernel void scatter_add_batched(
     atomic_add_float(&dst[dstIdx * featureSize + featIdx], src[idx]);
 }
 
+// scatter_add_batched — bit-deterministic variant (issue #382).
+__kernel void scatter_add_batched_deterministic(
+    __global const float* src,
+    __global const int* indices,
+    __global float* dst,
+    const int numElements,
+    const int numNodes,
+    const int featureSize)
+{
+    const int dstIdx = get_global_id(0);
+    const int featIdx = get_global_id(1);
+    if (dstIdx >= numNodes || featIdx >= featureSize) return;
+
+    float sum = 0.0f;
+    for (int i = 0; i < numElements; i++) {
+        if (indices[i] == dstIdx) {
+            sum += src[i * featureSize + featIdx];
+        }
+    }
+    dst[dstIdx * featureSize + featIdx] += sum;
+}
+
 __kernel void scatter_mean_accumulate(
     __global const float* src,
     __global const int* indices,
@@ -1596,6 +1643,32 @@ __kernel void scatter_mean_accumulate(
         // Use atomic increment for counts
         atomic_inc(&counts[dstIdx]);
     }
+}
+
+// scatter_mean_accumulate — bit-deterministic variant (issue #382).
+__kernel void scatter_mean_accumulate_deterministic(
+    __global const float* src,
+    __global const int* indices,
+    __global float* dst,
+    __global int* counts,
+    const int numElements,
+    const int numNodes,
+    const int featureSize)
+{
+    const int dstIdx = get_global_id(0);
+    const int featIdx = get_global_id(1);
+    if (dstIdx >= numNodes || featIdx >= featureSize) return;
+
+    float sum = 0.0f;
+    int cnt = 0;
+    for (int i = 0; i < numElements; i++) {
+        if (indices[i] == dstIdx) {
+            sum += src[i * featureSize + featIdx];
+            if (featIdx == 0) cnt++;
+        }
+    }
+    dst[dstIdx * featureSize + featIdx] += sum;
+    if (featIdx == 0) counts[dstIdx] += cnt;
 }
 
 __kernel void scatter_mean_normalize(
@@ -1621,6 +1694,8 @@ __kernel void scatter_mean_normalize(
 // Group normalization backward - Pass 1: Compute group-wise sums
 // CRITICAL: Host MUST validate that C % G == 0 before launching this kernel.
 // Launching with C not divisible by G will produce incorrect results.
+// Non-deterministic across runs (issue #382); see groupnorm_backward_sums_per_channel
+// + groupnorm_backward_sums_per_group below for the deterministic variants.
 __kernel void groupnorm_backward_sums(
     __global const float* gradOutput,
     __global const float* input,
@@ -1659,6 +1734,87 @@ __kernel void groupnorm_backward_sums(
     int groupIdx = n * G + g;
     atomic_add_float(&sumDy[groupIdx], dyGam);
     atomic_add_float(&sumDyXhat[groupIdx], dyGam * xHat);
+}
+
+// GroupNorm backward sums — bit-deterministic variants (issue #382).
+// Split into two kernels because the four atomic outputs reduce over different shapes:
+//   gradGamma/gradBeta:  one cell per channel C, sum over (N, H, W)
+//   sumDy/sumDyXhat:     one cell per (N, G), sum over (channelsPerGroup, H, W)
+// Each work-item owns one output cell and scans the contributing input range in a fixed
+// order — accumulation is bit-identical across runs.
+__kernel void groupnorm_backward_sums_per_channel_deterministic(
+    __global const float* gradOutput,
+    __global const float* input,
+    __global const float* mean,
+    __global const float* invStd,
+    __global float* gradGamma,
+    __global float* gradBeta,
+    const int N, const int C, const int H, const int W, const int G)
+{
+    const int c = get_global_id(0);
+    if (c >= C) return;
+
+    const int channelsPerGroup = C / G;
+    const int g = c / channelsPerGroup;
+    const int HW = H * W;
+
+    float accGamma = 0.0f;
+    float accBeta = 0.0f;
+    for (int n = 0; n < N; n++) {
+        float m = mean[n * G + g];
+        float s = invStd[n * G + g];
+        int baseNC = (n * C + c) * HW;
+        for (int hw = 0; hw < HW; hw++) {
+            float dy = gradOutput[baseNC + hw];
+            float x = input[baseNC + hw];
+            float xHat = (x - m) * s;
+            accGamma += dy * xHat;
+            accBeta += dy;
+        }
+    }
+    gradGamma[c] += accGamma;
+    gradBeta[c] += accBeta;
+}
+
+__kernel void groupnorm_backward_sums_per_group_deterministic(
+    __global const float* gradOutput,
+    __global const float* input,
+    __global const float* mean,
+    __global const float* invStd,
+    __global const float* gamma,
+    __global float* sumDy,
+    __global float* sumDyXhat,
+    const int N, const int C, const int H, const int W, const int G)
+{
+    const int ng = get_global_id(0);
+    if (ng >= N * G) return;
+
+    const int n = ng / G;
+    const int g = ng % G;
+    const int channelsPerGroup = C / G;
+    const int cStart = g * channelsPerGroup;
+    const int HW = H * W;
+
+    float m = mean[n * G + g];
+    float s = invStd[n * G + g];
+
+    float accDy = 0.0f;
+    float accDyXhat = 0.0f;
+    for (int cOff = 0; cOff < channelsPerGroup; cOff++) {
+        int c = cStart + cOff;
+        float gam = gamma[c];
+        int baseNC = (n * C + c) * HW;
+        for (int hw = 0; hw < HW; hw++) {
+            float dy = gradOutput[baseNC + hw];
+            float x = input[baseNC + hw];
+            float xHat = (x - m) * s;
+            float dyGam = dy * gam;
+            accDy += dyGam;
+            accDyXhat += dyGam * xHat;
+        }
+    }
+    sumDy[ng] += accDy;
+    sumDyXhat[ng] += accDyXhat;
 }
 
 // Group normalization backward - Pass 2: Compute final input gradients
@@ -1703,6 +1859,8 @@ __kernel void groupnorm_backward(
 }
 
 // Instance normalization backward - Pass 1: Compute instance-wise sums
+// Non-deterministic across runs (issue #382). DeterministicMode dispatches to the
+// per-channel + per-instance kernels below.
 __kernel void instancenorm_backward_sums(
     __global const float* gradOutput,
     __global const float* input,
@@ -1737,6 +1895,78 @@ __kernel void instancenorm_backward_sums(
     int instanceIdx = n * C + c;
     atomic_add_float(&sumDy[instanceIdx], dyGam);
     atomic_add_float(&sumDyXhat[instanceIdx], dyGam * xHat);
+}
+
+// InstanceNorm backward sums — bit-deterministic variants (issue #382).
+// Same two-axis split as the GroupNorm variants above:
+//   gradGamma/gradBeta:  one cell per channel C, sum over (N, H, W)
+//   sumDy/sumDyXhat:     one cell per (N, C) instance, sum over (H, W)
+__kernel void instancenorm_backward_sums_per_channel_deterministic(
+    __global const float* gradOutput,
+    __global const float* input,
+    __global const float* mean,
+    __global const float* invStd,
+    __global float* gradGamma,
+    __global float* gradBeta,
+    const int N, const int C, const int H, const int W)
+{
+    const int c = get_global_id(0);
+    if (c >= C) return;
+
+    const int HW = H * W;
+
+    float accGamma = 0.0f;
+    float accBeta = 0.0f;
+    for (int n = 0; n < N; n++) {
+        float m = mean[n * C + c];
+        float s = invStd[n * C + c];
+        int baseNC = (n * C + c) * HW;
+        for (int hw = 0; hw < HW; hw++) {
+            float dy = gradOutput[baseNC + hw];
+            float x = input[baseNC + hw];
+            float xHat = (x - m) * s;
+            accGamma += dy * xHat;
+            accBeta += dy;
+        }
+    }
+    gradGamma[c] += accGamma;
+    gradBeta[c] += accBeta;
+}
+
+__kernel void instancenorm_backward_sums_per_instance_deterministic(
+    __global const float* gradOutput,
+    __global const float* input,
+    __global const float* mean,
+    __global const float* invStd,
+    __global const float* gamma,
+    __global float* sumDy,
+    __global float* sumDyXhat,
+    const int N, const int C, const int H, const int W)
+{
+    const int nc = get_global_id(0);
+    if (nc >= N * C) return;
+
+    const int n = nc / C;
+    const int c = nc % C;
+    const int HW = H * W;
+
+    float m = mean[nc];
+    float s = invStd[nc];
+    float gam = gamma[c];
+
+    float accDy = 0.0f;
+    float accDyXhat = 0.0f;
+    int baseNC = nc * HW;
+    for (int hw = 0; hw < HW; hw++) {
+        float dy = gradOutput[baseNC + hw];
+        float x = input[baseNC + hw];
+        float xHat = (x - m) * s;
+        float dyGam = dy * gam;
+        accDy += dyGam;
+        accDyXhat += dyGam * xHat;
+    }
+    sumDy[nc] += accDy;
+    sumDyXhat[nc] += accDyXhat;
 }
 
 // Instance normalization backward - Pass 2: Compute final input gradients
@@ -1984,16 +2214,25 @@ __kernel void adaptive_avgpool_backward(
                 "mean_axis", "var_axis", "argmax_axis", "argmin_axis",
                 "dropout_forward", "dropout_backward",
                 "embedding_lookup", "embedding_backward", "embedding_backward_deterministic",
-                "fma_kernel", "gather_kernel", "scatter_add_kernel",
+                "fma_kernel", "gather_kernel", "scatter_add_kernel", "scatter_add_kernel_deterministic",
                 // LSTM kernels
                 "lstm_cell_forward", "lstm_cell_backward", "lstm_gates_precompute",
                 // GRU kernels
                 "gru_cell_forward", "gru_cell_backward",
                 // Additional scatter operations
-                "scatter_add_batched", "scatter_mean_accumulate", "scatter_mean_normalize",
-                // Additional normalization backward
-                "groupnorm_backward_sums", "groupnorm_backward",
-                "instancenorm_backward_sums", "instancenorm_backward",
+                "scatter_add_batched", "scatter_add_batched_deterministic",
+                "scatter_mean_accumulate", "scatter_mean_accumulate_deterministic",
+                "scatter_mean_normalize",
+                // Additional normalization backward (issue #382: deterministic variants split
+                // per-channel and per-group/instance to avoid atomic accumulation)
+                "groupnorm_backward_sums",
+                "groupnorm_backward_sums_per_channel_deterministic",
+                "groupnorm_backward_sums_per_group_deterministic",
+                "groupnorm_backward",
+                "instancenorm_backward_sums",
+                "instancenorm_backward_sums_per_channel_deterministic",
+                "instancenorm_backward_sums_per_instance_deterministic",
+                "instancenorm_backward",
                 // Conv3D backward
                 "conv3d_backward_input", "conv3d_backward_weights",
                 // Global pooling backward

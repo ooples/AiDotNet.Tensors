@@ -6985,40 +6985,83 @@ KERNEL VARIANTS (A/B testing):
             ZeroBuffer(gradGamma, channels);
             ZeroBuffer(gradBeta, channels);
 
-            // Pass 1: compute sums (uses atomics for gradGamma, gradBeta, sumDy, sumDyXhat)
-            var k1 = _kernelCache["instancenorm_backward_sums"];
-            uint arg = 0;
-            k1.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
-            k1.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
-            k1.SetArg(arg++, ((DirectOpenClGpuBuffer)saveMean).Buffer.Handle);
-            k1.SetArg(arg++, ((DirectOpenClGpuBuffer)saveInvVar).Buffer.Handle);
-            k1.SetArg(arg++, ((DirectOpenClGpuBuffer)gamma).Buffer.Handle);
-            k1.SetArg(arg++, ((DirectOpenClGpuBuffer)sumDyBuf).Buffer.Handle);
-            k1.SetArg(arg++, ((DirectOpenClGpuBuffer)sumDyXhatBuf).Buffer.Handle);
-            k1.SetArg(arg++, ((DirectOpenClGpuBuffer)gradGamma).Buffer.Handle);
-            k1.SetArg(arg++, ((DirectOpenClGpuBuffer)gradBeta).Buffer.Handle);
-            k1.SetArg(arg++, batch);
-            k1.SetArg(arg++, channels);
-            k1.SetArg(arg++, spatialSize); // H
-            k1.SetArg(arg++, 1);           // W = 1 (treat spatialSize as flat)
-            k1.Execute1D(totalSize, localSize);
-            _context.Finish();
+            // Pass 1: compute sums.
+            // Issue #382: atomic_add_float in instancenorm_backward_sums is FP-non-
+            // deterministic across runs. Under DeterministicMode, dispatch to two
+            // atomic-free kernels (per-channel for gradGamma/gradBeta, per-instance
+            // for sumDy/sumDyXhat) — each work-item owns one output cell and reduces
+            // its contributing range in fixed order.
+            if (GpuDeterminism.IsActive)
+            {
+                int hw = spatialSize; // host treats spatialSize as flat H, W = 1
+                var kpc = _kernelCache["instancenorm_backward_sums_per_channel_deterministic"];
+                uint apc = 0;
+                kpc.SetArg(apc++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
+                kpc.SetArg(apc++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+                kpc.SetArg(apc++, ((DirectOpenClGpuBuffer)saveMean).Buffer.Handle);
+                kpc.SetArg(apc++, ((DirectOpenClGpuBuffer)saveInvVar).Buffer.Handle);
+                kpc.SetArg(apc++, ((DirectOpenClGpuBuffer)gradGamma).Buffer.Handle);
+                kpc.SetArg(apc++, ((DirectOpenClGpuBuffer)gradBeta).Buffer.Handle);
+                kpc.SetArg(apc++, batch);
+                kpc.SetArg(apc++, channels);
+                kpc.SetArg(apc++, hw);
+                kpc.SetArg(apc++, 1);
+                kpc.Execute1D(channels, Math.Min(256, channels));
 
-            // Pass 2: compute gradInput using the accumulated sums
+                var kpi = _kernelCache["instancenorm_backward_sums_per_instance_deterministic"];
+                uint api = 0;
+                kpi.SetArg(api++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
+                kpi.SetArg(api++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+                kpi.SetArg(api++, ((DirectOpenClGpuBuffer)saveMean).Buffer.Handle);
+                kpi.SetArg(api++, ((DirectOpenClGpuBuffer)saveInvVar).Buffer.Handle);
+                kpi.SetArg(api++, ((DirectOpenClGpuBuffer)gamma).Buffer.Handle);
+                kpi.SetArg(api++, ((DirectOpenClGpuBuffer)sumDyBuf).Buffer.Handle);
+                kpi.SetArg(api++, ((DirectOpenClGpuBuffer)sumDyXhatBuf).Buffer.Handle);
+                kpi.SetArg(api++, batch);
+                kpi.SetArg(api++, channels);
+                kpi.SetArg(api++, hw);
+                kpi.SetArg(api++, 1);
+                int nc = batch * channels;
+                kpi.Execute1D(nc, Math.Min(256, nc));
+                _context.Finish();
+            }
+            else
+            {
+                var k1 = _kernelCache["instancenorm_backward_sums"];
+                uint arg = 0;
+                k1.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
+                k1.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+                k1.SetArg(arg++, ((DirectOpenClGpuBuffer)saveMean).Buffer.Handle);
+                k1.SetArg(arg++, ((DirectOpenClGpuBuffer)saveInvVar).Buffer.Handle);
+                k1.SetArg(arg++, ((DirectOpenClGpuBuffer)gamma).Buffer.Handle);
+                k1.SetArg(arg++, ((DirectOpenClGpuBuffer)sumDyBuf).Buffer.Handle);
+                k1.SetArg(arg++, ((DirectOpenClGpuBuffer)sumDyXhatBuf).Buffer.Handle);
+                k1.SetArg(arg++, ((DirectOpenClGpuBuffer)gradGamma).Buffer.Handle);
+                k1.SetArg(arg++, ((DirectOpenClGpuBuffer)gradBeta).Buffer.Handle);
+                k1.SetArg(arg++, batch);
+                k1.SetArg(arg++, channels);
+                k1.SetArg(arg++, spatialSize); // H
+                k1.SetArg(arg++, 1);           // W = 1 (treat spatialSize as flat)
+                k1.Execute1D(totalSize, localSize);
+                _context.Finish();
+            }
+
+            // Pass 2: compute gradInput using the accumulated sums (deterministic by
+            // construction — one work-item per (n, c, h, w), disjoint output cells).
             var k2 = _kernelCache["instancenorm_backward"];
-            arg = 0;
-            k2.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
-            k2.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
-            k2.SetArg(arg++, ((DirectOpenClGpuBuffer)saveMean).Buffer.Handle);
-            k2.SetArg(arg++, ((DirectOpenClGpuBuffer)saveInvVar).Buffer.Handle);
-            k2.SetArg(arg++, ((DirectOpenClGpuBuffer)gamma).Buffer.Handle);
-            k2.SetArg(arg++, ((DirectOpenClGpuBuffer)sumDyBuf).Buffer.Handle);
-            k2.SetArg(arg++, ((DirectOpenClGpuBuffer)sumDyXhatBuf).Buffer.Handle);
-            k2.SetArg(arg++, ((DirectOpenClGpuBuffer)gradInput).Buffer.Handle);
-            k2.SetArg(arg++, batch);
-            k2.SetArg(arg++, channels);
-            k2.SetArg(arg++, spatialSize); // H
-            k2.SetArg(arg++, 1);           // W = 1
+            uint arg2 = 0;
+            k2.SetArg(arg2++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
+            k2.SetArg(arg2++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+            k2.SetArg(arg2++, ((DirectOpenClGpuBuffer)saveMean).Buffer.Handle);
+            k2.SetArg(arg2++, ((DirectOpenClGpuBuffer)saveInvVar).Buffer.Handle);
+            k2.SetArg(arg2++, ((DirectOpenClGpuBuffer)gamma).Buffer.Handle);
+            k2.SetArg(arg2++, ((DirectOpenClGpuBuffer)sumDyBuf).Buffer.Handle);
+            k2.SetArg(arg2++, ((DirectOpenClGpuBuffer)sumDyXhatBuf).Buffer.Handle);
+            k2.SetArg(arg2++, ((DirectOpenClGpuBuffer)gradInput).Buffer.Handle);
+            k2.SetArg(arg2++, batch);
+            k2.SetArg(arg2++, channels);
+            k2.SetArg(arg2++, spatialSize); // H
+            k2.SetArg(arg2++, 1);           // W = 1
 
             k2.Execute1D(totalSize, localSize);
             _context.Finish();
