@@ -105,6 +105,63 @@ public class FrozenWeightRegistryTest
     }
 
     [Fact]
+    public void Registered_Weight_Adopted_In_ND_x_2D_TransformerPath()
+    {
+        // Transformer pattern: A is [batch, seq, hidden], B is [hidden, out_features].
+        // TensorMatMul collapses to TensorMatMulBatched which packs both into a
+        // single big GEMM. Registry should auto-adopt here too.
+        //
+        // Hidden must be ≥ 128 so the BlasManaged dispatcher picks PackBoth
+        // (k < 128 → PackAOnly which doesn't consume PackedB and the counter
+        // never ticks). Real transformer hidden dims (256/512/768) all qualify.
+        const int Batch = 4, Seq = 8, Hidden = 256, Out = 64;
+        var rng = new Random(101);
+        var a = new float[Batch * Seq * Hidden];
+        var b = new float[Hidden * Out];
+        for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < b.Length; i++) b[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        // Naïve reference: collapse A leading dims; gemm against B.
+        int Mflat = Batch * Seq;
+        var refResult = new float[Mflat * Out];
+        for (int i = 0; i < Mflat; i++)
+            for (int j = 0; j < Out; j++)
+            {
+                float sum = 0;
+                for (int kk = 0; kk < Hidden; kk++) sum += a[i * Hidden + kk] * b[kk * Out + j];
+                refResult[i * Out + j] = sum;
+            }
+
+        var aT = new Tensor<float>(a, new[] { Batch, Seq, Hidden });
+        var bT = new Tensor<float>(b, new[] { Hidden, Out });
+        var engine = new CpuEngine();
+
+        BlasManagedLib.ClearCaches();
+        FrozenWeightRegistry.Register(bT);
+        try
+        {
+            var statsBefore = BlasManagedLib.GetStats();
+            var result = engine.TensorMatMul(aT, bT);
+            var statsAfter = BlasManagedLib.GetStats();
+
+            double maxDelta = 0;
+            for (int i = 0; i < refResult.Length; i++)
+                maxDelta = Math.Max(maxDelta, Math.Abs(refResult[i] - result.Data.Span[i]));
+            Assert.True(maxDelta < 1e-3,
+                $"ND × 2D registered-weight TensorMatMul drift {maxDelta:G6} > 1e-3");
+
+            long hits = statsAfter.PackCacheHits - statsBefore.PackCacheHits;
+            Assert.True(hits > 0,
+                $"ND × 2D path should fire registry adoption; PackCacheHits delta={hits}");
+            _output.WriteLine($"ND × 2D PackCacheHits delta: {hits}");
+        }
+        finally
+        {
+            FrozenWeightRegistry.Unregister(bT);
+        }
+    }
+
+    [Fact]
     public void MarkDirty_Through_Registry_Forces_RePack()
     {
         const int M = 32, K = 64, N = 64;

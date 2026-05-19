@@ -11526,11 +11526,50 @@ public partial class CpuEngine : ITensorLevelEngine
         // wrong stride and produce silently incorrect results. The caller in
         // TensorMatMul ensures A is contiguous via a.Contiguous(); we guard
         // B here since it may be a shared weight matrix passed directly.
-        if (a.IsContiguous && b.IsContiguous && MatrixMultiplyHelper.TryGemm(
-            a.Data, 0, b.Data, 0, result.Data, 0,
-            batchSize * m, n, p))
+        if (a.IsContiguous && b.IsContiguous)
         {
-            return result;
+            // Sub-E (#373): collapsed ND × 2D path — when B is registered in
+            // FrozenWeightRegistry (the transformer-inference hot path), route
+            // the single big GEMM through BlasManaged with the pre-pack handle.
+            // The big-GEMM dim is (batchSize*m, n) × (n, p); pack-B amortizes
+            // across every batch slice in a single call, not just across
+            // separate calls — the consolidation already wins here, pre-pack
+            // adds the additional pack-cost amortization.
+            if (typeof(T) == typeof(float) || typeof(T) == typeof(double))
+            {
+                var handle = Engines.BlasManaged.FrozenWeightRegistry.TryGetHandle(b);
+                if (handle != null && Engines.BlasManaged.WeightPackCache.IsCacheCurrent(handle))
+                {
+                    int bigM = batchSize * m;
+                    if (typeof(T) == typeof(float))
+                    {
+                        var aArr = (float[])(object)aData;
+                        var bArr = (float[])(object)bData;
+                        var rArr = (float[])(object)rData;
+                        var opts = new Engines.BlasManaged.BlasOptions<float> { PackedB = handle };
+                        Engines.BlasManaged.BlasManaged.Gemm<float>(
+                            aArr, n, false, bArr, p, false, rArr, p, bigM, p, n, opts);
+                        return result;
+                    }
+                    else
+                    {
+                        var aArr = (double[])(object)aData;
+                        var bArr = (double[])(object)bData;
+                        var rArr = (double[])(object)rData;
+                        var opts = new Engines.BlasManaged.BlasOptions<double> { PackedB = handle };
+                        Engines.BlasManaged.BlasManaged.Gemm<double>(
+                            aArr, n, false, bArr, p, false, rArr, p, bigM, p, n, opts);
+                        return result;
+                    }
+                }
+            }
+
+            if (MatrixMultiplyHelper.TryGemm(
+                a.Data, 0, b.Data, 0, result.Data, 0,
+                batchSize * m, n, p))
+            {
+                return result;
+            }
         }
 
         // Fallback: per-slice dispatch (preserves behavior for non-contiguous A or
