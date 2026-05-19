@@ -458,7 +458,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 // Compile spatial transformer kernels (TopK, AffineGrid, GridSample)
                 var stProgram = CompileOrLoadCached(SpatialTransformerKernels.GetSource(), optimizationFlags, "Spatial transformer kernels");
                 _programs.Add(stProgram);
-                foreach (var name in new[] { "topk", "affine_grid", "grid_sample", "grid_sample_backward" })
+                foreach (var name in new[] { "topk", "affine_grid", "grid_sample", "grid_sample_backward", "grid_sample_backward_grad_grid_deterministic", "grid_sample_backward_grad_input_deterministic" })
                 {
                     _kernelCache[name] = new DirectOpenClKernel(_context, stProgram, name);
                 }

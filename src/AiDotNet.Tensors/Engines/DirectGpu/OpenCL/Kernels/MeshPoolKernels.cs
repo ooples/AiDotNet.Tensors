@@ -99,7 +99,24 @@ __kernel void mesh_pool_backward(
 
     float gradVal = gradOutput[keptIdx * inputChannels + channel];
 
+    // NON-DETERMINISTIC (issue #382); see mesh_pool_backward_deterministic.
     atomic_add_float(&gradInput[origIdx * inputChannels + channel], gradVal);
+}
+
+__kernel void mesh_pool_backward_deterministic(
+    __global const float* gradOutput,
+    __global const int* keptIndices,
+    __global float* gradInput,
+    const int numKept, const int numEdges, const int inputChannels)
+{
+    int origIdx = get_global_id(1);
+    int channel = get_global_id(0);
+    if (origIdx >= numEdges || channel >= inputChannels) return;
+    float sum = 0.0f;
+    for (int k = 0; k < numKept; k++) {
+        if (keptIndices[k] == origIdx) sum += gradOutput[k * inputChannels + channel];
+    }
+    gradInput[origIdx * inputChannels + channel] += sum;
 }
 
 // keptIndices: [numKept] - must be valid indices in [0, numEdges)
@@ -398,7 +415,28 @@ __kernel void mesh_pool_weighted_backward(
     float weight = scores[origIdx];
     float gradVal = gradOutput[keptIdx * inputChannels + channel] * weight;
 
+    // NON-DETERMINISTIC (issue #382); see mesh_pool_weighted_backward_deterministic.
     atomic_add_float(&gradInput[origIdx * inputChannels + channel], gradVal);
+}
+
+__kernel void mesh_pool_weighted_backward_deterministic(
+    __global const float* gradOutput,
+    __global const float* scores,
+    __global const int* keptIndices,
+    __global float* gradInput,
+    const int numKept, const int numEdges, const int inputChannels)
+{
+    int origIdx = get_global_id(1);
+    int channel = get_global_id(0);
+    if (origIdx >= numEdges || channel >= inputChannels) return;
+    float sum = 0.0f;
+    for (int k = 0; k < numKept; k++) {
+        if (keptIndices[k] == origIdx) {
+            float w = scores[origIdx];
+            sum += gradOutput[k * inputChannels + channel] * w;
+        }
+    }
+    gradInput[origIdx * inputChannels + channel] += sum;
 }
 
 // OPTIMIZED: O(k) instead of O(n*k)
@@ -475,6 +513,7 @@ __kernel void mesh_pool_scores_backward_legacy(
             "mesh_pool_compute_scores",
             "mesh_pool_gather",
             "mesh_pool_backward",
+            "mesh_pool_backward_deterministic",
             "mesh_pool_importance_backward",
             "mesh_pool_zero_grad",
             // Multi-kernel softmax approach (for large numEdges)
@@ -487,6 +526,7 @@ __kernel void mesh_pool_scores_backward_legacy(
             "mesh_pool_softmax_scores",
             "mesh_pool_weighted_gather",
             "mesh_pool_weighted_backward",
+            "mesh_pool_weighted_backward_deterministic",
             "mesh_pool_scores_backward",
             "mesh_pool_scores_backward_legacy"
         };
