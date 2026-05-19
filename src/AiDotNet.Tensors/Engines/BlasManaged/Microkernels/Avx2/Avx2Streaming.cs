@@ -136,11 +136,12 @@ internal static class Avx2Streaming
             return;
         }
 
-        // Process 64 cols per outer iter using 8 Vector256<float> accumulators.
-        // Each iter advances j by 64. With 8 accumulators, the FMA chain has
-        // enough independent ops to fully pipeline on Zen3 (FMA throughput 1
-        // per cycle once pipelined, latency 4-5 cycles → 5-acc minimum to hide).
-        int nBig = (n / 64) * 64;       // largest multiple of 64 ≤ n
+        // Sub-D9: for M=1 (gemv pattern, memory-bound), use 4-acc only.
+        // The 8-acc inner loop adds register pressure that the compiler spills
+        // on M=1 shapes (M=1 means no outer row reuse, so register pressure
+        // is the dominant cost vs FMA throughput). 4-acc was the sweet spot
+        // in the D6 baseline for these shapes (ResNet50_fc, MobileNetV2_fc).
+        int nBig = m == 1 ? 0 : (n / 64) * 64;       // M=1: skip 8-acc loop entirely
         int nBig32 = (n / 32) * 32;     // largest multiple of 32 ≤ n
         int nBlocks = n / 8;             // 8-col blocks for the trailing tail
         int nBig64_blocks = nBig / 8;    // covered by the 8-acc loop
