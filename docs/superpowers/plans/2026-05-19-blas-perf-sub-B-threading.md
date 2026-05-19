@@ -97,6 +97,23 @@
 - All three strategies use the same dispatch path
 - Removing/changing AxisSelector heuristic only requires editing one place
 
+### B.5 — 2D MN-grid in PackBothStrategy (deferred to follow-up)
+
+**Decision (2026-05-19):** **Defer** to a follow-up PR after baseline data shows MN_2D is actually a bottleneck. Rationale:
+
+- `AxisSelector.Select` picks `MN_2D` only when both M and N axes individually have too few blocks (`m_blocks * 2 < procs` AND `n_blocks > 1`). For the actual baseline catalog shapes, this is rare:
+  - Most BERT/ResNet shapes have M ≥ 256 so M-axis fires
+  - LSTM/Embedding/Attention have M=1 but huge N — N-axis fires
+  - Genuine 2D-grid cases need M and N both around 32–64, which the catalog lacks
+- Implementation cost is high: `PackBothStrategy.RunParallelUnsafe` does M-axis split AFTER packing B once per `jc`; converting to 2D grid requires either (a) packing all B-blocks upfront (~K*N elemsize extra memory) and threading over (jc, ic) tiles, or (b) accepting redundant per-thread B-packing. Either way is a meaningful rewrite of the parallel path.
+- The MN2DDriver primitive remains available for a future PR when a real bottleneck surfaces.
+
+`PackBothStrategy` keeps its current hardcoded M-axis parallel path. AxisSelector wire-up is also deferred — current code doesn't consult the selector.
+
+### B.6 — Centralize dispatch via StrategyDispatch helper (deferred to follow-up)
+
+**Decision (2026-05-19):** **Defer**. Three callers with slightly different (mr, nr) constants don't justify a wrapper class. When Sub-F's autotune cache lands, the dispatch becomes a cache lookup, making the centralization moot anyway.
+
 ### B.7 — `AxisSelector` autotune backing (deferred follow-up)
 
 **Decision:** **Defer** to a separate sub-PR or to Sub-issue F (the routing shim) which already uses the autotune cache. Wiring autotune into AxisSelector here would entangle B with F prematurely. AxisSelector stays heuristic in this PR; autotune adoption is a 1-PR follow-up.
