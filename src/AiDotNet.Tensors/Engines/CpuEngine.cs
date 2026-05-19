@@ -8344,28 +8344,32 @@ public partial class CpuEngine : ITensorLevelEngine
             // <Compile Remove>'d in the .csproj for that TFM). On net471 doubles
             // fall through to the im2col+GEMM path below.
             long convFmas = (long)batch * outChannels * inChannels * outputHeight * outputWidth * 9L;
-            // Per-output-channel work — needs to be high enough that the SIMD
-            // direct kernel's inner loop amortises parallel-task overhead. At
-            // SD UNet's deepest level (inChannels=1280 × 16×16 spatial) the
-            // per-channel work is only 2.9M ops which task-starves and falls
-            // to ~3% of peak GFLOPS (AiDotNet#1305 bench). im2col + DGEMM
-            // stays near peak at any shape because BLAS handles blocking
-            // internally. Empirical crossover from the #1305 bench:
-            //   - 320→640 at 32×32: per-channel 2.9M → direct kernel @ 110 GFLOPS
-            //   - 640→640 at 32×32: per-channel 5.9M → direct kernel @ 94 GFLOPS
-            //   - 640→1280 at 16×16: per-channel 1.5M → direct kernel @ 4.7 GFLOPS (fall off cliff)
-            //   - 1280→1280 at 16×16: per-channel 2.9M → direct kernel @ 4.5 GFLOPS
-            //   - 1280→1280 at 8×8: per-channel 737K → direct kernel @ 2.7 GFLOPS
-            // The cliff isn't strictly per-channel-work — outChannels matter too
-            // (high outChannels = many small tasks). Total work / outChannels
-            // captures the per-task budget; threshold 5M ops/task is the lowest
-            // value that keeps the existing-passing shapes on the direct path.
-            long perChannelWorkBudget = (long)batch * inChannels * outputHeight * outputWidth * 9L;
+            // AiDotNet#1305 perf gate: the direct kernel's per-output-channel
+            // loop traverses `outputHeight * outputWidth` output positions; if
+            // that count is small, the SIMD vector-register preroll + per-OC
+            // `Span.Clear()` + parallel-task scheduling overhead dominates the
+            // actual FMAs and throughput collapses. Empirical crossover from
+            // the #1305 bench (single Conv2DInto<double> on 32-core CPU):
+            //   spatial=4096 (320→320 @ 64×64):  158 GFLOPS — direct wins
+            //   spatial=1024 (320→640 @ 32×32):  110 GFLOPS — direct wins
+            //   spatial=1024 (640→640 @ 32×32):   94 GFLOPS — direct wins
+            //   spatial= 256 (640→1280 @ 16×16):   4.7 GFLOPS — direct CLIFF
+            //   spatial= 256 (1280→1280 @ 16×16):  4.5 GFLOPS — direct CLIFF
+            //   spatial=  64 (1280→1280 @ 8×8):    2.7 GFLOPS — direct CLIFF
+            // The discriminator is spatial output size, not per-channel work
+            // (the 320→640 @ 32×32 and 1280→1280 @ 16×16 cases both have ~2.9M
+            // ops per output channel but only the larger-spatial one is fast).
+            // Crossover sits between spatial=256 (cliff) and spatial=1024 (fast);
+            // threshold 512 is the midpoint that keeps every fast case on the
+            // direct path while routing the slow cliff shapes to im2col+DGEMM,
+            // which stays near peak at any shape because BLAS handles blocking
+            // internally.
+            long outputSpatial = (long)outputHeight * outputWidth;
             int directKernelMinTasks = 2 * Math.Max(1, Helpers.CpuParallelSettings.MaxDegreeOfParallelism);
-            const long MinPerChannelDirectWork = 5_000_000L;
+            const long MinDirectSpatial = 512L;
             bool directKernelFitsWell = convFmas <= 4_000_000L
                 || (outChannels >= directKernelMinTasks
-                    && perChannelWorkBudget >= MinPerChannelDirectWork);
+                    && outputSpatial >= MinDirectSpatial);
             if (kernelHeight == 3 && kernelWidth == 3
                 && stride == 1 && padding > 0 && dilation == 1
                 && directKernelFitsWell
@@ -8534,16 +8538,16 @@ public partial class CpuEngine : ITensorLevelEngine
             long convFmasInto = (long)batch * outChannels * inChannels * outputHeight * outputWidth * 9L;
             // AiDotNet#1305 perf gate: see Conv2D allocating overload above
             // for the empirical cliff (~3% peak GFLOPS at SD UNet deepest
-            // ResBlock shapes when per-channel work falls below ~5M ops).
+            // ResBlock shapes when output spatial size falls below ~512).
             // Same threshold/formula here so both inference paths (zero-alloc
             // Conv2DInto from ConvolutionalLayer.Forward + allocating Conv2D
             // from tape-active forward) make consistent kernel choices.
-            long perChannelWorkBudgetInto = (long)batch * inChannels * outputHeight * outputWidth * 9L;
+            long outputSpatialInto = (long)outputHeight * outputWidth;
             int directKernelMinTasksInto = 2 * Math.Max(1, Helpers.CpuParallelSettings.MaxDegreeOfParallelism);
-            const long MinPerChannelDirectWorkInto = 5_000_000L;
+            const long MinDirectSpatialInto = 512L;
             bool directKernelFitsWellInto = convFmasInto <= 4_000_000L
                 || (outChannels >= directKernelMinTasksInto
-                    && perChannelWorkBudgetInto >= MinPerChannelDirectWorkInto);
+                    && outputSpatialInto >= MinDirectSpatialInto);
             if (kernelHeight == 3 && kernelWidth == 3
                 && stride == 1 && padding > 0 && dilation == 1
                 && directKernelFitsWellInto
