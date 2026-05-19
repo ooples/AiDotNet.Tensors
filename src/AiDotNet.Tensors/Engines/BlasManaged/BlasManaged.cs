@@ -128,19 +128,111 @@ public static class BlasManaged
         // PackAOnly always uses scalar (4, 4) because its strided-B path has no
         // AVX2/AVX-512 RunStridedB variant yet (deferred to Phase Cx).
         var (mr, nr) = PickMicrokernelTile<T>();
+
+        // Sub-D4 (#372 follow-up): partial-M/N tail splitting. When the shape is
+        // big enough for the SIMD tile (m >= mr AND n >= nr) but not aligned
+        // (m % mr != 0 OR n % nr != 0), split the work into:
+        //   (a) aligned interior — fast path through the regular dispatcher
+        //   (b) M-tail rows                 — small, Streaming
+        //   (c) N-tail cols                 — small, Streaming
+        //   (d) MN corner (only if both)    — tiny, Streaming
+        // This avoids the entire shape falling to Streaming for a 1-7 row/col tail.
+        // Sub-D D.1 had previously routed all of (a..d) through Streaming for
+        // correctness, sacrificing the AVX2 perf on the aligned bulk. This restores it.
+        //
+        // Parallelism gate: PackBoth uses M-axis parallel; when m_aligned has too
+        // few mr-blocks to keep all cores busy, the streaming-N path wins despite
+        // the slower scalar microkernel because it parallelizes N-axis. Concrete
+        // example: ResNet50_layer4 m=49 → m_aligned=48 → 6 mr-blocks; on 16 cores
+        // most threads idle, so PackBoth ends up slower than Streaming with N
+        // split. Gate: m_aligned >= procs * mr (every core gets at least one
+        // mr-block).
+        //
+        // c.Clear() at the top of Gemm already zeroed all of c, so each sub-call
+        // accumulates from zero on its disjoint region (Streaming reads-modifies-
+        // writes; the recursive Gemm call re-clears its sub-slice, harmless).
+        // Epilogue is applied once at the very end on the full (m, n) — sub-calls
+        // get an inner options with Epilogue stripped to avoid double-application.
+        int splitMAligned = m - (m % mr);
+        int splitNAligned = n - (n % nr);
+        int splitProcs = options.NumThreads > 0 ? options.NumThreads : System.Environment.ProcessorCount;
+        if (m >= mr && n >= nr && (m % mr != 0 || n % nr != 0)
+            && splitMAligned >= splitProcs * mr)
+        {
+            int m_aligned = splitMAligned;
+            int n_aligned = splitNAligned;
+            int m_tail = m - m_aligned;
+            int n_tail = n - n_aligned;
+
+            // Strip epilogue for sub-calls; apply once at the end on full (m, n).
+            var innerOptions = new BlasOptions<T>
+            {
+                PackingMode = options.PackingMode,
+                Workspace = options.Workspace,
+                PackedA = options.PackedA,
+                PackedB = options.PackedB,
+                NumThreads = options.NumThreads,
+                AutotuneKey = options.AutotuneKey,
+                MaxJitCacheBytes = options.MaxJitCacheBytes,
+                Mode = options.Mode,
+                // Epilogue intentionally omitted.
+            };
+
+            // (a) Aligned interior — recursive Gemm on (m_aligned, n_aligned).
+            // m_aligned % mr == 0 AND n_aligned % nr == 0 by construction, so the
+            // recursion won't re-enter this branch.
+            if (m_aligned > 0 && n_aligned > 0)
+            {
+                Gemm<T>(a, lda, transA, b, ldb, transB, c, ldc,
+                        m_aligned, n_aligned, k, in innerOptions);
+            }
+
+            // (b) M-tail rows: [m_aligned, m) × [0, n_aligned)
+            if (m_tail > 0 && n_aligned > 0)
+            {
+                var aTail = transA ? a.Slice(m_aligned) : a.Slice(m_aligned * lda);
+                var cTail = c.Slice(m_aligned * ldc);
+                StreamingStrategy.Run<T>(
+                    aTail, lda, transA, b, ldb, transB,
+                    cTail, ldc, m_tail, n_aligned, k, in innerOptions);
+            }
+
+            // (c) N-tail cols: [0, m_aligned) × [n_aligned, n)
+            if (n_tail > 0 && m_aligned > 0)
+            {
+                var bTail = transB ? b.Slice(n_aligned * ldb) : b.Slice(n_aligned);
+                var cTail = c.Slice(n_aligned);
+                StreamingStrategy.Run<T>(
+                    a, lda, transA, bTail, ldb, transB,
+                    cTail, ldc, m_aligned, n_tail, k, in innerOptions);
+            }
+
+            // (d) Corner: [m_aligned, m) × [n_aligned, n)
+            if (m_tail > 0 && n_tail > 0)
+            {
+                var aTail = transA ? a.Slice(m_aligned) : a.Slice(m_aligned * lda);
+                var bTail = transB ? b.Slice(n_aligned * ldb) : b.Slice(n_aligned);
+                var cTail = c.Slice(m_aligned * ldc + n_aligned);
+                StreamingStrategy.Run<T>(
+                    aTail, lda, transA, bTail, ldb, transB,
+                    cTail, ldc, m_tail, n_tail, k, in innerOptions);
+            }
+
+            // Apply epilogue once on the full (m, n).
+            var splitEpilogue = options.Epilogue;
+            EpilogueChain.Apply<T>(c, ldc, m, n, in splitEpilogue);
+            return;
+        }
+
+        // Shapes too small for the SIMD tile entirely: fall back to scalar 4×4.
         if (m < mr || n < nr || m % mr != 0)
         {
             mr = 4; nr = 4;
         }
 
-        // Sub-D (#372) — correctness fix for the partial-M silent-drop bug.
-        // PackBoth and PackAOnly inner loops have `if (ir + mr > effectiveMc) break;`
-        // which silently exits before computing the partial-M tail. Combined with
-        // c.Clear() at function entry, shapes where m % mr != 0 produced all-zero
-        // trailing rows. Route those shapes to StreamingStrategy which has no
-        // row-alignment constraint. The original existing-tests cohort still hits
-        // the PackBoth/PackAOnly paths because they use shapes with m % 4 == 0;
-        // this branch only triggers on previously-broken shapes.
+        // If still misaligned after the scalar fallback (m < 4 or n < 4 or m%4 != 0):
+        // route to Streaming. This is the D.1 correctness fix for genuinely tiny
+        // misaligned shapes; the Sub-D4 split above handles m >= mr cases.
         if (m % mr != 0 || n % nr != 0)
         {
             StreamingStrategy.Run<T>(
