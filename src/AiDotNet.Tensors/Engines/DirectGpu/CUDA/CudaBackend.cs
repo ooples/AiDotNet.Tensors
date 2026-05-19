@@ -9149,16 +9149,39 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void ScatterAdd(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer destination, int sourceSize, int destSize)
     {
-        if (!_kernelCache.TryGetValue("embedding_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: embedding_backward");
-
-        // ScatterAdd is essentially the embedding backward operation
+        // ScatterAdd is implemented via the embedding_backward kernel — the same
+        // op with embDim = 1 (each input is a single value). Both atomic and
+        // deterministic variants follow the same pattern.
         using var _ = PushContext();
-        uint grid = (uint)((sourceSize + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr srcPtr = source.Handle;
         IntPtr idxPtr = indices.Handle;
         IntPtr dstPtr = destination.Handle;
         int embDim = 1;
+
+        if (GpuDeterminism.IsActive)
+        {
+            // Issue #382: route to embedding_backward_deterministic — one thread
+            // per (v, d) output cell scans numIndices in fixed order.
+            if (!_kernelCache.TryGetValue("embedding_backward_deterministic", out var kernelD))
+                throw new InvalidOperationException("CUDA kernel not found: embedding_backward_deterministic");
+            void** argsD = stackalloc void*[6];
+            argsD[0] = &srcPtr;
+            argsD[1] = &idxPtr;
+            argsD[2] = &dstPtr;
+            argsD[3] = &sourceSize;
+            argsD[4] = &embDim;
+            argsD[5] = &destSize;
+            // Grid: ceil(embDim / 16) x ceil(destSize / 16) — embDim=1 so X is 1.
+            uint gridX = (uint)((embDim + 15) / 16);
+            uint gridY = (uint)((destSize + 15) / 16);
+            LaunchKernel2D(kernelD, gridX, gridY, 16, 16, argsD);
+            return;
+        }
+
+        if (!_kernelCache.TryGetValue("embedding_backward", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: embedding_backward");
+
+        uint grid = (uint)((sourceSize + DefaultBlockSize - 1) / DefaultBlockSize);
         void** args = stackalloc void*[5];
         args[0] = &srcPtr;
         args[1] = &idxPtr;
