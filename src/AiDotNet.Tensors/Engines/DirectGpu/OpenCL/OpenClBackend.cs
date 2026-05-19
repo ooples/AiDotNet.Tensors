@@ -3682,8 +3682,12 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             zeroKernel.Execute1D(outputSize, 256);
             _context?.Finish();
 
-            // Then scatter-add
-            var kernel = _kernelCache["scatter_add_edges"];
+            // Then scatter-add. Issue #382: route to atomic-free variant when
+            // GpuDeterminism.IsActive — that variant parallelizes per (tgt, feat)
+            // output cell and scans edges in fixed order.
+            var kernel = GpuDeterminism.IsActive
+                ? _kernelCache["scatter_add_edges_deterministic"]
+                : _kernelCache["scatter_add_edges"];
             var bufferInput = ((DirectOpenClGpuBuffer)input).Buffer;
             var bufferSource = ((DirectOpenClGpuBuffer)sourceIndices).Buffer;
             var bufferTarget = ((DirectOpenClGpuBuffer)targetIndices).Buffer;
@@ -3708,8 +3712,11 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             kernel.SetArg(7, features);
             kernel.SetArg(8, edgeValues is not null ? 1 : 0);
 
-            var (localSizeX, localSizeY) = CalculateOptimalWorkGroupSize(features, numEdges);
-            kernel.Execute2D(features, numEdges, localSizeX, localSizeY);
+            // Deterministic launches with dim1=numNodes (one per target), atomic
+            // variant launches with dim1=numEdges (one per edge).
+            int dim1 = GpuDeterminism.IsActive ? numNodes : numEdges;
+            var (localSizeX, localSizeY) = CalculateOptimalWorkGroupSize(features, dim1);
+            kernel.Execute2D(features, dim1, localSizeX, localSizeY);
         }
 
         /// <inheritdoc/>
@@ -6736,6 +6743,42 @@ KERNEL VARIANTS (A/B testing):
             int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth,
             int paddingMode = 0, bool alignCorners = false)
         {
+            if (GpuDeterminism.IsActive)
+            {
+                // Issue #382: split into gradGrid (per output pos, deterministic by
+                // construction) + gradInput (per input cell scans output positions).
+                var kg = _kernelCache["grid_sample_backward_grad_grid_deterministic"];
+                uint ag = 0;
+                kg.SetArg(ag++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
+                kg.SetArg(ag++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+                kg.SetArg(ag++, ((DirectOpenClGpuBuffer)grid).Buffer.Handle);
+                kg.SetArg(ag++, ((DirectOpenClGpuBuffer)gradGrid).Buffer.Handle);
+                kg.SetArg(ag++, batch);
+                kg.SetArg(ag++, channels);
+                kg.SetArg(ag++, inHeight);
+                kg.SetArg(ag++, inWidth);
+                kg.SetArg(ag++, outHeight);
+                kg.SetArg(ag++, outWidth);
+                kg.SetArg(ag++, paddingMode);
+                kg.SetArg(ag++, alignCorners ? 1 : 0);
+                kg.Execute3D(outWidth, outHeight, batch, 16, 16, 1);
+
+                var ki = _kernelCache["grid_sample_backward_grad_input_deterministic"];
+                uint ai = 0;
+                ki.SetArg(ai++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
+                ki.SetArg(ai++, ((DirectOpenClGpuBuffer)grid).Buffer.Handle);
+                ki.SetArg(ai++, ((DirectOpenClGpuBuffer)gradInput).Buffer.Handle);
+                ki.SetArg(ai++, batch);
+                ki.SetArg(ai++, channels);
+                ki.SetArg(ai++, inHeight);
+                ki.SetArg(ai++, inWidth);
+                ki.SetArg(ai++, outHeight);
+                ki.SetArg(ai++, outWidth);
+                ki.SetArg(ai++, alignCorners ? 1 : 0);
+                ki.Execute3D(inWidth, inHeight, batch * channels, 16, 16, 1);
+                return;
+            }
+
             var k = _kernelCache["grid_sample_backward"];
             uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
