@@ -29,6 +29,20 @@ public static class BlasManaged
     internal const long TinyShapeWorkThreshold = 100_000;
 
     /// <summary>
+    /// Sub-issue F (#374): when true, <see cref="Helpers.BlasProvider.TryGemm"/> and
+    /// <see cref="Helpers.BlasProvider.TryGemmEx"/> route through <see cref="Gemm{T}"/>
+    /// instead of the native cblas P/Invoke. Provides a single flag to opt all 144
+    /// production call sites into managed dispatch — zero caller-side edits.
+    ///
+    /// <para>
+    /// Defaults to <see langword="false"/> (native path). Supply-chain-conscious
+    /// deployments set this to <see langword="true"/> at process startup to
+    /// eliminate the libopenblas / MKL attack surface.
+    /// </para>
+    /// </summary>
+    public static bool PreferManaged { get; set; } = false;
+
+    /// <summary>
     /// Computes C = op(A) · op(B), where op(X) is X or X^T.
     ///
     /// <para>

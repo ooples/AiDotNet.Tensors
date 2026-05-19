@@ -925,6 +925,16 @@ internal static class BlasProvider
         float[] c, int cOffset, int ldc)
     {
         ShapeLogHook?.Invoke(m, n, k, false, false, typeof(float));
+        // Sub-F (#374) routing shim: caller-opt-in managed dispatch.
+        if (Engines.BlasManaged.BlasManaged.PreferManaged)
+        {
+            Engines.BlasManaged.BlasManaged.Gemm<float>(
+                new ReadOnlySpan<float>(a, aOffset, a.Length - aOffset), lda, false,
+                new ReadOnlySpan<float>(b, bOffset, b.Length - bOffset), ldb, false,
+                new Span<float>(c, cOffset, c.Length - cOffset), ldc,
+                m, n, k);
+            return true;
+        }
         if (!_nativeAvailable.Value) return false;
         try
         {
@@ -949,6 +959,15 @@ internal static class BlasProvider
         double[] c, int cOffset, int ldc)
     {
         ShapeLogHook?.Invoke(m, n, k, false, false, typeof(double));
+        if (Engines.BlasManaged.BlasManaged.PreferManaged)
+        {
+            Engines.BlasManaged.BlasManaged.Gemm<double>(
+                new ReadOnlySpan<double>(a, aOffset, a.Length - aOffset), lda, false,
+                new ReadOnlySpan<double>(b, bOffset, b.Length - bOffset), ldb, false,
+                new Span<double>(c, cOffset, c.Length - cOffset), ldc,
+                m, n, k);
+            return true;
+        }
         if (!_nativeAvailable.Value) return false;
         try
         {
@@ -971,6 +990,11 @@ internal static class BlasProvider
         ReadOnlySpan<float> a, int lda, ReadOnlySpan<float> b, int ldb, Span<float> c, int ldc)
     {
         ShapeLogHook?.Invoke(m, n, k, false, false, typeof(float));
+        if (Engines.BlasManaged.BlasManaged.PreferManaged)
+        {
+            Engines.BlasManaged.BlasManaged.Gemm<float>(a, lda, false, b, ldb, false, c, ldc, m, n, k);
+            return true;
+        }
         if (!_nativeAvailable.Value) return false;
         try
         {
@@ -993,6 +1017,11 @@ internal static class BlasProvider
         ReadOnlySpan<double> a, int lda, ReadOnlySpan<double> b, int ldb, Span<double> c, int ldc)
     {
         ShapeLogHook?.Invoke(m, n, k, false, false, typeof(double));
+        if (Engines.BlasManaged.BlasManaged.PreferManaged)
+        {
+            Engines.BlasManaged.BlasManaged.Gemm<double>(a, lda, false, b, ldb, false, c, ldc, m, n, k);
+            return true;
+        }
         if (!_nativeAvailable.Value) return false;
         try
         {
@@ -1065,6 +1094,15 @@ internal static class BlasProvider
         float[] c, int cOffset, int ldc)
     {
         ShapeLogHook?.Invoke(m, n, k, transA, transB, typeof(float));
+        if (Engines.BlasManaged.BlasManaged.PreferManaged)
+        {
+            Engines.BlasManaged.BlasManaged.Gemm<float>(
+                new ReadOnlySpan<float>(a, aOffset, a.Length - aOffset), lda, transA,
+                new ReadOnlySpan<float>(b, bOffset, b.Length - bOffset), ldb, transB,
+                new Span<float>(c, cOffset, c.Length - cOffset), ldc,
+                m, n, k);
+            return true;
+        }
         // Phase G.1: when AIDOTNET_BLAS_PROVIDER=mkl, the static-ctor
         // resolver redirects libopenblas → MklImports; the call below
         // then dispatches into MKL's cblas_sgemm transparently.
@@ -1100,6 +1138,15 @@ internal static class BlasProvider
         double[] c, int cOffset, int ldc)
     {
         ShapeLogHook?.Invoke(m, n, k, transA, transB, typeof(double));
+        if (Engines.BlasManaged.BlasManaged.PreferManaged)
+        {
+            Engines.BlasManaged.BlasManaged.Gemm<double>(
+                new ReadOnlySpan<double>(a, aOffset, a.Length - aOffset), lda, transA,
+                new ReadOnlySpan<double>(b, bOffset, b.Length - bOffset), ldb, transB,
+                new Span<double>(c, cOffset, c.Length - cOffset), ldc,
+                m, n, k);
+            return true;
+        }
         if (!_nativeAvailable.Value) return false;
         try
         {
