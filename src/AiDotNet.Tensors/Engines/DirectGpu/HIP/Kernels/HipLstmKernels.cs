@@ -359,6 +359,47 @@ extern ""C"" __global__ __launch_bounds__(1024) void lstm_accumulate_weight_grad
     }
 }
 
+// lstm_accumulate_weight_gradients — bit-deterministic variant (issue #382).
+// Each (gateIdx, colIdx) cell has exactly one writer per launch; direct +=
+// instead of atomicAdd. See CUDA equivalent for full rationale.
+extern ""C"" __global__ __launch_bounds__(1024) void lstm_accumulate_weight_gradients_deterministic(
+    const float* input, const float* prevH, const float* dGates,
+    float* dWi, float* dWh, float* dBias,
+    int batch, int inputSize, int hiddenSize)
+{
+    int gateIdx = blockIdx.x;
+    int colIdx = blockIdx.y * blockDim.x + threadIdx.x;
+    if (gateIdx >= 4 * hiddenSize) return;
+
+    if (colIdx < inputSize) {
+        float grad = 0.0f;
+        for (int b = 0; b < batch; b++) {
+            float dGate = dGates[b * 4 * hiddenSize + gateIdx];
+            float x_val = input[b * inputSize + colIdx];
+            grad += dGate * x_val;
+        }
+        dWi[gateIdx * inputSize + colIdx] += grad;
+    }
+
+    if (colIdx < hiddenSize) {
+        float grad = 0.0f;
+        for (int b = 0; b < batch; b++) {
+            float dGate = dGates[b * 4 * hiddenSize + gateIdx];
+            float h_val = prevH[b * hiddenSize + colIdx];
+            grad += dGate * h_val;
+        }
+        dWh[gateIdx * hiddenSize + colIdx] += grad;
+    }
+
+    if (colIdx == 0) {
+        float grad = 0.0f;
+        for (int b = 0; b < batch; b++) {
+            grad += dGates[b * 4 * hiddenSize + gateIdx];
+        }
+        dBias[gateIdx] += grad;
+    }
+}
+
 extern ""C"" __global__ __launch_bounds__(1024) void lstm_backward_sequence(
     const float* gradOutput,
     const float* h_states,
@@ -525,6 +566,7 @@ extern ""C"" __global__ __launch_bounds__(1024) void lstm_backward_sequence(
             "lstm_backward_prevh",
             "lstm_compute_gate_gradients",
             "lstm_accumulate_weight_gradients",
+            "lstm_accumulate_weight_gradients_deterministic",
             "lstm_backward_sequence"
         };
     }

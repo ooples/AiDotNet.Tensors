@@ -413,6 +413,57 @@ extern ""C"" __global__ __launch_bounds__(256) void gru_accumulate_weight_gradie
     }
 }
 
+// gru_accumulate_weight_gradients — bit-deterministic variant (issue #382).
+extern ""C"" __global__ __launch_bounds__(256) void gru_accumulate_weight_gradients_deterministic(
+    const float* input, const float* prevH, const float* gateR, const float* dGates,
+    float* dWz, float* dWr, float* dWh,
+    float* dUz, float* dUr, float* dUh,
+    float* dbz, float* dbr, float* dbh,
+    int batch, int inputSize, int hiddenSize)
+{
+    int gateIdx = blockIdx.x;
+    int colIdx = blockIdx.y * blockDim.x + threadIdx.x;
+    if (gateIdx >= 3 * hiddenSize) return;
+    int gateType = gateIdx / hiddenSize;
+    int h = gateIdx % hiddenSize;
+
+    if (colIdx < inputSize) {
+        float grad = 0.0f;
+        for (int b = 0; b < batch; b++) {
+            float dGate = dGates[b * 3 * hiddenSize + gateIdx];
+            float x_val = input[b * inputSize + colIdx];
+            grad += dGate * x_val;
+        }
+        if (gateType == 0) dWz[h * inputSize + colIdx] += grad;
+        else if (gateType == 1) dWr[h * inputSize + colIdx] += grad;
+        else dWh[h * inputSize + colIdx] += grad;
+    }
+
+    if (colIdx < hiddenSize) {
+        float grad = 0.0f;
+        for (int b = 0; b < batch; b++) {
+            float dGate = dGates[b * 3 * hiddenSize + gateIdx];
+            float h_val = prevH[b * hiddenSize + colIdx];
+            if (gateType == 2) {
+                float r = gateR[b * hiddenSize + colIdx];
+                h_val *= r;
+            }
+            grad += dGate * h_val;
+        }
+        if (gateType == 0) dUz[h * hiddenSize + colIdx] += grad;
+        else if (gateType == 1) dUr[h * hiddenSize + colIdx] += grad;
+        else dUh[h * hiddenSize + colIdx] += grad;
+    }
+
+    if (colIdx == 0) {
+        float grad = 0.0f;
+        for (int b = 0; b < batch; b++) grad += dGates[b * 3 * hiddenSize + gateIdx];
+        if (gateType == 0) dbz[h] += grad;
+        else if (gateType == 1) dbr[h] += grad;
+        else dbh[h] += grad;
+    }
+}
+
 // GRU backward pass for entire sequence with full BPTT
 // Uses shared memory to store accumulated hidden gradients so all threads
 // can access each other's dH values for proper reset-gate gradient computation.
@@ -769,6 +820,7 @@ extern ""C"" __global__ __launch_bounds__(256) void gru_backward_prevh_unified(
             "gru_backward_prevh",
             "gru_compute_gate_gradients",
             "gru_accumulate_weight_gradients",
+            "gru_accumulate_weight_gradients_deterministic",
             "gru_backward_sequence",
             "gru_cell_backward_unified",
             "gru_backward_prevh_unified"
