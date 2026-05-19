@@ -358,6 +358,8 @@ extern ""C"" __global__ __launch_bounds__(256) void grid_sample_backward(
         gradGridY += go * (wx0 * (v10 - v00) + wx1 * (v11 - v01)) * gradMultY;
 
         // Gradient with respect to input (scatter add)
+        // NON-DETERMINISTIC (issue #382); deterministic split below as
+        // grid_sample_backward_grad_grid_deterministic + grid_sample_backward_grad_input_deterministic.
         if (ix0 >= 0 && ix0 < inWidth && iy0 >= 0 && iy0 < inHeight)
             atomicAdd(&gradInput[((b * channels + c) * inHeight + iy0) * inWidth + ix0], go * wy0 * wx0);
         if (ix1 >= 0 && ix1 < inWidth && iy0 >= 0 && iy0 < inHeight)
@@ -372,6 +374,124 @@ extern ""C"" __global__ __launch_bounds__(256) void grid_sample_backward(
     gradGrid[gridIdx] = gradGridX;
     gradGrid[gridIdx + 1] = gradGridY;
 }
+
+// grid_sample_backward — bit-deterministic split (issue #382).
+//   grad_grid: per (b, y, x) output position writes gradGrid only (no atomics)
+//   grad_input: per (b, c, h_in, w_in) input cell scans every (y, x) output position
+//               and accumulates the bilinear weight times gradOutput from any of the
+//               four corner positions that map to this input cell.
+extern ""C"" __global__ __launch_bounds__(256) void grid_sample_backward_grad_grid_deterministic(
+    const float* gradOutput, const float* input, const float* grid,
+    float* gradGrid,
+    int batch, int channels, int inHeight, int inWidth,
+    int outHeight, int outWidth, int paddingMode, int alignCorners)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    int b = blockIdx.z;
+    if (x >= outWidth || y >= outHeight || b >= batch) return;
+
+    int gridIdx = ((b * outHeight + y) * outWidth + x) * 2;
+    float gx = grid[gridIdx];
+    float gy = grid[gridIdx + 1];
+
+    float ix, iy, gradMultX, gradMultY;
+    if (alignCorners) {
+        ix = (gx + 1.0f) * 0.5f * (inWidth - 1);
+        iy = (gy + 1.0f) * 0.5f * (inHeight - 1);
+        gradMultX = 0.5f * (inWidth - 1);
+        gradMultY = 0.5f * (inHeight - 1);
+    } else {
+        ix = ((gx + 1.0f) * inWidth - 1.0f) * 0.5f;
+        iy = ((gy + 1.0f) * inHeight - 1.0f) * 0.5f;
+        gradMultX = 0.5f * inWidth;
+        gradMultY = 0.5f * inHeight;
+    }
+    int ix0 = (int)floorf(ix);
+    int iy0 = (int)floorf(iy);
+    int ix1 = ix0 + 1;
+    int iy1 = iy0 + 1;
+    float wx1 = ix - ix0;
+    float wy1 = iy - iy0;
+    float wx0 = 1.0f - wx1;
+    float wy0 = 1.0f - wy1;
+
+    float gradGridX = 0.0f;
+    float gradGridY = 0.0f;
+
+    for (int c = 0; c < channels; c++) {
+        int outIdx = ((b * channels + c) * outHeight + y) * outWidth + x;
+        float go = gradOutput[outIdx];
+
+        #define GET_PIXEL_DET(px, py) \
+            ((px >= 0 && px < inWidth && py >= 0 && py < inHeight) ? \
+                input[((b * channels + c) * inHeight + py) * inWidth + px] : \
+                (paddingMode == 1 ? input[((b * channels + c) * inHeight + \
+                    max(0, min(py, inHeight - 1))) * inWidth + max(0, min(px, inWidth - 1))] : 0.0f))
+
+        float v00 = GET_PIXEL_DET(ix0, iy0);
+        float v01 = GET_PIXEL_DET(ix1, iy0);
+        float v10 = GET_PIXEL_DET(ix0, iy1);
+        float v11 = GET_PIXEL_DET(ix1, iy1);
+        #undef GET_PIXEL_DET
+
+        gradGridX += go * (wy0 * (v01 - v00) + wy1 * (v11 - v10)) * gradMultX;
+        gradGridY += go * (wx0 * (v10 - v00) + wx1 * (v11 - v01)) * gradMultY;
+    }
+
+    gradGrid[gridIdx] = gradGridX;
+    gradGrid[gridIdx + 1] = gradGridY;
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void grid_sample_backward_grad_input_deterministic(
+    const float* gradOutput, const float* grid,
+    float* gradInput,
+    int batch, int channels, int inHeight, int inWidth,
+    int outHeight, int outWidth, int alignCorners)
+{
+    int w_in = blockIdx.x * blockDim.x + threadIdx.x;
+    int h_in = blockIdx.y * blockDim.y + threadIdx.y;
+    int bc = blockIdx.z;
+    if (w_in >= inWidth || h_in >= inHeight || bc >= batch * channels) return;
+
+    int b = bc / channels;
+    int c = bc % channels;
+
+    float sum = 0.0f;
+    // Scan every output position; check if its 4 bilinear corners include (w_in, h_in).
+    for (int y = 0; y < outHeight; y++) {
+        for (int x = 0; x < outWidth; x++) {
+            int gridIdx = ((b * outHeight + y) * outWidth + x) * 2;
+            float gx = grid[gridIdx];
+            float gy = grid[gridIdx + 1];
+            float ix, iy;
+            if (alignCorners) {
+                ix = (gx + 1.0f) * 0.5f * (inWidth - 1);
+                iy = (gy + 1.0f) * 0.5f * (inHeight - 1);
+            } else {
+                ix = ((gx + 1.0f) * inWidth - 1.0f) * 0.5f;
+                iy = ((gy + 1.0f) * inHeight - 1.0f) * 0.5f;
+            }
+            int ix0 = (int)floorf(ix);
+            int iy0 = (int)floorf(iy);
+            int ix1 = ix0 + 1;
+            int iy1 = iy0 + 1;
+            float wx1 = ix - ix0;
+            float wy1 = iy - iy0;
+            float wx0 = 1.0f - wx1;
+            float wy0 = 1.0f - wy1;
+
+            int outIdx = ((b * channels + c) * outHeight + y) * outWidth + x;
+            float go = gradOutput[outIdx];
+
+            if (w_in == ix0 && h_in == iy0) sum += go * wy0 * wx0;
+            if (w_in == ix1 && h_in == iy0) sum += go * wy0 * wx1;
+            if (w_in == ix0 && h_in == iy1) sum += go * wy1 * wx0;
+            if (w_in == ix1 && h_in == iy1) sum += go * wy1 * wx1;
+        }
+    }
+    gradInput[((b * channels + c) * inHeight + h_in) * inWidth + w_in] += sum;
+}
 ";
         }
 
@@ -383,7 +503,9 @@ extern ""C"" __global__ __launch_bounds__(256) void grid_sample_backward(
                 "topk_small",
                 "affine_grid",
                 "grid_sample",
-                "grid_sample_backward"
+                "grid_sample_backward",
+                "grid_sample_backward_grad_grid_deterministic",
+                "grid_sample_backward_grad_input_deterministic"
             };
         }
     }
