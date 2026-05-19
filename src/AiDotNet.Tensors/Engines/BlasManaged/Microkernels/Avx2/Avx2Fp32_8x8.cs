@@ -83,20 +83,69 @@ internal static class Avx2Fp32_8x8
             fixed (float* aPtr = packedA)
             fixed (float* bPtr = packedB)
             {
-                for (int k = 0; k < kc; k++)
+                // Sub-S (#409): K-loop unrolled by 2 so two B-loads issue
+                // back-to-back. The second load's L1-latency (~4 cycles on Zen)
+                // overlaps with the first batch of 8 FMAs (~4 cycle each, but
+                // 2 FMA ports → 4 FMAs/cycle issue rate). Halves branch
+                // overhead too. Loop body produces 16 FMAs per iteration.
+                int kc2 = kc & ~1;
+                int k = 0;
+                for (; k < kc2; k += 2)
                 {
-                    // Sub-O: prefetch the K-iteration `PrefetchDistance` ahead.
-                    // Hides L2→L1 fetch latency for both A and B streams.
+                    // Sub-O: prefetch 2 iterations ahead of the unroll-by-2 step.
                     if (k + PrefetchDistance < kc)
                     {
                         Sse.Prefetch0(aPtr + (k + PrefetchDistance) * Mr);
                         Sse.Prefetch0(bPtr + (k + PrefetchDistance) * Nr);
                     }
 
-                    // One vector load gives the full 8-col B row.
-                    Vector256<float> bRow = Avx.LoadVector256(bPtr + k * Nr);
+                    // Stage 1: load both B rows back-to-back so the second
+                    // load can stream while stage-1 FMAs are issued.
+                    Vector256<float> bRow0 = Avx.LoadVector256(bPtr + k * Nr);
+                    Vector256<float> bRow1 = Avx.LoadVector256(bPtr + (k + 1) * Nr);
 
-                    // Broadcast each of 8 A row scalars and FMA into its row's accumulator.
+                    // Stage 1 A broadcasts + FMAs.
+                    Vector256<float> a00 = Vector256.Create(aPtr[k * Mr + 0]);
+                    Vector256<float> a01 = Vector256.Create(aPtr[k * Mr + 1]);
+                    Vector256<float> a02 = Vector256.Create(aPtr[k * Mr + 2]);
+                    Vector256<float> a03 = Vector256.Create(aPtr[k * Mr + 3]);
+                    acc0 = Fma.MultiplyAdd(a00, bRow0, acc0);
+                    acc1 = Fma.MultiplyAdd(a01, bRow0, acc1);
+                    acc2 = Fma.MultiplyAdd(a02, bRow0, acc2);
+                    acc3 = Fma.MultiplyAdd(a03, bRow0, acc3);
+
+                    Vector256<float> a04 = Vector256.Create(aPtr[k * Mr + 4]);
+                    Vector256<float> a05 = Vector256.Create(aPtr[k * Mr + 5]);
+                    Vector256<float> a06 = Vector256.Create(aPtr[k * Mr + 6]);
+                    Vector256<float> a07 = Vector256.Create(aPtr[k * Mr + 7]);
+                    acc4 = Fma.MultiplyAdd(a04, bRow0, acc4);
+                    acc5 = Fma.MultiplyAdd(a05, bRow0, acc5);
+                    acc6 = Fma.MultiplyAdd(a06, bRow0, acc6);
+                    acc7 = Fma.MultiplyAdd(a07, bRow0, acc7);
+
+                    // Stage 2 A broadcasts + FMAs.
+                    Vector256<float> a10 = Vector256.Create(aPtr[(k + 1) * Mr + 0]);
+                    Vector256<float> a11 = Vector256.Create(aPtr[(k + 1) * Mr + 1]);
+                    Vector256<float> a12 = Vector256.Create(aPtr[(k + 1) * Mr + 2]);
+                    Vector256<float> a13 = Vector256.Create(aPtr[(k + 1) * Mr + 3]);
+                    acc0 = Fma.MultiplyAdd(a10, bRow1, acc0);
+                    acc1 = Fma.MultiplyAdd(a11, bRow1, acc1);
+                    acc2 = Fma.MultiplyAdd(a12, bRow1, acc2);
+                    acc3 = Fma.MultiplyAdd(a13, bRow1, acc3);
+
+                    Vector256<float> a14 = Vector256.Create(aPtr[(k + 1) * Mr + 4]);
+                    Vector256<float> a15 = Vector256.Create(aPtr[(k + 1) * Mr + 5]);
+                    Vector256<float> a16 = Vector256.Create(aPtr[(k + 1) * Mr + 6]);
+                    Vector256<float> a17 = Vector256.Create(aPtr[(k + 1) * Mr + 7]);
+                    acc4 = Fma.MultiplyAdd(a14, bRow1, acc4);
+                    acc5 = Fma.MultiplyAdd(a15, bRow1, acc5);
+                    acc6 = Fma.MultiplyAdd(a16, bRow1, acc6);
+                    acc7 = Fma.MultiplyAdd(a17, bRow1, acc7);
+                }
+                // K-tail when kc is odd: process the single remaining iter.
+                if (k < kc)
+                {
+                    Vector256<float> bRow = Avx.LoadVector256(bPtr + k * Nr);
                     Vector256<float> a0 = Vector256.Create(aPtr[k * Mr + 0]);
                     Vector256<float> a1 = Vector256.Create(aPtr[k * Mr + 1]);
                     Vector256<float> a2 = Vector256.Create(aPtr[k * Mr + 2]);
@@ -105,7 +154,6 @@ internal static class Avx2Fp32_8x8
                     Vector256<float> a5 = Vector256.Create(aPtr[k * Mr + 5]);
                     Vector256<float> a6 = Vector256.Create(aPtr[k * Mr + 6]);
                     Vector256<float> a7 = Vector256.Create(aPtr[k * Mr + 7]);
-
                     acc0 = Fma.MultiplyAdd(a0, bRow, acc0);
                     acc1 = Fma.MultiplyAdd(a1, bRow, acc1);
                     acc2 = Fma.MultiplyAdd(a2, bRow, acc2);
