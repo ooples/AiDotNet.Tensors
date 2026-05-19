@@ -726,15 +726,37 @@ public sealed partial class MetalBackend
         ThrowIfDisposed();
         if (source is not MetalGpuBuffer src || indices is not MetalGpuBuffer idx || output is not MetalGpuBuffer outp || counts is not MetalGpuBuffer cnt)
             throw new ArgumentException("Buffers must be MetalGpuBuffer");
-        // Pass 1: scatter-add
-        var p1 = GetPipeline("Activation", _activationLibrary, "scatter_mean");
-        var (tg1, tpg1) = p1.Calculate1DDispatch(sourceSize);
-        using var enc1 = _commandQueue.CreateScopedComputeEncoder();
-        enc1.SetPipelineState(p1.Handle);
-        enc1.SetBuffer(src, 0); enc1.SetBuffer(idx, 1); enc1.SetBuffer(outp, 2); enc1.SetBuffer(cnt, 3);
-        enc1.SetBytes((uint)sourceSize, 4); enc1.SetBytes((uint)featureSize, 5);
-        enc1.DispatchThreadgroups(tg1, tpg1);
-        // Pass 2: divide
+
+        if (GpuDeterminism.IsActive)
+        {
+            // Issue #382: route to atomic-free variant — per (dstRow, col) output cell.
+            var pD = GetPipeline("Activation", _activationLibrary, "scatter_mean_deterministic");
+            // 2D dispatch: dim x = featureSize (col), dim y = outputSize (dstRow)
+            uint threadsPerThreadgroupX = (uint)Math.Min(16, featureSize);
+            uint threadsPerThreadgroupY = (uint)Math.Min(16, outputSize);
+            uint groupsX = (uint)((featureSize + (int)threadsPerThreadgroupX - 1) / (int)threadsPerThreadgroupX);
+            uint groupsY = (uint)((outputSize + (int)threadsPerThreadgroupY - 1) / (int)threadsPerThreadgroupY);
+            using var encD = _commandQueue.CreateScopedComputeEncoder();
+            encD.SetPipelineState(pD.Handle);
+            encD.SetBuffer(src, 0); encD.SetBuffer(idx, 1); encD.SetBuffer(outp, 2); encD.SetBuffer(cnt, 3);
+            encD.SetBytes((uint)sourceSize, 4); encD.SetBytes((uint)outputSize, 5); encD.SetBytes((uint)featureSize, 6);
+            encD.DispatchThreadgroups(
+                new MetalNativeBindings.MTLSize(groupsX, groupsY, 1),
+                new MetalNativeBindings.MTLSize(threadsPerThreadgroupX, threadsPerThreadgroupY, 1));
+        }
+        else
+        {
+            // Pass 1: scatter-add (atomic)
+            var p1 = GetPipeline("Activation", _activationLibrary, "scatter_mean");
+            var (tg1, tpg1) = p1.Calculate1DDispatch(sourceSize);
+            using var enc1 = _commandQueue.CreateScopedComputeEncoder();
+            enc1.SetPipelineState(p1.Handle);
+            enc1.SetBuffer(src, 0); enc1.SetBuffer(idx, 1); enc1.SetBuffer(outp, 2); enc1.SetBuffer(cnt, 3);
+            enc1.SetBytes((uint)sourceSize, 4); enc1.SetBytes((uint)featureSize, 5);
+            enc1.DispatchThreadgroups(tg1, tpg1);
+        }
+
+        // Pass 2: divide (already deterministic by construction)
         var p2 = GetPipeline("Activation", _activationLibrary, "scatter_mean_divide");
         var (tg2, tpg2) = p2.Calculate1DDispatch(outputSize);
         using var enc2 = _commandQueue.CreateScopedComputeEncoder();
