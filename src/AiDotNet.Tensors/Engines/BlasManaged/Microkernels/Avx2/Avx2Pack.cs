@@ -297,6 +297,16 @@ internal static class Avx2Pack
 
         if (transB)
         {
+            // Sub-D10: SIMD transB=true PackB using AVX2 8x8 transpose.
+            // B is stored [N, K] row-major; we need [Kc x Nr=8] packed.
+            // For Nr=8, process the K dimension in groups of 8: load 8 rows
+            // (one stripe of 8 N-values, contiguous K) and transpose to write
+            // 8 packed K-rows, each holding 8 N-values.
+            if (nr == 8)
+            {
+                PackBTransposedFp32(b, ldb, packed, nc, kc);
+                return;
+            }
             ScalarPack.PackB<float>(b, ldb, transB, packed, nc, kc, nr);
             return;
         }
@@ -326,6 +336,105 @@ internal static class Avx2Pack
         else
         {
             ScalarPack.PackB<float>(b, ldb, transB, packed, nc, kc, nr);
+        }
+    }
+
+    /// <summary>
+    /// Sub-D10 SIMD path for transB=true PackB FP32 with Nr=8. B is stored
+    /// [N, K] row-major; pack output is [Kc × Nr=8] row-major. For each stripe
+    /// of 8 consecutive N values, load 8 source rows in K-groups of 8, do an
+    /// 8×8 in-register transpose using AVX2 unpacklo/unpackhi + shuffle +
+    /// permute2x128, then store 8 transposed rows to the packed buffer.
+    /// Bit-identical output to <see cref="ScalarPack.PackB{T}"/> for FP32 transB.
+    /// </summary>
+    private static unsafe void PackBTransposedFp32(
+        ReadOnlySpan<float> b, int ldb,
+        Span<float> packed, int nc, int kc)
+    {
+        const int Nr = 8;
+        int numFullStripes = nc / Nr;
+        int kFull = (kc / 8) * 8;
+
+        fixed (float* bPtr = b)
+        fixed (float* pPtr = packed)
+        {
+            for (int stripe = 0; stripe < numFullStripes; stripe++)
+            {
+                int srcRow = stripe * Nr;
+                float* packedStripe = pPtr + stripe * kc * Nr;
+
+                for (int kBase = 0; kBase < kFull; kBase += 8)
+                {
+                    Vector256<float> r0 = Avx.LoadVector256(bPtr + (srcRow + 0) * ldb + kBase);
+                    Vector256<float> r1 = Avx.LoadVector256(bPtr + (srcRow + 1) * ldb + kBase);
+                    Vector256<float> r2 = Avx.LoadVector256(bPtr + (srcRow + 2) * ldb + kBase);
+                    Vector256<float> r3 = Avx.LoadVector256(bPtr + (srcRow + 3) * ldb + kBase);
+                    Vector256<float> r4 = Avx.LoadVector256(bPtr + (srcRow + 4) * ldb + kBase);
+                    Vector256<float> r5 = Avx.LoadVector256(bPtr + (srcRow + 5) * ldb + kBase);
+                    Vector256<float> r6 = Avx.LoadVector256(bPtr + (srcRow + 6) * ldb + kBase);
+                    Vector256<float> r7 = Avx.LoadVector256(bPtr + (srcRow + 7) * ldb + kBase);
+
+                    Vector256<float> t0 = Avx.UnpackLow(r0, r1);
+                    Vector256<float> t1 = Avx.UnpackHigh(r0, r1);
+                    Vector256<float> t2 = Avx.UnpackLow(r2, r3);
+                    Vector256<float> t3 = Avx.UnpackHigh(r2, r3);
+                    Vector256<float> t4 = Avx.UnpackLow(r4, r5);
+                    Vector256<float> t5 = Avx.UnpackHigh(r4, r5);
+                    Vector256<float> t6 = Avx.UnpackLow(r6, r7);
+                    Vector256<float> t7 = Avx.UnpackHigh(r6, r7);
+
+                    Vector256<float> s0 = Avx.Shuffle(t0, t2, 0x44);
+                    Vector256<float> s1 = Avx.Shuffle(t0, t2, 0xEE);
+                    Vector256<float> s2 = Avx.Shuffle(t1, t3, 0x44);
+                    Vector256<float> s3 = Avx.Shuffle(t1, t3, 0xEE);
+                    Vector256<float> s4 = Avx.Shuffle(t4, t6, 0x44);
+                    Vector256<float> s5 = Avx.Shuffle(t4, t6, 0xEE);
+                    Vector256<float> s6 = Avx.Shuffle(t5, t7, 0x44);
+                    Vector256<float> s7 = Avx.Shuffle(t5, t7, 0xEE);
+
+                    Vector256<float> p0 = Avx.Permute2x128(s0, s4, 0x20);
+                    Vector256<float> p1 = Avx.Permute2x128(s1, s5, 0x20);
+                    Vector256<float> p2 = Avx.Permute2x128(s2, s6, 0x20);
+                    Vector256<float> p3 = Avx.Permute2x128(s3, s7, 0x20);
+                    Vector256<float> p4 = Avx.Permute2x128(s0, s4, 0x31);
+                    Vector256<float> p5 = Avx.Permute2x128(s1, s5, 0x31);
+                    Vector256<float> p6 = Avx.Permute2x128(s2, s6, 0x31);
+                    Vector256<float> p7 = Avx.Permute2x128(s3, s7, 0x31);
+
+                    Avx.Store(packedStripe + (kBase + 0) * Nr, p0);
+                    Avx.Store(packedStripe + (kBase + 1) * Nr, p1);
+                    Avx.Store(packedStripe + (kBase + 2) * Nr, p2);
+                    Avx.Store(packedStripe + (kBase + 3) * Nr, p3);
+                    Avx.Store(packedStripe + (kBase + 4) * Nr, p4);
+                    Avx.Store(packedStripe + (kBase + 5) * Nr, p5);
+                    Avx.Store(packedStripe + (kBase + 6) * Nr, p6);
+                    Avx.Store(packedStripe + (kBase + 7) * Nr, p7);
+                }
+                // K-tail: per-element fallback.
+                for (int k = kFull; k < kc; k++)
+                {
+                    for (int col = 0; col < Nr; col++)
+                    {
+                        packedStripe[k * Nr + col] = bPtr[(srcRow + col) * ldb + k];
+                    }
+                }
+            }
+            // Partial-N tail stripe (nc % Nr != 0): zero-pad.
+            int tailCols = nc - numFullStripes * Nr;
+            if (tailCols > 0)
+            {
+                int tailStripe = numFullStripes;
+                int tailPackedOff = tailStripe * kc * Nr;
+                int tailBaseRow = tailStripe * Nr;
+                for (int k = 0; k < kc; k++)
+                {
+                    for (int col = 0; col < Nr; col++)
+                    {
+                        float value = col < tailCols ? bPtr[(tailBaseRow + col) * ldb + k] : 0f;
+                        pPtr[tailPackedOff + k * Nr + col] = value;
+                    }
+                }
+            }
         }
     }
 
