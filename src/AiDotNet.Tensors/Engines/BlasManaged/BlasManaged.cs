@@ -141,7 +141,8 @@ public static class BlasManaged
                     a, lda, transA,
                     b, ldb, transB,
                     c, ldc,
-                    m, n, k);
+                    m, n, k,
+                    in options);
                 break;
             case PackingMode.DisableAutotune:
                 // DisableAutotune is a power-user override that bypasses the
