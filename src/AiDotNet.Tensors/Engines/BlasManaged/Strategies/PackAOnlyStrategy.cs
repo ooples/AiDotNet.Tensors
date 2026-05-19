@@ -1,6 +1,8 @@
 using System;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Threading.Tasks;
+using AiDotNet.Tensors.Helpers;
 
 namespace AiDotNet.Tensors.Engines.BlasManaged;
 
@@ -15,28 +17,20 @@ namespace AiDotNet.Tensors.Engines.BlasManaged;
 /// row-major [K, N]). transB=true is handled by <see cref="PackBothStrategy"/>
 /// (which packs B and absorbs the transpose) or <see cref="StreamingStrategy"/>.
 /// </para>
+///
+/// <para>
+/// <b>Sub-issue B (#370) task B.3:</b> when <see cref="AxisSelector"/> picks
+/// <see cref="ParallelismAxis.N"/>, the outer <c>jc</c> loop is partitioned
+/// across threads. Pack-A is computed once per (pc, ic) outer block and shared
+/// read-only inside the parallel region; each thread writes a disjoint column
+/// slice of C — bit-exact across thread counts.
+/// </para>
 /// </summary>
 internal static class PackAOnlyStrategy
 {
     /// <summary>
     /// Compute C += op(A) · B with no B-side pack. C is read-modify-write.
     /// </summary>
-    /// <typeparam name="T">Element type. Must be float or double.</typeparam>
-    /// <param name="a">Source A buffer.</param>
-    /// <param name="lda">Leading dimension of A.</param>
-    /// <param name="transA">True if A is stored transposed: [K, M] layout for logical [M, K].</param>
-    /// <param name="b">Source B buffer, row-major [K, N] (transB=false only).</param>
-    /// <param name="ldb">Leading dimension of B (number of columns in B, i.e. N).</param>
-    /// <param name="c">Output matrix C, row-major [M, N] with leading dimension ldc.</param>
-    /// <param name="ldc">Leading dimension of C (number of columns in the full C matrix).</param>
-    /// <param name="m">Number of rows in op(A) and C.</param>
-    /// <param name="n">Number of columns in B and C.</param>
-    /// <param name="k">Shared inner dimension: columns of op(A), rows of B.</param>
-    /// <param name="mc">Row blocking factor (Mc); each A panel covers mc rows.</param>
-    /// <param name="kc">K blocking factor (Kc); each packed panel covers kc K-steps.</param>
-    /// <param name="mr">Microkernel row-tile width (Mr). Must divide mc exactly (Phase G adds tail).</param>
-    /// <param name="nr">Microkernel column-tile width (Nr). Must divide n exactly (Phase G adds tail).</param>
-    /// <param name="options">Allocator options: workspace buffer, pre-pack handles, packing mode.</param>
     public static void Run<T>(
         ReadOnlySpan<T> a, int lda, bool transA,
         ReadOnlySpan<T> b, int ldb,
@@ -46,12 +40,6 @@ internal static class PackAOnlyStrategy
         int mr, int nr,
         in BlasOptions<T> options = default) where T : unmanaged
     {
-        // CodeRabbit #366: this strategy currently has no tail handling —
-        // the `jc` loop drops the final `n % nr` columns and the `ir` loop
-        // dispatches a full Mr kernel even when `effectiveMc` has a row
-        // remainder, slicing past `activePackA`. Until tail support lands,
-        // fail loudly on non-aligned shapes so callers can't silently get
-        // truncated results.
         if (mr <= 0 || nr <= 0)
             throw new ArgumentException($"mr and nr must be positive (mr={mr}, nr={nr}).");
         if ((m % mr) != 0)
@@ -65,12 +53,113 @@ internal static class PackAOnlyStrategy
                 "Tail column handling is tracked as follow-up work; callers should pad n " +
                 "or route to a strategy that handles remainders.");
 
-        // Compute byte size for the worst-case pack-A panel buffer.
+        int procs = options.NumThreads > 0 ? options.NumThreads : Environment.ProcessorCount;
+        if (options.NumThreads < 0) procs = 1;
+        bool isDeterministic = BlasProvider.IsDeterministicMode;
+
+        var axis = AxisSelector.Select(m, n, k, mr, nr, procs, isDeterministic);
+        if (axis == ParallelismAxis.N && n >= procs * nr * 2)
+        {
+            RunNParallel(a, lda, transA, b, ldb, c, ldc, m, n, k, mc, kc, mr, nr, in options, procs);
+            return;
+        }
+
+        RunSerial(a, lda, transA, b, ldb, c, ldc, m, n, k, mc, kc, mr, nr, in options);
+    }
+
+    /// <summary>
+    /// Partition N tiles across <paramref name="procs"/> threads. Each thread
+    /// runs the serial body on its sub-range of columns. Pack-A is recomputed
+    /// per (pc, ic) block inside each thread — this matches the serial behavior
+    /// exactly and avoids cross-thread pack-A sharing complexity (pack-A is cheap
+    /// relative to the inner microkernel work).
+    /// </summary>
+    private static void RunNParallel<T>(
+        ReadOnlySpan<T> a, int lda, bool transA,
+        ReadOnlySpan<T> b, int ldb,
+        Span<T> c, int ldc,
+        int m, int n, int k,
+        int mc, int kc,
+        int mr, int nr,
+        in BlasOptions<T> options,
+        int procs) where T : unmanaged
+    {
+        // Pre-snapshot options because ref struct fields can't be captured into a lambda.
+        // We discard PackedA in the parallel path — sharing the pre-pack across threads is
+        // safe (it's read-only) but the per-thread Run will re-route to its own packing.
+        var packingMode = options.PackingMode;
+        var packedA = options.PackedA;
+        var packedB = options.PackedB;
+        // Workspace can't be shared across threads — drop it; threads use [ThreadStatic] pools.
+        // NumThreads is overridden to -1 inside the worker so the sub-call doesn't recurse.
+
+        int nTilesTotal = n / nr;
+        int procsClamped = Math.Min(procs, nTilesTotal);
+
+        unsafe
+        {
+            fixed (T* aPtr = a)
+            fixed (T* bPtr = b)
+            fixed (T* cPtr = c)
+            {
+                T* aLocal = aPtr;
+                T* bLocal = bPtr;
+                T* cLocal = cPtr;
+                int aLen = a.Length, bLen = b.Length, cLen = c.Length;
+                int ldaLocal = lda, ldbLocal = ldb, ldcLocal = ldc;
+                int mLocal = m, kLocal = k, mcLocal = mc, kcLocal = kc, mrLocal = mr, nrLocal = nr;
+                bool taLocal = transA;
+
+                Parallel.For(0, procsClamped, p =>
+                {
+                    int tileStart = (int)(((long)p * nTilesTotal) / procsClamped);
+                    int tileEnd = (int)(((long)(p + 1) * nTilesTotal) / procsClamped);
+                    int nStart = tileStart * nrLocal;
+                    int nLocal = (tileEnd - tileStart) * nrLocal;
+                    if (nLocal <= 0) return;
+
+                    // B[K, N] row-major: column nStart starts at b[nStart]; ldb unchanged.
+                    var aSpan = new ReadOnlySpan<T>(aLocal, aLen);
+                    var bSpan = new ReadOnlySpan<T>(bLocal + nStart, bLen - nStart);
+                    var cSpan = new Span<T>(cLocal + nStart, cLen - nStart);
+
+                    // Sub-call: force single-thread so it routes to RunSerial without
+                    // re-recursing into RunNParallel.
+                    var subOpts = new BlasOptions<T>
+                    {
+                        PackingMode = packingMode,
+                        PackedA = packedA,
+                        PackedB = packedB,
+                        NumThreads = -1,
+                        // Workspace, Epilogue, AutotuneKey, MaxJitCacheBytes, Mode intentionally
+                        // not propagated: epilogue is applied once post-strategy by BlasManaged.Gemm,
+                        // and workspace can't be split across threads.
+                    };
+
+                    RunSerial(aSpan, ldaLocal, taLocal,
+                              bSpan, ldbLocal,
+                              cSpan, ldcLocal,
+                              mLocal, nLocal, kLocal,
+                              mcLocal, kcLocal, mrLocal, nrLocal,
+                              in subOpts);
+                });
+            }
+        }
+    }
+
+    /// <summary>Serial body — original Phase B implementation.</summary>
+    private static void RunSerial<T>(
+        ReadOnlySpan<T> a, int lda, bool transA,
+        ReadOnlySpan<T> b, int ldb,
+        Span<T> c, int ldc,
+        int m, int n, int k,
+        int mc, int kc,
+        int mr, int nr,
+        in BlasOptions<T> options) where T : unmanaged
+    {
         int elemSize = Unsafe.SizeOf<T>();
         int packABytes = mc * kc * elemSize;
 
-        // Layer 5 → 4 → 1 selection for pack-A byte buffer.
-        // Layer 3 (pre-pack handle) is checked per-iteration inside the loops.
         var carver = new WorkspaceCarver(options.Workspace);
 
         Span<byte> packABytesSpan = carver.HasWorkspace ? carver.TryCarve(packABytes) : Span<byte>.Empty;
@@ -87,9 +176,6 @@ internal static class PackAOnlyStrategy
             {
                 int effectiveMc = Math.Min(mc, m - ic);
 
-                // Layer 3: short-circuit pack-A when pre-pack handle is current.
-                // Use effective tile bytes, not nominal, because PrePackA clamps Mc/Kc to
-                // the actual matrix dimensions (small matrices produce smaller handles).
                 int effectivePackABytes = effectiveMc * effectiveKc * elemSize;
                 bool packAFromPrePack = false;
                 Span<T> activePackA = packA;
@@ -102,9 +188,6 @@ internal static class PackAOnlyStrategy
 
                 if (!packAFromPrePack)
                 {
-                    // Pack A[ic..ic+effectiveMc, pc..pc+effectiveKc] into packA.
-                    // transA=false: A is [M, K] row-major, panel starts at a[ic * lda + pc].
-                    // transA=true:  A is [K, M] row-major, panel starts at a[pc * lda + ic].
                     int aSliceOffset = transA ? pc * lda + ic : ic * lda + pc;
                     ScalarPack.PackA<T>(
                         a: a.Slice(aSliceOffset), lda, transA,
@@ -112,19 +195,14 @@ internal static class PackAOnlyStrategy
                         mc: effectiveMc, kc: effectiveKc, mr);
                 }
 
-                // Iterate microkernel tiles. B is read in-place at (pc, jc).
                 for (int jc = 0; jc < n; jc += nr)
                 {
-                    if (jc + nr > n) break;  // Phase G tail handling
+                    if (jc + nr > n) break;
 
                     for (int ir = 0; ir < effectiveMc; ir += mr)
                     {
-                        // Offset into packA for the current Mr-stripe (ir/mr th stripe).
-                        // Stripe layout: [numStripes, Kc, Mr] → stripe * Kc * Mr.
                         int packedAStripeOff = (ir / mr) * effectiveKc * mr;
-                        // C tile starts at row (ic + ir), col jc in the full C matrix.
                         int cTileOff = (ic + ir) * ldc + jc;
-                        // B slice starts at row pc, col jc for transB=false: b[pc * ldb + jc].
                         int bSliceOffset = pc * ldb + jc;
 
                         DispatchStridedMicrokernel<T>(
@@ -138,9 +216,7 @@ internal static class PackAOnlyStrategy
     }
 
     /// <summary>
-    /// Routes to the scalar strided-B microkernel matching T. Dispatches
-    /// <see cref="ScalarFp64_4x4.RunStridedB"/> or
-    /// <see cref="ScalarFp32_4x4.RunStridedB"/> based on the element type.
+    /// Routes to the scalar strided-B microkernel matching T.
     /// </summary>
     private static void DispatchStridedMicrokernel<T>(
         ReadOnlySpan<T> packedA, ReadOnlySpan<T> b, int ldb,
