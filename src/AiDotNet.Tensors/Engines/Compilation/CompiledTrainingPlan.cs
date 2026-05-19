@@ -1733,30 +1733,33 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
             if (allowCachedB)
             {
-                // Sub-E (#373): pre-pack B at plan-compile time when the replay
-                // path will route to BlasManaged.Gemm. B is constant across
-                // inference calls (allowCachedB=true), so the multi-panel pack
-                // amortizes over every replay.
+                // Sub-E (#373): pre-pack B at plan-compile time so the replay
+                // closure routes through BlasManaged.Gemm with the cached handle.
+                // B is constant across inference calls (allowCachedB=true).
                 //
-                // Three conditions route managed at replay:
-                //   1. PreferManaged=true: force-managed (supply-chain mode)
-                //   2. AutotuneRouting=true + PrefersManaged(shape)=true
-                //   3. Native BLAS unavailable (TryGemm returns false → managed fallback)
-                // Case 3 can't be predicted at compile time but the managed fallback
-                // (SgemmWithCachedB) already has its own pack cache, so we don't pre-
-                // pack for that case to avoid double-allocating. Cases 1 and 2 are
-                // both worth pre-packing.
-                bool willRouteManaged =
-                    Engines.BlasManaged.BlasManaged.PreferManaged
-                    || (Engines.BlasManaged.BlasManaged.AutotuneRouting
-                        && Engines.BlasManaged.PrefersManagedCache.PrefersManaged(
-                            M, N, K, transA: false, transB: false, dtype: typeof(float)));
+                // Sources for the handle, in priority order:
+                //   1. Caller pre-registered inputB via FrozenWeightRegistry —
+                //      use that handle directly (no double-allocation).
+                //   2. Otherwise pre-pack here at compile time, but only when
+                //      the replay will actually route managed (PreferManaged OR
+                //      AutotuneRouting + PrefersManaged for this shape).
+                // When neither fires, no pre-pack happens and the legacy
+                // TryGemm / SgemmWithCachedB path stays intact.
+                Engines.BlasManaged.WeightPackHandle? prePackedB =
+                    Engines.BlasManaged.FrozenWeightRegistry.TryGetHandle(inputB);
 
-                Engines.BlasManaged.WeightPackHandle? prePackedB = null;
-                if (willRouteManaged)
+                if (prePackedB == null)
                 {
-                    prePackedB = Engines.BlasManaged.BlasManaged.PrePackB<float>(
-                        new ReadOnlySpan<float>(cB), N, transB: false, k: K, n: N);
+                    bool willRouteManaged =
+                        Engines.BlasManaged.BlasManaged.PreferManaged
+                        || (Engines.BlasManaged.BlasManaged.AutotuneRouting
+                            && Engines.BlasManaged.PrefersManagedCache.PrefersManaged(
+                                M, N, K, transA: false, transB: false, dtype: typeof(float)));
+                    if (willRouteManaged)
+                    {
+                        prePackedB = Engines.BlasManaged.BlasManaged.PrePackB<float>(
+                            new ReadOnlySpan<float>(cB), N, transB: false, k: K, n: N);
+                    }
                 }
 
                 if (prePackedB != null)
