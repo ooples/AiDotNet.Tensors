@@ -119,6 +119,27 @@ public static class BlasManaged
             mr = 4; nr = 4;
         }
 
+        // Sub-D (#372) — correctness fix for the partial-M silent-drop bug.
+        // PackBoth and PackAOnly inner loops have `if (ir + mr > effectiveMc) break;`
+        // which silently exits before computing the partial-M tail. Combined with
+        // c.Clear() at function entry, shapes where m % mr != 0 produced all-zero
+        // trailing rows. Route those shapes to StreamingStrategy which has no
+        // row-alignment constraint. The original existing-tests cohort still hits
+        // the PackBoth/PackAOnly paths because they use shapes with m % 4 == 0;
+        // this branch only triggers on previously-broken shapes.
+        if (m % mr != 0 || n % nr != 0)
+        {
+            StreamingStrategy.Run<T>(
+                a, lda, transA,
+                b, ldb, transB,
+                c, ldc,
+                m, n, k,
+                in options);
+            var streamingEpilogue = options.Epilogue;
+            EpilogueChain.Apply<T>(c, ldc, m, n, in streamingEpilogue);
+            return;
+        }
+
         // Consult the autotune dispatcher for blocking parameters. The axis is
         // informational for now — strategy integration is a future task.
         bool hasEpilogue = options.Epilogue.Activation != AiDotNet.Tensors.Engines.FusedActivationType.None
