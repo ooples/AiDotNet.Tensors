@@ -574,11 +574,14 @@ internal static class PackBothStrategy
         int numJcBlocks = (n + nc - 1) / nc;
         int totalTiles = MN2DDriver.TotalItems(numIcBlocks, numJcBlocks);
 
+        // Capture pre-pack handle refs out of the `in` options param so the
+        // ParallelForOrSerial lambda can read them. Both reads are safe across
+        // threads because PackedBuffer is treated read-only inside the closure.
+        var packedA = options.PackedA;
+        var packedB = options.PackedB;
+
         // K-block outer loop: serial. Each iteration parallelizes across all
-        // (jcIdx, icIdx) tiles. Pre-pack handles intentionally skipped — the
-        // PackedB pre-pack from BlasOptions doesn't apply per-thread in 2D mode
-        // (each thread packs its own B). Future B5.1 follow-up: a shared
-        // pre-pack-B-per-pc path would amortize across same-jcIdx threads.
+        // (jcIdx, icIdx) tiles.
         for (int pc = 0; pc < k; pc += kc)
         {
             int effectiveKc = Math.Min(kc, k - pc);
@@ -598,30 +601,86 @@ internal static class PackBothStrategy
                 if (effectiveMc <= 0 || effectiveNc <= 0) return;
 
                 int paddedNc = ((effectiveNc + nr - 1) / nr) * nr;
+                int pcIdx = pc_cap / kc;
 
-                // ── Pack A (thread-local, from PerThreadPool.Current) ────────────
+                // ── Pack A: prefer pre-packed tile, else thread-local live pack ──
+                // Multi-panel matches when (TileMc, TileKc) equals the blocking
+                // parameters (mc, kc) — the tile at (icIdx, pcIdx) holds the
+                // effective-size-clamped pack for tail blocks within the full
+                // allocation, and the inner microkernel stripe math uses
+                // effectiveKc_cap so it reads only the live data.
                 int effectivePackABytes = effectiveMc * effectiveKc_cap * elemSize;
-                Span<byte> packABytesSpan_inner = PerThreadPool.Current.RentPackA(effectivePackABytes);
-                Span<T> activePackA = MemoryMarshal.Cast<byte, T>(packABytesSpan_inner)
-                                           .Slice(0, effectiveMc * effectiveKc_cap);
-                int aSliceOffset = transA ? pc_cap * lda + ic : ic * lda + pc_cap;
-                ReadOnlySpan<T> aSlice = new ReadOnlySpan<T>((T*)aPtrInt + aSliceOffset, aLen - aSliceOffset);
-                Avx2Pack.PackA<T>(
-                    a: aSlice, lda, transA,
-                    packed: activePackA,
-                    mc: effectiveMc, kc: effectiveKc_cap, mr);
+                Span<T> activePackA;
+                bool packAFromPrePack = false;
+                if (packedA != null && WeightPackCache.IsCacheCurrent(packedA)
+                    && packedA.MultiPanelStride > 0
+                    && packedA.TileMc == mc && packedA.TileKc == kc)
+                {
+                    var tile = packedA.GetTileSlice(icIdx, pcIdx);
+                    if (!tile.IsEmpty && tile.Length >= effectivePackABytes)
+                    {
+                        activePackA = MemoryMarshal.Cast<byte, T>(tile.Slice(0, effectivePackABytes));
+                        packAFromPrePack = true;
+                    }
+                    else
+                    {
+                        activePackA = default;
+                    }
+                }
+                else
+                {
+                    activePackA = default;
+                }
 
-                // ── Pack B (thread-local, from PerThreadPool.Current) ────────────
+                if (!packAFromPrePack)
+                {
+                    Span<byte> packABytesSpan_inner = PerThreadPool.Current.RentPackA(effectivePackABytes);
+                    activePackA = MemoryMarshal.Cast<byte, T>(packABytesSpan_inner)
+                                              .Slice(0, effectiveMc * effectiveKc_cap);
+                    int aSliceOffset = transA ? pc_cap * lda + ic : ic * lda + pc_cap;
+                    ReadOnlySpan<T> aSlice = new ReadOnlySpan<T>((T*)aPtrInt + aSliceOffset, aLen - aSliceOffset);
+                    Avx2Pack.PackA<T>(
+                        a: aSlice, lda, transA,
+                        packed: activePackA,
+                        mc: effectiveMc, kc: effectiveKc_cap, mr);
+                }
+
+                // ── Pack B: prefer pre-packed tile, else thread-local live pack ──
                 int effectivePackBBytes = effectiveKc_cap * paddedNc * elemSize;
-                Span<byte> packBBytesSpan_inner = PerThreadPool.Current.RentPackB(effectivePackBBytes);
-                Span<T> activePackB = MemoryMarshal.Cast<byte, T>(packBBytesSpan_inner)
-                                           .Slice(0, effectiveKc_cap * paddedNc);
-                int bSliceOffset = transB ? jc * ldb + pc_cap : pc_cap * ldb + jc;
-                ReadOnlySpan<T> bSlice = new ReadOnlySpan<T>((T*)bPtrInt + bSliceOffset, bLen - bSliceOffset);
-                Avx2Pack.PackB<T>(
-                    b: bSlice, ldb, transB,
-                    packed: activePackB,
-                    nc: effectiveNc, kc: effectiveKc_cap, nr);
+                Span<T> activePackB;
+                bool packBFromPrePack = false;
+                if (packedB != null && WeightPackCache.IsCacheCurrent(packedB)
+                    && packedB.MultiPanelStride > 0
+                    && packedB.TileMc == nc && packedB.TileKc == kc)
+                {
+                    var tile = packedB.GetTileSlice(jcIdx, pcIdx);
+                    if (!tile.IsEmpty && tile.Length >= effectivePackBBytes)
+                    {
+                        activePackB = MemoryMarshal.Cast<byte, T>(tile.Slice(0, effectivePackBBytes));
+                        packBFromPrePack = true;
+                    }
+                    else
+                    {
+                        activePackB = default;
+                    }
+                }
+                else
+                {
+                    activePackB = default;
+                }
+
+                if (!packBFromPrePack)
+                {
+                    Span<byte> packBBytesSpan_inner = PerThreadPool.Current.RentPackB(effectivePackBBytes);
+                    activePackB = MemoryMarshal.Cast<byte, T>(packBBytesSpan_inner)
+                                              .Slice(0, effectiveKc_cap * paddedNc);
+                    int bSliceOffset = transB ? jc * ldb + pc_cap : pc_cap * ldb + jc;
+                    ReadOnlySpan<T> bSlice = new ReadOnlySpan<T>((T*)bPtrInt + bSliceOffset, bLen - bSliceOffset);
+                    Avx2Pack.PackB<T>(
+                        b: bSlice, ldb, transB,
+                        packed: activePackB,
+                        nc: effectiveNc, kc: effectiveKc_cap, nr);
+                }
 
                 // ── Inner microkernel loop (jr, ir) — disjoint C writes ──────────
                 for (int jr = 0; jr < effectiveNc; jr += nr)

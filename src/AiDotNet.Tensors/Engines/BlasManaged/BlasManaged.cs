@@ -281,6 +281,24 @@ public static class BlasManaged
         int ncFromAutotune = autotuneNc;
         int kcFromAutotune = autotuneKc;
 
+        // Sub-E (#373): when a multi-panel pre-pack handle is supplied, override
+        // the autotuner's tile choice to match the handle. Otherwise the strategy
+        // would reject the handle (tile-size mismatch) and fall back to live pack,
+        // making the pre-pack a no-op. The handle's tile sizes are authoritative
+        // because they were baked into the packed-byte layout at PrePack time.
+        if (options.PackedA != null && options.PackedA.MultiPanelStride > 0
+            && options.PackedA.TileMc > 0 && options.PackedA.TileKc > 0)
+        {
+            mcFromAutotune = options.PackedA.TileMc;
+            kcFromAutotune = options.PackedA.TileKc;
+        }
+        if (options.PackedB != null && options.PackedB.MultiPanelStride > 0
+            && options.PackedB.TileMc > 0 && options.PackedB.TileKc > 0)
+        {
+            ncFromAutotune = options.PackedB.TileMc;  // PackedB stores Nc in TileMc slot
+            kcFromAutotune = options.PackedB.TileKc;
+        }
+
         switch (strategy)
         {
             case PackingMode.ForcePackBoth:
@@ -402,11 +420,13 @@ public static class BlasManaged
         // index by (ic/Mc, pc/Kc) at runtime via the new MultiPanelStride
         // metadata on the handle.
         //
-        // Tile dimensions: default Mc=128, Kc=256 (matches typical autotune
-        // choices on x64-amd-avx2-cpu16). For tiny weights where m < Mc or
-        // k < Kc, clamp to fit while keeping mr-alignment for Mc.
-        int mc = 128;
-        int kc = 256;
+        // Tile dimensions match the autotuner's FallbackToHeuristic defaults
+        // (Mc = Kc = 64) so the strategy naturally consumes the pre-pack on
+        // shapes the autotuner hasn't trained yet. The Gemm dispatch also
+        // honors handle dims via an override (search "TileMc" in BlasManaged.cs)
+        // so larger pre-pack tiles still work — they just override autotune.
+        int mc = 64;
+        int kc = 64;
         if (mc > m) mc = ((m + mr - 1) / mr) * mr;  // round UP to mr multiple, capped at m
         if (mc > m) mc = m;
         if (kc > k) kc = k;
@@ -493,11 +513,11 @@ public static class BlasManaged
     {
         var (_, nr) = PickMicrokernelTile<T>();
 
-        // Sub-E (#373): multi-panel pre-pack — see PrePackA above for the same
-        // mechanism applied to A. Pack the whole B matrix into (numJcBlocks ×
-        // numPcBlocks) tiles of size Kc × Nc.
-        int nc = 512;
-        int kc = 256;
+        // Sub-E (#373): multi-panel pre-pack — see PrePackA above. Tile sizes
+        // match the autotuner heuristic defaults (Nc = Kc = 64) for natural
+        // consume on un-trained shapes.
+        int nc = 64;
+        int kc = 64;
         if (nc > n) nc = ((n + nr - 1) / nr) * nr;
         if (nc > n) nc = n;
         if (kc > k) kc = k;

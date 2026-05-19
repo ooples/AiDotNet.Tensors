@@ -168,20 +168,41 @@ internal static class PackAOnlyStrategy
 
         Span<T> packA = MemoryMarshal.Cast<byte, T>(packABytesSpan).Slice(0, mc * kc);
 
+        // Sub-E (#373): detect multi-panel PackedA layout so the (ic, pc) loop
+        // below picks the right tile slice rather than always reading offset 0.
+        bool multiPanelA = options.PackedA != null
+            && WeightPackCache.IsCacheCurrent(options.PackedA)
+            && options.PackedA.TilingMatches(mc, kc)
+            && options.PackedA.FullM >= m
+            && options.PackedA.FullK >= k;
+
         for (int pc = 0; pc < k; pc += kc)
         {
             int effectiveKc = Math.Min(kc, k - pc);
+            int pcIdx = pc / kc;
 
             for (int ic = 0; ic < m; ic += mc)
             {
                 int effectiveMc = Math.Min(mc, m - ic);
+                int icIdx = ic / mc;
 
                 int effectivePackABytes = effectiveMc * effectiveKc * elemSize;
                 bool packAFromPrePack = false;
                 Span<T> activePackA = packA;
-                if (options.PackedA != null && WeightPackCache.IsCacheCurrent(options.PackedA)
+
+                if (multiPanelA)
+                {
+                    var tileBytes = options.PackedA!.GetTileSlice(icIdx, pcIdx);
+                    if (!tileBytes.IsEmpty && tileBytes.Length >= effectivePackABytes)
+                    {
+                        activePackA = MemoryMarshal.Cast<byte, T>(tileBytes.Slice(0, effectivePackABytes));
+                        packAFromPrePack = true;
+                    }
+                }
+                else if (options.PackedA != null && WeightPackCache.IsCacheCurrent(options.PackedA)
                     && options.PackedA.PackedBuffer.Length >= effectivePackABytes)
                 {
+                    // Legacy single-panel pre-pack: only valid when the entire weight fits one tile.
                     activePackA = MemoryMarshal.Cast<byte, T>(options.PackedA.PackedBuffer.AsSpan(0, effectivePackABytes));
                     packAFromPrePack = true;
                 }

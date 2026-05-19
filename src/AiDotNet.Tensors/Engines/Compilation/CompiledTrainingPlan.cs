@@ -1733,6 +1733,46 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
             if (allowCachedB)
             {
+                // Sub-E (#373): when autotune routing is enabled AND this shape
+                // prefers the managed kernel, pre-pack B once at plan-compile
+                // time and consume via BlasOptions.PackedB at replay. B is
+                // constant across inference calls (allowCachedB=true), so the
+                // multi-panel pack amortizes over all calls.
+                Engines.BlasManaged.WeightPackHandle? prePackedB = null;
+                if (Engines.BlasManaged.BlasManaged.AutotuneRouting
+                    && Engines.BlasManaged.PrefersManagedCache.PrefersManaged(
+                        M, N, K, transA: false, transB: false, dtype: typeof(float)))
+                {
+                    prePackedB = Engines.BlasManaged.BlasManaged.PrePackB<float>(
+                        new ReadOnlySpan<float>(cB), N, transB: false, k: K, n: N);
+                }
+
+                if (prePackedB != null)
+                {
+                    var capturedB = prePackedB;
+                    return eng =>
+                    {
+                        // Bypass autotune routing inside BlasProvider — we've
+                        // already decided managed wins and are passing the
+                        // pre-packed handle directly.
+                        bool prevBypass = Engines.BlasManaged.PrefersManagedCache.BypassAutotune;
+                        Engines.BlasManaged.PrefersManagedCache.BypassAutotune = true;
+                        try
+                        {
+                            Engines.BlasManaged.BlasManaged.Gemm<float>(
+                                new ReadOnlySpan<float>(cA), K, false,
+                                new ReadOnlySpan<float>(cB), N, false,
+                                new Span<float>(cOut), N,
+                                M, N, K,
+                                new Engines.BlasManaged.BlasOptions<float> { PackedB = capturedB });
+                        }
+                        finally
+                        {
+                            Engines.BlasManaged.PrefersManagedCache.BypassAutotune = prevBypass;
+                        }
+                    };
+                }
+
                 return eng =>
                 {
                     if (!BlasProvider.TryGemm(M, N, K, cA, 0, K, cB, 0, N, cOut, 0, N))
