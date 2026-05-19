@@ -97,43 +97,69 @@ internal static class PackBothStrategy
         else
         {
             // ── Parallel path (no workspace) ────────────────────────────────────────
-            // Pack-B is allocated once on the calling thread (shared, read-only during
-            // the parallel region). We use ArrayPool<byte> so the backing byte[] can be
-            // captured by the parallel lambda without violating the Span<T>-is-stack-only rule.
-            // Pack-A is NOT pre-allocated here: each parallel icIdx body calls
-            // PerThreadPool.Current.RentPackA ([ThreadStatic]) → every thread gets its own
-            // buffer with zero cross-thread contention.
-            //
-            // a, b, c are pinned via `fixed` before entering the parallel region so the GC
-            // cannot relocate them while worker threads hold raw pointers into them.
-            byte[]? packBArray = null;
-            try
-            {
-                Span<byte> packBBytesSpan = ArenaIntegration.TryRentBytes(packBBytes);
-                if (packBBytesSpan.IsEmpty)
-                {
-                    packBArray = ArrayPool<byte>.Shared.Rent(packBBytes);
-                    packBBytesSpan = packBArray.AsSpan(0, packBBytes);
-                }
+            // Sub-B5 (#370): dispatch to 2D MN-grid when shape has too few M-blocks
+            // to fill all cores via M-axis parallel alone. ShouldUse2DGrid returns
+            // true when (numMBlocks * 2 < procs && numNBlocks > 1) — i.e., the
+            // existing M-axis split would leave half or more cores idle.
+            int procs = options.NumThreads > 0 ? options.NumThreads : Environment.ProcessorCount;
+            if (options.NumThreads < 0) procs = 1;
+            int numMBlocks = (m + mc - 1) / mc;
+            int numNBlocks = (n + nc - 1) / nc;
+            // ShouldUse2DGrid fires when M-axis underutilizes. ALSO require m < 256
+            // (absolute) — when m is meaningful (≥ 256), M-axis can usually keep
+            // enough cores busy AND the per-thread redundant pack-B in 2D mode hurts
+            // memory bandwidth. Concrete cases:
+            //   ViT 192×768×768 → m=192 < 256: 2D wins (~2× speedup)
+            //   GPT-2 512×N×K   → m=512 ≥ 256: M-axis wins (2D would lose 30%)
+            //   LargeSquare 2048 → m=2048 ≥ 256: M-axis wins
+            // Threshold 256 = empirical from baseline-after-B5 sweep on
+            // x64-amd-avx2-cpu16. Future autotune (#374 F.3 deferred) should
+            // measure both paths per-shape and cache the winner.
+            bool use2D = MN2DDriver.ShouldUse2DGrid(numMBlocks, numNBlocks, procs)
+                         && m < 256;
 
-                // Pin a, b, c for the duration of RunParallelUnsafe.
-                // `fixed` on a Span<T> obtained from a managed array is supported in C# 7.3+.
-                fixed (T* aPtr = a)
-                fixed (T* bPtr = b)
-                fixed (T* cPtr = c)
+            // Pin a, b, c for the duration of the parallel region. Both paths use
+            // unsafe pointer access from worker threads.
+            fixed (T* aPtr = a)
+            fixed (T* bPtr = b)
+            fixed (T* cPtr = c)
+            {
+                if (use2D)
                 {
-                    RunParallelUnsafe<T>(
+                    // 2D-grid: each thread packs its OWN B for a unique (jcIdx, icIdx).
+                    // No shared packed-B; redundant pack-B work across threads but the
+                    // extra parallelism wins when M-axis alone has few blocks.
+                    Run2DParallelUnsafe<T>(
                         aPtr, a.Length, lda, transA,
                         bPtr, b.Length, ldb, transB,
                         cPtr, c.Length, ldc,
                         m, n, k, mc, nc, kc, mr, nr,
-                        packBBytesSpan, in options, elemSize);
+                        in options, elemSize);
                 }
-            }
-            finally
-            {
-                if (packBArray != null)
-                    ArrayPool<byte>.Shared.Return(packBArray);
+                else
+                {
+                    // M-axis (existing): shared packed-B, parallel over ic.
+                    byte[]? packBArray = null;
+                    try
+                    {
+                        Span<byte> packBBytesSpan = ArenaIntegration.TryRentBytes(packBBytes);
+                        if (packBBytesSpan.IsEmpty)
+                        {
+                            packBArray = ArrayPool<byte>.Shared.Rent(packBBytes);
+                            packBBytesSpan = packBArray.AsSpan(0, packBBytes);
+                        }
+                        RunParallelUnsafe<T>(
+                            aPtr, a.Length, lda, transA,
+                            bPtr, b.Length, ldb, transB,
+                            cPtr, c.Length, ldc,
+                            m, n, k, mc, nc, kc, mr, nr,
+                            packBBytesSpan, in options, elemSize);
+                    }
+                    finally
+                    {
+                        if (packBArray != null) ArrayPool<byte>.Shared.Return(packBArray);
+                    }
+                }
             }
         }
     }
@@ -452,6 +478,116 @@ internal static class PackBothStrategy
         finally
         {
             System.Buffers.ArrayPool<byte>.Shared.Return(packBArr);
+        }
+    }
+
+    /// <summary>
+    /// Sub-B5 (#370) — 2D MN-grid parallel path. For each pc (K-block, serial),
+    /// flatten the (jcIdx, icIdx) tile grid into a 1D work-item index and
+    /// dispatch via <see cref="CpuParallelSettings.ParallelForOrSerial"/>. Each
+    /// worker:
+    /// <list type="number">
+    ///   <item>Packs A for its (ic, pc) panel into thread-local PerThreadPool buffer.</item>
+    ///   <item>Packs B for its (pc, jc) stripe into thread-local PerThreadPool buffer.</item>
+    ///   <item>Iterates the inner (jr, ir) microkernel tiles writing C disjointly.</item>
+    /// </list>
+    ///
+    /// <para>
+    /// Memory model: per-thread packed-A AND packed-B (vs RunParallelUnsafe's
+    /// shared packed-B). Redundant pack-B work across threads handling different
+    /// icIdx within the same jcIdx, but the extra parallelism wins on shapes
+    /// where M-axis alone underutilizes cores (e.g., m=192 with mc=128 gives
+    /// 2 M-blocks; on 16 cores that's 87.5% idle without 2D).
+    /// </para>
+    ///
+    /// <para>
+    /// C-write disjointness: each thread owns a unique (ic, jc) tile, so writes
+    /// to C[ic..ic+effectiveMc, jc..jc+effectiveNc] don't collide. Same property
+    /// as M-axis parallel (where each thread owns rows [ic, ic+effectiveMc)).
+    /// </para>
+    /// </summary>
+    private static unsafe void Run2DParallelUnsafe<T>(
+        T* aPtrInt, int aLen, int lda, bool transA,
+        T* bPtrInt, int bLen, int ldb, bool transB,
+        T* cPtrInt, int cLen, int ldc,
+        int m, int n, int k,
+        int mc, int nc, int kc,
+        int mr, int nr,
+        in BlasOptions<T> options, int elemSize) where T : unmanaged
+    {
+        int numIcBlocks = (m + mc - 1) / mc;
+        int numJcBlocks = (n + nc - 1) / nc;
+        int totalTiles = MN2DDriver.TotalItems(numIcBlocks, numJcBlocks);
+
+        // K-block outer loop: serial. Each iteration parallelizes across all
+        // (jcIdx, icIdx) tiles. Pre-pack handles intentionally skipped — the
+        // PackedB pre-pack from BlasOptions doesn't apply per-thread in 2D mode
+        // (each thread packs its own B). Future B5.1 follow-up: a shared
+        // pre-pack-B-per-pc path would amortize across same-jcIdx threads.
+        for (int pc = 0; pc < k; pc += kc)
+        {
+            int effectiveKc = Math.Min(kc, k - pc);
+            int pc_cap = pc;
+            int effectiveKc_cap = effectiveKc;
+
+            long workPerTile = (long)mc * nc * effectiveKc;
+            long totalWork = workPerTile * totalTiles;
+
+            CpuParallelSettings.ParallelForOrSerial(0, totalTiles, totalWork, flatIdx =>
+            {
+                var (icIdx, jcIdx) = MN2DDriver.UnflattenIndex(flatIdx, numJcBlocks);
+                int ic = icIdx * mc;
+                int jc = jcIdx * nc;
+                int effectiveMc = Math.Min(mc, m - ic);
+                int effectiveNc = Math.Min(nc, n - jc);
+                if (effectiveMc <= 0 || effectiveNc <= 0) return;
+
+                int paddedNc = ((effectiveNc + nr - 1) / nr) * nr;
+
+                // ── Pack A (thread-local, from PerThreadPool.Current) ────────────
+                int effectivePackABytes = effectiveMc * effectiveKc_cap * elemSize;
+                Span<byte> packABytesSpan_inner = PerThreadPool.Current.RentPackA(effectivePackABytes);
+                Span<T> activePackA = MemoryMarshal.Cast<byte, T>(packABytesSpan_inner)
+                                           .Slice(0, effectiveMc * effectiveKc_cap);
+                int aSliceOffset = transA ? pc_cap * lda + ic : ic * lda + pc_cap;
+                ReadOnlySpan<T> aSlice = new ReadOnlySpan<T>((T*)aPtrInt + aSliceOffset, aLen - aSliceOffset);
+                Avx2Pack.PackA<T>(
+                    a: aSlice, lda, transA,
+                    packed: activePackA,
+                    mc: effectiveMc, kc: effectiveKc_cap, mr);
+
+                // ── Pack B (thread-local, from PerThreadPool.Current) ────────────
+                int effectivePackBBytes = effectiveKc_cap * paddedNc * elemSize;
+                Span<byte> packBBytesSpan_inner = PerThreadPool.Current.RentPackB(effectivePackBBytes);
+                Span<T> activePackB = MemoryMarshal.Cast<byte, T>(packBBytesSpan_inner)
+                                           .Slice(0, effectiveKc_cap * paddedNc);
+                int bSliceOffset = transB ? jc * ldb + pc_cap : pc_cap * ldb + jc;
+                ReadOnlySpan<T> bSlice = new ReadOnlySpan<T>((T*)bPtrInt + bSliceOffset, bLen - bSliceOffset);
+                Avx2Pack.PackB<T>(
+                    b: bSlice, ldb, transB,
+                    packed: activePackB,
+                    nc: effectiveNc, kc: effectiveKc_cap, nr);
+
+                // ── Inner microkernel loop (jr, ir) — disjoint C writes ──────────
+                for (int jr = 0; jr < effectiveNc; jr += nr)
+                {
+                    int effectiveNr = Math.Min(nr, effectiveNc - jr);
+                    for (int ir = 0; ir < effectiveMc; ir += mr)
+                    {
+                        if (ir + mr > effectiveMc) break;
+                        int packedAStripeOff = (ir / mr) * effectiveKc_cap * mr;
+                        int packedBStripeOff = (jr / nr) * effectiveKc_cap * nr;
+                        int cTileOff = (ic + ir) * ldc + (jc + jr);
+                        Span<T> cTile = new Span<T>((T*)cPtrInt + cTileOff, cLen - cTileOff);
+                        DispatchMicrokernelWithTail<T>(
+                            activePackA.Slice(packedAStripeOff, effectiveKc_cap * mr),
+                            activePackB.Slice(packedBStripeOff, effectiveKc_cap * nr),
+                            cTile,
+                            ldc, effectiveKc_cap,
+                            mr, nr, effectiveNr);
+                    }
+                }
+            });
         }
     }
 
