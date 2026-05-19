@@ -1232,7 +1232,11 @@ __kernel void embedding_lookup(
 }
 
 // Embedding backward (scatter add gradients)
-// Uses atomic operations for thread safety when indices collide
+// Uses atomic operations for thread safety when indices collide.
+// Order of atomic_add_float is scheduler-dependent and FP addition is not associative,
+// so this kernel is NOT bit-deterministic across runs. See issue #382.
+// When AiDotNetEngine.DeterministicMode is set, dispatch routes to
+// embedding_backward_deterministic instead.
 __kernel void embedding_backward(
     __global const float* gradOutput,
     __global const float* indices,
@@ -1249,6 +1253,38 @@ __kernel void embedding_backward(
         // Use atomic add for thread safety when multiple indices point to same embedding
         atomic_add_float(&gradEmbedding[index * embeddingDim + d], gradOutput[idx * embeddingDim + d]);
     }
+}
+
+// Embedding backward — bit-deterministic variant (issue #382).
+// Transposes the work: one thread per (v, d) output cell scans all numIndices entries
+// and accumulates contributions where indices[i] == v. No atomics; accumulation order
+// for a given output cell is fixed (ascending i), so the result is bit-identical
+// across runs at the same input.
+//
+// Cost: O(vocabSize * embeddingDim * numIndices) vs the atomic kernel's
+// O(numIndices * embeddingDim). Acceptable for the typical reproducibility-mode
+// use case (small fixtures, debugging, paper experiments) — that is the documented
+// trade-off of the DeterministicMode contract.
+__kernel void embedding_backward_deterministic(
+    __global const float* gradOutput,
+    __global const float* indices,
+    __global float* gradEmbedding,
+    const int numIndices,
+    const int embeddingDim,
+    const int vocabSize)
+{
+    const int v = get_global_id(0);
+    const int d = get_global_id(1);
+    if (v >= vocabSize || d >= embeddingDim) return;
+
+    float sum = 0.0f;
+    for (int i = 0; i < numIndices; i++) {
+        if ((int)indices[i] == v) {
+            sum += gradOutput[i * embeddingDim + d];
+        }
+    }
+    // Accumulate semantics match the atomic variant: existing gradient is preserved.
+    gradEmbedding[v * embeddingDim + d] += sum;
 }
 
 // Fused multiply-add: D = A * B + C
@@ -1947,7 +1983,7 @@ __kernel void adaptive_avgpool_backward(
                 "greater_than", "less_than", "equal_values", "where_select",
                 "mean_axis", "var_axis", "argmax_axis", "argmin_axis",
                 "dropout_forward", "dropout_backward",
-                "embedding_lookup", "embedding_backward",
+                "embedding_lookup", "embedding_backward", "embedding_backward_deterministic",
                 "fma_kernel", "gather_kernel", "scatter_add_kernel",
                 // LSTM kernels
                 "lstm_cell_forward", "lstm_cell_backward", "lstm_gates_precompute",

@@ -7163,6 +7163,27 @@ KERNEL VARIANTS (A/B testing):
 
         public void EmbeddingBackward(IGpuBuffer gradOutput, IGpuBuffer indices, IGpuBuffer gradEmbedding, int numIndices, int embeddingDim, int vocabSize)
         {
+            if (GpuDeterminism.IsActive)
+            {
+                // Issue #382: atomic_add_float in embedding_backward is FP-non-deterministic
+                // across runs because OpenCL atomic ordering is scheduler-dependent.
+                // Route to the atomic-free variant that pins one thread per (v, d) output
+                // cell and scans numIndices in fixed order.
+                var kd = _kernelCache["embedding_backward_deterministic"];
+                uint argD = 0;
+                kd.SetArg(argD++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
+                kd.SetArg(argD++, ((DirectOpenClGpuBuffer)indices).Buffer.Handle);
+                kd.SetArg(argD++, ((DirectOpenClGpuBuffer)gradEmbedding).Buffer.Handle);
+                kd.SetArg(argD++, numIndices);
+                kd.SetArg(argD++, embeddingDim);
+                kd.SetArg(argD++, vocabSize);
+
+                int localDx = Math.Min(8, vocabSize);
+                int localDy = Math.Min(16, embeddingDim);
+                kd.Execute2D(vocabSize, embeddingDim, localDx, localDy);
+                return;
+            }
+
             var k = _kernelCache["embedding_backward"];
             uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
