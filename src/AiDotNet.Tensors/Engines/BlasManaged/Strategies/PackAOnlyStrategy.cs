@@ -245,7 +245,15 @@ internal static class PackAOnlyStrategy
         }
         if (typeof(T) == typeof(double))
         {
-            // FP64 AVX2 strided-B is deferred to D.5 follow-up.
+            // Sub-D2 follow-up: AVX2 4×8 strided-B for FP64. Mr=4, Nr=8.
+            if (mr == 4 && nr == 8 && Avx2Fp64_4x8.IsSupported)
+            {
+                Avx2Fp64_4x8.RunStridedB(
+                    MemoryMarshal.Cast<T, double>(packedA),
+                    MemoryMarshal.Cast<T, double>(b), ldb,
+                    MemoryMarshal.Cast<T, double>(c), ldc, kc);
+                return;
+            }
             ScalarFp64_4x4.RunStridedB(
                 MemoryMarshal.Cast<T, double>(packedA),
                 MemoryMarshal.Cast<T, double>(b), ldb,
