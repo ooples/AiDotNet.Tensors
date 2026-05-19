@@ -5866,14 +5866,38 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void EmbeddingBackward(IGpuBuffer gradOutput, IGpuBuffer indices, IGpuBuffer gradEmbedding, int numIndices, int embeddingDim, int vocabSize)
     {
-        if (!_kernelCache.TryGetValue("embedding_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: embedding_backward");
-
         using var _ = PushContext();
-        uint grid = (uint)((numIndices + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr gradOutPtr = gradOutput.Handle;
         IntPtr idxPtr = indices.Handle;
         IntPtr gradEmbPtr = gradEmbedding.Handle;
+
+        if (GpuDeterminism.IsActive)
+        {
+            // Issue #382: atomicAdd in embedding_backward is FP-non-deterministic
+            // across runs. Route to the atomic-free deterministic variant — one
+            // thread per (v, d) output cell scans numIndices in fixed order.
+            if (!_kernelCache.TryGetValue("embedding_backward_deterministic", out var kernelD))
+                throw new InvalidOperationException("CUDA kernel not found: embedding_backward_deterministic");
+
+            void** argsD = stackalloc void*[6];
+            argsD[0] = &gradOutPtr;
+            argsD[1] = &idxPtr;
+            argsD[2] = &gradEmbPtr;
+            argsD[3] = &numIndices;
+            argsD[4] = &embeddingDim;
+            argsD[5] = &vocabSize;
+
+            // Grid: ceil(embeddingDim / 16) x ceil(vocabSize / 16), Block: 16x16
+            uint gridX = (uint)((embeddingDim + 15) / 16);
+            uint gridY = (uint)((vocabSize + 15) / 16);
+            LaunchKernel2D(kernelD, gridX, gridY, 16, 16, argsD);
+            return;
+        }
+
+        if (!_kernelCache.TryGetValue("embedding_backward", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: embedding_backward");
+
+        uint grid = (uint)((numIndices + DefaultBlockSize - 1) / DefaultBlockSize);
         void** args = stackalloc void*[5];
         args[0] = &gradOutPtr;
         args[1] = &idxPtr;
