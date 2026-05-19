@@ -11258,14 +11258,25 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             throw new ArgumentOutOfRangeException(nameof(numGammaBands), "numGammaBands must be positive.");
         if (gammaIdx < 0 || gammaIdx >= numGammaBands)
             throw new ArgumentOutOfRangeException(nameof(gammaIdx), $"gammaIdx must be in [0, {numGammaBands}).");
-        if (!_kernelCache.TryGetValue("pac_phase_bin_mi", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: pac_phase_bin_mi");
         IntPtr tp = thetaPhase.Handle, ga = gammaAmp.Handle, op = output.Handle;
         void** args = stackalloc void*[7];
         args[0] = &tp; args[1] = &ga; args[2] = &op;
         args[3] = &batch; args[4] = &numSamples; args[5] = &numGammaBands; args[6] = &gammaIdx;
-        LaunchKernelWithSharedMem(kernel, (uint)batch, 256, (uint)(2 * 18 * sizeof(float)),
-            new IntPtr[] { (IntPtr)args[0], (IntPtr)args[1], (IntPtr)args[2], (IntPtr)args[3], (IntPtr)args[4], (IntPtr)args[5], (IntPtr)args[6] });
+        var argList = new IntPtr[] { (IntPtr)args[0], (IntPtr)args[1], (IntPtr)args[2], (IntPtr)args[3], (IntPtr)args[4], (IntPtr)args[5], (IntPtr)args[6] };
+
+        if (GpuDeterminism.IsActive)
+        {
+            // Issue #382: per-(b, bin) parallelization; uses statically-sized __shared__ in kernel.
+            if (!_kernelCache.TryGetValue("pac_phase_bin_mi_deterministic", out var krnlD))
+                throw new InvalidOperationException("HIP kernel not found: pac_phase_bin_mi_deterministic");
+            // block size = NUM_PHASE_BINS = 18 (one thread per bin)
+            LaunchKernelWithSharedMem(krnlD, (uint)batch, 18, 0, argList);
+            return;
+        }
+
+        if (!_kernelCache.TryGetValue("pac_phase_bin_mi", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: pac_phase_bin_mi");
+        LaunchKernelWithSharedMem(kernel, (uint)batch, 256, (uint)(2 * 18 * sizeof(float)), argList);
     }
 }
 
