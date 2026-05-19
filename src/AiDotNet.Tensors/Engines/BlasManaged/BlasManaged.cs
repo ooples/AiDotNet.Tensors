@@ -106,6 +106,20 @@ public static class BlasManaged
         // beta=1 option that skips this zero, but Phase B's contract is C := A · B.
         c.Clear();
 
+        // Sub-R (#408): GEMV fast path. M=1 (row × matrix), N=1 (matrix × col),
+        // or K=1 (outer product) bypass the GEMM dispatcher entirely — per-call
+        // dispatch overhead (~10-30 µs of strategy + autotune + tile-pick +
+        // epilogue) dominates actual compute for these vector ops. Honours
+        // PackingMode.Auto only; explicit pack-mode overrides take the regular
+        // path so callers can force-test the strategy if needed.
+        if (GemvKernel.QualifiesFor(m, n, k) && options.PackingMode == PackingMode.Auto)
+        {
+            GemvKernel.Run<T>(a, lda, transA, b, ldb, transB, c, ldc, m, n, k);
+            var gemvEpilogue = options.Epilogue;
+            EpilogueChain.Apply<T>(c, ldc, m, n, in gemvEpilogue);
+            return;
+        }
+
         // Sub-issue C (#371): tiny-shape fast path. For very small (M, N, K),
         // dispatcher + autotune overhead exceeds the GEMM compute itself
         // (Tiny_8x6x4 at 192 flops takes 70us on the regular path → 99% overhead).
