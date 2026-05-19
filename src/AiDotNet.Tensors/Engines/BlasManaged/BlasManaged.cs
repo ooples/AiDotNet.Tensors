@@ -21,6 +21,14 @@ public static class BlasManaged
     public static BlasMode DefaultMode { get; set; } = BlasMode.Deterministic;
 
     /// <summary>
+    /// Sub-issue C (#371): work threshold (M·N·K) below which <see cref="Gemm{T}"/>
+    /// bypasses strategy selection / autotune / microkernel-tile picking and
+    /// routes directly to <see cref="StreamingStrategy"/>. Measured on tiny shapes
+    /// where dispatcher overhead exceeded actual compute by 100×+.
+    /// </summary>
+    internal const long TinyShapeWorkThreshold = 100_000;
+
+    /// <summary>
     /// Computes C = op(A) · op(B), where op(X) is X or X^T.
     ///
     /// <para>
@@ -68,6 +76,26 @@ public static class BlasManaged
         // produces C = A · B (not C += A · B). Future versions may expose a
         // beta=1 option that skips this zero, but Phase B's contract is C := A · B.
         c.Clear();
+
+        // Sub-issue C (#371): tiny-shape fast path. For very small (M, N, K),
+        // dispatcher + autotune overhead exceeds the GEMM compute itself
+        // (Tiny_8x6x4 at 192 flops takes 70us on the regular path → 99% overhead).
+        // When M*N*K is below the threshold AND the caller hasn't requested
+        // a specific PackingMode, skip strategy selection / autotune /
+        // microkernel-tile picking and route directly to StreamingStrategy.
+        if ((long)m * n * k <= TinyShapeWorkThreshold && options.PackingMode == PackingMode.Auto)
+        {
+            StreamingStrategy.Run<T>(
+                a, lda, transA,
+                b, ldb, transB,
+                c, ldc,
+                m, n, k,
+                in options);
+            // Apply epilogue if any (cheap check; rare for tiny shapes).
+            var fastEpilogue = options.Epilogue;
+            EpilogueChain.Apply<T>(c, ldc, m, n, in fastEpilogue);
+            return;
+        }
 
         PackingMode strategy = Dispatcher.SelectStrategy(m, n, k, options);
 
