@@ -5341,21 +5341,67 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth,
         int paddingMode = 0, bool alignCorners = false)
     {
-        if (!_kernelCache.TryGetValue("grid_sample_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: grid_sample_backward");
-
         using var _ = PushContext();
         const int blockSize = 16;
-        uint gridX = (uint)((outWidth + blockSize - 1) / blockSize);
-        uint gridY = (uint)((outHeight + blockSize - 1) / blockSize);
-        uint gridZ = (uint)batch;
-
         IntPtr gradOutputPtr = gradOutput.Handle;
         IntPtr inputPtr = input.Handle;
         IntPtr gridPtr = grid.Handle;
         IntPtr gradInputPtr = gradInput.Handle;
         IntPtr gradGridPtr = gradGrid.Handle;
         int alignCornersInt = alignCorners ? 1 : 0;
+
+        if (GpuDeterminism.IsActive)
+        {
+            // Issue #382: split into gradGrid (per output position) + gradInput
+            // (per input cell) atomic-free kernels.
+            if (!_kernelCache.TryGetValue("grid_sample_backward_grad_grid_deterministic", out var krnlGrid))
+                throw new InvalidOperationException("CUDA kernel not found: grid_sample_backward_grad_grid_deterministic");
+
+            void** argsG = stackalloc void*[13];
+            argsG[0] = &gradOutputPtr;
+            argsG[1] = &inputPtr;
+            argsG[2] = &gridPtr;
+            argsG[3] = &gradGridPtr;
+            argsG[4] = &batch;
+            argsG[5] = &channels;
+            argsG[6] = &inHeight;
+            argsG[7] = &inWidth;
+            argsG[8] = &outHeight;
+            argsG[9] = &outWidth;
+            argsG[10] = &paddingMode;
+            argsG[11] = &alignCornersInt;
+            uint gridGX = (uint)((outWidth + blockSize - 1) / blockSize);
+            uint gridGY = (uint)((outHeight + blockSize - 1) / blockSize);
+            uint gridGZ = (uint)batch;
+            LaunchKernel2D(krnlGrid, gridGX, gridGY, gridGZ, (uint)blockSize, (uint)blockSize, argsG);
+
+            if (!_kernelCache.TryGetValue("grid_sample_backward_grad_input_deterministic", out var krnlIn))
+                throw new InvalidOperationException("CUDA kernel not found: grid_sample_backward_grad_input_deterministic");
+
+            void** argsI = stackalloc void*[10];
+            argsI[0] = &gradOutputPtr;
+            argsI[1] = &gridPtr;
+            argsI[2] = &gradInputPtr;
+            argsI[3] = &batch;
+            argsI[4] = &channels;
+            argsI[5] = &inHeight;
+            argsI[6] = &inWidth;
+            argsI[7] = &outHeight;
+            argsI[8] = &outWidth;
+            argsI[9] = &alignCornersInt;
+            uint gridIX = (uint)((inWidth + blockSize - 1) / blockSize);
+            uint gridIY = (uint)((inHeight + blockSize - 1) / blockSize);
+            uint gridIZ = (uint)(batch * channels);
+            LaunchKernel2D(krnlIn, gridIX, gridIY, gridIZ, (uint)blockSize, (uint)blockSize, argsI);
+            return;
+        }
+
+        if (!_kernelCache.TryGetValue("grid_sample_backward", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: grid_sample_backward");
+
+        uint gridX = (uint)((outWidth + blockSize - 1) / blockSize);
+        uint gridY = (uint)((outHeight + blockSize - 1) / blockSize);
+        uint gridZ = (uint)batch;
 
         void** args = stackalloc void*[14];
         args[0] = &gradOutputPtr;
