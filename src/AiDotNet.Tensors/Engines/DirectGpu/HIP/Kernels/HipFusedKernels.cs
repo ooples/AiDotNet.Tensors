@@ -1030,7 +1030,11 @@ extern ""C"" __global__ __launch_bounds__(256) void reduce_mean_kernel_determini
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1)
         sum += __shfl_down(sum, offset);
-    if (tid == 0) *output = sum / (float)size;
+    // Write the raw sum to match the non-deterministic kernel above; the
+    // host divides once post-kernel (see HipBackend Variance reducer).
+    // Previously the kernel divided here and the host conditionally skipped
+    // its division — fragile (CodeRabbit PR #390).
+    if (tid == 0) *output = sum;
 }
 
 // Compute variance given a known mean, using parallel reduction

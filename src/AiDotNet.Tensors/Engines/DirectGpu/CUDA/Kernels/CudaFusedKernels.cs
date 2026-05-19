@@ -1039,7 +1039,12 @@ extern ""C"" __global__ __launch_bounds__(256) void reduce_mean_kernel_determini
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
             sum += __shfl_down_sync(warp_mask, sum, offset);
-        if (tid == 0) *output = sum / (float)size;
+        // Write the raw sum (matching the non-deterministic kernel above which
+        // writes a sum via atomicAdd). The caller does the /size normalization
+        // post-kernel; dividing here as well would mean deterministic mode
+        // normalizes twice and returns a value `size`x smaller than the
+        // non-deterministic path (CodeRabbit PR #390).
+        if (tid == 0) *output = sum;
     }
 }
 

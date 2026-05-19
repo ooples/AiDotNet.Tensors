@@ -9097,8 +9097,11 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             LaunchKernelWithSharedMem(meanKernel, launchGrid, (uint)blockSize, sharedBytes, args);
             // Synchronize() removed: DownloadBuffer uses cuMemcpyDtoH which is synchronous
             float[] meanResult = DownloadBuffer(meanBuffer);
-            // Deterministic kernel already divides by size; atomic kernel writes raw sum.
-            mean = GpuDeterminism.IsActive ? meanResult[0] : (meanResult[0] / size);
+            // Both kernels now write the raw sum; normalize once on the host so
+            // deterministic and non-deterministic paths agree (CodeRabbit PR #390 —
+            // previously the deterministic kernel divided internally and the host
+            // skipped the division, but that was fragile and easy to mis-match).
+            mean = meanResult[0] / size;
         }
         else
         {
