@@ -615,7 +615,11 @@ extern ""C"" __global__ __launch_bounds__(1024) void lstm_backward_sequence(
 // LSTM WEIGHT GRADIENT ACCUMULATION KERNEL
 // ===========================================================================
 
-// Accumulates weight gradients across batch dimension
+// Accumulates weight gradients across batch dimension.
+// NON-DETERMINISTIC across calls (issue #382): the atomicAdds at the end are
+// over-defensive — each (gateIdx, colIdx) cell is written by exactly one thread per
+// launch. But the kernel is invoked once per timestep, and atomicAdd ordering across
+// those calls is not bit-stable. See lstm_accumulate_weight_gradients_deterministic.
 extern ""C"" __global__ __launch_bounds__(1024) void lstm_accumulate_weight_gradients(
     const float* input,       // [batch, inputSize]
     const float* prevH,       // [batch, hiddenSize]
@@ -662,6 +666,56 @@ extern ""C"" __global__ __launch_bounds__(1024) void lstm_accumulate_weight_grad
             grad += dGates[b * 4 * hiddenSize + gateIdx];
         }
         atomicAdd(&dBias[gateIdx], grad);
+    }
+}
+
+// lstm_accumulate_weight_gradients — bit-deterministic variant (issue #382).
+// Within a single invocation each (gateIdx, colIdx) cell is touched by exactly one
+// thread, so direct += is safe. Across multiple timestep invocations the caller
+// accumulates by += into the same dWi/dWh/dBias buffers; doing this with direct
+// += inside the kernel keeps the cross-timestep accumulation order pinned to the
+// host-driven invocation sequence (host iterates timesteps in fixed order).
+extern ""C"" __global__ __launch_bounds__(1024) void lstm_accumulate_weight_gradients_deterministic(
+    const float* input,
+    const float* prevH,
+    const float* dGates,
+    float* dWi,
+    float* dWh,
+    float* dBias,
+    int batch,
+    int inputSize,
+    int hiddenSize)
+{
+    int gateIdx = blockIdx.x;
+    int colIdx = blockIdx.y * blockDim.x + threadIdx.x;
+    if (gateIdx >= 4 * hiddenSize) return;
+
+    if (colIdx < inputSize) {
+        float grad = 0.0f;
+        for (int b = 0; b < batch; b++) {
+            float dGate = dGates[b * 4 * hiddenSize + gateIdx];
+            float x_val = input[b * inputSize + colIdx];
+            grad += dGate * x_val;
+        }
+        dWi[gateIdx * inputSize + colIdx] += grad;
+    }
+
+    if (colIdx < hiddenSize) {
+        float grad = 0.0f;
+        for (int b = 0; b < batch; b++) {
+            float dGate = dGates[b * 4 * hiddenSize + gateIdx];
+            float h_val = prevH[b * hiddenSize + colIdx];
+            grad += dGate * h_val;
+        }
+        dWh[gateIdx * hiddenSize + colIdx] += grad;
+    }
+
+    if (colIdx == 0) {
+        float grad = 0.0f;
+        for (int b = 0; b < batch; b++) {
+            grad += dGates[b * 4 * hiddenSize + gateIdx];
+        }
+        dBias[gateIdx] += grad;
     }
 }
 
@@ -747,6 +801,7 @@ extern ""C"" __global__ __launch_bounds__(1024) void lstm_compute_gate_gradients
             "lstm_backward_prevh",
             "lstm_backward_sequence",
             "lstm_accumulate_weight_gradients",
+            "lstm_accumulate_weight_gradients_deterministic",
             "lstm_compute_gate_gradients"
         };
     }
