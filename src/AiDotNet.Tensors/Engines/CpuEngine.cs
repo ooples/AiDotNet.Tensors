@@ -11282,6 +11282,71 @@ public partial class CpuEngine : ITensorLevelEngine
         return result;
     }
 
+    /// <summary>
+    /// Sub-E (#373): inference fast path that consumes a pre-packed weight handle
+    /// for the right-hand-side matrix B. Callers (e.g., compiled inference plans,
+    /// frozen-weight backward kernels) pre-pack B once via
+    /// <see cref="Engines.BlasManaged.BlasManaged.PrePackB{T}"/> and reuse the
+    /// handle across many calls. When the handle is current
+    /// (<see cref="Engines.BlasManaged.WeightPackHandle.MarkDirty"/> hasn't been
+    /// called since the last pack), the BlasManaged dispatcher consumes the
+    /// pre-packed tiles directly instead of re-packing B per call.
+    ///
+    /// <para>
+    /// Falls back to the standard <c>TensorMatMul</c> path automatically when:
+    /// (a) T is not float/double, (b) shapes don't match the handle's layout,
+    /// or (c) the handle has been marked dirty (caller mutated B in place).
+    /// </para>
+    ///
+    /// <para>
+    /// Tape recording: this overload does NOT record a backward link. It is
+    /// intended for inference / frozen-weight paths where B's gradient is
+    /// not required. Callers that need gradients on B should use the regular
+    /// <see cref="TensorMatMul{T}(Tensor{T}, Tensor{T})"/> overload.
+    /// </para>
+    /// </summary>
+    /// <typeparam name="T">Element type. Optimised for float/double; other T routes through the legacy path.</typeparam>
+    /// <param name="a">Left operand, rank-2 row-major [M, K].</param>
+    /// <param name="b">Right operand backing buffer, rank-2 row-major [K, N]. Must be byte-identical to the buffer pre-packed into <paramref name="prePackedB"/>.</param>
+    /// <param name="prePackedB">Pre-pack handle returned by <see cref="Engines.BlasManaged.BlasManaged.PrePackB{T}"/>.</param>
+    public virtual Tensor<T> TensorMatMul2DWithPrePackedB<T>(Tensor<T> a, Tensor<T> b, Engines.BlasManaged.WeightPackHandle prePackedB)
+    {
+        if (a == null) throw new ArgumentNullException(nameof(a));
+        if (b == null) throw new ArgumentNullException(nameof(b));
+        if (prePackedB == null) throw new ArgumentNullException(nameof(prePackedB));
+        if (a.Rank != 2 || b.Rank != 2)
+            throw new ArgumentException($"TensorMatMul2DWithPrePackedB requires rank-2 inputs (got a={a.Rank}, b={b.Rank}).");
+        if (a._shape[1] != b._shape[0])
+            throw new ArgumentException($"Matrix dimensions incompatible: [{a._shape[0]},{a._shape[1]}] x [{b._shape[0]},{b._shape[1]}]");
+
+        int m = a._shape[0], k = a._shape[1], n = b._shape[1];
+        var result = AutoTensorCache.RentOrAllocate<T>(new[] { m, n });
+
+        if (typeof(T) == typeof(float))
+        {
+            var aArr = (float[])(object)a.GetDataArray();
+            var bArr = (float[])(object)b.GetDataArray();
+            var rArr = (float[])(object)result.GetDataArray();
+            var opts = new Engines.BlasManaged.BlasOptions<float> { PackedB = prePackedB };
+            Engines.BlasManaged.BlasManaged.Gemm<float>(
+                aArr, k, false, bArr, n, false, rArr, n, m, n, k, opts);
+            return result;
+        }
+        if (typeof(T) == typeof(double))
+        {
+            var aArr = (double[])(object)a.GetDataArray();
+            var bArr = (double[])(object)b.GetDataArray();
+            var rArr = (double[])(object)result.GetDataArray();
+            var opts = new Engines.BlasManaged.BlasOptions<double> { PackedB = prePackedB };
+            Engines.BlasManaged.BlasManaged.Gemm<double>(
+                aArr, k, false, bArr, n, false, rArr, n, m, n, k, opts);
+            return result;
+        }
+
+        // Fallback for non-float/double: ignore the handle and run the regular path.
+        return TensorMatMul(a, b);
+    }
+
     private static bool TryTensorMatMulGemv<T>(Tensor<T> a, Tensor<T> b, Tensor<T> result, int m, int k)
     {
         if (typeof(T) == typeof(float))

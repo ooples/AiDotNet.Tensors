@@ -448,6 +448,7 @@ public static class BlasManaged
         handle.NumIcBlocks = numIcBlocks;
         handle.NumPcBlocks = numPcBlocks;
         handle.MultiPanelStride = tileBytes;
+        BlasManagedStatsTracker.AddPackCacheBytes(packedBytes);
 
         // Snapshot Version BEFORE packing so a concurrent MarkDirty doesn't
         // race the post-pack MarkCacheCurrent and mark stale data current.
@@ -539,6 +540,7 @@ public static class BlasManaged
         handle.NumIcBlocks = numJcBlocks;  // B-side: jc-blocks live in NumIcBlocks slot
         handle.NumPcBlocks = numPcBlocks;
         handle.MultiPanelStride = tileBytes;
+        BlasManagedStatsTracker.AddPackCacheBytes(packedBytes);
 
         long packedVersion = Interlocked.Read(ref handle.Version);
 

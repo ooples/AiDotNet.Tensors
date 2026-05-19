@@ -235,8 +235,13 @@ internal static class PackBothStrategy
                     }
                 }
 
-                if (!packBFromPrePack)
+                if (packBFromPrePack)
                 {
+                    BlasManagedStatsTracker.IncrementPackCacheHit();
+                }
+                else
+                {
+                    if (options.PackedB != null) BlasManagedStatsTracker.IncrementPackCacheMiss();
                     // Pack B[pc..pc+effectiveKc, jc..jc+effectiveNc] into packB.
                     int bSliceOffset = transB ? jc * ldb + pc : pc * ldb + jc;
                     Avx2Pack.PackB<T>(
@@ -276,8 +281,13 @@ internal static class PackBothStrategy
                         }
                     }
 
-                    if (!packAFromPrePack)
+                    if (packAFromPrePack)
                     {
+                        BlasManagedStatsTracker.IncrementPackCacheHit();
+                    }
+                    else
+                    {
+                        if (options.PackedA != null) BlasManagedStatsTracker.IncrementPackCacheMiss();
                         // Pack A[ic..ic+effectiveMc, pc..pc+effectiveKc] into packA.
                         // transA=false: A is [M, K] row-major, panel starts at a[ic * lda + pc].
                         // transA=true:  A is [K, M] row-major, panel starts at a[pc * lda + ic].
@@ -395,18 +405,42 @@ internal static class PackBothStrategy
                 bool packBFromPrePack = false;
                 // CodeRabbit #366: gate on the PADDED byte count and copy the
                 // full padded region — see the serial path for rationale.
-                if (packedB != null && WeightPackCache.IsCacheCurrent(packedB)
-                    && packedB.PackedBuffer.Length >= packedBByteCount)
+                // Sub-E (#373): multi-panel consume — when the handle is
+                // multi-panel and (TileMc, TileKc) match (nc, kc), copy from
+                // the specific (jcIdx, pcIdx) tile rather than offset 0. The
+                // pre-Sub-E single-panel path stays as the fallback else-branch.
+                if (packedB != null && WeightPackCache.IsCacheCurrent(packedB))
                 {
-                    // Layer 3: pre-packed B is already in byte[] form — copy into packBArr
-                    // so the parallel lambda reads from a stable, capturable byte[].
-                    packedB.PackedBuffer.AsSpan(0, packedBByteCount)
-                           .CopyTo(packBArr.AsSpan(0, packedBByteCount));
-                    packBFromPrePack = true;
+                    if (packedB.MultiPanelStride > 0
+                        && packedB.TileMc == nc && packedB.TileKc == kc)
+                    {
+                        int jcIdx = jc / nc;
+                        int pcIdx = pc / kc;
+                        var tile = packedB.GetTileSlice(jcIdx, pcIdx);
+                        if (!tile.IsEmpty && tile.Length >= packedBByteCount)
+                        {
+                            tile.Slice(0, packedBByteCount)
+                                .CopyTo(packBArr.AsSpan(0, packedBByteCount));
+                            packBFromPrePack = true;
+                        }
+                    }
+                    else if (packedB.PackedBuffer.Length >= packedBByteCount)
+                    {
+                        // Legacy single-panel: pre-packed B is already in byte[] form — copy
+                        // into packBArr so the parallel lambda reads from a stable, capturable byte[].
+                        packedB.PackedBuffer.AsSpan(0, packedBByteCount)
+                               .CopyTo(packBArr.AsSpan(0, packedBByteCount));
+                        packBFromPrePack = true;
+                    }
                 }
 
-                if (!packBFromPrePack)
+                if (packBFromPrePack)
                 {
+                    BlasManagedStatsTracker.IncrementPackCacheHit();
+                }
+                else
+                {
+                    if (packedB != null) BlasManagedStatsTracker.IncrementPackCacheMiss();
                     // Pack B[pc..pc+effectiveKc, jc..jc+effectiveNc] into packBArr.
                     // transB=false: panel starts at b[pc * ldb + jc].
                     // transB=true:  panel starts at b[jc * ldb + pc].
@@ -469,10 +503,12 @@ internal static class PackBothStrategy
                     }
                     if (prePackHitParallel)
                     {
+                        BlasManagedStatsTracker.IncrementPackCacheHit();
                         activePackA = MemoryMarshal.Cast<byte, T>(packAByteSlice);
                     }
                     else
                     {
+                        if (packedA != null) BlasManagedStatsTracker.IncrementPackCacheMiss();
                         // Layer 1: per-thread pool — [ThreadStatic] ensures each worker
                         // thread rents from its own PerThreadPool instance.
                         // Workspace (Layer 5) and Arena (Layer 4) are intentionally bypassed:
@@ -632,8 +668,13 @@ internal static class PackBothStrategy
                     activePackA = default;
                 }
 
-                if (!packAFromPrePack)
+                if (packAFromPrePack)
                 {
+                    BlasManagedStatsTracker.IncrementPackCacheHit();
+                }
+                else
+                {
+                    if (packedA != null) BlasManagedStatsTracker.IncrementPackCacheMiss();
                     Span<byte> packABytesSpan_inner = PerThreadPool.Current.RentPackA(effectivePackABytes);
                     activePackA = MemoryMarshal.Cast<byte, T>(packABytesSpan_inner)
                                               .Slice(0, effectiveMc * effectiveKc_cap);
@@ -669,8 +710,13 @@ internal static class PackBothStrategy
                     activePackB = default;
                 }
 
-                if (!packBFromPrePack)
+                if (packBFromPrePack)
                 {
+                    BlasManagedStatsTracker.IncrementPackCacheHit();
+                }
+                else
+                {
+                    if (packedB != null) BlasManagedStatsTracker.IncrementPackCacheMiss();
                     Span<byte> packBBytesSpan_inner = PerThreadPool.Current.RentPackB(effectivePackBBytes);
                     activePackB = MemoryMarshal.Cast<byte, T>(packBBytesSpan_inner)
                                               .Slice(0, effectiveKc_cap * paddedNc);

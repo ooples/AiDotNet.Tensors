@@ -207,8 +207,13 @@ internal static class PackAOnlyStrategy
                     packAFromPrePack = true;
                 }
 
-                if (!packAFromPrePack)
+                if (packAFromPrePack)
                 {
+                    BlasManagedStatsTracker.IncrementPackCacheHit();
+                }
+                else
+                {
+                    if (options.PackedA != null) BlasManagedStatsTracker.IncrementPackCacheMiss();
                     int aSliceOffset = transA ? pc * lda + ic : ic * lda + pc;
                     Avx2Pack.PackA<T>(
                         a: a.Slice(aSliceOffset), lda, transA,
