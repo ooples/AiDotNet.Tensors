@@ -14242,6 +14242,154 @@ public partial class CpuEngine : ITensorLevelEngine
         return convTransResult;
     }
 
+    /// <summary>
+    /// Zero-alloc variant of <see cref="ConvTranspose2D{T}"/> — writes the result directly
+    /// into the caller-provided <paramref name="output"/> buffer. Used by the compiled-plan
+    /// replay path (<see cref="Compilation.CompiledTrainingPlan.TryBuildSpecializedForward"/>)
+    /// to skip the per-Execute tensor allocation that the allocating overload would do.
+    ///
+    /// SD UNet decoder Upsamples are <c>ConvTranspose2D</c> with kernel=4 stride=2 at 1280
+    /// channels — those calls dominate the decoder's wall time (~1 s per UNet forward
+    /// across three upsample stages), so the alloc savings here compound × 10 sampling
+    /// steps per Predict.
+    /// </summary>
+    public void ConvTranspose2DInto<T>(
+        Tensor<T> output, Tensor<T> input, Tensor<T> kernel,
+        int[] stride, int[] padding, int[] outputPadding)
+    {
+        if (output is null) throw new ArgumentNullException(nameof(output));
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (kernel is null) throw new ArgumentNullException(nameof(kernel));
+        if (!output.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        if (!input.IsContiguous) input = input.Contiguous();
+        if (!kernel.IsContiguous) kernel = kernel.Contiguous();
+        if (input.Rank != 4) throw new ArgumentException($"ConvTranspose2DInto requires 4D input. Got rank {input.Rank}.", nameof(input));
+        if (kernel.Rank != 4) throw new ArgumentException($"ConvTranspose2DInto requires 4D kernel. Got rank {kernel.Rank}.", nameof(kernel));
+        if (stride is null || stride.Length != 2) throw new ArgumentException("Stride must be 2 elements", nameof(stride));
+        if (padding is null || padding.Length != 2) throw new ArgumentException("Padding must be 2 elements", nameof(padding));
+        if (outputPadding is null || outputPadding.Length != 2) throw new ArgumentException("OutputPadding must be 2 elements", nameof(outputPadding));
+        if (input._shape[1] != kernel._shape[0])
+            throw new ArgumentException($"Input inChannels ({input._shape[1]}) must match kernel inChannels ({kernel._shape[0]})");
+
+        int batch = input._shape[0];
+        int inChannels = input._shape[1];
+        int height = input._shape[2];
+        int width = input._shape[3];
+        int outChannels = kernel._shape[1];
+        int kernelHeight = kernel._shape[2];
+        int kernelWidth = kernel._shape[3];
+        int strideH = stride[0], strideW = stride[1];
+        int padH = padding[0], padW = padding[1];
+        int outPadH = outputPadding[0], outPadW = outputPadding[1];
+        int outputHeight = (height - 1) * strideH - 2 * padH + kernelHeight + outPadH;
+        int outputWidth = (width - 1) * strideW - 2 * padW + kernelWidth + outPadW;
+        long expectedOutLen = (long)batch * outChannels * outputHeight * outputWidth;
+        if (output.Length != expectedOutLen)
+            throw new ArgumentException(
+                $"Output length {output.Length} does not match expected {expectedOutLen} for shape [{batch},{outChannels},{outputHeight},{outputWidth}].",
+                nameof(output));
+
+        var inputData = input.GetDataArray();
+        var kernelData = kernel.GetDataArray();
+        var outputData = output.GetDataArray();
+
+        // BLAS GEMM + Col2Im fast path — TryConvTranspose2DWithGemm zeros its
+        // output slice via Array.Clear (Im2ColHelper.cs:1185) before accumulating,
+        // so passing the caller's buffer with arbitrary stale data is safe.
+        if (typeof(T) == typeof(float))
+        {
+            var fInput = (float[])(object)inputData;
+            var fKernel = (float[])(object)kernelData;
+            var fOutput = (float[])(object)outputData;
+            if (Helpers.Im2ColHelper.TryConvTranspose2DWithGemm(
+                    fInput, fKernel, fOutput,
+                    batch, inChannels, height, width,
+                    outChannels, kernelHeight, kernelWidth,
+                    strideH, strideW, padH, padW, outputHeight, outputWidth))
+            { return; }
+            // Naive scalar fallback (parallel per [batch, outChannel])
+            CpuParallelSettings.ParallelForOrSerial(0, batch * outChannels, fOutput.Length, idx =>
+            {
+                int b = idx / outChannels; int oc = idx % outChannels;
+                for (int oh = 0; oh < outputHeight; oh++)
+                    for (int ow = 0; ow < outputWidth; ow++)
+                    {
+                        float sum = 0f;
+                        for (int kh = 0; kh < kernelHeight; kh++)
+                        {
+                            int numerH = oh + padH - kh;
+                            if (numerH < 0 || numerH % strideH != 0) continue;
+                            int ih = numerH / strideH;
+                            if (ih >= height) continue;
+                            for (int kw = 0; kw < kernelWidth; kw++)
+                            {
+                                int numerW = ow + padW - kw;
+                                if (numerW < 0 || numerW % strideW != 0) continue;
+                                int iw = numerW / strideW;
+                                if (iw >= width) continue;
+                                for (int ic = 0; ic < inChannels; ic++)
+                                {
+                                    int inIdx = ((b * inChannels + ic) * height + ih) * width + iw;
+                                    int kIdx = ((ic * outChannels + oc) * kernelHeight + kh) * kernelWidth + kw;
+                                    sum += fInput[inIdx] * fKernel[kIdx];
+                                }
+                            }
+                        }
+                        fOutput[((b * outChannels + oc) * outputHeight + oh) * outputWidth + ow] = sum;
+                    }
+            });
+            return;
+        }
+        if (typeof(T) == typeof(double))
+        {
+            var dInput = (double[])(object)inputData;
+            var dKernel = (double[])(object)kernelData;
+            var dOutput = (double[])(object)outputData;
+            if (Helpers.Im2ColHelper.TryConvTranspose2DWithGemm(
+                    dInput, dKernel, dOutput,
+                    batch, inChannels, height, width,
+                    outChannels, kernelHeight, kernelWidth,
+                    strideH, strideW, padH, padW, outputHeight, outputWidth))
+            { return; }
+            CpuParallelSettings.ParallelForOrSerial(0, batch * outChannels, dOutput.Length, idx =>
+            {
+                int b = idx / outChannels; int oc = idx % outChannels;
+                for (int oh = 0; oh < outputHeight; oh++)
+                    for (int ow = 0; ow < outputWidth; ow++)
+                    {
+                        double sum = 0d;
+                        for (int kh = 0; kh < kernelHeight; kh++)
+                        {
+                            int numerH = oh + padH - kh;
+                            if (numerH < 0 || numerH % strideH != 0) continue;
+                            int ih = numerH / strideH;
+                            if (ih >= height) continue;
+                            for (int kw = 0; kw < kernelWidth; kw++)
+                            {
+                                int numerW = ow + padW - kw;
+                                if (numerW < 0 || numerW % strideW != 0) continue;
+                                int iw = numerW / strideW;
+                                if (iw >= width) continue;
+                                for (int ic = 0; ic < inChannels; ic++)
+                                {
+                                    int inIdx = ((b * inChannels + ic) * height + ih) * width + iw;
+                                    int kIdx = ((ic * outChannels + oc) * kernelHeight + kh) * kernelWidth + kw;
+                                    sum += dInput[inIdx] * dKernel[kIdx];
+                                }
+                            }
+                        }
+                        dOutput[((b * outChannels + oc) * outputHeight + oh) * outputWidth + ow] = sum;
+                    }
+            });
+            return;
+        }
+
+        // Generic numOps fallback: delegate to allocating ConvTranspose2D + copy.
+        // Non-float/non-double T is a rare niche; the alloc-and-copy is acceptable here.
+        var allocated = ConvTranspose2D(input, kernel, stride, padding, outputPadding);
+        allocated.AsSpan().CopyTo(output.AsWritableSpan());
+    }
+
     /// <inheritdoc/>
     public Tensor<T> ConvTranspose2DBackwardInput<T>(Tensor<T> gradOutput, Tensor<T> kernel, int[] inputShape, int[] stride, int[] padding)
     {

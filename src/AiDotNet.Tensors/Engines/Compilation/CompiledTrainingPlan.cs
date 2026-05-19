@@ -2482,6 +2482,125 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             };
         }
 
+        // TensorBroadcastAdd forward: route compiled-plan replay through
+        // a copy-into-output + TensorBroadcastAddInPlace pair instead of the
+        // generic "allocate fresh result + memcpy into plan output" closure.
+        // Used in every SD UNet ResBlock for the time-embedding conditioning
+        // (15+ calls per UNet forward × 10 sampling steps per Predict).
+        //
+        // Save: 1 tensor allocation per Execute. Still pays one memcpy (to copy
+        // `a` into the plan's output buffer before the in-place add), but that
+        // memcpy is one fewer than the generic path which copies the eager
+        // result back into the output buffer.
+        if (step.OpType == OpType.TensorBroadcastAdd && step.Inputs.Length == 2
+            && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous)
+        {
+            var a = step.Inputs[0];
+            var b = step.Inputs[1];
+            var o = step.OutputBuffer;
+            // Same-shape fast path: just call TensorAddInPlace (no broadcast needed).
+            // Many SD ResBlock residual adds hit this — both operands are
+            // [batch, channels, h, w].
+            bool sameShape = a._shape.Length == b._shape.Length;
+            if (sameShape)
+            {
+                for (int d = 0; d < a._shape.Length; d++)
+                {
+                    if (a._shape[d] != b._shape[d]) { sameShape = false; break; }
+                }
+            }
+            if (sameShape)
+            {
+                return eng =>
+                {
+                    a.AsSpan().CopyTo(o.AsWritableSpan());
+                    if (eng is CpuEngine cpuEng) cpuEng.TensorAddInPlace(o, b);
+                    else { var r = eng.TensorAdd(a, b); r.AsSpan().CopyTo(o.AsWritableSpan()); }
+                };
+            }
+            // Broadcast path: copy a into output, then in-place add b (b is the
+            // smaller operand and broadcasts up to a's shape).
+            return eng =>
+            {
+                a.AsSpan().CopyTo(o.AsWritableSpan());
+                if (eng is CpuEngine cpuEng) cpuEng.TensorBroadcastAddInPlace(o, b);
+                else { var r = eng.TensorBroadcastAdd(a, b); r.AsSpan().CopyTo(o.AsWritableSpan()); }
+            };
+        }
+
+        // ConvTranspose2D forward: route compiled-plan replay through
+        // ConvTranspose2DInto (added in this PR) so per-Execute is zero-alloc
+        // and writes directly into the plan's pre-allocated output buffer.
+        // The SD UNet decoder Upsamples are ConvTranspose2D at 1280-channel SD shapes
+        // (~1 s/forward across three upsample stages), so eliminating the per-call
+        // tensor alloc compounds × 10 sampling steps per Predict.
+        //
+        // SavedState layout for ConvTranspose2D (set at CpuEngine.ConvTranspose2D
+        // record-site): [int[] stride, int[] padding]. Output-padding defaults to
+        // {0,0} since the compiled plan only replays the exact traced graph; if
+        // the trace ever runs with non-zero outputPadding the GraphMode recording
+        // captures it in a different SavedState layout that this case won't match,
+        // and we fall through to the generic recorded closure.
+        if (step.OpType == OpType.ConvTranspose2D && step.Inputs.Length == 2
+            && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous
+            && step.SavedState is { Length: >= 2 }
+            && step.SavedState[0] is int[] convTStride
+            && step.SavedState[1] is int[] convTPadding)
+        {
+            var inp = step.Inputs[0];
+            var kernel = step.Inputs[1];
+            var o = step.OutputBuffer;
+            var capStride = convTStride;
+            var capPadding = convTPadding;
+            var capOutPad = new[] { 0, 0 };
+            return eng =>
+            {
+                if (eng is CpuEngine cpuEng)
+                    cpuEng.ConvTranspose2DInto(o, inp, kernel, capStride, capPadding, capOutPad);
+                else
+                {
+                    var result = eng.ConvTranspose2D(inp, kernel, capStride, capPadding, capOutPad);
+                    result.AsSpan().CopyTo(o.AsWritableSpan());
+                }
+            };
+        }
+
+        // GroupNorm forward: route the compiled-plan replay through GroupNormInto
+        // so the per-Execute path is zero-alloc and writes directly into the plan's
+        // pre-allocated output buffer. Without this case, the recording closure
+        // captured in CpuEngine.GroupNorm (when GraphMode.IsActive) calls
+        // `eng.GroupNorm(...)` every Execute — which still allocates a fresh
+        // result tensor (and old GroupNormInto allocated *another*) and memcpy's
+        // into the plan's output. For SD UNet at [1,1280,16,16] doubles that's
+        // a 2.6 MB alloc + memcpy per call, repeated 24+ times per UNet forward,
+        // × 10 sampling steps per Predict — a measurable share of the residual
+        // compile-mode-slower-than-eager gap that #1305 surfaced.
+        //
+        // SavedState layout for GroupNorm (set at CpuEngine.GroupNorm record-site,
+        // see line ~20597): [int numGroups, Tensor<T> mean, Tensor<T> variance,
+        // double epsilon]. Forward-only inference ignores mean/variance — they
+        // are required for backward only — so we discard them via `out _`.
+        if (step.OpType == OpType.GroupNorm && step.Inputs.Length == 3 && step.Inputs[0].IsContiguous
+            && step.SavedState is { Length: >= 4 }
+            && step.SavedState[0] is int numGroupsGN
+            && step.SavedState[3] is double epsilonGN)
+        {
+            var inp = step.Inputs[0];
+            var gamma = step.Inputs[1];
+            var beta = step.Inputs[2];
+            var o = step.OutputBuffer;
+            return eng =>
+            {
+                if (eng is CpuEngine cpuEng)
+                    cpuEng.GroupNormInto(o, inp, numGroupsGN, gamma, beta, epsilonGN, out _, out _);
+                else
+                {
+                    var result = eng.GroupNorm(inp, numGroupsGN, gamma, beta, epsilonGN, out _, out _);
+                    result.AsSpan().CopyTo(o.AsWritableSpan());
+                }
+            };
+        }
+
         // LogSoftmax forward: pinned SIMD with VML exp for inner loop
         if (step.OpType == OpType.LogSoftmax && step.Inputs.Length == 1 && typeof(T) == typeof(float)
             && step.Inputs[0].IsContiguous && step.Inputs[0].Rank == 2)
