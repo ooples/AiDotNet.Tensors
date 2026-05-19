@@ -16,6 +16,11 @@ public class PrefersManagedCacheTest
 {
     public PrefersManagedCacheTest()
     {
+        // Sub-F4: redirect DiskPath to a per-test-run temp file so the cache
+        // doesn't read/write the user's ~/.aidotnet/autotune/ during tests.
+        PrefersManagedCache.DiskPath = System.IO.Path.Combine(
+            System.IO.Path.GetTempPath(),
+            $"prefers-managed-cache-test-{Guid.NewGuid():N}.json");
         PrefersManagedCache.Clear();
         BlasManagedLib.AutotuneRouting = false;
         BlasManagedLib.PreferManaged = false;
@@ -107,6 +112,48 @@ public class PrefersManagedCacheTest
         Assert.Equal(0, PrefersManagedCache.Count);
         // ok matches native availability (same as pre-F3 behavior).
         Assert.Equal(BlasProvider.IsAvailable, ok);
+    }
+
+    [Fact]
+    public void F4_Cache_Round_Trips_Via_Disk()
+    {
+        // Per-test isolated path (constructor sets one already).
+        string path = PrefersManagedCache.DiskPath!;
+
+        // Populate cache.
+        PrefersManagedCache.PrefersManaged(64, 64, 64, false, false, typeof(float));
+        Assert.Equal(1, PrefersManagedCache.Count);
+
+        // File written.
+        Assert.True(System.IO.File.Exists(path), $"DiskPath {path} should exist after measurement");
+
+        // Clear in-memory + re-load.
+        PrefersManagedCache.Clear();
+        Assert.Equal(0, PrefersManagedCache.Count);
+        PrefersManagedCache.LoadFromDisk();
+        Assert.Equal(1, PrefersManagedCache.Count);
+
+        // Cleanup.
+        try { System.IO.File.Delete(path); } catch { }
+    }
+
+    [Fact]
+    public void F4_Different_Hardware_Fingerprint_Discards_Disk_Cache()
+    {
+        string path = PrefersManagedCache.DiskPath!;
+
+        // Manually write a cache file with a fake fingerprint.
+        System.IO.File.WriteAllText(path,
+            "{\"SchemaVersion\":\"1\",\"HardwareFingerprint\":\"definitely-not-this-host-xyz\"," +
+            "\"Entries\":[{\"M\":64,\"N\":64,\"K\":64,\"TransA\":false,\"TransB\":false,\"Dtype\":1,\"PrefersManaged\":true}]}");
+
+        PrefersManagedCache.Clear();
+        PrefersManagedCache.LoadFromDisk();
+
+        // Wrong fingerprint → cache should be empty (entries discarded).
+        Assert.Equal(0, PrefersManagedCache.Count);
+
+        try { System.IO.File.Delete(path); } catch { }
     }
 
     [Fact]

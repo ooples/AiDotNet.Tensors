@@ -2,8 +2,11 @@ using System;
 using System.Buffers;
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.IO;
 using System.Runtime.InteropServices;
+using System.Text.Json;
 using AiDotNet.Tensors.Helpers;
+using AiDotNet.Tensors.Helpers.Autotune;
 using BlasManagedLib = AiDotNet.Tensors.Engines.BlasManaged.BlasManaged;
 
 namespace AiDotNet.Tensors.Engines.BlasManaged;
@@ -37,6 +40,9 @@ public static class PrefersManagedCache
         int M, int N, int K, bool TransA, bool TransB, byte Dtype);
 
     private static readonly ConcurrentDictionary<ShapeKey, bool> _cache = new();
+    private static readonly object _diskLock = new object();
+    private static bool _diskLoaded;
+    private static string? _diskPath;
 
     /// <summary>
     /// Thread-local bypass flag. Set to true inside the measurement helpers so
@@ -46,6 +52,135 @@ public static class PrefersManagedCache
     [ThreadStatic] internal static bool BypassAutotune;
 
     /// <summary>
+    /// Sub-F4 (#374 follow-up): on-disk persistence. The cache reads + writes
+    /// JSON at <see cref="DiskPath"/>. Hardware fingerprint is validated on
+    /// load — entries from a different host are ignored. Set to <c>null</c>
+    /// to disable persistence entirely.
+    /// </summary>
+    public static string? DiskPath
+    {
+        get
+        {
+            if (_diskPath is not null) return _diskPath;
+            // Default: ~/.aidotnet/autotune/blas-managed-routing.json
+            try
+            {
+                string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                if (string.IsNullOrEmpty(home)) return null;
+                return Path.Combine(home, ".aidotnet", "autotune", "blas-managed-routing.json");
+            }
+            catch { return null; }
+        }
+        set { _diskPath = value; _diskLoaded = false; }
+    }
+
+    /// <summary>
+    /// File schema written to <see cref="DiskPath"/>. The fingerprint is checked
+    /// on load — mismatches discard the cache (different hardware, different optima).
+    /// </summary>
+    private sealed class DiskFormat
+    {
+        public string SchemaVersion { get; set; } = "1";
+        public string HardwareFingerprint { get; set; } = string.Empty;
+        public System.Collections.Generic.List<DiskEntry> Entries { get; set; } = new();
+    }
+
+    private sealed class DiskEntry
+    {
+        public int M { get; set; }
+        public int N { get; set; }
+        public int K { get; set; }
+        public bool TransA { get; set; }
+        public bool TransB { get; set; }
+        public byte Dtype { get; set; }
+        public bool PrefersManaged { get; set; }
+    }
+
+    /// <summary>
+    /// Loads cached entries from <see cref="DiskPath"/> if the file exists AND
+    /// its hardware fingerprint matches the current host. No-op on subsequent calls.
+    /// Idempotent and thread-safe.
+    /// </summary>
+    public static void LoadFromDisk()
+    {
+        lock (_diskLock)
+        {
+            if (_diskLoaded) return;
+            _diskLoaded = true;
+
+            string? path = DiskPath;
+            if (string.IsNullOrEmpty(path) || !File.Exists(path)) return;
+
+            try
+            {
+                string json = File.ReadAllText(path);
+                var data = JsonSerializer.Deserialize<DiskFormat>(json);
+                if (data is null) return;
+
+                string current = HardwareFingerprint.Current.ToString();
+                if (data.HardwareFingerprint != current)
+                {
+                    // Different hardware — discard the file's entries.
+                    return;
+                }
+
+                foreach (var entry in data.Entries)
+                {
+                    var key = new ShapeKey(entry.M, entry.N, entry.K, entry.TransA, entry.TransB, entry.Dtype);
+                    _cache.TryAdd(key, entry.PrefersManaged);
+                }
+            }
+            catch
+            {
+                // Corrupted file or IO failure — proceed with empty cache.
+            }
+        }
+    }
+
+    /// <summary>
+    /// Persists the current cache to <see cref="DiskPath"/>. Atomic via
+    /// temp-file + rename. Best-effort: failures are swallowed (the cache
+    /// remains valid in-memory; persistence is a perf optimization).
+    /// </summary>
+    public static void SaveToDisk()
+    {
+        string? path = DiskPath;
+        if (string.IsNullOrEmpty(path)) return;
+
+        try
+        {
+            var data = new DiskFormat
+            {
+                SchemaVersion = "1",
+                HardwareFingerprint = HardwareFingerprint.Current.ToString(),
+            };
+            foreach (var kv in _cache)
+            {
+                data.Entries.Add(new DiskEntry
+                {
+                    M = kv.Key.M, N = kv.Key.N, K = kv.Key.K,
+                    TransA = kv.Key.TransA, TransB = kv.Key.TransB,
+                    Dtype = kv.Key.Dtype,
+                    PrefersManaged = kv.Value,
+                });
+            }
+
+            string? dir = Path.GetDirectoryName(path);
+            if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+
+            // Atomic write via temp + rename.
+            string tmp = path + ".tmp";
+            File.WriteAllText(tmp, JsonSerializer.Serialize(data, new JsonSerializerOptions { WriteIndented = true }));
+            if (File.Exists(path)) File.Delete(path);
+            File.Move(tmp, path);
+        }
+        catch
+        {
+            // Best-effort; cache stays valid in-memory.
+        }
+    }
+
+    /// <summary>
     /// Number of probe iterations per backend during measurement. Small (3) keeps
     /// first-call overhead low; the noise floor is acceptable because the goal
     /// is to pick the better path, not to produce a precise speedup number.
@@ -53,9 +188,14 @@ public static class PrefersManagedCache
     private const int ProbeIters = 3;
 
     /// <summary>
-    /// Clears the cache. Used by tests to ensure measurement fires fresh.
+    /// Clears the in-memory cache and resets the disk-loaded flag. Used by tests
+    /// to ensure measurement fires fresh. Does NOT delete <see cref="DiskPath"/>.
     /// </summary>
-    public static void Clear() => _cache.Clear();
+    public static void Clear()
+    {
+        _cache.Clear();
+        lock (_diskLock) { _diskLoaded = false; }
+    }
 
     /// <summary>Returns the current number of cached decisions.</summary>
     public static int Count => _cache.Count;
@@ -77,6 +217,9 @@ public static class PrefersManagedCache
                        : dtype == typeof(double) ? (byte)2 : (byte)0;
         if (dtypeKey == 0) return true;  // unknown dtype — managed path is the only supported
 
+        // Sub-F4: ensure on-disk cache is loaded (idempotent, thread-safe).
+        if (!_diskLoaded) LoadFromDisk();
+
         var key = new ShapeKey(m, n, k, transA, transB, dtypeKey);
         if (_cache.TryGetValue(key, out bool cached)) return cached;
 
@@ -84,6 +227,7 @@ public static class PrefersManagedCache
         if (!BlasProvider.IsAvailable)
         {
             _cache[key] = true;
+            SaveToDisk();
             return true;
         }
 
@@ -91,6 +235,9 @@ public static class PrefersManagedCache
             ? MeasureFp32(m, n, k, transA, transB)
             : MeasureFp64(m, n, k, transA, transB);
         _cache[key] = prefersManaged;
+        // Sub-F4: persist after every cache update so a crashed process still
+        // contributes its decisions to the next run.
+        SaveToDisk();
         return prefersManaged;
     }
 
