@@ -707,6 +707,92 @@ extern ""C"" __global__ __launch_bounds__(256) void gru_backward_sequence(
 //   dbz/dbr/dbh: per h scans (t, b)
 //   gradInput:   per (b, t, i) reads dGates_t, dot product with Wz/Wr/Wh
 
+// Pass 1: per (b, h_idx) thread iterates t in reverse, computes dZ/dR/dHCand
+// for the (b, h_idx, t) cell and writes them to dGates_t[t, b, *]. Across-t
+// dH propagation uses atomicAdd into dH_init (heavy-lift to fully eliminate
+// — see PR #390 review for the LSTM equivalent at lstm_backward_sequence_*).
+extern ""C"" __global__ __launch_bounds__(1024) void gru_backward_sequence_precompute_gates_deterministic(
+    const float* gradOutput,   // [B, T, H]
+    const float* h_states,     // [T, B, H]
+    const float* h_init,       // [B, H]
+    const float* gates,        // [T, B, 3*H] — (z, r, n_candidate) cached
+    const float* Uz,           // [H, H]
+    const float* Ur,           // [H, H]
+    const float* Uh,           // [H, H]
+    float* dGates_t,           // [T, B, 3*H] — scratch (output)
+    float* dH_init,            // [B, H]      — scratch / output
+    int batch, int timeSteps, int hiddenSize)
+{
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    int totalElements = batch * hiddenSize;
+    bool isValid = gid < totalElements;
+    int b = isValid ? (gid / hiddenSize) : 0;
+    int h_idx = isValid ? (gid % hiddenSize) : 0;
+
+    if (isValid) dH_init[gid] = 0.0f;
+    __syncthreads();
+
+    float dH = 0.0f;
+
+    for (int t = timeSteps - 1; t >= 0; t--) {
+        if (isValid && t < timeSteps - 1) {
+            dH = dH_init[gid];
+            dH_init[gid] = 0.0f;
+        }
+        __syncthreads();
+
+        if (isValid) {
+            dH += gradOutput[(b * timeSteps + t) * hiddenSize + h_idx];
+
+            int gateOffset = t * batch * 3 * hiddenSize + b * 3 * hiddenSize;
+            float z = gates[gateOffset + h_idx];
+            float r = gates[gateOffset + hiddenSize + h_idx];
+            float n = gates[gateOffset + 2 * hiddenSize + h_idx];
+
+            float h_prev = (t == 0)
+                ? h_init[b * hiddenSize + h_idx]
+                : h_states[(t - 1) * batch * hiddenSize + b * hiddenSize + h_idx];
+
+            // Direct gate derivatives at (b, h_idx, t).
+            float dZ = dH * (n - h_prev) * sigmoid_derivative(z);
+            float dHCand = dH * z * tanh_derivative(n);
+
+            // dR depends on a full sum over k of dHCand_k * Uh[k, h_idx] times
+            // h_prev[h_idx] * sigmoid'(r). Recompute dHCand_k locally for each k.
+            float dR_sum = 0.0f;
+            for (int k = 0; k < hiddenSize; k++) {
+                float z_k = gates[gateOffset + k];
+                float n_k = gates[gateOffset + 2 * hiddenSize + k];
+                float dH_k = (t == timeSteps - 1)
+                    ? gradOutput[(b * timeSteps + t) * hiddenSize + k]
+                    : (gradOutput[(b * timeSteps + t) * hiddenSize + k] + dH_init[b * hiddenSize + k]);
+                float dHCand_k = dH_k * z_k * tanh_derivative(n_k);
+                dR_sum += dHCand_k * Uh[k * hiddenSize + h_idx];
+            }
+            float dR = dR_sum * h_prev * sigmoid_derivative(r);
+
+            int scratchBase = t * batch * 3 * hiddenSize + b * 3 * hiddenSize;
+            dGates_t[scratchBase + h_idx] = dZ;
+            dGates_t[scratchBase + hiddenSize + h_idx] = dR;
+            dGates_t[scratchBase + 2 * hiddenSize + h_idx] = dHCand;
+
+            // dH at previous timestep: direct (1 - z) plus contributions through
+            // U{z,r,h}. atomicAdd on dH_init[b, j] mirrors the LSTM kernel and
+            // is the remaining nondeterministic op in this kernel — see the
+            // PR #390 review note at lstm_backward_sequence_precompute_gates.
+            float dH_self_next = dH * (1.0f - z);
+            atomicAdd(&dH_init[b * hiddenSize + h_idx], dH_self_next);
+            for (int j = 0; j < hiddenSize; j++) {
+                float contrib = dZ * Uz[h_idx * hiddenSize + j];
+                contrib += dR * Ur[h_idx * hiddenSize + j];
+                contrib += dHCand * Uh[h_idx * hiddenSize + j] * r;
+                atomicAdd(&dH_init[b * hiddenSize + j], contrib);
+            }
+        }
+        __syncthreads();
+    }
+}
+
 extern ""C"" __global__ __launch_bounds__(256) void gru_backward_sequence_dWi_deterministic(
     const float* input, const float* dGates_t,
     float* dWz, float* dWr, float* dWh,
@@ -946,6 +1032,7 @@ extern ""C"" __global__ __launch_bounds__(256) void gru_backward_prevh_unified(
             "gru_accumulate_weight_gradients",
             "gru_accumulate_weight_gradients_deterministic",
             "gru_backward_sequence",
+            "gru_backward_sequence_precompute_gates_deterministic",
             "gru_backward_sequence_dWi_deterministic",
             "gru_backward_sequence_dUi_deterministic",
             "gru_backward_sequence_dBias_deterministic",

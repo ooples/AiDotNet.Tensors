@@ -7544,12 +7544,18 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             LaunchKernel(scatterKernel, grid1, DefaultBlockSize, args1);
         }
 
-        // Step 2: divide by counts (deterministic by construction — one thread per cell)
+        // Step 2: divide by counts (deterministic by construction — one thread per cell).
+        // scatter_mean_divide expects flat output element count (kernel guards
+        // `idx < outputSize` and indexes `output[idx]`), so pass outputSize *
+        // featureSize as the flat element count. Pre-existing bug surfaced by
+        // PR #390 review: prior code passed row count and dispatched only
+        // `outputSize` work-items, normalizing just the first row.
         if (!_kernelCache.TryGetValue("scatter_mean_divide", out var divideKernel))
             throw new InvalidOperationException("CUDA kernel not found: scatter_mean_divide");
-        uint grid2 = (uint)((outputSize + DefaultBlockSize - 1) / DefaultBlockSize);
+        int outputFlat = outputSize * featureSize;
+        uint grid2 = (uint)((outputFlat + DefaultBlockSize - 1) / DefaultBlockSize);
         void** args2 = stackalloc void*[4];
-        args2[0] = &oPtr; args2[1] = &cPtr; args2[2] = &outputSize; args2[3] = &featureSize;
+        args2[0] = &oPtr; args2[1] = &cPtr; args2[2] = &outputFlat; args2[3] = &featureSize;
         LaunchKernel(divideKernel, grid2, DefaultBlockSize, args2);
     }
 

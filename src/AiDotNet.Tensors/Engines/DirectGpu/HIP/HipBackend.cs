@@ -2392,8 +2392,14 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         }
 
         if (!_kernelCache.TryGetValue("scatter_mean_divide", out var k2)) throw new InvalidOperationException("HIP kernel not found: scatter_mean_divide");
-        void** a2 = stackalloc void*[4]; a2[0] = &oPtr; a2[1] = &cPtr; a2[2] = &outputSize; a2[3] = &featureSize;
-        LaunchKernel(k2, (uint)((outputSize + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, a2); Synchronize();
+        // scatter_mean_divide expects flat output element count (kernel guards
+        // `idx < outputSize` and indexes `output[idx]`), so pass outputSize *
+        // featureSize as the flat element count. Pre-existing bug surfaced by
+        // PR #390 review: prior code passed row count and dispatched only
+        // `outputSize` work-items, normalizing just the first row.
+        int outputFlat = outputSize * featureSize;
+        void** a2 = stackalloc void*[4]; a2[0] = &oPtr; a2[1] = &cPtr; a2[2] = &outputFlat; a2[3] = &featureSize;
+        LaunchKernel(k2, (uint)((outputFlat + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, a2); Synchronize();
     }
 
     public unsafe void L1Loss(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numFeatures)
