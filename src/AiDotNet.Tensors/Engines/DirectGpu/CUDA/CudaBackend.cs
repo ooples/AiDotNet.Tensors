@@ -7268,12 +7268,23 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void PReluBackwardAlpha(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradAlpha, int size, int alphaSize)
     {
-        if (!_kernelCache.TryGetValue("prelu_backward_alpha", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: prelu_backward_alpha");
         using var _ = PushContext();
-        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr goPtr = gradOutput.Handle; IntPtr iPtr = input.Handle; IntPtr gaPtr = gradAlpha.Handle; int n = size; int aSize = alphaSize;
         void** args = stackalloc void*[5]; args[0] = &goPtr; args[1] = &iPtr; args[2] = &gaPtr; args[3] = &n; args[4] = &aSize;
+
+        if (GpuDeterminism.IsActive)
+        {
+            // Issue #382: per-alpha-channel thread scans size in strided order.
+            if (!_kernelCache.TryGetValue("prelu_backward_alpha_deterministic", out var kernelD))
+                throw new InvalidOperationException("CUDA kernel not found: prelu_backward_alpha_deterministic");
+            uint gridD = (uint)((alphaSize + DefaultBlockSize - 1) / DefaultBlockSize);
+            LaunchKernel(kernelD, gridD, DefaultBlockSize, args);
+            return;
+        }
+
+        if (!_kernelCache.TryGetValue("prelu_backward_alpha", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: prelu_backward_alpha");
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
@@ -12352,12 +12363,22 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void ReduceLogSumExp(IGpuBuffer input, IGpuBuffer output, float maxVal, int size)
     {
-        if (!_kernelCache.TryGetValue("reduce_logsumexp", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: reduce_logsumexp");
         using var _ = PushContext();
         IntPtr inPtr = input.Handle, outPtr = output.Handle;
         void** args = stackalloc void*[4];
         args[0] = &inPtr; args[1] = &outPtr; args[2] = &maxVal; args[3] = &size;
+
+        if (GpuDeterminism.IsActive)
+        {
+            if (!_kernelCache.TryGetValue("reduce_logsumexp_deterministic", out var kernelD))
+                throw new InvalidOperationException("CUDA kernel not found: reduce_logsumexp_deterministic");
+            Fill(output, 0f, 1);
+            LaunchKernel(kernelD, 1, DefaultBlockSize, args);
+            return;
+        }
+
+        if (!_kernelCache.TryGetValue("reduce_logsumexp", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: reduce_logsumexp");
         LaunchKernel(kernel, (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, args);
     }
 
@@ -12915,12 +12936,24 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     
     public unsafe void DotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int size)
     {
-        if (!_kernelCache.TryGetValue("dot_product", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: dot_product");
         using var _ = PushContext();
         IntPtr ap=a.Handle, bp=b.Handle, op=output.Handle;
         void** args = stackalloc void*[4];
         args[0]=&ap; args[1]=&bp; args[2]=&op; args[3]=&size;
+
+        if (GpuDeterminism.IsActive)
+        {
+            // Issue #382: single-block strided reduce, no inter-block atomic combine.
+            if (!_kernelCache.TryGetValue("dot_product_deterministic", out var kernelD))
+                throw new InvalidOperationException("CUDA kernel not found: dot_product_deterministic");
+            // Pre-zero output: single-block kernel does direct write.
+            Fill(output, 0f, 1);
+            LaunchKernel(kernelD, 1, DefaultBlockSize, args);
+            return;
+        }
+
+        if (!_kernelCache.TryGetValue("dot_product", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: dot_product");
         LaunchKernel(kernel, (uint)((size+DefaultBlockSize-1)/DefaultBlockSize), DefaultBlockSize, args);
     }
 
