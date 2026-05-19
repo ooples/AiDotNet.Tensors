@@ -550,6 +550,158 @@ extern ""C"" __global__ __launch_bounds__(1024) void lstm_backward_sequence(
         dC_init[gid] = dC;
     }
 }
+
+// lstm_backward_sequence — bit-deterministic split (issue #382). Mirror of CUDA.
+// Six-kernel pipeline keyed off dGates_t[T, B, 4*H] scratch.
+
+extern ""C"" __global__ __launch_bounds__(1024) void lstm_backward_sequence_precompute_gates_deterministic(
+    const float* gradOutput, const float* c_states, const float* gates,
+    const float* c_init, const float* Wh,
+    float* dGates_t, float* dH_init, float* dC_init,
+    int batch, int timeSteps, int hiddenSize)
+{
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    int totalElements = batch * hiddenSize;
+    bool isValid = gid < totalElements;
+    int b = isValid ? (gid / hiddenSize) : 0;
+    int h_idx = isValid ? (gid % hiddenSize) : 0;
+
+    float dH = 0.0f;
+    float dC = 0.0f;
+    if (isValid) dH_init[gid] = 0.0f;
+    __syncthreads();
+
+    for (int t = timeSteps - 1; t >= 0; t--) {
+        if (isValid && t < timeSteps - 1) {
+            dH = dH_init[gid];
+            dH_init[gid] = 0.0f;
+        }
+        __syncthreads();
+
+        if (isValid) {
+            dH += gradOutput[(b * timeSteps + t) * hiddenSize + h_idx];
+
+            int gateOffset = t * batch * 4 * hiddenSize + b * 4 * hiddenSize;
+            float f = gates[gateOffset + h_idx];
+            float i_gate = gates[gateOffset + hiddenSize + h_idx];
+            float c_candidate = gates[gateOffset + 2 * hiddenSize + h_idx];
+            float o = gates[gateOffset + 3 * hiddenSize + h_idx];
+
+            int stateOffset = t * batch * hiddenSize + gid;
+            float c_t = c_states[stateOffset];
+            float c_prev = (t == 0) ? c_init[gid] : c_states[(t - 1) * batch * hiddenSize + gid];
+
+            float tanh_c = tanhf(c_t);
+            float dO = dH * tanh_c * sigmoid_derivative(o);
+            float dC_from_H = dH * o * tanh_derivative(tanh_c);
+            dC += dC_from_H;
+            float dF = dC * c_prev * sigmoid_derivative(f);
+            float dI = dC * c_candidate * sigmoid_derivative(i_gate);
+            float dCCandidate = dC * i_gate * tanh_derivative(c_candidate);
+            float dC_prev = dC * f;
+
+            int scratchBase = t * batch * 4 * hiddenSize + b * 4 * hiddenSize;
+            dGates_t[scratchBase + h_idx] = dF;
+            dGates_t[scratchBase + hiddenSize + h_idx] = dI;
+            dGates_t[scratchBase + 2 * hiddenSize + h_idx] = dCCandidate;
+            dGates_t[scratchBase + 3 * hiddenSize + h_idx] = dO;
+
+            for (int j = 0; j < hiddenSize; j++) {
+                float contrib = dF * Wh[h_idx * hiddenSize + j];
+                contrib += dI * Wh[(hiddenSize + h_idx) * hiddenSize + j];
+                contrib += dCCandidate * Wh[(2 * hiddenSize + h_idx) * hiddenSize + j];
+                contrib += dO * Wh[(3 * hiddenSize + h_idx) * hiddenSize + j];
+                atomicAdd(&dH_init[b * hiddenSize + j], contrib);
+            }
+            dC = dC_prev;
+        }
+        __syncthreads();
+    }
+    if (isValid) dC_init[gid] = dC;
+}
+
+extern ""C"" __global__ __launch_bounds__(1024) void lstm_backward_sequence_dWi_deterministic(
+    const float* input, const float* dGates_t, float* dWi,
+    int batch, int timeSteps, int inputSize, int hiddenSize)
+{
+    int row = blockIdx.x;
+    int colIdx = blockIdx.y * blockDim.x + threadIdx.x;
+    if (row >= 4 * hiddenSize || colIdx >= inputSize) return;
+    float sum = 0.0f;
+    for (int t = 0; t < timeSteps; t++) {
+        int scratchBaseT = t * batch * 4 * hiddenSize;
+        for (int b = 0; b < batch; b++) {
+            float dGate = dGates_t[scratchBaseT + b * 4 * hiddenSize + row];
+            float x_val = input[(b * timeSteps + t) * inputSize + colIdx];
+            sum += dGate * x_val;
+        }
+    }
+    dWi[row * inputSize + colIdx] += sum;
+}
+
+extern ""C"" __global__ __launch_bounds__(1024) void lstm_backward_sequence_dWh_deterministic(
+    const float* h_states, const float* h_init, const float* dGates_t, float* dWh,
+    int batch, int timeSteps, int hiddenSize)
+{
+    int row = blockIdx.x;
+    int colIdx = blockIdx.y * blockDim.x + threadIdx.x;
+    if (row >= 4 * hiddenSize || colIdx >= hiddenSize) return;
+    float sum = 0.0f;
+    for (int t = 0; t < timeSteps; t++) {
+        int scratchBaseT = t * batch * 4 * hiddenSize;
+        for (int b = 0; b < batch; b++) {
+            float dGate = dGates_t[scratchBaseT + b * 4 * hiddenSize + row];
+            float hj = (t == 0) ? h_init[b * hiddenSize + colIdx]
+                                : h_states[(t - 1) * batch * hiddenSize + b * hiddenSize + colIdx];
+            sum += dGate * hj;
+        }
+    }
+    dWh[row * hiddenSize + colIdx] += sum;
+}
+
+extern ""C"" __global__ __launch_bounds__(1024) void lstm_backward_sequence_dBias_deterministic(
+    const float* dGates_t, float* dBiasIh, float* dBiasHh,
+    int batch, int timeSteps, int hiddenSize)
+{
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= 4 * hiddenSize) return;
+    float sum = 0.0f;
+    for (int t = 0; t < timeSteps; t++) {
+        int scratchBaseT = t * batch * 4 * hiddenSize;
+        for (int b = 0; b < batch; b++) {
+            sum += dGates_t[scratchBaseT + b * 4 * hiddenSize + row];
+        }
+    }
+    dBiasIh[row] += sum;
+    dBiasHh[row] += sum;
+}
+
+extern ""C"" __global__ __launch_bounds__(1024) void lstm_backward_sequence_dInput_deterministic(
+    const float* dGates_t, const float* Wi, float* gradInput,
+    int batch, int timeSteps, int inputSize, int hiddenSize)
+{
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    int totalElements = batch * timeSteps * inputSize;
+    if (gid >= totalElements) return;
+    int i = gid % inputSize;
+    int tmp = gid / inputSize;
+    int t = tmp % timeSteps;
+    int b = tmp / timeSteps;
+
+    int scratchBase = t * batch * 4 * hiddenSize + b * 4 * hiddenSize;
+    float grad = 0.0f;
+    for (int h = 0; h < hiddenSize; h++) {
+        float dF = dGates_t[scratchBase + h];
+        float dI = dGates_t[scratchBase + hiddenSize + h];
+        float dCCandidate = dGates_t[scratchBase + 2 * hiddenSize + h];
+        float dO = dGates_t[scratchBase + 3 * hiddenSize + h];
+        grad += dF * Wi[h * inputSize + i];
+        grad += dI * Wi[(hiddenSize + h) * inputSize + i];
+        grad += dCCandidate * Wi[(2 * hiddenSize + h) * inputSize + i];
+        grad += dO * Wi[(3 * hiddenSize + h) * inputSize + i];
+    }
+    gradInput[(b * timeSteps + t) * inputSize + i] += grad;
+}
 ";
     }
 
@@ -567,7 +719,12 @@ extern ""C"" __global__ __launch_bounds__(1024) void lstm_backward_sequence(
             "lstm_compute_gate_gradients",
             "lstm_accumulate_weight_gradients",
             "lstm_accumulate_weight_gradients_deterministic",
-            "lstm_backward_sequence"
+            "lstm_backward_sequence",
+            "lstm_backward_sequence_precompute_gates_deterministic",
+            "lstm_backward_sequence_dWi_deterministic",
+            "lstm_backward_sequence_dWh_deterministic",
+            "lstm_backward_sequence_dBias_deterministic",
+            "lstm_backward_sequence_dInput_deterministic"
         };
     }
 }
