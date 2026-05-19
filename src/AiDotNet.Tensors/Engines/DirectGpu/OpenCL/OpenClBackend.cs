@@ -7387,6 +7387,69 @@ KERNEL VARIANTS (A/B testing):
             int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal,
             IGpuBuffer? attentionBias = null, int biasBatchStride = 0)
         {
+            if (GpuDeterminism.IsActive)
+            {
+                // Issue #382: atomic_add_float scatter into gradKey/gradValue is FP-
+                // non-deterministic across runs. Split into two atomic-free kernels:
+                //   gradq: per (bh, qi) — writes gradQuery only
+                //   gradkv: per (bh, ki, d) — accumulates gradKey/gradValue with
+                //           fixed qi traversal order
+                var kq = _kernelCache["flash_attention_backward_gradq_deterministic"];
+                uint aq = 0;
+                kq.SetArg(aq++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
+                kq.SetArg(aq++, ((DirectOpenClGpuBuffer)query).Buffer.Handle);
+                kq.SetArg(aq++, ((DirectOpenClGpuBuffer)key).Buffer.Handle);
+                kq.SetArg(aq++, ((DirectOpenClGpuBuffer)value).Buffer.Handle);
+                kq.SetArg(aq++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+                kq.SetArg(aq++, ((DirectOpenClGpuBuffer)softmaxStats).Buffer.Handle);
+                kq.SetArg(aq++, ((DirectOpenClGpuBuffer)gradQuery).Buffer.Handle);
+                kq.SetArg(aq++, batch);
+                kq.SetArg(aq++, numHeads);
+                kq.SetArg(aq++, seqQ);
+                kq.SetArg(aq++, seqK);
+                kq.SetArg(aq++, headDim);
+                kq.SetArg(aq++, scale);
+                kq.SetArg(aq++, isCausal ? 1 : 0);
+                if (attentionBias is not null)
+                    kq.SetArg(aq++, ((DirectOpenClGpuBuffer)attentionBias).Buffer.Handle);
+                else
+                    kq.SetArg(aq++, IntPtr.Zero);
+                kq.SetArg(aq++, attentionBias is not null ? 1 : 0);
+                kq.SetArg(aq, biasBatchStride);
+
+                int lqx = Math.Min(64, seqQ);
+                kq.Execute2D(seqQ, batch * numHeads, lqx, 1);
+
+                var kkv = _kernelCache["flash_attention_backward_gradkv_deterministic"];
+                uint akv = 0;
+                kkv.SetArg(akv++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
+                kkv.SetArg(akv++, ((DirectOpenClGpuBuffer)query).Buffer.Handle);
+                kkv.SetArg(akv++, ((DirectOpenClGpuBuffer)key).Buffer.Handle);
+                kkv.SetArg(akv++, ((DirectOpenClGpuBuffer)value).Buffer.Handle);
+                kkv.SetArg(akv++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+                kkv.SetArg(akv++, ((DirectOpenClGpuBuffer)softmaxStats).Buffer.Handle);
+                kkv.SetArg(akv++, ((DirectOpenClGpuBuffer)gradKey).Buffer.Handle);
+                kkv.SetArg(akv++, ((DirectOpenClGpuBuffer)gradValue).Buffer.Handle);
+                kkv.SetArg(akv++, batch);
+                kkv.SetArg(akv++, numHeads);
+                kkv.SetArg(akv++, seqQ);
+                kkv.SetArg(akv++, seqK);
+                kkv.SetArg(akv++, headDim);
+                kkv.SetArg(akv++, scale);
+                kkv.SetArg(akv++, isCausal ? 1 : 0);
+                if (attentionBias is not null)
+                    kkv.SetArg(akv++, ((DirectOpenClGpuBuffer)attentionBias).Buffer.Handle);
+                else
+                    kkv.SetArg(akv++, IntPtr.Zero);
+                kkv.SetArg(akv++, attentionBias is not null ? 1 : 0);
+                kkv.SetArg(akv, biasBatchStride);
+
+                int lkvX = Math.Min(16, headDim);
+                int lkvY = Math.Min(4, seqK);
+                kkv.Execute3D(headDim, seqK, batch * numHeads, lkvX, lkvY, 1);
+                return;
+            }
+
             // FlashAttention backward with recomputation for memory efficiency
             var k = _kernelCache["flash_attention_backward"];
             uint arg = 0;
@@ -7455,6 +7518,53 @@ KERNEL VARIANTS (A/B testing):
             IGpuBuffer gradQuery, IGpuBuffer gradKey, IGpuBuffer gradValue,
             int batch, int numQHeads, int numKVHeads, int seqQ, int seqK, int headDim, float scale)
         {
+            if (GpuDeterminism.IsActive)
+            {
+                // Issue #382: gradkey/gradValue scatter atomics are FP-non-deterministic;
+                // split into per (bqh, qi) gradQuery and per (b, kvh, ki, d) gradKV.
+                var kqg = _kernelCache["grouped_query_attention_backward_gradq_deterministic"];
+                uint aqg = 0;
+                kqg.SetArg(aqg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
+                kqg.SetArg(aqg++, ((DirectOpenClGpuBuffer)query).Buffer.Handle);
+                kqg.SetArg(aqg++, ((DirectOpenClGpuBuffer)key).Buffer.Handle);
+                kqg.SetArg(aqg++, ((DirectOpenClGpuBuffer)value).Buffer.Handle);
+                kqg.SetArg(aqg++, ((DirectOpenClGpuBuffer)attentionWeights).Buffer.Handle);
+                kqg.SetArg(aqg++, ((DirectOpenClGpuBuffer)gradQuery).Buffer.Handle);
+                kqg.SetArg(aqg++, batch);
+                kqg.SetArg(aqg++, numQHeads);
+                kqg.SetArg(aqg++, numKVHeads);
+                kqg.SetArg(aqg++, numQHeads / numKVHeads);
+                kqg.SetArg(aqg++, seqQ);
+                kqg.SetArg(aqg++, seqK);
+                kqg.SetArg(aqg++, headDim);
+                kqg.SetArg(aqg++, scale);
+                int lqgx = Math.Min(16, headDim);
+                int lqgy = Math.Min(8, seqQ);
+                kqg.Execute3D(headDim, seqQ, batch * numQHeads, lqgx, lqgy, 1);
+
+                var kkvg = _kernelCache["grouped_query_attention_backward_gradkv_deterministic"];
+                uint akvg = 0;
+                kkvg.SetArg(akvg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
+                kkvg.SetArg(akvg++, ((DirectOpenClGpuBuffer)query).Buffer.Handle);
+                kkvg.SetArg(akvg++, ((DirectOpenClGpuBuffer)key).Buffer.Handle);
+                kkvg.SetArg(akvg++, ((DirectOpenClGpuBuffer)value).Buffer.Handle);
+                kkvg.SetArg(akvg++, ((DirectOpenClGpuBuffer)attentionWeights).Buffer.Handle);
+                kkvg.SetArg(akvg++, ((DirectOpenClGpuBuffer)gradKey).Buffer.Handle);
+                kkvg.SetArg(akvg++, ((DirectOpenClGpuBuffer)gradValue).Buffer.Handle);
+                kkvg.SetArg(akvg++, batch);
+                kkvg.SetArg(akvg++, numQHeads);
+                kkvg.SetArg(akvg++, numKVHeads);
+                kkvg.SetArg(akvg++, numQHeads / numKVHeads);
+                kkvg.SetArg(akvg++, seqQ);
+                kkvg.SetArg(akvg++, seqK);
+                kkvg.SetArg(akvg++, headDim);
+                kkvg.SetArg(akvg++, scale);
+                int lkvgx = Math.Min(16, headDim);
+                int lkvgy = Math.Min(4, seqK);
+                kkvg.Execute3D(headDim, seqK, batch * numKVHeads, lkvgx, lkvgy, 1);
+                return;
+            }
+
             // GQA backward - accumulate gradients for K,V across shared query heads
             var k = _kernelCache["grouped_query_attention_backward"];
             uint arg = 0;
