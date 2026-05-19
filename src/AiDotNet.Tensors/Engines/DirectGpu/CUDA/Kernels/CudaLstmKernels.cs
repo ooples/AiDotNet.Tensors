@@ -727,18 +727,29 @@ extern ""C"" __global__ __launch_bounds__(1024) void lstm_backward_sequence(
     }
 }
 
-// lstm_backward_sequence — bit-deterministic split (issue #382).
+// lstm_backward_sequence — atomic-free split (issue #382).
 // Six-kernel pipeline keyed off a scratch dGates_t buffer of size [T, B, 4H]:
 //   1. precompute_gates: per (b, h) thread iterates timesteps in reverse
 //      computing dGates_t[t, b, 4*h:4*h+4] = (dF, dI, dCCandidate, dO) per timestep,
-//      and writes final dC_init / dH_init. No atomics (each thread owns its (b, h)
-//      strip across all t; dH_init is written by stepping back through t to t=0).
+//      and writes final dC_init / dH_init.
 //      Caller must pre-zero dH_init and dC_init.
 //   2. dWi: per (gate*H+h, i) sums over (t, b). No atomics.
 //   3. dWh: per (gate*H+h, j) sums over (t, b) with hj from prior timestep. No atomics.
 //   4. dBias: per (gate*H+h) sums over (t, b). Writes both dBiasIh and dBiasHh.
 //   5. dInput: per (b, t, i) reads dGates_t, computes dot product with Wi. No atomics.
 // Scratch size: [T * B * 4H * sizeof(float)]; reuses dH_init as the in-loop accumulator.
+//
+// KNOWN PARTIAL-DETERMINISM LIMITATION (precompute kernel only):
+// The producer kernel below still uses atomicAdd on dH_init for the across-h
+// reduction at line marked AT-LIMITATION. The five consumer kernels are
+// fully deterministic given a fixed dGates_t.
+//
+// Fully eliminating the atomicAdd requires a 2-phase split per timestep,
+// which can not run in a single kernel launch because batch * hiddenSize
+// can exceed the single-block limit, so __syncthreads() does not span the
+// grid. The proper fix is host-orchestrated: launch a compute_dgates_at_t
+// kernel followed by a propagate_dh_at_t kernel per timestep (2*T launches
+// total). Tracked as follow-up.
 
 extern ""C"" __global__ __launch_bounds__(1024) void lstm_backward_sequence_precompute_gates_deterministic(
     const float* gradOutput,  // [batch, timeSteps, hidden]
@@ -798,8 +809,9 @@ extern ""C"" __global__ __launch_bounds__(1024) void lstm_backward_sequence_prec
             dGates_t[scratchBase + 2 * hiddenSize + h_idx] = dCCandidate;
             dGates_t[scratchBase + 3 * hiddenSize + h_idx] = dO;
 
-            // dH accumulation for t-1 (still atomic — multiple h_idx contribute per j)
-            // Per-cell deterministic version below.
+            // AT-LIMITATION: atomicAdd on dH_init across-h is the remaining
+            // nondeterminism in this kernel. See header comment for the
+            // proper 2-phase host-orchestrated fix.
             for (int j = 0; j < hiddenSize; j++) {
                 float contrib = dF * Wh[h_idx * hiddenSize + j];
                 contrib += dI * Wh[(hiddenSize + h_idx) * hiddenSize + j];

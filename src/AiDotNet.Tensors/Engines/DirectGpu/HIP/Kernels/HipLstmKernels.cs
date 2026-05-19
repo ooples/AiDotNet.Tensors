@@ -551,9 +551,23 @@ extern ""C"" __global__ __launch_bounds__(1024) void lstm_backward_sequence(
     }
 }
 
-// lstm_backward_sequence — bit-deterministic split (issue #382). Mirror of CUDA.
+// lstm_backward_sequence — atomic-free split (issue #382). Mirror of CUDA.
 // Six-kernel pipeline keyed off dGates_t[T, B, 4*H] scratch.
-
+//
+// KNOWN PARTIAL-DETERMINISM LIMITATION (precompute kernel only):
+// The producer kernel below still uses atomicAdd on dH_init for the across-h
+// reduction at line marked AT-LIMITATION below. The five consumer kernels
+// (dWi/dWh/dBias/dInput) are fully deterministic given a fixed dGates_t.
+//
+// Fully eliminating the atomicAdd requires a 2-phase split per timestep,
+// which can not run in a single kernel launch because batch * hiddenSize
+// can exceed the single-block limit, so __syncthreads() does not span the
+// grid. The proper fix is host-orchestrated: launch a compute_dgates_at_t
+// kernel followed by a propagate_dh_at_t kernel per timestep (2*T launches
+// total). Tracked as follow-up; this kernel is registered under the
+// `_deterministic` suffix because the across-run *value* drift is bounded
+// by the per-block atomicAdd order — small enough that downstream
+// gradient sanity checks pass — but it is NOT bit-equal.
 extern ""C"" __global__ __launch_bounds__(1024) void lstm_backward_sequence_precompute_gates_deterministic(
     const float* gradOutput, const float* c_states, const float* gates,
     const float* c_init, const float* Wh,
@@ -606,6 +620,9 @@ extern ""C"" __global__ __launch_bounds__(1024) void lstm_backward_sequence_prec
             dGates_t[scratchBase + 2 * hiddenSize + h_idx] = dCCandidate;
             dGates_t[scratchBase + 3 * hiddenSize + h_idx] = dO;
 
+            // AT-LIMITATION: atomicAdd on dH_init is the remaining
+            // nondeterminism in this kernel. See header comment for the
+            // proper 2-phase host-orchestrated fix.
             for (int j = 0; j < hiddenSize; j++) {
                 float contrib = dF * Wh[h_idx * hiddenSize + j];
                 contrib += dI * Wh[(hiddenSize + h_idx) * hiddenSize + j];
