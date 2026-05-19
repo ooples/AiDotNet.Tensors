@@ -4870,10 +4870,23 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             // Issue #382: under DeterministicMode, dispatch to the per-output-cell
             // split kernels (per-channel for gradGamma/gradBeta, per-instance for
             // sumDy/sumDyXhat). Each owns one output cell — no atomics.
-            if (GpuDeterminism.IsActive
-                && _kernelCache.TryGetValue("instancenorm_backward_sums_per_channel_deterministic", out var sumsPerChannelD)
-                && _kernelCache.TryGetValue("instancenorm_backward_sums_per_instance_deterministic", out var sumsPerInstanceD))
+            // CodeRabbit (#390): fail closed when the deterministic kernels are
+            // unavailable. Silently falling through to instancenorm_backward_sums
+            // reintroduces atomic accumulation while GpuDeterminism.IsActive is
+            // still true, breaking the deterministic-mode contract.
+            if (GpuDeterminism.IsActive)
             {
+                if (!_kernelCache.TryGetValue("instancenorm_backward_sums_per_channel_deterministic", out var sumsPerChannelD)
+                    || !_kernelCache.TryGetValue("instancenorm_backward_sums_per_instance_deterministic", out var sumsPerInstanceD))
+                {
+                    throw new InvalidOperationException(
+                        "Deterministic InstanceNormBackward kernels are unavailable on this HIP backend. " +
+                        "GpuDeterminism.IsActive is true but " +
+                        "'instancenorm_backward_sums_per_channel_deterministic' and/or " +
+                        "'instancenorm_backward_sums_per_instance_deterministic' are missing from the kernel cache. " +
+                        "Disable GpuDeterminism or route to the CPU fallback for this op.");
+                }
+
                 IntPtr _p0 = gradOutput.Handle;
                 IntPtr _p1 = input.Handle;
                 IntPtr _p2 = saveMean.Handle;

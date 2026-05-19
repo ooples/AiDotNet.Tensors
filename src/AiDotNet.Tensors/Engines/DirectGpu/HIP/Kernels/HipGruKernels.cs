@@ -759,13 +759,24 @@ extern ""C"" __global__ __launch_bounds__(1024) void gru_backward_sequence_preco
 
             // dR depends on a full sum over k of dHCand_k * Uh[k, h_idx] times
             // h_prev[h_idx] * sigmoid'(r). Recompute dHCand_k locally for each k.
+            // CodeRabbit (#390): for k == h_idx the read from dH_init at line
+            // (b * hiddenSize + k) returns 0 because line 740 zeroed it. The
+            // correct value is held in the local `dH` variable, which already
+            // equals gradOutput[t, h_idx] + (old dH_init[gid] when t < T-1).
             float dR_sum = 0.0f;
             for (int k = 0; k < hiddenSize; k++) {
                 float z_k = gates[gateOffset + k];
                 float n_k = gates[gateOffset + 2 * hiddenSize + k];
-                float dH_k = (t == timeSteps - 1)
-                    ? gradOutput[(b * timeSteps + t) * hiddenSize + k]
-                    : (gradOutput[(b * timeSteps + t) * hiddenSize + k] + dH_init[b * hiddenSize + k]);
+                float dH_k;
+                if (k == h_idx) {
+                    // Local `dH` holds the (preserved + this-timestep) sum.
+                    dH_k = dH;
+                } else if (t == timeSteps - 1) {
+                    dH_k = gradOutput[(b * timeSteps + t) * hiddenSize + k];
+                } else {
+                    dH_k = gradOutput[(b * timeSteps + t) * hiddenSize + k]
+                         + dH_init[b * hiddenSize + k];
+                }
                 float dHCand_k = dH_k * z_k * tanh_derivative(n_k);
                 dR_sum += dHCand_k * Uh[k * hiddenSize + h_idx];
             }

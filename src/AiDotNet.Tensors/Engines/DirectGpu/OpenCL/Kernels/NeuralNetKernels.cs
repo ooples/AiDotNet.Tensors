@@ -1609,6 +1609,8 @@ __kernel void scatter_add_batched(
 }
 
 // scatter_add_batched — bit-deterministic variant (issue #382).
+// CodeRabbit (#390): self-contained-write pattern — one thread owns its
+// (dstIdx, featIdx) cell; final `=` not `+=`. Matches CUDA + HIP twins.
 __kernel void scatter_add_batched_deterministic(
     __global const float* src,
     __global const int* indices,
@@ -1627,7 +1629,7 @@ __kernel void scatter_add_batched_deterministic(
             sum += src[i * featureSize + featIdx];
         }
     }
-    dst[dstIdx * featureSize + featIdx] += sum;
+    dst[dstIdx * featureSize + featIdx] = sum;
 }
 
 __kernel void scatter_mean_accumulate(

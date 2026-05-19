@@ -1937,6 +1937,9 @@ extern ""C"" __global__ __launch_bounds__(256) void scatter_add(
 
 // scatter_add — bit-deterministic variant (issue #382).
 // One thread per destination cell; scans numElements in ascending order.
+// CodeRabbit (#390): final write is `=` not `+=` — each thread fully owns its
+// destination cell, matching embedding_backward_deterministic's self-contained
+// pattern (no caller-must-zero precondition).
 extern ""C"" __global__ __launch_bounds__(256) void scatter_add_deterministic(
     const float* src,
     const int* indices,
@@ -1953,7 +1956,7 @@ extern ""C"" __global__ __launch_bounds__(256) void scatter_add_deterministic(
             sum += src[i];
         }
     }
-    dst[dstIdx] += sum;
+    dst[dstIdx] = sum;
 }
 
 // Batched scatter add for multi-dimensional tensors.
@@ -1975,6 +1978,8 @@ extern ""C"" __global__ __launch_bounds__(256) void scatter_add_batched(
 }
 
 // scatter_add_batched — bit-deterministic variant (issue #382).
+// CodeRabbit (#390): same self-contained-write pattern as
+// scatter_add_deterministic. One thread per (dstIdx, featIdx); final `=` not `+=`.
 extern ""C"" __global__ __launch_bounds__(256) void scatter_add_batched_deterministic(
     const float* src,
     const int* indices,
@@ -1993,7 +1998,7 @@ extern ""C"" __global__ __launch_bounds__(256) void scatter_add_batched_determin
             sum += src[i * featureSize + featIdx];
         }
     }
-    dst[dstIdx * featureSize + featIdx] += sum;
+    dst[dstIdx * featureSize + featIdx] = sum;
 }
 
 // Scatter max for graph pooling

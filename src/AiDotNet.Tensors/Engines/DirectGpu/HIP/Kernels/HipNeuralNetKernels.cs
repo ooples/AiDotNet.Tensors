@@ -1763,6 +1763,9 @@ extern ""C"" __global__ __launch_bounds__(256) void scatter_add(
 }
 
 // scatter_add — bit-deterministic variant (issue #382).
+// CodeRabbit (#390): one thread owns one destination cell; full sum is computed
+// locally so the final write is `=`, not `+=`. Matches embedding_backward_deterministic's
+// self-contained pattern — caller no longer needs to zero dst beforehand.
 extern ""C"" __global__ __launch_bounds__(256) void scatter_add_deterministic(
     const float* src,
     const int* indices,
@@ -1777,7 +1780,7 @@ extern ""C"" __global__ __launch_bounds__(256) void scatter_add_deterministic(
     for (int i = 0; i < numElements; i++) {
         if (indices[i] == dstIdx) sum += src[i];
     }
-    dst[dstIdx] += sum;
+    dst[dstIdx] = sum;
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void scatter_add_batched(
@@ -1796,6 +1799,8 @@ extern ""C"" __global__ __launch_bounds__(256) void scatter_add_batched(
     atomicAdd(&dst[dstIdx * featureSize + featIdx], src[idx]);
 }
 
+// CodeRabbit (#390): same self-contained-write pattern as
+// scatter_add_deterministic. One thread per (dstIdx, featIdx); final `=` not `+=`.
 extern ""C"" __global__ __launch_bounds__(256) void scatter_add_batched_deterministic(
     const float* src,
     const int* indices,
@@ -1812,7 +1817,7 @@ extern ""C"" __global__ __launch_bounds__(256) void scatter_add_batched_determin
     for (int i = 0; i < numElements; i++) {
         if (indices[i] == dstIdx) sum += src[i * featureSize + featIdx];
     }
-    dst[dstIdx * featureSize + featIdx] += sum;
+    dst[dstIdx * featureSize + featIdx] = sum;
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void scatter_max(
