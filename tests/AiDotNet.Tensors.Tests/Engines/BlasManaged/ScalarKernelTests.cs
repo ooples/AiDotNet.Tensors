@@ -2895,11 +2895,12 @@ public class ScalarKernelTests
 
         // The heuristic for this large shape with M=3137 and procs=16:
         // procs*mr*2 = 256, m=3137 > 256 → M-axis.
-        // Defaults: mc=64, nc=64, kc=64.
+        // Sub-Q (#407): BLIS-style defaults (mc=128, nc=512, kc=256) replaced
+        // the previous (64, 64, 64).
         Assert.Equal(ParallelismAxis.M, axis);
-        Assert.Equal(64, mc);
-        Assert.Equal(64, nc);
-        Assert.Equal(64, kc);
+        Assert.Equal(128, mc);
+        Assert.Equal(512, nc);
+        Assert.Equal(256, kc);
     }
 
     [Fact]

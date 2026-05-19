@@ -74,18 +74,44 @@ internal static class AutotuneDispatcher
     }
 
     /// <summary>
+    /// Sub-Q (#407): when set, on autotune cache miss benchmark a small set of
+    /// candidate (Mc, Nc, Kc) tuples and store the winner instead of using the
+    /// heuristic. Off by default — first-call overhead is several ms per shape.
+    /// Set via env var <c>AIDOTNET_BLAS_AUTOTUNE_MEASURE=1</c> at process start
+    /// (recommended: enable in production warmup, leave off in CI/tests).
+    /// </summary>
+    internal static bool MeasurementEnabled { get; } =
+        Environment.GetEnvironmentVariable("AIDOTNET_BLAS_AUTOTUNE_MEASURE") == "1";
+
+    /// <summary>
     /// Use the AxisSelector heuristic to choose an axis, with default blocking
     /// parameters. The heuristic itself is shape-aware (m, n, k, mr, nr, procs).
+    ///
+    /// <para>
+    /// Sub-Q (#407): block defaults upgraded from (64, 64, 64) to BLIS-style
+    /// (128, 512, 256) for shapes large enough to benefit. Small shapes still
+    /// clamp to dimension. The Pre-pack handle override in BlasManaged.Gemm
+    /// (search "TileMc") keeps the (Sub-E) FrozenWeightRegistry consumption
+    /// correct under the new defaults — handle dims override autotune choice.
+    /// </para>
     /// </summary>
     private static (ParallelismAxis Axis, int Mc, int Nc, int Kc, int ThreadCount)
         FallbackToHeuristic(int m, int n, int k, int mr, int nr, int procs, bool isDeterministic)
     {
         var axis = AxisSelector.Select(m, n, k, mr, nr, procs, isDeterministic);
-        // Default blocking: 64 across the board (matches BlasManaged.Gemm defaults).
-        // Cap each block at the corresponding shape dimension.
-        int mc = Math.Min(64, m);
-        int nc = Math.Min(64, n);
-        int kc = Math.Min(64, k);
+
+        // Sub-Q: BLIS-style defaults. Standard AVX2 + Zen-class cache geometry.
+        // Mc=128 fits L1 with M-stripe + Kc K-stripe = 128 × 256 × 4 = 128 KB (FP32)
+        //   — slightly over L1 but reads stream + microkernel reuses the stripe Nc/Nr
+        //   times per pack-A, so the working set is dominated by the C tile.
+        // Nc=512 lets B-pack fit L2 (256 KB FP32) and amortizes pack-B across many
+        //   ic-blocks.
+        // Kc=256 keeps the pack-A and pack-B regions cache-resident together.
+        // For tiny shapes (m < 128, etc.) the Math.Min clamp falls back to dim-fits.
+        int mc = Math.Min(128, m);
+        int nc = Math.Min(512, n);
+        int kc = Math.Min(256, k);
+
         // Round mc down to mr alignment, nc down to nr alignment.
         if (mr > 0) mc = (mc / mr) * mr;
         if (nr > 0) nc = (nc / nr) * nr;
