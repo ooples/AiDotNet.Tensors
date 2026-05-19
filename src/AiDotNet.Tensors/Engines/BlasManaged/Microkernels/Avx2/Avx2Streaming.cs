@@ -109,11 +109,15 @@ internal static class Avx2Streaming
             return;
         }
 
-        // Process 32 cols per outer iter using 4 Vector256<float> accumulators.
-        // Each iter advances j by 32.
-        int nBig = (n / 32) * 32;  // largest multiple of 32 ≤ n
-        int nBlocks = n / 8;        // 8-col blocks for the [nBig, n & ~7) tail
-        int nBig8 = nBig / 8;       // already covered by the big loop
+        // Process 64 cols per outer iter using 8 Vector256<float> accumulators.
+        // Each iter advances j by 64. With 8 accumulators, the FMA chain has
+        // enough independent ops to fully pipeline on Zen3 (FMA throughput 1
+        // per cycle once pipelined, latency 4-5 cycles → 5-acc minimum to hide).
+        int nBig = (n / 64) * 64;       // largest multiple of 64 ≤ n
+        int nBig32 = (n / 32) * 32;     // largest multiple of 32 ≤ n
+        int nBlocks = n / 8;             // 8-col blocks for the trailing tail
+        int nBig64_blocks = nBig / 8;    // covered by the 8-acc loop
+        int nBig32_blocks = nBig32 / 8;  // covered by either 8-acc or 4-acc
 
         fixed (float* aPtr = a)
         fixed (float* bPtr = b)
@@ -121,8 +125,42 @@ internal static class Avx2Streaming
         {
             for (int i = 0; i < m; i++)
             {
-                // ── 4-acc SIMD path: 32 cols per iter ──────────────────────────
-                for (int jStart = 0; jStart < nBig; jStart += 32)
+                // ── 8-acc SIMD path: 64 cols per iter ──────────────────────────
+                for (int jStart = 0; jStart < nBig; jStart += 64)
+                {
+                    Vector256<float> acc0 = Avx.LoadVector256(cPtr + i * ldc + jStart + 0);
+                    Vector256<float> acc1 = Avx.LoadVector256(cPtr + i * ldc + jStart + 8);
+                    Vector256<float> acc2 = Avx.LoadVector256(cPtr + i * ldc + jStart + 16);
+                    Vector256<float> acc3 = Avx.LoadVector256(cPtr + i * ldc + jStart + 24);
+                    Vector256<float> acc4 = Avx.LoadVector256(cPtr + i * ldc + jStart + 32);
+                    Vector256<float> acc5 = Avx.LoadVector256(cPtr + i * ldc + jStart + 40);
+                    Vector256<float> acc6 = Avx.LoadVector256(cPtr + i * ldc + jStart + 48);
+                    Vector256<float> acc7 = Avx.LoadVector256(cPtr + i * ldc + jStart + 56);
+                    for (int kk = 0; kk < k; kk++)
+                    {
+                        float aval = transA ? aPtr[kk * lda + i] : aPtr[i * lda + kk];
+                        Vector256<float> aVec = Vector256.Create(aval);
+                        float* bRow = bPtr + kk * ldb + jStart;
+                        acc0 = Fma.MultiplyAdd(aVec, Avx.LoadVector256(bRow + 0), acc0);
+                        acc1 = Fma.MultiplyAdd(aVec, Avx.LoadVector256(bRow + 8), acc1);
+                        acc2 = Fma.MultiplyAdd(aVec, Avx.LoadVector256(bRow + 16), acc2);
+                        acc3 = Fma.MultiplyAdd(aVec, Avx.LoadVector256(bRow + 24), acc3);
+                        acc4 = Fma.MultiplyAdd(aVec, Avx.LoadVector256(bRow + 32), acc4);
+                        acc5 = Fma.MultiplyAdd(aVec, Avx.LoadVector256(bRow + 40), acc5);
+                        acc6 = Fma.MultiplyAdd(aVec, Avx.LoadVector256(bRow + 48), acc6);
+                        acc7 = Fma.MultiplyAdd(aVec, Avx.LoadVector256(bRow + 56), acc7);
+                    }
+                    Avx.Store(cPtr + i * ldc + jStart + 0, acc0);
+                    Avx.Store(cPtr + i * ldc + jStart + 8, acc1);
+                    Avx.Store(cPtr + i * ldc + jStart + 16, acc2);
+                    Avx.Store(cPtr + i * ldc + jStart + 24, acc3);
+                    Avx.Store(cPtr + i * ldc + jStart + 32, acc4);
+                    Avx.Store(cPtr + i * ldc + jStart + 40, acc5);
+                    Avx.Store(cPtr + i * ldc + jStart + 48, acc6);
+                    Avx.Store(cPtr + i * ldc + jStart + 56, acc7);
+                }
+                // ── 4-acc SIMD path: 32 cols per iter for [nBig, nBig32) ──────
+                for (int jStart = nBig; jStart < nBig32; jStart += 32)
                 {
                     Vector256<float> acc0 = Avx.LoadVector256(cPtr + i * ldc + jStart + 0);
                     Vector256<float> acc1 = Avx.LoadVector256(cPtr + i * ldc + jStart + 8);
@@ -133,22 +171,18 @@ internal static class Avx2Streaming
                         float aval = transA ? aPtr[kk * lda + i] : aPtr[i * lda + kk];
                         Vector256<float> aVec = Vector256.Create(aval);
                         float* bRow = bPtr + kk * ldb + jStart;
-                        Vector256<float> b0 = Avx.LoadVector256(bRow + 0);
-                        Vector256<float> b1 = Avx.LoadVector256(bRow + 8);
-                        Vector256<float> b2 = Avx.LoadVector256(bRow + 16);
-                        Vector256<float> b3 = Avx.LoadVector256(bRow + 24);
-                        acc0 = Fma.MultiplyAdd(aVec, b0, acc0);
-                        acc1 = Fma.MultiplyAdd(aVec, b1, acc1);
-                        acc2 = Fma.MultiplyAdd(aVec, b2, acc2);
-                        acc3 = Fma.MultiplyAdd(aVec, b3, acc3);
+                        acc0 = Fma.MultiplyAdd(aVec, Avx.LoadVector256(bRow + 0), acc0);
+                        acc1 = Fma.MultiplyAdd(aVec, Avx.LoadVector256(bRow + 8), acc1);
+                        acc2 = Fma.MultiplyAdd(aVec, Avx.LoadVector256(bRow + 16), acc2);
+                        acc3 = Fma.MultiplyAdd(aVec, Avx.LoadVector256(bRow + 24), acc3);
                     }
                     Avx.Store(cPtr + i * ldc + jStart + 0, acc0);
                     Avx.Store(cPtr + i * ldc + jStart + 8, acc1);
                     Avx.Store(cPtr + i * ldc + jStart + 16, acc2);
                     Avx.Store(cPtr + i * ldc + jStart + 24, acc3);
                 }
-                // ── 1-acc SIMD path: remaining 8-col blocks in [nBig, nBlocks*8) ──
-                for (int jb = nBig8; jb < nBlocks; jb++)
+                // ── 1-acc SIMD path: remaining 8-col blocks ──────
+                for (int jb = nBig32_blocks; jb < nBlocks; jb++)
                 {
                     int jStart = jb * 8;
                     Vector256<float> acc = Avx.LoadVector256(cPtr + i * ldc + jStart);
