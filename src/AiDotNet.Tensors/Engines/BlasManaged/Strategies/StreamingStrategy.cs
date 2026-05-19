@@ -49,9 +49,22 @@ internal static class StreamingStrategy
         int procs = options.NumThreads > 0 ? options.NumThreads : Environment.ProcessorCount;
         // -1 from caller = force single-thread (deterministic regression-test path).
         if (options.NumThreads < 0) procs = 1;
-        bool isDeterministic = BlasProvider.IsDeterministicMode;
+        // Determinism comes from either the global BlasProvider switch or the per-call
+        // BlasOptions.Mode. Any source asking for Deterministic wins (OR semantics).
+        bool isDeterministic = BlasProvider.IsDeterministicMode || options.Mode == BlasMode.Deterministic;
 
         var axis = AxisSelector.Select(m, n, k, StreamingMr, StreamingNr, procs, isDeterministic);
+
+        // K-axis (Fast mode only): tall-K shape where M and N are too small for
+        // M-axis or N-axis splits. AxisSelector already gates K-axis on
+        // !isDeterministic, but we double-check here so a later AxisSelector
+        // refinement that ignores the determinism flag can't accidentally enable
+        // K-axis under Deterministic mode.
+        if (axis == ParallelismAxis.K && !isDeterministic && procs > 1)
+        {
+            RunKParallel(a, lda, transA, b, ldb, transB, c, ldc, m, n, k, procs);
+            return;
+        }
 
         if (axis == ParallelismAxis.N && n >= procs * StreamingNr * 2)
         {
@@ -60,6 +73,115 @@ internal static class StreamingStrategy
         }
 
         RunSerial(a, lda, transA, b, ldb, transB, c, ldc, m, n, k);
+    }
+
+    /// <summary>
+    /// K-axis split: partition K across <paramref name="procs"/> threads. Each
+    /// thread accumulates its partial C[M,N] over its K-slice; partials are
+    /// reduced in fixed pairwise order. Non-associative — Fast mode only.
+    /// </summary>
+    private static void RunKParallel<T>(
+        ReadOnlySpan<T> a, int lda, bool transA,
+        ReadOnlySpan<T> b, int ldb, bool transB,
+        Span<T> c, int ldc,
+        int m, int n, int k,
+        int procs) where T : unmanaged
+    {
+        int totalElems = m * n;
+        if (typeof(T) == typeof(double))
+        {
+            var partials = new Memory<double>[procs];
+            for (int p = 0; p < procs; p++) partials[p] = new double[totalElems];
+
+            unsafe
+            {
+                fixed (T* aPtr = a) fixed (T* bPtr = b)
+                {
+                    T* aLocal = aPtr;
+                    T* bLocal = bPtr;
+                    int aLen = a.Length, bLen = b.Length;
+                    int ldaLocal = lda, ldbLocal = ldb;
+                    int mLocal = m, nLocal = n;
+                    bool taLocal = transA, tbLocal = transB;
+                    int procsLocal = procs;
+
+                    Parallel.For(0, procsLocal, p =>
+                    {
+                        var (kStart, kLen) = KAxisDriver.GetThreadRange(k, procsLocal, p);
+                        if (kLen <= 0) return;
+
+                        int aOffset = taLocal ? kStart * ldaLocal : kStart;
+                        int bOffset = tbLocal ? kStart : kStart * ldbLocal;
+
+                        var aSpan = new ReadOnlySpan<T>(aLocal + aOffset, aLen - aOffset);
+                        var bSpan = new ReadOnlySpan<T>(bLocal + bOffset, bLen - bOffset);
+                        var partialSpan = partials[p].Span;
+                        // Cast partial buffer (double) to T span.
+                        Span<T> cTyped = MemoryMarshal.Cast<double, T>(partialSpan);
+                        RunSerial(aSpan, ldaLocal, taLocal,
+                                  bSpan, ldbLocal, tbLocal,
+                                  cTyped, nLocal,
+                                  mLocal, nLocal, kLen);
+                    });
+                }
+            }
+
+            ReductionTree.ReducePairwiseFp64(partials, totalElems);
+            // Copy reduced partials[0] into caller's C (row-major M×N with stride ldc).
+            var src = partials[0].Span;
+            var cDouble = MemoryMarshal.Cast<T, double>(c);
+            for (int i = 0; i < m; i++)
+                for (int j = 0; j < n; j++)
+                    cDouble[i * ldc + j] = src[i * n + j];
+        }
+        else if (typeof(T) == typeof(float))
+        {
+            var partials = new Memory<float>[procs];
+            for (int p = 0; p < procs; p++) partials[p] = new float[totalElems];
+
+            unsafe
+            {
+                fixed (T* aPtr = a) fixed (T* bPtr = b)
+                {
+                    T* aLocal = aPtr;
+                    T* bLocal = bPtr;
+                    int aLen = a.Length, bLen = b.Length;
+                    int ldaLocal = lda, ldbLocal = ldb;
+                    int mLocal = m, nLocal = n;
+                    bool taLocal = transA, tbLocal = transB;
+                    int procsLocal = procs;
+
+                    Parallel.For(0, procsLocal, p =>
+                    {
+                        var (kStart, kLen) = KAxisDriver.GetThreadRange(k, procsLocal, p);
+                        if (kLen <= 0) return;
+
+                        int aOffset = taLocal ? kStart * ldaLocal : kStart;
+                        int bOffset = tbLocal ? kStart : kStart * ldbLocal;
+
+                        var aSpan = new ReadOnlySpan<T>(aLocal + aOffset, aLen - aOffset);
+                        var bSpan = new ReadOnlySpan<T>(bLocal + bOffset, bLen - bOffset);
+                        var partialSpan = partials[p].Span;
+                        Span<T> cTyped = MemoryMarshal.Cast<float, T>(partialSpan);
+                        RunSerial(aSpan, ldaLocal, taLocal,
+                                  bSpan, ldbLocal, tbLocal,
+                                  cTyped, nLocal,
+                                  mLocal, nLocal, kLen);
+                    });
+                }
+            }
+
+            ReductionTree.ReducePairwiseFp32(partials, totalElems);
+            var src = partials[0].Span;
+            var cFloat = MemoryMarshal.Cast<T, float>(c);
+            for (int i = 0; i < m; i++)
+                for (int j = 0; j < n; j++)
+                    cFloat[i * ldc + j] = src[i * n + j];
+        }
+        else
+        {
+            throw new NotSupportedException($"StreamingStrategy K-axis does not support T={typeof(T).Name}.");
+        }
     }
 
     /// <summary>
