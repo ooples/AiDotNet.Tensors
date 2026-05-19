@@ -181,11 +181,18 @@ public static class PrefersManagedCache
     }
 
     /// <summary>
-    /// Number of probe iterations per backend during measurement. Small (3) keeps
-    /// first-call overhead low; the noise floor is acceptable because the goal
-    /// is to pick the better path, not to produce a precise speedup number.
+    /// Number of probe iterations per backend during measurement.
+    ///
+    /// <para>
+    /// Sub-F5: bumped from 3 → 10. The F.3/F.4 diagnostic showed sub-ms shapes
+    /// (M=1 inference) get noisy results at 3 iters — MobileNetV2_fc oscillated
+    /// between managed-routed and native-routed across runs. 10 iters reduces
+    /// variance enough that borderline shapes converge to a stable decision.
+    /// First-call cost rises to ~10× normal GEMM, but only once per (shape, host)
+    /// over the cache's lifetime.
+    /// </para>
     /// </summary>
-    private const int ProbeIters = 3;
+    private const int ProbeIters = 10;
 
     /// <summary>
     /// Clears the in-memory cache and resets the disk-loaded flag. Used by tests
