@@ -1301,6 +1301,8 @@ void main() {
     b[idx] = (1-hd)*(1-wd)*a[base_idx+h0*inW+w0] + (1-hd)*wd*a[base_idx+h0*inW+w1] + hd*(1-wd)*a[base_idx+h1*inW+w0] + hd*wd*a[base_idx+h1*inW+w1];
 }";
 
+    // ScatterMean — atomic CAS variant. NON-DETERMINISTIC across runs (issue #382);
+    // see ScatterMeanDeterministicGlsl below for the atomic-free variant.
     public static string ScatterMeanGlsl => Header + @"
 layout(set = 0, binding = 0) readonly buffer A { float a[]; };
 layout(set = 0, binding = 1) readonly buffer B { int bdata[]; };
@@ -1325,6 +1327,36 @@ void main() {
     uint targetRow = uint(bdata[row]);
     atomicAddFloat(targetRow * featureSize + col, a[idx]);
     if (col == 0) atomicAdd(d_counts[targetRow], 1u);
+}";
+
+    // ScatterMean — bit-deterministic variant (issue #382). One work-item per
+    // (dstRow, col) output cell scans numSrcRows in fixed ascending order.
+    // No atomic CAS loop; accumulation order is identical across runs.
+    // Uses a raw float buffer for output (not uint-bits) since no atomics are needed.
+    public static string ScatterMeanDeterministicGlsl => Header + @"
+layout(set = 0, binding = 0) readonly buffer A { float a[]; };
+layout(set = 0, binding = 1) readonly buffer B { int bdata[]; };
+layout(set = 0, binding = 2) buffer C { float c[]; };
+layout(set = 0, binding = 3) buffer D { uint d_counts[]; };
+layout(push_constant) uniform Params { uint sourceSize; uint outputSize; uint featureSize; };
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint total = outputSize * featureSize;
+    if (gid >= total) return;
+    uint dstRow = gid / featureSize;
+    uint col = gid % featureSize;
+    uint numSrcRows = sourceSize / featureSize;
+    float sum = 0.0;
+    uint cnt = 0u;
+    for (uint srcRow = 0u; srcRow < numSrcRows; srcRow++) {
+        if (uint(bdata[srcRow]) == dstRow) {
+            sum += a[srcRow * featureSize + col];
+            if (col == 0u) cnt++;
+        }
+    }
+    c[dstRow * featureSize + col] = sum;
+    if (col == 0u) d_counts[dstRow] = cnt;
 }";
 
     public static string ScatterMeanDivideGlsl => Header + @"
