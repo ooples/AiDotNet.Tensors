@@ -9075,8 +9075,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         int gridSize = (size + blockSize - 1) / blockSize;
 
         // Step 1: Compute mean via GPU reduction
+        // Issue #382: under DeterministicMode, the deterministic variant computes
+        // mean directly (writes sum/size) and uses a single-block grid; in non-
+        // deterministic mode the multi-block atomic kernel writes sum (caller divides).
         float mean;
-        if (_kernelCache.TryGetValue("reduce_mean_kernel", out var meanKernel))
+        string meanKernelName = GpuDeterminism.IsActive ? "reduce_mean_kernel_deterministic" : "reduce_mean_kernel";
+        if (_kernelCache.TryGetValue(meanKernelName, out var meanKernel))
         {
             var zeroData = new float[1];
             using var meanBuffer = AllocateBuffer(zeroData);
@@ -9089,10 +9093,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             args[1] = &meanPtr;
             args[2] = &n;
             uint sharedBytes = (uint)(blockSize * sizeof(float));
-            LaunchKernelWithSharedMem(meanKernel, (uint)gridSize, (uint)blockSize, sharedBytes, args);
+            uint launchGrid = GpuDeterminism.IsActive ? 1u : (uint)gridSize;
+            LaunchKernelWithSharedMem(meanKernel, launchGrid, (uint)blockSize, sharedBytes, args);
             // Synchronize() removed: DownloadBuffer uses cuMemcpyDtoH which is synchronous
             float[] meanResult = DownloadBuffer(meanBuffer);
-            mean = meanResult[0] / size;
+            // Deterministic kernel already divides by size; atomic kernel writes raw sum.
+            mean = GpuDeterminism.IsActive ? meanResult[0] : (meanResult[0] / size);
         }
         else
         {
@@ -9101,7 +9107,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
         // Step 2: Compute variance via GPU reduction
         float variance;
-        if (_kernelCache.TryGetValue("reduce_variance_kernel", out var varKernel))
+        string varKernelName = GpuDeterminism.IsActive ? "reduce_variance_kernel_deterministic" : "reduce_variance_kernel";
+        if (_kernelCache.TryGetValue(varKernelName, out var varKernel))
         {
             var zeroData = new float[1];
             using var varianceBuffer = AllocateBuffer(zeroData);
@@ -9116,7 +9123,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             args[2] = &meanVal;
             args[3] = &n;
             uint sharedBytes = (uint)(blockSize * sizeof(float));
-            LaunchKernelWithSharedMem(varKernel, (uint)gridSize, (uint)blockSize, sharedBytes, args);
+            uint launchGrid = GpuDeterminism.IsActive ? 1u : (uint)gridSize;
+            LaunchKernelWithSharedMem(varKernel, launchGrid, (uint)blockSize, sharedBytes, args);
             // Synchronize() removed: DownloadBuffer uses cuMemcpyDtoH which is synchronous
             float[] varResult = DownloadBuffer(varianceBuffer);
             variance = varResult[0] / size;
@@ -11656,14 +11664,27 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             throw new ArgumentOutOfRangeException(nameof(numGammaBands), "numGammaBands must be positive.");
         if (gammaIdx < 0 || gammaIdx >= numGammaBands)
             throw new ArgumentOutOfRangeException(nameof(gammaIdx), $"gammaIdx must be in [0, {numGammaBands}).");
-        if (!_kernelCache.TryGetValue("pac_phase_bin_mi", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: pac_phase_bin_mi");
         using var _ = PushContext();
         IntPtr tp = thetaPhase.Handle, ga = gammaAmp.Handle, op = output.Handle;
         void** args = stackalloc void*[7];
         args[0] = &tp; args[1] = &ga; args[2] = &op;
         args[3] = &batch; args[4] = &numSamples; args[5] = &numGammaBands; args[6] = &gammaIdx;
         uint grid = (uint)batch;
+
+        if (GpuDeterminism.IsActive)
+        {
+            // Issue #382: block size = NUM_PHASE_BINS = 18 (one thread per bin),
+            // no shared memory needed since the deterministic variant uses statically
+            // sized __shared__ inside the kernel.
+            if (!_kernelCache.TryGetValue("pac_phase_bin_mi_deterministic", out var kernelD))
+                throw new InvalidOperationException("CUDA kernel not found: pac_phase_bin_mi_deterministic");
+            CudaNativeBindings.cuLaunchKernel(kernelD, grid, 1, 1, 18, 1, 1,
+                0, IntPtr.Zero, (IntPtr)args, IntPtr.Zero);
+            return;
+        }
+
+        if (!_kernelCache.TryGetValue("pac_phase_bin_mi", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: pac_phase_bin_mi");
         uint block = 256;
         uint sharedMem = (uint)(2 * 18 * sizeof(float));
         CudaNativeBindings.cuLaunchKernel(kernel, grid, 1, 1, block, 1, 1,
