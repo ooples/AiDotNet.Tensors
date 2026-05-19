@@ -8297,7 +8297,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             if (!_kernelCache.TryGetValue("grid_sample_backward_grad_input_deterministic", out var krnlI))
                 throw new InvalidOperationException("HIP kernel not found: grid_sample_backward_grad_input_deterministic");
 
-            void** argsI = stackalloc void*[10];
+            void** argsI = stackalloc void*[11];
             argsI[0] = &_p0;
             argsI[1] = &_p2;
             argsI[2] = &_p3;
@@ -8307,7 +8307,8 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             argsI[6] = &inWidth;
             argsI[7] = &outHeight;
             argsI[8] = &outWidth;
-            argsI[9] = &alignCornersInt;
+            argsI[9] = &paddingMode;
+            argsI[10] = &alignCornersInt;
             uint gIX = (uint)((inWidth + 15) / 16);
             uint gIY = (uint)((inHeight + 15) / 16);
             uint gIZ = (uint)(batch * channels);

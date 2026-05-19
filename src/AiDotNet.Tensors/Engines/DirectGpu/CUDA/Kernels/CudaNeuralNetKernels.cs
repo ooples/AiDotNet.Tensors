@@ -1578,7 +1578,10 @@ extern ""C"" __global__ __launch_bounds__(256) void embedding_backward_determini
             sum += gradOutput[i * embeddingDim + d];
         }
     }
-    gradEmbedding[v * embeddingDim + d] += sum;
+    // Plain assignment: this launch owns every (v, d) cell, so overwriting keeps
+    // the kernel self-contained on reused buffers (no requirement that the caller
+    // zero gradEmbedding first).
+    gradEmbedding[v * embeddingDim + d] = sum;
 }
 
 // ===========================================================================
@@ -2183,8 +2186,11 @@ extern ""C"" __global__ __launch_bounds__(256) void groupnorm_backward_sums_per_
             accBeta += dy;
         }
     }
-    gradGamma[c] += accGamma;
-    gradBeta[c] += accBeta;
+    // Plain assignment: each thread owns one (c) slot and performs the full
+    // reduction locally. Overwriting keeps the kernel self-contained on reused
+    // scratch buffers.
+    gradGamma[c] = accGamma;
+    gradBeta[c] = accBeta;
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void groupnorm_backward_sums_per_group_deterministic(
@@ -2224,8 +2230,9 @@ extern ""C"" __global__ __launch_bounds__(256) void groupnorm_backward_sums_per_
             accDyXhat += dyGam * xHat;
         }
     }
-    sumDy[ng] += accDy;
-    sumDyXhat[ng] += accDyXhat;
+    // Plain assignment: one thread owns each (n*G+g) slot; full reduction is local.
+    sumDy[ng] = accDy;
+    sumDyXhat[ng] = accDyXhat;
 }
 
 // Group normalization backward - Pass 2: Compute final input gradients
@@ -2342,8 +2349,10 @@ extern ""C"" __global__ __launch_bounds__(256) void instancenorm_backward_sums_p
             accBeta += dy;
         }
     }
-    gradGamma[c] += accGamma;
-    gradBeta[c] += accBeta;
+    // Plain assignment: see groupnorm_backward_sums_per_channel_deterministic
+    // for the rationale (one owner per c, full local reduction).
+    gradGamma[c] = accGamma;
+    gradBeta[c] = accBeta;
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void instancenorm_backward_sums_per_instance_deterministic(
@@ -2378,8 +2387,9 @@ extern ""C"" __global__ __launch_bounds__(256) void instancenorm_backward_sums_p
         accDy += dyGam;
         accDyXhat += dyGam * xHat;
     }
-    sumDy[nc] += accDy;
-    sumDyXhat[nc] += accDyXhat;
+    // Plain assignment: one owner per (n*C+c), full local reduction.
+    sumDy[nc] = accDy;
+    sumDyXhat[nc] = accDyXhat;
 }
 
 // Instance normalization backward - Pass 2: Compute final input gradients

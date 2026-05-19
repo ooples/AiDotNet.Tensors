@@ -447,7 +447,7 @@ extern ""C"" __global__ __launch_bounds__(256) void grid_sample_backward_grad_in
     const float* gradOutput, const float* grid,
     float* gradInput,
     int batch, int channels, int inHeight, int inWidth,
-    int outHeight, int outWidth, int alignCorners)
+    int outHeight, int outWidth, int paddingMode, int alignCorners)
 {
     int w_in = blockIdx.x * blockDim.x + threadIdx.x;
     int h_in = blockIdx.y * blockDim.y + threadIdx.y;
@@ -481,13 +481,26 @@ extern ""C"" __global__ __launch_bounds__(256) void grid_sample_backward_grad_in
             float wx0 = 1.0f - wx1;
             float wy0 = 1.0f - wy1;
 
+            // Border padding (paddingMode == 1): clamp out-of-range corner
+            // coords to the boundary so border samples in the forward pass
+            // contribute back to the boundary pixels in the backward pass.
+            if (paddingMode == 1) {
+                ix0 = max(0, min(ix0, inWidth - 1));
+                ix1 = max(0, min(ix1, inWidth - 1));
+                iy0 = max(0, min(iy0, inHeight - 1));
+                iy1 = max(0, min(iy1, inHeight - 1));
+            }
+
             int outIdx = ((b * channels + c) * outHeight + y) * outWidth + x;
             float go = gradOutput[outIdx];
 
-            if (w_in == ix0 && h_in == iy0) sum += go * wy0 * wx0;
-            if (w_in == ix1 && h_in == iy0) sum += go * wy0 * wx1;
-            if (w_in == ix0 && h_in == iy1) sum += go * wy1 * wx0;
-            if (w_in == ix1 && h_in == iy1) sum += go * wy1 * wx1;
+            // Explicit in-bounds check on every corner: under zero padding
+            // (paddingMode == 0) out-of-range corners must not contribute;
+            // under border padding the clamps above guarantee the test passes.
+            if (ix0 >= 0 && ix0 < inWidth && iy0 >= 0 && iy0 < inHeight && w_in == ix0 && h_in == iy0) sum += go * wy0 * wx0;
+            if (ix1 >= 0 && ix1 < inWidth && iy0 >= 0 && iy0 < inHeight && w_in == ix1 && h_in == iy0) sum += go * wy0 * wx1;
+            if (ix0 >= 0 && ix0 < inWidth && iy1 >= 0 && iy1 < inHeight && w_in == ix0 && h_in == iy1) sum += go * wy1 * wx0;
+            if (ix1 >= 0 && ix1 < inWidth && iy1 >= 0 && iy1 < inHeight && w_in == ix1 && h_in == iy1) sum += go * wy1 * wx1;
         }
     }
     gradInput[((b * channels + c) * inHeight + h_in) * inWidth + w_in] += sum;

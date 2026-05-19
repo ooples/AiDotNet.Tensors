@@ -1234,8 +1234,11 @@ __kernel void scatter_mean_deterministic(
             if (col == 0) cnt++;
         }
     }
-    output[dstRow * featureSize + col] = sum;
-    if (col == 0) counts[dstRow] = cnt;
+    // Match additive semantics of the non-deterministic atomic path so callers
+    // that pre-seed `output`/`counts` (e.g. accumulating across multiple scatters)
+    // see identical results in deterministic mode.
+    output[dstRow * featureSize + col] += sum;
+    if (col == 0) counts[dstRow] += cnt;
 }
 
 __kernel void scatter_mean_divide(__global float* output, __global const int* counts, const int outputSize, const int featureSize)

@@ -6774,6 +6774,7 @@ KERNEL VARIANTS (A/B testing):
                 ki.SetArg(ai++, inWidth);
                 ki.SetArg(ai++, outHeight);
                 ki.SetArg(ai++, outWidth);
+                ki.SetArg(ai++, paddingMode);
                 ki.SetArg(ai++, alignCorners ? 1 : 0);
                 ki.Execute3D(inWidth, inHeight, batch * channels, 16, 16, 1);
                 return;

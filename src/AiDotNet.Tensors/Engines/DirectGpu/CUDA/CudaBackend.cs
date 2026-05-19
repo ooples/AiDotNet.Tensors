@@ -5376,7 +5376,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             if (!_kernelCache.TryGetValue("grid_sample_backward_grad_input_deterministic", out var krnlIn))
                 throw new InvalidOperationException("CUDA kernel not found: grid_sample_backward_grad_input_deterministic");
 
-            void** argsI = stackalloc void*[10];
+            void** argsI = stackalloc void*[11];
             argsI[0] = &gradOutputPtr;
             argsI[1] = &gridPtr;
             argsI[2] = &gradInputPtr;
@@ -5386,7 +5386,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             argsI[6] = &inWidth;
             argsI[7] = &outHeight;
             argsI[8] = &outWidth;
-            argsI[9] = &alignCornersInt;
+            argsI[9] = &paddingMode;
+            argsI[10] = &alignCornersInt;
             uint gridIX = (uint)((inWidth + blockSize - 1) / blockSize);
             uint gridIY = (uint)((inHeight + blockSize - 1) / blockSize);
             uint gridIZ = (uint)(batch * channels);
@@ -11704,8 +11705,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             // sized __shared__ inside the kernel.
             if (!_kernelCache.TryGetValue("pac_phase_bin_mi_deterministic", out var kernelD))
                 throw new InvalidOperationException("CUDA kernel not found: pac_phase_bin_mi_deterministic");
-            CudaNativeBindings.cuLaunchKernel(kernelD, grid, 1, 1, 18, 1, 1,
-                0, IntPtr.Zero, (IntPtr)args, IntPtr.Zero);
+            CuBlasNative.CheckCudaResult(
+                CudaNativeBindings.cuLaunchKernel(kernelD, grid, 1, 1, 18, 1, 1,
+                    0, _stream, (IntPtr)args, IntPtr.Zero),
+                "cuLaunchKernel(pac_phase_bin_mi_deterministic)");
             return;
         }
 
@@ -11713,8 +11716,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             throw new InvalidOperationException("CUDA kernel not found: pac_phase_bin_mi");
         uint block = 256;
         uint sharedMem = (uint)(2 * 18 * sizeof(float));
-        CudaNativeBindings.cuLaunchKernel(kernel, grid, 1, 1, block, 1, 1,
-            sharedMem, IntPtr.Zero, (IntPtr)args, IntPtr.Zero);
+        CuBlasNative.CheckCudaResult(
+            CudaNativeBindings.cuLaunchKernel(kernel, grid, 1, 1, block, 1, 1,
+                sharedMem, _stream, (IntPtr)args, IntPtr.Zero),
+            "cuLaunchKernel(pac_phase_bin_mi)");
     }
 
     #endregion

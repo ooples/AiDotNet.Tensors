@@ -1290,8 +1290,10 @@ __kernel void embedding_backward_deterministic(
             sum += gradOutput[i * embeddingDim + d];
         }
     }
-    // Accumulate semantics match the atomic variant: existing gradient is preserved.
-    gradEmbedding[v * embeddingDim + d] += sum;
+    // Plain assignment: this launch owns every (v, d) cell, so overwriting keeps
+    // the kernel self-contained on reused buffers (no requirement that the caller
+    // zero gradEmbedding first). Matches the CUDA/HIP deterministic variants.
+    gradEmbedding[v * embeddingDim + d] = sum;
 }
 
 // Fused multiply-add: D = A * B + C
@@ -1779,8 +1781,11 @@ __kernel void groupnorm_backward_sums_per_channel_deterministic(
             accBeta += dy;
         }
     }
-    gradGamma[c] += accGamma;
-    gradBeta[c] += accBeta;
+    // Plain assignment: each thread owns one (c) slot and performs the full
+    // reduction locally. Overwriting keeps the kernel self-contained on reused
+    // scratch buffers.
+    gradGamma[c] = accGamma;
+    gradBeta[c] = accBeta;
 }
 
 __kernel void groupnorm_backward_sums_per_group_deterministic(
@@ -1820,8 +1825,9 @@ __kernel void groupnorm_backward_sums_per_group_deterministic(
             accDyXhat += dyGam * xHat;
         }
     }
-    sumDy[ng] += accDy;
-    sumDyXhat[ng] += accDyXhat;
+    // Plain assignment: one thread owns each (n*G+g) slot; full reduction is local.
+    sumDy[ng] = accDy;
+    sumDyXhat[ng] = accDyXhat;
 }
 
 // Group normalization backward - Pass 2: Compute final input gradients
@@ -1936,8 +1942,9 @@ __kernel void instancenorm_backward_sums_per_channel_deterministic(
             accBeta += dy;
         }
     }
-    gradGamma[c] += accGamma;
-    gradBeta[c] += accBeta;
+    // Plain assignment: see groupnorm_backward_sums_per_channel_deterministic for rationale.
+    gradGamma[c] = accGamma;
+    gradBeta[c] = accBeta;
 }
 
 __kernel void instancenorm_backward_sums_per_instance_deterministic(
@@ -1972,8 +1979,9 @@ __kernel void instancenorm_backward_sums_per_instance_deterministic(
         accDy += dyGam;
         accDyXhat += dyGam * xHat;
     }
-    sumDy[nc] += accDy;
-    sumDyXhat[nc] += accDyXhat;
+    // Plain assignment: one owner per (n*C+c), full local reduction.
+    sumDy[nc] = accDy;
+    sumDyXhat[nc] = accDyXhat;
 }
 
 // Instance normalization backward - Pass 2: Compute final input gradients
