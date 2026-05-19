@@ -208,7 +208,8 @@ internal static class PackAOnlyStrategy
                         DispatchStridedMicrokernel<T>(
                             activePackA.Slice(packedAStripeOff, effectiveKc * mr),
                             b.Slice(bSliceOffset), ldb,
-                            c.Slice(cTileOff), ldc, effectiveKc);
+                            c.Slice(cTileOff), ldc, effectiveKc,
+                            mr, nr);
                     }
                 }
             }
@@ -216,29 +217,41 @@ internal static class PackAOnlyStrategy
     }
 
     /// <summary>
-    /// Routes to the scalar strided-B microkernel matching T.
+    /// Routes to the appropriate strided-B microkernel matching T and the
+    /// Mr×Nr tile width chosen by the caller. AVX2 8×8 FP32 fires when
+    /// <paramref name="mr"/>==8 AND <paramref name="nr"/>==8 AND AVX2+FMA
+    /// are runtime-available; else falls through to scalar 4×4.
     /// </summary>
     private static void DispatchStridedMicrokernel<T>(
         ReadOnlySpan<T> packedA, ReadOnlySpan<T> b, int ldb,
-        Span<T> c, int ldc, int kc) where T : unmanaged
+        Span<T> c, int ldc, int kc, int mr, int nr) where T : unmanaged
     {
-        if (typeof(T) == typeof(double))
+        if (typeof(T) == typeof(float))
         {
-            ScalarFp64_4x4.RunStridedB(
-                MemoryMarshal.Cast<T, double>(packedA),
-                MemoryMarshal.Cast<T, double>(b), ldb,
-                MemoryMarshal.Cast<T, double>(c), ldc, kc);
-        }
-        else if (typeof(T) == typeof(float))
-        {
+            // Sub-D (#372) D.3: AVX2 8×8 strided-B when shape and hardware allow.
+            if (mr == 8 && nr == 8 && Avx2Fp32_8x8.IsSupported)
+            {
+                Avx2Fp32_8x8.RunStridedB(
+                    MemoryMarshal.Cast<T, float>(packedA),
+                    MemoryMarshal.Cast<T, float>(b), ldb,
+                    MemoryMarshal.Cast<T, float>(c), ldc, kc);
+                return;
+            }
             ScalarFp32_4x4.RunStridedB(
                 MemoryMarshal.Cast<T, float>(packedA),
                 MemoryMarshal.Cast<T, float>(b), ldb,
                 MemoryMarshal.Cast<T, float>(c), ldc, kc);
+            return;
         }
-        else
+        if (typeof(T) == typeof(double))
         {
-            throw new NotSupportedException($"PackAOnlyStrategy does not support T={typeof(T).Name}.");
+            // FP64 AVX2 strided-B is deferred to D.5 follow-up.
+            ScalarFp64_4x4.RunStridedB(
+                MemoryMarshal.Cast<T, double>(packedA),
+                MemoryMarshal.Cast<T, double>(b), ldb,
+                MemoryMarshal.Cast<T, double>(c), ldc, kc);
+            return;
         }
+        throw new NotSupportedException($"PackAOnlyStrategy does not support T={typeof(T).Name}.");
     }
 }

@@ -96,14 +96,14 @@ public class TinyShapeBypassTest
         for (int i = 0; i < Iters; i++)
             BlasManagedLib.Gemm<float>(a, K, false, b, N, false, c, N, M, N, K);
         sw.Stop();
-        double bypassUs = sw.Elapsed.TotalMicroseconds / Iters;
+        double bypassUs = sw.Elapsed.TotalMilliseconds * 1000.0 / Iters;
 
         sw.Restart();
         for (int i = 0; i < Iters; i++)
             BlasManagedLib.Gemm<float>(a, K, false, b, N, false, c, N, M, N, K,
                 new BlasOptions<float> { PackingMode = PackingMode.ForcePackBoth });
         sw.Stop();
-        double forcedUs = sw.Elapsed.TotalMicroseconds / Iters;
+        double forcedUs = sw.Elapsed.TotalMilliseconds * 1000.0 / Iters;
 
         double speedup = forcedUs / bypassUs;
         _output.WriteLine($"Tiny bypass: bypass={bypassUs:F2}us forced={forcedUs:F2}us speedup={speedup:F2}x");

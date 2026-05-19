@@ -173,16 +173,26 @@ public static class BlasManaged
                     options);
                 break;
             case PackingMode.ForcePackAOnly:
-                // PackAOnly currently has no AVX2 strided-B kernel; always scalar Mr=Nr=4.
-                // TODO(Phase Cx): add Avx2 RunStridedB variants and wire them here.
-                PackAOnlyStrategy.Run<T>(
-                    a, lda, transA,
-                    b, ldb,
-                    c, ldc,
-                    m, n, k,
-                    mc: mcFromAutotune, kc: kcFromAutotune,
-                    mr: 4, nr: 4,
-                    options);
+                {
+                    // Sub-D (#372) D.3: PackAOnly now has Avx2Fp32_8x8.RunStridedB.
+                    // Use AVX2 8×8 for FP32 when shape aligns; else fall back to scalar 4×4.
+                    int paoMr = 4, paoNr = 4;
+                    if (typeof(T) == typeof(float)
+                        && Avx2Fp32_8x8.IsSupported
+                        && m % 8 == 0 && n % 8 == 0)
+                    {
+                        paoMr = 8;
+                        paoNr = 8;
+                    }
+                    PackAOnlyStrategy.Run<T>(
+                        a, lda, transA,
+                        b, ldb,
+                        c, ldc,
+                        m, n, k,
+                        mc: mcFromAutotune, kc: kcFromAutotune,
+                        mr: paoMr, nr: paoNr,
+                        options);
+                }
                 break;
             case PackingMode.ForceStreaming:
                 // Streaming dispatches AVX2 internally — no Mr/Nr tiling parameter.

@@ -109,6 +109,78 @@ internal static class Avx2Fp32_8x8
             Avx.Store(cPtr + 7 * ldc, acc7);
         }
     }
+
+    /// <summary>
+    /// Sub-D (#372) — strided-B variant for <see cref="PackAOnlyStrategy"/>. Same
+    /// loop structure as <see cref="Run"/>, but B is read in caller-supplied stride
+    /// <paramref name="ldb"/> instead of the packed stride <see cref="Nr"/>=8.
+    /// </summary>
+    /// <param name="packedA">Packed-A vpanel, layout [Kc × Mr=8] row-major.</param>
+    /// <param name="b">Source B, read at stride ldb. Must have ≥ kc rows of ldb cols.</param>
+    /// <param name="ldb">Leading dimension of B (caller's row stride).</param>
+    /// <param name="c">Output buffer; reads + writes C[0..Mr, 0..Nr=8] tile.</param>
+    /// <param name="ldc">Leading dimension of C.</param>
+    /// <param name="kc">Number of K-steps to accumulate.</param>
+    public static unsafe void RunStridedB(
+        ReadOnlySpan<float> packedA,
+        ReadOnlySpan<float> b,
+        int ldb,
+        Span<float> c,
+        int ldc,
+        int kc)
+    {
+        if (!IsSupported)
+            throw new PlatformNotSupportedException("Avx2Fp32_8x8 requires Avx2 + Fma.");
+
+        fixed (float* cPtr = c)
+        {
+            Vector256<float> acc0 = Avx.LoadVector256(cPtr + 0 * ldc);
+            Vector256<float> acc1 = Avx.LoadVector256(cPtr + 1 * ldc);
+            Vector256<float> acc2 = Avx.LoadVector256(cPtr + 2 * ldc);
+            Vector256<float> acc3 = Avx.LoadVector256(cPtr + 3 * ldc);
+            Vector256<float> acc4 = Avx.LoadVector256(cPtr + 4 * ldc);
+            Vector256<float> acc5 = Avx.LoadVector256(cPtr + 5 * ldc);
+            Vector256<float> acc6 = Avx.LoadVector256(cPtr + 6 * ldc);
+            Vector256<float> acc7 = Avx.LoadVector256(cPtr + 7 * ldc);
+
+            fixed (float* aPtr = packedA)
+            fixed (float* bPtr = b)
+            {
+                for (int k = 0; k < kc; k++)
+                {
+                    // ONE difference vs Run: stride is ldb (caller-supplied), not Nr.
+                    Vector256<float> bRow = Avx.LoadVector256(bPtr + k * ldb);
+
+                    Vector256<float> a0 = Vector256.Create(aPtr[k * Mr + 0]);
+                    Vector256<float> a1 = Vector256.Create(aPtr[k * Mr + 1]);
+                    Vector256<float> a2 = Vector256.Create(aPtr[k * Mr + 2]);
+                    Vector256<float> a3 = Vector256.Create(aPtr[k * Mr + 3]);
+                    Vector256<float> a4 = Vector256.Create(aPtr[k * Mr + 4]);
+                    Vector256<float> a5 = Vector256.Create(aPtr[k * Mr + 5]);
+                    Vector256<float> a6 = Vector256.Create(aPtr[k * Mr + 6]);
+                    Vector256<float> a7 = Vector256.Create(aPtr[k * Mr + 7]);
+
+                    acc0 = Fma.MultiplyAdd(a0, bRow, acc0);
+                    acc1 = Fma.MultiplyAdd(a1, bRow, acc1);
+                    acc2 = Fma.MultiplyAdd(a2, bRow, acc2);
+                    acc3 = Fma.MultiplyAdd(a3, bRow, acc3);
+                    acc4 = Fma.MultiplyAdd(a4, bRow, acc4);
+                    acc5 = Fma.MultiplyAdd(a5, bRow, acc5);
+                    acc6 = Fma.MultiplyAdd(a6, bRow, acc6);
+                    acc7 = Fma.MultiplyAdd(a7, bRow, acc7);
+                }
+            }
+
+            Avx.Store(cPtr + 0 * ldc, acc0);
+            Avx.Store(cPtr + 1 * ldc, acc1);
+            Avx.Store(cPtr + 2 * ldc, acc2);
+            Avx.Store(cPtr + 3 * ldc, acc3);
+            Avx.Store(cPtr + 4 * ldc, acc4);
+            Avx.Store(cPtr + 5 * ldc, acc5);
+            Avx.Store(cPtr + 6 * ldc, acc6);
+            Avx.Store(cPtr + 7 * ldc, acc7);
+        }
+    }
 #else
     /// <summary>Runtime support gate (false on net471 — no AVX2 intrinsics).</summary>
     public static bool IsSupported => false;
@@ -117,6 +189,16 @@ internal static class Avx2Fp32_8x8
     public static void Run(
         ReadOnlySpan<float> packedA,
         ReadOnlySpan<float> packedB,
+        Span<float> c,
+        int ldc,
+        int kc) =>
+        throw new PlatformNotSupportedException("Avx2Fp32_8x8 requires net5.0+ for Vector256<T>.");
+
+    /// <summary>Throws on net471 — AVX2 intrinsics unavailable. Dispatcher gates this.</summary>
+    public static void RunStridedB(
+        ReadOnlySpan<float> packedA,
+        ReadOnlySpan<float> b,
+        int ldb,
         Span<float> c,
         int ldc,
         int kc) =>
