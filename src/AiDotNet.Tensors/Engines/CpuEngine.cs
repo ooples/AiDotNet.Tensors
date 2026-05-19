@@ -3548,18 +3548,116 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public void GroupNormInto<T>(Tensor<T> output, Tensor<T> input, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
     {
+        if (output is null) throw new ArgumentNullException(nameof(output));
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (gamma is null) throw new ArgumentNullException(nameof(gamma));
+        if (beta is null) throw new ArgumentNullException(nameof(beta));
         if (!output.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
-        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
+        if (numGroups <= 0) throw new ArgumentOutOfRangeException(nameof(numGroups), "Number of groups must be positive.");
+
+        // #257: preserve user-facing refs before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
-        var gammaOrig = gamma;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!gamma.IsContiguous) gamma = gamma.Contiguous();
-        var betaOrig = beta;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!beta.IsContiguous) beta = beta.Contiguous();
-        // GroupNorm writes normalized values into pre-allocated output.
-        // The mean/variance stats are small tensors [batch, numGroups] that the callee allocates.
-        // The main output tensor avoids allocation since it's pre-allocated by the caller.
-        var result = GroupNorm(input, numGroups, gamma, beta, epsilon, out mean, out variance);
-        result.Data.Span.CopyTo(output.Data.Span);
+
+        int batch = input._shape[0];
+        int channels = input._shape[1];
+        if (channels % numGroups != 0)
+            throw new ArgumentException($"Number of channels ({channels}) must be divisible by number of groups ({numGroups}).");
+        int channelsPerGroup = channels / numGroups;
+        int spatialSize = 1;
+        for (int i = 2; i < input._shape.Length; i++) spatialSize *= input._shape[i];
+
+        // True zero-alloc Into: write normalized output directly into the
+        // caller's buffer. Avoids the old alloc+copy pattern (allocated a
+        // fresh tensor via AutoTensorCache.RentOrAllocate, then memcpy'd
+        // into the caller's output). For SD UNet at [1,1280,16,16] doubles
+        // that's a 2.6 MB rent + a 2.6 MB memcpy per call, repeated for
+        // every ResBlock's two GroupNorms — ~50 MB of pointless traffic
+        // per UNet forward at the heaviest shapes. The mean/variance
+        // out-tensors are still allocated (small: [batch, numGroups]).
+        if (typeof(T) == typeof(float))
+        {
+            using var pinIn = input.Data.Pin();
+            using var pinOut = output.Data.Pin();
+            using var pinGamma = gamma.Data.Pin();
+            using var pinBeta = beta.Data.Pin();
+            unsafe
+            {
+                float epsF = (float)epsilon;
+                GroupNormFloatPtr(
+                    (float*)pinIn.Pointer, (float*)pinOut.Pointer,
+                    (float*)pinGamma.Pointer, (float*)pinBeta.Pointer,
+                    batch, channels, spatialSize, numGroups, channelsPerGroup,
+                    epsF, out var meanArr, out var varArr);
+                mean = TensorAllocator.Rent<T>(new[] { batch, numGroups },
+                    new Vector<T>((T[])(object)meanArr));
+                variance = TensorAllocator.Rent<T>(new[] { batch, numGroups },
+                    new Vector<T>((T[])(object)varArr));
+            }
+            return;
+        }
+
+        // Generic path (covers double + any other T): replicate the inner
+        // loop from GroupNorm but write directly into output.GetDataArray()
+        // instead of allocating a fresh outputData.
+        var numOps = MathHelper.GetNumericOperations<T>();
+        T eps = numOps.FromDouble(epsilon);
+        int groupSize = channelsPerGroup * spatialSize;
+
+        var inputData = input.GetDataArray();
+        var gammaData = gamma.GetDataArray();
+        var betaData = beta.GetDataArray();
+        var outputData = output.GetDataArray();
+        var meanData = new T[batch * numGroups];
+        var varData = new T[batch * numGroups];
+
+        CpuParallelSettings.ParallelForOrSerial(0, batch * numGroups, outputData.Length, idx =>
+        {
+            int b = idx / numGroups;
+            int g = idx % numGroups;
+            int startChannel = g * channelsPerGroup;
+            int batchOffset = b * (channels * spatialSize);
+            T groupSizeT = numOps.FromDouble(groupSize);
+
+            T sum = numOps.Zero;
+            for (int c = 0; c < channelsPerGroup; c++)
+            {
+                int chanOffset = batchOffset + (startChannel + c) * spatialSize;
+                for (int s = 0; s < spatialSize; s++)
+                    sum = numOps.Add(sum, inputData[chanOffset + s]);
+            }
+            T groupMean = numOps.Divide(sum, groupSizeT);
+            meanData[b * numGroups + g] = groupMean;
+
+            T sumSq = numOps.Zero;
+            for (int c = 0; c < channelsPerGroup; c++)
+            {
+                int chanOffset = batchOffset + (startChannel + c) * spatialSize;
+                for (int s = 0; s < spatialSize; s++)
+                {
+                    T diff = numOps.Subtract(inputData[chanOffset + s], groupMean);
+                    sumSq = numOps.Add(sumSq, numOps.Multiply(diff, diff));
+                }
+            }
+            T groupVar = numOps.Divide(sumSq, groupSizeT);
+            varData[b * numGroups + g] = groupVar;
+
+            T invStd = numOps.Divide(numOps.One, numOps.Sqrt(numOps.Add(groupVar, eps)));
+            for (int c = 0; c < channelsPerGroup; c++)
+            {
+                int channel = startChannel + c;
+                int chanOffset = batchOffset + channel * spatialSize;
+                for (int s = 0; s < spatialSize; s++)
+                {
+                    T normalized = numOps.Multiply(numOps.Subtract(inputData[chanOffset + s], groupMean), invStd);
+                    outputData[chanOffset + s] = numOps.Add(numOps.Multiply(gammaData[channel], normalized), betaData[channel]);
+                }
+            }
+        });
+
+        mean = TensorAllocator.Rent<T>(new[] { batch, numGroups }, Vector<T>.WrapMemory(meanData));
+        variance = TensorAllocator.Rent<T>(new[] { batch, numGroups }, Vector<T>.WrapMemory(varData));
     }
 
     /// <inheritdoc/>
