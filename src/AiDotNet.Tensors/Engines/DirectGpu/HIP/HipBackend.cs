@@ -4309,32 +4309,27 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe void GlobalMaxPool2DBackward(IGpuBuffer gradOutput, IGpuBuffer indices, IGpuBuffer gradInput, int batch, int channels, int height, int width)
     {
-        if (!_kernelCache.TryGetValue("global_maxpool2d_backward", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: global_maxpool2d_backward");
-
-        // First zero out the gradient input
         Fill(gradInput, 0f, batch * channels * height * width);
 
         int totalOutputs = batch * channels;
         uint grid = (uint)((totalOutputs + DefaultBlockSize - 1) / DefaultBlockSize);
 
-            {
-            IntPtr _p0 = gradOutput.Handle;
-            IntPtr _p1 = indices.Handle;
-            IntPtr _p2 = gradInput.Handle;
-            void** args = stackalloc void*[7];
-            args[0] = &_p0;
-            args[1] = &_p1;
-            args[2] = &_p2;
-            args[3] = &batch;
-            args[4] = &channels;
-            args[5] = &height;
-            args[6] = &width;
+        IntPtr _p0 = gradOutput.Handle;
+        IntPtr _p1 = indices.Handle;
+        IntPtr _p2 = gradInput.Handle;
+        void** args = stackalloc void*[7];
+        args[0] = &_p0; args[1] = &_p1; args[2] = &_p2;
+        args[3] = &batch; args[4] = &channels;
+        args[5] = &height; args[6] = &width;
 
+        string kernelName = GpuDeterminism.IsActive
+            ? "global_maxpool2d_backward_deterministic"
+            : "global_maxpool2d_backward";
+        if (!_kernelCache.TryGetValue(kernelName, out var krnl))
+            throw new InvalidOperationException("HIP kernel not found: " + kernelName);
 
-            LaunchKernel(krnl, grid, DefaultBlockSize, args);
-            Synchronize();
-            }
+        LaunchKernel(krnl, grid, DefaultBlockSize, args);
+        Synchronize();
     }
 
     public unsafe void AdaptiveAvgPool2D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth)
@@ -4414,33 +4409,35 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int inDepth, int inHeight, int inWidth,
         int outDepth, int outHeight, int outWidth)
     {
+        IntPtr _p0 = gradOutput.Handle;
+        IntPtr _p1 = indices.Handle;
+        IntPtr _p2 = gradInput.Handle;
+        void** args = stackalloc void*[11];
+        args[0] = &_p0; args[1] = &_p1; args[2] = &_p2;
+        args[3] = &batch; args[4] = &channels;
+        args[5] = &inDepth; args[6] = &inHeight; args[7] = &inWidth;
+        args[8] = &outDepth; args[9] = &outHeight; args[10] = &outWidth;
+
+        if (GpuDeterminism.IsActive)
+        {
+            // Issue #382: per-input-cell parallelization.
+            if (!_kernelCache.TryGetValue("maxpool3d_backward_deterministic", out var krnlD))
+                throw new InvalidOperationException("HIP kernel not found: maxpool3d_backward_deterministic");
+            uint gDX = (uint)((inWidth + 7) / 8);
+            uint gDY = (uint)((inHeight + 7) / 8);
+            uint gDZ = (uint)(batch * channels * inDepth);
+            LaunchKernel3D(krnlD, gDX, gDY, gDZ, 8, 8, 1, args);
+            Synchronize();
+            return;
+        }
+
         if (!_kernelCache.TryGetValue("maxpool3d_backward", out var krnl))
             throw new InvalidOperationException("HIP kernel not found: maxpool3d_backward");
-
-            {
-            IntPtr _p0 = gradOutput.Handle;
-            IntPtr _p1 = indices.Handle;
-            IntPtr _p2 = gradInput.Handle;
-            void** args = stackalloc void*[11];
-            args[0] = &_p0;
-            args[1] = &_p1;
-            args[2] = &_p2;
-            args[3] = &batch;
-            args[4] = &channels;
-            args[5] = &inDepth;
-            args[6] = &inHeight;
-            args[7] = &inWidth;
-            args[8] = &outDepth;
-            args[9] = &outHeight;
-            args[10] = &outWidth;
-
-
-            uint gridX = (uint)((outWidth + 7) / 8);
-            uint gridY = (uint)((outHeight + 7) / 8);
-            uint gridZ = (uint)(batch * channels * outDepth);
-            LaunchKernel3D(krnl, gridX, gridY, gridZ, 8, 8, 1, args);
-            Synchronize();
-            }
+        uint gridX = (uint)((outWidth + 7) / 8);
+        uint gridY = (uint)((outHeight + 7) / 8);
+        uint gridZ = (uint)(batch * channels * outDepth);
+        LaunchKernel3D(krnl, gridX, gridY, gridZ, 8, 8, 1, args);
+        Synchronize();
     }
 
     public unsafe void NearestNeighborUpsample3D(IGpuBuffer input, IGpuBuffer output,
@@ -4484,35 +4481,37 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int inDepth, int inHeight, int inWidth,
         int scaleD, int scaleH, int scaleW)
     {
+        IntPtr _p0 = gradOutput.Handle;
+        IntPtr _p1 = gradInput.Handle;
+        void** args = stackalloc void*[10];
+        args[0] = &_p0; args[1] = &_p1;
+        args[2] = &batch; args[3] = &channels;
+        args[4] = &inDepth; args[5] = &inHeight; args[6] = &inWidth;
+        args[7] = &scaleD; args[8] = &scaleH; args[9] = &scaleW;
+
+        if (GpuDeterminism.IsActive)
+        {
+            // Issue #382: per-input-cell scan of scale-cube output cells.
+            if (!_kernelCache.TryGetValue("nearest_upsample3d_backward_deterministic", out var krnlD))
+                throw new InvalidOperationException("HIP kernel not found: nearest_upsample3d_backward_deterministic");
+            uint gDX = (uint)((inWidth + 7) / 8);
+            uint gDY = (uint)((inHeight + 7) / 8);
+            uint gDZ = (uint)(batch * channels * inDepth);
+            LaunchKernel3D(krnlD, gDX, gDY, gDZ, 8, 8, 1, args);
+            Synchronize();
+            return;
+        }
+
         if (!_kernelCache.TryGetValue("nearest_upsample3d_backward", out var krnl))
             throw new InvalidOperationException("HIP kernel not found: nearest_upsample3d_backward");
-
         int outDepth = inDepth * scaleD;
         int outHeight = inHeight * scaleH;
         int outWidth = inWidth * scaleW;
-
-            {
-            IntPtr _p0 = gradOutput.Handle;
-            IntPtr _p1 = gradInput.Handle;
-            void** args = stackalloc void*[10];
-            args[0] = &_p0;
-            args[1] = &_p1;
-            args[2] = &batch;
-            args[3] = &channels;
-            args[4] = &inDepth;
-            args[5] = &inHeight;
-            args[6] = &inWidth;
-            args[7] = &scaleD;
-            args[8] = &scaleH;
-            args[9] = &scaleW;
-
-
-            uint gridX = (uint)((outWidth + 7) / 8);
-            uint gridY = (uint)((outHeight + 7) / 8);
-            uint gridZ = (uint)(batch * channels * outDepth);
-            LaunchKernel3D(krnl, gridX, gridY, gridZ, 8, 8, 1, args);
-            Synchronize();
-            }
+        uint gridX = (uint)((outWidth + 7) / 8);
+        uint gridY = (uint)((outHeight + 7) / 8);
+        uint gridZ = (uint)(batch * channels * outDepth);
+        LaunchKernel3D(krnl, gridX, gridY, gridZ, 8, 8, 1, args);
+        Synchronize();
     }
 
     #endregion
