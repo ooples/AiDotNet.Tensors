@@ -34,6 +34,17 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         private IntPtr _platform;
         private bool _profilingSupported;
         private bool _disposed;
+        // Per-instance lock that serializes the ONE-TIME clCreateCommandQueue
+        // call per worker thread. The OpenCL 1.2 spec § 5.1.1 lists
+        // clCreateCommandQueue as thread-safe, but at least AMD's RDNA1 driver
+        // (gfx1012:xnack-, Adrenalin 24.x) crashes the host process with an
+        // access violation in amdocl64.dll when ≥ 4 threads call it
+        // concurrently. The lock costs ~tens of microseconds at first-touch
+        // per thread and zero on every subsequent kernel launch (the queue
+        // handle is then cached in the thread's ThreadLocal slot). This
+        // matches PyTorch's CUDA stream pool which serialises cudaStreamCreate
+        // for the same reason on older NVIDIA drivers.
+        private readonly object _queueCreateLock = new object();
 
         public IntPtr Context => _context;
 
@@ -321,7 +332,23 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             ulong properties = profilingEnabled
                 ? OpenClNativeBindings.CL_QUEUE_PROFILING_ENABLE
                 : 0;
-            IntPtr q = OpenClNativeBindings.CreateCommandQueue(_context, _device, properties, out int err);
+            // SERIALISE the native clCreateCommandQueue call across host
+            // threads — see _queueCreateLock field doc for the rationale (AMD
+            // RDNA1 driver crashes amdocl64.dll under concurrent invocation
+            // despite the OpenCL 1.2 spec listing this entry point as
+            // thread-safe). Cost: ~tens of microseconds at first-touch per
+            // worker thread; ZERO on subsequent kernel launches (the queue
+            // handle is cached by the ThreadLocal slot and re-used directly).
+            IntPtr q;
+            int err;
+            lock (_queueCreateLock)
+            {
+                // Re-check disposal under the lock so a concurrent Dispose
+                // that already released the context can't be raced into a
+                // call that uses the freed context handle.
+                if (_disposed) return IntPtr.Zero;
+                q = OpenClNativeBindings.CreateCommandQueue(_context, _device, properties, out err);
+            }
             if (err != OpenClNativeBindings.CL_SUCCESS || q == IntPtr.Zero)
             {
                 throw new InvalidOperationException(
