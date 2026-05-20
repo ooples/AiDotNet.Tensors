@@ -1,3 +1,4 @@
+#pragma warning disable CS0618 // SimdGemm.Sgemm/Dgemm (no-trans shims) are [Obsolete] — pending migration to BlasManaged.Gemm<T> in a later K task.
 using System;
 using System.Runtime.InteropServices;
 using System.Threading.Tasks;

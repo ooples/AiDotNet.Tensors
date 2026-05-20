@@ -406,6 +406,83 @@ internal static class BackwardFunctions<T>
     /// </summary>
     private static long MatMulBackwardSimdThreshold => SimdGemm.ParallelWorkThreshold;
 
+    /// <summary>
+    /// Sub-E (#373): backward for <c>C = A · B</c> where B is a frozen weight whose
+    /// transpose has been pre-packed by the caller. Used by inference paths that
+    /// still want a gradient on A (e.g., feature-extraction with a frozen backbone)
+    /// but DON'T need a gradient on B — the B-side computation is skipped.
+    ///
+    /// <para>
+    /// <c>gradA = gradOutput · Bᵀ</c> — computed via <see cref="Engines.BlasManaged.BlasManaged.Gemm{T}"/>
+    /// with the pre-packed Bᵀ handle. The handle MUST hold the row-major transpose
+    /// of B with shape [N, K] (caller pre-packs with <c>k=N, n=K</c>).
+    /// </para>
+    /// </summary>
+    /// <param name="gradOutput">Upstream gradient, shape [M, N].</param>
+    /// <param name="inputA">Forward input A, shape [M, K]. Only its shape is needed.</param>
+    /// <param name="bTransposed">Row-major [N, K] transpose of B. Same buffer the caller pre-packed into <paramref name="prePackedBT"/>; used as the live-pack fallback when the handle is dirty.</param>
+    /// <param name="prePackedBT">Pre-packed Bᵀ handle (from <see cref="Engines.BlasManaged.BlasManaged.PrePackB{T}"/> with the transpose of B).</param>
+    /// <returns>gradA, shape [M, K]. Caller is responsible for accumulating it into the gradient dict.</returns>
+    internal static Tensor<T> MatMulBackwardGradAOnly_PrePackedBT(
+        Tensor<T> gradOutput, Tensor<T> inputA, Tensor<T> bTransposed,
+        Engines.BlasManaged.WeightPackHandle prePackedBT)
+    {
+        if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
+        if (inputA == null) throw new ArgumentNullException(nameof(inputA));
+        if (bTransposed == null) throw new ArgumentNullException(nameof(bTransposed));
+        if (prePackedBT == null) throw new ArgumentNullException(nameof(prePackedBT));
+        if (bTransposed.Rank != 2)
+            throw new ArgumentException("bTransposed must be rank-2 [N, K].", nameof(bTransposed));
+
+        int M = inputA._shape[0];
+        int N = bTransposed._shape[0];  // rows of Bᵀ = cols of B
+        int K = bTransposed._shape[1];  // cols of Bᵀ = rows of B
+        if (gradOutput._shape[0] != M || gradOutput._shape[1] != N)
+            throw new ArgumentException($"gradOutput shape [{gradOutput._shape[0]},{gradOutput._shape[1]}] doesn't match [M={M}, N={N}].");
+
+        // PR #402 CodeRabbit fix: tape-aware gate. The BLAS fast path below
+        // dispatches BlasManaged.Gemm directly, bypassing engine ops — the
+        // gradA matmul is invisible to the outer tape, so higher-order AD
+        // (`createGraph=true`, HVP) silently loses the inner gradient edge.
+        // When a tape is recording we fall back to the engine-driven matmul
+        // so the inner op gets recorded onto the outer tape; the BLAS path
+        // is reserved for the no-tape inference / first-order training case
+        // where the silent recording bypass is observationally equivalent.
+        if (GradientTape<T>.Current is not null)
+        {
+            var engine = AiDotNetEngine.Current;
+            return engine.TensorMatMul<T>(gradOutput, bTransposed);
+        }
+
+        var gradA = AutoTensorCache.RentOrAllocate<T>(new[] { M, K });
+
+        if (typeof(T) == typeof(float))
+        {
+            var dC = (float[])(object)gradOutput.GetDataArray();
+            var bT = (float[])(object)bTransposed.GetDataArray();
+            var gA = (float[])(object)gradA.GetDataArray();
+            // gradA[M,K] = dC[M,N] · Bᵀ[N,K]. Bᵀ pre-packed as the "B" of this GEMM,
+            // bT is the live-pack fallback when handle is dirty.
+            var opts = new Engines.BlasManaged.BlasOptions<float> { PackedB = prePackedBT };
+            Engines.BlasManaged.BlasManaged.Gemm<float>(
+                dC, N, false, bT, K, false, gA, K, M, K, N, opts);
+            return gradA;
+        }
+        if (typeof(T) == typeof(double))
+        {
+            var dC = (double[])(object)gradOutput.GetDataArray();
+            var bT = (double[])(object)bTransposed.GetDataArray();
+            var gA = (double[])(object)gradA.GetDataArray();
+            var opts = new Engines.BlasManaged.BlasOptions<double> { PackedB = prePackedBT };
+            Engines.BlasManaged.BlasManaged.Gemm<double>(
+                dC, N, false, bT, K, false, gA, K, M, K, N, opts);
+            return gradA;
+        }
+
+        throw new NotSupportedException(
+            $"MatMulBackwardGradAOnly_PrePackedBT supports float/double only (got {typeof(T).Name}).");
+    }
+
     /// <summary>d(A@B)/dA = grad @ B^T, d(A@B)/dB = A^T @ grad</summary>
     internal static void MatMulBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,

@@ -1,6 +1,7 @@
 using System;
 using System.Buffers;
 using System.Threading.Tasks;
+using AiDotNet.Tensors.Engines.BlasManaged;
 
 namespace AiDotNet.Tensors.Helpers;
 
@@ -1123,52 +1124,37 @@ internal static class Im2ColHelper
         int inSliceSize  = inChannels * inputHeight * inputWidth;
         int kernelSize   = inChannels * kmkn;
 
-        // See the double overload below for the heuristic derivation. The cutoff is
-        // the same — float-precision GEMM has the same large-kernel + tiny-N pathology
-        // in MKL/OpenBLAS' transA=true codepath.
-        bool useTranspose = kernelSize <= 524288 && hw >= 32 && hw <= 256;
+        // CodeRabbit #366: the old useTranspose heuristic existed to dodge
+        // OpenBLAS/MKL's slow transA=true path by materialising kernel^T
+        // up front. BlasManaged absorbs the transpose inside PackA, so the
+        // caller-side transpose is now pure overhead — an extra O(kernelSize)
+        // copy and a redundant pooled buffer on every call. Drop both and
+        // always call Gemm with transA: true.
 
         var pool = ArrayPool<float>.Shared;
         float[] tempBuffer = pool.Rent(kmkn * hw);
-        float[]? kernelT = useTranspose ? pool.Rent(kernelSize) : null;
         try
         {
-            if (useTranspose && kernelT != null)
-            {
-                for (int ci = 0; ci < inChannels; ci++)
-                {
-                    int srcOff = ci * kmkn;
-                    for (int j = 0; j < kmkn; j++)
-                        kernelT[j * inChannels + ci] = kernel[srcOff + j];
-                }
-            }
 
             for (int b = 0; b < batch; b++)
             {
                 int inputOffset  = b * inSliceSize;
                 int outputOffset = b * outSliceSize;
 
-                bool usedBlas;
-                if (useTranspose && kernelT != null)
-                {
-                    // kernelT laid out as [C_out*kH*kW, C_in] row-major (lda = C_in).
-                    usedBlas = BlasProvider.TryGemmEx(
-                        m: kmkn, n: hw, k: inChannels,
-                        a: kernelT, aOffset: 0, lda: inChannels, transA: false,
-                        b: input, bOffset: inputOffset, ldb: hw, transB: false,
-                        c: tempBuffer, cOffset: 0, ldc: hw);
-                }
-                else
-                {
-                    // GEMM with transA=true: kernel stored as [C_in, C_out*kH*kW] (lda = C_out*kH*kW).
-                    // transA gives logical A^T of shape [C_out*kH*kW, C_in], multiplied by
-                    // B of shape [C_in, H_in*W_in] → C of shape [C_out*kH*kW, H_in*W_in].
-                    usedBlas = BlasProvider.TryGemmEx(
-                        m: kmkn, n: hw, k: inChannels,
-                        a: kernel, aOffset: 0, lda: kmkn, transA: true,
-                        b: input, bOffset: inputOffset, ldb: hw, transB: false,
-                        c: tempBuffer, cOffset: 0, ldc: hw);
-                }
+                // PHASE K5: BlasManaged.Gemm<float> fast path. kernel is [inChannels, kmkn]
+                // row-major; transA=true gives op(A) of shape [kmkn, inChannels], which is
+                // the L2-shape pathology (M=large, N=small, K=medium) that hits OpenBLAS/MKL's
+                // slow generic transA=true path. BlasManaged routes to the AVX-512 16×16
+                // microkernel via PackBothStrategy for this shape (closes issue #358).
+                BlasManaged.Gemm<float>(
+                    a: kernel.AsSpan(0, kernelSize),
+                    lda: kmkn, transA: true,
+                    b: input.AsSpan(inputOffset, inChannels * hw),
+                    ldb: hw, transB: false,
+                    c: tempBuffer.AsSpan(0, kmkn * hw),
+                    ldc: hw,
+                    m: kmkn, n: hw, k: inChannels);
+                bool usedBlas = true;
 
                 if (!usedBlas)
                 {
@@ -1206,7 +1192,6 @@ internal static class Im2ColHelper
         finally
         {
             pool.Return(tempBuffer);
-            if (kernelT != null) pool.Return(kernelT);
         }
     }
 
@@ -1251,46 +1236,35 @@ internal static class Im2ColHelper
         //       path picks the slow generic kernel and the explicit transpose wins big.
         //       Measured on M=2048 N=64 K=256 (4MB kernel): transA=60ms vs transposed=25ms.
         // The empirical cutoff that matches DCGAN's deconv stack: enable transpose when
-        // kernel ≤ 4MB AND N is in the "moderate" range (32-256).
-        bool useTranspose = kernelSize <= 524288 && hw >= 32 && hw <= 256;
+        // CodeRabbit #366: see float overload for rationale — drop the
+        // caller-side kernel transpose and always route through BlasManaged
+        // with transA: true. BlasManaged handles the transpose inside PackA.
 
         var pool = ArrayPool<double>.Shared;
         double[] tempBuffer = pool.Rent(kmkn * hw);
-        double[]? kernelT = useTranspose ? pool.Rent(kernelSize) : null;
         try
         {
-            if (useTranspose && kernelT != null)
-            {
-                for (int ci = 0; ci < inChannels; ci++)
-                {
-                    int srcOff = ci * kmkn;
-                    for (int j = 0; j < kmkn; j++)
-                        kernelT[j * inChannels + ci] = kernel[srcOff + j];
-                }
-            }
 
             for (int b = 0; b < batch; b++)
             {
                 int inputOffset  = b * inSliceSize;
                 int outputOffset = b * outSliceSize;
 
-                bool usedBlas;
-                if (useTranspose && kernelT != null)
-                {
-                    usedBlas = BlasProvider.TryGemmEx(
-                        m: kmkn, n: hw, k: inChannels,
-                        a: kernelT, aOffset: 0, lda: inChannels, transA: false,
-                        b: input, bOffset: inputOffset, ldb: hw, transB: false,
-                        c: tempBuffer, cOffset: 0, ldc: hw);
-                }
-                else
-                {
-                    usedBlas = BlasProvider.TryGemmEx(
-                        m: kmkn, n: hw, k: inChannels,
-                        a: kernel, aOffset: 0, lda: kmkn, transA: true,
-                        b: input, bOffset: inputOffset, ldb: hw, transB: false,
-                        c: tempBuffer, cOffset: 0, ldc: hw);
-                }
+                // PHASE K5: BlasManaged.Gemm<double> fast path. kernel is [inChannels, kmkn]
+                // row-major; transA=true gives op(A) of shape [kmkn, inChannels]. This is
+                // exactly the L2-shape (M=4096 N=16 K=512 transA=true) that took 215ms via
+                // OpenBLAS and 559ms via MKL. BlasManaged routes to the AVX-512 8×16 FP64
+                // microkernel via PackBothStrategy and handles the transpose internally
+                // without the per-call BLAS overhead (closes issue #358).
+                BlasManaged.Gemm<double>(
+                    a: kernel.AsSpan(0, kernelSize),
+                    lda: kmkn, transA: true,
+                    b: input.AsSpan(inputOffset, inChannels * hw),
+                    ldb: hw, transB: false,
+                    c: tempBuffer.AsSpan(0, kmkn * hw),
+                    ldc: hw,
+                    m: kmkn, n: hw, k: inChannels);
+                bool usedBlas = true;
 
                 if (!usedBlas)
                 {
@@ -1319,7 +1293,6 @@ internal static class Im2ColHelper
         finally
         {
             pool.Return(tempBuffer);
-            if (kernelT != null) pool.Return(kernelT);
         }
     }
 
