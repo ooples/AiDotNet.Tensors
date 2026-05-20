@@ -459,8 +459,12 @@ public static class BlasManaged
         // so larger pre-pack tiles still work — they just override autotune.
         int mc = 64;
         int kc = 64;
-        if (mc > m) mc = ((m + mr - 1) / mr) * mr;  // round UP to mr multiple, capped at m
-        if (mc > m) mc = m;
+        // Round mc UP to a multiple of mr — same rationale as PrePackB below.
+        // Pre-fix the second `if (mc > m) mc = m;` line clamped mc back DOWN
+        // to m, defeating the alignment intent and causing OOB writes in
+        // ScalarPack.PackA / Avx2Pack.PackA on shapes with m < mr (e.g., the
+        // ExecuteIntoTests m=2 mr=4 matmul plan).
+        if (mc > m) mc = ((m + mr - 1) / mr) * mr;
         if (kc > k) kc = k;
         if (mc <= 0)
             throw new ArgumentException($"M={m} smaller than microkernel Mr={mr}; pre-pack not supported.", nameof(m));
@@ -564,8 +568,16 @@ public static class BlasManaged
         // consume on un-trained shapes.
         int nc = 64;
         int kc = 64;
+        // Round nc UP to a multiple of nr (microkernel column tile width) — the
+        // packed-buffer layout in ScalarPack.PackB / Avx2Pack.PackB always
+        // writes ceil(nc / nr) * nr columns per Kc row, zero-padding the tail
+        // stripe. Pre-fix the code below clamped nc back DOWN to n when n < nr,
+        // so a [k×n] PrePackB with n=2 nr=4 would size the tile as kc*n*sizeof(T)
+        // but ScalarPack.PackB would still write kc*nr*sizeof(T) (one full
+        // zero-padded stripe), producing an IndexOutOfRangeException in the
+        // packed-buffer span. Keep nc aligned UP and let effectiveNc bound the
+        // logical read range in the per-tile inner loop.
         if (nc > n) nc = ((n + nr - 1) / nr) * nr;
-        if (nc > n) nc = n;
         if (kc > k) kc = k;
         if (nc <= 0)
             throw new ArgumentException($"N={n} smaller than microkernel Nr={nr}; pre-pack not supported.", nameof(n));
