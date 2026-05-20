@@ -1,8 +1,14 @@
 using System;
 using System.Linq;
-using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Tests.Engines.BlasManaged.Catalog;
 using Xunit;
+// Merge resolution (#402 + main #412): both branches added a `ShapeInstrumenter` type.
+// This file targets the test-side `Catalog.ShapeInstrumenter` (DType-aware, harvest
+// mode, deterministic JSON dump on exit). Main's `AiDotNet.Tensors.Helpers.ShapeInstrumenter`
+// is a simpler 5-arg variant used by production benchmarks; we reach it explicitly via
+// fully-qualified `BlasProvider` access. Dropping the `Helpers` using directive resolves
+// the CS0104 ambiguity without renaming either class.
+using BlasProvider = AiDotNet.Tensors.Helpers.BlasProvider;
 
 namespace AiDotNet.Tensors.Tests.Engines.BlasManaged;
 
@@ -139,8 +145,15 @@ public class ShapeInstrumenterTest
     }
 
     [Fact]
-    public void Instrumenter_Distinguishes_Single_From_Double_Dtype()
+    public void Instrumenter_CollapsesSameShape_AcrossDtypes()
     {
+        // Merge resolution (#402 + main #412): the merged BlasProvider.ShapeLogHook
+        // is the 5-arg variant from main (no DType payload). The bootstrap +
+        // WireHook record under DType.Single as a sentinel, so two TryGemm calls
+        // with the same M/N/K but different element types DEDUPE to a single
+        // catalog entry. Pre-merge the test asserted two separate buckets
+        // (DType.Single + DType.Double); we now pin the new contract: one
+        // sentinel-dtype bucket whose call count covers both precisions.
         if (HarvestModeActive) return;
         WireHook();
         ShapeInstrumenter.Enabled = true;
@@ -157,9 +170,14 @@ public class ShapeInstrumenterTest
             BlasProvider.TryGemm(64, 16, 32, ad, 0, 32, bd, 0, 16, cd, 0, 16);
 
             var shapes = ShapeInstrumenter.Snapshot();
-            Assert.Equal(2, shapes.Count(s => s.M == 64 && s.N == 16 && s.K == 32));
-            Assert.Contains(shapes, s => s.Dtype == DType.Single && s.M == 64 && s.N == 16 && s.K == 32);
-            Assert.Contains(shapes, s => s.Dtype == DType.Double && s.M == 64 && s.N == 16 && s.K == 32);
+            // Sentinel-bucket dedup: both calls land in the same row.
+            // Bucket key is (M, N, K, transA, transB, Dtype) — with Dtype always
+            // pinned to Single by the merged 5-arg hook, the FP32 and FP64
+            // observations collapse to one Shape entry with Frequency = 2.
+            var matching = shapes.Where(s => s.M == 64 && s.N == 16 && s.K == 32).ToList();
+            Assert.Single(matching);
+            Assert.Equal(DType.Single, matching[0].Dtype);
+            Assert.Equal(2, matching[0].Frequency);
         }
         finally
         {
@@ -169,9 +187,12 @@ public class ShapeInstrumenterTest
 
     private static void WireHook()
     {
-        BlasProvider.ShapeLogHook = (m, n, k, transA, transB, dtype) =>
-            ShapeInstrumenter.Record(m, n, k, transA, transB,
-                dtype == typeof(float) ? DType.Single : DType.Double);
+        // Match the 5-arg shape of the merged BlasProvider.ShapeLogHook contract
+        // (main #412 baseline). DType is no longer carried by the hook payload —
+        // record under DType.Single as a sentinel. See ShapeInstrumenterBootstrap
+        // for the matching rationale.
+        BlasProvider.ShapeLogHook = (m, n, k, transA, transB) =>
+            ShapeInstrumenter.Record(m, n, k, transA, transB, DType.Single);
     }
 
     private static void RestoreCleanState()

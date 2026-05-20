@@ -34,10 +34,17 @@ internal static class ShapeInstrumenterBootstrap
         if (!ShapeInstrumenter.Enabled) return;
 
         // Wire the hook. Idempotent: setting the same delegate twice is harmless.
-        BlasProvider.ShapeLogHook = (m, n, k, transA, transB, dtype) =>
-            ShapeInstrumenter.Record(
-                m, n, k, transA, transB,
-                dtype == typeof(float) ? DType.Single : DType.Double);
+        //
+        // Merge resolution (#402 + main #412): `BlasProvider.ShapeLogHook` is now the
+        // 5-arg `Action<int, int, int, bool, bool>?` from main (#412 phase A.1). The
+        // dtype info that this harvest mode used to record per call is no longer
+        // observable from the hook signature, so we record under DType.Single as a
+        // sentinel and lose the FP32-vs-FP64 split in harvested catalogs. The split
+        // can be reconstructed at analysis time by intersecting with the per-shape
+        // call-site Type when needed; for the issue #369 catalog-build use case
+        // (which dedupes by M/N/K/transA/transB anyway) the sentinel is sufficient.
+        BlasProvider.ShapeLogHook = (m, n, k, transA, transB) =>
+            ShapeInstrumenter.Record(m, n, k, transA, transB, DType.Single);
 
         // Dump on process exit. Errors are swallowed because the test process is
         // already exiting — surfacing an IOException at this point would mask

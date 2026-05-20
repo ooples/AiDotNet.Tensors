@@ -1010,11 +1010,11 @@ internal static class BlasProvider
     // is not loaded.
     // ────────────────────────────────────────────────────────────────────
 
-    /// <summary>
-    /// Test-only shape instrumentation hook. Visible to <c>AiDotNet.Tensors.Tests</c>
-    /// via <c>InternalsVisibleTo</c>. Production code never sets this.
-    /// </summary>
-    internal static Action<int, int, int, bool, bool, Type>? ShapeLogHook;
+    // Merge resolution (main #412 vs #402): kept main's 5-arg `Action<int,int,int,bool,bool>?
+    // ShapeLogHook` declared at line 548 above + main's LogShape(m, n, k[, transA, transB])
+    // wrapper that fires AFTER a successful BLAS call. Dropped #402's duplicate 6-arg field
+    // that included Type — the existing ShapeInstrumenter consumer (Helpers/ShapeInstrumenter.cs)
+    // uses the 5-arg shape and doesn't need the precision tag.
 
     // ────────────────────────────────────────────────────────────────────
     // Try* entry points. When BLAS is disabled (default), every call
@@ -1028,7 +1028,6 @@ internal static class BlasProvider
         float[] b, int bOffset, int ldb,
         float[] c, int cOffset, int ldc)
     {
-        ShapeLogHook?.Invoke(m, n, k, false, false, typeof(float));
         // Sub-F (#374) routing shim: caller-opt-in managed dispatch.
         if (Engines.BlasManaged.BlasManaged.PreferManaged)
         {
@@ -1063,7 +1062,6 @@ internal static class BlasProvider
         double[] b, int bOffset, int ldb,
         double[] c, int cOffset, int ldc)
     {
-        ShapeLogHook?.Invoke(m, n, k, false, false, typeof(double));
         if (Engines.BlasManaged.BlasManaged.PreferManaged)
         {
             Engines.BlasManaged.BlasManaged.Gemm<double>(
@@ -1095,7 +1093,6 @@ internal static class BlasProvider
     internal static bool TryGemm(int m, int n, int k,
         ReadOnlySpan<float> a, int lda, ReadOnlySpan<float> b, int ldb, Span<float> c, int ldc)
     {
-        ShapeLogHook?.Invoke(m, n, k, false, false, typeof(float));
         if (Engines.BlasManaged.BlasManaged.PreferManaged)
         {
             Engines.BlasManaged.BlasManaged.Gemm<float>(a, lda, false, b, ldb, false, c, ldc, m, n, k);
@@ -1123,7 +1120,6 @@ internal static class BlasProvider
     internal static bool TryGemm(int m, int n, int k,
         ReadOnlySpan<double> a, int lda, ReadOnlySpan<double> b, int ldb, Span<double> c, int ldc)
     {
-        ShapeLogHook?.Invoke(m, n, k, false, false, typeof(double));
         if (Engines.BlasManaged.BlasManaged.PreferManaged)
         {
             Engines.BlasManaged.BlasManaged.Gemm<double>(a, lda, false, b, ldb, false, c, ldc, m, n, k);
@@ -1153,7 +1149,6 @@ internal static class BlasProvider
         float[] b, int bOffset, int ldb,
         float[] c, int cOffset, int ldc, float beta)
     {
-        ShapeLogHook?.Invoke(m, n, k, false, false, typeof(float));
         if (!_nativeAvailable.Value) return false;
         try
         {
@@ -1178,7 +1173,6 @@ internal static class BlasProvider
         double[] b, int bOffset, int ldb,
         double[] c, int cOffset, int ldc, double beta)
     {
-        ShapeLogHook?.Invoke(m, n, k, false, false, typeof(double));
         if (!_nativeAvailable.Value) return false;
         try
         {
@@ -1203,7 +1197,6 @@ internal static class BlasProvider
         float[] b, int bOffset, int ldb, bool transB,
         float[] c, int cOffset, int ldc)
     {
-        ShapeLogHook?.Invoke(m, n, k, transA, transB, typeof(float));
         if (Engines.BlasManaged.BlasManaged.PreferManaged)
         {
             Engines.BlasManaged.BlasManaged.Gemm<float>(
@@ -1262,7 +1255,6 @@ internal static class BlasProvider
         double[] b, int bOffset, int ldb, bool transB,
         double[] c, int cOffset, int ldc)
     {
-        ShapeLogHook?.Invoke(m, n, k, transA, transB, typeof(double));
         if (Engines.BlasManaged.BlasManaged.PreferManaged)
         {
             Engines.BlasManaged.BlasManaged.Gemm<double>(
@@ -1316,7 +1308,6 @@ internal static class BlasProvider
         double[] c, int cOffset, int ldc,
         double alpha, double beta)
     {
-        ShapeLogHook?.Invoke(m, n, k, transA, transB, typeof(double));
         if (!_nativeAvailable.Value) return false;
         try
         {
@@ -1347,7 +1338,6 @@ internal static class BlasProvider
         float[] c, int cOffset, int ldc,
         float alpha, float beta)
     {
-        ShapeLogHook?.Invoke(m, n, k, transA, transB, typeof(float));
         if (!_nativeAvailable.Value) return false;
         try
         {
