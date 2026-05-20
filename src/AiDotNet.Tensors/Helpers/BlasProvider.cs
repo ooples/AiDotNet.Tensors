@@ -102,6 +102,88 @@ internal static class BlasProvider
         catch { /* libopenblas symbol missing — earlier OpenBLAS builds may lack it. Tolerate. */ }
     }
 
+    /// <summary>
+    /// Returns the cached OpenBLAS thread count last set by <see cref="TrySetOpenBlasThreads(int)"/>,
+    /// or <c>-1</c> if no override has been applied this process. Used by callers that
+    /// run an outer parallel-for around BLAS calls and need to scope OpenBLAS down to
+    /// 1 thread (avoid oversubscription) then restore the prior value on exit.
+    /// </summary>
+    /// <remarks>
+    /// PR #410 CodeRabbit fix: prefer <see cref="ScopeOpenBlasThreads(int)"/> over
+    /// directly reading this value for save/restore patterns — the scope token uses a
+    /// lock-protected depth counter so overlapping/nested calls don't restore stale
+    /// values. This getter is left in place for backward compat with eager callers
+    /// that already implement their own correctness guarantees.
+    /// </remarks>
+    internal static int GetOpenBlasThreadCount() => _openblasThreadCount;
+
+    // PR #410 CodeRabbit fix: lock-protected scope for the OpenBLAS thread-count
+    // set/restore contract. Without this, two concurrent callers each saving/setting/
+    // restoring around their own BLAS-bound parallel-for could leave the global
+    // thread count at a stale value (e.g., both see savedCount=8 → both set to 1 →
+    // inner thread restores to 1 prematurely → outer thread restores to 1 instead
+    // of 8). The depth counter ensures only the OUTERMOST scope restores.
+    private static readonly object _openblasScopeLock = new object();
+    private static int _openblasScopeDepth;
+    private static int _openblasScopeRestoreTarget = -1;
+
+    /// <summary>
+    /// PR #410 CodeRabbit fix: thread-safe scoped override of the OpenBLAS thread
+    /// count. Returns a disposable token; on disposal the outermost scope restores
+    /// the prior thread count atomically. Nested/overlapping scopes within the same
+    /// process are reference-counted — only the outer disposal touches OpenBLAS.
+    ///
+    /// <para>
+    /// Use this for the "run an outer parallel-for around BLAS calls, force OpenBLAS
+    /// to 1 thread to avoid oversubscription, restore on exit" pattern. Eager callers
+    /// using <see cref="GetOpenBlasThreadCount"/> + <see cref="TrySetOpenBlasThreads"/>
+    /// directly are NOT concurrency-safe across threads.
+    /// </para>
+    /// </summary>
+    /// <param name="requestedThreads">Desired OpenBLAS thread count for the scope.</param>
+    internal static OpenBlasThreadScope ScopeOpenBlasThreads(int requestedThreads)
+    {
+        if (!_nativeAvailable.Value) return default;
+        return new OpenBlasThreadScope(requestedThreads);
+    }
+
+    /// <summary>
+    /// Disposable scope token returned by <see cref="ScopeOpenBlasThreads(int)"/>.
+    /// Restores the prior OpenBLAS thread count when the outermost scope disposes.
+    /// </summary>
+    internal readonly struct OpenBlasThreadScope : IDisposable
+    {
+        private readonly bool _active;
+
+        internal OpenBlasThreadScope(int requestedThreads)
+        {
+            lock (_openblasScopeLock)
+            {
+                if (_openblasScopeDepth == 0)
+                {
+                    _openblasScopeRestoreTarget = _openblasThreadCount;
+                }
+                _openblasScopeDepth++;
+                TrySetOpenBlasThreads(requestedThreads);
+            }
+            _active = true;
+        }
+
+        public void Dispose()
+        {
+            if (!_active) return;
+            lock (_openblasScopeLock)
+            {
+                _openblasScopeDepth--;
+                if (_openblasScopeDepth == 0)
+                {
+                    int restore = _openblasScopeRestoreTarget;
+                    TrySetOpenBlasThreads(restore < 0 ? 0 : restore);
+                }
+            }
+        }
+    }
+
 
     // ─────────────────────────────────────────────────────────────────────
     // Issue #338 Phase G.1 — Intel MKL via Microsoft.ML.Mkl.Redist.
@@ -449,6 +531,28 @@ internal static class BlasProvider
 
     /// <summary>Resolved lazily on first use — probes MklImports once.</summary>
     private static readonly Lazy<bool> _mklAvailable = new(ProbeMklLibrary);
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Shape-instrumentation hook (issue #403 Phase A.1).
+    //
+    // When subscribed, every successful TryGemm/TryGemmWithBeta/TryGemmEx
+    // call invokes the hook with (m, n, k, transA, transB) so a higher-level
+    // profiler can build a unique-shape catalog without modifying call
+    // sites. The hook is a single volatile delegate read on the fast path —
+    // when unset, the per-call cost is one null check.
+    //
+    // Subscribe by assigning ShapeLogHook = (m,n,k,tA,tB) => {...}.
+    // Unsubscribe by assigning null. Concurrent subscribe/unsubscribe is not
+    // supported (intended single-consumer profiler).
+    // ─────────────────────────────────────────────────────────────────────
+    internal static Action<int, int, int, bool, bool>? ShapeLogHook;
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void LogShape(int m, int n, int k, bool transA = false, bool transB = false)
+    {
+        var hook = ShapeLogHook;
+        if (hook is not null) hook(m, n, k, transA, transB);
+    }
 
 #if NET5_0_OR_GREATER
     static BlasProvider()
@@ -948,6 +1052,7 @@ internal static class BlasProvider
                         m, n, k, 1.0f, pa, lda, pb, ldb, 0.0f, pc, ldc);
                 }
             }
+            LogShape(m, n, k);
             return true;
         }
         catch { return false; }
@@ -981,6 +1086,7 @@ internal static class BlasProvider
                         m, n, k, 1.0, pa, lda, pb, ldb, 0.0, pc, ldc);
                 }
             }
+            LogShape(m, n, k);
             return true;
         }
         catch { return false; }
@@ -1008,6 +1114,7 @@ internal static class BlasProvider
                         m, n, k, 1.0f, pa, lda, pb, ldb, 0.0f, pc, ldc);
                 }
             }
+            LogShape(m, n, k);
             return true;
         }
         catch { return false; }
@@ -1035,6 +1142,7 @@ internal static class BlasProvider
                         m, n, k, 1.0, pa, lda, pb, ldb, 0.0, pc, ldc);
                 }
             }
+            LogShape(m, n, k);
             return true;
         }
         catch { return false; }
@@ -1059,6 +1167,7 @@ internal static class BlasProvider
                         m, n, k, 1.0f, pa, lda, pb, ldb, beta, pc, ldc);
                 }
             }
+            LogShape(m, n, k);
             return true;
         }
         catch { return false; }
@@ -1083,6 +1192,7 @@ internal static class BlasProvider
                         m, n, k, 1.0, pa, lda, pb, ldb, beta, pc, ldc);
                 }
             }
+            LogShape(m, n, k);
             return true;
         }
         catch { return false; }
@@ -1135,6 +1245,7 @@ internal static class BlasProvider
                         m, n, k, 1.0f, pa, lda, pb, ldb, 0.0f, pc, ldc);
                 }
             }
+            LogShape(m, n, k, transA, transB);
             return true;
         }
         catch { return false; }
@@ -1187,6 +1298,7 @@ internal static class BlasProvider
                         m, n, k, 1.0, pa, lda, pb, ldb, 0.0, pc, ldc);
                 }
             }
+            LogShape(m, n, k, transA, transB);
             return true;
         }
         catch { return false; }
@@ -1220,6 +1332,7 @@ internal static class BlasProvider
                         m, n, k, alpha, pa, lda, pb, ldb, beta, pc, ldc);
                 }
             }
+            LogShape(m, n, k, transA, transB);
             return true;
         }
         catch { return false; }
@@ -1250,6 +1363,7 @@ internal static class BlasProvider
                         m, n, k, alpha, pa, lda, pb, ldb, beta, pc, ldc);
                 }
             }
+            LogShape(m, n, k, transA, transB);
             return true;
         }
         catch { return false; }
