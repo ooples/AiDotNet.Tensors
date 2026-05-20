@@ -10,7 +10,16 @@ namespace AiDotNet.Tensors.Tests.Helpers;
 /// Issue #403 Phase A.1 — verifies ShapeInstrumenter correctly collects
 /// every GEMM call dispatched through BlasProvider.ShapeLogHook, dedupes
 /// by (M, N, K, transA, transB), and restores the prior hook on dispose.
+///
+/// <para>PR #412 CodeRabbit fix: this test class mutates the process-wide
+/// static <see cref="BlasProvider.ShapeLogHook"/>. Joined to the
+/// <c>ShapeLogHookSerial</c> xunit collection so it never runs in parallel
+/// with any other class that touches the same hook — assertions like
+/// <c>Assert.Null(BlasProvider.ShapeLogHook)</c> after dispose were
+/// nondeterministic under parallel runs because a sibling test could have
+/// installed its own hook between this test's Setup and the assertion.</para>
 /// </summary>
+[Collection("ShapeLogHookSerial")]
 public class ShapeInstrumenterTests
 {
     [Fact]

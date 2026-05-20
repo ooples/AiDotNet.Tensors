@@ -65,6 +65,21 @@ public class DCGANStepProbe
     private const int ColH = InChannels * KernelHW * KernelHW;
     private const int ColW = SpatialOut * SpatialOut;
 
+    // PR #412 CodeRabbit fix: hoist the shape / stride / padding / dilation
+    // int[] arrays to static readonly fields so the backward probe methods
+    // don't allocate three fresh arrays per call. The allocation profile is
+    // measuring op-internal allocations; the harness overhead of allocating
+    // these argument arrays per call contaminates the per-substep ranking
+    // (especially Conv2DBackward* which fire ~1 KB of GC-heap traffic per
+    // call from just the int[] args before any engine code runs).
+    private static readonly int[] InputShape =
+        { Batch, InChannels, SpatialIn, SpatialIn };
+    private static readonly int[] KernelShape =
+        { OutChannels, InChannels, KernelHW, KernelHW };
+    private static readonly int[] StrideArr = { Stride, Stride };
+    private static readonly int[] PaddingArr = { Padding, Padding };
+    private static readonly int[] DilationArr = { 1, 1 };
+
     private CpuEngine _engine = null!;
 
     // FP64 (matches DCGANTests.MoreData_ShouldNotDegrade)
@@ -75,6 +90,12 @@ public class DCGANStepProbe
     private Tensor<double> _bnBeta64 = null!;
     private Tensor<double> _bnIn64 = null!;
     private Tensor<double> _bnGradOut64 = null!;
+    // PR #412 CodeRabbit fix: precomputed mean/var so BatchNormBackward_Fp64
+    // only measures the backward step. Pre-fix the benchmark called BatchNorm
+    // (forward) inside the measured method, so the reported "backward" time
+    // and allocation profile actually included the full forward pass.
+    private Tensor<double> _bnMean64 = null!;
+    private Tensor<double> _bnVar64 = null!;
     private Tensor<double> _addA64 = null!;
     private Tensor<double> _addB64 = null!;
 
@@ -101,6 +122,11 @@ public class DCGANStepProbe
         _bnGamma64 = Tensor<double>.CreateRandom(rng, InChannels);
         _bnBeta64 = Tensor<double>.CreateRandom(rng, InChannels);
         _bnGradOut64 = Tensor<double>.CreateRandom(rng, Batch, InChannels, SpatialIn, SpatialIn);
+
+        // PR #412 CodeRabbit fix: run BN forward ONCE during setup so the
+        // backward probe can reuse mean/var without paying forward cost on
+        // each measured iteration.
+        _ = _engine.BatchNorm(_bnIn64, _bnGamma64, _bnBeta64, 1e-5, out _bnMean64, out _bnVar64);
 
         int addLen = Batch * OutChannels * SpatialOut * SpatialOut;
         _addA64 = Tensor<double>.CreateRandom(rng, addLen);
@@ -144,14 +170,12 @@ public class DCGANStepProbe
     [Benchmark, BenchmarkCategory("Conv2DBackward")]
     public Tensor<double> Conv2DBackwardInput_Fp64()
         => _engine.Conv2DBackwardInput(_gradOutput64, _kernel64,
-            new[] { Batch, InChannels, SpatialIn, SpatialIn },
-            new[] { Stride, Stride }, new[] { Padding, Padding }, new[] { 1, 1 });
+            InputShape, StrideArr, PaddingArr, DilationArr);
 
     [Benchmark, BenchmarkCategory("Conv2DBackward")]
     public Tensor<double> Conv2DBackwardKernel_Fp64()
         => _engine.Conv2DBackwardKernel(_gradOutput64, _input64,
-            new[] { OutChannels, InChannels, KernelHW, KernelHW },
-            new[] { Stride, Stride }, new[] { Padding, Padding }, new[] { 1, 1 });
+            KernelShape, StrideArr, PaddingArr, DilationArr);
 
     // ─── RecordBinary overhead (tape inactive vs tape active) ─────────────
 
@@ -174,12 +198,10 @@ public class DCGANStepProbe
 
     [Benchmark, BenchmarkCategory("BatchNorm")]
     public Tensor<double> BatchNormBackward_Fp64()
-    {
-        var fwd = _engine.BatchNorm(_bnIn64, _bnGamma64, _bnBeta64, 1e-5, out var mean, out var var);
-        return _engine.BatchNormBackward(
-            _bnGradOut64, _bnIn64, _bnGamma64, mean, var, 1e-5,
+        // Use the precomputed mean/var from Setup so this measures backward-only.
+        => _engine.BatchNormBackward(
+            _bnGradOut64, _bnIn64, _bnGamma64, _bnMean64, _bnVar64, 1e-5,
             out _, out _);
-    }
 
     // ─── Phase A.3 allocation profile (callable outside BDN) ──────────────
 
@@ -201,8 +223,20 @@ public class DCGANStepProbe
         probe.Setup();
         var p = new AllocationProfile();
 
-        // Warm up JIT — first call dominates allocation if measured cold.
+        // Warm up every measured path once before allocation sampling.
+        // PR #412 CodeRabbit fix: pre-fix only Conv2DForward_Fp64 was warmed,
+        // so the other 8 substeps still incurred first-call/JIT-tier-up alloc
+        // overhead in their MeasureAlloc result — skewing the Phase A
+        // per-substep ranking. Warming all paths gives steady-state numbers.
+        probe.Im2Col_Fp32_DcganShape();
         _ = probe.Conv2DForward_Fp64();
+        _ = probe.Conv2DForward_Fp32();
+        _ = probe.Conv2DBackwardInput_Fp64();
+        _ = probe.Conv2DBackwardKernel_Fp64();
+        _ = probe.TensorAdd_NoTape();
+        _ = probe.TensorAdd_WithTape();
+        _ = probe.BatchNormForward_Fp64();
+        _ = probe.BatchNormBackward_Fp64();
 
         p.Im2Col_Fp32 = MeasureAlloc(() => probe.Im2Col_Fp32_DcganShape());
         p.Conv2DForward_Fp64 = MeasureAlloc(() => probe.Conv2DForward_Fp64());

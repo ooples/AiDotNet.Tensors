@@ -507,6 +507,7 @@ class Program
         Console.WriteLine("  --conv      : Run GPU convolution benchmarks (Conv2D, Depthwise)");
         Console.WriteLine("  --baseline  : Capture full baseline to CSV (--baseline [phase] [csv])");
         Console.WriteLine("  --compare   : Compare baselines (--compare before.csv after.csv)");
+        Console.WriteLine("  --dcgan-probe : Run DCGAN step allocation / shape probe (#403 Phase A)");
         Console.WriteLine();
         Console.WriteLine("GPU Bottleneck Analysis:");
         Console.WriteLine("  --vulkan   : Run Vulkan backend diagnostics and bottleneck analysis");
