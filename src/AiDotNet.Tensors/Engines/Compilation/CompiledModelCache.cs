@@ -1,6 +1,5 @@
 using System.Collections.Concurrent;
 using AiDotNet.Tensors.Engines.Optimization;
-using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Engines.Compilation;
@@ -258,14 +257,21 @@ public sealed class CompiledModelCache<T> : IDisposable
             hash *= unchecked((long)0x100000001b3L);
         }
 
-        // Issue #164: mix in the current determinism state (process-wide value or
-        // thread-local override, whichever wins) so plans compiled under one mode
-        // are not served under the other. Today this matters mainly for forward
-        // compatibility — if a future backend re-introduces determinism-divergent
-        // kernels (GPU paths, parallel SimdGemm, etc.) the segregation is already
-        // in place. The bool collapses into a single bit XORed in, then mixed.
-        hash ^= BlasProvider.IsDeterministicMode ? 1L : 0L;
-        hash *= unchecked((long)0x100000001b3L);
+        // AiDotNet#1395 fix: do NOT mix BlasProvider.IsDeterministicMode into the
+        // cache key. The previous mix-in (added in #164) was forward-compat for
+        // potential determinism-divergent backends, but it has a real cross-test
+        // failure mode under xUnit parallel runs:
+        //   - VGG.Train step 1: thread-local determinism override = X → cache key K_X.
+        //     Compile + commit fused. _fusedTrainingCommitted=true.
+        //   - Sibling test on the same pool thread sets the override to Y
+        //     (TensorCodecOptions.SetCurrent → BlasProvider.SetThreadLocalDeterministicMode).
+        //   - VGG.Train step 2: same shape but determinism override = Y → cache key K_Y ≠ K_X.
+        //     Cache miss → new plan compiled → ReferenceEquals(_configuredPlan, new) = false
+        //     → TryStepWithFusedOptimizer returns false → throws because fused has committed.
+        // No backend today actually branches on IsDeterministicMode in a way that
+        // makes compiled plans non-portable; managed SimdGemm is deterministic
+        // regardless. When a future backend reintroduces a divergent path, the
+        // correct fix is per-plan instruction selection, not cache-key segregation.
 
         return hash;
     }
