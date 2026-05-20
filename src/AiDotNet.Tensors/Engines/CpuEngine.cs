@@ -23248,22 +23248,27 @@ public partial class CpuEngine : ITensorLevelEngine
 
         int scoresLen = bhCount * seqQ * seqK;
         var scoresData = System.Buffers.ArrayPool<double>.Shared.Rent(scoresLen);
-
-        // #1305: avoid OpenBLAS thread oversubscription against our outer
-        // batch*heads parallel-for. Each per-head GEMM is tiny
-        // (M=seqQ, K=headDim≤128, N=seqK) — multi-threaded OpenBLAS gives no
-        // wall-time benefit over a sequential kernel at this size, and on a
-        // 32-core host an 8-head outer parallel-for × 32-thread inner DGEMM
-        // produces ~256-thread oversubscription that takes the call from
-        // ~30 ms to >600 s (>20,000× slower). Scope OpenBLAS to 1 thread for
-        // the duration of the parallel-for and restore the prior count.
-        //
-        // PR #410 CodeRabbit fix: use the lock-protected scope token so
-        // overlapping/nested callers from concurrent threads don't restore
-        // stale values. Only the outermost scope hits OpenBLAS on dispose.
-        using var blasScope = Helpers.BlasProvider.ScopeOpenBlasThreads(1);
         try
         {
+            // #1305: avoid OpenBLAS thread oversubscription against our outer
+            // batch*heads parallel-for. Each per-head GEMM is tiny
+            // (M=seqQ, K=headDim≤128, N=seqK) — multi-threaded OpenBLAS gives no
+            // wall-time benefit over a sequential kernel at this size, and on a
+            // 32-core host an 8-head outer parallel-for × 32-thread inner DGEMM
+            // produces ~256-thread oversubscription that takes the call from
+            // ~30 ms to >600 s (>20,000× slower). Scope OpenBLAS to 1 thread for
+            // the duration of the parallel-for and restore the prior count.
+            //
+            // PR #410 CodeRabbit fix: use the lock-protected scope token so
+            // overlapping/nested callers from concurrent threads don't restore
+            // stale values. Only the outermost scope hits OpenBLAS on dispose.
+            //
+            // PR #410 CodeRabbit follow-up: ScopeOpenBlasThreads is created
+            // INSIDE the try so if its constructor throws (lazy _nativeAvailable
+            // init, lock contention, etc.) the rented scoresData still gets
+            // returned via the finally below. Previously the scope acquisition
+            // happened before the try, leaking the array pool on that path.
+            using var blasScope = Helpers.BlasProvider.ScopeOpenBlasThreads(1);
             var weightsData = new double[scoresLen];
             var outputData = new double[bhCount * seqQ * d_v];
             var statsData = new double[bhCount * seqQ];

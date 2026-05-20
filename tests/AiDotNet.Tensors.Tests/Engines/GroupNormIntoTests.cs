@@ -66,20 +66,23 @@ public class GroupNormIntoTests
         var gamma = Random<double>(new[] { 8 }, 2);
         var beta = Random<double>(new[] { 8 }, 3);
 
-        // Build a non-contiguous view as the output target.
+        // Build a non-contiguous output view by transposing the last two axes
+        // of a fresh tensor. Both axes have size 4 so the resulting shape is
+        // unchanged ([1, 8, 4, 4]) — important because GroupNormInto requires
+        // input and output to share dims — but the strides are reordered, so
+        // IsContiguous returns false.
         var contiguousBuf = new Tensor<double>(new[] { 1, 8, 4, 4 });
-        // .Transpose(...) usually returns a strided view; if all engines return contiguous
-        // for this rank/perm we just exercise the contiguous-input fast path instead.
-        var output = contiguousBuf.IsContiguous
-            ? contiguousBuf  // No easy way to fabricate non-contiguous in this shape — skip strict assertion.
-            : contiguousBuf;
-        Assert.True(output.IsContiguous, "Test fixture assumes contiguous output is the common case");
+        var output = contiguousBuf.Transpose(new[] { 0, 1, 3, 2 });
+        Assert.False(output.IsContiguous,
+            "Test fixture must produce a non-contiguous output via axis-swap " +
+            "to exercise the InvalidOperationException guard in GroupNormInto.");
 
-        // The contract: non-contig output throws. Skipping the negative-case fabrication
-        // when the linear-algebra layer always materialises a contiguous tensor at this
-        // rank — the throw is exercised in practice when callers feed slice views from
-        // larger backing tensors.
-        engine.GroupNormInto<double>(output, input, 4, gamma, beta, 1e-5, out _, out _);
+        // GroupNormInto contract: non-contiguous output throws InvalidOperationException
+        // (CpuEngine.cs:3551). Wrap in Assert.Throws so the test FAILS if the guard
+        // is ever removed and the engine silently writes to a strided buffer (which
+        // would corrupt unrelated data via the wrong stride pattern).
+        Assert.Throws<InvalidOperationException>(() =>
+            engine.GroupNormInto<double>(output, input, 4, gamma, beta, 1e-5, out _, out _));
     }
 
     private static Tensor<T> Random<T>(int[] shape, int seed) where T : struct, IEquatable<T>
