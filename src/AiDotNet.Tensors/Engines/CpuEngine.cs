@@ -3548,18 +3548,116 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public void GroupNormInto<T>(Tensor<T> output, Tensor<T> input, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
     {
+        if (output is null) throw new ArgumentNullException(nameof(output));
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (gamma is null) throw new ArgumentNullException(nameof(gamma));
+        if (beta is null) throw new ArgumentNullException(nameof(beta));
         if (!output.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
-        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
+        if (numGroups <= 0) throw new ArgumentOutOfRangeException(nameof(numGroups), "Number of groups must be positive.");
+
+        // #257: preserve user-facing refs before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
-        var gammaOrig = gamma;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!gamma.IsContiguous) gamma = gamma.Contiguous();
-        var betaOrig = beta;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!beta.IsContiguous) beta = beta.Contiguous();
-        // GroupNorm writes normalized values into pre-allocated output.
-        // The mean/variance stats are small tensors [batch, numGroups] that the callee allocates.
-        // The main output tensor avoids allocation since it's pre-allocated by the caller.
-        var result = GroupNorm(input, numGroups, gamma, beta, epsilon, out mean, out variance);
-        result.Data.Span.CopyTo(output.Data.Span);
+
+        int batch = input._shape[0];
+        int channels = input._shape[1];
+        if (channels % numGroups != 0)
+            throw new ArgumentException($"Number of channels ({channels}) must be divisible by number of groups ({numGroups}).");
+        int channelsPerGroup = channels / numGroups;
+        int spatialSize = 1;
+        for (int i = 2; i < input._shape.Length; i++) spatialSize *= input._shape[i];
+
+        // True zero-alloc Into: write normalized output directly into the
+        // caller's buffer. Avoids the old alloc+copy pattern (allocated a
+        // fresh tensor via AutoTensorCache.RentOrAllocate, then memcpy'd
+        // into the caller's output). For SD UNet at [1,1280,16,16] doubles
+        // that's a 2.6 MB rent + a 2.6 MB memcpy per call, repeated for
+        // every ResBlock's two GroupNorms — ~50 MB of pointless traffic
+        // per UNet forward at the heaviest shapes. The mean/variance
+        // out-tensors are still allocated (small: [batch, numGroups]).
+        if (typeof(T) == typeof(float))
+        {
+            using var pinIn = input.Data.Pin();
+            using var pinOut = output.Data.Pin();
+            using var pinGamma = gamma.Data.Pin();
+            using var pinBeta = beta.Data.Pin();
+            unsafe
+            {
+                float epsF = (float)epsilon;
+                GroupNormFloatPtr(
+                    (float*)pinIn.Pointer, (float*)pinOut.Pointer,
+                    (float*)pinGamma.Pointer, (float*)pinBeta.Pointer,
+                    batch, channels, spatialSize, numGroups, channelsPerGroup,
+                    epsF, out var meanArr, out var varArr);
+                mean = TensorAllocator.Rent<T>(new[] { batch, numGroups },
+                    new Vector<T>((T[])(object)meanArr));
+                variance = TensorAllocator.Rent<T>(new[] { batch, numGroups },
+                    new Vector<T>((T[])(object)varArr));
+            }
+            return;
+        }
+
+        // Generic path (covers double + any other T): replicate the inner
+        // loop from GroupNorm but write directly into output.GetDataArray()
+        // instead of allocating a fresh outputData.
+        var numOps = MathHelper.GetNumericOperations<T>();
+        T eps = numOps.FromDouble(epsilon);
+        int groupSize = channelsPerGroup * spatialSize;
+
+        var inputData = input.GetDataArray();
+        var gammaData = gamma.GetDataArray();
+        var betaData = beta.GetDataArray();
+        var outputData = output.GetDataArray();
+        var meanData = new T[batch * numGroups];
+        var varData = new T[batch * numGroups];
+
+        CpuParallelSettings.ParallelForOrSerial(0, batch * numGroups, outputData.Length, idx =>
+        {
+            int b = idx / numGroups;
+            int g = idx % numGroups;
+            int startChannel = g * channelsPerGroup;
+            int batchOffset = b * (channels * spatialSize);
+            T groupSizeT = numOps.FromDouble(groupSize);
+
+            T sum = numOps.Zero;
+            for (int c = 0; c < channelsPerGroup; c++)
+            {
+                int chanOffset = batchOffset + (startChannel + c) * spatialSize;
+                for (int s = 0; s < spatialSize; s++)
+                    sum = numOps.Add(sum, inputData[chanOffset + s]);
+            }
+            T groupMean = numOps.Divide(sum, groupSizeT);
+            meanData[b * numGroups + g] = groupMean;
+
+            T sumSq = numOps.Zero;
+            for (int c = 0; c < channelsPerGroup; c++)
+            {
+                int chanOffset = batchOffset + (startChannel + c) * spatialSize;
+                for (int s = 0; s < spatialSize; s++)
+                {
+                    T diff = numOps.Subtract(inputData[chanOffset + s], groupMean);
+                    sumSq = numOps.Add(sumSq, numOps.Multiply(diff, diff));
+                }
+            }
+            T groupVar = numOps.Divide(sumSq, groupSizeT);
+            varData[b * numGroups + g] = groupVar;
+
+            T invStd = numOps.Divide(numOps.One, numOps.Sqrt(numOps.Add(groupVar, eps)));
+            for (int c = 0; c < channelsPerGroup; c++)
+            {
+                int channel = startChannel + c;
+                int chanOffset = batchOffset + channel * spatialSize;
+                for (int s = 0; s < spatialSize; s++)
+                {
+                    T normalized = numOps.Multiply(numOps.Subtract(inputData[chanOffset + s], groupMean), invStd);
+                    outputData[chanOffset + s] = numOps.Add(numOps.Multiply(gammaData[channel], normalized), betaData[channel]);
+                }
+            }
+        });
+
+        mean = TensorAllocator.Rent<T>(new[] { batch, numGroups }, Vector<T>.WrapMemory(meanData));
+        variance = TensorAllocator.Rent<T>(new[] { batch, numGroups }, Vector<T>.WrapMemory(varData));
     }
 
     /// <inheritdoc/>
@@ -8344,9 +8442,32 @@ public partial class CpuEngine : ITensorLevelEngine
             // <Compile Remove>'d in the .csproj for that TFM). On net471 doubles
             // fall through to the im2col+GEMM path below.
             long convFmas = (long)batch * outChannels * inChannels * outputHeight * outputWidth * 9L;
+            // AiDotNet#1305 perf gate: the direct kernel's per-output-channel
+            // loop traverses `outputHeight * outputWidth` output positions; if
+            // that count is small, the SIMD vector-register preroll + per-OC
+            // `Span.Clear()` + parallel-task scheduling overhead dominates the
+            // actual FMAs and throughput collapses. Empirical crossover from
+            // the #1305 bench (single Conv2DInto<double> on 32-core CPU):
+            //   spatial=4096 (320→320 @ 64×64):  158 GFLOPS — direct wins
+            //   spatial=1024 (320→640 @ 32×32):  110 GFLOPS — direct wins
+            //   spatial=1024 (640→640 @ 32×32):   94 GFLOPS — direct wins
+            //   spatial= 256 (640→1280 @ 16×16):   4.7 GFLOPS — direct CLIFF
+            //   spatial= 256 (1280→1280 @ 16×16):  4.5 GFLOPS — direct CLIFF
+            //   spatial=  64 (1280→1280 @ 8×8):    2.7 GFLOPS — direct CLIFF
+            // The discriminator is spatial output size, not per-channel work
+            // (the 320→640 @ 32×32 and 1280→1280 @ 16×16 cases both have ~2.9M
+            // ops per output channel but only the larger-spatial one is fast).
+            // Crossover sits between spatial=256 (cliff) and spatial=1024 (fast);
+            // threshold 512 is the midpoint that keeps every fast case on the
+            // direct path while routing the slow cliff shapes to im2col+DGEMM,
+            // which stays near peak at any shape because BLAS handles blocking
+            // internally.
+            long outputSpatial = (long)outputHeight * outputWidth;
             int directKernelMinTasks = 2 * Math.Max(1, Helpers.CpuParallelSettings.MaxDegreeOfParallelism);
+            const long MinDirectSpatial = 512L;
             bool directKernelFitsWell = convFmas <= 4_000_000L
-                || outChannels >= directKernelMinTasks;
+                || (outChannels >= directKernelMinTasks
+                    && outputSpatial >= MinDirectSpatial);
             if (kernelHeight == 3 && kernelWidth == 3
                 && stride == 1 && padding > 0 && dilation == 1
                 && directKernelFitsWell
@@ -8513,9 +8634,18 @@ public partial class CpuEngine : ITensorLevelEngine
         {
 #if !NET471
             long convFmasInto = (long)batch * outChannels * inChannels * outputHeight * outputWidth * 9L;
+            // AiDotNet#1305 perf gate: see Conv2D allocating overload above
+            // for the empirical cliff (~3% peak GFLOPS at SD UNet deepest
+            // ResBlock shapes when output spatial size falls below ~512).
+            // Same threshold/formula here so both inference paths (zero-alloc
+            // Conv2DInto from ConvolutionalLayer.Forward + allocating Conv2D
+            // from tape-active forward) make consistent kernel choices.
+            long outputSpatialInto = (long)outputHeight * outputWidth;
             int directKernelMinTasksInto = 2 * Math.Max(1, Helpers.CpuParallelSettings.MaxDegreeOfParallelism);
+            const long MinDirectSpatialInto = 512L;
             bool directKernelFitsWellInto = convFmasInto <= 4_000_000L
-                || outChannels >= directKernelMinTasksInto;
+                || (outChannels >= directKernelMinTasksInto
+                    && outputSpatialInto >= MinDirectSpatialInto);
             if (kernelHeight == 3 && kernelWidth == 3
                 && stride == 1 && padding > 0 && dilation == 1
                 && directKernelFitsWellInto
@@ -14110,6 +14240,154 @@ public partial class CpuEngine : ITensorLevelEngine
             savedState: new object[] { (int[])stride.Clone(), (int[])padding.Clone() });
         AutoTracer.RecordOp("ConvTranspose2D", convTransResult, eng => convTransResult);
         return convTransResult;
+    }
+
+    /// <summary>
+    /// Zero-alloc variant of <see cref="ConvTranspose2D{T}"/> — writes the result directly
+    /// into the caller-provided <paramref name="output"/> buffer. Used by the compiled-plan
+    /// replay path (<see cref="Compilation.CompiledTrainingPlan.TryBuildSpecializedForward"/>)
+    /// to skip the per-Execute tensor allocation that the allocating overload would do.
+    ///
+    /// SD UNet decoder Upsamples are <c>ConvTranspose2D</c> with kernel=4 stride=2 at 1280
+    /// channels — those calls dominate the decoder's wall time (~1 s per UNet forward
+    /// across three upsample stages), so the alloc savings here compound × 10 sampling
+    /// steps per Predict.
+    /// </summary>
+    public void ConvTranspose2DInto<T>(
+        Tensor<T> output, Tensor<T> input, Tensor<T> kernel,
+        int[] stride, int[] padding, int[] outputPadding)
+    {
+        if (output is null) throw new ArgumentNullException(nameof(output));
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (kernel is null) throw new ArgumentNullException(nameof(kernel));
+        if (!output.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        if (!input.IsContiguous) input = input.Contiguous();
+        if (!kernel.IsContiguous) kernel = kernel.Contiguous();
+        if (input.Rank != 4) throw new ArgumentException($"ConvTranspose2DInto requires 4D input. Got rank {input.Rank}.", nameof(input));
+        if (kernel.Rank != 4) throw new ArgumentException($"ConvTranspose2DInto requires 4D kernel. Got rank {kernel.Rank}.", nameof(kernel));
+        if (stride is null || stride.Length != 2) throw new ArgumentException("Stride must be 2 elements", nameof(stride));
+        if (padding is null || padding.Length != 2) throw new ArgumentException("Padding must be 2 elements", nameof(padding));
+        if (outputPadding is null || outputPadding.Length != 2) throw new ArgumentException("OutputPadding must be 2 elements", nameof(outputPadding));
+        if (input._shape[1] != kernel._shape[0])
+            throw new ArgumentException($"Input inChannels ({input._shape[1]}) must match kernel inChannels ({kernel._shape[0]})");
+
+        int batch = input._shape[0];
+        int inChannels = input._shape[1];
+        int height = input._shape[2];
+        int width = input._shape[3];
+        int outChannels = kernel._shape[1];
+        int kernelHeight = kernel._shape[2];
+        int kernelWidth = kernel._shape[3];
+        int strideH = stride[0], strideW = stride[1];
+        int padH = padding[0], padW = padding[1];
+        int outPadH = outputPadding[0], outPadW = outputPadding[1];
+        int outputHeight = (height - 1) * strideH - 2 * padH + kernelHeight + outPadH;
+        int outputWidth = (width - 1) * strideW - 2 * padW + kernelWidth + outPadW;
+        long expectedOutLen = (long)batch * outChannels * outputHeight * outputWidth;
+        if (output.Length != expectedOutLen)
+            throw new ArgumentException(
+                $"Output length {output.Length} does not match expected {expectedOutLen} for shape [{batch},{outChannels},{outputHeight},{outputWidth}].",
+                nameof(output));
+
+        var inputData = input.GetDataArray();
+        var kernelData = kernel.GetDataArray();
+        var outputData = output.GetDataArray();
+
+        // BLAS GEMM + Col2Im fast path — TryConvTranspose2DWithGemm zeros its
+        // output slice via Array.Clear (Im2ColHelper.cs:1185) before accumulating,
+        // so passing the caller's buffer with arbitrary stale data is safe.
+        if (typeof(T) == typeof(float))
+        {
+            var fInput = (float[])(object)inputData;
+            var fKernel = (float[])(object)kernelData;
+            var fOutput = (float[])(object)outputData;
+            if (Helpers.Im2ColHelper.TryConvTranspose2DWithGemm(
+                    fInput, fKernel, fOutput,
+                    batch, inChannels, height, width,
+                    outChannels, kernelHeight, kernelWidth,
+                    strideH, strideW, padH, padW, outputHeight, outputWidth))
+            { return; }
+            // Naive scalar fallback (parallel per [batch, outChannel])
+            CpuParallelSettings.ParallelForOrSerial(0, batch * outChannels, fOutput.Length, idx =>
+            {
+                int b = idx / outChannels; int oc = idx % outChannels;
+                for (int oh = 0; oh < outputHeight; oh++)
+                    for (int ow = 0; ow < outputWidth; ow++)
+                    {
+                        float sum = 0f;
+                        for (int kh = 0; kh < kernelHeight; kh++)
+                        {
+                            int numerH = oh + padH - kh;
+                            if (numerH < 0 || numerH % strideH != 0) continue;
+                            int ih = numerH / strideH;
+                            if (ih >= height) continue;
+                            for (int kw = 0; kw < kernelWidth; kw++)
+                            {
+                                int numerW = ow + padW - kw;
+                                if (numerW < 0 || numerW % strideW != 0) continue;
+                                int iw = numerW / strideW;
+                                if (iw >= width) continue;
+                                for (int ic = 0; ic < inChannels; ic++)
+                                {
+                                    int inIdx = ((b * inChannels + ic) * height + ih) * width + iw;
+                                    int kIdx = ((ic * outChannels + oc) * kernelHeight + kh) * kernelWidth + kw;
+                                    sum += fInput[inIdx] * fKernel[kIdx];
+                                }
+                            }
+                        }
+                        fOutput[((b * outChannels + oc) * outputHeight + oh) * outputWidth + ow] = sum;
+                    }
+            });
+            return;
+        }
+        if (typeof(T) == typeof(double))
+        {
+            var dInput = (double[])(object)inputData;
+            var dKernel = (double[])(object)kernelData;
+            var dOutput = (double[])(object)outputData;
+            if (Helpers.Im2ColHelper.TryConvTranspose2DWithGemm(
+                    dInput, dKernel, dOutput,
+                    batch, inChannels, height, width,
+                    outChannels, kernelHeight, kernelWidth,
+                    strideH, strideW, padH, padW, outputHeight, outputWidth))
+            { return; }
+            CpuParallelSettings.ParallelForOrSerial(0, batch * outChannels, dOutput.Length, idx =>
+            {
+                int b = idx / outChannels; int oc = idx % outChannels;
+                for (int oh = 0; oh < outputHeight; oh++)
+                    for (int ow = 0; ow < outputWidth; ow++)
+                    {
+                        double sum = 0d;
+                        for (int kh = 0; kh < kernelHeight; kh++)
+                        {
+                            int numerH = oh + padH - kh;
+                            if (numerH < 0 || numerH % strideH != 0) continue;
+                            int ih = numerH / strideH;
+                            if (ih >= height) continue;
+                            for (int kw = 0; kw < kernelWidth; kw++)
+                            {
+                                int numerW = ow + padW - kw;
+                                if (numerW < 0 || numerW % strideW != 0) continue;
+                                int iw = numerW / strideW;
+                                if (iw >= width) continue;
+                                for (int ic = 0; ic < inChannels; ic++)
+                                {
+                                    int inIdx = ((b * inChannels + ic) * height + ih) * width + iw;
+                                    int kIdx = ((ic * outChannels + oc) * kernelHeight + kh) * kernelWidth + kw;
+                                    sum += dInput[inIdx] * dKernel[kIdx];
+                                }
+                            }
+                        }
+                        dOutput[((b * outChannels + oc) * outputHeight + oh) * outputWidth + ow] = sum;
+                    }
+            });
+            return;
+        }
+
+        // Generic numOps fallback: delegate to allocating ConvTranspose2D + copy.
+        // Non-float/non-double T is a rare niche; the alloc-and-copy is acceptable here.
+        var allocated = ConvTranspose2D(input, kernel, stride, padding, outputPadding);
+        allocated.AsSpan().CopyTo(output.AsWritableSpan());
     }
 
     /// <inheritdoc/>
@@ -22972,6 +23250,25 @@ public partial class CpuEngine : ITensorLevelEngine
         var scoresData = System.Buffers.ArrayPool<double>.Shared.Rent(scoresLen);
         try
         {
+            // #1305: avoid OpenBLAS thread oversubscription against our outer
+            // batch*heads parallel-for. Each per-head GEMM is tiny
+            // (M=seqQ, K=headDim≤128, N=seqK) — multi-threaded OpenBLAS gives no
+            // wall-time benefit over a sequential kernel at this size, and on a
+            // 32-core host an 8-head outer parallel-for × 32-thread inner DGEMM
+            // produces ~256-thread oversubscription that takes the call from
+            // ~30 ms to >600 s (>20,000× slower). Scope OpenBLAS to 1 thread for
+            // the duration of the parallel-for and restore the prior count.
+            //
+            // PR #410 CodeRabbit fix: use the lock-protected scope token so
+            // overlapping/nested callers from concurrent threads don't restore
+            // stale values. Only the outermost scope hits OpenBLAS on dispose.
+            //
+            // PR #410 CodeRabbit follow-up: ScopeOpenBlasThreads is created
+            // INSIDE the try so if its constructor throws (lazy _nativeAvailable
+            // init, lock contention, etc.) the rented scoresData still gets
+            // returned via the finally below. Previously the scope acquisition
+            // happened before the try, leaking the array pool on that path.
+            using var blasScope = Helpers.BlasProvider.ScopeOpenBlasThreads(1);
             var weightsData = new double[scoresLen];
             var outputData = new double[bhCount * seqQ * d_v];
             var statsData = new double[bhCount * seqQ];
@@ -23081,6 +23378,8 @@ public partial class CpuEngine : ITensorLevelEngine
         finally
         {
             System.Buffers.ArrayPool<double>.Shared.Return(scoresData, clearArray: false);
+            // PR #410 CodeRabbit fix: thread-count restore is handled by the
+            // `using var blasScope` declaration above. No explicit restore here.
         }
     }
 
