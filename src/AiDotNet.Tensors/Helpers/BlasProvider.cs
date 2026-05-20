@@ -1028,13 +1028,6 @@ internal static class BlasProvider
         float[] b, int bOffset, int ldb,
         float[] c, int cOffset, int ldc)
     {
-        // PR #402 merge-resolution: log shape on entry so the hook fires for
-        // every TryGemm call regardless of which downstream dispatch path
-        // (PreferManaged / autotune / cblas / fallback) executes. The
-        // ShapeInstrumenter tests treat "TryGemm was invoked" as the unit of
-        // observation; gating on cblas-success would leave the catalog empty
-        // when the CI runner doesn't have libopenblas loaded.
-        LogShape(m, n, k);
         // Sub-F (#374) routing shim: caller-opt-in managed dispatch.
         if (Engines.BlasManaged.BlasManaged.PreferManaged)
         {
@@ -1058,6 +1051,7 @@ internal static class BlasProvider
                         m, n, k, 1.0f, pa, lda, pb, ldb, 0.0f, pc, ldc);
                 }
             }
+            LogShape(m, n, k);
             return true;
         }
         catch { return false; }
@@ -1068,7 +1062,6 @@ internal static class BlasProvider
         double[] b, int bOffset, int ldb,
         double[] c, int cOffset, int ldc)
     {
-        LogShape(m, n, k);
         if (Engines.BlasManaged.BlasManaged.PreferManaged)
         {
             Engines.BlasManaged.BlasManaged.Gemm<double>(
@@ -1091,6 +1084,7 @@ internal static class BlasProvider
                         m, n, k, 1.0, pa, lda, pb, ldb, 0.0, pc, ldc);
                 }
             }
+            LogShape(m, n, k);
             return true;
         }
         catch { return false; }
@@ -1099,7 +1093,6 @@ internal static class BlasProvider
     internal static bool TryGemm(int m, int n, int k,
         ReadOnlySpan<float> a, int lda, ReadOnlySpan<float> b, int ldb, Span<float> c, int ldc)
     {
-        LogShape(m, n, k);
         if (Engines.BlasManaged.BlasManaged.PreferManaged)
         {
             Engines.BlasManaged.BlasManaged.Gemm<float>(a, lda, false, b, ldb, false, c, ldc, m, n, k);
@@ -1118,6 +1111,7 @@ internal static class BlasProvider
                         m, n, k, 1.0f, pa, lda, pb, ldb, 0.0f, pc, ldc);
                 }
             }
+            LogShape(m, n, k);
             return true;
         }
         catch { return false; }
@@ -1126,7 +1120,6 @@ internal static class BlasProvider
     internal static bool TryGemm(int m, int n, int k,
         ReadOnlySpan<double> a, int lda, ReadOnlySpan<double> b, int ldb, Span<double> c, int ldc)
     {
-        LogShape(m, n, k);
         if (Engines.BlasManaged.BlasManaged.PreferManaged)
         {
             Engines.BlasManaged.BlasManaged.Gemm<double>(a, lda, false, b, ldb, false, c, ldc, m, n, k);
@@ -1145,6 +1138,7 @@ internal static class BlasProvider
                         m, n, k, 1.0, pa, lda, pb, ldb, 0.0, pc, ldc);
                 }
             }
+            LogShape(m, n, k);
             return true;
         }
         catch { return false; }
@@ -1155,7 +1149,6 @@ internal static class BlasProvider
         float[] b, int bOffset, int ldb,
         float[] c, int cOffset, int ldc, float beta)
     {
-        LogShape(m, n, k);
         if (!_nativeAvailable.Value) return false;
         try
         {
@@ -1169,6 +1162,7 @@ internal static class BlasProvider
                         m, n, k, 1.0f, pa, lda, pb, ldb, beta, pc, ldc);
                 }
             }
+            LogShape(m, n, k);
             return true;
         }
         catch { return false; }
@@ -1179,7 +1173,6 @@ internal static class BlasProvider
         double[] b, int bOffset, int ldb,
         double[] c, int cOffset, int ldc, double beta)
     {
-        LogShape(m, n, k);
         if (!_nativeAvailable.Value) return false;
         try
         {
@@ -1193,6 +1186,7 @@ internal static class BlasProvider
                         m, n, k, 1.0, pa, lda, pb, ldb, beta, pc, ldc);
                 }
             }
+            LogShape(m, n, k);
             return true;
         }
         catch { return false; }
@@ -1203,7 +1197,6 @@ internal static class BlasProvider
         float[] b, int bOffset, int ldb, bool transB,
         float[] c, int cOffset, int ldc)
     {
-        LogShape(m, n, k, transA, transB);
         if (Engines.BlasManaged.BlasManaged.PreferManaged)
         {
             Engines.BlasManaged.BlasManaged.Gemm<float>(
@@ -1245,6 +1238,7 @@ internal static class BlasProvider
                         m, n, k, 1.0f, pa, lda, pb, ldb, 0.0f, pc, ldc);
                 }
             }
+            LogShape(m, n, k, transA, transB);
             return true;
         }
         catch { return false; }
@@ -1261,7 +1255,6 @@ internal static class BlasProvider
         double[] b, int bOffset, int ldb, bool transB,
         double[] c, int cOffset, int ldc)
     {
-        LogShape(m, n, k, transA, transB);
         if (Engines.BlasManaged.BlasManaged.PreferManaged)
         {
             Engines.BlasManaged.BlasManaged.Gemm<double>(
@@ -1297,6 +1290,7 @@ internal static class BlasProvider
                         m, n, k, 1.0, pa, lda, pb, ldb, 0.0, pc, ldc);
                 }
             }
+            LogShape(m, n, k, transA, transB);
             return true;
         }
         catch { return false; }
@@ -1314,7 +1308,6 @@ internal static class BlasProvider
         double[] c, int cOffset, int ldc,
         double alpha, double beta)
     {
-        LogShape(m, n, k, transA, transB);
         if (!_nativeAvailable.Value) return false;
         try
         {
@@ -1330,6 +1323,7 @@ internal static class BlasProvider
                         m, n, k, alpha, pa, lda, pb, ldb, beta, pc, ldc);
                 }
             }
+            LogShape(m, n, k, transA, transB);
             return true;
         }
         catch { return false; }
@@ -1344,7 +1338,6 @@ internal static class BlasProvider
         float[] c, int cOffset, int ldc,
         float alpha, float beta)
     {
-        LogShape(m, n, k, transA, transB);
         if (!_nativeAvailable.Value) return false;
         try
         {
@@ -1360,6 +1353,7 @@ internal static class BlasProvider
                         m, n, k, alpha, pa, lda, pb, ldb, beta, pc, ldc);
                 }
             }
+            LogShape(m, n, k, transA, transB);
             return true;
         }
         catch { return false; }
