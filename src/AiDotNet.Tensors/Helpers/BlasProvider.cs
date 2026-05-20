@@ -532,6 +532,28 @@ internal static class BlasProvider
     /// <summary>Resolved lazily on first use — probes MklImports once.</summary>
     private static readonly Lazy<bool> _mklAvailable = new(ProbeMklLibrary);
 
+    // ─────────────────────────────────────────────────────────────────────
+    // Shape-instrumentation hook (issue #403 Phase A.1).
+    //
+    // When subscribed, every successful TryGemm/TryGemmWithBeta/TryGemmEx
+    // call invokes the hook with (m, n, k, transA, transB) so a higher-level
+    // profiler can build a unique-shape catalog without modifying call
+    // sites. The hook is a single volatile delegate read on the fast path —
+    // when unset, the per-call cost is one null check.
+    //
+    // Subscribe by assigning ShapeLogHook = (m,n,k,tA,tB) => {...}.
+    // Unsubscribe by assigning null. Concurrent subscribe/unsubscribe is not
+    // supported (intended single-consumer profiler).
+    // ─────────────────────────────────────────────────────────────────────
+    internal static Action<int, int, int, bool, bool>? ShapeLogHook;
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void LogShape(int m, int n, int k, bool transA = false, bool transB = false)
+    {
+        var hook = ShapeLogHook;
+        if (hook is not null) hook(m, n, k, transA, transB);
+    }
+
 #if NET5_0_OR_GREATER
     static BlasProvider()
     {
@@ -1002,6 +1024,7 @@ internal static class BlasProvider
                         m, n, k, 1.0f, pa, lda, pb, ldb, 0.0f, pc, ldc);
                 }
             }
+            LogShape(m, n, k);
             return true;
         }
         catch { return false; }
@@ -1025,6 +1048,7 @@ internal static class BlasProvider
                         m, n, k, 1.0, pa, lda, pb, ldb, 0.0, pc, ldc);
                 }
             }
+            LogShape(m, n, k);
             return true;
         }
         catch { return false; }
@@ -1046,6 +1070,7 @@ internal static class BlasProvider
                         m, n, k, 1.0f, pa, lda, pb, ldb, 0.0f, pc, ldc);
                 }
             }
+            LogShape(m, n, k);
             return true;
         }
         catch { return false; }
@@ -1067,6 +1092,7 @@ internal static class BlasProvider
                         m, n, k, 1.0, pa, lda, pb, ldb, 0.0, pc, ldc);
                 }
             }
+            LogShape(m, n, k);
             return true;
         }
         catch { return false; }
@@ -1090,6 +1116,7 @@ internal static class BlasProvider
                         m, n, k, 1.0f, pa, lda, pb, ldb, beta, pc, ldc);
                 }
             }
+            LogShape(m, n, k);
             return true;
         }
         catch { return false; }
@@ -1113,6 +1140,7 @@ internal static class BlasProvider
                         m, n, k, 1.0, pa, lda, pb, ldb, beta, pc, ldc);
                 }
             }
+            LogShape(m, n, k);
             return true;
         }
         catch { return false; }
@@ -1141,6 +1169,7 @@ internal static class BlasProvider
                         m, n, k, 1.0f, pa, lda, pb, ldb, 0.0f, pc, ldc);
                 }
             }
+            LogShape(m, n, k, transA, transB);
             return true;
         }
         catch { return false; }
@@ -1172,6 +1201,7 @@ internal static class BlasProvider
                         m, n, k, 1.0, pa, lda, pb, ldb, 0.0, pc, ldc);
                 }
             }
+            LogShape(m, n, k, transA, transB);
             return true;
         }
         catch { return false; }
@@ -1204,6 +1234,7 @@ internal static class BlasProvider
                         m, n, k, alpha, pa, lda, pb, ldb, beta, pc, ldc);
                 }
             }
+            LogShape(m, n, k, transA, transB);
             return true;
         }
         catch { return false; }
@@ -1233,6 +1264,7 @@ internal static class BlasProvider
                         m, n, k, alpha, pa, lda, pb, ldb, beta, pc, ldc);
                 }
             }
+            LogShape(m, n, k, transA, transB);
             return true;
         }
         catch { return false; }
