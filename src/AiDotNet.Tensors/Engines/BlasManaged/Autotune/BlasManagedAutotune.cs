@@ -34,13 +34,31 @@ internal static class BlasManagedAutotune
     /// <summary>
     /// Encode a BlasManaged GEMM signature into the existing cache's
     /// <see cref="ShapeProfile"/>. The int-array layout is:
-    /// <c>[M, N, K, transA, transB, precisionTag, mr, nr, hasEpilogue]</c>.
+    /// <c>[M, N, K, transA, transB, precisionTag, mr, nr, hasEpilogue, isDeterministic]</c>.
+    /// PR #402 CodeRabbit fix: <c>isDeterministic</c> is part of the key because
+    /// <c>AxisSelector.Select</c> branches on it — without this discriminator,
+    /// deterministic and non-deterministic calls reuse the same cache slot and
+    /// the wrong axis can be replayed under determinism mode.
+    /// </summary>
+    /// <summary>
+    /// Source-compat overload that defaults <c>isDeterministic</c> to false. Existing
+    /// callers (and tests) compiled before the determinism-keyed cache landed continue
+    /// to work without changes. New code SHOULD pass <c>isDeterministic</c> explicitly
+    /// to preserve the deterministic/non-deterministic cache separation.
     /// </summary>
     public static ShapeProfile EncodeShape<T>(
         int m, int n, int k,
         bool transA, bool transB,
         int mr, int nr,
         bool hasEpilogue) where T : unmanaged
+        => EncodeShape<T>(m, n, k, transA, transB, mr, nr, hasEpilogue, isDeterministic: false);
+
+    public static ShapeProfile EncodeShape<T>(
+        int m, int n, int k,
+        bool transA, bool transB,
+        int mr, int nr,
+        bool hasEpilogue,
+        bool isDeterministic) where T : unmanaged
     {
         int precisionTag;
         if (typeof(T) == typeof(double)) precisionTag = PrecisionTagFp64;
@@ -53,7 +71,8 @@ internal static class BlasManagedAutotune
             transB ? 1 : 0,
             precisionTag,
             mr, nr,
-            hasEpilogue ? 1 : 0);
+            hasEpilogue ? 1 : 0,
+            isDeterministic ? 1 : 0);
     }
 
     /// <summary>
@@ -89,6 +108,15 @@ internal static class BlasManagedAutotune
     public static (ParallelismAxis Axis, int Mc, int Nc, int Kc, int ThreadCount) DecodeChoice(KernelChoice choice)
     {
         if (choice is null) throw new ArgumentNullException(nameof(choice));
+        // PR #402 CodeRabbit fix: harden against malformed / older on-disk
+        // entries where Parameters may be null or contain non-positive
+        // blocking values that would destabilize the strategy pipeline if
+        // honored. On any defect, fall back to the safe (M-axis, 64×64×64,
+        // single-thread) default that matches FallbackToHeuristic.
+        if (choice.Parameters is null)
+        {
+            return (ParallelismAxis.M, 64, 64, 64, 1);
+        }
 
         ParallelismAxis axis = ParallelismAxis.M;
         if (choice.Parameters.TryGetValue("axis", out string? axisStr)
@@ -97,10 +125,12 @@ internal static class BlasManagedAutotune
             axis = parsed;
         }
 
-        int mc = ParseIntOrDefault(choice.Parameters, "mc", 64);
-        int nc = ParseIntOrDefault(choice.Parameters, "nc", 64);
-        int kc = ParseIntOrDefault(choice.Parameters, "kc", 64);
+        int mc = ParsePositiveIntOrDefault(choice.Parameters, "mc", 64);
+        int nc = ParsePositiveIntOrDefault(choice.Parameters, "nc", 64);
+        int kc = ParsePositiveIntOrDefault(choice.Parameters, "kc", 64);
+        // threadCount: 0 is a sentinel for "auto" (procs at run time); allow it.
         int threadCount = ParseIntOrDefault(choice.Parameters, "threadCount", 0);
+        if (threadCount < 0) threadCount = 0;
 
         return (axis, mc, nc, kc, threadCount);
     }
@@ -114,6 +144,16 @@ internal static class BlasManagedAutotune
             return result;
         }
         return defaultValue;
+    }
+
+    // PR #402 CodeRabbit fix: reject zero / negative blocking-parameter
+    // values from on-disk cache entries so the strategy pipeline isn't
+    // handed an invalid mc/nc/kc that would divide-by-zero in the inner
+    // tile loops or allocate a zero-byte packed buffer.
+    private static int ParsePositiveIntOrDefault(IDictionary<string, string> dict, string key, int defaultValue)
+    {
+        int parsed = ParseIntOrDefault(dict, key, defaultValue);
+        return parsed > 0 ? parsed : defaultValue;
     }
 
     /// <summary>

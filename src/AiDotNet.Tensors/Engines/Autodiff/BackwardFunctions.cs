@@ -440,6 +440,20 @@ internal static class BackwardFunctions<T>
         if (gradOutput._shape[0] != M || gradOutput._shape[1] != N)
             throw new ArgumentException($"gradOutput shape [{gradOutput._shape[0]},{gradOutput._shape[1]}] doesn't match [M={M}, N={N}].");
 
+        // PR #402 CodeRabbit fix: tape-aware gate. The BLAS fast path below
+        // dispatches BlasManaged.Gemm directly, bypassing engine ops — the
+        // gradA matmul is invisible to the outer tape, so higher-order AD
+        // (`createGraph=true`, HVP) silently loses the inner gradient edge.
+        // When a tape is recording we fall back to the engine-driven matmul
+        // so the inner op gets recorded onto the outer tape; the BLAS path
+        // is reserved for the no-tape inference / first-order training case
+        // where the silent recording bypass is observationally equivalent.
+        if (GradientTape<T>.Current is not null)
+        {
+            var engine = AiDotNetEngine.Current;
+            return engine.TensorMatMul<T>(gradOutput, bTransposed);
+        }
+
         var gradA = AutoTensorCache.RentOrAllocate<T>(new[] { M, K });
 
         if (typeof(T) == typeof(float))

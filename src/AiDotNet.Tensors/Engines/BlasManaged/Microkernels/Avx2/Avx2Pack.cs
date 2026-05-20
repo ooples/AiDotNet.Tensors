@@ -61,8 +61,14 @@ internal static class Avx2Pack
         if (!IsSupported)
             throw new PlatformNotSupportedException("Avx2Pack requires AVX2.");
 
-        // transA=false: full 4×4 transpose optimization deferred — delegate to scalar.
-        if (!transA || mr != 4)
+        // Fall back to scalar when:
+        // - transA is false (full 4×4 transpose optimization deferred), OR
+        // - mr != 4 (this SIMD path is mr=4 specific), OR
+        // - mc has a partial mr stripe (mc % mr != 0). Pre-fix, the SIMD path
+        //   truncated to (mc / mr) full stripes and silently dropped the bottom
+        //   (mc % mr) rows from the packed buffer; ScalarPack.PackA handles
+        //   the tail correctly. PR #402 CodeRabbit critical fix.
+        if (!transA || mr != 4 || (mc % mr) != 0)
         {
             ScalarPack.PackA<double>(a, lda, transA, packed, mc, kc, mr);
             return;
@@ -119,8 +125,14 @@ internal static class Avx2Pack
         if (!IsSupported)
             throw new PlatformNotSupportedException("Avx2Pack requires AVX2.");
 
-        // transA=false or mr != 8: delegate to scalar.
-        if (!transA || mr != 8)
+        // Fall back to scalar when:
+        // - transA is false, OR
+        // - mr != 8 (this SIMD path is mr=8 FP32 specific), OR
+        // - mc has a partial mr stripe (mc % mr != 0). Same partial-stripe
+        //   corruption as the FP64 path above — pre-fix, the SIMD path
+        //   silently truncated the bottom (mc % mr) rows. PR #402 CodeRabbit
+        //   critical fix.
+        if (!transA || mr != 8 || (mc % mr) != 0)
         {
             ScalarPack.PackA<float>(a, lda, transA, packed, mc, kc, mr);
             return;

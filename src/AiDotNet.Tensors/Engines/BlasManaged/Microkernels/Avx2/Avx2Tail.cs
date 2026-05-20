@@ -90,17 +90,24 @@ internal static class Avx2Tail
 
         fixed (double* cPtr = c)
         {
-            // Read initial C tile — masked load isn't strictly needed since we'll
-            // mask the store, but reading partial tile via unmasked load is safe
-            // because the strategy allocates the full Nr-wide row.
-            Vector256<double> acc0_lo = Avx.LoadVector256(cPtr + 0 * ldc + 0);
-            Vector256<double> acc0_hi = hiCount > 0 ? Avx.LoadVector256(cPtr + 0 * ldc + 4) : Vector256<double>.Zero;
-            Vector256<double> acc1_lo = Avx.LoadVector256(cPtr + 1 * ldc + 0);
-            Vector256<double> acc1_hi = hiCount > 0 ? Avx.LoadVector256(cPtr + 1 * ldc + 4) : Vector256<double>.Zero;
-            Vector256<double> acc2_lo = Avx.LoadVector256(cPtr + 2 * ldc + 0);
-            Vector256<double> acc2_hi = hiCount > 0 ? Avx.LoadVector256(cPtr + 2 * ldc + 4) : Vector256<double>.Zero;
-            Vector256<double> acc3_lo = Avx.LoadVector256(cPtr + 3 * ldc + 0);
-            Vector256<double> acc3_hi = hiCount > 0 ? Avx.LoadVector256(cPtr + 3 * ldc + 4) : Vector256<double>.Zero;
+            // Initial accumulator load — use MaskLoad so inactive lanes read zero
+            // instead of reading past the live columns. Pre-fix this used unmasked
+            // LoadVector256 which always read 4 doubles even when loCount < 4 (and
+            // similarly for the hi half), crossing past the end of the row's live
+            // columns and potentially into the next row's memory or off the end of
+            // the c buffer entirely on the final N tile. The MaskStore at the end
+            // already ignores inactive lanes, so zero-initializing them via
+            // MaskLoad is correctness-equivalent (the FMA into the masked-off lanes
+            // produces values that never get stored). PR #402 CodeRabbit critical
+            // fix (memory safety).
+            Vector256<double> acc0_lo = Avx2.MaskLoad((long*)(cPtr + 0 * ldc + 0), maskLo).AsDouble();
+            Vector256<double> acc0_hi = hiCount > 0 ? Avx2.MaskLoad((long*)(cPtr + 0 * ldc + 4), maskHi).AsDouble() : Vector256<double>.Zero;
+            Vector256<double> acc1_lo = Avx2.MaskLoad((long*)(cPtr + 1 * ldc + 0), maskLo).AsDouble();
+            Vector256<double> acc1_hi = hiCount > 0 ? Avx2.MaskLoad((long*)(cPtr + 1 * ldc + 4), maskHi).AsDouble() : Vector256<double>.Zero;
+            Vector256<double> acc2_lo = Avx2.MaskLoad((long*)(cPtr + 2 * ldc + 0), maskLo).AsDouble();
+            Vector256<double> acc2_hi = hiCount > 0 ? Avx2.MaskLoad((long*)(cPtr + 2 * ldc + 4), maskHi).AsDouble() : Vector256<double>.Zero;
+            Vector256<double> acc3_lo = Avx2.MaskLoad((long*)(cPtr + 3 * ldc + 0), maskLo).AsDouble();
+            Vector256<double> acc3_hi = hiCount > 0 ? Avx2.MaskLoad((long*)(cPtr + 3 * ldc + 4), maskHi).AsDouble() : Vector256<double>.Zero;
 
             fixed (double* aPtr = packedA)
             fixed (double* bPtr = packedB)
@@ -174,14 +181,19 @@ internal static class Avx2Tail
 
         fixed (float* cPtr = c)
         {
-            Vector256<float> acc0 = Avx.LoadVector256(cPtr + 0 * ldc);
-            Vector256<float> acc1 = Avx.LoadVector256(cPtr + 1 * ldc);
-            Vector256<float> acc2 = Avx.LoadVector256(cPtr + 2 * ldc);
-            Vector256<float> acc3 = Avx.LoadVector256(cPtr + 3 * ldc);
-            Vector256<float> acc4 = Avx.LoadVector256(cPtr + 4 * ldc);
-            Vector256<float> acc5 = Avx.LoadVector256(cPtr + 5 * ldc);
-            Vector256<float> acc6 = Avx.LoadVector256(cPtr + 6 * ldc);
-            Vector256<float> acc7 = Avx.LoadVector256(cPtr + 7 * ldc);
+            // Same memory-safety fix as the FP64 path above: use MaskLoad so
+            // inactive lanes read zero instead of reading 8 floats past the
+            // live `effectiveNr` columns. The MaskStore at the end ignores
+            // inactive lanes so zero-initializing them is equivalent. PR #402
+            // CodeRabbit critical fix.
+            Vector256<float> acc0 = Avx2.MaskLoad((int*)(cPtr + 0 * ldc), mask).AsSingle();
+            Vector256<float> acc1 = Avx2.MaskLoad((int*)(cPtr + 1 * ldc), mask).AsSingle();
+            Vector256<float> acc2 = Avx2.MaskLoad((int*)(cPtr + 2 * ldc), mask).AsSingle();
+            Vector256<float> acc3 = Avx2.MaskLoad((int*)(cPtr + 3 * ldc), mask).AsSingle();
+            Vector256<float> acc4 = Avx2.MaskLoad((int*)(cPtr + 4 * ldc), mask).AsSingle();
+            Vector256<float> acc5 = Avx2.MaskLoad((int*)(cPtr + 5 * ldc), mask).AsSingle();
+            Vector256<float> acc6 = Avx2.MaskLoad((int*)(cPtr + 6 * ldc), mask).AsSingle();
+            Vector256<float> acc7 = Avx2.MaskLoad((int*)(cPtr + 7 * ldc), mask).AsSingle();
 
             fixed (float* aPtr = packedA)
             fixed (float* bPtr = packedB)

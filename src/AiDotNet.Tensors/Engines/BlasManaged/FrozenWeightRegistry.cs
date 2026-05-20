@@ -34,6 +34,16 @@ public static class FrozenWeightRegistry
     private static readonly ConditionalWeakTable<Tensor<double>, WeightPackHandle> _doubleTable
         = new ConditionalWeakTable<Tensor<double>, WeightPackHandle>();
 
+    // PR #402 CodeRabbit fix: per-table write lock so the Register
+    // "overwrite" sequence (Remove + Add) is atomic. CWT itself is thread-safe
+    // for individual operations but Remove+Add is NOT atomic — two threads
+    // racing on the same tensor can both remove, then both Add, with the
+    // second Add throwing ArgumentException("key already exists"). Read paths
+    // (TryGetValue in TryGetHandle / Unregister) intentionally stay lock-free
+    // because CWT TryGetValue is fully concurrent-safe.
+    private static readonly object _floatTableLock = new object();
+    private static readonly object _doubleTableLock = new object();
+
     /// <summary>
     /// Register <paramref name="weight"/> as a frozen weight matrix and pre-pack
     /// it into a multi-panel <see cref="WeightPackHandle"/>. Subsequent
@@ -60,9 +70,15 @@ public static class FrozenWeightRegistry
             var data = (float[])(object)weight.GetDataArray();
             var handle = BlasManaged.PrePackB<float>(data, n, transB: false, k: k, n: n);
             var floatWeight = (Tensor<float>)(object)weight;
-            // CWT.AddOrUpdate is .NET 6+; for compat AddBefore pattern:
-            _floatTable.Remove(floatWeight);
-            _floatTable.Add(floatWeight, handle);
+            // CWT.AddOrUpdate is .NET 6+; for compat AddBefore pattern.
+            // PR #402 CodeRabbit fix: lock around Remove+Add so concurrent
+            // Register<float> calls on the same tensor can't interleave and
+            // produce a double-Add that throws ArgumentException.
+            lock (_floatTableLock)
+            {
+                _floatTable.Remove(floatWeight);
+                _floatTable.Add(floatWeight, handle);
+            }
             return;
         }
         if (typeof(T) == typeof(double))
@@ -70,8 +86,11 @@ public static class FrozenWeightRegistry
             var data = (double[])(object)weight.GetDataArray();
             var handle = BlasManaged.PrePackB<double>(data, n, transB: false, k: k, n: n);
             var doubleWeight = (Tensor<double>)(object)weight;
-            _doubleTable.Remove(doubleWeight);
-            _doubleTable.Add(doubleWeight, handle);
+            lock (_doubleTableLock)
+            {
+                _doubleTable.Remove(doubleWeight);
+                _doubleTable.Add(doubleWeight, handle);
+            }
             return;
         }
 

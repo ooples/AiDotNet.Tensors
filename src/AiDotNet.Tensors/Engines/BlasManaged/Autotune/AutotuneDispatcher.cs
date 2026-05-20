@@ -48,7 +48,7 @@ internal static class AutotuneDispatcher
             return FallbackToHeuristic(m, n, k, mr, nr, procs, isDeterministic);
         }
 
-        var shape = BlasManagedAutotune.EncodeShape<T>(m, n, k, transA, transB, mr, nr, hasEpilogue);
+        var shape = BlasManagedAutotune.EncodeShape<T>(m, n, k, transA, transB, mr, nr, hasEpilogue, isDeterministic);
 
         // Cache hit?
         var cached = BlasManagedAutotune.TryLookup(shape);

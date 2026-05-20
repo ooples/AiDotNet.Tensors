@@ -184,7 +184,15 @@ public static class BlasManaged
         // get an inner options with Epilogue stripped to avoid double-application.
         int splitMAligned = m - (m % mr);
         int splitNAligned = n - (n % nr);
-        int splitProcs = options.NumThreads > 0 ? options.NumThreads : System.Environment.ProcessorCount;
+        // Honor NumThreads = -1 as explicit single-thread (deterministic mode).
+        // Pre-fix: -1 fell into the "> 0 is false" branch and used all processors,
+        // breaking determinism/perf expectations. PR #402 CodeRabbit fix.
+        int splitProcs = options.NumThreads switch
+        {
+            -1 => 1,
+            > 0 => options.NumThreads,
+            _ => System.Environment.ProcessorCount,
+        };
         if (m >= mr && n >= nr && (m % mr != 0 || n % nr != 0)
             && splitMAligned >= splitProcs * mr)
         {
@@ -280,7 +288,13 @@ public static class BlasManaged
         bool hasEpilogue = options.Epilogue.Activation != AiDotNet.Tensors.Engines.FusedActivationType.None
             || !options.Epilogue.BiasN.IsEmpty
             || !options.Epilogue.SkipMxN.IsEmpty;
-        int procs = options.NumThreads > 0 ? options.NumThreads : Environment.ProcessorCount;
+        // Honor NumThreads = -1 as explicit single-thread (matches splitProcs above).
+        int procs = options.NumThreads switch
+        {
+            -1 => 1,
+            > 0 => options.NumThreads,
+            _ => Environment.ProcessorCount,
+        };
         var (_, autotuneMc, autotuneNc, autotuneKc, _) =
             AutotuneDispatcher.Decide<T>(
                 m, n, k,
@@ -384,7 +398,11 @@ public static class BlasManaged
                             PackAOnlyStrategy.Run<T>(a, lda, transA, b, ldb, c, ldc, m, n, k, mcFromAutotune, kcFromAutotune, 4, 4, options);
                             break;
                         case PackingMode.ForceStreaming:
-                            StreamingStrategy.Run<T>(a, lda, transA, b, ldb, transB, c, ldc, m, n, k);
+                            // PR #402 CodeRabbit fix: pass caller options through so
+                            // NumThreads / Mode / Epilogue stays honored on this fallback
+                            // path. Pre-fix this used the parameterless overload which
+                            // silently dropped all caller-provided execution settings.
+                            StreamingStrategy.Run<T>(a, lda, transA, b, ldb, transB, c, ldc, m, n, k, in options);
                             break;
                     }
                 }
@@ -450,8 +468,21 @@ public static class BlasManaged
         int numIcBlocks = (m + mc - 1) / mc;
         int numPcBlocks = (k + kc - 1) / kc;
         int elemSize = Marshal.SizeOf<T>();
-        int tileBytes = mc * kc * elemSize;
-        int packedBytes = numIcBlocks * numPcBlocks * tileBytes;
+        // PR #402 CodeRabbit fix: guard against int overflow on large shapes.
+        // mc * kc * elemSize alone can hit ~32 MB for double/64×64; multiplied
+        // by numIcBlocks × numPcBlocks for a 100k×100k pre-pack the product
+        // overflows int.MaxValue silently and produces an invalid alloc size.
+        long tileBytes64 = (long)mc * kc * elemSize;
+        long packedBytes64 = (long)numIcBlocks * numPcBlocks * tileBytes64;
+        if (tileBytes64 <= 0 || tileBytes64 > int.MaxValue
+            || packedBytes64 <= 0 || packedBytes64 > int.MaxValue)
+        {
+            throw new ArgumentOutOfRangeException(nameof(k),
+                $"Packed buffer size ({packedBytes64} bytes) exceeds supported limits " +
+                $"for m={m} k={k} mc={mc} kc={kc} elemSize={elemSize}.");
+        }
+        int tileBytes = (int)tileBytes64;
+        int packedBytes = (int)packedBytes64;
 
         var key = (mc, kc, transA, options.PackingMode, typeof(T));
         var handle = WeightPackCache.Allocate(packedBytes, key, isForA: true);
@@ -542,8 +573,18 @@ public static class BlasManaged
         int numJcBlocks = (n + nc - 1) / nc;
         int numPcBlocks = (k + kc - 1) / kc;
         int elemSize = Marshal.SizeOf<T>();
-        int tileBytes = kc * nc * elemSize;
-        int packedBytes = numJcBlocks * numPcBlocks * tileBytes;
+        // PR #402 CodeRabbit fix: same int-overflow guard as PrePackA.
+        long tileBytes64 = (long)kc * nc * elemSize;
+        long packedBytes64 = (long)numJcBlocks * numPcBlocks * tileBytes64;
+        if (tileBytes64 <= 0 || tileBytes64 > int.MaxValue
+            || packedBytes64 <= 0 || packedBytes64 > int.MaxValue)
+        {
+            throw new ArgumentOutOfRangeException(nameof(n),
+                $"Packed buffer size ({packedBytes64} bytes) exceeds supported limits " +
+                $"for k={k} n={n} kc={kc} nc={nc} elemSize={elemSize}.");
+        }
+        int tileBytes = (int)tileBytes64;
+        int packedBytes = (int)packedBytes64;
 
         var key = (nc, kc, transB, options.PackingMode, typeof(T));
         var handle = WeightPackCache.Allocate(packedBytes, key, isForA: false);

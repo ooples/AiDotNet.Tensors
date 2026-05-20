@@ -277,15 +277,24 @@ public static class PrefersManagedCache
                 m, n, k);
 
             BypassAutotune = true;
+            // PR #402 CodeRabbit fix: bail to "prefer managed" when the native
+            // probe fails. Pre-fix the return values from TryGemmEx were
+            // ignored, so when native execution failed (missing libopenblas,
+            // unsupported shape, etc.) the timed loop completed in ~0 ms and
+            // the cache was poisoned with "native is faster" routing — but no
+            // native call ever succeeded, so subsequent calls would also fail
+            // silently or worse, produce garbage output.
+            bool nativeOk;
             try
             {
-                BlasProvider.TryGemmEx(
+                nativeOk = BlasProvider.TryGemmEx(
                     m, n, k,
                     a, 0, lda, transA,
                     b, 0, ldb, transB,
                     c, 0, ldc);
             }
             finally { BypassAutotune = false; }
+            if (!nativeOk) return true;
 
             // Time managed.
             var sw = Stopwatch.StartNew();
@@ -308,11 +317,16 @@ public static class PrefersManagedCache
                 sw.Restart();
                 for (int i = 0; i < ProbeIters; i++)
                 {
-                    BlasProvider.TryGemmEx(
+                    if (!BlasProvider.TryGemmEx(
                         m, n, k,
                         a, 0, lda, transA,
                         b, 0, ldb, transB,
-                        c, 0, ldc);
+                        c, 0, ldc))
+                    {
+                        // Native started failing mid-loop — abandon the probe
+                        // and prefer managed. The partial timing isn't trustworthy.
+                        return true;
+                    }
                 }
                 sw.Stop();
                 nativeMs = sw.Elapsed.TotalMilliseconds / ProbeIters;
@@ -356,16 +370,21 @@ public static class PrefersManagedCache
                 new Span<double>(c, 0, cLen), ldc,
                 m, n, k);
 
+            // PR #402 CodeRabbit fix: same native-probe-failure guard as the
+            // FP32 path above. Bail to "prefer managed" if the warmup or any
+            // timed iteration of the native probe reports failure.
             BypassAutotune = true;
+            bool nativeOk;
             try
             {
-                BlasProvider.TryGemmEx(
+                nativeOk = BlasProvider.TryGemmEx(
                     m, n, k,
                     a, 0, lda, transA,
                     b, 0, ldb, transB,
                     c, 0, ldc);
             }
             finally { BypassAutotune = false; }
+            if (!nativeOk) return true;
 
             var sw = Stopwatch.StartNew();
             for (int i = 0; i < ProbeIters; i++)
@@ -386,11 +405,14 @@ public static class PrefersManagedCache
                 sw.Restart();
                 for (int i = 0; i < ProbeIters; i++)
                 {
-                    BlasProvider.TryGemmEx(
+                    if (!BlasProvider.TryGemmEx(
                         m, n, k,
                         a, 0, lda, transA,
                         b, 0, ldb, transB,
-                        c, 0, ldc);
+                        c, 0, ldc))
+                    {
+                        return true;
+                    }
                 }
                 sw.Stop();
                 nativeMs = sw.Elapsed.TotalMilliseconds / ProbeIters;

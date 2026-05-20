@@ -32,7 +32,7 @@ internal static class ArrayPoolOverflow
     /// <param name="bytes">Byte count requested. Must be &gt;= 0; 0 or negative returns an empty rent.</param>
     public static ArrayPoolByteRent Rent(int bytes)
     {
-        if (bytes <= 0) return default;
+        if (bytes <= 0) return ArrayPoolByteRent.Empty;
         var buffer = ArrayPool<byte>.Shared.Rent(bytes);
         return new ArrayPoolByteRent(buffer, bytes);
     }
@@ -44,13 +44,29 @@ internal static class ArrayPoolOverflow
 /// Implements <see cref="IDisposable"/> so it can be used with <c>using</c>
 /// statements and <c>using var</c> declarations (C# 8+).
 /// The <see cref="Dispose"/> method is idempotent — safe to call more than once.
+///
+/// <para>PR #402 CodeRabbit fix: changed from mutable struct to sealed class.
+/// As a struct the type could be silently copied (parameter pass-by-value,
+/// foreach iteration variables, local assignment) — each copy carried the same
+/// reference to <c>_buffer</c>, and each <see cref="Dispose"/> call attempted
+/// to return the array to the pool, producing a double-return that corrupts
+/// the shared <see cref="ArrayPool{T}"/>. Reference semantics enforce
+/// single-ownership: copies share a reference to the one instance, so the
+/// idempotent dispose check at the bottom of <see cref="Dispose"/> serializes
+/// correctly across all aliases.</para>
 /// </summary>
-internal struct ArrayPoolByteRent : IDisposable
+internal sealed class ArrayPoolByteRent : IDisposable
 {
+    /// <summary>Shared empty rent returned by <see cref="ArrayPoolOverflow.Rent"/> for
+    /// zero/negative byte requests. Safe to dispose multiple times because the buffer
+    /// is already null. Replaces the old <c>default(ArrayPoolByteRent)</c> sentinel
+    /// (struct era) that became a null-reference under the class refactor.</summary>
+    internal static readonly ArrayPoolByteRent Empty = new ArrayPoolByteRent(null, 0);
+
     private byte[]? _buffer;
     private readonly int _length;
 
-    internal ArrayPoolByteRent(byte[] buffer, int length)
+    internal ArrayPoolByteRent(byte[]? buffer, int length)
     {
         _buffer = buffer;
         _length = length;

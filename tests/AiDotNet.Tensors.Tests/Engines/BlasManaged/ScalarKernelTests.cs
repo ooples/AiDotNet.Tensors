@@ -2761,6 +2761,10 @@ public class ScalarKernelTests
     [Fact]
     public void BlasManagedAutotune_EncodeShape_RoundTrips()
     {
+        // PR #402 CodeRabbit fix added a 10th dim (isDeterministic) to the
+        // shape key so deterministic and non-deterministic calls don't share
+        // autotune slots. Source-compat overload defaults isDeterministic=false
+        // so existing callers without the new arg encode dims[9]=0.
         var shape = BlasManagedAutotune.EncodeShape<double>(
             m: 4096, n: 16, k: 512,
             transA: true, transB: false,
@@ -2768,7 +2772,7 @@ public class ScalarKernelTests
             hasEpilogue: false);
 
         var dims = shape.Dimensions;
-        Assert.Equal(9, dims.Length);
+        Assert.Equal(10, dims.Length);
         Assert.Equal(4096, dims[0]);
         Assert.Equal(16, dims[1]);
         Assert.Equal(512, dims[2]);
@@ -2778,6 +2782,28 @@ public class ScalarKernelTests
         Assert.Equal(8, dims[6]);
         Assert.Equal(16, dims[7]);
         Assert.Equal(0, dims[8]);  // hasEpilogue = false
+        Assert.Equal(0, dims[9]);  // isDeterministic = false (compat default)
+    }
+
+    [Fact]
+    public void BlasManagedAutotune_EncodeShape_IsDeterministicDiscriminator()
+    {
+        // PR #402 CodeRabbit fix: deterministic and non-deterministic calls
+        // with identical m/n/k/transA/transB/mr/nr/hasEpilogue must produce
+        // DIFFERENT ShapeProfile keys so they don't share a cached axis choice
+        // (AxisSelector.Select branches on isDeterministic).
+        var nonDet = BlasManagedAutotune.EncodeShape<float>(
+            m: 64, n: 64, k: 64,
+            transA: false, transB: false, mr: 8, nr: 8,
+            hasEpilogue: false, isDeterministic: false);
+        var det = BlasManagedAutotune.EncodeShape<float>(
+            m: 64, n: 64, k: 64,
+            transA: false, transB: false, mr: 8, nr: 8,
+            hasEpilogue: false, isDeterministic: true);
+
+        Assert.Equal(0, nonDet.Dimensions[9]);
+        Assert.Equal(1, det.Dimensions[9]);
+        Assert.NotEqual(nonDet, det);
     }
 
     [Fact]
