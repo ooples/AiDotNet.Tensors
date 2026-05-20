@@ -986,6 +986,7 @@ kernel void bilinear_upsample2d(
 }
 
 // Scatter Mean (accumulate)
+// NON-DETERMINISTIC across runs (issue #382); see scatter_mean_deterministic below.
 kernel void scatter_mean(
     device const float* source [[buffer(0)]],
     device const int* indices [[buffer(1)]],
@@ -1001,6 +1002,36 @@ kernel void scatter_mean(
         atomic_fetch_add_explicit(&output[targetRow * featureSize + col], source[gid], memory_order_relaxed);
         if (col == 0) atomic_fetch_add_explicit(&counts[targetRow], 1, memory_order_relaxed);
     }
+}
+
+// scatter_mean — bit-deterministic variant (issue #382).
+// Parallelize per (dstRow, col) output cell; scan source rows in fixed
+// ascending order; no atomics.
+kernel void scatter_mean_deterministic(
+    device const float* source [[buffer(0)]],
+    device const int* indices [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    device int* counts [[buffer(3)]],
+    constant uint& sourceSize [[buffer(4)]],
+    constant uint& outputSize [[buffer(5)]],
+    constant uint& featureSize [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint dstRow = gid.y;
+    uint col = gid.x;
+    if (dstRow >= outputSize || col >= featureSize) return;
+
+    uint numSrcRows = sourceSize / featureSize;
+    float sum = 0.0f;
+    int cnt = 0;
+    for (uint srcRow = 0u; srcRow < numSrcRows; srcRow++) {
+        if (uint(indices[srcRow]) == dstRow) {
+            sum += source[srcRow * featureSize + col];
+            if (col == 0u) cnt++;
+        }
+    }
+    output[dstRow * featureSize + col] = sum;
+    if (col == 0u) counts[dstRow] = cnt;
 }
 
 // Scatter Mean Divide

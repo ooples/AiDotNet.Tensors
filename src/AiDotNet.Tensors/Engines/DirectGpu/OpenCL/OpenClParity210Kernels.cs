@@ -14,7 +14,7 @@ public static class OpenClParity210Kernels
         "parity210_diag_embed",
         "parity210_cumsum_axis","parity210_cumprod_axis","parity210_cummax_axis",
         "parity210_cummin_axis","parity210_logcumsumexp_axis",
-        "parity210_take_linear","parity210_take_along_dim","parity210_index_add",
+        "parity210_take_linear","parity210_take_along_dim","parity210_index_add","parity210_index_add_deterministic",
         "parity210_index_copy","parity210_index_fill","parity210_masked_scatter",
         "parity210_hypot","parity210_copysign","parity210_fmod","parity210_remainder",
         "parity210_float_power","parity210_log_add_exp","parity210_log_add_exp2",
@@ -268,6 +268,7 @@ inline void p210_atomic_add(__global volatile float* addr, float val) {
     } while (atomic_cmpxchg((__global volatile unsigned int*)addr, old_u.i, new_u.i) != old_u.i);
 }
 
+// NON-DETERMINISTIC (issue #382); see parity210_index_add_deterministic.
 __kernel void parity210_index_add(
     __global volatile float* output, __global const int* indices,
     __global const float* source,
@@ -285,6 +286,32 @@ __kernel void parity210_index_add(
     int dstPos = (outer * dstAxis + target) * innerSize + inner;
     int srcPos = (outer * idxLen + i) * innerSize + inner;
     p210_atomic_add(&output[dstPos], source[srcPos]);
+}
+
+// bit-deterministic variant (issue #382): one work-item per (outer, dstTarget, inner)
+// output cell scans idxLen in fixed ascending order.
+__kernel void parity210_index_add_deterministic(
+    __global float* output, __global const int* indices,
+    __global const float* source,
+    const int outerSize, const int dstAxis, const int innerSize, const int idxLen)
+{
+    int gid = get_global_id(0);
+    int total = outerSize * dstAxis * innerSize;
+    if (gid >= total) return;
+    int inner = gid % innerSize;
+    int tmp = gid / innerSize;
+    int dstTarget = tmp % dstAxis;
+    int outer = tmp / dstAxis;
+
+    float sum = 0.0f;
+    for (int i = 0; i < idxLen; i++) {
+        if (p210_pmod(indices[i], dstAxis) == dstTarget) {
+            int srcPos = (outer * idxLen + i) * innerSize + inner;
+            sum += source[srcPos];
+        }
+    }
+    int dstPos = (outer * dstAxis + dstTarget) * innerSize + inner;
+    output[dstPos] += sum;
 }
 
 __kernel void parity210_index_copy(

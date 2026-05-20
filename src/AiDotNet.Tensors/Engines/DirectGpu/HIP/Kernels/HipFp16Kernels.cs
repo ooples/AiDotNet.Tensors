@@ -312,7 +312,35 @@ extern ""C"" __global__ __launch_bounds__(256) void fp16_reduce_sum(
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1)
         val += __shfl_down_sync(warp_mask, val, offset);
+    // NON-DETERMINISTIC (issue #382); see fp16_reduce_sum_deterministic.
     if (tid == 0) atomicAdd(&output[0], val);
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void fp16_reduce_sum_deterministic(
+    const unsigned short* __restrict__ input, float* __restrict__ output, int size)
+{
+    extern __shared__ float scratch_d[];
+    unsigned int tid = threadIdx.x;
+    float val = 0.0f;
+    for (unsigned int i = tid; i < (unsigned int)size; i += blockDim.x) {
+        __half h = *reinterpret_cast<const __half*>(&input[i]);
+        val += __half2float(h);
+    }
+    unsigned int mask = 0xFFFFFFFF;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        val += __shfl_down_sync(mask, val, offset);
+    unsigned int lane = tid & 31;
+    unsigned int warpId = tid >> 5;
+    if (lane == 0) scratch_d[warpId] = val;
+    __syncthreads();
+    unsigned int numWarps = (blockDim.x + 31) >> 5;
+    val = (tid < numWarps) ? scratch_d[tid] : 0.0f;
+    unsigned int warp_mask = (numWarps >= 32) ? 0xFFFFFFFF : ((1u << numWarps) - 1);
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        val += __shfl_down_sync(warp_mask, val, offset);
+    if (tid == 0) *output = val;
 }
 
 // ============================================================================
@@ -404,6 +432,7 @@ extern ""C"" __global__ __launch_bounds__(256) void fp16_softmax(
             "fp16_gelu",
             "fp16_swish",
             "fp16_reduce_sum",
+            "fp16_reduce_sum_deterministic",
             "fp16_softmax"
         };
     }

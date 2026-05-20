@@ -305,6 +305,7 @@ kernel void parity210_take_along_dim(
     output[gid] = input[srcIdx];
 }
 
+// NON-DETERMINISTIC (issue #382); see parity210_index_add_deterministic below.
 kernel void parity210_index_add(
     device atomic_float* output [[buffer(0)]],
     device const int* indices [[buffer(1)]],
@@ -327,6 +328,38 @@ kernel void parity210_index_add(
     int dstPos = (outer * dstAxis + target) * innerSize + inner;
     int srcPos = (outer * idxLen + i) * innerSize + inner;
     atomic_fetch_add_explicit(&output[dstPos], source[srcPos], memory_order_relaxed);
+}
+
+// parity210_index_add — bit-deterministic variant (issue #382).
+// One thread per (outer, dstTarget, inner) output cell scans idxLen in fixed order.
+kernel void parity210_index_add_deterministic(
+    device float* output [[buffer(0)]],
+    device const int* indices [[buffer(1)]],
+    device const float* source [[buffer(2)]],
+    constant int& outerSize [[buffer(3)]],
+    constant int& dstAxis [[buffer(4)]],
+    constant int& innerSize [[buffer(5)]],
+    constant int& idxLen [[buffer(6)]],
+    uint gid [[thread_position_in_grid]])
+{
+    int total = outerSize * dstAxis * innerSize;
+    if ((int)gid >= total) return;
+    int inner = (int)gid % innerSize;
+    int tmp = (int)gid / innerSize;
+    int dstTarget = tmp % dstAxis;
+    int outer = tmp / dstAxis;
+
+    float sum = 0.0f;
+    for (int i = 0; i < idxLen; i++) {
+        int t = indices[i];
+        if (t < 0) t += dstAxis;
+        if (t == dstTarget) {
+            int srcPos = (outer * idxLen + i) * innerSize + inner;
+            sum += source[srcPos];
+        }
+    }
+    int dstPos = (outer * dstAxis + dstTarget) * innerSize + inner;
+    output[dstPos] += sum;
 }
 
 kernel void parity210_index_copy(

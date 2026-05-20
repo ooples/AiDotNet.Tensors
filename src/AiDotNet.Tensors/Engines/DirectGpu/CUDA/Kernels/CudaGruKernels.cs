@@ -430,6 +430,138 @@ extern ""C"" __global__ __launch_bounds__(256) void gru_cell_backward(
     atomicAdd(&dbh[h], dHCand);
 }
 
+// gru_cell_backward — bit-deterministic split (issue #382).
+// The original single-pass kernel has many overlapping atomic-add patterns
+// (dPrevH direct path + reset path, dUh, dbr, dWz/dWr/dWh, dUz/dUr, dbz/dbh).
+// Deterministic split:
+//   1. compute_gates: per (b, h) writes dZ, dHCand, dR_h, dHPrev_direct to scratch
+//      dGates_z, dGates_h, dGates_r [each batch * hidden]; also writes
+//      dPrevH[b, h] += dHPrev_direct (own cell, no atomic).
+//   2. dPrevH_reset: per (b, j) reads scratch and gates, += reset-path contribution.
+//   3. dbr: per j reads scratch, sums over (b, h).
+//   4. dUh: per (h, j) reads scratch, sums over b (with r[j] factor).
+//   5. dWz/dWr/dWh: per (h, i) reads scratch, sums over b.
+//   6. dUz/dUr: per (h, j) reads scratch, sums over b.
+//   7. dbz/dbh: per h reads scratch, sums over b.
+// Kernels 5-7 are largely subsumed by the existing
+// gru_accumulate_weight_gradients_deterministic when called with dGates layout
+// [batch, 3*hidden] = [dZ, dR, dHCand] per (b, h).
+extern ""C"" __global__ __launch_bounds__(256) void gru_cell_backward_compute_gates_deterministic(
+    const float* dH,          // [batch, hidden]
+    const float* gateZ, const float* gateR, const float* gateHCand,
+    const float* prevH,       // [batch, hidden]
+    const float* Uh,          // [hidden, hidden] (reset-gated candidate weight)
+    float* dGates,            // [batch, 3*hidden]: [dZ, dR_h, dHCand] per (b, h)
+    float* dPrevH,            // [batch, hidden] — gets DIRECT-path contribution here
+    int batch, int hiddenSize)
+{
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    int totalElements = batch * hiddenSize;
+    if (gid >= totalElements) return;
+
+    int b = gid / hiddenSize;
+    int h = gid % hiddenSize;
+
+    float z = gateZ[gid];
+    float h_cand = gateHCand[gid];
+    float h_prev_h = prevH[gid];
+    float r_h = gateR[gid];
+    float dh = dH[gid];
+
+    float dHCand = dh * z * tanh_derivative(h_cand);
+    float dZ = dh * (h_cand - h_prev_h) * sigmoid_derivative(z);
+    float dHPrev_direct = dh * (1.0f - z);
+
+    // Compute dR_h = sum_k(dHCand_k * Uh[k, h]) * prevH[b, h] * sigmoid'(r[h])
+    int bBase = b * hiddenSize;
+    float dR_h_sum = 0.0f;
+    for (int k = 0; k < hiddenSize; k++) {
+        float dHCand_k = dH[bBase + k] * gateZ[bBase + k] * tanh_derivative(gateHCand[bBase + k]);
+        dR_h_sum += dHCand_k * Uh[k * hiddenSize + h];
+    }
+    float dR_h = dR_h_sum * h_prev_h * sigmoid_derivative(r_h);
+
+    int gateBase = b * 3 * hiddenSize;
+    dGates[gateBase + h] = dZ;
+    dGates[gateBase + hiddenSize + h] = dR_h;
+    dGates[gateBase + 2 * hiddenSize + h] = dHCand;
+
+    // Direct-path contribution to dPrevH[b, h] (own cell, no atomic needed)
+    dPrevH[gid] += dHPrev_direct;
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void gru_cell_backward_dPrevH_reset_deterministic(
+    const float* dGates,      // [batch, 3*hidden]
+    const float* gateR,       // [batch, hidden]
+    const float* Uh,          // [hidden, hidden]
+    float* dPrevH,            // [batch, hidden]
+    int batch, int hiddenSize)
+{
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    int totalElements = batch * hiddenSize;
+    if (gid >= totalElements) return;
+
+    int b = gid / hiddenSize;
+    int j = gid % hiddenSize;
+
+    int gateBase = b * 3 * hiddenSize;
+    float r_j = gateR[b * hiddenSize + j];
+
+    float sum = 0.0f;
+    for (int h = 0; h < hiddenSize; h++) {
+        float dHCand_h = dGates[gateBase + 2 * hiddenSize + h];
+        sum += dHCand_h * Uh[h * hiddenSize + j] * r_j;
+    }
+    dPrevH[gid] += sum;
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void gru_cell_backward_dbr_deterministic(
+    const float* dGates,      // [batch, 3*hidden]
+    const float* gateR,       // [batch, hidden]
+    const float* prevH,       // [batch, hidden]
+    const float* Uh,          // [hidden, hidden]
+    float* dbr,               // [hidden]
+    int batch, int hiddenSize)
+{
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= hiddenSize) return;
+
+    float sum = 0.0f;
+    for (int b = 0; b < batch; b++) {
+        float r_j = gateR[b * hiddenSize + j];
+        float prevH_j = prevH[b * hiddenSize + j];
+        float sigmoid_r_j = sigmoid_derivative(r_j);
+        int gateBase = b * 3 * hiddenSize;
+        for (int h = 0; h < hiddenSize; h++) {
+            float dHCand_h = dGates[gateBase + 2 * hiddenSize + h];
+            float dR_contrib_h = dHCand_h * Uh[h * hiddenSize + j];
+            sum += dR_contrib_h * prevH_j * sigmoid_r_j;
+        }
+    }
+    dbr[j] += sum;
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void gru_cell_backward_dUh_deterministic(
+    const float* dGates,      // [batch, 3*hidden]
+    const float* gateR,       // [batch, hidden]
+    const float* prevH,       // [batch, hidden]
+    float* dUh,               // [hidden, hidden]
+    int batch, int hiddenSize)
+{
+    int h = blockIdx.x;
+    int j = blockIdx.y * blockDim.x + threadIdx.x;
+    if (h >= hiddenSize || j >= hiddenSize) return;
+
+    float sum = 0.0f;
+    for (int b = 0; b < batch; b++) {
+        float dHCand_h = dGates[b * 3 * hiddenSize + 2 * hiddenSize + h];
+        float r_j = gateR[b * hiddenSize + j];
+        float prevH_j = prevH[b * hiddenSize + j];
+        sum += dHCand_h * r_j * prevH_j;
+    }
+    dUh[h * hiddenSize + j] += sum;
+}
+
 // ===========================================================================
 // GRU BACKWARD INPUT KERNEL
 // ===========================================================================
@@ -735,6 +867,117 @@ extern ""C"" __global__ __launch_bounds__(256) void gru_backward_sequence(
     }
 }
 
+// gru_backward_sequence — bit-deterministic split (issue #382). Mirror of HIP.
+// dGates_t[T, B, 3*H] scratch buffer, layout [dZ, dR, dHCand] per (b, h).
+// The precompute pass is deferred (full deterministic precompute requires
+// host-driven per-timestep external pipeline using
+// gru_cell_backward_unified + gru_backward_prevh_unified +
+// gru_accumulate_weight_gradients_deterministic + gru_backward_input).
+// These four accumulator kernels eliminate weight/bias/input atomic sites
+// once dGates_t scratch is populated.
+
+extern ""C"" __global__ __launch_bounds__(256) void gru_backward_sequence_dWi_deterministic(
+    const float* input, const float* dGates_t,
+    float* dWz, float* dWr, float* dWh,
+    int batch, int timeSteps, int inputSize, int hiddenSize)
+{
+    int gateType = blockIdx.x / hiddenSize;
+    int h = blockIdx.x % hiddenSize;
+    int colIdx = blockIdx.y * blockDim.x + threadIdx.x;
+    if (gateType > 2 || h >= hiddenSize || colIdx >= inputSize) return;
+
+    float sum = 0.0f;
+    for (int t = 0; t < timeSteps; t++) {
+        int scratchBaseT = t * batch * 3 * hiddenSize;
+        for (int b = 0; b < batch; b++) {
+            float dGate = dGates_t[scratchBaseT + b * 3 * hiddenSize + gateType * hiddenSize + h];
+            float x_val = input[(b * timeSteps + t) * inputSize + colIdx];
+            sum += dGate * x_val;
+        }
+    }
+    if (gateType == 0) dWz[h * inputSize + colIdx] += sum;
+    else if (gateType == 1) dWr[h * inputSize + colIdx] += sum;
+    else dWh[h * inputSize + colIdx] += sum;
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void gru_backward_sequence_dUi_deterministic(
+    const float* h_states, const float* h_init, const float* gates, const float* dGates_t,
+    float* dUz, float* dUr, float* dUh,
+    int batch, int timeSteps, int hiddenSize)
+{
+    int gateType = blockIdx.x / hiddenSize;
+    int h = blockIdx.x % hiddenSize;
+    int colIdx = blockIdx.y * blockDim.x + threadIdx.x;
+    if (gateType > 2 || h >= hiddenSize || colIdx >= hiddenSize) return;
+
+    float sum = 0.0f;
+    for (int t = 0; t < timeSteps; t++) {
+        int scratchBaseT = t * batch * 3 * hiddenSize;
+        int gateBaseT = t * batch * 3 * hiddenSize;
+        for (int b = 0; b < batch; b++) {
+            float dGate = dGates_t[scratchBaseT + b * 3 * hiddenSize + gateType * hiddenSize + h];
+            float hj = (t == 0) ? h_init[b * hiddenSize + colIdx]
+                                : h_states[(t - 1) * batch * hiddenSize + b * hiddenSize + colIdx];
+            if (gateType == 2) {
+                float r_j = gates[gateBaseT + b * 3 * hiddenSize + hiddenSize + colIdx];
+                hj *= r_j;
+            }
+            sum += dGate * hj;
+        }
+    }
+    if (gateType == 0) dUz[h * hiddenSize + colIdx] += sum;
+    else if (gateType == 1) dUr[h * hiddenSize + colIdx] += sum;
+    else dUh[h * hiddenSize + colIdx] += sum;
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void gru_backward_sequence_dBias_deterministic(
+    const float* dGates_t,
+    float* dbz, float* dbr, float* dbh,
+    int batch, int timeSteps, int hiddenSize)
+{
+    int gateType = blockIdx.x / hiddenSize;
+    int h = blockIdx.x % hiddenSize;
+    if (gateType > 2 || h >= hiddenSize) return;
+
+    float sum = 0.0f;
+    for (int t = 0; t < timeSteps; t++) {
+        int scratchBaseT = t * batch * 3 * hiddenSize;
+        for (int b = 0; b < batch; b++) {
+            sum += dGates_t[scratchBaseT + b * 3 * hiddenSize + gateType * hiddenSize + h];
+        }
+    }
+    if (gateType == 0) dbz[h] += sum;
+    else if (gateType == 1) dbr[h] += sum;
+    else dbh[h] += sum;
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void gru_backward_sequence_dInput_deterministic(
+    const float* dGates_t,
+    const float* Wz, const float* Wr, const float* Wh,
+    float* gradInput,
+    int batch, int timeSteps, int inputSize, int hiddenSize)
+{
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    int totalElements = batch * timeSteps * inputSize;
+    if (gid >= totalElements) return;
+    int i = gid % inputSize;
+    int tmp = gid / inputSize;
+    int t = tmp % timeSteps;
+    int b = tmp / timeSteps;
+
+    int scratchBase = t * batch * 3 * hiddenSize + b * 3 * hiddenSize;
+    float grad = 0.0f;
+    for (int h = 0; h < hiddenSize; h++) {
+        float dZ = dGates_t[scratchBase + h];
+        float dR = dGates_t[scratchBase + hiddenSize + h];
+        float dHCand = dGates_t[scratchBase + 2 * hiddenSize + h];
+        grad += dZ * Wz[h * inputSize + i];
+        grad += dR * Wr[h * inputSize + i];
+        grad += dHCand * Wh[h * inputSize + i];
+    }
+    gradInput[(b * timeSteps + t) * inputSize + i] += grad;
+}
+
 // ===========================================================================
 // GRU COMPUTE GATE GRADIENTS KERNEL
 // ===========================================================================
@@ -801,7 +1044,11 @@ extern ""C"" __global__ __launch_bounds__(256) void gru_compute_gate_gradients(
 // GRU WEIGHT GRADIENT ACCUMULATION KERNEL
 // ===========================================================================
 
-// Accumulates weight gradients across batch dimension
+// Accumulates weight gradients across batch dimension.
+// NON-DETERMINISTIC across timestep invocations (issue #382): each (gateIdx, colIdx)
+// cell is written by exactly one thread per launch (atomic is over-defensive), but
+// when the kernel is called per timestep the cross-timestep accumulation ordering
+// is scheduler-dependent. See gru_accumulate_weight_gradients_deterministic below.
 extern ""C"" __global__ __launch_bounds__(256) void gru_accumulate_weight_gradients(
     const float* input,       // [batch, inputSize]
     const float* prevH,       // [batch, hiddenSize]
@@ -869,6 +1116,58 @@ extern ""C"" __global__ __launch_bounds__(256) void gru_accumulate_weight_gradie
         if (gateType == 0) atomicAdd(&dbz[h], grad);
         else if (gateType == 1) atomicAdd(&dbr[h], grad);
         else atomicAdd(&dbh[h], grad);
+    }
+}
+
+// gru_accumulate_weight_gradients — bit-deterministic variant (issue #382).
+// Direct += instead of atomicAdd (each cell has exactly one writer per launch).
+extern ""C"" __global__ __launch_bounds__(256) void gru_accumulate_weight_gradients_deterministic(
+    const float* input, const float* prevH, const float* gateR, const float* dGates,
+    float* dWz, float* dWr, float* dWh,
+    float* dUz, float* dUr, float* dUh,
+    float* dbz, float* dbr, float* dbh,
+    int batch, int inputSize, int hiddenSize)
+{
+    int gateIdx = blockIdx.x;
+    int colIdx = blockIdx.y * blockDim.x + threadIdx.x;
+    if (gateIdx >= 3 * hiddenSize) return;
+    int gateType = gateIdx / hiddenSize;
+    int h = gateIdx % hiddenSize;
+
+    if (colIdx < inputSize) {
+        float grad = 0.0f;
+        for (int b = 0; b < batch; b++) {
+            float dGate = dGates[b * 3 * hiddenSize + gateIdx];
+            float x_val = input[b * inputSize + colIdx];
+            grad += dGate * x_val;
+        }
+        if (gateType == 0) dWz[h * inputSize + colIdx] += grad;
+        else if (gateType == 1) dWr[h * inputSize + colIdx] += grad;
+        else dWh[h * inputSize + colIdx] += grad;
+    }
+
+    if (colIdx < hiddenSize) {
+        float grad = 0.0f;
+        for (int b = 0; b < batch; b++) {
+            float dGate = dGates[b * 3 * hiddenSize + gateIdx];
+            float h_val = prevH[b * hiddenSize + colIdx];
+            if (gateType == 2) {
+                float r = gateR[b * hiddenSize + colIdx];
+                h_val *= r;
+            }
+            grad += dGate * h_val;
+        }
+        if (gateType == 0) dUz[h * hiddenSize + colIdx] += grad;
+        else if (gateType == 1) dUr[h * hiddenSize + colIdx] += grad;
+        else dUh[h * hiddenSize + colIdx] += grad;
+    }
+
+    if (colIdx == 0) {
+        float grad = 0.0f;
+        for (int b = 0; b < batch; b++) grad += dGates[b * 3 * hiddenSize + gateIdx];
+        if (gateType == 0) dbz[h] += grad;
+        else if (gateType == 1) dbr[h] += grad;
+        else dbh[h] += grad;
     }
 }
 
@@ -1003,11 +1302,20 @@ extern ""C"" __global__ __launch_bounds__(256) void gru_backward_prevh_unified(
             "gru_cell_forward",
             "gru_forward_sequence",
             "gru_cell_backward",
+            "gru_cell_backward_compute_gates_deterministic",
+            "gru_cell_backward_dPrevH_reset_deterministic",
+            "gru_cell_backward_dbr_deterministic",
+            "gru_cell_backward_dUh_deterministic",
             "gru_backward_input",
             "gru_backward_prevh",
             "gru_backward_sequence",
+            "gru_backward_sequence_dWi_deterministic",
+            "gru_backward_sequence_dUi_deterministic",
+            "gru_backward_sequence_dBias_deterministic",
+            "gru_backward_sequence_dInput_deterministic",
             "gru_compute_gate_gradients",
             "gru_accumulate_weight_gradients",
+            "gru_accumulate_weight_gradients_deterministic",
             "gru_cell_backward_unified",
             "gru_backward_prevh_unified"
         };

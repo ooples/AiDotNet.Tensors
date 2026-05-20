@@ -1012,8 +1012,39 @@ extern ""C"" __global__ __launch_bounds__(256) void reduce_mean_kernel(
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
             sum += __shfl_down_sync(warp_mask, sum, offset);
+        // NON-DETERMINISTIC (issue #382); see reduce_mean_kernel_deterministic.
         if (tid == 0)
             atomicAdd(output, sum);
+    }
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void reduce_mean_kernel_deterministic(
+    const float* __restrict__ input, float* __restrict__ output, int size)
+{
+    extern __shared__ float sdata_dm[];
+    int tid = threadIdx.x;
+    float sum = 0.0f;
+    for (int i = tid; i < size; i += blockDim.x) sum += input[i];
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+    int lane = tid & 31;
+    int warpId = tid >> 5;
+    if (lane == 0) sdata_dm[warpId] = sum;
+    __syncthreads();
+    int numWarps = (blockDim.x + 31) >> 5;
+    if (tid < numWarps) {
+        sum = sdata_dm[tid];
+        unsigned int warp_mask = (numWarps >= 32) ? 0xFFFFFFFF : ((1u << numWarps) - 1);
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            sum += __shfl_down_sync(warp_mask, sum, offset);
+        // Write the raw sum (matching the non-deterministic kernel above which
+        // writes a sum via atomicAdd). The caller does the /size normalization
+        // post-kernel; dividing here as well would mean deterministic mode
+        // normalizes twice and returns a value `size`x smaller than the
+        // non-deterministic path (CodeRabbit PR #390).
+        if (tid == 0) *output = sum;
     }
 }
 
@@ -1054,8 +1085,37 @@ extern ""C"" __global__ __launch_bounds__(256) void reduce_variance_kernel(
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
             sum += __shfl_down_sync(warp_mask2, sum, offset);
+        // NON-DETERMINISTIC (issue #382); see reduce_variance_kernel_deterministic.
         if (tid == 0)
             atomicAdd(output, sum);
+    }
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void reduce_variance_kernel_deterministic(
+    const float* __restrict__ input, float* __restrict__ output, float mean, int size)
+{
+    extern __shared__ float sdata_dv[];
+    int tid = threadIdx.x;
+    float sum = 0.0f;
+    for (int i = tid; i < size; i += blockDim.x) {
+        float diff = input[i] - mean;
+        sum += diff * diff;
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+    int lane = tid & 31;
+    int warpId = tid >> 5;
+    if (lane == 0) sdata_dv[warpId] = sum;
+    __syncthreads();
+    int numWarps = (blockDim.x + 31) >> 5;
+    if (tid < numWarps) {
+        sum = sdata_dv[tid];
+        unsigned int warp_mask = (numWarps >= 32) ? 0xFFFFFFFF : ((1u << numWarps) - 1);
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            sum += __shfl_down_sync(warp_mask, sum, offset);
+        if (tid == 0) *output = sum;
     }
 }
 ";
@@ -1088,7 +1148,9 @@ extern ""C"" __global__ __launch_bounds__(256) void reduce_variance_kernel(
                 "lerp_fused",
                 "add_scaled",
                 "reduce_mean_kernel",
-                "reduce_variance_kernel"
+                "reduce_mean_kernel_deterministic",
+                "reduce_variance_kernel",
+                "reduce_variance_kernel_deterministic"
             };
         }
     }

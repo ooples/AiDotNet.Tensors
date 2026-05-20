@@ -458,7 +458,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 // Compile spatial transformer kernels (TopK, AffineGrid, GridSample)
                 var stProgram = CompileOrLoadCached(SpatialTransformerKernels.GetSource(), optimizationFlags, "Spatial transformer kernels");
                 _programs.Add(stProgram);
-                foreach (var name in new[] { "topk", "affine_grid", "grid_sample", "grid_sample_backward" })
+                foreach (var name in new[] { "topk", "affine_grid", "grid_sample", "grid_sample_backward", "grid_sample_backward_grad_grid_deterministic", "grid_sample_backward_grad_input_deterministic" })
                 {
                     _kernelCache[name] = new DirectOpenClKernel(_context, stProgram, name);
                 }
@@ -3682,8 +3682,12 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             zeroKernel.Execute1D(outputSize, 256);
             _context?.Finish();
 
-            // Then scatter-add
-            var kernel = _kernelCache["scatter_add_edges"];
+            // Then scatter-add. Issue #382: route to atomic-free variant when
+            // GpuDeterminism.IsActive — that variant parallelizes per (tgt, feat)
+            // output cell and scans edges in fixed order.
+            var kernel = GpuDeterminism.IsActive
+                ? _kernelCache["scatter_add_edges_deterministic"]
+                : _kernelCache["scatter_add_edges"];
             var bufferInput = ((DirectOpenClGpuBuffer)input).Buffer;
             var bufferSource = ((DirectOpenClGpuBuffer)sourceIndices).Buffer;
             var bufferTarget = ((DirectOpenClGpuBuffer)targetIndices).Buffer;
@@ -3708,8 +3712,11 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             kernel.SetArg(7, features);
             kernel.SetArg(8, edgeValues is not null ? 1 : 0);
 
-            var (localSizeX, localSizeY) = CalculateOptimalWorkGroupSize(features, numEdges);
-            kernel.Execute2D(features, numEdges, localSizeX, localSizeY);
+            // Deterministic launches with dim1=numNodes (one per target), atomic
+            // variant launches with dim1=numEdges (one per edge).
+            int dim1 = GpuDeterminism.IsActive ? numNodes : numEdges;
+            var (localSizeX, localSizeY) = CalculateOptimalWorkGroupSize(features, dim1);
+            kernel.Execute2D(features, dim1, localSizeX, localSizeY);
         }
 
         /// <inheritdoc/>
@@ -6736,6 +6743,43 @@ KERNEL VARIANTS (A/B testing):
             int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth,
             int paddingMode = 0, bool alignCorners = false)
         {
+            if (GpuDeterminism.IsActive)
+            {
+                // Issue #382: split into gradGrid (per output pos, deterministic by
+                // construction) + gradInput (per input cell scans output positions).
+                var kg = _kernelCache["grid_sample_backward_grad_grid_deterministic"];
+                uint ag = 0;
+                kg.SetArg(ag++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
+                kg.SetArg(ag++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+                kg.SetArg(ag++, ((DirectOpenClGpuBuffer)grid).Buffer.Handle);
+                kg.SetArg(ag++, ((DirectOpenClGpuBuffer)gradGrid).Buffer.Handle);
+                kg.SetArg(ag++, batch);
+                kg.SetArg(ag++, channels);
+                kg.SetArg(ag++, inHeight);
+                kg.SetArg(ag++, inWidth);
+                kg.SetArg(ag++, outHeight);
+                kg.SetArg(ag++, outWidth);
+                kg.SetArg(ag++, paddingMode);
+                kg.SetArg(ag++, alignCorners ? 1 : 0);
+                kg.Execute3D(outWidth, outHeight, batch, 16, 16, 1);
+
+                var ki = _kernelCache["grid_sample_backward_grad_input_deterministic"];
+                uint ai = 0;
+                ki.SetArg(ai++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
+                ki.SetArg(ai++, ((DirectOpenClGpuBuffer)grid).Buffer.Handle);
+                ki.SetArg(ai++, ((DirectOpenClGpuBuffer)gradInput).Buffer.Handle);
+                ki.SetArg(ai++, batch);
+                ki.SetArg(ai++, channels);
+                ki.SetArg(ai++, inHeight);
+                ki.SetArg(ai++, inWidth);
+                ki.SetArg(ai++, outHeight);
+                ki.SetArg(ai++, outWidth);
+                ki.SetArg(ai++, paddingMode);
+                ki.SetArg(ai++, alignCorners ? 1 : 0);
+                ki.Execute3D(inWidth, inHeight, batch * channels, 16, 16, 1);
+                return;
+            }
+
             var k = _kernelCache["grid_sample_backward"];
             uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
@@ -6985,40 +7029,83 @@ KERNEL VARIANTS (A/B testing):
             ZeroBuffer(gradGamma, channels);
             ZeroBuffer(gradBeta, channels);
 
-            // Pass 1: compute sums (uses atomics for gradGamma, gradBeta, sumDy, sumDyXhat)
-            var k1 = _kernelCache["instancenorm_backward_sums"];
-            uint arg = 0;
-            k1.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
-            k1.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
-            k1.SetArg(arg++, ((DirectOpenClGpuBuffer)saveMean).Buffer.Handle);
-            k1.SetArg(arg++, ((DirectOpenClGpuBuffer)saveInvVar).Buffer.Handle);
-            k1.SetArg(arg++, ((DirectOpenClGpuBuffer)gamma).Buffer.Handle);
-            k1.SetArg(arg++, ((DirectOpenClGpuBuffer)sumDyBuf).Buffer.Handle);
-            k1.SetArg(arg++, ((DirectOpenClGpuBuffer)sumDyXhatBuf).Buffer.Handle);
-            k1.SetArg(arg++, ((DirectOpenClGpuBuffer)gradGamma).Buffer.Handle);
-            k1.SetArg(arg++, ((DirectOpenClGpuBuffer)gradBeta).Buffer.Handle);
-            k1.SetArg(arg++, batch);
-            k1.SetArg(arg++, channels);
-            k1.SetArg(arg++, spatialSize); // H
-            k1.SetArg(arg++, 1);           // W = 1 (treat spatialSize as flat)
-            k1.Execute1D(totalSize, localSize);
-            _context.Finish();
+            // Pass 1: compute sums.
+            // Issue #382: atomic_add_float in instancenorm_backward_sums is FP-non-
+            // deterministic across runs. Under DeterministicMode, dispatch to two
+            // atomic-free kernels (per-channel for gradGamma/gradBeta, per-instance
+            // for sumDy/sumDyXhat) — each work-item owns one output cell and reduces
+            // its contributing range in fixed order.
+            if (GpuDeterminism.IsActive)
+            {
+                int hw = spatialSize; // host treats spatialSize as flat H, W = 1
+                var kpc = _kernelCache["instancenorm_backward_sums_per_channel_deterministic"];
+                uint apc = 0;
+                kpc.SetArg(apc++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
+                kpc.SetArg(apc++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+                kpc.SetArg(apc++, ((DirectOpenClGpuBuffer)saveMean).Buffer.Handle);
+                kpc.SetArg(apc++, ((DirectOpenClGpuBuffer)saveInvVar).Buffer.Handle);
+                kpc.SetArg(apc++, ((DirectOpenClGpuBuffer)gradGamma).Buffer.Handle);
+                kpc.SetArg(apc++, ((DirectOpenClGpuBuffer)gradBeta).Buffer.Handle);
+                kpc.SetArg(apc++, batch);
+                kpc.SetArg(apc++, channels);
+                kpc.SetArg(apc++, hw);
+                kpc.SetArg(apc++, 1);
+                kpc.Execute1D(channels, Math.Min(256, channels));
 
-            // Pass 2: compute gradInput using the accumulated sums
+                var kpi = _kernelCache["instancenorm_backward_sums_per_instance_deterministic"];
+                uint api = 0;
+                kpi.SetArg(api++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
+                kpi.SetArg(api++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+                kpi.SetArg(api++, ((DirectOpenClGpuBuffer)saveMean).Buffer.Handle);
+                kpi.SetArg(api++, ((DirectOpenClGpuBuffer)saveInvVar).Buffer.Handle);
+                kpi.SetArg(api++, ((DirectOpenClGpuBuffer)gamma).Buffer.Handle);
+                kpi.SetArg(api++, ((DirectOpenClGpuBuffer)sumDyBuf).Buffer.Handle);
+                kpi.SetArg(api++, ((DirectOpenClGpuBuffer)sumDyXhatBuf).Buffer.Handle);
+                kpi.SetArg(api++, batch);
+                kpi.SetArg(api++, channels);
+                kpi.SetArg(api++, hw);
+                kpi.SetArg(api++, 1);
+                int nc = batch * channels;
+                kpi.Execute1D(nc, Math.Min(256, nc));
+                _context.Finish();
+            }
+            else
+            {
+                var k1 = _kernelCache["instancenorm_backward_sums"];
+                uint arg = 0;
+                k1.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
+                k1.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+                k1.SetArg(arg++, ((DirectOpenClGpuBuffer)saveMean).Buffer.Handle);
+                k1.SetArg(arg++, ((DirectOpenClGpuBuffer)saveInvVar).Buffer.Handle);
+                k1.SetArg(arg++, ((DirectOpenClGpuBuffer)gamma).Buffer.Handle);
+                k1.SetArg(arg++, ((DirectOpenClGpuBuffer)sumDyBuf).Buffer.Handle);
+                k1.SetArg(arg++, ((DirectOpenClGpuBuffer)sumDyXhatBuf).Buffer.Handle);
+                k1.SetArg(arg++, ((DirectOpenClGpuBuffer)gradGamma).Buffer.Handle);
+                k1.SetArg(arg++, ((DirectOpenClGpuBuffer)gradBeta).Buffer.Handle);
+                k1.SetArg(arg++, batch);
+                k1.SetArg(arg++, channels);
+                k1.SetArg(arg++, spatialSize); // H
+                k1.SetArg(arg++, 1);           // W = 1 (treat spatialSize as flat)
+                k1.Execute1D(totalSize, localSize);
+                _context.Finish();
+            }
+
+            // Pass 2: compute gradInput using the accumulated sums (deterministic by
+            // construction — one work-item per (n, c, h, w), disjoint output cells).
             var k2 = _kernelCache["instancenorm_backward"];
-            arg = 0;
-            k2.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
-            k2.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
-            k2.SetArg(arg++, ((DirectOpenClGpuBuffer)saveMean).Buffer.Handle);
-            k2.SetArg(arg++, ((DirectOpenClGpuBuffer)saveInvVar).Buffer.Handle);
-            k2.SetArg(arg++, ((DirectOpenClGpuBuffer)gamma).Buffer.Handle);
-            k2.SetArg(arg++, ((DirectOpenClGpuBuffer)sumDyBuf).Buffer.Handle);
-            k2.SetArg(arg++, ((DirectOpenClGpuBuffer)sumDyXhatBuf).Buffer.Handle);
-            k2.SetArg(arg++, ((DirectOpenClGpuBuffer)gradInput).Buffer.Handle);
-            k2.SetArg(arg++, batch);
-            k2.SetArg(arg++, channels);
-            k2.SetArg(arg++, spatialSize); // H
-            k2.SetArg(arg++, 1);           // W = 1
+            uint arg2 = 0;
+            k2.SetArg(arg2++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
+            k2.SetArg(arg2++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+            k2.SetArg(arg2++, ((DirectOpenClGpuBuffer)saveMean).Buffer.Handle);
+            k2.SetArg(arg2++, ((DirectOpenClGpuBuffer)saveInvVar).Buffer.Handle);
+            k2.SetArg(arg2++, ((DirectOpenClGpuBuffer)gamma).Buffer.Handle);
+            k2.SetArg(arg2++, ((DirectOpenClGpuBuffer)sumDyBuf).Buffer.Handle);
+            k2.SetArg(arg2++, ((DirectOpenClGpuBuffer)sumDyXhatBuf).Buffer.Handle);
+            k2.SetArg(arg2++, ((DirectOpenClGpuBuffer)gradInput).Buffer.Handle);
+            k2.SetArg(arg2++, batch);
+            k2.SetArg(arg2++, channels);
+            k2.SetArg(arg2++, spatialSize); // H
+            k2.SetArg(arg2++, 1);           // W = 1
 
             k2.Execute1D(totalSize, localSize);
             _context.Finish();
@@ -7163,6 +7250,27 @@ KERNEL VARIANTS (A/B testing):
 
         public void EmbeddingBackward(IGpuBuffer gradOutput, IGpuBuffer indices, IGpuBuffer gradEmbedding, int numIndices, int embeddingDim, int vocabSize)
         {
+            if (GpuDeterminism.IsActive)
+            {
+                // Issue #382: atomic_add_float in embedding_backward is FP-non-deterministic
+                // across runs because OpenCL atomic ordering is scheduler-dependent.
+                // Route to the atomic-free variant that pins one thread per (v, d) output
+                // cell and scans numIndices in fixed order.
+                var kd = _kernelCache["embedding_backward_deterministic"];
+                uint argD = 0;
+                kd.SetArg(argD++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
+                kd.SetArg(argD++, ((DirectOpenClGpuBuffer)indices).Buffer.Handle);
+                kd.SetArg(argD++, ((DirectOpenClGpuBuffer)gradEmbedding).Buffer.Handle);
+                kd.SetArg(argD++, numIndices);
+                kd.SetArg(argD++, embeddingDim);
+                kd.SetArg(argD++, vocabSize);
+
+                int localDx = Math.Min(8, vocabSize);
+                int localDy = Math.Min(16, embeddingDim);
+                kd.Execute2D(vocabSize, embeddingDim, localDx, localDy);
+                return;
+            }
+
             var k = _kernelCache["embedding_backward"];
             uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
@@ -7323,6 +7431,69 @@ KERNEL VARIANTS (A/B testing):
             int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal,
             IGpuBuffer? attentionBias = null, int biasBatchStride = 0)
         {
+            if (GpuDeterminism.IsActive)
+            {
+                // Issue #382: atomic_add_float scatter into gradKey/gradValue is FP-
+                // non-deterministic across runs. Split into two atomic-free kernels:
+                //   gradq: per (bh, qi) — writes gradQuery only
+                //   gradkv: per (bh, ki, d) — accumulates gradKey/gradValue with
+                //           fixed qi traversal order
+                var kq = _kernelCache["flash_attention_backward_gradq_deterministic"];
+                uint aq = 0;
+                kq.SetArg(aq++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
+                kq.SetArg(aq++, ((DirectOpenClGpuBuffer)query).Buffer.Handle);
+                kq.SetArg(aq++, ((DirectOpenClGpuBuffer)key).Buffer.Handle);
+                kq.SetArg(aq++, ((DirectOpenClGpuBuffer)value).Buffer.Handle);
+                kq.SetArg(aq++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+                kq.SetArg(aq++, ((DirectOpenClGpuBuffer)softmaxStats).Buffer.Handle);
+                kq.SetArg(aq++, ((DirectOpenClGpuBuffer)gradQuery).Buffer.Handle);
+                kq.SetArg(aq++, batch);
+                kq.SetArg(aq++, numHeads);
+                kq.SetArg(aq++, seqQ);
+                kq.SetArg(aq++, seqK);
+                kq.SetArg(aq++, headDim);
+                kq.SetArg(aq++, scale);
+                kq.SetArg(aq++, isCausal ? 1 : 0);
+                if (attentionBias is not null)
+                    kq.SetArg(aq++, ((DirectOpenClGpuBuffer)attentionBias).Buffer.Handle);
+                else
+                    kq.SetArg(aq++, IntPtr.Zero);
+                kq.SetArg(aq++, attentionBias is not null ? 1 : 0);
+                kq.SetArg(aq, biasBatchStride);
+
+                int lqx = Math.Min(64, seqQ);
+                kq.Execute2D(seqQ, batch * numHeads, lqx, 1);
+
+                var kkv = _kernelCache["flash_attention_backward_gradkv_deterministic"];
+                uint akv = 0;
+                kkv.SetArg(akv++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
+                kkv.SetArg(akv++, ((DirectOpenClGpuBuffer)query).Buffer.Handle);
+                kkv.SetArg(akv++, ((DirectOpenClGpuBuffer)key).Buffer.Handle);
+                kkv.SetArg(akv++, ((DirectOpenClGpuBuffer)value).Buffer.Handle);
+                kkv.SetArg(akv++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+                kkv.SetArg(akv++, ((DirectOpenClGpuBuffer)softmaxStats).Buffer.Handle);
+                kkv.SetArg(akv++, ((DirectOpenClGpuBuffer)gradKey).Buffer.Handle);
+                kkv.SetArg(akv++, ((DirectOpenClGpuBuffer)gradValue).Buffer.Handle);
+                kkv.SetArg(akv++, batch);
+                kkv.SetArg(akv++, numHeads);
+                kkv.SetArg(akv++, seqQ);
+                kkv.SetArg(akv++, seqK);
+                kkv.SetArg(akv++, headDim);
+                kkv.SetArg(akv++, scale);
+                kkv.SetArg(akv++, isCausal ? 1 : 0);
+                if (attentionBias is not null)
+                    kkv.SetArg(akv++, ((DirectOpenClGpuBuffer)attentionBias).Buffer.Handle);
+                else
+                    kkv.SetArg(akv++, IntPtr.Zero);
+                kkv.SetArg(akv++, attentionBias is not null ? 1 : 0);
+                kkv.SetArg(akv, biasBatchStride);
+
+                int lkvX = Math.Min(16, headDim);
+                int lkvY = Math.Min(4, seqK);
+                kkv.Execute3D(headDim, seqK, batch * numHeads, lkvX, lkvY, 1);
+                return;
+            }
+
             // FlashAttention backward with recomputation for memory efficiency
             var k = _kernelCache["flash_attention_backward"];
             uint arg = 0;
@@ -7391,6 +7562,53 @@ KERNEL VARIANTS (A/B testing):
             IGpuBuffer gradQuery, IGpuBuffer gradKey, IGpuBuffer gradValue,
             int batch, int numQHeads, int numKVHeads, int seqQ, int seqK, int headDim, float scale)
         {
+            if (GpuDeterminism.IsActive)
+            {
+                // Issue #382: gradkey/gradValue scatter atomics are FP-non-deterministic;
+                // split into per (bqh, qi) gradQuery and per (b, kvh, ki, d) gradKV.
+                var kqg = _kernelCache["grouped_query_attention_backward_gradq_deterministic"];
+                uint aqg = 0;
+                kqg.SetArg(aqg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
+                kqg.SetArg(aqg++, ((DirectOpenClGpuBuffer)query).Buffer.Handle);
+                kqg.SetArg(aqg++, ((DirectOpenClGpuBuffer)key).Buffer.Handle);
+                kqg.SetArg(aqg++, ((DirectOpenClGpuBuffer)value).Buffer.Handle);
+                kqg.SetArg(aqg++, ((DirectOpenClGpuBuffer)attentionWeights).Buffer.Handle);
+                kqg.SetArg(aqg++, ((DirectOpenClGpuBuffer)gradQuery).Buffer.Handle);
+                kqg.SetArg(aqg++, batch);
+                kqg.SetArg(aqg++, numQHeads);
+                kqg.SetArg(aqg++, numKVHeads);
+                kqg.SetArg(aqg++, numQHeads / numKVHeads);
+                kqg.SetArg(aqg++, seqQ);
+                kqg.SetArg(aqg++, seqK);
+                kqg.SetArg(aqg++, headDim);
+                kqg.SetArg(aqg++, scale);
+                int lqgx = Math.Min(16, headDim);
+                int lqgy = Math.Min(8, seqQ);
+                kqg.Execute3D(headDim, seqQ, batch * numQHeads, lqgx, lqgy, 1);
+
+                var kkvg = _kernelCache["grouped_query_attention_backward_gradkv_deterministic"];
+                uint akvg = 0;
+                kkvg.SetArg(akvg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
+                kkvg.SetArg(akvg++, ((DirectOpenClGpuBuffer)query).Buffer.Handle);
+                kkvg.SetArg(akvg++, ((DirectOpenClGpuBuffer)key).Buffer.Handle);
+                kkvg.SetArg(akvg++, ((DirectOpenClGpuBuffer)value).Buffer.Handle);
+                kkvg.SetArg(akvg++, ((DirectOpenClGpuBuffer)attentionWeights).Buffer.Handle);
+                kkvg.SetArg(akvg++, ((DirectOpenClGpuBuffer)gradKey).Buffer.Handle);
+                kkvg.SetArg(akvg++, ((DirectOpenClGpuBuffer)gradValue).Buffer.Handle);
+                kkvg.SetArg(akvg++, batch);
+                kkvg.SetArg(akvg++, numQHeads);
+                kkvg.SetArg(akvg++, numKVHeads);
+                kkvg.SetArg(akvg++, numQHeads / numKVHeads);
+                kkvg.SetArg(akvg++, seqQ);
+                kkvg.SetArg(akvg++, seqK);
+                kkvg.SetArg(akvg++, headDim);
+                kkvg.SetArg(akvg++, scale);
+                int lkvgx = Math.Min(16, headDim);
+                int lkvgy = Math.Min(4, seqK);
+                kkvg.Execute3D(headDim, seqK, batch * numKVHeads, lkvgx, lkvgy, 1);
+                return;
+            }
+
             // GQA backward - accumulate gradients for K,V across shared query heads
             var k = _kernelCache["grouped_query_attention_backward"];
             uint arg = 0;
@@ -8208,18 +8426,46 @@ KERNEL VARIANTS (A/B testing):
             // Initialize output and counts to zero before accumulation
             Fill(output, 0f, outputSize * featureSize);
             Fill(counts, 0f, outputSize);
-            var k1 = _kernelCache["scatter_mean"]; uint arg1 = 0;
-            k1.SetArg(arg1++, ((DirectOpenClGpuBuffer)source).Buffer.Handle);
-            k1.SetArg(arg1++, ((DirectOpenClGpuBuffer)indices).Buffer.Handle);
-            k1.SetArg(arg1++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
-            k1.SetArg(arg1++, ((DirectOpenClGpuBuffer)counts).Buffer.Handle);
-            k1.SetArg(arg1++, sourceSize); k1.SetArg(arg1++, featureSize);
-            k1.Execute1D(sourceSize, Math.Min(256, sourceSize));
+
+            if (GpuDeterminism.IsActive)
+            {
+                // Issue #382: atomic accumulation is FP-non-deterministic across runs;
+                // dispatch to the variant that pins one work-item per (dstRow, col)
+                // and scans source rows in fixed order.
+                var k1d = _kernelCache["scatter_mean_deterministic"]; uint a1d = 0;
+                k1d.SetArg(a1d++, ((DirectOpenClGpuBuffer)source).Buffer.Handle);
+                k1d.SetArg(a1d++, ((DirectOpenClGpuBuffer)indices).Buffer.Handle);
+                k1d.SetArg(a1d++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+                k1d.SetArg(a1d++, ((DirectOpenClGpuBuffer)counts).Buffer.Handle);
+                k1d.SetArg(a1d++, sourceSize);
+                k1d.SetArg(a1d++, outputSize);
+                k1d.SetArg(a1d++, featureSize);
+                int lDx = Math.Min(8, outputSize);
+                int lDy = Math.Min(16, featureSize);
+                k1d.Execute2D(outputSize, featureSize, lDx, lDy);
+            }
+            else
+            {
+                var k1 = _kernelCache["scatter_mean"]; uint arg1 = 0;
+                k1.SetArg(arg1++, ((DirectOpenClGpuBuffer)source).Buffer.Handle);
+                k1.SetArg(arg1++, ((DirectOpenClGpuBuffer)indices).Buffer.Handle);
+                k1.SetArg(arg1++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+                k1.SetArg(arg1++, ((DirectOpenClGpuBuffer)counts).Buffer.Handle);
+                k1.SetArg(arg1++, sourceSize); k1.SetArg(arg1++, featureSize);
+                k1.Execute1D(sourceSize, Math.Min(256, sourceSize));
+            }
+
+            // scatter_mean_divide expects flat output element count (kernel guards
+            // `idx < outputSize` and indexes `output[idx]`), so pass outputSize *
+            // featureSize as the flat element count. Pre-existing bug surfaced
+            // by PR #390 review: prior code passed row count and dispatched only
+            // `outputSize` work-items, normalizing just the first row.
+            int outputFlat = outputSize * featureSize;
             var k2 = _kernelCache["scatter_mean_divide"]; uint arg2 = 0;
             k2.SetArg(arg2++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
             k2.SetArg(arg2++, ((DirectOpenClGpuBuffer)counts).Buffer.Handle);
-            k2.SetArg(arg2++, outputSize); k2.SetArg(arg2++, featureSize);
-            k2.Execute1D(outputSize, Math.Min(256, outputSize));
+            k2.SetArg(arg2++, outputFlat); k2.SetArg(arg2++, featureSize);
+            k2.Execute1D(outputFlat, Math.Min(256, outputFlat));
         }
 
         public void L1Loss(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numFeatures)
@@ -9295,13 +9541,36 @@ KERNEL VARIANTS (A/B testing):
 
         public void ScatterAdd(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer destination, int sourceSize, int destSize)
         {
-            var k = _kernelCache["scatter_add"];
+            // Issue #382: route to atomic-free variant when deterministic mode is set.
+            // The dispatch name in this file was previously "scatter_add" (a kernel
+            // that doesn't exist by that bare name in OpenCL); both variants now
+            // route to the proper kernel names ("scatter_add_kernel" / its
+            // deterministic counterpart) which take (source, indices, dst, srcSize,
+            // featureSize) with featureSize=1 here since ScatterAdd is per-element.
+            int featureSize = 1;
+            if (GpuDeterminism.IsActive)
+            {
+                var kd = _kernelCache["scatter_add_kernel_deterministic"];
+                uint argD = 0;
+                kd.SetArg(argD++, ((DirectOpenClGpuBuffer)source).Buffer.Handle);
+                kd.SetArg(argD++, ((DirectOpenClGpuBuffer)indices).Buffer.Handle);
+                kd.SetArg(argD++, ((DirectOpenClGpuBuffer)destination).Buffer.Handle);
+                kd.SetArg(argD++, sourceSize);
+                kd.SetArg(argD++, destSize);
+                kd.SetArg(argD++, featureSize);
+                int lDx = Math.Min(8, destSize);
+                int lDy = Math.Min(1, featureSize);
+                kd.Execute2D(destSize, featureSize, lDx, lDy);
+                return;
+            }
+
+            var k = _kernelCache["scatter_add_kernel"];
             uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)source).Buffer.Handle);
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)indices).Buffer.Handle);
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)destination).Buffer.Handle);
             k.SetArg(arg++, sourceSize);
-            k.SetArg(arg++, destSize);
+            k.SetArg(arg++, featureSize);
 
             k.Execute1D(sourceSize, Math.Min(256, sourceSize));
         }

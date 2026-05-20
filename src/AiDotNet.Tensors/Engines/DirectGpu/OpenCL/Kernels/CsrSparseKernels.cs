@@ -133,7 +133,8 @@ __kernel void scatter_add_edges(
     }
 
     // OpenCL doesn't have atomicAdd for floats in all versions
-    // Use atomic_xchg loop for portability
+    // Use atomic_xchg loop for portability.
+    // NON-DETERMINISTIC (issue #382); see scatter_add_edges_deterministic below.
     __global volatile float* addr = &output[tgt * features + feat];
     float old_val, new_val;
     do {
@@ -141,6 +142,33 @@ __kernel void scatter_add_edges(
         new_val = old_val + value;
     } while (atomic_cmpxchg((__global volatile int*)addr,
              as_int(old_val), as_int(new_val)) != as_int(old_val));
+}
+
+// scatter_add_edges — bit-deterministic variant (issue #382).
+// One work-item per (tgt, feat) output cell scans edges in fixed ascending order.
+__kernel void scatter_add_edges_deterministic(
+    __global const float* restrict input,
+    __global const int* restrict sourceIndices,
+    __global const int* restrict targetIndices,
+    __global const float* restrict edgeValues,
+    __global float* output,
+    int numNodes, int numEdges, int features,
+    int hasEdgeValues)
+{
+    int tgt = get_global_id(1);
+    int feat = get_global_id(0);
+    if (tgt >= numNodes || feat >= features) return;
+
+    float sum = 0.0f;
+    for (int edge = 0; edge < numEdges; edge++) {
+        if (targetIndices[edge] == tgt) {
+            int src = sourceIndices[edge];
+            float value = input[src * features + feat];
+            if (hasEdgeValues != 0) value *= edgeValues[edge];
+            sum += value;
+        }
+    }
+    output[tgt * features + feat] += sum;
 }
 
 // Gather source features for each edge
@@ -267,6 +295,7 @@ __kernel void symmetric_degree_normalize(
             "csr_spmm_bias",
             "csr_spmm_bias_relu",
             "scatter_add_edges",
+            "scatter_add_edges_deterministic",
             "gather_source_features",
             "gather_target_features",
             "segment_sum",

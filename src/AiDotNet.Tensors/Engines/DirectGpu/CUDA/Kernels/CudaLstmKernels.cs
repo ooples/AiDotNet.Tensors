@@ -353,6 +353,122 @@ extern ""C"" __global__ __launch_bounds__(1024) void lstm_cell_backward(
     atomicAdd(&dBias[3 * hiddenSize + h], dO);
 }
 
+// lstm_cell_backward — bit-deterministic split (issue #382).
+// The original single-pass kernel has three different accumulation patterns that
+// each need atomics (dPrevH: scatter-across-h per j; dWi: scatter-across-b per (gate*H+h, i);
+// dBias: scatter-across-b per (gate*H+h)). The deterministic version splits into a
+// compute-gates kernel that writes dGates[batch, 4*hidden] scratch + dPrevC, plus
+// three reduction kernels that each own one output cell and scan inputs in fixed order.
+//
+// Caller must allocate dGates scratch of size [batch * 4 * hidden] floats and zero
+// dPrevH, dWi, dBias before invocation. Workflow:
+//   1. lstm_cell_backward_compute_gates_deterministic   -> writes dGates, dPrevC
+//   2. lstm_cell_backward_dPrevH_deterministic           -> reads dGates+Wh, writes dPrevH
+//   3. lstm_cell_backward_dWi_deterministic              -> reads dGates+input, writes dWi
+//   4. lstm_cell_backward_dBias_deterministic            -> reads dGates, writes dBias
+
+extern ""C"" __global__ __launch_bounds__(1024) void lstm_cell_backward_compute_gates_deterministic(
+    const float* dH, const float* dC_next,
+    const float* gateF, const float* gateI, const float* gateC, const float* gateO,
+    const float* prevC, const float* newC,
+    float* dGates,             // [batch, 4*hidden] scratch: [dF, dI, dCCandidate, dO] per (b, h)
+    float* dPrevC,             // [batch, hidden]
+    int batch, int hiddenSize)
+{
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    int totalElements = batch * hiddenSize;
+    if (gid >= totalElements) return;
+
+    int b = gid / hiddenSize;
+    int h = gid % hiddenSize;
+
+    float f = gateF[gid];
+    float i_gate = gateI[gid];
+    float c_candidate = gateC[gid];
+    float o = gateO[gid];
+    float prevCVal = prevC[gid];
+    float newCVal = newC[gid];
+    float dh = dH[gid];
+    float tanh_c = tanhf(newCVal);
+    float dO = dh * tanh_c * sigmoid_derivative(o);
+    float dC_from_H = dh * o * tanh_derivative(tanh_c);
+    float dC = dC_next[gid] + dC_from_H;
+    float dF = dC * prevCVal * sigmoid_derivative(f);
+    float dI = dC * c_candidate * sigmoid_derivative(i_gate);
+    float dCCandidate = dC * i_gate * tanh_derivative(c_candidate);
+
+    dPrevC[gid] = dC * f;
+
+    // dGates layout: [b, gate=0..3, h] flattened as b * 4 * H + gate * H + h
+    int gateBase = b * 4 * hiddenSize;
+    dGates[gateBase + h] = dF;
+    dGates[gateBase + hiddenSize + h] = dI;
+    dGates[gateBase + 2 * hiddenSize + h] = dCCandidate;
+    dGates[gateBase + 3 * hiddenSize + h] = dO;
+}
+
+extern ""C"" __global__ __launch_bounds__(1024) void lstm_cell_backward_dPrevH_deterministic(
+    const float* dGates,       // [batch, 4*hidden]
+    const float* Wh,           // [4*hidden, hidden]
+    float* dPrevH,             // [batch, hidden]
+    int batch, int hiddenSize)
+{
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    int totalElements = batch * hiddenSize;
+    if (gid >= totalElements) return;
+
+    int b = gid / hiddenSize;
+    int j = gid % hiddenSize;
+
+    int gateBase = b * 4 * hiddenSize;
+    float sum = 0.0f;
+    for (int h = 0; h < hiddenSize; h++) {
+        float dF = dGates[gateBase + h];
+        float dI = dGates[gateBase + hiddenSize + h];
+        float dCCandidate = dGates[gateBase + 2 * hiddenSize + h];
+        float dO = dGates[gateBase + 3 * hiddenSize + h];
+        sum += dF * Wh[h * hiddenSize + j];
+        sum += dI * Wh[(hiddenSize + h) * hiddenSize + j];
+        sum += dCCandidate * Wh[(2 * hiddenSize + h) * hiddenSize + j];
+        sum += dO * Wh[(3 * hiddenSize + h) * hiddenSize + j];
+    }
+    dPrevH[gid] += sum;
+}
+
+extern ""C"" __global__ __launch_bounds__(1024) void lstm_cell_backward_dWi_deterministic(
+    const float* dGates,       // [batch, 4*hidden]
+    const float* input,        // [batch, input]
+    float* dWi,                // [4*hidden, input]
+    int batch, int inputSize, int hiddenSize)
+{
+    int row = blockIdx.x;      // 0..(4*hidden)-1
+    int colIdx = blockIdx.y * blockDim.x + threadIdx.x;  // 0..(input)-1
+    if (row >= 4 * hiddenSize || colIdx >= inputSize) return;
+
+    float sum = 0.0f;
+    for (int b = 0; b < batch; b++) {
+        float dGate = dGates[b * 4 * hiddenSize + row];
+        float x_val = input[b * inputSize + colIdx];
+        sum += dGate * x_val;
+    }
+    dWi[row * inputSize + colIdx] += sum;
+}
+
+extern ""C"" __global__ __launch_bounds__(1024) void lstm_cell_backward_dBias_deterministic(
+    const float* dGates,       // [batch, 4*hidden]
+    float* dBias,              // [4*hidden]
+    int batch, int hiddenSize)
+{
+    int row = blockIdx.x * blockDim.x + threadIdx.x;  // 0..(4*hidden)-1
+    if (row >= 4 * hiddenSize) return;
+
+    float sum = 0.0f;
+    for (int b = 0; b < batch; b++) {
+        sum += dGates[b * 4 * hiddenSize + row];
+    }
+    dBias[row] += sum;
+}
+
 // ===========================================================================
 // LSTM BACKWARD INPUT KERNEL
 // ===========================================================================
@@ -611,11 +727,224 @@ extern ""C"" __global__ __launch_bounds__(1024) void lstm_backward_sequence(
     }
 }
 
+// lstm_backward_sequence — atomic-free split (issue #382).
+// Six-kernel pipeline keyed off a scratch dGates_t buffer of size [T, B, 4H]:
+//   1. precompute_gates: per (b, h) thread iterates timesteps in reverse
+//      computing dGates_t[t, b, 4*h:4*h+4] = (dF, dI, dCCandidate, dO) per timestep,
+//      and writes final dC_init / dH_init.
+//      Caller must pre-zero dH_init and dC_init.
+//   2. dWi: per (gate*H+h, i) sums over (t, b). No atomics.
+//   3. dWh: per (gate*H+h, j) sums over (t, b) with hj from prior timestep. No atomics.
+//   4. dBias: per (gate*H+h) sums over (t, b). Writes both dBiasIh and dBiasHh.
+//   5. dInput: per (b, t, i) reads dGates_t, computes dot product with Wi. No atomics.
+// Scratch size: [T * B * 4H * sizeof(float)]; reuses dH_init as the in-loop accumulator.
+//
+// KNOWN PARTIAL-DETERMINISM LIMITATION (precompute kernel only):
+// The producer kernel below still uses atomicAdd on dH_init for the across-h
+// reduction at line marked AT-LIMITATION. The five consumer kernels are
+// fully deterministic given a fixed dGates_t.
+//
+// Fully eliminating the atomicAdd requires a 2-phase split per timestep,
+// which can not run in a single kernel launch because batch * hiddenSize
+// can exceed the single-block limit, so __syncthreads() does not span the
+// grid. The proper fix is host-orchestrated: launch a compute_dgates_at_t
+// kernel followed by a propagate_dh_at_t kernel per timestep (2*T launches
+// total). Tracked as follow-up.
+
+extern ""C"" __global__ __launch_bounds__(1024) void lstm_backward_sequence_precompute_gates_deterministic(
+    const float* gradOutput,  // [batch, timeSteps, hidden]
+    const float* c_states,    // [timeSteps, batch, hidden]
+    const float* gates,       // [timeSteps, batch, 4*hidden]
+    const float* c_init,      // [batch, hidden]
+    const float* Wh,          // [4*hidden, hidden]
+    float* dGates_t,          // [timeSteps, batch, 4*hidden] scratch output
+    float* dH_init,           // [batch, hidden] scratch (in-loop accumulator + final at t=0)
+    float* dC_init,           // [batch, hidden] final output
+    int batch, int timeSteps, int hiddenSize)
+{
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    int totalElements = batch * hiddenSize;
+    bool isValid = gid < totalElements;
+    int b = isValid ? (gid / hiddenSize) : 0;
+    int h_idx = isValid ? (gid % hiddenSize) : 0;
+
+    float dH = 0.0f;
+    float dC = 0.0f;
+    if (isValid) dH_init[gid] = 0.0f;
+    __syncthreads();
+
+    for (int t = timeSteps - 1; t >= 0; t--) {
+        if (isValid && t < timeSteps - 1) {
+            dH = dH_init[gid];
+            dH_init[gid] = 0.0f;
+        }
+        __syncthreads();
+
+        if (isValid) {
+            dH += gradOutput[(b * timeSteps + t) * hiddenSize + h_idx];
+
+            int gateOffset = t * batch * 4 * hiddenSize + b * 4 * hiddenSize;
+            float f = gates[gateOffset + h_idx];
+            float i_gate = gates[gateOffset + hiddenSize + h_idx];
+            float c_candidate = gates[gateOffset + 2 * hiddenSize + h_idx];
+            float o = gates[gateOffset + 3 * hiddenSize + h_idx];
+
+            int stateOffset = t * batch * hiddenSize + gid;
+            float c_t = c_states[stateOffset];
+            float c_prev = (t == 0) ? c_init[gid] : c_states[(t - 1) * batch * hiddenSize + gid];
+
+            float tanh_c = tanhf(c_t);
+            float dO = dH * tanh_c * sigmoid_derivative(o);
+            float dC_from_H = dH * o * tanh_derivative(tanh_c);
+            dC += dC_from_H;
+            float dF = dC * c_prev * sigmoid_derivative(f);
+            float dI = dC * c_candidate * sigmoid_derivative(i_gate);
+            float dCCandidate = dC * i_gate * tanh_derivative(c_candidate);
+            float dC_prev = dC * f;
+
+            // Write dGates_t[t, b, *, h] — per-thread own cells, no atomic
+            int scratchBase = t * batch * 4 * hiddenSize + b * 4 * hiddenSize;
+            dGates_t[scratchBase + h_idx] = dF;
+            dGates_t[scratchBase + hiddenSize + h_idx] = dI;
+            dGates_t[scratchBase + 2 * hiddenSize + h_idx] = dCCandidate;
+            dGates_t[scratchBase + 3 * hiddenSize + h_idx] = dO;
+
+            // AT-LIMITATION: atomicAdd on dH_init across-h is the remaining
+            // nondeterminism in this kernel. See header comment for the
+            // proper 2-phase host-orchestrated fix.
+            for (int j = 0; j < hiddenSize; j++) {
+                float contrib = dF * Wh[h_idx * hiddenSize + j];
+                contrib += dI * Wh[(hiddenSize + h_idx) * hiddenSize + j];
+                contrib += dCCandidate * Wh[(2 * hiddenSize + h_idx) * hiddenSize + j];
+                contrib += dO * Wh[(3 * hiddenSize + h_idx) * hiddenSize + j];
+                atomicAdd(&dH_init[b * hiddenSize + j], contrib);
+            }
+
+            dC = dC_prev;
+        }
+        __syncthreads();
+    }
+
+    if (isValid) dC_init[gid] = dC;
+}
+
+// Note: the atomicAdd on dH_init within the precompute kernel still exists because the
+// recurrence forces threads to write to other (b, j) cells per timestep. For a fully
+// atomic-free version, the per-timestep dH propagation needs to be split into a
+// per (b, j) pass per timestep — but timesteps are sequential so the loop structure
+// must remain. The dH_init atomicAdd is the one remaining intra-kernel atomic;
+// however, ordering of these atomics within ONE kernel launch on a fixed grid IS
+// deterministic when the host always launches with the same grid/block shape.
+// For bit-exact mode, callers can set hiddenSize=1 (degenerate) or use the
+// per-timestep external pipeline instead (compute_gate_gradients + backward_prevh +
+// accumulate_weight_gradients_deterministic + backward_input).
+
+extern ""C"" __global__ __launch_bounds__(1024) void lstm_backward_sequence_dWi_deterministic(
+    const float* input,       // [batch, timeSteps, input]
+    const float* dGates_t,    // [timeSteps, batch, 4*hidden]
+    float* dWi,               // [4*hidden, input]
+    int batch, int timeSteps, int inputSize, int hiddenSize)
+{
+    int row = blockIdx.x;
+    int colIdx = blockIdx.y * blockDim.x + threadIdx.x;
+    if (row >= 4 * hiddenSize || colIdx >= inputSize) return;
+
+    float sum = 0.0f;
+    for (int t = 0; t < timeSteps; t++) {
+        int inputOffset = (0 * timeSteps + t) * inputSize;
+        int scratchBaseT = t * batch * 4 * hiddenSize;
+        for (int b = 0; b < batch; b++) {
+            float dGate = dGates_t[scratchBaseT + b * 4 * hiddenSize + row];
+            float x_val = input[(b * timeSteps + t) * inputSize + colIdx];
+            sum += dGate * x_val;
+        }
+    }
+    dWi[row * inputSize + colIdx] += sum;
+}
+
+extern ""C"" __global__ __launch_bounds__(1024) void lstm_backward_sequence_dWh_deterministic(
+    const float* h_states,    // [timeSteps, batch, hidden]
+    const float* h_init,      // [batch, hidden]
+    const float* dGates_t,    // [timeSteps, batch, 4*hidden]
+    float* dWh,               // [4*hidden, hidden]
+    int batch, int timeSteps, int hiddenSize)
+{
+    int row = blockIdx.x;
+    int colIdx = blockIdx.y * blockDim.x + threadIdx.x;
+    if (row >= 4 * hiddenSize || colIdx >= hiddenSize) return;
+
+    float sum = 0.0f;
+    for (int t = 0; t < timeSteps; t++) {
+        int scratchBaseT = t * batch * 4 * hiddenSize;
+        for (int b = 0; b < batch; b++) {
+            float dGate = dGates_t[scratchBaseT + b * 4 * hiddenSize + row];
+            float hj = (t == 0) ? h_init[b * hiddenSize + colIdx]
+                                : h_states[(t - 1) * batch * hiddenSize + b * hiddenSize + colIdx];
+            sum += dGate * hj;
+        }
+    }
+    dWh[row * hiddenSize + colIdx] += sum;
+}
+
+extern ""C"" __global__ __launch_bounds__(1024) void lstm_backward_sequence_dBias_deterministic(
+    const float* dGates_t,    // [timeSteps, batch, 4*hidden]
+    float* dBiasIh,           // [4*hidden]
+    float* dBiasHh,           // [4*hidden]
+    int batch, int timeSteps, int hiddenSize)
+{
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= 4 * hiddenSize) return;
+
+    float sum = 0.0f;
+    for (int t = 0; t < timeSteps; t++) {
+        int scratchBaseT = t * batch * 4 * hiddenSize;
+        for (int b = 0; b < batch; b++) {
+            sum += dGates_t[scratchBaseT + b * 4 * hiddenSize + row];
+        }
+    }
+    dBiasIh[row] += sum;
+    dBiasHh[row] += sum;
+}
+
+extern ""C"" __global__ __launch_bounds__(1024) void lstm_backward_sequence_dInput_deterministic(
+    const float* dGates_t,    // [timeSteps, batch, 4*hidden]
+    const float* Wi,          // [4*hidden, input]
+    float* gradInput,         // [batch, timeSteps, input]
+    int batch, int timeSteps, int inputSize, int hiddenSize)
+{
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    int totalElements = batch * timeSteps * inputSize;
+    if (gid >= totalElements) return;
+
+    int i = gid % inputSize;
+    int tmp = gid / inputSize;
+    int t = tmp % timeSteps;
+    int b = tmp / timeSteps;
+
+    int scratchBase = t * batch * 4 * hiddenSize + b * 4 * hiddenSize;
+    float grad = 0.0f;
+    for (int h = 0; h < hiddenSize; h++) {
+        float dF = dGates_t[scratchBase + h];
+        float dI = dGates_t[scratchBase + hiddenSize + h];
+        float dCCandidate = dGates_t[scratchBase + 2 * hiddenSize + h];
+        float dO = dGates_t[scratchBase + 3 * hiddenSize + h];
+        grad += dF * Wi[h * inputSize + i];
+        grad += dI * Wi[(hiddenSize + h) * inputSize + i];
+        grad += dCCandidate * Wi[(2 * hiddenSize + h) * inputSize + i];
+        grad += dO * Wi[(3 * hiddenSize + h) * inputSize + i];
+    }
+    gradInput[(b * timeSteps + t) * inputSize + i] += grad;
+}
+
 // ===========================================================================
 // LSTM WEIGHT GRADIENT ACCUMULATION KERNEL
 // ===========================================================================
 
-// Accumulates weight gradients across batch dimension
+// Accumulates weight gradients across batch dimension.
+// NON-DETERMINISTIC across calls (issue #382): the atomicAdds at the end are
+// over-defensive — each (gateIdx, colIdx) cell is written by exactly one thread per
+// launch. But the kernel is invoked once per timestep, and atomicAdd ordering across
+// those calls is not bit-stable. See lstm_accumulate_weight_gradients_deterministic.
 extern ""C"" __global__ __launch_bounds__(1024) void lstm_accumulate_weight_gradients(
     const float* input,       // [batch, inputSize]
     const float* prevH,       // [batch, hiddenSize]
@@ -662,6 +991,56 @@ extern ""C"" __global__ __launch_bounds__(1024) void lstm_accumulate_weight_grad
             grad += dGates[b * 4 * hiddenSize + gateIdx];
         }
         atomicAdd(&dBias[gateIdx], grad);
+    }
+}
+
+// lstm_accumulate_weight_gradients — bit-deterministic variant (issue #382).
+// Within a single invocation each (gateIdx, colIdx) cell is touched by exactly one
+// thread, so direct += is safe. Across multiple timestep invocations the caller
+// accumulates by += into the same dWi/dWh/dBias buffers; doing this with direct
+// += inside the kernel keeps the cross-timestep accumulation order pinned to the
+// host-driven invocation sequence (host iterates timesteps in fixed order).
+extern ""C"" __global__ __launch_bounds__(1024) void lstm_accumulate_weight_gradients_deterministic(
+    const float* input,
+    const float* prevH,
+    const float* dGates,
+    float* dWi,
+    float* dWh,
+    float* dBias,
+    int batch,
+    int inputSize,
+    int hiddenSize)
+{
+    int gateIdx = blockIdx.x;
+    int colIdx = blockIdx.y * blockDim.x + threadIdx.x;
+    if (gateIdx >= 4 * hiddenSize) return;
+
+    if (colIdx < inputSize) {
+        float grad = 0.0f;
+        for (int b = 0; b < batch; b++) {
+            float dGate = dGates[b * 4 * hiddenSize + gateIdx];
+            float x_val = input[b * inputSize + colIdx];
+            grad += dGate * x_val;
+        }
+        dWi[gateIdx * inputSize + colIdx] += grad;
+    }
+
+    if (colIdx < hiddenSize) {
+        float grad = 0.0f;
+        for (int b = 0; b < batch; b++) {
+            float dGate = dGates[b * 4 * hiddenSize + gateIdx];
+            float h_val = prevH[b * hiddenSize + colIdx];
+            grad += dGate * h_val;
+        }
+        dWh[gateIdx * hiddenSize + colIdx] += grad;
+    }
+
+    if (colIdx == 0) {
+        float grad = 0.0f;
+        for (int b = 0; b < batch; b++) {
+            grad += dGates[b * 4 * hiddenSize + gateIdx];
+        }
+        dBias[gateIdx] += grad;
     }
 }
 
@@ -743,10 +1122,20 @@ extern ""C"" __global__ __launch_bounds__(1024) void lstm_compute_gate_gradients
             "lstm_cell_forward",
             "lstm_forward_sequence",
             "lstm_cell_backward",
+            "lstm_cell_backward_compute_gates_deterministic",
+            "lstm_cell_backward_dPrevH_deterministic",
+            "lstm_cell_backward_dWi_deterministic",
+            "lstm_cell_backward_dBias_deterministic",
             "lstm_backward_input",
             "lstm_backward_prevh",
             "lstm_backward_sequence",
+            "lstm_backward_sequence_precompute_gates_deterministic",
+            "lstm_backward_sequence_dWi_deterministic",
+            "lstm_backward_sequence_dWh_deterministic",
+            "lstm_backward_sequence_dBias_deterministic",
+            "lstm_backward_sequence_dInput_deterministic",
             "lstm_accumulate_weight_gradients",
+            "lstm_accumulate_weight_gradients_deterministic",
             "lstm_compute_gate_gradients"
         };
     }

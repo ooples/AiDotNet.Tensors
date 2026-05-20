@@ -28,7 +28,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels
             "parity210_cummin_axis","parity210_logcumsumexp_axis",
             "parity210_cumsum_block_hillis_steele",
             // Indexing
-            "parity210_take_linear","parity210_take_along_dim","parity210_index_add",
+            "parity210_take_linear","parity210_take_along_dim","parity210_index_add","parity210_index_add_deterministic",
             "parity210_index_copy","parity210_index_fill","parity210_masked_scatter",
             // Element-wise binary special
             "parity210_hypot","parity210_copysign","parity210_fmod","parity210_remainder",
@@ -369,6 +369,7 @@ extern ""C"" __global__ __launch_bounds__(256) void parity210_take_along_dim(
 }
 
 // IndexAdd requires atomicAdd to be safe under repeated indices.
+// NON-DETERMINISTIC (issue #382); see parity210_index_add_deterministic below.
 extern ""C"" __global__ __launch_bounds__(256) void parity210_index_add(
     float* __restrict__ output, const int* __restrict__ indices,
     const float* __restrict__ source,
@@ -388,6 +389,33 @@ extern ""C"" __global__ __launch_bounds__(256) void parity210_index_add(
     int dstPos = (outer * dstAxis + target) * innerSize + inner;
     int srcPos = (outer * idxLen + i) * innerSize + inner;
     atomicAdd(&output[dstPos], source[srcPos]);
+}
+
+// IndexAdd — bit-deterministic variant (issue #382).
+// One thread per (outer, dstTarget, inner) output cell; scans idxLen in fixed order.
+extern ""C"" __global__ __launch_bounds__(256) void parity210_index_add_deterministic(
+    float* __restrict__ output, const int* __restrict__ indices,
+    const float* __restrict__ source,
+    int outerSize, int dstAxis, int innerSize, int idxLen)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = outerSize * dstAxis * innerSize;
+    if (idx >= total) return;
+
+    int inner = idx % innerSize;
+    int tmp = idx / innerSize;
+    int dstTarget = tmp % dstAxis;
+    int outer = tmp / dstAxis;
+
+    float sum = 0.0f;
+    for (int i = 0; i < idxLen; i++) {
+        if (indices[i] == dstTarget) {
+            int srcPos = (outer * idxLen + i) * innerSize + inner;
+            sum += source[srcPos];
+        }
+    }
+    int dstPos = (outer * dstAxis + dstTarget) * innerSize + inner;
+    output[dstPos] += sum;
 }
 
 // IndexCopy replaces target rows with source rows (no accumulation).

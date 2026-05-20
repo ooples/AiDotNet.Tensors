@@ -444,10 +444,26 @@ public sealed unsafe partial class VulkanBackend
         Fill(output, 0f, outputSize * featureSize);
         Fill(counts, 0f, outputSize);
         // Two-pass: scatter-add then divide
-        GlslQuadOp(VulkanGlslKernels.ScatterMeanGlsl, source, indices, output, counts,
-            sourceSize, new uint[] { (uint)sourceSize, (uint)featureSize }, 2 * sizeof(uint));
+        if (GpuDeterminism.IsActive)
+        {
+            // Issue #382: CAS-loop atomic adds are FP-non-deterministic; use the
+            // bit-deterministic variant that scans source rows in fixed order
+            // (one work-item per (dstRow, col)).
+            int outputFlat = outputSize * featureSize;
+            GlslQuadOp(VulkanGlslKernels.ScatterMeanDeterministicGlsl, source, indices, output, counts,
+                outputFlat, new uint[] { (uint)sourceSize, (uint)outputSize, (uint)featureSize }, 3 * sizeof(uint));
+        }
+        else
+        {
+            GlslQuadOp(VulkanGlslKernels.ScatterMeanGlsl, source, indices, output, counts,
+                sourceSize, new uint[] { (uint)sourceSize, (uint)featureSize }, 2 * sizeof(uint));
+        }
+        // Divide kernel guards `idx < outputSize` and indexes `a[idx]` (flat),
+        // so the dispatch count and size limit must be the flat output element
+        // count (outputSize * featureSize), not row count.
+        int divideElems = outputSize * featureSize;
         GlslBinaryOp(VulkanGlslKernels.ScatterMeanDivideGlsl, output, counts, output,
-            outputSize, new uint[] { (uint)outputSize, (uint)featureSize }, 2 * sizeof(uint));
+            divideElems, new uint[] { (uint)divideElems, (uint)featureSize }, 2 * sizeof(uint));
     }
 
     public void L1Loss(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numFeatures)

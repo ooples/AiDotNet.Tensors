@@ -2584,17 +2584,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (!IsAvailable)
             throw new InvalidOperationException("CUDA backend is not available.");
 
-        if (!_kernelCache.TryGetValue("scatter_add_edges", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: scatter_add_edges");
-
         using var _ = PushContext();
 
         // First zero the output buffer
         ZeroBuffer(output, numNodes * features);
-
-        // Launch configuration: edges x ceil(features/blockSize) grid
-        uint gridX = (uint)numEdges;
-        uint gridY = (uint)((features + DefaultBlockSize - 1) / DefaultBlockSize);
 
         IntPtr inputPtr = input.Handle;
         IntPtr sourcePtr = sourceIndices.Handle;
@@ -2603,17 +2596,6 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         IntPtr outputPtr = output.Handle;
         int hasEdgeValues = edgeValues is not null ? 1 : 0;
 
-        void** args = stackalloc void*[8];
-        args[0] = &inputPtr;
-        args[1] = &sourcePtr;
-        args[2] = &targetPtr;
-        args[3] = &edgeValuesPtr;
-        args[4] = &outputPtr;
-        args[5] = &numNodes;
-        args[6] = &numEdges;
-        args[7] = &features;
-
-        // Note: hasEdgeValues is passed as part of the kernel argument structure
         void** args2 = stackalloc void*[9];
         args2[0] = &inputPtr;
         args2[1] = &sourcePtr;
@@ -2625,6 +2607,22 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         args2[7] = &features;
         args2[8] = &hasEdgeValues;
 
+        if (GpuDeterminism.IsActive)
+        {
+            // Issue #382: per-target-node thread scans edges in fixed order.
+            if (!_kernelCache.TryGetValue("scatter_add_edges_deterministic", out var krnlD))
+                throw new InvalidOperationException("CUDA kernel not found: scatter_add_edges_deterministic");
+            uint gridDX = (uint)numNodes;
+            uint gridDY = (uint)((features + DefaultBlockSize - 1) / DefaultBlockSize);
+            LaunchKernel2D(krnlD, gridDX, gridDY, (uint)DefaultBlockSize, 1, args2);
+            return;
+        }
+
+        if (!_kernelCache.TryGetValue("scatter_add_edges", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: scatter_add_edges");
+
+        uint gridX = (uint)numEdges;
+        uint gridY = (uint)((features + DefaultBlockSize - 1) / DefaultBlockSize);
         LaunchKernel2D(kernel, gridX, gridY, (uint)DefaultBlockSize, 1, args2);
     }
 
@@ -4837,19 +4835,42 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         int kernelH, int kernelW,
         int strideH, int strideW, int padH, int padW)
     {
-        if (!_kernelCache.TryGetValue("maxpool2d_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: maxpool2d_backward");
-
         using var _ = PushContext();
         const int blockSize = 16;
-        uint gridX = (uint)((outWidth + blockSize - 1) / blockSize);
-        uint gridY = (uint)((outHeight + blockSize - 1) / blockSize);
-        uint gridZ = (uint)(batch * channels);
-
         IntPtr gradOutPtr = gradOutput.Handle;
         IntPtr indicesPtr = indices.Handle;
         IntPtr gradInPtr = gradInput.Handle;
         int outW = outWidth;
+
+        if (GpuDeterminism.IsActive)
+        {
+            // Issue #382: route to atomic-free variant.
+            if (!_kernelCache.TryGetValue("maxpool2d_backward_deterministic", out var kernelD))
+                throw new InvalidOperationException("CUDA kernel not found: maxpool2d_backward_deterministic");
+            void** argsD = stackalloc void*[8];
+            argsD[0] = &gradOutPtr;
+            argsD[1] = &indicesPtr;
+            argsD[2] = &gradInPtr;
+            argsD[3] = &batch;
+            argsD[4] = &channels;
+            argsD[5] = &inHeight;
+            argsD[6] = &inWidth;
+            argsD[7] = &outW;
+            // Deterministic variant grid: per (b, c, ih, iw) input cell.
+            uint gridDX = (uint)((inWidth + blockSize - 1) / blockSize);
+            uint gridDY = (uint)((inHeight + blockSize - 1) / blockSize);
+            uint gridDZ = (uint)(batch * channels);
+            LaunchKernel2D(kernelD, gridDX, gridDY, gridDZ, (uint)blockSize, (uint)blockSize, argsD);
+            return;
+        }
+
+        if (!_kernelCache.TryGetValue("maxpool2d_backward", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: maxpool2d_backward");
+
+        uint gridX = (uint)((outWidth + blockSize - 1) / blockSize);
+        uint gridY = (uint)((outHeight + blockSize - 1) / blockSize);
+        uint gridZ = (uint)(batch * channels);
+
         void** args = stackalloc void*[8];
         args[0] = &gradOutPtr;
         args[1] = &indicesPtr;
@@ -5019,11 +5040,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void GlobalMaxPool2DBackward(IGpuBuffer gradOutput, IGpuBuffer indices, IGpuBuffer gradInput, int batch, int channels, int height, int width)
     {
-        if (!_kernelCache.TryGetValue("global_maxpool2d_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: global_maxpool2d_backward");
-
         using var _ = PushContext();
-        // First zero out the gradient input
         Fill(gradInput, 0f, batch * channels * height * width);
 
         int totalOutputs = batch * channels;
@@ -5039,6 +5056,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         args[4] = &channels;
         args[5] = &height;
         args[6] = &width;
+
+        string kernelName = GpuDeterminism.IsActive
+            ? "global_maxpool2d_backward_deterministic"
+            : "global_maxpool2d_backward";
+        if (!_kernelCache.TryGetValue(kernelName, out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: " + kernelName);
+
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
@@ -5116,15 +5140,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         int inDepth, int inHeight, int inWidth,
         int outDepth, int outHeight, int outWidth)
     {
-        if (!_kernelCache.TryGetValue("maxpool3d_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: maxpool3d_backward");
-
         using var _ = PushContext();
         const int blockSize = 8;
-        uint gridX = (uint)((outWidth + blockSize - 1) / blockSize);
-        uint gridY = (uint)((outHeight + blockSize - 1) / blockSize);
-        uint gridZ = (uint)(batch * channels * outDepth);
-
         IntPtr gradOutPtr = gradOutput.Handle;
         IntPtr indicesPtr = indices.Handle;
         IntPtr gradInPtr = gradInput.Handle;
@@ -5142,6 +5159,24 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         args[9] = &outHeight;
         args[10] = &outWidth;
 
+        if (GpuDeterminism.IsActive)
+        {
+            // Issue #382: deterministic kernel parallelizes per input cell (iw, ih, b*c*id).
+            if (!_kernelCache.TryGetValue("maxpool3d_backward_deterministic", out var kernelD))
+                throw new InvalidOperationException("CUDA kernel not found: maxpool3d_backward_deterministic");
+            uint gridDX = (uint)((inWidth + blockSize - 1) / blockSize);
+            uint gridDY = (uint)((inHeight + blockSize - 1) / blockSize);
+            uint gridDZ = (uint)(batch * channels * inDepth);
+            LaunchKernel2D(kernelD, gridDX, gridDY, gridDZ, (uint)blockSize, (uint)blockSize, args);
+            return;
+        }
+
+        if (!_kernelCache.TryGetValue("maxpool3d_backward", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: maxpool3d_backward");
+
+        uint gridX = (uint)((outWidth + blockSize - 1) / blockSize);
+        uint gridY = (uint)((outHeight + blockSize - 1) / blockSize);
+        uint gridZ = (uint)(batch * channels * outDepth);
         LaunchKernel2D(kernel, gridX, gridY, gridZ, (uint)blockSize, (uint)blockSize, args);
     }
 
@@ -5186,21 +5221,44 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         int inDepth, int inHeight, int inWidth,
         int scaleD, int scaleH, int scaleW)
     {
+        using var _ = PushContext();
+        const int blockSize = 8;
+        IntPtr gradOutPtr = gradOutput.Handle;
+        IntPtr gradInPtr = gradInput.Handle;
+
+        if (GpuDeterminism.IsActive)
+        {
+            // Issue #382: per-input-cell scan of scale-cube output cells.
+            if (!_kernelCache.TryGetValue("nearest_upsample3d_backward_deterministic", out var kernelD))
+                throw new InvalidOperationException("CUDA kernel not found: nearest_upsample3d_backward_deterministic");
+            void** argsD = stackalloc void*[10];
+            argsD[0] = &gradOutPtr;
+            argsD[1] = &gradInPtr;
+            argsD[2] = &batch;
+            argsD[3] = &channels;
+            argsD[4] = &inDepth;
+            argsD[5] = &inHeight;
+            argsD[6] = &inWidth;
+            argsD[7] = &scaleD;
+            argsD[8] = &scaleH;
+            argsD[9] = &scaleW;
+            uint gridDX = (uint)((inWidth + blockSize - 1) / blockSize);
+            uint gridDY = (uint)((inHeight + blockSize - 1) / blockSize);
+            uint gridDZ = (uint)(batch * channels * inDepth);
+            LaunchKernel2D(kernelD, gridDX, gridDY, gridDZ, (uint)blockSize, (uint)blockSize, argsD);
+            return;
+        }
+
         if (!_kernelCache.TryGetValue("nearest_upsample3d_backward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: nearest_upsample3d_backward");
 
-        using var _ = PushContext();
         int outDepth = inDepth * scaleD;
         int outHeight = inHeight * scaleH;
         int outWidth = inWidth * scaleW;
 
-        const int blockSize = 8;
         uint gridX = (uint)((outWidth + blockSize - 1) / blockSize);
         uint gridY = (uint)((outHeight + blockSize - 1) / blockSize);
         uint gridZ = (uint)(batch * channels * outDepth);
-
-        IntPtr gradOutPtr = gradOutput.Handle;
-        IntPtr gradInPtr = gradInput.Handle;
 
         void** args = stackalloc void*[10];
         args[0] = &gradOutPtr;
@@ -5281,21 +5339,68 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth,
         int paddingMode = 0, bool alignCorners = false)
     {
-        if (!_kernelCache.TryGetValue("grid_sample_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: grid_sample_backward");
-
         using var _ = PushContext();
         const int blockSize = 16;
-        uint gridX = (uint)((outWidth + blockSize - 1) / blockSize);
-        uint gridY = (uint)((outHeight + blockSize - 1) / blockSize);
-        uint gridZ = (uint)batch;
-
         IntPtr gradOutputPtr = gradOutput.Handle;
         IntPtr inputPtr = input.Handle;
         IntPtr gridPtr = grid.Handle;
         IntPtr gradInputPtr = gradInput.Handle;
         IntPtr gradGridPtr = gradGrid.Handle;
         int alignCornersInt = alignCorners ? 1 : 0;
+
+        if (GpuDeterminism.IsActive)
+        {
+            // Issue #382: split into gradGrid (per output position) + gradInput
+            // (per input cell) atomic-free kernels.
+            if (!_kernelCache.TryGetValue("grid_sample_backward_grad_grid_deterministic", out var krnlGrid))
+                throw new InvalidOperationException("CUDA kernel not found: grid_sample_backward_grad_grid_deterministic");
+
+            void** argsG = stackalloc void*[13];
+            argsG[0] = &gradOutputPtr;
+            argsG[1] = &inputPtr;
+            argsG[2] = &gridPtr;
+            argsG[3] = &gradGridPtr;
+            argsG[4] = &batch;
+            argsG[5] = &channels;
+            argsG[6] = &inHeight;
+            argsG[7] = &inWidth;
+            argsG[8] = &outHeight;
+            argsG[9] = &outWidth;
+            argsG[10] = &paddingMode;
+            argsG[11] = &alignCornersInt;
+            uint gridGX = (uint)((outWidth + blockSize - 1) / blockSize);
+            uint gridGY = (uint)((outHeight + blockSize - 1) / blockSize);
+            uint gridGZ = (uint)batch;
+            LaunchKernel2D(krnlGrid, gridGX, gridGY, gridGZ, (uint)blockSize, (uint)blockSize, argsG);
+
+            if (!_kernelCache.TryGetValue("grid_sample_backward_grad_input_deterministic", out var krnlIn))
+                throw new InvalidOperationException("CUDA kernel not found: grid_sample_backward_grad_input_deterministic");
+
+            void** argsI = stackalloc void*[11];
+            argsI[0] = &gradOutputPtr;
+            argsI[1] = &gridPtr;
+            argsI[2] = &gradInputPtr;
+            argsI[3] = &batch;
+            argsI[4] = &channels;
+            argsI[5] = &inHeight;
+            argsI[6] = &inWidth;
+            argsI[7] = &outHeight;
+            argsI[8] = &outWidth;
+            argsI[9] = &paddingMode;
+            argsI[10] = &alignCornersInt;
+            uint gridIX = (uint)((inWidth + blockSize - 1) / blockSize);
+            uint gridIY = (uint)((inHeight + blockSize - 1) / blockSize);
+            uint gridIZ = (uint)(batch * channels);
+            LaunchKernel2D(krnlIn, gridIX, gridIY, gridIZ, (uint)blockSize, (uint)blockSize, argsI);
+            return;
+        }
+
+        if (!_kernelCache.TryGetValue("grid_sample_backward", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: grid_sample_backward");
+
+        uint gridX = (uint)((outWidth + blockSize - 1) / blockSize);
+        uint gridY = (uint)((outHeight + blockSize - 1) / blockSize);
+        uint gridZ = (uint)batch;
 
         void** args = stackalloc void*[14];
         args[0] = &gradOutputPtr;
@@ -5866,14 +5971,38 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void EmbeddingBackward(IGpuBuffer gradOutput, IGpuBuffer indices, IGpuBuffer gradEmbedding, int numIndices, int embeddingDim, int vocabSize)
     {
-        if (!_kernelCache.TryGetValue("embedding_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: embedding_backward");
-
         using var _ = PushContext();
-        uint grid = (uint)((numIndices + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr gradOutPtr = gradOutput.Handle;
         IntPtr idxPtr = indices.Handle;
         IntPtr gradEmbPtr = gradEmbedding.Handle;
+
+        if (GpuDeterminism.IsActive)
+        {
+            // Issue #382: atomicAdd in embedding_backward is FP-non-deterministic
+            // across runs. Route to the atomic-free deterministic variant — one
+            // thread per (v, d) output cell scans numIndices in fixed order.
+            if (!_kernelCache.TryGetValue("embedding_backward_deterministic", out var kernelD))
+                throw new InvalidOperationException("CUDA kernel not found: embedding_backward_deterministic");
+
+            void** argsD = stackalloc void*[6];
+            argsD[0] = &gradOutPtr;
+            argsD[1] = &idxPtr;
+            argsD[2] = &gradEmbPtr;
+            argsD[3] = &numIndices;
+            argsD[4] = &embeddingDim;
+            argsD[5] = &vocabSize;
+
+            // Grid: ceil(embeddingDim / 16) x ceil(vocabSize / 16), Block: 16x16
+            uint gridX = (uint)((embeddingDim + 15) / 16);
+            uint gridY = (uint)((vocabSize + 15) / 16);
+            LaunchKernel2D(kernelD, gridX, gridY, 16, 16, argsD);
+            return;
+        }
+
+        if (!_kernelCache.TryGetValue("embedding_backward", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: embedding_backward");
+
+        uint grid = (uint)((numIndices + DefaultBlockSize - 1) / DefaultBlockSize);
         void** args = stackalloc void*[5];
         args[0] = &gradOutPtr;
         args[1] = &idxPtr;
@@ -6084,14 +6213,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         IGpuBuffer? attentionBias = null, int biasBatchStride = 0)
     {
         using var _ = PushContext();
-        var kernel = _kernelCache["flash_attention_backward"];
-        uint gridX = (uint)((seqQ + 31) / 32);
-        uint gridY = (uint)(batch * numHeads);
         int causalFlag = isCausal ? 1 : 0;
         int hasBias = attentionBias is not null ? 1 : 0;
         IntPtr biasPtr = attentionBias is not null ? attentionBias.Handle : IntPtr.Zero;
 
-        void** args = stackalloc void*[19];
         IntPtr goPtr = gradOutput.Handle;
         IntPtr qPtr = query.Handle;
         IntPtr kPtr = key.Handle;
@@ -6101,6 +6226,71 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         IntPtr gqPtr = gradQuery.Handle;
         IntPtr gkPtr = gradKey.Handle;
         IntPtr gvPtr = gradValue.Handle;
+
+        if (GpuDeterminism.IsActive)
+        {
+            // Issue #382: tiled flash_attention_backward uses atomicAdd for
+            // gradKey/gradValue — non-deterministic across runs. Split into two
+            // atomic-free kernels:
+            //   gradq: per (bh, qi) writes gradQuery only
+            //   gradkv: per (bh, ki, d) accumulates gradKey/gradValue with fixed qi order
+            var kernelQ = _kernelCache["flash_attention_backward_gradq_deterministic"];
+            void** argsQ = stackalloc void*[17];
+            argsQ[0] = &goPtr;
+            argsQ[1] = &qPtr;
+            argsQ[2] = &kPtr;
+            argsQ[3] = &vPtr;
+            argsQ[4] = &oPtr;
+            argsQ[5] = &sPtr;
+            argsQ[6] = &gqPtr;
+            argsQ[7] = &batch;
+            argsQ[8] = &numHeads;
+            argsQ[9] = &seqQ;
+            argsQ[10] = &seqK;
+            argsQ[11] = &headDim;
+            argsQ[12] = &scale;
+            argsQ[13] = &causalFlag;
+            argsQ[14] = &biasPtr;
+            argsQ[15] = &hasBias;
+            argsQ[16] = &biasBatchStride;
+
+            uint gridQX = (uint)((seqQ + 63) / 64);
+            uint gridQY = (uint)(batch * numHeads);
+            LaunchKernel2D(kernelQ, gridQX, gridQY, 64, 1, argsQ);
+
+            var kernelKV = _kernelCache["flash_attention_backward_gradkv_deterministic"];
+            void** argsKV = stackalloc void*[18];
+            argsKV[0] = &goPtr;
+            argsKV[1] = &qPtr;
+            argsKV[2] = &kPtr;
+            argsKV[3] = &vPtr;
+            argsKV[4] = &oPtr;
+            argsKV[5] = &sPtr;
+            argsKV[6] = &gkPtr;
+            argsKV[7] = &gvPtr;
+            argsKV[8] = &batch;
+            argsKV[9] = &numHeads;
+            argsKV[10] = &seqQ;
+            argsKV[11] = &seqK;
+            argsKV[12] = &headDim;
+            argsKV[13] = &scale;
+            argsKV[14] = &causalFlag;
+            argsKV[15] = &biasPtr;
+            argsKV[16] = &hasBias;
+            argsKV[17] = &biasBatchStride;
+
+            uint gridKVX = (uint)((headDim + 15) / 16);
+            uint gridKVY = (uint)((seqK + 3) / 4);
+            uint gridKVZ = (uint)(batch * numHeads);
+            LaunchKernel3D(kernelKV, gridKVX, gridKVY, gridKVZ, 16, 4, 1, argsKV);
+            return;
+        }
+
+        var kernel = _kernelCache["flash_attention_backward"];
+        uint gridX = (uint)((seqQ + 31) / 32);
+        uint gridY = (uint)(batch * numHeads);
+
+        void** args = stackalloc void*[19];
         args[0] = &goPtr;
         args[1] = &qPtr;
         args[2] = &kPtr;
@@ -6172,12 +6362,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         int batch, int numQHeads, int numKVHeads, int seqQ, int seqK, int headDim, float scale)
     {
         using var _ = PushContext();
-        var kernel = _kernelCache["grouped_query_attention_backward"];
-        uint gridX = (uint)((seqQ + 31) / 32);
-        uint gridY = (uint)(batch * numQHeads);
         int queriesPerKV = numQHeads / numKVHeads;
 
-        void** args = stackalloc void*[16];
         IntPtr goPtr = gradOutput.Handle;
         IntPtr qPtr = query.Handle;
         IntPtr kPtr = key.Handle;
@@ -6186,6 +6372,60 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         IntPtr gqPtr = gradQuery.Handle;
         IntPtr gkPtr = gradKey.Handle;
         IntPtr gvPtr = gradValue.Handle;
+
+        if (GpuDeterminism.IsActive)
+        {
+            // Issue #382: split tiled GQA backward into gradq (per bqh, qi) and
+            // gradkv (per b, kvh, ki, d). No atomicAdd in either kernel.
+            var kqGqa = _kernelCache["grouped_query_attention_backward_gradq_deterministic"];
+            void** argsQg = stackalloc void*[14];
+            argsQg[0] = &goPtr;
+            argsQg[1] = &qPtr;
+            argsQg[2] = &kPtr;
+            argsQg[3] = &vPtr;
+            argsQg[4] = &wPtr;
+            argsQg[5] = &gqPtr;
+            argsQg[6] = &batch;
+            argsQg[7] = &numQHeads;
+            argsQg[8] = &numKVHeads;
+            argsQg[9] = &queriesPerKV;
+            argsQg[10] = &seqQ;
+            argsQg[11] = &seqK;
+            argsQg[12] = &headDim;
+            argsQg[13] = &scale;
+            uint gqX = (uint)((seqQ + 63) / 64);
+            uint gqY = (uint)(batch * numQHeads);
+            LaunchKernel2D(kqGqa, gqX, gqY, 64, 1, argsQg);
+
+            var kkvGqa = _kernelCache["grouped_query_attention_backward_gradkv_deterministic"];
+            void** argsKVg = stackalloc void*[15];
+            argsKVg[0] = &goPtr;
+            argsKVg[1] = &qPtr;
+            argsKVg[2] = &kPtr;
+            argsKVg[3] = &vPtr;
+            argsKVg[4] = &wPtr;
+            argsKVg[5] = &gkPtr;
+            argsKVg[6] = &gvPtr;
+            argsKVg[7] = &batch;
+            argsKVg[8] = &numQHeads;
+            argsKVg[9] = &numKVHeads;
+            argsKVg[10] = &queriesPerKV;
+            argsKVg[11] = &seqQ;
+            argsKVg[12] = &seqK;
+            argsKVg[13] = &headDim;
+            argsKVg[14] = &scale;
+            uint gkvX = (uint)((headDim + 15) / 16);
+            uint gkvY = (uint)((seqK + 3) / 4);
+            uint gkvZ = (uint)(batch * numKVHeads);
+            LaunchKernel3D(kkvGqa, gkvX, gkvY, gkvZ, 16, 4, 1, argsKVg);
+            return;
+        }
+
+        var kernel = _kernelCache["grouped_query_attention_backward"];
+        uint gridX = (uint)((seqQ + 31) / 32);
+        uint gridY = (uint)(batch * numQHeads);
+
+        void** args = stackalloc void*[16];
         args[0] = &goPtr;
         args[1] = &qPtr;
         args[2] = &kPtr;
@@ -7073,12 +7313,23 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void PReluBackwardAlpha(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradAlpha, int size, int alphaSize)
     {
-        if (!_kernelCache.TryGetValue("prelu_backward_alpha", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: prelu_backward_alpha");
         using var _ = PushContext();
-        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr goPtr = gradOutput.Handle; IntPtr iPtr = input.Handle; IntPtr gaPtr = gradAlpha.Handle; int n = size; int aSize = alphaSize;
         void** args = stackalloc void*[5]; args[0] = &goPtr; args[1] = &iPtr; args[2] = &gaPtr; args[3] = &n; args[4] = &aSize;
+
+        if (GpuDeterminism.IsActive)
+        {
+            // Issue #382: per-alpha-channel thread scans size in strided order.
+            if (!_kernelCache.TryGetValue("prelu_backward_alpha_deterministic", out var kernelD))
+                throw new InvalidOperationException("CUDA kernel not found: prelu_backward_alpha_deterministic");
+            uint gridD = (uint)((alphaSize + DefaultBlockSize - 1) / DefaultBlockSize);
+            LaunchKernel(kernelD, gridD, DefaultBlockSize, args);
+            return;
+        }
+
+        if (!_kernelCache.TryGetValue("prelu_backward_alpha", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: prelu_backward_alpha");
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
@@ -7267,22 +7518,44 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         // Initialize output and counts to zero before accumulation
         Fill(output, 0f, outputSize * featureSize);
         Fill(counts, 0f, outputSize);
-        // Step 1: scatter-add and count
-        if (!_kernelCache.TryGetValue("scatter_mean", out var scatterKernel))
-            throw new InvalidOperationException("CUDA kernel not found: scatter_mean");
-        uint grid1 = (uint)((sourceSize + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr sPtr = source.Handle, idxPtr = indices.Handle, oPtr = output.Handle, cPtr = counts.Handle;
-        void** args1 = stackalloc void*[6];
-        args1[0] = &sPtr; args1[1] = &idxPtr; args1[2] = &oPtr; args1[3] = &cPtr;
-        args1[4] = &sourceSize; args1[5] = &featureSize;
-        LaunchKernel(scatterKernel, grid1, DefaultBlockSize, args1);
 
-        // Step 2: divide by counts
+        if (GpuDeterminism.IsActive)
+        {
+            // Issue #382: route to atomic-free variant — per (dstRow, col) output cell.
+            if (!_kernelCache.TryGetValue("scatter_mean_activation_deterministic", out var kernelD))
+                throw new InvalidOperationException("CUDA kernel not found: scatter_mean_activation_deterministic");
+            void** argsD = stackalloc void*[7];
+            argsD[0] = &sPtr; argsD[1] = &idxPtr; argsD[2] = &oPtr; argsD[3] = &cPtr;
+            argsD[4] = &sourceSize; argsD[5] = &outputSize; argsD[6] = &featureSize;
+            const int blockSize = 16;
+            uint gridDX = (uint)((featureSize + blockSize - 1) / blockSize);
+            uint gridDY = (uint)((outputSize + blockSize - 1) / blockSize);
+            LaunchKernel2D(kernelD, gridDX, gridDY, (uint)blockSize, (uint)blockSize, argsD);
+        }
+        else
+        {
+            if (!_kernelCache.TryGetValue("scatter_mean", out var scatterKernel))
+                throw new InvalidOperationException("CUDA kernel not found: scatter_mean");
+            uint grid1 = (uint)((sourceSize + DefaultBlockSize - 1) / DefaultBlockSize);
+            void** args1 = stackalloc void*[6];
+            args1[0] = &sPtr; args1[1] = &idxPtr; args1[2] = &oPtr; args1[3] = &cPtr;
+            args1[4] = &sourceSize; args1[5] = &featureSize;
+            LaunchKernel(scatterKernel, grid1, DefaultBlockSize, args1);
+        }
+
+        // Step 2: divide by counts (deterministic by construction — one thread per cell).
+        // scatter_mean_divide expects flat output element count (kernel guards
+        // `idx < outputSize` and indexes `output[idx]`), so pass outputSize *
+        // featureSize as the flat element count. Pre-existing bug surfaced by
+        // PR #390 review: prior code passed row count and dispatched only
+        // `outputSize` work-items, normalizing just the first row.
         if (!_kernelCache.TryGetValue("scatter_mean_divide", out var divideKernel))
             throw new InvalidOperationException("CUDA kernel not found: scatter_mean_divide");
-        uint grid2 = (uint)((outputSize + DefaultBlockSize - 1) / DefaultBlockSize);
+        int outputFlat = outputSize * featureSize;
+        uint grid2 = (uint)((outputFlat + DefaultBlockSize - 1) / DefaultBlockSize);
         void** args2 = stackalloc void*[4];
-        args2[0] = &oPtr; args2[1] = &cPtr; args2[2] = &outputSize; args2[3] = &featureSize;
+        args2[0] = &oPtr; args2[1] = &cPtr; args2[2] = &outputFlat; args2[3] = &featureSize;
         LaunchKernel(divideKernel, grid2, DefaultBlockSize, args2);
     }
 
@@ -8809,8 +9082,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         int gridSize = (size + blockSize - 1) / blockSize;
 
         // Step 1: Compute mean via GPU reduction
+        // Issue #382: under DeterministicMode, the deterministic variant computes
+        // mean directly (writes sum/size) and uses a single-block grid; in non-
+        // deterministic mode the multi-block atomic kernel writes sum (caller divides).
         float mean;
-        if (_kernelCache.TryGetValue("reduce_mean_kernel", out var meanKernel))
+        string meanKernelName = GpuDeterminism.IsActive ? "reduce_mean_kernel_deterministic" : "reduce_mean_kernel";
+        if (_kernelCache.TryGetValue(meanKernelName, out var meanKernel))
         {
             var zeroData = new float[1];
             using var meanBuffer = AllocateBuffer(zeroData);
@@ -8823,9 +9100,14 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             args[1] = &meanPtr;
             args[2] = &n;
             uint sharedBytes = (uint)(blockSize * sizeof(float));
-            LaunchKernelWithSharedMem(meanKernel, (uint)gridSize, (uint)blockSize, sharedBytes, args);
+            uint launchGrid = GpuDeterminism.IsActive ? 1u : (uint)gridSize;
+            LaunchKernelWithSharedMem(meanKernel, launchGrid, (uint)blockSize, sharedBytes, args);
             // Synchronize() removed: DownloadBuffer uses cuMemcpyDtoH which is synchronous
             float[] meanResult = DownloadBuffer(meanBuffer);
+            // Both kernels now write the raw sum; normalize once on the host so
+            // deterministic and non-deterministic paths agree (CodeRabbit PR #390 —
+            // previously the deterministic kernel divided internally and the host
+            // skipped the division, but that was fragile and easy to mis-match).
             mean = meanResult[0] / size;
         }
         else
@@ -8835,7 +9117,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
         // Step 2: Compute variance via GPU reduction
         float variance;
-        if (_kernelCache.TryGetValue("reduce_variance_kernel", out var varKernel))
+        string varKernelName = GpuDeterminism.IsActive ? "reduce_variance_kernel_deterministic" : "reduce_variance_kernel";
+        if (_kernelCache.TryGetValue(varKernelName, out var varKernel))
         {
             var zeroData = new float[1];
             using var varianceBuffer = AllocateBuffer(zeroData);
@@ -8850,7 +9133,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             args[2] = &meanVal;
             args[3] = &n;
             uint sharedBytes = (uint)(blockSize * sizeof(float));
-            LaunchKernelWithSharedMem(varKernel, (uint)gridSize, (uint)blockSize, sharedBytes, args);
+            uint launchGrid = GpuDeterminism.IsActive ? 1u : (uint)gridSize;
+            LaunchKernelWithSharedMem(varKernel, launchGrid, (uint)blockSize, sharedBytes, args);
             // Synchronize() removed: DownloadBuffer uses cuMemcpyDtoH which is synchronous
             float[] varResult = DownloadBuffer(varianceBuffer);
             variance = varResult[0] / size;
@@ -8875,16 +9159,39 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void ScatterAdd(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer destination, int sourceSize, int destSize)
     {
-        if (!_kernelCache.TryGetValue("embedding_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: embedding_backward");
-
-        // ScatterAdd is essentially the embedding backward operation
+        // ScatterAdd is implemented via the embedding_backward kernel — the same
+        // op with embDim = 1 (each input is a single value). Both atomic and
+        // deterministic variants follow the same pattern.
         using var _ = PushContext();
-        uint grid = (uint)((sourceSize + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr srcPtr = source.Handle;
         IntPtr idxPtr = indices.Handle;
         IntPtr dstPtr = destination.Handle;
         int embDim = 1;
+
+        if (GpuDeterminism.IsActive)
+        {
+            // Issue #382: route to embedding_backward_deterministic — one thread
+            // per (v, d) output cell scans numIndices in fixed order.
+            if (!_kernelCache.TryGetValue("embedding_backward_deterministic", out var kernelD))
+                throw new InvalidOperationException("CUDA kernel not found: embedding_backward_deterministic");
+            void** argsD = stackalloc void*[6];
+            argsD[0] = &srcPtr;
+            argsD[1] = &idxPtr;
+            argsD[2] = &dstPtr;
+            argsD[3] = &sourceSize;
+            argsD[4] = &embDim;
+            argsD[5] = &destSize;
+            // Grid: ceil(embDim / 16) x ceil(destSize / 16) — embDim=1 so X is 1.
+            uint gridX = (uint)((embDim + 15) / 16);
+            uint gridY = (uint)((destSize + 15) / 16);
+            LaunchKernel2D(kernelD, gridX, gridY, 16, 16, argsD);
+            return;
+        }
+
+        if (!_kernelCache.TryGetValue("embedding_backward", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: embedding_backward");
+
+        uint grid = (uint)((sourceSize + DefaultBlockSize - 1) / DefaultBlockSize);
         void** args = stackalloc void*[5];
         args[0] = &srcPtr;
         args[1] = &idxPtr;
@@ -11390,18 +11697,35 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             throw new ArgumentOutOfRangeException(nameof(numGammaBands), "numGammaBands must be positive.");
         if (gammaIdx < 0 || gammaIdx >= numGammaBands)
             throw new ArgumentOutOfRangeException(nameof(gammaIdx), $"gammaIdx must be in [0, {numGammaBands}).");
-        if (!_kernelCache.TryGetValue("pac_phase_bin_mi", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: pac_phase_bin_mi");
         using var _ = PushContext();
         IntPtr tp = thetaPhase.Handle, ga = gammaAmp.Handle, op = output.Handle;
         void** args = stackalloc void*[7];
         args[0] = &tp; args[1] = &ga; args[2] = &op;
         args[3] = &batch; args[4] = &numSamples; args[5] = &numGammaBands; args[6] = &gammaIdx;
         uint grid = (uint)batch;
+
+        if (GpuDeterminism.IsActive)
+        {
+            // Issue #382: block size = NUM_PHASE_BINS = 18 (one thread per bin),
+            // no shared memory needed since the deterministic variant uses statically
+            // sized __shared__ inside the kernel.
+            if (!_kernelCache.TryGetValue("pac_phase_bin_mi_deterministic", out var kernelD))
+                throw new InvalidOperationException("CUDA kernel not found: pac_phase_bin_mi_deterministic");
+            CuBlasNative.CheckCudaResult(
+                CudaNativeBindings.cuLaunchKernel(kernelD, grid, 1, 1, 18, 1, 1,
+                    0, _stream, (IntPtr)args, IntPtr.Zero),
+                "cuLaunchKernel(pac_phase_bin_mi_deterministic)");
+            return;
+        }
+
+        if (!_kernelCache.TryGetValue("pac_phase_bin_mi", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: pac_phase_bin_mi");
         uint block = 256;
         uint sharedMem = (uint)(2 * 18 * sizeof(float));
-        CudaNativeBindings.cuLaunchKernel(kernel, grid, 1, 1, block, 1, 1,
-            sharedMem, IntPtr.Zero, (IntPtr)args, IntPtr.Zero);
+        CuBlasNative.CheckCudaResult(
+            CudaNativeBindings.cuLaunchKernel(kernel, grid, 1, 1, block, 1, 1,
+                sharedMem, _stream, (IntPtr)args, IntPtr.Zero),
+            "cuLaunchKernel(pac_phase_bin_mi)");
     }
 
     #endregion
@@ -12132,21 +12456,61 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     }
 
     // --- Reductions ---
-    public void ReduceMean(IGpuBuffer input, IGpuBuffer output, int size) => LaunchFusedUnary("reduce_mean", input, output, size);
+    // Issue #382: when GpuDeterminism.IsActive, route to single-block strided
+    // deterministic variants (no inter-block atomic combine).
+    public unsafe void ReduceMean(IGpuBuffer input, IGpuBuffer output, int size)
+        => LaunchFusedUnaryReduce(
+            GpuDeterminism.IsActive ? "reduce_mean_deterministic" : "reduce_mean",
+            input, output, size, GpuDeterminism.IsActive);
     public void ReduceProduct(IGpuBuffer input, IGpuBuffer output, int size) => LaunchFusedUnary("reduce_product", input, output, size);
-    public void ReduceNormL2(IGpuBuffer input, IGpuBuffer output, int size) => LaunchFusedUnary("reduce_norm_l2", input, output, size);
-    public void ReduceSumOfSquares(IGpuBuffer input, IGpuBuffer output, int size) => LaunchFusedUnary("reduce_sum_of_squares", input, output, size);
+    public unsafe void ReduceNormL2(IGpuBuffer input, IGpuBuffer output, int size)
+        => LaunchFusedUnaryReduce(
+            GpuDeterminism.IsActive ? "reduce_norm_l2_deterministic" : "reduce_norm_l2",
+            input, output, size, GpuDeterminism.IsActive);
+    public unsafe void ReduceSumOfSquares(IGpuBuffer input, IGpuBuffer output, int size)
+        => LaunchFusedUnaryReduce(
+            GpuDeterminism.IsActive ? "reduce_sum_of_squares_deterministic" : "reduce_sum_of_squares",
+            input, output, size, GpuDeterminism.IsActive);
+
+    /// <summary>
+    /// Issue #382: variant of LaunchFusedUnary for scalar reductions that
+    /// honors deterministic mode. When deterministic=true, launches a single block
+    /// (the deterministic kernels do a strided reduce in one block) and pre-zeros
+    /// the output (the kernel does a direct write, not an atomic accumulate).
+    /// </summary>
+    private unsafe void LaunchFusedUnaryReduce(string kernelName, IGpuBuffer input, IGpuBuffer output, int size, bool deterministic)
+    {
+        if (!_kernelCache.TryGetValue(kernelName, out var kernel))
+            throw new InvalidOperationException($"CUDA kernel not found: {kernelName}");
+        using var _ = PushContext();
+        if (deterministic) Fill(output, 0f, 1);
+        IntPtr inPtr = input.Handle, outPtr = output.Handle;
+        void** args = stackalloc void*[3];
+        args[0] = &inPtr; args[1] = &outPtr; args[2] = &size;
+        uint grid = deterministic ? 1u : (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
     public void ReduceMaxMagnitude(IGpuBuffer input, IGpuBuffer output, int size) => LaunchFusedUnary("reduce_max_magnitude", input, output, size);
     public void ReduceMinMagnitude(IGpuBuffer input, IGpuBuffer output, int size) => LaunchFusedUnary("reduce_min_magnitude", input, output, size);
 
     public unsafe void ReduceLogSumExp(IGpuBuffer input, IGpuBuffer output, float maxVal, int size)
     {
-        if (!_kernelCache.TryGetValue("reduce_logsumexp", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: reduce_logsumexp");
         using var _ = PushContext();
         IntPtr inPtr = input.Handle, outPtr = output.Handle;
         void** args = stackalloc void*[4];
         args[0] = &inPtr; args[1] = &outPtr; args[2] = &maxVal; args[3] = &size;
+
+        if (GpuDeterminism.IsActive)
+        {
+            if (!_kernelCache.TryGetValue("reduce_logsumexp_deterministic", out var kernelD))
+                throw new InvalidOperationException("CUDA kernel not found: reduce_logsumexp_deterministic");
+            Fill(output, 0f, 1);
+            LaunchKernel(kernelD, 1, DefaultBlockSize, args);
+            return;
+        }
+
+        if (!_kernelCache.TryGetValue("reduce_logsumexp", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: reduce_logsumexp");
         LaunchKernel(kernel, (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, args);
     }
 
@@ -12468,14 +12832,20 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public unsafe void Crop2DBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput, int batch, int channels, int inH, int inW, int outH, int outW, int offsetH, int offsetW)
     {
-        if (!_kernelCache.TryGetValue("crop_2d_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: crop_2d_backward");
         using var _ = PushContext();
         IntPtr goPtr = gradOutput.Handle, giPtr = gradInput.Handle;
         void** args = stackalloc void*[10];
         args[0] = &goPtr; args[1] = &giPtr; args[2] = &batch; args[3] = &channels;
         args[4] = &inH; args[5] = &inW; args[6] = &outH; args[7] = &outW; args[8] = &offsetH; args[9] = &offsetW;
         uint total = (uint)(batch * channels * outH * outW);
+
+        // Issue #382: original uses atomicAdd defensively (mapping is one-to-one
+        // per launch). Deterministic variant uses direct +=.
+        string kernelName = GpuDeterminism.IsActive
+            ? "crop_2d_backward_deterministic"
+            : "crop_2d_backward";
+        if (!_kernelCache.TryGetValue(kernelName, out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: " + kernelName);
         LaunchKernel(kernel, (total + DefaultBlockSize - 1) / DefaultBlockSize, DefaultBlockSize, args);
     }
 
@@ -12704,12 +13074,24 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     
     public unsafe void DotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int size)
     {
-        if (!_kernelCache.TryGetValue("dot_product", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: dot_product");
         using var _ = PushContext();
         IntPtr ap=a.Handle, bp=b.Handle, op=output.Handle;
         void** args = stackalloc void*[4];
         args[0]=&ap; args[1]=&bp; args[2]=&op; args[3]=&size;
+
+        if (GpuDeterminism.IsActive)
+        {
+            // Issue #382: single-block strided reduce, no inter-block atomic combine.
+            if (!_kernelCache.TryGetValue("dot_product_deterministic", out var kernelD))
+                throw new InvalidOperationException("CUDA kernel not found: dot_product_deterministic");
+            // Pre-zero output: single-block kernel does direct write.
+            Fill(output, 0f, 1);
+            LaunchKernel(kernelD, 1, DefaultBlockSize, args);
+            return;
+        }
+
+        if (!_kernelCache.TryGetValue("dot_product", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: dot_product");
         LaunchKernel(kernel, (uint)((size+DefaultBlockSize-1)/DefaultBlockSize), DefaultBlockSize, args);
     }
 

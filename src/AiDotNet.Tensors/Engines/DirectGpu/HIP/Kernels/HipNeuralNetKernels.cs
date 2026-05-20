@@ -1441,17 +1441,45 @@ extern ""C"" __global__ __launch_bounds__(256) void embedding_forward(
     }
 }
 
+// HIP AllocateIntBuffer uploads true int32 (see HipBackend.AllocateIntBuffer(int[])).
+// Declaring indices as int* (not float*) ensures correct reads; the prior signature
+// of const float* with a (int) cast would float-interpret the int's bit pattern
+// (denormal for small ints) and truncate to 0 — a long-standing bug surfaced by
+// PR #390 review (issue #382).
 extern ""C"" __global__ __launch_bounds__(256) void embedding_backward(
-    const float* gradOutput, const float* indices, float* gradEmbedding,
+    const float* gradOutput, const int* indices, float* gradEmbedding,
     int numIndices, int embeddingDim)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= numIndices) return;
 
-    int idx = (int)indices[i];
+    int idx = indices[i];
     for (int d = 0; d < embeddingDim; d++) {
+        // NON-DETERMINISTIC (issue #382); see embedding_backward_deterministic below.
         atomicAdd(&gradEmbedding[idx * embeddingDim + d], gradOutput[i * embeddingDim + d]);
     }
+}
+
+// Embedding backward — bit-deterministic variant (issue #382).
+// One thread per (v, d) output cell scans numIndices in fixed ascending order.
+extern ""C"" __global__ __launch_bounds__(256) void embedding_backward_deterministic(
+    const float* gradOutput, const int* indices, float* gradEmbedding,
+    int numIndices, int embeddingDim, int vocabSize)
+{
+    int v = blockIdx.y * blockDim.y + threadIdx.y;
+    int d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (v >= vocabSize || d >= embeddingDim) return;
+
+    float sum = 0.0f;
+    for (int i = 0; i < numIndices; i++) {
+        if (indices[i] == v) {
+            sum += gradOutput[i * embeddingDim + d];
+        }
+    }
+    // Plain assignment: this launch owns every (v, d) cell, so overwriting keeps
+    // the kernel self-contained on reused buffers (no requirement that the caller
+    // zero gradEmbedding first).
+    gradEmbedding[v * embeddingDim + d] = sum;
 }
 
 // ===========================================================================
@@ -1734,6 +1762,27 @@ extern ""C"" __global__ __launch_bounds__(256) void scatter_add(
     atomicAdd(&dst[dstIdx], src[idx]);
 }
 
+// scatter_add — bit-deterministic variant (issue #382).
+// CodeRabbit (#390): one thread owns one destination cell; full sum is computed
+// locally so the final write is `=`, not `+=`. Matches embedding_backward_deterministic's
+// self-contained pattern — caller no longer needs to zero dst beforehand.
+extern ""C"" __global__ __launch_bounds__(256) void scatter_add_deterministic(
+    const float* src,
+    const int* indices,
+    float* dst,
+    int numElements,
+    int dstSize)
+{
+    int dstIdx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (dstIdx >= dstSize) return;
+
+    float sum = 0.0f;
+    for (int i = 0; i < numElements; i++) {
+        if (indices[i] == dstIdx) sum += src[i];
+    }
+    dst[dstIdx] = sum;
+}
+
 extern ""C"" __global__ __launch_bounds__(256) void scatter_add_batched(
     const float* src,
     const int* indices,
@@ -1748,6 +1797,27 @@ extern ""C"" __global__ __launch_bounds__(256) void scatter_add_batched(
     int dstIdx = indices[elemIdx];
 
     atomicAdd(&dst[dstIdx * featureSize + featIdx], src[idx]);
+}
+
+// CodeRabbit (#390): same self-contained-write pattern as
+// scatter_add_deterministic. One thread per (dstIdx, featIdx); final `=` not `+=`.
+extern ""C"" __global__ __launch_bounds__(256) void scatter_add_batched_deterministic(
+    const float* src,
+    const int* indices,
+    float* dst,
+    int numElements,
+    int numNodes,
+    int featureSize)
+{
+    int dstIdx = blockIdx.y * blockDim.y + threadIdx.y;
+    int featIdx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (dstIdx >= numNodes || featIdx >= featureSize) return;
+
+    float sum = 0.0f;
+    for (int i = 0; i < numElements; i++) {
+        if (indices[i] == dstIdx) sum += src[i * featureSize + featIdx];
+    }
+    dst[dstIdx * featureSize + featIdx] = sum;
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void scatter_max(
@@ -1794,10 +1864,35 @@ extern ""C"" __global__ __launch_bounds__(256) void scatter_mean_accumulate(
     int dstIdx = indices[elemIdx];
 
     atomicAdd(&dst[dstIdx * featureSize + featIdx], src[idx]);
-    
+
     if (featIdx == 0) {
         atomicAdd(&counts[dstIdx], 1);
     }
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void scatter_mean_accumulate_deterministic(
+    const float* src,
+    const int* indices,
+    float* dst,
+    int* counts,
+    int numElements,
+    int numNodes,
+    int featureSize)
+{
+    int dstIdx = blockIdx.y * blockDim.y + threadIdx.y;
+    int featIdx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (dstIdx >= numNodes || featIdx >= featureSize) return;
+
+    float sum = 0.0f;
+    int cnt = 0;
+    for (int i = 0; i < numElements; i++) {
+        if (indices[i] == dstIdx) {
+            sum += src[i * featureSize + featIdx];
+            if (featIdx == 0) cnt++;
+        }
+    }
+    dst[dstIdx * featureSize + featIdx] += sum;
+    if (featIdx == 0) counts[dstIdx] += cnt;
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void scatter_mean_normalize(
@@ -1859,6 +1954,88 @@ extern ""C"" __global__ __launch_bounds__(256) void groupnorm_backward_sums(
     int groupIdx = n * G + g;
     atomicAdd(&sumDy[groupIdx], dyGam);
     atomicAdd(&sumDyXhat[groupIdx], dyGam * xHat);
+}
+
+// GroupNorm backward sums — bit-deterministic variants (issue #382).
+extern ""C"" __global__ __launch_bounds__(256) void groupnorm_backward_sums_per_channel_deterministic(
+    const float* gradOutput,
+    const float* input,
+    const float* mean,
+    const float* invStd,
+    float* gradGamma,
+    float* gradBeta,
+    int N, int C, int H, int W, int G)
+{
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+
+    int channelsPerGroup = C / G;
+    int g = c / channelsPerGroup;
+    int HW = H * W;
+
+    float accGamma = 0.0f;
+    float accBeta = 0.0f;
+    for (int n = 0; n < N; n++) {
+        float m = mean[n * G + g];
+        float s = invStd[n * G + g];
+        int baseNC = (n * C + c) * HW;
+        for (int hw = 0; hw < HW; hw++) {
+            float dy = gradOutput[baseNC + hw];
+            float x = input[baseNC + hw];
+            float xHat = (x - m) * s;
+            accGamma += dy * xHat;
+            accBeta += dy;
+        }
+    }
+    // Plain assignment: each thread owns one (c) slot and performs the full
+    // reduction locally. Overwriting keeps the kernel self-contained on reused
+    // scratch buffers (does not require the caller to zero-init).
+    gradGamma[c] = accGamma;
+    gradBeta[c] = accBeta;
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void groupnorm_backward_sums_per_group_deterministic(
+    const float* gradOutput,
+    const float* input,
+    const float* mean,
+    const float* invStd,
+    const float* gamma,
+    float* sumDy,
+    float* sumDyXhat,
+    int N, int C, int H, int W, int G)
+{
+    int ng = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ng >= N * G) return;
+
+    int n = ng / G;
+    int g = ng % G;
+    int channelsPerGroup = C / G;
+    int cStart = g * channelsPerGroup;
+    int HW = H * W;
+
+    float m = mean[ng];
+    float s = invStd[ng];
+
+    float accDy = 0.0f;
+    float accDyXhat = 0.0f;
+    for (int cOff = 0; cOff < channelsPerGroup; cOff++) {
+        int c = cStart + cOff;
+        float gam = gamma[c];
+        int baseNC = (n * C + c) * HW;
+        for (int hw = 0; hw < HW; hw++) {
+            float dy = gradOutput[baseNC + hw];
+            float x = input[baseNC + hw];
+            float xHat = (x - m) * s;
+            float dyGam = dy * gam;
+            accDy += dyGam;
+            accDyXhat += dyGam * xHat;
+        }
+    }
+    // Plain assignment: one thread owns each (n*G+g) slot; full reduction is
+    // local. Overwriting matches the per-channel kernel and keeps the kernel
+    // self-contained on reused scratch buffers.
+    sumDy[ng] = accDy;
+    sumDyXhat[ng] = accDyXhat;
 }
 
 // Group normalization backward - Pass 2: Compute final input gradients
@@ -1936,6 +2113,77 @@ extern ""C"" __global__ __launch_bounds__(256) void instancenorm_backward_sums(
     int instanceIdx = n * C + c;
     atomicAdd(&sumDy[instanceIdx], dyGam);
     atomicAdd(&sumDyXhat[instanceIdx], dyGam * xHat);
+}
+
+// InstanceNorm backward sums — bit-deterministic variants (issue #382).
+extern ""C"" __global__ __launch_bounds__(256) void instancenorm_backward_sums_per_channel_deterministic(
+    const float* gradOutput,
+    const float* input,
+    const float* mean,
+    const float* invStd,
+    float* gradGamma,
+    float* gradBeta,
+    int N, int C, int H, int W)
+{
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+
+    int HW = H * W;
+    float accGamma = 0.0f;
+    float accBeta = 0.0f;
+    for (int n = 0; n < N; n++) {
+        float m = mean[n * C + c];
+        float s = invStd[n * C + c];
+        int baseNC = (n * C + c) * HW;
+        for (int hw = 0; hw < HW; hw++) {
+            float dy = gradOutput[baseNC + hw];
+            float x = input[baseNC + hw];
+            float xHat = (x - m) * s;
+            accGamma += dy * xHat;
+            accBeta += dy;
+        }
+    }
+    // Plain assignment: see groupnorm_backward_sums_per_channel_deterministic
+    // for the rationale (one owner per c, full local reduction).
+    gradGamma[c] = accGamma;
+    gradBeta[c] = accBeta;
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void instancenorm_backward_sums_per_instance_deterministic(
+    const float* gradOutput,
+    const float* input,
+    const float* mean,
+    const float* invStd,
+    const float* gamma,
+    float* sumDy,
+    float* sumDyXhat,
+    int N, int C, int H, int W)
+{
+    int nc = blockIdx.x * blockDim.x + threadIdx.x;
+    if (nc >= N * C) return;
+
+    int n = nc / C;
+    int c = nc % C;
+    int HW = H * W;
+
+    float m = mean[nc];
+    float s = invStd[nc];
+    float gam = gamma[c];
+
+    float accDy = 0.0f;
+    float accDyXhat = 0.0f;
+    int baseNC = nc * HW;
+    for (int hw = 0; hw < HW; hw++) {
+        float dy = gradOutput[baseNC + hw];
+        float x = input[baseNC + hw];
+        float xHat = (x - m) * s;
+        float dyGam = dy * gam;
+        accDy += dyGam;
+        accDyXhat += dyGam * xHat;
+    }
+    // Plain assignment: one owner per (n*C+c), full local reduction.
+    sumDy[nc] = accDy;
+    sumDyXhat[nc] = accDyXhat;
 }
 
 // Instance normalization backward - Pass 2: Compute final input gradients
@@ -2256,17 +2504,27 @@ extern ""C"" __global__ __launch_bounds__(256) void batched_gemm(
             "lbfgs_scale_vector", "lbfgs_apply_direction", "lbfgs_compute_rho", "lbfgs_update_history",
             "bfgs_step", "levenberg_marquardt_step", "trust_region_step", "admm_step", "newton_method_step", "dfp_step", "coordinate_descent_step",
             "dropout_forward", "dropout_backward", "embedding_forward", "embedding_backward",
+            "embedding_backward_deterministic",
             "transpose_2d", "batched_transpose", "permute_general",
             // LSTM kernels
             "lstm_cell_forward", "lstm_cell_backward", "lstm_gates_precompute",
             // GRU kernels
             "gru_cell_forward", "gru_cell_backward",
-            // Scatter/Gather for GNNs
-            "scatter_add", "scatter_add_batched", "scatter_max",
-            "scatter_mean_accumulate", "scatter_mean_normalize",
+            // Scatter/Gather for GNNs (issue #382 deterministic variants)
+            "scatter_add", "scatter_add_deterministic",
+            "scatter_add_batched", "scatter_add_batched_deterministic",
+            "scatter_max",
+            "scatter_mean_accumulate", "scatter_mean_accumulate_deterministic",
+            "scatter_mean_normalize",
             // Additional normalization backward
-            "groupnorm_backward_sums", "groupnorm_backward",
-            "instancenorm_backward_sums", "instancenorm_backward",
+            "groupnorm_backward_sums",
+            "groupnorm_backward_sums_per_channel_deterministic",
+            "groupnorm_backward_sums_per_group_deterministic",
+            "groupnorm_backward",
+            "instancenorm_backward_sums",
+            "instancenorm_backward_sums_per_channel_deterministic",
+            "instancenorm_backward_sums_per_instance_deterministic",
+            "instancenorm_backward",
             // Conv3D backward
             "conv3d_backward_input", "conv3d_backward_weights",
             // Global pooling backward

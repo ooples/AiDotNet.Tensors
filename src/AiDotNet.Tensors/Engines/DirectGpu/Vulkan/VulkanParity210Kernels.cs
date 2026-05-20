@@ -242,6 +242,7 @@ void main() {
 }";
 
     // IndexAdd requires atomic float add. Vulkan 1.2+ / VK_EXT_shader_atomic_float.
+    // NON-DETERMINISTIC across runs (issue #382); see IndexAddDeterministic below.
     public static string IndexAdd => @"#version 450
 #extension GL_EXT_shader_atomic_float : require
 layout(local_size_x = 256) in;
@@ -262,6 +263,36 @@ void main() {
     int dstPos = (outer * dstAxis + target) * innerSize + inner;
     int srcPos = (outer * idxLen + i) * innerSize + inner;
     atomicAdd(o[dstPos], src[srcPos]);
+}
+";
+
+    // IndexAdd — bit-deterministic variant (issue #382).
+    // One work-item per (outer, dstTarget, inner) output cell scans idxLen in fixed
+    // ascending order and accumulates contributions whose idx[i] matches dstTarget.
+    // No atomics; accumulation order is identical across runs.
+    public static string IndexAddDeterministic => @"#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) buffer Out { float o[]; };
+layout(set = 0, binding = 1) readonly buffer Idx { int idx[]; };
+layout(set = 0, binding = 2) readonly buffer Src { float src[]; };
+layout(push_constant) uniform P { int outerSize; int dstAxis; int innerSize; int idxLen; };
+void main() {
+    int gid = int(gl_GlobalInvocationID.x);
+    int total = outerSize * dstAxis * innerSize;
+    if (gid >= total) return;
+    int inner = gid % innerSize;
+    int tmp = gid / innerSize;
+    int dstTarget = tmp % dstAxis;
+    int outer = tmp / dstAxis;
+    float sum = 0.0;
+    for (int i = 0; i < idxLen; i++) {
+        if (idx[i] == dstTarget) {
+            int srcPos = (outer * idxLen + i) * innerSize + inner;
+            sum += src[srcPos];
+        }
+    }
+    int dstPos = (outer * dstAxis + dstTarget) * innerSize + inner;
+    o[dstPos] += sum;
 }
 ";
 
