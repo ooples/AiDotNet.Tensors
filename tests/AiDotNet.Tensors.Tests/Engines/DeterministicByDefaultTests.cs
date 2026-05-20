@@ -80,29 +80,22 @@ public class DeterministicByDefaultTests
 
     // ── Acceptance criterion #3 ──────────────────────────────────────────────
     [Fact]
-    public void CompiledModelCache_DifferentDeterminismProducesDifferentPlans()
+    public void CompiledModelCache_DeterminismChange_ReusesPlanInstance()
     {
-        // Plan compiled under deterministic=true must not be served on a subsequent
-        // call under deterministic=false (and vice versa). The cache key mixes in
-        // the current determinism state so the second call misses and recompiles.
+        // PR ooples/AiDotNet.Tensors#416 (fix(AiDotNet#1395)): determinism is
+        // INTENTIONALLY no longer part of the CompiledModelCache shape key.
+        // The pre-PR keying behaviour caused cross-test cache-key drift under
+        // xUnit's pool-recycled thread model whenever
+        // BlasProvider._threadLocalDeterministicOverride drifted between
+        // tests on the same worker thread. This test now pins the new
+        // behaviour: switching the process-wide determinism flag between two
+        // compile calls on the same shape+dtype MUST hit the cache and reuse
+        // the SAME plan instance.
         //
-        // BlasProvider.IsDeterministicMode resolves as
-        //   `_threadLocalDeterministicOverride ?? _deterministicMode`.
-        // SetDeterministicMode only writes the process-wide field. If a prior
-        // test in this collection (or upstream framework code) installed a
-        // thread-local override on the xUnit worker thread and the override
-        // is still pinned, both `Set(true)` and `Set(false)` calls in this
-        // test will be ignored by the override-first read — both compiles
-        // see the same key and the cache hands back the same plan instance.
-        // Capture and restore BOTH layers, and explicitly clear the
-        // thread-local override at the top so the process-wide toggle is
-        // observable for the duration of the test.
-        // Order matters: capture the thread-local override first, then
-        // CLEAR it before reading the process-wide flag. AiDotNetEngine
-        // .DeterministicMode returns the *merged effective* state (override
-        // wins), so reading it before the clear can stash the wrong value
-        // and the finally-block restore would then leak that override into
-        // the global flag.
+        // Determinism still affects EXECUTION (BlasProvider.IsDeterministicMode
+        // is read inside the kernel dispatch), so the same compiled plan runs
+        // correctly in both modes — what's removed is the cache-miss-and-
+        // recompile-on-mode-switch that produced #1395.
         bool? originalThreadLocal = BlasProvider.GetThreadLocalDeterministicMode();
         BlasProvider.SetThreadLocalDeterministicMode(null);
         bool originalProcess = AiDotNetEngine.DeterministicMode;
@@ -136,11 +129,9 @@ public class DeterministicByDefaultTests
                     return engine.ReduceSum(output, null);
                 });
 
-            // The two plans must be distinct instances — the cache is keyed on
-            // (shape, elementType, deterministicMode), so switching determinism
-            // forces a miss and recompile even though the shape and type are
-            // identical.
-            Assert.NotSame(planDeterministic, planNonDeterministic);
+            // Post-PR #416: the cache key is (shape, elementType) only — the
+            // second call MUST hit the cache and hand back the same instance.
+            Assert.Same(planDeterministic, planNonDeterministic);
         }
         finally
         {
@@ -408,11 +399,19 @@ public class DeterministicByDefaultTests
     }
 
     [Fact]
-    public void SetCurrent_ThreadLocalOverride_ReflectsInCompiledModelCacheKey()
+    public void SetCurrent_ThreadLocalOverride_DoesNotInvalidateCompiledModelCachePlan()
     {
-        // The cache key already mixes in BlasProvider.IsDeterministicMode, so the
-        // thread-local override should automatically produce distinct plans when a
-        // single thread toggles its own override between two compile calls.
+        // PR ooples/AiDotNet.Tensors#416 (fix(AiDotNet#1395)): the
+        // [ThreadStatic] determinism override is INTENTIONALLY no longer part
+        // of the CompiledModelCache shape key. The pre-PR behaviour produced
+        // false cache misses whenever xUnit pool-recycled a thread that
+        // happened to carry a stale TensorCodecOptions override, causing the
+        // "fused training has already run but the current step cannot engage
+        // the fused path" failure documented in AiDotNet#1395.
+        //
+        // This test pins the new behaviour: toggling the thread-local
+        // determinism override between two compile calls on the same shape
+        // must NOT force a recompile — the plan is shared across modes.
         bool originalProcess = AiDotNetEngine.DeterministicMode;
         var originalOptions  = TensorCodecOptions.Current;
         try
@@ -445,7 +444,9 @@ public class DeterministicByDefaultTests
                     return engine.ReduceSum(output, null);
                 });
 
-            Assert.NotSame(planInherited, planOverridden);
+            // Post-PR #416: cache key no longer mixes determinism, so the
+            // second call hits the cache. Same instance expected.
+            Assert.Same(planInherited, planOverridden);
         }
         finally
         {
