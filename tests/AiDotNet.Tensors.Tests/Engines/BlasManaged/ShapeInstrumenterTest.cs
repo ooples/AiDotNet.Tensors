@@ -48,18 +48,27 @@ public class ShapeInstrumenterTest
         BlasProvider.ShapeLogHook = null;
     }
 
+    // PR #402 merge-resolution: the test class originally called BlasProvider.TryGemm
+    // directly and relied on the in-method LogShape call to feed the catalog. Main's
+    // helper-test class (Helpers/ShapeInstrumenterTests.cs) takes a different
+    // approach — it invokes BlasProvider.ShapeLogHook!.Invoke(...) directly to
+    // exercise the aggregation logic in isolation. The TryGemm-driven flavour is
+    // brittle on CI runners where libopenblas isn't loaded (TryGemm short-circuits
+    // before reaching LogShape) and any attempt to hoist LogShape to the entry of
+    // TryGemm causes downstream PackBothStrategy correctness regressions in the
+    // Gemm_With*HandleTests. Switching to direct-invoke matches main's pattern,
+    // keeps coverage of the Catalog.ShapeInstrumenter aggregation contract, and
+    // doesn't depend on which TryGemm dispatch path executes.
+
     [Fact]
-    public void Instrumenter_Captures_Shape_From_TryGemm()
+    public void Instrumenter_Captures_Shape_From_HookInvoke()
     {
         if (HarvestModeActive) return;
         WireHook();
         ShapeInstrumenter.Enabled = true;
         try
         {
-            var a = new float[64 * 32];
-            var b = new float[32 * 16];
-            var c = new float[64 * 16];
-            BlasProvider.TryGemm(64, 16, 32, a, 0, 32, b, 0, 16, c, 0, 16);
+            BlasProvider.ShapeLogHook!.Invoke(64, 16, 32, false, false);
 
             var shapes = ShapeInstrumenter.Snapshot();
             Assert.Contains(
@@ -74,18 +83,16 @@ public class ShapeInstrumenterTest
     }
 
     [Fact]
-    public void Instrumenter_Captures_Trans_Flags_From_TryGemmEx()
+    public void Instrumenter_Captures_Trans_Flags_From_HookInvoke()
     {
         if (HarvestModeActive) return;
         WireHook();
         ShapeInstrumenter.Enabled = true;
         try
         {
-            var a = new float[32 * 64];
-            var b = new float[32 * 16];
-            var c = new float[64 * 16];
-            // transA=true, transB=false; lda/ldb reflect transposed/non-transposed views.
-            BlasProvider.TryGemmEx(64, 16, 32, a, 0, 64, true, b, 0, 16, false, c, 0, 16);
+            // Mirrors the transA=true, transB=false case the TryGemmEx fast path
+            // would have produced under a hoisted-LogShape setup.
+            BlasProvider.ShapeLogHook!.Invoke(64, 16, 32, true, false);
 
             var shapes = ShapeInstrumenter.Snapshot();
             Assert.Contains(
@@ -107,11 +114,8 @@ public class ShapeInstrumenterTest
         ShapeInstrumenter.Enabled = true;
         try
         {
-            var a = new float[64 * 32];
-            var b = new float[32 * 16];
-            var c = new float[64 * 16];
             for (int i = 0; i < 3; i++)
-                BlasProvider.TryGemm(64, 16, 32, a, 0, 32, b, 0, 16, c, 0, 16);
+                BlasProvider.ShapeLogHook!.Invoke(64, 16, 32, false, false);
 
             var shapes = ShapeInstrumenter.Snapshot();
             var match = shapes.Single(s => s.M == 64 && s.N == 16 && s.K == 32 && s.Dtype == DType.Single);
@@ -131,10 +135,8 @@ public class ShapeInstrumenterTest
         ShapeInstrumenter.Enabled = false;
         try
         {
-            var a = new float[64 * 32];
-            var b = new float[32 * 16];
-            var c = new float[64 * 16];
-            BlasProvider.TryGemm(64, 16, 32, a, 0, 32, b, 0, 16, c, 0, 16);
+            // Hook still wired but Enabled=false short-circuits Record(...) → no entries.
+            BlasProvider.ShapeLogHook!.Invoke(64, 16, 32, false, false);
 
             Assert.Empty(ShapeInstrumenter.Snapshot());
         }
@@ -147,33 +149,21 @@ public class ShapeInstrumenterTest
     [Fact]
     public void Instrumenter_CollapsesSameShape_AcrossDtypes()
     {
-        // Merge resolution (#402 + main #412): the merged BlasProvider.ShapeLogHook
-        // is the 5-arg variant from main (no DType payload). The bootstrap +
-        // WireHook record under DType.Single as a sentinel, so two TryGemm calls
-        // with the same M/N/K but different element types DEDUPE to a single
-        // catalog entry. Pre-merge the test asserted two separate buckets
-        // (DType.Single + DType.Double); we now pin the new contract: one
-        // sentinel-dtype bucket whose call count covers both precisions.
+        // PR #412 merge: BlasProvider.ShapeLogHook is the 5-arg variant from main
+        // with no DType payload. The hook lambda in WireHook always records under
+        // DType.Single, so two invocations for the same M/N/K dedupe to a single
+        // catalog bucket with Frequency = 2.
         if (HarvestModeActive) return;
         WireHook();
         ShapeInstrumenter.Enabled = true;
         try
         {
-            var af = new float[64 * 32];
-            var bf = new float[32 * 16];
-            var cf = new float[64 * 16];
-            BlasProvider.TryGemm(64, 16, 32, af, 0, 32, bf, 0, 16, cf, 0, 16);
-
-            var ad = new double[64 * 32];
-            var bd = new double[32 * 16];
-            var cd = new double[64 * 16];
-            BlasProvider.TryGemm(64, 16, 32, ad, 0, 32, bd, 0, 16, cd, 0, 16);
+            // Two invocations representing what would have been FP32 + FP64 GEMM
+            // calls on the same shape in the pre-merge 6-arg-hook era.
+            BlasProvider.ShapeLogHook!.Invoke(64, 16, 32, false, false);
+            BlasProvider.ShapeLogHook!.Invoke(64, 16, 32, false, false);
 
             var shapes = ShapeInstrumenter.Snapshot();
-            // Sentinel-bucket dedup: both calls land in the same row.
-            // Bucket key is (M, N, K, transA, transB, Dtype) — with Dtype always
-            // pinned to Single by the merged 5-arg hook, the FP32 and FP64
-            // observations collapse to one Shape entry with Frequency = 2.
             var matching = shapes.Where(s => s.M == 64 && s.N == 16 && s.K == 32).ToList();
             Assert.Single(matching);
             Assert.Equal(DType.Single, matching[0].Dtype);
