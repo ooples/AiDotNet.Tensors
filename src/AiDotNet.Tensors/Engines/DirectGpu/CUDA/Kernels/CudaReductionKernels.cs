@@ -96,7 +96,25 @@ extern ""C"" __global__ __launch_bounds__(256) void reduce_mean(
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < size; i += blockDim.x * gridDim.x)
         sum += input[i];
     sum = block_reduce_sum(sum);
+    // NON-DETERMINISTIC (issue #382): inter-block atomicAdd ordering is scheduler-
+    // dependent. See *_deterministic variants below — launch with grid=1, single block
+    // iterates the entire tensor strided.
     if (threadIdx.x == 0) atomicAdd(output, sum / (float)size);
+}
+
+// Single-block deterministic reductions (issue #382).
+// Launch with gridDim=1, blockDim=256. The single block strides through the entire
+// input in fixed (threadIdx + k*blockDim) order; intra-block reduction is fixed.
+// No inter-block atomic combine. Slower than the multi-block atomic version for
+// very large tensors (limited to blockDim parallelism), but bit-identical across runs.
+extern ""C"" __global__ __launch_bounds__(256) void reduce_mean_deterministic(
+    const float* __restrict__ input, float* __restrict__ output, int size)
+{
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < size; i += blockDim.x)
+        sum += input[i];
+    sum = block_reduce_sum(sum);
+    if (threadIdx.x == 0) *output = sum / (float)size;
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void reduce_product(
@@ -127,7 +145,19 @@ extern ""C"" __global__ __launch_bounds__(256) void reduce_norm_l2(
     }
     sum_sq = block_reduce_sum(sum_sq);
     if (threadIdx.x == 0) atomicAdd(output, sum_sq);
-    // Caller takes sqrt of output
+    // Caller takes sqrt of output. NON-DETERMINISTIC (issue #382); see *_deterministic.
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void reduce_norm_l2_deterministic(
+    const float* __restrict__ input, float* __restrict__ output, int size)
+{
+    float sum_sq = 0.0f;
+    for (int i = threadIdx.x; i < size; i += blockDim.x) {
+        float v = input[i];
+        sum_sq += v * v;
+    }
+    sum_sq = block_reduce_sum(sum_sq);
+    if (threadIdx.x == 0) *output = sum_sq;
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void reduce_sum_of_squares(
@@ -140,6 +170,19 @@ extern ""C"" __global__ __launch_bounds__(256) void reduce_sum_of_squares(
     }
     sum_sq = block_reduce_sum(sum_sq);
     if (threadIdx.x == 0) atomicAdd(output, sum_sq);
+    // NON-DETERMINISTIC (issue #382); see reduce_sum_of_squares_deterministic.
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void reduce_sum_of_squares_deterministic(
+    const float* __restrict__ input, float* __restrict__ output, int size)
+{
+    float sum_sq = 0.0f;
+    for (int i = threadIdx.x; i < size; i += blockDim.x) {
+        float v = input[i];
+        sum_sq += v * v;
+    }
+    sum_sq = block_reduce_sum(sum_sq);
+    if (threadIdx.x == 0) *output = sum_sq;
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void reduce_max_magnitude(
@@ -188,7 +231,18 @@ extern ""C"" __global__ __launch_bounds__(256) void reduce_logsumexp(
         sum += expf(input[i] - maxVal);
     sum = block_reduce_sum(sum);
     if (threadIdx.x == 0) atomicAdd(output, sum);
-    // Caller computes: maxVal + log(output)
+    // Caller computes: maxVal + log(output). NON-DETERMINISTIC (issue #382).
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void reduce_logsumexp_deterministic(
+    const float* __restrict__ input, float* __restrict__ output,
+    float maxVal, int size)
+{
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < size; i += blockDim.x)
+        sum += expf(input[i] - maxVal);
+    sum = block_reduce_sum(sum);
+    if (threadIdx.x == 0) *output = sum;
 }
 
 // ============================================================================
@@ -467,12 +521,16 @@ extern ""C"" __global__ __launch_bounds__(256) void reduce_log_variance_backward
         return
         [
             "reduce_mean",
+            "reduce_mean_deterministic",
             "reduce_product",
             "reduce_norm_l2",
+            "reduce_norm_l2_deterministic",
             "reduce_sum_of_squares",
+            "reduce_sum_of_squares_deterministic",
             "reduce_max_magnitude",
             "reduce_min_magnitude",
             "reduce_logsumexp",
+            "reduce_logsumexp_deterministic",
             "mean_axis",
             "variance_axis",
             "std_axis",

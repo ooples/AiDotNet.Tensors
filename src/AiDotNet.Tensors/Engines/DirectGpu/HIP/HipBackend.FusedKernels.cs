@@ -29,8 +29,42 @@ public sealed partial class HipBackend
     public unsafe void BroadcastSubLast(IGpuBuffer a1, IGpuBuffer b1, IGpuBuffer o, int os, int isz) { if (_kernelCache.TryGetValue("broadcast_sub_last", out var k)) { IntPtr ap=a1.Handle,bp=b1.Handle,op=o.Handle; void** a=stackalloc void*[5]; a[0]=&ap;a[1]=&bp;a[2]=&op;a[3]=&os;a[4]=&isz; LaunchKernel(k,(uint)((os*isz+DefaultBlockSize-1)/DefaultBlockSize),DefaultBlockSize,a); return; } float[] ad=DownloadBuffer(a1);float[] bd=DownloadBuffer(b1);float[] r=new float[os*isz];for(int j=0;j<os*isz;j++)r[j]=ad[j]-bd[j%isz];UploadToExistingHip(r,o); }
     public unsafe void BroadcastMulLast(IGpuBuffer a1, IGpuBuffer b1, IGpuBuffer o, int os, int isz) { if (_kernelCache.TryGetValue("broadcast_mul_last", out var k)) { IntPtr ap=a1.Handle,bp=b1.Handle,op=o.Handle; void** a=stackalloc void*[5]; a[0]=&ap;a[1]=&bp;a[2]=&op;a[3]=&os;a[4]=&isz; LaunchKernel(k,(uint)((os*isz+DefaultBlockSize-1)/DefaultBlockSize),DefaultBlockSize,a); return; } float[] ad=DownloadBuffer(a1);float[] bd=DownloadBuffer(b1);float[] r=new float[os*isz];for(int j=0;j<os*isz;j++)r[j]=ad[j]*bd[j%isz];UploadToExistingHip(r,o); }
     public unsafe void BroadcastDivLast(IGpuBuffer a1, IGpuBuffer b1, IGpuBuffer o, int os, int isz) { if (_kernelCache.TryGetValue("broadcast_div_last", out var k)) { IntPtr ap=a1.Handle,bp=b1.Handle,op=o.Handle; void** a=stackalloc void*[5]; a[0]=&ap;a[1]=&bp;a[2]=&op;a[3]=&os;a[4]=&isz; LaunchKernel(k,(uint)((os*isz+DefaultBlockSize-1)/DefaultBlockSize),DefaultBlockSize,a); return; } float[] ad=DownloadBuffer(a1);float[] bd=DownloadBuffer(b1);float[] r=new float[os*isz];for(int j=0;j<os*isz;j++)r[j]=ad[j]/(bd[j%isz]+1e-12f);UploadToExistingHip(r,o); }
-    public unsafe void DotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int size) { if (_kernelCache.TryGetValue("dot_product", out var k)) { IntPtr ap=a.Handle,bp=b.Handle,op=output.Handle; void** ar=stackalloc void*[4]; ar[0]=&ap;ar[1]=&bp;ar[2]=&op;ar[3]=&size; LaunchKernel(k,(uint)((size+DefaultBlockSize-1)/DefaultBlockSize),DefaultBlockSize,ar); return; } float[] ad=DownloadBuffer(a);float[] bd=DownloadBuffer(b);float s=0;for(int i=0;i<size;i++)s+=ad[i]*bd[i]; UploadToExistingHip(new[]{s},output); }
-    public unsafe void StridedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int size, int strideA, int strideB, int count) { if (_kernelCache.TryGetValue("strided_dot_product", out var k)) { IntPtr ap=a.Handle,bp=b.Handle,op=output.Handle; void** ar=stackalloc void*[7]; ar[0]=&ap;ar[1]=&bp;ar[2]=&op;ar[3]=&size;ar[4]=&strideA;ar[5]=&strideB;ar[6]=&count; LaunchKernel(k,(uint)((count+DefaultBlockSize-1)/DefaultBlockSize),DefaultBlockSize,ar); return; } float[] ad=DownloadBuffer(a);float[] bd=DownloadBuffer(b);float[] r=new float[count];for(int c2=0;c2<count;c2++){float s=0;for(int i=0;i<size;i++)s+=ad[c2*strideA+i]*bd[c2*strideB+i];r[c2]=s;}UploadToExistingHip(r,output); }
+    public unsafe void DotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int size)
+    {
+        // Issue #382: deterministic variant fixes accumulation order by
+        // launching a single block (kernel itself ignores blockIdx.x — only
+        // threadIdx.x stride is used) and writing `*result = sum` instead of
+        // atomicAdd.
+        string kname = GpuDeterminism.IsActive ? "dot_product_deterministic" : "dot_product";
+        if (_kernelCache.TryGetValue(kname, out var k))
+        {
+            IntPtr ap=a.Handle,bp=b.Handle,op=output.Handle;
+            void** ar=stackalloc void*[4];
+            ar[0]=&ap;ar[1]=&bp;ar[2]=&op;ar[3]=&size;
+            uint grid = GpuDeterminism.IsActive ? 1u : (uint)((size+DefaultBlockSize-1)/DefaultBlockSize);
+            LaunchKernel(k, grid, DefaultBlockSize, ar);
+            return;
+        }
+        float[] ad=DownloadBuffer(a);float[] bd=DownloadBuffer(b);float s=0;for(int i=0;i<size;i++)s+=ad[i]*bd[i]; UploadToExistingHip(new[]{s},output);
+    }
+    public unsafe void StridedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int size, int strideA, int strideB, int count)
+    {
+        // Issue #382: deterministic variant launched single-block (kernel uses
+        // only threadIdx.x stride). Note: the kernel signature is
+        // (a, b, result, aSize, bSize, bOffset, bStride) — preserve the existing
+        // wire-up; argument-name mismatch is a separate concern.
+        string kname = GpuDeterminism.IsActive ? "strided_dot_product_deterministic" : "strided_dot_product";
+        if (_kernelCache.TryGetValue(kname, out var k))
+        {
+            IntPtr ap=a.Handle,bp=b.Handle,op=output.Handle;
+            void** ar=stackalloc void*[7];
+            ar[0]=&ap;ar[1]=&bp;ar[2]=&op;ar[3]=&size;ar[4]=&strideA;ar[5]=&strideB;ar[6]=&count;
+            uint grid = GpuDeterminism.IsActive ? 1u : (uint)((count+DefaultBlockSize-1)/DefaultBlockSize);
+            LaunchKernel(k, grid, DefaultBlockSize, ar);
+            return;
+        }
+        float[] ad=DownloadBuffer(a);float[] bd=DownloadBuffer(b);float[] r=new float[count];for(int c2=0;c2<count;c2++){float s=0;for(int i=0;i<size;i++)s+=ad[c2*strideA+i]*bd[c2*strideB+i];r[c2]=s;}UploadToExistingHip(r,output);
+    }
     public unsafe void BatchedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int batchSize, int dim) { if (_kernelCache.TryGetValue("batched_dot_product", out var k)) { IntPtr ap=a.Handle,bp=b.Handle,op=output.Handle; void** ar=stackalloc void*[5]; ar[0]=&ap;ar[1]=&bp;ar[2]=&op;ar[3]=&batchSize;ar[4]=&dim; LaunchKernel(k,(uint)((batchSize+DefaultBlockSize-1)/DefaultBlockSize),DefaultBlockSize,ar); return; } float[] ad=DownloadBuffer(a);float[] bd=DownloadBuffer(b);float[] r=new float[batchSize];for(int i=0;i<batchSize;i++){float s=0;for(int j=0;j<dim;j++)s+=ad[i*dim+j]*bd[i*dim+j];r[i]=s;}UploadToExistingHip(r,output); }
 
     private void UploadToExistingHip(float[] data, IGpuBuffer buffer)

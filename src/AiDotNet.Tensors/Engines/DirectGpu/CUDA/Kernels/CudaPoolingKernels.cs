@@ -58,6 +58,7 @@ extern ""C"" __global__ __launch_bounds__(256) void maxpool2d(
 }
 
 // Max Pooling 2D backward pass
+// NON-DETERMINISTIC across runs (issue #382); see maxpool2d_backward_deterministic.
 extern ""C"" __global__ __launch_bounds__(256) void maxpool2d_backward(
     const float* __restrict__ gradOutput, const int* __restrict__ indices, float* __restrict__ gradInput,
     int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth)
@@ -78,6 +79,34 @@ extern ""C"" __global__ __launch_bounds__(256) void maxpool2d_backward(
     int inputIdx = ((b * channels + c) * inHeight + ih) * inWidth + iw;
 
     atomicAdd(&gradInput[inputIdx], grad);
+}
+
+// maxpool2d_backward — bit-deterministic variant (issue #382).
+// One thread per (b, c, ih, iw) input cell scans every output position in fixed
+// (oh, ow) order and accumulates gradients from output cells whose indices[outIdx]
+// points to this input cell.
+extern ""C"" __global__ __launch_bounds__(256) void maxpool2d_backward_deterministic(
+    const float* __restrict__ gradOutput, const int* __restrict__ indices, float* __restrict__ gradInput,
+    int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth)
+{
+    int iw = blockIdx.x * blockDim.x + threadIdx.x;
+    int ih = blockIdx.y * blockDim.y + threadIdx.y;
+    int c = blockIdx.z % channels;
+    int b = blockIdx.z / channels;
+    if (iw >= inWidth || ih >= inHeight || b >= batch) return;
+
+    int targetMaxIdx = ih * inWidth + iw;
+    float sum = 0.0f;
+    int outBase = (b * channels + c) * outHeight * outWidth;
+    for (int oh = 0; oh < outHeight; oh++) {
+        for (int ow = 0; ow < outWidth; ow++) {
+            int outIdx = outBase + oh * outWidth + ow;
+            if (indices[outIdx] == targetMaxIdx) {
+                sum += gradOutput[outIdx];
+            }
+        }
+    }
+    gradInput[((b * channels + c) * inHeight + ih) * inWidth + iw] += sum;
 }
 
 // Average Pooling 2D
@@ -256,7 +285,37 @@ extern ""C"" __global__ __launch_bounds__(256) void global_maxpool2d_backward(
 
     // Convert local spatial index to global input index
     int inputOffset = (b * channels + c) * spatialSize;
+    // NON-DETERMINISTIC (issue #382): only one outputs writes per (b, c) here, BUT
+    // multiple grid_z values share the same maxIdx, so atomic ordering matters when
+    // multiple gradOutput[idx] target the same input cell across re-runs at different
+    // launch configurations. Deterministic variant below.
     atomicAdd(&gradInput[inputOffset + maxIdx], grad);
+}
+
+// global_maxpool2d_backward — bit-deterministic variant (issue #382).
+// Each (b, c) has exactly one output and one maxIdx, and inputOffset is
+// derived from (b, c) — so every thread owns a unique gradInput slot. The
+// 1D launch (one thread per (b, c) output cell) writes its grad with `=`,
+// no atomic and no race. Caller pre-zeros gradInput; non-maxIdx positions
+// stay zero by construction.
+extern ""C"" __global__ __launch_bounds__(256) void global_maxpool2d_backward_deterministic(
+    const float* __restrict__ gradOutput, const int* __restrict__ indices, float* __restrict__ gradInput,
+    int batch, int channels, int height, int width)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int totalOutputs = batch * channels;
+    if (idx >= totalOutputs) return;
+
+    int c = idx % channels;
+    int b = idx / channels;
+    int spatialSize = height * width;
+
+    float grad = gradOutput[idx];
+    int maxIdx = indices[idx];
+    if (maxIdx < 0 || maxIdx >= spatialSize) return;
+
+    int inputOffset = (b * channels + c) * spatialSize;
+    gradInput[inputOffset + maxIdx] = grad;
 }
 
 // Adaptive Average Pooling 2D
@@ -387,6 +446,41 @@ extern ""C"" __global__ __launch_bounds__(256) void maxpool3d_backward(
     int inputIdx = ((b * channels + c) * inDepth + id) * inHeight * inWidth
                  + ih * inWidth + iw;
     atomicAdd(&gradInput[inputIdx], grad);
+}
+
+// maxpool3d_backward — bit-deterministic variant (issue #382).
+// One thread per (b, c, id, ih, iw) input cell scans every output position and
+// accumulates gradients from output cells whose indices[outIdx] points here.
+extern ""C"" __global__ __launch_bounds__(256) void maxpool3d_backward_deterministic(
+    const float* __restrict__ gradOutput, const int* __restrict__ indices, float* __restrict__ gradInput,
+    int batch, int channels,
+    int inDepth, int inHeight, int inWidth,
+    int outDepth, int outHeight, int outWidth)
+{
+    int iw = blockIdx.x * blockDim.x + threadIdx.x;
+    int ih = blockIdx.y * blockDim.y + threadIdx.y;
+    int linear_z = blockIdx.z;
+    int id = linear_z % inDepth;
+    int c = (linear_z / inDepth) % channels;
+    int b = linear_z / (inDepth * channels);
+    if (iw >= inWidth || ih >= inHeight || id >= inDepth || b >= batch) return;
+
+    int spatialHW = inHeight * inWidth;
+    int targetMaxIdx = id * spatialHW + ih * inWidth + iw;
+
+    float sum = 0.0f;
+    for (int od = 0; od < outDepth; od++) {
+        for (int oh = 0; oh < outHeight; oh++) {
+            for (int ow = 0; ow < outWidth; ow++) {
+                int outIdx = ((b * channels + c) * outDepth + od) * outHeight * outWidth
+                           + oh * outWidth + ow;
+                if (indices[outIdx] == targetMaxIdx) {
+                    sum += gradOutput[outIdx];
+                }
+            }
+        }
+    }
+    gradInput[((b * channels + c) * inDepth + id) * inHeight * inWidth + ih * inWidth + iw] += sum;
 }
 
 // Average Pooling 3D
@@ -643,6 +737,44 @@ extern ""C"" __global__ __launch_bounds__(256) void nearest_upsample3d_backward(
     atomicAdd(&gradInput[inputIdx], gradOutput[outIdx]);
 }
 
+// nearest_upsample3d_backward — bit-deterministic variant (issue #382).
+// One thread per (b, c, id, ih, iw) input cell sums the gradients from the
+// scaleD*scaleH*scaleW output cells that map back to this input cell.
+extern ""C"" __global__ __launch_bounds__(256) void nearest_upsample3d_backward_deterministic(
+    const float* __restrict__ gradOutput, float* __restrict__ gradInput,
+    int batch, int channels,
+    int inDepth, int inHeight, int inWidth,
+    int scaleD, int scaleH, int scaleW)
+{
+    int outHeight = inHeight * scaleH;
+    int outWidth = inWidth * scaleW;
+    int outDepth = inDepth * scaleD;
+
+    int iw = blockIdx.x * blockDim.x + threadIdx.x;
+    int ih = blockIdx.y * blockDim.y + threadIdx.y;
+    int linear_z = blockIdx.z;
+    int id = linear_z % inDepth;
+    int c = (linear_z / inDepth) % channels;
+    int b = linear_z / (inDepth * channels);
+    if (iw >= inWidth || ih >= inHeight || id >= inDepth || b >= batch) return;
+
+    float sum = 0.0f;
+    int odStart = id * scaleD;
+    int ohStart = ih * scaleH;
+    int owStart = iw * scaleW;
+    for (int od = odStart; od < odStart + scaleD; od++) {
+        for (int oh = ohStart; oh < ohStart + scaleH; oh++) {
+            for (int ow = owStart; ow < owStart + scaleW; ow++) {
+                int outIdx = ((b * channels + c) * outDepth + od) * outHeight * outWidth
+                           + oh * outWidth + ow;
+                sum += gradOutput[outIdx];
+            }
+        }
+    }
+    int inputIdx = ((b * channels + c) * inDepth + id) * inHeight * inWidth + ih * inWidth + iw;
+    gradInput[inputIdx] += sum;
+}
+
 // ===========================================================================
 // BILINEAR UPSAMPLE 2D
 // ===========================================================================
@@ -729,6 +861,52 @@ extern ""C"" __global__ __launch_bounds__(256) void bilinear_upsample_backward(
     atomicAdd(&gradInput[baseIdx + h1 * inWidth + w0], grad * hLerp * (1.0f - wLerp));
     atomicAdd(&gradInput[baseIdx + h1 * inWidth + w1], grad * hLerp * wLerp);
 }
+
+// bilinear_upsample_backward — bit-deterministic variant (issue #382).
+// One thread per (bc, ih, iw) input cell scans every output position; for each
+// output position checks whether this input cell is one of its 4 bilinear corners
+// and accumulates the corresponding weighted gradient.
+extern ""C"" __global__ __launch_bounds__(256) void bilinear_upsample_backward_deterministic(
+    const float* __restrict__ gradOutput, float* __restrict__ gradInput,
+    int batchChannels, int inHeight, int inWidth, int outHeight, int outWidth)
+{
+    int iwIdx = blockIdx.x * blockDim.x + threadIdx.x;
+    int ihIdx = blockIdx.y * blockDim.y + threadIdx.y;
+    int bc = blockIdx.z;
+    if (iwIdx >= inWidth || ihIdx >= inHeight || bc >= batchChannels) return;
+
+    float sum = 0.0f;
+    float scaleH = (float)inHeight / (float)outHeight;
+    float scaleW = (float)inWidth / (float)outWidth;
+
+    for (int oh = 0; oh < outHeight; oh++) {
+        for (int ow = 0; ow < outWidth; ow++) {
+            float srcH = ((float)oh + 0.5f) * scaleH - 0.5f;
+            float srcW = ((float)ow + 0.5f) * scaleW - 0.5f;
+            int h0 = (int)floorf(srcH);
+            int w0 = (int)floorf(srcW);
+            int h1 = h0 + 1;
+            int w1 = w0 + 1;
+            float hLerp = srcH - (float)h0;
+            float wLerp = srcW - (float)w0;
+
+            h0 = max(0, min(h0, inHeight - 1));
+            h1 = max(0, min(h1, inHeight - 1));
+            w0 = max(0, min(w0, inWidth - 1));
+            w1 = max(0, min(w1, inWidth - 1));
+
+            int outIdx = (bc * outHeight + oh) * outWidth + ow;
+            float grad = gradOutput[outIdx];
+
+            if (h0 == ihIdx && w0 == iwIdx) sum += grad * (1.0f - hLerp) * (1.0f - wLerp);
+            if (h0 == ihIdx && w1 == iwIdx) sum += grad * (1.0f - hLerp) * wLerp;
+            if (h1 == ihIdx && w0 == iwIdx) sum += grad * hLerp * (1.0f - wLerp);
+            if (h1 == ihIdx && w1 == iwIdx) sum += grad * hLerp * wLerp;
+        }
+    }
+    int baseIdx = bc * inHeight * inWidth;
+    gradInput[baseIdx + ihIdx * inWidth + iwIdx] += sum;
+}
 ";
         }
 
@@ -738,15 +916,20 @@ extern ""C"" __global__ __launch_bounds__(256) void bilinear_upsample_backward(
             {
                 "maxpool2d",
                 "maxpool2d_backward",
+                "maxpool2d_backward_deterministic",
                 "avgpool2d",
                 "avgpool2d_backward",
                 "global_avgpool2d",
                 "global_maxpool2d",
                 "global_avgpool2d_backward",
                 "global_maxpool2d_backward",
+                "global_maxpool2d_backward_deterministic",
                 "adaptive_avgpool2d",
                 "maxpool3d",
                 "maxpool3d_backward",
+                "maxpool3d_backward_deterministic",
+                "nearest_upsample3d_backward_deterministic",
+                "bilinear_upsample_backward_deterministic",
                 "avgpool3d",
                 "avgpool3d_backward",
                 "nearest_neighbor_upsample",

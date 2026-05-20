@@ -1190,6 +1190,10 @@ inline void atomic_add_float(__global volatile float* addr, float val) {
     } while (atomic_cmpxchg((__global volatile unsigned int*)addr, oldval.u, newval.u) != oldval.u);
 }
 
+// scatter_mean: source[srcRow, col] is scattered into output[indices[srcRow], col]
+// then divided by per-output-row count. The atomic_add_float CAS loop is FP-
+// non-deterministic across runs (issue #382). When DeterministicMode is set,
+// dispatch routes to scatter_mean_deterministic below.
 __kernel void scatter_mean(__global const float* source, __global const int* indices, __global volatile float* output, __global volatile int* counts, const int sourceSize, const int featureSize)
 {
     const int idx = get_global_id(0); if (idx >= sourceSize) return;
@@ -1197,6 +1201,44 @@ __kernel void scatter_mean(__global const float* source, __global const int* ind
     int targetRow = indices[row];
     atomic_add_float(&output[targetRow * featureSize + col], source[idx]);
     if (col == 0) atomic_add(&counts[targetRow], 1);
+}
+
+// scatter_mean — bit-deterministic variant (issue #382).
+// Transposes the work: one work-item per (dstRow, col) cell of the output. The
+// work-item scans all source rows in fixed ascending order and accumulates
+// contributions whose target row matches dstRow. No atomics; accumulation order
+// is identical across runs.
+//
+// Cost: O(outputSize * featureSize * numSrcRows) vs the atomic kernel's
+// O(sourceSize) = O(numSrcRows * featureSize). Trade-off matches the documented
+// DeterministicMode contract.
+__kernel void scatter_mean_deterministic(
+    __global const float* source,
+    __global const int* indices,
+    __global float* output,
+    __global int* counts,
+    const int sourceSize,
+    const int outputSize,
+    const int featureSize)
+{
+    const int dstRow = get_global_id(0);
+    const int col = get_global_id(1);
+    if (dstRow >= outputSize || col >= featureSize) return;
+
+    int numSrcRows = sourceSize / featureSize;
+    float sum = 0.0f;
+    int cnt = 0;
+    for (int srcRow = 0; srcRow < numSrcRows; srcRow++) {
+        if (indices[srcRow] == dstRow) {
+            sum += source[srcRow * featureSize + col];
+            if (col == 0) cnt++;
+        }
+    }
+    // Match additive semantics of the non-deterministic atomic path so callers
+    // that pre-seed `output`/`counts` (e.g. accumulating across multiple scatters)
+    // see identical results in deterministic mode.
+    output[dstRow * featureSize + col] += sum;
+    if (col == 0) counts[dstRow] += cnt;
 }
 
 __kernel void scatter_mean_divide(__global float* output, __global const int* counts, const int outputSize, const int featureSize)
@@ -1437,7 +1479,7 @@ __kernel void scale_add(__global const float* A, __global const float* B, __glob
                 "var_backward", "std_backward", "masked_fill_backward",
                 "where_backward", "norm_backward", "logsumexp_backward",
                 "avg_pool1d", "max_pool1d", "bilinear_upsample2d",
-                "scatter_mean", "scatter_mean_divide",
+                "scatter_mean", "scatter_mean_deterministic", "scatter_mean_divide",
                 // Element-wise binary
                 "add_vectors", "subtract_vectors", "multiply_vectors",
                 "divide_vectors", "min_vectors", "max_vectors",

@@ -323,6 +323,8 @@ __kernel void grid_sample_backward(
         gradGridY += go * (wx0 * (v10 - v00) + wx1 * (v11 - v01)) * gradMultY;
 
         // Gradient with respect to input (thread-safe atomic add for overlapping writes)
+        // NON-DETERMINISTIC (issue #382); see grid_sample_backward_grad_grid_deterministic
+        // and grid_sample_backward_grad_input_deterministic below.
         if (ix0 >= 0 && ix0 < inWidth && iy0 >= 0 && iy0 < inHeight) {
             int idx = ((b * channels + c) * inHeight + iy0) * inWidth + ix0;
             atomicAddFloat(&gradInput[idx], go * wy0 * wx0);
@@ -344,6 +346,149 @@ __kernel void grid_sample_backward(
     // Write grid gradient
     gradGrid[gridIdx] = gradGridX;
     gradGrid[gridIdx + 1] = gradGridY;
+}
+
+// grid_sample_backward — bit-deterministic split (issue #382). See CUDA equivalent
+// in CudaSpatialTransformerKernels for the full algorithm rationale.
+__kernel void grid_sample_backward_grad_grid_deterministic(
+    __global const float* gradOutput,
+    __global const float* input,
+    __global const float* grid,
+    __global float* gradGrid,
+    const int batch, const int channels,
+    const int inHeight, const int inWidth,
+    const int outHeight, const int outWidth,
+    const int paddingMode, const int alignCorners)
+{
+    int x = get_global_id(0);
+    int y = get_global_id(1);
+    int b = get_global_id(2);
+    if (x >= outWidth || y >= outHeight || b >= batch) return;
+
+    int gridIdx = ((b * outHeight + y) * outWidth + x) * 2;
+    float gx = grid[gridIdx];
+    float gy = grid[gridIdx + 1];
+
+    float ix, iy, gradMultX, gradMultY;
+    if (alignCorners) {
+        ix = (gx + 1.0f) * 0.5f * (inWidth - 1);
+        iy = (gy + 1.0f) * 0.5f * (inHeight - 1);
+        gradMultX = 0.5f * (inWidth - 1);
+        gradMultY = 0.5f * (inHeight - 1);
+    } else {
+        ix = ((gx + 1.0f) * inWidth - 1.0f) * 0.5f;
+        iy = ((gy + 1.0f) * inHeight - 1.0f) * 0.5f;
+        gradMultX = 0.5f * inWidth;
+        gradMultY = 0.5f * inHeight;
+    }
+    int ix0 = (int)floor(ix);
+    int iy0 = (int)floor(iy);
+    int ix1 = ix0 + 1;
+    int iy1 = iy0 + 1;
+    float wx1 = ix - ix0;
+    float wy1 = iy - iy0;
+    float wx0 = 1.0f - wx1;
+    float wy0 = 1.0f - wy1;
+
+    float gradGridX = 0.0f;
+    float gradGridY = 0.0f;
+
+    for (int c = 0; c < channels; c++) {
+        int outIdx = ((b * channels + c) * outHeight + y) * outWidth + x;
+        float go = gradOutput[outIdx];
+
+        // Border padding (paddingMode == 1): out-of-range corners read the
+        // clamped boundary value; zero padding (paddingMode == 0): they read 0.
+        float v00 = 0.0f, v01 = 0.0f, v10 = 0.0f, v11 = 0.0f;
+        if (ix0 >= 0 && ix0 < inWidth && iy0 >= 0 && iy0 < inHeight)
+            v00 = input[((b * channels + c) * inHeight + iy0) * inWidth + ix0];
+        else if (paddingMode == 1 && inWidth > 0 && inHeight > 0)
+            v00 = input[((b * channels + c) * inHeight + clamp(iy0, 0, inHeight - 1)) * inWidth + clamp(ix0, 0, inWidth - 1)];
+
+        if (ix1 >= 0 && ix1 < inWidth && iy0 >= 0 && iy0 < inHeight)
+            v01 = input[((b * channels + c) * inHeight + iy0) * inWidth + ix1];
+        else if (paddingMode == 1 && inWidth > 0 && inHeight > 0)
+            v01 = input[((b * channels + c) * inHeight + clamp(iy0, 0, inHeight - 1)) * inWidth + clamp(ix1, 0, inWidth - 1)];
+
+        if (ix0 >= 0 && ix0 < inWidth && iy1 >= 0 && iy1 < inHeight)
+            v10 = input[((b * channels + c) * inHeight + iy1) * inWidth + ix0];
+        else if (paddingMode == 1 && inWidth > 0 && inHeight > 0)
+            v10 = input[((b * channels + c) * inHeight + clamp(iy1, 0, inHeight - 1)) * inWidth + clamp(ix0, 0, inWidth - 1)];
+
+        if (ix1 >= 0 && ix1 < inWidth && iy1 >= 0 && iy1 < inHeight)
+            v11 = input[((b * channels + c) * inHeight + iy1) * inWidth + ix1];
+        else if (paddingMode == 1 && inWidth > 0 && inHeight > 0)
+            v11 = input[((b * channels + c) * inHeight + clamp(iy1, 0, inHeight - 1)) * inWidth + clamp(ix1, 0, inWidth - 1)];
+
+        gradGridX += go * (wy0 * (v01 - v00) + wy1 * (v11 - v10)) * gradMultX;
+        gradGridY += go * (wx0 * (v10 - v00) + wx1 * (v11 - v01)) * gradMultY;
+    }
+    gradGrid[gridIdx] = gradGridX;
+    gradGrid[gridIdx + 1] = gradGridY;
+}
+
+__kernel void grid_sample_backward_grad_input_deterministic(
+    __global const float* gradOutput,
+    __global const float* grid,
+    __global float* gradInput,
+    const int batch, const int channels,
+    const int inHeight, const int inWidth,
+    const int outHeight, const int outWidth,
+    const int paddingMode, const int alignCorners)
+{
+    int w_in = get_global_id(0);
+    int h_in = get_global_id(1);
+    int bc = get_global_id(2);
+    if (w_in >= inWidth || h_in >= inHeight || bc >= batch * channels) return;
+
+    int b = bc / channels;
+    int c = bc % channels;
+
+    float sum = 0.0f;
+    for (int y = 0; y < outHeight; y++) {
+        for (int x = 0; x < outWidth; x++) {
+            int gridIdx = ((b * outHeight + y) * outWidth + x) * 2;
+            float gx = grid[gridIdx];
+            float gy = grid[gridIdx + 1];
+            float ix, iy;
+            if (alignCorners) {
+                ix = (gx + 1.0f) * 0.5f * (inWidth - 1);
+                iy = (gy + 1.0f) * 0.5f * (inHeight - 1);
+            } else {
+                ix = ((gx + 1.0f) * inWidth - 1.0f) * 0.5f;
+                iy = ((gy + 1.0f) * inHeight - 1.0f) * 0.5f;
+            }
+            int ix0 = (int)floor(ix);
+            int iy0 = (int)floor(iy);
+            int ix1 = ix0 + 1;
+            int iy1 = iy0 + 1;
+            float wx1 = ix - ix0;
+            float wy1 = iy - iy0;
+            float wx0 = 1.0f - wx1;
+            float wy0 = 1.0f - wy1;
+
+            // Border padding clamps out-of-range corner coords to the boundary
+            // so border samples in the forward pass contribute back here.
+            if (paddingMode == 1) {
+                ix0 = clamp(ix0, 0, inWidth - 1);
+                ix1 = clamp(ix1, 0, inWidth - 1);
+                iy0 = clamp(iy0, 0, inHeight - 1);
+                iy1 = clamp(iy1, 0, inHeight - 1);
+            }
+
+            int outIdx = ((b * channels + c) * outHeight + y) * outWidth + x;
+            float go = gradOutput[outIdx];
+
+            // Explicit in-bounds check on every corner: under zero padding
+            // (paddingMode == 0) out-of-range corners must not contribute;
+            // under border padding the clamps above guarantee the test passes.
+            if (ix0 >= 0 && ix0 < inWidth && iy0 >= 0 && iy0 < inHeight && w_in == ix0 && h_in == iy0) sum += go * wy0 * wx0;
+            if (ix1 >= 0 && ix1 < inWidth && iy0 >= 0 && iy0 < inHeight && w_in == ix1 && h_in == iy0) sum += go * wy0 * wx1;
+            if (ix0 >= 0 && ix0 < inWidth && iy1 >= 0 && iy1 < inHeight && w_in == ix0 && h_in == iy1) sum += go * wy1 * wx0;
+            if (ix1 >= 0 && ix1 < inWidth && iy1 >= 0 && iy1 < inHeight && w_in == ix1 && h_in == iy1) sum += go * wy1 * wx1;
+        }
+    }
+    gradInput[((b * channels + c) * inHeight + h_in) * inWidth + w_in] += sum;
 }
 ";
         }

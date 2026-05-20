@@ -2214,9 +2214,20 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe void PReluBackwardAlpha(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradAlpha, int size, int alphaSize)
     {
-        if (!_kernelCache.TryGetValue("prelu_backward_alpha", out var krnl)) throw new InvalidOperationException("HIP kernel not found: prelu_backward_alpha");
         IntPtr _p0 = gradOutput.Handle; IntPtr _p1 = input.Handle; IntPtr _p2 = gradAlpha.Handle;
         void** args = stackalloc void*[5]; args[0] = &_p0; args[1] = &_p1; args[2] = &_p2; args[3] = &size; args[4] = &alphaSize;
+
+        if (GpuDeterminism.IsActive)
+        {
+            // Issue #382: per-alpha-channel thread scans size in strided order.
+            if (!_kernelCache.TryGetValue("prelu_backward_alpha_deterministic", out var krnlD))
+                throw new InvalidOperationException("HIP kernel not found: prelu_backward_alpha_deterministic");
+            uint gridD = (uint)((alphaSize + DefaultBlockSize - 1) / DefaultBlockSize);
+            LaunchKernel(krnlD, gridD, DefaultBlockSize, args); Synchronize();
+            return;
+        }
+
+        if (!_kernelCache.TryGetValue("prelu_backward_alpha", out var krnl)) throw new InvalidOperationException("HIP kernel not found: prelu_backward_alpha");
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
         LaunchKernel(krnl, grid, DefaultBlockSize, args); Synchronize();
     }
@@ -2356,16 +2367,39 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe void ScatterMean(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output, IGpuBuffer counts, int sourceSize, int outputSize, int featureSize)
     {
-        // Initialize output and counts to zero before accumulation
         Fill(output, 0f, outputSize * featureSize);
         Fill(counts, 0f, outputSize);
-        if (!_kernelCache.TryGetValue("scatter_mean", out var k1)) throw new InvalidOperationException("HIP kernel not found: scatter_mean");
-        if (!_kernelCache.TryGetValue("scatter_mean_divide", out var k2)) throw new InvalidOperationException("HIP kernel not found: scatter_mean_divide");
         IntPtr sPtr = source.Handle, idxPtr = indices.Handle, oPtr = output.Handle, cPtr = counts.Handle;
-        void** a1 = stackalloc void*[6]; a1[0] = &sPtr; a1[1] = &idxPtr; a1[2] = &oPtr; a1[3] = &cPtr; a1[4] = &sourceSize; a1[5] = &featureSize;
-        LaunchKernel(k1, (uint)((sourceSize + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, a1);
-        void** a2 = stackalloc void*[4]; a2[0] = &oPtr; a2[1] = &cPtr; a2[2] = &outputSize; a2[3] = &featureSize;
-        LaunchKernel(k2, (uint)((outputSize + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, a2); Synchronize();
+
+        if (GpuDeterminism.IsActive)
+        {
+            // Issue #382: per (dstRow, col) output cell deterministic variant.
+            if (!_kernelCache.TryGetValue("scatter_mean_activation_deterministic", out var k1d))
+                throw new InvalidOperationException("HIP kernel not found: scatter_mean_activation_deterministic");
+            void** a1d = stackalloc void*[7];
+            a1d[0] = &sPtr; a1d[1] = &idxPtr; a1d[2] = &oPtr; a1d[3] = &cPtr;
+            a1d[4] = &sourceSize; a1d[5] = &outputSize; a1d[6] = &featureSize;
+            const int blockSize = 16;
+            uint gridDX = (uint)((featureSize + blockSize - 1) / blockSize);
+            uint gridDY = (uint)((outputSize + blockSize - 1) / blockSize);
+            LaunchKernel2D(k1d, gridDX, gridDY, (uint)blockSize, (uint)blockSize, a1d);
+        }
+        else
+        {
+            if (!_kernelCache.TryGetValue("scatter_mean", out var k1)) throw new InvalidOperationException("HIP kernel not found: scatter_mean");
+            void** a1 = stackalloc void*[6]; a1[0] = &sPtr; a1[1] = &idxPtr; a1[2] = &oPtr; a1[3] = &cPtr; a1[4] = &sourceSize; a1[5] = &featureSize;
+            LaunchKernel(k1, (uint)((sourceSize + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, a1);
+        }
+
+        if (!_kernelCache.TryGetValue("scatter_mean_divide", out var k2)) throw new InvalidOperationException("HIP kernel not found: scatter_mean_divide");
+        // scatter_mean_divide expects flat output element count (kernel guards
+        // `idx < outputSize` and indexes `output[idx]`), so pass outputSize *
+        // featureSize as the flat element count. Pre-existing bug surfaced by
+        // PR #390 review: prior code passed row count and dispatched only
+        // `outputSize` work-items, normalizing just the first row.
+        int outputFlat = outputSize * featureSize;
+        void** a2 = stackalloc void*[4]; a2[0] = &oPtr; a2[1] = &cPtr; a2[2] = &outputFlat; a2[3] = &featureSize;
+        LaunchKernel(k2, (uint)((outputFlat + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, a2); Synchronize();
     }
 
     public unsafe void L1Loss(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numFeatures)
@@ -3091,9 +3125,6 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (!IsAvailable)
             throw new InvalidOperationException("HIP backend is not available.");
 
-        if (!_kernelCache.TryGetValue("scatter_add_edges", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: scatter_add_edges");
-
         if (!_kernelCache.TryGetValue("zero_buffer", out var zeroKernel))
             throw new InvalidOperationException("HIP kernel not found: zero_buffer");
 
@@ -3104,15 +3135,23 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         LaunchKernel1D(zeroKernel, zeroGrid, DefaultBlockSize, outputHandle, outputSize);
         Synchronize();
 
-        // Launch scatter-add kernel
-        int gridX = numEdges;
-        int gridY = (features + DefaultBlockSize - 1) / DefaultBlockSize;
-
         var inputHandle = ((HipGpuBuffer)input).Handle;
         var sourceHandle = ((HipGpuBuffer)sourceIndices).Handle;
         var targetHandle = ((HipGpuBuffer)targetIndices).Handle;
         var edgeValuesHandle = edgeValues is not null ? ((HipGpuBuffer)edgeValues).Handle : IntPtr.Zero;
         int hasEdgeValues = edgeValues is not null ? 1 : 0;
+
+        // Issue #382: route to atomic-free variant — per-target-node thread scans edges.
+        string kernelName = GpuDeterminism.IsActive
+            ? "scatter_add_edges_deterministic"
+            : "scatter_add_edges";
+        if (!_kernelCache.TryGetValue(kernelName, out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: " + kernelName);
+
+        // Deterministic variant: gridX = numNodes (one thread per target node).
+        // Atomic variant: gridX = numEdges (one thread per edge).
+        int gridX = GpuDeterminism.IsActive ? numNodes : numEdges;
+        int gridY = (features + DefaultBlockSize - 1) / DefaultBlockSize;
 
         LaunchScatterAddKernel(kernel, gridX, gridY, DefaultBlockSize, 1,
             inputHandle, sourceHandle, targetHandle, edgeValuesHandle, outputHandle,
@@ -4081,31 +4120,35 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int kernelH, int kernelW,
         int strideH, int strideW, int padH, int padW)
     {
+        IntPtr _p0 = gradOutput.Handle;
+        IntPtr _p1 = indices.Handle;
+        IntPtr _p2 = gradInput.Handle;
+        void** args = stackalloc void*[9];
+        args[0] = &_p0; args[1] = &_p1; args[2] = &_p2;
+        args[3] = &batch; args[4] = &channels;
+        args[5] = &inHeight; args[6] = &inWidth;
+        args[7] = &outHeight; args[8] = &outWidth;
+
+        if (GpuDeterminism.IsActive)
+        {
+            // Issue #382: deterministic per-input-cell parallelization.
+            if (!_kernelCache.TryGetValue("maxpool2d_backward_deterministic", out var krnlD))
+                throw new InvalidOperationException("HIP kernel not found: maxpool2d_backward_deterministic");
+            uint gDX = (uint)((inWidth + 15) / 16);
+            uint gDY = (uint)((inHeight + 15) / 16);
+            uint gDZ = (uint)(batch * channels);
+            LaunchKernel3D(krnlD, gDX, gDY, gDZ, 16, 16, 1, args);
+            Synchronize();
+            return;
+        }
+
         if (!_kernelCache.TryGetValue("maxpool2d_backward", out var krnl))
             throw new InvalidOperationException("HIP kernel not found: maxpool2d_backward");
-
-            {
-            IntPtr _p0 = gradOutput.Handle;
-            IntPtr _p1 = indices.Handle;
-            IntPtr _p2 = gradInput.Handle;
-            void** args = stackalloc void*[9];
-            args[0] = &_p0;
-            args[1] = &_p1;
-            args[2] = &_p2;
-            args[3] = &batch;
-            args[4] = &channels;
-            args[5] = &inHeight;
-            args[6] = &inWidth;
-            args[7] = &outHeight;
-            args[8] = &outWidth;
-
-
-            uint gridX = (uint)((outWidth + 15) / 16);
-            uint gridY = (uint)((outHeight + 15) / 16);
-            uint gridZ = (uint)(batch * channels);
-            LaunchKernel3D(krnl, gridX, gridY, gridZ, 16, 16, 1, args);
-            Synchronize();
-            }
+        uint gridX = (uint)((outWidth + 15) / 16);
+        uint gridY = (uint)((outHeight + 15) / 16);
+        uint gridZ = (uint)(batch * channels);
+        LaunchKernel3D(krnl, gridX, gridY, gridZ, 16, 16, 1, args);
+        Synchronize();
     }
 
     public unsafe void AvgPool2D(IGpuBuffer input, IGpuBuffer output,
@@ -4277,32 +4320,27 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe void GlobalMaxPool2DBackward(IGpuBuffer gradOutput, IGpuBuffer indices, IGpuBuffer gradInput, int batch, int channels, int height, int width)
     {
-        if (!_kernelCache.TryGetValue("global_maxpool2d_backward", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: global_maxpool2d_backward");
-
-        // First zero out the gradient input
         Fill(gradInput, 0f, batch * channels * height * width);
 
         int totalOutputs = batch * channels;
         uint grid = (uint)((totalOutputs + DefaultBlockSize - 1) / DefaultBlockSize);
 
-            {
-            IntPtr _p0 = gradOutput.Handle;
-            IntPtr _p1 = indices.Handle;
-            IntPtr _p2 = gradInput.Handle;
-            void** args = stackalloc void*[7];
-            args[0] = &_p0;
-            args[1] = &_p1;
-            args[2] = &_p2;
-            args[3] = &batch;
-            args[4] = &channels;
-            args[5] = &height;
-            args[6] = &width;
+        IntPtr _p0 = gradOutput.Handle;
+        IntPtr _p1 = indices.Handle;
+        IntPtr _p2 = gradInput.Handle;
+        void** args = stackalloc void*[7];
+        args[0] = &_p0; args[1] = &_p1; args[2] = &_p2;
+        args[3] = &batch; args[4] = &channels;
+        args[5] = &height; args[6] = &width;
 
+        string kernelName = GpuDeterminism.IsActive
+            ? "global_maxpool2d_backward_deterministic"
+            : "global_maxpool2d_backward";
+        if (!_kernelCache.TryGetValue(kernelName, out var krnl))
+            throw new InvalidOperationException("HIP kernel not found: " + kernelName);
 
-            LaunchKernel(krnl, grid, DefaultBlockSize, args);
-            Synchronize();
-            }
+        LaunchKernel(krnl, grid, DefaultBlockSize, args);
+        Synchronize();
     }
 
     public unsafe void AdaptiveAvgPool2D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth)
@@ -4382,33 +4420,35 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int inDepth, int inHeight, int inWidth,
         int outDepth, int outHeight, int outWidth)
     {
+        IntPtr _p0 = gradOutput.Handle;
+        IntPtr _p1 = indices.Handle;
+        IntPtr _p2 = gradInput.Handle;
+        void** args = stackalloc void*[11];
+        args[0] = &_p0; args[1] = &_p1; args[2] = &_p2;
+        args[3] = &batch; args[4] = &channels;
+        args[5] = &inDepth; args[6] = &inHeight; args[7] = &inWidth;
+        args[8] = &outDepth; args[9] = &outHeight; args[10] = &outWidth;
+
+        if (GpuDeterminism.IsActive)
+        {
+            // Issue #382: per-input-cell parallelization.
+            if (!_kernelCache.TryGetValue("maxpool3d_backward_deterministic", out var krnlD))
+                throw new InvalidOperationException("HIP kernel not found: maxpool3d_backward_deterministic");
+            uint gDX = (uint)((inWidth + 7) / 8);
+            uint gDY = (uint)((inHeight + 7) / 8);
+            uint gDZ = (uint)(batch * channels * inDepth);
+            LaunchKernel3D(krnlD, gDX, gDY, gDZ, 8, 8, 1, args);
+            Synchronize();
+            return;
+        }
+
         if (!_kernelCache.TryGetValue("maxpool3d_backward", out var krnl))
             throw new InvalidOperationException("HIP kernel not found: maxpool3d_backward");
-
-            {
-            IntPtr _p0 = gradOutput.Handle;
-            IntPtr _p1 = indices.Handle;
-            IntPtr _p2 = gradInput.Handle;
-            void** args = stackalloc void*[11];
-            args[0] = &_p0;
-            args[1] = &_p1;
-            args[2] = &_p2;
-            args[3] = &batch;
-            args[4] = &channels;
-            args[5] = &inDepth;
-            args[6] = &inHeight;
-            args[7] = &inWidth;
-            args[8] = &outDepth;
-            args[9] = &outHeight;
-            args[10] = &outWidth;
-
-
-            uint gridX = (uint)((outWidth + 7) / 8);
-            uint gridY = (uint)((outHeight + 7) / 8);
-            uint gridZ = (uint)(batch * channels * outDepth);
-            LaunchKernel3D(krnl, gridX, gridY, gridZ, 8, 8, 1, args);
-            Synchronize();
-            }
+        uint gridX = (uint)((outWidth + 7) / 8);
+        uint gridY = (uint)((outHeight + 7) / 8);
+        uint gridZ = (uint)(batch * channels * outDepth);
+        LaunchKernel3D(krnl, gridX, gridY, gridZ, 8, 8, 1, args);
+        Synchronize();
     }
 
     public unsafe void NearestNeighborUpsample3D(IGpuBuffer input, IGpuBuffer output,
@@ -4452,35 +4492,37 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int inDepth, int inHeight, int inWidth,
         int scaleD, int scaleH, int scaleW)
     {
+        IntPtr _p0 = gradOutput.Handle;
+        IntPtr _p1 = gradInput.Handle;
+        void** args = stackalloc void*[10];
+        args[0] = &_p0; args[1] = &_p1;
+        args[2] = &batch; args[3] = &channels;
+        args[4] = &inDepth; args[5] = &inHeight; args[6] = &inWidth;
+        args[7] = &scaleD; args[8] = &scaleH; args[9] = &scaleW;
+
+        if (GpuDeterminism.IsActive)
+        {
+            // Issue #382: per-input-cell scan of scale-cube output cells.
+            if (!_kernelCache.TryGetValue("nearest_upsample3d_backward_deterministic", out var krnlD))
+                throw new InvalidOperationException("HIP kernel not found: nearest_upsample3d_backward_deterministic");
+            uint gDX = (uint)((inWidth + 7) / 8);
+            uint gDY = (uint)((inHeight + 7) / 8);
+            uint gDZ = (uint)(batch * channels * inDepth);
+            LaunchKernel3D(krnlD, gDX, gDY, gDZ, 8, 8, 1, args);
+            Synchronize();
+            return;
+        }
+
         if (!_kernelCache.TryGetValue("nearest_upsample3d_backward", out var krnl))
             throw new InvalidOperationException("HIP kernel not found: nearest_upsample3d_backward");
-
         int outDepth = inDepth * scaleD;
         int outHeight = inHeight * scaleH;
         int outWidth = inWidth * scaleW;
-
-            {
-            IntPtr _p0 = gradOutput.Handle;
-            IntPtr _p1 = gradInput.Handle;
-            void** args = stackalloc void*[10];
-            args[0] = &_p0;
-            args[1] = &_p1;
-            args[2] = &batch;
-            args[3] = &channels;
-            args[4] = &inDepth;
-            args[5] = &inHeight;
-            args[6] = &inWidth;
-            args[7] = &scaleD;
-            args[8] = &scaleH;
-            args[9] = &scaleW;
-
-
-            uint gridX = (uint)((outWidth + 7) / 8);
-            uint gridY = (uint)((outHeight + 7) / 8);
-            uint gridZ = (uint)(batch * channels * outDepth);
-            LaunchKernel3D(krnl, gridX, gridY, gridZ, 8, 8, 1, args);
-            Synchronize();
-            }
+        uint gridX = (uint)((outWidth + 7) / 8);
+        uint gridY = (uint)((outHeight + 7) / 8);
+        uint gridZ = (uint)(batch * channels * outDepth);
+        LaunchKernel3D(krnl, gridX, gridY, gridZ, 8, 8, 1, args);
+        Synchronize();
     }
 
     #endregion
@@ -4824,8 +4866,54 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
             uint grid = (uint)((totalSize + DefaultBlockSize - 1) / DefaultBlockSize);
 
-            // Pass 1: Compute sums for gradient correction
+            // Pass 1: Compute sums.
+            // Issue #382: under DeterministicMode, dispatch to the per-output-cell
+            // split kernels (per-channel for gradGamma/gradBeta, per-instance for
+            // sumDy/sumDyXhat). Each owns one output cell — no atomics.
+            // CodeRabbit (#390): fail closed when the deterministic kernels are
+            // unavailable. Silently falling through to instancenorm_backward_sums
+            // reintroduces atomic accumulation while GpuDeterminism.IsActive is
+            // still true, breaking the deterministic-mode contract.
+            if (GpuDeterminism.IsActive)
+            {
+                if (!_kernelCache.TryGetValue("instancenorm_backward_sums_per_channel_deterministic", out var sumsPerChannelD)
+                    || !_kernelCache.TryGetValue("instancenorm_backward_sums_per_instance_deterministic", out var sumsPerInstanceD))
                 {
+                    throw new InvalidOperationException(
+                        "Deterministic InstanceNormBackward kernels are unavailable on this HIP backend. " +
+                        "GpuDeterminism.IsActive is true but " +
+                        "'instancenorm_backward_sums_per_channel_deterministic' and/or " +
+                        "'instancenorm_backward_sums_per_instance_deterministic' are missing from the kernel cache. " +
+                        "Disable GpuDeterminism or route to the CPU fallback for this op.");
+                }
+
+                IntPtr _p0 = gradOutput.Handle;
+                IntPtr _p1 = input.Handle;
+                IntPtr _p2 = saveMean.Handle;
+                IntPtr _p3 = saveInvVar.Handle;
+                IntPtr _p4 = gradGamma.Handle;
+                IntPtr _p5 = gradBeta.Handle;
+                void** argsPc = stackalloc void*[10];
+                argsPc[0] = &_p0; argsPc[1] = &_p1; argsPc[2] = &_p2; argsPc[3] = &_p3;
+                argsPc[4] = &_p4; argsPc[5] = &_p5;
+                argsPc[6] = &N; argsPc[7] = &C; argsPc[8] = &H; argsPc[9] = &W;
+                uint gridPc = (uint)((C + DefaultBlockSize - 1) / DefaultBlockSize);
+                LaunchKernel(sumsPerChannelD, gridPc, DefaultBlockSize, argsPc);
+
+                IntPtr _gPtr = gamma.Handle;
+                IntPtr _sdyPtr = sumDy.Handle;
+                IntPtr _sdyxhatPtr = sumDyXhat.Handle;
+                void** argsPi = stackalloc void*[11];
+                argsPi[0] = &_p0; argsPi[1] = &_p1; argsPi[2] = &_p2; argsPi[3] = &_p3;
+                argsPi[4] = &_gPtr; argsPi[5] = &_sdyPtr; argsPi[6] = &_sdyxhatPtr;
+                argsPi[7] = &N; argsPi[8] = &C; argsPi[9] = &H; argsPi[10] = &W;
+                int nc = N * C;
+                uint gridPi = (uint)((nc + DefaultBlockSize - 1) / DefaultBlockSize);
+                LaunchKernel(sumsPerInstanceD, gridPi, DefaultBlockSize, argsPi);
+                Synchronize();
+            }
+            else
+            {
                 IntPtr _p0 = gradOutput.Handle;
                 IntPtr _p1 = input.Handle;
                 IntPtr _p2 = saveMean.Handle;
@@ -4853,7 +4941,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
                 LaunchKernel(sumsKernel, grid, DefaultBlockSize, args1);
                 Synchronize();
-                }
+            }
 
             // Pass 2: Compute final input gradients
                 {
@@ -5207,25 +5295,45 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe void EmbeddingBackward(IGpuBuffer gradOutput, IGpuBuffer indices, IGpuBuffer gradEmbedding, int numIndices, int embeddingDim, int vocabSize)
     {
+        IntPtr _p0 = gradOutput.Handle;
+        IntPtr _p1 = indices.Handle;
+        IntPtr _p2 = gradEmbedding.Handle;
+
+        if (GpuDeterminism.IsActive)
+        {
+            // Issue #382: atomicAdd in embedding_backward is FP-non-deterministic
+            // across runs. Route to the atomic-free variant — one thread per (v, d).
+            if (!_kernelCache.TryGetValue("embedding_backward_deterministic", out var krnlD))
+                throw new InvalidOperationException("HIP kernel not found: embedding_backward_deterministic");
+
+            void** argsD = stackalloc void*[6];
+            argsD[0] = &_p0;
+            argsD[1] = &_p1;
+            argsD[2] = &_p2;
+            argsD[3] = &numIndices;
+            argsD[4] = &embeddingDim;
+            argsD[5] = &vocabSize;
+
+            uint gridX = (uint)((embeddingDim + 15) / 16);
+            uint gridY = (uint)((vocabSize + 15) / 16);
+            LaunchKernel2D(krnlD, gridX, gridY, 16, 16, argsD);
+            Synchronize();
+            return;
+        }
+
         if (!_kernelCache.TryGetValue("embedding_backward", out var krnl))
             throw new InvalidOperationException("HIP kernel not found: embedding_backward");
 
-            {
-            IntPtr _p0 = gradOutput.Handle;
-            IntPtr _p1 = indices.Handle;
-            IntPtr _p2 = gradEmbedding.Handle;
-            void** args = stackalloc void*[5];
-            args[0] = &_p0;
-            args[1] = &_p1;
-            args[2] = &_p2;
-            args[3] = &numIndices;
-            args[4] = &embeddingDim;
+        void** args = stackalloc void*[5];
+        args[0] = &_p0;
+        args[1] = &_p1;
+        args[2] = &_p2;
+        args[3] = &numIndices;
+        args[4] = &embeddingDim;
 
-
-            uint grid = (uint)((numIndices + DefaultBlockSize - 1) / DefaultBlockSize);
-            LaunchKernel(krnl, grid, DefaultBlockSize, args);
-            Synchronize();
-            }
+        uint grid = (uint)((numIndices + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(krnl, grid, DefaultBlockSize, args);
+        Synchronize();
     }
 
     public IGpuBuffer AllocateIntBuffer(int size)
@@ -5850,50 +5958,107 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal,
         IGpuBuffer? attentionBias = null, int biasBatchStride = 0)
     {
-        if (!_kernelCache.TryGetValue("flash_attention_backward", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: flash_attention_backward");
-
         int causalFlag = isCausal ? 1 : 0;
         int hasBias = attentionBias is not null ? 1 : 0;
         IntPtr biasPtr = attentionBias is not null ? attentionBias.Handle : IntPtr.Zero;
-            {
-            IntPtr _p0 = gradOutput.Handle;
-            IntPtr _p1 = query.Handle;
-            IntPtr _p2 = key.Handle;
-            IntPtr _p3 = value.Handle;
-            IntPtr _p4 = output.Handle;
-            IntPtr _p5 = softmaxStats.Handle;
-            IntPtr _p6 = gradQuery.Handle;
-            IntPtr _p7 = gradKey.Handle;
-            IntPtr _p8 = gradValue.Handle;
-            void** args = stackalloc void*[19];
-            args[0] = &_p0;
-            args[1] = &_p1;
-            args[2] = &_p2;
-            args[3] = &_p3;
-            args[4] = &_p4;
-            args[5] = &_p5;
-            args[6] = &_p6;
-            args[7] = &_p7;
-            args[8] = &_p8;
-            args[9] = &batch;
-            args[10] = &numHeads;
-            args[11] = &seqQ;
-            args[12] = &seqK;
-            args[13] = &headDim;
-            args[14] = &scale;
-            args[15] = &causalFlag;
-            args[16] = &biasPtr;
-            args[17] = &hasBias;
-            args[18] = &biasBatchStride;
 
+        IntPtr _p0 = gradOutput.Handle;
+        IntPtr _p1 = query.Handle;
+        IntPtr _p2 = key.Handle;
+        IntPtr _p3 = value.Handle;
+        IntPtr _p4 = output.Handle;
+        IntPtr _p5 = softmaxStats.Handle;
+        IntPtr _p6 = gradQuery.Handle;
+        IntPtr _p7 = gradKey.Handle;
+        IntPtr _p8 = gradValue.Handle;
 
-            uint gridX = (uint)((seqQ + 31) / 32);
-            uint gridY = (uint)(batch * numHeads);
-            uint sharedBytes = (uint)(2 * 32 * headDim * sizeof(float));
-            LaunchKernel2D(krnl, gridX, gridY, 32, 1, args, sharedBytes);
+        if (GpuDeterminism.IsActive)
+        {
+            // Issue #382: split into atomic-free gradq + gradkv kernels.
+            if (!_kernelCache.TryGetValue("flash_attention_backward_gradq_deterministic", out var krnlQ))
+                throw new InvalidOperationException("HIP kernel not found: flash_attention_backward_gradq_deterministic");
+            void** argsQ = stackalloc void*[17];
+            argsQ[0] = &_p0;
+            argsQ[1] = &_p1;
+            argsQ[2] = &_p2;
+            argsQ[3] = &_p3;
+            argsQ[4] = &_p4;
+            argsQ[5] = &_p5;
+            argsQ[6] = &_p6;
+            argsQ[7] = &batch;
+            argsQ[8] = &numHeads;
+            argsQ[9] = &seqQ;
+            argsQ[10] = &seqK;
+            argsQ[11] = &headDim;
+            argsQ[12] = &scale;
+            argsQ[13] = &causalFlag;
+            argsQ[14] = &biasPtr;
+            argsQ[15] = &hasBias;
+            argsQ[16] = &biasBatchStride;
+
+            uint gQX = (uint)((seqQ + 63) / 64);
+            uint gQY = (uint)(batch * numHeads);
+            LaunchKernel2D(krnlQ, gQX, gQY, 64, 1, argsQ);
+
+            if (!_kernelCache.TryGetValue("flash_attention_backward_gradkv_deterministic", out var krnlKV))
+                throw new InvalidOperationException("HIP kernel not found: flash_attention_backward_gradkv_deterministic");
+            void** argsKV = stackalloc void*[18];
+            argsKV[0] = &_p0;
+            argsKV[1] = &_p1;
+            argsKV[2] = &_p2;
+            argsKV[3] = &_p3;
+            argsKV[4] = &_p4;
+            argsKV[5] = &_p5;
+            argsKV[6] = &_p7;
+            argsKV[7] = &_p8;
+            argsKV[8] = &batch;
+            argsKV[9] = &numHeads;
+            argsKV[10] = &seqQ;
+            argsKV[11] = &seqK;
+            argsKV[12] = &headDim;
+            argsKV[13] = &scale;
+            argsKV[14] = &causalFlag;
+            argsKV[15] = &biasPtr;
+            argsKV[16] = &hasBias;
+            argsKV[17] = &biasBatchStride;
+
+            uint gKVX = (uint)((headDim + 15) / 16);
+            uint gKVY = (uint)((seqK + 3) / 4);
+            uint gKVZ = (uint)(batch * numHeads);
+            LaunchKernel3D(krnlKV, gKVX, gKVY, gKVZ, 16, 4, 1, argsKV);
             Synchronize();
-            }
+            return;
+        }
+
+        if (!_kernelCache.TryGetValue("flash_attention_backward", out var krnl))
+            throw new InvalidOperationException("HIP kernel not found: flash_attention_backward");
+
+        void** args = stackalloc void*[19];
+        args[0] = &_p0;
+        args[1] = &_p1;
+        args[2] = &_p2;
+        args[3] = &_p3;
+        args[4] = &_p4;
+        args[5] = &_p5;
+        args[6] = &_p6;
+        args[7] = &_p7;
+        args[8] = &_p8;
+        args[9] = &batch;
+        args[10] = &numHeads;
+        args[11] = &seqQ;
+        args[12] = &seqK;
+        args[13] = &headDim;
+        args[14] = &scale;
+        args[15] = &causalFlag;
+        args[16] = &biasPtr;
+        args[17] = &hasBias;
+        args[18] = &biasBatchStride;
+
+        uint gridX = (uint)((seqQ + 31) / 32);
+        uint gridY = (uint)(batch * numHeads);
+        uint sharedBytes = (uint)(2 * 32 * headDim * sizeof(float));
+        LaunchKernel2D(krnl, gridX, gridY, 32, 1, args, sharedBytes);
+        Synchronize();
     }
 
     public unsafe void GroupedQueryAttention(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
@@ -5944,45 +6109,93 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         IGpuBuffer gradQuery, IGpuBuffer gradKey, IGpuBuffer gradValue,
         int batch, int numQHeads, int numKVHeads, int seqQ, int seqK, int headDim, float scale)
     {
+        int queriesPerKV = numQHeads / numKVHeads;
+
+        IntPtr _p0 = gradOutput.Handle;
+        IntPtr _p1 = query.Handle;
+        IntPtr _p2 = key.Handle;
+        IntPtr _p3 = value.Handle;
+        IntPtr _p4 = attentionWeights.Handle;
+        IntPtr _p5 = gradQuery.Handle;
+        IntPtr _p6 = gradKey.Handle;
+        IntPtr _p7 = gradValue.Handle;
+
+        if (GpuDeterminism.IsActive)
+        {
+            // Issue #382: split into atomic-free gradq + gradkv kernels.
+            if (!_kernelCache.TryGetValue("grouped_query_attention_backward_gradq_deterministic", out var kQg))
+                throw new InvalidOperationException("HIP kernel not found: grouped_query_attention_backward_gradq_deterministic");
+            void** argsQg = stackalloc void*[14];
+            argsQg[0] = &_p0;
+            argsQg[1] = &_p1;
+            argsQg[2] = &_p2;
+            argsQg[3] = &_p3;
+            argsQg[4] = &_p4;
+            argsQg[5] = &_p5;
+            argsQg[6] = &batch;
+            argsQg[7] = &numQHeads;
+            argsQg[8] = &numKVHeads;
+            argsQg[9] = &queriesPerKV;
+            argsQg[10] = &seqQ;
+            argsQg[11] = &seqK;
+            argsQg[12] = &headDim;
+            argsQg[13] = &scale;
+            uint gqX = (uint)((seqQ + 63) / 64);
+            uint gqY = (uint)(batch * numQHeads);
+            LaunchKernel2D(kQg, gqX, gqY, 64, 1, argsQg);
+
+            if (!_kernelCache.TryGetValue("grouped_query_attention_backward_gradkv_deterministic", out var kKVg))
+                throw new InvalidOperationException("HIP kernel not found: grouped_query_attention_backward_gradkv_deterministic");
+            void** argsKVg = stackalloc void*[15];
+            argsKVg[0] = &_p0;
+            argsKVg[1] = &_p1;
+            argsKVg[2] = &_p2;
+            argsKVg[3] = &_p3;
+            argsKVg[4] = &_p4;
+            argsKVg[5] = &_p6;
+            argsKVg[6] = &_p7;
+            argsKVg[7] = &batch;
+            argsKVg[8] = &numQHeads;
+            argsKVg[9] = &numKVHeads;
+            argsKVg[10] = &queriesPerKV;
+            argsKVg[11] = &seqQ;
+            argsKVg[12] = &seqK;
+            argsKVg[13] = &headDim;
+            argsKVg[14] = &scale;
+            uint gkvX = (uint)((headDim + 15) / 16);
+            uint gkvY = (uint)((seqK + 3) / 4);
+            uint gkvZ = (uint)(batch * numKVHeads);
+            LaunchKernel3D(kKVg, gkvX, gkvY, gkvZ, 16, 4, 1, argsKVg);
+            Synchronize();
+            return;
+        }
+
         if (!_kernelCache.TryGetValue("grouped_query_attention_backward", out var krnl))
             throw new InvalidOperationException("HIP kernel not found: grouped_query_attention_backward");
 
-        int queriesPerKV = numQHeads / numKVHeads;
+        void** args = stackalloc void*[16];
+        args[0] = &_p0;
+        args[1] = &_p1;
+        args[2] = &_p2;
+        args[3] = &_p3;
+        args[4] = &_p4;
+        args[5] = &_p5;
+        args[6] = &_p6;
+        args[7] = &_p7;
+        args[8] = &batch;
+        args[9] = &numQHeads;
+        args[10] = &numKVHeads;
+        args[11] = &queriesPerKV;
+        args[12] = &seqQ;
+        args[13] = &seqK;
+        args[14] = &headDim;
+        args[15] = &scale;
 
-            {
-            IntPtr _p0 = gradOutput.Handle;
-            IntPtr _p1 = query.Handle;
-            IntPtr _p2 = key.Handle;
-            IntPtr _p3 = value.Handle;
-            IntPtr _p4 = attentionWeights.Handle;
-            IntPtr _p5 = gradQuery.Handle;
-            IntPtr _p6 = gradKey.Handle;
-            IntPtr _p7 = gradValue.Handle;
-            void** args = stackalloc void*[16];
-            args[0] = &_p0;
-            args[1] = &_p1;
-            args[2] = &_p2;
-            args[3] = &_p3;
-            args[4] = &_p4;
-            args[5] = &_p5;
-            args[6] = &_p6;
-            args[7] = &_p7;
-            args[8] = &batch;
-            args[9] = &numQHeads;
-            args[10] = &numKVHeads;
-            args[11] = &queriesPerKV;
-            args[12] = &seqQ;
-            args[13] = &seqK;
-            args[14] = &headDim;
-            args[15] = &scale;
-
-
-            uint gridX = (uint)((seqQ + 31) / 32);
-            uint gridY = (uint)(batch * numQHeads);
-            uint sharedBytes = (uint)(2 * 32 * headDim * sizeof(float));
-            LaunchKernel2D(krnl, gridX, gridY, 32, 1, args, sharedBytes);
-            Synchronize();
-            }
+        uint gridX = (uint)((seqQ + 31) / 32);
+        uint gridY = (uint)(batch * numQHeads);
+        uint sharedBytes = (uint)(2 * 32 * headDim * sizeof(float));
+        LaunchKernel2D(krnl, gridX, gridY, 32, 1, args, sharedBytes);
+        Synchronize();
     }
 
     #endregion
@@ -7633,28 +7846,31 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         const int blockSize = 256;
         int gridSize = (size + blockSize - 1) / blockSize;
 
-        // Step 1: Compute mean via GPU reduction
+        // Step 1: Compute mean via GPU reduction.
+        // Issue #382: deterministic variant is single-block strided reduce and writes
+        // mean/size directly; atomic variant writes raw sum (caller divides).
         float mean;
-        if (_kernelCache.TryGetValue("reduce_mean_kernel", out var meanKernel))
+        string meanKernelName = GpuDeterminism.IsActive ? "reduce_mean_kernel_deterministic" : "reduce_mean_kernel";
+        if (_kernelCache.TryGetValue(meanKernelName, out var meanKernel))
         {
             var zeroData = new float[1];
             using var meanBuffer = AllocateBuffer(zeroData);
 
-                {
-                IntPtr _p0 = input.Handle;
-                IntPtr _p1 = meanBuffer.Handle;
-                void** meanArgs = stackalloc void*[3];
-                meanArgs[0] = &_p0;
-                meanArgs[1] = &_p1;
-                meanArgs[2] = &size;
+            IntPtr _p0 = input.Handle;
+            IntPtr _p1 = meanBuffer.Handle;
+            void** meanArgs = stackalloc void*[3];
+            meanArgs[0] = &_p0;
+            meanArgs[1] = &_p1;
+            meanArgs[2] = &size;
 
-
-                uint sharedBytes = (uint)(blockSize * sizeof(float));
-                LaunchKernelWithSharedMem(meanKernel, (uint)gridSize, (uint)blockSize, sharedBytes, meanArgs);
-                Synchronize();
-                }
+            uint sharedBytes = (uint)(blockSize * sizeof(float));
+            uint launchGrid = GpuDeterminism.IsActive ? 1u : (uint)gridSize;
+            LaunchKernelWithSharedMem(meanKernel, launchGrid, (uint)blockSize, sharedBytes, meanArgs);
+            Synchronize();
 
             float[] meanResult = DownloadBuffer(meanBuffer);
+            // Both kernels now write the raw sum; normalize once on the host so
+            // deterministic and non-deterministic paths agree (CodeRabbit PR #390).
             mean = meanResult[0] / size;
         }
         else
@@ -7664,25 +7880,24 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
         // Step 2: Compute variance via GPU reduction
         float variance;
-        if (_kernelCache.TryGetValue("reduce_variance_kernel", out var varKernel))
+        string varKernelName = GpuDeterminism.IsActive ? "reduce_variance_kernel_deterministic" : "reduce_variance_kernel";
+        if (_kernelCache.TryGetValue(varKernelName, out var varKernel))
         {
             var zeroData = new float[1];
             using var varianceBuffer = AllocateBuffer(zeroData);
 
-                {
-                IntPtr _p0 = input.Handle;
-                IntPtr _p1 = varianceBuffer.Handle;
-                void** varArgs = stackalloc void*[4];
-                varArgs[0] = &_p0;
-                varArgs[1] = &_p1;
-                varArgs[2] = &mean;
-                varArgs[3] = &size;
+            IntPtr _p0 = input.Handle;
+            IntPtr _p1 = varianceBuffer.Handle;
+            void** varArgs = stackalloc void*[4];
+            varArgs[0] = &_p0;
+            varArgs[1] = &_p1;
+            varArgs[2] = &mean;
+            varArgs[3] = &size;
 
-
-                uint sharedBytes = (uint)(blockSize * sizeof(float));
-                LaunchKernelWithSharedMem(varKernel, (uint)gridSize, (uint)blockSize, sharedBytes, varArgs);
-                Synchronize();
-                }
+            uint sharedBytes = (uint)(blockSize * sizeof(float));
+            uint launchGrid = GpuDeterminism.IsActive ? 1u : (uint)gridSize;
+            LaunchKernelWithSharedMem(varKernel, launchGrid, (uint)blockSize, sharedBytes, varArgs);
+            Synchronize();
 
             float[] varResult = DownloadBuffer(varianceBuffer);
             variance = varResult[0] / size;
@@ -8067,37 +8282,82 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth,
         int paddingMode = 0, bool alignCorners = false)
     {
+        IntPtr _p0 = gradOutput.Handle;
+        IntPtr _p1 = input.Handle;
+        IntPtr _p2 = grid.Handle;
+        IntPtr _p3 = gradInput.Handle;
+        IntPtr _p4 = gradGrid.Handle;
+        int alignCornersInt = alignCorners ? 1 : 0;
+
+        if (GpuDeterminism.IsActive)
+        {
+            // Issue #382: split into gradGrid (per output pos) + gradInput (per input cell).
+            if (!_kernelCache.TryGetValue("grid_sample_backward_grad_grid_deterministic", out var krnlG))
+                throw new InvalidOperationException("HIP kernel not found: grid_sample_backward_grad_grid_deterministic");
+
+            void** argsG = stackalloc void*[12];
+            argsG[0] = &_p0;
+            argsG[1] = &_p1;
+            argsG[2] = &_p2;
+            argsG[3] = &_p4;
+            argsG[4] = &batch;
+            argsG[5] = &channels;
+            argsG[6] = &inHeight;
+            argsG[7] = &inWidth;
+            argsG[8] = &outHeight;
+            argsG[9] = &outWidth;
+            argsG[10] = &paddingMode;
+            argsG[11] = &alignCornersInt;
+            uint gGX = (uint)((outWidth + 15) / 16);
+            uint gGY = (uint)((outHeight + 15) / 16);
+            uint gGZ = (uint)batch;
+            LaunchKernel3D(krnlG, gGX, gGY, gGZ, 16, 16, 1, argsG);
+
+            if (!_kernelCache.TryGetValue("grid_sample_backward_grad_input_deterministic", out var krnlI))
+                throw new InvalidOperationException("HIP kernel not found: grid_sample_backward_grad_input_deterministic");
+
+            void** argsI = stackalloc void*[11];
+            argsI[0] = &_p0;
+            argsI[1] = &_p2;
+            argsI[2] = &_p3;
+            argsI[3] = &batch;
+            argsI[4] = &channels;
+            argsI[5] = &inHeight;
+            argsI[6] = &inWidth;
+            argsI[7] = &outHeight;
+            argsI[8] = &outWidth;
+            argsI[9] = &paddingMode;
+            argsI[10] = &alignCornersInt;
+            uint gIX = (uint)((inWidth + 15) / 16);
+            uint gIY = (uint)((inHeight + 15) / 16);
+            uint gIZ = (uint)(batch * channels);
+            LaunchKernel3D(krnlI, gIX, gIY, gIZ, 16, 16, 1, argsI);
+            Synchronize();
+            return;
+        }
+
         if (!_kernelCache.TryGetValue("grid_sample_backward", out var krnl))
             throw new InvalidOperationException("HIP kernel not found: grid_sample_backward");
 
-            {
-            IntPtr _p0 = gradOutput.Handle;
-            IntPtr _p1 = input.Handle;
-            IntPtr _p2 = grid.Handle;
-            IntPtr _p3 = gradInput.Handle;
-            IntPtr _p4 = gradGrid.Handle;
-            void** args = stackalloc void*[13];
-            args[0] = &_p0;
-            args[1] = &_p1;
-            args[2] = &_p2;
-            args[3] = &_p3;
-            args[4] = &_p4;
-            args[5] = &batch;
-            args[6] = &channels;
-            args[7] = &inHeight;
-            args[8] = &inWidth;
-            args[9] = &outHeight;
-            args[10] = &outWidth;
-            args[11] = &paddingMode;
-            int alignCornersInt = alignCorners ? 1 : 0;
-            args[12] = &alignCornersInt;
-
-                uint gridX = (uint)((outWidth + 15) / 16);
-                uint gridY = (uint)((outHeight + 15) / 16);
-                uint gridZ = (uint)batch;
-                LaunchKernel3D(krnl, gridX, gridY, gridZ, 16, 16, 1, args);
-                Synchronize();
-            }
+        void** args = stackalloc void*[13];
+        args[0] = &_p0;
+        args[1] = &_p1;
+        args[2] = &_p2;
+        args[3] = &_p3;
+        args[4] = &_p4;
+        args[5] = &batch;
+        args[6] = &channels;
+        args[7] = &inHeight;
+        args[8] = &inWidth;
+        args[9] = &outHeight;
+        args[10] = &outWidth;
+        args[11] = &paddingMode;
+        args[12] = &alignCornersInt;
+        uint gridX = (uint)((outWidth + 15) / 16);
+        uint gridY = (uint)((outHeight + 15) / 16);
+        uint gridZ = (uint)batch;
+        LaunchKernel3D(krnl, gridX, gridY, gridZ, 16, 16, 1, args);
+        Synchronize();
     }
 
     public unsafe void BroadcastMultiplyLastAxis(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int outerSize, int innerSize)
@@ -11053,14 +11313,25 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             throw new ArgumentOutOfRangeException(nameof(numGammaBands), "numGammaBands must be positive.");
         if (gammaIdx < 0 || gammaIdx >= numGammaBands)
             throw new ArgumentOutOfRangeException(nameof(gammaIdx), $"gammaIdx must be in [0, {numGammaBands}).");
-        if (!_kernelCache.TryGetValue("pac_phase_bin_mi", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: pac_phase_bin_mi");
         IntPtr tp = thetaPhase.Handle, ga = gammaAmp.Handle, op = output.Handle;
         void** args = stackalloc void*[7];
         args[0] = &tp; args[1] = &ga; args[2] = &op;
         args[3] = &batch; args[4] = &numSamples; args[5] = &numGammaBands; args[6] = &gammaIdx;
-        LaunchKernelWithSharedMem(kernel, (uint)batch, 256, (uint)(2 * 18 * sizeof(float)),
-            new IntPtr[] { (IntPtr)args[0], (IntPtr)args[1], (IntPtr)args[2], (IntPtr)args[3], (IntPtr)args[4], (IntPtr)args[5], (IntPtr)args[6] });
+        var argList = new IntPtr[] { (IntPtr)args[0], (IntPtr)args[1], (IntPtr)args[2], (IntPtr)args[3], (IntPtr)args[4], (IntPtr)args[5], (IntPtr)args[6] };
+
+        if (GpuDeterminism.IsActive)
+        {
+            // Issue #382: per-(b, bin) parallelization; uses statically-sized __shared__ in kernel.
+            if (!_kernelCache.TryGetValue("pac_phase_bin_mi_deterministic", out var krnlD))
+                throw new InvalidOperationException("HIP kernel not found: pac_phase_bin_mi_deterministic");
+            // block size = NUM_PHASE_BINS = 18 (one thread per bin)
+            LaunchKernelWithSharedMem(krnlD, (uint)batch, 18, 0, argList);
+            return;
+        }
+
+        if (!_kernelCache.TryGetValue("pac_phase_bin_mi", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: pac_phase_bin_mi");
+        LaunchKernelWithSharedMem(kernel, (uint)batch, 256, (uint)(2 * 18 * sizeof(float)), argList);
     }
 }
 

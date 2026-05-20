@@ -249,6 +249,162 @@ __kernel void flash_attention_v2(
     softmaxStats[sOffset] = rowMax + log(rowSum);
 }
 
+// FlashAttention backward — bit-deterministic variants (issue #382).
+// The original flash_attention_backward parallelizes one work-item per (bh, qi) and
+// uses atomic_add_float to accumulate into gradKey[ki] / gradValue[ki] across the
+// many qi threads that touch the same ki. That is FP-non-deterministic across runs.
+//
+// Deterministic split into two atomic-free kernels:
+//   gradq: parallelize per (bh, qi) — writes gradQuery (each thread's own qi).
+//          Identical work to the atomic kernel but DOES NOT write gradKey/gradValue.
+//   gradkv: parallelize per (bh, ki, d) — each work-item owns one (ki, d) cell of
+//           gradKey AND gradValue, scans qi in fixed ascending order, and
+//           accumulates contributions. No atomics.
+// Both kernels recompute the forward scores from the saved logsumexp; total work
+// doubles in deterministic mode — documented DeterministicMode trade-off.
+__kernel void flash_attention_backward_gradq_deterministic(
+    __global const float* gradOutput,
+    __global const float* query,
+    __global const float* key,
+    __global const float* value,
+    __global const float* output,
+    __global const float* softmaxStats,
+    __global float* gradQuery,
+    const int batch,
+    const int numHeads,
+    const int seqQ,
+    const int seqK,
+    const int headDim,
+    const float scale,
+    const int isCausal,
+    __global const float* attentionBias,
+    const int hasBias,
+    const int biasBatchStride)
+{
+    const int bh = get_global_id(1);
+    const int qi = get_global_id(0);
+
+    if (bh >= batch * numHeads || qi >= seqQ) return;
+
+    const int qOffset = bh * seqQ * headDim + qi * headDim;
+    const int kOffset = bh * seqK * headDim;
+    const int vOffset = bh * seqK * headDim;
+    const int gOffset = bh * seqQ * headDim + qi * headDim;
+    const int sOffset = bh * seqQ + qi;
+
+    int biasBase = 0;
+    if (hasBias) {
+        const int b = bh / numHeads;
+        const int h = bh % numHeads;
+        biasBase = b * biasBatchStride + h * seqQ * seqK + qi * seqK;
+    }
+
+    float logsumexp = softmaxStats[sOffset];
+
+    float doO = 0.0f;
+    for (int d = 0; d < headDim; d++) {
+        doO += gradOutput[gOffset + d] * output[qOffset + d];
+    }
+
+    for (int ki = 0; ki < seqK; ki++) {
+        if (isCausal && ki > qi) continue;
+
+        float score = 0.0f;
+        for (int d = 0; d < headDim; d++) {
+            score += query[qOffset + d] * key[kOffset + ki * headDim + d];
+        }
+        score *= scale;
+        if (hasBias) score += attentionBias[biasBase + ki];
+
+        float attnWeight = exp(score - logsumexp);
+
+        float doV = 0.0f;
+        for (int d = 0; d < headDim; d++) {
+            doV += gradOutput[gOffset + d] * value[vOffset + ki * headDim + d];
+        }
+
+        float dS = attnWeight * (doV - doO) * scale;
+
+        // Only gradQuery is written here — gradKey/gradValue are produced by the
+        // companion gradkv kernel.
+        for (int d = 0; d < headDim; d++) {
+            gradQuery[qOffset + d] += dS * key[kOffset + ki * headDim + d];
+        }
+    }
+}
+
+__kernel void flash_attention_backward_gradkv_deterministic(
+    __global const float* gradOutput,
+    __global const float* query,
+    __global const float* key,
+    __global const float* value,
+    __global const float* output,
+    __global const float* softmaxStats,
+    __global float* gradKey,
+    __global float* gradValue,
+    const int batch,
+    const int numHeads,
+    const int seqQ,
+    const int seqK,
+    const int headDim,
+    const float scale,
+    const int isCausal,
+    __global const float* attentionBias,
+    const int hasBias,
+    const int biasBatchStride)
+{
+    const int bh = get_global_id(2);
+    const int ki = get_global_id(1);
+    const int d = get_global_id(0);
+    if (bh >= batch * numHeads || ki >= seqK || d >= headDim) return;
+
+    const int kOffset = bh * seqK * headDim;
+    const int vOffset = bh * seqK * headDim;
+    const int qBase = bh * seqQ * headDim;
+    const int gBase = bh * seqQ * headDim;
+    const int sBase = bh * seqQ;
+
+    float accV = 0.0f;
+    float accK = 0.0f;
+
+    int b = bh / numHeads;
+    int h = bh % numHeads;
+    int biasHeadBase = hasBias ? (b * biasBatchStride + h * seqQ * seqK) : 0;
+
+    for (int qi = 0; qi < seqQ; qi++) {
+        if (isCausal && ki > qi) continue;
+
+        const int qOffset = qBase + qi * headDim;
+        const int gOffset = gBase + qi * headDim;
+
+        float logsumexp = softmaxStats[sBase + qi];
+        float score = 0.0f;
+        for (int dd = 0; dd < headDim; dd++) {
+            score += query[qOffset + dd] * key[kOffset + ki * headDim + dd];
+        }
+        score *= scale;
+        if (hasBias) score += attentionBias[biasHeadBase + qi * seqK + ki];
+
+        float attnWeight = exp(score - logsumexp);
+
+        float doO = 0.0f;
+        for (int dd = 0; dd < headDim; dd++) {
+            doO += gradOutput[gOffset + dd] * output[qOffset + dd];
+        }
+        float doV = 0.0f;
+        for (int dd = 0; dd < headDim; dd++) {
+            doV += gradOutput[gOffset + dd] * value[vOffset + ki * headDim + dd];
+        }
+
+        accV += attnWeight * gradOutput[gOffset + d];
+        float dS = attnWeight * (doV - doO) * scale;
+        accK += dS * query[qOffset + d];
+    }
+
+    gradValue[vOffset + ki * headDim + d] += accV;
+    gradKey[kOffset + ki * headDim + d] += accK;
+}
+
 // FlashAttention backward pass with recomputation
 __kernel void flash_attention_backward(
     __global const float* gradOutput,     // [batch * heads * seqQ * headDim]
@@ -424,6 +580,140 @@ __kernel void grouped_query_attention(
     }
 }
 
+// GQA backward — bit-deterministic variants (issue #382).
+// Same split strategy as flash_attention_backward_*_deterministic above:
+//   gradq: per (bqh, qi) — writes gradQuery only, no atomics
+//   gradkv: per (b, kvh, ki, d) — iterates the queriesPerKV query heads + all qi,
+//           accumulates gradKey and gradValue with fixed (qh, qi) traversal order
+__kernel void grouped_query_attention_backward_gradq_deterministic(
+    __global const float* gradOutput,
+    __global const float* query,
+    __global const float* key,
+    __global const float* value,
+    __global const float* attentionWeights,
+    __global float* gradQuery,
+    const int batch,
+    const int numQHeads,
+    const int numKVHeads,
+    const int queriesPerKV,
+    const int seqQ,
+    const int seqK,
+    const int headDim,
+    const float scale)
+{
+    const int d = get_global_id(0);
+    const int qi = get_global_id(1);
+    const int bqh = get_global_id(2);
+
+    if (d >= headDim || qi >= seqQ || bqh >= batch * numQHeads) return;
+
+    const int b = bqh / numQHeads;
+    const int qh = bqh % numQHeads;
+    const int kvh = qh / queriesPerKV;
+
+    const int qOffset = bqh * seqQ * headDim + qi * headDim;
+    const int kOffset = (b * numKVHeads + kvh) * seqK * headDim;
+    const int vOffset = (b * numKVHeads + kvh) * seqK * headDim;
+    const int gOffset = bqh * seqQ * headDim + qi * headDim;
+    const int wOffset = bqh * seqQ * seqK + qi * seqK;
+
+    // Each work-item owns one output cell gradQuery[qOffset + d].
+    // dotProduct depends only on (qi, bqh) and is recomputed locally per
+    // work-item — this trades headDim-x extra arithmetic for true
+    // parallelism over d (the prior `if (d == 0)` gating wasted
+    // headDim - 1 threads doing nothing). Writes are bit-deterministic:
+    // each cell has a unique owner and uses `=`, not `+=`.
+    float dotProduct = 0.0f;
+    for (int ki = 0; ki < seqK; ki++) {
+        float w = attentionWeights[wOffset + ki];
+        float gw = 0.0f;
+        for (int dd = 0; dd < headDim; dd++) {
+            gw += gradOutput[gOffset + dd] * value[vOffset + ki * headDim + dd];
+        }
+        dotProduct += w * gw;
+    }
+
+    float acc = 0.0f;
+    for (int ki = 0; ki < seqK; ki++) {
+        float w = attentionWeights[wOffset + ki];
+        float gw = 0.0f;
+        for (int dd = 0; dd < headDim; dd++) {
+            gw += gradOutput[gOffset + dd] * value[vOffset + ki * headDim + dd];
+        }
+        float gradScore = w * (gw - dotProduct) * scale;
+        acc += gradScore * key[kOffset + ki * headDim + d];
+    }
+    gradQuery[qOffset + d] = acc;
+}
+
+__kernel void grouped_query_attention_backward_gradkv_deterministic(
+    __global const float* gradOutput,
+    __global const float* query,
+    __global const float* key,
+    __global const float* value,
+    __global const float* attentionWeights,
+    __global float* gradKey,
+    __global float* gradValue,
+    const int batch,
+    const int numQHeads,
+    const int numKVHeads,
+    const int queriesPerKV,
+    const int seqQ,
+    const int seqK,
+    const int headDim,
+    const float scale)
+{
+    // One work-item per (b, kvh, ki, d) cell of gradKey/gradValue
+    const int d = get_global_id(0);
+    const int ki = get_global_id(1);
+    const int bkvh = get_global_id(2);
+    if (d >= headDim || ki >= seqK || bkvh >= batch * numKVHeads) return;
+
+    const int b = bkvh / numKVHeads;
+    const int kvh = bkvh % numKVHeads;
+    const int kvOffsetBase = bkvh * seqK * headDim;
+
+    float accV = 0.0f;
+    float accK = 0.0f;
+
+    for (int qhOff = 0; qhOff < queriesPerKV; qhOff++) {
+        int qh = kvh * queriesPerKV + qhOff;
+        int bqh = b * numQHeads + qh;
+        int qheadBase = bqh * seqQ * headDim;
+        int wheadBase = bqh * seqQ * seqK;
+
+        for (int qi = 0; qi < seqQ; qi++) {
+            int qOffset = qheadBase + qi * headDim;
+            int gOffset = qOffset;
+            int wOffset = wheadBase + qi * seqK;
+
+            float weight = attentionWeights[wOffset + ki];
+
+            // Reconstruct gradScore as in the atomic kernel.
+            float dotProduct = 0.0f;
+            for (int kj = 0; kj < seqK; kj++) {
+                float wj = attentionWeights[wOffset + kj];
+                float gwj = 0.0f;
+                for (int dd = 0; dd < headDim; dd++) {
+                    gwj += gradOutput[gOffset + dd] * value[kvOffsetBase + kj * headDim + dd];
+                }
+                dotProduct += wj * gwj;
+            }
+            float gw = 0.0f;
+            for (int dd = 0; dd < headDim; dd++) {
+                gw += gradOutput[gOffset + dd] * value[kvOffsetBase + ki * headDim + dd];
+            }
+            float gradScore = weight * (gw - dotProduct) * scale;
+
+            accV += weight * gradOutput[gOffset + d];
+            accK += gradScore * query[qOffset + d];
+        }
+    }
+
+    gradValue[kvOffsetBase + ki * headDim + d] += accV;
+    gradKey[kvOffsetBase + ki * headDim + d] += accK;
+}
+
 __kernel void grouped_query_attention_backward(
     __global const float* gradOutput,     // [batch * numQHeads * seqQ * headDim]
     __global const float* query,          // [batch * numQHeads * seqQ * headDim]
@@ -573,8 +863,12 @@ __kernel void flash_attention_forward(
                 "scaled_dot_product_attention",
                 "flash_attention_v2",
                 "flash_attention_backward",
+                "flash_attention_backward_gradq_deterministic",
+                "flash_attention_backward_gradkv_deterministic",
                 "grouped_query_attention",
                 "grouped_query_attention_backward",
+                "grouped_query_attention_backward_gradq_deterministic",
+                "grouped_query_attention_backward_gradkv_deterministic",
                 "flash_attention_forward"
             };
         }

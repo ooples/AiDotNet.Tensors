@@ -292,7 +292,35 @@ extern ""C"" __global__ __launch_bounds__(256) void crop_2d_backward(
     int c = temp % channels;
     int b = temp / channels;
 
+    // NON-DETERMINISTIC across re-runs (issue #382). The mapping is one-to-one
+    // within a single launch (each output thread writes a different input cell),
+    // so atomicAdd is over-defensive; the deterministic variant below uses +=.
     atomicAdd(&grad_input[((b * channels + c) * inH + (h + offsetH)) * inW + (w + offsetW)], grad_output[idx]);
+}
+
+// crop_2d_backward — bit-deterministic variant (issue #382).
+// Same parallelization as the atomic version (one thread per output cell), but
+// the (output -> input) mapping is one-to-one across the cropped subregion, so
+// every thread owns a unique grad_input slot and a plain `=` write replaces the
+// over-defensive atomicAdd. Bit-identical across re-runs; caller is expected
+// to pre-zero grad_input — the non-cropped region is intentionally untouched.
+extern ""C"" __global__ __launch_bounds__(256) void crop_2d_backward_deterministic(
+    const float* __restrict__ grad_output, float* __restrict__ grad_input,
+    int batch, int channels, int inH, int inW,
+    int outH, int outW, int offsetH, int offsetW)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch * channels * outH * outW;
+    if (idx >= total) return;
+
+    int w = idx % outW;
+    int temp = idx / outW;
+    int h = temp % outH;
+    temp = temp / outH;
+    int c = temp % channels;
+    int b = temp / channels;
+
+    grad_input[((b * channels + c) * inH + (h + offsetH)) * inW + (w + offsetW)] = grad_output[idx];
 }
 
 // ============================================================================
@@ -420,6 +448,7 @@ extern ""C"" __global__ __launch_bounds__(256) void index_select(
             "pixel_shuffle_backward",
             "crop_2d",
             "crop_2d_backward",
+            "crop_2d_backward_deterministic",
             "eye_kernel",
             "linspace_kernel",
             "one_hot_kernel",

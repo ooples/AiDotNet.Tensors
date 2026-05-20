@@ -8,7 +8,9 @@ internal static class HipDotProductKernels
     public static string[] GetKernelNames() =>
     [
         "dot_product",
+        "dot_product_deterministic",
         "strided_dot_product",
+        "strided_dot_product_deterministic",
         "batched_dot_product"
     ];
 
@@ -51,7 +53,18 @@ extern ""C"" __global__ __launch_bounds__(256) void dot_product(
         sum += a[i] * b[i];
     }
     sum = blockReduceSum(sum);
+    // NON-DETERMINISTIC (issue #382); see dot_product_deterministic.
     if (threadIdx.x == 0) atomicAdd(result, sum);
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void dot_product_deterministic(
+    const float* __restrict__ a, const float* __restrict__ b,
+    float* __restrict__ result, int size)
+{
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < size; i += blockDim.x) sum += a[i] * b[i];
+    sum = blockReduceSum(sum);
+    if (threadIdx.x == 0) *result = sum;
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void strided_dot_product(
@@ -66,7 +79,21 @@ extern ""C"" __global__ __launch_bounds__(256) void strided_dot_product(
         }
     }
     sum = blockReduceSum(sum);
+    // NON-DETERMINISTIC (issue #382); see strided_dot_product_deterministic.
     if (threadIdx.x == 0) atomicAdd(result, sum);
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void strided_dot_product_deterministic(
+    const float* __restrict__ a, const float* __restrict__ b,
+    float* __restrict__ result, int aSize, int bSize, int bOffset, int bStride)
+{
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < aSize; i += blockDim.x) {
+        int bIdx = bOffset + i * bStride;
+        if (bIdx >= 0 && bIdx < bSize) sum += a[i] * b[bIdx];
+    }
+    sum = blockReduceSum(sum);
+    if (threadIdx.x == 0) *result = sum;
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void batched_dot_product(
