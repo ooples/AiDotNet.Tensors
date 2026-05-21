@@ -1,17 +1,27 @@
 // Copyright (c) AiDotNet. All rights reserved.
-// Dgemm (double-precision) SIMD kernel — issue #243 companion to the
-// existing Sgemm path. The public entry point is SimdGemm.Dgemm (see
-// partial below); this file carries the AVX2 Vector256<double>-based
-// tiled kernel + scalar fallback.
+// Dgemm (double-precision) SIMD kernel — FP64 companion to SimdGemm (FP32).
 //
-// Current perf envelope:
-//   - CpuEngine.MatMul<double> on [64, 2048] × [2048, 512] went from
-//     ~2.8 GFLOPS (MultiplyBlocked + per-row numOps.MultiplyAdd dispatch)
-//     to ~12 GFLOPS here (inline Vector256<double> FMA, 2D parallel).
-//   - Still well below MKL's ~75 GFLOPS — closing that gap would require
-//     packed-B panels + K-outer tiling at AVX-512 width (tracked under
-//     issue #131 follow-up). This kernel closes the majority of the gap
-//     without new deps, matching the supply-chain-free build constraint.
+// Stage 1 of the docs/mkl-replacement/PLAN.md FP64 closure: ports the FP32
+// SimdGemm primitives to FP64 with Mr×Nr=4×8 geometry (Vector256<double> =
+// 4 lanes vs 8 for float, so Mr halves; Nr stays at 8 doubles = 2 Vector256
+// blocks). Mc/Kc/Nc halve from the FP32 constants because FP64 is 2× bytes
+// per element — preserving the same L2/L3 occupancy fractions that iter
+// 31/33's adaptive Mc tuning was calibrated against.
+//
+// Foundation (this commit):
+//   - Adaptive Mc (port of ChooseAdaptiveMc with halved constants)
+//   - PackADouble / PackBDouble (port of PackA / PackB, full-Mr/Nr fast path)
+//   - DgemmMicroKernel4x8 (port of DirectKernel6x16, 8 YMM accumulators)
+//   - DgemmMacroKernel + DgemmTiledSequential (port of SgemmTiled core)
+//   - Dgemm entry dispatches to packed-tiled when m/n/k justify packing
+//     overhead, otherwise to the existing block-tile path below.
+//
+// Subsequent commits on this branch will add (per the plan):
+//   - Parallel-M / Parallel-N / Parallel-2D dispatch + heuristic
+//   - DgemmDirect small-matmul no-packing path (Stage 2)
+//   - Pre-packed B cache (Stage 3)
+//   - Masked edge kernels (DirectKernelMxNMasked equivalent)
+//   - AVX-512 8×16 microkernel companion (Stage 7)
 
 using System;
 using System.Runtime.CompilerServices;
@@ -19,17 +29,342 @@ using System.Runtime.CompilerServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
 #endif
-using System.Threading.Tasks;
 
 namespace AiDotNet.Tensors.Engines.Simd;
 
 internal static partial class SimdGemm
 {
+    // ─── FP64 layout constants ────────────────────────────────────────────
+    //
+    // Register block: 4 rows × 8 cols = 32 doubles = 8 Vector256<double>
+    // accumulators. With 16 YMM registers total, 8 accumulators + 2 B-loads +
+    // 1 A-broadcast = 11 live YMM, well within budget. (The FP32 6×16 path
+    // uses 12 accumulators; 4×8 leaves more register headroom to interleave
+    // K-loop broadcasts.)
+    private const int DMr = 4;
+    private const int DNr = 8;
+
+    // Mc/Kc/Nc halved from FP32's 128/512/4096 because each double is 2×
+    // the bytes of a float. Preserves the same L2/L3 occupancy fractions
+    // the iter-31/33 adaptive-Mc tuning landed.
+    private const int DSmallMc = 64;
+    private const int DLargeMc = 96;
+    private const int DKc = 256;
+    private const int DNc = 2048;
+    private const long DAdaptiveMcWorkThreshold = 1_500_000_000L; // 1.5G FMAs (half of FP32's 3G)
+    private const long DSquareMediumWorkLow  = 32_000_000L;
+    private const long DSquareMediumWorkHigh = 750_000_000L;
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int ChooseAdaptiveMcDouble(int m, int k, int n)
+    {
+        long work = (long)m * k * n;
+        if (work >= DAdaptiveMcWorkThreshold) return DLargeMc;
+        if (m == n && n == k && work >= DSquareMediumWorkLow && work <= DSquareMediumWorkHigh)
+            return DLargeMc;
+        return DSmallMc;
+    }
+
+    /// <summary>
+    /// Gate: should this (m, k, n) take the packed-tiled FP64 path, or the
+    /// existing inline 64-block path? Packed has setup overhead (PackA +
+    /// PackB allocate + populate) that only amortizes above ~1M FMAs and
+    /// when m, n are large enough to actually need multiple Mr/Nr tiles.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool DgemmShouldUsePackedTiled(int m, int k, int n)
+    {
+        long work = (long)m * k * n;
+        if (work < 1_000_000L) return false;          // setup overhead dominates
+        if (m < DMr || n < DNr) return false;         // can't fill even one tile
+        if (k < 8) return false;                      // K-loop micro-kernel doesn't amortize
+        return true;
+    }
+
+#if NET5_0_OR_GREATER
+    // ─── Microkernel: 4 rows × 8 cols register-blocked Vector256<double> FMA ──
+    //
+    // Mirrors FP32 DirectKernel6x16 (lines ~1820-1895 of SimdGemm.cs) with
+    // half the rows and half the per-row YMM count. 8 accumulators total:
+    //   c00 c01   ← row 0, cols 0-3 and 4-7
+    //   c10 c11   ← row 1
+    //   c20 c21   ← row 2
+    //   c30 c31   ← row 3
+    //
+    // The packed-A layout is [Mr-stride × kc] from PackADouble: at K-step p
+    // the 4 row-elements live at packedA[p*Mr + 0..3] (interleaved across
+    // rows). The packed-B layout is [kc × Nr-stride]: at K-step p the 8
+    // col-elements live at packedB[p*Nr + 0..7] (contiguous within the
+    // 8-col tile).
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe void DgemmMicroKernel4x8(
+        double* pPackedA, double* pPackedB,
+        double* pC, int ldc,
+        int kc)
+    {
+        var c00 = Vector256<double>.Zero; var c01 = Vector256<double>.Zero;
+        var c10 = Vector256<double>.Zero; var c11 = Vector256<double>.Zero;
+        var c20 = Vector256<double>.Zero; var c21 = Vector256<double>.Zero;
+        var c30 = Vector256<double>.Zero; var c31 = Vector256<double>.Zero;
+
+        // K-loop: per p, broadcast A[row, p] for each of 4 rows, then FMA
+        // against the two 4-wide B tiles. Interleaved A-broadcast / FMA
+        // keeps each A live for only 2 FMAs, recycling YMM registers.
+        for (int p = 0; p < kc; p++)
+        {
+            var b0 = Avx.LoadVector256(pPackedB);       // cols 0-3
+            var b1 = Avx.LoadVector256(pPackedB + 4);   // cols 4-7
+
+            var a0 = Vector256.Create(pPackedA[0]);
+            c00 = Fma.MultiplyAdd(a0, b0, c00); c01 = Fma.MultiplyAdd(a0, b1, c01);
+
+            var a1 = Vector256.Create(pPackedA[1]);
+            c10 = Fma.MultiplyAdd(a1, b0, c10); c11 = Fma.MultiplyAdd(a1, b1, c11);
+
+            var a2 = Vector256.Create(pPackedA[2]);
+            c20 = Fma.MultiplyAdd(a2, b0, c20); c21 = Fma.MultiplyAdd(a2, b1, c21);
+
+            var a3 = Vector256.Create(pPackedA[3]);
+            c30 = Fma.MultiplyAdd(a3, b0, c30); c31 = Fma.MultiplyAdd(a3, b1, c31);
+
+            pPackedA += DMr;
+            pPackedB += DNr;
+        }
+
+        // Accumulate into C (load-add-store). Caller cleared C via Dgemm.
+        Avx.Store(pC + 0, Avx.Add(c00, Avx.LoadVector256(pC + 0)));
+        Avx.Store(pC + 4, Avx.Add(c01, Avx.LoadVector256(pC + 4)));
+        pC += ldc;
+        Avx.Store(pC + 0, Avx.Add(c10, Avx.LoadVector256(pC + 0)));
+        Avx.Store(pC + 4, Avx.Add(c11, Avx.LoadVector256(pC + 4)));
+        pC += ldc;
+        Avx.Store(pC + 0, Avx.Add(c20, Avx.LoadVector256(pC + 0)));
+        Avx.Store(pC + 4, Avx.Add(c21, Avx.LoadVector256(pC + 4)));
+        pC += ldc;
+        Avx.Store(pC + 0, Avx.Add(c30, Avx.LoadVector256(pC + 0)));
+        Avx.Store(pC + 4, Avx.Add(c31, Avx.LoadVector256(pC + 4)));
+    }
+
+    // ─── Packing: A panel (mc × kc) → row-stride-Mr interleaved layout ───
+    //
+    // FP64 mirror of FP32 PackA. For full-Mr rows packs 4-element broadcasts
+    // contiguously: per K-step p, packed[p*Mr + r] = a[ic+r, pc+p]. The
+    // microkernel reads each K iter as a contiguous Mr-element load.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe void PackADouble(
+        ReadOnlySpan<double> a, double[] packed, int lda,
+        int ic, int mc, int pc, int kc)
+    {
+        int pos = 0;
+        int i = 0;
+        fixed (double* aPtr = a)
+        fixed (double* packedPtr = packed)
+        {
+            for (; i + DMr <= mc; i += DMr)
+            {
+                double* row0 = aPtr + (long)(ic + i + 0) * lda + pc;
+                double* row1 = aPtr + (long)(ic + i + 1) * lda + pc;
+                double* row2 = aPtr + (long)(ic + i + 2) * lda + pc;
+                double* row3 = aPtr + (long)(ic + i + 3) * lda + pc;
+                double* pp = packedPtr + pos;
+                for (int p = 0; p < kc; p++)
+                {
+                    pp[0] = row0[0]; pp[1] = row1[0]; pp[2] = row2[0]; pp[3] = row3[0];
+                    pp += DMr;
+                    row0++; row1++; row2++; row3++;
+                }
+                pos += DMr * kc;
+            }
+        }
+
+        // Edge rows (less than Mr remaining): pad with zeros so the
+        // microkernel can still process the full Mr panel; the caller
+        // discards the resulting rows past mc.
+        int remaining = mc - i;
+        if (remaining > 0)
+        {
+            for (int p = 0; p < kc; p++)
+            {
+                for (int ii = 0; ii < remaining; ii++)
+                    packed[pos++] = a[(ic + i + ii) * lda + (pc + p)];
+                for (int ii = remaining; ii < DMr; ii++)
+                    packed[pos++] = 0.0;
+            }
+        }
+    }
+
+    // ─── Packing: B panel (kc × nc) → col-stride-Nr layout ───
+    //
+    // FP64 mirror of FP32 PackB. For full-Nr columns: per K-step p, packed
+    // contains 8 contiguous doubles = the 8 column-elements at B[pc+p, jc..jc+7].
+    // The microkernel reads each K iter as two Vector256<double> loads.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe void PackBDouble(
+        ReadOnlySpan<double> b, double[] packed, int ldb,
+        int pc, int kc, int jc, int nc)
+    {
+        int pos = 0;
+        int j = 0;
+        fixed (double* bPtr = b)
+        fixed (double* packedPtr = packed)
+        {
+            for (; j + DNr <= nc; j += DNr)
+            {
+                double* pp = packedPtr + pos;
+                for (int p = 0; p < kc; p++)
+                {
+                    double* bRow = bPtr + (long)(pc + p) * ldb + (jc + j);
+                    // 8 doubles = two Vector256<double>
+                    Avx.Store(pp + 0, Avx.LoadVector256(bRow + 0));
+                    Avx.Store(pp + 4, Avx.LoadVector256(bRow + 4));
+                    pp += DNr;
+                }
+                pos += DNr * kc;
+            }
+        }
+
+        // Edge cols (less than Nr remaining): pad with zeros.
+        int remaining = nc - j;
+        if (remaining > 0)
+        {
+            for (int p = 0; p < kc; p++)
+            {
+                for (int jj = 0; jj < remaining; jj++)
+                    packed[pos++] = b[(pc + p) * ldb + (jc + j + jj)];
+                for (int jj = remaining; jj < DNr; jj++)
+                    packed[pos++] = 0.0;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Macro kernel: iterate over Mr × Nr microkernel tiles within the
+    /// (mc × kc × nc) packed panel. C destination is the [ic:ic+mc, jc:jc+nc]
+    /// slice of the global C, accessed via raw pointer + ldc.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe void DgemmMacroKernel(
+        double* packedA, double* packedB,
+        double* cBase, int ldc,
+        int mc, int nc, int kc)
+    {
+        // Full Mr × Nr tiles. Edge handling (mc % Mr != 0 or nc % Nr != 0)
+        // walks scalar fallback — minor cost since edges are 1-Mr-1 rows /
+        // 1-Nr-1 cols on shapes large enough to take the packed path.
+        int mFull = (mc / DMr) * DMr;
+        int nFull = (nc / DNr) * DNr;
+
+        for (int i = 0; i < mFull; i += DMr)
+        {
+            double* aPanel = packedA + (long)i * kc;
+            for (int j = 0; j < nFull; j += DNr)
+            {
+                double* bPanel = packedB + (long)j * kc;
+                double* cTile = cBase + (long)i * ldc + j;
+                DgemmMicroKernel4x8(aPanel, bPanel, cTile, ldc, kc);
+            }
+            // Right-edge cols [nFull, nc): scalar fallback into the same
+            // packed-A view (just walk K via the packed layout).
+            for (int j = nFull; j < nc; j++)
+            {
+                for (int ii = 0; ii < DMr; ii++)
+                {
+                    double sum = 0.0;
+                    double* aRow = aPanel + ii;
+                    double* bCol = packedB + (long)(j / DNr * DNr) * kc + (j % DNr);
+                    // For the edge column case (j >= nFull = nc - nc%Nr),
+                    // the packed-B tile that contains column j may be a
+                    // partial tile that PackBDouble padded with zeros, so
+                    // reading packed[p*Nr + (j % Nr)] still yields valid
+                    // contribution (zero contribution from padded lanes).
+                    for (int p = 0; p < kc; p++)
+                    {
+                        sum += aRow[p * DMr] * bCol[p * DNr];
+                    }
+                    cTile_Add(cBase, ldc, i + ii, j, sum);
+                }
+            }
+        }
+        // Bottom edge rows [mFull, mc): scalar over all cols, walking the
+        // packed-A edge buffer that PackADouble zero-padded.
+        for (int i = mFull; i < mc; i++)
+        {
+            int paddedRowBase = mFull * kc + ((i - mFull));
+            for (int j = 0; j < nc; j++)
+            {
+                double sum = 0.0;
+                for (int p = 0; p < kc; p++)
+                {
+                    double aval = packedA[paddedRowBase + p * DMr];
+                    double bval = packedB[(long)(j / DNr * DNr) * kc + p * DNr + (j % DNr)];
+                    sum += aval * bval;
+                }
+                cTile_Add(cBase, ldc, i, j, sum);
+            }
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe void cTile_Add(double* cBase, int ldc, int i, int j, double sum)
+    {
+        cBase[(long)i * ldc + j] += sum;
+    }
+
+    /// <summary>
+    /// Sequential packed-tiled DGEMM: jc → pc → ic → macro kernel. Mirrors
+    /// the FP32 SgemmTiled outer loop (lines ~2253-2360) with FP64 panel
+    /// sizes. C is assumed already zeroed by the caller (Dgemm clears).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe void DgemmTiledSequential(
+        ReadOnlySpan<double> a, ReadOnlySpan<double> b, Span<double> c,
+        int m, int k, int n)
+    {
+        int Mc = ChooseAdaptiveMcDouble(m, k, n);
+
+        // One packed buffer per panel — sized for the largest possible
+        // panel at this shape (Mc * Kc for A, Kc * Nc for B). At Mc=96,
+        // Kc=256 → 192 KB packed A; at Kc=256, Nc=2048 → 4 MB packed B.
+        // Both rent from the heap — pool integration is a follow-up commit
+        // alongside Stage 3 (pre-packed B cache).
+        var packedA = new double[Mc * DKc];
+        var packedB = new double[DKc * DNc];
+
+        fixed (double* aPtr = a)
+        fixed (double* bPtr = b)
+        fixed (double* cPtr = c)
+        {
+            for (int jc = 0; jc < n; jc += DNc)
+            {
+                int nc = Math.Min(DNc, n - jc);
+                for (int pc = 0; pc < k; pc += DKc)
+                {
+                    int kc = Math.Min(DKc, k - pc);
+                    PackBDouble(b, packedB, n, pc, kc, jc, nc);
+
+                    for (int ic = 0; ic < m; ic += Mc)
+                    {
+                        int mc = Math.Min(Mc, m - ic);
+                        PackADouble(a, packedA, k, ic, mc, pc, kc);
+
+                        fixed (double* paPtr = packedA)
+                        fixed (double* pbPtr = packedB)
+                        {
+                            double* cBase = cPtr + (long)ic * n + jc;
+                            DgemmMacroKernel(paPtr, pbPtr, cBase, n, mc, nc, kc);
+                        }
+                    }
+                }
+            }
+        }
+    }
+#endif
+
     /// <summary>
     /// C = A · B where A is [m, k], B is [k, n], C is [m, n], all in
     /// row-major order. C is cleared before computation.
     /// Uses AVX2 Vector256&lt;double&gt; FMA when available, scalar
-    /// fallback otherwise. Parallelizes over the 2D (M, N) block grid.
+    /// fallback otherwise.
     /// </summary>
     internal static void Dgemm(
         ReadOnlySpan<double> a,
@@ -44,6 +379,15 @@ internal static partial class SimdGemm
 #if NET5_0_OR_GREATER
         if (Avx2.IsSupported && Fma.IsSupported)
         {
+            // Stage 1 packed-tiled path: amortizes packing overhead on
+            // shapes large enough to benefit (per DgemmShouldUsePackedTiled
+            // gate). Small shapes fall through to the existing inline 64-
+            // block path which has no packing setup cost.
+            if (DgemmShouldUsePackedTiled(m, k, n))
+            {
+                DgemmTiledSequential(a, b, c, m, k, n);
+                return;
+            }
             DgemmAvx2(a, b, c, m, k, n, allowParallel: true);
             return;
         }
@@ -71,6 +415,11 @@ internal static partial class SimdGemm
 #if NET5_0_OR_GREATER
         if (Avx2.IsSupported && Fma.IsSupported)
         {
+            if (DgemmShouldUsePackedTiled(m, k, n))
+            {
+                DgemmTiledSequential(a, b, c, m, k, n);
+                return;
+            }
             DgemmAvx2(a, b, c, m, k, n, allowParallel: false);
             return;
         }
@@ -79,12 +428,9 @@ internal static partial class SimdGemm
     }
 
     // ─────────────────────────────────────────────────────────────────────
-    // AVX2 tiled kernel. Block size = 64 (fits L1 for M+N, double).
-    // Inner-most micro-kernel: per (i, kk+kIndex), broadcast a[i,kk+kIndex]
-    // across a Vector256<double>, then FMA against B panels 4 lanes at a
-    // time. This avoids the Action<int> dispatch + numOps.MultiplyAdd
-    // indirection in MatrixMultiplyHelper.MultiplyBlocked, which is most
-    // of the ~4× speedup on small-M transformer shapes.
+    // Pre-existing inline 64-block kernel (kept as fallback for small shapes
+    // where the packed-tiled path's setup overhead dominates). This is the
+    // original SimdGemmDouble path that shipped pre-Stage-1.
     // ─────────────────────────────────────────────────────────────────────
     private const int DgemmBlockSize = 64;
 
@@ -100,16 +446,10 @@ internal static partial class SimdGemm
         int numColBlocks = (n + DgemmBlockSize - 1) / DgemmBlockSize;
         bool doParallel = allowParallel && (long)m * n >= 16384 && Environment.ProcessorCount > 1;
 
-        // Pin once at the top level so the inner kernels can do raw
-        // pointer arithmetic — the Span's pointers are already pinned
-        // for the call duration so we capture them via fixed statements.
         fixed (double* aPtr0 = a)
         fixed (double* bPtr0 = b)
         fixed (double* cPtr0 = c)
         {
-            // We need to close over these raw pointers; marshal through
-            // IntPtr so the lambda captures stable handles (C# can't
-            // capture unsafe pointers directly into a lambda).
             IntPtr aHandle = (IntPtr)aPtr0;
             IntPtr bHandle = (IntPtr)bPtr0;
             IntPtr cHandle = (IntPtr)cPtr0;
@@ -136,11 +476,10 @@ internal static partial class SimdGemm
                         for (int kIndex = 0; kIndex < kLen; kIndex++)
                         {
                             double aik = aRow[kIndex];
-                            if (aik == 0.0) continue;  // Sparse skip.
+                            if (aik == 0.0) continue;
                             Vector256<double> vAik = Vector256.Create(aik);
                             double* bRow = bP + (long)(kk + kIndex) * n + jStart;
                             int j = 0;
-                            // 4-wide FMA loop.
                             for (; j <= nLen - 4; j += 4)
                             {
                                 var vB = Avx.LoadVector256(bRow + j);
@@ -148,7 +487,6 @@ internal static partial class SimdGemm
                                 vC = Fma.MultiplyAdd(vB, vAik, vC);
                                 Avx.Store(cRow + j, vC);
                             }
-                            // Scalar tail for n % 4.
                             for (; j < nLen; j++)
                                 cRow[j] += aik * bRow[j];
                         }
@@ -159,8 +497,6 @@ internal static partial class SimdGemm
             if (doParallel)
             {
                 int total = numRowBlocks * numColBlocks;
-                // Mirror MatrixMultiplyHelper's heuristic: 2D grid only
-                // when M-axis alone would under-subscribe cores.
                 int procs = Environment.ProcessorCount;
                 if (numRowBlocks * 2 < procs && numColBlocks > 1)
                 {
@@ -183,7 +519,6 @@ internal static partial class SimdGemm
             }
         }
     }
-
 #endif
 
     /// <summary>Pre-AVX2 scalar fallback — row-wise FMA accumulation.</summary>
