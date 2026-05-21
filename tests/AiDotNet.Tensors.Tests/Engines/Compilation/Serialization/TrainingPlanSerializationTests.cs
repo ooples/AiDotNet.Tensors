@@ -90,20 +90,8 @@ public class TrainingPlanSerializationTests
     public async Task SaveLoad_TrainingPlanWithOptimizer_ProducesSameLoss()
     {
         var engine = new CpuEngine();
-        // Construct tensors directly via `new Tensor<float>(shape)` rather
-        // than the engine-routed Tensor<float>.CreateRandom factory:
-        // CreateRandom goes through AiDotNetEngine.Current, whose
-        // ResolvedRandomUniform-path may rent storage from a pool / mark
-        // a non-CPU device hint that trips the ConfigureOptimizer guard
-        // ("Parameter has a layout that does not expose a live CPU backing
-        // array"). The fused-Adam pin path requires the tensor's storage
-        // to be writable in place, which the manually-constructed
-        // Tensor<float>([shape]) constructor guarantees.
-        var rng = new Random(42);
-        var input = new Tensor<float>(new[] { 4, 3 });
-        for (int i = 0; i < input.Length; i++) input.AsWritableSpan()[i] = (float)rng.NextDouble();
-        var weight = new Tensor<float>(new[] { 3, 2 });
-        for (int i = 0; i < weight.Length; i++) weight.AsWritableSpan()[i] = (float)rng.NextDouble();
+        var input  = Tensor<float>.CreateRandom([4, 3]);
+        var weight = Tensor<float>.CreateRandom([3, 2]);
 
         ICompiledTrainingPlan<float> original;
         using (var scope = GraphMode.Enable())
