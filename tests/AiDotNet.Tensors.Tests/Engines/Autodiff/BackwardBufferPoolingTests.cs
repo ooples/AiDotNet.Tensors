@@ -21,19 +21,32 @@ namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 /// </summary>
 public class BackwardBufferPoolingTests : IDisposable
 {
-    private readonly IEngine _engine = AiDotNetEngine.Current;
+    private readonly IEngine _engine;
     private const float Tolerance = 1e-4f;
 
     public BackwardBufferPoolingTests()
     {
+        // Reset AiDotNetEngine.Current to a fresh CpuEngine so the tests
+        // see a clean singleton state — the long-lived process-wide
+        // singleton accumulates cached AutoTracer plans, ReplayMode bits,
+        // and pooled-buffer state from other tests that, on the
+        // FusedLinear + AutoTrainingCompiler path, drift gradient
+        // values away from the deterministic step-to-step contract
+        // these tests assert. Tracked as a follow-up: the singleton
+        // engine ought to be reset-safe by itself; until that landed,
+        // explicit fixture reset is the closest thing to a clean room.
+        AiDotNetEngine.Current = new CpuEngine();
+        _engine = AiDotNetEngine.Current;
         AutoTrainingCompiler.Enabled = true;
         AutoTrainingCompiler.ReplayMode = false;
+        AutoTrainingCompiler.ResetState();
     }
 
     public void Dispose()
     {
         AutoTrainingCompiler.Enabled = true;
         AutoTrainingCompiler.ReplayMode = false;
+        AutoTrainingCompiler.ResetState();
     }
 
     // ──────────────────────────────────────────────────────────────
