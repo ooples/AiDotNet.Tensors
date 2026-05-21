@@ -74,17 +74,18 @@ __kernel void batched_bit_reverse(
     }
 }
 
-// Cooley-Tukey FFT butterfly operation for a single stage
+// Cooley-Tukey FFT butterfly operation for a single stage.
+// `fullSize` is the butterfly span at this stage (2, 4, 8, ..., n) — the host
+// loops `for (size = 2; size <= n; size *= 2)` and passes that directly.
 __kernel void fft_butterfly(
     __global float* real,
     __global float* imag,
     const int n,
-    const int stage,
+    const int fullSize,
     const int inverse)
 {
     int tid = get_global_id(0);
-    int halfSize = 1 << stage;
-    int fullSize = halfSize << 1;
+    int halfSize = fullSize >> 1;
     int numGroups = n / fullSize;
 
     int groupIdx = tid / halfSize;
@@ -114,13 +115,13 @@ __kernel void fft_butterfly(
     imag[j] = uImag - tImag;
 }
 
-// Batched FFT butterfly for multiple signals
+// Batched FFT butterfly for multiple signals (`fullSize` semantics — see fft_butterfly)
 __kernel void batched_fft_butterfly(
     __global float* real,
     __global float* imag,
     const int batch,
     const int n,
-    const int stage,
+    const int fullSize,
     const int inverse)
 {
     int tid = get_global_id(0);
@@ -131,8 +132,7 @@ __kernel void batched_fft_butterfly(
     int batchIdx = tid / (n / 2);
     int localTid = tid % (n / 2);
 
-    int halfSize = 1 << stage;
-    int fullSize = halfSize << 1;
+    int halfSize = fullSize >> 1;
     int numGroups = n / fullSize;
 
     int groupIdx = localTid / halfSize;
@@ -440,7 +440,7 @@ __kernel void fft_rows_butterfly(
     __global float* imag,
     const int height,
     const int width,
-    const int stage,
+    const int fullSize,
     const int inverse)
 {
     int tid = get_global_id(0);
@@ -449,8 +449,7 @@ __kernel void fft_rows_butterfly(
 
     if (row >= height) return;
 
-    int halfSize = 1 << stage;
-    int fullSize = halfSize << 1;
+    int halfSize = fullSize >> 1;
     int numGroups = width / fullSize;
 
     int groupIdx = localTid / halfSize;
@@ -484,7 +483,7 @@ __kernel void fft_cols_butterfly(
     __global float* imag,
     const int height,
     const int width,
-    const int stage,
+    const int fullSize,
     const int inverse)
 {
     int tid = get_global_id(0);
@@ -493,8 +492,7 @@ __kernel void fft_cols_butterfly(
 
     if (col >= width) return;
 
-    int halfSize = 1 << stage;
-    int fullSize = halfSize << 1;
+    int halfSize = fullSize >> 1;
     int numGroups = height / fullSize;
 
     int groupIdx = localTid / halfSize;
