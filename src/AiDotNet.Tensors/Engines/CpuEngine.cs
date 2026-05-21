@@ -12525,6 +12525,66 @@ public partial class CpuEngine : ITensorLevelEngine
         // cannot fit in the per-test 120 s budget.
         if (typeof(T) == typeof(double))
         {
+            // #415 Phase E: 1×1 stride=1 padding=0 backward-input direct
+            // path. Same identity the into-variant Conv2DBackwardInputInto
+            // already uses (line ~12888): when k=1/s=1/p=0, im2col is a
+            // no-op (col = input slice reshape) and col2im is also a no-op,
+            // so the whole thing collapses to a per-batch dgemm:
+            //   gradInput_b = kernel^T @ gradOutput_b
+            // ResNet50 has 16+ 1×1 conv layers per forward (bottleneck
+            // blocks); each pays a full im2col rent + col2im scatter on the
+            // pre-existing path even though both are identity. Skip them.
+            if (kernelHeight == 1 && kernelWidth == 1 && strideH == 1 && strideW == 1
+                && padH == 0 && padW == 0 && dilationH == 1 && dilationW == 1)
+            {
+                int N1x1 = outputHeight * outputWidth; // == height*width
+                int inputSliceSize1x1 = inChannels * N1x1;
+                int gradSliceSize1x1 = outChannels * N1x1;
+                var gradOutputD1x1 = (double[])(object)gradOutput.GetFlattenedData();
+                var kernelD1x1 = (double[])(object)kernel.GetFlattenedData();
+                var gradInputD1x1 = new double[batch * inputSliceSize1x1];
+
+                CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * inChannels * outChannels * N1x1, b =>
+                {
+                    int gradOutOff = b * gradSliceSize1x1;
+                    int destSliceOff = b * inputSliceSize1x1;
+                    bool usedBlas = Helpers.BlasProvider.TryGemmExBeta(
+                        inChannels, N1x1, outChannels,
+                        kernelD1x1, 0, inChannels, true,    // A = kernel [outC × inC]^T
+                        gradOutputD1x1, gradOutOff, N1x1, false,
+                        gradInputD1x1, destSliceOff, N1x1,
+                        alpha: 1.0,
+                        beta: 0.0);
+                    if (!usedBlas)
+                    {
+                        // Cold path — build transposed kernel once per batch (rare).
+                        var poolKt = System.Buffers.ArrayPool<double>.Shared;
+                        var kT = poolKt.Rent(inChannels * outChannels);
+                        try
+                        {
+                            for (int r = 0; r < outChannels; r++)
+                                for (int c = 0; c < inChannels; c++)
+                                    kT[c * outChannels + r] = kernelD1x1[r * inChannels + c];
+                            var dstSpan = new Span<double>(gradInputD1x1, destSliceOff, inputSliceSize1x1);
+                            dstSpan.Clear();
+                            for (int ic = 0; ic < inChannels; ic++)
+                            {
+                                int kRowBase = ic * outChannels;
+                                int dRowBase = ic * N1x1;
+                                for (int n = 0; n < N1x1; n++)
+                                {
+                                    double sum = 0.0;
+                                    for (int oc = 0; oc < outChannels; oc++)
+                                        sum += kT[kRowBase + oc] * gradOutputD1x1[gradOutOff + oc * N1x1 + n];
+                                    dstSpan[dRowBase + n] += sum;
+                                }
+                            }
+                        }
+                        finally { poolKt.Return(kT); }
+                    }
+                });
+                return TensorAllocator.Rent<T>(inputShape, (Vector<T>)(object)new Vector<double>(gradInputD1x1));
+            }
 #if !NET471
             // #415 Phase B: direct-kernel fast path for 3×3 stride=1 padding=1
             // (the dominant VGG / ResNet 3×3 backward-input shape). Uses the
@@ -13119,6 +13179,51 @@ public partial class CpuEngine : ITensorLevelEngine
             var gradOutputD = (double[])(object)gradOutput.GetFlattenedData();
             var inputD = (double[])(object)input.GetFlattenedData();
             int inputSliceSize = inChannels * height * width;
+
+            // #415 Phase E: 1×1 stride=1 padding=0 backward-kernel direct
+            // path. Mirror of the Conv2DBackwardInput 1×1 path above and
+            // the into-variant Conv2DBackwardKernelInto at line ~13423.
+            // For k=1/s=1/p=0, im2col is identity over the input slice, so
+            // the GEMM becomes
+            //   gradKernel[oc, ic] += gradOut_b[oc, N] @ input_b^T[ic, N]
+            // accumulated across batches via sequential β=1 dgemm calls into
+            // the same destination (saves the per-batch staging buffer +
+            // final merge pass the general path uses).
+            if (kernelHeight == 1 && kernelWidth == 1 && strideH == 1 && strideW == 1
+                && padH == 0 && padW == 0 && dilationH == 1 && dilationW == 1)
+            {
+                int N1x1 = outputHeight * outputWidth;
+                int totalLen1x1 = outChannels * inChannels;
+                for (int b = 0; b < batch; b++)
+                {
+                    double betaThis = (b == 0) ? 0.0 : 1.0;
+                    int gradOutOff = b * outChannels * N1x1;
+                    int inOff = b * inChannels * N1x1;
+                    bool usedBlas = Helpers.BlasProvider.TryGemmExBeta(
+                        outChannels, inChannels, N1x1,
+                        gradOutputD, gradOutOff, N1x1, false,
+                        inputD, inOff, N1x1, true,
+                        gradKernelD, 0, inChannels,
+                        alpha: 1.0, beta: betaThis);
+                    if (!usedBlas)
+                    {
+                        if (b == 0) Array.Clear(gradKernelD, 0, totalLen1x1);
+                        for (int oc = 0; oc < outChannels; oc++)
+                        {
+                            int goRowBase = gradOutOff + oc * N1x1;
+                            for (int ic = 0; ic < inChannels; ic++)
+                            {
+                                double sum = 0.0;
+                                int inRowBase = inOff + ic * N1x1;
+                                for (int n = 0; n < N1x1; n++)
+                                    sum += gradOutputD[goRowBase + n] * inputD[inRowBase + n];
+                                gradKernelD[oc * inChannels + ic] += sum;
+                            }
+                        }
+                    }
+                }
+                return TensorAllocator.Rent<T>(kernelShape, (Vector<T>)(object)new Vector<double>(gradKernelD));
+            }
 
 #if !NET471
             // #415 Phase B-2: direct backward-kernel fast path for 3×3 /

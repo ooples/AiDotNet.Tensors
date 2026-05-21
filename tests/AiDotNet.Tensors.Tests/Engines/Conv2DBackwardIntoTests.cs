@@ -281,4 +281,84 @@ public class Conv2DBackwardIntoTests
             Assert.True(System.Math.Abs(actual[i] - expected[i]) < 1e-11,
                 $"[{i}] actual={actual[i]:F12} expected={expected[i]:F12} diff={actual[i] - expected[i]:E2}");
     }
+
+    /// <summary>
+    /// #415 Phase E: 1×1 / stride=1 / padding=0 backward-input direct path
+    /// (skips im2col entirely — both im2col and col2im are identity at this
+    /// shape) must match the scalar reference. ResNet bottleneck blocks fire
+    /// this path many times per forward.
+    /// </summary>
+    [Fact]
+    public void Conv2DBackwardInput_DOUBLE_1x1_S1_P0_MatchesScalarReference()
+    {
+        var engine = new CpuEngine();
+        int batch = 2, inC = 6, H = 14, W = 14, outC = 11, kH = 1, kW = 1;
+        int padH = 0, padW = 0;
+        int oH = H + 2 * padH - kH + 1;
+        int oW = W + 2 * padW - kW + 1;
+        var rng = new System.Random(789);
+
+        var gradOut = new Tensor<double>(new[] { batch, outC, oH, oW });
+        for (int i = 0; i < gradOut.Length; i++) gradOut[i] = rng.NextDouble() - 0.5;
+        var kernel = new Tensor<double>(new[] { outC, inC, kH, kW });
+        for (int i = 0; i < kernel.Length; i++) kernel[i] = rng.NextDouble() - 0.5;
+
+        var actual = engine.Conv2DBackwardInput(gradOut, kernel,
+            new[] { batch, inC, H, W }, new[] { 1, 1 }, new[] { padH, padW }, new[] { 1, 1 });
+
+        var expected = new double[batch * inC * H * W];
+        for (int b = 0; b < batch; b++)
+            for (int ic = 0; ic < inC; ic++)
+                for (int ih = 0; ih < H; ih++)
+                    for (int iw = 0; iw < W; iw++)
+                    {
+                        double sum = 0.0;
+                        for (int oc = 0; oc < outC; oc++)
+                            sum += kernel[oc, ic, 0, 0] * gradOut[b, oc, ih, iw];
+                        expected[((b * inC + ic) * H + ih) * W + iw] = sum;
+                    }
+
+        for (int i = 0; i < actual.Length; i++)
+            Assert.True(System.Math.Abs(actual[i] - expected[i]) < 1e-11,
+                $"[{i}] actual={actual[i]:F12} expected={expected[i]:F12}");
+    }
+
+    /// <summary>
+    /// #415 Phase E: 1×1 / stride=1 / padding=0 backward-kernel direct path
+    /// must match the scalar reference.
+    /// </summary>
+    [Fact]
+    public void Conv2DBackwardKernel_DOUBLE_1x1_S1_P0_MatchesScalarReference()
+    {
+        var engine = new CpuEngine();
+        int batch = 2, inC = 6, H = 14, W = 14, outC = 11, kH = 1, kW = 1;
+        int padH = 0, padW = 0;
+        int oH = H + 2 * padH - kH + 1;
+        int oW = W + 2 * padW - kW + 1;
+        var rng = new System.Random(321);
+
+        var gradOut = new Tensor<double>(new[] { batch, outC, oH, oW });
+        for (int i = 0; i < gradOut.Length; i++) gradOut[i] = rng.NextDouble() - 0.5;
+        var input = new Tensor<double>(new[] { batch, inC, H, W });
+        for (int i = 0; i < input.Length; i++) input[i] = rng.NextDouble() - 0.5;
+
+        var actual = engine.Conv2DBackwardKernel(gradOut, input,
+            new[] { outC, inC, kH, kW }, new[] { 1, 1 }, new[] { padH, padW }, new[] { 1, 1 });
+
+        var expected = new double[outC * inC];
+        for (int oc = 0; oc < outC; oc++)
+            for (int ic = 0; ic < inC; ic++)
+            {
+                double sum = 0.0;
+                for (int b = 0; b < batch; b++)
+                    for (int oh = 0; oh < oH; oh++)
+                        for (int ow = 0; ow < oW; ow++)
+                            sum += gradOut[b, oc, oh, ow] * input[b, ic, oh, ow];
+                expected[oc * inC + ic] = sum;
+            }
+
+        for (int i = 0; i < actual.Length; i++)
+            Assert.True(System.Math.Abs(actual[i] - expected[i]) < 1e-10,
+                $"[{i}] actual={actual[i]:F12} expected={expected[i]:F12}");
+    }
 }
