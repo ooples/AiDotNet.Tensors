@@ -8468,8 +8468,17 @@ public partial class CpuEngine : ITensorLevelEngine
             bool directKernelFitsWell = convFmas <= 4_000_000L
                 || (outChannels >= directKernelMinTasks
                     && outputSpatial >= MinDirectSpatial);
-            if (kernelHeight == 3 && kernelWidth == 3
-                && stride == 1 && padding > 0 && dilation == 1
+            // Stage 5 (#415): expand the direct-kernel gate from 3×3 s=1 to
+            // include 1×1 s=1, 3×3 s=2, 7×7 s=2 (ResNet50 stem + bottlenecks).
+            // CanUseSimdConvDouble + Conv2DDirectDouble do the per-shape
+            // routing so this dispatch stays one branch.
+            bool isSupportedDirectShape =
+                dilation == 1
+                && ((kernelHeight == 3 && kernelWidth == 3 && stride == 1 && padding > 0)
+                 || (kernelHeight == 1 && kernelWidth == 1 && stride == 1 && padding == 0)
+                 || (kernelHeight == 3 && kernelWidth == 3 && stride == 2)
+                 || (kernelHeight == 7 && kernelWidth == 7 && stride == 2));
+            if (isSupportedDirectShape
                 && directKernelFitsWell
                 && Helpers.SimdConvHelper.CanUseSimdConvDouble(kernelHeight, kernelWidth, stride, stride))
             {
@@ -8481,10 +8490,11 @@ public partial class CpuEngine : ITensorLevelEngine
                 using var pinO  = dResult.Data.Pin();
                 unsafe
                 {
-                    Helpers.SimdConvHelper.Conv3x3Stride1Double(
+                    Helpers.SimdConvHelper.Conv2DDirectDouble(
                         (double*)pinIn.Pointer, (double*)pinK.Pointer, (double*)pinO.Pointer,
                         batch, inChannels, height, width,
-                        outChannels, padding, padding, dilation, dilation);
+                        outChannels, kernelHeight, kernelWidth, stride, stride,
+                        padding, padding, dilation, dilation);
                 }
                 DifferentiableOps.RecordBinary("Conv2D", result, inputOrig, kernel,
                     BackwardFunctions<T>.Conv2DBackward, new object[] { new[] { stride, stride }, new[] { padding, padding }, new[] { dilation, dilation } });
@@ -8646,29 +8656,34 @@ public partial class CpuEngine : ITensorLevelEngine
             bool directKernelFitsWellInto = convFmasInto <= 4_000_000L
                 || (outChannels >= directKernelMinTasksInto
                     && outputSpatialInto >= MinDirectSpatialInto);
-            if (kernelHeight == 3 && kernelWidth == 3
-                && stride == 1 && padding > 0 && dilation == 1
+            // Stage 5 (#415): same shape expansion as the non-Into Conv2D
+            // dispatch above.
+            bool isSupportedDirectShapeInto =
+                dilation == 1
+                && ((kernelHeight == 3 && kernelWidth == 3 && stride == 1 && padding > 0)
+                 || (kernelHeight == 1 && kernelWidth == 1 && stride == 1 && padding == 0)
+                 || (kernelHeight == 3 && kernelWidth == 3 && stride == 2)
+                 || (kernelHeight == 7 && kernelWidth == 7 && stride == 2));
+            if (isSupportedDirectShapeInto
                 && directKernelFitsWellInto
                 && Helpers.SimdConvHelper.CanUseSimdConvDouble(kernelHeight, kernelWidth, stride, stride))
             {
                 var dInput  = (Tensor<double>)(object)input;
                 var dKernel = (Tensor<double>)(object)kernel;
                 var dOutput = (Tensor<double>)(object)output;
-                // No outer Span.Clear() — Conv3x3Stride1SingleChannelDouble
-                // does `new Span<double>(outputChannel, outputSize).Clear()`
-                // on each per-oc slab before accumulating, so an extra
-                // full-tensor Clear here is a wasted memory pass (~10 MB
-                // at SD shapes per call). The direct kernel owns its
-                // initialization of every byte it writes.
+                // No outer Span.Clear() — the per-oc direct kernels (and the
+                // GEMM-based Conv1x1Stride1Double via Dgemm's c.Clear()) own
+                // initialization of every byte they write.
                 using var pinIn = dInput.Data.Pin();
                 using var pinK  = dKernel.Data.Pin();
                 using var pinO  = dOutput.Data.Pin();
                 unsafe
                 {
-                    Helpers.SimdConvHelper.Conv3x3Stride1Double(
+                    Helpers.SimdConvHelper.Conv2DDirectDouble(
                         (double*)pinIn.Pointer, (double*)pinK.Pointer, (double*)pinO.Pointer,
                         batch, inChannels, height, width,
-                        outChannels, padding, padding, dilation, dilation);
+                        outChannels, kernelHeight, kernelWidth, stride, stride,
+                        padding, padding, dilation, dilation);
                 }
                 return;
             }
