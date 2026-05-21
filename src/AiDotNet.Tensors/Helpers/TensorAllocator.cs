@@ -41,14 +41,29 @@ public static class TensorAllocator
     public static Tensor<T> RentPinned<T>(int[] shape)
     {
         if (shape is null) throw new ArgumentNullException(nameof(shape));
-        int totalSize = 1;
+        // Use long arithmetic for the dim product so an intermediate
+        // multiplication can't overflow Int32 (~2.1 B). The arrays we
+        // actually allocate still cap at Array.MaxLength (slightly under
+        // Int32.MaxValue for primitive types) — fail with a clear
+        // diagnostic when the long product exceeds that, rather than
+        // letting `checked(int * int)` throw the generic
+        // OverflowException from inside the multiplication.
+        long longTotal = 1;
         for (int i = 0; i < shape.Length; i++)
         {
             if (shape[i] < 0)
                 throw new ArgumentOutOfRangeException(nameof(shape),
                     $"shape[{i}] = {shape[i]}; shape dimensions must be non-negative.");
-            totalSize = checked(totalSize * shape[i]);
+            longTotal *= shape[i];
+            if (longTotal > int.MaxValue)
+                throw new InvalidOperationException(
+                    $"Requested tensor has {longTotal} elements (shape = " +
+                    $"[{string.Join(",", shape)}]); single-array allocation caps " +
+                    $"at Array.MaxLength (~{int.MaxValue}). Use the streaming " +
+                    $"pool (WeightRegistry.AllocateStreaming) or shard the " +
+                    $"tensor across multiple sub-tensors.");
         }
+        int totalSize = (int)longTotal;
         if (totalSize == 0) return new Tensor<T>(shape);
 
         // MemoryProfiler hook — pinned tier is always a fresh allocation
@@ -214,9 +229,36 @@ public static class TensorAllocator
     /// </summary>
     public static Tensor<T> Rent<T>(int[] shape)
     {
-        int totalSize = 1;
+        if (shape is null) throw new ArgumentNullException(nameof(shape));
+        // Use long arithmetic for the dim product so an intermediate
+        // multiplication can't overflow Int32 (~2.1 B). The arrays we
+        // actually allocate still cap at Array.MaxLength (slightly under
+        // Int32.MaxValue for primitive types) — fail with a clear
+        // diagnostic when the long product exceeds that, rather than
+        // letting `checked(int * int)` throw the generic
+        // OverflowException from inside the multiplication, which was
+        // the visible failure on TimeMachine / DQN / OWLViT / DGCNN /
+        // TabTransformer / TabDPT / SlimSAM / TriaffineNER tests on
+        // PR #1408 SonarCloud run 26241806890.
+        long longTotal = 1;
         for (int i = 0; i < shape.Length; i++)
-            totalSize = checked(totalSize * shape[i]);
+        {
+            if (shape[i] < 0)
+                throw new ArgumentOutOfRangeException(nameof(shape),
+                    $"shape[{i}] = {shape[i]}; shape dimensions must be non-negative. " +
+                    $"Lazy layers should resolve their input dim from the architecture " +
+                    $"BEFORE calling Rent; the -1 sentinel suggests EnsureInitialized " +
+                    $"ran before ResolveLazyLayerShapes propagated the parent's shape.");
+            longTotal *= shape[i];
+            if (longTotal > int.MaxValue)
+                throw new InvalidOperationException(
+                    $"Requested tensor has {longTotal} elements (shape = " +
+                    $"[{string.Join(",", shape)}]); single-array allocation caps " +
+                    $"at Array.MaxLength (~{int.MaxValue}). Use the streaming " +
+                    $"pool (WeightRegistry.AllocateStreaming) or shard the " +
+                    $"tensor across multiple sub-tensors.");
+        }
+        int totalSize = (int)longTotal;
 
         // MemoryProfiler hook (#220): only record branches that actually allocate
         // new memory — arena/pool/cache reuse paths do not, and recording them
