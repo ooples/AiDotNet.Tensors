@@ -429,6 +429,149 @@ internal static partial class SimdGemm
         finally { pool.Return(packedB); }
     }
 
+    // ─── Stage 2: DgemmDirect no-packing small-matmul path ────────────────
+    //
+    // Mirrors FP32 SgemmDirect at SimdGemm.cs:1380-1712. For small shapes
+    // (work ≤ 4M FMAs, k ≤ 512, n % Nr == 0) packing overhead exceeds the
+    // perf win of cache-friendly access. The direct path walks Mr × Nr
+    // tiles reading A and B directly from row-major memory — no PackA /
+    // PackB calls.
+    //
+    // NOTE: per FP32 iter 35 / 41 reverts, we DO NOT JIT-emit the direct
+    // kernel. RyuJIT inlines the C# kernel at the call site; a JIT'd
+    // function-pointer dispatch added 34% regression at small k on FP32
+    // and would do the same on FP64. The fat-kernel JIT (iter 42) is
+    // separately deferred per Stage 6 of the plan.
+
+    /// <summary>
+    /// Direct (no-packing) Mr×Nr microkernel — reads A row-major directly
+    /// from the source tensor, no packed-A layout. Same accumulator
+    /// topology as <see cref="DgemmMicroKernel4x8"/> but with hoisted
+    /// per-row A base pointers and the FP32-style broadcast-per-K-iter
+    /// pattern. Caller cleared C, so the accumulators store on top of
+    /// zero — load-add-store at the bottom is correct.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe void DgemmDirectKernel4x8(
+        double* pA, int lda,
+        double* pB, int ldb,
+        double* pC, int ldc,
+        int k)
+    {
+        var c00 = Vector256<double>.Zero; var c01 = Vector256<double>.Zero;
+        var c10 = Vector256<double>.Zero; var c11 = Vector256<double>.Zero;
+        var c20 = Vector256<double>.Zero; var c21 = Vector256<double>.Zero;
+        var c30 = Vector256<double>.Zero; var c31 = Vector256<double>.Zero;
+
+        // Hoist per-row A base pointers out of the K loop (avoids IMUL per iter).
+        double* pA0 = pA;
+        double* pA1 = pA + lda;
+        double* pA2 = pA + lda * 2;
+        double* pA3 = pA + lda * 3;
+
+        for (int p = 0; p < k; p++)
+        {
+            var b0 = Avx.LoadVector256(pB);       // cols 0-3
+            var b1 = Avx.LoadVector256(pB + 4);   // cols 4-7
+
+            var a0 = Vector256.Create(pA0[p]);
+            c00 = Fma.MultiplyAdd(a0, b0, c00); c01 = Fma.MultiplyAdd(a0, b1, c01);
+
+            var a1 = Vector256.Create(pA1[p]);
+            c10 = Fma.MultiplyAdd(a1, b0, c10); c11 = Fma.MultiplyAdd(a1, b1, c11);
+
+            var a2 = Vector256.Create(pA2[p]);
+            c20 = Fma.MultiplyAdd(a2, b0, c20); c21 = Fma.MultiplyAdd(a2, b1, c21);
+
+            var a3 = Vector256.Create(pA3[p]);
+            c30 = Fma.MultiplyAdd(a3, b0, c30); c31 = Fma.MultiplyAdd(a3, b1, c31);
+
+            pB += ldb;
+        }
+
+        Avx.Store(pC + 0, Avx.Add(c00, Avx.LoadVector256(pC + 0)));
+        Avx.Store(pC + 4, Avx.Add(c01, Avx.LoadVector256(pC + 4)));
+        pC += ldc;
+        Avx.Store(pC + 0, Avx.Add(c10, Avx.LoadVector256(pC + 0)));
+        Avx.Store(pC + 4, Avx.Add(c11, Avx.LoadVector256(pC + 4)));
+        pC += ldc;
+        Avx.Store(pC + 0, Avx.Add(c20, Avx.LoadVector256(pC + 0)));
+        Avx.Store(pC + 4, Avx.Add(c21, Avx.LoadVector256(pC + 4)));
+        pC += ldc;
+        Avx.Store(pC + 0, Avx.Add(c30, Avx.LoadVector256(pC + 0)));
+        Avx.Store(pC + 4, Avx.Add(c31, Avx.LoadVector256(pC + 4)));
+    }
+
+    /// <summary>
+    /// Stage 2 direct path: tile-walks M and N at Mr × Nr without packing.
+    /// Edge rows / cols (m % Mr != 0, n % Nr != 0) fall through to scalar
+    /// fallback. Caller ensures C is zeroed and that the gate predicate
+    /// <see cref="DgemmShouldUseDirect"/> returned true.
+    /// </summary>
+    private static unsafe void DgemmDirect(
+        ReadOnlySpan<double> a, ReadOnlySpan<double> b, Span<double> c,
+        int m, int k, int n)
+    {
+        int mFull = (m / DMr) * DMr;
+        int nFull = (n / DNr) * DNr;
+
+        fixed (double* pARoot = a)
+        fixed (double* pBRoot = b)
+        fixed (double* pCRoot = c)
+        {
+            // Full Mr × Nr tiles.
+            for (int i = 0; i < mFull; i += DMr)
+            {
+                double* pARow = pARoot + (long)i * k;
+                double* pCRow = pCRoot + (long)i * n;
+                for (int j = 0; j < nFull; j += DNr)
+                {
+                    DgemmDirectKernel4x8(pARow, k, pBRoot + j, n, pCRow + j, n, k);
+                }
+                // Right-edge cols [nFull, n): scalar fallback.
+                for (int j = nFull; j < n; j++)
+                {
+                    for (int ii = 0; ii < DMr; ii++)
+                    {
+                        double sum = 0.0;
+                        for (int p = 0; p < k; p++)
+                            sum += pARow[(long)ii * k + p] * pBRoot[(long)p * n + j];
+                        pCRow[(long)ii * n + j] += sum;
+                    }
+                }
+            }
+            // Bottom-edge rows [mFull, m): scalar over all cols.
+            for (int i = mFull; i < m; i++)
+            {
+                for (int j = 0; j < n; j++)
+                {
+                    double sum = 0.0;
+                    for (int p = 0; p < k; p++)
+                        sum += pARoot[(long)i * k + p] * pBRoot[(long)p * n + j];
+                    pCRoot[(long)i * n + j] += sum;
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Gate for the Stage 2 DgemmDirect path. Matches FP32 SgemmDirect gate
+    /// scaled for FP64: work ≤ 4M FMAs AND k ≤ 512 AND n%4 == 0 (the
+    /// microkernel does 4-wide AVX2 loads on B). M edges are accepted (the
+    /// direct path handles them via scalar fallback).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool DgemmShouldUseDirect(int m, int k, int n)
+    {
+        long work = (long)m * k * n;
+        if (work > 4_000_000L) return false;
+        if (k > 512) return false;
+        if (n % 4 != 0) return false;
+        // Need at least one full Mr × Nr tile to fire the SIMD kernel.
+        if (m < DMr || n < DNr) return false;
+        return true;
+    }
+
     /// <summary>
     /// Gate: parallel-M when there's at least 2 row blocks per worker and
     /// total work justifies parallel dispatch overhead. Mirror of the FP32
@@ -468,6 +611,14 @@ internal static partial class SimdGemm
 #if NET5_0_OR_GREATER
         if (Avx2.IsSupported && Fma.IsSupported)
         {
+            // Stage 2: direct (no-packing) path for small shapes — saves
+            // PackA + PackB setup cost when work is small and access
+            // patterns are already cache-friendly.
+            if (DgemmShouldUseDirect(m, k, n))
+            {
+                DgemmDirect(a, b, c, m, k, n);
+                return;
+            }
             // Stage 1 packed-tiled path: amortizes packing overhead on
             // shapes large enough to benefit (per DgemmShouldUsePackedTiled
             // gate). Small shapes fall through to the existing inline 64-
@@ -507,6 +658,11 @@ internal static partial class SimdGemm
 #if NET5_0_OR_GREATER
         if (Avx2.IsSupported && Fma.IsSupported)
         {
+            if (DgemmShouldUseDirect(m, k, n))
+            {
+                DgemmDirect(a, b, c, m, k, n);
+                return;
+            }
             if (DgemmShouldUsePackedTiled(m, k, n))
             {
                 DgemmTiledSequential(a, b, c, m, k, n);
