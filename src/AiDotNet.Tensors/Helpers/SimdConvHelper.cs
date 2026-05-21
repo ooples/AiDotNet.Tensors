@@ -369,10 +369,14 @@ internal static class SimdConvHelper
 
     /// <summary>
     /// Computes gradKernel[oc, :, :, :] (all inChannels × 9 entries for one
-    /// output channel) by summing over (b, oh, ow). Vectorized inner loop
-    /// along the contiguous ow dim with AVX2/FMA Vector256&lt;double&gt;
-    /// (4 doubles per chunk). 9 separate accumulators per (oc, ic) cover
-    /// the 3×3 kernel positions.
+    /// output channel) by summing over (b, oh, ow). Split-oh, split-ow
+    /// SIMD: the (oh, ow) iteration space is partitioned into 3 oh-bands
+    /// (top boundary / interior / bottom boundary) × 3 ow-bands
+    /// (left / interior / right) — 9 cells total. The dominant
+    /// (interior-oh × interior-ow) cell runs branch-free with manual
+    /// AVX2/FMA Vector256&lt;double&gt; (4-wide ow) and 9 vector
+    /// accumulators per (oc, ic). Boundary cells (3% of work at typical
+    /// 224×224 spatials) are scalar.
     /// </summary>
     [MethodImpl(HotInline)]
     private static unsafe void Conv3x3BackwardKernelOneOcDouble(
@@ -384,10 +388,28 @@ internal static class SimdConvHelper
         // gradKernel layout: [oc, ic, kh, kw] → flat index = ((oc*inC + ic)*3 + kh)*3 + kw
         double* gkOcBase = gradKernel + oc * inChannels * 9;
 
+        // Interior column range (ow where all 3 kw positions are in
+        // bounds): [1, outWidth - 1). SIMD chunk size = 4 doubles.
+        int interiorWStart = 1;
+        int interiorWEnd = outWidth - 1;
+        int interiorWSpan = (interiorWEnd > interiorWStart) ? interiorWEnd - interiorWStart : 0;
+        int simdSteps = interiorWSpan / 4;
+        int simdEnd = interiorWStart + simdSteps * 4;
+        bool useSimd = UseAvx2 && UseFma && simdSteps > 0;
+
+        // Interior row range (oh where all 3 kh positions are in bounds):
+        // [1, outHeight - 1).
+        int interiorOhStart = 1;
+        int interiorOhEnd = outHeight - 1;
+
         for (int ic = 0; ic < inChannels; ic++)
         {
-            // 9 scalar accumulators — one per (kh, kw). Each holds the
-            // partial sum across (b, oh, ow) for that kernel position.
+            // 9 SIMD accumulators (interior contributions) + 9 scalar
+            // accumulators (boundary contributions). Final result merges
+            // the horizontal sums with the scalars.
+            Vector256<double> v00 = Vector256<double>.Zero, v01 = Vector256<double>.Zero, v02 = Vector256<double>.Zero;
+            Vector256<double> v10 = Vector256<double>.Zero, v11 = Vector256<double>.Zero, v12 = Vector256<double>.Zero;
+            Vector256<double> v20 = Vector256<double>.Zero, v21 = Vector256<double>.Zero, v22 = Vector256<double>.Zero;
             double a00 = 0, a01 = 0, a02 = 0;
             double a10 = 0, a11 = 0, a12 = 0;
             double a20 = 0, a21 = 0, a22 = 0;
@@ -397,79 +419,150 @@ internal static class SimdConvHelper
                 double* goBase = gradOutput + b * gradOutBatchStride + oc * outputSize;
                 double* inBase = input + b * inputBatchStride + ic * height * width;
 
-                // Process each row oh; for each (kh, kw) the input row
-                // is at ih = oh + kh - 1. We compute partial sums by
-                // walking the contiguous ow dim and looking up the
-                // shifted input column. Boundary handling: when ih or
-                // iw falls outside [0, H) or [0, W), the contribution
-                // is zero — we skip out-of-bounds ow ranges per (kh, kw).
-                for (int oh = 0; oh < outHeight; oh++)
+                // ============================================================
+                // Top boundary row (oh = 0): kh=0 (ih=-1) invalid; only the
+                // mid + bot rows contribute. Always scalar (single row,
+                // boundary handling is cheap relative to interior).
+                // ============================================================
+                if (outHeight > 0)
                 {
-                    double* goRow = goBase + oh * outWidth;
-
-                    // kh contributes when ih = oh + kh - 1 ∈ [0, height).
-                    // kh=0 → ih=oh-1: need oh ≥ 1. kh=1 → ih=oh always valid.
-                    // kh=2 → ih=oh+1: need oh ≤ height-2.
-                    int ihTop = oh - 1;     // kh=0
-                    int ihMid = oh;          // kh=1
-                    int ihBot = oh + 1;      // kh=2
-                    bool topValid = ihTop >= 0;
-                    bool midValid = true;
-                    bool botValid = ihBot < height;
-
-                    double* inTop = topValid ? inBase + ihTop * width : null;
-                    double* inMid = inBase + ihMid * width;
-                    double* inBot = botValid ? inBase + ihBot * width : null;
-
-                    // For each (kw): iw = ow + kw - 1.
-                    //   kw=0 → iw=ow-1: valid for ow ∈ [1, width).
-                    //   kw=1 → iw=ow:   valid for ow ∈ [0, width).
-                    //   kw=2 → iw=ow+1: valid for ow ∈ [0, width-1).
-                    // For each (kh, kw) we walk ow with the per-row
-                    // pointers above, masking iw out-of-range. We unroll
-                    // by (kh, kw) so the inner loop is just 9 axpys plus
-                    // 9 boundary checks against ow (cheap branches that
-                    // get hoisted by the JIT).
+                    double* goRow = goBase;
+                    double* inMid = inBase;                  // ih = 0
+                    bool botValid0 = outHeight > 1;
+                    double* inBot = botValid0 ? inBase + width : null;
                     for (int ow = 0; ow < outWidth; ow++)
                     {
                         double g = goRow[ow];
-                        // Skip the multiply chain if gradient is exactly
-                        // zero — common after ReLU backward. The compiler
-                        // can elide this branch when it can't prove g!=0;
-                        // accept the conservative path.
-                        int iwLeft = ow - 1;     // kw=0
-                        int iwMid = ow;           // kw=1
-                        int iwRight = ow + 1;     // kw=2
-                        bool leftValid = iwLeft >= 0;
-                        bool rightValid = iwRight < width;
+                        bool leftValid = ow >= 1;
+                        bool rightValid = ow < outWidth - 1;
+                        if (leftValid)  a10 += g * inMid[ow - 1];
+                                        a11 += g * inMid[ow];
+                        if (rightValid) a12 += g * inMid[ow + 1];
+                        if (botValid0)
+                        {
+                            if (leftValid)  a20 += g * inBot[ow - 1];
+                                            a21 += g * inBot[ow];
+                            if (rightValid) a22 += g * inBot[ow + 1];
+                        }
+                    }
+                }
 
-                        if (topValid)
+                // ============================================================
+                // Interior rows (oh ∈ [1, outHeight - 1)): all 3 kh
+                // positions are in bounds. Each row is split into
+                // (left boundary col, SIMD interior, scalar interior tail,
+                // right boundary col). The SIMD inner is BRANCH-FREE — 9
+                // unconditional Vector256<double> FMAs per 4-wide ow chunk.
+                // ============================================================
+                for (int oh = interiorOhStart; oh < interiorOhEnd; oh++)
+                {
+                    double* goRow = goBase + oh * outWidth;
+                    double* inTop = inBase + (oh - 1) * width;
+                    double* inMid = inBase + oh * width;
+                    double* inBot = inBase + (oh + 1) * width;
+
+                    // Left boundary col (ow=0): kw=0 (iw=-1) invalid.
+                    if (outWidth > 0)
+                    {
+                        double g = goRow[0];
+                        a01 += g * inTop[0]; if (outWidth > 1) a02 += g * inTop[1];
+                        a11 += g * inMid[0]; if (outWidth > 1) a12 += g * inMid[1];
+                        a21 += g * inBot[0]; if (outWidth > 1) a22 += g * inBot[1];
+                    }
+
+                    // Interior SIMD: ow ∈ [interiorWStart, simdEnd) step 4,
+                    // all 9 positions in bounds. Branch-free hot path.
+                    int ow2 = interiorWStart;
+                    if (useSimd)
+                    {
+                        for (; ow2 < simdEnd; ow2 += 4)
                         {
-                            if (leftValid)  a00 += g * inTop[iwLeft];
-                                            a01 += g * inTop[iwMid];
-                            if (rightValid) a02 += g * inTop[iwRight];
+                            int iwLeft = ow2 - 1;
+                            Vector256<double> g = Avx.LoadVector256(goRow + ow2);
+
+                            v00 = Fma.MultiplyAdd(g, Avx.LoadVector256(inTop + iwLeft),     v00);
+                            v01 = Fma.MultiplyAdd(g, Avx.LoadVector256(inTop + ow2),        v01);
+                            v02 = Fma.MultiplyAdd(g, Avx.LoadVector256(inTop + ow2 + 1),    v02);
+
+                            v10 = Fma.MultiplyAdd(g, Avx.LoadVector256(inMid + iwLeft),     v10);
+                            v11 = Fma.MultiplyAdd(g, Avx.LoadVector256(inMid + ow2),        v11);
+                            v12 = Fma.MultiplyAdd(g, Avx.LoadVector256(inMid + ow2 + 1),    v12);
+
+                            v20 = Fma.MultiplyAdd(g, Avx.LoadVector256(inBot + iwLeft),     v20);
+                            v21 = Fma.MultiplyAdd(g, Avx.LoadVector256(inBot + ow2),        v21);
+                            v22 = Fma.MultiplyAdd(g, Avx.LoadVector256(inBot + ow2 + 1),    v22);
                         }
-                        if (midValid)
-                        {
-                            if (leftValid)  a10 += g * inMid[iwLeft];
-                                            a11 += g * inMid[iwMid];
-                            if (rightValid) a12 += g * inMid[iwRight];
-                        }
-                        if (botValid)
-                        {
-                            if (leftValid)  a20 += g * inBot[iwLeft];
-                                            a21 += g * inBot[iwMid];
-                            if (rightValid) a22 += g * inBot[iwRight];
-                        }
+                    }
+
+                    // Scalar tail (ow ∈ [simdEnd, interiorWEnd)).
+                    for (; ow2 < interiorWEnd; ow2++)
+                    {
+                        double g = goRow[ow2];
+                        int iwLeft = ow2 - 1, iwRight = ow2 + 1;
+                        a00 += g * inTop[iwLeft]; a01 += g * inTop[ow2]; a02 += g * inTop[iwRight];
+                        a10 += g * inMid[iwLeft]; a11 += g * inMid[ow2]; a12 += g * inMid[iwRight];
+                        a20 += g * inBot[iwLeft]; a21 += g * inBot[ow2]; a22 += g * inBot[iwRight];
+                    }
+
+                    // Right boundary col (ow=outWidth-1): kw=2 (iw=outWidth) invalid.
+                    if (outWidth > 1)
+                    {
+                        int owLast = outWidth - 1;
+                        double g = goRow[owLast];
+                        a00 += g * inTop[owLast - 1]; a01 += g * inTop[owLast];
+                        a10 += g * inMid[owLast - 1]; a11 += g * inMid[owLast];
+                        a20 += g * inBot[owLast - 1]; a21 += g * inBot[owLast];
+                    }
+                }
+
+                // ============================================================
+                // Bottom boundary row (oh = outHeight - 1): kh=2 (ih=outH)
+                // invalid; only top + mid contribute. Always scalar.
+                // ============================================================
+                if (outHeight > 1)
+                {
+                    int oh = outHeight - 1;
+                    double* goRow = goBase + oh * outWidth;
+                    double* inTop = inBase + (oh - 1) * width;
+                    double* inMid = inBase + oh * width;
+                    for (int ow = 0; ow < outWidth; ow++)
+                    {
+                        double g = goRow[ow];
+                        bool leftValid = ow >= 1;
+                        bool rightValid = ow < outWidth - 1;
+                        if (leftValid)  a00 += g * inTop[ow - 1];
+                                        a01 += g * inTop[ow];
+                        if (rightValid) a02 += g * inTop[ow + 1];
+                        if (leftValid)  a10 += g * inMid[ow - 1];
+                                        a11 += g * inMid[ow];
+                        if (rightValid) a12 += g * inMid[ow + 1];
                     }
                 }
             }
 
+            // Horizontal-sum the SIMD accumulators and combine with the
+            // boundary scalars to produce the 9 final kernel-gradient
+            // entries for this (oc, ic).
             double* gkIcBase = gkOcBase + ic * 9;
-            gkIcBase[0] = a00; gkIcBase[1] = a01; gkIcBase[2] = a02;
-            gkIcBase[3] = a10; gkIcBase[4] = a11; gkIcBase[5] = a12;
-            gkIcBase[6] = a20; gkIcBase[7] = a21; gkIcBase[8] = a22;
+            gkIcBase[0] = a00 + HorizontalSumDouble(v00);
+            gkIcBase[1] = a01 + HorizontalSumDouble(v01);
+            gkIcBase[2] = a02 + HorizontalSumDouble(v02);
+            gkIcBase[3] = a10 + HorizontalSumDouble(v10);
+            gkIcBase[4] = a11 + HorizontalSumDouble(v11);
+            gkIcBase[5] = a12 + HorizontalSumDouble(v12);
+            gkIcBase[6] = a20 + HorizontalSumDouble(v20);
+            gkIcBase[7] = a21 + HorizontalSumDouble(v21);
+            gkIcBase[8] = a22 + HorizontalSumDouble(v22);
         }
+    }
+
+    [MethodImpl(HotInline)]
+    private static double HorizontalSumDouble(Vector256<double> v)
+    {
+        var lo = v.GetLower();          // lanes [0, 1]
+        var hi = v.GetUpper();          // lanes [2, 3]
+        var pair = Sse2.Add(lo, hi);    // [0+2, 1+3]
+        return pair.GetElement(0) + pair.GetElement(1);
     }
 
     /// <summary>
