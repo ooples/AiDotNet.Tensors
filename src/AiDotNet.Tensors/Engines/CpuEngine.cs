@@ -12525,6 +12525,111 @@ public partial class CpuEngine : ITensorLevelEngine
         // cannot fit in the per-test 120 s budget.
         if (typeof(T) == typeof(double))
         {
+#if !NET471
+            // #415 Phase B: direct-kernel fast path for 3×3 stride=1 padding=1
+            // (the dominant VGG / ResNet 3×3 backward-input shape). Uses the
+            // identity: Conv2DBackwardInput with these constraints is exactly
+            //   forward Conv2D(gradOutput, K')   where K'[ic, oc, kh', kw'] = K[oc, ic, 2-kh', 2-kw']
+            // i.e. spatially-flipped and channel-transposed kernel applied to
+            // gradOutput. Lets us hit SimdConvHelper.Conv3x3Stride1Double's
+            // register-resident AVX2/FMA inner loop on the BACKWARD path
+            // instead of paying im2col allocation + col2im scatter + dgemm
+            // dispatch overhead. The kernel-flip prep allocates one
+            // inChannels × outChannels × 9 buffer (e.g. 18 MB at VGG block 5
+            // 512→512 — fits L3) which is a fraction of the per-call im2col
+            // buffer the dgemm path allocates per batch (~8 MB for ResNet
+            // res2 56×56 / 256 channels). Mirrors the gate used by the
+            // forward Conv2D direct path (line ~8439) so the perf cliff
+            // shapes (small spatial × high channels) stay on im2col+DGEMM
+            // where BLAS keeps near-peak throughput via internal blocking.
+            // Gate: T = double, all dilations = 1, kernel = 3×3, stride = 1,
+            // padding = 1 (the only padding that keeps outH = inH and outW
+            // = inW so the forward kernel's output dims line up with the
+            // gradInput we need), AVX2/FMA available.
+            if (kernelHeight == 3 && kernelWidth == 3
+                && strideH == 1 && strideW == 1
+                && padH == 1 && padW == 1
+                && dilationH == 1 && dilationW == 1
+                && Helpers.SimdConvHelper.CanUseSimdConvDouble(kernelHeight, kernelWidth, strideH, strideW))
+            {
+                // Same perf gate as forward Conv2D — see CpuEngine.Conv2D line
+                // ~8465 for the empirical rationale. The direct kernel wins
+                // when (a) total work is small enough that BLAS dispatch
+                // overhead dominates, OR (b) there's enough outChannels work
+                // to saturate the per-OC parallel tasks at sufficient spatial
+                // density that the no-im2col-blowup memory-traffic win
+                // materializes.  Reuse the identical formula so the
+                // backward path's routing decision tracks the forward's at
+                // every shape.
+                long convFmas = (long)batch * inChannels * outChannels * height * width * 9L;
+                long outputSpatial = (long)outputHeight * outputWidth;
+                int directKernelMinTasks = 2 * Math.Max(1, Helpers.CpuParallelSettings.MaxDegreeOfParallelism);
+                const long MinDirectSpatial = 512L;
+                bool directKernelFitsWell = convFmas <= 4_000_000L
+                    || (inChannels >= directKernelMinTasks
+                        && outputSpatial >= MinDirectSpatial);
+                if (directKernelFitsWell)
+                {
+                    var kernelDDirect = (double[])(object)kernel.GetFlattenedData();
+
+                    // Build K' shape [inChannels, outChannels, 3, 3] with
+                    // K'[ic, oc, kh', kw'] = K[oc, ic, 2-kh', 2-kw']. The
+                    // inner spatial flip is the kernel-flip from the
+                    // backward-input derivation; the (oc, ic) transpose
+                    // swaps the role of in/out channels because the forward
+                    // kernel reads the inChannels dim from the input tensor
+                    // (= gradOutput here) and the outChannels dim from the
+                    // kernel's leading axis.
+                    var kernelFlipped = new double[inChannels * outChannels * 9];
+                    for (int oc = 0; oc < outChannels; oc++)
+                    {
+                        for (int ic = 0; ic < inChannels; ic++)
+                        {
+                            int srcBase = (oc * inChannels + ic) * 9;
+                            int dstBase = (ic * outChannels + oc) * 9;
+                            kernelFlipped[dstBase + 0] = kernelDDirect[srcBase + 8];
+                            kernelFlipped[dstBase + 1] = kernelDDirect[srcBase + 7];
+                            kernelFlipped[dstBase + 2] = kernelDDirect[srcBase + 6];
+                            kernelFlipped[dstBase + 3] = kernelDDirect[srcBase + 5];
+                            kernelFlipped[dstBase + 4] = kernelDDirect[srcBase + 4];
+                            kernelFlipped[dstBase + 5] = kernelDDirect[srcBase + 3];
+                            kernelFlipped[dstBase + 6] = kernelDDirect[srcBase + 2];
+                            kernelFlipped[dstBase + 7] = kernelDDirect[srcBase + 1];
+                            kernelFlipped[dstBase + 8] = kernelDDirect[srcBase + 0];
+                        }
+                    }
+
+                    var gradOutputDDirect = (double[])(object)gradOutput.GetFlattenedData();
+                    var gradInputDDirect = new double[batch * inChannels * height * width];
+                    unsafe
+                    {
+                        fixed (double* pGradOut = gradOutputDDirect)
+                        fixed (double* pKFlipped = kernelFlipped)
+                        fixed (double* pGradIn = gradInputDDirect)
+                        {
+                            // Map original Conv2D's (outChannels, inChannels)
+                            // to the forward direct kernel's (inChannels,
+                            // outChannels) — the forward reads its inChannels
+                            // arg from the "input" tensor's channel dim (which
+                            // is gradOutput.outChannels here) and writes its
+                            // outChannels arg to the "output" tensor's
+                            // channel dim (which is gradInput.inChannels
+                            // here).
+                            Helpers.SimdConvHelper.Conv3x3Stride1Double(
+                                pGradOut, pKFlipped, pGradIn,
+                                batch,
+                                outChannels,   // forward "inChannels" = gradOutput's channel count
+                                outputHeight,  // forward "height"      = gradOutput H (== input H here)
+                                outputWidth,
+                                inChannels,    // forward "outChannels" = gradInput's channel count
+                                padH: 1, padW: 1, dilationH: 1, dilationW: 1);
+                        }
+                    }
+                    return TensorAllocator.Rent<T>(inputShape, (Vector<T>)(object)new Vector<double>(gradInputDDirect));
+                }
+            }
+#endif
+
             int colH = inChannels * kernelHeight * kernelWidth;
             int colW = outputHeight * outputWidth;
             var gradInputD = new double[batch * inChannels * height * width];
