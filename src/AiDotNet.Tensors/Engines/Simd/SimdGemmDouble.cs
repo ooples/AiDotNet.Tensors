@@ -41,6 +41,15 @@ internal static partial class SimdGemm
         c.Clear();
         if (k <= 0) return;
 
+#if NET8_0_OR_GREATER
+        // Stage 7 (#415): try AVX-512 8×16 first on capable CPUs; routes
+        // back to AVX2 internally if the shape is too small / misaligned.
+        if (Avx512SgemmDouble.CanUse)
+        {
+            Avx512SgemmDouble.DgemmBlocked(a, k, b, n, c, m, k, n, allowParallel: true);
+            return;
+        }
+#endif
 #if NET5_0_OR_GREATER
         if (Avx2.IsSupported && Fma.IsSupported)
         {
@@ -68,6 +77,13 @@ internal static partial class SimdGemm
         c.Clear();
         if (k <= 0) return;
 
+#if NET8_0_OR_GREATER
+        if (Avx512SgemmDouble.CanUse)
+        {
+            Avx512SgemmDouble.DgemmBlocked(a, k, b, n, c, m, k, n, allowParallel: false);
+            return;
+        }
+#endif
 #if NET5_0_OR_GREATER
         if (Avx2.IsSupported && Fma.IsSupported)
         {
