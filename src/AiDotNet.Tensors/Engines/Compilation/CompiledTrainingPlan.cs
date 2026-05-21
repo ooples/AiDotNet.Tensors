@@ -661,6 +661,19 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // Second moment buffers (Adam, RMSprop, etc.)
         var v = new float[paramCount][];
 
+        // GPU path state (parallel arrays to paramArrays etc.). For each
+        // parameter that's GPU-resident, gpuParam[p] / gpuGrad[p] hold the
+        // live IGpuBuffer and the per-step closure dispatches to the
+        // backend's fused SGD/Adam kernels instead of pinning a CPU array.
+        // CPU-resident params keep paramArrays[p] / gradArrays[p] non-null
+        // and the GPU slots stay null — single branch per parameter at
+        // step time picks the right path.
+        var gpuParam = new Engines.DirectGpu.IGpuBuffer?[paramCount];
+        var gpuGrad = new Engines.DirectGpu.IGpuBuffer?[paramCount];
+        var gpuM = new Engines.DirectGpu.IGpuBuffer?[paramCount];
+        var gpuV = new Engines.DirectGpu.IGpuBuffer?[paramCount];
+        var gpuBackends = new Engines.DirectGpu.IDirectGpuBackend?[paramCount];
+
         // Issue #350: GetDataArray() returns a COPY when the parameter tensor's
         // backing storage is pool-padded (e.g. logical length 6 on a 16-slot
         // ArrayPool bucket — common on net8+ where pool rent rounds up to
@@ -669,52 +682,95 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // success and the parameter never actually moves. The live-backing
         // accessor below is "allowing padding" because the fused kernel reads
         // exactly `lengths[p]` elements (the logical tensor size), never
-        // touching the pool-padding tail. For non-trivial layouts (views,
-        // non-zero offset, GPU-resident) the live-backing accessor returns
-        // null and we throw — that's a "should never happen for params
-        // registered with CompileTraining" condition and a silent fallback to
-        // a copy would just resurrect this bug.
+        // touching the pool-padding tail.
         for (int p = 0; p < paramCount; p++)
         {
-            var liveParam = _parameters[p].GetLiveBackingArrayAllowingPaddingOrNull();
-            if (liveParam is null)
-                throw new InvalidOperationException(
-                    $"Parameter {p} (shape [{string.Join(",", _parameters[p].Shape)}]) has a layout that does not expose " +
-                    $"a live CPU backing array (non-contiguous view, non-zero storageOffset, or non-CPU device). " +
-                    $"ConfigureOptimizer requires every registered parameter to be a contiguous CPU tensor so " +
-                    $"the fused optimizer step can mutate the caller's tensor in place. Call .Contiguous() / " +
-                    $"copy the parameter to CPU before registering it with CompileTraining.");
-            paramArrays[p] = (float[])(object)liveParam;
-            if (_gradients[p] is not null)
-            {
-                // Mirror the parameter contract: gradients also have to expose
-                // a live CPU backing array. A copy-fallback here would let
-                // _optimizerUpdate's `fixed (T* pGrad = gradArrays[p])` read
-                // a snapshot taken at compile time while backward writes to a
-                // different storage — the same stale-buffer bug the parameter
-                // fix above is fixing, but on the gradient side. Fail fast so
-                // the bug cannot resurrect through the gradient path.
-                var liveGrad = _gradients[p].GetLiveBackingArrayAllowingPaddingOrNull();
-                if (liveGrad is null)
-                    throw new InvalidOperationException(
-                        $"Gradient {p} (shape [{string.Join(",", _gradients[p].Shape)}]) has a layout that does not expose " +
-                        $"a live CPU backing array (non-contiguous view, non-zero storageOffset, or non-CPU device). " +
-                        $"ConfigureOptimizer requires live gradient storage so the fused optimizer step reads the " +
-                        $"current gradient values produced by each plan.Step()'s backward pass.");
-                gradArrays[p] = (float[])(object)liveGrad;
-            }
-            else
-            {
-                gradArrays[p] = Array.Empty<float>();
-            }
             lengths[p] = _parameters[p].Length;
-
             bool needsMomentum = optimizerType is OptimizerType.Adam or OptimizerType.AdamW
                 or OptimizerType.SGDMomentum or OptimizerType.Lion or OptimizerType.Nadam
                 or OptimizerType.AdaMax or OptimizerType.AMSGrad;
             bool needsSecondMoment = optimizerType is OptimizerType.Adam or OptimizerType.AdamW
                 or OptimizerType.RMSprop or OptimizerType.Nadam or OptimizerType.AMSGrad
                 or OptimizerType.Adagrad;
+
+            // GPU fast path: param is GPU-resident → allocate matching GPU
+            // state buffers and dispatch to backend kernels. Backends ship
+            // SgdUpdate / AdamUpdate / AdamWUpdate for every supported
+            // device (CUDA / HIP / OpenCL / Metal) so the fused kernel runs
+            // on-device with no CPU round-trip.
+            var paramGpuBuf = _parameters[p].TryGetGpuBuffer();
+            var paramBackend = _parameters[p]._gpuBackend;
+            if (paramGpuBuf is not null && paramBackend is not null
+                && typeof(T) == typeof(float))
+            {
+                gpuParam[p] = paramGpuBuf;
+                gpuBackends[p] = paramBackend;
+                // Gradient may be CPU or GPU. If CPU (the common case where
+                // backward ran on the engine the tape was bound to, which
+                // for a GPU-resident param SHOULD also be GPU but isn't
+                // guaranteed), upload to a transient GPU buffer each step
+                // — but our common case is gradient is GPU because tape
+                // backward routes through the same engine as forward.
+                if (_gradients[p] is not null)
+                {
+                    var gradGpuBuf = _gradients[p].TryGetGpuBuffer();
+                    if (gradGpuBuf is not null)
+                    {
+                        gpuGrad[p] = gradGpuBuf;
+                    }
+                    else
+                    {
+                        // Gradient is CPU-resident — bind its live CPU
+                        // backing as gradArrays[p]; the per-step closure
+                        // will upload it to a GPU staging buffer.
+                        var liveGrad = _gradients[p].GetLiveBackingArrayAllowingPaddingOrNull();
+                        if (liveGrad is not null)
+                            gradArrays[p] = (float[])(object)liveGrad;
+                        else
+                            gradArrays[p] = Array.Empty<float>();
+                    }
+                }
+                else
+                {
+                    gradArrays[p] = Array.Empty<float>();
+                }
+                if (needsMomentum) gpuM[p] = paramBackend.AllocateBuffer(lengths[p]);
+                if (needsSecondMoment) gpuV[p] = paramBackend.AllocateBuffer(lengths[p]);
+                // Skip the CPU live-backing check entirely — we're on GPU.
+                m[p] = Array.Empty<float>();
+                v[p] = Array.Empty<float>();
+                paramArrays[p] = Array.Empty<float>();
+                continue;
+            }
+
+            // CPU path. For non-trivial layouts (views, non-zero offset)
+            // the live-backing accessor returns null and we throw — that's
+            // a "should never happen for params registered with
+            // CompileTraining" condition and a silent fallback to a copy
+            // would just resurrect the Issue #350 stale-buffer bug.
+            var liveParam = _parameters[p].GetLiveBackingArrayAllowingPaddingOrNull();
+            if (liveParam is null)
+                throw new InvalidOperationException(
+                    $"Parameter {p} (shape [{string.Join(",", _parameters[p].Shape)}]) has a layout that does not expose " +
+                    $"a live CPU backing array (non-contiguous view, non-zero storageOffset). " +
+                    $"ConfigureOptimizer requires either a contiguous CPU tensor or a GPU-resident tensor with " +
+                    $"a backend-attached buffer (TryGetGpuBuffer() returns non-null). For non-contiguous views, " +
+                    $"call .Contiguous() before registering with CompileTraining.");
+            paramArrays[p] = (float[])(object)liveParam;
+            if (_gradients[p] is not null)
+            {
+                var liveGrad = _gradients[p].GetLiveBackingArrayAllowingPaddingOrNull();
+                if (liveGrad is null)
+                    throw new InvalidOperationException(
+                        $"Gradient {p} (shape [{string.Join(",", _gradients[p].Shape)}]) has a layout that does not expose " +
+                        $"a live CPU backing array. ConfigureOptimizer requires live gradient storage so the fused " +
+                        $"optimizer step reads the current gradient values produced by each plan.Step()'s backward pass.");
+                gradArrays[p] = (float[])(object)liveGrad;
+            }
+            else
+            {
+                gradArrays[p] = Array.Empty<float>();
+            }
 
             m[p] = needsMomentum ? new float[lengths[p]] : Array.Empty<float>();
             v[p] = needsSecondMoment ? new float[lengths[p]] : Array.Empty<float>();
@@ -737,8 +793,53 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             float lr = (float)lrSchedule.GetLr(_optimizerStep);
             for (int p = 0; p < paramCount; p++)
             {
-                if (gradArrays[p].Length == 0) continue;
                 int len = lengths[p];
+
+                // GPU path: dispatch to backend-native fused optimizer kernel.
+                // Backends own Sgd/Adam/AdamW kernel implementations
+                // (CUDA / HIP / OpenCL / Metal); we just translate the
+                // optimizer enum to the right call. Gradient may be CPU
+                // (uploaded transiently) or GPU (passed through directly).
+                if (gpuParam[p] is { } gpuP && gpuBackends[p] is { } gpuBe)
+                {
+                    Engines.DirectGpu.IGpuBuffer? gradBuf = gpuGrad[p];
+                    bool gradTransient = false;
+                    if (gradBuf is null)
+                    {
+                        if (gradArrays[p].Length == 0) continue; // no grad recorded
+                        gradBuf = gpuBe.AllocateBuffer(gradArrays[p]);
+                        gradTransient = true;
+                    }
+                    try
+                    {
+                        switch (optType)
+                        {
+                            case OptimizerType.SGD:
+                                gpuBe.SgdUpdate(gpuP, gradBuf, lr, wd, len);
+                                break;
+                            case OptimizerType.Adam:
+                                gpuBe.AdamUpdate(gpuP, gradBuf, gpuM[p]!, gpuV[p]!,
+                                    lr, b1, b2, epsVal, wd, _optimizerStep, len);
+                                break;
+                            case OptimizerType.AdamW:
+                                gpuBe.AdamWUpdate(gpuP, gradBuf, gpuM[p]!, gpuV[p]!,
+                                    lr, b1, b2, epsVal, wd, _optimizerStep, len);
+                                break;
+                            default:
+                                throw new NotSupportedException(
+                                    $"Optimizer type {optType} is not yet supported by ConfigureOptimizer on GPU. " +
+                                    $"Supported: SGD, Adam, AdamW.");
+                        }
+                    }
+                    finally
+                    {
+                        if (gradTransient) gradBuf.Dispose();
+                    }
+                    continue;
+                }
+
+                // CPU path: pin live backing + SIMD kernel.
+                if (gradArrays[p].Length == 0) continue;
 
                 fixed (float* pParam = paramArrays[p], pGrad = gradArrays[p],
                        pM = m[p], pV = v[p])
@@ -786,19 +887,68 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         for (int g = 0; g < groupCount; g++) schedules[g] = groupSchedules[g];
         for (int p = 0; p < paramCount; p++) paramGroup[p] = paramToGroup[p];
 
+        // GPU path state (parallel arrays — same scheme as ConfigureOptimizerFloat).
+        var gpuParam = new Engines.DirectGpu.IGpuBuffer?[paramCount];
+        var gpuGrad = new Engines.DirectGpu.IGpuBuffer?[paramCount];
+        var gpuM = new Engines.DirectGpu.IGpuBuffer?[paramCount];
+        var gpuV = new Engines.DirectGpu.IGpuBuffer?[paramCount];
+        var gpuBackends = new Engines.DirectGpu.IDirectGpuBackend?[paramCount];
+
         // Issue #350: live-backing binding (see ConfigureOptimizerFloat).
         for (int p = 0; p < paramCount; p++)
         {
+            lengths[p] = _parameters[p].Length;
+            bool needsMomentum = optimizerType is OptimizerType.Adam or OptimizerType.AdamW
+                or OptimizerType.SGDMomentum or OptimizerType.Lion or OptimizerType.Nadam
+                or OptimizerType.AdaMax or OptimizerType.AMSGrad;
+            bool needsSecondMoment = optimizerType is OptimizerType.Adam or OptimizerType.AdamW
+                or OptimizerType.RMSprop or OptimizerType.Nadam or OptimizerType.AMSGrad
+                or OptimizerType.Adagrad;
+
+            // GPU fast path — same logic as ConfigureOptimizerFloat. See
+            // there for the full rationale on per-param GPU/CPU dispatch.
+            var paramGpuBuf = _parameters[p].TryGetGpuBuffer();
+            var paramBackend = _parameters[p]._gpuBackend;
+            if (paramGpuBuf is not null && paramBackend is not null
+                && typeof(T) == typeof(float))
+            {
+                gpuParam[p] = paramGpuBuf;
+                gpuBackends[p] = paramBackend;
+                if (_gradients[p] is not null)
+                {
+                    var gradGpuBuf = _gradients[p].TryGetGpuBuffer();
+                    if (gradGpuBuf is not null)
+                    {
+                        gpuGrad[p] = gradGpuBuf;
+                    }
+                    else
+                    {
+                        var liveGrad = _gradients[p].GetLiveBackingArrayAllowingPaddingOrNull();
+                        gradArrays[p] = liveGrad is not null ? (float[])(object)liveGrad : Array.Empty<float>();
+                    }
+                }
+                else
+                {
+                    gradArrays[p] = Array.Empty<float>();
+                }
+                if (needsMomentum) gpuM[p] = paramBackend.AllocateBuffer(lengths[p]);
+                if (needsSecondMoment) gpuV[p] = paramBackend.AllocateBuffer(lengths[p]);
+                m[p] = Array.Empty<float>();
+                v[p] = Array.Empty<float>();
+                paramArrays[p] = Array.Empty<float>();
+                continue;
+            }
+
             var liveParam = _parameters[p].GetLiveBackingArrayAllowingPaddingOrNull();
             if (liveParam is null)
                 throw new InvalidOperationException(
                     $"Parameter {p} (shape [{string.Join(",", _parameters[p].Shape)}]) has a layout that does not expose " +
-                    $"a live CPU backing array (non-contiguous view, non-zero storageOffset, or non-CPU device). " +
-                    $"ConfigureOptimizerGrouped requires every registered parameter to be a contiguous CPU tensor.");
+                    $"a live CPU backing array (non-contiguous view, non-zero storageOffset). " +
+                    $"ConfigureOptimizerGrouped requires either a contiguous CPU tensor or a GPU-resident tensor with " +
+                    $"a backend-attached buffer (TryGetGpuBuffer() returns non-null).");
             paramArrays[p] = (float[])(object)liveParam;
             if (_gradients[p] is not null)
             {
-                // Fail fast on copy-fallback (see ConfigureOptimizerFloat for full rationale).
                 var liveGrad = _gradients[p].GetLiveBackingArrayAllowingPaddingOrNull();
                 if (liveGrad is null)
                     throw new InvalidOperationException(
@@ -810,14 +960,6 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             {
                 gradArrays[p] = Array.Empty<float>();
             }
-            lengths[p] = _parameters[p].Length;
-
-            bool needsMomentum = optimizerType is OptimizerType.Adam or OptimizerType.AdamW
-                or OptimizerType.SGDMomentum or OptimizerType.Lion or OptimizerType.Nadam
-                or OptimizerType.AdaMax or OptimizerType.AMSGrad;
-            bool needsSecondMoment = optimizerType is OptimizerType.Adam or OptimizerType.AdamW
-                or OptimizerType.RMSprop or OptimizerType.Nadam or OptimizerType.AMSGrad
-                or OptimizerType.Adagrad;
 
             m[p] = needsMomentum ? new float[lengths[p]] : Array.Empty<float>();
             v[p] = needsSecondMoment ? new float[lengths[p]] : Array.Empty<float>();
@@ -842,9 +984,49 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
             for (int p = 0; p < paramCount; p++)
             {
-                if (gradArrays[p].Length == 0) continue;
                 int len = lengths[p];
                 float lr = groupLrs[paramGroup[p]];
+
+                // GPU path (mirrors ConfigureOptimizerFloat).
+                if (gpuParam[p] is { } gpuP && gpuBackends[p] is { } gpuBe)
+                {
+                    Engines.DirectGpu.IGpuBuffer? gradBuf = gpuGrad[p];
+                    bool gradTransient = false;
+                    if (gradBuf is null)
+                    {
+                        if (gradArrays[p].Length == 0) continue;
+                        gradBuf = gpuBe.AllocateBuffer(gradArrays[p]);
+                        gradTransient = true;
+                    }
+                    try
+                    {
+                        switch (optType)
+                        {
+                            case OptimizerType.SGD:
+                                gpuBe.SgdUpdate(gpuP, gradBuf, lr, wd, len);
+                                break;
+                            case OptimizerType.Adam:
+                                gpuBe.AdamUpdate(gpuP, gradBuf, gpuM[p]!, gpuV[p]!,
+                                    lr, b1, b2, epsVal, wd, _optimizerStep, len);
+                                break;
+                            case OptimizerType.AdamW:
+                                gpuBe.AdamWUpdate(gpuP, gradBuf, gpuM[p]!, gpuV[p]!,
+                                    lr, b1, b2, epsVal, wd, _optimizerStep, len);
+                                break;
+                            default:
+                                throw new NotSupportedException(
+                                    $"Optimizer type {optType} is not yet supported by ConfigureOptimizerGrouped on GPU. " +
+                                    $"Supported: SGD, Adam, AdamW.");
+                        }
+                    }
+                    finally
+                    {
+                        if (gradTransient) gradBuf.Dispose();
+                    }
+                    continue;
+                }
+
+                if (gradArrays[p].Length == 0) continue;
 
                 fixed (float* pParam = paramArrays[p], pGrad = gradArrays[p],
                        pM = m[p], pV = v[p])
