@@ -314,49 +314,138 @@ internal static partial class SimdGemm
     /// Sequential packed-tiled DGEMM: jc → pc → ic → macro kernel. Mirrors
     /// the FP32 SgemmTiled outer loop (lines ~2253-2360) with FP64 panel
     /// sizes. C is assumed already zeroed by the caller (Dgemm clears).
+    /// Uses ArrayPool for the packed scratch buffers — eliminates per-call
+    /// GC pressure on training-loop hot paths.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static unsafe void DgemmTiledSequential(
         ReadOnlySpan<double> a, ReadOnlySpan<double> b, Span<double> c,
         int m, int k, int n)
     {
         int Mc = ChooseAdaptiveMcDouble(m, k, n);
-
-        // One packed buffer per panel — sized for the largest possible
-        // panel at this shape (Mc * Kc for A, Kc * Nc for B). At Mc=96,
-        // Kc=256 → 192 KB packed A; at Kc=256, Nc=2048 → 4 MB packed B.
-        // Both rent from the heap — pool integration is a follow-up commit
-        // alongside Stage 3 (pre-packed B cache).
-        var packedA = new double[Mc * DKc];
-        var packedB = new double[DKc * DNc];
-
-        fixed (double* aPtr = a)
-        fixed (double* bPtr = b)
-        fixed (double* cPtr = c)
+        var pool = System.Buffers.ArrayPool<double>.Shared;
+        var packedA = pool.Rent(Mc * DKc);
+        var packedB = pool.Rent(DKc * DNc);
+        try
         {
-            for (int jc = 0; jc < n; jc += DNc)
+            fixed (double* aPtr = a)
+            fixed (double* bPtr = b)
+            fixed (double* cPtr = c)
             {
-                int nc = Math.Min(DNc, n - jc);
-                for (int pc = 0; pc < k; pc += DKc)
+                for (int jc = 0; jc < n; jc += DNc)
                 {
-                    int kc = Math.Min(DKc, k - pc);
-                    PackBDouble(b, packedB, n, pc, kc, jc, nc);
-
-                    for (int ic = 0; ic < m; ic += Mc)
+                    int nc = Math.Min(DNc, n - jc);
+                    for (int pc = 0; pc < k; pc += DKc)
                     {
-                        int mc = Math.Min(Mc, m - ic);
-                        PackADouble(a, packedA, k, ic, mc, pc, kc);
+                        int kc = Math.Min(DKc, k - pc);
+                        PackBDouble(b, packedB, n, pc, kc, jc, nc);
 
-                        fixed (double* paPtr = packedA)
-                        fixed (double* pbPtr = packedB)
+                        for (int ic = 0; ic < m; ic += Mc)
                         {
-                            double* cBase = cPtr + (long)ic * n + jc;
-                            DgemmMacroKernel(paPtr, pbPtr, cBase, n, mc, nc, kc);
+                            int mc = Math.Min(Mc, m - ic);
+                            PackADouble(a, packedA, k, ic, mc, pc, kc);
+
+                            fixed (double* paPtr = packedA)
+                            fixed (double* pbPtr = packedB)
+                            {
+                                double* cBase = cPtr + (long)ic * n + jc;
+                                DgemmMacroKernel(paPtr, pbPtr, cBase, n, mc, nc, kc);
+                            }
                         }
                     }
                 }
             }
         }
+        finally
+        {
+            pool.Return(packedA);
+            pool.Return(packedB);
+        }
+    }
+
+    /// <summary>
+    /// Parallel-M packed-tiled DGEMM: outer ic loop parallelized via per-
+    /// row-block tasks. Each task rents its own packedA buffer (per-task
+    /// scratch, no contention); the single packedB panel is shared
+    /// read-only across all tasks within one (jc, pc) iteration. Mirrors
+    /// the FP32 SgemmTiledParallelM (lines ~2482-2562) structure.
+    /// </summary>
+    private static unsafe void DgemmTiledParallelM(
+        ReadOnlySpan<double> a, ReadOnlySpan<double> b, Span<double> c,
+        int m, int k, int n)
+    {
+        int Mc = ChooseAdaptiveMcDouble(m, k, n);
+        int numRowBlocks = (m + Mc - 1) / Mc;
+        var pool = System.Buffers.ArrayPool<double>.Shared;
+        var packedB = pool.Rent(DKc * DNc);
+        try
+        {
+            fixed (double* aPtr = a)
+            fixed (double* bPtr = b)
+            fixed (double* cPtr = c)
+            {
+                IntPtr aHandle = (IntPtr)aPtr;
+                IntPtr bHandle = (IntPtr)bPtr;
+                IntPtr cHandle = (IntPtr)cPtr;
+                int mCap = m, kCap = k, nCap = n, McCap = Mc;
+
+                for (int jc = 0; jc < n; jc += DNc)
+                {
+                    int nc = Math.Min(DNc, n - jc);
+                    for (int pc = 0; pc < k; pc += DKc)
+                    {
+                        int kc = Math.Min(DKc, k - pc);
+                        PackBDouble(b, packedB, n, pc, kc, jc, nc);
+
+                        int jcCap = jc, pcCap = pc, kcCap = kc, ncCap = nc;
+                        IntPtr packedBHandle;
+                        fixed (double* pbPtrTmp = packedB) packedBHandle = (IntPtr)pbPtrTmp;
+
+                        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(
+                            0, numRowBlocks, (long)m * nc * kc, (rb) =>
+                        {
+                            int ic = rb * McCap;
+                            int mc = Math.Min(McCap, mCap - ic);
+                            if (mc <= 0) return;
+                            var localPool = System.Buffers.ArrayPool<double>.Shared;
+                            var localPackedA = localPool.Rent(McCap * DKc);
+                            try
+                            {
+                                PackADouble(
+                                    new ReadOnlySpan<double>((double*)aHandle, mCap * kCap),
+                                    localPackedA, kCap, ic, mc, pcCap, kcCap);
+                                fixed (double* paPtr = localPackedA)
+                                {
+                                    double* pbPtr = (double*)packedBHandle;
+                                    double* cBase = (double*)cHandle + (long)ic * nCap + jcCap;
+                                    DgemmMacroKernel(paPtr, pbPtr, cBase, nCap, mc, ncCap, kcCap);
+                                }
+                            }
+                            finally { localPool.Return(localPackedA); }
+                        });
+                    }
+                }
+            }
+        }
+        finally { pool.Return(packedB); }
+    }
+
+    /// <summary>
+    /// Gate: parallel-M when there's at least 2 row blocks per worker and
+    /// total work justifies parallel dispatch overhead. Mirror of the FP32
+    /// SgemmTiled parallel gate (SimdGemm.cs:924-945 dispatch).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool DgemmShouldParallelize(int m, int k, int n)
+    {
+        if (!UseParallelGemm) return false;
+        long work = (long)m * k * n;
+        if (work < 4_000_000L) return false;     // small-shape parallel overhead dominates
+        int procs = AiDotNet.Tensors.Helpers.CpuParallelSettings.MaxDegreeOfParallelism;
+        if (procs <= 1) return false;
+        int Mc = ChooseAdaptiveMcDouble(m, k, n);
+        int numRowBlocks = (m + Mc - 1) / Mc;
+        // Need at least 2 row blocks per worker to amortize dispatch.
+        return numRowBlocks >= 2;
     }
 #endif
 
@@ -385,7 +474,10 @@ internal static partial class SimdGemm
             // block path which has no packing setup cost.
             if (DgemmShouldUsePackedTiled(m, k, n))
             {
-                DgemmTiledSequential(a, b, c, m, k, n);
+                if (DgemmShouldParallelize(m, k, n))
+                    DgemmTiledParallelM(a, b, c, m, k, n);
+                else
+                    DgemmTiledSequential(a, b, c, m, k, n);
                 return;
             }
             DgemmAvx2(a, b, c, m, k, n, allowParallel: true);
