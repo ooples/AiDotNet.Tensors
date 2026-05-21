@@ -34,13 +34,7 @@ public class AcceptanceCriteriaTests
 
     // ─── (a) Compiled training step matches eager loss on small MLP ──
 
-    [Fact(Skip = "Pre-existing minor numerical divergence between two eager-path runs on " +
-                 "small MLP: 0.142643794 vs 0.143529832 (~0.6% relative). Both runs use the " +
-                 "same DifferentiableOps surface but produce slightly different loss curves, " +
-                 "indicating non-determinism in the autograd path (likely parallel reduction " +
-                 "ordering or pooled-buffer state pollution). Confirmed pre-existing on " +
-                 "origin/main. Tracked as a follow-up — needs determinism audit of the " +
-                 "training-step path on shapes below the SimdGemm parallel gate.")]
+    [Fact]
     public void CompiledTraining_MatchesEagerLossCurve_OnSmallMLP()
     {
         // 2-layer MLP: y = ReLU(x · W1) · W2. SGD on MSE loss vs target.
