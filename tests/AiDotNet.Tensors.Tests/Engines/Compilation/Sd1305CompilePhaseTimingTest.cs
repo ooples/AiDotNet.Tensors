@@ -26,11 +26,7 @@ public class Sd1305CompilePhaseTimingTest
     private readonly ITestOutputHelper _output;
     public Sd1305CompilePhaseTimingTest(ITestOutputHelper output) => _output = output;
 
-    [Fact(Skip = "Pre-existing flaky timing assertion: depends on Stopwatch measurements " +
-                 "comparing eager vs compiled-plan phases, which are heavily influenced by " +
-                 "concurrent test allocations / GC pauses. Passes in isolation. Test is " +
-                 "Benchmark-category (already filtered out of normal CI runs); skip is the " +
-                 "matching default behavior for full-suite local runs.")]
+    [Fact]
     public void CompilePhaseTiming_SdResBlock_Double()
     {
         var engine = new CpuEngine();

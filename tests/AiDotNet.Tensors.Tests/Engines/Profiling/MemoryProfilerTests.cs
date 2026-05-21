@@ -56,11 +56,7 @@ public class MemoryProfilerTests
         }
     }
 
-    [Fact(Skip = "Pre-existing flaky test: depends on Environment.StackTrace capture finding " +
-                 "'TensorAllocator' in the recorded stack, but xunit's invoke trampoline + JIT " +
-                 "tiering can occasionally short-circuit the stack capture during the full-suite " +
-                 "run. Passes in isolation. Tracked as a follow-up — the MemoryProfiler stack " +
-                 "capture path needs hardening before this assertion can be re-enabled.")]
+    [Fact]
     public void RecordHistory_All_CapturesAllocationStack()
     {
         try

@@ -33,19 +33,7 @@ namespace AiDotNet.Tensors.Tests.Engines;
 public class Issue319TrainingLoopPerfTests
 {
     private readonly ITestOutputHelper _output;
-    public Issue319TrainingLoopPerfTests(ITestOutputHelper output)
-    {
-        _output = output;
-        // Reset shared engine + caches so alloc-counting probes aren't
-        // contaminated by pooled tensors / AutoTracer state from earlier
-        // tests in the same process. The perf-regression assertions use
-        // GC.GetTotalMemory deltas which are highly sensitive to other
-        // tests' residual heap.
-        AiDotNet.Tensors.Engines.AiDotNetEngine.Current = new AiDotNet.Tensors.Engines.CpuEngine();
-        AiDotNet.Tensors.Engines.Compilation.AutoTrainingCompiler.ResetState();
-        AiDotNet.Tensors.Helpers.AutoTensorCache.Clear();
-        AiDotNet.Tensors.Engines.Autodiff.TensorPool<float>.Clear();
-    }
+    public Issue319TrainingLoopPerfTests(ITestOutputHelper output) { _output = output; }
 
     /// <summary>
     /// Times one full training iteration on a 4-layer MLP at ViT-Base
@@ -169,12 +157,7 @@ public class Issue319TrainingLoopPerfTests
     /// flaky on net471 (GC.GetTotalMemory is not monotonic) — see
     /// OptimizerKernelsTests for the env-robust replacement.
     /// </remarks>
-    [Fact(Skip = "Pre-existing flaky alloc-comparison test: assertion `fusedAllocKb <= naiveAllocKb` " +
-                 "is GC-state sensitive — the GC.GetTotalAllocatedBytes() probe captures cross-test " +
-                 "allocations and the comparison fails non-deterministically when the suite is run " +
-                 "as a whole. Passes in isolation. The test is already marked Performance category " +
-                 "so it's filtered out of normal CI runs (Category!=Performance); skip is the matching " +
-                 "default behavior for the local full-suite run that ignores the filter.")]
+    [Fact]
     [Trait("Category", "Performance")]
     public void TrainingStep_FusedSgdInPlace_ReducesAllocsVsNaiveOptimizer()
     {
