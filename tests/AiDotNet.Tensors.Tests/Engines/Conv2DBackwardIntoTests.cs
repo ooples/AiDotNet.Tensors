@@ -232,4 +232,53 @@ public class Conv2DBackwardIntoTests
             Assert.True(System.Math.Abs(actual[i] - expected[i]) < 1e-11,
                 $"[{i}] actual={actual[i]:F12} expected={expected[i]:F12} diff={actual[i] - expected[i]:E2}");
     }
+
+    /// <summary>
+    /// #415 Phase B-2: direct backward-kernel for 3×3 / stride=1 / padding=1
+    /// FP64 must match the scalar reference computed from the
+    /// Conv2DBackwardKernel definition.
+    /// </summary>
+    [Fact]
+    public void Conv2DBackwardKernel_DOUBLE_3x3_S1_P1_MatchesScalarReference()
+    {
+        var engine = new CpuEngine();
+        int batch = 2, inC = 5, H = 12, W = 12, outC = 7, kH = 3, kW = 3;
+        int padH = 1, padW = 1;
+        int oH = H + 2 * padH - kH + 1; // = H for k=3 p=1
+        int oW = W + 2 * padW - kW + 1; // = W for k=3 p=1
+        var rng = new System.Random(456);
+
+        var gradOut = new Tensor<double>(new[] { batch, outC, oH, oW });
+        for (int i = 0; i < gradOut.Length; i++) gradOut[i] = rng.NextDouble() - 0.5;
+        var input = new Tensor<double>(new[] { batch, inC, H, W });
+        for (int i = 0; i < input.Length; i++) input[i] = rng.NextDouble() - 0.5;
+
+        var actual = engine.Conv2DBackwardKernel(gradOut, input,
+            new[] { outC, inC, kH, kW }, new[] { 1, 1 }, new[] { padH, padW }, new[] { 1, 1 });
+
+        // Scalar reference: gradKernel[oc,ic,kh,kw] = sum_{b,oh,ow}
+        //   gradOut[b,oc,oh,ow] * input[b,ic,oh+kh-padH,ow+kw-padW]   (if in bounds)
+        var expected = new double[outC * inC * kH * kW];
+        for (int oc = 0; oc < outC; oc++)
+            for (int ic = 0; ic < inC; ic++)
+                for (int kh = 0; kh < kH; kh++)
+                    for (int kw = 0; kw < kW; kw++)
+                    {
+                        double sum = 0.0;
+                        for (int b = 0; b < batch; b++)
+                            for (int oh = 0; oh < oH; oh++)
+                                for (int ow = 0; ow < oW; ow++)
+                                {
+                                    int ih = oh + kh - padH;
+                                    int iw = ow + kw - padW;
+                                    if (ih < 0 || ih >= H || iw < 0 || iw >= W) continue;
+                                    sum += gradOut[b, oc, oh, ow] * input[b, ic, ih, iw];
+                                }
+                        expected[((oc * inC + ic) * kH + kh) * kW + kw] = sum;
+                    }
+
+        for (int i = 0; i < actual.Length; i++)
+            Assert.True(System.Math.Abs(actual[i] - expected[i]) < 1e-11,
+                $"[{i}] actual={actual[i]:F12} expected={expected[i]:F12} diff={actual[i] - expected[i]:E2}");
+    }
 }

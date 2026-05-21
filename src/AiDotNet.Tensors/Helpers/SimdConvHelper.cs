@@ -277,6 +277,202 @@ internal static class SimdConvHelper
     }
 
     /// <summary>
+    /// #415 Phase B-2: direct backward-kernel for 3×3 / stride=1 / padding=1
+    /// FP64. Computes
+    ///   gradKernel[oc, ic, kh, kw] += sum_{b, oh, ow}
+    ///     gradOutput[b, oc, oh, ow] * input[b, ic, oh+kh-1, ow+kw-1]
+    /// directly (no im2col allocation) with AVX2/FMA Vector256&lt;double&gt;
+    /// vectorization along the contiguous ow dim. Parallelizes over oc so
+    /// per-thread work is well-defined and the small gradKernel output
+    /// (outC × inC × 9 doubles) lets us accumulate into the final
+    /// destination directly without per-batch staging buffers.
+    /// <para>
+    /// Caller (CpuEngine.Conv2DBackwardKernel double branch) gates this on
+    /// AVX2/FMA availability + the same FMA-budget / spatial-density rule
+    /// that the forward direct kernel uses. Caller passes <c>height</c>
+    /// and <c>outputHeight</c> separately because they're not strictly
+    /// equal for general s/p combinations — but for the 3×3/s=1/p=1
+    /// shape this kernel is gated on they ARE equal (outH = H, outW = W).
+    /// </para>
+    /// </summary>
+    public static unsafe void Conv3x3Stride1BackwardKernelDouble(
+        double[] gradOutput, double[] input, double[] gradKernel,
+        int batch, int inChannels, int outChannels,
+        int height, int width, int outHeight, int outWidth,
+        int padH, int padW)
+    {
+        if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (gradKernel == null) throw new ArgumentNullException(nameof(gradKernel));
+        if (padH != 1 || padW != 1) throw new ArgumentException("Phase B-2 kernel is specialized for padding=1.");
+        if (outHeight != height || outWidth != width)
+            throw new ArgumentException("Phase B-2 kernel requires outHeight==height and outWidth==width (the 3×3/s=1/p=1 invariant).");
+
+        Array.Clear(gradKernel, 0, outChannels * inChannels * 9);
+
+        int outputSize = outHeight * outWidth;
+        int gradOutBatchStride = outChannels * outputSize;
+        int inputBatchStride = inChannels * height * width;
+
+        // Parallel over outChannels: outC×inC pairs per task gives the
+        // right granularity to saturate workers without per-(oc,ic) task
+        // dispatch overhead. The inner ic loop benefits from input being
+        // hot in L2 if successive ic share a cache line.
+        bool useParallel = outChannels >= Math.Max(2, CpuParallelSettings.MaxDegreeOfParallelism);
+
+        if (useParallel)
+        {
+            fixed (double* pGradOutFix = gradOutput)
+            fixed (double* pInputFix = input)
+            fixed (double* pGradKernelFix = gradKernel)
+            {
+                IntPtr goPtr = (IntPtr)pGradOutFix;
+                IntPtr inPtr = (IntPtr)pInputFix;
+                IntPtr gkPtr = (IntPtr)pGradKernelFix;
+                int outChannelsCap = outChannels;
+                int inChannelsCap = inChannels;
+                int batchCap = batch;
+                int heightCap = height;
+                int widthCap = width;
+                int outHeightCap = outHeight;
+                int outWidthCap = outWidth;
+                int gradOutBatchStrideCap = gradOutBatchStride;
+                int inputBatchStrideCap = inputBatchStride;
+                int outputSizeCap = outputSize;
+                CpuParallelSettings.LightweightParallel(outChannels, oc =>
+                {
+                    Conv3x3BackwardKernelOneOcDouble(
+                        (double*)goPtr, (double*)inPtr, (double*)gkPtr,
+                        oc, batchCap, inChannelsCap, outChannelsCap,
+                        heightCap, widthCap, outHeightCap, outWidthCap,
+                        gradOutBatchStrideCap, inputBatchStrideCap, outputSizeCap);
+                });
+            }
+        }
+        else
+        {
+            fixed (double* pGradOut = gradOutput)
+            fixed (double* pInput = input)
+            fixed (double* pGradKernel = gradKernel)
+            {
+                for (int oc = 0; oc < outChannels; oc++)
+                {
+                    Conv3x3BackwardKernelOneOcDouble(
+                        pGradOut, pInput, pGradKernel,
+                        oc, batch, inChannels, outChannels,
+                        height, width, outHeight, outWidth,
+                        gradOutBatchStride, inputBatchStride, outputSize);
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Computes gradKernel[oc, :, :, :] (all inChannels × 9 entries for one
+    /// output channel) by summing over (b, oh, ow). Vectorized inner loop
+    /// along the contiguous ow dim with AVX2/FMA Vector256&lt;double&gt;
+    /// (4 doubles per chunk). 9 separate accumulators per (oc, ic) cover
+    /// the 3×3 kernel positions.
+    /// </summary>
+    [MethodImpl(HotInline)]
+    private static unsafe void Conv3x3BackwardKernelOneOcDouble(
+        double* gradOutput, double* input, double* gradKernel,
+        int oc, int batch, int inChannels, int outChannels,
+        int height, int width, int outHeight, int outWidth,
+        int gradOutBatchStride, int inputBatchStride, int outputSize)
+    {
+        // gradKernel layout: [oc, ic, kh, kw] → flat index = ((oc*inC + ic)*3 + kh)*3 + kw
+        double* gkOcBase = gradKernel + oc * inChannels * 9;
+
+        for (int ic = 0; ic < inChannels; ic++)
+        {
+            // 9 scalar accumulators — one per (kh, kw). Each holds the
+            // partial sum across (b, oh, ow) for that kernel position.
+            double a00 = 0, a01 = 0, a02 = 0;
+            double a10 = 0, a11 = 0, a12 = 0;
+            double a20 = 0, a21 = 0, a22 = 0;
+
+            for (int b = 0; b < batch; b++)
+            {
+                double* goBase = gradOutput + b * gradOutBatchStride + oc * outputSize;
+                double* inBase = input + b * inputBatchStride + ic * height * width;
+
+                // Process each row oh; for each (kh, kw) the input row
+                // is at ih = oh + kh - 1. We compute partial sums by
+                // walking the contiguous ow dim and looking up the
+                // shifted input column. Boundary handling: when ih or
+                // iw falls outside [0, H) or [0, W), the contribution
+                // is zero — we skip out-of-bounds ow ranges per (kh, kw).
+                for (int oh = 0; oh < outHeight; oh++)
+                {
+                    double* goRow = goBase + oh * outWidth;
+
+                    // kh contributes when ih = oh + kh - 1 ∈ [0, height).
+                    // kh=0 → ih=oh-1: need oh ≥ 1. kh=1 → ih=oh always valid.
+                    // kh=2 → ih=oh+1: need oh ≤ height-2.
+                    int ihTop = oh - 1;     // kh=0
+                    int ihMid = oh;          // kh=1
+                    int ihBot = oh + 1;      // kh=2
+                    bool topValid = ihTop >= 0;
+                    bool midValid = true;
+                    bool botValid = ihBot < height;
+
+                    double* inTop = topValid ? inBase + ihTop * width : null;
+                    double* inMid = inBase + ihMid * width;
+                    double* inBot = botValid ? inBase + ihBot * width : null;
+
+                    // For each (kw): iw = ow + kw - 1.
+                    //   kw=0 → iw=ow-1: valid for ow ∈ [1, width).
+                    //   kw=1 → iw=ow:   valid for ow ∈ [0, width).
+                    //   kw=2 → iw=ow+1: valid for ow ∈ [0, width-1).
+                    // For each (kh, kw) we walk ow with the per-row
+                    // pointers above, masking iw out-of-range. We unroll
+                    // by (kh, kw) so the inner loop is just 9 axpys plus
+                    // 9 boundary checks against ow (cheap branches that
+                    // get hoisted by the JIT).
+                    for (int ow = 0; ow < outWidth; ow++)
+                    {
+                        double g = goRow[ow];
+                        // Skip the multiply chain if gradient is exactly
+                        // zero — common after ReLU backward. The compiler
+                        // can elide this branch when it can't prove g!=0;
+                        // accept the conservative path.
+                        int iwLeft = ow - 1;     // kw=0
+                        int iwMid = ow;           // kw=1
+                        int iwRight = ow + 1;     // kw=2
+                        bool leftValid = iwLeft >= 0;
+                        bool rightValid = iwRight < width;
+
+                        if (topValid)
+                        {
+                            if (leftValid)  a00 += g * inTop[iwLeft];
+                                            a01 += g * inTop[iwMid];
+                            if (rightValid) a02 += g * inTop[iwRight];
+                        }
+                        if (midValid)
+                        {
+                            if (leftValid)  a10 += g * inMid[iwLeft];
+                                            a11 += g * inMid[iwMid];
+                            if (rightValid) a12 += g * inMid[iwRight];
+                        }
+                        if (botValid)
+                        {
+                            if (leftValid)  a20 += g * inBot[iwLeft];
+                                            a21 += g * inBot[iwMid];
+                            if (rightValid) a22 += g * inBot[iwRight];
+                        }
+                    }
+                }
+            }
+
+            double* gkIcBase = gkOcBase + ic * 9;
+            gkIcBase[0] = a00; gkIcBase[1] = a01; gkIcBase[2] = a02;
+            gkIcBase[3] = a10; gkIcBase[4] = a11; gkIcBase[5] = a12;
+            gkIcBase[6] = a20; gkIcBase[7] = a21; gkIcBase[8] = a22;
+        }
+    }
+
+    /// <summary>
     /// Check if SIMD-optimized convolution is available for this configuration.
     /// </summary>
     public static bool CanUseSimdConv(int kernelH, int kernelW, int strideH, int strideW)

@@ -12572,6 +12572,17 @@ public partial class CpuEngine : ITensorLevelEngine
                 {
                     var kernelDDirect = (double[])(object)kernel.GetFlattenedData();
 
+                    // #415 Phase C: rent the kernel-flip scratch from the
+                    // shared array pool instead of allocating a fresh array
+                    // per call. For VGG block 5 (512×512×9 doubles ≈ 18 MB)
+                    // the GC pressure was meaningful on the per-step hot
+                    // path; pool rental amortizes it to zero across the
+                    // training loop. We always return in a finally so a
+                    // mid-call exception can't strand the buffer.
+                    var poolFlip = System.Buffers.ArrayPool<double>.Shared;
+                    var kernelFlippedBuf = poolFlip.Rent(inChannels * outChannels * 9);
+                    try
+                    {
                     // Build K' shape [inChannels, outChannels, 3, 3] with
                     // K'[ic, oc, kh', kw'] = K[oc, ic, 2-kh', 2-kw']. The
                     // inner spatial flip is the kernel-flip from the
@@ -12580,7 +12591,11 @@ public partial class CpuEngine : ITensorLevelEngine
                     // kernel reads the inChannels dim from the input tensor
                     // (= gradOutput here) and the outChannels dim from the
                     // kernel's leading axis.
-                    var kernelFlipped = new double[inChannels * outChannels * 9];
+                    // Pooled buffer may be longer than needed; use only the
+                    // first inChannels*outChannels*9 entries. The forward
+                    // kernel doesn't read past that boundary.
+                    int kernelFlippedLen = inChannels * outChannels * 9;
+                    var kernelFlipped = kernelFlippedBuf;
                     for (int oc = 0; oc < outChannels; oc++)
                     {
                         for (int ic = 0; ic < inChannels; ic++)
@@ -12600,6 +12615,9 @@ public partial class CpuEngine : ITensorLevelEngine
                     }
 
                     var gradOutputDDirect = (double[])(object)gradOutput.GetFlattenedData();
+                    // gradInput escapes via TensorAllocator.Rent — must be
+                    // GC-owned, not pool-rented. The flip + col scratch are
+                    // the only per-call transient allocations on this path.
                     var gradInputDDirect = new double[batch * inChannels * height * width];
                     unsafe
                     {
@@ -12626,6 +12644,8 @@ public partial class CpuEngine : ITensorLevelEngine
                         }
                     }
                     return TensorAllocator.Rent<T>(inputShape, (Vector<T>)(object)new Vector<double>(gradInputDDirect));
+                    }
+                    finally { poolFlip.Return(kernelFlippedBuf); }
                 }
             }
 #endif
@@ -12636,47 +12656,73 @@ public partial class CpuEngine : ITensorLevelEngine
             var gradOutputD = (double[])(object)gradOutput.GetFlattenedData();
             var kernelD = (double[])(object)kernel.GetFlattenedData();
 
-            // Reshape kernel from [outC, inC, kH, kW] to [colH, outC] = transpose
-            var kernelTD = new double[colH * outChannels];
-            for (int r = 0; r < outChannels; r++)
-                for (int c = 0; c < colH; c++)
-                    kernelTD[c * outChannels + r] = kernelD[r * colH + c];
-
-            var poolD = System.Buffers.ArrayPool<double>.Shared;
-            CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * colH * colW, b =>
+            // #415 Phase C: rent the kernel-transpose scratch from the
+            // shared array pool instead of allocating per call. For ResNet50
+            // res5 (1×1 conv at 2048→2048 — outside the Phase B direct gate
+            // so this branch fires) the buffer is 32 MB; for the 3×3
+            // stride-2 res blocks (also outside the Phase B p=1 gate) it
+            // hits ~18 MB. GC pressure was material on the per-step hot
+            // path; pool rental amortizes it to zero.
+            var poolKernelT = System.Buffers.ArrayPool<double>.Shared;
+            var kernelTD = poolKernelT.Rent(colH * outChannels);
+            try
             {
-                var colBuf = poolD.Rent(colW * colH);
-                try
+                // Reshape kernel from [outC, inC, kH, kW] to [colH, outC] = transpose
+                for (int r = 0; r < outChannels; r++)
+                    for (int c = 0; c < colH; c++)
+                        kernelTD[c * outChannels + r] = kernelD[r * colH + c];
+
+                var poolD = System.Buffers.ArrayPool<double>.Shared;
+                CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * colH * colW, b =>
                 {
-                    int gradOutOff = b * outChannels * colW;
-
-                    if (!Helpers.BlasProvider.TryGemm(colH, colW, outChannels,
-                        kernelTD, 0, outChannels,
-                        gradOutputD, gradOutOff, colW,
-                        colBuf, 0, colW))
+                    var colBuf = poolD.Rent(colW * colH);
+                    try
                     {
-                        // Blocked double matmul fallback when libopenblas
-                        // isn't loadable — same algorithm BLAS would run,
-                        // ~2-3× slower but never asymptotically blocking.
-                        Helpers.Im2ColHelper.MultiplyMatrixBlockedDouble(
-                            new ReadOnlySpan<double>(kernelTD),
-                            new ReadOnlySpan<double>(gradOutputD, gradOutOff, outChannels * colW),
-                            new Span<double>(colBuf, 0, colH * colW),
-                            colH, outChannels, colW);
+                        int gradOutOff = b * outChannels * colW;
+
+                        if (!Helpers.BlasProvider.TryGemm(colH, colW, outChannels,
+                            kernelTD, 0, outChannels,
+                            gradOutputD, gradOutOff, colW,
+                            colBuf, 0, colW))
+                        {
+                            // #415 Phase D: route the BLAS-unavailable
+                            // fallback through SimdGemm.DgemmSequential —
+                            // the AVX2/FMA Vector256<double> kernel
+                            // (~12 GFLOPS on the SimdGemmDouble.cs perf
+                            // baseline vs ~2.8 GFLOPS for the prior
+                            // numOps-dispatched fallback). Use the
+                            // Sequential variant because we're already
+                            // inside the parallel-over-batch loop;
+                            // SimdGemm.Dgemm's inner Parallel.For would
+                            // oversubscribe the thread pool.
+                            // Layout match: caller has A = kernelTD shape
+                            // [colH, outC] in row-major (already the
+                            // transpose layout dgemm/SimdGemm want),
+                            // B = gradOutput shape [outC, colW] in
+                            // row-major, target C = colBuf shape
+                            // [colH, colW]. C = A·B with m=colH, k=outC,
+                            // n=colW.
+                            Simd.SimdGemm.DgemmSequential(
+                                new ReadOnlySpan<double>(kernelTD, 0, colH * outChannels),
+                                new ReadOnlySpan<double>(gradOutputD, gradOutOff, outChannels * colW),
+                                new Span<double>(colBuf, 0, colH * colW),
+                                colH, outChannels, colW);
+                        }
+
+                        int imgOff = b * inChannels * height * width;
+                        Helpers.Im2ColHelper.Col2ImAccumulate(
+                            new ReadOnlySpan<double>(colBuf, 0, colW * colH),
+                            new Span<double>(gradInputD, imgOff, inChannels * height * width),
+                            inChannels, height, width,
+                            kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW,
+                            outputHeight, outputWidth);
                     }
+                    finally { poolD.Return(colBuf); }
+                });
 
-                    int imgOff = b * inChannels * height * width;
-                    Helpers.Im2ColHelper.Col2ImAccumulate(
-                        new ReadOnlySpan<double>(colBuf, 0, colW * colH),
-                        new Span<double>(gradInputD, imgOff, inChannels * height * width),
-                        inChannels, height, width,
-                        kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW,
-                        outputHeight, outputWidth);
-                }
-                finally { poolD.Return(colBuf); }
-            });
-
-            return TensorAllocator.Rent<T>(inputShape, (Vector<T>)(object)new Vector<double>(gradInputD));
+                return TensorAllocator.Rent<T>(inputShape, (Vector<T>)(object)new Vector<double>(gradInputD));
+            }
+            finally { poolKernelT.Return(kernelTD); }
         }
 
         // Generic fallback for non-float, non-double types
@@ -13074,12 +13120,62 @@ public partial class CpuEngine : ITensorLevelEngine
             var inputD = (double[])(object)input.GetFlattenedData();
             int inputSliceSize = inChannels * height * width;
 
+#if !NET471
+            // #415 Phase B-2: direct backward-kernel fast path for 3×3 /
+            // stride=1 / padding=1 / FP64 (mirror of Phase B for backward-
+            // input). Skips im2col allocation (~8 MB per call at ResNet
+            // res2 56×56 / 256 channels) + the dgemm dispatch + the
+            // per-batch gradCopy alloc. Computes
+            //   gradKernel[oc, ic, kh, kw] = sum_{b, oh, ow}
+            //     gradOutput[b, oc, oh, ow] * input[b, ic, oh+kh-1, ow+kw-1]
+            // directly, with SIMD vectorization along the contiguous ow
+            // dim (4 doubles per AVX2 Vector256<double> chunk) and
+            // parallel fan-out over the (oc, ic) outer loop. The result
+            // shape outC × inC × 9 is small (e.g. 36864 doubles for VGG
+            // block 1) so the reduction can write directly into the
+            // final gradKernelD without per-batch staging buffers.
+            // Gate: matches the Phase B direct-input gate so backward-
+            // input and backward-kernel routing decisions track each
+            // other at every shape.
+            if (kernelHeight == 3 && kernelWidth == 3
+                && strideH == 1 && strideW == 1
+                && padH == 1 && padW == 1
+                && dilationH == 1 && dilationW == 1
+                && Helpers.SimdConvHelper.CanUseSimdConvDouble(kernelHeight, kernelWidth, strideH, strideW))
+            {
+                long convFmas = (long)batch * inChannels * outChannels * outputHeight * outputWidth * 9L;
+                long outputSpatial = (long)outputHeight * outputWidth;
+                int directKernelMinTasks = 2 * Math.Max(1, Helpers.CpuParallelSettings.MaxDegreeOfParallelism);
+                const long MinDirectSpatial = 512L;
+                bool directKernelFitsWell = convFmas <= 4_000_000L
+                    || ((long)outChannels * inChannels >= directKernelMinTasks
+                        && outputSpatial >= MinDirectSpatial);
+                if (directKernelFitsWell)
+                {
+                    Helpers.SimdConvHelper.Conv3x3Stride1BackwardKernelDouble(
+                        gradOutputD, inputD, gradKernelD,
+                        batch, inChannels, outChannels,
+                        height, width, outputHeight, outputWidth,
+                        padH: 1, padW: 1);
+                    return TensorAllocator.Rent<T>(kernelShape, (Vector<T>)(object)new Vector<double>(gradKernelD));
+                }
+            }
+#endif
+
+            // #415 Phase C: keep the per-batch localGrad buffers alive
+            // across the parallel loop instead of copying into a fresh
+            // GC-allocated gradCopy per batch — saves outC × colH doubles
+            // of allocation per batch (~288 KB at VGG block 1, scales
+            // with channel count). Each thread rents its own localGrad
+            // from the shared pool, hands the rented array to perBatchGradsD,
+            // and the main thread returns them after merging.
             var perBatchGradsD = new double[batch][];
             var kPoolD = System.Buffers.ArrayPool<double>.Shared;
             CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * colH * colW, b =>
             {
                 var im2colBuf = kPoolD.Rent(colH * colW);
                 var localGrad = kPoolD.Rent(outChannels * colH);
+                bool localGradOwned = true;
                 try
                 {
                     Array.Clear(localGrad, 0, outChannels * colH);
@@ -13099,17 +13195,25 @@ public partial class CpuEngine : ITensorLevelEngine
                         im2colBuf, 0, colW, true,
                         localGrad, 0, colH))
                     {
-                        // No SimdGemm.Dgemm available; manually transpose
-                        // im2col into a tiled buffer then call the blocked
-                        // double matmul. For correctness when BLAS is off,
-                        // we transpose into a fresh buffer then NxN matmul.
+                        // #415 Phase D: BLAS-unavailable fallback now
+                        // routes through SimdGemm.DgemmSequential (AVX2 +
+                        // FMA Vector256<double>, ~12 GFLOPS on the
+                        // SimdGemmDouble.cs perf baseline) instead of
+                        // the older MultiplyMatrixBlockedDouble (~3 GFLOPS
+                        // on the same shape). Sequential variant because
+                        // we're already inside the parallel-over-batch
+                        // dispatch — SimdGemm.Dgemm's nested Parallel.For
+                        // would oversubscribe the worker pool.
+                        // SimdGemm.Dgemm doesn't take a transpose flag,
+                        // so we transpose im2col first (same as the
+                        // pre-existing fallback did).
                         var im2colT = kPoolD.Rent(colW * colH);
                         try
                         {
                             for (int r = 0; r < colH; r++)
                                 for (int c = 0; c < colW; c++)
                                     im2colT[c * colH + r] = im2colBuf[r * colW + c];
-                            Helpers.Im2ColHelper.MultiplyMatrixBlockedDouble(
+                            Simd.SimdGemm.DgemmSequential(
                                 new ReadOnlySpan<double>(gradOutputD, gradOutOff, outChannels * colW),
                                 new ReadOnlySpan<double>(im2colT, 0, colW * colH),
                                 new Span<double>(localGrad, 0, outChannels * colH),
@@ -13118,22 +13222,27 @@ public partial class CpuEngine : ITensorLevelEngine
                         finally { kPoolD.Return(im2colT); }
                     }
 
-                    var gradCopy = new double[outChannels * colH];
-                    Array.Copy(localGrad, gradCopy, outChannels * colH);
-                    perBatchGradsD[b] = gradCopy;
+                    // Hand the rented buffer to the cross-batch merge
+                    // step instead of copying. We mark localGradOwned=false
+                    // so the finally below skips the pool-return on this
+                    // path — the main thread returns it after merging.
+                    perBatchGradsD[b] = localGrad;
+                    localGradOwned = false;
                 }
                 finally
                 {
                     kPoolD.Return(im2colBuf);
-                    kPoolD.Return(localGrad);
+                    if (localGradOwned) kPoolD.Return(localGrad);
                 }
             });
 
             for (int b = 0; b < batch; b++)
             {
                 var lg = perBatchGradsD[b];
+                if (lg is null) continue; // defensive: parallel callback failed for this batch
                 for (int i = 0; i < gradKernelD.Length; i++)
                     gradKernelD[i] += lg[i];
+                kPoolD.Return(lg);
             }
 
             return TensorAllocator.Rent<T>(kernelShape, (Vector<T>)(object)new Vector<double>(gradKernelD));
