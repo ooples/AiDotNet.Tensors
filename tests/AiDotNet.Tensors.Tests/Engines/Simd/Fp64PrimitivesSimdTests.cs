@@ -149,6 +149,64 @@ public class Fp64PrimitivesSimdTests
     }
 
     [Theory]
+    [InlineData(1, 16)]
+    [InlineData(1, 17)]
+    [InlineData(2, 64)]
+    [InlineData(4, 128)]
+    [InlineData(8, 768)]
+    [InlineData(2, 4096)]
+    public void LayerNorm_Forward_Double_Fused_Matches_Scalar_Reference(int batchSize, int featureSize)
+    {
+        var engine = new CpuEngine();
+        var rng = new System.Random(101);
+
+        var input = new Tensor<double>(new[] { batchSize, featureSize });
+        var gamma = new Tensor<double>(new[] { featureSize });
+        var beta = new Tensor<double>(new[] { featureSize });
+        for (int i = 0; i < input.Length; i++) input[i] = rng.NextDouble() - 0.5;
+        for (int i = 0; i < featureSize; i++)
+        {
+            gamma[i] = 0.5 + rng.NextDouble();
+            beta[i] = rng.NextDouble() - 0.5;
+        }
+        double epsilon = 1e-5;
+
+        var actual = engine.LayerNorm(input, gamma, beta, epsilon, out var actualMean, out var actualVar);
+
+        // Scalar Welford reference (single-pass, two-pass numerically
+        // identical for these shapes given the E[X²]−E[X]² approach the
+        // fused kernel uses).
+        for (int b = 0; b < batchSize; b++)
+        {
+            int off = b * featureSize;
+            double sum = 0;
+            for (int f = 0; f < featureSize; f++) sum += input[off + f];
+            double m = sum / featureSize;
+            double sumSq = 0;
+            for (int f = 0; f < featureSize; f++)
+            {
+                double d = input[off + f];
+                sumSq += d * d;
+            }
+            double v = sumSq / featureSize - m * m;
+            if (v < 0.0) v = 0.0;
+            double invStd = 1.0 / Math.Sqrt(v + epsilon);
+
+            Assert.True(Math.Abs(m - actualMean[b]) < 1e-12,
+                $"mean[{b}] expected={m:F14} actual={actualMean[b]:F14}");
+            Assert.True(Math.Abs(v - actualVar[b]) < 1e-12,
+                $"variance[{b}] expected={v:F14} actual={actualVar[b]:F14}");
+
+            for (int f = 0; f < featureSize; f++)
+            {
+                double expected = gamma[f] * ((input[off + f] - m) * invStd) + beta[f];
+                Assert.True(Math.Abs(expected - actual[off + f]) < 1e-10,
+                    $"out[{b},{f}] expected={expected:F12} actual={actual[off + f]:F12}");
+            }
+        }
+    }
+
+    [Theory]
     [InlineData(4)]
     [InlineData(7)]      // scalar tail
     [InlineData(16)]
