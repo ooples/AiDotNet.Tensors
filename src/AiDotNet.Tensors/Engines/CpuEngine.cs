@@ -17650,9 +17650,11 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 #endif
         // Double primitive fast path for last-axis softmax backward.
-        // Inline scalar arithmetic (no Vector256<double> kernel yet) but still
-        // ~4× the throughput of the generic INumericOperations<T> loop because
-        // it eliminates virtual-dispatch + Multiply/Add boxing on every element.
+        // Stage 4 (#415): Vector256<double> 4×-unrolled FMA — 16 doubles/iter
+        // for the dot-product reduction and the row write. Roughly mirrors
+        // SoftmaxBackwardFloat's structure with FP32→FP64 lane-count halved
+        // (4 doubles per Vector256, vs 8 floats). Falls through to scalar
+        // when AVX/FMA aren't available (net471 / non-x86).
         if (typeof(T) == typeof(double) && innerSize == 1
             && gradOutput.GetFlattenedData() is double[] gOutD
             && output.GetFlattenedData() is double[] outD)
@@ -17660,13 +17662,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var gInD = new double[outD.Length];
             bool useParallel = outerSize >= 4 && (long)outerSize * axisSize >= 32768;
             int axisSz = axisSize;
-            Action<int> rowKernel = row =>
-            {
-                int baseIdx = row * axisSz;
-                double dot = 0.0;
-                for (int i = 0; i < axisSz; i++) dot += gOutD[baseIdx + i] * outD[baseIdx + i];
-                for (int i = 0; i < axisSz; i++) gInD[baseIdx + i] = outD[baseIdx + i] * (gOutD[baseIdx + i] - dot);
-            };
+            Action<int> rowKernel = row => SoftmaxBackwardDoubleRow(gOutD, outD, gInD, row, axisSz);
             if (useParallel)
                 CpuParallelSettings.ParallelForOrSerial(0, outerSize, (long)outerSize * axisSize, rowKernel);
             else
@@ -17798,6 +17794,100 @@ public partial class CpuEngine : ITensorLevelEngine
             for (; i < axisSize; i++)
                 gi[i] = o[i] * (go[i] - dot);
         }
+    }
+
+    /// <summary>
+    /// Stage 4 (#415): Vector256&lt;double&gt; 4×-unrolled softmax-backward row
+    /// kernel. dot = Σ gradOut·output, then gradIn = output*(gradOut − dot).
+    /// 16 doubles per loop iter (4 × Vector256 lanes × 4-way unroll) to
+    /// keep both FMA ports busy. FP64 counterpart to
+    /// <see cref="SoftmaxBackwardFloatRow"/>. Falls back to scalar when
+    /// AVX/FMA aren't available.
+    /// </summary>
+    private static unsafe void SoftmaxBackwardDoubleRow(double[] gradOut, double[] output, double[] gradIn,
+        int row, int axisSize)
+    {
+        int baseIdx = row * axisSize;
+        fixed (double* pGO = gradOut, pO = output, pGI = gradIn)
+        {
+            double* go = pGO + baseIdx;
+            double* o = pO + baseIdx;
+            double* gi = pGI + baseIdx;
+
+            // Step 1: dot product = Σ gradOut[i] * output[i].
+            double dot = 0.0;
+            int i = 0;
+            if (System.Runtime.Intrinsics.X86.Fma.IsSupported && axisSize >= 16)
+            {
+                var vdot0 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var vdot1 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var vdot2 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var vdot3 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                int simdLen = axisSize & ~15;
+                for (; i < simdLen; i += 16)
+                {
+                    vdot0 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(
+                        System.Runtime.Intrinsics.X86.Avx.LoadVector256(go + i),
+                        System.Runtime.Intrinsics.X86.Avx.LoadVector256(o + i), vdot0);
+                    vdot1 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(
+                        System.Runtime.Intrinsics.X86.Avx.LoadVector256(go + i + 4),
+                        System.Runtime.Intrinsics.X86.Avx.LoadVector256(o + i + 4), vdot1);
+                    vdot2 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(
+                        System.Runtime.Intrinsics.X86.Avx.LoadVector256(go + i + 8),
+                        System.Runtime.Intrinsics.X86.Avx.LoadVector256(o + i + 8), vdot2);
+                    vdot3 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(
+                        System.Runtime.Intrinsics.X86.Avx.LoadVector256(go + i + 12),
+                        System.Runtime.Intrinsics.X86.Avx.LoadVector256(o + i + 12), vdot3);
+                }
+                vdot0 = System.Runtime.Intrinsics.X86.Avx.Add(
+                    System.Runtime.Intrinsics.X86.Avx.Add(vdot0, vdot1),
+                    System.Runtime.Intrinsics.X86.Avx.Add(vdot2, vdot3));
+                dot = HorizontalSumD(vdot0);
+            }
+            for (; i < axisSize; i++)
+                dot += go[i] * o[i];
+
+            // Step 2: gradIn[i] = output[i] * (gradOut[i] − dot).
+            i = 0;
+            if (System.Runtime.Intrinsics.X86.Avx.IsSupported && axisSize >= 16)
+            {
+                var vdot = System.Runtime.Intrinsics.Vector256.Create(dot);
+                int simdLen = axisSize & ~15;
+                for (; i < simdLen; i += 16)
+                {
+                    var go0 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(go + i);
+                    var go1 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(go + i + 4);
+                    var go2 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(go + i + 8);
+                    var go3 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(go + i + 12);
+                    var o0 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(o + i);
+                    var o1 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(o + i + 4);
+                    var o2 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(o + i + 8);
+                    var o3 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(o + i + 12);
+                    System.Runtime.Intrinsics.X86.Avx.Store(gi + i,
+                        System.Runtime.Intrinsics.X86.Avx.Multiply(o0, System.Runtime.Intrinsics.X86.Avx.Subtract(go0, vdot)));
+                    System.Runtime.Intrinsics.X86.Avx.Store(gi + i + 4,
+                        System.Runtime.Intrinsics.X86.Avx.Multiply(o1, System.Runtime.Intrinsics.X86.Avx.Subtract(go1, vdot)));
+                    System.Runtime.Intrinsics.X86.Avx.Store(gi + i + 8,
+                        System.Runtime.Intrinsics.X86.Avx.Multiply(o2, System.Runtime.Intrinsics.X86.Avx.Subtract(go2, vdot)));
+                    System.Runtime.Intrinsics.X86.Avx.Store(gi + i + 12,
+                        System.Runtime.Intrinsics.X86.Avx.Multiply(o3, System.Runtime.Intrinsics.X86.Avx.Subtract(go3, vdot)));
+                }
+            }
+            for (; i < axisSize; i++)
+                gi[i] = o[i] * (go[i] - dot);
+        }
+    }
+#endif
+
+#if !NET5_0_OR_GREATER
+    // Scalar fallback for non-x86 / net471 — keeps the dispatcher call valid.
+    private static void SoftmaxBackwardDoubleRow(double[] gradOut, double[] output, double[] gradIn,
+        int row, int axisSize)
+    {
+        int baseIdx = row * axisSize;
+        double dot = 0.0;
+        for (int i = 0; i < axisSize; i++) dot += gradOut[baseIdx + i] * output[baseIdx + i];
+        for (int i = 0; i < axisSize; i++) gradIn[baseIdx + i] = output[baseIdx + i] * (gradOut[baseIdx + i] - dot);
     }
 #endif
 
@@ -20701,45 +20791,18 @@ public partial class CpuEngine : ITensorLevelEngine
             double featureSizeD = fs;
             double invFeatureSizeD = 1.0 / featureSizeD;
 
-            for (int b = 0; b < batchSize; b++)
-            {
-                int off = b * fs;
-                double invStd = 1.0 / Math.Sqrt(dVar[b] + epsilon);
-                double m = dMean[b];
-                for (int f = 0; f < fs; f++)
-                {
-                    double go = dGradOut[off + f];
-                    double normalized = (dInput[off + f] - m) * invStd;
-                    dGradGamma[f] += go * normalized;
-                    dGradBeta[f] += go;
-                }
-            }
+            // Stage 4 (#415): Vector256<double> 4×-unrolled FMA paths for the
+            // three LN-backward passes (gradGamma/Beta accumulation, per-batch
+            // sum reduction, per-batch gradInput write). Mirrors the FP64 BN
+            // backward kernel structure at line ~19580; same 16 doubles/iter
+            // throughput target. Falls through to scalar on net471 / non-x86.
+            LayerNormBackwardDoubleAccumGammaBeta(
+                dGradOut, dInput, dMean, dVar, dGradGamma, dGradBeta,
+                batchSize, fs, epsilon);
 
-            void ProcessBatch(int b)
-            {
-                int off = b * fs;
-                double invStd = 1.0 / Math.Sqrt(dVar[b] + epsilon);
-                double m = dMean[b];
-
-                double sumGrad = 0.0;
-                double sumGradX = 0.0;
-                for (int f = 0; f < fs; f++)
-                {
-                    double scaledGrad = dGamma[f] * dGradOut[off + f];
-                    sumGrad += scaledGrad;
-                    sumGradX += scaledGrad * (dInput[off + f] - m);
-                }
-
-                double scale = invStd * invFeatureSizeD;
-                for (int f = 0; f < fs; f++)
-                {
-                    double normalized = (dInput[off + f] - m) * invStd;
-                    double gradNorm = dGamma[f] * dGradOut[off + f];
-                    double term1 = featureSizeD * gradNorm;
-                    double term3 = normalized * invStd * sumGradX;
-                    dGradInput[off + f] = scale * (term1 - sumGrad - term3);
-                }
-            }
+            void ProcessBatch(int b) => LayerNormBackwardDoubleRow(
+                dGradOut, dInput, dGamma, dMean, dVar, dGradInput,
+                b, fs, epsilon, invFeatureSizeD);
 
             if (batchSize * fs < 50_000)
             {
@@ -20804,6 +20867,261 @@ public partial class CpuEngine : ITensorLevelEngine
         gradGamma = gradGammaTensor;
         gradBeta = gradBetaTensor;
         return gradInputTensor;
+    }
+
+    /// <summary>
+    /// Stage 4 (#415): SIMD FP64 LayerNorm-backward gradGamma/gradBeta
+    /// accumulation. Pass 1 of 2 — sequential over batches (gradGamma/Beta
+    /// are shared per-feature accumulators), Vector256&lt;double&gt; 4×-unrolled
+    /// FMA on the inner feature loop. Mirrors the BN-backward kernel
+    /// structure at CpuEngine.cs:19580.
+    /// </summary>
+    private static unsafe void LayerNormBackwardDoubleAccumGammaBeta(
+        double[] gradOut, double[] input, double[] mean, double[] variance,
+        double[] gradGamma, double[] gradBeta,
+        int batchSize, int fs, double epsilon)
+    {
+#if NET5_0_OR_GREATER
+        if (System.Runtime.Intrinsics.X86.Fma.IsSupported && fs >= 16)
+        {
+            fixed (double* pGO = gradOut, pI = input, pGG = gradGamma, pGB = gradBeta)
+            {
+                for (int b = 0; b < batchSize; b++)
+                {
+                    int off = b * fs;
+                    double invStd = 1.0 / Math.Sqrt(variance[b] + epsilon);
+                    double m = mean[b];
+                    var vinvStd = System.Runtime.Intrinsics.Vector256.Create(invStd);
+                    var vmean = System.Runtime.Intrinsics.Vector256.Create(m);
+                    double* go = pGO + off;
+                    double* ip = pI + off;
+                    int f = 0;
+                    int simdLen = fs & ~15;
+                    for (; f < simdLen; f += 16)
+                    {
+                        // normalized = (x − m) · invStd, 4×Vector256 unrolled.
+                        var x0 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(ip + f);
+                        var x1 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(ip + f + 4);
+                        var x2 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(ip + f + 8);
+                        var x3 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(ip + f + 12);
+                        var d0 = System.Runtime.Intrinsics.X86.Avx.Subtract(x0, vmean);
+                        var d1 = System.Runtime.Intrinsics.X86.Avx.Subtract(x1, vmean);
+                        var d2 = System.Runtime.Intrinsics.X86.Avx.Subtract(x2, vmean);
+                        var d3 = System.Runtime.Intrinsics.X86.Avx.Subtract(x3, vmean);
+                        var n0 = System.Runtime.Intrinsics.X86.Avx.Multiply(d0, vinvStd);
+                        var n1 = System.Runtime.Intrinsics.X86.Avx.Multiply(d1, vinvStd);
+                        var n2 = System.Runtime.Intrinsics.X86.Avx.Multiply(d2, vinvStd);
+                        var n3 = System.Runtime.Intrinsics.X86.Avx.Multiply(d3, vinvStd);
+
+                        var g0 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(go + f);
+                        var g1 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(go + f + 4);
+                        var g2 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(go + f + 8);
+                        var g3 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(go + f + 12);
+
+                        // gradGamma[f] += go * normalized (FMA into existing accumulator).
+                        var gg0 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(g0, n0,
+                            System.Runtime.Intrinsics.X86.Avx.LoadVector256(pGG + f));
+                        var gg1 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(g1, n1,
+                            System.Runtime.Intrinsics.X86.Avx.LoadVector256(pGG + f + 4));
+                        var gg2 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(g2, n2,
+                            System.Runtime.Intrinsics.X86.Avx.LoadVector256(pGG + f + 8));
+                        var gg3 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(g3, n3,
+                            System.Runtime.Intrinsics.X86.Avx.LoadVector256(pGG + f + 12));
+                        System.Runtime.Intrinsics.X86.Avx.Store(pGG + f, gg0);
+                        System.Runtime.Intrinsics.X86.Avx.Store(pGG + f + 4, gg1);
+                        System.Runtime.Intrinsics.X86.Avx.Store(pGG + f + 8, gg2);
+                        System.Runtime.Intrinsics.X86.Avx.Store(pGG + f + 12, gg3);
+
+                        // gradBeta[f] += go.
+                        System.Runtime.Intrinsics.X86.Avx.Store(pGB + f,
+                            System.Runtime.Intrinsics.X86.Avx.Add(g0, System.Runtime.Intrinsics.X86.Avx.LoadVector256(pGB + f)));
+                        System.Runtime.Intrinsics.X86.Avx.Store(pGB + f + 4,
+                            System.Runtime.Intrinsics.X86.Avx.Add(g1, System.Runtime.Intrinsics.X86.Avx.LoadVector256(pGB + f + 4)));
+                        System.Runtime.Intrinsics.X86.Avx.Store(pGB + f + 8,
+                            System.Runtime.Intrinsics.X86.Avx.Add(g2, System.Runtime.Intrinsics.X86.Avx.LoadVector256(pGB + f + 8)));
+                        System.Runtime.Intrinsics.X86.Avx.Store(pGB + f + 12,
+                            System.Runtime.Intrinsics.X86.Avx.Add(g3, System.Runtime.Intrinsics.X86.Avx.LoadVector256(pGB + f + 12)));
+                    }
+                    for (; f < fs; f++)
+                    {
+                        double goS = go[f];
+                        double normalized = (ip[f] - m) * invStd;
+                        gradGamma[f] += goS * normalized;
+                        gradBeta[f] += goS;
+                    }
+                }
+            }
+            return;
+        }
+#endif
+        for (int b = 0; b < batchSize; b++)
+        {
+            int off = b * fs;
+            double invStd = 1.0 / Math.Sqrt(variance[b] + epsilon);
+            double m = mean[b];
+            for (int f = 0; f < fs; f++)
+            {
+                double go = gradOut[off + f];
+                double normalized = (input[off + f] - m) * invStd;
+                gradGamma[f] += go * normalized;
+                gradBeta[f] += go;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Stage 4 (#415): SIMD FP64 LayerNorm-backward per-batch gradInput
+    /// kernel. Two inner sub-passes (Σ γ·go and Σ γ·go·(x−m), then write)
+    /// each Vector256&lt;double&gt; 4×-unrolled. Algebraic rearrangement:
+    ///   gi[f] = invStd · γ · go − B − C · (x − m)
+    /// with B = invStd · sumGrad / fs and C = invStd² · sumGradX / fs.
+    /// </summary>
+    private static unsafe void LayerNormBackwardDoubleRow(
+        double[] gradOut, double[] input, double[] gamma,
+        double[] mean, double[] variance, double[] gradInput,
+        int b, int fs, double epsilon, double invFeatureSizeD)
+    {
+        int off = b * fs;
+        double invStd = 1.0 / Math.Sqrt(variance[b] + epsilon);
+        double m = mean[b];
+
+#if NET5_0_OR_GREATER
+        if (System.Runtime.Intrinsics.X86.Fma.IsSupported && fs >= 16)
+        {
+            fixed (double* pGO = gradOut, pI = input, pG = gamma, pGI = gradInput)
+            {
+                double* go = pGO + off;
+                double* ip = pI + off;
+                double* gi = pGI + off;
+                var vmean = System.Runtime.Intrinsics.Vector256.Create(m);
+
+                // Pass A: sumGrad = Σ γ·go, sumGradX = Σ γ·go·(x − m).
+                double sumGrad = 0.0;
+                double sumGradX = 0.0;
+                var vsg0 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var vsg1 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var vsg2 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var vsg3 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var vsgx0 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var vsgx1 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var vsgx2 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var vsgx3 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                int f = 0;
+                int simdLen = fs & ~15;
+                for (; f < simdLen; f += 16)
+                {
+                    var g0 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(pG + f);
+                    var g1 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(pG + f + 4);
+                    var g2 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(pG + f + 8);
+                    var g3 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(pG + f + 12);
+                    var go0 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(go + f);
+                    var go1 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(go + f + 4);
+                    var go2 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(go + f + 8);
+                    var go3 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(go + f + 12);
+                    var sg0 = System.Runtime.Intrinsics.X86.Avx.Multiply(g0, go0);
+                    var sg1 = System.Runtime.Intrinsics.X86.Avx.Multiply(g1, go1);
+                    var sg2 = System.Runtime.Intrinsics.X86.Avx.Multiply(g2, go2);
+                    var sg3 = System.Runtime.Intrinsics.X86.Avx.Multiply(g3, go3);
+                    var d0 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(ip + f), vmean);
+                    var d1 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(ip + f + 4), vmean);
+                    var d2 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(ip + f + 8), vmean);
+                    var d3 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(ip + f + 12), vmean);
+                    vsg0 = System.Runtime.Intrinsics.X86.Avx.Add(vsg0, sg0);
+                    vsg1 = System.Runtime.Intrinsics.X86.Avx.Add(vsg1, sg1);
+                    vsg2 = System.Runtime.Intrinsics.X86.Avx.Add(vsg2, sg2);
+                    vsg3 = System.Runtime.Intrinsics.X86.Avx.Add(vsg3, sg3);
+                    vsgx0 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(sg0, d0, vsgx0);
+                    vsgx1 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(sg1, d1, vsgx1);
+                    vsgx2 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(sg2, d2, vsgx2);
+                    vsgx3 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(sg3, d3, vsgx3);
+                }
+                for (; f < fs; f++)
+                {
+                    double sg = gamma[f] * go[f];
+                    sumGrad += sg;
+                    sumGradX += sg * (ip[f] - m);
+                }
+                vsg0 = System.Runtime.Intrinsics.X86.Avx.Add(
+                    System.Runtime.Intrinsics.X86.Avx.Add(vsg0, vsg1),
+                    System.Runtime.Intrinsics.X86.Avx.Add(vsg2, vsg3));
+                sumGrad += HorizontalSumD(vsg0);
+                vsgx0 = System.Runtime.Intrinsics.X86.Avx.Add(
+                    System.Runtime.Intrinsics.X86.Avx.Add(vsgx0, vsgx1),
+                    System.Runtime.Intrinsics.X86.Avx.Add(vsgx2, vsgx3));
+                sumGradX += HorizontalSumD(vsgx0);
+
+                // Pass B: gradInput[f] = invStd·γ·go − B − C·(x − m), where
+                // B = invStd·sumGrad/fs and C = invStd³·sumGradX/fs. The
+                // invStd³ factor is the rearranged form of
+                // scale·normalized·invStd·sumGradX = (invStd/fs)·((x−m)·invStd)·invStd·sumGradX.
+                double termB = invStd * sumGrad * invFeatureSizeD;
+                double termC = invStd * invStd * invStd * sumGradX * invFeatureSizeD;
+                var vinvStd = System.Runtime.Intrinsics.Vector256.Create(invStd);
+                var vtermB = System.Runtime.Intrinsics.Vector256.Create(termB);
+                var vtermC = System.Runtime.Intrinsics.Vector256.Create(termC);
+                f = 0;
+                for (; f < simdLen; f += 16)
+                {
+                    var g0 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(pG + f);
+                    var g1 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(pG + f + 4);
+                    var g2 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(pG + f + 8);
+                    var g3 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(pG + f + 12);
+                    var go0 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(go + f);
+                    var go1 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(go + f + 4);
+                    var go2 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(go + f + 8);
+                    var go3 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(go + f + 12);
+                    var d0 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(ip + f), vmean);
+                    var d1 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(ip + f + 4), vmean);
+                    var d2 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(ip + f + 8), vmean);
+                    var d3 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(ip + f + 12), vmean);
+                    // term1 = invStd · γ · go.
+                    var t1_0 = System.Runtime.Intrinsics.X86.Avx.Multiply(System.Runtime.Intrinsics.X86.Avx.Multiply(g0, go0), vinvStd);
+                    var t1_1 = System.Runtime.Intrinsics.X86.Avx.Multiply(System.Runtime.Intrinsics.X86.Avx.Multiply(g1, go1), vinvStd);
+                    var t1_2 = System.Runtime.Intrinsics.X86.Avx.Multiply(System.Runtime.Intrinsics.X86.Avx.Multiply(g2, go2), vinvStd);
+                    var t1_3 = System.Runtime.Intrinsics.X86.Avx.Multiply(System.Runtime.Intrinsics.X86.Avx.Multiply(g3, go3), vinvStd);
+                    // tmp = term1 − termB.
+                    var tmp0 = System.Runtime.Intrinsics.X86.Avx.Subtract(t1_0, vtermB);
+                    var tmp1 = System.Runtime.Intrinsics.X86.Avx.Subtract(t1_1, vtermB);
+                    var tmp2 = System.Runtime.Intrinsics.X86.Avx.Subtract(t1_2, vtermB);
+                    var tmp3 = System.Runtime.Intrinsics.X86.Avx.Subtract(t1_3, vtermB);
+                    // gi = tmp − termC·(x−m) = FNMA(termC, diff, tmp).
+                    System.Runtime.Intrinsics.X86.Avx.Store(gi + f,
+                        System.Runtime.Intrinsics.X86.Fma.MultiplyAddNegated(d0, vtermC, tmp0));
+                    System.Runtime.Intrinsics.X86.Avx.Store(gi + f + 4,
+                        System.Runtime.Intrinsics.X86.Fma.MultiplyAddNegated(d1, vtermC, tmp1));
+                    System.Runtime.Intrinsics.X86.Avx.Store(gi + f + 8,
+                        System.Runtime.Intrinsics.X86.Fma.MultiplyAddNegated(d2, vtermC, tmp2));
+                    System.Runtime.Intrinsics.X86.Avx.Store(gi + f + 12,
+                        System.Runtime.Intrinsics.X86.Fma.MultiplyAddNegated(d3, vtermC, tmp3));
+                }
+                for (; f < fs; f++)
+                {
+                    double diff = ip[f] - m;
+                    gi[f] = invStd * gamma[f] * go[f] - termB - termC * diff;
+                }
+            }
+            return;
+        }
+#endif
+        // Scalar fallback (net471 / non-x86).
+        double sumGrad_s = 0.0;
+        double sumGradX_s = 0.0;
+        for (int f = 0; f < fs; f++)
+        {
+            double scaledGrad = gamma[f] * gradOut[off + f];
+            sumGrad_s += scaledGrad;
+            sumGradX_s += scaledGrad * (input[off + f] - m);
+        }
+        double scale = invStd * invFeatureSizeD;
+        double featureSizeD2 = fs;
+        for (int f = 0; f < fs; f++)
+        {
+            double normalized = (input[off + f] - m) * invStd;
+            double gradNorm = gamma[f] * gradOut[off + f];
+            double term1 = featureSizeD2 * gradNorm;
+            double term3 = normalized * invStd * sumGradX_s;
+            gradInput[off + f] = scale * (term1 - sumGrad_s - term3);
+        }
     }
 
     /// <inheritdoc/>
@@ -34634,6 +34952,19 @@ public partial class CpuEngine : ITensorLevelEngine
             float* pI = (float*)pinI.Pointer;
             float* pR = (float*)pinR.Pointer;
             SimdKernels.GeluBackwardUnsafe(pG, pI, pR, length);
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            // Stage 4 (#415): SIMD FP64 path — Vector256<double> with
+            // FastExpDouble256-based tanh. Same accuracy envelope as the
+            // forward GELU SIMD kernel.
+            var gArr = (double[])(object)gradOutput.GetDataArray();
+            var iArr = (double[])(object)input.GetDataArray();
+            var rArr = (double[])(object)resultTensor.GetDataArray();
+            fixed (double* pG = gArr, pI = iArr, pR = rArr)
+            {
+                SimdKernels.GeluBackwardDouble(pG, pI, pR, length);
+            }
         }
         else
         {
