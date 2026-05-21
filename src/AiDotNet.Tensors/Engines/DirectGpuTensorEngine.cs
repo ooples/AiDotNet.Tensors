@@ -13236,35 +13236,21 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorPermute<T>(Tensor<T> tensor, int[] axes)
     {
-        // Previously routed through CpuEngine because the CUDA Permute
-        // kernel "is off for non-trivial axes mixes". Root cause for the
-        // 2×D permute fast path was the transpose_2d launch bug above
-        // (CudaBackend.Permute delegates rank-2 permutation [1,0] to
-        // Transpose, and rank-3 [0,2,1] to BatchedTranspose). The
-        // permute_general kernel formula itself is correct
-        // (see verification in CudaNeuralNetKernels.permute_general).
-        // Routing back to GPU now that the underlying transpose dispatch
-        // is fixed.
-        if (IsTapeActive<T>())
-            return base.TensorPermute(tensor, axes);
-        if (!TryGetBackend(out var backend))
-            return base.TensorPermute(tensor, axes);
-
-        try
-        {
-            using var bufIn = GetOrAllocateBuffer(backend, tensor.GetDataArray());
-            var bufOut = AllocateOutputBuffer(backend, tensor.Length);
-            backend.Permute(bufIn.Buffer, bufOut.Buffer, tensor.Shape._dims, axes);
-            var result = FinishGpuOp<T>(backend, bufOut, tensor.Length);
-            int[] outShape = new int[axes.Length];
-            for (int i = 0; i < axes.Length; i++)
-                outShape[i] = tensor.Shape._dims[axes[i]];
-            return new Tensor<T>(result, outShape);
-        }
-        catch (Exception)
-        {
-            return base.TensorPermute(tensor, axes);
-        }
+        // Permute is a view operation by contract — `tensor.Transpose(axes)`
+        // returns a strided view with permuted strides and zero data move.
+        // The GPU path here used to eagerly materialise into a new
+        // contiguous buffer via `backend.Permute(...)`, which violated the
+        // view contract: callers got back IsContiguous == true after a
+        // permute (TensorCopyToTests.StridedAfterPermute_*,
+        // StridedAfterTranspose_*, FloatTensor_CopyTo_WorksSymmetrically
+        // all asserted IsContiguous == false). Worse, it wasted a host→device→
+        // permute→device→host round-trip every time even though the result
+        // was indistinguishable from a metadata-only stride permute.
+        //
+        // Delegate to the CPU/base path which returns the strided view.
+        // Downstream GPU ops that genuinely need contiguous layout call
+        // `.Contiguous()` themselves at the point they need it.
+        return base.TensorPermute(tensor, axes);
     }
 
     /// <inheritdoc/>
