@@ -44,7 +44,18 @@ public class FlashAttentionDoubleHangIssue411Test
         _output = output;
     }
 
-    [Fact(Timeout = 30_000)]
+    // Test envelope (Timeout=90_000): catastrophic-hang detector. The
+    // original #411 regression was a >600 s process hang under OpenBLAS
+    // thread oversubscription; the 90 s xUnit timeout still trips on
+    // anything close to that magnitude while giving the per-call
+    // assertion (5 s) room to be the real regression signal on the
+    // CI-runner-variance + code-coverage-instrumentation slowdown that
+    // pushed the originally-chosen 30 s envelope into false-positive
+    // territory on Linux runners (locally on Windows 32-core: ~35 ms
+    // per call; on a 4-core Ubuntu CI runner with coverage active:
+    // ~3-4 s per call with the SimdGemm.DgemmSequential bypass from
+    // PR #426 c332c6df).
+    [Fact(Timeout = 90_000)]
     public async Task FlashAttentionDouble_SdUnetShape_CompletesUnderBudget()
     {
         // xUnit Fact(Timeout=...) needs an async signature so the runner can

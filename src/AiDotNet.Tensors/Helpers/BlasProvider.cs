@@ -87,66 +87,31 @@ internal static class BlasProvider
     [DllImport("libopenblas", EntryPoint = "openblas_set_num_threads", CallingConvention = CallingConvention.Cdecl)]
     private static extern void openblas_set_num_threads_native(int num_threads);
 
-    // Issue #411 CI follow-up: on Linux, OpenBLAS is often built against
-    // libgomp (OpenMP threading) rather than its own pthread pool. With
-    // OpenMP-threaded OpenBLAS, `openblas_set_num_threads` is a no-op —
-    // parallelism inside DGEMM is controlled by libgomp's
-    // `omp_set_num_threads`. Without ALSO calling that, the
-    // ScopeOpenBlasThreads(1) wrapper inside FlashAttentionDouble doesn't
-    // actually limit the inner GEMM's thread count, the outer
-    // parallel-for-over-heads still oversubscribes, and the test that
-    // measures the hang regression times out at 30s on CI Linux.
-    //
-    // P/Invoke probes libgomp once at startup; if missing (Windows, or
-    // OpenBLAS built without OpenMP) the calls become no-ops and the
-    // existing openblas_set_num_threads path stays the only mechanism.
-    [DllImport("libgomp.so.1", EntryPoint = "omp_set_num_threads", CallingConvention = CallingConvention.Cdecl)]
-    private static extern void omp_set_num_threads_gomp(int n);
-
-    private static readonly Lazy<bool> _gompAvailable = new(ProbeGompLibrary);
-
-    private static bool ProbeGompLibrary()
-    {
-        // Windows / OSX / OpenBLAS-pthread builds: libgomp.so.1 isn't present,
-        // P/Invoke throws DllNotFoundException on first call. Tolerate it —
-        // openblas_set_num_threads is the only control mechanism in that case.
-        try
-        {
-            omp_set_num_threads_gomp(omp_get_max_threads_gomp());
-            return true;
-        }
-        catch (DllNotFoundException) { return false; }
-        catch (EntryPointNotFoundException) { return false; }
-        catch (BadImageFormatException) { return false; }
-    }
-
-    [DllImport("libgomp.so.1", EntryPoint = "omp_get_max_threads", CallingConvention = CallingConvention.Cdecl)]
-    private static extern int omp_get_max_threads_gomp();
-
     private static int _openblasThreadCount = -1; // -1 = unset
 
     /// <summary>
     /// Sets the OpenBLAS internal thread count. Pass 1 to force deterministic
     /// single-threaded GEMM. Caller must verify <see cref="HasNativeDgemm"/>
     /// is true before calling, otherwise the P/Invoke will throw.
-    /// <para>
-    /// Issue #411 CI follow-up: also calls <c>omp_set_num_threads</c> via
-    /// libgomp when available so OpenMP-threaded OpenBLAS builds (the
-    /// default on Ubuntu / most Linux distros) actually honour the cap.
-    /// </para>
     /// </summary>
+    /// <remarks>
+    /// Issue #411 CI history: an earlier libgomp probe variant also called
+    /// <c>omp_set_num_threads(n)</c> via <c>libgomp.so.1</c> to cover
+    /// OpenMP-threaded OpenBLAS builds. That extra call was removed because
+    /// it set the OpenMP thread count PROCESS-WIDE, which caused
+    /// cross-test interference on xUnit-parallel CI runs (other tests
+    /// using OpenMP-backed libraries inherited the cap and starved their
+    /// parallel work). Since <see cref="Engines.CpuEngine.FlashAttentionDouble"/>
+    /// now bypasses BLAS entirely (using <see cref="Simd.SimdGemm.DgemmSequential"/>
+    /// directly), the libgomp guard is no longer load-bearing for the
+    /// originally-targeted #411 regression test.
+    /// </remarks>
     internal static void TrySetOpenBlasThreads(int n)
     {
         if (!_nativeAvailable.Value) return;
         if (_openblasThreadCount == n) return;
         try { openblas_set_num_threads_native(n); _openblasThreadCount = n; }
         catch { /* libopenblas symbol missing — earlier OpenBLAS builds may lack it. Tolerate. */ }
-
-        if (_gompAvailable.Value)
-        {
-            try { omp_set_num_threads_gomp(n); }
-            catch { /* shouldn't happen after probe success; tolerate to be safe. */ }
-        }
     }
 
     /// <summary>
