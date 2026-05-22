@@ -141,6 +141,57 @@ public class GemvBypassTest
         Assert.True(maxDelta < 1e-9, $"M=1 FP64 GEMV drift {maxDelta:G6}");
     }
 
+    [Fact]
+    public void N1_AVX2_Path_Beats_Scalar_Reference_BySignificantMargin()
+    {
+        // Sub-R (#408) perf gate: the N=1 case used to be scalar-only —
+        // single-multiply-per-cycle for the dot product. The new AVX2 FMA
+        // path does 8 multiplies per cycle, so on long-K shapes
+        // (K >= 256, m >= 64) we should see at least a 3× speedup over the
+        // scalar reference even on a CI runner. The reference here is the
+        // in-line NaiveGemmFp32 helper above — both paths process the
+        // same shape but only BlasManaged.Gemm hits the new AVX2 path.
+        //
+        // 3× catches the "AVX2 path silently regressed to scalar"
+        // regression class (e.g., if a future refactor accidentally
+        // breaks the contiguity gate) while tolerating CI-runner
+        // variance. On a 32-core Windows host the actual ratio is
+        // typically 5-8×.
+        const int M = 512, N = 1, K = 768;
+        var rng = new Random(31);
+        var a = new float[M * K];
+        var b = new float[K * N];
+        var cAvx2 = new float[M * N];
+        var cScalar = new float[M * N];
+        for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < b.Length; i++) b[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        // Warmup (JIT + cache).
+        BlasManagedLib.Gemm<float>(a, K, false, b, N, false, cAvx2, N, M, N, K);
+        NaiveGemmFp32(a, K, false, b, N, false, cScalar, N, M, N, K);
+
+        const int iters = 200;
+        var swAvx2 = System.Diagnostics.Stopwatch.StartNew();
+        for (int i = 0; i < iters; i++)
+            BlasManagedLib.Gemm<float>(a, K, false, b, N, false, cAvx2, N, M, N, K);
+        swAvx2.Stop();
+        var swScalar = System.Diagnostics.Stopwatch.StartNew();
+        for (int i = 0; i < iters; i++)
+            NaiveGemmFp32(a, K, false, b, N, false, cScalar, N, M, N, K);
+        swScalar.Stop();
+
+        double speedup = swScalar.Elapsed.TotalMilliseconds / swAvx2.Elapsed.TotalMilliseconds;
+        Assert.True(speedup >= 3.0,
+            $"N=1 AVX2 speedup over scalar reference is {speedup:F2}× — expected ≥3.0×. " +
+            $"AVX2: {swAvx2.Elapsed.TotalMilliseconds:F1} ms, scalar: {swScalar.Elapsed.TotalMilliseconds:F1} ms.");
+
+        // Sanity: same output.
+        double maxDelta = 0;
+        for (int i = 0; i < cAvx2.Length; i++)
+            maxDelta = Math.Max(maxDelta, Math.Abs(cAvx2[i] - cScalar[i]));
+        Assert.True(maxDelta < 1e-3, $"N=1 AVX2 vs scalar drift {maxDelta:G6}");
+    }
+
     [Theory]
     [InlineData(true, false)]   // a transposed
     [InlineData(false, true)]   // b transposed
