@@ -452,18 +452,22 @@ public static class BlasManaged
         // index by (ic/Mc, pc/Kc) at runtime via the new MultiPanelStride
         // metadata on the handle.
         //
-        // Tile dimensions match the autotuner's FallbackToHeuristic defaults
-        // (Mc = Kc = 64) so the strategy naturally consumes the pre-pack on
-        // shapes the autotuner hasn't trained yet. The Gemm dispatch also
-        // honors handle dims via an override (search "TileMc" in BlasManaged.cs)
-        // so larger pre-pack tiles still work — they just override autotune.
-        int mc = 64;
-        int kc = 64;
-        // Round mc UP to a multiple of mr — same rationale as PrePackB below.
-        // Pre-fix the second `if (mc > m) mc = m;` line clamped mc back DOWN
-        // to m, defeating the alignment intent and causing OOB writes in
-        // ScalarPack.PackA / Avx2Pack.PackA on shapes with m < mr (e.g., the
-        // ExecuteIntoTests m=2 mr=4 matmul plan).
+        // Tile dimensions MUST match the autotuner's FallbackToHeuristic
+        // defaults so the override at BlasManaged.Gemm (search "TileMc") sees
+        // the same (Mc, Kc) the live-pack path would have used — otherwise
+        // pre-pack forces a smaller block size on the consume path, multiplying
+        // the inner-loop iteration count and producing a NET SLOWDOWN. Sub-Q
+        // (#407) upgraded the autotune defaults to BLIS-style (128, 512, 256);
+        // PrePackA's contract is "give the consume path identical tiling to
+        // what live-pack would have produced" so we mirror those defaults.
+        int mc = Math.Min(128, m);
+        int kc = Math.Min(256, k);
+        // Round mc UP to a multiple of mr (microkernel row tile height) so the
+        // packed-byte layout matches what ScalarPack.PackA / Avx2Pack.PackA
+        // expects. The clamp-back-down here also handles the edge case of
+        // m < mr (e.g., the ExecuteIntoTests m=2 mr=4 matmul plan) where the
+        // intent is one zero-padded stripe.
+        if (mc < m && (mc % mr) != 0) mc = ((mc + mr - 1) / mr) * mr;
         if (mc > m) mc = ((m + mr - 1) / mr) * mr;
         if (kc > k) kc = k;
         if (mc <= 0)
@@ -564,10 +568,16 @@ public static class BlasManaged
         var (_, nr) = PickMicrokernelTile<T>();
 
         // Sub-E (#373): multi-panel pre-pack — see PrePackA above. Tile sizes
-        // match the autotuner heuristic defaults (Nc = Kc = 64) for natural
-        // consume on un-trained shapes.
-        int nc = 64;
-        int kc = 64;
+        // MUST match the autotuner's FallbackToHeuristic defaults (Sub-Q #407
+        // upgraded these to BLIS-style Nc=512, Kc=256). The consume-path
+        // override at BlasManaged.Gemm (search "TileMc") replaces the
+        // autotune-picked Nc/Kc with the handle's TileMc/TileKc — so any
+        // mismatch forces a smaller block size and hurts the GEMM (regression
+        // was 0.35× speedup on FFN_128×768×768: pre-pack forced 64×64 tiles
+        // = 6× more inner-loop iterations + far worse cache reuse than the
+        // 512×256 live-pack baseline).
+        int nc = Math.Min(512, n);
+        int kc = Math.Min(256, k);
         // Round nc UP to a multiple of nr (microkernel column tile width) — the
         // packed-buffer layout in ScalarPack.PackB / Avx2Pack.PackB always
         // writes ceil(nc / nr) * nr columns per Kc row, zero-padding the tail
@@ -577,6 +587,7 @@ public static class BlasManaged
         // zero-padded stripe), producing an IndexOutOfRangeException in the
         // packed-buffer span. Keep nc aligned UP and let effectiveNc bound the
         // logical read range in the per-tile inner loop.
+        if (nc < n && (nc % nr) != 0) nc = ((nc + nr - 1) / nr) * nr;
         if (nc > n) nc = ((n + nr - 1) / nr) * nr;
         if (kc > k) kc = k;
         if (nc <= 0)
