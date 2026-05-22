@@ -1,4 +1,5 @@
 using System;
+using System.Buffers;
 using System.Runtime.CompilerServices;
 using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Engines.Simd;
@@ -106,17 +107,243 @@ public partial class CpuEngine
                 "Call it outside an active graph-mode scope, or route training through the " +
                 "decomposed LSTMLayer.Forward path.");
 
-        // Pre-compute Wx = input @ wIh^T + bIh for ALL timesteps as one big
-        // GEMM. input is [B, seq, in] -> reshape to [B*seq, in]; wIh is
-        // [4H, in]. TensorMatMulTransposed handles transB=true natively via
-        // SimdGemm.Sgemm (float fast path), so this is a single dispatch
-        // instead of (seq) dispatches.
+        // Float fast path: SimdGemm + vectorized sigmoid/tanh + ArrayPool
+        // scratch buffers reused across timesteps. This is the path that
+        // closes the AIsEval LSTM gap on CPU. Generic-T path below stays
+        // for double / decimal / BigInteger / custom numerics.
+        if (typeof(T) == typeof(float))
+            return (Tensor<T>)(object)LstmSequenceForwardFloat(
+                (Tensor<float>)(object)input,
+                (Tensor<float>?)(object?)h0,
+                (Tensor<float>?)(object?)c0,
+                (Tensor<float>)(object)wIh,
+                (Tensor<float>)(object)wHh,
+                (Tensor<float>?)(object?)bIh,
+                (Tensor<float>?)(object?)bHh,
+                batch, seqLen, inFeatures, hidden, gateRows, returnSequences);
+
+        return LstmSequenceForwardGeneric(
+            input, h0, c0, wIh, wHh, bIh, bHh,
+            batch, seqLen, inFeatures, hidden, gateRows, returnSequences);
+    }
+
+    /// <summary>
+    /// Float32 fast path. Uses <see cref="SimdGemm.Sgemm"/> for both the
+    /// big <c>Wx</c> pre-compute and the per-step recurrent GEMM, with
+    /// vectorized <see cref="SimdKernels.SigmoidUnsafe(float*, float*, int)"/>
+    /// and <see cref="SimdKernels.TanhUnsafe(float*, float*, int)"/> for the
+    /// gate activations. All inter-timestep scratch is held in pooled arrays
+    /// (one alloc up front from <see cref="ArrayPool{T}"/>) so the per-step
+    /// loop is allocation-free.
+    /// </summary>
+    private unsafe Tensor<float> LstmSequenceForwardFloat(
+        Tensor<float> input,
+        Tensor<float>? h0,
+        Tensor<float>? c0,
+        Tensor<float> wIh,
+        Tensor<float> wHh,
+        Tensor<float>? bIh,
+        Tensor<float>? bHh,
+        int batch, int seqLen, int inFeatures, int hidden, int gateRows,
+        bool returnSequences)
+    {
+        // Pre-compute Wx = input @ wIh^T as one big GEMM via SimdGemm.
+        // input is [B, seq, in] — treat as [B*seq, in] row-major.
+        // wIh is [4H, in] — we want input @ wIh^T which is [B*seq, 4H].
+        // Avoid the Tensor<T> dispatch path for the contiguous fast case;
+        // call SimdGemm directly using transB=true.
+        int totalRows = batch * seqLen;
+        var pool = ArrayPool<float>.Shared;
+
+        var wxBuf = pool.Rent(totalRows * gateRows);
+        var hCurrBuf = pool.Rent(batch * hidden);
+        var cCurrBuf = pool.Rent(batch * hidden);
+        var hPrevBuf = pool.Rent(batch * hidden);
+        var cPrevBuf = pool.Rent(batch * hidden);
+        var hhBuf = pool.Rent(batch * gateRows);     // h_prev @ wHh^T scratch
+        var gateBuf = pool.Rent(batch * gateRows);   // gates pre-activation
+
+        // Output buffer comes from AutoTensorCache so we don't pay an allocation.
+        var output = returnSequences
+            ? AutoTensorCache.RentOrAllocate<float>(new[] { batch, seqLen, hidden })
+            : AutoTensorCache.RentOrAllocate<float>(new[] { batch, hidden });
+
+        try
+        {
+            // Wx = input @ wIh^T using SimdGemm with transB=true.
+            // input rows = totalRows, K = inFeatures, wIh rows = gateRows, ldb = inFeatures.
+            SimdGemm.Sgemm(
+                input.AsSpan(), inFeatures, false,
+                wIh.AsSpan(), inFeatures, true,
+                wxBuf.AsSpan(0, totalRows * gateRows),
+                totalRows, inFeatures, gateRows);
+
+            // Fold bIh into Wx (broadcast add) — SIMD-friendly contiguous loop.
+            if (bIh is not null)
+            {
+                var bIhArr = bIh.AsSpan();
+                for (int r = 0; r < totalRows; r++)
+                {
+                    int off = r * gateRows;
+                    for (int g = 0; g < gateRows; g++)
+                        wxBuf[off + g] += bIhArr[g];
+                }
+            }
+
+            // Initial states.
+            if (h0 is null) Array.Clear(hPrevBuf, 0, batch * hidden);
+            else h0.AsSpan().Slice(0, batch * hidden).CopyTo(hPrevBuf.AsSpan(0, batch * hidden));
+            if (c0 is null) Array.Clear(cPrevBuf, 0, batch * hidden);
+            else c0.AsSpan().Slice(0, batch * hidden).CopyTo(cPrevBuf.AsSpan(0, batch * hidden));
+
+            var wHhSpan = wHh.AsSpan();
+            bool hasBhh = bHh is not null;
+            ReadOnlySpan<float> bHhSpan = hasBhh ? bHh!.AsSpan() : default;
+            var outSpan = output.AsWritableSpan();
+
+            // Per-timestep loop.
+            for (int t = 0; t < seqLen; t++)
+            {
+                // hh = h_prev @ wHh^T — one GEMM per step via SimdGemm,
+                // shape [B, gateRows] = [B, hidden] @ [hidden, gateRows].
+                // wHh stored as [gateRows, hidden] so transB=true gives
+                // [B, gateRows] with K=hidden.
+                SimdGemm.Sgemm(
+                    hPrevBuf.AsSpan(0, batch * hidden), hidden, false,
+                    wHhSpan, hidden, true,
+                    hhBuf.AsSpan(0, batch * gateRows),
+                    batch, hidden, gateRows);
+
+                // Combine: gateBuf[b, g] = Wx[b*seq+t, g] + hh[b, g] + bHh[g]
+                // Lay this out so the next pass (sigmoid/tanh) is contiguous.
+                for (int b = 0; b < batch; b++)
+                {
+                    int wxRowOff = (b * seqLen + t) * gateRows;
+                    int hhOff = b * gateRows;
+                    int gateOff = b * gateRows;
+                    for (int g = 0; g < gateRows; g++)
+                    {
+                        float v = wxBuf[wxRowOff + g] + hhBuf[hhOff + g];
+                        if (hasBhh) v += bHhSpan[g];
+                        gateBuf[gateOff + g] = v;
+                    }
+                }
+
+                // Activate gates: i, f, o = sigmoid; g = tanh. Gate layout is
+                // [b, 0..H-1] = i, [b, H..2H-1] = f, [b, 2H..3H-1] = g, [b, 3H..4H-1] = o.
+                // Apply per-batch slice so each sigmoid/tanh call sees a
+                // contiguous run of one gate type — let SimdKernels vectorize
+                // the whole run, which is what makes the 8-element AVX2 path
+                // efficient.
+                //
+                // We could apply the activations to the whole [B, 4H] block at
+                // once but the gate layout is interleaved per batch (i, f, g, o
+                // concatenated along the inner axis), so contiguous activation
+                // requires a per-batch loop here. Hidden=64 in the AIsEval
+                // workload gives 64-element runs — well above the SIMD ramp.
+                fixed (float* gateP = gateBuf)
+                {
+                    for (int b = 0; b < batch; b++)
+                    {
+                        float* iSeg = gateP + b * gateRows + 0 * hidden;
+                        float* fSeg = gateP + b * gateRows + 1 * hidden;
+                        float* gSeg = gateP + b * gateRows + 2 * hidden;
+                        float* oSeg = gateP + b * gateRows + 3 * hidden;
+
+                        SimdKernels.SigmoidUnsafe(iSeg, iSeg, hidden);
+                        SimdKernels.SigmoidUnsafe(fSeg, fSeg, hidden);
+                        SimdKernels.TanhUnsafe(gSeg, gSeg, hidden);
+                        SimdKernels.SigmoidUnsafe(oSeg, oSeg, hidden);
+                    }
+                }
+
+                // Cell + hidden state update:
+                //   c[b, h] = f * c_prev + i * g
+                //   h[b, h] = o * tanh(c)
+                // We compute tanh(c) into hCurrBuf temporarily (it'll be
+                // overwritten below to o*tanh(c)) to keep memory traffic low.
+                fixed (float* gateP = gateBuf)
+                fixed (float* hCurrP = hCurrBuf)
+                fixed (float* cCurrP = cCurrBuf)
+                fixed (float* cPrevP = cPrevBuf)
+                {
+                    for (int b = 0; b < batch; b++)
+                    {
+                        float* iSeg = gateP + b * gateRows + 0 * hidden;
+                        float* fSeg = gateP + b * gateRows + 1 * hidden;
+                        float* gSeg = gateP + b * gateRows + 2 * hidden;
+                        float* oSeg = gateP + b * gateRows + 3 * hidden;
+                        float* cPrevSeg = cPrevP + b * hidden;
+                        float* cCurrSeg = cCurrP + b * hidden;
+                        float* hCurrSeg = hCurrP + b * hidden;
+
+                        // c = f * c_prev + i * g (scalar; vectorizable by JIT).
+                        for (int h = 0; h < hidden; h++)
+                            cCurrSeg[h] = fSeg[h] * cPrevSeg[h] + iSeg[h] * gSeg[h];
+
+                        // hCurr scratch = tanh(c), then overwrite with o * tanh(c).
+                        SimdKernels.TanhUnsafe(cCurrSeg, hCurrSeg, hidden);
+                        for (int h = 0; h < hidden; h++)
+                            hCurrSeg[h] = oSeg[h] * hCurrSeg[h];
+                    }
+                }
+
+                if (returnSequences)
+                {
+                    // Copy hCurr into output[:, t, :] (B copies of [hidden] floats).
+                    for (int b = 0; b < batch; b++)
+                    {
+                        int srcOff = b * hidden;
+                        int dstOff = (b * seqLen + t) * hidden;
+                        hCurrBuf.AsSpan(srcOff, hidden).CopyTo(outSpan.Slice(dstOff, hidden));
+                    }
+                }
+
+                // Swap roles: next iter's h_prev/c_prev are this iter's h_curr/c_curr.
+                (hPrevBuf, hCurrBuf) = (hCurrBuf, hPrevBuf);
+                (cPrevBuf, cCurrBuf) = (cCurrBuf, cPrevBuf);
+            }
+
+            if (!returnSequences)
+            {
+                // hPrevBuf now holds the last hCurr (post-swap). Copy it out.
+                hPrevBuf.AsSpan(0, batch * hidden).CopyTo(outSpan);
+            }
+
+            return output;
+        }
+        finally
+        {
+            pool.Return(wxBuf);
+            pool.Return(hCurrBuf);
+            pool.Return(cCurrBuf);
+            pool.Return(hPrevBuf);
+            pool.Return(cPrevBuf);
+            pool.Return(hhBuf);
+            pool.Return(gateBuf);
+        }
+    }
+
+    /// <summary>
+    /// Generic-T path for non-float numerics (double, decimal, BigInteger,
+    /// custom types). Uses <see cref="INumericOperations{T}"/> for the math
+    /// and the existing tensor-level matmul for the Wx pre-compute.
+    /// </summary>
+    private Tensor<T> LstmSequenceForwardGeneric<T>(
+        Tensor<T> input,
+        Tensor<T>? h0,
+        Tensor<T>? c0,
+        Tensor<T> wIh,
+        Tensor<T> wHh,
+        Tensor<T>? bIh,
+        Tensor<T>? bHh,
+        int batch, int seqLen, int inFeatures, int hidden, int gateRows,
+        bool returnSequences)
+    {
+        // Pre-compute Wx = input @ wIh^T + bIh for ALL timesteps as one big GEMM.
         var inputFlat = input.Reshape(new[] { batch * seqLen, inFeatures });
         var wxFlat = TensorMatMulTransposed(inputFlat, wIh); // [B*seq, 4H]
 
-        // Fold bIh into Wx in-place via raw span op (broadcast add along axis 0).
-        // Skip the standard TensorAdd dispatch since the broadcast pattern is
-        // trivial here and we want to avoid allocating another [B*seq, 4H] tensor.
         if (bIh is not null)
         {
             var ops = MathHelper.GetNumericOperations<T>();
@@ -131,49 +358,29 @@ public partial class CpuEngine
             }
         }
 
-        // Allocate output(s) + scratch buffers.
-        // h, c are alive across timesteps and are [B, H] each.
-        // gates buffer is [B, 4H] per step (reused). hh buffer for h_prev @
-        // wHh^T per step, also [B, 4H], also reused.
         var hShape = new[] { batch, hidden };
-        var gateShape = new[] { batch, gateRows };
-
         var hPrev = h0 is null ? Tensor<T>.CreateZeros(hShape) : h0.Clone();
         var cPrev = c0 is null ? Tensor<T>.CreateZeros(hShape) : c0.Clone();
 
-        // Output buffer: [B, seq, H] when returning sequences, else [B, H].
         Tensor<T> output = returnSequences
             ? AutoTensorCache.RentOrAllocate<T>(new[] { batch, seqLen, hidden })
             : AutoTensorCache.RentOrAllocate<T>(hShape);
 
-        // Reusable scratch for h_prev @ wHh^T (gate accumulator per step).
-        // We can't reuse a single Tensor<T> across the matmul calls (each
-        // returns a fresh allocation), but we can keep references short-lived
-        // so the GC reclaims them between steps. Keeping this honest for the
-        // first revision; a future pass can pre-allocate gateScratch.
-
         var opsT = MathHelper.GetNumericOperations<T>();
         var wxSpanRO = wxFlat.AsSpan();
 
-        // Per-timestep loop. We work primarily in spans here to keep the
-        // inner loop tight; the only Tensor<T>-level call per step is the
-        // h_prev @ wHh^T GEMM, which routes through SimdGemm for float.
         for (int t = 0; t < seqLen; t++)
         {
-            // gates_t = Wx[:, t, :] + h_prev @ wHh^T + bHh
-            var hh = TensorMatMulTransposed(hPrev, wHh); // [B, 4H]
+            var hh = TensorMatMulTransposed(hPrev, wHh);
             var hhSpan = hh.AsSpan();
             var hCurr = Tensor<T>.CreateZeros(hShape);
             var cCurr = Tensor<T>.CreateZeros(hShape);
             var hCurrSpan = hCurr.AsWritableSpan();
             var cCurrSpan = cCurr.AsWritableSpan();
-            var hPrevSpan = hPrev.AsSpan();
             var cPrevSpan = cPrev.AsSpan();
             bool hasBhh = bHh is not null;
             ReadOnlySpan<T> bHhSpan = hasBhh ? bHh!.AsSpan() : default;
 
-            // Wx slice for this timestep: rows [b * seqLen + t] for b in [0, B).
-            // We index it inline.
             for (int b = 0; b < batch; b++)
             {
                 int wxRow = b * seqLen + t;
@@ -183,7 +390,6 @@ public partial class CpuEngine
 
                 for (int h = 0; h < hidden; h++)
                 {
-                    // Indices into the 4 gates within this row.
                     int iIdx = hhOff + 0 * hidden + h;
                     int fIdx = hhOff + 1 * hidden + h;
                     int gIdx = hhOff + 2 * hidden + h;
@@ -193,7 +399,6 @@ public partial class CpuEngine
                     int wxG = wxOff + 2 * hidden + h;
                     int wxO = wxOff + 3 * hidden + h;
 
-                    // gate = Wx[b,t,gate] + hh[b,gate] + bHh[gate]
                     T iGate = opsT.Add(wxSpanRO[wxI], hhSpan[iIdx]);
                     T fGate = opsT.Add(wxSpanRO[wxF], hhSpan[fIdx]);
                     T gGate = opsT.Add(wxSpanRO[wxG], hhSpan[gIdx]);
@@ -206,15 +411,12 @@ public partial class CpuEngine
                         oGate = opsT.Add(oGate, bHhSpan[3 * hidden + h]);
                     }
 
-                    // Activations: i, f, o = sigmoid; g = tanh.
                     T iAct = Sigmoid(opsT, iGate);
                     T fAct = Sigmoid(opsT, fGate);
                     T gAct = TanhScalar(opsT, gGate);
                     T oAct = Sigmoid(opsT, oGate);
 
-                    // c = f * c_prev + i * g
                     T cNew = opsT.Add(opsT.Multiply(fAct, cPrevSpan[hOff + h]), opsT.Multiply(iAct, gAct));
-                    // h = o * tanh(c)
                     T hNew = opsT.Multiply(oAct, TanhScalar(opsT, cNew));
 
                     cCurrSpan[hOff + h] = cNew;
@@ -222,13 +424,11 @@ public partial class CpuEngine
                 }
             }
 
-            // Roll hPrev/cPrev to the just-computed states for next iteration.
             hPrev = hCurr;
             cPrev = cCurr;
 
             if (returnSequences)
             {
-                // Copy hCurr into output[:, t, :].
                 var outSpan = output.AsWritableSpan();
                 for (int b = 0; b < batch; b++)
                 {
@@ -242,9 +442,8 @@ public partial class CpuEngine
 
         if (!returnSequences)
         {
-            // Output is just the last hCurr — copy it.
             var outSpan = output.AsWritableSpan();
-            var hLastSpan = hPrev.AsSpan(); // hPrev was assigned to hCurr at end of last iter
+            var hLastSpan = hPrev.AsSpan();
             for (int i = 0; i < batch * hidden; i++)
                 outSpan[i] = hLastSpan[i];
         }
