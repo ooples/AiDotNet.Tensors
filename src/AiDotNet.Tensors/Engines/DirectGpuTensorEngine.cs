@@ -4082,6 +4082,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!TryGetBackend(out var backend))
             return base.FusedConv2D(input, kernel, bias, strideH, strideW, padH, padW, dilationH, dilationW, activation);
 
+        // Stage 8 precision-fallback gate: this GPU path materialises T into
+        // float[] buffers (see outputFloat / biasFloat below) — for T=double
+        // that silently loses ~7 mantissa bits, which shows up immediately
+        // in FusedConv2DDoublePerfTests at ulp ≤ 1e-9. Route fp64 to the
+        // contract-compliant CPU FusedConv2D direct kernel.
+        if (DirectGpuEngine.ShouldFallbackForPrecision<T>())
+            return base.FusedConv2D(input, kernel, bias, strideH, strideW, padH, padW, dilationH, dilationW, activation);
+
         // Expected input shape: [batch, inChannels, height, width]
         // Expected kernel shape: [outChannels, inChannels, kernelH, kernelW]
         if (input.Rank != 4 || kernel.Rank != 4)
@@ -14482,6 +14490,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorBroadcastAdd<T>(Tensor<T> a, Tensor<T> b)
     {
+        if (DirectGpuEngine.ShouldFallbackForPrecision<T>())
+            return base.TensorBroadcastAdd(a, b);
         if (TryGetBackend(out var backend) && a.Length > b.Length && a.Length % b.Length == 0)
         {
             try
@@ -14504,6 +14514,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorBroadcastSubtract<T>(Tensor<T> a, Tensor<T> b)
     {
+        if (DirectGpuEngine.ShouldFallbackForPrecision<T>())
+            return base.TensorBroadcastSubtract(a, b);
         if (TryGetBackend(out var backend) && a.Length > b.Length && a.Length % b.Length == 0)
         {
             try
@@ -14526,6 +14538,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorBroadcastDivide<T>(Tensor<T> a, Tensor<T> b)
     {
+        if (DirectGpuEngine.ShouldFallbackForPrecision<T>())
+            return base.TensorBroadcastDivide(a, b);
         if (TryGetBackend(out var backend) && a.Length > b.Length && a.Length % b.Length == 0)
         {
             try
