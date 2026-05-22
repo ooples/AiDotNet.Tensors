@@ -1,0 +1,131 @@
+<Project>
+
+  <!--
+    AiDotNet.Tensors Enterprise build-flag gate.
+
+    This file is auto-imported by the main csproj. It enforces that the
+    DISABLE_TELEMETRY and DISABLE_LICENSE_GUARD compile-time constants
+    can ONLY be set in builds that present a valid Ooples enterprise
+    license. Without the license, the build fails before compilation
+    reaches the #if-guarded code regions.
+
+    Rationale:
+      - The OSS source is licensed under BSL 1.1 with commercial gates
+        for non-trial production use. The BuildKey DRM and the telemetry
+        subsystem implement parts of that commercial contract.
+      - If an OSS consumer could simply pass -p:DefineConstants=DISABLE_LICENSE_GUARD
+        to their `dotnet build`, they would bypass the commercial gates
+        purely at compile time. That would render the BSL terms
+        technically unenforceable in self-built deployments.
+      - Locking the flags behind enterprise-license validation makes
+        them genuine enterprise-tier benefits (custom builds for federal
+        / air-gapped customers) instead of escape hatches.
+
+    Validation flow (phase 0 — placeholder):
+      1. Build invocation defines DISABLE_TELEMETRY and/or DISABLE_LICENSE_GUARD.
+      2. ValidateEnterpriseDisableFlags target inspects DefineConstants.
+      3. If either flag is present, the target requires the
+         AiDotNetEnterpriseLicenseKey MSBuild property AND
+         AiDotNetEnterpriseLicensePath MSBuild property (or matching
+         AIDOTNET_ENTERPRISE_LICENSE_KEY / _PATH env vars).
+      4. (Phase 0) Placeholder validation: license key must be a non-empty
+         string and license file must exist + be readable.
+      5. (Phase 4 — real implementation) The license file is a JSON
+         document signed with ed25519 by Ooples' enterprise-license
+         signing key. The targets file (or a precompiled validator DLL)
+         verifies the signature against an embedded public key, checks
+         the expiry date, and checks that the granted scope includes the
+         requested DISABLE_* flags.
+
+    Suppressing the gate is INTENTIONALLY HARD. There is no
+    `AiDotNetSkipLicenseValidation` property. A determined adversary
+    can fork the targets file out of their local checkout, but that
+    constitutes a clear, demonstrable BSL violation — not a gray-area
+    customer-friendly escape hatch.
+  -->
+
+  <PropertyGroup>
+    <_AiDotNetDisableTelemetryRequested
+      Condition="'$(DefineConstants.Contains(`DISABLE_TELEMETRY`))' == 'true'">true</_AiDotNetDisableTelemetryRequested>
+    <_AiDotNetDisableLicenseGuardRequested
+      Condition="'$(DefineConstants.Contains(`DISABLE_LICENSE_GUARD`))' == 'true'">true</_AiDotNetDisableLicenseGuardRequested>
+    <_AiDotNetAnyDisableFlagRequested
+      Condition="'$(_AiDotNetDisableTelemetryRequested)' == 'true' Or '$(_AiDotNetDisableLicenseGuardRequested)' == 'true'">true</_AiDotNetAnyDisableFlagRequested>
+  </PropertyGroup>
+
+  <Target Name="ValidateEnterpriseDisableFlags"
+          BeforeTargets="CoreCompile"
+          Condition="'$(_AiDotNetAnyDisableFlagRequested)' == 'true'">
+
+    <!--
+      Resolve license key + path: explicit MSBuild property wins, then env
+      var fallback. Both must be set; the key is the inline validator,
+      the path points to the signed license file Ooples issues to the
+      enterprise customer.
+    -->
+    <PropertyGroup>
+      <_AiDotNetEnterpriseLicenseKey
+        Condition="'$(AiDotNetEnterpriseLicenseKey)' != ''">$(AiDotNetEnterpriseLicenseKey)</_AiDotNetEnterpriseLicenseKey>
+      <_AiDotNetEnterpriseLicenseKey
+        Condition="'$(_AiDotNetEnterpriseLicenseKey)' == ''">$([System.Environment]::GetEnvironmentVariable('AIDOTNET_ENTERPRISE_LICENSE_KEY'))</_AiDotNetEnterpriseLicenseKey>
+
+      <_AiDotNetEnterpriseLicensePath
+        Condition="'$(AiDotNetEnterpriseLicensePath)' != ''">$(AiDotNetEnterpriseLicensePath)</_AiDotNetEnterpriseLicensePath>
+      <_AiDotNetEnterpriseLicensePath
+        Condition="'$(_AiDotNetEnterpriseLicensePath)' == ''">$([System.Environment]::GetEnvironmentVariable('AIDOTNET_ENTERPRISE_LICENSE_PATH'))</_AiDotNetEnterpriseLicensePath>
+    </PropertyGroup>
+
+    <Error
+      Code="AIDOTNET001"
+      Condition="'$(_AiDotNetEnterpriseLicenseKey)' == ''"
+      Text="DISABLE_TELEMETRY / DISABLE_LICENSE_GUARD compile flags require a valid AiDotNet Enterprise license. AiDotNetEnterpriseLicenseKey MSBuild property (or AIDOTNET_ENTERPRISE_LICENSE_KEY env var) is not set. These build flags are Enterprise-tier benefits for air-gapped / federal customers — contact admin@aidotnet.dev to obtain an enterprise license. See https://aidotnet.dev/enterprise for details." />
+
+    <Error
+      Code="AIDOTNET002"
+      Condition="'$(_AiDotNetEnterpriseLicensePath)' == ''"
+      Text="DISABLE_TELEMETRY / DISABLE_LICENSE_GUARD compile flags require AiDotNetEnterpriseLicensePath (or AIDOTNET_ENTERPRISE_LICENSE_PATH env var) pointing to the signed license file issued by Ooples for your tenant. See https://aidotnet.dev/enterprise." />
+
+    <Error
+      Code="AIDOTNET003"
+      Condition="'$(_AiDotNetEnterpriseLicensePath)' != '' And !Exists('$(_AiDotNetEnterpriseLicensePath)')"
+      Text="AiDotNet Enterprise license file not found at: $(_AiDotNetEnterpriseLicensePath). Verify the path or contact admin@aidotnet.dev." />
+
+    <!--
+      PHASE 0 PLACEHOLDER VALIDATION:
+        - License key must be non-empty (already checked above)
+        - License file must exist (already checked above)
+        - File must contain the marker string "AiDotNet-Enterprise-License-v1"
+
+      PHASE 4 REAL VALIDATION (replaces the marker check):
+        - License file is a JSON document signed with ed25519
+        - Public key is embedded in this targets file (or a sibling .props)
+        - Signature is verified via an inline RoslynCodeTaskFactory task
+          or a precompiled validator dll shipped under build/
+        - Expiry date is checked against current UTC date
+        - Granted scope is checked against the requested DISABLE_* flags
+        - Granted-to tenant is logged for audit trail
+
+      The phase 4 implementation will replace this entire <ReadLinesFromFile>
+      + <Error> block with a single <ValidateAiDotNetLicense ...Task call.
+    -->
+    <ReadLinesFromFile File="$(_AiDotNetEnterpriseLicensePath)"
+                       Condition="Exists('$(_AiDotNetEnterpriseLicensePath)')">
+      <Output TaskParameter="Lines" ItemName="_AiDotNetLicenseLines" />
+    </ReadLinesFromFile>
+
+    <PropertyGroup>
+      <_AiDotNetLicenseContent>@(_AiDotNetLicenseLines, '%0a')</_AiDotNetLicenseContent>
+    </PropertyGroup>
+
+    <Error
+      Code="AIDOTNET004"
+      Condition="!$(_AiDotNetLicenseContent.Contains('AiDotNet-Enterprise-License-v1'))"
+      Text="AiDotNet Enterprise license file at $(_AiDotNetEnterpriseLicensePath) does not contain the expected v1 marker. The file may be corrupt, an unrelated file, or a license for a different product. Phase 0 uses a placeholder marker check; Phase 4 will replace this with cryptographic ed25519 signature verification. Contact admin@aidotnet.dev if you believe your license is valid." />
+
+    <Message
+      Importance="high"
+      Text="AiDotNet Enterprise build flags accepted (phase 0 placeholder validation):  DISABLE_TELEMETRY=$(_AiDotNetDisableTelemetryRequested), DISABLE_LICENSE_GUARD=$(_AiDotNetDisableLicenseGuardRequested), license=$(_AiDotNetEnterpriseLicensePath)" />
+
+  </Target>
+
+</Project>

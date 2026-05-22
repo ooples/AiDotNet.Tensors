@@ -280,4 +280,11 @@
     </AssemblyAttribute>
   </ItemGroup>
 
+  <!--
+    Gate DISABLE_TELEMETRY / DISABLE_LICENSE_GUARD compile flags behind
+    enterprise-license validation. See build/AiDotNet.Tensors.Enterprise.targets
+    for the validation logic and full rationale.
+  -->
+  <Import Project="$(MSBuildThisFileDirectory)..\..\build\AiDotNet.Tensors.Enterprise.targets" />
+
 </Project>
