@@ -24,7 +24,17 @@ namespace AiDotNet.Tensors.Tests.Engines;
 /// <para>This test pins the contract — a hard 30-second budget. If a future change ever
 /// removes the OpenBLAS scope or re-introduces the oversubscription path, this test will
 /// time out cleanly instead of letting CI hang.</para>
+///
+/// <para>CI-follow-up: marked with <c>[Collection("BlasGlobalState")]</c> so the test is
+/// serialised with other tests that mutate the global OpenBLAS thread count
+/// (DeterministicMode/DeterministicByDefault). Without this, an unrelated test running in
+/// parallel could set OpenBLAS threads to a high value between this test's
+/// <c>ScopeOpenBlasThreads(1)</c> acquisition and the parallel-for entry, defeating the
+/// scope and re-introducing the oversubscription cliff. Originally not gated — fixed after
+/// PR #426 hit the 30s timeout on Linux CI even though the production fix from #410 was
+/// merged.</para>
 /// </summary>
+[Collection("BlasGlobalState")]
 public class FlashAttentionDoubleHangIssue411Test
 {
     private readonly ITestOutputHelper _output;
