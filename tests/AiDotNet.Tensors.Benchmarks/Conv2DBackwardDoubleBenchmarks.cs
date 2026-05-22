@@ -17,9 +17,13 @@ namespace AiDotNet.Tensors.Benchmarks;
 ///   - 3×3 stride=1 padding=1 (every VGG conv + ResNet50 residual block 3×3)
 ///   - 3×3 stride=2 padding=1 (ResNet50 stage-transition convs)
 ///   - 1×1 stride=1 padding=0 (ResNet50 bottleneck projections — 32 per forward)
-///   - 1×1 stride=2 padding=0 (ResNet50 stage downsamples)
-///   - 5×5 stride=1 padding=2 (various)
 ///   - 7×7 stride=2 padding=3 (ResNet50 conv1 stem)
+///
+/// Two additional shapes were considered for Stage 0 but deferred until
+/// the matching kernels land: 1×1 stride=2 padding=0 (ResNet50 stage
+/// downsamples) and 5×5 stride=1 padding=2 (various older Inception-style
+/// nets). Re-add benchmarks for those when their direct-kernel fast paths
+/// arrive — Stage 0's job is to baseline what we currently exercise.
 ///
 /// At canonical ImageNet feature-map spatial dims: 224, 112, 56, 28, 14, 7.
 ///

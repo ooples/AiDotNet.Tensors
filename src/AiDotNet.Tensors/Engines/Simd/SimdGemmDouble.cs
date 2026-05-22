@@ -503,16 +503,35 @@ internal static partial class SimdGemm
         // but we don't want both threads to do the (expensive) packing work.
         lock (_prePackedBDoubleCacheLock)
         {
+            // Same-shape race: another thread added between our TryGetValue
+            // and the lock — reuse theirs and skip rebuild.
             if (_prePackedBDoubleCache.TryGetValue(b, out var existing2)
                 && existing2.K == k && existing2.N == n && existing2.Kc == DKc)
                 return existing2;
+
+            // Different-shape collision: the same b[] is in the cache but
+            // packed for a different (k, n, Kc). ConditionalWeakTable.Add
+            // would throw ArgumentException and the OLD entry would silently
+            // re-surface, so callers would run the kernel against panels
+            // packed for the wrong shape. Remove the stale entry before
+            // installing the fresh one. (ConditionalWeakTable doesn't expose
+            // AddOrUpdate, so we serialize remove+add inside this lock.)
+            if (existing2 != null)
+                _prePackedBDoubleCache.Remove(b);
+
             var fresh = BuildPrePackedBDouble(b, k, n, m);
             try { _prePackedBDoubleCache.Add(b, fresh); }
             catch (ArgumentException)
             {
-                // Race — another thread added between our TryGetValue and
-                // Add. Re-fetch and use theirs.
-                _prePackedBDoubleCache.TryGetValue(b, out fresh!);
+                // Race — another thread added between our Remove and Add.
+                // Re-fetch and prefer theirs ONLY if it matches the shape we
+                // need; otherwise return the freshly-built copy. This
+                // sacrifices a small amount of cache churn under contention
+                // (both threads kept their own panels) but never returns
+                // wrong-shape panels.
+                if (_prePackedBDoubleCache.TryGetValue(b, out var raced)
+                    && raced.K == k && raced.N == n && raced.Kc == DKc)
+                    return raced;
             }
             return fresh;
         }
@@ -635,17 +654,25 @@ internal static partial class SimdGemm
             pB += ldb;
         }
 
-        Avx.Store(pC + 0, Avx.Add(c00, Avx.LoadVector256(pC + 0)));
-        Avx.Store(pC + 4, Avx.Add(c01, Avx.LoadVector256(pC + 4)));
+        // DgemmDirect's caller (Dgemm) does c.Clear() before dispatch and
+        // each Mr × Nr tile is produced exactly once per call — no inter-
+        // tile or inter-call accumulation runs through this kernel. Store
+        // the accumulators directly instead of load-add-store; the loaded
+        // value is guaranteed zero, so the add was pure overhead on the
+        // small-shape hot path this kernel targets. (Contrast with
+        // DgemmMicroKernel4x8 below, which DOES accumulate across pc K-
+        // blocks and keeps load-add-store correctly.)
+        Avx.Store(pC + 0, c00);
+        Avx.Store(pC + 4, c01);
         pC += ldc;
-        Avx.Store(pC + 0, Avx.Add(c10, Avx.LoadVector256(pC + 0)));
-        Avx.Store(pC + 4, Avx.Add(c11, Avx.LoadVector256(pC + 4)));
+        Avx.Store(pC + 0, c10);
+        Avx.Store(pC + 4, c11);
         pC += ldc;
-        Avx.Store(pC + 0, Avx.Add(c20, Avx.LoadVector256(pC + 0)));
-        Avx.Store(pC + 4, Avx.Add(c21, Avx.LoadVector256(pC + 4)));
+        Avx.Store(pC + 0, c20);
+        Avx.Store(pC + 4, c21);
         pC += ldc;
-        Avx.Store(pC + 0, Avx.Add(c30, Avx.LoadVector256(pC + 0)));
-        Avx.Store(pC + 4, Avx.Add(c31, Avx.LoadVector256(pC + 4)));
+        Avx.Store(pC + 0, c30);
+        Avx.Store(pC + 4, c31);
     }
 
     /// <summary>
@@ -733,8 +760,13 @@ internal static partial class SimdGemm
         if (procs <= 1) return false;
         int Mc = ChooseAdaptiveMcDouble(m, k, n);
         int numRowBlocks = (m + Mc - 1) / Mc;
-        // Need at least 2 row blocks per worker to amortize dispatch.
-        return numRowBlocks >= 2;
+        // Need at least 2 row blocks PER WORKER to amortize dispatch and
+        // give each thread enough sequential work to outrun the parallel
+        // overhead. On a 16-core machine that means we need ≥32 Mc row
+        // blocks; firing parallel-on-2-blocks because we have any two
+        // workers leaves 14 cores idle waiting on the slowest of two and
+        // regresses vs the sequential packed path the Stage-1 plan targets.
+        return numRowBlocks >= 2 * procs;
     }
 #endif
 
@@ -802,20 +834,47 @@ internal static partial class SimdGemm
         if (k <= 0) return;
 
 #if NET5_0_OR_GREATER
-        if (Avx2.IsSupported && Fma.IsSupported
-            && DgemmShouldUsePackedTiled(m, k, n))
+        if (Avx2.IsSupported && Fma.IsSupported)
         {
-            var prepacked = GetOrAddPrePackedBDouble(b, k, n, m);
-            if (prepacked != null)
+            // Mirror Dgemm's dispatch order so the cached entry doesn't
+            // silently regress shapes that Dgemm would have routed
+            // elsewhere:
+            //   1) Direct gate wins on small (≤4M FMA, n%4==0) shapes —
+            //      packing overhead (and therefore the cache hit) doesn't
+            //      apply; bypass the cache entirely.
+            //   2) Parallel-M wins on packed-tiled shapes that satisfy
+            //      DgemmShouldParallelize. The cached path doesn't have a
+            //      parallel + pre-packed variant yet, so fall through to
+            //      Dgemm which routes to DgemmTiledParallelM — losing
+            //      cache reuse is a smaller regression than serializing a
+            //      shape that should saturate 16 cores.
+            //   3) Sequential packed-tiled keeps the pre-packed-B fast
+            //      path for the gate-satisfying-but-not-parallel sweet
+            //      spot (mostly inference loops on bounded-batch shapes).
+            // Pre-fix this method went straight to the sequential packed
+            // path for any DgemmShouldUsePackedTiled hit, regressing both
+            // direct-friendly and parallel-friendly shapes.
+            if (DgemmShouldUseDirect(m, k, n))
             {
-                DgemmTiledWithPrePackedB(a, prepacked, c, m, k, n);
+                DgemmDirect(a, new ReadOnlySpan<double>(b), c, m, k, n);
                 return;
+            }
+            if (DgemmShouldUsePackedTiled(m, k, n)
+                && !DgemmShouldParallelize(m, k, n))
+            {
+                var prepacked = GetOrAddPrePackedBDouble(b, k, n, m);
+                if (prepacked != null)
+                {
+                    DgemmTiledWithPrePackedB(a, prepacked, c, m, k, n);
+                    return;
+                }
             }
         }
 #endif
-        // Fall through: caller's expectations are satisfied by the
-        // standard Dgemm path (no cache, no perf loss vs the un-Cached
-        // entry).
+        // Fall through: parallel-friendly shapes and anything that didn't
+        // match the gates above route to the standard Dgemm path
+        // (parallel-M dispatch, scalar fallback for non-AVX2, etc.). No
+        // perf loss vs the un-Cached entry.
         Dgemm(a, new ReadOnlySpan<double>(b), c, m, k, n);
     }
 

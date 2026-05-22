@@ -51,13 +51,17 @@ public class SimdGemmDoublePackedTests
     }
 
     [Theory]
-    // Inside the packed-tiled gate (≥1M FMAs). Mix of full-tile + edge shapes.
-    [InlineData(64, 64, 64)]     // exact full Mr/Nr tiles (16 Mr-rows × 8 Nr-cols)
-    [InlineData(100, 128, 200)]  // mc%Mr != 0, nc%Nr != 0
-    [InlineData(96, 256, 96)]    // square at the LargeMc boundary
-    [InlineData(128, 64, 64)]    // tall-skinny
-    [InlineData(64, 256, 256)]   // ResNet head shape
-    [InlineData(4, 256, 8)]      // minimum Mr × minimum Nr × medium K
+    // Inside the packed-tiled gate (work=m*k*n ≥ 1M, m ≥ Mr=4, n ≥ Nr=8, k ≥ 8).
+    // Mix of full-tile + edge shapes — every row here MUST clear the gate or
+    // the packed path is silently bypassed, leaving these assertions to
+    // validate only the inline 64-block path (already covered by
+    // DgemmInline_SmallShapes_MatchesScalarReference below).
+    [InlineData(128, 128, 128)]  // 2.1M FMAs, exact full Mr/Nr tiles (32×16)
+    [InlineData(100, 128, 200)]  // 2.6M, mc%Mr != 0, nc%Nr != 0
+    [InlineData(96, 256, 96)]    // 2.4M, square at the LargeMc boundary
+    [InlineData(256, 128, 64)]   // 2.1M, tall-skinny (4× Mc rows, single Nr col)
+    [InlineData(64, 256, 256)]   // 4.2M, ResNet head shape
+    [InlineData(8, 1024, 128)]   // 1.05M, minimum-Mr (2 Mr tiles) × large K × wide N
     public void DgemmTiled_MatchesScalarReference(int m, int k, int n)
     {
         var a = MakeRandom(m * k, 1);

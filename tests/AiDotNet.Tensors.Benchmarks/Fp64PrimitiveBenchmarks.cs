@@ -110,6 +110,8 @@ public class Fp64PrimitiveBenchmarks
         _pool_256x56  = Tensor<double>.CreateRandom([1, 256, 56, 56]);
         _pool_512x28  = Tensor<double>.CreateRandom([1, 512, 28, 28]);
         _pool_512x14  = Tensor<double>.CreateRandom([1, 512, 14, 14]);
+
+        _avgpool_2048x7 = Tensor<double>.CreateRandom([1, 2048, 7, 7]);
     }
 
     // ───────────── BatchNorm forward ─────────────
@@ -193,9 +195,6 @@ public class Fp64PrimitiveBenchmarks
 
     [Benchmark(Description = "AvgPool 7x7 global [1,2048,7,7]→[1,2048,1,1] (ResNet head)")]
     public Tensor<double> AvgPool_ResNetHead()
-    {
-        _avgpool_2048x7 ??= Tensor<double>.CreateRandom([1, 2048, 7, 7]);
-        return _engine.AvgPool2D(_avgpool_2048x7, 7, 1);
-    }
+        => _engine.AvgPool2D(_avgpool_2048x7, 7, 1);
 }
 #endif
