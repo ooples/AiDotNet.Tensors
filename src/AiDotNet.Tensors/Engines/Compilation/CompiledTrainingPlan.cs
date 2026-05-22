@@ -38,6 +38,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private readonly Tensor<T>[] _preAllocatedGrads;
     private readonly Tensor<T> _lossGradSeed;
     private readonly List<GCHandle> _pinnedHandles = new();
+    // CodeRabbit #425 review: GPU optimizer state (gpuM/gpuV) is owned by the
+    // plan once allocated via paramBackend.AllocateBuffer in
+    // ConfigureOptimizerFloat / ConfigureOptimizerFloatGrouped, but pre-fix
+    // Dispose() only freed _pinnedHandles. Tracking the per-parameter
+    // optimizer-state buffers here so Dispose() (and reconfigure) can free
+    // them — otherwise device memory leaks for every gpuM/gpuV across the
+    // plan's lifetime, which is unbounded for long-running training.
+    private readonly List<Engines.DirectGpu.IGpuBuffer> _gpuOptimizerBuffers = new();
     private bool _disposed;
 
     // Phase G.4: rebuild state captured at compile time so
@@ -112,6 +120,13 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 handle.Free();
         }
         _pinnedHandles.Clear();
+        // CodeRabbit #425: release GPU optimizer state. Buffers are added in
+        // ConfigureOptimizerFloat / ConfigureOptimizerFloatGrouped after the
+        // paramBackend.AllocateBuffer calls; reconfiguring also disposes
+        // these via the same list before re-allocating.
+        foreach (var buf in _gpuOptimizerBuffers)
+            buf.Dispose();
+        _gpuOptimizerBuffers.Clear();
     }
 
     public Tensor<T>[] Gradients => _gradients;
@@ -650,6 +665,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private unsafe void ConfigureOptimizerFloat(
         OptimizerType optimizerType, LrSchedule schedule, float beta1, float beta2, float eps, float weightDecay)
     {
+        // CodeRabbit #425: reconfigure releases any prior GPU optimizer-state
+        // buffers. Without this the device memory grows every time the user
+        // calls ConfigureOptimizer (e.g., to switch from SGD to Adam mid-run
+        // or to retune lr via re-configure with a fresh schedule).
+        foreach (var buf in _gpuOptimizerBuffers)
+            buf.Dispose();
+        _gpuOptimizerBuffers.Clear();
+
         // Pre-allocate optimizer state buffers for each parameter
         int paramCount = _parameters.Length;
         var paramArrays = new float[paramCount][];
@@ -734,8 +757,16 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 {
                     gradArrays[p] = Array.Empty<float>();
                 }
-                if (needsMomentum) gpuM[p] = paramBackend.AllocateBuffer(lengths[p]);
-                if (needsSecondMoment) gpuV[p] = paramBackend.AllocateBuffer(lengths[p]);
+                if (needsMomentum)
+                {
+                    gpuM[p] = paramBackend.AllocateBuffer(lengths[p]);
+                    _gpuOptimizerBuffers.Add(gpuM[p]!);
+                }
+                if (needsSecondMoment)
+                {
+                    gpuV[p] = paramBackend.AllocateBuffer(lengths[p]);
+                    _gpuOptimizerBuffers.Add(gpuV[p]!);
+                }
                 // Skip the CPU live-backing check entirely — we're on GPU.
                 m[p] = Array.Empty<float>();
                 v[p] = Array.Empty<float>();
@@ -847,9 +878,22 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     switch (optType)
                     {
                         case OptimizerType.SGD:
+                            // CodeRabbit #425: GPU SgdUpdate folds in wd via L2
+                            // regularization (grad += wd*param). Apply the same
+                            // semantics on CPU so ConfigureOptimizer(..., weightDecay)
+                            // behaves identically across CPU and GPU. PyTorch's
+                            // torch.optim.SGD(weight_decay=...) uses this convention.
+                            if (wd != 0f)
+                                for (int i = 0; i < len; i++) pGrad[i] += wd * pParam[i];
                             FusedOptimizer.SgdUpdateSimd(pParam, pGrad, len, lr);
                             break;
                         case OptimizerType.Adam:
+                            // CodeRabbit #425: same L2-regularization wd application
+                            // as SGD above so CPU/GPU Adam stay consistent.
+                            // (AdamW uses decoupled weight decay, handled below
+                            // by the dedicated AdamWUpdateSimd kernel.)
+                            if (wd != 0f)
+                                for (int i = 0; i < len; i++) pGrad[i] += wd * pParam[i];
                             FusedOptimizer.AdamUpdateSimd(pParam, pGrad, pM, pV, len,
                                 lr, b1, b2, epsVal, _optimizerStep);
                             break;
@@ -873,6 +917,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         System.Collections.Generic.IReadOnlyList<int> paramToGroup,
         float beta1, float beta2, float eps, float weightDecay)
     {
+        // CodeRabbit #425: reconfigure releases prior GPU optimizer-state.
+        // See ConfigureOptimizerFloat for the rationale.
+        foreach (var buf in _gpuOptimizerBuffers)
+            buf.Dispose();
+        _gpuOptimizerBuffers.Clear();
+
         int paramCount = _parameters.Length;
         int groupCount = groupSchedules.Count;
         var paramArrays = new float[paramCount][];
@@ -931,8 +981,16 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 {
                     gradArrays[p] = Array.Empty<float>();
                 }
-                if (needsMomentum) gpuM[p] = paramBackend.AllocateBuffer(lengths[p]);
-                if (needsSecondMoment) gpuV[p] = paramBackend.AllocateBuffer(lengths[p]);
+                if (needsMomentum)
+                {
+                    gpuM[p] = paramBackend.AllocateBuffer(lengths[p]);
+                    _gpuOptimizerBuffers.Add(gpuM[p]!);
+                }
+                if (needsSecondMoment)
+                {
+                    gpuV[p] = paramBackend.AllocateBuffer(lengths[p]);
+                    _gpuOptimizerBuffers.Add(gpuV[p]!);
+                }
                 m[p] = Array.Empty<float>();
                 v[p] = Array.Empty<float>();
                 paramArrays[p] = Array.Empty<float>();
@@ -1034,9 +1092,16 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     switch (optType)
                     {
                         case OptimizerType.SGD:
+                            // CodeRabbit #425: see ConfigureOptimizerFloat for
+                            // L2-regularization weight-decay rationale (same
+                            // semantics as gpuBe.SgdUpdate's wd parameter).
+                            if (wd != 0f)
+                                for (int i = 0; i < len; i++) pGrad[i] += wd * pParam[i];
                             FusedOptimizer.SgdUpdateSimd(pParam, pGrad, len, lr);
                             break;
                         case OptimizerType.Adam:
+                            if (wd != 0f)
+                                for (int i = 0; i < len; i++) pGrad[i] += wd * pParam[i];
                             FusedOptimizer.AdamUpdateSimd(pParam, pGrad, pM, pV, len,
                                 lr, b1, b2, epsVal, _optimizerStep);
                             break;
@@ -3118,6 +3183,40 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private static void ClipGradientsGlobalL2(Tensor<T>[] gradients, double maxNorm)
     {
         if (gradients.Length == 0) return;
+
+        // CodeRabbit #425 review: detect GPU-resident gradients before the CPU
+        // clip loop. Pre-fix the CPU pass would compute the L2 norm over a
+        // stale CPU backing (a GPU-resident tensor's host array is empty /
+        // uninitialised; the live data lives in backend memory). The norm
+        // came out as zero (or garbage), the scale was applied to the stale
+        // CPU buffer that the optimizer's GPU fast path never reads, and the
+        // optimizer step consumed the un-clipped GPU buffer — silently
+        // defeating SetMaxGradNorm whenever any parameter sat on GPU.
+        //
+        // Implementing the clip natively on GPU would require an in-place
+        // host→device upload primitive on IGpuBuffer (only OpenCL has it
+        // today; HIP/CUDA/WebGpu/Vulkan/Metal would all need new code) plus
+        // a scaled-axpy kernel on each backend — that's a feature, not a
+        // bug fix, and out of scope for the #415 follow-up cluster. For now
+        // we fail fast with an actionable message so the user knows their
+        // clip setting is unenforceable in the current configuration rather
+        // than training with silently bad behaviour.
+        for (int p = 0; p < gradients.Length; p++)
+        {
+            var tensor = gradients[p];
+            if (tensor == null) continue;
+            if (tensor.TryGetGpuBuffer() is not null)
+            {
+                throw new NotSupportedException(
+                    $"SetMaxGradNorm(maxNorm={maxNorm}) is not yet supported when any parameter " +
+                    $"gradient is GPU-resident (parameter {p}, shape [{string.Join(",", tensor.Shape)}] " +
+                    $"lives on backend '{tensor._gpuBackend?.BackendName}'). Native GPU clipping " +
+                    $"requires an in-place host→device upload primitive on IGpuBuffer that's not yet " +
+                    $"in the interface. Workarounds: (a) call SetMaxGradNorm(0) to disable clipping, " +
+                    $"(b) move the model to CPU for training, or (c) file a Tensors issue to track " +
+                    $"native GPU clip implementation. This guard replaces the prior silent no-op.");
+            }
+        }
 
         // Step 1: total L2 norm across all parameter gradients. Reads through
         // the `T` element type so float and double both work without per-type
