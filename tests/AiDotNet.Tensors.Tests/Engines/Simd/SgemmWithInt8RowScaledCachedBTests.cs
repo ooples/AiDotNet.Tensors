@@ -88,6 +88,11 @@ public class SgemmWithInt8RowScaledCachedBTests
     [InlineData(8, 1024, 16, 6)]    // k > Kc — exercise pcIter loop
     [InlineData(8, 600, 32, 7)]     // k % Kc != 0 — tail Kc panel
     [InlineData(4, 32, 5000, 8)]    // n > Nc — large-n fallback path
+    // CodeRabbit #427 review comment regression: canParallelize=true AND
+    // NumColSubBlocks=1 (n < Nr*4 ≈ 64). m*k*n = 64*1024*32 = 2 MiB hits
+    // ParallelWorkThreshold's 2 MiB floor on any core count; n=32 < 64 forces
+    // NumColSubBlocks=1. Pre-fix this NRE'd at packedABuf!.
+    [InlineData(64, 1024, 32, 9)]   // parallel-work threshold met + single col sub-block
     public void Correctness_VsScalarReference_AtSnr30Db(int m, int k, int n, int seed)
     {
         var tc = BuildRandomCase(m, k, n, seed);
@@ -117,8 +122,14 @@ public class SgemmWithInt8RowScaledCachedBTests
         SimdGemm.SgemmWithInt8RowScaledCachedB(
             tc.a.AsSpan(), tc.bInt8, tc.rowScales.AsSpan(), c2.AsSpan(), 8, 128, 32);
 
+        // Bit-identical: compare IEEE-754 bit patterns, not numeric equality.
+        // Assert.Equal(float, float) treats NaN-with-different-payloads / -0 vs +0
+        // as equal — neither should occur here, but the test's name promises
+        // bit-identity so the assertion should enforce it (CodeRabbit #427).
         for (int i = 0; i < c1.Length; i++)
-            Assert.Equal(c1[i], c2[i]);
+            Assert.Equal(
+                BitConverter.SingleToInt32Bits(c1[i]),
+                BitConverter.SingleToInt32Bits(c2[i]));
     }
 
     [Fact]
@@ -168,6 +179,27 @@ public class SgemmWithInt8RowScaledCachedBTests
         SimdGemm.SgemmWithInt8RowScaledCachedB(
             a.AsSpan(), b, scales.AsSpan(), c.AsSpan(), 0, 0, 0);
         // No exception is the assertion. (c.Length is 0, nothing to check.)
+    }
+
+    [Fact]
+    public void ZeroK_NonEmptyC_PrefilledOutputIsCleared()
+    {
+        // CodeRabbit #427: the zero-dim test above only exercises m=k=n=0
+        // (c.Length == 0), so the clear-on-entry contract is never observed.
+        // m>0 ∧ n>0 ∧ k=0 still hits the early-return branch but C is non-empty;
+        // the contract says C must be cleared regardless of dims.
+        int m = 3, k = 0, n = 4;
+        var a = new float[m * k];
+        var b = new sbyte[n * k];
+        var scales = new float[n];
+        var c = new float[m * n];
+        Array.Fill(c, 123.0f); // prefill with garbage to detect clear
+
+        SimdGemm.SgemmWithInt8RowScaledCachedB(
+            a.AsSpan(), b, scales.AsSpan(), c.AsSpan(), m, k, n);
+
+        for (int i = 0; i < c.Length; i++)
+            Assert.Equal(0f, c[i]);
     }
 
     [Fact]

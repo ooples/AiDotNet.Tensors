@@ -327,17 +327,27 @@ internal static partial class SimdGemm
         int packedASizePerRow = mcRounded * Kc;
         int packedBSizePerSub = cached.PackedSubs.Length > 0 ? cached.PackedSubs[0].Length : 0;
 
-        var packedABufs = canParallelize ? new float[numRowBlocks][] : null;
-        if (canParallelize)
+        // The parallel path requires at least 2 column sub-blocks — pack-A and
+        // dequant are dispatched as taskId>=numRowBlocks tasks alongside the
+        // pack-A tasks, and a single column sub-block leaves nothing to
+        // parallelize on the dequant side. When canParallelize is true but
+        // NumColSubBlocks < 2, the code falls through to the sequential branch
+        // below; that branch reads packedABuf!/dequantBuf!. Pre-fix those were
+        // null in this case → NRE under low n (n < Nr*4 ≈ 64). Compute the
+        // effective branch once here and key all buffer allocations off it.
+        bool useParallelPath = canParallelize && cached.NumColSubBlocks >= 2;
+
+        var packedABufs = useParallelPath ? new float[numRowBlocks][] : null;
+        if (useParallelPath)
             for (int r = 0; r < numRowBlocks; r++)
                 packedABufs![r] = System.Buffers.ArrayPool<float>.Shared.Rent(packedASizePerRow);
-        var packedABuf = canParallelize ? null : System.Buffers.ArrayPool<float>.Shared.Rent(packedASizePerRow);
+        var packedABuf = useParallelPath ? null : System.Buffers.ArrayPool<float>.Shared.Rent(packedASizePerRow);
 
-        var dequantBufs = canParallelize ? new float[cached.NumColSubBlocks][] : null;
-        if (canParallelize)
+        var dequantBufs = useParallelPath ? new float[cached.NumColSubBlocks][] : null;
+        if (useParallelPath)
             for (int cs = 0; cs < cached.NumColSubBlocks; cs++)
                 dequantBufs![cs] = System.Buffers.ArrayPool<float>.Shared.Rent(packedBSizePerSub);
-        var dequantBuf = canParallelize ? null : System.Buffers.ArrayPool<float>.Shared.Rent(packedBSizePerSub);
+        var dequantBuf = useParallelPath ? null : System.Buffers.ArrayPool<float>.Shared.Rent(packedBSizePerSub);
 
         try
         {
@@ -351,7 +361,7 @@ internal static partial class SimdGemm
                 int kc = Math.Min(Kc, k - pc);
                 int subsBase = pcIter * cached.NumColSubBlocks;
 
-                if (canParallelize && cached.NumColSubBlocks >= 2)
+                if (useParallelPath)
                 {
                     int localNumRowBlocks = numRowBlocks;
                     int localMc = Mc;
