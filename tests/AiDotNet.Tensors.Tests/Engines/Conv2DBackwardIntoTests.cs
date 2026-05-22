@@ -357,6 +357,12 @@ public class Conv2DBackwardIntoTests
                 expected[oc * inC + ic] = sum;
             }
 
+        // Looser tolerance vs the backward-input test's 1e-11: each kernel
+        // weight here is a sum of batch × oH × oW = 2 × 14 × 14 = 392 terms
+        // (vs 11 in the backward-input test), so floating-point accumulation
+        // error compounds proportionally. 1e-10 still asserts ~10 decimal
+        // digits of agreement against the naive reference — well inside the
+        // ~9-10-digit envelope expected for 392-term fp64 sums.
         for (int i = 0; i < actual.Length; i++)
             Assert.True(System.Math.Abs(actual[i] - expected[i]) < 1e-10,
                 $"[{i}] actual={actual[i]:F12} expected={expected[i]:F12}");
