@@ -66,7 +66,10 @@ inline float fast_exp1(float x) {
 // ACTIVATION KERNELS
 // ===========================================================================
 
-// ReLU: max(0, x)
+// ReLU: max(0, x) — NaN-preserving.
+// fmax(0, NaN) returns 0 in OpenCL because NaN compares as less-than,
+// silently zeroing incoming NaN values. CPU ReluNaNSafe* preserves NaN
+// as a debugging signal — match that contract here too.
 __kernel void relu(
     __global const float* input,
     __global float* output,
@@ -76,9 +79,18 @@ __kernel void relu(
     const int idx4 = idx * 4;
     if (idx4 + 3 < size) {
         float4 x = vload4(idx, input);
-        vstore4(fmax((float4)(0.0f), x), idx, output);
+        // isnan returns int4 mask (all-ones per NaN lane); select() returns
+        // the NaN where the mask is set, fmax otherwise. The fmax branch is
+        // safe for non-NaN inputs.
+        float4 zero = (float4)(0.0f);
+        float4 m = fmax(zero, x);
+        int4 nanMask = isnan(x);
+        vstore4(select(m, x, nanMask), idx, output);
     } else {
-        for (int i = idx4; i < size; i++) output[i] = fmax(0.0f, input[i]);
+        for (int i = idx4; i < size; i++) {
+            float v = input[i];
+            output[i] = isnan(v) ? v : fmax(0.0f, v);
+        }
     }
 }
 

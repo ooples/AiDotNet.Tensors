@@ -3074,7 +3074,31 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         private void ExecuteUnary(string kernelName, IGpuBuffer A, IGpuBuffer B, int size)
         {
-            ExecuteActivation(kernelName, A, B, size);
+            // The kernels routed through ExecuteUnary (negate_vector, floor_vector,
+            // ceil_vector, round_vector, trunc_vector) are SCALAR — one element per
+            // work item with an `if (idx >= size) return` early-out. Activation
+            // kernels (relu, sigmoid, etc) routed directly through ExecuteActivation
+            // are float4-vectorized. ExecuteActivation launches `(size+3)/4` work
+            // items assuming the float4 layout — that's correct for activations but
+            // catastrophically wrong for scalar kernels: only the first
+            // ceil(size/4) elements get a work item, so for size=3 only B[0] is
+            // written and B[1..2] stay at their pre-launch (post-allocation,
+            // device-default-zero) values. Manifests as TensorNegate returning
+            // [-1, 0, 0] for input [1, 1, 1] on the backward path. Fix: launch
+            // exactly `size` work items so every element gets one.
+            if (_context == null)
+                throw new InvalidOperationException("OpenCL context not available");
+
+            var bufferA = ((DirectOpenClGpuBuffer)A).Buffer;
+            var bufferB = ((DirectOpenClGpuBuffer)B).Buffer;
+
+            var kernel = _kernelCache[kernelName];
+            kernel.SetArg(0, bufferA.Handle);
+            kernel.SetArg(1, bufferB.Handle);
+            kernel.SetArg(2, size);
+
+            int localSize = CalculateOptimalWorkGroupSize1D(size);
+            kernel.Execute1D(size, localSize);
         }
 
         public void Relu(IGpuBuffer A, IGpuBuffer B, int size)
