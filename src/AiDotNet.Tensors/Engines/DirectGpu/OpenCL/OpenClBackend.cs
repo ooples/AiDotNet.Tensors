@@ -154,6 +154,17 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         /// </summary>
         public static bool IsOpenClAvailable => DirectOpenClContext.IsAvailable;
 
+        /// <summary>
+        /// True only when a real OpenCL GPU device is exposed (and
+        /// <c>AIDOTNET_DISABLE_OPENCL</c> is not set). Use this when deciding whether
+        /// to create an OpenCL backend — <see cref="IsOpenClAvailable"/> is true on
+        /// CPU-only machines that ship an OpenCL ICD (Intel/AMD CPU runtimes, POCL),
+        /// and proceeding into the backend on those machines forces the ~591-kernel
+        /// cache to compile against the CPU runtime, inflating RSS by 2-3 GB with
+        /// no inference speedup over the SIMD CPU path.
+        /// </summary>
+        public static bool IsGpuAvailable => DirectOpenClContext.IsGpuAvailable;
+
         public OpenClBackend(ILogger? logger = null) : this(0, logger)
         {
         }
@@ -165,7 +176,13 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             _programs = new List<DirectOpenClProgram>();
             _maxWorkItemSizes = Array.Empty<ulong>();
 
-            if (!DirectOpenClContext.IsAvailable)
+            // Gate on GPU presence (not just OpenCL ICD presence). On a CPU-only box
+            // with an OpenCL CPU runtime installed (Intel/AMD/POCL), the legacy
+            // IsAvailable check returned true and we eagerly compiled ~591 kernels
+            // against the CPU runtime, costing 2-3 GB of process RSS for nothing.
+            // AIDOTNET_DISABLE_OPENCL=1 forces this branch even on machines with a
+            // real GPU. See AiDotNet.Tensors#436 (P2 — OpenCL kernel cache RSS).
+            if (!DirectOpenClContext.IsGpuAvailable)
             {
                 IsAvailable = false;
                 DeviceName = "None";

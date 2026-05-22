@@ -345,6 +345,17 @@ public sealed class DirectGpuEngine : IDisposable
         {
             Trace.WriteLine("[DirectGpuEngine] Checking OpenCL availability...");
             Trace.WriteLine($"[DirectGpuEngine] OpenClBackend.IsOpenClAvailable = {OpenClBackend.IsOpenClAvailable}");
+            // Skip backend creation entirely when no real GPU is present. The
+            // OpenClBackend ctor would early-exit on the same check, but it still
+            // pays a context-init / native-binding cost we can avoid by short-
+            // circuiting here. CPU-only machines with an OpenCL CPU runtime
+            // installed (Intel/AMD/POCL) used to fall into this path and burn
+            // a few hundred ms on a no-op probe.
+            if (!OpenClBackend.IsGpuAvailable)
+            {
+                Trace.WriteLine("[DirectGpuEngine] No OpenCL GPU device exposed — skipping backend creation.");
+                return null;
+            }
 
             Trace.WriteLine("[DirectGpuEngine] Creating OpenCL backend...");
             var openClBackend = new OpenClBackend();
