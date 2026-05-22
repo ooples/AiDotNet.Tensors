@@ -46,6 +46,18 @@ public class PerformanceRegressionTests
     private const double BatchMatMulBudgetMs = 2.0;      // Scalar would be ~5ms
     private const double ReLUBackwardBudgetMs = 5.0;     // Scalar would be ~10ms
 
+    // AIsEval CNN inference perf gate — see ooples/AiDotNet.Tensors#436.
+    // The AIsEval (PyTorch-vs-AiDotNet) benchmark surfaced that AiDotNet's CNN
+    // bs=128 inference is currently ~6.7x faster than PyTorch's nn.Conv2d path
+    // on the same shapes (6.21 ms vs 41.42 ms on the reference rig). These two
+    // gates lock in the two Conv2D forward shapes that dominate the CNN
+    // benchmark (the layer-1 and layer-2 conv at SmallCNN's input/intermediate
+    // resolutions) so a future refactor of the conv path can't silently regress
+    // the lead. Budgets are 4-5x our measured numbers — generous enough for CI
+    // noise, tight enough to catch any 5x+ regression.
+    private const double CnnAiseval_L1_BudgetMs = 30.0;  // Measured ~6 ms on RTX-class CPU
+    private const double CnnAiseval_L2_BudgetMs = 35.0;  // Measured ~8 ms on RTX-class CPU
+
     public PerformanceRegressionTests(ITestOutputHelper output) => _output = output;
 
     [Fact(Skip = "Performance guard — run manually with --filter PerformanceRegression")]
@@ -267,5 +279,57 @@ public class PerformanceRegressionTests
         _output.WriteLine($"ReLU backward 1M: {ms:F3}ms (budget: 5ms)");
         Assert.True(ms < ReLUBackwardBudgetMs,
             $"ReLU backward took {ms:F3}ms — check SimdKernels.ReluBackwardUnsafe.");
+    }
+
+    [Fact(Skip = "Performance guard — run manually with --filter PerformanceRegression")]
+    public void Conv2D_AiseValCnnL1_Forward_PreservesPyTorchLead()
+    {
+        // AIsEval CNN layer-1 shape: nn.Conv2d(1, 16, kernel=3, padding=1) at
+        // input [128, 1, 28, 28] (MNIST-shape, bs=128). PyTorch baseline for
+        // this exact shape was 41.42 ms (bs=128 steady-state latency including
+        // ReLU + MaxPool, but Conv2D dominates). Our measured pure-Conv2D was
+        // ~5-6 ms. Locking the gate at 30 ms catches a 5x+ regression while
+        // tolerating CI noise and cold JIT.
+        var input = Tensor<float>.CreateRandom([128, 1, 28, 28]);
+        var kernel = Tensor<float>.CreateRandom([16, 1, 3, 3]);
+
+        for (int w = 0; w < 3; w++) _engine.Conv2D(input, kernel, stride: 1, padding: 1);
+
+        var sw = Stopwatch.StartNew();
+        const int iters = 10;
+        for (int i = 0; i < iters; i++) _engine.Conv2D(input, kernel, stride: 1, padding: 1);
+        sw.Stop();
+        double ms = sw.Elapsed.TotalMilliseconds / iters;
+
+        _output.WriteLine($"Conv2D AIsEval-L1 [128,1,28,28]@[16,1,3,3] pad=1: {ms:F3}ms (budget: {CnnAiseval_L1_BudgetMs}ms)");
+        Assert.True(ms < CnnAiseval_L1_BudgetMs,
+            $"Conv2D AIsEval-L1 took {ms:F3}ms — exceeds {CnnAiseval_L1_BudgetMs}ms budget. " +
+            "The AIsEval benchmark relies on this shape being well below PyTorch's 41.42ms baseline; " +
+            "a regression here would erase the CNN inference lead documented in issue #436.");
+    }
+
+    [Fact(Skip = "Performance guard — run manually with --filter PerformanceRegression")]
+    public void Conv2D_AiseValCnnL2_Forward_PreservesPyTorchLead()
+    {
+        // AIsEval CNN layer-2 shape: nn.Conv2d(16, 32, kernel=3, padding=1) at
+        // input [128, 16, 14, 14] (post-first-MaxPool). This is the heavier of
+        // the two convs by FLOPs (~ 36M MACs vs ~6M for L1). Budget at 35 ms
+        // covers the same 5x-regression-catching headroom.
+        var input = Tensor<float>.CreateRandom([128, 16, 14, 14]);
+        var kernel = Tensor<float>.CreateRandom([32, 16, 3, 3]);
+
+        for (int w = 0; w < 3; w++) _engine.Conv2D(input, kernel, stride: 1, padding: 1);
+
+        var sw = Stopwatch.StartNew();
+        const int iters = 10;
+        for (int i = 0; i < iters; i++) _engine.Conv2D(input, kernel, stride: 1, padding: 1);
+        sw.Stop();
+        double ms = sw.Elapsed.TotalMilliseconds / iters;
+
+        _output.WriteLine($"Conv2D AIsEval-L2 [128,16,14,14]@[32,16,3,3] pad=1: {ms:F3}ms (budget: {CnnAiseval_L2_BudgetMs}ms)");
+        Assert.True(ms < CnnAiseval_L2_BudgetMs,
+            $"Conv2D AIsEval-L2 took {ms:F3}ms — exceeds {CnnAiseval_L2_BudgetMs}ms budget. " +
+            "Layer-2 conv dominates the CNN benchmark's FLOPs; a regression here is what would " +
+            "show up first in the AIsEval bs=128 numbers.");
     }
 }
