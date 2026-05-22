@@ -1594,6 +1594,34 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
     private unsafe delegate void PointerBinaryKernel(float* a, float* b, float* r, int count);
 
+    /// <summary>
+    /// AiDotNet#396 fix: return the array suitable for pinning the tensor's storage
+    /// in a specialized-forward kernel. Prefers
+    /// <see cref="LinearAlgebra.TensorBase{T}.GetLiveBackingArrayAllowingPaddingOrNull"/>
+    /// which returns the actual pool-padded backing array, so pins point at the live
+    /// storage and writes through the pin are visible to subsequent
+    /// <c>tensor.AsSpan()</c> / <c>tensor[i]</c> reads. Falls back to
+    /// <c>GetDataArray()</c> for non-contiguous / non-zero-offset / non-CPU tensors
+    /// (where GetDataArray returns a COPY) — those are filtered out by callers'
+    /// <c>IsContiguous</c> gates, so the fallback should never fire in practice.
+    /// <para>
+    /// The bug was: <c>GetDataArray()</c> returns a COPY when the tensor is
+    /// ArrayPool-padded (logical Length=1 on a 16-slot bucket, for instance).
+    /// Pinning that copy and writing through the pin updated the COPY, not the
+    /// live tensor backing. Subsequent reads via <c>lossOutput[0]</c> →
+    /// <c>GetFlat</c> hit the live backing (still zero-initialized from the pool
+    /// rent), so the consumer saw <c>lastLoss = 0</c> even when the negate kernel
+    /// computed NaN. Surfaced by AiDotNet#1346 / Tensors#396; original
+    /// pool-padding fix pattern was established by Tensors#350.
+    /// </para>
+    /// </summary>
+    private static float[] GetPinnableFloatBacking(Tensor<float> t)
+        => t.GetLiveBackingArrayAllowingPaddingOrNull() ?? t.GetDataArray();
+
+    /// <summary>FP64 counterpart of <see cref="GetPinnableFloatBacking"/>.</summary>
+    private static double[] GetPinnableDoubleBacking(Tensor<double> t)
+        => t.GetLiveBackingArrayAllowingPaddingOrNull() ?? t.GetDataArray();
+
     internal static unsafe Action<IEngine>? TryBuildSpecializedForward(
         CompiledStep<T> step,
         List<GCHandle>? handleTracker = null,
@@ -1800,7 +1828,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             {
                 // Pinned path: GCHandle once at compile time
                 var inH = PinAndTrack(
-                    ((Tensor<float>)(object)input).GetDataArray(), handleTracker);
+                    GetPinnableFloatBacking((Tensor<float>)(object)input), handleTracker);
                 int len = input.Length;
 
                 // For large arrays, use parallel chunked reduction (matches TensorSum)
@@ -1898,7 +1926,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             var input = step.Inputs[0];
             var output = step.OutputBuffer;
-            var inH = PinAndTrack(((Tensor<float>)(object)input).GetDataArray(), handleTracker);
+            var inH = PinAndTrack(GetPinnableFloatBacking((Tensor<float>)(object)input), handleTracker);
             int len = input.Length;
             float[]? cOut = null;
 
@@ -1927,9 +1955,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             && typeof(T) == typeof(float))
         {
             var a = step.Inputs[0]; var b = step.Inputs[1]; var o = step.OutputBuffer;
-            var aH = PinAndTrack(((Tensor<float>)(object)a).GetDataArray(), handleTracker);
-            var bH = PinAndTrack(((Tensor<float>)(object)b).GetDataArray(), handleTracker);
-            var oH = PinAndTrack(((Tensor<float>)(object)o).GetDataArray(), handleTracker);
+            var aH = PinAndTrack(GetPinnableFloatBacking((Tensor<float>)(object)a), handleTracker);
+            var bH = PinAndTrack(GetPinnableFloatBacking((Tensor<float>)(object)b), handleTracker);
+            var oH = PinAndTrack(GetPinnableFloatBacking((Tensor<float>)(object)o), handleTracker);
             int len = a.Length;
             return BuildParallelBinaryKernel(aH, bH, oH, len,
                 (pA, pB, pR, count) => { unsafe { SimdKernels.VectorAddUnsafe(pA, pB, pR, count); } });
@@ -1947,9 +1975,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             && typeof(T) == typeof(float))
         {
             var a = step.Inputs[0]; var b = step.Inputs[1]; var o = step.OutputBuffer;
-            var aH = PinAndTrack(((Tensor<float>)(object)a).GetDataArray(), handleTracker);
-            var bH = PinAndTrack(((Tensor<float>)(object)b).GetDataArray(), handleTracker);
-            var oH = PinAndTrack(((Tensor<float>)(object)o).GetDataArray(), handleTracker);
+            var aH = PinAndTrack(GetPinnableFloatBacking((Tensor<float>)(object)a), handleTracker);
+            var bH = PinAndTrack(GetPinnableFloatBacking((Tensor<float>)(object)b), handleTracker);
+            var oH = PinAndTrack(GetPinnableFloatBacking((Tensor<float>)(object)o), handleTracker);
             int len = a.Length;
             return BuildParallelBinaryKernel(aH, bH, oH, len,
                 (pA, pB, pR, count) => { unsafe { SimdKernels.VectorSubtractUnsafe(pA, pB, pR, count); } });
@@ -1967,9 +1995,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             && typeof(T) == typeof(float))
         {
             var a = step.Inputs[0]; var b = step.Inputs[1]; var o = step.OutputBuffer;
-            var aH = PinAndTrack(((Tensor<float>)(object)a).GetDataArray(), handleTracker);
-            var bH = PinAndTrack(((Tensor<float>)(object)b).GetDataArray(), handleTracker);
-            var oH = PinAndTrack(((Tensor<float>)(object)o).GetDataArray(), handleTracker);
+            var aH = PinAndTrack(GetPinnableFloatBacking((Tensor<float>)(object)a), handleTracker);
+            var bH = PinAndTrack(GetPinnableFloatBacking((Tensor<float>)(object)b), handleTracker);
+            var oH = PinAndTrack(GetPinnableFloatBacking((Tensor<float>)(object)o), handleTracker);
             int len = a.Length;
             return BuildParallelBinaryKernel(aH, bH, oH, len,
                 (pA, pB, pR, count) => { unsafe { SimdKernels.VectorMultiplyUnsafe(pA, pB, pR, count); } });
@@ -1990,9 +2018,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
             var inH = PinAndTrack(
-                ((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+                GetPinnableFloatBacking((Tensor<float>)(object)inp), handleTracker);
             var outH = PinAndTrack(
-                ((Tensor<float>)(object)o).GetDataArray(), handleTracker);
+                GetPinnableFloatBacking((Tensor<float>)(object)o), handleTracker);
             int len = inp.Length;
             return eng =>
             {
@@ -2026,8 +2054,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            var inH = PinAndTrack(((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
-            var outH = PinAndTrack(((Tensor<float>)(object)o).GetDataArray(), handleTracker);
+            var inH = PinAndTrack(GetPinnableFloatBacking((Tensor<float>)(object)inp), handleTracker);
+            var outH = PinAndTrack(GetPinnableFloatBacking((Tensor<float>)(object)o), handleTracker);
             int len = inp.Length;
             return eng => { unsafe { SimdKernels.NegateUnsafe((float*)inH.AddrOfPinnedObject(), (float*)outH.AddrOfPinnedObject(), len); } };
         }
@@ -2047,9 +2075,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
             var inH = PinAndTrack(
-                ((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+                GetPinnableFloatBacking((Tensor<float>)(object)inp), handleTracker);
             var outH = PinAndTrack(
-                ((Tensor<float>)(object)o).GetDataArray(), handleTracker);
+                GetPinnableFloatBacking((Tensor<float>)(object)o), handleTracker);
             int len = inp.Length;
             return eng =>
             {
@@ -2069,9 +2097,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
             // Pin arrays once at compile time — GCHandles survive across replays
             var inHandle = PinAndTrack(
-                ((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+                GetPinnableFloatBacking((Tensor<float>)(object)inp), handleTracker);
             var outHandle = PinAndTrack(
-                ((Tensor<float>)(object)o).GetDataArray(), handleTracker);
+                GetPinnableFloatBacking((Tensor<float>)(object)o), handleTracker);
             int len = inp.Length;
             return eng =>
             {
@@ -2177,9 +2205,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
             var inH = PinAndTrack(
-                ((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+                GetPinnableFloatBacking((Tensor<float>)(object)inp), handleTracker);
             var outH = PinAndTrack(
-                ((Tensor<float>)(object)o).GetDataArray(), handleTracker);
+                GetPinnableFloatBacking((Tensor<float>)(object)o), handleTracker);
             int len = inp.Length;
             return eng =>
             {
@@ -2206,9 +2234,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
             float alphaF = step.SavedState != null && step.SavedState.Length > 0 ? (float)(double)step.SavedState[0] : 1.0f;
             var inH = PinAndTrack(
-                ((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+                GetPinnableFloatBacking((Tensor<float>)(object)inp), handleTracker);
             var outH = PinAndTrack(
-                ((Tensor<float>)(object)o).GetDataArray(), handleTracker);
+                GetPinnableFloatBacking((Tensor<float>)(object)o), handleTracker);
             int len = inp.Length;
             return eng =>
             {
@@ -2229,9 +2257,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
             var inH = PinAndTrack(
-                ((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+                GetPinnableFloatBacking((Tensor<float>)(object)inp), handleTracker);
             var outH = PinAndTrack(
-                ((Tensor<float>)(object)o).GetDataArray(), handleTracker);
+                GetPinnableFloatBacking((Tensor<float>)(object)o), handleTracker);
             int len = inp.Length;
             return eng =>
             {
@@ -2251,9 +2279,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
             var inH = PinAndTrack(
-                ((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+                GetPinnableFloatBacking((Tensor<float>)(object)inp), handleTracker);
             var outH = PinAndTrack(
-                ((Tensor<float>)(object)o).GetDataArray(), handleTracker);
+                GetPinnableFloatBacking((Tensor<float>)(object)o), handleTracker);
             int len = inp.Length;
             return eng =>
             {
@@ -2279,9 +2307,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
             var inH = PinAndTrack(
-                ((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+                GetPinnableFloatBacking((Tensor<float>)(object)inp), handleTracker);
             var outH = PinAndTrack(
-                ((Tensor<float>)(object)o).GetDataArray(), handleTracker);
+                GetPinnableFloatBacking((Tensor<float>)(object)o), handleTracker);
             int len = inp.Length;
             return eng =>
             {
@@ -2350,12 +2378,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             if (step.SavedState.Length >= 3 && step.SavedState[2] is double epsD)
                 eps = (float)epsD;
 
-            var inH = PinAndTrack(((Tensor<float>)(object)input).GetDataArray(), handleTracker);
-            var outH = PinAndTrack(((Tensor<float>)(object)output).GetDataArray(), handleTracker);
-            var gammaH = PinAndTrack(((Tensor<float>)(object)gamma).GetDataArray(), handleTracker);
-            var betaH = PinAndTrack(((Tensor<float>)(object)beta).GetDataArray(), handleTracker);
-            var meanH = PinAndTrack(((Tensor<float>)(object)mean).GetDataArray(), handleTracker);
-            var varH = PinAndTrack(((Tensor<float>)(object)variance).GetDataArray(), handleTracker);
+            var inH = PinAndTrack(GetPinnableFloatBacking((Tensor<float>)(object)input), handleTracker);
+            var outH = PinAndTrack(GetPinnableFloatBacking((Tensor<float>)(object)output), handleTracker);
+            var gammaH = PinAndTrack(GetPinnableFloatBacking((Tensor<float>)(object)gamma), handleTracker);
+            var betaH = PinAndTrack(GetPinnableFloatBacking((Tensor<float>)(object)beta), handleTracker);
+            var meanH = PinAndTrack(GetPinnableFloatBacking((Tensor<float>)(object)mean), handleTracker);
+            var varH = PinAndTrack(GetPinnableFloatBacking((Tensor<float>)(object)variance), handleTracker);
             int length = input.Length;
             float capturedEps = eps;
 
@@ -2399,9 +2427,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             && typeof(T) == typeof(float))
         {
             var a = step.Inputs[0]; var b = step.Inputs[1]; var o = step.OutputBuffer;
-            var aH = PinAndTrack(((Tensor<float>)(object)a).GetDataArray(), handleTracker);
-            var bH = PinAndTrack(((Tensor<float>)(object)b).GetDataArray(), handleTracker);
-            var oH = PinAndTrack(((Tensor<float>)(object)o).GetDataArray(), handleTracker);
+            var aH = PinAndTrack(GetPinnableFloatBacking((Tensor<float>)(object)a), handleTracker);
+            var bH = PinAndTrack(GetPinnableFloatBacking((Tensor<float>)(object)b), handleTracker);
+            var oH = PinAndTrack(GetPinnableFloatBacking((Tensor<float>)(object)o), handleTracker);
             int len = a.Length;
             return eng =>
             {
@@ -2607,9 +2635,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
             var inH = PinAndTrack(
-                ((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+                GetPinnableFloatBacking((Tensor<float>)(object)inp), handleTracker);
             var outH = PinAndTrack(
-                ((Tensor<float>)(object)o).GetDataArray(), handleTracker);
+                GetPinnableFloatBacking((Tensor<float>)(object)o), handleTracker);
             int rows = inp._shape[0], cols = inp._shape[1];
             return eng =>
             {
@@ -2636,7 +2664,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
             var inHandle = PinAndTrack(
-                ((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+                GetPinnableFloatBacking((Tensor<float>)(object)inp), handleTracker);
             float[]? cOut = null;
             int len = inp.Length;
             return eng =>
@@ -2656,9 +2684,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
             var inH = PinAndTrack(
-                ((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+                GetPinnableFloatBacking((Tensor<float>)(object)inp), handleTracker);
             var outH = PinAndTrack(
-                ((Tensor<float>)(object)o).GetDataArray(), handleTracker);
+                GetPinnableFloatBacking((Tensor<float>)(object)o), handleTracker);
             int len = inp.Length;
             return eng =>
             {
@@ -2693,9 +2721,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
             var inH = PinAndTrack(
-                ((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+                GetPinnableFloatBacking((Tensor<float>)(object)inp), handleTracker);
             var outH = PinAndTrack(
-                ((Tensor<float>)(object)o).GetDataArray(), handleTracker);
+                GetPinnableFloatBacking((Tensor<float>)(object)o), handleTracker);
             int len = inp.Length;
             return eng =>
             {
@@ -2709,9 +2737,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
             var inH = PinAndTrack(
-                ((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+                GetPinnableFloatBacking((Tensor<float>)(object)inp), handleTracker);
             var outH = PinAndTrack(
-                ((Tensor<float>)(object)o).GetDataArray(), handleTracker);
+                GetPinnableFloatBacking((Tensor<float>)(object)o), handleTracker);
             int len = inp.Length;
             return eng =>
             {
@@ -2725,9 +2753,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
             var inH = PinAndTrack(
-                ((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+                GetPinnableFloatBacking((Tensor<float>)(object)inp), handleTracker);
             var outH = PinAndTrack(
-                ((Tensor<float>)(object)o).GetDataArray(), handleTracker);
+                GetPinnableFloatBacking((Tensor<float>)(object)o), handleTracker);
             int len = inp.Length;
             return eng =>
             {
@@ -2741,9 +2769,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
             var inH = PinAndTrack(
-                ((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+                GetPinnableFloatBacking((Tensor<float>)(object)inp), handleTracker);
             var outH = PinAndTrack(
-                ((Tensor<float>)(object)o).GetDataArray(), handleTracker);
+                GetPinnableFloatBacking((Tensor<float>)(object)o), handleTracker);
             int len = inp.Length;
             return eng =>
             {
@@ -2757,9 +2785,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
             var inH = PinAndTrack(
-                ((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+                GetPinnableFloatBacking((Tensor<float>)(object)inp), handleTracker);
             var outH = PinAndTrack(
-                ((Tensor<float>)(object)o).GetDataArray(), handleTracker);
+                GetPinnableFloatBacking((Tensor<float>)(object)o), handleTracker);
             int len = inp.Length;
             return eng =>
             {
@@ -2772,8 +2800,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            var inH = PinAndTrack(((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
-            var outH = PinAndTrack(((Tensor<float>)(object)o).GetDataArray(), handleTracker);
+            var inH = PinAndTrack(GetPinnableFloatBacking((Tensor<float>)(object)inp), handleTracker);
+            var outH = PinAndTrack(GetPinnableFloatBacking((Tensor<float>)(object)o), handleTracker);
             int len = inp.Length;
             return eng => { unsafe { SimdKernels.ReciprocalUnsafe((float*)inH.AddrOfPinnedObject(), (float*)outH.AddrOfPinnedObject(), len); } };
         }
@@ -2783,8 +2811,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            var inH = PinAndTrack(((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
-            var outH = PinAndTrack(((Tensor<float>)(object)o).GetDataArray(), handleTracker);
+            var inH = PinAndTrack(GetPinnableFloatBacking((Tensor<float>)(object)inp), handleTracker);
+            var outH = PinAndTrack(GetPinnableFloatBacking((Tensor<float>)(object)o), handleTracker);
             int len = inp.Length;
             return eng => { unsafe { SimdKernels.FloorUnsafe((float*)inH.AddrOfPinnedObject(), (float*)outH.AddrOfPinnedObject(), len); } };
         }
@@ -2794,8 +2822,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            var inH = PinAndTrack(((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
-            var outH = PinAndTrack(((Tensor<float>)(object)o).GetDataArray(), handleTracker);
+            var inH = PinAndTrack(GetPinnableFloatBacking((Tensor<float>)(object)inp), handleTracker);
+            var outH = PinAndTrack(GetPinnableFloatBacking((Tensor<float>)(object)o), handleTracker);
             int len = inp.Length;
             return eng => { unsafe { SimdKernels.CeilingUnsafe((float*)inH.AddrOfPinnedObject(), (float*)outH.AddrOfPinnedObject(), len); } };
         }
@@ -2805,8 +2833,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            var inH = PinAndTrack(((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
-            var outH = PinAndTrack(((Tensor<float>)(object)o).GetDataArray(), handleTracker);
+            var inH = PinAndTrack(GetPinnableFloatBacking((Tensor<float>)(object)inp), handleTracker);
+            var outH = PinAndTrack(GetPinnableFloatBacking((Tensor<float>)(object)o), handleTracker);
             int len = inp.Length;
             return eng => { unsafe { SimdKernels.RoundUnsafe((float*)inH.AddrOfPinnedObject(), (float*)outH.AddrOfPinnedObject(), len); } };
         }
@@ -2818,11 +2846,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             var a = step.Inputs[0]; var b = step.Inputs[1]; var o = step.OutputBuffer;
             var aH = PinAndTrack(
-                ((Tensor<float>)(object)a).GetDataArray(), handleTracker);
+                GetPinnableFloatBacking((Tensor<float>)(object)a), handleTracker);
             var bH = PinAndTrack(
-                ((Tensor<float>)(object)b).GetDataArray(), handleTracker);
+                GetPinnableFloatBacking((Tensor<float>)(object)b), handleTracker);
             var oH = PinAndTrack(
-                ((Tensor<float>)(object)o).GetDataArray(), handleTracker);
+                GetPinnableFloatBacking((Tensor<float>)(object)o), handleTracker);
             int len = a.Length;
             return eng =>
             {
@@ -2838,9 +2866,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             float fMin = step.SavedState != null && step.SavedState.Length >= 2 ? Convert.ToSingle(step.SavedState[0]) : float.MinValue;
             float fMax = step.SavedState != null && step.SavedState.Length >= 2 ? Convert.ToSingle(step.SavedState[1]) : float.MaxValue;
             var inH = PinAndTrack(
-                ((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+                GetPinnableFloatBacking((Tensor<float>)(object)inp), handleTracker);
             var outH = PinAndTrack(
-                ((Tensor<float>)(object)o).GetDataArray(), handleTracker);
+                GetPinnableFloatBacking((Tensor<float>)(object)o), handleTracker);
             int len = inp.Length;
             return eng =>
             {
