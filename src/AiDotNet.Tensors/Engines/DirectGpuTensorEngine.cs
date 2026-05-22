@@ -4082,6 +4082,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!TryGetBackend(out var backend))
             return base.FusedConv2D(input, kernel, bias, strideH, strideW, padH, padW, dilationH, dilationW, activation);
 
+        // Stage 8 precision-fallback gate: this GPU path materialises T into
+        // float[] buffers (see outputFloat / biasFloat below) — for T=double
+        // that silently loses ~7 mantissa bits, which shows up immediately
+        // in FusedConv2DDoublePerfTests at ulp ≤ 1e-9. Route fp64 to the
+        // contract-compliant CPU FusedConv2D direct kernel.
+        if (DirectGpuEngine.ShouldFallbackForPrecision<T>())
+            return base.FusedConv2D(input, kernel, bias, strideH, strideW, padH, padW, dilationH, dilationW, activation);
+
         // Expected input shape: [batch, inChannels, height, width]
         // Expected kernel shape: [outChannels, inChannels, kernelH, kernelW]
         if (input.Rank != 4 || kernel.Rank != 4)
@@ -13236,35 +13244,21 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorPermute<T>(Tensor<T> tensor, int[] axes)
     {
-        // Previously routed through CpuEngine because the CUDA Permute
-        // kernel "is off for non-trivial axes mixes". Root cause for the
-        // 2×D permute fast path was the transpose_2d launch bug above
-        // (CudaBackend.Permute delegates rank-2 permutation [1,0] to
-        // Transpose, and rank-3 [0,2,1] to BatchedTranspose). The
-        // permute_general kernel formula itself is correct
-        // (see verification in CudaNeuralNetKernels.permute_general).
-        // Routing back to GPU now that the underlying transpose dispatch
-        // is fixed.
-        if (IsTapeActive<T>())
-            return base.TensorPermute(tensor, axes);
-        if (!TryGetBackend(out var backend))
-            return base.TensorPermute(tensor, axes);
-
-        try
-        {
-            using var bufIn = GetOrAllocateBuffer(backend, tensor.GetDataArray());
-            var bufOut = AllocateOutputBuffer(backend, tensor.Length);
-            backend.Permute(bufIn.Buffer, bufOut.Buffer, tensor.Shape._dims, axes);
-            var result = FinishGpuOp<T>(backend, bufOut, tensor.Length);
-            int[] outShape = new int[axes.Length];
-            for (int i = 0; i < axes.Length; i++)
-                outShape[i] = tensor.Shape._dims[axes[i]];
-            return new Tensor<T>(result, outShape);
-        }
-        catch (Exception)
-        {
-            return base.TensorPermute(tensor, axes);
-        }
+        // Permute is a view operation by contract — `tensor.Transpose(axes)`
+        // returns a strided view with permuted strides and zero data move.
+        // The GPU path here used to eagerly materialise into a new
+        // contiguous buffer via `backend.Permute(...)`, which violated the
+        // view contract: callers got back IsContiguous == true after a
+        // permute (TensorCopyToTests.StridedAfterPermute_*,
+        // StridedAfterTranspose_*, FloatTensor_CopyTo_WorksSymmetrically
+        // all asserted IsContiguous == false). Worse, it wasted a host→device→
+        // permute→device→host round-trip every time even though the result
+        // was indistinguishable from a metadata-only stride permute.
+        //
+        // Delegate to the CPU/base path which returns the strided view.
+        // Downstream GPU ops that genuinely need contiguous layout call
+        // `.Contiguous()` themselves at the point they need it.
+        return base.TensorPermute(tensor, axes);
     }
 
     /// <inheritdoc/>
@@ -14397,6 +14391,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> ReLU<T>(Tensor<T> tensor)
     {
+        // Stage 8 precision-fallback gate. TryRunUnary upload converts T→float
+        // inside GetOrAllocateBuffer and the download converts float→T. For
+        // T=double the round-trip silently loses ~7 mantissa bits per element,
+        // showing up as a 2.2e-9 drift in FusedConv2DDoublePerfTests.
+        // FusedConv2D_Double_ReLU_MatchesConvPlusBroadcastAddPlusReLU (Path A
+        // = Conv2D + BroadcastAdd + ReLU was being fp32-quantised through this
+        // ReLU even after my fallbacks fixed Conv2D + BroadcastAdd).
+        if (DirectGpuEngine.ShouldFallbackForPrecision<T>())
+            return base.ReLU(tensor);
+
         try
         {
             var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Relu(input, output, size));
@@ -14414,6 +14418,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> GELU<T>(Tensor<T> tensor)
     {
+        if (DirectGpuEngine.ShouldFallbackForPrecision<T>())
+            return base.GELU(tensor);
         try
         {
             var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Gelu(input, output, size));
@@ -14431,6 +14437,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> Mish<T>(Tensor<T> tensor)
     {
+        if (DirectGpuEngine.ShouldFallbackForPrecision<T>())
+            return base.Mish(tensor);
         try
         {
             var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Mish(input, output, size));
@@ -14449,6 +14457,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<T> LeakyReLU<T>(Tensor<T> tensor, T alpha)
     {
         if (!TryGetBackend(out var backend))
+            return base.LeakyReLU(tensor, alpha);
+        if (DirectGpuEngine.ShouldFallbackForPrecision<T>())
             return base.LeakyReLU(tensor, alpha);
 
         try
@@ -14472,6 +14482,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> HardSwish<T>(Tensor<T> input)
     {
+        if (DirectGpuEngine.ShouldFallbackForPrecision<T>())
+            return base.HardSwish(input);
         try
         {
             var result = TryRunUnary(input, static (backend, inp, output, size) => backend.Hardswish(inp, output, size));
@@ -14496,6 +14508,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorBroadcastAdd<T>(Tensor<T> a, Tensor<T> b)
     {
+        if (DirectGpuEngine.ShouldFallbackForPrecision<T>())
+            return base.TensorBroadcastAdd(a, b);
         if (TryGetBackend(out var backend) && a.Length > b.Length && a.Length % b.Length == 0)
         {
             try
@@ -14518,6 +14532,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorBroadcastSubtract<T>(Tensor<T> a, Tensor<T> b)
     {
+        if (DirectGpuEngine.ShouldFallbackForPrecision<T>())
+            return base.TensorBroadcastSubtract(a, b);
         if (TryGetBackend(out var backend) && a.Length > b.Length && a.Length % b.Length == 0)
         {
             try
@@ -14540,6 +14556,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorBroadcastDivide<T>(Tensor<T> a, Tensor<T> b)
     {
+        if (DirectGpuEngine.ShouldFallbackForPrecision<T>())
+            return base.TensorBroadcastDivide(a, b);
         if (TryGetBackend(out var backend) && a.Length > b.Length && a.Length % b.Length == 0)
         {
             try
@@ -16174,6 +16192,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return base.NativeComplexMultiply(a ?? throw new ArgumentNullException(nameof(a)), b ?? throw new ArgumentNullException(nameof(b)));
         if (!TryGetBackend(out var backend))
             return base.NativeComplexMultiply(a, b);
+        if (DirectGpuEngine.ShouldFallbackForPrecision<T>())
+            return base.NativeComplexMultiply(a, b);
 
         try
         {
@@ -16481,6 +16501,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (!TryGetBackend(out var backend))
             return base.NativeComplexConjugate(a);
+        if (DirectGpuEngine.ShouldFallbackForPrecision<T>())
+            return base.NativeComplexConjugate(a);
 
         try
         {
@@ -16504,6 +16526,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (!TryGetBackend(out var backend))
             return base.NativeComplexMagnitude(a);
+        if (DirectGpuEngine.ShouldFallbackForPrecision<T>())
+            return base.NativeComplexMagnitude(a);
 
         try
         {
@@ -16524,6 +16548,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<T> NativeComplexMagnitudeSquared<T>(Tensor<Complex<T>> a)
     {
         if (!TryGetBackend(out var backend))
+            return base.NativeComplexMagnitudeSquared(a);
+        if (DirectGpuEngine.ShouldFallbackForPrecision<T>())
             return base.NativeComplexMagnitudeSquared(a);
 
         try
@@ -16546,6 +16572,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (!TryGetBackend(out var backend))
             return base.NativeComplexPhase(a);
+        if (DirectGpuEngine.ShouldFallbackForPrecision<T>())
+            return base.NativeComplexPhase(a);
 
         try
         {
@@ -16566,6 +16594,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<Complex<T>> NativeComplexFromPolar<T>(Tensor<T> magnitudes, Tensor<T> phases)
     {
         if (!TryGetBackend(out var backend))
+            return base.NativeComplexFromPolar(magnitudes, phases);
+        if (DirectGpuEngine.ShouldFallbackForPrecision<T>())
             return base.NativeComplexFromPolar(magnitudes, phases);
 
         try
@@ -16597,6 +16627,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (!TryGetBackend(out var backend))
             return base.NativeComplexScale(a, scalar);
+        if (DirectGpuEngine.ShouldFallbackForPrecision<T>())
+            return base.NativeComplexScale(a, scalar);
 
         try
         {
@@ -16624,6 +16656,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return base.NativeComplexAdd(a ?? throw new ArgumentNullException(nameof(a)), b ?? throw new ArgumentNullException(nameof(b)));
         if (!TryGetBackend(out var backend))
             return base.NativeComplexAdd(a, b);
+        if (DirectGpuEngine.ShouldFallbackForPrecision<T>())
+            return base.NativeComplexAdd(a, b);
 
         try
         {
@@ -16650,6 +16684,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<Complex<T>> NativeComplexFFTComplex<T>(Tensor<Complex<T>> input)
     {
         if (!TryGetBackend(out var backend))
+            return base.NativeComplexFFTComplex(input);
+        if (DirectGpuEngine.ShouldFallbackForPrecision<T>())
             return base.NativeComplexFFTComplex(input);
 
         try
@@ -16685,6 +16721,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (k <= 0)
             throw new ArgumentException("k must be positive.", nameof(k));
         if (!TryGetBackend(out var backend))
+            return base.NativeComplexTopK(input, k);
+        if (DirectGpuEngine.ShouldFallbackForPrecision<T>())
             return base.NativeComplexTopK(input, k);
 
         try
@@ -16739,6 +16777,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return base.NativeComplexCrossSpectral(x ?? throw new ArgumentNullException(nameof(x)), y ?? throw new ArgumentNullException(nameof(y)));
         if (!TryGetBackend(out var backend))
             return base.NativeComplexCrossSpectral(x, y);
+        if (DirectGpuEngine.ShouldFallbackForPrecision<T>())
+            return base.NativeComplexCrossSpectral(x, y);
 
         try
         {
@@ -16765,6 +16805,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<Complex<T>> NativeComplexFFT<T>(Tensor<T> input)
     {
         if (!TryGetBackend(out var backend))
+            return base.NativeComplexFFT(input);
+        if (DirectGpuEngine.ShouldFallbackForPrecision<T>())
             return base.NativeComplexFFT(input);
 
         try
@@ -16801,6 +16843,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (!TryGetBackend(out var backend))
             return base.NativeComplexIFFTReal(input);
+        if (DirectGpuEngine.ShouldFallbackForPrecision<T>())
+            return base.NativeComplexIFFTReal(input);
 
         try
         {
@@ -16830,6 +16874,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<Complex<T>> NativeComplexIFFT<T>(Tensor<Complex<T>> input)
     {
         if (!TryGetBackend(out var backend))
+            return base.NativeComplexIFFT(input);
+        if (DirectGpuEngine.ShouldFallbackForPrecision<T>())
             return base.NativeComplexIFFT(input);
 
         try
@@ -16862,6 +16908,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (input is null || input.Rank < 2)
             return base.NativeComplexFFT2D(input ?? throw new ArgumentNullException(nameof(input)));
         if (!TryGetBackend(out var backend))
+            return base.NativeComplexFFT2D(input);
+        if (DirectGpuEngine.ShouldFallbackForPrecision<T>())
             return base.NativeComplexFFT2D(input);
 
         try
@@ -16900,6 +16948,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return base.NativeComplexIFFT2DReal(input ?? throw new ArgumentNullException(nameof(input)));
         if (!TryGetBackend(out var backend))
             return base.NativeComplexIFFT2DReal(input);
+        if (DirectGpuEngine.ShouldFallbackForPrecision<T>())
+            return base.NativeComplexIFFT2DReal(input);
 
         try
         {
@@ -16934,6 +16984,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 input ?? throw new ArgumentNullException(nameof(input)),
                 filter ?? throw new ArgumentNullException(nameof(filter)));
         if (!TryGetBackend(out var backend))
+            return base.NativeSpectralFilter(input, filter);
+        if (DirectGpuEngine.ShouldFallbackForPrecision<T>())
             return base.NativeSpectralFilter(input, filter);
 
         try
@@ -16997,6 +17049,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 input ?? throw new ArgumentNullException(nameof(input)),
                 filter ?? throw new ArgumentNullException(nameof(filter)));
         if (!TryGetBackend(out var backend))
+            return base.NativeSpectralFilterBatch(input, filter);
+        if (DirectGpuEngine.ShouldFallbackForPrecision<T>())
             return base.NativeSpectralFilterBatch(input, filter);
 
         try

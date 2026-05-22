@@ -794,23 +794,64 @@ internal static partial class SimdGemm
         if (m <= 0 || n <= 0) return;
         if (k <= 0) { c.Clear(); return; }
 
-        // PR #402: Dgemm shims to BlasManaged.Gemm<double> with autotune
-        // disabled — the multi-stage dispatch from main (Avx512 fast path,
-        // Stage 1 packed-tiled, Stage 2 direct, AVX2 fallback) lives inside
-        // BlasManaged.Gemm<T> now, so the shim is a transparent pass-through
-        // and avoids duplicating the dispatch logic here. DisableAutotune
-        // means this path doesn't read/write the autotune cache or
-        // increment global stats; autotune learning belongs in callers that
-        // call Gemm<T> directly.
-        AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.Gemm<double>(
-            a, lda: k, transA: false,
-            b, ldb: n, transB: false,
-            c, ldc: n,
-            m, n, k,
-            new AiDotNet.Tensors.Engines.BlasManaged.BlasOptions<double>
+#if NET8_0_OR_GREATER
+        // Stage 7 (#415): try AVX-512 8×16 first on capable CPUs; routes
+        // back to AVX2 internally if the shape is too small / misaligned.
+        if (Avx512SgemmDouble.CanUse)
+        {
+            Avx512SgemmDouble.DgemmBlocked(a, k, b, n, c, m, k, n, allowParallel: true);
+            return;
+        }
+#endif
+        DgemmAvx2OrScalar(a, b, c, m, k, n, allowParallel: true);
+    }
+
+    /// <summary>
+    /// AVX2-or-scalar dispatch with NO AVX-512 re-check. The AVX-512 path
+    /// (Avx512SgemmDouble.DgemmBlocked) calls this from its
+    /// small-or-misaligned fallback; routing back through <see cref="Dgemm"/>
+    /// would re-dispatch into Avx512SgemmDouble.DgemmBlocked on capable
+    /// hosts and recurse forever for any shape that fails the 8×16-aligned
+    /// gate. C must already be cleared by the caller.
+    /// </summary>
+    internal static void DgemmAvx2OrScalar(
+        ReadOnlySpan<double> a,
+        ReadOnlySpan<double> b,
+        Span<double> c,
+        int m, int k, int n,
+        bool allowParallel)
+    {
+#if NET5_0_OR_GREATER
+        if (Avx2.IsSupported && Fma.IsSupported)
+        {
+            // Stage 2: direct (no-packing) path for small shapes — saves
+            // PackA + PackB setup cost when work is small and access
+            // patterns are already cache-friendly.
+            if (DgemmShouldUseDirect(m, k, n))
             {
-                PackingMode = AiDotNet.Tensors.Engines.BlasManaged.PackingMode.DisableAutotune
-            });
+                DgemmDirect(a, b, c, m, k, n);
+                return;
+            }
+            // Stage 1 packed-tiled path: amortizes packing overhead on
+            // shapes large enough to benefit (per DgemmShouldUsePackedTiled
+            // gate). Small shapes fall through to the existing inline 64-
+            // block path which has no packing setup cost.
+            // Only DgemmTiledParallelM spawns nested parallelism — gated on
+            // allowParallel so DgemmSequential callers (BatchMatMul slices
+            // already running inside Parallel.For) don't oversubscribe.
+            if (DgemmShouldUsePackedTiled(m, k, n))
+            {
+                if (allowParallel && DgemmShouldParallelize(m, k, n))
+                    DgemmTiledParallelM(a, b, c, m, k, n);
+                else
+                    DgemmTiledSequential(a, b, c, m, k, n);
+                return;
+            }
+            DgemmAvx2(a, b, c, m, k, n, allowParallel);
+            return;
+        }
+#endif
+        DgemmScalar(a, b, c, m, k, n);
     }
 
     /// <summary>
@@ -900,24 +941,19 @@ internal static partial class SimdGemm
         c.Clear();
         if (k <= 0) return;
 
-#if NET5_0_OR_GREATER
-        if (Avx2.IsSupported && Fma.IsSupported)
+#if NET8_0_OR_GREATER
+        if (Avx512SgemmDouble.CanUse)
         {
-            if (DgemmShouldUseDirect(m, k, n))
-            {
-                DgemmDirect(a, b, c, m, k, n);
-                return;
-            }
-            if (DgemmShouldUsePackedTiled(m, k, n))
-            {
-                DgemmTiledSequential(a, b, c, m, k, n);
-                return;
-            }
-            DgemmAvx2(a, b, c, m, k, n, allowParallel: false);
+            Avx512SgemmDouble.DgemmBlocked(a, k, b, n, c, m, k, n, allowParallel: false);
             return;
         }
 #endif
-        DgemmScalar(a, b, c, m, k, n);
+        // DgemmAvx2OrScalar with allowParallel=false runs the same Stage 1/2
+        // direct + packed-tiled gates as Dgemm but takes the sequential
+        // packed-tiled branch (no DgemmTiledParallelM). Avoids duplicating
+        // the multi-stage dispatch logic here while preserving the
+        // "no nested parallelism" contract DgemmSequential promises.
+        DgemmAvx2OrScalar(a, b, c, m, k, n, allowParallel: false);
     }
 
     // ─────────────────────────────────────────────────────────────────────

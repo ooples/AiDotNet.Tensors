@@ -3144,6 +3144,29 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!a.IsContiguous) a = a.Contiguous();
         if (!b.IsContiguous) b = b.Contiguous();
 
+        // Channel-repeat fast path — covers the Conv2D NCHW bias / BN scale-shift
+        // pattern [B,C,H,W] op [1,C,1,1] that TryBroadcastTrailingRepeat rejects.
+        // Profile of VGG16 [1,3,224,224] FP64 forward showed BN inference at
+        // [1,64,224,224] taking ~254 ms per call without this path (the generic
+        // a.BroadcastAdd walks each output index via indexer — ~100× slower
+        // than SIMD). Closes the AiDotNet#1394 perf wall on Conv+BN models.
+        if (TryBroadcastChannelRepeat(a, b, out int bcr_batch, out int bcr_chan, out int bcr_spatial))
+        {
+            var res = AutoTensorCache.RentOrAllocate<T>(a._shape);
+            ApplyBroadcastChannelOp(
+                a._storage.GetDataArray(), a._storageOffset,
+                b._storage.GetDataArray(), b._storageOffset,
+                res._storage.GetDataArray(), res._storageOffset,
+                bcr_batch, bcr_chan, bcr_spatial, BroadcastOp.Add);
+            DifferentiableOps.RecordBinary("TensorBroadcastAdd", res, aOrig, bOrig, BackwardFunctions<T>.BroadcastAddBackward);
+            if (AutoTracer.ShouldRecord)
+            {
+                var ca = a; var cb = b;
+                AutoTracer.RecordOp("TensorBroadcastAdd", res, eng => eng.TensorBroadcastAdd(ca, cb));
+            }
+            return res;
+        }
+
         // Generic trailing-repeat fast path — same rationale as
         // TensorBroadcastMultiply. The DiT AdaLN shift path hits this every
         // block × every inference step × every Predict, so the prior indexer-
@@ -3216,6 +3239,24 @@ public partial class CpuEngine : ITensorLevelEngine
         var bOrig = b;
         if (!a.IsContiguous) a = a.Contiguous();
         if (!b.IsContiguous) b = b.Contiguous();
+
+        // Channel-repeat fast path — see TensorBroadcastAdd for rationale.
+        if (TryBroadcastChannelRepeat(a, b, out int bcs_batch, out int bcs_chan, out int bcs_spatial))
+        {
+            var res = AutoTensorCache.RentOrAllocate<T>(a._shape);
+            ApplyBroadcastChannelOp(
+                a._storage.GetDataArray(), a._storageOffset,
+                b._storage.GetDataArray(), b._storageOffset,
+                res._storage.GetDataArray(), res._storageOffset,
+                bcs_batch, bcs_chan, bcs_spatial, BroadcastOp.Subtract);
+            DifferentiableOps.RecordBinary("TensorBroadcastSubtract", res, aOrig, bOrig, BackwardFunctions<T>.BroadcastSubtractBackward);
+            if (AutoTracer.ShouldRecord)
+            {
+                var ca = a; var cb = b;
+                AutoTracer.RecordOp("TensorBroadcastSubtract", res, eng => eng.TensorBroadcastSubtract(ca, cb));
+            }
+            return res;
+        }
 
         // Fast path for [N,M] - [M] or [N,M] - [1,M] bias subtract pattern
         if (typeof(T) == typeof(float) && a.Rank == 2 && (b.Rank == 1 || (b.Rank == 2 && b._shape[0] == 1)))
@@ -3308,6 +3349,24 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!a.IsContiguous) a = a.Contiguous();
         if (!b.IsContiguous) b = b.Contiguous();
 
+        // Channel-repeat fast path — see TensorBroadcastAdd for rationale.
+        if (TryBroadcastChannelRepeat(a, b, out int bcd_batch, out int bcd_chan, out int bcd_spatial))
+        {
+            var res = AutoTensorCache.RentOrAllocate<T>(a._shape);
+            ApplyBroadcastChannelOp(
+                a._storage.GetDataArray(), a._storageOffset,
+                b._storage.GetDataArray(), b._storageOffset,
+                res._storage.GetDataArray(), res._storageOffset,
+                bcd_batch, bcd_chan, bcd_spatial, BroadcastOp.Divide);
+            DifferentiableOps.RecordBinary("TensorBroadcastDivide", res, aOrig, bOrig, BackwardFunctions<T>.BroadcastDivideBackward);
+            if (AutoTracer.ShouldRecord)
+            {
+                var ca = a; var cb = b;
+                AutoTracer.RecordOp("TensorBroadcastDivide", res, eng => eng.TensorBroadcastDivide(ca, cb));
+            }
+            return res;
+        }
+
         var result = a.BroadcastDivide(b);
         DifferentiableOps.RecordBinary("TensorBroadcastDivide", result, aOrig, bOrig, BackwardFunctions<T>.BroadcastDivideBackward);
         { var ca = a; var cb = b; AutoTracer.RecordOp("TensorBroadcastDivide", result, eng => eng.TensorBroadcastDivide(ca, cb)); }
@@ -3347,6 +3406,27 @@ public partial class CpuEngine : ITensorLevelEngine
         var bOrig = b;
         if (!a.IsContiguous) a = a.Contiguous();
         if (!b.IsContiguous) b = b.Contiguous();
+
+        // Channel-repeat fast path — see TensorBroadcastAdd for rationale.
+        // BatchNorm inference scale at [B,C,H,W] * [1,C,1,1] hits this; VGG16
+        // forward profile showed 13 BN layers consuming ~44% of the step
+        // before this path existed.
+        if (TryBroadcastChannelRepeat(a, b, out int bcm_batch, out int bcm_chan, out int bcm_spatial))
+        {
+            var res = AutoTensorCache.RentOrAllocate<T>(a._shape);
+            ApplyBroadcastChannelOp(
+                a._storage.GetDataArray(), a._storageOffset,
+                b._storage.GetDataArray(), b._storageOffset,
+                res._storage.GetDataArray(), res._storageOffset,
+                bcm_batch, bcm_chan, bcm_spatial, BroadcastOp.Multiply);
+            DifferentiableOps.RecordBinary("TensorBroadcastMultiply", res, aOrig, bOrig, BackwardFunctions<T>.BroadcastMultiplyBackward);
+            if (AutoTracer.ShouldRecord)
+            {
+                var ca = a; var cb = b;
+                AutoTracer.RecordOp("TensorBroadcastMultiply", res, eng => eng.TensorBroadcastMultiply(ca, cb));
+            }
+            return res;
+        }
 
         // Generic trailing-repeat fast path (float + double + any T with SIMD numOps).
         // Covers the AdaLN / transformer-bias shape pattern where b's shape is a
@@ -3454,6 +3534,218 @@ public partial class CpuEngine : ITensorLevelEngine
 
         tileSize = ts;
         return true;
+    }
+
+    /// <summary>
+    /// Detects the "channel-repeat" broadcast pattern where <paramref name="b"/>
+    /// broadcasts across the batch (leading) and spatial (trailing) axes of
+    /// <paramref name="a"/>, repeating its channel vector across each spatial
+    /// cell — the dominant shape pattern for Conv2D bias add / BatchNorm
+    /// scale-shift / GroupNorm rescale.
+    ///
+    /// <para>Recognised shapes:</para>
+    /// <code>
+    ///   a=[B, C, H, W],    b=[1, C, 1, 1]    (Conv2D NCHW bias)
+    ///   a=[B, C, H, W, D], b=[1, C, 1, 1, 1] (Conv3D NCDHW bias)
+    ///   a=[B, C, L],       b=[1, C, 1]       (Conv1D NCL bias)
+    ///   a=[B, C],          b=[1, C]          (Dense bias, channel axis = last)
+    /// </code>
+    ///
+    /// <para>Required: <c>a.Rank == b.Rank &gt;= 2</c>, <c>b._shape[0] == 1</c>,
+    /// <c>b._shape[1] == a._shape[1]</c>, and all <c>b._shape[i &gt;= 2] == 1</c>.</para>
+    ///
+    /// <para>This is the broadcast pattern <see cref="TryBroadcastTrailingRepeat"/>
+    /// explicitly rejects ("broadcast in the middle"). The decomposition is
+    /// <c>batch × channels</c> independent spatial planes, each of size
+    /// <c>spatialSize = product(a._shape[2..])</c>; per plane the kernel runs
+    /// <c>r[i] = a[i] OP b[c]</c> — a tight vectorisable inner loop.</para>
+    /// </summary>
+    private static bool TryBroadcastChannelRepeat<T>(Tensor<T> a, Tensor<T> b,
+        out int batchCount, out int channelCount, out int spatialSize)
+    {
+        batchCount = channelCount = spatialSize = 0;
+        if (!a.IsContiguous || !b.IsContiguous) return false;
+        int rank = a.Rank;
+        if (rank < 2 || b.Rank != rank) return false;
+
+        // b._shape[0] must broadcast over batch (leading dim = 1).
+        if (b._shape[0] != 1) return false;
+        // b._shape[1] must equal a._shape[1] (channel axis is the one b carries data on).
+        if (b._shape[1] != a._shape[1]) return false;
+        // All b dims to the right of channel must be 1 (broadcast over spatial).
+        for (int i = 2; i < rank; i++)
+            if (b._shape[i] != 1) return false;
+
+        batchCount = a._shape[0];
+        channelCount = a._shape[1];
+        spatialSize = 1;
+        for (int i = 2; i < rank; i++) spatialSize *= a._shape[i];
+
+        // Structural sanity: b.Length must equal channelCount (one scalar per channel).
+        if (b.Length != channelCount) return false;
+        // And a.Length must factor into batch × channels × spatial without remainder.
+        if ((long)batchCount * channelCount * spatialSize != a.Length) return false;
+
+        // Reject the zero-sized degenerate case so the caller can rely on
+        // batch / channels / spatial all > 0.
+        if (batchCount <= 0 || channelCount <= 0 || spatialSize <= 0) return false;
+
+        return true;
+    }
+
+    // Op selector for the channel-repeat broadcast kernel.
+    private enum BroadcastOp { Add, Subtract, Multiply, Divide }
+
+    /// <summary>
+    /// Channel-repeat broadcast kernel: writes <c>result[i] = a[i] OP b[c]</c>
+    /// per (batch, channel) plane of size <paramref name="spatialSize"/>. Uses
+    /// <see cref="Vector256{T}"/> AVX2 for float/double (the dominant T for
+    /// CNN training); other element types fall through to the scalar loop via
+    /// <see cref="INumericOperations{T}"/>. <c>aSpan</c> and <c>rSpan</c> are
+    /// strided by plane (offset = (n*C + c) * spatialSize); <c>bSpan[c]</c>
+    /// supplies the broadcast scalar.
+    ///
+    /// <para>Generic <c>T</c> can't satisfy <see cref="System.Runtime.InteropServices.MemoryMarshal.Cast{TFrom,TTo}(ReadOnlySpan{TFrom})"/>'s
+    /// <c>unmanaged</c> constraint, so the type-specialised branches take the
+    /// caller's raw underlying arrays via the (Type[])(object)arr cast — the
+    /// same pattern the rest of CpuEngine uses for typeof-T-specialisation
+    /// dispatch (see e.g. <c>TensorBroadcastSubtract</c> fp32/fp64 fast paths).</para>
+    /// </summary>
+    private static unsafe void ApplyBroadcastChannelOp<T>(
+        T[] aArr, int aOff, T[] bArr, int bOff, T[] rArr, int rOff,
+        int batchCount, int channelCount, int spatialSize,
+        BroadcastOp op)
+    {
+#if NET5_0_OR_GREATER
+        if (typeof(T) == typeof(float) && System.Runtime.Intrinsics.X86.Avx.IsSupported)
+        {
+            var aF = (float[])(object)aArr;
+            var bF = (float[])(object)bArr;
+            var rF = (float[])(object)rArr;
+            fixed (float* aPtr0 = aF) fixed (float* bPtr0 = bF) fixed (float* rPtr0 = rF)
+            {
+                float* aPtr = aPtr0 + aOff;
+                float* bPtr = bPtr0 + bOff;
+                float* rPtr = rPtr0 + rOff;
+                for (int n = 0; n < batchCount; n++)
+                {
+                    for (int c = 0; c < channelCount; c++)
+                    {
+                        float scalar = bPtr[c];
+                        var vScalar = System.Runtime.Intrinsics.Vector256.Create(scalar);
+                        int planeOff = (n * channelCount + c) * spatialSize;
+                        float* aBase = aPtr + planeOff;
+                        float* rBase = rPtr + planeOff;
+                        int i = 0;
+                        int simdLen = spatialSize & ~7;
+                        switch (op)
+                        {
+                            case BroadcastOp.Add:
+                                for (; i < simdLen; i += 8)
+                                    System.Runtime.Intrinsics.X86.Avx.Store(rBase + i,
+                                        System.Runtime.Intrinsics.X86.Avx.Add(System.Runtime.Intrinsics.X86.Avx.LoadVector256(aBase + i), vScalar));
+                                for (; i < spatialSize; i++) rBase[i] = aBase[i] + scalar;
+                                break;
+                            case BroadcastOp.Subtract:
+                                for (; i < simdLen; i += 8)
+                                    System.Runtime.Intrinsics.X86.Avx.Store(rBase + i,
+                                        System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(aBase + i), vScalar));
+                                for (; i < spatialSize; i++) rBase[i] = aBase[i] - scalar;
+                                break;
+                            case BroadcastOp.Multiply:
+                                for (; i < simdLen; i += 8)
+                                    System.Runtime.Intrinsics.X86.Avx.Store(rBase + i,
+                                        System.Runtime.Intrinsics.X86.Avx.Multiply(System.Runtime.Intrinsics.X86.Avx.LoadVector256(aBase + i), vScalar));
+                                for (; i < spatialSize; i++) rBase[i] = aBase[i] * scalar;
+                                break;
+                            case BroadcastOp.Divide:
+                                for (; i < simdLen; i += 8)
+                                    System.Runtime.Intrinsics.X86.Avx.Store(rBase + i,
+                                        System.Runtime.Intrinsics.X86.Avx.Divide(System.Runtime.Intrinsics.X86.Avx.LoadVector256(aBase + i), vScalar));
+                                for (; i < spatialSize; i++) rBase[i] = aBase[i] / scalar;
+                                break;
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        if (typeof(T) == typeof(double) && System.Runtime.Intrinsics.X86.Avx.IsSupported)
+        {
+            var aD = (double[])(object)aArr;
+            var bD = (double[])(object)bArr;
+            var rD = (double[])(object)rArr;
+            fixed (double* aPtr0 = aD) fixed (double* bPtr0 = bD) fixed (double* rPtr0 = rD)
+            {
+                double* aPtr = aPtr0 + aOff;
+                double* bPtr = bPtr0 + bOff;
+                double* rPtr = rPtr0 + rOff;
+                for (int n = 0; n < batchCount; n++)
+                {
+                    for (int c = 0; c < channelCount; c++)
+                    {
+                        double scalar = bPtr[c];
+                        var vScalar = System.Runtime.Intrinsics.Vector256.Create(scalar);
+                        int planeOff = (n * channelCount + c) * spatialSize;
+                        double* aBase = aPtr + planeOff;
+                        double* rBase = rPtr + planeOff;
+                        int i = 0;
+                        int simdLen = spatialSize & ~3;
+                        switch (op)
+                        {
+                            case BroadcastOp.Add:
+                                for (; i < simdLen; i += 4)
+                                    System.Runtime.Intrinsics.X86.Avx.Store(rBase + i,
+                                        System.Runtime.Intrinsics.X86.Avx.Add(System.Runtime.Intrinsics.X86.Avx.LoadVector256(aBase + i), vScalar));
+                                for (; i < spatialSize; i++) rBase[i] = aBase[i] + scalar;
+                                break;
+                            case BroadcastOp.Subtract:
+                                for (; i < simdLen; i += 4)
+                                    System.Runtime.Intrinsics.X86.Avx.Store(rBase + i,
+                                        System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(aBase + i), vScalar));
+                                for (; i < spatialSize; i++) rBase[i] = aBase[i] - scalar;
+                                break;
+                            case BroadcastOp.Multiply:
+                                for (; i < simdLen; i += 4)
+                                    System.Runtime.Intrinsics.X86.Avx.Store(rBase + i,
+                                        System.Runtime.Intrinsics.X86.Avx.Multiply(System.Runtime.Intrinsics.X86.Avx.LoadVector256(aBase + i), vScalar));
+                                for (; i < spatialSize; i++) rBase[i] = aBase[i] * scalar;
+                                break;
+                            case BroadcastOp.Divide:
+                                for (; i < simdLen; i += 4)
+                                    System.Runtime.Intrinsics.X86.Avx.Store(rBase + i,
+                                        System.Runtime.Intrinsics.X86.Avx.Divide(System.Runtime.Intrinsics.X86.Avx.LoadVector256(aBase + i), vScalar));
+                                for (; i < spatialSize; i++) rBase[i] = aBase[i] / scalar;
+                                break;
+                        }
+                    }
+                }
+            }
+            return;
+        }
+#endif
+        // Generic T fallback — scalar loop via INumericOperations.
+        var numOps = MathHelper.GetNumericOperations<T>();
+        for (int n = 0; n < batchCount; n++)
+        {
+            for (int c = 0; c < channelCount; c++)
+            {
+                T scalar = bArr[bOff + c];
+                int planeOff = (n * channelCount + c) * spatialSize;
+                for (int i = 0; i < spatialSize; i++)
+                {
+                    T av = aArr[aOff + planeOff + i];
+                    rArr[rOff + planeOff + i] = op switch
+                    {
+                        BroadcastOp.Add => numOps.Add(av, scalar),
+                        BroadcastOp.Subtract => numOps.Subtract(av, scalar),
+                        BroadcastOp.Multiply => numOps.Multiply(av, scalar),
+                        BroadcastOp.Divide => numOps.Divide(av, scalar),
+                        _ => throw new ArgumentOutOfRangeException(nameof(op)),
+                    };
+                }
+            }
+        }
     }
 
     /// <inheritdoc/>
