@@ -117,6 +117,12 @@ public class PoolPaddedLossReadoutTests
         var prePadded = new float[16][];
         for (int i = 0; i < prePadded.Length; i++)
             prePadded[i] = ArrayPool<float>.Shared.Rent(1);
+        // Capture the existing engine BEFORE mutating the process-global slot.
+        // GraphMode + CompileInference require AiDotNetEngine.Current to be a
+        // CpuEngine instance here, but xunit parallelises across collections
+        // and other tests assume the slot they set is the one they observe.
+        // Restore in the outer finally below.
+        var previousEngine = AiDotNetEngine.Current;
         try
         {
             var engine = new CpuEngine();
@@ -170,6 +176,7 @@ public class PoolPaddedLossReadoutTests
         }
         finally
         {
+            AiDotNetEngine.Current = previousEngine;
             for (int i = 0; i < prePadded.Length; i++)
                 ArrayPool<float>.Shared.Return(prePadded[i]);
         }
