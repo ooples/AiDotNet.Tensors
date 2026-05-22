@@ -4,6 +4,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using AiDotNet.Tensors.Engines.Optimization;
 
 namespace AiDotNet.Tensors.Engines.Profiling;
 
@@ -101,12 +102,22 @@ public static class Profiler
     /// Opens a categorized range. <paramref name="category"/> appears in
     /// chrome-trace UIs as the event's tag — typical values are
     /// <c>"cpu_op"</c>, <c>"compile_pass"</c>, <c>"autograd"</c>.
+    /// <para>
+    /// CodeRabbit #428 review: this entry point is user-annotation territory
+    /// — events here are not CPU kernel timings and must NOT feed
+    /// <see cref="PerformanceProfiler.Instance"/>, which backs the per-op
+    /// rollup <c>TensorsOperationProfile.Capture</c> exposes (mixing user
+    /// annotations and arbitrary categories into that flat name→ticks map
+    /// would break the rollup contract and collide on names across
+    /// categories). Only <see cref="OpScope(string)"/> and
+    /// <see cref="FusedOpScope"/> bridge to the legacy aggregator.
+    /// </para>
     /// </summary>
     public static IDisposable Range(string name, string category)
     {
         var session = Current;
         if (session is null) return NoOpScope.Instance;
-        return new RangeScope(session, name, category, args: null);
+        return new RangeScope(session, name, category, args: null, recordToLegacy: false);
     }
 
     /// <summary>
@@ -122,9 +133,11 @@ public static class Profiler
     /// </summary>
     public static IDisposable Range(string name, string category, IReadOnlyDictionary<string, string> args)
     {
+        // CodeRabbit #428: user-annotation overload — never bridges to the
+        // legacy per-op aggregator. See no-args Range(string, string).
         var session = Current;
         if (session is null) return NoOpScope.Instance;
-        return new RangeScope(session, name, category, args);
+        return new RangeScope(session, name, category, args, recordToLegacy: false);
     }
 
     /// <summary>Records an instantaneous event on the active session.
@@ -149,32 +162,51 @@ public static class Profiler
     /// <c>CpuEngine</c> so a profiler turned on by the user at runtime
     /// gets per-op timings without engine code paying any cost when the
     /// profiler is off.
+    /// <para>
+    /// Issue #363 bridge: when <see cref="PerformanceProfiler.Instance"/>'s
+    /// <see cref="PerformanceProfiler.Enabled"/> flag is set (the legacy
+    /// per-op aggregator surface consumed by AiDotNet's
+    /// <c>TensorsOperationProfile.Capture</c>), this scope also records to
+    /// it on dispose — so users who flip the documented knob get the CPU
+    /// op rollup they expect, without needing to additionally start a
+    /// modern <see cref="ProfilerSession"/>.
+    /// </para>
     /// </summary>
     public static IDisposable OpScope(string opName)
     {
         var session = Current;
-        if (session is null) return NoOpScope.Instance;
-        return new RangeScope(session, opName, category: "cpu_op", args: null);
+        bool legacyEnabled = PerformanceProfiler.Instance.Enabled;
+        if (session is null && !legacyEnabled) return NoOpScope.Instance;
+        return new RangeScope(session, opName, category: "cpu_op", args: null, legacyEnabled);
     }
 
     /// <summary>Op scope with structured args (typical: shape, dtype, dispatch tier).</summary>
     public static IDisposable OpScope(string opName, IReadOnlyDictionary<string, string> args)
     {
         var session = Current;
-        if (session is null) return NoOpScope.Instance;
-        return new RangeScope(session, opName, category: "cpu_op", args);
+        bool legacyEnabled = PerformanceProfiler.Instance.Enabled;
+        if (session is null && !legacyEnabled) return NoOpScope.Instance;
+        return new RangeScope(session, opName, category: "cpu_op", args, legacyEnabled);
     }
 
     /// <summary>
     /// Compile-pass scope — a categorized variant for the optimization
     /// pipeline so chrome-trace UIs can filter pass timings out of the
     /// per-op category.
+    /// <para>
+    /// CodeRabbit #428 review: compile-pass timings are build-time, not
+    /// CPU kernel timings — they must NOT feed
+    /// <see cref="PerformanceProfiler.Instance"/> (which backs the per-op
+    /// rollup <c>TensorsOperationProfile.Capture</c> exposes). Only the
+    /// engine hot-path ops (<see cref="OpScope(string)"/>,
+    /// <see cref="FusedOpScope"/>) bridge to the legacy aggregator.
+    /// </para>
     /// </summary>
     public static IDisposable CompilePassScope(string passName)
     {
         var session = Current;
         if (session is null) return NoOpScope.Instance;
-        return new RangeScope(session, passName, category: "compile_pass", args: null);
+        return new RangeScope(session, passName, category: "compile_pass", args: null, recordToLegacy: false);
     }
 
     /// <summary>
@@ -187,13 +219,14 @@ public static class Profiler
     public static IDisposable FusedOpScope(string fusedName, IReadOnlyList<string> originalOpNames)
     {
         var session = Current;
-        if (session is null) return NoOpScope.Instance;
+        bool legacyEnabled = PerformanceProfiler.Instance.Enabled;
+        if (session is null && !legacyEnabled) return NoOpScope.Instance;
         var args = new Dictionary<string, string>(2)
         {
             ["subops"] = string.Join(",", originalOpNames),
             ["fused"]  = "true",
         };
-        return new RangeScope(session, fusedName, category: "cpu_op", args);
+        return new RangeScope(session, fusedName, category: "cpu_op", args, legacyEnabled);
     }
 
     /// <summary>
@@ -221,33 +254,47 @@ public static class Profiler
 
     private sealed class RangeScope : IDisposable
     {
-        private readonly ProfilerSession _session;
+        // Session is nullable in the #363 bridge path: the user enabled the
+        // legacy PerformanceProfiler without starting a modern session, so
+        // the scope still ticks the legacy aggregator but has no session
+        // events to emit.
+        private readonly ProfilerSession? _session;
         private readonly string _name;
         private readonly string _category;
         private readonly IReadOnlyDictionary<string, string>? _args;
         private readonly long _startTicks;
         private readonly bool _emitNvtx;
         private readonly bool _emitItt;
+        private readonly bool _recordToLegacy;
         private bool _disposed;
 
-        public RangeScope(ProfilerSession session, string name, string category, IReadOnlyDictionary<string, string>? args)
+        public RangeScope(
+            ProfilerSession? session,
+            string name,
+            string category,
+            IReadOnlyDictionary<string, string>? args,
+            bool recordToLegacy = false)
         {
             _session = session;
             _name = name;
             _category = category;
             _args = args;
+            _recordToLegacy = recordToLegacy;
             _startTicks = Stopwatch.GetTimestamp();
 
-            // Bridge to the native profilers when the session opted in. We
-            // gate on the session's Activities so a CPU-only session doesn't
-            // pay the marshalling cost. The bridge classes themselves probed
-            // for the native libs at startup, so the call is a single bool
-            // check + p/invoke when present, no-op when absent.
-            var activities = session.Options.Activities;
-            _emitNvtx = (activities & ProfilerActivities.Gpu) != 0 && Native.NvtxBridge.IsAvailable;
-            _emitItt  = (activities & ProfilerActivities.Cpu) != 0 && Native.IttBridge.IsAvailable;
-            if (_emitNvtx) Native.NvtxBridge.PushRange(name);
-            if (_emitItt)  Native.IttBridge.PushTask(name);
+            if (session is not null)
+            {
+                // Bridge to the native profilers when the session opted in. We
+                // gate on the session's Activities so a CPU-only session doesn't
+                // pay the marshalling cost. The bridge classes themselves probed
+                // for the native libs at startup, so the call is a single bool
+                // check + p/invoke when present, no-op when absent.
+                var activities = session.Options.Activities;
+                _emitNvtx = (activities & ProfilerActivities.Gpu) != 0 && Native.NvtxBridge.IsAvailable;
+                _emitItt  = (activities & ProfilerActivities.Cpu) != 0 && Native.IttBridge.IsAvailable;
+                if (_emitNvtx) Native.NvtxBridge.PushRange(name);
+                if (_emitItt)  Native.IttBridge.PushTask(name);
+            }
         }
 
         public void Dispose()
@@ -257,7 +304,20 @@ public static class Profiler
             if (_emitItt)  Native.IttBridge.PopTask();
             if (_emitNvtx) Native.NvtxBridge.PopRange();
             long endTicks = Stopwatch.GetTimestamp();
-            _session.RecordCompleteInternal(_name, _category, _startTicks, endTicks, _args);
+            _session?.RecordCompleteInternal(_name, _category, _startTicks, endTicks, _args);
+            if (_recordToLegacy)
+            {
+                // Issue #363: tick the legacy PerformanceProfiler.Instance so the
+                // documented `PerformanceProfiler.Instance.Enabled = true` knob
+                // produces CPU-side stats. Memory delta is left at 0 here —
+                // RangeScope doesn't capture per-thread allocation deltas and
+                // the legacy memory column is rarely the consumer's question
+                // (TensorsOperationProfile.Capture surfaces wall-clock timings,
+                // not allocations). Profile() callers who explicitly want
+                // allocation tracking continue to use the legacy Profile() API
+                // directly — that path's ProfileScope still captures it.
+                PerformanceProfiler.Instance.RecordOperation(_name, endTicks - _startTicks, memoryBytes: 0);
+            }
         }
     }
 
