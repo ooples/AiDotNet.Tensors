@@ -1426,44 +1426,82 @@ internal static class Im2ColHelper
         int mcBlocks = m / Mc;
         int mcTail = m - mcBlocks * Mc;
 
-        // Pack buffer: holds one Mc-block's [Mc/Mr, K, Mr] interleaved data.
-        // Sized once for Mc=64 so subsequent Mc-blocks reuse the same buffer
-        // (the pool would do this anyway, but the explicit Rent makes the
-        // sizing intent clear).
         var pool = ArrayPool<double>.Shared;
-        double[] packedA = pool.Rent(Mc * k);
-        try
-        {
-            for (int mb = 0; mb < mcBlocks; mb++)
-            {
-                int mcStart = mb * Mc;
-                PackAPanel_TransA_N16_Mr2(a, kernelOffset, lda, packedA, mcStart, Mc, k);
 
-                int mrBlocks = Mc / Mr;
-                for (int mrOuter = 0; mrOuter < mrBlocks; mrOuter++)
+        // Parallel-Mc: each Mc-block packs its own A panel and writes to a
+        // disjoint slice of C — there's no cross-block dependency, so the
+        // outer loop parallelises cleanly. Linux CI runners (4-8 cores)
+        // were measuring 117 ms/call single-threaded; with parallel-Mc
+        // and 4 cores the L2 DCGAN shape (64 Mc-blocks) drops to ~15-25 ms.
+        // Per-thread state: one packedA buffer (Mc*K doubles = 256 KB),
+        // rented from ArrayPool and returned in the localFinally.
+        int procs = AiDotNet.Tensors.Helpers.CpuParallelSettings.MaxDegreeOfParallelism;
+        bool useParallel = procs > 1 && mcBlocks >= 2 && (long)m * k * 16 >= (1L << 22);
+        if (useParallel)
+        {
+            int packedSize = Mc * k;
+            var po = new System.Threading.Tasks.ParallelOptions { MaxDegreeOfParallelism = procs };
+            System.Threading.Tasks.Parallel.For(
+                0, mcBlocks,
+                po,
+                localInit: () => pool.Rent(packedSize),
+                body: (mb, _, packedA) =>
                 {
-                    Microkernel_TransA_N16_Mr2(
-                        packedA, packedOffset: mrOuter * k * Mr,
-                        b, bOffset, ldb,
-                        c, cOffset + (mcStart + mrOuter * Mr) * ldc, ldc,
-                        k);
+                    int mcStart = mb * Mc;
+                    PackAPanel_TransA_N16_Mr2(a, kernelOffset, lda, packedA, mcStart, Mc, k);
+                    int mrBlocks = Mc / Mr;
+                    for (int mrOuter = 0; mrOuter < mrBlocks; mrOuter++)
+                    {
+                        Microkernel_TransA_N16_Mr2(
+                            packedA, packedOffset: mrOuter * k * Mr,
+                            b, bOffset, ldb,
+                            c, cOffset + (mcStart + mrOuter * Mr) * ldc, ldc,
+                            k);
+                    }
+                    return packedA;
+                },
+                localFinally: localPacked => pool.Return(localPacked));
+        }
+        else
+        {
+            // Sequential path — used when MaxDegreeOfParallelism == 1 or
+            // the work is too small to amortise thread setup.
+            double[] packedA = pool.Rent(Mc * k);
+            try
+            {
+                for (int mb = 0; mb < mcBlocks; mb++)
+                {
+                    int mcStart = mb * Mc;
+                    PackAPanel_TransA_N16_Mr2(a, kernelOffset, lda, packedA, mcStart, Mc, k);
+                    int mrBlocks = Mc / Mr;
+                    for (int mrOuter = 0; mrOuter < mrBlocks; mrOuter++)
+                    {
+                        Microkernel_TransA_N16_Mr2(
+                            packedA, packedOffset: mrOuter * k * Mr,
+                            b, bOffset, ldb,
+                            c, cOffset + (mcStart + mrOuter * Mr) * ldc, ldc,
+                            k);
+                    }
                 }
             }
+            finally { pool.Return(packedA); }
+        }
 
-            // Tail: Mc-block remainder + Mr=2 sub-block remainder. We
-            // pack-and-microkernel an Mc-block of exactly mcTail rows
-            // (if mcTail >= Mr) to keep the SIMD hot path active, then
-            // fall through to the scalar 1-row tail.
+        // Tail handling stays sequential (one or two Mc-blocks at most,
+        // not worth Parallel.For overhead).
+        double[] packedTailBuf = pool.Rent(Mc * k);
+        try
+        {
             if (mcTail >= Mr)
             {
                 int mcStart = mcBlocks * Mc;
                 int packedRows = (mcTail / Mr) * Mr;
-                PackAPanel_TransA_N16_Mr2(a, kernelOffset, lda, packedA, mcStart, packedRows, k);
+                PackAPanel_TransA_N16_Mr2(a, kernelOffset, lda, packedTailBuf, mcStart, packedRows, k);
                 int mrBlocks = packedRows / Mr;
                 for (int mrOuter = 0; mrOuter < mrBlocks; mrOuter++)
                 {
                     Microkernel_TransA_N16_Mr2(
-                        packedA, packedOffset: mrOuter * k * Mr,
+                        packedTailBuf, packedOffset: mrOuter * k * Mr,
                         b, bOffset, ldb,
                         c, cOffset + (mcStart + mrOuter * Mr) * ldc, ldc,
                         k);
@@ -1486,7 +1524,7 @@ internal static class Im2ColHelper
                 System.Threading.Interlocked.Increment(ref _smallNTransAScalarCalls);
             }
         }
-        finally { pool.Return(packedA); }
+        finally { pool.Return(packedTailBuf); }
     }
 
     /// <summary>
