@@ -1,0 +1,8 @@
+{
+  "_doc": "Coverage ratchet baseline (audit-2026-05 finding #8 remediation). The build.yml workflow asserts that line coverage does not regress below `line` by more than COVERAGE_REGRESSION_TOLERANCE percentage points (default 1.0pp). When current coverage exceeds `line + COVERAGE_RATCHET_INCREMENT` (default 5.0pp), the workflow emits a notice asking us to update this file. Updating must be a dedicated PR — do not bundle baseline bumps with feature/fix PRs so the ratchet provenance stays auditable.",
+  "_initial_value_pending": "On first CI run after the audit-2026-05 phase 0 PR merges, the workflow will warn (no baseline found) and print the actual measured coverage. Update this file with the measured numbers in a follow-up commit. Until then, the gate is effectively bootstrap-mode.",
+  "line": 0,
+  "branch": 0,
+  "recorded_at": "2026-05-22",
+  "recorded_sha": "pending-first-ci-run-after-audit-phase0"
+}
