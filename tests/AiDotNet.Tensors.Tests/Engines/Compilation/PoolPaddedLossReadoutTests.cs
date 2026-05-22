@@ -94,14 +94,26 @@ public class PoolPaddedLossReadoutTests
     [Fact]
     public void CompiledNegateChain_OnPoolPaddedLossOutput_ReadsNaN()
     {
-        // End-to-end: build a tiny compiled training plan whose loss chain
-        // produces NaN (TensorNegate(TensorLog(0))), execute it via the
-        // engine wrapper that exercises the same TryBuildSpecializedForward
-        // path AiDotNet's fused-Adam wiring uses, and verify the loss readout
-        // is NaN, not literal 0.
+        // End-to-end: trace a TensorNegate(TensorLog(input)) chain inside
+        // GraphMode, COMPILE it (so the kernels go through
+        // <see cref="CompiledTrainingPlan{T}.TryBuildSpecializedForward"/>
+        // — the exact site the #396 fix patches), Execute the compiled plan,
+        // and verify the output propagates NaN instead of being silently zeroed.
         //
-        // Pre-pad the pool first to maximise the chance the loss tensor is
-        // padded — same pattern as the test above.
+        // Pre-fix, the specialized forward for TensorNegate / TensorLog pinned
+        // step.OutputBuffer via GetDataArray(). For ArrayPool-padded tensors
+        // that returned a COPY — the kernel wrote NaN to the copy, the consumer
+        // reading via the tensor indexer hit the still-zero live backing, and
+        // training silently consumed lastLoss=0 while gradients were corrupted.
+        //
+        // The previous (eager-engine) version of this test would have passed
+        // even on the pre-fix code because eager TensorLog/TensorNegate write
+        // through the live backing directly — only the compiled fast path
+        // exhibits the bug. This rewrite drives the compiled fast path so the
+        // assertion would FAIL on the pre-#419 commit.
+        //
+        // Pre-pad the pool first to maximise the chance the compiled plan's
+        // intermediate / output buffers come from a padded slot.
         var prePadded = new float[16][];
         for (int i = 0; i < prePadded.Length; i++)
             prePadded[i] = ArrayPool<float>.Shared.Rent(1);
@@ -110,24 +122,51 @@ public class PoolPaddedLossReadoutTests
             var engine = new CpuEngine();
             AiDotNetEngine.Current = engine;
 
-            // log(0) = -inf; -(-inf) = +inf — but log(-1) = NaN; -NaN = NaN.
-            // Use input = -1 to drive the chain through NaN.
+            // log(-1) = NaN; -NaN = NaN. The compiled forward must propagate
+            // both. Use a length-1 input — that's exactly the ArrayPool bucket
+            // that surfaced #396 (loss tensors are scalar).
             var input = new Tensor<float>(new float[] { -1.0f }, new[] { 1 });
-            var logged = engine.TensorLog(input);
-            var negated = engine.TensorNegate(logged);
+
+            // Phase 1 — trace under GraphMode so the engine ops record into
+            // the lazy graph rather than executing eagerly. CompileInference
+            // then walks the recorded graph and emits the specialized-forward
+            // closures from TryBuildSpecializedForward.
+            ICompiledPlan<float> plan;
+            Tensor<float> tracedOutput;
+            var traceScope = GraphMode.Enable();
+            try
+            {
+                var logged = engine.TensorLog(input);
+                tracedOutput = engine.TensorNegate(logged);
+                plan = traceScope.CompileInference<float>(tracedOutput, input._shape);
+            }
+            finally { traceScope.Dispose(); }
+
+            // Phase 2 — Execute the compiled plan. The result tensor's backing
+            // is the same step.OutputBuffer the specialized forward writes
+            // through; if the pin grabs a copy, the indexer here sees 0 (the
+            // pool's zero-initialised live backing) instead of NaN.
+            Tensor<float> compiledOut;
+            using (plan)
+            {
+                compiledOut = plan.Execute();
+            }
 
             _output.WriteLine(
-                $"input={input[0]}, log(input)={logged[0]}, -log(input)={negated[0]}, " +
-                $"IsNaN(neg)={float.IsNaN(negated[0])}, IsZero(neg)={negated[0] == 0f}");
+                $"compiledOut[0]={compiledOut[0]}, " +
+                $"IsNaN={float.IsNaN(compiledOut[0])}, " +
+                $"IsZero={compiledOut[0] == 0f}, " +
+                $"backingLen={compiledOut.GetLiveBackingArrayAllowingPaddingOrNull()?.Length ?? -1}");
 
-            // Bug manifestation: negated[0] returns literal 0 instead of NaN.
-            Assert.False(negated[0] == 0f && !float.IsNaN(negated[0]),
-                "#396 regression: TensorNegate(TensorLog(-1)) returned literal 0 " +
+            // Bug manifestation: compiledOut[0] would be literal 0 on pre-fix
+            // code because the kernel's NaN write went to the orphaned copy.
+            Assert.False(compiledOut[0] == 0f && !float.IsNaN(compiledOut[0]),
+                "#396 regression: compiled TensorNegate(TensorLog(-1)) returned literal 0 " +
                 "instead of NaN. The pool-padded output's GetDataArray() must have " +
                 "returned a copy, the kernel wrote NaN to the copy, and the read via " +
                 "tensor indexer hit the still-zero live backing.");
-            Assert.True(float.IsNaN(negated[0]),
-                $"Expected NaN from -log(-1), got {negated[0]}.");
+            Assert.True(float.IsNaN(compiledOut[0]),
+                $"Expected NaN from compiled -log(-1), got {compiledOut[0]}.");
         }
         finally
         {
