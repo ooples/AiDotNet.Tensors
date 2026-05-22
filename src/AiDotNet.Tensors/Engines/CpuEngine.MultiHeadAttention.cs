@@ -242,20 +242,22 @@ public partial class CpuEngine
         return new Tensor<float>(buffer, new[] { d0, d1, d2, d3 });
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void TransposeQkv(float[] src, float[] dst, int batch, int seq, int numHeads, int dHead)
     {
         // src layout: [B, seq, numHeads, dHead]  (linear stride: dHead, numHeads*dHead, seq*numHeads*dHead)
         // dst layout: [B, numHeads, seq, dHead]
         int srcStrideS = numHeads * dHead;
         int srcStrideB = seq * srcStrideS;
-        int dstStrideS = dHead;
         int dstStrideH = seq * dHead;
         int dstStrideB = numHeads * dstStrideH;
-        var srcSpan = src.AsSpan();
-        var dstSpan = dst.AsSpan();
-        for (int b = 0; b < batch; b++)
+
+        // Parallelize across batch. Each batch element writes to a disjoint
+        // dstStrideB-sized region so there's no contention. For the AIsEval
+        // shape (batch=128) this typically hits 4-8x of the cores.
+        System.Threading.Tasks.Parallel.For(0, batch, b =>
         {
+            var srcSpan = src.AsSpan();
+            var dstSpan = dst.AsSpan();
             for (int s = 0; s < seq; s++)
             {
                 int srcBase = b * srcStrideB + s * srcStrideS;
@@ -264,29 +266,25 @@ public partial class CpuEngine
                 {
                     int srcOff = srcBase + h * dHead;
                     int dstOff = dstBaseBS + h * dstStrideH;
-                    // dHead-element block copy (typically 8-64 floats =
-                    // 1-8 AVX2 vectors). Span<T>.CopyTo dispatches to
-                    // Buffer.MemoryCopy which is SIMD on .NET 5+.
                     srcSpan.Slice(srcOff, dHead).CopyTo(dstSpan.Slice(dstOff, dHead));
                 }
             }
-        }
+        });
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void InverseTransposeQkv(float[] src, float[] dst, int batch, int seq, int numHeads, int dHead)
     {
         // src layout: [B, numHeads, seq, dHead]
         // dst layout: [B, seq, numHeads, dHead]  (== [B*seq, dModel])
-        int srcStrideS = dHead;
         int srcStrideH = seq * dHead;
         int srcStrideB = numHeads * srcStrideH;
         int dstStrideS = numHeads * dHead;
         int dstStrideB = seq * dstStrideS;
-        var srcSpan = src.AsSpan();
-        var dstSpan = dst.AsSpan();
-        for (int b = 0; b < batch; b++)
+
+        System.Threading.Tasks.Parallel.For(0, batch, b =>
         {
+            var srcSpan = src.AsSpan();
+            var dstSpan = dst.AsSpan();
             for (int s = 0; s < seq; s++)
             {
                 int dstBaseBS = b * dstStrideB + s * dstStrideS;
@@ -298,7 +296,7 @@ public partial class CpuEngine
                     srcSpan.Slice(srcOff, dHead).CopyTo(dstSpan.Slice(dstOff, dHead));
                 }
             }
-        }
+        });
     }
 
     /// <summary>

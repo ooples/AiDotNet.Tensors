@@ -58,6 +58,16 @@ public class PerformanceRegressionTests
     private const double CnnAiseval_L1_BudgetMs = 30.0;  // Measured ~6 ms on RTX-class CPU
     private const double CnnAiseval_L2_BudgetMs = 35.0;  // Measured ~8 ms on RTX-class CPU
 
+    // AIsEval LSTM + MHA inference perf gates (issue #436, post-Stage 5/6).
+    // The float fast paths on LstmSequenceForward and MultiHeadAttentionForward
+    // brought AIsEval-shape inference to 8.19 ms / 10.13 ms on net10.0
+    // respectively. The 30 ms budgets here are ~3-4x the steady-state measured
+    // time on the reference rig — tight enough to catch a regression to
+    // pre-fast-path or generic-T behavior (44 ms / 22 ms) while tolerating
+    // CI noise and cold JIT.
+    private const double LstmAiseval_BudgetMs = 30.0;
+    private const double MhaAiseval_BudgetMs = 30.0;
+
     public PerformanceRegressionTests(ITestOutputHelper output) => _output = output;
 
     [Fact(Skip = "Performance guard — run manually with --filter PerformanceRegression")]
@@ -306,6 +316,68 @@ public class PerformanceRegressionTests
             $"Conv2D AIsEval-L1 took {ms:F3}ms — exceeds {CnnAiseval_L1_BudgetMs}ms budget. " +
             "The AIsEval benchmark relies on this shape being well below PyTorch's 41.42ms baseline; " +
             "a regression here would erase the CNN inference lead documented in issue #436.");
+    }
+
+    [Fact(Skip = "Performance guard — run manually with --filter PerformanceRegression")]
+    public void LstmSequenceForward_Aiseval_FloatFastPath_BeatsPyTorch()
+    {
+        // Locks in the AIsEval LSTM win. Stage 3 took LSTM from "doesn't
+        // finish in 3+ min" to 44 ms (generic-T path). Stage 5 added a
+        // float fast path using SimdGemm + vectorized sigmoid/tanh +
+        // ArrayPool scratch, bringing the AIsEval shape to 8.19 ms on
+        // net10.0 — faster than PyTorch's 11.76 ms nn.LSTM. This gate
+        // catches any regression that would lose that lead.
+        const int batch = 128, seq = 32, inFeatures = 32, hidden = 64;
+        var input = Tensor<float>.CreateRandom(batch, seq, inFeatures);
+        var wIh   = Tensor<float>.CreateRandom(4 * hidden, inFeatures);
+        var wHh   = Tensor<float>.CreateRandom(4 * hidden, hidden);
+
+        var cpu = (AiDotNet.Tensors.Engines.CpuEngine)_engine;
+        for (int w = 0; w < 3; w++)
+            _ = cpu.LstmSequenceForward(input, null, null, wIh, wHh, null, null);
+
+        var sw = Stopwatch.StartNew();
+        const int iters = 10;
+        for (int i = 0; i < iters; i++)
+            _ = cpu.LstmSequenceForward(input, null, null, wIh, wHh, null, null);
+        sw.Stop();
+        double ms = sw.Elapsed.TotalMilliseconds / iters;
+
+        _output.WriteLine($"LstmSequenceForward AIsEval [128,32,32->64]: {ms:F2} ms (budget: {LstmAiseval_BudgetMs} ms; PyTorch baseline 11.76 ms)");
+        Assert.True(ms < LstmAiseval_BudgetMs,
+            $"LstmSequenceForward took {ms:F2} ms — exceeds {LstmAiseval_BudgetMs} ms budget. " +
+            "This indicates a regression away from the Stage 5 float fast path that put AiDotNet ahead of PyTorch on this shape.");
+    }
+
+    [Fact(Skip = "Performance guard — run manually with --filter PerformanceRegression")]
+    public void MultiHeadAttentionForward_Aiseval_FloatFastPath()
+    {
+        // Locks in the Stage 6 MHA float fast path. Stage 4 wrapper measured
+        // 22.31 ms on net10.0; Stage 6 brought it to 10.13 ms via direct
+        // SimdGemm projections + ArrayPool scratch + explicit-loop transpose.
+        // Budget at 30 ms catches regression back to the wrapper-only path.
+        const int batch = 128, seq = 32, dModel = 64, numHeads = 4;
+        var input = Tensor<float>.CreateRandom(batch, seq, dModel);
+        var qW = Tensor<float>.CreateRandom(dModel, dModel);
+        var kW = Tensor<float>.CreateRandom(dModel, dModel);
+        var vW = Tensor<float>.CreateRandom(dModel, dModel);
+        var oW = Tensor<float>.CreateRandom(dModel, dModel);
+
+        var cpu = (AiDotNet.Tensors.Engines.CpuEngine)_engine;
+        for (int w = 0; w < 3; w++)
+            _ = cpu.MultiHeadAttentionForward(input, qW, kW, vW, oW, numHeads);
+
+        var sw = Stopwatch.StartNew();
+        const int iters = 10;
+        for (int i = 0; i < iters; i++)
+            _ = cpu.MultiHeadAttentionForward(input, qW, kW, vW, oW, numHeads);
+        sw.Stop();
+        double ms = sw.Elapsed.TotalMilliseconds / iters;
+
+        _output.WriteLine($"MultiHeadAttentionForward AIsEval [128,32,64] h=4: {ms:F2} ms (budget: {MhaAiseval_BudgetMs} ms)");
+        Assert.True(ms < MhaAiseval_BudgetMs,
+            $"MultiHeadAttentionForward took {ms:F2} ms — exceeds {MhaAiseval_BudgetMs} ms budget. " +
+            "Stage 6 float fast path measured 10.13 ms on net10.0; a regression to the Stage 4 wrapper path would push this back to ~22 ms.");
     }
 
     [Fact(Skip = "Performance guard — run manually with --filter PerformanceRegression")]
