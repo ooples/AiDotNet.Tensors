@@ -1352,30 +1352,64 @@ internal static class Im2ColHelper
     }
 
     /// <summary>
-    /// Issue #358 phase-1 fast path: FP64 GEMM with transA=true at the
-    /// N=16 "fat A" aspect ratio (M ≫ K). Computes
+    /// Issue #358 fast path: FP64 GEMM with transA=true at the N=16 "fat A"
+    /// aspect ratio (M ≫ K). Computes
     /// <c>C[m, 0..15] = sum_k A[k, m] * B[k, 0..15]</c> where A is
-    /// <c>[K, M]</c> row-major and B is <c>[K, 16]</c> row-major. Output
-    /// C is <c>[M, 16]</c> row-major.
+    /// <c>[K, M]</c> row-major (the un-transposed kernel matrix) and B is
+    /// <c>[K, 16]</c> row-major. Output C is <c>[M, 16]</c> row-major.
     /// <para>
-    /// Specialised for N=16 exactly (the DCGAN L2 deconv shape's H*W=4*4=16)
-    /// so the inner loop has zero runtime conditionals — JIT emits a tight
-    /// straight-line 4-vector unroll without branches. AVX2 FMA hot path
-    /// processes Mb=2 m-rows per outer iteration, 8 Vector256&lt;double&gt;
-    /// accumulators total (8 of 16 YMMs), 4 B-loads kept in registers
-    /// across the K loop body. Scalar fallback for non-AVX2 / net471 hosts
-    /// uses the same loop shape with element-wise multiplies.
+    /// Specialised for N=16 (the DCGAN L2 deconv shape's H*W=4*4=16) and
+    /// uses BLIS-style A-panel packing + Mc macro-blocking:
+    /// </para>
+    /// <list type="number">
+    ///   <item>
+    ///     <description><b>Pack-A</b>: For each Mc=64-row macro-block,
+    ///       pack the corresponding A slice into an interleaved layout
+    ///       <c>packedA[mr_outer, kk, ri]</c> where mr_outer indexes Mc/Mr
+    ///       sub-blocks, kk indexes the K axis, and ri indexes the Mr=2
+    ///       innermost rows. The pack reads A strided by lda once per
+    ///       Mc-block (M / Mc = 64 packs total for the L2 shape) and
+    ///       writes the packed buffer sequentially. Net A-traffic =
+    ///       kernel size (~16 MB), pulled once from RAM/L3.
+    ///     </description>
+    ///   </item>
+    ///   <item>
+    ///     <description><b>Microkernel</b>: For each Mr=2 sub-block inside
+    ///       the Mc-block, the AVX2 microkernel reads the packed panel
+    ///       sequentially (stride Mr = 16 bytes between consecutive kk
+    ///       steps), keeping a single Mr × K = 8 KB working set resident
+    ///       in L1. 8 Vector256&lt;double&gt; C-accumulators (2 m-rows ×
+    ///       4 vectors-per-row), 4 B-vector scratch, 1 A-broadcast scratch
+    ///       = 13 YMM, comfortably under the 16-YMM AVX2 budget.
+    ///     </description>
+    ///   </item>
+    /// </list>
+    /// <para>
+    /// Phase 1 (un-packed K-outer) was bottlenecked by L1 thrashing at the
+    /// lda=4096-double stride. Phase 2 (this implementation) keeps the
+    /// inner microkernel's A reads in L1 by streaming the packed panel
+    /// through it, closing the gap to BLAS peak.
     /// </para>
     /// <para>
-    /// Perf envelope: measured ~170 ms on the L2 shape vs 215 ms OpenBLAS
-    /// and 559 ms MKL — ~20% over OpenBLAS in phase 1. Phase-2 work
-    /// (A-panel packing + Mc macro-blocking + AVX-512 8-row microkernel)
-    /// is tracked as #358 follow-up to close the remaining gap toward the
-    /// ~1 ms theoretical peak.
+    /// Scalar fallback (non-AVX2 / net471) uses the same packed layout so
+    /// correctness is identical; only the inner-K compute drops from
+    /// 8 FMA/cycle to ~1 op/cycle.
     /// </para>
     /// </summary>
     internal static long _smallNTransAAvx2Calls;
     internal static long _smallNTransAScalarCalls;
+
+    // BLIS-style blocking parameters.
+    //  Mc = macro-block size. 64 m-rows × K = 512 × 8B = 256 KB packed
+    //    panel — fits L2 on consumer CPUs (256 KB-1 MB typical). Larger
+    //    Mc reduces pack overhead but spills L2; smaller increases pack
+    //    overhead. 64 is the empirical sweet spot for K~512.
+    //  Mr = microkernel row tile. 2 doubles × 16 cols × 8B = 256 B per
+    //    inner update. With 4 b-loads + 8 c-accumulators + 1 a-broadcast
+    //    = 13 YMM (under AVX2's 16-YMM budget). Mr=4 would need 16 c +
+    //    4 b + 1 a = 21 YMM → spill, hence Mr=2 on AVX2.
+    private const int DgemmFatAMc = 64;
+    private const int DgemmFatAMr = 2;
 
     internal static void DgemmTransA_N16_FatA(
         double[] a, int kernelOffset, int lda,
@@ -1387,46 +1421,128 @@ internal static class Im2ColHelper
         // (beta=0) behaviour the dispatcher contract expects.
         Array.Clear(c, cOffset, m * ldc);
 
-        const int Mb = 2;
-        int mBlocks = m / Mb;
-        int mTail = m - mBlocks * Mb;
+        const int Mc = DgemmFatAMc;
+        const int Mr = DgemmFatAMr;
+        int mcBlocks = m / Mc;
+        int mcTail = m - mcBlocks * Mc;
 
-        for (int mb = 0; mb < mBlocks; mb++)
+        // Pack buffer: holds one Mc-block's [Mc/Mr, K, Mr] interleaved data.
+        // Sized once for Mc=64 so subsequent Mc-blocks reuse the same buffer
+        // (the pool would do this anyway, but the explicit Rent makes the
+        // sizing intent clear).
+        var pool = ArrayPool<double>.Shared;
+        double[] packedA = pool.Rent(Mc * k);
+        try
         {
-            DgemmTransA_N16_ProcessMb2(
-                a, kernelOffset, lda,
-                b, bOffset, ldb,
-                c, cOffset, ldc,
-                mStart: mb * Mb, k: k);
-        }
-        if (mTail > 0)
-        {
-            // Tail: 1 m-row, scalar.
-            int mStart = mBlocks * Mb;
-            for (int j = 0; j < 16; j++)
+            for (int mb = 0; mb < mcBlocks; mb++)
             {
-                double acc = 0;
-                for (int kk = 0; kk < k; kk++)
-                    acc += a[kernelOffset + (long)kk * lda + mStart] * b[bOffset + kk * ldb + j];
-                c[cOffset + mStart * ldc + j] = acc;
+                int mcStart = mb * Mc;
+                PackAPanel_TransA_N16_Mr2(a, kernelOffset, lda, packedA, mcStart, Mc, k);
+
+                int mrBlocks = Mc / Mr;
+                for (int mrOuter = 0; mrOuter < mrBlocks; mrOuter++)
+                {
+                    Microkernel_TransA_N16_Mr2(
+                        packedA, packedOffset: mrOuter * k * Mr,
+                        b, bOffset, ldb,
+                        c, cOffset + (mcStart + mrOuter * Mr) * ldc, ldc,
+                        k);
+                }
             }
-            System.Threading.Interlocked.Increment(ref _smallNTransAScalarCalls);
+
+            // Tail: Mc-block remainder + Mr=2 sub-block remainder. We
+            // pack-and-microkernel an Mc-block of exactly mcTail rows
+            // (if mcTail >= Mr) to keep the SIMD hot path active, then
+            // fall through to the scalar 1-row tail.
+            if (mcTail >= Mr)
+            {
+                int mcStart = mcBlocks * Mc;
+                int packedRows = (mcTail / Mr) * Mr;
+                PackAPanel_TransA_N16_Mr2(a, kernelOffset, lda, packedA, mcStart, packedRows, k);
+                int mrBlocks = packedRows / Mr;
+                for (int mrOuter = 0; mrOuter < mrBlocks; mrOuter++)
+                {
+                    Microkernel_TransA_N16_Mr2(
+                        packedA, packedOffset: mrOuter * k * Mr,
+                        b, bOffset, ldb,
+                        c, cOffset + (mcStart + mrOuter * Mr) * ldc, ldc,
+                        k);
+                }
+                mcTail -= packedRows;
+            }
+            if (mcTail > 0)
+            {
+                // 1-row scalar tail. m=4096 with Mc=64 leaves no tail at
+                // all (4096 % 64 == 0), so this branch is dead on the L2
+                // shape. Kept for correctness on arbitrary m.
+                int mStart = m - mcTail;
+                for (int j = 0; j < 16; j++)
+                {
+                    double acc = 0;
+                    for (int kk = 0; kk < k; kk++)
+                        acc += a[kernelOffset + (long)kk * lda + mStart] * b[bOffset + kk * ldb + j];
+                    c[cOffset + mStart * ldc + j] = acc;
+                }
+                System.Threading.Interlocked.Increment(ref _smallNTransAScalarCalls);
+            }
+        }
+        finally { pool.Return(packedA); }
+    }
+
+    /// <summary>
+    /// Packs <c>mc</c> consecutive m-rows of A starting at <c>mcStart</c>
+    /// into the interleaved BLIS layout <c>packedA[mr_outer, kk, ri]</c>.
+    /// Read pattern from A: stride lda per kk step (the unavoidable cost
+    /// of transA=true). Write pattern: sequential along packedA. After
+    /// packing, the microkernel's inner K loop reads packedA at stride
+    /// Mr=2 doubles (16 bytes) per kk step — well inside one cache line
+    /// per 4 steps, keeping the Mr × K = 8 KB working set in L1.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe void PackAPanel_TransA_N16_Mr2(
+        double[] a, int aOffset, int lda,
+        double[] packed, int mcStart, int mc, int k)
+    {
+        const int Mr = DgemmFatAMr;
+        int mrBlocks = mc / Mr;
+        fixed (double* pA = &a[aOffset])
+        fixed (double* pPacked = packed)
+        {
+            for (int mrOuter = 0; mrOuter < mrBlocks; mrOuter++)
+            {
+                int mGlobal = mcStart + mrOuter * Mr;
+                double* outBase = pPacked + (long)mrOuter * k * Mr;
+                // For each kk, read 2 consecutive doubles from A[kk, mGlobal..mGlobal+1].
+                // Write 2 consecutive doubles to packed[mrOuter, kk, 0..1].
+                for (int kk = 0; kk < k; kk++)
+                {
+                    double* aRow = pA + (long)kk * lda + mGlobal;
+                    double* outRow = outBase + (long)kk * Mr;
+                    outRow[0] = aRow[0];
+                    outRow[1] = aRow[1];
+                }
+            }
         }
     }
 
+    /// <summary>
+    /// Mr=2, Nr=16 FP64 AVX2 microkernel reading the BLIS-packed A panel.
+    /// Per kk step: 2 sequential A loads (8 bytes apart, same cache line),
+    /// 4 B-vector loads (sequential, 64 bytes total), 8 FMA into 8 c-
+    /// accumulators. No branching in the K loop; JIT emits a tight
+    /// straight-line unroll.
+    /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static unsafe void DgemmTransA_N16_ProcessMb2(
-        double[] a, int kernelOffset, int lda,
+    private static unsafe void Microkernel_TransA_N16_Mr2(
+        double[] packedA, int packedOffset,
         double[] b, int bOffset, int ldb,
         double[] c, int cOffset, int ldc,
-        int mStart, int k)
+        int k)
     {
 #if NET5_0_OR_GREATER
         if (Avx2.IsSupported && Fma.IsSupported)
         {
             System.Threading.Interlocked.Increment(ref _smallNTransAAvx2Calls);
-            // 8 accumulators (2 m-rows × 4 vectors per row), 4 b-vector
-            // scratch, 1 broadcast scratch = 13 YMM, comfortably under 16.
             var c00 = Vector256<double>.Zero;
             var c01 = Vector256<double>.Zero;
             var c02 = Vector256<double>.Zero;
@@ -1436,16 +1552,17 @@ internal static class Im2ColHelper
             var c12 = Vector256<double>.Zero;
             var c13 = Vector256<double>.Zero;
 
-            fixed (double* pA = &a[kernelOffset])
+            fixed (double* pA = &packedA[packedOffset])
             fixed (double* pB = &b[bOffset])
             fixed (double* pC = &c[cOffset])
             {
                 for (int kk = 0; kk < k; kk++)
                 {
-                    double* aRow = pA + (long)kk * lda + mStart;
+                    // Packed A: 2 consecutive doubles per kk step (stride Mr=2).
+                    double* aPtr = pA + (long)kk * 2;
                     double* bRow = pB + (long)kk * ldb;
-                    var va0 = Vector256.Create(aRow[0]);
-                    var va1 = Vector256.Create(aRow[1]);
+                    var va0 = Vector256.Create(aPtr[0]);
+                    var va1 = Vector256.Create(aPtr[1]);
                     var vb0 = Avx.LoadVector256(bRow + 0);
                     var vb1 = Avx.LoadVector256(bRow + 4);
                     var vb2 = Avx.LoadVector256(bRow + 8);
@@ -1460,12 +1577,11 @@ internal static class Im2ColHelper
                     c13 = Fma.MultiplyAdd(va1, vb3, c13);
                 }
 
-                double* cRow0 = pC + (long)mStart * ldc;
-                double* cRow1 = pC + (long)(mStart + 1) * ldc;
-                Avx.Store(cRow0 + 0, c00);
-                Avx.Store(cRow0 + 4, c01);
-                Avx.Store(cRow0 + 8, c02);
-                Avx.Store(cRow0 + 12, c03);
+                Avx.Store(pC + 0, c00);
+                Avx.Store(pC + 4, c01);
+                Avx.Store(pC + 8, c02);
+                Avx.Store(pC + 12, c03);
+                double* cRow1 = pC + ldc;
                 Avx.Store(cRow1 + 0, c10);
                 Avx.Store(cRow1 + 4, c11);
                 Avx.Store(cRow1 + 8, c12);
@@ -1475,18 +1591,19 @@ internal static class Im2ColHelper
         }
 #endif
         System.Threading.Interlocked.Increment(ref _smallNTransAScalarCalls);
-        // Scalar fallback for non-AVX2 / net471 hosts.
+        // Scalar fallback. Same packed-A layout — for each output column
+        // accumulate Mr=2 dot products against the packed panel.
         for (int j = 0; j < 16; j++)
         {
             double acc0 = 0, acc1 = 0;
             for (int kk = 0; kk < k; kk++)
             {
                 double bv = b[bOffset + kk * ldb + j];
-                acc0 += a[kernelOffset + (long)kk * lda + mStart + 0] * bv;
-                acc1 += a[kernelOffset + (long)kk * lda + mStart + 1] * bv;
+                acc0 += packedA[packedOffset + kk * 2 + 0] * bv;
+                acc1 += packedA[packedOffset + kk * 2 + 1] * bv;
             }
-            c[cOffset + mStart * ldc + j] = acc0;
-            c[cOffset + (mStart + 1) * ldc + j] = acc1;
+            c[cOffset + j] = acc0;
+            c[cOffset + ldc + j] = acc1;
         }
     }
 

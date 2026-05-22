@@ -146,6 +146,75 @@ public class ConvTranspose2DGemmCorrectnessTests
             + $"[B={batch},Ci={inChannels},H={inH},W={inW}] → [Co={outChannels}] k={kH}x{kW} s={stride} p={padding}");
     }
 
+    [Fact]
+    public void DcganL2Shape_FatASmallNFastPath_BeatsOpenBlasBudget()
+    {
+        // Issue #358 phase-2 perf gate: the DCGAN L2 ConvTranspose2D shape
+        // [B=1, Cin=512, 4, 4] → [Co=256, 8, 8] hits a documented MKL/OpenBLAS
+        // perf cliff at M=4096, N=16, K=512, transA=true (215 ms OpenBLAS /
+        // 559 ms MKL vs ~1 ms theoretical peak). The packed-A + Mc-blocked
+        // AVX2 kernel must come in well under the OpenBLAS budget.
+        //
+        // Budget = 50 ms — generous over the expected ~3-10 ms steady-state
+        // on a 4-core AVX2 runner with code coverage instrumentation, but
+        // still 4-10x under the pre-fix OpenBLAS measurement so any
+        // regression that re-introduces the cliff (e.g., disabling the
+        // dispatch gate, or breaking the packed layout) trips the test.
+        const int batch = 1, inChannels = 512, inH = 4, inW = 4;
+        const int outChannels = 256, kH = 4, kW = 4;
+        const int stride = 2, padding = 1;
+        int outH = (inH - 1) * stride - 2 * padding + kH;
+        int outW = (inW - 1) * stride - 2 * padding + kW;
+
+        var inputT = MakeRandomTensor(new[] { batch, inChannels, inH, inW }, seed: 7);
+        var kernelT = MakeRandomTensor(new[] { inChannels, outChannels, kH, kW }, seed: 11);
+        var inputArr = inputT.Data.ToArray();
+        var kernelArr = kernelT.Data.ToArray();
+        var actual = new double[batch * outChannels * outH * outW];
+
+        Im2ColHelper._smallNTransAAvx2Calls = 0;
+        Im2ColHelper._smallNTransAScalarCalls = 0;
+
+        // Warmup — first call pays JIT + ArrayPool warmup.
+        Im2ColHelper.TryConvTranspose2DWithGemm(
+            inputArr, kernelArr, actual,
+            batch, inChannels, inH, inW, outChannels, kH, kW,
+            stride, stride, padding, padding, outH, outW);
+        Assert.True(Im2ColHelper._smallNTransAAvx2Calls > 0 || Im2ColHelper._smallNTransAScalarCalls > 0,
+            "Phase-2 dispatch did not fire on warmup — gate (hw == 16 && kmkn >= 8*inChannels) " +
+            "may not match L2 shape.");
+
+        // Two additional warmups to settle thermal / branch-predictor /
+        // ArrayPool state. The first warmup-after-JIT can still pay for
+        // the pool's slab allocation; the second + third let the kernel
+        // run cleanly on the hot data path.
+        for (int w = 0; w < 2; w++)
+        {
+            Im2ColHelper.TryConvTranspose2DWithGemm(
+                inputArr, kernelArr, actual,
+                batch, inChannels, inH, inW, outChannels, kH, kW,
+                stride, stride, padding, padding, outH, outW);
+        }
+
+        const int iters = 10;
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        for (int i = 0; i < iters; i++)
+        {
+            Im2ColHelper.TryConvTranspose2DWithGemm(
+                inputArr, kernelArr, actual,
+                batch, inChannels, inH, inW, outChannels, kH, kW,
+                stride, stride, padding, padding, outH, outW);
+        }
+        sw.Stop();
+        double msPerCall = sw.Elapsed.TotalMilliseconds / iters;
+
+        Assert.True(msPerCall < 50.0,
+            $"L2 ConvTranspose2D took {msPerCall:F1} ms/call — exceeds 50 ms phase-2 budget. " +
+            $"AVX2 calls: {Im2ColHelper._smallNTransAAvx2Calls}, scalar calls: {Im2ColHelper._smallNTransAScalarCalls}. " +
+            "Pre-fix OpenBLAS measured 215 ms / MKL 559 ms at this shape. Phase-2 packed-A " +
+            "kernel should produce well under the 50 ms budget with the BLIS-style Mc=64, Mr=2 blocking.");
+    }
+
     // Same shape suite for float — float has tighter precision tolerance
     // and BLAS path uses SGEMM whose accumulation order differs from naive.
     [Theory]
