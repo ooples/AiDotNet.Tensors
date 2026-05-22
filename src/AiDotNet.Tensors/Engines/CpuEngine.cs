@@ -8469,8 +8469,17 @@ public partial class CpuEngine : ITensorLevelEngine
             bool directKernelFitsWell = convFmas <= 4_000_000L
                 || (outChannels >= directKernelMinTasks
                     && outputSpatial >= MinDirectSpatial);
-            if (kernelHeight == 3 && kernelWidth == 3
-                && stride == 1 && padding > 0 && dilation == 1
+            // Stage 5 (#415): expand the direct-kernel gate from 3×3 s=1 to
+            // include 1×1 s=1, 3×3 s=2, 7×7 s=2 (ResNet50 stem + bottlenecks).
+            // CanUseSimdConvDouble + Conv2DDirectDouble do the per-shape
+            // routing so this dispatch stays one branch.
+            bool isSupportedDirectShape =
+                dilation == 1
+                && ((kernelHeight == 3 && kernelWidth == 3 && stride == 1 && padding > 0)
+                 || (kernelHeight == 1 && kernelWidth == 1 && stride == 1 && padding == 0)
+                 || (kernelHeight == 3 && kernelWidth == 3 && stride == 2)
+                 || (kernelHeight == 7 && kernelWidth == 7 && stride == 2));
+            if (isSupportedDirectShape
                 && directKernelFitsWell
                 && Helpers.SimdConvHelper.CanUseSimdConvDouble(kernelHeight, kernelWidth, stride, stride))
             {
@@ -8482,10 +8491,11 @@ public partial class CpuEngine : ITensorLevelEngine
                 using var pinO  = dResult.Data.Pin();
                 unsafe
                 {
-                    Helpers.SimdConvHelper.Conv3x3Stride1Double(
+                    Helpers.SimdConvHelper.Conv2DDirectDouble(
                         (double*)pinIn.Pointer, (double*)pinK.Pointer, (double*)pinO.Pointer,
                         batch, inChannels, height, width,
-                        outChannels, padding, padding, dilation, dilation);
+                        outChannels, kernelHeight, kernelWidth, stride, stride,
+                        padding, padding, dilation, dilation);
                 }
                 DifferentiableOps.RecordBinary("Conv2D", result, inputOrig, kernel,
                     BackwardFunctions<T>.Conv2DBackward, new object[] { new[] { stride, stride }, new[] { padding, padding }, new[] { dilation, dilation } });
@@ -8647,29 +8657,34 @@ public partial class CpuEngine : ITensorLevelEngine
             bool directKernelFitsWellInto = convFmasInto <= 4_000_000L
                 || (outChannels >= directKernelMinTasksInto
                     && outputSpatialInto >= MinDirectSpatialInto);
-            if (kernelHeight == 3 && kernelWidth == 3
-                && stride == 1 && padding > 0 && dilation == 1
+            // Stage 5 (#415): same shape expansion as the non-Into Conv2D
+            // dispatch above.
+            bool isSupportedDirectShapeInto =
+                dilation == 1
+                && ((kernelHeight == 3 && kernelWidth == 3 && stride == 1 && padding > 0)
+                 || (kernelHeight == 1 && kernelWidth == 1 && stride == 1 && padding == 0)
+                 || (kernelHeight == 3 && kernelWidth == 3 && stride == 2)
+                 || (kernelHeight == 7 && kernelWidth == 7 && stride == 2));
+            if (isSupportedDirectShapeInto
                 && directKernelFitsWellInto
                 && Helpers.SimdConvHelper.CanUseSimdConvDouble(kernelHeight, kernelWidth, stride, stride))
             {
                 var dInput  = (Tensor<double>)(object)input;
                 var dKernel = (Tensor<double>)(object)kernel;
                 var dOutput = (Tensor<double>)(object)output;
-                // No outer Span.Clear() — Conv3x3Stride1SingleChannelDouble
-                // does `new Span<double>(outputChannel, outputSize).Clear()`
-                // on each per-oc slab before accumulating, so an extra
-                // full-tensor Clear here is a wasted memory pass (~10 MB
-                // at SD shapes per call). The direct kernel owns its
-                // initialization of every byte it writes.
+                // No outer Span.Clear() — the per-oc direct kernels (and the
+                // GEMM-based Conv1x1Stride1Double via Dgemm's c.Clear()) own
+                // initialization of every byte they write.
                 using var pinIn = dInput.Data.Pin();
                 using var pinK  = dKernel.Data.Pin();
                 using var pinO  = dOutput.Data.Pin();
                 unsafe
                 {
-                    Helpers.SimdConvHelper.Conv3x3Stride1Double(
+                    Helpers.SimdConvHelper.Conv2DDirectDouble(
                         (double*)pinIn.Pointer, (double*)pinK.Pointer, (double*)pinO.Pointer,
                         batch, inChannels, height, width,
-                        outChannels, padding, padding, dilation, dilation);
+                        outChannels, kernelHeight, kernelWidth, stride, stride,
+                        padding, padding, dilation, dilation);
                 }
                 return;
             }
@@ -12700,53 +12715,264 @@ public partial class CpuEngine : ITensorLevelEngine
         // cannot fit in the per-test 120 s budget.
         if (typeof(T) == typeof(double))
         {
+            // #415 Phase E: 1×1 stride=1 padding=0 backward-input direct
+            // path. Same identity the into-variant Conv2DBackwardInputInto
+            // already uses (line ~12888): when k=1/s=1/p=0, im2col is a
+            // no-op (col = input slice reshape) and col2im is also a no-op,
+            // so the whole thing collapses to a per-batch dgemm:
+            //   gradInput_b = kernel^T @ gradOutput_b
+            // ResNet50 has 16+ 1×1 conv layers per forward (bottleneck
+            // blocks); each pays a full im2col rent + col2im scatter on the
+            // pre-existing path even though both are identity. Skip them.
+            if (kernelHeight == 1 && kernelWidth == 1 && strideH == 1 && strideW == 1
+                && padH == 0 && padW == 0 && dilationH == 1 && dilationW == 1)
+            {
+                int N1x1 = outputHeight * outputWidth; // == height*width
+                int inputSliceSize1x1 = inChannels * N1x1;
+                int gradSliceSize1x1 = outChannels * N1x1;
+                var gradOutputD1x1 = (double[])(object)gradOutput.GetFlattenedData();
+                var kernelD1x1 = (double[])(object)kernel.GetFlattenedData();
+                var gradInputD1x1 = new double[batch * inputSliceSize1x1];
+
+                CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * inChannels * outChannels * N1x1, b =>
+                {
+                    int gradOutOff = b * gradSliceSize1x1;
+                    int destSliceOff = b * inputSliceSize1x1;
+                    bool usedBlas = Helpers.BlasProvider.TryGemmExBeta(
+                        inChannels, N1x1, outChannels,
+                        kernelD1x1, 0, inChannels, true,    // A = kernel [outC × inC]^T
+                        gradOutputD1x1, gradOutOff, N1x1, false,
+                        gradInputD1x1, destSliceOff, N1x1,
+                        alpha: 1.0,
+                        beta: 0.0);
+                    if (!usedBlas)
+                    {
+                        // Cold path — build transposed kernel once per batch (rare).
+                        var poolKt = System.Buffers.ArrayPool<double>.Shared;
+                        var kT = poolKt.Rent(inChannels * outChannels);
+                        try
+                        {
+                            for (int r = 0; r < outChannels; r++)
+                                for (int c = 0; c < inChannels; c++)
+                                    kT[c * outChannels + r] = kernelD1x1[r * inChannels + c];
+                            var dstSpan = new Span<double>(gradInputD1x1, destSliceOff, inputSliceSize1x1);
+                            dstSpan.Clear();
+                            for (int ic = 0; ic < inChannels; ic++)
+                            {
+                                int kRowBase = ic * outChannels;
+                                int dRowBase = ic * N1x1;
+                                for (int n = 0; n < N1x1; n++)
+                                {
+                                    double sum = 0.0;
+                                    for (int oc = 0; oc < outChannels; oc++)
+                                        sum += kT[kRowBase + oc] * gradOutputD1x1[gradOutOff + oc * N1x1 + n];
+                                    dstSpan[dRowBase + n] += sum;
+                                }
+                            }
+                        }
+                        finally { poolKt.Return(kT); }
+                    }
+                });
+                return TensorAllocator.Rent<T>(inputShape, (Vector<T>)(object)new Vector<double>(gradInputD1x1));
+            }
+#if !NET471
+            // #415 Phase B: direct-kernel fast path for 3×3 stride=1 padding=1
+            // (the dominant VGG / ResNet 3×3 backward-input shape). Uses the
+            // identity: Conv2DBackwardInput with these constraints is exactly
+            //   forward Conv2D(gradOutput, K')   where K'[ic, oc, kh', kw'] = K[oc, ic, 2-kh', 2-kw']
+            // i.e. spatially-flipped and channel-transposed kernel applied to
+            // gradOutput. Lets us hit SimdConvHelper.Conv3x3Stride1Double's
+            // register-resident AVX2/FMA inner loop on the BACKWARD path
+            // instead of paying im2col allocation + col2im scatter + dgemm
+            // dispatch overhead. The kernel-flip prep allocates one
+            // inChannels × outChannels × 9 buffer (e.g. 18 MB at VGG block 5
+            // 512→512 — fits L3) which is a fraction of the per-call im2col
+            // buffer the dgemm path allocates per batch (~8 MB for ResNet
+            // res2 56×56 / 256 channels). Mirrors the gate used by the
+            // forward Conv2D direct path (line ~8439) so the perf cliff
+            // shapes (small spatial × high channels) stay on im2col+DGEMM
+            // where BLAS keeps near-peak throughput via internal blocking.
+            // Gate: T = double, all dilations = 1, kernel = 3×3, stride = 1,
+            // padding = 1 (the only padding that keeps outH = inH and outW
+            // = inW so the forward kernel's output dims line up with the
+            // gradInput we need), AVX2/FMA available.
+            if (kernelHeight == 3 && kernelWidth == 3
+                && strideH == 1 && strideW == 1
+                && padH == 1 && padW == 1
+                && dilationH == 1 && dilationW == 1
+                && Helpers.SimdConvHelper.CanUseSimdConvDouble(kernelHeight, kernelWidth, strideH, strideW))
+            {
+                // Same perf gate as forward Conv2D — see CpuEngine.Conv2D line
+                // ~8465 for the empirical rationale. The direct kernel wins
+                // when (a) total work is small enough that BLAS dispatch
+                // overhead dominates, OR (b) there's enough outChannels work
+                // to saturate the per-OC parallel tasks at sufficient spatial
+                // density that the no-im2col-blowup memory-traffic win
+                // materializes.  Reuse the identical formula so the
+                // backward path's routing decision tracks the forward's at
+                // every shape.
+                long convFmas = (long)batch * inChannels * outChannels * height * width * 9L;
+                long outputSpatial = (long)outputHeight * outputWidth;
+                int directKernelMinTasks = 2 * Math.Max(1, Helpers.CpuParallelSettings.MaxDegreeOfParallelism);
+                const long MinDirectSpatial = 512L;
+                bool directKernelFitsWell = convFmas <= 4_000_000L
+                    || (inChannels >= directKernelMinTasks
+                        && outputSpatial >= MinDirectSpatial);
+                if (directKernelFitsWell)
+                {
+                    var kernelDDirect = (double[])(object)kernel.GetFlattenedData();
+
+                    // #415 Phase C: rent the kernel-flip scratch from the
+                    // shared array pool instead of allocating a fresh array
+                    // per call. For VGG block 5 (512×512×9 doubles ≈ 18 MB)
+                    // the GC pressure was meaningful on the per-step hot
+                    // path; pool rental amortizes it to zero across the
+                    // training loop. We always return in a finally so a
+                    // mid-call exception can't strand the buffer.
+                    var poolFlip = System.Buffers.ArrayPool<double>.Shared;
+                    var kernelFlippedBuf = poolFlip.Rent(inChannels * outChannels * 9);
+                    try
+                    {
+                    // Build K' shape [inChannels, outChannels, 3, 3] with
+                    // K'[ic, oc, kh', kw'] = K[oc, ic, 2-kh', 2-kw']. The
+                    // inner spatial flip is the kernel-flip from the
+                    // backward-input derivation; the (oc, ic) transpose
+                    // swaps the role of in/out channels because the forward
+                    // kernel reads the inChannels dim from the input tensor
+                    // (= gradOutput here) and the outChannels dim from the
+                    // kernel's leading axis.
+                    // Pooled buffer may be longer than needed; use only the
+                    // first inChannels*outChannels*9 entries. The forward
+                    // kernel doesn't read past that boundary.
+                    int kernelFlippedLen = inChannels * outChannels * 9;
+                    var kernelFlipped = kernelFlippedBuf;
+                    for (int oc = 0; oc < outChannels; oc++)
+                    {
+                        for (int ic = 0; ic < inChannels; ic++)
+                        {
+                            int srcBase = (oc * inChannels + ic) * 9;
+                            int dstBase = (ic * outChannels + oc) * 9;
+                            kernelFlipped[dstBase + 0] = kernelDDirect[srcBase + 8];
+                            kernelFlipped[dstBase + 1] = kernelDDirect[srcBase + 7];
+                            kernelFlipped[dstBase + 2] = kernelDDirect[srcBase + 6];
+                            kernelFlipped[dstBase + 3] = kernelDDirect[srcBase + 5];
+                            kernelFlipped[dstBase + 4] = kernelDDirect[srcBase + 4];
+                            kernelFlipped[dstBase + 5] = kernelDDirect[srcBase + 3];
+                            kernelFlipped[dstBase + 6] = kernelDDirect[srcBase + 2];
+                            kernelFlipped[dstBase + 7] = kernelDDirect[srcBase + 1];
+                            kernelFlipped[dstBase + 8] = kernelDDirect[srcBase + 0];
+                        }
+                    }
+
+                    var gradOutputDDirect = (double[])(object)gradOutput.GetFlattenedData();
+                    // gradInput escapes via TensorAllocator.Rent — must be
+                    // GC-owned, not pool-rented. The flip + col scratch are
+                    // the only per-call transient allocations on this path.
+                    var gradInputDDirect = new double[batch * inChannels * height * width];
+                    unsafe
+                    {
+                        fixed (double* pGradOut = gradOutputDDirect)
+                        fixed (double* pKFlipped = kernelFlipped)
+                        fixed (double* pGradIn = gradInputDDirect)
+                        {
+                            // Map original Conv2D's (outChannels, inChannels)
+                            // to the forward direct kernel's (inChannels,
+                            // outChannels) — the forward reads its inChannels
+                            // arg from the "input" tensor's channel dim (which
+                            // is gradOutput.outChannels here) and writes its
+                            // outChannels arg to the "output" tensor's
+                            // channel dim (which is gradInput.inChannels
+                            // here).
+                            Helpers.SimdConvHelper.Conv3x3Stride1Double(
+                                pGradOut, pKFlipped, pGradIn,
+                                batch,
+                                outChannels,   // forward "inChannels" = gradOutput's channel count
+                                outputHeight,  // forward "height"      = gradOutput H (== input H here)
+                                outputWidth,
+                                inChannels,    // forward "outChannels" = gradInput's channel count
+                                padH: 1, padW: 1, dilationH: 1, dilationW: 1);
+                        }
+                    }
+                    return TensorAllocator.Rent<T>(inputShape, (Vector<T>)(object)new Vector<double>(gradInputDDirect));
+                    }
+                    finally { poolFlip.Return(kernelFlippedBuf); }
+                }
+            }
+#endif
+
             int colH = inChannels * kernelHeight * kernelWidth;
             int colW = outputHeight * outputWidth;
             var gradInputD = new double[batch * inChannels * height * width];
             var gradOutputD = (double[])(object)gradOutput.GetFlattenedData();
             var kernelD = (double[])(object)kernel.GetFlattenedData();
 
-            // Reshape kernel from [outC, inC, kH, kW] to [colH, outC] = transpose
-            var kernelTD = new double[colH * outChannels];
-            for (int r = 0; r < outChannels; r++)
-                for (int c = 0; c < colH; c++)
-                    kernelTD[c * outChannels + r] = kernelD[r * colH + c];
-
-            var poolD = System.Buffers.ArrayPool<double>.Shared;
-            CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * colH * colW, b =>
+            // #415 Phase C: rent the kernel-transpose scratch from the
+            // shared array pool instead of allocating per call. For ResNet50
+            // res5 (1×1 conv at 2048→2048 — outside the Phase B direct gate
+            // so this branch fires) the buffer is 32 MB; for the 3×3
+            // stride-2 res blocks (also outside the Phase B p=1 gate) it
+            // hits ~18 MB. GC pressure was material on the per-step hot
+            // path; pool rental amortizes it to zero.
+            var poolKernelT = System.Buffers.ArrayPool<double>.Shared;
+            var kernelTD = poolKernelT.Rent(colH * outChannels);
+            try
             {
-                var colBuf = poolD.Rent(colW * colH);
-                try
+                // Reshape kernel from [outC, inC, kH, kW] to [colH, outC] = transpose
+                for (int r = 0; r < outChannels; r++)
+                    for (int c = 0; c < colH; c++)
+                        kernelTD[c * outChannels + r] = kernelD[r * colH + c];
+
+                var poolD = System.Buffers.ArrayPool<double>.Shared;
+                CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * colH * colW, b =>
                 {
-                    int gradOutOff = b * outChannels * colW;
-
-                    if (!Helpers.BlasProvider.TryGemm(colH, colW, outChannels,
-                        kernelTD, 0, outChannels,
-                        gradOutputD, gradOutOff, colW,
-                        colBuf, 0, colW))
+                    var colBuf = poolD.Rent(colW * colH);
+                    try
                     {
-                        // Blocked double matmul fallback when libopenblas
-                        // isn't loadable — same algorithm BLAS would run,
-                        // ~2-3× slower but never asymptotically blocking.
-                        Helpers.Im2ColHelper.MultiplyMatrixBlockedDouble(
-                            new ReadOnlySpan<double>(kernelTD),
-                            new ReadOnlySpan<double>(gradOutputD, gradOutOff, outChannels * colW),
-                            new Span<double>(colBuf, 0, colH * colW),
-                            colH, outChannels, colW);
+                        int gradOutOff = b * outChannels * colW;
+
+                        if (!Helpers.BlasProvider.TryGemm(colH, colW, outChannels,
+                            kernelTD, 0, outChannels,
+                            gradOutputD, gradOutOff, colW,
+                            colBuf, 0, colW))
+                        {
+                            // #415 Phase D: route the BLAS-unavailable
+                            // fallback through SimdGemm.DgemmSequential —
+                            // the AVX2/FMA Vector256<double> kernel
+                            // (~12 GFLOPS on the SimdGemmDouble.cs perf
+                            // baseline vs ~2.8 GFLOPS for the prior
+                            // numOps-dispatched fallback). Use the
+                            // Sequential variant because we're already
+                            // inside the parallel-over-batch loop;
+                            // SimdGemm.Dgemm's inner Parallel.For would
+                            // oversubscribe the thread pool.
+                            // Layout match: caller has A = kernelTD shape
+                            // [colH, outC] in row-major (already the
+                            // transpose layout dgemm/SimdGemm want),
+                            // B = gradOutput shape [outC, colW] in
+                            // row-major, target C = colBuf shape
+                            // [colH, colW]. C = A·B with m=colH, k=outC,
+                            // n=colW.
+                            Simd.SimdGemm.DgemmSequential(
+                                new ReadOnlySpan<double>(kernelTD, 0, colH * outChannels),
+                                new ReadOnlySpan<double>(gradOutputD, gradOutOff, outChannels * colW),
+                                new Span<double>(colBuf, 0, colH * colW),
+                                colH, outChannels, colW);
+                        }
+
+                        int imgOff = b * inChannels * height * width;
+                        Helpers.Im2ColHelper.Col2ImAccumulate(
+                            new ReadOnlySpan<double>(colBuf, 0, colW * colH),
+                            new Span<double>(gradInputD, imgOff, inChannels * height * width),
+                            inChannels, height, width,
+                            kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW,
+                            outputHeight, outputWidth);
                     }
+                    finally { poolD.Return(colBuf); }
+                });
 
-                    int imgOff = b * inChannels * height * width;
-                    Helpers.Im2ColHelper.Col2ImAccumulate(
-                        new ReadOnlySpan<double>(colBuf, 0, colW * colH),
-                        new Span<double>(gradInputD, imgOff, inChannels * height * width),
-                        inChannels, height, width,
-                        kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW,
-                        outputHeight, outputWidth);
-                }
-                finally { poolD.Return(colBuf); }
-            });
-
-            return TensorAllocator.Rent<T>(inputShape, (Vector<T>)(object)new Vector<double>(gradInputD));
+                return TensorAllocator.Rent<T>(inputShape, (Vector<T>)(object)new Vector<double>(gradInputD));
+            }
+            finally { poolKernelT.Return(kernelTD); }
         }
 
         // Generic fallback for non-float, non-double types
@@ -13144,12 +13370,107 @@ public partial class CpuEngine : ITensorLevelEngine
             var inputD = (double[])(object)input.GetFlattenedData();
             int inputSliceSize = inChannels * height * width;
 
+            // #415 Phase E: 1×1 stride=1 padding=0 backward-kernel direct
+            // path. Mirror of the Conv2DBackwardInput 1×1 path above and
+            // the into-variant Conv2DBackwardKernelInto at line ~13423.
+            // For k=1/s=1/p=0, im2col is identity over the input slice, so
+            // the GEMM becomes
+            //   gradKernel[oc, ic] += gradOut_b[oc, N] @ input_b^T[ic, N]
+            // accumulated across batches via sequential β=1 dgemm calls into
+            // the same destination (saves the per-batch staging buffer +
+            // final merge pass the general path uses).
+            if (kernelHeight == 1 && kernelWidth == 1 && strideH == 1 && strideW == 1
+                && padH == 0 && padW == 0 && dilationH == 1 && dilationW == 1)
+            {
+                int N1x1 = outputHeight * outputWidth;
+                int totalLen1x1 = outChannels * inChannels;
+                for (int b = 0; b < batch; b++)
+                {
+                    double betaThis = (b == 0) ? 0.0 : 1.0;
+                    int gradOutOff = b * outChannels * N1x1;
+                    int inOff = b * inChannels * N1x1;
+                    bool usedBlas = Helpers.BlasProvider.TryGemmExBeta(
+                        outChannels, inChannels, N1x1,
+                        gradOutputD, gradOutOff, N1x1, false,
+                        inputD, inOff, N1x1, true,
+                        gradKernelD, 0, inChannels,
+                        alpha: 1.0, beta: betaThis);
+                    if (!usedBlas)
+                    {
+                        if (b == 0) Array.Clear(gradKernelD, 0, totalLen1x1);
+                        for (int oc = 0; oc < outChannels; oc++)
+                        {
+                            int goRowBase = gradOutOff + oc * N1x1;
+                            for (int ic = 0; ic < inChannels; ic++)
+                            {
+                                double sum = 0.0;
+                                int inRowBase = inOff + ic * N1x1;
+                                for (int n = 0; n < N1x1; n++)
+                                    sum += gradOutputD[goRowBase + n] * inputD[inRowBase + n];
+                                gradKernelD[oc * inChannels + ic] += sum;
+                            }
+                        }
+                    }
+                }
+                return TensorAllocator.Rent<T>(kernelShape, (Vector<T>)(object)new Vector<double>(gradKernelD));
+            }
+
+#if !NET471
+            // #415 Phase B-2: direct backward-kernel fast path for 3×3 /
+            // stride=1 / padding=1 / FP64 (mirror of Phase B for backward-
+            // input). Skips im2col allocation (~8 MB per call at ResNet
+            // res2 56×56 / 256 channels) + the dgemm dispatch + the
+            // per-batch gradCopy alloc. Computes
+            //   gradKernel[oc, ic, kh, kw] = sum_{b, oh, ow}
+            //     gradOutput[b, oc, oh, ow] * input[b, ic, oh+kh-1, ow+kw-1]
+            // directly, with SIMD vectorization along the contiguous ow
+            // dim (4 doubles per AVX2 Vector256<double> chunk) and
+            // parallel fan-out over the (oc, ic) outer loop. The result
+            // shape outC × inC × 9 is small (e.g. 36864 doubles for VGG
+            // block 1) so the reduction can write directly into the
+            // final gradKernelD without per-batch staging buffers.
+            // Gate: matches the Phase B direct-input gate so backward-
+            // input and backward-kernel routing decisions track each
+            // other at every shape.
+            if (kernelHeight == 3 && kernelWidth == 3
+                && strideH == 1 && strideW == 1
+                && padH == 1 && padW == 1
+                && dilationH == 1 && dilationW == 1
+                && Helpers.SimdConvHelper.CanUseSimdConvDouble(kernelHeight, kernelWidth, strideH, strideW))
+            {
+                long convFmas = (long)batch * inChannels * outChannels * outputHeight * outputWidth * 9L;
+                long outputSpatial = (long)outputHeight * outputWidth;
+                int directKernelMinTasks = 2 * Math.Max(1, Helpers.CpuParallelSettings.MaxDegreeOfParallelism);
+                const long MinDirectSpatial = 512L;
+                bool directKernelFitsWell = convFmas <= 4_000_000L
+                    || ((long)outChannels * inChannels >= directKernelMinTasks
+                        && outputSpatial >= MinDirectSpatial);
+                if (directKernelFitsWell)
+                {
+                    Helpers.SimdConvHelper.Conv3x3Stride1BackwardKernelDouble(
+                        gradOutputD, inputD, gradKernelD,
+                        batch, inChannels, outChannels,
+                        height, width, outputHeight, outputWidth,
+                        padH: 1, padW: 1);
+                    return TensorAllocator.Rent<T>(kernelShape, (Vector<T>)(object)new Vector<double>(gradKernelD));
+                }
+            }
+#endif
+
+            // #415 Phase C: keep the per-batch localGrad buffers alive
+            // across the parallel loop instead of copying into a fresh
+            // GC-allocated gradCopy per batch — saves outC × colH doubles
+            // of allocation per batch (~288 KB at VGG block 1, scales
+            // with channel count). Each thread rents its own localGrad
+            // from the shared pool, hands the rented array to perBatchGradsD,
+            // and the main thread returns them after merging.
             var perBatchGradsD = new double[batch][];
             var kPoolD = System.Buffers.ArrayPool<double>.Shared;
             CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * colH * colW, b =>
             {
                 var im2colBuf = kPoolD.Rent(colH * colW);
                 var localGrad = kPoolD.Rent(outChannels * colH);
+                bool localGradOwned = true;
                 try
                 {
                     Array.Clear(localGrad, 0, outChannels * colH);
@@ -13169,17 +13490,25 @@ public partial class CpuEngine : ITensorLevelEngine
                         im2colBuf, 0, colW, true,
                         localGrad, 0, colH))
                     {
-                        // No SimdGemm.Dgemm available; manually transpose
-                        // im2col into a tiled buffer then call the blocked
-                        // double matmul. For correctness when BLAS is off,
-                        // we transpose into a fresh buffer then NxN matmul.
+                        // #415 Phase D: BLAS-unavailable fallback now
+                        // routes through SimdGemm.DgemmSequential (AVX2 +
+                        // FMA Vector256<double>, ~12 GFLOPS on the
+                        // SimdGemmDouble.cs perf baseline) instead of
+                        // the older MultiplyMatrixBlockedDouble (~3 GFLOPS
+                        // on the same shape). Sequential variant because
+                        // we're already inside the parallel-over-batch
+                        // dispatch — SimdGemm.Dgemm's nested Parallel.For
+                        // would oversubscribe the worker pool.
+                        // SimdGemm.Dgemm doesn't take a transpose flag,
+                        // so we transpose im2col first (same as the
+                        // pre-existing fallback did).
                         var im2colT = kPoolD.Rent(colW * colH);
                         try
                         {
                             for (int r = 0; r < colH; r++)
                                 for (int c = 0; c < colW; c++)
                                     im2colT[c * colH + r] = im2colBuf[r * colW + c];
-                            Helpers.Im2ColHelper.MultiplyMatrixBlockedDouble(
+                            Simd.SimdGemm.DgemmSequential(
                                 new ReadOnlySpan<double>(gradOutputD, gradOutOff, outChannels * colW),
                                 new ReadOnlySpan<double>(im2colT, 0, colW * colH),
                                 new Span<double>(localGrad, 0, outChannels * colH),
@@ -13188,22 +13517,27 @@ public partial class CpuEngine : ITensorLevelEngine
                         finally { kPoolD.Return(im2colT); }
                     }
 
-                    var gradCopy = new double[outChannels * colH];
-                    Array.Copy(localGrad, gradCopy, outChannels * colH);
-                    perBatchGradsD[b] = gradCopy;
+                    // Hand the rented buffer to the cross-batch merge
+                    // step instead of copying. We mark localGradOwned=false
+                    // so the finally below skips the pool-return on this
+                    // path — the main thread returns it after merging.
+                    perBatchGradsD[b] = localGrad;
+                    localGradOwned = false;
                 }
                 finally
                 {
                     kPoolD.Return(im2colBuf);
-                    kPoolD.Return(localGrad);
+                    if (localGradOwned) kPoolD.Return(localGrad);
                 }
             });
 
             for (int b = 0; b < batch; b++)
             {
                 var lg = perBatchGradsD[b];
+                if (lg is null) continue; // defensive: parallel callback failed for this batch
                 for (int i = 0; i < gradKernelD.Length; i++)
                     gradKernelD[i] += lg[i];
+                kPoolD.Return(lg);
             }
 
             return TensorAllocator.Rent<T>(kernelShape, (Vector<T>)(object)new Vector<double>(gradKernelD));
@@ -17825,9 +18159,11 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 #endif
         // Double primitive fast path for last-axis softmax backward.
-        // Inline scalar arithmetic (no Vector256<double> kernel yet) but still
-        // ~4× the throughput of the generic INumericOperations<T> loop because
-        // it eliminates virtual-dispatch + Multiply/Add boxing on every element.
+        // Stage 4 (#415): Vector256<double> 4×-unrolled FMA — 16 doubles/iter
+        // for the dot-product reduction and the row write. Roughly mirrors
+        // SoftmaxBackwardFloat's structure with FP32→FP64 lane-count halved
+        // (4 doubles per Vector256, vs 8 floats). Falls through to scalar
+        // when AVX/FMA aren't available (net471 / non-x86).
         if (typeof(T) == typeof(double) && innerSize == 1
             && gradOutput.GetFlattenedData() is double[] gOutD
             && output.GetFlattenedData() is double[] outD)
@@ -17835,13 +18171,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var gInD = new double[outD.Length];
             bool useParallel = outerSize >= 4 && (long)outerSize * axisSize >= 32768;
             int axisSz = axisSize;
-            Action<int> rowKernel = row =>
-            {
-                int baseIdx = row * axisSz;
-                double dot = 0.0;
-                for (int i = 0; i < axisSz; i++) dot += gOutD[baseIdx + i] * outD[baseIdx + i];
-                for (int i = 0; i < axisSz; i++) gInD[baseIdx + i] = outD[baseIdx + i] * (gOutD[baseIdx + i] - dot);
-            };
+            Action<int> rowKernel = row => SoftmaxBackwardDoubleRow(gOutD, outD, gInD, row, axisSz);
             if (useParallel)
                 CpuParallelSettings.ParallelForOrSerial(0, outerSize, (long)outerSize * axisSize, rowKernel);
             else
@@ -17973,6 +18303,100 @@ public partial class CpuEngine : ITensorLevelEngine
             for (; i < axisSize; i++)
                 gi[i] = o[i] * (go[i] - dot);
         }
+    }
+
+    /// <summary>
+    /// Stage 4 (#415): Vector256&lt;double&gt; 4×-unrolled softmax-backward row
+    /// kernel. dot = Σ gradOut·output, then gradIn = output*(gradOut − dot).
+    /// 16 doubles per loop iter (4 × Vector256 lanes × 4-way unroll) to
+    /// keep both FMA ports busy. FP64 counterpart to
+    /// <see cref="SoftmaxBackwardFloatRow"/>. Falls back to scalar when
+    /// AVX/FMA aren't available.
+    /// </summary>
+    private static unsafe void SoftmaxBackwardDoubleRow(double[] gradOut, double[] output, double[] gradIn,
+        int row, int axisSize)
+    {
+        int baseIdx = row * axisSize;
+        fixed (double* pGO = gradOut, pO = output, pGI = gradIn)
+        {
+            double* go = pGO + baseIdx;
+            double* o = pO + baseIdx;
+            double* gi = pGI + baseIdx;
+
+            // Step 1: dot product = Σ gradOut[i] * output[i].
+            double dot = 0.0;
+            int i = 0;
+            if (System.Runtime.Intrinsics.X86.Fma.IsSupported && axisSize >= 16)
+            {
+                var vdot0 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var vdot1 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var vdot2 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var vdot3 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                int simdLen = axisSize & ~15;
+                for (; i < simdLen; i += 16)
+                {
+                    vdot0 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(
+                        System.Runtime.Intrinsics.X86.Avx.LoadVector256(go + i),
+                        System.Runtime.Intrinsics.X86.Avx.LoadVector256(o + i), vdot0);
+                    vdot1 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(
+                        System.Runtime.Intrinsics.X86.Avx.LoadVector256(go + i + 4),
+                        System.Runtime.Intrinsics.X86.Avx.LoadVector256(o + i + 4), vdot1);
+                    vdot2 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(
+                        System.Runtime.Intrinsics.X86.Avx.LoadVector256(go + i + 8),
+                        System.Runtime.Intrinsics.X86.Avx.LoadVector256(o + i + 8), vdot2);
+                    vdot3 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(
+                        System.Runtime.Intrinsics.X86.Avx.LoadVector256(go + i + 12),
+                        System.Runtime.Intrinsics.X86.Avx.LoadVector256(o + i + 12), vdot3);
+                }
+                vdot0 = System.Runtime.Intrinsics.X86.Avx.Add(
+                    System.Runtime.Intrinsics.X86.Avx.Add(vdot0, vdot1),
+                    System.Runtime.Intrinsics.X86.Avx.Add(vdot2, vdot3));
+                dot = HorizontalSumD(vdot0);
+            }
+            for (; i < axisSize; i++)
+                dot += go[i] * o[i];
+
+            // Step 2: gradIn[i] = output[i] * (gradOut[i] − dot).
+            i = 0;
+            if (System.Runtime.Intrinsics.X86.Avx.IsSupported && axisSize >= 16)
+            {
+                var vdot = System.Runtime.Intrinsics.Vector256.Create(dot);
+                int simdLen = axisSize & ~15;
+                for (; i < simdLen; i += 16)
+                {
+                    var go0 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(go + i);
+                    var go1 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(go + i + 4);
+                    var go2 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(go + i + 8);
+                    var go3 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(go + i + 12);
+                    var o0 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(o + i);
+                    var o1 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(o + i + 4);
+                    var o2 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(o + i + 8);
+                    var o3 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(o + i + 12);
+                    System.Runtime.Intrinsics.X86.Avx.Store(gi + i,
+                        System.Runtime.Intrinsics.X86.Avx.Multiply(o0, System.Runtime.Intrinsics.X86.Avx.Subtract(go0, vdot)));
+                    System.Runtime.Intrinsics.X86.Avx.Store(gi + i + 4,
+                        System.Runtime.Intrinsics.X86.Avx.Multiply(o1, System.Runtime.Intrinsics.X86.Avx.Subtract(go1, vdot)));
+                    System.Runtime.Intrinsics.X86.Avx.Store(gi + i + 8,
+                        System.Runtime.Intrinsics.X86.Avx.Multiply(o2, System.Runtime.Intrinsics.X86.Avx.Subtract(go2, vdot)));
+                    System.Runtime.Intrinsics.X86.Avx.Store(gi + i + 12,
+                        System.Runtime.Intrinsics.X86.Avx.Multiply(o3, System.Runtime.Intrinsics.X86.Avx.Subtract(go3, vdot)));
+                }
+            }
+            for (; i < axisSize; i++)
+                gi[i] = o[i] * (go[i] - dot);
+        }
+    }
+#endif
+
+#if !NET5_0_OR_GREATER
+    // Scalar fallback for non-x86 / net471 — keeps the dispatcher call valid.
+    private static void SoftmaxBackwardDoubleRow(double[] gradOut, double[] output, double[] gradIn,
+        int row, int axisSize)
+    {
+        int baseIdx = row * axisSize;
+        double dot = 0.0;
+        for (int i = 0; i < axisSize; i++) dot += gradOut[baseIdx + i] * output[baseIdx + i];
+        for (int i = 0; i < axisSize; i++) gradIn[baseIdx + i] = output[baseIdx + i] * (gradOut[baseIdx + i] - dot);
     }
 #endif
 
@@ -20163,62 +20587,23 @@ public partial class CpuEngine : ITensorLevelEngine
             var outD = (double[])(object)outputData;
             double epsD = epsilon;
             int fs = featureSize;
-            // #319: total work is batchSize * featureSize floats. For ViT-Base
-            // with batch=1, featureSize=768 (= 768 ops total), this is well
-            // below the 32K grain size — Parallel.For dispatch was paying
-            // semaphore-signal overhead with zero parallelism benefit.
-            // Migrate to ParallelForOrSerial so small-batch LayerNorm runs
-            // inline on the calling thread.
+
+            // Stage 4 (#415): 2-pass fused SIMD path mirroring the FP32
+            // ProcessBatchesSimd structure — variance via E[X²]−E[X]², then
+            // affine normalize. Cuts from 5 passes (Sum + AffineNormalize
+            // scratch + SumOfSquares + AffineNormalize + scalar γ·x+β) to
+            // 2 passes (fused sum/sumSq + fused normalize+γβ). 2.5× memory
+            // bandwidth reduction at ACEStep LN shapes.
             long lnTotalWork = (long)batchSize * featureSize;
+            void RunBatch(int b) => LayerNormForwardDoubleFusedBatch(
+                inputD, gammaD, betaD, outD, meanD, varD, b, fs, epsD);
             if (lnTotalWork < AiDotNet.Tensors.Helpers.PersistentParallelExecutor.DefaultSerialGrainSize)
             {
-                // Serial path: one scratch shared across iterations.
-                var scratchSerial = new double[fs];
-                for (int b = 0; b < batchSize; b++)
-                {
-                    int offset = b * fs;
-                    var inSlice = new ReadOnlySpan<double>(inputD, offset, fs);
-                    double sum = AiDotNet.Tensors.Engines.Optimization.NumericFastPath.SumDouble(inSlice);
-                    double m = sum / fs;
-                    meanD[b] = m;
-                    AiDotNet.Tensors.Engines.Optimization.NumericFastPath.AffineNormalizeDouble(
-                        inSlice, scratchSerial.AsSpan(0, fs), m, 1.0);
-                    double v = AiDotNet.Tensors.Engines.Optimization.NumericFastPath.SumOfSquaresDouble(
-                        new ReadOnlySpan<double>(scratchSerial, 0, fs)) / fs;
-                    varD[b] = v;
-                    double invStd = 1.0 / Math.Sqrt(v + epsD);
-                    AiDotNet.Tensors.Engines.Optimization.NumericFastPath.AffineNormalizeDouble(
-                        inSlice, new Span<double>(outD, offset, fs), m, invStd);
-                    for (int f = 0; f < fs; f++)
-                        outD[offset + f] = gammaD[f] * outD[offset + f] + betaD[f];
-                }
+                for (int b = 0; b < batchSize; b++) RunBatch(b);
             }
             else
             {
-                // Parallel path: per-thread scratch via Parallel.For's
-                // localInit / localFinally so allocations don't churn.
-                CpuParallelSettings.ParallelForOrSerial(0, batchSize,
-                    (long)batchSize * fs,
-                    () => new double[fs],
-                    (b, _, scratch) =>
-                {
-                    int offset = b * fs;
-                    var inSlice = new ReadOnlySpan<double>(inputD, offset, fs);
-                    double sum = AiDotNet.Tensors.Engines.Optimization.NumericFastPath.SumDouble(inSlice);
-                    double m = sum / fs;
-                    meanD[b] = m;
-                    AiDotNet.Tensors.Engines.Optimization.NumericFastPath.AffineNormalizeDouble(
-                        inSlice, scratch.AsSpan(0, fs), m, 1.0);
-                    double v = AiDotNet.Tensors.Engines.Optimization.NumericFastPath.SumOfSquaresDouble(
-                        new ReadOnlySpan<double>(scratch, 0, fs)) / fs;
-                    varD[b] = v;
-                    double invStd = 1.0 / Math.Sqrt(v + epsD);
-                    AiDotNet.Tensors.Engines.Optimization.NumericFastPath.AffineNormalizeDouble(
-                        inSlice, new Span<double>(outD, offset, fs), m, invStd);
-                    for (int f = 0; f < fs; f++)
-                        outD[offset + f] = gammaD[f] * outD[offset + f] + betaD[f];
-                    return scratch;
-                }, scratch => { /* per-thread scratch goes out of scope */ });
+                CpuParallelSettings.ParallelForOrSerial(0, batchSize, lnTotalWork, RunBatch);
             }
         }
         else
@@ -20876,45 +21261,18 @@ public partial class CpuEngine : ITensorLevelEngine
             double featureSizeD = fs;
             double invFeatureSizeD = 1.0 / featureSizeD;
 
-            for (int b = 0; b < batchSize; b++)
-            {
-                int off = b * fs;
-                double invStd = 1.0 / Math.Sqrt(dVar[b] + epsilon);
-                double m = dMean[b];
-                for (int f = 0; f < fs; f++)
-                {
-                    double go = dGradOut[off + f];
-                    double normalized = (dInput[off + f] - m) * invStd;
-                    dGradGamma[f] += go * normalized;
-                    dGradBeta[f] += go;
-                }
-            }
+            // Stage 4 (#415): Vector256<double> 4×-unrolled FMA paths for the
+            // three LN-backward passes (gradGamma/Beta accumulation, per-batch
+            // sum reduction, per-batch gradInput write). Mirrors the FP64 BN
+            // backward kernel structure at line ~19580; same 16 doubles/iter
+            // throughput target. Falls through to scalar on net471 / non-x86.
+            LayerNormBackwardDoubleAccumGammaBeta(
+                dGradOut, dInput, dMean, dVar, dGradGamma, dGradBeta,
+                batchSize, fs, epsilon);
 
-            void ProcessBatch(int b)
-            {
-                int off = b * fs;
-                double invStd = 1.0 / Math.Sqrt(dVar[b] + epsilon);
-                double m = dMean[b];
-
-                double sumGrad = 0.0;
-                double sumGradX = 0.0;
-                for (int f = 0; f < fs; f++)
-                {
-                    double scaledGrad = dGamma[f] * dGradOut[off + f];
-                    sumGrad += scaledGrad;
-                    sumGradX += scaledGrad * (dInput[off + f] - m);
-                }
-
-                double scale = invStd * invFeatureSizeD;
-                for (int f = 0; f < fs; f++)
-                {
-                    double normalized = (dInput[off + f] - m) * invStd;
-                    double gradNorm = dGamma[f] * dGradOut[off + f];
-                    double term1 = featureSizeD * gradNorm;
-                    double term3 = normalized * invStd * sumGradX;
-                    dGradInput[off + f] = scale * (term1 - sumGrad - term3);
-                }
-            }
+            void ProcessBatch(int b) => LayerNormBackwardDoubleRow(
+                dGradOut, dInput, dGamma, dMean, dVar, dGradInput,
+                b, fs, epsilon, invFeatureSizeD);
 
             if (batchSize * fs < 50_000)
             {
@@ -20979,6 +21337,392 @@ public partial class CpuEngine : ITensorLevelEngine
         gradGamma = gradGammaTensor;
         gradBeta = gradBetaTensor;
         return gradInputTensor;
+    }
+
+    /// <summary>
+    /// Stage 4 (#415): single-fused-pass FP64 LayerNorm forward, one batch
+    /// row. Pass A: sum + sumSq (variance via E[X²]−E[X]²) with 4×Vector256
+    /// FMA. Pass B: γ·((x − μ)·invStd) + β fused single-loop write. Mirrors
+    /// the FP32 ProcessBatchesSimd structure; same E[X²]−E[X]² numerical
+    /// caveat (clamp small-negative variance to 0).
+    /// </summary>
+    private static unsafe void LayerNormForwardDoubleFusedBatch(
+        double[] input, double[] gamma, double[] beta,
+        double[] output, double[] mean, double[] variance,
+        int b, int fs, double epsilon)
+    {
+        int off = b * fs;
+#if NET5_0_OR_GREATER
+        if (System.Runtime.Intrinsics.X86.Fma.IsSupported && fs >= 16)
+        {
+            fixed (double* pIn = input, pG = gamma, pB = beta, pOut = output)
+            {
+                double* ip = pIn + off;
+                double* op = pOut + off;
+
+                // Pass A: fused sum + sumSq via E[X²]−E[X]², 4×Vector256.
+                double sum = 0.0, sumSq = 0.0;
+                var vsum0 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var vsum1 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var vsum2 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var vsum3 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var vsq0 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var vsq1 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var vsq2 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var vsq3 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                int f = 0;
+                int simdLen = fs & ~15;
+                for (; f < simdLen; f += 16)
+                {
+                    var x0 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(ip + f);
+                    var x1 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(ip + f + 4);
+                    var x2 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(ip + f + 8);
+                    var x3 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(ip + f + 12);
+                    vsum0 = System.Runtime.Intrinsics.X86.Avx.Add(vsum0, x0);
+                    vsum1 = System.Runtime.Intrinsics.X86.Avx.Add(vsum1, x1);
+                    vsum2 = System.Runtime.Intrinsics.X86.Avx.Add(vsum2, x2);
+                    vsum3 = System.Runtime.Intrinsics.X86.Avx.Add(vsum3, x3);
+                    vsq0 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(x0, x0, vsq0);
+                    vsq1 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(x1, x1, vsq1);
+                    vsq2 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(x2, x2, vsq2);
+                    vsq3 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(x3, x3, vsq3);
+                }
+                for (; f < fs; f++)
+                {
+                    double x = ip[f];
+                    sum += x;
+                    sumSq += x * x;
+                }
+                vsum0 = System.Runtime.Intrinsics.X86.Avx.Add(
+                    System.Runtime.Intrinsics.X86.Avx.Add(vsum0, vsum1),
+                    System.Runtime.Intrinsics.X86.Avx.Add(vsum2, vsum3));
+                sum += HorizontalSumD(vsum0);
+                vsq0 = System.Runtime.Intrinsics.X86.Avx.Add(
+                    System.Runtime.Intrinsics.X86.Avx.Add(vsq0, vsq1),
+                    System.Runtime.Intrinsics.X86.Avx.Add(vsq2, vsq3));
+                sumSq += HorizontalSumD(vsq0);
+
+                double invFs = 1.0 / fs;
+                double m = sum * invFs;
+                double v = sumSq * invFs - m * m;
+                if (v < 0.0) v = 0.0;  // numerical-safety clamp (matches FP32 BN kernel).
+                mean[b] = m;
+                variance[b] = v;
+                double invStd = 1.0 / Math.Sqrt(v + epsilon);
+
+                // Pass B: γ · (x − μ) · invStd + β, fused, 4×Vector256.
+                var vmean = System.Runtime.Intrinsics.Vector256.Create(m);
+                var vinvStd = System.Runtime.Intrinsics.Vector256.Create(invStd);
+                f = 0;
+                for (; f < simdLen; f += 16)
+                {
+                    var x0 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(ip + f);
+                    var x1 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(ip + f + 4);
+                    var x2 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(ip + f + 8);
+                    var x3 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(ip + f + 12);
+                    var n0 = System.Runtime.Intrinsics.X86.Avx.Multiply(
+                        System.Runtime.Intrinsics.X86.Avx.Subtract(x0, vmean), vinvStd);
+                    var n1 = System.Runtime.Intrinsics.X86.Avx.Multiply(
+                        System.Runtime.Intrinsics.X86.Avx.Subtract(x1, vmean), vinvStd);
+                    var n2 = System.Runtime.Intrinsics.X86.Avx.Multiply(
+                        System.Runtime.Intrinsics.X86.Avx.Subtract(x2, vmean), vinvStd);
+                    var n3 = System.Runtime.Intrinsics.X86.Avx.Multiply(
+                        System.Runtime.Intrinsics.X86.Avx.Subtract(x3, vmean), vinvStd);
+                    var g0 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(pG + f);
+                    var g1 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(pG + f + 4);
+                    var g2 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(pG + f + 8);
+                    var g3 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(pG + f + 12);
+                    var b0 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(pB + f);
+                    var b1 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(pB + f + 4);
+                    var b2 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(pB + f + 8);
+                    var b3 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(pB + f + 12);
+                    System.Runtime.Intrinsics.X86.Avx.Store(op + f,
+                        System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(n0, g0, b0));
+                    System.Runtime.Intrinsics.X86.Avx.Store(op + f + 4,
+                        System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(n1, g1, b1));
+                    System.Runtime.Intrinsics.X86.Avx.Store(op + f + 8,
+                        System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(n2, g2, b2));
+                    System.Runtime.Intrinsics.X86.Avx.Store(op + f + 12,
+                        System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(n3, g3, b3));
+                }
+                for (; f < fs; f++)
+                    op[f] = gamma[f] * ((ip[f] - m) * invStd) + beta[f];
+            }
+            return;
+        }
+#endif
+        // Scalar fallback (net471 / non-x86): same E[X²]−E[X]² structure.
+        double sumS = 0.0, sumSqS = 0.0;
+        for (int f = 0; f < fs; f++)
+        {
+            double x = input[off + f];
+            sumS += x;
+            sumSqS += x * x;
+        }
+        double invFsS = 1.0 / fs;
+        double mS = sumS * invFsS;
+        double vS = sumSqS * invFsS - mS * mS;
+        if (vS < 0.0) vS = 0.0;
+        mean[b] = mS;
+        variance[b] = vS;
+        double invStdS = 1.0 / Math.Sqrt(vS + epsilon);
+        for (int f = 0; f < fs; f++)
+            output[off + f] = gamma[f] * ((input[off + f] - mS) * invStdS) + beta[f];
+    }
+
+    /// <summary>
+    /// Stage 4 (#415): SIMD FP64 LayerNorm-backward gradGamma/gradBeta
+    /// accumulation. Pass 1 of 2 — sequential over batches (gradGamma/Beta
+    /// are shared per-feature accumulators), Vector256&lt;double&gt; 4×-unrolled
+    /// FMA on the inner feature loop. Mirrors the BN-backward kernel
+    /// structure at CpuEngine.cs:19580.
+    /// </summary>
+    private static unsafe void LayerNormBackwardDoubleAccumGammaBeta(
+        double[] gradOut, double[] input, double[] mean, double[] variance,
+        double[] gradGamma, double[] gradBeta,
+        int batchSize, int fs, double epsilon)
+    {
+#if NET5_0_OR_GREATER
+        if (System.Runtime.Intrinsics.X86.Fma.IsSupported && fs >= 16)
+        {
+            fixed (double* pGO = gradOut, pI = input, pGG = gradGamma, pGB = gradBeta)
+            {
+                for (int b = 0; b < batchSize; b++)
+                {
+                    int off = b * fs;
+                    double invStd = 1.0 / Math.Sqrt(variance[b] + epsilon);
+                    double m = mean[b];
+                    var vinvStd = System.Runtime.Intrinsics.Vector256.Create(invStd);
+                    var vmean = System.Runtime.Intrinsics.Vector256.Create(m);
+                    double* go = pGO + off;
+                    double* ip = pI + off;
+                    int f = 0;
+                    int simdLen = fs & ~15;
+                    for (; f < simdLen; f += 16)
+                    {
+                        // normalized = (x − m) · invStd, 4×Vector256 unrolled.
+                        var x0 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(ip + f);
+                        var x1 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(ip + f + 4);
+                        var x2 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(ip + f + 8);
+                        var x3 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(ip + f + 12);
+                        var d0 = System.Runtime.Intrinsics.X86.Avx.Subtract(x0, vmean);
+                        var d1 = System.Runtime.Intrinsics.X86.Avx.Subtract(x1, vmean);
+                        var d2 = System.Runtime.Intrinsics.X86.Avx.Subtract(x2, vmean);
+                        var d3 = System.Runtime.Intrinsics.X86.Avx.Subtract(x3, vmean);
+                        var n0 = System.Runtime.Intrinsics.X86.Avx.Multiply(d0, vinvStd);
+                        var n1 = System.Runtime.Intrinsics.X86.Avx.Multiply(d1, vinvStd);
+                        var n2 = System.Runtime.Intrinsics.X86.Avx.Multiply(d2, vinvStd);
+                        var n3 = System.Runtime.Intrinsics.X86.Avx.Multiply(d3, vinvStd);
+
+                        var g0 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(go + f);
+                        var g1 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(go + f + 4);
+                        var g2 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(go + f + 8);
+                        var g3 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(go + f + 12);
+
+                        // gradGamma[f] += go * normalized (FMA into existing accumulator).
+                        var gg0 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(g0, n0,
+                            System.Runtime.Intrinsics.X86.Avx.LoadVector256(pGG + f));
+                        var gg1 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(g1, n1,
+                            System.Runtime.Intrinsics.X86.Avx.LoadVector256(pGG + f + 4));
+                        var gg2 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(g2, n2,
+                            System.Runtime.Intrinsics.X86.Avx.LoadVector256(pGG + f + 8));
+                        var gg3 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(g3, n3,
+                            System.Runtime.Intrinsics.X86.Avx.LoadVector256(pGG + f + 12));
+                        System.Runtime.Intrinsics.X86.Avx.Store(pGG + f, gg0);
+                        System.Runtime.Intrinsics.X86.Avx.Store(pGG + f + 4, gg1);
+                        System.Runtime.Intrinsics.X86.Avx.Store(pGG + f + 8, gg2);
+                        System.Runtime.Intrinsics.X86.Avx.Store(pGG + f + 12, gg3);
+
+                        // gradBeta[f] += go.
+                        System.Runtime.Intrinsics.X86.Avx.Store(pGB + f,
+                            System.Runtime.Intrinsics.X86.Avx.Add(g0, System.Runtime.Intrinsics.X86.Avx.LoadVector256(pGB + f)));
+                        System.Runtime.Intrinsics.X86.Avx.Store(pGB + f + 4,
+                            System.Runtime.Intrinsics.X86.Avx.Add(g1, System.Runtime.Intrinsics.X86.Avx.LoadVector256(pGB + f + 4)));
+                        System.Runtime.Intrinsics.X86.Avx.Store(pGB + f + 8,
+                            System.Runtime.Intrinsics.X86.Avx.Add(g2, System.Runtime.Intrinsics.X86.Avx.LoadVector256(pGB + f + 8)));
+                        System.Runtime.Intrinsics.X86.Avx.Store(pGB + f + 12,
+                            System.Runtime.Intrinsics.X86.Avx.Add(g3, System.Runtime.Intrinsics.X86.Avx.LoadVector256(pGB + f + 12)));
+                    }
+                    for (; f < fs; f++)
+                    {
+                        double goS = go[f];
+                        double normalized = (ip[f] - m) * invStd;
+                        gradGamma[f] += goS * normalized;
+                        gradBeta[f] += goS;
+                    }
+                }
+            }
+            return;
+        }
+#endif
+        for (int b = 0; b < batchSize; b++)
+        {
+            int off = b * fs;
+            double invStd = 1.0 / Math.Sqrt(variance[b] + epsilon);
+            double m = mean[b];
+            for (int f = 0; f < fs; f++)
+            {
+                double go = gradOut[off + f];
+                double normalized = (input[off + f] - m) * invStd;
+                gradGamma[f] += go * normalized;
+                gradBeta[f] += go;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Stage 4 (#415): SIMD FP64 LayerNorm-backward per-batch gradInput
+    /// kernel. Two inner sub-passes (Σ γ·go and Σ γ·go·(x−m), then write)
+    /// each Vector256&lt;double&gt; 4×-unrolled. Algebraic rearrangement:
+    ///   gi[f] = invStd · γ · go − B − C · (x − m)
+    /// with B = invStd · sumGrad / fs and C = invStd² · sumGradX / fs.
+    /// </summary>
+    private static unsafe void LayerNormBackwardDoubleRow(
+        double[] gradOut, double[] input, double[] gamma,
+        double[] mean, double[] variance, double[] gradInput,
+        int b, int fs, double epsilon, double invFeatureSizeD)
+    {
+        int off = b * fs;
+        double invStd = 1.0 / Math.Sqrt(variance[b] + epsilon);
+        double m = mean[b];
+
+#if NET5_0_OR_GREATER
+        if (System.Runtime.Intrinsics.X86.Fma.IsSupported && fs >= 16)
+        {
+            fixed (double* pGO = gradOut, pI = input, pG = gamma, pGI = gradInput)
+            {
+                double* go = pGO + off;
+                double* ip = pI + off;
+                double* gi = pGI + off;
+                var vmean = System.Runtime.Intrinsics.Vector256.Create(m);
+
+                // Pass A: sumGrad = Σ γ·go, sumGradX = Σ γ·go·(x − m).
+                double sumGrad = 0.0;
+                double sumGradX = 0.0;
+                var vsg0 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var vsg1 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var vsg2 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var vsg3 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var vsgx0 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var vsgx1 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var vsgx2 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var vsgx3 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                int f = 0;
+                int simdLen = fs & ~15;
+                for (; f < simdLen; f += 16)
+                {
+                    var g0 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(pG + f);
+                    var g1 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(pG + f + 4);
+                    var g2 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(pG + f + 8);
+                    var g3 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(pG + f + 12);
+                    var go0 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(go + f);
+                    var go1 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(go + f + 4);
+                    var go2 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(go + f + 8);
+                    var go3 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(go + f + 12);
+                    var sg0 = System.Runtime.Intrinsics.X86.Avx.Multiply(g0, go0);
+                    var sg1 = System.Runtime.Intrinsics.X86.Avx.Multiply(g1, go1);
+                    var sg2 = System.Runtime.Intrinsics.X86.Avx.Multiply(g2, go2);
+                    var sg3 = System.Runtime.Intrinsics.X86.Avx.Multiply(g3, go3);
+                    var d0 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(ip + f), vmean);
+                    var d1 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(ip + f + 4), vmean);
+                    var d2 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(ip + f + 8), vmean);
+                    var d3 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(ip + f + 12), vmean);
+                    vsg0 = System.Runtime.Intrinsics.X86.Avx.Add(vsg0, sg0);
+                    vsg1 = System.Runtime.Intrinsics.X86.Avx.Add(vsg1, sg1);
+                    vsg2 = System.Runtime.Intrinsics.X86.Avx.Add(vsg2, sg2);
+                    vsg3 = System.Runtime.Intrinsics.X86.Avx.Add(vsg3, sg3);
+                    vsgx0 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(sg0, d0, vsgx0);
+                    vsgx1 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(sg1, d1, vsgx1);
+                    vsgx2 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(sg2, d2, vsgx2);
+                    vsgx3 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(sg3, d3, vsgx3);
+                }
+                for (; f < fs; f++)
+                {
+                    double sg = gamma[f] * go[f];
+                    sumGrad += sg;
+                    sumGradX += sg * (ip[f] - m);
+                }
+                vsg0 = System.Runtime.Intrinsics.X86.Avx.Add(
+                    System.Runtime.Intrinsics.X86.Avx.Add(vsg0, vsg1),
+                    System.Runtime.Intrinsics.X86.Avx.Add(vsg2, vsg3));
+                sumGrad += HorizontalSumD(vsg0);
+                vsgx0 = System.Runtime.Intrinsics.X86.Avx.Add(
+                    System.Runtime.Intrinsics.X86.Avx.Add(vsgx0, vsgx1),
+                    System.Runtime.Intrinsics.X86.Avx.Add(vsgx2, vsgx3));
+                sumGradX += HorizontalSumD(vsgx0);
+
+                // Pass B: gradInput[f] = invStd·γ·go − B − C·(x − m), where
+                // B = invStd·sumGrad/fs and C = invStd³·sumGradX/fs. The
+                // invStd³ factor is the rearranged form of
+                // scale·normalized·invStd·sumGradX = (invStd/fs)·((x−m)·invStd)·invStd·sumGradX.
+                double termB = invStd * sumGrad * invFeatureSizeD;
+                double termC = invStd * invStd * invStd * sumGradX * invFeatureSizeD;
+                var vinvStd = System.Runtime.Intrinsics.Vector256.Create(invStd);
+                var vtermB = System.Runtime.Intrinsics.Vector256.Create(termB);
+                var vtermC = System.Runtime.Intrinsics.Vector256.Create(termC);
+                f = 0;
+                for (; f < simdLen; f += 16)
+                {
+                    var g0 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(pG + f);
+                    var g1 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(pG + f + 4);
+                    var g2 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(pG + f + 8);
+                    var g3 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(pG + f + 12);
+                    var go0 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(go + f);
+                    var go1 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(go + f + 4);
+                    var go2 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(go + f + 8);
+                    var go3 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(go + f + 12);
+                    var d0 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(ip + f), vmean);
+                    var d1 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(ip + f + 4), vmean);
+                    var d2 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(ip + f + 8), vmean);
+                    var d3 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(ip + f + 12), vmean);
+                    // term1 = invStd · γ · go.
+                    var t1_0 = System.Runtime.Intrinsics.X86.Avx.Multiply(System.Runtime.Intrinsics.X86.Avx.Multiply(g0, go0), vinvStd);
+                    var t1_1 = System.Runtime.Intrinsics.X86.Avx.Multiply(System.Runtime.Intrinsics.X86.Avx.Multiply(g1, go1), vinvStd);
+                    var t1_2 = System.Runtime.Intrinsics.X86.Avx.Multiply(System.Runtime.Intrinsics.X86.Avx.Multiply(g2, go2), vinvStd);
+                    var t1_3 = System.Runtime.Intrinsics.X86.Avx.Multiply(System.Runtime.Intrinsics.X86.Avx.Multiply(g3, go3), vinvStd);
+                    // tmp = term1 − termB.
+                    var tmp0 = System.Runtime.Intrinsics.X86.Avx.Subtract(t1_0, vtermB);
+                    var tmp1 = System.Runtime.Intrinsics.X86.Avx.Subtract(t1_1, vtermB);
+                    var tmp2 = System.Runtime.Intrinsics.X86.Avx.Subtract(t1_2, vtermB);
+                    var tmp3 = System.Runtime.Intrinsics.X86.Avx.Subtract(t1_3, vtermB);
+                    // gi = tmp − termC·(x−m) = FNMA(termC, diff, tmp).
+                    System.Runtime.Intrinsics.X86.Avx.Store(gi + f,
+                        System.Runtime.Intrinsics.X86.Fma.MultiplyAddNegated(d0, vtermC, tmp0));
+                    System.Runtime.Intrinsics.X86.Avx.Store(gi + f + 4,
+                        System.Runtime.Intrinsics.X86.Fma.MultiplyAddNegated(d1, vtermC, tmp1));
+                    System.Runtime.Intrinsics.X86.Avx.Store(gi + f + 8,
+                        System.Runtime.Intrinsics.X86.Fma.MultiplyAddNegated(d2, vtermC, tmp2));
+                    System.Runtime.Intrinsics.X86.Avx.Store(gi + f + 12,
+                        System.Runtime.Intrinsics.X86.Fma.MultiplyAddNegated(d3, vtermC, tmp3));
+                }
+                for (; f < fs; f++)
+                {
+                    double diff = ip[f] - m;
+                    gi[f] = invStd * gamma[f] * go[f] - termB - termC * diff;
+                }
+            }
+            return;
+        }
+#endif
+        // Scalar fallback (net471 / non-x86).
+        double sumGrad_s = 0.0;
+        double sumGradX_s = 0.0;
+        for (int f = 0; f < fs; f++)
+        {
+            double scaledGrad = gamma[f] * gradOut[off + f];
+            sumGrad_s += scaledGrad;
+            sumGradX_s += scaledGrad * (input[off + f] - m);
+        }
+        double scale = invStd * invFeatureSizeD;
+        double featureSizeD2 = fs;
+        for (int f = 0; f < fs; f++)
+        {
+            double normalized = (input[off + f] - m) * invStd;
+            double gradNorm = gamma[f] * gradOut[off + f];
+            double term1 = featureSizeD2 * gradNorm;
+            double term3 = normalized * invStd * sumGradX_s;
+            gradInput[off + f] = scale * (term1 - sumGrad_s - term3);
+        }
     }
 
     /// <inheritdoc/>
@@ -34809,6 +35553,19 @@ public partial class CpuEngine : ITensorLevelEngine
             float* pI = (float*)pinI.Pointer;
             float* pR = (float*)pinR.Pointer;
             SimdKernels.GeluBackwardUnsafe(pG, pI, pR, length);
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            // Stage 4 (#415): SIMD FP64 path — Vector256<double> with
+            // FastExpDouble256-based tanh. Same accuracy envelope as the
+            // forward GELU SIMD kernel.
+            var gArr = (double[])(object)gradOutput.GetDataArray();
+            var iArr = (double[])(object)input.GetDataArray();
+            var rArr = (double[])(object)resultTensor.GetDataArray();
+            fixed (double* pG = gArr, pI = iArr, pR = rArr)
+            {
+                SimdKernels.GeluBackwardDouble(pG, pI, pR, length);
+            }
         }
         else
         {

@@ -8019,12 +8019,51 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// </summary>
         public static unsafe void GeluBackwardDouble(double* grad, double* input, double* output, int length)
         {
-            for (int i = 0; i < length; i++)
+            int i = 0;
+#if NET5_0_OR_GREATER
+            // Stage 4 (#415): Vector256<double> path mirroring the forward
+            // GELUUnsafe(double*) kernel — tanh via (e^{2z}−1)/(e^{2z}+1)
+            // using the existing FastExpDouble256. ulp ≤ a few hundred vs
+            // Math.Tanh (same accuracy envelope as the forward path).
+            if (Avx2.IsSupported && Fma.IsSupported && length >= 4)
+            {
+                var vSqrt2OverPi = Vector256.Create(0.7978845608028654);
+                var vCoeff = Vector256.Create(0.044715);
+                var vHalf = Vector256.Create(0.5);
+                var vOne = Vector256.Create(1.0);
+                var vTwo = Vector256.Create(2.0);
+                var vThreeCoeff = Vector256.Create(3.0 * 0.044715);
+
+                int simdLen = length & ~3;
+                for (; i < simdLen; i += 4)
+                {
+                    var x = Avx.LoadVector256(input + i);
+                    var g = Avx.LoadVector256(grad + i);
+                    var x2 = Avx.Multiply(x, x);
+                    var x3 = Avx.Multiply(x2, x);
+                    var inner = Fma.MultiplyAdd(vCoeff, x3, x);     // x + 0.044715·x³
+                    var tanhArg = Avx.Multiply(vSqrt2OverPi, inner);
+                    var e2z = FastExpDouble256(Avx.Multiply(vTwo, tanhArg));
+                    var tanhVal = Avx.Divide(Avx.Subtract(e2z, vOne), Avx.Add(e2z, vOne));
+                    var sechSq = Fma.MultiplyAddNegated(tanhVal, tanhVal, vOne);   // 1 − t²
+                    // dArgDx = √(2/π) · (1 + 3·0.044715·x²)
+                    var dArgDx = Avx.Multiply(vSqrt2OverPi, Fma.MultiplyAdd(vThreeCoeff, x2, vOne));
+                    // derivative = 0.5·(1+t) + 0.5·x·sechSq·dArgDx
+                    var part1 = Avx.Multiply(vHalf, Avx.Add(vOne, tanhVal));
+                    var part2 = Avx.Multiply(vHalf, Avx.Multiply(x, Avx.Multiply(sechSq, dArgDx)));
+                    var derivative = Avx.Add(part1, part2);
+                    Avx.Store(output + i, Avx.Multiply(g, derivative));
+                }
+            }
+#endif
+            for (; i < length; i++)
             {
                 double x = input[i];
-                double t = Math.Tanh(0.7978845608 * (x + 0.044715 * x * x * x));
-                double dtdx = 0.7978845608 * (1.0 + 0.134145 * x * x) * (1.0 - t * t);
-                output[i] = grad[i] * (0.5 * (1.0 + t) + 0.5 * x * dtdx);
+                double t = Math.Tanh(0.7978845608028654 * (x + 0.044715 * x * x * x));
+                double sechSq = 1.0 - t * t;
+                double dArgDx = 0.7978845608028654 * (1.0 + 3.0 * 0.044715 * x * x);
+                double derivative = 0.5 * (1.0 + t) + 0.5 * x * sechSq * dArgDx;
+                output[i] = grad[i] * derivative;
             }
         }
 

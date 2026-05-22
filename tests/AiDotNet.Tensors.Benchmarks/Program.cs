@@ -399,6 +399,35 @@ class Program
             return;
         }
 
+        // FP64 companion to --dit-xl-matmul: includes DiT-XL shapes at double
+        // precision PLUS the cluster #6 cluster (VGG FC layers, ResNet head /
+        // bottleneck shapes, ACEStep MHA + MLP). Stage 0 baseline of the
+        // FP64 perf-closure effort. (~15-25min).
+        if (args[0] == "--dit-xl-matmul-double")
+        {
+            BenchmarkRunner.Run<DitXLMatMulDoubleBenchmarks>(BenchConfig);
+            return;
+        }
+
+        // FP64 Conv2D backward (dW + dX) across the {kernel × stride × padding}
+        // matrix that cluster #6 (VGG16 / ResNet50 / DenseNet) exercises at
+        // ImageNet input scale. Stage 0 baseline for Stage 1 / 5 / 7 conv work.
+        // (~15-30min).
+        if (args[0] == "--conv2d-backward-double")
+        {
+            BenchmarkRunner.Run<Conv2DBackwardDoubleBenchmarks>(BenchConfig);
+            return;
+        }
+
+        // FP64 primitive ops (BatchNorm, LayerNorm, Softmax, activations,
+        // pools). Stage 0 baseline for Stage 4 SIMD ports of currently-scalar
+        // FP64 primitives. (~10-20min).
+        if (args[0] == "--fp64-primitives")
+        {
+            BenchmarkRunner.Run<Fp64PrimitiveBenchmarks>(BenchConfig);
+            return;
+        }
+
         // DiT-XL SDPA benchmark: measures ScaledDotProductAttention at the exact
         // 4D shape DiT-XL exercises, to verify the Issue #162 BLAS-backed fast
         // path eliminates the scalar virtual-dispatch wall clock. (~1-2min).
@@ -537,6 +566,9 @@ class Program
         Console.WriteLine("  --workspace         : Run TensorWorkspace zero-allocation benchmarks");
         Console.WriteLine("  --vs-deterministic-matmul: Deterministic vs non-deterministic SimdGemm on HRE + square shapes (post-MKL-removal both paths are SimdGemm; pair with iter-17 MKL baseline for vs-MKL comparison)");
         Console.WriteLine("  --dit-xl-matmul     : SimdGemm at DiT-XL shapes; compare against docs/mkl-replacement/baseline/baseline-iter17.md for vs-MKL numbers");
+        Console.WriteLine("  --dit-xl-matmul-double : FP64 GEMM at DiT-XL + cluster-#6 shapes; Stage 0 baseline (docs/mkl-replacement/PLAN.md)");
+        Console.WriteLine("  --conv2d-backward-double : FP64 Conv2DBackward dW+dX across cluster-#6 shapes; Stage 0 baseline");
+        Console.WriteLine("  --fp64-primitives   : FP64 BN/LN/Softmax/activations/pools; Stage 0 baseline for Stage 4");
         Console.WriteLine("  --dit-xl-sdpa       : ScaledDotProductAttention at DiT-XL shape [4,16,256,72] (Issue #162 SDPA fix)");
         Console.WriteLine("  --transformer-ffn   : Small-M transformer FFN matmul (Sgemm+Dgemm+batched) — Issue #245 coverage");
         Console.WriteLine();

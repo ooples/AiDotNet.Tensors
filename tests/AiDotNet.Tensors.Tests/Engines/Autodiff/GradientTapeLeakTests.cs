@@ -35,7 +35,22 @@ public class GradientTapeLeakTestsCollection { }
 public class GradientTapeLeakTests
 {
     private readonly ITestOutputHelper _output;
-    public GradientTapeLeakTests(ITestOutputHelper output) { _output = output; }
+    public GradientTapeLeakTests(ITestOutputHelper output)
+    {
+        _output = output;
+        // Reset the engine singleton + the auto-training-compiler so
+        // heap-leak measurements aren't contaminated by other tests'
+        // residual state (pooled tensors, cached compiled plans,
+        // ReplayMode bits). The leak-detection tests use heap-delta
+        // probes (LiveBytes() across StableForcedGc() windows) which
+        // are exquisitely sensitive to global GC pressure from earlier
+        // tests; isolation here is what makes the assertions
+        // reproducible run-to-run.
+        AiDotNet.Tensors.Engines.AiDotNetEngine.Current = new AiDotNet.Tensors.Engines.CpuEngine();
+        AiDotNet.Tensors.Engines.Compilation.AutoTrainingCompiler.ResetState();
+        AiDotNet.Tensors.Helpers.AutoTensorCache.Clear();
+        AiDotNet.Tensors.Engines.Autodiff.TensorPool<float>.Clear();
+    }
 
     // Diagnostic helper retained for manual leak investigation. It writes
     // tracking output to the test runner but asserts nothing — running it
@@ -675,11 +690,21 @@ public class GradientTapeLeakTests
         // than 50 KB/call. A true linear leak would show w2 ≈ w1; this guard
         // catches a regression where retention grows across windows (the
         // signature that distinguishes a leak from one-time warmup).
-        Assert.True(w2PerCall < w1PerCall + 50_000,
+        //
+        // Clamp win1 to ≥ 0 for the comparison: when warmup completes during
+        // window 1 (large GC frees in-flight), w1PerCall can be NEGATIVE,
+        // which would make the comparison `w2 < w1 + 50K` fail against a
+        // SHRINKING heap — false-positive "leak grows" even though w2=0
+        // (steady state). The contract we actually want is "w2 must not
+        // grow more than 50KB beyond max(w1, 0)" — i.e., if w1 was
+        // shrinking, the threshold floors at +50KB above zero.
+        long w1Floor = w1PerCall < 0 ? 0 : w1PerCall;
+        Assert.True(w2PerCall < w1Floor + 50_000,
             $"4-layer Transformer leak grows across windows: " +
             $"win1={w1PerCall} B/call → win2={w2PerCall} B/call " +
-            $"(slope > 50 KB/call). A linear leak should hold w1 ≈ w2; " +
-            $"w2 > w1 + 50KB indicates accelerating retention.");
+            $"(slope > 50 KB/call above max(w1,0)={w1Floor}). " +
+            $"A linear leak should hold w1 ≈ w2; w2 > max(w1,0) + 50KB " +
+            $"indicates accelerating retention.");
 
         void Step()
         {
