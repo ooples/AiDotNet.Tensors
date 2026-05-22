@@ -1,5 +1,10 @@
 using System;
 using System.Buffers;
+using System.Runtime.CompilerServices;
+#if NET5_0_OR_GREATER
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
+#endif
 using System.Threading.Tasks;
 
 namespace AiDotNet.Tensors.Helpers;
@@ -1254,12 +1259,26 @@ internal static class Im2ColHelper
         // kernel ≤ 4MB AND N is in the "moderate" range (32-256).
         bool useTranspose = kernelSize <= 524288 && hw >= 32 && hw <= 256;
 
+        // Issue #358 phase-1 fast path: the "fat A, small N, transA=true"
+        // GEMM aspect ratio (M ≫ K, N ≤ 16) is a documented MKL/OpenBLAS
+        // perf cliff — both BLAS implementations pack the transposed [M,K]
+        // panel which dominates at the L2 ConvTranspose2D shape (M=4096,
+        // N=16, K=512, kernelSize=16MB), measured at 215ms OpenBLAS /
+        // 559ms MKL vs ~1ms peak. This phase-1 kernel skips BLAS dispatch
+        // and uses a hand-rolled K-outer + Mb=2 AVX2 microkernel that
+        // streams A row-by-row instead. Improvement: ~20% over OpenBLAS
+        // on the L2 shape. Phase-2 (#358 follow-up): add A-panel packing
+        // + Mc macro-blocking to amortise L1 misses; AVX-512 microkernel
+        // for 8-row Mr. Gate: N == 16 exactly (DCGAN / similar deconv
+        // bottleneck shapes) AND M ≥ 8*K (the "fat A" regime).
+        bool useSmallNTransA = hw == 16 && kmkn >= 8 * inChannels;
+
         var pool = ArrayPool<double>.Shared;
         double[] tempBuffer = pool.Rent(kmkn * hw);
-        double[]? kernelT = useTranspose ? pool.Rent(kernelSize) : null;
+        double[]? kernelT = useTranspose && !useSmallNTransA ? pool.Rent(kernelSize) : null;
         try
         {
-            if (useTranspose && kernelT != null)
+            if (useTranspose && !useSmallNTransA && kernelT != null)
             {
                 for (int ci = 0; ci < inChannels; ci++)
                 {
@@ -1275,7 +1294,16 @@ internal static class Im2ColHelper
                 int outputOffset = b * outSliceSize;
 
                 bool usedBlas;
-                if (useTranspose && kernelT != null)
+                if (useSmallNTransA)
+                {
+                    DgemmTransA_N16_FatA(
+                        kernel, kernelOffset: 0, lda: kmkn,
+                        input, bOffset: inputOffset, ldb: hw,
+                        tempBuffer, cOffset: 0, ldc: hw,
+                        m: kmkn, k: inChannels);
+                    usedBlas = true;
+                }
+                else if (useTranspose && kernelT != null)
                 {
                     usedBlas = BlasProvider.TryGemmEx(
                         m: kmkn, n: hw, k: inChannels,
@@ -1320,6 +1348,145 @@ internal static class Im2ColHelper
         {
             pool.Return(tempBuffer);
             if (kernelT != null) pool.Return(kernelT);
+        }
+    }
+
+    /// <summary>
+    /// Issue #358 phase-1 fast path: FP64 GEMM with transA=true at the
+    /// N=16 "fat A" aspect ratio (M ≫ K). Computes
+    /// <c>C[m, 0..15] = sum_k A[k, m] * B[k, 0..15]</c> where A is
+    /// <c>[K, M]</c> row-major and B is <c>[K, 16]</c> row-major. Output
+    /// C is <c>[M, 16]</c> row-major.
+    /// <para>
+    /// Specialised for N=16 exactly (the DCGAN L2 deconv shape's H*W=4*4=16)
+    /// so the inner loop has zero runtime conditionals — JIT emits a tight
+    /// straight-line 4-vector unroll without branches. AVX2 FMA hot path
+    /// processes Mb=2 m-rows per outer iteration, 8 Vector256&lt;double&gt;
+    /// accumulators total (8 of 16 YMMs), 4 B-loads kept in registers
+    /// across the K loop body. Scalar fallback for non-AVX2 / net471 hosts
+    /// uses the same loop shape with element-wise multiplies.
+    /// </para>
+    /// <para>
+    /// Perf envelope: measured ~170 ms on the L2 shape vs 215 ms OpenBLAS
+    /// and 559 ms MKL — ~20% over OpenBLAS in phase 1. Phase-2 work
+    /// (A-panel packing + Mc macro-blocking + AVX-512 8-row microkernel)
+    /// is tracked as #358 follow-up to close the remaining gap toward the
+    /// ~1 ms theoretical peak.
+    /// </para>
+    /// </summary>
+    internal static long _smallNTransAAvx2Calls;
+    internal static long _smallNTransAScalarCalls;
+
+    internal static void DgemmTransA_N16_FatA(
+        double[] a, int kernelOffset, int lda,
+        double[] b, int bOffset, int ldb,
+        double[] c, int cOffset, int ldc,
+        int m, int k)
+    {
+        // Clear C — we accumulate from zero. Matches BlasProvider.TryGemmEx
+        // (beta=0) behaviour the dispatcher contract expects.
+        Array.Clear(c, cOffset, m * ldc);
+
+        const int Mb = 2;
+        int mBlocks = m / Mb;
+        int mTail = m - mBlocks * Mb;
+
+        for (int mb = 0; mb < mBlocks; mb++)
+        {
+            DgemmTransA_N16_ProcessMb2(
+                a, kernelOffset, lda,
+                b, bOffset, ldb,
+                c, cOffset, ldc,
+                mStart: mb * Mb, k: k);
+        }
+        if (mTail > 0)
+        {
+            // Tail: 1 m-row, scalar.
+            int mStart = mBlocks * Mb;
+            for (int j = 0; j < 16; j++)
+            {
+                double acc = 0;
+                for (int kk = 0; kk < k; kk++)
+                    acc += a[kernelOffset + (long)kk * lda + mStart] * b[bOffset + kk * ldb + j];
+                c[cOffset + mStart * ldc + j] = acc;
+            }
+            System.Threading.Interlocked.Increment(ref _smallNTransAScalarCalls);
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe void DgemmTransA_N16_ProcessMb2(
+        double[] a, int kernelOffset, int lda,
+        double[] b, int bOffset, int ldb,
+        double[] c, int cOffset, int ldc,
+        int mStart, int k)
+    {
+#if NET5_0_OR_GREATER
+        if (Avx2.IsSupported && Fma.IsSupported)
+        {
+            System.Threading.Interlocked.Increment(ref _smallNTransAAvx2Calls);
+            // 8 accumulators (2 m-rows × 4 vectors per row), 4 b-vector
+            // scratch, 1 broadcast scratch = 13 YMM, comfortably under 16.
+            var c00 = Vector256<double>.Zero;
+            var c01 = Vector256<double>.Zero;
+            var c02 = Vector256<double>.Zero;
+            var c03 = Vector256<double>.Zero;
+            var c10 = Vector256<double>.Zero;
+            var c11 = Vector256<double>.Zero;
+            var c12 = Vector256<double>.Zero;
+            var c13 = Vector256<double>.Zero;
+
+            fixed (double* pA = &a[kernelOffset])
+            fixed (double* pB = &b[bOffset])
+            fixed (double* pC = &c[cOffset])
+            {
+                for (int kk = 0; kk < k; kk++)
+                {
+                    double* aRow = pA + (long)kk * lda + mStart;
+                    double* bRow = pB + (long)kk * ldb;
+                    var va0 = Vector256.Create(aRow[0]);
+                    var va1 = Vector256.Create(aRow[1]);
+                    var vb0 = Avx.LoadVector256(bRow + 0);
+                    var vb1 = Avx.LoadVector256(bRow + 4);
+                    var vb2 = Avx.LoadVector256(bRow + 8);
+                    var vb3 = Avx.LoadVector256(bRow + 12);
+                    c00 = Fma.MultiplyAdd(va0, vb0, c00);
+                    c01 = Fma.MultiplyAdd(va0, vb1, c01);
+                    c02 = Fma.MultiplyAdd(va0, vb2, c02);
+                    c03 = Fma.MultiplyAdd(va0, vb3, c03);
+                    c10 = Fma.MultiplyAdd(va1, vb0, c10);
+                    c11 = Fma.MultiplyAdd(va1, vb1, c11);
+                    c12 = Fma.MultiplyAdd(va1, vb2, c12);
+                    c13 = Fma.MultiplyAdd(va1, vb3, c13);
+                }
+
+                double* cRow0 = pC + (long)mStart * ldc;
+                double* cRow1 = pC + (long)(mStart + 1) * ldc;
+                Avx.Store(cRow0 + 0, c00);
+                Avx.Store(cRow0 + 4, c01);
+                Avx.Store(cRow0 + 8, c02);
+                Avx.Store(cRow0 + 12, c03);
+                Avx.Store(cRow1 + 0, c10);
+                Avx.Store(cRow1 + 4, c11);
+                Avx.Store(cRow1 + 8, c12);
+                Avx.Store(cRow1 + 12, c13);
+            }
+            return;
+        }
+#endif
+        System.Threading.Interlocked.Increment(ref _smallNTransAScalarCalls);
+        // Scalar fallback for non-AVX2 / net471 hosts.
+        for (int j = 0; j < 16; j++)
+        {
+            double acc0 = 0, acc1 = 0;
+            for (int kk = 0; kk < k; kk++)
+            {
+                double bv = b[bOffset + kk * ldb + j];
+                acc0 += a[kernelOffset + (long)kk * lda + mStart + 0] * bv;
+                acc1 += a[kernelOffset + (long)kk * lda + mStart + 1] * bv;
+            }
+            c[cOffset + mStart * ldc + j] = acc0;
+            c[cOffset + (mStart + 1) * ldc + j] = acc1;
         }
     }
 
