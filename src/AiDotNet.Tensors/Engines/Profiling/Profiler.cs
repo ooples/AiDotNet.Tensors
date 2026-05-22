@@ -102,13 +102,22 @@ public static class Profiler
     /// Opens a categorized range. <paramref name="category"/> appears in
     /// chrome-trace UIs as the event's tag — typical values are
     /// <c>"cpu_op"</c>, <c>"compile_pass"</c>, <c>"autograd"</c>.
+    /// <para>
+    /// CodeRabbit #428 review: this entry point is user-annotation territory
+    /// — events here are not CPU kernel timings and must NOT feed
+    /// <see cref="PerformanceProfiler.Instance"/>, which backs the per-op
+    /// rollup <c>TensorsOperationProfile.Capture</c> exposes (mixing user
+    /// annotations and arbitrary categories into that flat name→ticks map
+    /// would break the rollup contract and collide on names across
+    /// categories). Only <see cref="OpScope(string)"/> and
+    /// <see cref="FusedOpScope"/> bridge to the legacy aggregator.
+    /// </para>
     /// </summary>
     public static IDisposable Range(string name, string category)
     {
         var session = Current;
-        bool legacyEnabled = PerformanceProfiler.Instance.Enabled;
-        if (session is null && !legacyEnabled) return NoOpScope.Instance;
-        return new RangeScope(session, name, category, args: null, legacyEnabled);
+        if (session is null) return NoOpScope.Instance;
+        return new RangeScope(session, name, category, args: null, recordToLegacy: false);
     }
 
     /// <summary>
@@ -124,10 +133,11 @@ public static class Profiler
     /// </summary>
     public static IDisposable Range(string name, string category, IReadOnlyDictionary<string, string> args)
     {
+        // CodeRabbit #428: user-annotation overload — never bridges to the
+        // legacy per-op aggregator. See no-args Range(string, string).
         var session = Current;
-        bool legacyEnabled = PerformanceProfiler.Instance.Enabled;
-        if (session is null && !legacyEnabled) return NoOpScope.Instance;
-        return new RangeScope(session, name, category, args, legacyEnabled);
+        if (session is null) return NoOpScope.Instance;
+        return new RangeScope(session, name, category, args, recordToLegacy: false);
     }
 
     /// <summary>Records an instantaneous event on the active session.
@@ -183,13 +193,20 @@ public static class Profiler
     /// Compile-pass scope — a categorized variant for the optimization
     /// pipeline so chrome-trace UIs can filter pass timings out of the
     /// per-op category.
+    /// <para>
+    /// CodeRabbit #428 review: compile-pass timings are build-time, not
+    /// CPU kernel timings — they must NOT feed
+    /// <see cref="PerformanceProfiler.Instance"/> (which backs the per-op
+    /// rollup <c>TensorsOperationProfile.Capture</c> exposes). Only the
+    /// engine hot-path ops (<see cref="OpScope(string)"/>,
+    /// <see cref="FusedOpScope"/>) bridge to the legacy aggregator.
+    /// </para>
     /// </summary>
     public static IDisposable CompilePassScope(string passName)
     {
         var session = Current;
-        bool legacyEnabled = PerformanceProfiler.Instance.Enabled;
-        if (session is null && !legacyEnabled) return NoOpScope.Instance;
-        return new RangeScope(session, passName, category: "compile_pass", args: null, legacyEnabled);
+        if (session is null) return NoOpScope.Instance;
+        return new RangeScope(session, passName, category: "compile_pass", args: null, recordToLegacy: false);
     }
 
     /// <summary>
