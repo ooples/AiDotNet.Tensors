@@ -23,6 +23,35 @@ public class MultiHeadAttentionForwardTests
         _engine = new CpuEngine();
     }
 
+    [Fact(Skip = "Performance measurement — run manually with --filter MultiHeadAttentionForward_AisevalShape")]
+    public void MultiHeadAttentionForward_AisevalShape_PerfMeasurement()
+    {
+        // AIsEval Transformer per-layer attention shape:
+        // [B=128, seq=32, dModel=64], numHeads=4, dHead=16.
+        // PyTorch nn.TransformerEncoderLayer @ bs=128 was 13.85 ms steady-state
+        // for the whole encoder layer (attention + FFN). We're benchmarking
+        // just MHA here, which should be ~half of that.
+        const int batch = 128, seq = 32, dModel = 64, numHeads = 4;
+        var rng = new Random(2026);
+        var input = MakeRandom(rng, batch, seq, dModel);
+        var qW = MakeRandom(rng, dModel, dModel);
+        var kW = MakeRandom(rng, dModel, dModel);
+        var vW = MakeRandom(rng, dModel, dModel);
+        var oW = MakeRandom(rng, dModel, dModel);
+
+        for (int w = 0; w < 3; w++)
+            _ = _engine.MultiHeadAttentionForward(input, qW, kW, vW, oW, numHeads);
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        const int iters = 10;
+        for (int i = 0; i < iters; i++)
+            _ = _engine.MultiHeadAttentionForward(input, qW, kW, vW, oW, numHeads);
+        sw.Stop();
+        double ms = sw.Elapsed.TotalMilliseconds / iters;
+
+        _output.WriteLine($"MultiHeadAttentionForward AIsEval shape [128,32,64] h=4: {ms:F2} ms/iter");
+    }
+
     [Fact]
     public void MultiHeadAttentionForward_MatchesDecomposedChain()
     {

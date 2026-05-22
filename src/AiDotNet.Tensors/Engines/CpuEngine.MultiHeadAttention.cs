@@ -1,5 +1,9 @@
 using System;
+using System.Buffers;
+using System.Runtime.CompilerServices;
 using AiDotNet.Tensors.Engines.Compilation;
+using AiDotNet.Tensors.Engines.Simd;
+using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Engines;
@@ -37,8 +41,11 @@ public partial class CpuEngine
     /// <c>GraphMode</c>-aware recording path. Inference doesn't need any of
     /// those tape entries. Bundling the whole MHA chain into one engine call
     /// that explicitly bypasses graph mode reduces 5 dispatches to 1 and
-    /// reclaims the autograd-recording overhead. The actual compute stays
-    /// identical (same SimdGemm and same SDPA kernel underneath).
+    /// reclaims the autograd-recording overhead. The float fast path goes
+    /// further: it calls <see cref="SimdGemm.Sgemm"/> directly for all four
+    /// GEMMs and writes Q/K/V into <c>[B, heads, seq, dHead]</c> layout
+    /// inline (so the four large strided-transpose materializations that
+    /// dominated the wrapper's cost are gone).
     /// </para>
     ///
     /// <para>
@@ -94,27 +101,229 @@ public partial class CpuEngine
                 "MultiHeadAttentionForward is inference-only and does not yet support GradientTape. " +
                 "For training, call the decomposed Q/K/V + SDPA + output projection primitives directly.");
 
-        // Q/K/V projections. We project the entire [B, seq, dModel] input
-        // against each weight in one GEMM. Reshape [B, seq, dModel] to
-        // [B*seq, dModel] so the 3D-vs-2D matmul dispatch picks the fast path,
-        // then reshape back to [B, seq, dModel].
+        // Float fast path: direct SimdGemm + in-layout Q/K/V scratch + a
+        // single output-projection transpose. Avoids the 4 strided-transpose
+        // materializations and 4 Tensor<float> intermediates that the
+        // generic-T path goes through. This is the path that closes the
+        // AIsEval Transformer-inference gap.
+        if (typeof(T) == typeof(float))
+            return (Tensor<T>)(object)MultiHeadAttentionForwardFloat(
+                (Tensor<float>)(object)input,
+                (Tensor<float>)(object)qWeight,
+                (Tensor<float>)(object)kWeight,
+                (Tensor<float>)(object)vWeight,
+                (Tensor<float>)(object)outWeight,
+                batch, seqLen, dModel, numHeads, dHead);
+
+        return MultiHeadAttentionForwardGeneric(
+            input, qWeight, kWeight, vWeight, outWeight,
+            batch, seqLen, dModel, numHeads, dHead);
+    }
+
+    /// <summary>
+    /// Float32 fast path. Calls <see cref="SimdGemm.Sgemm"/> directly for the
+    /// four projections, writes Q/K/V into <c>[B, heads, seq, dHead]</c>
+    /// layout inline via a small post-GEMM scatter (one O(B*seq*dModel)
+    /// memory pass instead of three through <see cref="Tensor{T}.Transpose"/>),
+    /// reuses pooled scratch buffers across the whole call, and only
+    /// constructs <see cref="Tensor{T}"/> wrappers at the boundaries with
+    /// <see cref="ScaledDotProductAttention{T}"/>.
+    /// </summary>
+    private unsafe Tensor<float> MultiHeadAttentionForwardFloat(
+        Tensor<float> input,
+        Tensor<float> qWeight, Tensor<float> kWeight, Tensor<float> vWeight, Tensor<float> outWeight,
+        int batch, int seqLen, int dModel, int numHeads, int dHead)
+    {
+        int totalRows = batch * seqLen;
+        int qkvElems = batch * numHeads * seqLen * dHead; // == totalRows * dModel
+        var pool = ArrayPool<float>.Shared;
+
+        var qFlatBuf = pool.Rent(totalRows * dModel);  // [B*seq, dModel] GEMM output
+        var kFlatBuf = pool.Rent(totalRows * dModel);
+        var vFlatBuf = pool.Rent(totalRows * dModel);
+        var qHeadBuf = pool.Rent(qkvElems);            // [B, heads, seq, dHead] post-transpose
+        var kHeadBuf = pool.Rent(qkvElems);
+        var vHeadBuf = pool.Rent(qkvElems);
+        var attnHeadBuf = pool.Rent(qkvElems);         // SDPA output
+        var concatBuf = pool.Rent(totalRows * dModel); // [B*seq, dModel] post-inverse-transpose
+
+        var output = AutoTensorCache.RentOrAllocate<float>(new[] { batch, seqLen, dModel });
+
+        try
+        {
+            // ---- Q/K/V projections via direct SimdGemm calls. ----
+            // input [B*seq, dModel] @ Weight [dModel, dModel] -> [B*seq, dModel]
+            var inputSpan = input.AsSpan();
+            int batchSeqRows = totalRows;
+            SimdGemm.Sgemm(
+                inputSpan, dModel, false,
+                qWeight.AsSpan(), dModel, false,
+                qFlatBuf.AsSpan(0, totalRows * dModel),
+                batchSeqRows, dModel, dModel);
+            SimdGemm.Sgemm(
+                inputSpan, dModel, false,
+                kWeight.AsSpan(), dModel, false,
+                kFlatBuf.AsSpan(0, totalRows * dModel),
+                batchSeqRows, dModel, dModel);
+            SimdGemm.Sgemm(
+                inputSpan, dModel, false,
+                vWeight.AsSpan(), dModel, false,
+                vFlatBuf.AsSpan(0, totalRows * dModel),
+                batchSeqRows, dModel, dModel);
+
+            // ---- Transpose Q/K/V from [B*seq, dModel] = [B, seq, H, dHead]
+            // (read as 4D with strides 1, seq*H*dHead, etc) into
+            // [B, H, seq, dHead]. One tight nested loop per matrix.
+            // The mapping for output index (b, h, s, d):
+            //   src_off = (b * seq + s) * dModel + h * dHead + d
+            //   dst_off = ((b * H + h) * seq + s) * dHead + d
+            // dHead is contiguous in both layouts, so the innermost copy is
+            // a dHead-element block-copy (Span<T>.CopyTo gives us SIMD).
+            TransposeQkv(qFlatBuf, qHeadBuf, batch, seqLen, numHeads, dHead);
+            TransposeQkv(kFlatBuf, kHeadBuf, batch, seqLen, numHeads, dHead);
+            TransposeQkv(vFlatBuf, vHeadBuf, batch, seqLen, numHeads, dHead);
+
+            // ---- SDPA. Wrap the pooled buffers as Tensor<float> views just
+            // long enough to call the existing optimized primitive, which
+            // does scale + softmax + matmul internally. The wrapping is
+            // O(1) — no data copy. ----
+            var qHeadTensor = WrapAsTensor(qHeadBuf, batch, numHeads, seqLen, dHead);
+            var kHeadTensor = WrapAsTensor(kHeadBuf, batch, numHeads, seqLen, dHead);
+            var vHeadTensor = WrapAsTensor(vHeadBuf, batch, numHeads, seqLen, dHead);
+
+            var attnTensor = ScaledDotProductAttention<float>(
+                qHeadTensor, kHeadTensor, vHeadTensor,
+                mask: null, scale: null, out _);
+
+            // Copy SDPA output ([B, H, seq, dHead]) into our pooled buffer
+            // so the inverse-transpose is a contiguous read pass.
+            attnTensor.AsSpan().Slice(0, qkvElems).CopyTo(attnHeadBuf.AsSpan(0, qkvElems));
+
+            // ---- Inverse transpose: [B, H, seq, dHead] -> [B*seq, dModel]. ----
+            InverseTransposeQkv(attnHeadBuf, concatBuf, batch, seqLen, numHeads, dHead);
+
+            // ---- Output projection: [B*seq, dModel] @ outWeight [dModel, dModel] -> output. ----
+            SimdGemm.Sgemm(
+                concatBuf.AsSpan(0, totalRows * dModel), dModel, false,
+                outWeight.AsSpan(), dModel, false,
+                output.AsWritableSpan(),
+                batchSeqRows, dModel, dModel);
+
+            return output;
+        }
+        finally
+        {
+            pool.Return(qFlatBuf);
+            pool.Return(kFlatBuf);
+            pool.Return(vFlatBuf);
+            pool.Return(qHeadBuf);
+            pool.Return(kHeadBuf);
+            pool.Return(vHeadBuf);
+            pool.Return(attnHeadBuf);
+            pool.Return(concatBuf);
+        }
+    }
+
+    /// <summary>
+    /// Wraps a rented array slice as a contiguous rank-4 <see cref="Tensor{T}"/>
+    /// for passing to <see cref="ScaledDotProductAttention{T}"/>. The
+    /// tensor's lifetime is tied to the caller's <c>try/finally</c>;
+    /// internal callers must not store the result past the pool return.
+    /// </summary>
+    private static Tensor<float> WrapAsTensor(float[] buffer, int d0, int d1, int d2, int d3)
+    {
+        // Tensor<float> ctor takes (T[] data, int[] dimensions). Note the
+        // buffer is from ArrayPool which may be larger than the logical
+        // tensor (bucket-sized); only the first product(dimensions) elements
+        // are meaningful. The ctor's base() forwards to the storage layer
+        // which uses dimensions for element count — capacity past that is
+        // harmless. Lifetime: this Tensor must not outlive the pool.Return
+        // in the caller's finally — we use it only as a thunk into SDPA.
+        return new Tensor<float>(buffer, new[] { d0, d1, d2, d3 });
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void TransposeQkv(float[] src, float[] dst, int batch, int seq, int numHeads, int dHead)
+    {
+        // src layout: [B, seq, numHeads, dHead]  (linear stride: dHead, numHeads*dHead, seq*numHeads*dHead)
+        // dst layout: [B, numHeads, seq, dHead]
+        int srcStrideS = numHeads * dHead;
+        int srcStrideB = seq * srcStrideS;
+        int dstStrideS = dHead;
+        int dstStrideH = seq * dHead;
+        int dstStrideB = numHeads * dstStrideH;
+        var srcSpan = src.AsSpan();
+        var dstSpan = dst.AsSpan();
+        for (int b = 0; b < batch; b++)
+        {
+            for (int s = 0; s < seq; s++)
+            {
+                int srcBase = b * srcStrideB + s * srcStrideS;
+                int dstBaseBS = b * dstStrideB + s * dHead;
+                for (int h = 0; h < numHeads; h++)
+                {
+                    int srcOff = srcBase + h * dHead;
+                    int dstOff = dstBaseBS + h * dstStrideH;
+                    // dHead-element block copy (typically 8-64 floats =
+                    // 1-8 AVX2 vectors). Span<T>.CopyTo dispatches to
+                    // Buffer.MemoryCopy which is SIMD on .NET 5+.
+                    srcSpan.Slice(srcOff, dHead).CopyTo(dstSpan.Slice(dstOff, dHead));
+                }
+            }
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void InverseTransposeQkv(float[] src, float[] dst, int batch, int seq, int numHeads, int dHead)
+    {
+        // src layout: [B, numHeads, seq, dHead]
+        // dst layout: [B, seq, numHeads, dHead]  (== [B*seq, dModel])
+        int srcStrideS = dHead;
+        int srcStrideH = seq * dHead;
+        int srcStrideB = numHeads * srcStrideH;
+        int dstStrideS = numHeads * dHead;
+        int dstStrideB = seq * dstStrideS;
+        var srcSpan = src.AsSpan();
+        var dstSpan = dst.AsSpan();
+        for (int b = 0; b < batch; b++)
+        {
+            for (int s = 0; s < seq; s++)
+            {
+                int dstBaseBS = b * dstStrideB + s * dstStrideS;
+                int srcBaseBS = b * srcStrideB + s * dHead;
+                for (int h = 0; h < numHeads; h++)
+                {
+                    int srcOff = srcBaseBS + h * srcStrideH;
+                    int dstOff = dstBaseBS + h * dHead;
+                    srcSpan.Slice(srcOff, dHead).CopyTo(dstSpan.Slice(dstOff, dHead));
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Generic-T path. Composes existing tensor-level primitives. Used for
+    /// double/decimal/BigInteger/custom numerics — those callers tend to
+    /// be correctness-driven and don't pay the per-call dispatch overhead
+    /// that motivates the float fast path above.
+    /// </summary>
+    private Tensor<T> MultiHeadAttentionForwardGeneric<T>(
+        Tensor<T> input,
+        Tensor<T> qWeight, Tensor<T> kWeight, Tensor<T> vWeight, Tensor<T> outWeight,
+        int batch, int seqLen, int dModel, int numHeads, int dHead)
+    {
         var inputFlat = input.Reshape(new[] { batch * seqLen, dModel });
-        var qFlat = TensorMatMul(inputFlat, qWeight); // [B*seq, dModel]
+        var qFlat = TensorMatMul(inputFlat, qWeight);
         var kFlat = TensorMatMul(inputFlat, kWeight);
         var vFlat = TensorMatMul(inputFlat, vWeight);
 
-        // Reshape to [B, seq, numHeads, dHead] then permute (0,2,1,3) -> [B, numHeads, seq, dHead].
         var q = qFlat.Reshape(new[] { batch, seqLen, numHeads, dHead }).Transpose(new[] { 0, 2, 1, 3 });
         var k = kFlat.Reshape(new[] { batch, seqLen, numHeads, dHead }).Transpose(new[] { 0, 2, 1, 3 });
         var v = vFlat.Reshape(new[] { batch, seqLen, numHeads, dHead }).Transpose(new[] { 0, 2, 1, 3 });
 
-        // SDPA: existing primitive. Out shape [B, numHeads, seq, dHead].
         var attnOut = ScaledDotProductAttention<T>(q, k, v, mask: null, scale: null, out _);
 
-        // Permute back (0,2,1,3) -> [B, seq, numHeads, dHead] then flatten heads -> [B, seq, dModel].
         var concat = attnOut.Transpose(new[] { 0, 2, 1, 3 }).Reshape(new[] { batch, seqLen, dModel });
-
-        // Output projection: [B*seq, dModel] @ [dModel, dModel] -> [B*seq, dModel] -> reshape.
         var concatFlat = concat.Reshape(new[] { batch * seqLen, dModel });
         var outFlat = TensorMatMul(concatFlat, outWeight);
         return outFlat.Reshape(new[] { batch, seqLen, dModel });
