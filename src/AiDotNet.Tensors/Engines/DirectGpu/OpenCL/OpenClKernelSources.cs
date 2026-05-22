@@ -277,7 +277,11 @@ internal static class OpenClKernelSources
         __kernel void relu(__global const float* input, __global float* output, const int size) {
             int idx = get_global_id(0);
             if (idx >= size) return;
-            output[idx] = fmax(0.0f, input[idx]);
+            // NaN-preserving: fmax(0, NaN) returns 0 in OpenCL (NaN compares
+            // as "less than"), silently zeroing NaN. CPU ReluNaNSafe* preserves
+            // NaN as a numerical-blowup signal — match that contract.
+            float v = input[idx];
+            output[idx] = isnan(v) ? v : fmax(0.0f, v);
         }
 
         __kernel void sigmoid(__global const float* input, __global float* output, const int size) {
