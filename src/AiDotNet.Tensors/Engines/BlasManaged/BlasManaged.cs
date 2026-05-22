@@ -464,11 +464,15 @@ public static class BlasManaged
         int kc = Math.Min(256, k);
         // Round mc UP to a multiple of mr (microkernel row tile height) so the
         // packed-byte layout matches what ScalarPack.PackA / Avx2Pack.PackA
-        // expects. The clamp-back-down here also handles the edge case of
-        // m < mr (e.g., the ExecuteIntoTests m=2 mr=4 matmul plan) where the
-        // intent is one zero-padded stripe.
-        if (mc < m && (mc % mr) != 0) mc = ((mc + mr - 1) / mr) * mr;
-        if (mc > m) mc = ((m + mr - 1) / mr) * mr;
+        // expects. CodeRabbit #402: the previous gated form (`if (mc < m ...`)
+        // skipped tiny-panel cases where Math.Min(128, m) made mc start equal
+        // to m, leaving mc unaligned to mr. Concrete repro: m=2, mr=4 →
+        // mc=Min(128,2)=2, mc<m is false, mc>m is false, no round-up runs and
+        // tileBytes is sized for 2 rows instead of the mr-aligned padded
+        // stripe the packer reads. Unconditional round-up handles both
+        // "smaller than full tile" (mc=m < 128) and "edge of full tile"
+        // (mc=128 already mr-aligned) consistently.
+        if ((mc % mr) != 0) mc = ((mc + mr - 1) / mr) * mr;
         if (kc > k) kc = k;
         if (mc <= 0)
             throw new ArgumentException($"M={m} smaller than microkernel Mr={mr}; pre-pack not supported.", nameof(m));
@@ -587,8 +591,10 @@ public static class BlasManaged
         // zero-padded stripe), producing an IndexOutOfRangeException in the
         // packed-buffer span. Keep nc aligned UP and let effectiveNc bound the
         // logical read range in the per-tile inner loop.
-        if (nc < n && (nc % nr) != 0) nc = ((nc + nr - 1) / nr) * nr;
-        if (nc > n) nc = ((n + nr - 1) / nr) * nr;
+        // CodeRabbit #402: unconditional round-up (same rationale as PrePackA
+        // above). The previous gated form skipped tiny-panel cases where
+        // Math.Min(512, n) made nc == n on a value already smaller than nr.
+        if ((nc % nr) != 0) nc = ((nc + nr - 1) / nr) * nr;
         if (kc > k) kc = k;
         if (nc <= 0)
             throw new ArgumentException($"N={n} smaller than microkernel Nr={nr}; pre-pack not supported.", nameof(n));
