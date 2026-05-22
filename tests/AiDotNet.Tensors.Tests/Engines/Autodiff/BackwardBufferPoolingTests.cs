@@ -19,13 +19,33 @@ namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 /// 3. All paths must produce numerically identical gradients across repeated steps
 ///    (regression: if a buffer is not cleared/overwritten, step 2+ would return wrong values).
 /// </summary>
+// Serialize with other tests that mutate AiDotNetEngine.Current (the
+// same shared collection used by CompiledBackwardWalkTests etc.) — the
+// constructor swaps the process-wide engine for fixture isolation, so
+// concurrent execution against another fixture that does the same thing
+// would race and corrupt either side's state.
+[Collection("EngineCurrentGlobalState")]
 public class BackwardBufferPoolingTests : IDisposable
 {
     private readonly IEngine _engine;
+    private readonly IEngine _savedEngine;
+    private readonly bool _savedAutoTrainingCompilerEnabled;
+    private readonly bool _savedAutoTrainingCompilerReplayMode;
     private const float Tolerance = 1e-4f;
 
     public BackwardBufferPoolingTests()
     {
+        // Snapshot prior global state so we can restore it in Dispose —
+        // overwriting AiDotNetEngine.Current without restore lets the
+        // fresh CpuEngine leak past the fixture's lifetime and break any
+        // sibling test class that expected its own engine (e.g. tests
+        // that ran with the process default DirectGpuTensorEngine and
+        // assert GPU dispatch). Same rationale for the
+        // AutoTrainingCompiler flags below — they're process-wide.
+        _savedEngine = AiDotNetEngine.Current;
+        _savedAutoTrainingCompilerEnabled = AutoTrainingCompiler.Enabled;
+        _savedAutoTrainingCompilerReplayMode = AutoTrainingCompiler.ReplayMode;
+
         // Reset AiDotNetEngine.Current to a fresh CpuEngine so the tests
         // see a clean singleton state — the long-lived process-wide
         // singleton accumulates cached AutoTracer plans, ReplayMode bits,
@@ -44,9 +64,12 @@ public class BackwardBufferPoolingTests : IDisposable
 
     public void Dispose()
     {
-        AutoTrainingCompiler.Enabled = true;
-        AutoTrainingCompiler.ReplayMode = false;
+        // Restore process-wide state captured in ctor so we don't leak the
+        // fixture's CpuEngine / compiler flag tweaks past the test class.
         AutoTrainingCompiler.ResetState();
+        AutoTrainingCompiler.ReplayMode = _savedAutoTrainingCompilerReplayMode;
+        AutoTrainingCompiler.Enabled = _savedAutoTrainingCompilerEnabled;
+        AiDotNetEngine.Current = _savedEngine;
     }
 
     // ──────────────────────────────────────────────────────────────

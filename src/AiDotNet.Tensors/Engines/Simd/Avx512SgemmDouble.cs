@@ -69,8 +69,14 @@ internal static class Avx512SgemmDouble
             return;
         }
 #endif
-        // AVX2 fallback — Dgemm clears C and runs the existing AVX2 path.
-        SimdGemm.Dgemm(a, b, c, m, k, n);
+        // AVX2/scalar fallback for small or non-aligned shapes. Must use the
+        // non-dispatching helper (DgemmAvx2OrScalar) — calling SimdGemm.Dgemm
+        // would re-check Avx512SgemmDouble.CanUse and recurse back into this
+        // method on AVX-512 hosts for the same misaligned input. Note: the
+        // caller (SimdGemm.Dgemm) has already cleared C before dispatch, so
+        // the AVX2/scalar paths' accumulation against zero produces the same
+        // result they would compute from a fresh C buffer.
+        SimdGemm.DgemmAvx2OrScalar(a, b, c, m, k, n, allowParallel);
     }
 
 #if NET8_0_OR_GREATER
