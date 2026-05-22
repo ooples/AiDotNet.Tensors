@@ -14391,6 +14391,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> ReLU<T>(Tensor<T> tensor)
     {
+        // Stage 8 precision-fallback gate. TryRunUnary upload converts T→float
+        // inside GetOrAllocateBuffer and the download converts float→T. For
+        // T=double the round-trip silently loses ~7 mantissa bits per element,
+        // showing up as a 2.2e-9 drift in FusedConv2DDoublePerfTests.
+        // FusedConv2D_Double_ReLU_MatchesConvPlusBroadcastAddPlusReLU (Path A
+        // = Conv2D + BroadcastAdd + ReLU was being fp32-quantised through this
+        // ReLU even after my fallbacks fixed Conv2D + BroadcastAdd).
+        if (DirectGpuEngine.ShouldFallbackForPrecision<T>())
+            return base.ReLU(tensor);
+
         try
         {
             var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Relu(input, output, size));
@@ -14408,6 +14418,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> GELU<T>(Tensor<T> tensor)
     {
+        if (DirectGpuEngine.ShouldFallbackForPrecision<T>())
+            return base.GELU(tensor);
         try
         {
             var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Gelu(input, output, size));
@@ -14425,6 +14437,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> Mish<T>(Tensor<T> tensor)
     {
+        if (DirectGpuEngine.ShouldFallbackForPrecision<T>())
+            return base.Mish(tensor);
         try
         {
             var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Mish(input, output, size));
@@ -14443,6 +14457,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<T> LeakyReLU<T>(Tensor<T> tensor, T alpha)
     {
         if (!TryGetBackend(out var backend))
+            return base.LeakyReLU(tensor, alpha);
+        if (DirectGpuEngine.ShouldFallbackForPrecision<T>())
             return base.LeakyReLU(tensor, alpha);
 
         try
@@ -14466,6 +14482,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> HardSwish<T>(Tensor<T> input)
     {
+        if (DirectGpuEngine.ShouldFallbackForPrecision<T>())
+            return base.HardSwish(input);
         try
         {
             var result = TryRunUnary(input, static (backend, inp, output, size) => backend.Hardswish(inp, output, size));
