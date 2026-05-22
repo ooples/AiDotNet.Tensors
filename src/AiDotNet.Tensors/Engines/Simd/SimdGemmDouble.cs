@@ -50,10 +50,28 @@ internal static partial class SimdGemm
             return;
         }
 #endif
+        DgemmAvx2OrScalar(a, b, c, m, k, n, allowParallel: true);
+    }
+
+    /// <summary>
+    /// AVX2-or-scalar dispatch with NO AVX-512 re-check. The AVX-512 path
+    /// (Avx512SgemmDouble.DgemmBlocked) calls this from its
+    /// small-or-misaligned fallback; routing back through <see cref="Dgemm"/>
+    /// would re-dispatch into Avx512SgemmDouble.DgemmBlocked on capable
+    /// hosts and recurse forever for any shape that fails the 8×16-aligned
+    /// gate. C must already be cleared by the caller.
+    /// </summary>
+    internal static void DgemmAvx2OrScalar(
+        ReadOnlySpan<double> a,
+        ReadOnlySpan<double> b,
+        Span<double> c,
+        int m, int k, int n,
+        bool allowParallel)
+    {
 #if NET5_0_OR_GREATER
         if (Avx2.IsSupported && Fma.IsSupported)
         {
-            DgemmAvx2(a, b, c, m, k, n, allowParallel: true);
+            DgemmAvx2(a, b, c, m, k, n, allowParallel);
             return;
         }
 #endif
@@ -84,14 +102,7 @@ internal static partial class SimdGemm
             return;
         }
 #endif
-#if NET5_0_OR_GREATER
-        if (Avx2.IsSupported && Fma.IsSupported)
-        {
-            DgemmAvx2(a, b, c, m, k, n, allowParallel: false);
-            return;
-        }
-#endif
-        DgemmScalar(a, b, c, m, k, n);
+        DgemmAvx2OrScalar(a, b, c, m, k, n, allowParallel: false);
     }
 
     // ─────────────────────────────────────────────────────────────────────
