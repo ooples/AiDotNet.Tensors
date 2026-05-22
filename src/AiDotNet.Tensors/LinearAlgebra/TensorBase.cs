@@ -177,6 +177,41 @@ public abstract class TensorBase<T> : IDisposable
     /// </remarks>
     internal void DropStorageForStreaming()
     {
+        if (!TryDropStorageForStreaming(throwOnSharedRefcount: true))
+        {
+            // TryDropStorageForStreaming throws inside when refcount > 1
+            // and throwOnSharedRefcount is true; this branch is unreachable
+            // in the strict path. Kept as a defensive guard.
+            throw new InvalidOperationException(
+                $"Streaming drop requires sole storage ownership; storage refcount is {_storage.RefCount}. " +
+                "Register the weight via WeightRegistry before any RebindStorageFrom / view operation that " +
+                "shares its storage.");
+        }
+    }
+
+    /// <summary>
+    /// Tries to drop this tensor's in-memory data per <see cref="DropStorageForStreaming"/>
+    /// semantics, but returns <c>false</c> instead of throwing when the storage
+    /// refcount is &gt; 1 (a peer view — typically the autodiff tape — holds the
+    /// other reference).
+    /// <para>
+    /// Issue #430: lazy weights allocated via <c>WeightRegistry.AllocateStreaming</c>
+    /// in <c>OnFirstForward</c> have their storage referenced by the very next
+    /// op's view (autodiff tape input capture), making the refcount 2 at the
+    /// moment <c>RegisterWeight</c> is called. <c>RegisterWeight</c> uses this
+    /// non-throwing variant to detect that case and defer the drop until the
+    /// peer ref releases (typically end of training step).
+    /// </para>
+    /// </summary>
+    /// <param name="throwOnSharedRefcount">When true, throws the same
+    /// <see cref="InvalidOperationException"/> the strict
+    /// <see cref="DropStorageForStreaming"/> raises. When false, returns
+    /// <c>false</c> on shared refcount.</param>
+    /// <returns><c>true</c> when the drop succeeded (refcount 1 → 0, storage
+    /// replaced with empty); <c>false</c> when refcount &gt; 1 and the caller
+    /// opted for the soft path.</returns>
+    internal bool TryDropStorageForStreaming(bool throwOnSharedRefcount = false)
+    {
         if (!IsContiguous || _storageOffset != 0 || IsView)
             throw new InvalidOperationException(
                 "Streaming drop requires contiguous, non-view, zero-offset tensors. " +
@@ -193,10 +228,14 @@ public abstract class TensorBase<T> : IDisposable
         // refcount was exactly 1 at the moment of the claim, and after
         // success any concurrent AddRef throws ObjectDisposedException.
         if (!_storage.TryClaimExclusive())
-            throw new InvalidOperationException(
-                $"Streaming drop requires sole storage ownership; storage refcount is {_storage.RefCount}. " +
-                "Register the weight via WeightRegistry before any RebindStorageFrom / view operation that " +
-                "shares its storage.");
+        {
+            if (throwOnSharedRefcount)
+                throw new InvalidOperationException(
+                    $"Streaming drop requires sole storage ownership; storage refcount is {_storage.RefCount}. " +
+                    "Register the weight via WeightRegistry before any RebindStorageFrom / view operation that " +
+                    "shares its storage.");
+            return false;
+        }
 
         // Successful claim drove refcount 1 → 0. The old storage is now
         // owned exclusively by this method and no other thread can take
@@ -206,6 +245,7 @@ public abstract class TensorBase<T> : IDisposable
         // is already 0, Release would underflow.
         _data = Vector<T>.Empty();
         _storage = new TensorStorage<T>(_data);
+        return true;
     }
 
     /// <summary>
@@ -699,6 +739,30 @@ public abstract class TensorBase<T> : IDisposable
     /// can't desync the pool's <c>_reservedBytes</c> bookkeeping.
     /// </summary>
     internal long StreamingReservedBytes { get; set; }
+
+    /// <summary>
+    /// Issue #430: indicates that <see cref="WeightRegistry.RegisterWeight{T}"/>
+    /// registered this tensor with the streaming pool but the in-memory storage
+    /// drop was deferred because the storage refcount was &gt; 1 at register
+    /// time (a peer view, typically the autodiff tape's input capture, held
+    /// the second reference). The GC-heap storage stays live so the peer's
+    /// reads continue to see valid data; the pool also holds the serialized
+    /// snapshot under <see cref="StreamingPoolHandle"/>. On the next call to
+    /// <see cref="WeightRegistry.TryFinalizeDeferredDrop{T}"/> (typically at
+    /// the end of the training step, after backward releases tape captures)
+    /// the drop is retried and this flag clears on success.
+    /// <para>
+    /// Lifecycle:
+    /// <list type="bullet">
+    ///   <item><c>false</c> by default; remains <c>false</c> on normal
+    ///     RegisterWeight (refcount == 1, drop succeeds inline).</item>
+    ///   <item>set to <c>true</c> by <c>RegisterWeight</c> when refcount &gt; 1.</item>
+    ///   <item>cleared by <c>TryFinalizeDeferredDrop</c> when the drop
+    ///     finally succeeds.</item>
+    /// </list>
+    /// </para>
+    /// </summary>
+    internal bool StreamingDropDeferred { get; set; }
 
     /// <summary>
     /// GPU offload allocation handle when <see cref="Lifetime"/> is
