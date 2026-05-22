@@ -179,13 +179,22 @@ public class TransformerMatmulPerfTests
     //   - matmul still works regardless of which path fires
 
     [Fact]
-    public void BlasProvider_DefaultBuild_ReportsUnavailable()
+    public void BlasProvider_OptOut_ReportsUnavailable()
     {
-        // This test relies on the env var being unset in CI, which is
-        // the normal case. If a dev has AIDOTNET_USE_BLAS=1 locally, the
-        // assertion changes meaning — skip cleanly.
+        // BlasProvider default flipped to opt-OUT (AIDOTNET_USE_BLAS=0|false|no)
+        // in the post-MKL.NET removal work — `AiDotNet.Native.OpenBLAS` ships
+        // as a transitive NuGet dependency, so libopenblas is loadable on
+        // every consumer install and the default contract is now
+        // BLAS-on-when-loadable. This test only validates the opt-OUT path;
+        // when the env var is unset (or set to 1/true/yes), `IsAvailable`
+        // reflects whether the native probe succeeded, which is host-
+        // dependent and not contractually false.
         var envVar = Environment.GetEnvironmentVariable("AIDOTNET_USE_BLAS");
-        if (!string.IsNullOrWhiteSpace(envVar)) return;
+        bool isOptOut = string.Equals(envVar, "0", StringComparison.OrdinalIgnoreCase)
+                     || string.Equals(envVar, "false", StringComparison.OrdinalIgnoreCase)
+                     || string.Equals(envVar, "no", StringComparison.OrdinalIgnoreCase)
+                     || string.Equals(envVar, "off", StringComparison.OrdinalIgnoreCase);
+        if (!isOptOut) return;
 
         Assert.False(BlasProvider.IsAvailable);
         Assert.False(BlasProvider.HasNativeSgemm);

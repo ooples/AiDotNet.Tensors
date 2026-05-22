@@ -35,6 +35,35 @@ public sealed class DirectGpuEngine : IDisposable
         Environment.GetEnvironmentVariable("AIDOTNET_GEMM_VALIDATE") == "1";
 
     /// <summary>
+    /// Stage 8 (#415): when set, generic-T entry points that would route a
+    /// non-float T (notably <c>double</c>, <c>Half</c>, <c>BFloat16</c>)
+    /// through the FP32 GPU boundary return <c>null</c> instead — forcing
+    /// the caller to fall back to the CPU path which preserves the
+    /// requested precision. Default: ON for double (silent downcast was
+    /// the source of precision loss in cluster #6 ResNet50/VGG FP64 tests).
+    /// Override via env var <c>AIDOTNET_DIRECTGPU_STRICT_FP64=0</c> to opt
+    /// back into the legacy lossy behavior for benchmarking / smoke tests.
+    /// </summary>
+    public static readonly bool StrictFp64Fallback =
+        Environment.GetEnvironmentVariable("AIDOTNET_DIRECTGPU_STRICT_FP64") != "0";
+
+    /// <summary>
+    /// Stage 8 (#415): returns true when the requested element type would
+    /// lose precision crossing the FP32 GPU boundary. Used by every
+    /// generic-T entry point to early-return null and force CPU fallback.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static bool ShouldFallbackForPrecision<T>()
+    {
+        if (!StrictFp64Fallback) return false;
+        // float is the GPU boundary type — never lossy. Everything else is
+        // potentially lossy. Half / BFloat16 callers are rare and usually
+        // opt into the downcast deliberately; only double is the high-
+        // leverage case for cluster #6.
+        return typeof(T) == typeof(double);
+    }
+
+    /// <summary>
     /// Gets whether the direct GPU engine is available.
     /// </summary>
     public bool IsAvailable => _isAvailable && _backend != null;
@@ -502,6 +531,10 @@ public sealed class DirectGpuEngine : IDisposable
         if (!IsAvailable || _backend == null)
             return null;
 
+        // Stage 8 (#415): preserve FP64 precision — fall back to CPU rather
+        // than silently downcasting through the FP32 GPU boundary.
+        if (ShouldFallbackForPrecision<T>()) return null;
+
         // Convert to float
         float[] aFloat = ToFloatArray(A);
         float[] bFloat = ToFloatArray(B);
@@ -550,6 +583,8 @@ public sealed class DirectGpuEngine : IDisposable
         if (!IsAvailable || _backend == null)
             return null;
 
+        if (ShouldFallbackForPrecision<T>()) return null;
+
         float[] inputFloat = ToFloatArray(input);
         using var bufferInput = _backend.AllocateBuffer(inputFloat);
         using var bufferC = _backend.MatMul(bufferInput, cachedWeights, M, N, K);
@@ -583,6 +618,8 @@ public sealed class DirectGpuEngine : IDisposable
     {
         if (!IsAvailable || _backend == null)
             return null;
+
+        if (ShouldFallbackForPrecision<T>()) return null;
 
         float[] inputFloat = ToFloatArray(input);
         float[] weightsFloat = ToFloatArray(weights);
@@ -696,6 +733,8 @@ public sealed class DirectGpuEngine : IDisposable
     {
         if (!IsAvailable || _backend == null || operations == null || operations.Count == 0)
             return null;
+
+        if (ShouldFallbackForPrecision<T>()) return null;
 
         // Try to fuse the operations
         var fusionResult = _fusionManager.TryFuseOperations(operations);
@@ -1062,6 +1101,8 @@ public sealed class DirectGpuEngine : IDisposable
         if (!IsAvailable || _backend == null)
             return null;
 
+        if (ShouldFallbackForPrecision<T>()) return null;
+
         float[] inputFloat = ToFloatArray(input);
         using var bufferA = _backend.AllocateBuffer(inputFloat);
         using var bufferB = _backend.AllocateBuffer(input.Length);
@@ -1080,6 +1121,8 @@ public sealed class DirectGpuEngine : IDisposable
         if (!IsAvailable || _backend == null)
             return null;
 
+        if (ShouldFallbackForPrecision<T>()) return null;
+
         float[] inputFloat = ToFloatArray(input);
         using var bufferA = _backend.AllocateBuffer(inputFloat);
         using var bufferB = _backend.AllocateBuffer(input.Length);
@@ -1097,6 +1140,8 @@ public sealed class DirectGpuEngine : IDisposable
     {
         if (!IsAvailable || _backend == null)
             return null;
+
+        if (ShouldFallbackForPrecision<T>()) return null;
 
         float[] inputFloat = ToFloatArray(input);
         using var bufferA = _backend.AllocateBuffer(inputFloat);

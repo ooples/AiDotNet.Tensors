@@ -216,12 +216,27 @@ public class TensorCopyToTests
     [Fact]
     public void Rank4AfterPermute_Copy_MatchesContiguousThenCopy()
     {
+        // Disable AutoTracer for this test — TensorPermute's RecordOp path
+        // would otherwise return a materialized (row-major-contiguous)
+        // tensor from a cached compiled plan on the second-and-later
+        // invocations within the same process. That defeats the test's
+        // intent (exercise the strided decomposition copy path). Tracked
+        // as a separate concern: AutoTracer should preserve the view
+        // contract for ops that document themselves as views.
+        bool savedAutoTracer = AiDotNet.Tensors.Engines.Compilation.AutoTracer.Enabled;
+        AiDotNet.Tensors.Engines.Compilation.AutoTracer.Enabled = false;
+        try
+        {
         // [N=2, C=3, H=2, W=2] — 24 elements, each distinct.
         var nchw = new Tensor<double>([2, 3, 2, 2]);
         for (int i = 0; i < nchw.Length; i++) nchw.AsWritableSpan()[i] = i;
 
-        // NCHW -> NHWC: axes [0, 2, 3, 1].
-        var nhwc = AiDotNetEngine.Current.TensorPermute(nchw, [0, 2, 3, 1]);
+        // NCHW -> NHWC: axes [0, 2, 3, 1]. Call Transpose() directly to
+        // get the view-contract (engine.TensorPermute routes through an
+        // AutoTracer / GraphMode path that may materialize the result on
+        // cache hit, defeating the strided-decomposition coverage intent
+        // of this test).
+        var nhwc = nchw.Transpose(new[] { 0, 2, 3, 1 });
         Assert.False(nhwc.IsContiguous);
 
         Span<double> viaCopy = stackalloc double[nhwc.Length];
@@ -240,6 +255,11 @@ public class TensorCopyToTests
                 for (int y = 0; y < 2; y++)
                     for (int x = 0; x < 2; x++)
                         Assert.Equal(nchw[n, c, y, x], nhwc[n, y, x, c]);
+        }
+        finally
+        {
+            AiDotNet.Tensors.Engines.Compilation.AutoTracer.Enabled = savedAutoTracer;
+        }
     }
 
     /// <summary>

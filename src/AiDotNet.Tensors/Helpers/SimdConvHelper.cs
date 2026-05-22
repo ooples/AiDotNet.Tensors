@@ -4,6 +4,7 @@ using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
 using System.Threading.Tasks;
+using AiDotNet.Tensors.Engines.Simd;
 using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Helpers;
@@ -53,12 +54,295 @@ internal static class SimdConvHelper
 
     /// <summary>
     /// Check if SIMD-optimized double-precision convolution is available.
-    /// Currently only 3×3 stride=1 (the most common ResNet/transformer pattern).
+    /// Stage 5 (#415) extension: covers 3×3 s=1 (ResNet/VGG/transformer
+    /// hot path), 1×1 s=1 (ResNet bottleneck pointwise), 3×3 s=2 (ResNet
+    /// bottleneck transitions), and 7×7 s=2 (ResNet50 stem).
     /// </summary>
     public static bool CanUseSimdConvDouble(int kernelH, int kernelW, int strideH, int strideW)
     {
         if (!UseAvx2 || !UseFma) return false;
-        return kernelH == 3 && kernelW == 3 && strideH == 1 && strideW == 1;
+        if (strideH != strideW) return false;
+        if (kernelH != kernelW) return false;
+        return (kernelH == 3 && strideH == 1)   // existing Conv3x3Stride1Double
+            || (kernelH == 1 && strideH == 1)   // Stage 5 Conv1x1Stride1Double
+            || (kernelH == 3 && strideH == 2)   // Stage 5 Conv3x3Stride2Double
+            || (kernelH == 7 && strideH == 2);  // Stage 5 Conv7x7Stride2Double
+    }
+
+    /// <summary>
+    /// Stage 5 (#415) — dispatcher to the per-(K,S) FP64 direct kernels.
+    /// Centralizes the routing so CpuEngine's Conv2D dispatch stays one
+    /// guarded branch rather than four. All kernels are pure C# AVX2+FMA
+    /// using <see cref="System.Runtime.Intrinsics.Vector256{T}"/>.
+    /// </summary>
+    public static unsafe void Conv2DDirectDouble(
+        double* input, double* kernel, double* output,
+        int batch, int inChannels, int height, int width,
+        int outChannels, int kernelH, int kernelW, int strideH, int strideW,
+        int padH, int padW, int dilationH, int dilationW)
+    {
+        if (kernelH == 3 && kernelW == 3 && strideH == 1 && strideW == 1)
+        {
+            Conv3x3Stride1Double(input, kernel, output,
+                batch, inChannels, height, width, outChannels, padH, padW, dilationH, dilationW);
+        }
+        else if (kernelH == 1 && kernelW == 1 && strideH == 1 && strideW == 1)
+        {
+            Conv1x1Stride1Double(input, kernel, output,
+                batch, inChannels, height, width, outChannels);
+        }
+        else if (kernelH == 3 && kernelW == 3 && strideH == 2 && strideW == 2)
+        {
+            Conv3x3Stride2Double(input, kernel, output,
+                batch, inChannels, height, width, outChannels, padH, padW);
+        }
+        else if (kernelH == 7 && kernelW == 7 && strideH == 2 && strideW == 2)
+        {
+            Conv7x7Stride2Double(input, kernel, output,
+                batch, inChannels, height, width, outChannels, padH, padW);
+        }
+        else
+        {
+            throw new ArgumentException(
+                $"Conv2DDirectDouble does not support kernel={kernelH}x{kernelW} stride={strideH}x{strideW}. " +
+                $"Check CanUseSimdConvDouble before dispatch.");
+        }
+    }
+
+    /// <summary>
+    /// Stage 5 (#415): 1×1 stride=1 FP64 direct conv. Routes to
+    /// <see cref="SimdGemm.Dgemm"/> as a per-batch GEMM C=A·B with
+    /// A=kernel[OC,IC], B=input[IC,H·W], C=output[OC,H·W]. No im2col
+    /// scratch (1×1 im2col would be the identity transform with extra
+    /// allocation overhead). 32 ResNet bottlenecks per forward step
+    /// — eliminates the per-call malloc that ResNet50 MoreData was
+    /// blocked on.
+    /// </summary>
+    public static unsafe void Conv1x1Stride1Double(
+        double* input, double* kernel, double* output,
+        int batch, int inChannels, int height, int width, int outChannels)
+    {
+        int spatial = height * width;
+        long perBatchA = (long)inChannels * spatial;
+        long perBatchC = (long)outChannels * spatial;
+        for (int b = 0; b < batch; b++)
+        {
+            // A = kernel [OC, IC], B = input[b] [IC, spatial], C = output[b] [OC, spatial].
+            var aSpan = new ReadOnlySpan<double>(kernel, outChannels * inChannels);
+            var bSpan = new ReadOnlySpan<double>(input + b * perBatchA, inChannels * spatial);
+            var cSpan = new Span<double>(output + b * perBatchC, outChannels * spatial);
+            SimdGemm.Dgemm(aSpan, bSpan, cSpan, outChannels, inChannels, spatial);
+        }
+    }
+
+    /// <summary>
+    /// Stage 5 (#415): 3×3 stride=2 FP64 direct conv. SIMD vectorizes
+    /// over input channels (per output cell, sum across IC is the inner
+    /// reduction). Padding handled per-cell. Used by ResNet bottleneck
+    /// transitions (5 layers per ResNet50 forward step).
+    /// </summary>
+    public static unsafe void Conv3x3Stride2Double(
+        double* input, double* kernel, double* output,
+        int batch, int inChannels, int height, int width,
+        int outChannels, int padH, int padW)
+    {
+        int outHeight = (height + 2 * padH - 3) / 2 + 1;
+        int outWidth = (width + 2 * padW - 3) / 2 + 1;
+        int outputSize = outHeight * outWidth;
+        int spatial = height * width;
+        bool useParallel = outputSize >= ParallelThreshold && Environment.ProcessorCount > 1;
+
+        for (int b = 0; b < batch; b++)
+        {
+            double* inputBatch = input + b * inChannels * spatial;
+            double* outputBatch = output + b * outChannels * outputSize;
+
+            void RunOc(int oc) => Conv3x3Stride2SingleOcDouble(
+                inputBatch, kernel + oc * inChannels * 9,
+                outputBatch + oc * outputSize,
+                inChannels, height, width, outHeight, outWidth, padH, padW);
+
+            if (useParallel) CpuParallelSettings.LightweightParallel(outChannels, RunOc);
+            else for (int oc = 0; oc < outChannels; oc++) RunOc(oc);
+        }
+    }
+
+    [MethodImpl(HotInline)]
+    private static unsafe void Conv3x3Stride2SingleOcDouble(
+        double* input, double* kernelOc, double* outputChannel,
+        int inChannels, int height, int width, int outHeight, int outWidth,
+        int padH, int padW)
+    {
+        int outputSize = outHeight * outWidth;
+        new Span<double>(outputChannel, outputSize).Clear();
+        int channelSpatial = height * width;
+
+        for (int oh = 0; oh < outHeight; oh++)
+        {
+            int ihBase = oh * 2 - padH;
+            for (int ow = 0; ow < outWidth; ow++)
+            {
+                int iwBase = ow * 2 - padW;
+                // Bounds-check the 3×3 window once.
+                int khStart = ihBase < 0 ? -ihBase : 0;
+                int khEnd = ihBase + 3 > height ? height - ihBase : 3;
+                int kwStart = iwBase < 0 ? -iwBase : 0;
+                int kwEnd = iwBase + 3 > width ? width - iwBase : 3;
+
+                // Inner channel-accumulation loop with Vector256<double> across IC.
+                double sum = 0.0;
+                int ic = 0;
+                if (inChannels >= 4)
+                {
+                    var vsum = Vector256<double>.Zero;
+                    for (; ic + 4 <= inChannels; ic += 4)
+                    {
+                        for (int kh = khStart; kh < khEnd; kh++)
+                        {
+                            int ih = ihBase + kh;
+                            for (int kw = kwStart; kw < kwEnd; kw++)
+                            {
+                                int iw = iwBase + kw;
+                                int kIdx = kh * 3 + kw;
+                                // Gather 4 IC values at the same (ih,iw).
+                                var vIn = Vector256.Create(
+                                    input[(ic + 0) * channelSpatial + ih * width + iw],
+                                    input[(ic + 1) * channelSpatial + ih * width + iw],
+                                    input[(ic + 2) * channelSpatial + ih * width + iw],
+                                    input[(ic + 3) * channelSpatial + ih * width + iw]);
+                                var vK = Vector256.Create(
+                                    kernelOc[(ic + 0) * 9 + kIdx],
+                                    kernelOc[(ic + 1) * 9 + kIdx],
+                                    kernelOc[(ic + 2) * 9 + kIdx],
+                                    kernelOc[(ic + 3) * 9 + kIdx]);
+                                vsum = Fma.MultiplyAdd(vIn, vK, vsum);
+                            }
+                        }
+                    }
+                    // Horizontal reduce.
+                    var lo = vsum.GetLower();
+                    var hi = vsum.GetUpper();
+                    var s = Sse2.Add(lo, hi);
+                    sum += s.GetElement(0) + s.GetElement(1);
+                }
+                for (; ic < inChannels; ic++)
+                {
+                    double* ip = input + ic * channelSpatial;
+                    double* kp = kernelOc + ic * 9;
+                    for (int kh = khStart; kh < khEnd; kh++)
+                    {
+                        int ih = ihBase + kh;
+                        for (int kw = kwStart; kw < kwEnd; kw++)
+                        {
+                            int iw = iwBase + kw;
+                            sum += ip[ih * width + iw] * kp[kh * 3 + kw];
+                        }
+                    }
+                }
+                outputChannel[oh * outWidth + ow] = sum;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Stage 5 (#415): 7×7 stride=2 FP64 direct conv. The ResNet50 stem
+    /// — one layer per forward step over [B,3,224,224] → [B,64,112,112].
+    /// SIMD vectorizes the inner 7-wide kernel row via two Vector256
+    /// loads (4 + 3 doubles per row). 49 muls/output cell vs the dense
+    /// im2col-then-Dgemm path that allocates a 49× scratch.
+    /// </summary>
+    public static unsafe void Conv7x7Stride2Double(
+        double* input, double* kernel, double* output,
+        int batch, int inChannels, int height, int width,
+        int outChannels, int padH, int padW)
+    {
+        int outHeight = (height + 2 * padH - 7) / 2 + 1;
+        int outWidth = (width + 2 * padW - 7) / 2 + 1;
+        int outputSize = outHeight * outWidth;
+        int spatial = height * width;
+        bool useParallel = outputSize >= ParallelThreshold && Environment.ProcessorCount > 1;
+
+        for (int b = 0; b < batch; b++)
+        {
+            double* inputBatch = input + b * inChannels * spatial;
+            double* outputBatch = output + b * outChannels * outputSize;
+
+            void RunOc(int oc) => Conv7x7Stride2SingleOcDouble(
+                inputBatch, kernel + oc * inChannels * 49,
+                outputBatch + oc * outputSize,
+                inChannels, height, width, outHeight, outWidth, padH, padW);
+
+            if (useParallel) CpuParallelSettings.LightweightParallel(outChannels, RunOc);
+            else for (int oc = 0; oc < outChannels; oc++) RunOc(oc);
+        }
+    }
+
+    [MethodImpl(HotInline)]
+    private static unsafe void Conv7x7Stride2SingleOcDouble(
+        double* input, double* kernelOc, double* outputChannel,
+        int inChannels, int height, int width, int outHeight, int outWidth,
+        int padH, int padW)
+    {
+        int outputSize = outHeight * outWidth;
+        new Span<double>(outputChannel, outputSize).Clear();
+        int channelSpatial = height * width;
+
+        for (int ic = 0; ic < inChannels; ic++)
+        {
+            double* inputChannel = input + ic * channelSpatial;
+            double* kernelChannel = kernelOc + ic * 49;
+            for (int oh = 0; oh < outHeight; oh++)
+            {
+                int ihBase = oh * 2 - padH;
+                for (int ow = 0; ow < outWidth; ow++)
+                {
+                    int iwBase = ow * 2 - padW;
+                    double sum = 0.0;
+                    int khStart = ihBase < 0 ? -ihBase : 0;
+                    int khEnd = ihBase + 7 > height ? height - ihBase : 7;
+                    int kwStart = iwBase < 0 ? -iwBase : 0;
+                    int kwEnd = iwBase + 7 > width ? width - iwBase : 7;
+
+                    // Inner loop over kh, kw — when full 7-wide row is in bounds
+                    // (no left/right pad), SIMD across kw with one Vector256+1 scalar.
+                    for (int kh = khStart; kh < khEnd; kh++)
+                    {
+                        int ih = ihBase + kh;
+                        double* iRow = inputChannel + ih * width;
+                        double* kRow = kernelChannel + kh * 7;
+                        if (kwStart == 0 && kwEnd == 7)
+                        {
+                            // SIMD: load 4 + load 4 (overlap last lane), 7 valid muls.
+                            var v0 = Avx.LoadVector256(iRow + iwBase);
+                            var v1 = Avx.LoadVector256(iRow + iwBase + 3);
+                            var k0 = Avx.LoadVector256(kRow);
+                            var k1 = Avx.LoadVector256(kRow + 3);
+                            var p0 = Avx.Multiply(v0, k0);
+                            var p1 = Avx.Multiply(v1, k1);
+                            // Sum p0 fully + p1 with first lane discarded (overlap).
+                            var lo0 = p0.GetLower(); var hi0 = p0.GetUpper();
+                            var s0 = Sse2.Add(lo0, hi0);
+                            sum += s0.GetElement(0) + s0.GetElement(1);
+                            // p1 covers kw {3,4,5,6} — but we already added kw 3
+                            // via v0/k0 (lane 3). Subtract that double-counted term.
+                            sum -= iRow[iwBase + 3] * kRow[3];
+                            var lo1 = p1.GetLower(); var hi1 = p1.GetUpper();
+                            var s1 = Sse2.Add(lo1, hi1);
+                            sum += s1.GetElement(0) + s1.GetElement(1);
+                        }
+                        else
+                        {
+                            for (int kw = kwStart; kw < kwEnd; kw++)
+                            {
+                                int iw = iwBase + kw;
+                                sum += iRow[iw] * kRow[kw];
+                            }
+                        }
+                    }
+                    outputChannel[oh * outWidth + ow] += sum;
+                }
+            }
+        }
     }
 
     /// <summary>
@@ -274,6 +558,295 @@ internal static class SimdConvHelper
     {
         for (int ow = 0; ow < outWidth; ow++)
             outputRow[ow] += ScalarConv3x3Double(input, kernel, height, width, oh, ow, padH, padW);
+    }
+
+    /// <summary>
+    /// #415 Phase B-2: direct backward-kernel for 3×3 / stride=1 / padding=1
+    /// FP64. Computes
+    ///   gradKernel[oc, ic, kh, kw] += sum_{b, oh, ow}
+    ///     gradOutput[b, oc, oh, ow] * input[b, ic, oh+kh-1, ow+kw-1]
+    /// directly (no im2col allocation) with AVX2/FMA Vector256&lt;double&gt;
+    /// vectorization along the contiguous ow dim. Parallelizes over oc so
+    /// per-thread work is well-defined and the small gradKernel output
+    /// (outC × inC × 9 doubles) lets us accumulate into the final
+    /// destination directly without per-batch staging buffers.
+    /// <para>
+    /// Caller (CpuEngine.Conv2DBackwardKernel double branch) gates this on
+    /// AVX2/FMA availability + the same FMA-budget / spatial-density rule
+    /// that the forward direct kernel uses. Caller passes <c>height</c>
+    /// and <c>outputHeight</c> separately because they're not strictly
+    /// equal for general s/p combinations — but for the 3×3/s=1/p=1
+    /// shape this kernel is gated on they ARE equal (outH = H, outW = W).
+    /// </para>
+    /// </summary>
+    public static unsafe void Conv3x3Stride1BackwardKernelDouble(
+        double[] gradOutput, double[] input, double[] gradKernel,
+        int batch, int inChannels, int outChannels,
+        int height, int width, int outHeight, int outWidth,
+        int padH, int padW)
+    {
+        if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (gradKernel == null) throw new ArgumentNullException(nameof(gradKernel));
+        if (padH != 1 || padW != 1) throw new ArgumentException("Phase B-2 kernel is specialized for padding=1.");
+        if (outHeight != height || outWidth != width)
+            throw new ArgumentException("Phase B-2 kernel requires outHeight==height and outWidth==width (the 3×3/s=1/p=1 invariant).");
+
+        Array.Clear(gradKernel, 0, outChannels * inChannels * 9);
+
+        int outputSize = outHeight * outWidth;
+        int gradOutBatchStride = outChannels * outputSize;
+        int inputBatchStride = inChannels * height * width;
+
+        // Parallel over outChannels: outC×inC pairs per task gives the
+        // right granularity to saturate workers without per-(oc,ic) task
+        // dispatch overhead. The inner ic loop benefits from input being
+        // hot in L2 if successive ic share a cache line.
+        bool useParallel = outChannels >= Math.Max(2, CpuParallelSettings.MaxDegreeOfParallelism);
+
+        if (useParallel)
+        {
+            fixed (double* pGradOutFix = gradOutput)
+            fixed (double* pInputFix = input)
+            fixed (double* pGradKernelFix = gradKernel)
+            {
+                IntPtr goPtr = (IntPtr)pGradOutFix;
+                IntPtr inPtr = (IntPtr)pInputFix;
+                IntPtr gkPtr = (IntPtr)pGradKernelFix;
+                int outChannelsCap = outChannels;
+                int inChannelsCap = inChannels;
+                int batchCap = batch;
+                int heightCap = height;
+                int widthCap = width;
+                int outHeightCap = outHeight;
+                int outWidthCap = outWidth;
+                int gradOutBatchStrideCap = gradOutBatchStride;
+                int inputBatchStrideCap = inputBatchStride;
+                int outputSizeCap = outputSize;
+                CpuParallelSettings.LightweightParallel(outChannels, oc =>
+                {
+                    Conv3x3BackwardKernelOneOcDouble(
+                        (double*)goPtr, (double*)inPtr, (double*)gkPtr,
+                        oc, batchCap, inChannelsCap, outChannelsCap,
+                        heightCap, widthCap, outHeightCap, outWidthCap,
+                        gradOutBatchStrideCap, inputBatchStrideCap, outputSizeCap);
+                });
+            }
+        }
+        else
+        {
+            fixed (double* pGradOut = gradOutput)
+            fixed (double* pInput = input)
+            fixed (double* pGradKernel = gradKernel)
+            {
+                for (int oc = 0; oc < outChannels; oc++)
+                {
+                    Conv3x3BackwardKernelOneOcDouble(
+                        pGradOut, pInput, pGradKernel,
+                        oc, batch, inChannels, outChannels,
+                        height, width, outHeight, outWidth,
+                        gradOutBatchStride, inputBatchStride, outputSize);
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Computes gradKernel[oc, :, :, :] (all inChannels × 9 entries for one
+    /// output channel) by summing over (b, oh, ow). Split-oh, split-ow
+    /// SIMD: the (oh, ow) iteration space is partitioned into 3 oh-bands
+    /// (top boundary / interior / bottom boundary) × 3 ow-bands
+    /// (left / interior / right) — 9 cells total. The dominant
+    /// (interior-oh × interior-ow) cell runs branch-free with manual
+    /// AVX2/FMA Vector256&lt;double&gt; (4-wide ow) and 9 vector
+    /// accumulators per (oc, ic). Boundary cells (3% of work at typical
+    /// 224×224 spatials) are scalar.
+    /// </summary>
+    [MethodImpl(HotInline)]
+    private static unsafe void Conv3x3BackwardKernelOneOcDouble(
+        double* gradOutput, double* input, double* gradKernel,
+        int oc, int batch, int inChannels, int outChannels,
+        int height, int width, int outHeight, int outWidth,
+        int gradOutBatchStride, int inputBatchStride, int outputSize)
+    {
+        // gradKernel layout: [oc, ic, kh, kw] → flat index = ((oc*inC + ic)*3 + kh)*3 + kw
+        double* gkOcBase = gradKernel + oc * inChannels * 9;
+
+        // Interior column range (ow where all 3 kw positions are in
+        // bounds): [1, outWidth - 1). SIMD chunk size = 4 doubles.
+        int interiorWStart = 1;
+        int interiorWEnd = outWidth - 1;
+        int interiorWSpan = (interiorWEnd > interiorWStart) ? interiorWEnd - interiorWStart : 0;
+        int simdSteps = interiorWSpan / 4;
+        int simdEnd = interiorWStart + simdSteps * 4;
+        bool useSimd = UseAvx2 && UseFma && simdSteps > 0;
+
+        // Interior row range (oh where all 3 kh positions are in bounds):
+        // [1, outHeight - 1).
+        int interiorOhStart = 1;
+        int interiorOhEnd = outHeight - 1;
+
+        for (int ic = 0; ic < inChannels; ic++)
+        {
+            // 9 SIMD accumulators (interior contributions) + 9 scalar
+            // accumulators (boundary contributions). Final result merges
+            // the horizontal sums with the scalars.
+            Vector256<double> v00 = Vector256<double>.Zero, v01 = Vector256<double>.Zero, v02 = Vector256<double>.Zero;
+            Vector256<double> v10 = Vector256<double>.Zero, v11 = Vector256<double>.Zero, v12 = Vector256<double>.Zero;
+            Vector256<double> v20 = Vector256<double>.Zero, v21 = Vector256<double>.Zero, v22 = Vector256<double>.Zero;
+            double a00 = 0, a01 = 0, a02 = 0;
+            double a10 = 0, a11 = 0, a12 = 0;
+            double a20 = 0, a21 = 0, a22 = 0;
+
+            for (int b = 0; b < batch; b++)
+            {
+                double* goBase = gradOutput + b * gradOutBatchStride + oc * outputSize;
+                double* inBase = input + b * inputBatchStride + ic * height * width;
+
+                // ============================================================
+                // Top boundary row (oh = 0): kh=0 (ih=-1) invalid; only the
+                // mid + bot rows contribute. Always scalar (single row,
+                // boundary handling is cheap relative to interior).
+                // ============================================================
+                if (outHeight > 0)
+                {
+                    double* goRow = goBase;
+                    double* inMid = inBase;                  // ih = 0
+                    bool botValid0 = outHeight > 1;
+                    double* inBot = botValid0 ? inBase + width : null;
+                    for (int ow = 0; ow < outWidth; ow++)
+                    {
+                        double g = goRow[ow];
+                        bool leftValid = ow >= 1;
+                        bool rightValid = ow < outWidth - 1;
+                        if (leftValid)  a10 += g * inMid[ow - 1];
+                                        a11 += g * inMid[ow];
+                        if (rightValid) a12 += g * inMid[ow + 1];
+                        if (botValid0)
+                        {
+                            if (leftValid)  a20 += g * inBot[ow - 1];
+                                            a21 += g * inBot[ow];
+                            if (rightValid) a22 += g * inBot[ow + 1];
+                        }
+                    }
+                }
+
+                // ============================================================
+                // Interior rows (oh ∈ [1, outHeight - 1)): all 3 kh
+                // positions are in bounds. Each row is split into
+                // (left boundary col, SIMD interior, scalar interior tail,
+                // right boundary col). The SIMD inner is BRANCH-FREE — 9
+                // unconditional Vector256<double> FMAs per 4-wide ow chunk.
+                // ============================================================
+                for (int oh = interiorOhStart; oh < interiorOhEnd; oh++)
+                {
+                    double* goRow = goBase + oh * outWidth;
+                    double* inTop = inBase + (oh - 1) * width;
+                    double* inMid = inBase + oh * width;
+                    double* inBot = inBase + (oh + 1) * width;
+
+                    // Left boundary col (ow=0): kw=0 (iw=-1) invalid.
+                    if (outWidth > 0)
+                    {
+                        double g = goRow[0];
+                        a01 += g * inTop[0]; if (outWidth > 1) a02 += g * inTop[1];
+                        a11 += g * inMid[0]; if (outWidth > 1) a12 += g * inMid[1];
+                        a21 += g * inBot[0]; if (outWidth > 1) a22 += g * inBot[1];
+                    }
+
+                    // Interior SIMD: ow ∈ [interiorWStart, simdEnd) step 4,
+                    // all 9 positions in bounds. Branch-free hot path.
+                    int ow2 = interiorWStart;
+                    if (useSimd)
+                    {
+                        for (; ow2 < simdEnd; ow2 += 4)
+                        {
+                            int iwLeft = ow2 - 1;
+                            Vector256<double> g = Avx.LoadVector256(goRow + ow2);
+
+                            v00 = Fma.MultiplyAdd(g, Avx.LoadVector256(inTop + iwLeft),     v00);
+                            v01 = Fma.MultiplyAdd(g, Avx.LoadVector256(inTop + ow2),        v01);
+                            v02 = Fma.MultiplyAdd(g, Avx.LoadVector256(inTop + ow2 + 1),    v02);
+
+                            v10 = Fma.MultiplyAdd(g, Avx.LoadVector256(inMid + iwLeft),     v10);
+                            v11 = Fma.MultiplyAdd(g, Avx.LoadVector256(inMid + ow2),        v11);
+                            v12 = Fma.MultiplyAdd(g, Avx.LoadVector256(inMid + ow2 + 1),    v12);
+
+                            v20 = Fma.MultiplyAdd(g, Avx.LoadVector256(inBot + iwLeft),     v20);
+                            v21 = Fma.MultiplyAdd(g, Avx.LoadVector256(inBot + ow2),        v21);
+                            v22 = Fma.MultiplyAdd(g, Avx.LoadVector256(inBot + ow2 + 1),    v22);
+                        }
+                    }
+
+                    // Scalar tail (ow ∈ [simdEnd, interiorWEnd)).
+                    for (; ow2 < interiorWEnd; ow2++)
+                    {
+                        double g = goRow[ow2];
+                        int iwLeft = ow2 - 1, iwRight = ow2 + 1;
+                        a00 += g * inTop[iwLeft]; a01 += g * inTop[ow2]; a02 += g * inTop[iwRight];
+                        a10 += g * inMid[iwLeft]; a11 += g * inMid[ow2]; a12 += g * inMid[iwRight];
+                        a20 += g * inBot[iwLeft]; a21 += g * inBot[ow2]; a22 += g * inBot[iwRight];
+                    }
+
+                    // Right boundary col (ow=outWidth-1): kw=2 (iw=outWidth) invalid.
+                    if (outWidth > 1)
+                    {
+                        int owLast = outWidth - 1;
+                        double g = goRow[owLast];
+                        a00 += g * inTop[owLast - 1]; a01 += g * inTop[owLast];
+                        a10 += g * inMid[owLast - 1]; a11 += g * inMid[owLast];
+                        a20 += g * inBot[owLast - 1]; a21 += g * inBot[owLast];
+                    }
+                }
+
+                // ============================================================
+                // Bottom boundary row (oh = outHeight - 1): kh=2 (ih=outH)
+                // invalid; only top + mid contribute. Always scalar.
+                // ============================================================
+                if (outHeight > 1)
+                {
+                    int oh = outHeight - 1;
+                    double* goRow = goBase + oh * outWidth;
+                    double* inTop = inBase + (oh - 1) * width;
+                    double* inMid = inBase + oh * width;
+                    for (int ow = 0; ow < outWidth; ow++)
+                    {
+                        double g = goRow[ow];
+                        bool leftValid = ow >= 1;
+                        bool rightValid = ow < outWidth - 1;
+                        if (leftValid)  a00 += g * inTop[ow - 1];
+                                        a01 += g * inTop[ow];
+                        if (rightValid) a02 += g * inTop[ow + 1];
+                        if (leftValid)  a10 += g * inMid[ow - 1];
+                                        a11 += g * inMid[ow];
+                        if (rightValid) a12 += g * inMid[ow + 1];
+                    }
+                }
+            }
+
+            // Horizontal-sum the SIMD accumulators and combine with the
+            // boundary scalars to produce the 9 final kernel-gradient
+            // entries for this (oc, ic).
+            double* gkIcBase = gkOcBase + ic * 9;
+            gkIcBase[0] = a00 + HorizontalSumDouble(v00);
+            gkIcBase[1] = a01 + HorizontalSumDouble(v01);
+            gkIcBase[2] = a02 + HorizontalSumDouble(v02);
+            gkIcBase[3] = a10 + HorizontalSumDouble(v10);
+            gkIcBase[4] = a11 + HorizontalSumDouble(v11);
+            gkIcBase[5] = a12 + HorizontalSumDouble(v12);
+            gkIcBase[6] = a20 + HorizontalSumDouble(v20);
+            gkIcBase[7] = a21 + HorizontalSumDouble(v21);
+            gkIcBase[8] = a22 + HorizontalSumDouble(v22);
+        }
+    }
+
+    [MethodImpl(HotInline)]
+    private static double HorizontalSumDouble(Vector256<double> v)
+    {
+        var lo = v.GetLower();          // lanes [0, 1]
+        var hi = v.GetUpper();          // lanes [2, 3]
+        var pair = Sse2.Add(lo, hi);    // [0+2, 1+3]
+        return pair.GetElement(0) + pair.GetElement(1);
     }
 
     /// <summary>
