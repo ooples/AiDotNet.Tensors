@@ -439,7 +439,7 @@ internal static class BackwardFunctions<T>
         // collapsing the leading batch dims into Mflat and dispatching
         // SimdGemm.Sgemm directly with transA/transB flags eliminates the
         // 2 transposes per call and the engine-dispatch overhead.
-        bool floatFastPathEligible = typeof(T) == typeof(float)
+        bool rank3FastPathEligible = (typeof(T) == typeof(float) || typeof(T) == typeof(double))
             && inputs[1].Rank == 2
             && inputs[0].Rank >= 2
             && inputs[0].IsContiguous
@@ -447,7 +447,7 @@ internal static class BackwardFunctions<T>
             && gradOutput.IsContiguous
             && GradientTape<T>.Current is null;
 
-        if (floatFastPathEligible)
+        if (rank3FastPathEligible)
         {
             int aRank = inputs[0].Rank;
             int Mflat = 1;
@@ -457,39 +457,78 @@ internal static class BackwardFunctions<T>
 
             if ((long)Mflat * K * N >= MatMulBackwardFastPathMinWork)
             {
-                var dCArr = (gradOutput as Tensor<float>)?.GetDataArray();
-                var aArr = (inputs[0] as Tensor<float>)?.GetDataArray();
-                var bArr = (inputs[1] as Tensor<float>)?.GetDataArray();
+                long backwardWork = (long)Mflat * K * N;
 
-                if (dCArr is not null && aArr is not null && bArr is not null)
+                if (typeof(T) == typeof(float))
                 {
-                    long backwardWork = (long)Mflat * K * N;
-                    bool tryBlas = backwardWork < MatMulBackwardSimdThreshold && BlasProvider.IsAvailable;
-                    if (backwardWork >= MatMulBackwardSimdThreshold || tryBlas)
+                    var dCArr = (gradOutput as Tensor<float>)?.GetDataArray();
+                    var aArr = (inputs[0] as Tensor<float>)?.GetDataArray();
+                    var bArr = (inputs[1] as Tensor<float>)?.GetDataArray();
+
+                    if (dCArr is not null && aArr is not null && bArr is not null)
                     {
-                        // Defer rentals until we know a fast path will use them.
+                        bool tryBlas = backwardWork < MatMulBackwardSimdThreshold && BlasProvider.IsAvailable;
+                        if (backwardWork >= MatMulBackwardSimdThreshold || tryBlas)
+                        {
+                            var gradATensor = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[0]._shape);
+                            var gradBTensor = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[1]._shape);
+                            var gradAData = (float[])(object)gradATensor.GetDataArray();
+                            var gradBData = (float[])(object)gradBTensor.GetDataArray();
+
+                            if (backwardWork >= MatMulBackwardSimdThreshold)
+                            {
+                                // gradA[Mflat,K] = dC[Mflat,N] · Bᵀ[N,K]. Contiguous
+                                // leading-dim collapse lets us treat the rank-3 input
+                                // as rank-2 [Mflat, K] (same memory layout).
+                                SimdGemm.Sgemm(dCArr, N, false, bArr, N, true,
+                                    gradAData.AsSpan(0, Mflat * K), Mflat, N, K);
+                                // gradB[K,N] = Aᵀ[K,Mflat] · dC[Mflat,N].
+                                SimdGemm.Sgemm(aArr, K, true, dCArr, N, false,
+                                    gradBData.AsSpan(0, K * N), K, Mflat, N);
+
+                                DifferentiableOps.AccumulateGrad(grads, inputs[0], gradATensor, engine);
+                                DifferentiableOps.AccumulateGrad(grads, inputs[1], gradBTensor, engine);
+                                return;
+                            }
+
+                            // BLAS fast path:
+                            bool okA = BlasProvider.TryGemmEx(Mflat, K, N,
+                                dCArr, 0, N, false, bArr, 0, N, true, gradAData, 0, K);
+                            bool okB = BlasProvider.TryGemmEx(K, N, Mflat,
+                                aArr, 0, K, true, dCArr, 0, N, false, gradBData, 0, N);
+
+                            if (okA && okB)
+                            {
+                                DifferentiableOps.AccumulateGrad(grads, inputs[0], gradATensor, engine);
+                                DifferentiableOps.AccumulateGrad(grads, inputs[1], gradBTensor, engine);
+                                return;
+                            }
+                            // BLAS refused — return buffers before falling through.
+                            AutoTensorCache.Return(gradATensor);
+                            AutoTensorCache.Return(gradBTensor);
+                        }
+                    }
+                }
+                else // double
+                {
+                    // Issue #433 phase-2: extend rank-3 fast path to double via
+                    // BlasProvider.TryGemmEx's double overload + transA/transB.
+                    // SimdGemm has no Dgemm-with-transA variant yet, so this
+                    // path is BLAS-only. When BLAS isn't available the call
+                    // falls through to the rank-3 path below (which still
+                    // works for double, just allocates 2 transposes per call).
+                    var dCArr = (gradOutput as Tensor<double>)?.GetDataArray();
+                    var aArr = (inputs[0] as Tensor<double>)?.GetDataArray();
+                    var bArr = (inputs[1] as Tensor<double>)?.GetDataArray();
+
+                    if (dCArr is not null && aArr is not null && bArr is not null
+                        && BlasProvider.IsAvailable)
+                    {
                         var gradATensor = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[0]._shape);
                         var gradBTensor = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[1]._shape);
-                        var gradAData = (float[])(object)gradATensor.GetDataArray();
-                        var gradBData = (float[])(object)gradBTensor.GetDataArray();
+                        var gradAData = (double[])(object)gradATensor.GetDataArray();
+                        var gradBData = (double[])(object)gradBTensor.GetDataArray();
 
-                        if (backwardWork >= MatMulBackwardSimdThreshold)
-                        {
-                            // gradA[Mflat,K] = dC[Mflat,N] · Bᵀ[N,K]. Contiguous
-                            // leading-dim collapse lets us treat the rank-3 input
-                            // as rank-2 [Mflat, K] (same memory layout).
-                            SimdGemm.Sgemm(dCArr, N, false, bArr, N, true,
-                                gradAData.AsSpan(0, Mflat * K), Mflat, N, K);
-                            // gradB[K,N] = Aᵀ[K,Mflat] · dC[Mflat,N].
-                            SimdGemm.Sgemm(aArr, K, true, dCArr, N, false,
-                                gradBData.AsSpan(0, K * N), K, Mflat, N);
-
-                            DifferentiableOps.AccumulateGrad(grads, inputs[0], gradATensor, engine);
-                            DifferentiableOps.AccumulateGrad(grads, inputs[1], gradBTensor, engine);
-                            return;
-                        }
-
-                        // BLAS fast path:
                         bool okA = BlasProvider.TryGemmEx(Mflat, K, N,
                             dCArr, 0, N, false, bArr, 0, N, true, gradAData, 0, K);
                         bool okB = BlasProvider.TryGemmEx(K, N, Mflat,
@@ -501,7 +540,6 @@ internal static class BackwardFunctions<T>
                             DifferentiableOps.AccumulateGrad(grads, inputs[1], gradBTensor, engine);
                             return;
                         }
-                        // BLAS refused — return buffers before falling through.
                         AutoTensorCache.Return(gradATensor);
                         AutoTensorCache.Return(gradBTensor);
                     }
