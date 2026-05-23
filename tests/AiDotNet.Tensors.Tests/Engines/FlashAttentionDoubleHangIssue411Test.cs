@@ -101,6 +101,9 @@ public class FlashAttentionDoubleHangIssue411Test
         var sw = Stopwatch.StartNew();
         var _r = engine.FlashAttention<double>(q, k, v, scale: null, isCausal: false, out _);
         sw.Stop();
+        // Confirm the timed call actually produced output — proves it completed,
+        // not merely that it returned quickly (mirrors the warmup NotNull check).
+        Assert.NotNull(_r);
         double msPerCall = sw.Elapsed.TotalMilliseconds;
         _output.WriteLine($"FlashAttention<double> [1, 8, 1024, 80]: {msPerCall:F1} ms/call (1 timed iter after warmup)");
 
