@@ -71,9 +71,21 @@ public class PackAOnlyNAxisParallelTest
             Assert.Equal(cSerial[i], cParallel[i]);
     }
 
-    [Fact]
+    [SkippableFact]
     public void PackAOnly_NAxisParallel_Delivers_Speedup_On_Wide_N()
     {
+        // Per-thread overhead dominates on low-core hosts: the parallel
+        // configuration spawns NumThreads=8 even when the box only has 2-4
+        // physical cores, so the parallel path loses to the serial baseline
+        // (CI run 26304260634 measured 0.30x on a 4-vCPU runner). The
+        // contract this test pins is "parallel pack-A wins on adequately
+        // multi-core hardware"; gate to >=8 cores so we don't false-positive
+        // on undersized CI runners. Bit-exactness vs serial is covered by
+        // the unconditional [Fact] siblings above, so undersized-runner
+        // skip doesn't lose any correctness coverage.
+        Skip.IfNot(Environment.ProcessorCount >= 8,
+            $"Requires >=8 logical processors for NumThreads=8 to deliver speedup; have {Environment.ProcessorCount}.");
+
         // Need M < procs*mr*2 so AxisSelector picks N over M. With procs=8 and
         // PackAOnly's Mr=4, the M-axis threshold is 64; using M=32 forces N.
         const int M = 32, N = 4096, K = 64;
