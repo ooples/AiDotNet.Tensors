@@ -11802,13 +11802,22 @@ KERNEL VARIANTS (A/B testing):
             _dynamicGemm?.Dispose();
             _bufferPool.Dispose();
 
-            foreach (var kernel in _kernelCache.Values)
+            // Snapshot both collections to arrays before disposing their members.
+            // A child's Dispose() (or a concurrent GPU finalizer under load) can
+            // mutate the backing _kernelCache / _programs collection, which would
+            // throw "Collection was modified" if we enumerated the live view.
+            // Snapshotting decouples iteration from any such mutation, then we
+            // clear the originals once.
+            var kernels = new DirectOpenClKernel[_kernelCache.Count];
+            _kernelCache.Values.CopyTo(kernels, 0);
+            foreach (var kernel in kernels)
             {
                 kernel.Dispose();
             }
             _kernelCache.Clear();
 
-            foreach (var program in _programs)
+            var programs = _programs.ToArray();
+            foreach (var program in programs)
             {
                 program.Dispose();
             }
