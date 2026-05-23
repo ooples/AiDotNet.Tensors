@@ -34,7 +34,22 @@ public sealed class AutotuneWarmupTests : IDisposable
         // CI runner that preset the var loses its setting after the first
         // test runs. Save-and-restore matches AutotuneCacheTests.
         _originalEnv = Environment.GetEnvironmentVariable(EnvVar);
+
+        // Establish a DETERMINISTIC catalog. WarmupCommonKernelsAsync /
+        // WarmupCategoryAsync always call BuiltInCatalog.EnsureRegistered()
+        // internally, which lazily (and idempotently, latched on _registered)
+        // injects the shipped SGEMM + SPARSE_MM entries. A bare Clear() leaves
+        // that latch at 0 for the FIRST warmup test to run in the process, so
+        // its warmup re-seeds the two built-ins and inflates KernelsWarmed
+        // (e.g. SingleEntry saw 2 instead of 1, depending on test order).
+        //
+        // Force the built-ins to register (latching _registered = 1) and THEN
+        // clear the catalog: because the latch stays set, the warmup APIs'
+        // EnsureRegistered() becomes a no-op and every test sees exactly the
+        // entries it registers — order-independent.
+        BuiltInCatalog.EnsureRegistered();
         AutotuneKernelCatalog.Clear();
+
         _tempRoot = Path.Combine(
             Path.GetTempPath(),
             "aidotnet-autotune-test-" + Guid.NewGuid().ToString("N"));
@@ -45,6 +60,10 @@ public sealed class AutotuneWarmupTests : IDisposable
     {
         Environment.SetEnvironmentVariable(EnvVar, _originalEnv);
         AutotuneKernelCatalog.Clear();
+        // Restore the pristine "built-ins not yet registered" latch so a later
+        // consumer (or test class) re-seeds them on its first warmup, instead
+        // of inheriting our emptied-and-latched catalog.
+        BuiltInCatalog.ResetRegistrationForTests();
         try
         {
             if (Directory.Exists(_tempRoot)) Directory.Delete(_tempRoot, recursive: true);

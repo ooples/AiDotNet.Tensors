@@ -344,10 +344,12 @@ public static class AutotuneCache
         IProgress<string>? progress = null,
         CancellationToken ct = default)
     {
-        // Lazy register built-in entries (GEMM variant select, …) the first
-        // time any warmup runs. Tests that Clear() the catalog don't get
-        // re-seeded automatically — they call BuiltInCatalog.EnsureRegistered
-        // or accept an empty catalog.
+        // Lazy-register built-in entries (GEMM variant select, …) the first
+        // time any warmup runs. This is idempotent — latched on
+        // BuiltInCatalog._registered — so a process only ever benchmarks the
+        // shipped kernels once. NOTE: a test that Clear()s the catalog WILL be
+        // re-seeded here unless it also latches the registration (call
+        // EnsureRegistered then Clear); see AutotuneWarmupTests' fixture.
         BuiltInCatalog.EnsureRegistered();
         return WarmupInternalAsync(
             AutotuneKernelCatalog.Entries,
