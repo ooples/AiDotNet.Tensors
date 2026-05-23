@@ -227,9 +227,21 @@ public sealed class TensorArena : IDisposable
     /// </summary>
     public void Reset()
     {
-        // Rewind all cursors to 0 — arrays and tensors stay pooled
-        foreach (var key in _cursor.Keys)
-            _cursor[key] = 0;
+        // Rewind all cursors to 0 — arrays and tensors stay pooled.
+        // NOTE: must snapshot the keys before mutating. On .NET Framework
+        // (net471), Dictionary<,>.this[key] = value increments the collection
+        // version even when updating an EXISTING key, so iterating
+        // _cursor.Keys while assigning _cursor[key] throws "Collection was
+        // modified". (.NET Core / net5+ doesn't bump version on update, which
+        // is why this only reproduced on the net471 TFM.)
+        int n = _cursor.Count;
+        if (n > 0)
+        {
+            var keys = new (Type, int)[n];
+            _cursor.Keys.CopyTo(keys, 0);
+            for (int i = 0; i < n; i++)
+                _cursor[keys[i]] = 0;
+        }
         // Reset flat tensor ring cursors
         if (_tensorRingCursors != null)
         {
