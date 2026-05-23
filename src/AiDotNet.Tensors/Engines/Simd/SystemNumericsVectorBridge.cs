@@ -1074,6 +1074,23 @@ internal static class SystemNumericsVectorBridge
         return result;
     }
 
+    /// <summary>sigmoid(x) = 1/(1+exp(-x)) for one BCL <see cref="Vector{Single}"/> block.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static Vector<float> FastSigmoid(Vector<float> x)
+    {
+        var one = new Vector<float>(1.0f);
+        return one / (one + FastExp(-x));
+    }
+
+    /// <summary>tanh(x) = 2*sigmoid(2x) - 1 for one BCL <see cref="Vector{Single}"/> block.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static Vector<float> FastTanh(Vector<float> x)
+    {
+        var one = new Vector<float>(1.0f);
+        var two = new Vector<float>(2.0f);
+        return two / (one + FastExp(-two * x)) - one;
+    }
+
     // ---- span-level transcendental ops -------------------------------------
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
