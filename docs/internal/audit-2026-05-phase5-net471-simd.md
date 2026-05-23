@@ -15,7 +15,8 @@
 | 3a | NchwcPool: MaxPool / AvgPool / GlobalAvgPool | ✅ |
 | 3b | NchwcBatchNorm: NCHWc8 + NCHW inference | ✅ |
 | 3c | NchwcConv2D: forward (was hard-disabled on net471) | ✅ |
-| 4 | SimdGemm micro-kernel unroll | see §C |
+| 3d | FusedKernels: Swish/GELU/Mish/AddReLU/SigmoidMul/RMSNorm/LayerNorm/Softmax/LogSoftmax/BatchNorm | ✅ |
+| 4 | SimdGemm micro-kernel | already vectorized — see §C |
 
 ## Problem
 
@@ -113,9 +114,9 @@ The original deferral claimed the 8-channel-block assumption blocked a portable 
 
 ## Still deferred — with concrete technical reasons
 
-### C. GEMM micro-kernel unroll (SimdGemm / SimdGemmDouble)
+### C. GEMM micro-kernel (SimdGemm / SimdGemmDouble) — already vectorized
 
-SimdGemm.cs already uses `Vector<float>` on net471 for the column-wise accumulator at line 1329, but the outer loop structure assumes hand-unrolled 6×16 / 4×8 micro-kernels matched to AVX2 register pressure. Adapting the unroll factor to `Vector<float>.Count` is substantial and the existing partial `Vector<float>` path already provides the dominant win. Tracked as slice 4; land if net471 GEMM profiling shows a remaining bottleneck.
+Investigated: SimdGemm's net471 path (`SgemmVector`, line 1313) is **already** a fully `Vector<float>`-vectorized axpy-over-N kernel with a 4×-unrolled inner loop — a prior PR closed this (the method's own doc-comment notes net471 previously fell to scalar and now reaches "~8× over scalar on AVX2"). The net5 hand-unrolled 6×16 / 4×8 micro-kernels are an *additional* optimization on top, gated on `Avx2.IsSupported`, that targets specific small-matmul shapes; porting their exact unroll geometry to BCL `Vector<T>` would yield marginal gains over `SgemmVector` and risks regressing the tuned net5 path. No action needed — GEMM is not a net471 scalar-fallback gap.
 
 ### D. Math primitives Floor / Ceiling / Frac / Sin / Cos / Log2 / Pow
 
@@ -125,17 +126,16 @@ SimdGemm.cs already uses `Vector<float>` on net471 for the column-wise accumulat
 
 Now unblocked by slice 2's transcendentals; wire in a follow-up. The `*_Half` variants additionally need a `Vector<float>`-from-`Half` widening path.
 
-## Cumulative impact
+## Cumulative impact (delivered on this branch)
 
-| Phase | Primitives wired | Net471 ops at AVX2 speed |
-|-------|------------------|--------------------------|
-| Pre-phase 5 | 0 of 200 SimdKernels.cs ops | 0% |
-| **This PR (foundation + slice 1)** | **34 of 200** | **~75% of training-loop call-volume** |
-| + slice 2 (transcendentals) | +20 | ~92% |
-| + slice 3 (NCHWc8) | +15 | ~98% |
-| + slice 4 (GEMM) | +5 | ~100% |
+| Slice | What it added | Net471 coverage |
+|-------|---------------|-----------------|
+| Pre-phase 5 | — | 0% (everything scalar except GEMM) |
+| Foundation + 1 | 34 SimdKernels elementwise/scalar/reduction ops | dense-layer hot path |
+| 2 | exp/log/sigmoid/tanh/elu/gelu (+swish/mish transitive) | + all activations |
+| 3a–3d | pool, batchnorm, conv2d, fused pointwise/norm/softmax | + CNN + transformer blocks |
 
-The 75% figure reflects that the wired primitives are precisely the hot path of dense-layer training: VectorAdd / Multiply / ScalarMultiplyAdd / Sum / DotProduct / ReLU dominate every Adam/SGD step. Transcendentals are called ~10× less than these algebraic ops in typical workloads.
+Combined, the wired surface covers the full forward inference path of CNNs (conv → BN → ReLU/activation → pool) and transformers (matmul → LayerNorm → softmax → fused activations), plus the dense-layer training inner loop (Add/Multiply/ScalarMultiplyAdd/Sum/Dot). GEMM was already vectorized (§C). The net471 build now uses AVX2 throughput across essentially every op a typical model exercises at inference, and the dense + activation ops at training.
 
 ## Constraints honored
 
