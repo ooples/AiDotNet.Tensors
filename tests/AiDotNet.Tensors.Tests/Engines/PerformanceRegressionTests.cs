@@ -344,14 +344,16 @@ public class PerformanceRegressionTests
         var wIh   = Tensor<float>.CreateRandom(4 * hidden, inFeatures);
         var wHh   = Tensor<float>.CreateRandom(4 * hidden, hidden);
 
-        var cpu = (AiDotNet.Tensors.Engines.CpuEngine)_engine;
+        // LstmSequenceForward is on IEngine (the float fast path lives in
+        // CpuEngine and is picked up by DirectGpuTensorEngine via inheritance),
+        // so no downcast needed.
         for (int w = 0; w < 3; w++)
-            _ = cpu.LstmSequenceForward(input, null, null, wIh, wHh, null, null);
+            _ = _engine.LstmSequenceForward(input, null, null, wIh, wHh, null, null);
 
         var sw = Stopwatch.StartNew();
         const int iters = 10;
         for (int i = 0; i < iters; i++)
-            _ = cpu.LstmSequenceForward(input, null, null, wIh, wHh, null, null);
+            _ = _engine.LstmSequenceForward(input, null, null, wIh, wHh, null, null);
         sw.Stop();
         double ms = sw.Elapsed.TotalMilliseconds / iters;
 
@@ -375,14 +377,16 @@ public class PerformanceRegressionTests
         var vW = Tensor<float>.CreateRandom(dModel, dModel);
         var oW = Tensor<float>.CreateRandom(dModel, dModel);
 
-        var cpu = (AiDotNet.Tensors.Engines.CpuEngine)_engine;
+        // MultiHeadAttentionForward is on IEngine (the float fast path lives in
+        // CpuEngine and is picked up by DirectGpuTensorEngine via inheritance),
+        // so no downcast needed.
         for (int w = 0; w < 3; w++)
-            _ = cpu.MultiHeadAttentionForward(input, qW, kW, vW, oW, numHeads);
+            _ = _engine.MultiHeadAttentionForward(input, qW, kW, vW, oW, numHeads);
 
         var sw = Stopwatch.StartNew();
         const int iters = 10;
         for (int i = 0; i < iters; i++)
-            _ = cpu.MultiHeadAttentionForward(input, qW, kW, vW, oW, numHeads);
+            _ = _engine.MultiHeadAttentionForward(input, qW, kW, vW, oW, numHeads);
         sw.Stop();
         double ms = sw.Elapsed.TotalMilliseconds / iters;
 
