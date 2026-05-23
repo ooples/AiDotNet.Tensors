@@ -12,6 +12,7 @@
 | Foundation | bridge skeleton + `VectorAdd` proof-of-concept | ✅ |
 | 1 | SimdKernels elementwise / scalar / reduction (34 methods, float+double) | ✅ |
 | 2 | transcendentals: Cephes `Vector<float>` exp/log → Exp, Log, Sigmoid, Tanh, ELU, GELU (Swish/Mish transitive) | ✅ |
+| 2b | math: `Vector<float>` Sin / Cos / Pow | ✅ |
 | 3a | NchwcPool: MaxPool / AvgPool / GlobalAvgPool | ✅ |
 | 3b | NchwcBatchNorm: NCHWc8 + NCHW inference | ✅ |
 | 3c | NchwcConv2D: forward (was hard-disabled on net471) | ✅ |
@@ -118,9 +119,11 @@ The original deferral claimed the 8-channel-block assumption blocked a portable 
 
 Investigated: SimdGemm's net471 path (`SgemmVector`, line 1313) is **already** a fully `Vector<float>`-vectorized axpy-over-N kernel with a 4×-unrolled inner loop — a prior PR closed this (the method's own doc-comment notes net471 previously fell to scalar and now reaches "~8× over scalar on AVX2"). The net5 hand-unrolled 6×16 / 4×8 micro-kernels are an *additional* optimization on top, gated on `Avx2.IsSupported`, that targets specific small-matmul shapes; porting their exact unroll geometry to BCL `Vector<T>` would yield marginal gains over `SgemmVector` and risks regressing the tuned net5 path. No action needed — GEMM is not a net471 scalar-fallback gap.
 
-### D. Math primitives Floor / Ceiling / Frac / Sin / Cos / Log2 / Pow
+### D. Math primitives — Sin/Cos/Pow DONE (slice 2b); Floor/Ceiling/Frac/Log2 remain
 
-`Floor`/`Ceiling`/`Frac` have no `Vector<T>` BCL primitive before .NET 7 (`Vector.Floor` is .NET 7+) and the integer-truncate-and-correct trick used for exp's range reduction would need per-call masking that erodes the win. `Sin`/`Cos` would need their own polynomial ports (the bridge now has the exp/log machinery to model them on); `Pow` = `exp(y·log(x))` could compose the new bridge primitives. These are the lowest-call-volume ops in training and remain scalar on net471 for now.
+`Sin`/`Cos` (Cephes 2/π-reduction minimax port) and `Pow` (= `exp(exp·log(x))`) are now wired (slice 2b), with huge-magnitude / non-positive-base blocks routed to libm per the net10 gates.
+
+`Floor`/`Ceiling`/`Frac` stay scalar: the BCL has no `Vector<T>.Floor` before .NET 7 (`Vector.Floor` is .NET 7+), and the convert-to-int-truncate-and-correct trick needs per-call sign masking that erodes the win for these low-call-volume ops. `Log2` = `Log(x) · 1.4426950408` could compose the bridge `FastLog` if a caller ever shows it hot.
 
 ### E. Backward-pass primitives (SoftmaxBackward, LayerNormBackward, GELUBackward, BatchNormBackward, *_Half variants)
 
