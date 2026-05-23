@@ -139,10 +139,12 @@ public class SystemNumericsVectorBridgeTests
     [Fact]
     public void IsHardwareAccelerated_Reflects_Bcl_Capability()
     {
-        // The bridge exposes the same flag as System.Numerics.Vector. We just assert that
-        // FloatLaneCount is positive and matches whatever the BCL reports.
+        // Lane counts come straight from the BCL and must be positive.
         Assert.True(SystemNumericsVectorBridge.FloatLaneCount > 0);
         Assert.True(SystemNumericsVectorBridge.DoubleLaneCount > 0);
+        // The bridge's IsHardwareAccelerated must mirror the BCL capability flag
+        // it forwards — the property this test's name actually claims.
+        Assert.Equal(System.Numerics.Vector.IsHardwareAccelerated, SystemNumericsVectorBridge.IsHardwareAccelerated);
     }
 
     [Fact]
@@ -583,6 +585,49 @@ public class SystemNumericsVectorBridgeTests
             float expected = (float)Math.Pow(src[i], exponent);
             float relErr = Math.Abs(actual[i] - expected) / Math.Max(1e-30f, Math.Abs(expected));
             Assert.True(relErr <= 5e-4f, $"pow rel err {relErr} at x={src[i]}");
+        }
+    }
+
+    [Fact]
+    public void Pow_ExponentZero_IsOneForAllBases()
+    {
+        // pow(x, 0) == 1 for every base, including +/-Infinity and NaN (matches Math.Pow).
+        // The fast path exp(0*log(+inf)) would otherwise produce NaN.
+        var bases = new[] { 0f, 1f, -2f, 3.5f, float.PositiveInfinity, float.NegativeInfinity, float.NaN, 1e-40f };
+        var actual = new float[bases.Length];
+        SystemNumericsVectorBridge.Pow(bases, 0f, actual);
+        for (int i = 0; i < bases.Length; i++)
+            Assert.Equal(1f, actual[i]);
+    }
+
+    [Fact]
+    public void Pow_NonNormalAndNonFiniteBases_MatchLibm()
+    {
+        // Subnormal (FastLog clamps it), +/-Infinity and NaN bases (FastExp/FastLog clamp them),
+        // and non-positive bases must all match libm Math.Pow — the block routes to scalar.
+        var bases = new[]
+        {
+            1e-40f,                    // positive subnormal
+            float.PositiveInfinity,    // +inf
+            float.NaN,                 // NaN
+            -2f, 0f,                   // non-positive
+            2f, 3f, 4f,                // normal positives (fill the rest of a lane block)
+        };
+        const float exponent = 2.0f;
+        var actual = new float[bases.Length];
+        SystemNumericsVectorBridge.Pow(bases, exponent, actual);
+        for (int i = 0; i < bases.Length; i++)
+        {
+            float expected = (float)Math.Pow(bases[i], exponent);
+            if (float.IsNaN(expected))
+                Assert.True(float.IsNaN(actual[i]), $"expected NaN at base={bases[i]}, got {actual[i]}");
+            else if (float.IsInfinity(expected))
+                Assert.Equal(expected, actual[i]); // exact ±inf match (rel-err math is undefined here)
+            else
+            {
+                float relErr = Math.Abs(actual[i] - expected) / Math.Max(1e-30f, Math.Abs(expected));
+                Assert.True(relErr <= 5e-4f, $"pow rel err {relErr} at base={bases[i]}");
+            }
         }
     }
 

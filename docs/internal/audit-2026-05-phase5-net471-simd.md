@@ -62,7 +62,7 @@ On AVX-512 hosts: `Vector<T>` on net471 caps at 256-bit. Acceptable — the alte
 
 ### `src/AiDotNet.Tensors/Engines/Simd/SystemNumericsVectorBridge.cs`
 
-31 primitives covering the BLAS-1 / activation / reduction core of SimdKernels.cs:
+20 distinct operations (39 float + double overloads — float has the extra `Saxpy`) covering the BLAS-1 / activation / reduction core of SimdKernels.cs:
 
 | Family | float | double |
 |--------|-------|--------|

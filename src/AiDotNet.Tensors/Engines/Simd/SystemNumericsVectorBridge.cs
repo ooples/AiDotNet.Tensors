@@ -1310,7 +1310,11 @@ internal static class SystemNumericsVectorBridge
             throw new ArgumentException("Input and output spans must have the same length.");
         int length = result.Length, lanes = Vector<float>.Count;
         int simd = length - (length % lanes);
-        var limit = new Vector<float>(TrigReductionLimit);
+        // FastCos(x) evaluates FastSin(x + π/2), so the SHIFTED argument is what must
+        // stay inside the 2/π reduction window. Tighten the cutoff by π/2 (use the
+        // larger |·| margin) so inputs in the top π/2 band fall back to libm rather
+        // than feeding FastSin an out-of-range argument.
+        var limit = new Vector<float>(TrigReductionLimit - 1.5707964f);
         var s = MemoryMarshal.Cast<float, Vector<float>>(src.Slice(0, simd));
         var r = MemoryMarshal.Cast<float, Vector<float>>(result.Slice(0, simd));
         for (int v = 0; v < s.Length; v++)
@@ -1329,23 +1333,53 @@ internal static class SystemNumericsVectorBridge
         for (int i = simd; i < length; i++) result[i] = (float)Math.Cos(src[i]);
     }
 
-    /// <summary>pow(x, exponent) = exp(exponent * log(x)) — valid for positive bases; non-positive lanes fall to libm.</summary>
+    /// <summary>
+    /// pow(x, exponent) = exp(exponent * log(x)) — the SIMD fast path is only valid for NORMAL,
+    /// FINITE, POSITIVE bases. exponent == 0 (libm returns 1 for every base, incl. ±∞ and NaN),
+    /// a non-finite exponent, and any block containing a non-positive / subnormal / non-finite base
+    /// all route to libm <see cref="Math.Pow(double, double)"/> so the result matches MathF.Pow.
+    /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static void Pow(ReadOnlySpan<float> baseValues, float exponent, Span<float> result)
     {
         if (baseValues.Length != result.Length)
             throw new ArgumentException("Input and output spans must have the same length.");
-        int length = result.Length, lanes = Vector<float>.Count;
+        int length = result.Length;
+
+        // pow(x, 0) == 1 for ALL x (including ±∞ and NaN). The fast path would give
+        // exp(0 * log(+∞)) = exp(0 * +∞) = exp(NaN) = NaN, so special-case it.
+        if (exponent == 0f)
+        {
+            result.Slice(0, length).Fill(1f);
+            return;
+        }
+        // A non-finite exponent makes exp(y·log x) unreliable — defer the whole span to libm.
+        if (float.IsNaN(exponent) || float.IsInfinity(exponent))
+        {
+            for (int i = 0; i < length; i++) result[i] = (float)Math.Pow(baseValues[i], exponent);
+            return;
+        }
+
+        int lanes = Vector<float>.Count;
         int simd = length - (length % lanes);
         var expVec = new Vector<float>(exponent);
-        var zero = Vector<float>.Zero;
+        var minNormal = new Vector<float>(1.17549435e-38f); // smallest normal positive float
+        var maxFinite = new Vector<float>(float.MaxValue);
         var s = MemoryMarshal.Cast<float, Vector<float>>(baseValues.Slice(0, simd));
         var r = MemoryMarshal.Cast<float, Vector<float>>(result.Slice(0, simd));
         for (int v = 0; v < s.Length; v++)
         {
             var b = s[v];
-            // exp(y*log(x)) is only valid for x > 0; route non-positive blocks to libm.
-            if (Vector.LessThanOrEqualAny(b, zero))
+            // FastLog clamps subnormals up to MinNormal and FastExp clamps infinities, so the
+            // fast path is wrong for non-positive, subnormal, or non-finite bases. Detect any
+            // such lane and route the whole block to libm:
+            //   b < MinNormal   → catches <= 0 AND positive subnormals
+            //   b > MaxFinite   → catches +∞
+            //   b != b          → catches NaN
+            var bad = Vector.BitwiseOr(
+                Vector.BitwiseOr(Vector.LessThan(b, minNormal), Vector.GreaterThan(b, maxFinite)),
+                Vector.OnesComplement(Vector.Equals(b, b)));
+            if (!Vector.EqualsAll(Vector.AsVectorInt32(bad), Vector<int>.Zero))
             {
                 int baseIdx = v * lanes;
                 for (int l = 0; l < lanes; l++) result[baseIdx + l] = (float)Math.Pow(baseValues[baseIdx + l], exponent);
