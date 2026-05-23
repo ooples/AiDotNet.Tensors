@@ -180,7 +180,9 @@ public class ConvTranspose2DGemmCorrectnessTests
             inputArr, kernelArr, actual,
             batch, inChannels, inH, inW, outChannels, kH, kW,
             stride, stride, padding, padding, outH, outW);
-        Assert.True(Im2ColHelper._smallNTransAAvx2Calls > 0 || Im2ColHelper._smallNTransAScalarCalls > 0,
+        bool usedAvx2 = Im2ColHelper._smallNTransAAvx2Calls > 0;
+        bool usedScalar = Im2ColHelper._smallNTransAScalarCalls > 0;
+        Assert.True(usedAvx2 || usedScalar,
             "Phase-2 dispatch did not fire on warmup — gate (hw == 16 && kmkn >= 8*inChannels) " +
             "may not match L2 shape.");
 
@@ -207,6 +209,17 @@ public class ConvTranspose2DGemmCorrectnessTests
         }
         sw.Stop();
         double msPerCall = sw.Elapsed.TotalMilliseconds / iters;
+
+        if (!usedAvx2)
+        {
+            // Scalar-fallback runners (no AVX2, or x86 32-bit, or pre-.NET5
+            // intrinsics) hit the same dispatch path but don't reach the
+            // BLIS-style packed-A kernel the 50 ms budget is sized for. The
+            // warmup gate above already confirmed the dispatch fired; treat
+            // this as a dispatch smoke test on those hosts and skip the
+            // AVX2-only latency assertion. Closes CodeRabbit on PR #432.
+            return;
+        }
 
         Assert.True(msPerCall < 50.0,
             $"L2 ConvTranspose2D took {msPerCall:F1} ms/call — exceeds 50 ms phase-2 budget. " +
