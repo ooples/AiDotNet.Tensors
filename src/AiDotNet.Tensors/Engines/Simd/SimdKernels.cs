@@ -1958,10 +1958,10 @@ namespace AiDotNet.Tensors.Engines.Simd
                 throw new ArgumentException("Input and output spans must have the same length.");
             }
 
+#if NET5_0_OR_GREATER
             int length = result.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 32)
             {
                 int simdLength = length & ~31;
@@ -1997,12 +1997,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector128(result, i, AdvSimd.Subtract(ReadVector128(a, i), ReadVector128(b, i)));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
                 result[i] = a[i] - b[i];
             }
+#else
+            SystemNumericsVectorBridge.VectorSubtract(a, b, result);
+#endif
         }
 
         [MethodImpl(HotInline)]
@@ -2013,10 +2015,10 @@ namespace AiDotNet.Tensors.Engines.Simd
                 throw new ArgumentException("Input and output spans must have the same length.");
             }
 
+#if NET5_0_OR_GREATER
             int length = result.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 32)
             {
                 int simdLength = length & ~31;
@@ -2052,12 +2054,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector128(result, i, AdvSimd.Multiply(ReadVector128(a, i), ReadVector128(b, i)));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
                 result[i] = a[i] * b[i];
             }
+#else
+            SystemNumericsVectorBridge.VectorMultiply(a, b, result);
+#endif
         }
 
         [MethodImpl(HotInline)]
@@ -2068,10 +2072,10 @@ namespace AiDotNet.Tensors.Engines.Simd
                 throw new ArgumentException("Input and output spans must have the same length.");
             }
 
+#if NET5_0_OR_GREATER
             int length = result.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 32)
             {
                 int simdLength = length & ~31;
@@ -2099,12 +2103,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector128(result, i, Sse.Divide(ReadVector128(a, i), ReadVector128(b, i)));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
                 result[i] = a[i] / b[i];
             }
+#else
+            SystemNumericsVectorBridge.VectorDivide(a, b, result);
+#endif
         }
 
         /// <summary>Adds a scalar to each element: result[i] = a[i] + scalar.</summary>
@@ -2116,10 +2122,10 @@ namespace AiDotNet.Tensors.Engines.Simd
                 throw new ArgumentException("Input and output spans must have the same length.");
             }
 
+#if NET5_0_OR_GREATER
             int length = result.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 32)
             {
                 var vs = Vector256.Create(scalar);
@@ -2141,12 +2147,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector256(result, i, Avx.Add(ReadVector256(a, i), vs));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
                 result[i] = a[i] + scalar;
             }
+#else
+            SystemNumericsVectorBridge.AddScalar(a, scalar, result);
+#endif
         }
 
         /// <summary>Multiplies each element by a scalar: result[i] = a[i] * scalar.</summary>
@@ -2158,10 +2166,10 @@ namespace AiDotNet.Tensors.Engines.Simd
                 throw new ArgumentException("Input and output spans must have the same length.");
             }
 
+#if NET5_0_OR_GREATER
             int length = result.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 32)
             {
                 var vs = Vector256.Create(scalar);
@@ -2183,12 +2191,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector256(result, i, Avx.Multiply(ReadVector256(a, i), vs));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
                 result[i] = a[i] * scalar;
             }
+#else
+            SystemNumericsVectorBridge.MultiplyScalar(a, scalar, result);
+#endif
         }
 
         /// <summary>Divides each element by a scalar: result[i] = a[i] / scalar.</summary>
@@ -2214,11 +2224,11 @@ namespace AiDotNet.Tensors.Engines.Simd
                 throw new ArgumentException("Input spans must have the same length.");
             }
 
+#if NET5_0_OR_GREATER
             int length = a.Length;
             int i = 0;
             float sum = 0f;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && Fma.IsSupported && length >= 32)
             {
                 // 4-way parallel accumulation to hide FMA latency (5 cycles on Zen2)
@@ -2275,20 +2285,18 @@ namespace AiDotNet.Tensors.Engines.Simd
 
                 sum += HorizontalSum(vsum);
             }
-#endif
 
             for (; i < length; i++)
             {
-#if NET5_0_OR_GREATER
                 sum = Fma.IsSupported
                     ? MathF.FusedMultiplyAdd(a[i], b[i], sum)
                     : sum + (a[i] * b[i]);
-#else
-                sum += a[i] * b[i];
-#endif
             }
 
             return sum;
+#else
+            return SystemNumericsVectorBridge.Dot(a, b);
+#endif
         }
 
         /// <summary>
@@ -2303,10 +2311,10 @@ namespace AiDotNet.Tensors.Engines.Simd
                 throw new ArgumentException("Input and output spans must have the same length.");
             }
 
+#if NET5_0_OR_GREATER
             int length = result.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 4)
             {
                 var vscalar = Vector256.Create(scalar);
@@ -2341,12 +2349,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector128Double(result, i, AdvSimd.Arm64.Add(va, AdvSimd.Arm64.Multiply(vb, vscalar)));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
                 result[i] = a[i] + scalar * b[i];
             }
+#else
+            SystemNumericsVectorBridge.ScalarMultiplyAdd(a, b, scalar, result);
+#endif
         }
 
         [MethodImpl(HotInline)]
@@ -2357,10 +2367,10 @@ namespace AiDotNet.Tensors.Engines.Simd
                 throw new ArgumentException("Input and output spans must have the same length.");
             }
 
+#if NET5_0_OR_GREATER
             int length = result.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 8)
             {
                 var vscalar = Vector256.Create(scalar);
@@ -2395,12 +2405,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector128(result, i, AdvSimd.Add(va, AdvSimd.Multiply(vb, vscalar)));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
                 result[i] = a[i] + scalar * b[i];
             }
+#else
+            SystemNumericsVectorBridge.ScalarMultiplyAdd(a, b, scalar, result);
+#endif
         }
 
         [MethodImpl(HotInline)]
@@ -2411,10 +2423,10 @@ namespace AiDotNet.Tensors.Engines.Simd
                 throw new ArgumentException("Input and output spans must have the same length.");
             }
 
+#if NET5_0_OR_GREATER
             int length = output.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 32)
             {
                 var vzero = Vector256<float>.Zero;
@@ -2454,12 +2466,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector128(output, i, AdvSimd.Max(ReadVector128(input, i), vzero));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
                 output[i] = input[i] > 0f ? input[i] : 0f;
             }
+#else
+            SystemNumericsVectorBridge.ReLU(input, output);
+#endif
         }
 
         /// <summary>
@@ -3490,10 +3504,10 @@ namespace AiDotNet.Tensors.Engines.Simd
                 throw new ArgumentException("Input and output spans must have the same length.");
             }
 
+#if NET5_0_OR_GREATER
             int length = output.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 8)
             {
                 var vzero = Vector256<float>.Zero;
@@ -3536,12 +3550,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector128(output, i, AdvSimd.BitwiseSelect(mask, v, scaled));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
                 output[i] = input[i] > 0f ? input[i] : alpha * input[i];
             }
+#else
+            SystemNumericsVectorBridge.LeakyReLU(input, alpha, output);
+#endif
         }
 
         /// <summary>
@@ -3736,11 +3752,11 @@ namespace AiDotNet.Tensors.Engines.Simd
         [MethodImpl(HotInline)]
         public static float Sum(ReadOnlySpan<float> data)
         {
+#if NET5_0_OR_GREATER
             int length = data.Length;
             int i = 0;
             float sum = 0f;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 32)
             {
                 // 4-way parallel accumulation to hide add latency (3 cycles on Zen2)
@@ -3792,7 +3808,6 @@ namespace AiDotNet.Tensors.Engines.Simd
 
                 sum += HorizontalSum(vsum);
             }
-#endif
 
             for (; i < length; i++)
             {
@@ -3800,6 +3815,9 @@ namespace AiDotNet.Tensors.Engines.Simd
             }
 
             return sum;
+#else
+            return SystemNumericsVectorBridge.Sum(data);
+#endif
         }
 
         /// <summary>
@@ -4562,10 +4580,10 @@ namespace AiDotNet.Tensors.Engines.Simd
             if (input.Length != output.Length)
                 throw new ArgumentException("Input and output spans must have the same length.");
 
+#if NET5_0_OR_GREATER
             int length = input.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 8)
             {
                 int simdLength = length & ~7;
@@ -4582,16 +4600,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector128(output, i, Sse.Sqrt(ReadVector128(input, i)));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
-#if NET5_0_OR_GREATER
                 output[i] = MathF.Sqrt(input[i]);
-#else
-                output[i] = (float)Math.Sqrt(input[i]);
-#endif
             }
+#else
+            SystemNumericsVectorBridge.Sqrt(input, output);
+#endif
         }
 
         /// <summary>Element-wise square root for double precision.</summary>
@@ -4601,10 +4617,10 @@ namespace AiDotNet.Tensors.Engines.Simd
             if (input.Length != output.Length)
                 throw new ArgumentException("Input and output spans must have the same length.");
 
+#if NET5_0_OR_GREATER
             int length = input.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 4)
             {
                 int simdLength = length & ~3;
@@ -4613,12 +4629,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector256Double(output, i, Avx.Sqrt(ReadVector256Double(input, i)));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
                 output[i] = Math.Sqrt(input[i]);
             }
+#else
+            SystemNumericsVectorBridge.Sqrt(input, output);
+#endif
         }
 
         /// <summary>Element-wise absolute value using AVX bitwise AND with sign mask.</summary>
@@ -4628,10 +4646,10 @@ namespace AiDotNet.Tensors.Engines.Simd
             if (input.Length != output.Length)
                 throw new ArgumentException("Input and output spans must have the same length.");
 
+#if NET5_0_OR_GREATER
             int length = input.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 8)
             {
                 // Clear sign bit: AND with 0x7FFFFFFF
@@ -4642,12 +4660,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector256(output, i, Avx.And(ReadVector256(input, i), signMask));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
                 output[i] = Math.Abs(input[i]);
             }
+#else
+            SystemNumericsVectorBridge.Abs(input, output);
+#endif
         }
 
         /// <summary>Element-wise absolute value for double precision.</summary>
@@ -4657,10 +4677,10 @@ namespace AiDotNet.Tensors.Engines.Simd
             if (input.Length != output.Length)
                 throw new ArgumentException("Input and output spans must have the same length.");
 
+#if NET5_0_OR_GREATER
             int length = input.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 4)
             {
                 var signMask = Vector256.Create(0x7FFFFFFFFFFFFFFFL).AsDouble();
@@ -4670,12 +4690,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector256Double(output, i, Avx.And(ReadVector256Double(input, i), signMask));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
                 output[i] = Math.Abs(input[i]);
             }
+#else
+            SystemNumericsVectorBridge.Abs(input, output);
+#endif
         }
 
         /// <summary>Element-wise negation using AVX XOR with sign bit.</summary>
@@ -4685,10 +4707,10 @@ namespace AiDotNet.Tensors.Engines.Simd
             if (input.Length != output.Length)
                 throw new ArgumentException("Input and output spans must have the same length.");
 
+#if NET5_0_OR_GREATER
             int length = input.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 8)
             {
                 var vzero = Vector256<float>.Zero;
@@ -4698,12 +4720,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector256(output, i, Avx.Subtract(vzero, ReadVector256(input, i)));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
                 output[i] = -input[i];
             }
+#else
+            SystemNumericsVectorBridge.Negate(input, output);
+#endif
         }
 
         /// <summary>Element-wise negation for double precision.</summary>
@@ -4713,10 +4737,10 @@ namespace AiDotNet.Tensors.Engines.Simd
             if (input.Length != output.Length)
                 throw new ArgumentException("Input and output spans must have the same length.");
 
+#if NET5_0_OR_GREATER
             int length = input.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 4)
             {
                 var vzero = Vector256<double>.Zero;
@@ -4726,12 +4750,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector256Double(output, i, Avx.Subtract(vzero, ReadVector256Double(input, i)));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
                 output[i] = -input[i];
             }
+#else
+            SystemNumericsVectorBridge.Negate(input, output);
+#endif
         }
 
         /// <summary>Element-wise clamp to [min, max] range.</summary>
@@ -4741,10 +4767,10 @@ namespace AiDotNet.Tensors.Engines.Simd
             if (input.Length != output.Length)
                 throw new ArgumentException("Input and output spans must have the same length.");
 
+#if NET5_0_OR_GREATER
             int length = input.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 8)
             {
                 var vmin = Vector256.Create(min);
@@ -4755,12 +4781,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector256(output, i, Avx.Max(vmin, Avx.Min(vmax, ReadVector256(input, i))));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
                 output[i] = input[i] < min ? min : (input[i] > max ? max : input[i]);
             }
+#else
+            SystemNumericsVectorBridge.Clamp(input, min, max, output);
+#endif
         }
 
         /// <summary>Element-wise power: result[i] = base[i] ^ exp[i].</summary>
@@ -4860,10 +4888,10 @@ namespace AiDotNet.Tensors.Engines.Simd
             if (input.Length != output.Length)
                 throw new ArgumentException("Input and output spans must have the same length.");
 
+#if NET5_0_OR_GREATER
             int length = input.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 4)
             {
                 var vmin = Vector256.Create(min);
@@ -4874,12 +4902,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector256Double(output, i, Avx.Max(vmin, Avx.Min(vmax, ReadVector256Double(input, i))));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
                 output[i] = input[i] < min ? min : (input[i] > max ? max : input[i]);
             }
+#else
+            SystemNumericsVectorBridge.Clamp(input, min, max, output);
+#endif
         }
 
         /// <summary>Element-wise power with scalar exponent for double precision.</summary>
@@ -4953,11 +4983,11 @@ namespace AiDotNet.Tensors.Engines.Simd
         {
             if (data.Length == 0) throw new ArgumentException("Span must not be empty.");
 
+#if NET5_0_OR_GREATER
             int length = data.Length;
             int i = 0;
             float max = float.NegativeInfinity;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 32)
             {
                 var vmax0 = Vector256.Create(float.NegativeInfinity);
@@ -4986,7 +5016,6 @@ namespace AiDotNet.Tensors.Engines.Simd
                 }
                 max = HorizontalMax(vmax);
             }
-#endif
 
             for (; i < length; i++)
             {
@@ -4994,6 +5023,9 @@ namespace AiDotNet.Tensors.Engines.Simd
             }
 
             return max;
+#else
+            return SystemNumericsVectorBridge.Max(data);
+#endif
         }
 
         /// <summary>Returns the minimum value in the span with 4-way accumulation.</summary>
@@ -5002,11 +5034,11 @@ namespace AiDotNet.Tensors.Engines.Simd
         {
             if (data.Length == 0) throw new ArgumentException("Span must not be empty.");
 
+#if NET5_0_OR_GREATER
             int length = data.Length;
             int i = 0;
             float min = float.PositiveInfinity;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 32)
             {
                 var vmin0 = Vector256.Create(float.PositiveInfinity);
@@ -5035,7 +5067,6 @@ namespace AiDotNet.Tensors.Engines.Simd
                 }
                 min = HorizontalMin(vmin);
             }
-#endif
 
             for (; i < length; i++)
             {
@@ -5043,6 +5074,9 @@ namespace AiDotNet.Tensors.Engines.Simd
             }
 
             return min;
+#else
+            return SystemNumericsVectorBridge.Min(data);
+#endif
         }
 
         /// <summary>Cosine similarity: dot(a,b) / (||a|| * ||b||).</summary>
@@ -5075,10 +5109,10 @@ namespace AiDotNet.Tensors.Engines.Simd
             if (a.Length != b.Length || a.Length != result.Length)
                 throw new ArgumentException("Input and output spans must have the same length.");
 
+#if NET5_0_OR_GREATER
             int length = result.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 16)
             {
                 int simdLength = length & ~15;
@@ -5098,12 +5132,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector256Double(result, i, Avx.Add(ReadVector256Double(a, i), ReadVector256Double(b, i)));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
                 result[i] = a[i] + b[i];
             }
+#else
+            SystemNumericsVectorBridge.VectorAdd(a, b, result);
+#endif
         }
 
         /// <summary>Element-wise subtraction for double precision with 4x unrolling.</summary>
@@ -5113,10 +5149,10 @@ namespace AiDotNet.Tensors.Engines.Simd
             if (a.Length != b.Length || a.Length != result.Length)
                 throw new ArgumentException("Input and output spans must have the same length.");
 
+#if NET5_0_OR_GREATER
             int length = result.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 16)
             {
                 int simdLength = length & ~15;
@@ -5136,12 +5172,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector256Double(result, i, Avx.Subtract(ReadVector256Double(a, i), ReadVector256Double(b, i)));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
                 result[i] = a[i] - b[i];
             }
+#else
+            SystemNumericsVectorBridge.VectorSubtract(a, b, result);
+#endif
         }
 
         /// <summary>Element-wise multiplication for double precision with 4x unrolling.</summary>
@@ -5151,10 +5189,10 @@ namespace AiDotNet.Tensors.Engines.Simd
             if (a.Length != b.Length || a.Length != result.Length)
                 throw new ArgumentException("Input and output spans must have the same length.");
 
+#if NET5_0_OR_GREATER
             int length = result.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 16)
             {
                 int simdLength = length & ~15;
@@ -5174,12 +5212,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector256Double(result, i, Avx.Multiply(ReadVector256Double(a, i), ReadVector256Double(b, i)));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
                 result[i] = a[i] * b[i];
             }
+#else
+            SystemNumericsVectorBridge.VectorMultiply(a, b, result);
+#endif
         }
 
         /// <summary>Element-wise division for double precision.</summary>
@@ -5189,10 +5229,10 @@ namespace AiDotNet.Tensors.Engines.Simd
             if (a.Length != b.Length || a.Length != result.Length)
                 throw new ArgumentException("Input and output spans must have the same length.");
 
+#if NET5_0_OR_GREATER
             int length = result.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 16)
             {
                 int simdLength = length & ~15;
@@ -5212,12 +5252,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector256Double(result, i, Avx.Divide(ReadVector256Double(a, i), ReadVector256Double(b, i)));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
                 result[i] = a[i] / b[i];
             }
+#else
+            SystemNumericsVectorBridge.VectorDivide(a, b, result);
+#endif
         }
 
         /// <summary>Adds a scalar to each double element.</summary>
@@ -5227,10 +5269,10 @@ namespace AiDotNet.Tensors.Engines.Simd
             if (a.Length != result.Length)
                 throw new ArgumentException("Input and output spans must have the same length.");
 
+#if NET5_0_OR_GREATER
             int length = result.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 16)
             {
                 var vs = Vector256.Create(scalar);
@@ -5252,12 +5294,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector256Double(result, i, Avx.Add(ReadVector256Double(a, i), vs));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
                 result[i] = a[i] + scalar;
             }
+#else
+            SystemNumericsVectorBridge.AddScalar(a, scalar, result);
+#endif
         }
 
         /// <summary>Multiplies each double element by a scalar.</summary>
@@ -5267,10 +5311,10 @@ namespace AiDotNet.Tensors.Engines.Simd
             if (a.Length != result.Length)
                 throw new ArgumentException("Input and output spans must have the same length.");
 
+#if NET5_0_OR_GREATER
             int length = result.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 16)
             {
                 var vs = Vector256.Create(scalar);
@@ -5292,12 +5336,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector256Double(result, i, Avx.Multiply(ReadVector256Double(a, i), vs));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
                 result[i] = a[i] * scalar;
             }
+#else
+            SystemNumericsVectorBridge.MultiplyScalar(a, scalar, result);
+#endif
         }
 
         /// <summary>
@@ -5786,11 +5832,11 @@ namespace AiDotNet.Tensors.Engines.Simd
         [MethodImpl(HotInline)]
         public static double Sum(ReadOnlySpan<double> data)
         {
+#if NET5_0_OR_GREATER
             int length = data.Length;
             int i = 0;
             double sum = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 16)
             {
                 var vsum0 = Vector256<double>.Zero;
@@ -5818,7 +5864,6 @@ namespace AiDotNet.Tensors.Engines.Simd
                 }
                 sum += HorizontalSum(vsum);
             }
-#endif
 
             for (; i < length; i++)
             {
@@ -5826,6 +5871,9 @@ namespace AiDotNet.Tensors.Engines.Simd
             }
 
             return sum;
+#else
+            return SystemNumericsVectorBridge.Sum(data);
+#endif
         }
 
         /// <summary>Dot product for double precision.</summary>
@@ -5835,11 +5883,11 @@ namespace AiDotNet.Tensors.Engines.Simd
             if (a.Length != b.Length)
                 throw new ArgumentException("Input spans must have the same length.");
 
+#if NET5_0_OR_GREATER
             int length = a.Length;
             int i = 0;
             double sum = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 16)
             {
                 var vsum0 = Vector256<double>.Zero;
@@ -5877,20 +5925,18 @@ namespace AiDotNet.Tensors.Engines.Simd
                 }
                 sum += HorizontalSum(vsum);
             }
-#endif
 
             for (; i < length; i++)
             {
-#if NET5_0_OR_GREATER
                 sum = Fma.IsSupported
                     ? Math.FusedMultiplyAdd(a[i], b[i], sum)
                     : sum + (a[i] * b[i]);
-#else
-                sum += a[i] * b[i];
-#endif
             }
 
             return sum;
+#else
+            return SystemNumericsVectorBridge.Dot(a, b);
+#endif
         }
 
         /// <summary>Max for double precision.</summary>
@@ -5898,12 +5944,16 @@ namespace AiDotNet.Tensors.Engines.Simd
         public static double Max(ReadOnlySpan<double> data)
         {
             if (data.Length == 0) throw new ArgumentException("Span must not be empty.");
+#if NET5_0_OR_GREATER
             double max = double.NegativeInfinity;
             for (int i = 0; i < data.Length; i++)
             {
                 if (data[i] > max) max = data[i];
             }
             return max;
+#else
+            return SystemNumericsVectorBridge.Max(data);
+#endif
         }
 
         /// <summary>Min for double precision.</summary>
@@ -5911,12 +5961,16 @@ namespace AiDotNet.Tensors.Engines.Simd
         public static double Min(ReadOnlySpan<double> data)
         {
             if (data.Length == 0) throw new ArgumentException("Span must not be empty.");
+#if NET5_0_OR_GREATER
             double min = double.PositiveInfinity;
             for (int i = 0; i < data.Length; i++)
             {
                 if (data[i] < min) min = data[i];
             }
             return min;
+#else
+            return SystemNumericsVectorBridge.Min(data);
+#endif
         }
 
         /// <summary>Cosine similarity for double precision.</summary>
@@ -5991,10 +6045,10 @@ namespace AiDotNet.Tensors.Engines.Simd
                 throw new ArgumentException("Input and output spans must have the same length.");
             }
 
+#if NET5_0_OR_GREATER
             int length = output.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 4)
             {
                 var vzero = Vector256<double>.Zero;
@@ -6015,12 +6069,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector128Double(output, i, Sse2.Max(v, vzero));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
                 output[i] = input[i] > 0 ? input[i] : 0;
             }
+#else
+            SystemNumericsVectorBridge.ReLU(input, output);
+#endif
         }
 
         /// <summary>
@@ -6035,10 +6091,10 @@ namespace AiDotNet.Tensors.Engines.Simd
                 throw new ArgumentException("Input and output spans must have the same length.");
             }
 
+#if NET5_0_OR_GREATER
             int length = output.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 4)
             {
                 var vzero = Vector256<double>.Zero;
@@ -6068,12 +6124,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                         : Sse2.Or(Sse2.And(mask, v), Sse2.AndNot(mask, scaled)));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
                 output[i] = input[i] > 0 ? input[i] : alpha * input[i];
             }
+#else
+            SystemNumericsVectorBridge.LeakyReLU(input, alpha, output);
+#endif
         }
 
         /// <summary>
