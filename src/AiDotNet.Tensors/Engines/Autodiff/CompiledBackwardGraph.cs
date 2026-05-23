@@ -187,7 +187,18 @@ public sealed class CompiledBackwardGraph<T>
 
         try
         {
-            // Execute only reachable entries (dead node elimination applied)
+            // Execute only reachable entries (dead node elimination applied).
+            //
+            // Issue #433 phase-2: use GetInputsArrayInto with thread-local
+            // size-1/2/3 buffers instead of GetInputsArray's per-call array
+            // allocation. SenseVoice's ~600 tape entries × N backward passes
+            // per training step previously allocated a fresh Tensor<T>[]
+            // per entry — switching to the buffer-into variant eliminates
+            // ~600 allocations per step. The buffers are CALL-LIFETIME ONLY
+            // and never escape this method, so a thread-local pair is safe.
+            var inputsBuf1 = BackwardInputBuffers<T>.Get1();
+            var inputsBuf2 = BackwardInputBuffers<T>.Get2();
+            var inputsBuf3 = BackwardInputBuffers<T>.Get3();
             foreach (int i in _reachableEntryIndices)
             {
                 ref var entry = ref _entries[i];
@@ -196,7 +207,7 @@ public sealed class CompiledBackwardGraph<T>
                     continue;
 
                 entry.ValidateInputVersions();
-                var inputsArray = entry.GetInputsArray();
+                var inputsArray = entry.GetInputsArrayInto(inputsBuf1, inputsBuf2, inputsBuf3);
                 long _bwdStart = BackwardTiming.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
                 entry.Backward(gradOutput, inputsArray, entry.Output,
                     entry.SavedState ?? Array.Empty<object>(), _engine, grads);
@@ -207,6 +218,12 @@ public sealed class CompiledBackwardGraph<T>
         finally
         {
             DifferentiableOps.ClearIndexedGrads();
+            // Issue #433 phase-2: clear the thread-local input buffers — they
+            // hold strong references to the LAST entry's inputs and would
+            // otherwise pin those tensors (forward intermediates) across the
+            // call boundary, defeating the GradFn cleanup the rest of this
+            // finally block performs. GradientTapeLeakTests catches this.
+            BackwardInputBuffers<T>.Clear();
 
             // Persistent-tape parity with the GradientTape.ComputeGradientsViaGraphCore
             // cleanup: clear .GradFn AND .Grad on forward intermediates so they don't
@@ -382,4 +399,39 @@ public sealed class CompiledBackwardGraph<T>
     /// Gets the number of entries that were eliminated (not reachable from loss).
     /// </summary>
     public int EliminatedEntryCount => _entries.Count - _reachableEntryIndices.Length;
+}
+
+/// <summary>
+/// Issue #433 phase-2: thread-local scratch buffers used by
+/// <see cref="CompiledBackwardGraph{T}.Execute(Tensor{T})"/> and
+/// <see cref="OptimizedBackwardPlan{T}.Execute"/> to avoid per-entry array
+/// allocations from <see cref="TapeEntry{T}.GetInputsArray"/>. The three
+/// fixed-size buffers (length 1, 2, 3) cover the InputCount cases the
+/// microkernel branches over; the overflow (InputCount > 3) case still
+/// allocates from <c>InputsOverflow</c> which is itself a permanent
+/// tape-entry-owned array. Buffers never escape the Execute call so
+/// thread-local reuse is safe.
+/// </summary>
+internal static class BackwardInputBuffers<T>
+{
+    [System.ThreadStatic] private static Tensor<T>[]? _buf1;
+    [System.ThreadStatic] private static Tensor<T>[]? _buf2;
+    [System.ThreadStatic] private static Tensor<T>[]? _buf3;
+
+    internal static Tensor<T>[] Get1() => _buf1 ??= new Tensor<T>[1];
+    internal static Tensor<T>[] Get2() => _buf2 ??= new Tensor<T>[2];
+    internal static Tensor<T>[] Get3() => _buf3 ??= new Tensor<T>[3];
+
+    /// <summary>
+    /// Clears the buffers' slots so they don't pin tensors across the
+    /// Execute call boundary. Must be invoked in the Execute finally block;
+    /// the GradientTapeLeakTests at issue #283 scale catch any caller that
+    /// forgets this and re-introduces the cross-iteration intermediate pin.
+    /// </summary>
+    internal static void Clear()
+    {
+        if (_buf1 is not null) _buf1[0] = null!;
+        if (_buf2 is not null) { _buf2[0] = null!; _buf2[1] = null!; }
+        if (_buf3 is not null) { _buf3[0] = null!; _buf3[1] = null!; _buf3[2] = null!; }
+    }
 }
