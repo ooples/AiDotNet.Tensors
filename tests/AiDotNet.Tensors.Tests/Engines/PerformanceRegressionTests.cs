@@ -58,15 +58,27 @@ public class PerformanceRegressionTests
     private const double CnnAiseval_L1_BudgetMs = 30.0;  // Measured ~6 ms on RTX-class CPU
     private const double CnnAiseval_L2_BudgetMs = 35.0;  // Measured ~8 ms on RTX-class CPU
 
-    // AIsEval LSTM + MHA inference perf gates (issue #436, post-Stage 5/6).
-    // The float fast paths on LstmSequenceForward and MultiHeadAttentionForward
-    // brought AIsEval-shape inference to 8.19 ms / 10.13 ms on net10.0
-    // respectively. The 30 ms budgets here are ~3-4x the steady-state measured
-    // time on the reference rig — tight enough to catch a regression to
-    // pre-fast-path or generic-T behavior (44 ms / 22 ms) while tolerating
-    // CI noise and cold JIT.
+    // AIsEval LSTM + MHA inference perf gates (issue #436, post-Stage 5-7).
+    // Budgets are sized to catch a regression to the previous-stage path,
+    // not just generic CI noise:
+    //
+    //   LSTM:
+    //     Stage 3 (generic-T fused, pre float fast path): 44 ms/iter
+    //     Stage 5 (float fast path, current):              8 ms/iter
+    //     30 ms budget catches Stage 5 -> Stage 3 regression with ~3x
+    //     headroom over the Stage 5 measurement.
+    //
+    //   MHA:
+    //     Stage 4 (wrapper path, no float fast path):     22 ms/iter
+    //     Stage 6 (float fast path):                      10 ms/iter
+    //     Stage 7 (+ parallel transposes, current):        8.5 ms/iter
+    //     15 ms budget catches Stage 7/6 -> Stage 4 regression while still
+    //     tolerating ~1.7x CI variance over the Stage 7 measurement. The
+    //     previous 30 ms budget (CodeRabbit review on PR #437) would have
+    //     passed a wrapper-path fallback unchanged — it caught only outright
+    //     unfused dispatch, not the regression this test is named for.
     private const double LstmAiseval_BudgetMs = 30.0;
-    private const double MhaAiseval_BudgetMs = 30.0;
+    private const double MhaAiseval_BudgetMs = 15.0;
 
     public PerformanceRegressionTests(ITestOutputHelper output) => _output = output;
 
