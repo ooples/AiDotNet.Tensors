@@ -2489,10 +2489,10 @@ namespace AiDotNet.Tensors.Engines.Simd
                 throw new ArgumentException("Input and output spans must have the same length.");
             }
 
+#if NET5_0_OR_GREATER
             int length = input.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             // Use Cephes-style fast exp polynomial with explicit AVX2/FMA intrinsics.
             // Note: MKL VML was tested but delegate-based P/Invoke overhead negated the
             // SVML benefit. Our FastExp256 is competitive for float.
@@ -2517,16 +2517,15 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector256(output, i, FastExp256(ReadVector256(input, i)));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
-#if NET5_0_OR_GREATER
                 output[i] = MathF.Exp(input[i]);
-#else
-                output[i] = (float)Math.Exp(input[i]);
-#endif
             }
+#else
+            // net471: BCL Vector<float> Cephes-style exp (audit-2026-05 phase 5 slice 2).
+            SystemNumericsVectorBridge.Exp(input, output);
+#endif
         }
 
 
@@ -2608,10 +2607,10 @@ namespace AiDotNet.Tensors.Engines.Simd
                 throw new ArgumentException("Input and output spans must have the same length.");
             }
 
+#if NET5_0_OR_GREATER
             int length = input.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx2.IsSupported && Fma.IsSupported && length >= 32)
             {
                 int simdLength = length & ~31;
@@ -2632,16 +2631,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector256(output, i, FastSigmoid256(ReadVector256(input, i)));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
-#if NET5_0_OR_GREATER
                 output[i] = 1.0f / (1.0f + MathF.Exp(-input[i]));
-#else
-                output[i] = 1.0f / (1.0f + (float)Math.Exp(-input[i]));
-#endif
             }
+#else
+            SystemNumericsVectorBridge.Sigmoid(input, output);
+#endif
         }
 
         /// <summary>
@@ -2802,10 +2799,10 @@ namespace AiDotNet.Tensors.Engines.Simd
                 throw new ArgumentException("Input and output spans must have the same length.");
             }
 
+#if NET5_0_OR_GREATER
             int length = input.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx2.IsSupported && Fma.IsSupported && length >= 32)
             {
                 var vone = Vector256.Create(1.0f);
@@ -2831,16 +2828,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector256(output, i, Avx.Subtract(Avx.Multiply(vtwo, FastSigmoid256(Avx.Multiply(vtwo, ReadVector256(input, i)))), vone));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
-#if NET5_0_OR_GREATER
                 output[i] = MathF.Tanh(input[i]);
-#else
-                output[i] = (float)Math.Tanh(input[i]);
-#endif
             }
+#else
+            SystemNumericsVectorBridge.Tanh(input, output);
+#endif
         }
 
         /// <summary>
@@ -3573,6 +3568,7 @@ namespace AiDotNet.Tensors.Engines.Simd
                 throw new ArgumentException("Input and output spans must have the same length.");
             }
 
+#if NET5_0_OR_GREATER
             // Constants for GELU approximation
             const float sqrt2OverPi = 0.7978845608028654f;
             const float coeff = 0.044715f;
@@ -3581,7 +3577,6 @@ namespace AiDotNet.Tensors.Engines.Simd
             int length = output.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && Fma.IsSupported && length >= 8)
             {
                 var vSqrt2OverPi = Vector256.Create(sqrt2OverPi);
@@ -3602,7 +3597,6 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector256(output, i, Avx.Multiply(vHalf, Avx.Multiply(x, Avx.Add(vOne, tanh_val))));
                 }
             }
-#endif
 
             // Scalar implementation for remaining elements
             for (; i < length; i++)
@@ -3611,13 +3605,13 @@ namespace AiDotNet.Tensors.Engines.Simd
                 float x_cubed = x * x * x;
                 float inner = x + coeff * x_cubed;
                 float tanh_arg = sqrt2OverPi * inner;
-#if NET5_0_OR_GREATER
                 float tanh_val = MathF.Tanh(tanh_arg);
-#else
-                float tanh_val = (float)Math.Tanh(tanh_arg);
-#endif
                 output[i] = half * x * (1f + tanh_val);
             }
+#else
+            // net471: BCL Vector<float> GELU (tanh approximation) — audit-2026-05 phase 5 slice 2.
+            SystemNumericsVectorBridge.GELU(input, output);
+#endif
         }
 
         /// <summary>
@@ -3705,10 +3699,10 @@ namespace AiDotNet.Tensors.Engines.Simd
                 throw new ArgumentException("Input and output spans must have the same length.");
             }
 
+#if NET5_0_OR_GREATER
             int length = output.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx2.IsSupported && Fma.IsSupported && length >= 8)
             {
                 var vzero = Vector256<float>.Zero;
@@ -3728,7 +3722,6 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector256(output, i, Avx.BlendVariable(negResult, x, mask));
                 }
             }
-#endif
 
             // Scalar fallback
             for (; i < length; i++)
@@ -3740,13 +3733,13 @@ namespace AiDotNet.Tensors.Engines.Simd
                 }
                 else
                 {
-#if NET5_0_OR_GREATER
                     output[i] = alpha * (MathF.Exp(x) - 1f);
-#else
-                    output[i] = alpha * ((float)Math.Exp(x) - 1f);
-#endif
                 }
             }
+#else
+            // net471: BCL Vector<float> ELU — audit-2026-05 phase 5 slice 2.
+            SystemNumericsVectorBridge.ELU(input, alpha, output);
+#endif
         }
 
         [MethodImpl(HotInline)]
@@ -4408,10 +4401,10 @@ namespace AiDotNet.Tensors.Engines.Simd
             if (input.Length != output.Length)
                 throw new ArgumentException("Input and output spans must have the same length.");
 
+#if NET5_0_OR_GREATER
             int length = input.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             // FastLog256 polynomial (MKL VML tested but delegate overhead negated benefit).
             if (Avx2.IsSupported && Fma.IsSupported && length >= 32)
             {
@@ -4433,16 +4426,15 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector256(output, i, FastLog256(ReadVector256(input, i)));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
-#if NET5_0_OR_GREATER
                 output[i] = MathF.Log(input[i]);
-#else
-                output[i] = (float)Math.Log(input[i]);
-#endif
             }
+#else
+            // net471: BCL Vector<float> Cephes-style log — audit-2026-05 phase 5 slice 2.
+            SystemNumericsVectorBridge.Log(input, output);
+#endif
         }
 
         /// <summary>Element-wise natural log for double precision.</summary>
