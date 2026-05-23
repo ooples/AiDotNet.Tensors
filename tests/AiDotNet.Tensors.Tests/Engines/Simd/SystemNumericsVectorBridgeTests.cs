@@ -540,6 +540,52 @@ public class SystemNumericsVectorBridgeTests
         }
     }
 
+    [Theory]
+    [InlineData(8)] [InlineData(33)] [InlineData(256)]
+    public void Sin_Matches_Libm_WithinPolyTolerance(int length)
+    {
+        var rng = RandomHelper.CreateSeededRandom(90);
+        var src = new float[length];
+        for (int i = 0; i < length; i++) src[i] = (float)((rng.NextDouble() - 0.5) * 4.0 * Math.PI); // [-2π, 2π]
+        var actual = new float[length];
+        SystemNumericsVectorBridge.Sin(src, actual);
+        for (int i = 0; i < length; i++)
+            Assert.True(Math.Abs(actual[i] - (float)Math.Sin(src[i])) <= 1e-4f,
+                $"sin abs err {Math.Abs(actual[i] - (float)Math.Sin(src[i]))} at x={src[i]}");
+    }
+
+    [Theory]
+    [InlineData(8)] [InlineData(33)] [InlineData(256)]
+    public void Cos_Matches_Libm_WithinPolyTolerance(int length)
+    {
+        var rng = RandomHelper.CreateSeededRandom(91);
+        var src = new float[length];
+        for (int i = 0; i < length; i++) src[i] = (float)((rng.NextDouble() - 0.5) * 4.0 * Math.PI);
+        var actual = new float[length];
+        SystemNumericsVectorBridge.Cos(src, actual);
+        for (int i = 0; i < length; i++)
+            Assert.True(Math.Abs(actual[i] - (float)Math.Cos(src[i])) <= 1e-4f,
+                $"cos abs err {Math.Abs(actual[i] - (float)Math.Cos(src[i]))} at x={src[i]}");
+    }
+
+    [Theory]
+    [InlineData(8)] [InlineData(33)] [InlineData(256)]
+    public void Pow_Matches_Libm_WithinPolyTolerance(int length)
+    {
+        var rng = RandomHelper.CreateSeededRandom(92);
+        var src = new float[length];
+        for (int i = 0; i < length; i++) src[i] = (float)(rng.NextDouble() * 4.0 + 0.1); // positive bases
+        const float exponent = 2.5f;
+        var actual = new float[length];
+        SystemNumericsVectorBridge.Pow(src, exponent, actual);
+        for (int i = 0; i < length; i++)
+        {
+            float expected = (float)Math.Pow(src[i], exponent);
+            float relErr = Math.Abs(actual[i] - expected) / Math.Max(1e-30f, Math.Abs(expected));
+            Assert.True(relErr <= 5e-4f, $"pow rel err {relErr} at x={src[i]}");
+        }
+    }
+
     private static double[] NextRandomDoubleArray(Random rng, int length)
     {
         var arr = new double[length];

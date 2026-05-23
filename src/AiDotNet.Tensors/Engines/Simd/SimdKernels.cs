@@ -4174,10 +4174,10 @@ namespace AiDotNet.Tensors.Engines.Simd
                 throw new ArgumentException("Input and output spans must have the same length.");
             }
 
+#if NET5_0_OR_GREATER
             int length = input.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx2.IsSupported && Fma.IsSupported && length >= 8)
             {
                 int simdLength = i + ((length - i) & ~7);
@@ -4186,16 +4186,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector256(output, i, FastSin256(ReadVector256(input, i)));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
-#if NET5_0_OR_GREATER
                 output[i] = MathF.Sin(input[i]);
-#else
-                output[i] = (float)Math.Sin(input[i]);
-#endif
             }
+#else
+            SystemNumericsVectorBridge.Sin(input, output);
+#endif
         }
 
         /// <summary>
@@ -4212,10 +4210,10 @@ namespace AiDotNet.Tensors.Engines.Simd
                 throw new ArgumentException("Input and output spans must have the same length.");
             }
 
+#if NET5_0_OR_GREATER
             int length = input.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx2.IsSupported && Fma.IsSupported && length >= 8)
             {
                 int simdLength = i + ((length - i) & ~7);
@@ -4224,16 +4222,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector256(output, i, FastCos256(ReadVector256(input, i)));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
-#if NET5_0_OR_GREATER
                 output[i] = MathF.Cos(input[i]);
-#else
-                output[i] = (float)Math.Cos(input[i]);
-#endif
             }
+#else
+            SystemNumericsVectorBridge.Cos(input, output);
+#endif
         }
 
         /// <summary>
@@ -4838,10 +4834,10 @@ namespace AiDotNet.Tensors.Engines.Simd
             if (baseValues.Length != output.Length)
                 throw new ArgumentException("Input and output spans must have the same length.");
 
+#if NET5_0_OR_GREATER
             int length = baseValues.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             // pow(x, y) = exp(y * log(x)) — only valid for positive bases
             if (Avx2.IsSupported && Fma.IsSupported && length >= 8)
             {
@@ -4861,16 +4857,15 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector256(output, i, FastExp256(Avx.Multiply(vExp, logBase)));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
-#if NET5_0_OR_GREATER
                 output[i] = MathF.Pow(baseValues[i], exponent);
-#else
-                output[i] = (float)Math.Pow(baseValues[i], exponent);
-#endif
             }
+#else
+            // net471: BCL Vector<float> exp(exponent*log(x)); non-positive lanes fall to libm.
+            SystemNumericsVectorBridge.Pow(baseValues, exponent, output);
+#endif
         }
 
         /// <summary>Element-wise clamp to [min, max] range for double precision.</summary>

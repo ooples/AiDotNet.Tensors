@@ -1074,6 +1074,63 @@ internal static class SystemNumericsVectorBridge
         return result;
     }
 
+    /// <summary>
+    /// Cephes-style sin(x) for one BCL <see cref="Vector{Single}"/> block — faithful port of
+    /// SimdKernels.FastSin256 (2/π range reduction + quadrant selection + odd/even minimax).
+    /// Accurate for bounded arguments; callers route huge-magnitude lanes to scalar Math.Sin.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static Vector<float> FastSin(Vector<float> x)
+    {
+        var twoOverPi = new Vector<float>(0.6366197723675814f);
+        var piOver2Hi = new Vector<float>(1.5707963267341256f);
+        var piOver2Lo = new Vector<float>(6.077100506303966e-11f);
+        var one = new Vector<float>(1.0f);
+
+        // sign(x) bit, then work with |x|.
+        var signBit = Vector.AsVectorInt32(x) & new Vector<int>(unchecked((int)0x80000000));
+        x = Vector.Abs(x);
+
+        // j = round(x * 2/pi) via floor(t + 0.5).
+        var t = x * twoOverPi + new Vector<float>(0.5f);
+        var jf = Vector.ConvertToSingle(Vector.ConvertToInt32(t));
+        jf -= Vector.ConditionalSelect(Vector.GreaterThan(jf, t), one, Vector<float>.Zero);
+        var jInt = Vector.ConvertToInt32(jf);
+
+        // r = x - j*pi/2 (hi/lo split).
+        var r = x - jf * piOver2Hi;
+        r = r - jf * piOver2Lo;
+
+        var quadrant = jInt & new Vector<int>(3);
+        var needNeg = Vector.GreaterThan(quadrant, new Vector<int>(1));            // all-ones where j%4 >= 2
+        var negMask = needNeg & new Vector<int>(unchecked((int)0x80000000));
+        var useCosPoly = Vector.Equals(jInt & new Vector<int>(1), new Vector<int>(1));
+
+        var r2 = r * r;
+
+        // sin (odd): r - r^3/6 + r^5/120 - r^7/5040
+        var sinP = new Vector<float>(-1.9515295891e-4f);
+        sinP = sinP * r2 + new Vector<float>(8.3321608736e-3f);
+        sinP = sinP * r2 + new Vector<float>(-1.6666654611e-1f);
+        sinP = sinP * (r2 * r) + r;
+
+        // cos (even): 1 - r^2/2 + r^4/24 - r^6/720
+        var cosP = new Vector<float>(-1.3888377460e-3f);
+        cosP = cosP * r2 + new Vector<float>(4.1666638908e-2f);
+        cosP = cosP * r2 + new Vector<float>(-0.5f);
+        cosP = cosP * r2 + one;
+
+        // Select sin/cos poly by reinterpreting the int mask, then apply sign flips.
+        var result = Vector.ConditionalSelect(Vector.AsVectorSingle(useCosPoly), cosP, sinP);
+        var flipBits = negMask ^ signBit;
+        return Vector.AsVectorSingle(Vector.AsVectorInt32(result) ^ flipBits);
+    }
+
+    /// <summary>cos(x) = sin(x + π/2) for one BCL <see cref="Vector{Single}"/> block.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static Vector<float> FastCos(Vector<float> x)
+        => FastSin(x + new Vector<float>(1.5707963267948966f));
+
     /// <summary>sigmoid(x) = 1/(1+exp(-x)) for one BCL <see cref="Vector{Single}"/> block.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static Vector<float> FastSigmoid(Vector<float> x)
@@ -1213,6 +1270,92 @@ internal static class SystemNumericsVectorBridge
             float inner = 0.7978845608028654f * (x + 0.044715f * x * x * x);
             result[i] = 0.5f * x * (1f + (float)Math.Tanh(inner));
         }
+    }
+
+    // Above this |x| the float ulp exceeds π/2, so 2/π range reduction loses all
+    // precision — those lanes fall back to libm Math.Sin/Cos.
+    private const float TrigReductionLimit = 105414f;
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void Sin(ReadOnlySpan<float> src, Span<float> result)
+    {
+        if (src.Length != result.Length)
+            throw new ArgumentException("Input and output spans must have the same length.");
+        int length = result.Length, lanes = Vector<float>.Count;
+        int simd = length - (length % lanes);
+        var limit = new Vector<float>(TrigReductionLimit);
+        var s = MemoryMarshal.Cast<float, Vector<float>>(src.Slice(0, simd));
+        var r = MemoryMarshal.Cast<float, Vector<float>>(result.Slice(0, simd));
+        for (int v = 0; v < s.Length; v++)
+        {
+            var x = s[v];
+            // If any lane is out of the reduction range, do the whole block in scalar.
+            if (Vector.GreaterThanAny(Vector.Abs(x), limit))
+            {
+                int baseIdx = v * lanes;
+                for (int l = 0; l < lanes; l++) result[baseIdx + l] = (float)Math.Sin(src[baseIdx + l]);
+            }
+            else
+            {
+                r[v] = FastSin(x);
+            }
+        }
+        for (int i = simd; i < length; i++) result[i] = (float)Math.Sin(src[i]);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void Cos(ReadOnlySpan<float> src, Span<float> result)
+    {
+        if (src.Length != result.Length)
+            throw new ArgumentException("Input and output spans must have the same length.");
+        int length = result.Length, lanes = Vector<float>.Count;
+        int simd = length - (length % lanes);
+        var limit = new Vector<float>(TrigReductionLimit);
+        var s = MemoryMarshal.Cast<float, Vector<float>>(src.Slice(0, simd));
+        var r = MemoryMarshal.Cast<float, Vector<float>>(result.Slice(0, simd));
+        for (int v = 0; v < s.Length; v++)
+        {
+            var x = s[v];
+            if (Vector.GreaterThanAny(Vector.Abs(x), limit))
+            {
+                int baseIdx = v * lanes;
+                for (int l = 0; l < lanes; l++) result[baseIdx + l] = (float)Math.Cos(src[baseIdx + l]);
+            }
+            else
+            {
+                r[v] = FastCos(x);
+            }
+        }
+        for (int i = simd; i < length; i++) result[i] = (float)Math.Cos(src[i]);
+    }
+
+    /// <summary>pow(x, exponent) = exp(exponent * log(x)) — valid for positive bases; non-positive lanes fall to libm.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void Pow(ReadOnlySpan<float> baseValues, float exponent, Span<float> result)
+    {
+        if (baseValues.Length != result.Length)
+            throw new ArgumentException("Input and output spans must have the same length.");
+        int length = result.Length, lanes = Vector<float>.Count;
+        int simd = length - (length % lanes);
+        var expVec = new Vector<float>(exponent);
+        var zero = Vector<float>.Zero;
+        var s = MemoryMarshal.Cast<float, Vector<float>>(baseValues.Slice(0, simd));
+        var r = MemoryMarshal.Cast<float, Vector<float>>(result.Slice(0, simd));
+        for (int v = 0; v < s.Length; v++)
+        {
+            var b = s[v];
+            // exp(y*log(x)) is only valid for x > 0; route non-positive blocks to libm.
+            if (Vector.LessThanOrEqualAny(b, zero))
+            {
+                int baseIdx = v * lanes;
+                for (int l = 0; l < lanes; l++) result[baseIdx + l] = (float)Math.Pow(baseValues[baseIdx + l], exponent);
+            }
+            else
+            {
+                r[v] = FastExp(expVec * FastLog(b));
+            }
+        }
+        for (int i = simd; i < length; i++) result[i] = (float)Math.Pow(baseValues[i], exponent);
     }
 }
 
