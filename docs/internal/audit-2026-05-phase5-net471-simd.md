@@ -1,9 +1,21 @@
 # Audit 2026-05 · Phase 5 · net471 SIMD migration
 
-**Status:** Foundation + slice 1 wired (this PR) → 75% of SimdKernels.cs hot paths now use BCL SIMD on net471.
+**Status:** Foundation + slices 1–3 wired → the dense-layer, activation, pooling, batch-norm, and convolution hot paths all use BCL SIMD on net471.
 **Branch:** `audit/2026-05-phase5-net471-simd-foundation`
 **Owner:** AiDotNet.Tensors core
 **Audit finding addressed:** #13 — *"net471 silently loses AVX2 because `System.Runtime.Intrinsics` is .NET 5+"*
+
+## Slice ledger (this branch)
+
+| Slice | Scope | Status |
+|-------|-------|--------|
+| Foundation | bridge skeleton + `VectorAdd` proof-of-concept | ✅ |
+| 1 | SimdKernels elementwise / scalar / reduction (34 methods, float+double) | ✅ |
+| 2 | transcendentals: Cephes `Vector<float>` exp/log → Exp, Log, Sigmoid, Tanh, ELU, GELU (Swish/Mish transitive) | ✅ |
+| 3a | NchwcPool: MaxPool / AvgPool / GlobalAvgPool | ✅ |
+| 3b | NchwcBatchNorm: NCHWc8 + NCHW inference | ✅ |
+| 3c | NchwcConv2D: forward (was hard-disabled on net471) | ✅ |
+| 4 | SimdGemm micro-kernel unroll | see §C |
 
 ## Problem
 
@@ -85,44 +97,33 @@ This document.
 - `dotnet build src/AiDotNet.Tensors/AiDotNet.Tensors.csproj -c Release -f net10.0` → 0 warning / 0 error ✅
 - `dotnet test -c Release -f net471 --filter "FullyQualifiedName~SystemNumericsVectorBridgeTests"` → 109/109 pass ✅
 
-## Intentionally deferred — explicit non-goals for this PR
+## Resolved since the original deferral
 
-Each of the following is technically wirable but requires substantial separate work and was deliberately excluded from this PR to keep it reviewable. They are tracked as follow-up issues.
+The foundation PR deferred transcendentals and the NCHWc8 kernels claiming both were blocked. **Both claims were wrong** and have since been delivered:
 
-### A. Transcendentals (Sigmoid, Tanh, GELU, Mish, Swish, ELU, Exp, Log, Sin, Cos, Pow, SoftMax)
+### A. Transcendentals — DONE (slice 2)
 
-These primitives' net10.0 path uses hand-written polynomial approximations (`FastExp256`, `FastSigmoid256`, `FastTanh256`, `FastLog256`, `FastSin256`, …) coded directly against `Vector256<float>`. Porting them to `Vector<float>` requires:
-- Re-implementing each polynomial against `Vector.Create<float>(const)` + arithmetic ops
-- Validating ulp ≤ 4 vs scalar reference at the same dense test grid the FP32 polynomials use
-- Custom min-max range-reduction with bit-masking (BCL has no `Vector.Reinterpret<uint, float>` equivalent in net471 — needs `MemoryMarshal.Cast<uint, float>` per lane)
+The original deferral claimed an accurate `Vector<float>` exp was impossible because the IEEE `2^n` reconstruction needs a vector integer left-shift (`<<23`) unavailable before .NET 7's `Vector.ShiftLeft`. **That was incorrect**: the shift is expressible as integer **multiply** by `2^23` (and the log right-shift as integer **divide** by `2^23` for non-negative operands), both supported on `Vector<int>`, plus `Vector.AsVectorSingle` / `Vector.AsVectorInt32` for the bit-reinterpret — all present in the netstandard2.0 `System.Numerics.Vectors` net471 references.
 
-Per-primitive work estimate: 100–300 LoC + ~30 tests. Total ~3000 LoC. Defer to slice 2 follow-up PR.
+`FastExp` and `FastLog` are now faithful `Vector<float>` ports of the net10 `FastExp256` / `FastLog256` polynomials. Sigmoid, Tanh, ELU, GELU are wired; Swish and Mish vectorize transitively (they compose Sigmoid/Tanh/Exp/Log/VectorMultiply). Accuracy is asserted to the same fast-poly class the net10 path holds (~2e-4 rel for exp, ~1e-4 abs for log/sigmoid/tanh/elu), not weakened tolerance.
 
-The current net471 behavior for these primitives is **unchanged** (scalar Math.Exp per element), so this PR is strictly additive — no regression vs pre-phase5 net471 performance.
+### B. NCHWc8 kernels — DONE (slice 3)
 
-### B. NCHWc8 layout-coupled kernels (NchwcPool, NchwcBatchNorm, NchwcConv2D)
+The original deferral claimed the 8-channel-block assumption blocked a portable path. It only blocks the SSE2-only (4-lane) host; on the common AVX2 net471 host `Vector<float>.Count == 8 == CBlock`, so `new Vector<float>(arr, idx)` loads the block directly. All three NCHWc8 reducers (Pool/BatchNorm/Conv2D) now gate the BCL path on `Vector<float>.Count == CBlock` and fall through to the existing scalar path on narrower SIMD — zero correctness risk. The NCHW (non-blocked) BatchNorm path is lane-width-agnostic and accelerates on SSE2 too.
 
-These files hard-code an 8-channel block (`CBlock = 8`) that exactly matches AVX2's 8-float-lane width. On AVX2 net471 hosts, `Vector<float>.Count == 8` so the wiring would be direct; on SSE2-only hosts, `Vector<float>.Count == 4` and the per-cell load would need to be split into 2× Vector<float> with mid-loop concatenation.
-
-Path forward (slice 3 follow-up PR): either
-- Require AVX2 for the SIMD path on net471 (else fall through to scalar — current behavior); or
-- Hard-fork the kernels into separate 4-lane and 8-lane variants and dispatch on `Vector<float>.Count`.
-
-Both options are non-trivial; defer.
+## Still deferred — with concrete technical reasons
 
 ### C. GEMM micro-kernel unroll (SimdGemm / SimdGemmDouble)
 
-SimdGemm.cs already uses `Vector<float>` on net471 for the column-wise accumulator at line 1329, but the outer loop structure assumes hand-unrolled 6×16 / 4×8 micro-kernels matched to AVX2 register pressure. Adapting to BCL `Vector<T>` would require rewriting the unroll factor against `Vector<float>.Count` — substantial.
+SimdGemm.cs already uses `Vector<float>` on net471 for the column-wise accumulator at line 1329, but the outer loop structure assumes hand-unrolled 6×16 / 4×8 micro-kernels matched to AVX2 register pressure. Adapting the unroll factor to `Vector<float>.Count` is substantial and the existing partial `Vector<float>` path already provides the dominant win. Tracked as slice 4; land if net471 GEMM profiling shows a remaining bottleneck.
 
-Defer to slice 4 follow-up PR if performance profiling shows GEMM is a net471 bottleneck.
+### D. Math primitives Floor / Ceiling / Frac / Sin / Cos / Log2 / Pow
 
-### D. Math primitives that already fall through to scalar Math.* (Floor, Ceiling, Frac, Sin, Cos, Log2, Pow)
-
-These have no `Vector<T>.Floor` / `Vector<T>.Ceiling` BCL primitives. Slow on net471 today, same as before. Polynomial Sin/Cos would help, but see (A) above.
+`Floor`/`Ceiling`/`Frac` have no `Vector<T>` BCL primitive before .NET 7 (`Vector.Floor` is .NET 7+) and the integer-truncate-and-correct trick used for exp's range reduction would need per-call masking that erodes the win. `Sin`/`Cos` would need their own polynomial ports (the bridge now has the exp/log machinery to model them on); `Pow` = `exp(y·log(x))` could compose the new bridge primitives. These are the lowest-call-volume ops in training and remain scalar on net471 for now.
 
 ### E. Backward-pass primitives (SoftmaxBackward, LayerNormBackward, GELUBackward, BatchNormBackward, *_Half variants)
 
-Largely depend on (A) transcendentals being wired first.
+Now unblocked by slice 2's transcendentals; wire in a follow-up. The `*_Half` variants additionally need a `Vector<float>`-from-`Half` widening path.
 
 ## Cumulative impact
 
