@@ -26,10 +26,10 @@ namespace AiDotNet.Tensors.Engines.Simd
                 throw new ArgumentException("Input and output spans must have the same length.");
             }
 
+#if NET5_0_OR_GREATER
             int length = result.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 32)
             {
                 int simdLength = length & ~31;
@@ -65,12 +65,18 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector128(result, i, AdvSimd.Add(ReadVector128(a, i), ReadVector128(b, i)));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
                 result[i] = a[i] + b[i];
             }
+#else
+            // audit-2026-05 phase 5 foundation: route net471 through the BCL Vector<T> bridge instead
+            // of a per-element scalar loop. RyuJIT auto-vectorizes Vector<float> to AVX2 (8 lanes) /
+            // SSE2 (4 lanes) at the host CPU's native width. See
+            // docs/internal/audit-2026-05-phase5-net471-simd.md for the migration plan.
+            SystemNumericsVectorBridge.VectorAdd(a, b, result);
+#endif
         }
 
         /// <summary>
