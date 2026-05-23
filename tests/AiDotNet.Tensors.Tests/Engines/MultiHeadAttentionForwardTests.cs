@@ -102,7 +102,7 @@ public class MultiHeadAttentionForwardTests
         var fusedMasked = _engine.MultiHeadAttentionForward(input, qW, kW, vW, oW, numHeads, mask);
         var referenceMasked = DecomposedChain(input, qW, kW, vW, oW, numHeads, mask);
 
-        Assert.Equal(new[] { batch, seq, dModel }, fusedMasked.Shape);
+        Assert.Equal(new[] { batch, seq, dModel }, fusedMasked.Shape.ToArray());
         AssertClose(fusedMasked, referenceMasked, atol: 1e-4f);
 
         // A causal mask must change the result vs unmasked (full) attention.

@@ -85,9 +85,9 @@ public class LstmSequenceForwardTests
             chunk2, h0: hN1, c0: cN1, wIh, wHh, bIh: null, bHh: null,
             out _, out _, returnSequences: true);
 
-        Assert.Equal(new[] { batch, half, hidden }, out1.Shape);
-        Assert.Equal(new[] { batch, hidden }, hN1.Shape);
-        Assert.Equal(new[] { batch, hidden }, cN1.Shape);
+        Assert.Equal(new[] { batch, half, hidden }, out1.Shape.ToArray());
+        Assert.Equal(new[] { batch, hidden }, hN1.Shape.ToArray());
+        Assert.Equal(new[] { batch, hidden }, cN1.Shape.ToArray());
 
         // out1 == full[:, :half, :] and out2 == full[:, half:, :].
         var fullSpan = full.AsSpan();
