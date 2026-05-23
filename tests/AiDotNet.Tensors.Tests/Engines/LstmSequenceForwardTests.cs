@@ -61,6 +61,86 @@ public class LstmSequenceForwardTests
     }
 
     [Fact]
+    public void LstmSequenceForward_FinalStates_EnableChunkedInference()
+    {
+        const int batch = 2, seq = 6, inFeatures = 3, hidden = 5, half = 3;
+        var rng = new Random(99);
+
+        var input = MakeRandom(rng, batch, seq, inFeatures);
+        var wIh   = MakeRandom(rng, 4 * hidden, inFeatures);
+        var wHh   = MakeRandom(rng, 4 * hidden, hidden);
+
+        // Reference: one shot over the whole sequence.
+        var full = _engine.LstmSequenceForward(input, h0: null, c0: null, wIh, wHh, bIh: null, bHh: null, returnSequences: true);
+
+        // Chunked: first half returns its final (h_n, c_n); feed those as the
+        // second half's initial state. The concatenation must equal `full`.
+        var chunk1 = SliceSeq(input, 0, half);
+        var chunk2 = SliceSeq(input, half, seq - half);
+
+        var out1 = _engine.LstmSequenceForward(
+            chunk1, h0: null, c0: null, wIh, wHh, bIh: null, bHh: null,
+            out var hN1, out var cN1, returnSequences: true);
+        var out2 = _engine.LstmSequenceForward(
+            chunk2, h0: hN1, c0: cN1, wIh, wHh, bIh: null, bHh: null,
+            out _, out _, returnSequences: true);
+
+        Assert.Equal(new[] { batch, half, hidden }, out1.Shape);
+        Assert.Equal(new[] { batch, hidden }, hN1.Shape);
+        Assert.Equal(new[] { batch, hidden }, cN1.Shape);
+
+        // out1 == full[:, :half, :] and out2 == full[:, half:, :].
+        var fullSpan = full.AsSpan();
+        var o1 = out1.AsSpan();
+        var o2 = out2.AsSpan();
+        for (int b = 0; b < batch; b++)
+        {
+            for (int t = 0; t < half; t++)
+                for (int h = 0; h < hidden; h++)
+                    Assert.True(Math.Abs(o1[(b * half + t) * hidden + h] - fullSpan[(b * seq + t) * hidden + h]) < 1e-4f);
+            for (int t = 0; t < seq - half; t++)
+                for (int h = 0; h < hidden; h++)
+                    Assert.True(Math.Abs(o2[(b * (seq - half) + t) * hidden + h] - fullSpan[(b * seq + (half + t)) * hidden + h]) < 1e-4f);
+        }
+    }
+
+    [Fact]
+    public void LstmSequenceForward_FinalHidden_EqualsLastOutput()
+    {
+        // With returnSequences:false the returned tensor IS the last timestep's
+        // hidden state, so it must equal finalHidden (h_n).
+        const int batch = 2, seq = 4, inFeatures = 3, hidden = 5;
+        var rng = new Random(13);
+        var input = MakeRandom(rng, batch, seq, inFeatures);
+        var wIh   = MakeRandom(rng, 4 * hidden, inFeatures);
+        var wHh   = MakeRandom(rng, 4 * hidden, hidden);
+
+        var last = _engine.LstmSequenceForward(
+            input, h0: null, c0: null, wIh, wHh, bIh: null, bHh: null,
+            out var hN, out _, returnSequences: false);
+
+        Assert.Equal(last.Shape, hN.Shape);
+        var a = last.AsSpan();
+        var b2 = hN.AsSpan();
+        for (int i = 0; i < a.Length; i++)
+            Assert.Equal(a[i], b2[i]);
+    }
+
+    // Extracts input[:, start..start+len, :] as a fresh [batch, len, in] tensor.
+    private static Tensor<float> SliceSeq(Tensor<float> input, int start, int len)
+    {
+        int batch = input.Shape[0], seq = input.Shape[1], inF = input.Shape[2];
+        var outT = new Tensor<float>(new[] { batch, len, inF });
+        var src = input.AsSpan();
+        var dst = outT.AsWritableSpan();
+        for (int b = 0; b < batch; b++)
+            for (int t = 0; t < len; t++)
+                for (int f = 0; f < inF; f++)
+                    dst[(b * len + t) * inF + f] = src[(b * seq + (start + t)) * inF + f];
+        return outT;
+    }
+
+    [Fact]
     public void LstmSequenceForward_AcceptsInitialHiddenAndCellStates()
     {
         // h0/c0 path: feed non-zero initial states and verify the reference

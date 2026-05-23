@@ -69,6 +69,28 @@ public partial class CpuEngine
         Tensor<T>? bIh,
         Tensor<T>? bHh,
         bool returnSequences = false)
+        // Delegate to the state-returning overload and discard the final states.
+        => LstmSequenceForward(input, h0, c0, wIh, wHh, bIh, bHh, out _, out _, returnSequences);
+
+    /// <summary>
+    /// Fused LSTM sequence forward that also returns the final hidden / cell states,
+    /// enabling chunked / streaming inference (feed <paramref name="finalHidden"/> /
+    /// <paramref name="finalCell"/> back as <c>h0</c> / <c>c0</c> for the next chunk
+    /// instead of recomputing the prefix).
+    /// </summary>
+    /// <param name="finalHidden">Receives the last timestep's hidden state <c>[batch, hidden]</c> (== h_n).</param>
+    /// <param name="finalCell">Receives the last timestep's cell state <c>[batch, hidden]</c> (== c_n).</param>
+    public virtual Tensor<T> LstmSequenceForward<T>(
+        Tensor<T> input,
+        Tensor<T>? h0,
+        Tensor<T>? c0,
+        Tensor<T> wIh,
+        Tensor<T> wHh,
+        Tensor<T>? bIh,
+        Tensor<T>? bHh,
+        out Tensor<T> finalHidden,
+        out Tensor<T> finalCell,
+        bool returnSequences = false)
     {
         if (input is null) throw new ArgumentNullException(nameof(input));
         if (wIh is null) throw new ArgumentNullException(nameof(wIh));
@@ -112,7 +134,8 @@ public partial class CpuEngine
         // closes the AIsEval LSTM gap on CPU. Generic-T path below stays
         // for double / decimal / BigInteger / custom numerics.
         if (typeof(T) == typeof(float))
-            return (Tensor<T>)(object)LstmSequenceForwardFloat(
+        {
+            var outF = LstmSequenceForwardFloat(
                 (Tensor<float>)(object)input,
                 (Tensor<float>?)(object?)h0,
                 (Tensor<float>?)(object?)c0,
@@ -120,11 +143,17 @@ public partial class CpuEngine
                 (Tensor<float>)(object)wHh,
                 (Tensor<float>?)(object?)bIh,
                 (Tensor<float>?)(object?)bHh,
-                batch, seqLen, inFeatures, hidden, gateRows, returnSequences);
+                batch, seqLen, inFeatures, hidden, gateRows, returnSequences,
+                out var hnF, out var cnF);
+            finalHidden = (Tensor<T>)(object)hnF;
+            finalCell = (Tensor<T>)(object)cnF;
+            return (Tensor<T>)(object)outF;
+        }
 
         return LstmSequenceForwardGeneric(
             input, h0, c0, wIh, wHh, bIh, bHh,
-            batch, seqLen, inFeatures, hidden, gateRows, returnSequences);
+            batch, seqLen, inFeatures, hidden, gateRows, returnSequences,
+            out finalHidden, out finalCell);
     }
 
     /// <summary>
@@ -145,7 +174,9 @@ public partial class CpuEngine
         Tensor<float>? bIh,
         Tensor<float>? bHh,
         int batch, int seqLen, int inFeatures, int hidden, int gateRows,
-        bool returnSequences)
+        bool returnSequences,
+        out Tensor<float> finalHidden,
+        out Tensor<float> finalCell)
     {
         // Pre-compute Wx = input @ wIh^T as one big GEMM via SimdGemm.
         // input is [B, seq, in] — treat as [B*seq, in] row-major.
@@ -310,6 +341,15 @@ public partial class CpuEngine
                 hPrevBuf.AsSpan(0, batch * hidden).CopyTo(outSpan);
             }
 
+            // Final states (h_n, c_n) for streaming/chunked inference. After the
+            // role-swap at the end of the last timestep, hPrevBuf / cPrevBuf hold
+            // the last step's hidden / cell state. Copy into owned [B, hidden]
+            // tensors so they outlive the pooled scratch returned below.
+            finalHidden = new Tensor<float>(new[] { batch, hidden });
+            finalCell = new Tensor<float>(new[] { batch, hidden });
+            hPrevBuf.AsSpan(0, batch * hidden).CopyTo(finalHidden.AsWritableSpan());
+            cPrevBuf.AsSpan(0, batch * hidden).CopyTo(finalCell.AsWritableSpan());
+
             return output;
         }
         finally
@@ -338,7 +378,9 @@ public partial class CpuEngine
         Tensor<T>? bIh,
         Tensor<T>? bHh,
         int batch, int seqLen, int inFeatures, int hidden, int gateRows,
-        bool returnSequences)
+        bool returnSequences,
+        out Tensor<T> finalHidden,
+        out Tensor<T> finalCell)
     {
         // Pre-compute Wx = input @ wIh^T + bIh for ALL timesteps as one big GEMM.
         var inputFlat = input.Reshape(new[] { batch * seqLen, inFeatures });
@@ -447,6 +489,12 @@ public partial class CpuEngine
             for (int i = 0; i < batch * hidden; i++)
                 outSpan[i] = hLastSpan[i];
         }
+
+        // Final states (h_n, c_n) for streaming/chunked inference. hPrev / cPrev
+        // hold the last timestep's hidden / cell state; Clone so they are owned
+        // tensors independent of the loop's intermediate buffers.
+        finalHidden = hPrev.Clone();
+        finalCell = cPrev.Clone();
 
         return output;
     }

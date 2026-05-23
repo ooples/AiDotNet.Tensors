@@ -3980,6 +3980,15 @@ public interface IEngine
     /// <param name="vWeight">[dModel, dModel] value projection.</param>
     /// <param name="outWeight">[dModel, dModel] output projection.</param>
     /// <param name="numHeads">Number of attention heads. Must divide dModel.</param>
+    /// <param name="mask">
+    /// Optional boolean attention mask forwarded to the inner
+    /// <see cref="ScaledDotProductAttention{T}"/> (<c>true</c> = keep, <c>false</c> = mask
+    /// out). Shape <c>[batch, numHeads, seq, seq]</c> or any shape broadcastable to it
+    /// (e.g. <c>[1, 1, seq, seq]</c> for a shared causal mask, <c>[batch, 1, seq, seq]</c>
+    /// for per-batch padding). Null = no mask (full bidirectional attention). Exposed so
+    /// the fused path supports causal decoding and padded batches without a future
+    /// breaking signature change.
+    /// </param>
     /// <returns>The attention output with shape [batch, seq, dModel].</returns>
     /// <remarks>
     /// <para>
@@ -4000,7 +4009,8 @@ public interface IEngine
         Tensor<T> kWeight,
         Tensor<T> vWeight,
         Tensor<T> outWeight,
-        int numHeads);
+        int numHeads,
+        Tensor<bool>? mask = null);
 
     /// <summary>
     /// Fused LSTM sequence forward (inference only): processes a full

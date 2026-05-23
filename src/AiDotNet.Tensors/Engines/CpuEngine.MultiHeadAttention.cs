@@ -67,7 +67,8 @@ public partial class CpuEngine
         Tensor<T> kWeight,
         Tensor<T> vWeight,
         Tensor<T> outWeight,
-        int numHeads)
+        int numHeads,
+        Tensor<bool>? mask = null)
     {
         if (input is null) throw new ArgumentNullException(nameof(input));
         if (qWeight is null) throw new ArgumentNullException(nameof(qWeight));
@@ -113,10 +114,11 @@ public partial class CpuEngine
                 (Tensor<float>)(object)kWeight,
                 (Tensor<float>)(object)vWeight,
                 (Tensor<float>)(object)outWeight,
+                mask,
                 batch, seqLen, dModel, numHeads, dHead);
 
         return MultiHeadAttentionForwardGeneric(
-            input, qWeight, kWeight, vWeight, outWeight,
+            input, qWeight, kWeight, vWeight, outWeight, mask,
             batch, seqLen, dModel, numHeads, dHead);
     }
 
@@ -132,6 +134,7 @@ public partial class CpuEngine
     private unsafe Tensor<float> MultiHeadAttentionForwardFloat(
         Tensor<float> input,
         Tensor<float> qWeight, Tensor<float> kWeight, Tensor<float> vWeight, Tensor<float> outWeight,
+        Tensor<bool>? mask,
         int batch, int seqLen, int dModel, int numHeads, int dHead)
     {
         int totalRows = batch * seqLen;
@@ -193,7 +196,7 @@ public partial class CpuEngine
 
             var attnTensor = ScaledDotProductAttention<float>(
                 qHeadTensor, kHeadTensor, vHeadTensor,
-                mask: null, scale: null, out _);
+                mask: mask, scale: null, out _);
 
             // Copy SDPA output ([B, H, seq, dHead]) into our pooled buffer
             // so the inverse-transpose is a contiguous read pass.
@@ -308,6 +311,7 @@ public partial class CpuEngine
     private Tensor<T> MultiHeadAttentionForwardGeneric<T>(
         Tensor<T> input,
         Tensor<T> qWeight, Tensor<T> kWeight, Tensor<T> vWeight, Tensor<T> outWeight,
+        Tensor<bool>? mask,
         int batch, int seqLen, int dModel, int numHeads, int dHead)
     {
         var inputFlat = input.Reshape(new[] { batch * seqLen, dModel });
@@ -319,7 +323,7 @@ public partial class CpuEngine
         var k = kFlat.Reshape(new[] { batch, seqLen, numHeads, dHead }).Transpose(new[] { 0, 2, 1, 3 });
         var v = vFlat.Reshape(new[] { batch, seqLen, numHeads, dHead }).Transpose(new[] { 0, 2, 1, 3 });
 
-        var attnOut = ScaledDotProductAttention<T>(q, k, v, mask: null, scale: null, out _);
+        var attnOut = ScaledDotProductAttention<T>(q, k, v, mask: mask, scale: null, out _);
 
         var concat = attnOut.Transpose(new[] { 0, 2, 1, 3 }).Reshape(new[] { batch, seqLen, dModel });
         var concatFlat = concat.Reshape(new[] { batch * seqLen, dModel });
