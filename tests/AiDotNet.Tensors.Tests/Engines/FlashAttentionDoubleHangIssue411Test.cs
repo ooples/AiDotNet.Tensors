@@ -44,18 +44,28 @@ public class FlashAttentionDoubleHangIssue411Test
         _output = output;
     }
 
-    // Test envelope (Timeout=90_000): catastrophic-hang detector. The
+    // Test envelope (Timeout=180_000): catastrophic-hang detector. The
     // original #411 regression was a >600 s process hang under OpenBLAS
-    // thread oversubscription; the 90 s xUnit timeout still trips on
+    // thread oversubscription; the 180 s xUnit timeout still trips on
     // anything close to that magnitude while giving the per-call
-    // assertion (5 s) room to be the real regression signal on the
-    // CI-runner-variance + code-coverage-instrumentation slowdown that
-    // pushed the originally-chosen 30 s envelope into false-positive
-    // territory on Linux runners (locally on Windows 32-core: ~35 ms
-    // per call; on a 4-core Ubuntu CI runner with coverage active:
-    // ~3-4 s per call with the SimdGemm.DgemmSequential bypass from
-    // PR #426 c332c6df).
-    [Fact(Timeout = 90_000)]
+    // assertion (60 s) room to be the real regression signal even on
+    // the slowest observed CI shape.
+    //
+    // Calibration:
+    //   - Local Windows 32-core dev:  ~35 ms / call
+    //   - Ubuntu CI runner (4 vCPU, coverage active, after the
+    //     SimdGemm.DgemmSequential bypass from PR #426 c332c6df):
+    //     observed at 9.5 s / call on run 26304046213
+    //
+    // The 5 s per-call ceiling tried previously was based on the dev-box
+    // bench (~33 ms) and the expected-CI bench (~3-4 s); it turned out
+    // the real CI shape — with code-coverage instrumentation active and
+    // every per-head DGEMM serialised — runs nearly 3× over that target.
+    // Bumping the per-call ceiling to 60 s keeps ~6× headroom over the
+    // slowest observed shape while still firing immediately if a future
+    // change re-introduces the oversubscription cliff (which jumps the
+    // wall time by an order of magnitude or more).
+    [Fact(Timeout = 180_000)]
     public async Task FlashAttentionDouble_SdUnetShape_CompletesUnderBudget()
     {
         // xUnit Fact(Timeout=...) needs an async signature so the runner can
@@ -78,29 +88,28 @@ public class FlashAttentionDoubleHangIssue411Test
 
         // Warmup so OpenBLAS thread cache / JIT / pool effects don't pollute the timing.
         // Single warmup is enough — if the fix is intact the warmup itself completes in
-        // ~50 ms (BLAS-backed dgemm). If the fix is missing, the warmup hangs and the
-        // Timeout fires before we ever reach the measured loop.
+        // O(seconds). If the fix is missing, the warmup hangs and the Timeout fires
+        // before we ever reach the measured loop.
         var resultWarm = engine.FlashAttention<double>(q, k, v, scale: null, isCausal: false, out _);
         Assert.NotNull(resultWarm);
 
-        // Measure 3 iterations averaged. Even on a heavily-loaded CI runner this
-        // should be well under 5 seconds per call (the issue's pre-fix observation
-        // was >4 minutes per call).
-        const int iters = 3;
+        // Measure a single call after warmup — that's enough to prove the
+        // no-hang contract; we are not benchmarking. Averaging more iterations
+        // just inflates total wall time on slow CI hardware (3 iters × ~10 s
+        // would put us back near the previous 30 s envelope) without
+        // strengthening the assertion.
         var sw = Stopwatch.StartNew();
-        for (int i = 0; i < iters; i++)
-        {
-            var _r = engine.FlashAttention<double>(q, k, v, scale: null, isCausal: false, out _);
-        }
+        var _r = engine.FlashAttention<double>(q, k, v, scale: null, isCausal: false, out _);
         sw.Stop();
-        double msPerCall = sw.Elapsed.TotalMilliseconds / iters;
-        _output.WriteLine($"FlashAttention<double> [1, 8, 1024, 80]: {msPerCall:F1} ms/call ({iters} iters)");
+        double msPerCall = sw.Elapsed.TotalMilliseconds;
+        _output.WriteLine($"FlashAttention<double> [1, 8, 1024, 80]: {msPerCall:F1} ms/call (1 timed iter after warmup)");
 
-        // Hard ceiling: 5 seconds per call. Pre-fix this shape took >600 s
-        // (process hang). Post-fix bench measured ~33 ms on a 32-core host.
-        // 5 s gives generous headroom for slower CI runners while still catching
-        // any regression that re-introduces the oversubscription cliff.
-        Assert.True(msPerCall < 5000,
+        // Hard ceiling: 60 seconds per call. Pre-fix this shape took >600 s
+        // (process hang); post-fix on the slowest observed CI shape is
+        // ~9.5 s. 60 s gives ~6× headroom over CI while still 10× under
+        // the pre-fix hang, so any regression of the OpenBLAS thread-scope
+        // fix from PR #410 fires immediately.
+        Assert.True(msPerCall < 60_000,
             $"FlashAttention<double> at SD UNet shape took {msPerCall:F1} ms/call — " +
             $"a regression of the OpenBLAS thread-scope fix from PR #410 (issue #411). " +
             $"Pre-fix this shape hung >600 s under 32-thread BLAS × 8-head outer parallel-for.");
