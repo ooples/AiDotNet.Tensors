@@ -45,6 +45,74 @@ public class WeightRegistryStreamingTests : IDisposable
     }
 
     [Fact]
+    public void RegisterStreaming_RefcountTwo_DefersDrop_KeepsPeerReadValid()
+    {
+        // Issue #430 regression: RegisterWeight on a streaming weight with
+        // refcount > 1 (autodiff tape holds the peer ref to the weight's
+        // storage, captured by the first forward op) used to throw
+        // "Streaming drop requires sole storage ownership". Lazy weights in
+        // PatchEmbeddingLayer + family hit this exact pattern — the
+        // OnFirstForward → AllocateLazyWeight → Engine.TensorMatMul sequence
+        // makes the storage refcount 2 by the time RegisterWeight runs.
+        // Post-fix: register succeeds, drop is deferred, peer continues to
+        // read valid data.
+        var w = new Tensor<float>(new float[] { 1.5f, 2.5f, 3.5f, 4.5f }, new[] { 4 });
+        w.Lifetime = WeightLifetime.Streaming;
+
+        // Simulate the autodiff tape's peer capture: a sibling tensor that
+        // shares the same storage. RebindStorageFrom is the same primitive
+        // CompiledInferencePlan / MemoryPlanningPass use; the autodiff
+        // tape's input-capture path bumps the storage refcount the same way.
+        var peer = new Tensor<float>(new[] { 4 });
+        peer.RebindStorageFrom(w);
+        Assert.Equal(2, w._storage.RefCount);
+
+        // Pre-fix this would throw InvalidOperationException. Post-fix it
+        // succeeds with the drop deferred.
+        WeightRegistry.RegisterWeight(w);
+
+        Assert.True(w.StreamingPoolHandle >= 0, "Handle must be bound even when drop is deferred.");
+        Assert.True(w.StreamingDropDeferred, "Drop should be deferred when refcount > 1.");
+        // GC heap storage is still live so the peer can read its data.
+        Assert.Equal(4, w.DataVector.Length);
+        Assert.Equal(1.5f, peer[0]);
+        Assert.Equal(4.5f, peer[3]);
+
+        // Retry while peer still holds the ref — should still return false.
+        Assert.False(WeightRegistry.TryFinalizeDeferredDrop(w),
+            "Drop must stay deferred while peer ref is still alive.");
+        Assert.True(w.StreamingDropDeferred, "Flag remains set on failed retry.");
+
+        // Release the peer ref by rebinding it to a fresh storage. Now the
+        // weight's storage refcount drops back to 1 and the deferred drop
+        // can finalize.
+        var fresh = new Tensor<float>(new[] { 4 });
+        peer.RebindStorageFrom(fresh);
+        Assert.Equal(1, w._storage.RefCount);
+
+        Assert.True(WeightRegistry.TryFinalizeDeferredDrop(w),
+            "Drop should now succeed with refcount == 1.");
+        Assert.False(w.StreamingDropDeferred, "Flag clears on successful finalize.");
+        Assert.Equal(0, w.DataVector.Length);
+    }
+
+    [Fact]
+    public void TryFinalizeDeferredDrop_NoOpOnNonDeferredTensor()
+    {
+        // Idempotency / no-op guarantee: calling TryFinalizeDeferredDrop on a
+        // tensor that never had a deferred drop (or already finalized) must
+        // return true without touching storage. AiDotNet's step-boundary
+        // loop wants to call this on every trainable parameter without
+        // tracking which ones are deferred.
+        var t = new Tensor<float>(new float[] { 1.5f, 2.5f }, new[] { 2 });
+        t.Lifetime = WeightLifetime.Streaming;
+        WeightRegistry.RegisterWeight(t);
+        Assert.False(t.StreamingDropDeferred);
+        Assert.True(WeightRegistry.TryFinalizeDeferredDrop(t));
+        Assert.False(t.StreamingDropDeferred);
+    }
+
+    [Fact]
     public void RegisterStreaming_DropsTensorData_PoolKeepsCanonicalCopy()
     {
         var t = new Tensor<float>(new float[] { 1.5f, 2.5f, 3.5f, 4.5f }, new[] { 4 });
@@ -348,14 +416,19 @@ public class WeightRegistryStreamingTests : IDisposable
     }
 
     [Fact]
-    public void DropStorage_OnSharedRefcount_Throws()
+    public void DropStorage_OnSharedRefcount_DefersDropWithoutThrowing()
     {
-        // Audit P1 #5: DropStorageForStreaming must reject tensors whose
-        // storage refcount > 1 (rebound peers exist). Construct that
-        // scenario directly via RebindStorageFrom — the test assembly
-        // has internals access. Without this guard, registering a
-        // tensor whose storage is shared with a peer would silently
-        // drop bytes the peer is still reading.
+        // Audit P1 #5 + Issue #430 update: pre-#430 this test asserted that
+        // RegisterWeight THROWS on shared refcount. That was the right strict
+        // semantics for the original streaming workflow (RegisterWeight before
+        // any view op), but it blocked the lazy-weight pattern in
+        // PatchEmbeddingLayer + family where the very next op's autodiff tape
+        // capture bumps refcount to 2 BEFORE RegisterWeight runs. The #430 fix
+        // changes the contract: RegisterWeight on a shared-refcount tensor now
+        // SUCCEEDS with the drop deferred. The pool gets the bytes-snapshot,
+        // the handle is bound, the GC-heap storage stays live so peers can
+        // continue to read it, and StreamingDropDeferred = true signals that
+        // TryFinalizeDeferredDrop must be called once peer refs release.
         var t1 = new Tensor<float>(new float[] { 1f, 2f, 3f }, new[] { 3 });
         var t2 = new Tensor<float>(new float[] { 9f, 9f, 9f }, new[] { 3 });
         // Rebind t2's storage to point at t1's — both now share storage,
@@ -364,23 +437,25 @@ public class WeightRegistryStreamingTests : IDisposable
 
         t1.Lifetime = WeightLifetime.Streaming;
 
-        // RegisterWeight implicitly calls DropStorageForStreaming; with
-        // refcount > 1 the atomic claim must fail and the call must
-        // throw. The pool-entry rollback (separate audit fix) means
-        // there's no leaked pool entry on this throw path.
-        var ex = Assert.Throws<InvalidOperationException>(() => WeightRegistry.RegisterWeight(t1));
-        Assert.Contains("sole storage ownership", ex.Message);
+        // RegisterWeight succeeds (no throw) and defers the drop.
+        WeightRegistry.RegisterWeight(t1);
 
-        // Both tensors must still be intact: the failed register must
-        // not have stripped t1's bytes (and therefore t2's).
+        Assert.True(t1.StreamingPoolHandle >= 0, "Handle must be bound on deferred-drop path.");
+        Assert.True(t1.StreamingDropDeferred, "DropDeferred flag must be set when refcount > 1.");
+
+        // Both tensors' bytes are still GC-resident so the peer can keep
+        // reading via the shared storage.
         Assert.Equal(3, t1.DataVector.Length);
         Assert.Equal(3, t2.DataVector.Length);
         Assert.Equal(1f, t1.DataVector.AsSpan()[0]);
         Assert.Equal(1f, t2.DataVector.AsSpan()[0]); // shared with t1
 
-        // No pool handle should have been assigned because the rollback
-        // must restore the tensor to its pre-register state.
-        Assert.True(t1.StreamingPoolHandle < 0);
+        // Cleanup: rebind peer to fresh storage so the deferred drop can
+        // finalize before the fixture's Dispose tears down the pool.
+        var fresh = new Tensor<float>(new[] { 3 });
+        t2.RebindStorageFrom(fresh);
+        Assert.True(WeightRegistry.TryFinalizeDeferredDrop(t1));
+        Assert.False(t1.StreamingDropDeferred);
     }
 
     [Fact]

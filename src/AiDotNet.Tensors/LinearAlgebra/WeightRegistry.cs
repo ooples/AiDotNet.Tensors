@@ -155,7 +155,7 @@ public static class WeightRegistry
                         // Two-phase commit: drop storage FIRST (the operation
                         // that can throw — non-contiguous, view, shared
                         // refcount), then commit the handle on the tensor.
-                        // If DropStorageForStreaming throws after the pool
+                        // If TryDropStorageForStreaming throws after the pool
                         // already accepted the bytes, roll the pool entry
                         // back so we don't leak both a registered pool
                         // entry and a tensor still in its pre-stream state
@@ -163,10 +163,25 @@ public static class WeightRegistry
                         // never released" + a pool entry no caller can
                         // ever reach because StreamingPoolHandle was never
                         // set on the tensor).
+                        //
+                        // Issue #430: lazy weights allocated via
+                        // AllocateStreaming inside OnFirstForward have their
+                        // storage captured by the very next op's autodiff
+                        // tape input list — refcount becomes 2 by the time
+                        // RegisterWeight runs. Pre-fix the strict drop threw
+                        // and broke any forward path that lazy-allocated
+                        // weights mid-Forward (PatchEmbeddingLayer in
+                        // Gemma3, DeepSeekVL, etc.). Use the non-throwing
+                        // TryDropStorageForStreaming and DEFER the drop when
+                        // refcount > 1: bind the handle anyway, mark the
+                        // tensor with StreamingDropDeferred, and let
+                        // TryFinalizeDeferredDrop retry once peer refs
+                        // release (typically end of training step).
                         try
                         {
-                            weight.DropStorageForStreaming();
+                            bool dropped = weight.TryDropStorageForStreaming(throwOnSharedRefcount: false);
                             weight.StreamingPoolHandle = handle;
+                            weight.StreamingDropDeferred = !dropped;
                         }
                         catch
                         {
@@ -235,6 +250,42 @@ public static class WeightRegistry
                     throw new ArgumentOutOfRangeException(nameof(weight.Lifetime));
             }
         }
+    }
+
+    /// <summary>
+    /// Issue #430: retries the storage drop for a streaming weight whose
+    /// registration was deferred because the storage refcount was &gt; 1 at
+    /// <see cref="RegisterWeight{T}"/> time (typically the autodiff tape's
+    /// input capture holding the second ref). Call this after the peer
+    /// reference has released — for training loops, the natural call site
+    /// is the end of each step's backward pass when the tape disposes its
+    /// captures.
+    /// <para>
+    /// Idempotent and concurrent-safe: if <see cref="Tensor{T}.StreamingDropDeferred"/>
+    /// is already <c>false</c> (already dropped, or never deferred) this
+    /// returns <c>true</c> without touching the storage. When the refcount
+    /// is still &gt; 1 it returns <c>false</c> and leaves the deferred flag
+    /// set so callers can retry on the next opportunity.
+    /// </para>
+    /// </summary>
+    /// <returns><c>true</c> if the drop succeeded (or was already done);
+    /// <c>false</c> if peer refs still hold the storage.</returns>
+    public static bool TryFinalizeDeferredDrop<T>(Tensor<T> weight)
+    {
+        if (weight is null) throw new ArgumentNullException(nameof(weight));
+        // Already finalised — either the original RegisterWeight succeeded
+        // inline or a prior TryFinalizeDeferredDrop call cleared the flag.
+        if (!weight.StreamingDropDeferred) return true;
+        // No registry lock held: TryDropStorageForStreaming is internally
+        // atomic via TryClaimExclusive's CAS. Pool bookkeeping was already
+        // recorded by the deferring RegisterWeight call; the only state
+        // mutated here is on the tensor itself.
+        bool dropped = weight.TryDropStorageForStreaming(throwOnSharedRefcount: false);
+        if (dropped)
+        {
+            weight.StreamingDropDeferred = false;
+        }
+        return dropped;
     }
 
     /// <summary>
