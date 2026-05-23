@@ -44,6 +44,12 @@ internal static class NchwcPool
         var outArr = output;
 #if NET5_0_OR_GREATER
         bool useSimd = Avx.IsSupported;
+#else
+        // audit-2026-05 phase 5 slice 3: net471 BCL SIMD. The NCHWc block is 8 wide,
+        // so the BCL Vector<float> path only applies when the JIT lane width is exactly
+        // 8 (AVX2 host); on SSE2-only (4 lanes) a contiguous load would cover half the
+        // block, so fall through to scalar.
+        bool useBcl = System.Numerics.Vector<float>.Count == CBlock;
 #endif
 
         AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, N * cg, (long)N * cg * outStrideCg, task =>
@@ -61,6 +67,8 @@ internal static class NchwcPool
                     // Initialize reduction with -Inf. SIMD path uses vector, scalar array.
 #if NET5_0_OR_GREATER
                     var vMax = Vector256.Create(float.NegativeInfinity);
+#else
+                    var vMaxBcl = new System.Numerics.Vector<float>(float.NegativeInfinity);
 #endif
                     for (int i = 0; i < CBlock; i++) acc[i] = float.NegativeInfinity;
 
@@ -83,6 +91,13 @@ internal static class NchwcPool
                                 vMax = Avx.Max(vMax, vIn);
                                 continue;
                             }
+#else
+                            if (useBcl)
+                            {
+                                var vIn = new System.Numerics.Vector<float>(inArr, idx);
+                                vMaxBcl = System.Numerics.Vector.Max(vMaxBcl, vIn);
+                                continue;
+                            }
 #endif
                             for (int cb = 0; cb < CBlock; cb++)
                                 if (inArr[idx + cb] > acc[cb]) acc[cb] = inArr[idx + cb];
@@ -94,6 +109,11 @@ internal static class NchwcPool
                     if (useSimd)
                     {
                         vMax.CopyTo(acc);
+                    }
+#else
+                    if (useBcl)
+                    {
+                        vMaxBcl.CopyTo(acc);
                     }
 #endif
                     for (int cb = 0; cb < CBlock; cb++) outArr[outIdx + cb] = acc[cb];
@@ -133,6 +153,8 @@ internal static class NchwcPool
         var outArr = output;
 #if NET5_0_OR_GREATER
         bool useSimd = Avx.IsSupported;
+#else
+        bool useBcl = System.Numerics.Vector<float>.Count == CBlock;
 #endif
 
         AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, N * cg, (long)N * cg * outStrideCg, task =>
@@ -149,6 +171,8 @@ internal static class NchwcPool
                 {
 #if NET5_0_OR_GREATER
                     var vSum = Vector256<float>.Zero;
+#else
+                    var vSumBcl = System.Numerics.Vector<float>.Zero;
 #endif
                     for (int i = 0; i < CBlock; i++) acc[i] = 0f;
                     int count = 0;
@@ -173,6 +197,13 @@ internal static class NchwcPool
                                 vSum = Avx.Add(vSum, vIn);
                                 continue;
                             }
+#else
+                            if (useBcl)
+                            {
+                                var vIn = new System.Numerics.Vector<float>(inArr, idx);
+                                vSumBcl += vIn;
+                                continue;
+                            }
 #endif
                             for (int cb = 0; cb < CBlock; cb++) acc[cb] += inArr[idx + cb];
                         }
@@ -184,6 +215,11 @@ internal static class NchwcPool
                     if (useSimd)
                     {
                         vSum.CopyTo(acc);
+                    }
+#else
+                    if (useBcl)
+                    {
+                        vSumBcl.CopyTo(acc);
                     }
 #endif
                     float inv = 1f / divisor;
@@ -212,6 +248,8 @@ internal static class NchwcPool
         var outArr = output;
 #if NET5_0_OR_GREATER
         bool useSimd = Avx.IsSupported;
+#else
+        bool useBcl = System.Numerics.Vector<float>.Count == CBlock;
 #endif
 
         AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, N * cg, (long)N * cg * inStrideCg, task =>
@@ -222,6 +260,8 @@ internal static class NchwcPool
             var acc = new float[CBlock];
 #if NET5_0_OR_GREATER
             var vSum = Vector256<float>.Zero;
+#else
+            var vSumBcl = System.Numerics.Vector<float>.Zero;
 #endif
             for (int sp = 0; sp < spatial; sp++)
             {
@@ -235,11 +275,20 @@ internal static class NchwcPool
                     vSum = Avx.Add(vSum, vIn);
                     continue;
                 }
+#else
+                if (useBcl)
+                {
+                    var vIn = new System.Numerics.Vector<float>(inArr, idx);
+                    vSumBcl += vIn;
+                    continue;
+                }
 #endif
                 for (int cb = 0; cb < CBlock; cb++) acc[cb] += inArr[idx + cb];
             }
 #if NET5_0_OR_GREATER
             if (useSimd) vSum.CopyTo(acc);
+#else
+            if (useBcl) vSumBcl.CopyTo(acc);
 #endif
             // Store into [n, ocg*CBlock + cb] of flat [N, C].
             int outBase = n * C + ocg * CBlock;
