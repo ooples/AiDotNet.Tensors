@@ -323,12 +323,12 @@ internal static class OpRegistry
         // separate BatchNormBackward path above)
         "BatchNormInference",
 
-        // Inference-only fused sequence/attention primitives (#436, PR #437):
+        // Inference-only fused sequence/attention/MLP primitives (#436, PR #437):
         // forward-only fast paths that throw on an active GradientTape. Training
-        // keeps using the decomposed LSTMLayer / MultiHeadAttention layer paths,
-        // whose constituent ops (MatMul/Softmax/etc.) record normally — same
-        // precedent as BatchNormInference above.
-        "LstmSequenceForward", "MultiHeadAttentionForward",
+        // keeps using the decomposed LSTMLayer / MultiHeadAttention / DenseLayer
+        // paths, whose constituent ops (MatMul/Softmax/FusedLinear/etc.) record
+        // normally — same precedent as BatchNormInference above.
+        "LstmSequenceForward", "MultiHeadAttentionForward", "MlpForward",
 
         // Vision Detection — Issue #217. The four IoU variants (BoxIou,
         // GeneralizedBoxIou, DistanceBoxIou, CompleteBoxIou) ARE

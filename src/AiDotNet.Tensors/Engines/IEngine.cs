@@ -4774,6 +4774,24 @@ public interface IEngine
         out Tensor<T> saveMean,
         out Tensor<T> saveVar);
 
+    /// <summary>
+    /// Fused multi-layer perceptron forward: runs a stack of dense layers
+    /// (<c>activation(x @ Wᵢ + bᵢ)</c>) in a single inference call. Closes the
+    /// MLP <c>Predict()</c> dispatch-overhead gap from issue #436 P1.
+    /// Forward-only — throws under an active <c>GradientTape</c>.
+    /// </summary>
+    /// <param name="input">[..., inFeatures] input; leading dims preserved.</param>
+    /// <param name="weights">Per-layer weights, each [inFeatures_i, outFeatures_i].</param>
+    /// <param name="biases">Per-layer biases, each [outFeatures_i] or null; same count as weights.</param>
+    /// <param name="hiddenActivation">Activation after every layer except the last.</param>
+    /// <param name="outputActivation">Activation after the last layer (default None).</param>
+    Tensor<T> MlpForward<T>(
+        Tensor<T> input,
+        IReadOnlyList<Tensor<T>> weights,
+        IReadOnlyList<Tensor<T>?> biases,
+        FusedActivationType hiddenActivation,
+        FusedActivationType outputActivation);
+
     #endregion
 
     #region Persistent Tensor Management
