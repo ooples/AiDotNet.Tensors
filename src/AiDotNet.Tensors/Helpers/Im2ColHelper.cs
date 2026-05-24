@@ -1386,6 +1386,23 @@ internal static class Im2ColHelper
         double[] c, int cOffset, int ldc,
         int m, int k)
     {
+#if NET8_0_OR_GREATER
+        // Issue #358 fix #1 names an AVX-512 small-N kernel. On AVX-512 hosts
+        // (Skylake-X / Ice Lake / Sapphire Rapids) the Mr=8 microkernel packs
+        // 8 m-rows × N=16 into 16 Vector512<double> accumulators (well inside
+        // the 32-ZMM budget), doubling the rows-per-pack of the AVX2 Mr=2 path
+        // and pushing the fat-A N=16 shape closer to the ~1 ms DGEMM peak. The
+        // AVX2 path below is left byte-identical (it still serves every non-
+        // AVX-512 host, including this repo's Zen2 dev box). Correctness is
+        // enforced by the existing ConvTranspose2DGemmCorrectnessTests, which
+        // compare against the naive 7-loop reference on whichever ISA the host
+        // exposes.
+        if (Avx512F.IsSupported)
+        {
+            DgemmTransA_N16_FatA_Avx512(a, kernelOffset, lda, b, bOffset, ldb, c, cOffset, ldc, m, k);
+            return;
+        }
+#endif
         // Clear C — we accumulate from zero. Matches BlasProvider.TryGemmEx
         // (beta=0) behaviour the dispatcher contract expects.
         Array.Clear(c, cOffset, m * ldc);
@@ -1613,6 +1630,186 @@ internal static class Im2ColHelper
             c[cOffset + ldc + j] = acc1;
         }
     }
+
+#if NET8_0_OR_GREATER
+    // Mr = 8 microkernel row tile for AVX-512. 8 m-rows × N=16 = 16
+    // Vector512<double> c-accumulators (each row's 16 cols split into two
+    // 8-double halves) + 2 b-vectors + 1 a-broadcast = 19 ZMM, inside the
+    // 32-ZMM AVX-512 budget. Mc=64 is divisible by both Mr=8 and Mr=2.
+    private const int DgemmFatAMr8 = 8;
+
+    /// <summary>
+    /// AVX-512 variant of <see cref="DgemmTransA_N16_FatA"/> (Mr=8). Same
+    /// BLIS-style packed-A + Mc=64 macro-blocking and parallel-Mc dispatch as
+    /// the AVX2 path; only the row-tile width and microkernel ISA differ.
+    /// </summary>
+    private static void DgemmTransA_N16_FatA_Avx512(
+        double[] a, int kernelOffset, int lda,
+        double[] b, int bOffset, int ldb,
+        double[] c, int cOffset, int ldc,
+        int m, int k)
+    {
+        Array.Clear(c, cOffset, m * ldc);
+
+        const int Mc = DgemmFatAMc;
+        const int Mr = DgemmFatAMr8;
+        int mcBlocks = m / Mc;
+        int mcTail = m - mcBlocks * Mc;
+
+        var pool = ArrayPool<double>.Shared;
+        int procs = AiDotNet.Tensors.Helpers.CpuParallelSettings.MaxDegreeOfParallelism;
+        bool useParallel = procs > 1 && mcBlocks >= 2 && (long)m * k * 16 >= (1L << 22);
+
+        if (useParallel)
+        {
+            int packedSize = Mc * k;
+            var po = new System.Threading.Tasks.ParallelOptions { MaxDegreeOfParallelism = procs };
+            System.Threading.Tasks.Parallel.For(
+                0, mcBlocks, po,
+                localInit: () => pool.Rent(packedSize),
+                body: (mb, _, packedA) =>
+                {
+                    int mcStart = mb * Mc;
+                    PackAPanel_TransA_N16_Mr8(a, kernelOffset, lda, packedA, mcStart, Mc, k);
+                    int mrBlocks = Mc / Mr;
+                    for (int mrOuter = 0; mrOuter < mrBlocks; mrOuter++)
+                        Microkernel_TransA_N16_Mr8(
+                            packedA, mrOuter * k * Mr, b, bOffset, ldb,
+                            c, cOffset + (mcStart + mrOuter * Mr) * ldc, ldc, k);
+                    return packedA;
+                },
+                localFinally: localPacked => pool.Return(localPacked));
+        }
+        else
+        {
+            double[] packedA = pool.Rent(Mc * k);
+            try
+            {
+                for (int mb = 0; mb < mcBlocks; mb++)
+                {
+                    int mcStart = mb * Mc;
+                    PackAPanel_TransA_N16_Mr8(a, kernelOffset, lda, packedA, mcStart, Mc, k);
+                    int mrBlocks = Mc / Mr;
+                    for (int mrOuter = 0; mrOuter < mrBlocks; mrOuter++)
+                        Microkernel_TransA_N16_Mr8(
+                            packedA, mrOuter * k * Mr, b, bOffset, ldb,
+                            c, cOffset + (mcStart + mrOuter * Mr) * ldc, ldc, k);
+                }
+            }
+            finally { pool.Return(packedA); }
+        }
+
+        // Tail: pack the largest Mr=8 multiple, then a 1-row scalar remainder.
+        double[] packedTailBuf = pool.Rent(Mc * k);
+        try
+        {
+            if (mcTail >= Mr)
+            {
+                int mcStart = mcBlocks * Mc;
+                int packedRows = (mcTail / Mr) * Mr;
+                PackAPanel_TransA_N16_Mr8(a, kernelOffset, lda, packedTailBuf, mcStart, packedRows, k);
+                int mrBlocks = packedRows / Mr;
+                for (int mrOuter = 0; mrOuter < mrBlocks; mrOuter++)
+                    Microkernel_TransA_N16_Mr8(
+                        packedTailBuf, mrOuter * k * Mr, b, bOffset, ldb,
+                        c, cOffset + (mcStart + mrOuter * Mr) * ldc, ldc, k);
+                mcTail -= packedRows;
+            }
+            for (int r = 0; r < mcTail; r++)
+            {
+                int mGlobal = m - mcTail + r;
+                for (int j = 0; j < 16; j++)
+                {
+                    double acc = 0;
+                    for (int kk = 0; kk < k; kk++)
+                        acc += a[kernelOffset + (long)kk * lda + mGlobal] * b[bOffset + kk * ldb + j];
+                    c[cOffset + mGlobal * ldc + j] = acc;
+                }
+            }
+        }
+        finally { pool.Return(packedTailBuf); }
+    }
+
+    /// <summary>Mr=8 BLIS pack: packed[mrOuter, kk, ri] for ri in 0..7.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe void PackAPanel_TransA_N16_Mr8(
+        double[] a, int aOffset, int lda,
+        double[] packed, int mcStart, int mc, int k)
+    {
+        const int Mr = DgemmFatAMr8;
+        int mrBlocks = mc / Mr;
+        fixed (double* pA = &a[aOffset])
+        fixed (double* pPacked = packed)
+        {
+            for (int mrOuter = 0; mrOuter < mrBlocks; mrOuter++)
+            {
+                int mGlobal = mcStart + mrOuter * Mr;
+                double* outBase = pPacked + (long)mrOuter * k * Mr;
+                for (int kk = 0; kk < k; kk++)
+                {
+                    double* aRow = pA + (long)kk * lda + mGlobal;
+                    double* outRow = outBase + (long)kk * Mr;
+                    for (int ri = 0; ri < Mr; ri++)
+                        outRow[ri] = aRow[ri];
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Mr=8, Nr=16 FP64 AVX-512 microkernel over the BLIS-packed panel. Per kk:
+    /// 2 B-loads (Vector512, the full N=16 row), 8 a-broadcasts, 16 fused
+    /// multiply-adds into 16 ZMM accumulators (8 rows × 2 halves). Mirrors the
+    /// proven Avx512Fp64_8x16 FMA pattern in the BlasManaged subsystem.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe void Microkernel_TransA_N16_Mr8(
+        double[] packedA, int packedOffset,
+        double[] b, int bOffset, int ldb,
+        double[] c, int cOffset, int ldc,
+        int k)
+    {
+        const int Mr = DgemmFatAMr8;
+        var cLo0 = Vector512<double>.Zero; var cHi0 = Vector512<double>.Zero;
+        var cLo1 = Vector512<double>.Zero; var cHi1 = Vector512<double>.Zero;
+        var cLo2 = Vector512<double>.Zero; var cHi2 = Vector512<double>.Zero;
+        var cLo3 = Vector512<double>.Zero; var cHi3 = Vector512<double>.Zero;
+        var cLo4 = Vector512<double>.Zero; var cHi4 = Vector512<double>.Zero;
+        var cLo5 = Vector512<double>.Zero; var cHi5 = Vector512<double>.Zero;
+        var cLo6 = Vector512<double>.Zero; var cHi6 = Vector512<double>.Zero;
+        var cLo7 = Vector512<double>.Zero; var cHi7 = Vector512<double>.Zero;
+
+        fixed (double* pA = &packedA[packedOffset])
+        fixed (double* pB = &b[bOffset])
+        fixed (double* pC = &c[cOffset])
+        {
+            for (int kk = 0; kk < k; kk++)
+            {
+                double* aPtr = pA + (long)kk * Mr;
+                double* bRow = pB + (long)kk * ldb;
+                var vbLo = Avx512F.LoadVector512(bRow + 0);
+                var vbHi = Avx512F.LoadVector512(bRow + 8);
+                var a0 = Vector512.Create(aPtr[0]); cLo0 = Avx512F.FusedMultiplyAdd(a0, vbLo, cLo0); cHi0 = Avx512F.FusedMultiplyAdd(a0, vbHi, cHi0);
+                var a1 = Vector512.Create(aPtr[1]); cLo1 = Avx512F.FusedMultiplyAdd(a1, vbLo, cLo1); cHi1 = Avx512F.FusedMultiplyAdd(a1, vbHi, cHi1);
+                var a2 = Vector512.Create(aPtr[2]); cLo2 = Avx512F.FusedMultiplyAdd(a2, vbLo, cLo2); cHi2 = Avx512F.FusedMultiplyAdd(a2, vbHi, cHi2);
+                var a3 = Vector512.Create(aPtr[3]); cLo3 = Avx512F.FusedMultiplyAdd(a3, vbLo, cLo3); cHi3 = Avx512F.FusedMultiplyAdd(a3, vbHi, cHi3);
+                var a4 = Vector512.Create(aPtr[4]); cLo4 = Avx512F.FusedMultiplyAdd(a4, vbLo, cLo4); cHi4 = Avx512F.FusedMultiplyAdd(a4, vbHi, cHi4);
+                var a5 = Vector512.Create(aPtr[5]); cLo5 = Avx512F.FusedMultiplyAdd(a5, vbLo, cLo5); cHi5 = Avx512F.FusedMultiplyAdd(a5, vbHi, cHi5);
+                var a6 = Vector512.Create(aPtr[6]); cLo6 = Avx512F.FusedMultiplyAdd(a6, vbLo, cLo6); cHi6 = Avx512F.FusedMultiplyAdd(a6, vbHi, cHi6);
+                var a7 = Vector512.Create(aPtr[7]); cLo7 = Avx512F.FusedMultiplyAdd(a7, vbLo, cLo7); cHi7 = Avx512F.FusedMultiplyAdd(a7, vbHi, cHi7);
+            }
+
+            Avx512F.Store(pC + 0 * ldc + 0, cLo0); Avx512F.Store(pC + 0 * ldc + 8, cHi0);
+            Avx512F.Store(pC + 1 * ldc + 0, cLo1); Avx512F.Store(pC + 1 * ldc + 8, cHi1);
+            Avx512F.Store(pC + 2 * ldc + 0, cLo2); Avx512F.Store(pC + 2 * ldc + 8, cHi2);
+            Avx512F.Store(pC + 3 * ldc + 0, cLo3); Avx512F.Store(pC + 3 * ldc + 8, cHi3);
+            Avx512F.Store(pC + 4 * ldc + 0, cLo4); Avx512F.Store(pC + 4 * ldc + 8, cHi4);
+            Avx512F.Store(pC + 5 * ldc + 0, cLo5); Avx512F.Store(pC + 5 * ldc + 8, cHi5);
+            Avx512F.Store(pC + 6 * ldc + 0, cLo6); Avx512F.Store(pC + 6 * ldc + 8, cHi6);
+            Avx512F.Store(pC + 7 * ldc + 0, cLo7); Avx512F.Store(pC + 7 * ldc + 8, cHi7);
+        }
+    }
+#endif
 
     #endregion
 }
