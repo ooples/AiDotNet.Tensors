@@ -18,6 +18,7 @@
 | 3c | NchwcConv2D: forward (was hard-disabled on net471) | ✅ |
 | 3d | FusedKernels: Swish/GELU/Mish/AddReLU/SigmoidMul/RMSNorm/LayerNorm/Softmax/LogSoftmax/BatchNorm | ✅ |
 | 4 | SimdGemm micro-kernel | already vectorized — see §C |
+| 6 | Backward-pass SIMD (Softmax/GELU/LayerNorm/BatchNorm backward, float+double; *_Half transitive) + Floor/Ceiling (float+double) | ✅ — see §D, §E |
 
 ## Problem
 
@@ -119,15 +120,17 @@ The original deferral claimed the 8-channel-block assumption blocked a portable 
 
 Investigated: SimdGemm's net471 path (`SgemmVector`, line 1313) is **already** a fully `Vector<float>`-vectorized axpy-over-N kernel with a 4×-unrolled inner loop — a prior PR closed this (the method's own doc-comment notes net471 previously fell to scalar and now reaches "~8× over scalar on AVX2"). The net5 hand-unrolled 6×16 / 4×8 micro-kernels are an *additional* optimization on top, gated on `Avx2.IsSupported`, that targets specific small-matmul shapes; porting their exact unroll geometry to BCL `Vector<T>` would yield marginal gains over `SgemmVector` and risks regressing the tuned net5 path. No action needed — GEMM is not a net471 scalar-fallback gap.
 
-### D. Math primitives — Sin/Cos/Pow DONE (slice 2b); Floor/Ceiling/Frac/Log2 remain
+### D. Math primitives — Sin/Cos/Pow DONE (slice 2b); Floor/Ceiling DONE (slice 6); Frac/Log2 remain
 
 `Sin`/`Cos` (Cephes 2/π-reduction minimax port) and `Pow` (= `exp(exp·log(x))`) are now wired (slice 2b), with huge-magnitude / non-positive-base blocks routed to libm per the net10 gates.
 
-`Floor`/`Ceiling`/`Frac` stay scalar: the BCL has no `Vector<T>.Floor` before .NET 7 (`Vector.Floor` is .NET 7+), and the convert-to-int-truncate-and-correct trick needs per-call sign masking that erodes the win for these low-call-volume ops. `Log2` = `Log(x) · 1.4426950408` could compose the bridge `FastLog` if a caller ever shows it hot.
+`Floor`/`Ceiling` are now wired (slice 6) via the convert-to-int-truncate-and-correct trick: `floor(x) = trunc(x) − (trunc(x) > x ? 1 : 0)`, guarded to `|x| < 2^23` (float) / `2^52` (double) — above which the value is already integer-valued in the float/double, so `x` is returned directly (this branch also passes `NaN`/`±Inf` through unchanged, matching `MathF.Floor`/`Math.Floor`). The earlier concern about `Vector<T>.Floor` being .NET7+ stands, but the int round-trip (`Vector.ConvertToInt32`/`ConvertToInt64` + `ConvertToSingle`/`ConvertToDouble`, all present on the net471 BCL `Vector`) closes it with no per-element scalar fallback.
 
-### E. Backward-pass primitives (SoftmaxBackward, LayerNormBackward, GELUBackward, BatchNormBackward, *_Half variants)
+`Frac` stays scalar (composes Floor — could wire later). `Log2` = `Log(x) · 1.4426950408` could compose the bridge `FastLog` if a caller ever shows it hot.
 
-Now unblocked by slice 2's transcendentals; wire in a follow-up. The `*_Half` variants additionally need a `Vector<float>`-from-`Half` widening path.
+### E. Backward-pass primitives — DONE (slice 6)
+
+`SoftmaxBackward`, `GELUBackward`, `LayerNormBackward`, and `BatchNormBackward` now have net471 BCL `Vector<T>` paths for **both float and double** (the reductions use `Vector.Dot(acc, One)` horizontal sums; the elementwise passes use `MemoryMarshal.Cast<T, Vector<T>>`). GELU's `tanh` is composed from the bridge's `FastExp`/`FastExpDouble` (slice 2's transcendentals unblocked this; the double exp was added to the bridge in slice 6). The `*_Half` variants accelerate transitively — they convert `Half→float`, run the now-vectorized float `Unsafe` kernel, and convert back, so no separate `Vector<float>`-from-`Half` path is required. Verified by 22 net471 parity tests vs an independent scalar reference (`BackwardSimdParityTests`, `RoundingSimdNet471Tests`).
 
 ## Cumulative impact (delivered on this branch)
 
