@@ -1,3 +1,4 @@
+#pragma warning disable CS0618 // SimdGemm.Sgemm (no-trans shim) is [Obsolete] — pending migration to BlasManaged.Gemm<T> in a later K task.
 using AiDotNet.Tensors.Engines.Simd;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;

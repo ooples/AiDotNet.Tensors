@@ -1,3 +1,4 @@
+#pragma warning disable CS0618 // SimdGemm.Sgemm/Dgemm (no-trans shims) are [Obsolete] — pending migration to BlasManaged.Gemm<T> in later K tasks.
 using System.Buffers;
 using System.Diagnostics;
 using System.IO;
@@ -2007,6 +2008,65 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
             if (allowCachedB)
             {
+                // Sub-E (#373): pre-pack B at plan-compile time so the replay
+                // closure routes through BlasManaged.Gemm with the cached handle.
+                // B is constant across inference calls (allowCachedB=true).
+                //
+                // Sources for the handle, in priority order:
+                //   1. Caller pre-registered inputB via FrozenWeightRegistry AND
+                //      managed wins for this shape — use the registry handle.
+                //   2. Caller didn't register but managed wins anyway — pre-pack
+                //      here at compile time.
+                //   3. Otherwise no pre-pack — legacy TryGemm/SgemmWithCachedB
+                //      stays intact (native BLAS is faster than managed at this
+                //      shape; routing managed despite the pre-pack regresses
+                //      end-to-end perf — see the regression test
+                //      Registered_FFN_128x768x768_Inference_Loop_Faster_Than_Unregistered).
+                bool willRouteManaged =
+                    Engines.BlasManaged.BlasManaged.PreferManaged
+                    || !Helpers.BlasProvider.IsAvailable
+                    || (Engines.BlasManaged.BlasManaged.AutotuneRouting
+                        && Engines.BlasManaged.PrefersManagedCache.PrefersManaged(
+                            M, N, K, transA: false, transB: false, dtype: typeof(float)));
+
+                Engines.BlasManaged.WeightPackHandle? prePackedB = null;
+                if (willRouteManaged)
+                {
+                    // Prefer the caller's registered handle so we don't double-allocate.
+                    prePackedB = Engines.BlasManaged.FrozenWeightRegistry.TryGetHandle(inputB);
+                    if (prePackedB == null)
+                    {
+                        prePackedB = Engines.BlasManaged.BlasManaged.PrePackB<float>(
+                            new ReadOnlySpan<float>(cB), N, transB: false, k: K, n: N);
+                    }
+                }
+
+                if (prePackedB != null)
+                {
+                    var capturedB = prePackedB;
+                    return eng =>
+                    {
+                        // Bypass autotune routing inside BlasProvider — we've
+                        // already decided managed wins and are passing the
+                        // pre-packed handle directly.
+                        bool prevBypass = Engines.BlasManaged.PrefersManagedCache.BypassAutotune;
+                        Engines.BlasManaged.PrefersManagedCache.BypassAutotune = true;
+                        try
+                        {
+                            Engines.BlasManaged.BlasManaged.Gemm<float>(
+                                new ReadOnlySpan<float>(cA), K, false,
+                                new ReadOnlySpan<float>(cB), N, false,
+                                new Span<float>(cOut), N,
+                                M, N, K,
+                                new Engines.BlasManaged.BlasOptions<float> { PackedB = capturedB });
+                        }
+                        finally
+                        {
+                            Engines.BlasManaged.PrefersManagedCache.BypassAutotune = prevBypass;
+                        }
+                    };
+                }
+
                 return eng =>
                 {
                     if (!BlasProvider.TryGemm(M, N, K, cA, 0, K, cB, 0, N, cOut, 0, N))
