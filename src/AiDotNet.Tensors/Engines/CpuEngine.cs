@@ -24498,6 +24498,21 @@ public partial class CpuEngine : ITensorLevelEngine
 
                 // Step 1: scores = Q · K^T. Pre-transpose this head's K into a
                 // pooled scratch buffer so the GEMM doesn't need transB support.
+                //
+                // PR #426 Linux CI follow-up: bypass BlasProvider.TryGemmEx
+                // entirely and call SimdGemm.DgemmSequential directly — matches
+                // the float path's design (FlashAttentionFloat goes straight
+                // to SgemmSequential without trying OpenBLAS first). Pre-fix
+                // the double path preferred native OpenBLAS; even with the
+                // ScopeOpenBlasThreads(1) cap from PR #410, 8 concurrent worker
+                // threads contending on OpenBLAS's internal mutex serialised
+                // badly on Linux CI runners and the
+                // FlashAttentionDouble_SdUnetShape_CompletesUnderBudget test
+                // (#411 regression guard) timed out at 30s. SimdGemm's
+                // managed kernel is per-thread stateless (no global mutex)
+                // and at FlashAttention's per-head shapes (M=seqQ,
+                // K=headDim≤128, N=seqK) the AVX2/AVX-512 SIMD kernel is
+                // competitive with native DGEMM.
                 var kt = System.Buffers.ArrayPool<double>.Shared.Rent(headDim * seqK);
                 try
                 {
@@ -24505,17 +24520,11 @@ public partial class CpuEngine : ITensorLevelEngine
                         for (int j = 0; j < headDim; j++)
                             kt[j * seqK + i] = kd[kOff + i * headDim + j];
 
-                    if (!BlasProvider.TryGemmEx(seqQ, seqK, headDim,
-                        qd, qOff, headDim, false,
-                        kt, 0, seqK, false,
-                        scoresData, sOff, seqK))
-                    {
-                        SimdGemm.DgemmSequential(
-                            qd.AsSpan(qOff, seqQ * headDim),
-                            kt.AsSpan(0, headDim * seqK),
-                            scoresData.AsSpan(sOff, seqQ * seqK),
-                            seqQ, headDim, seqK);
-                    }
+                    SimdGemm.DgemmSequential(
+                        qd.AsSpan(qOff, seqQ * headDim),
+                        kt.AsSpan(0, headDim * seqK),
+                        scoresData.AsSpan(sOff, seqQ * seqK),
+                        seqQ, headDim, seqK);
                 }
                 finally { System.Buffers.ArrayPool<double>.Shared.Return(kt); }
 
@@ -24563,20 +24572,15 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
 
                 // Step 3: output = softmax · V. No transpose, V is row-major.
+                // Same SimdGemm-direct rationale as Step 1 (PR #426 CI fix).
                 int wOff = bh * seqQ * seqK;
                 int vOff = bh * seqK * d_v;
                 int oOff = bh * seqQ * d_v;
-                if (!BlasProvider.TryGemmEx(seqQ, d_v, seqK,
-                    weightsData, wOff, seqK, false,
-                    vd, vOff, d_v, false,
-                    outputData, oOff, d_v))
-                {
-                    SimdGemm.DgemmSequential(
-                        weightsData.AsSpan(wOff, seqQ * seqK),
-                        vd.AsSpan(vOff, seqK * d_v),
-                        outputData.AsSpan(oOff, seqQ * d_v),
-                        seqQ, seqK, d_v);
-                }
+                SimdGemm.DgemmSequential(
+                    weightsData.AsSpan(wOff, seqQ * seqK),
+                    vd.AsSpan(vOff, seqK * d_v),
+                    outputData.AsSpan(oOff, seqQ * d_v),
+                    seqQ, seqK, d_v);
             });
 
             softmaxStats = TensorAllocator.Rent<double>(
