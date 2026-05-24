@@ -84,9 +84,20 @@
           Condition="'$(_AiDotNetAnyDisableFlagRequested)' == 'true' And !Exists('$(_AiDotNetLicenseValidatorDll)')">
     <Message Importance="high"
              Text="AiDotNet enterprise gate: building the license-validator task assembly because the precompiled DLL is missing at $(_AiDotNetLicenseValidatorDll)." />
+    <!--
+      RemoveProperties="TargetFramework": the parent build sets TargetFramework
+      as a global property while multi-targeting (net10.0 / net471). Without
+      stripping it, that value propagates into this inner build and the
+      netstandard2.0 validator project is asked to build for net471 — which
+      fails with MSB3644 (no net471 ref assemblies for a netstandard2.0
+      project) and was the reason the net471 build path silently skipped the
+      gate. Restore is included so the validator's BouncyCastle / System.Text.Json
+      references resolve on a fresh source tree (otherwise NETSDK1004).
+    -->
     <MSBuild Projects="$(MSBuildThisFileDirectory)LicenseValidator\AiDotNet.Tensors.LicenseValidator.csproj"
-             Targets="Build"
-             Properties="Configuration=Release" />
+             Targets="Restore;Build"
+             Properties="Configuration=Release"
+             RemoveProperties="TargetFramework" />
   </Target>
 
   <UsingTask

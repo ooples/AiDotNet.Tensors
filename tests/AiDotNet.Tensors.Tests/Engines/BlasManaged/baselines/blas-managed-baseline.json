@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "captured_on": "2026-05-17",
+  "hardware_fingerprint": "x64-amd-avx2-cpu16",
+  "framework": "net10.0",
+  "notes": "Captured at commit b97c655 on AVX2-only host (no AVX-512). AVX-512 hosts will see substantially lower numbers. Values are the 95th-percentile observed across 5 test runs on a noisy dev box; this ensures the 50% tolerance check does not flake due to OS scheduling jitter.",
+  "shapes": [
+    {
+      "id": "L2_4096x16x512_TA",
+      "m": 4096, "n": 16, "k": 512,
+      "trans_a": true, "trans_b": false,
+      "median_ms": 9.00, "p95_ms": 12.00,
+      "iterations": 30, "warmup": 3
+    },
+    {
+      "id": "Small_64sq",
+      "m": 64, "n": 64, "k": 64,
+      "trans_a": false, "trans_b": false,
+      "median_ms": 0.80, "p95_ms": 1.20,
+      "iterations": 30, "warmup": 3
+    },
+    {
+      "id": "Medium_128sq",
+      "m": 128, "n": 128, "k": 128,
+      "trans_a": false, "trans_b": false,
+      "median_ms": 1.50, "p95_ms": 2.50,
+      "iterations": 30, "warmup": 3
+    },
+    {
+      "id": "Large_256sq",
+      "m": 256, "n": 256, "k": 256,
+      "trans_a": false, "trans_b": false,
+      "median_ms": 7.00, "p95_ms": 12.00,
+      "iterations": 30, "warmup": 3
+    },
+    {
+      "id": "MHeavy_512x32x128",
+      "m": 512, "n": 32, "k": 128,
+      "trans_a": false, "trans_b": false,
+      "median_ms": 1.00, "p95_ms": 1.80,
+      "iterations": 30, "warmup": 3
+    },
+    {
+      "id": "NHeavy_32x512x128",
+      "m": 32, "n": 512, "k": 128,
+      "trans_a": false, "trans_b": false,
+      "median_ms": 2.50, "p95_ms": 4.00,
+      "iterations": 30, "warmup": 3
+    },
+    {
+      "id": "SmallK_64x64x16",
+      "m": 64, "n": 64, "k": 16,
+      "trans_a": false, "trans_b": false,
+      "median_ms": 0.30, "p95_ms": 0.60,
+      "iterations": 30, "warmup": 3
+    },
+    {
+      "id": "TallK_32x32x1024",
+      "m": 32, "n": 32, "k": 1024,
+      "trans_a": false, "trans_b": false,
+      "median_ms": 1.50, "p95_ms": 2.50,
+      "iterations": 30, "warmup": 3
+    },
+    {
+      "id": "TransA_128sq_K256",
+      "m": 128, "n": 128, "k": 256,
+      "trans_a": true, "trans_b": false,
+      "median_ms": 2.80, "p95_ms": 4.50,
+      "iterations": 30, "warmup": 3
+    },
+    {
+      "id": "TransB_128sq_K256",
+      "m": 128, "n": 128, "k": 256,
+      "trans_a": false, "trans_b": true,
+      "median_ms": 2.20, "p95_ms": 3.50,
+      "iterations": 30, "warmup": 3
+    }
+  ]
+}
