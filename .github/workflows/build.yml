@@ -122,6 +122,30 @@ jobs:
           exit 0
         fi
 
+        # Bootstrap-mode detection: a baseline file that is a placeholder (e.g.,
+        # the audit-phase0 stub with line=0, branch=0, recorded_sha="pending-...")
+        # must NOT enforce the ratchet — line=0 means everything passes the
+        # "current < baseline - tolerance" check. CodeRabbit (PR #438) flagged
+        # this as a silent gate disablement. Detect via the
+        # `_initial_value_pending` marker key OR a `recorded_sha` that starts
+        # with `pending-`. When either is true, treat the run as bootstrap and
+        # print the measured numbers for the human to record in a follow-up PR.
+        BASELINE_PENDING=$(python3 -c "
+        import json
+        with open('$COVERAGE_BASELINE_FILE') as f:
+            data = json.load(f)
+        sha = str(data.get('recorded_sha', ''))
+        pending = bool(data.get('_initial_value_pending')) or sha.startswith('pending-')
+        print('yes' if pending else 'no')
+        ")
+        if [ "$BASELINE_PENDING" = "yes" ]; then
+          echo "::warning::$COVERAGE_BASELINE_FILE is in bootstrap state (placeholder values; _initial_value_pending set or recorded_sha begins with 'pending-'). Ratchet enforcement skipped for this run."
+          echo "Measured this run: line=${LINE_RATE}% branch=${BRANCH_RATE}%"
+          echo "Update $COVERAGE_BASELINE_FILE in a dedicated follow-up PR with:"
+          echo "  {\"line\": ${LINE_RATE}, \"branch\": ${BRANCH_RATE}, \"recorded_at\": \"$(date -u +%Y-%m-%d)\", \"recorded_sha\": \"$GITHUB_SHA\"}"
+          exit 0
+        fi
+
         BASELINE_LINE=$(python3 -c "
         import json
         with open('$COVERAGE_BASELINE_FILE') as f:
