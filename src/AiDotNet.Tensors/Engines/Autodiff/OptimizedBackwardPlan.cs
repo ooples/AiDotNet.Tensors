@@ -31,6 +31,12 @@ internal sealed class OptimizedBackwardPlan<T>
     /// </summary>
     private readonly HashSet<Tensor<T>>? _retainGrad;
 
+    // Issue #433 phase-2: scratch buffers for GetInputsArrayInto, populated
+    // at the top of Execute() and reused across all entries in the inner loop.
+    private Tensor<T>[]? _inputsBuf1;
+    private Tensor<T>[]? _inputsBuf2;
+    private Tensor<T>[]? _inputsBuf3;
+
     internal OptimizedBackwardPlan(
         TapeEntryArena<T> entries,
         int[] reachableIndices,
@@ -92,6 +98,15 @@ internal sealed class OptimizedBackwardPlan<T>
         grads[_loss] = seedGrad;
         if (_loss._gradIndex >= 0) indexedGrads[_loss._gradIndex] = seedGrad;
 
+        // Thread-local scratch buffers for GetInputsArrayInto (issue #433
+        // phase-2). Acquired once outside the entry loop; reused across all
+        // ~600 entries on SenseVoice. Same buffers CompiledBackwardGraph
+        // uses — they're per-T thread-local so the two execute paths share
+        // them safely (the buffers don't carry state across calls).
+        _inputsBuf1 = BackwardInputBuffers<T>.Get1();
+        _inputsBuf2 = BackwardInputBuffers<T>.Get2();
+        _inputsBuf3 = BackwardInputBuffers<T>.Get3();
+
         try
         {
             foreach (int i in _reachableIndices)
@@ -110,7 +125,13 @@ internal sealed class OptimizedBackwardPlan<T>
                 // Default path: use the original backward function.
                 // Phase A (#338) timing wrapper records per-op ticks when
                 // AIDOTNET_BWD_TIMING=1.
-                var inputsArray = entry.GetInputsArray();
+                //
+                // Issue #433 phase-2: GetInputsArrayInto with thread-local
+                // scratch buffers eliminates the per-entry array allocation
+                // GetInputsArray() previously paid. Buffers acquired once
+                // before the loop, reused across all entries; same buffers
+                // CompiledBackwardGraph.Execute uses.
+                var inputsArray = entry.GetInputsArrayInto(_inputsBuf1!, _inputsBuf2!, _inputsBuf3!);
                 long _bwdStart = BackwardTiming.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
                 entry.Backward(gradOutput, inputsArray, entry.Output,
                     entry.SavedState ?? Array.Empty<object>(), _engine, grads);
@@ -122,6 +143,9 @@ internal sealed class OptimizedBackwardPlan<T>
         {
             cse.Clear();
             DifferentiableOps.ClearIndexedGrads();
+            // Issue #433 phase-2: clear thread-local input buffers (see
+            // CompiledBackwardGraph.Execute for the leak-test rationale).
+            BackwardInputBuffers<T>.Clear();
 
             // Parity with CompiledBackwardGraph.Execute's finally block:
             // a consumer-side cache that retains a forward intermediate

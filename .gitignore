@@ -30,7 +30,14 @@ bld/
 *.snupkg
 project.lock.json
 project.fragment.lock.json
-artifacts/
+# BlasManaged perf-sprint data (issue #368): the `artifacts/` directory is build
+# output by convention, but `artifacts/perf/*.json` is committed because it drives
+# the bench catalog and the PerfBarTest gate. Re-include via per-level negation
+# (git doesn't recurse into excluded directories).
+artifacts/*
+!artifacts/perf/
+artifacts/perf/*
+!artifacts/perf/*.json
 
 # Build
 [Oo]ut/
