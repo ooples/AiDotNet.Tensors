@@ -56,4 +56,44 @@ public unsafe class RoundingSimdNet471Tests
             else Assert.True(got[i] == expected, $"Ceiling({input[i]:G9}) = {got[i]:G9}, expected {expected:G9}");
         }
     }
+
+    private static double[] EdgeCasesD() => new[]
+    {
+        0d, -0d, 0.3, -0.3, 2.7, -2.7, 3.0, -3.0, 5d, -5d,
+        0.9999999999, -0.9999999999, 1.0000000001, -1.0000000001,
+        123.456, -123.456, 4503599627370496.0 /*2^52*/, -4503599627370496.0,
+        9007199254740992.0 /*2^53*/, 1e15, -1e15,
+        double.PositiveInfinity, double.NegativeInfinity,
+        1.5, -1.5, 2.5, -2.5, 100.1, -100.1, 0.001, -0.001, 42d, -42d, 7.7, -7.7, 9.2,
+    };
+
+    [Fact]
+    public void Floor_Double_MatchesMath()
+    {
+        var input = EdgeCasesD();
+        var got = new double[input.Length];
+        fixed (double* ip = input, op = got)
+            SimdKernels.FloorUnsafe(ip, op, input.Length);
+        for (int i = 0; i < input.Length; i++)
+        {
+            double expected = Math.Floor(input[i]);
+            if (double.IsNaN(expected)) Assert.True(double.IsNaN(got[i]));
+            else Assert.True(got[i] == expected, $"Floor({input[i]:G17}) = {got[i]:G17}, expected {expected:G17}");
+        }
+    }
+
+    [Fact]
+    public void Ceiling_Double_MatchesMath()
+    {
+        var input = EdgeCasesD();
+        var got = new double[input.Length];
+        fixed (double* ip = input, op = got)
+            SimdKernels.CeilingUnsafe(ip, op, input.Length);
+        for (int i = 0; i < input.Length; i++)
+        {
+            double expected = Math.Ceiling(input[i]);
+            if (double.IsNaN(expected)) Assert.True(double.IsNaN(got[i]));
+            else Assert.True(got[i] == expected, $"Ceiling({input[i]:G17}) = {got[i]:G17}, expected {expected:G17}");
+        }
+    }
 }

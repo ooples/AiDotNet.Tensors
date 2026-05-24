@@ -1162,6 +1162,29 @@ namespace AiDotNet.Tensors.Engines.Simd
                 for (; i < simdLength; i += 4)
                     Avx.Store(output + i, Avx.Floor(Avx.LoadVector256(input + i)));
             }
+#else
+            // net471 §D: floor(x) = trunc(x) - (trunc(x) > x ? 1 : 0); guarded to
+            // |x| < 2^52 (above which doubles are integer-valued, so x is returned
+            // directly — which also passes NaN/±Inf through to match Math.Floor).
+            {
+                int lanes = Vector<double>.Count;
+                int simdLen = length - (length % lanes);
+                if (simdLen > 0)
+                {
+                    var one = Vector<double>.One;
+                    var pow2_52 = new Vector<double>(4503599627370496.0);
+                    var inV = MemoryMarshal.Cast<double, Vector<double>>(new ReadOnlySpan<double>(input, simdLen));
+                    var outV = MemoryMarshal.Cast<double, Vector<double>>(new Span<double>(output, simdLen));
+                    for (int v = 0; v < inV.Length; v++)
+                    {
+                        var x = inV[v];
+                        var trunc = Vector.ConvertToDouble(Vector.ConvertToInt64(x));
+                        var floorTrick = Vector.ConditionalSelect(Vector.GreaterThan(trunc, x), trunc - one, trunc);
+                        outV[v] = Vector.ConditionalSelect(Vector.LessThan(Vector.Abs(x), pow2_52), floorTrick, x);
+                    }
+                    i = simdLen;
+                }
+            }
 #endif
             for (; i < length; i++)
                 output[i] = Math.Floor(input[i]);
@@ -1191,6 +1214,27 @@ namespace AiDotNet.Tensors.Engines.Simd
                 int simdLength = i + ((length - i) & ~3);
                 for (; i < simdLength; i += 4)
                     Avx.Store(output + i, Avx.Ceiling(Avx.LoadVector256(input + i)));
+            }
+#else
+            // net471 §D: ceil(x) = trunc(x) + (trunc(x) < x ? 1 : 0); |x| < 2^52 guard.
+            {
+                int lanes = Vector<double>.Count;
+                int simdLen = length - (length % lanes);
+                if (simdLen > 0)
+                {
+                    var one = Vector<double>.One;
+                    var pow2_52 = new Vector<double>(4503599627370496.0);
+                    var inV = MemoryMarshal.Cast<double, Vector<double>>(new ReadOnlySpan<double>(input, simdLen));
+                    var outV = MemoryMarshal.Cast<double, Vector<double>>(new Span<double>(output, simdLen));
+                    for (int v = 0; v < inV.Length; v++)
+                    {
+                        var x = inV[v];
+                        var trunc = Vector.ConvertToDouble(Vector.ConvertToInt64(x));
+                        var ceilTrick = Vector.ConditionalSelect(Vector.LessThan(trunc, x), trunc + one, trunc);
+                        outV[v] = Vector.ConditionalSelect(Vector.LessThan(Vector.Abs(x), pow2_52), ceilTrick, x);
+                    }
+                    i = simdLen;
+                }
             }
 #endif
             for (; i < length; i++)
@@ -8187,6 +8231,35 @@ namespace AiDotNet.Tensors.Engines.Simd
                     var part2 = Avx.Multiply(vHalf, Avx.Multiply(x, Avx.Multiply(sechSq, dArgDx)));
                     var derivative = Avx.Add(part1, part2);
                     Avx.Store(output + i, Avx.Multiply(g, derivative));
+                }
+            }
+#else
+            // net471 §E: BCL Vector<double> GELU', tanh via FastTanhDouble.
+            {
+                int lanes = Vector<double>.Count;
+                int simdLen = length - (length % lanes);
+                if (simdLen > 0)
+                {
+                    var vSqrt2OverPi = new Vector<double>(0.7978845608028654);
+                    var vCoeff = new Vector<double>(0.044715);
+                    var vThreeCoeff = new Vector<double>(3.0 * 0.044715);
+                    var vHalf = new Vector<double>(0.5);
+                    var vOne = Vector<double>.One;
+                    var xVecs = MemoryMarshal.Cast<double, Vector<double>>(new ReadOnlySpan<double>(input, simdLen));
+                    var gVecs = MemoryMarshal.Cast<double, Vector<double>>(new ReadOnlySpan<double>(grad, simdLen));
+                    var oVecs = MemoryMarshal.Cast<double, Vector<double>>(new Span<double>(output, simdLen));
+                    for (int v = 0; v < xVecs.Length; v++)
+                    {
+                        var x = xVecs[v];
+                        var x2 = x * x;
+                        var inner = x + vCoeff * x2 * x;
+                        var t = SystemNumericsVectorBridge.FastTanhDouble(vSqrt2OverPi * inner);
+                        var sechSq = vOne - t * t;
+                        var dArgDx = vSqrt2OverPi * (vOne + vThreeCoeff * x2);
+                        var derivative = vHalf * (vOne + t) + vHalf * (x * sechSq * dArgDx);
+                        oVecs[v] = gVecs[v] * derivative;
+                    }
+                    i = simdLen;
                 }
             }
 #endif

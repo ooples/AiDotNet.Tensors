@@ -1148,6 +1148,62 @@ internal static class SystemNumericsVectorBridge
         return two / (one + FastExp(-two * x)) - one;
     }
 
+    /// <summary>
+    /// exp(x) for one BCL <see cref="Vector{Double}"/> block — double-precision
+    /// counterpart of <see cref="FastExp"/>. Range-reduces x = n·ln2 + r and
+    /// evaluates a degree-7 Taylor of exp(r) on r ∈ [-ln2/2, ln2/2] (error
+    /// ~5e-8, well inside the fast-poly accuracy class). 2^n is injected via the
+    /// IEEE-754 exponent field: ((n + 1023) · 2^52) reinterpreted as double —
+    /// integer multiply (not shift) so it works on the pre-.NET7 BCL Vector.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static Vector<double> FastExpDouble(Vector<double> x)
+    {
+        x = Vector.Min(new Vector<double>(709.0), Vector.Max(new Vector<double>(-708.0), x));
+
+        var log2e = new Vector<double>(1.4426950408889634);
+        var ln2hi = new Vector<double>(0.6931471803691238);   // hi/lo split of ln2
+        var ln2lo = new Vector<double>(1.9082149292705877e-10);
+        var half = new Vector<double>(0.5);
+        var one = new Vector<double>(1.0);
+
+        // n = round-to-nearest(x*log2e) via truncate + floor-correction.
+        var z = x * log2e + half;
+        var trunc = Vector.ConvertToDouble(Vector.ConvertToInt64(z));
+        var overshot = Vector.GreaterThan(trunc, z);
+        var n = trunc - Vector.ConditionalSelect(overshot, one, Vector<double>.Zero);
+
+        // r = x - n*ln2 (hi/lo).
+        var r = x - n * ln2hi;
+        r = r - n * ln2lo;
+
+        // exp(r), degree-7 Taylor (Horner). c_k = 1/k!.
+        var poly = new Vector<double>(1.0 / 5040.0);
+        poly = poly * r + new Vector<double>(1.0 / 720.0);
+        poly = poly * r + new Vector<double>(1.0 / 120.0);
+        poly = poly * r + new Vector<double>(1.0 / 24.0);
+        poly = poly * r + new Vector<double>(1.0 / 6.0);
+        poly = poly * r + half;
+        poly = poly * r + one;
+        poly = poly * r + one;
+
+        // 2^n via exponent injection: (n + 1023) << 52 == (n + 1023) * 2^52.
+        var nLong = Vector.ConvertToInt64(n);
+        var biased = (nLong + new Vector<long>(1023L)) * new Vector<long>(1L << 52);
+        var scale = Vector.AsVectorDouble(biased);
+
+        return poly * scale;
+    }
+
+    /// <summary>tanh(x) for one BCL <see cref="Vector{Double}"/> block.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static Vector<double> FastTanhDouble(Vector<double> x)
+    {
+        var one = new Vector<double>(1.0);
+        var two = new Vector<double>(2.0);
+        return two / (one + FastExpDouble(-two * x)) - one;
+    }
+
     // ---- span-level transcendental ops -------------------------------------
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

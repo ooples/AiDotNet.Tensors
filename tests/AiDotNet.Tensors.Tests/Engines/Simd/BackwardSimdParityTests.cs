@@ -194,6 +194,35 @@ public unsafe class BackwardSimdParityTests
     }
 
     [Theory]
+    [InlineData(37)]
+    [InlineData(64)]
+    public void GeluBackward_Double_MatchesScalarReference(int length)
+    {
+        const double sqrtTwoPi = 0.7978845608028654;
+        const double coeff = 0.044715;
+        var rng = new Random(909);
+        var grad = new double[length];
+        var input = new double[length];
+        for (int i = 0; i < length; i++) { grad[i] = rng.NextDouble() * 2 - 1; input[i] = rng.NextDouble() * 6 - 3; }
+
+        var got = new double[length];
+        fixed (double* gp = grad, ip = input, op = got)
+            SimdKernels.GeluBackwardDouble(gp, ip, op, length);
+
+        for (int i = 0; i < length; i++)
+        {
+            double x = input[i];
+            double t = Math.Tanh(sqrtTwoPi * (x + coeff * x * x * x));
+            double sech2 = 1.0 - t * t;
+            double dArgDx = sqrtTwoPi * (1.0 + 3.0 * coeff * x * x);
+            double expected = grad[i] * (0.5 * (1.0 + t) + 0.5 * x * sech2 * dArgDx);
+            // FastTanhDouble is a polynomial approx → fast-poly accuracy class.
+            Assert.True(Math.Abs(got[i] - expected) < 3e-3,
+                $"GeluBackward double mismatch at {i}: {got[i]:G9} vs {expected:G9} (x={x:G4})");
+        }
+    }
+
+    [Theory]
     [InlineData(3, 37)]
     [InlineData(4, 64)]
     public void LayerNormBackward_Double_MatchesScalarReference(int batch, int normSize)
