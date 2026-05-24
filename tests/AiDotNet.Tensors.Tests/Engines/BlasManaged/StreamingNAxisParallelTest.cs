@@ -114,10 +114,14 @@ public class StreamingNAxisParallelTest
     [SkippableFact]
     public void Streaming_NAxisParallel_Delivers_Speedup_On_Wide_N()
     {
-        // CI runs on 4-vCPU boxes: NumThreads=8 oversubscribes and parallel
-        // loses to serial. Same fix landed on PR #402 commit 5354a2a6.
-        // Bit-exactness vs serial is asserted by the unconditional sibling
-        // tests, so undersized-runner skip costs no correctness coverage.
+        // CI run 26304260634 measured 0.39x on a 4-vCPU runner: with
+        // NumThreads=8 the streaming parallel path oversubscribes and
+        // loses to the serial baseline. The contract this test pins is
+        // "streaming N-axis parallel wins on adequately multi-core
+        // hardware"; gate to >=8 cores to avoid false-positive on
+        // undersized runners. Bit-exactness vs serial is asserted by the
+        // unconditional sibling tests, so undersized-runner skip costs
+        // no correctness coverage.
         Skip.IfNot(Environment.ProcessorCount >= 8,
             $"Requires >=8 logical processors for NumThreads=8 to deliver speedup; have {Environment.ProcessorCount}.");
 

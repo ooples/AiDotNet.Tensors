@@ -74,12 +74,15 @@ public class PackAOnlyNAxisParallelTest
     [SkippableFact]
     public void PackAOnly_NAxisParallel_Delivers_Speedup_On_Wide_N()
     {
-        // Per-thread overhead dominates on low-core hosts: NumThreads=8 on
-        // a 2-4 core box oversubscribes, so parallel loses to serial.
-        // Same fix landed on PR #402 commit 5354a2a6 for the underlying
-        // BlasManaged shared test. Bit-exactness vs serial is covered by
+        // Per-thread overhead dominates on low-core hosts: the parallel
+        // configuration spawns NumThreads=8 even when the box only has 2-4
+        // physical cores, so the parallel path loses to the serial baseline
+        // (CI run 26304260634 measured 0.30x on a 4-vCPU runner). The
+        // contract this test pins is "parallel pack-A wins on adequately
+        // multi-core hardware"; gate to >=8 cores so we don't false-positive
+        // on undersized CI runners. Bit-exactness vs serial is covered by
         // the unconditional [Fact] siblings above, so undersized-runner
-        // skip costs no correctness coverage.
+        // skip doesn't lose any correctness coverage.
         Skip.IfNot(Environment.ProcessorCount >= 8,
             $"Requires >=8 logical processors for NumThreads=8 to deliver speedup; have {Environment.ProcessorCount}.");
 

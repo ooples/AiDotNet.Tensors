@@ -123,6 +123,57 @@ public class GemvBypassTest
         Assert.True(maxDelta < 1e-5, $"K=1 outer product FP32 drift {maxDelta:G6}");
     }
 
+    [Theory]
+    [InlineData(64, 32)]    // N>=4 → hits the new FP64 AVX2 outer-product path
+    [InlineData(96, 100)]
+    [InlineData(8, 3)]      // N<4 → scalar fallback
+    public void K1_OuterProduct_FP64_Matches_Reference(int M, int N)
+    {
+        const int K = 1;
+        var rng = new Random(101);
+        var a = new double[M * K];
+        var b = new double[K * N];
+        var cMgr = new double[M * N];
+        var cRef = new double[M * N];
+        for (int i = 0; i < a.Length; i++) a[i] = rng.NextDouble() * 2 - 1;
+        for (int i = 0; i < b.Length; i++) b[i] = rng.NextDouble() * 2 - 1;
+
+        NaiveGemmFp64(a, K, false, b, N, false, cRef, N, M, N, K);
+        BlasManagedLib.Gemm<double>(a, K, false, b, N, false, cMgr, N, M, N, K);
+
+        double maxDelta = 0;
+        for (int i = 0; i < cRef.Length; i++)
+            maxDelta = Math.Max(maxDelta, Math.Abs(cRef[i] - cMgr[i]));
+        Assert.True(maxDelta < 1e-9, $"K=1 outer product FP64 drift {maxDelta:G6}");
+    }
+
+    [Theory]
+    [InlineData(true, false)]   // a transposed ([K=1, M] storage) — AVX2 b-contiguous path
+    [InlineData(false, true)]   // b transposed ([N, K=1] storage) — scalar fallback
+    [InlineData(true, true)]    // both transposed
+    public void K1_OuterProduct_TransVariants_FP32_Match_Reference(bool transA, bool transB)
+    {
+        const int M = 48, N = 40, K = 1;
+        var rng = new Random(202);
+        var a = new float[M * K];          // K=1 ⇒ M elements regardless of transA
+        var b = new float[K * N];          // K=1 ⇒ N elements regardless of transB
+        var cMgr = new float[M * N];
+        var cRef = new float[M * N];
+        for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < b.Length; i++) b[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        // K=1 leading dims: A is [M,1] (lda=1) or op of [1,M]; B is [1,N] (ldb=N) or op of [N,1].
+        int lda = transA ? M : K;
+        int ldb = transB ? K : N;
+        NaiveGemmFp32(a, lda, transA, b, ldb, transB, cRef, N, M, N, K);
+        BlasManagedLib.Gemm<float>(a, lda, transA, b, ldb, transB, cMgr, N, M, N, K);
+
+        double maxDelta = 0;
+        for (int i = 0; i < cRef.Length; i++)
+            maxDelta = Math.Max(maxDelta, Math.Abs(cRef[i] - cMgr[i]));
+        Assert.True(maxDelta < 1e-5, $"K=1 trans({transA},{transB}) FP32 drift {maxDelta:G6}");
+    }
+
     [Fact]
     public void M1_FP64_Matches_Reference()
     {

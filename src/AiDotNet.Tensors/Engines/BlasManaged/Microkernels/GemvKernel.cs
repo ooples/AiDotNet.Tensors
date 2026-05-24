@@ -74,23 +74,59 @@ internal static class GemvKernel
         throw new ArgumentException($"GemvKernel.Run requires m==1 or n==1 or k==1; got ({m}, {n}, {k}).");
     }
 
-    private static void RunOuterProduct<T>(
+    private static unsafe void RunOuterProduct<T>(
         ReadOnlySpan<T> a, int lda, bool transA,
         ReadOnlySpan<T> b, int ldb, bool transB,
         Span<T> c, int ldc,
         int m, int n) where T : unmanaged
     {
+        // K=1 ⇒ c[i, j] = a_i · b_j (pure outer product, no reduction).
+        //   a_i: transA=false → af[i * lda]; transA=true → af[i]  (stride below)
+        //   b_j: transB=false → bf[j] (contiguous row); transB=true → bf[j * ldb]
         if (typeof(T) == typeof(float))
         {
             var af = MemoryMarshal.Cast<T, float>(a);
             var bf = MemoryMarshal.Cast<T, float>(b);
             var cf = MemoryMarshal.Cast<T, float>(c);
+            int aStride = transA ? 1 : lda;
+
+#if !NET471
+            // Sub-R (#408) AVX2 outer-product fast path: broadcast the scalar
+            // a_i across a Vector256 and multiply by 8 contiguous b-values per
+            // iter, storing to the contiguous c-row. No reduction, so a plain
+            // Avx.Multiply (no FMA) is enough. Requires transB=false (b is a
+            // contiguous [1, N] row); transB=true / tiny N / non-AVX2 fall
+            // through to the scalar loop below.
+            if (!transB && Avx.IsSupported && n >= 8)
+            {
+                int nFull = n & ~7;
+                fixed (float* aPtr = af)
+                fixed (float* bPtr = bf)
+                fixed (float* cPtr = cf)
+                {
+                    for (int i = 0; i < m; i++)
+                    {
+                        float ai = aPtr[i * aStride];
+                        var av = Vector256.Create(ai);
+                        float* cRow = cPtr + (long)i * ldc;
+                        for (int j = 0; j < nFull; j += 8)
+                        {
+                            var bv = Avx.LoadVector256(bPtr + j);
+                            Avx.Store(cRow + j, Avx.Multiply(av, bv));
+                        }
+                        for (int j = nFull; j < n; j++)
+                            cRow[j] = ai * bPtr[j];
+                    }
+                }
+                return;
+            }
+#endif
             for (int i = 0; i < m; i++)
             {
-                float ai = transA ? af[i] : af[i * lda];  // K=1 ⇒ stride collapses
+                float ai = af[i * aStride];
                 for (int j = 0; j < n; j++)
                 {
-                    float bj = transB ? bf[j * ldb] : bf[j];  // K=1 ⇒ same
+                    float bj = transB ? bf[j * ldb] : bf[j];
                     cf[i * ldc + j] = ai * bj;
                 }
             }
@@ -101,9 +137,37 @@ internal static class GemvKernel
             var ad = MemoryMarshal.Cast<T, double>(a);
             var bd = MemoryMarshal.Cast<T, double>(b);
             var cd = MemoryMarshal.Cast<T, double>(c);
+            int aStride = transA ? 1 : lda;
+
+#if !NET471
+            // AVX2 FP64 mirror — 4 doubles per Vector256<double>.
+            if (!transB && Avx.IsSupported && n >= 4)
+            {
+                int nFull = n & ~3;
+                fixed (double* aPtr = ad)
+                fixed (double* bPtr = bd)
+                fixed (double* cPtr = cd)
+                {
+                    for (int i = 0; i < m; i++)
+                    {
+                        double ai = aPtr[i * aStride];
+                        var av = Vector256.Create(ai);
+                        double* cRow = cPtr + (long)i * ldc;
+                        for (int j = 0; j < nFull; j += 4)
+                        {
+                            var bv = Avx.LoadVector256(bPtr + j);
+                            Avx.Store(cRow + j, Avx.Multiply(av, bv));
+                        }
+                        for (int j = nFull; j < n; j++)
+                            cRow[j] = ai * bPtr[j];
+                    }
+                }
+                return;
+            }
+#endif
             for (int i = 0; i < m; i++)
             {
-                double ai = transA ? ad[i] : ad[i * lda];
+                double ai = ad[i * aStride];
                 for (int j = 0; j < n; j++)
                 {
                     double bj = transB ? bd[j * ldb] : bd[j];
@@ -297,6 +361,10 @@ internal static class GemvKernel
 
             // Scalar fallback — handles transA=true, non-contiguous B
             // (transB=false with ldb>1), tiny K (k<8), and non-AVX2 hosts.
+            // b is logically [K, 1]: transB=false → bf[kk * ldb]; transB=true → bf[kk].
+            // Each output cell c[i, 0] is a dot product of a's row i with b's column:
+            //   transA=false → a row i starts at af[i * lda];
+            //   transA=true  → a row i (logical) is column i in storage, af[kk * lda + i].
             for (int i = 0; i < m; i++)
             {
                 double sum = 0;
@@ -310,6 +378,7 @@ internal static class GemvKernel
                     var aRow = af.Slice(i * lda, k);
                     if (transB)
                     {
+                        // b stride = 1, contiguous K-vec
                         for (int kk = 0; kk < k; kk++) sum += (double)aRow[kk] * bf[kk];
                     }
                     else

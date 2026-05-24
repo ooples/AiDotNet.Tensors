@@ -94,6 +94,18 @@ internal static class BlasProvider
     /// single-threaded GEMM. Caller must verify <see cref="HasNativeDgemm"/>
     /// is true before calling, otherwise the P/Invoke will throw.
     /// </summary>
+    /// <remarks>
+    /// Issue #411 CI history: an earlier libgomp probe variant also called
+    /// <c>omp_set_num_threads(n)</c> via <c>libgomp.so.1</c> to cover
+    /// OpenMP-threaded OpenBLAS builds. That extra call was removed because
+    /// it set the OpenMP thread count PROCESS-WIDE, which caused
+    /// cross-test interference on xUnit-parallel CI runs (other tests
+    /// using OpenMP-backed libraries inherited the cap and starved their
+    /// parallel work). Since <see cref="Engines.CpuEngine.FlashAttentionDouble"/>
+    /// now bypasses BLAS entirely (using <see cref="Simd.SimdGemm.DgemmSequential"/>
+    /// directly), the libgomp guard is no longer load-bearing for the
+    /// originally-targeted #411 regression test.
+    /// </remarks>
     internal static void TrySetOpenBlasThreads(int n)
     {
         if (!_nativeAvailable.Value) return;
