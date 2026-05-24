@@ -12,6 +12,14 @@ namespace AiDotNet.Tensors.Engines;
 public partial class CpuEngine
 {
     /// <summary>
+    /// Cached zero-length placeholder returned for the final hidden / cell out
+    /// params when a caller of the allocation-free <c>LstmSequenceForward</c>
+    /// overload discards them. Shared (and never mutated) so the hot path stays
+    /// free of per-call state allocation.
+    /// </summary>
+    private static readonly Tensor<float> s_emptyState = new(new[] { 0 });
+
+    /// <summary>
     /// Fused LSTM sequence forward — processes a full <c>[B, seq, in]</c> sequence
     /// through one LSTM cell in a single call, returning either the entire hidden
     /// state sequence <c>[B, seq, hidden]</c> (when <paramref name="returnSequences"/>
@@ -69,8 +77,12 @@ public partial class CpuEngine
         Tensor<T>? bIh,
         Tensor<T>? bHh,
         bool returnSequences = false)
-        // Delegate to the state-returning overload and discard the final states.
-        => LstmSequenceForward(input, h0, c0, wIh, wHh, bIh, bHh, out _, out _, returnSequences);
+        // Allocation-free hot path (the AIsEval Predict path): compute only the
+        // sequence output. wantState: false skips materializing finalHidden /
+        // finalCell, so this overload never pays the two [batch, hidden] copies.
+        => LstmSequenceForwardImpl(
+            input, h0, c0, wIh, wHh, bIh, bHh, returnSequences,
+            wantState: false, out _, out _);
 
     /// <summary>
     /// Fused LSTM sequence forward that also returns the final hidden / cell states,
@@ -91,6 +103,29 @@ public partial class CpuEngine
         out Tensor<T> finalHidden,
         out Tensor<T> finalCell,
         bool returnSequences = false)
+        => LstmSequenceForwardImpl(
+            input, h0, c0, wIh, wHh, bIh, bHh, returnSequences,
+            wantState: true, out finalHidden, out finalCell);
+
+    /// <summary>
+    /// Shared implementation for both <c>LstmSequenceForward</c> overloads.
+    /// <paramref name="wantState"/> gates final-state materialization: when
+    /// false (the allocation-free overload), the per-step compute runs exactly
+    /// as before but the two <c>[batch, hidden]</c> final-state tensors are
+    /// neither allocated nor copied.
+    /// </summary>
+    private Tensor<T> LstmSequenceForwardImpl<T>(
+        Tensor<T> input,
+        Tensor<T>? h0,
+        Tensor<T>? c0,
+        Tensor<T> wIh,
+        Tensor<T> wHh,
+        Tensor<T>? bIh,
+        Tensor<T>? bHh,
+        bool returnSequences,
+        bool wantState,
+        out Tensor<T> finalHidden,
+        out Tensor<T> finalCell)
     {
         if (input is null) throw new ArgumentNullException(nameof(input));
         if (wIh is null) throw new ArgumentNullException(nameof(wIh));
@@ -143,7 +178,7 @@ public partial class CpuEngine
                 (Tensor<float>)(object)wHh,
                 (Tensor<float>?)(object?)bIh,
                 (Tensor<float>?)(object?)bHh,
-                batch, seqLen, inFeatures, hidden, gateRows, returnSequences,
+                batch, seqLen, inFeatures, hidden, gateRows, returnSequences, wantState,
                 out var hnF, out var cnF);
             finalHidden = (Tensor<T>)(object)hnF;
             finalCell = (Tensor<T>)(object)cnF;
@@ -152,7 +187,7 @@ public partial class CpuEngine
 
         return LstmSequenceForwardGeneric(
             input, h0, c0, wIh, wHh, bIh, bHh,
-            batch, seqLen, inFeatures, hidden, gateRows, returnSequences,
+            batch, seqLen, inFeatures, hidden, gateRows, returnSequences, wantState,
             out finalHidden, out finalCell);
     }
 
@@ -175,6 +210,7 @@ public partial class CpuEngine
         Tensor<float>? bHh,
         int batch, int seqLen, int inFeatures, int hidden, int gateRows,
         bool returnSequences,
+        bool wantState,
         out Tensor<float> finalHidden,
         out Tensor<float> finalCell)
     {
@@ -341,14 +377,24 @@ public partial class CpuEngine
                 hPrevBuf.AsSpan(0, batch * hidden).CopyTo(outSpan);
             }
 
-            // Final states (h_n, c_n) for streaming/chunked inference. After the
-            // role-swap at the end of the last timestep, hPrevBuf / cPrevBuf hold
-            // the last step's hidden / cell state. Copy into owned [B, hidden]
-            // tensors so they outlive the pooled scratch returned below.
-            finalHidden = new Tensor<float>(new[] { batch, hidden });
-            finalCell = new Tensor<float>(new[] { batch, hidden });
-            hPrevBuf.AsSpan(0, batch * hidden).CopyTo(finalHidden.AsWritableSpan());
-            cPrevBuf.AsSpan(0, batch * hidden).CopyTo(finalCell.AsWritableSpan());
+            if (wantState)
+            {
+                // Final states (h_n, c_n) for streaming/chunked inference. After the
+                // role-swap at the end of the last timestep, hPrevBuf / cPrevBuf hold
+                // the last step's hidden / cell state. Copy into owned [B, hidden]
+                // tensors so they outlive the pooled scratch returned below.
+                finalHidden = new Tensor<float>(new[] { batch, hidden });
+                finalCell = new Tensor<float>(new[] { batch, hidden });
+                hPrevBuf.AsSpan(0, batch * hidden).CopyTo(finalHidden.AsWritableSpan());
+                cPrevBuf.AsSpan(0, batch * hidden).CopyTo(finalCell.AsWritableSpan());
+            }
+            else
+            {
+                // Hot path: caller discards state — skip the two [B, hidden]
+                // allocations + copies entirely. Share one cached empty tensor.
+                finalHidden = s_emptyState;
+                finalCell = s_emptyState;
+            }
 
             return output;
         }
@@ -379,6 +425,7 @@ public partial class CpuEngine
         Tensor<T>? bHh,
         int batch, int seqLen, int inFeatures, int hidden, int gateRows,
         bool returnSequences,
+        bool wantState,
         out Tensor<T> finalHidden,
         out Tensor<T> finalCell)
     {
@@ -490,11 +537,20 @@ public partial class CpuEngine
                 outSpan[i] = hLastSpan[i];
         }
 
-        // Final states (h_n, c_n) for streaming/chunked inference. hPrev / cPrev
-        // hold the last timestep's hidden / cell state; Clone so they are owned
-        // tensors independent of the loop's intermediate buffers.
-        finalHidden = hPrev.Clone();
-        finalCell = cPrev.Clone();
+        if (wantState)
+        {
+            // Final states (h_n, c_n) for streaming/chunked inference. hPrev / cPrev
+            // hold the last timestep's hidden / cell state; Clone so they are owned
+            // tensors independent of the loop's intermediate buffers.
+            finalHidden = hPrev.Clone();
+            finalCell = cPrev.Clone();
+        }
+        else
+        {
+            // Hot path: caller discards state — skip the two clones.
+            finalHidden = new Tensor<T>(new[] { 0 });
+            finalCell = new Tensor<T>(new[] { 0 });
+        }
 
         return output;
     }
