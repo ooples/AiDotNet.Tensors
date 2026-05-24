@@ -4,6 +4,10 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using AiDotNet.Tensors.Helpers;
 using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
+#if !NET5_0_OR_GREATER
+// audit-2026-05 phase 5 §E/§D: BCL Vector<T> backward-pass + rounding SIMD on net471.
+using System.Numerics;
+#endif
 #if NET5_0_OR_GREATER
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.Arm;
@@ -7487,6 +7491,38 @@ namespace AiDotNet.Tensors.Engines.Simd
                     Avx.Store(output + i, Avx.Multiply(g, derivative));
                 }
             }
+#else
+            // net471 §E: BCL Vector<float> GELU' = grad · [0.5(1+tanh k) + 0.5·x·sech²(k)·k'],
+            // tanh via the bridge's FastExp-based FastTanh (slice 2 unblocked this).
+            {
+                int lanes = Vector<float>.Count;
+                int simdLen = length - (length % lanes);
+                if (simdLen > 0)
+                {
+                    var vSqrtTwoPi = new Vector<float>(sqrtTwoPi);
+                    var vCoeff = new Vector<float>(coeff);
+                    var vThreeCoeff = new Vector<float>(3f * coeff);
+                    var vHalf = new Vector<float>(0.5f);
+                    var vOne = Vector<float>.One;
+                    var xVecs = MemoryMarshal.Cast<float, Vector<float>>(new ReadOnlySpan<float>(input, simdLen));
+                    var gVecs = MemoryMarshal.Cast<float, Vector<float>>(new ReadOnlySpan<float>(grad, simdLen));
+                    var oVecs = MemoryMarshal.Cast<float, Vector<float>>(new Span<float>(output, simdLen));
+                    for (int v = 0; v < xVecs.Length; v++)
+                    {
+                        var x = xVecs[v];
+                        var x2 = x * x;
+                        var x3 = x2 * x;
+                        var inner = vSqrtTwoPi * (x + vCoeff * x3);
+                        var tanhK = SystemNumericsVectorBridge.FastTanh(inner);
+                        var sech2 = vOne - tanhK * tanhK;
+                        var kPrime = vSqrtTwoPi * (vOne + vThreeCoeff * x2);
+                        var term1 = vHalf * (vOne + tanhK);
+                        var term2 = vHalf * (x * sech2 * kPrime);
+                        oVecs[v] = gVecs[v] * (term1 + term2);
+                    }
+                    i = simdLen;
+                }
+            }
 #endif
             for (; i < length; i++)
             {
@@ -8272,6 +8308,22 @@ namespace AiDotNet.Tensors.Engines.Simd
                     sum4 = Sse.AddScalar(sum4, Sse.Shuffle(sum4, sum4, 0x01));
                     dot = sum4.ToScalar();
                 }
+#else
+                // net471 §E: BCL Vector<float> reduction for dot(grad, softmax).
+                {
+                    int lanes = Vector<float>.Count;
+                    int simdLen = features - (features % lanes);
+                    if (simdLen > 0)
+                    {
+                        var gVecs = MemoryMarshal.Cast<float, Vector<float>>(new ReadOnlySpan<float>(grad + offset, simdLen));
+                        var sVecs = MemoryMarshal.Cast<float, Vector<float>>(new ReadOnlySpan<float>(softmaxOutput + offset, simdLen));
+                        var acc = Vector<float>.Zero;
+                        for (int v = 0; v < gVecs.Length; v++)
+                            acc += gVecs[v] * sVecs[v];
+                        dot = Vector.Dot(acc, Vector<float>.One);
+                        j = simdLen;
+                    }
+                }
 #endif
                 for (; j < features; j++)
                     dot += grad[offset + j] * softmaxOutput[offset + j];
@@ -8289,6 +8341,22 @@ namespace AiDotNet.Tensors.Engines.Simd
                         var g = Avx.LoadVector256(grad + offset + j);
                         var diff = Avx.Subtract(g, vDotBroadcast);
                         Avx.Store(output + offset + j, Avx.Multiply(s, diff));
+                    }
+                }
+#else
+                // net471 §E: BCL Vector<float> elementwise softmax[i]*(grad[i]-dot).
+                {
+                    int lanes = Vector<float>.Count;
+                    int simdLen = features - (features % lanes);
+                    if (simdLen > 0)
+                    {
+                        var sVecs = MemoryMarshal.Cast<float, Vector<float>>(new ReadOnlySpan<float>(softmaxOutput + offset, simdLen));
+                        var gVecs = MemoryMarshal.Cast<float, Vector<float>>(new ReadOnlySpan<float>(grad + offset, simdLen));
+                        var oVecs = MemoryMarshal.Cast<float, Vector<float>>(new Span<float>(output + offset, simdLen));
+                        var vDot = new Vector<float>(dot);
+                        for (int v = 0; v < sVecs.Length; v++)
+                            oVecs[v] = sVecs[v] * (gVecs[v] - vDot);
+                        j = simdLen;
                     }
                 }
 #endif
@@ -8408,9 +8476,46 @@ namespace AiDotNet.Tensors.Engines.Simd
             {
                 int offset = b * features;
                 double dot = 0;
-                for (int j = 0; j < features; j++)
+                int j = 0;
+#if !NET5_0_OR_GREATER
+                // net471 §E: BCL Vector<double> reduction for dot(grad, softmax).
+                {
+                    int lanes = Vector<double>.Count;
+                    int simdLen = features - (features % lanes);
+                    if (simdLen > 0)
+                    {
+                        var gVecs = MemoryMarshal.Cast<double, Vector<double>>(new ReadOnlySpan<double>(grad + offset, simdLen));
+                        var sVecs = MemoryMarshal.Cast<double, Vector<double>>(new ReadOnlySpan<double>(softmaxOutput + offset, simdLen));
+                        var acc = Vector<double>.Zero;
+                        for (int v = 0; v < gVecs.Length; v++)
+                            acc += gVecs[v] * sVecs[v];
+                        dot = Vector.Dot(acc, Vector<double>.One);
+                        j = simdLen;
+                    }
+                }
+#endif
+                for (; j < features; j++)
                     dot += grad[offset + j] * softmaxOutput[offset + j];
-                for (int j = 0; j < features; j++)
+
+                j = 0;
+#if !NET5_0_OR_GREATER
+                // net471 §E: BCL Vector<double> elementwise softmax[i]*(grad[i]-dot).
+                {
+                    int lanes = Vector<double>.Count;
+                    int simdLen = features - (features % lanes);
+                    if (simdLen > 0)
+                    {
+                        var sVecs = MemoryMarshal.Cast<double, Vector<double>>(new ReadOnlySpan<double>(softmaxOutput + offset, simdLen));
+                        var gVecs = MemoryMarshal.Cast<double, Vector<double>>(new ReadOnlySpan<double>(grad + offset, simdLen));
+                        var oVecs = MemoryMarshal.Cast<double, Vector<double>>(new Span<double>(output + offset, simdLen));
+                        var vDot = new Vector<double>(dot);
+                        for (int v = 0; v < sVecs.Length; v++)
+                            oVecs[v] = sVecs[v] * (gVecs[v] - vDot);
+                        j = simdLen;
+                    }
+                }
+#endif
+                for (; j < features; j++)
                     output[offset + j] = softmaxOutput[offset + j] * (grad[offset + j] - dot);
             }
         }
