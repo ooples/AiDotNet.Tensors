@@ -54,4 +54,16 @@
     <Reference Include="System.IO.Compression.FileSystem" />
   </ItemGroup>
 
+  <!-- Deploy BlasManaged baseline JSON alongside the test assembly so the
+       regression test can locate it via Assembly.Location at runtime.
+       Use Include (not Update) so MSBuild adds the file to the item list
+       and respects CopyToOutputDirectory. Link controls the relative path
+       in the output directory. -->
+  <ItemGroup>
+    <None Include="Engines\BlasManaged\baselines\blas-managed-baseline.json">
+      <Link>baselines\blas-managed-baseline.json</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
 </Project>

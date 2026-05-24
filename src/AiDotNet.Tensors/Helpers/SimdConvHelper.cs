@@ -128,10 +128,21 @@ internal static class SimdConvHelper
         for (int b = 0; b < batch; b++)
         {
             // A = kernel [OC, IC], B = input[b] [IC, spatial], C = output[b] [OC, spatial].
+            // Route to BlasManaged.Gemm directly (SimdGemm.Dgemm is the obsolete
+            // shim that just forwards here anyway — calling it would trip the
+            // [Obsolete] error on this PR's branch).
             var aSpan = new ReadOnlySpan<double>(kernel, outChannels * inChannels);
             var bSpan = new ReadOnlySpan<double>(input + b * perBatchA, inChannels * spatial);
             var cSpan = new Span<double>(output + b * perBatchC, outChannels * spatial);
-            SimdGemm.Dgemm(aSpan, bSpan, cSpan, outChannels, inChannels, spatial);
+            AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.Gemm<double>(
+                aSpan, lda: inChannels, transA: false,
+                bSpan, ldb: spatial, transB: false,
+                cSpan, ldc: spatial,
+                outChannels, spatial, inChannels,
+                new AiDotNet.Tensors.Engines.BlasManaged.BlasOptions<double>
+                {
+                    PackingMode = AiDotNet.Tensors.Engines.BlasManaged.PackingMode.DisableAutotune
+                });
         }
     }
 

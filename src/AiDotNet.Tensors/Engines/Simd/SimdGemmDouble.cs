@@ -776,15 +776,23 @@ internal static partial class SimdGemm
     /// Uses AVX2 Vector256&lt;double&gt; FMA when available, scalar
     /// fallback otherwise.
     /// </summary>
+    /// <remarks>
+    /// K1 (#358): forwarded to <see cref="AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.Gemm{T}"/>
+    /// so all double-precision call sites migrate transparently alongside the float path.
+    /// BlasManaged handles clearing C, picks tile sizes, and dispatches the right strategy.
+    /// <see cref="DgemmSequential"/> remains on the old path (per-call-site migration later).
+    /// </remarks>
+    [Obsolete("Use BlasManaged.Gemm<double>() directly. This no-trans shim forwards to it transparently and will be removed one release after v" +
+              "1.0. See docs/superpowers/specs/2026-05-16-blas-managed-design.md for migration guidance.")]
     internal static void Dgemm(
         ReadOnlySpan<double> a,
         ReadOnlySpan<double> b,
         Span<double> c,
         int m, int k, int n)
     {
+        // Match original contract: m<=0 or n<=0 → no-op; k<=0 → clear C and return.
         if (m <= 0 || n <= 0) return;
-        c.Clear();
-        if (k <= 0) return;
+        if (k <= 0) { c.Clear(); return; }
 
 #if NET8_0_OR_GREATER
         // Stage 7 (#415): try AVX-512 8×16 first on capable CPUs; routes
@@ -902,10 +910,18 @@ internal static partial class SimdGemm
         }
 #endif
         // Fall through: parallel-friendly shapes and anything that didn't
-        // match the gates above route to the standard Dgemm path
-        // (parallel-M dispatch, scalar fallback for non-AVX2, etc.). No
-        // perf loss vs the un-Cached entry.
-        Dgemm(a, new ReadOnlySpan<double>(b), c, m, k, n);
+        // match the gates above route to BlasManaged.Gemm<double> directly.
+        // The Dgemm shim is marked [Obsolete] per PR #402's BlasManaged
+        // migration; calling Gemm<double> here is the migration target.
+        AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.Gemm<double>(
+            a, lda: k, transA: false,
+            new ReadOnlySpan<double>(b), ldb: n, transB: false,
+            c, ldc: n,
+            m, n, k,
+            new AiDotNet.Tensors.Engines.BlasManaged.BlasOptions<double>
+            {
+                PackingMode = AiDotNet.Tensors.Engines.BlasManaged.PackingMode.DisableAutotune
+            });
     }
 
     /// <summary>
