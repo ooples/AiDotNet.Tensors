@@ -1000,6 +1000,23 @@ internal static class BlasProvider
     internal static bool IsMklVerified => _nativeAvailable.Value;
 
     // ────────────────────────────────────────────────────────────────────
+    // Test-only shape instrumentation hook (Sub-issue A / #369).
+    //
+    // Set by the test infrastructure (ShapeInstrumenter) to record every
+    // (m, n, k, transA, transB, dtype) tuple that flows through the public
+    // Try* entry points. Always null in production builds — invocation is
+    // a single null-check that the JIT inlines away. Hook fires BEFORE the
+    // _nativeAvailable check so shapes are recorded even when libopenblas
+    // is not loaded.
+    // ────────────────────────────────────────────────────────────────────
+
+    // Merge resolution (main #412 vs #402): kept main's 5-arg `Action<int,int,int,bool,bool>?
+    // ShapeLogHook` declared at line 548 above + main's LogShape(m, n, k[, transA, transB])
+    // wrapper that fires AFTER a successful BLAS call. Dropped #402's duplicate 6-arg field
+    // that included Type — the existing ShapeInstrumenter consumer (Helpers/ShapeInstrumenter.cs)
+    // uses the 5-arg shape and doesn't need the precision tag.
+
+    // ────────────────────────────────────────────────────────────────────
     // Try* entry points. When BLAS is disabled (default), every call
     // returns false and callers fall through to SimdGemm. When enabled
     // via AIDOTNET_USE_BLAS=1 and libopenblas loads, calls dispatch to
@@ -1011,6 +1028,16 @@ internal static class BlasProvider
         float[] b, int bOffset, int ldb,
         float[] c, int cOffset, int ldc)
     {
+        // Sub-F (#374) routing shim: caller-opt-in managed dispatch.
+        if (Engines.BlasManaged.BlasManaged.PreferManaged)
+        {
+            Engines.BlasManaged.BlasManaged.Gemm<float>(
+                new ReadOnlySpan<float>(a, aOffset, a.Length - aOffset), lda, false,
+                new ReadOnlySpan<float>(b, bOffset, b.Length - bOffset), ldb, false,
+                new Span<float>(c, cOffset, c.Length - cOffset), ldc,
+                m, n, k);
+            return true;
+        }
         if (!_nativeAvailable.Value) return false;
         try
         {
@@ -1035,6 +1062,15 @@ internal static class BlasProvider
         double[] b, int bOffset, int ldb,
         double[] c, int cOffset, int ldc)
     {
+        if (Engines.BlasManaged.BlasManaged.PreferManaged)
+        {
+            Engines.BlasManaged.BlasManaged.Gemm<double>(
+                new ReadOnlySpan<double>(a, aOffset, a.Length - aOffset), lda, false,
+                new ReadOnlySpan<double>(b, bOffset, b.Length - bOffset), ldb, false,
+                new Span<double>(c, cOffset, c.Length - cOffset), ldc,
+                m, n, k);
+            return true;
+        }
         if (!_nativeAvailable.Value) return false;
         try
         {
@@ -1057,6 +1093,11 @@ internal static class BlasProvider
     internal static bool TryGemm(int m, int n, int k,
         ReadOnlySpan<float> a, int lda, ReadOnlySpan<float> b, int ldb, Span<float> c, int ldc)
     {
+        if (Engines.BlasManaged.BlasManaged.PreferManaged)
+        {
+            Engines.BlasManaged.BlasManaged.Gemm<float>(a, lda, false, b, ldb, false, c, ldc, m, n, k);
+            return true;
+        }
         if (!_nativeAvailable.Value) return false;
         try
         {
@@ -1079,6 +1120,11 @@ internal static class BlasProvider
     internal static bool TryGemm(int m, int n, int k,
         ReadOnlySpan<double> a, int lda, ReadOnlySpan<double> b, int ldb, Span<double> c, int ldc)
     {
+        if (Engines.BlasManaged.BlasManaged.PreferManaged)
+        {
+            Engines.BlasManaged.BlasManaged.Gemm<double>(a, lda, false, b, ldb, false, c, ldc, m, n, k);
+            return true;
+        }
         if (!_nativeAvailable.Value) return false;
         try
         {
@@ -1151,6 +1197,29 @@ internal static class BlasProvider
         float[] b, int bOffset, int ldb, bool transB,
         float[] c, int cOffset, int ldc)
     {
+        if (Engines.BlasManaged.BlasManaged.PreferManaged)
+        {
+            Engines.BlasManaged.BlasManaged.Gemm<float>(
+                new ReadOnlySpan<float>(a, aOffset, a.Length - aOffset), lda, transA,
+                new ReadOnlySpan<float>(b, bOffset, b.Length - bOffset), ldb, transB,
+                new Span<float>(c, cOffset, c.Length - cOffset), ldc,
+                m, n, k);
+            return true;
+        }
+        // Sub-F3 (#374 follow-up): per-shape autotune routing.
+        // BypassAutotune is a ThreadStatic flag the PrefersManagedCache flips
+        // during its measurement probe so the nested call goes to native.
+        if (Engines.BlasManaged.BlasManaged.AutotuneRouting
+            && !Engines.BlasManaged.PrefersManagedCache.BypassAutotune
+            && Engines.BlasManaged.PrefersManagedCache.PrefersManaged(m, n, k, transA, transB, typeof(float)))
+        {
+            Engines.BlasManaged.BlasManaged.Gemm<float>(
+                new ReadOnlySpan<float>(a, aOffset, a.Length - aOffset), lda, transA,
+                new ReadOnlySpan<float>(b, bOffset, b.Length - bOffset), ldb, transB,
+                new Span<float>(c, cOffset, c.Length - cOffset), ldc,
+                m, n, k);
+            return true;
+        }
         // Phase G.1: when AIDOTNET_BLAS_PROVIDER=mkl, the static-ctor
         // resolver redirects libopenblas → MklImports; the call below
         // then dispatches into MKL's cblas_sgemm transparently.
@@ -1186,6 +1255,26 @@ internal static class BlasProvider
         double[] b, int bOffset, int ldb, bool transB,
         double[] c, int cOffset, int ldc)
     {
+        if (Engines.BlasManaged.BlasManaged.PreferManaged)
+        {
+            Engines.BlasManaged.BlasManaged.Gemm<double>(
+                new ReadOnlySpan<double>(a, aOffset, a.Length - aOffset), lda, transA,
+                new ReadOnlySpan<double>(b, bOffset, b.Length - bOffset), ldb, transB,
+                new Span<double>(c, cOffset, c.Length - cOffset), ldc,
+                m, n, k);
+            return true;
+        }
+        if (Engines.BlasManaged.BlasManaged.AutotuneRouting
+            && !Engines.BlasManaged.PrefersManagedCache.BypassAutotune
+            && Engines.BlasManaged.PrefersManagedCache.PrefersManaged(m, n, k, transA, transB, typeof(double)))
+        {
+            Engines.BlasManaged.BlasManaged.Gemm<double>(
+                new ReadOnlySpan<double>(a, aOffset, a.Length - aOffset), lda, transA,
+                new ReadOnlySpan<double>(b, bOffset, b.Length - bOffset), ldb, transB,
+                new Span<double>(c, cOffset, c.Length - cOffset), ldc,
+                m, n, k);
+            return true;
+        }
         if (!_nativeAvailable.Value) return false;
         try
         {
