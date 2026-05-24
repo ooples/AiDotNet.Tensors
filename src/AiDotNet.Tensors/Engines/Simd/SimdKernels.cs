@@ -8708,25 +8708,80 @@ namespace AiDotNet.Tensors.Engines.Simd
             {
                 double m = mean[c];
                 double invStd = 1.0 / Math.Sqrt(variance[c] + epsilon);
-                double gGamma = 0, gBeta = 0, sumGradXhat = 0, sumGrad = 0;
+                double sumGradXhat = 0, sumGrad = 0;
                 for (int b = 0; b < batchSize; b++)
-                    for (int s = 0; s < spatialSize; s++)
+                {
+                    int baseIdx = (b * channels + c) * spatialSize;
+                    int s = 0;
+#if !NET5_0_OR_GREATER
                     {
-                        int idx = (b * channels + c) * spatialSize + s;
+                        int lanes = Vector<double>.Count;
+                        int simdLen = spatialSize - (spatialSize % lanes);
+                        if (simdLen > 0)
+                        {
+                            var vm = new Vector<double>(m);
+                            var vinv = new Vector<double>(invStd);
+                            var goV = MemoryMarshal.Cast<double, Vector<double>>(new ReadOnlySpan<double>(gradOutput + baseIdx, simdLen));
+                            var inV = MemoryMarshal.Cast<double, Vector<double>>(new ReadOnlySpan<double>(input + baseIdx, simdLen));
+                            var accXhat = Vector<double>.Zero;
+                            var accGo = Vector<double>.Zero;
+                            for (int v = 0; v < goV.Length; v++)
+                            {
+                                var xhat = (inV[v] - vm) * vinv;
+                                accXhat += goV[v] * xhat;
+                                accGo += goV[v];
+                            }
+                            sumGradXhat += Vector.Dot(accXhat, Vector<double>.One);
+                            sumGrad += Vector.Dot(accGo, Vector<double>.One);
+                            s = simdLen;
+                        }
+                    }
+#endif
+                    for (; s < spatialSize; s++)
+                    {
+                        int idx = baseIdx + s;
                         double go = gradOutput[idx];
                         double xhat = (input[idx] - m) * invStd;
-                        gGamma += go * xhat; gBeta += go;
                         sumGradXhat += go * xhat; sumGrad += go;
                     }
-                gradGamma[c] = gGamma; gradBeta[c] = gBeta;
+                }
+                gradGamma[c] = sumGradXhat; gradBeta[c] = sumGrad;
                 double g = gamma[c];
                 for (int b = 0; b < batchSize; b++)
-                    for (int s = 0; s < spatialSize; s++)
+                {
+                    int baseIdx = (b * channels + c) * spatialSize;
+                    int s = 0;
+#if !NET5_0_OR_GREATER
                     {
-                        int idx = (b * channels + c) * spatialSize + s;
+                        int lanes = Vector<double>.Count;
+                        int simdLen = spatialSize - (spatialSize % lanes);
+                        if (simdLen > 0)
+                        {
+                            var vm = new Vector<double>(m);
+                            var vinv = new Vector<double>(invStd);
+                            var vg = new Vector<double>(g);
+                            var vinvN = new Vector<double>(invN);
+                            var vSumGrad = new Vector<double>(sumGrad);
+                            var vSumXhat = new Vector<double>(sumGradXhat);
+                            var goV = MemoryMarshal.Cast<double, Vector<double>>(new ReadOnlySpan<double>(gradOutput + baseIdx, simdLen));
+                            var inV = MemoryMarshal.Cast<double, Vector<double>>(new ReadOnlySpan<double>(input + baseIdx, simdLen));
+                            var giV = MemoryMarshal.Cast<double, Vector<double>>(new Span<double>(gradInput + baseIdx, simdLen));
+                            for (int v = 0; v < goV.Length; v++)
+                            {
+                                var xhat = (inV[v] - vm) * vinv;
+                                giV[v] = vg * vinv * (goV[v] - vinvN * (vSumGrad + xhat * vSumXhat));
+                            }
+                            s = simdLen;
+                        }
+                    }
+#endif
+                    for (; s < spatialSize; s++)
+                    {
+                        int idx = baseIdx + s;
                         double xhat = (input[idx] - m) * invStd;
                         gradInput[idx] = g * invStd * (gradOutput[idx] - invN * (sumGrad + xhat * sumGradXhat));
                     }
+                }
             }
         }
 
@@ -8743,21 +8798,96 @@ namespace AiDotNet.Tensors.Engines.Simd
                 int offset = b * normSize;
                 double m = mean[b];
                 double invStd = 1.0 / Math.Sqrt(variance[b] + epsilon);
-                for (int i = 0; i < normSize; i++)
+                int i = 0;
+#if !NET5_0_OR_GREATER
+                {
+                    int lanes = Vector<double>.Count;
+                    int simdLen = normSize - (normSize % lanes);
+                    if (simdLen > 0)
+                    {
+                        var vm = new Vector<double>(m);
+                        var vinv = new Vector<double>(invStd);
+                        var goV = MemoryMarshal.Cast<double, Vector<double>>(new ReadOnlySpan<double>(gradOutput + offset, simdLen));
+                        var inV = MemoryMarshal.Cast<double, Vector<double>>(new ReadOnlySpan<double>(input + offset, simdLen));
+                        var ggV = MemoryMarshal.Cast<double, Vector<double>>(new Span<double>(gradGamma, simdLen));
+                        var gbV = MemoryMarshal.Cast<double, Vector<double>>(new Span<double>(gradBeta, simdLen));
+                        for (int v = 0; v < goV.Length; v++)
+                        {
+                            var xhat = (inV[v] - vm) * vinv;
+                            ggV[v] += goV[v] * xhat;
+                            gbV[v] += goV[v];
+                        }
+                        i = simdLen;
+                    }
+                }
+#endif
+                for (; i < normSize; i++)
                 {
                     double xhat = (input[offset + i] - m) * invStd;
                     gradGamma[i] += gradOutput[offset + i] * xhat;
                     gradBeta[i] += gradOutput[offset + i];
                 }
                 double ds = 0, db = 0;
-                for (int i = 0; i < normSize; i++)
+                i = 0;
+#if !NET5_0_OR_GREATER
+                {
+                    int lanes = Vector<double>.Count;
+                    int simdLen = normSize - (normSize % lanes);
+                    if (simdLen > 0)
+                    {
+                        var vm = new Vector<double>(m);
+                        var vinv = new Vector<double>(invStd);
+                        var goV = MemoryMarshal.Cast<double, Vector<double>>(new ReadOnlySpan<double>(gradOutput + offset, simdLen));
+                        var inV = MemoryMarshal.Cast<double, Vector<double>>(new ReadOnlySpan<double>(input + offset, simdLen));
+                        var gaV = MemoryMarshal.Cast<double, Vector<double>>(new ReadOnlySpan<double>(gamma, simdLen));
+                        var accDs = Vector<double>.Zero;
+                        var accDb = Vector<double>.Zero;
+                        for (int v = 0; v < goV.Length; v++)
+                        {
+                            var go = goV[v] * gaV[v];
+                            var xhat = (inV[v] - vm) * vinv;
+                            accDs += go * xhat;
+                            accDb += go;
+                        }
+                        ds = Vector.Dot(accDs, Vector<double>.One);
+                        db = Vector.Dot(accDb, Vector<double>.One);
+                        i = simdLen;
+                    }
+                }
+#endif
+                for (; i < normSize; i++)
                 {
                     double go = gradOutput[offset + i] * gamma[i];
                     double xhat = (input[offset + i] - m) * invStd;
                     ds += go * xhat; db += go;
                 }
                 double invN = 1.0 / normSize;
-                for (int i = 0; i < normSize; i++)
+                i = 0;
+#if !NET5_0_OR_GREATER
+                {
+                    int lanes = Vector<double>.Count;
+                    int simdLen = normSize - (normSize % lanes);
+                    if (simdLen > 0)
+                    {
+                        var vm = new Vector<double>(m);
+                        var vinv = new Vector<double>(invStd);
+                        var vds = new Vector<double>(ds);
+                        var vdb = new Vector<double>(db);
+                        var vinvN = new Vector<double>(invN);
+                        var goV = MemoryMarshal.Cast<double, Vector<double>>(new ReadOnlySpan<double>(gradOutput + offset, simdLen));
+                        var inV = MemoryMarshal.Cast<double, Vector<double>>(new ReadOnlySpan<double>(input + offset, simdLen));
+                        var gaV = MemoryMarshal.Cast<double, Vector<double>>(new ReadOnlySpan<double>(gamma, simdLen));
+                        var giV = MemoryMarshal.Cast<double, Vector<double>>(new Span<double>(gradInput + offset, simdLen));
+                        for (int v = 0; v < goV.Length; v++)
+                        {
+                            var xhat = (inV[v] - vm) * vinv;
+                            giV[v] = vinv * (goV[v] * gaV[v] - vinvN * (vdb + xhat * vds));
+                        }
+                        i = simdLen;
+                    }
+                }
+#endif
+                for (; i < normSize; i++)
                 {
                     double xhat = (input[offset + i] - m) * invStd;
                     gradInput[offset + i] = invStd * (gradOutput[offset + i] * gamma[i] - invN * (db + xhat * ds));

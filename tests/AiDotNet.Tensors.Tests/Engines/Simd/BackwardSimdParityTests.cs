@@ -192,4 +192,80 @@ public unsafe class BackwardSimdParityTests
         for (int c = 0; c < channels; c++) Assert.True(MathF.Abs(gg[c] - rGg[c]) < 2e-3f, $"BN gradGamma[{c}] {gg[c]:G6} vs {rGg[c]:G6}");
         for (int c = 0; c < channels; c++) Assert.True(MathF.Abs(gb[c] - rGb[c]) < 2e-3f, $"BN gradBeta[{c}] {gb[c]:G6} vs {rGb[c]:G6}");
     }
+
+    [Theory]
+    [InlineData(3, 37)]
+    [InlineData(4, 64)]
+    public void LayerNormBackward_Double_MatchesScalarReference(int batch, int normSize)
+    {
+        var rng = new Random(321);
+        var go = new double[batch * normSize];
+        var input = new double[batch * normSize];
+        var gamma = new double[normSize];
+        var mean = new double[batch];
+        var variance = new double[batch];
+        for (int i = 0; i < go.Length; i++) { go[i] = rng.NextDouble() * 2 - 1; input[i] = rng.NextDouble() * 2 - 1; }
+        for (int i = 0; i < normSize; i++) gamma[i] = rng.NextDouble() + 0.5;
+        for (int b = 0; b < batch; b++)
+        {
+            double mu = 0; for (int i = 0; i < normSize; i++) mu += input[b * normSize + i]; mu /= normSize;
+            double var = 0; for (int i = 0; i < normSize; i++) { double d = input[b * normSize + i] - mu; var += d * d; } var /= normSize;
+            mean[b] = mu; variance[b] = var;
+        }
+        const double eps = 1e-5;
+
+        var gi = new double[batch * normSize]; var gg = new double[normSize]; var gb = new double[normSize];
+        fixed (double* gop = go, ip = input, gap = gamma, mp = mean, vp = variance, gip = gi, ggp = gg, gbp = gb)
+            SimdKernels.LayerNormBackwardDouble(gop, ip, gap, mp, vp, eps, gip, ggp, gbp, batch, normSize);
+
+        var rGi = new double[batch * normSize]; var rGg = new double[normSize]; var rGb = new double[normSize];
+        for (int b = 0; b < batch; b++)
+        {
+            int off = b * normSize;
+            double m = mean[b], invStd = 1.0 / Math.Sqrt(variance[b] + eps);
+            for (int i = 0; i < normSize; i++) { double xhat = (input[off + i] - m) * invStd; rGg[i] += go[off + i] * xhat; rGb[i] += go[off + i]; }
+            double ds = 0, db = 0;
+            for (int i = 0; i < normSize; i++) { double g = go[off + i] * gamma[i]; double xhat = (input[off + i] - m) * invStd; ds += g * xhat; db += g; }
+            double invN = 1.0 / normSize;
+            for (int i = 0; i < normSize; i++) { double xhat = (input[off + i] - m) * invStd; rGi[off + i] = invStd * (go[off + i] * gamma[i] - invN * (db + xhat * ds)); }
+        }
+
+        for (int i = 0; i < gi.Length; i++) Assert.True(Math.Abs(gi[i] - rGi[i]) < 1e-9, $"LN(d) gradInput[{i}] {gi[i]:G17} vs {rGi[i]:G17}");
+        for (int i = 0; i < normSize; i++) Assert.True(Math.Abs(gg[i] - rGg[i]) < 1e-9, $"LN(d) gradGamma[{i}]");
+        for (int i = 0; i < normSize; i++) Assert.True(Math.Abs(gb[i] - rGb[i]) < 1e-9, $"LN(d) gradBeta[{i}]");
+    }
+
+    [Theory]
+    [InlineData(2, 3, 37)]
+    [InlineData(2, 4, 16)]
+    public void BatchNormBackward_Double_MatchesScalarReference(int batch, int channels, int spatial)
+    {
+        var rng = new Random(654);
+        int n = batch * channels * spatial;
+        var go = new double[n]; var input = new double[n];
+        var gamma = new double[channels]; var mean = new double[channels]; var variance = new double[channels];
+        for (int i = 0; i < n; i++) { go[i] = rng.NextDouble() * 2 - 1; input[i] = rng.NextDouble() * 2 - 1; }
+        for (int c = 0; c < channels; c++) { gamma[c] = rng.NextDouble() + 0.5; mean[c] = rng.NextDouble() * 0.4 - 0.2; variance[c] = rng.NextDouble() + 0.5; }
+        const double eps = 1e-5;
+
+        var gi = new double[n]; var gg = new double[channels]; var gb = new double[channels];
+        fixed (double* gop = go, ip = input, gap = gamma, mp = mean, vp = variance, gip = gi, ggp = gg, gbp = gb)
+            SimdKernels.BatchNormBackwardDouble(gop, ip, gap, mp, vp, eps, gip, ggp, gbp, batch, channels, spatial);
+
+        var rGi = new double[n]; var rGg = new double[channels]; var rGb = new double[channels];
+        double invN = 1.0 / (batch * spatial);
+        for (int c = 0; c < channels; c++)
+        {
+            double m = mean[c], invStd = 1.0 / Math.Sqrt(variance[c] + eps);
+            double sx = 0, sg = 0;
+            for (int b = 0; b < batch; b++) for (int s = 0; s < spatial; s++) { int idx = (b * channels + c) * spatial + s; double xhat = (input[idx] - m) * invStd; sx += go[idx] * xhat; sg += go[idx]; }
+            rGg[c] = sx; rGb[c] = sg;
+            double g = gamma[c];
+            for (int b = 0; b < batch; b++) for (int s = 0; s < spatial; s++) { int idx = (b * channels + c) * spatial + s; double xhat = (input[idx] - m) * invStd; rGi[idx] = g * invStd * (go[idx] - invN * (sg + xhat * sx)); }
+        }
+
+        for (int i = 0; i < n; i++) Assert.True(Math.Abs(gi[i] - rGi[i]) < 1e-9, $"BN(d) gradInput[{i}] {gi[i]:G17} vs {rGi[i]:G17}");
+        for (int c = 0; c < channels; c++) Assert.True(Math.Abs(gg[c] - rGg[c]) < 1e-9, $"BN(d) gradGamma[{c}]");
+        for (int c = 0; c < channels; c++) Assert.True(Math.Abs(gb[c] - rGb[c]) < 1e-9, $"BN(d) gradBeta[{c}]");
+    }
 }
