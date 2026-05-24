@@ -1025,6 +1025,31 @@ namespace AiDotNet.Tensors.Engines.Simd
                 for (; i < simdLength; i += 8)
                     Avx.Store(output + i, Avx.Floor(Avx.LoadVector256(input + i)));
             }
+#else
+            // net471 §D: no Vector<T>.Floor before .NET 7, so truncate-toward-zero
+            // via int round-trip and correct: floor(x) = trunc(x) - (trunc(x) > x ? 1 : 0).
+            // Only valid where |x| < 2^23 (floats represent every integer exactly
+            // above that, so x is already its own floor — and that branch also
+            // safely passes NaN/±Inf through unchanged, matching MathF.Floor).
+            {
+                int lanes = Vector<float>.Count;
+                int simdLen = length - (length % lanes);
+                if (simdLen > 0)
+                {
+                    var one = Vector<float>.One;
+                    var pow2_23 = new Vector<float>(8388608f);
+                    var inV = MemoryMarshal.Cast<float, Vector<float>>(new ReadOnlySpan<float>(input, simdLen));
+                    var outV = MemoryMarshal.Cast<float, Vector<float>>(new Span<float>(output, simdLen));
+                    for (int v = 0; v < inV.Length; v++)
+                    {
+                        var x = inV[v];
+                        var trunc = Vector.ConvertToSingle(Vector.ConvertToInt32(x));
+                        var floorTrick = Vector.ConditionalSelect(Vector.GreaterThan(trunc, x), trunc - one, trunc);
+                        outV[v] = Vector.ConditionalSelect(Vector.LessThan(Vector.Abs(x), pow2_23), floorTrick, x);
+                    }
+                    i = simdLen;
+                }
+            }
 #endif
             for (; i < length; i++)
                 output[i] = MathF.Floor(input[i]);
@@ -1054,6 +1079,28 @@ namespace AiDotNet.Tensors.Engines.Simd
                 int simdLength = i + ((length - i) & ~7);
                 for (; i < simdLength; i += 8)
                     Avx.Store(output + i, Avx.Ceiling(Avx.LoadVector256(input + i)));
+            }
+#else
+            // net471 §D: ceil(x) = trunc(x) + (trunc(x) < x ? 1 : 0); same |x| < 2^23
+            // guard as Floor above (passes NaN/±Inf through unchanged).
+            {
+                int lanes = Vector<float>.Count;
+                int simdLen = length - (length % lanes);
+                if (simdLen > 0)
+                {
+                    var one = Vector<float>.One;
+                    var pow2_23 = new Vector<float>(8388608f);
+                    var inV = MemoryMarshal.Cast<float, Vector<float>>(new ReadOnlySpan<float>(input, simdLen));
+                    var outV = MemoryMarshal.Cast<float, Vector<float>>(new Span<float>(output, simdLen));
+                    for (int v = 0; v < inV.Length; v++)
+                    {
+                        var x = inV[v];
+                        var trunc = Vector.ConvertToSingle(Vector.ConvertToInt32(x));
+                        var ceilTrick = Vector.ConditionalSelect(Vector.LessThan(trunc, x), trunc + one, trunc);
+                        outV[v] = Vector.ConditionalSelect(Vector.LessThan(Vector.Abs(x), pow2_23), ceilTrick, x);
+                    }
+                    i = simdLen;
+                }
             }
 #endif
             for (; i < length; i++)
