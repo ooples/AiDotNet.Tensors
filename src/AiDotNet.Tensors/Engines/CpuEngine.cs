@@ -1,4 +1,5 @@
-﻿using System;
+﻿#pragma warning disable CS0618 // SimdGemm.Sgemm/Dgemm (no-trans shims) are [Obsolete] — internal call sites pending migration to BlasManaged.Gemm<T> in later K tasks.
+using System;
 using System.Buffers;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
@@ -11721,6 +11722,43 @@ public partial class CpuEngine : ITensorLevelEngine
             return result;
         }
 
+        // Sub-E (#373): auto-adopt pre-packed weight when B is registered in
+        // FrozenWeightRegistry AND the autotune routing decision says managed
+        // wins for this shape. The second check matters because at many shapes
+        // (M*N*K compute-bound) native BLAS is 4-6× faster than BlasManaged
+        // even with a pre-pack — routing managed unconditionally there makes
+        // adoption ANTI-helpful. The gate is the same one BlasProvider.TryGemmEx
+        // uses, so behavior is consistent with the rest of the dispatcher.
+        if (typeof(T) == typeof(float) || typeof(T) == typeof(double))
+        {
+            var handle = Engines.BlasManaged.FrozenWeightRegistry.TryGetHandle(b);
+            if (handle != null && Engines.BlasManaged.WeightPackCache.IsCacheCurrent(handle)
+                && a.IsContiguous && b.IsContiguous
+                && ShouldRouteManagedForPrePackedB<T>(m, p, n))
+            {
+                if (typeof(T) == typeof(float))
+                {
+                    var aArr = (float[])(object)a.GetDataArray();
+                    var bArr = (float[])(object)b.GetDataArray();
+                    var rArr = (float[])(object)result.GetDataArray();
+                    var opts = new Engines.BlasManaged.BlasOptions<float> { PackedB = handle };
+                    Engines.BlasManaged.BlasManaged.Gemm<float>(
+                        aArr, n, false, bArr, p, false, rArr, p, m, p, n, opts);
+                    return result;
+                }
+                else
+                {
+                    var aArr = (double[])(object)a.GetDataArray();
+                    var bArr = (double[])(object)b.GetDataArray();
+                    var rArr = (double[])(object)result.GetDataArray();
+                    var opts = new Engines.BlasManaged.BlasOptions<double> { PackedB = handle };
+                    Engines.BlasManaged.BlasManaged.Gemm<double>(
+                        aArr, n, false, bArr, p, false, rArr, p, m, p, n, opts);
+                    return result;
+                }
+            }
+        }
+
         // Try BLAS-accelerated path for float/double tensors
         if (MatrixMultiplyHelper.TryGemm(a.Data, 0, b.Data, 0, result.Data, 0, m, n, p))
         {
@@ -11743,6 +11781,104 @@ public partial class CpuEngine : ITensorLevelEngine
         MatrixMultiplyHelper.MultiplyBlocked(numOps, a.Data, b.Data, result.Data, m, n, p, n, p, p);
 
         return result;
+    }
+
+    /// <summary>
+    /// Sub-E (#373): inference fast path that consumes a pre-packed weight handle
+    /// for the right-hand-side matrix B. Callers (e.g., compiled inference plans,
+    /// frozen-weight backward kernels) pre-pack B once via
+    /// <see cref="Engines.BlasManaged.BlasManaged.PrePackB{T}"/> and reuse the
+    /// handle across many calls. When the handle is current
+    /// (<see cref="Engines.BlasManaged.WeightPackHandle.MarkDirty"/> hasn't been
+    /// called since the last pack), the BlasManaged dispatcher consumes the
+    /// pre-packed tiles directly instead of re-packing B per call.
+    ///
+    /// <para>
+    /// Falls back to the standard <c>TensorMatMul</c> path automatically when:
+    /// (a) T is not float/double, (b) shapes don't match the handle's layout,
+    /// or (c) the handle has been marked dirty (caller mutated B in place).
+    /// </para>
+    ///
+    /// <para>
+    /// Tape recording: this overload does NOT record a backward link. It is
+    /// intended for inference / frozen-weight paths where B's gradient is
+    /// not required. Callers that need gradients on B should use the regular
+    /// <see cref="TensorMatMul{T}(Tensor{T}, Tensor{T})"/> overload.
+    /// </para>
+    /// </summary>
+    /// <typeparam name="T">Element type. Optimised for float/double; other T routes through the legacy path.</typeparam>
+    /// <param name="a">Left operand, rank-2 row-major [M, K].</param>
+    /// <param name="b">Right operand backing buffer, rank-2 row-major [K, N]. Must be byte-identical to the buffer pre-packed into <paramref name="prePackedB"/>.</param>
+    /// <param name="prePackedB">Pre-pack handle returned by <see cref="Engines.BlasManaged.BlasManaged.PrePackB{T}"/>.</param>
+    public virtual Tensor<T> TensorMatMul2DWithPrePackedB<T>(Tensor<T> a, Tensor<T> b, Engines.BlasManaged.WeightPackHandle prePackedB)
+    {
+        if (a == null) throw new ArgumentNullException(nameof(a));
+        if (b == null) throw new ArgumentNullException(nameof(b));
+        if (prePackedB == null) throw new ArgumentNullException(nameof(prePackedB));
+        if (a.Rank != 2 || b.Rank != 2)
+            throw new ArgumentException($"TensorMatMul2DWithPrePackedB requires rank-2 inputs (got a={a.Rank}, b={b.Rank}).");
+        if (a._shape[1] != b._shape[0])
+            throw new ArgumentException($"Matrix dimensions incompatible: [{a._shape[0]},{a._shape[1]}] x [{b._shape[0]},{b._shape[1]}]");
+
+        int m = a._shape[0], k = a._shape[1], n = b._shape[1];
+        var result = AutoTensorCache.RentOrAllocate<T>(new[] { m, n });
+
+        if (typeof(T) == typeof(float))
+        {
+            var aArr = (float[])(object)a.GetDataArray();
+            var bArr = (float[])(object)b.GetDataArray();
+            var rArr = (float[])(object)result.GetDataArray();
+            var opts = new Engines.BlasManaged.BlasOptions<float> { PackedB = prePackedB };
+            Engines.BlasManaged.BlasManaged.Gemm<float>(
+                aArr, k, false, bArr, n, false, rArr, n, m, n, k, opts);
+            return result;
+        }
+        if (typeof(T) == typeof(double))
+        {
+            var aArr = (double[])(object)a.GetDataArray();
+            var bArr = (double[])(object)b.GetDataArray();
+            var rArr = (double[])(object)result.GetDataArray();
+            var opts = new Engines.BlasManaged.BlasOptions<double> { PackedB = prePackedB };
+            Engines.BlasManaged.BlasManaged.Gemm<double>(
+                aArr, k, false, bArr, n, false, rArr, n, m, n, k, opts);
+            return result;
+        }
+
+        // Fallback for non-float/double: ignore the handle and run the regular path.
+        return TensorMatMul(a, b);
+    }
+
+    /// <summary>
+    /// Sub-E (#373): decide whether a pre-packed-B fast path should route the
+    /// call to <see cref="Engines.BlasManaged.BlasManaged.Gemm{T}"/> (managed)
+    /// or fall through to <see cref="Helpers.MatrixMultiplyHelper.TryGemm"/>
+    /// (native BLAS). Mirrors the routing decision made by
+    /// <see cref="Helpers.BlasProvider.TryGemmEx"/> so the pre-pack adoption
+    /// only fires when managed is actually competitive — otherwise routing
+    /// managed for a faster native shape regresses end-to-end perf even
+    /// after pre-pack savings (see the regression caught by
+    /// <c>Registered_FFN_128x768x768_Inference_Loop_Faster_Than_Unregistered</c>
+    /// where managed was 5.7× slower than native).
+    /// </summary>
+    private static bool ShouldRouteManagedForPrePackedB<T>(int m, int n, int k)
+    {
+        // Force-managed mode (supply-chain) — always route managed.
+        if (Engines.BlasManaged.BlasManaged.PreferManaged) return true;
+
+        // Native BLAS unavailable — managed is the only option.
+        if (!Helpers.BlasProvider.IsAvailable) return true;
+
+        // Autotune-based per-shape routing — only when the cache says managed wins.
+        if (Engines.BlasManaged.BlasManaged.AutotuneRouting)
+        {
+            Type dtype = typeof(T) == typeof(float) ? typeof(float) : typeof(double);
+            return Engines.BlasManaged.PrefersManagedCache.PrefersManaged(
+                m, n, k, transA: false, transB: false, dtype: dtype);
+        }
+
+        // No routing flag set: prefer native — pre-pack savings don't outweigh
+        // the BlasManaged-vs-native compute gap at most production shapes.
+        return false;
     }
 
     private static bool TryTensorMatMulGemv<T>(Tensor<T> a, Tensor<T> b, Tensor<T> result, int m, int k)
@@ -11890,11 +12026,50 @@ public partial class CpuEngine : ITensorLevelEngine
         // wrong stride and produce silently incorrect results. The caller in
         // TensorMatMul ensures A is contiguous via a.Contiguous(); we guard
         // B here since it may be a shared weight matrix passed directly.
-        if (a.IsContiguous && b.IsContiguous && MatrixMultiplyHelper.TryGemm(
-            a.Data, 0, b.Data, 0, result.Data, 0,
-            batchSize * m, n, p))
+        if (a.IsContiguous && b.IsContiguous)
         {
-            return result;
+            // Sub-E (#373): collapsed ND × 2D path — when B is registered in
+            // FrozenWeightRegistry AND managed wins for this shape, route the
+            // single big GEMM through BlasManaged with the pre-pack handle.
+            // Gate is identical to the 2D path's ShouldRouteManagedForPrePackedB
+            // to keep behavior consistent (and avoid the 5.7× regression that
+            // unconditional managed routing produced at FFN_128×768×768).
+            if (typeof(T) == typeof(float) || typeof(T) == typeof(double))
+            {
+                int bigM = batchSize * m;
+                var handle = Engines.BlasManaged.FrozenWeightRegistry.TryGetHandle(b);
+                if (handle != null && Engines.BlasManaged.WeightPackCache.IsCacheCurrent(handle)
+                    && ShouldRouteManagedForPrePackedB<T>(bigM, p, n))
+                {
+                    if (typeof(T) == typeof(float))
+                    {
+                        var aArr = (float[])(object)aData;
+                        var bArr = (float[])(object)bData;
+                        var rArr = (float[])(object)rData;
+                        var opts = new Engines.BlasManaged.BlasOptions<float> { PackedB = handle };
+                        Engines.BlasManaged.BlasManaged.Gemm<float>(
+                            aArr, n, false, bArr, p, false, rArr, p, bigM, p, n, opts);
+                        return result;
+                    }
+                    else
+                    {
+                        var aArr = (double[])(object)aData;
+                        var bArr = (double[])(object)bData;
+                        var rArr = (double[])(object)rData;
+                        var opts = new Engines.BlasManaged.BlasOptions<double> { PackedB = handle };
+                        Engines.BlasManaged.BlasManaged.Gemm<double>(
+                            aArr, n, false, bArr, p, false, rArr, p, bigM, p, n, opts);
+                        return result;
+                    }
+                }
+            }
+
+            if (MatrixMultiplyHelper.TryGemm(
+                a.Data, 0, b.Data, 0, result.Data, 0,
+                batchSize * m, n, p))
+            {
+                return result;
+            }
         }
 
         // Fallback: per-slice dispatch (preserves behavior for non-contiguous A or
@@ -24323,6 +24498,21 @@ public partial class CpuEngine : ITensorLevelEngine
 
                 // Step 1: scores = Q · K^T. Pre-transpose this head's K into a
                 // pooled scratch buffer so the GEMM doesn't need transB support.
+                //
+                // PR #426 Linux CI follow-up: bypass BlasProvider.TryGemmEx
+                // entirely and call SimdGemm.DgemmSequential directly — matches
+                // the float path's design (FlashAttentionFloat goes straight
+                // to SgemmSequential without trying OpenBLAS first). Pre-fix
+                // the double path preferred native OpenBLAS; even with the
+                // ScopeOpenBlasThreads(1) cap from PR #410, 8 concurrent worker
+                // threads contending on OpenBLAS's internal mutex serialised
+                // badly on Linux CI runners and the
+                // FlashAttentionDouble_SdUnetShape_CompletesUnderBudget test
+                // (#411 regression guard) timed out at 30s. SimdGemm's
+                // managed kernel is per-thread stateless (no global mutex)
+                // and at FlashAttention's per-head shapes (M=seqQ,
+                // K=headDim≤128, N=seqK) the AVX2/AVX-512 SIMD kernel is
+                // competitive with native DGEMM.
                 var kt = System.Buffers.ArrayPool<double>.Shared.Rent(headDim * seqK);
                 try
                 {
@@ -24330,17 +24520,11 @@ public partial class CpuEngine : ITensorLevelEngine
                         for (int j = 0; j < headDim; j++)
                             kt[j * seqK + i] = kd[kOff + i * headDim + j];
 
-                    if (!BlasProvider.TryGemmEx(seqQ, seqK, headDim,
-                        qd, qOff, headDim, false,
-                        kt, 0, seqK, false,
-                        scoresData, sOff, seqK))
-                    {
-                        SimdGemm.DgemmSequential(
-                            qd.AsSpan(qOff, seqQ * headDim),
-                            kt.AsSpan(0, headDim * seqK),
-                            scoresData.AsSpan(sOff, seqQ * seqK),
-                            seqQ, headDim, seqK);
-                    }
+                    SimdGemm.DgemmSequential(
+                        qd.AsSpan(qOff, seqQ * headDim),
+                        kt.AsSpan(0, headDim * seqK),
+                        scoresData.AsSpan(sOff, seqQ * seqK),
+                        seqQ, headDim, seqK);
                 }
                 finally { System.Buffers.ArrayPool<double>.Shared.Return(kt); }
 
@@ -24388,20 +24572,15 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
 
                 // Step 3: output = softmax · V. No transpose, V is row-major.
+                // Same SimdGemm-direct rationale as Step 1 (PR #426 CI fix).
                 int wOff = bh * seqQ * seqK;
                 int vOff = bh * seqK * d_v;
                 int oOff = bh * seqQ * d_v;
-                if (!BlasProvider.TryGemmEx(seqQ, d_v, seqK,
-                    weightsData, wOff, seqK, false,
-                    vd, vOff, d_v, false,
-                    outputData, oOff, d_v))
-                {
-                    SimdGemm.DgemmSequential(
-                        weightsData.AsSpan(wOff, seqQ * seqK),
-                        vd.AsSpan(vOff, seqK * d_v),
-                        outputData.AsSpan(oOff, seqQ * d_v),
-                        seqQ, seqK, d_v);
-                }
+                SimdGemm.DgemmSequential(
+                    weightsData.AsSpan(wOff, seqQ * seqK),
+                    vd.AsSpan(vOff, seqK * d_v),
+                    outputData.AsSpan(oOff, seqQ * d_v),
+                    seqQ, seqK, d_v);
             });
 
             softmaxStats = TensorAllocator.Rent<double>(

@@ -1,0 +1,211 @@
+[
+  {
+    "Name": "Instrumented_197x768x768_NA_NB_Single",
+    "M": 197,
+    "N": 768,
+    "K": 768,
+    "TransA": false,
+    "TransB": false,
+    "Dtype": 0,
+    "Frequency": 939,
+    "Source": "instrumented:test-suite"
+  },
+  {
+    "Name": "Instrumented_64x64x64_NA_NB_Single",
+    "M": 64,
+    "N": 64,
+    "K": 64,
+    "TransA": false,
+    "TransB": false,
+    "Dtype": 0,
+    "Frequency": 159,
+    "Source": "instrumented:test-suite"
+  },
+  {
+    "Name": "Instrumented_64x64x64_NA_NB_Double",
+    "M": 64,
+    "N": 64,
+    "K": 64,
+    "TransA": false,
+    "TransB": false,
+    "Dtype": 1,
+    "Frequency": 107,
+    "Source": "instrumented:test-suite"
+  },
+  {
+    "Name": "Instrumented_197x768x768_NA_TB_Single",
+    "M": 197,
+    "N": 768,
+    "K": 768,
+    "TransA": false,
+    "TransB": true,
+    "Dtype": 0,
+    "Frequency": 96,
+    "Source": "instrumented:test-suite"
+  },
+  {
+    "Name": "Instrumented_768x768x197_TA_NB_Single",
+    "M": 768,
+    "N": 768,
+    "K": 197,
+    "TransA": true,
+    "TransB": false,
+    "Dtype": 0,
+    "Frequency": 96,
+    "Source": "instrumented:test-suite"
+  },
+  {
+    "Name": "Instrumented_32x32x32_NA_NB_Double",
+    "M": 32,
+    "N": 32,
+    "K": 32,
+    "TransA": false,
+    "TransB": false,
+    "Dtype": 1,
+    "Frequency": 53,
+    "Source": "instrumented:test-suite"
+  },
+  {
+    "Name": "Instrumented_32x32x32_NA_NB_Single",
+    "M": 32,
+    "N": 32,
+    "K": 32,
+    "TransA": false,
+    "TransB": false,
+    "Dtype": 0,
+    "Frequency": 53,
+    "Source": "instrumented:test-suite"
+  },
+  {
+    "Name": "Instrumented_256x256x128_TA_NB_Double",
+    "M": 256,
+    "N": 256,
+    "K": 128,
+    "TransA": true,
+    "TransB": false,
+    "Dtype": 1,
+    "Frequency": 53,
+    "Source": "instrumented:test-suite"
+  },
+  {
+    "Name": "Instrumented_256x256x256_NA_NB_Double",
+    "M": 256,
+    "N": 256,
+    "K": 256,
+    "TransA": false,
+    "TransB": false,
+    "Dtype": 1,
+    "Frequency": 33,
+    "Source": "instrumented:test-suite"
+  },
+  {
+    "Name": "Instrumented_4096x16x512_TA_NB_Double",
+    "M": 4096,
+    "N": 16,
+    "K": 512,
+    "TransA": true,
+    "TransB": false,
+    "Dtype": 1,
+    "Frequency": 33,
+    "Source": "instrumented:test-suite"
+  },
+  {
+    "Name": "Instrumented_64x64x4096_NA_NB_Double",
+    "M": 64,
+    "N": 64,
+    "K": 4096,
+    "TransA": false,
+    "TransB": false,
+    "Dtype": 1,
+    "Frequency": 33,
+    "Source": "instrumented:test-suite"
+  },
+  {
+    "Name": "Instrumented_2048x32x256_NA_NB_Double",
+    "M": 2048,
+    "N": 32,
+    "K": 256,
+    "TransA": false,
+    "TransB": false,
+    "Dtype": 1,
+    "Frequency": 33,
+    "Source": "instrumented:test-suite"
+  },
+  {
+    "Name": "Instrumented_32x2048x256_NA_NB_Double",
+    "M": 32,
+    "N": 2048,
+    "K": 256,
+    "TransA": false,
+    "TransB": false,
+    "Dtype": 1,
+    "Frequency": 33,
+    "Source": "instrumented:test-suite"
+  },
+  {
+    "Name": "Instrumented_512x512x64_NA_NB_Double",
+    "M": 512,
+    "N": 512,
+    "K": 64,
+    "TransA": false,
+    "TransB": false,
+    "Dtype": 1,
+    "Frequency": 33,
+    "Source": "instrumented:test-suite"
+  },
+  {
+    "Name": "Instrumented_128x768x768_NA_NB_Double",
+    "M": 128,
+    "N": 768,
+    "K": 768,
+    "TransA": false,
+    "TransB": false,
+    "Dtype": 1,
+    "Frequency": 33,
+    "Source": "instrumented:test-suite"
+  },
+  {
+    "Name": "Instrumented_16x4096x512_NA_TB_Double",
+    "M": 16,
+    "N": 4096,
+    "K": 512,
+    "TransA": false,
+    "TransB": true,
+    "Dtype": 1,
+    "Frequency": 33,
+    "Source": "instrumented:test-suite"
+  },
+  {
+    "Name": "Instrumented_1024x1024x1024_NA_NB_Double",
+    "M": 1024,
+    "N": 1024,
+    "K": 1024,
+    "TransA": false,
+    "TransB": false,
+    "Dtype": 1,
+    "Frequency": 13,
+    "Source": "instrumented:test-suite"
+  },
+  {
+    "Name": "Instrumented_8x2x4_NA_NB_Single",
+    "M": 8,
+    "N": 2,
+    "K": 4,
+    "TransA": false,
+    "TransB": false,
+    "Dtype": 0,
+    "Frequency": 1,
+    "Source": "instrumented:test-suite"
+  },
+  {
+    "Name": "Instrumented_8x6x4_NA_NB_Single",
+    "M": 8,
+    "N": 6,
+    "K": 4,
+    "TransA": false,
+    "TransB": false,
+    "Dtype": 0,
+    "Frequency": 1,
+    "Source": "instrumented:test-suite"
+  }
+]
