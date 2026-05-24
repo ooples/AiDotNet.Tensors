@@ -8382,35 +8382,85 @@ namespace AiDotNet.Tensors.Engines.Simd
             {
                 float m = mean[c];
                 float invStd = 1.0f / MathF.Sqrt(variance[c] + epsilon);
-                float gGamma = 0, gBeta = 0;
                 float sumGradXhat = 0, sumGrad = 0;
 
-                // Pass 1: accumulate gradGamma, gradBeta, and intermediate sums
+                // Pass 1: reductions over (b, s). The inner spatial loop is
+                // contiguous (idx = base + s), so net471 vectorizes it.
                 for (int b = 0; b < batchSize; b++)
                 {
-                    for (int s = 0; s < spatialSize; s++)
+                    int baseIdx = (b * channels + c) * spatialSize;
+                    int s = 0;
+#if !NET5_0_OR_GREATER
+                    // net471 §E: BCL Vector<float> reduction over the spatial run.
                     {
-                        int idx = (b * channels + c) * spatialSize + s;
-                        float go = gradOutput[idx];
-                        float xhat = (input[idx] - m) * invStd;
-                        gGamma += go * xhat;
-                        gBeta += go;
+                        int lanes = Vector<float>.Count;
+                        int simdLen = spatialSize - (spatialSize % lanes);
+                        if (simdLen > 0)
+                        {
+                            var vm = new Vector<float>(m);
+                            var vinv = new Vector<float>(invStd);
+                            var goV = MemoryMarshal.Cast<float, Vector<float>>(new ReadOnlySpan<float>(gradOutput + baseIdx, simdLen));
+                            var inV = MemoryMarshal.Cast<float, Vector<float>>(new ReadOnlySpan<float>(input + baseIdx, simdLen));
+                            var accXhat = Vector<float>.Zero;
+                            var accGo = Vector<float>.Zero;
+                            for (int v = 0; v < goV.Length; v++)
+                            {
+                                var xhat = (inV[v] - vm) * vinv;
+                                accXhat += goV[v] * xhat;
+                                accGo += goV[v];
+                            }
+                            sumGradXhat += Vector.Dot(accXhat, Vector<float>.One);
+                            sumGrad += Vector.Dot(accGo, Vector<float>.One);
+                            s = simdLen;
+                        }
+                    }
+#endif
+                    for (; s < spatialSize; s++)
+                    {
+                        float go = gradOutput[baseIdx + s];
+                        float xhat = (input[baseIdx + s] - m) * invStd;
                         sumGradXhat += go * xhat;
                         sumGrad += go;
                     }
                 }
-                gradGamma[c] = gGamma;
-                gradBeta[c] = gBeta;
+                gradGamma[c] = sumGradXhat;
+                gradBeta[c] = sumGrad;
 
                 // Pass 2: compute gradInput
                 float g = gamma[c];
                 for (int b = 0; b < batchSize; b++)
                 {
-                    for (int s = 0; s < spatialSize; s++)
+                    int baseIdx = (b * channels + c) * spatialSize;
+                    int s = 0;
+#if !NET5_0_OR_GREATER
+                    // net471 §E: BCL Vector<float> elementwise gradInput.
                     {
-                        int idx = (b * channels + c) * spatialSize + s;
-                        float xhat = (input[idx] - m) * invStd;
-                        gradInput[idx] = g * invStd * (gradOutput[idx] - invN * (sumGrad + xhat * sumGradXhat));
+                        int lanes = Vector<float>.Count;
+                        int simdLen = spatialSize - (spatialSize % lanes);
+                        if (simdLen > 0)
+                        {
+                            var vm = new Vector<float>(m);
+                            var vinv = new Vector<float>(invStd);
+                            var vg = new Vector<float>(g);
+                            var vinvN = new Vector<float>(invN);
+                            var vSumGrad = new Vector<float>(sumGrad);
+                            var vSumXhat = new Vector<float>(sumGradXhat);
+                            var goV = MemoryMarshal.Cast<float, Vector<float>>(new ReadOnlySpan<float>(gradOutput + baseIdx, simdLen));
+                            var inV = MemoryMarshal.Cast<float, Vector<float>>(new ReadOnlySpan<float>(input + baseIdx, simdLen));
+                            var giV = MemoryMarshal.Cast<float, Vector<float>>(new Span<float>(gradInput + baseIdx, simdLen));
+                            for (int v = 0; v < goV.Length; v++)
+                            {
+                                var xhat = (inV[v] - vm) * vinv;
+                                giV[v] = vg * vinv * (goV[v] - vinvN * (vSumGrad + xhat * vSumXhat));
+                            }
+                            s = simdLen;
+                        }
+                    }
+#endif
+                    for (; s < spatialSize; s++)
+                    {
+                        float xhat = (input[baseIdx + s] - m) * invStd;
+                        gradInput[baseIdx + s] = g * invStd * (gradOutput[baseIdx + s] - invN * (sumGrad + xhat * sumGradXhat));
                     }
                 }
             }
@@ -8439,17 +8489,69 @@ namespace AiDotNet.Tensors.Engines.Simd
                 float m = mean[b];
                 float invStd = 1.0f / MathF.Sqrt(variance[b] + epsilon);
 
-                // Accumulate gradGamma and gradBeta
-                for (int i = 0; i < normSize; i++)
+                // Pass 1: accumulate gradGamma[i] += go·xhat, gradBeta[i] += go
+                int i = 0;
+#if !NET5_0_OR_GREATER
+                // net471 §E: BCL Vector<float> elementwise accumulation.
+                {
+                    int lanes = Vector<float>.Count;
+                    int simdLen = normSize - (normSize % lanes);
+                    if (simdLen > 0)
+                    {
+                        var vm = new Vector<float>(m);
+                        var vinv = new Vector<float>(invStd);
+                        var goV = MemoryMarshal.Cast<float, Vector<float>>(new ReadOnlySpan<float>(gradOutput + offset, simdLen));
+                        var inV = MemoryMarshal.Cast<float, Vector<float>>(new ReadOnlySpan<float>(input + offset, simdLen));
+                        var ggV = MemoryMarshal.Cast<float, Vector<float>>(new Span<float>(gradGamma, simdLen));
+                        var gbV = MemoryMarshal.Cast<float, Vector<float>>(new Span<float>(gradBeta, simdLen));
+                        for (int v = 0; v < goV.Length; v++)
+                        {
+                            var xhat = (inV[v] - vm) * vinv;
+                            ggV[v] += goV[v] * xhat;
+                            gbV[v] += goV[v];
+                        }
+                        i = simdLen;
+                    }
+                }
+#endif
+                for (; i < normSize; i++)
                 {
                     float xhat = (input[offset + i] - m) * invStd;
                     gradGamma[i] += gradOutput[offset + i] * xhat;
                     gradBeta[i] += gradOutput[offset + i];
                 }
 
-                // Compute intermediate sums for gradInput
+                // Pass 2: intermediate sums ds = Σ go·γ·xhat, db = Σ go·γ
                 float ds = 0, db = 0;
-                for (int i = 0; i < normSize; i++)
+                i = 0;
+#if !NET5_0_OR_GREATER
+                // net471 §E: BCL Vector<float> reduction.
+                {
+                    int lanes = Vector<float>.Count;
+                    int simdLen = normSize - (normSize % lanes);
+                    if (simdLen > 0)
+                    {
+                        var vm = new Vector<float>(m);
+                        var vinv = new Vector<float>(invStd);
+                        var goV = MemoryMarshal.Cast<float, Vector<float>>(new ReadOnlySpan<float>(gradOutput + offset, simdLen));
+                        var inV = MemoryMarshal.Cast<float, Vector<float>>(new ReadOnlySpan<float>(input + offset, simdLen));
+                        var gaV = MemoryMarshal.Cast<float, Vector<float>>(new ReadOnlySpan<float>(gamma, simdLen));
+                        var accDs = Vector<float>.Zero;
+                        var accDb = Vector<float>.Zero;
+                        for (int v = 0; v < goV.Length; v++)
+                        {
+                            var go = goV[v] * gaV[v];
+                            var xhat = (inV[v] - vm) * vinv;
+                            accDs += go * xhat;
+                            accDb += go;
+                        }
+                        ds = Vector.Dot(accDs, Vector<float>.One);
+                        db = Vector.Dot(accDb, Vector<float>.One);
+                        i = simdLen;
+                    }
+                }
+#endif
+                for (; i < normSize; i++)
                 {
                     float go = gradOutput[offset + i] * gamma[i];
                     float xhat = (input[offset + i] - m) * invStd;
@@ -8457,9 +8559,35 @@ namespace AiDotNet.Tensors.Engines.Simd
                     db += go;
                 }
 
-                // gradInput
+                // Pass 3: gradInput
                 float invN = 1.0f / normSize;
-                for (int i = 0; i < normSize; i++)
+                i = 0;
+#if !NET5_0_OR_GREATER
+                // net471 §E: BCL Vector<float> elementwise gradInput.
+                {
+                    int lanes = Vector<float>.Count;
+                    int simdLen = normSize - (normSize % lanes);
+                    if (simdLen > 0)
+                    {
+                        var vm = new Vector<float>(m);
+                        var vinv = new Vector<float>(invStd);
+                        var vds = new Vector<float>(ds);
+                        var vdb = new Vector<float>(db);
+                        var vinvN = new Vector<float>(invN);
+                        var goV = MemoryMarshal.Cast<float, Vector<float>>(new ReadOnlySpan<float>(gradOutput + offset, simdLen));
+                        var inV = MemoryMarshal.Cast<float, Vector<float>>(new ReadOnlySpan<float>(input + offset, simdLen));
+                        var gaV = MemoryMarshal.Cast<float, Vector<float>>(new ReadOnlySpan<float>(gamma, simdLen));
+                        var giV = MemoryMarshal.Cast<float, Vector<float>>(new Span<float>(gradInput + offset, simdLen));
+                        for (int v = 0; v < goV.Length; v++)
+                        {
+                            var xhat = (inV[v] - vm) * vinv;
+                            giV[v] = vinv * (goV[v] * gaV[v] - vinvN * (vdb + xhat * vds));
+                        }
+                        i = simdLen;
+                    }
+                }
+#endif
+                for (; i < normSize; i++)
                 {
                     float xhat = (input[offset + i] - m) * invStd;
                     gradInput[offset + i] = invStd * (gradOutput[offset + i] * gamma[i] - invN * (db + xhat * ds));
