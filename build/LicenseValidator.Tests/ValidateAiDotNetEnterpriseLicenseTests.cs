@@ -25,6 +25,19 @@ public class ValidateAiDotNetEnterpriseLicenseTests : IDisposable
     private readonly RSA _signingRsa;
     private readonly string _publicKeyBase64;
 
+    /// <summary>The secret license key the synthetic test licenses are bound to.</summary>
+    private const string TestLicenseKey = "ENT-TEST-KEY-7f3a9c21e84b46d0a1559e2cdbf60a17";
+
+    /// <summary>Lowercase-hex SHA-256 of a key — must match the validator's ComputeKeyHash.</summary>
+    private static string KeyHashHex(string key)
+    {
+        using var sha = SHA256.Create();
+        var bytes = sha.ComputeHash(Encoding.UTF8.GetBytes(key));
+        var sb = new StringBuilder(bytes.Length * 2);
+        foreach (var b in bytes) sb.Append(b.ToString("x2"));
+        return sb.ToString();
+    }
+
     public ValidateAiDotNetEnterpriseLicenseTests()
     {
         _tempDir = Path.Combine(Path.GetTempPath(), "aidotnet-license-tests-" + Guid.NewGuid().ToString("N"));
@@ -92,9 +105,10 @@ public class ValidateAiDotNetEnterpriseLicenseTests : IDisposable
         string tenant = "ACME Corp.",
         string expires = "2099-12-31",
         string[]? scope = null,
-        bool corruptSignature = false)
+        bool corruptSignature = false,
+        string licenseKey = TestLicenseKey)
     {
-        scope ??= new[] { "DISABLE_TELEMETRY", "DISABLE_LICENSE_GUARD" };
+        scope ??= new[] { "AIDOTNET_DISABLE_TELEMETRY", "AIDOTNET_DISABLE_LICENSE_GUARD" };
 
         var inner = new
         {
@@ -103,6 +117,7 @@ public class ValidateAiDotNetEnterpriseLicenseTests : IDisposable
             issued = "2026-05-22",
             expires,
             scope,
+            keyHash = KeyHashHex(licenseKey),
         };
         var payloadJson = JsonSerializer.Serialize(inner, new JsonSerializerOptions { WriteIndented = false });
         var payloadBytes = Encoding.UTF8.GetBytes(payloadJson);
@@ -137,7 +152,8 @@ public class ValidateAiDotNetEnterpriseLicenseTests : IDisposable
         {
             BuildEngine = NewEngine(),
             LicensePath = path,
-            RequestedFlags = "DISABLE_TELEMETRY",
+            RequestedFlags = "AIDOTNET_DISABLE_TELEMETRY",
+            LicenseKey = TestLicenseKey,
         };
 
         Assert.True(task.Execute(), $"Validator rejected a well-formed license: {string.Join("; ", ((MockBuildEngine)task.BuildEngine).Errors)}");
@@ -154,7 +170,8 @@ public class ValidateAiDotNetEnterpriseLicenseTests : IDisposable
         {
             BuildEngine = NewEngine(),
             LicensePath = path,
-            RequestedFlags = "DISABLE_TELEMETRY",
+            RequestedFlags = "AIDOTNET_DISABLE_TELEMETRY",
+            LicenseKey = TestLicenseKey,
         };
 
         Assert.False(task.Execute());
@@ -172,7 +189,8 @@ public class ValidateAiDotNetEnterpriseLicenseTests : IDisposable
         {
             BuildEngine = NewEngine(),
             LicensePath = path,
-            RequestedFlags = "DISABLE_TELEMETRY",
+            RequestedFlags = "AIDOTNET_DISABLE_TELEMETRY",
+            LicenseKey = TestLicenseKey,
         };
 
         Assert.False(task.Execute());
@@ -184,13 +202,14 @@ public class ValidateAiDotNetEnterpriseLicenseTests : IDisposable
     public void RequestedFlagNotInScope_RejectsWithAIDOTNET006()
     {
         OverrideEmbeddedPublicKey(_publicKeyBase64);
-        var path = WriteLicense(scope: new[] { "DISABLE_TELEMETRY" });
+        var path = WriteLicense(scope: new[] { "AIDOTNET_DISABLE_TELEMETRY" });
 
         var task = new ValidateAiDotNetEnterpriseLicense
         {
             BuildEngine = NewEngine(),
             LicensePath = path,
-            RequestedFlags = "DISABLE_LICENSE_GUARD",
+            RequestedFlags = "AIDOTNET_DISABLE_LICENSE_GUARD",
+            LicenseKey = TestLicenseKey,
         };
 
         Assert.False(task.Execute());
@@ -208,7 +227,8 @@ public class ValidateAiDotNetEnterpriseLicenseTests : IDisposable
         {
             BuildEngine = NewEngine(),
             LicensePath = path,
-            RequestedFlags = "DISABLE_TELEMETRY",
+            RequestedFlags = "AIDOTNET_DISABLE_TELEMETRY",
+            LicenseKey = TestLicenseKey,
         };
 
         Assert.False(task.Execute());
@@ -227,7 +247,7 @@ public class ValidateAiDotNetEnterpriseLicenseTests : IDisposable
         string[] envelopeScope, string envelopeExpires)
     {
         const string marker = "AiDotNet-Enterprise-License-v1";
-        var inner = new { marker, tenant = "ACME Corp.", issued = "2026-05-22", expires = signedExpires, scope = signedScope };
+        var inner = new { marker, tenant = "ACME Corp.", issued = "2026-05-22", expires = signedExpires, scope = signedScope, keyHash = KeyHashHex(TestLicenseKey) };
         var payloadBytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(inner));
         var signature = _signingRsa.SignData(payloadBytes, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
         var envelope = new
@@ -249,18 +269,19 @@ public class ValidateAiDotNetEnterpriseLicenseTests : IDisposable
     public void TamperedEnvelope_ScopeEscalation_RejectedFromSignedPayload()
     {
         OverrideEmbeddedPublicKey(_publicKeyBase64);
-        // Signed payload grants only DISABLE_TELEMETRY; the envelope tries to add
-        // DISABLE_LICENSE_GUARD. Requesting the escalated flag must fail — the
+        // Signed payload grants only AIDOTNET_DISABLE_TELEMETRY; the envelope tries to add
+        // AIDOTNET_DISABLE_LICENSE_GUARD. Requesting the escalated flag must fail — the
         // signed scope is the source of truth, not the envelope.
         var path = WriteTamperedLicense(
-            signedScope: new[] { "DISABLE_TELEMETRY" }, signedExpires: "2099-12-31",
-            envelopeScope: new[] { "DISABLE_TELEMETRY", "DISABLE_LICENSE_GUARD" }, envelopeExpires: "2099-12-31");
+            signedScope: new[] { "AIDOTNET_DISABLE_TELEMETRY" }, signedExpires: "2099-12-31",
+            envelopeScope: new[] { "AIDOTNET_DISABLE_TELEMETRY", "AIDOTNET_DISABLE_LICENSE_GUARD" }, envelopeExpires: "2099-12-31");
 
         var task = new ValidateAiDotNetEnterpriseLicense
         {
             BuildEngine = NewEngine(),
             LicensePath = path,
-            RequestedFlags = "DISABLE_LICENSE_GUARD",
+            RequestedFlags = "AIDOTNET_DISABLE_LICENSE_GUARD",
+            LicenseKey = TestLicenseKey,
         };
 
         Assert.False(task.Execute(), "Validator accepted an envelope-escalated scope absent from the signed payload.");
@@ -274,14 +295,15 @@ public class ValidateAiDotNetEnterpriseLicenseTests : IDisposable
         // Signed payload is expired; the envelope tries to extend expiry to the
         // far future. The signed (expired) date must govern.
         var path = WriteTamperedLicense(
-            signedScope: new[] { "DISABLE_TELEMETRY" }, signedExpires: "2000-01-01",
-            envelopeScope: new[] { "DISABLE_TELEMETRY" }, envelopeExpires: "2099-12-31");
+            signedScope: new[] { "AIDOTNET_DISABLE_TELEMETRY" }, signedExpires: "2000-01-01",
+            envelopeScope: new[] { "AIDOTNET_DISABLE_TELEMETRY" }, envelopeExpires: "2099-12-31");
 
         var task = new ValidateAiDotNetEnterpriseLicense
         {
             BuildEngine = NewEngine(),
             LicensePath = path,
-            RequestedFlags = "DISABLE_TELEMETRY",
+            RequestedFlags = "AIDOTNET_DISABLE_TELEMETRY",
+            LicenseKey = TestLicenseKey,
         };
 
         Assert.False(task.Execute(), "Validator accepted an envelope-extended expiry past the signed expiry.");
@@ -296,7 +318,8 @@ public class ValidateAiDotNetEnterpriseLicenseTests : IDisposable
         {
             BuildEngine = NewEngine(),
             LicensePath = Path.Combine(_tempDir, "does-not-exist.json"),
-            RequestedFlags = "DISABLE_TELEMETRY",
+            RequestedFlags = "AIDOTNET_DISABLE_TELEMETRY",
+            LicenseKey = TestLicenseKey,
         };
 
         Assert.False(task.Execute());
@@ -315,12 +338,54 @@ public class ValidateAiDotNetEnterpriseLicenseTests : IDisposable
         {
             BuildEngine = NewEngine(),
             LicensePath = path,
-            RequestedFlags = "DISABLE_TELEMETRY",
+            RequestedFlags = "AIDOTNET_DISABLE_TELEMETRY",
+            LicenseKey = TestLicenseKey,
         };
 
         Assert.False(task.Execute());
         Assert.Contains(((MockBuildEngine)task.BuildEngine).Errors,
             e => e.Code == "AIDOTNET008");
+    }
+
+    [Fact]
+    public void WrongLicenseKey_RejectsWithAIDOTNET011()
+    {
+        OverrideEmbeddedPublicKey(_publicKeyBase64);
+        // A perfectly valid, correctly-signed, in-scope, unexpired license — but
+        // the builder supplies the WRONG secret key. The signed payload's keyHash
+        // binds the license to TestLicenseKey, so a different key must be rejected.
+        // This is the security property that makes a leaked/redistributed license
+        // file useless without the matching key.
+        var path = WriteLicense(licenseKey: TestLicenseKey);
+
+        var task = new ValidateAiDotNetEnterpriseLicense
+        {
+            BuildEngine = NewEngine(),
+            LicensePath = path,
+            RequestedFlags = "AIDOTNET_DISABLE_TELEMETRY",
+            LicenseKey = "ENT-WRONG-KEY-0000000000000000000000000000000000",
+        };
+
+        Assert.False(task.Execute(), "Validator accepted a license with a non-matching license key.");
+        Assert.Contains(((MockBuildEngine)task.BuildEngine).Errors, e => e.Code == "AIDOTNET011");
+    }
+
+    [Fact]
+    public void CorrectLicenseKey_VerifiesSuccessfully()
+    {
+        OverrideEmbeddedPublicKey(_publicKeyBase64);
+        var path = WriteLicense(licenseKey: TestLicenseKey);
+
+        var task = new ValidateAiDotNetEnterpriseLicense
+        {
+            BuildEngine = NewEngine(),
+            LicensePath = path,
+            RequestedFlags = "AIDOTNET_DISABLE_TELEMETRY",
+            LicenseKey = TestLicenseKey,
+        };
+
+        Assert.True(task.Execute(), $"Validator rejected a license with the correct key: {string.Join("; ", ((MockBuildEngine)task.BuildEngine).Errors)}");
+        Assert.Equal("ACME Corp.", task.Tenant);
     }
 
     /// <summary>Minimal IBuildEngine stub that captures errors so tests can assert on diagnostic codes.</summary>

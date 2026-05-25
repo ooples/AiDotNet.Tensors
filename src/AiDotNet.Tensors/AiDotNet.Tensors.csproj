@@ -289,9 +289,9 @@
   </ItemGroup>
 
   <!--
-    audit-2026-05 Phase 4: gate DISABLE_TELEMETRY / DISABLE_LICENSE_GUARD
+    audit-2026-05 Phase 4: gate AIDOTNET_DISABLE_TELEMETRY / AIDOTNET_DISABLE_LICENSE_GUARD
     compile flags behind RSA-2048 PKCS#1 v1.5 SHA-256 enterprise-license
-    signature verification. See build/AiDotNet.Tensors.Enterprise.targets
+    signature verification + secret license-key binding. See build/AiDotNet.Tensors.Enterprise.targets
     for the validation flow and build/LicenseValidator/README.md for the
     operator-side keypair-generation procedure.
   -->

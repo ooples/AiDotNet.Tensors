@@ -17,7 +17,7 @@ namespace AiDotNet.Tensors.LicenseValidator;
 
 /// <summary>
 /// MSBuild task that validates an Ooples AiDotNet Enterprise license file before allowing the build
-/// to define <c>DISABLE_TELEMETRY</c> or <c>DISABLE_LICENSE_GUARD</c> compile flags.
+/// to define <c>AIDOTNET_DISABLE_TELEMETRY</c> or <c>AIDOTNET_DISABLE_LICENSE_GUARD</c> compile flags.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -35,7 +35,8 @@ namespace AiDotNet.Tensors.LicenseValidator;
 ///   "tenant":    "ACME Corp.",
 ///   "issued":    "YYYY-MM-DD",
 ///   "expires":   "YYYY-MM-DD",
-///   "scope":     ["DISABLE_TELEMETRY", "DISABLE_LICENSE_GUARD"],
+///   "scope":     ["AIDOTNET_DISABLE_TELEMETRY", "AIDOTNET_DISABLE_LICENSE_GUARD"],
+///   "keyHash":   "&lt;lowercase-hex SHA-256 of the customer's secret license key&gt;",
 ///   "payload":   "&lt;base64 of canonical JSON without signature field&gt;",
 ///   "signature": "&lt;base64 RSA-2048 PKCS#1 v1.5 SHA-256 signature over payload&gt;"
 /// }
@@ -96,6 +97,16 @@ public sealed class ValidateAiDotNetEnterpriseLicense : Task
     /// </summary>
     [Required]
     public string RequestedFlags { get; set; } = string.Empty;
+
+    /// <summary>
+    /// The customer's per-tenant secret license key (the <c>AiDotNetEnterpriseLicenseKey</c>
+    /// MSBuild property / <c>AIDOTNET_ENTERPRISE_LICENSE_KEY</c> env var). It is bound to the
+    /// signed license: the signed payload carries <c>keyHash = SHA-256(key)</c> (lowercase hex),
+    /// and validation fails unless <c>SHA-256(LicenseKey)</c> matches it. This makes a leaked or
+    /// redistributed (still-validly-signed) license file useless without the matching secret key.
+    /// </summary>
+    [Required]
+    public string LicenseKey { get; set; } = string.Empty;
 
     /// <summary>Output: the tenant name from the validated license, surfaced for audit logging.</summary>
     [Output]
@@ -291,6 +302,27 @@ public sealed class ValidateAiDotNetEnterpriseLicense : Task
                         }
                     }
 
+                    // Bind the customer's secret license KEY to the signed license. The
+                    // signed payload carries keyHash = SHA-256(key) (hex); validation fails
+                    // unless SHA-256(LicenseKey) matches. A valid signed license FILE alone
+                    // is insufficient — without the matching key a leaked/redistributed file
+                    // can't be used, which is what makes requiring the key meaningful.
+                    if (!TryGetString(signed, "keyHash", out var keyHashExpected)
+                        || string.IsNullOrWhiteSpace(keyHashExpected))
+                    {
+                        Log.LogError(null, "AIDOTNET004", null, LicensePath, 0, 0, 0, 0,
+                            "AiDotNet Enterprise license at {0} signed payload is missing the 'keyHash' field required to bind the license key. Re-issue the license with a keyHash (see build/LicenseValidator/README.md).",
+                            LicensePath);
+                        return false;
+                    }
+                    var keyHashActual = ComputeKeyHash(LicenseKey ?? string.Empty);
+                    if (!string.Equals(keyHashActual, keyHashExpected!.Trim(), StringComparison.OrdinalIgnoreCase))
+                    {
+                        Log.LogError(null, "AIDOTNET011", null, LicensePath, 0, 0, 0, 0,
+                            "AiDotNet Enterprise license key does not match this license file. The AiDotNetEnterpriseLicenseKey property (or AIDOTNET_ENTERPRISE_LICENSE_KEY env var) is not the key this license was issued for. Contact admin@aidotnet.dev.");
+                        return false;
+                    }
+
                     Tenant = TryGetString(signed, "tenant", out var tenant) && !string.IsNullOrWhiteSpace(tenant)
                         ? tenant!
                         : "(unspecified)";
@@ -307,6 +339,21 @@ public sealed class ValidateAiDotNetEnterpriseLicense : Task
                 "AiDotNet Enterprise license validation failed unexpectedly: {0}", ex.Message);
             return false;
         }
+    }
+
+    /// <summary>
+    /// Computes the lowercase-hex SHA-256 of the license key, matching the <c>keyHash</c>
+    /// baked into the signed payload. The license issuer computes the same value
+    /// (<c>printf '%s' "$KEY" | openssl dgst -sha256 -hex</c>); see README.md.
+    /// </summary>
+    private static string ComputeKeyHash(string key)
+    {
+        using var sha = SHA256.Create();
+        var bytes = sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes(key));
+        var sb = new System.Text.StringBuilder(bytes.Length * 2);
+        foreach (var b in bytes)
+            sb.Append(b.ToString("x2", CultureInfo.InvariantCulture));
+        return sb.ToString();
     }
 
     private static bool TryGetString(JsonElement obj, string name, out string? value)

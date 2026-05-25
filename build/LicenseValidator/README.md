@@ -1,8 +1,12 @@
 # AiDotNet.Tensors.LicenseValidator — keypair generation + license issuance
 
-This directory hosts the MSBuild Task DLL that gates the `DISABLE_TELEMETRY` /
-`DISABLE_LICENSE_GUARD` compile-time flags on a valid Ooples enterprise license
-via RSA-2048 PKCS#1 v1.5 SHA-256 signature verification.
+This directory hosts the MSBuild Task DLL that gates the
+`AIDOTNET_DISABLE_TELEMETRY` / `AIDOTNET_DISABLE_LICENSE_GUARD` compile-time flags
+on a valid Ooples enterprise license via RSA-2048 PKCS#1 v1.5 SHA-256 signature
+verification **plus** a secret-key binding (the signed payload carries a
+`keyHash`; the build must supply the matching `AiDotNetEnterpriseLicenseKey`).
+The flags are AiDotNet-prefixed so the gate never trips on a generic
+`DISABLE_TELEMETRY` a package consumer defines for their own code.
 
 This README is the procedure for the **Ooples-side** operator that generates the
 signing keypair, replaces the placeholder public key embedded in the validator
@@ -53,16 +57,32 @@ value of the production constant.
 
 ## 3. Issue a license to a customer
 
-Compose the license JSON (substitute customer tenant + expiry date):
+First, mint the customer's secret **license key** (high-entropy random — this is
+the second factor, kept secret by the customer) and compute its SHA-256 so it can
+be bound into the signed payload:
 
 ```bash
-cat > inner.json <<'EOF'
+# A high-entropy random key. The customer supplies this exact value at build time
+# via AiDotNetEnterpriseLicenseKey / AIDOTNET_ENTERPRISE_LICENSE_KEY.
+LICENSE_KEY=$(openssl rand -hex 32)        # e.g. ENT-... — give this to the customer
+# Bind it to the license: lowercase-hex SHA-256 of the EXACT key string (no newline).
+KEY_HASH=$(printf '%s' "$LICENSE_KEY" | openssl dgst -sha256 -hex | awk '{print $2}')
+```
+
+Compose the license JSON (substitute customer tenant + expiry date). The
+`keyHash` binds the license to the secret key above — a leaked or redistributed
+license file is useless without the matching key. Flags are AiDotNet-prefixed so
+they never collide with a consumer's own `DISABLE_TELEMETRY`:
+
+```bash
+cat > inner.json <<EOF
 {
   "marker": "AiDotNet-Enterprise-License-v1",
   "tenant": "ACME Corp.",
   "issued": "2026-05-22",
   "expires": "2027-05-22",
-  "scope":   ["DISABLE_TELEMETRY", "DISABLE_LICENSE_GUARD"]
+  "scope":   ["AIDOTNET_DISABLE_TELEMETRY", "AIDOTNET_DISABLE_LICENSE_GUARD"],
+  "keyHash": "$KEY_HASH"
 }
 EOF
 ```
@@ -89,7 +109,9 @@ EOF
 
 > **Security — the signed payload is the source of truth.** The validator
 > verifies the RSA signature over `payload`, then reads `marker`, `expires`,
-> `scope`, and `tenant` **from the decoded signed payload only**. Any fields
+> `scope`, `tenant`, and `keyHash` **from the decoded signed payload only**, and
+> rejects the build unless `SHA-256(AiDotNetEnterpriseLicenseKey)` equals the
+> signed `keyHash` (AIDOTNET011). Any fields
 > placed in the *outer* envelope are ignored — they cannot grant scope or
 > extend expiry beyond what was signed. You may add outer fields for human
 > readability, but they carry no authority; tampering with them (e.g. widening
@@ -106,19 +128,20 @@ existing `DefineConstants`:
 dotnet build \
   -p:AiDotNetEnterpriseLicenseKey='<key provided with the license>' \
   -p:AiDotNetEnterpriseLicensePath='/path/to/acme-corp-license.json' \
-  -p:DefineConstants='$(DefineConstants);DISABLE_TELEMETRY' ...
+  -p:DefineConstants='$(DefineConstants);AIDOTNET_DISABLE_TELEMETRY' ...
 
 # …or via environment variables instead of -p: properties:
 #   AIDOTNET_ENTERPRISE_LICENSE_KEY, AIDOTNET_ENTERPRISE_LICENSE_PATH
 ```
 
 > **Note.** Use the `$(DefineConstants);…` append form. A bare
-> `-p:DefineConstants=DISABLE_TELEMETRY` *replaces* the project's
+> `-p:DefineConstants=AIDOTNET_DISABLE_TELEMETRY` *replaces* the project's
 > `DefineConstants` (command-line properties have highest precedence), which can
 > silently drop constants the build relies on.
 
 The validator picks up the license, verifies the RSA signature against the
 embedded public key, checks the expiry and scope **from the signed payload**,
+confirms `SHA-256(AiDotNetEnterpriseLicenseKey)` matches the signed `keyHash`,
 and authorises the compile.
 
 ## 4. Rotate the signing key
@@ -172,3 +195,4 @@ When you suspect compromise or simply on the annual cycle:
 | AIDOTNET008 | RSA signature verification failed (or placeholder key in build) |
 | AIDOTNET009 | Unexpected validator exception (see message for details)        |
 | AIDOTNET010 | Validator DLL missing and bootstrap-build failed                |
+| AIDOTNET011 | License key doesn't match the license file's signed `keyHash`   |

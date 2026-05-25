@@ -4,10 +4,12 @@
     AiDotNet.Tensors Enterprise build-flag gate (Phase 4).
 
     This file is auto-imported by the main csproj. It enforces that the
-    DISABLE_TELEMETRY and DISABLE_LICENSE_GUARD compile-time constants
-    can ONLY be set in builds that present a valid Ooples enterprise
+    AIDOTNET_DISABLE_TELEMETRY and AIDOTNET_DISABLE_LICENSE_GUARD compile-time
+    constants can ONLY be set in builds that present a valid Ooples enterprise
     license. Without the license, the build fails before compilation
-    reaches the #if-guarded code regions.
+    reaches the #if-guarded code regions. The flags are AIDOTNET_-prefixed so
+    the gate never trips on a generic DISABLE_TELEMETRY a package consumer might
+    define for their own unrelated code (see the whole-token match note below).
 
     Phase 4 — RSA-2048 PKCS#1 v1.5 SHA-256 signature verification via a
     precompiled MSBuild Task assembly shipped under build/LicenseValidator/.
@@ -20,7 +22,7 @@
       - The OSS source is licensed under BSL 1.1 with commercial gates
         for non-trial production use. The BuildKey DRM and the telemetry
         subsystem implement parts of that commercial contract.
-      - If an OSS consumer could simply pass -p:DefineConstants=DISABLE_LICENSE_GUARD
+      - If an OSS consumer could simply pass -p:DefineConstants=AIDOTNET_DISABLE_LICENSE_GUARD
         to their `dotnet build`, they would bypass the commercial gates
         purely at compile time. That would render the BSL terms
         technically unenforceable in self-built deployments.
@@ -29,7 +31,7 @@
         federal / air-gapped customers) instead of escape hatches.
 
     Validation flow:
-      1. Build invocation defines DISABLE_TELEMETRY and/or DISABLE_LICENSE_GUARD.
+      1. Build invocation defines AIDOTNET_DISABLE_TELEMETRY and/or AIDOTNET_DISABLE_LICENSE_GUARD.
       2. ValidateEnterpriseDisableFlags target inspects DefineConstants.
       3. If either flag is present, the target requires the
          AiDotNetEnterpriseLicenseKey MSBuild property AND
@@ -57,16 +59,28 @@
   <PropertyGroup>
     <!--
       Exact ;-delimited token match, NOT a substring Contains. A bare
-      DefineConstants.Contains('DISABLE_TELEMETRY') would also fire for an
-      unrelated symbol that merely embeds the name (e.g. SOME_DISABLE_TELEMETRY_TEST),
-      spuriously gating the build. Wrapping both the constants and the needle in
-      ';' makes the match a whole-token comparison.
+      DefineConstants.Contains('AIDOTNET_DISABLE_TELEMETRY') would also fire for
+      an unrelated symbol that merely embeds the name (e.g.
+      SOME_AIDOTNET_DISABLE_TELEMETRY_TEST), spuriously gating the build.
+      Wrapping both the constants and the needle in ';' makes the match a
+      whole-token comparison.
+
+      AIDOTNET_-prefixed symbols (Copilot #439): the gate keys on
+      AIDOTNET_DISABLE_TELEMETRY / AIDOTNET_DISABLE_LICENSE_GUARD, NOT the
+      generic DISABLE_TELEMETRY / DISABLE_LICENSE_GUARD. Because this targets
+      file is auto-imported into every package consumer, an unprefixed name
+      would trip the enterprise gate on any consumer that happens to define a
+      common symbol like DISABLE_TELEMETRY for their own unrelated code (a false
+      build failure that couldn't even bypass anything — the assembly is already
+      compiled). The prefix keeps the gate seamless for ordinary consumers while
+      still governing source-tree builds that genuinely toggle AiDotNet's own
+      telemetry/license-guard compilation.
     -->
     <_AiDotNetDefineConstantsDelimited>;$(DefineConstants);</_AiDotNetDefineConstantsDelimited>
     <_AiDotNetDisableTelemetryRequested
-      Condition="$(_AiDotNetDefineConstantsDelimited.Contains(';DISABLE_TELEMETRY;'))">true</_AiDotNetDisableTelemetryRequested>
+      Condition="$(_AiDotNetDefineConstantsDelimited.Contains(';AIDOTNET_DISABLE_TELEMETRY;'))">true</_AiDotNetDisableTelemetryRequested>
     <_AiDotNetDisableLicenseGuardRequested
-      Condition="$(_AiDotNetDefineConstantsDelimited.Contains(';DISABLE_LICENSE_GUARD;'))">true</_AiDotNetDisableLicenseGuardRequested>
+      Condition="$(_AiDotNetDefineConstantsDelimited.Contains(';AIDOTNET_DISABLE_LICENSE_GUARD;'))">true</_AiDotNetDisableLicenseGuardRequested>
     <_AiDotNetAnyDisableFlagRequested
       Condition="'$(_AiDotNetDisableTelemetryRequested)' == 'true' Or '$(_AiDotNetDisableLicenseGuardRequested)' == 'true'">true</_AiDotNetAnyDisableFlagRequested>
 
@@ -141,22 +155,22 @@
         Condition="'$(_AiDotNetEnterpriseLicensePath)' == ''">$([System.Environment]::GetEnvironmentVariable('AIDOTNET_ENTERPRISE_LICENSE_PATH'))</_AiDotNetEnterpriseLicensePath>
 
       <_AiDotNetRequestedDisableFlags
-        Condition="'$(_AiDotNetDisableTelemetryRequested)' == 'true'">DISABLE_TELEMETRY</_AiDotNetRequestedDisableFlags>
+        Condition="'$(_AiDotNetDisableTelemetryRequested)' == 'true'">AIDOTNET_DISABLE_TELEMETRY</_AiDotNetRequestedDisableFlags>
       <_AiDotNetRequestedDisableFlags
-        Condition="'$(_AiDotNetDisableLicenseGuardRequested)' == 'true' And '$(_AiDotNetRequestedDisableFlags)' == ''">DISABLE_LICENSE_GUARD</_AiDotNetRequestedDisableFlags>
+        Condition="'$(_AiDotNetDisableLicenseGuardRequested)' == 'true' And '$(_AiDotNetRequestedDisableFlags)' == ''">AIDOTNET_DISABLE_LICENSE_GUARD</_AiDotNetRequestedDisableFlags>
       <_AiDotNetRequestedDisableFlags
-        Condition="'$(_AiDotNetDisableLicenseGuardRequested)' == 'true' And '$(_AiDotNetRequestedDisableFlags)' != '' And !$(_AiDotNetRequestedDisableFlags.Contains('DISABLE_LICENSE_GUARD'))">$(_AiDotNetRequestedDisableFlags);DISABLE_LICENSE_GUARD</_AiDotNetRequestedDisableFlags>
+        Condition="'$(_AiDotNetDisableLicenseGuardRequested)' == 'true' And '$(_AiDotNetRequestedDisableFlags)' != '' And !$(_AiDotNetRequestedDisableFlags.Contains('AIDOTNET_DISABLE_LICENSE_GUARD'))">$(_AiDotNetRequestedDisableFlags);AIDOTNET_DISABLE_LICENSE_GUARD</_AiDotNetRequestedDisableFlags>
     </PropertyGroup>
 
     <Error
       Code="AIDOTNET001"
       Condition="'$(_AiDotNetEnterpriseLicenseKey)' == ''"
-      Text="DISABLE_TELEMETRY / DISABLE_LICENSE_GUARD compile flags require a valid AiDotNet Enterprise license. AiDotNetEnterpriseLicenseKey MSBuild property (or AIDOTNET_ENTERPRISE_LICENSE_KEY env var) is not set. These build flags are Enterprise-tier benefits for air-gapped / federal customers — contact admin@aidotnet.dev to obtain an enterprise license. See https://aidotnet.dev/enterprise for details." />
+      Text="AIDOTNET_DISABLE_TELEMETRY / AIDOTNET_DISABLE_LICENSE_GUARD compile flags require a valid AiDotNet Enterprise license. AiDotNetEnterpriseLicenseKey MSBuild property (or AIDOTNET_ENTERPRISE_LICENSE_KEY env var) is not set. These build flags are Enterprise-tier benefits for air-gapped / federal customers — contact admin@aidotnet.dev to obtain an enterprise license. See https://aidotnet.dev/enterprise for details." />
 
     <Error
       Code="AIDOTNET002"
       Condition="'$(_AiDotNetEnterpriseLicensePath)' == ''"
-      Text="DISABLE_TELEMETRY / DISABLE_LICENSE_GUARD compile flags require AiDotNetEnterpriseLicensePath (or AIDOTNET_ENTERPRISE_LICENSE_PATH env var) pointing to the signed license file issued by Ooples for your tenant. See https://aidotnet.dev/enterprise." />
+      Text="AIDOTNET_DISABLE_TELEMETRY / AIDOTNET_DISABLE_LICENSE_GUARD compile flags require AiDotNetEnterpriseLicensePath (or AIDOTNET_ENTERPRISE_LICENSE_PATH env var) pointing to the signed license file issued by Ooples for your tenant. See https://aidotnet.dev/enterprise." />
 
     <Error
       Code="AIDOTNET003"
@@ -171,6 +185,7 @@
     <ValidateAiDotNetEnterpriseLicense
       Condition="'$(_AiDotNetRequestedDisableFlags)' != '' And Exists('$(_AiDotNetLicenseValidatorDll)')"
       LicensePath="$(_AiDotNetEnterpriseLicensePath)"
+      LicenseKey="$(_AiDotNetEnterpriseLicenseKey)"
       RequestedFlags="$(_AiDotNetRequestedDisableFlags)">
       <Output TaskParameter="Tenant" PropertyName="_AiDotNetEnterpriseLicenseTenant" />
     </ValidateAiDotNetEnterpriseLicense>

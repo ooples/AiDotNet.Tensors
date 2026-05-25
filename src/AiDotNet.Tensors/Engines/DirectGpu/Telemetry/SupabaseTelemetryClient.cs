@@ -1,6 +1,6 @@
 // Copyright (c) AiDotNet. All rights reserved.
 
-#if !DISABLE_TELEMETRY
+#if !AIDOTNET_DISABLE_TELEMETRY
 
 using System;
 using System.Linq;
@@ -94,7 +94,7 @@ public sealed class SupabaseTelemetryClient : ITelemetryClient
     /// </list>
     /// <para>
     /// Enterprise / federal / air-gapped builds may set the
-    /// <c>DISABLE_TELEMETRY</c> MSBuild constant, which compiles the entire
+    /// <c>AIDOTNET_DISABLE_TELEMETRY</c> MSBuild constant, which compiles the entire
     /// telemetry namespace out of the assembly — the client and its callers
     /// are physically absent from the binary. See
     /// <c>docs/enterprise/custom-builds.md</c> in the AiDotNet repo.
@@ -539,4 +539,4 @@ public sealed class SupabaseTelemetryClient : ITelemetryClient
     }
 }
 
-#endif // !DISABLE_TELEMETRY
+#endif // !AIDOTNET_DISABLE_TELEMETRY
