@@ -1648,12 +1648,31 @@ public sealed class GradientTape<T> : IDisposable
     }
 
     /// <summary>
+    /// Finalizer backstop. A tape that is never disposed (e.g. dropped after an
+    /// exception) would otherwise leak the process-wide
+    /// <see cref="DifferentiableOps._anyTapeActive"/> counter forever — it is
+    /// incremented in the constructor and only decremented in <see cref="Dispose"/>.
+    /// A stuck-positive counter forces every op on every thread down the
+    /// tape-recording slow path and can flip tape-gated dispatch (e.g. the
+    /// BlasManaged GEMM packed path keys on <see cref="Current"/> being null), so
+    /// we self-heal the global count on GC. Only the Interlocked global is touched
+    /// here: the ThreadStatic <c>_current</c> / <c>_threadTapeDepth</c> belong to
+    /// the originating thread and must never be poked from the finalizer thread.
+    /// </summary>
+    ~GradientTape()
+    {
+        if (!_disposed)
+            System.Threading.Interlocked.Decrement(ref DifferentiableOps._anyTapeActive);
+    }
+
+    /// <summary>
     /// Disposes the tape and restores the parent tape (if any) as the current tape.
     /// </summary>
     public void Dispose()
     {
         if (_disposed) return;
         _disposed = true;
+        GC.SuppressFinalize(this);
         // Restore the previous ReplayMode instead of hard-resetting.
         // This is critical for nested tapes: an inner tape disposing must not
         // clear replay suppression that an outer tape still needs.
