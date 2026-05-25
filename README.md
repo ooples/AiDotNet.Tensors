@@ -2,9 +2,27 @@
 
 [![NuGet](https://img.shields.io/nuget/v/AiDotNet.Tensors.svg)](https://www.nuget.org/packages/AiDotNet.Tensors/)
 [![Build](https://github.com/ooples/AiDotNet.Tensors/actions/workflows/build.yml/badge.svg)](https://github.com/ooples/AiDotNet.Tensors/actions/workflows/build.yml)
-[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-BSL%201.1-blue.svg)](LICENSE)
 
-The fastest pure-managed .NET tensor library. **Zero external library dependencies** — no `System.Numerics.Tensors`, no MKL, no oneDNN. Every hot path is a hand-written AVX2/AVX-512 SIMD kernel in `SimdKernels.cs` / `SimdGemm.cs` / `SimdConvHelper.cs`. Beats ML.NET, TensorFlow.NET, MathNet, and NumSharp outright on every measured op. Against libtorch (TorchSharp's hand-tuned C++ kernels), wins on Mish 2.3×, Mish (double) 2.2×, **GELU (double) 1.6× ahead**, **Tanh (double) within noise**, Tanh (float) 1.4×, TensorMean/Min/Max, MaxPool2D, TensorAdd 100K, and TensorAdd 1M (vs single-thread torch) — all using pure managed C# with hand-tuned AVX2/FMA SIMD kernels and JIT-compiled machine code.
+A high-performance .NET tensor library with hand-written AVX2/AVX-512 SIMD kernels in `SimdKernels.cs` / `SimdGemm.cs` / `SimdConvHelper.cs`. Every hot path runs through our own managed-C# kernels — we do NOT call into `System.Numerics.Tensors`, MKL.NET, or oneDNN through the standard wrappers. Beats ML.NET, TensorFlow.NET, MathNet, and NumSharp outright on every measured op. Against libtorch (TorchSharp's hand-tuned C++ kernels), wins on Mish 2.3×, Mish (double) 2.2×, **GELU (double) 1.6× ahead**, **Tanh (double) within noise**, Tanh (float) 1.4×, TensorMean/Min/Max, MaxPool2D, TensorAdd 100K, and TensorAdd 1M (vs single-thread torch) — all using pure managed C# with hand-tuned AVX2/FMA SIMD kernels and JIT-compiled machine code.
+
+> **Note on dependencies.** The .nupkg ships with the following PackageReferences:
+> `Microsoft.Extensions.Logging.Abstractions`, `System.Text.Json`,
+> `System.Threading.Channels`, `K4os.Compression.LZ4` (LZ4 compression for
+> serialized tensor blobs), `AiDotNet.Native.OpenBLAS` (transitive native
+> OpenBLAS for fallback paths only — our SimdGemm beats it for d=128
+> transformer hot paths), and **MKL via Microsoft.ML.Mkl.Redist (~66 MB on
+> win-x64) + `intelmkl.redist.win-x64` (~500 MB on win-x64)** for the FP64
+> kernels that haven't yet been ported to pure-managed AVX2 (Phase 0 remediation
+> work tracks the port). For air-gapped / federal deployments we ship a custom
+> build with MKL/OpenBLAS removed and the entire telemetry namespace compiled
+> out — see [aidotnet.dev/enterprise](https://aidotnet.dev/enterprise) for
+> the Enterprise tier including air-gapped builds.
+>
+> **Performance numbers above assume net8.0+.** On net471 the SIMD/intrinsics
+> helpers are excluded (System.Runtime.Intrinsics is unavailable pre-net6); a
+> custom net471 SIMD path that beats `System.Numerics.Vector<T>` is on the
+> roadmap as Phase 5.
 
 ## Features
 
