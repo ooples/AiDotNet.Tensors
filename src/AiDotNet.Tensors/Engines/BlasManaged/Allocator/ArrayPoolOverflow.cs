@@ -1,5 +1,6 @@
 using System;
 using System.Buffers;
+using System.Threading;
 
 namespace AiDotNet.Tensors.Engines.BlasManaged;
 
@@ -80,15 +81,19 @@ internal sealed class ArrayPoolByteRent : IDisposable
     public Span<byte> Span => _buffer is null ? Span<byte>.Empty : _buffer.AsSpan(0, _length);
 
     /// <summary>
-    /// Return the buffer to the shared pool. Idempotent — subsequent calls
-    /// after the first are no-ops.
+    /// Return the buffer to the shared pool. Idempotent and thread-safe —
+    /// subsequent calls (and concurrent disposes on aliased references) after
+    /// the first are no-ops.
     /// </summary>
     public void Dispose()
     {
-        if (_buffer != null)
-        {
-            ArrayPool<byte>.Shared.Return(_buffer);
-            _buffer = null;
-        }
+        // Atomically claim the buffer: the non-atomic check-then-null below
+        // let two concurrent Dispose calls on aliased references both observe
+        // a non-null _buffer and both Return it — a double-return that
+        // corrupts the shared ArrayPool. Interlocked.Exchange ensures exactly
+        // one caller wins the buffer and performs the single Return.
+        var buffer = Interlocked.Exchange(ref _buffer, null);
+        if (buffer != null)
+            ArrayPool<byte>.Shared.Return(buffer);
     }
 }

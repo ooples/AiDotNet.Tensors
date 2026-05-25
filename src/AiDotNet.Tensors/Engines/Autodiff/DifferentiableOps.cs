@@ -58,6 +58,26 @@ internal static class DifferentiableOps
            && GradientTape<T>.Current is not null
            && !NoGradScope<T>.IsSuppressed;
 
+    /// <summary>
+    /// Test-isolation hook: clears the CALLING THREAD's tape-depth counter only.
+    /// A test that constructs a <see cref="GradientTape{T}"/> and never disposes
+    /// it (e.g. an assertion throws first) otherwise leaves this stuck on the
+    /// thread, which—together with a leaked <c>GradientTape&lt;T&gt;.Current</c>—
+    /// corrupts later tests on that thread.
+    /// <para>
+    /// Deliberately does NOT touch the process-wide <see cref="_anyTapeActive"/>
+    /// counter: that is shared across threads, and xUnit runs test classes in
+    /// parallel, so zeroing it here would kill a concurrently-running test's
+    /// active tape. A leaked global count is benign for correctness (recording
+    /// no-ops whenever the thread's <c>Current</c> is null) and is healed on GC
+    /// by the GradientTape finalizer.
+    /// </para>
+    /// </summary>
+    internal static void ResetThreadTapeStateForTests()
+    {
+        _threadTapeDepth = 0;
+    }
+
     // Indexed gradient array: set by ComputeGradients before backward walk,
     // read by AccumulateGrad for O(1) access instead of dictionary hash lookup.
     // ThreadStatic because backward is single-threaded per tape.
