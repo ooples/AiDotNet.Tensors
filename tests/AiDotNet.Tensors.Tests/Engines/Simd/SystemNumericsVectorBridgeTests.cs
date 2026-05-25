@@ -385,6 +385,49 @@ public class SystemNumericsVectorBridgeTests
         Assert.Equal(expected, actual);
     }
 
+    // Max/Min must PROPAGATE NaN (any NaN in the input -> NaN result), matching
+    // NumPy/PyTorch, and must do so deterministically REGARDLESS of which lane the
+    // NaN lands in — the bug Copilot flagged was that Vector.Max/Min could drop a
+    // NaN depending on its lane position. nanIndex sweeps lane 0, an interior SIMD
+    // lane, a second-vector lane, and the scalar tail across a 33-element array.
+    [Theory]
+    [InlineData(33, 0)] [InlineData(33, 5)] [InlineData(33, 16)] [InlineData(33, 32)]
+    [InlineData(8, 3)] [InlineData(256, 200)]
+    public void Max_PropagatesNaN_RegardlessOfLane(int length, int nanIndex)
+    {
+        var rng = RandomHelper.CreateSeededRandom(70);
+        var src = NextRandomArray(rng, length);
+        src[nanIndex] = float.NaN;
+        Assert.True(float.IsNaN(SystemNumericsVectorBridge.Max(src)),
+            $"Max should return NaN when src[{nanIndex}] is NaN (length {length}).");
+    }
+
+    [Theory]
+    [InlineData(33, 0)] [InlineData(33, 5)] [InlineData(33, 16)] [InlineData(33, 32)]
+    [InlineData(8, 3)] [InlineData(256, 200)]
+    public void Min_PropagatesNaN_RegardlessOfLane(int length, int nanIndex)
+    {
+        var rng = RandomHelper.CreateSeededRandom(71);
+        var src = NextRandomArray(rng, length);
+        src[nanIndex] = float.NaN;
+        Assert.True(float.IsNaN(SystemNumericsVectorBridge.Min(src)),
+            $"Min should return NaN when src[{nanIndex}] is NaN (length {length}).");
+    }
+
+    [Theory]
+    [InlineData(33, 0)] [InlineData(33, 5)] [InlineData(33, 16)] [InlineData(33, 32)]
+    [InlineData(8, 3)] [InlineData(256, 200)]
+    public void MaxMin_Double_PropagatesNaN_RegardlessOfLane(int length, int nanIndex)
+    {
+        var rng = RandomHelper.CreateSeededRandom(72);
+        var src = NextRandomDoubleArray(rng, length);
+        src[nanIndex] = double.NaN;
+        Assert.True(double.IsNaN(SystemNumericsVectorBridge.Max(src)),
+            $"Max(double) should return NaN when src[{nanIndex}] is NaN (length {length}).");
+        Assert.True(double.IsNaN(SystemNumericsVectorBridge.Min(src)),
+            $"Min(double) should return NaN when src[{nanIndex}] is NaN (length {length}).");
+    }
+
     // ==================================================================
     // DOUBLE precision parity coverage.
     // ==================================================================

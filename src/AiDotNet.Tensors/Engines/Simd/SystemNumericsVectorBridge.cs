@@ -425,26 +425,49 @@ internal static class SystemNumericsVectorBridge
         int lanes = Vector<float>.Count;
         if (length < lanes)
         {
+            // Propagate NaN (any NaN in input -> NaN result), matching NumPy/PyTorch
+            // max and giving a lane-/position-independent, deterministic contract.
+            // Scalar `x > m` skips NaNs, so detect them explicitly.
             float m = src[0];
+            bool nan = float.IsNaN(m);
             for (int i = 1; i < length; i++)
-                if (src[i] > m) m = src[i];
-            return m;
+            {
+                float x = src[i];
+                if (float.IsNaN(x)) nan = true;
+                else if (x > m) m = x;
+            }
+            return nan ? float.NaN : m;
         }
 
         int simdElements = length - (length % lanes);
         var sVecs = MemoryMarshal.Cast<float, Vector<float>>(src.Slice(0, simdElements));
 
         var accum = sVecs[0];
+        // Vector.Equals(v, v) is all-ones for non-NaN lanes and 0 for NaN lanes, so
+        // AND-accumulating it across the raw inputs detects NaN independently of which
+        // lane Vector.Max happens to keep (Vector.Max's NaN behavior is unspecified).
+        var notNan = Vector.Equals(sVecs[0], sVecs[0]);
         for (int v = 1; v < sVecs.Length; v++)
-            accum = Vector.Max(accum, sVecs[v]);
+        {
+            var cur = sVecs[v];
+            accum = Vector.Max(accum, cur);
+            notNan = Vector.BitwiseAnd(notNan, Vector.Equals(cur, cur));
+        }
+
+        // A 0 lane in notNan (reinterpreted as int) means a NaN was seen somewhere.
+        bool anyNaN = !Vector.EqualsAll(Vector.AsVectorInt32(notNan), new Vector<int>(-1));
 
         float max = accum[0];
         for (int j = 1; j < lanes; j++)
             if (accum[j] > max) max = accum[j];
 
         for (int i = simdElements; i < length; i++)
-            if (src[i] > max) max = src[i];
-        return max;
+        {
+            float x = src[i];
+            if (float.IsNaN(x)) anyNaN = true;
+            else if (x > max) max = x;
+        }
+        return anyNaN ? float.NaN : max;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -457,26 +480,45 @@ internal static class SystemNumericsVectorBridge
         int lanes = Vector<float>.Count;
         if (length < lanes)
         {
+            // Propagate NaN (any NaN -> NaN), matching NumPy/PyTorch min. Scalar
+            // `x < m` skips NaNs, so detect them explicitly for a deterministic result.
             float m = src[0];
+            bool nan = float.IsNaN(m);
             for (int i = 1; i < length; i++)
-                if (src[i] < m) m = src[i];
-            return m;
+            {
+                float x = src[i];
+                if (float.IsNaN(x)) nan = true;
+                else if (x < m) m = x;
+            }
+            return nan ? float.NaN : m;
         }
 
         int simdElements = length - (length % lanes);
         var sVecs = MemoryMarshal.Cast<float, Vector<float>>(src.Slice(0, simdElements));
 
         var accum = sVecs[0];
+        // notNan AND-accumulator detects NaN independently of which lane Vector.Min keeps.
+        var notNan = Vector.Equals(sVecs[0], sVecs[0]);
         for (int v = 1; v < sVecs.Length; v++)
-            accum = Vector.Min(accum, sVecs[v]);
+        {
+            var cur = sVecs[v];
+            accum = Vector.Min(accum, cur);
+            notNan = Vector.BitwiseAnd(notNan, Vector.Equals(cur, cur));
+        }
+
+        bool anyNaN = !Vector.EqualsAll(Vector.AsVectorInt32(notNan), new Vector<int>(-1));
 
         float min = accum[0];
         for (int j = 1; j < lanes; j++)
             if (accum[j] < min) min = accum[j];
 
         for (int i = simdElements; i < length; i++)
-            if (src[i] < min) min = src[i];
-        return min;
+        {
+            float x = src[i];
+            if (float.IsNaN(x)) anyNaN = true;
+            else if (x < min) min = x;
+        }
+        return anyNaN ? float.NaN : min;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -859,26 +901,44 @@ internal static class SystemNumericsVectorBridge
         int lanes = Vector<double>.Count;
         if (length < lanes)
         {
+            // Propagate NaN (any NaN -> NaN), matching NumPy/PyTorch max.
             double m = src[0];
+            bool nan = double.IsNaN(m);
             for (int i = 1; i < length; i++)
-                if (src[i] > m) m = src[i];
-            return m;
+            {
+                double x = src[i];
+                if (double.IsNaN(x)) nan = true;
+                else if (x > m) m = x;
+            }
+            return nan ? double.NaN : m;
         }
 
         int simdElements = length - (length % lanes);
         var sVecs = MemoryMarshal.Cast<double, Vector<double>>(src.Slice(0, simdElements));
 
         var accum = sVecs[0];
+        // notNan AND-accumulator detects NaN independently of which lane Vector.Max keeps.
+        var notNan = Vector.Equals(sVecs[0], sVecs[0]);
         for (int v = 1; v < sVecs.Length; v++)
-            accum = Vector.Max(accum, sVecs[v]);
+        {
+            var cur = sVecs[v];
+            accum = Vector.Max(accum, cur);
+            notNan = Vector.BitwiseAnd(notNan, Vector.Equals(cur, cur));
+        }
+
+        bool anyNaN = !Vector.EqualsAll(Vector.AsVectorInt64(notNan), new Vector<long>(-1L));
 
         double max = accum[0];
         for (int j = 1; j < lanes; j++)
             if (accum[j] > max) max = accum[j];
 
         for (int i = simdElements; i < length; i++)
-            if (src[i] > max) max = src[i];
-        return max;
+        {
+            double x = src[i];
+            if (double.IsNaN(x)) anyNaN = true;
+            else if (x > max) max = x;
+        }
+        return anyNaN ? double.NaN : max;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -891,26 +951,44 @@ internal static class SystemNumericsVectorBridge
         int lanes = Vector<double>.Count;
         if (length < lanes)
         {
+            // Propagate NaN (any NaN -> NaN), matching NumPy/PyTorch min.
             double m = src[0];
+            bool nan = double.IsNaN(m);
             for (int i = 1; i < length; i++)
-                if (src[i] < m) m = src[i];
-            return m;
+            {
+                double x = src[i];
+                if (double.IsNaN(x)) nan = true;
+                else if (x < m) m = x;
+            }
+            return nan ? double.NaN : m;
         }
 
         int simdElements = length - (length % lanes);
         var sVecs = MemoryMarshal.Cast<double, Vector<double>>(src.Slice(0, simdElements));
 
         var accum = sVecs[0];
+        // notNan AND-accumulator detects NaN independently of which lane Vector.Min keeps.
+        var notNan = Vector.Equals(sVecs[0], sVecs[0]);
         for (int v = 1; v < sVecs.Length; v++)
-            accum = Vector.Min(accum, sVecs[v]);
+        {
+            var cur = sVecs[v];
+            accum = Vector.Min(accum, cur);
+            notNan = Vector.BitwiseAnd(notNan, Vector.Equals(cur, cur));
+        }
+
+        bool anyNaN = !Vector.EqualsAll(Vector.AsVectorInt64(notNan), new Vector<long>(-1L));
 
         double min = accum[0];
         for (int j = 1; j < lanes; j++)
             if (accum[j] < min) min = accum[j];
 
         for (int i = simdElements; i < length; i++)
-            if (src[i] < min) min = src[i];
-        return min;
+        {
+            double x = src[i];
+            if (double.IsNaN(x)) anyNaN = true;
+            else if (x < min) min = x;
+        }
+        return anyNaN ? double.NaN : min;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
