@@ -10,6 +10,13 @@ using Xunit.Abstractions;
 
 namespace AiDotNet.Tensors.Tests.Engines.Simd
 {
+    // Pure diagnostic benchmark — every method only measures eager-vs-compiled
+    // timing and _output.WriteLine()s the numbers; there are NO Assert calls, so
+    // it gates nothing. It was running ~8+ minutes under CI coverage (the single
+    // longest test in the suite) because it lacked the category trait the CI
+    // filter (Category!=Benchmark&Category!=Performance) keys on. Tagged so it
+    // is excluded from the gating run; invoke it explicitly when profiling.
+    [Trait("Category", "Benchmark")]
     public class TensorCodecMultiSizeBenchmark
     {
         private readonly ITestOutputHelper _output;

@@ -26,6 +26,10 @@ namespace AiDotNet.Tensors.Tests.Engines.BlasManaged;
 ///   dotnet test --filter "Compare_BlasManaged_vs_NativeBLAS_FP64" --logger "console;verbosity=normal"
 /// </para>
 /// </summary>
+// Pure reporting benchmark (see summary above — "no assertions other than
+// doesn't crash"). Ran ~3 min under CI coverage despite gating nothing; tag it
+// so the CI filter (Category!=Benchmark&Category!=Performance) excludes it.
+[Trait("Category", "Benchmark")]
 [Collection("BlasManaged-Stats-Serial")]
 public class ComparativeBenchmark
 {
