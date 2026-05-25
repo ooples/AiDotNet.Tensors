@@ -1367,6 +1367,7 @@ internal static class Im2ColHelper
     /// </summary>
     internal static long _smallNTransAAvx2Calls;
     internal static long _smallNTransAScalarCalls;
+    internal static long _smallNTransAAvx512Calls;
 
     // BLIS-style blocking parameters.
     //  Mc = macro-block size. 64 m-rows × K = 512 × 8B = 256 KB packed
@@ -1770,6 +1771,7 @@ internal static class Im2ColHelper
         int k)
     {
         const int Mr = DgemmFatAMr8;
+        System.Threading.Interlocked.Increment(ref _smallNTransAAvx512Calls);
         var cLo0 = Vector512<double>.Zero; var cHi0 = Vector512<double>.Zero;
         var cLo1 = Vector512<double>.Zero; var cHi1 = Vector512<double>.Zero;
         var cLo2 = Vector512<double>.Zero; var cHi2 = Vector512<double>.Zero;

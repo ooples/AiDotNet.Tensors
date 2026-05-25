@@ -174,6 +174,7 @@ public class ConvTranspose2DGemmCorrectnessTests
 
         Im2ColHelper._smallNTransAAvx2Calls = 0;
         Im2ColHelper._smallNTransAScalarCalls = 0;
+        Im2ColHelper._smallNTransAAvx512Calls = 0;
 
         // Warmup — first call pays JIT + ArrayPool warmup.
         Im2ColHelper.TryConvTranspose2DWithGemm(
@@ -181,8 +182,13 @@ public class ConvTranspose2DGemmCorrectnessTests
             batch, inChannels, inH, inW, outChannels, kH, kW,
             stride, stride, padding, padding, outH, outW);
         bool usedAvx2 = Im2ColHelper._smallNTransAAvx2Calls > 0;
+        bool usedAvx512 = Im2ColHelper._smallNTransAAvx512Calls > 0;
         bool usedScalar = Im2ColHelper._smallNTransAScalarCalls > 0;
-        Assert.True(usedAvx2 || usedScalar,
+        // AVX-512 hosts take the Mr=8 DgemmTransA_N16_FatA_Avx512 path, which
+        // increments its own counter — include it so the dispatch-fired check
+        // doesn't false-fail on those hosts.
+        bool usedVectorized = usedAvx2 || usedAvx512;
+        Assert.True(usedVectorized || usedScalar,
             "Phase-2 dispatch did not fire on warmup — gate (hw == 16 && kmkn >= 8*inChannels) " +
             "may not match L2 shape.");
 
@@ -210,14 +216,14 @@ public class ConvTranspose2DGemmCorrectnessTests
         sw.Stop();
         double msPerCall = sw.Elapsed.TotalMilliseconds / iters;
 
-        if (!usedAvx2)
+        if (!usedVectorized)
         {
-            // Scalar-fallback runners (no AVX2, or x86 32-bit, or pre-.NET5
-            // intrinsics) hit the same dispatch path but don't reach the
-            // BLIS-style packed-A kernel the 50 ms budget is sized for. The
+            // Scalar-fallback runners (no AVX2/AVX-512, or x86 32-bit, or
+            // pre-.NET5 intrinsics) hit the same dispatch path but don't reach
+            // the BLIS-style packed-A kernel the 50 ms budget is sized for. The
             // warmup gate above already confirmed the dispatch fired; treat
             // this as a dispatch smoke test on those hosts and skip the
-            // AVX2-only latency assertion. Closes CodeRabbit on PR #432.
+            // vectorized-only latency assertion. Closes CodeRabbit on PR #432.
             return;
         }
 
@@ -237,7 +243,7 @@ public class ConvTranspose2DGemmCorrectnessTests
         double budgetMs = Environment.ProcessorCount >= 8 ? 50.0 : 200.0;
         Assert.True(msPerCall < budgetMs,
             $"L2 ConvTranspose2D took {msPerCall:F1} ms/call — exceeds {budgetMs:F0} ms budget. " +
-            $"AVX2 calls: {Im2ColHelper._smallNTransAAvx2Calls}, scalar calls: {Im2ColHelper._smallNTransAScalarCalls}. " +
+            $"AVX2 calls: {Im2ColHelper._smallNTransAAvx2Calls}, AVX-512 calls: {Im2ColHelper._smallNTransAAvx512Calls}, scalar calls: {Im2ColHelper._smallNTransAScalarCalls}. " +
             "Pre-fix OpenBLAS measured 215 ms / MKL 559 ms at this shape. Phase-2 packed-A " +
             "kernel should produce well under the budget with the BLIS-style Mc=64, Mr=2 blocking.");
     }
