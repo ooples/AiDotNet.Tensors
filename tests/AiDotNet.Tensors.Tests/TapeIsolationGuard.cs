@@ -45,6 +45,9 @@ public sealed class TapeIsolationGuardAttribute : BeforeAfterTestAttribute
             || DifferentiableOps.ThreadTapeActive()
             || NoGradScope<float>.IsSuppressed
             || NoGradScope<double>.IsSuppressed
+            || InferenceModeScope<float>.IsActive
+            || InferenceModeScope<double>.IsActive
+            || InferenceModeFlag.IsActive
             || AutoTrainingCompiler.ReplayMode;
 
         if (leaked)
@@ -54,7 +57,9 @@ public sealed class TapeIsolationGuardAttribute : BeforeAfterTestAttribute
                 $"left thread-static autodiff state set (floatCurrent={GradientTape<float>.Current is not null}, " +
                 $"doubleCurrent={GradientTape<double>.Current is not null}, threadDepth>0={DifferentiableOps.ThreadTapeActive()}, " +
                 $"noGradFloat={NoGradScope<float>.IsSuppressed}, noGradDouble={NoGradScope<double>.IsSuppressed}, " +
-                $"replayMode={AutoTrainingCompiler.ReplayMode}). The test should dispose its scopes — resetting to isolate the next test.");
+                $"inferFloat={InferenceModeScope<float>.IsActive}, inferDouble={InferenceModeScope<double>.IsActive}, " +
+                $"inferFlag={InferenceModeFlag.IsActive}, replayMode={AutoTrainingCompiler.ReplayMode}). " +
+                $"The test should dispose its scopes — resetting to isolate the next test.");
         }
 
         GradientTape<float>.ResetCurrentForTests();
@@ -62,6 +67,13 @@ public sealed class TapeIsolationGuardAttribute : BeforeAfterTestAttribute
         DifferentiableOps.ResetThreadTapeStateForTests();
         NoGradScope<float>.ResetForTests();
         NoGradScope<double>.ResetForTests();
-        AutoTrainingCompiler.ReplayMode = false;
+        InferenceModeScope<float>.ResetForTests();
+        InferenceModeScope<double>.ResetForTests();
+        InferenceModeFlag.ResetForTests();
+        // ResetState() clears BOTH the [ThreadStatic] ReplayMode flag AND the
+        // [ThreadStatic] cached AutoTrainingState (compiled-plan/step-hash
+        // accumulator) — a leaked _state would otherwise let one test's
+        // recorded step pattern bleed into the next test on the same thread.
+        AutoTrainingCompiler.ResetState();
     }
 }
