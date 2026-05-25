@@ -1,5 +1,7 @@
 // Copyright (c) AiDotNet. All rights reserved.
 
+#if !DISABLE_TELEMETRY
+
 using System;
 using System.Linq;
 using System.Net.Http;
@@ -50,6 +52,23 @@ public sealed class SupabaseTelemetryClient : ITelemetryClient
     /// </summary>
     public const string SupabaseKeyEnvVar = "AIDOTNET_TELEMETRY_KEY";
 
+    /// <summary>
+    /// Environment variable name for the explicit opt-in. Set to "true" (case
+    /// insensitive) to participate in anonymous hardware-tuning telemetry.
+    /// When unset or set to any other value, telemetry stays disabled regardless
+    /// of whether credentials are present.
+    /// </summary>
+    public const string TelemetryOptInEnvVar = "AIDOTNET_TELEMETRY";
+
+    /// <summary>
+    /// Environment variable users can set to "true" to suppress the one-time
+    /// first-run notice (without opting in). For environments where any console
+    /// output would be problematic (CI logs, containerized inference services).
+    /// </summary>
+    public const string TelemetryNoticeSuppressEnvVar = "AIDOTNET_TELEMETRY_NOTICE_SUPPRESS";
+
+    private static int _noticeShown;
+
     /// <inheritdoc/>
     public bool IsEnabled => _isEnabled && !_disposed;
 
@@ -57,26 +76,53 @@ public sealed class SupabaseTelemetryClient : ITelemetryClient
     /// Creates a new Supabase telemetry client.
     /// </summary>
     /// <remarks>
+    /// <para>
+    /// As of v0.205.0 telemetry defaults to OFF on the public NuGet package per
+    /// the audit-2026-05 procurement-cleanup. To opt in, set the
+    /// <c>AIDOTNET_TELEMETRY=true</c> environment variable AND ensure credentials
+    /// are present (either passed explicitly, via env vars, or embedded by an
+    /// authorized build). Without all three, this client constructs in a no-op
+    /// state and never makes outbound HTTP calls.
+    /// </para>
+    /// <para>
     /// Credential resolution order (first non-empty wins):
+    /// </para>
     /// <list type="number">
     /// <item>Constructor parameters (explicit override)</item>
     /// <item>Environment variables (<see cref="SupabaseUrlEnvVar"/> / <see cref="SupabaseKeyEnvVar"/>)</item>
     /// <item>Assembly metadata embedded at build time by CI/CD</item>
     /// </list>
+    /// <para>
+    /// Enterprise / federal / air-gapped builds may set the
+    /// <c>DISABLE_TELEMETRY</c> MSBuild constant, which compiles the entire
+    /// telemetry namespace out of the assembly — the client and its callers
+    /// are physically absent from the binary. See
+    /// <c>docs/enterprise/custom-builds.md</c> in the AiDotNet repo.
+    /// </para>
     /// </remarks>
-    /// <param name="enabled">Whether telemetry is enabled (default: true).</param>
+    /// <param name="enabled">Whether telemetry is enabled (default: false). Even when true, requires <c>AIDOTNET_TELEMETRY=true</c> env var AND credentials.</param>
     /// <param name="supabaseUrl">Supabase project URL (optional, resolved via <see cref="SupabaseUrlEnvVar"/> or assembly metadata if omitted).</param>
     /// <param name="supabaseKey">Supabase anon key (optional, resolved via <see cref="SupabaseKeyEnvVar"/> or assembly metadata if omitted).</param>
     public SupabaseTelemetryClient(
-        bool enabled = true,
+        bool enabled = false,
         string? supabaseUrl = null,
         string? supabaseKey = null)
     {
         _supabaseUrl = ResolveCredential(supabaseUrl, SupabaseUrlEnvVar, "TelemetryUrl");
         _supabaseKey = ResolveCredential(supabaseKey, SupabaseKeyEnvVar, "TelemetryKey");
 
+        // Explicit env-var opt-in is REQUIRED even if a caller passes enabled=true.
+        // This prevents accidental enablement (default-true constructors elsewhere)
+        // and gives procurement reviewers a single grep-able switch
+        // (`AIDOTNET_TELEMETRY=true`) to confirm whether telemetry is active.
+        bool envOptIn = string.Equals(
+            Environment.GetEnvironmentVariable(TelemetryOptInEnvVar),
+            "true",
+            StringComparison.OrdinalIgnoreCase);
+
         // Disable telemetry if credentials are missing or URL is not a valid HTTPS URI
         _isEnabled = enabled
+            && envOptIn
             && !string.IsNullOrWhiteSpace(_supabaseUrl)
             && !string.IsNullOrWhiteSpace(_supabaseKey)
             && Uri.TryCreate(_supabaseUrl, UriKind.Absolute, out var uri)
@@ -98,6 +144,60 @@ public sealed class SupabaseTelemetryClient : ITelemetryClient
         {
             _httpClient.DefaultRequestHeaders.TryAddWithoutValidation("apikey", _supabaseKey);
             _httpClient.DefaultRequestHeaders.TryAddWithoutValidation("Authorization", $"Bearer {_supabaseKey}");
+        }
+        else
+        {
+            // Telemetry is off either because the user didn't opt in or because
+            // credentials are missing. Emit the first-run notice exactly once
+            // per process — only when (a) credentials ARE embedded (so it makes
+            // sense to invite opt-in), (b) the user hasn't already set
+            // AIDOTNET_TELEMETRY=true (already opted in), and (c) hasn't
+            // suppressed the notice. Skips silently in containerized / CI
+            // environments where stderr is consumed by log aggregators.
+            MaybeShowFirstRunNotice(envOptIn);
+        }
+    }
+
+    private void MaybeShowFirstRunNotice(bool envOptIn)
+    {
+        // Show at most once per process.
+        if (Interlocked.CompareExchange(ref _noticeShown, 1, 0) != 0)
+        {
+            return;
+        }
+
+        // Already opted in — no need to invite.
+        if (envOptIn)
+        {
+            return;
+        }
+
+        // No credentials anywhere — nothing the user can opt into, so no notice.
+        if (string.IsNullOrWhiteSpace(_supabaseUrl) || string.IsNullOrWhiteSpace(_supabaseKey))
+        {
+            return;
+        }
+
+        // User asked us not to show the notice.
+        var suppress = Environment.GetEnvironmentVariable(TelemetryNoticeSuppressEnvVar);
+        if (string.Equals(suppress, "true", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(suppress, "1", StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        try
+        {
+            Console.Error.WriteLine(
+                "AiDotNet: optional anonymous hardware-tuning telemetry is available " +
+                "and currently DISABLED. To help us tune kernels for your GPU/CPU, set " +
+                "AIDOTNET_TELEMETRY=true. Details: https://aidotnet.dev/privacy. " +
+                "Suppress this notice: AIDOTNET_TELEMETRY_NOTICE_SUPPRESS=true.");
+        }
+        catch
+        {
+            // Console output failed (redirected, closed, etc.) — silently ignore.
+            // Never let the telemetry notice break the host process.
         }
     }
 
@@ -438,3 +538,5 @@ public sealed class SupabaseTelemetryClient : ITelemetryClient
         _httpClient.Dispose();
     }
 }
+
+#endif // !DISABLE_TELEMETRY
