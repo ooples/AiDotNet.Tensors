@@ -14,6 +14,14 @@ namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 /// on every thread down the tape-recording slow path and flipping tape-gated
 /// dispatch (the cross-suite flakiness root cause).
 /// </summary>
+// These tests assert on the process-wide DifferentiableOps._anyTapeActive
+// counter, so they must not run concurrently with other tape-using tests (which
+// would skew the count). DisableParallelization runs this collection serially
+// with respect to every other collection.
+[CollectionDefinition("TapeGlobalStateSerial", DisableParallelization = true)]
+public sealed class TapeGlobalStateSerialCollection { }
+
+[Collection("TapeGlobalStateSerial")]
 public class GradientTapeFinalizerTests
 {
     [Fact]

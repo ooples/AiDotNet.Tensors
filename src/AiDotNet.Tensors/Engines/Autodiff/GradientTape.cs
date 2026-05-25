@@ -46,6 +46,14 @@ public sealed class GradientTape<T> : IDisposable
     /// </summary>
     private static void SetCurrentTape(GradientTape<T>? tape) => _current = tape;
 
+    /// <summary>
+    /// Test-isolation hook: clears this thread's current-tape reference for
+    /// <typeparamref name="T"/>. An undisposed tape pins <see cref="_current"/>
+    /// (a ThreadStatic strong ref the finalizer cannot reach), so the harness
+    /// clears it between tests. Not part of the public API.
+    /// </summary>
+    internal static void ResetCurrentForTests() => _current = null;
+
     private readonly GradientTape<T>? _parent;
     private readonly TapeEntryArena<T> _entries;
     private readonly GradientTapeOptions _options;
@@ -1788,6 +1796,14 @@ public sealed class NoGradScope<T> : IDisposable
     /// Checked by DifferentiableOps.RecordIfActive.
     /// </summary>
     public static bool IsSuppressed => _suppressionCount > 0;
+
+    /// <summary>
+    /// Test-isolation hook: clears this thread's suppression count. A test that
+    /// enters a <see cref="NoGradScope{T}"/> and never disposes it (exception
+    /// path) otherwise leaves recording suppressed for every later test on the
+    /// thread, silently zeroing their gradients. Not part of the public API.
+    /// </summary>
+    internal static void ResetForTests() => _suppressionCount = 0;
 
     /// <summary>
     /// Creates a new NoGradScope, incrementing the suppression counter.
