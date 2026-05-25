@@ -104,7 +104,20 @@ public static class BlasManaged
         // Strategies do read-modify-write on C; zero it here so the first call
         // produces C = A · B (not C += A · B). Future versions may expose a
         // beta=1 option that skips this zero, but Phase B's contract is C := A · B.
-        c.Clear();
+        //
+        // Clear only the logical [m, n] output tile, NOT the whole span: with an
+        // ldc-padded or offset-based caller the backing span extends past the
+        // tile, and c.Clear() would clobber data the caller owns outside it.
+        if (ldc == n)
+        {
+            // Contiguous rows — the tile is a single [0, m*n) run.
+            c.Slice(0, m * n).Clear();
+        }
+        else
+        {
+            for (int row = 0; row < m; row++)
+                c.Slice(row * ldc, n).Clear();
+        }
 
         // Sub-R (#408): GEMV fast path. M=1 (row × matrix), N=1 (matrix × col),
         // or K=1 (outer product) bypass the GEMM dispatcher entirely — per-call
