@@ -11,4 +11,8 @@
     <Project Path="tests/AiDotNet.Tensors.Benchmarks/AiDotNet.Tensors.Benchmarks.csproj" />
     <Project Path="tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj" />
   </Folder>
+  <Folder Name="/build/">
+    <Project Path="build/LicenseValidator/AiDotNet.Tensors.LicenseValidator.csproj" />
+    <Project Path="build/LicenseValidator.Tests/AiDotNet.Tensors.LicenseValidator.Tests.csproj" />
+  </Folder>
 </Solution>

@@ -95,12 +95,19 @@ EOF
 > readability, but they carry no authority; tampering with them (e.g. widening
 > `scope` or pushing out `expires`) has no effect.
 
-The customer points
-`AiDotNetEnterpriseLicensePath` / `AIDOTNET_ENTERPRISE_LICENSE_PATH` at the
-file's location and **appends** the flag to their existing `DefineConstants`:
+The gate requires **both** the license path **and** a license key to be set —
+setting only the path fails with `AIDOTNET001`. The customer sets both (via
+MSBuild properties or the matching env vars) and **appends** the flag to their
+existing `DefineConstants`:
 
 ```bash
-dotnet build -p:DefineConstants='$(DefineConstants);DISABLE_TELEMETRY' ...
+dotnet build \
+  -p:AiDotNetEnterpriseLicenseKey='<key provided with the license>' \
+  -p:AiDotNetEnterpriseLicensePath='/path/to/acme-corp-license.json' \
+  -p:DefineConstants='$(DefineConstants);DISABLE_TELEMETRY' ...
+
+# …or via environment variables instead of -p: properties:
+#   AIDOTNET_ENTERPRISE_LICENSE_KEY, AIDOTNET_ENTERPRISE_LICENSE_PATH
 ```
 
 > **Note.** Use the `$(DefineConstants);…` append form. A bare

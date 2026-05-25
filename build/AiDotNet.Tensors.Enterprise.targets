@@ -55,10 +55,18 @@
   -->
 
   <PropertyGroup>
+    <!--
+      Exact ;-delimited token match, NOT a substring Contains. A bare
+      DefineConstants.Contains('DISABLE_TELEMETRY') would also fire for an
+      unrelated symbol that merely embeds the name (e.g. SOME_DISABLE_TELEMETRY_TEST),
+      spuriously gating the build. Wrapping both the constants and the needle in
+      ';' makes the match a whole-token comparison.
+    -->
+    <_AiDotNetDefineConstantsDelimited>;$(DefineConstants);</_AiDotNetDefineConstantsDelimited>
     <_AiDotNetDisableTelemetryRequested
-      Condition="'$(DefineConstants.Contains(`DISABLE_TELEMETRY`))' == 'true'">true</_AiDotNetDisableTelemetryRequested>
+      Condition="$(_AiDotNetDefineConstantsDelimited.Contains(';DISABLE_TELEMETRY;'))">true</_AiDotNetDisableTelemetryRequested>
     <_AiDotNetDisableLicenseGuardRequested
-      Condition="'$(DefineConstants.Contains(`DISABLE_LICENSE_GUARD`))' == 'true'">true</_AiDotNetDisableLicenseGuardRequested>
+      Condition="$(_AiDotNetDefineConstantsDelimited.Contains(';DISABLE_LICENSE_GUARD;'))">true</_AiDotNetDisableLicenseGuardRequested>
     <_AiDotNetAnyDisableFlagRequested
       Condition="'$(_AiDotNetDisableTelemetryRequested)' == 'true' Or '$(_AiDotNetDisableLicenseGuardRequested)' == 'true'">true</_AiDotNetAnyDisableFlagRequested>
 
@@ -172,6 +180,43 @@
       Condition="'$(_AiDotNetEnterpriseLicenseTenant)' != ''"
       Text="AiDotNet Enterprise build flags accepted (RSA-verified): tenant=$(_AiDotNetEnterpriseLicenseTenant), flags=$(_AiDotNetRequestedDisableFlags), license=$(_AiDotNetEnterpriseLicensePath)" />
 
+  </Target>
+
+  <!--
+    Pack the enterprise gate into the .nupkg (CodeRabbit #439). This runs at
+    pack time only (BeforeTargets="_GetPackageFiles", the NuGet pack
+    file-collection target) so it never slows ordinary builds. It first builds
+    the validator so its full output closure exists on disk, then adds the
+    targets file + EVERY assembly in the validator's bin/ — picking up
+    System.Text.Json's transitive netstandard2.0 closure (System.Text.Encodings.Web,
+    Microsoft.Bcl.AsyncInterfaces, System.Memory, …) and BouncyCastle without
+    hand-enumerating them. The items are added inside the target (not as static
+    <None>) because the files don't exist until the validator is built, and a
+    glob in a top-level ItemGroup is frozen at evaluation time before that build.
+  -->
+  <Target Name="PackLicenseValidatorAssets"
+          BeforeTargets="_GetPackageFiles"
+          Condition="'$(GeneratePackageOnBuild)' == 'true' Or '$(_IsPacking)' == 'true' Or '$(IsPackable)' != 'false'">
+    <MSBuild Projects="$(MSBuildThisFileDirectory)LicenseValidator\AiDotNet.Tensors.LicenseValidator.csproj"
+             Targets="Restore;Build"
+             Properties="Configuration=Release"
+             RemoveProperties="TargetFramework" />
+    <ItemGroup>
+      <!-- The NuGet-convention auto-import shim (build/<PackageId>.targets) plus
+           the actual gate it forwards to. -->
+      <None Include="$(MSBuildThisFileDirectory)AiDotNet.Tensors.targets">
+        <Pack>true</Pack>
+        <PackagePath>build\</PackagePath>
+      </None>
+      <None Include="$(MSBuildThisFileDirectory)AiDotNet.Tensors.Enterprise.targets">
+        <Pack>true</Pack>
+        <PackagePath>build\</PackagePath>
+      </None>
+      <None Include="$(MSBuildThisFileDirectory)LicenseValidator\bin\*.dll">
+        <Pack>true</Pack>
+        <PackagePath>build\LicenseValidator\bin\</PackagePath>
+      </None>
+    </ItemGroup>
   </Target>
 
 </Project>
