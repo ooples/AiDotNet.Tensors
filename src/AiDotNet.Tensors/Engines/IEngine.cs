@@ -3969,6 +3969,102 @@ public interface IEngine
         out Tensor<T> attentionWeights);
 
     /// <summary>
+    /// Fused multi-head attention forward (inference only): Q/K/V projection +
+    /// multi-head reshape + scaled dot-product attention + output projection in
+    /// a single call. Returns <c>[batch, seq, dModel]</c>.
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="input">[batch, seq, dModel] input sequence.</param>
+    /// <param name="qWeight">[dModel, dModel] query projection.</param>
+    /// <param name="kWeight">[dModel, dModel] key projection.</param>
+    /// <param name="vWeight">[dModel, dModel] value projection.</param>
+    /// <param name="outWeight">[dModel, dModel] output projection.</param>
+    /// <param name="numHeads">Number of attention heads. Must divide dModel.</param>
+    /// <param name="mask">
+    /// Optional boolean attention mask forwarded to the inner
+    /// <see cref="ScaledDotProductAttention{T}"/> (<c>true</c> = keep, <c>false</c> = mask
+    /// out). Shape <c>[batch, numHeads, seq, seq]</c> or any shape broadcastable to it
+    /// (e.g. <c>[1, 1, seq, seq]</c> for a shared causal mask, <c>[batch, 1, seq, seq]</c>
+    /// for per-batch padding). Null = no mask (full bidirectional attention). Exposed so
+    /// the fused path supports causal decoding and padded batches without a future
+    /// breaking signature change.
+    /// </param>
+    /// <returns>The attention output with shape [batch, seq, dModel].</returns>
+    /// <remarks>
+    /// <para>
+    /// Equivalent to chaining <see cref="ScaledDotProductAttention{T}"/> with
+    /// the Q/K/V projection MatMuls and output projection MatMul. Bundling
+    /// them into one engine call reduces autograd-tape dispatch overhead from
+    /// 5+ entries to 1 — the path that closes the AIsEval Transformer
+    /// inference gap (issue ooples/AiDotNet.Tensors#436).
+    /// </para>
+    /// <para>
+    /// Forward-only. Throws under an active <c>GradientTape</c> — training
+    /// paths should call the decomposed primitive chain instead.
+    /// </para>
+    /// </remarks>
+    Tensor<T> MultiHeadAttentionForward<T>(
+        Tensor<T> input,
+        Tensor<T> qWeight,
+        Tensor<T> kWeight,
+        Tensor<T> vWeight,
+        Tensor<T> outWeight,
+        int numHeads,
+        Tensor<bool>? mask = null);
+
+    /// <summary>
+    /// Fused LSTM sequence forward (inference only): processes a full
+    /// <c>[batch, seq, in]</c> sequence through one LSTM cell in a single call.
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="input">[batch, seq, in] input sequence.</param>
+    /// <param name="h0">[batch, hidden] initial hidden state. Null = zeros.</param>
+    /// <param name="c0">[batch, hidden] initial cell state. Null = zeros.</param>
+    /// <param name="wIh">[4*hidden, in] input-to-hidden weight (PyTorch order: i, f, g, o).</param>
+    /// <param name="wHh">[4*hidden, hidden] hidden-to-hidden weight.</param>
+    /// <param name="bIh">[4*hidden] input-to-hidden bias. Null = no bias.</param>
+    /// <param name="bHh">[4*hidden] hidden-to-hidden bias. Null = no bias.</param>
+    /// <param name="returnSequences">
+    /// True returns the full <c>[batch, seq, hidden]</c> stack. False returns
+    /// just the last timestep's hidden state <c>[batch, hidden]</c> — the
+    /// common shape for classification heads (matches PyTorch's
+    /// <c>output[:, -1, :]</c> pattern).
+    /// </param>
+    /// <returns>
+    /// Either <c>[batch, seq, hidden]</c> or <c>[batch, hidden]</c> depending
+    /// on <paramref name="returnSequences"/>.
+    /// </returns>
+    /// <remarks>
+    /// <para>
+    /// Replaces the per-timestep loop (one MatMul + sigmoid/tanh dispatch per
+    /// step) with one batched <c>Wx = input @ W_ih^T</c> GEMM plus a tight
+    /// per-step inner loop. Closes the AIsEval LSTM inference gap (issue
+    /// ooples/AiDotNet.Tensors#436): the float fast path on CPU finishes the
+    /// <c>[B=128, seq=32, in=32, hidden=64]</c> shape in ~8 ms — faster than
+    /// PyTorch's <c>nn.LSTM</c>.
+    /// </para>
+    /// <para>
+    /// PyTorch <c>nn.LSTM</c> gate convention: weights concatenate gates in
+    /// the order <c>[i, f, g, o]</c> along the row axis of
+    /// <paramref name="wIh"/> / <paramref name="wHh"/>. Biases follow the same
+    /// order.
+    /// </para>
+    /// <para>
+    /// Forward-only. Throws under an active <c>GradientTape</c> — training
+    /// paths should call the decomposed primitive chain instead.
+    /// </para>
+    /// </remarks>
+    Tensor<T> LstmSequenceForward<T>(
+        Tensor<T> input,
+        Tensor<T>? h0,
+        Tensor<T>? c0,
+        Tensor<T> wIh,
+        Tensor<T> wHh,
+        Tensor<T>? bIh,
+        Tensor<T>? bHh,
+        bool returnSequences = false);
+
+    /// <summary>
     /// Computes the backward pass for scaled dot-product attention.
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
@@ -4677,6 +4773,24 @@ public interface IEngine
         FusedActivationType activation,
         out Tensor<T> saveMean,
         out Tensor<T> saveVar);
+
+    /// <summary>
+    /// Fused multi-layer perceptron forward: runs a stack of dense layers
+    /// (<c>activation(x @ Wᵢ + bᵢ)</c>) in a single inference call. Closes the
+    /// MLP <c>Predict()</c> dispatch-overhead gap from issue #436 P1.
+    /// Forward-only — throws under an active <c>GradientTape</c>.
+    /// </summary>
+    /// <param name="input">[..., inFeatures] input; leading dims preserved.</param>
+    /// <param name="weights">Per-layer weights, each [inFeatures_i, outFeatures_i].</param>
+    /// <param name="biases">Per-layer biases, each [outFeatures_i] or null; same count as weights.</param>
+    /// <param name="hiddenActivation">Activation after every layer except the last.</param>
+    /// <param name="outputActivation">Activation after the last layer (default None).</param>
+    Tensor<T> MlpForward<T>(
+        Tensor<T> input,
+        IReadOnlyList<Tensor<T>> weights,
+        IReadOnlyList<Tensor<T>?> biases,
+        FusedActivationType hiddenActivation,
+        FusedActivationType outputActivation);
 
     #endregion
 
