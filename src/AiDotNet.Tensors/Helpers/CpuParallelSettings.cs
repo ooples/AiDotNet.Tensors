@@ -182,10 +182,11 @@ public static class CpuParallelSettings
         // Honor the class-level MaxDegreeOfParallelism contract: if the user has
         // pinned to 1 thread, run serial regardless of work size. Same
         // pattern as ParallelForChunks (line 84) and the legacy LightweightParallel
-        // code path. Snapshot the value once so a concurrent setter mid-call
-        // can't toggle us between paths.
+        // code path. Snapshot BOTH gating values once so a concurrent setter
+        // mid-call can't toggle us between the serial and parallel paths.
         int maxDegree = MaxDegreeOfParallelism;
-        if (maxDegree <= 1 || DeterministicReductions || totalWork < PersistentParallelExecutor.DefaultSerialGrainSize)
+        bool deterministic = DeterministicReductions;
+        if (maxDegree <= 1 || deterministic || totalWork < PersistentParallelExecutor.DefaultSerialGrainSize)
         {
             // Match Parallel.For's exception semantics: capture
             // first thrown exception, finish remaining iterations,
@@ -249,9 +250,10 @@ public static class CpuParallelSettings
         if (toExclusive <= fromInclusive) return;
         // Honor the class-level MaxDegreeOfParallelism contract: pinning to 1
         // forces serial regardless of work size (same as the Action<int>
-        // overload above). Snapshot once for consistency.
+        // overload above). Snapshot both gating values once for consistency.
         int maxDegree = MaxDegreeOfParallelism;
-        if (maxDegree <= 1 || DeterministicReductions || totalWork < PersistentParallelExecutor.DefaultSerialGrainSize)
+        bool deterministic = DeterministicReductions;
+        if (maxDegree <= 1 || deterministic || totalWork < PersistentParallelExecutor.DefaultSerialGrainSize)
         {
             // Serial fast path: one local accumulator, no
             // ParallelLoopState (Stop/Break never fire serial-side).
