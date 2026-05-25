@@ -1,7 +1,10 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net8.0</TargetFramework>
+    <!-- net10.0 to match the SDK/runtime the CI workflow installs (10.0.x). A
+         net8.0 testhost would build but fail to launch on a runner without the
+         .NET 8 runtime preinstalled. -->
+    <TargetFramework>net10.0</TargetFramework>
     <LangVersion>latest</LangVersion>
     <Nullable>enable</Nullable>
     <IsPackable>false</IsPackable>
