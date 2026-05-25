@@ -160,6 +160,21 @@ internal static class NchwcBatchNorm
             }
         }
         else
+#else
+        // audit-2026-05 phase 5 slice 3: net471 BCL SIMD. CBlock==8 maps to the
+        // 8-lane AVX2 Vector<float>; gated so 4-lane SSE2-only hosts use scalar.
+        if (System.Numerics.Vector<float>.Count == CBlock)
+        {
+            var vScale = new System.Numerics.Vector<float>(packedScale, scaleBase);
+            var vBias = new System.Numerics.Vector<float>(packedBias, scaleBase);
+            for (int sp = 0; sp < spatial; sp++)
+            {
+                int idx = groupBase + sp * CBlock;
+                var vIn = new System.Numerics.Vector<float>(inArr, idx);
+                (vIn * vScale + vBias).CopyTo(outArr, idx);
+            }
+        }
+        else
 #endif
         {
             for (int sp = 0; sp < spatial; sp++)
@@ -298,6 +313,26 @@ internal static class NchwcBatchNorm
                 // One 32-byte vector store — no fresh float[8] alloc.
                 Unsafe.WriteUnaligned(
                     ref Unsafe.As<float, byte>(ref outArr[idx]), vOut);
+            }
+            for (; i < spatial; i++)
+                outArr[chanBase + i] = inArr[chanBase + i] * s + b;
+        }
+        else
+#else
+        // audit-2026-05 phase 5 slice 3: net471 BCL SIMD. NCHW is contiguous in the
+        // spatial dimension, so this is lane-width-agnostic (works on SSE2 4-lane and
+        // AVX2 8-lane alike) — broadcast scale/bias, stride by Vector<float>.Count.
+        int lanes = System.Numerics.Vector<float>.Count;
+        if (spatial >= lanes)
+        {
+            var vS = new System.Numerics.Vector<float>(s);
+            var vB = new System.Numerics.Vector<float>(b);
+            int i = 0;
+            for (; i + lanes <= spatial; i += lanes)
+            {
+                int idx = chanBase + i;
+                var vIn = new System.Numerics.Vector<float>(inArr, idx);
+                (vIn * vS + vB).CopyTo(outArr, idx);
             }
             for (; i < spatial; i++)
                 outArr[chanBase + i] = inArr[chanBase + i] * s + b;

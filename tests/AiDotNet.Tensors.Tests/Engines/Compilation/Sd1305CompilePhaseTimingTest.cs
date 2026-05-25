@@ -117,11 +117,18 @@ public class Sd1305CompilePhaseTimingTest
         _output.WriteLine($"Correctness: max delta vs eager = {maxDelta:E2}");
         Assert.True(maxDelta < 1e-12, $"Compiled output diverged from eager: maxDelta={maxDelta:E6}");
 
-        var swE = Stopwatch.StartNew();
-        for (int it = 0; it < 5; it++) { var _o = plan.Execute(); }
-        swE.Stop();
-        double compiledMs = swE.Elapsed.TotalMilliseconds / 5.0;
-        _output.WriteLine($"Phase E — steady-state Execute: {compiledMs:F1} ms/call");
+        // Best-of-N timing (fastest iteration) — robust to scheduler
+        // contention when this perf guard runs inside the full parallel suite.
+        const int compiledIters = 8;
+        double compiledMs = double.MaxValue;
+        for (int it = 0; it < compiledIters; it++)
+        {
+            var swE = Stopwatch.StartNew();
+            var _o = plan.Execute();
+            swE.Stop();
+            compiledMs = Math.Min(compiledMs, swE.Elapsed.TotalMilliseconds);
+        }
+        _output.WriteLine($"Phase E — steady-state Execute: {compiledMs:F1} ms/call (best of {compiledIters})");
         _output.WriteLine($"Speedup: eager {eagerMs:F1} ms -> compiled {compiledMs:F1} ms = {eagerMs / compiledMs:F2}x");
         plan.Dispose();
 
@@ -159,16 +166,23 @@ public class Sd1305CompilePhaseTimingTest
             var _w = engine.ConvTranspose2D<double>(input, kernel,
                 stride: new[] { 2, 2 }, padding: new[] { 1, 1 }, outputPadding: new[] { 0, 0 });
         }
-        const int eagerIters = 5;
-        var swA = Stopwatch.StartNew();
+        // Best-of-N timing: take the FASTEST iteration rather than the mean.
+        // On a contended box (e.g. the full test suite running in parallel)
+        // the mean is dominated by scheduler preemption, which made the
+        // eager-vs-compiled comparison flaky. The minimum reflects the true
+        // compute cost when the OS happened to give a clean slice, so it is
+        // robust to load while keeping the 15% acceptance threshold below.
+        const int eagerIters = 8;
+        double eagerMs = double.MaxValue;
         for (int it = 0; it < eagerIters; it++)
         {
+            var swA = Stopwatch.StartNew();
             var _o = engine.ConvTranspose2D<double>(input, kernel,
                 stride: new[] { 2, 2 }, padding: new[] { 1, 1 }, outputPadding: new[] { 0, 0 });
+            swA.Stop();
+            eagerMs = Math.Min(eagerMs, swA.Elapsed.TotalMilliseconds);
         }
-        swA.Stop();
-        double eagerMs = swA.Elapsed.TotalMilliseconds / eagerIters;
-        _output.WriteLine($"Phase A — eager ConvTranspose2D: {eagerMs:F1} ms/iter ({eagerIters} iters)");
+        _output.WriteLine($"Phase A — eager ConvTranspose2D: {eagerMs:F1} ms/iter (best of {eagerIters})");
 
         Tensor<double> tracedOutput;
         ICompiledPlan<double> plan;
@@ -196,11 +210,18 @@ public class Sd1305CompilePhaseTimingTest
         _output.WriteLine($"Correctness: max delta vs eager = {maxDelta:E2}");
         Assert.True(maxDelta < 1e-12, $"Compiled ConvTranspose2D diverged from eager: maxDelta={maxDelta:E6}");
 
-        var swE = Stopwatch.StartNew();
-        for (int it = 0; it < 5; it++) { var _o = plan.Execute(); }
-        swE.Stop();
-        double compiledMs = swE.Elapsed.TotalMilliseconds / 5.0;
-        _output.WriteLine($"Phase E — steady-state Execute: {compiledMs:F1} ms/call");
+        // Best-of-N timing (fastest iteration) — robust to scheduler
+        // contention when this perf guard runs inside the full parallel suite.
+        const int compiledIters = 8;
+        double compiledMs = double.MaxValue;
+        for (int it = 0; it < compiledIters; it++)
+        {
+            var swE = Stopwatch.StartNew();
+            var _o = plan.Execute();
+            swE.Stop();
+            compiledMs = Math.Min(compiledMs, swE.Elapsed.TotalMilliseconds);
+        }
+        _output.WriteLine($"Phase E — steady-state Execute: {compiledMs:F1} ms/call (best of {compiledIters})");
         _output.WriteLine($"Speedup: eager {eagerMs:F1} ms -> compiled {compiledMs:F1} ms = {eagerMs / compiledMs:F2}x");
         plan.Dispose();
 

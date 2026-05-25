@@ -33,6 +33,18 @@ internal static class FusedKernels
                 Avx.Store(output + i, Avx.Multiply(x, sig));
             }
         }
+#else
+        // audit-2026-05 phase 5 slice 3d: net471 BCL Vector<float> fused path.
+        int lanes = System.Numerics.Vector<float>.Count;
+        if (length >= lanes)
+        {
+            int simdLen = length - (length % lanes);
+            for (; i < simdLen; i += lanes)
+            {
+                var x = Unsafe.ReadUnaligned<System.Numerics.Vector<float>>((void*)(input + i));
+                Unsafe.WriteUnaligned((void*)(output + i), x * SystemNumericsVectorBridge.FastSigmoid(x));
+            }
+        }
 #endif
         for (; i < length; i++)
         {
@@ -61,6 +73,23 @@ internal static class FusedKernels
                 var inner = Avx.Multiply(sqrt2OverPi, Fma.MultiplyAdd(coeff, xCubed, x));
                 var tanhVal = SimdKernels.FastTanh256(inner);
                 Avx.Store(output + i, Avx.Multiply(Avx.Multiply(half, x), Avx.Add(one, tanhVal)));
+            }
+        }
+#else
+        int lanes = System.Numerics.Vector<float>.Count;
+        if (length >= lanes)
+        {
+            var vHalf = new System.Numerics.Vector<float>(0.5f);
+            var vOne = new System.Numerics.Vector<float>(1f);
+            var vS2P = new System.Numerics.Vector<float>(0.7978845608028654f);
+            var vCoeff = new System.Numerics.Vector<float>(0.044715f);
+            int simdLen = length - (length % lanes);
+            for (; i < simdLen; i += lanes)
+            {
+                var x = Unsafe.ReadUnaligned<System.Numerics.Vector<float>>((void*)(input + i));
+                var inner = vS2P * (x + vCoeff * x * x * x);
+                var t = SystemNumericsVectorBridge.FastTanh(inner);
+                Unsafe.WriteUnaligned((void*)(output + i), vHalf * x * (vOne + t));
             }
         }
 #endif
@@ -97,6 +126,23 @@ internal static class FusedKernels
                 Avx.Store(output + i, Avx.Multiply(x, tanhSp));
             }
         }
+#else
+        int lanes = System.Numerics.Vector<float>.Count;
+        if (length >= lanes)
+        {
+            var vOne = new System.Numerics.Vector<float>(1f);
+            var vThreshold = new System.Numerics.Vector<float>(20f);
+            int simdLen = length - (length % lanes);
+            for (; i < simdLen; i += lanes)
+            {
+                var x = Unsafe.ReadUnaligned<System.Numerics.Vector<float>>((void*)(input + i));
+                var softplus = SystemNumericsVectorBridge.FastLog(vOne + SystemNumericsVectorBridge.FastExp(x));
+                // softplus(x) ≈ x for large x — select x where x > threshold.
+                softplus = System.Numerics.Vector.ConditionalSelect(
+                    System.Numerics.Vector.GreaterThan(x, vThreshold), x, softplus);
+                Unsafe.WriteUnaligned((void*)(output + i), x * SystemNumericsVectorBridge.FastTanh(softplus));
+            }
+        }
 #endif
         for (; i < length; i++)
         {
@@ -118,6 +164,19 @@ internal static class FusedKernels
             int simdLen = length & ~7;
             for (; i < simdLen; i += 8)
                 Avx.Store(output + i, Avx.Max(zero, Avx.Add(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i))));
+        }
+#else
+        int lanes = System.Numerics.Vector<float>.Count;
+        if (length >= lanes)
+        {
+            var zero = System.Numerics.Vector<float>.Zero;
+            int simdLen = length - (length % lanes);
+            for (; i < simdLen; i += lanes)
+            {
+                var va = Unsafe.ReadUnaligned<System.Numerics.Vector<float>>((void*)(a + i));
+                var vb = Unsafe.ReadUnaligned<System.Numerics.Vector<float>>((void*)(b + i));
+                Unsafe.WriteUnaligned((void*)(output + i), System.Numerics.Vector.Max(zero, va + vb));
+            }
         }
 #endif
         for (; i < length; i++)
@@ -143,6 +202,19 @@ internal static class FusedKernels
             }
             sumSq = SimdKernels.HorizontalSum(acc);
         }
+#else
+        int lanes = System.Numerics.Vector<float>.Count;
+        if (length >= lanes)
+        {
+            var acc = System.Numerics.Vector<float>.Zero;
+            int simdLen = length - (length % lanes);
+            for (; i < simdLen; i += lanes)
+            {
+                var x = Unsafe.ReadUnaligned<System.Numerics.Vector<float>>((void*)(input + i));
+                acc += x * x;
+            }
+            sumSq = System.Numerics.Vector.Dot(acc, System.Numerics.Vector<float>.One);
+        }
 #endif
         for (; i < length; i++)
             sumSq += input[i] * input[i];
@@ -163,6 +235,19 @@ internal static class FusedKernels
                 Avx.Store(output + i, Avx.Multiply(Avx.Multiply(x, vScale), g));
             }
         }
+#else
+        int lanes2 = System.Numerics.Vector<float>.Count;
+        if (length >= lanes2)
+        {
+            var vScale = new System.Numerics.Vector<float>(rmsInv);
+            int simdLen = length - (length % lanes2);
+            for (; i < simdLen; i += lanes2)
+            {
+                var x = Unsafe.ReadUnaligned<System.Numerics.Vector<float>>((void*)(input + i));
+                var g = Unsafe.ReadUnaligned<System.Numerics.Vector<float>>((void*)(gamma + i));
+                Unsafe.WriteUnaligned((void*)(output + i), x * vScale * g);
+            }
+        }
 #endif
         for (; i < length; i++)
             output[i] = input[i] * rmsInv * gamma[i];
@@ -181,6 +266,18 @@ internal static class FusedKernels
             {
                 var sig = SimdKernels.FastSigmoid256(Avx.LoadVector256(a + i));
                 Avx.Store(output + i, Avx.Multiply(sig, Avx.LoadVector256(b + i)));
+            }
+        }
+#else
+        int lanes = System.Numerics.Vector<float>.Count;
+        if (length >= lanes)
+        {
+            int simdLen = length - (length % lanes);
+            for (; i < simdLen; i += lanes)
+            {
+                var va = Unsafe.ReadUnaligned<System.Numerics.Vector<float>>((void*)(a + i));
+                var vb = Unsafe.ReadUnaligned<System.Numerics.Vector<float>>((void*)(b + i));
+                Unsafe.WriteUnaligned((void*)(output + i), SystemNumericsVectorBridge.FastSigmoid(va) * vb);
             }
         }
 #endif
@@ -205,6 +302,16 @@ internal static class FusedKernels
                 acc = Avx.Add(acc, Avx.LoadVector256(input + i));
             mean = SimdKernels.HorizontalSum(acc);
         }
+#else
+        int lanes = System.Numerics.Vector<float>.Count;
+        if (length >= lanes)
+        {
+            var acc = System.Numerics.Vector<float>.Zero;
+            int simdLen = length - (length % lanes);
+            for (; i < simdLen; i += lanes)
+                acc += Unsafe.ReadUnaligned<System.Numerics.Vector<float>>((void*)(input + i));
+            mean = System.Numerics.Vector.Dot(acc, System.Numerics.Vector<float>.One);
+        }
 #endif
         for (; i < length; i++) mean += input[i];
         mean /= length;
@@ -225,6 +332,20 @@ internal static class FusedKernels
             }
             variance = SimdKernels.HorizontalSum(acc);
         }
+#else
+        int lanesV = System.Numerics.Vector<float>.Count;
+        if (length >= lanesV)
+        {
+            var vMean = new System.Numerics.Vector<float>(mean);
+            var acc = System.Numerics.Vector<float>.Zero;
+            int simdLen = length - (length % lanesV);
+            for (; i < simdLen; i += lanesV)
+            {
+                var diff = Unsafe.ReadUnaligned<System.Numerics.Vector<float>>((void*)(input + i)) - vMean;
+                acc += diff * diff;
+            }
+            variance = System.Numerics.Vector.Dot(acc, System.Numerics.Vector<float>.One);
+        }
 #endif
         for (; i < length; i++) { float d = input[i] - mean; variance += d * d; }
         variance /= length;
@@ -242,6 +363,21 @@ internal static class FusedKernels
             {
                 var normalized = Avx.Multiply(Avx.Subtract(Avx.LoadVector256(input + i), vMean2), vInvStd);
                 Avx.Store(output + i, Fma.MultiplyAdd(normalized, Avx.LoadVector256(gamma + i), Avx.LoadVector256(beta + i)));
+            }
+        }
+#else
+        int lanesN = System.Numerics.Vector<float>.Count;
+        if (length >= lanesN)
+        {
+            var vMean2 = new System.Numerics.Vector<float>(mean);
+            var vInvStd = new System.Numerics.Vector<float>(invStd);
+            int simdLen = length - (length % lanesN);
+            for (; i < simdLen; i += lanesN)
+            {
+                var normalized = (Unsafe.ReadUnaligned<System.Numerics.Vector<float>>((void*)(input + i)) - vMean2) * vInvStd;
+                var g = Unsafe.ReadUnaligned<System.Numerics.Vector<float>>((void*)(gamma + i));
+                var bta = Unsafe.ReadUnaligned<System.Numerics.Vector<float>>((void*)(beta + i));
+                Unsafe.WriteUnaligned((void*)(output + i), normalized * g + bta);
             }
         }
 #endif
@@ -276,6 +412,22 @@ internal static class FusedKernels
             }
             sum = SimdKernels.HorizontalSum(vSum);
         }
+#else
+        int lanes = System.Numerics.Vector<float>.Count;
+        if (length >= lanes)
+        {
+            var vMax = new System.Numerics.Vector<float>(maxVal);
+            var vSum = System.Numerics.Vector<float>.Zero;
+            int simdLen = length - (length % lanes);
+            for (; j < simdLen; j += lanes)
+            {
+                var x = Unsafe.ReadUnaligned<System.Numerics.Vector<float>>((void*)(input + j)) - vMax;
+                var expX = SystemNumericsVectorBridge.FastExp(x);
+                Unsafe.WriteUnaligned((void*)(output + j), expX);
+                vSum += expX;
+            }
+            sum = System.Numerics.Vector.Dot(vSum, System.Numerics.Vector<float>.One);
+        }
 #endif
         for (; j < length; j++)
         {
@@ -293,6 +445,18 @@ internal static class FusedKernels
             int simdLen = length & ~7;
             for (; j < simdLen; j += 8)
                 Avx.Store(output + j, Avx.Multiply(Avx.LoadVector256(output + j), vInvSum));
+        }
+#else
+        int lanesN = System.Numerics.Vector<float>.Count;
+        if (length >= lanesN)
+        {
+            var vInvSum = new System.Numerics.Vector<float>(invSum);
+            int simdLen = length - (length % lanesN);
+            for (; j < simdLen; j += lanesN)
+            {
+                var v = Unsafe.ReadUnaligned<System.Numerics.Vector<float>>((void*)(output + j));
+                Unsafe.WriteUnaligned((void*)(output + j), v * vInvSum);
+            }
         }
 #endif
         for (; j < length; j++) output[j] *= invSum;
@@ -321,6 +485,20 @@ internal static class FusedKernels
             }
             sum = SimdKernels.HorizontalSum(vSum);
         }
+#else
+        int lanes = System.Numerics.Vector<float>.Count;
+        if (length >= lanes)
+        {
+            var vMax = new System.Numerics.Vector<float>(maxVal);
+            var vSum = System.Numerics.Vector<float>.Zero;
+            int simdLen = length - (length % lanes);
+            for (; j < simdLen; j += lanes)
+            {
+                var x = Unsafe.ReadUnaligned<System.Numerics.Vector<float>>((void*)(input + j)) - vMax;
+                vSum += SystemNumericsVectorBridge.FastExp(x);
+            }
+            sum = System.Numerics.Vector.Dot(vSum, System.Numerics.Vector<float>.One);
+        }
 #endif
         for (; j < length; j++)
             sum += MathF.Exp(input[j] - maxVal);
@@ -334,6 +512,18 @@ internal static class FusedKernels
             int simdLen = length & ~7;
             for (; j < simdLen; j += 8)
                 Avx.Store(output + j, Avx.Subtract(Avx.LoadVector256(input + j), vLse));
+        }
+#else
+        int lanesS = System.Numerics.Vector<float>.Count;
+        if (length >= lanesS)
+        {
+            var vLse = new System.Numerics.Vector<float>(logSumExp);
+            int simdLen = length - (length % lanesS);
+            for (; j < simdLen; j += lanesS)
+            {
+                var v = Unsafe.ReadUnaligned<System.Numerics.Vector<float>>((void*)(input + j));
+                Unsafe.WriteUnaligned((void*)(output + j), v - vLse);
+            }
         }
 #endif
         for (; j < length; j++)
@@ -364,6 +554,19 @@ internal static class FusedKernels
                 for (; i < simdLen; i += 8)
                     Avx.Store(output + offset + i,
                         Fma.MultiplyAdd(vScale, Avx.LoadVector256(input + offset + i), vShift));
+            }
+#else
+            int lanes = System.Numerics.Vector<float>.Count;
+            if (spatialSize >= lanes)
+            {
+                var vScale = new System.Numerics.Vector<float>(scale);
+                var vShift = new System.Numerics.Vector<float>(shift);
+                int simdLen = spatialSize - (spatialSize % lanes);
+                for (; i < simdLen; i += lanes)
+                {
+                    var x = Unsafe.ReadUnaligned<System.Numerics.Vector<float>>((void*)(input + offset + i));
+                    Unsafe.WriteUnaligned((void*)(output + offset + i), vScale * x + vShift);
+                }
             }
 #endif
             for (; i < spatialSize; i++)
