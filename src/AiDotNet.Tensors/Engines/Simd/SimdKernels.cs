@@ -1038,6 +1038,7 @@ namespace AiDotNet.Tensors.Engines.Simd
                 {
                     var one = Vector<float>.One;
                     var pow2_23 = new Vector<float>(8388608f);
+                    var zero = Vector<float>.Zero;
                     var inV = MemoryMarshal.Cast<float, Vector<float>>(new ReadOnlySpan<float>(input, simdLen));
                     var outV = MemoryMarshal.Cast<float, Vector<float>>(new Span<float>(output, simdLen));
                     for (int v = 0; v < inV.Length; v++)
@@ -1045,7 +1046,12 @@ namespace AiDotNet.Tensors.Engines.Simd
                         var x = inV[v];
                         var trunc = Vector.ConvertToSingle(Vector.ConvertToInt32(x));
                         var floorTrick = Vector.ConditionalSelect(Vector.GreaterThan(trunc, x), trunc - one, trunc);
-                        outV[v] = Vector.ConditionalSelect(Vector.LessThan(Vector.Abs(x), pow2_23), floorTrick, x);
+                        var result = Vector.ConditionalSelect(Vector.LessThan(Vector.Abs(x), pow2_23), floorTrick, x);
+                        // Preserve signed zero: the int round-trip collapses -0.0 to +0.0,
+                        // but MathF.Floor returns the SAME ±0.0 only when x is itself ±0.0
+                        // (MathF.Floor(-0.0f) = -0.0f). A nonzero x already rounds with the
+                        // correct sign, so pass only the raw ±0.0 input straight through.
+                        outV[v] = Vector.ConditionalSelect(Vector.Equals(x, zero), x, result);
                     }
                     i = simdLen;
                 }
@@ -1090,6 +1096,7 @@ namespace AiDotNet.Tensors.Engines.Simd
                 {
                     var one = Vector<float>.One;
                     var pow2_23 = new Vector<float>(8388608f);
+                    var zero = Vector<float>.Zero;
                     var inV = MemoryMarshal.Cast<float, Vector<float>>(new ReadOnlySpan<float>(input, simdLen));
                     var outV = MemoryMarshal.Cast<float, Vector<float>>(new Span<float>(output, simdLen));
                     for (int v = 0; v < inV.Length; v++)
@@ -1097,7 +1104,13 @@ namespace AiDotNet.Tensors.Engines.Simd
                         var x = inV[v];
                         var trunc = Vector.ConvertToSingle(Vector.ConvertToInt32(x));
                         var ceilTrick = Vector.ConditionalSelect(Vector.LessThan(trunc, x), trunc + one, trunc);
-                        outV[v] = Vector.ConditionalSelect(Vector.LessThan(Vector.Abs(x), pow2_23), ceilTrick, x);
+                        var result = Vector.ConditionalSelect(Vector.LessThan(Vector.Abs(x), pow2_23), ceilTrick, x);
+                        // Preserve signed zero: MathF.Ceiling returns ±0.0 only when x is
+                        // itself ±0.0 (MathF.Ceiling(-0.0f) = -0.0f) — NOT for x in (-1,0),
+                        // where MathF.Ceiling(-0.3f) = +0.0f. The int round-trip already
+                        // yields +0.0 for the (-1,0) case, so pass only the raw ±0.0 input
+                        // straight through to keep its sign.
+                        outV[v] = Vector.ConditionalSelect(Vector.Equals(x, zero), x, result);
                     }
                     i = simdLen;
                 }
@@ -1173,6 +1186,7 @@ namespace AiDotNet.Tensors.Engines.Simd
                 {
                     var one = Vector<double>.One;
                     var pow2_52 = new Vector<double>(4503599627370496.0);
+                    var zero = Vector<double>.Zero;
                     var inV = MemoryMarshal.Cast<double, Vector<double>>(new ReadOnlySpan<double>(input, simdLen));
                     var outV = MemoryMarshal.Cast<double, Vector<double>>(new Span<double>(output, simdLen));
                     for (int v = 0; v < inV.Length; v++)
@@ -1180,7 +1194,11 @@ namespace AiDotNet.Tensors.Engines.Simd
                         var x = inV[v];
                         var trunc = Vector.ConvertToDouble(Vector.ConvertToInt64(x));
                         var floorTrick = Vector.ConditionalSelect(Vector.GreaterThan(trunc, x), trunc - one, trunc);
-                        outV[v] = Vector.ConditionalSelect(Vector.LessThan(Vector.Abs(x), pow2_52), floorTrick, x);
+                        var result = Vector.ConditionalSelect(Vector.LessThan(Vector.Abs(x), pow2_52), floorTrick, x);
+                        // Preserve signed zero: the int round-trip collapses -0.0 to +0.0,
+                        // but Math.Floor returns the SAME ±0.0 only when x is itself ±0.0
+                        // (Math.Floor(-0.0) = -0.0). Pass only the raw ±0.0 input through.
+                        outV[v] = Vector.ConditionalSelect(Vector.Equals(x, zero), x, result);
                     }
                     i = simdLen;
                 }
@@ -1224,6 +1242,7 @@ namespace AiDotNet.Tensors.Engines.Simd
                 {
                     var one = Vector<double>.One;
                     var pow2_52 = new Vector<double>(4503599627370496.0);
+                    var zero = Vector<double>.Zero;
                     var inV = MemoryMarshal.Cast<double, Vector<double>>(new ReadOnlySpan<double>(input, simdLen));
                     var outV = MemoryMarshal.Cast<double, Vector<double>>(new Span<double>(output, simdLen));
                     for (int v = 0; v < inV.Length; v++)
@@ -1231,7 +1250,12 @@ namespace AiDotNet.Tensors.Engines.Simd
                         var x = inV[v];
                         var trunc = Vector.ConvertToDouble(Vector.ConvertToInt64(x));
                         var ceilTrick = Vector.ConditionalSelect(Vector.LessThan(trunc, x), trunc + one, trunc);
-                        outV[v] = Vector.ConditionalSelect(Vector.LessThan(Vector.Abs(x), pow2_52), ceilTrick, x);
+                        var result = Vector.ConditionalSelect(Vector.LessThan(Vector.Abs(x), pow2_52), ceilTrick, x);
+                        // Preserve signed zero: Math.Ceiling returns ±0.0 only when x is
+                        // itself ±0.0 (Math.Ceiling(-0.0) = -0.0) — NOT for x in (-1,0),
+                        // where Math.Ceiling(-0.3) = +0.0 (which the int round-trip already
+                        // yields). Pass only the raw ±0.0 input through to keep its sign.
+                        outV[v] = Vector.ConditionalSelect(Vector.Equals(x, zero), x, result);
                     }
                     i = simdLen;
                 }

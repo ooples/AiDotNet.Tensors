@@ -13,6 +13,12 @@ namespace AiDotNet.Tensors.Tests.Engines.Simd;
 /// </summary>
 public unsafe class RoundingSimdNet471Tests
 {
+    // Raw IEEE-754 bit comparison — `==` treats +0.0 and -0.0 as equal, so it
+    // can't catch a signed-zero regression (floor(-0.0)=-0.0, ceil(-0.5)=-0.0).
+    // net471 has no SingleToInt32Bits, so round-trip via GetBytes/ToInt32.
+    private static int BitsF(float v) => BitConverter.ToInt32(BitConverter.GetBytes(v), 0);
+    private static long BitsD(double v) => BitConverter.DoubleToInt64Bits(v);
+
     private static float[] EdgeCases() => new[]
     {
         0f, -0f, 0.3f, -0.3f, 2.7f, -2.7f, 3.0f, -3.0f, 5f, -5f,
@@ -37,7 +43,8 @@ public unsafe class RoundingSimdNet471Tests
         {
             float expected = MathF.Floor(input[i]);
             if (float.IsNaN(expected)) Assert.True(float.IsNaN(got[i]));
-            else Assert.True(got[i] == expected, $"Floor({input[i]:G9}) = {got[i]:G9}, expected {expected:G9}");
+            else Assert.True(BitsF(got[i]) == BitsF(expected),
+                $"Floor({input[i]:G9}) = {got[i]:G9} (0x{BitsF(got[i]):X8}), expected {expected:G9} (0x{BitsF(expected):X8})");
         }
     }
 
@@ -53,7 +60,8 @@ public unsafe class RoundingSimdNet471Tests
         {
             float expected = MathF.Ceiling(input[i]);
             if (float.IsNaN(expected)) Assert.True(float.IsNaN(got[i]));
-            else Assert.True(got[i] == expected, $"Ceiling({input[i]:G9}) = {got[i]:G9}, expected {expected:G9}");
+            else Assert.True(BitsF(got[i]) == BitsF(expected),
+                $"Ceiling({input[i]:G9}) = {got[i]:G9} (0x{BitsF(got[i]):X8}), expected {expected:G9} (0x{BitsF(expected):X8})");
         }
     }
 
@@ -78,7 +86,8 @@ public unsafe class RoundingSimdNet471Tests
         {
             double expected = Math.Floor(input[i]);
             if (double.IsNaN(expected)) Assert.True(double.IsNaN(got[i]));
-            else Assert.True(got[i] == expected, $"Floor({input[i]:G17}) = {got[i]:G17}, expected {expected:G17}");
+            else Assert.True(BitsD(got[i]) == BitsD(expected),
+                $"Floor({input[i]:G17}) = {got[i]:G17} (0x{BitsD(got[i]):X16}), expected {expected:G17} (0x{BitsD(expected):X16})");
         }
     }
 
@@ -93,7 +102,8 @@ public unsafe class RoundingSimdNet471Tests
         {
             double expected = Math.Ceiling(input[i]);
             if (double.IsNaN(expected)) Assert.True(double.IsNaN(got[i]));
-            else Assert.True(got[i] == expected, $"Ceiling({input[i]:G17}) = {got[i]:G17}, expected {expected:G17}");
+            else Assert.True(BitsD(got[i]) == BitsD(expected),
+                $"Ceiling({input[i]:G17}) = {got[i]:G17} (0x{BitsD(got[i]):X16}), expected {expected:G17} (0x{BitsD(expected):X16})");
         }
     }
 }
