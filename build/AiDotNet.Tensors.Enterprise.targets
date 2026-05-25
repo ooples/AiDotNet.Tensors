@@ -193,10 +193,23 @@
     hand-enumerating them. The items are added inside the target (not as static
     <None>) because the files don't exist until the validator is built, and a
     glob in a top-level ItemGroup is frozen at evaluation time before that build.
+
+    SOURCE-PACK ONLY (Copilot #439): this Enterprise.targets file is also
+    imported into *consumer* projects through the NuGet-convention shim
+    build/AiDotNet.Tensors.targets. The package ships only the compiled
+    validator DLLs (build/LicenseValidator/bin/*.dll), NOT the validator
+    csproj — so if this pack hook ran during a consumer's own `dotnet pack`
+    (their project is packable, satisfying IsPackable != 'false'), the nested
+    MSBuild would try to build a csproj that isn't there and break their pack.
+    The two extra guards below restrict it to this repo's own package build:
+    the project being packed must be the main AiDotNet.Tensors project AND the
+    validator csproj must exist on disk (it only does in the source tree).
   -->
   <Target Name="PackLicenseValidatorAssets"
           BeforeTargets="_GetPackageFiles"
-          Condition="'$(GeneratePackageOnBuild)' == 'true' Or '$(_IsPacking)' == 'true' Or '$(IsPackable)' != 'false'">
+          Condition="('$(GeneratePackageOnBuild)' == 'true' Or '$(_IsPacking)' == 'true' Or '$(IsPackable)' != 'false')
+                     And '$(MSBuildProjectName)' == 'AiDotNet.Tensors'
+                     And Exists('$(MSBuildThisFileDirectory)LicenseValidator\AiDotNet.Tensors.LicenseValidator.csproj')">
     <MSBuild Projects="$(MSBuildThisFileDirectory)LicenseValidator\AiDotNet.Tensors.LicenseValidator.csproj"
              Targets="Restore;Build"
              Properties="Configuration=Release"
