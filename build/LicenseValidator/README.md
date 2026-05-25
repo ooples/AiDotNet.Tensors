@@ -95,9 +95,11 @@ EOF
 > readability, but they carry no authority; tampering with them (e.g. widening
 > `scope` or pushing out `expires`) has no effect.
 
-The gate requires **both** the license path **and** a license key to be set —
-setting only the path fails with `AIDOTNET001`. The customer sets both (via
-MSBuild properties or the matching env vars) and **appends** the flag to their
+The gate requires **both** the license path **and** a license key to be set:
+setting only the path (no key) fails with `AIDOTNET001` (missing license key),
+and setting only the key (no path) fails with `AIDOTNET002` (missing license
+path) — see the diagnostic table below. The customer sets both (via MSBuild
+properties or the matching env vars) and **appends** the flag to their
 existing `DefineConstants`:
 
 ```bash
