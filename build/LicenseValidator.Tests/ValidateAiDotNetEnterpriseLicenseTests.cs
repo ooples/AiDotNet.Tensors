@@ -216,6 +216,78 @@ public class ValidateAiDotNetEnterpriseLicenseTests : IDisposable
             e => e.Code == "AIDOTNET004");
     }
 
+    /// <summary>
+    /// Writes a license whose SIGNED payload and outer envelope deliberately
+    /// disagree. The signature is valid over the (restricted) signed fields,
+    /// while the envelope advertises escalated fields — the exact attack the
+    /// signed-payload-as-source-of-truth fix defends against.
+    /// </summary>
+    private string WriteTamperedLicense(
+        string[] signedScope, string signedExpires,
+        string[] envelopeScope, string envelopeExpires)
+    {
+        const string marker = "AiDotNet-Enterprise-License-v1";
+        var inner = new { marker, tenant = "ACME Corp.", issued = "2026-05-22", expires = signedExpires, scope = signedScope };
+        var payloadBytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(inner));
+        var signature = _signingRsa.SignData(payloadBytes, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+        var envelope = new
+        {
+            marker,
+            tenant = "ACME Corp.",
+            issued = "2026-05-22",
+            expires = envelopeExpires,
+            scope = envelopeScope,
+            payload = Convert.ToBase64String(payloadBytes),
+            signature = Convert.ToBase64String(signature),
+        };
+        var licensePath = Path.Combine(_tempDir, Guid.NewGuid().ToString("N") + ".json");
+        File.WriteAllText(licensePath, JsonSerializer.Serialize(envelope));
+        return licensePath;
+    }
+
+    [Fact]
+    public void TamperedEnvelope_ScopeEscalation_RejectedFromSignedPayload()
+    {
+        OverrideEmbeddedPublicKey(_publicKeyBase64);
+        // Signed payload grants only DISABLE_TELEMETRY; the envelope tries to add
+        // DISABLE_LICENSE_GUARD. Requesting the escalated flag must fail — the
+        // signed scope is the source of truth, not the envelope.
+        var path = WriteTamperedLicense(
+            signedScope: new[] { "DISABLE_TELEMETRY" }, signedExpires: "2099-12-31",
+            envelopeScope: new[] { "DISABLE_TELEMETRY", "DISABLE_LICENSE_GUARD" }, envelopeExpires: "2099-12-31");
+
+        var task = new ValidateAiDotNetEnterpriseLicense
+        {
+            BuildEngine = NewEngine(),
+            LicensePath = path,
+            RequestedFlags = "DISABLE_LICENSE_GUARD",
+        };
+
+        Assert.False(task.Execute(), "Validator accepted an envelope-escalated scope absent from the signed payload.");
+        Assert.Contains(((MockBuildEngine)task.BuildEngine).Errors, e => e.Code == "AIDOTNET006");
+    }
+
+    [Fact]
+    public void TamperedEnvelope_ExpiryExtension_RejectedFromSignedPayload()
+    {
+        OverrideEmbeddedPublicKey(_publicKeyBase64);
+        // Signed payload is expired; the envelope tries to extend expiry to the
+        // far future. The signed (expired) date must govern.
+        var path = WriteTamperedLicense(
+            signedScope: new[] { "DISABLE_TELEMETRY" }, signedExpires: "2000-01-01",
+            envelopeScope: new[] { "DISABLE_TELEMETRY" }, envelopeExpires: "2099-12-31");
+
+        var task = new ValidateAiDotNetEnterpriseLicense
+        {
+            BuildEngine = NewEngine(),
+            LicensePath = path,
+            RequestedFlags = "DISABLE_TELEMETRY",
+        };
+
+        Assert.False(task.Execute(), "Validator accepted an envelope-extended expiry past the signed expiry.");
+        Assert.Contains(((MockBuildEngine)task.BuildEngine).Errors, e => e.Code == "AIDOTNET005");
+    }
+
     [Fact]
     public void MissingFile_RejectsWithAIDOTNET003()
     {

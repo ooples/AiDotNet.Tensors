@@ -60,6 +60,31 @@
       <Pack>True</Pack>
       <PackagePath>\</PackagePath>
     </None>
+
+    <!--
+      Ship the enterprise gate so a source/NuGet build that requests a DISABLE_*
+      flag still hits the license check (CodeRabbit #439): without these the
+      <Import> resolves nothing in a restored package and the validation never
+      runs. The validator DLL + its runtime closure (BouncyCastle,
+      System.Text.Json) ship next to the targets so the <UsingTask> AssemblyFile
+      resolves; the bootstrap target rebuilds it from source when absent.
+    -->
+    <None Include="..\..\build\AiDotNet.Tensors.Enterprise.targets">
+      <Pack>True</Pack>
+      <PackagePath>build\</PackagePath>
+    </None>
+    <None Include="..\..\build\LicenseValidator\bin\AiDotNet.Tensors.LicenseValidator.dll">
+      <Pack>True</Pack>
+      <PackagePath>build\LicenseValidator\bin\</PackagePath>
+    </None>
+    <None Include="..\..\build\LicenseValidator\bin\BouncyCastle.Cryptography.dll">
+      <Pack>True</Pack>
+      <PackagePath>build\LicenseValidator\bin\</PackagePath>
+    </None>
+    <None Include="..\..\build\LicenseValidator\bin\System.Text.Json.dll">
+      <Pack>True</Pack>
+      <PackagePath>build\LicenseValidator\bin\</PackagePath>
+    </None>
   </ItemGroup>
 
   <ItemGroup>

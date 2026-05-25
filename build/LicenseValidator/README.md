@@ -20,7 +20,9 @@ openssl genrsa -out enterprise-license-signing.key 2048
 # wrapper, no PEM markers). This is what the validator's
 # ImportPkcs1RsaPublicKey() expects.
 openssl rsa -in enterprise-license-signing.key -RSAPublicKey_out -outform DER \
-  | base64 -w0 > enterprise-license-signing.pub.b64
+  | openssl enc -base64 -A > enterprise-license-signing.pub.b64
+# (openssl enc -base64 -A is portable unwrapped base64; GNU `base64 -w0`
+#  is not available on macOS/BSD.)
 
 cat enterprise-license-signing.pub.b64
 # → single long base64 string. Copy verbatim.
@@ -68,9 +70,9 @@ EOF
 Sign the canonical bytes with the private key:
 
 ```bash
-PAYLOAD_B64=$(base64 -w0 < inner.json)
+PAYLOAD_B64=$(openssl enc -base64 -A < inner.json)
 SIG_B64=$(openssl dgst -sha256 -sign enterprise-license-signing.key inner.json \
-          | base64 -w0)
+          | openssl enc -base64 -A)
 ```
 
 Compose the final envelope and deliver to the customer over a secure channel
@@ -79,22 +81,35 @@ Compose the final envelope and deliver to the customer over a secure channel
 ```bash
 cat > acme-corp-license.json <<EOF
 {
-  "marker":    "AiDotNet-Enterprise-License-v1",
-  "tenant":    "ACME Corp.",
-  "issued":    "2026-05-22",
-  "expires":   "2027-05-22",
-  "scope":     ["DISABLE_TELEMETRY", "DISABLE_LICENSE_GUARD"],
   "payload":   "$PAYLOAD_B64",
   "signature": "$SIG_B64"
 }
 EOF
 ```
 
+> **Security — the signed payload is the source of truth.** The validator
+> verifies the RSA signature over `payload`, then reads `marker`, `expires`,
+> `scope`, and `tenant` **from the decoded signed payload only**. Any fields
+> placed in the *outer* envelope are ignored — they cannot grant scope or
+> extend expiry beyond what was signed. You may add outer fields for human
+> readability, but they carry no authority; tampering with them (e.g. widening
+> `scope` or pushing out `expires`) has no effect.
+
 The customer points
 `AiDotNetEnterpriseLicensePath` / `AIDOTNET_ENTERPRISE_LICENSE_PATH` at the
-file's location and adds `-p:DefineConstants=DISABLE_TELEMETRY` to their
-`dotnet build` command. The validator picks up the license, verifies the
-RSA signature against the embedded public key, checks the expiry and scope,
+file's location and **appends** the flag to their existing `DefineConstants`:
+
+```bash
+dotnet build -p:DefineConstants='$(DefineConstants);DISABLE_TELEMETRY' ...
+```
+
+> **Note.** Use the `$(DefineConstants);…` append form. A bare
+> `-p:DefineConstants=DISABLE_TELEMETRY` *replaces* the project's
+> `DefineConstants` (command-line properties have highest precedence), which can
+> silently drop constants the build relies on.
+
+The validator picks up the license, verifies the RSA signature against the
+embedded public key, checks the expiry and scope **from the signed payload**,
 and authorises the compile.
 
 ## 4. Rotate the signing key

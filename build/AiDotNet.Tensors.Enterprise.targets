@@ -100,8 +100,20 @@
              RemoveProperties="TargetFramework" />
   </Target>
 
+  <!--
+    No Condition="Exists(...)" here on purpose. UsingTask conditions are
+    evaluated at project-evaluation time, before any target runs — so on a
+    clean checkout where the validator DLL doesn't exist yet, a conditioned
+    registration is silently skipped and stays skipped even after
+    EnsureAiDotNetLicenseValidatorBuilt produces the DLL later in the same
+    build, leaving ValidateEnterpriseDisableFlags unable to find the task.
+    Registering unconditionally is safe: AssemblyFile is resolved lazily when
+    the task is first invoked, which only happens inside
+    ValidateEnterpriseDisableFlags (gated on a DISABLE_* flag) — and that
+    target runs after the bootstrap has built the DLL. When no flag is
+    requested the task is never invoked, so the path is never touched.
+  -->
   <UsingTask
-    Condition="Exists('$(_AiDotNetLicenseValidatorDll)')"
     TaskName="AiDotNet.Tensors.LicenseValidator.ValidateAiDotNetEnterpriseLicense"
     AssemblyFile="$(_AiDotNetLicenseValidatorDll)" />
 

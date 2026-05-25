@@ -143,64 +143,14 @@ public sealed class ValidateAiDotNetEnterpriseLicense : Task
                     return false;
                 }
 
-                if (!TryGetString(root, "marker", out var marker)
-                    || !string.Equals(marker, "AiDotNet-Enterprise-License-v1", StringComparison.Ordinal))
-                {
-                    Log.LogError(null, "AIDOTNET004", null, LicensePath, 0, 0, 0, 0,
-                        "AiDotNet Enterprise license at {0} missing or wrong 'marker' field (expected 'AiDotNet-Enterprise-License-v1').",
-                        LicensePath);
-                    return false;
-                }
-
-                if (!TryGetString(root, "expires", out var expiresRaw)
-                    || !DateTime.TryParse(expiresRaw, CultureInfo.InvariantCulture,
-                        DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal,
-                        out var expires))
-                {
-                    Log.LogError(null, "AIDOTNET005", null, LicensePath, 0, 0, 0, 0,
-                        "AiDotNet Enterprise license at {0} has missing or unparseable 'expires' field.",
-                        LicensePath);
-                    return false;
-                }
-                if (expires < DateTime.UtcNow.Date)
-                {
-                    Log.LogError(null, "AIDOTNET005", null, LicensePath, 0, 0, 0, 0,
-                        "AiDotNet Enterprise license at {0} expired on {1:yyyy-MM-dd} UTC. Contact admin@aidotnet.dev to renew.",
-                        LicensePath, expires);
-                    return false;
-                }
-
-                if (!root.TryGetProperty("scope", out var scopeEl) || scopeEl.ValueKind != JsonValueKind.Array)
-                {
-                    Log.LogError(null, "AIDOTNET006", null, LicensePath, 0, 0, 0, 0,
-                        "AiDotNet Enterprise license at {0} missing 'scope' array.", LicensePath);
-                    return false;
-                }
-                var grantedScope = new HashSet<string>(StringComparer.Ordinal);
-                foreach (var s in scopeEl.EnumerateArray())
-                {
-                    if (s.ValueKind == JsonValueKind.String)
-                    {
-                        var sv = s.GetString();
-                        if (!string.IsNullOrWhiteSpace(sv))
-                            grantedScope.Add(sv!);
-                    }
-                }
-                var requested = (RequestedFlags ?? string.Empty)
-                    .Split(new[] { ';', ',' }, StringSplitOptions.RemoveEmptyEntries);
-                foreach (var rawFlag in requested)
-                {
-                    var flag = rawFlag.Trim();
-                    if (flag.Length == 0) continue;
-                    if (!grantedScope.Contains(flag))
-                    {
-                        Log.LogError(null, "AIDOTNET006", null, LicensePath, 0, 0, 0, 0,
-                            "AiDotNet Enterprise license at {0} does not include '{1}' in its granted scope. Granted: [{2}].",
-                            LicensePath, flag, string.Join(", ", grantedScope));
-                        return false;
-                    }
-                }
-
+                // Extract the signed payload + detached signature from the envelope.
+                // SECURITY: only the bytes inside "payload" are RSA-signed. The outer
+                // envelope is untrusted input — every privilege-bearing field (marker,
+                // expires, scope, tenant) MUST be read from the *signed* payload below,
+                // never from the envelope. Reading them from the envelope let an attacker
+                // keep a valid (payload, signature) pair and re-wrap it with escalated
+                // scope / extended expiry. The envelope's only trusted role is carrying
+                // the payload + signature.
                 if (!TryGetString(root, "payload", out var payloadB64)
                     || !TryGetString(root, "signature", out var signatureB64))
                 {
@@ -260,13 +210,95 @@ public sealed class ValidateAiDotNetEnterpriseLicense : Task
                     return false;
                 }
 
-                Tenant = TryGetString(root, "tenant", out var tenant) && !string.IsNullOrWhiteSpace(tenant)
-                    ? tenant!
-                    : "(unspecified)";
-                Log.LogMessage(MessageImportance.High,
-                    "AiDotNet Enterprise license verified: tenant='{0}', expires={1:yyyy-MM-dd}, scope=[{2}]",
-                    Tenant, expires, string.Join(", ", grantedScope));
-                return true;
+                // Signature verified → the payload bytes are authentic. Parse the SIGNED
+                // payload as the sole source of truth for the gating fields.
+                JsonDocument payloadDoc;
+                try
+                {
+                    payloadDoc = JsonDocument.Parse(new ReadOnlyMemory<byte>(payloadBytes));
+                }
+                catch (JsonException ex)
+                {
+                    Log.LogError(null, "AIDOTNET004", null, LicensePath, 0, 0, 0, 0,
+                        "AiDotNet Enterprise license at {0} has a signed payload that is not valid JSON: {1}", LicensePath, ex.Message);
+                    return false;
+                }
+                using (payloadDoc)
+                {
+                    var signed = payloadDoc.RootElement;
+                    if (signed.ValueKind != JsonValueKind.Object)
+                    {
+                        Log.LogError(null, "AIDOTNET004", null, LicensePath, 0, 0, 0, 0,
+                            "AiDotNet Enterprise license at {0} signed payload is not a JSON object.", LicensePath);
+                        return false;
+                    }
+
+                    if (!TryGetString(signed, "marker", out var marker)
+                        || !string.Equals(marker, "AiDotNet-Enterprise-License-v1", StringComparison.Ordinal))
+                    {
+                        Log.LogError(null, "AIDOTNET004", null, LicensePath, 0, 0, 0, 0,
+                            "AiDotNet Enterprise license at {0} signed payload missing or wrong 'marker' field (expected 'AiDotNet-Enterprise-License-v1').",
+                            LicensePath);
+                        return false;
+                    }
+
+                    if (!TryGetString(signed, "expires", out var expiresRaw)
+                        || !DateTime.TryParse(expiresRaw, CultureInfo.InvariantCulture,
+                            DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal,
+                            out var expires))
+                    {
+                        Log.LogError(null, "AIDOTNET005", null, LicensePath, 0, 0, 0, 0,
+                            "AiDotNet Enterprise license at {0} signed payload has missing or unparseable 'expires' field.",
+                            LicensePath);
+                        return false;
+                    }
+                    if (expires < DateTime.UtcNow.Date)
+                    {
+                        Log.LogError(null, "AIDOTNET005", null, LicensePath, 0, 0, 0, 0,
+                            "AiDotNet Enterprise license at {0} expired on {1:yyyy-MM-dd} UTC. Contact admin@aidotnet.dev to renew.",
+                            LicensePath, expires);
+                        return false;
+                    }
+
+                    if (!signed.TryGetProperty("scope", out var scopeEl) || scopeEl.ValueKind != JsonValueKind.Array)
+                    {
+                        Log.LogError(null, "AIDOTNET006", null, LicensePath, 0, 0, 0, 0,
+                            "AiDotNet Enterprise license at {0} signed payload missing 'scope' array.", LicensePath);
+                        return false;
+                    }
+                    var grantedScope = new HashSet<string>(StringComparer.Ordinal);
+                    foreach (var s in scopeEl.EnumerateArray())
+                    {
+                        if (s.ValueKind == JsonValueKind.String)
+                        {
+                            var sv = s.GetString();
+                            if (!string.IsNullOrWhiteSpace(sv))
+                                grantedScope.Add(sv!);
+                        }
+                    }
+                    var requested = (RequestedFlags ?? string.Empty)
+                        .Split(new[] { ';', ',' }, StringSplitOptions.RemoveEmptyEntries);
+                    foreach (var rawFlag in requested)
+                    {
+                        var flag = rawFlag.Trim();
+                        if (flag.Length == 0) continue;
+                        if (!grantedScope.Contains(flag))
+                        {
+                            Log.LogError(null, "AIDOTNET006", null, LicensePath, 0, 0, 0, 0,
+                                "AiDotNet Enterprise license at {0} does not include '{1}' in its granted scope. Granted: [{2}].",
+                                LicensePath, flag, string.Join(", ", grantedScope));
+                            return false;
+                        }
+                    }
+
+                    Tenant = TryGetString(signed, "tenant", out var tenant) && !string.IsNullOrWhiteSpace(tenant)
+                        ? tenant!
+                        : "(unspecified)";
+                    Log.LogMessage(MessageImportance.High,
+                        "AiDotNet Enterprise license verified: tenant='{0}', expires={1:yyyy-MM-dd}, scope=[{2}]",
+                        Tenant, expires, string.Join(", ", grantedScope));
+                    return true;
+                }
             }
         }
         catch (Exception ex)
