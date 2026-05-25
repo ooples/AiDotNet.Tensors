@@ -14,7 +14,15 @@ env:
   DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
   DOTNET_CLI_TELEMETRY_OPTOUT: true
   DOTNET_NOLOGO: true
-  COVERAGE_THRESHOLD: 3
+  # Coverage ratchet: per-PR coverage must not drop below the stored
+  # baseline (`coverage-baseline.json`) by more than COVERAGE_REGRESSION_TOLERANCE
+  # percentage points. The previous fixed COVERAGE_THRESHOLD=3 was
+  # performative (audit-2026-05 finding #8) — replaced with a ratchet
+  # that holds the floor where current actual coverage is and lets us
+  # raise it incrementally via the recorded baseline.
+  COVERAGE_BASELINE_FILE: coverage-baseline.json
+  COVERAGE_REGRESSION_TOLERANCE: 1.0
+  COVERAGE_RATCHET_INCREMENT: 5.0
 
 jobs:
   build:
@@ -70,8 +78,22 @@ jobs:
           echo "============================="
         fi
 
-    - name: Check Coverage Threshold
+    - name: Check Coverage Ratchet
       run: |
+        # Coverage ratchet — replaces the prior fixed COVERAGE_THRESHOLD=3
+        # gate per audit-2026-05 finding #8.
+        #
+        # Behaviour:
+        #   1. Read current line / branch coverage from cobertura XML.
+        #   2. Read stored baseline from $COVERAGE_BASELINE_FILE at repo root
+        #      (JSON with keys: line, branch, recorded_at, recorded_sha).
+        #      If the file is missing, treat the current measurement as the
+        #      initial baseline and pass (lets us bootstrap on first PR).
+        #   3. Fail if current line coverage drops below
+        #      (baseline_line - COVERAGE_REGRESSION_TOLERANCE).
+        #   4. Print whether the PR met the +COVERAGE_RATCHET_INCREMENT target
+        #      (informational only — does NOT fail; baseline must be advanced
+        #      explicitly via a separate PR that updates the file).
         COVERAGE_FILE=$(find ./coverage -name "coverage.cobertura.xml" -type f | head -1)
         if [ -z "$COVERAGE_FILE" ]; then
           echo "::error::No coverage file found!"
@@ -89,17 +111,79 @@ jobs:
         print(float(tree.getroot().get('branch-rate', '0')) * 100)
         ")
 
-        echo "Line Coverage: ${LINE_RATE}%"
+        echo "Line Coverage:   ${LINE_RATE}%"
         echo "Branch Coverage: ${BRANCH_RATE}%"
-        echo "Required Threshold: ${COVERAGE_THRESHOLD}%"
 
-        PASS=$(python3 -c "print('yes' if $LINE_RATE >= $COVERAGE_THRESHOLD else 'no')")
-        if [ "$PASS" != "yes" ]; then
-          echo "::error::Line coverage (${LINE_RATE}%) is below the required threshold (${COVERAGE_THRESHOLD}%)!"
+        if [ ! -f "$COVERAGE_BASELINE_FILE" ]; then
+          echo "::warning::No $COVERAGE_BASELINE_FILE found at repo root. Treating current coverage as initial baseline."
+          echo "Bootstrap baseline: line=${LINE_RATE}% branch=${BRANCH_RATE}%"
+          echo "To record this baseline, commit a $COVERAGE_BASELINE_FILE with:"
+          echo "  {\"line\": ${LINE_RATE}, \"branch\": ${BRANCH_RATE}, \"recorded_at\": \"$(date -u +%Y-%m-%d)\", \"recorded_sha\": \"$GITHUB_SHA\"}"
+          exit 0
+        fi
+
+        # Bootstrap-mode detection: a baseline file that is a placeholder (e.g.,
+        # the audit-phase0 stub with line=0, branch=0, recorded_sha="pending-...")
+        # must NOT enforce the ratchet — line=0 means everything passes the
+        # "current < baseline - tolerance" check. CodeRabbit (PR #438) flagged
+        # this as a silent gate disablement. Detect via the
+        # `_initial_value_pending` marker key OR a `recorded_sha` that starts
+        # with `pending-`. When either is true, treat the run as bootstrap and
+        # print the measured numbers for the human to record in a follow-up PR.
+        BASELINE_PENDING=$(python3 -c "
+        import json
+        with open('$COVERAGE_BASELINE_FILE') as f:
+            data = json.load(f)
+        sha = str(data.get('recorded_sha', ''))
+        pending = bool(data.get('_initial_value_pending')) or sha.startswith('pending-')
+        print('yes' if pending else 'no')
+        ")
+        if [ "$BASELINE_PENDING" = "yes" ]; then
+          echo "::warning::$COVERAGE_BASELINE_FILE is in bootstrap state (placeholder values; _initial_value_pending set or recorded_sha begins with 'pending-'). Ratchet enforcement skipped for this run."
+          echo "Measured this run: line=${LINE_RATE}% branch=${BRANCH_RATE}%"
+          echo "Update $COVERAGE_BASELINE_FILE in a dedicated follow-up PR with:"
+          echo "  {\"line\": ${LINE_RATE}, \"branch\": ${BRANCH_RATE}, \"recorded_at\": \"$(date -u +%Y-%m-%d)\", \"recorded_sha\": \"$GITHUB_SHA\"}"
+          exit 0
+        fi
+
+        BASELINE_LINE=$(python3 -c "
+        import json
+        with open('$COVERAGE_BASELINE_FILE') as f:
+            print(json.load(f)['line'])
+        ")
+        BASELINE_BRANCH=$(python3 -c "
+        import json
+        with open('$COVERAGE_BASELINE_FILE') as f:
+            print(json.load(f).get('branch', 0))
+        ")
+
+        echo "Baseline Line:   ${BASELINE_LINE}%"
+        echo "Baseline Branch: ${BASELINE_BRANCH}%"
+        echo "Regression tolerance: ${COVERAGE_REGRESSION_TOLERANCE}pp"
+        echo "Ratchet target:       baseline + ${COVERAGE_RATCHET_INCREMENT}pp"
+
+        FAIL_LINE=$(python3 -c "
+        baseline = float('$BASELINE_LINE')
+        current = float('$LINE_RATE')
+        tolerance = float('$COVERAGE_REGRESSION_TOLERANCE')
+        print('yes' if current < baseline - tolerance else 'no')
+        ")
+        if [ "$FAIL_LINE" = "yes" ]; then
+          echo "::error::Line coverage (${LINE_RATE}%) regressed from baseline (${BASELINE_LINE}%) by more than ${COVERAGE_REGRESSION_TOLERANCE}pp. Either restore coverage or update $COVERAGE_BASELINE_FILE in a separate dedicated PR."
           exit 1
         fi
 
-        echo "Coverage check PASSED!"
+        AT_TARGET=$(python3 -c "
+        baseline = float('$BASELINE_LINE')
+        current = float('$LINE_RATE')
+        target = float('$COVERAGE_RATCHET_INCREMENT')
+        print('yes' if current >= baseline + target else 'no')
+        ")
+        if [ "$AT_TARGET" = "yes" ]; then
+          echo "::notice::Coverage advanced ${COVERAGE_RATCHET_INCREMENT}pp+ over baseline. Consider updating $COVERAGE_BASELINE_FILE to ratchet the floor up."
+        fi
+
+        echo "Coverage ratchet PASSED!"
 
     - name: Upload Coverage Report
       uses: actions/upload-artifact@v4

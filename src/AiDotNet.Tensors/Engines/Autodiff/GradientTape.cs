@@ -46,6 +46,14 @@ public sealed class GradientTape<T> : IDisposable
     /// </summary>
     private static void SetCurrentTape(GradientTape<T>? tape) => _current = tape;
 
+    /// <summary>
+    /// Test-isolation hook: clears this thread's current-tape reference for
+    /// <typeparamref name="T"/>. An undisposed tape pins <see cref="_current"/>
+    /// (a ThreadStatic strong ref the finalizer cannot reach), so the harness
+    /// clears it between tests. Not part of the public API.
+    /// </summary>
+    internal static void ResetCurrentForTests() => _current = null;
+
     private readonly GradientTape<T>? _parent;
     private readonly TapeEntryArena<T> _entries;
     private readonly GradientTapeOptions _options;
@@ -1648,12 +1656,46 @@ public sealed class GradientTape<T> : IDisposable
     }
 
     /// <summary>
+    /// Finalizer backstop for the process-wide
+    /// <see cref="DifferentiableOps._anyTapeActive"/> counter, which the ctor
+    /// increments and only <see cref="Dispose"/> decrements. A stuck-positive
+    /// count forces every op on every thread down the tape-recording slow path
+    /// and can flip tape-gated dispatch (e.g. the BlasManaged GEMM packed path
+    /// keys on <see cref="Current"/> being null), so we decrement the global on
+    /// GC. Only the Interlocked global is touched: the ThreadStatic
+    /// <c>_current</c> / <c>_threadTapeDepth</c> belong to the originating thread
+    /// and must never be poked from the finalizer thread.
+    ///
+    /// <para><b>Scope of this backstop.</b> A tape is only eligible for GC (and
+    /// hence finalization) once nothing roots it — and an undisposed tape stays
+    /// rooted by this thread's <c>[ThreadStatic] _current</c> slot until that
+    /// thread either clears <c>_current</c> or exits. So this finalizer heals
+    /// the realistic production leak: an undisposed tape on a <i>transient</i>
+    /// worker/request thread, whose TLS is released when the thread ends,
+    /// letting the tape collect and the global count self-correct. It does
+    /// <i>not</i> rescue an undisposed tape pinned by a <i>long-lived</i>
+    /// thread's <c>_current</c> — there the global stays elevated until that
+    /// thread is reused (each <see cref="GradientTape{T}"/> ctor overwrites
+    /// <c>_current</c> with the new tape) or exits. The real fix for that case
+    /// is disposal: always wrap tape usage in <c>using</c>/try-finally. In the
+    /// test harness, <c>TapeIsolationGuard</c> clears <c>_current</c> after every
+    /// test, which both unroots any leaked tape (so this finalizer can run) and
+    /// prevents same-thread cross-test contamination.</para>
+    /// </summary>
+    ~GradientTape()
+    {
+        if (!_disposed)
+            System.Threading.Interlocked.Decrement(ref DifferentiableOps._anyTapeActive);
+    }
+
+    /// <summary>
     /// Disposes the tape and restores the parent tape (if any) as the current tape.
     /// </summary>
     public void Dispose()
     {
         if (_disposed) return;
         _disposed = true;
+        GC.SuppressFinalize(this);
         // Restore the previous ReplayMode instead of hard-resetting.
         // This is critical for nested tapes: an inner tape disposing must not
         // clear replay suppression that an outer tape still needs.
@@ -1771,6 +1813,14 @@ public sealed class NoGradScope<T> : IDisposable
     public static bool IsSuppressed => _suppressionCount > 0;
 
     /// <summary>
+    /// Test-isolation hook: clears this thread's suppression count. A test that
+    /// enters a <see cref="NoGradScope{T}"/> and never disposes it (exception
+    /// path) otherwise leaves recording suppressed for every later test on the
+    /// thread, silently zeroing their gradients. Not part of the public API.
+    /// </summary>
+    internal static void ResetForTests() => _suppressionCount = 0;
+
+    /// <summary>
     /// Creates a new NoGradScope, incrementing the suppression counter.
     /// Supports nesting: multiple scopes can be active simultaneously.
     /// </summary>
@@ -1842,6 +1892,14 @@ public sealed class InferenceModeScope<T> : IDisposable
     public static bool IsActive => _activeCount > 0;
 
     /// <summary>
+    /// Test-isolation hook: clears this thread's inference-scope count. A test
+    /// that enters an <see cref="InferenceModeScope{T}"/> and never disposes it
+    /// (exception path) otherwise leaves in-place mutation legal and recording
+    /// suppressed for every later test on the thread. Not part of the public API.
+    /// </summary>
+    internal static void ResetForTests() => _activeCount = 0;
+
+    /// <summary>
     /// Creates a new scope. Increments three counters: the NoGrad
     /// suppression counter (InferenceMode is strictly stronger so
     /// <see cref="NoGradScope{T}.IsSuppressed"/> reports true while
@@ -1904,6 +1962,13 @@ public static class InferenceModeFlag
     internal static void Enter() => _activeCount++;
 
     internal static void Exit() => _activeCount--;
+
+    /// <summary>
+    /// Test-isolation hook: clears the type-erased inference-mode count for
+    /// this thread. Paired with <see cref="InferenceModeScope{T}.ResetForTests"/>
+    /// so a leaked inference scope cannot contaminate later tests. Not public.
+    /// </summary>
+    internal static void ResetForTests() => _activeCount = 0;
 }
 
 /// <summary>

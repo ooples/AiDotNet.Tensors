@@ -433,10 +433,20 @@ internal static class BackwardFunctions<T>
         if (prePackedBT == null) throw new ArgumentNullException(nameof(prePackedBT));
         if (bTransposed.Rank != 2)
             throw new ArgumentException("bTransposed must be rank-2 [N, K].", nameof(bTransposed));
+        // The helper is documented as [M, K] @ [N, K]ᵀ → [M, K]; validate the
+        // full 2D shape contract before dispatching. Without these, a rank>2
+        // inputA is silently truncated to its first dim and a mismatched
+        // inputA[1] returns a gradient that no longer matches inputA's shape.
+        if (inputA.Rank != 2)
+            throw new ArgumentException("inputA must be rank-2 [M, K].", nameof(inputA));
+        if (gradOutput.Rank != 2)
+            throw new ArgumentException("gradOutput must be rank-2 [M, N].", nameof(gradOutput));
 
         int M = inputA._shape[0];
         int N = bTransposed._shape[0];  // rows of Bᵀ = cols of B
         int K = bTransposed._shape[1];  // cols of Bᵀ = rows of B
+        if (inputA._shape[1] != K)
+            throw new ArgumentException($"inputA cols ({inputA._shape[1]}) must equal K={K} (rows of B).", nameof(inputA));
         if (gradOutput._shape[0] != M || gradOutput._shape[1] != N)
             throw new ArgumentException($"gradOutput shape [{gradOutput._shape[0]},{gradOutput._shape[1]}] doesn't match [M={M}, N={N}].");
 
@@ -454,10 +464,12 @@ internal static class BackwardFunctions<T>
             return engine.TensorMatMul<T>(gradOutput, bTransposed);
         }
 
-        var gradA = AutoTensorCache.RentOrAllocate<T>(new[] { M, K });
-
+        // Rent gradA only inside the supported-type branches — renting before
+        // the dispatch leaked the buffer on the unsupported-type throw below
+        // (it never returned to AutoTensorCache).
         if (typeof(T) == typeof(float))
         {
+            var gradA = AutoTensorCache.RentOrAllocate<T>(new[] { M, K });
             var dC = (float[])(object)gradOutput.GetDataArray();
             var bT = (float[])(object)bTransposed.GetDataArray();
             var gA = (float[])(object)gradA.GetDataArray();
@@ -470,6 +482,7 @@ internal static class BackwardFunctions<T>
         }
         if (typeof(T) == typeof(double))
         {
+            var gradA = AutoTensorCache.RentOrAllocate<T>(new[] { M, K });
             var dC = (double[])(object)gradOutput.GetDataArray();
             var bT = (double[])(object)bTransposed.GetDataArray();
             var gA = (double[])(object)gradA.GetDataArray();
