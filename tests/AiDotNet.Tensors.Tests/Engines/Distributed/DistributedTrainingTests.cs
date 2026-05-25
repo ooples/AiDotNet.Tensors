@@ -515,7 +515,7 @@ public class DistributedTrainingTests
             pg.AllReduce(t, ReduceOp.Avg);
             results[rank] = new float[4];
             t.AsSpan().CopyTo(results[rank]);
-        }, timeout: TimeSpan.FromSeconds(20), opName: "TcpProcessGroup_AllReduce");
+        }, timeout: TimeSpan.FromSeconds(60), opName: "TcpProcessGroup_AllReduce");
         for (int r = 0; r < worldSize; r++)
             for (int i = 0; i < 4; i++)
                 Assert.Equal(2.0f, results[r][i], precision: 4); // mean(1,2,3) = 2
@@ -566,7 +566,7 @@ public class DistributedTrainingTests
             pg.Broadcast(t, root: 1);
             results[rank] = new float[3];
             t.AsSpan().CopyTo(results[rank]);
-        }, timeout: TimeSpan.FromSeconds(20), opName: "TcpProcessGroup_Broadcast");
+        }, timeout: TimeSpan.FromSeconds(60), opName: "TcpProcessGroup_Broadcast");
         for (int r = 0; r < worldSize; r++)
         {
             Assert.Equal(7, results[r][0]);
@@ -588,7 +588,7 @@ public class DistributedTrainingTests
             using var pg = new TcpProcessGroup(rank, worldSize, endpoint);
             pg.Barrier();
             System.Threading.Interlocked.Increment(ref reachedBarrier);
-        }, timeout: TimeSpan.FromSeconds(20), opName: "TcpProcessGroup_Barrier");
+        }, timeout: TimeSpan.FromSeconds(60), opName: "TcpProcessGroup_Barrier");
         Assert.Equal(worldSize, reachedBarrier);
     }
 

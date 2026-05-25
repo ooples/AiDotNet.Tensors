@@ -964,17 +964,25 @@ public class CompiledBackwardWalkTests
                 .GetValue(entriesObj)!;
             if (entryCount == 0) return;
 
-            // Walk entries via the internal Item indexer to fetch each
-            // entry's Backward delegate, then capture its MethodInfo.
-            var indexer = arenaType.GetProperty("Item",
-                BindingFlags.NonPublic | BindingFlags.Instance)!;
+            // Read the arena's backing TapeEntry<T>[] array directly to fetch
+            // each entry's Backward delegate, then capture its MethodInfo.
+            //
+            // We deliberately do NOT use the arena's `Item` indexer here: it
+            // returns `ref TapeEntry<T>`, and .NET Framework (net471) reflection
+            // cannot invoke ref-returning members — PropertyInfo.GetValue throws
+            // "NotSupportedException: ByRef return value not supported in
+            // reflection invocation". (.NET 5+ auto-dereferences the ref, which
+            // is why this only broke on the net471 TFM.) Indexing the backing
+            // array via Array.GetValue yields a boxed struct copy on both TFMs,
+            // which is all we need to read the Backward field's .Method.
+            var backingField = arenaType.GetField("_entries",
+                BindingFlags.NonPublic | BindingFlags.Instance);
+            Assert.NotNull(backingField);
+            var backingArray = (Array)backingField!.GetValue(entriesObj)!;
             var methods = new MethodInfo[entryCount];
             for (int i = 0; i < entryCount; i++)
             {
-                // Indexer returns ref TapeEntry<T>; reflection unboxes
-                // the struct copy. That's fine — we only need the
-                // Backward field's .Method.
-                var entry = indexer.GetValue(entriesObj, new object?[] { i })!;
+                var entry = backingArray.GetValue(i)!;
                 var backwardField = entry.GetType().GetField("Backward")!;
                 var backwardDelegate = (Delegate)backwardField.GetValue(entry)!;
                 methods[i] = backwardDelegate.Method;

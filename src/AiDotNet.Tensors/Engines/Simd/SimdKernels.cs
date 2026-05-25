@@ -4,6 +4,10 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using AiDotNet.Tensors.Helpers;
 using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
+#if !NET5_0_OR_GREATER
+// audit-2026-05 phase 5 §E/§D: BCL Vector<T> backward-pass + rounding SIMD on net471.
+using System.Numerics;
+#endif
 #if NET5_0_OR_GREATER
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.Arm;
@@ -26,10 +30,10 @@ namespace AiDotNet.Tensors.Engines.Simd
                 throw new ArgumentException("Input and output spans must have the same length.");
             }
 
+#if NET5_0_OR_GREATER
             int length = result.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 32)
             {
                 int simdLength = length & ~31;
@@ -65,12 +69,18 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector128(result, i, AdvSimd.Add(ReadVector128(a, i), ReadVector128(b, i)));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
                 result[i] = a[i] + b[i];
             }
+#else
+            // audit-2026-05 phase 5 foundation: route net471 through the BCL Vector<T> bridge instead
+            // of a per-element scalar loop. RyuJIT auto-vectorizes Vector<float> to AVX2 (8 lanes) /
+            // SSE2 (4 lanes) at the host CPU's native width. See
+            // docs/internal/audit-2026-05-phase5-net471-simd.md for the migration plan.
+            SystemNumericsVectorBridge.VectorAdd(a, b, result);
+#endif
         }
 
         /// <summary>
@@ -1015,6 +1025,37 @@ namespace AiDotNet.Tensors.Engines.Simd
                 for (; i < simdLength; i += 8)
                     Avx.Store(output + i, Avx.Floor(Avx.LoadVector256(input + i)));
             }
+#else
+            // net471 §D: no Vector<T>.Floor before .NET 7, so truncate-toward-zero
+            // via int round-trip and correct: floor(x) = trunc(x) - (trunc(x) > x ? 1 : 0).
+            // Only valid where |x| < 2^23 (floats represent every integer exactly
+            // above that, so x is already its own floor — and that branch also
+            // safely passes NaN/±Inf through unchanged, matching MathF.Floor).
+            {
+                int lanes = Vector<float>.Count;
+                int simdLen = length - (length % lanes);
+                if (simdLen > 0)
+                {
+                    var one = Vector<float>.One;
+                    var pow2_23 = new Vector<float>(8388608f);
+                    var zero = Vector<float>.Zero;
+                    var inV = MemoryMarshal.Cast<float, Vector<float>>(new ReadOnlySpan<float>(input, simdLen));
+                    var outV = MemoryMarshal.Cast<float, Vector<float>>(new Span<float>(output, simdLen));
+                    for (int v = 0; v < inV.Length; v++)
+                    {
+                        var x = inV[v];
+                        var trunc = Vector.ConvertToSingle(Vector.ConvertToInt32(x));
+                        var floorTrick = Vector.ConditionalSelect(Vector.GreaterThan(trunc, x), trunc - one, trunc);
+                        var result = Vector.ConditionalSelect(Vector.LessThan(Vector.Abs(x), pow2_23), floorTrick, x);
+                        // Preserve signed zero: the int round-trip collapses -0.0 to +0.0,
+                        // but MathF.Floor returns the SAME ±0.0 only when x is itself ±0.0
+                        // (MathF.Floor(-0.0f) = -0.0f). A nonzero x already rounds with the
+                        // correct sign, so pass only the raw ±0.0 input straight through.
+                        outV[v] = Vector.ConditionalSelect(Vector.Equals(x, zero), x, result);
+                    }
+                    i = simdLen;
+                }
+            }
 #endif
             for (; i < length; i++)
                 output[i] = MathF.Floor(input[i]);
@@ -1044,6 +1085,35 @@ namespace AiDotNet.Tensors.Engines.Simd
                 int simdLength = i + ((length - i) & ~7);
                 for (; i < simdLength; i += 8)
                     Avx.Store(output + i, Avx.Ceiling(Avx.LoadVector256(input + i)));
+            }
+#else
+            // net471 §D: ceil(x) = trunc(x) + (trunc(x) < x ? 1 : 0); same |x| < 2^23
+            // guard as Floor above (passes NaN/±Inf through unchanged).
+            {
+                int lanes = Vector<float>.Count;
+                int simdLen = length - (length % lanes);
+                if (simdLen > 0)
+                {
+                    var one = Vector<float>.One;
+                    var pow2_23 = new Vector<float>(8388608f);
+                    var zero = Vector<float>.Zero;
+                    var inV = MemoryMarshal.Cast<float, Vector<float>>(new ReadOnlySpan<float>(input, simdLen));
+                    var outV = MemoryMarshal.Cast<float, Vector<float>>(new Span<float>(output, simdLen));
+                    for (int v = 0; v < inV.Length; v++)
+                    {
+                        var x = inV[v];
+                        var trunc = Vector.ConvertToSingle(Vector.ConvertToInt32(x));
+                        var ceilTrick = Vector.ConditionalSelect(Vector.LessThan(trunc, x), trunc + one, trunc);
+                        var result = Vector.ConditionalSelect(Vector.LessThan(Vector.Abs(x), pow2_23), ceilTrick, x);
+                        // Preserve signed zero: MathF.Ceiling returns ±0.0 only when x is
+                        // itself ±0.0 (MathF.Ceiling(-0.0f) = -0.0f) — NOT for x in (-1,0),
+                        // where MathF.Ceiling(-0.3f) = +0.0f. The int round-trip already
+                        // yields +0.0 for the (-1,0) case, so pass only the raw ±0.0 input
+                        // straight through to keep its sign.
+                        outV[v] = Vector.ConditionalSelect(Vector.Equals(x, zero), x, result);
+                    }
+                    i = simdLen;
+                }
             }
 #endif
             for (; i < length; i++)
@@ -1105,6 +1175,34 @@ namespace AiDotNet.Tensors.Engines.Simd
                 for (; i < simdLength; i += 4)
                     Avx.Store(output + i, Avx.Floor(Avx.LoadVector256(input + i)));
             }
+#else
+            // net471 §D: floor(x) = trunc(x) - (trunc(x) > x ? 1 : 0); guarded to
+            // |x| < 2^52 (above which doubles are integer-valued, so x is returned
+            // directly — which also passes NaN/±Inf through to match Math.Floor).
+            {
+                int lanes = Vector<double>.Count;
+                int simdLen = length - (length % lanes);
+                if (simdLen > 0)
+                {
+                    var one = Vector<double>.One;
+                    var pow2_52 = new Vector<double>(4503599627370496.0);
+                    var zero = Vector<double>.Zero;
+                    var inV = MemoryMarshal.Cast<double, Vector<double>>(new ReadOnlySpan<double>(input, simdLen));
+                    var outV = MemoryMarshal.Cast<double, Vector<double>>(new Span<double>(output, simdLen));
+                    for (int v = 0; v < inV.Length; v++)
+                    {
+                        var x = inV[v];
+                        var trunc = Vector.ConvertToDouble(Vector.ConvertToInt64(x));
+                        var floorTrick = Vector.ConditionalSelect(Vector.GreaterThan(trunc, x), trunc - one, trunc);
+                        var result = Vector.ConditionalSelect(Vector.LessThan(Vector.Abs(x), pow2_52), floorTrick, x);
+                        // Preserve signed zero: the int round-trip collapses -0.0 to +0.0,
+                        // but Math.Floor returns the SAME ±0.0 only when x is itself ±0.0
+                        // (Math.Floor(-0.0) = -0.0). Pass only the raw ±0.0 input through.
+                        outV[v] = Vector.ConditionalSelect(Vector.Equals(x, zero), x, result);
+                    }
+                    i = simdLen;
+                }
+            }
 #endif
             for (; i < length; i++)
                 output[i] = Math.Floor(input[i]);
@@ -1134,6 +1232,33 @@ namespace AiDotNet.Tensors.Engines.Simd
                 int simdLength = i + ((length - i) & ~3);
                 for (; i < simdLength; i += 4)
                     Avx.Store(output + i, Avx.Ceiling(Avx.LoadVector256(input + i)));
+            }
+#else
+            // net471 §D: ceil(x) = trunc(x) + (trunc(x) < x ? 1 : 0); |x| < 2^52 guard.
+            {
+                int lanes = Vector<double>.Count;
+                int simdLen = length - (length % lanes);
+                if (simdLen > 0)
+                {
+                    var one = Vector<double>.One;
+                    var pow2_52 = new Vector<double>(4503599627370496.0);
+                    var zero = Vector<double>.Zero;
+                    var inV = MemoryMarshal.Cast<double, Vector<double>>(new ReadOnlySpan<double>(input, simdLen));
+                    var outV = MemoryMarshal.Cast<double, Vector<double>>(new Span<double>(output, simdLen));
+                    for (int v = 0; v < inV.Length; v++)
+                    {
+                        var x = inV[v];
+                        var trunc = Vector.ConvertToDouble(Vector.ConvertToInt64(x));
+                        var ceilTrick = Vector.ConditionalSelect(Vector.LessThan(trunc, x), trunc + one, trunc);
+                        var result = Vector.ConditionalSelect(Vector.LessThan(Vector.Abs(x), pow2_52), ceilTrick, x);
+                        // Preserve signed zero: Math.Ceiling returns ±0.0 only when x is
+                        // itself ±0.0 (Math.Ceiling(-0.0) = -0.0) — NOT for x in (-1,0),
+                        // where Math.Ceiling(-0.3) = +0.0 (which the int round-trip already
+                        // yields). Pass only the raw ±0.0 input through to keep its sign.
+                        outV[v] = Vector.ConditionalSelect(Vector.Equals(x, zero), x, result);
+                    }
+                    i = simdLen;
+                }
             }
 #endif
             for (; i < length; i++)
@@ -1952,10 +2077,10 @@ namespace AiDotNet.Tensors.Engines.Simd
                 throw new ArgumentException("Input and output spans must have the same length.");
             }
 
+#if NET5_0_OR_GREATER
             int length = result.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 32)
             {
                 int simdLength = length & ~31;
@@ -1991,12 +2116,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector128(result, i, AdvSimd.Subtract(ReadVector128(a, i), ReadVector128(b, i)));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
                 result[i] = a[i] - b[i];
             }
+#else
+            SystemNumericsVectorBridge.VectorSubtract(a, b, result);
+#endif
         }
 
         [MethodImpl(HotInline)]
@@ -2007,10 +2134,10 @@ namespace AiDotNet.Tensors.Engines.Simd
                 throw new ArgumentException("Input and output spans must have the same length.");
             }
 
+#if NET5_0_OR_GREATER
             int length = result.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 32)
             {
                 int simdLength = length & ~31;
@@ -2046,12 +2173,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector128(result, i, AdvSimd.Multiply(ReadVector128(a, i), ReadVector128(b, i)));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
                 result[i] = a[i] * b[i];
             }
+#else
+            SystemNumericsVectorBridge.VectorMultiply(a, b, result);
+#endif
         }
 
         [MethodImpl(HotInline)]
@@ -2062,10 +2191,10 @@ namespace AiDotNet.Tensors.Engines.Simd
                 throw new ArgumentException("Input and output spans must have the same length.");
             }
 
+#if NET5_0_OR_GREATER
             int length = result.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 32)
             {
                 int simdLength = length & ~31;
@@ -2093,12 +2222,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector128(result, i, Sse.Divide(ReadVector128(a, i), ReadVector128(b, i)));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
                 result[i] = a[i] / b[i];
             }
+#else
+            SystemNumericsVectorBridge.VectorDivide(a, b, result);
+#endif
         }
 
         /// <summary>Adds a scalar to each element: result[i] = a[i] + scalar.</summary>
@@ -2110,10 +2241,10 @@ namespace AiDotNet.Tensors.Engines.Simd
                 throw new ArgumentException("Input and output spans must have the same length.");
             }
 
+#if NET5_0_OR_GREATER
             int length = result.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 32)
             {
                 var vs = Vector256.Create(scalar);
@@ -2135,12 +2266,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector256(result, i, Avx.Add(ReadVector256(a, i), vs));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
                 result[i] = a[i] + scalar;
             }
+#else
+            SystemNumericsVectorBridge.AddScalar(a, scalar, result);
+#endif
         }
 
         /// <summary>Multiplies each element by a scalar: result[i] = a[i] * scalar.</summary>
@@ -2152,10 +2285,10 @@ namespace AiDotNet.Tensors.Engines.Simd
                 throw new ArgumentException("Input and output spans must have the same length.");
             }
 
+#if NET5_0_OR_GREATER
             int length = result.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 32)
             {
                 var vs = Vector256.Create(scalar);
@@ -2177,12 +2310,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector256(result, i, Avx.Multiply(ReadVector256(a, i), vs));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
                 result[i] = a[i] * scalar;
             }
+#else
+            SystemNumericsVectorBridge.MultiplyScalar(a, scalar, result);
+#endif
         }
 
         /// <summary>Divides each element by a scalar: result[i] = a[i] / scalar.</summary>
@@ -2208,11 +2343,11 @@ namespace AiDotNet.Tensors.Engines.Simd
                 throw new ArgumentException("Input spans must have the same length.");
             }
 
+#if NET5_0_OR_GREATER
             int length = a.Length;
             int i = 0;
             float sum = 0f;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && Fma.IsSupported && length >= 32)
             {
                 // 4-way parallel accumulation to hide FMA latency (5 cycles on Zen2)
@@ -2269,20 +2404,18 @@ namespace AiDotNet.Tensors.Engines.Simd
 
                 sum += HorizontalSum(vsum);
             }
-#endif
 
             for (; i < length; i++)
             {
-#if NET5_0_OR_GREATER
                 sum = Fma.IsSupported
                     ? MathF.FusedMultiplyAdd(a[i], b[i], sum)
                     : sum + (a[i] * b[i]);
-#else
-                sum += a[i] * b[i];
-#endif
             }
 
             return sum;
+#else
+            return SystemNumericsVectorBridge.Dot(a, b);
+#endif
         }
 
         /// <summary>
@@ -2297,10 +2430,10 @@ namespace AiDotNet.Tensors.Engines.Simd
                 throw new ArgumentException("Input and output spans must have the same length.");
             }
 
+#if NET5_0_OR_GREATER
             int length = result.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 4)
             {
                 var vscalar = Vector256.Create(scalar);
@@ -2335,12 +2468,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector128Double(result, i, AdvSimd.Arm64.Add(va, AdvSimd.Arm64.Multiply(vb, vscalar)));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
                 result[i] = a[i] + scalar * b[i];
             }
+#else
+            SystemNumericsVectorBridge.ScalarMultiplyAdd(a, b, scalar, result);
+#endif
         }
 
         [MethodImpl(HotInline)]
@@ -2351,10 +2486,10 @@ namespace AiDotNet.Tensors.Engines.Simd
                 throw new ArgumentException("Input and output spans must have the same length.");
             }
 
+#if NET5_0_OR_GREATER
             int length = result.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 8)
             {
                 var vscalar = Vector256.Create(scalar);
@@ -2389,12 +2524,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector128(result, i, AdvSimd.Add(va, AdvSimd.Multiply(vb, vscalar)));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
                 result[i] = a[i] + scalar * b[i];
             }
+#else
+            SystemNumericsVectorBridge.ScalarMultiplyAdd(a, b, scalar, result);
+#endif
         }
 
         [MethodImpl(HotInline)]
@@ -2405,10 +2542,10 @@ namespace AiDotNet.Tensors.Engines.Simd
                 throw new ArgumentException("Input and output spans must have the same length.");
             }
 
+#if NET5_0_OR_GREATER
             int length = output.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 32)
             {
                 var vzero = Vector256<float>.Zero;
@@ -2448,12 +2585,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector128(output, i, AdvSimd.Max(ReadVector128(input, i), vzero));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
                 output[i] = input[i] > 0f ? input[i] : 0f;
             }
+#else
+            SystemNumericsVectorBridge.ReLU(input, output);
+#endif
         }
 
         /// <summary>
@@ -2469,10 +2608,10 @@ namespace AiDotNet.Tensors.Engines.Simd
                 throw new ArgumentException("Input and output spans must have the same length.");
             }
 
+#if NET5_0_OR_GREATER
             int length = input.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             // Use Cephes-style fast exp polynomial with explicit AVX2/FMA intrinsics.
             // Note: MKL VML was tested but delegate-based P/Invoke overhead negated the
             // SVML benefit. Our FastExp256 is competitive for float.
@@ -2497,16 +2636,15 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector256(output, i, FastExp256(ReadVector256(input, i)));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
-#if NET5_0_OR_GREATER
                 output[i] = MathF.Exp(input[i]);
-#else
-                output[i] = (float)Math.Exp(input[i]);
-#endif
             }
+#else
+            // net471: BCL Vector<float> Cephes-style exp (audit-2026-05 phase 5 slice 2).
+            SystemNumericsVectorBridge.Exp(input, output);
+#endif
         }
 
 
@@ -2588,10 +2726,10 @@ namespace AiDotNet.Tensors.Engines.Simd
                 throw new ArgumentException("Input and output spans must have the same length.");
             }
 
+#if NET5_0_OR_GREATER
             int length = input.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx2.IsSupported && Fma.IsSupported && length >= 32)
             {
                 int simdLength = length & ~31;
@@ -2612,16 +2750,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector256(output, i, FastSigmoid256(ReadVector256(input, i)));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
-#if NET5_0_OR_GREATER
                 output[i] = 1.0f / (1.0f + MathF.Exp(-input[i]));
-#else
-                output[i] = 1.0f / (1.0f + (float)Math.Exp(-input[i]));
-#endif
             }
+#else
+            SystemNumericsVectorBridge.Sigmoid(input, output);
+#endif
         }
 
         /// <summary>
@@ -2782,10 +2918,10 @@ namespace AiDotNet.Tensors.Engines.Simd
                 throw new ArgumentException("Input and output spans must have the same length.");
             }
 
+#if NET5_0_OR_GREATER
             int length = input.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx2.IsSupported && Fma.IsSupported && length >= 32)
             {
                 var vone = Vector256.Create(1.0f);
@@ -2811,16 +2947,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector256(output, i, Avx.Subtract(Avx.Multiply(vtwo, FastSigmoid256(Avx.Multiply(vtwo, ReadVector256(input, i)))), vone));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
-#if NET5_0_OR_GREATER
                 output[i] = MathF.Tanh(input[i]);
-#else
-                output[i] = (float)Math.Tanh(input[i]);
-#endif
             }
+#else
+            SystemNumericsVectorBridge.Tanh(input, output);
+#endif
         }
 
         /// <summary>
@@ -3484,10 +3618,10 @@ namespace AiDotNet.Tensors.Engines.Simd
                 throw new ArgumentException("Input and output spans must have the same length.");
             }
 
+#if NET5_0_OR_GREATER
             int length = output.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 8)
             {
                 var vzero = Vector256<float>.Zero;
@@ -3530,12 +3664,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector128(output, i, AdvSimd.BitwiseSelect(mask, v, scaled));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
                 output[i] = input[i] > 0f ? input[i] : alpha * input[i];
             }
+#else
+            SystemNumericsVectorBridge.LeakyReLU(input, alpha, output);
+#endif
         }
 
         /// <summary>
@@ -3551,6 +3687,7 @@ namespace AiDotNet.Tensors.Engines.Simd
                 throw new ArgumentException("Input and output spans must have the same length.");
             }
 
+#if NET5_0_OR_GREATER
             // Constants for GELU approximation
             const float sqrt2OverPi = 0.7978845608028654f;
             const float coeff = 0.044715f;
@@ -3559,7 +3696,6 @@ namespace AiDotNet.Tensors.Engines.Simd
             int length = output.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && Fma.IsSupported && length >= 8)
             {
                 var vSqrt2OverPi = Vector256.Create(sqrt2OverPi);
@@ -3580,7 +3716,6 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector256(output, i, Avx.Multiply(vHalf, Avx.Multiply(x, Avx.Add(vOne, tanh_val))));
                 }
             }
-#endif
 
             // Scalar implementation for remaining elements
             for (; i < length; i++)
@@ -3589,13 +3724,13 @@ namespace AiDotNet.Tensors.Engines.Simd
                 float x_cubed = x * x * x;
                 float inner = x + coeff * x_cubed;
                 float tanh_arg = sqrt2OverPi * inner;
-#if NET5_0_OR_GREATER
                 float tanh_val = MathF.Tanh(tanh_arg);
-#else
-                float tanh_val = (float)Math.Tanh(tanh_arg);
-#endif
                 output[i] = half * x * (1f + tanh_val);
             }
+#else
+            // net471: BCL Vector<float> GELU (tanh approximation) — audit-2026-05 phase 5 slice 2.
+            SystemNumericsVectorBridge.GELU(input, output);
+#endif
         }
 
         /// <summary>
@@ -3683,10 +3818,10 @@ namespace AiDotNet.Tensors.Engines.Simd
                 throw new ArgumentException("Input and output spans must have the same length.");
             }
 
+#if NET5_0_OR_GREATER
             int length = output.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx2.IsSupported && Fma.IsSupported && length >= 8)
             {
                 var vzero = Vector256<float>.Zero;
@@ -3706,7 +3841,6 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector256(output, i, Avx.BlendVariable(negResult, x, mask));
                 }
             }
-#endif
 
             // Scalar fallback
             for (; i < length; i++)
@@ -3718,23 +3852,23 @@ namespace AiDotNet.Tensors.Engines.Simd
                 }
                 else
                 {
-#if NET5_0_OR_GREATER
                     output[i] = alpha * (MathF.Exp(x) - 1f);
-#else
-                    output[i] = alpha * ((float)Math.Exp(x) - 1f);
-#endif
                 }
             }
+#else
+            // net471: BCL Vector<float> ELU — audit-2026-05 phase 5 slice 2.
+            SystemNumericsVectorBridge.ELU(input, alpha, output);
+#endif
         }
 
         [MethodImpl(HotInline)]
         public static float Sum(ReadOnlySpan<float> data)
         {
+#if NET5_0_OR_GREATER
             int length = data.Length;
             int i = 0;
             float sum = 0f;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 32)
             {
                 // 4-way parallel accumulation to hide add latency (3 cycles on Zen2)
@@ -3786,7 +3920,6 @@ namespace AiDotNet.Tensors.Engines.Simd
 
                 sum += HorizontalSum(vsum);
             }
-#endif
 
             for (; i < length; i++)
             {
@@ -3794,6 +3927,9 @@ namespace AiDotNet.Tensors.Engines.Simd
             }
 
             return sum;
+#else
+            return SystemNumericsVectorBridge.Sum(data);
+#endif
         }
 
         /// <summary>
@@ -4157,10 +4293,10 @@ namespace AiDotNet.Tensors.Engines.Simd
                 throw new ArgumentException("Input and output spans must have the same length.");
             }
 
+#if NET5_0_OR_GREATER
             int length = input.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx2.IsSupported && Fma.IsSupported && length >= 8)
             {
                 int simdLength = i + ((length - i) & ~7);
@@ -4169,16 +4305,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector256(output, i, FastSin256(ReadVector256(input, i)));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
-#if NET5_0_OR_GREATER
                 output[i] = MathF.Sin(input[i]);
-#else
-                output[i] = (float)Math.Sin(input[i]);
-#endif
             }
+#else
+            SystemNumericsVectorBridge.Sin(input, output);
+#endif
         }
 
         /// <summary>
@@ -4195,10 +4329,10 @@ namespace AiDotNet.Tensors.Engines.Simd
                 throw new ArgumentException("Input and output spans must have the same length.");
             }
 
+#if NET5_0_OR_GREATER
             int length = input.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx2.IsSupported && Fma.IsSupported && length >= 8)
             {
                 int simdLength = i + ((length - i) & ~7);
@@ -4207,16 +4341,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector256(output, i, FastCos256(ReadVector256(input, i)));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
-#if NET5_0_OR_GREATER
                 output[i] = MathF.Cos(input[i]);
-#else
-                output[i] = (float)Math.Cos(input[i]);
-#endif
             }
+#else
+            SystemNumericsVectorBridge.Cos(input, output);
+#endif
         }
 
         /// <summary>
@@ -4384,10 +4516,10 @@ namespace AiDotNet.Tensors.Engines.Simd
             if (input.Length != output.Length)
                 throw new ArgumentException("Input and output spans must have the same length.");
 
+#if NET5_0_OR_GREATER
             int length = input.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             // FastLog256 polynomial (MKL VML tested but delegate overhead negated benefit).
             if (Avx2.IsSupported && Fma.IsSupported && length >= 32)
             {
@@ -4409,16 +4541,15 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector256(output, i, FastLog256(ReadVector256(input, i)));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
-#if NET5_0_OR_GREATER
                 output[i] = MathF.Log(input[i]);
-#else
-                output[i] = (float)Math.Log(input[i]);
-#endif
             }
+#else
+            // net471: BCL Vector<float> Cephes-style log — audit-2026-05 phase 5 slice 2.
+            SystemNumericsVectorBridge.Log(input, output);
+#endif
         }
 
         /// <summary>Element-wise natural log for double precision.</summary>
@@ -4556,10 +4687,10 @@ namespace AiDotNet.Tensors.Engines.Simd
             if (input.Length != output.Length)
                 throw new ArgumentException("Input and output spans must have the same length.");
 
+#if NET5_0_OR_GREATER
             int length = input.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 8)
             {
                 int simdLength = length & ~7;
@@ -4576,16 +4707,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector128(output, i, Sse.Sqrt(ReadVector128(input, i)));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
-#if NET5_0_OR_GREATER
                 output[i] = MathF.Sqrt(input[i]);
-#else
-                output[i] = (float)Math.Sqrt(input[i]);
-#endif
             }
+#else
+            SystemNumericsVectorBridge.Sqrt(input, output);
+#endif
         }
 
         /// <summary>Element-wise square root for double precision.</summary>
@@ -4595,10 +4724,10 @@ namespace AiDotNet.Tensors.Engines.Simd
             if (input.Length != output.Length)
                 throw new ArgumentException("Input and output spans must have the same length.");
 
+#if NET5_0_OR_GREATER
             int length = input.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 4)
             {
                 int simdLength = length & ~3;
@@ -4607,12 +4736,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector256Double(output, i, Avx.Sqrt(ReadVector256Double(input, i)));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
                 output[i] = Math.Sqrt(input[i]);
             }
+#else
+            SystemNumericsVectorBridge.Sqrt(input, output);
+#endif
         }
 
         /// <summary>Element-wise absolute value using AVX bitwise AND with sign mask.</summary>
@@ -4622,10 +4753,10 @@ namespace AiDotNet.Tensors.Engines.Simd
             if (input.Length != output.Length)
                 throw new ArgumentException("Input and output spans must have the same length.");
 
+#if NET5_0_OR_GREATER
             int length = input.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 8)
             {
                 // Clear sign bit: AND with 0x7FFFFFFF
@@ -4636,12 +4767,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector256(output, i, Avx.And(ReadVector256(input, i), signMask));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
                 output[i] = Math.Abs(input[i]);
             }
+#else
+            SystemNumericsVectorBridge.Abs(input, output);
+#endif
         }
 
         /// <summary>Element-wise absolute value for double precision.</summary>
@@ -4651,10 +4784,10 @@ namespace AiDotNet.Tensors.Engines.Simd
             if (input.Length != output.Length)
                 throw new ArgumentException("Input and output spans must have the same length.");
 
+#if NET5_0_OR_GREATER
             int length = input.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 4)
             {
                 var signMask = Vector256.Create(0x7FFFFFFFFFFFFFFFL).AsDouble();
@@ -4664,12 +4797,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector256Double(output, i, Avx.And(ReadVector256Double(input, i), signMask));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
                 output[i] = Math.Abs(input[i]);
             }
+#else
+            SystemNumericsVectorBridge.Abs(input, output);
+#endif
         }
 
         /// <summary>Element-wise negation using AVX XOR with sign bit.</summary>
@@ -4679,10 +4814,10 @@ namespace AiDotNet.Tensors.Engines.Simd
             if (input.Length != output.Length)
                 throw new ArgumentException("Input and output spans must have the same length.");
 
+#if NET5_0_OR_GREATER
             int length = input.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 8)
             {
                 var vzero = Vector256<float>.Zero;
@@ -4692,12 +4827,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector256(output, i, Avx.Subtract(vzero, ReadVector256(input, i)));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
                 output[i] = -input[i];
             }
+#else
+            SystemNumericsVectorBridge.Negate(input, output);
+#endif
         }
 
         /// <summary>Element-wise negation for double precision.</summary>
@@ -4707,10 +4844,10 @@ namespace AiDotNet.Tensors.Engines.Simd
             if (input.Length != output.Length)
                 throw new ArgumentException("Input and output spans must have the same length.");
 
+#if NET5_0_OR_GREATER
             int length = input.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 4)
             {
                 var vzero = Vector256<double>.Zero;
@@ -4720,12 +4857,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector256Double(output, i, Avx.Subtract(vzero, ReadVector256Double(input, i)));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
                 output[i] = -input[i];
             }
+#else
+            SystemNumericsVectorBridge.Negate(input, output);
+#endif
         }
 
         /// <summary>Element-wise clamp to [min, max] range.</summary>
@@ -4735,10 +4874,10 @@ namespace AiDotNet.Tensors.Engines.Simd
             if (input.Length != output.Length)
                 throw new ArgumentException("Input and output spans must have the same length.");
 
+#if NET5_0_OR_GREATER
             int length = input.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 8)
             {
                 var vmin = Vector256.Create(min);
@@ -4749,12 +4888,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector256(output, i, Avx.Max(vmin, Avx.Min(vmax, ReadVector256(input, i))));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
                 output[i] = input[i] < min ? min : (input[i] > max ? max : input[i]);
             }
+#else
+            SystemNumericsVectorBridge.Clamp(input, min, max, output);
+#endif
         }
 
         /// <summary>Element-wise power: result[i] = base[i] ^ exp[i].</summary>
@@ -4812,10 +4953,10 @@ namespace AiDotNet.Tensors.Engines.Simd
             if (baseValues.Length != output.Length)
                 throw new ArgumentException("Input and output spans must have the same length.");
 
+#if NET5_0_OR_GREATER
             int length = baseValues.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             // pow(x, y) = exp(y * log(x)) — only valid for positive bases
             if (Avx2.IsSupported && Fma.IsSupported && length >= 8)
             {
@@ -4835,16 +4976,15 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector256(output, i, FastExp256(Avx.Multiply(vExp, logBase)));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
-#if NET5_0_OR_GREATER
                 output[i] = MathF.Pow(baseValues[i], exponent);
-#else
-                output[i] = (float)Math.Pow(baseValues[i], exponent);
-#endif
             }
+#else
+            // net471: BCL Vector<float> exp(exponent*log(x)); non-positive lanes fall to libm.
+            SystemNumericsVectorBridge.Pow(baseValues, exponent, output);
+#endif
         }
 
         /// <summary>Element-wise clamp to [min, max] range for double precision.</summary>
@@ -4854,10 +4994,10 @@ namespace AiDotNet.Tensors.Engines.Simd
             if (input.Length != output.Length)
                 throw new ArgumentException("Input and output spans must have the same length.");
 
+#if NET5_0_OR_GREATER
             int length = input.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 4)
             {
                 var vmin = Vector256.Create(min);
@@ -4868,12 +5008,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector256Double(output, i, Avx.Max(vmin, Avx.Min(vmax, ReadVector256Double(input, i))));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
                 output[i] = input[i] < min ? min : (input[i] > max ? max : input[i]);
             }
+#else
+            SystemNumericsVectorBridge.Clamp(input, min, max, output);
+#endif
         }
 
         /// <summary>Element-wise power with scalar exponent for double precision.</summary>
@@ -4947,11 +5089,11 @@ namespace AiDotNet.Tensors.Engines.Simd
         {
             if (data.Length == 0) throw new ArgumentException("Span must not be empty.");
 
+#if NET5_0_OR_GREATER
             int length = data.Length;
             int i = 0;
             float max = float.NegativeInfinity;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 32)
             {
                 var vmax0 = Vector256.Create(float.NegativeInfinity);
@@ -4980,7 +5122,6 @@ namespace AiDotNet.Tensors.Engines.Simd
                 }
                 max = HorizontalMax(vmax);
             }
-#endif
 
             for (; i < length; i++)
             {
@@ -4988,6 +5129,9 @@ namespace AiDotNet.Tensors.Engines.Simd
             }
 
             return max;
+#else
+            return SystemNumericsVectorBridge.Max(data);
+#endif
         }
 
         /// <summary>Returns the minimum value in the span with 4-way accumulation.</summary>
@@ -4996,11 +5140,11 @@ namespace AiDotNet.Tensors.Engines.Simd
         {
             if (data.Length == 0) throw new ArgumentException("Span must not be empty.");
 
+#if NET5_0_OR_GREATER
             int length = data.Length;
             int i = 0;
             float min = float.PositiveInfinity;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 32)
             {
                 var vmin0 = Vector256.Create(float.PositiveInfinity);
@@ -5029,7 +5173,6 @@ namespace AiDotNet.Tensors.Engines.Simd
                 }
                 min = HorizontalMin(vmin);
             }
-#endif
 
             for (; i < length; i++)
             {
@@ -5037,6 +5180,9 @@ namespace AiDotNet.Tensors.Engines.Simd
             }
 
             return min;
+#else
+            return SystemNumericsVectorBridge.Min(data);
+#endif
         }
 
         /// <summary>Cosine similarity: dot(a,b) / (||a|| * ||b||).</summary>
@@ -5069,10 +5215,10 @@ namespace AiDotNet.Tensors.Engines.Simd
             if (a.Length != b.Length || a.Length != result.Length)
                 throw new ArgumentException("Input and output spans must have the same length.");
 
+#if NET5_0_OR_GREATER
             int length = result.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 16)
             {
                 int simdLength = length & ~15;
@@ -5092,12 +5238,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector256Double(result, i, Avx.Add(ReadVector256Double(a, i), ReadVector256Double(b, i)));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
                 result[i] = a[i] + b[i];
             }
+#else
+            SystemNumericsVectorBridge.VectorAdd(a, b, result);
+#endif
         }
 
         /// <summary>Element-wise subtraction for double precision with 4x unrolling.</summary>
@@ -5107,10 +5255,10 @@ namespace AiDotNet.Tensors.Engines.Simd
             if (a.Length != b.Length || a.Length != result.Length)
                 throw new ArgumentException("Input and output spans must have the same length.");
 
+#if NET5_0_OR_GREATER
             int length = result.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 16)
             {
                 int simdLength = length & ~15;
@@ -5130,12 +5278,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector256Double(result, i, Avx.Subtract(ReadVector256Double(a, i), ReadVector256Double(b, i)));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
                 result[i] = a[i] - b[i];
             }
+#else
+            SystemNumericsVectorBridge.VectorSubtract(a, b, result);
+#endif
         }
 
         /// <summary>Element-wise multiplication for double precision with 4x unrolling.</summary>
@@ -5145,10 +5295,10 @@ namespace AiDotNet.Tensors.Engines.Simd
             if (a.Length != b.Length || a.Length != result.Length)
                 throw new ArgumentException("Input and output spans must have the same length.");
 
+#if NET5_0_OR_GREATER
             int length = result.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 16)
             {
                 int simdLength = length & ~15;
@@ -5168,12 +5318,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector256Double(result, i, Avx.Multiply(ReadVector256Double(a, i), ReadVector256Double(b, i)));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
                 result[i] = a[i] * b[i];
             }
+#else
+            SystemNumericsVectorBridge.VectorMultiply(a, b, result);
+#endif
         }
 
         /// <summary>Element-wise division for double precision.</summary>
@@ -5183,10 +5335,10 @@ namespace AiDotNet.Tensors.Engines.Simd
             if (a.Length != b.Length || a.Length != result.Length)
                 throw new ArgumentException("Input and output spans must have the same length.");
 
+#if NET5_0_OR_GREATER
             int length = result.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 16)
             {
                 int simdLength = length & ~15;
@@ -5206,12 +5358,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector256Double(result, i, Avx.Divide(ReadVector256Double(a, i), ReadVector256Double(b, i)));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
                 result[i] = a[i] / b[i];
             }
+#else
+            SystemNumericsVectorBridge.VectorDivide(a, b, result);
+#endif
         }
 
         /// <summary>Adds a scalar to each double element.</summary>
@@ -5221,10 +5375,10 @@ namespace AiDotNet.Tensors.Engines.Simd
             if (a.Length != result.Length)
                 throw new ArgumentException("Input and output spans must have the same length.");
 
+#if NET5_0_OR_GREATER
             int length = result.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 16)
             {
                 var vs = Vector256.Create(scalar);
@@ -5246,12 +5400,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector256Double(result, i, Avx.Add(ReadVector256Double(a, i), vs));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
                 result[i] = a[i] + scalar;
             }
+#else
+            SystemNumericsVectorBridge.AddScalar(a, scalar, result);
+#endif
         }
 
         /// <summary>Multiplies each double element by a scalar.</summary>
@@ -5261,10 +5417,10 @@ namespace AiDotNet.Tensors.Engines.Simd
             if (a.Length != result.Length)
                 throw new ArgumentException("Input and output spans must have the same length.");
 
+#if NET5_0_OR_GREATER
             int length = result.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 16)
             {
                 var vs = Vector256.Create(scalar);
@@ -5286,12 +5442,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector256Double(result, i, Avx.Multiply(ReadVector256Double(a, i), vs));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
                 result[i] = a[i] * scalar;
             }
+#else
+            SystemNumericsVectorBridge.MultiplyScalar(a, scalar, result);
+#endif
         }
 
         /// <summary>
@@ -5780,11 +5938,11 @@ namespace AiDotNet.Tensors.Engines.Simd
         [MethodImpl(HotInline)]
         public static double Sum(ReadOnlySpan<double> data)
         {
+#if NET5_0_OR_GREATER
             int length = data.Length;
             int i = 0;
             double sum = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 16)
             {
                 var vsum0 = Vector256<double>.Zero;
@@ -5812,7 +5970,6 @@ namespace AiDotNet.Tensors.Engines.Simd
                 }
                 sum += HorizontalSum(vsum);
             }
-#endif
 
             for (; i < length; i++)
             {
@@ -5820,6 +5977,9 @@ namespace AiDotNet.Tensors.Engines.Simd
             }
 
             return sum;
+#else
+            return SystemNumericsVectorBridge.Sum(data);
+#endif
         }
 
         /// <summary>Dot product for double precision.</summary>
@@ -5829,11 +5989,11 @@ namespace AiDotNet.Tensors.Engines.Simd
             if (a.Length != b.Length)
                 throw new ArgumentException("Input spans must have the same length.");
 
+#if NET5_0_OR_GREATER
             int length = a.Length;
             int i = 0;
             double sum = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 16)
             {
                 var vsum0 = Vector256<double>.Zero;
@@ -5871,20 +6031,18 @@ namespace AiDotNet.Tensors.Engines.Simd
                 }
                 sum += HorizontalSum(vsum);
             }
-#endif
 
             for (; i < length; i++)
             {
-#if NET5_0_OR_GREATER
                 sum = Fma.IsSupported
                     ? Math.FusedMultiplyAdd(a[i], b[i], sum)
                     : sum + (a[i] * b[i]);
-#else
-                sum += a[i] * b[i];
-#endif
             }
 
             return sum;
+#else
+            return SystemNumericsVectorBridge.Dot(a, b);
+#endif
         }
 
         /// <summary>Max for double precision.</summary>
@@ -5892,12 +6050,16 @@ namespace AiDotNet.Tensors.Engines.Simd
         public static double Max(ReadOnlySpan<double> data)
         {
             if (data.Length == 0) throw new ArgumentException("Span must not be empty.");
+#if NET5_0_OR_GREATER
             double max = double.NegativeInfinity;
             for (int i = 0; i < data.Length; i++)
             {
                 if (data[i] > max) max = data[i];
             }
             return max;
+#else
+            return SystemNumericsVectorBridge.Max(data);
+#endif
         }
 
         /// <summary>Min for double precision.</summary>
@@ -5905,12 +6067,16 @@ namespace AiDotNet.Tensors.Engines.Simd
         public static double Min(ReadOnlySpan<double> data)
         {
             if (data.Length == 0) throw new ArgumentException("Span must not be empty.");
+#if NET5_0_OR_GREATER
             double min = double.PositiveInfinity;
             for (int i = 0; i < data.Length; i++)
             {
                 if (data[i] < min) min = data[i];
             }
             return min;
+#else
+            return SystemNumericsVectorBridge.Min(data);
+#endif
         }
 
         /// <summary>Cosine similarity for double precision.</summary>
@@ -5985,10 +6151,10 @@ namespace AiDotNet.Tensors.Engines.Simd
                 throw new ArgumentException("Input and output spans must have the same length.");
             }
 
+#if NET5_0_OR_GREATER
             int length = output.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 4)
             {
                 var vzero = Vector256<double>.Zero;
@@ -6009,12 +6175,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                     WriteVector128Double(output, i, Sse2.Max(v, vzero));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
                 output[i] = input[i] > 0 ? input[i] : 0;
             }
+#else
+            SystemNumericsVectorBridge.ReLU(input, output);
+#endif
         }
 
         /// <summary>
@@ -6029,10 +6197,10 @@ namespace AiDotNet.Tensors.Engines.Simd
                 throw new ArgumentException("Input and output spans must have the same length.");
             }
 
+#if NET5_0_OR_GREATER
             int length = output.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 4)
             {
                 var vzero = Vector256<double>.Zero;
@@ -6062,12 +6230,14 @@ namespace AiDotNet.Tensors.Engines.Simd
                         : Sse2.Or(Sse2.And(mask, v), Sse2.AndNot(mask, scaled)));
                 }
             }
-#endif
 
             for (; i < length; i++)
             {
                 output[i] = input[i] > 0 ? input[i] : alpha * input[i];
             }
+#else
+            SystemNumericsVectorBridge.LeakyReLU(input, alpha, output);
+#endif
         }
 
         /// <summary>
@@ -7436,6 +7606,38 @@ namespace AiDotNet.Tensors.Engines.Simd
                     Avx.Store(output + i, Avx.Multiply(g, derivative));
                 }
             }
+#else
+            // net471 §E: BCL Vector<float> GELU' = grad · [0.5(1+tanh k) + 0.5·x·sech²(k)·k'],
+            // tanh via the bridge's FastExp-based FastTanh (slice 2 unblocked this).
+            {
+                int lanes = Vector<float>.Count;
+                int simdLen = length - (length % lanes);
+                if (simdLen > 0)
+                {
+                    var vSqrtTwoPi = new Vector<float>(sqrtTwoPi);
+                    var vCoeff = new Vector<float>(coeff);
+                    var vThreeCoeff = new Vector<float>(3f * coeff);
+                    var vHalf = new Vector<float>(0.5f);
+                    var vOne = Vector<float>.One;
+                    var xVecs = MemoryMarshal.Cast<float, Vector<float>>(new ReadOnlySpan<float>(input, simdLen));
+                    var gVecs = MemoryMarshal.Cast<float, Vector<float>>(new ReadOnlySpan<float>(grad, simdLen));
+                    var oVecs = MemoryMarshal.Cast<float, Vector<float>>(new Span<float>(output, simdLen));
+                    for (int v = 0; v < xVecs.Length; v++)
+                    {
+                        var x = xVecs[v];
+                        var x2 = x * x;
+                        var x3 = x2 * x;
+                        var inner = vSqrtTwoPi * (x + vCoeff * x3);
+                        var tanhK = SystemNumericsVectorBridge.FastTanh(inner);
+                        var sech2 = vOne - tanhK * tanhK;
+                        var kPrime = vSqrtTwoPi * (vOne + vThreeCoeff * x2);
+                        var term1 = vHalf * (vOne + tanhK);
+                        var term2 = vHalf * (x * sech2 * kPrime);
+                        oVecs[v] = gVecs[v] * (term1 + term2);
+                    }
+                    i = simdLen;
+                }
+            }
 #endif
             for (; i < length; i++)
             {
@@ -8055,6 +8257,35 @@ namespace AiDotNet.Tensors.Engines.Simd
                     Avx.Store(output + i, Avx.Multiply(g, derivative));
                 }
             }
+#else
+            // net471 §E: BCL Vector<double> GELU', tanh via FastTanhDouble.
+            {
+                int lanes = Vector<double>.Count;
+                int simdLen = length - (length % lanes);
+                if (simdLen > 0)
+                {
+                    var vSqrt2OverPi = new Vector<double>(0.7978845608028654);
+                    var vCoeff = new Vector<double>(0.044715);
+                    var vThreeCoeff = new Vector<double>(3.0 * 0.044715);
+                    var vHalf = new Vector<double>(0.5);
+                    var vOne = Vector<double>.One;
+                    var xVecs = MemoryMarshal.Cast<double, Vector<double>>(new ReadOnlySpan<double>(input, simdLen));
+                    var gVecs = MemoryMarshal.Cast<double, Vector<double>>(new ReadOnlySpan<double>(grad, simdLen));
+                    var oVecs = MemoryMarshal.Cast<double, Vector<double>>(new Span<double>(output, simdLen));
+                    for (int v = 0; v < xVecs.Length; v++)
+                    {
+                        var x = xVecs[v];
+                        var x2 = x * x;
+                        var inner = x + vCoeff * x2 * x;
+                        var t = SystemNumericsVectorBridge.FastTanhDouble(vSqrt2OverPi * inner);
+                        var sechSq = vOne - t * t;
+                        var dArgDx = vSqrt2OverPi * (vOne + vThreeCoeff * x2);
+                        var derivative = vHalf * (vOne + t) + vHalf * (x * sechSq * dArgDx);
+                        oVecs[v] = gVecs[v] * derivative;
+                    }
+                    i = simdLen;
+                }
+            }
 #endif
             for (; i < length; i++)
             {
@@ -8221,6 +8452,22 @@ namespace AiDotNet.Tensors.Engines.Simd
                     sum4 = Sse.AddScalar(sum4, Sse.Shuffle(sum4, sum4, 0x01));
                     dot = sum4.ToScalar();
                 }
+#else
+                // net471 §E: BCL Vector<float> reduction for dot(grad, softmax).
+                {
+                    int lanes = Vector<float>.Count;
+                    int simdLen = features - (features % lanes);
+                    if (simdLen > 0)
+                    {
+                        var gVecs = MemoryMarshal.Cast<float, Vector<float>>(new ReadOnlySpan<float>(grad + offset, simdLen));
+                        var sVecs = MemoryMarshal.Cast<float, Vector<float>>(new ReadOnlySpan<float>(softmaxOutput + offset, simdLen));
+                        var acc = Vector<float>.Zero;
+                        for (int v = 0; v < gVecs.Length; v++)
+                            acc += gVecs[v] * sVecs[v];
+                        dot = Vector.Dot(acc, Vector<float>.One);
+                        j = simdLen;
+                    }
+                }
 #endif
                 for (; j < features; j++)
                     dot += grad[offset + j] * softmaxOutput[offset + j];
@@ -8238,6 +8485,22 @@ namespace AiDotNet.Tensors.Engines.Simd
                         var g = Avx.LoadVector256(grad + offset + j);
                         var diff = Avx.Subtract(g, vDotBroadcast);
                         Avx.Store(output + offset + j, Avx.Multiply(s, diff));
+                    }
+                }
+#else
+                // net471 §E: BCL Vector<float> elementwise softmax[i]*(grad[i]-dot).
+                {
+                    int lanes = Vector<float>.Count;
+                    int simdLen = features - (features % lanes);
+                    if (simdLen > 0)
+                    {
+                        var sVecs = MemoryMarshal.Cast<float, Vector<float>>(new ReadOnlySpan<float>(softmaxOutput + offset, simdLen));
+                        var gVecs = MemoryMarshal.Cast<float, Vector<float>>(new ReadOnlySpan<float>(grad + offset, simdLen));
+                        var oVecs = MemoryMarshal.Cast<float, Vector<float>>(new Span<float>(output + offset, simdLen));
+                        var vDot = new Vector<float>(dot);
+                        for (int v = 0; v < sVecs.Length; v++)
+                            oVecs[v] = sVecs[v] * (gVecs[v] - vDot);
+                        j = simdLen;
                     }
                 }
 #endif
@@ -8263,35 +8526,85 @@ namespace AiDotNet.Tensors.Engines.Simd
             {
                 float m = mean[c];
                 float invStd = 1.0f / MathF.Sqrt(variance[c] + epsilon);
-                float gGamma = 0, gBeta = 0;
                 float sumGradXhat = 0, sumGrad = 0;
 
-                // Pass 1: accumulate gradGamma, gradBeta, and intermediate sums
+                // Pass 1: reductions over (b, s). The inner spatial loop is
+                // contiguous (idx = base + s), so net471 vectorizes it.
                 for (int b = 0; b < batchSize; b++)
                 {
-                    for (int s = 0; s < spatialSize; s++)
+                    int baseIdx = (b * channels + c) * spatialSize;
+                    int s = 0;
+#if !NET5_0_OR_GREATER
+                    // net471 §E: BCL Vector<float> reduction over the spatial run.
                     {
-                        int idx = (b * channels + c) * spatialSize + s;
-                        float go = gradOutput[idx];
-                        float xhat = (input[idx] - m) * invStd;
-                        gGamma += go * xhat;
-                        gBeta += go;
+                        int lanes = Vector<float>.Count;
+                        int simdLen = spatialSize - (spatialSize % lanes);
+                        if (simdLen > 0)
+                        {
+                            var vm = new Vector<float>(m);
+                            var vinv = new Vector<float>(invStd);
+                            var goV = MemoryMarshal.Cast<float, Vector<float>>(new ReadOnlySpan<float>(gradOutput + baseIdx, simdLen));
+                            var inV = MemoryMarshal.Cast<float, Vector<float>>(new ReadOnlySpan<float>(input + baseIdx, simdLen));
+                            var accXhat = Vector<float>.Zero;
+                            var accGo = Vector<float>.Zero;
+                            for (int v = 0; v < goV.Length; v++)
+                            {
+                                var xhat = (inV[v] - vm) * vinv;
+                                accXhat += goV[v] * xhat;
+                                accGo += goV[v];
+                            }
+                            sumGradXhat += Vector.Dot(accXhat, Vector<float>.One);
+                            sumGrad += Vector.Dot(accGo, Vector<float>.One);
+                            s = simdLen;
+                        }
+                    }
+#endif
+                    for (; s < spatialSize; s++)
+                    {
+                        float go = gradOutput[baseIdx + s];
+                        float xhat = (input[baseIdx + s] - m) * invStd;
                         sumGradXhat += go * xhat;
                         sumGrad += go;
                     }
                 }
-                gradGamma[c] = gGamma;
-                gradBeta[c] = gBeta;
+                gradGamma[c] = sumGradXhat;
+                gradBeta[c] = sumGrad;
 
                 // Pass 2: compute gradInput
                 float g = gamma[c];
                 for (int b = 0; b < batchSize; b++)
                 {
-                    for (int s = 0; s < spatialSize; s++)
+                    int baseIdx = (b * channels + c) * spatialSize;
+                    int s = 0;
+#if !NET5_0_OR_GREATER
+                    // net471 §E: BCL Vector<float> elementwise gradInput.
                     {
-                        int idx = (b * channels + c) * spatialSize + s;
-                        float xhat = (input[idx] - m) * invStd;
-                        gradInput[idx] = g * invStd * (gradOutput[idx] - invN * (sumGrad + xhat * sumGradXhat));
+                        int lanes = Vector<float>.Count;
+                        int simdLen = spatialSize - (spatialSize % lanes);
+                        if (simdLen > 0)
+                        {
+                            var vm = new Vector<float>(m);
+                            var vinv = new Vector<float>(invStd);
+                            var vg = new Vector<float>(g);
+                            var vinvN = new Vector<float>(invN);
+                            var vSumGrad = new Vector<float>(sumGrad);
+                            var vSumXhat = new Vector<float>(sumGradXhat);
+                            var goV = MemoryMarshal.Cast<float, Vector<float>>(new ReadOnlySpan<float>(gradOutput + baseIdx, simdLen));
+                            var inV = MemoryMarshal.Cast<float, Vector<float>>(new ReadOnlySpan<float>(input + baseIdx, simdLen));
+                            var giV = MemoryMarshal.Cast<float, Vector<float>>(new Span<float>(gradInput + baseIdx, simdLen));
+                            for (int v = 0; v < goV.Length; v++)
+                            {
+                                var xhat = (inV[v] - vm) * vinv;
+                                giV[v] = vg * vinv * (goV[v] - vinvN * (vSumGrad + xhat * vSumXhat));
+                            }
+                            s = simdLen;
+                        }
+                    }
+#endif
+                    for (; s < spatialSize; s++)
+                    {
+                        float xhat = (input[baseIdx + s] - m) * invStd;
+                        gradInput[baseIdx + s] = g * invStd * (gradOutput[baseIdx + s] - invN * (sumGrad + xhat * sumGradXhat));
                     }
                 }
             }
@@ -8320,17 +8633,69 @@ namespace AiDotNet.Tensors.Engines.Simd
                 float m = mean[b];
                 float invStd = 1.0f / MathF.Sqrt(variance[b] + epsilon);
 
-                // Accumulate gradGamma and gradBeta
-                for (int i = 0; i < normSize; i++)
+                // Pass 1: accumulate gradGamma[i] += go·xhat, gradBeta[i] += go
+                int i = 0;
+#if !NET5_0_OR_GREATER
+                // net471 §E: BCL Vector<float> elementwise accumulation.
+                {
+                    int lanes = Vector<float>.Count;
+                    int simdLen = normSize - (normSize % lanes);
+                    if (simdLen > 0)
+                    {
+                        var vm = new Vector<float>(m);
+                        var vinv = new Vector<float>(invStd);
+                        var goV = MemoryMarshal.Cast<float, Vector<float>>(new ReadOnlySpan<float>(gradOutput + offset, simdLen));
+                        var inV = MemoryMarshal.Cast<float, Vector<float>>(new ReadOnlySpan<float>(input + offset, simdLen));
+                        var ggV = MemoryMarshal.Cast<float, Vector<float>>(new Span<float>(gradGamma, simdLen));
+                        var gbV = MemoryMarshal.Cast<float, Vector<float>>(new Span<float>(gradBeta, simdLen));
+                        for (int v = 0; v < goV.Length; v++)
+                        {
+                            var xhat = (inV[v] - vm) * vinv;
+                            ggV[v] += goV[v] * xhat;
+                            gbV[v] += goV[v];
+                        }
+                        i = simdLen;
+                    }
+                }
+#endif
+                for (; i < normSize; i++)
                 {
                     float xhat = (input[offset + i] - m) * invStd;
                     gradGamma[i] += gradOutput[offset + i] * xhat;
                     gradBeta[i] += gradOutput[offset + i];
                 }
 
-                // Compute intermediate sums for gradInput
+                // Pass 2: intermediate sums ds = Σ go·γ·xhat, db = Σ go·γ
                 float ds = 0, db = 0;
-                for (int i = 0; i < normSize; i++)
+                i = 0;
+#if !NET5_0_OR_GREATER
+                // net471 §E: BCL Vector<float> reduction.
+                {
+                    int lanes = Vector<float>.Count;
+                    int simdLen = normSize - (normSize % lanes);
+                    if (simdLen > 0)
+                    {
+                        var vm = new Vector<float>(m);
+                        var vinv = new Vector<float>(invStd);
+                        var goV = MemoryMarshal.Cast<float, Vector<float>>(new ReadOnlySpan<float>(gradOutput + offset, simdLen));
+                        var inV = MemoryMarshal.Cast<float, Vector<float>>(new ReadOnlySpan<float>(input + offset, simdLen));
+                        var gaV = MemoryMarshal.Cast<float, Vector<float>>(new ReadOnlySpan<float>(gamma, simdLen));
+                        var accDs = Vector<float>.Zero;
+                        var accDb = Vector<float>.Zero;
+                        for (int v = 0; v < goV.Length; v++)
+                        {
+                            var go = goV[v] * gaV[v];
+                            var xhat = (inV[v] - vm) * vinv;
+                            accDs += go * xhat;
+                            accDb += go;
+                        }
+                        ds = Vector.Dot(accDs, Vector<float>.One);
+                        db = Vector.Dot(accDb, Vector<float>.One);
+                        i = simdLen;
+                    }
+                }
+#endif
+                for (; i < normSize; i++)
                 {
                     float go = gradOutput[offset + i] * gamma[i];
                     float xhat = (input[offset + i] - m) * invStd;
@@ -8338,9 +8703,35 @@ namespace AiDotNet.Tensors.Engines.Simd
                     db += go;
                 }
 
-                // gradInput
+                // Pass 3: gradInput
                 float invN = 1.0f / normSize;
-                for (int i = 0; i < normSize; i++)
+                i = 0;
+#if !NET5_0_OR_GREATER
+                // net471 §E: BCL Vector<float> elementwise gradInput.
+                {
+                    int lanes = Vector<float>.Count;
+                    int simdLen = normSize - (normSize % lanes);
+                    if (simdLen > 0)
+                    {
+                        var vm = new Vector<float>(m);
+                        var vinv = new Vector<float>(invStd);
+                        var vds = new Vector<float>(ds);
+                        var vdb = new Vector<float>(db);
+                        var vinvN = new Vector<float>(invN);
+                        var goV = MemoryMarshal.Cast<float, Vector<float>>(new ReadOnlySpan<float>(gradOutput + offset, simdLen));
+                        var inV = MemoryMarshal.Cast<float, Vector<float>>(new ReadOnlySpan<float>(input + offset, simdLen));
+                        var gaV = MemoryMarshal.Cast<float, Vector<float>>(new ReadOnlySpan<float>(gamma, simdLen));
+                        var giV = MemoryMarshal.Cast<float, Vector<float>>(new Span<float>(gradInput + offset, simdLen));
+                        for (int v = 0; v < goV.Length; v++)
+                        {
+                            var xhat = (inV[v] - vm) * vinv;
+                            giV[v] = vinv * (goV[v] * gaV[v] - vinvN * (vdb + xhat * vds));
+                        }
+                        i = simdLen;
+                    }
+                }
+#endif
+                for (; i < normSize; i++)
                 {
                     float xhat = (input[offset + i] - m) * invStd;
                     gradInput[offset + i] = invStd * (gradOutput[offset + i] * gamma[i] - invN * (db + xhat * ds));
@@ -8357,9 +8748,46 @@ namespace AiDotNet.Tensors.Engines.Simd
             {
                 int offset = b * features;
                 double dot = 0;
-                for (int j = 0; j < features; j++)
+                int j = 0;
+#if !NET5_0_OR_GREATER
+                // net471 §E: BCL Vector<double> reduction for dot(grad, softmax).
+                {
+                    int lanes = Vector<double>.Count;
+                    int simdLen = features - (features % lanes);
+                    if (simdLen > 0)
+                    {
+                        var gVecs = MemoryMarshal.Cast<double, Vector<double>>(new ReadOnlySpan<double>(grad + offset, simdLen));
+                        var sVecs = MemoryMarshal.Cast<double, Vector<double>>(new ReadOnlySpan<double>(softmaxOutput + offset, simdLen));
+                        var acc = Vector<double>.Zero;
+                        for (int v = 0; v < gVecs.Length; v++)
+                            acc += gVecs[v] * sVecs[v];
+                        dot = Vector.Dot(acc, Vector<double>.One);
+                        j = simdLen;
+                    }
+                }
+#endif
+                for (; j < features; j++)
                     dot += grad[offset + j] * softmaxOutput[offset + j];
-                for (int j = 0; j < features; j++)
+
+                j = 0;
+#if !NET5_0_OR_GREATER
+                // net471 §E: BCL Vector<double> elementwise softmax[i]*(grad[i]-dot).
+                {
+                    int lanes = Vector<double>.Count;
+                    int simdLen = features - (features % lanes);
+                    if (simdLen > 0)
+                    {
+                        var sVecs = MemoryMarshal.Cast<double, Vector<double>>(new ReadOnlySpan<double>(softmaxOutput + offset, simdLen));
+                        var gVecs = MemoryMarshal.Cast<double, Vector<double>>(new ReadOnlySpan<double>(grad + offset, simdLen));
+                        var oVecs = MemoryMarshal.Cast<double, Vector<double>>(new Span<double>(output + offset, simdLen));
+                        var vDot = new Vector<double>(dot);
+                        for (int v = 0; v < sVecs.Length; v++)
+                            oVecs[v] = sVecs[v] * (gVecs[v] - vDot);
+                        j = simdLen;
+                    }
+                }
+#endif
+                for (; j < features; j++)
                     output[offset + j] = softmaxOutput[offset + j] * (grad[offset + j] - dot);
             }
         }
@@ -8377,25 +8805,80 @@ namespace AiDotNet.Tensors.Engines.Simd
             {
                 double m = mean[c];
                 double invStd = 1.0 / Math.Sqrt(variance[c] + epsilon);
-                double gGamma = 0, gBeta = 0, sumGradXhat = 0, sumGrad = 0;
+                double sumGradXhat = 0, sumGrad = 0;
                 for (int b = 0; b < batchSize; b++)
-                    for (int s = 0; s < spatialSize; s++)
+                {
+                    int baseIdx = (b * channels + c) * spatialSize;
+                    int s = 0;
+#if !NET5_0_OR_GREATER
                     {
-                        int idx = (b * channels + c) * spatialSize + s;
+                        int lanes = Vector<double>.Count;
+                        int simdLen = spatialSize - (spatialSize % lanes);
+                        if (simdLen > 0)
+                        {
+                            var vm = new Vector<double>(m);
+                            var vinv = new Vector<double>(invStd);
+                            var goV = MemoryMarshal.Cast<double, Vector<double>>(new ReadOnlySpan<double>(gradOutput + baseIdx, simdLen));
+                            var inV = MemoryMarshal.Cast<double, Vector<double>>(new ReadOnlySpan<double>(input + baseIdx, simdLen));
+                            var accXhat = Vector<double>.Zero;
+                            var accGo = Vector<double>.Zero;
+                            for (int v = 0; v < goV.Length; v++)
+                            {
+                                var xhat = (inV[v] - vm) * vinv;
+                                accXhat += goV[v] * xhat;
+                                accGo += goV[v];
+                            }
+                            sumGradXhat += Vector.Dot(accXhat, Vector<double>.One);
+                            sumGrad += Vector.Dot(accGo, Vector<double>.One);
+                            s = simdLen;
+                        }
+                    }
+#endif
+                    for (; s < spatialSize; s++)
+                    {
+                        int idx = baseIdx + s;
                         double go = gradOutput[idx];
                         double xhat = (input[idx] - m) * invStd;
-                        gGamma += go * xhat; gBeta += go;
                         sumGradXhat += go * xhat; sumGrad += go;
                     }
-                gradGamma[c] = gGamma; gradBeta[c] = gBeta;
+                }
+                gradGamma[c] = sumGradXhat; gradBeta[c] = sumGrad;
                 double g = gamma[c];
                 for (int b = 0; b < batchSize; b++)
-                    for (int s = 0; s < spatialSize; s++)
+                {
+                    int baseIdx = (b * channels + c) * spatialSize;
+                    int s = 0;
+#if !NET5_0_OR_GREATER
                     {
-                        int idx = (b * channels + c) * spatialSize + s;
+                        int lanes = Vector<double>.Count;
+                        int simdLen = spatialSize - (spatialSize % lanes);
+                        if (simdLen > 0)
+                        {
+                            var vm = new Vector<double>(m);
+                            var vinv = new Vector<double>(invStd);
+                            var vg = new Vector<double>(g);
+                            var vinvN = new Vector<double>(invN);
+                            var vSumGrad = new Vector<double>(sumGrad);
+                            var vSumXhat = new Vector<double>(sumGradXhat);
+                            var goV = MemoryMarshal.Cast<double, Vector<double>>(new ReadOnlySpan<double>(gradOutput + baseIdx, simdLen));
+                            var inV = MemoryMarshal.Cast<double, Vector<double>>(new ReadOnlySpan<double>(input + baseIdx, simdLen));
+                            var giV = MemoryMarshal.Cast<double, Vector<double>>(new Span<double>(gradInput + baseIdx, simdLen));
+                            for (int v = 0; v < goV.Length; v++)
+                            {
+                                var xhat = (inV[v] - vm) * vinv;
+                                giV[v] = vg * vinv * (goV[v] - vinvN * (vSumGrad + xhat * vSumXhat));
+                            }
+                            s = simdLen;
+                        }
+                    }
+#endif
+                    for (; s < spatialSize; s++)
+                    {
+                        int idx = baseIdx + s;
                         double xhat = (input[idx] - m) * invStd;
                         gradInput[idx] = g * invStd * (gradOutput[idx] - invN * (sumGrad + xhat * sumGradXhat));
                     }
+                }
             }
         }
 
@@ -8412,21 +8895,96 @@ namespace AiDotNet.Tensors.Engines.Simd
                 int offset = b * normSize;
                 double m = mean[b];
                 double invStd = 1.0 / Math.Sqrt(variance[b] + epsilon);
-                for (int i = 0; i < normSize; i++)
+                int i = 0;
+#if !NET5_0_OR_GREATER
+                {
+                    int lanes = Vector<double>.Count;
+                    int simdLen = normSize - (normSize % lanes);
+                    if (simdLen > 0)
+                    {
+                        var vm = new Vector<double>(m);
+                        var vinv = new Vector<double>(invStd);
+                        var goV = MemoryMarshal.Cast<double, Vector<double>>(new ReadOnlySpan<double>(gradOutput + offset, simdLen));
+                        var inV = MemoryMarshal.Cast<double, Vector<double>>(new ReadOnlySpan<double>(input + offset, simdLen));
+                        var ggV = MemoryMarshal.Cast<double, Vector<double>>(new Span<double>(gradGamma, simdLen));
+                        var gbV = MemoryMarshal.Cast<double, Vector<double>>(new Span<double>(gradBeta, simdLen));
+                        for (int v = 0; v < goV.Length; v++)
+                        {
+                            var xhat = (inV[v] - vm) * vinv;
+                            ggV[v] += goV[v] * xhat;
+                            gbV[v] += goV[v];
+                        }
+                        i = simdLen;
+                    }
+                }
+#endif
+                for (; i < normSize; i++)
                 {
                     double xhat = (input[offset + i] - m) * invStd;
                     gradGamma[i] += gradOutput[offset + i] * xhat;
                     gradBeta[i] += gradOutput[offset + i];
                 }
                 double ds = 0, db = 0;
-                for (int i = 0; i < normSize; i++)
+                i = 0;
+#if !NET5_0_OR_GREATER
+                {
+                    int lanes = Vector<double>.Count;
+                    int simdLen = normSize - (normSize % lanes);
+                    if (simdLen > 0)
+                    {
+                        var vm = new Vector<double>(m);
+                        var vinv = new Vector<double>(invStd);
+                        var goV = MemoryMarshal.Cast<double, Vector<double>>(new ReadOnlySpan<double>(gradOutput + offset, simdLen));
+                        var inV = MemoryMarshal.Cast<double, Vector<double>>(new ReadOnlySpan<double>(input + offset, simdLen));
+                        var gaV = MemoryMarshal.Cast<double, Vector<double>>(new ReadOnlySpan<double>(gamma, simdLen));
+                        var accDs = Vector<double>.Zero;
+                        var accDb = Vector<double>.Zero;
+                        for (int v = 0; v < goV.Length; v++)
+                        {
+                            var go = goV[v] * gaV[v];
+                            var xhat = (inV[v] - vm) * vinv;
+                            accDs += go * xhat;
+                            accDb += go;
+                        }
+                        ds = Vector.Dot(accDs, Vector<double>.One);
+                        db = Vector.Dot(accDb, Vector<double>.One);
+                        i = simdLen;
+                    }
+                }
+#endif
+                for (; i < normSize; i++)
                 {
                     double go = gradOutput[offset + i] * gamma[i];
                     double xhat = (input[offset + i] - m) * invStd;
                     ds += go * xhat; db += go;
                 }
                 double invN = 1.0 / normSize;
-                for (int i = 0; i < normSize; i++)
+                i = 0;
+#if !NET5_0_OR_GREATER
+                {
+                    int lanes = Vector<double>.Count;
+                    int simdLen = normSize - (normSize % lanes);
+                    if (simdLen > 0)
+                    {
+                        var vm = new Vector<double>(m);
+                        var vinv = new Vector<double>(invStd);
+                        var vds = new Vector<double>(ds);
+                        var vdb = new Vector<double>(db);
+                        var vinvN = new Vector<double>(invN);
+                        var goV = MemoryMarshal.Cast<double, Vector<double>>(new ReadOnlySpan<double>(gradOutput + offset, simdLen));
+                        var inV = MemoryMarshal.Cast<double, Vector<double>>(new ReadOnlySpan<double>(input + offset, simdLen));
+                        var gaV = MemoryMarshal.Cast<double, Vector<double>>(new ReadOnlySpan<double>(gamma, simdLen));
+                        var giV = MemoryMarshal.Cast<double, Vector<double>>(new Span<double>(gradInput + offset, simdLen));
+                        for (int v = 0; v < goV.Length; v++)
+                        {
+                            var xhat = (inV[v] - vm) * vinv;
+                            giV[v] = vinv * (goV[v] * gaV[v] - vinvN * (vdb + xhat * vds));
+                        }
+                        i = simdLen;
+                    }
+                }
+#endif
+                for (; i < normSize; i++)
                 {
                     double xhat = (input[offset + i] - m) * invStd;
                     gradInput[offset + i] = invStd * (gradOutput[offset + i] * gamma[i] - invN * (db + xhat * ds));

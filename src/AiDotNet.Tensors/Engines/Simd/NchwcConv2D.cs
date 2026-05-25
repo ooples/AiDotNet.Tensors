@@ -85,7 +85,10 @@ internal static class NchwcConv2D
 #if NET5_0_OR_GREATER
         bool useSimd = Avx2.IsSupported && Fma.IsSupported;
 #else
-        bool useSimd = false; // net471: no Runtime.Intrinsics — scalar only.
+        // audit-2026-05 phase 5 slice 3c: BCL Vector<float> path. The output block
+        // is 8 wide, so it engages only on AVX2 net471 hosts (Vector<float>.Count==8);
+        // SSE2-only (4-lane) falls through to scalar.
+        bool useBcl = System.Numerics.Vector<float>.Count == CBlock;
 #endif
 
         AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, totalTasks,
@@ -111,8 +114,11 @@ internal static class NchwcConv2D
                     int outIdx = oBase + oh * _outStrideH + ow * _outStrideW;
 #if NET5_0_OR_GREATER
                     var acc = Vector256<float>.Zero;
-#endif
                     if (!useSimd) Array.Clear(scalarAcc, 0, CBlock);
+#else
+                    var accBcl = System.Numerics.Vector<float>.Zero;
+                    if (!useBcl) Array.Clear(scalarAcc, 0, CBlock);
+#endif
 
                     for (int icg = 0; icg < _cgIn; icg++)
                     {
@@ -145,6 +151,19 @@ internal static class NchwcConv2D
                                     }
                                 }
                                 else
+#else
+                                if (useBcl)
+                                {
+                                    for (int icb = 0; icb < CBlock; icb++)
+                                    {
+                                        // Broadcast the one input lane, load 8 contiguous
+                                        // kernel weights, fused multiply-add into the acc.
+                                        var vIn = new System.Numerics.Vector<float>(inArr[inIdx + icb]);
+                                        var vK = new System.Numerics.Vector<float>(kArr, kIdx + icb * CBlock);
+                                        accBcl = vIn * vK + accBcl;
+                                    }
+                                }
+                                else
 #endif
                                 {
                                     for (int icb = 0; icb < CBlock; icb++)
@@ -164,6 +183,12 @@ internal static class NchwcConv2D
                     {
                         acc.CopyTo(simdStore);
                         for (int ocb = 0; ocb < CBlock; ocb++) outArr[outIdx + ocb] = simdStore[ocb];
+                    }
+                    else
+#else
+                    if (useBcl)
+                    {
+                        accBcl.CopyTo(outArr, outIdx);
                     }
                     else
 #endif
