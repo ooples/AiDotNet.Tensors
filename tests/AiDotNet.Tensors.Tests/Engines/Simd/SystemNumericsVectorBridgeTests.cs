@@ -206,6 +206,67 @@ public class SystemNumericsVectorBridgeTests
 
     [Theory]
     [InlineData(0)] [InlineData(1)] [InlineData(8)] [InlineData(33)] [InlineData(256)]
+    public void SubtractScalar_Matches_Scalar(int length)
+    {
+        var rng = RandomHelper.CreateSeededRandom(60);
+        var a = NextRandomArray(rng, length);
+        const float scalar = 2.71f;
+        var expected = new float[length];
+        for (int i = 0; i < length; i++) expected[i] = a[i] - scalar;
+        var actual = new float[length];
+        SystemNumericsVectorBridge.SubtractScalar(a, scalar, actual);
+        AssertBitIdentical(expected, actual);
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(8)] [InlineData(33)] [InlineData(256)]
+    public void DivideScalar_Matches_Scalar(int length)
+    {
+        var rng = RandomHelper.CreateSeededRandom(61);
+        var a = NextRandomArray(rng, length);
+        const float scalar = 4f;
+        // DivideScalar multiplies by the reciprocal (a * (1/scalar)); mirror that
+        // exactly so the bit-identical assertion holds.
+        float inv = 1f / scalar;
+        var expected = new float[length];
+        for (int i = 0; i < length; i++) expected[i] = a[i] * inv;
+        var actual = new float[length];
+        SystemNumericsVectorBridge.DivideScalar(a, scalar, actual);
+        AssertBitIdentical(expected, actual);
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(8)] [InlineData(33)] [InlineData(256)]
+    public void ScalarMultiplyAdd_Matches_Scalar(int length)
+    {
+        var rng = RandomHelper.CreateSeededRandom(62);
+        var a = NextRandomArray(rng, length);
+        var b = NextRandomArray(rng, length);
+        const float scalar = 1.5f;
+        var expected = new float[length];
+        for (int i = 0; i < length; i++) expected[i] = a[i] + scalar * b[i];
+        var actual = new float[length];
+        SystemNumericsVectorBridge.ScalarMultiplyAdd(a, b, scalar, actual);
+        AssertBitIdentical(expected, actual);
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(8)] [InlineData(33)] [InlineData(256)]
+    public void ScalarMultiplyAdd_Double_Matches_Scalar(int length)
+    {
+        var rng = RandomHelper.CreateSeededRandom(63);
+        var a = NextRandomDoubleArray(rng, length);
+        var b = NextRandomDoubleArray(rng, length);
+        const double scalar = 1.5;
+        var expected = new double[length];
+        for (int i = 0; i < length; i++) expected[i] = a[i] + scalar * b[i];
+        var actual = new double[length];
+        SystemNumericsVectorBridge.ScalarMultiplyAdd(a, b, scalar, actual);
+        AssertBitIdenticalDouble(expected, actual);
+    }
+
+    [Theory]
+    [InlineData(0)] [InlineData(1)] [InlineData(8)] [InlineData(33)] [InlineData(256)]
     public void MultiplyScalar_Matches_Scalar(int length)
     {
         var rng = RandomHelper.CreateSeededRandom(53);

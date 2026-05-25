@@ -47,6 +47,13 @@ public sealed class TensorArena : IDisposable
     private readonly Dictionary<(Type, int), int> _cursor = new();
 
     /// <summary>
+    /// Reusable scratch buffer for <see cref="Reset"/>'s key snapshot, so the
+    /// steady-state reset is allocation-free (the arena's key set is stable
+    /// across training iterations). Grown only when the key count rises.
+    /// </summary>
+    private (Type, int)[]? _resetKeyScratch;
+
+    /// <summary>
     /// PINNED list: long-lived allocations that survive <see cref="Reset"/>.
     /// Model weights (from layer EnsureInitialized), optimizer moment state
     /// (Adam m / v), running BatchNorm statistics, positional embeddings —
@@ -237,10 +244,13 @@ public sealed class TensorArena : IDisposable
         int n = _cursor.Count;
         if (n > 0)
         {
-            var keys = new (Type, int)[n];
-            _cursor.Keys.CopyTo(keys, 0);
+            // Reuse a scratch buffer so steady-state Reset() allocates nothing
+            // (the key set is stable across iterations); grow only when it rises.
+            if (_resetKeyScratch is null || _resetKeyScratch.Length < n)
+                _resetKeyScratch = new (Type, int)[n];
+            _cursor.Keys.CopyTo(_resetKeyScratch, 0);
             for (int i = 0; i < n; i++)
-                _cursor[keys[i]] = 0;
+                _cursor[_resetKeyScratch[i]] = 0;
         }
         // Reset flat tensor ring cursors
         if (_tensorRingCursors != null)
