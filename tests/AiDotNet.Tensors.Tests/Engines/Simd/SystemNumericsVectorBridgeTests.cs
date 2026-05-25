@@ -644,8 +644,13 @@ public class SystemNumericsVectorBridgeTests
         Assert.Equal(expected.Length, actual.Length);
         for (int i = 0; i < expected.Length; i++)
         {
-            Assert.True(expected[i] == actual[i],
-                $"Mismatch at i={i}: expected {expected[i]}, actual {actual[i]}.");
+            // Compare raw IEEE-754 bit patterns, not `==`: `==` treats +0.0 and
+            // -0.0 as equal and ignores NaN payload differences, so it can't
+            // enforce the bit-identity this helper's name promises.
+            long e = BitConverter.DoubleToInt64Bits(expected[i]);
+            long a = BitConverter.DoubleToInt64Bits(actual[i]);
+            Assert.True(e == a,
+                $"Bit mismatch at i={i}: expected {expected[i]} (0x{e:X16}), actual {actual[i]} (0x{a:X16}).");
         }
     }
 
@@ -664,9 +669,14 @@ public class SystemNumericsVectorBridgeTests
         {
             // Bit-identity guard — element-wise SIMD ops must produce IEEE-equivalent results
             // to the scalar loop they replace. (Reductions, which sum in a different order,
-            // are tested separately with tolerance.)
-            Assert.True(expected[i] == actual[i],
-                $"Mismatch at i={i}: expected {expected[i]}, actual {actual[i]}.");
+            // are tested separately with tolerance.) Compare raw IEEE-754 bit patterns, not
+            // `==`, which conflates +0/-0 and ignores NaN payloads. net471 has no
+            // SingleToInt32Bits, so round-trip through GetBytes/ToInt32 (the pattern used
+            // elsewhere in the suite, e.g. GpuDeterminismRegressionTests).
+            int e = BitConverter.ToInt32(BitConverter.GetBytes(expected[i]), 0);
+            int a = BitConverter.ToInt32(BitConverter.GetBytes(actual[i]), 0);
+            Assert.True(e == a,
+                $"Bit mismatch at i={i}: expected {expected[i]} (0x{e:X8}), actual {actual[i]} (0x{a:X8}).");
         }
     }
 }
