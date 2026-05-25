@@ -3,6 +3,7 @@
 // Works on ALL .NET versions including .NET Framework 4.6.2.
 
 using System;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
@@ -622,7 +623,11 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         }
 
         /// <summary>
-        /// Checks if OpenCL is available on this system.
+        /// Checks if OpenCL is available on this system (any platform / any device type).
+        /// Note: returning true here does not mean a real GPU is present — many CPU-only
+        /// systems ship with an OpenCL ICD that exposes CPU devices. Use
+        /// <see cref="IsGpuAvailable"/> when you only want to trigger GPU code paths
+        /// (kernel compilation, backend init) on machines with real GPU hardware.
         /// </summary>
         public static bool IsAvailable
         {
@@ -632,18 +637,68 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 {
                     int err = GetPlatformIDs(0, null, out uint numPlatforms);
                     bool available = err == CL_SUCCESS && numPlatforms > 0;
-                    Console.WriteLine($"[OpenCL Diagnostics] GetPlatformIDs returned error code: {err}, platforms found: {numPlatforms}, available: {available}");
+                    Trace.WriteLine($"[OpenCL Diagnostics] GetPlatformIDs returned error code: {err}, platforms found: {numPlatforms}, available: {available}");
                     return available;
                 }
                 catch (DllNotFoundException ex)
                 {
-                    Console.WriteLine($"[OpenCL Diagnostics] DllNotFoundException: {ex.Message}");
+                    Trace.WriteLine($"[OpenCL Diagnostics] DllNotFoundException: {ex.Message}");
                     PrintDllSearchDiagnostics();
                     return false;
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"[OpenCL Diagnostics] Exception during OpenCL availability check: {ex.GetType().Name}: {ex.Message}");
+                    Trace.WriteLine($"[OpenCL Diagnostics] Exception during OpenCL availability check: {ex.GetType().Name}: {ex.Message}");
+                    return false;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Checks if a real GPU device is exposed by any OpenCL platform on this system.
+        /// Returns false on CPU-only machines that happen to have an OpenCL ICD installed
+        /// (Intel CPU runtime, AMD APP CPU runtime, POCL), preventing the OpenCL backend
+        /// from compiling its ~591-kernel cache on hardware that has no use for it.
+        /// Honors <c>AIDOTNET_DISABLE_OPENCL=1</c> as a manual opt-out for users who want
+        /// to force the CPU path even on machines with a GPU.
+        /// </summary>
+        public static bool IsGpuAvailable
+        {
+            get
+            {
+                if (string.Equals(Environment.GetEnvironmentVariable("AIDOTNET_DISABLE_OPENCL"), "1", StringComparison.Ordinal))
+                {
+                    Trace.WriteLine("[OpenCL Diagnostics] AIDOTNET_DISABLE_OPENCL=1 — skipping GPU probe.");
+                    return false;
+                }
+                if (!IsAvailable) return false;
+                try
+                {
+                    int err = GetPlatformIDs(0, null, out uint numPlatforms);
+                    if (err != CL_SUCCESS || numPlatforms == 0) return false;
+
+                    var platforms = new IntPtr[numPlatforms];
+                    err = GetPlatformIDs(numPlatforms, platforms, out _);
+                    if (err != CL_SUCCESS) return false;
+
+                    for (uint p = 0; p < numPlatforms; p++)
+                    {
+                        // GetDeviceIDs returns CL_DEVICE_NOT_FOUND (-1) when the platform
+                        // has no devices of the requested type; that is not an error here
+                        // — it just means this platform has no GPU. Continue scanning.
+                        int devErr = GetDeviceIDs(platforms[p], CL_DEVICE_TYPE_GPU, 0, null, out uint numDevices);
+                        if (devErr == CL_SUCCESS && numDevices > 0)
+                        {
+                            Trace.WriteLine($"[OpenCL Diagnostics] Found {numDevices} GPU device(s) on platform {p}.");
+                            return true;
+                        }
+                    }
+                    Trace.WriteLine("[OpenCL Diagnostics] No GPU devices found across any OpenCL platform.");
+                    return false;
+                }
+                catch (Exception ex)
+                {
+                    Trace.WriteLine($"[OpenCL Diagnostics] Exception during GPU probe: {ex.GetType().Name}: {ex.Message}");
                     return false;
                 }
             }

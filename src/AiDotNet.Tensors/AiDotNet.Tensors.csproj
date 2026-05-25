@@ -7,7 +7,7 @@
     <GeneratePackageOnBuild>True</GeneratePackageOnBuild>
     <Version>1.0.0-preview</Version>
     <Title>AiDotNet.Tensors</Title>
-    <Description>High-performance tensor operations with SIMD acceleration for .NET. Provides Vector, Matrix, and Tensor types with hardware-accelerated operations (Sin, Cos, Exp, Log, etc.) that work across .NET Framework 4.7.1 and .NET 10.0. Supports any numeric type via generic INumericOperations interface. Optional GPU acceleration available via separate packages.</Description>
+    <Description>High-performance tensor operations with SIMD acceleration for .NET. Provides Vector, Matrix, and Tensor types with hardware-accelerated operations (Sin, Cos, Exp, Log, etc.). On net8.0+ uses hand-written AVX2/AVX-512 SIMD kernels via System.Runtime.Intrinsics for maximum throughput; on net471 falls back to scalar paths (System.Runtime.Intrinsics is unavailable pre-net6). Performance numbers in benchmarks assume net8.0+. Supports any numeric type via generic INumericOperations interface. Optional GPU acceleration available via separate packages. Optional anonymous telemetry (opt-in via AIDOTNET_TELEMETRY=true; default off in v0.205.0+).</Description>
     <Company>Ooples Finance</Company>
     <Authors>ooples</Authors>
     <Copyright>Ooples Finance LLC 2025</Copyright>
@@ -279,5 +279,12 @@
       <_Parameter2>$(TelemetryKey)</_Parameter2>
     </AssemblyAttribute>
   </ItemGroup>
+
+  <!--
+    Gate DISABLE_TELEMETRY / DISABLE_LICENSE_GUARD compile flags behind
+    enterprise-license validation. See build/AiDotNet.Tensors.Enterprise.targets
+    for the validation logic and full rationale.
+  -->
+  <Import Project="$(MSBuildThisFileDirectory)..\..\build\AiDotNet.Tensors.Enterprise.targets" />
 
 </Project>

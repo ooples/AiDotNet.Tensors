@@ -46,6 +46,40 @@ public class PerformanceRegressionTests
     private const double BatchMatMulBudgetMs = 2.0;      // Scalar would be ~5ms
     private const double ReLUBackwardBudgetMs = 5.0;     // Scalar would be ~10ms
 
+    // AIsEval CNN inference perf gate — see ooples/AiDotNet.Tensors#436.
+    // The AIsEval (PyTorch-vs-AiDotNet) benchmark surfaced that AiDotNet's CNN
+    // bs=128 inference is currently ~6.7x faster than PyTorch's nn.Conv2d path
+    // on the same shapes (6.21 ms vs 41.42 ms on the reference rig). These two
+    // gates lock in the two Conv2D forward shapes that dominate the CNN
+    // benchmark (the layer-1 and layer-2 conv at SmallCNN's input/intermediate
+    // resolutions) so a future refactor of the conv path can't silently regress
+    // the lead. Budgets are 4-5x our measured numbers — generous enough for CI
+    // noise, tight enough to catch any 5x+ regression.
+    private const double CnnAiseval_L1_BudgetMs = 30.0;  // Measured ~6 ms on RTX-class CPU
+    private const double CnnAiseval_L2_BudgetMs = 35.0;  // Measured ~8 ms on RTX-class CPU
+
+    // AIsEval LSTM + MHA inference perf gates (issue #436, post-Stage 5-7).
+    // Budgets are sized to catch a regression to the previous-stage path,
+    // not just generic CI noise:
+    //
+    //   LSTM:
+    //     Stage 3 (generic-T fused, pre float fast path): 44 ms/iter
+    //     Stage 5 (float fast path, current):              8 ms/iter
+    //     30 ms budget catches Stage 5 -> Stage 3 regression with ~3x
+    //     headroom over the Stage 5 measurement.
+    //
+    //   MHA:
+    //     Stage 4 (wrapper path, no float fast path):     22 ms/iter
+    //     Stage 6 (float fast path):                      10 ms/iter
+    //     Stage 7 (+ parallel transposes, current):        8.5 ms/iter
+    //     15 ms budget catches Stage 7/6 -> Stage 4 regression while still
+    //     tolerating ~1.7x CI variance over the Stage 7 measurement. The
+    //     previous 30 ms budget (CodeRabbit review on PR #437) would have
+    //     passed a wrapper-path fallback unchanged — it caught only outright
+    //     unfused dispatch, not the regression this test is named for.
+    private const double LstmAiseval_BudgetMs = 30.0;
+    private const double MhaAiseval_BudgetMs = 15.0;
+
     public PerformanceRegressionTests(ITestOutputHelper output) => _output = output;
 
     [Fact(Skip = "Performance guard — run manually with --filter PerformanceRegression")]
@@ -267,5 +301,123 @@ public class PerformanceRegressionTests
         _output.WriteLine($"ReLU backward 1M: {ms:F3}ms (budget: 5ms)");
         Assert.True(ms < ReLUBackwardBudgetMs,
             $"ReLU backward took {ms:F3}ms — check SimdKernels.ReluBackwardUnsafe.");
+    }
+
+    [Fact(Skip = "Performance guard — run manually with --filter PerformanceRegression")]
+    public void Conv2D_AiseValCnnL1_Forward_PreservesPyTorchLead()
+    {
+        // AIsEval CNN layer-1 shape: nn.Conv2d(1, 16, kernel=3, padding=1) at
+        // input [128, 1, 28, 28] (MNIST-shape, bs=128). PyTorch baseline for
+        // this exact shape was 41.42 ms (bs=128 steady-state latency including
+        // ReLU + MaxPool, but Conv2D dominates). Our measured pure-Conv2D was
+        // ~5-6 ms. Locking the gate at 30 ms catches a 5x+ regression while
+        // tolerating CI noise and cold JIT.
+        var input = Tensor<float>.CreateRandom([128, 1, 28, 28]);
+        var kernel = Tensor<float>.CreateRandom([16, 1, 3, 3]);
+
+        for (int w = 0; w < 3; w++) _engine.Conv2D(input, kernel, stride: 1, padding: 1);
+
+        var sw = Stopwatch.StartNew();
+        const int iters = 10;
+        for (int i = 0; i < iters; i++) _engine.Conv2D(input, kernel, stride: 1, padding: 1);
+        sw.Stop();
+        double ms = sw.Elapsed.TotalMilliseconds / iters;
+
+        _output.WriteLine($"Conv2D AIsEval-L1 [128,1,28,28]@[16,1,3,3] pad=1: {ms:F3}ms (budget: {CnnAiseval_L1_BudgetMs}ms)");
+        Assert.True(ms < CnnAiseval_L1_BudgetMs,
+            $"Conv2D AIsEval-L1 took {ms:F3}ms — exceeds {CnnAiseval_L1_BudgetMs}ms budget. " +
+            "The AIsEval benchmark relies on this shape being well below PyTorch's 41.42ms baseline; " +
+            "a regression here would erase the CNN inference lead documented in issue #436.");
+    }
+
+    [Fact(Skip = "Performance guard — run manually with --filter PerformanceRegression")]
+    public void LstmSequenceForward_Aiseval_FloatFastPath_BeatsPyTorch()
+    {
+        // Locks in the AIsEval LSTM win. Stage 3 took LSTM from "doesn't
+        // finish in 3+ min" to 44 ms (generic-T path). Stage 5 added a
+        // float fast path using SimdGemm + vectorized sigmoid/tanh +
+        // ArrayPool scratch, bringing the AIsEval shape to 8.19 ms on
+        // net10.0 — faster than PyTorch's 11.76 ms nn.LSTM. This gate
+        // catches any regression that would lose that lead.
+        const int batch = 128, seq = 32, inFeatures = 32, hidden = 64;
+        var input = Tensor<float>.CreateRandom(batch, seq, inFeatures);
+        var wIh   = Tensor<float>.CreateRandom(4 * hidden, inFeatures);
+        var wHh   = Tensor<float>.CreateRandom(4 * hidden, hidden);
+
+        // LstmSequenceForward is on IEngine (the float fast path lives in
+        // CpuEngine and is picked up by DirectGpuTensorEngine via inheritance),
+        // so no downcast needed.
+        for (int w = 0; w < 3; w++)
+            _ = _engine.LstmSequenceForward(input, null, null, wIh, wHh, null, null);
+
+        var sw = Stopwatch.StartNew();
+        const int iters = 10;
+        for (int i = 0; i < iters; i++)
+            _ = _engine.LstmSequenceForward(input, null, null, wIh, wHh, null, null);
+        sw.Stop();
+        double ms = sw.Elapsed.TotalMilliseconds / iters;
+
+        _output.WriteLine($"LstmSequenceForward AIsEval [128,32,32->64]: {ms:F2} ms (budget: {LstmAiseval_BudgetMs} ms; PyTorch baseline 11.76 ms)");
+        Assert.True(ms < LstmAiseval_BudgetMs,
+            $"LstmSequenceForward took {ms:F2} ms — exceeds {LstmAiseval_BudgetMs} ms budget. " +
+            "This indicates a regression away from the Stage 5 float fast path that put AiDotNet ahead of PyTorch on this shape.");
+    }
+
+    [Fact(Skip = "Performance guard — run manually with --filter PerformanceRegression")]
+    public void MultiHeadAttentionForward_Aiseval_FloatFastPath()
+    {
+        // Locks in the Stage 6 MHA float fast path. Stage 4 wrapper measured
+        // 22.31 ms on net10.0; Stage 6 brought it to 10.13 ms via direct
+        // SimdGemm projections + ArrayPool scratch + explicit-loop transpose.
+        // Budget at 30 ms catches regression back to the wrapper-only path.
+        const int batch = 128, seq = 32, dModel = 64, numHeads = 4;
+        var input = Tensor<float>.CreateRandom(batch, seq, dModel);
+        var qW = Tensor<float>.CreateRandom(dModel, dModel);
+        var kW = Tensor<float>.CreateRandom(dModel, dModel);
+        var vW = Tensor<float>.CreateRandom(dModel, dModel);
+        var oW = Tensor<float>.CreateRandom(dModel, dModel);
+
+        // MultiHeadAttentionForward is on IEngine (the float fast path lives in
+        // CpuEngine and is picked up by DirectGpuTensorEngine via inheritance),
+        // so no downcast needed.
+        for (int w = 0; w < 3; w++)
+            _ = _engine.MultiHeadAttentionForward(input, qW, kW, vW, oW, numHeads);
+
+        var sw = Stopwatch.StartNew();
+        const int iters = 10;
+        for (int i = 0; i < iters; i++)
+            _ = _engine.MultiHeadAttentionForward(input, qW, kW, vW, oW, numHeads);
+        sw.Stop();
+        double ms = sw.Elapsed.TotalMilliseconds / iters;
+
+        _output.WriteLine($"MultiHeadAttentionForward AIsEval [128,32,64] h=4: {ms:F2} ms (budget: {MhaAiseval_BudgetMs} ms)");
+        Assert.True(ms < MhaAiseval_BudgetMs,
+            $"MultiHeadAttentionForward took {ms:F2} ms — exceeds {MhaAiseval_BudgetMs} ms budget. " +
+            "Stage 6 float fast path measured 10.13 ms on net10.0; a regression to the Stage 4 wrapper path would push this back to ~22 ms.");
+    }
+
+    [Fact(Skip = "Performance guard — run manually with --filter PerformanceRegression")]
+    public void Conv2D_AiseValCnnL2_Forward_PreservesPyTorchLead()
+    {
+        // AIsEval CNN layer-2 shape: nn.Conv2d(16, 32, kernel=3, padding=1) at
+        // input [128, 16, 14, 14] (post-first-MaxPool). This is the heavier of
+        // the two convs by FLOPs (~ 36M MACs vs ~6M for L1). Budget at 35 ms
+        // covers the same 5x-regression-catching headroom.
+        var input = Tensor<float>.CreateRandom([128, 16, 14, 14]);
+        var kernel = Tensor<float>.CreateRandom([32, 16, 3, 3]);
+
+        for (int w = 0; w < 3; w++) _engine.Conv2D(input, kernel, stride: 1, padding: 1);
+
+        var sw = Stopwatch.StartNew();
+        const int iters = 10;
+        for (int i = 0; i < iters; i++) _engine.Conv2D(input, kernel, stride: 1, padding: 1);
+        sw.Stop();
+        double ms = sw.Elapsed.TotalMilliseconds / iters;
+
+        _output.WriteLine($"Conv2D AIsEval-L2 [128,16,14,14]@[32,16,3,3] pad=1: {ms:F3}ms (budget: {CnnAiseval_L2_BudgetMs}ms)");
+        Assert.True(ms < CnnAiseval_L2_BudgetMs,
+            $"Conv2D AIsEval-L2 took {ms:F3}ms — exceeds {CnnAiseval_L2_BudgetMs}ms budget. " +
+            "Layer-2 conv dominates the CNN benchmark's FLOPs; a regression here is what would " +
+            "show up first in the AIsEval bs=128 numbers.");
     }
 }

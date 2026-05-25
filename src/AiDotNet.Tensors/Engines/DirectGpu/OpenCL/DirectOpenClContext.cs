@@ -157,9 +157,21 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public bool SupportsSubgroups { get; private set; }
 
         /// <summary>
-        /// Gets whether OpenCL is available on this system.
+        /// Gets whether OpenCL is available on this system (any platform / any device type).
+        /// Returning true here does not guarantee a real GPU is present — use
+        /// <see cref="IsGpuAvailable"/> to gate GPU-backend creation.
         /// </summary>
         public static bool IsAvailable => OpenClNativeBindings.IsAvailable;
+
+        /// <summary>
+        /// Gets whether a real GPU device is exposed by any OpenCL platform on this system.
+        /// False on CPU-only machines that happen to have an OpenCL ICD installed, and
+        /// false when <c>AIDOTNET_DISABLE_OPENCL=1</c> is set. Use this (not
+        /// <see cref="IsAvailable"/>) before constructing <c>OpenClBackend</c> on a
+        /// CPU-only run, otherwise the ~591-kernel cache will compile against the CPU
+        /// runtime and inflate process RSS by 2-3 GB for no benefit.
+        /// </summary>
+        public static bool IsGpuAvailable => OpenClNativeBindings.IsGpuAvailable;
 
         /// <summary>
         /// Gets the total number of OpenCL GPU devices across all platforms.
