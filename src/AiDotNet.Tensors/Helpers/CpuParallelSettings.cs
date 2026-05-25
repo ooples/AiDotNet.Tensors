@@ -24,6 +24,17 @@ public static class CpuParallelSettings
     public static int MaxDegreeOfParallelism { get; set; } = Environment.ProcessorCount;
 
     /// <summary>
+    /// When true, the grain-size-gated <see cref="ParallelForOrSerial(int,int,long,System.Action{int})"/>
+    /// helpers run serially regardless of work size. This is for the order-dependent reduction/
+    /// accumulation kernels routed through these helpers, whose multi-threaded partial-sum
+    /// combination is non-deterministic in floating point (thread-completion order). GEMM/conv use
+    /// their own parallel paths and are unaffected, so enabling this keeps those fast while making
+    /// reductions bit-reproducible. Default false (full speed); test harnesses that assert on exact
+    /// training trajectories set it true alongside <see cref="BlasProvider.SetDeterministicMode"/>.
+    /// </summary>
+    public static bool DeterministicReductions { get; set; }
+
+    /// <summary>
     /// Gets or sets whether SIMD (Single Instruction, Multiple Data) operations are enabled.
     /// </summary>
     /// <remarks>
@@ -174,7 +185,7 @@ public static class CpuParallelSettings
         // code path. Snapshot the value once so a concurrent setter mid-call
         // can't toggle us between paths.
         int maxDegree = MaxDegreeOfParallelism;
-        if (maxDegree <= 1 || totalWork < PersistentParallelExecutor.DefaultSerialGrainSize)
+        if (maxDegree <= 1 || DeterministicReductions || totalWork < PersistentParallelExecutor.DefaultSerialGrainSize)
         {
             // Match Parallel.For's exception semantics: capture
             // first thrown exception, finish remaining iterations,
@@ -240,7 +251,7 @@ public static class CpuParallelSettings
         // forces serial regardless of work size (same as the Action<int>
         // overload above). Snapshot once for consistency.
         int maxDegree = MaxDegreeOfParallelism;
-        if (maxDegree <= 1 || totalWork < PersistentParallelExecutor.DefaultSerialGrainSize)
+        if (maxDegree <= 1 || DeterministicReductions || totalWork < PersistentParallelExecutor.DefaultSerialGrainSize)
         {
             // Serial fast path: one local accumulator, no
             // ParallelLoopState (Stop/Break never fire serial-side).
