@@ -142,14 +142,38 @@ internal static class MachineCodeFmaKernel
     /// </summary>
     internal static byte[] EmitFp32_6x16_PackedWindows()
     {
-        const int RCX = 1, RDX = 2, R8 = 8, R9 = 9, R10 = 10, R11 = 11, RAX = 0, RSP = 4;
+        var asm = new X64Assembler();
+        EmitWindowsPrologue(asm);                    // kc->r10, frame, save xmm6–15
+        EmitBody_Fp32_6x16(asm);
+        EmitWindowsEpilogue(asm);                    // restore xmm6–15, frame, vzeroupper, ret
+        return asm.ToArray();
+    }
+
+    /// <summary>System V AMD64 (Linux/macOS) variant of <see cref="EmitFp32_6x16_PackedWindows"/>.
+    /// Same body; only the ABI differs (args rdi/rsi/rdx/rcx/r8, no nonvolatile xmm).</summary>
+    internal static byte[] EmitFp32_6x16_PackedSysV()
+    {
+        var asm = new X64Assembler();
+        EmitSysVPrologue(asm);                       // shuffle SysV args into rcx/rdx/r8/r9/r10
+        EmitBody_Fp32_6x16(asm);
+        asm.Vzeroupper();
+        asm.Ret();
+        return asm.ToArray();
+    }
+
+    /// <summary>
+    /// Register-level FP32 6×16 body. Assumes rcx=packedA, rdx=packedB, r8=c,
+    /// r9=ldc(elements), r10=kc; clobbers ymm0–15, rax, r11 and advances rcx/rdx/r10.
+    /// ABI-agnostic — the caller supplies the prologue/epilogue. ymm6–15 are used as
+    /// accumulators/scratch (callee must preserve them on Windows; on SysV they are
+    /// volatile so nothing is saved).
+    /// </summary>
+    private static void EmitBody_Fp32_6x16(X64Assembler asm)
+    {
+        const int RCX = 1, RDX = 2, R8 = 8, R9 = 9, R10 = 10, R11 = 11, RAX = 0;
         const int BLO = 12, BHI = 13, A0 = 14, A1 = 15;
         const int Mr = 6, Nr = 16; // Nr*4=64 bytes/Kstep for B; Mr*4=24 for A.
-        var asm = new X64Assembler();
 
-        asm.MovRegFromRsp(R10, 0x28);                // kc (5th arg) before moving rsp
-        asm.SubRsp(0xA0);
-        for (int i = 0; i < 10; i++) asm.VmovupsXmmStore(RSP, (sbyte)(i * 0x10), 6 + i); // save xmm6–15
         asm.LeaRaxIndexScale4(R9);                   // rowStride bytes = ldc*4 -> rax
 
         // Load 12 accumulators from C (read-modify-write). r11 walks the C rows.
@@ -189,13 +213,39 @@ internal static class MachineCodeFmaKernel
             asm.VmovupsStore(R11, 32, 2 * r + 1);
             if (r < Mr - 1) asm.AddRegReg(R11, RAX);
         }
+    }
 
-        for (int i = 0; i < 10; i++) asm.VmovupsXmmLoad(6 + i, RSP, (sbyte)(i * 0x10));
+    // ── ABI prologue/epilogue helpers (shared by Windows + SysV emitters) ───────
+    private const int RSP_ = 4, R8_ = 8, R9_ = 9, R10_ = 10, RCX_ = 1, RDX_ = 2, RSI_ = 6, RDI_ = 7;
+
+    /// <summary>Windows x64: kc (5th arg) is at [rsp+0x28]; xmm6–15 are nonvolatile.
+    /// Load kc→r10 (before moving rsp), reserve frame, save xmm6–15.</summary>
+    private static void EmitWindowsPrologue(X64Assembler asm)
+    {
+        asm.MovRegFromRsp(R10_, 0x28);
+        asm.SubRsp(0xA0);
+        for (int i = 0; i < 10; i++) asm.VmovupsXmmStore(RSP_, (sbyte)(i * 0x10), 6 + i);
+    }
+
+    private static void EmitWindowsEpilogue(X64Assembler asm)
+    {
+        for (int i = 0; i < 10; i++) asm.VmovupsXmmLoad(6 + i, RSP_, (sbyte)(i * 0x10));
         asm.AddRsp(0xA0);
         asm.Vzeroupper();
         asm.Ret();
+    }
 
-        return asm.ToArray();
+    /// <summary>System V AMD64: args in rdi(packedA), rsi(packedB), rdx(c), rcx(ldc),
+    /// r8(kc). Shuffle into the body's rcx/rdx/r8/r9/r10 layout. No nonvolatile xmm,
+    /// and the body touches no callee-saved GP regs, so no stack frame is needed.
+    /// Order avoids clobbering a source before it's read.</summary>
+    private static void EmitSysVPrologue(X64Assembler asm)
+    {
+        asm.MovRegReg(R10_, R8_);   // r10 = kc      (r8 was kc)
+        asm.MovRegReg(R9_, RCX_);   // r9  = ldc     (rcx was ldc)
+        asm.MovRegReg(R8_, RDX_);   // r8  = c       (rdx was c — read before overwrite)
+        asm.MovRegReg(RDX_, RSI_);  // rdx = packedB
+        asm.MovRegReg(RCX_, RDI_);  // rcx = packedA
     }
 
     /// <summary>
@@ -215,14 +265,36 @@ internal static class MachineCodeFmaKernel
     /// </summary>
     internal static byte[] EmitFp64_6x8_PackedWindowsU4()
     {
-        const int RCX = 1, RDX = 2, R8 = 8, R9 = 9, R10 = 10, R11 = 11, RAX = 0, RSP = 4;
+        var asm = new X64Assembler();
+        EmitWindowsPrologue(asm);
+        EmitBody_Fp64_6x8_U4(asm);
+        EmitWindowsEpilogue(asm);
+        return asm.ToArray();
+    }
+
+    /// <summary>System V AMD64 (Linux/macOS) variant of <see cref="EmitFp64_6x8_PackedWindowsU4"/>.
+    /// Same body; only the ABI differs (args rdi/rsi/rdx/rcx/r8, no nonvolatile xmm).</summary>
+    internal static byte[] EmitFp64_6x8_PackedSysVU4()
+    {
+        var asm = new X64Assembler();
+        EmitSysVPrologue(asm);
+        EmitBody_Fp64_6x8_U4(asm);
+        asm.Vzeroupper();
+        asm.Ret();
+        return asm.ToArray();
+    }
+
+    /// <summary>
+    /// Register-level FP64 6×8 unroll-by-4 body. Assumes rcx=packedA, rdx=packedB,
+    /// r8=c, r9=ldc(elements), r10=kc; clobbers ymm0–15, rax, r11 and advances
+    /// rcx/rdx/r10. ABI-agnostic — the caller supplies the prologue/epilogue.
+    /// </summary>
+    private static void EmitBody_Fp64_6x8_U4(X64Assembler asm)
+    {
+        const int RCX = 1, RDX = 2, R8 = 8, R9 = 9, R10 = 10, R11 = 11, RAX = 0;
         const int BLO = 12, BHI = 13, A0 = 14, A1 = 15;
         const int Mr = 6, Nr = 8, U = 4;
-        var asm = new X64Assembler();
 
-        asm.MovRegFromRsp(R10, 0x28);                // kc
-        asm.SubRsp(0xA0);
-        for (int i = 0; i < 10; i++) asm.VmovupsXmmStore(RSP, (sbyte)(i * 0x10), 6 + i);
         asm.LeaRaxIndexScale8(R9);                   // rowStride bytes
 
         // C read.
@@ -287,12 +359,5 @@ internal static class MachineCodeFmaKernel
             asm.VmovupdStore(R11, 32, 2 * r + 1);
             if (r < Mr - 1) asm.AddRegReg(R11, RAX);
         }
-
-        for (int i = 0; i < 10; i++) asm.VmovupsXmmLoad(6 + i, RSP, (sbyte)(i * 0x10));
-        asm.AddRsp(0xA0);
-        asm.Vzeroupper();
-        asm.Ret();
-
-        return asm.ToArray();
     }
 }

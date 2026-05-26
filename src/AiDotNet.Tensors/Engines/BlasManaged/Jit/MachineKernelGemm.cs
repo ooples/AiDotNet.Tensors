@@ -55,9 +55,15 @@ internal static class MachineKernelGemm
     private static ExecutableMemory? _mem64, _mem32; // kept alive for the process (never disposed)
     private static nint _kern64, _kern32;
 
+    private static bool IsWindows => RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
+
+    // x64 on a supported OS with AVX2+FMA and dynamic code allowed. Windows uses the
+    // Windows-x64 ABI kernels; Linux/macOS use the System V AMD64 ABI kernels.
     private static bool PlatformOk() =>
         RuntimeInformation.OSArchitecture == Architecture.X64
-        && RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+        && (IsWindows
+            || RuntimeInformation.IsOSPlatform(OSPlatform.Linux)
+            || RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
         && Avx2.IsSupported && Fma.IsSupported
         && NativeAotDetector.IsDynamicCodeSupported;
 
@@ -71,7 +77,10 @@ internal static class MachineKernelGemm
             if (!PlatformOk()) return false;
             try
             {
-                _mem64 = ExecutableMemory.TryAllocate(MachineCodeFmaKernel.EmitFp64_6x8_PackedWindowsU4());
+                byte[] code = IsWindows
+                    ? MachineCodeFmaKernel.EmitFp64_6x8_PackedWindowsU4()
+                    : MachineCodeFmaKernel.EmitFp64_6x8_PackedSysVU4();
+                _mem64 = ExecutableMemory.TryAllocate(code);
                 if (_mem64 is not null) _kern64 = _mem64.Pointer;
             }
             catch { _mem64 = null; _kern64 = 0; }
@@ -89,7 +98,10 @@ internal static class MachineKernelGemm
             if (!PlatformOk()) return false;
             try
             {
-                _mem32 = ExecutableMemory.TryAllocate(MachineCodeFmaKernel.EmitFp32_6x16_PackedWindows());
+                byte[] code = IsWindows
+                    ? MachineCodeFmaKernel.EmitFp32_6x16_PackedWindows()
+                    : MachineCodeFmaKernel.EmitFp32_6x16_PackedSysV();
+                _mem32 = ExecutableMemory.TryAllocate(code);
                 if (_mem32 is not null) _kern32 = _mem32.Pointer;
             }
             catch { _mem32 = null; _kern32 = 0; }

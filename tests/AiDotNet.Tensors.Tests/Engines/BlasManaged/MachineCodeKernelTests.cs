@@ -228,6 +228,93 @@ public class MachineCodeKernelTests
                 $"6x16 FP32 machine kernel mismatch at {i}: kernel={cKernel[i]:G9}, ref={cRef[i]:G9} (kc={kc}, ldc={ldc})");
     }
 
+    [Theory]
+    [InlineData(1, 8)]
+    [InlineData(7, 8)]
+    [InlineData(64, 8)]
+    [InlineData(256, 8)]
+    [InlineData(37, 11)]
+    [InlineData(6, 9)]
+    public unsafe void Fp64_6x8_SysV_MatchesFmaReference(int kc, int ldc)
+    {
+        // Runs on Linux/macOS x64 (incl. CI) — validates the System V ABI encoding,
+        // which can't be executed on Windows. delegate* unmanaged uses the platform
+        // default convention (SysV on Linux/macOS x64), matching the emitted kernel.
+        if (!IsX64Unix || !Avx2.IsSupported || !Fma.IsSupported) return;
+
+        const int Mr = 6, Nr = 8;
+        byte[] code = MachineCodeFmaKernel.EmitFp64_6x8_PackedSysVU4();
+        using var mem = ExecutableMemory.TryAllocate(code);
+        if (mem is null) return;
+        var fn = (delegate* unmanaged<double*, double*, double*, long, long, void>)mem.Pointer;
+
+        var rng = new Random(7 + kc * 13 + ldc);
+        var packedA = new double[kc * Mr];
+        var packedB = new double[kc * Nr];
+        for (int i = 0; i < packedA.Length; i++) packedA[i] = rng.NextDouble() * 2 - 1;
+        for (int i = 0; i < packedB.Length; i++) packedB[i] = rng.NextDouble() * 2 - 1;
+        int cLen = (Mr - 1) * ldc + Nr;
+        var c0 = new double[cLen];
+        for (int i = 0; i < cLen; i++) c0[i] = rng.NextDouble() * 2 - 1;
+        var cKernel = (double[])c0.Clone();
+        var cRef = (double[])c0.Clone();
+
+        fixed (double* pa = packedA, pb = packedB, pc = cKernel) fn(pa, pb, pc, ldc, kc);
+
+        for (int r = 0; r < Mr; r++)
+            for (int col = 0; col < Nr; col++)
+            {
+                double acc = cRef[r * ldc + col];
+                for (int kk = 0; kk < kc; kk++)
+                    acc = Math.FusedMultiplyAdd(packedA[kk * Mr + r], packedB[kk * Nr + col], acc);
+                cRef[r * ldc + col] = acc;
+            }
+        for (int i = 0; i < cLen; i++)
+            Assert.True(BitConverter.DoubleToInt64Bits(cKernel[i]) == BitConverter.DoubleToInt64Bits(cRef[i]),
+                $"6x8 SysV mismatch at {i}: kernel={cKernel[i]:G17}, ref={cRef[i]:G17} (kc={kc}, ldc={ldc})");
+    }
+
+    [Theory]
+    [InlineData(1, 16)]
+    [InlineData(7, 16)]
+    [InlineData(256, 16)]
+    [InlineData(37, 19)]
+    public unsafe void Fp32_6x16_SysV_MatchesFmaReference(int kc, int ldc)
+    {
+        if (!IsX64Unix || !Avx2.IsSupported || !Fma.IsSupported) return;
+
+        const int Mr = 6, Nr = 16;
+        byte[] code = MachineCodeFmaKernel.EmitFp32_6x16_PackedSysV();
+        using var mem = ExecutableMemory.TryAllocate(code);
+        if (mem is null) return;
+        var fn = (delegate* unmanaged<float*, float*, float*, long, long, void>)mem.Pointer;
+
+        var rng = new Random(13 + kc * 17 + ldc);
+        var packedA = new float[kc * Mr];
+        var packedB = new float[kc * Nr];
+        for (int i = 0; i < packedA.Length; i++) packedA[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < packedB.Length; i++) packedB[i] = (float)(rng.NextDouble() * 2 - 1);
+        int cLen = (Mr - 1) * ldc + Nr;
+        var c0 = new float[cLen];
+        for (int i = 0; i < cLen; i++) c0[i] = (float)(rng.NextDouble() * 2 - 1);
+        var cKernel = (float[])c0.Clone();
+        var cRef = (float[])c0.Clone();
+
+        fixed (float* pa = packedA, pb = packedB, pc = cKernel) fn(pa, pb, pc, ldc, kc);
+
+        for (int r = 0; r < Mr; r++)
+            for (int col = 0; col < Nr; col++)
+            {
+                float acc = cRef[r * ldc + col];
+                for (int kk = 0; kk < kc; kk++)
+                    acc = MathF.FusedMultiplyAdd(packedA[kk * Mr + r], packedB[kk * Nr + col], acc);
+                cRef[r * ldc + col] = acc;
+            }
+        for (int i = 0; i < cLen; i++)
+            Assert.True(BitConverter.SingleToInt32Bits(cKernel[i]) == BitConverter.SingleToInt32Bits(cRef[i]),
+                $"6x16 FP32 SysV mismatch at {i}: kernel={cKernel[i]:G9}, ref={cRef[i]:G9} (kc={kc}, ldc={ldc})");
+    }
+
     [Fact]
     public unsafe void Fp64_6x8_MachineCode_Perf()
     {
