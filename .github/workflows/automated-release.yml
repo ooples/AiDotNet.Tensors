@@ -403,8 +403,9 @@ jobs:
           CODE_SIGNING_CERT_BASE64: ${{ secrets.CODE_SIGNING_CERT_BASE64 }}
           CODE_SIGNING_CERT_PASSWORD: ${{ secrets.CODE_SIGNING_CERT_PASSWORD }}
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:CODE_SIGNING_CERT_BASE64)) {
-            Write-Host "No CODE_SIGNING_CERT_BASE64 secret configured - skipping signing (packages will be UNSIGNED)."
+          if ([string]::IsNullOrWhiteSpace($env:CODE_SIGNING_CERT_BASE64) -or
+              [string]::IsNullOrWhiteSpace($env:CODE_SIGNING_CERT_PASSWORD)) {
+            Write-Host "Code-signing secrets are incomplete (CERT_BASE64 and/or CERT_PASSWORD missing) - skipping signing (packages will be UNSIGNED)."
             exit 0
           }
           $certPath = Join-Path ([System.IO.Path]::GetTempPath()) "aidotnet-codesign.pfx"
