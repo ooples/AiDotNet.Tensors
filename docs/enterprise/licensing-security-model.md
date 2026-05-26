@@ -97,15 +97,25 @@ infra/tooling, not code:
    `license-server-response-signing.md` and (b) the customer enables
    `RequireSignedResponse`. **Note:** the offline entitlement already covers the
    high-assurance case, so this only matters if trial-bypass is a concern.
-4. **NativeAOT the enforcement path** *(architecture initiative)*. Compiling
-   enforcement to native code turns "minutes in dnSpy" into serious reverse
-   engineering. Flipping the *whole* tensor library to AOT is infeasible
+4. **NativeAOT the enforcement path** *(architecture initiative — FULLY DESIGNED)*.
+   Compiling enforcement to native code turns "minutes in dnSpy" into serious
+   reverse engineering. Flipping the *whole* tensor library to AOT is infeasible
    (reflection/generics); the real path is extracting enforcement into a small,
-   separately-AOT-compiled component. Scoped as its own project.
-5. **Commercial obfuscation / anti-tamper** *(tooling)*. ConfuserEx (OSS) or a
-   commercial SDK (e.g. Dotfuscator) integrated into the publish step. Raises
-   reverse-engineering cost; still crackable. Requires pipeline integration; not
-   something a source edit delivers.
+   separately-AOT-compiled component. Complete architecture, P/Invoke contract,
+   the anti-no-op "binding" design, and the per-OS CI build matrix are in
+   `nativeaot-enforcement-design.md`. **Blocker:** needs the 4-runner native
+   build matrix (a single machine can't produce cross-platform native binaries,
+   and a single-RID dependency would break Linux CI / non-Windows consumers).
+   Honest ceiling: the managed call site stays patchable unless the native
+   component gates something the app genuinely needs (the "binding").
+5. **Commercial obfuscation / anti-tamper** *(tooling — INTEGRATION POINT WIRED)*.
+   The release pipeline has a guarded "Obfuscate Release assemblies" step that
+   runs your obfuscator over the built DLLs before pack — a **no-op until** you
+   set the `OBFUSCATOR_EXE` (+ optional `OBFUSCATOR_ARGS`) repository variables.
+   **Blocker:** the obfuscator itself is a licensed product (Eazfuscator /
+   Dotfuscator / PreEmptive) that must be provisioned; no OSS default is wired
+   in because ConfuserEx is unmaintained and risks breaking this
+   reflection/generics-heavy assembly. Validate against a staging release first.
 
 ## What actually protects enterprise revenue
 

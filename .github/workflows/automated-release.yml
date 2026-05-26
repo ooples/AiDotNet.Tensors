@@ -279,6 +279,34 @@ jobs:
           dotnet restore
           dotnet build -c Release --no-restore -p:TelemetryUrl="${{ secrets.AIDOTNET_TELEMETRY_URL }}" -p:TelemetryKey="${{ secrets.AIDOTNET_TELEMETRY_KEY }}"
 
+      # Obfuscation / anti-tamper integration point. Runs the obfuscator you
+      # provision over the freshly-built Release DLLs BEFORE they're packed, so
+      # the published assemblies are protected. This is a NO-OP until you set the
+      # OBFUSCATOR_EXE repository variable (path/command of your licensed tool,
+      # e.g. Eazfuscator/Dotfuscator CLI) and optional OBFUSCATOR_ARGS — so it
+      # never breaks a build. See docs/enterprise/licensing-security-model.md.
+      # NOTE: validate your tool against this reflection/generics-heavy library
+      # in a staging release first — aggressive obfuscation can break runtime
+      # behaviour. (No OSS default is wired in: ConfuserEx is unmaintained and
+      # risks breaking this assembly.)
+      - name: Obfuscate Release assemblies (if obfuscator configured)
+        shell: pwsh
+        env:
+          OBFUSCATOR_EXE: ${{ vars.OBFUSCATOR_EXE }}
+          OBFUSCATOR_ARGS: ${{ vars.OBFUSCATOR_ARGS }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:OBFUSCATOR_EXE)) {
+            Write-Host "No OBFUSCATOR_EXE configured - skipping obfuscation (assemblies will be UNobfuscated)."
+            exit 0
+          }
+          $targets = Get-ChildItem -Recurse -Path src -Filter AiDotNet.Tensors.dll |
+                     Where-Object { $_.FullName -match '[\\/]bin[\\/]Release[\\/]' }
+          foreach ($dll in $targets) {
+            Write-Host "Obfuscating $($dll.FullName)..."
+            & $env:OBFUSCATOR_EXE @($env:OBFUSCATOR_ARGS -split ' ' | Where-Object { $_ }) "$($dll.FullName)"
+            if ($LASTEXITCODE -ne 0) { Write-Error "Obfuscation failed for $($dll.Name)"; exit $LASTEXITCODE }
+          }
+
       - name: Pack NuGet packages
         shell: pwsh
         run: |
