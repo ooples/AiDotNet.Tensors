@@ -3380,7 +3380,10 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
 
         // Get broadcast shape
         int[] broadcastShape = GetBroadcastShape(this._shape, other._shape);
-        var result = new Tensor<T>(broadcastShape);
+        // Pooled result — BroadcastElementwise writes every element (full
+        // coverage), so dirty rented memory is safe, and this keeps the
+        // broadcast result off the GC heap (matches the same-shape fast paths).
+        var result = TensorAllocator.Rent<T>(broadcastShape);
 
         // Span-based stride broadcast — replaces the previous
         // foreach (var index in result.GetIndices()) + indexer-per-element
@@ -3419,7 +3422,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         }
 
         int[] broadcastShape = GetBroadcastShape(this._shape, other._shape);
-        var result = new Tensor<T>(broadcastShape);
+        var result = TensorAllocator.Rent<T>(broadcastShape);
         BroadcastElementwise(this, other, result, broadcastShape, BroadcastOp.Subtract);
         return result;
     }
@@ -3454,7 +3457,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         }
 
         int[] broadcastShape = GetBroadcastShape(this._shape, other._shape);
-        var result = new Tensor<T>(broadcastShape);
+        var result = TensorAllocator.Rent<T>(broadcastShape);
         BroadcastElementwise(this, other, result, broadcastShape, BroadcastOp.Multiply);
         return result;
     }
