@@ -82,14 +82,34 @@ public class PrePackSpeedupTest
         for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() * 2 - 1);
         for (int i = 0; i < b.Length; i++) b[i] = (float)(rng.NextDouble() * 2 - 1);
 
+        // Min-of-N timing on a shared CI runner: a single wall-clock measurement
+        // window is contaminated whenever the GC fires, the OS preempts the
+        // benchmark thread, or another xUnit thread on the same machine spikes
+        // the runner. CI run 26429102450 measured 0.25x speedup for what locally
+        // gives ~1.3x; multiple PRs since then have hit the same flake.
+        // Take the min wall-clock per timing block across repetitions, then
+        // compute the speedup ratio from those mins — the unpolluted floor
+        // moves only on a real regression, not a transient pause.
+        const int repeats = 3;
+        double baselineUsBest = double.MaxValue;
+        double prePackUsBest = double.MaxValue;
+
         // Baseline: live-pack B every call.
         for (int w = 0; w < warmup; w++)
             BlasManagedLib.Gemm<float>(a, K, false, b, N, false, cBaseline, N, M, N, K);
-        var swBaseline = Stopwatch.StartNew();
-        for (int it = 0; it < iterations; it++)
-            BlasManagedLib.Gemm<float>(a, K, false, b, N, false, cBaseline, N, M, N, K);
-        swBaseline.Stop();
-        double baselineUs = (swBaseline.Elapsed.TotalMilliseconds * 1000.0) / iterations;
+        for (int r = 0; r < repeats; r++)
+        {
+            GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, blocking: true);
+            GC.WaitForPendingFinalizers();
+            GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, blocking: true);
+            var swBaseline = Stopwatch.StartNew();
+            for (int it = 0; it < iterations; it++)
+                BlasManagedLib.Gemm<float>(a, K, false, b, N, false, cBaseline, N, M, N, K);
+            swBaseline.Stop();
+            double us = (swBaseline.Elapsed.TotalMilliseconds * 1000.0) / iterations;
+            if (us < baselineUsBest) baselineUsBest = us;
+        }
+        double baselineUs = baselineUsBest;
 
         var handle = BlasManagedLib.PrePackB<float>(b, N, false, K, N);
         try
@@ -97,11 +117,19 @@ public class PrePackSpeedupTest
             var opts = new BlasOptions<float> { PackedB = handle };
             for (int w = 0; w < warmup; w++)
                 BlasManagedLib.Gemm<float>(a, K, false, b, N, false, cPrePack, N, M, N, K, opts);
-            var swPrePack = Stopwatch.StartNew();
-            for (int it = 0; it < iterations; it++)
-                BlasManagedLib.Gemm<float>(a, K, false, b, N, false, cPrePack, N, M, N, K, opts);
-            swPrePack.Stop();
-            double prePackUs = (swPrePack.Elapsed.TotalMilliseconds * 1000.0) / iterations;
+            for (int r = 0; r < repeats; r++)
+            {
+                GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, blocking: true);
+                GC.WaitForPendingFinalizers();
+                GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, blocking: true);
+                var swPrePack = Stopwatch.StartNew();
+                for (int it = 0; it < iterations; it++)
+                    BlasManagedLib.Gemm<float>(a, K, false, b, N, false, cPrePack, N, M, N, K, opts);
+                swPrePack.Stop();
+                double us = (swPrePack.Elapsed.TotalMilliseconds * 1000.0) / iterations;
+                if (us < prePackUsBest) prePackUsBest = us;
+            }
+            double prePackUs = prePackUsBest;
 
             double maxDelta = 0;
             for (int i = 0; i < cBaseline.Length; i++)
