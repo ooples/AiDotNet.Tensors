@@ -167,9 +167,9 @@ public static class BlasManaged
             int mkMr = 0, mkNr = 0;
             bool mkAvail = false;
             if (typeof(T) == typeof(double) && MachineKernelGemm.IsFp64Available)
-            { mkMr = MachineKernelGemm.Fp64Mr; mkNr = MachineKernelGemm.Fp64Nr; mkAvail = true; }
+            { mkMr = MachineKernelGemm.Fp64Mr; mkNr = MachineKernelGemm.ActiveFp64Nr; mkAvail = true; }
             else if (typeof(T) == typeof(float) && MachineKernelGemm.IsFp32Available)
-            { mkMr = MachineKernelGemm.Fp32Mr; mkNr = MachineKernelGemm.Fp32Nr; mkAvail = true; }
+            { mkMr = MachineKernelGemm.Fp32Mr; mkNr = MachineKernelGemm.ActiveFp32Nr; mkAvail = true; }
 
             var epi409 = options.Epilogue;
             if (mkAvail && m >= mkMr && n >= mkNr

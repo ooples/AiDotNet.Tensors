@@ -177,6 +177,42 @@ public class MachineKernelGemmTests
             $"FP32 M={M} N={N} K={K}: Auto vs reference drift {maxVsRef:G6} > {tol:G6}");
     }
 
+    [Theory]
+    [InlineData(96, 256, 384)]   // FP64: aligned to AVX-512 6×16 interior
+    [InlineData(100, 300, 256)]  // FP64: both tails (m%6, n%16)
+    public void Gemm_MachineKernel_Avx512Enabled_FP64_Matches_Reference(int M, int N, int K)
+    {
+        // With EnableAvx512=true this exercises the AVX-512 6×16 path on AVX-512
+        // hardware, and the AVX2 fallback (UseAvx512=false) on this box — both must
+        // match the reference. Verifies the dispatch + tail split for the wider tile.
+        var rng = new Random(909 + M + N + K);
+        var a = new double[M * K];
+        var b = new double[K * N];
+        for (int i = 0; i < a.Length; i++) a[i] = rng.NextDouble() * 2 - 1;
+        for (int i = 0; i < b.Length; i++) b[i] = rng.NextDouble() * 2 - 1;
+        var cAuto = new double[M * N];
+        var cRef = new double[M * N];
+
+        bool prev = MachineKernelGemm.EnableAvx512;
+        try
+        {
+            MachineKernelGemm.EnableAvx512 = true;
+            BlasManagedLib.Gemm<double>(a, K, false, b, N, false, cAuto, N, M, N, K,
+                new BlasOptions<double> { PackingMode = PackingMode.Auto });
+        }
+        finally { MachineKernelGemm.EnableAvx512 = prev; }
+        ReferenceGemm(a, K, b, N, cRef, N, M, N, K);
+
+        double maxDelta = 0, scale = 0;
+        for (int i = 0; i < cAuto.Length; i++)
+        {
+            maxDelta = Math.Max(maxDelta, Math.Abs(cAuto[i] - cRef[i]));
+            scale = Math.Max(scale, Math.Abs(cRef[i]));
+        }
+        Assert.True(maxDelta < 1e-9 * Math.Max(1.0, scale) * K,
+            $"AVX-512-enabled M={M} N={N} K={K}: drift {maxDelta:G6}");
+    }
+
     [Fact]
     public void Gemm_MachineKernel_Disabled_StillCorrect()
     {

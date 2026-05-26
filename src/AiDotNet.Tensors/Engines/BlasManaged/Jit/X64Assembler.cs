@@ -108,6 +108,22 @@ internal sealed class X64Assembler
         B(0, 0, 0, 0);
     }
 
+    /// <summary>jnz rel32 (any distance). 0F 85 cd. For loop bodies too big for rel8.</summary>
+    internal void JnzLabel32(int label)
+    {
+        B(0x0F, 0x85);
+        _rel32Fixups.Add((_code.Count, label));
+        B(0, 0, 0, 0);
+    }
+
+    /// <summary>jz rel32 (any distance). 0F 84 cd.</summary>
+    internal void JzLabel32(int label)
+    {
+        B(0x0F, 0x84);
+        _rel32Fixups.Add((_code.Count, label));
+        B(0, 0, 0, 0);
+    }
+
     // VEX memory form with disp32 (mod=10): [base + disp32].
     private void VexMemDisp32(int map, int pp, int w, int L, byte opcode, int reg, int baseReg, int disp32)
     {
@@ -236,6 +252,12 @@ internal sealed class X64Assembler
     /// <summary>vmovups [base+disp8], xmm_src (128-bit store). VEX.128.0F.WIG 11.</summary>
     internal void VmovupsXmmStore(int baseReg, sbyte disp8, int src) => VexMemDisp8(Map0F, PpNone, 0, 0, 0x11, src, baseReg, disp8);
 
+    /// <summary>vmovups xmm_dst, [base+disp32] (128-bit load, disp32 form for offsets ≥ 0x80).</summary>
+    internal void VmovupsXmmLoadD32(int dst, int baseReg, int disp32) => VexMemDisp32(Map0F, PpNone, 0, 0, 0x10, dst, baseReg, disp32);
+
+    /// <summary>vmovups [base+disp32], xmm_src (128-bit store, disp32 form for offsets ≥ 0x80).</summary>
+    internal void VmovupsXmmStoreD32(int baseReg, int disp32, int src) => VexMemDisp32(Map0F, PpNone, 0, 0, 0x11, src, baseReg, disp32);
+
     // ── FP32 (ps) AVX2/FMA forms ───────────────────────────────────────────────
     // Differences from the pd forms: vbroadcastss is opcode 0x18 (vs 0x19),
     // vfmadd231ps uses W0 (vs W1), and vmovups has no 66-prefix (pp=None, vs Pp66).
@@ -260,4 +282,61 @@ internal sealed class X64Assembler
         B(rex, 0x8D, 0x04, sib);
         Imm32(0);
     }
+
+    // ── AVX-512 (EVEX) forms ────────────────────────────────────────────────
+    // 4-byte EVEX prefix: 62 P0 P1 P2.
+    //   P0 = [R̄ X̄ B̄ R̄'] [0 0] [mm]   (RXB + R' extend reg/rm to 4th/5th bit, all inverted)
+    //   P1 = [W] [v̄v̄v̄v̄] [1] [pp]     (W, NDS vvvv inverted, fixed 1, prefix pp)
+    //   P2 = [z] [L'L] [b] [V̄'] [aaa]  (z=merge/zero, L'L=length, b=broadcast, V' = vvvv[4] inverted, mask)
+    // Used here only for zmm0–15 / GP base regs 0–15, no mask, no broadcast, 512-bit,
+    // disp32 (mod=10, raw byte displacement — avoids EVEX's scaled disp8 entirely).
+
+    // EVEX register-register (mod=11): dst = reg, v = NDS source, rm = the other source.
+    private void EvexRR(int map, int pp, int w, byte opcode, int reg, int v, int rm)
+    {
+        int R = ((reg >> 3) & 1) ^ 1;
+        int Rp = ((reg >> 4) & 1) ^ 1;
+        int X = ((rm >> 4) & 1) ^ 1;
+        int Bb = ((rm >> 3) & 1) ^ 1;
+        byte p0 = (byte)((R << 7) | (X << 6) | (Bb << 5) | (Rp << 4) | (map & 3));
+        int vvvv = (~v) & 0xF;
+        int Vp = ((v >> 4) & 1) ^ 1;
+        byte p1 = (byte)((w << 7) | (vvvv << 3) | (1 << 2) | (pp & 3));
+        byte p2 = (byte)((2 << 5) | (Vp << 3)); // L'L=10 (512), z=0, b=0, aaa=000
+        byte modrm = (byte)(0xC0 | ((reg & 7) << 3) | (rm & 7));
+        B(0x62, p0, p1, p2, opcode, modrm);
+    }
+
+    // EVEX memory (mod=10, disp32, no SIB index): reg op [base + disp32].
+    private void EvexMemDisp32(int map, int pp, int w, byte opcode, int reg, int baseReg, int disp32)
+    {
+        int R = ((reg >> 3) & 1) ^ 1;
+        int Rp = ((reg >> 4) & 1) ^ 1;
+        int X = ((baseReg >> 4) & 1) ^ 1; // base 4th bit (GP regs 0–15 → 0 → X=1); no index
+        int Bb = ((baseReg >> 3) & 1) ^ 1;
+        byte p0 = (byte)((R << 7) | (X << 6) | (Bb << 5) | (Rp << 4) | (map & 3));
+        byte p1 = (byte)((w << 7) | (0xF << 3) | (1 << 2) | (pp & 3)); // vvvv=1111 (unused)
+        byte p2 = (byte)((2 << 5) | (1 << 3));                          // L'L=512, V'=1
+        byte modrm = (byte)(0x80 | ((reg & 7) << 3) | (baseReg & 7));   // mod=10
+        B(0x62, p0, p1, p2, opcode, modrm);
+        if ((baseReg & 7) == 4) _code.Add(0x24);                        // SIB for rsp/r12
+        Imm32(disp32);
+    }
+
+    /// <summary>vfmadd231pd zmm, zmm, zmm. EVEX.512.66.0F38.W1 B8.</summary>
+    internal void Vfmadd231pdZ(int dst, int s1, int s2) => EvexRR(Map0F38, Pp66, 1, 0xB8, dst, s1, s2);
+    /// <summary>vfmadd231ps zmm, zmm, zmm. EVEX.512.66.0F38.W0 B8.</summary>
+    internal void Vfmadd231psZ(int dst, int s1, int s2) => EvexRR(Map0F38, Pp66, 0, 0xB8, dst, s1, s2);
+    /// <summary>vmovupd zmm, [base+disp32] (load). EVEX.512.66.0F.W1 10.</summary>
+    internal void VmovupdLoadZ(int dst, int baseReg, int disp32) => EvexMemDisp32(Map0F, Pp66, 1, 0x10, dst, baseReg, disp32);
+    /// <summary>vmovupd [base+disp32], zmm (store). EVEX.512.66.0F.W1 11.</summary>
+    internal void VmovupdStoreZ(int baseReg, int disp32, int src) => EvexMemDisp32(Map0F, Pp66, 1, 0x11, src, baseReg, disp32);
+    /// <summary>vmovups zmm, [base+disp32] (load). EVEX.512.0F.W0 10.</summary>
+    internal void VmovupsLoadZ(int dst, int baseReg, int disp32) => EvexMemDisp32(Map0F, PpNone, 0, 0x10, dst, baseReg, disp32);
+    /// <summary>vmovups [base+disp32], zmm (store). EVEX.512.0F.W0 11.</summary>
+    internal void VmovupsStoreZ(int baseReg, int disp32, int src) => EvexMemDisp32(Map0F, PpNone, 0, 0x11, src, baseReg, disp32);
+    /// <summary>vbroadcastsd zmm, [base+disp32]. EVEX.512.66.0F38.W1 19.</summary>
+    internal void VbroadcastSdZ(int dst, int baseReg, int disp32) => EvexMemDisp32(Map0F38, Pp66, 1, 0x19, dst, baseReg, disp32);
+    /// <summary>vbroadcastss zmm, [base+disp32]. EVEX.512.66.0F38.W0 18.</summary>
+    internal void VbroadcastSsZ(int dst, int baseReg, int disp32) => EvexMemDisp32(Map0F38, Pp66, 0, 0x18, dst, baseReg, disp32);
 }

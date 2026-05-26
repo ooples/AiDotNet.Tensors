@@ -42,18 +42,36 @@ internal static class MachineKernelGemm
     /// <summary>FP32 microkernel column tile (N alignment the interior must satisfy).</summary>
     internal const int Fp32Nr = 16;
 
+    /// <summary>
+    /// Opt-in AVX-512 path (default OFF). The EVEX kernels are encoding-verified
+    /// (capstone disassembly) but NOT yet execution-verified on real AVX-512 hardware
+    /// (none available locally or in CI), so the verified AVX2 kernels remain the
+    /// default. Flip to true only after the Avx512F-gated tests are green on an
+    /// AVX-512 runner. When enabled AND Avx512F is supported, the FP64 tile widens to
+    /// 6×16 and FP32 to 6×32 (512-bit), otherwise the AVX2 6×8 / 6×16 tiles are used.
+    /// </summary>
+    internal static bool EnableAvx512 { get; set; }
+
 #if NET5_0_OR_GREATER
     private const int KcBlock = 256; // K-blocking so packed panels stay cache-resident.
 
     /// <summary>True when the FP64 machine kernel is usable on this process. Idempotent.</summary>
-    internal static bool IsFp64Available => Enabled && TryInitFp64();
+    internal static bool IsFp64Available => Enabled && (TryInitFp64() || UseAvx512Fp64);
     /// <summary>True when the FP32 machine kernel is usable on this process. Idempotent.</summary>
-    internal static bool IsFp32Available => Enabled && TryInitFp32();
+    internal static bool IsFp32Available => Enabled && (TryInitFp32() || UseAvx512Fp32);
+
+    /// <summary>Effective FP64 N-tile (16 when the AVX-512 path is active, else 8).</summary>
+    internal static int ActiveFp64Nr => UseAvx512Fp64 ? 16 : Fp64Nr;
+    /// <summary>Effective FP32 N-tile (32 when the AVX-512 path is active, else 16).</summary>
+    internal static int ActiveFp32Nr => UseAvx512Fp32 ? 32 : Fp32Nr;
+
+    private static bool UseAvx512Fp64 => EnableAvx512 && Avx512F.IsSupported && TryInitAvx512Fp64();
+    private static bool UseAvx512Fp32 => EnableAvx512 && Avx512F.IsSupported && TryInitAvx512Fp32();
 
     private static readonly object _lock = new();
-    private static bool _tried64, _tried32;
-    private static ExecutableMemory? _mem64, _mem32; // kept alive for the process (never disposed)
-    private static nint _kern64, _kern32;
+    private static bool _tried64, _tried32, _triedZ64, _triedZ32;
+    private static ExecutableMemory? _mem64, _mem32, _memZ64, _memZ32; // kept alive for the process
+    private static nint _kern64, _kern32, _kernZ64, _kernZ32;
 
     private static bool IsWindows => RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
 
@@ -109,9 +127,52 @@ internal static class MachineKernelGemm
         }
     }
 
+    private static bool TryInitAvx512Fp64()
+    {
+        if (_triedZ64) return _kernZ64 != 0;
+        lock (_lock)
+        {
+            if (_triedZ64) return _kernZ64 != 0;
+            _triedZ64 = true;
+            if (!PlatformOk()) return false;
+            try
+            {
+                byte[] code = IsWindows
+                    ? MachineCodeFmaKernel.EmitFp64_6x16_Avx512Windows()
+                    : MachineCodeFmaKernel.EmitFp64_6x16_Avx512SysV();
+                _memZ64 = ExecutableMemory.TryAllocate(code);
+                if (_memZ64 is not null) _kernZ64 = _memZ64.Pointer;
+            }
+            catch { _memZ64 = null; _kernZ64 = 0; }
+            return _kernZ64 != 0;
+        }
+    }
+
+    private static bool TryInitAvx512Fp32()
+    {
+        if (_triedZ32) return _kernZ32 != 0;
+        lock (_lock)
+        {
+            if (_triedZ32) return _kernZ32 != 0;
+            _triedZ32 = true;
+            if (!PlatformOk()) return false;
+            try
+            {
+                byte[] code = IsWindows
+                    ? MachineCodeFmaKernel.EmitFp32_6x32_Avx512Windows()
+                    : MachineCodeFmaKernel.EmitFp32_6x32_Avx512SysV();
+                _memZ32 = ExecutableMemory.TryAllocate(code);
+                if (_memZ32 is not null) _kernZ32 = _memZ32.Pointer;
+            }
+            catch { _memZ32 = null; _kernZ32 = 0; }
+            return _kernZ32 != 0;
+        }
+    }
+
     /// <summary>
     /// Run C = A·B (FP64) with the machine kernel; returns false if the shape doesn't
-    /// qualify. C must already be zeroed (the kernel accumulates).
+    /// qualify. C must already be zeroed (the kernel accumulates). Uses the AVX-512
+    /// 6×16 kernel when that path is active, otherwise the AVX2 6×8 kernel.
     /// </summary>
     internal static unsafe bool TryGemmFp64(
         ReadOnlySpan<double> a, int lda, bool transA,
@@ -119,14 +180,19 @@ internal static class MachineKernelGemm
         Span<double> c, int ldc, int m, int n, int k, bool hasEpilogue, bool hasPrePack)
     {
         if (!Enabled || transA || transB || hasEpilogue || hasPrePack) return false;
-        if (m % Fp64Mr != 0 || n % Fp64Nr != 0 || m <= 0 || n <= 0 || k <= 0) return false;
-        if (!TryInitFp64()) return false;
-        return RunPacked<double>(a, lda, b, ldb, c, ldc, m, n, k, Fp64Mr, Fp64Nr, _kern64);
+        bool z = UseAvx512Fp64;
+        int nr = z ? 16 : Fp64Nr;
+        nint kern = z ? _kernZ64 : _kern64;
+        if (!z && !TryInitFp64()) return false;
+        if (kern == 0) return false;
+        if (m % Fp64Mr != 0 || n % nr != 0 || m <= 0 || n <= 0 || k <= 0) return false;
+        return RunPacked<double>(a, lda, b, ldb, c, ldc, m, n, k, Fp64Mr, nr, kern);
     }
 
     /// <summary>
     /// Run C = A·B (FP32) with the machine kernel; returns false if the shape doesn't
-    /// qualify. C must already be zeroed (the kernel accumulates).
+    /// qualify. C must already be zeroed. Uses the AVX-512 6×32 kernel when active,
+    /// otherwise the AVX2 6×16 kernel.
     /// </summary>
     internal static unsafe bool TryGemmFp32(
         ReadOnlySpan<float> a, int lda, bool transA,
@@ -134,9 +200,13 @@ internal static class MachineKernelGemm
         Span<float> c, int ldc, int m, int n, int k, bool hasEpilogue, bool hasPrePack)
     {
         if (!Enabled || transA || transB || hasEpilogue || hasPrePack) return false;
-        if (m % Fp32Mr != 0 || n % Fp32Nr != 0 || m <= 0 || n <= 0 || k <= 0) return false;
-        if (!TryInitFp32()) return false;
-        return RunPacked<float>(a, lda, b, ldb, c, ldc, m, n, k, Fp32Mr, Fp32Nr, _kern32);
+        bool z = UseAvx512Fp32;
+        int nr = z ? 32 : Fp32Nr;
+        nint kern = z ? _kernZ32 : _kern32;
+        if (!z && !TryInitFp32()) return false;
+        if (kern == 0) return false;
+        if (m % Fp32Mr != 0 || n % nr != 0 || m <= 0 || n <= 0 || k <= 0) return false;
+        return RunPacked<float>(a, lda, b, ldb, c, ldc, m, n, k, Fp32Mr, nr, kern);
     }
 
     /// <summary>
@@ -239,6 +309,8 @@ internal static class MachineKernelGemm
     /// <summary>net471 has no x86 intrinsics / function pointers — always defer to managed.</summary>
     internal static bool IsFp64Available => false;
     internal static bool IsFp32Available => false;
+    internal static int ActiveFp64Nr => Fp64Nr;
+    internal static int ActiveFp32Nr => Fp32Nr;
 
     internal static bool TryGemmFp64(
         ReadOnlySpan<double> a, int lda, bool transA,

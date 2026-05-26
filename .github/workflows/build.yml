@@ -40,12 +40,6 @@ jobs:
     - name: Restore dependencies
       run: dotnet restore
 
-    - name: Probe CPU SIMD capability (AVX-512 verification feasibility, #409)
-      run: |
-        echo "CPU flags (AVX family):"
-        lscpu | grep -ioE "avx[0-9a-z_]*" | sort -u || true
-        if lscpu | grep -qiw avx512f; then echo "RUNNER_HAS_AVX512=yes"; else echo "RUNNER_HAS_AVX512=no"; fi
-
     - name: Build (net10.0)
       run: |
         dotnet build src/AiDotNet.Tensors/AiDotNet.Tensors.csproj --configuration Release --no-restore --framework net10.0 -p:TelemetryUrl="${{ secrets.AIDOTNET_TELEMETRY_URL }}" -p:TelemetryKey="${{ secrets.AIDOTNET_TELEMETRY_KEY }}"
@@ -212,6 +206,42 @@ jobs:
         verbose: true
       env:
         CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  # AVX-512 machine-code microkernel verification (#409). The EVEX kernels are
+  # encoding-verified (capstone disassembly) but need AVX-512 hardware to verify the
+  # numerical result. Standard GitHub Linux runners are AMD (no AVX-512), so this job
+  # defaults to ubuntu-latest where the Avx512F-gated kernel tests SKIP (harmless — it
+  # still exercises the AVX2/SysV machine kernels on Linux). To get real AVX-512
+  # verification, set the repo variable AVX512_RUNNER to an AVX-512-capable runner
+  # label (a GitHub larger runner or a self-hosted box); the gated tests then execute
+  # and assert bit-exactness, after which MachineKernelGemm.EnableAvx512 can be
+  # flipped on by default.
+  avx512-verify:
+    runs-on: ${{ vars.AVX512_RUNNER || 'ubuntu-latest' }}
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '10.0.x'
+        dotnet-quality: 'preview'
+
+    - name: Report CPU AVX-512 capability
+      run: |
+        if lscpu | grep -qiw avx512f; then
+          echo "AVX-512 present — AVX-512 kernel tests WILL execute and verify.";
+        else
+          echo "::warning::Runner lacks AVX-512; AVX-512 kernel tests SKIP. Set repo variable AVX512_RUNNER to an AVX-512 runner to verify (#409).";
+        fi
+
+    - name: Build tests (net10.0)
+      run: dotnet build tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --framework net10.0
+
+    - name: Run machine-kernel tests (AVX-512 gated tests run only on AVX-512 hardware)
+      run: |
+        dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --no-build --framework net10.0 \
+          --filter "FullyQualifiedName~MachineCodeKernelTests|FullyQualifiedName~MachineKernelGemmTests"
 
   publish:
     needs: build

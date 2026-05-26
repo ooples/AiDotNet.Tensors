@@ -315,6 +315,117 @@ public class MachineCodeKernelTests
                 $"6x16 FP32 SysV mismatch at {i}: kernel={cKernel[i]:G9}, ref={cRef[i]:G9} (kc={kc}, ldc={ldc})");
     }
 
+    // The exact emitted lengths and prologue bytes were verified instruction-by-
+    // instruction with the capstone disassembler (0 bad, full byte coverage, correct
+    // EVEX + ABI). These platform-independent invariants catch any later encoder
+    // regression even on machines (like the CI runner) without AVX-512.
+    [Theory]
+    [InlineData("fp64-win", 688, 0x4C)] // Windows: starts `mov r10,[rsp+0x28]` (4C 8B ...)
+    [InlineData("fp64-sysv", 484, 0x4D)] // SysV:   starts `mov r10,r8`        (4D 89 C2)
+    [InlineData("fp32-win", 688, 0x4C)]
+    [InlineData("fp32-sysv", 484, 0x4D)]
+    public void Avx512_Encoding_StructuralInvariants(string which, int expectedLen, byte firstByte)
+    {
+        byte[] code = which switch
+        {
+            "fp64-win" => MachineCodeFmaKernel.EmitFp64_6x16_Avx512Windows(),
+            "fp64-sysv" => MachineCodeFmaKernel.EmitFp64_6x16_Avx512SysV(),
+            "fp32-win" => MachineCodeFmaKernel.EmitFp32_6x32_Avx512Windows(),
+            _ => MachineCodeFmaKernel.EmitFp32_6x32_Avx512SysV(),
+        };
+        Assert.Equal(expectedLen, code.Length);
+        Assert.Equal(firstByte, code[0]);
+        Assert.Equal(0xC3, code[code.Length - 1]);                 // ends with `ret`
+        Assert.Equal(0x77, code[code.Length - 2]);                 // `vzeroupper` (C5 F8 77)
+        int evex = 0;                                              // EVEX prefixes (0x62) ≈ ZMM ops
+        foreach (byte b in code) if (b == 0x62) evex++;
+        Assert.True(evex >= 12, $"{which}: expected ≥12 EVEX ops, found {evex}");
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(7)]
+    [InlineData(64)]
+    [InlineData(256)]
+    public unsafe void Fp64_6x16_Avx512_MatchesFmaReference(int kc)
+    {
+        // Runs only on AVX-512 hardware (none in our CI today — verifies on any such
+        // box/runner). The encoding is already capstone-verified; this confirms the
+        // numerical result bit-exactly.
+        if (!Avx512F.IsSupported || !(IsX64Windows || IsX64Unix)) return;
+
+        const int Mr = 6, Nr = 16, ldc = 16;
+        byte[] code = IsX64Windows
+            ? MachineCodeFmaKernel.EmitFp64_6x16_Avx512Windows()
+            : MachineCodeFmaKernel.EmitFp64_6x16_Avx512SysV();
+        using var mem = ExecutableMemory.TryAllocate(code);
+        if (mem is null) return;
+        var fn = (delegate* unmanaged<double*, double*, double*, long, long, void>)mem.Pointer;
+
+        var rng = new Random(101 + kc);
+        var packedA = new double[kc * Mr];
+        var packedB = new double[kc * Nr];
+        for (int i = 0; i < packedA.Length; i++) packedA[i] = rng.NextDouble() * 2 - 1;
+        for (int i = 0; i < packedB.Length; i++) packedB[i] = rng.NextDouble() * 2 - 1;
+        int cLen = (Mr - 1) * ldc + Nr;
+        var cKernel = new double[cLen];
+        var cRef = new double[cLen];
+        for (int i = 0; i < cLen; i++) { double v = rng.NextDouble() * 2 - 1; cKernel[i] = v; cRef[i] = v; }
+
+        fixed (double* pa = packedA, pb = packedB, pc = cKernel) fn(pa, pb, pc, ldc, kc);
+        for (int r = 0; r < Mr; r++)
+            for (int col = 0; col < Nr; col++)
+            {
+                double acc = cRef[r * ldc + col];
+                for (int kk = 0; kk < kc; kk++)
+                    acc = Math.FusedMultiplyAdd(packedA[kk * Mr + r], packedB[kk * Nr + col], acc);
+                cRef[r * ldc + col] = acc;
+            }
+        for (int i = 0; i < cLen; i++)
+            Assert.True(BitConverter.DoubleToInt64Bits(cKernel[i]) == BitConverter.DoubleToInt64Bits(cRef[i]),
+                $"AVX-512 6x16 mismatch at {i} (kc={kc})");
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(7)]
+    [InlineData(256)]
+    public unsafe void Fp32_6x32_Avx512_MatchesFmaReference(int kc)
+    {
+        if (!Avx512F.IsSupported || !(IsX64Windows || IsX64Unix)) return;
+
+        const int Mr = 6, Nr = 32, ldc = 32;
+        byte[] code = IsX64Windows
+            ? MachineCodeFmaKernel.EmitFp32_6x32_Avx512Windows()
+            : MachineCodeFmaKernel.EmitFp32_6x32_Avx512SysV();
+        using var mem = ExecutableMemory.TryAllocate(code);
+        if (mem is null) return;
+        var fn = (delegate* unmanaged<float*, float*, float*, long, long, void>)mem.Pointer;
+
+        var rng = new Random(202 + kc);
+        var packedA = new float[kc * Mr];
+        var packedB = new float[kc * Nr];
+        for (int i = 0; i < packedA.Length; i++) packedA[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < packedB.Length; i++) packedB[i] = (float)(rng.NextDouble() * 2 - 1);
+        int cLen = (Mr - 1) * ldc + Nr;
+        var cKernel = new float[cLen];
+        var cRef = new float[cLen];
+        for (int i = 0; i < cLen; i++) { float v = (float)(rng.NextDouble() * 2 - 1); cKernel[i] = v; cRef[i] = v; }
+
+        fixed (float* pa = packedA, pb = packedB, pc = cKernel) fn(pa, pb, pc, ldc, kc);
+        for (int r = 0; r < Mr; r++)
+            for (int col = 0; col < Nr; col++)
+            {
+                float acc = cRef[r * ldc + col];
+                for (int kk = 0; kk < kc; kk++)
+                    acc = MathF.FusedMultiplyAdd(packedA[kk * Mr + r], packedB[kk * Nr + col], acc);
+                cRef[r * ldc + col] = acc;
+            }
+        for (int i = 0; i < cLen; i++)
+            Assert.True(BitConverter.SingleToInt32Bits(cKernel[i]) == BitConverter.SingleToInt32Bits(cRef[i]),
+                $"AVX-512 6x32 FP32 mismatch at {i} (kc={kc})");
+    }
+
     [Fact]
     public unsafe void Fp64_6x8_MachineCode_Perf()
     {

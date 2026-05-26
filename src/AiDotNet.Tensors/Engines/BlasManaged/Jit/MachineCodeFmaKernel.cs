@@ -74,8 +74,9 @@ internal static class MachineCodeFmaKernel
         asm.MovRegFromRsp(R10, 0x28);
 
         // Prologue: preserve nonvolatile xmm6–15 (10 regs × 16 bytes = 0xA0).
+        // disp32 form: offsets 0x80/0x90 overflow a signed disp8.
         asm.SubRsp(0xA0);
-        for (int i = 0; i < 10; i++) asm.VmovupsXmmStore(RSP, (sbyte)(i * 0x10), 6 + i);
+        for (int i = 0; i < 10; i++) asm.VmovupsXmmStoreD32(RSP, i * 0x10, 6 + i);
 
         // rowStride (bytes) = ldc * 8  -> rax.
         asm.LeaRaxIndexScale8(R9);
@@ -122,7 +123,7 @@ internal static class MachineCodeFmaKernel
         }
 
         // Epilogue: restore xmm6–15, vzeroupper, ret.
-        for (int i = 0; i < 10; i++) asm.VmovupsXmmLoad(6 + i, RSP, (sbyte)(i * 0x10));
+        for (int i = 0; i < 10; i++) asm.VmovupsXmmLoadD32(6 + i, RSP, i * 0x10);
         asm.AddRsp(0xA0);
         asm.Vzeroupper();
         asm.Ret();
@@ -224,12 +225,14 @@ internal static class MachineCodeFmaKernel
     {
         asm.MovRegFromRsp(R10_, 0x28);
         asm.SubRsp(0xA0);
-        for (int i = 0; i < 10; i++) asm.VmovupsXmmStore(RSP_, (sbyte)(i * 0x10), 6 + i);
+        // disp32 form: offsets 0x80/0x90 don't fit a signed disp8 (would wrap negative,
+        // storing below rsp outside the frame — Windows has no red zone).
+        for (int i = 0; i < 10; i++) asm.VmovupsXmmStoreD32(RSP_, i * 0x10, 6 + i);
     }
 
     private static void EmitWindowsEpilogue(X64Assembler asm)
     {
-        for (int i = 0; i < 10; i++) asm.VmovupsXmmLoad(6 + i, RSP_, (sbyte)(i * 0x10));
+        for (int i = 0; i < 10; i++) asm.VmovupsXmmLoadD32(6 + i, RSP_, i * 0x10);
         asm.AddRsp(0xA0);
         asm.Vzeroupper();
         asm.Ret();
@@ -357,6 +360,153 @@ internal static class MachineCodeFmaKernel
         {
             asm.VmovupdStore(R11, 0, 2 * r);
             asm.VmovupdStore(R11, 32, 2 * r + 1);
+            if (r < Mr - 1) asm.AddRegReg(R11, RAX);
+        }
+    }
+
+    // ── AVX-512 (EVEX) microkernels ────────────────────────────────────────────
+    // Same 12-accumulator 6×(2-vector) structure as the AVX2 kernels, but each
+    // vector is a 512-bit ZMM (8 doubles / 16 floats), so the tile is 6×16 (FP64)
+    // or 6×32 (FP32). Registers stay in zmm0–15 (12 accumulators + bLo/bHi +
+    // 2 broadcasts), so no zmm16–31 extension encoding is needed. The Windows/SysV
+    // ABI wrappers are shared with the AVX2 kernels (zmm6–15's low 128 bits are the
+    // nonvolatile xmm6–15 on Windows). EVEX uses disp32 memory forms (raw byte
+    // displacement, no scaled-disp8). Unverified until run on AVX-512 hardware —
+    // gated behind Avx512F.IsSupported by the caller; tests assert the encoding via
+    // disassembly and (on AVX-512 hardware) bit-exactness vs the FMA reference.
+
+    /// <summary>AVX-512 FP64 6×16 packed microkernel, Windows x64 ABI.</summary>
+    internal static byte[] EmitFp64_6x16_Avx512Windows()
+    {
+        var asm = new X64Assembler();
+        EmitWindowsPrologue(asm);
+        EmitBody_Avx512_Fp64_6x16(asm);
+        EmitWindowsEpilogue(asm);
+        return asm.ToArray();
+    }
+
+    /// <summary>AVX-512 FP64 6×16 packed microkernel, System V AMD64 ABI.</summary>
+    internal static byte[] EmitFp64_6x16_Avx512SysV()
+    {
+        var asm = new X64Assembler();
+        EmitSysVPrologue(asm);
+        EmitBody_Avx512_Fp64_6x16(asm);
+        asm.Vzeroupper();
+        asm.Ret();
+        return asm.ToArray();
+    }
+
+    /// <summary>AVX-512 FP32 6×32 packed microkernel, Windows x64 ABI.</summary>
+    internal static byte[] EmitFp32_6x32_Avx512Windows()
+    {
+        var asm = new X64Assembler();
+        EmitWindowsPrologue(asm);
+        EmitBody_Avx512_Fp32_6x32(asm);
+        EmitWindowsEpilogue(asm);
+        return asm.ToArray();
+    }
+
+    /// <summary>AVX-512 FP32 6×32 packed microkernel, System V AMD64 ABI.</summary>
+    internal static byte[] EmitFp32_6x32_Avx512SysV()
+    {
+        var asm = new X64Assembler();
+        EmitSysVPrologue(asm);
+        EmitBody_Avx512_Fp32_6x32(asm);
+        asm.Vzeroupper();
+        asm.Ret();
+        return asm.ToArray();
+    }
+
+    /// <summary>Register-level AVX-512 FP64 6×16 body (zmm0–15). rcx=A, rdx=B, r8=c,
+    /// r9=ldc, r10=kc; clobbers zmm0–15, rax, r11; advances rcx/rdx/r10.</summary>
+    private static void EmitBody_Avx512_Fp64_6x16(X64Assembler asm)
+    {
+        const int RCX = 1, RDX = 2, R8 = 8, R9 = 9, R10 = 10, R11 = 11, RAX = 0;
+        const int BLO = 12, BHI = 13, A0 = 14, A1 = 15;
+        const int Mr = 6, Nr = 16; // Nr*8=128 bytes/Kstep for B; Mr*8=48 for A; hi ZMM at +64.
+
+        asm.LeaRaxIndexScale8(R9);                    // rowStride bytes = ldc*8
+        asm.MovRegReg(R11, R8);
+        for (int r = 0; r < Mr; r++)
+        {
+            asm.VmovupdLoadZ(2 * r, R11, 0);          // c[r] cols 0–7
+            asm.VmovupdLoadZ(2 * r + 1, R11, 64);     // c[r] cols 8–15
+            if (r < Mr - 1) asm.AddRegReg(R11, RAX);
+        }
+
+        int store = asm.NewLabel();
+        asm.TestRegSelf(R10);
+        asm.JzLabel32(store);
+
+        int loop = asm.NewLabel();
+        asm.MarkLabel(loop);
+        asm.VmovupdLoadZ(BLO, RDX, 0);
+        asm.VmovupdLoadZ(BHI, RDX, 64);
+        for (int r = 0; r < Mr; r++)
+        {
+            int areg = (r % 2 == 0) ? A0 : A1;
+            asm.VbroadcastSdZ(areg, RCX, r * 8);
+            asm.Vfmadd231pdZ(2 * r, areg, BLO);
+            asm.Vfmadd231pdZ(2 * r + 1, areg, BHI);
+        }
+        asm.AddRegImm8(RCX, Mr * 8);                  // aPtr += 6 doubles (48)
+        asm.AddRegImm32(RDX, Nr * 8);                 // bPtr += 16 doubles (128, > sbyte)
+        asm.DecReg(R10);
+        asm.JnzLabel32(loop);
+
+        asm.MarkLabel(store);
+        asm.MovRegReg(R11, R8);
+        for (int r = 0; r < Mr; r++)
+        {
+            asm.VmovupdStoreZ(R11, 0, 2 * r);
+            asm.VmovupdStoreZ(R11, 64, 2 * r + 1);
+            if (r < Mr - 1) asm.AddRegReg(R11, RAX);
+        }
+    }
+
+    /// <summary>Register-level AVX-512 FP32 6×32 body (zmm0–15). rcx=A, rdx=B, r8=c,
+    /// r9=ldc, r10=kc; clobbers zmm0–15, rax, r11; advances rcx/rdx/r10.</summary>
+    private static void EmitBody_Avx512_Fp32_6x32(X64Assembler asm)
+    {
+        const int RCX = 1, RDX = 2, R8 = 8, R9 = 9, R10 = 10, R11 = 11, RAX = 0;
+        const int BLO = 12, BHI = 13, A0 = 14, A1 = 15;
+        const int Mr = 6, Nr = 32; // Nr*4=128 bytes/Kstep for B; Mr*4=24 for A; hi ZMM at +64.
+
+        asm.LeaRaxIndexScale4(R9);                    // rowStride bytes = ldc*4
+        asm.MovRegReg(R11, R8);
+        for (int r = 0; r < Mr; r++)
+        {
+            asm.VmovupsLoadZ(2 * r, R11, 0);          // c[r] cols 0–15
+            asm.VmovupsLoadZ(2 * r + 1, R11, 64);     // c[r] cols 16–31
+            if (r < Mr - 1) asm.AddRegReg(R11, RAX);
+        }
+
+        int store = asm.NewLabel();
+        asm.TestRegSelf(R10);
+        asm.JzLabel32(store);
+
+        int loop = asm.NewLabel();
+        asm.MarkLabel(loop);
+        asm.VmovupsLoadZ(BLO, RDX, 0);
+        asm.VmovupsLoadZ(BHI, RDX, 64);
+        for (int r = 0; r < Mr; r++)
+        {
+            int areg = (r % 2 == 0) ? A0 : A1;
+            asm.VbroadcastSsZ(areg, RCX, r * 4);
+            asm.Vfmadd231psZ(2 * r, areg, BLO);
+            asm.Vfmadd231psZ(2 * r + 1, areg, BHI);
+        }
+        asm.AddRegImm8(RCX, Mr * 4);                  // aPtr += 6 floats (24)
+        asm.AddRegImm32(RDX, Nr * 4);                 // bPtr += 32 floats (128, > sbyte)
+        asm.DecReg(R10);
+        asm.JnzLabel32(loop);
+
+        asm.MarkLabel(store);
+        asm.MovRegReg(R11, R8);
+        for (int r = 0; r < Mr; r++)
+        {
+            asm.VmovupsStoreZ(R11, 0, 2 * r);
+            asm.VmovupsStoreZ(R11, 64, 2 * r + 1);
             if (r < Mr - 1) asm.AddRegReg(R11, RAX);
         }
     }
