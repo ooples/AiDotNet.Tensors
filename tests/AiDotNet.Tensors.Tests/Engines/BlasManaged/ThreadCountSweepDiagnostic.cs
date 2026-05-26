@@ -23,21 +23,23 @@ namespace AiDotNet.Tensors.Tests.Engines.BlasManaged;
 /// </para>
 ///
 /// <para>
-/// <b>Findings (Ryzen 9 3950X, FP64).</b> The default (all 32 threads) is often
-/// suboptimal, and near-native is reachable at the right thread count:
-/// <list type="bullet">
-///   <item>Large_1024sq: 32t=19.8 ms vs <b>2t=11.3 ms (1.76× faster, 1.1× native)</b></item>
-///   <item>BERT_FFN: 4–16t pathologically slow (44 ms) but <b>2t=27.4 ms = 1.0× native</b></item>
-///   <item>FFN_up: <b>wants 32t</b> (10 ms, 2.2× native) — opposite preference</item>
-/// </list>
-/// The optimum is shape- AND hardware-dependent and NON-monotonic (the 4–16t dip
-/// is shared-packed-B bandwidth contention + this chip's 4-CCD/NUMA placement).
-/// A static heuristic can't capture it without regressing one shape to fix
-/// another (FFN_up vs Large are both ≈1 GFLOP with opposite optima). <b>The
-/// robust fix is to autotune the thread count by measurement</b> — extend
-/// <c>BlockSizeSweep</c> (the #407 measurement autotune) to also sweep thread
-/// count and cache the per-shape winner. This diagnostic is the evidence the
-/// lever is real and worth ~1.05–1.76× on these shapes.
+/// <b>Finding (corrected): there is NO reproducible thread-count lever.</b> An
+/// initial run of THIS sweep showed dramatic spreads (Large 2t=11.3 vs 32t=19.8
+/// ms, BERT 4–16t=44 ms) that looked like a 1.05–1.76× win from fewer threads.
+/// That was MEASUREMENT VARIANCE — inter-config thermal/background drift across a
+/// 36-config sequential sweep on a noisy 32-core box. A tighter re-measurement
+/// (each of {2,4,8,32}t independently warmed, fewer configs, one run) showed all
+/// thread counts within ~5% for every shape (e.g. Large: 2t=15.1, 4t=15.1,
+/// 8t=15.4, 32t=15.1 ms). So thread count does NOT meaningfully affect these
+/// shapes, and a thread-count autotune was prototyped and then REVERTED — it
+/// captured a non-existent win and would only add hot-path complexity.
+/// </para>
+/// <para>
+/// The real, thread-count-independent gap is fundamental managed-vs-OpenBLAS
+/// efficiency: ~1.5× (Large), ~1.8× (BERT), ~2.3–3× (FFN) native — the kernel +
+/// pack/strategy efficiency, not parallelism. Lesson recorded: mid-size GEMM
+/// timings on a many-core box are high-variance; trust only tightly-controlled,
+/// individually-warmed, single-run comparisons.
 /// </para>
 /// </summary>
 [Trait("Category", "Benchmark")]
