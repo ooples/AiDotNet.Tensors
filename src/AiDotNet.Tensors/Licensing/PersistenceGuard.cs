@@ -281,6 +281,15 @@ public static class PersistenceGuard
                     trialDaysElapsed: null, operationsPerformed: null,
                     keyStatus: LicenseKeyStatus.CapabilityMissing,
                     requiredCapability: requiredCapability);
+            // Tamper-EVIDENCE: a token is present but failed signature/marker/
+            // expiry verification — i.e. it was forged, corrupted, or tampered.
+            // Emit an audit trace so the attempt is recorded even if an upstream
+            // caller swallows the exception. (This is evidence, not prevention —
+            // see the SECURITY doc on why self-protection in managed code can't
+            // be absolute.)
+            System.Diagnostics.Trace.TraceWarning(
+                "AiDotNet.Tensors SECURITY: a signed entitlement was presented but FAILED verification (" +
+                (entitlement.Message ?? "no detail") + "). Possible forged/tampered license token.");
             throw new LicenseRequiredException(
                 "Signed entitlement (AIDOTNET_LICENSE_TOKEN / ~/.aidotnet/tensors-entitlement.json) " +
                 "failed verification: " + (entitlement.Message ?? "(no detail)") +
