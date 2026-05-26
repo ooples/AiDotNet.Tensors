@@ -102,6 +102,12 @@ class Program
             PyTorchComparison.FrozenWeightInferenceBench.Run();
             return;
         }
+        if (args[0] == "--pytorch-headtohead")
+        {
+            string outPath = args.Length > 1 ? args[1] : "artifacts/perf/pytorch-comparison.md";
+            PyTorchComparison.HeadToHeadCatalogBench.Run(outPath);
+            return;
+        }
 
         // Issue #403 Phase A.3: per-substep allocation profile + shape catalog
         // for one pass through the DCGAN-step probe substeps. Cheap to run
