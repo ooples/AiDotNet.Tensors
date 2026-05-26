@@ -112,6 +112,27 @@ internal static class AutotuneDispatcher
         int nc = Math.Min(512, n);
         int kc = Math.Min(256, k);
 
+        // Sub-G (#375): M-axis occupancy floor. PackBoth parallelises over
+        // numIcBlocks = ceil(m / mc). With mc=128 a shape like 512×512×512 has
+        // only 4 ic-blocks, so it plateaus at 4 threads (measured: 165 GFLOPS @
+        // 4 threads, no gain past that, vs torch's 331). Shrink mc to add blocks
+        // when underutilised — but floor mc at 64 so the packed A panel stays
+        // cache-friendly (mc=32 was measured to regress per-block efficiency
+        // more than the extra parallelism gained). Target ≈ 2×procs blocks for
+        // load-balance headroom without over-fragmenting.
+        if (procs > 1 && mr > 0)
+        {
+            int mBlocks = (m + mc - 1) / mc;
+            if (mBlocks < procs && m >= 2 * 64)
+            {
+                int floorMc = Math.Max(mr, 64);
+                int targetBlocks = 2 * procs;
+                int targetMc = ((m / targetBlocks) / mr) * mr;
+                targetMc = Math.Max(floorMc, targetMc);
+                if (targetMc < mc) mc = targetMc;
+            }
+        }
+
         // Round mc down to mr alignment, nc down to nr alignment.
         if (mr > 0) mc = (mc / mr) * mr;
         if (nr > 0) nc = (nc / nr) * nr;
