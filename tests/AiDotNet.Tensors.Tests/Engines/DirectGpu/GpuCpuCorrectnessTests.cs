@@ -25,6 +25,7 @@ using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
+[Collection("DirectGpuSerial")]
 public sealed class GpuCpuCorrectnessTests : IDisposable
 {
     private readonly CpuEngine _cpu = new CpuEngine();
