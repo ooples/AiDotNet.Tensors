@@ -34,9 +34,22 @@ namespace AiDotNet.Tensors.Engines.BlasManaged;
 /// to ~20 at 10–12 chains as the JIT spills past ~8 YMM accumulators). The kernel
 /// is NOT near the ceiling — it has ~2.4× headroom, and OpenBLAS dgemm achieves
 /// ~62 GFLOPS on this chip (it even exceeds the managed 8-chain FMA loop, so the
-/// codegen ceiling can also be pushed). The gap is <i>kernel quality</i>; the
-/// bottleneck is load/broadcast latency that source-level unroll/reorder doesn't
-/// fix (JIT reschedules), so it needs JIT-disasm-driven work — the open S.3 task.
+/// codegen ceiling can also be pushed). The gap is <i>kernel quality</i>.
+/// </para>
+///
+/// <para>
+/// <b>S.3 JIT-disasm finding (DOTNET_JitDisasm).</b> The emitted hot loop issues
+/// each iteration's B-loads + A-broadcasts <i>directly</i> into that iteration's
+/// FMAs — classic load-to-use stall (measured ~0.6 FMA/cyc, well under the
+/// 8-chain limit of ~1.6). Three YMM regs sit idle, suggesting room to
+/// double-buffer. HOWEVER, hand-writing a software-pipelined variant (preload
+/// next-iter B into spare regs) REGRESSED it to ~15 GFLOPS: the disasm showed
+/// RyuJIT then emits <b>18 stack spills</b> — it won't sustain 8 accumulators +
+/// double-buffered operands within the 16-YMM file (it needs scratch regs the
+/// budget doesn't have). So the bottleneck is bounded by <b>RyuJIT register
+/// allocation</b>, not the kernel source: source-level pipelining backfires.
+/// Closing it needs an allocator-friendly kernel shape (fewer live operands) or
+/// JIT-level work — this naive no-spill form is the best source-level version.
 /// </para>
 /// </summary>
 internal static class Avx2Fp64_4x8
