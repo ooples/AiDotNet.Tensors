@@ -23,6 +23,19 @@ namespace AiDotNet.Tensors.Engines.BlasManaged;
 /// (Task C7). On net471 the type still compiles but the kernel methods are
 /// not reachable because <see cref="Vector256{T}"/> doesn't exist there.
 /// </para>
+///
+/// <para>
+/// <b>Audit (Sub-S #409, Phase S.2 — measured via <c>--microkernel-gflops</c>).</b>
+/// Microbench on a Ryzen 9 3950X (AVX2, no AVX-512): <b>~20 GFLOPS, ~85–95% of a
+/// register-only FP64 FMA ceiling</b> on the same machine (slightly noisier than
+/// the FP32 8×8 sibling — the 4-row tile has fewer independent FMA chains in
+/// flight to hide the ~5-cycle latency, so it sits a touch below the ceiling
+/// rather than at it). As with the FP32 kernel the residual gap to hardware-
+/// theoretical peak tracks the managed runtime's FMA issue rate, not kernel
+/// structure; closing it needs JIT-disasm review (follow-up). A wider tile
+/// (e.g. 4×16 / more accumulators) is the only structural lever that might add
+/// chains, and should be evaluated against the same harness before adopting.
+/// </para>
 /// </summary>
 internal static class Avx2Fp64_4x8
 {

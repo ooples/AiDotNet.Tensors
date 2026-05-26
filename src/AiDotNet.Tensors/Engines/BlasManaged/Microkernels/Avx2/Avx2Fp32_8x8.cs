@@ -25,6 +25,25 @@ namespace AiDotNet.Tensors.Engines.BlasManaged;
 /// (Task C7). On net471 the type still compiles but the kernel methods are
 /// not reachable.
 /// </para>
+///
+/// <para>
+/// <b>Audit (Sub-S #409, Phase S.2 — measured via <c>--microkernel-gflops</c>).</b>
+/// Structure is already peak-tuned for a managed AVX2 target: K-loop unrolled
+/// by 2 (back-to-back B-loads to overlap L1 latency with FMAs), software
+/// prefetch (Sub-O), C tile resident in 8 accumulators across the whole K-loop,
+/// and 10 live registers (8 acc + A-broadcast + B-load) — no spills on the
+/// 16-register AVX2 file. Microbench on a Ryzen 9 3950X (AVX2, no AVX-512):
+/// <b>~47 GFLOPS, ~100% of a register-only FMA ceiling</b> measured on the same
+/// machine. The kernel is therefore <i>not</i> leaving FMA throughput on the
+/// table relative to what this runtime delivers for back-to-back FMAs. Both the
+/// kernel and that register-only loop sit at ~37% of the chip's ~125 GFLOPS
+/// hardware-theoretical single-thread AVX2 peak, which points the residual gap
+/// at the managed runtime's FMA <i>issue rate</i> (≈1 vs the hardware's 2
+/// FMA/cycle), not at kernel structure. Confirming/closing that needs JIT-disasm
+/// inspection (<c>DOTNET_JitDisasm=Avx2Fp32_8x8:Run</c>) and is tracked as
+/// follow-up, since further source-level unrolling cannot beat a ceiling a pure
+/// register FMA loop already hits.
+/// </para>
 /// </summary>
 internal static class Avx2Fp32_8x8
 {
