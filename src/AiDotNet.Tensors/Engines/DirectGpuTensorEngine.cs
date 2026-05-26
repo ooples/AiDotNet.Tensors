@@ -15311,7 +15311,28 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // which is only correct when `ea` is the LAST axis. For an interior axis the elements
             // along it are strided and there are trailing dims the kernel ignores, so the result is
             // garbage — fall back to the CPU reduction in that case.
-            if (ea == rank-1) { int outerSize=1; for(int i=0;i<ea;i++)outerSize*=tensor.Shape._dims[i]; int reduceSize=tensor.Shape._dims[ea]; var gi=UploadTensorRaw(bb, tensor); var go=bb.AllocateBuffer(outerSize); bb.LogSumExpAxis(gi,go,outerSize,reduceSize); int[] outShape; if(keepDims){outShape=(int[])tensor.Shape._dims.Clone();outShape[ea]=1;}else{outShape=new int[rank-1]; for(int i=0,j=0;i<rank;i++) if(i!=ea) outShape[j++]=tensor.Shape._dims[i];} return DeferTensorResult<T>(bb,go,outerSize,outShape); } } catch{} }
+            if (ea == rank-1) {
+                int outerSize=1; for(int i=0;i<ea;i++)outerSize*=tensor.Shape._dims[i];
+                int reduceSize=tensor.Shape._dims[ea];
+                var gi=UploadTensorRaw(bb, tensor);
+                var go=bb.AllocateBuffer(outerSize);
+                // Ownership transfer pattern: dispose `go` if anything throws
+                // between Allocate and DeferTensorResult (LogSumExpAxis kernel
+                // launch, shape-array construction). Without this guard the
+                // outer empty catch{} swallowed the exception and silently
+                // leaked the native GPU buffer. CodeRabbit PRRT_kwDOQ-aYaM6ExmA_.
+                bool transferredOwnership = false;
+                try {
+                    bb.LogSumExpAxis(gi,go,outerSize,reduceSize);
+                    int[] outShape;
+                    if(keepDims){outShape=(int[])tensor.Shape._dims.Clone();outShape[ea]=1;}
+                    else{outShape=new int[rank-1]; for(int i=0,j=0;i<rank;i++) if(i!=ea) outShape[j++]=tensor.Shape._dims[i];}
+                    transferredOwnership = true;
+                    return DeferTensorResult<T>(bb,go,outerSize,outShape);
+                }
+                finally { if (!transferredOwnership) go.Dispose(); }
+            }
+        } catch{} }
         return base.TensorLogSumExp(tensor,axis,keepDims);
     }
 
