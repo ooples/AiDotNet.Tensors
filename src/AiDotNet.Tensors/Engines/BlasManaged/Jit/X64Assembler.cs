@@ -41,6 +41,13 @@ internal sealed class X64Assembler
     /// <summary>dec rcx (REX.W FF /1).</summary>
     internal void DecRcx() => B(0x48, 0xFF, 0xC9);
 
+    /// <summary>dec reg64 (REX.W[.B] FF /1).</summary>
+    internal void DecReg(int reg)
+    {
+        byte rex = (byte)(0x48 | (reg >= 8 ? 1 : 0));
+        B(rex, 0xFF, (byte)(0xC8 | (reg & 7))); // /1: reg field=001 -> 0xC8 | rm
+    }
+
     /// <summary>jnz rel8 to a (backward) label.</summary>
     internal void JnzLabel(int label)
     {
@@ -49,8 +56,60 @@ internal sealed class X64Assembler
         _code.Add(0);                              // placeholder
     }
 
+    /// <summary>jz rel8 to a (forward) label.</summary>
+    internal void JzLabel(int label)
+    {
+        B(0x74);                                   // jz rel8
+        _rel8Fixups.Add((_code.Count, label));
+        _code.Add(0);
+    }
+
+    /// <summary>test reg64, reg64 (sets ZF if reg==0). REX.W[.R.B] 85 /r.</summary>
+    internal void TestRegSelf(int reg)
+    {
+        byte rex = (byte)(0x48 | (reg >= 8 ? 4 : 0) | (reg >= 8 ? 1 : 0));
+        B(rex, 0x85, (byte)(0xC0 | ((reg & 7) << 3) | (reg & 7)));
+    }
+
     internal void Ret() => B(0xC3);
     internal void Vzeroupper() => B(0xC5, 0xF8, 0x77);
+
+    /// <summary>add reg64, imm8 (sign-extended). REX.W[.B] 83 /0 ib.</summary>
+    internal void AddRegImm8(int reg, sbyte imm)
+    {
+        byte rex = (byte)(0x48 | (reg >= 8 ? 1 : 0));
+        B(rex, 0x83, (byte)(0xC0 | (reg & 7)), (byte)imm);
+    }
+
+    /// <summary>add dst64, src64 (dst += src). REX.W[.R.B] 01 /r.</summary>
+    internal void AddRegReg(int dst, int src)
+    {
+        byte rex = (byte)(0x48 | (src >= 8 ? 4 : 0) | (dst >= 8 ? 1 : 0));
+        B(rex, 0x01, (byte)(0xC0 | ((src & 7) << 3) | (dst & 7)));
+    }
+
+    /// <summary>mov dst64, src64. REX.W[.R.B] 89 /r.</summary>
+    internal void MovRegReg(int dst, int src)
+    {
+        byte rex = (byte)(0x48 | (src >= 8 ? 4 : 0) | (dst >= 8 ? 1 : 0));
+        B(rex, 0x89, (byte)(0xC0 | ((src & 7) << 3) | (dst & 7)));
+    }
+
+    /// <summary>mov dst64, [rsp+disp8]. REX.W[.R] 8B /r, mod=01, rm=100 (SIB rsp), disp8.</summary>
+    internal void MovRegFromRsp(int dst, sbyte disp)
+    {
+        byte rex = (byte)(0x48 | (dst >= 8 ? 4 : 0));
+        B(rex, 0x8B, (byte)(0x40 | ((dst & 7) << 3) | 4), 0x24, (byte)disp);
+    }
+
+    /// <summary>lea rax, [idx*8]. REX.W[.X] 8D, mod=00 reg=rax rm=100, SIB(scale8,idx,base=disp32), disp32=0.</summary>
+    internal void LeaRaxIndexScale8(int idx)
+    {
+        byte rex = (byte)(0x48 | (idx >= 8 ? 2 : 0));
+        byte sib = (byte)((3 << 6) | ((idx & 7) << 3) | 5);
+        B(rex, 0x8D, 0x04, sib);
+        Imm32(0);
+    }
 
     /// <summary>sub rsp, imm32 (REX.W 81 /5).</summary>
     internal void SubRsp(int imm) { B(0x48, 0x81, 0xEC); Imm32(imm); }
