@@ -46,12 +46,16 @@ public static class PerfBar
     public const double MaxLossMultiple = 1.20;
 
     /// <summary>
-    /// <see cref="Catalog.ShapeCatalog.All"/> size as of A.4 commit (37 workload +
-    /// 19 instrumented - 2 dedups = 54 shapes). <see cref="PerfBarTest.Catalog_Size_Matches_PerfBar"/>
-    /// fails if a new shape is added without updating this constant — by design, the
-    /// bar must be re-evaluated when the catalog grows.
+    /// <see cref="Catalog.ShapeCatalog.All"/> size. Originally 54 shapes (#369
+    /// A.4 commit: 37 workload + 19 instrumented − 2 dedups). Re-set to 76 in
+    /// the #369 follow-up that added 22 modern-architecture workload shapes
+    /// (Llama-7B, Stable Diffusion UNet, DiT-XL, Mixtral MoE, Whisper,
+    /// ConvNeXt, EfficientNet-B0; 59 workload + 19 instrumented − 2 dedups).
+    /// <see cref="PerfBarTest.Catalog_Size_Matches_PerfBar"/> fails if a new
+    /// shape is added without updating this constant — by design, the bar
+    /// must be re-evaluated when the catalog grows.
     /// </summary>
-    public const int CatalogShapeCount = 54;
+    public const int CatalogShapeCount = 76;
 
     /// <summary>
     /// Hardware fingerprint of the authoritative runner where the bar was set.
