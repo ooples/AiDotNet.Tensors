@@ -1,5 +1,6 @@
 using System;
 using System.Buffers;
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using AiDotNet.Tensors.Helpers;
@@ -244,10 +245,12 @@ internal static class PackBothStrategy
                     if (options.PackedB != null) BlasManagedStatsTracker.IncrementPackCacheMiss();
                     // Pack B[pc..pc+effectiveKc, jc..jc+effectiveNc] into packB.
                     int bSliceOffset = transB ? jc * ldb + pc : pc * ldb + jc;
+                    long _pbStart = PackBothProfiler.Enabled ? Stopwatch.GetTimestamp() : 0L;
                     Avx2Pack.PackB<T>(
                         b: b.Slice(bSliceOffset), ldb, transB,
                         packed: activePackB.Slice(0, packedBElemCount),
                         nc: effectiveNc, kc: effectiveKc, nr);
+                    if (PackBothProfiler.Enabled) PackBothProfiler.PackBTicks += Stopwatch.GetTimestamp() - _pbStart;
                 }
 
                 for (int ic = 0; ic < m; ic += mc)
@@ -292,13 +295,16 @@ internal static class PackBothStrategy
                         // transA=false: A is [M, K] row-major, panel starts at a[ic * lda + pc].
                         // transA=true:  A is [K, M] row-major, panel starts at a[pc * lda + ic].
                         int aSliceOffset = transA ? pc * lda + ic : ic * lda + pc;
+                        long _paStart = PackBothProfiler.Enabled ? Stopwatch.GetTimestamp() : 0L;
                         Avx2Pack.PackA<T>(
                             a: a.Slice(aSliceOffset), lda, transA,
                             packed: activePackA.Slice(0, effectiveMc * effectiveKc),
                             mc: effectiveMc, kc: effectiveKc, mr);
+                        if (PackBothProfiler.Enabled) PackBothProfiler.PackATicks += Stopwatch.GetTimestamp() - _paStart;
                     }
 
                     // Iterate microkernel tiles within this Mc × Nc panel.
+                    long _krStart = PackBothProfiler.Enabled ? Stopwatch.GetTimestamp() : 0L;
                     for (int jr = 0; jr < effectiveNc; jr += nr)
                     {
                         // Partial-N tile on the last jr iteration when effectiveNc % nr != 0.
@@ -327,6 +333,7 @@ internal static class PackBothStrategy
                                 mr, nr, effectiveNr);
                         }
                     }
+                    if (PackBothProfiler.Enabled) PackBothProfiler.KernelTicks += Stopwatch.GetTimestamp() - _krStart;
                 }
             }
         }
@@ -520,10 +527,12 @@ internal static class PackBothStrategy
                         // zero-pad the partial tail stripe when effectiveNc % nr != 0.
                         ReadOnlySpan<T> bSlice = new ReadOnlySpan<T>((T*)bPtrInt + bSliceOffset, bLen - bSliceOffset);
                         Span<T> packBTemp = MemoryMarshal.Cast<byte, T>(packBArr.AsSpan(packBAlignedOffset, packedBByteCount));
+                        long _pbStart = PackBothProfiler.Enabled ? Stopwatch.GetTimestamp() : 0L;
                         Avx2Pack.PackB<T>(
                             b: bSlice, ldb, transB,
                             packed: packBTemp,
                             nc: effectiveNc, kc: effectiveKc, nr);
+                        if (PackBothProfiler.Enabled) PackBothProfiler.PackBTicks += Stopwatch.GetTimestamp() - _pbStart;
                     }
                 }
 
@@ -593,10 +602,12 @@ internal static class PackBothStrategy
 
                         int aSliceOffset = transA ? pc_cap * lda + ic : ic * lda + pc_cap;
                         ReadOnlySpan<T> aSlice = new ReadOnlySpan<T>((T*)aPtrInt + aSliceOffset, aLen - aSliceOffset);
+                        long _paStart = PackBothProfiler.Enabled ? Stopwatch.GetTimestamp() : 0L;
                         Avx2Pack.PackA<T>(
                             a: aSlice, lda, transA,
                             packed: activePackA,
                             mc: effectiveMc, kc: effectiveKc_cap, mr);
+                        if (PackBothProfiler.Enabled) PackBothProfiler.PackATicks += Stopwatch.GetTimestamp() - _paStart;
                     }
 
                     // Shared pack-B: reconstruct span from captured byte[] (read-only).
@@ -606,6 +617,7 @@ internal static class PackBothStrategy
                         packBArr_cap.AsSpan(packBAlignedOffset_cap, packedBByteCount_cap));
 
                     // ── Inner microkernel loop (jr, ir) ────────────────────────────────
+                    long _krStart = PackBothProfiler.Enabled ? Stopwatch.GetTimestamp() : 0L;
                     for (int jr = 0; jr < effectiveNc_cap; jr += nr)
                     {
                         // Partial-N tile on the last jr iteration when effectiveNc % nr != 0.
@@ -634,6 +646,7 @@ internal static class PackBothStrategy
                                 mr, nr, effectiveNr);
                         }
                     }
+                    if (PackBothProfiler.Enabled) PackBothProfiler.KernelTicks += Stopwatch.GetTimestamp() - _krStart;
                 });
             }
         }
