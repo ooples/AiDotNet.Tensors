@@ -156,6 +156,30 @@ public static class PersistenceGuard
     private static LicenseValidator GetValidator(AiDotNetTensorsLicenseKey key)
         => _validators.GetOrAdd(key.Key, _ => new LicenseValidator(key));
 
+    // ─── Signed-entitlement cache ──────────────────────────────────
+    //
+    // The offline entitlement is resolved from env/disk and RSA-verified once
+    // per process (it's effectively constant for a run, and re-verifying the
+    // signature on every persistence op would be wasteful). null sentinel ==
+    // "no entitlement configured"; a verified EntitlementResult is cached so
+    // repeated ops reuse it.
+    private static readonly object _entitlementLock = new();
+    private static bool _entitlementResolved;
+    private static EntitlementResult? _entitlement;
+
+    private static EntitlementResult? GetCachedEntitlement()
+    {
+        lock (_entitlementLock)
+        {
+            if (!_entitlementResolved)
+            {
+                _entitlement = SignedEntitlement.TryVerifyConfigured();
+                _entitlementResolved = true;
+            }
+            return _entitlement;
+        }
+    }
+
     // Per-key "pending allowance consumed" set. The first
     // ValidationPending result for a key is allowed (lets users on a
     // flaky network bootstrap into the offline-grace window), but
@@ -235,6 +259,36 @@ public static class PersistenceGuard
         // Suppressed under InternalOperation — upstream AiDotNet
         // already enforced before delegating to us.
         if (_internalDepth.Value > 0) return;
+
+        // ── Offline, RSA-signed entitlement (strongest trust anchor) ───
+        // Checked FIRST. A signed entitlement is verified with an embedded
+        // public key entirely offline, so — unlike the online key path — it
+        // can't be defeated by spoofing/MITM'ing the license server. A valid
+        // entitlement that grants the capability authorises the op with no
+        // network call and no trial tick. A present-but-INVALID token is a
+        // hard failure: we must NOT silently fall through to the trial path,
+        // or a tampered/forged token would just degrade to free trial ops.
+        // Absent (the default) → null → fall through unchanged.
+        var entitlement = GetCachedEntitlement();
+        if (entitlement is not null)
+        {
+            if (entitlement.IsValid && entitlement.HasCapability(requiredCapability))
+                return;
+            if (entitlement.IsValid)
+                throw new LicenseRequiredException(
+                    $"Signed entitlement does not grant the '{requiredCapability}' capability " +
+                    $"required for tensor {operationLabel}.",
+                    trialDaysElapsed: null, operationsPerformed: null,
+                    keyStatus: LicenseKeyStatus.CapabilityMissing,
+                    requiredCapability: requiredCapability);
+            throw new LicenseRequiredException(
+                "Signed entitlement (AIDOTNET_LICENSE_TOKEN / ~/.aidotnet/tensors-entitlement.json) " +
+                "failed verification: " + (entitlement.Message ?? "(no detail)") +
+                " Remove it to fall back to key/trial licensing, or obtain a valid entitlement from admin@aidotnet.dev.",
+                trialDaysElapsed: null, operationsPerformed: null,
+                keyStatus: LicenseKeyStatus.Invalid,
+                requiredCapability: requiredCapability);
+        }
 
         // Resolve key: AsyncLocal > env var > file. None present →
         // fall through to the trial path.
@@ -364,5 +418,10 @@ public static class PersistenceGuard
     {
         _validators.Clear();
         _pendingConsumed.Clear();
+        lock (_entitlementLock)
+        {
+            _entitlementResolved = false;
+            _entitlement = null;
+        }
     }
 }
