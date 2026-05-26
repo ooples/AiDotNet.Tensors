@@ -153,6 +153,27 @@ public static class BlasManaged
             return;
         }
 
+        // Sub-S (#409): machine-code microkernel fast path. Tile-aligned, no-trans,
+        // no-epilogue FP64 GEMMs route to the hand-emitted 6×8 kernel (~57 GFLOPS,
+        // ~95% of OpenBLAS — first-party machine code, no dependency). Honours
+        // PackingMode.Auto only (explicit pack-mode overrides take the managed path
+        // so callers can force-test a strategy). TryGemmFp64 returns false for any
+        // shape that doesn't qualify, so this can only add speed, never change
+        // results — and C is already zeroed above, which the kernel requires.
+        if (typeof(T) == typeof(double) && options.PackingMode == PackingMode.Auto)
+        {
+            var epi409 = options.Epilogue;
+            if (EpilogueFlagsCompute.Compute(in epi409) == EpilogueFlags.None
+                && MachineKernelGemm.TryGemmFp64(
+                    MemoryMarshal.Cast<T, double>(a), lda, transA,
+                    MemoryMarshal.Cast<T, double>(b), ldb, transB,
+                    MemoryMarshal.Cast<T, double>(c), ldc,
+                    m, n, k,
+                    hasEpilogue: false,
+                    hasPrePack: options.PackedA is not null || options.PackedB is not null))
+                return;
+        }
+
         PackingMode strategy = Dispatcher.SelectStrategy(m, n, k, options);
 
         // PackAOnly does not support transB=true in Phase B — fall back to
