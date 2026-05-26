@@ -47,18 +47,34 @@ public class ParallelForOrSerialDispatchTests
             var observed = new int[numChunks];
 
             // Same deterministic worker-probe as GrainSizeDispatchTests: a worker
-            // iteration Sets the event, caller-thread iterations Wait briefly for
-            // it. If nothing ever dispatched off-thread the Wait times out.
-            // 1s wait tolerates a cold ThreadPool warmup on a constrained CI
-            // runner — Set() fires from the first off-thread iter so the wait
-            // is almost always instant on a warm pool.
+            // iteration Sets the event, the FIRST caller-thread iteration Waits
+            // briefly for it. If nothing ever dispatched off-thread the Wait
+            // times out. 1s wait tolerates a cold ThreadPool warmup on a
+            // constrained CI runner — Set() fires from the first off-thread
+            // iter so the wait is almost always instant on a warm pool.
+            //
+            // CodeRabbit fix: only ONE caller-thread iteration waits. With
+            // numChunks=max(16, cores*4), the old "every caller-iter waits 1s"
+            // pattern would have cost 16+ s of timeout if the test regressed
+            // to serial execution. Interlocked.Exchange ensures exactly one
+            // caller-iter is the "designated waiter"; the rest continue
+            // immediately so the test fails fast on real serial regression.
             using var workerSeen = new ManualResetEventSlim(false);
+            int callerWaiterClaimed = 0;
             CpuParallelSettings.ParallelForOrSerial(0, numChunks, totalWork, c =>
             {
                 int tid = Thread.CurrentThread.ManagedThreadId;
                 observed[c] = tid;
-                if (tid != callerThread) workerSeen.Set();
-                else workerSeen.Wait(TimeSpan.FromSeconds(1));
+                if (tid != callerThread)
+                {
+                    workerSeen.Set();
+                }
+                else if (Interlocked.Exchange(ref callerWaiterClaimed, 1) == 0)
+                {
+                    // First caller-thread iter — designated waiter.
+                    workerSeen.Wait(TimeSpan.FromSeconds(1));
+                }
+                // Other caller-thread iters: no wait, continue immediately.
             });
 
             bool sawWorker = false;
