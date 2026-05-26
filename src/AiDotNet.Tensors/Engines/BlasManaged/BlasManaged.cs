@@ -153,31 +153,39 @@ public static class BlasManaged
             return;
         }
 
-        // Sub-S (#409): machine-code microkernel fast path. The tile-aligned FP64
-        // interior runs on the hand-emitted 6×8 kernel (~57 GFLOPS/core, ~95% of
-        // OpenBLAS, multithreaded — first-party machine code, no dependency); the
-        // m%6 / n%8 tails go to Streaming. Honours PackingMode.Auto only (explicit
+        // Sub-S (#409): machine-code microkernel fast path. The tile-aligned interior
+        // runs on the hand-emitted kernel (FP64 6×8 ~57 GFLOPS/core ~95% of OpenBLAS;
+        // FP32 6×16 — multithreaded, first-party machine code, no dependency); the
+        // m%Mr / n%Nr tails go to Streaming. Honours PackingMode.Auto only (explicit
         // pack-mode overrides take the managed path so callers can force-test a
         // strategy), no transpose, no epilogue, no pre-pack. C is already zeroed
         // above (the kernel accumulates), and the tails read-modify-write their own
         // disjoint sub-tiles — so this can only add speed, never change results.
-        if (typeof(T) == typeof(double)
-            && options.PackingMode == PackingMode.Auto
-            && !transA && !transB
-            && m >= MachineKernelGemm.Fp64Mr && n >= MachineKernelGemm.Fp64Nr
-            && options.PackedA is null && options.PackedB is null
-            && MachineKernelGemm.IsFp64Available)
+        if (options.PackingMode == PackingMode.Auto && !transA && !transB
+            && options.PackedA is null && options.PackedB is null)
         {
+            int mkMr = 0, mkNr = 0;
+            bool mkAvail = false;
+            if (typeof(T) == typeof(double) && MachineKernelGemm.IsFp64Available)
+            { mkMr = MachineKernelGemm.Fp64Mr; mkNr = MachineKernelGemm.Fp64Nr; mkAvail = true; }
+            else if (typeof(T) == typeof(float) && MachineKernelGemm.IsFp32Available)
+            { mkMr = MachineKernelGemm.Fp32Mr; mkNr = MachineKernelGemm.Fp32Nr; mkAvail = true; }
+
             var epi409 = options.Epilogue;
-            if (EpilogueFlagsCompute.Compute(in epi409) == EpilogueFlags.None)
+            if (mkAvail && m >= mkMr && n >= mkNr
+                && EpilogueFlagsCompute.Compute(in epi409) == EpilogueFlags.None)
             {
-                int mAl = m - (m % MachineKernelGemm.Fp64Mr); // interior rows (× Mr)
-                int nAl = n - (n % MachineKernelGemm.Fp64Nr); // interior cols (× Nr)
-                bool ran = MachineKernelGemm.TryGemmFp64(
-                    MemoryMarshal.Cast<T, double>(a), lda, false,
-                    MemoryMarshal.Cast<T, double>(b), ldb, false,
-                    MemoryMarshal.Cast<T, double>(c), ldc,
-                    mAl, nAl, k, hasEpilogue: false, hasPrePack: false);
+                int mAl = m - (m % mkMr); // interior rows (× Mr)
+                int nAl = n - (n % mkNr); // interior cols (× Nr)
+                bool ran = typeof(T) == typeof(double)
+                    ? MachineKernelGemm.TryGemmFp64(
+                        MemoryMarshal.Cast<T, double>(a), lda, false,
+                        MemoryMarshal.Cast<T, double>(b), ldb, false,
+                        MemoryMarshal.Cast<T, double>(c), ldc, mAl, nAl, k, false, false)
+                    : MachineKernelGemm.TryGemmFp32(
+                        MemoryMarshal.Cast<T, float>(a), lda, false,
+                        MemoryMarshal.Cast<T, float>(b), ldb, false,
+                        MemoryMarshal.Cast<T, float>(c), ldc, mAl, nAl, k, false, false);
                 if (ran)
                 {
                     int mTail = m - mAl, nTail = n - nAl;

@@ -182,6 +182,52 @@ public class MachineCodeKernelTests
                 $"6x8-U4 mismatch at {i}: kernel={cKernel[i]:G17}, ref={cRef[i]:G17} (kc={kc}, ldc={ldc})");
     }
 
+    [Theory]
+    [InlineData(1, 16)]
+    [InlineData(7, 16)]
+    [InlineData(64, 16)]
+    [InlineData(256, 16)]
+    [InlineData(37, 19)]   // ldc > Nr (padded C), odd kc
+    public unsafe void Fp32_6x16_MachineCode_MatchesFmaReference(int kc, int ldc)
+    {
+        if (!IsX64Windows || !Avx2.IsSupported || !Fma.IsSupported) return;
+
+        const int Mr = 6, Nr = 16;
+        byte[] code = MachineCodeFmaKernel.EmitFp32_6x16_PackedWindows();
+        using var mem = ExecutableMemory.TryAllocate(code);
+        if (mem is null) return;
+        var fn = (delegate* unmanaged<float*, float*, float*, long, long, void>)mem.Pointer;
+
+        var rng = new Random(13 + kc * 17 + ldc);
+        var packedA = new float[kc * Mr];   // [k*Mr + r]
+        var packedB = new float[kc * Nr];   // [k*Nr + col]
+        for (int i = 0; i < packedA.Length; i++) packedA[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < packedB.Length; i++) packedB[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        int cLen = (Mr - 1) * ldc + Nr;
+        var c0 = new float[cLen];
+        for (int i = 0; i < cLen; i++) c0[i] = (float)(rng.NextDouble() * 2 - 1);
+        var cKernel = (float[])c0.Clone();
+        var cRef = (float[])c0.Clone();
+
+        fixed (float* pa = packedA, pb = packedB, pc = cKernel)
+            fn(pa, pb, pc, ldc, kc);
+
+        // Reference: lane-wise FMA accumulation in k order (matches vfmadd231ps rounding).
+        for (int r = 0; r < Mr; r++)
+            for (int col = 0; col < Nr; col++)
+            {
+                float acc = cRef[r * ldc + col];
+                for (int k = 0; k < kc; k++)
+                    acc = MathF.FusedMultiplyAdd(packedA[k * Mr + r], packedB[k * Nr + col], acc);
+                cRef[r * ldc + col] = acc;
+            }
+
+        for (int i = 0; i < cLen; i++)
+            Assert.True(BitConverter.SingleToInt32Bits(cKernel[i]) == BitConverter.SingleToInt32Bits(cRef[i]),
+                $"6x16 FP32 machine kernel mismatch at {i}: kernel={cKernel[i]:G9}, ref={cRef[i]:G9} (kc={kc}, ldc={ldc})");
+    }
+
     [Fact]
     public unsafe void Fp64_6x8_MachineCode_Perf()
     {
@@ -198,6 +244,41 @@ public class MachineCodeKernelTests
 
         Measure("6x8 base ", MachineCodeFmaKernel.EmitFp64_6x8_PackedWindows(), packedA, packedB, c, ldc, kc);
         Measure("6x8 unroll4", MachineCodeFmaKernel.EmitFp64_6x8_PackedWindowsU4(), packedA, packedB, c, ldc, kc);
+    }
+
+    [Fact]
+    public unsafe void Fp32_6x16_MachineCode_Perf()
+    {
+        if (Environment.GetEnvironmentVariable("AIDOTNET_RUN_JIT_PERF") != "1") return;
+        if (!IsX64Windows || !Avx2.IsSupported || !Fma.IsSupported) return;
+
+        const int Mr = 6, Nr = 16, kc = 256, ldc = 16;
+        var rng = new Random(42);
+        var packedA = new float[kc * Mr];
+        var packedB = new float[kc * Nr];
+        for (int i = 0; i < packedA.Length; i++) packedA[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < packedB.Length; i++) packedB[i] = (float)(rng.NextDouble() * 2 - 1);
+        var c = new float[Mr * ldc];
+
+        using var mem = ExecutableMemory.TryAllocate(MachineCodeFmaKernel.EmitFp32_6x16_PackedWindows());
+        if (mem is null) { _output.WriteLine("6x16: no exec mem"); return; }
+        var fn = (delegate* unmanaged<float*, float*, float*, long, long, void>)mem.Pointer;
+        fixed (float* pa = packedA, pb = packedB, pc = c)
+        {
+            for (int i = 0; i < 20000; i++) fn(pa, pb, pc, ldc, kc);
+            const int iters = 2_000_000;
+            double best = double.MaxValue;
+            for (int w = 0; w < 7; w++)
+            {
+                var sw = Stopwatch.StartNew();
+                for (int i = 0; i < iters; i++) fn(pa, pb, pc, ldc, kc);
+                sw.Stop();
+                best = Math.Min(best, sw.Elapsed.TotalSeconds);
+            }
+            double gflops = 2.0 * Mr * Nr * kc * iters / best / 1e9;
+            _output.WriteLine($"machine-code 6x16 FP32: {gflops:F1} GFLOPS (best-of-7) " +
+                "(FP64 6x8 ~57; FP32 should be ~2× since 8 lanes/FMA; HW FP32 peak ~128)");
+        }
     }
 
     private unsafe void Measure(string name, byte[] code, double[] packedA, double[] packedB, double[] c, int ldc, int kc)

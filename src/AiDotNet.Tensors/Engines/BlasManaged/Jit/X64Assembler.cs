@@ -235,4 +235,29 @@ internal sealed class X64Assembler
 
     /// <summary>vmovups [base+disp8], xmm_src (128-bit store). VEX.128.0F.WIG 11.</summary>
     internal void VmovupsXmmStore(int baseReg, sbyte disp8, int src) => VexMemDisp8(Map0F, PpNone, 0, 0, 0x11, src, baseReg, disp8);
+
+    // ── FP32 (ps) AVX2/FMA forms ───────────────────────────────────────────────
+    // Differences from the pd forms: vbroadcastss is opcode 0x18 (vs 0x19),
+    // vfmadd231ps uses W0 (vs W1), and vmovups has no 66-prefix (pp=None, vs Pp66).
+
+    /// <summary>vfmadd231ps dst, s1, s2 (dst += s1*s2). VEX.DDS.256.66.0F38.W0 B8.</summary>
+    internal void Vfmadd231ps(int dst, int s1, int s2) => VexRR(Map0F38, Pp66, 0, 1, 0xB8, dst, s1, s2);
+
+    /// <summary>vbroadcastss ymm_dst, [base+disp8]. VEX.256.66.0F38.W0 18.</summary>
+    internal void VbroadcastSs(int dst, int baseReg, sbyte disp8) => VexMemDisp8(Map0F38, Pp66, 0, 1, 0x18, dst, baseReg, disp8);
+
+    /// <summary>vmovups ymm_dst, [base+disp8] (256-bit load). VEX.256.0F.WIG 10.</summary>
+    internal void VmovupsLoad(int dst, int baseReg, sbyte disp8) => VexMemDisp8(Map0F, PpNone, 0, 1, 0x10, dst, baseReg, disp8);
+
+    /// <summary>vmovups [base+disp8], ymm_src (256-bit store). VEX.256.0F.WIG 11.</summary>
+    internal void VmovupsStore(int baseReg, sbyte disp8, int src) => VexMemDisp8(Map0F, PpNone, 0, 1, 0x11, src, baseReg, disp8);
+
+    /// <summary>lea rax, [idx*4] (FP32 row stride bytes = ldc*4). SIB scale=2.</summary>
+    internal void LeaRaxIndexScale4(int idx)
+    {
+        byte rex = (byte)(0x48 | (idx >= 8 ? 2 : 0));
+        byte sib = (byte)((2 << 6) | ((idx & 7) << 3) | 5);
+        B(rex, 0x8D, 0x04, sib);
+        Imm32(0);
+    }
 }

@@ -131,6 +131,74 @@ internal static class MachineCodeFmaKernel
     }
 
     /// <summary>
+    /// Emit a 6×16 FP32 packed GEMM microkernel (Windows x64):
+    ///   C[0..6, 0..16] += packedA[Kc×6] · packedB[Kc×16]  over kc K-steps, C read-modify-write.
+    /// Signature: <c>void(float* packedA, float* packedB, float* c, long ldc, long kc)</c>
+    ///   rcx=packedA, rdx=packedB, r8=c, r9=ldc(elements), [rsp+0x28]=kc.
+    /// Same 12-accumulator structure as the FP64 6×8 kernel, but each YMM holds 8
+    /// floats: row r occupies lo=ymm(2r) (cols 0–7) + hi=ymm(2r+1) (cols 8–15). The
+    /// per-step strides differ (A: 6×4=24 bytes, B: 16×4=64) and the row stride is
+    /// ldc×4 bytes; the ps opcodes (vbroadcastss / vfmadd231ps / vmovups) replace pd.
+    /// </summary>
+    internal static byte[] EmitFp32_6x16_PackedWindows()
+    {
+        const int RCX = 1, RDX = 2, R8 = 8, R9 = 9, R10 = 10, R11 = 11, RAX = 0, RSP = 4;
+        const int BLO = 12, BHI = 13, A0 = 14, A1 = 15;
+        const int Mr = 6, Nr = 16; // Nr*4=64 bytes/Kstep for B; Mr*4=24 for A.
+        var asm = new X64Assembler();
+
+        asm.MovRegFromRsp(R10, 0x28);                // kc (5th arg) before moving rsp
+        asm.SubRsp(0xA0);
+        for (int i = 0; i < 10; i++) asm.VmovupsXmmStore(RSP, (sbyte)(i * 0x10), 6 + i); // save xmm6–15
+        asm.LeaRaxIndexScale4(R9);                   // rowStride bytes = ldc*4 -> rax
+
+        // Load 12 accumulators from C (read-modify-write). r11 walks the C rows.
+        asm.MovRegReg(R11, R8);
+        for (int r = 0; r < Mr; r++)
+        {
+            asm.VmovupsLoad(2 * r, R11, 0);          // c[r] cols 0–7
+            asm.VmovupsLoad(2 * r + 1, R11, 32);     // c[r] cols 8–15
+            if (r < Mr - 1) asm.AddRegReg(R11, RAX);
+        }
+
+        int store = asm.NewLabel();
+        asm.TestRegSelf(R10);
+        asm.JzLabel(store);
+
+        int loop = asm.NewLabel();
+        asm.MarkLabel(loop);
+        asm.VmovupsLoad(BLO, RDX, 0);
+        asm.VmovupsLoad(BHI, RDX, 32);
+        for (int r = 0; r < Mr; r++)
+        {
+            int areg = (r % 2 == 0) ? A0 : A1;
+            asm.VbroadcastSs(areg, RCX, (sbyte)(r * 4));
+            asm.Vfmadd231ps(2 * r, areg, BLO);
+            asm.Vfmadd231ps(2 * r + 1, areg, BHI);
+        }
+        asm.AddRegImm8(RCX, Mr * 4);                 // aPtr += 6 floats
+        asm.AddRegImm8(RDX, Nr * 4);                 // bPtr += 16 floats
+        asm.DecReg(R10);
+        asm.JnzLabel(loop);
+
+        asm.MarkLabel(store);
+        asm.MovRegReg(R11, R8);
+        for (int r = 0; r < Mr; r++)
+        {
+            asm.VmovupsStore(R11, 0, 2 * r);
+            asm.VmovupsStore(R11, 32, 2 * r + 1);
+            if (r < Mr - 1) asm.AddRegReg(R11, RAX);
+        }
+
+        for (int i = 0; i < 10; i++) asm.VmovupsXmmLoad(6 + i, RSP, (sbyte)(i * 0x10));
+        asm.AddRsp(0xA0);
+        asm.Vzeroupper();
+        asm.Ret();
+
+        return asm.ToArray();
+    }
+
+    /// <summary>
     /// Unroll-by-4 variant of <see cref="EmitFp64_6x8_PackedWindows"/> (disp32
     /// addressing, no per-step pointer advance; disp8 remainder loop for kc % 4).
     /// Same 6×8 / 12-accumulator math; bit-identical result.

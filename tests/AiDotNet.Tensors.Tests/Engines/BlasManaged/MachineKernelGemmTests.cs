@@ -123,6 +123,60 @@ public class MachineKernelGemmTests
             $"M={M} N={N} K={K}: tail Auto vs reference drift {maxVsRef:G6} > {tol:G6}");
     }
 
+    private static void ReferenceGemmF(
+        ReadOnlySpan<float> a, int lda, ReadOnlySpan<float> b, int ldb,
+        Span<float> c, int ldc, int m, int n, int k)
+    {
+        for (int i = 0; i < m; i++)
+            for (int j = 0; j < n; j++)
+            {
+                float sum = 0;
+                for (int p = 0; p < k; p++) sum += a[i * lda + p] * b[p * ldb + j];
+                c[i * ldc + j] = sum;
+            }
+    }
+
+    [Theory]
+    [InlineData(6, 16, 4)]      // single tile
+    [InlineData(6, 16, 500)]    // multi-Kc
+    [InlineData(48, 64, 128)]   // many tiles, aligned
+    [InlineData(192, 768, 768)] // ViT-class, aligned
+    [InlineData(7, 17, 64)]     // both tails (m%6=1, n%16=1, corner)
+    [InlineData(50, 100, 256)]  // both tails, multi-Kc (n%16=4)
+    [InlineData(193, 770, 384)] // ViT-ish, both tails
+    public void Gemm_MachineKernel_Fp32_Matches_PackBoth_And_Reference(int M, int N, int K)
+    {
+        var rng = new Random(321 + M * 13 + N * 5 + K);
+        var a = new float[M * K];
+        var b = new float[K * N];
+        for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < b.Length; i++) b[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        var cAuto = new float[M * N];
+        var cPackBoth = new float[M * N];
+        var cRef = new float[M * N];
+
+        BlasManagedLib.Gemm<float>(a, K, false, b, N, false, cAuto, N, M, N, K,
+            new BlasOptions<float> { PackingMode = PackingMode.Auto });
+        BlasManagedLib.Gemm<float>(a, K, false, b, N, false, cPackBoth, N, M, N, K,
+            new BlasOptions<float> { PackingMode = PackingMode.ForcePackBoth });
+        ReferenceGemmF(a, K, b, N, cRef, N, M, N, K);
+
+        double maxVsPackBoth = 0, maxVsRef = 0, scale = 0;
+        for (int i = 0; i < cAuto.Length; i++)
+        {
+            maxVsPackBoth = Math.Max(maxVsPackBoth, Math.Abs((double)cAuto[i] - cPackBoth[i]));
+            maxVsRef = Math.Max(maxVsRef, Math.Abs((double)cAuto[i] - cRef[i]));
+            scale = Math.Max(scale, Math.Abs((double)cRef[i]));
+        }
+        // FP32: float-association differences + 1e-6-ish epsilon, scaled by K.
+        double tol = 1e-4 * Math.Max(1.0, scale) * Math.Sqrt(K);
+        Assert.True(maxVsPackBoth < tol,
+            $"FP32 M={M} N={N} K={K}: Auto vs PackBoth drift {maxVsPackBoth:G6} > {tol:G6}");
+        Assert.True(maxVsRef < tol,
+            $"FP32 M={M} N={N} K={K}: Auto vs reference drift {maxVsRef:G6} > {tol:G6}");
+    }
+
     [Fact]
     public void Gemm_MachineKernel_Disabled_StillCorrect()
     {
@@ -193,6 +247,48 @@ public class MachineKernelGemmTests
             double managed = Run(PackingMode.Auto, machine: false);
             double machine = Run(PackingMode.Auto, machine: true);
             _output.WriteLine($"end-to-end DGEMM {M}x{N}x{K} (multithreaded): " +
+                $"managed-strategy {managed:F1} GFLOPS, machine-kernel {machine:F1} GFLOPS " +
+                $"({machine / managed:F2}×)");
+        }
+        finally { MachineKernelGemm.Enabled = true; }
+    }
+
+    [Fact]
+    public void Gemm_MachineKernel_Fp32_EndToEnd_Perf()
+    {
+        if (Environment.GetEnvironmentVariable("AIDOTNET_RUN_JIT_PERF") != "1") return;
+        if (!IsX64Windows || !Avx2.IsSupported || !Fma.IsSupported) return;
+
+        const int M = 1536, N = 1536, K = 1536; // aligned (m%6==0, n%16==0)
+        var rng = new Random(42);
+        var a = new float[M * K];
+        var b = new float[K * N];
+        for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < b.Length; i++) b[i] = (float)(rng.NextDouble() * 2 - 1);
+        var c = new float[M * N];
+        double gflopWork = 2.0 * M * N * K / 1e9;
+
+        double Run(bool machine)
+        {
+            MachineKernelGemm.Enabled = machine;
+            var opt = new BlasOptions<float> { PackingMode = PackingMode.Auto };
+            for (int i = 0; i < 2; i++) BlasManagedLib.Gemm<float>(a, K, false, b, N, false, c, N, M, N, K, opt);
+            double best = double.MaxValue;
+            for (int w = 0; w < 5; w++)
+            {
+                var sw = Stopwatch.StartNew();
+                BlasManagedLib.Gemm<float>(a, K, false, b, N, false, c, N, M, N, K, opt);
+                sw.Stop();
+                best = Math.Min(best, sw.Elapsed.TotalSeconds);
+            }
+            return gflopWork / best;
+        }
+
+        try
+        {
+            double managed = Run(machine: false);
+            double machine = Run(machine: true);
+            _output.WriteLine($"end-to-end SGEMM {M}x{N}x{K} (multithreaded): " +
                 $"managed-strategy {managed:F1} GFLOPS, machine-kernel {machine:F1} GFLOPS " +
                 $"({machine / managed:F2}×)");
         }
