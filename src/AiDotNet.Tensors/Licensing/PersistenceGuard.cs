@@ -181,7 +181,12 @@ public static class PersistenceGuard
     // I/O is intentionally low-frequency (Save / Load / Serialize /
     // Deserialize entry points) so a per-process lock is the right
     // grain — matches upstream's ModelPersistenceGuard pattern.
+    //
+    // Guarded out in enterprise builds where EnforceCore (its only consumer)
+    // is compiled out, so the field doesn't dangle unused there.
+#if !AIDOTNET_DISABLE_LICENSE_GUARD
     private static readonly object _trialStateGate = new();
+#endif
 
     // ─── Enforcement entry points ──────────────────────────────────
 
@@ -212,6 +217,21 @@ public static class PersistenceGuard
 
     private static void EnforceCore(string requiredCapability, string operationLabel)
     {
+#if AIDOTNET_DISABLE_LICENSE_GUARD
+        // ENTERPRISE BUILDS ONLY. The AIDOTNET_DISABLE_LICENSE_GUARD compile
+        // constant can only be defined by a build that passed the RSA-verified
+        // enterprise-license gate (build/AiDotNet.Tensors.Enterprise.targets) —
+        // entitlement is already proven at build time, so the runtime guard is
+        // compiled out: persistence runs with no trial counter and no online
+        // license check (the behaviour air-gapped / federal customers require).
+        //
+        // For EVERY non-enterprise build the constant is absent, the whole body
+        // below is compiled in unchanged, and the trial/OSS/standard-license
+        // enforcement path is completely unaffected.
+        _ = requiredCapability;
+        _ = operationLabel;
+        return;
+#else
         // Suppressed under InternalOperation — upstream AiDotNet
         // already enforced before delegating to us.
         if (_internalDepth.Value > 0) return;
@@ -299,6 +319,7 @@ public static class PersistenceGuard
             trial.OperationsConsumed++;
             trial.Save(trialPath);
         }
+#endif
     }
 
     private static AiDotNetTensorsLicenseKey? ResolveActiveKey()

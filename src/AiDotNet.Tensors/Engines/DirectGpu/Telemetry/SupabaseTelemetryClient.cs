@@ -94,10 +94,13 @@ public sealed class SupabaseTelemetryClient : ITelemetryClient
     /// </list>
     /// <para>
     /// Enterprise / federal / air-gapped builds may set the
-    /// <c>AIDOTNET_DISABLE_TELEMETRY</c> MSBuild constant, which compiles the entire
-    /// telemetry namespace out of the assembly — the client and its callers
-    /// are physically absent from the binary. See
-    /// <c>docs/enterprise/custom-builds.md</c> in the AiDotNet repo.
+    /// <c>AIDOTNET_DISABLE_TELEMETRY</c> MSBuild constant, which compiles
+    /// <see cref="SupabaseTelemetryClient"/> (this type — the only class that
+    /// transmits data off-box) out of the assembly so the network egress path
+    /// is physically absent from the binary. The <see cref="ITelemetryClient"/>
+    /// abstraction and local-only consumers (e.g. the auto-tuner / profile
+    /// cache) still compile; with this client gone they have no transmitter to
+    /// resolve. See <c>docs/enterprise/custom-builds.md</c> in the AiDotNet repo.
     /// </para>
     /// </remarks>
     /// <param name="enabled">Whether telemetry is enabled (default: false). Even when true, requires <c>AIDOTNET_TELEMETRY=true</c> env var AND credentials.</param>
