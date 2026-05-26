@@ -128,19 +128,41 @@ internal static class MachineKernelGemm
     }
 
     /// <summary>
-    /// Shared pack + parallel macro-loop. The <c>typeof(T)</c> branch is a JIT-time
-    /// constant per instantiation (double/float) and folds away, so there's no
-    /// per-call type test in the hot loop. C must be pre-zeroed; mc%Mr==0 &amp;&amp;
-    /// n%Nr==0 (callers guarantee). Returns true.
+    /// Shared pack + parallel macro-loop with BLIS-style cache blocking. The
+    /// <c>typeof(T)</c> branch is a JIT-time constant per instantiation (double/float)
+    /// and folds away, so there's no per-call type test in the hot loop. C must be
+    /// pre-zeroed; m%Mr==0 &amp;&amp; n%Nr==0 (callers guarantee). Returns true.
+    ///
+    /// <para>
+    /// Loop nest: pc (Kc K-blocks) → jc (Nc N-panels) → parallel over M-stripes.
+    /// The packed-B panel for one jc is Kc×Nc sized to fit ~half of L2, so it stays
+    /// resident and is re-read from L2 (not memory) by every M-stripe — the previous
+    /// "pack whole B, re-stream per stripe" cost (hundreds of MB per K-block at large
+    /// n) was the dominant bottleneck. The B micro-column the kernel reads (Kc×Nr)
+    /// fits L1. Packing stays outside the parallel body (Span can't be captured by a
+    /// lambda); the M-stripe parallelism keeps full core occupancy.
+    /// </para>
     /// </summary>
     private static unsafe bool RunPacked<T>(
         ReadOnlySpan<T> a, int lda, ReadOnlySpan<T> b, int ldb, Span<T> c, int ldc,
         int m, int n, int k, int Mr, int Nr, nint kernelAddr) where T : unmanaged
     {
+        int elem = sizeof(T);
+        // Nc: packed-B panel size, chosen by dtype because the bottleneck differs.
+        // FP32 does 2× the FMAs/byte, so it is L3-bandwidth-bound and wins big when the
+        // B panel (Kc×Nc) is kept ~half-L2-resident and re-read from L2 by every
+        // M-stripe (measured +97% at 1536³). FP64 is compute-bound (already ~hardware
+        // peak), so the extra N-panel/loop overhead costs more than any cache gain —
+        // give it a large Nc that degenerates to whole-N (no blocking) for typical n.
+        int targetBytes = elem == 4 ? 256 * 1024 : 8 * 1024 * 1024;
+        int Nc = targetBytes / (KcBlock * elem);
+        Nc -= Nc % Nr;
+        if (Nc < Nr) Nc = Nr;
+        Nc = Math.Min(Nc, ((n + Nr - 1) / Nr) * Nr); // no larger than n (rounded up to Nr)
+
         int mStripes = m / Mr;
-        int nStripes = n / Nr;
-        var packA = ArrayPool<T>.Shared.Rent(m * KcBlock);  // [mStripes, Kc, Mr]
-        var packB = ArrayPool<T>.Shared.Rent(KcBlock * n);  // [nStripes, Kc, Nr]
+        var packA = ArrayPool<T>.Shared.Rent(m * KcBlock);   // [mStripes, Kc, Mr] (whole A panel per Kc)
+        var packB = ArrayPool<T>.Shared.Rent(KcBlock * Nc);  // [Nc/Nr, Kc, Nr]   (one N-panel)
         try
         {
             fixed (T* cPtr = c)
@@ -148,48 +170,49 @@ internal static class MachineKernelGemm
             fixed (T* pbBase = packB)
             {
                 // Capture buffer addresses as nint — pointers can't be captured by the
-                // parallel body lambda, but the surrounding `fixed` keeps them pinned
-                // for the whole (serial-outer) K-loop including the parallel region.
+                // parallel body lambda, but the surrounding `fixed` keeps them pinned.
                 nint paAddr = (nint)paBase, pbAddr = (nint)pbBase, cAddr = (nint)cPtr;
-                int ldcL = ldc, nStripesL = nStripes, MrL = Mr, NrL = Nr;
+                int ldcL = ldc, MrL = Mr, NrL = Nr;
 
                 for (int pc = 0; pc < k; pc += KcBlock)
                 {
                     int ekc = Math.Min(KcBlock, k - pc);
-
-                    // Pack the Kc-block: A[:, pc:pc+ekc] (all m rows), B[pc:pc+ekc, :] (all n cols).
+                    // Pack the whole A panel A[:, pc:pc+ekc] once per K-block.
                     Avx2Pack.PackA<T>(a.Slice(pc), lda, false,
                         new Span<T>(paBase, m * ekc), mc: m, kc: ekc, Mr);
-                    Avx2Pack.PackB<T>(b.Slice(pc * ldb), ldb, false,
-                        new Span<T>(pbBase, ekc * n), nc: n, kc: ekc, Nr);
 
-                    // Parallelize over M-stripes: each handles Mr disjoint C rows, so
-                    // there's no write contention. The pc loop stays serial-outer, so
-                    // C accumulates correctly across K-blocks. Small shapes run inline
-                    // (ParallelForOrSerial's grain-size gate) — no thread-dispatch cost.
-                    int ekcL = ekc;
-                    long stripeWork = (long)nStripesL * ekcL * MrL * NrL * 2;
-                    CpuParallelSettings.ParallelForOrSerial(0, mStripes, (long)mStripes * stripeWork, isr =>
+                    for (int jc = 0; jc < n; jc += Nc)
                     {
-                        if (typeof(T) == typeof(double))
+                        int ncEff = Math.Min(Nc, n - jc);
+                        int njStripes = ncEff / Nr;
+                        // Pack the B panel B[pc:pc+ekc, jc:jc+ncEff] (fits L2).
+                        Avx2Pack.PackB<T>(b.Slice(pc * ldb + jc), ldb, false,
+                            new Span<T>(pbBase, ekc * ncEff), nc: ncEff, kc: ekc, Nr);
+
+                        int ekcL = ekc, jcL = jc, njStripesL = njStripes;
+                        long stripeWork = (long)njStripesL * ekcL * MrL * NrL * 2;
+                        CpuParallelSettings.ParallelForOrSerial(0, mStripes, (long)mStripes * stripeWork, isr =>
                         {
-                            var kern = (delegate* unmanaged<double*, double*, double*, long, long, void>)kernelAddr;
-                            double* aS = (double*)paAddr + (long)isr * ekcL * MrL;
-                            double* cR = (double*)cAddr + (long)(isr * MrL) * ldcL;
-                            double* pb = (double*)pbAddr;
-                            for (int jsr = 0; jsr < nStripesL; jsr++)
-                                kern(aS, pb + (long)jsr * ekcL * NrL, cR + jsr * NrL, ldcL, ekcL);
-                        }
-                        else // float
-                        {
-                            var kern = (delegate* unmanaged<float*, float*, float*, long, long, void>)kernelAddr;
-                            float* aS = (float*)paAddr + (long)isr * ekcL * MrL;
-                            float* cR = (float*)cAddr + (long)(isr * MrL) * ldcL;
-                            float* pb = (float*)pbAddr;
-                            for (int jsr = 0; jsr < nStripesL; jsr++)
-                                kern(aS, pb + (long)jsr * ekcL * NrL, cR + jsr * NrL, ldcL, ekcL);
-                        }
-                    });
+                            if (typeof(T) == typeof(double))
+                            {
+                                var kern = (delegate* unmanaged<double*, double*, double*, long, long, void>)kernelAddr;
+                                double* aS = (double*)paAddr + (long)isr * ekcL * MrL;
+                                double* cR = (double*)cAddr + (long)(isr * MrL) * ldcL + jcL;
+                                double* pb = (double*)pbAddr;
+                                for (int js = 0; js < njStripesL; js++)
+                                    kern(aS, pb + (long)js * ekcL * NrL, cR + js * NrL, ldcL, ekcL);
+                            }
+                            else // float
+                            {
+                                var kern = (delegate* unmanaged<float*, float*, float*, long, long, void>)kernelAddr;
+                                float* aS = (float*)paAddr + (long)isr * ekcL * MrL;
+                                float* cR = (float*)cAddr + (long)(isr * MrL) * ldcL + jcL;
+                                float* pb = (float*)pbAddr;
+                                for (int js = 0; js < njStripesL; js++)
+                                    kern(aS, pb + (long)js * ekcL * NrL, cR + js * NrL, ldcL, ekcL);
+                            }
+                        });
+                    }
                 }
             }
             return true;
