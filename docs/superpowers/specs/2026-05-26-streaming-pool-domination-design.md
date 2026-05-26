@@ -292,3 +292,42 @@ durable wins are now (1) **Layer F autotune** (empirical per-shape strategy+thre
 retiring the fragile static heuristics) and (2) **Layer D differentiators** (cold-start,
 determinism, per-call threads, frozen-weight — structural advantages PyTorch cannot match).
 Layer C is closed as "no safe microkernel change available on this hardware."
+
+## 17. Layer E head-to-head + the PackBoth occupancy fix (C2)
+
+Built a BlasManaged-vs-TorchSharp(MKL) strict-gate head-to-head (`--pytorch-headtohead`) plus a
+gap-investigation harness (`--investigate-gap`). Findings, in order of how the picture changed:
+
+**17.1 First read (raw head-to-head): we lose everywhere.** All 10 catalog shapes FAIL the
+≥1.5×-faster gate — BlasManaged is 1.6×–34× slower than MKL-backed torch.matmul (verified real:
+maxErr=0). The "dominate PyTorch on raw GEMM" premise looked unreachable.
+
+**17.2 Investigation corrected two misconceptions.**
+- torch.matmul is genuinely fast (not a lazy/measurement artifact).
+- `CpuParallelSettings.ParallelForOrSerial` reads the **global** `MaxDegreeOfParallelism`, not the
+  per-call `NumThreads` — so PackBoth was already multi-core; the apparent "no scaling" was an
+  artifact of comparing two all-cores runs.
+- A clean global-MaxDOP sweep showed the real shape: **512³ plateaued at 4 threads** because
+  `Mc=128` gives only 4 ic-blocks (the sole parallel axis); the large shape (8 blocks) scaled to ~5×.
+
+**17.3 The occupancy fix (C2).** Shrink `Mc` toward ~2×procs ic-blocks, **floored at 64** so packed-A
+panels stay cache-resident (an earlier mc=32 attempt over-fragmented and regressed both shapes).
+Measured on 16-core AVX2 (global MaxDOP sweep, min of 300 iters):
+
+| Shape | Before (mc=128) | After (mc=64) | torch | Note |
+|---|---|---|---|---|
+| 512×512×512 FP32 | 165 GFLOPS @ 4thr | **202 @ 8thr (+22%)** | 331 | now scales past 4 threads |
+| 1024×3072×768 FP32 | 254 @ 16thr | **285 @ 16thr (+12%)** | 292 | **min-case parity with MKL** |
+
+Bit-exact/determinism preserved (Mc is a blocking factor; per-row K-reduction order unchanged).
+
+**17.4 What remains (honest).**
+- **Tiny shapes (≤128³): ~11–18× behind MKL.** Fundamental microkernel gap; not closable without
+  hand-tuned tiny-GEMM kernels (and ideally AVX-512). Out of scope.
+- **Large compute-bound: min-case parity, but median/tail trails** (~1.2× on median). Our GEMM has
+  higher run-to-run variance than MKL on this box; tail-latency reduction (warm pools, NUMA pinning,
+  capping effective threads at physical-core count — 16 logical = 8 physical+SMT here, and GEMM is
+  FMA-bound so SMT doesn't help) is the next lever. Tracked as follow-up.
+- **Net:** we do not yet *dominate* MKL on raw GEMM, but C2 brought the largest compute-bound shape
+  to best-case parity. The shippable value remains supply-chain (pure-managed) + Layer D
+  differentiators, now with a materially faster PackBoth on medium/large shapes.
