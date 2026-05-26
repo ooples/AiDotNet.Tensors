@@ -428,4 +428,164 @@ internal static class Conv2DAbBench
         double stddev = Math.Sqrt(sumSq / samples.Length);
         return (label, mean, min, stddev);
     }
+
+    /// <summary>
+    /// Sub-G readiness diagnostic: identify why BlasManaged is 16× slower than
+    /// OpenBLAS on 64×64×64 FP64 (the worst remaining loss in the 2026-05-26
+    /// baseline). Tries every PackingMode + thread count combination and reports
+    /// the min wall-clock so we can see whether the bottleneck is:
+    ///   (a) strategy selection — wrong PackingMode for this shape,
+    ///   (b) parallelism — serial dispatch when parallel would win,
+    ///   (c) microkernel — even the best-case path is slow.
+    /// Run with: <c>dotnet run -c Release -- --ab-blas-small-square-fp64</c>
+    /// </summary>
+    public static void RunBlasSmallSquareFp64()
+    {
+        Console.WriteLine("=== BlasManaged 64×64×64 FP64 strategy A/B (Sub-G worst-loss target) ===");
+        Console.WriteLine($"Host: cores={Environment.ProcessorCount}, AVX2={System.Runtime.Intrinsics.X86.Avx2.IsSupported}, AVX-512F={System.Runtime.Intrinsics.X86.Avx512F.IsSupported}");
+        Console.WriteLine();
+
+        // Also probe nearby shapes so we don't regress them when adjusting the
+        // dispatcher threshold:
+        //   - 96×128×64: BERT_Attn_score (k=64 — same K, larger m×n)
+        //   - 96×64×128: BERT_Attn_ctx   (k=128 — PackBoth gate boundary)
+        //   - 128×128×128: square cube above the proposed cutoff
+        var shapesToProbe = new (int M, int N, int K, string note, bool fp32)[]
+        {
+            (64,  64,  64,  "64³ FP64 — was the worst-loss shape (16.1× behind OpenBLAS)", false),
+            (96,  128, 64,  "BERT_Attn_score FP64 — close-by, same K", false),
+            (96,  64,  128, "BERT_Attn_ctx FP64 — K=128 boundary", false),
+            (128, 128, 128, "128³ FP64 — above proposed Streaming cutoff", false),
+            // FP32 probes — 64³ FP32 is now the worst after the FP64 fix.
+            (64,  64,  64,  "64³ FP32 — new worst-loss shape (11.3× behind OpenBLAS)", true),
+            (3136, 32, 32,  "MobileNetV2 PW FP32 — thin-N 9.7× regression", true),
+        };
+
+        foreach (var (M_, N_, K_, note, fp32) in shapesToProbe)
+        {
+            if (fp32) ProbeStrategiesFp32(M_, N_, K_, note);
+            else ProbeStrategies(M_, N_, K_, note);
+            Console.WriteLine();
+        }
+        return;
+    }
+
+    private static void ProbeStrategies(int M, int N, int K, string note)
+    {
+        Console.WriteLine($"=== {M}×{N}×{K} FP64  ({note}) ===");
+        var rng = new Random(42);
+        var a = new double[M * K];
+        var b = new double[K * N];
+        var c = new double[M * N];
+        for (int i = 0; i < a.Length; i++) a[i] = rng.NextDouble() * 2 - 1;
+        for (int i = 0; i < b.Length; i++) b[i] = rng.NextDouble() * 2 - 1;
+        double fmas = 2.0 * M * N * K;
+
+        var modes = new (string label, AiDotNet.Tensors.Engines.BlasManaged.PackingMode mode)[]
+        {
+            ("Auto (default)",   AiDotNet.Tensors.Engines.BlasManaged.PackingMode.Auto),
+            ("ForceStreaming",   AiDotNet.Tensors.Engines.BlasManaged.PackingMode.ForceStreaming),
+            ("ForcePackAOnly",   AiDotNet.Tensors.Engines.BlasManaged.PackingMode.ForcePackAOnly),
+            ("ForcePackBoth",    AiDotNet.Tensors.Engines.BlasManaged.PackingMode.ForcePackBoth),
+        };
+        var threadCounts = new[] { -1, 1, 2, 4, 8, 16 };  // -1 = explicit single-thread
+
+        Console.WriteLine($"{"Strategy",-22}  {"Threads",8}  {"min μs",8}  {"GFLOPS",8}");
+        Console.WriteLine(new string('-', 60));
+        foreach (var (label, mode) in modes)
+        {
+            foreach (var nt in threadCounts)
+            {
+                // Skip combos that don't make sense.
+                if (mode == AiDotNet.Tensors.Engines.BlasManaged.PackingMode.Auto && nt > 0)
+                    continue;  // Auto: just measure once with default thread count.
+
+                var opts = new AiDotNet.Tensors.Engines.BlasManaged.BlasOptions<double>
+                {
+                    PackingMode = mode,
+                    NumThreads = nt,
+                };
+
+                // Warmup.
+                for (int i = 0; i < 5; i++)
+                    AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.Gemm<double>(
+                        a, K, false, b, N, false, c, N, M, N, K, opts);
+
+                // GC settle.
+                GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, blocking: true);
+                GC.WaitForPendingFinalizers();
+                GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, blocking: true);
+
+                const int iters = 200;
+                var samples = new double[iters];
+                var sw = new Stopwatch();
+                for (int i = 0; i < iters; i++)
+                {
+                    sw.Restart();
+                    AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.Gemm<double>(
+                        a, K, false, b, N, false, c, N, M, N, K, opts);
+                    sw.Stop();
+                    samples[i] = sw.Elapsed.TotalMicroseconds;
+                }
+                double min = samples.Min();
+                double gflops = fmas / (min * 1e-6) / 1e9;
+                string ntLabel = nt < 0 ? "default" : nt.ToString();
+                Console.WriteLine($"{label,-22}  {ntLabel,8}  {min,8:F2}  {gflops,8:F2}");
+
+                if (mode == AiDotNet.Tensors.Engines.BlasManaged.PackingMode.Auto) break;
+            }
+        }
+        Console.WriteLine();
+    }
+
+    private static void ProbeStrategiesFp32(int M, int N, int K, string note)
+    {
+        Console.WriteLine($"=== {M}×{N}×{K} FP32  ({note}) ===");
+        var rng = new Random(42);
+        var a = new float[M * K];
+        var b = new float[K * N];
+        var c = new float[M * N];
+        for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < b.Length; i++) b[i] = (float)(rng.NextDouble() * 2 - 1);
+        double fmas = 2.0 * M * N * K;
+
+        var modes = new (string label, AiDotNet.Tensors.Engines.BlasManaged.PackingMode mode)[]
+        {
+            ("Auto (default)",   AiDotNet.Tensors.Engines.BlasManaged.PackingMode.Auto),
+            ("ForceStreaming",   AiDotNet.Tensors.Engines.BlasManaged.PackingMode.ForceStreaming),
+            ("ForcePackAOnly",   AiDotNet.Tensors.Engines.BlasManaged.PackingMode.ForcePackAOnly),
+            ("ForcePackBoth",    AiDotNet.Tensors.Engines.BlasManaged.PackingMode.ForcePackBoth),
+        };
+
+        Console.WriteLine($"{"Strategy",-22}  {"min μs",8}  {"GFLOPS",8}");
+        Console.WriteLine(new string('-', 45));
+        foreach (var (label, mode) in modes)
+        {
+            var opts = new AiDotNet.Tensors.Engines.BlasManaged.BlasOptions<float>
+            {
+                PackingMode = mode,
+            };
+            for (int i = 0; i < 5; i++)
+                AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.Gemm<float>(
+                    a, K, false, b, N, false, c, N, M, N, K, opts);
+            GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, blocking: true);
+            GC.WaitForPendingFinalizers();
+            GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, blocking: true);
+
+            const int iters = 200;
+            var samples = new double[iters];
+            var sw = new Stopwatch();
+            for (int i = 0; i < iters; i++)
+            {
+                sw.Restart();
+                AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.Gemm<float>(
+                    a, K, false, b, N, false, c, N, M, N, K, opts);
+                sw.Stop();
+                samples[i] = sw.Elapsed.TotalMicroseconds;
+            }
+            double min = samples.Min();
+            double gflops = fmas / (min * 1e-6) / 1e9;
+            Console.WriteLine($"{label,-22}  {min,8:F2}  {gflops,8:F2}");
+        }
+    }
 }

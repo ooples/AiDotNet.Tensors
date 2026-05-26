@@ -33,6 +33,21 @@ internal static class Dispatcher
             return options.PackingMode;
 
         if (k < 32 || (long)m * n < 1024) return PackingMode.ForceStreaming;
+
+        // Sub-G readiness: small cubes (the 64×64×64 family) hit a perf cliff
+        // on PackAOnly because pack-A + autotune dispatch overhead exceeds
+        // the actual GEMM compute at these sizes. The A/B diagnostic
+        // (Conv2DAbBench `--ab-blas-small-square-fp64`) showed:
+        //   - 64³ FP64: Streaming 4.3 vs PackAOnly 2.4 GFLOPS (1.8× win)
+        //   - 64³ FP32: Streaming 5.8 vs PackAOnly 3.3 GFLOPS (1.75× win)
+        //   - 96×128×64 FP64 (786K): PackAOnly 9.0 GFLOPS still wins
+        //     (above the cutoff)
+        // 300K total-work is the empirical cutoff: 64³ (262K) routes to
+        // Streaming; 96×128×64 (786K) stays on PackAOnly. Applies to FP32
+        // and FP64 — both showed the same shape-dependent crossover.
+        if ((long)m * n * k <= 300_000L)
+            return PackingMode.ForceStreaming;
+
         if (k < 128) return PackingMode.ForcePackAOnly;
         return PackingMode.ForcePackBoth;
     }

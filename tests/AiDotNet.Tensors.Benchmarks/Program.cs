@@ -67,6 +67,14 @@ class Program
             return;
         }
 
+        // Sub-G worst-loss diagnostic: identify which strategy/thread count
+        // gives best BlasManaged perf for the 64×64×64 FP64 shape.
+        if (args[0] == "--ab-blas-small-square-fp64")
+        {
+            Conv2DAbBench.RunBlasSmallSquareFp64();
+            return;
+        }
+
         // Issue #403 Phase A.3: per-substep allocation profile + shape catalog
         // for one pass through the DCGAN-step probe substeps. Cheap to run
         // (one call per substep) so reviewers can compare alloc shape against
