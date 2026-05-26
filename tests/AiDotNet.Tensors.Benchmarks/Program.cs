@@ -108,6 +108,11 @@ class Program
             PyTorchComparison.HeadToHeadCatalogBench.Run(outPath);
             return;
         }
+        if (args[0] == "--investigate-gap")
+        {
+            PyTorchComparison.GapInvestigationBench.Run();
+            return;
+        }
 
         // Issue #403 Phase A.3: per-substep allocation profile + shape catalog
         // for one pass through the DCGAN-step probe substeps. Cheap to run
