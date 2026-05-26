@@ -1,6 +1,7 @@
 using System;
 using System.Threading;
 using AiDotNet.Tensors.Engines.BlasManaged;
+using AiDotNet.Tensors.Engines.BlasManaged.Autotune;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.BlasManaged;
