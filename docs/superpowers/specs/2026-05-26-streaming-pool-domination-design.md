@@ -259,3 +259,36 @@ When detection finds 1 node (most dev boxes, most CI runners), Layer G is a no-o
 - PR #460 (`feat/369-refresh-perf-catalog-and-baseline`) — refreshed shape catalog + metrics.
 - PR #462 (`perf/blas-managed-fp64-small-square-microkernel`) — dispatcher rebalance + reverted-M-axis prototype (this PR builds on its branch).
 - Issue #368 — parent mega; Issue #375 — Sub-G native removal.
+
+## 16. Layer C findings (post full A/B scan, 2026-05-26)
+
+Executed the "full C scan" path: `--ab-blas-small-square-fp64` across all 12 worst-loss
+catalog shapes on a 16-core AVX2 (no AVX-512) Windows host. Honest results:
+
+**Catalog is already well-tuned.** Layers A+B (StreamingWorkerPool + M-axis dispatch) plus
+the prior PR #462 dispatcher rebalance leave most shapes performing near their per-strategy
+optimum. The large apparent "Auto vs best" gaps in the raw table are a **benchmark-labeling
+artifact**: the probe's `default` column passes `NumThreads = -1` (force single-thread), not the
+production default (`NumThreads = 0` → all cores). E.g. 128×768×768 FP64 shows "Auto 23 vs
+PackAOnly@8 92" but production (`NumThreads=0`) already routes PackAOnly multi-threaded (~83 GFLOPS).
+
+**64³ FP64/FP32 are microkernel-bound and resist register-tiling.** Attempted a BLIS-style 4×8
+streaming register tile (8 accumulators vs the row-walk's 4), both with strided-A and with
+on-the-fly per-M-tile A-packing. Both **regressed** single-thread throughput (4.28 → 2.81 GFLOPS)
+because the binding constraint at 64³ is **L2 B-streaming bandwidth**, not FMA-port saturation or
+accumulator count — B (32 KB) just exceeds L1, so it is re-streamed from L2 every M-row. The
+strided-B access in the register tile defeats the HW prefetcher and the pack overhead negates the
+theoretical 4× B-reuse. The existing multi-accumulator row-walk is near-optimal for this shape
+class on AVX2-without-512 hardware. **Marked as known gap; revisit only with AVX-512 (8×16 tile,
+B fits differently) or a genuine L1-blocking rewrite — not in scope for this PR.**
+
+**Static dispatcher heuristics are fragile.** The `n≤32 → PackBoth` rule's documented basis
+(3136×32×32 FP32: "PackBoth 35.3") no longer matches reality (now PackBoth 21.0 vs Streaming 26.8).
+Hand-tuning these thresholds chases a moving target. **This is precisely the problem
+`AutotuneCacheV2` (Layer F) solves** — per-shape empirical routing replaces brittle static cutoffs.
+
+**Conclusion / re-prioritisation:** Micro-kernel hand-tuning has hit diminishing returns. The
+durable wins are now (1) **Layer F autotune** (empirical per-shape strategy+thread routing,
+retiring the fragile static heuristics) and (2) **Layer D differentiators** (cold-start,
+determinism, per-call threads, frozen-weight — structural advantages PyTorch cannot match).
+Layer C is closed as "no safe microkernel change available on this hardware."
