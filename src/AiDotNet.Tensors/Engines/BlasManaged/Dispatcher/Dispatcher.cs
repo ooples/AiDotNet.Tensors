@@ -34,21 +34,48 @@ internal static class Dispatcher
 
         if (k < 32 || (long)m * n < 1024) return PackingMode.ForceStreaming;
 
-        // Sub-G readiness: small cubes (the 64×64×64 family) hit a perf cliff
-        // on PackAOnly because pack-A + autotune dispatch overhead exceeds
-        // the actual GEMM compute at these sizes. The A/B diagnostic
-        // (Conv2DAbBench `--ab-blas-small-square-fp64`) showed:
-        //   - 64³ FP64: Streaming 4.3 vs PackAOnly 2.4 GFLOPS (1.8× win)
-        //   - 64³ FP32: Streaming 5.8 vs PackAOnly 3.3 GFLOPS (1.75× win)
-        //   - 96×128×64 FP64 (786K): PackAOnly 9.0 GFLOPS still wins
-        //     (above the cutoff)
-        // 300K total-work is the empirical cutoff: 64³ (262K) routes to
-        // Streaming; 96×128×64 (786K) stays on PackAOnly. Applies to FP32
-        // and FP64 — both showed the same shape-dependent crossover.
-        if ((long)m * n * k <= 300_000L)
-            return PackingMode.ForceStreaming;
+        // Sub-G readiness — A/B diagnostic (Conv2DAbBench
+        // `--ab-blas-small-square-fp64`) measured every PackingMode for the
+        // 6 worst-loss shapes in the refreshed baseline and revealed three
+        // distinct K<128 regimes that PackAOnly handled badly. PackAOnly is
+        // rarely the optimal choice — it wins only on a narrow band of
+        // medium-work shapes (~96×128×64-ish), and the prior heuristic
+        // routed every K<128 shape to it regardless of M, N, total work.
+        //
+        // Empirical optima (16-core AVX2 Windows host, 2026-05-26):
+        //
+        //   tiny cubes (M·N·K ≤ 300K):              Streaming
+        //     - 64³ FP64: Streaming 4.3 vs PackAOnly 2.4 (1.8× win)
+        //     - 64³ FP32: Streaming 5.8 vs PackAOnly 3.3 (1.75× win)
+        //
+        //   thin-K with substantial work, very thin N (≤32):  PackBoth
+        //     - 3136×32×32 FP32: PackBoth 35.3 vs PackAOnly 18.2 (1.94×)
+        //
+        //   thin-K with substantial work, tall + thin N (n≤64, m≥8·n): Streaming
+        //     - 3136×64×64 FP32: Streaming 55.6 vs PackAOnly 26.3 (2.11×)
+        //
+        //   thin-K with substantial work, balanced M·N:    PackBoth
+        //     - 512×512×64 FP64: PackBoth 53.2 vs PackAOnly 12.0 (4.43×)
+        //
+        //   medium-K, medium work (PackAOnly's narrow band): PackAOnly
+        //     - 96×128×64 FP64: PackAOnly 9.2 vs Streaming 8.6 vs PackBoth 3.3
+        //
+        // The branch ordering below codifies this map. The 300K Streaming
+        // cutoff is intentionally BELOW 96×128×64's work (786K) so
+        // PackAOnly's narrow band is preserved.
 
-        if (k < 128) return PackingMode.ForcePackAOnly;
+        long work = (long)m * n * k;
+        if (work <= 300_000L) return PackingMode.ForceStreaming;
+
+        if (k < 128 && work >= 1_000_000L)
+        {
+            // Substantial thin-K shape. Three sub-regimes:
+            if (n <= 32) return PackingMode.ForcePackBoth;                  // micro-N
+            if (n <= 64 && m >= 8 * n) return PackingMode.ForceStreaming;   // tall + thin
+            return PackingMode.ForcePackBoth;                               // balanced
+        }
+
+        if (k < 128) return PackingMode.ForcePackAOnly;                     // 96×128×64-style
         return PackingMode.ForcePackBoth;
     }
 }

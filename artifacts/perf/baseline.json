@@ -1,7 +1,7 @@
 {
-  "GitSha": "a14a5992bde9f3b2f9e20211e9c76e46c2800acf",
+  "GitSha": "f961367361c117af79c2d6444a9e7e17334f4535",
   "HardwareFingerprint": "x64-amd-avx2-cpu16",
-  "TimestampUtc": "2026-05-26 14:57:40Z",
+  "TimestampUtc": "2026-05-26 15:11:41Z",
   "Shapes": [
     {
       "ShapeName": "BERT_FFN_up_1024x3072x768",
@@ -11,12 +11,12 @@
       "TransA": false,
       "TransB": false,
       "Dtype": "Single",
-      "BlasManagedMedianMs": 39.1022,
-      "BlasManagedP95Ms": 152.5595,
-      "NativeMedianMs": 21.7247,
-      "NativeP95Ms": 29.1262,
+      "BlasManagedMedianMs": 36.8148,
+      "BlasManagedP95Ms": 128.822,
+      "NativeMedianMs": 15.9577,
+      "NativeP95Ms": 21.2176,
       "NativeAvailable": true,
-      "RatioBmOverNative": 1.799895970945514
+      "RatioBmOverNative": 2.307024195216102
     },
     {
       "ShapeName": "BERT_FFN_down_1024x768x3072",
@@ -26,12 +26,12 @@
       "TransA": false,
       "TransB": false,
       "Dtype": "Single",
-      "BlasManagedMedianMs": 33.1693,
-      "BlasManagedP95Ms": 38.0338,
-      "NativeMedianMs": 13.2365,
-      "NativeP95Ms": 14.5037,
+      "BlasManagedMedianMs": 34.9119,
+      "BlasManagedP95Ms": 41.5995,
+      "NativeMedianMs": 14.6463,
+      "NativeP95Ms": 18.0977,
       "NativeAvailable": true,
-      "RatioBmOverNative": 2.505896573867714
+      "RatioBmOverNative": 2.3836668646688928
     },
     {
       "ShapeName": "BERT_Attn_QKV_1024x768x768",
@@ -41,12 +41,12 @@
       "TransA": false,
       "TransB": false,
       "Dtype": "Single",
-      "BlasManagedMedianMs": 8.616,
-      "BlasManagedP95Ms": 9.551,
-      "NativeMedianMs": 3.5361,
-      "NativeP95Ms": 3.8764,
+      "BlasManagedMedianMs": 9.0376,
+      "BlasManagedP95Ms": 9.87,
+      "NativeMedianMs": 7.8973,
+      "NativeP95Ms": 11.1508,
       "NativeAvailable": true,
-      "RatioBmOverNative": 2.4365826758293037
+      "RatioBmOverNative": 1.1443911210160433
     },
     {
       "ShapeName": "BERT_Attn_score_96x128x64",
@@ -56,12 +56,12 @@
       "TransA": false,
       "TransB": false,
       "Dtype": "Single",
-      "BlasManagedMedianMs": 0.3112,
-      "BlasManagedP95Ms": 0.4068,
-      "NativeMedianMs": 0.0455,
-      "NativeP95Ms": 0.077,
+      "BlasManagedMedianMs": 0.4159,
+      "BlasManagedP95Ms": 0.5972,
+      "NativeMedianMs": 0.1072,
+      "NativeP95Ms": 0.3556,
       "NativeAvailable": true,
-      "RatioBmOverNative": 6.839560439560439
+      "RatioBmOverNative": 3.8796641791044775
     },
     {
       "ShapeName": "BERT_Attn_ctx_96x64x128",
@@ -71,12 +71,12 @@
       "TransA": false,
       "TransB": false,
       "Dtype": "Single",
-      "BlasManagedMedianMs": 0.1523,
-      "BlasManagedP95Ms": 0.2105,
-      "NativeMedianMs": 0.0425,
-      "NativeP95Ms": 0.0925,
+      "BlasManagedMedianMs": 0.1978,
+      "BlasManagedP95Ms": 0.2895,
+      "NativeMedianMs": 0.08,
+      "NativeP95Ms": 0.1424,
       "NativeAvailable": true,
-      "RatioBmOverNative": 3.5835294117647054
+      "RatioBmOverNative": 2.4725
     },
     {
       "ShapeName": "GPT2med_FFN_up_512x4096x1024",
@@ -86,12 +86,12 @@
       "TransA": false,
       "TransB": false,
       "Dtype": "Single",
-      "BlasManagedMedianMs": 40.9635,
-      "BlasManagedP95Ms": 44.1973,
-      "NativeMedianMs": 14.9091,
-      "NativeP95Ms": 17.1139,
+      "BlasManagedMedianMs": 42.0239,
+      "BlasManagedP95Ms": 47.7146,
+      "NativeMedianMs": 14.853,
+      "NativeP95Ms": 15.5566,
       "NativeAvailable": true,
-      "RatioBmOverNative": 2.747550153932833
+      "RatioBmOverNative": 2.8293206759577187
     },
     {
       "ShapeName": "GPT2med_FFN_down_512x1024x4096",
@@ -101,12 +101,12 @@
       "TransA": false,
       "TransB": false,
       "Dtype": "Single",
-      "BlasManagedMedianMs": 34.4372,
-      "BlasManagedP95Ms": 64.3741,
-      "NativeMedianMs": 13.2967,
-      "NativeP95Ms": 14.477,
+      "BlasManagedMedianMs": 35.9736,
+      "BlasManagedP95Ms": 47.5804,
+      "NativeMedianMs": 14.6708,
+      "NativeP95Ms": 22.1663,
       "NativeAvailable": true,
-      "RatioBmOverNative": 2.589905766092339
+      "RatioBmOverNative": 2.4520544210268014
     },
     {
       "ShapeName": "GPT2med_Attn_proj_512x1024x1024",
@@ -116,12 +116,12 @@
       "TransA": false,
       "TransB": false,
       "Dtype": "Single",
-      "BlasManagedMedianMs": 8.8064,
-      "BlasManagedP95Ms": 9.7075,
-      "NativeMedianMs": 3.3085,
-      "NativeP95Ms": 4.6275,
+      "BlasManagedMedianMs": 9.3337,
+      "BlasManagedP95Ms": 11.7628,
+      "NativeMedianMs": 4.5729,
+      "NativeP95Ms": 7.0116,
       "NativeAvailable": true,
-      "RatioBmOverNative": 2.661750037781472
+      "RatioBmOverNative": 2.041089899188699
     },
     {
       "ShapeName": "ResNet50_conv1_3136x64x147",
@@ -131,12 +131,12 @@
       "TransA": false,
       "TransB": false,
       "Dtype": "Single",
-      "BlasManagedMedianMs": 0.7762,
-      "BlasManagedP95Ms": 0.9462,
-      "NativeMedianMs": 0.4327,
-      "NativeP95Ms": 0.6279,
+      "BlasManagedMedianMs": 1.3065,
+      "BlasManagedP95Ms": 1.957,
+      "NativeMedianMs": 1.1998,
+      "NativeP95Ms": 3.1067,
       "NativeAvailable": true,
-      "RatioBmOverNative": 1.7938525537323782
+      "RatioBmOverNative": 1.0889314885814303
     },
     {
       "ShapeName": "ResNet50_layer1_3136x64x64",
@@ -146,12 +146,12 @@
       "TransA": false,
       "TransB": false,
       "Dtype": "Single",
-      "BlasManagedMedianMs": 3.9881,
-      "BlasManagedP95Ms": 5.0103,
-      "NativeMedianMs": 0.2035,
-      "NativeP95Ms": 0.2817,
+      "BlasManagedMedianMs": 0.7331,
+      "BlasManagedP95Ms": 1.1096,
+      "NativeMedianMs": 0.2954,
+      "NativeP95Ms": 0.6393,
       "NativeAvailable": true,
-      "RatioBmOverNative": 19.597542997542998
+      "RatioBmOverNative": 2.481719702098849
     },
     {
       "ShapeName": "ResNet50_layer2_784x128x128",
@@ -161,12 +161,12 @@
       "TransA": false,
       "TransB": false,
       "Dtype": "Single",
-      "BlasManagedMedianMs": 0.454,
-      "BlasManagedP95Ms": 0.6403,
-      "NativeMedianMs": 0.2012,
-      "NativeP95Ms": 0.2507,
+      "BlasManagedMedianMs": 0.5847,
+      "BlasManagedP95Ms": 0.7804,
+      "NativeMedianMs": 0.2256,
+      "NativeP95Ms": 0.3659,
       "NativeAvailable": true,
-      "RatioBmOverNative": 2.256461232604374
+      "RatioBmOverNative": 2.591755319148936
     },
     {
       "ShapeName": "ResNet50_layer3_196x256x256",
@@ -176,12 +176,12 @@
       "TransA": false,
       "TransB": false,
       "Dtype": "Single",
-      "BlasManagedMedianMs": 0.6071,
-      "BlasManagedP95Ms": 0.8155,
-      "NativeMedianMs": 0.1162,
-      "NativeP95Ms": 0.1721,
+      "BlasManagedMedianMs": 0.9225,
+      "BlasManagedP95Ms": 1.2967,
+      "NativeMedianMs": 0.2232,
+      "NativeP95Ms": 0.7443,
       "NativeAvailable": true,
-      "RatioBmOverNative": 5.224612736660929
+      "RatioBmOverNative": 4.133064516129032
     },
     {
       "ShapeName": "ResNet50_layer4_49x512x512",
@@ -191,12 +191,12 @@
       "TransA": false,
       "TransB": false,
       "Dtype": "Single",
-      "BlasManagedMedianMs": 0.465,
-      "BlasManagedP95Ms": 0.5388,
-      "NativeMedianMs": 0.2476,
-      "NativeP95Ms": 0.4122,
+      "BlasManagedMedianMs": 0.4549,
+      "BlasManagedP95Ms": 0.5949,
+      "NativeMedianMs": 0.1948,
+      "NativeP95Ms": 0.3394,
       "NativeAvailable": true,
-      "RatioBmOverNative": 1.8780290791599357
+      "RatioBmOverNative": 2.335215605749487
     },
     {
       "ShapeName": "ResNet50_fc_1x1000x2048",
@@ -206,12 +206,12 @@
       "TransA": false,
       "TransB": false,
       "Dtype": "Single",
-      "BlasManagedMedianMs": 1.5428,
-      "BlasManagedP95Ms": 2.2177,
-      "NativeMedianMs": 0.5672,
-      "NativeP95Ms": 0.7821,
+      "BlasManagedMedianMs": 1.6177,
+      "BlasManagedP95Ms": 2.2809,
+      "NativeMedianMs": 0.7435,
+      "NativeP95Ms": 1.7719,
       "NativeAvailable": true,
-      "RatioBmOverNative": 2.7200282087447105
+      "RatioBmOverNative": 2.175790181573638
     },
     {
       "ShapeName": "MobileNetV2_pw_3136x32x32",
@@ -221,12 +221,12 @@
       "TransA": false,
       "TransB": false,
       "Dtype": "Single",
-      "BlasManagedMedianMs": 1.1005,
-      "BlasManagedP95Ms": 1.3334,
-      "NativeMedianMs": 0.114,
-      "NativeP95Ms": 0.1938,
+      "BlasManagedMedianMs": 0.3895,
+      "BlasManagedP95Ms": 0.6599,
+      "NativeMedianMs": 0.1782,
+      "NativeP95Ms": 0.3908,
       "NativeAvailable": true,
-      "RatioBmOverNative": 9.653508771929825
+      "RatioBmOverNative": 2.185746352413019
     },
     {
       "ShapeName": "MobileNetV2_pw_784x144x24",
@@ -236,12 +236,12 @@
       "TransA": false,
       "TransB": false,
       "Dtype": "Single",
-      "BlasManagedMedianMs": 0.2251,
-      "BlasManagedP95Ms": 0.3021,
-      "NativeMedianMs": 0.1092,
-      "NativeP95Ms": 0.1942,
+      "BlasManagedMedianMs": 0.3935,
+      "BlasManagedP95Ms": 0.6605,
+      "NativeMedianMs": 0.2791,
+      "NativeP95Ms": 1.3306,
       "NativeAvailable": true,
-      "RatioBmOverNative": 2.061355311355311
+      "RatioBmOverNative": 1.409888928699391
     },
     {
       "ShapeName": "MobileNetV2_pw_196x96x96",
@@ -251,12 +251,12 @@
       "TransA": false,
       "TransB": false,
       "Dtype": "Single",
-      "BlasManagedMedianMs": 0.5548,
-      "BlasManagedP95Ms": 0.7855,
-      "NativeMedianMs": 0.0942,
-      "NativeP95Ms": 0.2256,
+      "BlasManagedMedianMs": 0.4003,
+      "BlasManagedP95Ms": 0.5817,
+      "NativeMedianMs": 0.2464,
+      "NativeP95Ms": 1.9062,
       "NativeAvailable": true,
-      "RatioBmOverNative": 5.889596602972398
+      "RatioBmOverNative": 1.6245941558441557
     },
     {
       "ShapeName": "MobileNetV2_fc_1x1000x1280",
@@ -266,12 +266,12 @@
       "TransA": false,
       "TransB": false,
       "Dtype": "Single",
-      "BlasManagedMedianMs": 0.4887,
-      "BlasManagedP95Ms": 0.9959,
-      "NativeMedianMs": 0.4748,
-      "NativeP95Ms": 0.7471,
+      "BlasManagedMedianMs": 0.9348,
+      "BlasManagedP95Ms": 2.0812,
+      "NativeMedianMs": 0.7078,
+      "NativeP95Ms": 1.1677,
       "NativeAvailable": true,
-      "RatioBmOverNative": 1.0292754844144905
+      "RatioBmOverNative": 1.3207120655552416
     },
     {
       "ShapeName": "FP64_Linreg_4096x1024x1024",
@@ -281,12 +281,12 @@
       "TransA": false,
       "TransB": false,
       "Dtype": "Double",
-      "BlasManagedMedianMs": 84.4551,
-      "BlasManagedP95Ms": 92.2677,
-      "NativeMedianMs": 70.0147,
-      "NativeP95Ms": 74.2701,
+      "BlasManagedMedianMs": 98.7204,
+      "BlasManagedP95Ms": 109.6285,
+      "NativeMedianMs": 84.6381,
+      "NativeP95Ms": 96.5746,
       "NativeAvailable": true,
-      "RatioBmOverNative": 1.2062481164669705
+      "RatioBmOverNative": 1.1663825156755645
     },
     {
       "ShapeName": "FP64_PCA_512x512x4096",
@@ -296,12 +296,12 @@
       "TransA": false,
       "TransB": false,
       "Dtype": "Double",
-      "BlasManagedMedianMs": 34.84,
-      "BlasManagedP95Ms": 39.9353,
-      "NativeMedianMs": 14.5373,
-      "NativeP95Ms": 17.1501,
+      "BlasManagedMedianMs": 37.9821,
+      "BlasManagedP95Ms": 46.7358,
+      "NativeMedianMs": 17.5724,
+      "NativeP95Ms": 25.173,
       "NativeAvailable": true,
-      "RatioBmOverNative": 2.396593590281552
+      "RatioBmOverNative": 2.161463431289978
     },
     {
       "ShapeName": "FP64_QR_2048x2048x256",
@@ -311,12 +311,12 @@
       "TransA": false,
       "TransB": false,
       "Dtype": "Double",
-      "BlasManagedMedianMs": 27.2235,
-      "BlasManagedP95Ms": 36.3321,
-      "NativeMedianMs": 28.4644,
-      "NativeP95Ms": 34.4063,
+      "BlasManagedMedianMs": 27.4758,
+      "BlasManagedP95Ms": 30.2392,
+      "NativeMedianMs": 17.7195,
+      "NativeP95Ms": 21.9228,
       "NativeAvailable": true,
-      "RatioBmOverNative": 0.9564051938561853
+      "RatioBmOverNative": 1.550596800135444
     },
     {
       "ShapeName": "BERT_FFN_bwd_dW_3072x768x1024",
@@ -326,12 +326,12 @@
       "TransA": true,
       "TransB": false,
       "Dtype": "Single",
-      "BlasManagedMedianMs": 23.4765,
-      "BlasManagedP95Ms": 24.0641,
-      "NativeMedianMs": 16.0037,
-      "NativeP95Ms": 19.896,
+      "BlasManagedMedianMs": 24.9521,
+      "BlasManagedP95Ms": 29.4348,
+      "NativeMedianMs": 15.6385,
+      "NativeP95Ms": 19.4425,
       "NativeAvailable": true,
-      "RatioBmOverNative": 1.4669420196579543
+      "RatioBmOverNative": 1.5955558397544523
     },
     {
       "ShapeName": "ResNet50_bwd_dW_64x147x3136",
@@ -341,12 +341,12 @@
       "TransA": true,
       "TransB": false,
       "Dtype": "Single",
-      "BlasManagedMedianMs": 5.4256,
-      "BlasManagedP95Ms": 13.8685,
-      "NativeMedianMs": 1.3963,
-      "NativeP95Ms": 2.6107,
+      "BlasManagedMedianMs": 7.0218,
+      "BlasManagedP95Ms": 11.7577,
+      "NativeMedianMs": 1.5656,
+      "NativeP95Ms": 2.2529,
       "NativeAvailable": true,
-      "RatioBmOverNative": 3.8856979159206473
+      "RatioBmOverNative": 4.485053653551354
     },
     {
       "ShapeName": "LSTM_cell_1x256x256",
@@ -356,12 +356,12 @@
       "TransA": false,
       "TransB": false,
       "Dtype": "Single",
-      "BlasManagedMedianMs": 0.0106,
-      "BlasManagedP95Ms": 0.0121,
-      "NativeMedianMs": 0.0403,
-      "NativeP95Ms": 0.0408,
+      "BlasManagedMedianMs": 0.0116,
+      "BlasManagedP95Ms": 0.0148,
+      "NativeMedianMs": 0.0426,
+      "NativeP95Ms": 0.048,
       "NativeAvailable": true,
-      "RatioBmOverNative": 0.2630272952853598
+      "RatioBmOverNative": 0.27230046948356806
     },
     {
       "ShapeName": "LSTM_cell_1x512x512",
@@ -371,12 +371,12 @@
       "TransA": false,
       "TransB": false,
       "Dtype": "Single",
-      "BlasManagedMedianMs": 0.0737,
-      "BlasManagedP95Ms": 0.0821,
-      "NativeMedianMs": 0.1561,
-      "NativeP95Ms": 0.1858,
+      "BlasManagedMedianMs": 0.0775,
+      "BlasManagedP95Ms": 0.1012,
+      "NativeMedianMs": 0.1685,
+      "NativeP95Ms": 0.1786,
       "NativeAvailable": true,
-      "RatioBmOverNative": 0.4721332479180013
+      "RatioBmOverNative": 0.45994065281899105
     },
     {
       "ShapeName": "GRU_cell_1x768x768",
@@ -386,12 +386,12 @@
       "TransA": false,
       "TransB": false,
       "Dtype": "Single",
-      "BlasManagedMedianMs": 0.2322,
-      "BlasManagedP95Ms": 0.3268,
-      "NativeMedianMs": 0.2997,
-      "NativeP95Ms": 0.68,
+      "BlasManagedMedianMs": 0.3804,
+      "BlasManagedP95Ms": 0.6328,
+      "NativeMedianMs": 0.3093,
+      "NativeP95Ms": 0.5646,
       "NativeAvailable": true,
-      "RatioBmOverNative": 0.7747747747747746
+      "RatioBmOverNative": 1.2298739088263821
     },
     {
       "ShapeName": "Embedding_proj_8x768x768",
@@ -401,12 +401,12 @@
       "TransA": false,
       "TransB": false,
       "Dtype": "Single",
-      "BlasManagedMedianMs": 0.6812,
-      "BlasManagedP95Ms": 0.9154,
-      "NativeMedianMs": 0.3065,
-      "NativeP95Ms": 0.7129,
+      "BlasManagedMedianMs": 1.2771,
+      "BlasManagedP95Ms": 1.9921,
+      "NativeMedianMs": 0.5195,
+      "NativeP95Ms": 2.0301,
       "NativeAvailable": true,
-      "RatioBmOverNative": 2.2225122349102775
+      "RatioBmOverNative": 2.45832531280077
     },
     {
       "ShapeName": "BERT_train_b32_4096x3072x768",
@@ -416,12 +416,12 @@
       "TransA": false,
       "TransB": false,
       "Dtype": "Single",
-      "BlasManagedMedianMs": 94.7834,
-      "BlasManagedP95Ms": 104.802,
-      "NativeMedianMs": 52.2552,
-      "NativeP95Ms": 55.426,
+      "BlasManagedMedianMs": 135.2305,
+      "BlasManagedP95Ms": 171.7287,
+      "NativeMedianMs": 56.5262,
+      "NativeP95Ms": 61.1103,
       "NativeAvailable": true,
-      "RatioBmOverNative": 1.8138558459253815
+      "RatioBmOverNative": 2.392350803698108
     },
     {
       "ShapeName": "BERTlarge_FFN_up_1024x4096x1024",
@@ -431,12 +431,12 @@
       "TransA": false,
       "TransB": false,
       "Dtype": "Single",
-      "BlasManagedMedianMs": 55.3549,
-      "BlasManagedP95Ms": 64.3485,
-      "NativeMedianMs": 24.0187,
-      "NativeP95Ms": 26.1805,
+      "BlasManagedMedianMs": 62.8835,
+      "BlasManagedP95Ms": 68.2079,
+      "NativeMedianMs": 24.2645,
+      "NativeP95Ms": 27.6961,
       "NativeAvailable": true,
-      "RatioBmOverNative": 2.3046584536215535
+      "RatioBmOverNative": 2.5915844134435075
     },
     {
       "ShapeName": "BERTlarge_Attn_QKV_1024x1024x1024",
@@ -446,12 +446,12 @@
       "TransA": false,
       "TransB": false,
       "Dtype": "Single",
-      "BlasManagedMedianMs": 14.6241,
-      "BlasManagedP95Ms": 15.4658,
-      "NativeMedianMs": 6.8484,
-      "NativeP95Ms": 10.4976,
+      "BlasManagedMedianMs": 15.1406,
+      "BlasManagedP95Ms": 16.0033,
+      "NativeMedianMs": 7.5123,
+      "NativeP95Ms": 9.712,
       "NativeAvailable": true,
-      "RatioBmOverNative": 2.1354038899596985
+      "RatioBmOverNative": 2.015441342864369
     },
     {
       "ShapeName": "GPT2sm_FFN_up_512x3072x768",
@@ -461,12 +461,12 @@
       "TransA": false,
       "TransB": false,
       "Dtype": "Single",
-      "BlasManagedMedianMs": 20.8893,
-      "BlasManagedP95Ms": 22.8029,
-      "NativeMedianMs": 11.6904,
-      "NativeP95Ms": 18.8197,
+      "BlasManagedMedianMs": 19.0574,
+      "BlasManagedP95Ms": 35.7623,
+      "NativeMedianMs": 7.435,
+      "NativeP95Ms": 8.393,
       "NativeAvailable": true,
-      "RatioBmOverNative": 1.7868764114144937
+      "RatioBmOverNative": 2.5632010759919304
     },
     {
       "ShapeName": "GPT2sm_Attn_proj_512x768x768",
@@ -476,12 +476,12 @@
       "TransA": false,
       "TransB": false,
       "Dtype": "Single",
-      "BlasManagedMedianMs": 6.5912,
-      "BlasManagedP95Ms": 7.8735,
-      "NativeMedianMs": 2.3402,
-      "NativeP95Ms": 4.8372,
+      "BlasManagedMedianMs": 5.0343,
+      "BlasManagedP95Ms": 6.8321,
+      "NativeMedianMs": 1.8327,
+      "NativeP95Ms": 3.3426,
       "NativeAvailable": true,
-      "RatioBmOverNative": 2.816511409281258
+      "RatioBmOverNative": 2.746930757898183
     },
     {
       "ShapeName": "ViT_patch_proj_196x768x768",
@@ -491,12 +491,12 @@
       "TransA": false,
       "TransB": false,
       "Dtype": "Single",
-      "BlasManagedMedianMs": 4.7711,
-      "BlasManagedP95Ms": 13.542,
-      "NativeMedianMs": 2.1463,
-      "NativeP95Ms": 4.0065,
+      "BlasManagedMedianMs": 3.909,
+      "BlasManagedP95Ms": 10.1154,
+      "NativeMedianMs": 0.9403,
+      "NativeP95Ms": 1.3874,
       "NativeAvailable": true,
-      "RatioBmOverNative": 2.222941806830359
+      "RatioBmOverNative": 4.157183877485909
     },
     {
       "ShapeName": "ViT_Attn_QKV_197x2304x768",
@@ -506,12 +506,12 @@
       "TransA": false,
       "TransB": false,
       "Dtype": "Single",
-      "BlasManagedMedianMs": 8.4876,
-      "BlasManagedP95Ms": 10.3134,
-      "NativeMedianMs": 2.6566,
-      "NativeP95Ms": 3.5013,
+      "BlasManagedMedianMs": 6.4664,
+      "BlasManagedP95Ms": 7.2522,
+      "NativeMedianMs": 2.2056,
+      "NativeP95Ms": 2.6746,
       "NativeAvailable": true,
-      "RatioBmOverNative": 3.1949107882255516
+      "RatioBmOverNative": 2.931809938338774
     },
     {
       "ShapeName": "LargeSquare_2048sq",
@@ -521,12 +521,12 @@
       "TransA": false,
       "TransB": false,
       "Dtype": "Single",
-      "BlasManagedMedianMs": 93.4464,
-      "BlasManagedP95Ms": 97.4614,
-      "NativeMedianMs": 46.0019,
-      "NativeP95Ms": 71.6821,
+      "BlasManagedMedianMs": 90.9784,
+      "BlasManagedP95Ms": 103.2547,
+      "NativeMedianMs": 44.2163,
+      "NativeP95Ms": 46.4068,
       "NativeAvailable": true,
-      "RatioBmOverNative": 2.031359574278454
+      "RatioBmOverNative": 2.0575760522703166
     },
     {
       "ShapeName": "LargeSquare_FP64_1024sq",
@@ -536,12 +536,12 @@
       "TransA": false,
       "TransB": false,
       "Dtype": "Double",
-      "BlasManagedMedianMs": 28.1303,
-      "BlasManagedP95Ms": 30.7995,
-      "NativeMedianMs": 15.8656,
-      "NativeP95Ms": 17.7171,
+      "BlasManagedMedianMs": 28.9143,
+      "BlasManagedP95Ms": 37.3284,
+      "NativeMedianMs": 19.2267,
+      "NativeP95Ms": 27.9804,
       "NativeAvailable": true,
-      "RatioBmOverNative": 1.7730372630092777
+      "RatioBmOverNative": 1.5038618171605111
     },
     {
       "ShapeName": "Instrumented_197x768x768_NA_NB_Single",
@@ -551,12 +551,12 @@
       "TransA": false,
       "TransB": false,
       "Dtype": "Single",
-      "BlasManagedMedianMs": 3.2705,
-      "BlasManagedP95Ms": 3.8209,
-      "NativeMedianMs": 0.7704,
-      "NativeP95Ms": 1.107,
+      "BlasManagedMedianMs": 3.5848,
+      "BlasManagedP95Ms": 4.5205,
+      "NativeMedianMs": 1.1467,
+      "NativeP95Ms": 1.6567,
       "NativeAvailable": true,
-      "RatioBmOverNative": 4.245197300103842
+      "RatioBmOverNative": 3.1261881922037147
     },
     {
       "ShapeName": "Instrumented_64x64x64_NA_NB_Single",
@@ -566,12 +566,12 @@
       "TransA": false,
       "TransB": false,
       "Dtype": "Single",
-      "BlasManagedMedianMs": 0.0856,
-      "BlasManagedP95Ms": 0.1169,
-      "NativeMedianMs": 0.009,
-      "NativeP95Ms": 0.0091,
+      "BlasManagedMedianMs": 0.1136,
+      "BlasManagedP95Ms": 0.1521,
+      "NativeMedianMs": 0.0104,
+      "NativeP95Ms": 0.0107,
       "NativeAvailable": true,
-      "RatioBmOverNative": 9.511111111111111
+      "RatioBmOverNative": 10.923076923076923
     },
     {
       "ShapeName": "Instrumented_64x64x64_NA_NB_Double",
@@ -581,12 +581,12 @@
       "TransA": false,
       "TransB": false,
       "Dtype": "Double",
-      "BlasManagedMedianMs": 0.1082,
-      "BlasManagedP95Ms": 0.1369,
-      "NativeMedianMs": 0.0134,
-      "NativeP95Ms": 0.0135,
+      "BlasManagedMedianMs": 0.1796,
+      "BlasManagedP95Ms": 0.3449,
+      "NativeMedianMs": 0.0167,
+      "NativeP95Ms": 0.0213,
       "NativeAvailable": true,
-      "RatioBmOverNative": 8.074626865671641
+      "RatioBmOverNative": 10.754491017964073
     },
     {
       "ShapeName": "Instrumented_197x768x768_NA_TB_Single",
@@ -596,12 +596,12 @@
       "TransA": false,
       "TransB": true,
       "Dtype": "Single",
-      "BlasManagedMedianMs": 4.0362,
-      "BlasManagedP95Ms": 4.4518,
-      "NativeMedianMs": 0.6629,
-      "NativeP95Ms": 0.8044,
+      "BlasManagedMedianMs": 4.1244,
+      "BlasManagedP95Ms": 4.4359,
+      "NativeMedianMs": 0.9421,
+      "NativeP95Ms": 2.0379,
       "NativeAvailable": true,
-      "RatioBmOverNative": 6.088701161562829
+      "RatioBmOverNative": 4.377879206029084
     },
     {
       "ShapeName": "Instrumented_768x768x197_TA_NB_Single",
@@ -611,12 +611,12 @@
       "TransA": true,
       "TransB": false,
       "Dtype": "Single",
-      "BlasManagedMedianMs": 2.2456,
-      "BlasManagedP95Ms": 3.0298,
-      "NativeMedianMs": 0.9439,
-      "NativeP95Ms": 1.5886,
+      "BlasManagedMedianMs": 2.5214,
+      "BlasManagedP95Ms": 2.6369,
+      "NativeMedianMs": 1.0782,
+      "NativeP95Ms": 1.6618,
       "NativeAvailable": true,
-      "RatioBmOverNative": 2.3790655789808244
+      "RatioBmOverNative": 2.3385271749211647
     },
     {
       "ShapeName": "Instrumented_32x32x32_NA_NB_Double",
@@ -626,12 +626,12 @@
       "TransA": false,
       "TransB": false,
       "Dtype": "Double",
-      "BlasManagedMedianMs": 0.0132,
-      "BlasManagedP95Ms": 0.014,
-      "NativeMedianMs": 0.0027,
-      "NativeP95Ms": 0.0028,
+      "BlasManagedMedianMs": 0.0139,
+      "BlasManagedP95Ms": 0.0156,
+      "NativeMedianMs": 0.0036,
+      "NativeP95Ms": 0.0037,
       "NativeAvailable": true,
-      "RatioBmOverNative": 4.888888888888888
+      "RatioBmOverNative": 3.861111111111111
     },
     {
       "ShapeName": "Instrumented_32x32x32_NA_NB_Single",
@@ -641,12 +641,12 @@
       "TransA": false,
       "TransB": false,
       "Dtype": "Single",
-      "BlasManagedMedianMs": 0.0014,
-      "BlasManagedP95Ms": 0.0015,
-      "NativeMedianMs": 0.002,
-      "NativeP95Ms": 0.002,
+      "BlasManagedMedianMs": 0.0019,
+      "BlasManagedP95Ms": 0.0019,
+      "NativeMedianMs": 0.0026,
+      "NativeP95Ms": 0.0026,
       "NativeAvailable": true,
-      "RatioBmOverNative": 0.7
+      "RatioBmOverNative": 0.7307692307692308
     },
     {
       "ShapeName": "Instrumented_256x256x128_TA_NB_Double",
@@ -656,12 +656,12 @@
       "TransA": true,
       "TransB": false,
       "Dtype": "Double",
-      "BlasManagedMedianMs": 0.6187,
-      "BlasManagedP95Ms": 0.9913,
-      "NativeMedianMs": 0.2323,
-      "NativeP95Ms": 0.4163,
+      "BlasManagedMedianMs": 0.6513,
+      "BlasManagedP95Ms": 0.8548,
+      "NativeMedianMs": 0.227,
+      "NativeP95Ms": 0.4662,
       "NativeAvailable": true,
-      "RatioBmOverNative": 2.6633663366336635
+      "RatioBmOverNative": 2.8691629955947135
     },
     {
       "ShapeName": "Instrumented_256x256x256_NA_NB_Double",
@@ -671,12 +671,12 @@
       "TransA": false,
       "TransB": false,
       "Dtype": "Double",
-      "BlasManagedMedianMs": 1.0537,
-      "BlasManagedP95Ms": 1.4797,
-      "NativeMedianMs": 0.3214,
-      "NativeP95Ms": 0.4642,
+      "BlasManagedMedianMs": 1.23,
+      "BlasManagedP95Ms": 1.8543,
+      "NativeMedianMs": 0.3624,
+      "NativeP95Ms": 1.2326,
       "NativeAvailable": true,
-      "RatioBmOverNative": 3.278469197261979
+      "RatioBmOverNative": 3.3940397350993377
     },
     {
       "ShapeName": "Instrumented_4096x16x512_TA_NB_Double",
@@ -686,12 +686,12 @@
       "TransA": true,
       "TransB": false,
       "Dtype": "Double",
-      "BlasManagedMedianMs": 3.9606,
-      "BlasManagedP95Ms": 4.8912,
-      "NativeMedianMs": 2.5691,
-      "NativeP95Ms": 5.0782,
+      "BlasManagedMedianMs": 4.2043,
+      "BlasManagedP95Ms": 4.8376,
+      "NativeMedianMs": 2.8994,
+      "NativeP95Ms": 4.3033,
       "NativeAvailable": true,
-      "RatioBmOverNative": 1.541629364368845
+      "RatioBmOverNative": 1.4500586328205836
     },
     {
       "ShapeName": "Instrumented_64x64x4096_NA_NB_Double",
@@ -701,12 +701,12 @@
       "TransA": false,
       "TransB": false,
       "Dtype": "Double",
-      "BlasManagedMedianMs": 2.0492,
-      "BlasManagedP95Ms": 2.6443,
-      "NativeMedianMs": 1.2455,
-      "NativeP95Ms": 2.8135,
+      "BlasManagedMedianMs": 2.2363,
+      "BlasManagedP95Ms": 2.5937,
+      "NativeMedianMs": 1.9558,
+      "NativeP95Ms": 3.9255,
       "NativeAvailable": true,
-      "RatioBmOverNative": 1.6452830188679244
+      "RatioBmOverNative": 1.1434195725534309
     },
     {
       "ShapeName": "Instrumented_2048x32x256_NA_NB_Double",
@@ -716,12 +716,12 @@
       "TransA": false,
       "TransB": false,
       "Dtype": "Double",
-      "BlasManagedMedianMs": 0.9149,
-      "BlasManagedP95Ms": 1.1732,
-      "NativeMedianMs": 0.566,
-      "NativeP95Ms": 1.0863,
+      "BlasManagedMedianMs": 1.0723,
+      "BlasManagedP95Ms": 1.5766,
+      "NativeMedianMs": 0.7177,
+      "NativeP95Ms": 1.2666,
       "NativeAvailable": true,
-      "RatioBmOverNative": 1.6164310954063608
+      "RatioBmOverNative": 1.4940783056987599
     },
     {
       "ShapeName": "Instrumented_32x2048x256_NA_NB_Double",
@@ -731,12 +731,12 @@
       "TransA": false,
       "TransB": false,
       "Dtype": "Double",
-      "BlasManagedMedianMs": 1.2718,
-      "BlasManagedP95Ms": 1.8257,
-      "NativeMedianMs": 0.4664,
-      "NativeP95Ms": 0.7945,
+      "BlasManagedMedianMs": 1.4499,
+      "BlasManagedP95Ms": 1.9719,
+      "NativeMedianMs": 0.5361,
+      "NativeP95Ms": 1.218,
       "NativeAvailable": true,
-      "RatioBmOverNative": 2.726843910806175
+      "RatioBmOverNative": 2.7045327364297704
     },
     {
       "ShapeName": "Instrumented_512x512x64_NA_NB_Double",
@@ -746,12 +746,12 @@
       "TransA": false,
       "TransB": false,
       "Dtype": "Double",
-      "BlasManagedMedianMs": 4.1876,
-      "BlasManagedP95Ms": 9.3447,
-      "NativeMedianMs": 0.4063,
-      "NativeP95Ms": 0.6068,
+      "BlasManagedMedianMs": 0.9184,
+      "BlasManagedP95Ms": 1.1926,
+      "NativeMedianMs": 0.5002,
+      "NativeP95Ms": 0.7037,
       "NativeAvailable": true,
-      "RatioBmOverNative": 10.306669948314052
+      "RatioBmOverNative": 1.8360655737704918
     },
     {
       "ShapeName": "Instrumented_128x768x768_NA_NB_Double",
@@ -761,12 +761,12 @@
       "TransA": false,
       "TransB": false,
       "Dtype": "Double",
-      "BlasManagedMedianMs": 6.2751,
-      "BlasManagedP95Ms": 7.4208,
-      "NativeMedianMs": 1.1711,
-      "NativeP95Ms": 2.2461,
+      "BlasManagedMedianMs": 5.8675,
+      "BlasManagedP95Ms": 8.1843,
+      "NativeMedianMs": 1.1123,
+      "NativeP95Ms": 1.8144,
       "NativeAvailable": true,
-      "RatioBmOverNative": 5.358295619503031
+      "RatioBmOverNative": 5.275105636968443
     },
     {
       "ShapeName": "Instrumented_16x4096x512_NA_TB_Double",
@@ -776,12 +776,12 @@
       "TransA": false,
       "TransB": true,
       "Dtype": "Double",
-      "BlasManagedMedianMs": 4.0317,
-      "BlasManagedP95Ms": 4.6404,
-      "NativeMedianMs": 2.2908,
-      "NativeP95Ms": 3.6743,
+      "BlasManagedMedianMs": 4.1844,
+      "BlasManagedP95Ms": 5.2918,
+      "NativeMedianMs": 2.6792,
+      "NativeP95Ms": 3.8583,
       "NativeAvailable": true,
-      "RatioBmOverNative": 1.7599528548978522
+      "RatioBmOverNative": 1.561809495371753
     },
     {
       "ShapeName": "Instrumented_8x2x4_NA_NB_Single",
@@ -792,7 +792,7 @@
       "TransB": false,
       "Dtype": "Single",
       "BlasManagedMedianMs": 0.0002,
-      "BlasManagedP95Ms": 0.0003,
+      "BlasManagedP95Ms": 0.0002,
       "NativeMedianMs": 0.0002,
       "NativeP95Ms": 0.0003,
       "NativeAvailable": true,
@@ -808,10 +808,10 @@
       "Dtype": "Single",
       "BlasManagedMedianMs": 0.0003,
       "BlasManagedP95Ms": 0.0004,
-      "NativeMedianMs": 0.0003,
+      "NativeMedianMs": 0.0002,
       "NativeP95Ms": 0.0003,
       "NativeAvailable": true,
-      "RatioBmOverNative": 1
+      "RatioBmOverNative": 1.4999999999999998
     }
   ]
 }

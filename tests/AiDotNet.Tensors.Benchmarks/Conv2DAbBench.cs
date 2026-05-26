@@ -452,13 +452,19 @@ internal static class Conv2DAbBench
         //   - 128×128×128: square cube above the proposed cutoff
         var shapesToProbe = new (int M, int N, int K, string note, bool fp32)[]
         {
-            (64,  64,  64,  "64³ FP64 — was the worst-loss shape (16.1× behind OpenBLAS)", false),
-            (96,  128, 64,  "BERT_Attn_score FP64 — close-by, same K", false),
-            (96,  64,  128, "BERT_Attn_ctx FP64 — K=128 boundary", false),
-            (128, 128, 128, "128³ FP64 — above proposed Streaming cutoff", false),
-            // FP32 probes — 64³ FP32 is now the worst after the FP64 fix.
-            (64,  64,  64,  "64³ FP32 — new worst-loss shape (11.3× behind OpenBLAS)", true),
-            (3136, 32, 32,  "MobileNetV2 PW FP32 — thin-N 9.7× regression", true),
+            // FP64 cubes (verify prior fix sticks)
+            (64,   64,   64,  "64³ FP64 — was worst-loss (16.1× behind OpenBLAS)",       false),
+            (96,   128,  64,  "BERT_Attn_score FP64 — sanity (PackAOnly still wins)",     false),
+            (128,  128,  128, "128³ FP64 — above Streaming cutoff",                       false),
+
+            // Remaining Sub-G worst-loss shapes from refreshed baseline:
+            (3136, 64,   64,  "ResNet50_layer1 FP32 — thin-N 9.1× regression",            true),
+            (3136, 32,   32,  "MobileNetV2_pw FP32 — thin-N 9.7× regression",             true),
+            (512,  512,  64,  "Instrumented 512x512x64 FP64 — thin-K 6.8× regression",    false),
+            (1024, 3072, 768, "BERT_FFN_up FP32 — compute-bound 10.7× regression (big)",  true),
+
+            // FP32 sanity probes
+            (64,   64,   64,  "64³ FP32 — verify FP32 fix sticks",                        true),
         };
 
         foreach (var (M_, N_, K_, note, fp32) in shapesToProbe)
