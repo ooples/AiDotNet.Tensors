@@ -1,0 +1,20 @@
+<Project>
+
+  <!--
+    NuGet auto-imports build/<PackageId>.targets (this file) into every project
+    that consumes the AiDotNet.Tensors package. It forwards to the enterprise
+    gate, which keys ONLY on the AiDotNet-prefixed AIDOTNET_DISABLE_TELEMETRY /
+    AIDOTNET_DISABLE_LICENSE_GUARD constants. A consumer who compiles with a
+    generic DISABLE_TELEMETRY for their own unrelated code is therefore NOT
+    affected — the gate stays inert for them (no false build failure, and there
+    is nothing to bypass since the package assembly is already compiled). The
+    gate only fires for a build that explicitly requests the AiDotNet-prefixed
+    flags. Builds from this repo's source import Enterprise.targets directly
+    (see src/AiDotNet.Tensors/AiDotNet.Tensors.csproj), so this shim is the
+    packaged-consumer entry point; the Exists guard keeps it inert if the gate
+    file is somehow absent from the package.
+  -->
+  <Import Project="$(MSBuildThisFileDirectory)AiDotNet.Tensors.Enterprise.targets"
+          Condition="Exists('$(MSBuildThisFileDirectory)AiDotNet.Tensors.Enterprise.targets')" />
+
+</Project>

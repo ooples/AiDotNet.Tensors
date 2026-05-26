@@ -1,0 +1,59 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!--
+      MSBuild loads task assemblies into its own AppDomain — netstandard2.0 is
+      the safest TFM target because it works under both Full Framework MSBuild
+      (Visual Studio, msbuild.exe) and .NET MSBuild (dotnet build) without
+      additional runtime juggling.
+    -->
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <AssemblyName>AiDotNet.Tensors.LicenseValidator</AssemblyName>
+    <RootNamespace>AiDotNet.Tensors.LicenseValidator</RootNamespace>
+    <IsPackable>false</IsPackable>
+
+    <!--
+      Drop the compiled DLL right next to the targets file so the relative-
+      path <UsingTask> reference in AiDotNet.Tensors.Enterprise.targets
+      resolves cleanly during both source builds and consumer builds where
+      the package ships a pre-built copy.
+    -->
+    <OutputPath>$(MSBuildThisFileDirectory)bin\</OutputPath>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <AppendRuntimeIdentifierToOutputPath>false</AppendRuntimeIdentifierToOutputPath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!--
+      ExcludeAssets=Runtime — the task assembly only needs the compile-time
+      reference; MSBuild loads its own copy at task-execution time so we
+      must not bundle the build SDK assemblies into our output directory.
+    -->
+    <PackageReference Include="Microsoft.Build.Framework" Version="17.0.0" ExcludeAssets="Runtime" PrivateAssets="All" />
+    <PackageReference Include="Microsoft.Build.Utilities.Core" Version="17.0.0" ExcludeAssets="Runtime" PrivateAssets="All" />
+
+    <!--
+      System.Text.Json isn't part of netstandard2.0 — pulled in as a small
+      transitive (no native deps). BouncyCastle handles the RSA PKCS#1
+      key import that netstandard2.0's System.Security.Cryptography.RSA
+      can't do directly (RSA.ImportRSAPublicKey is netstandard2.1+).
+      PrivateAssets="All" so consumers of the precompiled DLL don't pull
+      them transitively.
+    -->
+    <PackageReference Include="System.Text.Json" Version="8.0.5" PrivateAssets="All" />
+    <PackageReference Include="BouncyCastle.Cryptography" Version="2.4.0" PrivateAssets="All" />
+  </ItemGroup>
+
+  <!--
+    BouncyCastle + System.Text.Json bring transitive package dependencies
+    that MSBuild can't probe for at task-load time, so we copy the runtime
+    closure of the validator into its output directory alongside the main
+    DLL. CopyLocal=true on every transitive dep accomplishes that.
+  -->
+  <PropertyGroup>
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+  </PropertyGroup>
+
+</Project>
