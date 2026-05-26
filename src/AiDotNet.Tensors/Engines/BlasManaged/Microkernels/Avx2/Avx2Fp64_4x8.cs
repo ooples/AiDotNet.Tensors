@@ -38,18 +38,25 @@ namespace AiDotNet.Tensors.Engines.BlasManaged;
 /// </para>
 ///
 /// <para>
-/// <b>S.3 JIT-disasm finding (DOTNET_JitDisasm).</b> The emitted hot loop issues
-/// each iteration's B-loads + A-broadcasts <i>directly</i> into that iteration's
-/// FMAs — classic load-to-use stall (measured ~0.6 FMA/cyc, well under the
-/// 8-chain limit of ~1.6). Three YMM regs sit idle, suggesting room to
-/// double-buffer. HOWEVER, hand-writing a software-pipelined variant (preload
-/// next-iter B into spare regs) REGRESSED it to ~15 GFLOPS: the disasm showed
-/// RyuJIT then emits <b>18 stack spills</b> — it won't sustain 8 accumulators +
-/// double-buffered operands within the 16-YMM file (it needs scratch regs the
-/// budget doesn't have). So the bottleneck is bounded by <b>RyuJIT register
-/// allocation</b>, not the kernel source: source-level pipelining backfires.
-/// Closing it needs an allocator-friendly kernel shape (fewer live operands) or
-/// JIT-level work — this naive no-spill form is the best source-level version.
+/// <b>S.3 fix (prefetch removal) — landed.</b> JIT-disasm showed the hot loop ran
+/// <b>3 prefetcht0 + 2 B-loads + 4 A-broadcasts = 9 load-port ops per iter</b>
+/// feeding 8 FMAs. On Zen2 (2 loads/cyc) that's 4.5 cyc of load-port work vs 4
+/// cyc of FMA, so the cache-resident K-block was <b>load-port bound</b> and the
+/// prefetches (data already in L1 at the autotuned Kc) were pure overhead. The
+/// loop above no longer prefetches: this lifted the kernel <b>~19 → ~32 GFLOPS
+/// (44% → 72% of the managed FMA ceiling)</b>, and a large kernel-dominated GEMM
+/// (Square_2048 FP64) reached <b>~1.1× OpenBLAS end-to-end</b> with no regression
+/// on the large-Kc stress shape.
+/// </para>
+/// <para>
+/// <b>Remaining gap (open).</b> The residual ~28% to the managed ceiling is
+/// load-to-use latency (loads feed FMAs in the same iter). Software-pipelining
+/// (preload next-iter B) would hide it but REGRESSED to ~15 GFLOPS — disasm
+/// showed RyuJIT emits <b>18 stack spills</b>, refusing to sustain 8 accumulators
+/// + double-buffered operands in 16 YMM. So that last step is bounded by RyuJIT
+/// register allocation and needs an allocator-friendly shape or JIT-level work.
+/// (<see cref="RunStridedB"/> keeps its prefetch — its B is the caller's strided,
+/// non-packed matrix, which may not be L1-resident; evaluate separately.)
 /// </para>
 /// </summary>
 internal static class Avx2Fp64_4x8
@@ -113,13 +120,12 @@ internal static class Avx2Fp64_4x8
             {
                 for (int k = 0; k < kc; k++)
                 {
-                    // Sub-O (#405): prefetch A + B PrefetchDistance iters ahead.
-                    if (k + PrefetchDistance < kc)
-                    {
-                        Sse.Prefetch0(aPtr + (k + PrefetchDistance) * Mr);
-                        Sse.Prefetch0(bPtr + (k + PrefetchDistance) * Nr);
-                        Sse.Prefetch0(bPtr + (k + PrefetchDistance) * Nr + 4);
-                    }
+                    // Sub-S (#409) S.3 experiment: prefetch removed. The JIT disasm
+                    // showed 3 prefetcht0 + 2 B-loads + 4 A-broadcasts = 9 load-port
+                    // ops per iter feeding only 8 FMAs — on Zen2 (2 loads/cyc) that's
+                    // 4.5 cyc of load-port work vs 4 cyc of FMA, so the cache-resident
+                    // K-block is load-port bound and the prefetches (data already in
+                    // L1 at the autotuned Kc) are pure overhead stealing AGU slots.
 
                     // Load B row: 8 doubles = 2 Vector256 halves.
                     Vector256<double> bRow_lo = Avx.LoadVector256(bPtr + k * Nr + 0);

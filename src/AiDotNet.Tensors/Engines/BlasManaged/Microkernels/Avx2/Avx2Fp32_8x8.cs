@@ -28,21 +28,22 @@ namespace AiDotNet.Tensors.Engines.BlasManaged;
 ///
 /// <para>
 /// <b>Audit (Sub-S #409, Phase S.2 — measured via <c>--microkernel-gflops</c>).</b>
-/// Structure: K-loop unrolled by 2, software prefetch (Sub-O), C tile resident
-/// in 8 accumulators across the whole K-loop. Microbench on a Ryzen 9 3950X
-/// (AVX2, no AVX-512): <b>~38 GFLOPS, ~42% of the measured managed FMA ceiling
-/// (~90 GFLOPS at 8 chains)</b>. <b>Correction (was previously mis-reported as
-/// "~100% / at ceiling"):</b> that earlier reading came from a buggy calibration
-/// whose 12-chain peak loop SPILLED (the RyuJIT enregisters ~8 YMM accumulators
-/// before spilling), under-measuring the ceiling ~2×. The kernel is NOT at the
-/// ceiling — it has ~2.4× headroom, and OpenBLAS achieves ~62 GFLOPS (FP64) on
-/// this same chip, proving ~95% of hardware is reachable. So the gap is <i>kernel
-/// quality, not a managed-runtime wall</i> — exactly the BlasManaged-replaces-
-/// OpenBLAS goal. The bottleneck is load/broadcast latency not being hidden
-/// (FmaCeilingProbe: pure 8-chain FMA hits the ceiling, but adding the B-loads +
-/// A-broadcasts halves throughput); source-level reorder/unroll doesn't fix it
-/// (the JIT reschedules), so closing it needs JIT-disasm-driven work
-/// (<c>DOTNET_JitDisasm=*Avx2Fp32_8x8:Run</c>) — tracked as the open S.3 task.
+/// Structure: K-loop unrolled by 2, C tile resident in 8 accumulators across
+/// the whole K-loop. <b>Correction</b> to an earlier audit that called this "at
+/// ceiling": that used a buggy 12-chain calibration that SPILLED (RyuJIT
+/// enregisters ~8 YMM accumulators before spilling), under-measuring the managed
+/// FMA ceiling ~2×. The real ceiling here is ~90 GFLOPS FP32, and OpenBLAS hits
+/// ~62 GFLOPS FP64 on this chip — so the gap is <i>kernel quality, not a runtime
+/// wall</i>, exactly the BlasManaged-replaces-OpenBLAS goal.
+/// </para>
+/// <para>
+/// <b>S.3 fix (prefetch removal) — landed.</b> JIT-disasm showed the unrolled
+/// loop ran prefetcht0 ops that, for a cache-resident K-block (data already in
+/// L1 at the autotuned Kc), only stole AGU/load-port slots while the kernel was
+/// load-port bound. Removing them lifted it <b>~38 → ~54 GFLOPS (42% → 60% of the
+/// managed ceiling)</b>. The residual gap is load-to-use latency; hiding it via
+/// software-pipelining spills on RyuJIT (see the <see cref="Avx2Fp64_4x8"/>
+/// note) — bounded by register allocation, open.
 /// </para>
 /// </summary>
 internal static class Avx2Fp32_8x8
@@ -111,12 +112,11 @@ internal static class Avx2Fp32_8x8
                 int k = 0;
                 for (; k < kc2; k += 2)
                 {
-                    // Sub-O: prefetch 2 iterations ahead of the unroll-by-2 step.
-                    if (k + PrefetchDistance < kc)
-                    {
-                        Sse.Prefetch0(aPtr + (k + PrefetchDistance) * Mr);
-                        Sse.Prefetch0(bPtr + (k + PrefetchDistance) * Nr);
-                    }
+                    // Sub-S (#409) S.3: prefetch removed — see Avx2Fp64_4x8 note.
+                    // For a cache-resident K-block the prefetcht0 ops only steal
+                    // AGU/load-port slots (the data is already in L1 at the
+                    // autotuned Kc), and the kernel is load-port bound. Removing
+                    // them lifted the FP64 sibling ~39% (19→26 GFLOPS).
 
                     // Stage 1: load both B rows back-to-back so the second
                     // load can stream while stage-1 FMAs are issued.
