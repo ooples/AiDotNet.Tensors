@@ -17,16 +17,22 @@ internal sealed class X64Assembler
     private readonly List<byte> _code = new(256);
     private readonly Dictionary<int, int> _labelPos = new();      // label id -> byte offset
     private readonly List<(int pos, int label)> _rel8Fixups = new();
+    private readonly List<(int pos, int label)> _rel32Fixups = new();
 
     internal byte[] ToArray()
     {
         foreach (var (pos, label) in _rel8Fixups)
         {
-            int target = _labelPos[label];
-            int rel = target - (pos + 1); // rel8 is relative to the byte AFTER the displacement
+            int rel = _labelPos[label] - (pos + 1); // rel8: relative to byte AFTER the displacement
             if (rel < sbyte.MinValue || rel > sbyte.MaxValue)
                 throw new InvalidOperationException("rel8 jump out of range");
             _code[pos] = (byte)(sbyte)rel;
+        }
+        foreach (var (pos, label) in _rel32Fixups)
+        {
+            int rel = _labelPos[label] - (pos + 4); // rel32: relative to byte AFTER the 4-byte displacement
+            _code[pos] = (byte)rel; _code[pos + 1] = (byte)(rel >> 8);
+            _code[pos + 2] = (byte)(rel >> 16); _code[pos + 3] = (byte)(rel >> 24);
         }
         return _code.ToArray();
     }
@@ -35,7 +41,8 @@ internal sealed class X64Assembler
     private void Imm32(int v) { _code.Add((byte)v); _code.Add((byte)(v >> 8)); _code.Add((byte)(v >> 16)); _code.Add((byte)(v >> 24)); }
 
     // ── Labels / branches ────────────────────────────────────────────────────
-    internal int NewLabel() => _labelPos.Count + _rel8Fixups.Count + 100000; // unique id
+    private int _nextLabel;
+    internal int NewLabel() => _nextLabel++; // genuinely unique, monotonic
     internal void MarkLabel(int label) => _labelPos[label] = _code.Count;
 
     /// <summary>dec rcx (REX.W FF /1).</summary>
@@ -71,6 +78,55 @@ internal sealed class X64Assembler
         B(rex, 0x85, (byte)(0xC0 | ((reg & 7) << 3) | (reg & 7)));
     }
 
+    /// <summary>cmp reg64, imm8 (sign-extended). REX.W[.B] 83 /7 ib.</summary>
+    internal void CmpRegImm8(int reg, sbyte imm)
+    {
+        byte rex = (byte)(0x48 | (reg >= 8 ? 1 : 0));
+        B(rex, 0x83, (byte)(0xF8 | (reg & 7)), (byte)imm);
+    }
+
+    /// <summary>sub reg64, imm8 (sign-extended). REX.W[.B] 83 /5 ib.</summary>
+    internal void SubRegImm8(int reg, sbyte imm)
+    {
+        byte rex = (byte)(0x48 | (reg >= 8 ? 1 : 0));
+        B(rex, 0x83, (byte)(0xE8 | (reg & 7)), (byte)imm);
+    }
+
+    /// <summary>jmp rel32 to a label (any distance). E9 cd.</summary>
+    internal void JmpLabel32(int label)
+    {
+        B(0xE9);
+        _rel32Fixups.Add((_code.Count, label));
+        B(0, 0, 0, 0);
+    }
+
+    /// <summary>jl rel32 to a label (signed less-than). 0F 8C cd.</summary>
+    internal void JlLabel32(int label)
+    {
+        B(0x0F, 0x8C);
+        _rel32Fixups.Add((_code.Count, label));
+        B(0, 0, 0, 0);
+    }
+
+    // VEX memory form with disp32 (mod=10): [base + disp32].
+    private void VexMemDisp32(int map, int pp, int w, int L, byte opcode, int reg, int baseReg, int disp32)
+    {
+        int rBit = (reg < 8) ? 1 : 0;
+        int bBit = (baseReg < 8) ? 1 : 0;
+        byte b1 = (byte)((rBit << 7) | (1 << 6) | (bBit << 5) | map);
+        byte b2 = (byte)((w << 7) | (0xF << 3) | (L << 2) | pp);
+        byte modrm = (byte)(0x80 | ((reg & 7) << 3) | (baseReg & 7)); // mod=10
+        B(0xC4, b1, b2, opcode, modrm);
+        if ((baseReg & 7) == 4) _code.Add(0x24); // SIB for rsp/r12
+        Imm32(disp32);
+    }
+
+    /// <summary>vmovupd ymm_dst, [base+disp32] (load).</summary>
+    internal void VmovupdLoadD32(int dst, int baseReg, int disp32) => VexMemDisp32(Map0F, Pp66, 0, 1, 0x10, dst, baseReg, disp32);
+
+    /// <summary>vbroadcastsd ymm_dst, [base+disp32].</summary>
+    internal void VbroadcastSdD32(int dst, int baseReg, int disp32) => VexMemDisp32(Map0F38, Pp66, 0, 1, 0x19, dst, baseReg, disp32);
+
     internal void Ret() => B(0xC3);
     internal void Vzeroupper() => B(0xC5, 0xF8, 0x77);
 
@@ -79,6 +135,14 @@ internal sealed class X64Assembler
     {
         byte rex = (byte)(0x48 | (reg >= 8 ? 1 : 0));
         B(rex, 0x83, (byte)(0xC0 | (reg & 7)), (byte)imm);
+    }
+
+    /// <summary>add reg64, imm32. REX.W[.B] 81 /0 id.</summary>
+    internal void AddRegImm32(int reg, int imm)
+    {
+        byte rex = (byte)(0x48 | (reg >= 8 ? 1 : 0));
+        B(rex, 0x81, (byte)(0xC0 | (reg & 7)));
+        Imm32(imm);
     }
 
     /// <summary>add dst64, src64 (dst += src). REX.W[.R.B] 01 /r.</summary>

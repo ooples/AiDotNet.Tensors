@@ -139,6 +139,49 @@ public class MachineCodeKernelTests
                 $"6x8 machine kernel mismatch at {i}: kernel={cKernel[i]:G17}, ref={cRef[i]:G17} (kc={kc}, ldc={ldc})");
     }
 
+    [Theory]
+    [InlineData(1, 8)]
+    [InlineData(7, 8)]
+    [InlineData(64, 8)]
+    [InlineData(256, 8)]
+    [InlineData(37, 11)]
+    [InlineData(6, 9)]     // kc divisible by U=4? no (6%4=2) — exercises remainder
+    public unsafe void Fp64_6x8_U4_MatchesFmaReference(int kc, int ldc)
+    {
+        if (!IsX64Windows || !Avx2.IsSupported || !Fma.IsSupported) return;
+
+        const int Mr = 6, Nr = 8;
+        byte[] code = MachineCodeFmaKernel.EmitFp64_6x8_PackedWindowsU4();
+        using var mem = ExecutableMemory.TryAllocate(code);
+        if (mem is null) return;
+        var fn = (delegate* unmanaged<double*, double*, double*, long, long, void>)mem.Pointer;
+
+        var rng = new Random(7 + kc * 13 + ldc);
+        var packedA = new double[kc * Mr];
+        var packedB = new double[kc * Nr];
+        for (int i = 0; i < packedA.Length; i++) packedA[i] = rng.NextDouble() * 2 - 1;
+        for (int i = 0; i < packedB.Length; i++) packedB[i] = rng.NextDouble() * 2 - 1;
+        int cLen = (Mr - 1) * ldc + Nr;
+        var c0 = new double[cLen];
+        for (int i = 0; i < cLen; i++) c0[i] = rng.NextDouble() * 2 - 1;
+        var cKernel = (double[])c0.Clone();
+        var cRef = (double[])c0.Clone();
+
+        fixed (double* pa = packedA, pb = packedB, pc = cKernel) fn(pa, pb, pc, ldc, kc);
+
+        for (int r = 0; r < Mr; r++)
+            for (int col = 0; col < Nr; col++)
+            {
+                double acc = cRef[r * ldc + col];
+                for (int k = 0; k < kc; k++)
+                    acc = Math.FusedMultiplyAdd(packedA[k * Mr + r], packedB[k * Nr + col], acc);
+                cRef[r * ldc + col] = acc;
+            }
+        for (int i = 0; i < cLen; i++)
+            Assert.True(BitConverter.DoubleToInt64Bits(cKernel[i]) == BitConverter.DoubleToInt64Bits(cRef[i]),
+                $"6x8-U4 mismatch at {i}: kernel={cKernel[i]:G17}, ref={cRef[i]:G17} (kc={kc}, ldc={ldc})");
+    }
+
     [Fact]
     public unsafe void Fp64_6x8_MachineCode_Perf()
     {
@@ -146,11 +189,6 @@ public class MachineCodeKernelTests
         if (!IsX64Windows || !Avx2.IsSupported || !Fma.IsSupported) return;
 
         const int Mr = 6, Nr = 8, kc = 256, ldc = 8;
-        byte[] code = MachineCodeFmaKernel.EmitFp64_6x8_PackedWindows();
-        using var mem = ExecutableMemory.TryAllocate(code);
-        if (mem is null) return;
-        var fn = (delegate* unmanaged<double*, double*, double*, long, long, void>)mem.Pointer;
-
         var rng = new Random(42);
         var packedA = new double[kc * Mr];
         var packedB = new double[kc * Nr];
@@ -158,16 +196,33 @@ public class MachineCodeKernelTests
         for (int i = 0; i < packedB.Length; i++) packedB[i] = rng.NextDouble() * 2 - 1;
         var c = new double[Mr * ldc];
 
+        Measure("6x8 base ", MachineCodeFmaKernel.EmitFp64_6x8_PackedWindows(), packedA, packedB, c, ldc, kc);
+        Measure("6x8 unroll4", MachineCodeFmaKernel.EmitFp64_6x8_PackedWindowsU4(), packedA, packedB, c, ldc, kc);
+    }
+
+    private unsafe void Measure(string name, byte[] code, double[] packedA, double[] packedB, double[] c, int ldc, int kc)
+    {
+        const int Mr = 6, Nr = 8;
+        using var mem = ExecutableMemory.TryAllocate(code);
+        if (mem is null) { _output.WriteLine($"{name}: no exec mem"); return; }
+        var fn = (delegate* unmanaged<double*, double*, double*, long, long, void>)mem.Pointer;
         fixed (double* pa = packedA, pb = packedB, pc = c)
         {
-            for (int i = 0; i < 5000; i++) fn(pa, pb, pc, ldc, kc);
+            for (int i = 0; i < 20000; i++) fn(pa, pb, pc, ldc, kc); // warm
             const int iters = 2_000_000;
-            var sw = Stopwatch.StartNew();
-            for (int i = 0; i < iters; i++) fn(pa, pb, pc, ldc, kc);
-            sw.Stop();
-            double gflops = 2.0 * Mr * Nr * kc * iters / sw.Elapsed.TotalSeconds / 1e9;
-            _output.WriteLine($"machine-code 6x8 GEMM microkernel: {gflops:F1} GFLOPS " +
-                "(hand-written Avx2Fp64_4x8 ~38; OpenBLAS dgemm ~60)");
+            // Min over windows: noise/contention only ADDS time, so the minimum
+            // window is the most representative peak throughput (this box is noisy).
+            double best = double.MaxValue;
+            for (int w = 0; w < 7; w++)
+            {
+                var sw = Stopwatch.StartNew();
+                for (int i = 0; i < iters; i++) fn(pa, pb, pc, ldc, kc);
+                sw.Stop();
+                best = Math.Min(best, sw.Elapsed.TotalSeconds);
+            }
+            double gflops = 2.0 * Mr * Nr * kc * iters / best / 1e9;
+            _output.WriteLine($"machine-code {name}: {gflops:F1} GFLOPS (best-of-7) " +
+                "(hand-written ~38; managed FMA ceiling 44; OpenBLAS ~60; HW ~64)");
         }
     }
 }
