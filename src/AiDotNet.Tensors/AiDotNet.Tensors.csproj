@@ -60,14 +60,29 @@
       <Pack>True</Pack>
       <PackagePath>\</PackagePath>
     </None>
+
     <!--
-      The enterprise gate targets + validator assembly closure are packed
-      DYNAMICALLY by the PackLicenseValidatorAssets target in
-      build/AiDotNet.Tensors.Enterprise.targets. They can't be static <None>
-      items here: the validator DLL doesn't exist until it's built, and its
-      System.Text.Json/BouncyCastle runtime closure can't be enumerated by hand.
-      That target builds the validator first, then globs its whole bin/ output.
+      The two enterprise .targets files are STATIC (they always exist in the
+      repo) and are packed here as static <None> items so the NuGet-convention
+      file 'build/AiDotNet.Tensors.targets' is ALWAYS present in the package's
+      build/ folder. This must be static, not added by the dynamic
+      PackLicenseValidatorAssets target: under GeneratePackageOnBuild the pack
+      file-collection / NU5129 validation can run before a
+      BeforeTargets="_GetPackageFiles" hook populates its ItemGroup, which left
+      the conventional shim out of the package and broke the release pipeline
+      with `error NU5129: ... 'build/AiDotNet.Tensors.targets' was not [found]`.
+      Static items are evaluated at project load, so they're immune to that
+      ordering. Only the validator DLL closure (which doesn't exist until built)
+      stays dynamic in PackLicenseValidatorAssets.
     -->
+    <None Include="..\..\build\AiDotNet.Tensors.targets">
+      <Pack>true</Pack>
+      <PackagePath>build\</PackagePath>
+    </None>
+    <None Include="..\..\build\AiDotNet.Tensors.Enterprise.targets">
+      <Pack>true</Pack>
+      <PackagePath>build\</PackagePath>
+    </None>
   </ItemGroup>
 
   <ItemGroup>
