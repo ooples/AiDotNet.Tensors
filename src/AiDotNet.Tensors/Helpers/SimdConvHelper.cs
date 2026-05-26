@@ -161,7 +161,13 @@ internal static class SimdConvHelper
         int outWidth = (width + 2 * padW - 3) / 2 + 1;
         int outputSize = outHeight * outWidth;
         int spatial = height * width;
-        bool useParallel = outputSize >= ParallelThreshold && Environment.ProcessorCount > 1;
+        // #415 Phase F: gate on TOTAL FMA work, not just spatial. Same fix as
+        // Conv3x3Stride1Double — see that method for the perf rationale and
+        // empirical FP64 crossover (~900M FMAs).
+        long totalFmas = (long)outChannels * inChannels * outputSize * 9L;
+        bool useParallel = totalFmas >= 900_000_000L
+                          && outChannels >= 2
+                          && Environment.ProcessorCount > 1;
 
         for (int b = 0; b < batch; b++)
         {
@@ -271,7 +277,16 @@ internal static class SimdConvHelper
         int outWidth = (width + 2 * padW - 7) / 2 + 1;
         int outputSize = outHeight * outWidth;
         int spatial = height * width;
-        bool useParallel = outputSize >= ParallelThreshold && Environment.ProcessorCount > 1;
+        // #415 Phase F: gate on TOTAL FMA work (49 = 7×7 taps). Same fix
+        // as Conv3x3Stride1Double — see that method for the perf rationale.
+        // 7×7 ops use a lower threshold (100M FMAs) because per-task work
+        // scales with kernel-tap count, so even small spatial shapes have
+        // enough per-task compute for parallel to win (ResNet50 stem
+        // at outC=64, inC=3, spatial=12544 = 118M FMAs — solidly parallel).
+        long totalFmas = (long)outChannels * inChannels * outputSize * 49L;
+        bool useParallel = totalFmas >= 100_000_000L
+                          && outChannels >= 2
+                          && Environment.ProcessorCount > 1;
 
         for (int b = 0; b < batch; b++)
         {
@@ -371,7 +386,20 @@ internal static class SimdConvHelper
         int outWidth = width + 2 * padW - (dilationW * 2 + 1) + 1;
         int outputSize = outHeight * outWidth;
 
-        bool useParallel = outputSize >= ParallelThreshold && Environment.ProcessorCount > 1;
+        // #415 Phase F: gate on TOTAL FMA work, not just spatial. The original
+        // `outputSize >= 1024` gate forced serial dispatch on small-spatial ×
+        // high-channel shapes that have plenty of work to parallelise across
+        // outChannels — VGG b4 backward-input ran serial (684 ms) at
+        // outChannels=512, inChannels=512, outputSize=784 (under 1024
+        // spatial) despite 1.85 GFMAs of compute. Empirical FP64 crossover
+        // on the VGG/ResNet shape catalog: parallel is worth it above ~1G
+        // total FMAs (VGG b4 wins big at 1.85G; VGG b5 at 462M still loses
+        // to serial — per-task work too small to amortise dispatch overhead
+        // and the per-thread cache footprint thrashes L1).
+        long totalFmas = (long)outChannels * inChannels * outputSize * 9L;
+        bool useParallel = totalFmas >= 900_000_000L
+                          && outChannels >= 2
+                          && Environment.ProcessorCount > 1;
 
         for (int b = 0; b < batch; b++)
         {
