@@ -53,6 +53,14 @@ $embed = [Convert]::ToBase64String($pub.Modulus) + ':' + [Convert]::ToBase64Stri
 
 # Export the PRIVATE key as PKCS#8 PEM for transfer into your HSM/secret store.
 $privPath = Join-Path $OutDir "aidotnet-$Purpose-signing-PRIVATE.pem"
+# Refuse to clobber an existing private key — a silent overwrite on an
+# accidental rerun would destroy the only local copy of the active signing key
+# (and effectively rotate it while the matching public key is still embedded
+# and in production use). The operator must move the prior PEM into their
+# HSM/secret store and delete it from disk before regenerating.
+if (Test-Path -LiteralPath $privPath) {
+    throw "Refusing to overwrite existing private key at $privPath. Move/delete it first if you intend to regenerate."
+}
 $pkcs8 = $rsa.ExportPkcs8PrivateKey()
 $pem = "-----BEGIN PRIVATE KEY-----`n" +
        ([Convert]::ToBase64String($pkcs8, 'InsertLineBreaks')) +
