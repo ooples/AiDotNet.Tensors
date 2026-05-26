@@ -81,16 +81,21 @@ infra/tooling, not code:
    `InternalsVisibleTo` friend (incl. the test assemblies) must then also be
    strong-named / use public-key IVT, or the build breaks. Deferred because it's
    a cross-cutting change with real breakage risk and net471-only value.
-2. **Authenticode-sign the published DLLs/NuGet** *(release-eng, real)*. A
-   patched DLL fails OS signature verification; deployment policy can enforce
-   signed-only loading. This is the most practical real tamper-evidence. Belongs
-   in the release pipeline.
-3. **Sign the online validation response + client nonce** *(needs server change)*.
-   Closes the server-spoof trial-bypass. Requires the Supabase Edge Function to
-   sign `(nonce, status, tier, expiry, capabilities)` with a key whose public
-   half is embedded client-side. Client verification is straightforward to add
-   once the server signs; until then it would be inert, so it's deferred behind
-   the server work. **Note:** the offline entitlement already covers the
+2. **Sign the published NuGet packages** *(release-eng, real)* — **SCAFFOLDED.**
+   A patched/repacked `.nupkg` fails NuGet signature verification. The release
+   pipeline (`.github/workflows/automated-release.yml`) now signs every package
+   via `dotnet nuget sign` + timestamp; it's a **no-op until** the
+   `CODE_SIGNING_CERT_BASE64` / `CODE_SIGNING_CERT_PASSWORD` secrets are set, so
+   it never breaks a build. **To activate:** provision an Ooples code-signing
+   certificate and add those two secrets. (Authenticode-signing the individual
+   DLLs is a further step — `signtool`/`osslsigncode` — once a cert exists.)
+3. **Sign the online validation response + client nonce** *(client DONE, needs
+   server change to activate)*. The client (`LicenseResponseVerifier`,
+   `RequireSignedResponse`) is implemented and tested; it sends a per-request
+   nonce and verifies an RSA signature over `(nonce|status|tier|expires|caps)`.
+   It activates once (a) the Supabase Edge Function signs per
+   `license-server-response-signing.md` and (b) the customer enables
+   `RequireSignedResponse`. **Note:** the offline entitlement already covers the
    high-assurance case, so this only matters if trial-bypass is a concern.
 4. **NativeAOT the enforcement path** *(architecture initiative)*. Compiling
    enforcement to native code turns "minutes in dnSpy" into serious reverse

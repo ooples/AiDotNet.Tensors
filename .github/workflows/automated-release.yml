@@ -362,6 +362,45 @@ jobs:
           Write-Host "=== Packages created ==="
           Get-ChildItem out/
 
+      # Code-signs every .nupkg with the Ooples code-signing certificate so a
+      # tampered/repacked package fails NuGet signature verification (real
+      # tamper-evidence — see docs/enterprise/licensing-security-model.md). This
+      # is a NO-OP when the cert secrets are absent (forks, PRs, or before the
+      # cert is provisioned), so it never breaks a build. To activate, set the
+      # CODE_SIGNING_CERT_BASE64 (base64 of the .pfx) and CODE_SIGNING_CERT_PASSWORD
+      # repository secrets.
+      - name: Sign NuGet packages (if cert configured)
+        shell: pwsh
+        env:
+          CODE_SIGNING_CERT_BASE64: ${{ secrets.CODE_SIGNING_CERT_BASE64 }}
+          CODE_SIGNING_CERT_PASSWORD: ${{ secrets.CODE_SIGNING_CERT_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:CODE_SIGNING_CERT_BASE64)) {
+            Write-Host "No CODE_SIGNING_CERT_BASE64 secret configured - skipping signing (packages will be UNSIGNED)."
+            exit 0
+          }
+          $certPath = Join-Path ([System.IO.Path]::GetTempPath()) "aidotnet-codesign.pfx"
+          [System.IO.File]::WriteAllBytes($certPath, [System.Convert]::FromBase64String($env:CODE_SIGNING_CERT_BASE64))
+          try {
+            $pkgs = Get-ChildItem out/*.nupkg
+            foreach ($pkg in $pkgs) {
+              Write-Host "Signing $($pkg.Name)..."
+              dotnet nuget sign "$($pkg.FullName)" `
+                --certificate-path $certPath `
+                --certificate-password $env:CODE_SIGNING_CERT_PASSWORD `
+                --timestamper "http://timestamp.digicert.com"
+              if ($LASTEXITCODE -ne 0) { Write-Error "Signing failed for $($pkg.Name)"; exit $LASTEXITCODE }
+            }
+            Write-Host "All packages signed. Verifying..."
+            foreach ($pkg in $pkgs) {
+              dotnet nuget verify "$($pkg.FullName)" --all
+              if ($LASTEXITCODE -ne 0) { Write-Error "Verification failed for $($pkg.Name)"; exit $LASTEXITCODE }
+            }
+          }
+          finally {
+            Remove-Item $certPath -Force -ErrorAction SilentlyContinue
+          }
+
       - name: Upload package artifacts
         uses: actions/upload-artifact@v4
         with:
