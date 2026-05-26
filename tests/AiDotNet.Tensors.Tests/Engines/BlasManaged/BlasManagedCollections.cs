@@ -26,3 +26,19 @@ public sealed class BlasManagedStatsSerialCollection { }
 /// </summary>
 [CollectionDefinition("BlasManaged-Perf-Serial", DisableParallelization = true)]
 public sealed class BlasManagedPerfSerialCollection { }
+
+/// <summary>
+/// StreamingWorkerPool tests measure dispatch latency and assert each chunk
+/// runs exactly once — both are sensitive to concurrent CPU contention from
+/// other collections. Serialize against all other collections.
+/// </summary>
+[CollectionDefinition("BlasManaged-Pool-Serial", DisableParallelization = true)]
+public sealed class BlasManagedPoolSerialCollection { }
+
+/// <summary>
+/// AutotuneCacheV2 tests toggle the process-global <c>EnableAutotuneV2</c>
+/// flag. If another GEMM collection ran concurrently while the flag is on, its
+/// dispatch would change underneath it. Serialize against all other collections.
+/// </summary>
+[CollectionDefinition("BlasManaged-Autotune-Serial", DisableParallelization = true)]
+public sealed class BlasManagedAutotuneSerialCollection { }
