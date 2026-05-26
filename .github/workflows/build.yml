@@ -40,6 +40,12 @@ jobs:
     - name: Restore dependencies
       run: dotnet restore
 
+    - name: Probe CPU SIMD capability (AVX-512 verification feasibility, #409)
+      run: |
+        echo "CPU flags (AVX family):"
+        lscpu | grep -ioE "avx[0-9a-z_]*" | sort -u || true
+        if lscpu | grep -qiw avx512f; then echo "RUNNER_HAS_AVX512=yes"; else echo "RUNNER_HAS_AVX512=no"; fi
+
     - name: Build (net10.0)
       run: |
         dotnet build src/AiDotNet.Tensors/AiDotNet.Tensors.csproj --configuration Release --no-restore --framework net10.0 -p:TelemetryUrl="${{ secrets.AIDOTNET_TELEMETRY_URL }}" -p:TelemetryKey="${{ secrets.AIDOTNET_TELEMETRY_KEY }}"
