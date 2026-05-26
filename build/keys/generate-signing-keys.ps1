@@ -22,7 +22,11 @@
   These MUST be two DIFFERENT keypairs (compromise isolation).
 
 .PARAMETER OutDir
-  Directory to write the private key to. Defaults to the current directory.
+  Directory to write the private key to. Defaults to the SCRIPT's directory
+  (build/keys/), which is covered by .gitignore — so a run with no -OutDir
+  argument cannot accidentally drop the private PEM into a parent folder that
+  the operator might subsequently `git add`. Override with an explicit path
+  outside the repo (preferably on encrypted storage) for production use.
 
 .EXAMPLE
   pwsh ./generate-signing-keys.ps1 -Purpose entitlement -OutDir C:\secure
@@ -32,10 +36,14 @@
 param(
     [Parameter(Mandatory = $true)][ValidateSet('entitlement', 'response')]
     [string]$Purpose,
-    [string]$OutDir = (Get-Location).Path
+    [string]$OutDir = $PSScriptRoot
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Ensure the (possibly operator-supplied) output directory exists before we
+# try to write the private PEM into it. Idempotent when it already exists.
+New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
 
 $rsa = [System.Security.Cryptography.RSA]::Create()
 if ($rsa.KeySize -ne 2048) { $rsa.KeySize = 2048 }
