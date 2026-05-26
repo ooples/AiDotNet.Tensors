@@ -155,13 +155,20 @@ public static class MicrokernelGflopsBench
     }
 
     // ─────────────────────────────────────────────────────────────────────
-    // Register-only FMA ceilings. 12 independent dependent-FMA chains hide the
+    // Register-only FMA ceilings. Independent dependent-FMA chains hide the
     // ~4-5 cycle FMA latency across the 2 FMA issue ports, so the loop retires
     // FMAs at the port-bound maximum — the practical peak for this width/clock
     // on this machine. flops = iters · chains · lanes · 2.
+    //
+    // CHAIN COUNT MATTERS: the RyuJIT enregisters ~8 YMM accumulators before it
+    // starts spilling. FmaCeilingProbe measured FP64 at 4ch=22, 8ch=46, 10ch=19,
+    // 12ch=22 GFLOPS — i.e. 8 chains saturates the ports, but 10+ SPILL and crater
+    // throughput. An earlier 12-chain version of this calibration therefore
+    // UNDER-measured the ceiling ~2× (reported ~22 instead of ~46) and made the
+    // microkernels look "at ceiling" when they actually have ~2× headroom. Use 8.
     // ─────────────────────────────────────────────────────────────────────
 
-    private const int PeakChains = 12;
+    private const int PeakChains = 8;
     private const long PeakIters = 80_000_000;
 
     private static double MeasureAvx2Fp32PeakGflops()
@@ -169,7 +176,7 @@ public static class MicrokernelGflopsBench
         var a = Vector256.Create(1.0000001f);
         var b = Vector256.Create(0.9999999f);
         Vector256<float> c0 = Vector256<float>.Zero, c1 = c0, c2 = c0, c3 = c0,
-            c4 = c0, c5 = c0, c6 = c0, c7 = c0, c8 = c0, c9 = c0, c10 = c0, c11 = c0;
+            c4 = c0, c5 = c0, c6 = c0, c7 = c0;
         // warmup
         for (long i = 0; i < 1_000_000; i++) c0 = Fma.MultiplyAdd(a, b, c0);
         var sw = Stopwatch.StartNew();
@@ -179,12 +186,9 @@ public static class MicrokernelGflopsBench
             c2 = Fma.MultiplyAdd(a, b, c2); c3 = Fma.MultiplyAdd(a, b, c3);
             c4 = Fma.MultiplyAdd(a, b, c4); c5 = Fma.MultiplyAdd(a, b, c5);
             c6 = Fma.MultiplyAdd(a, b, c6); c7 = Fma.MultiplyAdd(a, b, c7);
-            c8 = Fma.MultiplyAdd(a, b, c8); c9 = Fma.MultiplyAdd(a, b, c9);
-            c10 = Fma.MultiplyAdd(a, b, c10); c11 = Fma.MultiplyAdd(a, b, c11);
         }
         sw.Stop();
         var sum = Avx.Add(Avx.Add(Avx.Add(c0, c1), Avx.Add(c2, c3)), Avx.Add(Avx.Add(c4, c5), Avx.Add(c6, c7)));
-        sum = Avx.Add(sum, Avx.Add(Avx.Add(c8, c9), Avx.Add(c10, c11)));
         s_sink += sum.GetElement(0);
         return 2.0 * PeakChains * 8 * PeakIters / sw.Elapsed.TotalSeconds / 1e9;
     }
@@ -194,7 +198,7 @@ public static class MicrokernelGflopsBench
         var a = Vector256.Create(1.0000001);
         var b = Vector256.Create(0.9999999);
         Vector256<double> c0 = Vector256<double>.Zero, c1 = c0, c2 = c0, c3 = c0,
-            c4 = c0, c5 = c0, c6 = c0, c7 = c0, c8 = c0, c9 = c0, c10 = c0, c11 = c0;
+            c4 = c0, c5 = c0, c6 = c0, c7 = c0;
         for (long i = 0; i < 1_000_000; i++) c0 = Fma.MultiplyAdd(a, b, c0);
         var sw = Stopwatch.StartNew();
         for (long i = 0; i < PeakIters; i++)
@@ -203,12 +207,9 @@ public static class MicrokernelGflopsBench
             c2 = Fma.MultiplyAdd(a, b, c2); c3 = Fma.MultiplyAdd(a, b, c3);
             c4 = Fma.MultiplyAdd(a, b, c4); c5 = Fma.MultiplyAdd(a, b, c5);
             c6 = Fma.MultiplyAdd(a, b, c6); c7 = Fma.MultiplyAdd(a, b, c7);
-            c8 = Fma.MultiplyAdd(a, b, c8); c9 = Fma.MultiplyAdd(a, b, c9);
-            c10 = Fma.MultiplyAdd(a, b, c10); c11 = Fma.MultiplyAdd(a, b, c11);
         }
         sw.Stop();
         var sum = Avx.Add(Avx.Add(Avx.Add(c0, c1), Avx.Add(c2, c3)), Avx.Add(Avx.Add(c4, c5), Avx.Add(c6, c7)));
-        sum = Avx.Add(sum, Avx.Add(Avx.Add(c8, c9), Avx.Add(c10, c11)));
         s_sink += sum.GetElement(0);
         return 2.0 * PeakChains * 4 * PeakIters / sw.Elapsed.TotalSeconds / 1e9;
     }
@@ -218,7 +219,7 @@ public static class MicrokernelGflopsBench
         var a = Vector512.Create(1.0000001f);
         var b = Vector512.Create(0.9999999f);
         Vector512<float> c0 = Vector512<float>.Zero, c1 = c0, c2 = c0, c3 = c0,
-            c4 = c0, c5 = c0, c6 = c0, c7 = c0, c8 = c0, c9 = c0, c10 = c0, c11 = c0;
+            c4 = c0, c5 = c0, c6 = c0, c7 = c0;
         for (long i = 0; i < 1_000_000; i++) c0 = Avx512F.FusedMultiplyAdd(a, b, c0);
         var sw = Stopwatch.StartNew();
         for (long i = 0; i < PeakIters; i++)
@@ -227,12 +228,9 @@ public static class MicrokernelGflopsBench
             c2 = Avx512F.FusedMultiplyAdd(a, b, c2); c3 = Avx512F.FusedMultiplyAdd(a, b, c3);
             c4 = Avx512F.FusedMultiplyAdd(a, b, c4); c5 = Avx512F.FusedMultiplyAdd(a, b, c5);
             c6 = Avx512F.FusedMultiplyAdd(a, b, c6); c7 = Avx512F.FusedMultiplyAdd(a, b, c7);
-            c8 = Avx512F.FusedMultiplyAdd(a, b, c8); c9 = Avx512F.FusedMultiplyAdd(a, b, c9);
-            c10 = Avx512F.FusedMultiplyAdd(a, b, c10); c11 = Avx512F.FusedMultiplyAdd(a, b, c11);
         }
         sw.Stop();
         var sum = Avx512F.Add(Avx512F.Add(Avx512F.Add(c0, c1), Avx512F.Add(c2, c3)), Avx512F.Add(Avx512F.Add(c4, c5), Avx512F.Add(c6, c7)));
-        sum = Avx512F.Add(sum, Avx512F.Add(Avx512F.Add(c8, c9), Avx512F.Add(c10, c11)));
         s_sink += sum.GetElement(0);
         return 2.0 * PeakChains * 16 * PeakIters / sw.Elapsed.TotalSeconds / 1e9;
     }
@@ -242,7 +240,7 @@ public static class MicrokernelGflopsBench
         var a = Vector512.Create(1.0000001);
         var b = Vector512.Create(0.9999999);
         Vector512<double> c0 = Vector512<double>.Zero, c1 = c0, c2 = c0, c3 = c0,
-            c4 = c0, c5 = c0, c6 = c0, c7 = c0, c8 = c0, c9 = c0, c10 = c0, c11 = c0;
+            c4 = c0, c5 = c0, c6 = c0, c7 = c0;
         for (long i = 0; i < 1_000_000; i++) c0 = Avx512F.FusedMultiplyAdd(a, b, c0);
         var sw = Stopwatch.StartNew();
         for (long i = 0; i < PeakIters; i++)
@@ -251,12 +249,9 @@ public static class MicrokernelGflopsBench
             c2 = Avx512F.FusedMultiplyAdd(a, b, c2); c3 = Avx512F.FusedMultiplyAdd(a, b, c3);
             c4 = Avx512F.FusedMultiplyAdd(a, b, c4); c5 = Avx512F.FusedMultiplyAdd(a, b, c5);
             c6 = Avx512F.FusedMultiplyAdd(a, b, c6); c7 = Avx512F.FusedMultiplyAdd(a, b, c7);
-            c8 = Avx512F.FusedMultiplyAdd(a, b, c8); c9 = Avx512F.FusedMultiplyAdd(a, b, c9);
-            c10 = Avx512F.FusedMultiplyAdd(a, b, c10); c11 = Avx512F.FusedMultiplyAdd(a, b, c11);
         }
         sw.Stop();
         var sum = Avx512F.Add(Avx512F.Add(Avx512F.Add(c0, c1), Avx512F.Add(c2, c3)), Avx512F.Add(Avx512F.Add(c4, c5), Avx512F.Add(c6, c7)));
-        sum = Avx512F.Add(sum, Avx512F.Add(Avx512F.Add(c8, c9), Avx512F.Add(c10, c11)));
         s_sink += sum.GetElement(0);
         return 2.0 * PeakChains * 8 * PeakIters / sw.Elapsed.TotalSeconds / 1e9;
     }

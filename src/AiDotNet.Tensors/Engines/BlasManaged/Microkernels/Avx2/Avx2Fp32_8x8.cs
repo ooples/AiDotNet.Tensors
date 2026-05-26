@@ -28,21 +28,21 @@ namespace AiDotNet.Tensors.Engines.BlasManaged;
 ///
 /// <para>
 /// <b>Audit (Sub-S #409, Phase S.2 — measured via <c>--microkernel-gflops</c>).</b>
-/// Structure is already peak-tuned for a managed AVX2 target: K-loop unrolled
-/// by 2 (back-to-back B-loads to overlap L1 latency with FMAs), software
-/// prefetch (Sub-O), C tile resident in 8 accumulators across the whole K-loop,
-/// and 10 live registers (8 acc + A-broadcast + B-load) — no spills on the
-/// 16-register AVX2 file. Microbench on a Ryzen 9 3950X (AVX2, no AVX-512):
-/// <b>~47 GFLOPS, ~100% of a register-only FMA ceiling</b> measured on the same
-/// machine. The kernel is therefore <i>not</i> leaving FMA throughput on the
-/// table relative to what this runtime delivers for back-to-back FMAs. Both the
-/// kernel and that register-only loop sit at ~37% of the chip's ~125 GFLOPS
-/// hardware-theoretical single-thread AVX2 peak, which points the residual gap
-/// at the managed runtime's FMA <i>issue rate</i> (≈1 vs the hardware's 2
-/// FMA/cycle), not at kernel structure. Confirming/closing that needs JIT-disasm
-/// inspection (<c>DOTNET_JitDisasm=Avx2Fp32_8x8:Run</c>) and is tracked as
-/// follow-up, since further source-level unrolling cannot beat a ceiling a pure
-/// register FMA loop already hits.
+/// Structure: K-loop unrolled by 2, software prefetch (Sub-O), C tile resident
+/// in 8 accumulators across the whole K-loop. Microbench on a Ryzen 9 3950X
+/// (AVX2, no AVX-512): <b>~38 GFLOPS, ~42% of the measured managed FMA ceiling
+/// (~90 GFLOPS at 8 chains)</b>. <b>Correction (was previously mis-reported as
+/// "~100% / at ceiling"):</b> that earlier reading came from a buggy calibration
+/// whose 12-chain peak loop SPILLED (the RyuJIT enregisters ~8 YMM accumulators
+/// before spilling), under-measuring the ceiling ~2×. The kernel is NOT at the
+/// ceiling — it has ~2.4× headroom, and OpenBLAS achieves ~62 GFLOPS (FP64) on
+/// this same chip, proving ~95% of hardware is reachable. So the gap is <i>kernel
+/// quality, not a managed-runtime wall</i> — exactly the BlasManaged-replaces-
+/// OpenBLAS goal. The bottleneck is load/broadcast latency not being hidden
+/// (FmaCeilingProbe: pure 8-chain FMA hits the ceiling, but adding the B-loads +
+/// A-broadcasts halves throughput); source-level reorder/unroll doesn't fix it
+/// (the JIT reschedules), so closing it needs JIT-disasm-driven work
+/// (<c>DOTNET_JitDisasm=*Avx2Fp32_8x8:Run</c>) — tracked as the open S.3 task.
 /// </para>
 /// </summary>
 internal static class Avx2Fp32_8x8

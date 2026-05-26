@@ -26,15 +26,17 @@ namespace AiDotNet.Tensors.Engines.BlasManaged;
 ///
 /// <para>
 /// <b>Audit (Sub-S #409, Phase S.2 — measured via <c>--microkernel-gflops</c>).</b>
-/// Microbench on a Ryzen 9 3950X (AVX2, no AVX-512): <b>~20 GFLOPS, ~85–95% of a
-/// register-only FP64 FMA ceiling</b> on the same machine (slightly noisier than
-/// the FP32 8×8 sibling — the 4-row tile has fewer independent FMA chains in
-/// flight to hide the ~5-cycle latency, so it sits a touch below the ceiling
-/// rather than at it). As with the FP32 kernel the residual gap to hardware-
-/// theoretical peak tracks the managed runtime's FMA issue rate, not kernel
-/// structure; closing it needs JIT-disasm review (follow-up). A wider tile
-/// (e.g. 4×16 / more accumulators) is the only structural lever that might add
-/// chains, and should be evaluated against the same harness before adopting.
+/// Microbench on a Ryzen 9 3950X (AVX2, no AVX-512): <b>~19 GFLOPS, ~44% of the
+/// measured managed FP64 FMA ceiling (~44 GFLOPS at 8 chains)</b>.
+/// <b>Correction (was previously mis-reported as "~85–95% of ceiling"):</b> the
+/// old reading used a buggy 12-chain calibration that SPILLED and under-measured
+/// the ceiling ~2× (FmaCeilingProbe: FP64 hits 46 GFLOPS at 8 chains but craters
+/// to ~20 at 10–12 chains as the JIT spills past ~8 YMM accumulators). The kernel
+/// is NOT near the ceiling — it has ~2.4× headroom, and OpenBLAS dgemm achieves
+/// ~62 GFLOPS on this chip (it even exceeds the managed 8-chain FMA loop, so the
+/// codegen ceiling can also be pushed). The gap is <i>kernel quality</i>; the
+/// bottleneck is load/broadcast latency that source-level unroll/reorder doesn't
+/// fix (JIT reschedules), so it needs JIT-disasm-driven work — the open S.3 task.
 /// </para>
 /// </summary>
 internal static class Avx2Fp64_4x8
