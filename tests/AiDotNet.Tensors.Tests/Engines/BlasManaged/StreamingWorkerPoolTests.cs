@@ -67,4 +67,44 @@ public class StreamingWorkerPoolTests
         });
         Assert.True(innerRan);
     }
+
+    [Fact]
+    public void Dispatch_WithGrainSize_RunsSerialBelowThreshold()
+    {
+        int callerTid = Thread.CurrentThread.ManagedThreadId;
+        var observedTids = new ConcurrentBag<int>();
+        // totalWork below DefaultSerialGrainSize (32768) should run all chunks on caller.
+        StreamingWorkerPool.Dispatch(8, totalWork: 1000, c => observedTids.Add(Thread.CurrentThread.ManagedThreadId));
+        foreach (var t in observedTids)
+            Assert.Equal(callerTid, t);
+    }
+
+    [Fact]
+    public void Dispatch_DispatchLatency_BelowMicrosecond()
+    {
+        if (Environment.ProcessorCount < 2)
+            return;  // Single-core: no worker parallelism, latency irrelevant.
+
+        // Warm up the pool (first call spawns workers).
+        for (int i = 0; i < 100; i++)
+            StreamingWorkerPool.Dispatch(8, c => { /* no-op */ });
+
+        // Measure: 1000 minimal dispatches. Median wall-time per dispatch
+        // should be ≤25 µs on a multi-core box (spin-then-park hot path).
+        var times = new double[1000];
+        var sw = new System.Diagnostics.Stopwatch();
+        for (int i = 0; i < 1000; i++)
+        {
+            sw.Restart();
+            StreamingWorkerPool.Dispatch(8, c => { /* no-op */ });
+            sw.Stop();
+            times[i] = sw.Elapsed.TotalMicroseconds;
+        }
+        Array.Sort(times);
+        double medianUs = times[500];
+
+        // Gate: 25 µs is generous. The aspirational sub-µs is hardware-dependent.
+        // This catches order-of-magnitude regressions (e.g., accidental TPL fallback).
+        Assert.True(medianUs < 25.0, $"Median dispatch latency {medianUs:F1} µs exceeds 25 µs sentinel.");
+    }
 }

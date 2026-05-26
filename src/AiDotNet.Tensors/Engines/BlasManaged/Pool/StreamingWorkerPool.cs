@@ -115,6 +115,34 @@ internal static class StreamingWorkerPool
     }
 
     /// <summary>
+    /// Default serial-fallback grain size (matches <c>PersistentParallelExecutor.DefaultSerialGrainSize</c>).
+    /// Below this total-work threshold, <see cref="Dispatch(int, long, Action{int})"/>
+    /// runs all chunks on the caller (no worker wakeup, no completion wait).
+    /// </summary>
+    public static int DefaultSerialGrainSize { get; set; } = 32 * 1024;
+
+    /// <summary>
+    /// Dispatch with PyTorch-style serial-fallback: when <paramref name="totalWork"/>
+    /// is below <see cref="DefaultSerialGrainSize"/>, all chunks run on the caller.
+    /// </summary>
+    public static void Dispatch(int numChunks, long totalWork, Action<int> action)
+    {
+        if (numChunks <= 0) return;
+        if (totalWork < DefaultSerialGrainSize)
+        {
+            Exception? first = null;
+            for (int c = 0; c < numChunks; c++)
+            {
+                try { action(c); }
+                catch (Exception ex) { first ??= ex; }
+            }
+            if (first is not null) throw first;
+            return;
+        }
+        Dispatch(numChunks, action);
+    }
+
+    /// <summary>
     /// Run <paramref name="action"/> across <paramref name="numChunks"/>
     /// chunks. Workers run a leading prefix; the caller runs the tail
     /// in-line for overlap. Returns when all chunks complete. Re-throws
