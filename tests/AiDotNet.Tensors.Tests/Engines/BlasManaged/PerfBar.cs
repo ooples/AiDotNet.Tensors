@@ -32,9 +32,18 @@ public static class PerfBar
 {
     /// <summary>
     /// Target win rate: BlasManaged must beat OpenBLAS on at least this percentage
-    /// of catalog shapes. Set against the 2026-05-18 baseline that showed 0% wins
-    /// (median 23.5× slower than OpenBLAS, worst 381× on Tiny_8x6x4). The 80% bar
-    /// is what closes Sub-issue G (#375 — native BLAS removal).
+    /// of catalog shapes. The 80% bar is what closes Sub-issue G (#375 — native
+    /// BLAS removal). Tracking against this bar:
+    /// <list type="bullet">
+    ///   <item>2026-05-18 (original baseline, 54 shapes): 0% wins, median 23.5×
+    ///     slower, worst 381× on Tiny_8x6x4.</item>
+    ///   <item>2026-05-26 (76-shape refresh, after PRs #420 / #423 / #432 / #453
+    ///     conv-backward + FP64 perf closures): <b>5% wins (4/76)</b>, median
+    ///     2.45× slower, worst 16.1× on Instrumented_64x64x64 FP64. The median
+    ///     dropped ~10× and the worst case improved ~24× — Sub-issues B–F closed
+    ///     most of the long tail, but BlasManaged is still consistently slower
+    ///     than OpenBLAS on most shapes, so the bar stays aspirational.</item>
+    /// </list>
     /// </summary>
     public const int MinWinRatePercent = 80;
 
@@ -42,6 +51,8 @@ public static class PerfBar
     /// Ceiling for the worst remaining loss. No shape may be more than this
     /// multiple of OpenBLAS slower. 1.20 = within the noise floor of repeated
     /// measurement. Sub-issue G can only merge when every shape clears this.
+    /// 2026-05-26: worst observed is 16.1× — far from the bar but a ~24×
+    /// improvement vs the 2026-05-18 worst (381×).
     /// </summary>
     public const double MaxLossMultiple = 1.20;
 
