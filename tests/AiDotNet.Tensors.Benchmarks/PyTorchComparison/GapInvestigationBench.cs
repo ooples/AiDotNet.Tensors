@@ -77,13 +77,18 @@ internal static class GapInvestigationBench
         double flops = 2.0 * M * N * K;
         int iters = (long)M * N * K > 100_000_000 ? 50 : 500;
 
-        // AiDotNet single-thread (isolates kernel quality).
-        var (aiStMin, aiStMed) = TimeAi(() =>
-            BlasManagedLib.Gemm<float>(a, K, false, b, N, false, c, N, M, N, K,
-                new BlasOptions<float> { NumThreads = 1 }), iters);
+        // NOTE: the autotune cache is NOT keyed on thread count, and
+        // PackBoth's parallel loop uses the GLOBAL MaxDegreeOfParallelism rather
+        // than the per-call NumThreads — so the "1-thread" row below does NOT
+        // actually run single-threaded for PackBoth; it only differs in the
+        // cached blocking factors. Both rows use all cores. Treat the 1-thread
+        // row as "kernel + blocking at procs=1 heuristic", not a true serial run.
         // AiDotNet multi-thread (default = Deterministic mode).
         var (aiMtMin, aiMtMed) = TimeAi(() =>
             BlasManagedLib.Gemm<float>(a, K, false, b, N, false, c, N, M, N, K), iters);
+        var (aiStMin, aiStMed) = TimeAi(() =>
+            BlasManagedLib.Gemm<float>(a, K, false, b, N, false, c, N, M, N, K,
+                new BlasOptions<float> { NumThreads = 1 }), iters);
         // AiDotNet multi-thread in FAST mode (non-deterministic) — tests the
         // hypothesis that the deterministic guard is what kills PackBoth scaling.
         var (aiFastMin, aiFastMed) = TimeAi(() =>
