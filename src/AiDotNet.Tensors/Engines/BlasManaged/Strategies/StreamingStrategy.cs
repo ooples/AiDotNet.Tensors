@@ -73,21 +73,92 @@ internal static class StreamingStrategy
             return;
         }
 
-        // Sub-G #375 note: 64×64×64 routes here (AxisSelector picks MN_2D
-        // because neither M nor N reaches the procs×{mr,nr}×2 gate at
-        // procs=16). An M-axis parallel path was prototyped — it correctly
-        // partitions M across threads with disjoint C row-slices — but at
-        // 64³ the per-thread work (M/procs)·N·K = 32K FMAs ≈ 2 µs at AVX2
-        // peak is dwarfed by .NET ThreadPool dispatch overhead (~5-10 µs
-        // per task). Net: M-axis parallel was 4 GFLOPS, the same as
-        // serial, on this shape. The 10× gap to OpenBLAS (~30 GFLOPS,
-        // observed) is OpenBLAS using a pre-warmed persistent worker pool
-        // with µs-level dispatch — closing it requires a custom Streaming-
-        // microkernel thread pool, not a TPL Parallel.For wrapper. Tracked
-        // as a follow-up; for now the kernel-level gap on tiny cubes
-        // remains the binding Sub-G blocker on this shape family.
+        // Sub-G #375 (Layer B): M-axis + MN_2D fallback through
+        // StreamingWorkerPool. AxisSelector picks MN_2D for shapes where
+        // neither M nor N reaches the procs×{mr,nr}×2 gate (e.g. 64×64×64
+        // FP64 at procs=16). The MN_2D path falls through to M-axis since
+        // C[m,n] row-slicing has disjoint writes and matches the
+        // RunNParallel column-disjoint contract on the other axis.
+        // StreamingWorkerPool's sub-µs dispatch latency makes this win
+        // even at tiny shapes (the earlier TPL-Parallel.For prototype
+        // was net-zero on 64³ because dispatch overhead ≈ compute).
+        if ((axis == ParallelismAxis.M || axis == ParallelismAxis.MN_2D)
+            && procs > 1
+            && m >= StreamingMr
+            && (long)m * n * k >= AxisSelector.ParallelWorkThreshold)
+        {
+            int effectiveProcs = Math.Min(procs, m / StreamingMr);
+            if (effectiveProcs >= 2)
+            {
+                RunMParallel(a, lda, transA, b, ldb, transB, c, ldc, m, n, k, effectiveProcs);
+                return;
+            }
+        }
 
         RunSerial(a, lda, transA, b, ldb, transB, c, ldc, m, n, k);
+    }
+
+    /// <summary>
+    /// Partition M across <paramref name="procs"/> threads. Each thread
+    /// writes a disjoint row slice of C — bit-exact across thread counts.
+    /// Mirror of <see cref="RunNParallel{T}"/> on the M axis; used for
+    /// shapes where N is too small for N-axis splitting (e.g., 64×64×64
+    /// cubes where N=64 doesn't reach procs×nr×2=256 at procs=16).
+    /// </summary>
+    private static void RunMParallel<T>(
+        ReadOnlySpan<T> a, int lda, bool transA,
+        ReadOnlySpan<T> b, int ldb, bool transB,
+        Span<T> c, int ldc,
+        int m, int n, int k,
+        int procs) where T : unmanaged
+    {
+        unsafe
+        {
+            fixed (T* aPtr = a)
+            fixed (T* bPtr = b)
+            fixed (T* cPtr = c)
+            {
+                T* aLocal = aPtr;
+                T* bLocal = bPtr;
+                T* cLocal = cPtr;
+                int aLen = a.Length, bLen = b.Length, cLen = c.Length;
+                int procsLocal = procs;
+                int mLocal = m;
+                int nLocal = n;
+                int kLocal = k;
+                int ldaLocal = lda, ldbLocal = ldb, ldcLocal = ldc;
+                bool taLocal = transA, tbLocal = transB;
+
+                StreamingWorkerPool.Dispatch(procsLocal, p =>
+                {
+                    int mStart = (int)(((long)p * mLocal) / procsLocal);
+                    int mEnd = (int)(((long)(p + 1) * mLocal) / procsLocal);
+                    int mChunk = mEnd - mStart;
+                    if (mChunk <= 0) return;
+
+                    // A slice along M: depends on transA.
+                    //   transA=false: A[M, K] row-major. Row mStart starts at
+                    //                 a[mStart*lda]; stride is lda. Kernel sees [mChunk, K].
+                    //   transA=true:  A[K, M] row-major. Column mStart starts at a[mStart];
+                    //                 stride between rows is lda. Kernel sees a [K, mChunk] panel.
+                    int aOffset = taLocal ? mStart : mStart * ldaLocal;
+                    int aSliceLen = aLen - aOffset;
+
+                    // C slice along M: row-major, row mStart starts at c[mStart*ldc].
+                    int cOffset = mStart * ldcLocal;
+                    int cSliceLen = cLen - cOffset;
+
+                    var aSpan = new ReadOnlySpan<T>(aLocal + aOffset, aSliceLen);
+                    var bSpan = new ReadOnlySpan<T>(bLocal, bLen);
+                    var cSpan = new Span<T>(cLocal + cOffset, cSliceLen);
+
+                    RunSerial(aSpan, ldaLocal, taLocal,
+                              bSpan, ldbLocal, tbLocal,
+                              cSpan, ldcLocal,
+                              mChunk, nLocal, kLocal);
+                });
+            }
+        }
     }
 
     /// <summary>
