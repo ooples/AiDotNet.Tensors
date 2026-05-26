@@ -34,7 +34,9 @@ public class FmaCeilingProbe
 
         _output.WriteLine("FP64 register-only FMA ceiling (8 flops/FMA, target ~62 GFLOPS = OpenBLAS here):");
         _output.WriteLine($"  4 chains: {Chains4():F1} GFLOPS");
+        _output.WriteLine($"  6 chains: {Chains6():F1} GFLOPS");
         _output.WriteLine($"  8 chains: {Chains8():F1} GFLOPS");
+        _output.WriteLine($"  9 chains: {Chains9():F1} GFLOPS");
         _output.WriteLine($" 10 chains: {Chains10():F1} GFLOPS");
         _output.WriteLine($" 12 chains: {Chains12():F1} GFLOPS");
         _output.WriteLine($"(sink={s_sink:G4})");
@@ -57,6 +59,46 @@ public class FmaCeilingProbe
         sw.Stop();
         s_sink += Avx.Add(Avx.Add(c0, c1), Avx.Add(c2, c3)).GetElement(0);
         return Gf(4, sw);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    private static double Chains6()
+    {
+        var a = Vector256.Create(1.0000001); var b = Vector256.Create(0.9999999);
+        Vector256<double> c0 = Vector256<double>.Zero, c1 = c0, c2 = c0, c3 = c0, c4 = c0, c5 = c0;
+        for (long i = 0; i < 1_000_000; i++) c0 = Fma.MultiplyAdd(a, b, c0);
+        var sw = Stopwatch.StartNew();
+        for (long i = 0; i < Iters; i++)
+        {
+            c0 = Fma.MultiplyAdd(a, b, c0); c1 = Fma.MultiplyAdd(a, b, c1);
+            c2 = Fma.MultiplyAdd(a, b, c2); c3 = Fma.MultiplyAdd(a, b, c3);
+            c4 = Fma.MultiplyAdd(a, b, c4); c5 = Fma.MultiplyAdd(a, b, c5);
+        }
+        sw.Stop();
+        s_sink += Avx.Add(Avx.Add(Avx.Add(c0, c1), Avx.Add(c2, c3)), Avx.Add(c4, c5)).GetElement(0);
+        return Gf(6, sw);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    private static double Chains9()
+    {
+        var a = Vector256.Create(1.0000001); var b = Vector256.Create(0.9999999);
+        Vector256<double> c0 = Vector256<double>.Zero, c1 = c0, c2 = c0, c3 = c0,
+            c4 = c0, c5 = c0, c6 = c0, c7 = c0, c8 = c0;
+        for (long i = 0; i < 1_000_000; i++) c0 = Fma.MultiplyAdd(a, b, c0);
+        var sw = Stopwatch.StartNew();
+        for (long i = 0; i < Iters; i++)
+        {
+            c0 = Fma.MultiplyAdd(a, b, c0); c1 = Fma.MultiplyAdd(a, b, c1);
+            c2 = Fma.MultiplyAdd(a, b, c2); c3 = Fma.MultiplyAdd(a, b, c3);
+            c4 = Fma.MultiplyAdd(a, b, c4); c5 = Fma.MultiplyAdd(a, b, c5);
+            c6 = Fma.MultiplyAdd(a, b, c6); c7 = Fma.MultiplyAdd(a, b, c7);
+            c8 = Fma.MultiplyAdd(a, b, c8);
+        }
+        sw.Stop();
+        var s = Avx.Add(Avx.Add(Avx.Add(c0, c1), Avx.Add(c2, c3)), Avx.Add(Avx.Add(c4, c5), Avx.Add(c6, c7)));
+        s_sink += Avx.Add(s, c8).GetElement(0);
+        return Gf(9, sw);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
