@@ -299,8 +299,19 @@ jobs:
             Write-Host "No OBFUSCATOR_EXE configured - skipping obfuscation (assemblies will be UNobfuscated)."
             exit 0
           }
-          $targets = Get-ChildItem -Recurse -Path src -Filter AiDotNet.Tensors.dll |
-                     Where-Object { $_.FullName -match '[\\/]bin[\\/]Release[\\/]' }
+          # Wrap in @() so a single-match result is still iterable as a
+          # collection (PowerShell unwraps a one-element pipeline result to
+          # the scalar otherwise, and .Count then returns the byte length).
+          $targets = @(Get-ChildItem -Recurse -Path src -Filter AiDotNet.Tensors.dll |
+                     Where-Object { $_.FullName -match '[\\/]bin[\\/]Release[\\/]' })
+          if ($targets.Count -eq 0) {
+            # Fail closed: OBFUSCATOR_EXE was explicitly configured but the
+            # Release glob found nothing to obfuscate. Shipping unobfuscated
+            # packages from a hardening-enabled job is exactly the silent
+            # weakening this guard exists to prevent.
+            Write-Error "OBFUSCATOR_EXE is configured but no src/**/bin/Release/AiDotNet.Tensors.dll were found - refusing to ship unobfuscated packages."
+            exit 1
+          }
           foreach ($dll in $targets) {
             Write-Host "Obfuscating $($dll.FullName)..."
             & $env:OBFUSCATOR_EXE @($env:OBFUSCATOR_ARGS -split ' ' | Where-Object { $_ }) "$($dll.FullName)"
