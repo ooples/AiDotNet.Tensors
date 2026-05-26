@@ -209,7 +209,7 @@ __kernel void softmax(
         float4 v = vload4(0, rowIn + f);
         threadMax = fmax(threadMax, fmax(fmax(v.x, v.y), fmax(v.z, v.w)));
     }
-    for (int i = f / 4 * 4 + lid % (localSize); i < features; i += localSize) {
+    for (int i = (features / 4) * 4 + lid; i < features; i += localSize) {
         if (i < features) threadMax = fmax(threadMax, rowIn[i]);
     }
 
@@ -232,7 +232,7 @@ __kernel void softmax(
         vstore4(e, 0, rowOut + f);
         threadSum += e.x + e.y + e.z + e.w;
     }
-    for (int i = f / 4 * 4 + lid % (localSize); i < features; i += localSize) {
+    for (int i = (features / 4) * 4 + lid; i < features; i += localSize) {
         if (i < features) { float e = fast_exp1(rowIn[i] - rowMax); rowOut[i] = e; threadSum += e; }
     }
 
@@ -252,7 +252,7 @@ __kernel void softmax(
     for (; f + 3 < features; f += localSize * 4) {
         vstore4(vload4(0, rowOut + f) * invSum, 0, rowOut + f);
     }
-    for (int i = f / 4 * 4 + lid % (localSize); i < features; i += localSize) {
+    for (int i = (features / 4) * 4 + lid; i < features; i += localSize) {
         if (i < features) rowOut[i] *= invSum;
     }
 }
