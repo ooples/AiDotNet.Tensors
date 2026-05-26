@@ -31,6 +31,7 @@ public sealed class GpuCpuCorrectnessTests : IDisposable
     private readonly CpuEngine _cpu = new CpuEngine();
     private readonly DirectGpuTensorEngine _gpu;
     private readonly bool _gpuReady;
+    private readonly Exception _gpuInitException;
 
     public GpuCpuCorrectnessTests()
     {
@@ -39,13 +40,40 @@ public sealed class GpuCpuCorrectnessTests : IDisposable
             _gpu = new DirectGpuTensorEngine();
             _gpuReady = _gpu.IsGpuAvailable;
         }
-        catch
+        catch (Exception ex)
         {
+            // Capture so an opt-in CI gate (AIDOTNET_REQUIRE_GPU_TESTS=1) can
+            // surface the underlying init failure instead of letting the suite
+            // pass green as a no-op when a GPU was supposed to be available.
+            _gpuInitException = ex;
             _gpuReady = false;
         }
     }
 
     public void Dispose() => _gpu?.Dispose();
+
+    /// <summary>
+    /// Returns whether the GPU is usable for this test. Tests should early-
+    /// return when this returns <c>false</c> (CPU-only host — the suite stays
+    /// portable). When <c>AIDOTNET_REQUIRE_GPU_TESTS=1</c> is set the call
+    /// instead throws, so a CI lane that's *supposed* to have a GPU surfaces
+    /// init failures loudly rather than silently passing the suite.
+    /// </summary>
+    private bool EnsureGpuReady()
+    {
+        if (_gpuReady) return true;
+        if (string.Equals(
+                Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_GPU_TESTS"),
+                "1",
+                StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                "GPU tests were required (AIDOTNET_REQUIRE_GPU_TESTS=1) but " +
+                "DirectGpu initialization failed or no GPU is available.",
+                _gpuInitException);
+        }
+        return false;
+    }
 
     // float32 GEMM at K=512 accumulates ~7e-6 abs error; the #364 bug produced
     // errors of 0.16 / NaN / 1e37. 1e-3 cleanly separates correct from broken.
@@ -117,7 +145,7 @@ public sealed class GpuCpuCorrectnessTests : IDisposable
     [MemberData(nameof(GemmSizes))]
     public void TensorMatMul_Gpu_Matches_Cpu(int m, int n, int k)
     {
-        if (!_gpuReady) return;
+        if (!EnsureGpuReady()) return;
         var a = Rand(1, m, k);
         var b = Rand(2, k, n);
         var cpu = _cpu.TensorMatMul(a, b);
@@ -129,7 +157,7 @@ public sealed class GpuCpuCorrectnessTests : IDisposable
     [MemberData(nameof(GemmSizes))]
     public void TensorMatMulTransposed_Gpu_Matches_Cpu(int m, int n, int k)
     {
-        if (!_gpuReady) return;
+        if (!EnsureGpuReady()) return;
         // C[m,n] = A[m,k] * B[n,k]^T
         var a = Rand(3, m, k);
         var b = Rand(4, n, k);
@@ -152,7 +180,7 @@ public sealed class GpuCpuCorrectnessTests : IDisposable
     [MemberData(nameof(ElementwiseShapes))]
     public void TensorAdd_Gpu_Matches_Cpu(int[] shape)
     {
-        if (!_gpuReady) return;
+        if (!EnsureGpuReady()) return;
         var a = Rand(5, shape);
         var b = Rand(6, shape);
         AssertGpuMatchesCpu(_gpu.TensorAdd(a, b), _cpu.TensorAdd(a, b), "TensorAdd");
@@ -162,7 +190,7 @@ public sealed class GpuCpuCorrectnessTests : IDisposable
     [MemberData(nameof(ElementwiseShapes))]
     public void TensorSubtract_Gpu_Matches_Cpu(int[] shape)
     {
-        if (!_gpuReady) return;
+        if (!EnsureGpuReady()) return;
         var a = Rand(7, shape);
         var b = Rand(8, shape);
         AssertGpuMatchesCpu(_gpu.TensorSubtract(a, b), _cpu.TensorSubtract(a, b), "TensorSubtract");
@@ -172,7 +200,7 @@ public sealed class GpuCpuCorrectnessTests : IDisposable
     [MemberData(nameof(ElementwiseShapes))]
     public void TensorMultiply_Gpu_Matches_Cpu(int[] shape)
     {
-        if (!_gpuReady) return;
+        if (!EnsureGpuReady()) return;
         var a = Rand(9, shape);
         var b = Rand(10, shape);
         AssertGpuMatchesCpu(_gpu.TensorMultiply(a, b), _cpu.TensorMultiply(a, b), "TensorMultiply");
@@ -185,7 +213,7 @@ public sealed class GpuCpuCorrectnessTests : IDisposable
     [InlineData(1, 512)]
     public void TensorTranspose_Gpu_Matches_Cpu(int r, int c)
     {
-        if (!_gpuReady) return;
+        if (!EnsureGpuReady()) return;
         var a = Rand(11, r, c);
         AssertGpuMatchesCpu(_gpu.TensorTranspose(a), _cpu.TensorTranspose(a), $"TensorTranspose[{r}x{c}]");
     }
@@ -196,7 +224,7 @@ public sealed class GpuCpuCorrectnessTests : IDisposable
     [InlineData(256, 256)]
     public void Softmax_Gpu_Matches_Cpu(int rows, int cols)
     {
-        if (!_gpuReady) return;
+        if (!EnsureGpuReady()) return;
         var a = Rand(12, rows, cols);
         AssertGpuMatchesCpu(_gpu.Softmax(a, axis: -1), _cpu.Softmax(a, axis: -1), $"Softmax[{rows}x{cols}]");
     }
@@ -207,7 +235,7 @@ public sealed class GpuCpuCorrectnessTests : IDisposable
     [InlineData(256, 256)]
     public void ReduceSum_LastAxis_Gpu_Matches_Cpu(int rows, int cols)
     {
-        if (!_gpuReady) return;
+        if (!EnsureGpuReady()) return;
         var a = Rand(13, rows, cols);
         var cpu = _cpu.ReduceSum(a, new[] { 1 }, keepDims: false);
         var gpu = _gpu.ReduceSum(a, new[] { 1 }, keepDims: false);
@@ -238,7 +266,7 @@ public sealed class GpuCpuCorrectnessTests : IDisposable
 
     private void AssertUnary(Func<IEngine, Tensor<float>, Tensor<float>> op, int[] shape, string name, float tol, int seed = 20)
     {
-        if (!_gpuReady) return;
+        if (!EnsureGpuReady()) return;
         var a = Rand(seed, shape);
         var gpu = op(_gpu, a);
         var cpu = op(_cpu, a);
@@ -263,7 +291,7 @@ public sealed class GpuCpuCorrectnessTests : IDisposable
     [MemberData(nameof(ElementwiseShapes))]
     public void TensorDivide_Gpu_Matches_Cpu(int[] shape)
     {
-        if (!_gpuReady) return;
+        if (!EnsureGpuReady()) return;
         var a = Rand(21, shape);
         // Denominator bounded away from zero so the ratio stays well-conditioned.
         var bd = new float[a.ToArray().Length];
@@ -281,7 +309,7 @@ public sealed class GpuCpuCorrectnessTests : IDisposable
     [InlineData(33, 1025)]
     public void ReduceMax_LastAxis_Gpu_Matches_Cpu(int rows, int cols)
     {
-        if (!_gpuReady) return;
+        if (!EnsureGpuReady()) return;
         var a = Rand(23, rows, cols);
         var cpu = _cpu.ReduceMax(a, new[] { 1 }, false, out _);
         var gpu = _gpu.ReduceMax(a, new[] { 1 }, false, out _);
@@ -295,7 +323,7 @@ public sealed class GpuCpuCorrectnessTests : IDisposable
     [InlineData(33, 1025)]
     public void ReduceMean_LastAxis_Gpu_Matches_Cpu(int rows, int cols)
     {
-        if (!_gpuReady) return;
+        if (!EnsureGpuReady()) return;
         var a = Rand(24, rows, cols);
         AssertGpuMatchesCpu(_gpu.ReduceMean(a, new[] { 1 }, false), _cpu.ReduceMean(a, new[] { 1 }, false), $"ReduceMean[{rows}x{cols}]");
     }
@@ -308,7 +336,7 @@ public sealed class GpuCpuCorrectnessTests : IDisposable
     [InlineData(2, 512, 512, 512)]
     public void BatchMatMul_Gpu_Matches_Cpu(int batch, int m, int n, int k)
     {
-        if (!_gpuReady) return;
+        if (!EnsureGpuReady()) return;
         var a = Rand(25, batch, m, k);
         var b = Rand(26, batch, k, n);
         AssertGpuMatchesCpu(_gpu.BatchMatMul(a, b), _cpu.BatchMatMul(a, b), $"BatchMatMul[{batch}x{m}x{k}*{batch}x{k}x{n}]");
