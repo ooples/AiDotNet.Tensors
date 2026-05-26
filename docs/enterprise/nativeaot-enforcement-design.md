@@ -44,9 +44,9 @@ reviewed carefully — a bad binding degrades the product for paying customers.
 
 ## Project layout
 
-```
+```text
 src/AiDotNet.Native.LicenseGuard/        # NativeAOT shared lib
-  AiDotNet.Native.LicenseGuard.csproj     # <PublishAot>, <NativeLib>Shared</NativeLib>
+  AiDotNet.Native.LicenseGuard.csproj     # <PublishAot>true</PublishAot>, <NativeLib>Shared</NativeLib>
   Exports.cs                              # [UnmanagedCallersOnly(EntryPoint="...")]
 src/AiDotNet.Tensors/Licensing/
   NativeLicenseGuard.cs                   # [DllImport] wrapper + managed fallback
