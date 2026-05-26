@@ -43,7 +43,7 @@ later request.
 
 The client reconstructs and verifies exactly this (`LicenseResponseVerifier.BuildCanonical`):
 
-```
+```text
 {nonce}\n{status}\n{tier}\n{expires_at}\n{capabilities_csv}
 ```
 
