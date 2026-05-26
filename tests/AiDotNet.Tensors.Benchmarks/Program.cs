@@ -75,6 +75,34 @@ class Program
             return;
         }
 
+        // Sub-G #375 Layer D — differentiator benchmarks (structural wins PyTorch
+        // can't match). Each runs standalone; the cold-start child workload is
+        // dispatched via --cold-start-aidotnet.
+        if (args[0] == "--cold-start-aidotnet")
+        {
+            Environment.Exit(PyTorchComparison.ColdStartBench.RunAiDotNetWorkload());
+        }
+        if (args[0] == "--cold-start")
+        {
+            PyTorchComparison.ColdStartBench.Run();
+            return;
+        }
+        if (args[0] == "--determinism-bench")
+        {
+            PyTorchComparison.DeterminismBench.Run();
+            return;
+        }
+        if (args[0] == "--per-call-threads")
+        {
+            PyTorchComparison.PerCallThreadsBench.Run();
+            return;
+        }
+        if (args[0] == "--frozen-weight-inference")
+        {
+            PyTorchComparison.FrozenWeightInferenceBench.Run();
+            return;
+        }
+
         // Issue #403 Phase A.3: per-substep allocation profile + shape catalog
         // for one pass through the DCGAN-step probe substeps. Cheap to run
         // (one call per substep) so reviewers can compare alloc shape against
