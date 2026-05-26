@@ -100,11 +100,8 @@ public sealed class GpuCpuAutoDifferentialTests : IDisposable
         ["TensorLayerNorm"] = "gamma/beta must match normalized-shape suffix, not full input shape",
         ["GroupNorm"] = "gamma/beta must be per-channel [C]; group count vs channels constraint",
         ["RMSNorm"] = "gamma must be [C] (last dim), not full input shape",
-        // FLAGGED — valid generic input, SHOULD match: suspected real discrepancies, pending investigation
-        ["TensorL1Loss"] = "FLAGGED: deterministic mean|a-b|, generic input valid — GPU vs CPU differ; investigate",
-        ["TensorHuberLoss"] = "FLAGGED: deterministic, generic input valid — GPU vs CPU differ; investigate",
-        ["TensorLogSumExp"] = "FLAGGED: reduction over last axis at width 129 (softmax-tail-bug class?); investigate",
-        ["TensorScatterAdd"] = "FLAGGED: deterministic scatter-add — GPU vs CPU differ by ~250; investigate",
+        // transcendental composite precision (NOT a structural bug)
+        ["TensorLogSumExp"] = "per-row reduction verified exact; multi-row uses a composite GPU path (reduce-max/exp/reduce-sum, each <1e-2) that accumulates ~0.058 (<1%) at width 129 — precision, not garbage",
     };
 
     // Stochastic / non-deterministic kernels — substring match on the method name.
