@@ -84,6 +84,45 @@ public class MachineKernelGemmTests
             $"M={M} N={N} K={K}: Auto vs reference drift {maxVsRef:G6} > {tol:G6}");
     }
 
+    [Theory]
+    [InlineData(7, 9, 64)]      // 1-row M-tail, 1-col N-tail, corner
+    [InlineData(11, 8, 128)]    // M-tail only (n aligned)
+    [InlineData(6, 13, 128)]    // N-tail only (m aligned)
+    [InlineData(50, 100, 256)]  // m%6=2, n%8=4 — both tails, multi-Kc
+    [InlineData(193, 770, 384)] // ViT-ish, both tails
+    [InlineData(5, 7, 32)]      // below one tile in BOTH dims — interior empty (managed handles)
+    public void Gemm_MachineKernel_Tails_Match_PackBoth_And_Reference(int M, int N, int K)
+    {
+        var rng = new Random(555 + M * 31 + N * 7 + K);
+        var a = new double[M * K];
+        var b = new double[K * N];
+        for (int i = 0; i < a.Length; i++) a[i] = rng.NextDouble() * 2 - 1;
+        for (int i = 0; i < b.Length; i++) b[i] = rng.NextDouble() * 2 - 1;
+
+        var cAuto = new double[M * N];
+        var cPackBoth = new double[M * N];
+        var cRef = new double[M * N];
+
+        BlasManagedLib.Gemm<double>(a, K, false, b, N, false, cAuto, N, M, N, K,
+            new BlasOptions<double> { PackingMode = PackingMode.Auto });
+        BlasManagedLib.Gemm<double>(a, K, false, b, N, false, cPackBoth, N, M, N, K,
+            new BlasOptions<double> { PackingMode = PackingMode.ForcePackBoth });
+        ReferenceGemm(a, K, b, N, cRef, N, M, N, K);
+
+        double maxVsPackBoth = 0, maxVsRef = 0, scale = 0;
+        for (int i = 0; i < cAuto.Length; i++)
+        {
+            maxVsPackBoth = Math.Max(maxVsPackBoth, Math.Abs(cAuto[i] - cPackBoth[i]));
+            maxVsRef = Math.Max(maxVsRef, Math.Abs(cAuto[i] - cRef[i]));
+            scale = Math.Max(scale, Math.Abs(cRef[i]));
+        }
+        double tol = 1e-9 * Math.Max(1.0, scale) * K;
+        Assert.True(maxVsPackBoth < tol,
+            $"M={M} N={N} K={K}: tail Auto vs PackBoth drift {maxVsPackBoth:G6} > {tol:G6}");
+        Assert.True(maxVsRef < tol,
+            $"M={M} N={N} K={K}: tail Auto vs reference drift {maxVsRef:G6} > {tol:G6}");
+    }
+
     [Fact]
     public void Gemm_MachineKernel_Disabled_StillCorrect()
     {

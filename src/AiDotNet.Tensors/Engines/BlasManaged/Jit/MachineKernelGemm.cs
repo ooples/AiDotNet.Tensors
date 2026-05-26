@@ -33,9 +33,21 @@ internal static class MachineKernelGemm
     /// <summary>Master switch (default on). Set false to force the managed path everywhere.</summary>
     internal static bool Enabled { get; set; } = true;
 
+    /// <summary>Microkernel row tile (M alignment the interior must satisfy).</summary>
+    internal const int Fp64Mr = 6;
+    /// <summary>Microkernel column tile (N alignment the interior must satisfy).</summary>
+    internal const int Fp64Nr = 8;
+
 #if NET5_0_OR_GREATER
-    private const int Mr = 6, Nr = 8;
+    private const int Mr = Fp64Mr, Nr = Fp64Nr;
     private const int KcBlock = 256; // K-blocking so packed panels stay cache-resident.
+
+    /// <summary>
+    /// True when the FP64 machine kernel is usable on this process (enabled, x64
+    /// Windows, AVX2+FMA, dynamic code allowed, kernel emitted). Lets callers decide
+    /// to carve an aligned interior for the kernel BEFORE attempting it. Idempotent.
+    /// </summary>
+    internal static bool IsFp64Available => Enabled && TryInitKernel();
 
     private static readonly object _lock = new();
     private static bool _initTried;
@@ -134,6 +146,8 @@ internal static class MachineKernelGemm
     }
 #else
     /// <summary>net471 has no x86 intrinsics / function pointers — always defer to managed.</summary>
+    internal static bool IsFp64Available => false;
+
     internal static bool TryGemmFp64(
         ReadOnlySpan<double> a, int lda, bool transA,
         ReadOnlySpan<double> b, int ldb, bool transB,

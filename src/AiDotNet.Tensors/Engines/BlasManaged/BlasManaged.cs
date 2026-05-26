@@ -153,25 +153,49 @@ public static class BlasManaged
             return;
         }
 
-        // Sub-S (#409): machine-code microkernel fast path. Tile-aligned, no-trans,
-        // no-epilogue FP64 GEMMs route to the hand-emitted 6×8 kernel (~57 GFLOPS,
-        // ~95% of OpenBLAS — first-party machine code, no dependency). Honours
-        // PackingMode.Auto only (explicit pack-mode overrides take the managed path
-        // so callers can force-test a strategy). TryGemmFp64 returns false for any
-        // shape that doesn't qualify, so this can only add speed, never change
-        // results — and C is already zeroed above, which the kernel requires.
-        if (typeof(T) == typeof(double) && options.PackingMode == PackingMode.Auto)
+        // Sub-S (#409): machine-code microkernel fast path. The tile-aligned FP64
+        // interior runs on the hand-emitted 6×8 kernel (~57 GFLOPS/core, ~95% of
+        // OpenBLAS, multithreaded — first-party machine code, no dependency); the
+        // m%6 / n%8 tails go to Streaming. Honours PackingMode.Auto only (explicit
+        // pack-mode overrides take the managed path so callers can force-test a
+        // strategy), no transpose, no epilogue, no pre-pack. C is already zeroed
+        // above (the kernel accumulates), and the tails read-modify-write their own
+        // disjoint sub-tiles — so this can only add speed, never change results.
+        if (typeof(T) == typeof(double)
+            && options.PackingMode == PackingMode.Auto
+            && !transA && !transB
+            && m >= MachineKernelGemm.Fp64Mr && n >= MachineKernelGemm.Fp64Nr
+            && options.PackedA is null && options.PackedB is null
+            && MachineKernelGemm.IsFp64Available)
         {
             var epi409 = options.Epilogue;
-            if (EpilogueFlagsCompute.Compute(in epi409) == EpilogueFlags.None
-                && MachineKernelGemm.TryGemmFp64(
-                    MemoryMarshal.Cast<T, double>(a), lda, transA,
-                    MemoryMarshal.Cast<T, double>(b), ldb, transB,
+            if (EpilogueFlagsCompute.Compute(in epi409) == EpilogueFlags.None)
+            {
+                int mAl = m - (m % MachineKernelGemm.Fp64Mr); // interior rows (× Mr)
+                int nAl = n - (n % MachineKernelGemm.Fp64Nr); // interior cols (× Nr)
+                bool ran = MachineKernelGemm.TryGemmFp64(
+                    MemoryMarshal.Cast<T, double>(a), lda, false,
+                    MemoryMarshal.Cast<T, double>(b), ldb, false,
                     MemoryMarshal.Cast<T, double>(c), ldc,
-                    m, n, k,
-                    hasEpilogue: false,
-                    hasPrePack: options.PackedA is not null || options.PackedB is not null))
-                return;
+                    mAl, nAl, k, hasEpilogue: false, hasPrePack: false);
+                if (ran)
+                {
+                    int mTail = m - mAl, nTail = n - nAl;
+                    // (b) M-tail rows [mAl, m) × [0, nAl)
+                    if (mTail > 0 && nAl > 0)
+                        StreamingStrategy.Run<T>(a.Slice(mAl * lda), lda, false, b, ldb, false,
+                            c.Slice(mAl * ldc), ldc, mTail, nAl, k, in options);
+                    // (c) N-tail cols [0, mAl) × [nAl, n)
+                    if (nTail > 0 && mAl > 0)
+                        StreamingStrategy.Run<T>(a, lda, false, b.Slice(nAl), ldb, false,
+                            c.Slice(nAl), ldc, mAl, nTail, k, in options);
+                    // (d) corner [mAl, m) × [nAl, n)
+                    if (mTail > 0 && nTail > 0)
+                        StreamingStrategy.Run<T>(a.Slice(mAl * lda), lda, false, b.Slice(nAl), ldb, false,
+                            c.Slice(mAl * ldc + nAl), ldc, mTail, nTail, k, in options);
+                    return;
+                }
+            }
         }
 
         PackingMode strategy = Dispatcher.SelectStrategy(m, n, k, options);
