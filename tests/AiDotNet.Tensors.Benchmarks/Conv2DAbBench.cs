@@ -453,18 +453,23 @@ internal static class Conv2DAbBench
         var shapesToProbe = new (int M, int N, int K, string note, bool fp32)[]
         {
             // FP64 cubes (verify prior fix sticks)
-            (64,   64,   64,  "64³ FP64 — was worst-loss (16.1× behind OpenBLAS)",       false),
+            (64,   64,   64,  "64³ FP64 — kernel-level 10.7× gap (OpenBLAS MT, ours ST)", false),
             (96,   128,  64,  "BERT_Attn_score FP64 — sanity (PackAOnly still wins)",     false),
             (128,  128,  128, "128³ FP64 — above Streaming cutoff",                       false),
 
             // Remaining Sub-G worst-loss shapes from refreshed baseline:
-            (3136, 64,   64,  "ResNet50_layer1 FP32 — thin-N 9.1× regression",            true),
-            (3136, 32,   32,  "MobileNetV2_pw FP32 — thin-N 9.7× regression",             true),
-            (512,  512,  64,  "Instrumented 512x512x64 FP64 — thin-K 6.8× regression",    false),
-            (1024, 3072, 768, "BERT_FFN_up FP32 — compute-bound 10.7× regression (big)",  true),
+            (3136, 64,   64,  "ResNet50_layer1 FP32 — thin-N",                            true),
+            (3136, 32,   32,  "MobileNetV2_pw FP32 — thin-N",                             true),
+            (512,  512,  64,  "Instrumented 512x512x64 FP64 — thin-K balanced",           false),
+            (1024, 3072, 768, "BERT_FFN_up FP32 — compute-bound",                         true),
+
+            // Now-worst-loss shapes after the strategy fix:
+            (128,  768,  768, "Instrumented 128x768x768 FP64 — PackBoth 5.3× gap",        false),
+            (64,   147,  3136, "ResNet50_bwd_dW FP32 — small-M-big-K 4.5× gap",          true),
+            (197,  768,  768, "ViT_Attn_QKV 197x768x768 FP32 — moderate-M wide 4.4× gap", true),
 
             // FP32 sanity probes
-            (64,   64,   64,  "64³ FP32 — verify FP32 fix sticks",                        true),
+            (64,   64,   64,  "64³ FP32 — kernel-level 10.9× gap (same as FP64)",         true),
         };
 
         foreach (var (M_, N_, K_, note, fp32) in shapesToProbe)

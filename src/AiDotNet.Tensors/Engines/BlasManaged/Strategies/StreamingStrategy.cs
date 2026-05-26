@@ -72,6 +72,20 @@ internal static class StreamingStrategy
             return;
         }
 
+        // Sub-G #375 note: 64×64×64 routes here (AxisSelector picks MN_2D
+        // because neither M nor N reaches the procs×{mr,nr}×2 gate at
+        // procs=16). An M-axis parallel path was prototyped — it correctly
+        // partitions M across threads with disjoint C row-slices — but at
+        // 64³ the per-thread work (M/procs)·N·K = 32K FMAs ≈ 2 µs at AVX2
+        // peak is dwarfed by .NET ThreadPool dispatch overhead (~5-10 µs
+        // per task). Net: M-axis parallel was 4 GFLOPS, the same as
+        // serial, on this shape. The 10× gap to OpenBLAS (~30 GFLOPS,
+        // observed) is OpenBLAS using a pre-warmed persistent worker pool
+        // with µs-level dispatch — closing it requires a custom Streaming-
+        // microkernel thread pool, not a TPL Parallel.For wrapper. Tracked
+        // as a follow-up; for now the kernel-level gap on tiny cubes
+        // remains the binding Sub-G blocker on this shape family.
+
         RunSerial(a, lda, transA, b, ldb, transB, c, ldc, m, n, k);
     }
 

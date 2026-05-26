@@ -76,6 +76,24 @@ internal static class Dispatcher
         }
 
         if (k < 128) return PackingMode.ForcePackAOnly;                     // 96×128×64-style
+
+        // Sub-G follow-on: medium-M wide-shape pattern. At k≥256 with
+        // moderate M (128-256) and substantially larger N and K, PackBoth
+        // amortises its pack-B cost poorly — M/mr reuse is small while
+        // N×K pack-B work is huge. PackAOnly skips the pack-B hit and
+        // parallelises over N effectively. A/B measured wins:
+        //   - 128×768×768 FP64: PackAOnly@8thr 97.8 vs PackBoth-default 22 (4.4×)
+        //   - 197×768×768 FP32: PackAOnly 118 vs PackBoth 87 (1.4×)
+        // Tight gate (m≥128 AND k≥256) keeps the rule narrow:
+        //   - Doesn't trigger for BERT_FFN_up 1024×3072×768 (m=1024 ≥ k=768
+        //     so m<k is false anyway), preserving Auto's 217 GFLOPS.
+        //   - Doesn't trigger for ResNet50_bwd_dW 64×147×3136 (m=64 <128),
+        //     letting PackBoth's 22.9 GFLOPS stand vs PackAOnly's 21.2.
+        //   - Doesn't trigger for 32×2048×256 FP64 (m=32 <128), preserving
+        //     the existing PackBoth route.
+        if (m >= 128 && m <= 256 && k >= 256 && m < k && m < n)
+            return PackingMode.ForcePackAOnly;
+
         return PackingMode.ForcePackBoth;
     }
 }
