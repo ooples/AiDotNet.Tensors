@@ -1,16 +1,19 @@
 using System;
+#if NET5_0_OR_GREATER
 using System.Buffers;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics.X86;
 using AiDotNet.Tensors.Helpers;
+#endif
 
 namespace AiDotNet.Tensors.Engines.BlasManaged;
 
 /// <summary>
 /// Sub-S (#409): routes qualifying FP64 GEMMs to the hand-emitted machine-code
-/// 6×8 microkernel (~57 GFLOPS, ~95% of OpenBLAS — see <see cref="MachineCodeFmaKernel"/>).
-/// First-party machine code; falls back to the existing managed strategy for any
-/// shape that doesn't qualify, so it can only add speed, never change results.
+/// 6×8 microkernel (~57 GFLOPS/core, ~95% of OpenBLAS — see
+/// <see cref="MachineCodeFmaKernel"/>). First-party machine code; falls back to
+/// the existing managed strategy for any shape that doesn't qualify, so it can
+/// only add speed, never change results.
 ///
 /// <para>
 /// Strict qualification (everything else → caller's existing path):
@@ -18,14 +21,21 @@ namespace AiDotNet.Tensors.Engines.BlasManaged;
 /// no pre-pack handle, and m % 6 == 0 && n % 8 == 0 (tile-aligned — tail handling
 /// is a follow-up). The emitted kernel is built once and cached for the process.
 /// </para>
+///
+/// <para>
+/// Requires function pointers + x86 intrinsics, so the kernel path is net5.0+
+/// only; on net471 <see cref="TryGemmFp64"/> always returns false and callers use
+/// the managed strategy.
+/// </para>
 /// </summary>
 internal static class MachineKernelGemm
 {
-    private const int Mr = 6, Nr = 8;
-    private const int KcBlock = 256; // K-blocking so packed panels stay cache-resident.
-
     /// <summary>Master switch (default on). Set false to force the managed path everywhere.</summary>
     internal static bool Enabled { get; set; } = true;
+
+#if NET5_0_OR_GREATER
+    private const int Mr = 6, Nr = 8;
+    private const int KcBlock = 256; // K-blocking so packed panels stay cache-resident.
 
     private static readonly object _lock = new();
     private static bool _initTried;
@@ -122,4 +132,13 @@ internal static class MachineKernelGemm
             ArrayPool<double>.Shared.Return(packB);
         }
     }
+#else
+    /// <summary>net471 has no x86 intrinsics / function pointers — always defer to managed.</summary>
+    internal static bool TryGemmFp64(
+        ReadOnlySpan<double> a, int lda, bool transA,
+        ReadOnlySpan<double> b, int ldb, bool transB,
+        Span<double> c, int ldc,
+        int m, int n, int k,
+        bool hasEpilogue, bool hasPrePack) => false;
+#endif
 }
