@@ -287,6 +287,27 @@ public static class BlasManaged
         if (strategy == PackingMode.ForcePackAOnly && transB)
             strategy = PackingMode.ForcePackBoth;
 
+        // Sub-G (#375): Streaming per-call-overhead fast path. Streaming streams A
+        // and B in place — it uses no packing/blocking params (mc/nc/kc) and no
+        // microkernel tile (mr/nr), and handles its own M/N tails internally. So
+        // for any shape SelectStrategy routes to Streaming (small shapes above the
+        // TinyShapeWorkThreshold, thin-K tall-skinny, etc.), the PickMicrokernelTile
+        // + partial-M/N split + AutotuneDispatcher.Decide work below is pure
+        // overhead — and Decide does a JSON disk write on a cache miss, which on a
+        // ~60 µs streaming GEMM dwarfs the actual compute. Dispatch directly here.
+        if (strategy == PackingMode.ForceStreaming)
+        {
+            StreamingStrategy.Run<T>(
+                a, lda, transA,
+                b, ldb, transB,
+                c, ldc,
+                m, n, k,
+                in options);
+            var streamingFastEpilogue = options.Epilogue;
+            EpilogueChain.Apply<T>(c, ldc, m, n, in streamingFastEpilogue);
+            return;
+        }
+
         // Pick SIMD-aware (mr, nr) for PackBoth using the AVX-512 → AVX2 → Neon → scalar
         // hierarchy. Fall back to (4, 4) scalar only when the shape is too small for
         // the SIMD tile to even start (m < mr or n < nr), or when m is not an exact
