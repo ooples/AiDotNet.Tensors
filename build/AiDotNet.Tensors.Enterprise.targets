@@ -230,16 +230,15 @@
              Properties="Configuration=Release"
              RemoveProperties="TargetFramework" />
     <ItemGroup>
-      <!-- The NuGet-convention auto-import shim (build/<PackageId>.targets) plus
-           the actual gate it forwards to. -->
-      <None Include="$(MSBuildThisFileDirectory)AiDotNet.Tensors.targets">
-        <Pack>true</Pack>
-        <PackagePath>build\</PackagePath>
-      </None>
-      <None Include="$(MSBuildThisFileDirectory)AiDotNet.Tensors.Enterprise.targets">
-        <Pack>true</Pack>
-        <PackagePath>build\</PackagePath>
-      </None>
+      <!-- ONLY the validator DLL closure is added dynamically — those files
+           don't exist until the validator is built above, and the
+           System.Text.Json/BouncyCastle closure can't be hand-enumerated. The
+           two static .targets (this file + the AiDotNet.Tensors.targets shim)
+           are packed as STATIC <None> items in src/AiDotNet.Tensors.csproj so
+           the NuGet-convention build/AiDotNet.Tensors.targets is always present
+           regardless of pack-target ordering (fixes NU5129 under
+           GeneratePackageOnBuild). Do NOT re-add them here — that would
+           double-pack and trip NU5118. -->
       <None Include="$(MSBuildThisFileDirectory)LicenseValidator\bin\*.dll">
         <Pack>true</Pack>
         <PackagePath>build\LicenseValidator\bin\</PackagePath>
