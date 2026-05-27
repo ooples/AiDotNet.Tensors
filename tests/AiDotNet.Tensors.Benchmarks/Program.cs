@@ -133,6 +133,11 @@ class Program
             PyTorchComparison.GapInvestigationBench.SelectStrategyHotPath();
             return;
         }
+        if (args[0] == "--hybrid-win")
+        {
+            PyTorchComparison.GapInvestigationBench.HybridWin();
+            return;
+        }
 
         // Issue #403 Phase A.3: per-substep allocation profile + shape catalog
         // for one pass through the DCGAN-step probe substeps. Cheap to run

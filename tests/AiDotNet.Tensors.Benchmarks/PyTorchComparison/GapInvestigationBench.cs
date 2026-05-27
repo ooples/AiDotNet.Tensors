@@ -178,6 +178,72 @@ internal static class GapInvestigationBench
         Console.WriteLine($"  → sub-µs (<1000 ns) = fine; multi-µs = disk-read-per-call regression.");
     }
 
+    /// <summary>
+    /// #375: demonstrate the hybrid win. Over a set of TRANSPOSED shapes (the ones the hybrid
+    /// governs) spanning regimes where different strategies win, compare three policies on
+    /// aggregate wall-clock: always-Streaming, always-PackBoth, and hybrid Auto (per-shape
+    /// routing via the table/learned cache). If hybrid beats BOTH fixed policies, that is the
+    /// real value — no single static strategy is right for all shapes, and the hybrid picks
+    /// the right one per shape. Honest: if hybrid only ties the best fixed policy, the win is
+    /// marginal and we say so.
+    /// </summary>
+    public static void HybridWin()
+    {
+        Console.WriteLine("=== Hybrid win: per-shape routing vs best single fixed strategy (transposed) ===");
+        Console.WriteLine($"Host: {AiDotNet.Tensors.Helpers.Autotune.HardwareFingerprint.Current}");
+        // Transposed shapes spanning regimes: small (Streaming-optimal) + ThinK/large
+        // (PackBoth-optimal). A fixed policy is wrong for one end or the other.
+        var shapes = new (int M, int N, int K)[]
+        {
+            (96, 128, 64), (128, 128, 128), (160, 160, 96),   // small/cube → Streaming wins
+            (512, 512, 64), (384, 384, 96), (256, 256, 128),  // ThinK/medium → PackBoth wins
+        };
+
+        double TimeShape(int M, int N, int K, PackingMode? forced)
+        {
+            var rng = new Random(7);
+            var a = new double[M * K];
+            var b = new double[N * K]; // [N,K] transB
+            var c = new double[M * N];
+            for (int i = 0; i < a.Length; i++) a[i] = rng.NextDouble() * 2 - 1;
+            for (int i = 0; i < b.Length; i++) b[i] = rng.NextDouble() * 2 - 1;
+            var opts = forced is { } f
+                ? new AiDotNet.Tensors.Engines.BlasManaged.BlasOptions<double> { PackingMode = f }
+                : default;
+            for (int w = 0; w < 10; w++)
+                AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.Gemm<double>(a, K, false, b, K, true, c, N, M, N, K, opts);
+            double best = double.MaxValue;
+            for (int rep = 0; rep < 11; rep++)
+            {
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                for (int i = 0; i < 30; i++)
+                    AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.Gemm<double>(a, K, false, b, K, true, c, N, M, N, K, opts);
+                sw.Stop();
+                best = Math.Min(best, sw.Elapsed.TotalMilliseconds);
+            }
+            return best;
+        }
+
+        double streamTot = 0, packTot = 0, hybridTot = 0;
+        Console.WriteLine($"  {"shape",-16}{"Streaming",12}{"PackBoth",12}{"Hybrid",12}{"routed",10}");
+        foreach (var s in shapes)
+        {
+            double st = TimeShape(s.M, s.N, s.K, PackingMode.ForceStreaming);
+            double pb = TimeShape(s.M, s.N, s.K, PackingMode.ForcePackBoth);
+            var routed = AiDotNet.Tensors.Engines.BlasManaged.Dispatcher.SelectStrategy<double>(s.M, s.N, s.K, false, true, default);
+            double hy = TimeShape(s.M, s.N, s.K, null); // Auto → hybrid routing
+            streamTot += st; packTot += pb; hybridTot += hy;
+            Console.WriteLine($"  {$"{s.M}x{s.N}x{s.K}",-16}{st,12:F3}{pb,12:F3}{hy,12:F3}{routed,10}");
+        }
+        Console.WriteLine($"  {"TOTAL ms",-16}{streamTot,12:F2}{packTot,12:F2}{hybridTot,12:F2}");
+        double bestFixed = Math.Min(streamTot, packTot);
+        Console.WriteLine();
+        Console.WriteLine($"  best single fixed policy: {bestFixed:F2} ms; hybrid: {hybridTot:F2} ms");
+        Console.WriteLine($"  → hybrid is {bestFixed / hybridTot:F2}× vs the best single fixed strategy.");
+        Console.WriteLine($"    (>1.0 = real win: the hybrid picks the right strategy per shape; a single");
+        Console.WriteLine($"     fixed choice is wrong for one regime or the other.)");
+    }
+
     /// <summary>Diagnose whether the autotune Decide cache hits on repeated calls.</summary>
     public static void CacheProbe()
     {
