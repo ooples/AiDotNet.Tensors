@@ -50,6 +50,12 @@ class Program
             return;
         }
 
+        if (args[0] == "--ab-aiseval-dopsweep")
+        {
+            AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.DopSweep();
+            return;
+        }
+
         // Softmax<double> micro-benchmark — same-process measurement
         // for the new SoftmaxRowDoubleUnsafe SIMD kernel.
         if (args[0] == "--ab-softmax-double")
