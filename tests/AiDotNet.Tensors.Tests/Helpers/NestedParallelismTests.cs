@@ -122,7 +122,9 @@ public class NestedParallelismTests
 
         var outSpan = task.Result.AsSpan();
         for (int i = 0; i < outSpan.Length; i++)
-            Assert.True(float.IsFinite(outSpan[i]), $"output[{i}] is not finite ({outSpan[i]}).");
+            // float.IsFinite is unavailable on net471 — use the NaN/Inf primitives.
+            Assert.True(!float.IsNaN(outSpan[i]) && !float.IsInfinity(outSpan[i]),
+                $"output[{i}] is not finite ({outSpan[i]}).");
     }
 
     [Fact]
