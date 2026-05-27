@@ -279,7 +279,10 @@ public static class BlasManaged
             }
         }
 
-        PackingMode strategy = Dispatcher.SelectStrategy(m, n, k, options);
+        // #375 hybrid: pass transA/transB so the learned-strategy cache key matches the
+        // actual call (the shapes reaching strategy selection are typically transposed —
+        // Sub-S already handled non-transposed aligned GEMM above).
+        PackingMode strategy = Dispatcher.SelectStrategy(m, n, k, transA, transB, in options);
 
         // PackAOnly does not support transB=true in Phase B — fall back to
         // PackBoth (which absorbs the transpose into its pack) or Streaming

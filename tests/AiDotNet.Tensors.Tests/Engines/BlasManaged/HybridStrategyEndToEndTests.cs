@@ -40,4 +40,18 @@ public class HybridStrategyEndToEndTests
             Assert.True(Math.Abs(reference[i] - c[i]) < 1e-9,
                 $"mismatch at {i}: ref {reference[i]} got {c[i]}");
     }
+
+    [Fact]
+    public void LearnedCache_Overrides_Table()
+    {
+        // Store a learned entry differing from the table's default, then assert
+        // SelectStrategy returns the learned strategy (precedence learned > table).
+        const int M = 200, N = 200, K = 64;  // table → Streaming on this box; learned → PackBoth
+        var shape = BlasManagedAutotune.EncodeShape<float>(M, N, K, false, false, 0, 0, false,
+            AiDotNet.Tensors.Helpers.BlasProvider.IsDeterministicMode);
+        BlasManagedAutotune.StoreStrategy(shape, PackingMode.ForcePackBoth, ParallelismAxis.M,
+            64, 64, 64, 8, BlasKernelVersion.Current);
+        var opts = default(BlasOptions<float>);
+        Assert.Equal(PackingMode.ForcePackBoth, Dispatcher.SelectStrategy<float>(M, N, K, in opts));
+    }
 }

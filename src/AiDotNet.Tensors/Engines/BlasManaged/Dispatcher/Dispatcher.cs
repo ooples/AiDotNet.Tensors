@@ -27,7 +27,15 @@ internal static class Dispatcher
     /// not <see cref="PackingMode.Auto"/>; otherwise applies the default
     /// heuristic.
     /// </summary>
+    /// <summary>
+    /// No-transpose overload (transA = transB = false). Existing call sites and tests
+    /// that don't thread the transpose flags use this; it routes via the trans-aware path.
+    /// </summary>
     public static PackingMode SelectStrategy<T>(int m, int n, int k, in BlasOptions<T> options)
+        where T : unmanaged
+        => SelectStrategy<T>(m, n, k, transA: false, transB: false, in options);
+
+    public static PackingMode SelectStrategy<T>(int m, int n, int k, bool transA, bool transB, in BlasOptions<T> options)
         where T : unmanaged
     {
         if (options.PackingMode != PackingMode.Auto)
@@ -44,6 +52,16 @@ internal static class Dispatcher
         // #375 hybrid: a supplied pre-pack handle MUST be consumed via the packing
         // path — Streaming/PackAOnly ignore a packed B, which would silently drop it.
         if (hasPrePack) return PackingMode.ForcePackBoth;
+
+        // #375 hybrid layer 1 (highest precedence): learned / shipped-prewarm entry for
+        // THIS shape on THIS fingerprint. KernelVersion-gated inside TryLookupStrategy.
+        // Strategy routing is tile-independent → encode with mr=nr=0; the background
+        // autotuner (Phase 3) stores under the same key.
+        var shapeKey = BlasManagedAutotune.EncodeShape<T>(
+            m, n, k, transA, transB, mr: 0, nr: 0, hasEpilogue: false,
+            isDeterministic: Helpers.BlasProvider.IsDeterministicMode);
+        var learned = BlasManagedAutotune.TryLookupStrategy(shapeKey);
+        if (learned is { } e) return e.Mode;
 
         // #375 hybrid: route via the per-hardware seed table (the cold-start tier of the
         // unified (hardwareKey, shapeBucket) → strategy map). Replaces the static
