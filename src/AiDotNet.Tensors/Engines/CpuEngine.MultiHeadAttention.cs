@@ -194,13 +194,15 @@ public partial class CpuEngine
             var kHeadTensor = WrapAsTensor(kHeadBuf, batch, numHeads, seqLen, dHead);
             var vHeadTensor = WrapAsTensor(vHeadBuf, batch, numHeads, seqLen, dHead);
 
-            var attnTensor = ScaledDotProductAttention<float>(
+            // Zero-alloc SDPA (#476): write softmax(Q·Kᵀ·scale)·V straight into the
+            // pooled attnHeadBuf — no attention-weights tensor, no SDPA output tensor,
+            // no copy. scale defaults to 1/sqrt(dHead), matching ScaledDotProductAttention.
+            double scaleVal = 1.0 / Math.Sqrt(dHead);
+            ScaledDotProductAttentionFloatInto(
                 qHeadTensor, kHeadTensor, vHeadTensor,
-                mask: mask, scale: null, out _);
-
-            // Copy SDPA output ([B, H, seq, dHead]) into our pooled buffer
-            // so the inverse-transpose is a contiguous read pass.
-            attnTensor.AsSpan().Slice(0, qkvElems).CopyTo(attnHeadBuf.AsSpan(0, qkvElems));
+                mask, scaleVal,
+                batch, numHeads, seqLen, dHead, seqLen, dHead,
+                attnHeadBuf, 0);
 
             // ---- Inverse transpose: [B, H, seq, dHead] -> [B*seq, dModel]. ----
             InverseTransposeQkv(attnHeadBuf, concatBuf, batch, seqLen, numHeads, dHead);

@@ -53,6 +53,50 @@ public class MultiHeadAttentionForwardTests
     }
 
     [Fact]
+    public void MultiHeadAttentionForward_ZeroAllocSdpa_AllocationBelowThreshold()
+    {
+        // #476: the zero-alloc SDPA path must not allocate the per-call [B,H,Sq,Sk]
+        // attention-weights tensor or a separate SDPA output tensor. At the AIsEval
+        // shape the old path allocated ~7.3 MB/call (dominated by the SDPA
+        // scores/softmax + output tensors); the fix does in-place softmax in pooled
+        // scratch and writes P·V straight into the pooled MHA buffer.
+        const int batch = 128, seq = 32, dModel = 64, numHeads = 4;
+        var rng = new Random(2026);
+        var input = MakeRandom(rng, batch, seq, dModel);
+        var qW = MakeRandom(rng, dModel, dModel);
+        var kW = MakeRandom(rng, dModel, dModel);
+        var vW = MakeRandom(rng, dModel, dModel);
+        var oW = MakeRandom(rng, dModel, dModel);
+
+        // Warm up: JIT, fill ArrayPool buckets, prime AutoTensorCache.
+        for (int w = 0; w < 12; w++)
+            _ = _engine.MultiHeadAttentionForward(input, qW, kW, vW, oW, numHeads);
+
+#if NET5_0_OR_GREATER
+        const int iters = 20;
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        for (int i = 0; i < iters; i++)
+            _ = _engine.MultiHeadAttentionForward(input, qW, kW, vW, oW, numHeads);
+        long after = GC.GetAllocatedBytesForCurrentThread();
+        double perCallKb = (after - before) / (double)iters / 1024.0;
+        _output.WriteLine($"MHA per-call allocation (steady state): {perCallKb:F1} KB " +
+                          $"(old SDPA scores+softmax+output path was ~7.3 MB/call)");
+
+        // Old path ≈ 7.3 MB/call. After the fix the only sizeable per-call allocation
+        // is the returned [B,seq,dModel] result tensor (~1 MB here); the ~3 MB SDPA
+        // weights+output scratch is gone. 2 MB is a comfortable bar — far below the
+        // old profile, above the inherent result allocation, robust to pool/GC noise.
+        Assert.True(perCallKb < 2048.0,
+            $"MHA allocated {perCallKb:F1} KB/call — expected < 2048 KB (zero-alloc SDPA regressed?).");
+#else
+        // GC.GetAllocatedBytesForCurrentThread is net5+; the allocation assertion runs
+        // on net10.0. On net471 just exercise the path (correctness is covered by the
+        // decomposed-chain tests).
+        _ = _engine.MultiHeadAttentionForward(input, qW, kW, vW, oW, numHeads);
+#endif
+    }
+
+    [Fact]
     public void MultiHeadAttentionForward_MatchesDecomposedChain()
     {
         // Small shape that runs the decomposed reference quickly.
