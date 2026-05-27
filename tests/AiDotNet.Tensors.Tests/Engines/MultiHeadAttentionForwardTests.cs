@@ -135,6 +135,152 @@ public class MultiHeadAttentionForwardTests
             _engine.MultiHeadAttentionForward(input, goodW, goodW, goodW, goodW, numHeads: 0));
     }
 
+    // ===================== Issue #468 regression =====================
+    // Before the fix, MultiHeadAttentionForwardFloat wrapped its ArrayPool-rented
+    // scratch (qHead/kHead/vHead) with the exact logical shape. ArrayPool returns a
+    // BUCKET-sized array (rounded up to a power of 2), and the Tensor ctor validates
+    // data.Length == product(shape) exactly — so it threw "The number of values does
+    // not match the specified shape" whenever batch*heads*seq*dHead was not a power
+    // of 2, i.e. every non-power-of-2 sequence length. The fix wraps EXACTLY
+    // product(shape) elements as a zero-copy Memory view. These tests prove the fused
+    // primitive is numerically correct (vs the decomposed chain) across power-of-2
+    // AND non-power-of-2 lengths, multiple batch/head/dModel shapes, single-token
+    // and masked edge cases — not merely that it stops throwing.
+
+    [Theory]
+    [InlineData(1)]    // degenerate single token
+    [InlineData(2)]    // power of 2  (worked pre-fix)
+    [InlineData(3)]    // NOT pow2    (threw pre-fix)
+    [InlineData(5)]    // NOT pow2    (exact issue #468 repro length)
+    [InlineData(6)]
+    [InlineData(7)]
+    [InlineData(8)]    // power of 2
+    [InlineData(12)]
+    [InlineData(16)]   // power of 2
+    [InlineData(31)]
+    [InlineData(32)]   // power of 2
+    [InlineData(100)]  // common non-pow2 transformer length
+    [InlineData(128)]  // power of 2
+    public void MultiHeadAttentionForward_AnySeqLen_MatchesDecomposedChain(int seqLen)
+    {
+        const int batch = 2, dModel = 16, numHeads = 4;
+        var rng = new Random(1000 + seqLen);
+        var input = MakeRandom(rng, batch, seqLen, dModel);
+        var qW = MakeRandom(rng, dModel, dModel);
+        var kW = MakeRandom(rng, dModel, dModel);
+        var vW = MakeRandom(rng, dModel, dModel);
+        var oW = MakeRandom(rng, dModel, dModel);
+
+        var fused = _engine.MultiHeadAttentionForward(input, qW, kW, vW, oW, numHeads);
+        var reference = DecomposedChain(input, qW, kW, vW, oW, numHeads);
+
+        Assert.Equal(new[] { batch, seqLen, dModel }, fused.Shape.ToArray());
+        AssertClose(fused, reference, atol: 1e-4f);
+    }
+
+    [Fact]
+    public void MultiHeadAttentionForward_IssueRepro_SeqLen5_DoesNotThrowAndIsCorrect()
+    {
+        // The exact shape from issue #468: batch=1, seqLen=5 (not pow2), embed=32, heads=4.
+        const int batch = 1, seqLen = 5, embed = 32, numHeads = 4;
+        var rng = new Random(468);
+        var input = MakeRandom(rng, batch, seqLen, embed);
+        var qW = MakeRandom(rng, embed, embed);
+        var kW = MakeRandom(rng, embed, embed);
+        var vW = MakeRandom(rng, embed, embed);
+        var oW = MakeRandom(rng, embed, embed);
+
+        // Pre-fix: ArgumentException "The number of values does not match the specified shape".
+        var ex = Record.Exception(() => _engine.MultiHeadAttentionForward(input, qW, kW, vW, oW, numHeads));
+        Assert.Null(ex);
+
+        var fused = _engine.MultiHeadAttentionForward(input, qW, kW, vW, oW, numHeads);
+        AssertClose(fused, DecomposedChain(input, qW, kW, vW, oW, numHeads), atol: 1e-4f);
+    }
+
+    [Theory]
+    // (batch, seqLen, dModel, numHeads) — each chosen so batch*heads*seqLen*dHead is
+    // NOT a power of 2, and spanning batch>1, several head counts and dModel sizes.
+    [InlineData(3, 5, 12, 3)]    // qkvElems = 3·3·5·4   = 180
+    [InlineData(2, 7, 24, 4)]    //           2·4·7·6   = 336
+    [InlineData(1, 100, 32, 4)]  //           1·4·100·8 = 3200
+    [InlineData(4, 13, 48, 6)]   //           4·6·13·8  = 2496
+    [InlineData(5, 3, 8, 2)]     //           5·2·3·4   = 120
+    [InlineData(2, 6, 6, 3)]     //           2·3·6·2   = 72
+    [InlineData(3, 9, 30, 5)]    //           3·5·9·6   = 810
+    public void MultiHeadAttentionForward_VariousNonPow2Shapes_MatchesDecomposedChain(
+        int batch, int seqLen, int dModel, int numHeads)
+    {
+        var rng = new Random(batch * 1000 + seqLen * 31 + dModel * 7 + numHeads);
+        var input = MakeRandom(rng, batch, seqLen, dModel);
+        var qW = MakeRandom(rng, dModel, dModel);
+        var kW = MakeRandom(rng, dModel, dModel);
+        var vW = MakeRandom(rng, dModel, dModel);
+        var oW = MakeRandom(rng, dModel, dModel);
+
+        var fused = _engine.MultiHeadAttentionForward(input, qW, kW, vW, oW, numHeads);
+        var reference = DecomposedChain(input, qW, kW, vW, oW, numHeads);
+
+        Assert.Equal(new[] { batch, seqLen, dModel }, fused.Shape.ToArray());
+        AssertClose(fused, reference, atol: 1e-4f);
+    }
+
+    [Theory]
+    [InlineData(5)]
+    [InlineData(7)]
+    [InlineData(12)]
+    [InlineData(31)]
+    public void MultiHeadAttentionForward_NonPow2SeqLen_WithCausalMask_MatchesDecomposedChain(int seqLen)
+    {
+        const int batch = 2, dModel = 16, numHeads = 4;
+        var rng = new Random(2000 + seqLen);
+        var input = MakeRandom(rng, batch, seqLen, dModel);
+        var qW = MakeRandom(rng, dModel, dModel);
+        var kW = MakeRandom(rng, dModel, dModel);
+        var vW = MakeRandom(rng, dModel, dModel);
+        var oW = MakeRandom(rng, dModel, dModel);
+
+        // Causal mask [B, H, seq, seq]: query i attends to key j <= i.
+        var mask = new Tensor<bool>(new[] { batch, numHeads, seqLen, seqLen });
+        var maskSpan = mask.AsWritableSpan();
+        for (int b = 0; b < batch; b++)
+            for (int h = 0; h < numHeads; h++)
+                for (int i = 0; i < seqLen; i++)
+                    for (int j = 0; j < seqLen; j++)
+                        maskSpan[((b * numHeads + h) * seqLen + i) * seqLen + j] = j <= i;
+
+        var fused = _engine.MultiHeadAttentionForward(input, qW, kW, vW, oW, numHeads, mask);
+        var reference = DecomposedChain(input, qW, kW, vW, oW, numHeads, mask);
+
+        Assert.Equal(new[] { batch, seqLen, dModel }, fused.Shape.ToArray());
+        AssertClose(fused, reference, atol: 1e-4f);
+    }
+
+    [Fact]
+    public void MultiHeadAttentionForward_NonPow2SeqLen_AcrossManyLengths_NeverThrows()
+    {
+        // Sweep every length 1..40 (most are non-pow2) to lock the pattern: the
+        // pre-fix failure was "OK iff seqLen is a power of 2", so a contiguous sweep
+        // is the strongest guard against the bucket-size regression reappearing.
+        const int batch = 2, dModel = 16, numHeads = 4;
+        for (int seqLen = 1; seqLen <= 40; seqLen++)
+        {
+            var rng = new Random(7000 + seqLen);
+            var input = MakeRandom(rng, batch, seqLen, dModel);
+            var qW = MakeRandom(rng, dModel, dModel);
+            var kW = MakeRandom(rng, dModel, dModel);
+            var vW = MakeRandom(rng, dModel, dModel);
+            var oW = MakeRandom(rng, dModel, dModel);
+
+            var ex = Record.Exception(() =>
+            {
+                var fused = _engine.MultiHeadAttentionForward(input, qW, kW, vW, oW, numHeads);
+                Assert.Equal(new[] { batch, seqLen, dModel }, fused.Shape.ToArray());
+            });
+            Assert.True(ex is null, $"seqLen={seqLen} threw: {ex?.GetType().Name}: {ex?.Message}");
+        }
+    }
+
     // ----------------- Helpers -----------------
 
     private static Tensor<float> MakeRandom(Random rng, params int[] shape)
