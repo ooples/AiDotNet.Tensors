@@ -193,6 +193,14 @@ internal static class BlasManagedAutotune
     // strategy is picked up immediately on the next call.
     private static readonly ConcurrentDictionary<ShapeProfile, StrategyChoice?> _strategyMemo = new();
 
+    /// <summary>
+    /// Cap on the in-memory strategy memo (#375 G4 consistency). Real workloads have a
+    /// bounded set of distinct GEMM shapes (dozens–hundreds); this only trips on an
+    /// adversarial dynamic-shape stream. On overflow the memo is cleared (it repopulates
+    /// from disk per shape on demand) rather than growing unbounded.
+    /// </summary>
+    private const int StrategyMemoCap = 8192;
+
     public static void StoreStrategy(ShapeProfile shape, PackingMode mode, ParallelismAxis axis,
         int mc, int nc, int kc, int threadCount, string kernelVersion)
     {
@@ -222,6 +230,7 @@ internal static class BlasManagedAutotune
 
         EnsurePrewarmLoaded();
         StrategyChoice? result = LookupStrategyOnDisk(shape);
+        if (_strategyMemo.Count >= StrategyMemoCap) _strategyMemo.Clear(); // bound memory
         _strategyMemo[shape] = result;  // memoize hit or miss (null)
         return result is { } r ? (r.Mode, r.Axis, r.Mc, r.Nc, r.Kc, r.ThreadCount) : null;
     }
