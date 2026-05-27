@@ -59,16 +59,20 @@ where the machine kernel is unavailable).
 
 | Component | File | Responsibility |
 |---|---|---|
-| `StrategyDefaultTable` (new) | `Engines/BlasManaged/Dispatcher/StrategyDefaultTable.cs` | Hardcoded `SimdClass → routing params` map (streaming work cutoff, streaming-k cutoff, special-case flags). Seeded from measured AVX2 data; AVX512 / Ryzen-AVX2 / NEON / scalar entries added as measured. Pure function, no I/O. |
-| `HardwareFingerprint.SimdClass` (extend) | `Helpers/Autotune/HardwareFingerprint.cs` | Coarse SIMD-class accessor (`avx512`/`avx2`/`sse2`/`neon`/`scalar`) — the table key, independent of CPU count. |
-| `PersistentStrategyCache` (extend `BlasManagedAutotune`) | `Engines/BlasManaged/Autotune/BlasManagedAutotune.cs` | Add `PackingMode` to the persisted per-(shape,fingerprint) record; `TryGetStrategy` / `StoreStrategy`. Reuses the existing `~/.aidotnet/autotune/{fp}/` JSON format and fingerprint isolation. |
-| `BackgroundAutotuner` (new) | `Engines/BlasManaged/Autotune/BackgroundAutotuner.cs` | Single bounded background worker. Dequeues (shape, fp), sweeps Streaming/PackAOnly/PackBoth on freshly-allocated scratch buffers, times each (best of N), writes the winner to `PersistentStrategyCache`. Never touches caller data. |
-| `SightingTracker` (new, same file) | `Engines/BlasManaged/Autotune/BackgroundAutotuner.cs` | Concurrent shape→count; gates measurement to the 2nd+ sighting so one-shot shapes never sweep. |
-| Pre-warm pipeline (new) | benchmark `--prewarm-autotune` mode + shipped-resource loader | CI sweeps the catalog per fingerprint, writes cache files; package ships them; on startup, if no user cache exists for the current fingerprint, seed `PersistentStrategyCache` from the shipped resource. |
+| `StrategyDefaultTable` (new) | `Engines/BlasManaged/Dispatcher/StrategyDefaultTable.cs` | Hardcoded `(simd, vendor, cpuBucket) → routing params` map (streaming work cutoff, streaming-k cutoff, special-case flags). **Keyed on `{simd, vendor, cpuBucket}`, NOT SIMD class alone — see G1.** Seeded from measured AVX2-Intel data; AVX2-AMD (Ryzen), AVX512, NEON, scalar entries added as measured. Unknown keys fall back to the nearest coarser entry (same simd, any vendor) then a conservative scalar default. Pure function, no I/O. |
+| `HardwareFingerprint` (extend) | `Helpers/Autotune/HardwareFingerprint.cs` | Add `SimdClass`, `Vendor`, and `CpuBucket` accessors (cpuBucket = small/medium/large core-count bands, e.g. `≤4 / 5–16 / >16`) — together the table key. The full per-machine fingerprint string still keys the on-disk cache. |
+| `PersistentStrategyCache` (extend `BlasManagedAutotune`) | `Engines/BlasManaged/Autotune/BlasManagedAutotune.cs` | Add `PackingMode` to the persisted per-(shape,fingerprint) record; `TryGetStrategy` / `StoreStrategy`. **Cache key includes a `KernelVersion` token (G2)** so a kernel/build change invalidates stale tunings instead of serving a now-suboptimal strategy forever. Reuses `~/.aidotnet/autotune/{fp}/` and adds the version to the record (mismatched-version entries are ignored on read and overwritten on next measure). |
+| `BackgroundAutotuner` (new) | `Engines/BlasManaged/Autotune/BackgroundAutotuner.cs` | Single bounded background worker at **below-normal thread priority (G3)**. Dequeues (shape, fp), sweeps Streaming/PackAOnly/PackBoth on freshly-allocated scratch buffers **in the serving path's current `BlasMode` (G5)**, times each (best of N), writes the winner + KernelVersion to `PersistentStrategyCache`. **Skips shapes above a work ceiling (G3)** — large shapes already route well via the table and their sweep is too expensive to run under load. Never touches caller data. De-dups via an in-flight set (G4). |
+| `SightingTracker` (new, same file) | `Engines/BlasManaged/Autotune/BackgroundAutotuner.cs` | **Bounded LRU** (cap ~4096 shapes) shape→count (G4) — no unbounded growth on dynamic-shape workloads. Gates measurement to the 2nd+ sighting so one-shot shapes never sweep, and holds the in-flight de-dup set so concurrent first-callers enqueue a shape once. |
+| Pre-warm pipeline (new) | benchmark `--prewarm-autotune` mode + shipped-resource loader | CI sweeps the catalog per fingerprint, writes cache files tagged with the current `KernelVersion`; package ships them; on startup, if no *version-matching* user cache entry exists for the current fingerprint, seed `PersistentStrategyCache` from the shipped resource. Shipped entries seed only when absent locally (local learned entries win). |
 
-**Storage split:** the **default table is hardcoded C#** (small curated arch set, type-safe,
-zero I/O); the **learned + pre-warm cache is on-disk** (reuses the existing autotune
-persistence format and fingerprint directory layout).
+**Storage split:** the **default table is hardcoded C#** (small curated `{simd,vendor,cpuBucket}`
+set, type-safe, zero I/O); the **learned + pre-warm cache is on-disk** (reuses the existing
+autotune persistence format and fingerprint directory layout, plus the new KernelVersion tag).
+
+**KernelVersion (G2):** a build-stamped constant (e.g. assembly-info hash or a manually-bumped
+`BlasKernelVersion` int incremented whenever a microkernel/strategy/blocking change lands).
+Both the on-disk learned cache and the shipped pre-warm carry it; reads ignore mismatches.
 
 ## 5. Data flow, threading, error handling
 
@@ -76,7 +80,17 @@ persistence format and fingerprint directory layout).
   same-shape buffers** (fixed seed) — never the caller's A/B/C — so a concurrent
   measurement cannot corrupt a live GEMM. One bounded worker; queue cap ~64; enqueue is a
   non-blocking try-add that drops on full (measurement is best-effort). Trigger only on the
-  2nd+ sighting of a shape.
+  2nd+ sighting of a shape, de-duplicated via an in-flight set.
+- **Contention control (G3).** The worker runs at `ThreadPriority.BelowNormal`. It
+  **skips shapes whose work (M·N·K) exceeds a ceiling** (default ~8M) — large shapes
+  already route well from the table and a multi-strategy sweep of them under load is exactly
+  the latency-stealing case we must avoid; their tuning, if wanted, comes from the offline
+  pre-warm pipeline, not live background measurement. The worker also yields between
+  candidates so a busy box deprioritises tuning behind real work.
+- **Measurement fidelity (G5).** The sweep runs in the **same `BlasMode`** (deterministic
+  vs fast) the serving path is using, so the measured winner reflects the real parallel
+  path. Isolated cache state is an accepted approximation — strategy choice is coarse and
+  cache-residency effects are second-order for it; this is documented, not hidden.
 - **Correctness invariant.** Every strategy the hybrid can pick produces **bit-identical**
   results (they are the same kernels) — table vs learned vs measured routing changes only
   speed, never output. This is the central safety property and a required test.
@@ -93,28 +107,36 @@ persistence format and fingerprint directory layout).
 
 ## 6. Testing
 
-- `StrategyDefaultTable`: each SIMD class returns the expected route for representative
-  shapes (the catalog worst-loss set).
-- `PersistentStrategyCache`: store strategy → reload → hit; fingerprint isolation (entry
-  for one fp not served to another).
+- `StrategyDefaultTable`: each `{simd,vendor,cpuBucket}` key returns the expected route for
+  representative shapes; **distinct entries for AVX2-Intel vs AVX2-AMD (G1 regression test)**;
+  unknown-key fallback chain (exact → same-simd → scalar).
+- `PersistentStrategyCache`: store strategy → reload → hit; fingerprint isolation; **a
+  KernelVersion mismatch is ignored on read (G2 regression test)**.
 - `BackgroundAutotuner` + `SightingTracker`: no enqueue on 1st sighting; enqueue on 2nd;
-  cache populated after the worker runs; **caller C buffer is never mutated by a concurrent
-  measurement**; serving thread latency unaffected (assertion).
+  **concurrent first-callers enqueue once (dedup, G4)**; **large shape above the work ceiling
+  is never enqueued (G3)**; **LRU evicts beyond cap (G4)**; cache populated after the worker
+  runs; **caller C buffer is never mutated by a concurrent measurement**; serving thread
+  latency unaffected (assertion).
 - `SelectStrategy` precedence: learned > table; prepack → PackBoth; explicit mode honored.
-- Pre-warm: a shipped cache file seeds the persistent cache on a fresh fingerprint.
+- Pre-warm: a shipped cache file seeds the persistent cache on a fresh fingerprint; a
+  version-mismatched shipped file is not seeded.
 - **Bit-exactness invariant**: identical output regardless of which layer chose the
   strategy (table / learned / measured), across FP32 and FP64.
 
 ## 7. Phasing (all on PR #462)
 
-1. `StrategyDefaultTable` + `HardwareFingerprint.SimdClass` + wire `SelectStrategy` →
-   replaces the static k≤128/work<1M heuristic with a per-SIMD-class table (matches MKL
-   static, resolves the collision deterministically).
-2. Extend `BlasManagedAutotune` to persist + consult `PackingMode` → cross-restart
-   persistence.
-3. `BackgroundAutotuner` + `SightingTracker` → non-blocking background learning (the
-   differentiator torch.compile can't match).
-4. Pre-warm pipeline → optimal-on-arrival for catalog shapes per fingerprint.
+1. **Lever check + `StrategyDefaultTable` + `{simd,vendor,cpuBucket}` fingerprint keys +
+   wire `SelectStrategy`.** Begin with a quick instrumented measurement of how much
+   real-workload GEMM bypasses Sub-S and reaches strategy selection (G6) — this both
+   validates the investment and identifies which shapes the table must cover. Then replace
+   the static k≤128/work<1M heuristic with the per-`{simd,vendor,cpuBucket}` table (matches
+   MKL static, resolves the collision deterministically — distinct Intel/AMD entries).
+2. Extend `BlasManagedAutotune` to persist + consult `PackingMode`, with the `KernelVersion`
+   tag → cross-restart persistence that self-invalidates on kernel changes (G2).
+3. `BackgroundAutotuner` + bounded-LRU `SightingTracker` → non-blocking, contention-controlled,
+   mode-matched background learning (the differentiator torch.compile can't match), with the
+   G3/G4/G5 hardening above.
+4. Pre-warm pipeline → optimal-on-arrival for catalog shapes per fingerprint (version-tagged).
 
 ## 8. Non-goals
 
@@ -123,11 +145,20 @@ persistence format and fingerprint directory layout).
 - Changing the Sub-S machine-code path or the kernels themselves.
 - A networked/shared tuning service — persistence is local-disk + shipped-resource only.
 
-## 9. Risks
+## 9. Risks (post-hardening)
 
-- **Background-thread contention** with the serving workload on a fully-loaded box. Mitigated
-  by a single bounded worker, 2nd-sighting gating, and best-effort drop-on-full.
-- **Table staleness** across kernel changes — the table is a *default*, superseded by
-  measured cache entries, so staleness self-heals on hardware that runs measurement.
+- **Background-thread contention** (G3) — mitigated by below-normal priority, a work-ceiling
+  skip for large shapes, single bounded worker, 2nd-sighting + dedup gating, and
+  drop-on-full. Residual risk on a 100%-pinned box is bounded to small-shape sweeps at low
+  priority; offline pre-warm covers large shapes instead.
+- **Learned-cache staleness** across kernel changes (G2) — the `KernelVersion` tag
+  invalidates mismatched entries on read, so a kernel change can't serve a stale strategy.
+- **Default-table staleness** — the hardcoded table is a *default*, superseded by measured
+  cache entries; it self-heals on hardware that runs measurement, and a wrong table entry
+  only costs a suboptimal-but-correct strategy until measurement overrides it.
+- **Lever size** (G6) — strategy selection is a smaller lever than kernel quality, and Sub-S
+  already handles aligned plain GEMM. Phase 1's lever check quantifies the real win before
+  Phases 3–4 invest; if the bypass-coverage is small, Phases 3–4 can be deferred.
 - **Cross-session collision on the dispatcher** (parallel agents on #462) — mitigated by
   landing the table behind a clean new file and keeping `SelectStrategy` edits minimal.
+- **Dynamic-shape memory** (G4) — bounded-LRU `SightingTracker` caps growth.
