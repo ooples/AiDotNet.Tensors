@@ -48,4 +48,24 @@ public class BackgroundAutotunerTests
         t.RecordAndShouldMeasure(nt);
         Assert.False(t.RecordAndShouldMeasure(tt)); // transB variant is a separate 1st sighting
     }
+
+    [Fact]
+    public void ShouldMeasureSize_SkipsLargeShapes()
+    {
+        // Work ceiling ~8M: large shapes get offline pre-warm, not live background sweep (G3).
+        Assert.False(BackgroundAutotuner.ShouldMeasureSize(1024, 3072, 768));
+        Assert.True(BackgroundAutotuner.ShouldMeasureSize(96, 128, 64));
+    }
+
+    [Fact]
+    public void Measure_PopulatesCache_TransAware()
+    {
+        // A transB shape's measurement must store under the transB key (so a transB
+        // call's learned-cache consult actually hits it).
+        var id = new SightingTracker.ShapeId(80, 80, 96, Fp64: true, TransA: false, TransB: true);
+        BackgroundAutotuner.MeasureNowForTest(id);
+        var shape = BlasManagedAutotune.EncodeShape<double>(80, 80, 96, false, true, 0, 0, false,
+            AiDotNet.Tensors.Helpers.BlasProvider.IsDeterministicMode);
+        Assert.NotNull(BlasManagedAutotune.TryLookupStrategy(shape));
+    }
 }
