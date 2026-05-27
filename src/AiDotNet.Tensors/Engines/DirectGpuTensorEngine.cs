@@ -13820,6 +13820,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
     }
 
+    // Reduces a synchronously-downloaded per-row loss vector to the single scalar mean (CpuEngine
+    // loss contract). Downloads (not FinishGpuOp's deferred array) because the values are read now.
+    private static Tensor<T> ScalarMeanResult<T>(IDirectGpuBackend backend, OwnedBuffer perRowBuf, int count)
+    {
+        float[] perRow = backend.DownloadBuffer(perRowBuf.Buffer);
+        double acc = 0.0;
+        for (int i = 0; i < count; i++) acc += perRow[i];
+        var numOps = MathHelper.GetNumericOperations<T>();
+        return new Tensor<T>(new[] { numOps.FromDouble(acc / count) }, new[] { 1 });
+    }
+
     public override Tensor<T> TensorL1Loss<T>(Tensor<T> predictions, Tensor<T> targets)
     {
         if (IsTapeActive<T>()) return base.TensorL1Loss(predictions, targets);
@@ -13832,10 +13843,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             int numFeatures = predictions.Length / batchSize;
             using var bufP = GetOrAllocateBuffer(backend, predictions.GetDataArray());
             using var bufT = GetOrAllocateBuffer(backend, targets.GetDataArray());
-            var bufOut = AllocateOutputBuffer(backend, batchSize);
+            using var bufOut = AllocateOutputBuffer(backend, batchSize);
             backend.L1Loss(bufP.Buffer, bufT.Buffer, bufOut.Buffer, batchSize, numFeatures);
-            var result = FinishGpuOp<T>(backend, bufOut, batchSize);
-            return new Tensor<T>(result, new[] { batchSize });
+            // Kernel returns per-row means; CpuEngine contract is a single scalar = mean over ALL
+            // elements. With equal-length rows that equals the mean of the per-row means.
+            return ScalarMeanResult<T>(backend, bufOut, batchSize);
         }
         catch (Exception)
         {
@@ -13855,10 +13867,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             int numFeatures = predictions.Length / batchSize;
             using var bufP = GetOrAllocateBuffer(backend, predictions.GetDataArray());
             using var bufT = GetOrAllocateBuffer(backend, targets.GetDataArray());
-            var bufOut = AllocateOutputBuffer(backend, batchSize);
+            using var bufOut = AllocateOutputBuffer(backend, batchSize);
             backend.HuberLoss(bufP.Buffer, bufT.Buffer, bufOut.Buffer, batchSize, numFeatures, (float)delta);
-            var result = FinishGpuOp<T>(backend, bufOut, batchSize);
-            return new Tensor<T>(result, new[] { batchSize });
+            // Reduce per-row means to the single scalar mean over all elements (CpuEngine contract).
+            return ScalarMeanResult<T>(backend, bufOut, batchSize);
         }
         catch (Exception)
         {
@@ -15294,7 +15306,33 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (IsTapeActive<T>()) return base.TensorLogSumExp(tensor, axis, keepDims);
         if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb))
-        { try { int rank=tensor.Rank; int ea=axis<0?rank+axis:axis; int outerSize=1; for(int i=0;i<ea;i++)outerSize*=tensor.Shape._dims[i]; int reduceSize=tensor.Shape._dims[ea]; var gi=UploadTensorRaw(bb, tensor); var go=bb.AllocateBuffer(outerSize); bb.LogSumExpAxis(gi,go,outerSize,reduceSize); int[] outShape; if(keepDims){outShape=(int[])tensor.Shape._dims.Clone();outShape[ea]=1;}else{outShape=new int[rank-1]; for(int i=0,j=0;i<rank;i++) if(i!=ea) outShape[j++]=tensor.Shape._dims[i];} return DeferTensorResult<T>(bb,go,outerSize,outShape); } catch{} }
+        { try { int rank=tensor.Rank; int ea=axis<0?rank+axis:axis;
+            // The GPU kernel (LogSumExpAxis) reduces `reduceSize` CONTIGUOUS elements per group,
+            // which is only correct when `ea` is the LAST axis. For an interior axis the elements
+            // along it are strided and there are trailing dims the kernel ignores, so the result is
+            // garbage — fall back to the CPU reduction in that case.
+            if (ea == rank-1) {
+                int outerSize=1; for(int i=0;i<ea;i++)outerSize*=tensor.Shape._dims[i];
+                int reduceSize=tensor.Shape._dims[ea];
+                var gi=UploadTensorRaw(bb, tensor);
+                var go=bb.AllocateBuffer(outerSize);
+                // Ownership transfer pattern: dispose `go` if anything throws
+                // between Allocate and DeferTensorResult (LogSumExpAxis kernel
+                // launch, shape-array construction). Without this guard the
+                // outer empty catch{} swallowed the exception and silently
+                // leaked the native GPU buffer. CodeRabbit PRRT_kwDOQ-aYaM6ExmA_.
+                bool transferredOwnership = false;
+                try {
+                    bb.LogSumExpAxis(gi,go,outerSize,reduceSize);
+                    int[] outShape;
+                    if(keepDims){outShape=(int[])tensor.Shape._dims.Clone();outShape[ea]=1;}
+                    else{outShape=new int[rank-1]; for(int i=0,j=0;i<rank;i++) if(i!=ea) outShape[j++]=tensor.Shape._dims[i];}
+                    transferredOwnership = true;
+                    return DeferTensorResult<T>(bb,go,outerSize,outShape);
+                }
+                finally { if (!transferredOwnership) go.Dispose(); }
+            }
+        } catch{} }
         return base.TensorLogSumExp(tensor,axis,keepDims);
     }
 

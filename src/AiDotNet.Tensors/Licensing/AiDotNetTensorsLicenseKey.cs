@@ -73,6 +73,20 @@ public sealed class AiDotNetTensorsLicenseKey
     public bool EnableTelemetry { get; set; } = true;
 
     /// <summary>
+    /// When <c>true</c>, the online validation response MUST carry a valid RSA
+    /// signature over the client's per-request nonce (see
+    /// <see cref="LicenseResponseVerifier"/>); an unsigned or bad-signature
+    /// response is treated as <see cref="LicenseKeyStatus.Invalid"/>. This
+    /// closes the server-spoof / MITM bypass of the online path. Defaults to
+    /// <c>false</c> for backward compatibility — enable it only once the
+    /// license server is deployed with response signing (see
+    /// <c>docs/enterprise/license-server-response-signing.md</c>). High-assurance
+    /// deployments should prefer the fully-offline signed entitlement
+    /// (<see cref="SignedEntitlement"/>), which needs no server at all.
+    /// </summary>
+    public bool RequireSignedResponse { get; set; }
+
+    /// <summary>
     /// Creates a new license key with the supplied string.
     /// </summary>
     /// <param name="key">The license key string. Must not be null,
