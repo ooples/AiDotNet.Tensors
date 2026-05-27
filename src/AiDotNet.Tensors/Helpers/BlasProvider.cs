@@ -635,7 +635,11 @@ internal static class BlasProvider
 
     private static bool ProbeNativeLibrary()
     {
-        if (!_blasOptIn) return false;
+        if (!_blasOptIn)
+        {
+            _loadError = "native CPU BLAS disabled via AIDOTNET_USE_BLAS opt-out";
+            return false;
+        }
         try
         {
             // Call into native with a trivially-small 1×1 gemm to verify the
@@ -646,11 +650,31 @@ internal static class BlasProvider
             var c = new float[] { 0.0f };
             cblas_sgemm_native(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                 1, 1, 1, 1.0f, a, 1, b, 1, 0.0f, c, 1);
-            return c[0] == 6.0f;
+            if (c[0] == 6.0f) return true;
+            _loadError = $"native CPU BLAS loaded but returned an incorrect result for the 1x1 probe GEMM (expected 6.0, got {c[0]}) — the library may be corrupt or ABI-incompatible";
+            return false;
         }
-        catch (DllNotFoundException) { return false; }
-        catch (EntryPointNotFoundException) { return false; }
-        catch (BadImageFormatException) { return false; }
+        // Issue #444: capture WHY the native library failed to load so the
+        // diagnostic surface (NativeLibraryDetector / PlatformDetector) can
+        // distinguish "package not installed" from a transitive-dependency
+        // load failure (e.g. a missing libgcc/libgfortran/pthread runtime that
+        // makes Win32 LoadLibrary fail with ERROR_MOD_NOT_FOUND (126) even
+        // though libopenblas.dll itself is present on disk).
+        catch (DllNotFoundException ex)
+        {
+            _loadError = $"native CPU BLAS module not found (the package may not be installed, or a dependent runtime DLL is missing): {ex.Message}";
+            return false;
+        }
+        catch (EntryPointNotFoundException ex)
+        {
+            _loadError = $"native CPU BLAS loaded but the cblas_sgemm entry point is missing (unexpected library or version): {ex.Message}";
+            return false;
+        }
+        catch (BadImageFormatException ex)
+        {
+            _loadError = $"native CPU BLAS architecture mismatch (e.g. x86 DLL in an x64 process): {ex.Message}";
+            return false;
+        }
     }
 
     /// <summary>
@@ -993,6 +1017,65 @@ internal static class BlasProvider
 
     /// <summary>True iff <c>AIDOTNET_USE_BLAS=1</c> is set AND libopenblas loaded successfully.</summary>
     internal static bool IsAvailable => _nativeAvailable.Value;
+
+    /// <summary>
+    /// Issue #444: the reason the native CPU BLAS probe failed, or <c>null</c> when it
+    /// succeeded (or has not run yet). Forcing <see cref="IsAvailable"/> first guarantees
+    /// the probe has run before this is read. Surfaced by
+    /// <see cref="Engines.NativeLibraryDetector.OpenBlasLoadDiagnostic"/> so consumers can
+    /// tell "package not installed" apart from a transitive-dependency load failure.
+    /// </summary>
+    private static volatile string? _loadError;
+
+    /// <summary>
+    /// Issue #444: human-readable reason the native CPU BLAS is unavailable, or <c>null</c>
+    /// when it loaded successfully. Reading this forces the (lazy) load probe to run.
+    /// </summary>
+    internal static string? LoadError
+    {
+        get
+        {
+            _ = _nativeAvailable.Value; // ensure the probe (which sets _loadError) has run
+            return _loadError;
+        }
+    }
+
+    /// <summary>
+    /// Issue #444: true when the active, successfully-loaded native CPU BLAS is OpenBLAS
+    /// (the default provider — i.e. <c>AIDOTNET_BLAS_PROVIDER</c> is not set to an MKL
+    /// variant). This is the signal the engine's GEMM dispatch actually gates on, so the
+    /// diagnostic surface stays consistent with the path real matmul takes.
+    /// </summary>
+    internal static bool IsOpenBlasActive
+    {
+        get
+        {
+#if NET5_0_OR_GREATER
+            return _nativeAvailable.Value && !_preferMkl;
+#else
+            // net471 has no DllImport resolver redirect, so the native library
+            // bound by the libopenblas DllImports is always OpenBLAS.
+            return _nativeAvailable.Value;
+#endif
+        }
+    }
+
+    /// <summary>
+    /// Issue #444: true when the active, successfully-loaded native CPU BLAS is Intel MKL
+    /// (<c>AIDOTNET_BLAS_PROVIDER=mkl*</c>, which redirects the libopenblas DllImports to
+    /// MklImports via a resolver — NET5+ only).
+    /// </summary>
+    internal static bool IsMklActive
+    {
+        get
+        {
+#if NET5_0_OR_GREATER
+            return _nativeAvailable.Value && _preferMkl;
+#else
+            return false;
+#endif
+        }
+    }
 
     internal static string BackendName => _nativeAvailable.Value
         ? "OpenBLAS (AIDOTNET_USE_BLAS=1)"
