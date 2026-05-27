@@ -1,4 +1,5 @@
 using System;
+using AiDotNet.Tensors.Helpers.Autotune;
 
 namespace AiDotNet.Tensors.Engines.BlasManaged;
 
@@ -40,51 +41,18 @@ internal static class Dispatcher
         // Streaming routes below are gated on !hasPrePack; PackBoth/PackAOnly consume it.
         bool hasPrePack = options.PackedA != null || options.PackedB != null;
 
-        // Sub-C (#371, PR #464): small total work → pack-free Streaming. Below
-        // SmallShapeWorkThreshold (1M) the pack-A rent+pack round-trip costs more
-        // than the GEMM compute, so packing is skipped. This is the routing PR
-        // #464 introduced and that SmallShapeStreamingDispatchTests pins; a prior
-        // main→branch merge silently reverted it to a 300K cutoff (leaving the
-        // 1M constant unused), which regressed 96³/80×80×100-class shapes back to
-        // PackAOnly and turned those tests red. Restored here. Also routes
-        // 96×128×64 (786K) pack-free, which the 16-core AVX2 A/B confirms
-        // (Streaming ≫ PackAOnly).
-        long work = (long)m * n * k;
-        if (!hasPrePack && work < SmallShapeWorkThreshold) return PackingMode.ForceStreaming;
+        // #375 hybrid: a supplied pre-pack handle MUST be consumed via the packing
+        // path — Streaming/PackAOnly ignore a packed B, which would silently drop it.
+        if (hasPrePack) return PackingMode.ForcePackBoth;
 
-        // work ≥ 1M. Preserve the two special-case wins the old heuristic carried
-        // (PR #464's clean version dropped both, which would regress them):
-        //   (a) tall + thin-N, low-K → Streaming (e.g. ResNet50_layer1 3136×64×64:
-        //       Streaming ≫ PackAOnly; the very tall M streams cheaply).
-        //   (b) medium-M wide-shape, k≥256 → PackAOnly (e.g. 128×768×768: PackAOnly
-        //       ≫ PackBoth — pack-B amortises poorly at small M/mr reuse).
-        // Everything else low-K goes PackAOnly; high-K balanced goes PackBoth.
-        // (The strategy choice on 128³ / 512×512×64 is hardware-dependent — see
-        // the per-fingerprint autotune; the static default here matches #464's
-        // tests.)
-        if (!hasPrePack && k < 128 && n <= 64 && m >= 8 * n)
-            return PackingMode.ForceStreaming;                              // (a) tall + thin
-
-        if (k < 128) return PackingMode.ForcePackAOnly;                     // 512×512×64, 3136×32×32
-
-        // Sub-G follow-on: medium-M wide-shape pattern. At k≥256 with
-        // moderate M (128-256) and substantially larger N and K, PackBoth
-        // amortises its pack-B cost poorly — M/mr reuse is small while
-        // N×K pack-B work is huge. PackAOnly skips the pack-B hit and
-        // parallelises over N effectively. A/B measured wins:
-        //   - 128×768×768 FP64: PackAOnly@8thr 97.8 vs PackBoth-default 22 (4.4×)
-        //   - 197×768×768 FP32: PackAOnly 118 vs PackBoth 87 (1.4×)
-        // Tight gate (m≥128 AND k≥256) keeps the rule narrow:
-        //   - Doesn't trigger for BERT_FFN_up 1024×3072×768 (m=1024 ≥ k=768
-        //     so m<k is false anyway), preserving Auto's 217 GFLOPS.
-        //   - Doesn't trigger for ResNet50_bwd_dW 64×147×3136 (m=64 <128),
-        //     letting PackBoth's 22.9 GFLOPS stand vs PackAOnly's 21.2.
-        //   - Doesn't trigger for 32×2048×256 FP64 (m=32 <128), preserving
-        //     the existing PackBoth route.
-        if (m >= 128 && m <= 256 && k >= 256 && m < k && m < n)
-            return PackingMode.ForcePackAOnly;
-
-        return PackingMode.ForcePackBoth;
+        // #375 hybrid: route via the per-hardware seed table (the cold-start tier of the
+        // unified (hardwareKey, shapeBucket) → strategy map). Replaces the static
+        // work<1M/k<128 heuristic, which baked one machine's optimum in for all hardware
+        // (the amd-avx2-cpu16 vs cpu32 collision). The table reproduces the prior routing
+        // for unmeasured shapes and encodes the measured per-hardware wins (e.g. cpu16
+        // routes 512×512×64 / 128³ to Streaming, cpu32 to blocking). The learned cache
+        // (Phase 2) and background autotuner (Phase 3) refine this per fingerprint.
+        return StrategyDefaultTable.Route(HardwareFingerprint.Key, m, n, k);
     }
 
     /// <summary>
