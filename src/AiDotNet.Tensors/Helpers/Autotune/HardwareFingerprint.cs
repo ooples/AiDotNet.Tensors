@@ -54,8 +54,37 @@ public static class HardwareFingerprint
     /// </summary>
     internal static void InvalidateForTests()
     {
-        lock (_lock) _cachedFingerprint = null;
+        lock (_lock) { _cachedFingerprint = null; _cachedKey = null; }
     }
+
+    /// <summary>
+    /// Coarse hardware key for GEMM strategy routing: (simd, vendor, cpuBucket).
+    /// Distinct from the full fingerprint string — it is the seed-table key (#375).
+    /// </summary>
+    public readonly record struct HwKey(string Simd, string Vendor, int CpuBucket);
+
+    private static HwKey? _cachedKey;
+
+    /// <summary>The current host's coarse routing key (cached for the process lifetime).</summary>
+    public static HwKey Key
+    {
+        get
+        {
+            if (_cachedKey is { } k) return k;
+            lock (_lock)
+            {
+                _cachedKey ??= new HwKey(DetectSimdLevel(), DetectVendor(), BucketFor(Environment.ProcessorCount));
+                return _cachedKey.Value;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Core-count band for routing: 0 = ≤4 (small), 1 = 5–16 (mid), 2 = &gt;16 (large).
+    /// Separates the amd-avx2-cpu16 vs amd-avx2-cpu32 collision (#375 G1).
+    /// </summary>
+    public static int BucketFor(int processorCount)
+        => processorCount <= 4 ? 0 : processorCount <= 16 ? 1 : 2;
 
     private static string Compute()
     {
