@@ -61,6 +61,15 @@ class Program
             return;
         }
 
+        // #415 Phase F: same-process FP64 Conv2D backward probe at the 9
+        // ResNet50/VGG16 shapes from the issue. Quick-feedback sibling of
+        // the BDN-driven Conv2DBackwardDoubleBenchmarks.cs.
+        if (args[0] == "--ab-conv2d-backward-double")
+        {
+            Conv2DAbBench.RunConv2DBackwardDouble();
+            return;
+        }
+
         if (args[0] == "--ab-binary-ops")
         {
             Conv2DAbBench.RunBinaryOps();
