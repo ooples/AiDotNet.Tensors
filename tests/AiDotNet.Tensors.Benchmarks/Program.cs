@@ -38,6 +38,18 @@ class Program
             return;
         }
 
+        if (args[0] == "--ab-aiseval-diag")
+        {
+            AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.Diag();
+            return;
+        }
+
+        if (args[0] == "--ab-aiseval-floor")
+        {
+            AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.RawGemmFloor();
+            return;
+        }
+
         // Softmax<double> micro-benchmark — same-process measurement
         // for the new SoftmaxRowDoubleUnsafe SIMD kernel.
         if (args[0] == "--ab-softmax-double")
