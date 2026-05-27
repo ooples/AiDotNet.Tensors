@@ -14,6 +14,9 @@ namespace AiDotNet.Tensors.Tests.Engines.BlasManaged;
 /// asserted against the per-hardware StrategyDefaultTable with explicit keys,
 /// not as a single universal answer. Numerical equality to PackBoth is preserved.
 /// </summary>
+// DefaultDispatch/SmallShape correctness compares strategy outputs, sensitive to the
+// global reduction-order state; serialize so a concurrent mutator can't flip it (#375 de-flake).
+[Collection("BlasManaged-Stats-Serial")]
 public class SmallShapeStreamingDispatchTests
 {
     [Theory]
