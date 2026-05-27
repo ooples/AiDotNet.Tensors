@@ -32,8 +32,13 @@ namespace AiDotNet.Tensors.Benchmarks.PyTorchComparison;
 /// </summary>
 internal static class AisEvalHeadToHeadBench
 {
-    private const int Warmup = 25;
-    private const int Iters = 300;
+    private const int Warmup = 50;
+    private const int Iters = 400;
+    // Min-of-N robustness: each measurement runs Rounds independent windows and
+    // keeps the window with the lowest median — the least load-perturbed sample.
+    // Both sides are measured identically so the comparison stays fair, and a
+    // transient OS/GC/neighbor spike in one window can't decide the verdict.
+    private const int Rounds = 7;
 
     public static void Run()
     {
@@ -310,6 +315,45 @@ internal static class AisEvalHeadToHeadBench
 
     private static float[] NewAligned(int n) => new float[n];
 
+    /// <summary>
+    /// MaxDOP sweep for the managed-SimdGemm primitives (MHA, LSTM): do they
+    /// oversubscribe threads on these small-batch shapes the way OpenBLAS did
+    /// for MLP? If a low cap wins, it's a cheap production lever. Run:
+    /// --ab-aiseval-dopsweep.
+    /// </summary>
+    public static void DopSweep()
+    {
+        Console.WriteLine("=== Issue #436 — CpuParallelSettings MaxDOP sweep (MHA, LSTM) ===");
+        Console.WriteLine($"Host: cores={Environment.ProcessorCount}");
+        var engine = new CpuEngine();
+
+        const int batch = 128, seq = 32, dModel = 64, heads = 4;
+        var mIn = Tensor<float>.CreateRandom(batch, seq, dModel);
+        var qW = Tensor<float>.CreateRandom(dModel, dModel); var kW = Tensor<float>.CreateRandom(dModel, dModel);
+        var vW = Tensor<float>.CreateRandom(dModel, dModel); var oW = Tensor<float>.CreateRandom(dModel, dModel);
+        Func<Tensor<float>> mha = () => engine.MultiHeadAttentionForward(mIn, qW, kW, vW, oW, heads);
+
+        const int inF = 32, hidden = 64;
+        var lIn = Tensor<float>.CreateRandom(batch, seq, inF);
+        var wIh = Tensor<float>.CreateRandom(4 * hidden, inF);
+        var wHh = Tensor<float>.CreateRandom(4 * hidden, hidden);
+        Func<Tensor<float>> lstm = () => engine.LstmSequenceForward(lIn, null, null, wIh, wHh, null, null);
+
+        int saved = AiDotNet.Tensors.Helpers.CpuParallelSettings.MaxDegreeOfParallelism;
+        try
+        {
+            foreach (int dop in new[] { 1, 2, 4, 8, 16 })
+            {
+                if (dop > Environment.ProcessorCount) break;
+                AiDotNet.Tensors.Helpers.CpuParallelSettings.MaxDegreeOfParallelism = dop;
+                var (mm, mp) = MeasureRobust(() => mha());
+                var (lm, lp) = MeasureRobust(() => lstm());
+                Console.WriteLine($"  MaxDOP={dop,2}:  MHA med {mm,7:F3} p95 {mp,7:F3}  |  LSTM med {lm,7:F3} p95 {lp,7:F3}");
+            }
+        }
+        finally { AiDotNet.Tensors.Helpers.CpuParallelSettings.MaxDegreeOfParallelism = saved; }
+    }
+
     private static void ReportDiag(string label, Func<Tensor<float>> forward)
     {
         for (int i = 0; i < Warmup; i++) forward();
@@ -330,35 +374,37 @@ internal static class AisEvalHeadToHeadBench
     }
 
     private static (double median, double p95) TimeAi(Func<Tensor<float>> forward)
-    {
-        for (int i = 0; i < Warmup; i++) forward();
-        SettleGc();
-        var times = new double[Iters];
-        var sw = new Stopwatch();
-        for (int i = 0; i < Iters; i++)
-        {
-            sw.Restart();
-            forward();
-            sw.Stop();
-            times[i] = sw.Elapsed.TotalMilliseconds;
-        }
-        return Percentiles(times);
-    }
+        => MeasureRobust(() => forward());
 
     private static (double median, double p95) TimeTorch(Func<torch.Tensor> forward)
+        => MeasureRobust(() => forward().Dispose());
+
+    /// <summary>
+    /// Runs <see cref="Rounds"/> independent measurement windows of
+    /// <see cref="Iters"/> iterations each and returns the (median, p95) of the
+    /// window with the LOWEST median — the least load-perturbed sample. This is
+    /// the min-of-N noise-robustness contract used for both sides.
+    /// </summary>
+    private static (double median, double p95) MeasureRobust(Action run)
     {
-        for (int i = 0; i < Warmup; i++) forward().Dispose();
-        SettleGc();
-        var times = new double[Iters];
+        for (int i = 0; i < Warmup; i++) run();
         var sw = new Stopwatch();
-        for (int i = 0; i < Iters; i++)
+        double bestMedian = double.MaxValue, bestP95 = double.MaxValue;
+        for (int r = 0; r < Rounds; r++)
         {
-            sw.Restart();
-            forward().Dispose();
-            sw.Stop();
-            times[i] = sw.Elapsed.TotalMilliseconds;
+            SettleGc();
+            var times = new double[Iters];
+            for (int i = 0; i < Iters; i++)
+            {
+                sw.Restart();
+                run();
+                sw.Stop();
+                times[i] = sw.Elapsed.TotalMilliseconds;
+            }
+            var (m, p) = Percentiles(times);
+            if (m < bestMedian) { bestMedian = m; bestP95 = p; }
         }
-        return Percentiles(times);
+        return (bestMedian, bestP95);
     }
 
     private static (double median, double p95) Percentiles(double[] times)
