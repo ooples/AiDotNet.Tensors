@@ -207,4 +207,16 @@ internal static class BlasManagedAutotune
         var (axis, mc, nc, kc, tc) = DecodeChoice(choice);
         return (mode, axis, mc, nc, kc, tc);
     }
+
+    /// <summary>
+    /// #375 Phase 4: seed a strategy entry from the shipped pre-warm ONLY if no
+    /// version-matching local entry exists. Local learned entries always win — the
+    /// shipped pre-warm is a cold-start convenience, not an override.
+    /// </summary>
+    public static void SeedFromShippedIfAbsent(ShapeProfile shape, PackingMode mode,
+        ParallelismAxis axis, int mc, int nc, int kc, int threadCount)
+    {
+        if (TryLookupStrategy(shape) is not null) return;  // local/learned wins
+        StoreStrategy(shape, mode, axis, mc, nc, kc, threadCount, BlasKernelVersion.Current);
+    }
 }

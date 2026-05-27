@@ -32,4 +32,25 @@ public class HybridStrategyPersistenceTests
             64, 64, 64, 8, "stale-version-token");
         Assert.Null(BlasManagedAutotune.TryLookupStrategy(shape)); // mismatched version → miss
     }
+
+    [Fact]
+    public void SeedFromShipped_DoesNotOverwriteLocalLearnedEntry()
+    {
+        var shape = BlasManagedAutotune.EncodeShape<float>(123, 45, 67, false, false, 0, 0, false, false);
+        BlasManagedAutotune.StoreStrategy(shape, PackingMode.ForceStreaming, ParallelismAxis.M,
+            64, 64, 64, 8, BlasKernelVersion.Current);
+        // A (hypothetical) shipped PackBoth entry must NOT override the local learned one.
+        BlasManagedAutotune.SeedFromShippedIfAbsent(shape, PackingMode.ForcePackBoth, ParallelismAxis.M,
+            64, 64, 64, 8);
+        Assert.Equal(PackingMode.ForceStreaming, BlasManagedAutotune.TryLookupStrategy(shape)!.Value.Mode);
+    }
+
+    [Fact]
+    public void SeedFromShipped_SeedsWhenAbsent()
+    {
+        var shape = BlasManagedAutotune.EncodeShape<float>(124, 46, 68, false, false, 0, 0, false, false);
+        BlasManagedAutotune.SeedFromShippedIfAbsent(shape, PackingMode.ForcePackBoth, ParallelismAxis.M,
+            64, 64, 64, 8);
+        Assert.Equal(PackingMode.ForcePackBoth, BlasManagedAutotune.TryLookupStrategy(shape)!.Value.Mode);
+    }
 }
