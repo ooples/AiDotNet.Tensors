@@ -2120,8 +2120,11 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// before this is reached.
     /// </para>
     /// </summary>
+    /// <summary>Element-wise binary operation kind for the broadcast fast path.</summary>
+    private enum BroadcastOp { Add, Subtract, Multiply }
+
     private static void BroadcastElementwise(
-        Tensor<T> a, Tensor<T> b, Tensor<T> result, int[] broadcastShape, Func<T, T, T> op)
+        Tensor<T> a, Tensor<T> b, Tensor<T> result, int[] broadcastShape, BroadcastOp op)
     {
         int maxRank = broadcastShape.Length;
         int aRank = a.Rank;
@@ -2142,6 +2145,10 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         var aSpan = aContig._data.AsSpan().Slice(aContig._storageOffset, aContig.Length);
         var bSpan = bContig._data.AsSpan().Slice(bContig._storageOffset, bContig.Length);
         var rSpan = result._data.AsWritableSpan();
+
+        int total = result.Length;
+        if (total == 0) return;
+        if (maxRank == 0) { rSpan[0] = ApplyScalar(op, aSpan[0], bSpan[0]); return; }
 
         // Broadcast stride per axis: operand's row-major stride if its dim
         // matches the broadcast dim, or 0 if the dim is 1 (broadcast axis).
@@ -2164,31 +2171,233 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         }
         for (int i = 0; i < bOff; i++) bBroadStride[i] = 0;
 
-        // Walk the result tensor in row-major order. For each output offset,
-        // compute the two operand offsets from multi-dim coordinate derived
-        // from the running flat offset via the broadcast shape.
-        Span<int> coord = stackalloc int[maxRank];
-        int total = result.Length;
-        for (int flat = 0; flat < total; flat++)
+        // Coalesce trailing dims into one vectorizable inner block. The
+        // innermost result dim has result-stride 1; extend the block leftward
+        // while BOTH operands keep a uniform per-element stride across it —
+        // i.e. each operand is either fully contiguous (stride == running
+        // inner length) or constant (stride 0, a broadcast axis). This turns a
+        // BatchNorm-style [N,C,H,W] (op) [1,C,1,1] from a per-element
+        // delegate+coordinate loop into one contiguous SIMD run per (n,c),
+        // and a same-trailing-shape residual add into a single SIMD sweep.
+        int innerLen = broadcastShape[maxRank - 1];
+        int aStride = aBroadStride[maxRank - 1];
+        int bStride = bBroadStride[maxRank - 1];
+        int outerRank = maxRank - 1;
+        for (int d = maxRank - 2; d >= 0; d--)
         {
-            // Derive multi-dim coord from flat index (row-major).
-            int remaining = flat;
-            for (int d = maxRank - 1; d >= 0; d--)
+            int expectedA = aStride == 0 ? 0 : innerLen;
+            int expectedB = bStride == 0 ? 0 : innerLen;
+            if (aBroadStride[d] == expectedA && bBroadStride[d] == expectedB)
+            {
+                innerLen *= broadcastShape[d];
+                outerRank = d;
+            }
+            else break;
+        }
+        int outer = total / innerLen;
+
+        // Outer loop walks the (few) non-coalesced leading dims; the inner
+        // block is applied with SIMD (float/double) or a tight scalar+enum
+        // loop (other T) — never a per-element Func<T,T,T> delegate.
+        Span<int> coord = stackalloc int[maxRank];
+        for (int o = 0; o < outer; o++)
+        {
+            int remaining = o;
+            for (int d = outerRank - 1; d >= 0; d--)
             {
                 coord[d] = remaining % broadcastShape[d];
                 remaining /= broadcastShape[d];
             }
-
-            int aIdx = 0, bIdx = 0;
-            for (int d = 0; d < maxRank; d++)
+            int aBase = 0, bBase = 0;
+            for (int d = 0; d < outerRank; d++)
             {
-                aIdx += coord[d] * aBroadStride[d];
-                bIdx += coord[d] * bBroadStride[d];
+                aBase += coord[d] * aBroadStride[d];
+                bBase += coord[d] * bBroadStride[d];
             }
-
-            rSpan[flat] = op(aSpan[aIdx], bSpan[bIdx]);
+            ApplyInner(op, rSpan, o * innerLen, aSpan, aBase, aStride, bSpan, bBase, bStride, innerLen);
         }
     }
+
+    // _numOps is a protected static field on TensorBase<T>, so this static
+    // helper reads it directly — no need to thread it through as a parameter.
+    private static T ApplyScalar(BroadcastOp op, T x, T y)
+        => op switch
+        {
+            BroadcastOp.Add => _numOps.Add(x, y),
+            BroadcastOp.Subtract => _numOps.Subtract(x, y),
+            BroadcastOp.Multiply => _numOps.Multiply(x, y),
+            _ => _numOps.Multiply(x, y),
+        };
+
+#if NET6_0_OR_GREATER
+    // Reinterprets a Span<T> as Span<TTo> after a runtime typeof(T)==typeof(TTo)
+    // check. Tensor<T> is not struct-constrained (so MemoryMarshal.Cast is
+    // unavailable), but Unsafe.As + CreateSpan carry no constraint.
+    private static Span<TTo> ReinterpretSpan<TTo>(Span<T> s)
+        => System.Runtime.InteropServices.MemoryMarshal.CreateSpan(
+            ref System.Runtime.CompilerServices.Unsafe.As<T, TTo>(
+                ref System.Runtime.InteropServices.MemoryMarshal.GetReference(s)),
+            s.Length);
+
+    private static ReadOnlySpan<TTo> ReinterpretReadOnlySpan<TTo>(ReadOnlySpan<T> s)
+        => System.Runtime.InteropServices.MemoryMarshal.CreateReadOnlySpan(
+            ref System.Runtime.CompilerServices.Unsafe.As<T, TTo>(
+                ref System.Runtime.InteropServices.MemoryMarshal.GetReference(s)),
+            s.Length);
+#endif
+
+    // Applies the op over a contiguous inner block. aStride / bStride are each
+    // 1 (operand advances element-by-element) or 0 (operand is constant across
+    // the block — a broadcast axis). Dispatches to typed SIMD for float/double.
+    private static void ApplyInner(
+        BroadcastOp op,
+        Span<T> r, int rBase, ReadOnlySpan<T> a, int aBase, int aStride,
+        ReadOnlySpan<T> b, int bBase, int bStride, int len)
+    {
+#if NET6_0_OR_GREATER
+        // Tensor<T> is not struct-constrained, so MemoryMarshal.Cast<T,float>
+        // is illegal here. After the runtime typeof check T IS float/double, so
+        // reinterpret the span via Unsafe.As + CreateSpan (no struct constraint).
+        if (typeof(T) == typeof(float))
+        {
+            ApplyInnerFloat(op,
+                ReinterpretSpan<float>(r), rBase,
+                ReinterpretReadOnlySpan<float>(a), aBase, aStride,
+                ReinterpretReadOnlySpan<float>(b), bBase, bStride, len);
+            return;
+        }
+        if (typeof(T) == typeof(double))
+        {
+            ApplyInnerDouble(op,
+                ReinterpretSpan<double>(r), rBase,
+                ReinterpretReadOnlySpan<double>(a), aBase, aStride,
+                ReinterpretReadOnlySpan<double>(b), bBase, bStride, len);
+            return;
+        }
+#endif
+        // net471 (and non-float/double T): tight scalar+enum loop. Still avoids
+        // the per-element Func<T,T,T> delegate and benefits from the collapsed
+        // inner block (coordinate math runs per-block, not per-element).
+        for (int i = 0; i < len; i++)
+            r[rBase + i] = ApplyScalar(op,
+                a[aBase + (aStride == 0 ? 0 : i)], b[bBase + (bStride == 0 ? 0 : i)]);
+    }
+
+#if NET6_0_OR_GREATER
+    private static void ApplyInnerFloat(BroadcastOp op,
+        Span<float> r, int rBase, ReadOnlySpan<float> a, int aBase, int aStride,
+        ReadOnlySpan<float> b, int bBase, int bStride, int len)
+    {
+        int w = System.Numerics.Vector<float>.Count;
+        int i = 0;
+        if (aStride == 1 && bStride == 1)
+        {
+            for (; i + w <= len; i += w)
+            {
+                var va = new System.Numerics.Vector<float>(a.Slice(aBase + i, w));
+                var vb = new System.Numerics.Vector<float>(b.Slice(bBase + i, w));
+                VecFloat(op, va, vb).CopyTo(r.Slice(rBase + i, w));
+            }
+            for (; i < len; i++) r[rBase + i] = ScalarFloat(op, a[aBase + i], b[bBase + i]);
+        }
+        else if (aStride == 1 && bStride == 0)
+        {
+            float bs = b[bBase];
+            var vb = new System.Numerics.Vector<float>(bs);
+            for (; i + w <= len; i += w)
+            {
+                var va = new System.Numerics.Vector<float>(a.Slice(aBase + i, w));
+                VecFloat(op, va, vb).CopyTo(r.Slice(rBase + i, w));
+            }
+            for (; i < len; i++) r[rBase + i] = ScalarFloat(op, a[aBase + i], bs);
+        }
+        else if (aStride == 0 && bStride == 1)
+        {
+            float as0 = a[aBase];
+            var va = new System.Numerics.Vector<float>(as0);
+            for (; i + w <= len; i += w)
+            {
+                var vb = new System.Numerics.Vector<float>(b.Slice(bBase + i, w));
+                VecFloat(op, va, vb).CopyTo(r.Slice(rBase + i, w));
+            }
+            for (; i < len; i++) r[rBase + i] = ScalarFloat(op, as0, b[bBase + i]);
+        }
+        else
+        {
+            r.Slice(rBase, len).Fill(ScalarFloat(op, a[aBase], b[bBase]));
+        }
+    }
+
+    private static void ApplyInnerDouble(BroadcastOp op,
+        Span<double> r, int rBase, ReadOnlySpan<double> a, int aBase, int aStride,
+        ReadOnlySpan<double> b, int bBase, int bStride, int len)
+    {
+        int w = System.Numerics.Vector<double>.Count;
+        int i = 0;
+        if (aStride == 1 && bStride == 1)
+        {
+            for (; i + w <= len; i += w)
+            {
+                var va = new System.Numerics.Vector<double>(a.Slice(aBase + i, w));
+                var vb = new System.Numerics.Vector<double>(b.Slice(bBase + i, w));
+                VecDouble(op, va, vb).CopyTo(r.Slice(rBase + i, w));
+            }
+            for (; i < len; i++) r[rBase + i] = ScalarDouble(op, a[aBase + i], b[bBase + i]);
+        }
+        else if (aStride == 1 && bStride == 0)
+        {
+            double bs = b[bBase];
+            var vb = new System.Numerics.Vector<double>(bs);
+            for (; i + w <= len; i += w)
+            {
+                var va = new System.Numerics.Vector<double>(a.Slice(aBase + i, w));
+                VecDouble(op, va, vb).CopyTo(r.Slice(rBase + i, w));
+            }
+            for (; i < len; i++) r[rBase + i] = ScalarDouble(op, a[aBase + i], bs);
+        }
+        else if (aStride == 0 && bStride == 1)
+        {
+            double as0 = a[aBase];
+            var va = new System.Numerics.Vector<double>(as0);
+            for (; i + w <= len; i += w)
+            {
+                var vb = new System.Numerics.Vector<double>(b.Slice(bBase + i, w));
+                VecDouble(op, va, vb).CopyTo(r.Slice(rBase + i, w));
+            }
+            for (; i < len; i++) r[rBase + i] = ScalarDouble(op, as0, b[bBase + i]);
+        }
+        else
+        {
+            r.Slice(rBase, len).Fill(ScalarDouble(op, a[aBase], b[bBase]));
+        }
+    }
+
+    private static System.Numerics.Vector<float> VecFloat(BroadcastOp op,
+        System.Numerics.Vector<float> x, System.Numerics.Vector<float> y)
+        => op switch
+        {
+            BroadcastOp.Add => x + y,
+            BroadcastOp.Subtract => x - y,
+            BroadcastOp.Multiply => x * y,
+            _ => x * y,
+        };
+
+    private static System.Numerics.Vector<double> VecDouble(BroadcastOp op,
+        System.Numerics.Vector<double> x, System.Numerics.Vector<double> y)
+        => op switch
+        {
+            BroadcastOp.Add => x + y,
+            BroadcastOp.Subtract => x - y,
+            BroadcastOp.Multiply => x * y,
+            _ => x * y,
+        };
+
+    private static float ScalarFloat(BroadcastOp op, float x, float y)
+        => op switch { BroadcastOp.Add => x + y, BroadcastOp.Subtract => x - y, BroadcastOp.Multiply => x * y, _ => x * y };
+
+    private static double ScalarDouble(BroadcastOp op, double x, double y)
+        => op switch { BroadcastOp.Add => x + y, BroadcastOp.Subtract => x - y, BroadcastOp.Multiply => x * y, _ => x * y };
+#endif
 
     /// <summary>
     /// Calculates the arithmetic mean (average) of all values in the tensor.
@@ -3171,7 +3380,10 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
 
         // Get broadcast shape
         int[] broadcastShape = GetBroadcastShape(this._shape, other._shape);
-        var result = new Tensor<T>(broadcastShape);
+        // Pooled result — BroadcastElementwise writes every element (full
+        // coverage), so dirty rented memory is safe, and this keeps the
+        // broadcast result off the GC heap (matches the same-shape fast paths).
+        var result = TensorAllocator.Rent<T>(broadcastShape);
 
         // Span-based stride broadcast — replaces the previous
         // foreach (var index in result.GetIndices()) + indexer-per-element
@@ -3182,7 +3394,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         // Add from numOps when the two operand spans align exactly — otherwise
         // fall through to scalar per-element, but still avoiding the allocating
         // GetIndices iterator.
-        BroadcastElementwise(this, other, result, broadcastShape, _numOps.Add);
+        BroadcastElementwise(this, other, result, broadcastShape, BroadcastOp.Add);
         return result;
     }
 
@@ -3210,8 +3422,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         }
 
         int[] broadcastShape = GetBroadcastShape(this._shape, other._shape);
-        var result = new Tensor<T>(broadcastShape);
-        BroadcastElementwise(this, other, result, broadcastShape, _numOps.Subtract);
+        var result = TensorAllocator.Rent<T>(broadcastShape);
+        BroadcastElementwise(this, other, result, broadcastShape, BroadcastOp.Subtract);
         return result;
     }
 
@@ -3245,8 +3457,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         }
 
         int[] broadcastShape = GetBroadcastShape(this._shape, other._shape);
-        var result = new Tensor<T>(broadcastShape);
-        BroadcastElementwise(this, other, result, broadcastShape, _numOps.Multiply);
+        var result = TensorAllocator.Rent<T>(broadcastShape);
+        BroadcastElementwise(this, other, result, broadcastShape, BroadcastOp.Multiply);
         return result;
     }
 
