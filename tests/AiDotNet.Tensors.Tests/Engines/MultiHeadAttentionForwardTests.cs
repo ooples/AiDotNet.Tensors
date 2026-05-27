@@ -23,9 +23,10 @@ public class MultiHeadAttentionForwardTests
         _engine = new CpuEngine();
     }
 
-    [Fact(Skip = "Performance measurement — run manually with --filter MultiHeadAttentionForward_AisevalShape")]
+    [Fact]
     public void MultiHeadAttentionForward_AisevalShape_PerfMeasurement()
     {
+        if (Environment.GetEnvironmentVariable("AIDOTNET_RUN_JIT_PERF") != "1") return;
         // AIsEval Transformer per-layer attention shape:
         // [B=128, seq=32, dModel=64], numHeads=4, dHead=16.
         // PyTorch nn.TransformerEncoderLayer @ bs=128 was 13.85 ms steady-state
@@ -39,17 +40,18 @@ public class MultiHeadAttentionForwardTests
         var vW = MakeRandom(rng, dModel, dModel);
         var oW = MakeRandom(rng, dModel, dModel);
 
-        for (int w = 0; w < 3; w++)
+        for (int w = 0; w < 8; w++)
             _ = _engine.MultiHeadAttentionForward(input, qW, kW, vW, oW, numHeads);
 
-        var sw = System.Diagnostics.Stopwatch.StartNew();
-        const int iters = 10;
-        for (int i = 0; i < iters; i++)
+        double best = double.MaxValue;
+        for (int r = 0; r < 15; r++)
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
             _ = _engine.MultiHeadAttentionForward(input, qW, kW, vW, oW, numHeads);
-        sw.Stop();
-        double ms = sw.Elapsed.TotalMilliseconds / iters;
-
-        _output.WriteLine($"MultiHeadAttentionForward AIsEval shape [128,32,64] h=4: {ms:F2} ms/iter");
+            sw.Stop();
+            best = System.Math.Min(best, sw.Elapsed.TotalMilliseconds);
+        }
+        _output.WriteLine($"MHA AIsEval [128,32,64] h=4 best-of-15: {best:F2} ms (PyTorch ~2.74 ms)");
     }
 
     [Fact]

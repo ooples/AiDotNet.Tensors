@@ -141,9 +141,14 @@ public partial class CpuEngine
         int qkvElems = batch * numHeads * seqLen * dHead; // == totalRows * dModel
         var pool = ArrayPool<float>.Shared;
 
-        var qFlatBuf = pool.Rent(totalRows * dModel);  // [B*seq, dModel] GEMM output
-        var kFlatBuf = pool.Rent(totalRows * dModel);
-        var vFlatBuf = pool.Rent(totalRows * dModel);
+        // Fused QKV projection: one [B*seq, dModel] @ [dModel, 3*dModel] GEMM
+        // instead of three @ [dModel, dModel]. Reads `input` once (vs 3×), one
+        // dispatch (vs 3), and a wider N=3*dModel that the SIMD microkernel
+        // utilizes far better than N=dModel — #476 root-cause-2 (managed
+        // projection GEMM quality). Output rows are [q(dModel)|k(dModel)|v(dModel)].
+        int dModel3 = 3 * dModel;
+        var qkvFlatBuf = pool.Rent(totalRows * dModel3);
+        var fusedWBuf = pool.Rent(dModel * dModel3);    // [dModel, 3*dModel] = [qW | kW | vW]
         var qHeadBuf = pool.Rent(qkvElems);            // [B, heads, seq, dHead] post-transpose
         var kHeadBuf = pool.Rent(qkvElems);
         var vHeadBuf = pool.Rent(qkvElems);
@@ -154,37 +159,38 @@ public partial class CpuEngine
 
         try
         {
-            // ---- Q/K/V projections via direct SimdGemm calls. ----
-            // input [B*seq, dModel] @ Weight [dModel, dModel] -> [B*seq, dModel]
+            // ---- Fused Q/K/V projection. ----
+            // Concatenate [qW | kW | vW] column-wise into a [dModel, 3*dModel]
+            // weight once (cheap: dModel*3*dModel = ~48 KB at the AIsEval shape),
+            // then ONE GEMM input[B*seq, dModel] @ fusedW[dModel, 3*dModel] ->
+            // qkvFlat[B*seq, 3*dModel]. Each output row is [q|k|v].
             var inputSpan = input.AsSpan();
             int batchSeqRows = totalRows;
+            {
+                var qWS = qWeight.AsSpan();
+                var kWS = kWeight.AsSpan();
+                var vWS = vWeight.AsSpan();
+                var fW = fusedWBuf.AsSpan();
+                for (int kk = 0; kk < dModel; kk++)
+                {
+                    int dstRow = kk * dModel3;
+                    qWS.Slice(kk * dModel, dModel).CopyTo(fW.Slice(dstRow, dModel));
+                    kWS.Slice(kk * dModel, dModel).CopyTo(fW.Slice(dstRow + dModel, dModel));
+                    vWS.Slice(kk * dModel, dModel).CopyTo(fW.Slice(dstRow + 2 * dModel, dModel));
+                }
+            }
             SimdGemm.Sgemm(
                 inputSpan, dModel, false,
-                qWeight.AsSpan(), dModel, false,
-                qFlatBuf.AsSpan(0, totalRows * dModel),
-                batchSeqRows, dModel, dModel);
-            SimdGemm.Sgemm(
-                inputSpan, dModel, false,
-                kWeight.AsSpan(), dModel, false,
-                kFlatBuf.AsSpan(0, totalRows * dModel),
-                batchSeqRows, dModel, dModel);
-            SimdGemm.Sgemm(
-                inputSpan, dModel, false,
-                vWeight.AsSpan(), dModel, false,
-                vFlatBuf.AsSpan(0, totalRows * dModel),
-                batchSeqRows, dModel, dModel);
+                fusedWBuf.AsSpan(0, dModel * dModel3), dModel3, false,
+                qkvFlatBuf.AsSpan(0, totalRows * dModel3),
+                batchSeqRows, dModel, dModel3);
 
-            // ---- Transpose Q/K/V from [B*seq, dModel] = [B, seq, H, dHead]
-            // (read as 4D with strides 1, seq*H*dHead, etc) into
-            // [B, H, seq, dHead]. One tight nested loop per matrix.
-            // The mapping for output index (b, h, s, d):
-            //   src_off = (b * seq + s) * dModel + h * dHead + d
-            //   dst_off = ((b * H + h) * seq + s) * dHead + d
-            // dHead is contiguous in both layouts, so the innermost copy is
-            // a dHead-element block-copy (Span<T>.CopyTo gives us SIMD).
-            TransposeQkv(qFlatBuf, qHeadBuf, batch, seqLen, numHeads, dHead);
-            TransposeQkv(kFlatBuf, kHeadBuf, batch, seqLen, numHeads, dHead);
-            TransposeQkv(vFlatBuf, vHeadBuf, batch, seqLen, numHeads, dHead);
+            // ---- Transpose Q/K/V from the fused [B, seq, (q|k|v), H, dHead]
+            // buffer into [B, H, seq, dHead]. Row stride is 3*dModel; q/k/v
+            // live at column offsets 0 / dModel / 2*dModel within each row.
+            TransposeQkv(qkvFlatBuf, qHeadBuf, batch, seqLen, numHeads, dHead, dModel3, 0);
+            TransposeQkv(qkvFlatBuf, kHeadBuf, batch, seqLen, numHeads, dHead, dModel3, dModel);
+            TransposeQkv(qkvFlatBuf, vHeadBuf, batch, seqLen, numHeads, dHead, dModel3, 2 * dModel);
 
             // ---- SDPA. Wrap the pooled buffers as Tensor<float> views just
             // long enough to call the existing optimized primitive, which
@@ -218,9 +224,8 @@ public partial class CpuEngine
         }
         finally
         {
-            pool.Return(qFlatBuf);
-            pool.Return(kFlatBuf);
-            pool.Return(vFlatBuf);
+            pool.Return(qkvFlatBuf);
+            pool.Return(fusedWBuf);
             pool.Return(qHeadBuf);
             pool.Return(kHeadBuf);
             pool.Return(vHeadBuf);
@@ -252,12 +257,17 @@ public partial class CpuEngine
         return new Tensor<float>(new[] { d0, d1, d2, d3 }, view);
     }
 
-    private static void TransposeQkv(float[] src, float[] dst, int batch, int seq, int numHeads, int dHead)
+    private static void TransposeQkv(float[] src, float[] dst, int batch, int seq, int numHeads, int dHead,
+        int srcRowStride, int srcColOffset)
     {
-        // src layout: [B, seq, numHeads, dHead]  (linear stride: dHead, numHeads*dHead, seq*numHeads*dHead)
+        // src layout: rows of [..., q|k|v interleaved ...] with per-row stride
+        //   srcRowStride and this matrix's block starting at srcColOffset; within
+        //   the block the layout is [seq, numHeads, dHead]. For the FUSED QKV
+        //   projection srcRowStride = 3*dModel and srcColOffset picks q/k/v
+        //   (0 / dModel / 2*dModel). For an un-fused [B*seq, dModel] buffer pass
+        //   srcRowStride = numHeads*dHead and srcColOffset = 0.
         // dst layout: [B, numHeads, seq, dHead]
-        int srcStrideS = numHeads * dHead;
-        int srcStrideB = seq * srcStrideS;
+        int srcStrideB = seq * srcRowStride;
         int dstStrideH = seq * dHead;
         int dstStrideB = numHeads * dstStrideH;
 
@@ -270,7 +280,7 @@ public partial class CpuEngine
             var dstSpan = dst.AsSpan();
             for (int s = 0; s < seq; s++)
             {
-                int srcBase = b * srcStrideB + s * srcStrideS;
+                int srcBase = b * srcStrideB + s * srcRowStride + srcColOffset;
                 int dstBaseBS = b * dstStrideB + s * dHead;
                 for (int h = 0; h < numHeads; h++)
                 {
