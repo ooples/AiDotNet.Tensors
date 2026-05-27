@@ -189,33 +189,45 @@ public class FusedAttentionFp32PrecisionTests
     public void Float32Precision_IsFasterThanFp64_AtUNetShape()
     {
         if (Environment.GetEnvironmentVariable("AIDOTNET_RUN_JIT_PERF") != "1") return;
-        // SD-UNet level-1 self-attention shape from #467: seqLen large, headDim 64.
         var engine = new CpuEngine();
-        const int B = 1, H = 8, S = 1024, D = 64;
-        var q = RandomDouble(new[] { B, H, S, D }, 71);
-        var k = RandomDouble(new[] { B, H, S, D }, 72);
-        var v = RandomDouble(new[] { B, H, S, D }, 73);
         var fp64 = new FlashAttentionConfig();
         var fp32 = new FlashAttentionConfig { Float32Precision = true };
 
-        double Time(FlashAttentionConfig cfg)
+        // Representative self-attention shapes: canonical SD-UNet level-1 (#467),
+        // a longer-context variant, and a DiT-XL-style batched shape.
+        var shapes = new[]
         {
-            FusedAttention<double>.Forward(q, k, v, cfg, engine: engine); // warmup
-            double best = double.MaxValue;
-            for (int r = 0; r < 3; r++)
-            {
-                var sw = System.Diagnostics.Stopwatch.StartNew();
-                FusedAttention<double>.Forward(q, k, v, cfg, engine: engine);
-                sw.Stop();
-                best = Math.Min(best, sw.Elapsed.TotalMilliseconds);
-            }
-            return best;
-        }
+            (B: 1, H: 8,  S: 1024, D: 64),  // SD-UNet level-1 (the #467 hot path)
+            (B: 1, H: 8,  S: 2048, D: 64),  // longer context
+            (B: 4, H: 16, S: 256,  D: 72),  // DiT-XL-style batched
+        };
 
-        double tFp64 = Time(fp64);
-        double tFp32 = Time(fp32);
-        _output.WriteLine($"FusedAttention<double> [B={B},H={H},S={S},D={D}]: " +
-            $"FP64 {tFp64:F1} ms, FP32-internal {tFp32:F1} ms ({tFp64 / tFp32:F2}× faster)");
+        _output.WriteLine("shape [B,H,S,D]            FP64 ms   FP32 ms   speedup");
+        foreach (var (B, H, S, D) in shapes)
+        {
+            var q = RandomDouble(new[] { B, H, S, D }, 71);
+            var k = RandomDouble(new[] { B, H, S, D }, 72);
+            var v = RandomDouble(new[] { B, H, S, D }, 73);
+
+            double Time(FlashAttentionConfig cfg)
+            {
+                FusedAttention<double>.Forward(q, k, v, cfg, engine: engine); // warmup
+                double best = double.MaxValue;
+                for (int r = 0; r < 5; r++)
+                {
+                    var sw = System.Diagnostics.Stopwatch.StartNew();
+                    FusedAttention<double>.Forward(q, k, v, cfg, engine: engine);
+                    sw.Stop();
+                    best = Math.Min(best, sw.Elapsed.TotalMilliseconds);
+                }
+                return best;
+            }
+
+            double tFp64 = Time(fp64);
+            double tFp32 = Time(fp32);
+            _output.WriteLine($"[{B},{H},{S},{D}]".PadRight(26) +
+                $"{tFp64,7:F1}   {tFp32,7:F1}   {tFp64 / tFp32,5:F2}×");
+        }
     }
 
     // ----------------- Helpers -----------------
