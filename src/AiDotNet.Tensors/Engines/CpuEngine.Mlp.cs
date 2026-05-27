@@ -83,6 +83,19 @@ public partial class CpuEngine
                 "MlpForward is inference-only and does not yet support GradientTape. " +
                 "For training, call the decomposed FusedLinear / DenseLayer path which records each layer.");
 
+        // Issue #436: small-batch inference GEMMs are oversubscribed by the
+        // default all-cores native-BLAS thread count. On a 16-core box the
+        // AIsEval MLP (bs=128) measured ~1.74 ms at 16 threads vs ~1.20 ms at
+        // 8 — the per-GEMM thread-fan-out/sync cost dominates the tiny actual
+        // compute (the 128×10×128 head is almost pure overhead). Cap the native
+        // BLAS thread count to roughly one thread per 16 output rows (so each
+        // thread keeps a cache-resident M-stripe of useful work), clamped to the
+        // core count, for the span of the forward. The scope restores the prior
+        // count on exit and is reference-counted for nested/concurrent callers.
+        int rows = input.Rank >= 1 ? input._shape[0] : 1;
+        int blasThreads = Math.Clamp(rows / 16, 1, Environment.ProcessorCount);
+        using var _blasScope = Helpers.BlasProvider.ScopeOpenBlasThreads(blasThreads);
+
         // Chain the fused linear layers. FusedLinear validates each weight /
         // bias shape against the running activation, so a layer-to-layer
         // feature mismatch surfaces as a clear per-layer ArgumentException.
