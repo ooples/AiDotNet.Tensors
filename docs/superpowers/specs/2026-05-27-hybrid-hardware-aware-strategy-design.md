@@ -268,3 +268,18 @@ have caught at the time:
 - The hybrid's end-to-end *speedup* on real transposed workloads is **not yet demonstrated** —
   only routing correctness, no-regression on the Sub-S path, and sub-µs dispatch are verified.
   The lever is bounded (~1/6 catalog shapes reach strategy selection).
+
+## 12. Limitations addressed + win demonstrated (follow-up)
+
+- **Memo unbounded → fixed.** `_strategyMemo` now caps at 8192 entries (clear-on-overflow);
+  only trips on an adversarial dynamic-shape stream.
+- **EnableAutotuneV2 redundancy → removed.** The earlier opt-in Gemm-level autotune
+  (`EnableAutotuneV2` + `AutotuneCacheV2` + synchronous warmup sweep) was deleted; the hybrid
+  (per-fingerprint, disk-persistent, non-blocking, default-on) supersedes it.
+- **Hybrid win → demonstrated** (`--hybrid-win`, 6 transposed shapes, 16-core AVX2):
+  always-Streaming 365 ms, always-PackBoth 122 ms, **hybrid (per-shape) 110 ms**. The hybrid is
+  **3.3× vs always-Streaming** (it never makes the catastrophic 512×512×64-transB Streaming
+  choice) and **1.11× vs the best single fixed strategy** (it picks Streaming for small shapes
+  and PackBoth for ThinK). Honest: the edge over the best fixed policy is modest; the dominant
+  value is avoiding the wrong static choice a hardware-agnostic heuristic would make on some
+  shape/hardware.
