@@ -74,6 +74,57 @@ public static class CpuParallelSettings
     public const int MinChunkSize = 8192;
 
     /// <summary>
+    /// Thread-local flag: true while the calling thread is executing a body
+    /// dispatched by one of this class's parallel loops. Nested parallel calls
+    /// inspect it and run serially.
+    /// </summary>
+    /// <remarks>
+    /// <b>Why this exists (nested-parallelism deadlock):</b> several kernels run
+    /// an outer <see cref="ParallelForOrSerial(int,int,long,Action{int})"/> and,
+    /// inside each iteration, call another parallel primitive — e.g. the float
+    /// <c>ScaledDotProductAttention</c> parallelizes over batch·heads and each head
+    /// runs a (multi-threaded) BlasManaged GEMM. Without this guard the outer
+    /// workers occupy every ThreadPool thread and then block waiting on the inner
+    /// loop's tasks, which can't get a thread to run on. The pool only recovers by
+    /// slowly injecting new threads (~1/500ms), so the op crawls for minutes. The
+    /// double SDPA path avoided this by hand-calling a sequential inner kernel; this
+    /// guard generalizes that: once inside a parallel region, nested parallel loops
+    /// collapse to serial automatically.
+    /// </remarks>
+    [ThreadStatic]
+    private static bool _inParallelRegion;
+
+    /// <summary>
+    /// True when the calling thread is already running inside a parallel region
+    /// dispatched by this class. Raw <c>Parallel.For</c> sites (e.g. the BlasManaged
+    /// GEMM strategies) consult this to fall back to a serial loop when nested,
+    /// preventing ThreadPool starvation. See <see cref="EnterParallelRegion"/>.
+    /// </summary>
+    public static bool IsInParallelRegion => _inParallelRegion;
+
+    /// <summary>
+    /// Marks the calling thread as inside a parallel region until the returned
+    /// scope is disposed, restoring the prior value on dispose. Wrap the body of
+    /// any <c>Parallel.For</c> worker with this so nested parallel calls serialize.
+    /// </summary>
+    internal static ParallelRegionScope EnterParallelRegion() => new ParallelRegionScope(true);
+
+    /// <summary>
+    /// RAII scope toggling <see cref="IsInParallelRegion"/>. Struct (no allocation);
+    /// restores the previous value on <see cref="Dispose"/> so it nests correctly.
+    /// </summary>
+    internal readonly struct ParallelRegionScope : IDisposable
+    {
+        private readonly bool _previous;
+        internal ParallelRegionScope(bool entering)
+        {
+            _previous = _inParallelRegion;
+            _inParallelRegion = entering;
+        }
+        public void Dispose() => _inParallelRegion = _previous;
+    }
+
+    /// <summary>
     /// Executes a parallel for loop with chunked iterations.
     /// </summary>
     /// <param name="length">Total number of elements to process.</param>
@@ -92,7 +143,9 @@ public static class CpuParallelSettings
             throw new ArgumentNullException(nameof(action));
 
         int maxDegree = MaxDegreeOfParallelism;
-        if (maxDegree <= 1 || length <= minChunkSize)
+        // Nested call (already inside a parallel region) → serial, to avoid
+        // ThreadPool starvation. See _inParallelRegion.
+        if (maxDegree <= 1 || length <= minChunkSize || _inParallelRegion)
         {
             // Single-threaded execution
             action(0, length);
@@ -111,6 +164,7 @@ public static class CpuParallelSettings
 
         Parallel.For(0, numChunks, new ParallelOptions { MaxDegreeOfParallelism = maxDegree }, i =>
         {
+            using var _region = EnterParallelRegion();
             int start = i * chunkSize;
             int count = Math.Min(chunkSize, length - start);
             if (count > 0)
@@ -118,6 +172,41 @@ public static class CpuParallelSettings
                 action(start, count);
             }
         });
+    }
+
+    /// <summary>
+    /// Runs <paramref name="body"/> for each <c>p</c> in <c>[0, count)</c> across
+    /// threads — but serially when the calling thread is already inside a parallel
+    /// region (<see cref="IsInParallelRegion"/>) or parallelism is pinned off.
+    /// Each parallel worker marks itself in-region so its own nested loops serialize.
+    /// </summary>
+    /// <remarks>
+    /// For the BlasManaged GEMM strategies, which partition a fixed work count
+    /// (<c>procs</c>) and always want all of it parallel at the top level, but must
+    /// collapse to serial when invoked from inside another parallel loop (e.g. the
+    /// per-head GEMM in float ScaledDotProductAttention) to avoid ThreadPool
+    /// starvation. Unlike <see cref="ParallelForOrSerial(int,int,long,Action{int})"/>
+    /// there is no grain-size gate — the caller has already decided this work is
+    /// worth parallelizing.
+    /// </remarks>
+    /// <param name="count">Number of partitions / iterations.</param>
+    /// <param name="body">Body invoked with each partition index.</param>
+    public static void ParallelForRegion(int count, Action<int> body)
+    {
+        if (count <= 0) return;
+        if (body is null) throw new ArgumentNullException(nameof(body));
+        if (count == 1 || MaxDegreeOfParallelism <= 1 || _inParallelRegion)
+        {
+            for (int p = 0; p < count; p++) body(p);
+            return;
+        }
+        Parallel.For(0, count,
+            new ParallelOptions { MaxDegreeOfParallelism = MaxDegreeOfParallelism },
+            p =>
+            {
+                using var _region = EnterParallelRegion();
+                body(p);
+            });
     }
 
     /// <summary>
@@ -186,7 +275,10 @@ public static class CpuParallelSettings
         // mid-call can't toggle us between the serial and parallel paths.
         int maxDegree = MaxDegreeOfParallelism;
         bool deterministic = DeterministicReductions;
-        if (maxDegree <= 1 || deterministic || totalWork < PersistentParallelExecutor.DefaultSerialGrainSize)
+        // _inParallelRegion: a nested call (this thread is already a parallel
+        // worker) runs serial to avoid ThreadPool starvation. See its docs.
+        if (maxDegree <= 1 || deterministic || _inParallelRegion
+            || totalWork < PersistentParallelExecutor.DefaultSerialGrainSize)
         {
             // Match Parallel.For's exception semantics: capture
             // first thrown exception, finish remaining iterations,
@@ -207,7 +299,13 @@ public static class CpuParallelSettings
             fromInclusive,
             toExclusive,
             new ParallelOptions { MaxDegreeOfParallelism = maxDegree },
-            body);
+            i =>
+            {
+                // Mark this worker as inside a parallel region so any nested
+                // parallel loop it triggers (e.g. a per-iteration GEMM) serializes.
+                using var _region = EnterParallelRegion();
+                body(i);
+            });
     }
 
     /// <summary>
@@ -253,7 +351,9 @@ public static class CpuParallelSettings
         // overload above). Snapshot both gating values once for consistency.
         int maxDegree = MaxDegreeOfParallelism;
         bool deterministic = DeterministicReductions;
-        if (maxDegree <= 1 || deterministic || totalWork < PersistentParallelExecutor.DefaultSerialGrainSize)
+        // _inParallelRegion: nested call → serial (avoids ThreadPool starvation).
+        if (maxDegree <= 1 || deterministic || _inParallelRegion
+            || totalWork < PersistentParallelExecutor.DefaultSerialGrainSize)
         {
             // Serial fast path: one local accumulator, no
             // ParallelLoopState (Stop/Break never fire serial-side).
@@ -283,7 +383,13 @@ public static class CpuParallelSettings
             toExclusive,
             new ParallelOptions { MaxDegreeOfParallelism = maxDegree },
             localInit,
-            body,
+            (i, state, local) =>
+            {
+                // Mark this worker as inside a parallel region for the body call
+                // so nested parallel loops serialize (restored after each call).
+                using var _region = EnterParallelRegion();
+                return body(i, state, local);
+            },
             localFinally);
     }
 }

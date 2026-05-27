@@ -23117,7 +23117,19 @@ public partial class CpuEngine : ITensorLevelEngine
             // ──── Step 1: scores = Q @ K^T, via BLAS TryGemmEx with transB=true.
             // If TryGemmEx is unavailable (deterministic mode, MKL absent), fall back
             // to pre-transposing K and calling SimdGemm.Sgemm.
-            bool gemmed = BlasProvider.TryGemmEx(
+            //
+            // Nested-threading guard: this body runs inside ParallelForOrSerial over
+            // batch·heads. TryGemmEx routes to a MULTI-THREADED GEMM (native OpenBLAS
+            // cblas_sgemm, or the managed machine kernel). Invoking that from each of N
+            // parallel head-workers oversubscribes the box (N × innerThreads) and the
+            // native BLAS pool blocks in native sync — a [1,8,1024,64] forward then
+            // crawls for minutes. So when this thread is already a parallel worker
+            // (IsInParallelRegion) we force the single-threaded AVX2 SgemmSequential
+            // path below — mirroring the double path, which always uses a sequential
+            // inner GEMM for exactly this reason. When the head loop ran serially (few
+            // heads / small work) we keep the fast multi-threaded GEMM for the lone head.
+            bool useSequentialGemm = CpuParallelSettings.IsInParallelRegion;
+            bool gemmed = !useSequentialGemm && BlasProvider.TryGemmEx(
                 m: seqQ, n: seqK, k: d_k,
                 a: qf, aOffset: qOff, lda: d_k, transA: false,
                 b: kf, bOffset: kOff, ldb: d_k, transB: true,
@@ -23183,10 +23195,12 @@ public partial class CpuEngine : ITensorLevelEngine
             }
 
             // ──── Step 3: output = weights @ V, via BLAS (no transpose).
+            // Same nested-threading guard as Step 1: serial inner GEMM when this is a
+            // parallel head-worker, multi-threaded GEMM only when the head loop is serial.
             int wOff = bh * seqQ * seqK;
             int vOff = bh * seqK * d_v;
             int oOff = bh * seqQ * d_v;
-            bool gemmed2 = BlasProvider.TryGemmEx(
+            bool gemmed2 = !useSequentialGemm && BlasProvider.TryGemmEx(
                 m: seqQ, n: d_v, k: seqK,
                 a: weightsData, aOffset: wOff, lda: seqK, transA: false,
                 b: vf, bOffset: vOff, ldb: d_v, transB: false,

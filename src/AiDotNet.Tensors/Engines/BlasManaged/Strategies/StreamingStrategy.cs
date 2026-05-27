@@ -105,7 +105,7 @@ internal static class StreamingStrategy
                     bool taLocal = transA, tbLocal = transB;
                     int procsLocal = procs;
 
-                    Parallel.For(0, procsLocal, p =>
+                    CpuParallelSettings.ParallelForRegion(procsLocal, p =>
                     {
                         var (kStart, kLen) = KAxisDriver.GetThreadRange(k, procsLocal, p);
                         if (kLen <= 0) return;
@@ -151,7 +151,7 @@ internal static class StreamingStrategy
                     bool taLocal = transA, tbLocal = transB;
                     int procsLocal = procs;
 
-                    Parallel.For(0, procsLocal, p =>
+                    CpuParallelSettings.ParallelForRegion(procsLocal, p =>
                     {
                         var (kStart, kLen) = KAxisDriver.GetThreadRange(k, procsLocal, p);
                         if (kLen <= 0) return;
@@ -218,7 +218,7 @@ internal static class StreamingStrategy
                 int ldaLocal = lda, ldbLocal = ldb, ldcLocal = ldc;
                 bool taLocal = transA, tbLocal = transB;
 
-                Parallel.For(0, procsLocal, p =>
+                CpuParallelSettings.ParallelForRegion(procsLocal, p =>
                 {
                     int nStart = (int)(((long)p * nLocal) / procsLocal);
                     int nEnd = (int)(((long)(p + 1) * nLocal) / procsLocal);

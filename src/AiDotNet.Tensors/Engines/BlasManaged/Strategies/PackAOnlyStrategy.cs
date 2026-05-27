@@ -110,7 +110,7 @@ internal static class PackAOnlyStrategy
                 int mLocal = m, kLocal = k, mcLocal = mc, kcLocal = kc, mrLocal = mr, nrLocal = nr;
                 bool taLocal = transA;
 
-                Parallel.For(0, procsClamped, p =>
+                CpuParallelSettings.ParallelForRegion(procsClamped, p =>
                 {
                     int tileStart = (int)(((long)p * nTilesTotal) / procsClamped);
                     int tileEnd = (int)(((long)(p + 1) * nTilesTotal) / procsClamped);
