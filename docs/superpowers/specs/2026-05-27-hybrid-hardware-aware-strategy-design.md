@@ -8,12 +8,21 @@
 
 `Dispatcher.SelectStrategy` chooses the GEMM packing strategy (Streaming / PackAOnly /
 PackBoth) with a **static, hardware-agnostic heuristic**. Two sessions independently
-tuned it and collided: a `k≤128 → Streaming` rule (measured optimal on a 16-core AVX2
-box) versus a `work<1M → Streaming` rule (#464, measured optimal on a Ryzen 9 3950X).
-Both are correct *for their hardware* — e.g. on 512×512×64 the AVX2 box wants Streaming
-(80 GFLOPS) while the Ryzen wants blocking. **No single static threshold is right for all
-hardware**, so baking in either one regresses the other and overwrites a colleague's
-merged tests.
+tuned it on **different hardware** and collided: a `k≤128 → Streaming` rule (measured on
+`x64-amd-avx2-cpu16`) versus a `work<1M → Streaming` rule (#464, measured on a Ryzen 9
+3950X = `x64-amd-avx2-cpu32`). Both are correct *for their machine* — e.g. on 512×512×64
+the 16-thread box wants Streaming (80 GFLOPS) while the 32-thread Ryzen wants blocking.
+**No single static threshold is right for all hardware**, so baking in either one regresses
+the other and overwrites a colleague's merged tests.
+
+The deeper point — and the actual goal — is that this is not a two-machine problem to
+hand-resolve; it is the general need to **adapt the strategy to whatever hardware the
+library runs on**. Crucially, the measurement/learning layers below make the *source* of
+any divergence (core count, microarchitecture, even measurement methodology) irrelevant:
+the system measures ground truth on each real machine with the current kernels. The shipped
+default table is only a cold-start *seed*; the learned per-fingerprint cache is the truth
+for that box. So we never need to pre-decide whether a given divergence is "really
+hardware" — the empirical layer settles it per machine.
 
 The codebase already isolates *per-shape blocking params* (Mc/Nc/Kc) per hardware via
 `HardwareFingerprint` + the `BlasManagedAutotune` disk cache. But the **strategy choice
@@ -59,7 +68,7 @@ where the machine kernel is unavailable).
 
 | Component | File | Responsibility |
 |---|---|---|
-| `StrategyDefaultTable` (new) | `Engines/BlasManaged/Dispatcher/StrategyDefaultTable.cs` | Hardcoded `(simd, vendor, cpuBucket) → routing params` map (streaming work cutoff, streaming-k cutoff, special-case flags). **Keyed on `{simd, vendor, cpuBucket}`, NOT SIMD class alone — see G1.** Seeded from measured AVX2-Intel data; AVX2-AMD (Ryzen), AVX512, NEON, scalar entries added as measured. Unknown keys fall back to the nearest coarser entry (same simd, any vendor) then a conservative scalar default. Pure function, no I/O. |
+| `StrategyDefaultTable` (new) | `Engines/BlasManaged/Dispatcher/StrategyDefaultTable.cs` | Hardcoded `(simd, vendor, cpuBucket, shapeBucket) → strategy` map — the *seed tier* of the unified map (G9), returning a strategy per shape-bucket, NOT a separate threshold model. **Keyed on `{simd, vendor, cpuBucket}`, NOT SIMD class alone — see G1.** Seeded from measured `amd-avx2-cpu16` data; `amd-avx2-cpu32` (Ryzen), AVX512, NEON, scalar entries added as measured. Unknown keys fall back to the nearest coarser entry (same simd, any vendor/cpu) then a conservative scalar default. Pure function, no I/O. |
 | `HardwareFingerprint` (extend) | `Helpers/Autotune/HardwareFingerprint.cs` | Add `SimdClass`, `Vendor`, and `CpuBucket` accessors (cpuBucket = small/medium/large core-count bands, e.g. `≤4 / 5–16 / >16`) — together the table key. The full per-machine fingerprint string still keys the on-disk cache. |
 | `PersistentStrategyCache` (extend `BlasManagedAutotune`) | `Engines/BlasManaged/Autotune/BlasManagedAutotune.cs` | Add `PackingMode` to the persisted per-(shape,fingerprint) record; `TryGetStrategy` / `StoreStrategy`. **Cache key includes a `KernelVersion` token (G2)** so a kernel/build change invalidates stale tunings instead of serving a now-suboptimal strategy forever. Reuses `~/.aidotnet/autotune/{fp}/` and adds the version to the record (mismatched-version entries are ignored on read and overwritten on next measure). |
 | `BackgroundAutotuner` (new) | `Engines/BlasManaged/Autotune/BackgroundAutotuner.cs` | Single bounded background worker at **below-normal thread priority (G3)**. Dequeues (shape, fp), sweeps Streaming/PackAOnly/PackBoth on freshly-allocated scratch buffers **in the serving path's current `BlasMode` (G5)**, times each (best of N), writes the winner + KernelVersion to `PersistentStrategyCache`. **Skips shapes above a work ceiling (G3)** — large shapes already route well via the table and their sweep is too expensive to run under load. Never touches caller data. De-dups via an in-flight set (G4). |
@@ -70,9 +79,23 @@ where the machine kernel is unavailable).
 set, type-safe, zero I/O); the **learned + pre-warm cache is on-disk** (reuses the existing
 autotune persistence format and fingerprint directory layout, plus the new KernelVersion tag).
 
-**KernelVersion (G2):** a build-stamped constant (e.g. assembly-info hash or a manually-bumped
-`BlasKernelVersion` int incremented whenever a microkernel/strategy/blocking change lands).
-Both the on-disk learned cache and the shipped pre-warm carry it; reads ignore mismatches.
+**KernelVersion (G2, G8):** an **auto-derived** token — a content hash over the kernel-relevant
+sources (the `Strategies/`, `Microkernels/`, `Jit/`, and dispatcher blocking-param files),
+combined into a short stamp at build time (e.g. a source-generator or a checked-in hash
+updated by a build step). **Not a manually-bumped int** — that would be forgotten on a kernel
+change and silently serve a stale tuning (the G8 footgun). Both the on-disk learned cache and
+the shipped pre-warm carry it; reads ignore mismatches and the next measurement overwrites.
+
+**Unified representation (G9):** there is ONE concept — `(hardwareKey, shapeBucket) → (strategy,
+blocking)`. The default table is the *shipped/seed tier* of that map (coarse, hardcoded); the
+disk cache is the *learned tier* (exact shape, per fingerprint). The table does NOT expose
+thresholds as a separate model — it returns a strategy for a shape bucket, exactly like the
+cache, so both tiers are queried and reasoned about identically.
+
+**Strategy + blocking are one unit (G11):** the existing `BlasManagedAutotune` record already
+holds Mc/Nc/Kc/Axis/ThreadCount; `PackingMode` joins it as part of the *same* tuned tuple. The
+background sweep measures the strategy **and** re-tunes its blocking together, then stores them
+atomically — never a new strategy paired with blocking tuned for the old one.
 
 ## 5. Data flow, threading, error handling
 
@@ -100,6 +123,16 @@ Both the on-disk learned cache and the shipped pre-warm carry it; reads ignore m
   live behavior.
 - **Sub-S interaction.** Unchanged. Sub-S precedes strategy selection for aligned plain
   GEMM; the hybrid optimizes the rest.
+- **Hot-path lookup cost (G13).** The lookup chain (fingerprint → cache → table) must not
+  re-introduce the per-call overhead the Streaming short-circuit just removed. The
+  fingerprint key is computed once and cached; the cache + table are single dictionary
+  hits on a struct key. The chain only runs on the strategy-selection path — the tiny-shape
+  and Sub-S fast paths return *before* it, so the smallest/hottest shapes pay nothing. A
+  micro-benchmark guards that `SelectStrategy` stays sub-microsecond.
+- **Multi-process write safety (G10).** The background writer increases write frequency to
+  the shared `~/.aidotnet/autotune/{fp}/` dir. Writes are atomic (write-temp + rename);
+  reads tolerate a partially-written/corrupt file (treat as miss). Concurrent processes may
+  redundantly measure the same shape — wasteful but correct (last atomic write wins).
 - **Opt-out.** A process-global switch (default ON for the table + persistence; background
   measurement default ON but bounded) lets a deployment force pure-static behavior if
   desired. Background measurement honors the existing deterministic-mode constraints (it
@@ -122,6 +155,12 @@ Both the on-disk learned cache and the shipped pre-warm carry it; reads ignore m
   version-mismatched shipped file is not seeded.
 - **Bit-exactness invariant**: identical output regardless of which layer chose the
   strategy (table / learned / measured), across FP32 and FP64.
+- **Anti-regression guard (G12)**: a perf test asserts the table's routing is **no worse
+  than the current (fixed) static heuristic** across the catalog on the local fingerprint —
+  so a hand-seeded table entry can't ship a regression. "Expected route" assertions are
+  paired with this empirical check rather than standing alone (which would be circular).
+- **Hot-path micro-bench (G13)**: `SelectStrategy` median latency stays sub-µs with the
+  lookup chain active; tiny/Sub-S shapes confirmed to bypass it.
 
 ## 7. Phasing (all on PR #462)
 
