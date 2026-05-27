@@ -201,6 +201,14 @@ internal static class BlasManagedAutotune
     /// </summary>
     private const int StrategyMemoCap = 8192;
 
+    /// <summary>
+    /// Drops the in-memory strategy memo so the next <see cref="TryLookupStrategy"/> for each
+    /// shape re-reads from disk (a cold miss if nothing is persisted). The on-disk cache is
+    /// untouched. Used by <c>BlasManaged.ClearCaches</c> and by diagnostics that need to
+    /// observe genuine cold-miss behavior rather than warm-memo hits.
+    /// </summary>
+    public static void ClearStrategyMemo() => _strategyMemo.Clear();
+
     public static void StoreStrategy(ShapeProfile shape, PackingMode mode, ParallelismAxis axis,
         int mc, int nc, int kc, int threadCount, string kernelVersion)
     {

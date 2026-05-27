@@ -54,7 +54,7 @@ public static class HardwareFingerprint
     /// </summary>
     internal static void InvalidateForTests()
     {
-        lock (_lock) { _cachedFingerprint = null; _cachedKey = null; }
+        lock (_lock) { _cachedFingerprint = null; _cachedKeyBox = null; }
     }
 
     /// <summary>
@@ -63,18 +63,25 @@ public static class HardwareFingerprint
     /// </summary>
     public readonly record struct HwKey(string Simd, string Vendor, int CpuBucket);
 
-    private static HwKey? _cachedKey;
+    // Stored as a BOXED reference behind a volatile field rather than a nullable
+    // struct: HwKey holds two string refs + an int, so a direct `HwKey?` read outside
+    // the lock could tear. A reference read/write is atomic, and `volatile` publishes
+    // the immutable boxed value safely — so the hot-path read stays lock-free while the
+    // first-time compute is guarded.
+    private static volatile object? _cachedKeyBox;
 
     /// <summary>The current host's coarse routing key (cached for the process lifetime).</summary>
     public static HwKey Key
     {
         get
         {
-            if (_cachedKey is { } k) return k;
+            if (_cachedKeyBox is HwKey k) return k;
             lock (_lock)
             {
-                _cachedKey ??= new HwKey(DetectSimdLevel(), DetectVendor(), BucketFor(Environment.ProcessorCount));
-                return _cachedKey.Value;
+                if (_cachedKeyBox is HwKey existing) return existing;
+                var computed = new HwKey(DetectSimdLevel(), DetectVendor(), BucketFor(Environment.ProcessorCount));
+                _cachedKeyBox = computed; // boxes; volatile write = safe publication
+                return computed;
             }
         }
     }

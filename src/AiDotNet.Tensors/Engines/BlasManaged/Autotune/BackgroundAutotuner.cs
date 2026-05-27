@@ -23,7 +23,13 @@ internal sealed class SightingTracker
     private readonly LinkedList<ShapeId> _lru = new();
     private readonly Dictionary<ShapeId, (LinkedListNode<ShapeId> node, int count, bool inFlight)> _map = new();
 
-    public SightingTracker(int capacity = 4096) => _capacity = capacity;
+    public SightingTracker(int capacity = 4096)
+    {
+        if (capacity < 1)
+            throw new ArgumentOutOfRangeException(nameof(capacity), capacity,
+                "Capacity must be >= 1 (a non-positive cap would evict from an empty LRU and dereference null).");
+        _capacity = capacity;
+    }
 
     /// <summary>Record a sighting; return true iff this shape should be measured now
     /// (2nd+ sighting and not already in flight).</summary>

@@ -780,6 +780,7 @@ public static class BlasManaged
     {
         BlasManagedStatsTracker.Reset();
         JittedKernelCache.Clear();
+        BlasManagedAutotune.ClearStrategyMemo(); // in-memory strategy memo (#375 G13)
         // Future: clear weight pre-pack cache entries that are still in memory.
     }
 

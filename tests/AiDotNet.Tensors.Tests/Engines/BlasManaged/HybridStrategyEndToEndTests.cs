@@ -64,19 +64,25 @@ public class HybridStrategyEndToEndTests
         var a = new double[M * K];
         var b = new double[N * K]; // [N,K] for transB
         var c = new double[M * N];
-        // Background autotuner is disabled assembly-wide for tests; enable locally. This
-        // test class is in the DisableParallelization serial collection, so the worker
-        // never overlaps other tests during this window.
+        var shape = BlasManagedAutotune.EncodeShape<double>(M, N, K, false, true, 0, 0, false,
+            AiDotNet.Tensors.Helpers.BlasProvider.IsDeterministicMode);
+        // Background autotuner is disabled assembly-wide for tests; enable locally and
+        // restore the PRIOR value (not unconditionally false) so global state never leaks.
+        // This class is in the DisableParallelization serial collection, so the worker never
+        // overlaps other tests during this window.
+        bool prevEnabled = BackgroundAutotuner.Enabled;
         BackgroundAutotuner.Enabled = true;
         try
         {
             for (int i = 0; i < 2; i++)
                 BlasManagedLib.Gemm<double>(a, K, false, b, K, true, c, N, M, N, K);
-            System.Threading.Thread.Sleep(2000); // let the below-normal background worker run
-            var shape = BlasManagedAutotune.EncodeShape<double>(M, N, K, false, true, 0, 0, false,
-                AiDotNet.Tensors.Helpers.BlasProvider.IsDeterministicMode);
+            // Poll with timeout instead of a fixed sleep — the below-normal worker may take
+            // a moment under load; succeed as soon as the learned entry appears.
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            while (BlasManagedAutotune.TryLookupStrategy(shape) is null && sw.Elapsed.TotalSeconds < 10)
+                System.Threading.Thread.Sleep(50);
             Assert.NotNull(BlasManagedAutotune.TryLookupStrategy(shape));
         }
-        finally { BackgroundAutotuner.Enabled = false; }
+        finally { BackgroundAutotuner.Enabled = prevEnabled; }
     }
 }

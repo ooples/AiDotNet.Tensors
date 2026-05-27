@@ -86,25 +86,33 @@ internal static class GapInvestigationBench
     public static void LeverCheck()
     {
         Console.WriteLine("=== Hybrid lever check: Sub-S bypass coverage ===");
-        var shapes = new (string name, int M, int N, int K, bool fp64, bool transB)[]
+        // Sub-S intercepts a call BEFORE strategy selection only when it is non-transposed
+        // AND aligned AND has no epilogue: !transA && !transB && aligned && noEpilogue. So a
+        // call reaches the hybrid when ANY of (transA, transB, epilogue, !aligned) holds.
+        // Each probe shape carries all four flags so the predicate is the real one, not a
+        // transB-only proxy that under-counts the hybrid's true coverage.
+        var shapes = new (string name, int M, int N, int K, bool fp64,
+                          bool transA, bool transB, bool epilogue, bool aligned)[]
         {
-            ("64cube_f32", 64, 64, 64, false, false),
-            ("96x128x64_f64", 96, 128, 64, true, false),
-            ("128cube_f64", 128, 128, 128, true, false),
-            ("512x512x64_f64", 512, 512, 64, true, false),
-            ("attn_qkT_197x197x64_f32", 197, 197, 64, false, true),   // transposed: bypasses Sub-S
-            ("1024x3072x768_f32", 1024, 3072, 768, false, false),
+            ("64cube_f32",               64,  64,  64, false, false, false, false, true),
+            ("96x128x64_f64",            96, 128,  64, true,  false, false, false, true),
+            ("128cube_f64",             128, 128, 128, true,  false, false, false, true),
+            ("512x512x64_f64",          512, 512,  64, true,  false, false, false, true),
+            ("attn_qkT_197x197x64_f32", 197, 197,  64, false, false, true,  false, true),  // transposed → hybrid
+            ("1024x3072x768_f32",      1024, 3072, 768, false, false, false, false, true),
         };
         int reached = 0;
         foreach (var s in shapes)
         {
-            bool reachesHybrid = s.transB; // Sub-S is !transA && !transB only
+            // Full bypass-inverse predicate, not just transB.
+            bool reachesHybrid = s.transA || s.transB || s.epilogue || !s.aligned;
             if (reachesHybrid) reached++;
             Console.WriteLine($"  {s.name,-28} reachesStrategySelection={reachesHybrid}");
         }
         Console.WriteLine($"  → {reached}/{shapes.Length} reach strategy selection (rest handled by Sub-S).");
-        Console.WriteLine("    The hybrid's lever is bounded to transposed/epilogue/unaligned shapes");
-        Console.WriteLine("    (attention QK^T, backward passes) — quantify against the real workload mix.");
+        Console.WriteLine("    Coverage here is a LOWER BOUND: this probe set holds aligned, epilogue-free");
+        Console.WriteLine("    shapes, so it surfaces only the transpose lever. Epilogue-fused and unaligned");
+        Console.WriteLine("    calls also reach the hybrid — quantify against the real workload mix.");
     }
 
     /// <summary>
@@ -248,6 +256,9 @@ internal static class GapInvestigationBench
     public static void CacheProbe()
     {
         Console.WriteLine("=== Autotune cache hit/miss probe (96×128×64 FP64 Auto, 50 calls) ===");
+        // Clear the in-memory strategy memo + stat counters first so prior runs in this process
+        // can't serve a warm hit and mask cold-miss behavior. (On-disk cache is left intact.)
+        BlasManagedLib.ClearCaches();
         const int M = 96, N = 128, K = 64;
         var rng = new Random(1);
         var a = new double[M * K];
