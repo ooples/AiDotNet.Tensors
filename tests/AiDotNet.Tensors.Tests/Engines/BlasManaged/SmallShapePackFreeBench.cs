@@ -70,14 +70,19 @@ public class SmallShapePackFreeBench
     {
         var (a, b, c) = MakeBuffers(s);
         int iters = Iters(s);
+        // TryGemmEx can route to managed or fail; assert success so the recorded
+        // timings/ratios genuinely reflect the native path (not a silent fallback).
         for (int i = 0; i < 5; i++)
-            BlasProvider.TryGemmEx(s.M, s.N, s.K, a, 0, s.K, false, b, 0, s.N, false, c, 0, s.N);
+            Assert.True(
+                BlasProvider.TryGemmEx(s.M, s.N, s.K, a, 0, s.K, false, b, 0, s.N, false, c, 0, s.N),
+                $"Native TryGemmEx failed for shape {s.Name} ({s.M}x{s.N}x{s.K}) — native timing would be invalid.");
         var times = new double[iters];
         var sw = new Stopwatch();
         for (int i = 0; i < iters; i++)
         {
             sw.Restart();
-            BlasProvider.TryGemmEx(s.M, s.N, s.K, a, 0, s.K, false, b, 0, s.N, false, c, 0, s.N);
+            if (!BlasProvider.TryGemmEx(s.M, s.N, s.K, a, 0, s.K, false, b, 0, s.N, false, c, 0, s.N))
+                throw new InvalidOperationException($"Native TryGemmEx failed mid-run for {s.Name}.");
             sw.Stop();
             times[i] = sw.Elapsed.TotalMilliseconds;
         }
