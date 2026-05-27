@@ -34,6 +34,12 @@ internal static class Dispatcher
 
         if (k < 32 || (long)m * n < 1024) return PackingMode.ForceStreaming;
 
+        // #371 guard (merged from main): a supplied pre-pack handle (FrozenWeightRegistry)
+        // MUST be consumed via the packing path — the Streaming kernel ignores packed
+        // handles, which would silently make the pre-pack a no-op. So the work-based
+        // Streaming routes below are gated on !hasPrePack; PackBoth/PackAOnly consume it.
+        bool hasPrePack = options.PackedA != null || options.PackedB != null;
+
         // Sub-G readiness — A/B diagnostic (Conv2DAbBench
         // `--ab-blas-small-square-fp64`) measured every PackingMode for the
         // 6 worst-loss shapes in the refreshed baseline and revealed three
@@ -65,13 +71,13 @@ internal static class Dispatcher
         // PackAOnly's narrow band is preserved.
 
         long work = (long)m * n * k;
-        if (work <= 300_000L) return PackingMode.ForceStreaming;
+        if (!hasPrePack && work <= 300_000L) return PackingMode.ForceStreaming;
 
         if (k < 128 && work >= 1_000_000L)
         {
             // Substantial thin-K shape. Three sub-regimes:
             if (n <= 32) return PackingMode.ForcePackBoth;                  // micro-N
-            if (n <= 64 && m >= 8 * n) return PackingMode.ForceStreaming;   // tall + thin
+            if (!hasPrePack && n <= 64 && m >= 8 * n) return PackingMode.ForceStreaming;   // tall + thin
             return PackingMode.ForcePackBoth;                               // balanced
         }
 
@@ -96,4 +102,14 @@ internal static class Dispatcher
 
         return PackingMode.ForcePackBoth;
     }
+
+    /// <summary>
+    /// Sub-C (#371): total-work ceiling below which packing is skipped (route to
+    /// pack-free <see cref="PackingMode.ForceStreaming"/>). Chosen to capture
+    /// small low-K shapes whose pack overhead dominates compute, while leaving
+    /// larger shapes — where pack + cache blocking pays off — on the packing
+    /// path. Above <see cref="BlasManaged.TinyShapeWorkThreshold"/> (100k), which
+    /// Gemm already routes to Streaming directly.
+    /// </summary>
+    internal const long SmallShapeWorkThreshold = 1_000_000;
 }

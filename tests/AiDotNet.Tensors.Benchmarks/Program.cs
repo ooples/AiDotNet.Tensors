@@ -179,6 +179,13 @@ class Program
             return;
         }
 
+        // Sub-S (#409) Phase S.1 — microkernel-only GFLOPS harness.
+        if (args[0] == "--microkernel-gflops")
+        {
+            MicrokernelGflopsBench.Run();
+            return;
+        }
+
 #if !NET462
         // Run cuBLAS vs DirectGpu GEMM benchmark
         if (args[0] == "--cublas")
@@ -572,6 +579,7 @@ class Program
         Console.WriteLine("  --full     : Run full BenchmarkDotNet suite (trigonometric)");
         Console.WriteLine("  --linalg   : Run linear algebra benchmarks vs MathNet.Numerics");
         Console.WriteLine("  --cpu-matmul: Run CPU matrix multiply diagnostics");
+        Console.WriteLine("  --microkernel-gflops: Microkernel-only GFLOPS vs register-FMA peak (Sub-S #409)");
 #if !NET462
         Console.WriteLine("  --cublas   : Run cuBLAS vs DirectGpu GEMM benchmark");
         Console.WriteLine("  --opencl   : Run OpenCL GEMM benchmark (AMD/Intel GPUs)");
