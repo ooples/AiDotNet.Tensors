@@ -67,6 +67,108 @@ public sealed class TensorArena : IDisposable
     /// </summary>
     private readonly List<Array> _pinnedArrays = new();
 
+    // Backing arrays handed out by the tensor RING (TryRentTensor) this
+    // lifetime, tracked with their (element type, element count) so Dispose
+    // can return them to the cross-arena persistent pool. The ring caches
+    // Tensor<T> WRAPPERS in _tensorRing; those are cheap and dropped on
+    // Dispose, but their large backing arrays must survive to the next arena.
+    private readonly List<(Type Type, int Size, Array Arr)> _ringBackingArrays = new();
+
+    // ---------------------------------------------------------------------
+    // Cross-arena PERSISTENT pool (issue #478)
+    //
+    // The per-instance _pool / ring are dropped on Dispose. Production callers
+    // that create + dispose a fresh arena PER training step (e.g.
+    // NeuralNetworkBase.TrainWithTape) therefore re-allocate and gen2-collect
+    // the entire transient working set (~param-count × sizeof(T), ~1 GB for a
+    // paper-scale model) every step — the bottleneck profiled in #478. To make
+    // that pattern allocation-free after warmup WITHOUT requiring callers to
+    // hold a long-lived arena, Dispose RETURNS large backing arrays to this
+    // thread-static pool and allocation RENTS from it first. The next arena on
+    // the same thread reuses the buffers instead of asking the GC for new ones.
+    //
+    // Thread-static: each thread keeps its own pool (no locks, matches the
+    // [ThreadStatic] _current contract). Bounded: only arrays at/above
+    // PersistThresholdElems are retained (small buffers GC cheaply and would
+    // bloat the dictionary), and at most MaxPersistPerSize per (type,size) so
+    // a model with many distinct shapes can't grow the pool without bound.
+    // ---------------------------------------------------------------------
+    [ThreadStatic]
+    private static Dictionary<(Type, int), Stack<Array>>? _persistent;
+
+    // Test/diagnostic: counts how many times a large buffer was served from the
+    // cross-arena persistent pool (a reuse hit) rather than freshly allocated.
+    [ThreadStatic]
+    private static long _persistentReuseHits;
+
+    /// <summary>Number of cross-arena persistent-pool reuse hits on this thread
+    /// since the last <see cref="ClearPersistentPool"/>. Test-only signal that
+    /// large buffers are actually being recycled across arena lifetimes.</summary>
+    internal static long PersistentReuseHits => _persistentReuseHits;
+
+    /// <summary>Minimum element count for an array to be worth persisting across
+    /// arena lifetimes. 65536 elems = 256 KB (float) / 512 KB (double) — matches
+    /// <see cref="TensorAllocator.ArrayPoolThresholdValue"/>'s intent: below this,
+    /// allocation/GC is cheap and pooling churns the dictionary for no gain.</summary>
+    private const int PersistThresholdElems = 64 * 1024;
+
+    /// <summary>Max retained buffers per (type, size). A single-threaded training
+    /// step rents each distinct size O(1) times, so a small cap fully covers
+    /// steady-state reuse while bounding worst-case retained memory to a few ×
+    /// the model's transient working set.</summary>
+    private const int MaxPersistPerSize = 4;
+
+    private static Array? RentPersistent(Type type, int elementCount)
+    {
+        if (elementCount < PersistThresholdElems) return null;
+        var pool = _persistent;
+        if (pool is null) return null;
+        if (pool.TryGetValue((type, elementCount), out var stack) && stack.Count > 0)
+        {
+            var arr = stack.Pop();
+            _persistentReuseHits++;
+            // Zero the recycled buffer. The arena's previous behaviour allocated
+            // every first-use-per-arena buffer via `new T[]`, which the CLR
+            // always zeroes — so consumers (e.g. GroupNorm reductions, any op
+            // that accumulates into a "fresh" scratch tensor) latently rely on
+            // zero-init even on the "uninitialized" ring path. A recycled buffer
+            // carries the previous lifetime's bytes, so it MUST be cleared to
+            // preserve that contract. This costs the same memset `new T[]` paid
+            // anyway — we just skip the allocation + GC. Without this, the
+            // cross-arena reuse corrupts those consumers (caught by GroupNorm
+            // correctness tests).
+            Array.Clear(arr, 0, arr.Length);
+            return arr;
+        }
+        return null;
+    }
+
+    private static void ReturnPersistent(Type type, int elementCount, Array arr)
+    {
+        if (elementCount < PersistThresholdElems) return; // let small buffers GC
+        var pool = _persistent ??= new Dictionary<(Type, int), Stack<Array>>();
+        var key = (type, elementCount);
+        if (!pool.TryGetValue(key, out var stack))
+        {
+            stack = new Stack<Array>(MaxPersistPerSize);
+            pool[key] = stack;
+        }
+        if (stack.Count < MaxPersistPerSize)
+            stack.Push(arr);
+        // else: at cap — drop the reference, let GC reclaim (don't hoard).
+    }
+
+    /// <summary>
+    /// Drops every buffer held in the calling thread's cross-arena persistent
+    /// pool. For tests / explicit memory-pressure handling; production code
+    /// never needs this (the pool is bounded by <see cref="MaxPersistPerSize"/>).
+    /// </summary>
+    public static void ClearPersistentPool()
+    {
+        _persistent?.Clear();
+        _persistentReuseHits = 0;
+    }
+
     private bool _disposed;
     private readonly TensorArena? _previous;
 
@@ -158,8 +260,14 @@ public sealed class TensorArena : IDisposable
             return existing;
         }
 
-        // Warmup path: allocate new array and track it
-        var arr = new T[elementCount];
+        // Warmup path: reuse a buffer from the cross-arena persistent pool if
+        // one is available for this (type,size), else allocate fresh. Both
+        // sources yield ZEROED memory — RentPersistent clears recycled buffers,
+        // and `new T[]` is CLR-zeroed — so the `clear` contract is already
+        // satisfied without an extra Array.Clear here. (The within-arena reuse
+        // path above still clears, because those buffers were handed out earlier
+        // THIS lifetime and may hold stale data the caller wrote.)
+        var arr = RentPersistent(typeof(T), elementCount) as T[] ?? new T[elementCount];
         bucket.Add(arr);
         _cursor[key] = cursor + 1;
         return arr;
@@ -203,8 +311,11 @@ public sealed class TensorArena : IDisposable
                     return (LinearAlgebra.Tensor<T>)bucket[cursor];
                 }
 
-                // Need one more tensor of this size
-                var newArr = new T[totalSize];
+                // Need one more tensor of this size — reuse a persistent-pool
+                // backing array if available (ring tensors are uninitialized:
+                // the caller overwrites every element, so no clear needed).
+                var newArr = RentPersistent(typeof(T), totalSize) as T[] ?? new T[totalSize];
+                _ringBackingArrays.Add((typeof(T), totalSize, newArr));
                 var newTensor = LinearAlgebra.Tensor<T>.FromMemory(new Memory<T>(newArr, 0, totalSize), shape);
                 bucket.Add(newTensor);
                 _tensorRingCursors[i] = cursor + 1;
@@ -215,7 +326,8 @@ public sealed class TensorArena : IDisposable
         // New size — add slot
         if (_tensorRingCount < MaxTensorRingSlots)
         {
-            var arr = new T[totalSize];
+            var arr = RentPersistent(typeof(T), totalSize) as T[] ?? new T[totalSize];
+            _ringBackingArrays.Add((typeof(T), totalSize, arr));
             var tensor = LinearAlgebra.Tensor<T>.FromMemory(new Memory<T>(arr, 0, totalSize), shape);
             var newBucket = new List<object>(4) { tensor };
             int idx = _tensorRingCount++;
@@ -225,7 +337,20 @@ public sealed class TensorArena : IDisposable
             return tensor;
         }
 
-        return null; // Arena full — caller falls through to other allocators
+        // Ring is full: this model produces more distinct tensor sizes than
+        // MaxTensorRingSlots (deep models exhaust the ring with forward
+        // activation shapes before the large backward gradient shapes arrive).
+        // Returning null sends the caller to ArrayPool.Shared, whose largest
+        // retained bucket is 2^20 elements — every paper-scale weight gradient
+        // exceeds that, so ArrayPool.Rent returns a FRESH array and Return drops
+        // it (the ~1 GB/step GC churn in #478). Instead fall back to the
+        // UNCAPPED dictionary scratch tier (which itself rents from / returns to
+        // the cross-arena persistent pool), so large gradients pool+reuse no
+        // matter how many distinct sizes the model has. Uninitialized — matches
+        // the ring's contract that the caller writes every element first.
+        var overflowArr = TryAllocateUninitialized<T>(totalSize);
+        if (overflowArr is null) return null; // disposed
+        return LinearAlgebra.Tensor<T>.FromMemory(new Memory<T>(overflowArr, 0, totalSize), shape);
     }
 
     /// <summary>
@@ -282,11 +407,32 @@ public sealed class TensorArena : IDisposable
         if (_current == this)
             _current = _previous; // restore outer arena if nested
 
+        // Return large backing arrays to the cross-arena persistent pool so the
+        // NEXT arena on this thread reuses them instead of GC-allocating fresh
+        // (issue #478). Small buffers (< PersistThresholdElems) are skipped by
+        // ReturnPersistent and simply dropped for GC. The pinned tier is NOT
+        // returned — those are long-lived (weights / optimizer state) and the
+        // owner still holds references to them.
+        foreach (var kvp in _pool)
+        {
+            var (type, size) = kvp.Key;
+            var bucket = kvp.Value;
+            for (int i = 0; i < bucket.Count; i++)
+                ReturnPersistent(type, size, bucket[i]);
+        }
+        for (int i = 0; i < _ringBackingArrays.Count; i++)
+        {
+            var (type, size, arr) = _ringBackingArrays[i];
+            ReturnPersistent(type, size, arr);
+        }
+
         _pool.Clear();
         _cursor.Clear();
         _pinnedArrays.Clear();
+        _ringBackingArrays.Clear();
 
-        // Clear tensor ring pools
+        // Clear tensor ring pools (the Tensor<T> wrappers; their backing arrays
+        // were just handed to the persistent pool above).
         if (_tensorRing != null)
         {
             Array.Clear(_tensorRing, 0, _tensorRingCount);
