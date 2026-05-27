@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using AiDotNet.Tensors.Helpers.Autotune;
 
@@ -180,6 +181,18 @@ internal static class BlasManagedAutotune
     /// version (G2/G11). Strategy and blocking are persisted together so a learned strategy
     /// is never paired with blocking tuned for a different one.
     /// </summary>
+    /// <summary>Strategy tuple stored in the in-memory memo + returned by lookup.</summary>
+    public readonly record struct StrategyChoice(
+        PackingMode Mode, ParallelismAxis Axis, int Mc, int Nc, int Kc, int ThreadCount);
+
+    // #375 G13: in-memory memo over the disk strategy cache. AutotuneCache.Lookup does a
+    // File.Exists + ReadAllText + JSON parse PER CALL (~77 µs measured); without this layer
+    // every non-Sub-S GEMM (e.g. each attention QK^T) paid that on the dispatch hot path.
+    // The memo makes the disk read happen at most once per distinct shape; a dict entry with
+    // a null value is a remembered MISS. StoreStrategy updates the memo so a background-learned
+    // strategy is picked up immediately on the next call.
+    private static readonly ConcurrentDictionary<ShapeProfile, StrategyChoice?> _strategyMemo = new();
+
     public static void StoreStrategy(ShapeProfile shape, PackingMode mode, ParallelismAxis axis,
         int mc, int nc, int kc, int threadCount, string kernelVersion)
     {
@@ -187,16 +200,34 @@ internal static class BlasManagedAutotune
         choice.Parameters["packingMode"] = mode.ToString();
         choice.Parameters["kernelVersion"] = kernelVersion;
         AutotuneCache.Store(GemmKernelId, shape, choice);
+        // Refresh the in-memory memo so the freshly-stored strategy is served immediately —
+        // but only for the current kernel version (a stale-version store, e.g. in tests, must
+        // invalidate so the next lookup re-applies the version-mismatch rule and returns miss).
+        if (kernelVersion == BlasKernelVersion.Current)
+            _strategyMemo[shape] = new StrategyChoice(mode, axis, mc, nc, kc, threadCount);
+        else
+            _strategyMemo.TryRemove(shape, out _);
     }
 
     /// <summary>
     /// #375: Look up a tuned (strategy + blocking) unit. Returns null on miss OR when the
     /// stored entry's kernel version doesn't match the current build (stale → ignore, G2).
+    /// In-memory memoized (G13) — disk is touched at most once per distinct shape.
     /// </summary>
     public static (PackingMode Mode, ParallelismAxis Axis, int Mc, int Nc, int Kc, int ThreadCount)?
         TryLookupStrategy(ShapeProfile shape)
     {
+        if (_strategyMemo.TryGetValue(shape, out var memo))
+            return memo is { } m ? (m.Mode, m.Axis, m.Mc, m.Nc, m.Kc, m.ThreadCount) : null;
+
         EnsurePrewarmLoaded();
+        StrategyChoice? result = LookupStrategyOnDisk(shape);
+        _strategyMemo[shape] = result;  // memoize hit or miss (null)
+        return result is { } r ? (r.Mode, r.Axis, r.Mc, r.Nc, r.Kc, r.ThreadCount) : null;
+    }
+
+    private static StrategyChoice? LookupStrategyOnDisk(ShapeProfile shape)
+    {
         KernelChoice? choice = AutotuneCache.Lookup(GemmKernelId, shape);
         if (choice?.Parameters is null) return null;
         if (!choice.Parameters.TryGetValue("kernelVersion", out var ver)
@@ -206,7 +237,7 @@ internal static class BlasManagedAutotune
             || !Enum.TryParse<PackingMode>(modeStr, out var mode))
             return null;
         var (axis, mc, nc, kc, tc) = DecodeChoice(choice);
-        return (mode, axis, mc, nc, kc, tc);
+        return new StrategyChoice(mode, axis, mc, nc, kc, tc);
     }
 
     /// <summary>

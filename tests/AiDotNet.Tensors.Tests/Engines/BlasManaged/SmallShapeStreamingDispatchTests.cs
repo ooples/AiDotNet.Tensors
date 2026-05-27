@@ -43,13 +43,15 @@ public class SmallShapeStreamingDispatchTests
     }
 
     [Theory]
-    // HARDWARE-DEPENDENT routing — the #375 collision shapes. Asserted against the
-    // table with explicit keys: 32-thread (Ryzen #464) wants blocking; ≤16-thread
-    // wants streaming (measured A/B). A single universal assertion is wrong here.
-    [InlineData("avx2", "amd", 2, 512, 512, 64, PackingMode.ForcePackAOnly)]   // cpu32: WideFat → blocking
-    [InlineData("avx2", "amd", 1, 512, 512, 64, PackingMode.ForceStreaming)]   // cpu16: WideFat → streaming
-    [InlineData("avx2", "amd", 2, 128, 128, 128, PackingMode.ForcePackBoth)]   // cpu32: medium square → blocking
-    [InlineData("avx2", "amd", 1, 128, 128, 128, PackingMode.ForceStreaming)]  // cpu16: medium square → streaming
+    // HARDWARE-DEPENDENT routing — the #375 collision shapes. The table is consulted only
+    // for the TRANSPOSED shapes Sub-S declines, so values are the transposed optima:
+    //   - 512×512×64 (ThinK): PackBoth on both core bands (transposed Streaming is 2.5×
+    //     slower — G12-caught; the non-transposed Streaming win never reaches this table).
+    //   - 128³ (true cube): cpu16 → Streaming (transposed Streaming wins), cpu32 → PackBoth.
+    [InlineData("avx2", "amd", 2, 512, 512, 64, PackingMode.ForcePackAOnly)]   // cpu32 ThinK → blocking
+    [InlineData("avx2", "amd", 1, 512, 512, 64, PackingMode.ForcePackBoth)]    // cpu16 ThinK → blocking (transposed)
+    [InlineData("avx2", "amd", 2, 128, 128, 128, PackingMode.ForcePackBoth)]   // cpu32 cube → blocking
+    [InlineData("avx2", "amd", 1, 128, 128, 128, PackingMode.ForceStreaming)]  // cpu16 cube → streaming
     public void LargeLowKWork_RoutingIsHardwareAware(string simd, string vendor, int bucket,
         int m, int n, int k, PackingMode expected)
     {

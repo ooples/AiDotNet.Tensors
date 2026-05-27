@@ -156,6 +156,28 @@ internal static class GapInvestigationBench
         Console.WriteLine($"  → commit it as src/AiDotNet.Tensors/Engines/BlasManaged/Autotune/prewarm/{fp}.prewarm.json");
     }
 
+    /// <summary>
+    /// #375 G13: measure SelectStrategy hot-path latency. The hybrid added a learned-cache
+    /// lookup + Observe per non-Sub-S call; this quantifies the per-call cost (must be
+    /// sub-µs, not a disk read every call).
+    /// </summary>
+    public static void SelectStrategyHotPath()
+    {
+        Console.WriteLine("=== SelectStrategy hot-path latency (#375 G13) ===");
+        var opts = default(AiDotNet.Tensors.Engines.BlasManaged.BlasOptions<float>);
+        // transB shape reaches strategy selection (Sub-S handles non-transposed).
+        for (int w = 0; w < 1000; w++)
+            AiDotNet.Tensors.Engines.BlasManaged.Dispatcher.SelectStrategy<float>(197, 197, 64, false, true, in opts);
+        const int iters = 200_000;
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        for (int i = 0; i < iters; i++)
+            AiDotNet.Tensors.Engines.BlasManaged.Dispatcher.SelectStrategy<float>(197, 197, 64, false, true, in opts);
+        sw.Stop();
+        double nsPerCall = sw.Elapsed.TotalMilliseconds * 1e6 / iters;
+        Console.WriteLine($"  SelectStrategy: {nsPerCall:F0} ns/call over {iters} iters");
+        Console.WriteLine($"  → sub-µs (<1000 ns) = fine; multi-µs = disk-read-per-call regression.");
+    }
+
     /// <summary>Diagnose whether the autotune Decide cache hits on repeated calls.</summary>
     public static void CacheProbe()
     {

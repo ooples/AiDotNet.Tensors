@@ -4,9 +4,19 @@ namespace AiDotNet.Tensors.Engines.BlasManaged;
 
 /// <summary>
 /// Seed tier of the unified (hardwareKey, shapeBucket) → strategy map (#375). Hardcoded
-/// per-{simd,vendor,cpuBucket} routing measured on real hardware; the cold-start default
-/// before the learned disk cache populates. Pure, no I/O. The learned cache (Phase 2)
-/// overrides this per shape; the background autotuner (Phase 3) populates that cache.
+/// per-{simd,vendor,cpuBucket} routing; the cold-start default before the learned disk
+/// cache populates. Pure, no I/O. The learned cache (Phase 2) overrides this per shape;
+/// the background autotuner (Phase 3) populates that cache.
+///
+/// <para>
+/// IMPORTANT — this table is consulted ONLY for shapes the Sub-S machine-code fast path
+/// declines (transposed / epilogue-fused / unaligned); Sub-S handles all non-transposed
+/// aligned GEMM before strategy selection. So the seed values are calibrated for the
+/// TRANSPOSED case (measured via `--prewarm-autotune`), NOT the non-transposed A/B — e.g.
+/// transposed 512×512×64 wants PackBoth (≈43 ms) even though non-transposed 512×512×64 wants
+/// Streaming (which never reaches here). Routing transposed ThinK to Streaming was a 2.5×
+/// regression caught by the G12 anti-regression test.
+/// </para>
 /// </summary>
 internal static class StrategyDefaultTable
 {
@@ -41,17 +51,21 @@ internal static class StrategyDefaultTable
     {
         var bucket = Bucket(m, n, k);
 
-        // amd-avx2 mid-core (≤16T, this box): k≤128 wins on Streaming (measured A/B 2026-05).
+        // amd-avx2 mid-core (≤16T, this box). Calibrated for the TRANSPOSED shapes that
+        // actually reach this table (--prewarm-autotune measurements): small/cube → Streaming
+        // wins even transposed; ThinK (e.g. 512×512×64 transB) → PackBoth (Streaming is 2.5×
+        // slower there — the G12-caught regression); MediumMWide → PackAOnly (redirects to
+        // PackBoth under transB, which wins).
         if (key.Simd == "avx2" && key.CpuBucket <= 1)
         {
             return bucket switch
             {
                 ShapeBucket.TinyCube => PackingMode.ForceStreaming,
-                ShapeBucket.SmallLowK => PackingMode.ForceStreaming,
+                ShapeBucket.SmallLowK => PackingMode.ForceStreaming,     // 96×128×64 transB: Streaming
                 ShapeBucket.TallThin => PackingMode.ForceStreaming,
-                ShapeBucket.MediumSquare => PackingMode.ForceStreaming,   // 128³: Streaming 80 vs PackBoth 18
-                ShapeBucket.ThinK => PackingMode.ForceStreaming,          // 512×512×64: Streaming 80 vs PackBoth 59
-                ShapeBucket.MediumMWide => PackingMode.ForcePackAOnly,    // 128×768×768: PackAOnly 110 vs PackBoth 34
+                ShapeBucket.MediumSquare => PackingMode.ForceStreaming,  // 128³ transB: Streaming
+                ShapeBucket.ThinK => PackingMode.ForcePackBoth,          // 512×512×64 transB: PackBoth ≫ Streaming
+                ShapeBucket.MediumMWide => PackingMode.ForcePackAOnly,   // 197×768×768 transB → PackBoth via PackAOnly
                 _ => PackingMode.ForcePackBoth,
             };
         }
