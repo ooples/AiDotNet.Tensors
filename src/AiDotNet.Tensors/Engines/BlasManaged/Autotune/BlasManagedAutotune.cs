@@ -196,6 +196,7 @@ internal static class BlasManagedAutotune
     public static (PackingMode Mode, ParallelismAxis Axis, int Mc, int Nc, int Kc, int ThreadCount)?
         TryLookupStrategy(ShapeProfile shape)
     {
+        EnsurePrewarmLoaded();
         KernelChoice? choice = AutotuneCache.Lookup(GemmKernelId, shape);
         if (choice?.Parameters is null) return null;
         if (!choice.Parameters.TryGetValue("kernelVersion", out var ver)
@@ -218,5 +219,45 @@ internal static class BlasManagedAutotune
     {
         if (TryLookupStrategy(shape) is not null) return;  // local/learned wins
         StoreStrategy(shape, mode, axis, mc, nc, kc, threadCount, BlasKernelVersion.Current);
+    }
+
+    private static int _prewarmLoaded;
+
+    /// <summary>
+    /// #375 Phase 4: load shipped pre-warm entries for the current fingerprint once.
+    /// Best-effort — missing/garbled resource → no-op. Each line:
+    /// "M N K fp64 transA transB strategy mc nc kc threadCount". Seeds only where no
+    /// local learned entry exists (local always wins); version-tagged via StoreStrategy.
+    /// </summary>
+    internal static void EnsurePrewarmLoaded()
+    {
+        if (System.Threading.Interlocked.CompareExchange(ref _prewarmLoaded, 1, 0) != 0) return;
+        try
+        {
+            string fp = Helpers.Autotune.HardwareFingerprint.Current;
+            string resourceName =
+                $"AiDotNet.Tensors.Engines.BlasManaged.Autotune.prewarm.{fp}.prewarm.json";
+            using var stream = typeof(BlasManagedAutotune).Assembly.GetManifestResourceStream(resourceName);
+            if (stream is null) return; // no pre-warm shipped for this fingerprint
+            using var reader = new System.IO.StreamReader(stream);
+            string? line;
+            while ((line = reader.ReadLine()) is not null)
+            {
+                var p = line.Split(' ');
+                if (p.Length < 11) continue;
+                if (!int.TryParse(p[0], out int m) || !int.TryParse(p[1], out int n)
+                    || !int.TryParse(p[2], out int k)) continue;
+                bool fp64 = p[3] == "1";
+                bool transA = p[4] == "1", transB = p[5] == "1";
+                if (!Enum.TryParse<PackingMode>(p[6], out var mode)) continue;
+                if (!int.TryParse(p[7], out int mc) || !int.TryParse(p[8], out int nc)
+                    || !int.TryParse(p[9], out int kc) || !int.TryParse(p[10], out int tc)) continue;
+                var shape = fp64
+                    ? EncodeShape<double>(m, n, k, transA, transB, 0, 0, false, false)
+                    : EncodeShape<float>(m, n, k, transA, transB, 0, 0, false, false);
+                SeedFromShippedIfAbsent(shape, mode, ParallelismAxis.M, mc, nc, kc, tc);
+            }
+        }
+        catch { /* best-effort */ }
     }
 }
