@@ -98,7 +98,7 @@ public class StreamingWorkerPoolTests
             sw.Restart();
             StreamingWorkerPool.Dispatch(8, c => { /* no-op */ });
             sw.Stop();
-            times[i] = sw.Elapsed.TotalMicroseconds;
+            times[i] = sw.Elapsed.TotalMilliseconds * 1000.0; // µs (TimeSpan.TotalMicroseconds is net7.0+ only; this is net471-safe)
         }
         Array.Sort(times);
         double medianUs = times[500];

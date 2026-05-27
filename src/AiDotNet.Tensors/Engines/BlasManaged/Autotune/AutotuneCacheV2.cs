@@ -76,6 +76,14 @@ internal sealed class AutotuneCacheV2
     /// <summary>Number of distinct shapes with a finalized cache entry.</summary>
     public int Count => _cache.Count;
 
+    /// <summary>Drop all finalized entries and in-flight warmup slots, returning the
+    /// cache to its empty initial state (process-global reset for tests / re-sweep).</summary>
+    public void Clear()
+    {
+        _cache.Clear();
+        _warmup.Clear();
+    }
+
     /// <summary>Look up the cached winner for a shape. Returns false on miss.</summary>
     public bool TryGet(ShapeKey key, out Entry? entry) => _cache.TryGetValue(key, out entry);
 
@@ -112,8 +120,13 @@ internal sealed class AutotuneCacheV2
     /// </summary>
     public void FinalizeWarmup(ShapeKey key)
     {
-        if (_warmup.TryRemove(key, out var slot) && slot.Best is not null)
-            _cache[key] = slot.Best;
+        if (!_warmup.TryRemove(key, out var slot)) return;
+        // Read slot.Best under the same lock RecordWarmupSample uses to write it —
+        // a concurrent same-shape warmup sample can still hold this slot reference
+        // (it GetOrAdd'd before the TryRemove) and be mutating Best.
+        Entry? best;
+        lock (slot) { best = slot.Best; }
+        if (best is not null) _cache[key] = best;
     }
 
     /// <summary>

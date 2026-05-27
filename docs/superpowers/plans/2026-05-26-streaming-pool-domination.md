@@ -451,6 +451,14 @@ internal static class StreamingWorkerPool
 }
 ```
 
+> **Note (sketch vs. shipped code):** this sketch sets the re-entrancy guard
+> `_isExecuting` only in `Dispatch`, but the shipped `StreamingWorkerPool` also
+> sets it inside `WorkerLoop` around each body invocation. `_isExecuting` is
+> `[ThreadStatic]`, so without the worker-side set a worker thread whose body
+> calls `Dispatch` again would see its own flag as false and spin up a nested
+> parallel dispatch; setting it on the worker makes nested dispatches run inline.
+> Defer to `StreamingWorkerPool.cs` for the exact (correct) guard placement.
+
 - [ ] **Step 2: Build and run all 5 pool tests**
 
 Run:

@@ -540,7 +540,7 @@ internal static class Conv2DAbBench
                 }
                 double min = samples.Min();
                 double gflops = fmas / (min * 1e-6) / 1e9;
-                string ntLabel = nt < 0 ? "default" : nt.ToString();
+                string ntLabel = nt < 0 ? "1 (st)" : nt.ToString();  // -1 = explicit single-thread
                 Console.WriteLine($"{label,-22}  {ntLabel,8}  {min,8:F2}  {gflops,8:F2}");
 
                 if (mode == AiDotNet.Tensors.Engines.BlasManaged.PackingMode.Auto) break;

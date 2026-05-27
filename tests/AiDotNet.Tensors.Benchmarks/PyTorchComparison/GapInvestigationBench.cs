@@ -136,25 +136,31 @@ internal static class GapInvestigationBench
             BlasManagedLib.Gemm<float>(a, K, false, b, N, false, c, N, M, N, K,
                 new BlasOptions<float> { Mode = BlasMode.Fast }), iters);
 
-        // Torch single-thread.
+        // Torch single-thread. Restore the global Torch thread count in a finally so
+        // a timing failure can't leave process-global threading in a bad state for
+        // later benchmarks.
         int prevThreads = torch.get_num_threads();
-        torch.set_num_threads(1);
-        using (var aT = torch.tensor(a, new long[] { M, K }, device: torch.CPU))
-        using (var bT = torch.tensor(b, new long[] { K, N }, device: torch.CPU))
+        try
         {
-            var (tStMin, tStMed) = TimeTorch(aT, bT, iters);
-            torch.set_num_threads(prevThreads);
-            var (tMtMin, tMtMed) = TimeTorch(aT, bT, iters);
+            torch.set_num_threads(1);
+            using (var aT = torch.tensor(a, new long[] { M, K }, device: torch.CPU))
+            using (var bT = torch.tensor(b, new long[] { K, N }, device: torch.CPU))
+            {
+                var (tStMin, tStMed) = TimeTorch(aT, bT, iters);
+                torch.set_num_threads(prevThreads);
+                var (tMtMin, tMtMed) = TimeTorch(aT, bT, iters);
 
-            Console.WriteLine($"  {"",-18}{"min µs",12}{"med µs",12}{"GFLOPS(min)",14}");
-            PrintRow("AiDN 1-thread", aiStMin, aiStMed, flops);
-            PrintRow("AiDN N-thr (det)", aiMtMin, aiMtMed, flops);
-            PrintRow("AiDN N-thr (fast)", aiFastMin, aiFastMed, flops);
-            PrintRow("torch 1-thread", tStMin, tStMed, flops);
-            PrintRow("torch N-thread", tMtMin, tMtMed, flops);
-            Console.WriteLine($"  → 1-thread kernel gap (AiDN/torch min): {aiStMin / tStMin:F1}×");
-            Console.WriteLine($"  → N-thread gap (AiDN/torch min):        {aiMtMin / tMtMin:F1}×");
+                Console.WriteLine($"  {"",-18}{"min µs",12}{"med µs",12}{"GFLOPS(min)",14}");
+                PrintRow("AiDN 1-thread", aiStMin, aiStMed, flops);
+                PrintRow("AiDN N-thr (det)", aiMtMin, aiMtMed, flops);
+                PrintRow("AiDN N-thr (fast)", aiFastMin, aiFastMed, flops);
+                PrintRow("torch 1-thread", tStMin, tStMed, flops);
+                PrintRow("torch N-thread", tMtMin, tMtMed, flops);
+                Console.WriteLine($"  → 1-thread kernel gap (AiDN/torch min): {aiStMin / tStMin:F1}×");
+                Console.WriteLine($"  → N-thread gap (AiDN/torch min):        {aiMtMin / tMtMin:F1}×");
+            }
         }
+        finally { torch.set_num_threads(prevThreads); }
         Console.WriteLine();
     }
 

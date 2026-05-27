@@ -83,6 +83,14 @@ public static class BlasManaged
     internal static int AutotuneV2ShapeCount => _autotuneV2.Count;
 
     /// <summary>
+    /// Clear the process-wide autotune V2 cache. The cache is process-global state;
+    /// without a reset it bleeds across tests and persists for a long-running
+    /// session. Tests call this to start from a known state, and callers can use it
+    /// to force a re-sweep (e.g., after a host/affinity change).
+    /// </summary>
+    public static void ClearAutotuneV2() => _autotuneV2.Clear();
+
+    /// <summary>
     /// Minimum work (M·N·K) for an autotune warmup sweep. Below this the
     /// per-call dispatch overhead dwarfs the strategy difference, so a sweep
     /// wastes time. Matches the tiny-shape regime that already routes straight
@@ -207,7 +215,12 @@ public static class BlasManaged
 
             if (cached is not null)
             {
-                var tuned = WithStrategy(in options, cached.Mode, cached.NumThreads);
+                // Respect an explicit caller thread request (NumThreads != 0, including
+                // -1 = single-thread); only apply the autotuned thread count when the
+                // caller left threading on auto (0). Otherwise the cache would override
+                // the call site's deliberate threading intent.
+                int tunedThreads = options.NumThreads != 0 ? options.NumThreads : cached.NumThreads;
+                var tuned = WithStrategy(in options, cached.Mode, tunedThreads);
                 Gemm<T>(a, lda, transA, b, ldb, transB, c, ldc, m, n, k, in tuned);
                 return;
             }

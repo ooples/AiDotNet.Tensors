@@ -87,7 +87,13 @@ internal static class ColdStartBench
             var sw = Stopwatch.StartNew();
             using var p = Process.Start(psi);
             if (p is null) return -1;
-            p.WaitForExit(15_000);
+            if (!p.WaitForExit(15_000))
+            {
+                // Timed out — kill the child (and its tree) so it can't keep running
+                // and pollute later measurements / leak processes.
+                try { p.Kill(entireProcessTree: true); } catch { /* already exiting */ }
+                return -1;
+            }
             sw.Stop();
             return p.ExitCode == 0 ? sw.Elapsed.TotalMilliseconds : -1;
         }

@@ -619,6 +619,31 @@ class Program
         Console.WriteLine("  --dit-xl-sdpa       : ScaledDotProductAttention at DiT-XL shape [4,16,256,72] (Issue #162 SDPA fix)");
         Console.WriteLine("  --transformer-ffn   : Small-M transformer FFN matmul (Sgemm+Dgemm+batched) — Issue #245 coverage");
         Console.WriteLine();
+        Console.WriteLine("A/B microkernel + dispatch benchmarks:");
+        Console.WriteLine("  --ab-matmul            : A/B GEMM (FP32) across catalog shapes");
+        Console.WriteLine("  --ab-conv2d            : A/B Conv2D (FP32)");
+        Console.WriteLine("  --ab-conv2d-double     : A/B Conv2D (FP64)");
+        Console.WriteLine("  --ab-blas-small-square-fp64 : A/B small-square FP64 GEMM microkernel");
+        Console.WriteLine("  --ab-attention-qkt     : A/B attention Q·Kᵀ");
+        Console.WriteLine("  --ab-softmax-double    : A/B softmax (FP64)");
+        Console.WriteLine("  --ab-layernorm         : A/B LayerNorm");
+        Console.WriteLine("  --ab-binary-ops        : A/B elementwise binary ops");
+        Console.WriteLine();
+        Console.WriteLine("PyTorch-comparison diagnostics:");
+        Console.WriteLine("  --per-call-threads       : Per-call NumThreads sweep vs PyTorch");
+        Console.WriteLine("  --frozen-weight-inference: Frozen-weight (pre-packed) inference vs PyTorch");
+        Console.WriteLine("  --pytorch-headtohead     : Head-to-head catalog (--pytorch-headtohead [out.md])");
+        Console.WriteLine("  --investigate-gap        : Single/multi-thread kernel-gap investigation vs Torch");
+        Console.WriteLine("  --cold-start             : Cold-start latency (AiDotNet vs PyTorch subprocess)");
+        Console.WriteLine("  --cold-start-aidotnet    : Cold-start latency (AiDotNet only)");
+        Console.WriteLine("  --determinism-bench      : Deterministic vs fast-mode reduction cost");
+        Console.WriteLine("  --layers                 : End-to-end layer (Linear/Conv/Norm) microbench");
+        Console.WriteLine("  --unet                   : U-Net step microbench");
+        Console.WriteLine("  --pr319-grain            : PR #319 grain-size migration regression harness");
+#if NET8_0_OR_GREATER
+        Console.WriteLine("  --pytorch-parity         : PyTorch CPU parity (matmul/FlashAttn/LayerNorm/BCE fwd+bwd, .NET 8+)");
+#endif
+        Console.WriteLine();
         Console.WriteLine("Issue #296 acceptance benchmarks (real async ICompiledPlan):");
         Console.WriteLine("  --296-chain         : Single-batch latency vs PyTorch (BS=1/32/128, two-stage Linear→ReLU→Linear)");
         Console.WriteLine("  --296-throughput    : Multi-batch pipelined throughput vs PyTorch (NumBatches=8/32)");
