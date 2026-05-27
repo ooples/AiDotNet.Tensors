@@ -77,6 +77,36 @@ internal static class GapInvestigationBench
         Console.WriteLine();
     }
 
+    /// <summary>
+    /// Phase-1 lever check (#375 hybrid): report whether each catalog shape reaches
+    /// strategy selection vs being intercepted by the Sub-S machine-code path. Sub-S
+    /// takes only !transA &amp;&amp; !transB (no epilogue / no pre-pack), so transposed /
+    /// epilogue / unaligned shapes are the universe the hybrid actually governs.
+    /// </summary>
+    public static void LeverCheck()
+    {
+        Console.WriteLine("=== Hybrid lever check: Sub-S bypass coverage ===");
+        var shapes = new (string name, int M, int N, int K, bool fp64, bool transB)[]
+        {
+            ("64cube_f32", 64, 64, 64, false, false),
+            ("96x128x64_f64", 96, 128, 64, true, false),
+            ("128cube_f64", 128, 128, 128, true, false),
+            ("512x512x64_f64", 512, 512, 64, true, false),
+            ("attn_qkT_197x197x64_f32", 197, 197, 64, false, true),   // transposed: bypasses Sub-S
+            ("1024x3072x768_f32", 1024, 3072, 768, false, false),
+        };
+        int reached = 0;
+        foreach (var s in shapes)
+        {
+            bool reachesHybrid = s.transB; // Sub-S is !transA && !transB only
+            if (reachesHybrid) reached++;
+            Console.WriteLine($"  {s.name,-28} reachesStrategySelection={reachesHybrid}");
+        }
+        Console.WriteLine($"  → {reached}/{shapes.Length} reach strategy selection (rest handled by Sub-S).");
+        Console.WriteLine("    The hybrid's lever is bounded to transposed/epilogue/unaligned shapes");
+        Console.WriteLine("    (attention QK^T, backward passes) — quantify against the real workload mix.");
+    }
+
     /// <summary>Diagnose whether the autotune Decide cache hits on repeated calls.</summary>
     public static void CacheProbe()
     {
