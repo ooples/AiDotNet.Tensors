@@ -60,19 +60,26 @@ public class AutotuneCacheV2Tests
         // End-to-end: with EnableAutotuneV2 on, a GEMM above the work floor runs
         // a warmup sweep (cache miss), caches the winner, and produces a correct
         // result. A second call hits the cache. Both must match the naive ref.
+        //
+        // Uses transB=true: the Sub-S (#409) machine-code fast path handles plain
+        // non-transposed Auto GEMM before the Layer-F autotune block, so a plain
+        // shape never reaches the sweep. transB=true is skipped by Sub-S (it only
+        // takes !transA && !transB), so it exercises the autotune-V2 path that
+        // governs transposed / epilogue / pre-pack shapes.
         const int M = 128, K = 128, N = 128;  // work = 2.1M ≥ 100K floor
         var rng = new Random(7);
         var a = new float[M * K];
-        var b = new float[K * N];
+        var b = new float[N * K];  // [N, K] row-major when transB=true
         for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() * 2 - 1);
         for (int i = 0; i < b.Length; i++) b[i] = (float)(rng.NextDouble() * 2 - 1);
 
+        // transB=true reference: C[i,j] = Σ a[i,kk] · B[j,kk]  (B stored [N, K]).
         var reference = new float[M * N];
         for (int i = 0; i < M; i++)
             for (int j = 0; j < N; j++)
             {
                 float sum = 0;
-                for (int kk = 0; kk < K; kk++) sum += a[i * K + kk] * b[kk * N + j];
+                for (int kk = 0; kk < K; kk++) sum += a[i * K + kk] * b[j * K + kk];
                 reference[i * N + j] = sum;
             }
 
@@ -83,7 +90,7 @@ public class AutotuneCacheV2Tests
             int countBefore = BlasManagedLib.AutotuneV2ShapeCount;
 
             var c1 = new float[M * N];
-            BlasManagedLib.Gemm<float>(a, K, false, b, N, false, c1, N, M, N, K);
+            BlasManagedLib.Gemm<float>(a, K, false, b, K, true, c1, N, M, N, K);
 
             // Cache must now hold this shape (sweep finalized).
             Assert.True(BlasManagedLib.AutotuneV2ShapeCount > countBefore,
@@ -91,7 +98,7 @@ public class AutotuneCacheV2Tests
 
             // Second call: cache hit, same correct result.
             var c2 = new float[M * N];
-            BlasManagedLib.Gemm<float>(a, K, false, b, N, false, c2, N, M, N, K);
+            BlasManagedLib.Gemm<float>(a, K, false, b, K, true, c2, N, M, N, K);
 
             for (int i = 0; i < reference.Length; i++)
             {
