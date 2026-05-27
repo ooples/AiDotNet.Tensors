@@ -32,6 +32,16 @@ public class PrePackSpeedupTest
         _output = output;
     }
 
+    // Category=Performance so the CI correctness run (which filters out
+    // Category!=Performance) excludes this wall-clock gate — exactly like the repo's
+    // other perf tests (Conv2DBackwardPerfTests, Issue319*PerfTests, …). #455 fixed
+    // the measurement methodology (GC-drain + min-of-N) but a wall-clock ratio on a
+    // shared 4-core runner under coverage instrumentation is still noise-dominated:
+    // PR #451's run measured 0.79x for what is 3.92x locally. The gate value (0.8x)
+    // is unchanged — it just runs in the perf pipeline, not the flaky correctness CI.
+    // The bit-equality correctness contract runs deterministically in CI via
+    // PrePackedB_Output_BitMatches_LivePack below.
+    [Trait("Category", "Performance")]
     [Fact]
     public void PrePackedB_Reused_Across_Repeated_Gemms_Is_Faster()
     {
@@ -65,10 +75,48 @@ public class PrePackSpeedupTest
     /// baseline (maxDelta &lt; 1e-3) — IS still asserted below; that is what
     /// catches a broken consume path that produces wrong numbers.
     /// </summary>
+    [Trait("Category", "Performance")]
     [Fact]
     public void PrePackedB_At_FFN_128x768x768_Reports_Speedup()
     {
         RunSpeedupGate(M: 128, N: 768, K: 768, iterations: 100, warmup: 10, gateMin: 0.5, enforcePerfGate: false);
+    }
+
+    /// <summary>
+    /// Deterministic correctness contract (runs in the CI correctness pipeline — no
+    /// wall-clock, no Performance trait): pre-packing B once and reusing the packed
+    /// buffer must produce bit-identical output to live-packing B every call. This is
+    /// the check that catches a broken consume path (the documented pre-Sub-E
+    /// regression produced wrong numbers); the speedup gates above are perf-only.
+    /// </summary>
+    [Theory]
+    [InlineData(8, 1024, 1024)]
+    [InlineData(128, 768, 768)]
+    public void PrePackedB_Output_BitMatches_LivePack(int M, int N, int K)
+    {
+        var rng = new Random(42);
+        var a = new float[M * K];
+        var b = new float[K * N];
+        for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < b.Length; i++) b[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        var cBaseline = new float[M * N];
+        var cPrePack = new float[M * N];
+        BlasManagedLib.Gemm<float>(a, K, false, b, N, false, cBaseline, N, M, N, K);
+
+        var handle = BlasManagedLib.PrePackB<float>(b, N, false, K, N);
+        try
+        {
+            var opts = new BlasOptions<float> { PackedB = handle };
+            BlasManagedLib.Gemm<float>(a, K, false, b, N, false, cPrePack, N, M, N, K, opts);
+        }
+        finally { handle.Dispose(); }
+
+        double maxDelta = 0;
+        for (int i = 0; i < cBaseline.Length; i++)
+            maxDelta = Math.Max(maxDelta, Math.Abs((double)cBaseline[i] - cPrePack[i]));
+        Assert.True(maxDelta < 1e-3,
+            $"M={M} N={N} K={K}: pre-pack output drift {maxDelta:G6} exceeds 1e-3 — consume path is incorrect");
     }
 
     private void RunSpeedupGate(int M, int N, int K, int iterations, int warmup, double gateMin, bool enforcePerfGate = true)

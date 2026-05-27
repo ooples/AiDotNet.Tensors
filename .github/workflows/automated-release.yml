@@ -279,6 +279,45 @@ jobs:
           dotnet restore
           dotnet build -c Release --no-restore -p:TelemetryUrl="${{ secrets.AIDOTNET_TELEMETRY_URL }}" -p:TelemetryKey="${{ secrets.AIDOTNET_TELEMETRY_KEY }}"
 
+      # Obfuscation / anti-tamper integration point. Runs the obfuscator you
+      # provision over the freshly-built Release DLLs BEFORE they're packed, so
+      # the published assemblies are protected. This is a NO-OP until you set the
+      # OBFUSCATOR_EXE repository variable (path/command of your licensed tool,
+      # e.g. Eazfuscator/Dotfuscator CLI) and optional OBFUSCATOR_ARGS — so it
+      # never breaks a build. See docs/enterprise/licensing-security-model.md.
+      # NOTE: validate your tool against this reflection/generics-heavy library
+      # in a staging release first — aggressive obfuscation can break runtime
+      # behaviour. (No OSS default is wired in: ConfuserEx is unmaintained and
+      # risks breaking this assembly.)
+      - name: Obfuscate Release assemblies (if obfuscator configured)
+        shell: pwsh
+        env:
+          OBFUSCATOR_EXE: ${{ vars.OBFUSCATOR_EXE }}
+          OBFUSCATOR_ARGS: ${{ vars.OBFUSCATOR_ARGS }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:OBFUSCATOR_EXE)) {
+            Write-Host "No OBFUSCATOR_EXE configured - skipping obfuscation (assemblies will be UNobfuscated)."
+            exit 0
+          }
+          # Wrap in @() so a single-match result is still iterable as a
+          # collection (PowerShell unwraps a one-element pipeline result to
+          # the scalar otherwise, and .Count then returns the byte length).
+          $targets = @(Get-ChildItem -Recurse -Path src -Filter AiDotNet.Tensors.dll |
+                     Where-Object { $_.FullName -match '[\\/]bin[\\/]Release[\\/]' })
+          if ($targets.Count -eq 0) {
+            # Fail closed: OBFUSCATOR_EXE was explicitly configured but the
+            # Release glob found nothing to obfuscate. Shipping unobfuscated
+            # packages from a hardening-enabled job is exactly the silent
+            # weakening this guard exists to prevent.
+            Write-Error "OBFUSCATOR_EXE is configured but no src/**/bin/Release/AiDotNet.Tensors.dll were found - refusing to ship unobfuscated packages."
+            exit 1
+          }
+          foreach ($dll in $targets) {
+            Write-Host "Obfuscating $($dll.FullName)..."
+            & $env:OBFUSCATOR_EXE @($env:OBFUSCATOR_ARGS -split ' ' | Where-Object { $_ }) "$($dll.FullName)"
+            if ($LASTEXITCODE -ne 0) { Write-Error "Obfuscation failed for $($dll.Name)"; exit $LASTEXITCODE }
+          }
+
       - name: Pack NuGet packages
         shell: pwsh
         run: |
@@ -361,6 +400,46 @@ jobs:
 
           Write-Host "=== Packages created ==="
           Get-ChildItem out/
+
+      # Code-signs every .nupkg with the Ooples code-signing certificate so a
+      # tampered/repacked package fails NuGet signature verification (real
+      # tamper-evidence — see docs/enterprise/licensing-security-model.md). This
+      # is a NO-OP when the cert secrets are absent (forks, PRs, or before the
+      # cert is provisioned), so it never breaks a build. To activate, set the
+      # CODE_SIGNING_CERT_BASE64 (base64 of the .pfx) and CODE_SIGNING_CERT_PASSWORD
+      # repository secrets.
+      - name: Sign NuGet packages (if cert configured)
+        shell: pwsh
+        env:
+          CODE_SIGNING_CERT_BASE64: ${{ secrets.CODE_SIGNING_CERT_BASE64 }}
+          CODE_SIGNING_CERT_PASSWORD: ${{ secrets.CODE_SIGNING_CERT_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:CODE_SIGNING_CERT_BASE64) -or
+              [string]::IsNullOrWhiteSpace($env:CODE_SIGNING_CERT_PASSWORD)) {
+            Write-Host "Code-signing secrets are incomplete (CERT_BASE64 and/or CERT_PASSWORD missing) - skipping signing (packages will be UNSIGNED)."
+            exit 0
+          }
+          $certPath = Join-Path ([System.IO.Path]::GetTempPath()) "aidotnet-codesign.pfx"
+          [System.IO.File]::WriteAllBytes($certPath, [System.Convert]::FromBase64String($env:CODE_SIGNING_CERT_BASE64))
+          try {
+            $pkgs = Get-ChildItem out/*.nupkg
+            foreach ($pkg in $pkgs) {
+              Write-Host "Signing $($pkg.Name)..."
+              dotnet nuget sign "$($pkg.FullName)" `
+                --certificate-path $certPath `
+                --certificate-password $env:CODE_SIGNING_CERT_PASSWORD `
+                --timestamper "http://timestamp.digicert.com"
+              if ($LASTEXITCODE -ne 0) { Write-Error "Signing failed for $($pkg.Name)"; exit $LASTEXITCODE }
+            }
+            Write-Host "All packages signed. Verifying..."
+            foreach ($pkg in $pkgs) {
+              dotnet nuget verify "$($pkg.FullName)" --all
+              if ($LASTEXITCODE -ne 0) { Write-Error "Verification failed for $($pkg.Name)"; exit $LASTEXITCODE }
+            }
+          }
+          finally {
+            Remove-Item $certPath -Force -ErrorAction SilentlyContinue
+          }
 
       - name: Upload package artifacts
         uses: actions/upload-artifact@v4
