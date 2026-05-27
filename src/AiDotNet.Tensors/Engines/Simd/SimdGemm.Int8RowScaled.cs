@@ -35,6 +35,7 @@
 #if NET5_0_OR_GREATER
 using System;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
 
@@ -325,29 +326,20 @@ internal static partial class SimdGemm
 
         int mcRounded = ((Mc + Mr - 1) / Mr) * Mr;
         int packedASizePerRow = mcRounded * Kc;
-        int packedBSizePerSub = cached.PackedSubs.Length > 0 ? cached.PackedSubs[0].Length : 0;
 
-        // The parallel path requires at least 2 column sub-blocks — pack-A and
-        // dequant are dispatched as taskId>=numRowBlocks tasks alongside the
-        // pack-A tasks, and a single column sub-block leaves nothing to
-        // parallelize on the dequant side. When canParallelize is true but
-        // NumColSubBlocks < 2, the code falls through to the sequential branch
-        // below; that branch reads packedABuf!/dequantBuf!. Pre-fix those were
-        // null in this case → NRE under low n (n < Nr*4 ≈ 64). Compute the
-        // effective branch once here and key all buffer allocations off it.
+        // The parallel path requires at least 2 column sub-blocks (nothing to
+        // parallelize across otherwise). When canParallelize is true but
+        // NumColSubBlocks < 2, fall through to the sequential branch.
         bool useParallelPath = canParallelize && cached.NumColSubBlocks >= 2;
 
+        // Only pack-A buffers are needed now — the fused macro-kernel reads the
+        // cached packed int8 weights directly (widened in-register), so there's
+        // no FP32 dequant buffer to rent per call.
         var packedABufs = useParallelPath ? new float[numRowBlocks][] : null;
         if (useParallelPath)
             for (int r = 0; r < numRowBlocks; r++)
                 packedABufs![r] = System.Buffers.ArrayPool<float>.Shared.Rent(packedASizePerRow);
         var packedABuf = useParallelPath ? null : System.Buffers.ArrayPool<float>.Shared.Rent(packedASizePerRow);
-
-        var dequantBufs = useParallelPath ? new float[cached.NumColSubBlocks][] : null;
-        if (useParallelPath)
-            for (int cs = 0; cs < cached.NumColSubBlocks; cs++)
-                dequantBufs![cs] = System.Buffers.ArrayPool<float>.Shared.Rent(packedBSizePerSub);
-        var dequantBuf = useParallelPath ? null : System.Buffers.ArrayPool<float>.Shared.Rent(packedBSizePerSub);
 
         try
         {
@@ -374,7 +366,6 @@ internal static partial class SimdGemm
                     int localNumColSubs = cached.NumColSubBlocks;
                     int localNc = nc;
                     var localPackedABufs = packedABufs!;
-                    var localDequantBufs = dequantBufs!;
                     var localCachedSubs = cached.PackedSubs;
                     int localSubsBase = subsBase;
                     float[] localRowScales = rowScalesArr;
@@ -387,29 +378,16 @@ internal static partial class SimdGemm
                         float* localCPtr = cPtr0;
                         int localCLen = c.Length;
 
-                        int numPackTasks = localNumRowBlocks + localNumColSubs;
-                        Helpers.CpuParallelSettings.LightweightParallel(numPackTasks, taskId =>
+                        // Pack-A only (one task per row block).
+                        Helpers.CpuParallelSettings.LightweightParallel(localNumRowBlocks, taskId =>
                         {
-                            if (taskId < localNumRowBlocks)
+                            int r = taskId;
+                            int ic = r * localMc;
+                            int mcLocal = Math.Min(localMc, localM - ic);
+                            if (mcLocal > 0)
                             {
-                                int r = taskId;
-                                int ic = r * localMc;
-                                int mcLocal = Math.Min(localMc, localM - ic);
-                                if (mcLocal > 0)
-                                {
-                                    var aSpan = new ReadOnlySpan<float>(localAPtr, localALen);
-                                    PackA(aSpan, localPackedABufs[r], localK, ic, mcLocal, localPc, localKc);
-                                }
-                            }
-                            else
-                            {
-                                int cs = taskId - localNumRowBlocks;
-                                int jStart = cs * localColSubSize;
-                                int subNc = (cs == localNumColSubs - 1) ? (localNc - jStart) : localColSubSize;
-                                var int8Sub = localCachedSubs[localSubsBase + cs];
-                                DequantizeInt8WithRowScalesToFloat32(
-                                    int8Sub, localDequantBufs[cs],
-                                    localRowScales, jStart, localKc, subNc);
+                                var aSpan = new ReadOnlySpan<float>(localAPtr, localALen);
+                                PackA(aSpan, localPackedABufs[r], localK, ic, mcLocal, localPc, localKc);
                             }
                         });
 
@@ -425,8 +403,9 @@ internal static partial class SimdGemm
                             if (mcLocal > 0 && subNc > 0)
                             {
                                 var cSpan = new Span<float>(localCPtr, localCLen);
-                                MacroKernel(
-                                    localPackedABufs[r], localDequantBufs[cs],
+                                MacroKernelInt8RowScaledFused(
+                                    localPackedABufs[r], localCachedSubs[localSubsBase + cs],
+                                    localRowScales, jStart,
                                     cSpan, mcLocal, subNc, localKc, localN,
                                     ic, jc + jStart);
                             }
@@ -435,7 +414,8 @@ internal static partial class SimdGemm
                 }
                 else
                 {
-                    // Sequential fallback. Pack-A and dequant happen inline.
+                    // Sequential fallback. Pack-A inline; the fused macro-kernel
+                    // reads the cached packed int8 weights directly.
                     PackA(a, packedABuf!, k, false, ic: 0, mc: Math.Min(Mc, m), pc, kc);
                     for (int ic = 0; ic < m; ic += Mc)
                     {
@@ -449,11 +429,9 @@ internal static partial class SimdGemm
                             int subNc = (cs == cached.NumColSubBlocks - 1) ? (nc - jStart) : cached.ColSubSize;
                             if (subNc > 0)
                             {
-                                DequantizeInt8WithRowScalesToFloat32(
-                                    cached.PackedSubs[subsBase + cs], dequantBuf!,
-                                    rowScalesArr, jStart, kc, subNc);
-                                MacroKernel(
-                                    packedABuf!, dequantBuf!,
+                                MacroKernelInt8RowScaledFused(
+                                    packedABuf!, cached.PackedSubs[subsBase + cs],
+                                    rowScalesArr, jStart,
                                     c, mc, subNc, kc, n,
                                     ic, jc + jStart);
                             }
@@ -466,85 +444,9 @@ internal static partial class SimdGemm
         {
             if (packedABuf is not null)
                 System.Buffers.ArrayPool<float>.Shared.Return(packedABuf);
-            if (dequantBuf is not null)
-                System.Buffers.ArrayPool<float>.Shared.Return(dequantBuf);
             if (packedABufs is not null)
                 for (int r = 0; r < numRowBlocks; r++)
                     System.Buffers.ArrayPool<float>.Shared.Return(packedABufs[r]);
-            if (dequantBufs is not null)
-                for (int cs = 0; cs < cached.NumColSubBlocks; cs++)
-                    System.Buffers.ArrayPool<float>.Shared.Return(dequantBufs[cs]);
-        }
-    }
-
-    /// <summary>
-    /// Dequantize one packed sub-block of int8 weights with per-row scales,
-    /// producing the FP32 buffer the macro-kernel reads. Within ONE Nr-wide
-    /// panel of the packed buffer, the same Nr scales apply to every kc-row,
-    /// so we broadcast them once and multiply per row — the per-row scale
-    /// lookup happens Nr times per panel (not Nr × kc times).
-    /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static unsafe void DequantizeInt8WithRowScalesToFloat32(
-        ReadOnlySpan<sbyte> int8Sub,
-        Span<float> output,
-        ReadOnlySpan<float> rowScales,
-        int jStart,
-        int kc,
-        int subNc)
-    {
-        int numPanels = (subNc + Nr - 1) / Nr;
-
-        Span<float> panelScales = stackalloc float[Nr];
-        for (int panel = 0; panel < numPanels; panel++)
-        {
-            int panelStart = panel * Nr;
-            int panelCols = Math.Min(Nr, subNc - panelStart);
-
-            // Gather the Nr scales for this panel; pad with zero so a
-            // partial tail panel contributes zero through the
-            // (zero-padded packed weight) × (zero scale) multiply.
-            for (int jj = 0; jj < Nr; jj++)
-                panelScales[jj] = jj < panelCols ? rowScales[jStart + panelStart + jj] : 0f;
-
-            int packedRowStride = Nr;
-            int panelBase = panel * kc * Nr;
-
-#if NET5_0_OR_GREATER
-            if (Avx2.IsSupported)
-            {
-                fixed (sbyte* pIn = int8Sub)
-                fixed (float* pOut = output)
-                fixed (float* pScales = panelScales)
-                {
-                    // Two AVX2 256-bit vectors cover the 16-wide Nr.
-                    var vScale0 = Avx.LoadVector256(pScales + 0);
-                    var vScale1 = Avx.LoadVector256(pScales + 8);
-                    for (int p = 0; p < kc; p++)
-                    {
-                        int row = panelBase + p * packedRowStride;
-                        sbyte* pInRow = pIn + row;
-                        float* pOutRow = pOut + row;
-                        var v0 = Vector256.Create(
-                            (float)pInRow[0], (float)pInRow[1], (float)pInRow[2], (float)pInRow[3],
-                            (float)pInRow[4], (float)pInRow[5], (float)pInRow[6], (float)pInRow[7]);
-                        var v1 = Vector256.Create(
-                            (float)pInRow[8], (float)pInRow[9], (float)pInRow[10], (float)pInRow[11],
-                            (float)pInRow[12], (float)pInRow[13], (float)pInRow[14], (float)pInRow[15]);
-                        Avx.Store(pOutRow + 0, Avx.Multiply(v0, vScale0));
-                        Avx.Store(pOutRow + 8, Avx.Multiply(v1, vScale1));
-                    }
-                }
-                continue;
-            }
-#endif
-            // Scalar fallback — used on net471 / non-AVX2 hosts.
-            for (int p = 0; p < kc; p++)
-            {
-                int row = panelBase + p * packedRowStride;
-                for (int jj = 0; jj < Nr; jj++)
-                    output[row + jj] = (float)int8Sub[row + jj] * panelScales[jj];
-            }
         }
     }
 
@@ -563,6 +465,210 @@ internal static partial class SimdGemm
             int baseIdx = row * k;
             for (int col = 0; col < k; col++)
                 output[baseIdx + col] = bInt8[baseIdx + col] * scale;
+        }
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // Fused int8×fp32 macro/micro-kernels.
+    //
+    // The weights stay packed int8 all the way into the micro-kernel: each
+    // K-row's 16 int8 weights are widened to fp32 IN-REGISTER (VPMOVSXBD +
+    // CVTDQ2PS) during the FMA loop — no separate dequant pass, no FP32 B
+    // buffer, no per-call ArrayPool rent for it. The per-column row-scale is
+    // constant across the K loop, so it's folded into the store via one FMA
+    // per output row (C += accum·scale) instead of a multiply per K step. This
+    // is the realization of the "INT8 all the way through the kernel" goal:
+    // C[r,c] += scale[c] · Σ_k A[r,k]·B_int8[c,k].
+    // ───────────────────────────────────────────────────────────────────────
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe void WidenInt8RowToFloat(
+        sbyte* p, out Vector256<float> b0, out Vector256<float> b1)
+    {
+        // 16 packed int8 weights (one K-row of an Nr=16 panel) → two fp32 vectors.
+        Vector128<sbyte> raw = Sse2.LoadVector128(p);
+        b0 = Avx.ConvertToVector256Single(Avx2.ConvertToVector256Int32(raw));
+        b1 = Avx.ConvertToVector256Single(
+            Avx2.ConvertToVector256Int32(Sse2.ShiftRightLogical128BitLane(raw, 8)));
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void StoreScaledAccumRow(
+        ref float cRef, int row, int col, int ldc,
+        Vector256<float> v0, Vector256<float> v1,
+        Vector256<float> s0, Vector256<float> s1)
+    {
+        ref float target = ref Unsafe.Add(ref cRef, row * ldc + col);
+        var e0 = Unsafe.ReadUnaligned<Vector256<float>>(ref Unsafe.As<float, byte>(ref target));
+        var e1 = Unsafe.ReadUnaligned<Vector256<float>>(
+            ref Unsafe.As<float, byte>(ref Unsafe.Add(ref target, 8)));
+        Unsafe.WriteUnaligned(ref Unsafe.As<float, byte>(ref target), Fma.MultiplyAdd(v0, s0, e0));
+        Unsafe.WriteUnaligned(
+            ref Unsafe.As<float, byte>(ref Unsafe.Add(ref target, 8)), Fma.MultiplyAdd(v1, s1, e1));
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe void StoreMaskedScaledAccumRow(
+        float* row, Vector256<int> mask0, Vector256<int> mask1,
+        Vector256<float> v0, Vector256<float> v1,
+        Vector256<float> s0, Vector256<float> s1)
+    {
+        var m0f = mask0.AsSingle();
+        var m1f = mask1.AsSingle();
+        var e0 = Avx.MaskLoad(row, m0f);
+        var e1 = Avx.MaskLoad(row + 8, m1f);
+        Avx.MaskStore(row, m0f, Fma.MultiplyAdd(v0, s0, e0));
+        Avx.MaskStore(row + 8, m1f, Fma.MultiplyAdd(v1, s1, e1));
+    }
+
+    private static unsafe void MicroKernel6x16Int8RowScaledFused(
+        float[] packedA, int aOffset,
+        sbyte[] packedBInt8, int bOffset,
+        Vector256<float> s0, Vector256<float> s1,
+        Span<float> c, int ldc, int cRow, int cCol, int kc)
+    {
+        var c00 = Vector256<float>.Zero; var c01 = Vector256<float>.Zero;
+        var c10 = Vector256<float>.Zero; var c11 = Vector256<float>.Zero;
+        var c20 = Vector256<float>.Zero; var c21 = Vector256<float>.Zero;
+        var c30 = Vector256<float>.Zero; var c31 = Vector256<float>.Zero;
+        var c40 = Vector256<float>.Zero; var c41 = Vector256<float>.Zero;
+        var c50 = Vector256<float>.Zero; var c51 = Vector256<float>.Zero;
+
+        ref float aRef = ref MemoryMarshal.GetArrayDataReference(packedA);
+        fixed (sbyte* pB0 = packedBInt8)
+        {
+            sbyte* pB = pB0 + bOffset;
+            for (int p = 0; p < kc; p++)
+            {
+                WidenInt8RowToFloat(pB + p * Nr, out var b0, out var b1);
+                int aBase = aOffset + p * Mr;
+                var a = Vector256.Create(Unsafe.Add(ref aRef, aBase + 0));
+                c00 = Fma.MultiplyAdd(a, b0, c00); c01 = Fma.MultiplyAdd(a, b1, c01);
+                a = Vector256.Create(Unsafe.Add(ref aRef, aBase + 1));
+                c10 = Fma.MultiplyAdd(a, b0, c10); c11 = Fma.MultiplyAdd(a, b1, c11);
+                a = Vector256.Create(Unsafe.Add(ref aRef, aBase + 2));
+                c20 = Fma.MultiplyAdd(a, b0, c20); c21 = Fma.MultiplyAdd(a, b1, c21);
+                a = Vector256.Create(Unsafe.Add(ref aRef, aBase + 3));
+                c30 = Fma.MultiplyAdd(a, b0, c30); c31 = Fma.MultiplyAdd(a, b1, c31);
+                a = Vector256.Create(Unsafe.Add(ref aRef, aBase + 4));
+                c40 = Fma.MultiplyAdd(a, b0, c40); c41 = Fma.MultiplyAdd(a, b1, c41);
+                a = Vector256.Create(Unsafe.Add(ref aRef, aBase + 5));
+                c50 = Fma.MultiplyAdd(a, b0, c50); c51 = Fma.MultiplyAdd(a, b1, c51);
+            }
+        }
+
+        ref float cRef = ref MemoryMarshal.GetReference(c);
+        StoreScaledAccumRow(ref cRef, cRow + 0, cCol, ldc, c00, c01, s0, s1);
+        StoreScaledAccumRow(ref cRef, cRow + 1, cCol, ldc, c10, c11, s0, s1);
+        StoreScaledAccumRow(ref cRef, cRow + 2, cCol, ldc, c20, c21, s0, s1);
+        StoreScaledAccumRow(ref cRef, cRow + 3, cCol, ldc, c30, c31, s0, s1);
+        StoreScaledAccumRow(ref cRef, cRow + 4, cCol, ldc, c40, c41, s0, s1);
+        StoreScaledAccumRow(ref cRef, cRow + 5, cCol, ldc, c50, c51, s0, s1);
+    }
+
+    private static unsafe void MicroKernelMxNMaskedInt8RowScaledFused(
+        float[] packedA, int aOffset,
+        sbyte[] packedBInt8, int bOffset,
+        Vector256<float> s0, Vector256<float> s1,
+        Span<float> c, int ldc, int cRow, int cCol,
+        int kc, int mc_actual, int nc_actual)
+    {
+        var c00 = Vector256<float>.Zero; var c01 = Vector256<float>.Zero;
+        var c10 = Vector256<float>.Zero; var c11 = Vector256<float>.Zero;
+        var c20 = Vector256<float>.Zero; var c21 = Vector256<float>.Zero;
+        var c30 = Vector256<float>.Zero; var c31 = Vector256<float>.Zero;
+        var c40 = Vector256<float>.Zero; var c41 = Vector256<float>.Zero;
+        var c50 = Vector256<float>.Zero; var c51 = Vector256<float>.Zero;
+
+        ref float aRef = ref MemoryMarshal.GetArrayDataReference(packedA);
+        fixed (sbyte* pB0 = packedBInt8)
+        {
+            sbyte* pB = pB0 + bOffset;
+            for (int p = 0; p < kc; p++)
+            {
+                WidenInt8RowToFloat(pB + p * Nr, out var b0, out var b1);
+                int aBase = aOffset + p * Mr;
+                var a = Vector256.Create(Unsafe.Add(ref aRef, aBase + 0));
+                c00 = Fma.MultiplyAdd(a, b0, c00); c01 = Fma.MultiplyAdd(a, b1, c01);
+                a = Vector256.Create(Unsafe.Add(ref aRef, aBase + 1));
+                c10 = Fma.MultiplyAdd(a, b0, c10); c11 = Fma.MultiplyAdd(a, b1, c11);
+                a = Vector256.Create(Unsafe.Add(ref aRef, aBase + 2));
+                c20 = Fma.MultiplyAdd(a, b0, c20); c21 = Fma.MultiplyAdd(a, b1, c21);
+                a = Vector256.Create(Unsafe.Add(ref aRef, aBase + 3));
+                c30 = Fma.MultiplyAdd(a, b0, c30); c31 = Fma.MultiplyAdd(a, b1, c31);
+                a = Vector256.Create(Unsafe.Add(ref aRef, aBase + 4));
+                c40 = Fma.MultiplyAdd(a, b0, c40); c41 = Fma.MultiplyAdd(a, b1, c41);
+                a = Vector256.Create(Unsafe.Add(ref aRef, aBase + 5));
+                c50 = Fma.MultiplyAdd(a, b0, c50); c51 = Fma.MultiplyAdd(a, b1, c51);
+            }
+        }
+
+        int lane0N = nc_actual >= 8 ? 8 : nc_actual;
+        int lane1N = nc_actual >= 8 ? nc_actual - 8 : 0;
+        Vector256<int> mask0 = _partialNrMasks[lane0N];
+        Vector256<int> mask1 = _partialNrMasks[lane1N];
+
+        fixed (float* pC = c)
+        {
+            float* row = pC + cRow * ldc + cCol;
+            if (mc_actual > 0) StoreMaskedScaledAccumRow(row,           mask0, mask1, c00, c01, s0, s1);
+            if (mc_actual > 1) StoreMaskedScaledAccumRow(row + ldc,     mask0, mask1, c10, c11, s0, s1);
+            if (mc_actual > 2) StoreMaskedScaledAccumRow(row + ldc * 2, mask0, mask1, c20, c21, s0, s1);
+            if (mc_actual > 3) StoreMaskedScaledAccumRow(row + ldc * 3, mask0, mask1, c30, c31, s0, s1);
+            if (mc_actual > 4) StoreMaskedScaledAccumRow(row + ldc * 4, mask0, mask1, c40, c41, s0, s1);
+            if (mc_actual > 5) StoreMaskedScaledAccumRow(row + ldc * 5, mask0, mask1, c50, c51, s0, s1);
+        }
+    }
+
+    /// <summary>
+    /// Fused macro-kernel: drives the int8×fp32 micro-kernels over an
+    /// (mc × nc) C tile reading packed int8 weights directly (no dequant
+    /// buffer). <paramref name="rowScaleBase"/> is the column offset of this
+    /// sub-block within the per-row-scale array.
+    /// </summary>
+    private static unsafe void MacroKernelInt8RowScaledFused(
+        float[] packedA, sbyte[] packedBInt8,
+        float[] rowScales, int rowScaleBase,
+        Span<float> c, int mc, int nc, int kc, int ldc, int icOffset, int jcOffset)
+    {
+        int nrBlocks = (nc + Nr - 1) / Nr;
+        int mrBlocks = (mc + Mr - 1) / Mr;
+        float* sc = stackalloc float[Nr];
+
+        for (int jr = 0; jr < nrBlocks; jr++)
+        {
+            int jLocal = jr * Nr;
+            int nc_actual = Math.Min(Nr, nc - jLocal);
+            int bPanelOffset = jr * kc * Nr;
+
+            // Gather the 16 per-column scales for this Nr panel; pad columns
+            // past nc_actual with 0 so the zero-padded packed weights × 0
+            // contribute nothing (mirrors PackBInt8FromNK's tail padding).
+            for (int jj = 0; jj < Nr; jj++)
+                sc[jj] = jj < nc_actual ? rowScales[rowScaleBase + jLocal + jj] : 0f;
+            var s0 = Avx.LoadVector256(sc);
+            var s1 = Avx.LoadVector256(sc + 8);
+
+            for (int ir = 0; ir < mrBlocks; ir++)
+            {
+                int iLocal = ir * Mr;
+                int mc_actual = Math.Min(Mr, mc - iLocal);
+                int aPanelOffset = ir * kc * Mr;
+
+                if (mc_actual == Mr && nc_actual == Nr)
+                {
+                    MicroKernel6x16Int8RowScaledFused(
+                        packedA, aPanelOffset, packedBInt8, bPanelOffset,
+                        s0, s1, c, ldc, icOffset + iLocal, jcOffset + jLocal, kc);
+                }
+                else if (mc_actual > 0 && nc_actual > 0)
+                {
+                    MicroKernelMxNMaskedInt8RowScaledFused(
+                        packedA, aPanelOffset, packedBInt8, bPanelOffset,
+                        s0, s1, c, ldc, icOffset + iLocal, jcOffset + jLocal,
+                        kc, mc_actual, nc_actual);
+                }
+            }
         }
     }
 }

@@ -1,4 +1,5 @@
-﻿using System.Diagnostics;
+﻿using System.Collections.Generic;
+using System.Diagnostics;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -79,6 +80,17 @@ public class PerformanceRegressionTests
     //     unfused dispatch, not the regression this test is named for.
     private const double LstmAiseval_BudgetMs = 30.0;
     private const double MhaAiseval_BudgetMs = 15.0;
+
+    // AIsEval MLP inference perf gate (issue #436 P1). The MlpForward fused
+    // primitive shipped in #437 with correctness tests but no perf gate. The
+    // AIsEval rerun measured the framework's unfused per-layer Predict path at
+    // 8.94 ms (PyTorch 1.91 ms) on Dense(784->512)->Dense(512->128)->Dense(128->10)
+    // at bs=128 — attributed to dispatch overhead (nine dispatches for three
+    // layers). MlpForward collapses the stack to three fused-linear dispatches.
+    // This gate measures the primitive at the AIsEval shape and budgets below
+    // the unfused 8.94 ms so a regression to the unfused/scalar path fails,
+    // while leaving headroom for CI noise over the measured number.
+    private const double MlpAiseval_BudgetMs = 8.0;
 
     public PerformanceRegressionTests(ITestOutputHelper output) => _output = output;
 
@@ -394,6 +406,55 @@ public class PerformanceRegressionTests
         Assert.True(ms < MhaAiseval_BudgetMs,
             $"MultiHeadAttentionForward took {ms:F2} ms — exceeds {MhaAiseval_BudgetMs} ms budget. " +
             "Stage 6 float fast path measured 10.13 ms on net10.0; a regression to the Stage 4 wrapper path would push this back to ~22 ms.");
+    }
+
+    [Fact(Skip = "Performance guard — run manually with --filter PerformanceRegression")]
+    public void MlpForward_Aiseval_FusedDispatch_BeatsUnfusedPath()
+    {
+        // AIsEval MLP inference shape: Dense(784->512)->Dense(512->128)->Dense(128->10)
+        // at bs=128 — three GEMMs of (128,784,512), (128,512,128), (128,128,10).
+        // PyTorch did this in 1.91 ms; the framework's per-layer
+        // MatMul+Add+Activation Predict path measured 8.94 ms (issue #436 P1).
+        // MlpForward collapses the 3-layer stack to 3 fused-linear dispatches and
+        // measured 2.95 ms/iter on net10.0 (Release) on the dev host — i.e. it
+        // already meets the issue's <= 3 ms acceptance (1.54x PyTorch), so the
+        // remaining work is framework-side wiring (ooples/AiDotNet#1447).
+        // Budget at 8 ms catches a regression back to the unfused dispatch path
+        // (which the issue measured at 8.94 ms) while leaving ~2.7x headroom over
+        // the measured fused number for CI noise. Skip-by-default to match the
+        // repo perf-gate convention (run via --filter PerformanceRegression).
+        var input = Tensor<float>.CreateRandom([128, 784]);
+        var weights = new List<Tensor<float>>
+        {
+            Tensor<float>.CreateRandom([784, 512]),
+            Tensor<float>.CreateRandom([512, 128]),
+            Tensor<float>.CreateRandom([128, 10]),
+        };
+        var biases = new List<Tensor<float>?>
+        {
+            Tensor<float>.CreateRandom([512]),
+            Tensor<float>.CreateRandom([128]),
+            Tensor<float>.CreateRandom([10]),
+        };
+
+        // MlpForward is on IEngine (the fused path lives in CpuEngine and is
+        // picked up by DirectGpuTensorEngine via inheritance), so no downcast.
+        for (int w = 0; w < 5; w++)
+            _ = _engine.MlpForward(input, weights, biases, FusedActivationType.ReLU, FusedActivationType.None);
+
+        var sw = Stopwatch.StartNew();
+        const int iters = 50;
+        for (int i = 0; i < iters; i++)
+            _ = _engine.MlpForward(input, weights, biases, FusedActivationType.ReLU, FusedActivationType.None);
+        sw.Stop();
+        double ms = sw.Elapsed.TotalMilliseconds / iters;
+
+        _output.WriteLine($"MlpForward AIsEval [128,784->512->128->10]: {ms:F3} ms/iter " +
+            $"(budget: {MlpAiseval_BudgetMs} ms; PyTorch baseline 1.91 ms; framework unfused path 8.94 ms)");
+        Assert.True(ms < MlpAiseval_BudgetMs,
+            $"MlpForward took {ms:F3} ms — exceeds {MlpAiseval_BudgetMs} ms budget. " +
+            "The fused 3-dispatch path should stay below the 8.94 ms unfused-dispatch number " +
+            "from issue #436; a regression here means the primitive is no longer collapsing the dense stack.");
     }
 
     [Fact(Skip = "Performance guard — run manually with --filter PerformanceRegression")]
