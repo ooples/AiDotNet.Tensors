@@ -83,6 +83,19 @@ public static class PerfHarness
     private const int Warmup = 3;
 
     /// <summary>
+    /// Per-thread allocated bytes. <see cref="GC.GetAllocatedBytesForCurrentThread"/>
+    /// is net5.0+ only (absent from this project's net471 profile), so on net471 the
+    /// alloc metric is reported as 0 — the perf catalog is a net5.0+ artifact and its
+    /// perf tests run there; net471 is build-only.
+    /// </summary>
+    private static long AllocatedBytes() =>
+#if NET5_0_OR_GREATER
+        GC.GetAllocatedBytesForCurrentThread();
+#else
+        0L;
+#endif
+
+    /// <summary>
     /// Measures one shape on both backends. Returns a fully-populated
     /// <see cref="ShapeResult"/> even when native BLAS is unavailable (in which
     /// case <see cref="ShapeResult.NativeAvailable"/> is false and the native
@@ -135,7 +148,7 @@ public static class PerfHarness
         // Drain GC before the measurement so a Gen2 collect mid-window
         // doesn't contaminate the alloc-bytes delta or the timing tail.
         SettleHeap();
-        long bmAllocStart = GC.GetAllocatedBytesForCurrentThread();
+        long bmAllocStart = AllocatedBytes();
         var bmTimes = new double[iters];
         var sw = new Stopwatch();
         for (int i = 0; i < iters; i++)
@@ -145,7 +158,7 @@ public static class PerfHarness
             sw.Stop();
             bmTimes[i] = sw.Elapsed.TotalMilliseconds;
         }
-        double bmAllocPerCall = (GC.GetAllocatedBytesForCurrentThread() - bmAllocStart) / (double)iters;
+        double bmAllocPerCall = (AllocatedBytes() - bmAllocStart) / (double)iters;
         Array.Sort(bmTimes);
         double bmMedian = bmTimes[iters / 2];
         double bmP95 = bmTimes[Math.Min(iters - 1, (int)(iters * 0.95))];
@@ -163,7 +176,7 @@ public static class PerfHarness
                     BlasProvider.TryGemmEx(s.M, s.N, s.K, a, 0, aCols, s.TransA, b, 0, bCols, s.TransB, c, 0, s.N);
 
                 SettleHeap();
-                long nAllocStart = GC.GetAllocatedBytesForCurrentThread();
+                long nAllocStart = AllocatedBytes();
                 var nTimes = new double[iters];
                 for (int i = 0; i < iters; i++)
                 {
@@ -172,7 +185,7 @@ public static class PerfHarness
                     sw.Stop();
                     nTimes[i] = sw.Elapsed.TotalMilliseconds;
                 }
-                nativeAlloc = (GC.GetAllocatedBytesForCurrentThread() - nAllocStart) / (double)iters;
+                nativeAlloc = (AllocatedBytes() - nAllocStart) / (double)iters;
                 Array.Sort(nTimes);
                 nativeMedian = nTimes[iters / 2];
                 nativeP95 = nTimes[Math.Min(iters - 1, (int)(iters * 0.95))];
@@ -210,7 +223,7 @@ public static class PerfHarness
             BlasManagedLib.Gemm<double>(a, aCols, s.TransA, b, bCols, s.TransB, c, s.N, s.M, s.N, s.K);
 
         SettleHeap();
-        long bmAllocStart = GC.GetAllocatedBytesForCurrentThread();
+        long bmAllocStart = AllocatedBytes();
         var bmTimes = new double[iters];
         var sw = new Stopwatch();
         for (int i = 0; i < iters; i++)
@@ -220,7 +233,7 @@ public static class PerfHarness
             sw.Stop();
             bmTimes[i] = sw.Elapsed.TotalMilliseconds;
         }
-        double bmAllocPerCall = (GC.GetAllocatedBytesForCurrentThread() - bmAllocStart) / (double)iters;
+        double bmAllocPerCall = (AllocatedBytes() - bmAllocStart) / (double)iters;
         Array.Sort(bmTimes);
         double bmMedian = bmTimes[iters / 2];
         double bmP95 = bmTimes[Math.Min(iters - 1, (int)(iters * 0.95))];
@@ -238,7 +251,7 @@ public static class PerfHarness
                     BlasProvider.TryGemmEx(s.M, s.N, s.K, a, 0, aCols, s.TransA, b, 0, bCols, s.TransB, c, 0, s.N);
 
                 SettleHeap();
-                long nAllocStart = GC.GetAllocatedBytesForCurrentThread();
+                long nAllocStart = AllocatedBytes();
                 var nTimes = new double[iters];
                 for (int i = 0; i < iters; i++)
                 {
@@ -247,7 +260,7 @@ public static class PerfHarness
                     sw.Stop();
                     nTimes[i] = sw.Elapsed.TotalMilliseconds;
                 }
-                nativeAlloc = (GC.GetAllocatedBytesForCurrentThread() - nAllocStart) / (double)iters;
+                nativeAlloc = (AllocatedBytes() - nAllocStart) / (double)iters;
                 Array.Sort(nTimes);
                 nativeMedian = nTimes[iters / 2];
                 nativeP95 = nTimes[Math.Min(iters - 1, (int)(iters * 0.95))];
