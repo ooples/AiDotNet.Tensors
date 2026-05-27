@@ -25,42 +25,62 @@ public class ParallelForOrSerialDispatchTests
 
         bool savedDeterministic = CpuParallelSettings.DeterministicReductions;
         int savedMaxDegree = CpuParallelSettings.MaxDegreeOfParallelism;
+        ThreadPool.GetMinThreads(out int savedMinWorker, out int savedMinIo);
         try
         {
             CpuParallelSettings.DeterministicReductions = false;
             CpuParallelSettings.MaxDegreeOfParallelism = Environment.ProcessorCount;
+            // Pre-spawn worker threads so fan-out doesn't hinge on a cold ThreadPool
+            // warming up — the dominant flake source on a shared 4-vCPU CI runner
+            // where sibling xUnit tests saturate the pool (#447 / #451 / #455).
+            ThreadPool.SetMinThreads(Math.Max(savedMinWorker, Environment.ProcessorCount), savedMinIo);
 
             int callerThread = Thread.CurrentThread.ManagedThreadId;
-            int numChunks = Math.Max(2, Environment.ProcessorCount);
+            // totalWork >> grain forces ParallelForOrSerial down the PARALLEL branch
+            // (Parallel.For). But TPL is still ALLOWED to inline that parallel branch
+            // entirely on the caller when the pool is momentarily starved — that is a
+            // TPL scheduling choice, NOT a ParallelForOrSerial regression. So we retry
+            // the worker-probe: a genuine serial-dispatch regression (wrong branch
+            // taken) fails EVERY attempt; a transient starvation passes one. Each
+            // attempt blocks ONE caller iteration briefly (Interlocked-designated
+            // waiter — the rest continue so a real regression fails fast) to give TPL
+            // a window to recruit a worker that Sets the event.
+            int numChunks = Math.Max(16, Environment.ProcessorCount * 4);
             long totalWork = (long)PersistentParallelExecutor.DefaultSerialGrainSize * 4;
-            var observed = new int[numChunks];
-
-            // Same deterministic worker-probe as GrainSizeDispatchTests: a worker
-            // iteration Sets the event, caller-thread iterations Wait briefly for
-            // it. If nothing ever dispatched off-thread the Wait times out.
-            using var workerSeen = new ManualResetEventSlim(false);
-            CpuParallelSettings.ParallelForOrSerial(0, numChunks, totalWork, c =>
-            {
-                int tid = Thread.CurrentThread.ManagedThreadId;
-                observed[c] = tid;
-                if (tid != callerThread) workerSeen.Set();
-                else workerSeen.Wait(TimeSpan.FromMilliseconds(200));
-            });
-
+            const int attempts = 8;
             bool sawWorker = false;
-            for (int c = 0; c < numChunks; c++)
-                if (observed[c] != callerThread) { sawWorker = true; break; }
 
-            Assert.True(sawWorker && workerSeen.IsSet,
+            for (int attempt = 0; attempt < attempts && !sawWorker; attempt++)
+            {
+                var observed = new int[numChunks];
+                using var workerSeen = new ManualResetEventSlim(false);
+                int callerWaiterClaimed = 0;
+                CpuParallelSettings.ParallelForOrSerial(0, numChunks, totalWork, c =>
+                {
+                    int tid = Thread.CurrentThread.ManagedThreadId;
+                    observed[c] = tid;
+                    if (tid != callerThread)
+                        workerSeen.Set();
+                    else if (Interlocked.Exchange(ref callerWaiterClaimed, 1) == 0)
+                        workerSeen.Wait(TimeSpan.FromSeconds(2));
+                });
+
+                for (int c = 0; c < numChunks; c++)
+                    if (observed[c] != callerThread) { sawWorker = true; break; }
+            }
+
+            Assert.True(sawWorker,
                 $"totalWork ({totalWork}) >> grain size "
                 + $"({PersistentParallelExecutor.DefaultSerialGrainSize}) with DeterministicReductions=false "
-                + $"should have dispatched to the worker pool, but all {numChunks} chunks ran on caller "
-                + $"thread {callerThread}.");
+                + $"should have dispatched to the worker pool, but across {attempts} attempts all "
+                + $"{numChunks} chunks ran on caller thread {callerThread} — ParallelForOrSerial took the "
+                + "serial branch when it should have parallelized.");
         }
         finally
         {
             CpuParallelSettings.DeterministicReductions = savedDeterministic;
             CpuParallelSettings.MaxDegreeOfParallelism = savedMaxDegree;
+            ThreadPool.SetMinThreads(savedMinWorker, savedMinIo);
         }
     }
 
