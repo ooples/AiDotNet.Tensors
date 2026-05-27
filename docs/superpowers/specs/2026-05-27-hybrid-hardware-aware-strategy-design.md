@@ -201,3 +201,40 @@ atomically — never a new strategy paired with blocking tuned for the old one.
 - **Cross-session collision on the dispatcher** (parallel agents on #462) — mitigated by
   landing the table behind a clean new file and keeping `SelectStrategy` edits minimal.
 - **Dynamic-shape memory** (G4) — bounded-LRU `SightingTracker` caps growth.
+
+## 10. As-built (2026-05-27, PR #462)
+
+Implemented in 4 phases on `perf/blas-managed-fp64-small-square-microkernel`. Deltas from
+the design above:
+
+- **Trans-aware throughout (refinement).** The lever-check (Task 1.0) confirmed only ~1/6
+  catalog shapes reach strategy selection — Sub-S handles non-transposed aligned GEMM, so
+  the shapes the hybrid governs are *transposed*. Accordingly `SightingTracker.ShapeId`,
+  `BackgroundAutotuner.Observe`, the measurement, and the learned-cache key all carry
+  `transA/transB`, and `SelectStrategy` gained a trans-aware overload. Without this the
+  learned key would never match real (transposed) calls.
+- **`#464` dispatch tests converted to hardware-aware.** `SmallShapeStreamingDispatchTests`
+  asserted universal routes (incompatible with per-hardware routing); the hardware-dependent
+  cases now assert the table per explicit `HwKey` (cpu16→Streaming, cpu32→blocking). The
+  `MediumSquare` bucket requires a true cube (m==n==k) so thin-K 512×512×64 isn't conflated
+  with 128³.
+- **`BackgroundAutotuner.Enabled` switch.** Default ON (production). The test assembly
+  disables it at load (`[ModuleInitializer]`) so its concurrent measurement load can't
+  perturb timing-sensitive tests; the worker-exercising test re-enables locally inside the
+  serialized collection.
+- **KernelVersion (G8) interim.** `assembly-version + manual KernelEpoch` rather than a full
+  source content-hash (deferred to a source-generator). Combining with the assembly version
+  bounds the staleness window to a single dev build.
+- **net471.** `BlockingCollection`/`ThreadPriority`/`Thread` are available there; the worker
+  compiles and runs on both TFMs (no no-op needed).
+- **Pre-warm dir ships empty.** The `*.prewarm.json` glob matches nothing until CI runs
+  `--prewarm-autotune` per arch and commits trustworthy sweeps; dev-box single-run output is
+  intentionally not committed.
+- **De-flake (pre-existing).** Serialized the reduction-order mutators (`DeterministicModeTests`,
+  `ParallelForOrSerialDispatchTests`) and bit-exact victims (`PartialMCorrectnessTest`,
+  `Avx2PackTransBFp32Test`, `SmallShapeStreamingDispatchTests`) into `BlasManaged-Stats-Serial`;
+  tagged the unguarded `Fp64x12` GFLOPS gate `[Trait Performance]`.
+
+**Verification:** 493 BlasManaged/ScalarKernel tests pass ×3 (no flakes); both TFMs build;
+head-to-head shows no regression on the Sub-S-handled plain shapes (the hybrid governs the
+transposed shapes outside that catalog).
