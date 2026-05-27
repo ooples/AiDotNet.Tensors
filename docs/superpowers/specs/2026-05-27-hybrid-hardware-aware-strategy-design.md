@@ -238,3 +238,33 @@ the design above:
 **Verification:** 493 BlasManaged/ScalarKernel tests pass ×3 (no flakes); both TFMs build;
 head-to-head shows no regression on the Sub-S-handled plain shapes (the hybrid governs the
 transposed shapes outside that catalog).
+
+## 11. Post-verification corrections (the as-built §10 claimed clean completion prematurely)
+
+A follow-up audit found two real defects that the originally-skipped G12/G13 guards would
+have caught at the time:
+
+- **G13 — hot-path disk-read regression (severe).** `SelectStrategy`'s learned-cache consult
+  called `AutotuneCache.Lookup`, which does `File.Exists + ReadAllText + JSON parse` *per
+  call* (it is not memory-cached). Measured **77 µs/call** — roughly doubling every
+  transposed GEMM's dispatch cost. Fixed with an in-memory memo in `BlasManagedAutotune`
+  (`_strategyMemo`): disk touched at most once per distinct shape; `StoreStrategy` refreshes
+  it (version-gated). Re-measured **757 ns/call** (100× faster, sub-µs). Committed G13 latency
+  guard (`HybridStrategyPerfTests`, default-on, 10 µs gate).
+- **G12 — table mis-calibration.** The seed table was calibrated from *non-transposed* A/B
+  data, but it is consulted *only* for transposed shapes (Sub-S handles non-transposed). So
+  transposed 512×512×64 routed to Streaming = **2.5× slower** than PackBoth. Recalibrated the
+  cpu16 `ThinK` entry to PackBoth (the transposed optimum from `--prewarm-autotune`); updated
+  the dispatch tests. The learned/prewarm layer already measured this correctly, so it
+  self-heals — only the static cold-start seed was wrong. The G12 wall-clock guard is env-gated
+  (`AIDOTNET_RUN_HYBRID_PERF=1`) as it is contention-sensitive; routing correctness is
+  guarded deterministically by `SmallShapeStreamingDispatchTests`.
+
+**Remaining known limitations (disclosed, not yet addressed):**
+- `_strategyMemo` is unbounded (bounded in practice by a workload's distinct-shape count;
+  the on-disk cache is likewise per-shape unbounded).
+- The earlier-session `EnableAutotuneV2` (Gemm-level, opt-in, default off) coexists with this
+  hybrid (SelectStrategy-level) — redundant; a future consolidation should pick one.
+- The hybrid's end-to-end *speedup* on real transposed workloads is **not yet demonstrated** —
+  only routing correctness, no-regression on the Sub-S path, and sub-µs dispatch are verified.
+  The lever is bounded (~1/6 catalog shapes reach strategy selection).
