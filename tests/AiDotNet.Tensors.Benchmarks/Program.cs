@@ -113,6 +113,11 @@ class Program
             PyTorchComparison.GapInvestigationBench.Run();
             return;
         }
+        if (args[0] == "--cache-probe")
+        {
+            PyTorchComparison.GapInvestigationBench.CacheProbe();
+            return;
+        }
 
         // Issue #403 Phase A.3: per-substep allocation profile + shape catalog
         // for one pass through the DCGAN-step probe substeps. Cheap to run

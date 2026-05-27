@@ -77,6 +77,35 @@ internal static class GapInvestigationBench
         Console.WriteLine();
     }
 
+    /// <summary>Diagnose whether the autotune Decide cache hits on repeated calls.</summary>
+    public static void CacheProbe()
+    {
+        Console.WriteLine("=== Autotune cache hit/miss probe (96×128×64 FP64 Auto, 50 calls) ===");
+        const int M = 96, N = 128, K = 64;
+        var rng = new Random(1);
+        var a = new double[M * K];
+        var b = new double[K * N];
+        var c = new double[M * N];
+        for (int i = 0; i < a.Length; i++) a[i] = rng.NextDouble();
+        for (int i = 0; i < b.Length; i++) b[i] = rng.NextDouble();
+
+        var before = BlasManagedLib.GetStats();
+        var sw = new Stopwatch();
+        double total = 0;
+        for (int i = 0; i < 50; i++)
+        {
+            sw.Restart();
+            BlasManagedLib.Gemm<double>(a, K, false, b, N, false, c, N, M, N, K);
+            sw.Stop();
+            total += sw.Elapsed.TotalMicroseconds;
+        }
+        var after = BlasManagedLib.GetStats();
+        Console.WriteLine($"  autotune hits  Δ = {after.AutotuneHits - before.AutotuneHits}");
+        Console.WriteLine($"  autotune misses Δ = {after.AutotuneMisses - before.AutotuneMisses}");
+        Console.WriteLine($"  avg per call = {total / 50:F1} µs (50 calls)");
+        Console.WriteLine($"  → if misses ≈ 50, the cache thrashes (Store/disk per call).");
+    }
+
     private static void VerifyTorchComputes()
     {
         const int M = 32, K = 16, N = 8;
