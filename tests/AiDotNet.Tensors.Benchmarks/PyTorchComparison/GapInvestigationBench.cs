@@ -107,6 +107,55 @@ internal static class GapInvestigationBench
         Console.WriteLine("    (attention QK^T, backward passes) — quantify against the real workload mix.");
     }
 
+    /// <summary>
+    /// Phase-4 pre-warm (#375): synchronously measure the strategy winner for each catalog
+    /// shape on THIS fingerprint and write a shippable {fingerprint}.prewarm.json. Run per
+    /// arch in CI; commit the output under
+    /// src/AiDotNet.Tensors/Engines/BlasManaged/Autotune/prewarm/ to ship optimal-on-arrival
+    /// routing. Local learned entries always win at runtime; this only seeds cold-start.
+    /// </summary>
+    public static void PrewarmAutotune()
+    {
+        string fp = AiDotNet.Tensors.Helpers.Autotune.HardwareFingerprint.Current;
+        Console.WriteLine($"=== Pre-warm autotune for fingerprint: {fp} ===");
+        // (M, N, K, fp64, transA, transB) — focus on shapes that reach strategy selection
+        // (transposed / unaligned), below the background work ceiling.
+        var shapes = new (int M, int N, int K, bool fp64, bool transA, bool transB)[]
+        {
+            (96, 128, 64, true, false, true),
+            (128, 128, 128, true, false, true),
+            (197, 197, 64, false, false, true),
+            (256, 256, 96, true, false, true),
+            (512, 512, 64, true, false, true),
+            (197, 768, 768, false, false, true),
+        };
+        var outPath = $"{fp}.prewarm.json";
+        using var w = new System.IO.StreamWriter(outPath, append: false);
+        int done = 0;
+        foreach (var s in shapes)
+        {
+            var id = new AiDotNet.Tensors.Engines.BlasManaged.SightingTracker.ShapeId(
+                s.M, s.N, s.K, s.fp64, s.transA, s.transB);
+            AiDotNet.Tensors.Engines.BlasManaged.BackgroundAutotuner.MeasureNowForTest(id);
+            var shape = s.fp64
+                ? AiDotNet.Tensors.Engines.BlasManaged.BlasManagedAutotune.EncodeShape<double>(
+                    s.M, s.N, s.K, s.transA, s.transB, 0, 0, false,
+                    AiDotNet.Tensors.Helpers.BlasProvider.IsDeterministicMode)
+                : AiDotNet.Tensors.Engines.BlasManaged.BlasManagedAutotune.EncodeShape<float>(
+                    s.M, s.N, s.K, s.transA, s.transB, 0, 0, false,
+                    AiDotNet.Tensors.Helpers.BlasProvider.IsDeterministicMode);
+            var learned = AiDotNet.Tensors.Engines.BlasManaged.BlasManagedAutotune.TryLookupStrategy(shape);
+            if (learned is not { } e) continue;
+            // M N K fp64 transA transB strategy mc nc kc threadCount
+            w.WriteLine($"{s.M} {s.N} {s.K} {(s.fp64 ? 1 : 0)} {(s.transA ? 1 : 0)} {(s.transB ? 1 : 0)} " +
+                        $"{e.Mode} {e.Mc} {e.Nc} {e.Kc} {e.ThreadCount}");
+            done++;
+            Console.WriteLine($"  {s.M}x{s.N}x{s.K} fp64={s.fp64} transB={s.transB} → {e.Mode}");
+        }
+        Console.WriteLine($"  wrote {done}/{shapes.Length} entries to {outPath}");
+        Console.WriteLine($"  → commit it as src/AiDotNet.Tensors/Engines/BlasManaged/Autotune/prewarm/{fp}.prewarm.json");
+    }
+
     /// <summary>Diagnose whether the autotune Decide cache hits on repeated calls.</summary>
     public static void CacheProbe()
     {
