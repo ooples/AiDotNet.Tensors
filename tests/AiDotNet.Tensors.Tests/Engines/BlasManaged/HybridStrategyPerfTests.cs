@@ -35,7 +35,7 @@ public class HybridStrategyPerfTests
             sw.Restart();
             Dispatcher.SelectStrategy<float>(197, 197, 64, false, true, in opts);
             sw.Stop();
-            times[i] = sw.Elapsed.TotalMicroseconds;
+            times[i] = sw.Elapsed.TotalMilliseconds * 1000.0; // µs (TimeSpan.TotalMicroseconds is net7.0+ only; this is net471-safe)
         }
         Array.Sort(times);
         double medianUs = times[iters / 2];
