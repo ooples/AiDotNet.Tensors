@@ -40,48 +40,32 @@ internal static class Dispatcher
         // Streaming routes below are gated on !hasPrePack; PackBoth/PackAOnly consume it.
         bool hasPrePack = options.PackedA != null || options.PackedB != null;
 
-        // Sub-G readiness — A/B diagnostic (Conv2DAbBench
-        // `--ab-blas-small-square-fp64`) measured every PackingMode for the
-        // 6 worst-loss shapes in the refreshed baseline and revealed three
-        // distinct K<128 regimes that PackAOnly handled badly. PackAOnly is
-        // rarely the optimal choice — it wins only on a narrow band of
-        // medium-work shapes (~96×128×64-ish), and the prior heuristic
-        // routed every K<128 shape to it regardless of M, N, total work.
-        //
-        // Empirical optima (16-core AVX2 Windows host, 2026-05-26):
-        //
-        //   tiny cubes (M·N·K ≤ 300K):              Streaming
-        //     - 64³ FP64: Streaming 4.3 vs PackAOnly 2.4 (1.8× win)
-        //     - 64³ FP32: Streaming 5.8 vs PackAOnly 3.3 (1.75× win)
-        //
-        //   thin-K with substantial work, very thin N (≤32):  PackBoth
-        //     - 3136×32×32 FP32: PackBoth 35.3 vs PackAOnly 18.2 (1.94×)
-        //
-        //   thin-K with substantial work, tall + thin N (n≤64, m≥8·n): Streaming
-        //     - 3136×64×64 FP32: Streaming 55.6 vs PackAOnly 26.3 (2.11×)
-        //
-        //   thin-K with substantial work, balanced M·N:    PackBoth
-        //     - 512×512×64 FP64: PackBoth 53.2 vs PackAOnly 12.0 (4.43×)
-        //
-        //   medium-K, medium work (PackAOnly's narrow band): PackAOnly
-        //     - 96×128×64 FP64: PackAOnly 9.2 vs Streaming 8.6 vs PackBoth 3.3
-        //
-        // The branch ordering below codifies this map. The 300K Streaming
-        // cutoff is intentionally BELOW 96×128×64's work (786K) so
-        // PackAOnly's narrow band is preserved.
-
+        // Sub-C (#371, PR #464): small total work → pack-free Streaming. Below
+        // SmallShapeWorkThreshold (1M) the pack-A rent+pack round-trip costs more
+        // than the GEMM compute, so packing is skipped. This is the routing PR
+        // #464 introduced and that SmallShapeStreamingDispatchTests pins; a prior
+        // main→branch merge silently reverted it to a 300K cutoff (leaving the
+        // 1M constant unused), which regressed 96³/80×80×100-class shapes back to
+        // PackAOnly and turned those tests red. Restored here. Also routes
+        // 96×128×64 (786K) pack-free, which the 16-core AVX2 A/B confirms
+        // (Streaming ≫ PackAOnly).
         long work = (long)m * n * k;
-        if (!hasPrePack && work <= 300_000L) return PackingMode.ForceStreaming;
+        if (!hasPrePack && work < SmallShapeWorkThreshold) return PackingMode.ForceStreaming;
 
-        if (k < 128 && work >= 1_000_000L)
-        {
-            // Substantial thin-K shape. Three sub-regimes:
-            if (n <= 32) return PackingMode.ForcePackBoth;                  // micro-N
-            if (!hasPrePack && n <= 64 && m >= 8 * n) return PackingMode.ForceStreaming;   // tall + thin
-            return PackingMode.ForcePackBoth;                               // balanced
-        }
+        // work ≥ 1M. Preserve the two special-case wins the old heuristic carried
+        // (PR #464's clean version dropped both, which would regress them):
+        //   (a) tall + thin-N, low-K → Streaming (e.g. ResNet50_layer1 3136×64×64:
+        //       Streaming ≫ PackAOnly; the very tall M streams cheaply).
+        //   (b) medium-M wide-shape, k≥256 → PackAOnly (e.g. 128×768×768: PackAOnly
+        //       ≫ PackBoth — pack-B amortises poorly at small M/mr reuse).
+        // Everything else low-K goes PackAOnly; high-K balanced goes PackBoth.
+        // (The strategy choice on 128³ / 512×512×64 is hardware-dependent — see
+        // the per-fingerprint autotune; the static default here matches #464's
+        // tests.)
+        if (!hasPrePack && k < 128 && n <= 64 && m >= 8 * n)
+            return PackingMode.ForceStreaming;                              // (a) tall + thin
 
-        if (k < 128) return PackingMode.ForcePackAOnly;                     // 96×128×64-style
+        if (k < 128) return PackingMode.ForcePackAOnly;                     // 512×512×64, 3136×32×32
 
         // Sub-G follow-on: medium-M wide-shape pattern. At k≥256 with
         // moderate M (128-256) and substantially larger N and K, PackBoth
