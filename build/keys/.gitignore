@@ -1,0 +1,7 @@
+# NEVER commit signing private keys. These are the trust anchors for enterprise
+# licensing — committing one compromises it permanently (git history is forever).
+*.pem
+*.key
+*.pfx
+*-PRIVATE*
+*private*

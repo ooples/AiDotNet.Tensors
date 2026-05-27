@@ -54,6 +54,18 @@
     <Reference Include="System.IO.Compression.FileSystem" />
   </ItemGroup>
 
+  <!-- Machine-code / JIT-emitter tests need System.Runtime.Intrinsics.X86,
+       function pointers, and MethodImplOptions.AggressiveOptimization — none of
+       which exist on net471. The kernels they cover are net5.0+ only (see the
+       #if NET5_0_OR_GREATER guard in MachineKernelGemm), so exclude these test
+       files from the net471 build (net471 is build-only; tests run on net10.0). -->
+  <ItemGroup Condition="'$(TargetFramework)' == 'net471'">
+    <Compile Remove="Engines\BlasManaged\FmaCeilingProbe.cs" />
+    <Compile Remove="Engines\BlasManaged\Fp64MicrokernelEmitterTests.cs" />
+    <Compile Remove="Engines\BlasManaged\MachineCodeKernelTests.cs" />
+    <Compile Remove="Engines\BlasManaged\MachineKernelGemmTests.cs" />
+  </ItemGroup>
+
   <!-- Deploy BlasManaged baseline JSON alongside the test assembly so the
        regression test can locate it via Assembly.Location at runtime.
        Use Include (not Update) so MSBuild adds the file to the item list
