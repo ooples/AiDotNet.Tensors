@@ -432,7 +432,7 @@ internal static class Conv2DAbBench
     /// <summary>
     /// #415 Phase F — fast same-process probe of the FP64 Conv2D backward path
     /// at the exact ResNet50/VGG16 shapes that drive cluster #6 timeouts on
-    /// AiDotNet CI. Reports per-shape median + min ms for dW
+    /// AiDotNet CI. Reports per-shape min ms (min-of-N — robust to GC/noise) for dW
     /// (Conv2DBackwardKernel) and dX (Conv2DBackwardInput), plus a synthetic
     /// "1 train step" total to compare against the 480 ms/step target.
     ///
