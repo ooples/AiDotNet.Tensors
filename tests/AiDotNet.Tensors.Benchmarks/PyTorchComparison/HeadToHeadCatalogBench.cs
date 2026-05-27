@@ -203,7 +203,7 @@ internal static class HeadToHeadCatalogBench
         sb.AppendLine();
         sb.AppendLine($"**Summary (median gate):** {pass} PASS, {warn} WARN, {fail} FAIL of {rows.Count} shapes.");
         sb.AppendLine();
-        sb.AppendLine("> Note: AiDotNet measured on the default dispatch path (EnableAutotuneV2 off). " +
+        sb.AppendLine("> Note: AiDotNet measured on the default dispatch path. " +
                       "Raw-GEMM parity with MKL-backed torch on compute-bound shapes is the hardest gate; " +
                       "see the differentiator benchmarks (cold-start, determinism, per-call threads, frozen-weight) " +
                       "for the structural wins PyTorch cannot match regardless of GFLOPS.");

@@ -57,46 +57,12 @@ public static class BlasManaged
     /// </summary>
     public static bool AutotuneRouting { get; set; } = false;
 
-    /// <summary>
-    /// Layer F (#375): per-shape strategy autotune. When true, <see cref="Gemm{T}"/>
-    /// consults <see cref="_autotuneV2"/> for the empirically-fastest
-    /// (<see cref="PackingMode"/> + thread count) per shape, learned via a one-time
-    /// warmup sweep on first use. Opt-in (default <see langword="false"/>) because
-    /// the warmup sweep adds first-call latency for each new shape — long-running
-    /// servers and training loops benefit; one-shot calls do not. Distinct from
-    /// <see cref="AutotuneRouting"/>, which chooses managed-vs-native, not the
-    /// managed strategy.
-    /// </summary>
-    public static bool EnableAutotuneV2 { get; set; } = false;
-
-    /// <summary>
-    /// Process-wide strategy autotune cache (Layer F). Gated by
-    /// <see cref="EnableAutotuneV2"/>. Empirically routes each shape to its
-    /// fastest strategy + thread count, retiring the brittle static dispatcher
-    /// thresholds for shapes that have been seen before.
-    /// </summary>
-    private static readonly Autotune.AutotuneCacheV2 _autotuneV2 = new();
-
-    /// <summary>
-    /// Test/diagnostic hook: number of shapes with a finalized autotune entry.
-    /// </summary>
-    internal static int AutotuneV2ShapeCount => _autotuneV2.Count;
-
-    /// <summary>
-    /// Clear the process-wide autotune V2 cache. The cache is process-global state;
-    /// without a reset it bleeds across tests and persists for a long-running
-    /// session. Tests call this to start from a known state, and callers can use it
-    /// to force a re-sweep (e.g., after a host/affinity change).
-    /// </summary>
-    public static void ClearAutotuneV2() => _autotuneV2.Clear();
-
-    /// <summary>
-    /// Minimum work (M·N·K) for an autotune warmup sweep. Below this the
-    /// per-call dispatch overhead dwarfs the strategy difference, so a sweep
-    /// wastes time. Matches the tiny-shape regime that already routes straight
-    /// to Streaming.
-    /// </summary>
-    private const long AutotuneV2MinWork = 100_000L;
+    // #375: the earlier opt-in Gemm-level autotune (EnableAutotuneV2 + AutotuneCacheV2 +
+    // a synchronous warmup sweep) was superseded by the hybrid hardware-aware strategy
+    // selection — a per-fingerprint, disk-persistent, non-blocking learned cache wired into
+    // Dispatcher.SelectStrategy (see StrategyDefaultTable + BlasManagedAutotune.TryLookupStrategy
+    // + BackgroundAutotuner). The hybrid does the same job strictly better (persistent,
+    // default-on, no first-call sweep cost), so the redundant V2 path was removed.
 
     /// <summary>
     /// Computes C = op(A) · op(B), where op(X) is X or X^T.
@@ -244,38 +210,6 @@ public static class BlasManaged
                             c.Slice(mAl * ldc + nAl), ldc, mTail, nTail, k, in options);
                     return;
                 }
-            }
-        }
-
-        // Layer F (#375): per-shape strategy autotune (opt-in via EnableAutotuneV2).
-        // On a cache hit, dispatch the empirically-fastest (strategy, threads) for
-        // this shape; on a miss, run a one-time warmup sweep then cache + use the
-        // winner. Both paths re-enter Gemm with an explicit (non-Auto) PackingMode
-        // so this branch fires at most once per top-level call. Gated + work-floored
-        // so default behaviour and tiny shapes are untouched.
-        if (EnableAutotuneV2 && options.PackingMode == PackingMode.Auto
-            && (long)m * n * k >= AutotuneV2MinWork)
-        {
-            var dt = typeof(T) == typeof(double) ? Autotune.DType.Double : Autotune.DType.Single;
-            var shapeKey = new Autotune.AutotuneCacheV2.ShapeKey(m, n, k, transA, transB, dt);
-
-            if (!_autotuneV2.TryGet(shapeKey, out var cached))
-            {
-                RunAutotuneSweep<T>(a, lda, transA, b, ldb, transB, c, ldc, m, n, k, shapeKey, in options);
-                _autotuneV2.FinalizeWarmup(shapeKey);
-                _autotuneV2.TryGet(shapeKey, out cached);
-            }
-
-            if (cached is not null)
-            {
-                // Respect an explicit caller thread request (NumThreads != 0, including
-                // -1 = single-thread); only apply the autotuned thread count when the
-                // caller left threading on auto (0). Otherwise the cache would override
-                // the call site's deliberate threading intent.
-                int tunedThreads = options.NumThreads != 0 ? options.NumThreads : cached.NumThreads;
-                var tuned = WithStrategy(in options, cached.Mode, tunedThreads);
-                Gemm<T>(a, lda, transA, b, ldb, transB, c, ldc, m, n, k, in tuned);
-                return;
             }
         }
 
@@ -867,71 +801,6 @@ public static class BlasManaged
     /// This selection drives the layout of packed-A and packed-B, so it must
     /// match the microkernel the strategy ultimately dispatches to.
     /// </summary>
-    /// <summary>
-    /// Layer F: clone <paramref name="options"/> with an explicit
-    /// <paramref name="mode"/> + <paramref name="numThreads"/>, preserving all
-    /// other fields. The explicit (non-Auto) mode ensures the recursive dispatch
-    /// bypasses the autotune branch.
-    /// </summary>
-    private static BlasOptions<T> WithStrategy<T>(in BlasOptions<T> options, PackingMode mode, int numThreads)
-        where T : unmanaged =>
-        new()
-        {
-            PackingMode = mode,
-            NumThreads = numThreads,
-            Epilogue = options.Epilogue,
-            Workspace = options.Workspace,
-            PackedA = options.PackedA,
-            PackedB = options.PackedB,
-            AutotuneKey = options.AutotuneKey,
-            MaxJitCacheBytes = options.MaxJitCacheBytes,
-            Mode = options.Mode,
-        };
-
-    /// <summary>
-    /// Layer F (#375): one-time warmup sweep on a cache miss. Times three
-    /// candidate strategies (Streaming, PackAOnly, PackBoth) at sensible thread
-    /// counts, taking the best of two runs each, and records the samples into
-    /// <see cref="_autotuneV2"/>. The caller finalizes the sweep to publish the
-    /// winner. Each timed run is a full <see cref="Gemm{T}"/> with an explicit
-    /// strategy, so it computes correct C — the last winner call recomputes once
-    /// more for the actual result.
-    /// </summary>
-    private static void RunAutotuneSweep<T>(
-        ReadOnlySpan<T> a, int lda, bool transA,
-        ReadOnlySpan<T> b, int ldb, bool transB,
-        Span<T> c, int ldc,
-        int m, int n, int k,
-        Autotune.AutotuneCacheV2.ShapeKey key,
-        in BlasOptions<T> baseOptions) where T : unmanaged
-    {
-        int procs = Environment.ProcessorCount;
-        Span<(PackingMode mode, int threads)> candidates = stackalloc (PackingMode, int)[3];
-        candidates[0] = (PackingMode.ForceStreaming, procs);
-        candidates[1] = (PackingMode.ForcePackAOnly, Math.Min(procs, 8));
-        candidates[2] = (PackingMode.ForcePackBoth, procs);
-
-        var (mr, nr) = PickMicrokernelTile<T>();
-
-        foreach (var (mode, threads) in candidates)
-        {
-            // PackAOnly has no transB=true path — skip that candidate.
-            if (mode == PackingMode.ForcePackAOnly && transB) continue;
-
-            var subOpts = WithStrategy(in baseOptions, mode, threads);
-            double min = double.MaxValue;
-            for (int i = 0; i < 2; i++)
-            {
-                var sw = System.Diagnostics.Stopwatch.StartNew();
-                Gemm<T>(a, lda, transA, b, ldb, transB, c, ldc, m, n, k, in subOpts);
-                sw.Stop();
-                double t = sw.Elapsed.TotalMilliseconds;
-                if (t < min) min = t;
-            }
-            _autotuneV2.RecordWarmupSample(key, mode, threads, mc: m, nc: n, kc: k, mr: mr, nr: nr, measuredMs: min);
-        }
-    }
-
     private static (int Mr, int Nr) PickMicrokernelTile<T>() where T : unmanaged
     {
         if (typeof(T) == typeof(double))

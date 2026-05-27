@@ -34,11 +34,3 @@ public sealed class BlasManagedPerfSerialCollection { }
 /// </summary>
 [CollectionDefinition("BlasManaged-Pool-Serial", DisableParallelization = true)]
 public sealed class BlasManagedPoolSerialCollection { }
-
-/// <summary>
-/// AutotuneCacheV2 tests toggle the process-global <c>EnableAutotuneV2</c>
-/// flag. If another GEMM collection ran concurrently while the flag is on, its
-/// dispatch would change underneath it. Serialize against all other collections.
-/// </summary>
-[CollectionDefinition("BlasManaged-Autotune-Serial", DisableParallelization = true)]
-public sealed class BlasManagedAutotuneSerialCollection { }
