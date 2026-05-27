@@ -174,4 +174,37 @@ internal static class BlasManagedAutotune
         var choice = EncodeChoice(axis, mc, nc, kc, threadCount, measuredTimeMs);
         AutotuneCache.Store(GemmKernelId, shape, choice);
     }
+
+    /// <summary>
+    /// #375: Store a tuned (strategy + blocking) unit for a shape, tagged with the kernel
+    /// version (G2/G11). Strategy and blocking are persisted together so a learned strategy
+    /// is never paired with blocking tuned for a different one.
+    /// </summary>
+    public static void StoreStrategy(ShapeProfile shape, PackingMode mode, ParallelismAxis axis,
+        int mc, int nc, int kc, int threadCount, string kernelVersion)
+    {
+        var choice = EncodeChoice(axis, mc, nc, kc, threadCount, measuredTimeMs: 0);
+        choice.Parameters["packingMode"] = mode.ToString();
+        choice.Parameters["kernelVersion"] = kernelVersion;
+        AutotuneCache.Store(GemmKernelId, shape, choice);
+    }
+
+    /// <summary>
+    /// #375: Look up a tuned (strategy + blocking) unit. Returns null on miss OR when the
+    /// stored entry's kernel version doesn't match the current build (stale → ignore, G2).
+    /// </summary>
+    public static (PackingMode Mode, ParallelismAxis Axis, int Mc, int Nc, int Kc, int ThreadCount)?
+        TryLookupStrategy(ShapeProfile shape)
+    {
+        KernelChoice? choice = AutotuneCache.Lookup(GemmKernelId, shape);
+        if (choice?.Parameters is null) return null;
+        if (!choice.Parameters.TryGetValue("kernelVersion", out var ver)
+            || ver != BlasKernelVersion.Current)
+            return null; // stale or pre-strategy entry → treat as miss (G2)
+        if (!choice.Parameters.TryGetValue("packingMode", out var modeStr)
+            || !Enum.TryParse<PackingMode>(modeStr, out var mode))
+            return null;
+        var (axis, mc, nc, kc, tc) = DecodeChoice(choice);
+        return (mode, axis, mc, nc, kc, tc);
+    }
 }
