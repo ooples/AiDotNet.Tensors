@@ -239,10 +239,16 @@ public sealed class LicenseValidator
         // set for the calling library — `AiDotNet.Tensors` gets the
         // tensors:* capabilities, `AiDotNet` gets the model:* set, and
         // higher tiers get both.
+        // Per-request nonce: the server binds it into its signed response so a
+        // captured/spoofed response can't be replayed (the nonce won't match the
+        // next request). Always sent; only ENFORCED when RequireSignedResponse.
+        string nonce = LicenseResponseVerifier.NewNonce();
+
         var body = new Dictionary<string, string?>
         {
             ["license_key"] = _licenseKey.Key,
             ["package"] = "AiDotNet.Tensors",
+            ["nonce"] = nonce,
         };
         if (_licenseKey.Environment is not null)
             body["environment"] = _licenseKey.Environment;
@@ -255,14 +261,14 @@ public sealed class LicenseValidator
         string json = JsonSerializer.Serialize(body);
 
 #if NET471
-        return PostNet471(url, json);
+        return PostNet471(url, json, nonce, _licenseKey.RequireSignedResponse);
 #else
-        return PostModern(url, json);
+        return PostModern(url, json, nonce, _licenseKey.RequireSignedResponse);
 #endif
     }
 
 #if NET471
-    private LicenseValidationResult PostNet471(string url, string json)
+    private LicenseValidationResult PostNet471(string url, string json, string nonce, bool requireSigned)
     {
         var req = (HttpWebRequest)WebRequest.Create(url);
         req.Method = "POST";
@@ -276,15 +282,15 @@ public sealed class LicenseValidator
         using var stream = resp.GetResponseStream() ?? Stream.Null;
         using var reader = new StreamReader(stream, Encoding.UTF8);
         string responseJson = reader.ReadToEnd();
-        return ParseResponse(responseJson, (int)resp.StatusCode);
+        return ParseResponse(responseJson, (int)resp.StatusCode, nonce, requireSigned);
     }
 #else
-    private LicenseValidationResult PostModern(string url, string json)
+    private LicenseValidationResult PostModern(string url, string json, string nonce, bool requireSigned)
     {
         var content = new StringContent(json, Encoding.UTF8, "application/json");
         var response = SharedHttpClient.PostAsync(url, content).GetAwaiter().GetResult();
         string responseJson = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
-        return ParseResponse(responseJson, (int)response.StatusCode);
+        return ParseResponse(responseJson, (int)response.StatusCode, nonce, requireSigned);
     }
 #endif
 
@@ -293,7 +299,8 @@ public sealed class LicenseValidator
     /// Visible to tests so the parser can be exercised without a live
     /// server.
     /// </summary>
-    internal static LicenseValidationResult ParseResponse(string responseJson, int statusCode)
+    internal static LicenseValidationResult ParseResponse(
+        string responseJson, int statusCode, string? nonce = null, bool requireSigned = false)
     {
         // Network non-2xx → invalid. The Edge Function returns 200
         // for both valid and invalid keys with status in the body, so
@@ -342,6 +349,29 @@ public sealed class LicenseValidator
                         var v = cap.GetString();
                         if (!string.IsNullOrEmpty(v)) caps.Add(v!);
                     }
+                }
+            }
+
+            // Anti-spoof: when the caller requires it, the response MUST carry a
+            // valid RSA signature over the canonical (nonce|status|tier|expires|
+            // caps) form, verified against the embedded server key. The nonce
+            // binding defeats replay of any captured response. A missing/invalid
+            // signature degrades the result to Invalid — a spoofed server can't
+            // forge "active". (Inert until RequireSignedResponse is enabled AND
+            // the embedded response-signing key is real; see the server spec.)
+            if (requireSigned)
+            {
+                string? signature = root.TryGetProperty("signature", out var sigEl) ? sigEl.GetString() : null;
+                string? expiresRaw = root.TryGetProperty("expires_at", out var expRaw) ? expRaw.GetString() : null;
+                bool ok = LicenseResponseVerifier.Verify(nonce ?? string.Empty, statusStr, tier, expiresRaw, caps, signature);
+                if (!ok)
+                {
+                    return new LicenseValidationResult(
+                        LicenseKeyStatus.Invalid,
+                        tier: null, expiresAt: null, validatedAt: DateTimeOffset.UtcNow,
+                        message: "License server response failed signature verification " +
+                                 "(RequireSignedResponse is enabled). Possible spoofed/MITM'd server.",
+                        capabilities: null);
                 }
             }
 

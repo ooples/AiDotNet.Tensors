@@ -235,14 +235,19 @@ public partial class CpuEngine
     /// </summary>
     private static Tensor<float> WrapAsTensor(float[] buffer, int d0, int d1, int d2, int d3)
     {
-        // Tensor<float> ctor takes (T[] data, int[] dimensions). Note the
-        // buffer is from ArrayPool which may be larger than the logical
-        // tensor (bucket-sized); only the first product(dimensions) elements
-        // are meaningful. The ctor's base() forwards to the storage layer
-        // which uses dimensions for element count — capacity past that is
-        // harmless. Lifetime: this Tensor must not outlive the pool.Return
-        // in the caller's finally — we use it only as a thunk into SDPA.
-        return new Tensor<float>(buffer, new[] { d0, d1, d2, d3 });
+        // The buffer is from ArrayPool, which returns a BUCKET-sized array (rounded
+        // up to a power of 2) that is ≥ the logical element count and only equals it
+        // when the count is itself a power of 2. The Tensor ctor validates
+        // data.Length == product(dimensions) exactly, so passing the whole array threw
+        // "The number of values does not match the specified shape" whenever
+        // d0*d1*d2*d3 wasn't a power of 2 — i.e. every non-power-of-2 sequence length
+        // (issue #468). Wrap EXACTLY product(dimensions) elements as a zero-copy
+        // Memory view so the length always matches regardless of the rented capacity.
+        // Lifetime: this Tensor must not outlive the caller's pool.Return — it is used
+        // only as a thunk into SDPA.
+        int n = d0 * d1 * d2 * d3;
+        var view = Vector<float>.WrapMemory(buffer.AsMemory(0, n));
+        return new Tensor<float>(new[] { d0, d1, d2, d3 }, view);
     }
 
     private static void TransposeQkv(float[] src, float[] dst, int batch, int seq, int numHeads, int dHead)

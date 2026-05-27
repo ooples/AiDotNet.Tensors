@@ -27,6 +27,18 @@ public static class NativeLibraryDetector
     public static bool HasOpenBlas => Status.HasOpenBlas;
 
     /// <summary>
+    /// Gets a human-readable explanation of why the native CPU BLAS is unavailable,
+    /// or <c>null</c> when it loaded successfully (<see cref="HasCpuBlas"/> is <c>true</c>).
+    /// <para>
+    /// Issue #444: when <c>libopenblas</c> is deployed but still reports as not found, this
+    /// distinguishes the common causes — package not installed, a missing transitive
+    /// dependency causing the OS loader to fail (<c>ERROR_MOD_NOT_FOUND</c>), an
+    /// architecture mismatch, or an explicit <c>AIDOTNET_USE_BLAS</c> opt-out.
+    /// </para>
+    /// </summary>
+    public static string? OpenBlasLoadDiagnostic => Helpers.BlasProvider.LoadError;
+
+    /// <summary>
     /// Gets whether Intel MKL is available for CPU-accelerated BLAS operations.
     /// </summary>
     public static bool HasMkl => Status.HasMkl;
@@ -127,10 +139,16 @@ public static class NativeLibraryDetector
     public static string GetStatusSummary()
     {
         var status = Status;
+        // Issue #444: when OpenBLAS is not active, append the captured load
+        // reason so a deployed-but-not-loaded library is diagnosable in place.
+        var diagnostic = OpenBlasLoadDiagnostic;
+        string openBlasLine = status.HasOpenBlas
+            ? "Available"
+            : string.IsNullOrEmpty(diagnostic) ? "Not found" : $"Not found ({diagnostic})";
         return $"""
             Native Library Status:
               CPU BLAS:
-                OpenBLAS: {(status.HasOpenBlas ? "Available" : "Not found")}
+                OpenBLAS: {openBlasLine}
                 Intel MKL: {(status.HasMkl ? "Available" : "Not found")}
 
               GPU Acceleration:
@@ -160,22 +178,24 @@ public static class NativeLibraryDetector
 
     private static bool DetectOpenBlas()
     {
-        // External BLAS disabled in the supply-chain-independence build
-        // (feat/finish-mkl-replacement). NativeLibraryDetector still exists for
-        // diagnostic purposes (HasCuda / HasHip / HasOpenCl / HasClBlast all
-        // report GPU-side libraries that ARE still loaded when AiDotNet.Native.*
-        // packages are installed), but the two CPU BLAS detectors (OpenBlas,
-        // MKL) always report false since those paths are no longer used by
-        // the engine — matmul runs through SimdGemm.
-        return false;
+        // Issue #444: report the TRUE state of the native CPU BLAS path. These
+        // detectors previously hardcoded `false` (a stale assumption from when
+        // matmul ran exclusively through SimdGemm), but the engine's GEMM
+        // dispatch now routes through Helpers.BlasProvider, which loads
+        // libopenblas by default (industry-standard BLAS-on; opt out with
+        // AIDOTNET_USE_BLAS=0). Hardcoding `false` made AccelerationDiagnostics
+        // report "OpenBLAS: Not found" even when libopenblas was deployed,
+        // loaded, and actively servicing matmul — a diagnostic that
+        // contradicted reality. Delegating to BlasProvider keeps the diagnostic
+        // surface consistent with the path real matmul actually takes.
+        return Helpers.BlasProvider.IsOpenBlasActive;
     }
 
     private static bool DetectMkl()
     {
-        // See DetectOpenBlas: CPU BLAS detection disabled. The engine routes
-        // all matmul through SimdGemm's AVX2 blocked kernel + JIT micro-kernel
-        // regardless of whether a system MKL DLL is present.
-        return false;
+        // Issue #444: see DetectOpenBlas. True only when the consumer opted into
+        // MKL routing (AIDOTNET_BLAS_PROVIDER=mkl*) AND MklImports loaded.
+        return Helpers.BlasProvider.IsMklActive;
     }
 
     private static bool DetectClBlast()

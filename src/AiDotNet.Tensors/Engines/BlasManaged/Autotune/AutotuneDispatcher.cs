@@ -42,6 +42,21 @@ internal static class AutotuneDispatcher
             bool hasEpilogue,
             PackingMode packingMode) where T : unmanaged
     {
+        // Sub-Q (#407): when a BlockSizeSweep is measuring candidates, every
+        // nested GEMM on this thread must (a) use the candidate blocking under
+        // test and (b) NOT re-enter the cache or kick off another sweep — that
+        // would recurse forever. The per-thread override supplies the candidate
+        // blocking AND acts as the recursion guard. (This is the role the issue
+        // earmarked for PrefersManagedCache.BypassAutotune; a dedicated override
+        // is cleaner because it also carries the (Mc, Nc, Kc) being probed.)
+        var ovr = BlockOverride;
+        if (ovr.HasValue)
+        {
+            var axisOvr = AxisSelector.Select(m, n, k, mr, nr, procs, isDeterministic);
+            var (omc, onc, okc) = ClampBlocking(ovr.Value.Mc, ovr.Value.Nc, ovr.Value.Kc, m, n, k, mr, nr);
+            return (axisOvr, omc, onc, okc, procs);
+        }
+
         // DisableAutotune: skip cache entirely, use heuristic directly.
         if (packingMode == PackingMode.DisableAutotune)
         {
@@ -58,8 +73,34 @@ internal static class AutotuneDispatcher
             return cached.Value;
         }
 
-        // Cache miss — use heuristic, store the decision.
+        // Cache miss.
         BlasManagedStatsTracker.IncrementAutotuneMiss();
+
+        // Sub-Q (#407): measurement-based tuning. When enabled (and the shape is
+        // large enough that the block choice actually matters), benchmark a set
+        // of candidate (Mc, Nc, Kc) tuples and cache the measured winner. Off by
+        // default — falls through to the heuristic below.
+        if ((MeasurementEnabled || ForceMeasureOnMiss) && ShouldMeasure(m, n, k))
+        {
+            try
+            {
+                var measured = BlockSizeSweep.Measure<T>(m, n, k, transA, transB, mr, nr, procs, isDeterministic);
+                try
+                {
+                    BlasManagedAutotune.Store(shape, measured.Axis, measured.Mc, measured.Nc, measured.Kc, measured.ThreadCount, measured.MeasuredMs);
+                }
+                catch { /* cache write failure is non-fatal */ }
+                return (measured.Axis, measured.Mc, measured.Nc, measured.Kc, measured.ThreadCount);
+            }
+            catch
+            {
+                // Any measurement failure (allocation, unexpected shape, etc.) is
+                // non-fatal — fall through to the heuristic so the GEMM still runs.
+            }
+        }
+
+        // Heuristic fallback — store the decision so future calls of this shape
+        // are a cache hit even without measurement.
         var result = FallbackToHeuristic(m, n, k, mr, nr, procs, isDeterministic);
         try
         {
@@ -74,6 +115,48 @@ internal static class AutotuneDispatcher
     }
 
     /// <summary>
+    /// Sub-Q (#407): per-thread block-size override consumed by <see cref="Decide{T}"/>.
+    /// <see cref="BlockSizeSweep"/> sets this to the candidate under test before
+    /// each measurement GEMM and clears it afterwards. Non-null also suppresses
+    /// cache lookup/store and recursive measurement on this thread.
+    /// </summary>
+    [ThreadStatic] internal static (int Mc, int Nc, int Kc)? BlockOverride;
+
+    /// <summary>
+    /// Gate for measurement-based autotune: only spend the (one-time, cached-
+    /// forever) measurement cost on shapes big enough that (a) the timing is
+    /// stable at ms scale and (b) a block choice beyond the heuristic clamp
+    /// actually exists. Tiny/skinny shapes clamp to their dimensions anyway, so
+    /// there is nothing to tune.
+    /// </summary>
+    private static bool ShouldMeasure(int m, int n, int k)
+        => (long)m * n * k >= 1_000_000
+           && (m > 128 || n > 512 || k > 256);
+
+    /// <summary>
+    /// Clamp a candidate (Mc, Nc, Kc) to the shape and microkernel alignment, so
+    /// the strategy pipeline never sees a block bigger than the matrix or a
+    /// non-positive / mis-aligned value. Mirrors the clamping in
+    /// <see cref="FallbackToHeuristic"/>.
+    /// </summary>
+    internal static (int Mc, int Nc, int Kc) ClampBlocking(
+        int mc, int nc, int kc, int m, int n, int k, int mr, int nr)
+    {
+        mc = Math.Min(mc, m);
+        nc = Math.Min(nc, n);
+        kc = Math.Min(kc, k);
+        if (mr > 0) mc = (mc / mr) * mr;
+        if (nr > 0) nc = (nc / nr) * nr;
+        if (mc <= 0) mc = Math.Min(Math.Max(1, mr), m);
+        if (nc <= 0) nc = Math.Min(Math.Max(1, nr), n);
+        if (kc <= 0) kc = 1; // k > 0 is guaranteed by Gemm's early-out
+        mc = Math.Min(mc, m);
+        nc = Math.Min(nc, n);
+        kc = Math.Min(kc, k);
+        return (mc, nc, kc);
+    }
+
+    /// <summary>
     /// Sub-Q (#407): when set, on autotune cache miss benchmark a small set of
     /// candidate (Mc, Nc, Kc) tuples and store the winner instead of using the
     /// heuristic. Off by default — first-call overhead is several ms per shape.
@@ -82,6 +165,14 @@ internal static class AutotuneDispatcher
     /// </summary>
     internal static bool MeasurementEnabled { get; } =
         Environment.GetEnvironmentVariable("AIDOTNET_BLAS_AUTOTUNE_MEASURE") == "1";
+
+    /// <summary>
+    /// Sub-Q (#407): per-thread force-measure flag set by
+    /// <see cref="BlockSizeSweep.PrepopulateCommonShapes"/> so offline warmup
+    /// measures-and-caches the common shapes even when runtime measurement
+    /// (<see cref="MeasurementEnabled"/>) is off. Scoped to the warmup thread.
+    /// </summary>
+    [ThreadStatic] internal static bool ForceMeasureOnMiss;
 
     /// <summary>
     /// Use the AxisSelector heuristic to choose an axis, with default blocking

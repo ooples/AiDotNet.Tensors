@@ -33,7 +33,37 @@ internal static class Dispatcher
             return options.PackingMode;
 
         if (k < 32 || (long)m * n < 1024) return PackingMode.ForceStreaming;
+
+        // Sub-C (#371): skip packing entirely for small total work. PackAOnly
+        // rents + packs the A panel (PackAOnlyStrategy) and PackBoth packs both;
+        // at small M·N·K that rent+pack round-trip costs more than the GEMM
+        // compute itself. Measured (FP64, OpenBLAS baseline): Tiny_64sq
+        // (64×64×64 = 262k) drops from ~21× to ~13× when routed pack-free,
+        // because the pack-A allocation is eliminated. The threshold stays well
+        // below larger low-K shapes (e.g. WideFat 512×512×64 = 16.7M, where
+        // PackAOnly's cache blocking still wins ~5× vs streaming's ~7×), so they
+        // keep the packing path. (Shapes ≤ TinyShapeWorkThreshold never reach
+        // here — BlasManaged.Gemm already fast-paths them to Streaming.)
+        //
+        // Guard: a supplied pre-pack handle (Sub-E FrozenWeightRegistry) MUST be
+        // consumed via the packing path — the Streaming kernel ignores packed
+        // handles, which would silently make the pre-pack a no-op. So never
+        // route pack-free when PackedA/PackedB is present, regardless of size.
+        bool hasPrePack = options.PackedA != null || options.PackedB != null;
+        if (!hasPrePack && (long)m * n * k < SmallShapeWorkThreshold)
+            return PackingMode.ForceStreaming;
+
         if (k < 128) return PackingMode.ForcePackAOnly;
         return PackingMode.ForcePackBoth;
     }
+
+    /// <summary>
+    /// Sub-C (#371): total-work ceiling below which packing is skipped (route to
+    /// pack-free <see cref="PackingMode.ForceStreaming"/>). Chosen to capture
+    /// small low-K shapes whose pack overhead dominates compute, while leaving
+    /// larger shapes — where pack + cache blocking pays off — on the packing
+    /// path. Above <see cref="BlasManaged.TinyShapeWorkThreshold"/> (100k), which
+    /// Gemm already routes to Streaming directly.
+    /// </summary>
+    internal const long SmallShapeWorkThreshold = 1_000_000;
 }
