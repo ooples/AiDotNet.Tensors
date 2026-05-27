@@ -29,6 +29,15 @@ class Program
             return;
         }
 
+        // Issue #436: same-machine head-to-head of the fused inference
+        // primitives (MLP / MHA / LSTM) vs TorchSharp at the AIsEval shapes.
+        // Win = AiDotNet p95 < PyTorch median.
+        if (args[0] == "--ab-aiseval-h2h")
+        {
+            AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.Run();
+            return;
+        }
+
         // Softmax<double> micro-benchmark — same-process measurement
         // for the new SoftmaxRowDoubleUnsafe SIMD kernel.
         if (args[0] == "--ab-softmax-double")
