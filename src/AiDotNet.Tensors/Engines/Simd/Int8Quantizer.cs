@@ -195,6 +195,77 @@ public static class Int8Quantizer
     }
 
     /// <summary>
+    /// W8A8 (#465) per-row (per-token) symmetric int8 activation quantization.
+    /// For each of the <paramref name="m"/> rows of the <c>[m, k]</c> activation
+    /// matrix, computes <c>scale = max|x| / 127</c>, quantizes
+    /// <c>q = round(x / scale)</c> clamped to <c>[-127, 127]</c>, and emits the
+    /// <b>unsigned</b> byte <c>u = q + 128 ∈ [1, 255]</c> that the
+    /// <c>VPMADDUBSW</c>/<c>VPDPBUSD</c> int8 kernels consume (the +128 shift is
+    /// undone by the per-weight-row <c>−128·Σb</c> correction inside the kernel).
+    /// Per-row (not per-tensor) preserves accuracy across tokens with differing
+    /// dynamic range.
+    /// </summary>
+    /// <param name="a">Activations, row-major <c>[m, k]</c>.</param>
+    /// <param name="m">Row count.</param>
+    /// <param name="k">Column count.</param>
+    /// <param name="outU8">Output unsigned bytes, length ≥ <c>m·k</c>.</param>
+    /// <param name="outScale">Output per-row scales, length ≥ <c>m</c>.</param>
+    public static void QuantizeActivationsPerRowToUint8(
+        ReadOnlySpan<float> a, int m, int k, Span<byte> outU8, Span<float> outScale)
+    {
+        if (a.Length < m * k) throw new ArgumentException("a.Length must be >= m*k", nameof(a));
+        if (outU8.Length < m * k) throw new ArgumentException("outU8.Length must be >= m*k", nameof(outU8));
+        if (outScale.Length < m) throw new ArgumentException("outScale.Length must be >= m", nameof(outScale));
+
+        for (int i = 0; i < m; i++)
+        {
+            var row = a.Slice(i * k, k);
+            float scale = ComputeSymmetricScale(row);
+            outScale[i] = scale;
+            float inv = 1f / scale;
+            var rowOut = outU8.Slice(i * k, k);
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && k >= 8)
+            {
+                unsafe
+                {
+                    fixed (float* pIn = row)
+                    fixed (byte* pOut = rowOut)
+                    {
+                        var vInv = Vector256.Create(inv);
+                        var vMin = Vector256.Create(-127f);
+                        var vMax = Vector256.Create(127f);
+                        int t = 0, simd = k & ~7;
+                        for (; t < simd; t += 8)
+                        {
+                            var v = Avx.Multiply(Avx.LoadVector256(pIn + t), vInv);
+                            v = Avx.RoundToNearestInteger(v);            // round-to-even (ONNX)
+                            v = Avx.Min(Avx.Max(v, vMin), vMax);
+                            var vi = Avx.ConvertToVector256Int32(v);
+                            for (int e = 0; e < 8; e++)
+                                pOut[t + e] = (byte)(vi.GetElement(e) + 128);
+                        }
+                        for (; t < k; t++)
+                        {
+                            float q = MathF.Round(pIn[t] * inv);
+                            if (q < -127f) q = -127f; if (q > 127f) q = 127f;
+                            pOut[t] = (byte)((int)q + 128);
+                        }
+                    }
+                }
+                continue;
+            }
+#endif
+            for (int t = 0; t < k; t++)
+            {
+                float q = (float)Math.Round(row[t] * inv, MidpointRounding.ToEven);
+                if (q < -127f) q = -127f; if (q > 127f) q = 127f;
+                rowOut[t] = (byte)((int)q + 128);
+            }
+        }
+    }
+
+    /// <summary>
     /// Numerical-quality verification helper: round-trip error of
     /// quantize→dequantize for each element. Returns:
     ///   - <c>MaxRelLarge</c>: max relative error for values whose magnitude
