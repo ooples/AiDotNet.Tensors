@@ -71,6 +71,9 @@ internal static class BlockSizeSweep
     /// </summary>
     public static void PrepopulateCommonShapes()
     {
+        // Save/restore (don't hard-reset): these are [ThreadStatic] flags and a
+        // nested warmup/measurement flow on the same thread could have set them.
+        bool prevForce = AutotuneDispatcher.ForceMeasureOnMiss;
         AutotuneDispatcher.ForceMeasureOnMiss = true;
         try
         {
@@ -82,7 +85,7 @@ internal static class BlockSizeSweep
         }
         finally
         {
-            AutotuneDispatcher.ForceMeasureOnMiss = false;
+            AutotuneDispatcher.ForceMeasureOnMiss = prevForce;
         }
     }
 
@@ -195,6 +198,7 @@ internal static class BlockSizeSweep
         T[] c, int cLen, int ldc,
         int m, int n, int k) where T : unmanaged
     {
+        var prevOverride = AutotuneDispatcher.BlockOverride; // save/restore ([ThreadStatic])
         AutotuneDispatcher.BlockOverride = cand;
         try
         {
@@ -222,7 +226,7 @@ internal static class BlockSizeSweep
         }
         finally
         {
-            AutotuneDispatcher.BlockOverride = null;
+            AutotuneDispatcher.BlockOverride = prevOverride;
         }
     }
 

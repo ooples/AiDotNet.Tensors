@@ -128,15 +128,19 @@ public class BlockSizeSweepLossRatioBench
         var (a, b, c) = MakeBuffers(s);
         int iters = Iters(s);
 
+        // Assert TryGemmEx success — if native execution fails or routes to managed,
+        // the timing/ratio is invalid and must not be reported as a native result.
         for (int i = 0; i < 3; i++)
-            BlasProvider.TryGemmEx(s.M, s.N, s.K, a, 0, s.K, false, b, 0, s.N, false, c, 0, s.N);
+            if (!BlasProvider.TryGemmEx(s.M, s.N, s.K, a, 0, s.K, false, b, 0, s.N, false, c, 0, s.N))
+                throw new InvalidOperationException($"Native TryGemmEx failed for shape {s.M}x{s.N}x{s.K} — native timing would be invalid.");
 
         var times = new double[iters];
         var sw = new Stopwatch();
         for (int i = 0; i < iters; i++)
         {
             sw.Restart();
-            BlasProvider.TryGemmEx(s.M, s.N, s.K, a, 0, s.K, false, b, 0, s.N, false, c, 0, s.N);
+            if (!BlasProvider.TryGemmEx(s.M, s.N, s.K, a, 0, s.K, false, b, 0, s.N, false, c, 0, s.N))
+                throw new InvalidOperationException("Native TryGemmEx failed mid-run.");
             sw.Stop();
             times[i] = sw.Elapsed.TotalMilliseconds;
         }
