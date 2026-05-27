@@ -53,7 +53,7 @@ public class FfnUpDispatchDiagnostic
         _output.WriteLine($"heuristic blocking would be: (mc={heur.mc}, nc={heur.nc}, kc={heur.kc}), strategy={Dispatcher.SelectStrategy<double>(M, N, K, default)}");
         _output.WriteLine("");
 
-        double nat = nativeOk ? TimeNative() : 0;
+        double nat = nativeOk ? TimeProviderPath() : double.NaN;
         double def = TimeManaged(default);
         double single = TimeManaged(new BlasOptions<double> { NumThreads = -1 });
         double t4 = TimeManaged(new BlasOptions<double> { NumThreads = 4 });
@@ -63,7 +63,7 @@ public class FfnUpDispatchDiagnostic
         double strm = TimeManaged(new BlasOptions<double> { PackingMode = PackingMode.ForceStreaming });
         double defLast = TimeManaged(default); // re-measure default at the end (warm) to rule out order/warmup
 
-        if (nativeOk) _output.WriteLine($"native               : {nat:F2} ms");
+        if (nativeOk) _output.WriteLine($"provider (TryGemmEx) : {nat:F2} ms");
         _output.WriteLine($"default dispatch     : {def:F2} ms");
         _output.WriteLine($"default (warm, last) : {defLast:F2} ms");
         _output.WriteLine($"default, 1 thread    : {single:F2} ms");
@@ -91,13 +91,24 @@ public class FfnUpDispatchDiagnostic
         Array.Sort(t); return t[iters / 2];
     }
 
-    private double TimeNative()
+    // Times the native provider path. TryGemmEx can route to managed or fail, so
+    // we assert its success — otherwise the reported number wouldn't be a native run.
+    private double TimeProviderPath()
     {
         var (a, b, c) = Buf();
         const int iters = 15;
-        for (int i = 0; i < 3; i++) BlasProvider.TryGemmEx(M, N, K, a, 0, K, false, b, 0, N, false, c, 0, N);
+        for (int i = 0; i < 3; i++)
+            if (!BlasProvider.TryGemmEx(M, N, K, a, 0, K, false, b, 0, N, false, c, 0, N))
+                throw new InvalidOperationException("TryGemmEx failed during warmup — result would not be a native run.");
         var t = new double[iters]; var sw = new Stopwatch();
-        for (int i = 0; i < iters; i++) { sw.Restart(); BlasProvider.TryGemmEx(M, N, K, a, 0, K, false, b, 0, N, false, c, 0, N); sw.Stop(); t[i] = sw.Elapsed.TotalMilliseconds; }
+        for (int i = 0; i < iters; i++)
+        {
+            sw.Restart();
+            if (!BlasProvider.TryGemmEx(M, N, K, a, 0, K, false, b, 0, N, false, c, 0, N))
+                throw new InvalidOperationException("TryGemmEx failed during timed run.");
+            sw.Stop();
+            t[i] = sw.Elapsed.TotalMilliseconds;
+        }
         Array.Sort(t); return t[iters / 2];
     }
 

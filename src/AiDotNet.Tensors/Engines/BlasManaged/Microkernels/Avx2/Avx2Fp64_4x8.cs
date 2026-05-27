@@ -45,8 +45,10 @@ namespace AiDotNet.Tensors.Engines.BlasManaged;
 /// prefetches (data already in L1 at the autotuned Kc) were pure overhead. The
 /// loop no longer prefetches AND is explicitly unrolled by 4. Cumulative:
 /// <b>~19 (baseline) → ~32 (prefetch removed) → ~35 GFLOPS (explicit 4-way
-/// unroll) = 80% of the managed FMA ceiling, ~1.76× OpenBLAS</b>. A large
-/// kernel-dominated GEMM (Square_2048 FP64) reached ~1.1× OpenBLAS end-to-end.
+/// unroll) = 80% of the managed FMA ceiling, ~0.56× OpenBLAS (~62 GFLOPS)</b>.
+/// (The hand-emitted machine-code 6×8 kernel later closed this gap to ~57 GFLOPS,
+/// ~0.95× OpenBLAS — see MachineCodeFmaKernel.) A large kernel-dominated GEMM
+/// (Square_2048 FP64) reached ~1.1× OpenBLAS end-to-end.
 /// </para>
 /// <para>
 /// <b>Why the unroll is written out explicitly (not a <c>for</c> loop):</b>

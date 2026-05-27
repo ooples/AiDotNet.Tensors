@@ -250,7 +250,7 @@ internal static class PackBothStrategy
                         b: b.Slice(bSliceOffset), ldb, transB,
                         packed: activePackB.Slice(0, packedBElemCount),
                         nc: effectiveNc, kc: effectiveKc, nr);
-                    if (PackBothProfiler.Enabled) PackBothProfiler.PackBTicks += Stopwatch.GetTimestamp() - _pbStart;
+                    if (PackBothProfiler.Enabled) PackBothProfiler.AddPackB(Stopwatch.GetTimestamp() - _pbStart);
                 }
 
                 for (int ic = 0; ic < m; ic += mc)
@@ -300,7 +300,7 @@ internal static class PackBothStrategy
                             a: a.Slice(aSliceOffset), lda, transA,
                             packed: activePackA.Slice(0, effectiveMc * effectiveKc),
                             mc: effectiveMc, kc: effectiveKc, mr);
-                        if (PackBothProfiler.Enabled) PackBothProfiler.PackATicks += Stopwatch.GetTimestamp() - _paStart;
+                        if (PackBothProfiler.Enabled) PackBothProfiler.AddPackA(Stopwatch.GetTimestamp() - _paStart);
                     }
 
                     // Iterate microkernel tiles within this Mc × Nc panel.
@@ -333,7 +333,7 @@ internal static class PackBothStrategy
                                 mr, nr, effectiveNr);
                         }
                     }
-                    if (PackBothProfiler.Enabled) PackBothProfiler.KernelTicks += Stopwatch.GetTimestamp() - _krStart;
+                    if (PackBothProfiler.Enabled) PackBothProfiler.AddKernel(Stopwatch.GetTimestamp() - _krStart);
                 }
             }
         }
@@ -532,7 +532,7 @@ internal static class PackBothStrategy
                             b: bSlice, ldb, transB,
                             packed: packBTemp,
                             nc: effectiveNc, kc: effectiveKc, nr);
-                        if (PackBothProfiler.Enabled) PackBothProfiler.PackBTicks += Stopwatch.GetTimestamp() - _pbStart;
+                        if (PackBothProfiler.Enabled) PackBothProfiler.AddPackB(Stopwatch.GetTimestamp() - _pbStart);
                     }
                 }
 
@@ -607,7 +607,7 @@ internal static class PackBothStrategy
                             a: aSlice, lda, transA,
                             packed: activePackA,
                             mc: effectiveMc, kc: effectiveKc_cap, mr);
-                        if (PackBothProfiler.Enabled) PackBothProfiler.PackATicks += Stopwatch.GetTimestamp() - _paStart;
+                        if (PackBothProfiler.Enabled) PackBothProfiler.AddPackA(Stopwatch.GetTimestamp() - _paStart);
                     }
 
                     // Shared pack-B: reconstruct span from captured byte[] (read-only).
@@ -646,7 +646,7 @@ internal static class PackBothStrategy
                                 mr, nr, effectiveNr);
                         }
                     }
-                    if (PackBothProfiler.Enabled) PackBothProfiler.KernelTicks += Stopwatch.GetTimestamp() - _krStart;
+                    if (PackBothProfiler.Enabled) PackBothProfiler.AddKernel(Stopwatch.GetTimestamp() - _krStart);
                 });
             }
         }

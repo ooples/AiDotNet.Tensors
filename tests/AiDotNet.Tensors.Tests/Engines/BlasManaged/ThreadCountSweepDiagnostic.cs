@@ -87,7 +87,7 @@ public class ThreadCountSweepDiagnostic
         foreach (var s in Shapes)
         {
             double mflop = 2.0 * s.M * s.N * s.K / 1e6;
-            double nat = nativeOk ? TimeNative(s) : 0;
+            double nat = nativeOk ? TimeProviderPath(s) : double.NaN;
 
             var ms = new double[ThreadCounts.Length];
             double best = double.MaxValue; int bestIdx = 0;
@@ -103,7 +103,9 @@ public class ThreadCountSweepDiagnostic
             for (int i = 0; i < ThreadCounts.Length; i++)
                 cells[i] = $"{ThreadCounts[i]}t={ms[i]:F2}{(i == bestIdx ? "*" : " ")}";
 
-            _output.WriteLine($"{s.Name,-26} {mflop,8:F0} {nat,7:F2}m | {string.Join("  ", cells)}  | best={ThreadCounts[bestIdx]}t {speedupVs32:F2}x-vs-32t  best/nat={best / nat:F1}x");
+            string bestVsNat = nativeOk ? $"{best / nat:F1}x" : "n/a";
+            string natCell = nativeOk ? $"{nat,7:F2}m" : "    n/a";
+            _output.WriteLine($"{s.Name,-26} {mflop,8:F0} {natCell} | {string.Join("  ", cells)}  | best={ThreadCounts[bestIdx]}t {speedupVs32:F2}x-vs-32t  best/nat={bestVsNat}");
         }
     }
 
@@ -119,13 +121,24 @@ public class ThreadCountSweepDiagnostic
         Array.Sort(t); return t[iters / 2];
     }
 
-    private double TimeNative(Shape s)
+    // Times the native provider path. TryGemmEx can route to managed or fail, so we
+    // assert success — otherwise the number wouldn't be a native run.
+    private double TimeProviderPath(Shape s)
     {
         var (a, b, c) = Buf(s);
-        for (int i = 0; i < 20; i++) BlasProvider.TryGemmEx(s.M, s.N, s.K, a, 0, s.K, false, b, 0, s.N, false, c, 0, s.N);
+        for (int i = 0; i < 20; i++)
+            if (!BlasProvider.TryGemmEx(s.M, s.N, s.K, a, 0, s.K, false, b, 0, s.N, false, c, 0, s.N))
+                throw new InvalidOperationException("TryGemmEx failed during warmup — result would not be a native run.");
         int iters = IterFor(s);
         var t = new double[iters]; var sw = new Stopwatch();
-        for (int i = 0; i < iters; i++) { sw.Restart(); BlasProvider.TryGemmEx(s.M, s.N, s.K, a, 0, s.K, false, b, 0, s.N, false, c, 0, s.N); sw.Stop(); t[i] = sw.Elapsed.TotalMilliseconds; }
+        for (int i = 0; i < iters; i++)
+        {
+            sw.Restart();
+            if (!BlasProvider.TryGemmEx(s.M, s.N, s.K, a, 0, s.K, false, b, 0, s.N, false, c, 0, s.N))
+                throw new InvalidOperationException("TryGemmEx failed during timed run.");
+            sw.Stop();
+            t[i] = sw.Elapsed.TotalMilliseconds;
+        }
         Array.Sort(t); return t[iters / 2];
     }
 
