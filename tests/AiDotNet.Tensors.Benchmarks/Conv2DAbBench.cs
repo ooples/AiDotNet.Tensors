@@ -599,4 +599,99 @@ internal static class Conv2DAbBench
             Console.WriteLine($"{label,-22}  {min,8:F2}  {gflops,8:F2}");
         }
     }
+
+    /// <summary>
+    /// #415 Phase F — fast same-process probe of the FP64 Conv2D backward path
+    /// at the exact ResNet50/VGG16 shapes that drive cluster #6 timeouts on
+    /// AiDotNet CI. Reports per-shape min ms (min-of-N — robust to GC/noise) for dW
+    /// (Conv2DBackwardKernel) and dX (Conv2DBackwardInput), plus a synthetic
+    /// "1 train step" total to compare against the 480 ms/step target.
+    ///
+    /// Designed to be a 10–20 second run so we can iterate optimisation
+    /// commits without paying BDN's launch-per-method overhead (the BDN
+    /// version of this is Conv2DBackwardDoubleBenchmarks.cs; this is its
+    /// quick-feedback sibling).
+    ///
+    /// Run with: <c>dotnet run -c Release -- --ab-conv2d-backward-double</c>
+    /// </summary>
+    public static void RunConv2DBackwardDouble()
+    {
+        Console.WriteLine("=== #415 FP64 Conv2D Backward — quick probe ===");
+        Console.WriteLine($"Host: cores={Environment.ProcessorCount}, AVX2={System.Runtime.Intrinsics.X86.Avx2.IsSupported}, AVX-512F={System.Runtime.Intrinsics.X86.Avx512F.IsSupported}");
+        Console.WriteLine();
+
+        var engine = new CpuEngine();
+        int[] S1 = [1, 1], S2 = [2, 2], P0 = [0, 0], P1 = [1, 1], P3 = [3, 3], D1 = [1, 1];
+
+        // (label, kernel-shape, stride-arr, pad-arr, gradOut-NCHW, input-NCHW)
+        var cases = new (string label, int[] kshape, int[] s, int[] p, int[] gradShape, int[] inputShape)[]
+        {
+            // VGG16 3x3 s=1 p=1 stack (5 shapes, descending H)
+            ("VGG b1   3x3 s1 p1   [1,64,224,224]",  [64,  64,   3, 3], S1, P1, [1,  64, 224, 224], [1,  64, 224, 224]),
+            ("VGG b2   3x3 s1 p1   [1,128,112,112]", [128, 128,  3, 3], S1, P1, [1, 128, 112, 112], [1, 128, 112, 112]),
+            ("VGG b3   3x3 s1 p1   [1,256,56,56]",   [256, 256,  3, 3], S1, P1, [1, 256,  56,  56], [1, 256,  56,  56]),
+            ("VGG b4   3x3 s1 p1   [1,512,28,28]",   [512, 512,  3, 3], S1, P1, [1, 512,  28,  28], [1, 512,  28,  28]),
+            ("VGG b5   3x3 s1 p1   [1,512,14,14]",   [512, 512,  3, 3], S1, P1, [1, 512,  14,  14], [1, 512,  14,  14]),
+            // ResNet50 1x1 (bottleneck reduce + expand at 56x56 / 7x7)
+            ("R50 1x1  reduce 256→64  [1,64,56,56]",   [64,  256, 1, 1], S1, P0, [1,  64,  56,  56], [1, 256,  56,  56]),
+            ("R50 1x1  expand 512→2048 [1,2048,7,7]",  [2048,512, 1, 1], S1, P0, [1, 2048,  7,   7], [1, 512,   7,   7]),
+            // ResNet50 stem (7x7 s2 p3) — biggest single op in the network
+            ("R50 stem 7x7 s2 p3 [1,3,224,224]→[1,64,112,112]", [64, 3, 7, 7], S2, P3, [1, 64, 112, 112], [1, 3, 224, 224]),
+            // ResNet50 3x3 s=2 transition
+            ("R50 3x3  s2 p1 [1,128,56,56]→[1,128,28,28]",      [128,128, 3, 3], S2, P1, [1, 128, 28, 28], [1, 128, 56, 56]),
+        };
+
+        double totalDwMs = 0, totalDxMs = 0;
+        Console.WriteLine($"{"Shape",-58}  {"dW(ms)",10}  {"dX(ms)",10}  {"dW+dX(ms)",10}");
+        Console.WriteLine(new string('-', 92));
+        foreach (var c in cases)
+        {
+            var gradOut = Tensor<double>.CreateRandom(c.gradShape);
+            var input   = Tensor<double>.CreateRandom(c.inputShape);
+            var kernel  = Tensor<double>.CreateRandom(c.kshape);
+
+            // dW (Conv2DBackwardKernel): gradOut × input → gradKernel
+            var dwMs = MeasureBackward(() => engine.Conv2DBackwardKernel(gradOut, input, c.kshape, c.s, c.p, D1));
+            // dX (Conv2DBackwardInput): gradOut × kernel → gradInput
+            var dxMs = MeasureBackward(() => engine.Conv2DBackwardInput(gradOut, kernel, c.inputShape, c.s, c.p, D1));
+
+            Console.WriteLine($"{c.label,-58}  {dwMs,10:F1}  {dxMs,10:F1}  {(dwMs + dxMs),10:F1}");
+            totalDwMs += dwMs;
+            totalDxMs += dxMs;
+        }
+        Console.WriteLine(new string('-', 92));
+        Console.WriteLine($"{"SUM (1× of each probed shape)",-58}  {totalDwMs,10:F1}  {totalDxMs,10:F1}  {(totalDwMs + totalDxMs),10:F1}");
+        Console.WriteLine();
+        Console.WriteLine("Reference: AiDotNet `MoreData_ShouldNotDegrade` needs ≤480 ms/step for the 120 s × 250-iter budget.");
+        Console.WriteLine("Note: a full ResNet50/VGG16 step calls each probed shape multiple times (bottleneck-block repetition); this is the per-shape floor.");
+    }
+
+    private static double MeasureBackward(Func<Tensor<double>> op)
+    {
+        // 3 warmup iterations — first call pays JIT + ArrayPool init.
+        for (int i = 0; i < 3; i++)
+        {
+            var r = op();
+            AiDotNet.Tensors.Helpers.TensorPool.Return(r);
+        }
+        // GC settle so a finalizer-queue drain from a prior iteration doesn't
+        // fall inside the measurement window (the same hygiene we added to
+        // ConvTranspose2D's latency gate).
+        GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, blocking: true);
+        GC.WaitForPendingFinalizers();
+        GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, blocking: true);
+
+        const int iters = 5;
+        var samples = new double[iters];
+        var sw = new Stopwatch();
+        for (int i = 0; i < iters; i++)
+        {
+            sw.Restart();
+            var r = op();
+            sw.Stop();
+            samples[i] = sw.Elapsed.TotalMilliseconds;
+            AiDotNet.Tensors.Helpers.TensorPool.Return(r);
+        }
+        return samples.Min(); // min-of-N — robust to GC pauses / noisy-neighbor
+    }
 }
