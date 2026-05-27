@@ -93,7 +93,9 @@ public partial class CpuEngine
         // core count, for the span of the forward. The scope restores the prior
         // count on exit and is reference-counted for nested/concurrent callers.
         int rows = input.Rank >= 1 ? input._shape[0] : 1;
-        int blasThreads = Math.Clamp(rows / 16, 1, Environment.ProcessorCount);
+        // Math.Clamp isn't available on net471 — use Max/Min (see the same
+        // pattern in CpuEngine.Geometry.cs / FusedPointwise.cs).
+        int blasThreads = Math.Max(1, Math.Min(rows / 16, Environment.ProcessorCount));
         using var _blasScope = Helpers.BlasProvider.ScopeOpenBlasThreads(blasThreads);
 
         // Chain the fused linear layers. FusedLinear validates each weight /
