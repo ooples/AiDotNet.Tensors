@@ -1752,16 +1752,25 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                         if (timingEnabled) { Synchronize(); packATime = sw!.ElapsedTicks; }
                     }
 
-                    // Pad "B" (originally A) if needed - NO TRANSPOSE, just copy with padding
-                    if (bNeedsPad)
+                    // Materialize "B" (originally A) as A^T — ALWAYS, even when no padding.
+                    //
+                    // The CLBlast Xgemm kernel's two operands use DIFFERENT load conventions:
+                    // it reads its A operand column-major (agm[idm + idk*ld]) but its B operand
+                    // row-major/"transposed" (bgm[idk*ld + idn]). The row-major-swap reinterpret
+                    // trick (row-major X == column-major X^T) therefore works for the A slot
+                    // (agm = original B, passed as-is) but NOT for the B slot: the kernel needs
+                    // bgm[k*ld + n] == A[n,k], i.e. the PHYSICAL transpose A^T (K×M, ld=nCeiled).
+                    // The previous code copied A un-transposed (and skipped the copy entirely when
+                    // no padding was needed), so the kernel contracted the wrong axis and produced
+                    // wrong results for every non-symmetric input >= MinIndirectSize (symmetric
+                    // inputs like all-ones masked the bug). Transposing A fixes it. (#364 follow-up)
                     {
                         if (timingEnabled) { sw!.Restart(); }
                         bTemp = AllocateBuffer((int)bSize);
                         if (timingEnabled) { allocTime += sw!.ElapsedTicks; sw.Restart(); }
-                        // A is M×K row-major. Reinterpreted as column-major, it's K×M.
-                        // We need nCeiled×kCeiled = swappedN_ceiled × K_ceiled.
-                        // Copy M rows of K elements, with output stride nCeiled.
-                        ClBlastCopyMatrix(A, bTemp, K, M, K, 0, nCeiled, kCeiled, nCeiled, 0, true);
+                        // A is M×K row-major (one=K cols, two=M rows, ld=K). Transpose to
+                        // A^T = K×M, padded to (kCeiled rows × nCeiled cols), ld=nCeiled.
+                        ClBlastTransposeMatrix(A, bTemp, K, M, K, 0, nCeiled, kCeiled, nCeiled, 0, true);
                         bBuf = bTemp;
                         if (timingEnabled) { Synchronize(); packBTime = sw!.ElapsedTicks; }
                     }

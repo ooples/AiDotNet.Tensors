@@ -1333,7 +1333,7 @@ __kernel void gather_kernel(
 // scatter_add_kernel_deterministic below.
 __kernel void scatter_add_kernel(
     __global const float* source,
-    __global const float* indices,
+    __global const int* indices,
     __global float* destination,
     const int sourceSize,
     const int featureSize)
@@ -1341,7 +1341,7 @@ __kernel void scatter_add_kernel(
     const int idx = get_global_id(0);
     if (idx >= sourceSize) return;
 
-    int destIdx = (int)indices[idx];
+    int destIdx = indices[idx];
     for (int f = 0; f < featureSize; f++) {
         // Use atomic add for thread safety when multiple sources scatter to same destination
         atomic_add_float(&destination[destIdx * featureSize + f], source[idx * featureSize + f]);
@@ -1352,7 +1352,7 @@ __kernel void scatter_add_kernel(
 // One work-item per (dstRow, f) cell; scans source rows in fixed ascending order.
 __kernel void scatter_add_kernel_deterministic(
     __global const float* source,
-    __global const float* indices,
+    __global const int* indices,
     __global float* destination,
     const int sourceSize,
     const int destSize,
@@ -1364,7 +1364,7 @@ __kernel void scatter_add_kernel_deterministic(
 
     float sum = 0.0f;
     for (int i = 0; i < sourceSize; i++) {
-        if ((int)indices[i] == dstRow) {
+        if (indices[i] == dstRow) {
             sum += source[i * featureSize + f];
         }
     }
