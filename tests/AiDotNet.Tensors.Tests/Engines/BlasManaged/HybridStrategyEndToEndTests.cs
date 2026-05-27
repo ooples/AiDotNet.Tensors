@@ -54,4 +54,29 @@ public class HybridStrategyEndToEndTests
         var opts = default(BlasOptions<float>);
         Assert.Equal(PackingMode.ForcePackBoth, Dispatcher.SelectStrategy<float>(M, N, K, in opts));
     }
+
+    [Fact]
+    public void Repeated_SmallShape_Eventually_GetsLearnedEntry()
+    {
+        // Two transB calls of the same small shape → 2nd sighting enqueues a background
+        // measurement; after a short wait the learned cache should hold a strategy.
+        const int M = 72, N = 72, K = 48;
+        var a = new double[M * K];
+        var b = new double[N * K]; // [N,K] for transB
+        var c = new double[M * N];
+        // Background autotuner is disabled assembly-wide for tests; enable locally. This
+        // test class is in the DisableParallelization serial collection, so the worker
+        // never overlaps other tests during this window.
+        BackgroundAutotuner.Enabled = true;
+        try
+        {
+            for (int i = 0; i < 2; i++)
+                BlasManagedLib.Gemm<double>(a, K, false, b, K, true, c, N, M, N, K);
+            System.Threading.Thread.Sleep(2000); // let the below-normal background worker run
+            var shape = BlasManagedAutotune.EncodeShape<double>(M, N, K, false, true, 0, 0, false,
+                AiDotNet.Tensors.Helpers.BlasProvider.IsDeterministicMode);
+            Assert.NotNull(BlasManagedAutotune.TryLookupStrategy(shape));
+        }
+        finally { BackgroundAutotuner.Enabled = false; }
+    }
 }

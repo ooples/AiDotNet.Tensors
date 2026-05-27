@@ -63,6 +63,10 @@ internal static class Dispatcher
         var learned = BlasManagedAutotune.TryLookupStrategy(shapeKey);
         if (learned is { } e) return e.Mode;
 
+        // #375 Phase 3: record the sighting; the 2nd+ enqueues a non-blocking background
+        // sweep that populates the learned cache for future calls of this exact shape.
+        BackgroundAutotuner.Observe(m, n, k, typeof(T) == typeof(double), transA, transB);
+
         // #375 hybrid: route via the per-hardware seed table (the cold-start tier of the
         // unified (hardwareKey, shapeBucket) → strategy map). Replaces the static
         // work<1M/k<128 heuristic, which baked one machine's optimum in for all hardware

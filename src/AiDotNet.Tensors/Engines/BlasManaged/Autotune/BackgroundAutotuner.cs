@@ -80,6 +80,14 @@ internal static class BackgroundAutotuner
     private static readonly SightingTracker _tracker = new();
     private static int _started;
 
+    /// <summary>
+    /// Master switch for the background autotuner. Default ON (the #375 differentiator —
+    /// learn the deployment's shapes without blocking). The test suite turns it OFF so its
+    /// concurrent measurement load doesn't perturb timing-sensitive tests; the tests that
+    /// exercise it re-enable locally inside their serialized collection.
+    /// </summary>
+    internal static bool Enabled { get; set; } = true;
+
     internal static bool ShouldMeasureSize(int m, int n, int k) => (long)m * n * k <= WorkCeiling;
 
     /// <summary>
@@ -88,7 +96,7 @@ internal static class BackgroundAutotuner
     /// </summary>
     public static void Observe(int m, int n, int k, bool fp64, bool transA, bool transB)
     {
-        if (!ShouldMeasureSize(m, n, k)) return;
+        if (!Enabled || !ShouldMeasureSize(m, n, k)) return;
         var id = new SightingTracker.ShapeId(m, n, k, fp64, transA, transB);
         if (!_tracker.RecordAndShouldMeasure(id)) return;
         EnsureStarted();
