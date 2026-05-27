@@ -1,6 +1,7 @@
 using System;
 using System.Diagnostics;
 using AiDotNet.Tensors.Engines.BlasManaged;
+using AiDotNet.Tensors.Helpers;
 using TorchSharp;
 using BlasManagedLib = AiDotNet.Tensors.Engines.BlasManaged.BlasManaged;
 
@@ -34,6 +35,46 @@ internal static class GapInvestigationBench
         Investigate("512×512×512 FP32", 512, 512, 512);
         // 4) Large compute-bound: 1024×3072×768 FP32.
         Investigate("1024×3072×768 FP32", 1024, 3072, 768);
+
+        // 5) TRUE scaling curve via the global MaxDegreeOfParallelism (the only
+        //    knob PackBoth's parallel loop actually honours). Tells us whether
+        //    the medium-shape gap is kernel-bound (flat single-thread) or
+        //    scaling-bound (single-thread fast, parallel inefficient).
+        Console.WriteLine();
+        ScalingCurve("512×512×512 FP32", 512, 512, 512);
+        ScalingCurve("1024×3072×768 FP32", 1024, 3072, 768);
+    }
+
+    private static void ScalingCurve(string label, int M, int N, int K)
+    {
+        Console.WriteLine($"--- scaling curve: {label} (global MaxDOP sweep) ---");
+        var rng = new Random(42);
+        var a = new float[M * K];
+        var b = new float[K * N];
+        var c = new float[M * N];
+        for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < b.Length; i++) b[i] = (float)(rng.NextDouble() * 2 - 1);
+        double flops = 2.0 * M * N * K;
+        int iters = (long)M * N * K > 100_000_000 ? 50 : 300;
+
+        int saved = CpuParallelSettings.MaxDegreeOfParallelism;
+        double baseGflops = 0;
+        try
+        {
+            Console.WriteLine($"  {"MaxDOP",8}{"min µs",12}{"GFLOPS",12}{"scaling",10}");
+            foreach (int dop in new[] { 1, 2, 4, 8, 16 })
+            {
+                if (dop > Environment.ProcessorCount) break;
+                CpuParallelSettings.MaxDegreeOfParallelism = dop;
+                var (min, _) = TimeAi(() =>
+                    BlasManagedLib.Gemm<float>(a, K, false, b, N, false, c, N, M, N, K), iters);
+                double g = flops / (min * 1e-6) / 1e9;
+                if (dop == 1) baseGflops = g;
+                Console.WriteLine($"  {dop,8}{min,12:F1}{g,12:F2}{(g / baseGflops),9:F2}×");
+            }
+        }
+        finally { CpuParallelSettings.MaxDegreeOfParallelism = saved; }
+        Console.WriteLine();
     }
 
     private static void VerifyTorchComputes()
