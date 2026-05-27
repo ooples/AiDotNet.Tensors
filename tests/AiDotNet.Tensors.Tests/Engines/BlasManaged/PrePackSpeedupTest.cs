@@ -23,6 +23,14 @@ namespace AiDotNet.Tensors.Tests.Engines.BlasManaged;
 ///     was silently broken).</item>
 /// </list>
 /// </summary>
+// Serial collection (shared with ScalarKernelTests, which holds the sibling PackedB
+// correctness tests): the deterministic PrePackedB_Output_BitMatches_LivePack check
+// must not run concurrently with other global-state-mutating BlasManaged tests. CI
+// (4-vCPU + coverage instrumentation) intermittently corrupted the pre-pack output
+// (drift 59.7) when this ran in the default parallel pool — yet the production path
+// is concurrency-safe (PrePackConcurrencyStress: 19k concurrent ops, zero drift),
+// so the corruption was cross-test contamination, fixed by serializing here.
+[Collection("BlasManaged-Stats-Serial")]
 public class PrePackSpeedupTest
 {
     private readonly ITestOutputHelper _output;
