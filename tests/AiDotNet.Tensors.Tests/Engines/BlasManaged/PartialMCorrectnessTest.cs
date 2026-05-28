@@ -27,6 +27,9 @@ namespace AiDotNet.Tensors.Tests.Engines.BlasManaged;
 /// constraint. Correctness restored.
 /// </para>
 /// </summary>
+// Bit-exact vs reference at the default global reduction state — serialize so a
+// concurrent reduction-order mutator can't flip it mid-assertion (#375 de-flake).
+[Collection("BlasManaged-Stats-Serial")]
 public class PartialMCorrectnessTest
 {
     /// <summary>

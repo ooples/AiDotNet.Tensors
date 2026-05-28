@@ -1163,18 +1163,12 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         ThrowIfSparse();
         if (Rank == 0)
             throw new InvalidOperationException("Cannot slice a scalar (rank-0) tensor.");
-        if (index < 0 || index >= _shape[0])
-            throw new ArgumentOutOfRangeException(nameof(index));
 
-        // O(1) view: adjust offset by index * stride[0], drop first dimension.
-        int newRank = Rank - 1;
-        var newShape = new int[newRank];
-        var newStrides = new int[newRank];
-        Array.Copy(_shape, 1, newShape, 0, newRank);
-        Array.Copy(_strides, 1, newStrides, 0, newRank);
-        int newOffset = _storageOffset + index * _strides[0];
-
-        return new Tensor<T>(_data, newShape, newStrides, newOffset, _storage);
+        // Slicing axis 0 is identical to GetSliceAlongDimension(index, 0). Delegate so
+        // both public entry points (Slice/GetSlice and GetSliceAlongDimension) share the
+        // same autodiff-aware path; otherwise Slice/GetSlice would silently drop gradients
+        // under an active GradientTape while GetSliceAlongDimension records them.
+        return GetSliceAlongDimension(index, 0);
     }
 
     /// <summary>
@@ -3029,7 +3023,29 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         }
 
         int newOffset = _storageOffset + index * _strides[dimension];
-        return new Tensor<T>(_data, newShape, newStrides, newOffset, _storage);
+        var result = new Tensor<T>(_data, newShape, newStrides, newOffset, _storage);
+
+        // Propagate the gradient chain: if a GradientTape is active, set GradFn on
+        // the result so gradients flow through the slice during backward. Without
+        // this, GetSliceAlongDimension was a raw storage-sharing view with no
+        // recorded backward — any layer that slices a tape tensor per-timestep
+        // (recurrent / sequence layers) leaked wrong input gradients via aliasing.
+        // The view is preserved (zero-copy) for the inference path where no tape
+        // is active; only training pays the node record. Mirrors Reshape above.
+        if (Engines.Autodiff.GradientTape<T>.Current != null)
+        {
+            var sliceNode = Engines.Autodiff.GradNodePool<T>.Rent();
+            sliceNode.OwningTape = Engines.Autodiff.GradientTape<T>.Current;
+            sliceNode.Backward = Engines.Autodiff.BackwardFunctions<T>.SliceAxisBackward;
+            sliceNode.Output = result;
+            sliceNode.Input0 = this;
+            sliceNode.InputCount = 1;
+            // SliceAxisBackward reads SavedState as { axis, index }.
+            sliceNode.SavedState = new object[] { dimension, index };
+            result.GradFn = sliceNode;
+        }
+
+        return result;
     }
 
     /// <summary>

@@ -337,6 +337,25 @@ internal static class LinearSolvers
         int n, int nrhs, bool upper, bool transpose, bool unitDiagonal)
         where T : unmanaged, IEquatable<T>, IComparable<T>
     {
+        // #379: float/double fast path — native typed arithmetic with no per-element
+        // ToDouble/FromDouble conversion. The row update x[i,:] −= a_ij·x[j,:] and the
+        // diagonal divide x[i,:] /= div are written as flat in-place loops over the
+        // nrhs RHS columns that RyuJIT auto-vectorizes (same raw-loop style as the
+        // streaming / LSTM-cell kernels — no external SIMD). Generic T keeps the
+        // double-accumulating scalar path below.
+        if (typeof(T) == typeof(float))
+        {
+            TriangularSolveSingleFloat((float[])(object)a, offA, (float[])(object)x, offX,
+                n, nrhs, upper, transpose, unitDiagonal);
+            return;
+        }
+        if (typeof(T) == typeof(double))
+        {
+            TriangularSolveSingleDouble((double[])(object)a, offA, (double[])(object)x, offX,
+                n, nrhs, upper, transpose, unitDiagonal);
+            return;
+        }
+
         // Four cases:
         //   upper + !transpose: U·x = b (backward substitution)
         //   upper +  transpose: Uᵀ·x = b (forward substitution)
@@ -374,6 +393,70 @@ internal static class LinearSolvers
                     double div = unitDiagonal ? 1.0 : ToDouble(a[offA + i * n + i]);
                     x[offX + i * nrhs + c] = FromDouble<T>(sum / div);
                 }
+            }
+        }
+    }
+
+    // #379 float fast path for TriangularSolveSingle. Restructures the solve so the
+    // row update (x[i,:] −= a_ij·x[j,:]) and the diagonal divide run as flat in-place
+    // loops over the nrhs RHS columns — RyuJIT auto-vectorizes these in native float.
+    // The four upper/transpose cases reduce to forward (i: 0→n) or backward (n→0)
+    // substitution via `backward = upper ^ transpose`, exactly as the scalar path.
+    private static void TriangularSolveSingleFloat(
+        float[] a, int offA, float[] x, int offX,
+        int n, int nrhs, bool upper, bool transpose, bool unitDiagonal)
+    {
+        bool backward = upper ^ transpose;
+        for (int ii = 0; ii < n; ii++)
+        {
+            int i = backward ? (n - 1 - ii) : ii;
+            int xi = offX + i * nrhs;
+            int jStart = backward ? i + 1 : 0;
+            int jEnd = backward ? n : i;
+            for (int j = jStart; j < jEnd; j++)
+            {
+                int aRow = transpose ? j : i;
+                int aCol = transpose ? i : j;
+                float aij = a[offA + aRow * n + aCol];
+                int xj = offX + j * nrhs;
+                for (int c = 0; c < nrhs; c++)
+                    x[xi + c] -= aij * x[xj + c];
+            }
+            if (!unitDiagonal)
+            {
+                float div = a[offA + i * n + i];
+                for (int c = 0; c < nrhs; c++)
+                    x[xi + c] /= div;
+            }
+        }
+    }
+
+    // #379 double fast path — identical structure to the float version, native double.
+    private static void TriangularSolveSingleDouble(
+        double[] a, int offA, double[] x, int offX,
+        int n, int nrhs, bool upper, bool transpose, bool unitDiagonal)
+    {
+        bool backward = upper ^ transpose;
+        for (int ii = 0; ii < n; ii++)
+        {
+            int i = backward ? (n - 1 - ii) : ii;
+            int xi = offX + i * nrhs;
+            int jStart = backward ? i + 1 : 0;
+            int jEnd = backward ? n : i;
+            for (int j = jStart; j < jEnd; j++)
+            {
+                int aRow = transpose ? j : i;
+                int aCol = transpose ? i : j;
+                double aij = a[offA + aRow * n + aCol];
+                int xj = offX + j * nrhs;
+                for (int c = 0; c < nrhs; c++)
+                    x[xi + c] -= aij * x[xj + c];
+            }
+            if (!unitDiagonal)
+            {
+                double div = a[offA + i * n + i];
+                for (int c = 0; c < nrhs; c++)
+                    x[xi + c] /= div;
             }
         }
     }
