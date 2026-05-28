@@ -25,16 +25,16 @@ namespace AiDotNet.Tensors.Tests.Engines;
 /// removes the OpenBLAS scope or re-introduces the oversubscription path, this test will
 /// time out cleanly instead of letting CI hang.</para>
 ///
-/// <para>CI-follow-up: marked with <c>[Collection("BlasGlobalState")]</c> so the test is
-/// serialised with other tests that mutate the global OpenBLAS thread count
-/// (DeterministicMode/DeterministicByDefault). Without this, an unrelated test running in
-/// parallel could set OpenBLAS threads to a high value between this test's
-/// <c>ScopeOpenBlasThreads(1)</c> acquisition and the parallel-for entry, defeating the
-/// scope and re-introducing the oversubscription cliff. Originally not gated — fixed after
-/// PR #426 hit the 30s timeout on Linux CI even though the production fix from #410 was
-/// merged.</para>
+/// <para>CI-follow-up: marked with <c>[Collection("BlasManaged-Stats-Serial")]</c> so the
+/// test is serialised with every other tests that mutate global BLAS state — the
+/// determinism flag and the OpenBLAS thread count (DeterministicMode/DeterministicByDefault,
+/// the pre-pack/GEMM tests, …). Without this, an unrelated test running in parallel could
+/// set OpenBLAS threads to a high value between this test's <c>ScopeOpenBlasThreads(1)</c>
+/// acquisition and the parallel-for entry, defeating the scope and re-introducing the
+/// oversubscription cliff. Originally not gated — fixed after PR #426 hit the 30s timeout on
+/// Linux CI even though the production fix from #410 was merged.</para>
 /// </summary>
-[Collection("BlasGlobalState")]
+[Collection("BlasManaged-Stats-Serial")]
 public class FlashAttentionDoubleHangIssue411Test
 {
     private readonly ITestOutputHelper _output;
