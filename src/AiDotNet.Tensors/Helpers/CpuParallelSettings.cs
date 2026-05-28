@@ -103,6 +103,32 @@ public static class CpuParallelSettings
     public static bool IsInParallelRegion => _inParallelRegion;
 
     /// <summary>
+    /// Resolves the worker-thread count for a GEMM/pack parallel loop, honoring both the
+    /// caller's explicit <c>NumThreads</c> and the nested-parallel-region guard.
+    /// </summary>
+    /// <param name="requestedThreads">
+    /// The caller's <c>BlasOptions.NumThreads</c>: <c>&gt;0</c> = an explicit fixed count,
+    /// <c>-1</c> = explicit single-thread (deterministic mode), <c>0</c> = unset/default.
+    /// </param>
+    /// <returns>
+    /// The explicit count when one was requested; otherwise <c>1</c> when the calling
+    /// thread is already inside a parallel region (so the inner loop collapses to serial),
+    /// or <see cref="System.Environment.ProcessorCount"/> at the top level.
+    /// </returns>
+    /// <remarks>
+    /// This is the wiring the BlasManaged strategy doc on <see cref="IsInParallelRegion"/>
+    /// describes: without it, a per-head attention <c>Parallel.For</c> (one worker per
+    /// B·H head) would have each head launch a <c>ProcessorCount</c>-wide GEMM loop,
+    /// oversubscribing the ThreadPool by <c>heads × ProcessorCount</c> and thrashing.
+    /// </remarks>
+    public static int ResolveWorkerThreads(int requestedThreads)
+    {
+        if (requestedThreads > 0) return requestedThreads;
+        if (requestedThreads < 0) return 1;
+        return _inParallelRegion ? 1 : System.Environment.ProcessorCount;
+    }
+
+    /// <summary>
     /// Marks the calling thread as inside a parallel region until the returned
     /// scope is disposed, restoring the prior value on dispose. Wrap the body of
     /// any <c>Parallel.For</c> worker with this so nested parallel calls serialize.

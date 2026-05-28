@@ -46,9 +46,11 @@ internal static class StreamingStrategy
         int m, int n, int k,
         in BlasOptions<T> options = default) where T : unmanaged
     {
-        int procs = options.NumThreads > 0 ? options.NumThreads : Environment.ProcessorCount;
-        // -1 from caller = force single-thread (deterministic regression-test path).
-        if (options.NumThreads < 0) procs = 1;
+        // Honors NumThreads (>0 explicit, -1 deterministic single-thread) AND the
+        // nested-parallel-region guard: an unset NumThreads collapses to 1 thread when
+        // called from inside a per-head attention Parallel.For, avoiding ThreadPool
+        // oversubscription (heads × ProcessorCount workers).
+        int procs = CpuParallelSettings.ResolveWorkerThreads(options.NumThreads);
         // Determinism comes from either the global BlasProvider switch or the per-call
         // BlasOptions.Mode. Any source asking for Deterministic wins (OR semantics).
         bool isDeterministic = BlasProvider.IsDeterministicMode || options.Mode == BlasMode.Deterministic;

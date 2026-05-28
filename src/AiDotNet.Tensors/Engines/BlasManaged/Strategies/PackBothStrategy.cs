@@ -102,8 +102,10 @@ internal static class PackBothStrategy
             // to fill all cores via M-axis parallel alone. ShouldUse2DGrid returns
             // true when (numMBlocks * 2 < procs && numNBlocks > 1) — i.e., the
             // existing M-axis split would leave half or more cores idle.
-            int procs = options.NumThreads > 0 ? options.NumThreads : Environment.ProcessorCount;
-            if (options.NumThreads < 0) procs = 1;
+            // Honors NumThreads AND the nested-parallel-region guard (unset → 1 thread
+            // when nested in a per-head attention Parallel.For, avoiding heads ×
+            // ProcessorCount ThreadPool oversubscription).
+            int procs = CpuParallelSettings.ResolveWorkerThreads(options.NumThreads);
             int numMBlocks = (m + mc - 1) / mc;
             int numNBlocks = (n + nc - 1) / nc;
             // ShouldUse2DGrid fires when M-axis underutilizes. ALSO require m < 256
@@ -477,8 +479,7 @@ internal static class PackBothStrategy
                     // Threshold: ≥4 stripes AND ≥procs threads available AND
                     // ≥256 KB of pack work — below that, serial wins.
                     int packBStripeSize = effectiveKc * nr * elemSize;
-                    int procsLocal = options.NumThreads > 0 ? options.NumThreads : Environment.ProcessorCount;
-                    if (options.NumThreads < 0) procsLocal = 1;
+                    int procsLocal = CpuParallelSettings.ResolveWorkerThreads(options.NumThreads);
                     bool packBParallelWorthwhile =
                         totalNumStripes >= 4
                         && procsLocal >= 2

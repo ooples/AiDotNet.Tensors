@@ -250,15 +250,10 @@ public static class BlasManaged
         // get an inner options with Epilogue stripped to avoid double-application.
         int splitMAligned = m - (m % mr);
         int splitNAligned = n - (n % nr);
-        // Honor NumThreads = -1 as explicit single-thread (deterministic mode).
-        // Pre-fix: -1 fell into the "> 0 is false" branch and used all processors,
-        // breaking determinism/perf expectations. PR #402 CodeRabbit fix.
-        int splitProcs = options.NumThreads switch
-        {
-            -1 => 1,
-            > 0 => options.NumThreads,
-            _ => System.Environment.ProcessorCount,
-        };
+        // Honor NumThreads = -1 as explicit single-thread (deterministic mode); PR #402.
+        // Also collapses to 1 when nested inside a parallel region so the split gate
+        // matches the strategies' single-threaded execution (no oversubscription).
+        int splitProcs = CpuParallelSettings.ResolveWorkerThreads(options.NumThreads);
         if (m >= mr && n >= nr && (m % mr != 0 || n % nr != 0)
             && splitMAligned >= splitProcs * mr)
         {
@@ -354,13 +349,9 @@ public static class BlasManaged
         bool hasEpilogue = options.Epilogue.Activation != AiDotNet.Tensors.Engines.FusedActivationType.None
             || !options.Epilogue.BiasN.IsEmpty
             || !options.Epilogue.SkipMxN.IsEmpty;
-        // Honor NumThreads = -1 as explicit single-thread (matches splitProcs above).
-        int procs = options.NumThreads switch
-        {
-            -1 => 1,
-            > 0 => options.NumThreads,
-            _ => Environment.ProcessorCount,
-        };
+        // Honor NumThreads = -1 as explicit single-thread (matches splitProcs above);
+        // region-aware so nested calls feed the autotuner a single-thread blocking choice.
+        int procs = CpuParallelSettings.ResolveWorkerThreads(options.NumThreads);
         var (_, autotuneMc, autotuneNc, autotuneKc, _) =
             AutotuneDispatcher.Decide<T>(
                 m, n, k,

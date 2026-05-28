@@ -53,8 +53,10 @@ internal static class PackAOnlyStrategy
                 "Tail column handling is tracked as follow-up work; callers should pad n " +
                 "or route to a strategy that handles remainders.");
 
-        int procs = options.NumThreads > 0 ? options.NumThreads : Environment.ProcessorCount;
-        if (options.NumThreads < 0) procs = 1;
+        // Honors NumThreads AND the nested-parallel-region guard: from a per-head
+        // attention Parallel.For, an unset NumThreads collapses to 1 thread here so
+        // heads × ProcessorCount workers don't oversubscribe the ThreadPool.
+        int procs = CpuParallelSettings.ResolveWorkerThreads(options.NumThreads);
         bool isDeterministic = BlasProvider.IsDeterministicMode;
 
         var axis = AxisSelector.Select(m, n, k, mr, nr, procs, isDeterministic);
