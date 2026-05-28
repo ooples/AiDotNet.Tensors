@@ -25,6 +25,15 @@ public class MhaLeanSdpaAllocTests
     }
 
 #if NET5_0_OR_GREATER
+    // Category=Performance so the coverage-instrumented CI correctness run (which filters
+    // out Category!=Performance) excludes this allocation-measurement gate. Coverlet's
+    // per-line hit counters allocate on every instrumented call across all parallel SDPA
+    // worker threads, and GC.GetTotalAllocatedBytes counts ALL threads — so under coverage
+    // this measured 9017 KB/call (higher than even the old 7200 KB path) while the real
+    // path is ~1024 KB locally (where this passes). The threshold is unchanged; the gate
+    // is just moved out of the instrumented lane where the measurement is meaningless,
+    // exactly like PrePackSpeedupTest's wall-clock gates.
+    [Trait("Category", "Performance")]
     [Fact]
     public void MhaForward_AllocatesFarLessThanWeightMaterializingPath()
     {
