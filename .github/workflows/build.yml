@@ -51,6 +51,25 @@ jobs:
         dotnet build src/AiDotNet.Tensors/AiDotNet.Tensors.csproj --configuration Release --no-restore --framework net471 -p:TelemetryUrl="${{ secrets.AIDOTNET_TELEMETRY_URL }}" -p:TelemetryKey="${{ secrets.AIDOTNET_TELEMETRY_KEY }}"
         dotnet build tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --no-restore --framework net471
 
+    - name: No-coverage drift probe (DIAGNOSTIC — is coverlet the trigger?)
+      continue-on-error: true
+      run: |
+        # Run the SAME full concurrent suite WITHOUT coverage instrumentation, 5x.
+        # If the pre-pack bit-match / scalar-kernel tests stay green here while the
+        # covered run below drifts (~50%), coverlet is the confirmed trigger.
+        drift=0
+        for i in 1 2 3 4 5; do
+          echo "===== no-coverage run $i ====="
+          if dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --no-build --framework net10.0 \
+               --filter "Category!=Benchmark&Category!=Performance" 2>&1 \
+             | grep -iE "pre-pack output drift|PrePackedB_Output.*FAIL|Gemm_WithoutMarkDirty.*FAIL|Gemm_WithPackedAHandle.*FAIL|Failed:[[:space:]]*[1-9]"; then
+            echo "RUN $i: DRIFT/FAILURE detected (no coverage)"; drift=$((drift+1))
+          else
+            echo "RUN $i: clean"
+          fi
+        done
+        echo "===== NO-COVERAGE DRIFT COUNT: $drift / 5 ====="
+
     - name: Test with Coverage
       run: |
         dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --no-build --verbosity normal --framework net10.0 \
