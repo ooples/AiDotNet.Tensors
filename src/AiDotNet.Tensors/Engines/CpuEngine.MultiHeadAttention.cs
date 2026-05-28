@@ -138,7 +138,6 @@ public partial class CpuEngine
         int batch, int seqLen, int dModel, int numHeads, int dHead)
     {
         int totalRows = batch * seqLen;
-        int qkvElems = batch * numHeads * seqLen * dHead; // == totalRows * dModel
         var pool = ArrayPool<float>.Shared;
 
         // Fused QKV projection: one [B*seq, dModel] @ [dModel, 3*dModel] GEMM
@@ -149,11 +148,7 @@ public partial class CpuEngine
         int dModel3 = 3 * dModel;
         var qkvFlatBuf = pool.Rent(totalRows * dModel3);
         var fusedWBuf = pool.Rent(dModel * dModel3);    // [dModel, 3*dModel] = [qW | kW | vW]
-        var qHeadBuf = pool.Rent(qkvElems);            // [B, heads, seq, dHead] post-transpose
-        var kHeadBuf = pool.Rent(qkvElems);
-        var vHeadBuf = pool.Rent(qkvElems);
-        var attnHeadBuf = pool.Rent(qkvElems);         // SDPA output
-        var concatBuf = pool.Rent(totalRows * dModel); // [B*seq, dModel] post-inverse-transpose
+        var concatBuf = pool.Rent(totalRows * dModel); // [B*seq, dModel] attention output, pre out-proj
 
         var output = AutoTensorCache.RentOrAllocate<float>(new[] { batch, seqLen, dModel });
 
@@ -185,33 +180,22 @@ public partial class CpuEngine
                 qkvFlatBuf.AsSpan(0, totalRows * dModel3),
                 batchSeqRows, dModel, dModel3);
 
-            // ---- Transpose Q/K/V from the fused [B, seq, (q|k|v), H, dHead]
-            // buffer into [B, H, seq, dHead]. Row stride is 3*dModel; q/k/v
-            // live at column offsets 0 / dModel / 2*dModel within each row.
-            TransposeQkv(qkvFlatBuf, qHeadBuf, batch, seqLen, numHeads, dHead, dModel3, 0);
-            TransposeQkv(qkvFlatBuf, kHeadBuf, batch, seqLen, numHeads, dHead, dModel3, dModel);
-            TransposeQkv(qkvFlatBuf, vHeadBuf, batch, seqLen, numHeads, dHead, dModel3, 2 * dModel);
-
-            // ---- SDPA. Wrap the pooled buffers as Tensor<float> views just
-            // long enough to call the existing optimized primitive, which
-            // does scale + softmax + matmul internally. The wrapping is
-            // O(1) — no data copy. ----
-            var qHeadTensor = WrapAsTensor(qHeadBuf, batch, numHeads, seqLen, dHead);
-            var kHeadTensor = WrapAsTensor(kHeadBuf, batch, numHeads, seqLen, dHead);
-            var vHeadTensor = WrapAsTensor(vHeadBuf, batch, numHeads, seqLen, dHead);
-
-            // Zero-alloc SDPA (#476): write softmax(Q·Kᵀ·scale)·V straight into the
-            // pooled attnHeadBuf — no attention-weights tensor, no SDPA output tensor,
-            // no copy. scale defaults to 1/sqrt(dHead), matching ScaledDotProductAttention.
+            // ---- Transpose-fused SDPA (#476 root-cause-2). ----
+            // Instead of three full [B,seq,dModel]→[B,H,seq,dHead] transpose
+            // passes + buffers, an SDPA output buffer, and an inverse-transpose
+            // pass, fold the per-head gather straight into the SDPA loop: each
+            // (b,h) worker GATHERS its Q/K/V slice from the fused qkvFlat buffer
+            // (K gathered already-transposed), runs Q·Kᵀ → softmax → P·V, and
+            // SCATTERS the result directly into concatBuf at [B,seq,H,dHead] =
+            // [B*seq,dModel]. Removes 4 transpose passes + 4 pooled buffers; the
+            // gather/scatter is the same byte movement but fused with the GEMMs
+            // (per-slice locality, no separate memory round-trips).
             double scaleVal = 1.0 / Math.Sqrt(dHead);
-            ScaledDotProductAttentionFloatInto(
-                qHeadTensor, kHeadTensor, vHeadTensor,
+            MultiHeadAttentionFusedSdpa(
+                qkvFlatBuf, dModel3, /*qCol*/0, /*kCol*/dModel, /*vCol*/2 * dModel,
                 mask, scaleVal,
-                batch, numHeads, seqLen, dHead, seqLen, dHead,
-                attnHeadBuf, 0);
-
-            // ---- Inverse transpose: [B, H, seq, dHead] -> [B*seq, dModel]. ----
-            InverseTransposeQkv(attnHeadBuf, concatBuf, batch, seqLen, numHeads, dHead);
+                batch, numHeads, seqLen, dHead,
+                concatBuf, dModel);
 
             // ---- Output projection: [B*seq, dModel] @ outWeight [dModel, dModel] -> output. ----
             SimdGemm.Sgemm(
@@ -226,95 +210,122 @@ public partial class CpuEngine
         {
             pool.Return(qkvFlatBuf);
             pool.Return(fusedWBuf);
-            pool.Return(qHeadBuf);
-            pool.Return(kHeadBuf);
-            pool.Return(vHeadBuf);
-            pool.Return(attnHeadBuf);
             pool.Return(concatBuf);
         }
     }
 
     /// <summary>
-    /// Wraps a rented array slice as a contiguous rank-4 <see cref="Tensor{T}"/>
-    /// for passing to <see cref="ScaledDotProductAttention{T}"/>. The
-    /// tensor's lifetime is tied to the caller's <c>try/finally</c>;
-    /// internal callers must not store the result past the pool return.
+    /// Transpose-fused scaled-dot-product attention for the MHA float path
+    /// (#476 root-cause-2). Reads Q/K/V for each (batch, head) slice DIRECTLY
+    /// from the fused QKV projection buffer — no separate [B,H,seq,dHead]
+    /// transpose passes or buffers — runs Q·Kᵀ → scaled+masked softmax → P·V
+    /// per slice, and scatters the result straight into <paramref name="concat"/>
+    /// in [B, seq, H, dHead] = [B*seq, dModel] layout (ready for the output
+    /// projection, no inverse transpose).
     /// </summary>
-    private static Tensor<float> WrapAsTensor(float[] buffer, int d0, int d1, int d2, int d3)
+    /// <param name="qkv">Fused projection buffer; row r=(b*seq+s) has stride
+    /// <paramref name="qkvRowStride"/>; q/k/v blocks start at qCol/kCol/vCol and
+    /// within a block the per-head layout is [..., h*dHead + d].</param>
+    private void MultiHeadAttentionFusedSdpa(
+        float[] qkv, int qkvRowStride, int qCol, int kCol, int vCol,
+        Tensor<bool>? mask, double scaleValue,
+        int batch, int heads, int seq, int dHead,
+        float[] concat, int dModel)
     {
-        // The buffer is from ArrayPool, which returns a BUCKET-sized array (rounded
-        // up to a power of 2) that is ≥ the logical element count and only equals it
-        // when the count is itself a power of 2. The Tensor ctor validates
-        // data.Length == product(dimensions) exactly, so passing the whole array threw
-        // "The number of values does not match the specified shape" whenever
-        // d0*d1*d2*d3 wasn't a power of 2 — i.e. every non-power-of-2 sequence length
-        // (issue #468). Wrap EXACTLY product(dimensions) elements as a zero-copy
-        // Memory view so the length always matches regardless of the rented capacity.
-        // Lifetime: this Tensor must not outlive the caller's pool.Return — it is used
-        // only as a thunk into SDPA.
-        int n = d0 * d1 * d2 * d3;
-        var view = Vector<float>.WrapMemory(buffer.AsMemory(0, n));
-        return new Tensor<float>(new[] { d0, d1, d2, d3 }, view);
-    }
+        int bhCount = batch * heads;
+        float scaleF = (float)scaleValue;
+        float negInfF = float.NegativeInfinity;
+        var pool = System.Buffers.ArrayPool<float>.Shared;
 
-    private static void TransposeQkv(float[] src, float[] dst, int batch, int seq, int numHeads, int dHead,
-        int srcRowStride, int srcColOffset)
-    {
-        // src layout: rows of [..., q|k|v interleaved ...] with per-row stride
-        //   srcRowStride and this matrix's block starting at srcColOffset; within
-        //   the block the layout is [seq, numHeads, dHead]. For the FUSED QKV
-        //   projection srcRowStride = 3*dModel and srcColOffset picks q/k/v
-        //   (0 / dModel / 2*dModel). For an un-fused [B*seq, dModel] buffer pass
-        //   srcRowStride = numHeads*dHead and srcColOffset = 0.
-        // dst layout: [B, numHeads, seq, dHead]
-        int srcStrideB = seq * srcRowStride;
-        int dstStrideH = seq * dHead;
-        int dstStrideB = numHeads * dstStrideH;
+        // Per-slice scratch: Q [seq×dHead] | V [seq×dHead] | Kᵀ [dHead×seq] | scores [seq×seq].
+        int qSoff = 0;
+        int vSoff = seq * dHead;
+        int ktoff = 2 * seq * dHead;
+        int scoff = 3 * seq * dHead;      // dHead*seq == seq*dHead
+        int scratchLen = 3 * seq * dHead + seq * seq;
 
-        // Parallelize across batch. Each batch element writes to a disjoint
-        // dstStrideB-sized region so there's no contention. For the AIsEval
-        // shape (batch=128) this typically hits 4-8x of the cores.
-        System.Threading.Tasks.Parallel.For(0, batch, b =>
+        System.Threading.Tasks.Parallel.For(0, bhCount, bh =>
         {
-            var srcSpan = src.AsSpan();
-            var dstSpan = dst.AsSpan();
-            for (int s = 0; s < seq; s++)
+            int b = bh / heads;
+            int h = bh % heads;
+            var scratch = pool.Rent(scratchLen);
+            try
             {
-                int srcBase = b * srcStrideB + s * srcRowStride + srcColOffset;
-                int dstBaseBS = b * dstStrideB + s * dHead;
-                for (int h = 0; h < numHeads; h++)
+                int hQ = qCol + h * dHead;
+                int hK = kCol + h * dHead;
+                int hV = vCol + h * dHead;
+
+                // Gather: Q contiguous [seq×dHead], V contiguous [seq×dHead],
+                // K already TRANSPOSED into [dHead×seq] (so the score GEMM is a
+                // plain no-transpose A·B). One strided read pass per slice.
+                for (int s = 0; s < seq; s++)
                 {
-                    int srcOff = srcBase + h * dHead;
-                    int dstOff = dstBaseBS + h * dstStrideH;
-                    srcSpan.Slice(srcOff, dHead).CopyTo(dstSpan.Slice(dstOff, dHead));
+                    int rowBase = (b * seq + s) * qkvRowStride;
+                    int qsrc = rowBase + hQ, vsrc = rowBase + hV, ksrc = rowBase + hK;
+                    int qdst = qSoff + s * dHead, vdst = vSoff + s * dHead;
+                    for (int d = 0; d < dHead; d++)
+                    {
+                        scratch[qdst + d] = qkv[qsrc + d];
+                        scratch[vdst + d] = qkv[vsrc + d];
+                        scratch[ktoff + d * seq + s] = qkv[ksrc + d];   // Kᵀ
+                    }
+                }
+
+                // scores[seq×seq] = Q[seq×dHead] · Kᵀ[dHead×seq]
+                Engines.Simd.SimdGemm.SgemmSequential(
+                    scratch.AsSpan(qSoff, seq * dHead),
+                    scratch.AsSpan(ktoff, dHead * seq),
+                    scratch.AsSpan(scoff, seq * seq),
+                    seq, dHead, seq);
+
+                // In-place scale + mask + numerically-stable softmax, row by row.
+                for (int i = 0; i < seq; i++)
+                {
+                    int rowOff = scoff + i * seq;
+                    float maxVal = negInfF;
+                    for (int j = 0; j < seq; j++)
+                    {
+                        float v = scratch[rowOff + j] * scaleF;
+                        if (mask != null && !mask[b, h, i, j]) v = negInfF;
+                        if (v > maxVal) maxVal = v;
+                        scratch[rowOff + j] = v;
+                    }
+                    if (float.IsNegativeInfinity(maxVal))
+                    {
+                        for (int j = 0; j < seq; j++) scratch[rowOff + j] = 0f;
+                        continue;
+                    }
+                    float sumExp = 0f;
+                    for (int j = 0; j < seq; j++)
+                    {
+                        float e = MathF.Exp(scratch[rowOff + j] - maxVal);
+                        scratch[rowOff + j] = e;
+                        sumExp += e;
+                    }
+                    float inv = sumExp != 0f ? 1f / sumExp : 0f;
+                    for (int j = 0; j < seq; j++) scratch[rowOff + j] *= inv;
+                }
+
+                // out[seq×dHead] = P[seq×seq] · V[seq×dHead]. Reuse the Q region
+                // (no longer needed) as the output buffer.
+                Engines.Simd.SimdGemm.SgemmSequential(
+                    scratch.AsSpan(scoff, seq * seq),
+                    scratch.AsSpan(vSoff, seq * dHead),
+                    scratch.AsSpan(qSoff, seq * dHead),
+                    seq, seq, dHead);
+
+                // Scatter into concat[B, seq, H, dHead] = [B*seq, dModel].
+                for (int s = 0; s < seq; s++)
+                {
+                    int dst = (b * seq + s) * dModel + h * dHead;
+                    int src = qSoff + s * dHead;
+                    for (int d = 0; d < dHead; d++)
+                        concat[dst + d] = scratch[src + d];
                 }
             }
-        });
-    }
-
-    private static void InverseTransposeQkv(float[] src, float[] dst, int batch, int seq, int numHeads, int dHead)
-    {
-        // src layout: [B, numHeads, seq, dHead]
-        // dst layout: [B, seq, numHeads, dHead]  (== [B*seq, dModel])
-        int srcStrideH = seq * dHead;
-        int srcStrideB = numHeads * srcStrideH;
-        int dstStrideS = numHeads * dHead;
-        int dstStrideB = seq * dstStrideS;
-
-        System.Threading.Tasks.Parallel.For(0, batch, b =>
-        {
-            var srcSpan = src.AsSpan();
-            var dstSpan = dst.AsSpan();
-            for (int s = 0; s < seq; s++)
+            finally
             {
-                int dstBaseBS = b * dstStrideB + s * dstStrideS;
-                int srcBaseBS = b * srcStrideB + s * dHead;
-                for (int h = 0; h < numHeads; h++)
-                {
-                    int srcOff = srcBaseBS + h * srcStrideH;
-                    int dstOff = dstBaseBS + h * dHead;
-                    srcSpan.Slice(srcOff, dHead).CopyTo(dstSpan.Slice(dstOff, dHead));
-                }
+                pool.Return(scratch);
             }
         });
     }
