@@ -38,9 +38,13 @@ public class MhaLeanSdpaAllocTests
         for (int w = 0; w < 5; w++) _ = eng.MultiHeadAttentionForward(input, qW, kW, vW, oW, numHeads);
 
         const int n = 20;
-        long a0 = GC.GetAllocatedBytesForCurrentThread();
+        // GetTotalAllocatedBytes counts allocations on ALL threads — the SDPA path runs
+        // per-head work on parallel workers, and any ArrayPool misses there are real
+        // allocations that GetAllocatedBytesForCurrentThread would silently miss
+        // (giving a false-negative regression guard).
+        long a0 = GC.GetTotalAllocatedBytes(precise: false);
         for (int i = 0; i < n; i++) _ = eng.MultiHeadAttentionForward(input, qW, kW, vW, oW, numHeads);
-        long a1 = GC.GetAllocatedBytesForCurrentThread();
+        long a1 = GC.GetTotalAllocatedBytes(precise: false);
         double kbPerCall = (a1 - a0) / 1024.0 / n;
 
         // Lean path measures ~1.0 MB/call; the old weight-materializing path was ~7.2 MB/call.

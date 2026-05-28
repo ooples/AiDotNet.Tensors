@@ -23251,7 +23251,16 @@ public partial class CpuEngine : ITensorLevelEngine
         int batch, int heads, int seqQ, int d_k, int seqK, int d_v)
     {
         int bhCount = batch * heads;
-        int scoresLen = bhCount * seqQ * seqK;
+        // Use long arithmetic for the score-buffer size: for large attention contexts
+        // (e.g. batch=8, heads=16, seq=4096 → 2.1B floats) the 32-bit product would
+        // silently overflow and ArrayPool.Rent would see a negative size.
+        long scoresLenL = (long)bhCount * seqQ * seqK;
+        if (scoresLenL > int.MaxValue)
+            throw new ArgumentOutOfRangeException(
+                nameof(seqK),
+                $"Attention scores buffer size ({scoresLenL:N0} floats) exceeds int.MaxValue; " +
+                "reduce batch, heads, or sequence length.");
+        int scoresLen = (int)scoresLenL;
         var scratch = System.Buffers.ArrayPool<float>.Shared.Rent(scoresLen);
         try
         {
