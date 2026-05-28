@@ -267,15 +267,19 @@ internal static class AisEvalHeadToHeadBench
         foreach (int t in new[] { 1, 2, 4, 8, 16 })
         {
             if (t > Environment.ProcessorCount) break;
-            BlasProvider.TrySetOpenBlasThreads(t);
-            for (int i = 0; i < Warmup; i++) gemm3();
-            SettleGc();
-            var tt = new double[Iters];
-            for (int i = 0; i < Iters; i++) { sw.Restart(); gemm3(); sw.Stop(); tt[i] = sw.Elapsed.TotalMilliseconds; }
-            var (tm, tp) = Percentiles(tt);
-            Console.WriteLine($"    threads={t,2}: med {tm,7:F3}ms  p95 {tp,7:F3}ms");
+            // Scope the override so the prior OpenBLAS thread state is restored after each
+            // iteration (and after the loop), instead of hardcoding ProcessorCount — which
+            // would contaminate the later measurements in this same process.
+            using (BlasProvider.ScopeOpenBlasThreads(t))
+            {
+                for (int i = 0; i < Warmup; i++) gemm3();
+                SettleGc();
+                var tt = new double[Iters];
+                for (int i = 0; i < Iters; i++) { sw.Restart(); gemm3(); sw.Stop(); tt[i] = sw.Elapsed.TotalMilliseconds; }
+                var (tm, tp) = Percentiles(tt);
+                Console.WriteLine($"    threads={t,2}: med {tm,7:F3}ms  p95 {tp,7:F3}ms");
+            }
         }
-        BlasProvider.TrySetOpenBlasThreads(Environment.ProcessorCount);
 
         for (int i = 0; i < Warmup; i++) gemm3();
         SettleGc();

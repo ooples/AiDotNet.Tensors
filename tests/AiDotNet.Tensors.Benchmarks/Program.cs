@@ -653,6 +653,10 @@ class Program
         Console.WriteLine("  --baseline  : Capture full baseline to CSV (--baseline [phase] [csv])");
         Console.WriteLine("  --compare   : Compare baselines (--compare before.csv after.csv)");
         Console.WriteLine("  --dcgan-probe : Run DCGAN step allocation / shape probe (#403 Phase A)");
+        Console.WriteLine("  --ab-aiseval-h2h      : AIsEval head-to-head (AiDotNet fused vs TorchSharp)");
+        Console.WriteLine("  --ab-aiseval-diag     : AIsEval diagnostics (pooled vs baseline alloc/latency)");
+        Console.WriteLine("  --ab-aiseval-floor    : AIsEval raw-GEMM floor + OpenBLAS/MKL floor check");
+        Console.WriteLine("  --ab-aiseval-dopsweep : AIsEval MaxDOP sweep for MHA/LSTM");
         Console.WriteLine();
         Console.WriteLine("GPU Bottleneck Analysis:");
         Console.WriteLine("  --vulkan   : Run Vulkan backend diagnostics and bottleneck analysis");

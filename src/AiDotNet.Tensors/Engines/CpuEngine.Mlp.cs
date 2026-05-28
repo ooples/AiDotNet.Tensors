@@ -92,10 +92,19 @@ public partial class CpuEngine
         // thread keeps a cache-resident M-stripe of useful work), clamped to the
         // core count, for the span of the forward. The scope restores the prior
         // count on exit and is reference-counted for nested/concurrent callers.
-        int rows = input.Rank >= 1 ? input._shape[0] : 1;
+        // Effective GEMM M is the product of every leading dimension ([..., inFeatures]);
+        // using only _shape[0] would collapse a shape like [batch, time, features] to
+        // near single-thread and skew the cap badly. Accumulate in a long and stop early
+        // once the cap is already saturated (rows/16 >= ProcessorCount) to avoid overflow.
+        long rows = 1;
+        for (int d = 0; d < Math.Max(0, input.Rank - 1); d++)
+        {
+            rows *= input._shape[d];
+            if (rows >= (long)Environment.ProcessorCount * 16) break;
+        }
         // Math.Clamp isn't available on net471 — use Max/Min (see the same
         // pattern in CpuEngine.Geometry.cs / FusedPointwise.cs).
-        int blasThreads = Math.Max(1, Math.Min(rows / 16, Environment.ProcessorCount));
+        int blasThreads = Math.Max(1, Math.Min((int)(rows / 16), Environment.ProcessorCount));
         using var _blasScope = Helpers.BlasProvider.ScopeOpenBlasThreads(blasThreads);
 
         // Chain the fused linear layers. FusedLinear validates each weight /
