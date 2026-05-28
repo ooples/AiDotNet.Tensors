@@ -19,12 +19,12 @@ namespace AiDotNet.Tensors.Tests.Engines;
 ///   3. <see cref="CompiledModelCache{T}"/> invalidates plans compiled under the
 ///      opposite determinism setting.
 ///
-/// Shares xUnit collection <c>BlasGlobalState</c> with the existing
-/// <see cref="DeterministicModeTests"/> so tests do not run in parallel —
-/// they mutate a process-wide static flag that would race under xUnit
-/// parallelism.
+/// Shares xUnit collection <c>BlasManaged-Stats-Serial</c> with every other
+/// process-global-determinism / GEMM-path mutator (DeterministicModeTests,
+/// PrePackSpeedupTest, ScalarKernelTests, …) so tests do not run in parallel —
+/// they mutate a process-wide static flag that would race under xUnit parallelism.
 /// </summary>
-[Collection("BlasGlobalState")]
+[Collection("BlasManaged-Stats-Serial")]
 public class DeterministicByDefaultTests
 {
     // ── Acceptance criterion #1 ──────────────────────────────────────────────
