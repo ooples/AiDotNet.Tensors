@@ -1,6 +1,7 @@
 using System;
 using System.Diagnostics;
 using AiDotNet.Tensors.Engines.BlasManaged;
+using AiDotNet.Tensors.Helpers;
 using Xunit;
 using Xunit.Abstractions;
 using BlasManagedLib = AiDotNet.Tensors.Engines.BlasManaged.BlasManaged;
@@ -121,10 +122,50 @@ public class PrePackSpeedupTest
         finally { handle.Dispose(); }
 
         double maxDelta = 0;
+        int maxIdx = 0;
         for (int i = 0; i < cBaseline.Length; i++)
-            maxDelta = Math.Max(maxDelta, Math.Abs((double)cBaseline[i] - cPrePack[i]));
+        {
+            double d = Math.Abs((double)cBaseline[i] - cPrePack[i]);
+            if (d > maxDelta) { maxDelta = d; maxIdx = i; }
+        }
+
+        // #486 flaky-drift hunt: on drift, capture WHICH path is wrong (vs a naive
+        // reference — M is small so this is cheap) and whether a re-run of the
+        // live-pack baseline is now correct (transient cross-test/-thread
+        // contamination vs a deterministic consume-path bug), plus the suspect
+        // process/thread-global state. This message is surfaced in the CI failure log.
+        string diag = "consume path is incorrect";
+        if (maxDelta >= 1e-3)
+        {
+            var cNaive = new float[M * N];
+            for (int mi = 0; mi < M; mi++)
+                for (int ni = 0; ni < N; ni++)
+                {
+                    double acc = 0;
+                    for (int kk = 0; kk < K; kk++) acc += (double)a[mi * K + kk] * b[kk * N + ni];
+                    cNaive[mi * N + ni] = (float)acc;
+                }
+            double baseVsNaive = 0, prepackVsNaive = 0;
+            for (int i = 0; i < cNaive.Length; i++)
+            {
+                baseVsNaive = Math.Max(baseVsNaive, Math.Abs((double)cBaseline[i] - cNaive[i]));
+                prepackVsNaive = Math.Max(prepackVsNaive, Math.Abs((double)cPrePack[i] - cNaive[i]));
+            }
+            var cBaseline2 = new float[M * N];
+            BlasManagedLib.Gemm<float>(a, K, false, b, N, false, cBaseline2, N, M, N, K);
+            double base2VsNaive = 0;
+            for (int i = 0; i < cNaive.Length; i++)
+                base2VsNaive = Math.Max(base2VsNaive, Math.Abs((double)cBaseline2[i] - cNaive[i]));
+
+            diag = $"baseVsNaive={baseVsNaive:G6} prepackVsNaive={prepackVsNaive:G6} base2VsNaive={base2VsNaive:G6} " +
+                   $"(idx {maxIdx} r{maxIdx / N} c{maxIdx % N}: base={cBaseline[maxIdx]:G6} prepack={cPrePack[maxIdx]:G6} naive={cNaive[maxIdx]:G6}) " +
+                   $"arenaActive={ArenaIntegration.IsArenaActive} deterministic={BlasProvider.IsDeterministicMode} " +
+                   $"mklVerified={BlasProvider.IsMklVerified} jitKernels={JittedKernelCache.Count} thread={Environment.CurrentManagedThreadId}";
+            _output.WriteLine($"[DRIFT DIAG] M={M} N={N} K={K} maxDelta={maxDelta:G6} {diag}");
+        }
+
         Assert.True(maxDelta < 1e-3,
-            $"M={M} N={N} K={K}: pre-pack output drift {maxDelta:G6} exceeds 1e-3 — consume path is incorrect");
+            $"M={M} N={N} K={K}: pre-pack output drift {maxDelta:G6} exceeds 1e-3 — {diag}");
     }
 
     private void RunSpeedupGate(int M, int N, int K, int iterations, int warmup, double gateMin, bool enforcePerfGate = true)
