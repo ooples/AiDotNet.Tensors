@@ -1,4 +1,5 @@
 using System;
+using AiDotNet.Tensors.Helpers.Autotune;
 
 namespace AiDotNet.Tensors.Engines.BlasManaged;
 
@@ -26,7 +27,15 @@ internal static class Dispatcher
     /// not <see cref="PackingMode.Auto"/>; otherwise applies the default
     /// heuristic.
     /// </summary>
+    /// <summary>
+    /// No-transpose overload (transA = transB = false). Existing call sites and tests
+    /// that don't thread the transpose flags use this; it routes via the trans-aware path.
+    /// </summary>
     public static PackingMode SelectStrategy<T>(int m, int n, int k, in BlasOptions<T> options)
+        where T : unmanaged
+        => SelectStrategy<T>(m, n, k, transA: false, transB: false, in options);
+
+    public static PackingMode SelectStrategy<T>(int m, int n, int k, bool transA, bool transB, in BlasOptions<T> options)
         where T : unmanaged
     {
         if (options.PackingMode != PackingMode.Auto)
@@ -34,27 +43,38 @@ internal static class Dispatcher
 
         if (k < 32 || (long)m * n < 1024) return PackingMode.ForceStreaming;
 
-        // Sub-C (#371): skip packing entirely for small total work. PackAOnly
-        // rents + packs the A panel (PackAOnlyStrategy) and PackBoth packs both;
-        // at small M·N·K that rent+pack round-trip costs more than the GEMM
-        // compute itself. Measured (FP64, OpenBLAS baseline): Tiny_64sq
-        // (64×64×64 = 262k) drops from ~21× to ~13× when routed pack-free,
-        // because the pack-A allocation is eliminated. The threshold stays well
-        // below larger low-K shapes (e.g. WideFat 512×512×64 = 16.7M, where
-        // PackAOnly's cache blocking still wins ~5× vs streaming's ~7×), so they
-        // keep the packing path. (Shapes ≤ TinyShapeWorkThreshold never reach
-        // here — BlasManaged.Gemm already fast-paths them to Streaming.)
-        //
-        // Guard: a supplied pre-pack handle (Sub-E FrozenWeightRegistry) MUST be
-        // consumed via the packing path — the Streaming kernel ignores packed
-        // handles, which would silently make the pre-pack a no-op. So never
-        // route pack-free when PackedA/PackedB is present, regardless of size.
+        // #371 guard (merged from main): a supplied pre-pack handle (FrozenWeightRegistry)
+        // MUST be consumed via the packing path — the Streaming kernel ignores packed
+        // handles, which would silently make the pre-pack a no-op. So the work-based
+        // Streaming routes below are gated on !hasPrePack; PackBoth/PackAOnly consume it.
         bool hasPrePack = options.PackedA != null || options.PackedB != null;
-        if (!hasPrePack && (long)m * n * k < SmallShapeWorkThreshold)
-            return PackingMode.ForceStreaming;
 
-        if (k < 128) return PackingMode.ForcePackAOnly;
-        return PackingMode.ForcePackBoth;
+        // #375 hybrid: a supplied pre-pack handle MUST be consumed via the packing
+        // path — Streaming/PackAOnly ignore a packed B, which would silently drop it.
+        if (hasPrePack) return PackingMode.ForcePackBoth;
+
+        // #375 hybrid layer 1 (highest precedence): learned / shipped-prewarm entry for
+        // THIS shape on THIS fingerprint. KernelVersion-gated inside TryLookupStrategy.
+        // Strategy routing is tile-independent → encode with mr=nr=0; the background
+        // autotuner (Phase 3) stores under the same key.
+        var shapeKey = BlasManagedAutotune.EncodeShape<T>(
+            m, n, k, transA, transB, mr: 0, nr: 0, hasEpilogue: false,
+            isDeterministic: Helpers.BlasProvider.IsDeterministicMode);
+        var learned = BlasManagedAutotune.TryLookupStrategy(shapeKey);
+        if (learned is { } e) return e.Mode;
+
+        // #375 Phase 3: record the sighting; the 2nd+ enqueues a non-blocking background
+        // sweep that populates the learned cache for future calls of this exact shape.
+        BackgroundAutotuner.Observe(m, n, k, typeof(T) == typeof(double), transA, transB);
+
+        // #375 hybrid: route via the per-hardware seed table (the cold-start tier of the
+        // unified (hardwareKey, shapeBucket) → strategy map). Replaces the static
+        // work<1M/k<128 heuristic, which baked one machine's optimum in for all hardware
+        // (the amd-avx2-cpu16 vs cpu32 collision). The table reproduces the prior routing
+        // for unmeasured shapes and encodes the measured per-hardware wins (e.g. cpu16
+        // routes 512×512×64 / 128³ to Streaming, cpu32 to blocking). The learned cache
+        // (Phase 2) and background autotuner (Phase 3) refine this per fingerprint.
+        return StrategyDefaultTable.Route(HardwareFingerprint.Key, m, n, k);
     }
 
     /// <summary>

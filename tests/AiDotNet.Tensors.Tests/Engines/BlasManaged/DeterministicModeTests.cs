@@ -9,14 +9,8 @@ using AiDotNet.Tensors.Helpers;
 
 namespace AiDotNet.Tensors.Tests.Engines.BlasManaged;
 
-// Serialized with the other BlasManaged global-state mutators (ScalarKernelTests,
-// PrePackSpeedupTest, StatsCounterTests, …). These tests toggle the process-wide
-// BlasProvider.IsDeterministicMode flag, which switches the GEMM reduction/packing
-// path. Without serialization this class runs in the parallel pool and can flip the
-// flag mid-GEMM in a concurrent pre-pack / scalar-kernel test, drifting that test's
-// packed output away from its live-pack baseline (the intermittent CI "drift"
-// failures in PrePackedB_Output_BitMatches_LivePack and the cached-packed-buffer
-// tests) — and SetDeterministicMode_Toggles can itself observe a concurrent flip.
+// Toggles process-global BlasProvider.IsDeterministicMode (changes GEMM reduction
+// order); serialize against the bit-exact correctness tests (#375 de-flake).
 [Collection("BlasManaged-Stats-Serial")]
 public class DeterministicModeTests
 {

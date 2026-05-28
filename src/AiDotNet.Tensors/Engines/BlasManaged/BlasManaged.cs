@@ -57,6 +57,13 @@ public static class BlasManaged
     /// </summary>
     public static bool AutotuneRouting { get; set; } = false;
 
+    // #375: the earlier opt-in Gemm-level autotune (EnableAutotuneV2 + AutotuneCacheV2 +
+    // a synchronous warmup sweep) was superseded by the hybrid hardware-aware strategy
+    // selection — a per-fingerprint, disk-persistent, non-blocking learned cache wired into
+    // Dispatcher.SelectStrategy (see StrategyDefaultTable + BlasManagedAutotune.TryLookupStrategy
+    // + BackgroundAutotuner). The hybrid does the same job strictly better (persistent,
+    // default-on, no first-call sweep cost), so the redundant V2 path was removed.
+
     /// <summary>
     /// Computes C = op(A) · op(B), where op(X) is X or X^T.
     ///
@@ -206,13 +213,37 @@ public static class BlasManaged
             }
         }
 
-        PackingMode strategy = Dispatcher.SelectStrategy(m, n, k, options);
+        // #375 hybrid: pass transA/transB so the learned-strategy cache key matches the
+        // actual call (the shapes reaching strategy selection are typically transposed —
+        // Sub-S already handled non-transposed aligned GEMM above).
+        PackingMode strategy = Dispatcher.SelectStrategy(m, n, k, transA, transB, in options);
 
         // PackAOnly does not support transB=true in Phase B — fall back to
         // PackBoth (which absorbs the transpose into its pack) or Streaming
         // (which handles transB via in-place index branching).
         if (strategy == PackingMode.ForcePackAOnly && transB)
             strategy = PackingMode.ForcePackBoth;
+
+        // Sub-G (#375): Streaming per-call-overhead fast path. Streaming streams A
+        // and B in place — it uses no packing/blocking params (mc/nc/kc) and no
+        // microkernel tile (mr/nr), and handles its own M/N tails internally. So
+        // for any shape SelectStrategy routes to Streaming (small shapes above the
+        // TinyShapeWorkThreshold, thin-K tall-skinny, etc.), the PickMicrokernelTile
+        // + partial-M/N split + AutotuneDispatcher.Decide work below is pure
+        // overhead — and Decide does a JSON disk write on a cache miss, which on a
+        // ~60 µs streaming GEMM dwarfs the actual compute. Dispatch directly here.
+        if (strategy == PackingMode.ForceStreaming)
+        {
+            StreamingStrategy.Run<T>(
+                a, lda, transA,
+                b, ldb, transB,
+                c, ldc,
+                m, n, k,
+                in options);
+            var streamingFastEpilogue = options.Epilogue;
+            EpilogueChain.Apply<T>(c, ldc, m, n, in streamingFastEpilogue);
+            return;
+        }
 
         // Pick SIMD-aware (mr, nr) for PackBoth using the AVX-512 → AVX2 → Neon → scalar
         // hierarchy. Fall back to (4, 4) scalar only when the shape is too small for
@@ -749,6 +780,7 @@ public static class BlasManaged
     {
         BlasManagedStatsTracker.Reset();
         JittedKernelCache.Clear();
+        BlasManagedAutotune.ClearStrategyMemo(); // in-memory strategy memo (#375 G13)
         // Future: clear weight pre-pack cache entries that are still in memory.
     }
 

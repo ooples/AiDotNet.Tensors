@@ -312,4 +312,11 @@
   -->
   <Import Project="$(MSBuildThisFileDirectory)..\..\build\AiDotNet.Tensors.Enterprise.targets" />
 
+  <!-- #375 Phase 4: shipped per-fingerprint pre-warm autotune caches. Empty until CI
+       produces them, so the glob matching nothing is a build no-op. The README is not
+       embedded. -->
+  <ItemGroup>
+    <EmbeddedResource Include="Engines\BlasManaged\Autotune\prewarm\*.prewarm.json" />
+  </ItemGroup>
+
 </Project>

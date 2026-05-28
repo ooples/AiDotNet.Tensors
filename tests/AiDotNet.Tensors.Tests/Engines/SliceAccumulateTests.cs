@@ -1,4 +1,6 @@
+using System;
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
@@ -82,5 +84,64 @@ public class SliceAccumulateTests
                 Assert.Equal(expected, result[new[] { b, d }], 1e-10);
             }
         }
+    }
+
+    [Fact]
+    public void GetSliceAlongDimension_UnderActiveTape_ScattersGradientToSlicedPositionOnly()
+    {
+        // The fix records a SliceAxisBackward node when a GradientTape is active so
+        // gradients flow back to ONLY the sliced position (zeros elsewhere) instead of
+        // leaking through storage aliasing. loss = sum(input[:, sliceIndex, :]) =>
+        // d loss / d input = 1 at seq==sliceIndex, 0 everywhere else.
+        int batch = 2, seqLen = 3, dim = 4;
+        var input = new Tensor<double>(new[] { batch, seqLen, dim });
+        var rng = new Random(7);
+        for (int i = 0; i < input.Length; i++) input[i] = rng.NextDouble() + 0.1;
+
+        const int sliceIndex = 1;
+        using var tape = new GradientTape<double>();
+        var slice = input.GetSliceAlongDimension(sliceIndex, 1); // [batch, dim] view at seq==1
+        var loss = _engine.ReduceSum(slice, null);
+        var grads = tape.ComputeGradients(loss, new[] { input });
+
+        Assert.True(grads.ContainsKey(input), "Gradient was not recorded for the sliced input (taped path missing).");
+        var g = grads[input];
+        Assert.Equal(input.Shape.ToArray(), g.Shape.ToArray());
+
+        for (int b = 0; b < batch; b++)
+            for (int t = 0; t < seqLen; t++)
+                for (int d = 0; d < dim; d++)
+                {
+                    double expected = (t == sliceIndex) ? 1.0 : 0.0;
+                    Assert.Equal(expected, g[new[] { b, t, d }], 1e-10);
+                }
+    }
+
+    [Fact]
+    public void Slice_UnderActiveTape_RecordsBackwardLikeGetSliceAlongDimension()
+    {
+        // Slice(index) (axis 0) and GetSlice(index) must follow the same taped path as
+        // GetSliceAlongDimension(index, 0); otherwise equivalent public APIs behave
+        // differently under autodiff. loss = sum(input[sliceIndex]) =>
+        // d loss / d input = 1 at row==sliceIndex, 0 elsewhere.
+        int batch = 3, dim = 4;
+        var input = new Tensor<double>(new[] { batch, dim });
+        var rng = new Random(11);
+        for (int i = 0; i < input.Length; i++) input[i] = rng.NextDouble() + 0.1;
+
+        const int sliceIndex = 2;
+        using var tape = new GradientTape<double>();
+        var slice = input.Slice(sliceIndex); // axis-0 slice must route through the taped path
+        var loss = _engine.ReduceSum(slice, null);
+        var grads = tape.ComputeGradients(loss, new[] { input });
+
+        Assert.True(grads.ContainsKey(input), "Slice(int) dropped the gradient — it is not routing through the taped path.");
+        var g = grads[input];
+        for (int b = 0; b < batch; b++)
+            for (int d = 0; d < dim; d++)
+            {
+                double expected = (b == sliceIndex) ? 1.0 : 0.0;
+                Assert.Equal(expected, g[new[] { b, d }], 1e-10);
+            }
     }
 }

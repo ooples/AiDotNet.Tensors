@@ -25,6 +25,28 @@ public class LstmSequenceForwardTests
         _engine = new CpuEngine();
     }
 
+    [Trait("Category", "Performance")]
+    [Fact]
+    public void LstmSequenceForward_AisevalShape_LatencyBench()
+    {
+        if (Environment.GetEnvironmentVariable("AIDOTNET_RUN_JIT_PERF") != "1") return;
+        const int batch = 128, seq = 32, inFeatures = 32, hidden = 64;
+        var input = Tensor<float>.CreateRandom(batch, seq, inFeatures);
+        var wIh = Tensor<float>.CreateRandom(4 * hidden, inFeatures);
+        var wHh = Tensor<float>.CreateRandom(4 * hidden, hidden);
+
+        for (int w = 0; w < 8; w++) _ = _engine.LstmSequenceForward(input, null, null, wIh, wHh, null, null);
+        double best = double.MaxValue;
+        for (int r = 0; r < 15; r++)
+        {
+            var sw = Stopwatch.StartNew();
+            _ = _engine.LstmSequenceForward(input, null, null, wIh, wHh, null, null);
+            sw.Stop();
+            best = Math.Min(best, sw.Elapsed.TotalMilliseconds);
+        }
+        _output.WriteLine($"LSTM AIsEval [128,32,32->64] best-of-15: {best:F2} ms (PyTorch ~2.78 ms)");
+    }
+
     [Fact]
     public void LstmSequenceForward_MatchesDecomposedReference_NoSequencesReturn()
     {
