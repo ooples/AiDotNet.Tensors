@@ -2,14 +2,14 @@
 
 Files here are per-fingerprint strategy caches produced by
 
-```
+```bash
 dotnet run --project tests/AiDotNet.Tensors.Benchmarks -- --prewarm-autotune
 ```
 
 on representative hardware in CI, named `{fingerprint}.prewarm.json` (e.g.
 `x64-amd-avx2-cpu16.prewarm.json`). Each line is:
 
-```
+```text
 M N K fp64 transA transB strategy mc nc kc threadCount
 ```
 

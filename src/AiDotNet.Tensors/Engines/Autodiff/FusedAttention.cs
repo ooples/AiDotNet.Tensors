@@ -80,6 +80,23 @@ public sealed class FlashAttentionConfig
     /// </summary>
     public bool UseFlashAttention2 { get; set; }
 
+    /// <summary>
+    /// Mixed-precision opt-in for <c>T == double</c> callers: run the attention
+    /// kernel internally in <c>float</c> (FlashAttention-2), then upcast the result
+    /// back to <c>double</c>. AVX2 packs 8 floats vs 4 doubles per register, so the
+    /// FP32-internal kernel is ~2× the throughput of the full FP64 path, and it
+    /// inherits FlashAttention-2's O(seqLen) memory — the win that dominates SD-UNet
+    /// self-attention at seqLen≥1024 on the FP64 model surface (#467 Phase A).
+    /// <para>
+    /// This is LOSSY (FP32 accumulation, ~1e-3 relative vs the FP64 reference), so
+    /// it is opt-in and intended for inference where FP32 accuracy suffices. No-op
+    /// when <c>T != double</c> (float already runs the float kernel; Half is
+    /// unaffected). Like the FlashAttention-2 path it cannot return attention
+    /// weights (the block-tiled kernel never materialises the score matrix).
+    /// </para>
+    /// </summary>
+    public bool Float32Precision { get; set; }
+
     /// <summary>Default configuration — every field at its spec default.</summary>
     public static FlashAttentionConfig Default => new();
 }
@@ -152,6 +169,25 @@ public static class FusedAttention<T>
         if (value is null) throw new ArgumentNullException(nameof(value));
         config ??= new FlashAttentionConfig();
         engine ??= new CpuEngine();
+
+        // #467 Phase A — mixed-precision opt-in for double callers: re-run the WHOLE
+        // attention path in float (8 AVX2 lanes vs 4 for double, via the float
+        // SimdGemm-backed SDPA / FlashAttention-2 / bias path), then upcast the
+        // result. Reusing the float Forward means rank-3 promotion, causal masking,
+        // additive bias and attention-weights all behave identically — just faster
+        // and lossy (FP32 accumulation). The flag is a no-op for T==float (this
+        // branch is gated to double), so the recursive call can't re-enter.
+        if (config.Float32Precision && typeof(T) == typeof(double))
+        {
+            var qf = DoubleToFloat((Tensor<double>)(object)query);
+            var kf = DoubleToFloat((Tensor<double>)(object)key);
+            var vf = DoubleToFloat((Tensor<double>)(object)value);
+            var biasF = attentionBias is null ? null : DoubleToFloat((Tensor<double>)(object)attentionBias);
+            var (fOut, fWeights) = FusedAttention<float>.Forward(qf, kf, vf, config, biasF, engine);
+            var outD = (Tensor<T>)(object)FloatToDouble(fOut);
+            var weightsD = fWeights is null ? null : (Tensor<T>)(object)FloatToDouble(fWeights);
+            return (outD, weightsD);
+        }
 
         // Rank normalisation — 3D [B, S, D] → 4D [B, 1, S, D]. Dispatcher
         // below always sees 4D so shape-validation lives in one place.
@@ -227,6 +263,7 @@ public static class FusedAttention<T>
                     nameof(config));
             return (outT, null);
         }
+
 
         // Causal no-bias → synthesize the offset-aware -inf upper-triangle
         // bias and route through the bias path. Honours queryOffset so the
@@ -330,6 +367,28 @@ public static class FusedAttention<T>
             return engine.Reshape(t, new[] { t._shape[0], t._shape[2], t._shape[3] });
         }
         return t;
+    }
+
+    // #467 Phase A: contiguous element-wise narrowing/widening for the
+    // Float32Precision mixed-precision path. Plain loops — the cost is O(elements)
+    // and dwarfed by the GEMM-heavy attention kernel; the win is running that kernel
+    // in float (8 AVX2 lanes) instead of double (4).
+    private static Tensor<float> DoubleToFloat(Tensor<double> t)
+    {
+        var src = t.AsSpan();
+        var result = Tensor<float>.CreateZeros((int[])t._shape.Clone());
+        var dst = result.AsWritableSpan();
+        for (int i = 0; i < src.Length; i++) dst[i] = (float)src[i];
+        return result;
+    }
+
+    private static Tensor<double> FloatToDouble(Tensor<float> t)
+    {
+        var src = t.AsSpan();
+        var result = Tensor<double>.CreateZeros((int[])t._shape.Clone());
+        var dst = result.AsWritableSpan();
+        for (int i = 0; i < src.Length; i++) dst[i] = src[i];
+        return result;
     }
 
     private static Tensor<T> TransposeLastTwo(IEngine engine, Tensor<T> t)
