@@ -159,8 +159,12 @@ public class PrePackSpeedupTest
 
             diag = $"baseVsNaive={baseVsNaive:G6} prepackVsNaive={prepackVsNaive:G6} base2VsNaive={base2VsNaive:G6} " +
                    $"(idx {maxIdx} r{maxIdx / N} c{maxIdx % N}: base={cBaseline[maxIdx]:G6} prepack={cPrePack[maxIdx]:G6} naive={cNaive[maxIdx]:G6}) " +
-                   $"arenaActive={ArenaIntegration.IsArenaActive} deterministic={BlasProvider.IsDeterministicMode} " +
-                   $"mklVerified={BlasProvider.IsMklVerified} jitKernels={JittedKernelCache.Count} thread={Environment.CurrentManagedThreadId}";
+                   $"arenaActive={ArenaIntegration.IsArenaActive} blasDeterministic={BlasProvider.IsDeterministicMode} " +
+                   $"mklVerified={BlasProvider.IsMklVerified} jitKernels={JittedKernelCache.Count} thread={Environment.CurrentManagedThreadId} " +
+                   // CI-bisect: which shared global toggle is poisoned by a concurrent test?
+                   $"| EnableSimd={Helpers.CpuParallelSettings.EnableSimd} MaxDOP={Helpers.CpuParallelSettings.MaxDegreeOfParallelism} " +
+                   $"DetReductions={Helpers.CpuParallelSettings.DeterministicReductions} Avx2Gather={Helpers.CpuParallelSettings.EnableAvx2Gather} " +
+                   $"ParThreshold={Helpers.CpuParallelSettings.ParallelThreshold} inParRegion={Helpers.CpuParallelSettings.IsInParallelRegion}";
             _output.WriteLine($"[DRIFT DIAG] M={M} N={N} K={K} maxDelta={maxDelta:G6} {diag}");
         }
 
