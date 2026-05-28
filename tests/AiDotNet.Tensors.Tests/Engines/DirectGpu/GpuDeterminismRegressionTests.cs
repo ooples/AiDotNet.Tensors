@@ -11,16 +11,6 @@ using Xunit;
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
 /// <summary>
-/// xUnit collection grouping all tests that mutate the process-wide
-/// <see cref="AiDotNetEngine.Current"/> and / or
-/// <see cref="AiDotNetEngine.SetDeterministicMode(bool)"/> static state. Tests
-/// in this collection are serialized, so a parallel test cannot observe a
-/// half-applied engine swap.
-/// </summary>
-[CollectionDefinition("AiDotNetEngineGlobalState")]
-public class AiDotNetEngineGlobalStateCollection { }
-
-/// <summary>
 /// Closed-loop regression test for issue #382. Verifies that when the global
 /// <see cref="AiDotNetEngine.SetDeterministicMode(bool)"/> flag is set, the GPU
 /// embedding gradient — the most directly visible site of the original bug —
@@ -35,11 +25,15 @@ public class AiDotNetEngineGlobalStateCollection { }
 /// kernel's nondeterminism is maximally exercised.
 ///
 /// Mutates the process-wide <see cref="AiDotNetEngine.Current"/> and the
-/// <see cref="AiDotNetEngine.SetDeterministicMode(bool)"/> static flag, so the
-/// test joins the dedicated <c>AiDotNetEngineGlobalState</c> collection to
-/// serialize against any other test that touches those statics.
+/// <see cref="AiDotNetEngine.SetDeterministicMode(bool)"/> static flag — which
+/// propagates to <c>BlasProvider.IsDeterministicMode</c> and switches the GEMM
+/// reduction/packing path — so the test joins the unified
+/// <c>BlasManaged-Stats-Serial</c> collection to serialize against every other test
+/// that touches those statics (the pre-pack / scalar-kernel GEMM tests, the CPU
+/// DeterministicMode tests, …). This is the fix for the cross-test "drift" flakiness
+/// those GEMM tests intermittently hit on CI.
 /// </summary>
-[Collection("AiDotNetEngineGlobalState")]
+[Collection("BlasManaged-Stats-Serial")]
 public class GpuDeterminismRegressionTests
 {
     private readonly bool _isDirectGpuAvailable;
