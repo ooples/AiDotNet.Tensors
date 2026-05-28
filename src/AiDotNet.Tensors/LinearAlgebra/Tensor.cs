@@ -3029,7 +3029,29 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         }
 
         int newOffset = _storageOffset + index * _strides[dimension];
-        return new Tensor<T>(_data, newShape, newStrides, newOffset, _storage);
+        var result = new Tensor<T>(_data, newShape, newStrides, newOffset, _storage);
+
+        // Propagate the gradient chain: if a GradientTape is active, set GradFn on
+        // the result so gradients flow through the slice during backward. Without
+        // this, GetSliceAlongDimension was a raw storage-sharing view with no
+        // recorded backward — any layer that slices a tape tensor per-timestep
+        // (recurrent / sequence layers) leaked wrong input gradients via aliasing.
+        // The view is preserved (zero-copy) for the inference path where no tape
+        // is active; only training pays the node record. Mirrors Reshape above.
+        if (Engines.Autodiff.GradientTape<T>.Current != null)
+        {
+            var sliceNode = Engines.Autodiff.GradNodePool<T>.Rent();
+            sliceNode.OwningTape = Engines.Autodiff.GradientTape<T>.Current;
+            sliceNode.Backward = Engines.Autodiff.BackwardFunctions<T>.SliceAxisBackward;
+            sliceNode.Output = result;
+            sliceNode.Input0 = this;
+            sliceNode.InputCount = 1;
+            // SliceAxisBackward reads SavedState as { axis, index }.
+            sliceNode.SavedState = new object[] { dimension, index };
+            result.GradFn = sliceNode;
+        }
+
+        return result;
     }
 
     /// <summary>
