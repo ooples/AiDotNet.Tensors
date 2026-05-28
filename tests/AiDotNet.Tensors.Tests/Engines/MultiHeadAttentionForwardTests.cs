@@ -23,9 +23,10 @@ public class MultiHeadAttentionForwardTests
         _engine = new CpuEngine();
     }
 
-    [Fact(Skip = "Performance measurement — run manually with --filter MultiHeadAttentionForward_AisevalShape")]
+    [Fact]
     public void MultiHeadAttentionForward_AisevalShape_PerfMeasurement()
     {
+        if (Environment.GetEnvironmentVariable("AIDOTNET_RUN_JIT_PERF") != "1") return;
         // AIsEval Transformer per-layer attention shape:
         // [B=128, seq=32, dModel=64], numHeads=4, dHead=16.
         // PyTorch nn.TransformerEncoderLayer @ bs=128 was 13.85 ms steady-state
@@ -39,17 +40,62 @@ public class MultiHeadAttentionForwardTests
         var vW = MakeRandom(rng, dModel, dModel);
         var oW = MakeRandom(rng, dModel, dModel);
 
-        for (int w = 0; w < 3; w++)
+        for (int w = 0; w < 8; w++)
             _ = _engine.MultiHeadAttentionForward(input, qW, kW, vW, oW, numHeads);
 
-        var sw = System.Diagnostics.Stopwatch.StartNew();
-        const int iters = 10;
+        double best = double.MaxValue;
+        for (int r = 0; r < 15; r++)
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            _ = _engine.MultiHeadAttentionForward(input, qW, kW, vW, oW, numHeads);
+            sw.Stop();
+            best = System.Math.Min(best, sw.Elapsed.TotalMilliseconds);
+        }
+        _output.WriteLine($"MHA AIsEval [128,32,64] h=4 best-of-15: {best:F2} ms (PyTorch ~2.74 ms)");
+    }
+
+    [Fact]
+    public void MultiHeadAttentionForward_ZeroAllocSdpa_AllocationBelowThreshold()
+    {
+        // #476: the zero-alloc SDPA path must not allocate the per-call [B,H,Sq,Sk]
+        // attention-weights tensor or a separate SDPA output tensor. At the AIsEval
+        // shape the old path allocated ~7.3 MB/call (dominated by the SDPA
+        // scores/softmax + output tensors); the fix does in-place softmax in pooled
+        // scratch and writes P·V straight into the pooled MHA buffer.
+        const int batch = 128, seq = 32, dModel = 64, numHeads = 4;
+        var rng = new Random(2026);
+        var input = MakeRandom(rng, batch, seq, dModel);
+        var qW = MakeRandom(rng, dModel, dModel);
+        var kW = MakeRandom(rng, dModel, dModel);
+        var vW = MakeRandom(rng, dModel, dModel);
+        var oW = MakeRandom(rng, dModel, dModel);
+
+        // Warm up: JIT, fill ArrayPool buckets, prime AutoTensorCache.
+        for (int w = 0; w < 12; w++)
+            _ = _engine.MultiHeadAttentionForward(input, qW, kW, vW, oW, numHeads);
+
+#if NET5_0_OR_GREATER
+        const int iters = 20;
+        long before = GC.GetAllocatedBytesForCurrentThread();
         for (int i = 0; i < iters; i++)
             _ = _engine.MultiHeadAttentionForward(input, qW, kW, vW, oW, numHeads);
-        sw.Stop();
-        double ms = sw.Elapsed.TotalMilliseconds / iters;
+        long after = GC.GetAllocatedBytesForCurrentThread();
+        double perCallKb = (after - before) / (double)iters / 1024.0;
+        _output.WriteLine($"MHA per-call allocation (steady state): {perCallKb:F1} KB " +
+                          $"(old SDPA scores+softmax+output path was ~7.3 MB/call)");
 
-        _output.WriteLine($"MultiHeadAttentionForward AIsEval shape [128,32,64] h=4: {ms:F2} ms/iter");
+        // Old path ≈ 7.3 MB/call. After the fix the only sizeable per-call allocation
+        // is the returned [B,seq,dModel] result tensor (~1 MB here); the ~3 MB SDPA
+        // weights+output scratch is gone. 2 MB is a comfortable bar — far below the
+        // old profile, above the inherent result allocation, robust to pool/GC noise.
+        Assert.True(perCallKb < 2048.0,
+            $"MHA allocated {perCallKb:F1} KB/call — expected < 2048 KB (zero-alloc SDPA regressed?).");
+#else
+        // GC.GetAllocatedBytesForCurrentThread is net5+; the allocation assertion runs
+        // on net10.0. On net471 just exercise the path (correctness is covered by the
+        // decomposed-chain tests).
+        _ = _engine.MultiHeadAttentionForward(input, qW, kW, vW, oW, numHeads);
+#endif
     }
 
     [Fact]
