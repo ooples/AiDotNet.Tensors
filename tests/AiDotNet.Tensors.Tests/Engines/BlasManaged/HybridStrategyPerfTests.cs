@@ -1,0 +1,99 @@
+using System;
+using System.Diagnostics;
+using AiDotNet.Tensors.Engines.BlasManaged;
+using BlasManagedLib = AiDotNet.Tensors.Engines.BlasManaged.BlasManaged;
+using Xunit;
+
+namespace AiDotNet.Tensors.Tests.Engines.BlasManaged;
+
+/// <summary>
+/// #375 G12/G13 guards. Perf-tagged (excluded from the CI correctness filter, run in the
+/// perf pipeline) because they assert wall-clock behaviour.
+/// </summary>
+[Trait("Category", "Performance")]
+[Collection("BlasManaged-Stats-Serial")]
+public class HybridStrategyPerfTests
+{
+    /// <summary>
+    /// G13: SelectStrategy must stay sub-µs. The hybrid added a learned-cache consult on the
+    /// dispatch path; without the in-memory memo it did a File.Exists+ReadAllText+JSON parse
+    /// per call (~77 µs measured). The memo makes the disk read at-most-once-per-shape. This
+    /// guards against the disk-per-call regression returning (gate at 10 µs — generous, but
+    /// 77 µs would fail it by 8×; the fixed path is ~0.8 µs).
+    /// </summary>
+    [Fact]
+    public void SelectStrategy_HotPath_StaysFast()
+    {
+        var opts = default(BlasOptions<float>);
+        for (int w = 0; w < 1000; w++)
+            Dispatcher.SelectStrategy<float>(197, 197, 64, false, true, in opts);
+        const int iters = 100_000;
+        var times = new double[iters];
+        var sw = new Stopwatch();
+        for (int i = 0; i < iters; i++)
+        {
+            sw.Restart();
+            Dispatcher.SelectStrategy<float>(197, 197, 64, false, true, in opts);
+            sw.Stop();
+            times[i] = sw.Elapsed.TotalMilliseconds * 1000.0; // µs (TimeSpan.TotalMicroseconds is net7.0+ only; this is net471-safe)
+        }
+        Array.Sort(times);
+        double medianUs = times[iters / 2];
+        Assert.True(medianUs < 10.0,
+            $"SelectStrategy median {medianUs:F2} µs — disk-read-per-call regression (memo broken?).");
+    }
+
+    /// <summary>
+    /// G12: the table's routed strategy must be no worse than the alternatives on the catalog
+    /// (a hand-seeded table entry can't ship a *regression*). For each transposed shape (the
+    /// ones the hybrid governs), measure the table's choice vs the other strategies; assert
+    /// table ≤ best × 1.5. The 1.5× tolerance is wide enough to absorb wall-clock noise on a
+    /// loaded box yet still catches the class of regression this guards — the 512×512×64
+    /// Streaming-vs-PackBoth gap was 2.5×, which a 1.5× gate fails decisively.
+    /// </summary>
+    [Theory]
+    [InlineData(96, 128, 64)]
+    [InlineData(128, 128, 128)]
+    [InlineData(512, 512, 64)]
+    public void Table_Routing_NoWorse_Than_Alternatives_FP64(int M, int N, int K)
+    {
+        // Opt-in: a wall-clock strategy comparison is inherently contention-sensitive, so it
+        // is gated behind an env var (matching the repo's other most-noise-prone perf gates)
+        // rather than flaking even the perf pipeline. The ROUTING correctness this ultimately
+        // protects is already guarded deterministically by SmallShapeStreamingDispatchTests
+        // (which asserts the per-key table routes); this is the supplementary "the chosen
+        // strategy actually performs" check, run manually with AIDOTNET_RUN_HYBRID_PERF=1.
+        if (Environment.GetEnvironmentVariable("AIDOTNET_RUN_HYBRID_PERF") != "1") return;
+
+        var rng = new Random(11);
+        var a = new double[M * K];
+        var b = new double[N * K]; // [N,K] transB
+        var c = new double[M * N];
+        for (int i = 0; i < a.Length; i++) a[i] = rng.NextDouble() * 2 - 1;
+        for (int i = 0; i < b.Length; i++) b[i] = rng.NextDouble() * 2 - 1;
+
+        double Time(PackingMode mode)
+        {
+            var opts = new BlasOptions<double> { PackingMode = mode };
+            for (int w = 0; w < 10; w++) BlasManagedLib.Gemm<double>(a, K, false, b, K, true, c, N, M, N, K, opts);
+            double best = double.MaxValue;
+            for (int w = 0; w < 11; w++)  // best-of-11 to suppress contention spikes
+            {
+                var sw = Stopwatch.StartNew();
+                for (int i = 0; i < 20; i++) BlasManagedLib.Gemm<double>(a, K, false, b, K, true, c, N, M, N, K, opts);
+                sw.Stop();
+                best = Math.Min(best, sw.Elapsed.TotalMilliseconds);
+            }
+            return best;
+        }
+
+        var chosen = Dispatcher.SelectStrategy<double>(M, N, K, false, true, default);
+        double chosenMs = Time(chosen);
+        double bestAltMs = double.MaxValue;
+        foreach (var mode in new[] { PackingMode.ForceStreaming, PackingMode.ForcePackBoth })
+            bestAltMs = Math.Min(bestAltMs, Time(mode));
+
+        Assert.True(chosenMs <= bestAltMs * 1.5,
+            $"{M}x{N}x{K}: table chose {chosen} at {chosenMs:F3} ms but best alternative was {bestAltMs:F3} ms (>1.5×).");
+    }
+}

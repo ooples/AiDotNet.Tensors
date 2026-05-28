@@ -16,6 +16,9 @@ namespace AiDotNet.Tensors.Tests.Engines.BlasManaged;
 /// was the bottleneck. D10 should close most of that gap.
 /// </para>
 /// </summary>
+// Bit-exact vs scalar reference — serialize against global reduction-order mutators
+// so a concurrent toggle can't change the GEMM reduction order mid-assertion (#375 de-flake).
+[Collection("BlasManaged-Stats-Serial")]
 public class Avx2PackTransBFp32Test
 {
     private static void ReferenceGemmTransBFp32(
