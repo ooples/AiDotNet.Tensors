@@ -214,6 +214,18 @@ public partial class CpuEngine
         out Tensor<float> finalHidden,
         out Tensor<float> finalCell)
     {
+        // Empty-batch / empty-sequence early return — matches the generic LSTM path's
+        // tolerance of degenerate inputs and shortcuts the per-step GEMM/activation work
+        // (avoids any zero-size buffer surprises and pool churn on a no-op call).
+        if (batch == 0 || seqLen == 0)
+        {
+            finalHidden = AutoTensorCache.RentOrAllocate<float>(new[] { batch, hidden });
+            finalCell = AutoTensorCache.RentOrAllocate<float>(new[] { batch, hidden });
+            return returnSequences
+                ? AutoTensorCache.RentOrAllocate<float>(new[] { batch, seqLen, hidden })
+                : AutoTensorCache.RentOrAllocate<float>(new[] { batch, hidden });
+        }
+
         // Pre-compute Wx = input @ wIh^T as one big GEMM via SimdGemm.
         // input is [B, seq, in] — treat as [B*seq, in] row-major.
         // wIh is [4H, in] — we want input @ wIh^T which is [B*seq, 4H].
@@ -268,91 +280,87 @@ public partial class CpuEngine
             ReadOnlySpan<float> bHhSpan = hasBhh ? bHh!.AsSpan() : default;
             var outSpan = output.AsWritableSpan();
 
+            // #477: the recurrent GEMM h_prev @ wHh^T runs once per timestep (seqLen
+            // serial calls). The old transB=true Sgemm re-transposed + re-packed the
+            // constant wHh on EVERY step — per-GEMM dispatch over the sequence was the
+            // measured bottleneck (thread-insensitive ~5.9 ms). Pre-transpose wHh
+            // [gateRows, hidden] → wHhT [hidden, gateRows] ONCE, then drive the per-step
+            // GEMM through SgemmWithCachedB: it keys the pre-packed B on the array
+            // identity, so wHhT is packed once (step 0) and reused for every later step.
+            // A fresh array (not pooled) guarantees a unique identity per call, so the
+            // pack cache can never serve stale bytes from a recycled buffer.
+            var wHhT = new float[hidden * gateRows];
+            for (int g = 0; g < gateRows; g++)
+                for (int hh2 = 0; hh2 < hidden; hh2++)
+                    wHhT[hh2 * gateRows + g] = wHhSpan[g * hidden + hh2];
+
             // Per-timestep loop.
             for (int t = 0; t < seqLen; t++)
             {
-                // hh = h_prev @ wHh^T — one GEMM per step via SimdGemm,
-                // shape [B, gateRows] = [B, hidden] @ [hidden, gateRows].
-                // wHh stored as [gateRows, hidden] so transB=true gives
-                // [B, gateRows] with K=hidden.
-                SimdGemm.Sgemm(
-                    hPrevBuf.AsSpan(0, batch * hidden), hidden, false,
-                    wHhSpan, hidden, true,
+                // hh = h_prev @ wHh^T = h_prev @ wHhT, [B, hidden] @ [hidden, gateRows].
+                // No-transpose A·B with the pre-packed (cached) wHhT — pack happens once
+                // on the first step, every later step reuses it. See the wHhT note above.
+                // Kept SERIAL on purpose: parallelizing this tiny per-step GEMM across the
+                // batch loses badly (32 parallel-for dispatches over the sequence dominate
+                // the ~2M-FMA chunks — measured 4× slower), matching the issue's
+                // thread-insensitive finding.
+                SimdGemm.SgemmWithCachedB(
+                    hPrevBuf.AsSpan(0, batch * hidden),
+                    wHhT,
                     hhBuf.AsSpan(0, batch * gateRows),
                     batch, hidden, gateRows);
 
-                // Combine: gateBuf[b, g] = Wx[b*seq+t, g] + hh[b, g] + bHh[g]
-                // Lay this out so the next pass (sigmoid/tanh) is contiguous.
+                // Combine into a DE-INTERLEAVED gate layout [gateType][batch][hidden]
+                // (i-block | f-block | g-block | o-block, each batch*hidden contiguous):
+                //   gate[gType][b][h] = Wx[(b*seq+t), gType*H+h] + hh[b, gType*H+h] + bHh[...]
+                // This lets each activation run as ONE big SimdKernels call per step
+                // (4/step) instead of 4-per-batch (512/step at B=128), and turns the
+                // cell update into a flat contiguous pass. #477: the per-call activation
+                // overhead over the 32-step sequence was ~half the kernel wall-clock.
+                int bh = batch * hidden;
                 for (int b = 0; b < batch; b++)
                 {
                     int wxRowOff = (b * seqLen + t) * gateRows;
                     int hhOff = b * gateRows;
-                    int gateOff = b * gateRows;
-                    for (int g = 0; g < gateRows; g++)
+                    for (int gType = 0; gType < 4; gType++)
                     {
-                        float v = wxBuf[wxRowOff + g] + hhBuf[hhOff + g];
-                        if (hasBhh) v += bHhSpan[g];
-                        gateBuf[gateOff + g] = v;
+                        int srcG = gType * hidden;
+                        int dst = gType * bh + b * hidden;
+                        for (int h = 0; h < hidden; h++)
+                        {
+                            float v = wxBuf[wxRowOff + srcG + h] + hhBuf[hhOff + srcG + h];
+                            if (hasBhh) v += bHhSpan[srcG + h];
+                            gateBuf[dst + h] = v;
+                        }
                     }
                 }
 
-                // Activate gates: i, f, o = sigmoid; g = tanh. Gate layout is
-                // [b, 0..H-1] = i, [b, H..2H-1] = f, [b, 2H..3H-1] = g, [b, 3H..4H-1] = o.
-                // Apply per-batch slice so each sigmoid/tanh call sees a
-                // contiguous run of one gate type — let SimdKernels vectorize
-                // the whole run, which is what makes the 8-element AVX2 path
-                // efficient.
-                //
-                // We could apply the activations to the whole [B, 4H] block at
-                // once but the gate layout is interleaved per batch (i, f, g, o
-                // concatenated along the inner axis), so contiguous activation
-                // requires a per-batch loop here. Hidden=64 in the AIsEval
-                // workload gives 64-element runs — well above the SIMD ramp.
+                // Activate each gate-type block in a single vectorized call.
                 fixed (float* gateP = gateBuf)
                 {
-                    for (int b = 0; b < batch; b++)
-                    {
-                        float* iSeg = gateP + b * gateRows + 0 * hidden;
-                        float* fSeg = gateP + b * gateRows + 1 * hidden;
-                        float* gSeg = gateP + b * gateRows + 2 * hidden;
-                        float* oSeg = gateP + b * gateRows + 3 * hidden;
-
-                        SimdKernels.SigmoidUnsafe(iSeg, iSeg, hidden);
-                        SimdKernels.SigmoidUnsafe(fSeg, fSeg, hidden);
-                        SimdKernels.TanhUnsafe(gSeg, gSeg, hidden);
-                        SimdKernels.SigmoidUnsafe(oSeg, oSeg, hidden);
-                    }
+                    SimdKernels.SigmoidUnsafe(gateP + 0 * bh, gateP + 0 * bh, bh);  // i
+                    SimdKernels.SigmoidUnsafe(gateP + 1 * bh, gateP + 1 * bh, bh);  // f
+                    SimdKernels.TanhUnsafe(gateP + 2 * bh, gateP + 2 * bh, bh);     // g
+                    SimdKernels.SigmoidUnsafe(gateP + 3 * bh, gateP + 3 * bh, bh);  // o
                 }
 
-                // Cell + hidden state update:
-                //   c[b, h] = f * c_prev + i * g
-                //   h[b, h] = o * tanh(c)
-                // We compute tanh(c) into hCurrBuf temporarily (it'll be
-                // overwritten below to o*tanh(c)) to keep memory traffic low.
+                // Cell + hidden update over the flat [batch*hidden] blocks:
+                //   c = f * c_prev + i * g ;  h = o * tanh(c)
+                // tanh(c) is now a single batched call (was per-batch).
                 fixed (float* gateP = gateBuf)
                 fixed (float* hCurrP = hCurrBuf)
                 fixed (float* cCurrP = cCurrBuf)
                 fixed (float* cPrevP = cPrevBuf)
                 {
-                    for (int b = 0; b < batch; b++)
-                    {
-                        float* iSeg = gateP + b * gateRows + 0 * hidden;
-                        float* fSeg = gateP + b * gateRows + 1 * hidden;
-                        float* gSeg = gateP + b * gateRows + 2 * hidden;
-                        float* oSeg = gateP + b * gateRows + 3 * hidden;
-                        float* cPrevSeg = cPrevP + b * hidden;
-                        float* cCurrSeg = cCurrP + b * hidden;
-                        float* hCurrSeg = hCurrP + b * hidden;
-
-                        // c = f * c_prev + i * g (scalar; vectorizable by JIT).
-                        for (int h = 0; h < hidden; h++)
-                            cCurrSeg[h] = fSeg[h] * cPrevSeg[h] + iSeg[h] * gSeg[h];
-
-                        // hCurr scratch = tanh(c), then overwrite with o * tanh(c).
-                        SimdKernels.TanhUnsafe(cCurrSeg, hCurrSeg, hidden);
-                        for (int h = 0; h < hidden; h++)
-                            hCurrSeg[h] = oSeg[h] * hCurrSeg[h];
-                    }
+                    float* iB = gateP + 0 * bh;
+                    float* fB = gateP + 1 * bh;
+                    float* gB = gateP + 2 * bh;
+                    float* oB = gateP + 3 * bh;
+                    for (int idx = 0; idx < bh; idx++)
+                        cCurrP[idx] = fB[idx] * cPrevP[idx] + iB[idx] * gB[idx];
+                    SimdKernels.TanhUnsafe(cCurrP, hCurrP, bh);   // hCurr = tanh(c)
+                    for (int idx = 0; idx < bh; idx++)
+                        hCurrP[idx] = oB[idx] * hCurrP[idx];       // h = o * tanh(c)
                 }
 
                 if (returnSequences)
