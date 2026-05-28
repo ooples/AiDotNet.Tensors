@@ -76,6 +76,78 @@ class Program
             return;
         }
 
+        // Sub-G worst-loss diagnostic: identify which strategy/thread count
+        // gives best BlasManaged perf for the 64×64×64 FP64 shape.
+        if (args[0] == "--ab-blas-small-square-fp64")
+        {
+            Conv2DAbBench.RunBlasSmallSquareFp64();
+            return;
+        }
+
+        // Sub-G #375 Layer D — differentiator benchmarks (structural wins PyTorch
+        // can't match). Each runs standalone; the cold-start child workload is
+        // dispatched via --cold-start-aidotnet.
+        if (args[0] == "--cold-start-aidotnet")
+        {
+            Environment.Exit(PyTorchComparison.ColdStartBench.RunAiDotNetWorkload());
+        }
+        if (args[0] == "--cold-start")
+        {
+            PyTorchComparison.ColdStartBench.Run();
+            return;
+        }
+        if (args[0] == "--determinism-bench")
+        {
+            PyTorchComparison.DeterminismBench.Run();
+            return;
+        }
+        if (args[0] == "--per-call-threads")
+        {
+            PyTorchComparison.PerCallThreadsBench.Run();
+            return;
+        }
+        if (args[0] == "--frozen-weight-inference")
+        {
+            PyTorchComparison.FrozenWeightInferenceBench.Run();
+            return;
+        }
+        if (args[0] == "--pytorch-headtohead")
+        {
+            string outPath = args.Length > 1 ? args[1] : "artifacts/perf/pytorch-comparison.md";
+            PyTorchComparison.HeadToHeadCatalogBench.Run(outPath);
+            return;
+        }
+        if (args[0] == "--investigate-gap")
+        {
+            PyTorchComparison.GapInvestigationBench.Run();
+            return;
+        }
+        if (args[0] == "--cache-probe")
+        {
+            PyTorchComparison.GapInvestigationBench.CacheProbe();
+            return;
+        }
+        if (args[0] == "--hybrid-lever-check")
+        {
+            PyTorchComparison.GapInvestigationBench.LeverCheck();
+            return;
+        }
+        if (args[0] == "--prewarm-autotune")
+        {
+            PyTorchComparison.GapInvestigationBench.PrewarmAutotune();
+            return;
+        }
+        if (args[0] == "--selectstrategy-hotpath")
+        {
+            PyTorchComparison.GapInvestigationBench.SelectStrategyHotPath();
+            return;
+        }
+        if (args[0] == "--hybrid-win")
+        {
+            PyTorchComparison.GapInvestigationBench.HybridWin();
+            return;
+        }
+
         // Issue #403 Phase A.3: per-substep allocation profile + shape catalog
         // for one pass through the DCGAN-step probe substeps. Cheap to run
         // (one call per substep) so reviewers can compare alloc shape against
@@ -588,6 +660,31 @@ class Program
         Console.WriteLine("  --fp64-primitives   : FP64 BN/LN/Softmax/activations/pools; Stage 0 baseline for Stage 4");
         Console.WriteLine("  --dit-xl-sdpa       : ScaledDotProductAttention at DiT-XL shape [4,16,256,72] (Issue #162 SDPA fix)");
         Console.WriteLine("  --transformer-ffn   : Small-M transformer FFN matmul (Sgemm+Dgemm+batched) — Issue #245 coverage");
+        Console.WriteLine();
+        Console.WriteLine("A/B microkernel + dispatch benchmarks:");
+        Console.WriteLine("  --ab-matmul            : A/B GEMM (FP32) across catalog shapes");
+        Console.WriteLine("  --ab-conv2d            : A/B Conv2D (FP32)");
+        Console.WriteLine("  --ab-conv2d-double     : A/B Conv2D (FP64)");
+        Console.WriteLine("  --ab-blas-small-square-fp64 : A/B small-square FP64 GEMM microkernel");
+        Console.WriteLine("  --ab-attention-qkt     : A/B attention Q·Kᵀ");
+        Console.WriteLine("  --ab-softmax-double    : A/B softmax (FP64)");
+        Console.WriteLine("  --ab-layernorm         : A/B LayerNorm");
+        Console.WriteLine("  --ab-binary-ops        : A/B elementwise binary ops");
+        Console.WriteLine();
+        Console.WriteLine("PyTorch-comparison diagnostics:");
+        Console.WriteLine("  --per-call-threads       : Per-call NumThreads sweep vs PyTorch");
+        Console.WriteLine("  --frozen-weight-inference: Frozen-weight (pre-packed) inference vs PyTorch");
+        Console.WriteLine("  --pytorch-headtohead     : Head-to-head catalog (--pytorch-headtohead [out.md])");
+        Console.WriteLine("  --investigate-gap        : Single/multi-thread kernel-gap investigation vs Torch");
+        Console.WriteLine("  --cold-start             : Cold-start latency (AiDotNet vs PyTorch subprocess)");
+        Console.WriteLine("  --cold-start-aidotnet    : Cold-start latency (AiDotNet only)");
+        Console.WriteLine("  --determinism-bench      : Deterministic vs fast-mode reduction cost");
+        Console.WriteLine("  --layers                 : End-to-end layer (Linear/Conv/Norm) microbench");
+        Console.WriteLine("  --unet                   : U-Net step microbench");
+        Console.WriteLine("  --pr319-grain            : PR #319 grain-size migration regression harness");
+#if NET8_0_OR_GREATER
+        Console.WriteLine("  --pytorch-parity         : PyTorch CPU parity (matmul/FlashAttn/LayerNorm/BCE fwd+bwd, .NET 8+)");
+#endif
         Console.WriteLine();
         Console.WriteLine("Issue #296 acceptance benchmarks (real async ICompiledPlan):");
         Console.WriteLine("  --296-chain         : Single-batch latency vs PyTorch (BS=1/32/128, two-stage Linear→ReLU→Linear)");

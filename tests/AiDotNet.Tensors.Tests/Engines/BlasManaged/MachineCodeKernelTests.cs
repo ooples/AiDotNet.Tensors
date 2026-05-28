@@ -50,6 +50,11 @@ public class MachineCodeKernelTests
         Assert.Equal(-4L, fn(-5L));
     }
 
+    // Wall-clock GFLOPS gate (>44) — flakes under parallel CPU contention in the CI
+    // correctness run; tag Performance so the Category!=Performance filter excludes it,
+    // matching the repo's other perf gates (#375 de-flake). Correctness of the kernel is
+    // covered by the bit-match tests in this class.
+    [Trait("Category", "Performance")]
     [Fact]
     public unsafe void Fp64x12_MachineCode_BreaksRyuJitCeiling()
     {

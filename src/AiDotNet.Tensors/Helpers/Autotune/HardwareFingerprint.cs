@@ -54,8 +54,44 @@ public static class HardwareFingerprint
     /// </summary>
     internal static void InvalidateForTests()
     {
-        lock (_lock) _cachedFingerprint = null;
+        lock (_lock) { _cachedFingerprint = null; _cachedKeyBox = null; }
     }
+
+    /// <summary>
+    /// Coarse hardware key for GEMM strategy routing: (simd, vendor, cpuBucket).
+    /// Distinct from the full fingerprint string — it is the seed-table key (#375).
+    /// </summary>
+    public readonly record struct HwKey(string Simd, string Vendor, int CpuBucket);
+
+    // Stored as a BOXED reference behind a volatile field rather than a nullable
+    // struct: HwKey holds two string refs + an int, so a direct `HwKey?` read outside
+    // the lock could tear. A reference read/write is atomic, and `volatile` publishes
+    // the immutable boxed value safely — so the hot-path read stays lock-free while the
+    // first-time compute is guarded.
+    private static volatile object? _cachedKeyBox;
+
+    /// <summary>The current host's coarse routing key (cached for the process lifetime).</summary>
+    public static HwKey Key
+    {
+        get
+        {
+            if (_cachedKeyBox is HwKey k) return k;
+            lock (_lock)
+            {
+                if (_cachedKeyBox is HwKey existing) return existing;
+                var computed = new HwKey(DetectSimdLevel(), DetectVendor(), BucketFor(Environment.ProcessorCount));
+                _cachedKeyBox = computed; // boxes; volatile write = safe publication
+                return computed;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Core-count band for routing: 0 = ≤4 (small), 1 = 5–16 (mid), 2 = &gt;16 (large).
+    /// Separates the amd-avx2-cpu16 vs amd-avx2-cpu32 collision (#375 G1).
+    /// </summary>
+    public static int BucketFor(int processorCount)
+        => processorCount <= 4 ? 0 : processorCount <= 16 ? 1 : 2;
 
     private static string Compute()
     {

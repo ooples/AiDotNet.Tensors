@@ -14,6 +14,10 @@ namespace AiDotNet.Tensors.Tests.Helpers;
 /// work runs entirely on the calling thread when the flag is true. Every test
 /// saves and restores the global flag so it can't leak into other tests.
 /// </summary>
+// Sets process-global CpuParallelSettings.DeterministicReductions / MaxDegreeOfParallelism
+// mid-test (changes GEMM reduction order). Save/restore can't stop a CONCURRENT test from
+// observing the flag, so serialize against all collections (#375 de-flake).
+[Collection("BlasManaged-Stats-Serial")]
 public class ParallelForOrSerialDispatchTests
 {
     [Fact]

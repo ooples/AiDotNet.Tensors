@@ -9,6 +9,9 @@ using AiDotNet.Tensors.Helpers;
 
 namespace AiDotNet.Tensors.Tests.Engines.BlasManaged;
 
+// Toggles process-global BlasProvider.IsDeterministicMode (changes GEMM reduction
+// order); serialize against the bit-exact correctness tests (#375 de-flake).
+[Collection("BlasManaged-Stats-Serial")]
 public class DeterministicModeTests
 {
     [Fact]
