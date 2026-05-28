@@ -162,9 +162,9 @@ public class PrePackSpeedupTest
                    $"arenaActive={ArenaIntegration.IsArenaActive} blasDeterministic={BlasProvider.IsDeterministicMode} " +
                    $"mklVerified={BlasProvider.IsMklVerified} jitKernels={JittedKernelCache.Count} thread={Environment.CurrentManagedThreadId} " +
                    // CI-bisect: which shared global toggle is poisoned by a concurrent test?
-                   $"| EnableSimd={Helpers.CpuParallelSettings.EnableSimd} MaxDOP={Helpers.CpuParallelSettings.MaxDegreeOfParallelism} " +
-                   $"DetReductions={Helpers.CpuParallelSettings.DeterministicReductions} Avx2Gather={Helpers.CpuParallelSettings.EnableAvx2Gather} " +
-                   $"ParThreshold={Helpers.CpuParallelSettings.ParallelThreshold} inParRegion={Helpers.CpuParallelSettings.IsInParallelRegion}";
+                   $"| EnableSimd={AiDotNet.Tensors.Helpers.CpuParallelSettings.EnableSimd} MaxDOP={AiDotNet.Tensors.Helpers.CpuParallelSettings.MaxDegreeOfParallelism} " +
+                   $"DetReductions={AiDotNet.Tensors.Helpers.CpuParallelSettings.DeterministicReductions} Avx2Gather={AiDotNet.Tensors.Helpers.CpuParallelSettings.EnableAvx2Gather} " +
+                   $"ParThreshold={AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelThreshold} inParRegion={AiDotNet.Tensors.Helpers.CpuParallelSettings.IsInParallelRegion}";
             _output.WriteLine($"[DRIFT DIAG] M={M} N={N} K={K} maxDelta={maxDelta:G6} {diag}");
         }
 
