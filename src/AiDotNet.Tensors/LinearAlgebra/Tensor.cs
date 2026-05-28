@@ -1163,18 +1163,12 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         ThrowIfSparse();
         if (Rank == 0)
             throw new InvalidOperationException("Cannot slice a scalar (rank-0) tensor.");
-        if (index < 0 || index >= _shape[0])
-            throw new ArgumentOutOfRangeException(nameof(index));
 
-        // O(1) view: adjust offset by index * stride[0], drop first dimension.
-        int newRank = Rank - 1;
-        var newShape = new int[newRank];
-        var newStrides = new int[newRank];
-        Array.Copy(_shape, 1, newShape, 0, newRank);
-        Array.Copy(_strides, 1, newStrides, 0, newRank);
-        int newOffset = _storageOffset + index * _strides[0];
-
-        return new Tensor<T>(_data, newShape, newStrides, newOffset, _storage);
+        // Slicing axis 0 is identical to GetSliceAlongDimension(index, 0). Delegate so
+        // both public entry points (Slice/GetSlice and GetSliceAlongDimension) share the
+        // same autodiff-aware path; otherwise Slice/GetSlice would silently drop gradients
+        // under an active GradientTape while GetSliceAlongDimension records them.
+        return GetSliceAlongDimension(index, 0);
     }
 
     /// <summary>
