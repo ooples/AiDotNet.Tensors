@@ -13,9 +13,19 @@ namespace AiDotNet.Tensors.Tests.Engines.BlasManaged;
 // what their authors intended.
 
 /// <summary>
-/// Tests that mutate process-wide global state (CpuParallelSettings,
-/// BlasProvider.IsDeterministicMode, BlasManaged stats counters) must run
-/// serially to avoid cross-class state contamination.
+/// Single serial collection for every test that mutates process-wide global state
+/// affecting the GEMM path — CpuParallelSettings, the OpenBLAS thread count,
+/// BlasManaged stats/JIT caches, and especially BlasProvider.IsDeterministicMode
+/// (which AiDotNetEngine.SetDeterministicMode also flips, and which switches the GEMM
+/// reduction/packing path). These were previously split across three separate serial
+/// collections (BlasGlobalState, AiDotNetEngineGlobalState, this one); cross-collection
+/// DisableParallelization did NOT reliably isolate them on CI, so a flip of the
+/// determinism flag in one collection drifted a concurrent pre-pack/GEMM test's output
+/// away from its baseline (the intermittent "drift" failures in
+/// PrePackedB_Output_BitMatches_LivePack, the cached-packed-buffer tests, and
+/// SetDeterministicMode_Toggles). Membership in ONE collection guarantees sequential
+/// execution (xUnit's core contract, independent of DisableParallelization semantics),
+/// which is what actually fixes the flakiness.
 /// </summary>
 [CollectionDefinition("BlasManaged-Stats-Serial", DisableParallelization = true)]
 public sealed class BlasManagedStatsSerialCollection { }
