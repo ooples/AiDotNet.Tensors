@@ -186,21 +186,17 @@ public partial class CpuEngine
             TransposeQkv(kFlatBuf, kHeadBuf, batch, seqLen, numHeads, dHead);
             TransposeQkv(vFlatBuf, vHeadBuf, batch, seqLen, numHeads, dHead);
 
-            // ---- SDPA. Wrap the pooled buffers as Tensor<float> views just
-            // long enough to call the existing optimized primitive, which
-            // does scale + softmax + matmul internally. The wrapping is
-            // O(1) — no data copy. ----
-            var qHeadTensor = WrapAsTensor(qHeadBuf, batch, numHeads, seqLen, dHead);
-            var kHeadTensor = WrapAsTensor(kHeadBuf, batch, numHeads, seqLen, dHead);
-            var vHeadTensor = WrapAsTensor(vHeadBuf, batch, numHeads, seqLen, dHead);
-
-            var attnTensor = ScaledDotProductAttention<float>(
-                qHeadTensor, kHeadTensor, vHeadTensor,
-                mask: mask, scale: null, out _);
-
-            // Copy SDPA output ([B, H, seq, dHead]) into our pooled buffer
-            // so the inverse-transpose is a contiguous read pass.
-            attnTensor.AsSpan().Slice(0, qkvElems).CopyTo(attnHeadBuf.AsSpan(0, qkvElems));
+            // ---- SDPA, output-only, straight into the pooled attn buffer. MHA discards
+            // the attention-weight matrix (the general ScaledDotProductAttention's `out _`),
+            // so route through ScaledDotProductAttentionFloatInto: it runs the identical
+            // per-head scale + softmax + matmul kernel but skips the weightsData array, the
+            // attentionWeights tensor, the output tensor, AND the copy-out below. The pooled
+            // qkv buffers are already contiguous [B, H, seq, dHead], so no wrapping is needed.
+            // scale = 1/sqrt(dHead) matches ScaledDotProductAttention's scale:null default. ----
+            ScaledDotProductAttentionFloatInto(
+                qHeadBuf, kHeadBuf, vHeadBuf, attnHeadBuf,
+                mask, 1.0 / Math.Sqrt(dHead),
+                batch, numHeads, seqLen, dHead, seqLen, dHead);
 
             // ---- Inverse transpose: [B, H, seq, dHead] -> [B*seq, dModel]. ----
             InverseTransposeQkv(attnHeadBuf, concatBuf, batch, seqLen, numHeads, dHead);
