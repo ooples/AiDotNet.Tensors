@@ -214,6 +214,18 @@ public partial class CpuEngine
         out Tensor<float> finalHidden,
         out Tensor<float> finalCell)
     {
+        // Empty-batch / empty-sequence early return — matches the generic LSTM path's
+        // tolerance of degenerate inputs and shortcuts the per-step GEMM/activation work
+        // (avoids any zero-size buffer surprises and pool churn on a no-op call).
+        if (batch == 0 || seqLen == 0)
+        {
+            finalHidden = AutoTensorCache.RentOrAllocate<float>(new[] { batch, hidden });
+            finalCell = AutoTensorCache.RentOrAllocate<float>(new[] { batch, hidden });
+            return returnSequences
+                ? AutoTensorCache.RentOrAllocate<float>(new[] { batch, seqLen, hidden })
+                : AutoTensorCache.RentOrAllocate<float>(new[] { batch, hidden });
+        }
+
         // Pre-compute Wx = input @ wIh^T as one big GEMM via SimdGemm.
         // input is [B, seq, in] — treat as [B*seq, in] row-major.
         // wIh is [4H, in] — we want input @ wIh^T which is [B*seq, 4H].
