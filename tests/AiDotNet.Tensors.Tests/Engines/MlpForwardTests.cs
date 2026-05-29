@@ -17,6 +17,39 @@ namespace AiDotNet.Tensors.Tests.Engines;
 public class MlpForwardTests
 {
     private readonly CpuEngine _engine = new();
+    private readonly Xunit.Abstractions.ITestOutputHelper _output;
+
+    public MlpForwardTests(Xunit.Abstractions.ITestOutputHelper output) => _output = output;
+
+    [Fact]
+    public void MlpForward_AisevalShape_LatencyBench()
+    {
+        if (Environment.GetEnvironmentVariable("AIDOTNET_RUN_JIT_PERF") != "1") return;
+        // AIsEval MLP inference: Dense 784→512→128→10, bs=128, ReLU hidden.
+        var rng = new Random(2026);
+        int b = 128;
+        int[] dims = { 784, 512, 128, 10 };
+        var input = MakeRandom(rng, b, dims[0]);
+        var weights = new List<Tensor<float>>();
+        var biases = new List<Tensor<float>?>();
+        for (int i = 0; i + 1 < dims.Length; i++)
+        {
+            weights.Add(MakeRandom(rng, dims[i], dims[i + 1]));
+            biases.Add(MakeRandom(rng, dims[i + 1]));
+        }
+
+        for (int w = 0; w < 12; w++)
+            _ = _engine.MlpForward(input, weights, biases, FusedActivationType.ReLU, FusedActivationType.None);
+        double best = double.MaxValue;
+        for (int r = 0; r < 30; r++)
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            _ = _engine.MlpForward(input, weights, biases, FusedActivationType.ReLU, FusedActivationType.None);
+            sw.Stop();
+            best = Math.Min(best, sw.Elapsed.TotalMilliseconds);
+        }
+        _output.WriteLine($"MLP AIsEval [128,784->512->128->10] best-of-30: {best:F3} ms (PyTorch ~0.63 ms)");
+    }
 
     [Fact]
     public void MlpForward_MatchesNaiveReference_Float()

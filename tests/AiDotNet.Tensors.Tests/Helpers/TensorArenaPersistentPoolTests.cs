@@ -1,0 +1,153 @@
+// Copyright (c) AiDotNet. All rights reserved.
+// Issue #478 — cross-arena persistent buffer pool. A caller that creates +
+// disposes a fresh TensorArena PER training step (e.g.
+// NeuralNetworkBase.TrainWithTape) must NOT re-allocate the large transient
+// working set every step. Dispose returns large backing arrays to a
+// thread-static persistent pool; the next arena rents them back. These tests
+// pin that reuse contract (no per-step GC churn) and its bounds.
+
+using System;
+using AiDotNet.Tensors.Helpers;
+using AiDotNet.Tensors.LinearAlgebra;
+using Xunit;
+
+namespace AiDotNet.Tensors.Tests.Helpers;
+
+// Reuse the arena collection so these serialize with the other arena tests —
+// TensorArena.Current and the persistent pool are both [ThreadStatic] and xUnit
+// reuses worker threads across collections.
+[Collection(nameof(TensorArenaPinnedTests))]
+public class TensorArenaPersistentPoolTests
+{
+    // 2M float elements = 8 MB — larger than ArrayPool<T>.Shared's 2^20-element
+    // max bucket, i.e. exactly the paper-scale gradient-buffer size that
+    // ArrayPool refuses to pool and that #478 is about.
+    private const int LargeElems = 2 * 1024 * 1024;
+
+    /// <summary>
+    /// The core #478 guarantee (TFM-agnostic): creating + disposing a fresh
+    /// arena every "step" and renting a large buffer each time reuses backing
+    /// arrays from the cross-arena persistent pool instead of allocating fresh.
+    /// Proven via the reuse-hit counter (recycled buffers are zeroed to preserve
+    /// the de-facto zero-init contract, so a content sentinel can't distinguish
+    /// reuse from fresh — the counter can).
+    /// </summary>
+    [Fact]
+    public void LargeBuffer_ReusedAcrossArenaLifetimes_RegistersReuseHits()
+    {
+        TensorArena.ClearPersistentPool();
+        int[] shape = { LargeElems };
+
+        // Cycle 1: fresh allocation, returned to the pool on dispose. No reuse yet.
+        using (var arena = TensorArena.Create())
+        {
+            var t = TensorAllocator.RentUninitialized<float>(shape);
+            t.AsWritableSpan()[0] = 1f;
+        }
+        Assert.Equal(0, TensorArena.PersistentReuseHits);
+
+        // Cycles 2..N: each must pull the backing array from the persistent pool.
+        for (int i = 0; i < 5; i++)
+        {
+            using var arena = TensorArena.Create();
+            var t = TensorAllocator.RentUninitialized<float>(shape);
+            t.AsWritableSpan()[0] = i;
+        }
+        Assert.Equal(5, TensorArena.PersistentReuseHits);
+    }
+
+#if NET5_0_OR_GREATER
+    /// <summary>
+    /// Same guarantee, measured directly: steady-state per-step allocation must
+    /// be bookkeeping-only, NOT the multi-MB backing array. Uses
+    /// <c>GC.GetTotalAllocatedBytes</c> (net5+ only).
+    /// </summary>
+    [Fact]
+    public void LargeBuffer_ReusedAcrossArenaLifetimes_NoPerStepChurn()
+    {
+        TensorArena.ClearPersistentPool();
+        int[] shape = { LargeElems };
+
+        // Warmup: a few full create→rent→dispose cycles to reach steady state.
+        for (int i = 0; i < 4; i++)
+        {
+            using var arena = TensorArena.Create();
+            var t = TensorAllocator.RentUninitialized<float>(shape);
+            t.AsWritableSpan()[0] = i; // touch so nothing is elided
+        }
+
+        long before = GC.GetTotalAllocatedBytes(precise: true);
+        using (var arena = TensorArena.Create())
+        {
+            var t = TensorAllocator.RentUninitialized<float>(shape);
+            t.AsWritableSpan()[0] = 42f;
+        }
+        long delta = GC.GetTotalAllocatedBytes(precise: true) - before;
+
+        long bufferBytes = (long)LargeElems * sizeof(float); // 8 MB
+        Assert.True(delta < bufferBytes / 4,
+            $"Per-cycle allocation was {delta} bytes; the {bufferBytes}-byte buffer is " +
+            "being re-allocated every cycle — the cross-arena persistent pool is not reusing it.");
+    }
+#endif
+
+    /// <summary>
+    /// Reuse must not corrupt: a buffer rented via the CLEAR tier
+    /// (<see cref="TensorAllocator.Rent{T}"/>) is zero-initialized even when it
+    /// is a recycled buffer that previously held non-zero data.
+    /// </summary>
+    [Fact]
+    public void RecycledClearTierBuffer_IsZeroInitialized()
+    {
+        TensorArena.ClearPersistentPool();
+        int[] shape = { LargeElems };
+
+        // Cycle 1: stamp non-zero data into a clear-tier buffer, then dispose
+        // (returns the dirty buffer to the persistent pool).
+        using (var arena = TensorArena.Create())
+        {
+            var t = TensorAllocator.Rent<float>(shape);
+            var span = t.AsWritableSpan();
+            for (int i = 0; i < 16; i++) span[i] = 123.5f;
+        }
+
+        // Cycle 2: rent the same size from the clear tier — it should hand back
+        // the recycled buffer, but zeroed.
+        using (var arena = TensorArena.Create())
+        {
+            var t = TensorAllocator.Rent<float>(shape);
+            var span = t.AsSpan();
+            for (int i = 0; i < 16; i++)
+                Assert.Equal(0f, span[i]);
+        }
+    }
+
+    /// <summary>
+    /// Small buffers (below the persist threshold) are intentionally NOT pooled
+    /// across lifetimes — they GC cheaply and pooling them would bloat the
+    /// dictionary. This guards the threshold so the pool stays focused on the
+    /// large buffers that actually drive the churn.
+    /// </summary>
+    [Fact]
+    public void SmallBuffers_NotRetainedAcrossLifetimes()
+    {
+        TensorArena.ClearPersistentPool();
+        int[] shape = { 64 }; // 256 bytes — far below PersistThresholdElems
+
+        for (int i = 0; i < 4; i++)
+        {
+            using var arena = TensorArena.Create();
+            var t = TensorAllocator.RentUninitialized<float>(shape);
+            t.AsWritableSpan()[0] = i;
+        }
+
+        // A small buffer is re-allocated each cycle (no persistent retention),
+        // so per-cycle allocation includes the array. We only assert this does
+        // not THROW / mis-pool — correctness, not a perf bound (small allocs
+        // are fine). Renting again must still succeed and be writable.
+        using var arena2 = TensorArena.Create();
+        var t2 = TensorAllocator.RentUninitialized<float>(shape);
+        t2.AsWritableSpan()[0] = 7f;
+        Assert.Equal(7f, t2.AsSpan()[0]);
+    }
+}

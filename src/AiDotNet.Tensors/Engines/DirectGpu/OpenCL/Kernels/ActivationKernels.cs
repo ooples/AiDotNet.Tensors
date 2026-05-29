@@ -70,6 +70,15 @@ inline float fast_exp1(float x) {
 // fmax(0, NaN) returns 0 in OpenCL because NaN compares as less-than,
 // silently zeroing incoming NaN values. CPU ReluNaNSafe* preserves NaN
 // as a debugging signal — match that contract here too.
+//
+// NaN is detected by reinterpreting the float bits, NOT by isnan()/float
+// comparison: the program is built with -cl-finite-math-only (see
+// OpenClBuildOptions.OptimizationFlags), which lets the compiler assume no
+// NaN/Inf exists and fold isnan(x) to constant-false — silently defeating a
+// select()/ternary that depends on it. The integer test below survives those
+// flags because it operates on the raw bit pattern: a float is NaN iff its
+// exponent is all-ones and the mantissa is non-zero, i.e. (bits & 0x7fffffff)
+// exceeds 0x7f800000 (the bit pattern of +Inf).
 __kernel void relu(
     __global const float* input,
     __global float* output,
@@ -79,17 +88,16 @@ __kernel void relu(
     const int idx4 = idx * 4;
     if (idx4 + 3 < size) {
         float4 x = vload4(idx, input);
-        // isnan returns int4 mask (all-ones per NaN lane); select() returns
-        // the NaN where the mask is set, fmax otherwise. The fmax branch is
-        // safe for non-NaN inputs.
-        float4 zero = (float4)(0.0f);
-        float4 m = fmax(zero, x);
-        int4 nanMask = isnan(x);
+        float4 m = fmax((float4)(0.0f), x);
+        // Vector relational ops return a signed int vector (-1 per true lane);
+        // select() picks x (the NaN) where the lane's MSB is set, m otherwise.
+        int4 nanMask = (as_uint4(x) & (uint4)(0x7fffffffu)) > (uint4)(0x7f800000u);
         vstore4(select(m, x, nanMask), idx, output);
     } else {
         for (int i = idx4; i < size; i++) {
             float v = input[i];
-            output[i] = isnan(v) ? v : fmax(0.0f, v);
+            uint bits = as_uint(v) & 0x7fffffffu;
+            output[i] = (bits > 0x7f800000u) ? v : fmax(0.0f, v);
         }
     }
 }

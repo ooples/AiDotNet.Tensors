@@ -29,6 +29,33 @@ class Program
             return;
         }
 
+        // Issue #436: same-machine head-to-head of the fused inference
+        // primitives (MLP / MHA / LSTM) vs TorchSharp at the AIsEval shapes.
+        // Win = AiDotNet p95 < PyTorch median.
+        if (args[0] == "--ab-aiseval-h2h")
+        {
+            AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.Run();
+            return;
+        }
+
+        if (args[0] == "--ab-aiseval-diag")
+        {
+            AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.Diag();
+            return;
+        }
+
+        if (args[0] == "--ab-aiseval-floor")
+        {
+            AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.RawGemmFloor();
+            return;
+        }
+
+        if (args[0] == "--ab-aiseval-dopsweep")
+        {
+            AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.DopSweep();
+            return;
+        }
+
         // Softmax<double> micro-benchmark — same-process measurement
         // for the new SoftmaxRowDoubleUnsafe SIMD kernel.
         if (args[0] == "--ab-softmax-double")
@@ -626,6 +653,10 @@ class Program
         Console.WriteLine("  --baseline  : Capture full baseline to CSV (--baseline [phase] [csv])");
         Console.WriteLine("  --compare   : Compare baselines (--compare before.csv after.csv)");
         Console.WriteLine("  --dcgan-probe : Run DCGAN step allocation / shape probe (#403 Phase A)");
+        Console.WriteLine("  --ab-aiseval-h2h      : AIsEval head-to-head (AiDotNet fused vs TorchSharp)");
+        Console.WriteLine("  --ab-aiseval-diag     : AIsEval diagnostics (pooled vs baseline alloc/latency)");
+        Console.WriteLine("  --ab-aiseval-floor    : AIsEval raw-GEMM floor + OpenBLAS/MKL floor check");
+        Console.WriteLine("  --ab-aiseval-dopsweep : AIsEval MaxDOP sweep for MHA/LSTM");
         Console.WriteLine();
         Console.WriteLine("GPU Bottleneck Analysis:");
         Console.WriteLine("  --vulkan   : Run Vulkan backend diagnostics and bottleneck analysis");

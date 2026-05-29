@@ -82,15 +82,19 @@ public class PerformanceRegressionTests
     private const double MhaAiseval_BudgetMs = 15.0;
 
     // AIsEval MLP inference perf gate (issue #436 P1). The MlpForward fused
-    // primitive shipped in #437 with correctness tests but no perf gate. The
-    // AIsEval rerun measured the framework's unfused per-layer Predict path at
-    // 8.94 ms (PyTorch 1.91 ms) on Dense(784->512)->Dense(512->128)->Dense(128->10)
-    // at bs=128 — attributed to dispatch overhead (nine dispatches for three
-    // layers). MlpForward collapses the stack to three fused-linear dispatches.
-    // This gate measures the primitive at the AIsEval shape and budgets below
-    // the unfused 8.94 ms so a regression to the unfused/scalar path fails,
-    // while leaving headroom for CI noise over the measured number.
-    private const double MlpAiseval_BudgetMs = 8.0;
+    // primitive shipped in #437; the AIsEval rerun measured the framework's
+    // unfused per-layer Predict path at 8.94 ms on
+    // Dense(784->512)->Dense(512->128)->Dense(128->10) at bs=128.
+    // The #436 fresh head-to-head (min-of-7-rounds) then measured the fused
+    // primitive at ~1.65 ms median / 3.24 ms p95, and the native-BLAS
+    // thread-cap (one thread per 16 rows; see CpuEngine.Mlp.cs) brought it to
+    // ~1.37 ms median / 1.75 ms p95 on a 16-core box — the thread cap removed
+    // the small-GEMM oversubscription jitter. Budget tightened to 4 ms: it still
+    // catches a regression to the 8.94 ms unfused path or the un-capped p95
+    // (~3.2 ms) while leaving ~2.9x headroom over the capped median for slower
+    // CI hardware. (Beating PyTorch's ~0.6 ms median outright is blocked by
+    // OpenBLAS-vs-MKL small-GEMM kernel quality — tracked as a follow-up.)
+    private const double MlpAiseval_BudgetMs = 4.0;
 
     public PerformanceRegressionTests(ITestOutputHelper output) => _output = output;
 

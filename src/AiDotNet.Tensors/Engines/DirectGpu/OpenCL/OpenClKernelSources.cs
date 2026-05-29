@@ -280,8 +280,15 @@ internal static class OpenClKernelSources
             // NaN-preserving: fmax(0, NaN) returns 0 in OpenCL (NaN compares
             // as "less than"), silently zeroing NaN. CPU ReluNaNSafe* preserves
             // NaN as a numerical-blowup signal — match that contract.
+            //
+            // NaN is detected on the raw bit pattern, NOT via isnan(): the program
+            // is built with -cl-finite-math-only (OpenClBuildOptions.OptimizationFlags),
+            // which lets the compiler assume no NaN exists and fold isnan(v) to
+            // constant-false. The integer test survives those flags — a float is NaN
+            // iff (bits & 0x7fffffff) > 0x7f800000 (the bit pattern of +Inf).
             float v = input[idx];
-            output[idx] = isnan(v) ? v : fmax(0.0f, v);
+            uint bits = as_uint(v) & 0x7fffffffu;
+            output[idx] = (bits > 0x7f800000u) ? v : fmax(0.0f, v);
         }
 
         __kernel void sigmoid(__global const float* input, __global float* output, const int size) {

@@ -43,7 +43,14 @@ internal sealed class PersistentParallelExecutor
 
         for (int i = 0; i < _numWorkers; i++)
         {
-            _workReady[i] = new ManualResetEventSlim(false);
+            // spinCount 2047 (the ManualResetEventSlim max): keep workers busy-
+            // spinning before they park, so back-to-back small GEMMs (inference)
+            // find them already hot — no kernel wake per Execute. #475: the
+            // default low spin count made each dispatch pay ~µs wake latency per
+            // worker, which dominates sub-millisecond tile work (1.1-1.7× scaling).
+            // libtorch/OpenMP busy-wait for the same reason. Workers still PARK
+            // after the spin window when the workload truly ends.
+            _workReady[i] = new ManualResetEventSlim(false, spinCount: 2047);
             int workerSlot = i;
             _workers[i] = new Thread(() => WorkerLoop(workerSlot))
             {

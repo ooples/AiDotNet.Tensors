@@ -13744,31 +13744,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
     }
 
-    public override Tensor<T> TensorScatterAdd<T>(Tensor<T> destination, Tensor<int> indices, Tensor<T> updates, int axis)
-    {
-        if (!TryGetBackend(out var backend) || axis != 0)
-            return base.TensorScatterAdd(destination, indices, updates, axis);
-
-        try
-        {
-            // Copy destination first, then scatter-add into it
-            using var bufDst = GetOrAllocateBuffer(backend, destination.GetDataArray());
-            using var bufIdx = backend.AllocateIntBuffer(indices.GetDataArray());
-            using var bufSrc = GetOrAllocateBuffer(backend, updates.GetDataArray());
-            backend.ScatterAdd(bufSrc.Buffer, bufIdx, bufDst.Buffer, updates.Length, destination.Length);
-            float[] resultFloat = backend.DownloadBuffer(bufDst.Buffer);
-            var result = DirectGpuEngine.FromFloatArray<T>(resultFloat);
-            var output = new Tensor<T>(result, destination.Shape._dims);
-            Autodiff.DifferentiableOps.RecordUnary("ScatterAdd", output, updates,
-                Autodiff.BackwardFunctions<T>.ScatterAddBackward, new object[] { indices, axis, destination.Shape._dims });
-            return output;
-        }
-        catch (Exception)
-        {
-            return base.TensorScatterAdd(destination, indices, updates, axis);
-        }
-    }
-
+    // TensorScatterAdd<T>: GPU override removed. The CUDA scatter_add kernel
+    // itself uses atomicAdd and is correct in isolation, but the engine-level
+    // 1D-into-1D wiring diverged from the CPU reference (GpuCpuAutoDifferentialTests
+    // observed max_abs_err ≈ 1.74 vs CPU on shape [257]). Falling back to the
+    // CpuEngine base implementation restores GPU/CPU parity for the autodiff
+    // harness; a properly verified GPU TensorScatterAdd path can be re-added
+    // when it can be A/B'd against CPU across the full shape grid. Inheriting
+    // from base also preserves autodiff recording (CpuEngine handles its own
+    // RecordUnary).
     public override Tensor<T> Embedding<T>(Tensor<int> indices, Tensor<T> embeddingTable)
     {
         if (!TryGetBackend(out var backend))
