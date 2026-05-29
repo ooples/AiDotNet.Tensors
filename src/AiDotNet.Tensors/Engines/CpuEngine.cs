@@ -23237,6 +23237,123 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>
+    /// Output-only float SDPA for the fused MHA forward, which discards the attention-weight
+    /// matrix. Computes scale + softmax + P·V straight into <paramref name="outBuf"/> using a
+    /// single ArrayPool scratch that holds each head's scores then (in place) its softmax
+    /// probabilities. Versus <see cref="ScaledDotProductAttentionFloat"/> + a copy, this skips the
+    /// per-call weightsData array, the attentionWeights tensor, the output tensor, and the
+    /// caller's copy-out — the MHA path only ever wanted the output buffer. Same per-head kernel
+    /// (incl. the nested-parallel sequential-GEMM guard), so numerics are identical.
+    /// </summary>
+    internal void ScaledDotProductAttentionFloatInto(
+        float[] qf, float[] kf, float[] vf, float[] outBuf,
+        Tensor<bool>? mask, double scaleValue,
+        int batch, int heads, int seqQ, int d_k, int seqK, int d_v)
+    {
+        int bhCount = batch * heads;
+        // Use long arithmetic for the score-buffer size: for large attention contexts
+        // (e.g. batch=8, heads=16, seq=4096 → 2.1B floats) the 32-bit product would
+        // silently overflow and ArrayPool.Rent would see a negative size.
+        long scoresLenL = (long)bhCount * seqQ * seqK;
+        if (scoresLenL > int.MaxValue)
+            throw new ArgumentOutOfRangeException(
+                nameof(seqK),
+                $"Attention scores buffer size ({scoresLenL:N0} floats) exceeds int.MaxValue; " +
+                "reduce batch, heads, or sequence length.");
+        int scoresLen = (int)scoresLenL;
+        var scratch = System.Buffers.ArrayPool<float>.Shared.Rent(scoresLen);
+        try
+        {
+            float scaleF = (float)scaleValue;
+            float negInfF = float.NegativeInfinity;
+            CpuParallelSettings.ParallelForOrSerial(0, bhCount, (long)bhCount * seqQ * d_k, bh =>
+            {
+                int b = bh / heads;
+                int h = bh % heads;
+                int qOff = bh * seqQ * d_k;
+                int kOff = bh * seqK * d_k;
+                int sOff = bh * seqQ * seqK;
+                int vOff = bh * seqK * d_v;
+                int oOff = bh * seqQ * d_v;
+
+                // Nested-parallel guard: identical reasoning to ScaledDotProductAttentionFloat —
+                // force the single-threaded inner GEMM when this body is itself a parallel worker.
+                bool useSequentialGemm = CpuParallelSettings.IsInParallelRegion;
+
+                // Step 1: scores = Q @ K^T → scratch (transB=true, or transpose + SgemmSequential).
+                bool gemmed = !useSequentialGemm && BlasProvider.TryGemmEx(
+                    m: seqQ, n: seqK, k: d_k,
+                    a: qf, aOffset: qOff, lda: d_k, transA: false,
+                    b: kf, bOffset: kOff, ldb: d_k, transB: true,
+                    c: scratch, cOffset: sOff, ldc: seqK);
+                if (!gemmed)
+                {
+                    var kt = System.Buffers.ArrayPool<float>.Shared.Rent(d_k * seqK);
+                    try
+                    {
+                        for (int i = 0; i < seqK; i++)
+                            for (int j = 0; j < d_k; j++)
+                                kt[j * seqK + i] = kf[kOff + i * d_k + j];
+                        Engines.Simd.SimdGemm.SgemmSequential(
+                            qf.AsSpan(qOff, seqQ * d_k),
+                            kt.AsSpan(0, d_k * seqK),
+                            scratch.AsSpan(sOff, seqQ * seqK),
+                            seqQ, d_k, seqK);
+                    }
+                    finally { System.Buffers.ArrayPool<float>.Shared.Return(kt); }
+                }
+
+                // Step 2: scale + mask + numerically-stable softmax, IN PLACE in scratch.
+                for (int i = 0; i < seqQ; i++)
+                {
+                    int rowOff = sOff + i * seqK;
+                    float maxVal = negInfF;
+                    for (int j = 0; j < seqK; j++)
+                    {
+                        float val = scratch[rowOff + j] * scaleF;
+                        if (mask != null && !mask[b, h, i, j]) val = negInfF;
+                        if (val > maxVal) maxVal = val;
+                        scratch[rowOff + j] = val;
+                    }
+                    if (float.IsNegativeInfinity(maxVal))
+                    {
+                        for (int j = 0; j < seqK; j++) scratch[rowOff + j] = 0f;
+                        continue;
+                    }
+                    float sumExp = 0f;
+                    for (int j = 0; j < seqK; j++)
+                    {
+                        float ev = MathF.Exp(scratch[rowOff + j] - maxVal);
+                        scratch[rowOff + j] = ev;
+                        sumExp += ev;
+                    }
+                    float inv = sumExp != 0f ? 1f / sumExp : 0f;
+                    for (int j = 0; j < seqK; j++) scratch[rowOff + j] *= inv;
+                }
+
+                // Step 3: output = probs @ V → outBuf (TryGemmEx beta=0 / SgemmSequential self-clears).
+                bool gemmed2 = !useSequentialGemm && BlasProvider.TryGemmEx(
+                    m: seqQ, n: d_v, k: seqK,
+                    a: scratch, aOffset: sOff, lda: seqK, transA: false,
+                    b: vf, bOffset: vOff, ldb: d_v, transB: false,
+                    c: outBuf, cOffset: oOff, ldc: d_v);
+                if (!gemmed2)
+                {
+                    Engines.Simd.SimdGemm.SgemmSequential(
+                        scratch.AsSpan(sOff, seqQ * seqK),
+                        vf.AsSpan(vOff, seqK * d_v),
+                        outBuf.AsSpan(oOff, seqQ * d_v),
+                        seqQ, seqK, d_v);
+                }
+            });
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<float>.Shared.Return(scratch, clearArray: false);
+        }
+    }
+
+    /// <summary>
     /// SIMD-backed double-precision fast path for <see cref="ScaledDotProductAttention{T}"/>.
     /// Replaces the scalar virtual-dispatch triple-loop with two SIMD-blocked DGEMMs per head
     /// (Q·K^T then P·V), parallelized across batch*heads. Uses
