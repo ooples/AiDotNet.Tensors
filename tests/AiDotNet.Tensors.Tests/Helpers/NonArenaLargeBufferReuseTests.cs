@@ -164,15 +164,23 @@ public class NonArenaLargeBufferReuseTests
         ThreadLocalTensorCache<float>.Clear();
         int[] shape = { LargeElems };
 
+        const int mid = LargeElems / 2;
         var dirty = TensorAllocator.Rent<float>(shape);
         var dspan = dirty.AsWritableSpan();
+        // Poison the head, a mid window, AND the tail so the zero-init check below
+        // pins the contract across the WHOLE buffer — an end-of-buffer regression
+        // (e.g. a clear that stops short of the SIMD-overhang tail) is exactly the
+        // #311 class this guards, and a head-only check would miss it.
         for (int i = 0; i < 32; i++) dspan[i] = 777.25f;
+        for (int i = mid; i < mid + 32; i++) dspan[i] = 777.25f;
+        for (int i = LargeElems - 32; i < LargeElems; i++) dspan[i] = 777.25f;
         TensorPool.Return(dirty);
 
         var recycled = TensorAllocator.Rent<float>(shape);
         var rspan = recycled.AsSpan();
-        for (int i = 0; i < 32; i++)
-            Assert.Equal(0f, rspan[i]);
+        for (int i = 0; i < 32; i++) Assert.Equal(0f, rspan[i]);
+        for (int i = mid; i < mid + 32; i++) Assert.Equal(0f, rspan[i]);
+        for (int i = LargeElems - 32; i < LargeElems; i++) Assert.Equal(0f, rspan[i]);
         TensorPool.Return(recycled);
 
         ThreadLocalTensorCache<float>.Clear();
