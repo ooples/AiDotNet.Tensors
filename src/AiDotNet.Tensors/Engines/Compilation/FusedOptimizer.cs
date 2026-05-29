@@ -1278,6 +1278,49 @@ internal static class FusedOptimizer
     }
 }
 
+/// <summary>
+/// Extra per-optimizer hyperparameters that don't fit the generic
+/// (learningRate, beta1, beta2, eps, weightDecay) slots of
+/// <c>CompiledTrainingPlan.ConfigureOptimizer</c>. Pass an instance to configure
+/// AdaDelta / LARS / FTRL / ASGD / Rprop; omit it to use the per-field defaults.
+/// All other optimizers ignore it.
+/// </summary>
+/// <remarks>
+/// A class with property initializers (not a record struct) so <c>new
+/// FusedOptimizerExtras()</c> reliably yields the documented defaults — a
+/// <c>default</c> record-struct would zero every field, which is wrong for e.g.
+/// LARS <c>TrustCoefficient</c> or Rprop step bounds.
+/// </remarks>
+public sealed class FusedOptimizerExtras
+{
+    /// <summary>LARS momentum coefficient. Default 0.9.</summary>
+    public float Momentum { get; init; } = 0.9f;
+    /// <summary>LARS trust coefficient (η in the layer-wise trust ratio). Default 0.001.</summary>
+    public float TrustCoefficient { get; init; } = 0.001f;
+    /// <summary>FTRL L1 regularization strength. Default 0.</summary>
+    public float L1 { get; init; } = 0f;
+    /// <summary>FTRL L2 regularization strength. Default 0.</summary>
+    public float L2 { get; init; } = 0f;
+    /// <summary>FTRL learning-rate power (β in n^β). Default -0.5.</summary>
+    public float LrPower { get; init; } = -0.5f;
+    /// <summary>ASGD decay term λ in η_t = lr/(1+λ·lr·t)^α. Default 1e-4.</summary>
+    public float Lambd { get; init; } = 1e-4f;
+    /// <summary>ASGD decay exponent α. Default 0.75.</summary>
+    public float Alpha { get; init; } = 0.75f;
+    /// <summary>ASGD averaging start step t0 (μ_t = 1/max(1, t−t0)). Default 1e6.</summary>
+    public float T0 { get; init; } = 1e6f;
+    /// <summary>Rprop step-increase factor η⁺. Default 1.2.</summary>
+    public float RpropEtaPlus { get; init; } = 1.2f;
+    /// <summary>Rprop step-decrease factor η⁻. Default 0.5.</summary>
+    public float RpropEtaMinus { get; init; } = 0.5f;
+    /// <summary>Rprop minimum step size. Default 1e-6.</summary>
+    public float RpropStepMin { get; init; } = 1e-6f;
+    /// <summary>Rprop maximum step size. Default 50.</summary>
+    public float RpropStepMax { get; init; } = 50f;
+    /// <summary>Rprop initial per-element step size. Default 0.01.</summary>
+    public float RpropInitialStep { get; init; } = 0.01f;
+}
+
 /// <summary>Optimizer type for fused parameter updates.</summary>
 public enum OptimizerType
 {

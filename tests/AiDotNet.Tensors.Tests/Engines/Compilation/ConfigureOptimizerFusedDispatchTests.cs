@@ -40,6 +40,12 @@ public class ConfigureOptimizerFusedDispatchTests
         OptimizerType.Lion,
         OptimizerType.SGDMomentum,
         OptimizerType.AdaMax,
+        // #76 part 2: optimizers wired via the FusedOptimizerExtras API extension.
+        OptimizerType.AdaDelta,
+        OptimizerType.LARS,
+        OptimizerType.FTRL,
+        OptimizerType.ASGD,
+        OptimizerType.Rprop,
     };
 
     /// <summary>
@@ -117,17 +123,20 @@ public class ConfigureOptimizerFusedDispatchTests
     }
 
     /// <summary>
-    /// Optimizers whose kernels need hyperparameters the ConfigureOptimizer API
-    /// doesn't carry (AdaDelta rho+2 accumulators, FTRL l1/l2/lr_power, LARS
-    /// trust coeff, ASGD lambd/alpha/mu) are intentionally NOT wired and must
-    /// still be rejected at configure time — so models using them fall back to
-    /// the eager tape cleanly instead of configuring then throwing mid-step.
+    /// Optimizers that need an execution model the per-parameter fused
+    /// optimizer-step loop can't provide are intentionally NOT wired and must be
+    /// rejected at configure time, so models using them fall back to the eager
+    /// tape cleanly: SparseAdam (sparse-gradient index lists), LBFGS (closure
+    /// line-search over the whole loss), HypergradientSGD / DAdaptationSGD (need
+    /// a GLOBAL cross-parameter reduction, not per-tensor), ScheduleFreeSGD
+    /// (needs a y-buffer written before the forward pass).
     /// </summary>
     [Theory]
-    [InlineData(OptimizerType.AdaDelta)]
-    [InlineData(OptimizerType.FTRL)]
-    [InlineData(OptimizerType.LARS)]
-    [InlineData(OptimizerType.ASGD)]
+    [InlineData(OptimizerType.SparseAdam)]
+    [InlineData(OptimizerType.LBFGS)]
+    [InlineData(OptimizerType.HypergradientSGD)]
+    [InlineData(OptimizerType.ScheduleFreeSGD)]
+    [InlineData(OptimizerType.DAdaptationSGD)]
     public void ConfigureOptimizer_UnwiredOptimizer_Throws(OptimizerType opt)
     {
         var engine = new CpuEngine();
@@ -145,5 +154,64 @@ public class ConfigureOptimizerFusedDispatchTests
         {
             Assert.Throws<NotSupportedException>(() => plan.ConfigureOptimizer(opt, Lr, B1, B2, Eps));
         }
+    }
+
+    private static float[] SeedFloat(int n, int seed)
+    {
+        var rng = new Random(seed);
+        var w = new float[n];
+        for (int i = 0; i < n; i++) w[i] = (float)(rng.NextDouble() * 2.0 - 1.0);
+        return w;
+    }
+
+    private static float L1Norm(float[] w)
+    {
+        float s = 0;
+        foreach (var x in w) s += Math.Abs(x);
+        return s;
+    }
+
+    private static float[] RunFtrl(float[] init, float l1)
+    {
+        var engine = new CpuEngine();
+        var weight = new Tensor<float>(new[] { init.Length });
+        for (int i = 0; i < init.Length; i++) weight[i] = init[i];
+
+        ICompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            var sq = engine.TensorMultiply(weight, weight);
+            engine.ReduceSum(sq, null);
+            plan = scope.CompileTraining(new[] { weight });
+        }
+        using (plan)
+        {
+            // The 6th positional arg is weightDecay; the 7th is the extras object.
+            plan.ConfigureOptimizer(OptimizerType.FTRL, 0.1f, B1, B2, Eps, 0f,
+                new FusedOptimizerExtras { L1 = l1, L2 = 0f, LrPower = -0.5f });
+            for (int s = 0; s < 6; s++) plan.Step();
+        }
+        return weight.GetDataArray().AsSpan(0, init.Length).ToArray();
+    }
+
+    /// <summary>
+    /// Proves the FusedOptimizerExtras values actually flow into the kernel (not
+    /// ignored): FTRL with a strong L1 penalty must drive parameters closer to
+    /// zero (sparsity via the L1 proximal soft-threshold) than FTRL with L1=0 on
+    /// the same trajectory. If extras were dropped, both runs would be identical.
+    /// </summary>
+    [Fact]
+    public void ConfigureOptimizer_FtrlExtras_L1_DrivesSparsity()
+    {
+        var init = SeedFloat(16, seed: 55);
+        var noL1 = RunFtrl(init, l1: 0f);
+        var strongL1 = RunFtrl(init, l1: 5f);
+
+        foreach (var x in strongL1)
+            Assert.True(!float.IsNaN(x) && !float.IsInfinity(x), "FTRL produced a non-finite parameter");
+
+        Assert.True(L1Norm(strongL1) < L1Norm(noL1),
+            $"FTRL L1 extras did not increase sparsity: ||w||₁(L1=5)={L1Norm(strongL1)} should be < " +
+            $"||w||₁(L1=0)={L1Norm(noL1)} — extras may not be flowing into the kernel.");
     }
 }
