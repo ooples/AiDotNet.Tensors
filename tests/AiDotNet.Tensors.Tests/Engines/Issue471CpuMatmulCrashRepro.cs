@@ -17,10 +17,11 @@ public class Issue471CpuMatmulCrashRepro
     private readonly ITestOutputHelper _o;
     public Issue471CpuMatmulCrashRepro(ITestOutputHelper o) { _o = o; }
 
-    [Fact]
+    [SkippableFact]
     public void Cpu_large_matmul_contracting_over_V()
     {
-        if (Environment.GetEnvironmentVariable("TENSORS_RUN_REPRO") != "1") return;
+        Skip.IfNot(Environment.GetEnvironmentVariable("TENSORS_RUN_REPRO") == "1",
+            "Env-gated #471 repro: set TENSORS_RUN_REPRO=1 to run.");
         AiDotNetEngine.ResetToCpu();
         var eng = AiDotNetEngine.Current;
         _o.WriteLine($"engine={eng.Name}");
@@ -56,10 +57,11 @@ public class Issue471CpuMatmulCrashRepro
     /// training-batch shapes + large [B,V] readout matmuls, mimicking the per-batch kernel-launch cadence.
     /// Env-gated TENSORS_RUN_REPRO=1. A clean run prints "GPU ALL OK".
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void Gpu_training_loop_stress()
     {
-        if (Environment.GetEnvironmentVariable("TENSORS_RUN_REPRO") != "1") return;
+        Skip.IfNot(Environment.GetEnvironmentVariable("TENSORS_RUN_REPRO") == "1",
+            "Env-gated #471 repro: set TENSORS_RUN_REPRO=1 to run.");
         var eng = AiDotNetEngine.Current;   // default = auto-detected GPU on this box
         _o.WriteLine($"engine={eng.Name}");
         const int B = 128, d = 128, ff = 512, V = 15001;
@@ -84,10 +86,11 @@ public class Issue471CpuMatmulCrashRepro
     /// matmul-chain + ReduceSum loss, then ComputeGradients (the BACKWARD pass = the prime crash suspect), with a
     /// CPU-side weight update to keep values bounded. Many iters on the default (GPU) engine. Env TENSORS_RUN_REPRO=1.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void Gpu_autodiff_training_stress()
     {
-        if (Environment.GetEnvironmentVariable("TENSORS_RUN_REPRO") != "1") return;
+        Skip.IfNot(Environment.GetEnvironmentVariable("TENSORS_RUN_REPRO") == "1",
+            "Env-gated #471 repro: set TENSORS_RUN_REPRO=1 to run.");
         var eng = AiDotNetEngine.Current;
         _o.WriteLine($"engine={eng.Name}");
         const int B = 64, d = 128, ff = 512, V = 15001;
