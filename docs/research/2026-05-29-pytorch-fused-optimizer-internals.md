@@ -58,7 +58,7 @@ per step** and broadcast, not per parameter.
 ### 3a. Horizontal (multi-tensor) fusion of the optimizer step  ★ highest value
 Our `_optimizerUpdate` closure loops **per parameter**, calling one
 `*UpdateSimd` per tensor:
-```
+```csharp
 for (int p = 0; p < paramCount; p++)
     fixed (float* pParam = ..., pM = m[p], ...) AMSGradUpdateSimd(pParam, ...);
 ```

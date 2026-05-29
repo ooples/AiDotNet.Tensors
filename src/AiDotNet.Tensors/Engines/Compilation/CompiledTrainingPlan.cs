@@ -580,7 +580,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         FusedOptimizerExtras? extras = null)
     {
         if (schedule is null) throw new ArgumentNullException(nameof(schedule));
-        ValidatePlanOptimizerSupport(optimizerType, typeof(T) == typeof(float));
+        // GPU residency only matters for float (the GPU configure branch is
+        // float-gated); detect any GPU-backed parameter so the gate can reject
+        // optimizers without a GPU backend kernel.
+        bool hasGpuParams = typeof(T) == typeof(float)
+            && System.Array.Exists(_parameters, p => p.TryGetGpuBuffer() is not null);
+        ValidatePlanOptimizerSupport(optimizerType, typeof(T) == typeof(float), hasGpuParams);
         var ex = extras ?? new FusedOptimizerExtras();
         if (typeof(T) == typeof(float))
         {
@@ -634,7 +639,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     nameof(paramToGroup),
                     $"paramToGroup[{i}]={g} is out of range [0, {groupSchedules.Count}).");
         }
-        ValidatePlanOptimizerSupport(optimizerType, typeof(T) == typeof(float));
+        // GPU residency only matters for float (the GPU configure branch is
+        // float-gated); detect any GPU-backed parameter so the gate can reject
+        // optimizers without a GPU backend kernel.
+        bool hasGpuParams = typeof(T) == typeof(float)
+            && System.Array.Exists(_parameters, p => p.TryGetGpuBuffer() is not null);
+        ValidatePlanOptimizerSupport(optimizerType, typeof(T) == typeof(float), hasGpuParams);
         var ex = extras ?? new FusedOptimizerExtras();
         if (typeof(T) == typeof(float))
         {
@@ -656,11 +666,27 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// on the first Step(). <c>OptimizerKernels.IsFusedPathEligible</c>
     /// is the broader semantic predicate (which kernels exist at all);
     /// this is the narrower "what the plan can replay today" check.</summary>
-    private static void ValidatePlanOptimizerSupport(OptimizerType optimizerType, bool isFloat)
+    private static void ValidatePlanOptimizerSupport(OptimizerType optimizerType, bool isFloat, bool hasGpuParams)
     {
+        // Device-aware gate (CodeRabbit, PR #501): the GPU step path only ships
+        // SgdUpdate/AdamUpdate/AdamWUpdate backend kernels. AMSGrad and every
+        // float-only CPU kernel hit the GPU switch's default and throw — but on a
+        // MIXED CPU/GPU plan that throw lands AFTER earlier CPU parameters were
+        // already updated, leaving the optimizer step partially applied. Reject
+        // the unsupported-on-GPU combinations here, before _optimizerUpdate is
+        // published, so the failure is at configure time and atomic.
+        if (hasGpuParams &&
+            optimizerType is not (OptimizerType.SGD or OptimizerType.Adam or OptimizerType.AdamW))
+        {
+            throw new NotSupportedException(
+                $"Optimizer type {optimizerType} is not supported for GPU-resident parameters in " +
+                "CompiledTrainingPlan (the backend ships only SGD/Adam/AdamW GPU kernels). Use a " +
+                "CPU-resident plan for this optimizer, or SGD/Adam/AdamW on GPU.");
+        }
+
         // SGD/Adam/AdamW/AMSGrad have both float and double fused-update kernels
-        // (#74 added AMSGrad). GPU AMSGrad is NOT implemented — a GPU-resident
-        // parameter with AMSGrad throws at step time via the GPU switch default.
+        // (#74 added AMSGrad). GPU AMSGrad is NOT implemented — handled by the
+        // device-aware guard above.
         bool supportedAnyDtype = optimizerType is OptimizerType.SGD
             or OptimizerType.Adam
             or OptimizerType.AdamW
