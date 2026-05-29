@@ -162,6 +162,17 @@ internal static class StreamingWorkerPool
     public static void Dispatch(int numChunks, Action<int> action)
     {
         if (numChunks <= 0) return;
+        // Phase 2 migration seam: when the cooperative scheduler is enabled, route
+        // there instead. Unlike this pool (one shared _slots set → a concurrent
+        // second caller falls back to fully-serial, #492), the cooperative scheduler
+        // lets concurrent dispatches interleave their chunks on a shared work queue —
+        // so concurrent GEMMs stay parallel. Default-off until the concurrency
+        // benchmark proves it; flip CooperativeGemmScheduler.Enabled to A/B test.
+        if (CooperativeGemmScheduler.Enabled)
+        {
+            CooperativeGemmScheduler.Dispatch(numChunks, action);
+            return;
+        }
         // Run serially on the caller when: a single chunk; this thread is already
         // driving a dispatch (nested — avoids ThreadPool starvation); or ANOTHER
         // thread is currently driving the shared worker slots. The last case is the
