@@ -1016,6 +1016,14 @@ internal static class BlasProvider
         // already guarantees. Restoring multi-threading on disable lets
         // perf go back up for callers that re-enter non-deterministic mode.
         TrySetOpenBlasThreads(deterministic ? 1 : 0);
+        // Unify the switch (plan item 1.4): deterministic mode must ALSO make the
+        // order-dependent reduction/accumulation kernels bit-reproducible — their
+        // multi-threaded partial-sum combine is non-associative. Previously callers
+        // had to set this separately, so "deterministic mode" left those reductions
+        // non-deterministic. GEMM stays parallel because its M/N-tile splits are
+        // marked deterministicSafe (see CpuParallelSettings.ParallelForOrSerial), so
+        // this serializes only the genuinely order-dependent reductions.
+        CpuParallelSettings.DeterministicReductions = deterministic;
     }
 
     /// <summary>True iff <c>AIDOTNET_USE_BLAS=1</c> is set AND libopenblas loaded successfully.</summary>

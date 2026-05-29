@@ -265,7 +265,15 @@ public static class CpuParallelSettings
     /// perform across all iterations combined.</param>
     /// <param name="body">Iteration body — same shape as
     /// <c>Parallel.For</c>'s <c>Action&lt;int&gt;</c>.</param>
-    public static void ParallelForOrSerial(int fromInclusive, int toExclusive, long totalWork, Action<int> body)
+    /// <param name="deterministicSafe">When <see langword="true"/>, this loop is
+    /// exempt from the <see cref="DeterministicReductions"/> serial-forcing gate: the
+    /// caller guarantees its parallelism is bit-reproducible regardless of thread count
+    /// (disjoint-write output tiles where each element's reduction is done by a single
+    /// thread in fixed order — e.g. GEMM M/N-tile splits, see
+    /// <c>DeterministicParallelGemmContractTests</c>). Order-dependent reduction/
+    /// accumulation kernels leave this <see langword="false"/> so deterministic mode
+    /// serializes them for reproducibility.</param>
+    public static void ParallelForOrSerial(int fromInclusive, int toExclusive, long totalWork, Action<int> body, bool deterministicSafe = false)
     {
         if (toExclusive <= fromInclusive) return;
         // Honor the class-level MaxDegreeOfParallelism contract: if the user has
@@ -274,7 +282,11 @@ public static class CpuParallelSettings
         // code path. Snapshot BOTH gating values once so a concurrent setter
         // mid-call can't toggle us between the serial and parallel paths.
         int maxDegree = MaxDegreeOfParallelism;
-        bool deterministic = DeterministicReductions;
+        // DeterministicReductions forces order-dependent reductions serial for
+        // bit-reproducibility; deterministicSafe callers stay parallel (they're already
+        // reproducible across thread counts) so deterministic mode doesn't lose GEMM
+        // parallelism — the whole point of Lever A (deterministic AND parallel).
+        bool deterministic = DeterministicReductions && !deterministicSafe;
         // _inParallelRegion: a nested call (this thread is already a parallel
         // worker) runs serial to avoid ThreadPool starvation. See its docs.
         if (maxDegree <= 1 || deterministic || _inParallelRegion

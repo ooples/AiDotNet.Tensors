@@ -293,7 +293,7 @@ internal static class MachineKernelGemm
                                 for (int js = 0; js < njStripesL; js++)
                                     kern(aS, pb + (long)js * ekcL * NrL, cR + js * NrL, ldcL, ekcL);
                             }
-                        });
+                        }, deterministicSafe: true); // M-stripe split: each C tile reduced by one worker, fixed order
                     }
                 }
             }

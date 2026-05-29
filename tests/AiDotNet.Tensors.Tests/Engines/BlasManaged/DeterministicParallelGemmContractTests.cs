@@ -118,6 +118,35 @@ public class DeterministicParallelGemmContractTests
         }
     }
 
+    [Fact]
+    public void SetDeterministicMode_IsTheUnifiedSwitch_DrivesDeterministicReductions()
+    {
+        // Plan item 1.4: SetDeterministicMode is the single public switch — it must
+        // also gate the order-dependent reduction kernels (DeterministicReductions),
+        // not just the GEMM route + OpenBLAS thread count. Otherwise "deterministic
+        // mode" would still run reductions (softmax/BN/sum) non-deterministically.
+        bool? beforeThreadDet = BlasProvider.GetThreadLocalDeterministicMode();
+        if (beforeThreadDet is not null) BlasProvider.SetThreadLocalDeterministicMode(null);
+        bool beforeDet = BlasProvider.IsDeterministicMode;
+        bool beforeReductions = CpuParallelSettings.DeterministicReductions;
+        try
+        {
+            BlasProvider.SetDeterministicMode(true);
+            Assert.True(CpuParallelSettings.DeterministicReductions,
+                "deterministic mode must force reduction kernels deterministic (DeterministicReductions)");
+
+            BlasProvider.SetDeterministicMode(false);
+            Assert.False(CpuParallelSettings.DeterministicReductions,
+                "non-deterministic mode must release the reduction serial-gate");
+        }
+        finally
+        {
+            BlasProvider.SetDeterministicMode(beforeDet);
+            CpuParallelSettings.DeterministicReductions = beforeReductions;
+            BlasProvider.SetThreadLocalDeterministicMode(beforeThreadDet);
+        }
+    }
+
     /// <summary>Bit-for-bit equality (reinterpreted integer bits), so +0.0/-0.0 and
     /// NaN payloads count as different — the contract is bit-identical, not value-equal.</summary>
     private static bool BitIdentical<T>(T x, T y) where T : unmanaged
