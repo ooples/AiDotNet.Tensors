@@ -147,22 +147,56 @@ public class RoutingShimTest
     }
 
     [Fact]
-    public void TryGemm_With_PreferManaged_False_Goes_Through_Native_Path()
+    public void TryGemm_DefaultDeterministicMode_RoutesToManaged_AndProducesCorrectOutput()
     {
-        // This is the default behavior; just confirm TryGemm still works when
-        // the toggle is off (no regression to the existing native path).
-        const int M = 32, N = 32, K = 32;
-        var rng = new Random(42);
-        var a = new float[M * K];
-        var b = new float[K * N];
-        var c = new float[M * N];
-        for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() * 2 - 1);
-        for (int i = 0; i < b.Length; i++) b[i] = (float)(rng.NextDouble() * 2 - 1);
+        // Best-practice default config: deterministic mode (the managed
+        // parallel-AND-reproducible kernel — what PyTorch's deterministic mode can't
+        // offer). BlasProvider.ShouldRouteManaged routes deterministic GEMM to the
+        // managed kernel regardless of native availability, so PreferManaged=false
+        // here STILL goes managed — and TryGemm returns true even on a no-native
+        // runner. This replaces an obsolete pre-Phase-1 test that asserted
+        // "PreferManaged=false → native" (no longer the contract). The native path
+        // for the NON-deterministic mode is covered by
+        // NativeBlasNonDeterministicConcurrencyTests; we do not disable best-practice
+        // modes here to chase it.
+        bool? beforeThreadDet = BlasProvider.GetThreadLocalDeterministicMode();
+        if (beforeThreadDet is not null) BlasProvider.SetThreadLocalDeterministicMode(null);
+        bool beforeDet = BlasProvider.IsDeterministicMode;
+        try
+        {
+            BlasProvider.SetDeterministicMode(true); // ensure the default best-practice mode regardless of test order
+            BlasManagedLib.PreferManaged = false;
 
-        BlasManagedLib.PreferManaged = false;
-        bool ok = BlasProvider.TryGemm(M, N, K, a, 0, K, b, 0, N, c, 0, N);
-        // If native is available, ok=true; if not, ok=false. Both are acceptable —
-        // we're just confirming the default path is unchanged.
-        Assert.Equal(BlasProvider.IsAvailable, ok);
+            const int M = 32, N = 32, K = 32;
+            var rng = new Random(42);
+            var a = new float[M * K];
+            var b = new float[K * N];
+            var c = new float[M * N];
+            for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() * 2 - 1);
+            for (int i = 0; i < b.Length; i++) b[i] = (float)(rng.NextDouble() * 2 - 1);
+
+            bool ok = BlasProvider.TryGemm(M, N, K, a, 0, K, b, 0, N, c, 0, N);
+            // Deterministic mode routes to the managed kernel, which always succeeds —
+            // independent of whether native BLAS is loaded.
+            Assert.True(ok, "Deterministic-mode TryGemm must route to managed and return true");
+
+            // And the result is a correct GEMM (within FP32 bound of FP64 ground truth).
+            const double maxAbsErr = 1.6e-5; // 2 · K · eps_fp32
+            double maxErr = 0;
+            for (int i = 0; i < M; i++)
+                for (int j = 0; j < N; j++)
+                {
+                    double sum = 0;
+                    for (int kk = 0; kk < K; kk++) sum += (double)a[i * K + kk] * b[kk * N + j];
+                    maxErr = Math.Max(maxErr, Math.Abs(sum - c[i * N + j]));
+                }
+            Assert.True(maxErr < maxAbsErr, $"Managed deterministic GEMM error vs FP64 truth: {maxErr:G6} (bound {maxAbsErr})");
+        }
+        finally
+        {
+            BlasProvider.SetDeterministicMode(beforeDet);
+            BlasProvider.SetThreadLocalDeterministicMode(beforeThreadDet);
+            BlasManagedLib.PreferManaged = false;
+        }
     }
 }

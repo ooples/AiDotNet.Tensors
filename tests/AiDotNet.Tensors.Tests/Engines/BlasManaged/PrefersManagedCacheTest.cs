@@ -22,13 +22,20 @@ public class PrefersManagedCacheTest
             System.IO.Path.GetTempPath(),
             $"prefers-managed-cache-test-{Guid.NewGuid():N}.json");
         PrefersManagedCache.Clear();
+        // Force a clean baseline for the direct-cache tests in this class. NOTE: the
+        // PRODUCT default of AutotuneRouting is now `true` (see BlasManaged.AutotuneRouting
+        // — managed deterministic-parallel + non-deterministic best-of is the intended
+        // CPU GEMM behavior); this ctor resets it to false so per-test setup is explicit.
         BlasManagedLib.AutotuneRouting = false;
         BlasManagedLib.PreferManaged = false;
     }
 
     [Fact]
-    public void Default_AutotuneRouting_Is_False()
+    public void Ctor_ResetsAutotuneRouting_ForTestIsolation()
     {
+        // The ctor forces AutotuneRouting=false so the direct PrefersManaged tests
+        // start from a known state. (The product default is true — asserting that here
+        // is impossible because the ctor has already mutated the static.)
         Assert.False(BlasManagedLib.AutotuneRouting);
     }
 
@@ -64,6 +71,13 @@ public class PrefersManagedCacheTest
     {
         PrefersManagedCache.Clear();
         BlasManagedLib.AutotuneRouting = true;
+        // Autotune routing is a NON-deterministic-mode feature: deterministic mode
+        // (the default) forces managed dispatch BEFORE the timing-based autotune is
+        // consulted (BlasProvider.ShouldRouteManaged), because a measurement-chosen
+        // kernel would not be bit-reproducible. Drop into non-deterministic mode so
+        // the autotune cache is actually exercised.
+        bool beforeDet = BlasProvider.IsDeterministicMode;
+        BlasProvider.SetDeterministicMode(false);
         try
         {
             const int M = 64, N = 64, K = 64;
@@ -88,6 +102,7 @@ public class PrefersManagedCacheTest
         finally
         {
             BlasManagedLib.AutotuneRouting = false;
+            BlasProvider.SetDeterministicMode(beforeDet);
         }
     }
 
@@ -97,21 +112,32 @@ public class PrefersManagedCacheTest
         BlasManagedLib.AutotuneRouting = false;
         BlasManagedLib.PreferManaged = false;
         PrefersManagedCache.Clear();
+        // Must be non-deterministic: deterministic mode forces managed dispatch
+        // regardless of AutotuneRouting (ShouldRouteManaged), so "autotune off → native
+        // path" only holds when determinism isn't forcing managed.
+        bool beforeDet = BlasProvider.IsDeterministicMode;
+        BlasProvider.SetDeterministicMode(false);
+        try
+        {
+            const int M = 32, N = 32, K = 32;
+            var rng = new Random(42);
+            var a = new float[M * K];
+            var b = new float[K * N];
+            var c = new float[M * N];
+            for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() * 2 - 1);
+            for (int i = 0; i < b.Length; i++) b[i] = (float)(rng.NextDouble() * 2 - 1);
 
-        const int M = 32, N = 32, K = 32;
-        var rng = new Random(42);
-        var a = new float[M * K];
-        var b = new float[K * N];
-        var c = new float[M * N];
-        for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() * 2 - 1);
-        for (int i = 0; i < b.Length; i++) b[i] = (float)(rng.NextDouble() * 2 - 1);
+            bool ok = BlasProvider.TryGemmEx(M, N, K, a, 0, K, false, b, 0, N, false, c, 0, N);
 
-        bool ok = BlasProvider.TryGemmEx(M, N, K, a, 0, K, false, b, 0, N, false, c, 0, N);
-
-        // With autotune off, cache must NOT be touched.
-        Assert.Equal(0, PrefersManagedCache.Count);
-        // ok matches native availability (same as pre-F3 behavior).
-        Assert.Equal(BlasProvider.IsAvailable, ok);
+            // With autotune off (and non-deterministic), cache must NOT be touched.
+            Assert.Equal(0, PrefersManagedCache.Count);
+            // ok matches native availability (same as pre-F3 behavior).
+            Assert.Equal(BlasProvider.IsAvailable, ok);
+        }
+        finally
+        {
+            BlasProvider.SetDeterministicMode(beforeDet);
+        }
     }
 
     [Fact]

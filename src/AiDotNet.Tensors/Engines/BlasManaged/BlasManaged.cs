@@ -43,19 +43,25 @@ public static class BlasManaged
     public static bool PreferManaged { get; set; } = false;
 
     /// <summary>
-    /// Sub-F3 (#374 follow-up): when true, <see cref="Helpers.BlasProvider.TryGemmEx"/>
-    /// consults <see cref="PrefersManagedCache"/> on each call. The cache measures
-    /// both managed and native paths once per (shape, hardware) tuple and routes
-    /// future calls to the winner.
+    /// Sub-F3 (#374 follow-up): when true, the <see cref="Helpers.BlasProvider"/>
+    /// <c>TryGemm</c> / <c>TryGemmEx</c> entry points consult
+    /// <see cref="PrefersManagedCache"/> in NON-deterministic mode. The cache measures
+    /// both managed and native paths once per (shape, hardware) tuple (disk-persisted)
+    /// and routes future calls to the faster one — managed where it wins, native where
+    /// it wins — so flipping toward managed never costs throughput.
     ///
     /// <para>
-    /// Defaults to <see langword="false"/> (no autotune routing).
-    /// <see cref="PreferManaged"/> takes precedence — when both are true,
-    /// every call routes managed regardless of autotune. This lets supply-chain
-    /// deployments override autotune (forcing managed dispatch unconditionally).
+    /// Defaults to <see langword="true"/> (ManagedBlas deterministic-parallel +
+    /// non-deterministic best-of is the intended CPU GEMM behavior; native OpenBLAS is
+    /// being retired — see the managed-blas-deterministic-parallel plan). Precedence is
+    /// resolved in <see cref="Helpers.BlasProvider.ShouldRouteManaged"/>:
+    /// <see cref="PreferManaged"/> and <see cref="Helpers.BlasProvider.IsDeterministicMode"/>
+    /// both force managed BEFORE this timing-based routing is consulted — deterministic
+    /// mode must not pick its kernel by measurement noise (it would break
+    /// bit-reproducibility), so autotune only governs the non-deterministic path.
     /// </para>
     /// </summary>
-    public static bool AutotuneRouting { get; set; } = false;
+    public static bool AutotuneRouting { get; set; } = true;
 
     // #375: the earlier opt-in Gemm-level autotune (EnableAutotuneV2 + AutotuneCacheV2 +
     // a synchronous warmup sweep) was superseded by the hybrid hardware-aware strategy

@@ -1190,13 +1190,41 @@ internal static class BlasProvider
     // cblas_{s,d}gemm with standard row-major layout.
     // ────────────────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Single routing decision shared by every <c>TryGemm*</c> entry point:
+    /// should this GEMM dispatch to the managed kernel (<see cref="Engines.BlasManaged.BlasManaged.Gemm{T}"/>)
+    /// rather than native cblas? Three reasons, in priority order:
+    /// <list type="number">
+    ///   <item><see cref="Engines.BlasManaged.BlasManaged.PreferManaged"/> — supply-chain
+    ///   force-managed (no native attack surface).</item>
+    ///   <item><see cref="IsDeterministicMode"/> — the managed GEMM is parallel AND
+    ///   bit-reproducible across thread counts (M/N/2D disjoint-write splits; K-axis
+    ///   gated off — see <c>DeterministicParallelGemmContractTests</c>), whereas native
+    ///   multi-threaded reduction order is not reproducible and native deterministic
+    ///   mode runs single-threaded. Routing deterministic mode to managed gives
+    ///   reproducibility WITHOUT serializing — a capability PyTorch's deterministic
+    ///   mode lacks. Deterministic mode must NOT use the timing-based autotune below
+    ///   (its winner varies with measurement noise → non-reproducible kernel choice).</item>
+    ///   <item><see cref="Engines.BlasManaged.BlasManaged.AutotuneRouting"/> — in
+    ///   non-deterministic mode, per-shape best-of-managed-vs-native (results need not
+    ///   be bit-reproducible, so a measured kernel choice is fine).</item>
+    /// </list>
+    /// </summary>
+    internal static bool ShouldRouteManaged(int m, int n, int k, bool transA, bool transB, Type dtype)
+    {
+        if (Engines.BlasManaged.BlasManaged.PreferManaged) return true;
+        if (IsDeterministicMode) return true;
+        return Engines.BlasManaged.BlasManaged.AutotuneRouting
+            && !Engines.BlasManaged.PrefersManagedCache.BypassAutotune
+            && Engines.BlasManaged.PrefersManagedCache.PrefersManaged(m, n, k, transA, transB, dtype);
+    }
+
     internal static bool TryGemm(int m, int n, int k,
         float[] a, int aOffset, int lda,
         float[] b, int bOffset, int ldb,
         float[] c, int cOffset, int ldc)
     {
-        // Sub-F (#374) routing shim: caller-opt-in managed dispatch.
-        if (Engines.BlasManaged.BlasManaged.PreferManaged)
+        if (ShouldRouteManaged(m, n, k, false, false, typeof(float)))
         {
             Engines.BlasManaged.BlasManaged.Gemm<float>(
                 new ReadOnlySpan<float>(a, aOffset, a.Length - aOffset), lda, false,
@@ -1252,7 +1280,7 @@ internal static class BlasProvider
         double[] b, int bOffset, int ldb,
         double[] c, int cOffset, int ldc)
     {
-        if (Engines.BlasManaged.BlasManaged.PreferManaged)
+        if (ShouldRouteManaged(m, n, k, false, false, typeof(double)))
         {
             Engines.BlasManaged.BlasManaged.Gemm<double>(
                 new ReadOnlySpan<double>(a, aOffset, a.Length - aOffset), lda, false,
@@ -1298,7 +1326,7 @@ internal static class BlasProvider
     internal static bool TryGemm(int m, int n, int k,
         ReadOnlySpan<float> a, int lda, ReadOnlySpan<float> b, int ldb, Span<float> c, int ldc)
     {
-        if (Engines.BlasManaged.BlasManaged.PreferManaged)
+        if (ShouldRouteManaged(m, n, k, false, false, typeof(float)))
         {
             Engines.BlasManaged.BlasManaged.Gemm<float>(a, lda, false, b, ldb, false, c, ldc, m, n, k);
             return true;
@@ -1336,7 +1364,7 @@ internal static class BlasProvider
     internal static bool TryGemm(int m, int n, int k,
         ReadOnlySpan<double> a, int lda, ReadOnlySpan<double> b, int ldb, Span<double> c, int ldc)
     {
-        if (Engines.BlasManaged.BlasManaged.PreferManaged)
+        if (ShouldRouteManaged(m, n, k, false, false, typeof(double)))
         {
             Engines.BlasManaged.BlasManaged.Gemm<double>(a, lda, false, b, ldb, false, c, ldc, m, n, k);
             return true;
@@ -1424,21 +1452,10 @@ internal static class BlasProvider
         float[] b, int bOffset, int ldb, bool transB,
         float[] c, int cOffset, int ldc)
     {
-        if (Engines.BlasManaged.BlasManaged.PreferManaged)
-        {
-            Engines.BlasManaged.BlasManaged.Gemm<float>(
-                new ReadOnlySpan<float>(a, aOffset, a.Length - aOffset), lda, transA,
-                new ReadOnlySpan<float>(b, bOffset, b.Length - bOffset), ldb, transB,
-                new Span<float>(c, cOffset, c.Length - cOffset), ldc,
-                m, n, k);
-            return true;
-        }
-        // Sub-F3 (#374 follow-up): per-shape autotune routing.
-        // BypassAutotune is a ThreadStatic flag the PrefersManagedCache flips
-        // during its measurement probe so the nested call goes to native.
-        if (Engines.BlasManaged.BlasManaged.AutotuneRouting
-            && !Engines.BlasManaged.PrefersManagedCache.BypassAutotune
-            && Engines.BlasManaged.PrefersManagedCache.PrefersManaged(m, n, k, transA, transB, typeof(float)))
+        // PreferManaged / deterministic-mode / non-deterministic autotune best-of —
+        // see ShouldRouteManaged. (BypassAutotune, flipped during the autotune probe,
+        // is honored inside ShouldRouteManaged so the measurement still hits native.)
+        if (ShouldRouteManaged(m, n, k, transA, transB, typeof(float)))
         {
             Engines.BlasManaged.BlasManaged.Gemm<float>(
                 new ReadOnlySpan<float>(a, aOffset, a.Length - aOffset), lda, transA,
@@ -1497,18 +1514,7 @@ internal static class BlasProvider
         double[] b, int bOffset, int ldb, bool transB,
         double[] c, int cOffset, int ldc)
     {
-        if (Engines.BlasManaged.BlasManaged.PreferManaged)
-        {
-            Engines.BlasManaged.BlasManaged.Gemm<double>(
-                new ReadOnlySpan<double>(a, aOffset, a.Length - aOffset), lda, transA,
-                new ReadOnlySpan<double>(b, bOffset, b.Length - bOffset), ldb, transB,
-                new Span<double>(c, cOffset, c.Length - cOffset), ldc,
-                m, n, k);
-            return true;
-        }
-        if (Engines.BlasManaged.BlasManaged.AutotuneRouting
-            && !Engines.BlasManaged.PrefersManagedCache.BypassAutotune
-            && Engines.BlasManaged.PrefersManagedCache.PrefersManaged(m, n, k, transA, transB, typeof(double)))
+        if (ShouldRouteManaged(m, n, k, transA, transB, typeof(double)))
         {
             Engines.BlasManaged.BlasManaged.Gemm<double>(
                 new ReadOnlySpan<double>(a, aOffset, a.Length - aOffset), lda, transA,
