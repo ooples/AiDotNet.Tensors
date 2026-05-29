@@ -31,6 +31,13 @@ public class CooperativeSchedulerThroughputBench
     private readonly ITestOutputHelper _out;
     public CooperativeSchedulerThroughputBench(ITestOutputHelper output) => _out = output;
 
+    // Repetitions per shape. Odd so the median is a real sample. Each rep uses a
+    // DISTINCT seed (fresh operands) so the verdict is robust to a single lucky/
+    // unlucky operand layout — not just to per-run timing jitter. A single A/B
+    // sample on this scheduler swings 0.7x↔1.3x run-to-run; the median over many
+    // seeds is what we trust to decide retirement of the legacy pool.
+    private const int Reps = 9;
+
     [Theory]
     // K<32 → StreamingStrategy → StreamingWorkerPool (the path wired to the
     // cooperative scheduler). Small vs large M·N to see where each pool wins:
@@ -50,39 +57,87 @@ public class CooperativeSchedulerThroughputBench
         {
             BlasProvider.SetDeterministicMode(true); // both paths → managed
 
-            var rng = new Random(123);
-            var a = new float[m * k];
-            var b = new float[k * n];
-            for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() * 2 - 1);
-            for (int i = 0; i < b.Length; i++) b[i] = (float)(rng.NextDouble() * 2 - 1);
+            var legacyMsAll = new double[Reps];
+            var coopMsAll = new double[Reps];
+            var ratios = new double[Reps];
 
-            // Warm up both paths (JIT, pool spin-up, autotune-free deterministic route).
-            CooperativeGemmScheduler.Enabled = false; RunConcurrent(a, b, m, n, k, threads, 5);
-            CooperativeGemmScheduler.Enabled = true; RunConcurrent(a, b, m, n, k, threads, 5);
+            for (int rep = 0; rep < Reps; rep++)
+            {
+                // Fresh operands per rep with a distinct seed.
+                var rng = new Random(1000 + rep * 7919);
+                var a = new float[m * k];
+                var b = new float[k * n];
+                for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() * 2 - 1);
+                for (int i = 0; i < b.Length; i++) b[i] = (float)(rng.NextDouble() * 2 - 1);
 
-            CooperativeGemmScheduler.Enabled = false;
-            double legacyMs = RunConcurrent(a, b, m, n, k, threads, itersPerThread);
+                // Warm both paths on THIS rep's data (JIT, pool spin-up, deterministic route).
+                CooperativeGemmScheduler.Enabled = false; RunConcurrent(a, b, m, n, k, threads, 5);
+                CooperativeGemmScheduler.Enabled = true; RunConcurrent(a, b, m, n, k, threads, 5);
 
-            CooperativeGemmScheduler.Enabled = true;
-            double coopMs = RunConcurrent(a, b, m, n, k, threads, itersPerThread);
+                double legacyMs, coopMs;
+                // Alternate measurement order per rep so neither path systematically
+                // benefits from a warmer cache / thermal ramp by always running second.
+                if ((rep & 1) == 0)
+                {
+                    CooperativeGemmScheduler.Enabled = false; legacyMs = RunConcurrent(a, b, m, n, k, threads, itersPerThread);
+                    CooperativeGemmScheduler.Enabled = true; coopMs = RunConcurrent(a, b, m, n, k, threads, itersPerThread);
+                }
+                else
+                {
+                    CooperativeGemmScheduler.Enabled = true; coopMs = RunConcurrent(a, b, m, n, k, threads, itersPerThread);
+                    CooperativeGemmScheduler.Enabled = false; legacyMs = RunConcurrent(a, b, m, n, k, threads, itersPerThread);
+                }
 
-            double speedup = legacyMs / coopMs;
-            _out.WriteLine($"Concurrent GEMM {m}x{n}x{k}, {threads} threads x {itersPerThread} iters:");
-            _out.WriteLine($"  legacy  StreamingWorkerPool : {legacyMs,8:F1} ms");
-            _out.WriteLine($"  cooperative scheduler       : {coopMs,8:F1} ms");
-            _out.WriteLine($"  speedup (legacy/coop)       : {speedup,8:F2}x");
+                legacyMsAll[rep] = legacyMs;
+                coopMsAll[rep] = coopMs;
+                ratios[rep] = legacyMs / coopMs;
+            }
 
-            // Anti-regression / anti-deadlock guard only: cooperative must not be
-            // catastrophically slower. The go/no-go on flipping Enabled is read from
-            // the numbers above, not asserted here.
-            Assert.True(coopMs < legacyMs * 5.0,
-                $"Cooperative scheduler is >5x slower than legacy ({coopMs:F1} vs {legacyMs:F1} ms) — investigate before enabling.");
+            double medLegacy = Median(legacyMsAll);
+            double medCoop = Median(coopMsAll);
+            double medRatio = Median(ratios);
+            double minRatio = Min(ratios);
+            double maxRatio = Max(ratios);
+
+            _out.WriteLine($"Concurrent GEMM {m}x{n}x{k}, {threads} threads x {itersPerThread} iters, {Reps} seeds:");
+            _out.WriteLine($"  legacy  StreamingWorkerPool (median) : {medLegacy,8:F1} ms");
+            _out.WriteLine($"  cooperative scheduler       (median) : {medCoop,8:F1} ms");
+            _out.WriteLine($"  speedup legacy/coop  median={medRatio:F2}x  min={minRatio:F2}x  max={maxRatio:F2}x");
+            _out.WriteLine($"    >1.0 = cooperative faster; per-seed ratios = [{string.Join(", ", System.Linq.Enumerable.Select(ratios, r => r.ToString("F2")))}]");
+
+            // Anti-regression / anti-deadlock guard only, on the MEDIAN so single-seed
+            // noise can't fail it: cooperative must not be catastrophically slower. The
+            // go/no-go on flipping Enabled is read from the reported medians, not asserted.
+            Assert.True(medCoop < medLegacy * 5.0,
+                $"Cooperative scheduler median is >5x slower than legacy ({medCoop:F1} vs {medLegacy:F1} ms) — investigate before enabling.");
         }
         finally
         {
             CooperativeGemmScheduler.Enabled = beforeCoop;
             BlasProvider.SetDeterministicMode(beforeDet);
         }
+    }
+
+    private static double Median(double[] xs)
+    {
+        var copy = (double[])xs.Clone();
+        Array.Sort(copy);
+        int mid = copy.Length / 2;
+        return (copy.Length & 1) == 1 ? copy[mid] : (copy[mid - 1] + copy[mid]) / 2.0;
+    }
+
+    private static double Min(double[] xs)
+    {
+        double m = xs[0];
+        for (int i = 1; i < xs.Length; i++) if (xs[i] < m) m = xs[i];
+        return m;
+    }
+
+    private static double Max(double[] xs)
+    {
+        double m = xs[0];
+        for (int i = 1; i < xs.Length; i++) if (xs[i] > m) m = xs[i];
+        return m;
     }
 
     private static double RunConcurrent(float[] a, float[] b, int m, int n, int k, int threads, int iters)
