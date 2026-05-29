@@ -392,10 +392,26 @@ public sealed class GpuCpuCorrectnessTests : IDisposable
         var a = RandVec(101, n);
         var b = RandVec(202, n);
 
-        AssertVecGpuMatchesCpu((Vector<float>)_gpu.Add(a, b), (Vector<float>)_cpu.Add(a, b), $"Add[{n}]");
-        AssertVecGpuMatchesCpu((Vector<float>)_gpu.Subtract(a, b), (Vector<float>)_cpu.Subtract(a, b), $"Subtract[{n}]");
-        AssertVecGpuMatchesCpu((Vector<float>)_gpu.Multiply(a, b), (Vector<float>)_cpu.Multiply(a, b), $"Multiply[{n}]");
-        AssertVecGpuMatchesCpu((Vector<float>)_gpu.Divide(a, b), (Vector<float>)_cpu.Divide(a, b), $"Divide[{n}]");
+        // CRITICAL: dispatch through the IEngine interface. Add/Subtract/Multiply/Divide are
+        // EXPLICIT interface implementations on DirectGpuTensorEngine — calling them on the
+        // concrete type resolves to the inherited CpuEngine method and silently bypasses the GPU
+        // path entirely. The original element-wise-returns-zeros bug only manifests via IEngine.
+        IEngine g = _gpu;
+        IEngine c = _cpu;
+
+        AssertVecGpuMatchesCpu((Vector<float>)g.Add(a, b), (Vector<float>)c.Add(a, b), $"Add[{n}]");
+        AssertVecGpuMatchesCpu((Vector<float>)g.Subtract(a, b), (Vector<float>)c.Subtract(a, b), $"Subtract[{n}]");
+        AssertVecGpuMatchesCpu((Vector<float>)g.Multiply(a, b), (Vector<float>)c.Multiply(a, b), $"Multiply[{n}]");
+        AssertVecGpuMatchesCpu((Vector<float>)g.Divide(a, b), (Vector<float>)c.Divide(a, b), $"Divide[{n}]");
+
+        // double path too (the GAMLSS/AiModelBuilder case is double): the GPU converts
+        // double->float->double, and the result is wrapped in a Vector<double> that copies.
+        var ad = new Vector<double>(System.Linq.Enumerable.Range(0, n).Select(i => (double)a[i]).ToArray());
+        var bd = new Vector<double>(System.Linq.Enumerable.Range(0, n).Select(i => (double)b[i]).ToArray());
+        var subD = (Vector<double>)g.Subtract(ad, bd);
+        var subDc = (Vector<double>)c.Subtract(ad, bd);
+        for (int i = 0; i < n; i++)
+            Assert.True(System.Math.Abs(subD[i] - subDc[i]) < Tol, $"Subtract<double>[{n}] idx {i}: gpu {subD[i]} vs cpu {subDc[i]}");
     }
 }
 #endif
