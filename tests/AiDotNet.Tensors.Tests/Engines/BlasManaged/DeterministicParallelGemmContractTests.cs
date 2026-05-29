@@ -57,6 +57,11 @@ public class DeterministicParallelGemmContractTests
     private static void AssertBitIdenticalAcrossThreadCounts<T>(int m, int n, int k, int seed)
         where T : unmanaged
     {
+        // Clear any thread-local determinism override first, else SetDeterministicMode
+        // (process-wide) wouldn't guarantee this thread actually runs deterministic
+        // (the override wins). Capture/restore it separately from the process-wide value.
+        bool? beforeThreadDet = BlasProvider.GetThreadLocalDeterministicMode();
+        if (beforeThreadDet is not null) BlasProvider.SetThreadLocalDeterministicMode(null);
         bool beforeDet = BlasProvider.IsDeterministicMode;
         int beforeMax = CpuParallelSettings.MaxDegreeOfParallelism;
         try
@@ -90,7 +95,10 @@ public class DeterministicParallelGemmContractTests
 
                 for (int i = 0; i < c.Length; i++)
                 {
-                    if (!reference[i].Equals(c[i]))
+                    // Bitwise comparison, not value-equality: the contract is BIT-identical.
+                    // .Equals treats +0.0 == -0.0 (and would also mishandle NaN), which could
+                    // mask a deterministic-drift regression.
+                    if (!BitIdentical(reference[i], c[i]))
                     {
                         Assert.Fail(
                             $"Deterministic GEMM drifted with thread-count change " +
@@ -105,9 +113,25 @@ public class DeterministicParallelGemmContractTests
         finally
         {
             BlasProvider.SetDeterministicMode(beforeDet);
+            BlasProvider.SetThreadLocalDeterministicMode(beforeThreadDet);
             CpuParallelSettings.MaxDegreeOfParallelism = beforeMax;
         }
     }
+
+    /// <summary>Bit-for-bit equality (reinterpreted integer bits), so +0.0/-0.0 and
+    /// NaN payloads count as different — the contract is bit-identical, not value-equal.</summary>
+    private static bool BitIdentical<T>(T x, T y) where T : unmanaged
+    {
+        if (typeof(T) == typeof(float))
+            return FloatBits((float)(object)x) == FloatBits((float)(object)y);
+        if (typeof(T) == typeof(double))
+            return BitConverter.DoubleToInt64Bits((double)(object)x) == BitConverter.DoubleToInt64Bits((double)(object)y);
+        throw new NotSupportedException($"Unsupported element type {typeof(T).Name}.");
+    }
+
+    // BitConverter.SingleToInt32Bits is net5+; GetBytes→ToInt32 is the net471-safe
+    // equivalent (allocates a 4-byte buffer, fine for a test).
+    private static int FloatBits(float f) => BitConverter.ToInt32(BitConverter.GetBytes(f), 0);
 
     private static T[] RandomArray<T>(int len, int seed) where T : unmanaged
     {

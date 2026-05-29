@@ -90,6 +90,7 @@ public class CooperativeSchedulerGemmIntegrationTests
             int threads = Math.Max(8, Environment.ProcessorCount * 2);
             const int iters = 30;
             var drifts = new ConcurrentBag<string>();
+            using var cts = new CancellationTokenSource();
             using var gate = new Barrier(threads + 1);
             var workers = new Task[threads];
             for (int t = 0; t < threads; t++)
@@ -97,7 +98,12 @@ public class CooperativeSchedulerGemmIntegrationTests
                 workers[t] = Task.Factory.StartNew(() =>
                 {
                     gate.SignalAndWait();
-                    for (int it = 0; it < iters; it++)
+                    // Observe cancellation between GEMMs so that, on a (deadlock) timeout
+                    // below, workers stop promptly and we can quiesce them BEFORE the
+                    // finally restores process-wide flags — otherwise a timed-out worker
+                    // could still be running with the test's globals and leak state into
+                    // later tests.
+                    for (int it = 0; it < iters && !cts.IsCancellationRequested; it++)
                     {
                         var c = new float[m * n];
                         BlasManagedLib.Gemm<float>(a, k, false, b, n, false, c, n, m, n, k);
@@ -108,6 +114,13 @@ public class CooperativeSchedulerGemmIntegrationTests
             }
             gate.SignalAndWait();
             bool done = Task.WaitAll(workers, TimeSpan.FromSeconds(120));
+            if (!done)
+            {
+                // Deadlock suspected: signal workers to stop and give them a moment to
+                // observe it before the finally resets the global flags.
+                cts.Cancel();
+                Task.WaitAll(workers, TimeSpan.FromSeconds(30));
+            }
             Assert.True(done, "Concurrent GEMMs via cooperative scheduler did not finish in 120s — possible deadlock.");
             Assert.True(drifts.IsEmpty,
                 $"{drifts.Count} concurrent GEMMs drifted from the serial reference. " +

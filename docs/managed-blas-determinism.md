@@ -78,6 +78,8 @@ AiDotNetEngine.SetDeterministicMode(false);
 // Hardened: never touch native BLAS, in any mode.
 BlasManaged.PreferManaged = true;
 
-// Disable per-shape autotune (always managed in non-deterministic mode too).
+// Disable per-shape autotune. Deterministic mode still routes managed; in
+// non-deterministic mode dispatch then falls back to native (unless PreferManaged
+// is true).
 BlasManaged.AutotuneRouting = false;
 ```

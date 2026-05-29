@@ -87,6 +87,7 @@ public class CooperativeSchedulerThroughputBench
 
     private static double RunConcurrent(float[] a, float[] b, int m, int n, int k, int threads, int iters)
     {
+        using var cts = new CancellationTokenSource();
         using var gate = new Barrier(threads + 1);
         var workers = new Task[threads];
         for (int t = 0; t < threads; t++)
@@ -95,15 +96,24 @@ public class CooperativeSchedulerThroughputBench
             {
                 var c = new float[m * n];
                 gate.SignalAndWait();
-                for (int it = 0; it < iters; it++)
+                // Observe cancellation between GEMMs so a scheduler deadlock can't hang
+                // the benchmark indefinitely (which would skip the caller's finally).
+                for (int it = 0; it < iters && !cts.IsCancellationRequested; it++)
                     BlasManagedLib.Gemm<float>(a, k, false, b, n, false, c, n, m, n, k);
             }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
         }
         gate.SignalAndWait();
         var sw = Stopwatch.StartNew();
-        // Start gate already released; measure until all finish.
-        Task.WaitAll(workers);
+        // Bounded wait: on a deadlock, cancel + quiesce and surface it rather than hang.
+        bool done = Task.WaitAll(workers, TimeSpan.FromSeconds(120));
         sw.Stop();
+        if (!done)
+        {
+            cts.Cancel();
+            Task.WaitAll(workers, TimeSpan.FromSeconds(30));
+            throw new Xunit.Sdk.XunitException(
+                $"RunConcurrent({m}x{n}x{k}, {threads} threads) did not finish in 120s — possible scheduler deadlock.");
+        }
         return sw.Elapsed.TotalMilliseconds;
     }
 }
