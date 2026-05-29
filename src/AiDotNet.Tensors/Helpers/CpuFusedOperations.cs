@@ -1233,6 +1233,13 @@ public static class CpuFusedOperations
         { FusedActivationType.Tanh, MathF.Tanh },
         { FusedActivationType.LeakyReLU, x => x > 0f ? x : 0.01f * x },
         { FusedActivationType.Swish, x => x / (1f + MathF.Exp(-x)) },
+        { FusedActivationType.ELU, ApplyElu },
+        { FusedActivationType.SELU, ApplySelu },
+        { FusedActivationType.Softplus, ApplySoftplus },
+        { FusedActivationType.Mish, ApplyMish },
+        { FusedActivationType.HardSwish, ApplyHardSwish },
+        { FusedActivationType.HardSigmoid, ApplyHardSigmoid },
+        { FusedActivationType.HardTanh, ApplyHardTanh },
         // Softmax is NOT pointwise (depends on entire row) — must not appear here.
         // Fused paths that include Softmax should apply it separately after the GEMM loop.
     };
@@ -1260,6 +1267,36 @@ public static class CpuFusedOperations
         float inner = sqrt2OverPi * (x + coeff * xCubed);
         return 0.5f * x * (1f + MathF.Tanh(inner));
     }
+
+    // SELU constants (Klambauer et al., 2017 — self-normalizing networks).
+    private const float SeluAlpha = 1.6732632423543772f;
+    private const float SeluScale = 1.0507009873554805f;
+
+    [MethodImpl(Hot)]
+    private static float ApplyElu(float x) => x > 0f ? x : MathF.Exp(x) - 1f; // alpha = 1
+    [MethodImpl(Hot)]
+    private static float ApplySelu(float x) => SeluScale * (x > 0f ? x : SeluAlpha * (MathF.Exp(x) - 1f));
+    // Softplus with the standard large-x linear cutoff (matches PyTorch's threshold=20)
+    // so exp() can't overflow; above the threshold log(1+e^x) ≈ x to float precision.
+    [MethodImpl(Hot)]
+    private static float ApplySoftplus(float x) => x > 20f ? x : MathF.Log(1f + MathF.Exp(x));
+    [MethodImpl(Hot)]
+    private static float ApplyMish(float x) => x * MathF.Tanh(ApplySoftplus(x));
+    [MethodImpl(Hot)]
+    private static float ApplyHardSwish(float x)
+    {
+        float t = (x + 3f) / 6f;
+        t = t < 0f ? 0f : (t > 1f ? 1f : t);
+        return x * t;
+    }
+    [MethodImpl(Hot)]
+    private static float ApplyHardSigmoid(float x)
+    {
+        float t = (x + 3f) / 6f;
+        return t < 0f ? 0f : (t > 1f ? 1f : t);
+    }
+    [MethodImpl(Hot)]
+    private static float ApplyHardTanh(float x) => x < -1f ? -1f : (x > 1f ? 1f : x);
 
     #endregion
 
@@ -1345,6 +1382,13 @@ public static class CpuFusedOperations
         { FusedActivationType.Tanh, Math.Tanh },
         { FusedActivationType.LeakyReLU, x => x > 0.0 ? x : 0.01 * x },
         { FusedActivationType.Swish, x => x / (1.0 + Math.Exp(-x)) },
+        { FusedActivationType.ELU, ApplyEluDouble },
+        { FusedActivationType.SELU, ApplySeluDouble },
+        { FusedActivationType.Softplus, ApplySoftplusDouble },
+        { FusedActivationType.Mish, ApplyMishDouble },
+        { FusedActivationType.HardSwish, ApplyHardSwishDouble },
+        { FusedActivationType.HardSigmoid, ApplyHardSigmoidDouble },
+        { FusedActivationType.HardTanh, ApplyHardTanhDouble },
         // Softmax is NOT pointwise — must not appear here.
     };
 
@@ -1367,6 +1411,30 @@ public static class CpuFusedOperations
         double inner = sqrt2OverPi * (x + coeff * xCubed);
         return 0.5 * x * (1.0 + Math.Tanh(inner));
     }
+
+    [MethodImpl(Hot)]
+    private static double ApplyEluDouble(double x) => x > 0.0 ? x : Math.Exp(x) - 1.0;
+    [MethodImpl(Hot)]
+    private static double ApplySeluDouble(double x) => 1.0507009873554805 * (x > 0.0 ? x : 1.6732632423543772 * (Math.Exp(x) - 1.0));
+    [MethodImpl(Hot)]
+    private static double ApplySoftplusDouble(double x) => x > 20.0 ? x : Math.Log(1.0 + Math.Exp(x));
+    [MethodImpl(Hot)]
+    private static double ApplyMishDouble(double x) => x * Math.Tanh(ApplySoftplusDouble(x));
+    [MethodImpl(Hot)]
+    private static double ApplyHardSwishDouble(double x)
+    {
+        double t = (x + 3.0) / 6.0;
+        t = t < 0.0 ? 0.0 : (t > 1.0 ? 1.0 : t);
+        return x * t;
+    }
+    [MethodImpl(Hot)]
+    private static double ApplyHardSigmoidDouble(double x)
+    {
+        double t = (x + 3.0) / 6.0;
+        return t < 0.0 ? 0.0 : (t > 1.0 ? 1.0 : t);
+    }
+    [MethodImpl(Hot)]
+    private static double ApplyHardTanhDouble(double x) => x < -1.0 ? -1.0 : (x > 1.0 ? 1.0 : x);
 
     #endregion
 

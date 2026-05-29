@@ -184,18 +184,20 @@ public class FusedAdaptiveLrPlanTests
     }
 
     [Theory]
-    [InlineData(OptimizerType.Lion)]
-    [InlineData(OptimizerType.LAMB)]
+    [InlineData(OptimizerType.SparseAdam)]
     [InlineData(OptimizerType.HypergradientSGD)]
     [InlineData(OptimizerType.ScheduleFreeSGD)]
     [InlineData(OptimizerType.DAdaptationSGD)]
     public void ConfigureOptimizer_RejectsOptimizersPlanCantDispatch(OptimizerType opt)
     {
-        // PR #349 review #1: the kernels for these exist (so
-        // IsFusedPathEligible says yes) but CompiledTrainingPlan's
-        // dispatch only branches SGD/Adam/AdamW today. Configuring
-        // should fail FAST at configure time, not surprise the caller
-        // with a NotSupportedException on the first Step().
+        // Tensors #500: the per-parameter fused dispatch now covers the full
+        // elementwise kernel-backed set (SGD/Adam/AdamW/AMSGrad + SGDMomentum/
+        // Adagrad/RMSprop/Lion/AdaMax/Nadam/RAdam/LAMB/AdaDelta/LARS/FTRL/ASGD/
+        // Rprop). What remains rejected needs an execution model the per-param
+        // loop can't provide: SparseAdam (sparse-gradient indices),
+        // HypergradientSGD / DAdaptationSGD (GLOBAL cross-parameter reductions),
+        // ScheduleFreeSGD (y-buffer written before the forward). These must fail
+        // FAST at configure time, not surprise the caller on the first Step().
         var engine = new CpuEngine();
         var w = new Tensor<float>(new float[] { 1.0f }, new[] { 1 });
         using var plan = CompileReduceSumPlan(engine, w);

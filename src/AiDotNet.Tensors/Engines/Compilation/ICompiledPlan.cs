@@ -407,7 +407,8 @@ public interface ICompiledTrainingPlan<T> : IDisposable
         float beta1 = 0.9f,
         float beta2 = 0.999f,
         float eps = 1e-8f,
-        float weightDecay = 0f);
+        float weightDecay = 0f,
+        FusedOptimizerExtras? extras = null);
 
     /// <summary>
     /// Configures global gradient L2-norm clipping for the fused training
@@ -440,7 +441,8 @@ public interface ICompiledTrainingPlan<T> : IDisposable
         float beta1 = 0.9f,
         float beta2 = 0.999f,
         float eps = 1e-8f,
-        float weightDecay = 0f);
+        float weightDecay = 0f,
+        FusedOptimizerExtras? extras = null);
 
     /// <summary>
     /// Configures fused optimizer updates with a per-parameter-group
@@ -468,7 +470,8 @@ public interface ICompiledTrainingPlan<T> : IDisposable
         float beta1 = 0.9f,
         float beta2 = 0.999f,
         float eps = 1e-8f,
-        float weightDecay = 0f);
+        float weightDecay = 0f,
+        FusedOptimizerExtras? extras = null);
 
     /// <summary>
     /// Issue #338 Phase G.4: Enables pre-packed-B caching on the forward

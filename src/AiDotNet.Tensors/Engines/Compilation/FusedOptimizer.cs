@@ -482,6 +482,57 @@ internal static class FusedOptimizer
         }
     }
 
+    /// <summary>AVX2 AMSGrad (double): Adam with max of past squared gradients.
+    /// Mirrors the float <see cref="AMSGradUpdateSimd(float*,float*,float*,float*,float*,int,float,float,float,float,int)"/>
+    /// exactly so a double-precision CompiledTrainingPlan keeps the same
+    /// non-increasing-denominator guarantee (Reddi, Kale, Kumar 2018) that the
+    /// FeedForwardNeuralNetwork default relies on (drift fix, AiDotNet #1332).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static unsafe void AMSGradUpdateSimd(
+        double* param, double* grad, double* m, double* v, double* vMax, int length,
+        double lr, double beta1, double beta2, double eps, int step)
+    {
+        double bc1 = 1.0 - System.Math.Pow(beta1, step);
+        double bc2 = 1.0 - System.Math.Pow(beta2, step);
+        double lrAdj = lr / bc1;
+        int i = 0;
+#if NET5_0_OR_GREATER
+        if (Fma.IsSupported && length >= 4)
+        {
+            var vB1 = Vector256.Create(beta1);
+            var v1mB1 = Vector256.Create(1.0 - beta1);
+            var vB2 = Vector256.Create(beta2);
+            var v1mB2 = Vector256.Create(1.0 - beta2);
+            var vLr = Vector256.Create(-lrAdj);
+            var vEps = Vector256.Create(eps);
+            var vBc2Inv = Vector256.Create(1.0 / bc2);
+            int simdLen = length & ~3;
+            for (; i < simdLen; i += 4)
+            {
+                var g = Avx.LoadVector256(grad + i);
+                var mNew = Fma.MultiplyAdd(vB1, Avx.LoadVector256(m + i), Avx.Multiply(v1mB1, g));
+                Avx.Store(m + i, mNew);
+                var vNew = Fma.MultiplyAdd(vB2, Avx.LoadVector256(v + i), Avx.Multiply(v1mB2, Avx.Multiply(g, g)));
+                Avx.Store(v + i, vNew);
+                var vmNew = Avx.Max(Avx.LoadVector256(vMax + i), vNew);
+                Avx.Store(vMax + i, vmNew);
+                var vMaxHat = Avx.Multiply(vmNew, vBc2Inv);
+                var denom = Avx.Add(Avx.Sqrt(vMaxHat), vEps);
+                Avx.Store(param + i, Fma.MultiplyAdd(vLr, Avx.Divide(mNew, denom), Avx.LoadVector256(param + i)));
+            }
+        }
+#endif
+        for (; i < length; i++)
+        {
+            m[i] = beta1 * m[i] + (1.0 - beta1) * grad[i];
+            v[i] = beta2 * v[i] + (1.0 - beta2) * grad[i] * grad[i];
+            vMax[i] = System.Math.Max(vMax[i], v[i]);
+            double mHat = m[i] / bc1;
+            double vMaxHat = vMax[i] / bc2;
+            param[i] -= lr * mHat / (System.Math.Sqrt(vMaxHat) + eps);
+        }
+    }
+
     /// <summary>AVX2 Nadam: Adam with Nesterov momentum</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static unsafe void NadamUpdateSimd(
@@ -1225,6 +1276,49 @@ internal static class FusedOptimizer
 
         return dNew;
     }
+}
+
+/// <summary>
+/// Extra per-optimizer hyperparameters that don't fit the generic
+/// (learningRate, beta1, beta2, eps, weightDecay) slots of
+/// <c>CompiledTrainingPlan.ConfigureOptimizer</c>. Pass an instance to configure
+/// AdaDelta / LARS / FTRL / ASGD / Rprop; omit it to use the per-field defaults.
+/// All other optimizers ignore it.
+/// </summary>
+/// <remarks>
+/// A class with property initializers (not a record struct) so <c>new
+/// FusedOptimizerExtras()</c> reliably yields the documented defaults — a
+/// <c>default</c> record-struct would zero every field, which is wrong for e.g.
+/// LARS <c>TrustCoefficient</c> or Rprop step bounds.
+/// </remarks>
+public sealed class FusedOptimizerExtras
+{
+    /// <summary>LARS momentum coefficient. Default 0.9.</summary>
+    public float Momentum { get; init; } = 0.9f;
+    /// <summary>LARS trust coefficient (η in the layer-wise trust ratio). Default 0.001.</summary>
+    public float TrustCoefficient { get; init; } = 0.001f;
+    /// <summary>FTRL L1 regularization strength. Default 0.</summary>
+    public float L1 { get; init; } = 0f;
+    /// <summary>FTRL L2 regularization strength. Default 0.</summary>
+    public float L2 { get; init; } = 0f;
+    /// <summary>FTRL learning-rate power (β in n^β). Default -0.5.</summary>
+    public float LrPower { get; init; } = -0.5f;
+    /// <summary>ASGD decay term λ in η_t = lr/(1+λ·lr·t)^α. Default 1e-4.</summary>
+    public float Lambd { get; init; } = 1e-4f;
+    /// <summary>ASGD decay exponent α. Default 0.75.</summary>
+    public float Alpha { get; init; } = 0.75f;
+    /// <summary>ASGD averaging start step t0 (μ_t = 1/max(1, t−t0)). Default 1e6.</summary>
+    public float T0 { get; init; } = 1e6f;
+    /// <summary>Rprop step-increase factor η⁺. Default 1.2.</summary>
+    public float RpropEtaPlus { get; init; } = 1.2f;
+    /// <summary>Rprop step-decrease factor η⁻. Default 0.5.</summary>
+    public float RpropEtaMinus { get; init; } = 0.5f;
+    /// <summary>Rprop minimum step size. Default 1e-6.</summary>
+    public float RpropStepMin { get; init; } = 1e-6f;
+    /// <summary>Rprop maximum step size. Default 50.</summary>
+    public float RpropStepMax { get; init; } = 50f;
+    /// <summary>Rprop initial per-element step size. Default 0.01.</summary>
+    public float RpropInitialStep { get; init; } = 0.01f;
 }
 
 /// <summary>Optimizer type for fused parameter updates.</summary>
