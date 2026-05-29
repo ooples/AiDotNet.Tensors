@@ -60,8 +60,11 @@ internal static class BlasProvider
 
     // Array-slice variants. libopenblas takes pointer-offset natively, so we
     // bridge via span + MemoryMarshal.
+    // Raw P/Invoke. NEVER call these directly — go through the gated
+    // cblas_sgemm_ptr / cblas_dgemm_ptr wrappers below, which serialize native
+    // entry (OpenBLAS crashes on concurrent entry; see _nativeGemmGate).
     [DllImport("libopenblas", EntryPoint = "cblas_sgemm", CallingConvention = CallingConvention.Cdecl)]
-    private static extern unsafe void cblas_sgemm_ptr(
+    private static extern unsafe void cblas_sgemm_native(
         int layout, int transA, int transB,
         int m, int n, int k,
         float alpha, float* a, int lda,
@@ -69,7 +72,7 @@ internal static class BlasProvider
         float beta, float* c, int ldc);
 
     [DllImport("libopenblas", EntryPoint = "cblas_dgemm", CallingConvention = CallingConvention.Cdecl)]
-    private static extern unsafe void cblas_dgemm_ptr(
+    private static extern unsafe void cblas_dgemm_native(
         int layout, int transA, int transB,
         int m, int n, int k,
         double alpha, double* a, int lda,
@@ -1110,6 +1113,53 @@ internal static class BlasProvider
     // wrapper that fires AFTER a successful BLAS call. Dropped #402's duplicate 6-arg field
     // that included Type — the existing ShapeInstrumenter consumer (Helpers/ShapeInstrumenter.cs)
     // uses the 5-arg shape and doesn't need the precision tag.
+
+    // ────────────────────────────────────────────────────────────────────
+    // Native-entry serialization gate.
+    //
+    // OpenBLAS (and any libopenblas-redirected MKL) corrupts its internal
+    // per-thread working buffers when cblas_*gemm is ENTERED from more than one
+    // managed thread at the same time — a hard native crash (access violation),
+    // not merely wrong results. This is the native-path analog of the
+    // StreamingWorkerPool concurrent-dispatch bug fixed in #492: there the shared
+    // state was a managed worker pool; here it is OpenBLAS's own buffer table,
+    // which we can't make reentrant from managed code. Reproduced by two
+    // concurrent CpuEngine.TensorMatMul calls (the PaddedBuffer concurrency
+    // stress guard) — single-threaded native is fine, 2+ simultaneous entries
+    // segfault the process.
+    //
+    // Fix: every native cblas_*gemm invocation goes through SgemmGated/DgemmGated,
+    // which hold this gate for the duration of the call, so at most one native
+    // GEMM runs at a time. This does NOT throttle real parallelism: a single
+    // OpenBLAS GEMM already fans out across all cores via its own threadpool, so
+    // serializing entry prevents thread oversubscription rather than adding it.
+    // Concurrent callers on the MANAGED path (BlasManaged / SimdGemm — used when
+    // PreferManaged, when native is unavailable, or when a Try* returns false)
+    // never touch native state and are unaffected by this gate.
+    private static readonly object _nativeGemmGate = new();
+
+    // Gated wrappers carrying the historical cblas_*gemm_ptr names so every
+    // existing call site routes through the serialization gate with no churn.
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static unsafe void cblas_sgemm_ptr(
+        int order, int transA, int transB, int m, int n, int k,
+        float alpha, float* a, int lda, float* b, int ldb, float beta, float* c, int ldc)
+    {
+        // Pointers are pinned by the caller's enclosing `fixed` block, which
+        // encloses this call — the GC can't move the backing arrays for the
+        // call's duration even though the lock is held inside this method.
+        lock (_nativeGemmGate)
+            cblas_sgemm_native(order, transA, transB, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static unsafe void cblas_dgemm_ptr(
+        int order, int transA, int transB, int m, int n, int k,
+        double alpha, double* a, int lda, double* b, int ldb, double beta, double* c, int ldc)
+    {
+        lock (_nativeGemmGate)
+            cblas_dgemm_native(order, transA, transB, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc);
+    }
 
     // ────────────────────────────────────────────────────────────────────
     // Try* entry points. When BLAS is disabled (default), every call

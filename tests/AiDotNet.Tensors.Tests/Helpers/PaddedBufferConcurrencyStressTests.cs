@@ -110,4 +110,64 @@ public class PaddedBufferConcurrencyStressTests
         Assert.True(drifts.IsEmpty,
             $"{drifts.Count} concurrent iterations drifted from the fresh reference. First: {(drifts.IsEmpty ? "" : System.Linq.Enumerable.First(drifts))}");
     }
+
+    // Native-BLAS concurrency guard. The chain test above uses small shapes
+    // (M*N*K below MatrixMultiplyHelper's BLAS work threshold), so it runs the
+    // managed kernel and never enters native OpenBLAS. This test uses a shape
+    // ABOVE the threshold (M=8, K=513, N=512 → ~2.1M work) so CpuEngine.TensorMatMul
+    // routes to the native cblas_sgemm path. OpenBLAS corrupts its internal
+    // per-thread buffers when entered from 2+ managed threads at once — a hard
+    // process crash (access violation), not a drift — unless native entry is
+    // serialized (BlasProvider._nativeGemmGate). Pre-fix this segfaulted the test
+    // host with as few as 2 simultaneous threads; this is the regression guard for
+    // that fix. (The K=513 / N=512 weight is also genuinely padded on the net5+
+    // pooling tier, so the pad-respect property is exercised here too.)
+    [Fact]
+    public void MatMul_NativeBlasPath_UnderHeavyConcurrency_DoesNotCrashOrDrift()
+    {
+        const int M = 8, K = 513, N = 512;
+        var rng = new Random(2);
+        var xVals = new float[M * K];
+        for (int i = 0; i < xVals.Length; i++) xVals[i] = (float)(rng.NextDouble() * 2.0 - 1.0);
+        var wVals = new float[K * N];
+        for (int i = 0; i < wVals.Length; i++) wVals[i] = (float)(rng.NextDouble() * 0.1);
+
+        var engine = new CpuEngine();
+        var xRef = new Tensor<float>(new[] { M, K }); xVals.CopyTo(xRef.AsWritableSpan());
+        var wRef = new Tensor<float>(new[] { K, N }); wVals.CopyTo(wRef.AsWritableSpan());
+        var refOut = engine.TensorMatMul(xRef, wRef).AsSpan().ToArray();
+
+        int threads = Math.Max(4, Environment.ProcessorCount * 2);
+        const int itersPerThread = 60;
+        var drifts = new ConcurrentBag<string>();
+
+        using var startGate = new Barrier(threads + 1);
+        var workers = new Task[threads];
+        for (int w = 0; w < threads; w++)
+        {
+            workers[w] = Task.Factory.StartNew(() =>
+            {
+                var eng = new CpuEngine();
+                var x = new Tensor<float>(new[] { M, K }); xVals.CopyTo(x.AsWritableSpan());
+                startGate.SignalAndWait();
+                for (int it = 0; it < itersPerThread; it++)
+                {
+                    var wPad = RentWithGarbagePadding(new[] { K, N }, wVals, 999_999f);
+                    var outPad = eng.TensorMatMul(x, wPad).AsSpan();
+                    for (int i = 0; i < refOut.Length; i++)
+                        if (outPad[i] != refOut[i])
+                        {
+                            drifts.Add($"idx {i}: {outPad[i]} vs ref {refOut[i]} (Δ={Math.Abs((double)outPad[i] - refOut[i]):G4})");
+                            break;
+                        }
+                }
+            }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+        }
+
+        startGate.SignalAndWait();   // release all workers simultaneously
+        Task.WaitAll(workers);
+
+        Assert.True(drifts.IsEmpty,
+            $"{drifts.Count} concurrent iterations drifted from the fresh reference. First: {(drifts.IsEmpty ? "" : System.Linq.Enumerable.First(drifts))}");
+    }
 }
