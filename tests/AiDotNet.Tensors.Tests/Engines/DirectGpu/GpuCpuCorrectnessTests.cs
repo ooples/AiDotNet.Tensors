@@ -341,5 +341,61 @@ public sealed class GpuCpuCorrectnessTests : IDisposable
         var b = Rand(26, batch, k, n);
         AssertGpuMatchesCpu(_gpu.BatchMatMul(a, b), _cpu.BatchMatMul(a, b), $"BatchMatMul[{batch}x{m}x{k}*{batch}x{k}x{n}]");
     }
+
+    // ----- Element-wise VECTOR ops (Add / Subtract / Multiply / Divide) -----
+    // Regression guard: the deferred-download path released its input buffers
+    // (the `using var bufferA/bufferB` in TryRunBinary) before the queued
+    // element-wise kernel ever ran, so the kernel read freed/recycled buffers
+    // and the result came back all-zeros. The sizes deliberately include values
+    // that are NOT multiples of 4 (the float4 kernel's scalar-tail path) and
+    // small sizes < one work-group.
+    private static Vector<float> RandVec(int seed, int n)
+    {
+        var rng = new Random(seed);
+        var data = new float[n];
+        for (int i = 0; i < n; i++) data[i] = (float)(rng.NextDouble() * 2.0 - 1.0) + 1.5f; // keep away from 0 for divide
+        return new Vector<float>(data);
+    }
+
+    private void AssertVecGpuMatchesCpu(Vector<float> gpu, Vector<float> cpu, string op)
+    {
+        Assert.Equal(cpu.Length, gpu.Length);
+        double m = 0;
+        for (int i = 0; i < cpu.Length; i++)
+        {
+            float x = gpu[i], y = cpu[i];
+            Assert.False(float.IsNaN(x) || float.IsInfinity(x), $"{op}: GPU produced non-finite value {x} at index {i}");
+            double e = Math.Abs((double)x - y);
+            if (e > m) m = e;
+        }
+        Assert.True(m < Tol, $"{op}: GPU vs CPU max_abs_err {m:E3} exceeded tolerance {Tol:E3}");
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    [InlineData(4)]
+    [InlineData(5)]
+    [InlineData(7)]
+    [InlineData(8)]
+    [InlineData(15)]
+    [InlineData(16)]
+    [InlineData(17)]
+    [InlineData(70)]
+    [InlineData(100)]
+    [InlineData(256)]
+    [InlineData(257)]
+    public void ElementwiseVectorOps_Gpu_Matches_Cpu(int n)
+    {
+        if (!EnsureGpuReady()) return;
+        var a = RandVec(101, n);
+        var b = RandVec(202, n);
+
+        AssertVecGpuMatchesCpu((Vector<float>)_gpu.Add(a, b), (Vector<float>)_cpu.Add(a, b), $"Add[{n}]");
+        AssertVecGpuMatchesCpu((Vector<float>)_gpu.Subtract(a, b), (Vector<float>)_cpu.Subtract(a, b), $"Subtract[{n}]");
+        AssertVecGpuMatchesCpu((Vector<float>)_gpu.Multiply(a, b), (Vector<float>)_cpu.Multiply(a, b), $"Multiply[{n}]");
+        AssertVecGpuMatchesCpu((Vector<float>)_gpu.Divide(a, b), (Vector<float>)_cpu.Divide(a, b), $"Divide[{n}]");
+    }
 }
 #endif

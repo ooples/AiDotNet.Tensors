@@ -1281,6 +1281,29 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return new OwnedBuffer(backend.AllocateBuffer(size), ownsBuffer: true);
     }
 
+    // An element-wise kernel launch is asynchronous, but FinishGpuOp only defers the *download* of
+    // the output — any freshly-uploaded input buffer (OwnsBuffer == true) is released by the
+    // caller's `using` block the moment the dispatch method returns. Because the command queue is
+    // not flushed until the deferred download (or a later op) forces it, the queued kernel can run
+    // *after* that buffer has been freed and its pooled GPU memory handed to another allocation —
+    // so the kernel reads stale/zeroed memory and writes an all-zero result (the GAMLSS-through-
+    // AiModelBuilder corruption: every Engine.Subtract/Add/Multiply/Divide on a fresh Vector came
+    // back as zeros). Cached inputs (OwnsBuffer == false — the neural-network hot path where
+    // weights/activations persist in the activation cache) are never disposed here, so they carry
+    // no such hazard and we skip the otherwise pipeline-stalling sync. Only force completion when a
+    // transient input is in play, keeping its memory valid until the kernel has consumed it.
+    private static void SyncIfInputsTransient(IDirectGpuBackend backend, OwnedBuffer a, OwnedBuffer b)
+    {
+        if (a.OwnsBuffer || b.OwnsBuffer)
+            backend.Synchronize();
+    }
+
+    private static void SyncIfInputsTransient(IDirectGpuBackend backend, OwnedBuffer a)
+    {
+        if (a.OwnsBuffer)
+            backend.Synchronize();
+    }
+
     /// <summary>
     /// Completes a GPU operation by either deferring the download (when GpuScope is active)
     /// or downloading immediately. When deferred, the GPU buffer stays resident and the CPU
@@ -1641,6 +1664,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 fp16Input?.Dispose();
             }
+            SyncIfInputsTransient(backend, bufferA);
             return FinishGpuOp<T>(backend, bufferB, input.Length);
         }
         catch
@@ -1827,6 +1851,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 fp16A?.Dispose();
                 fp16B?.Dispose();
             }
+            // Keep transient inputs valid until the async kernel consumes them — see
+            // SyncIfInputsTransient. (The fp16 scratch buffers are already disposed above; the
+            // hazard is the fp32 bufferA/bufferB that the `using` releases when this returns.)
+            SyncIfInputsTransient(backend, bufferA, bufferB);
             return FinishGpuOp<T>(backend, bufferC, left.Length);
         }
         catch
@@ -1949,6 +1977,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             try
             {
                 op(backend, bufferA.Buffer, bufferB.Buffer, input.Length);
+                SyncIfInputsTransient(backend, bufferA);
                 return FinishGpuOp<T>(backend, bufferB, input.Length);
             }
             catch
@@ -1979,6 +2008,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             try
             {
                 op(backend, bufferA.Buffer, bufferB.Buffer, bufferC.Buffer, left.Length);
+                SyncIfInputsTransient(backend, bufferA, bufferB);
                 return FinishGpuOp<T>(backend, bufferC, left.Length);
             }
             catch
@@ -2010,6 +2040,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             try
             {
                 op(backend, bufferA.Buffer, bufferB.Buffer, ToFloatScalar(scalar), input.Length);
+                SyncIfInputsTransient(backend, bufferA);
                 return FinishGpuOp<T>(backend, bufferB, input.Length);
             }
             catch
@@ -2043,6 +2074,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             try
             {
                 op(backend, bufferA.Buffer, bufferB.Buffer, bufferC.Buffer, left.Length);
+                SyncIfInputsTransient(backend, bufferA, bufferB);
                 return FinishGpuOp<T>(backend, bufferC, left.Length);
             }
             catch
@@ -2073,6 +2105,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             try
             {
                 op(backend, bufferA.Buffer, bufferB.Buffer, ToFloatScalar(scalar), input.Length);
+                SyncIfInputsTransient(backend, bufferA);
                 return FinishGpuOp<T>(backend, bufferB, input.Length);
             }
             catch
