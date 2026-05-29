@@ -44,11 +44,27 @@ public class NativeBlasNonDeterministicConcurrencyTests
         var wVals = new float[K * N];
         for (int i = 0; i < wVals.Length; i++) wVals[i] = (float)(rng.NextDouble() * 0.1);
 
+        // IsDeterministicMode is the MERGED view (thread-local override ?? process-wide).
+        // Capture and restore the two layers separately, otherwise restoring via
+        // SetDeterministicMode(before) would write the merged value into the process-wide
+        // field and leave any pre-existing thread-local override behind — leaking state
+        // into later tests (CodeRabbit, PR #491).
+        bool? beforeThreadOverride = BlasProvider.GetThreadLocalDeterministicMode();
+        if (beforeThreadOverride is not null)
+            BlasProvider.SetThreadLocalDeterministicMode(null);
         bool before = BlasProvider.IsDeterministicMode;
         try
         {
             // Non-deterministic mode → the gate uses TryEnter + managed fallback.
             BlasProvider.SetDeterministicMode(false);
+
+            // This regression test guards the NATIVE concurrency gate (_nativeGemmGate).
+            // If native BLAS is opted out (AIDOTNET_USE_BLAS=0) or the library fails to
+            // load, TensorMatMul stays on the managed path and the test would pass without
+            // covering the native path at all — fail loudly instead of silently mis-covering.
+            Assert.True(BlasProvider.IsAvailable,
+                "This regression test requires native BLAS to exercise _nativeGemmGate; " +
+                "native is unavailable (AIDOTNET_USE_BLAS=0 or libopenblas failed to load).");
 
             var engine = new CpuEngine();
             var xRef = new Tensor<float>(new[] { M, K }); xVals.CopyTo(xRef.AsWritableSpan());
@@ -95,7 +111,8 @@ public class NativeBlasNonDeterministicConcurrencyTests
         }
         finally
         {
-            BlasProvider.SetDeterministicMode(before); // restore process-wide state
+            BlasProvider.SetDeterministicMode(before);                       // restore process-wide
+            BlasProvider.SetThreadLocalDeterministicMode(beforeThreadOverride); // restore thread-local
         }
     }
 }
