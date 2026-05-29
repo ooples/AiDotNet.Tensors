@@ -88,6 +88,18 @@ internal static class StreamingWorkerPool
                 else
                 {
                     Volatile.Write(ref _slots[slot].ParkPending, 1);
+                    // FULL FENCE before re-reading Seq. This is a Dekker-style mutual
+                    // signal: the worker writes ParkPending then reads Seq, while the
+                    // dispatcher writes Seq (Interlocked.Increment — a full fence) then
+                    // reads ParkPending. Volatile.Write/Read alone do NOT order a store
+                    // followed by a load (x86 TSO permits store-load reordering), so
+                    // without this barrier the worker could read a stale Seq==lastSeq and
+                    // park while the dispatcher reads a stale ParkPending==0 and skips the
+                    // wake — a lost wakeup that hangs the dispatcher's spin-wait on
+                    // _remaining forever (intermittent deadlock under concurrent dispatch).
+                    // The barrier makes ParkPending=1 globally visible before the Seq read,
+                    // pairing with the dispatcher's interlocked Seq increment.
+                    Thread.MemoryBarrier();
                     // Re-check under park to avoid lost wakeup.
                     if (Volatile.Read(ref _slots[slot].Seq) == lastSeq)
                         _slots[slot].ParkEvent!.Wait();
