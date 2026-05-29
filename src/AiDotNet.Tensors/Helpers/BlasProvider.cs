@@ -1128,18 +1128,40 @@ internal static class BlasProvider
     // stress guard) — single-threaded native is fine, 2+ simultaneous entries
     // segfault the process.
     //
-    // Fix: every native cblas_*gemm invocation goes through SgemmGated/DgemmGated,
-    // which hold this gate for the duration of the call, so at most one native
-    // GEMM runs at a time. This does NOT throttle real parallelism: a single
-    // OpenBLAS GEMM already fans out across all cores via its own threadpool, so
-    // serializing entry prevents thread oversubscription rather than adding it.
-    // Concurrent callers on the MANAGED path (BlasManaged / SimdGemm — used when
-    // PreferManaged, when native is unavailable, or when a Try* returns false)
-    // never touch native state and are unaffected by this gate.
+    // Fix: at most one native GEMM is ever in flight, but HOW that's enforced is
+    // mode-aware so concurrent inference isn't needlessly serialized:
+    //
+    //   • Deterministic mode (the default): results must be bit-reproducible, so every
+    //     call uses the native kernel (the managed kernel differs bit-for-bit). The
+    //     Try* entry points call the BLOCKING cblas_*gemm_ptr wrappers below; concurrent
+    //     callers wait. When OpenBLAS runs multi-threaded this is also near-optimal — a
+    //     single GEMM already fans across all cores, so serializing entry prevents
+    //     oversubscription rather than adding it. (Deterministic mode forces OpenBLAS to
+    //     1 thread, so concurrent GEMM there is genuinely serialized — an accepted
+    //     correctness-over-speed tradeoff for that mode.)
+    //
+    //   • Non-deterministic mode: the Try* entry points take this gate via
+    //     Monitor.TryEnter WITHOUT blocking; a caller that can't acquire it runs the
+    //     concurrency-safe MANAGED kernel (BlasManaged, ~95% of OpenBLAS/core) instead
+    //     of blocking — so N concurrent GEMMs stay parallel (1 native + N-1 managed).
+    //     The native/managed kernel mix is acceptable precisely because this mode has
+    //     opted out of bit-reproducibility. This mirrors the #492 StreamingWorkerPool
+    //     TryEnter-then-fallback fix, on the native side.
+    //
+    // Either way, OpenBLAS's per-thread buffer table is never entered concurrently, so
+    // the segfault can't occur. Managed-path callers (PreferManaged, native unavailable,
+    // or a Try* returning false) never touch native state and are unaffected.
+    //
+    // NOTE: the α/β accumulate + raw paths (TryGemmWithBeta, TryGemmExBeta, SgemmRaw,
+    // DgemmRaw) always use the BLOCKING wrappers regardless of mode — BlasManaged.Gemm
+    // computes only C:=A·B (no α/β), so there's no one-line managed fallback for them.
+    // They're conv/backward (training) paths, not the inference forward hot path.
     private static readonly object _nativeGemmGate = new();
 
-    // Gated wrappers carrying the historical cblas_*gemm_ptr names so every
-    // existing call site routes through the serialization gate with no churn.
+    // Blocking-gated wrappers carrying the historical cblas_*gemm_ptr names. Used by the
+    // deterministic-mode hot paths and the α/β + raw paths (which have no managed
+    // fallback). The non-deterministic hot paths instead TryEnter _nativeGemmGate
+    // themselves and call cblas_*gemm_native directly, so they never double-acquire.
     [MethodImpl(MethodImplOptions.NoInlining)]
     private static unsafe void cblas_sgemm_ptr(
         int order, int transA, int transB, int m, int n, int k,
@@ -1184,6 +1206,24 @@ internal static class BlasProvider
             return true;
         }
         if (!_nativeAvailable.Value) return false;
+        // Concurrent native entry crashes OpenBLAS (see _nativeGemmGate). Two modes:
+        //   • Deterministic mode: results must be bit-reproducible, so EVERY call uses
+        //     the native kernel (managed differs bit-for-bit). Serialize via the
+        //     blocking cblas_*gemm_ptr wrapper — concurrent callers wait, never race.
+        //   • Non-deterministic mode: never block. TryEnter; if another thread holds
+        //     the gate, run the concurrency-safe managed kernel so concurrent inference
+        //     stays parallel (the #492 fallback pattern). Kernel-mixing is acceptable
+        //     here precisely because the caller opted out of bit-reproducibility.
+        bool deterministic = IsDeterministicMode;
+        if (!deterministic && !System.Threading.Monitor.TryEnter(_nativeGemmGate))
+        {
+            Engines.BlasManaged.BlasManaged.Gemm<float>(
+                new ReadOnlySpan<float>(a, aOffset, a.Length - aOffset), lda, false,
+                new ReadOnlySpan<float>(b, bOffset, b.Length - bOffset), ldb, false,
+                new Span<float>(c, cOffset, c.Length - cOffset), ldc,
+                m, n, k);
+            return true;
+        }
         try
         {
             unsafe
@@ -1192,14 +1232,19 @@ internal static class BlasProvider
                 fixed (float* pb = &b[bOffset])
                 fixed (float* pc = &c[cOffset])
                 {
-                    cblas_sgemm_ptr(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                        m, n, k, 1.0f, pa, lda, pb, ldb, 0.0f, pc, ldc);
+                    if (deterministic)
+                        cblas_sgemm_ptr(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                            m, n, k, 1.0f, pa, lda, pb, ldb, 0.0f, pc, ldc);
+                    else
+                        cblas_sgemm_native(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                            m, n, k, 1.0f, pa, lda, pb, ldb, 0.0f, pc, ldc);
                 }
             }
             LogShape(m, n, k);
             return true;
         }
         catch { return false; }
+        finally { if (!deterministic) System.Threading.Monitor.Exit(_nativeGemmGate); }
     }
 
     internal static bool TryGemm(int m, int n, int k,
@@ -1217,6 +1262,16 @@ internal static class BlasProvider
             return true;
         }
         if (!_nativeAvailable.Value) return false;
+        bool deterministic = IsDeterministicMode; // see TryGemm(float[]) note
+        if (!deterministic && !System.Threading.Monitor.TryEnter(_nativeGemmGate))
+        {
+            Engines.BlasManaged.BlasManaged.Gemm<double>(
+                new ReadOnlySpan<double>(a, aOffset, a.Length - aOffset), lda, false,
+                new ReadOnlySpan<double>(b, bOffset, b.Length - bOffset), ldb, false,
+                new Span<double>(c, cOffset, c.Length - cOffset), ldc,
+                m, n, k);
+            return true;
+        }
         try
         {
             unsafe
@@ -1225,14 +1280,19 @@ internal static class BlasProvider
                 fixed (double* pb = &b[bOffset])
                 fixed (double* pc = &c[cOffset])
                 {
-                    cblas_dgemm_ptr(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                        m, n, k, 1.0, pa, lda, pb, ldb, 0.0, pc, ldc);
+                    if (deterministic)
+                        cblas_dgemm_ptr(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                            m, n, k, 1.0, pa, lda, pb, ldb, 0.0, pc, ldc);
+                    else
+                        cblas_dgemm_native(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                            m, n, k, 1.0, pa, lda, pb, ldb, 0.0, pc, ldc);
                 }
             }
             LogShape(m, n, k);
             return true;
         }
         catch { return false; }
+        finally { if (!deterministic) System.Threading.Monitor.Exit(_nativeGemmGate); }
     }
 
     internal static bool TryGemm(int m, int n, int k,
@@ -1244,6 +1304,12 @@ internal static class BlasProvider
             return true;
         }
         if (!_nativeAvailable.Value) return false;
+        bool deterministic = IsDeterministicMode; // see TryGemm(float[]) note
+        if (!deterministic && !System.Threading.Monitor.TryEnter(_nativeGemmGate))
+        {
+            Engines.BlasManaged.BlasManaged.Gemm<float>(a, lda, false, b, ldb, false, c, ldc, m, n, k);
+            return true;
+        }
         try
         {
             unsafe
@@ -1252,14 +1318,19 @@ internal static class BlasProvider
                 fixed (float* pb = b)
                 fixed (float* pc = c)
                 {
-                    cblas_sgemm_ptr(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                        m, n, k, 1.0f, pa, lda, pb, ldb, 0.0f, pc, ldc);
+                    if (deterministic)
+                        cblas_sgemm_ptr(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                            m, n, k, 1.0f, pa, lda, pb, ldb, 0.0f, pc, ldc);
+                    else
+                        cblas_sgemm_native(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                            m, n, k, 1.0f, pa, lda, pb, ldb, 0.0f, pc, ldc);
                 }
             }
             LogShape(m, n, k);
             return true;
         }
         catch { return false; }
+        finally { if (!deterministic) System.Threading.Monitor.Exit(_nativeGemmGate); }
     }
 
     internal static bool TryGemm(int m, int n, int k,
@@ -1271,6 +1342,12 @@ internal static class BlasProvider
             return true;
         }
         if (!_nativeAvailable.Value) return false;
+        bool deterministic = IsDeterministicMode; // see TryGemm(float[]) note
+        if (!deterministic && !System.Threading.Monitor.TryEnter(_nativeGemmGate))
+        {
+            Engines.BlasManaged.BlasManaged.Gemm<double>(a, lda, false, b, ldb, false, c, ldc, m, n, k);
+            return true;
+        }
         try
         {
             unsafe
@@ -1279,14 +1356,19 @@ internal static class BlasProvider
                 fixed (double* pb = b)
                 fixed (double* pc = c)
                 {
-                    cblas_dgemm_ptr(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                        m, n, k, 1.0, pa, lda, pb, ldb, 0.0, pc, ldc);
+                    if (deterministic)
+                        cblas_dgemm_ptr(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                            m, n, k, 1.0, pa, lda, pb, ldb, 0.0, pc, ldc);
+                    else
+                        cblas_dgemm_native(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                            m, n, k, 1.0, pa, lda, pb, ldb, 0.0, pc, ldc);
                 }
             }
             LogShape(m, n, k);
             return true;
         }
         catch { return false; }
+        finally { if (!deterministic) System.Threading.Monitor.Exit(_nativeGemmGate); }
     }
 
     internal static bool TryGemmWithBeta(int m, int n, int k,
@@ -1369,6 +1451,16 @@ internal static class BlasProvider
         // resolver redirects libopenblas → MklImports; the call below
         // then dispatches into MKL's cblas_sgemm transparently.
         if (!_nativeAvailable.Value) return false;
+        bool deterministic = IsDeterministicMode; // see TryGemm(float[]) note
+        if (!deterministic && !System.Threading.Monitor.TryEnter(_nativeGemmGate))
+        {
+            Engines.BlasManaged.BlasManaged.Gemm<float>(
+                new ReadOnlySpan<float>(a, aOffset, a.Length - aOffset), lda, transA,
+                new ReadOnlySpan<float>(b, bOffset, b.Length - bOffset), ldb, transB,
+                new Span<float>(c, cOffset, c.Length - cOffset), ldc,
+                m, n, k);
+            return true;
+        }
         try
         {
             int cblasTA = transA ? 112 : CblasNoTrans;  // 112 = CblasTrans
@@ -1379,14 +1471,19 @@ internal static class BlasProvider
                 fixed (float* pb = &b[bOffset])
                 fixed (float* pc = &c[cOffset])
                 {
-                    cblas_sgemm_ptr(CblasRowMajor, cblasTA, cblasTB,
-                        m, n, k, 1.0f, pa, lda, pb, ldb, 0.0f, pc, ldc);
+                    if (deterministic)
+                        cblas_sgemm_ptr(CblasRowMajor, cblasTA, cblasTB,
+                            m, n, k, 1.0f, pa, lda, pb, ldb, 0.0f, pc, ldc);
+                    else
+                        cblas_sgemm_native(CblasRowMajor, cblasTA, cblasTB,
+                            m, n, k, 1.0f, pa, lda, pb, ldb, 0.0f, pc, ldc);
                 }
             }
             LogShape(m, n, k, transA, transB);
             return true;
         }
         catch { return false; }
+        finally { if (!deterministic) System.Threading.Monitor.Exit(_nativeGemmGate); }
     }
 
     /// <summary>
@@ -1421,6 +1518,16 @@ internal static class BlasProvider
             return true;
         }
         if (!_nativeAvailable.Value) return false;
+        bool deterministic = IsDeterministicMode; // see TryGemm(float[]) note
+        if (!deterministic && !System.Threading.Monitor.TryEnter(_nativeGemmGate))
+        {
+            Engines.BlasManaged.BlasManaged.Gemm<double>(
+                new ReadOnlySpan<double>(a, aOffset, a.Length - aOffset), lda, transA,
+                new ReadOnlySpan<double>(b, bOffset, b.Length - bOffset), ldb, transB,
+                new Span<double>(c, cOffset, c.Length - cOffset), ldc,
+                m, n, k);
+            return true;
+        }
         try
         {
             int cblasTA = transA ? 112 : CblasNoTrans;  // 112 = CblasTrans
@@ -1431,14 +1538,19 @@ internal static class BlasProvider
                 fixed (double* pb = &b[bOffset])
                 fixed (double* pc = &c[cOffset])
                 {
-                    cblas_dgemm_ptr(CblasRowMajor, cblasTA, cblasTB,
-                        m, n, k, 1.0, pa, lda, pb, ldb, 0.0, pc, ldc);
+                    if (deterministic)
+                        cblas_dgemm_ptr(CblasRowMajor, cblasTA, cblasTB,
+                            m, n, k, 1.0, pa, lda, pb, ldb, 0.0, pc, ldc);
+                    else
+                        cblas_dgemm_native(CblasRowMajor, cblasTA, cblasTB,
+                            m, n, k, 1.0, pa, lda, pb, ldb, 0.0, pc, ldc);
                 }
             }
             LogShape(m, n, k, transA, transB);
             return true;
         }
         catch { return false; }
+        finally { if (!deterministic) System.Threading.Monitor.Exit(_nativeGemmGate); }
     }
 
     /// <summary>
