@@ -118,6 +118,12 @@ public class TapePerformanceTests
             $"Recording overhead {overheadPct:F1}% exceeds 200% budget for 1K element tensors");
     }
 
+    // Category=Performance so the coverage-instrumented CI correctness run (filter
+    // Category!=Performance) excludes this wall-clock gate. Under coverlet on a shared
+    // CI runner this measured 178ms/step while it passes locally well under the 100ms
+    // budget — instrumentation + runner contention, not a real regression. Budget
+    // unchanged; the gate just runs where wall-clock time is meaningful.
+    [Trait("Category", "Performance")]
     [Fact]
     public void FullForwardBackward_MLP_Performance()
     {
