@@ -22,33 +22,47 @@ public class Issue471CpuMatmulCrashRepro
     {
         Skip.IfNot(Environment.GetEnvironmentVariable("TENSORS_RUN_REPRO") == "1",
             "Env-gated #471 repro: set TENSORS_RUN_REPRO=1 to run.");
+
+        // ResetToCpu() mutates AiDotNetEngine.Current — a shared process-wide
+        // singleton. xUnit test order is nondeterministic, so without restoring
+        // the previous selection the GPU repros below could silently run on CPU
+        // and miss the hardware path they exist to cover. Capture-and-restore
+        // around the CPU-specific body keeps this test isolated.
+        var previousEngine = AiDotNetEngine.Current;
         AiDotNetEngine.ResetToCpu();
-        var eng = AiDotNetEngine.Current;
-        _o.WriteLine($"engine={eng.Name}");
-        const int d = 128;
-        foreach (int V in new[] { 1000, 10000, 30000, 50257 })
+        try
         {
-            var aData = new double[d * V]; for (int i = 0; i < aData.Length; i++) aData[i] = 0.01;
-            var bData = new double[V * d]; for (int i = 0; i < bData.Length; i++) bData[i] = 0.01;
-            var a = new Tensor<double>(aData, new[] { d, V });
-            var b = new Tensor<double>(bData, new[] { V, d });
-            _o.WriteLine($"matmul [d={d} x V={V}] x [V={V} x d={d}] ...");
-            var c = eng.TensorMatMul(a, b);
-            _o.WriteLine($"  OK V={V}: c[0,0]={c[0, 0]:F4} (expect {V * 0.01 * 0.01:F4})");
+            var eng = AiDotNetEngine.Current;
+            _o.WriteLine($"engine={eng.Name}");
+            const int d = 128;
+            foreach (int V in new[] { 1000, 10000, 30000, 50257 })
+            {
+                var aData = new double[d * V]; for (int i = 0; i < aData.Length; i++) aData[i] = 0.01;
+                var bData = new double[V * d]; for (int i = 0; i < bData.Length; i++) bData[i] = 0.01;
+                var a = new Tensor<double>(aData, new[] { d, V });
+                var b = new Tensor<double>(bData, new[] { V, d });
+                _o.WriteLine($"matmul [d={d} x V={V}] x [V={V} x d={d}] ...");
+                var c = eng.TensorMatMul(a, b);
+                _o.WriteLine($"  OK V={V}: c[0,0]={c[0, 0]:F4} (expect {V * 0.01 * 0.01:F4})");
+            }
+            // FLOAT path (matches HE's training-readout dtype; float is the oneDNN/SimdGemm-Sgemm dispatch)
+            foreach (int V in new[] { 10000, 50257 })
+            {
+                var aData = new float[d * V]; for (int i = 0; i < aData.Length; i++) aData[i] = 0.01f;
+                var bData = new float[V * d]; for (int i = 0; i < bData.Length; i++) bData[i] = 0.01f;
+                var a = new Tensor<float>(aData, new[] { d, V });
+                var b = new Tensor<float>(bData, new[] { V, d });
+                _o.WriteLine($"FLOAT matmul [d={d} x V={V}] x [V={V} x d={d}] ...");
+                var c = eng.TensorMatMul(a, b);
+                _o.WriteLine($"  OK float V={V}: c[0,0]={c[0, 0]:F4}");
+            }
+            _o.WriteLine("ALL OK — no crash");
+            Assert.True(true);
         }
-        // FLOAT path (matches HE's training-readout dtype; float is the oneDNN/SimdGemm-Sgemm dispatch)
-        foreach (int V in new[] { 10000, 50257 })
+        finally
         {
-            var aData = new float[d * V]; for (int i = 0; i < aData.Length; i++) aData[i] = 0.01f;
-            var bData = new float[V * d]; for (int i = 0; i < bData.Length; i++) bData[i] = 0.01f;
-            var a = new Tensor<float>(aData, new[] { d, V });
-            var b = new Tensor<float>(bData, new[] { V, d });
-            _o.WriteLine($"FLOAT matmul [d={d} x V={V}] x [V={V} x d={d}] ...");
-            var c = eng.TensorMatMul(a, b);
-            _o.WriteLine($"  OK float V={V}: c[0,0]={c[0, 0]:F4}");
+            AiDotNetEngine.Current = previousEngine;
         }
-        _o.WriteLine("ALL OK — no crash");
-        Assert.True(true);
     }
 
     /// <summary>
