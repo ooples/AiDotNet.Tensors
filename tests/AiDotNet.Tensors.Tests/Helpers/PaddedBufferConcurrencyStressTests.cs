@@ -9,6 +9,7 @@
 
 using System;
 using System.Collections.Concurrent;
+using System.Threading;
 using System.Threading.Tasks;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Helpers;
@@ -73,23 +74,38 @@ public class PaddedBufferConcurrencyStressTests
         const int itersPerThread = 200;
         var drifts = new ConcurrentBag<string>();
 
-        Parallel.For(0, threads, _ =>
+        // Explicit start gate so every worker is parked at the gate before the
+        // hot loops begin — Parallel.For only guarantees "eventually started",
+        // so its bodies can stagger and the shared-buffer race window we're
+        // hunting may never co-occur. A Barrier with (threads + 1) parties
+        // ensures all workers are AT SignalAndWait() before main thread also
+        // signals, then everyone is released simultaneously.
+        using var startGate = new Barrier(threads + 1);
+        var workers = new Task[threads];
+        for (int w = 0; w < threads; w++)
         {
-            var eng = new CpuEngine();
-            for (int it = 0; it < itersPerThread; it++)
+            workers[w] = Task.Factory.StartNew(() =>
             {
-                var inPad = RentWithGarbagePadding(new[] { batch, hidden }, inputVals, 999_999f);
-                var wPad = RentWithGarbagePadding(new[] { hidden, outFeat }, wVals, -999_999f);
-                var w2Pad = RentWithGarbagePadding(new[] { outFeat, hidden }, w2Vals, 777_777f);
-                var outPad = eng.TensorMatMul(eng.Sigmoid(eng.TensorMatMul(inPad, wPad)), w2Pad).AsSpan();
-                for (int i = 0; i < refOut.Length; i++)
-                    if (outPad[i] != refOut[i])
-                    {
-                        drifts.Add($"idx {i}: {outPad[i]} vs ref {refOut[i]} (Δ={Math.Abs((double)outPad[i] - refOut[i]):G4})");
-                        break;
-                    }
-            }
-        });
+                var eng = new CpuEngine();
+                startGate.SignalAndWait();
+                for (int it = 0; it < itersPerThread; it++)
+                {
+                    var inPad = RentWithGarbagePadding(new[] { batch, hidden }, inputVals, 999_999f);
+                    var wPad = RentWithGarbagePadding(new[] { hidden, outFeat }, wVals, -999_999f);
+                    var w2Pad = RentWithGarbagePadding(new[] { outFeat, hidden }, w2Vals, 777_777f);
+                    var outPad = eng.TensorMatMul(eng.Sigmoid(eng.TensorMatMul(inPad, wPad)), w2Pad).AsSpan();
+                    for (int i = 0; i < refOut.Length; i++)
+                        if (outPad[i] != refOut[i])
+                        {
+                            drifts.Add($"idx {i}: {outPad[i]} vs ref {refOut[i]} (Δ={Math.Abs((double)outPad[i] - refOut[i]):G4})");
+                            break;
+                        }
+                }
+            }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+        }
+
+        startGate.SignalAndWait();   // release all workers simultaneously
+        Task.WaitAll(workers);
 
         Assert.True(drifts.IsEmpty,
             $"{drifts.Count} concurrent iterations drifted from the fresh reference. First: {(drifts.IsEmpty ? "" : System.Linq.Enumerable.First(drifts))}");
