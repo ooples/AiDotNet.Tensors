@@ -650,14 +650,21 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// this is the narrower "what the plan can replay today" check.</summary>
     private static void ValidatePlanOptimizerSupport(OptimizerType optimizerType)
     {
+        // AMSGrad (#74): CPU float+double plan dispatch is wired (see the
+        // AMSGradUpdateSimd cases in the four Configure* closures). GPU AMSGrad
+        // is NOT implemented — a GPU-resident parameter with AMSGrad throws at
+        // step time via the GPU switch's default branch. The common path
+        // (FeedForwardNeuralNetwork's AMSGrad default on the CPU engine) is the
+        // one this unblocks.
         bool supported = optimizerType is OptimizerType.SGD
             or OptimizerType.Adam
-            or OptimizerType.AdamW;
+            or OptimizerType.AdamW
+            or OptimizerType.AMSGrad;
         if (!supported)
         {
             throw new NotSupportedException(
                 $"Optimizer type {optimizerType} is not yet supported by CompiledTrainingPlan's " +
-                "fused-update closures. Currently supported: SGD, Adam, AdamW. " +
+                "fused-update closures. Currently supported: SGD, Adam, AdamW, AMSGrad. " +
                 "The kernel for this optimizer may still exist (see OptimizerKernels.IsFusedPathEligible); " +
                 "use eager apply via OptimizerKernels directly until a plan-level dispatch branch lands.");
         }
@@ -684,6 +691,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var m = new float[paramCount][];
         // Second moment buffers (Adam, RMSprop, etc.)
         var v = new float[paramCount][];
+        // AMSGrad (#74): per-parameter running max of the second moment. Pinned
+        // and used only by the AMSGrad case; allocated per-param below only when
+        // the optimizer is AMSGrad, else left as an empty array.
+        var vMax = new float[paramCount][];
 
         // GPU path state (parallel arrays to paramArrays etc.). For each
         // parameter that's GPU-resident, gpuParam[p] / gpuGrad[p] hold the
@@ -806,6 +817,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
             m[p] = needsMomentum ? new float[lengths[p]] : Array.Empty<float>();
             v[p] = needsSecondMoment ? new float[lengths[p]] : Array.Empty<float>();
+            vMax[p] = optimizerType is OptimizerType.AMSGrad ? new float[lengths[p]] : Array.Empty<float>();
         }
 
         _optimizerStep = 0;
@@ -874,7 +886,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 if (gradArrays[p].Length == 0) continue;
 
                 fixed (float* pParam = paramArrays[p], pGrad = gradArrays[p],
-                       pM = m[p], pV = v[p])
+                       pM = m[p], pV = v[p], pVMax = vMax[p])
                 {
                     switch (optType)
                     {
@@ -901,6 +913,19 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         case OptimizerType.AdamW:
                             FusedOptimizer.AdamWUpdateSimd(pParam, pGrad, pM, pV, len,
                                 lr, b1, b2, epsVal, wd, _optimizerStep);
+                            break;
+                        case OptimizerType.AMSGrad:
+                            // AMSGrad (#74): Adam with a running max of v̂ so the
+                            // denominator can only grow — the non-increasing-step
+                            // property the FeedForwardNeuralNetwork default relies on
+                            // (drift fix, AiDotNet #1332). Uses Adam's L2 weight-decay
+                            // convention (grad += wd*param); wd is 0 for that default.
+                            // AMSGradUpdateSimd binds the float or double overload by
+                            // pointer type.
+                            if (wd != 0f)
+                                for (int i = 0; i < len; i++) pGrad[i] += wd * pParam[i];
+                            FusedOptimizer.AMSGradUpdateSimd(pParam, pGrad, pM, pV, pVMax, len,
+                                lr, b1, b2, epsVal, _optimizerStep);
                             break;
                         default:
                             throw new NotSupportedException(
@@ -931,6 +956,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var lengths = new int[paramCount];
         var m = new float[paramCount][];
         var v = new float[paramCount][];
+        // AMSGrad (#74): per-parameter running max of the second moment. Pinned
+        // and used only by the AMSGrad case; allocated per-param below only when
+        // the optimizer is AMSGrad, else left as an empty array.
+        var vMax = new float[paramCount][];
         var paramGroup = new int[paramCount];
         // Snapshot schedule references — concrete types so closure can
         // see them without an extra interface dispatch per step.
@@ -1022,6 +1051,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
             m[p] = needsMomentum ? new float[lengths[p]] : Array.Empty<float>();
             v[p] = needsSecondMoment ? new float[lengths[p]] : Array.Empty<float>();
+            vMax[p] = optimizerType is OptimizerType.AMSGrad ? new float[lengths[p]] : Array.Empty<float>();
         }
 
         _optimizerStep = 0;
@@ -1088,7 +1118,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 if (gradArrays[p].Length == 0) continue;
 
                 fixed (float* pParam = paramArrays[p], pGrad = gradArrays[p],
-                       pM = m[p], pV = v[p])
+                       pM = m[p], pV = v[p], pVMax = vMax[p])
                 {
                     switch (optType)
                     {
@@ -1109,6 +1139,19 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         case OptimizerType.AdamW:
                             FusedOptimizer.AdamWUpdateSimd(pParam, pGrad, pM, pV, len,
                                 lr, b1, b2, epsVal, wd, _optimizerStep);
+                            break;
+                        case OptimizerType.AMSGrad:
+                            // AMSGrad (#74): Adam with a running max of v̂ so the
+                            // denominator can only grow — the non-increasing-step
+                            // property the FeedForwardNeuralNetwork default relies on
+                            // (drift fix, AiDotNet #1332). Uses Adam's L2 weight-decay
+                            // convention (grad += wd*param); wd is 0 for that default.
+                            // AMSGradUpdateSimd binds the float or double overload by
+                            // pointer type.
+                            if (wd != 0f)
+                                for (int i = 0; i < len; i++) pGrad[i] += wd * pParam[i];
+                            FusedOptimizer.AMSGradUpdateSimd(pParam, pGrad, pM, pV, pVMax, len,
+                                lr, b1, b2, epsVal, _optimizerStep);
                             break;
                         default:
                             throw new NotSupportedException(
@@ -1135,6 +1178,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var lengths = new int[paramCount];
         var m = new double[paramCount][];
         var v = new double[paramCount][];
+        // AMSGrad (#74): per-parameter running max of the second moment (see the
+        // float builder). Allocated per-param below only when AMSGrad.
+        var vMax = new double[paramCount][];
 
         // Issue #350: bind to the live backing (see ConfigureOptimizerFloat
         // for the full reasoning) — GetDataArray()'s pool-padded copy
@@ -1176,6 +1222,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
             m[p] = needsMomentum ? new double[lengths[p]] : Array.Empty<double>();
             v[p] = needsSecondMoment ? new double[lengths[p]] : Array.Empty<double>();
+            vMax[p] = optimizerType is OptimizerType.AMSGrad ? new double[lengths[p]] : Array.Empty<double>();
         }
 
         _optimizerStep = 0;
@@ -1195,7 +1242,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 if (gradArrays[p].Length == 0) continue;
                 int len = lengths[p];
                 fixed (double* pParam = paramArrays[p], pGrad = gradArrays[p],
-                       pM = m[p], pV = v[p])
+                       pM = m[p], pV = v[p], pVMax = vMax[p])
                 {
                     switch (optType)
                     {
@@ -1209,6 +1256,19 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         case OptimizerType.AdamW:
                             FusedOptimizer.AdamWUpdateSimd(pParam, pGrad, pM, pV, len,
                                 lr, b1, b2, epsVal, wd, _optimizerStep);
+                            break;
+                        case OptimizerType.AMSGrad:
+                            // AMSGrad (#74): Adam with a running max of v̂ so the
+                            // denominator can only grow — the non-increasing-step
+                            // property the FeedForwardNeuralNetwork default relies on
+                            // (drift fix, AiDotNet #1332). Uses Adam's L2 weight-decay
+                            // convention (grad += wd*param); wd is 0 for that default.
+                            // AMSGradUpdateSimd binds the float or double overload by
+                            // pointer type.
+                            if (wd != 0f)
+                                for (int i = 0; i < len; i++) pGrad[i] += wd * pParam[i];
+                            FusedOptimizer.AMSGradUpdateSimd(pParam, pGrad, pM, pV, pVMax, len,
+                                lr, b1, b2, epsVal, _optimizerStep);
                             break;
                         default:
                             throw new NotSupportedException(
@@ -1233,6 +1293,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var lengths = new int[paramCount];
         var m = new double[paramCount][];
         var v = new double[paramCount][];
+        // AMSGrad (#74): per-parameter running max of the second moment (see the
+        // float builder). Allocated per-param below only when AMSGrad.
+        var vMax = new double[paramCount][];
         var paramGroup = new int[paramCount];
         var schedules = new LrSchedule[groupCount];
         for (int g = 0; g < groupCount; g++) schedules[g] = groupSchedules[g];
@@ -1273,6 +1336,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
             m[p] = needsMomentum ? new double[lengths[p]] : Array.Empty<double>();
             v[p] = needsSecondMoment ? new double[lengths[p]] : Array.Empty<double>();
+            vMax[p] = optimizerType is OptimizerType.AMSGrad ? new double[lengths[p]] : Array.Empty<double>();
         }
 
         _optimizerStep = 0;
@@ -1296,7 +1360,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 double lr = groupLrs[paramGroup[p]];
 
                 fixed (double* pParam = paramArrays[p], pGrad = gradArrays[p],
-                       pM = m[p], pV = v[p])
+                       pM = m[p], pV = v[p], pVMax = vMax[p])
                 {
                     switch (optType)
                     {
@@ -1310,6 +1374,19 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         case OptimizerType.AdamW:
                             FusedOptimizer.AdamWUpdateSimd(pParam, pGrad, pM, pV, len,
                                 lr, b1, b2, epsVal, wd, _optimizerStep);
+                            break;
+                        case OptimizerType.AMSGrad:
+                            // AMSGrad (#74): Adam with a running max of v̂ so the
+                            // denominator can only grow — the non-increasing-step
+                            // property the FeedForwardNeuralNetwork default relies on
+                            // (drift fix, AiDotNet #1332). Uses Adam's L2 weight-decay
+                            // convention (grad += wd*param); wd is 0 for that default.
+                            // AMSGradUpdateSimd binds the float or double overload by
+                            // pointer type.
+                            if (wd != 0f)
+                                for (int i = 0; i < len; i++) pGrad[i] += wd * pParam[i];
+                            FusedOptimizer.AMSGradUpdateSimd(pParam, pGrad, pM, pV, pVMax, len,
+                                lr, b1, b2, epsVal, _optimizerStep);
                             break;
                         default:
                             throw new NotSupportedException(
