@@ -1,11 +1,11 @@
 # ManagedBlas determinism & dispatch modes
 
 AiDotNet.Tensors runs CPU matrix multiplication (GEMM) through its own managed
-kernel, **ManagedBlas** (`BlasManaged.Gemm`), with native OpenBLAS available only
-as an optional, per-shape accelerator in non-deterministic mode (and being retired
-entirely — see the managed-blas-deterministic-parallel roadmap). This document
-describes the two execution modes, the determinism guarantee, and how dispatch is
-routed.
+kernel, **ManagedBlas** (`BlasManaged.Gemm`), as the default path. Native OpenBLAS
+is kept as an **optional per-shape accelerator**: in non-deterministic mode the
+autotune router may dispatch to it for the (typically large, single-stream) shapes
+where it still edges the managed kernel. This document describes the two execution
+modes, the determinism guarantee, and how dispatch is routed.
 
 ## Two modes
 

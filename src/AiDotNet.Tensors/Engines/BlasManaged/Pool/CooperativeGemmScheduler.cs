@@ -2,6 +2,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
 using System.Threading;
+using AiDotNet.Tensors.Helpers;
 
 namespace AiDotNet.Tensors.Engines.BlasManaged.Pool;
 
@@ -81,6 +82,12 @@ internal static class CooperativeGemmScheduler
     private static int _initialized; // 0 = not started, 1 = workers spawned
     private static readonly object _initLock = new();
     private static int _numWorkers;
+
+    /// <summary>Number of persistent worker threads (0 until first dispatch). The pool
+    /// is fixed-size — callers PARTICIPATE rather than the pool spawning threads per
+    /// dispatch — so this never grows under load (the no-oversubscription guarantee).
+    /// Test/diagnostic accessor.</summary>
+    internal static int WorkerCount => Volatile.Read(ref _initialized) == 1 ? _numWorkers : 0;
 
     private static void EnsureInitialized()
     {
@@ -171,9 +178,11 @@ internal static class CooperativeGemmScheduler
     public static void Dispatch(int numChunks, Action<int> action)
     {
         if (numChunks <= 0) return;
-        // Single chunk, or nested call (this thread is already running a chunk) →
-        // serial on the caller. Nested pool re-entry would risk deadlock.
-        if (numChunks == 1 || _inScheduler)
+        // Run serial on the caller when: a single chunk; a nested call (this thread is
+        // already running a chunk — pool re-entry would risk deadlock); or parallelism
+        // is pinned off via CpuParallelSettings.MaxDegreeOfParallelism <= 1 (honor the
+        // class-level contract the legacy pools and ParallelForOrSerial also respect).
+        if (numChunks == 1 || _inScheduler || CpuParallelSettings.MaxDegreeOfParallelism <= 1)
         {
             RunSerial(numChunks, action);
             return;

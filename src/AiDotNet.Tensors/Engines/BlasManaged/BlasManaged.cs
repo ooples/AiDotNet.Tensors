@@ -53,8 +53,8 @@ public static class BlasManaged
     /// <para>
     /// Defaults to <see langword="true"/> (ManagedBlas deterministic-parallel +
     /// non-deterministic best-of is the intended CPU GEMM behavior; native OpenBLAS is
-    /// being retired — see the managed-blas-deterministic-parallel plan). Precedence is
-    /// resolved in <see cref="Helpers.BlasProvider.ShouldRouteManaged"/>:
+    /// kept as an optional per-shape accelerator the router picks where it still wins).
+    /// Precedence is resolved in <see cref="Helpers.BlasProvider.ShouldRouteManaged"/>:
     /// <see cref="PreferManaged"/> and <see cref="Helpers.BlasProvider.IsDeterministicMode"/>
     /// both force managed BEFORE this timing-based routing is consulted — deterministic
     /// mode must not pick its kernel by measurement noise (it would break

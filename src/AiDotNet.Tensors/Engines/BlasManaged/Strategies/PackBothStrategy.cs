@@ -518,7 +518,7 @@ internal static class PackBothStrategy
                                     stripeStart, numStripesInChunk,
                                     effectiveNc_packB_cap, effectiveKc_packB_cap, nr);
                             }
-                        });
+                        }, deterministicSafe: true); // disjoint stripe packing — order-independent
                     }
                     else
                     {
@@ -647,7 +647,7 @@ internal static class PackBothStrategy
                         }
                     }
                     if (PackBothProfiler.Enabled) PackBothProfiler.AddKernel(Stopwatch.GetTimestamp() - _krStart);
-                });
+                }, deterministicSafe: true); // M-axis (ic) split: disjoint C rows, fixed-order K reduction per tile
             }
         }
 
@@ -833,7 +833,7 @@ internal static class PackBothStrategy
                             mr, nr, effectiveNr);
                     }
                 }
-            });
+            }, deterministicSafe: true); // 2D MN-grid split: each (ic,jc) tile disjoint, fixed-order K reduction
         }
     }
 

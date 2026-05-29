@@ -65,6 +65,26 @@ public class CooperativeSchedulerConcurrencyTests
     }
 
     [Fact]
+    public void Pool_IsFixedSize_DoesNotGrowUnderConcurrentLoad()
+    {
+        // No-oversubscription guarantee (plan 2.8): the cooperative pool is a FIXED set
+        // of workers and callers PARTICIPATE rather than the pool spawning a thread per
+        // dispatch/chunk. So heavy concurrent dispatch must NOT grow the worker count —
+        // that's what keeps active worker threads ≈ cores regardless of caller count.
+        CooperativeGemmScheduler.Dispatch(8, _ => { }); // trigger pool init
+        int initial = CooperativeGemmScheduler.WorkerCount;
+        Assert.InRange(initial, 1, Environment.ProcessorCount);
+
+        Parallel.For(0, Environment.ProcessorCount * 3, _ =>
+        {
+            for (int i = 0; i < 25; i++)
+                CooperativeGemmScheduler.Dispatch(48, c => { var _ = c * c; });
+        });
+
+        Assert.Equal(initial, CooperativeGemmScheduler.WorkerCount); // fixed — no per-dispatch threads
+    }
+
+    [Fact]
     public void ConcurrentDispatches_AllComplete_CorrectAndUncontaminated()
     {
         // The headline property: many threads each run their own dispatch
