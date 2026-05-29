@@ -9,12 +9,25 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels
             return @"
 #include <math.h>
 
+// NaN-preserving ReLU. A plain (x > 0 ? x : 0) maps NaN to 0 because every
+// ordered comparison with NaN is false, silently swallowing NaN — the CPU
+// ReluNaNSafe* path instead keeps NaN as a numerical-blowup signal, so match
+// that contract here. NaN is detected on the raw bit pattern via
+// __float_as_uint, NOT isnan()/float comparison: the kernels compile with
+// --use_fast_math, and a bit test survives that (a float is NaN iff its
+// exponent is all-ones and mantissa non-zero, i.e. (bits & 0x7fffffff) exceeds
+// 0x7f800000, the bit pattern of +Inf).
+__device__ __forceinline__ float relu_nan_safe(float x)
+{
+    unsigned int bits = __float_as_uint(x) & 0x7fffffffu;
+    return (bits > 0x7f800000u) ? x : (x > 0.0f ? x : 0.0f);
+}
+
 extern ""C"" __global__ __launch_bounds__(256) void relu(const float* __restrict__ input, float* __restrict__ output, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
-    float x = input[idx];
-    output[idx] = x > 0.0f ? x : 0.0f;
+    output[idx] = relu_nan_safe(input[idx]);
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void sigmoid(const float* __restrict__ input, float* __restrict__ output, int size)
@@ -1158,11 +1171,12 @@ extern ""C"" __global__ __launch_bounds__(256) void relu_vec4(const float* __res
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size4) return;
     float4 v = reinterpret_cast<const float4*>(input)[idx];
+    // Use relu_nan_safe so NaN propagates here too — same contract as scalar relu.
     float4 r;
-    r.x = v.x > 0.0f ? v.x : 0.0f;
-    r.y = v.y > 0.0f ? v.y : 0.0f;
-    r.z = v.z > 0.0f ? v.z : 0.0f;
-    r.w = v.w > 0.0f ? v.w : 0.0f;
+    r.x = relu_nan_safe(v.x);
+    r.y = relu_nan_safe(v.y);
+    r.z = relu_nan_safe(v.z);
+    r.w = relu_nan_safe(v.w);
     reinterpret_cast<float4*>(output)[idx] = r;
 }
 

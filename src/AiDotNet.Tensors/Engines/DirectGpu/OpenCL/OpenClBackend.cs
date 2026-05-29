@@ -316,8 +316,11 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 }
                 WriteDiag($"[OpenClBackend] GEMM kernels: {string.Join(", ", GemmKernel.GetKernelNames())}");
 
-                // Compile activation kernels
-                var activationProgram = CompileOrLoadCached(ActivationKernels.GetSource(), optimizationFlags, "Activation kernels");
+                // Compile activation kernels with NaN-preserving math flags: the
+                // relu kernel propagates NaN by contract, which -cl-finite-math-only
+                // / -cl-fast-relaxed-math would optimize away (the compiler assumes
+                // no NaN exists). See OpenClBuildOptions.SafeMathFlags.
+                var activationProgram = CompileOrLoadCached(ActivationKernels.GetSource(), OpenClBuildOptions.SafeMathFlags, "Activation kernels");
                 _programs.Add(activationProgram);
                 foreach (var name in ActivationKernels.GetKernelNames())
                 {
