@@ -1240,6 +1240,9 @@ public static class CpuFusedOperations
         { FusedActivationType.HardSwish, ApplyHardSwish },
         { FusedActivationType.HardSigmoid, ApplyHardSigmoid },
         { FusedActivationType.HardTanh, ApplyHardTanh },
+        // NaN-preserving clamp (see ReLU note above): x<0 false / x>6 false on NaN ⇒ NaN survives.
+        { FusedActivationType.ReLU6, x => x < 0f ? 0f : (x > 6f ? 6f : x) },
+        { FusedActivationType.SoftSign, x => x / (1f + MathF.Abs(x)) },
         // Softmax is NOT pointwise (depends on entire row) — must not appear here.
         // Fused paths that include Softmax should apply it separately after the GEMM loop.
     };
@@ -1389,6 +1392,8 @@ public static class CpuFusedOperations
         { FusedActivationType.HardSwish, ApplyHardSwishDouble },
         { FusedActivationType.HardSigmoid, ApplyHardSigmoidDouble },
         { FusedActivationType.HardTanh, ApplyHardTanhDouble },
+        { FusedActivationType.ReLU6, x => x < 0.0 ? 0.0 : (x > 6.0 ? 6.0 : x) },
+        { FusedActivationType.SoftSign, x => x / (1.0 + Math.Abs(x)) },
         // Softmax is NOT pointwise — must not appear here.
     };
 

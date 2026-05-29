@@ -110,5 +110,17 @@ public enum FusedActivationType
     /// HardTanh: f(x) = clip(x, -1, 1)
     /// Efficient approximation of Tanh with bounded outputs.
     /// </summary>
-    HardTanh = 14
+    HardTanh = 14,
+
+    /// <summary>
+    /// ReLU6: f(x) = min(max(0, x), 6)
+    /// ReLU clamped at 6; common in mobile/quantized networks (MobileNet).
+    /// </summary>
+    ReLU6 = 15,
+
+    /// <summary>
+    /// SoftSign: f(x) = x / (1 + |x|)
+    /// Smooth, bounded (-1, 1) alternative to Tanh with polynomial tails.
+    /// </summary>
+    SoftSign = 16
 }

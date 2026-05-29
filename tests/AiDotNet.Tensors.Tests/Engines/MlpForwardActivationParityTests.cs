@@ -31,6 +31,8 @@ public class MlpForwardActivationParityTests
         FusedActivationType.HardSwish => x * Math.Max(0.0, Math.Min(1.0, (x + 3.0) / 6.0)),
         FusedActivationType.HardSigmoid => Math.Max(0.0, Math.Min(1.0, (x + 3.0) / 6.0)),
         FusedActivationType.HardTanh => Math.Max(-1.0, Math.Min(1.0, x)),
+        FusedActivationType.ReLU6 => Math.Max(0.0, Math.Min(6.0, x)),
+        FusedActivationType.SoftSign => x / (1.0 + Math.Abs(x)),
         _ => throw new ArgumentOutOfRangeException(nameof(act)),
     };
 
@@ -42,6 +44,8 @@ public class MlpForwardActivationParityTests
     [InlineData(FusedActivationType.HardSwish)]
     [InlineData(FusedActivationType.HardSigmoid)]
     [InlineData(FusedActivationType.HardTanh)]
+    [InlineData(FusedActivationType.ReLU6)]
+    [InlineData(FusedActivationType.SoftSign)]
     public void MlpForward_NewActivationFloat_MatchesCanonicalFormula(FusedActivationType act)
     {
         var engine = new CpuEngine();
@@ -78,6 +82,8 @@ public class MlpForwardActivationParityTests
     [InlineData(FusedActivationType.HardSwish)]
     [InlineData(FusedActivationType.HardSigmoid)]
     [InlineData(FusedActivationType.HardTanh)]
+    [InlineData(FusedActivationType.ReLU6)]
+    [InlineData(FusedActivationType.SoftSign)]
     public void MlpForward_NewActivationDouble_MatchesCanonicalFormula(FusedActivationType act)
     {
         var engine = new CpuEngine();

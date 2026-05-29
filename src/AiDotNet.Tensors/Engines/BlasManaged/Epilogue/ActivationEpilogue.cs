@@ -102,6 +102,67 @@ internal static class ActivationEpilogue
                         c[i * ldc + j] = x > 0 ? x : (Math.Exp(x) - 1.0);
                     }
                 break;
+            case FusedActivationType.SELU:
+                // scale * (x>0 ? x : alpha*(exp(x)-1)); Klambauer et al. 2017 constants.
+                const double seluAlpha = 1.6732632423543772, seluScale = 1.0507009873554805;
+                for (int i = 0; i < m; i++)
+                    for (int j = 0; j < n; j++)
+                    {
+                        double x = c[i * ldc + j];
+                        c[i * ldc + j] = seluScale * (x > 0 ? x : seluAlpha * (Math.Exp(x) - 1.0));
+                    }
+                break;
+            case FusedActivationType.Softplus:
+                // log(1+exp(x)); x>20 linear cutoff avoids exp overflow (PyTorch threshold).
+                for (int i = 0; i < m; i++)
+                    for (int j = 0; j < n; j++)
+                    {
+                        double x = c[i * ldc + j];
+                        c[i * ldc + j] = x > 20.0 ? x : Math.Log(1.0 + Math.Exp(x));
+                    }
+                break;
+            case FusedActivationType.HardSwish:
+                for (int i = 0; i < m; i++)
+                    for (int j = 0; j < n; j++)
+                    {
+                        double x = c[i * ldc + j];
+                        double t = (x + 3.0) / 6.0;
+                        t = t < 0.0 ? 0.0 : (t > 1.0 ? 1.0 : t);
+                        c[i * ldc + j] = x * t;
+                    }
+                break;
+            case FusedActivationType.HardSigmoid:
+                for (int i = 0; i < m; i++)
+                    for (int j = 0; j < n; j++)
+                    {
+                        double t = (c[i * ldc + j] + 3.0) / 6.0;
+                        c[i * ldc + j] = t < 0.0 ? 0.0 : (t > 1.0 ? 1.0 : t);
+                    }
+                break;
+            case FusedActivationType.HardTanh:
+                for (int i = 0; i < m; i++)
+                    for (int j = 0; j < n; j++)
+                    {
+                        double x = c[i * ldc + j];
+                        c[i * ldc + j] = x < -1.0 ? -1.0 : (x > 1.0 ? 1.0 : x);
+                    }
+                break;
+            case FusedActivationType.ReLU6:
+                for (int i = 0; i < m; i++)
+                    for (int j = 0; j < n; j++)
+                    {
+                        double x = c[i * ldc + j];
+                        c[i * ldc + j] = x < 0.0 ? 0.0 : (x > 6.0 ? 6.0 : x);
+                    }
+                break;
+            case FusedActivationType.SoftSign:
+                for (int i = 0; i < m; i++)
+                    for (int j = 0; j < n; j++)
+                    {
+                        double x = c[i * ldc + j];
+                        c[i * ldc + j] = x / (1.0 + Math.Abs(x));
+                    }
+                break;
             case FusedActivationType.None:
                 break;
             default:
@@ -175,6 +236,65 @@ internal static class ActivationEpilogue
                     {
                         float x = c[i * ldc + j];
                         c[i * ldc + j] = x > 0 ? x : (float)(Math.Exp(x) - 1.0);
+                    }
+                break;
+            case FusedActivationType.SELU:
+                const float seluAlphaF = 1.6732632f, seluScaleF = 1.0507010f;
+                for (int i = 0; i < m; i++)
+                    for (int j = 0; j < n; j++)
+                    {
+                        float x = c[i * ldc + j];
+                        c[i * ldc + j] = seluScaleF * (x > 0 ? x : seluAlphaF * (float)(Math.Exp(x) - 1.0));
+                    }
+                break;
+            case FusedActivationType.Softplus:
+                for (int i = 0; i < m; i++)
+                    for (int j = 0; j < n; j++)
+                    {
+                        float x = c[i * ldc + j];
+                        c[i * ldc + j] = x > 20f ? x : (float)Math.Log(1.0 + Math.Exp(x));
+                    }
+                break;
+            case FusedActivationType.HardSwish:
+                for (int i = 0; i < m; i++)
+                    for (int j = 0; j < n; j++)
+                    {
+                        float x = c[i * ldc + j];
+                        float t = (x + 3f) / 6f;
+                        t = t < 0f ? 0f : (t > 1f ? 1f : t);
+                        c[i * ldc + j] = x * t;
+                    }
+                break;
+            case FusedActivationType.HardSigmoid:
+                for (int i = 0; i < m; i++)
+                    for (int j = 0; j < n; j++)
+                    {
+                        float t = (c[i * ldc + j] + 3f) / 6f;
+                        c[i * ldc + j] = t < 0f ? 0f : (t > 1f ? 1f : t);
+                    }
+                break;
+            case FusedActivationType.HardTanh:
+                for (int i = 0; i < m; i++)
+                    for (int j = 0; j < n; j++)
+                    {
+                        float x = c[i * ldc + j];
+                        c[i * ldc + j] = x < -1f ? -1f : (x > 1f ? 1f : x);
+                    }
+                break;
+            case FusedActivationType.ReLU6:
+                for (int i = 0; i < m; i++)
+                    for (int j = 0; j < n; j++)
+                    {
+                        float x = c[i * ldc + j];
+                        c[i * ldc + j] = x < 0f ? 0f : (x > 6f ? 6f : x);
+                    }
+                break;
+            case FusedActivationType.SoftSign:
+                for (int i = 0; i < m; i++)
+                    for (int j = 0; j < n; j++)
+                    {
+                        float x = c[i * ldc + j];
+                        c[i * ldc + j] = x / (1f + Math.Abs(x));
                     }
                 break;
             case FusedActivationType.None:
