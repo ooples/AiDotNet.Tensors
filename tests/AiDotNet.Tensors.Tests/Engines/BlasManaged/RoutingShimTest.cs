@@ -149,20 +149,41 @@ public class RoutingShimTest
     [Fact]
     public void TryGemm_With_PreferManaged_False_Goes_Through_Native_Path()
     {
-        // This is the default behavior; just confirm TryGemm still works when
-        // the toggle is off (no regression to the existing native path).
-        const int M = 32, N = 32, K = 32;
-        var rng = new Random(42);
-        var a = new float[M * K];
-        var b = new float[K * N];
-        var c = new float[M * N];
-        for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() * 2 - 1);
-        for (int i = 0; i < b.Length; i++) b[i] = (float)(rng.NextDouble() * 2 - 1);
+        // "PreferManaged=false → native" only holds when nothing ELSE forces managed
+        // first. BlasProvider.ShouldRouteManaged routes managed when (a) PreferManaged,
+        // (b) deterministic mode — the parallel-and-reproducible kernel, default ON — or
+        // (c) AutotuneRouting (default ON) picks managed per-shape. To genuinely exercise
+        // the native path, pin determinism AND autotune off; then ok must reflect native
+        // availability (true with native loaded, false without). Capture/restore the
+        // thread-local determinism override separately from the process-wide value.
+        bool? beforeThreadDet = BlasProvider.GetThreadLocalDeterministicMode();
+        if (beforeThreadDet is not null) BlasProvider.SetThreadLocalDeterministicMode(null);
+        bool beforeDet = BlasProvider.IsDeterministicMode;
+        bool beforeAutotune = BlasManagedLib.AutotuneRouting;
+        try
+        {
+            BlasProvider.SetDeterministicMode(false);
+            BlasManagedLib.AutotuneRouting = false;
+            BlasManagedLib.PreferManaged = false;
 
-        BlasManagedLib.PreferManaged = false;
-        bool ok = BlasProvider.TryGemm(M, N, K, a, 0, K, b, 0, N, c, 0, N);
-        // If native is available, ok=true; if not, ok=false. Both are acceptable —
-        // we're just confirming the default path is unchanged.
-        Assert.Equal(BlasProvider.IsAvailable, ok);
+            const int M = 32, N = 32, K = 32;
+            var rng = new Random(42);
+            var a = new float[M * K];
+            var b = new float[K * N];
+            var c = new float[M * N];
+            for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() * 2 - 1);
+            for (int i = 0; i < b.Length; i++) b[i] = (float)(rng.NextDouble() * 2 - 1);
+
+            bool ok = BlasProvider.TryGemm(M, N, K, a, 0, K, b, 0, N, c, 0, N);
+            // Native path: ok=true when native is loaded, false otherwise.
+            Assert.Equal(BlasProvider.IsAvailable, ok);
+        }
+        finally
+        {
+            BlasManagedLib.AutotuneRouting = beforeAutotune;
+            BlasProvider.SetDeterministicMode(beforeDet);
+            BlasProvider.SetThreadLocalDeterministicMode(beforeThreadDet);
+            BlasManagedLib.PreferManaged = false;
+        }
     }
 }
