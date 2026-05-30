@@ -36,4 +36,11 @@ public static class SpecializedPerfBar
 
     /// <summary>True once the owner has frozen the SpMM bar (non-zero win rate).</summary>
     public static bool SpMMBarFrozen => SpMMMinWinRatePercent > 0;
+
+    // GBMV vs OpenBLAS sgbmv/dgbmv on the authoritative runner.
+    public const int    GbmvMinWinRatePercent = 0;     // TO BE SET after first bench
+    public const double GbmvMaxLossMultiple    = 99.0; // TO BE SET after first bench
+
+    /// <summary>True once the owner has frozen the GBMV bar (non-zero win rate).</summary>
+    public static bool GbmvBarFrozen => GbmvMinWinRatePercent > 0;
 }

@@ -51,4 +51,14 @@ public static class SpecializedShapeCatalog
         new("Dense_ish_512x512x64",    true, 512,  512,  64, 5.0,  true, 10, "workload:spmm-stress"),
         new("GNN_FP32_2708x2708x64",   true, 2708, 2708,  64, 0.18, false,12, "workload:gnn-cora-fp32"),
     };
+
+    public record GbmvShape(string Name, bool Trans, int M, int N, int Kl, int Ku, bool Fp64, int Frequency, string Source);
+
+    public static readonly GbmvShape[] Gbmv =
+    {
+        new("Tridiag_1024",   false, 1024, 1024, 1, 1, true, 20, "workload:tridiagonal-solver"),
+        new("Pentadiag_2048", false, 2048, 2048, 2, 2, true, 15, "workload:pentadiagonal"),
+        new("Tridiag_T_1024", true,  1024, 1024, 1, 1, true, 10, "workload:tridiagonal-transpose"),
+        new("Banded_FP32_4096",false,4096, 4096, 3, 3, false, 8, "workload:banded-fp32"),
+    };
 }
