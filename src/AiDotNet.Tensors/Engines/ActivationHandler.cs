@@ -32,6 +32,28 @@ internal abstract class ActivationHandler
     /// from the pre-activation input, or override to accept it via other means.
     /// </summary>
     public abstract Tensor<T> ApplyBackward<T>(CpuEngine engine, Tensor<T> gradOutput, Tensor<T> input);
+
+    // #506 review: parametric-activation overloads. Most activations are
+    // non-parametric and ignore FusedActivationParams (the default bodies below
+    // forward to the no-param versions); the parametric handlers (ELU / CELU /
+    // ThresholdedReLU / ScaledTanh / RReLU / ISRU / SQRBF via PointwiseFused, and
+    // PReLU) override these so the fused forward AND backward honor a caller-supplied
+    // slope/alpha/theta instead of the canonical default.
+
+    /// <summary>Apply with explicit parametric settings. Default ignores them.</summary>
+    public virtual Tensor<T> Apply<T>(CpuEngine engine, Tensor<T> input, FusedActivationParams? activationParams)
+        => Apply(engine, input);
+
+    /// <summary>Apply in-place with explicit parametric settings. Default ignores them.</summary>
+    public virtual void ApplyInPlace<T>(CpuEngine engine, Tensor<T> input, FusedActivationParams? activationParams)
+    {
+        var result = Apply(engine, input, activationParams);
+        result.AsSpan().CopyTo(input.AsWritableSpan());
+    }
+
+    /// <summary>Backward with explicit parametric settings. Default ignores them.</summary>
+    public virtual Tensor<T> ApplyBackward<T>(CpuEngine engine, Tensor<T> gradOutput, Tensor<T> input, FusedActivationParams? activationParams)
+        => ApplyBackward(engine, gradOutput, input);
 }
 
 /// <summary>
@@ -191,10 +213,19 @@ internal sealed class TanhActivationHandler : ActivationHandler
 
 internal sealed class LeakyReLUActivationHandler : ActivationHandler
 {
-    public override Tensor<T> Apply<T>(CpuEngine engine, Tensor<T> input)
-        => engine.LeakyReLU(input, Helpers.MathHelper.GetNumericOperations<T>().FromDouble(0.01));
+    private const double DefaultSlope = 0.01;
+    // #506 review: honor a caller-supplied negative slope (FusedActivationParams.Alpha)
+    // in both forward and backward; default to the canonical 0.01.
+    private static double SlopeOf(FusedActivationParams? p) => p?.Alpha ?? DefaultSlope;
+
+    public override Tensor<T> Apply<T>(CpuEngine engine, Tensor<T> input) => Apply(engine, input, null);
+    public override Tensor<T> Apply<T>(CpuEngine engine, Tensor<T> input, FusedActivationParams? activationParams)
+        => engine.LeakyReLU(input, Helpers.MathHelper.GetNumericOperations<T>().FromDouble(SlopeOf(activationParams)));
+
     public override Tensor<T> ApplyBackward<T>(CpuEngine engine, Tensor<T> gradOutput, Tensor<T> input)
-        => engine.LeakyReluBackward(gradOutput, input, 0.01);
+        => ApplyBackward(engine, gradOutput, input, null);
+    public override Tensor<T> ApplyBackward<T>(CpuEngine engine, Tensor<T> gradOutput, Tensor<T> input, FusedActivationParams? activationParams)
+        => engine.LeakyReluBackward(gradOutput, input, SlopeOf(activationParams));
 }
 
 internal sealed class SwishActivationHandler : ActivationHandler
@@ -227,20 +258,24 @@ internal sealed class PointwiseFusedActivationHandler : ActivationHandler
     private readonly FusedActivationType _type;
     public PointwiseFusedActivationHandler(FusedActivationType type) => _type = type;
 
-    public override Tensor<T> Apply<T>(CpuEngine engine, Tensor<T> input)
+    public override Tensor<T> Apply<T>(CpuEngine engine, Tensor<T> input) => ApplyImpl<T>(input, null);
+    public override Tensor<T> Apply<T>(CpuEngine engine, Tensor<T> input, FusedActivationParams? activationParams)
+        => ApplyImpl<T>(input, activationParams);
+
+    private Tensor<T> ApplyImpl<T>(Tensor<T> input, FusedActivationParams? p)
     {
         var result = new Tensor<T>(input._shape);
         int n = input.Length;
         if (typeof(T) == typeof(float))
         {
-            var f = Helpers.CpuFusedOperations.GetFloatActivation(_type);
+            var f = Helpers.CpuFusedOperations.GetFloatActivation(_type, p);
             var xi = (float[])(object)input.GetDataArray();
             var ro = (float[])(object)result.GetDataArray();
             for (int i = 0; i < n; i++) ro[i] = f(xi[i]);
         }
         else if (typeof(T) == typeof(double))
         {
-            var f = Helpers.CpuFusedOperations.GetDoubleActivation(_type);
+            var f = Helpers.CpuFusedOperations.GetDoubleActivation(_type, p);
             var xi = (double[])(object)input.GetDataArray();
             var ro = (double[])(object)result.GetDataArray();
             for (int i = 0; i < n; i++) ro[i] = f(xi[i]);
@@ -250,12 +285,17 @@ internal sealed class PointwiseFusedActivationHandler : ActivationHandler
     }
 
     public override Tensor<T> ApplyBackward<T>(CpuEngine engine, Tensor<T> gradOutput, Tensor<T> input)
+        => BackwardImpl<T>(gradOutput, input, null);
+    public override Tensor<T> ApplyBackward<T>(CpuEngine engine, Tensor<T> gradOutput, Tensor<T> input, FusedActivationParams? activationParams)
+        => BackwardImpl<T>(gradOutput, input, activationParams);
+
+    private Tensor<T> BackwardImpl<T>(Tensor<T> gradOutput, Tensor<T> input, FusedActivationParams? p)
     {
         var result = new Tensor<T>(input._shape);
         int n = input.Length;
         if (typeof(T) == typeof(float))
         {
-            var d = Helpers.CpuFusedOperations.GetFloatActivationDerivative(_type);
+            var d = Helpers.CpuFusedOperations.GetFloatActivationDerivative(_type, p);
             var xi = (float[])(object)input.GetDataArray();
             var gi = (float[])(object)gradOutput.GetDataArray();
             var ro = (float[])(object)result.GetDataArray();
@@ -263,7 +303,7 @@ internal sealed class PointwiseFusedActivationHandler : ActivationHandler
         }
         else if (typeof(T) == typeof(double))
         {
-            var d = Helpers.CpuFusedOperations.GetDoubleActivationDerivative(_type);
+            var d = Helpers.CpuFusedOperations.GetDoubleActivationDerivative(_type, p);
             var xi = (double[])(object)input.GetDataArray();
             var gi = (double[])(object)gradOutput.GetDataArray();
             var ro = (double[])(object)result.GetDataArray();
@@ -274,24 +314,40 @@ internal sealed class PointwiseFusedActivationHandler : ActivationHandler
     }
 }
 
-/// <summary>PReLU with the canonical default slope 0.25: f = x&gt;0 ? x : 0.25·x; f' = x&gt;0 ? 1 : 0.25.</summary>
+/// <summary>PReLU: f = x&gt;0 ? x : a·x; f' = x&gt;0 ? 1 : a. The negative slope <c>a</c>
+/// comes from <see cref="FusedActivationParams.PReluSlope"/> (first element, the shared
+/// scalar slope) when supplied, else the canonical default 0.25.</summary>
 internal sealed class PReLUFusedActivationHandler : ActivationHandler
 {
     private const double DefaultSlope = 0.25;
-    public override Tensor<T> Apply<T>(CpuEngine engine, Tensor<T> input)
+
+    private static double SlopeOf(FusedActivationParams? p)
+        => p?.PReluSlope is { Length: > 0 } s ? s[0] : DefaultSlope;
+
+    public override Tensor<T> Apply<T>(CpuEngine engine, Tensor<T> input) => ApplyImpl<T>(input, null);
+    public override Tensor<T> Apply<T>(CpuEngine engine, Tensor<T> input, FusedActivationParams? activationParams)
+        => ApplyImpl<T>(input, activationParams);
+
+    private Tensor<T> ApplyImpl<T>(Tensor<T> input, FusedActivationParams? p)
     {
         var ops = Helpers.MathHelper.GetNumericOperations<T>();
-        var slope = ops.FromDouble(DefaultSlope);
+        var slope = ops.FromDouble(SlopeOf(p));
         var result = new Tensor<T>(input._shape);
         var xi = input.AsSpan(); var ro = result.AsWritableSpan();
         for (int i = 0; i < xi.Length; i++)
             ro[i] = ops.ToDouble(xi[i]) > 0.0 ? xi[i] : ops.Multiply(slope, xi[i]);
         return result;
     }
+
     public override Tensor<T> ApplyBackward<T>(CpuEngine engine, Tensor<T> gradOutput, Tensor<T> input)
+        => BackwardImpl<T>(gradOutput, input, null);
+    public override Tensor<T> ApplyBackward<T>(CpuEngine engine, Tensor<T> gradOutput, Tensor<T> input, FusedActivationParams? activationParams)
+        => BackwardImpl<T>(gradOutput, input, activationParams);
+
+    private Tensor<T> BackwardImpl<T>(Tensor<T> gradOutput, Tensor<T> input, FusedActivationParams? p)
     {
         var ops = Helpers.MathHelper.GetNumericOperations<T>();
-        var slope = ops.FromDouble(DefaultSlope);
+        var slope = ops.FromDouble(SlopeOf(p));
         var result = new Tensor<T>(input._shape);
         var xi = input.AsSpan(); var gi = gradOutput.AsSpan(); var ro = result.AsWritableSpan();
         for (int i = 0; i < xi.Length; i++)

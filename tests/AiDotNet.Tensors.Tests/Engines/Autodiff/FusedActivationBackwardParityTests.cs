@@ -148,6 +148,56 @@ public class FusedActivationBackwardParityTests
         }
     }
 
+    /// <summary>
+    /// #506 review: the fused-activation backward must honor a caller-supplied
+    /// <see cref="FusedActivationParams"/> (slope/alpha), not silently use the default.
+    /// For each parametric activation: the params-aware backward matches a finite-difference
+    /// VJP of the params-aware forward, AND differs from the default-params backward (proving
+    /// the parameter actually flows through — the bug CodeRabbit flagged).
+    /// </summary>
+    [Theory]
+    [InlineData(FusedActivationType.PReLU)]   // PReluSlope[0]
+    [InlineData(FusedActivationType.ELU)]     // Alpha
+    [InlineData(FusedActivationType.CELU)]    // Alpha
+    [InlineData(FusedActivationType.LeakyReLU)] // Alpha
+    public void ParametricActivation_Backward_HonorsNonDefaultParams(FusedActivationType act)
+    {
+        var engine = new CpuEngine();
+        var handler = ActivationRegistry.Get(act)!;
+        int n = 12;
+        var x = MakeSafeInput(n, 4242 + (int)act);
+        var g = MakeGrad(n, 2424 + (int)act);
+        // Non-default params: slope/alpha = 0.3 (defaults are 0.25 / 1.0 / 1.0 / 0.01).
+        var p = act == FusedActivationType.PReLU
+            ? new FusedActivationParams { PReluSlope = new[] { 0.3f } }
+            : new FusedActivationParams { Alpha = 0.3f };
+
+        var xT = new Tensor<double>((double[])x.Clone(), new[] { n });
+        var gT = new Tensor<double>((double[])g.Clone(), new[] { n });
+        var analytic = handler.ApplyBackward(engine, gT, xT, p).AsSpan().ToArray();
+
+        // Finite-difference VJP of the params-aware forward (pointwise: per-element).
+        const double eps = 1e-6;
+        for (int i = 0; i < n; i++)
+        {
+            var xp = (double[])x.Clone(); xp[i] += eps;
+            var xm = (double[])x.Clone(); xm[i] -= eps;
+            var fp = handler.Apply(engine, new Tensor<double>(xp, new[] { n }), p).AsSpan();
+            var fm = handler.Apply(engine, new Tensor<double>(xm, new[] { n }), p).AsSpan();
+            double numerical = g[i] * (fp[i] - fm[i]) / (2.0 * eps);
+            Assert.True(Math.Abs(analytic[i] - numerical) < 2e-3,
+                $"{act} params-aware backward[{i}] {analytic[i]:E4} != finite-diff {numerical:E4}");
+        }
+
+        // And it must DIFFER from the default-params backward on the negative region
+        // (where the slope/alpha applies), proving the parameter took effect.
+        var defaultGrad = handler.ApplyBackward(engine, gT, xT).AsSpan().ToArray();
+        double maxDiff = 0;
+        for (int i = 0; i < n; i++) maxDiff = Math.Max(maxDiff, Math.Abs(analytic[i] - defaultGrad[i]));
+        Assert.True(maxDiff > 1e-6,
+            $"{act}: params-aware backward identical to default — FusedActivationParams not honored.");
+    }
+
     private static double[] MakeSafeInput(int n, int seed)
     {
         var rng = new Random(seed);
