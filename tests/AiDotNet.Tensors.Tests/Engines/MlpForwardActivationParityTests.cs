@@ -33,6 +33,13 @@ public class MlpForwardActivationParityTests
         FusedActivationType.HardTanh => Math.Max(-1.0, Math.Min(1.0, x)),
         FusedActivationType.ReLU6 => Math.Max(0.0, Math.Min(6.0, x)),
         FusedActivationType.SoftSign => x / (1.0 + Math.Abs(x)),
+        FusedActivationType.Sign => x < 0 ? -1.0 : (x > 0 ? 1.0 : 0.0),
+        FusedActivationType.BentIdentity => 0.5 * (Math.Sqrt(x * x + 1.0) - 1.0) + x,
+        FusedActivationType.Gaussian => Math.Exp(-x * x),
+        FusedActivationType.LiSHT => x * Math.Tanh(x),
+        FusedActivationType.ISRU => x / Math.Sqrt(1.0 + x * x),        // alpha=1 default
+        FusedActivationType.SQRBF => Math.Exp(-x * x),                  // beta=1 default
+        FusedActivationType.BinarySpiking => x >= 1.0 ? 1.0 : 0.0,      // threshold=1 default
         _ => throw new ArgumentOutOfRangeException(nameof(act)),
     };
 
@@ -46,6 +53,13 @@ public class MlpForwardActivationParityTests
     [InlineData(FusedActivationType.HardTanh)]
     [InlineData(FusedActivationType.ReLU6)]
     [InlineData(FusedActivationType.SoftSign)]
+    [InlineData(FusedActivationType.Sign)]
+    [InlineData(FusedActivationType.BentIdentity)]
+    [InlineData(FusedActivationType.Gaussian)]
+    [InlineData(FusedActivationType.LiSHT)]
+    [InlineData(FusedActivationType.ISRU)]
+    [InlineData(FusedActivationType.SQRBF)]
+    [InlineData(FusedActivationType.BinarySpiking)]
     public void MlpForward_NewActivationFloat_MatchesCanonicalFormula(FusedActivationType act)
     {
         var engine = new CpuEngine();
@@ -84,6 +98,13 @@ public class MlpForwardActivationParityTests
     [InlineData(FusedActivationType.HardTanh)]
     [InlineData(FusedActivationType.ReLU6)]
     [InlineData(FusedActivationType.SoftSign)]
+    [InlineData(FusedActivationType.Sign)]
+    [InlineData(FusedActivationType.BentIdentity)]
+    [InlineData(FusedActivationType.Gaussian)]
+    [InlineData(FusedActivationType.LiSHT)]
+    [InlineData(FusedActivationType.ISRU)]
+    [InlineData(FusedActivationType.SQRBF)]
+    [InlineData(FusedActivationType.BinarySpiking)]
     public void MlpForward_NewActivationDouble_MatchesCanonicalFormula(FusedActivationType act)
     {
         var engine = new CpuEngine();
@@ -244,6 +265,112 @@ public class MlpForwardActivationParityTests
                 rowSum += actual;
             }
             Assert.True(Math.Abs(rowSum - 1.0) < 1e-4, $"{act} row {i} does not sum to 1 ({rowSum}).");
+        }
+    }
+
+    /// <summary>Independent reference for the remaining row-wise activations.</summary>
+    private static double[] RowwiseRef(FusedActivationType act, double[] r)
+    {
+        int n = r.Length; var y = new double[n];
+        switch (act)
+        {
+            case FusedActivationType.LogSoftmax:
+            {
+                double mx = double.NegativeInfinity; foreach (var v in r) if (v > mx) mx = v;
+                double s = 0; foreach (var v in r) s += Math.Exp(v - mx);
+                double lse = mx + Math.Log(s);
+                for (int j = 0; j < n; j++) y[j] = r[j] - lse;
+                break;
+            }
+            case FusedActivationType.LogSoftmin:
+            {
+                double mx = double.NegativeInfinity; foreach (var v in r) if (-v > mx) mx = -v;
+                double s = 0; foreach (var v in r) s += Math.Exp(-v - mx);
+                double lse = mx + Math.Log(s);
+                for (int j = 0; j < n; j++) y[j] = -r[j] - lse;
+                break;
+            }
+            case FusedActivationType.SphericalSoftmax:
+            {
+                double ss = 0; foreach (var v in r) ss += v * v; double norm = Math.Sqrt(ss);
+                double s = 0; var e = new double[n];
+                for (int j = 0; j < n; j++) { e[j] = Math.Exp(r[j] / norm); s += e[j]; }
+                for (int j = 0; j < n; j++) y[j] = e[j] / s;
+                break;
+            }
+            case FusedActivationType.TaylorSoftmax:
+            {
+                double s = 0; var t = new double[n];
+                for (int j = 0; j < n; j++) { t[j] = 1 + r[j] + 0.5 * r[j] * r[j]; s += t[j]; }
+                for (int j = 0; j < n; j++) y[j] = t[j] / s;
+                break;
+            }
+            case FusedActivationType.GumbelSoftmax: // tau=1 ⇒ softmax(x)
+            {
+                double mx = double.NegativeInfinity; foreach (var v in r) if (v > mx) mx = v;
+                double s = 0; var e = new double[n];
+                for (int j = 0; j < n; j++) { e[j] = Math.Exp(r[j] - mx); s += e[j]; }
+                for (int j = 0; j < n; j++) y[j] = e[j] / s;
+                break;
+            }
+            case FusedActivationType.Squash:
+            {
+                double ss = 0; foreach (var v in r) ss += v * v; double norm = Math.Sqrt(ss);
+                double k = norm > 0 ? (ss / (1 + ss)) / norm : 0;
+                for (int j = 0; j < n; j++) y[j] = r[j] * k;
+                break;
+            }
+            case FusedActivationType.Sparsemax:
+            {
+                var z = (double[])r.Clone(); Array.Sort(z); Array.Reverse(z); // descending
+                double cum = 0; int k = 1; double cumK = 0;
+                for (int i = 0; i < n; i++) { cum += z[i]; if (1 + (i + 1) * z[i] > cum) { k = i + 1; cumK = cum; } }
+                double tau = (cumK - 1) / k;
+                for (int j = 0; j < n; j++) y[j] = Math.Max(0, r[j] - tau);
+                break;
+            }
+            default: throw new ArgumentOutOfRangeException(nameof(act));
+        }
+        return y;
+    }
+
+    [Theory]
+    [InlineData(FusedActivationType.LogSoftmax)]
+    [InlineData(FusedActivationType.LogSoftmin)]
+    [InlineData(FusedActivationType.SphericalSoftmax)]
+    [InlineData(FusedActivationType.TaylorSoftmax)]
+    [InlineData(FusedActivationType.GumbelSoftmax)]
+    [InlineData(FusedActivationType.Sparsemax)]
+    [InlineData(FusedActivationType.Squash)]
+    public void MlpForward_RowwiseActivation_MatchesReference(FusedActivationType act)
+    {
+        var engine = new CpuEngine();
+        const int batch = 4, inF = 16, outF = 8;
+        var rng = new Random(20260604);
+        var wData = new float[inF * outF];
+        for (int i = 0; i < wData.Length; i++) wData[i] = (float)(rng.NextDouble() * 2.0 - 1.0);
+        var w = new Tensor<float>(wData, new[] { inF, outF });
+        var xData = new float[batch * inF];
+        for (int i = 0; i < xData.Length; i++) xData[i] = (float)(rng.NextDouble() * 4.0 - 2.0);
+        var x = new Tensor<float>(xData, new[] { batch, inF });
+
+        var weights = new System.Collections.Generic.List<Tensor<float>> { w };
+        var noBias = new System.Collections.Generic.List<Tensor<float>?> { null };
+
+        var raw = engine.MlpForward(x, weights, noBias, FusedActivationType.None, FusedActivationType.None);
+        var fused = engine.MlpForward(x, weights, noBias, FusedActivationType.None, act);
+
+        for (int i = 0; i < batch; i++)
+        {
+            var rowRaw = new double[outF];
+            for (int j = 0; j < outF; j++) rowRaw[j] = Convert.ToDouble(raw[i * outF + j]);
+            var expected = RowwiseRef(act, rowRaw);
+            for (int j = 0; j < outF; j++)
+            {
+                double actual = Convert.ToDouble(fused[i * outF + j]);
+                Assert.True(Math.Abs(expected[j] - actual) < 1e-4,
+                    $"{act} row {i} col {j}: {actual} != {expected[j]}.");
+            }
         }
     }
 }

@@ -17,13 +17,21 @@ internal static class ActivationEpilogue
         if (typeof(T) == typeof(double))
         {
             var cd = MemoryMarshal.Cast<T, double>(c);
-            ApplyFp64(cd, ldc, m, n, activation, p);
+            // Channel/row-wise (PReLU, softmax family, Sparsemax, Squash, …) via the
+            // shared helper so this path matches CpuFusedOperations exactly.
+            if (AiDotNet.Tensors.Helpers.RowwiseFusedActivations.Handles(activation))
+                AiDotNet.Tensors.Helpers.RowwiseFusedActivations.ApplyDouble(cd, ldc, m, n, activation, p);
+            else
+                ApplyFp64(cd, ldc, m, n, activation, p);
             return;
         }
         if (typeof(T) == typeof(float))
         {
             var cf = MemoryMarshal.Cast<T, float>(c);
-            ApplyFp32(cf, ldc, m, n, activation, p);
+            if (AiDotNet.Tensors.Helpers.RowwiseFusedActivations.Handles(activation))
+                AiDotNet.Tensors.Helpers.RowwiseFusedActivations.ApplyFloat(cf, ldc, m, n, activation, p);
+            else
+                ApplyFp32(cf, ldc, m, n, activation, p);
             return;
         }
         throw new NotSupportedException($"ActivationEpilogue does not support T={typeof(T).Name}.");
@@ -199,49 +207,20 @@ internal static class ActivationEpilogue
                         c[i * ldc + j] = x / (1.0 + Math.Abs(x));
                     }
                 break;
-            case FusedActivationType.RReLU:
-            {
-                double a = p?.Alpha ?? 0.22916667; // deterministic eval slope
-                for (int i = 0; i < m; i++)
-                    for (int j = 0; j < n; j++)
-                    {
-                        double x = c[i * ldc + j];
-                        c[i * ldc + j] = x > 0 ? x : a * x;
-                    }
-                break;
-            }
-            case FusedActivationType.PReLU:
-            {
-                var slope = p?.PReluSlope;
-                for (int i = 0; i < m; i++)
-                    for (int j = 0; j < n; j++)
-                    {
-                        double s = slope == null ? 0.25 : (slope.Length == 1 ? slope[0] : slope[j]);
-                        double x = c[i * ldc + j];
-                        c[i * ldc + j] = x > 0 ? x : s * x;
-                    }
-                break;
-            }
-            case FusedActivationType.Softmax:
-            case FusedActivationType.Softmin:
-            {
-                bool min = activation == FusedActivationType.Softmin;
-                for (int i = 0; i < m; i++)
-                {
-                    int row = i * ldc;
-                    double mx = double.NegativeInfinity;
-                    for (int j = 0; j < n; j++) { double v = min ? -c[row + j] : c[row + j]; if (v > mx) mx = v; }
-                    double sum = 0.0;
-                    for (int j = 0; j < n; j++) { double v = min ? -c[row + j] : c[row + j]; double e = Math.Exp(v - mx); c[row + j] = e; sum += e; }
-                    double inv = 1.0 / sum;
-                    for (int j = 0; j < n; j++) c[row + j] *= inv;
-                }
-                break;
-            }
             case FusedActivationType.None:
                 break;
             default:
-                throw new NotSupportedException($"ActivationEpilogue: {activation} not yet implemented.");
+            {
+                // Any other pointwise activation (RReLU, Sign, BentIdentity, Gaussian,
+                // LiSHT, ISRU, SQRBF, BinarySpiking, …) — resolve the scalar map once
+                // from the shared registry. Row/channel-wise types never reach here
+                // (intercepted in Apply<T> via RowwiseFusedActivations).
+                var fn = Helpers.CpuFusedOperations.GetDoubleActivation(activation, p);
+                for (int i = 0; i < m; i++)
+                    for (int j = 0; j < n; j++)
+                        c[i * ldc + j] = fn(c[i * ldc + j]);
+                break;
+            }
         }
     }
 
@@ -408,49 +387,18 @@ internal static class ActivationEpilogue
                         c[i * ldc + j] = x / (1f + Math.Abs(x));
                     }
                 break;
-            case FusedActivationType.RReLU:
-            {
-                float a = p?.Alpha ?? 0.22916667f;
-                for (int i = 0; i < m; i++)
-                    for (int j = 0; j < n; j++)
-                    {
-                        float x = c[i * ldc + j];
-                        c[i * ldc + j] = x > 0 ? x : a * x;
-                    }
-                break;
-            }
-            case FusedActivationType.PReLU:
-            {
-                var slope = p?.PReluSlope;
-                for (int i = 0; i < m; i++)
-                    for (int j = 0; j < n; j++)
-                    {
-                        float s = slope == null ? 0.25f : (slope.Length == 1 ? slope[0] : slope[j]);
-                        float x = c[i * ldc + j];
-                        c[i * ldc + j] = x > 0 ? x : s * x;
-                    }
-                break;
-            }
-            case FusedActivationType.Softmax:
-            case FusedActivationType.Softmin:
-            {
-                bool min = activation == FusedActivationType.Softmin;
-                for (int i = 0; i < m; i++)
-                {
-                    int row = i * ldc;
-                    float mx = float.NegativeInfinity;
-                    for (int j = 0; j < n; j++) { float v = min ? -c[row + j] : c[row + j]; if (v > mx) mx = v; }
-                    float sum = 0f;
-                    for (int j = 0; j < n; j++) { float v = min ? -c[row + j] : c[row + j]; float e = (float)Math.Exp(v - mx); c[row + j] = e; sum += e; }
-                    float inv = 1f / sum;
-                    for (int j = 0; j < n; j++) c[row + j] *= inv;
-                }
-                break;
-            }
             case FusedActivationType.None:
                 break;
             default:
-                throw new NotSupportedException($"ActivationEpilogue: {activation} not yet implemented.");
+            {
+                // Other pointwise activations resolved from the shared registry
+                // (row/channel-wise types are intercepted in Apply<T>).
+                var fn = Helpers.CpuFusedOperations.GetFloatActivation(activation, p);
+                for (int i = 0; i < m; i++)
+                    for (int j = 0; j < n; j++)
+                        c[i * ldc + j] = fn(c[i * ldc + j]);
+                break;
+            }
         }
     }
 }

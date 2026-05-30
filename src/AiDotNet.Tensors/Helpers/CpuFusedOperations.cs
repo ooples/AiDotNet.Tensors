@@ -563,42 +563,15 @@ public static class CpuFusedOperations
         if (!hasBias && !hasActivation) return;
 
         // PReLU / Softmax / Softmin need per-column or per-row context (not a
-        // pointwise scalar), so they get a dedicated bias-then-activation pass.
-        if (activation is FusedActivationType.PReLU or FusedActivationType.Softmax or FusedActivationType.Softmin)
+        // pointwise scalar), so they get a dedicated bias-then-activation pass
+        // via the shared RowwiseFusedActivations (also used by the BlasManaged epilogue).
+        if (RowwiseFusedActivations.Handles(activation))
         {
             if (hasBias)
                 for (int i = 0; i < M; i++)
                     for (int j = 0; j < N; j++)
                         output[i * N + j] += bias![j];
-
-            if (activation == FusedActivationType.PReLU)
-            {
-                var slope = activationParams?.PReluSlope;
-                for (int i = 0; i < M; i++)
-                {
-                    int row = i * N;
-                    for (int j = 0; j < N; j++)
-                    {
-                        float s = slope == null ? 0.25f : (slope.Length == 1 ? slope[0] : slope[j]);
-                        float v = output[row + j];
-                        output[row + j] = v > 0f ? v : s * v;
-                    }
-                }
-            }
-            else
-            {
-                bool min = activation == FusedActivationType.Softmin; // softmax over -x
-                for (int i = 0; i < M; i++)
-                {
-                    int row = i * N;
-                    float mx = float.NegativeInfinity;
-                    for (int j = 0; j < N; j++) { float v = min ? -output[row + j] : output[row + j]; if (v > mx) mx = v; }
-                    float sum = 0f;
-                    for (int j = 0; j < N; j++) { float v = min ? -output[row + j] : output[row + j]; float e = MathF.Exp(v - mx); output[row + j] = e; sum += e; }
-                    float inv = 1f / sum;
-                    for (int j = 0; j < N; j++) output[row + j] *= inv;
-                }
-            }
+            RowwiseFusedActivations.ApplyFloat(output, N, M, N, activation, activationParams);
             return;
         }
 
@@ -1323,6 +1296,29 @@ public static class CpuFusedOperations
                 float a = p?.Alpha ?? 1f, b = p?.Beta ?? 1f;
                 return x => a * MathF.Tanh(b * x);
             }
+            case FusedActivationType.Sign:
+                return x => x < 0f ? -1f : (x > 0f ? 1f : 0f);
+            case FusedActivationType.BentIdentity:
+                return x => 0.5f * (MathF.Sqrt(x * x + 1f) - 1f) + x;
+            case FusedActivationType.Gaussian:
+                return x => MathF.Exp(-x * x);
+            case FusedActivationType.LiSHT:
+                return x => x * MathF.Tanh(x); // tanh is bounded ⇒ no overflow; → |x| for large |x|
+            case FusedActivationType.ISRU:
+            {
+                float a = p?.Alpha ?? 1f;
+                return x => x / MathF.Sqrt(1f + a * x * x);
+            }
+            case FusedActivationType.SQRBF:
+            {
+                float b = p?.Beta ?? 1f;
+                return x => MathF.Exp(-b * x * x);
+            }
+            case FusedActivationType.BinarySpiking:
+            {
+                float t = p?.Theta ?? 1f;
+                return x => x >= t ? 1f : 0f;
+            }
         }
         if (_floatActivations.TryGetValue(activation, out var fn))
             return fn;
@@ -1431,42 +1427,15 @@ public static class CpuFusedOperations
         bool hasActivation = activation != FusedActivationType.None;
         if (!hasBias && !hasActivation) return;
 
-        // PReLU / Softmax / Softmin: per-column / per-row, not pointwise.
-        if (activation is FusedActivationType.PReLU or FusedActivationType.Softmax or FusedActivationType.Softmin)
+        // Channel/row-wise activations (PReLU, the softmax family, Sparsemax,
+        // Squash, …) via the shared RowwiseFusedActivations.
+        if (RowwiseFusedActivations.Handles(activation))
         {
             if (hasBias)
                 for (int i = 0; i < M; i++)
                     for (int j = 0; j < N; j++)
                         output[i * N + j] += bias![j];
-
-            if (activation == FusedActivationType.PReLU)
-            {
-                var slope = activationParams?.PReluSlope;
-                for (int i = 0; i < M; i++)
-                {
-                    int row = i * N;
-                    for (int j = 0; j < N; j++)
-                    {
-                        double s = slope == null ? 0.25 : (slope.Length == 1 ? slope[0] : slope[j]);
-                        double v = output[row + j];
-                        output[row + j] = v > 0.0 ? v : s * v;
-                    }
-                }
-            }
-            else
-            {
-                bool min = activation == FusedActivationType.Softmin;
-                for (int i = 0; i < M; i++)
-                {
-                    int row = i * N;
-                    double mx = double.NegativeInfinity;
-                    for (int j = 0; j < N; j++) { double v = min ? -output[row + j] : output[row + j]; if (v > mx) mx = v; }
-                    double sum = 0.0;
-                    for (int j = 0; j < N; j++) { double v = min ? -output[row + j] : output[row + j]; double e = Math.Exp(v - mx); output[row + j] = e; sum += e; }
-                    double inv = 1.0 / sum;
-                    for (int j = 0; j < N; j++) output[row + j] *= inv;
-                }
-            }
+            RowwiseFusedActivations.ApplyDouble(output, N, M, N, activation, activationParams);
             return;
         }
 
@@ -1538,6 +1507,29 @@ public static class CpuFusedOperations
             {
                 double a = p?.Alpha ?? 1f, b = p?.Beta ?? 1f;
                 return x => a * Math.Tanh(b * x);
+            }
+            case FusedActivationType.Sign:
+                return x => x < 0.0 ? -1.0 : (x > 0.0 ? 1.0 : 0.0);
+            case FusedActivationType.BentIdentity:
+                return x => 0.5 * (Math.Sqrt(x * x + 1.0) - 1.0) + x;
+            case FusedActivationType.Gaussian:
+                return x => Math.Exp(-x * x);
+            case FusedActivationType.LiSHT:
+                return x => x * Math.Tanh(x);
+            case FusedActivationType.ISRU:
+            {
+                double a = p?.Alpha ?? 1f;
+                return x => x / Math.Sqrt(1.0 + a * x * x);
+            }
+            case FusedActivationType.SQRBF:
+            {
+                double b = p?.Beta ?? 1f;
+                return x => Math.Exp(-b * x * x);
+            }
+            case FusedActivationType.BinarySpiking:
+            {
+                double t = p?.Theta ?? 1f;
+                return x => x >= t ? 1.0 : 0.0;
             }
         }
         if (_doubleActivations.TryGetValue(activation, out var fn))
