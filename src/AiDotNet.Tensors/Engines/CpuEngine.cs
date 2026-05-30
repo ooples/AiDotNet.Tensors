@@ -13725,7 +13725,6 @@ public partial class CpuEngine : ITensorLevelEngine
                 var kcPool = System.Buffers.ArrayPool<float>.Shared;
                 var gradOutAll = kcPool.Rent(outChannels * batchColW);
                 var im2colAll = kcPool.Rent(colH * batchColW);
-                var im2colTmp = kcPool.Rent(colH * colW);
                 try
                 {
                     for (int b = 0; b < batch; b++)
@@ -13735,14 +13734,14 @@ public partial class CpuEngine : ITensorLevelEngine
                             Array.Copy(gradOutputF, gradOutOff + oc * colW,
                                        gradOutAll, oc * batchColW + b * colW, colW);
 
-                        Im2ColHelper.Im2Col(
+                        // #403 Phase E: im2col directly into batch b's column block
+                        // (no per-batch temp + strided row-copies).
+                        Im2ColHelper.Im2ColStridedSingle(
                             new ReadOnlySpan<float>(inputF, b * inputSliceSize, inputSliceSize),
-                            new Span<float>(im2colTmp, 0, colH * colW),
-                            1, inChannels, height, width,
-                            kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW);
-                        for (int ch = 0; ch < colH; ch++)
-                            Array.Copy(im2colTmp, ch * colW,
-                                       im2colAll, ch * batchColW + b * colW, colW);
+                            new Span<float>(im2colAll, 0, colH * batchColW), batchColW, b * colW,
+                            inChannels, height, width,
+                            kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW,
+                            outputHeight, outputWidth);
                     }
 
                     // gradKernel = gradOutAll @ im2colAll^T — one full-width GEMM.
@@ -13770,7 +13769,6 @@ public partial class CpuEngine : ITensorLevelEngine
                 {
                     kcPool.Return(gradOutAll);
                     kcPool.Return(im2colAll);
-                    kcPool.Return(im2colTmp);
                 }
             }
 
@@ -13962,7 +13960,6 @@ public partial class CpuEngine : ITensorLevelEngine
                 var kcPool = System.Buffers.ArrayPool<double>.Shared;
                 var gradOutAll = kcPool.Rent(outChannels * batchColW);
                 var im2colAll = kcPool.Rent(colH * batchColW);
-                var im2colTmp = kcPool.Rent(colH * colW);
                 try
                 {
                     for (int b = 0; b < batch; b++)
@@ -13973,15 +13970,16 @@ public partial class CpuEngine : ITensorLevelEngine
                             Array.Copy(gradOutputD, gradOutOff + oc * colW,
                                        gradOutAll, oc * batchColW + b * colW, colW);
 
-                        // im2colAll[ch, b·colW + n] = im2col(input[b])[ch, n]
-                        Helpers.Im2ColHelper.Im2Col(
+                        // #403 Phase E: im2col(input[b]) DIRECTLY into batch b's
+                        // column block of im2colAll (row stride batchColW, col
+                        // offset b·colW) — no per-batch temp buffer + no ~colH
+                        // strided row-copies.
+                        Helpers.Im2ColHelper.Im2ColStridedSingle(
                             new ReadOnlySpan<double>(inputD, b * inputSliceSize, inputSliceSize),
-                            new Span<double>(im2colTmp, 0, colH * colW),
-                            1, inChannels, height, width,
-                            kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW);
-                        for (int ch = 0; ch < colH; ch++)
-                            Array.Copy(im2colTmp, ch * colW,
-                                       im2colAll, ch * batchColW + b * colW, colW);
+                            new Span<double>(im2colAll, 0, colH * batchColW), batchColW, b * colW,
+                            inChannels, height, width,
+                            kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW,
+                            outputHeight, outputWidth);
                     }
 
                     // gradKernel = gradOutAll @ im2colAll^T — one full-width GEMM.
@@ -14002,7 +14000,6 @@ public partial class CpuEngine : ITensorLevelEngine
                 {
                     kcPool.Return(gradOutAll);
                     kcPool.Return(im2colAll);
-                    kcPool.Return(im2colTmp);
                 }
             }
 

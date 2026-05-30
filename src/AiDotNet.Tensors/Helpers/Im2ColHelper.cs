@@ -719,6 +719,185 @@ internal static class Im2ColHelper
         }
     }
 
+    /// <summary>
+    /// #403 Phase E: strided-destination im2col for a single image (double).
+    /// Writes each of the colH rows at <c>output[row * colRowStride + colColOffset + col]</c>
+    /// instead of the contiguous <c>[colH, colW]</c> layout. Lets the K-concatenated
+    /// Conv2DBackwardKernel path im2col each batch DIRECTLY into its column block of
+    /// a shared <c>[colH, batch*colW]</c> buffer (colRowStride = batch*colW,
+    /// colColOffset = b*colW) — eliminating the per-batch temp buffer + the ~colH
+    /// strided row-copies that the stacking otherwise pays. With
+    /// <c>colRowStride = colW, colColOffset = 0</c> this matches the contiguous
+    /// <see cref="Im2ColSingleImageDouble"/>.
+    /// </summary>
+    public static unsafe void Im2ColStridedSingle(
+        ReadOnlySpan<double> input,
+        Span<double> output, int colRowStride, int colColOffset,
+        int channels, int height, int width,
+        int kernelH, int kernelW,
+        int strideH, int strideW,
+        int padH, int padW,
+        int dilationH, int dilationW,
+        int outputH, int outputW)
+    {
+        int colW = outputH * outputW;
+        fixed (double* inputPtr = input)
+        fixed (double* outputPtr = output)
+        {
+            if (strideH == 1 && strideW == 1 && dilationH == 1 && dilationW == 1)
+            {
+                int rowIdx = 0;
+                for (int c = 0; c < channels; c++)
+                {
+                    int channelOffset = c * height * width;
+                    for (int kh = 0; kh < kernelH; kh++)
+                    {
+                        int ohStart = Math.Max(0, padH - kh);
+                        int ohEnd = Math.Min(outputH, height + padH - kh);
+                        for (int kw = 0; kw < kernelW; kw++)
+                        {
+                            double* outRow = outputPtr + rowIdx * colRowStride + colColOffset;
+                            new Span<double>(outRow, colW).Clear(); // padding zeros for this row block
+
+                            int owStart = Math.Max(0, padW - kw);
+                            int owEnd = Math.Min(outputW, width + padW - kw);
+                            int validWidth = owEnd - owStart;
+                            if (validWidth > 0 && ohEnd > ohStart)
+                            {
+                                for (int oh = ohStart; oh < ohEnd; oh++)
+                                {
+                                    int ih = oh + kh - padH;
+                                    int inputStart = channelOffset + ih * width + (owStart + kw - padW);
+                                    int outputStart = oh * outputW + owStart;
+                                    Buffer.MemoryCopy(
+                                        inputPtr + inputStart,
+                                        outRow + outputStart,
+                                        validWidth * sizeof(double),
+                                        validWidth * sizeof(double));
+                                }
+                            }
+                            rowIdx++;
+                        }
+                    }
+                }
+            }
+            else
+            {
+                int rowIdx = 0;
+                for (int c = 0; c < channels; c++)
+                {
+                    int channelOffset = c * height * width;
+                    for (int kh = 0; kh < kernelH; kh++)
+                    {
+                        for (int kw = 0; kw < kernelW; kw++)
+                        {
+                            double* outRow = outputPtr + rowIdx * colRowStride + colColOffset;
+                            int colIdx = 0;
+                            for (int oh = 0; oh < outputH; oh++)
+                            {
+                                int ih = oh * strideH + kh * dilationH - padH;
+                                for (int ow = 0; ow < outputW; ow++)
+                                {
+                                    int iw = ow * strideW + kw * dilationW - padW;
+                                    double val = 0.0;
+                                    if (ih >= 0 && ih < height && iw >= 0 && iw < width)
+                                        val = inputPtr[channelOffset + ih * width + iw];
+                                    outRow[colIdx++] = val;
+                                }
+                            }
+                            rowIdx++;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// <summary>Strided-destination im2col for a single image (float). Float
+    /// counterpart of <see cref="Im2ColStridedSingle(ReadOnlySpan{double}, Span{double}, int, int, int, int, int, int, int, int, int, int, int, int, int, int)"/>.</summary>
+    public static unsafe void Im2ColStridedSingle(
+        ReadOnlySpan<float> input,
+        Span<float> output, int colRowStride, int colColOffset,
+        int channels, int height, int width,
+        int kernelH, int kernelW,
+        int strideH, int strideW,
+        int padH, int padW,
+        int dilationH, int dilationW,
+        int outputH, int outputW)
+    {
+        int colW = outputH * outputW;
+        fixed (float* inputPtr = input)
+        fixed (float* outputPtr = output)
+        {
+            if (strideH == 1 && strideW == 1 && dilationH == 1 && dilationW == 1)
+            {
+                int rowIdx = 0;
+                for (int c = 0; c < channels; c++)
+                {
+                    int channelOffset = c * height * width;
+                    for (int kh = 0; kh < kernelH; kh++)
+                    {
+                        int ohStart = Math.Max(0, padH - kh);
+                        int ohEnd = Math.Min(outputH, height + padH - kh);
+                        for (int kw = 0; kw < kernelW; kw++)
+                        {
+                            float* outRow = outputPtr + rowIdx * colRowStride + colColOffset;
+                            new Span<float>(outRow, colW).Clear();
+
+                            int owStart = Math.Max(0, padW - kw);
+                            int owEnd = Math.Min(outputW, width + padW - kw);
+                            int validWidth = owEnd - owStart;
+                            if (validWidth > 0 && ohEnd > ohStart)
+                            {
+                                for (int oh = ohStart; oh < ohEnd; oh++)
+                                {
+                                    int ih = oh + kh - padH;
+                                    int inputStart = channelOffset + ih * width + (owStart + kw - padW);
+                                    int outputStart = oh * outputW + owStart;
+                                    Buffer.MemoryCopy(
+                                        inputPtr + inputStart,
+                                        outRow + outputStart,
+                                        validWidth * sizeof(float),
+                                        validWidth * sizeof(float));
+                                }
+                            }
+                            rowIdx++;
+                        }
+                    }
+                }
+            }
+            else
+            {
+                int rowIdx = 0;
+                for (int c = 0; c < channels; c++)
+                {
+                    int channelOffset = c * height * width;
+                    for (int kh = 0; kh < kernelH; kh++)
+                    {
+                        for (int kw = 0; kw < kernelW; kw++)
+                        {
+                            float* outRow = outputPtr + rowIdx * colRowStride + colColOffset;
+                            int colIdx = 0;
+                            for (int oh = 0; oh < outputH; oh++)
+                            {
+                                int ih = oh * strideH + kh * dilationH - padH;
+                                for (int ow = 0; ow < outputW; ow++)
+                                {
+                                    int iw = ow * strideW + kw * dilationW - padW;
+                                    float val = 0.0f;
+                                    if (ih >= 0 && ih < height && iw >= 0 && iw < width)
+                                        val = inputPtr[channelOffset + ih * width + iw];
+                                    outRow[colIdx++] = val;
+                                }
+                            }
+                            rowIdx++;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     private static unsafe void Im2ColSingleImageDouble(
         ReadOnlySpan<double> input,
         Span<double> output,
