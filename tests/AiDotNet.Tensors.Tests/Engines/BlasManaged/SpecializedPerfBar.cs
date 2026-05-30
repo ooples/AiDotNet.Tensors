@@ -29,4 +29,11 @@ public static class SpecializedPerfBar
 
     /// <summary>True once the owner has frozen the SYMM bar (non-zero win rate).</summary>
     public static bool SymmBarFrozen => SymmMinWinRatePercent > 0;
+
+    // SpMM vs MKL Sparse BLAS mkl_sparse_*_mm (else vs the naive managed loop floor).
+    public const int    SpMMMinWinRatePercent = 0;     // TO BE SET after first bench
+    public const double SpMMMaxLossMultiple    = 99.0; // TO BE SET after first bench
+
+    /// <summary>True once the owner has frozen the SpMM bar (non-zero win rate).</summary>
+    public static bool SpMMBarFrozen => SpMMMinWinRatePercent > 0;
 }

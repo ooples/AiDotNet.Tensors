@@ -37,4 +37,18 @@ public static class SpecializedShapeCatalog
         new("Sym_Right_128x512", Side.Right, Uplo.Upper, 128, 512, true, 12, "workload:optimization"),
         new("Sym_FP32_256x256",  Side.Left, Uplo.Lower, 256, 256, false, 10, "workload:optimization-fp32"),
     };
+
+    // SpMM: sparse A (rows×cols, given density) × dense B (cols×N). DensityPercent
+    // is nnz / (rows·cols) × 100.
+    public record SpMMShape(string Name, bool Csr, int Rows, int Cols, int N, double DensityPercent,
+        bool Fp64, int Frequency, string Source);
+
+    public static readonly SpMMShape[] SpMM =
+    {
+        new("GNN_Cora_2708x2708x64",   true, 2708, 2708,  64, 0.18, true, 30, "workload:gnn-cora"),
+        new("GNN_PubMed_19717x500x128",true, 19717, 500, 128, 0.10, true, 20, "workload:gnn-pubmed"),
+        new("RecSys_10000x10000x32",   true, 10000,10000, 32, 0.05, true, 15, "workload:recsys"),
+        new("Dense_ish_512x512x64",    true, 512,  512,  64, 5.0,  true, 10, "workload:spmm-stress"),
+        new("GNN_FP32_2708x2708x64",   true, 2708, 2708,  64, 0.18, false,12, "workload:gnn-cora-fp32"),
+    };
 }
