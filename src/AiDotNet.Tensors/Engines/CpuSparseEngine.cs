@@ -142,6 +142,14 @@ public sealed class CpuSparseEngine : ISparseEngine
         var colIndices = csr.ColumnIndices;
         var values = csr.Values;
 
+        // #379 NOTE: the managed BlasManaged.SpMM<T> kernel (cache-friendly,
+        // deterministic CSR/CSC) is the intended replacement for this triple loop,
+        // but it constrains T : unmanaged and ISparseEngine.SpMM<T> is unconstrained.
+        // Routing this call site requires either adding `where T : unmanaged` to the
+        // ISparseEngine interface (a public-API change) or a typed float/double
+        // dispatch with array casts. Tracked as a follow-up on the #379 branch; the
+        // kernel is in place and tested independently. The loop below is unchanged.
+        //
         // SpMM: C[i,k] = sum_j A[i,j] * B[j,k]
         for (int i = 0; i < sparse.Rows; i++)
         {
