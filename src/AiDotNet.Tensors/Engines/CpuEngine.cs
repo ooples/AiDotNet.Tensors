@@ -13586,6 +13586,68 @@ public partial class CpuEngine : ITensorLevelEngine
             var inputF = (float[])(object)input.GetFlattenedData();
             int inputSliceSize = inChannels * height * width;
 
+            // #403 Phase B: K-concatenated single GEMM for batch>1 (mirror of
+            // the FP64 branch below — see its comment for the rationale). The
+            // batch-parallel loop collapses the wide-N transposed GEMM to
+            // serial; stacking gradOutput + im2col along the K axis lets one
+            // full-width GEMM fold the cross-batch sum into its K reduction.
+            long kConcatElemsF = (long)colH * batch * colW;
+            const long MaxKConcatElemsF = 16L * 1024 * 1024; // 64 MB of floats
+            if (batch >= 2 && kConcatElemsF <= MaxKConcatElemsF)
+            {
+                int batchColW = batch * colW;
+                var kcPool = System.Buffers.ArrayPool<float>.Shared;
+                var gradOutAll = kcPool.Rent(outChannels * batchColW);
+                var im2colAll = kcPool.Rent(colH * batchColW);
+                var im2colTmp = kcPool.Rent(colH * colW);
+                try
+                {
+                    for (int b = 0; b < batch; b++)
+                    {
+                        int gradOutOff = b * outChannels * colW;
+                        for (int oc = 0; oc < outChannels; oc++)
+                            Array.Copy(gradOutputF, gradOutOff + oc * colW,
+                                       gradOutAll, oc * batchColW + b * colW, colW);
+
+                        Im2ColHelper.Im2Col(
+                            new ReadOnlySpan<float>(inputF, b * inputSliceSize, inputSliceSize),
+                            new Span<float>(im2colTmp, 0, colH * colW),
+                            1, inChannels, height, width,
+                            kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW);
+                        for (int ch = 0; ch < colH; ch++)
+                            Array.Copy(im2colTmp, ch * colW,
+                                       im2colAll, ch * batchColW + b * colW, colW);
+                    }
+
+                    // gradKernel = gradOutAll @ im2colAll^T — one full-width GEMM.
+                    if (!Helpers.BlasProvider.TryGemmEx(
+                        outChannels, colH, batchColW,
+                        gradOutAll, 0, batchColW, false,
+                        im2colAll, 0, batchColW, true,
+                        gradKernelF, 0, colH))
+                    {
+                        // Top-level (not in a parallel region) so the parallel
+                        // SimdGemm.Sgemm self-parallelizes at full width.
+                        Simd.SimdGemm.Sgemm(
+                            new ReadOnlySpan<float>(gradOutAll, 0, outChannels * batchColW), batchColW, false,
+                            new ReadOnlySpan<float>(im2colAll, 0, colH * batchColW), batchColW, true,
+                            new Span<float>(gradKernelF, 0, outChannels * colH),
+                            outChannels, batchColW, colH);
+                    }
+
+                    var opsKc = MathHelper.GetNumericOperations<T>();
+                    var resultKc = new T[gradKernelF.Length];
+                    opsKc.FromFloatSpan(new ReadOnlySpan<float>(gradKernelF), new Span<T>(resultKc));
+                    return TensorAllocator.Rent<T>(kernelShape, resultKc);
+                }
+                finally
+                {
+                    kcPool.Return(gradOutAll);
+                    kcPool.Return(im2colAll);
+                    kcPool.Return(im2colTmp);
+                }
+            }
+
             // Parallel across batches — each batch accumulates into a local gradKernel,
             // merged after. This avoids lock contention on the shared accumulator.
             var perBatchGrads = new float[batch][];
@@ -13748,6 +13810,75 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
             }
 #endif
+
+            // #403 Phase B: K-concatenated single GEMM for the batch>1 case.
+            // The per-batch path below parallelizes over `batch`; inside that
+            // parallel region the inner transposed GEMM (M=outC, N=colH — wide)
+            // collapses to serial, trading the GEMM's ~10× internal parallelism
+            // for a `batch`-way (often just 2) outer parallelism. #403 Phase A
+            // measured this as the dominant DCGAN<double> backward cost: 4.4ms
+            // in this wrapper vs a 0.43ms full-width bare GEMM at the same shape.
+            // Instead, stack the per-batch gradOutput and im2col along the GEMM
+            // K axis (k = b·colW + n) and issue ONE top-level GEMM that
+            // self-parallelizes at full width:
+            //   gradKernel[outC, colH] = gradOutAll[outC, batch·colW]
+            //                          @ im2colAll[colH, batch·colW]^T
+            // The cross-batch sum the merge loop did is now folded into the
+            // GEMM's K reduction (K = batch·colW). No per-batch staging, no
+            // merge pass. Gated on a memory bound so large-batch / large-spatial
+            // shapes (where the stacked buffer would be huge and batch-parallel
+            // already supplies enough outer tasks) keep the per-batch path below.
+            long kConcatElems = (long)colH * batch * colW;
+            const long MaxKConcatElems = 8L * 1024 * 1024; // 64 MB of doubles
+            if (batch >= 2 && kConcatElems <= MaxKConcatElems)
+            {
+                int batchColW = batch * colW;
+                var kcPool = System.Buffers.ArrayPool<double>.Shared;
+                var gradOutAll = kcPool.Rent(outChannels * batchColW);
+                var im2colAll = kcPool.Rent(colH * batchColW);
+                var im2colTmp = kcPool.Rent(colH * colW);
+                try
+                {
+                    for (int b = 0; b < batch; b++)
+                    {
+                        // gradOutAll[oc, b·colW + n] = gradOutput[b, oc, n]
+                        int gradOutOff = b * outChannels * colW;
+                        for (int oc = 0; oc < outChannels; oc++)
+                            Array.Copy(gradOutputD, gradOutOff + oc * colW,
+                                       gradOutAll, oc * batchColW + b * colW, colW);
+
+                        // im2colAll[ch, b·colW + n] = im2col(input[b])[ch, n]
+                        Helpers.Im2ColHelper.Im2Col(
+                            new ReadOnlySpan<double>(inputD, b * inputSliceSize, inputSliceSize),
+                            new Span<double>(im2colTmp, 0, colH * colW),
+                            1, inChannels, height, width,
+                            kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW);
+                        for (int ch = 0; ch < colH; ch++)
+                            Array.Copy(im2colTmp, ch * colW,
+                                       im2colAll, ch * batchColW + b * colW, colW);
+                    }
+
+                    // gradKernel = gradOutAll @ im2colAll^T — one full-width GEMM.
+                    if (Helpers.BlasProvider.TryGemmEx(
+                        outChannels, colH, batchColW,
+                        gradOutAll, 0, batchColW, false,
+                        im2colAll, 0, batchColW, true,
+                        gradKernelD, 0, colH))
+                    {
+                        return TensorAllocator.Rent<T>(kernelShape, (Vector<T>)(object)new Vector<double>(gradKernelD));
+                    }
+                    // BLAS declined (non-deterministic + no native BLAS): clear
+                    // the partial destination and fall through to the per-batch
+                    // path below, which carries its own SimdGemm fallback.
+                    Array.Clear(gradKernelD, 0, gradKernelD.Length);
+                }
+                finally
+                {
+                    kcPool.Return(gradOutAll);
+                    kcPool.Return(im2colAll);
+                    kcPool.Return(im2colTmp);
+                }
+            }
 
             // #415 Phase C: keep the per-batch localGrad buffers alive
             // across the parallel loop instead of copying into a fresh
