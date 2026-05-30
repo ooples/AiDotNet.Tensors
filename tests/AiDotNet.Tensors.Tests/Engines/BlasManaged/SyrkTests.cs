@@ -106,4 +106,26 @@ public class SyrkTests
             for (int j = 0; j <= i; j++)
                 Assert.Equal(expectedFull[i * n + j], actual[i * n + j], 3);
     }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Syrk_FP64_LargeN_BlockedPath_MatchesReference(bool trans)
+    {
+        const int n = 150, k = 40; // n > SyrkBlock(64)
+        var rng = new Random(2025);
+        int aRows = trans ? k : n, aCols = trans ? n : k, lda = aCols;
+        double[] a = new double[aRows * aCols];
+        for (int i = 0; i < a.Length; i++) a[i] = rng.NextDouble() * 2 - 1;
+        double[] c = new double[n * n];
+        for (int i = 0; i < c.Length; i++) c[i] = rng.NextDouble() * 2 - 1;
+
+        double alpha = 0.9, beta = 0.3;
+        double[] expectedFull = ReferenceSyrk(trans, n, k, alpha, a, lda, beta, c, n);
+        double[] actual = (double[])c.Clone();
+        BlasManagedLib.Syrk<double>(Uplo.Lower, trans, n, k, alpha, a, lda, beta, actual, n);
+        for (int i = 0; i < n; i++)
+            for (int j = 0; j <= i; j++)
+                Assert.Equal(expectedFull[i * n + j], actual[i * n + j], 8);
+    }
 }
