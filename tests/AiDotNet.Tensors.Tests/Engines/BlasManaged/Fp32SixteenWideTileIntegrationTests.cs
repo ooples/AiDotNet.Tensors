@@ -111,8 +111,8 @@ public class Fp32SixteenWideTileIntegrationTests
         }
 
         _out.WriteLine($"ForcePackBoth FP32 [M={M},N={N},K={K}] min over {measured}:");
-        _out.WriteLine($"  Deterministic 8×8 : {det8,7:F2} us   {flops / (det8 * 1e-3) / 1e9,6:F1} GF/s");
-        _out.WriteLine($"  Fast          6×16: {fast16,7:F2} us   {flops / (fast16 * 1e-3) / 1e9,6:F1} GF/s   ({det8 / fast16:F2}x vs 8×8)");
+        _out.WriteLine($"  Deterministic 8×8 : {det8,7:F2} us   {flops / (det8 * 1e-6) / 1e9,6:F1} GF/s");
+        _out.WriteLine($"  Fast          6×16: {fast16,7:F2} us   {flops / (fast16 * 1e-6) / 1e9,6:F1} GF/s   ({det8 / fast16:F2}x vs 8×8)");
 
         Assert.True(det8 > 0 && fast16 > 0);
     }
