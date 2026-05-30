@@ -185,6 +185,13 @@ class Program
             Console.WriteLine(profile.Format());
 
             Console.WriteLine();
+            var timing = DCGANStepProbe.RunWallClockProfile();
+            Console.WriteLine(timing.Format());
+
+            Console.WriteLine();
+            Console.WriteLine(DCGANStepProbe.RunBareGemmProbe());
+
+            Console.WriteLine();
             using (var shapes = new AiDotNet.Tensors.Helpers.ShapeInstrumenter())
             {
                 var probe = new DCGANStepProbe();

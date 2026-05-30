@@ -1239,6 +1239,7 @@ internal static class BlasProvider
                 new ReadOnlySpan<float>(b, bOffset, b.Length - bOffset), ldb, false,
                 new Span<float>(c, cOffset, c.Length - cOffset), ldc,
                 m, n, k);
+            LogShape(m, n, k);
             return true;
         }
         if (!_nativeAvailable.Value) return false;
@@ -1258,6 +1259,7 @@ internal static class BlasProvider
                 new ReadOnlySpan<float>(b, bOffset, b.Length - bOffset), ldb, false,
                 new Span<float>(c, cOffset, c.Length - cOffset), ldc,
                 m, n, k);
+            LogShape(m, n, k);
             return true;
         }
         try
@@ -1295,6 +1297,7 @@ internal static class BlasProvider
                 new ReadOnlySpan<double>(b, bOffset, b.Length - bOffset), ldb, false,
                 new Span<double>(c, cOffset, c.Length - cOffset), ldc,
                 m, n, k);
+            LogShape(m, n, k);
             return true;
         }
         if (!_nativeAvailable.Value) return false;
@@ -1306,6 +1309,7 @@ internal static class BlasProvider
                 new ReadOnlySpan<double>(b, bOffset, b.Length - bOffset), ldb, false,
                 new Span<double>(c, cOffset, c.Length - cOffset), ldc,
                 m, n, k);
+            LogShape(m, n, k);
             return true;
         }
         try
@@ -1337,6 +1341,7 @@ internal static class BlasProvider
         if (ShouldRouteManaged(m, n, k, false, false, typeof(float)))
         {
             Engines.BlasManaged.BlasManaged.Gemm<float>(a, lda, false, b, ldb, false, c, ldc, m, n, k);
+            LogShape(m, n, k);
             return true;
         }
         if (!_nativeAvailable.Value) return false;
@@ -1344,6 +1349,7 @@ internal static class BlasProvider
         if (!deterministic && !System.Threading.Monitor.TryEnter(_nativeGemmGate))
         {
             Engines.BlasManaged.BlasManaged.Gemm<float>(a, lda, false, b, ldb, false, c, ldc, m, n, k);
+            LogShape(m, n, k);
             return true;
         }
         try
@@ -1375,6 +1381,7 @@ internal static class BlasProvider
         if (ShouldRouteManaged(m, n, k, false, false, typeof(double)))
         {
             Engines.BlasManaged.BlasManaged.Gemm<double>(a, lda, false, b, ldb, false, c, ldc, m, n, k);
+            LogShape(m, n, k);
             return true;
         }
         if (!_nativeAvailable.Value) return false;
@@ -1382,6 +1389,7 @@ internal static class BlasProvider
         if (!deterministic && !System.Threading.Monitor.TryEnter(_nativeGemmGate))
         {
             Engines.BlasManaged.BlasManaged.Gemm<double>(a, lda, false, b, ldb, false, c, ldc, m, n, k);
+            LogShape(m, n, k);
             return true;
         }
         try
@@ -1470,6 +1478,7 @@ internal static class BlasProvider
                 new ReadOnlySpan<float>(b, bOffset, b.Length - bOffset), ldb, transB,
                 new Span<float>(c, cOffset, c.Length - cOffset), ldc,
                 m, n, k);
+            LogShape(m, n, k, transA, transB);
             return true;
         }
         // Phase G.1: when AIDOTNET_BLAS_PROVIDER=mkl, the static-ctor
@@ -1484,6 +1493,7 @@ internal static class BlasProvider
                 new ReadOnlySpan<float>(b, bOffset, b.Length - bOffset), ldb, transB,
                 new Span<float>(c, cOffset, c.Length - cOffset), ldc,
                 m, n, k);
+            LogShape(m, n, k, transA, transB);
             return true;
         }
         try
@@ -1529,6 +1539,7 @@ internal static class BlasProvider
                 new ReadOnlySpan<double>(b, bOffset, b.Length - bOffset), ldb, transB,
                 new Span<double>(c, cOffset, c.Length - cOffset), ldc,
                 m, n, k);
+            LogShape(m, n, k, transA, transB);
             return true;
         }
         if (!_nativeAvailable.Value) return false;
@@ -1540,6 +1551,7 @@ internal static class BlasProvider
                 new ReadOnlySpan<double>(b, bOffset, b.Length - bOffset), ldb, transB,
                 new Span<double>(c, cOffset, c.Length - cOffset), ldc,
                 m, n, k);
+            LogShape(m, n, k, transA, transB);
             return true;
         }
         try
