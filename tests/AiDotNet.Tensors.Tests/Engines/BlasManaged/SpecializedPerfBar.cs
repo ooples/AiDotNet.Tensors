@@ -15,4 +15,11 @@ public static class SpecializedPerfBar
 
     /// <summary>True once the owner has frozen the TRSM bar (non-zero win rate).</summary>
     public static bool TrsmBarFrozen => TrsmMinWinRatePercent > 0;
+
+    // SYRK vs OpenBLAS ssyrk/dsyrk on the authoritative runner.
+    public const int    SyrkMinWinRatePercent = 0;     // TO BE SET after first bench
+    public const double SyrkMaxLossMultiple    = 99.0; // TO BE SET after first bench
+
+    /// <summary>True once the owner has frozen the SYRK bar (non-zero win rate).</summary>
+    public static bool SyrkBarFrozen => SyrkMinWinRatePercent > 0;
 }

@@ -17,4 +17,14 @@ public static class SpecializedShapeCatalog
         new("Chol_SolveT_256x1", Side.Left, Uplo.Lower, true,  Diag.NonUnit, 256,   1, true,  25, "workload:cholesky-solve-transpose"),
         new("Solve_FP32_512x64", Side.Left, Uplo.Lower, false, Diag.NonUnit, 512,  64, false, 15, "workload:linsolve-fp32"),
     };
+
+    public record SyrkShape(string Name, Uplo Uplo, bool Trans, int N, int K, bool Fp64, int Frequency, string Source);
+
+    public static readonly SyrkShape[] Syrk =
+    {
+        new("Cov_256x64",  Uplo.Lower, true,  256,  64, true, 30, "workload:covariance"),
+        new("Cov_512x128", Uplo.Lower, true,  512, 128, true, 25, "workload:covariance"),
+        new("Gram_128x768",Uplo.Lower, false, 128, 768, true, 20, "workload:gram-matrix"),
+        new("Cov_FP32_256x64", Uplo.Lower, true, 256, 64, false, 15, "workload:covariance-fp32"),
+    };
 }
