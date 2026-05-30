@@ -333,6 +333,51 @@ public class DCGANStepProbe
         return sb.ToString();
     }
 
+    /// <summary>
+    /// Issue #403 Phase C — Conv2DBackwardInput sub-step breakdown at the DCGAN
+    /// shape. Phase A's bare-GEMM probe showed the BackwardInput GEMM is only
+    /// ~134µs but the wrapper is ~751µs; this splits the wrapper into its three
+    /// pieces (kernel transpose, GEMM, col2im scatter) so we know which to
+    /// optimize. Single-batch cost (the wrapper runs one of each per batch).
+    /// </summary>
+    public static string RunBackwardInputBreakdown(int innerReps = 50, int outerSamples = 25)
+    {
+        int colH = InChannels * KernelHW * KernelHW; // 1024
+        int colW = SpatialOut * SpatialOut;          // 49
+        var rng = new Random(11);
+        double[] R(int n) { var x = new double[n]; for (int i = 0; i < n; i++) x[i] = rng.NextDouble(); return x; }
+
+        double[] kernel = R(OutChannels * colH);   // [outC, colH]
+        double[] kernelTD = new double[colH * OutChannels];
+        double[] gradOut = R(OutChannels * colW);  // one batch slice [outC, colW]
+        double[] colBuf = R(colH * colW);          // pre-filled (col2im reads it)
+        double[] gradInput = new double[InChannels * SpatialIn * SpatialIn];
+
+        void Transpose()
+        {
+            for (int r = 0; r < OutChannels; r++)
+                for (int c = 0; c < colH; c++)
+                    kernelTD[c * OutChannels + r] = kernel[r * colH + c];
+        }
+        void Gemm() => Engines.BlasManaged.BlasManaged.Gemm<double>(
+            kernelTD, OutChannels, false, gradOut, colW, false, colBuf, colW, colH, colW, OutChannels);
+        void Col2Im() => Im2ColHelper.Col2ImAccumulate(
+            colBuf, gradInput, InChannels, SpatialIn, SpatialIn,
+            KernelHW, KernelHW, Stride, Stride, Padding, Padding, 1, 1, SpatialOut, SpatialOut);
+
+        Transpose(); Gemm(); Col2Im();
+        double t = MinTime(Transpose, innerReps, outerSamples);
+        double g = MinTime(Gemm, innerReps, outerSamples);
+        double c = MinTime(Col2Im, innerReps, outerSamples);
+
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine("Conv2DBackwardInput sub-step breakdown (min-of-many, µs, single batch slice):");
+        sb.AppendLine($"  {t / 1000.0,10:N3} µs  kernel transpose ([outC,colH] -> [colH,outC], once/call)");
+        sb.AppendLine($"  {g / 1000.0,10:N3} µs  GEMM colH×colW×outC (full width)");
+        sb.AppendLine($"  {c / 1000.0,10:N3} µs  Col2ImAccumulate scatter (per batch)");
+        return sb.ToString();
+    }
+
     /// <summary>Minimum per-call nanoseconds across <paramref name="outerSamples"/>
     /// samples, each averaging <paramref name="innerReps"/> back-to-back calls.</summary>
     private static double MinTime(Action action, int innerReps, int outerSamples)

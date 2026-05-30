@@ -192,6 +192,9 @@ class Program
             Console.WriteLine(DCGANStepProbe.RunBareGemmProbe());
 
             Console.WriteLine();
+            Console.WriteLine(DCGANStepProbe.RunBackwardInputBreakdown());
+
+            Console.WriteLine();
             using (var shapes = new AiDotNet.Tensors.Helpers.ShapeInstrumenter())
             {
                 var probe = new DCGANStepProbe();

@@ -12949,15 +12949,74 @@ public partial class CpuEngine : ITensorLevelEngine
             var gradOutputF = (float[])(object)gradOutput.GetFlattenedData();
             var kernelF = (float[])(object)kernel.GetFlattenedData();
 
-            // Reshape kernel from [outC, inC, kH, kW] to [outC, colH] — already contiguous in memory
-            // We need kernel^T which is [colH, outC]
-            var kernelT = new float[colH * outChannels];
-            for (int r = 0; r < outChannels; r++)
-                for (int c = 0; c < colH; c++)
-                    kernelT[c * outChannels + r] = kernelF[r * colH + c];
+            // #403 Phase C: feed the kernel straight into a transposed GEMM
+            // (transA) instead of materializing kernel^T into a scratch first
+            // (see the FP64 branch below — the explicit [outC,colH]->[colH,outC]
+            // reshape is a cache-miss-bound strided write; the GEMM's own
+            // A-packing absorbs the transpose for free). Sgemm has a
+            // transpose-flag overload so the fallback needs no scratch either.
 
             // Parallel across batches — each batch rents a colBuffer from the pool
             var pool = System.Buffers.ArrayPool<float>.Shared;
+
+            // #403 Phase C: N-concatenated single transA GEMM for batch>1
+            // (mirror of the FP64 branch below — stack gradOutput along N, one
+            // full-width transA GEMM packs the kernel exactly once, then
+            // batch-parallel Col2ImAccumulateStrided scatters each batch's
+            // slice in place). Gated on a memory bound.
+            long niConcatElemsF = (long)colH * batch * colW;
+            const long MaxNiConcatElemsF = 16L * 1024 * 1024; // 64 MB of floats
+            if (batch >= 2 && niConcatElemsF <= MaxNiConcatElemsF)
+            {
+                int batchColW = batch * colW;
+                var gradOutAll = pool.Rent(outChannels * batchColW);
+                var colAll = pool.Rent(colH * batchColW);
+                try
+                {
+                    for (int b = 0; b < batch; b++)
+                    {
+                        int gradOutOff = b * outChannels * colW;
+                        for (int oc = 0; oc < outChannels; oc++)
+                            Array.Copy(gradOutputF, gradOutOff + oc * colW,
+                                       gradOutAll, oc * batchColW + b * colW, colW);
+                    }
+
+                    if (!Helpers.BlasProvider.TryGemmEx(colH, batchColW, outChannels,
+                        kernelF, 0, colH, true,
+                        gradOutAll, 0, batchColW, false,
+                        colAll, 0, batchColW))
+                    {
+                        Simd.SimdGemm.Sgemm(
+                            new ReadOnlySpan<float>(kernelF, 0, outChannels * colH), colH, true,
+                            new ReadOnlySpan<float>(gradOutAll, 0, outChannels * batchColW), batchColW, false,
+                            new Span<float>(colAll, 0, colH * batchColW),
+                            colH, outChannels, batchColW);
+                    }
+
+                    CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * colH * colW, b =>
+                    {
+                        int imgOff = b * inChannels * height * width;
+                        Im2ColHelper.Col2ImAccumulateStrided(
+                            new ReadOnlySpan<float>(colAll, 0, colH * batchColW),
+                            batchColW, b * colW,
+                            new Span<float>(gradInputF, imgOff, inChannels * height * width),
+                            inChannels, height, width,
+                            kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW,
+                            outputHeight, outputWidth);
+                    });
+
+                    var opsNi = MathHelper.GetNumericOperations<T>();
+                    var resultNi = new T[gradInputF.Length];
+                    opsNi.FromFloatSpan(new ReadOnlySpan<float>(gradInputF), new Span<T>(resultNi));
+                    return TensorAllocator.Rent<T>(inputShape, resultNi);
+                }
+                finally
+                {
+                    pool.Return(gradOutAll);
+                    pool.Return(colAll);
+                }
+            }
+
             CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * colH * colW, b =>
             {
                 var colBuf = pool.Rent(colW * colH);
@@ -12965,16 +13024,17 @@ public partial class CpuEngine : ITensorLevelEngine
                 {
                     int gradOutOff = b * outChannels * colW;
 
-                    // BLAS GEMM: col = kernel^T × gradOutput → [colH, colW]
-                    if (!Helpers.BlasProvider.TryGemm(colH, colW, outChannels,
-                        kernelT, 0, outChannels,
-                        gradOutputF, gradOutOff, colW,
+                    // col[colH,colW] = kernel^T[colH,outC] @ gradOutput[outC,colW].
+                    // A = kernel stored [outC,colH] (lda=colH), transposed via transA.
+                    if (!Helpers.BlasProvider.TryGemmEx(colH, colW, outChannels,
+                        kernelF, 0, colH, true,
+                        gradOutputF, gradOutOff, colW, false,
                         colBuf, 0, colW))
                     {
-                        // SimdGemm fallback when BLAS unavailable
+                        // SimdGemm fallback (transpose A in-place via the flag).
                         Simd.SimdGemm.Sgemm(
-                            new ReadOnlySpan<float>(kernelT),
-                            new ReadOnlySpan<float>(gradOutputF, gradOutOff, outChannels * colW),
+                            new ReadOnlySpan<float>(kernelF, 0, outChannels * colH), colH, true,
+                            new ReadOnlySpan<float>(gradOutputF, gradOutOff, outChannels * colW), colW, false,
                             new Span<float>(colBuf, 0, colH * colW),
                             colH, outChannels, colW);
                     }
@@ -13198,73 +13258,139 @@ public partial class CpuEngine : ITensorLevelEngine
             var gradOutputD = (double[])(object)gradOutput.GetFlattenedData();
             var kernelD = (double[])(object)kernel.GetFlattenedData();
 
-            // #415 Phase C: rent the kernel-transpose scratch from the
-            // shared array pool instead of allocating per call. For ResNet50
-            // res5 (1×1 conv at 2048→2048 — outside the Phase B direct gate
-            // so this branch fires) the buffer is 32 MB; for the 3×3
-            // stride-2 res blocks (also outside the Phase B p=1 gate) it
-            // hits ~18 MB. GC pressure was material on the per-step hot
-            // path; pool rental amortizes it to zero.
-            var poolKernelT = System.Buffers.ArrayPool<double>.Shared;
-            var kernelTD = poolKernelT.Rent(colH * outChannels);
-            try
-            {
-                // Reshape kernel from [outC, inC, kH, kW] to [colH, outC] = transpose
-                for (int r = 0; r < outChannels; r++)
-                    for (int c = 0; c < colH; c++)
-                        kernelTD[c * outChannels + r] = kernelD[r * colH + c];
+            // #403 Phase C: feed the kernel straight into a transposed GEMM
+            // (transA) instead of materializing kernel^T into a scratch buffer
+            // first. The explicit [outC,colH]->[colH,outC] reshape was a
+            // cache-miss-bound strided write measured at ~160µs/call at the
+            // DCGAN shape (and up to a 32 MB buffer at ResNet res5) — pure
+            // overhead, since the GEMM's own A-packing absorbs the transpose.
+            // The transA GEMM (M=colH, N=colW, K=outC) also runs faster than
+            // the pre-transposed NN GEMM at this tiny-K shape (~134µs vs
+            // ~258µs). Drops the kernelTD rental + the transpose entirely.
+            var poolD = System.Buffers.ArrayPool<double>.Shared;
 
-                var poolD = System.Buffers.ArrayPool<double>.Shared;
-                CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * colH * colW, b =>
+            // #403 Phase C: N-concatenated single transA GEMM for batch>1. The
+            // per-batch transA loop below re-packs (re-transposes) the kernel
+            // once PER BATCH, inside the batch-parallel region where the GEMM
+            // also can't use full core width. Instead, stack the per-batch
+            // gradOutput along N and issue ONE full-width transA GEMM that packs
+            // the kernel exactly once:
+            //   colAll[colH, batch·colW] = kernel^T[colH, outC]
+            //                            @ gradOutAll[outC, batch·colW]
+            // (gradOutAll[oc, b·colW+n] = gradOutput[b, oc, n]). The col2im
+            // scatter then reads each batch's [colH, colW] slice in place from
+            // colAll via Col2ImAccumulateStrided (row stride batch·colW, column
+            // offset b·colW) — no extraction copy — and stays batch-parallel
+            // (disjoint gradInput slices, no nested GEMM). Gated on a memory
+            // bound; large shapes keep the per-batch path.
+            long niConcatElems = (long)colH * batch * colW;
+            const long MaxNiConcatElems = 8L * 1024 * 1024; // 64 MB of doubles
+            if (batch >= 2 && niConcatElems <= MaxNiConcatElems)
+            {
+                int batchColW = batch * colW;
+                var gradOutAll = poolD.Rent(outChannels * batchColW);
+                var colAll = poolD.Rent(colH * batchColW);
+                try
                 {
-                    var colBuf = poolD.Rent(colW * colH);
-                    try
+                    // gradOutAll[oc, b·colW + n] = gradOutput[b, oc, n]
+                    for (int b = 0; b < batch; b++)
                     {
                         int gradOutOff = b * outChannels * colW;
+                        for (int oc = 0; oc < outChannels; oc++)
+                            Array.Copy(gradOutputD, gradOutOff + oc * colW,
+                                       gradOutAll, oc * batchColW + b * colW, colW);
+                    }
 
-                        if (!Helpers.BlasProvider.TryGemm(colH, colW, outChannels,
-                            kernelTD, 0, outChannels,
-                            gradOutputD, gradOutOff, colW,
-                            colBuf, 0, colW))
+                    // One full-width transA GEMM (kernel packed once).
+                    if (!Helpers.BlasProvider.TryGemmEx(colH, batchColW, outChannels,
+                        kernelD, 0, colH, true,
+                        gradOutAll, 0, batchColW, false,
+                        colAll, 0, batchColW))
+                    {
+                        // Cold fallback: transpose kernel once, sequential GEMM.
+                        var ktScratch = poolD.Rent(colH * outChannels);
+                        try
                         {
-                            // #415 Phase D: route the BLAS-unavailable
-                            // fallback through SimdGemm.DgemmSequential —
-                            // the AVX2/FMA Vector256<double> kernel
-                            // (~12 GFLOPS on the SimdGemmDouble.cs perf
-                            // baseline vs ~2.8 GFLOPS for the prior
-                            // numOps-dispatched fallback). Use the
-                            // Sequential variant because we're already
-                            // inside the parallel-over-batch loop;
-                            // SimdGemm.Dgemm's inner Parallel.For would
-                            // oversubscribe the thread pool.
-                            // Layout match: caller has A = kernelTD shape
-                            // [colH, outC] in row-major (already the
-                            // transpose layout dgemm/SimdGemm want),
-                            // B = gradOutput shape [outC, colW] in
-                            // row-major, target C = colBuf shape
-                            // [colH, colW]. C = A·B with m=colH, k=outC,
-                            // n=colW.
+                            for (int r = 0; r < outChannels; r++)
+                                for (int c = 0; c < colH; c++)
+                                    ktScratch[c * outChannels + r] = kernelD[r * colH + c];
                             Simd.SimdGemm.DgemmSequential(
-                                new ReadOnlySpan<double>(kernelTD, 0, colH * outChannels),
-                                new ReadOnlySpan<double>(gradOutputD, gradOutOff, outChannels * colW),
-                                new Span<double>(colBuf, 0, colH * colW),
-                                colH, outChannels, colW);
+                                new ReadOnlySpan<double>(ktScratch, 0, colH * outChannels),
+                                new ReadOnlySpan<double>(gradOutAll, 0, outChannels * batchColW),
+                                new Span<double>(colAll, 0, colH * batchColW),
+                                colH, outChannels, batchColW);
                         }
+                        finally { poolD.Return(ktScratch); }
+                    }
 
+                    // Batch-parallel col2im, reading each batch's strided slice.
+                    CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * colH * colW, b =>
+                    {
                         int imgOff = b * inChannels * height * width;
-                        Helpers.Im2ColHelper.Col2ImAccumulate(
-                            new ReadOnlySpan<double>(colBuf, 0, colW * colH),
+                        Helpers.Im2ColHelper.Col2ImAccumulateStrided(
+                            new ReadOnlySpan<double>(colAll, 0, colH * batchColW),
+                            batchColW, b * colW,
                             new Span<double>(gradInputD, imgOff, inChannels * height * width),
                             inChannels, height, width,
                             kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW,
                             outputHeight, outputWidth);
-                    }
-                    finally { poolD.Return(colBuf); }
-                });
+                    });
 
-                return TensorAllocator.Rent<T>(inputShape, (Vector<T>)(object)new Vector<double>(gradInputD));
+                    return TensorAllocator.Rent<T>(inputShape, (Vector<T>)(object)new Vector<double>(gradInputD));
+                }
+                finally
+                {
+                    poolD.Return(gradOutAll);
+                    poolD.Return(colAll);
+                }
             }
-            finally { poolKernelT.Return(kernelTD); }
+
+            CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * colH * colW, b =>
+            {
+                var colBuf = poolD.Rent(colW * colH);
+                try
+                {
+                    int gradOutOff = b * outChannels * colW;
+
+                    // col[colH,colW] = kernel^T[colH,outC] @ gradOutput[outC,colW].
+                    // A = kernel stored [outC,colH] (lda=colH), transposed via transA.
+                    if (!Helpers.BlasProvider.TryGemmEx(colH, colW, outChannels,
+                        kernelD, 0, colH, true,
+                        gradOutputD, gradOutOff, colW, false,
+                        colBuf, 0, colW))
+                    {
+                        // Cold fallback (no managed/native GEMM): SimdGemm has no
+                        // transpose flag, so materialize kernel^T into a scratch
+                        // for this batch and run the sequential AVX2/FMA kernel
+                        // (we're inside the parallel-over-batch loop, so the
+                        // parallel SimdGemm.Dgemm would oversubscribe).
+                        var ktScratch = poolD.Rent(colH * outChannels);
+                        try
+                        {
+                            for (int r = 0; r < outChannels; r++)
+                                for (int c = 0; c < colH; c++)
+                                    ktScratch[c * outChannels + r] = kernelD[r * colH + c];
+                            Simd.SimdGemm.DgemmSequential(
+                                new ReadOnlySpan<double>(ktScratch, 0, colH * outChannels),
+                                new ReadOnlySpan<double>(gradOutputD, gradOutOff, outChannels * colW),
+                                new Span<double>(colBuf, 0, colH * colW),
+                                colH, outChannels, colW);
+                        }
+                        finally { poolD.Return(ktScratch); }
+                    }
+
+                    int imgOff = b * inChannels * height * width;
+                    Helpers.Im2ColHelper.Col2ImAccumulate(
+                        new ReadOnlySpan<double>(colBuf, 0, colW * colH),
+                        new Span<double>(gradInputD, imgOff, inChannels * height * width),
+                        inChannels, height, width,
+                        kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW,
+                        outputHeight, outputWidth);
+                }
+                finally { poolD.Return(colBuf); }
+            });
+
+            return TensorAllocator.Rent<T>(inputShape, (Vector<T>)(object)new Vector<double>(gradInputD));
         }
 
         // Generic fallback for non-float, non-double types
