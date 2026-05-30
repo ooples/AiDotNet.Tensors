@@ -66,7 +66,9 @@ public partial class CpuEngine
         IReadOnlyList<Tensor<T>> weights,
         IReadOnlyList<Tensor<T>?> biases,
         FusedActivationType hiddenActivation,
-        FusedActivationType outputActivation = FusedActivationType.None)
+        FusedActivationType outputActivation = FusedActivationType.None,
+        FusedActivationParams? hiddenActivationParams = null,
+        FusedActivationParams? outputActivationParams = null)
     {
         if (input is null) throw new ArgumentNullException(nameof(input));
         if (weights is null) throw new ArgumentNullException(nameof(weights));
@@ -115,7 +117,8 @@ public partial class CpuEngine
         for (int i = 0; i < weights.Count; i++)
         {
             var activation = i == last ? outputActivation : hiddenActivation;
-            x = FusedLinear(x, weights[i], biases[i], activation);
+            var actParams = i == last ? outputActivationParams : hiddenActivationParams;
+            x = FusedLinear(x, weights[i], biases[i], activation, actParams);
         }
 
         return x;

@@ -4681,7 +4681,26 @@ public interface IEngine
         Tensor<T> input,
         Tensor<T> weights,
         Tensor<T>? bias,
-        FusedActivationType activation);
+        FusedActivationType activation,
+        FusedActivationParams? activationParams = null);
+
+    /// <summary>
+    /// Fused linear + Maxout (Goodfellow et al. 2013): computes x·W + bias of shape
+    /// [.., M, N] then reduces along the feature dim by max over consecutive groups
+    /// of <paramref name="numPieces"/>, producing [.., M, N/numPieces]. A
+    /// shape-changing reduction (not an activation epilogue). Forward/inference-only.
+    /// </summary>
+    Tensor<T> FusedLinearMaxout<T>(Tensor<T> input, Tensor<T> weights, Tensor<T>? bias, int numPieces);
+
+    /// <summary>
+    /// Fused hierarchical softmax (Morin &amp; Bengio 2005): class probabilities
+    /// over a balanced binary tree whose per-level routing gate is
+    /// <c>sigmoid(input·nodeWeights[level])</c>. <paramref name="input"/> is
+    /// [.., D], <paramref name="nodeWeights"/> is [treeDepth, D]; the result is
+    /// [.., numClasses]. The <c>treeDepth</c> shared gate sigmoids are computed
+    /// once per row and reused across all classes. Forward/inference-only.
+    /// </summary>
+    Tensor<T> FusedHierarchicalSoftmax<T>(Tensor<T> input, Tensor<T> nodeWeights, int numClasses);
 
     /// <summary>
     /// Computes the backward pass for fused linear transformation.
@@ -4790,7 +4809,9 @@ public interface IEngine
         IReadOnlyList<Tensor<T>> weights,
         IReadOnlyList<Tensor<T>?> biases,
         FusedActivationType hiddenActivation,
-        FusedActivationType outputActivation);
+        FusedActivationType outputActivation = FusedActivationType.None,
+        FusedActivationParams? hiddenActivationParams = null,
+        FusedActivationParams? outputActivationParams = null);
 
     #endregion
 

@@ -1319,6 +1319,39 @@ public sealed class FusedOptimizerExtras
     public float RpropStepMax { get; init; } = 50f;
     /// <summary>Rprop initial per-element step size. Default 0.01.</summary>
     public float RpropInitialStep { get; init; } = 0.01f;
+    /// <summary>Hypergradient-SGD learning rate of the learning rate (β). Default 1e-7.</summary>
+    public float HyperLr { get; init; } = 1e-7f;
+    /// <summary>D-Adaptation initial distance estimate d0. Default 1e-6.</summary>
+    public float D0 { get; init; } = 1e-6f;
+    /// <summary>D-Adaptation per-step growth cap (Prodigy growth_rate). Default +inf (uncapped).</summary>
+    public float DGrowthRate { get; init; } = float.PositiveInfinity;
+    /// <summary>Schedule-Free SGD interpolation factor β for the y-update
+    /// <c>y = (1-β)z + βx</c> (Defazio et al., 2024). Default 0.9 — the
+    /// paper's momentum-equivalent default.</summary>
+    public float SfBeta { get; init; } = 0.9f;
+
+    /// <summary>
+    /// Validates the hyperparameters that would otherwise produce undefined or
+    /// divergent fused-optimizer math, throwing <see cref="ArgumentOutOfRangeException"/>
+    /// at configuration time rather than silently corrupting a training run.
+    /// Called by <c>CompiledTrainingPlan.ConfigureOptimizer*</c> before the
+    /// per-step closures capture these values.
+    /// </summary>
+    public void Validate()
+    {
+        if (!(HyperLr >= 0f) || float.IsNaN(HyperLr))
+            throw new ArgumentOutOfRangeException(nameof(HyperLr), HyperLr,
+                "Hypergradient-SGD HyperLr (β) must be >= 0.");
+        if (!(D0 > 0f) || float.IsNaN(D0))
+            throw new ArgumentOutOfRangeException(nameof(D0), D0,
+                "D-Adaptation initial distance estimate D0 must be > 0.");
+        if (!(DGrowthRate >= 1f))   // +inf is allowed (uncapped); only < 1 (incl. NaN) is rejected
+            throw new ArgumentOutOfRangeException(nameof(DGrowthRate), DGrowthRate,
+                "D-Adaptation DGrowthRate must be >= 1 (per-step growth cap; +inf = uncapped).");
+        if (!(SfBeta >= 0f && SfBeta <= 1f))
+            throw new ArgumentOutOfRangeException(nameof(SfBeta), SfBeta,
+                "Schedule-Free SfBeta must be in [0, 1].");
+    }
 }
 
 /// <summary>Optimizer type for fused parameter updates.</summary>

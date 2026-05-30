@@ -208,6 +208,13 @@ public sealed class GpuCpuAutoDifferentialTests : IDisposable
             for (int i = 0; i < n; i++) data[i] = new Complex<float>((float)(rng.NextDouble() - 0.5), (float)(rng.NextDouble() - 0.5));
             return new List<object> { new Tensor<Complex<float>>(data, (int[])shape.Clone()) };
         }
+        // FusedActivationParams is the optional parametric-activation config on the
+        // FusedLinear(...,FusedActivationType,FusedActivationParams) overload. null is a
+        // valid value meaning "no extra params / use defaults", so the overload reduces
+        // to the base FusedLinear(...,FusedActivationType) kernel that is already
+        // auto-tested — driving it with null gives the params overload real GPU-vs-CPU
+        // coverage (CPU and GPU both apply the same default, so they match).
+        if (pt == typeof(FusedActivationParams)) return new List<object> { null };
         return null; // ValueTuple[], unknown ref types, etc. -> dedicated test / allowlist
     }
 
