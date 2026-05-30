@@ -37,6 +37,15 @@ internal static class Avx512Fp32_16x16
     public static bool IsSupported => Avx512F.IsSupported;
 
     /// <summary>
+    /// Sub-O (#405): software-prefetch lookahead, in K-steps. Each K-step touches
+    /// one Mr-wide packed-A vpanel slice and one Nr-wide packed-B stripe; issuing a
+    /// <see cref="Sse.Prefetch0"/> this many iterations ahead hides the L2→L1 fetch
+    /// latency behind the current step's FMAs (matches the AVX2 kernels). The guard
+    /// <c>k + PrefetchDistance &lt; kc</c> avoids prefetching past the packed buffers.
+    /// </summary>
+    private const int PrefetchDistance = 8;
+
+    /// <summary>
     /// Accumulate packedA · packedB into C[0..Mr, 0..Nr]. C is read-modify-write.
     /// </summary>
     public static unsafe void Run(
@@ -74,6 +83,14 @@ internal static class Avx512Fp32_16x16
             {
                 for (int k = 0; k < kc; k++)
                 {
+                    // Sub-O (#405): prefetch the packed-A vpanel + packed-B stripe
+                    // PrefetchDistance K-steps ahead so the next loads land in L1.
+                    if (k + PrefetchDistance < kc)
+                    {
+                        Sse.Prefetch0(aPtr + (k + PrefetchDistance) * Mr);
+                        Sse.Prefetch0(bPtr + (k + PrefetchDistance) * Nr);
+                    }
+
                     Vector512<float> bRow = Avx512F.LoadVector512(bPtr + k * Nr);
 
                     Vector512<float> a0  = Vector512.Create(aPtr[k * Mr + 0]);

@@ -48,6 +48,15 @@ internal static class Avx512Fp64_8x16
     public static bool IsSupported => Avx512F.IsSupported;
 
     /// <summary>
+    /// Sub-O (#405): software-prefetch lookahead, in K-steps. Each K-step reads one
+    /// Mr-wide packed-A slice (one cache line) and one Nr-wide packed-B stripe (two
+    /// 512-bit loads ⇒ two cache lines), so we prefetch A plus both B lines this many
+    /// iterations ahead to hide L2→L1 latency behind the current step's FMAs (matches
+    /// the AVX2 kernels). Guarded by <c>k + PrefetchDistance &lt; kc</c>.
+    /// </summary>
+    private const int PrefetchDistance = 8;
+
+    /// <summary>
     /// Accumulate packedA · packedB into the C[0..Mr, 0..Nr] tile, summing over
     /// kc K-steps. C is read-modify-write; caller is responsible for zero-init
     /// if a fresh result is desired. When kc is 0 the kernel reads + writes C
@@ -93,6 +102,15 @@ internal static class Avx512Fp64_8x16
             {
                 for (int k = 0; k < kc; k++)
                 {
+                    // Sub-O (#405): prefetch packed-A slice + both packed-B cache lines
+                    // PrefetchDistance K-steps ahead so the next loads land in L1.
+                    if (k + PrefetchDistance < kc)
+                    {
+                        Sse.Prefetch0(aPtr + (k + PrefetchDistance) * Mr);
+                        Sse.Prefetch0(bPtr + (k + PrefetchDistance) * Nr + 0);
+                        Sse.Prefetch0(bPtr + (k + PrefetchDistance) * Nr + 8);
+                    }
+
                     // Two vector loads per K-step from packed-B.
                     Vector512<double> bRow_lo = Avx512F.LoadVector512(bPtr + k * Nr + 0);
                     Vector512<double> bRow_hi = Avx512F.LoadVector512(bPtr + k * Nr + 8);
