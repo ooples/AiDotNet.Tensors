@@ -70,16 +70,20 @@ internal static class LdlDecomposition
         var ldData = ld.GetDataArray();
         var bData = b.GetDataArray();
         var xData = result.GetDataArray();
+        var pivData = pivots.GetDataArray();
         int matStride = n * n;
         int rhsStride = b.Rank == ld.Rank ? n * nrhs : n;
+        int pivStride = n;
 
         for (int ib = 0; ib < batch; ib++)
-            SolveSingle(ldData, ib * matStride, bData, ib * rhsStride, xData, ib * rhsStride, n, nrhs, upper);
+            SolveSingle(ldData, ib * matStride, bData, ib * rhsStride, xData, ib * rhsStride,
+                pivData, ib * pivStride, n, nrhs, upper);
 
         return result;
     }
 
-    private static void SolveSingle<T>(T[] a, int offA, T[] b, int offB, T[] x, int offX, int n, int nrhs, bool upper)
+    private static void SolveSingle<T>(T[] a, int offA, T[] b, int offB, T[] x, int offX,
+        int[] piv, int offPiv, int n, int nrhs, bool upper)
         where T : unmanaged, IEquatable<T>, IComparable<T>
     {
         // Copy RHS into X; we solve in place.
@@ -87,6 +91,14 @@ internal static class LdlDecomposition
 
         for (int c = 0; c < nrhs; c++)
         {
+            // Apply the factorization's symmetric pivoting to the RHS: b' = P·b.
+            // (Forward order, matching how the swaps were applied during Factor.)
+            for (int j = 0; j < n; j++)
+            {
+                int pj = piv[offPiv + j];
+                if (pj != j) (x[offX + j * nrhs + c], x[offX + pj * nrhs + c]) = (x[offX + pj * nrhs + c], x[offX + j * nrhs + c]);
+            }
+
             // Phase 1: forward-solve L·y = b (or Uᵀ·y = b when upper).
             for (int i = 0; i < n; i++)
             {
@@ -121,65 +133,81 @@ internal static class LdlDecomposition
                 }
                 x[offX + i * nrhs + c] = FromDouble<T>(s);
             }
+
+            // Undo the pivoting: x = Pᵀ·z (reverse order of the forward swaps).
+            for (int j = n - 1; j >= 0; j--)
+            {
+                int pj = piv[offPiv + j];
+                if (pj != j) (x[offX + j * nrhs + c], x[offX + pj * nrhs + c]) = (x[offX + pj * nrhs + c], x[offX + j * nrhs + c]);
+            }
         }
     }
 
     private static void FactorSingle<T>(T[] a, int off, int[] piv, int offPiv, int n, bool upper)
         where T : unmanaged, IEquatable<T>, IComparable<T>
     {
-        // Simple Bunch–Kaufman (1×1 block pivoting only). Sufficient for
-        // strictly-diagonally-dominant or positive-definite cases; a future
-        // PR upgrades to full 2×2 block pivoting for strongly indefinite
-        // inputs. The unified lower-triangle loop writes L[i,j] for i>j and
-        // D[i,i] on the diagonal; when `upper` is true we transpose into the
-        // upper triangle afterwards so callers see U = Lᵀ.
+        // Outer-product LDLᵀ with symmetric (diagonal) partial pivoting:
+        // P·A·Pᵀ = L·D·Lᵀ. At each step the largest-magnitude remaining
+        // Schur-complement diagonal is permuted to the pivot position (rows AND
+        // columns swapped to preserve symmetry), then a rank-1 update eliminates
+        // the column. piv[j] records the row swapped with j at step j (LAPACK
+        // style); Solve replays it. This fixes the previous no-pivot path that
+        // produced NaN whenever an (intermediate) diagonal was zero — exactly the
+        // symmetric-INDEFINITE inputs this routine is meant to handle.
+        //
+        // Pivoting is 1×1 only (largest-diagonal rule), which covers the practical
+        // indefinite cases. A fully general matrix whose entire remaining diagonal
+        // is zero (e.g. [[0,1],[1,0]]) would need 2×2 block pivots; that is left as
+        // a tracked follow-up and detected below (D=0 → Solve reports it rather
+        // than silently dividing).
+        var m = new double[n * n];
+        for (int i = 0; i < n; i++)
+            for (int j = 0; j < n; j++)
+                m[i * n + j] = ToDouble(a[off + i * n + j]);
+
         for (int j = 0; j < n; j++)
         {
-            piv[offPiv + j] = j; // Trivial pivots for the simple path.
-            double d = ToDouble(a[off + j * n + j]);
-            for (int k = 0; k < j; k++)
+            // Choose pivot = largest |diagonal| among the remaining rows [j, n).
+            int p = j;
+            double best = Math.Abs(m[j * n + j]);
+            for (int i = j + 1; i < n; i++)
             {
-                double l_jk = ToDouble(a[off + j * n + k]);
-                double d_k = ToDouble(a[off + k * n + k]);
-                d -= l_jk * l_jk * d_k;
+                double val = Math.Abs(m[i * n + i]);
+                if (val > best) { best = val; p = i; }
             }
-            a[off + j * n + j] = FromDouble<T>(d);
-            if (d == 0.0) continue;
+            piv[offPiv + j] = p;
+            if (p != j)
+            {
+                for (int k = 0; k < n; k++) (m[j * n + k], m[p * n + k]) = (m[p * n + k], m[j * n + k]); // swap rows
+                for (int k = 0; k < n; k++) (m[k * n + j], m[k * n + p]) = (m[k * n + p], m[k * n + j]); // swap cols
+            }
+
+            double d = m[j * n + j];
+            if (d == 0.0) continue; // 2×2-pivot-essential block; D[j]=0 (see remark above)
 
             for (int i = j + 1; i < n; i++)
             {
-                double s = ToDouble(a[off + i * n + j]);
-                for (int k = 0; k < j; k++)
-                {
-                    double l_ik = ToDouble(a[off + i * n + k]);
-                    double l_jk = ToDouble(a[off + j * n + k]);
-                    double d_k = ToDouble(a[off + k * n + k]);
-                    s -= l_ik * l_jk * d_k;
-                }
-                a[off + i * n + j] = FromDouble<T>(s / d);
+                double lij = m[i * n + j] / d;
+                m[i * n + j] = lij;                               // store L (unit-lower)
+                for (int k = j + 1; k < n; k++)
+                    m[i * n + k] -= lij * m[j * n + k];           // symmetric rank-1 Schur update
             }
         }
 
+        // Pack: D on the diagonal, L strictly below; zero the rest.
+        for (int i = 0; i < n; i++)
+            for (int j = 0; j < n; j++)
+                a[off + i * n + j] = FromDouble<T>(j < i ? m[i * n + j] : (j == i ? m[i * n + i] : 0.0));
+
         if (upper)
         {
-            // Move lower-triangle L into upper-triangle U = Lᵀ, then clear the
-            // lower triangle so the returned factor has U in the upper and
-            // zeros below the diagonal.
+            // Mirror L into U = Lᵀ (upper), clearing the lower triangle.
             for (int i = 0; i < n; i++)
-            {
                 for (int j = 0; j < i; j++)
                 {
                     a[off + j * n + i] = a[off + i * n + j];
                     a[off + i * n + j] = default;
                 }
-            }
-        }
-        else
-        {
-            // Zero upper triangle for a clean L·D·Lᵀ factor view.
-            for (int i = 0; i < n; i++)
-                for (int j = i + 1; j < n; j++)
-                    a[off + i * n + j] = default;
         }
     }
 
