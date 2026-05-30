@@ -34,7 +34,6 @@ public class LstmComponentBreakdownBench
         var hPrev = RandF(batch * hidden, rng);
         var wHhT = RandF(hidden * gateRows, rng);
         var hh = new float[batch * gateRows];
-        var gate = RandF(4 * bh, rng);   // i|f|g|o blocks, 32768
         var cPrev = RandF(bh, rng);
         var cCurr = new float[bh];
         var hCurr = new float[bh];
@@ -60,43 +59,53 @@ public class LstmComponentBreakdownBench
         // 2. Recurrent GEMM (per step): h_prev @ wHhT, [128,64] x [64,256].
         double tRec = MinUs(() => SimdGemm.SgemmSequential(hPrev, wHhT, hh, batch, hidden, gateRows));
 
-        // 3. Gate activations (per step): sigmoid(i+f) | tanh(g) | sigmoid(o).
-        double tAct = MinUs(() =>
+        // 3. Fused elementwise cell (per step): the #477 fast path no longer
+        // de-interleaves into a gate buffer or runs separate activation/cell passes.
+        // It reads the four gate pre-activations straight from the NATURAL
+        // [b][gateRows] Wx + hh layout, applies sigmoid/tanh, and writes
+        // c = f·c_prev + i·g and h = o·tanh(c) in ONE pass. Timing that fused pass
+        // (here at t = 0) is what actually catches regressions in the new kernel —
+        // the old split sigmoid/tanh + cell-update measurement is retired.
+        double tFusedCell = MinUs(() =>
         {
-            fixed (float* g = gate)
-            {
-                SimdKernels.SigmoidUnsafe(g + 0 * bh, g + 0 * bh, 2 * bh);
-                SimdKernels.TanhUnsafe(g + 2 * bh, g + 2 * bh, bh);
-                SimdKernels.SigmoidUnsafe(g + 3 * bh, g + 3 * bh, bh);
-            }
-        });
-
-        // 4. Cell + hidden update (per step): c=f*cprev+i*g; h=o*tanh(c).
-        double tCell = MinUs(() =>
-        {
-            fixed (float* g = gate)
+            fixed (float* wxP = wx)
+            fixed (float* hhP = hh)
             fixed (float* cp = cPrev)
             fixed (float* cc = cCurr)
             fixed (float* hc = hCurr)
             {
-                float* iB = g; float* fB = g + bh; float* gB = g + 2 * bh; float* oB = g + 3 * bh;
-                for (int x = 0; x < bh; x++) cc[x] = fB[x] * cp[x] + iB[x] * gB[x];
-                SimdKernels.TanhUnsafe(cc, hc, bh);
-                for (int x = 0; x < bh; x++) hc[x] = oB[x] * hc[x];
+                const int t = 0;
+                for (int b = 0; b < batch; b++)
+                {
+                    int wxRow = (b * seq + t) * gateRows;
+                    int hhRow = b * gateRows;
+                    int cRow = b * hidden;
+                    for (int h = 0; h < hidden; h++)
+                    {
+                        float ig = Sigmoid(wxP[wxRow + 0 * hidden + h] + hhP[hhRow + 0 * hidden + h]);
+                        float fg = Sigmoid(wxP[wxRow + 1 * hidden + h] + hhP[hhRow + 1 * hidden + h]);
+                        float gg = MathF.Tanh(wxP[wxRow + 2 * hidden + h] + hhP[hhRow + 2 * hidden + h]);
+                        float og = Sigmoid(wxP[wxRow + 3 * hidden + h] + hhP[hhRow + 3 * hidden + h]);
+                        float c = fg * cp[cRow + h] + ig * gg;
+                        cc[cRow + h] = c;
+                        hc[cRow + h] = og * MathF.Tanh(c);
+                    }
+                }
             }
         });
 
-        double perStep = tRec + tAct + tCell;
+        double perStep = tRec + tFusedCell;
         double accounted = (tInput + perStep * seq) / 1000.0;
         _out.WriteLine($"LSTM component breakdown [128,32,32]->64 (min of {measured}):");
         _out.WriteLine($"  input GEMM    x1  : {tInput,7:F1} us            -> {tInput / 1000.0,5:F2} ms");
         _out.WriteLine($"  recurrent GEMM x{seq}: {tRec,7:F1} us/step -> {tRec * seq / 1000.0,5:F2} ms");
-        _out.WriteLine($"  activations    x{seq}: {tAct,7:F1} us/step -> {tAct * seq / 1000.0,5:F2} ms");
-        _out.WriteLine($"  cell update    x{seq}: {tCell,7:F1} us/step -> {tCell * seq / 1000.0,5:F2} ms");
-        _out.WriteLine($"  accounted sum     : {accounted:F2} ms (vs ~3.3ms full; rest = de-interleave + copies + per-call overhead)");
+        _out.WriteLine($"  fused cell     x{seq}: {tFusedCell,7:F1} us/step -> {tFusedCell * seq / 1000.0,5:F2} ms");
+        _out.WriteLine($"  accounted sum     : {accounted:F2} ms (rest = per-call overhead + the wHhT transpose + state copies)");
 
-        Assert.True(tInput > 0 && tRec > 0 && tAct > 0 && tCell > 0);
+        Assert.True(tInput > 0 && tRec > 0 && tFusedCell > 0);
     }
+
+    private static float Sigmoid(float x) => 1f / (1f + MathF.Exp(-x));
 
     private static float[] RandF(int n, Random rng)
     {
