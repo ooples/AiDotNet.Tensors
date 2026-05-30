@@ -122,5 +122,47 @@ public enum FusedActivationType
     /// SoftSign: f(x) = x / (1 + |x|)
     /// Smooth, bounded (-1, 1) alternative to Tanh with polynomial tails.
     /// </summary>
-    SoftSign = 16
+    SoftSign = 16,
+
+    /// <summary>
+    /// CELU: f(x) = max(0, x) + min(0, alpha * (exp(x / alpha) - 1))
+    /// Continuously-differentiable ELU variant (Barron, 2017). Parametric (alpha,
+    /// default 1) — supply via <see cref="FusedActivationParams.Alpha"/>.
+    /// </summary>
+    CELU = 17,
+
+    /// <summary>
+    /// ThresholdedReLU: f(x) = x if x &gt; theta, else 0
+    /// Parametric (theta, default 1) — supply via <see cref="FusedActivationParams.Theta"/>.
+    /// </summary>
+    ThresholdedReLU = 18,
+
+    /// <summary>
+    /// ScaledTanh: f(x) = alpha * tanh(beta * x)
+    /// Parametric (alpha/beta, defaults 1/1) — supply via
+    /// <see cref="FusedActivationParams.Alpha"/> / <see cref="FusedActivationParams.Beta"/>.
+    /// </summary>
+    ScaledTanh = 19
+}
+
+/// <summary>
+/// Optional scalar parameters for parametric fused activations. Omit (null) to use
+/// each activation's canonical default. Only the field(s) relevant to the chosen
+/// <see cref="FusedActivationType"/> are read.
+/// </summary>
+/// <remarks>
+/// A class with nullable init properties (not a record struct) so a missing field
+/// can be distinguished from an explicit value and resolved to the per-activation
+/// default. Lets <c>FusedLinear</c> / <c>MlpForward</c> / the activation epilogue
+/// fuse LeakyReLU (any slope), ELU / CELU (any alpha), ThresholdedReLU (theta),
+/// and ScaledTanh (alpha, beta) — not only the hardcoded default value.
+/// </remarks>
+public sealed class FusedActivationParams
+{
+    /// <summary>LeakyReLU slope, ELU/CELU/ScaledTanh alpha. Default: LeakyReLU 0.01, others 1.</summary>
+    public float? Alpha { get; init; }
+    /// <summary>ScaledTanh inner scale beta. Default 1.</summary>
+    public float? Beta { get; init; }
+    /// <summary>ThresholdedReLU threshold. Default 1.</summary>
+    public float? Theta { get; init; }
 }

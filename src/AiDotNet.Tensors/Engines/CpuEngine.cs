@@ -33942,7 +33942,7 @@ public partial class CpuEngine : ITensorLevelEngine
     #if !NETFRAMEWORK
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
 #endif
-    public virtual Tensor<T> FusedLinear<T>(Tensor<T> input, Tensor<T> weights, Tensor<T>? bias, FusedActivationType activation)
+    public virtual Tensor<T> FusedLinear<T>(Tensor<T> input, Tensor<T> weights, Tensor<T>? bias, FusedActivationType activation, FusedActivationParams? activationParams = null)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (weights == null) throw new ArgumentNullException(nameof(weights));
@@ -34102,7 +34102,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 if (bias != null || activation != FusedActivationType.None)
                 {
                     var bArr = bias != null ? (float[])(object)bias.GetDataArray() : null;
-                    CpuFusedOperations.ApplyBiasActivationInPlace(outArr, bArr, M, N, activation);
+                    CpuFusedOperations.ApplyBiasActivationInPlace(outArr, bArr, M, N, activation, activationParams);
                 }
 
                 return result;
@@ -34153,7 +34153,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 if (bias != null || activation != FusedActivationType.None)
                 {
                     var bArr = bias != null ? (double[])(object)bias.GetDataArray() : null;
-                    CpuFusedOperations.ApplyBiasActivationInPlaceDouble(outArr, bArr, M, N, activation);
+                    CpuFusedOperations.ApplyBiasActivationInPlaceDouble(outArr, bArr, M, N, activation, activationParams);
                 }
 
                 return result;

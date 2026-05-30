@@ -556,7 +556,7 @@ public static class CpuFusedOperations
 #endif
 
     [MethodImpl(Hot)]
-    internal static void ApplyBiasActivationInPlace(float[] output, float[]? bias, int M, int N, FusedActivationType activation)
+    internal static void ApplyBiasActivationInPlace(float[] output, float[]? bias, int M, int N, FusedActivationType activation, FusedActivationParams? activationParams = null)
     {
         bool hasBias = bias != null;
         bool hasActivation = activation != FusedActivationType.None;
@@ -644,7 +644,7 @@ public static class CpuFusedOperations
 #endif
 
         // Hoist the delegate lookup outside the hot loop to avoid per-element dictionary access
-        Func<float, float>? activationFn = hasActivation ? GetFloatActivation(activation) : null;
+        Func<float, float>? activationFn = hasActivation ? GetFloatActivation(activation, activationParams) : null;
 
         for (int i = 0; i < M; i++)
         {
@@ -1249,8 +1249,35 @@ public static class CpuFusedOperations
 
     /// <summary>Gets the float activation function delegate for use in tight loops.
     /// Resolve once outside the loop, then call the returned delegate per element.</summary>
-    internal static Func<float, float> GetFloatActivation(FusedActivationType activation)
+    internal static Func<float, float> GetFloatActivation(FusedActivationType activation, FusedActivationParams? p = null)
     {
+        // Parametric activations: build a closure from p, falling back to each
+        // activation's canonical default. LeakyReLU/ELU only intercept here when an
+        // explicit alpha is supplied; otherwise they use the hardcoded-default dict
+        // entry below. CELU/ThresholdedReLU/ScaledTanh are parametric-only.
+        switch (activation)
+        {
+            case FusedActivationType.LeakyReLU when p?.Alpha is float la:
+                return x => x > 0f ? x : la * x;
+            case FusedActivationType.ELU when p?.Alpha is float ea:
+                return x => x > 0f ? x : ea * (MathF.Exp(x) - 1f);
+            case FusedActivationType.CELU:
+            {
+                // max(0,x)+min(0,a*(exp(x/a)-1)) reduces to this piecewise form.
+                float a = p?.Alpha ?? 1f;
+                return x => x >= 0f ? x : a * (MathF.Exp(x / a) - 1f);
+            }
+            case FusedActivationType.ThresholdedReLU:
+            {
+                float t = p?.Theta ?? 1f;
+                return x => x > t ? x : 0f;
+            }
+            case FusedActivationType.ScaledTanh:
+            {
+                float a = p?.Alpha ?? 1f, b = p?.Beta ?? 1f;
+                return x => a * MathF.Tanh(b * x);
+            }
+        }
         if (_floatActivations.TryGetValue(activation, out var fn))
             return fn;
         throw new ArgumentException($"No float activation registered for type: {activation}");
@@ -1352,14 +1379,14 @@ public static class CpuFusedOperations
     /// Applies bias addition and activation function in-place over the double GEMM output.
     /// </summary>
     [MethodImpl(Hot)]
-    internal static void ApplyBiasActivationInPlaceDouble(double[] output, double[]? bias, int M, int N, FusedActivationType activation)
+    internal static void ApplyBiasActivationInPlaceDouble(double[] output, double[]? bias, int M, int N, FusedActivationType activation, FusedActivationParams? activationParams = null)
     {
         bool hasBias = bias != null;
         bool hasActivation = activation != FusedActivationType.None;
         if (!hasBias && !hasActivation) return;
 
         // Hoist the delegate lookup outside the hot loop
-        Func<double, double>? activationFn = hasActivation ? GetDoubleActivation(activation) : null;
+        Func<double, double>? activationFn = hasActivation ? GetDoubleActivation(activation, activationParams) : null;
 
         for (int i = 0; i < M; i++)
         {
@@ -1399,8 +1426,30 @@ public static class CpuFusedOperations
 
     /// <summary>Gets the double activation function delegate for use in tight loops.
     /// Resolve once outside the loop, then call the returned delegate per element.</summary>
-    internal static Func<double, double> GetDoubleActivation(FusedActivationType activation)
+    internal static Func<double, double> GetDoubleActivation(FusedActivationType activation, FusedActivationParams? p = null)
     {
+        switch (activation)
+        {
+            case FusedActivationType.LeakyReLU when p?.Alpha is float la:
+                return x => x > 0.0 ? x : la * x;
+            case FusedActivationType.ELU when p?.Alpha is float ea:
+                return x => x > 0.0 ? x : ea * (Math.Exp(x) - 1.0);
+            case FusedActivationType.CELU:
+            {
+                double a = p?.Alpha ?? 1f;
+                return x => x >= 0.0 ? x : a * (Math.Exp(x / a) - 1.0);
+            }
+            case FusedActivationType.ThresholdedReLU:
+            {
+                double t = p?.Theta ?? 1f;
+                return x => x > t ? x : 0.0;
+            }
+            case FusedActivationType.ScaledTanh:
+            {
+                double a = p?.Alpha ?? 1f, b = p?.Beta ?? 1f;
+                return x => a * Math.Tanh(b * x);
+            }
+        }
         if (_doubleActivations.TryGetValue(activation, out var fn))
             return fn;
         throw new ArgumentException($"No double activation registered for type: {activation}");

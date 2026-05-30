@@ -79,4 +79,61 @@ public class EpilogueActivationParityTests
             Assert.True(Math.Abs(expected[i] - data[i]) < 1e-12,
                 $"{act} fp64: epilogue {data[i]} != canonical {expected[i]} at {i}.");
     }
+
+    // ---- parametric (FusedActivationParams) -------------------------------
+
+    private static double ParamRef(FusedActivationType act, double x, FusedActivationParams p) => act switch
+    {
+        FusedActivationType.LeakyReLU => x >= 0 ? x : p.Alpha!.Value * x,
+        FusedActivationType.ELU => x > 0 ? x : p.Alpha!.Value * (Math.Exp(x) - 1.0),
+        FusedActivationType.CELU => x >= 0 ? x : p.Alpha!.Value * (Math.Exp(x / p.Alpha!.Value) - 1.0),
+        FusedActivationType.ThresholdedReLU => x > p.Theta!.Value ? x : 0.0,
+        FusedActivationType.ScaledTanh => p.Alpha!.Value * Math.Tanh(p.Beta!.Value * x),
+        _ => throw new ArgumentOutOfRangeException(nameof(act)),
+    };
+
+    public static TheoryData<FusedActivationType, FusedActivationParams> ParametricCases => new()
+    {
+        { FusedActivationType.LeakyReLU, new FusedActivationParams { Alpha = 0.2f } },
+        { FusedActivationType.ELU, new FusedActivationParams { Alpha = 2.0f } },
+        { FusedActivationType.CELU, new FusedActivationParams { Alpha = 1.5f } },
+        { FusedActivationType.ThresholdedReLU, new FusedActivationParams { Theta = 0.5f } },
+        { FusedActivationType.ScaledTanh, new FusedActivationParams { Alpha = 1.7f, Beta = 0.66f } },
+    };
+
+    [Theory]
+    [MemberData(nameof(ParametricCases))]
+    public void ApplyFp32_ParametricHonorsParams(FusedActivationType act, FusedActivationParams p)
+    {
+        var rng = new Random(20260601);
+        const int n = 17;
+        var data = new float[n];
+        for (int i = 0; i < n; i++) data[i] = (float)(rng.NextDouble() * 8.0 - 4.0);
+        var expected = new double[n];
+        for (int i = 0; i < n; i++) expected[i] = ParamRef(act, data[i], p);
+
+        ActivationEpilogue.Apply<float>(data, ldc: n, m: 1, n: n, act, p);
+
+        for (int i = 0; i < n; i++)
+            Assert.True(Math.Abs(expected[i] - data[i]) < 1e-4,
+                $"{act} fp32 params: epilogue {data[i]} != {expected[i]} at {i}.");
+    }
+
+    [Theory]
+    [MemberData(nameof(ParametricCases))]
+    public void ApplyFp64_ParametricHonorsParams(FusedActivationType act, FusedActivationParams p)
+    {
+        var rng = new Random(20260601);
+        const int n = 17;
+        var data = new double[n];
+        for (int i = 0; i < n; i++) data[i] = rng.NextDouble() * 8.0 - 4.0;
+        var expected = new double[n];
+        for (int i = 0; i < n; i++) expected[i] = ParamRef(act, data[i], p);
+
+        ActivationEpilogue.Apply<double>(data, ldc: n, m: 1, n: n, act, p);
+
+        for (int i = 0; i < n; i++)
+            Assert.True(Math.Abs(expected[i] - data[i]) < 1e-12,
+                $"{act} fp64 params: epilogue {data[i]} != {expected[i]} at {i}.");
+    }
 }

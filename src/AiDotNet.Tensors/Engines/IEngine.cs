@@ -4681,7 +4681,8 @@ public interface IEngine
         Tensor<T> input,
         Tensor<T> weights,
         Tensor<T>? bias,
-        FusedActivationType activation);
+        FusedActivationType activation,
+        FusedActivationParams? activationParams = null);
 
     /// <summary>
     /// Computes the backward pass for fused linear transformation.
@@ -4790,7 +4791,9 @@ public interface IEngine
         IReadOnlyList<Tensor<T>> weights,
         IReadOnlyList<Tensor<T>?> biases,
         FusedActivationType hiddenActivation,
-        FusedActivationType outputActivation);
+        FusedActivationType outputActivation = FusedActivationType.None,
+        FusedActivationParams? hiddenActivationParams = null,
+        FusedActivationParams? outputActivationParams = null);
 
     #endregion
 

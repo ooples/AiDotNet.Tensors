@@ -9,7 +9,7 @@ namespace AiDotNet.Tensors.Engines.BlasManaged;
 /// </summary>
 internal static class ActivationEpilogue
 {
-    public static void Apply<T>(Span<T> c, int ldc, int m, int n, FusedActivationType activation)
+    public static void Apply<T>(Span<T> c, int ldc, int m, int n, FusedActivationType activation, FusedActivationParams? p = null)
         where T : unmanaged
     {
         if (activation == FusedActivationType.None) return;
@@ -17,19 +17,19 @@ internal static class ActivationEpilogue
         if (typeof(T) == typeof(double))
         {
             var cd = MemoryMarshal.Cast<T, double>(c);
-            ApplyFp64(cd, ldc, m, n, activation);
+            ApplyFp64(cd, ldc, m, n, activation, p);
             return;
         }
         if (typeof(T) == typeof(float))
         {
             var cf = MemoryMarshal.Cast<T, float>(c);
-            ApplyFp32(cf, ldc, m, n, activation);
+            ApplyFp32(cf, ldc, m, n, activation, p);
             return;
         }
         throw new NotSupportedException($"ActivationEpilogue does not support T={typeof(T).Name}.");
     }
 
-    private static void ApplyFp64(Span<double> c, int ldc, int m, int n, FusedActivationType activation)
+    private static void ApplyFp64(Span<double> c, int ldc, int m, int n, FusedActivationType activation, FusedActivationParams? p = null)
     {
         switch (activation)
         {
@@ -42,14 +42,16 @@ internal static class ActivationEpilogue
                     }
                 break;
             case FusedActivationType.LeakyReLU:
-                // Default leaky slope = 0.01.
+            {
+                double slope = p?.Alpha ?? 0.01; // default leaky slope 0.01
                 for (int i = 0; i < m; i++)
                     for (int j = 0; j < n; j++)
                     {
                         double v = c[i * ldc + j];
-                        c[i * ldc + j] = v >= 0 ? v : 0.01 * v;
+                        c[i * ldc + j] = v >= 0 ? v : slope * v;
                     }
                 break;
+            }
             case FusedActivationType.Sigmoid:
                 for (int i = 0; i < m; i++)
                     for (int j = 0; j < n; j++)
@@ -94,14 +96,48 @@ internal static class ActivationEpilogue
                     }
                 break;
             case FusedActivationType.ELU:
-                // f(x) = x if x > 0 else alpha * (exp(x) - 1); alpha = 1.
+            {
+                // f(x) = x if x > 0 else alpha * (exp(x) - 1); alpha default 1.
+                double a = p?.Alpha ?? 1.0;
                 for (int i = 0; i < m; i++)
                     for (int j = 0; j < n; j++)
                     {
                         double x = c[i * ldc + j];
-                        c[i * ldc + j] = x > 0 ? x : (Math.Exp(x) - 1.0);
+                        c[i * ldc + j] = x > 0 ? x : a * (Math.Exp(x) - 1.0);
                     }
                 break;
+            }
+            case FusedActivationType.CELU:
+            {
+                // max(0,x)+min(0,a*(exp(x/a)-1)) → piecewise: x>=0 ? x : a*(exp(x/a)-1).
+                double a = p?.Alpha ?? 1.0;
+                for (int i = 0; i < m; i++)
+                    for (int j = 0; j < n; j++)
+                    {
+                        double x = c[i * ldc + j];
+                        c[i * ldc + j] = x >= 0 ? x : a * (Math.Exp(x / a) - 1.0);
+                    }
+                break;
+            }
+            case FusedActivationType.ThresholdedReLU:
+            {
+                double t = p?.Theta ?? 1.0;
+                for (int i = 0; i < m; i++)
+                    for (int j = 0; j < n; j++)
+                    {
+                        double x = c[i * ldc + j];
+                        c[i * ldc + j] = x > t ? x : 0.0;
+                    }
+                break;
+            }
+            case FusedActivationType.ScaledTanh:
+            {
+                double a = p?.Alpha ?? 1.0, b = p?.Beta ?? 1.0;
+                for (int i = 0; i < m; i++)
+                    for (int j = 0; j < n; j++)
+                        c[i * ldc + j] = a * Math.Tanh(b * c[i * ldc + j]);
+                break;
+            }
             case FusedActivationType.SELU:
                 // scale * (x>0 ? x : alpha*(exp(x)-1)); Klambauer et al. 2017 constants.
                 const double seluAlpha = 1.6732632423543772, seluScale = 1.0507009873554805;
@@ -170,7 +206,7 @@ internal static class ActivationEpilogue
         }
     }
 
-    private static void ApplyFp32(Span<float> c, int ldc, int m, int n, FusedActivationType activation)
+    private static void ApplyFp32(Span<float> c, int ldc, int m, int n, FusedActivationType activation, FusedActivationParams? p = null)
     {
         switch (activation)
         {
@@ -183,13 +219,16 @@ internal static class ActivationEpilogue
                     }
                 break;
             case FusedActivationType.LeakyReLU:
+            {
+                float slope = p?.Alpha ?? 0.01f;
                 for (int i = 0; i < m; i++)
                     for (int j = 0; j < n; j++)
                     {
                         float v = c[i * ldc + j];
-                        c[i * ldc + j] = v >= 0 ? v : 0.01f * v;
+                        c[i * ldc + j] = v >= 0 ? v : slope * v;
                     }
                 break;
+            }
             case FusedActivationType.Sigmoid:
                 for (int i = 0; i < m; i++)
                     for (int j = 0; j < n; j++)
@@ -231,13 +270,46 @@ internal static class ActivationEpilogue
                     }
                 break;
             case FusedActivationType.ELU:
+            {
+                float a = p?.Alpha ?? 1f;
                 for (int i = 0; i < m; i++)
                     for (int j = 0; j < n; j++)
                     {
                         float x = c[i * ldc + j];
-                        c[i * ldc + j] = x > 0 ? x : (float)(Math.Exp(x) - 1.0);
+                        c[i * ldc + j] = x > 0 ? x : a * (float)(Math.Exp(x) - 1.0);
                     }
                 break;
+            }
+            case FusedActivationType.CELU:
+            {
+                float a = p?.Alpha ?? 1f;
+                for (int i = 0; i < m; i++)
+                    for (int j = 0; j < n; j++)
+                    {
+                        float x = c[i * ldc + j];
+                        c[i * ldc + j] = x >= 0 ? x : a * (float)(Math.Exp(x / a) - 1.0);
+                    }
+                break;
+            }
+            case FusedActivationType.ThresholdedReLU:
+            {
+                float t = p?.Theta ?? 1f;
+                for (int i = 0; i < m; i++)
+                    for (int j = 0; j < n; j++)
+                    {
+                        float x = c[i * ldc + j];
+                        c[i * ldc + j] = x > t ? x : 0f;
+                    }
+                break;
+            }
+            case FusedActivationType.ScaledTanh:
+            {
+                float a = p?.Alpha ?? 1f, b = p?.Beta ?? 1f;
+                for (int i = 0; i < m; i++)
+                    for (int j = 0; j < n; j++)
+                        c[i * ldc + j] = a * (float)Math.Tanh(b * c[i * ldc + j]);
+                break;
+            }
             case FusedActivationType.SELU:
                 const float seluAlphaF = 1.6732632f, seluScaleF = 1.0507010f;
                 for (int i = 0; i < m; i++)

@@ -111,4 +111,60 @@ public class MlpForwardActivationParityTests
                 $"{act}: MlpForward(double) {actual} != canonical {expected} at index {i} (raw={raw[i]}).");
         }
     }
+
+    // ---- parametric activations (FusedActivationParams) -------------------
+
+    private static double ParamRef(FusedActivationType act, double x, FusedActivationParams p) => act switch
+    {
+        FusedActivationType.LeakyReLU => x > 0 ? x : p.Alpha!.Value * x,
+        FusedActivationType.ELU => x > 0 ? x : p.Alpha!.Value * (Math.Exp(x) - 1.0),
+        FusedActivationType.CELU => x >= 0 ? x : p.Alpha!.Value * (Math.Exp(x / p.Alpha!.Value) - 1.0),
+        FusedActivationType.ThresholdedReLU => x > p.Theta!.Value ? x : 0.0,
+        FusedActivationType.ScaledTanh => p.Alpha!.Value * Math.Tanh(p.Beta!.Value * x),
+        _ => throw new ArgumentOutOfRangeException(nameof(act)),
+    };
+
+    public static TheoryData<FusedActivationType, FusedActivationParams> ParametricCases => new()
+    {
+        { FusedActivationType.LeakyReLU, new FusedActivationParams { Alpha = 0.2f } },   // non-default slope
+        { FusedActivationType.ELU, new FusedActivationParams { Alpha = 2.0f } },          // non-default alpha
+        { FusedActivationType.CELU, new FusedActivationParams { Alpha = 1.5f } },
+        { FusedActivationType.ThresholdedReLU, new FusedActivationParams { Theta = 0.5f } },
+        { FusedActivationType.ScaledTanh, new FusedActivationParams { Alpha = 1.7f, Beta = 0.66f } },
+    };
+
+    /// <summary>
+    /// Parametric activations must honor the supplied FusedActivationParams through
+    /// MlpForward — LeakyReLU(0.2)/ELU(2) use the given (non-default) parameter, and
+    /// CELU/ThresholdedReLU/ScaledTanh fuse at all (they have no hardcoded entry).
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(ParametricCases))]
+    public void MlpForward_ParametricActivationFloat_HonorsParams(FusedActivationType act, FusedActivationParams p)
+    {
+        var engine = new CpuEngine();
+        const int batch = 4, inF = 16, outF = 8;
+        var rng = new Random(20260601);
+        var wData = new float[inF * outF];
+        for (int i = 0; i < wData.Length; i++) wData[i] = (float)(rng.NextDouble() * 2.0 - 1.0);
+        var w = new Tensor<float>(wData, new[] { inF, outF });
+        var xData = new float[batch * inF];
+        for (int i = 0; i < xData.Length; i++) xData[i] = (float)(rng.NextDouble() * 4.0 - 2.0);
+        var x = new Tensor<float>(xData, new[] { batch, inF });
+
+        var weights = new System.Collections.Generic.List<Tensor<float>> { w };
+        var noBias = new System.Collections.Generic.List<Tensor<float>?> { null };
+
+        var raw = engine.MlpForward(x, weights, noBias, FusedActivationType.None, FusedActivationType.None);
+        var fused = engine.MlpForward(x, weights, noBias, FusedActivationType.None, act,
+            hiddenActivationParams: null, outputActivationParams: p);
+
+        for (int i = 0; i < raw.Length; i++)
+        {
+            double expected = ParamRef(act, Convert.ToDouble(raw[i]), p);
+            double actual = Convert.ToDouble(fused[i]);
+            Assert.True(Math.Abs(expected - actual) < 1e-4,
+                $"{act} params: MlpForward {actual} != {expected} at {i} (raw={raw[i]}).");
+        }
+    }
 }
