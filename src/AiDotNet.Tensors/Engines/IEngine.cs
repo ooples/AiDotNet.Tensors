@@ -4065,6 +4065,32 @@ public interface IEngine
         bool returnSequences = false);
 
     /// <summary>
+    /// Fused RWKV-7 time-mixing WKV recurrence over a whole sequence in a single op
+    /// (forward + custom autodiff backward). Replaces the ~10 per-timestep tape micro-ops the
+    /// decomposed <c>RWKV7Block</c> loop records, which is the dominant training cost on long
+    /// sequences (issue ooples/AiDotNet#1464). Inputs are the per-position projected gate/value
+    /// streams <c>[batch, seqLen, modelDim]</c>; the per-position sigmoids are applied internally.
+    /// Unlike <see cref="LstmSequenceForward{T}"/>, this op IS differentiable — it records a single
+    /// tape node whose backward runs the BPTT adjoint of the recurrence, so it is safe under an
+    /// active <c>GradientTape</c>.
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="rProj">Receptance projection [batch, seqLen, modelDim] (pre-sigmoid).</param>
+    /// <param name="kProj">Key projection [batch, seqLen, modelDim].</param>
+    /// <param name="vProj">Value projection [batch, seqLen, modelDim].</param>
+    /// <param name="aProj">State-evolution decay (a) projection [batch, seqLen, modelDim] (pre-sigmoid).</param>
+    /// <param name="bProj">State-evolution injection (b) projection [batch, seqLen, modelDim] (pre-sigmoid).</param>
+    /// <param name="numHeads">Number of heads; modelDim must be divisible by it.</param>
+    /// <returns>The gated WKV output [batch, seqLen, modelDim].</returns>
+    Tensor<T> Rwkv7SequenceForward<T>(
+        Tensor<T> rProj,
+        Tensor<T> kProj,
+        Tensor<T> vProj,
+        Tensor<T> aProj,
+        Tensor<T> bProj,
+        int numHeads);
+
+    /// <summary>
     /// Computes the backward pass for scaled dot-product attention.
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
