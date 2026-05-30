@@ -262,11 +262,18 @@ public class NormConvAccuracyTests
     }
 
     [Theory]
-    [InlineData(1, 16, 64, 64, 32, 3, 1, 1, 1)]   // BDN benchmark shape
-    [InlineData(1, 3, 32, 32, 8, 3, 1, 1, 1)]     // small ResNet
+    [InlineData(1, 16, 64, 64, 32, 3, 1, 1, 1)]   // BDN benchmark shape (im2colOps 589K < 1M → serial Im2ColHelper)
+    [InlineData(1, 3, 32, 32, 8, 3, 1, 1, 1)]     // small ResNet (serial Im2ColHelper im2col path)
     [InlineData(2, 4, 16, 16, 6, 3, 1, 1, 1)]     // batched
     [InlineData(1, 1, 8, 8, 1, 3, 1, 1, 1)]       // single-channel edge
     [InlineData(1, 4, 16, 16, 4, 1, 1, 0, 1)]     // 1×1 conv (different fast path)
+    // Conv2DIm2colGemm im2col gate boundary: per-image im2colOps = inC·kH·kW·oH·oW.
+    // < 1M routes through the serial Im2ColHelper.Im2Col path (CNN inference win);
+    // ≥ 1M keeps the channel-parallel CopyChannel path. Guard both produce the
+    // same naive-reference output so the gate split can never silently diverge.
+    [InlineData(1, 1, 28, 28, 16, 3, 1, 1, 1)]    // parity CNN conv1 (im2colOps 7K → serial Im2ColHelper)
+    [InlineData(1, 16, 14, 14, 32, 3, 1, 1, 1)]   // parity CNN conv2 (im2colOps 28K → serial Im2ColHelper)
+    [InlineData(1, 128, 32, 32, 16, 3, 1, 1, 1)]  // im2colOps 1.18M ≥ 1M → parallel CopyChannel
     public void Conv2D_FloatMatchesDoubleReference(
         int batch, int inChannels, int height, int width,
         int outChannels, int kernelSize, int stride, int padding, int dilation)
