@@ -318,19 +318,36 @@ public partial class CpuEngine
                 // cell update into a flat contiguous pass. #477: the per-call activation
                 // overhead over the 32-step sequence was ~half the kernel wall-clock.
                 int bh = batch * hidden;
-                for (int b = 0; b < batch; b++)
+                // #477: vectorize the gate combine + de-interleave. Each (b, gType) block
+                // is a CONTIGUOUS add of two [hidden]-length runs (Wx slice + hh slice,
+                // plus optional bHh) into a contiguous destination. Using raw pointers
+                // drops the per-element bounds checks and the per-element bias branch
+                // (hoisted out of the inner loop), so the inner add auto-vectorizes to
+                // SIMD — the scalar version was a measured chunk of the per-step overhead.
+                fixed (float* wxP = wxBuf)
+                fixed (float* hhP = hhBuf)
+                fixed (float* gateP = gateBuf)
+                fixed (float* bHhP = bHhSpan)
                 {
-                    int wxRowOff = (b * seqLen + t) * gateRows;
-                    int hhOff = b * gateRows;
-                    for (int gType = 0; gType < 4; gType++)
+                    for (int b = 0; b < batch; b++)
                     {
-                        int srcG = gType * hidden;
-                        int dst = gType * bh + b * hidden;
-                        for (int h = 0; h < hidden; h++)
+                        int wxRowOff = (b * seqLen + t) * gateRows;
+                        int hhOff = b * gateRows;
+                        for (int gType = 0; gType < 4; gType++)
                         {
-                            float v = wxBuf[wxRowOff + srcG + h] + hhBuf[hhOff + srcG + h];
-                            if (hasBhh) v += bHhSpan[srcG + h];
-                            gateBuf[dst + h] = v;
+                            int srcG = gType * hidden;
+                            float* wx = wxP + wxRowOff + srcG;
+                            float* hh = hhP + hhOff + srcG;
+                            float* dst = gateP + gType * bh + b * hidden;
+                            if (hasBhh)
+                            {
+                                float* bb = bHhP + srcG;
+                                for (int h = 0; h < hidden; h++) dst[h] = wx[h] + hh[h] + bb[h];
+                            }
+                            else
+                            {
+                                for (int h = 0; h < hidden; h++) dst[h] = wx[h] + hh[h];
+                            }
                         }
                     }
                 }
@@ -338,10 +355,12 @@ public partial class CpuEngine
                 // Activate each gate-type block in a single vectorized call.
                 fixed (float* gateP = gateBuf)
                 {
-                    SimdKernels.SigmoidUnsafe(gateP + 0 * bh, gateP + 0 * bh, bh);  // i
-                    SimdKernels.SigmoidUnsafe(gateP + 1 * bh, gateP + 1 * bh, bh);  // f
-                    SimdKernels.TanhUnsafe(gateP + 2 * bh, gateP + 2 * bh, bh);     // g
-                    SimdKernels.SigmoidUnsafe(gateP + 3 * bh, gateP + 3 * bh, bh);  // o
+                    // i and f are both sigmoid and ADJACENT in the de-interleaved layout
+                    // (blocks 0 and 1), so activate them in ONE call over 2*bh — one fewer
+                    // kernel dispatch per step than activating each gate block separately.
+                    SimdKernels.SigmoidUnsafe(gateP + 0 * bh, gateP + 0 * bh, 2 * bh); // i + f
+                    SimdKernels.TanhUnsafe(gateP + 2 * bh, gateP + 2 * bh, bh);        // g
+                    SimdKernels.SigmoidUnsafe(gateP + 3 * bh, gateP + 3 * bh, bh);     // o
                 }
 
                 // Cell + hidden update over the flat [batch*hidden] blocks:
