@@ -155,6 +155,48 @@ public class MlpForwardWholeChainBench
         }
     }
 
+    [Fact]
+    public void Phase7_PerCallOverhead_Probe()
+    {
+        if (Environment.GetEnvironmentVariable("AIDOTNET_RUN_JIT_PERF") != "1") return;
+
+        // Phase 7 (option E) headroom probe: the Tensor-based engine MlpForward
+        // pays per-call overhead the array-based CompiledMlp.Run does not —
+        // AutoTensorCache.RentOrAllocate for the result tensor, two ArrayPool
+        // rents for ping-pong scratch, the BLAS thread-cap scope, plus shape
+        // checks. (Per-op tape/profiler bookkeeping already early-outs to a
+        // no-op/singleton when inactive.) Quantify that delta: if MlpForward ≈
+        // CompiledMlp the per-call overhead is already negligible and option E
+        // has no win to ship (cf. Phase 4); if there's a gap, it bounds what a
+        // leaner inference entry could save.
+        var engine = new CpuEngine();
+        int[] dims = { 784, 512, 128, 10 };
+        int layers = dims.Length - 1;
+        var w = new List<float[]>(); var b = new List<float[]?>(); var inF = new List<int>(); var outF = new List<int>();
+        var wT = new List<Tensor<float>>(); var bT = new List<Tensor<float>?>();
+        for (int l = 0; l < layers; l++)
+        {
+            var wa = MakeArr(dims[l] * dims[l + 1], 100 + l);
+            var ba = MakeArr(dims[l + 1], 200 + l);
+            w.Add(wa); b.Add(ba); inF.Add(dims[l]); outF.Add(dims[l + 1]);
+            var wt = new Tensor<float>(new[] { dims[l], dims[l + 1] }); wa.AsSpan().CopyTo(wt.AsWritableSpan()); wT.Add(wt);
+            var bt = new Tensor<float>(new[] { 1, dims[l + 1] }); ba.AsSpan().CopyTo(bt.AsWritableSpan()); bT.Add(bt);
+        }
+        var plan = CompiledMlp.Create(w, b, inF, outF, FusedActivationType.ReLU, FusedActivationType.None, maxBatch: 512);
+
+        foreach (int m in new[] { 1, 8, 32, 128 })
+        {
+            var inputArr = MakeArr(m * dims[0], 7);
+            var output = new float[m * plan.OutputFeatures];
+            var inputT = new Tensor<float>(new[] { m, dims[0] });
+            inputArr.AsSpan().CopyTo(inputT.AsWritableSpan());
+
+            double compiled = Bench(() => plan.Run(inputArr, m, output));
+            double mlpFwd = Bench(() => { var _ = engine.MlpForward(inputT, wT, bT, FusedActivationType.ReLU); });
+            _output.WriteLine($"[m={m,4}]  CompiledMlp.Run {compiled * 1000:F1}us  engine.MlpForward {mlpFwd * 1000:F1}us  overhead {(mlpFwd - compiled) * 1000:F1}us ({mlpFwd / compiled:F2}×)");
+        }
+    }
+
     private enum KernelForce { Native, Managed }
     private static readonly float[][] _nativeScratch = new float[2][];
     private static void NativePerLayer(float[] input, int m, int[] dims, List<float[]> weights, List<float[]?> biases, KernelForce force)

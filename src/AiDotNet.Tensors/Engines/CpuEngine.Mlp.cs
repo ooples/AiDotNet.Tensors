@@ -160,7 +160,18 @@ public partial class CpuEngine
                         // Last layer writes directly into the result buffer (no copy).
                         float[] dst = i == last ? outArr : (pingToggle == 0 ? bufA : bufB);
 
-                        if (PreferManagedInferenceGemm(M, curK, n))
+                        // Per-layer kernel choice: a WIDE layer (large K·N) goes to native
+                        // BLAS at EVERY batch — including the small-M latency regime.
+                        // The shared PreferManagedInferenceGemm gate keeps wide layers on
+                        // managed cached-B at M<16, but measurement (Phase5/Phase7 probes)
+                        // shows native BLAS wins the wide classifier-head layer
+                        // (e.g. 784→512) even at M=1; routing it to managed made MlpForward
+                        // ~6.7× slower than the self-tuned CompiledMlp at M=1. Managed
+                        // cached-B still wins the small layers (low K·N), where native
+                        // BLAS dispatch overhead dominates. Mirror that split here without
+                        // changing PreferManagedInferenceGemm (which FusedLinear also uses).
+                        bool preferManaged = (long)curK * n <= 200_000 || !BlasProvider.HasRawSgemm;
+                        if (preferManaged)
                         {
                             Simd.SimdGemm.SgemmWithCachedB(
                                 src.AsSpan(0, M * curK), wArr, dst.AsSpan(0, M * n), M, curK, n);
