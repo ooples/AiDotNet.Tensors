@@ -281,14 +281,11 @@ public partial class CpuEngine
             var outSpan = output.AsWritableSpan();
 
             // #477: the recurrent GEMM h_prev @ wHh^T runs once per timestep (seqLen
-            // serial calls). The old transB=true Sgemm re-transposed + re-packed the
-            // constant wHh on EVERY step — per-GEMM dispatch over the sequence was the
-            // measured bottleneck (thread-insensitive ~5.9 ms). Pre-transpose wHh
-            // [gateRows, hidden] → wHhT [hidden, gateRows] ONCE, then drive the per-step
-            // GEMM through SgemmWithCachedB: it keys the pre-packed B on the array
-            // identity, so wHhT is packed once (step 0) and reused for every later step.
-            // A fresh array (not pooled) guarantees a unique identity per call, so the
-            // pack cache can never serve stale bytes from a recycled buffer.
+            // serial calls). The old transB=true Sgemm re-transposed wHh on EVERY step.
+            // Pre-transpose wHh [gateRows, hidden] → wHhT [hidden, gateRows] ONCE, then
+            // pass wHhT as the no-transpose B operand to the per-step direct GEMM below
+            // ([hidden, gateRows] is exactly the [K, N] row-major layout SgemmSequential
+            // expects, so the per-step call needs no further transpose or packing setup).
             var wHhT = new float[hidden * gateRows];
             for (int g = 0; g < gateRows; g++)
                 for (int hh2 = 0; hh2 < hidden; hh2++)
@@ -298,13 +295,16 @@ public partial class CpuEngine
             for (int t = 0; t < seqLen; t++)
             {
                 // hh = h_prev @ wHh^T = h_prev @ wHhT, [B, hidden] @ [hidden, gateRows].
-                // No-transpose A·B with the pre-packed (cached) wHhT — pack happens once
-                // on the first step, every later step reuses it. See the wHhT note above.
-                // Kept SERIAL on purpose: parallelizing this tiny per-step GEMM across the
-                // batch loses badly (32 parallel-for dispatches over the sequence dominate
-                // the ~2M-FMA chunks — measured 4× slower), matching the issue's
-                // thread-insensitive finding.
-                SimdGemm.SgemmWithCachedB(
+                // #477: route through SgemmSequential (the DIRECT 6×16 AVX2 kernel), NOT
+                // SgemmWithCachedB. A min-of-2000 microbench at this exact shape
+                // [M=128, K=64, N=256] showed the cached-pre-packed path runs ~82 GF/s
+                // while the direct kernel runs ~103 GF/s (+24%): for this small K the
+                // cached-B tiling machinery costs more than the direct kernel's lighter
+                // per-call packing, so the "avoid re-packing" optimization was a net loss
+                // here. Kept SERIAL: parallelizing this tiny per-step GEMM across the batch
+                // loses to dispatch overhead over the 32-step sequence (the issue's
+                // thread-insensitive finding).
+                SimdGemm.SgemmSequential(
                     hPrevBuf.AsSpan(0, batch * hidden),
                     wHhT,
                     hhBuf.AsSpan(0, batch * gateRows),
