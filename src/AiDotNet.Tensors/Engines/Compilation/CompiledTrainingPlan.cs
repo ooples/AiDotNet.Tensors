@@ -264,6 +264,13 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
     // Fused optimizer state
     private Action? _optimizerUpdate;
+    // Schedule-Free SGD (#499): a transform applied to the live parameter
+    // backing BEFORE each forward pass. Schedule-Free evaluates gradients at
+    // the interpolated point y = (1-β)z + βx (not at the stored eval weights),
+    // so this hook writes y into the parameter backing every step; the
+    // optimizer update then restores the eval copy x afterwards. Null for
+    // every other optimizer (they evaluate at the live weights directly).
+    private Action? _preForwardParamTransform;
     private int _optimizerStep;
 
     /// <summary>
@@ -389,6 +396,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // capture timestamps so kept on the hot path.
         long t0 = _profileStepEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         bool stepTiming = StepTiming.Enabled;
+
+        // Schedule-Free SGD: write y = (1-β)z + βx into the live parameter
+        // backing so the forward/backward evaluate gradients at the
+        // interpolation point (no-op for every other optimizer — the field
+        // is null unless ConfigureOptimizer set ScheduleFreeSGD).
+        _preForwardParamTransform?.Invoke();
 
         // Forward: use checkpointing if enabled, otherwise straight-line delegates
         long fwdStart = stepTiming ? Stopwatch.GetTimestamp() : 0;
@@ -648,10 +661,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // Global-state optimizers adapt ONE learning-rate/distance scalar across all
         // parameters — a per-group schedule is meaningless for them, so they are only
         // supported through the ungrouped ConfigureOptimizer.
-        if (optimizerType is OptimizerType.HypergradientSGD or OptimizerType.DAdaptationSGD)
+        if (optimizerType is OptimizerType.HypergradientSGD or OptimizerType.DAdaptationSGD
+            or OptimizerType.ScheduleFreeSGD)
             throw new NotSupportedException(
-                $"{optimizerType} maintains a single global learning-rate/distance scalar and is not " +
-                "supported with per-group schedules; use the ungrouped ConfigureOptimizer.");
+                $"{optimizerType} maintains a single global learning-rate/distance/weight-sum scalar " +
+                "(or a per-step parameter transform) and is not supported with per-group schedules; " +
+                "use the ungrouped ConfigureOptimizer.");
         var ex = extras ?? new FusedOptimizerExtras();
         if (typeof(T) == typeof(float))
         {
@@ -716,7 +731,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             or OptimizerType.ASGD
             or OptimizerType.Rprop
             or OptimizerType.HypergradientSGD
-            or OptimizerType.DAdaptationSGD;
+            or OptimizerType.DAdaptationSGD
+            or OptimizerType.ScheduleFreeSGD;
 
         bool supported = supportedAnyDtype || (isFloat && supportedFloatOnly);
         if (!supported)
@@ -789,12 +805,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 or OptimizerType.AdaMax or OptimizerType.AMSGrad
                 or OptimizerType.RAdam or OptimizerType.LAMB
                 or OptimizerType.LARS or OptimizerType.ASGD or OptimizerType.Rprop
-                or OptimizerType.HypergradientSGD or OptimizerType.DAdaptationSGD;
+                or OptimizerType.HypergradientSGD or OptimizerType.DAdaptationSGD
+                or OptimizerType.ScheduleFreeSGD;   // m[p] = z (SGD trajectory)
             bool needsSecondMoment = optimizerType is OptimizerType.Adam or OptimizerType.AdamW
                 or OptimizerType.RMSprop or OptimizerType.Nadam or OptimizerType.AMSGrad
                 or OptimizerType.Adagrad
                 or OptimizerType.RAdam or OptimizerType.LAMB or OptimizerType.AdaMax
-                or OptimizerType.AdaDelta or OptimizerType.FTRL or OptimizerType.Rprop;
+                or OptimizerType.AdaDelta or OptimizerType.FTRL or OptimizerType.Rprop
+                or OptimizerType.ScheduleFreeSGD;   // v[p] = x (eval/average copy)
 
             // GPU fast path: param is GPU-resident → allocate matching GPU
             // state buffers and dispatch to backend kernels. Backends ship
@@ -907,6 +925,35 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         float exHyperLr = extras.HyperLr;
         float exGrowth = extras.DGrowthRate;
 
+        // Schedule-Free SGD (#499): z (SGD trajectory) and x (eval/average)
+        // both start at the initial parameter values. They live in m[p] / v[p]
+        // (allocated zero-filled above), so seed them from the current weights.
+        // weightSum accumulates Σ lr² across steps (Defazio p=2,q=0). The
+        // pre-forward hook writes y into the live backing each step; reset any
+        // stale hook from a prior ConfigureOptimizer for every other optimizer.
+        _preForwardParamTransform = null;
+        if (optimizerType == OptimizerType.ScheduleFreeSGD)
+        {
+            for (int p = 0; p < paramCount; p++)
+            {
+                if (paramArrays[p].Length == 0) continue; // GPU-resident: gate rejects this combo
+                Array.Copy(paramArrays[p], m[p], lengths[p]); // z ← param₀
+                Array.Copy(paramArrays[p], v[p], lengths[p]); // x ← param₀
+            }
+            float sfBeta = extras.SfBeta;
+            _preForwardParamTransform = () =>
+            {
+                for (int p = 0; p < paramCount; p++)
+                {
+                    int lenY = lengths[p];
+                    if (paramArrays[p].Length == 0) continue;
+                    fixed (float* pY = paramArrays[p], pZ = m[p], pX = v[p])
+                        FusedOptimizer.ScheduleFreeYUpdateSimd(pY, pZ, pX, lenY, sfBeta);
+                }
+            };
+        }
+        float sfWeightSum = 0f;
+
         _optimizerUpdate = () =>
         {
             _optimizerStep++;
@@ -968,6 +1015,28 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         for (int i = 0; i < len2; i++) pParam[i] -= gammaNew * pGrad[i];
                 }
                 dEst = dNew;
+                return;
+            }
+            if (optType == OptimizerType.ScheduleFreeSGD)
+            {
+                // The pre-forward hook already wrote y into the live backing and
+                // the backward computed grad at y. Update z (SGD step) and x
+                // (running weighted average) per parameter, then restore x into
+                // the live backing so the user/eval sees the average weights.
+                // weightSum is global (lr is shared across params each step), so
+                // every per-param call consumes the SAME weightSum and returns
+                // the SAME new value — capture it once.
+                float wsNext = sfWeightSum;
+                for (int p = 0; p < paramCount; p++)
+                {
+                    if (gradArrays[p].Length == 0) continue;
+                    int len2 = lengths[p];
+                    fixed (float* pZ = m[p], pX = v[p], pGrad = gradArrays[p])
+                        wsNext = FusedOptimizer.ScheduleFreeSgdUpdateSimd(
+                            pZ, pX, pGrad, len2, lr, sfWeightSum);
+                    Array.Copy(v[p], paramArrays[p], len2); // live backing ← x (eval copy)
+                }
+                sfWeightSum = wsNext;
                 return;
             }
 

@@ -127,16 +127,14 @@ public class ConfigureOptimizerFusedDispatchTests
     /// intentionally NOT wired and must be rejected at configure time, so models
     /// using them fall back to the eager tape cleanly:
     ///  • SparseAdam — sparse-gradient index lists (the plan operates on dense grads),
-    ///  • LBFGS — closure line-search (multiple loss evaluations per step),
-    ///  • ScheduleFreeSGD — needs the y = (1-β)z+βx buffer written BEFORE the forward
-    ///    pass (a pre-forward parameter transform the plan has no hook for).
-    /// (HypergradientSGD and DAdaptationSGD ARE now wired via the two-phase
-    /// global-reduction path — see the dedicated tests above.)
+    ///  • LBFGS — closure line-search (multiple loss evaluations per step).
+    /// (HypergradientSGD and DAdaptationSGD are wired via the two-phase
+    /// global-reduction path; ScheduleFreeSGD is wired via the pre-forward
+    /// parameter-transform hook — see the dedicated tests below.)
     /// </summary>
     [Theory]
     [InlineData(OptimizerType.SparseAdam)]
     [InlineData(OptimizerType.LBFGS)]
-    [InlineData(OptimizerType.ScheduleFreeSGD)]
     public void ConfigureOptimizer_UnwiredOptimizer_Throws(OptimizerType opt)
     {
         var engine = new CpuEngine();
@@ -285,10 +283,39 @@ public class ConfigureOptimizerFusedDispatchTests
         Assert.True(maxMove > 1e-3, $"D-Adaptation distance estimate did not grow (max move = {maxMove}).");
     }
 
+    /// <summary>
+    /// Schedule-Free SGD (Defazio et al. 2024) evaluates gradients at the
+    /// interpolation y = (1-β)z + βx (written into the live backing by the
+    /// plan's pre-forward hook) and returns the running-average eval copy x as
+    /// the parameter. On the convex loss Σ wᵢ² the eval weights must shrink
+    /// toward 0 (training works) AND differ from plain SGD's trajectory (the
+    /// averaging is active, not a silent SGD passthrough) while staying finite.
+    /// </summary>
+    [Fact]
+    public void ConfigureOptimizer_ScheduleFreeSGD_AveragesAndDivergesFromSGD()
+    {
+        var init = SeedFloat(16, seed: 79);
+        const int steps = 30;
+        var sf = RunGlobal(init, OptimizerType.ScheduleFreeSGD, steps, new FusedOptimizerExtras { SfBeta = 0.9f });
+        var sgd = RunGlobal(init, OptimizerType.SGD, steps, null);
+
+        double initNorm = L1Norm(init), sfNorm = L1Norm(sf), maxAbs = 0;
+        for (int i = 0; i < init.Length; i++)
+        {
+            Assert.True(!float.IsNaN(sf[i]) && !float.IsInfinity(sf[i]), "Schedule-Free produced a non-finite parameter");
+            maxAbs = Math.Max(maxAbs, Math.Abs(sf[i] - sgd[i]));
+        }
+        Assert.True(sfNorm < initNorm,
+            $"Schedule-Free eval weights did not shrink on Σwᵢ²: ‖w‖₁ {sfNorm} should be < initial {initNorm}.");
+        Assert.True(maxAbs > 1e-5,
+            $"Schedule-Free never diverged from plain SGD — the averaging/pre-forward hook appears unwired (max |Δ| = {maxAbs}).");
+    }
+
     /// <summary>Global-state optimizers are rejected with per-group schedules (configure-time).</summary>
     [Theory]
     [InlineData(OptimizerType.HypergradientSGD)]
     [InlineData(OptimizerType.DAdaptationSGD)]
+    [InlineData(OptimizerType.ScheduleFreeSGD)]
     public void ConfigureOptimizerGrouped_GlobalStateOptimizer_Throws(OptimizerType opt)
     {
         var engine = new CpuEngine();

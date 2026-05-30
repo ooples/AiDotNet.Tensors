@@ -1325,6 +1325,10 @@ public sealed class FusedOptimizerExtras
     public float D0 { get; init; } = 1e-6f;
     /// <summary>D-Adaptation per-step growth cap (Prodigy growth_rate). Default +inf (uncapped).</summary>
     public float DGrowthRate { get; init; } = float.PositiveInfinity;
+    /// <summary>Schedule-Free SGD interpolation factor β for the y-update
+    /// <c>y = (1-β)z + βx</c> (Defazio et al., 2024). Default 0.9 — the
+    /// paper's momentum-equivalent default.</summary>
+    public float SfBeta { get; init; } = 0.9f;
 }
 
 /// <summary>Optimizer type for fused parameter updates.</summary>

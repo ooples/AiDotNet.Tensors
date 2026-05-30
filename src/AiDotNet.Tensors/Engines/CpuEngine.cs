@@ -34247,6 +34247,85 @@ public partial class CpuEngine : ITensorLevelEngine
         return result;
     }
 
+    /// <summary>
+    /// Fused hierarchical softmax: class probabilities over a balanced binary
+    /// tree whose per-LEVEL routing gate is <c>sigmoid(input·nodeWeights[level])</c>.
+    /// <paramref name="input"/> is [.., D]; <paramref name="nodeWeights"/> is
+    /// [treeDepth, D] (one weight vector per tree level); the result is
+    /// [.., numClasses], where each leaf's probability is the product of the
+    /// gate decisions along its root-to-leaf path (left = 1−gate, right = gate).
+    /// The fusion computes the <c>treeDepth</c> shared gate sigmoids ONCE per row
+    /// and reuses them across every class, instead of the eager layer's
+    /// per-class gate recomputation (Morin &amp; Bengio 2005). Inference/forward-only.
+    /// </summary>
+    public virtual Tensor<T> FusedHierarchicalSoftmax<T>(Tensor<T> input, Tensor<T> nodeWeights, int numClasses)
+    {
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (nodeWeights == null) throw new ArgumentNullException(nameof(nodeWeights));
+        if (numClasses < 2) throw new ArgumentException("numClasses must be >= 2.", nameof(numClasses));
+        if (nodeWeights._shape.Length != 2)
+            throw new ArgumentException("nodeWeights must be rank-2 [treeDepth, D].", nameof(nodeWeights));
+
+        int d = input._shape[input._shape.Length - 1];
+        int treeDepth = nodeWeights._shape[0];
+        if (nodeWeights._shape[1] != d)
+            throw new ArgumentException(
+                $"nodeWeights feature dim ({nodeWeights._shape[1]}) must match input feature dim ({d}).",
+                nameof(nodeWeights));
+        // A balanced tree of depth t can address up to 2^t leaves; require
+        // enough levels to reach every class (ceil(log2(numClasses))).
+        int minDepth = 0;
+        while ((1 << minDepth) < numClasses) minDepth++;
+        if (treeDepth < minDepth)
+            throw new ArgumentException(
+                $"treeDepth ({treeDepth}) is too small for {numClasses} classes; need >= {minDepth}.",
+                nameof(nodeWeights));
+
+        int rows = input.Length / d;
+        var outShape = (int[])input._shape.Clone();
+        outShape[outShape.Length - 1] = numClasses;
+        var result = new Tensor<T>(outShape);
+
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var xa = input.GetDataArray();
+        var wa = nodeWeights.GetDataArray();
+        var oa = result.GetDataArray();
+        var one = numOps.One;
+        var gates = new T[treeDepth];
+
+        for (int r = 0; r < rows; r++)
+        {
+            int xBase = r * d;
+            // Shared per-level gates: sigmoid(input·nodeWeights[level]).
+            for (int level = 0; level < treeDepth; level++)
+            {
+                int wBase = level * d;
+                T dot = numOps.Zero;
+                for (int k = 0; k < d; k++)
+                    dot = numOps.Add(dot, numOps.Multiply(xa[xBase + k], wa[wBase + k]));
+                // sigmoid(z) = 1 / (1 + exp(-z))
+                T denom = numOps.Add(one, numOps.Exp(numOps.Negate(dot)));
+                gates[level] = numOps.Divide(one, denom);
+            }
+
+            int outBase = r * numClasses;
+            for (int c = 0; c < numClasses; c++)
+            {
+                T prob = one;
+                int node = 1;
+                for (int level = 0; level < treeDepth; level++)
+                {
+                    bool goRight = (c & (1 << (treeDepth - level - 1))) != 0;
+                    prob = numOps.Multiply(prob, goRight ? gates[level] : numOps.Subtract(one, gates[level]));
+                    node = node * 2 + (goRight ? 1 : 0);
+                    if (node >= numClasses) break;
+                }
+                oa[outBase + c] = prob;
+            }
+        }
+        return result;
+    }
+
     /// <inheritdoc/>
     public Tensor<T> FusedLinearBackward<T>(
         Tensor<T> gradOutput,

@@ -4693,6 +4693,16 @@ public interface IEngine
     Tensor<T> FusedLinearMaxout<T>(Tensor<T> input, Tensor<T> weights, Tensor<T>? bias, int numPieces);
 
     /// <summary>
+    /// Fused hierarchical softmax (Morin &amp; Bengio 2005): class probabilities
+    /// over a balanced binary tree whose per-level routing gate is
+    /// <c>sigmoid(input·nodeWeights[level])</c>. <paramref name="input"/> is
+    /// [.., D], <paramref name="nodeWeights"/> is [treeDepth, D]; the result is
+    /// [.., numClasses]. The <c>treeDepth</c> shared gate sigmoids are computed
+    /// once per row and reused across all classes. Forward/inference-only.
+    /// </summary>
+    Tensor<T> FusedHierarchicalSoftmax<T>(Tensor<T> input, Tensor<T> nodeWeights, int numClasses);
+
+    /// <summary>
     /// Computes the backward pass for fused linear transformation.
     /// </summary>
     Tensor<T> FusedLinearBackward<T>(
