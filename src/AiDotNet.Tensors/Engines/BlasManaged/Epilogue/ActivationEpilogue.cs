@@ -199,6 +199,45 @@ internal static class ActivationEpilogue
                         c[i * ldc + j] = x / (1.0 + Math.Abs(x));
                     }
                 break;
+            case FusedActivationType.RReLU:
+            {
+                double a = p?.Alpha ?? 0.22916667; // deterministic eval slope
+                for (int i = 0; i < m; i++)
+                    for (int j = 0; j < n; j++)
+                    {
+                        double x = c[i * ldc + j];
+                        c[i * ldc + j] = x > 0 ? x : a * x;
+                    }
+                break;
+            }
+            case FusedActivationType.PReLU:
+            {
+                var slope = p?.PReluSlope;
+                for (int i = 0; i < m; i++)
+                    for (int j = 0; j < n; j++)
+                    {
+                        double s = slope == null ? 0.25 : (slope.Length == 1 ? slope[0] : slope[j]);
+                        double x = c[i * ldc + j];
+                        c[i * ldc + j] = x > 0 ? x : s * x;
+                    }
+                break;
+            }
+            case FusedActivationType.Softmax:
+            case FusedActivationType.Softmin:
+            {
+                bool min = activation == FusedActivationType.Softmin;
+                for (int i = 0; i < m; i++)
+                {
+                    int row = i * ldc;
+                    double mx = double.NegativeInfinity;
+                    for (int j = 0; j < n; j++) { double v = min ? -c[row + j] : c[row + j]; if (v > mx) mx = v; }
+                    double sum = 0.0;
+                    for (int j = 0; j < n; j++) { double v = min ? -c[row + j] : c[row + j]; double e = Math.Exp(v - mx); c[row + j] = e; sum += e; }
+                    double inv = 1.0 / sum;
+                    for (int j = 0; j < n; j++) c[row + j] *= inv;
+                }
+                break;
+            }
             case FusedActivationType.None:
                 break;
             default:
@@ -369,6 +408,45 @@ internal static class ActivationEpilogue
                         c[i * ldc + j] = x / (1f + Math.Abs(x));
                     }
                 break;
+            case FusedActivationType.RReLU:
+            {
+                float a = p?.Alpha ?? 0.22916667f;
+                for (int i = 0; i < m; i++)
+                    for (int j = 0; j < n; j++)
+                    {
+                        float x = c[i * ldc + j];
+                        c[i * ldc + j] = x > 0 ? x : a * x;
+                    }
+                break;
+            }
+            case FusedActivationType.PReLU:
+            {
+                var slope = p?.PReluSlope;
+                for (int i = 0; i < m; i++)
+                    for (int j = 0; j < n; j++)
+                    {
+                        float s = slope == null ? 0.25f : (slope.Length == 1 ? slope[0] : slope[j]);
+                        float x = c[i * ldc + j];
+                        c[i * ldc + j] = x > 0 ? x : s * x;
+                    }
+                break;
+            }
+            case FusedActivationType.Softmax:
+            case FusedActivationType.Softmin:
+            {
+                bool min = activation == FusedActivationType.Softmin;
+                for (int i = 0; i < m; i++)
+                {
+                    int row = i * ldc;
+                    float mx = float.NegativeInfinity;
+                    for (int j = 0; j < n; j++) { float v = min ? -c[row + j] : c[row + j]; if (v > mx) mx = v; }
+                    float sum = 0f;
+                    for (int j = 0; j < n; j++) { float v = min ? -c[row + j] : c[row + j]; float e = (float)Math.Exp(v - mx); c[row + j] = e; sum += e; }
+                    float inv = 1f / sum;
+                    for (int j = 0; j < n; j++) c[row + j] *= inv;
+                }
+                break;
+            }
             case FusedActivationType.None:
                 break;
             default:

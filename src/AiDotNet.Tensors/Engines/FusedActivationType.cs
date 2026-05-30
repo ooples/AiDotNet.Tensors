@@ -142,7 +142,31 @@ public enum FusedActivationType
     /// Parametric (alpha/beta, defaults 1/1) — supply via
     /// <see cref="FusedActivationParams.Alpha"/> / <see cref="FusedActivationParams.Beta"/>.
     /// </summary>
-    ScaledTanh = 19
+    ScaledTanh = 19,
+
+    /// <summary>
+    /// PReLU: f(x) = x if x &gt; 0, else slope_c * x — a per-channel learned slope.
+    /// Supply the slopes via <see cref="FusedActivationParams.PReluSlope"/> (length =
+    /// output features, or 1 for a shared slope; default 0.25). Applied per output
+    /// column of the [batch, features] result, so it needs channel context (not a
+    /// pointwise scalar kernel).
+    /// </summary>
+    PReLU = 20,
+
+    /// <summary>
+    /// RReLU (randomized leaky ReLU): in inference/eval it is deterministic —
+    /// f(x) = x if x &gt; 0, else alpha * x with alpha = (lower+upper)/2 (PyTorch
+    /// default (1/8+1/3)/2 ≈ 0.2292). Supply the eval slope via
+    /// <see cref="FusedActivationParams.Alpha"/>. (Fused paths are inference-only;
+    /// the training-time random slope is not fused.)
+    /// </summary>
+    RReLU = 21,
+
+    /// <summary>
+    /// Softmin: softmax(-x) over each row — f(x)_i = exp(-x_i) / Σ_j exp(-x_j).
+    /// Row-wise (not pointwise); applied across the feature dimension after the GEMM.
+    /// </summary>
+    Softmin = 22
 }
 
 /// <summary>
@@ -165,4 +189,10 @@ public sealed class FusedActivationParams
     public float? Beta { get; init; }
     /// <summary>ThresholdedReLU threshold. Default 1.</summary>
     public float? Theta { get; init; }
+    /// <summary>
+    /// PReLU per-channel negative slopes — length = output features (one per column
+    /// of the [batch, features] result), or length 1 for a single shared slope.
+    /// Null ⇒ 0.25 shared (PyTorch PReLU default init).
+    /// </summary>
+    public float[]? PReluSlope { get; init; }
 }

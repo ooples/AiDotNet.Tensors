@@ -117,6 +117,7 @@ public class MlpForwardActivationParityTests
     private static double ParamRef(FusedActivationType act, double x, FusedActivationParams p) => act switch
     {
         FusedActivationType.LeakyReLU => x > 0 ? x : p.Alpha!.Value * x,
+        FusedActivationType.RReLU => x > 0 ? x : p.Alpha!.Value * x,
         FusedActivationType.ELU => x > 0 ? x : p.Alpha!.Value * (Math.Exp(x) - 1.0),
         FusedActivationType.CELU => x >= 0 ? x : p.Alpha!.Value * (Math.Exp(x / p.Alpha!.Value) - 1.0),
         FusedActivationType.ThresholdedReLU => x > p.Theta!.Value ? x : 0.0,
@@ -127,6 +128,7 @@ public class MlpForwardActivationParityTests
     public static TheoryData<FusedActivationType, FusedActivationParams> ParametricCases => new()
     {
         { FusedActivationType.LeakyReLU, new FusedActivationParams { Alpha = 0.2f } },   // non-default slope
+        { FusedActivationType.RReLU, new FusedActivationParams { Alpha = 0.15f } },       // eval slope
         { FusedActivationType.ELU, new FusedActivationParams { Alpha = 2.0f } },          // non-default alpha
         { FusedActivationType.CELU, new FusedActivationParams { Alpha = 1.5f } },
         { FusedActivationType.ThresholdedReLU, new FusedActivationParams { Theta = 0.5f } },
@@ -165,6 +167,83 @@ public class MlpForwardActivationParityTests
             double actual = Convert.ToDouble(fused[i]);
             Assert.True(Math.Abs(expected - actual) < 1e-4,
                 $"{act} params: MlpForward {actual} != {expected} at {i} (raw={raw[i]}).");
+        }
+    }
+
+    /// <summary>PReLU applies a per-output-channel (per-column) learned slope.</summary>
+    [Fact]
+    public void MlpForward_PReLU_AppliesPerChannelSlope()
+    {
+        var engine = new CpuEngine();
+        const int batch = 4, inF = 16, outF = 8;
+        var rng = new Random(20260602);
+        var wData = new float[inF * outF];
+        for (int i = 0; i < wData.Length; i++) wData[i] = (float)(rng.NextDouble() * 2.0 - 1.0);
+        var w = new Tensor<float>(wData, new[] { inF, outF });
+        var xData = new float[batch * inF];
+        for (int i = 0; i < xData.Length; i++) xData[i] = (float)(rng.NextDouble() * 4.0 - 2.0);
+        var x = new Tensor<float>(xData, new[] { batch, inF });
+        var slope = new float[outF];
+        for (int j = 0; j < outF; j++) slope[j] = 0.05f + 0.1f * j; // distinct per channel
+
+        var weights = new System.Collections.Generic.List<Tensor<float>> { w };
+        var noBias = new System.Collections.Generic.List<Tensor<float>?> { null };
+
+        var raw = engine.MlpForward(x, weights, noBias, FusedActivationType.None, FusedActivationType.None);
+        var fused = engine.MlpForward(x, weights, noBias, FusedActivationType.None, FusedActivationType.PReLU,
+            outputActivationParams: new FusedActivationParams { PReluSlope = slope });
+
+        for (int i = 0; i < batch; i++)
+            for (int j = 0; j < outF; j++)
+            {
+                double v = Convert.ToDouble(raw[i * outF + j]);
+                double expected = v > 0 ? v : slope[j] * v;
+                double actual = Convert.ToDouble(fused[i * outF + j]);
+                Assert.True(Math.Abs(expected - actual) < 1e-4,
+                    $"PReLU col {j}: {actual} != {expected} (raw={v}).");
+            }
+    }
+
+    /// <summary>Softmax / Softmin normalize across each row (feature dim).</summary>
+    [Theory]
+    [InlineData(FusedActivationType.Softmax)]
+    [InlineData(FusedActivationType.Softmin)]
+    public void MlpForward_SoftmaxSoftmin_NormalizesEachRow(FusedActivationType act)
+    {
+        var engine = new CpuEngine();
+        const int batch = 4, inF = 16, outF = 8;
+        var rng = new Random(20260603);
+        var wData = new float[inF * outF];
+        for (int i = 0; i < wData.Length; i++) wData[i] = (float)(rng.NextDouble() * 2.0 - 1.0);
+        var w = new Tensor<float>(wData, new[] { inF, outF });
+        var xData = new float[batch * inF];
+        for (int i = 0; i < xData.Length; i++) xData[i] = (float)(rng.NextDouble() * 4.0 - 2.0);
+        var x = new Tensor<float>(xData, new[] { batch, inF });
+
+        var weights = new System.Collections.Generic.List<Tensor<float>> { w };
+        var noBias = new System.Collections.Generic.List<Tensor<float>?> { null };
+
+        var raw = engine.MlpForward(x, weights, noBias, FusedActivationType.None, FusedActivationType.None);
+        var fused = engine.MlpForward(x, weights, noBias, FusedActivationType.None, act);
+
+        bool min = act == FusedActivationType.Softmin;
+        for (int i = 0; i < batch; i++)
+        {
+            // independent reference softmax over the row
+            double mx = double.NegativeInfinity;
+            for (int j = 0; j < outF; j++) { double v = min ? -raw[i * outF + j] : raw[i * outF + j]; if (v > mx) mx = v; }
+            double sum = 0; var exp = new double[outF];
+            for (int j = 0; j < outF; j++) { double v = min ? -raw[i * outF + j] : raw[i * outF + j]; exp[j] = Math.Exp(v - mx); sum += exp[j]; }
+            double rowSum = 0;
+            for (int j = 0; j < outF; j++)
+            {
+                double expected = exp[j] / sum;
+                double actual = Convert.ToDouble(fused[i * outF + j]);
+                Assert.True(Math.Abs(expected - actual) < 1e-5,
+                    $"{act} row {i} col {j}: {actual} != {expected}.");
+                rowSum += actual;
+            }
+            Assert.True(Math.Abs(rowSum - 1.0) < 1e-4, $"{act} row {i} does not sum to 1 ({rowSum}).");
         }
     }
 }

@@ -85,6 +85,7 @@ public class EpilogueActivationParityTests
     private static double ParamRef(FusedActivationType act, double x, FusedActivationParams p) => act switch
     {
         FusedActivationType.LeakyReLU => x >= 0 ? x : p.Alpha!.Value * x,
+        FusedActivationType.RReLU => x > 0 ? x : p.Alpha!.Value * x,
         FusedActivationType.ELU => x > 0 ? x : p.Alpha!.Value * (Math.Exp(x) - 1.0),
         FusedActivationType.CELU => x >= 0 ? x : p.Alpha!.Value * (Math.Exp(x / p.Alpha!.Value) - 1.0),
         FusedActivationType.ThresholdedReLU => x > p.Theta!.Value ? x : 0.0,
@@ -95,11 +96,46 @@ public class EpilogueActivationParityTests
     public static TheoryData<FusedActivationType, FusedActivationParams> ParametricCases => new()
     {
         { FusedActivationType.LeakyReLU, new FusedActivationParams { Alpha = 0.2f } },
+        { FusedActivationType.RReLU, new FusedActivationParams { Alpha = 0.15f } },
         { FusedActivationType.ELU, new FusedActivationParams { Alpha = 2.0f } },
         { FusedActivationType.CELU, new FusedActivationParams { Alpha = 1.5f } },
         { FusedActivationType.ThresholdedReLU, new FusedActivationParams { Theta = 0.5f } },
         { FusedActivationType.ScaledTanh, new FusedActivationParams { Alpha = 1.7f, Beta = 0.66f } },
     };
+
+    /// <summary>Epilogue PReLU (per-channel slope) + Softmax/Softmin (row-wise).</summary>
+    [Fact]
+    public void ApplyFp32_PReLU_PerChannel_And_Softmax_Softmin()
+    {
+        // PReLU: 2 rows × 4 cols, distinct per-column slope.
+        var slope = new float[] { 0.1f, 0.2f, 0.3f, 0.4f };
+        var data = new float[] { -1f, 2f, -3f, 4f, 5f, -6f, 7f, -8f };
+        var expected = new float[8];
+        for (int i = 0; i < 2; i++)
+            for (int j = 0; j < 4; j++)
+            {
+                float v = data[i * 4 + j];
+                expected[i * 4 + j] = v > 0 ? v : slope[j] * v;
+            }
+        ActivationEpilogue.Apply<float>(data, ldc: 4, m: 2, n: 4, FusedActivationType.PReLU,
+            new FusedActivationParams { PReluSlope = slope });
+        for (int k = 0; k < 8; k++)
+            Assert.True(Math.Abs(expected[k] - data[k]) < 1e-5, $"PReLU mismatch at {k}: {data[k]} != {expected[k]}");
+
+        // Softmax over a single row of 4.
+        var sm = new float[] { 1f, 2f, 3f, 4f };
+        ActivationEpilogue.Apply<float>(sm, ldc: 4, m: 1, n: 4, FusedActivationType.Softmax);
+        float smSum = 0; foreach (var v in sm) smSum += v;
+        Assert.True(Math.Abs(smSum - 1f) < 1e-5, $"Softmax row sum {smSum} != 1");
+        Assert.True(sm[3] > sm[2] && sm[2] > sm[1] && sm[1] > sm[0], "Softmax should be monotonic in input");
+
+        // Softmin = softmax(-x): smallest input gets the largest weight.
+        var smin = new float[] { 1f, 2f, 3f, 4f };
+        ActivationEpilogue.Apply<float>(smin, ldc: 4, m: 1, n: 4, FusedActivationType.Softmin);
+        float sminSum = 0; foreach (var v in smin) sminSum += v;
+        Assert.True(Math.Abs(sminSum - 1f) < 1e-5, $"Softmin row sum {sminSum} != 1");
+        Assert.True(smin[0] > smin[1] && smin[1] > smin[2] && smin[2] > smin[3], "Softmin should be anti-monotonic in input");
+    }
 
     [Theory]
     [MemberData(nameof(ParametricCases))]

@@ -562,6 +562,46 @@ public static class CpuFusedOperations
         bool hasActivation = activation != FusedActivationType.None;
         if (!hasBias && !hasActivation) return;
 
+        // PReLU / Softmax / Softmin need per-column or per-row context (not a
+        // pointwise scalar), so they get a dedicated bias-then-activation pass.
+        if (activation is FusedActivationType.PReLU or FusedActivationType.Softmax or FusedActivationType.Softmin)
+        {
+            if (hasBias)
+                for (int i = 0; i < M; i++)
+                    for (int j = 0; j < N; j++)
+                        output[i * N + j] += bias![j];
+
+            if (activation == FusedActivationType.PReLU)
+            {
+                var slope = activationParams?.PReluSlope;
+                for (int i = 0; i < M; i++)
+                {
+                    int row = i * N;
+                    for (int j = 0; j < N; j++)
+                    {
+                        float s = slope == null ? 0.25f : (slope.Length == 1 ? slope[0] : slope[j]);
+                        float v = output[row + j];
+                        output[row + j] = v > 0f ? v : s * v;
+                    }
+                }
+            }
+            else
+            {
+                bool min = activation == FusedActivationType.Softmin; // softmax over -x
+                for (int i = 0; i < M; i++)
+                {
+                    int row = i * N;
+                    float mx = float.NegativeInfinity;
+                    for (int j = 0; j < N; j++) { float v = min ? -output[row + j] : output[row + j]; if (v > mx) mx = v; }
+                    float sum = 0f;
+                    for (int j = 0; j < N; j++) { float v = min ? -output[row + j] : output[row + j]; float e = MathF.Exp(v - mx); output[row + j] = e; sum += e; }
+                    float inv = 1f / sum;
+                    for (int j = 0; j < N; j++) output[row + j] *= inv;
+                }
+            }
+            return;
+        }
+
 #if NET5_0_OR_GREATER
         // Path B: SIMD-vectorised bias + activation epilogue. The prior scalar
         // loop with per-element delegate dispatch took ~8 ms on BERT FFN
@@ -1259,6 +1299,12 @@ public static class CpuFusedOperations
         {
             case FusedActivationType.LeakyReLU when p?.Alpha is float la:
                 return x => x > 0f ? x : la * x;
+            case FusedActivationType.RReLU:
+            {
+                // Inference/eval: deterministic slope (lower+upper)/2. PyTorch default ≈ 0.2292.
+                float a = p?.Alpha ?? 0.22916667f;
+                return x => x > 0f ? x : a * x;
+            }
             case FusedActivationType.ELU when p?.Alpha is float ea:
                 return x => x > 0f ? x : ea * (MathF.Exp(x) - 1f);
             case FusedActivationType.CELU:
@@ -1385,6 +1431,45 @@ public static class CpuFusedOperations
         bool hasActivation = activation != FusedActivationType.None;
         if (!hasBias && !hasActivation) return;
 
+        // PReLU / Softmax / Softmin: per-column / per-row, not pointwise.
+        if (activation is FusedActivationType.PReLU or FusedActivationType.Softmax or FusedActivationType.Softmin)
+        {
+            if (hasBias)
+                for (int i = 0; i < M; i++)
+                    for (int j = 0; j < N; j++)
+                        output[i * N + j] += bias![j];
+
+            if (activation == FusedActivationType.PReLU)
+            {
+                var slope = activationParams?.PReluSlope;
+                for (int i = 0; i < M; i++)
+                {
+                    int row = i * N;
+                    for (int j = 0; j < N; j++)
+                    {
+                        double s = slope == null ? 0.25 : (slope.Length == 1 ? slope[0] : slope[j]);
+                        double v = output[row + j];
+                        output[row + j] = v > 0.0 ? v : s * v;
+                    }
+                }
+            }
+            else
+            {
+                bool min = activation == FusedActivationType.Softmin;
+                for (int i = 0; i < M; i++)
+                {
+                    int row = i * N;
+                    double mx = double.NegativeInfinity;
+                    for (int j = 0; j < N; j++) { double v = min ? -output[row + j] : output[row + j]; if (v > mx) mx = v; }
+                    double sum = 0.0;
+                    for (int j = 0; j < N; j++) { double v = min ? -output[row + j] : output[row + j]; double e = Math.Exp(v - mx); output[row + j] = e; sum += e; }
+                    double inv = 1.0 / sum;
+                    for (int j = 0; j < N; j++) output[row + j] *= inv;
+                }
+            }
+            return;
+        }
+
         // Hoist the delegate lookup outside the hot loop
         Func<double, double>? activationFn = hasActivation ? GetDoubleActivation(activation, activationParams) : null;
 
@@ -1432,6 +1517,11 @@ public static class CpuFusedOperations
         {
             case FusedActivationType.LeakyReLU when p?.Alpha is float la:
                 return x => x > 0.0 ? x : la * x;
+            case FusedActivationType.RReLU:
+            {
+                double a = p?.Alpha ?? 0.22916667f;
+                return x => x > 0.0 ? x : a * x;
+            }
             case FusedActivationType.ELU when p?.Alpha is float ea:
                 return x => x > 0.0 ? x : ea * (Math.Exp(x) - 1.0);
             case FusedActivationType.CELU:
