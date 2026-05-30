@@ -378,6 +378,121 @@ public class DCGANStepProbe
         return sb.ToString();
     }
 
+    /// <summary>
+    /// Issue #403 Phase D — Conv2DForward sub-step breakdown at the DCGAN shape.
+    /// Forward lowers to im2col + GEMM per batch (no kernel transpose — the
+    /// kernel is already [outC, colH]). Splits the wrapper into im2col vs GEMM
+    /// so we know which (if either) is the lever for the remaining ~790µs.
+    /// Single-batch cost.
+    /// </summary>
+    public static string RunForwardBreakdown(int innerReps = 50, int outerSamples = 25)
+    {
+        int colH = InChannels * KernelHW * KernelHW; // K = 1024
+        int colW = SpatialOut * SpatialOut;          // N = 49
+        var rng = new Random(13);
+        double[] R(int n) { var x = new double[n]; for (int i = 0; i < n; i++) x[i] = rng.NextDouble(); return x; }
+
+        double[] inputSlice = R(InChannels * SpatialIn * SpatialIn); // one image
+        double[] kernel = R(OutChannels * colH);                     // [outC, colH]
+        double[] col = new double[colH * colW];
+        double[] output = new double[OutChannels * colW];
+
+        void Im2ColD() => Im2ColHelper.Im2Col(
+            new ReadOnlySpan<double>(inputSlice), new Span<double>(col),
+            1, InChannels, SpatialIn, SpatialIn, KernelHW, KernelHW,
+            Stride, Stride, Padding, Padding, 1, 1);
+        void Gemm() => Engines.BlasManaged.BlasManaged.Gemm<double>(
+            kernel, colH, false, col, colW, false, output, colW, OutChannels, colW, colH);
+
+        Im2ColD(); Gemm();
+        double i2c = MinTime(Im2ColD, innerReps, outerSamples);
+        double g = MinTime(Gemm, innerReps, outerSamples);
+
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine("Conv2DForward sub-step breakdown (min-of-many, µs, single batch slice):");
+        sb.AppendLine($"  {i2c / 1000.0,10:N3} µs  Im2Col (double, per batch)");
+        sb.AppendLine($"  {g / 1000.0,10:N3} µs  GEMM outC×colW×colH (M=64,N=49,K=1024, full width)");
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// Issue #403 Phase D — strategy sweep for the three conv GEMM shapes.
+    /// Each shape is timed under Auto (the deterministic-mode static heuristic)
+    /// vs forced Streaming / PackAOnly / PackBoth, so we can see whether the
+    /// heuristic's PackBoth choice is wrong for these small-output/large-K
+    /// shapes (where pack overhead dwarfs the ~6.4 MFLOP compute).
+    /// </summary>
+    public static string RunConvGemmStrategySweep(int innerReps = 50, int outerSamples = 25)
+    {
+        int colH = InChannels * KernelHW * KernelHW; // 1024
+        int colW = SpatialOut * SpatialOut;          // 49
+        var rng = new Random(17);
+        double[] R(int n) { var x = new double[n]; for (int i = 0; i < n; i++) x[i] = rng.NextDouble(); return x; }
+
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine("Conv GEMM strategy sweep (min-of-many, µs/call):");
+
+        // Forward: C[outC,colW] = kernel[outC,colH] @ im2col[colH,colW]  (NN)
+        {
+            double[] kern = R(OutChannels * colH), col = R(colH * colW), o = new double[OutChannels * colW];
+            double Run(Engines.BlasManaged.PackingMode pm) => MinTime(() =>
+                Engines.BlasManaged.BlasManaged.Gemm<double>(kern, colH, false, col, colW, false, o, colW,
+                    OutChannels, colW, colH, new Engines.BlasManaged.BlasOptions<double> { PackingMode = pm }),
+                innerReps, outerSamples);
+            sb.AppendLine($"  Forward       M=64  N=49   K=1024 NN : Auto {Run(Engines.BlasManaged.PackingMode.Auto)/1000.0,8:N2}  Stream {Run(Engines.BlasManaged.PackingMode.ForceStreaming)/1000.0,8:N2}  PackA {Run(Engines.BlasManaged.PackingMode.ForcePackAOnly)/1000.0,8:N2}  PackBoth {Run(Engines.BlasManaged.PackingMode.ForcePackBoth)/1000.0,8:N2}");
+        }
+        // BackwardInput: C[colH,colW] = kernel^T[colH,outC] @ gradOut[outC,colW]  (transA)
+        {
+            double[] kern = R(OutChannels * colH), go = R(OutChannels * colW), o = new double[colH * colW];
+            double Run(Engines.BlasManaged.PackingMode pm) => MinTime(() =>
+                Engines.BlasManaged.BlasManaged.Gemm<double>(kern, colH, true, go, colW, false, o, colW,
+                    colH, colW, OutChannels, new Engines.BlasManaged.BlasOptions<double> { PackingMode = pm }),
+                innerReps, outerSamples);
+            sb.AppendLine($"  BackwardInput M=1024 N=49  K=64   tA : Auto {Run(Engines.BlasManaged.PackingMode.Auto)/1000.0,8:N2}  Stream {Run(Engines.BlasManaged.PackingMode.ForceStreaming)/1000.0,8:N2}  PackA {Run(Engines.BlasManaged.PackingMode.ForcePackAOnly)/1000.0,8:N2}  PackBoth {Run(Engines.BlasManaged.PackingMode.ForcePackBoth)/1000.0,8:N2}");
+        }
+        // BackwardKernel: C[outC,colH] = gradOut[outC,colW] @ im2col[colH,colW]^T  (transB)
+        {
+            double[] go = R(OutChannels * colW), col = R(colH * colW), o = new double[OutChannels * colH];
+            double Run(Engines.BlasManaged.PackingMode pm) => MinTime(() =>
+                Engines.BlasManaged.BlasManaged.Gemm<double>(go, colW, false, col, colW, true, o, colH,
+                    OutChannels, colH, colW, new Engines.BlasManaged.BlasOptions<double> { PackingMode = pm }),
+                innerReps, outerSamples);
+            sb.AppendLine($"  BackwardKern  M=64  N=1024 K=49   tB : Auto {Run(Engines.BlasManaged.PackingMode.Auto)/1000.0,8:N2}  Stream {Run(Engines.BlasManaged.PackingMode.ForceStreaming)/1000.0,8:N2}  PackA {Run(Engines.BlasManaged.PackingMode.ForcePackAOnly)/1000.0,8:N2}  PackBoth {Run(Engines.BlasManaged.PackingMode.ForcePackBoth)/1000.0,8:N2}");
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// Issue #403 Phase D — machine-code-vs-managed crossover for NN GEMMs.
+    /// Forward routes through the #409 machine-code fast path (Auto, NN) which
+    /// is ~5× slower than managed for small outputs. Sweep (M,N) at K=1024 to
+    /// find where machine-code (Auto) catches up to PackBoth, so a min-output
+    /// guard on the machine-code gate can exclude only the loss region.
+    /// </summary>
+    public static string RunMachineKernelCrossover(int innerReps = 30, int outerSamples = 20)
+    {
+        var rng = new Random(19);
+        double[] R(int n) { var x = new double[n]; for (int i = 0; i < n; i++) x[i] = rng.NextDouble(); return x; }
+
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine("Machine-code (Auto,NN) vs PackBoth crossover, K=1024 (min-of-many, µs/call):");
+        (int m, int n)[] shapes = { (64, 49), (64, 256), (128, 128), (256, 256), (256, 49), (512, 512), (1024, 49) };
+        const int K = 1024;
+        foreach (var (m, n) in shapes)
+        {
+            double[] a = R(m * K), bb = R(K * n), c = new double[m * n];
+            double auto = MinTime(() => Engines.BlasManaged.BlasManaged.Gemm<double>(
+                a, K, false, bb, n, false, c, n, m, n, K), innerReps, outerSamples);
+            double packBoth = MinTime(() => Engines.BlasManaged.BlasManaged.Gemm<double>(
+                a, K, false, bb, n, false, c, n, m, n, K,
+                new Engines.BlasManaged.BlasOptions<double> { PackingMode = Engines.BlasManaged.PackingMode.ForcePackBoth }),
+                innerReps, outerSamples);
+            string winner = auto <= packBoth * 1.05 ? "machine-code OK" : "MANAGED WINS";
+            sb.AppendLine($"  M={m,5} N={n,5} (M·N={m * n,8}) : Auto {auto / 1000.0,8:N2}  PackBoth {packBoth / 1000.0,8:N2}  -> {winner}");
+        }
+        return sb.ToString();
+    }
+
     /// <summary>Minimum per-call nanoseconds across <paramref name="outerSamples"/>
     /// samples, each averaging <paramref name="innerReps"/> back-to-back calls.</summary>
     private static double MinTime(Action action, int innerReps, int outerSamples)

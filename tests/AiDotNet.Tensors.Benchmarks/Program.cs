@@ -195,6 +195,15 @@ class Program
             Console.WriteLine(DCGANStepProbe.RunBackwardInputBreakdown());
 
             Console.WriteLine();
+            Console.WriteLine(DCGANStepProbe.RunForwardBreakdown());
+
+            Console.WriteLine();
+            Console.WriteLine(DCGANStepProbe.RunConvGemmStrategySweep());
+
+            Console.WriteLine();
+            Console.WriteLine(DCGANStepProbe.RunMachineKernelCrossover());
+
+            Console.WriteLine();
             using (var shapes = new AiDotNet.Tensors.Helpers.ShapeInstrumenter())
             {
                 var probe = new DCGANStepProbe();
