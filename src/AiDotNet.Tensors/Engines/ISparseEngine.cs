@@ -74,7 +74,12 @@ public interface ISparseEngine
     /// Time complexity: O(nnz * K) where K is the number of columns in B.
     /// </para>
     /// </remarks>
-    Matrix<T> SpMM<T>(SparseTensor<T> sparse, Matrix<T> dense);
+    /// <remarks>
+    /// <para><b>#379:</b> <c>T : unmanaged</c> is required so SpMM can route through
+    /// the SIMD/parallel <see cref="BlasManaged.BlasManaged.SpMM{T}"/> kernel. All
+    /// numeric element types used in this library satisfy it.</para>
+    /// </remarks>
+    Matrix<T> SpMM<T>(SparseTensor<T> sparse, Matrix<T> dense) where T : unmanaged;
 
     /// <summary>
     /// Sparse matrix-sparse matrix multiplication: C = A * B (both sparse)
