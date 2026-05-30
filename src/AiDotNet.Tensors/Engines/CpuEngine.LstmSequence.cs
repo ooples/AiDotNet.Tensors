@@ -281,14 +281,11 @@ public partial class CpuEngine
             var outSpan = output.AsWritableSpan();
 
             // #477: the recurrent GEMM h_prev @ wHh^T runs once per timestep (seqLen
-            // serial calls). The old transB=true Sgemm re-transposed + re-packed the
-            // constant wHh on EVERY step — per-GEMM dispatch over the sequence was the
-            // measured bottleneck (thread-insensitive ~5.9 ms). Pre-transpose wHh
-            // [gateRows, hidden] → wHhT [hidden, gateRows] ONCE, then drive the per-step
-            // GEMM through SgemmWithCachedB: it keys the pre-packed B on the array
-            // identity, so wHhT is packed once (step 0) and reused for every later step.
-            // A fresh array (not pooled) guarantees a unique identity per call, so the
-            // pack cache can never serve stale bytes from a recycled buffer.
+            // serial calls). The old transB=true Sgemm re-transposed wHh on EVERY step.
+            // Pre-transpose wHh [gateRows, hidden] → wHhT [hidden, gateRows] ONCE, then
+            // pass wHhT as the no-transpose B operand to the per-step direct GEMM below
+            // ([hidden, gateRows] is exactly the [K, N] row-major layout SgemmSequential
+            // expects, so the per-step call needs no further transpose or packing setup).
             var wHhT = new float[hidden * gateRows];
             for (int g = 0; g < gateRows; g++)
                 for (int hh2 = 0; hh2 < hidden; hh2++)
@@ -298,13 +295,16 @@ public partial class CpuEngine
             for (int t = 0; t < seqLen; t++)
             {
                 // hh = h_prev @ wHh^T = h_prev @ wHhT, [B, hidden] @ [hidden, gateRows].
-                // No-transpose A·B with the pre-packed (cached) wHhT — pack happens once
-                // on the first step, every later step reuses it. See the wHhT note above.
-                // Kept SERIAL on purpose: parallelizing this tiny per-step GEMM across the
-                // batch loses badly (32 parallel-for dispatches over the sequence dominate
-                // the ~2M-FMA chunks — measured 4× slower), matching the issue's
-                // thread-insensitive finding.
-                SimdGemm.SgemmWithCachedB(
+                // #477: route through SgemmSequential (the DIRECT 6×16 AVX2 kernel), NOT
+                // SgemmWithCachedB. A min-of-2000 microbench at this exact shape
+                // [M=128, K=64, N=256] showed the cached-pre-packed path runs ~82 GF/s
+                // while the direct kernel runs ~103 GF/s (+24%): for this small K the
+                // cached-B tiling machinery costs more than the direct kernel's lighter
+                // per-call packing, so the "avoid re-packing" optimization was a net loss
+                // here. Kept SERIAL: parallelizing this tiny per-step GEMM across the batch
+                // loses to dispatch overhead over the 32-step sequence (the issue's
+                // thread-insensitive finding).
+                SimdGemm.SgemmSequential(
                     hPrevBuf.AsSpan(0, batch * hidden),
                     wHhT,
                     hhBuf.AsSpan(0, batch * gateRows),
@@ -318,19 +318,36 @@ public partial class CpuEngine
                 // cell update into a flat contiguous pass. #477: the per-call activation
                 // overhead over the 32-step sequence was ~half the kernel wall-clock.
                 int bh = batch * hidden;
-                for (int b = 0; b < batch; b++)
+                // #477: vectorize the gate combine + de-interleave. Each (b, gType) block
+                // is a CONTIGUOUS add of two [hidden]-length runs (Wx slice + hh slice,
+                // plus optional bHh) into a contiguous destination. Using raw pointers
+                // drops the per-element bounds checks and the per-element bias branch
+                // (hoisted out of the inner loop), so the inner add auto-vectorizes to
+                // SIMD — the scalar version was a measured chunk of the per-step overhead.
+                fixed (float* wxP = wxBuf)
+                fixed (float* hhP = hhBuf)
+                fixed (float* gateP = gateBuf)
+                fixed (float* bHhP = bHhSpan)
                 {
-                    int wxRowOff = (b * seqLen + t) * gateRows;
-                    int hhOff = b * gateRows;
-                    for (int gType = 0; gType < 4; gType++)
+                    for (int b = 0; b < batch; b++)
                     {
-                        int srcG = gType * hidden;
-                        int dst = gType * bh + b * hidden;
-                        for (int h = 0; h < hidden; h++)
+                        int wxRowOff = (b * seqLen + t) * gateRows;
+                        int hhOff = b * gateRows;
+                        for (int gType = 0; gType < 4; gType++)
                         {
-                            float v = wxBuf[wxRowOff + srcG + h] + hhBuf[hhOff + srcG + h];
-                            if (hasBhh) v += bHhSpan[srcG + h];
-                            gateBuf[dst + h] = v;
+                            int srcG = gType * hidden;
+                            float* wx = wxP + wxRowOff + srcG;
+                            float* hh = hhP + hhOff + srcG;
+                            float* dst = gateP + gType * bh + b * hidden;
+                            if (hasBhh)
+                            {
+                                float* bb = bHhP + srcG;
+                                for (int h = 0; h < hidden; h++) dst[h] = wx[h] + hh[h] + bb[h];
+                            }
+                            else
+                            {
+                                for (int h = 0; h < hidden; h++) dst[h] = wx[h] + hh[h];
+                            }
                         }
                     }
                 }
@@ -338,10 +355,12 @@ public partial class CpuEngine
                 // Activate each gate-type block in a single vectorized call.
                 fixed (float* gateP = gateBuf)
                 {
-                    SimdKernels.SigmoidUnsafe(gateP + 0 * bh, gateP + 0 * bh, bh);  // i
-                    SimdKernels.SigmoidUnsafe(gateP + 1 * bh, gateP + 1 * bh, bh);  // f
-                    SimdKernels.TanhUnsafe(gateP + 2 * bh, gateP + 2 * bh, bh);     // g
-                    SimdKernels.SigmoidUnsafe(gateP + 3 * bh, gateP + 3 * bh, bh);  // o
+                    // i and f are both sigmoid and ADJACENT in the de-interleaved layout
+                    // (blocks 0 and 1), so activate them in ONE call over 2*bh — one fewer
+                    // kernel dispatch per step than activating each gate block separately.
+                    SimdKernels.SigmoidUnsafe(gateP + 0 * bh, gateP + 0 * bh, 2 * bh); // i + f
+                    SimdKernels.TanhUnsafe(gateP + 2 * bh, gateP + 2 * bh, bh);        // g
+                    SimdKernels.SigmoidUnsafe(gateP + 3 * bh, gateP + 3 * bh, bh);     // o
                 }
 
                 // Cell + hidden update over the flat [batch*hidden] blocks:
