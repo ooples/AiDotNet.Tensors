@@ -144,14 +144,16 @@ internal sealed class CompiledMlp
         int layers = _weights.Length;
         float[] src = input;
         int curK = _inFeat[0];
+        // Resolve the per-layer kernel choice (managed cached-B vs native BLAS)
+        // for this batch from the self-tuner — see SelectKernels.
+        byte[] kernelChoice = SelectKernels(batch);
         // Ping-pong: layer i writes into dst, which becomes the next src.
         for (int i = 0; i < layers; i++)
         {
             int n = _outFeat[i];
             float[] dst = (i % 2 == 0) ? _bufA : _bufB;   // src=input(layer0) → bufA → bufB → bufA …
 
-            SimdGemm.SgemmWithCachedB(
-                src.AsSpan(0, batch * curK), _weights[i], dst.AsSpan(0, batch * n), batch, curK, n);
+            RunLayerGemm(kernelChoice[i], src, _weights[i], dst, batch, curK, n);
 
             var bArr = _biases[i];
             if (bArr is not null || _act[i] != FusedActivationType.None)
@@ -163,5 +165,118 @@ internal sealed class CompiledMlp
 
         // src now holds the final layer output in a ping-pong buffer; copy out.
         Array.Copy(src, 0, output, 0, batch * OutputFeatures);
+    }
+
+    // Per-layer GEMM kernel selector. KernelManaged = managed cached-B
+    // (SgemmWithCachedB, prepacked, low dispatch overhead — wins on the tiny
+    // layers); KernelNative = native BLAS (re-packs B per call but saturates
+    // wide layers). The split matters: the static CompiledMlp routed every
+    // layer through managed cached-B, which left ~2.5× on the table for the
+    // wide first layer of a typical classifier head (AIsEval 784→512→128→10:
+    // native is 0.40–0.56× of always-managed at every batch — Phase5 probe).
+    private const byte KernelManaged = 0;
+    private const byte KernelNative = 1;
+
+    private static unsafe void RunLayerGemm(byte kernel, float[] src, float[] weight, float[] dst, int m, int k, int n)
+    {
+        if (kernel == KernelNative && BlasProvider.HasRawSgemm)
+        {
+            // Direct native BLAS sgemm (overwrite C). Goes straight to the
+            // native kernel — unlike BlasProvider.TryGemm, which first consults
+            // ShouldRouteManaged and can divert wide layers into a much slower
+            // managed path (measured ~10× slower on 32×784×512).
+            fixed (float* ps = src, pw = weight, pd = dst)
+                BlasProvider.SgemmRaw(m, n, k, ps, k, pw, n, pd, n);
+            return;
+        }
+        // Managed cached-B (prepacked, low dispatch overhead).
+        SimdGemm.SgemmWithCachedB(src.AsSpan(0, m * k), weight, dst.AsSpan(0, m * n), m, k, n);
+    }
+
+    // ── Self-tuner ────────────────────────────────────────────────────────
+    // Persistent, per-batch-size cache of the per-layer kernel choice, seeded
+    // from the same static gate FusedLinear/MlpForward use
+    // (PreferManagedInferenceGemm: native BLAS once a layer's K·N is large
+    // enough that re-packing B is amortised and M ≥ 16; managed cached-B
+    // otherwise). The first Run at a given batch computes the choice; every
+    // subsequent Run at that batch reads it with no overhead. Bounded to a
+    // small number of distinct batch buckets so a drifting batch size can't
+    // grow it without limit. (An online A/B refinement — re-measure both
+    // kernels on the real shape and lock the empirical winner — is layered on
+    // top in TuneBatch only if measurement shows the static gate mispredicts.)
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<int, byte[]> _kernelByBatch = new();
+    private const int MaxTunedBatchBuckets = 16;
+
+    private byte[] SelectKernels(int batch)
+    {
+        if (_kernelByBatch.TryGetValue(batch, out var cached))
+            return cached;
+
+        var choice = TuneBatch(batch);
+
+        // Bounded cache: a drifting batch size can't grow it without limit.
+        if (_kernelByBatch.Count < MaxTunedBatchBuckets)
+            _kernelByBatch.TryAdd(batch, choice);
+        return choice;
+    }
+
+    /// <summary>
+    /// One-shot online tuning for a given batch: for each layer, micro-A/B the
+    /// managed cached-B kernel against the native BLAS kernel on the layer's
+    /// actual shape and lock the empirically faster one. This is the persistent
+    /// self-tuning step — online profile-guided re-specialisation that adapts to
+    /// the real shapes + hardware, with no external compiler or IL emission. It
+    /// beats a static heuristic gate, which mispredicts here: the
+    /// PreferManagedInferenceGemm rule prefers managed at M &lt; 16, but native
+    /// BLAS actually wins the wide layers of a classifier head at every batch
+    /// (Phase5 probe). Cost is a one-time spike on the first Run at a new batch
+    /// (amortised over a long-lived serving process); bounded buckets cap it.
+    /// When no native sgemm is wired, every layer keeps managed cached-B.
+    /// </summary>
+    private byte[] TuneBatch(int batch)
+    {
+        int layers = _weights.Length;
+        var choice = new byte[layers];
+        if (!BlasProvider.HasRawSgemm)
+            return choice;   // all KernelManaged (0)
+
+        var pool = System.Buffers.ArrayPool<float>.Shared;
+        int k = _inFeat[0];
+        for (int i = 0; i < layers; i++)
+        {
+            int n = _outFeat[i];
+            float[] srcT = pool.Rent(batch * k);
+            float[] dstT = pool.Rent(batch * n);
+            try
+            {
+                double managed = TimeKernel(KernelManaged, srcT, _weights[i], dstT, batch, k, n);
+                double native = TimeKernel(KernelNative, srcT, _weights[i], dstT, batch, k, n);
+                choice[i] = native < managed ? KernelNative : KernelManaged;
+            }
+            finally
+            {
+                pool.Return(srcT);
+                pool.Return(dstT);
+            }
+            k = n;
+        }
+        return choice;
+    }
+
+    private static double TimeKernel(byte kernel, float[] src, float[] weight, float[] dst, int m, int k, int n)
+    {
+        const int warm = 5, reps = 25;
+        for (int w = 0; w < warm; w++) RunLayerGemm(kernel, src, weight, dst, m, k, n);
+        var sw = new System.Diagnostics.Stopwatch();
+        double best = double.MaxValue;
+        for (int r = 0; r < reps; r++)
+        {
+            sw.Restart();
+            RunLayerGemm(kernel, src, weight, dst, m, k, n);
+            sw.Stop();
+            double e = sw.Elapsed.TotalMilliseconds;
+            if (e < best) best = e;
+        }
+        return best;
     }
 }

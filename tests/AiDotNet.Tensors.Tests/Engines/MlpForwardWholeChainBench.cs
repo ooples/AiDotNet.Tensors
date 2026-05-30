@@ -102,6 +102,91 @@ public class MlpForwardWholeChainBench
         finally { SimdGemm.UseParallelGemm = savedPar; }
     }
 
+    [Fact]
+    public void Phase5_CompiledMlp_SelfTuningHeadroom_Probe()
+    {
+        if (Environment.GetEnvironmentVariable("AIDOTNET_RUN_JIT_PERF") != "1") return;
+
+        // Phase 5 headroom probe (measure-before-build): the static CompiledMlp
+        // ALWAYS routes every layer through managed cached-B SgemmWithCachedB.
+        // The FusedLinear lesson is that native BLAS overtakes managed cached-B
+        // at large M (batch). If a per-batch best-of {managed, native} chain
+        // beats static-managed at some batch, a self-tuning plan that observes
+        // the steady-state batch and locks the winning per-layer kernel has real
+        // headroom to capture. If managed wins at every batch, there is nothing
+        // to self-tune here (cf. the Phase-4 finding that tiny models already
+        // run serial) — and we ship no speculative loop.
+        int[] dims = { 784, 512, 128, 10 };   // AIsEval MLP
+        int layers = dims.Length - 1;
+        _output.WriteLine($"HasRawSgemm={BlasProvider.HasRawSgemm}, IsMklVerified={BlasProvider.IsMklVerified}, cores={Environment.ProcessorCount}");
+
+        const int maxB = 512;
+        var w = new List<float[]>(); var b = new List<float[]?>(); var inF = new List<int>(); var outF = new List<int>();
+        var wT = new List<Tensor<float>>(); var bT = new List<Tensor<float>?>();
+        for (int l = 0; l < layers; l++)
+        {
+            var wa = MakeArr(dims[l] * dims[l + 1], 100 + l);
+            var ba = MakeArr(dims[l + 1], 200 + l);
+            w.Add(wa); b.Add(ba); inF.Add(dims[l]); outF.Add(dims[l + 1]);
+            var wt = new Tensor<float>(new[] { dims[l], dims[l + 1] }); wa.AsSpan().CopyTo(wt.AsWritableSpan()); wT.Add(wt);
+            var bt = new Tensor<float>(new[] { 1, dims[l + 1] }); ba.AsSpan().CopyTo(bt.AsWritableSpan()); bT.Add(bt);
+        }
+        var plan = CompiledMlp.Create(w, b, inF, outF, FusedActivationType.ReLU, FusedActivationType.None, maxBatch: maxB);
+
+        foreach (int m in new[] { 1, 8, 32, 128, 512 })
+        {
+            var inputArr = MakeArr(m * dims[0], 7);
+            var output = new float[m * plan.OutputFeatures];
+            var inputT = new Tensor<float>(new[] { m, dims[0] });
+            inputArr.AsSpan().CopyTo(inputT.AsWritableSpan());
+
+            // Gated: CompiledMlp.Run (per-layer managed/native self-tuner).
+            double gated = Bench(() => plan.Run(inputArr, m, output));
+
+            // Native-always: per-layer native-BLAS GEMM + fused epilogue, reusing buffers.
+            double native = Bench(() => NativePerLayer(inputArr, m, dims, w, b, KernelForce.Native));
+
+            // Managed-always: per-layer managed cached-B (the OLD static CompiledMlp).
+            double managed = Bench(() => NativePerLayer(inputArr, m, dims, w, b, KernelForce.Managed));
+
+            double best = Math.Min(gated, Math.Min(native, managed));
+            string verdict = gated <= best + 1e-9 ? "GATED ≤ best" : $"gated {gated / best:F2}× of best";
+            _output.WriteLine($"[m={m,4}]  gated {gated * 1000:F1}us  native-always {native * 1000:F1}us  managed-always {managed * 1000:F1}us  → {verdict}");
+        }
+    }
+
+    private enum KernelForce { Native, Managed }
+    private static readonly float[][] _nativeScratch = new float[2][];
+    private static void NativePerLayer(float[] input, int m, int[] dims, List<float[]> weights, List<float[]?> biases, KernelForce force)
+    {
+        int layers = weights.Count;
+        float[] src = input;
+        int k = dims[0];
+        for (int l = 0; l < layers; l++)
+        {
+            int n = dims[l + 1];
+            if (_nativeScratch[l % 2] is null || _nativeScratch[l % 2]!.Length < m * n)
+                _nativeScratch[l % 2] = new float[m * n];
+            var dst = _nativeScratch[l % 2]!;
+            if (force == KernelForce.Native && BlasProvider.HasRawSgemm)
+            {
+                unsafe
+                {
+                    fixed (float* ps = src, pw = weights[l], pd = dst)
+                        BlasProvider.SgemmRaw(m, n, k, ps, k, pw, n, pd, n);
+                }
+            }
+            else
+            {
+                SimdGemm.SgemmWithCachedB(src.AsSpan(0, m * k), weights[l], dst.AsSpan(0, m * n), m, k, n);
+            }
+            var act = l == layers - 1 ? FusedActivationType.None : FusedActivationType.ReLU;
+            CpuFusedOperations.ApplyBiasActivationInPlace(dst, biases[l], m, n, act);
+            src = dst;
+            k = n;
+        }
+    }
+
     private static float[] MakeArr(int n, int seed)
     {
         var rng = new Random(seed);
