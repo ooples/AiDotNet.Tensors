@@ -58,6 +58,14 @@ public static class MicrokernelGflopsBench
         }
         else Console.WriteLine("Avx2Fp32_8x8: not supported on this CPU.\n");
 
+        // ── AVX2 FP32 6×16 (#409 S.3 — higher arithmetic intensity than 8×8)
+        if (Avx2Fp32_6x16.IsSupported)
+        {
+            double peak = MeasureAvx2Fp32PeakGflops();
+            BenchAvx2Fp32_6x16(peak);
+        }
+        else Console.WriteLine("Avx2Fp32_6x16: not supported on this CPU.\n");
+
         // ── AVX2 FP64 4×8
         if (Avx2Fp64_4x8.IsSupported)
         {
@@ -100,6 +108,18 @@ public static class MicrokernelGflopsBench
         Action call = () => Avx2Fp32_8x8.Run(packedA, packedB, c, Nr, Kc);
         double gflops = TimeKernel(call, 2.0 * Mr * Nr * Kc, warmup: 2_000, iters: 2_000_000);
         Report("Avx2Fp32_8x8   ", Mr, Nr, gflops, peakGflops);
+    }
+
+    private static void BenchAvx2Fp32_6x16(double peakGflops)
+    {
+        const int Mr = Avx2Fp32_6x16.Mr, Nr = Avx2Fp32_6x16.Nr;
+        var packedA = MakeRandomF(Kc * Mr);
+        var packedB = MakeRandomF(Kc * Nr);
+        var c = new float[Mr * Nr];
+
+        Action call = () => Avx2Fp32_6x16.Run(packedA, packedB, c, Nr, Kc);
+        double gflops = TimeKernel(call, 2.0 * Mr * Nr * Kc, warmup: 2_000, iters: 2_000_000);
+        Report("Avx2Fp32_6x16  ", Mr, Nr, gflops, peakGflops);
     }
 
     private static void BenchAvx2Fp64_4x8(double peakGflops)
