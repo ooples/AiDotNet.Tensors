@@ -33942,6 +33942,15 @@ public partial class CpuEngine : ITensorLevelEngine
     #if !NETFRAMEWORK
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
 #endif
+    // Phase 1 (compiled-inference) routing gate: prefer the managed cached-B GEMM
+    // (persistent prepack, no pinned→managed copy) for small/medium inference
+    // shapes, where it beats native BLAS + copy by 1.3-2.8x. Fall back to native
+    // BLAS only for large K·N·M, where native raw throughput wins. Thresholds from
+    // InferenceGemmStrategyAbTests on the AIsEval MLP shapes; shape-based so it
+    // generalises beyond MLP (transformer projections, etc.).
+    private static bool PreferManagedInferenceGemm(int m, int k, int n)
+        => !((long)k * n > 200_000 && m >= 16);
+
     public virtual Tensor<T> FusedLinear<T>(Tensor<T> input, Tensor<T> weights, Tensor<T>? bias, FusedActivationType activation, FusedActivationParams? activationParams = null)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
@@ -34040,10 +34049,26 @@ public partial class CpuEngine : ITensorLevelEngine
                 var outArr = (float[])(object)result.GetDataArray();
 
                 bool blasDone = false;
+
+                // Phase 1 (compiled-inference): for small/medium inference GEMMs the
+                // managed cached-B path wins 1.3-2.8x over native BLAS + pinned copy —
+                // it reuses the persistent prepacked-B cache (keyed by weight identity,
+                // no per-call PackB) AND writes outArr directly (no pinned→managed copy).
+                // The subsequent bias+activation pass is the same either way. Native
+                // BLAS is kept ONLY for large K·N·M, where its raw throughput beats our
+                // managed kernel (verified: InferenceGemmStrategyAbTests). Gate is
+                // shape-based so it generalises beyond MLP. Skipped under a tape (the
+                // tape path returns earlier) — this is the pure-inference fast path.
+                if (PreferManagedInferenceGemm(M, K, N))
+                {
+                    Simd.SimdGemm.SgemmWithCachedB(
+                        inArr.AsSpan(0, M * K), wArr, outArr.AsSpan(0, M * N), M, K, N);
+                    blasDone = true;
+                }
 #if NET5_0_OR_GREATER
                 // Tier -1: NativeInferencePool — pre-pinned weights, zero GC per call
                 var inferPool = NativeInferencePool.Current;
-                if (inferPool is not null && (BlasProvider.HasRawSgemm || BlasProvider.HasNativeSgemm))
+                if (!blasDone && inferPool is not null && (BlasProvider.HasRawSgemm || BlasProvider.HasNativeSgemm))
                 {
                     unsafe
                     {
