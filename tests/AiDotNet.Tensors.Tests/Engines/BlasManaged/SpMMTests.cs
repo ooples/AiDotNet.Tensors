@@ -158,4 +158,42 @@ public class SpMMTests
         BlasManagedLib.SpMM<float>(1f, layout, b, n, n, 0f, actual, n);
         for (int i = 0; i < actual.Length; i++) Assert.Equal(expected[i], actual[i], 3);
     }
+
+    [Fact]
+    public void SpMM_FP64_Csr_FusedBiasReLU_EqualsUnfusedPipeline()
+    {
+        // Exceed-vendor lever: SpMM + bias + ReLU in one call == SpMM then bias then ReLU.
+        const int rows = 6, cols = 5, n = 4;
+        var rng = new Random(2024);
+        double[] a = new double[rows * cols];
+        for (int i = 0; i < a.Length; i++) a[i] = rng.NextDouble() < 0.5 ? 0.0 : rng.NextDouble() * 2 - 1;
+        double[] b = new double[cols * n];
+        for (int i = 0; i < b.Length; i++) b[i] = rng.NextDouble() * 2 - 1;
+        double[] bias = new double[n];
+        for (int i = 0; i < n; i++) bias[i] = rng.NextDouble() * 2 - 1;
+
+        var (ptr, ind, val) = DenseToCsr(a, rows, cols);
+        var layout = new SparseLayout<double>
+        { Rows = rows, Cols = cols, Pointers = ptr, Indices = ind, Values = val, Format = SparseLayoutFormat.Csr };
+
+        // Unfused reference: SpMM (beta=0) then +bias[j] then ReLU.
+        double[] unfused = new double[rows * n];
+        BlasManagedLib.SpMM<double>(1.0, layout, b, n, n, 0.0, unfused, n);
+        for (int i = 0; i < rows; i++)
+            for (int j = 0; j < n; j++)
+            {
+                double v = unfused[i * n + j] + bias[j];
+                unfused[i * n + j] = v > 0 ? v : 0; // ReLU
+            }
+
+        // Fused: bias + ReLU via the epilogue.
+        double[] fused = new double[rows * n];
+        var opts = new BlasOptions<double>
+        {
+            Epilogue = new Epilogue<double> { BiasN = bias, Activation = AiDotNet.Tensors.Engines.FusedActivationType.ReLU },
+        };
+        BlasManagedLib.SpMM<double>(1.0, layout, b, n, n, 0.0, fused, n, opts);
+
+        for (int i = 0; i < fused.Length; i++) Assert.Equal(unfused[i], fused[i], 10);
+    }
 }
