@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using AiDotNet.Tensors.Engines.BlasManaged;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 
@@ -85,32 +86,55 @@ public sealed class SimplicialComplex
         return boundary;
     }
 
-    public Matrix<T> HodgeLaplacian<T>(int k)
+    public Matrix<T> HodgeLaplacian<T>(int k) where T : unmanaged
     {
-        var ops = MathHelper.GetNumericOperations<T>();
         var kSimplices = GetSimplices(k);
         if (kSimplices.Count == 0)
             return new Matrix<T>(0, 0);
 
+        // #379: the two Hodge terms are symmetric rank-k updates (Bᵀ·B and B·Bᵀ),
+        // computed via the SYRK kernel (≈half the FLOPs of a dense GEMM) then
+        // symmetrized to a full matrix before the element-wise add.
         Matrix<T> result = new Matrix<T>(kSimplices.Count, kSimplices.Count);
         if (k > 0)
         {
-            var bK = BoundaryOperator<T>(k);
-            var term = (Matrix<T>)bK.Transpose().Multiply(bK);
-            result = (Matrix<T>)result.Add(term);
+            var bK = BoundaryOperator<T>(k);                 // Bₖᵀ·Bₖ
+            result = (Matrix<T>)result.Add(SyrkFull(bK, trans: true));
         }
 
         if (k < MaxDimension)
         {
             var bKPlus = BoundaryOperator<T>(k + 1);
             if (bKPlus.Rows > 0 && bKPlus.Columns > 0)
-            {
-                var term = (Matrix<T>)bKPlus.Multiply(bKPlus.Transpose());
-                result = (Matrix<T>)result.Add(term);
-            }
+                result = (Matrix<T>)result.Add(SyrkFull(bKPlus, trans: false)); // Bₖ₊₁·Bₖ₊₁ᵀ
         }
 
         return result;
+    }
+
+    /// <summary>
+    /// Computes the full symmetric matrix α=1·op(A)·op(A)ᵀ via the SYRK kernel
+    /// (lower triangle) then mirrors it to the upper triangle. trans=true gives
+    /// Aᵀ·A (n = A.Columns); trans=false gives A·Aᵀ (n = A.Rows).
+    /// </summary>
+    private static Matrix<T> SyrkFull<T>(Matrix<T> a, bool trans) where T : unmanaged
+    {
+        var ops = MathHelper.GetNumericOperations<T>();
+        int n = trans ? a.Columns : a.Rows;
+        int kk = trans ? a.Rows : a.Columns;
+        var term = new Matrix<T>(n, n);
+        if (kk == 0 || n == 0) return term;
+
+        BlasManaged.Syrk<T>(
+            Uplo.Lower, trans, n, kk, ops.One,
+            a.AsSpan(), a.Columns, ops.Zero, term.AsWritableSpan(), n);
+
+        // Mirror lower → upper to produce the full symmetric matrix.
+        var span = term.AsWritableSpan();
+        for (int i = 0; i < n; i++)
+            for (int j = 0; j < i; j++)
+                span[j * n + i] = span[i * n + j];
+        return term;
     }
 
     private void AddSimplexInternal(Simplex simplex)
