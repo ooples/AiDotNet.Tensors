@@ -187,4 +187,25 @@ public class TrsmTests
         BlasManagedLib.Trsm<double>(Side.Left, Uplo.Lower, false, Diag.NonUnit, m, n, 2.5, a, m, actual, n);
         for (int i = 0; i < actual.Length; i++) Assert.Equal(expected[i], actual[i], 9);
     }
+
+    [Fact]
+    public void Trsm_FP64_LargeLeftLower_BlockedPath_MatchesReference()
+    {
+        const int m = 200, n = 5; // m > TrsmBlock(64) → blocked
+        var rng = new Random(2024);
+        double[] a = new double[m * m];
+        for (int i = 0; i < m; i++)
+        {
+            for (int j = 0; j <= i; j++) a[i * m + j] = rng.NextDouble() * 2 - 1;
+            a[i * m + i] += m;
+        }
+        double[] b = new double[m * n];
+        for (int i = 0; i < b.Length; i++) b[i] = rng.NextDouble() * 2 - 1;
+
+        double[] expected = (double[])b.Clone();
+        ReferenceTrsmLeft(Side.Left, Uplo.Lower, false, Diag.NonUnit, m, n, 1.0, a, m, expected, n);
+        double[] actual = (double[])b.Clone();
+        BlasManagedLib.Trsm<double>(Side.Left, Uplo.Lower, false, Diag.NonUnit, m, n, 1.0, a, m, actual, n);
+        for (int i = 0; i < actual.Length; i++) Assert.Equal(expected[i], actual[i], 8);
+    }
 }

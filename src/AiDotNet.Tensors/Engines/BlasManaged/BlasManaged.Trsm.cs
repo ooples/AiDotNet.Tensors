@@ -31,9 +31,59 @@ public static partial class BlasManaged
             }
 
         if (side == Side.Left)
-            TrsmLeftScalar(uplo, transA, diag, m, n, a, lda, b, ldb, ops);
+        {
+            // Blocked path only for the canonical Left-Lower-NoTrans case in this
+            // phase; all other combinations use the proven scalar kernel. Later
+            // tasks extend blocking to upper/transposed cases.
+            if (m > TrsmBlock && uplo == Uplo.Lower && !transA)
+                TrsmLeftLowerNoTransBlocked(diag, m, n, a, lda, b, ldb, options, ops);
+            else
+                TrsmLeftScalar(uplo, transA, diag, m, n, a, lda, b, ldb, ops);
+        }
         else
             TrsmRightScalar(uplo, transA, diag, m, n, a, lda, b, ldb, ops);
+    }
+
+    // Block size for the diagonal-solve / trailing-update split. 64 keeps the
+    // diagonal block in L1 while giving the GEMM macrokernel a worthwhile panel.
+    private const int TrsmBlock = 64;
+
+    private static void TrsmLeftLowerNoTransBlocked<T>(
+        Diag diag, int m, int n,
+        ReadOnlySpan<T> a, int lda, Span<T> b, int ldb,
+        in BlasOptions<T> options,
+        INumericOperations<T> ops) where T : unmanaged
+    {
+        for (int i0 = 0; i0 < m; i0 += TrsmBlock)
+        {
+            int bm = Math.Min(TrsmBlock, m - i0);
+
+            // 1) Solve the bm×n diagonal block with the scalar kernel.
+            //    The block's own triangle is A[i0:i0+bm, i0:i0+bm].
+            var aDiag = a.Slice(i0 * lda + i0);
+            var bBlock = b.Slice(i0 * ldb);
+            TrsmLeftScalar(Uplo.Lower, false, diag, bm, n, aDiag, lda, bBlock, ldb, ops);
+
+            // 2) Trailing update: for rows below this block,
+            //    B[i0+bm:, :] -= A[i0+bm:, i0:i0+bm] · X[i0:i0+bm, :]
+            int remRows = m - (i0 + bm);
+            if (remRows > 0)
+            {
+                var aSub = a.Slice((i0 + bm) * lda + i0); // remRows × bm panel (lda-strided)
+                var xBlk = b.Slice(i0 * ldb);              // bm × n (just solved), ldb-strided
+                // scratch = aSub · xBlk  (remRows × n)
+                T[] scratch = new T[remRows * n];
+                Gemm<T>(aSub, lda, false, xBlk, ldb, false, scratch, n, remRows, n, bm,
+                        new BlasOptions<T> { NumThreads = options.NumThreads, Mode = options.Mode });
+                var bRem = b.Slice((i0 + bm) * ldb);
+                for (int r = 0; r < remRows; r++)
+                    for (int c = 0; c < n; c++)
+                    {
+                        int bi = r * ldb + c;
+                        bRem[bi] = ops.Subtract(bRem[bi], scratch[r * n + c]);
+                    }
+            }
+        }
     }
 
     // A(r,c) honoring transpose. Inlined as a static helper (local functions
