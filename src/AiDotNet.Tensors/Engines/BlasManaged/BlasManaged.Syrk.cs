@@ -83,16 +83,10 @@ public static partial class BlasManaged
                     }
                     else
                     {
-                        // Column-strided operands (op(A) row r = a[p*lda + r]); scalar dot
-                        // keeps the trans tile correct + deterministic. Same skip pattern.
-                        for (int ii = 0; ii < bm; ii++)
-                            for (int jj = 0; jj < bn; jj++)
-                            {
-                                T dot = ops.Zero;
-                                for (int p = 0; p < k; p++)
-                                    dot = ops.Add(dot, ops.Multiply(a[p * lda + (i0 + ii)], a[p * lda + (j0 + jj)]));
-                                tile[ii * bn + jj] = dot;
-                            }
+                        // trans=true: op(A) = Aᵀ, A is k×n. tile = op(A)[i0:,:]·op(A)[j0:,:]ᵀ.
+                        // op(A)[i0:i0+bm,:] = (A[:, i0:i0+bm])ᵀ → pass A[:, i0:] (k×bm) with transA=true;
+                        // op(A)[j0:j0+bn,:]ᵀ = A[:, j0:j0+bn] (k×bn) → pass with transB=false.
+                        Gemm<T>(a.Slice(i0), lda, true, a.Slice(j0), lda, false, tile, bn, bm, bn, k, gemmOpts);
                     }
                 }
 
