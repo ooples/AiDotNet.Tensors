@@ -6,7 +6,7 @@
 
 **Architecture:** Approach A from the spec — `Trsm` is a blocked BLIS-style driver: solve each `Mr`-sized diagonal block with a new scalar triangular-solve kernel, then update the trailing right-hand-side via the existing `PackBothStrategy` GEMM macrokernel. TDD throughout: a correct scalar `Trsm` is built and verified against the existing `TriangularSolveSingle` oracle first, then the blocked/macrokernel-reuse optimization is layered in behind the same passing tests.
 
-**Tech Stack:** C# (net8.0 / net6.0 / net471 multi-target), xUnit, the existing `AiDotNet.Tensors.Engines.BlasManaged` infrastructure (microkernels, `PackBothStrategy`, `BlasOptions<T>`, `BlasMode`).
+**Tech Stack:** C# (net10.0 / net471 multi-target), xUnit, the existing `AiDotNet.Tensors.Engines.BlasManaged` infrastructure (microkernels, `PackBothStrategy`, `BlasOptions<T>`, `BlasMode`).
 
 **Spec:** `docs/superpowers/specs/2026-05-30-specialized-blas-variants-design.md` (§3 API, §4 TRSM, §6 phasing).
 
@@ -51,7 +51,7 @@ public static partial class BlasManaged
 
 - [ ] **Step 2: Build to verify nothing broke**
 
-Run: `dotnet build src/AiDotNet.Tensors/AiDotNet.Tensors.csproj --no-restore -f net8.0`
+Run: `dotnet build src/AiDotNet.Tensors/AiDotNet.Tensors.csproj --no-restore -f net10.0`
 Expected: `Build succeeded.` with 0 errors. (`partial` on a single declaration is always legal.)
 
 - [ ] **Step 3: Commit**
@@ -139,7 +139,7 @@ public readonly ref struct SparseLayout<T> where T : unmanaged
 
 - [ ] **Step 2: Build to verify it compiles**
 
-Run: `dotnet build src/AiDotNet.Tensors/AiDotNet.Tensors.csproj --no-restore -f net8.0`
+Run: `dotnet build src/AiDotNet.Tensors/AiDotNet.Tensors.csproj --no-restore -f net10.0`
 Expected: `Build succeeded.` 0 errors.
 
 - [ ] **Step 3: Commit**
@@ -246,7 +246,7 @@ public class TrsmTests
 
 - [ ] **Step 2: Run the test to verify it fails to compile / fail**
 
-Run: `dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --filter "FullyQualifiedName~TrsmTests" -f net8.0`
+Run: `dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --filter "FullyQualifiedName~TrsmTests" -f net10.0`
 Expected: **compile error** `'BlasManaged' does not contain a definition for 'Trsm'` (the method does not exist yet). This confirms the test exercises the new API.
 
 ---
@@ -379,7 +379,7 @@ Expected: all three method signatures print. (They are the standard generic-math
 
 - [ ] **Step 3: Run the test to verify it passes**
 
-Run: `dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --filter "FullyQualifiedName~Trsm_FP64_LeftLowerNoTransNonUnit_SingleRhs_MatchesReference" -f net8.0`
+Run: `dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --filter "FullyQualifiedName~Trsm_FP64_LeftLowerNoTransNonUnit_SingleRhs_MatchesReference" -f net10.0`
 Expected: `Passed!  - Failed: 0, Passed: 1`.
 
 - [ ] **Step 4: Commit**
@@ -515,7 +515,7 @@ Append to `TrsmTests.cs` (inside the class). The reference for Right-side is add
 
 - [ ] **Step 2: Run the full TRSM test class**
 
-Run: `dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --filter "FullyQualifiedName~TrsmTests" -f net8.0`
+Run: `dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --filter "FullyQualifiedName~TrsmTests" -f net10.0`
 Expected: `Passed!` — 16 (full matrix) + 1 (FP32) + 1 (alpha) + 1 (original) = 19 tests pass, 0 fail.
 
 - [ ] **Step 3: Commit**
@@ -582,7 +582,7 @@ public class TrsmDeterminismTests
 
 - [ ] **Step 2: Run it**
 
-Run: `dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --filter "FullyQualifiedName~TrsmDeterminismTests" -f net8.0`
+Run: `dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --filter "FullyQualifiedName~TrsmDeterminismTests" -f net10.0`
 Expected: `Passed!` 3 tests, 0 fail.
 
 - [ ] **Step 3: Commit**
@@ -676,7 +676,7 @@ Then route to it from `TrsmLeftScalar`'s caller. In `Trsm<T>`, replace the `side
 
 - [ ] **Step 3: Run the full correctness + determinism suite (must still pass)**
 
-Run: `dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --filter "FullyQualifiedName~Trsm" -f net8.0`
+Run: `dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --filter "FullyQualifiedName~Trsm" -f net10.0`
 Expected: `Passed!` — all TRSM correctness (19) + determinism (3) tests pass. The blocked path is now exercised by the `256×8` determinism case and the larger correctness cases.
 
 - [ ] **Step 4: Add a large-shape correctness case that forces the blocked path**
@@ -708,7 +708,7 @@ Append to `TrsmTests.cs`:
 
 - [ ] **Step 5: Run it**
 
-Run: `dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --filter "FullyQualifiedName~Trsm_FP64_LargeLeftLower" -f net8.0`
+Run: `dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --filter "FullyQualifiedName~Trsm_FP64_LargeLeftLower" -f net10.0`
 Expected: `Passed!` 1 test.
 
 - [ ] **Step 6: Commit**
@@ -787,7 +787,7 @@ public static class SpecializedPerfBar
 
 - [ ] **Step 4: Build the test project**
 
-Run: `dotnet build tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --no-restore -f net8.0`
+Run: `dotnet build tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --no-restore -f net10.0`
 Expected: `Build succeeded.` 0 errors.
 
 - [ ] **Step 5: Commit**
@@ -854,7 +854,7 @@ In the per-batch loop (`LinearSolvers.cs` ~line 156-160), replace the body of th
 
 - [ ] **Step 3: Run the existing linear-solver test suite (the canary)**
 
-Run: `dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --filter "FullyQualifiedName~Solve|FullyQualifiedName~Triangular|FullyQualifiedName~Cholesky|FullyQualifiedName~Lstsq" -f net8.0`
+Run: `dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --filter "FullyQualifiedName~Solve|FullyQualifiedName~Triangular|FullyQualifiedName~Cholesky|FullyQualifiedName~Lstsq" -f net10.0`
 Expected: `Passed!` — all existing solver/Cholesky/Lstsq tests still pass. Any failure here means the flag mapping in Step 1 is wrong; fix the `Uplo`/`transA`/`Diag` translation, do not weaken the test.
 
 - [ ] **Step 4: Commit**
@@ -873,11 +873,11 @@ git commit -m "perf(#379): route FP32/FP64 triangular solve through BlasManaged.
 - [ ] **Step 1: Build all target frameworks**
 
 Run: `dotnet build src/AiDotNet.Tensors/AiDotNet.Tensors.csproj --no-restore`
-Expected: `Build succeeded.` for net8.0, net6.0, and net471 (the multi-target set). If net471 errors on a span/`MathHelper` API, gate or adjust — net471 lacks some APIs (see CLAUDE.md note on `GC.GetAllocatedBytesForCurrentThread`).
+Expected: `Build succeeded.` for net10.0 and net471 (the multi-target set). If net471 errors on a span/`MathHelper` API, gate or adjust — net471 lacks some APIs (see CLAUDE.md note on `GC.GetAllocatedBytesForCurrentThread`).
 
 - [ ] **Step 2: Run the full BlasManaged + solver test surface**
 
-Run: `dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --filter "FullyQualifiedName~BlasManaged|FullyQualifiedName~Trsm|FullyQualifiedName~Solve|FullyQualifiedName~Cholesky" -f net8.0`
+Run: `dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --filter "FullyQualifiedName~BlasManaged|FullyQualifiedName~Trsm|FullyQualifiedName~Solve|FullyQualifiedName~Cholesky" -f net10.0`
 Expected: `Passed!` 0 failures.
 
 - [ ] **Step 3: Final commit if any net471 gating was needed; otherwise nothing to commit.**

@@ -9,7 +9,7 @@ namespace AiDotNet.Tensors.Engines.BlasManaged;
 /// BLIS-style managed GEMM kernel. Replaces Avx512Sgemm + SimdGemm as the
 /// codebase's primary GEMM path. See docs/superpowers/specs/2026-05-16-blas-managed-design.md.
 /// </summary>
-public static class BlasManaged
+public static partial class BlasManaged
 {
     /// <summary>
     /// Process-wide default execution mode. Applied when a caller's
