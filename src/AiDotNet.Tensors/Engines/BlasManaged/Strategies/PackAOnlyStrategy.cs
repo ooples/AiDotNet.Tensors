@@ -254,6 +254,15 @@ internal static class PackAOnlyStrategy
     {
         if (typeof(T) == typeof(float))
         {
+            // #409 S.3: higher-intensity 6×16 strided-B FP32 tile (Fast-mode default).
+            if (mr == 6 && nr == 16 && Avx2Fp32_6x16.IsSupported)
+            {
+                Avx2Fp32_6x16.RunStridedB(
+                    MemoryMarshal.Cast<T, float>(packedA),
+                    MemoryMarshal.Cast<T, float>(b), ldb,
+                    MemoryMarshal.Cast<T, float>(c), ldc, kc);
+                return;
+            }
             // Sub-D (#372) D.3: AVX2 8×8 strided-B when shape and hardware allow.
             if (mr == 8 && nr == 8 && Avx2Fp32_8x8.IsSupported)
             {

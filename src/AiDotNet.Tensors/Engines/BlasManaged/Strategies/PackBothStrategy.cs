@@ -898,6 +898,16 @@ internal static class PackBothStrategy
                     ldc, kc);
                 return;
             }
+            // #409 S.3: higher-intensity 6×16 FP32 tile (Fast-mode default via SelectMrNr).
+            if (mr == 6 && nr == 16 && Avx2Fp32_6x16.IsSupported)
+            {
+                Avx2Fp32_6x16.Run(
+                    MemoryMarshal.Cast<T, float>(packedA),
+                    MemoryMarshal.Cast<T, float>(packedB),
+                    MemoryMarshal.Cast<T, float>(c),
+                    ldc, kc);
+                return;
+            }
             if (mr == 8 && nr == 8 && Avx2Fp32_8x8.IsSupported)
             {
                 Avx2Fp32_8x8.Run(
