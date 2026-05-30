@@ -27,4 +27,14 @@ public static class SpecializedShapeCatalog
         new("Gram_128x768",Uplo.Lower, false, 128, 768, true, 20, "workload:gram-matrix"),
         new("Cov_FP32_256x64", Uplo.Lower, true, 256, 64, false, 15, "workload:covariance-fp32"),
     };
+
+    public record SymmShape(string Name, Side Side, Uplo Uplo, int M, int N, bool Fp64, int Frequency, string Source);
+
+    public static readonly SymmShape[] Symm =
+    {
+        new("Sym_Left_256x256",  Side.Left, Uplo.Lower, 256, 256, true, 20, "workload:optimization"),
+        new("Sym_Left_512x128",  Side.Left, Uplo.Lower, 512, 128, true, 18, "workload:optimization"),
+        new("Sym_Right_128x512", Side.Right, Uplo.Upper, 128, 512, true, 12, "workload:optimization"),
+        new("Sym_FP32_256x256",  Side.Left, Uplo.Lower, 256, 256, false, 10, "workload:optimization-fp32"),
+    };
 }
