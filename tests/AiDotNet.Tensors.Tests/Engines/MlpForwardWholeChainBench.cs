@@ -197,6 +197,68 @@ public class MlpForwardWholeChainBench
         }
     }
 
+    [Fact]
+    public void Phase7F_GemmAutotuneHeadroom_Probe()
+    {
+        if (Environment.GetEnvironmentVariable("AIDOTNET_RUN_JIT_PERF") != "1") return;
+
+        // Option F headroom: the self-tuner currently A/Bs managed cached-B vs
+        // native BLAS at DEFAULT (all-core) threads. #475 found wide-layer
+        // parallel scaling plateaus ~2× — i.e. all-core native may oversubscribe
+        // the small-M wide GEMM. Sweep native thread counts {1,2,4,8,16} per
+        // (shape, M) and compare best-of-all-threads against the self-tuner's
+        // current best-of-{managed, native@all}. If a capped thread count beats
+        // native@all, F has real headroom → add thread-count to the tuner's
+        // candidate set; if native@all is already best, F is a no-op here.
+        if (!BlasProvider.HasRawSgemm) { _output.WriteLine("no native sgemm; skipping"); return; }
+        _output.WriteLine($"cores={Environment.ProcessorCount}");
+
+        // CONCLUSION (measured): native@cores/2 beats native@all-cores ~1.3× here
+        // when the thread count is held FIXED across calls. But capturing it in
+        // the self-tuner via a per-call ScopeOpenBlasThreads BACKFIRES: changing
+        // the OpenBLAS/OMP thread count rebuilds the thread pool (~700 µs), so
+        // flipping it per layer per Run made CompiledMlp ~6× SLOWER (110→836 µs at
+        // M=1). The win is only realizable by pinning the process-global BLAS
+        // thread count ONCE at the deployment/serving layer — NOT a per-call
+        // primitive concern. So this stays a probe; the self-tuner keeps
+        // native@ambient. (This is the measured reason option F was not wired.)
+        // The wide layers of the AIsEval MLP: 784→512 and 512→128.
+        (int k, int n)[] shapes = { (784, 512), (512, 128) };
+        int[] threadCounts = { 1, 2, 4, 8, 16 };
+
+        foreach (var (k, n) in shapes)
+        {
+            var wArr = MakeArr(k * n, 11);
+            foreach (int m in new[] { 1, 8, 32, 128 })
+            {
+                var src = MakeArr(m * k, 7);
+                var dst = new float[m * n];
+
+                double managed = Bench(() => SimdGemm.SgemmWithCachedB(src.AsSpan(0, m * k), wArr, dst.AsSpan(0, m * n), m, k, n));
+
+                var perThread = new double[threadCounts.Length];
+                for (int ti = 0; ti < threadCounts.Length; ti++)
+                {
+                    int th = threadCounts[ti];
+                    perThread[ti] = Bench(() =>
+                    {
+                        using var _ = BlasProvider.ScopeOpenBlasThreads(th);
+                        unsafe { fixed (float* ps = src, pw = wArr, pd = dst) BlasProvider.SgemmRaw(m, n, k, ps, k, pw, n, pd, n); }
+                    });
+                }
+                int bestTi = 0; for (int ti = 1; ti < perThread.Length; ti++) if (perThread[ti] < perThread[bestTi]) bestTi = ti;
+                double nativeAll = perThread[threadCounts.Length - 1];   // 16 = all cores (self-tuner's native candidate)
+                double tunerPick = Math.Min(managed, nativeAll);
+                double fBest = Math.Min(managed, perThread[bestTi]);
+                string verdict = fBest < tunerPick - 0.0005 ? $"F WINS via native@{threadCounts[bestTi]}t ({tunerPick / fBest:F2}×)" : "no F headroom";
+                _output.WriteLine(
+                    $"[{k}->{n} m={m,4}] managed {managed*1000:F1}  native@[" +
+                    string.Join(",", System.Linq.Enumerable.Range(0, threadCounts.Length).Select(i => $"{threadCounts[i]}t:{perThread[i]*1000:F0}")) +
+                    $"]us  tuner {tunerPick*1000:F1}  Fbest {fBest*1000:F1}  → {verdict}");
+            }
+        }
+    }
+
     private enum KernelForce { Native, Managed }
     private static readonly float[][] _nativeScratch = new float[2][];
     private static void NativePerLayer(float[] input, int m, int[] dims, List<float[]> weights, List<float[]?> biases, KernelForce force)
