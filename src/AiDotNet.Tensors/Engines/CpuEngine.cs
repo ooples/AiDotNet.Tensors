@@ -34198,6 +34198,55 @@ public partial class CpuEngine : ITensorLevelEngine
         return fallbackResult;
     }
 
+    /// <summary>
+    /// Fused linear + Maxout: computes the linear pre-activation (x·W + bias) of
+    /// shape [.., M, N] and reduces it by taking the max over consecutive groups of
+    /// <paramref name="numPieces"/> along the feature dimension, producing
+    /// [.., M, N/numPieces]. This is the shape-changing Maxout operation (Goodfellow
+    /// et al. 2013) — not an activation epilogue, since it shrinks the feature
+    /// dimension. Inference/forward-only (mirrors MlpForward); under a gradient tape
+    /// the caller should use the per-layer decomposition.
+    /// </summary>
+    public virtual Tensor<T> FusedLinearMaxout<T>(Tensor<T> input, Tensor<T> weights, Tensor<T>? bias, int numPieces)
+    {
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (weights == null) throw new ArgumentNullException(nameof(weights));
+        if (numPieces < 2) throw new ArgumentException("numPieces must be >= 2.", nameof(numPieces));
+
+        // GEMM + bias (no activation) — reuse the fused linear fast path.
+        var pre = FusedLinear(input, weights, bias, FusedActivationType.None);
+        int n = pre._shape[pre._shape.Length - 1];
+        if (n % numPieces != 0)
+            throw new ArgumentException(
+                $"Maxout feature dimension ({n}) must be divisible by numPieces ({numPieces}).", nameof(numPieces));
+        int units = n / numPieces;
+        int rows = pre.Length / n;
+
+        var outShape = (int[])pre._shape.Clone();
+        outShape[outShape.Length - 1] = units;
+        var result = new Tensor<T>(outShape);
+
+        var pa = pre.GetDataArray();
+        var oa = result.GetDataArray();
+        var cmp = System.Collections.Generic.Comparer<T>.Default;
+        for (int r = 0; r < rows; r++)
+        {
+            int inRow = r * n, outRow = r * units;
+            for (int u = 0; u < units; u++)
+            {
+                int g = inRow + u * numPieces;
+                T mx = pa[g];
+                for (int j = 1; j < numPieces; j++)
+                {
+                    T v = pa[g + j];
+                    if (cmp.Compare(v, mx) > 0) mx = v;
+                }
+                oa[outRow + u] = mx;
+            }
+        }
+        return result;
+    }
+
     /// <inheritdoc/>
     public Tensor<T> FusedLinearBackward<T>(
         Tensor<T> gradOutput,

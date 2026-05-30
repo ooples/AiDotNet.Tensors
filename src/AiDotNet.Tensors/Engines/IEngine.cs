@@ -4685,6 +4685,14 @@ public interface IEngine
         FusedActivationParams? activationParams = null);
 
     /// <summary>
+    /// Fused linear + Maxout (Goodfellow et al. 2013): computes x·W + bias of shape
+    /// [.., M, N] then reduces along the feature dim by max over consecutive groups
+    /// of <paramref name="numPieces"/>, producing [.., M, N/numPieces]. A
+    /// shape-changing reduction (not an activation epilogue). Forward/inference-only.
+    /// </summary>
+    Tensor<T> FusedLinearMaxout<T>(Tensor<T> input, Tensor<T> weights, Tensor<T>? bias, int numPieces);
+
+    /// <summary>
     /// Computes the backward pass for fused linear transformation.
     /// </summary>
     Tensor<T> FusedLinearBackward<T>(

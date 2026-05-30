@@ -1319,6 +1319,12 @@ public sealed class FusedOptimizerExtras
     public float RpropStepMax { get; init; } = 50f;
     /// <summary>Rprop initial per-element step size. Default 0.01.</summary>
     public float RpropInitialStep { get; init; } = 0.01f;
+    /// <summary>Hypergradient-SGD learning rate of the learning rate (β). Default 1e-7.</summary>
+    public float HyperLr { get; init; } = 1e-7f;
+    /// <summary>D-Adaptation initial distance estimate d0. Default 1e-6.</summary>
+    public float D0 { get; init; } = 1e-6f;
+    /// <summary>D-Adaptation per-step growth cap (Prodigy growth_rate). Default +inf (uncapped).</summary>
+    public float DGrowthRate { get; init; } = float.PositiveInfinity;
 }
 
 /// <summary>Optimizer type for fused parameter updates.</summary>

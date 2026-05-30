@@ -185,19 +185,16 @@ public class FusedAdaptiveLrPlanTests
 
     [Theory]
     [InlineData(OptimizerType.SparseAdam)]
-    [InlineData(OptimizerType.HypergradientSGD)]
     [InlineData(OptimizerType.ScheduleFreeSGD)]
-    [InlineData(OptimizerType.DAdaptationSGD)]
     public void ConfigureOptimizer_RejectsOptimizersPlanCantDispatch(OptimizerType opt)
     {
-        // Tensors #500: the per-parameter fused dispatch now covers the full
-        // elementwise kernel-backed set (SGD/Adam/AdamW/AMSGrad + SGDMomentum/
-        // Adagrad/RMSprop/Lion/AdaMax/Nadam/RAdam/LAMB/AdaDelta/LARS/FTRL/ASGD/
-        // Rprop). What remains rejected needs an execution model the per-param
-        // loop can't provide: SparseAdam (sparse-gradient indices),
-        // HypergradientSGD / DAdaptationSGD (GLOBAL cross-parameter reductions),
-        // ScheduleFreeSGD (y-buffer written before the forward). These must fail
-        // FAST at configure time, not surprise the caller on the first Step().
+        // Tensors #500/#499: the fused dispatch now covers the full elementwise
+        // kernel-backed set PLUS the global-state optimizers HypergradientSGD and
+        // DAdaptationSGD (via a two-phase global-reduction pass). What remains
+        // rejected needs an execution model the plan can't provide: SparseAdam
+        // (sparse-gradient indices) and ScheduleFreeSGD (a y-buffer written before
+        // the forward pass). These must fail FAST at configure time, not surprise
+        // the caller on the first Step().
         var engine = new CpuEngine();
         var w = new Tensor<float>(new float[] { 1.0f }, new[] { 1 });
         using var plan = CompileReduceSumPlan(engine, w);

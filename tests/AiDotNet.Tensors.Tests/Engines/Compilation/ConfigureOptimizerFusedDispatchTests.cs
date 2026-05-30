@@ -123,20 +123,20 @@ public class ConfigureOptimizerFusedDispatchTests
     }
 
     /// <summary>
-    /// Optimizers that need an execution model the per-parameter fused
-    /// optimizer-step loop can't provide are intentionally NOT wired and must be
-    /// rejected at configure time, so models using them fall back to the eager
-    /// tape cleanly: SparseAdam (sparse-gradient index lists), LBFGS (closure
-    /// line-search over the whole loss), HypergradientSGD / DAdaptationSGD (need
-    /// a GLOBAL cross-parameter reduction, not per-tensor), ScheduleFreeSGD
-    /// (needs a y-buffer written before the forward pass).
+    /// Optimizers that need an execution model the fused plan can't provide are
+    /// intentionally NOT wired and must be rejected at configure time, so models
+    /// using them fall back to the eager tape cleanly:
+    ///  • SparseAdam — sparse-gradient index lists (the plan operates on dense grads),
+    ///  • LBFGS — closure line-search (multiple loss evaluations per step),
+    ///  • ScheduleFreeSGD — needs the y = (1-β)z+βx buffer written BEFORE the forward
+    ///    pass (a pre-forward parameter transform the plan has no hook for).
+    /// (HypergradientSGD and DAdaptationSGD ARE now wired via the two-phase
+    /// global-reduction path — see the dedicated tests above.)
     /// </summary>
     [Theory]
     [InlineData(OptimizerType.SparseAdam)]
     [InlineData(OptimizerType.LBFGS)]
-    [InlineData(OptimizerType.HypergradientSGD)]
     [InlineData(OptimizerType.ScheduleFreeSGD)]
-    [InlineData(OptimizerType.DAdaptationSGD)]
     public void ConfigureOptimizer_UnwiredOptimizer_Throws(OptimizerType opt)
     {
         var engine = new CpuEngine();
@@ -213,5 +213,100 @@ public class ConfigureOptimizerFusedDispatchTests
         Assert.True(L1Norm(strongL1) < L1Norm(noL1),
             $"FTRL L1 extras did not increase sparsity: ||w||₁(L1=5)={L1Norm(strongL1)} should be < " +
             $"||w||₁(L1=0)={L1Norm(noL1)} — extras may not be flowing into the kernel.");
+    }
+
+    // ---- global-state optimizers (Hypergradient / D-Adaptation) -----------
+
+    private static float[] RunGlobal(float[] init, OptimizerType opt, int steps, FusedOptimizerExtras? extras)
+    {
+        var engine = new CpuEngine();
+        var weight = new Tensor<float>(new[] { init.Length });
+        for (int i = 0; i < init.Length; i++) weight[i] = init[i];
+
+        ICompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            var sq = engine.TensorMultiply(weight, weight);
+            engine.ReduceSum(sq, null);
+            plan = scope.CompileTraining(new[] { weight });
+        }
+        using (plan)
+        {
+            plan.ConfigureOptimizer(opt, Lr, B1, B2, Eps, 0f, extras);
+            for (int s = 0; s < steps; s++) plan.Step();
+        }
+        return weight.GetDataArray().AsSpan(0, init.Length).ToArray();
+    }
+
+    /// <summary>
+    /// Hypergradient SGD adapts ONE global learning rate from the inner product of
+    /// successive gradients. Step 1 (no prior gradient) equals plain SGD; over a
+    /// consistent-direction trajectory the adapted LR grows, so it must diverge from
+    /// plain SGD — proving the global reduction is wired (not per-tensor / a no-op).
+    /// </summary>
+    [Fact]
+    public void ConfigureOptimizer_HypergradientSGD_AdaptsGlobalLrAndDivergesFromSGD()
+    {
+        var init = SeedFloat(16, seed: 71);
+        const int steps = 12;
+        var hg = RunGlobal(init, OptimizerType.HypergradientSGD, steps, new FusedOptimizerExtras { HyperLr = 1e-3f });
+        var sgd = RunGlobal(init, OptimizerType.SGD, steps, null);
+
+        double maxAbs = 0;
+        for (int i = 0; i < init.Length; i++)
+        {
+            Assert.True(!float.IsNaN(hg[i]) && !float.IsInfinity(hg[i]), "Hypergradient produced a non-finite parameter");
+            maxAbs = Math.Max(maxAbs, Math.Abs(hg[i] - sgd[i]));
+        }
+        Assert.True(maxAbs > 1e-5, $"Hypergradient never diverged from SGD — global LR adaptation appears unwired (max |Δ| = {maxAbs}).");
+    }
+
+    /// <summary>
+    /// D-Adaptation maintains a single global distance estimate d that should GROW
+    /// from a small d0, so the parameters move substantially more than d0·lr·g would
+    /// in one step. Asserts finite, moves meaningfully, and (vs a tiny fixed d0 SGD-like
+    /// step) that the global d estimate has taken effect.
+    /// </summary>
+    [Fact]
+    public void ConfigureOptimizer_DAdaptationSGD_GrowsGlobalDistanceEstimate()
+    {
+        var init = SeedFloat(16, seed: 73);
+        const int steps = 20;
+        var d = RunGlobal(init, OptimizerType.DAdaptationSGD, steps, new FusedOptimizerExtras { D0 = 1e-6f });
+
+        double maxMove = 0;
+        for (int i = 0; i < init.Length; i++)
+        {
+            Assert.True(!float.IsNaN(d[i]) && !float.IsInfinity(d[i]), "D-Adaptation produced a non-finite parameter");
+            maxMove = Math.Max(maxMove, Math.Abs(d[i] - init[i]));
+        }
+        // With d frozen at d0=1e-6 the total move over 20 steps would be ~O(1e-6·lr·20·|g|) ≈ 1e-6.
+        // A meaningfully larger move proves d grew well above d0 (the adaptation is active).
+        Assert.True(maxMove > 1e-3, $"D-Adaptation distance estimate did not grow (max move = {maxMove}).");
+    }
+
+    /// <summary>Global-state optimizers are rejected with per-group schedules (configure-time).</summary>
+    [Theory]
+    [InlineData(OptimizerType.HypergradientSGD)]
+    [InlineData(OptimizerType.DAdaptationSGD)]
+    public void ConfigureOptimizerGrouped_GlobalStateOptimizer_Throws(OptimizerType opt)
+    {
+        var engine = new CpuEngine();
+        var weight = new Tensor<float>(new[] { 8 });
+        for (int i = 0; i < 8; i++) weight[i] = 0.1f * (i + 1);
+
+        ICompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            var sq = engine.TensorMultiply(weight, weight);
+            engine.ReduceSum(sq, null);
+            plan = scope.CompileTraining(new[] { weight });
+        }
+        using (plan)
+        {
+            var schedules = new System.Collections.Generic.List<LrSchedule> { LrSchedule.Constant(0.01) };
+            var map = new System.Collections.Generic.List<int> { 0 };
+            Assert.Throws<NotSupportedException>(() => plan.ConfigureOptimizerGrouped(opt, schedules, map, B1, B2, Eps));
+        }
     }
 }

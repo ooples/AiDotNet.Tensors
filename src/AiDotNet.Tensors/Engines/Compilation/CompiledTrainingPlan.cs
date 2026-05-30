@@ -645,6 +645,13 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         bool hasGpuParams = typeof(T) == typeof(float)
             && System.Array.Exists(_parameters, p => p.TryGetGpuBuffer() is not null);
         ValidatePlanOptimizerSupport(optimizerType, typeof(T) == typeof(float), hasGpuParams);
+        // Global-state optimizers adapt ONE learning-rate/distance scalar across all
+        // parameters — a per-group schedule is meaningless for them, so they are only
+        // supported through the ungrouped ConfigureOptimizer.
+        if (optimizerType is OptimizerType.HypergradientSGD or OptimizerType.DAdaptationSGD)
+            throw new NotSupportedException(
+                $"{optimizerType} maintains a single global learning-rate/distance scalar and is not " +
+                "supported with per-group schedules; use the ungrouped ConfigureOptimizer.");
         var ex = extras ?? new FusedOptimizerExtras();
         if (typeof(T) == typeof(float))
         {
@@ -707,7 +714,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             or OptimizerType.LARS
             or OptimizerType.FTRL
             or OptimizerType.ASGD
-            or OptimizerType.Rprop;
+            or OptimizerType.Rprop
+            or OptimizerType.HypergradientSGD
+            or OptimizerType.DAdaptationSGD;
 
         bool supported = supportedAnyDtype || (isFloat && supportedFloatOnly);
         if (!supported)
@@ -779,7 +788,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 or OptimizerType.SGDMomentum or OptimizerType.Lion or OptimizerType.Nadam
                 or OptimizerType.AdaMax or OptimizerType.AMSGrad
                 or OptimizerType.RAdam or OptimizerType.LAMB
-                or OptimizerType.LARS or OptimizerType.ASGD or OptimizerType.Rprop;
+                or OptimizerType.LARS or OptimizerType.ASGD or OptimizerType.Rprop
+                or OptimizerType.HypergradientSGD or OptimizerType.DAdaptationSGD;
             bool needsSecondMoment = optimizerType is OptimizerType.Adam or OptimizerType.AdamW
                 or OptimizerType.RMSprop or OptimizerType.Nadam or OptimizerType.AMSGrad
                 or OptimizerType.Adagrad
@@ -885,6 +895,17 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var wd = weightDecay;
         var optType = optimizerType;
         var lrSchedule = schedule;
+        // Global-state optimizers (#500): these maintain a single scalar shared
+        // across ALL parameters, so they run a two-phase (global reduce → apply)
+        // pass rather than the per-parameter switch. State persists across steps
+        // via these captured locals. CPU-only (the device gate rejects them for
+        // GPU plans) and ungrouped (a per-group LR is meaningless for a globally
+        // adapted step).
+        float hgLr = (float)schedule.GetLr(1);   // Hypergradient: adaptive learning rate
+        float dEst = extras.D0;                   // D-Adaptation: distance estimate
+        float dRAccum = 0f;                       // D-Adaptation: r accumulator
+        float exHyperLr = extras.HyperLr;
+        float exGrowth = extras.DGrowthRate;
 
         _optimizerUpdate = () =>
         {
@@ -893,6 +914,63 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // LRScheduler.step() pays managed-code dispatch overhead per
             // step; here it's an inlined Math.Cos / Math.Pow.
             float lr = (float)lrSchedule.GetLr(_optimizerStep);
+
+            if (optType == OptimizerType.HypergradientSGD)
+            {
+                // lr_t = lr_{t-1} + β·⟨g_t, g_{t-1}⟩ (global inner product across all params),
+                // then p -= lr_t·g. prevGrad is stored in m[p].
+                double inner = 0;
+                for (int p = 0; p < paramCount; p++)
+                {
+                    if (gradArrays[p].Length == 0) continue;
+                    int len2 = lengths[p];
+                    fixed (float* pGrad = gradArrays[p], pPrev = m[p])
+                        for (int i = 0; i < len2; i++) inner += (double)pGrad[i] * pPrev[i];
+                }
+                float newLr = hgLr + exHyperLr * (float)inner;
+                for (int p = 0; p < paramCount; p++)
+                {
+                    if (gradArrays[p].Length == 0) continue;
+                    int len2 = lengths[p];
+                    fixed (float* pParam = paramArrays[p], pGrad = gradArrays[p], pPrev = m[p])
+                        for (int i = 0; i < len2; i++) { pParam[i] -= newLr * pGrad[i]; pPrev[i] = pGrad[i]; }
+                }
+                hgLr = newLr;
+                return;
+            }
+            if (optType == OptimizerType.DAdaptationSGD)
+            {
+                // Defazio & Mishchenko 2023 (growth-bounded, Prodigy). s, ‖s‖², r are GLOBAL.
+                float gamma = dEst * lr;
+                double gNorm2 = 0, sNorm2 = 0;
+                for (int p = 0; p < paramCount; p++)
+                {
+                    if (gradArrays[p].Length == 0) continue;
+                    int len2 = lengths[p];
+                    fixed (float* pGrad = gradArrays[p], pS = m[p])
+                        for (int i = 0; i < len2; i++)
+                        {
+                            pS[i] += gamma * pGrad[i];
+                            gNorm2 += (double)pGrad[i] * pGrad[i];
+                            sNorm2 += (double)pS[i] * pS[i];
+                        }
+                }
+                dRAccum += gamma * gamma * (float)gNorm2;
+                float dHat = (float)(sNorm2 / (Math.Sqrt(dRAccum) + 1e-30));
+                float dCapped = float.IsPositiveInfinity(exGrowth) ? dHat : Math.Min(dHat, dEst * exGrowth);
+                float dNew = Math.Max(dEst, dCapped);
+                float gammaNew = dNew * lr;
+                for (int p = 0; p < paramCount; p++)
+                {
+                    if (gradArrays[p].Length == 0) continue;
+                    int len2 = lengths[p];
+                    fixed (float* pParam = paramArrays[p], pGrad = gradArrays[p])
+                        for (int i = 0; i < len2; i++) pParam[i] -= gammaNew * pGrad[i];
+                }
+                dEst = dNew;
+                return;
+            }
+
             for (int p = 0; p < paramCount; p++)
             {
                 int len = lengths[p];
@@ -1121,7 +1199,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 or OptimizerType.SGDMomentum or OptimizerType.Lion or OptimizerType.Nadam
                 or OptimizerType.AdaMax or OptimizerType.AMSGrad
                 or OptimizerType.RAdam or OptimizerType.LAMB
-                or OptimizerType.LARS or OptimizerType.ASGD or OptimizerType.Rprop;
+                or OptimizerType.LARS or OptimizerType.ASGD or OptimizerType.Rprop
+                or OptimizerType.HypergradientSGD or OptimizerType.DAdaptationSGD;
             bool needsSecondMoment = optimizerType is OptimizerType.Adam or OptimizerType.AdamW
                 or OptimizerType.RMSprop or OptimizerType.Nadam or OptimizerType.AMSGrad
                 or OptimizerType.Adagrad
@@ -1430,7 +1509,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 or OptimizerType.SGDMomentum or OptimizerType.Lion or OptimizerType.Nadam
                 or OptimizerType.AdaMax or OptimizerType.AMSGrad
                 or OptimizerType.RAdam or OptimizerType.LAMB
-                or OptimizerType.LARS or OptimizerType.ASGD or OptimizerType.Rprop;
+                or OptimizerType.LARS or OptimizerType.ASGD or OptimizerType.Rprop
+                or OptimizerType.HypergradientSGD or OptimizerType.DAdaptationSGD;
             bool needsSecondMoment = optimizerType is OptimizerType.Adam or OptimizerType.AdamW
                 or OptimizerType.RMSprop or OptimizerType.Nadam or OptimizerType.AMSGrad
                 or OptimizerType.Adagrad
@@ -1548,7 +1628,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 or OptimizerType.SGDMomentum or OptimizerType.Lion or OptimizerType.Nadam
                 or OptimizerType.AdaMax or OptimizerType.AMSGrad
                 or OptimizerType.RAdam or OptimizerType.LAMB
-                or OptimizerType.LARS or OptimizerType.ASGD or OptimizerType.Rprop;
+                or OptimizerType.LARS or OptimizerType.ASGD or OptimizerType.Rprop
+                or OptimizerType.HypergradientSGD or OptimizerType.DAdaptationSGD;
             bool needsSecondMoment = optimizerType is OptimizerType.Adam or OptimizerType.AdamW
                 or OptimizerType.RMSprop or OptimizerType.Nadam or OptimizerType.AMSGrad
                 or OptimizerType.Adagrad
