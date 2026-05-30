@@ -117,13 +117,17 @@ public static class CpuFusedOperations
     /// <param name="N">Number of columns in B (output features).</param>
     /// <param name="K">Shared dimension (input features).</param>
     /// <param name="activation">Activation function to apply.</param>
+    /// <param name="activationParams">Optional parametric-activation settings
+    /// (LeakyReLU/RReLU slope, ELU/CELU/ThresholdedReLU/ScaledTanh params). Null
+    /// uses each activation's default.</param>
     public static void FusedGemmBiasActivation(
         float[] A,
         float[] B,
         float[]? bias,
         float[] output,
         int M, int N, int K,
-        FusedActivationType activation)
+        FusedActivationType activation,
+        FusedActivationParams? activationParams = null)
     {
         if (A.Length < M * K)
             throw new ArgumentException($"A must have at least {M * K} elements", nameof(A));
@@ -134,7 +138,7 @@ public static class CpuFusedOperations
         if (bias != null && bias.Length < N)
             throw new ArgumentException($"bias must have at least {N} elements", nameof(bias));
 
-        FusedGemmBiasActivationUnchecked(A, B, bias, output, M, N, K, activation);
+        FusedGemmBiasActivationUnchecked(A, B, bias, output, M, N, K, activation, activationParams: activationParams);
     }
 
     internal static void FusedGemmBiasActivationUnchecked(
@@ -144,12 +148,13 @@ public static class CpuFusedOperations
         float[] output,
         int M, int N, int K,
         FusedActivationType activation,
-        bool allowCachedB = true)
+        bool allowCachedB = true,
+        FusedActivationParams? activationParams = null)
     {
         // Use BLAS for the O(MNK) GEMM, then fuse bias+activation in a cheap O(MN) second pass.
         if (BlasProvider.TryGemm(M, N, K, A, 0, K, B, 0, N, output, 0, N))
         {
-            ApplyBiasActivationInPlace(output, bias, M, N, activation);
+            ApplyBiasActivationInPlace(output, bias, M, N, activation, activationParams);
             return;
         }
 
@@ -172,7 +177,7 @@ public static class CpuFusedOperations
             SimdGemm.Sgemm(
                 A.AsSpan(0, M * K), B.AsSpan(0, K * N), output.AsSpan(0, M * N), M, K, N);
         }
-        ApplyBiasActivationInPlace(output, bias, M, N, activation);
+        ApplyBiasActivationInPlace(output, bias, M, N, activation, activationParams);
     }
 
     /// <summary>
@@ -1284,6 +1289,8 @@ public static class CpuFusedOperations
             {
                 // max(0,x)+min(0,a*(exp(x/a)-1)) reduces to this piecewise form.
                 float a = p?.Alpha ?? 1f;
+                if (!(a > 0f))
+                    throw new ArgumentOutOfRangeException(nameof(p), "CELU alpha must be > 0 (the activation divides by it).");
                 return x => x >= 0f ? x : a * (MathF.Exp(x / a) - 1f);
             }
             case FusedActivationType.ThresholdedReLU:
@@ -1383,7 +1390,8 @@ public static class CpuFusedOperations
         double[]? bias,
         double[] output,
         int M, int N, int K,
-        FusedActivationType activation)
+        FusedActivationType activation,
+        FusedActivationParams? activationParams = null)
     {
         if (A.Length < M * K)
             throw new ArgumentException($"A must have at least {M * K} elements", nameof(A));
@@ -1397,7 +1405,7 @@ public static class CpuFusedOperations
         // Use BLAS for the O(MNK) GEMM, then fuse bias+activation in a cheap O(MN) second pass.
         if (BlasProvider.TryGemm(M, N, K, A, 0, K, B, 0, N, output, 0, N))
         {
-            ApplyBiasActivationInPlaceDouble(output, bias, M, N, activation);
+            ApplyBiasActivationInPlaceDouble(output, bias, M, N, activation, activationParams);
             return;
         }
 
@@ -1414,7 +1422,7 @@ public static class CpuFusedOperations
             MathHelper.GetNumericOperations<double>(),
             A.AsMemory(0, M * K), B.AsMemory(0, K * N), output.AsMemory(0, M * N),
             M, K, N, K, N, N);
-        ApplyBiasActivationInPlaceDouble(output, bias, M, N, activation);
+        ApplyBiasActivationInPlaceDouble(output, bias, M, N, activation, activationParams);
     }
 
     /// <summary>
@@ -1496,6 +1504,8 @@ public static class CpuFusedOperations
             case FusedActivationType.CELU:
             {
                 double a = p?.Alpha ?? 1f;
+                if (!(a > 0.0))
+                    throw new ArgumentOutOfRangeException(nameof(p), "CELU alpha must be > 0 (the activation divides by it).");
                 return x => x >= 0.0 ? x : a * (Math.Exp(x / a) - 1.0);
             }
             case FusedActivationType.ThresholdedReLU:

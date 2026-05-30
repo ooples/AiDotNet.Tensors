@@ -119,6 +119,8 @@ internal static class ActivationEpilogue
             {
                 // max(0,x)+min(0,a*(exp(x/a)-1)) → piecewise: x>=0 ? x : a*(exp(x/a)-1).
                 double a = p?.Alpha ?? 1.0;
+                if (!(a > 0.0))
+                    throw new ArgumentOutOfRangeException(nameof(p), "CELU alpha must be > 0 (the activation divides by it).");
                 for (int i = 0; i < m; i++)
                     for (int j = 0; j < n; j++)
                     {
@@ -301,6 +303,8 @@ internal static class ActivationEpilogue
             case FusedActivationType.CELU:
             {
                 float a = p?.Alpha ?? 1f;
+                if (!(a > 0f))
+                    throw new ArgumentOutOfRangeException(nameof(p), "CELU alpha must be > 0 (the activation divides by it).");
                 for (int i = 0; i < m; i++)
                     for (int j = 0; j < n; j++)
                     {

@@ -35,7 +35,12 @@ internal static class RowwiseFusedActivations
                     var slope = p?.PReluSlope;
                     for (int j = 0; j < n; j++)
                     {
-                        float s = slope == null ? 0.25f : (slope.Length == 1 ? slope[0] : slope[j]);
+                        // Per-channel slope; broadcast a length-1 array, and defensively
+                        // clamp to the last element if a misconfigured slope is shorter
+                        // than the feature dim (rather than throwing IndexOutOfRange).
+                        float s = slope == null ? 0.25f
+                                : slope.Length == 1 ? slope[0]
+                                : j < slope.Length ? slope[j] : slope[slope.Length - 1];
                         float v = c[row + j];
                         c[row + j] = v > 0f ? v : s * v;
                     }
@@ -133,7 +138,12 @@ internal static class RowwiseFusedActivations
                     var slope = p?.PReluSlope;
                     for (int j = 0; j < n; j++)
                     {
-                        double s = slope == null ? 0.25 : (slope.Length == 1 ? slope[0] : slope[j]);
+                        // Per-channel slope; broadcast a length-1 array, and defensively
+                        // clamp to the last element if a misconfigured slope is shorter
+                        // than the feature dim (rather than throwing IndexOutOfRange).
+                        double s = slope == null ? 0.25
+                                 : slope.Length == 1 ? slope[0]
+                                 : j < slope.Length ? slope[j] : slope[slope.Length - 1];
                         double v = c[row + j];
                         c[row + j] = v > 0.0 ? v : s * v;
                     }

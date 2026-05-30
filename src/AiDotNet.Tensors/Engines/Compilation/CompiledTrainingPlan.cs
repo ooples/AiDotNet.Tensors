@@ -600,6 +600,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             && System.Array.Exists(_parameters, p => p.TryGetGpuBuffer() is not null);
         ValidatePlanOptimizerSupport(optimizerType, typeof(T) == typeof(float), hasGpuParams);
         var ex = extras ?? new FusedOptimizerExtras();
+        ex.Validate();
         if (typeof(T) == typeof(float))
         {
             ConfigureOptimizerFloat(optimizerType, schedule, beta1, beta2, eps, weightDecay, ex);
@@ -658,6 +659,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         bool hasGpuParams = typeof(T) == typeof(float)
             && System.Array.Exists(_parameters, p => p.TryGetGpuBuffer() is not null);
         ValidatePlanOptimizerSupport(optimizerType, typeof(T) == typeof(float), hasGpuParams);
+        // Drop any Schedule-Free pre-forward hook left over from a prior ungrouped
+        // ConfigureOptimizer(ScheduleFreeSGD); a grouped optimizer never sets one,
+        // and Step() unconditionally invokes it — leaving it active would rewrite
+        // the live weights with stale y=(1-β)z+βx before each forward.
+        _preForwardParamTransform = null;
         // Global-state optimizers adapt ONE learning-rate/distance scalar across all
         // parameters — a per-group schedule is meaningless for them, so they are only
         // supported through the ungrouped ConfigureOptimizer.
@@ -668,6 +674,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 "(or a per-step parameter transform) and is not supported with per-group schedules; " +
                 "use the ungrouped ConfigureOptimizer.");
         var ex = extras ?? new FusedOptimizerExtras();
+        ex.Validate();
         if (typeof(T) == typeof(float))
         {
             ConfigureOptimizerFloatGrouped(optimizerType, groupSchedules, paramToGroup, beta1, beta2, eps, weightDecay, ex);
@@ -919,7 +926,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // via these captured locals. CPU-only (the device gate rejects them for
         // GPU plans) and ungrouped (a per-group LR is meaningless for a globally
         // adapted step).
-        float hgLr = (float)schedule.GetLr(1);   // Hypergradient: adaptive learning rate
+        float hgAdj = 0f;                         // Hypergradient: accumulated lr adjustment (added to the per-step schedule base)
         float dEst = extras.D0;                   // D-Adaptation: distance estimate
         float dRAccum = 0f;                       // D-Adaptation: r accumulator
         float exHyperLr = extras.HyperLr;
@@ -964,8 +971,13 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
             if (optType == OptimizerType.HypergradientSGD)
             {
-                // lr_t = lr_{t-1} + β·⟨g_t, g_{t-1}⟩ (global inner product across all params),
-                // then p -= lr_t·g. prevGrad is stored in m[p].
+                // Hypergradient descent (Baydin et al. 2018): the effective lr is the
+                // per-step schedule base PLUS an adjustment accumulated from successive
+                // gradient inner products: adj_t = adj_{t-1} + β·⟨g_t, g_{t-1}⟩, then
+                // lr_eff = schedule.GetLr(t) + adj_t, and p -= lr_eff·g. prevGrad is in
+                // m[p]. Threading the per-step `lr` in means a non-constant LrSchedule is
+                // honored (was previously frozen at GetLr(1)); a constant schedule
+                // reduces to plain hypergradient from that base.
                 double inner = 0;
                 for (int p = 0; p < paramCount; p++)
                 {
@@ -974,7 +986,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     fixed (float* pGrad = gradArrays[p], pPrev = m[p])
                         for (int i = 0; i < len2; i++) inner += (double)pGrad[i] * pPrev[i];
                 }
-                float newLr = hgLr + exHyperLr * (float)inner;
+                hgAdj += exHyperLr * (float)inner;
+                float newLr = lr + hgAdj;
                 for (int p = 0; p < paramCount; p++)
                 {
                     if (gradArrays[p].Length == 0) continue;
@@ -982,7 +995,6 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     fixed (float* pParam = paramArrays[p], pGrad = gradArrays[p], pPrev = m[p])
                         for (int i = 0; i < len2; i++) { pParam[i] -= newLr * pGrad[i]; pPrev[i] = pGrad[i]; }
                 }
-                hgLr = newLr;
                 return;
             }
             if (optType == OptimizerType.DAdaptationSGD)

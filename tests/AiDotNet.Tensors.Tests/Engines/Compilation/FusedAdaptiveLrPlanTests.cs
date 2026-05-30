@@ -192,8 +192,10 @@ public class FusedAdaptiveLrPlanTests
         // DAdaptationSGD (two-phase global-reduction pass), and ScheduleFreeSGD
         // (the y-buffer is written by the plan's pre-forward parameter-transform
         // hook). What remains rejected needs an execution model the plan still
-        // can't provide: SparseAdam (sparse-gradient indices). It must fail FAST
-        // at configure time, not surprise the caller on the first Step().
+        // can't provide: SparseAdam (sparse-gradient indices) and LBFGS (closure
+        // line-search — see ConfigureOptimizer_RejectsIneligibleOptimizer above).
+        // These must fail FAST at configure time, not surprise the caller on the
+        // first Step().
         var engine = new CpuEngine();
         var w = new Tensor<float>(new float[] { 1.0f }, new[] { 1 });
         using var plan = CompileReduceSumPlan(engine, w);
