@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Engines.Simd;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -62,6 +63,51 @@ public class MlpForwardWholeChainBench
                 $"[m={m,4}]  new {newMs * 1000:F1}us  old(native+copy+sep+alloc) {oldMs * 1000:F1}us  " +
                 $"ratio {oldMs / newMs:F2}x  {verdict}  (maxDiff {maxDiff:E2})");
         }
+    }
+
+    [Fact]
+    public void TinyModel_CompiledMlp_SerialVsParallel_Probe()
+    {
+        if (Environment.GetEnvironmentVariable("AIDOTNET_RUN_JIT_PERF") != "1") return;
+
+        // Phase 4 probe: does forcing single-thread help a cache-resident tiny
+        // model, or do its GEMMs already run serial (below ParallelWorkThreshold)?
+        int[] dims = { 64, 48, 16, 5 };
+        int layers = dims.Length - 1;
+        var w = new List<float[]>(); var b = new List<float[]?>(); var inF = new List<int>(); var outF = new List<int>();
+        for (int l = 0; l < layers; l++)
+        {
+            w.Add(MakeArr(dims[l] * dims[l + 1], 100 + l));
+            b.Add(MakeArr(dims[l + 1], 200 + l));
+            inF.Add(dims[l]); outF.Add(dims[l + 1]);
+        }
+        var plan = CompiledMlp.Create(w, b, inF, outF, FusedActivationType.ReLU, FusedActivationType.None, maxBatch: 64);
+        long modelBytes = 0; foreach (var ww in w) modelBytes += (long)ww.Length * 4;
+        _output.WriteLine($"ParallelWorkThreshold={SimdGemm.ParallelWorkThreshold} FMAs; tiny-model weights={modelBytes} B");
+
+        bool savedPar = SimdGemm.UseParallelGemm;
+        try
+        {
+            foreach (int m in new[] { 1, 8, 32 })
+            {
+                var input = MakeArr(m * dims[0], 7);
+                var output = new float[m * plan.OutputFeatures];
+                SimdGemm.UseParallelGemm = true;
+                double par = Bench(() => plan.Run(input, m, output));
+                SimdGemm.UseParallelGemm = false;
+                double ser = Bench(() => plan.Run(input, m, output));
+                _output.WriteLine($"[m={m,3}]  parallel-flag {par * 1000:F1}us  serial-flag {ser * 1000:F1}us  ratio {par / ser:F2}x");
+            }
+        }
+        finally { SimdGemm.UseParallelGemm = savedPar; }
+    }
+
+    private static float[] MakeArr(int n, int seed)
+    {
+        var rng = new Random(seed);
+        var a = new float[n];
+        for (int i = 0; i < n; i++) a[i] = (float)(rng.NextDouble() - 0.5);
+        return a;
     }
 
     private static void OldNativePerLayer(Tensor<float> input, List<Tensor<float>> weights, List<Tensor<float>?> biases, int m, int[] dims)
