@@ -1332,6 +1332,92 @@ public static class CpuFusedOperations
         throw new ArgumentException($"No float activation registered for type: {activation}");
     }
 
+    /// <summary>Returns f'(x) for the pointwise fused activation — the exact analytic
+    /// derivative of the matching <see cref="GetFloatActivation"/> form, for use in the
+    /// fused-activation backward pass. Sign/BinarySpiking are hard (piecewise-constant)
+    /// nonlinearities whose derivative is 0 almost everywhere — they return 0 (use a
+    /// surrogate-gradient layer for SNN training).</summary>
+    internal static Func<float, float> GetFloatActivationDerivative(FusedActivationType activation, FusedActivationParams? p = null)
+    {
+        switch (activation)
+        {
+            case FusedActivationType.LeakyReLU:
+            {
+                float a = p?.Alpha ?? 0.01f;
+                return x => x > 0f ? 1f : a;
+            }
+            case FusedActivationType.RReLU:
+            {
+                float a = p?.Alpha ?? 0.22916667f;
+                return x => x > 0f ? 1f : a;
+            }
+            case FusedActivationType.ELU:
+            {
+                float a = p?.Alpha ?? 1f;
+                return x => x > 0f ? 1f : a * MathF.Exp(x);
+            }
+            case FusedActivationType.SELU:
+                return x => SeluScale * (x > 0f ? 1f : SeluAlpha * MathF.Exp(x));
+            case FusedActivationType.CELU:
+            {
+                float a = p?.Alpha ?? 1f;
+                if (!(a > 0f))
+                    throw new ArgumentOutOfRangeException(nameof(p), "CELU alpha must be > 0 (the activation divides by it).");
+                return x => x >= 0f ? 1f : MathF.Exp(x / a);
+            }
+            case FusedActivationType.Softplus:
+                return x => x > 20f ? 1f : 1f / (1f + MathF.Exp(-x));
+            case FusedActivationType.Mish:
+                return x =>
+                {
+                    float sp = ApplySoftplus(x);
+                    float t = MathF.Tanh(sp);
+                    float sig = x > 20f ? 1f : 1f / (1f + MathF.Exp(-x));
+                    return t + x * sig * (1f - t * t);
+                };
+            case FusedActivationType.HardSwish:
+                return x => x <= -3f ? 0f : (x >= 3f ? 1f : (2f * x + 3f) / 6f);
+            case FusedActivationType.HardSigmoid:
+                return x => (x > -3f && x < 3f) ? 1f / 6f : 0f;
+            case FusedActivationType.HardTanh:
+                return x => (x > -1f && x < 1f) ? 1f : 0f;
+            case FusedActivationType.ReLU6:
+                return x => (x > 0f && x < 6f) ? 1f : 0f;
+            case FusedActivationType.SoftSign:
+                return x => { float d = 1f + MathF.Abs(x); return 1f / (d * d); };
+            case FusedActivationType.ThresholdedReLU:
+            {
+                float t = p?.Theta ?? 1f;
+                return x => x > t ? 1f : 0f;
+            }
+            case FusedActivationType.ScaledTanh:
+            {
+                float a = p?.Alpha ?? 1f, b = p?.Beta ?? 1f;
+                return x => { float th = MathF.Tanh(b * x); return a * b * (1f - th * th); };
+            }
+            case FusedActivationType.BentIdentity:
+                return x => x / (2f * MathF.Sqrt(x * x + 1f)) + 1f;
+            case FusedActivationType.Gaussian:
+                return x => -2f * x * MathF.Exp(-x * x);
+            case FusedActivationType.LiSHT:
+                return x => { float t = MathF.Tanh(x); return t + x * (1f - t * t); };
+            case FusedActivationType.ISRU:
+            {
+                float a = p?.Alpha ?? 1f;
+                return x => { float denom = 1f + a * x * x; return 1f / (denom * MathF.Sqrt(denom)); };
+            }
+            case FusedActivationType.SQRBF:
+            {
+                float b = p?.Beta ?? 1f;
+                return x => -2f * b * x * MathF.Exp(-b * x * x);
+            }
+            case FusedActivationType.Sign:
+            case FusedActivationType.BinarySpiking:
+                return _ => 0f;  // derivative 0 a.e.; documented hard nonlinearity
+        }
+        throw new ArgumentException($"No float activation derivative registered for type: {activation}");
+    }
+
     /// <summary>
     /// GELU activation using fast tanh approximation.
     /// GELU(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
@@ -1545,6 +1631,90 @@ public static class CpuFusedOperations
         if (_doubleActivations.TryGetValue(activation, out var fn))
             return fn;
         throw new ArgumentException($"No double activation registered for type: {activation}");
+    }
+
+    /// <summary>Double-precision f'(x) for the pointwise fused activation — exact analytic
+    /// derivative of the matching <see cref="GetDoubleActivation"/> form. See the float
+    /// overload for the Sign/BinarySpiking note.</summary>
+    internal static Func<double, double> GetDoubleActivationDerivative(FusedActivationType activation, FusedActivationParams? p = null)
+    {
+        switch (activation)
+        {
+            case FusedActivationType.LeakyReLU:
+            {
+                double a = p?.Alpha ?? 0.01;
+                return x => x > 0.0 ? 1.0 : a;
+            }
+            case FusedActivationType.RReLU:
+            {
+                double a = p?.Alpha ?? 0.22916667;
+                return x => x > 0.0 ? 1.0 : a;
+            }
+            case FusedActivationType.ELU:
+            {
+                double a = p?.Alpha ?? 1.0;
+                return x => x > 0.0 ? 1.0 : a * Math.Exp(x);
+            }
+            case FusedActivationType.SELU:
+                return x => 1.0507009873554805 * (x > 0.0 ? 1.0 : 1.6732632423543772 * Math.Exp(x));
+            case FusedActivationType.CELU:
+            {
+                double a = p?.Alpha ?? 1.0;
+                if (!(a > 0.0))
+                    throw new ArgumentOutOfRangeException(nameof(p), "CELU alpha must be > 0 (the activation divides by it).");
+                return x => x >= 0.0 ? 1.0 : Math.Exp(x / a);
+            }
+            case FusedActivationType.Softplus:
+                return x => x > 20.0 ? 1.0 : 1.0 / (1.0 + Math.Exp(-x));
+            case FusedActivationType.Mish:
+                return x =>
+                {
+                    double sp = ApplySoftplusDouble(x);
+                    double t = Math.Tanh(sp);
+                    double sig = x > 20.0 ? 1.0 : 1.0 / (1.0 + Math.Exp(-x));
+                    return t + x * sig * (1.0 - t * t);
+                };
+            case FusedActivationType.HardSwish:
+                return x => x <= -3.0 ? 0.0 : (x >= 3.0 ? 1.0 : (2.0 * x + 3.0) / 6.0);
+            case FusedActivationType.HardSigmoid:
+                return x => (x > -3.0 && x < 3.0) ? 1.0 / 6.0 : 0.0;
+            case FusedActivationType.HardTanh:
+                return x => (x > -1.0 && x < 1.0) ? 1.0 : 0.0;
+            case FusedActivationType.ReLU6:
+                return x => (x > 0.0 && x < 6.0) ? 1.0 : 0.0;
+            case FusedActivationType.SoftSign:
+                return x => { double d = 1.0 + Math.Abs(x); return 1.0 / (d * d); };
+            case FusedActivationType.ThresholdedReLU:
+            {
+                double t = p?.Theta ?? 1.0;
+                return x => x > t ? 1.0 : 0.0;
+            }
+            case FusedActivationType.ScaledTanh:
+            {
+                double a = p?.Alpha ?? 1.0, b = p?.Beta ?? 1.0;
+                return x => { double th = Math.Tanh(b * x); return a * b * (1.0 - th * th); };
+            }
+            case FusedActivationType.BentIdentity:
+                return x => x / (2.0 * Math.Sqrt(x * x + 1.0)) + 1.0;
+            case FusedActivationType.Gaussian:
+                return x => -2.0 * x * Math.Exp(-x * x);
+            case FusedActivationType.LiSHT:
+                return x => { double t = Math.Tanh(x); return t + x * (1.0 - t * t); };
+            case FusedActivationType.ISRU:
+            {
+                double a = p?.Alpha ?? 1.0;
+                return x => { double denom = 1.0 + a * x * x; return 1.0 / (denom * Math.Sqrt(denom)); };
+            }
+            case FusedActivationType.SQRBF:
+            {
+                double b = p?.Beta ?? 1.0;
+                return x => -2.0 * b * x * Math.Exp(-b * x * x);
+            }
+            case FusedActivationType.Sign:
+            case FusedActivationType.BinarySpiking:
+                return _ => 0.0;  // derivative 0 a.e.; documented hard nonlinearity
+        }
+        throw new ArgumentException($"No double activation derivative registered for type: {activation}");
     }
 
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]

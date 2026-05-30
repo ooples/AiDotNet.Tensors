@@ -33964,15 +33964,18 @@ public partial class CpuEngine : ITensorLevelEngine
 
                 var inputs = bias != null ? new[] { input, weights, bias } : new[] { input, weights };
                 var capturedActivation = activation;
+                var capturedParams = activationParams;
                 return scope.RecordVariadic(nodeType, "FusedLinear", inputs, outShape,
                     (eng, output) =>
                     {
                         var eager = eng.FusedLinear(inputs[0], inputs[1],
-                            inputs.Length > 2 ? inputs[2] : null, capturedActivation);
+                            inputs.Length > 2 ? inputs[2] : null, capturedActivation, capturedParams);
                         eager.AsSpan().CopyTo(output.AsWritableSpan());
                     },
                     BackwardFunctions<T>.FusedLinearWithActivationBackward,
-                    activation != FusedActivationType.None ? new object[] { activation } : null);
+                    // savedState layout [0]=activation, [1]=preActivation (null here ⇒ backward
+                    // recomputes), [2]=FusedActivationParams (#506 review: parametric backward).
+                    activation != FusedActivationType.None ? new object[] { activation, null!, activationParams! } : null);
             }
         }
 
@@ -33996,15 +33999,16 @@ public partial class CpuEngine : ITensorLevelEngine
             if (activation != FusedActivationType.None)
             {
                 savedPreActivation = fusedResult.Clone();
-                ApplyFusedActivationInPlace(fusedResult, activation);
+                ApplyFusedActivationInPlace(fusedResult, activation, activationParams);
             }
             RemoveLastNTapeEntries<T>(bias != null ? 2 : 1);
 
             // Record single fused entry with activation info AND the captured
-            // pre-activation for backward.
+            // pre-activation for backward. #506 review: also carry FusedActivationParams
+            // ([2]) so parametric backward matches the parametric forward applied above.
             var fusedInputs = bias != null ? new[] { input, weights, bias } : new[] { input, weights };
             object[]? savedState = activation != FusedActivationType.None
-                ? new object[] { activation, savedPreActivation! } // [0]=activation, [1]=pre-activation
+                ? new object[] { activation, savedPreActivation!, activationParams! } // [0]=activation, [1]=pre-activation, [2]=params
                 : null;
             Autodiff.DifferentiableOps.RecordIfActive("FusedLinear", fusedResult, fusedInputs,
                 Autodiff.BackwardFunctions<T>.FusedLinearWithActivationBackward, savedState);
@@ -34598,11 +34602,11 @@ public partial class CpuEngine : ITensorLevelEngine
     /// Handlers with true in-place support (ReLU, Sigmoid) override ApplyInPlace.
     /// Others fall back to allocate + copy.
     /// </summary>
-    private void ApplyFusedActivationInPlace<T>(Tensor<T> tensor, FusedActivationType activation)
+    private void ApplyFusedActivationInPlace<T>(Tensor<T> tensor, FusedActivationType activation, FusedActivationParams? activationParams = null)
     {
         var handler = ActivationRegistry.Get(activation);
         if (handler is null) return; // None
-        handler.ApplyInPlace(this, tensor);
+        handler.ApplyInPlace(this, tensor, activationParams);
     }
 
     /// <summary>
@@ -34619,16 +34623,18 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <summary>
     /// Computes the backward pass for the specified activation function.
     /// </summary>
-    internal Tensor<T> ApplyFusedActivationBackward<T>(Tensor<T> gradOutput, Tensor<T> preActivation, FusedActivationType activation)
+    internal Tensor<T> ApplyFusedActivationBackward<T>(Tensor<T> gradOutput, Tensor<T> preActivation, FusedActivationType activation, FusedActivationParams? activationParams = null)
     {
         // None is an explicit pass-through — no derivative to apply
         if (activation == FusedActivationType.None) return gradOutput;
 
         // OCP-compliant: dispatch through ActivationRegistry, no switch statement.
         // ActivationRegistry.Get throws for unknown types, preventing silent identity pass-through.
+        // #506 review: forward parametric settings so non-default LeakyReLU/ELU/CELU/
+        // ThresholdedReLU/ScaledTanh/RReLU/PReLU gradients match the forward.
         var handler = ActivationRegistry.Get(activation);
         if (handler is null) return gradOutput;
-        return handler.ApplyBackward(this, gradOutput, preActivation);
+        return handler.ApplyBackward(this, gradOutput, preActivation, activationParams);
     }
 
     /// <summary>
