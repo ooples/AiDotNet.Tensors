@@ -208,4 +208,39 @@ public class TrsmTests
         BlasManagedLib.Trsm<double>(Side.Left, Uplo.Lower, false, Diag.NonUnit, m, n, 1.0, a, m, actual, n);
         for (int i = 0; i < actual.Length; i++) Assert.Equal(expected[i], actual[i], 8);
     }
+
+    public static System.Collections.Generic.IEnumerable<object[]> LeftMatrix()
+    {
+        foreach (var uplo in new[] { Uplo.Upper, Uplo.Lower })
+        foreach (var trans in new[] { false, true })
+        foreach (var diag in new[] { Diag.NonUnit, Diag.Unit })
+            yield return new object[] { uplo, trans, diag };
+    }
+
+    [Theory]
+    [MemberData(nameof(LeftMatrix))]
+    public void Trsm_FP64_LargeLeft_AllCombos_BlockedPath_MatchesReference(Uplo uplo, bool trans, Diag diag)
+    {
+        const int m = 200, n = 6; // m > TrsmBlock(64) → blocked, all Left uplo×trans×diag
+        var rng = new Random(4242);
+        double[] a = new double[m * m];
+        for (int i = 0; i < m; i++)
+        {
+            for (int j = 0; j < m; j++)
+                if ((uplo == Uplo.Upper && j >= i) || (uplo == Uplo.Lower && j <= i))
+                    // Small off-diagonals so a 200-row UNIT-triangular solve stays
+                    // well-conditioned (no exponential substitution growth that would
+                    // push values to ~1e10 and defeat an absolute tolerance).
+                    a[i * m + j] = (rng.NextDouble() * 2 - 1) * 0.05;
+            a[i * m + i] += m; // dominant diagonal (used by NonUnit; ignored by Unit)
+        }
+        double[] b = new double[m * n];
+        for (int i = 0; i < b.Length; i++) b[i] = rng.NextDouble() * 2 - 1;
+
+        double[] expected = (double[])b.Clone();
+        ReferenceTrsmLeft(Side.Left, uplo, trans, diag, m, n, 1.0, a, m, expected, n);
+        double[] actual = (double[])b.Clone();
+        BlasManagedLib.Trsm<double>(Side.Left, uplo, trans, diag, m, n, 1.0, a, m, actual, n);
+        for (int i = 0; i < actual.Length; i++) Assert.Equal(expected[i], actual[i], 7);
+    }
 }
