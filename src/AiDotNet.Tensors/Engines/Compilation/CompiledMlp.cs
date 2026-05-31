@@ -75,6 +75,8 @@ internal sealed class CompiledMlp
     {
         if (weights is null) throw new ArgumentNullException(nameof(weights));
         if (biases is null) throw new ArgumentNullException(nameof(biases));
+        if (inFeatures is null) throw new ArgumentNullException(nameof(inFeatures));
+        if (outFeatures is null) throw new ArgumentNullException(nameof(outFeatures));
         int layers = weights.Count;
         if (layers == 0) throw new ArgumentException("CompiledMlp requires at least one layer.", nameof(weights));
         if (biases.Count != layers || inFeatures.Count != layers || outFeatures.Count != layers)
