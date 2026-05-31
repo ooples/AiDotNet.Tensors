@@ -156,19 +156,20 @@ public class MlpForwardWholeChainBench
     }
 
     [Fact]
-    public void Phase7_PerCallOverhead_Probe()
+    public void Phase7_EndToEndEntryPath_Probe()
     {
         if (Environment.GetEnvironmentVariable("AIDOTNET_RUN_JIT_PERF") != "1") return;
 
-        // Phase 7 (option E) headroom probe: the Tensor-based engine MlpForward
-        // pays per-call overhead the array-based CompiledMlp.Run does not —
-        // AutoTensorCache.RentOrAllocate for the result tensor, two ArrayPool
-        // rents for ping-pong scratch, the BLAS thread-cap scope, plus shape
-        // checks. (Per-op tape/profiler bookkeeping already early-outs to a
-        // no-op/singleton when inactive.) Quantify that delta: if MlpForward ≈
-        // CompiledMlp the per-call overhead is already negligible and option E
-        // has no win to ship (cf. Phase 4); if there's a gap, it bounds what a
-        // leaner inference entry could save.
+        // Phase 7 (option E) headroom probe: compares the END-TO-END entry-path cost
+        // of the Tensor-based engine MlpForward versus the array-based CompiledMlp.Run.
+        // The printed delta is NOT pure per-call overhead: CompiledMlp.Run uses per-batch
+        // self-tuned kernel selection while MlpForward follows the static preferManaged
+        // gate, so the gap also folds in routing-policy differences alongside the entry
+        // costs MlpForward pays that Run does not (AutoTensorCache.RentOrAllocate for the
+        // result tensor, two ArrayPool rents for ping-pong scratch, the BLAS thread-cap
+        // scope, shape checks). Treat the number as "which inference entry is faster
+        // end-to-end on this shape", a bound on what a leaner entry+routing could save —
+        // not an isolated overhead measurement.
         var engine = new CpuEngine();
         int[] dims = { 784, 512, 128, 10 };
         int layers = dims.Length - 1;
@@ -193,7 +194,7 @@ public class MlpForwardWholeChainBench
 
             double compiled = Bench(() => plan.Run(inputArr, m, output));
             double mlpFwd = Bench(() => { var _ = engine.MlpForward(inputT, wT, bT, FusedActivationType.ReLU); });
-            _output.WriteLine($"[m={m,4}]  CompiledMlp.Run {compiled * 1000:F1}us  engine.MlpForward {mlpFwd * 1000:F1}us  overhead {(mlpFwd - compiled) * 1000:F1}us ({mlpFwd / compiled:F2}×)");
+            _output.WriteLine($"[m={m,4}]  CompiledMlp.Run {compiled * 1000:F1}us  engine.MlpForward {mlpFwd * 1000:F1}us  delta {(mlpFwd - compiled) * 1000:F1}us ({mlpFwd / compiled:F2}×, end-to-end incl. routing policy)");
         }
     }
 
