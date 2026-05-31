@@ -20,6 +20,11 @@ namespace AiDotNet.Tensors.Tests.Engines;
 /// the released package; this measures the kernel-path delta we control directly.
 /// Env-gated (AIDOTNET_RUN_JIT_PERF=1); CI-safe no-op otherwise.
 /// </summary>
+// #513: the Phase-F probe scopes the PROCESS-GLOBAL OpenBLAS thread count
+// (ScopeOpenBlasThreads). Even though it's env-gated, classify it with the other
+// global-BLAS-state tests so it can never run in parallel with the bit-match GEMM
+// tests (which would see a transient thread count → reduction-order bit mismatch).
+[Collection("BlasManaged-Stats-Serial")]
 public class MlpForwardWholeChainBench
 {
     private readonly ITestOutputHelper _output;

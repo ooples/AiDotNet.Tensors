@@ -11,6 +11,12 @@ namespace AiDotNet.Tensors.Tests.Engines;
 /// Each test restores the count to ProcessorCount so it can't leave the shared
 /// process pinned low for other (parallel) tests in the run.
 /// </summary>
+// #513: restoring in finally is NOT enough — while a test is pinned low, a
+// concurrently-running BlasManaged GEMM (PrePackSpeedupTest / ScalarKernelTests
+// bit-match) executes at the wrong PROCESS-GLOBAL OpenBLAS thread count → a
+// different reduction order → bit-match failure on CI. Join the serial collection
+// so these never run in parallel with the global-state-sensitive BlasManaged tests.
+[Collection("BlasManaged-Stats-Serial")]
 public class CpuInferenceConfigTests
 {
     [Fact]
