@@ -150,6 +150,30 @@ internal static class LinearSolvers
         int aStride = n * n;
         int xStride = bIsVector ? n : n * nrhs;
 
+        // Fast path: route FP32/FP64 to the managed BLAS Trsm kernel (#379).
+        // Triangular solve is always Left side with alpha = 1. The blocked Trsm
+        // reuses the GEMM macrokernel for trailing updates on large systems.
+        bool useBlas = (typeof(T) == typeof(double) || typeof(T) == typeof(float));
+        if (useBlas)
+        {
+            var trsmUplo = upper ? AiDotNet.Tensors.Engines.BlasManaged.Uplo.Upper
+                                 : AiDotNet.Tensors.Engines.BlasManaged.Uplo.Lower;
+            var trsmDiag = unitDiagonal ? AiDotNet.Tensors.Engines.BlasManaged.Diag.Unit
+                                        : AiDotNet.Tensors.Engines.BlasManaged.Diag.NonUnit;
+            var one = Helpers.MathHelper.GetNumericOperations<T>().One;
+            for (int bi = 0; bi < batch; bi++)
+            {
+                var aSlice = new ReadOnlySpan<T>(aData, bi * aStride, n * n);
+                var xSlice = new Span<T>(xData, bi * xStride, xStride);
+                AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.Trsm<T>(
+                    AiDotNet.Tensors.Engines.BlasManaged.Side.Left,
+                    trsmUplo, transpose, trsmDiag,
+                    n, nrhs, one,
+                    aSlice, n, xSlice, nrhs);
+            }
+            return x;
+        }
+
         for (int bi = 0; bi < batch; bi++)
         {
             TriangularSolveSingle(

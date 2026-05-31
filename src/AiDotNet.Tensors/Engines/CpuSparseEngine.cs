@@ -123,7 +123,7 @@ public sealed class CpuSparseEngine : ISparseEngine
     #region Sparse Matrix-Matrix Operations
 
     /// <inheritdoc/>
-    public Matrix<T> SpMM<T>(SparseTensor<T> sparse, Matrix<T> dense)
+    public Matrix<T> SpMM<T>(SparseTensor<T> sparse, Matrix<T> dense) where T : unmanaged
     {
         if (sparse is null) throw new ArgumentNullException(nameof(sparse));
         if (dense is null) throw new ArgumentNullException(nameof(dense));
@@ -136,32 +136,24 @@ public sealed class CpuSparseEngine : ISparseEngine
         var ops = MathHelper.GetNumericOperations<T>();
         var result = new Matrix<T>(sparse.Rows, dense.Columns);
 
-        // Convert to CSR format
+        // #379: route through the SIMD/parallel managed BLAS SpMM kernel (C = 1·A·B + 0·C).
+        // CSR row-parallel, cache-friendly (B rows read contiguously), bit-deterministic —
+        // replaces the prior column-strided naive triple loop.
         var csr = sparse.ToCsr();
-        var rowPtrs = csr.RowPointers;
-        var colIndices = csr.ColumnIndices;
-        var values = csr.Values;
-
-        // SpMM: C[i,k] = sum_j A[i,j] * B[j,k]
-        for (int i = 0; i < sparse.Rows; i++)
+        var layout = new BlasManaged.SparseLayout<T>
         {
-            int start = rowPtrs[i];
-            int end = rowPtrs[i + 1];
-
-            for (int k = 0; k < dense.Columns; k++)
-            {
-                T sum = ops.Zero;
-
-                for (int idx = start; idx < end; idx++)
-                {
-                    int j = colIndices[idx];
-                    T aVal = values[idx];
-                    sum = ops.Add(sum, ops.Multiply(aVal, dense[j, k]));
-                }
-
-                result[i, k] = sum;
-            }
-        }
+            Rows = sparse.Rows,
+            Cols = sparse.Columns,
+            Pointers = csr.RowPointers,
+            Indices = csr.ColumnIndices,
+            Values = csr.Values,
+            Format = BlasManaged.SparseLayoutFormat.Csr,
+        };
+        int n = dense.Columns;
+        BlasManaged.BlasManaged.SpMM<T>(
+            ops.One, layout,
+            dense.AsSpan(), n, n,
+            ops.Zero, result.AsWritableSpan(), n);
 
         return result;
     }
