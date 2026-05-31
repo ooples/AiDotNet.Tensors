@@ -185,6 +185,25 @@ class Program
             Console.WriteLine(profile.Format());
 
             Console.WriteLine();
+            var timing = DCGANStepProbe.RunWallClockProfile();
+            Console.WriteLine(timing.Format());
+
+            Console.WriteLine();
+            Console.WriteLine(DCGANStepProbe.RunBareGemmProbe());
+
+            Console.WriteLine();
+            Console.WriteLine(DCGANStepProbe.RunBackwardInputBreakdown());
+
+            Console.WriteLine();
+            Console.WriteLine(DCGANStepProbe.RunForwardBreakdown());
+
+            Console.WriteLine();
+            Console.WriteLine(DCGANStepProbe.RunConvGemmStrategySweep());
+
+            Console.WriteLine();
+            Console.WriteLine(DCGANStepProbe.RunMachineKernelCrossover());
+
+            Console.WriteLine();
             using (var shapes = new AiDotNet.Tensors.Helpers.ShapeInstrumenter())
             {
                 var probe = new DCGANStepProbe();
