@@ -330,6 +330,12 @@ internal static class OpRegistry
         // normally — same precedent as BatchNormInference above.
         "LstmSequenceForward", "MultiHeadAttentionForward", "MlpForward",
 
+        // Shape-changing fused output primitives (#499): forward/inference-only.
+        // Under a tape the caller decomposes into per-layer ops (linear +
+        // grouped-max / per-level sigmoids) which record normally — same
+        // precedent as the fused sequence/MLP primitives above.
+        "FusedLinearMaxout", "FusedHierarchicalSoftmax",
+
         // Vision Detection — Issue #217. The four IoU variants (BoxIou,
         // GeneralizedBoxIou, DistanceBoxIou, CompleteBoxIou) ARE
         // differentiable and have explicit backward functions registered

@@ -160,4 +160,74 @@ public class LrScheduleTests
         Assert.Throws<System.ArgumentOutOfRangeException>(() => LrSchedule.OneCycle(1.0, 100, pctStart: 0.0));
         Assert.Throws<System.ArgumentOutOfRangeException>(() => LrSchedule.OneCycle(1.0, 100, pctStart: 1.0));
     }
+
+    // Noam schedule (Vaswani 2017 §5.3): lr(t) = factor·d^(-0.5)·min(t^(-0.5), t·warmup^(-1.5)).
+    // This is the schedule that lets the default Transformer (Adam β₂=0.98 + Noam)
+    // run on the fused-compiled training path with a correct per-step ramp
+    // instead of falling back to the eager tape (AiDotNet#1470).
+
+    private static double NoamRef(int d, int warmup, double factor, int t)
+        => factor * System.Math.Pow(d, -0.5)
+                  * System.Math.Min(System.Math.Pow(t, -0.5), t * System.Math.Pow(warmup, -1.5));
+
+    [Fact]
+    public void Noam_MatchesPaperFormula_AcrossWarmupAndDecay()
+    {
+        const int d = 512, warmup = 4000;
+        var s = LrSchedule.Noam(modelDimension: d, warmupSteps: warmup);
+        foreach (int t in new[] { 1, 100, 2000, 3999, 4000, 4001, 8000, 50000 })
+            Assert.Equal(NoamRef(d, warmup, 1.0, t), s.GetLr(t), Tol);
+    }
+
+    [Fact]
+    public void Noam_RampsUpDuringWarmup_PeaksAtWarmup_ThenDecays()
+    {
+        const int d = 256, warmup = 100;
+        var s = LrSchedule.Noam(modelDimension: d, warmupSteps: warmup);
+
+        // Strictly increasing up to the warmup peak.
+        for (int t = 1; t < warmup; t++)
+            Assert.True(s.GetLr(t) < s.GetLr(t + 1),
+                $"Noam must ramp up during warmup: GetLr({t}) < GetLr({t + 1})");
+
+        // Peak at exactly t = warmup, value = factor·d^(-0.5)·warmup^(-0.5).
+        double peak = s.GetLr(warmup);
+        Assert.Equal(System.Math.Pow(d, -0.5) * System.Math.Pow(warmup, -0.5), peak, Tol);
+
+        // Strictly decreasing after the peak.
+        Assert.True(s.GetLr(warmup + 1) < peak);
+        Assert.True(s.GetLr(2 * warmup) < s.GetLr(warmup + 1));
+
+        // The frozen-at-warmup-step-1 symptom (#1470) would make GetLr(warmup)
+        // ≈ GetLr(1); assert a real ramp of many ×.
+        Assert.True(peak > s.GetLr(1) * 10,
+            "Noam peak must be far above the warmup-step-1 value (the #1470 freeze symptom).");
+    }
+
+    [Fact]
+    public void Noam_FactorScalesLinearly()
+    {
+        const int d = 128, warmup = 50;
+        var s1 = LrSchedule.Noam(d, warmup, factor: 1.0);
+        var s3 = LrSchedule.Noam(d, warmup, factor: 3.0);
+        foreach (int t in new[] { 1, 25, 50, 200 })
+            Assert.Equal(3.0 * s1.GetLr(t), s3.GetLr(t), Tol);
+    }
+
+    [Fact]
+    public void Noam_ClampsNonPositiveStepToWarmupStart()
+    {
+        var s = LrSchedule.Noam(modelDimension: 64, warmupSteps: 10);
+        // step < 1 clamps to t = 1 (no 0^(-0.5) blowup).
+        Assert.Equal(s.GetLr(1), s.GetLr(0), Tol);
+        Assert.Equal(s.GetLr(1), s.GetLr(-5), Tol);
+    }
+
+    [Fact]
+    public void Noam_RejectsBadArgs()
+    {
+        Assert.Throws<System.ArgumentOutOfRangeException>(() => LrSchedule.Noam(modelDimension: 0, warmupSteps: 10));
+        Assert.Throws<System.ArgumentOutOfRangeException>(() => LrSchedule.Noam(modelDimension: 64, warmupSteps: 0));
+        Assert.Throws<System.ArgumentOutOfRangeException>(() => LrSchedule.Noam(modelDimension: 64, warmupSteps: 10, factor: 0.0));
+    }
 }

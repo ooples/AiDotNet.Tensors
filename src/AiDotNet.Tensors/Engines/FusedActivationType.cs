@@ -110,5 +110,123 @@ public enum FusedActivationType
     /// HardTanh: f(x) = clip(x, -1, 1)
     /// Efficient approximation of Tanh with bounded outputs.
     /// </summary>
-    HardTanh = 14
+    HardTanh = 14,
+
+    /// <summary>
+    /// ReLU6: f(x) = min(max(0, x), 6)
+    /// ReLU clamped at 6; common in mobile/quantized networks (MobileNet).
+    /// </summary>
+    ReLU6 = 15,
+
+    /// <summary>
+    /// SoftSign: f(x) = x / (1 + |x|)
+    /// Smooth, bounded (-1, 1) alternative to Tanh with polynomial tails.
+    /// </summary>
+    SoftSign = 16,
+
+    /// <summary>
+    /// CELU: f(x) = max(0, x) + min(0, alpha * (exp(x / alpha) - 1))
+    /// Continuously-differentiable ELU variant (Barron, 2017). Parametric (alpha,
+    /// default 1) — supply via <see cref="FusedActivationParams.Alpha"/>.
+    /// </summary>
+    CELU = 17,
+
+    /// <summary>
+    /// ThresholdedReLU: f(x) = x if x &gt; theta, else 0
+    /// Parametric (theta, default 1) — supply via <see cref="FusedActivationParams.Theta"/>.
+    /// </summary>
+    ThresholdedReLU = 18,
+
+    /// <summary>
+    /// ScaledTanh: f(x) = alpha * tanh(beta * x)
+    /// Parametric (alpha/beta, defaults 1/1) — supply via
+    /// <see cref="FusedActivationParams.Alpha"/> / <see cref="FusedActivationParams.Beta"/>.
+    /// </summary>
+    ScaledTanh = 19,
+
+    /// <summary>
+    /// PReLU: f(x) = x if x &gt; 0, else slope_c * x — a per-channel learned slope.
+    /// Supply the slopes via <see cref="FusedActivationParams.PReluSlope"/> (length =
+    /// output features, or 1 for a shared slope; default 0.25). Applied per output
+    /// column of the [batch, features] result, so it needs channel context (not a
+    /// pointwise scalar kernel).
+    /// </summary>
+    PReLU = 20,
+
+    /// <summary>
+    /// RReLU (randomized leaky ReLU): in inference/eval it is deterministic —
+    /// f(x) = x if x &gt; 0, else alpha * x with alpha = (lower+upper)/2 (PyTorch
+    /// default (1/8+1/3)/2 ≈ 0.2292). Supply the eval slope via
+    /// <see cref="FusedActivationParams.Alpha"/>. (Fused paths are inference-only;
+    /// the training-time random slope is not fused.)
+    /// </summary>
+    RReLU = 21,
+
+    /// <summary>
+    /// Softmin: softmax(-x) over each row — f(x)_i = exp(-x_i) / Σ_j exp(-x_j).
+    /// Row-wise (not pointwise); applied across the feature dimension after the GEMM.
+    /// </summary>
+    Softmin = 22,
+
+    /// <summary>Sign: -1 if x&lt;0, 0 if x==0, +1 if x&gt;0.</summary>
+    Sign = 23,
+    /// <summary>BentIdentity: f(x) = (sqrt(x²+1) - 1)/2 + x.</summary>
+    BentIdentity = 24,
+    /// <summary>Gaussian: f(x) = exp(-x²).</summary>
+    Gaussian = 25,
+    /// <summary>LiSHT: f(x) = x · tanh(x).</summary>
+    LiSHT = 26,
+    /// <summary>ISRU: f(x) = x / sqrt(1 + alpha·x²). Parametric (alpha, default 1) via <see cref="FusedActivationParams.Alpha"/>.</summary>
+    ISRU = 27,
+    /// <summary>SQRBF (square-RBF / Gaussian RBF): f(x) = exp(-beta·x²). Parametric (beta, default 1) via <see cref="FusedActivationParams.Beta"/>.</summary>
+    SQRBF = 28,
+    /// <summary>BinarySpiking: f(x) = x &gt;= threshold ? 1 : 0. Parametric (threshold, default 1) via <see cref="FusedActivationParams.Theta"/>.</summary>
+    BinarySpiking = 29,
+    /// <summary>LogSoftmax: x_i - (max + log Σ_j exp(x_j - max)). Row-wise.</summary>
+    LogSoftmax = 30,
+    /// <summary>LogSoftmin: log(softmax(-x)) = -x_i - log Σ_j exp(-x_j). Row-wise.</summary>
+    LogSoftmin = 31,
+    /// <summary>SphericalSoftmax: softmax(x / ||x||₂) over each row. Row-wise.</summary>
+    SphericalSoftmax = 32,
+    /// <summary>TaylorSoftmax: T(x_i)/Σ_j T(x_j) with T(x)=1+x+x²/2 (2nd-order). Row-wise.</summary>
+    TaylorSoftmax = 33,
+    /// <summary>GumbelSoftmax (deterministic eval): softmax(x / temperature). Parametric (temperature via
+    /// <see cref="FusedActivationParams.Alpha"/>, default 1). The training-time Gumbel noise is not fused.</summary>
+    GumbelSoftmax = 34,
+    /// <summary>Sparsemax: Euclidean projection of each row onto the probability simplex (Martins &amp; Astudillo 2016). Row-wise.</summary>
+    Sparsemax = 35,
+    /// <summary>Squash (capsule): y = (||x||²/(1+||x||²)) · x/||x||, over each row as a vector. Row-wise.</summary>
+    Squash = 36
+
+    // NOT fusible as an in-place [M,N]→[M,N] epilogue activation (structural, not a gap):
+    //  • Maxout — reduces k channels to 1 (changes output dimensionality; it's a pooling op, not elementwise).
+    //  • HierarchicalSoftmax — needs a class tree + the target label (a loss-coupled structure, not a plain activation).
+}
+
+/// <summary>
+/// Optional scalar parameters for parametric fused activations. Omit (null) to use
+/// each activation's canonical default. Only the field(s) relevant to the chosen
+/// <see cref="FusedActivationType"/> are read.
+/// </summary>
+/// <remarks>
+/// A class with nullable init properties (not a record struct) so a missing field
+/// can be distinguished from an explicit value and resolved to the per-activation
+/// default. Lets <c>FusedLinear</c> / <c>MlpForward</c> / the activation epilogue
+/// fuse LeakyReLU (any slope), ELU / CELU (any alpha), ThresholdedReLU (theta),
+/// and ScaledTanh (alpha, beta) — not only the hardcoded default value.
+/// </remarks>
+public sealed class FusedActivationParams
+{
+    /// <summary>LeakyReLU slope, ELU/CELU/ScaledTanh alpha. Default: LeakyReLU 0.01, others 1.</summary>
+    public float? Alpha { get; init; }
+    /// <summary>ScaledTanh inner scale beta. Default 1.</summary>
+    public float? Beta { get; init; }
+    /// <summary>ThresholdedReLU threshold. Default 1.</summary>
+    public float? Theta { get; init; }
+    /// <summary>
+    /// PReLU per-channel negative slopes — length = output features (one per column
+    /// of the [batch, features] result), or length 1 for a single shared slope.
+    /// Null ⇒ 0.25 shared (PyTorch PReLU default init).
+    /// </summary>
+    public float[]? PReluSlope { get; init; }
 }

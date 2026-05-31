@@ -52,4 +52,44 @@ public class LstmSequencePerfBench
 
         Assert.True(median > 0);
     }
+
+    [Fact]
+    public void LstmSequenceForward_AllocationProfile()
+    {
+        const int batch = 128, seq = 32, inF = 32, hidden = 64;
+        const int warmup = 50, calls = 500;
+
+        var engine = new CpuEngine();
+        var input = Tensor<float>.CreateRandom(batch, seq, inF);
+        var wIh = Tensor<float>.CreateRandom(4 * hidden, inF);
+        var wHh = Tensor<float>.CreateRandom(4 * hidden, hidden);
+
+        for (int i = 0; i < warmup; i++)
+            engine.LstmSequenceForward(input, null, null, wIh, wHh, null, null);
+
+        long before = AllocatedBytes();
+        int g0 = GC.CollectionCount(0), g1 = GC.CollectionCount(1), g2 = GC.CollectionCount(2);
+        for (int i = 0; i < calls; i++)
+            engine.LstmSequenceForward(input, null, null, wIh, wHh, null, null);
+        long after = AllocatedBytes();
+
+        double perCall = (after - before) / (double)calls;
+        _out.WriteLine($"LSTM [128,32,32]->64 allocation over {calls} calls:");
+        _out.WriteLine($"  bytes/call = {perCall:F0}");
+        _out.WriteLine($"  gen0 collections = {GC.CollectionCount(0) - g0}, gen1 = {GC.CollectionCount(1) - g1}, gen2 = {GC.CollectionCount(2) - g2}");
+
+        Assert.True(perCall >= 0);
+    }
+
+    // GC.GetAllocatedBytesForCurrentThread() is .NET Core 3.0+ only; on net471 the
+    // build broke (CS0117). Fall back to a coarse whole-heap proxy there so this
+    // diagnostic bench compiles and runs on both target frameworks.
+    private static long AllocatedBytes()
+    {
+#if NET5_0_OR_GREATER
+        return GC.GetAllocatedBytesForCurrentThread();
+#else
+        return GC.GetTotalMemory(forceFullCollection: false);
+#endif
+    }
 }

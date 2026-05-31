@@ -3211,8 +3211,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// Uses cached GPU buffers for registered persistent tensors (weights/bias) to avoid
     /// redundant CPU→GPU transfers on every forward pass.
     /// </summary>
-    public override Tensor<T> FusedLinear<T>(Tensor<T> input, Tensor<T> weights, Tensor<T>? bias, FusedActivationType activation)
+    public override Tensor<T> FusedLinear<T>(Tensor<T> input, Tensor<T> weights, Tensor<T>? bias, FusedActivationType activation, FusedActivationParams? activationParams = null)
     {
+        // Parametric activation parameters (LeakyReLU slope, ELU/CELU alpha,
+        // ThresholdedReLU theta, ScaledTanh alpha/beta) are not yet plumbed into
+        // the GPU fused kernels — defer to the base CPU params-aware path so a
+        // custom parameter produces a correct result rather than the kernel's
+        // hardcoded default.
+        if (activationParams is not null)
+            return base.FusedLinear(input, weights, bias, activation, activationParams);
+
         // When a tape is active, defer to the base (CpuEngine) tape-aware
         // path which decomposes into TensorMatMul + TensorBroadcastAdd and
         // collapses them into a single recorded "FusedLinear" entry. The

@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using AiDotNet.Tensors.Engines.Compilation;
+using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Engines;
@@ -66,7 +67,9 @@ public partial class CpuEngine
         IReadOnlyList<Tensor<T>> weights,
         IReadOnlyList<Tensor<T>?> biases,
         FusedActivationType hiddenActivation,
-        FusedActivationType outputActivation = FusedActivationType.None)
+        FusedActivationType outputActivation = FusedActivationType.None,
+        FusedActivationParams? hiddenActivationParams = null,
+        FusedActivationParams? outputActivationParams = null)
     {
         if (input is null) throw new ArgumentNullException(nameof(input));
         if (weights is null) throw new ArgumentNullException(nameof(weights));
@@ -107,15 +110,105 @@ public partial class CpuEngine
         int blasThreads = Math.Max(1, Math.Min((int)(rows / 16), Environment.ProcessorCount));
         using var _blasScope = Helpers.BlasProvider.ScopeOpenBlasThreads(blasThreads);
 
-        // Chain the fused linear layers. FusedLinear validates each weight /
-        // bias shape against the running activation, so a layer-to-layer
-        // feature mismatch surfaces as a clear per-layer ArgumentException.
         int last = weights.Count - 1;
+
+        // Phase 3 (compiled-inference): whole-MLP ping-pong fast path for float.
+        // Chains every layer through two reused scratch buffers — no per-layer
+        // Tensor allocation, no per-layer FusedLinear preamble, intermediates stay
+        // cache-resident — with the LAST layer writing straight into the result
+        // (no final copy). Each layer's GEMM follows the Phase-1 routing gate
+        // (managed cached-B prepack vs native BLAS); bias+activation is applied in
+        // place. Output is numerically identical to the per-layer FusedLinear chain.
+        if (typeof(T) == typeof(float) && input.Rank == 2 && input.IsContiguous && !input.IsSparse)
+        {
+            int M = input._shape[0];
+            int k0 = input._shape[1];
+            bool eligible = true;
+            int runK = k0, finalN = 0, maxIntermediate = 0;
+            for (int i = 0; i < weights.Count; i++)
+            {
+                var w = weights[i];
+                var bi = biases[i];
+                if (w.Rank != 2 || !w.IsContiguous || w.IsSparse || w._shape[0] != runK
+                    || (bi is not null && (!bi.IsContiguous || bi.Length < w._shape[1])))
+                {
+                    eligible = false;
+                    break;
+                }
+                runK = w._shape[1];
+                finalN = runK;
+                if (i != last && (long)M * runK > maxIntermediate) maxIntermediate = M * runK;
+            }
+
+            if (eligible)
+            {
+                var result = AutoTensorCache.RentOrAllocate<T>(new[] { M, finalN });
+                var outArr = (float[])(object)result.GetDataArray();
+                var pool = System.Buffers.ArrayPool<float>.Shared;
+                float[] bufA = maxIntermediate > 0 ? pool.Rent(maxIntermediate) : System.Array.Empty<float>();
+                float[] bufB = maxIntermediate > 0 ? pool.Rent(maxIntermediate) : System.Array.Empty<float>();
+                try
+                {
+                    float[] src = (float[])(object)input.GetDataArray();
+                    int curK = k0;
+                    int pingToggle = 0;
+                    for (int i = 0; i < weights.Count; i++)
+                    {
+                        var w = weights[i];
+                        int n = w._shape[1];
+                        var wArr = (float[])(object)w.GetDataArray();
+                        // Last layer writes directly into the result buffer (no copy).
+                        float[] dst = i == last ? outArr : (pingToggle == 0 ? bufA : bufB);
+
+                        if (PreferManagedInferenceGemm(M, curK, n))
+                        {
+                            Simd.SimdGemm.SgemmWithCachedB(
+                                src.AsSpan(0, M * curK), wArr, dst.AsSpan(0, M * n), M, curK, n);
+                        }
+                        else
+                        {
+                            unsafe
+                            {
+                                fixed (float* ps = src, pw = wArr, pd = dst)
+                                {
+                                    if (BlasProvider.HasRawSgemm)
+                                        BlasProvider.SgemmRaw(M, n, curK, ps, curK, pw, n, pd, n);
+                                    else
+                                        Simd.SimdGemm.SgemmWithCachedB(
+                                            src.AsSpan(0, M * curK), wArr, dst.AsSpan(0, M * n), M, curK, n);
+                                }
+                            }
+                        }
+
+                        var act = i == last ? outputActivation : hiddenActivation;
+                        var ap = i == last ? outputActivationParams : hiddenActivationParams;
+                        var bi = biases[i];
+                        var bArr = bi is null ? null : (float[])(object)bi.GetDataArray();
+                        if (bArr is not null || act != FusedActivationType.None)
+                            CpuFusedOperations.ApplyBiasActivationInPlace(dst, bArr, M, n, act, ap);
+
+                        src = dst;
+                        curK = n;
+                        if (i != last) pingToggle ^= 1;
+                    }
+                    return result;
+                }
+                finally
+                {
+                    if (maxIntermediate > 0) { pool.Return(bufA); pool.Return(bufB); }
+                }
+            }
+        }
+
+        // Generic fallback: chain the fused linear layers. FusedLinear validates
+        // each weight/bias shape against the running activation, so a layer-to-layer
+        // feature mismatch surfaces as a clear per-layer ArgumentException.
         var x = input;
         for (int i = 0; i < weights.Count; i++)
         {
             var activation = i == last ? outputActivation : hiddenActivation;
-            x = FusedLinear(x, weights[i], biases[i], activation);
+            var actParams = i == last ? outputActivationParams : hiddenActivationParams;
+            x = FusedLinear(x, weights[i], biases[i], activation, actParams);
         }
 
         return x;

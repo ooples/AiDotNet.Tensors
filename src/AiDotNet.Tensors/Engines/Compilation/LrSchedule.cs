@@ -77,6 +77,24 @@ public abstract class LrSchedule
     public static LrSchedule LinearWarmupCosine(
         double lrMax, int warmupSteps, int totalSteps, double lrMin = 0.0)
         => new LinearWarmupCosineLr(lrMax, warmupSteps, totalSteps, lrMin);
+
+    /// <summary>
+    /// Noam schedule from "Attention Is All You Need" (Vaswani et al. 2017,
+    /// §5.3): linear warmup then inverse-square-root decay —
+    /// <c>lr(t) = factor · d_model^(-0.5) · min(t^(-0.5), t · warmup^(-1.5))</c>,
+    /// peaking at <c>t = warmupSteps</c>. <c>t</c> is the 1-indexed optimizer
+    /// step (the same 1-based counter <see cref="GetLr"/> receives), so the
+    /// fused-path LR sequence is bit-identical to the eager
+    /// <c>AiDotNet.LearningRateSchedulers.NoamSchedule</c>: both yield
+    /// <c>lr(t=N)</c> on batch N. This lets the default Transformer recipe
+    /// (Adam β₂=0.98 + Noam) run on the fused-compiled training path with a
+    /// correct per-step ramp instead of falling back to the eager tape.
+    /// </summary>
+    /// <param name="modelDimension">Transformer model dimension (d_model); must be &gt; 0.</param>
+    /// <param name="warmupSteps">Linear-warmup step count; must be &gt; 0.</param>
+    /// <param name="factor">Multiplicative scale on the schedule (default 1.0, paper-faithful); must be &gt; 0.</param>
+    public static LrSchedule Noam(int modelDimension, int warmupSteps, double factor = 1.0)
+        => new NoamLr(modelDimension, warmupSteps, factor);
 }
 
 internal sealed class ConstantLr : LrSchedule
@@ -85,6 +103,44 @@ internal sealed class ConstantLr : LrSchedule
     public ConstantLr(double lr) { _lr = lr; }
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public override double GetLr(int step) => _lr;
+}
+
+internal sealed class NoamLr : LrSchedule
+{
+    // Pre-computed step-invariant coefficients so GetLr is one Math.Sqrt + a
+    // couple of multiplies per step (no Math.Pow), matching the eager
+    // NoamSchedule's hot-path optimization:
+    //   _scaledModelInvSqrt = factor · d_model^(-0.5)
+    //   _scaledWarmupTerm   = _scaledModelInvSqrt · warmup^(-1.5)   (coeff on the linear branch)
+    private readonly double _scaledModelInvSqrt;
+    private readonly double _scaledWarmupTerm;
+
+    public NoamLr(int modelDimension, int warmupSteps, double factor)
+    {
+        if (modelDimension <= 0)
+            throw new ArgumentOutOfRangeException(nameof(modelDimension), "modelDimension must be positive.");
+        if (warmupSteps <= 0)
+            throw new ArgumentOutOfRangeException(nameof(warmupSteps), "warmupSteps must be positive.");
+        if (factor <= 0)
+            throw new ArgumentOutOfRangeException(nameof(factor), "factor must be positive.");
+
+        _scaledModelInvSqrt = factor / System.Math.Sqrt(modelDimension);
+        _scaledWarmupTerm = _scaledModelInvSqrt / ((double)warmupSteps * System.Math.Sqrt(warmupSteps));
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public override double GetLr(int step)
+    {
+        // step is 1-indexed (CompiledTrainingPlan increments _optimizerStep to 1
+        // before the first GetLr call), and the paper's t is also 1-based, so
+        // t = step directly — no +1 remap (unlike the eager NoamSchedule, which
+        // remaps from a 0-based framework counter). The clamp guards a non-
+        // positive t that would make t^(-0.5) blow up.
+        int t = step < 1 ? 1 : step;
+        double invSqrtBranch = _scaledModelInvSqrt / System.Math.Sqrt(t);
+        double warmupBranch = _scaledWarmupTerm * t;
+        return System.Math.Min(invSqrtBranch, warmupBranch);
+    }
 }
 
 internal sealed class CosineLr : LrSchedule

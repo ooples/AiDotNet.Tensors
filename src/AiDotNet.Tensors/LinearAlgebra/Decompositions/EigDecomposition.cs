@@ -115,34 +115,127 @@ internal static class EigDecomposition
             }
         }
 
-        // Write Q columns as real eigenvectors (imaginary part zero for real eigenvalues).
-        // For complex eigenvalue pairs, the two adjacent Q columns form the real and
-        // imaginary parts of a complex eigenvector pair.
-        idx = 0;
-        while (idx < n)
-        {
-            bool isComplex = idx < n - 1 && ToDouble(w[offW + idx * 2 + 1]) != 0.0;
-            if (isComplex)
+        // Right eigenvectors via inverse iteration on the ORIGINAL matrix A.
+        // The Schur vectors q are NOT eigenvectors for a non-symmetric matrix
+        // (only the Schur basis), so copying them was incorrect. Inverse
+        // iteration solves (A − λI)x = b for the (now accurate) eigenvalue λ;
+        // because the shift sits ε away from λ, one or two solves amplify the
+        // matching eigenvector to dominate. Complex λ is handled with the
+        // equivalent 2n×2n real system, so a single routine covers real and
+        // complex-conjugate eigenpairs.
+        var a0 = new double[n * n];
+        double scale = 0.0;
+        for (int i = 0; i < n; i++)
+            for (int j = 0; j < n; j++)
             {
-                for (int r = 0; r < n; r++)
-                {
-                    v[offV + (r * n + idx) * 2] = FromDouble<T>(q[r * n + idx]);
-                    v[offV + (r * n + idx) * 2 + 1] = FromDouble<T>(q[r * n + idx + 1]);
-                    v[offV + (r * n + idx + 1) * 2] = FromDouble<T>(q[r * n + idx]);
-                    v[offV + (r * n + idx + 1) * 2 + 1] = FromDouble<T>(-q[r * n + idx + 1]);
-                }
-                idx += 2;
+                double aij = ToDouble(src[offSrc + i * n + j]);
+                a0[i * n + j] = aij;
+                double m = Math.Abs(aij);
+                if (m > scale) scale = m;
             }
-            else
+        if (scale == 0.0) scale = 1.0;
+
+        for (int k = 0; k < n; k++)
+        {
+            double re = ToDouble(w[offW + k * 2]);
+            double im = ToDouble(w[offW + k * 2 + 1]);
+            EigenvectorByInverseIteration(a0, n, re, im, scale, out var xr, out var xi);
+            for (int r = 0; r < n; r++)
             {
-                for (int r = 0; r < n; r++)
-                {
-                    v[offV + (r * n + idx) * 2] = FromDouble<T>(q[r * n + idx]);
-                    v[offV + (r * n + idx) * 2 + 1] = FromDouble<T>(0.0);
-                }
-                idx += 1;
+                v[offV + (r * n + k) * 2] = FromDouble<T>(xr[r]);
+                v[offV + (r * n + k) * 2 + 1] = FromDouble<T>(xi[r]);
             }
         }
+    }
+
+    /// <summary>
+    /// Right eigenvector for eigenvalue (<paramref name="re"/> + i·<paramref name="im"/>)
+    /// of the real matrix <paramref name="a"/> via inverse iteration. The shift is
+    /// perturbed ε·scale off the eigenvalue to keep (A − shift·I) non-singular while
+    /// still converging to the matching eigenvector. The complex solve is cast to a
+    /// 2n×2n real system: (A−sI)xr + im·xi = br, −im·xr + (A−sI)xi = bi.
+    /// </summary>
+    private static void EigenvectorByInverseIteration(
+        double[] a, int n, double re, double im, double scale, out double[] xr, out double[] xi)
+    {
+        double shift = re + (re >= 0 ? 1.0 : -1.0) * 1e-7 * scale;
+        int m = 2 * n;
+        var mat = new double[m * m];
+        for (int i = 0; i < n; i++)
+            for (int j = 0; j < n; j++)
+            {
+                double val = a[i * n + j] - (i == j ? shift : 0.0);
+                mat[i * m + j] = val;               // top-left  (A − sI)
+                mat[(i + n) * m + (j + n)] = val;   // bottom-right (A − sI)
+            }
+        for (int i = 0; i < n; i++)
+        {
+            mat[i * m + (i + n)] = im;              // top-right  (+im·I)
+            mat[(i + n) * m + i] = -im;             // bottom-left (−im·I)
+        }
+
+        // Start vector: ones in the real block. Two inverse-iteration steps.
+        var x = new double[m];
+        for (int i = 0; i < n; i++) x[i] = 1.0;
+        for (int iter = 0; iter < 2; iter++)
+        {
+            var y = SolveDense(mat, x, m);
+            double nrm = 0.0;
+            for (int i = 0; i < m; i++) nrm += y[i] * y[i];
+            nrm = Math.Sqrt(nrm);
+            if (nrm > 0.0) for (int i = 0; i < m; i++) y[i] /= nrm;
+            x = y;
+        }
+
+        xr = new double[n];
+        xi = new double[n];
+        double cnorm = 0.0;
+        for (int i = 0; i < n; i++) { xr[i] = x[i]; xi[i] = x[i + n]; cnorm += xr[i] * xr[i] + xi[i] * xi[i]; }
+        cnorm = Math.Sqrt(cnorm);
+        if (cnorm > 0.0) for (int i = 0; i < n; i++) { xr[i] /= cnorm; xi[i] /= cnorm; }
+    }
+
+    /// <summary>Solve M·y = b (M is m×m, row-major) via Gaussian elimination with
+    /// partial pivoting. Operates on copies so the caller's matrix is preserved.</summary>
+    private static double[] SolveDense(double[] mIn, double[] b, int m)
+    {
+        var a = (double[])mIn.Clone();
+        var y = (double[])b.Clone();
+        for (int col = 0; col < m; col++)
+        {
+            // Partial pivot.
+            int piv = col;
+            double best = Math.Abs(a[col * m + col]);
+            for (int r = col + 1; r < m; r++)
+            {
+                double val = Math.Abs(a[r * m + col]);
+                if (val > best) { best = val; piv = r; }
+            }
+            if (piv != col)
+            {
+                for (int j = 0; j < m; j++) { (a[col * m + j], a[piv * m + j]) = (a[piv * m + j], a[col * m + j]); }
+                (y[col], y[piv]) = (y[piv], y[col]);
+            }
+            double diag = a[col * m + col];
+            if (diag == 0.0) diag = 1e-300; // guard; shift keeps M non-singular in practice
+            for (int r = col + 1; r < m; r++)
+            {
+                double f = a[r * m + col] / diag;
+                if (f == 0.0) continue;
+                for (int j = col; j < m; j++) a[r * m + j] -= f * a[col * m + j];
+                y[r] -= f * y[col];
+            }
+        }
+        // Back-substitution.
+        var x = new double[m];
+        for (int i = m - 1; i >= 0; i--)
+        {
+            double s = y[i];
+            for (int j = i + 1; j < m; j++) s -= a[i * m + j] * x[j];
+            double diag = a[i * m + i];
+            x[i] = diag == 0.0 ? 0.0 : s / diag;
+        }
+        return x;
     }
 
     private static void HessenbergReduce(double[] h, double[] q, int n)

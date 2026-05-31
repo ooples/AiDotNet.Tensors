@@ -733,4 +733,154 @@ public class LinalgTests
                     Assert.Equal(expected, qd[b * 9 + i * 3 + j], 10);
                 }
     }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // #376 — managed LAPACK-replacement verification: the general (non-symmetric)
+    // Eig, LDL factor/solve, and rectangular SVD are managed replacements for
+    // native LAPACK (dgeev / dsytrf / dgesvd) but had no correctness coverage.
+    // These reconstruction tests prove the managed routines are correct so the
+    // native-LAPACK-free build is verifiably sound (no eager fallback exists).
+    // Eig output layout: eigenvalues [n,2] (Re,Im); eigenvectors [n,n,2] columns.
+    // ═══════════════════════════════════════════════════════════════════════
+
+    [Fact]
+    public void Eig_DiagonalMatrix_ReturnsRealDiagonalEigenvalues()
+    {
+        var A = FromRows(new double[,] { { 2, 0, 0 }, { 0, -3, 0 }, { 0, 0, 5 } });
+        var (valsT, _) = Linalg.Eig(A);
+        var v = valsT.GetDataArray(); // [3,2]
+        var re = new List<double>();
+        for (int i = 0; i < 3; i++)
+        {
+            re.Add(v[i * 2]);
+            Assert.True(Math.Abs(v[i * 2 + 1]) < 1e-9, $"diagonal real matrix → real eigenvalue, got Im={v[i * 2 + 1]}");
+        }
+        re.Sort();
+        Assert.True(Math.Abs(re[0] - (-3)) < 1e-6 && Math.Abs(re[1] - 2) < 1e-6 && Math.Abs(re[2] - 5) < 1e-6,
+            $"eigenvalues should be {{-3,2,5}}, got {{{string.Join(",", re)}}}");
+    }
+
+    [Fact]
+    public void Eig_NonSymmetricMatrix_EigenpairsSatisfyAvEqualsLambdaV()
+    {
+        // Lower-triangular, distinct eigenvalues 2,3,4 → diagonalizable, real spectrum.
+        var A = FromRows(new double[,] { { 2, 0, 0 }, { 1, 3, 0 }, { 0, 1, 4 } });
+        var aD = A.GetDataArray();
+        const int n = 3;
+        var (valsT, vecsT) = Linalg.Eig(A);
+        var val = valsT.GetDataArray();   // [n,2]
+        var vec = vecsT.GetDataArray();   // [n,n,2] — eigenvector j is column j across rows
+        for (int j = 0; j < n; j++)
+        {
+            double lRe = val[j * 2], lIm = val[j * 2 + 1];
+            for (int r = 0; r < n; r++)
+            {
+                // (A·v)_re = A·vRe, (A·v)_im = A·vIm  (A is real)
+                double avRe = 0, avIm = 0;
+                for (int c = 0; c < n; c++)
+                {
+                    avRe += aD[r * n + c] * vec[(c * n + j) * 2];
+                    avIm += aD[r * n + c] * vec[(c * n + j) * 2 + 1];
+                }
+                // (λ·v)_re = λRe·vRe − λIm·vIm ; (λ·v)_im = λRe·vIm + λIm·vRe
+                double vrRe = vec[(r * n + j) * 2], vrIm = vec[(r * n + j) * 2 + 1];
+                double lvRe = lRe * vrRe - lIm * vrIm;
+                double lvIm = lRe * vrIm + lIm * vrRe;
+                Assert.True(Math.Abs(avRe - lvRe) < 1e-6, $"eig{j}: (A·v)re[{r}]={avRe} != (λ·v)re={lvRe}");
+                Assert.True(Math.Abs(avIm - lvIm) < 1e-6, $"eig{j}: (A·v)im[{r}]={avIm} != (λ·v)im={lvIm}");
+            }
+        }
+    }
+
+    [Fact]
+    public void Eig_RotationMatrix_ReturnsConjugateImaginaryPair()
+    {
+        // [[0,-1],[1,0]] → eigenvalues ±i.
+        var A = FromRows(new double[,] { { 0, -1 }, { 1, 0 } });
+        var (valsT, _) = Linalg.Eig(A);
+        var v = valsT.GetDataArray(); // [2,2]
+        for (int i = 0; i < 2; i++)
+            Assert.True(Math.Abs(v[i * 2]) < 1e-6, $"Re(λ{i})={v[i * 2]} should be ~0");
+        double im0 = v[1], im1 = v[3];
+        Assert.True(Math.Abs(Math.Abs(im0) - 1) < 1e-6 && Math.Abs(Math.Abs(im1) - 1) < 1e-6,
+            $"|Im| should be 1, got {im0}, {im1}");
+        Assert.True(Math.Abs(im0 + im1) < 1e-6, "eigenvalues should form a conjugate pair (Im parts sum to 0)");
+    }
+
+    [Fact]
+    public void LdlFactorSolve_SymmetricIndefinite_SolvesSystem()
+    {
+        // [[1,2],[2,1]] is symmetric INDEFINITE (eigenvalues 3, −1) — Cholesky would
+        // fail; LDL with pivoting is the managed dsytrf/dsytrs replacement.
+        var A = FromRows(new double[,] { { 1, 2 }, { 2, 1 } });
+        var b = new Tensor<double>(new[] { 2 });
+        b.GetDataArray()[0] = 5; b.GetDataArray()[1] = 4;
+        var (ld, piv) = Linalg.LdlFactor(A);
+        var x = Linalg.LdlSolve(ld, piv, b);
+        var aD = A.GetDataArray(); var xD = x.GetDataArray();
+        for (int i = 0; i < 2; i++)
+        {
+            double ax = aD[i * 2] * xD[0] + aD[i * 2 + 1] * xD[1];
+            Assert.True(Math.Abs(ax - b.GetDataArray()[i]) < 1e-8, $"A·x[{i}]={ax} != b[{i}]={b.GetDataArray()[i]}");
+        }
+    }
+
+    [Fact]
+    public void LdlFactorSolve_3x3SymmetricIndefinite_SolvesSystem()
+    {
+        var A = FromRows(new double[,] { { 0, 1, 2 }, { 1, 3, 1 }, { 2, 1, 0 } }); // symmetric, indefinite
+        var b = new Tensor<double>(new[] { 3 });
+        b.GetDataArray()[0] = 3; b.GetDataArray()[1] = 5; b.GetDataArray()[2] = 2;
+        var (ld, piv) = Linalg.LdlFactor(A);
+        var x = Linalg.LdlSolve(ld, piv, b);
+        var aD = A.GetDataArray(); var xD = x.GetDataArray();
+        for (int i = 0; i < 3; i++)
+        {
+            double ax = 0; for (int j = 0; j < 3; j++) ax += aD[i * 3 + j] * xD[j];
+            Assert.True(Math.Abs(ax - b.GetDataArray()[i]) < 1e-8, $"A·x[{i}]={ax} != b[{i}]={b.GetDataArray()[i]}");
+        }
+    }
+
+    [Fact]
+    public void Svd_TallMatrix_ReconstructsInputWithOrthonormalU()
+    {
+        var rows = new double[,] { { 1, 2 }, { 3, 4 }, { 5, 6 }, { 7, 8 } }; // 4×2
+        var A = FromRows(rows);
+        var (U, S, Vh) = Linalg.Svd(A, fullMatrices: false);
+        var Umat = ToArray2D(U); var VhMat = ToArray2D(Vh);
+        int k = S.Shape[0];
+        var sD = S.GetDataArray();
+        for (int i = 0; i < k; i++) Assert.True(sD[i] >= -1e-12, $"singular value S[{i}]={sD[i]} is negative");
+        for (int i = 1; i < k; i++) Assert.True(sD[i - 1] >= sD[i] - 1e-9, "singular values must be descending");
+
+        var diagS = new double[k, k];
+        for (int i = 0; i < k; i++) diagS[i, i] = sD[i];
+        var recon = MatMul(MatMul(Umat, diagS), VhMat);
+        AssertClose(FromRows(recon), rows, tol: 1e-4);
+
+        // Uᵀ·U = I_k (orthonormal columns).
+        var utu = MatMul(Transpose(Umat), Umat);
+        var ik = new double[k, k]; for (int i = 0; i < k; i++) ik[i, i] = 1;
+        AssertClose(FromRows(utu), ik, tol: 1e-4);
+    }
+
+    [Fact]
+    public void Svd_WideMatrix_ReconstructsInput()
+    {
+        var rows = new double[,] { { 1, 2, 3, 4 }, { 5, 6, 7, 8 } }; // 2×4
+        var A = FromRows(rows);
+        var (U, S, Vh) = Linalg.Svd(A, fullMatrices: false);
+        var Umat = ToArray2D(U); var VhMat = ToArray2D(Vh);
+        int k = S.Shape[0];
+        var sD = S.GetDataArray();
+        var diagS = new double[k, k];
+        for (int i = 0; i < k; i++) diagS[i, i] = sD[i];
+        var recon = MatMul(MatMul(Umat, diagS), VhMat);
+        AssertClose(FromRows(recon), rows, tol: 1e-4);
+
+        // Vh rows orthonormal: Vh·Vhᵀ = I_k.
+        var vvt = MatMul(VhMat, Transpose(VhMat));
+        var ik = new double[k, k]; for (int i = 0; i < k; i++) ik[i, i] = 1;
+        AssertClose(FromRows(vvt), ik, tol: 1e-4);
+    }
 }

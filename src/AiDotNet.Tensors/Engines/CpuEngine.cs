@@ -33942,7 +33942,16 @@ public partial class CpuEngine : ITensorLevelEngine
     #if !NETFRAMEWORK
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
 #endif
-    public virtual Tensor<T> FusedLinear<T>(Tensor<T> input, Tensor<T> weights, Tensor<T>? bias, FusedActivationType activation)
+    // Phase 1 (compiled-inference) routing gate: prefer the managed cached-B GEMM
+    // (persistent prepack, no pinned→managed copy) for small/medium inference
+    // shapes, where it beats native BLAS + copy by 1.3-2.8x. Fall back to native
+    // BLAS only for large K·N·M, where native raw throughput wins. Thresholds from
+    // InferenceGemmStrategyAbTests on the AIsEval MLP shapes; shape-based so it
+    // generalises beyond MLP (transformer projections, etc.).
+    private static bool PreferManagedInferenceGemm(int m, int k, int n)
+        => !((long)k * n > 200_000 && m >= 16);
+
+    public virtual Tensor<T> FusedLinear<T>(Tensor<T> input, Tensor<T> weights, Tensor<T>? bias, FusedActivationType activation, FusedActivationParams? activationParams = null)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (weights == null) throw new ArgumentNullException(nameof(weights));
@@ -33964,15 +33973,18 @@ public partial class CpuEngine : ITensorLevelEngine
 
                 var inputs = bias != null ? new[] { input, weights, bias } : new[] { input, weights };
                 var capturedActivation = activation;
+                var capturedParams = activationParams;
                 return scope.RecordVariadic(nodeType, "FusedLinear", inputs, outShape,
                     (eng, output) =>
                     {
                         var eager = eng.FusedLinear(inputs[0], inputs[1],
-                            inputs.Length > 2 ? inputs[2] : null, capturedActivation);
+                            inputs.Length > 2 ? inputs[2] : null, capturedActivation, capturedParams);
                         eager.AsSpan().CopyTo(output.AsWritableSpan());
                     },
                     BackwardFunctions<T>.FusedLinearWithActivationBackward,
-                    activation != FusedActivationType.None ? new object[] { activation } : null);
+                    // savedState layout [0]=activation, [1]=preActivation (null here ⇒ backward
+                    // recomputes), [2]=FusedActivationParams (#506 review: parametric backward).
+                    activation != FusedActivationType.None ? new object[] { activation, null!, activationParams! } : null);
             }
         }
 
@@ -33996,15 +34008,16 @@ public partial class CpuEngine : ITensorLevelEngine
             if (activation != FusedActivationType.None)
             {
                 savedPreActivation = fusedResult.Clone();
-                ApplyFusedActivationInPlace(fusedResult, activation);
+                ApplyFusedActivationInPlace(fusedResult, activation, activationParams);
             }
             RemoveLastNTapeEntries<T>(bias != null ? 2 : 1);
 
             // Record single fused entry with activation info AND the captured
-            // pre-activation for backward.
+            // pre-activation for backward. #506 review: also carry FusedActivationParams
+            // ([2]) so parametric backward matches the parametric forward applied above.
             var fusedInputs = bias != null ? new[] { input, weights, bias } : new[] { input, weights };
             object[]? savedState = activation != FusedActivationType.None
-                ? new object[] { activation, savedPreActivation! } // [0]=activation, [1]=pre-activation
+                ? new object[] { activation, savedPreActivation!, activationParams! } // [0]=activation, [1]=pre-activation, [2]=params
                 : null;
             Autodiff.DifferentiableOps.RecordIfActive("FusedLinear", fusedResult, fusedInputs,
                 Autodiff.BackwardFunctions<T>.FusedLinearWithActivationBackward, savedState);
@@ -34036,10 +34049,26 @@ public partial class CpuEngine : ITensorLevelEngine
                 var outArr = (float[])(object)result.GetDataArray();
 
                 bool blasDone = false;
+
+                // Phase 1 (compiled-inference): for small/medium inference GEMMs the
+                // managed cached-B path wins 1.3-2.8x over native BLAS + pinned copy —
+                // it reuses the persistent prepacked-B cache (keyed by weight identity,
+                // no per-call PackB) AND writes outArr directly (no pinned→managed copy).
+                // The subsequent bias+activation pass is the same either way. Native
+                // BLAS is kept ONLY for large K·N·M, where its raw throughput beats our
+                // managed kernel (verified: InferenceGemmStrategyAbTests). Gate is
+                // shape-based so it generalises beyond MLP. Skipped under a tape (the
+                // tape path returns earlier) — this is the pure-inference fast path.
+                if (PreferManagedInferenceGemm(M, K, N))
+                {
+                    Simd.SimdGemm.SgemmWithCachedB(
+                        inArr.AsSpan(0, M * K), wArr, outArr.AsSpan(0, M * N), M, K, N);
+                    blasDone = true;
+                }
 #if NET5_0_OR_GREATER
                 // Tier -1: NativeInferencePool — pre-pinned weights, zero GC per call
                 var inferPool = NativeInferencePool.Current;
-                if (inferPool is not null && (BlasProvider.HasRawSgemm || BlasProvider.HasNativeSgemm))
+                if (!blasDone && inferPool is not null && (BlasProvider.HasRawSgemm || BlasProvider.HasNativeSgemm))
                 {
                     unsafe
                     {
@@ -34102,7 +34131,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 if (bias != null || activation != FusedActivationType.None)
                 {
                     var bArr = bias != null ? (float[])(object)bias.GetDataArray() : null;
-                    CpuFusedOperations.ApplyBiasActivationInPlace(outArr, bArr, M, N, activation);
+                    CpuFusedOperations.ApplyBiasActivationInPlace(outArr, bArr, M, N, activation, activationParams);
                 }
 
                 return result;
@@ -34153,7 +34182,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 if (bias != null || activation != FusedActivationType.None)
                 {
                     var bArr = bias != null ? (double[])(object)bias.GetDataArray() : null;
-                    CpuFusedOperations.ApplyBiasActivationInPlaceDouble(outArr, bArr, M, N, activation);
+                    CpuFusedOperations.ApplyBiasActivationInPlaceDouble(outArr, bArr, M, N, activation, activationParams);
                 }
 
                 return result;
@@ -34196,6 +34225,134 @@ public partial class CpuEngine : ITensorLevelEngine
         ApplyFusedActivationInPlace(fallbackResult, activation);
 
         return fallbackResult;
+    }
+
+    /// <summary>
+    /// Fused linear + Maxout: computes the linear pre-activation (x·W + bias) of
+    /// shape [.., M, N] and reduces it by taking the max over consecutive groups of
+    /// <paramref name="numPieces"/> along the feature dimension, producing
+    /// [.., M, N/numPieces]. This is the shape-changing Maxout operation (Goodfellow
+    /// et al. 2013) — not an activation epilogue, since it shrinks the feature
+    /// dimension. Inference/forward-only (mirrors MlpForward); under a gradient tape
+    /// the caller should use the per-layer decomposition.
+    /// </summary>
+    public virtual Tensor<T> FusedLinearMaxout<T>(Tensor<T> input, Tensor<T> weights, Tensor<T>? bias, int numPieces)
+    {
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (weights == null) throw new ArgumentNullException(nameof(weights));
+        if (numPieces < 2) throw new ArgumentException("numPieces must be >= 2.", nameof(numPieces));
+
+        // GEMM + bias (no activation) — reuse the fused linear fast path.
+        var pre = FusedLinear(input, weights, bias, FusedActivationType.None);
+        int n = pre._shape[pre._shape.Length - 1];
+        if (n % numPieces != 0)
+            throw new ArgumentException(
+                $"Maxout feature dimension ({n}) must be divisible by numPieces ({numPieces}).", nameof(numPieces));
+        int units = n / numPieces;
+        int rows = pre.Length / n;
+
+        var outShape = (int[])pre._shape.Clone();
+        outShape[outShape.Length - 1] = units;
+        var result = new Tensor<T>(outShape);
+
+        var pa = pre.GetDataArray();
+        var oa = result.GetDataArray();
+        var cmp = System.Collections.Generic.Comparer<T>.Default;
+        for (int r = 0; r < rows; r++)
+        {
+            int inRow = r * n, outRow = r * units;
+            for (int u = 0; u < units; u++)
+            {
+                int g = inRow + u * numPieces;
+                T mx = pa[g];
+                for (int j = 1; j < numPieces; j++)
+                {
+                    T v = pa[g + j];
+                    if (cmp.Compare(v, mx) > 0) mx = v;
+                }
+                oa[outRow + u] = mx;
+            }
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Fused hierarchical softmax: class probabilities over a balanced binary
+    /// tree whose per-LEVEL routing gate is <c>sigmoid(input·nodeWeights[level])</c>.
+    /// <paramref name="input"/> is [.., D]; <paramref name="nodeWeights"/> is
+    /// [treeDepth, D] (one weight vector per tree level); the result is
+    /// [.., numClasses], where each leaf's probability is the product of the
+    /// gate decisions along its root-to-leaf path (left = 1−gate, right = gate).
+    /// The fusion computes the <c>treeDepth</c> shared gate sigmoids ONCE per row
+    /// and reuses them across every class, instead of the eager layer's
+    /// per-class gate recomputation (Morin &amp; Bengio 2005). Inference/forward-only.
+    /// </summary>
+    public virtual Tensor<T> FusedHierarchicalSoftmax<T>(Tensor<T> input, Tensor<T> nodeWeights, int numClasses)
+    {
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (nodeWeights == null) throw new ArgumentNullException(nameof(nodeWeights));
+        if (numClasses < 2) throw new ArgumentException("numClasses must be >= 2.", nameof(numClasses));
+        if (nodeWeights._shape.Length != 2)
+            throw new ArgumentException("nodeWeights must be rank-2 [treeDepth, D].", nameof(nodeWeights));
+
+        int d = input._shape[input._shape.Length - 1];
+        int treeDepth = nodeWeights._shape[0];
+        if (nodeWeights._shape[1] != d)
+            throw new ArgumentException(
+                $"nodeWeights feature dim ({nodeWeights._shape[1]}) must match input feature dim ({d}).",
+                nameof(nodeWeights));
+        // A balanced tree of depth t can address up to 2^t leaves; require
+        // enough levels to reach every class (ceil(log2(numClasses))).
+        int minDepth = 0;
+        while ((1 << minDepth) < numClasses) minDepth++;
+        if (treeDepth < minDepth)
+            throw new ArgumentException(
+                $"treeDepth ({treeDepth}) is too small for {numClasses} classes; need >= {minDepth}.",
+                nameof(nodeWeights));
+
+        int rows = input.Length / d;
+        var outShape = (int[])input._shape.Clone();
+        outShape[outShape.Length - 1] = numClasses;
+        var result = new Tensor<T>(outShape);
+
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var xa = input.GetDataArray();
+        var wa = nodeWeights.GetDataArray();
+        var oa = result.GetDataArray();
+        var one = numOps.One;
+        var gates = new T[treeDepth];
+
+        for (int r = 0; r < rows; r++)
+        {
+            int xBase = r * d;
+            // Shared per-level gates: sigmoid(input·nodeWeights[level]).
+            for (int level = 0; level < treeDepth; level++)
+            {
+                int wBase = level * d;
+                T dot = numOps.Zero;
+                for (int k = 0; k < d; k++)
+                    dot = numOps.Add(dot, numOps.Multiply(xa[xBase + k], wa[wBase + k]));
+                // sigmoid(z) = 1 / (1 + exp(-z))
+                T denom = numOps.Add(one, numOps.Exp(numOps.Negate(dot)));
+                gates[level] = numOps.Divide(one, denom);
+            }
+
+            int outBase = r * numClasses;
+            for (int c = 0; c < numClasses; c++)
+            {
+                T prob = one;
+                int node = 1;
+                for (int level = 0; level < treeDepth; level++)
+                {
+                    bool goRight = (c & (1 << (treeDepth - level - 1))) != 0;
+                    prob = numOps.Multiply(prob, goRight ? gates[level] : numOps.Subtract(one, gates[level]));
+                    node = node * 2 + (goRight ? 1 : 0);
+                    if (node >= numClasses) break;
+                }
+                oa[outBase + c] = prob;
+            }
+        }
+        return result;
     }
 
     /// <inheritdoc/>
@@ -34470,11 +34627,11 @@ public partial class CpuEngine : ITensorLevelEngine
     /// Handlers with true in-place support (ReLU, Sigmoid) override ApplyInPlace.
     /// Others fall back to allocate + copy.
     /// </summary>
-    private void ApplyFusedActivationInPlace<T>(Tensor<T> tensor, FusedActivationType activation)
+    private void ApplyFusedActivationInPlace<T>(Tensor<T> tensor, FusedActivationType activation, FusedActivationParams? activationParams = null)
     {
         var handler = ActivationRegistry.Get(activation);
         if (handler is null) return; // None
-        handler.ApplyInPlace(this, tensor);
+        handler.ApplyInPlace(this, tensor, activationParams);
     }
 
     /// <summary>
@@ -34491,16 +34648,18 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <summary>
     /// Computes the backward pass for the specified activation function.
     /// </summary>
-    internal Tensor<T> ApplyFusedActivationBackward<T>(Tensor<T> gradOutput, Tensor<T> preActivation, FusedActivationType activation)
+    internal Tensor<T> ApplyFusedActivationBackward<T>(Tensor<T> gradOutput, Tensor<T> preActivation, FusedActivationType activation, FusedActivationParams? activationParams = null)
     {
         // None is an explicit pass-through — no derivative to apply
         if (activation == FusedActivationType.None) return gradOutput;
 
         // OCP-compliant: dispatch through ActivationRegistry, no switch statement.
         // ActivationRegistry.Get throws for unknown types, preventing silent identity pass-through.
+        // #506 review: forward parametric settings so non-default LeakyReLU/ELU/CELU/
+        // ThresholdedReLU/ScaledTanh/RReLU/PReLU gradients match the forward.
         var handler = ActivationRegistry.Get(activation);
         if (handler is null) return gradOutput;
-        return handler.ApplyBackward(this, gradOutput, preActivation);
+        return handler.ApplyBackward(this, gradOutput, preActivation, activationParams);
     }
 
     /// <summary>

@@ -244,6 +244,12 @@ public partial class CpuEngine
         var hPrevBuf = pool.Rent(batch * hidden);
         var cPrevBuf = pool.Rent(batch * hidden);
         var hhBuf = pool.Rent(batch * gateRows);     // h_prev @ wHh^T scratch (natural layout)
+        // #477: pool the transposed hidden weight too. It used to be `new float[]` per
+        // call (64 KB at the AIsEval shape) because SgemmWithCachedB keyed its pre-pack
+        // cache on the array identity. Now the recurrent GEMM is SgemmSequential (no
+        // identity cache), so wHhT can come from the pool — removing the single biggest
+        // per-call allocation (the main GC-churn / p95 source).
+        var wHhTBuf = pool.Rent(hidden * gateRows);
 
         // Output buffer comes from AutoTensorCache so we don't pay an allocation.
         var output = returnSequences
@@ -289,7 +295,10 @@ public partial class CpuEngine
             // pass wHhT as the no-transpose B operand to the per-step direct GEMM below
             // ([hidden, gateRows] is exactly the [K, N] row-major layout SgemmSequential
             // expects, so the per-step call needs no further transpose or packing setup).
-            var wHhT = new float[hidden * gateRows];
+            // Pooled buffer (ArrayPool may return a larger array; every element of the
+            // [hidden, gateRows] window is overwritten by the transpose, so no stale data,
+            // and the GEMM call below slices to exactly hidden*gateRows).
+            var wHhT = wHhTBuf;
             for (int g = 0; g < gateRows; g++)
                 for (int hh2 = 0; hh2 < hidden; hh2++)
                     wHhT[hh2 * gateRows + g] = wHhSpan[g * hidden + hh2];
@@ -309,7 +318,7 @@ public partial class CpuEngine
                 // thread-insensitive finding).
                 SimdGemm.SgemmSequential(
                     hPrevBuf.AsSpan(0, batch * hidden),
-                    wHhT,
+                    wHhT.AsSpan(0, hidden * gateRows),
                     hhBuf.AsSpan(0, batch * gateRows),
                     batch, hidden, gateRows);
 
@@ -458,6 +467,7 @@ public partial class CpuEngine
             pool.Return(hPrevBuf);
             pool.Return(cPrevBuf);
             pool.Return(hhBuf);
+            pool.Return(wHhTBuf);
         }
     }
 
