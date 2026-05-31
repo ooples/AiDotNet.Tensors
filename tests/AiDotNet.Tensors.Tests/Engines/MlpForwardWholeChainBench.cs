@@ -237,23 +237,36 @@ public class MlpForwardWholeChainBench
 
                 double managed = Bench(() => SimdGemm.SgemmWithCachedB(src.AsSpan(0, m * k), wArr, dst.AsSpan(0, m * n), m, k, n));
 
+                // Ambient native baseline (NO scope): this is exactly what the self-tuner's
+                // native candidate runs per call — process-global thread count, no per-call
+                // retune. Use THIS as the tuner baseline, not perThread[last], which would
+                // (a) assume the process ambient count equals the last swept value and
+                // (b) include the pool-rebuild cost (see below).
+                double nativeAmbient = Bench(() =>
+                {
+                    unsafe { fixed (float* ps = src, pw = wArr, pd = dst) BlasProvider.SgemmRaw(m, n, k, ps, k, pw, n, pd, n); }
+                });
+
+                // Fixed-thread sweep: set the OpenBLAS thread count ONCE *outside* the timed
+                // region so perThread[ti] measures steady-state throughput held fixed at th
+                // threads — NOT the per-call ScopeOpenBlasThreads pool-rebuild (~700µs) that
+                // the CONCLUSION above documents as why option F can't be a per-call primitive.
                 var perThread = new double[threadCounts.Length];
                 for (int ti = 0; ti < threadCounts.Length; ti++)
                 {
                     int th = threadCounts[ti];
-                    perThread[ti] = Bench(() =>
-                    {
-                        using var _ = BlasProvider.ScopeOpenBlasThreads(th);
-                        unsafe { fixed (float* ps = src, pw = wArr, pd = dst) BlasProvider.SgemmRaw(m, n, k, ps, k, pw, n, pd, n); }
-                    });
+                    using (BlasProvider.ScopeOpenBlasThreads(th))
+                        perThread[ti] = Bench(() =>
+                        {
+                            unsafe { fixed (float* ps = src, pw = wArr, pd = dst) BlasProvider.SgemmRaw(m, n, k, ps, k, pw, n, pd, n); }
+                        });
                 }
                 int bestTi = 0; for (int ti = 1; ti < perThread.Length; ti++) if (perThread[ti] < perThread[bestTi]) bestTi = ti;
-                double nativeAll = perThread[threadCounts.Length - 1];   // 16 = all cores (self-tuner's native candidate)
-                double tunerPick = Math.Min(managed, nativeAll);
-                double fBest = Math.Min(managed, perThread[bestTi]);
-                string verdict = fBest < tunerPick - 0.0005 ? $"F WINS via native@{threadCounts[bestTi]}t ({tunerPick / fBest:F2}×)" : "no F headroom";
+                double tunerPick = Math.Min(managed, nativeAmbient);     // true self-tuner baseline (managed vs native@ambient)
+                double fBest = Math.Min(managed, perThread[bestTi]);     // best achievable if a fixed thread count were pinned
+                string verdict = fBest < tunerPick - 0.0005 ? $"F WINS via native@{threadCounts[bestTi]}t-fixed ({tunerPick / fBest:F2}×)" : "no F headroom";
                 _output.WriteLine(
-                    $"[{k}->{n} m={m,4}] managed {managed*1000:F1}  native@[" +
+                    $"[{k}->{n} m={m,4}] managed {managed*1000:F1}  native@ambient {nativeAmbient*1000:F1}  fixed@[" +
                     string.Join(",", System.Linq.Enumerable.Range(0, threadCounts.Length).Select(i => $"{threadCounts[i]}t:{perThread[i]*1000:F0}")) +
                     $"]us  tuner {tunerPick*1000:F1}  Fbest {fBest*1000:F1}  → {verdict}");
             }
