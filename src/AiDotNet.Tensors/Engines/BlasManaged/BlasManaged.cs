@@ -276,7 +276,13 @@ public static class BlasManaged
         // column-block via Avx2Tail/Avx512Tail (Task G2).
         // PackAOnly always uses scalar (4, 4) because its strided-B path has no
         // AVX2/AVX-512 RunStridedB variant yet (deferred to Phase Cx).
-        var (mr, nr) = PickMicrokernelTile<T>();
+        //
+        // #409 S.3: the live (non-pre-packed) path takes the mode-gated tile (Fast → 6×16);
+        // a supplied pre-packed handle must consume with the SAME 8×8 tile it was packed
+        // against (PickMicrokernelTilePrePack), independent of mode.
+        var (mr, nr) = (options.PackedB is null && options.PackedA is null)
+            ? PickMicrokernelTile<T>()
+            : PickMicrokernelTilePrePack<T>();
 
         // Sub-D4 (#372 follow-up): partial-M/N tail splitting. When the shape is
         // big enough for the SIMD tile (m >= mr AND n >= nr) but not aligned
@@ -565,7 +571,7 @@ public static class BlasManaged
         int m, int k,
         in BlasOptions<T> options = default) where T : unmanaged
     {
-        var (mr, _) = PickMicrokernelTile<T>();
+        var (mr, _) = PickMicrokernelTilePrePack<T>();
 
         // Sub-E (#373): multi-panel pre-pack. Pack the entire weight into
         // (numIcBlocks × numPcBlocks) tiles, each of size Mc × Kc. Strategies
@@ -689,7 +695,7 @@ public static class BlasManaged
         int k, int n,
         in BlasOptions<T> options = default) where T : unmanaged
     {
-        var (_, nr) = PickMicrokernelTile<T>();
+        var (_, nr) = PickMicrokernelTilePrePack<T>();
 
         // Sub-E (#373): multi-panel pre-pack — see PrePackA above. Tile sizes
         // MUST match the autotuner's FallbackToHeuristic defaults (Sub-Q #407
@@ -837,10 +843,32 @@ public static class BlasManaged
         if (typeof(T) == typeof(float))
         {
             if (Avx512Fp32_16x16.IsSupported) return (16, 16);
+            // #409 S.3: the higher-arithmetic-intensity 6×16 kernel (1.5 FMA/load, ~66% of
+            // peak vs the load-bound 8×8's ~0.89 / ~49-59%) is used in FAST (non-deterministic)
+            // mode only. Deterministic mode keeps 8×8 because 6×16's different float reduction
+            // order would break the bit-exact invariant the Streaming bypass / serial-vs-parallel
+            // paths assert — acceptable only where bit-reproducibility isn't promised (Fast mode).
+            if (!Helpers.BlasProvider.IsDeterministicMode && Avx2Fp32_6x16.IsSupported) return (6, 16);
             if (Avx2Fp32_8x8.IsSupported) return (8, 8);
             if (NeonFp32_8x4.IsSupported) return (8, 4);
             return (4, 4);
         }
         return (4, 4);
+    }
+
+    /// <summary>
+    /// Tile selection for the PRE-PACK path (<see cref="PrePackA{T}"/> / <see cref="PrePackB{T}"/>
+    /// and the consume side when a pre-packed handle is supplied). FP32 AVX2 stays on the legacy
+    /// 8×8 tile regardless of Fast/Deterministic mode: a pre-packed handle's pack-time and
+    /// consume-time tiles MUST agree, and the multi-panel byte layout + offset math are validated
+    /// for 8×8. #409's 6×16 applies only to the live (non-pre-packed) Fast-mode path.
+    /// </summary>
+    private static (int Mr, int Nr) PickMicrokernelTilePrePack<T>() where T : unmanaged
+    {
+        if (typeof(T) == typeof(float)
+            && !Avx512Fp32_16x16.IsSupported   // AVX-512 FP32 already uses 16×16 (unchanged)
+            && Avx2Fp32_8x8.IsSupported)
+            return (8, 8);
+        return PickMicrokernelTile<T>();
     }
 }

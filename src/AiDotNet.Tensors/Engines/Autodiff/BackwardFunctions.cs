@@ -4119,6 +4119,9 @@ internal static class BackwardFunctions<T>
         if (savedState is { Length: >= 1 })
         {
             var activation = (FusedActivationType)savedState[0];
+            // #506 review: parametric settings saved by the fused forward at [2] so the
+            // backward derivative honors a non-default slope/alpha/theta.
+            var activationParams = savedState.Length >= 3 ? savedState[2] as FusedActivationParams : null;
             Tensor<T> preActivation;
             if (savedState.Length >= 2 && savedState[1] is Tensor<T> cached)
             {
@@ -4134,21 +4137,22 @@ internal static class BackwardFunctions<T>
                 if (inputs.Length > 2)
                     preActivation = engine.TensorBroadcastAdd(preActivation, inputs[2]);
             }
-            gradOutput = ApplyActivationDerivative(gradOutput, preActivation, activation, engine);
+            gradOutput = ApplyActivationDerivative(gradOutput, preActivation, activation, engine, activationParams);
         }
 
         FusedLinearBackwardCore(gradOutput, inputs, output, savedState ?? Array.Empty<object>(), engine, grads);
     }
 
     private static Tensor<T> ApplyActivationDerivative(
-        Tensor<T> gradOutput, Tensor<T> preActivation, FusedActivationType activation, IEngine engine)
+        Tensor<T> gradOutput, Tensor<T> preActivation, FusedActivationType activation, IEngine engine,
+        FusedActivationParams? activationParams = null)
     {
         if (activation == FusedActivationType.None) return gradOutput;
 
         // Use CpuEngine.ApplyFusedActivationBackward which dispatches via ActivationRegistry
         // This is OCP-compliant: new activations register themselves, no switch needed here
         if (engine is CpuEngine cpuEngine)
-            return cpuEngine.ApplyFusedActivationBackward(gradOutput, preActivation, activation);
+            return cpuEngine.ApplyFusedActivationBackward(gradOutput, preActivation, activation, activationParams);
 
         // Fallback for non-CPU engines
         return gradOutput;

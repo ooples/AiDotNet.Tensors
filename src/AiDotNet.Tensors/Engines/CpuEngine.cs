@@ -34196,6 +34196,15 @@ public partial class CpuEngine : ITensorLevelEngine
     #if !NETFRAMEWORK
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
 #endif
+    // Phase 1 (compiled-inference) routing gate: prefer the managed cached-B GEMM
+    // (persistent prepack, no pinned→managed copy) for small/medium inference
+    // shapes, where it beats native BLAS + copy by 1.3-2.8x. Fall back to native
+    // BLAS only for large K·N·M, where native raw throughput wins. Thresholds from
+    // InferenceGemmStrategyAbTests on the AIsEval MLP shapes; shape-based so it
+    // generalises beyond MLP (transformer projections, etc.).
+    private static bool PreferManagedInferenceGemm(int m, int k, int n)
+        => !((long)k * n > 200_000 && m >= 16);
+
     public virtual Tensor<T> FusedLinear<T>(Tensor<T> input, Tensor<T> weights, Tensor<T>? bias, FusedActivationType activation, FusedActivationParams? activationParams = null)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
@@ -34218,15 +34227,18 @@ public partial class CpuEngine : ITensorLevelEngine
 
                 var inputs = bias != null ? new[] { input, weights, bias } : new[] { input, weights };
                 var capturedActivation = activation;
+                var capturedParams = activationParams;
                 return scope.RecordVariadic(nodeType, "FusedLinear", inputs, outShape,
                     (eng, output) =>
                     {
                         var eager = eng.FusedLinear(inputs[0], inputs[1],
-                            inputs.Length > 2 ? inputs[2] : null, capturedActivation);
+                            inputs.Length > 2 ? inputs[2] : null, capturedActivation, capturedParams);
                         eager.AsSpan().CopyTo(output.AsWritableSpan());
                     },
                     BackwardFunctions<T>.FusedLinearWithActivationBackward,
-                    activation != FusedActivationType.None ? new object[] { activation } : null);
+                    // savedState layout [0]=activation, [1]=preActivation (null here ⇒ backward
+                    // recomputes), [2]=FusedActivationParams (#506 review: parametric backward).
+                    activation != FusedActivationType.None ? new object[] { activation, null!, activationParams! } : null);
             }
         }
 
@@ -34250,15 +34262,16 @@ public partial class CpuEngine : ITensorLevelEngine
             if (activation != FusedActivationType.None)
             {
                 savedPreActivation = fusedResult.Clone();
-                ApplyFusedActivationInPlace(fusedResult, activation);
+                ApplyFusedActivationInPlace(fusedResult, activation, activationParams);
             }
             RemoveLastNTapeEntries<T>(bias != null ? 2 : 1);
 
             // Record single fused entry with activation info AND the captured
-            // pre-activation for backward.
+            // pre-activation for backward. #506 review: also carry FusedActivationParams
+            // ([2]) so parametric backward matches the parametric forward applied above.
             var fusedInputs = bias != null ? new[] { input, weights, bias } : new[] { input, weights };
             object[]? savedState = activation != FusedActivationType.None
-                ? new object[] { activation, savedPreActivation! } // [0]=activation, [1]=pre-activation
+                ? new object[] { activation, savedPreActivation!, activationParams! } // [0]=activation, [1]=pre-activation, [2]=params
                 : null;
             Autodiff.DifferentiableOps.RecordIfActive("FusedLinear", fusedResult, fusedInputs,
                 Autodiff.BackwardFunctions<T>.FusedLinearWithActivationBackward, savedState);
@@ -34290,10 +34303,26 @@ public partial class CpuEngine : ITensorLevelEngine
                 var outArr = (float[])(object)result.GetDataArray();
 
                 bool blasDone = false;
+
+                // Phase 1 (compiled-inference): for small/medium inference GEMMs the
+                // managed cached-B path wins 1.3-2.8x over native BLAS + pinned copy —
+                // it reuses the persistent prepacked-B cache (keyed by weight identity,
+                // no per-call PackB) AND writes outArr directly (no pinned→managed copy).
+                // The subsequent bias+activation pass is the same either way. Native
+                // BLAS is kept ONLY for large K·N·M, where its raw throughput beats our
+                // managed kernel (verified: InferenceGemmStrategyAbTests). Gate is
+                // shape-based so it generalises beyond MLP. Skipped under a tape (the
+                // tape path returns earlier) — this is the pure-inference fast path.
+                if (PreferManagedInferenceGemm(M, K, N))
+                {
+                    Simd.SimdGemm.SgemmWithCachedB(
+                        inArr.AsSpan(0, M * K), wArr, outArr.AsSpan(0, M * N), M, K, N);
+                    blasDone = true;
+                }
 #if NET5_0_OR_GREATER
                 // Tier -1: NativeInferencePool — pre-pinned weights, zero GC per call
                 var inferPool = NativeInferencePool.Current;
-                if (inferPool is not null && (BlasProvider.HasRawSgemm || BlasProvider.HasNativeSgemm))
+                if (!blasDone && inferPool is not null && (BlasProvider.HasRawSgemm || BlasProvider.HasNativeSgemm))
                 {
                     unsafe
                     {
@@ -34852,11 +34881,11 @@ public partial class CpuEngine : ITensorLevelEngine
     /// Handlers with true in-place support (ReLU, Sigmoid) override ApplyInPlace.
     /// Others fall back to allocate + copy.
     /// </summary>
-    private void ApplyFusedActivationInPlace<T>(Tensor<T> tensor, FusedActivationType activation)
+    private void ApplyFusedActivationInPlace<T>(Tensor<T> tensor, FusedActivationType activation, FusedActivationParams? activationParams = null)
     {
         var handler = ActivationRegistry.Get(activation);
         if (handler is null) return; // None
-        handler.ApplyInPlace(this, tensor);
+        handler.ApplyInPlace(this, tensor, activationParams);
     }
 
     /// <summary>
@@ -34873,16 +34902,18 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <summary>
     /// Computes the backward pass for the specified activation function.
     /// </summary>
-    internal Tensor<T> ApplyFusedActivationBackward<T>(Tensor<T> gradOutput, Tensor<T> preActivation, FusedActivationType activation)
+    internal Tensor<T> ApplyFusedActivationBackward<T>(Tensor<T> gradOutput, Tensor<T> preActivation, FusedActivationType activation, FusedActivationParams? activationParams = null)
     {
         // None is an explicit pass-through — no derivative to apply
         if (activation == FusedActivationType.None) return gradOutput;
 
         // OCP-compliant: dispatch through ActivationRegistry, no switch statement.
         // ActivationRegistry.Get throws for unknown types, preventing silent identity pass-through.
+        // #506 review: forward parametric settings so non-default LeakyReLU/ELU/CELU/
+        // ThresholdedReLU/ScaledTanh/RReLU/PReLU gradients match the forward.
         var handler = ActivationRegistry.Get(activation);
         if (handler is null) return gradOutput;
-        return handler.ApplyBackward(this, gradOutput, preActivation);
+        return handler.ApplyBackward(this, gradOutput, preActivation, activationParams);
     }
 
     /// <summary>
