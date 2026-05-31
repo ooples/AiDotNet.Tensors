@@ -158,6 +158,13 @@ internal static class OpRegistry
         "FusedLinearReLU", "FusedLinearSigmoid", "FusedLinearTanh",
         "FusedLinearGELU", "FusedLinearSwish",
 
+        // Fused RWKV-7 sequence kernel — records ONE tape node for the whole
+        // recurrence via DifferentiableOps.RecordIfActive with a custom BPTT
+        // backward (Rwkv7SequenceBackward), replacing the per-timestep tape
+        // micro-ops. Differentiable (unlike the inference-only fused
+        // LstmSequenceForward / MultiHeadAttentionForward primitives).
+        "Rwkv7SequenceForward",
+
         // Signal
         "RFFT", "IRFFT",
 
