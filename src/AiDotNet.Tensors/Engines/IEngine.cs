@@ -4091,6 +4091,99 @@ public interface IEngine
         int numHeads);
 
     /// <summary>
+    /// Fused RWKV-4 WKV recurrence (running-max stable per-channel WKV) over a whole sequence as one
+    /// differentiable op (forward + analytic BPTT backward); see <c>CpuEngine.Rwkv4Wkv.cs</c> (#1464).
+    /// </summary>
+    Tensor<T> Rwkv4WkvForward<T>(
+        Tensor<T> rProj,
+        Tensor<T> kProj,
+        Tensor<T> vProj,
+        Tensor<T> timeDecay,
+        Tensor<T> timeFirst);
+
+    /// <summary>
+    /// Fused Mamba S6 selective-scan over a whole sequence as one differentiable op
+    /// (forward + analytic BPTT backward); see <c>CpuEngine.MambaScan.cs</c> (#1464).
+    /// </summary>
+    Tensor<T> MambaSelectiveScanForward<T>(
+        Tensor<T> x,
+        Tensor<T> delta,
+        Tensor<T> aLog,
+        Tensor<T> bParam,
+        Tensor<T> cParam,
+        Tensor<T> dParam);
+
+    /// <summary>
+    /// Fused RG-LRU (Griffin/Hawk/RecurrentGemma) gated linear recurrence over a whole sequence as one
+    /// differentiable op (forward + analytic BPTT backward); see <c>CpuEngine.RgLruScan.cs</c> (#1464).
+    /// </summary>
+    Tensor<T> RgLruScanForward<T>(
+        Tensor<T> value,
+        Tensor<T> recGate,
+        Tensor<T> inpGate,
+        Tensor<T> decay);
+
+    /// <summary>
+    /// Fused Gated Linear Attention recurrence over a whole sequence as one differentiable op
+    /// (forward + analytic BPTT backward); see <c>CpuEngine.GlaScan.cs</c> (#1464).
+    /// </summary>
+    Tensor<T> GlaScanForward<T>(
+        Tensor<T> qProj,
+        Tensor<T> kProj,
+        Tensor<T> vProj,
+        Tensor<T> gate,
+        int numHeads);
+
+    /// <summary>
+    /// Fused Gated DeltaNet (delta-rule) recurrence over a whole sequence as one differentiable op
+    /// (forward + analytic BPTT backward); see <c>CpuEngine.GatedDeltaNetScan.cs</c> (#1464).
+    /// </summary>
+    Tensor<T> GatedDeltaNetScanForward<T>(
+        Tensor<T> qProj,
+        Tensor<T> kProj,
+        Tensor<T> vProj,
+        Tensor<T> alpha,
+        Tensor<T> beta,
+        int numHeads);
+
+    /// <summary>
+    /// Fused xLSTM (mLSTM) matrix-memory recurrence over a whole sequence as one differentiable op
+    /// (forward + analytic BPTT backward); see <c>CpuEngine.XLstmScan.cs</c> (#1464).
+    /// </summary>
+    Tensor<T> XLstmScanForward<T>(
+        Tensor<T> qProj,
+        Tensor<T> kProj,
+        Tensor<T> vProj,
+        Tensor<T> iGate,
+        Tensor<T> fGate,
+        Tensor<T> oGate,
+        int numHeads);
+
+    /// <summary>
+    /// Fused Mamba-2 SSD scan over a whole sequence as one differentiable op
+    /// (forward + analytic BPTT backward); see <c>CpuEngine.Mamba2SsdScan.cs</c> (#1464).
+    /// </summary>
+    Tensor<T> Mamba2SsdScanForward<T>(
+        Tensor<T> x,
+        Tensor<T> delta,
+        Tensor<T> aLog,
+        Tensor<T> bParam,
+        Tensor<T> cParam,
+        Tensor<T> dParam,
+        int numHeads);
+
+    /// <summary>
+    /// Fused linear (LM head) + cross-entropy-with-logits loss as one differentiable op, without
+    /// materializing the [N, vocab] logits on the tape; see
+    /// <c>CpuEngine.FusedLinearCrossEntropy.cs</c> (#1464).
+    /// </summary>
+    Tensor<T> FusedLinearCrossEntropyWithLogits<T>(
+        Tensor<T> hidden,
+        Tensor<T> weight,
+        Tensor<T> bias,
+        Tensor<T> target);
+
+    /// <summary>
     /// Computes the backward pass for scaled dot-product attention.
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
