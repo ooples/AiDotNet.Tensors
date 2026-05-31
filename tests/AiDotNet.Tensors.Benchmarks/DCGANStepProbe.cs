@@ -251,6 +251,265 @@ public class DCGANStepProbe
         return p;
     }
 
+    /// <summary>
+    /// Issue #403 Phase A.2 — per-substep wall-clock ranking via min-of-many.
+    /// The allocation profile shows the conv backward paths are already
+    /// ArrayPool-backed, so the 519ms DCGAN&lt;double&gt; step is compute-bound,
+    /// not allocation-bound. This method ranks substeps by time so Phase B-E
+    /// target the right GEMM. Min-of-many (industry-standard on a noisy box):
+    /// each substep is run <paramref name="innerReps"/> times per sample, the
+    /// per-call time is the sample, and the reported figure is the minimum
+    /// across <paramref name="outerSamples"/> samples (least-perturbed run).
+    /// </summary>
+    public static WallClockProfile RunWallClockProfile(int innerReps = 50, int outerSamples = 25)
+    {
+        var probe = new DCGANStepProbe();
+        probe.Setup();
+
+        // Warm all paths (JIT tier-up + pool fill) before timing.
+        probe.Im2Col_Fp32_DcganShape();
+        _ = probe.Conv2DForward_Fp64();
+        _ = probe.Conv2DForward_Fp32();
+        _ = probe.Conv2DBackwardInput_Fp64();
+        _ = probe.Conv2DBackwardKernel_Fp64();
+        _ = probe.TensorAdd_NoTape();
+        _ = probe.TensorAdd_WithTape();
+        _ = probe.BatchNormForward_Fp64();
+        _ = probe.BatchNormBackward_Fp64();
+
+        return new WallClockProfile
+        {
+            Im2Col_Fp32 = MinTime(() => probe.Im2Col_Fp32_DcganShape(), innerReps, outerSamples),
+            Conv2DForward_Fp64 = MinTime(() => probe.Conv2DForward_Fp64(), innerReps, outerSamples),
+            Conv2DForward_Fp32 = MinTime(() => probe.Conv2DForward_Fp32(), innerReps, outerSamples),
+            Conv2DBackwardInput_Fp64 = MinTime(() => probe.Conv2DBackwardInput_Fp64(), innerReps, outerSamples),
+            Conv2DBackwardKernel_Fp64 = MinTime(() => probe.Conv2DBackwardKernel_Fp64(), innerReps, outerSamples),
+            TensorAdd_NoTape = MinTime(() => probe.TensorAdd_NoTape(), innerReps, outerSamples),
+            TensorAdd_WithTape = MinTime(() => probe.TensorAdd_WithTape(), innerReps, outerSamples),
+            BatchNormForward_Fp64 = MinTime(() => probe.BatchNormForward_Fp64(), innerReps, outerSamples),
+            BatchNormBackward_Fp64 = MinTime(() => probe.BatchNormBackward_Fp64(), innerReps, outerSamples),
+        };
+    }
+
+    /// <summary>
+    /// Issue #403 Phase A.2b — bare <see cref="Engines.BlasManaged.BlasManaged.Gemm{T}"/>
+    /// timing at the three catalog shapes, with NO conv wrapper (no im2col, no
+    /// batch-parallel fan-out). Isolates whether the BackwardKernel pathology is
+    /// the transposed tiny-K/wide-N GEMM shape itself, vs the conv wrapper's
+    /// nested batch parallelism. Each shape runs single-call (the conv path
+    /// already dispatches one GEMM per batch), so this measures the inner GEMM
+    /// the way the conv path invokes it.
+    /// </summary>
+    public static string RunBareGemmProbe(int innerReps = 50, int outerSamples = 25)
+    {
+        // Shapes straight from the catalog (single batch slice each):
+        //   Forward:        C[64,49]   = A[64,1024]   · B[1024,49]            (NN)
+        //   BackwardInput:  C[1024,49] = A[64,1024]^T · B[64,49]             (tA)
+        //   BackwardKernel: C[64,1024] = A[64,49]     · B[1024,49]^T (transB) (tB)
+        var rng = new Random(7);
+        double[] Rand(int n) { var x = new double[n]; for (int i = 0; i < n; i++) x[i] = rng.NextDouble(); return x; }
+
+        // Forward: M=64, N=49, K=1024 (NN)
+        double[] fwdA = Rand(64 * 1024), fwdB = Rand(1024 * 49), fwdC = new double[64 * 49];
+        // BackwardInput: M=1024, N=49, K=64 (transA): A stored [64,1024], B [64,49]
+        double[] biA = Rand(64 * 1024), biB = Rand(64 * 49), biC = new double[1024 * 49];
+        // BackwardKernel: M=64, N=1024, K=49 (transB): A [64,49], B stored [1024,49]
+        double[] bkA = Rand(64 * 49), bkB = Rand(1024 * 49), bkC = new double[64 * 1024];
+
+        void Fwd() => Engines.BlasManaged.BlasManaged.Gemm<double>(fwdA, 1024, false, fwdB, 49, false, fwdC, 49, 64, 49, 1024);
+        void BwdInput() => Engines.BlasManaged.BlasManaged.Gemm<double>(biA, 1024, true, biB, 49, false, biC, 49, 1024, 49, 64);
+        void BwdKernel() => Engines.BlasManaged.BlasManaged.Gemm<double>(bkA, 49, false, bkB, 49, true, bkC, 1024, 64, 1024, 49);
+
+        Fwd(); BwdInput(); BwdKernel();  // warm
+        double fwd = MinTime(Fwd, innerReps, outerSamples);
+        double bi = MinTime(BwdInput, innerReps, outerSamples);
+        double bk = MinTime(BwdKernel, innerReps, outerSamples);
+
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine("Bare BlasManaged.Gemm<double> (min-of-many, µs/call) — no conv wrapper:");
+        sb.AppendLine($"  {fwd / 1000.0,10:N3} µs  Forward        M=64  N=49   K=1024 NN");
+        sb.AppendLine($"  {bi / 1000.0,10:N3} µs  BackwardInput  M=1024 N=49  K=64   tA");
+        sb.AppendLine($"  {bk / 1000.0,10:N3} µs  BackwardKernel M=64  N=1024 K=49   tB  <-- catalog hot shape");
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// Issue #403 Phase C — Conv2DBackwardInput sub-step breakdown at the DCGAN
+    /// shape. Phase A's bare-GEMM probe showed the BackwardInput GEMM is only
+    /// ~134µs but the wrapper is ~751µs; this splits the wrapper into its three
+    /// pieces (kernel transpose, GEMM, col2im scatter) so we know which to
+    /// optimize. Single-batch cost (the wrapper runs one of each per batch).
+    /// </summary>
+    public static string RunBackwardInputBreakdown(int innerReps = 50, int outerSamples = 25)
+    {
+        int colH = InChannels * KernelHW * KernelHW; // 1024
+        int colW = SpatialOut * SpatialOut;          // 49
+        var rng = new Random(11);
+        double[] R(int n) { var x = new double[n]; for (int i = 0; i < n; i++) x[i] = rng.NextDouble(); return x; }
+
+        double[] kernel = R(OutChannels * colH);   // [outC, colH]
+        double[] kernelTD = new double[colH * OutChannels];
+        double[] gradOut = R(OutChannels * colW);  // one batch slice [outC, colW]
+        double[] colBuf = R(colH * colW);          // pre-filled (col2im reads it)
+        double[] gradInput = new double[InChannels * SpatialIn * SpatialIn];
+
+        void Transpose()
+        {
+            for (int r = 0; r < OutChannels; r++)
+                for (int c = 0; c < colH; c++)
+                    kernelTD[c * OutChannels + r] = kernel[r * colH + c];
+        }
+        void Gemm() => Engines.BlasManaged.BlasManaged.Gemm<double>(
+            kernelTD, OutChannels, false, gradOut, colW, false, colBuf, colW, colH, colW, OutChannels);
+        void Col2Im() => Im2ColHelper.Col2ImAccumulate(
+            colBuf, gradInput, InChannels, SpatialIn, SpatialIn,
+            KernelHW, KernelHW, Stride, Stride, Padding, Padding, 1, 1, SpatialOut, SpatialOut);
+
+        Transpose(); Gemm(); Col2Im();
+        double t = MinTime(Transpose, innerReps, outerSamples);
+        double g = MinTime(Gemm, innerReps, outerSamples);
+        double c = MinTime(Col2Im, innerReps, outerSamples);
+
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine("Conv2DBackwardInput sub-step breakdown (min-of-many, µs, single batch slice):");
+        sb.AppendLine($"  {t / 1000.0,10:N3} µs  kernel transpose ([outC,colH] -> [colH,outC], once/call)");
+        sb.AppendLine($"  {g / 1000.0,10:N3} µs  GEMM colH×colW×outC (full width)");
+        sb.AppendLine($"  {c / 1000.0,10:N3} µs  Col2ImAccumulate scatter (per batch)");
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// Issue #403 Phase D — Conv2DForward sub-step breakdown at the DCGAN shape.
+    /// Forward lowers to im2col + GEMM per batch (no kernel transpose — the
+    /// kernel is already [outC, colH]). Splits the wrapper into im2col vs GEMM
+    /// so we know which (if either) is the lever for the remaining ~790µs.
+    /// Single-batch cost.
+    /// </summary>
+    public static string RunForwardBreakdown(int innerReps = 50, int outerSamples = 25)
+    {
+        int colH = InChannels * KernelHW * KernelHW; // K = 1024
+        int colW = SpatialOut * SpatialOut;          // N = 49
+        var rng = new Random(13);
+        double[] R(int n) { var x = new double[n]; for (int i = 0; i < n; i++) x[i] = rng.NextDouble(); return x; }
+
+        double[] inputSlice = R(InChannels * SpatialIn * SpatialIn); // one image
+        double[] kernel = R(OutChannels * colH);                     // [outC, colH]
+        double[] col = new double[colH * colW];
+        double[] output = new double[OutChannels * colW];
+
+        void Im2ColD() => Im2ColHelper.Im2Col(
+            new ReadOnlySpan<double>(inputSlice), new Span<double>(col),
+            1, InChannels, SpatialIn, SpatialIn, KernelHW, KernelHW,
+            Stride, Stride, Padding, Padding, 1, 1);
+        void Gemm() => Engines.BlasManaged.BlasManaged.Gemm<double>(
+            kernel, colH, false, col, colW, false, output, colW, OutChannels, colW, colH);
+
+        Im2ColD(); Gemm();
+        double i2c = MinTime(Im2ColD, innerReps, outerSamples);
+        double g = MinTime(Gemm, innerReps, outerSamples);
+
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine("Conv2DForward sub-step breakdown (min-of-many, µs, single batch slice):");
+        sb.AppendLine($"  {i2c / 1000.0,10:N3} µs  Im2Col (double, per batch)");
+        sb.AppendLine($"  {g / 1000.0,10:N3} µs  GEMM outC×colW×colH (M=64,N=49,K=1024, full width)");
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// Issue #403 Phase D — strategy sweep for the three conv GEMM shapes.
+    /// Each shape is timed under Auto (the deterministic-mode static heuristic)
+    /// vs forced Streaming / PackAOnly / PackBoth, so we can see whether the
+    /// heuristic's PackBoth choice is wrong for these small-output/large-K
+    /// shapes (where pack overhead dwarfs the ~6.4 MFLOP compute).
+    /// </summary>
+    public static string RunConvGemmStrategySweep(int innerReps = 50, int outerSamples = 25)
+    {
+        int colH = InChannels * KernelHW * KernelHW; // 1024
+        int colW = SpatialOut * SpatialOut;          // 49
+        var rng = new Random(17);
+        double[] R(int n) { var x = new double[n]; for (int i = 0; i < n; i++) x[i] = rng.NextDouble(); return x; }
+
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine("Conv GEMM strategy sweep (min-of-many, µs/call):");
+
+        // Forward: C[outC,colW] = kernel[outC,colH] @ im2col[colH,colW]  (NN)
+        {
+            double[] kern = R(OutChannels * colH), col = R(colH * colW), o = new double[OutChannels * colW];
+            double Run(Engines.BlasManaged.PackingMode pm) => MinTime(() =>
+                Engines.BlasManaged.BlasManaged.Gemm<double>(kern, colH, false, col, colW, false, o, colW,
+                    OutChannels, colW, colH, new Engines.BlasManaged.BlasOptions<double> { PackingMode = pm }),
+                innerReps, outerSamples);
+            sb.AppendLine($"  Forward       M=64  N=49   K=1024 NN : Auto {Run(Engines.BlasManaged.PackingMode.Auto)/1000.0,8:N2}  Stream {Run(Engines.BlasManaged.PackingMode.ForceStreaming)/1000.0,8:N2}  PackA {Run(Engines.BlasManaged.PackingMode.ForcePackAOnly)/1000.0,8:N2}  PackBoth {Run(Engines.BlasManaged.PackingMode.ForcePackBoth)/1000.0,8:N2}");
+        }
+        // BackwardInput: C[colH,colW] = kernel^T[colH,outC] @ gradOut[outC,colW]  (transA)
+        {
+            double[] kern = R(OutChannels * colH), go = R(OutChannels * colW), o = new double[colH * colW];
+            double Run(Engines.BlasManaged.PackingMode pm) => MinTime(() =>
+                Engines.BlasManaged.BlasManaged.Gemm<double>(kern, colH, true, go, colW, false, o, colW,
+                    colH, colW, OutChannels, new Engines.BlasManaged.BlasOptions<double> { PackingMode = pm }),
+                innerReps, outerSamples);
+            sb.AppendLine($"  BackwardInput M=1024 N=49  K=64   tA : Auto {Run(Engines.BlasManaged.PackingMode.Auto)/1000.0,8:N2}  Stream {Run(Engines.BlasManaged.PackingMode.ForceStreaming)/1000.0,8:N2}  PackA {Run(Engines.BlasManaged.PackingMode.ForcePackAOnly)/1000.0,8:N2}  PackBoth {Run(Engines.BlasManaged.PackingMode.ForcePackBoth)/1000.0,8:N2}");
+        }
+        // BackwardKernel: C[outC,colH] = gradOut[outC,colW] @ im2col[colH,colW]^T  (transB)
+        {
+            double[] go = R(OutChannels * colW), col = R(colH * colW), o = new double[OutChannels * colH];
+            double Run(Engines.BlasManaged.PackingMode pm) => MinTime(() =>
+                Engines.BlasManaged.BlasManaged.Gemm<double>(go, colW, false, col, colW, true, o, colH,
+                    OutChannels, colH, colW, new Engines.BlasManaged.BlasOptions<double> { PackingMode = pm }),
+                innerReps, outerSamples);
+            sb.AppendLine($"  BackwardKern  M=64  N=1024 K=49   tB : Auto {Run(Engines.BlasManaged.PackingMode.Auto)/1000.0,8:N2}  Stream {Run(Engines.BlasManaged.PackingMode.ForceStreaming)/1000.0,8:N2}  PackA {Run(Engines.BlasManaged.PackingMode.ForcePackAOnly)/1000.0,8:N2}  PackBoth {Run(Engines.BlasManaged.PackingMode.ForcePackBoth)/1000.0,8:N2}");
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// Issue #403 Phase D — machine-code-vs-managed crossover for NN GEMMs.
+    /// Forward routes through the #409 machine-code fast path (Auto, NN) which
+    /// is ~5× slower than managed for small outputs. Sweep (M,N) at K=1024 to
+    /// find where machine-code (Auto) catches up to PackBoth, so a min-output
+    /// guard on the machine-code gate can exclude only the loss region.
+    /// </summary>
+    public static string RunMachineKernelCrossover(int innerReps = 30, int outerSamples = 20)
+    {
+        var rng = new Random(19);
+        double[] R(int n) { var x = new double[n]; for (int i = 0; i < n; i++) x[i] = rng.NextDouble(); return x; }
+
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine("Machine-code (Auto,NN) vs PackBoth crossover, K=1024 (min-of-many, µs/call):");
+        (int m, int n)[] shapes = { (64, 49), (64, 256), (128, 128), (256, 256), (256, 49), (512, 512), (1024, 49) };
+        const int K = 1024;
+        foreach (var (m, n) in shapes)
+        {
+            double[] a = R(m * K), bb = R(K * n), c = new double[m * n];
+            double auto = MinTime(() => Engines.BlasManaged.BlasManaged.Gemm<double>(
+                a, K, false, bb, n, false, c, n, m, n, K), innerReps, outerSamples);
+            double packBoth = MinTime(() => Engines.BlasManaged.BlasManaged.Gemm<double>(
+                a, K, false, bb, n, false, c, n, m, n, K,
+                new Engines.BlasManaged.BlasOptions<double> { PackingMode = Engines.BlasManaged.PackingMode.ForcePackBoth }),
+                innerReps, outerSamples);
+            string winner = auto <= packBoth * 1.05 ? "machine-code OK" : "MANAGED WINS";
+            sb.AppendLine($"  M={m,5} N={n,5} (M·N={m * n,8}) : Auto {auto / 1000.0,8:N2}  PackBoth {packBoth / 1000.0,8:N2}  -> {winner}");
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>Minimum per-call nanoseconds across <paramref name="outerSamples"/>
+    /// samples, each averaging <paramref name="innerReps"/> back-to-back calls.</summary>
+    private static double MinTime(Action action, int innerReps, int outerSamples)
+    {
+        double nsPerTick = 1_000_000_000.0 / System.Diagnostics.Stopwatch.Frequency;
+        double best = double.MaxValue;
+        for (int s = 0; s < outerSamples; s++)
+        {
+            long start = System.Diagnostics.Stopwatch.GetTimestamp();
+            for (int r = 0; r < innerReps; r++) action();
+            long end = System.Diagnostics.Stopwatch.GetTimestamp();
+            double perCallNs = (end - start) * nsPerTick / innerReps;
+            if (perCallNs < best) best = perCallNs;
+        }
+        return best;
+    }
+
     private static long MeasureAlloc(Action action)
     {
         // GC.Collect before the measurement to keep allocator state
@@ -265,6 +524,49 @@ public class DCGANStepProbe
         action();
         long after = GC.GetAllocatedBytesForCurrentThread();
         return after - before;
+    }
+
+    /// <summary>Per-substep min-of-many wall-clock (nanoseconds per call).</summary>
+    public sealed class WallClockProfile
+    {
+        public double Im2Col_Fp32;
+        public double Conv2DForward_Fp64;
+        public double Conv2DForward_Fp32;
+        public double Conv2DBackwardInput_Fp64;
+        public double Conv2DBackwardKernel_Fp64;
+        public double TensorAdd_NoTape;
+        public double TensorAdd_WithTape;
+        public double BatchNormForward_Fp64;
+        public double BatchNormBackward_Fp64;
+
+        public string Format()
+        {
+            var entries = new (string name, double ns)[]
+            {
+                ("Conv2DBackwardInput_Fp64",  Conv2DBackwardInput_Fp64),
+                ("Conv2DBackwardKernel_Fp64", Conv2DBackwardKernel_Fp64),
+                ("Conv2DForward_Fp64",        Conv2DForward_Fp64),
+                ("Conv2DForward_Fp32",        Conv2DForward_Fp32),
+                ("BatchNormBackward_Fp64",    BatchNormBackward_Fp64),
+                ("BatchNormForward_Fp64",     BatchNormForward_Fp64),
+                ("Im2Col_Fp32",               Im2Col_Fp32),
+                ("TensorAdd_WithTape",        TensorAdd_WithTape),
+                ("TensorAdd_NoTape",          TensorAdd_NoTape),
+            };
+            Array.Sort(entries, (a, b) => b.ns.CompareTo(a.ns));
+
+            // FP64 substeps that make up one generator/discriminator conv layer's
+            // forward+backward (the #403 hot path). Sum to contextualize the ranking.
+            double convStepNs = Conv2DForward_Fp64 + Conv2DBackwardInput_Fp64 + Conv2DBackwardKernel_Fp64;
+
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine("Per-substep wall-clock (min-of-many, µs/call, descending):");
+            foreach (var (name, ns) in entries)
+                sb.AppendLine($"  {ns / 1000.0,12:N3} µs  {name}");
+            sb.AppendLine($"  ----");
+            sb.AppendLine($"  {convStepNs / 1000.0,12:N3} µs  [Conv2D fwd + bwdInput + bwdKernel, FP64]");
+            return sb.ToString();
+        }
     }
 
     /// <summary>Per-substep bytes-allocated (one-call sample, current thread).</summary>

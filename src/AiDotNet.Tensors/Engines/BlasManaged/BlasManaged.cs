@@ -9,7 +9,7 @@ namespace AiDotNet.Tensors.Engines.BlasManaged;
 /// BLIS-style managed GEMM kernel. Replaces Avx512Sgemm + SimdGemm as the
 /// codebase's primary GEMM path. See docs/superpowers/specs/2026-05-16-blas-managed-design.md.
 /// </summary>
-public static class BlasManaged
+public static partial class BlasManaged
 {
     /// <summary>
     /// Process-wide default execution mode. Applied when a caller's
@@ -27,6 +27,22 @@ public static class BlasManaged
     /// where dispatcher overhead exceeded actual compute by 100×+.
     /// </summary>
     internal const long TinyShapeWorkThreshold = 100_000;
+
+    /// <summary>
+    /// #403 Phase D: minimum M·N·K work for the Sub-S machine-code microkernel
+    /// fast path to be worth taking. The machine kernel has higher fixed per-call
+    /// overhead than the managed strategies (JIT-cache lookup + M-stripe parallel
+    /// partition + unpacked-B streamed over K), so below this it loses to managed
+    /// PackBoth/Streaming. Measured at the DCGAN conv-forward shape
+    /// (M=64,N=49,K=1024 → 3.2M work): machine-code ~218-316µs vs managed ~60µs
+    /// (~4-5× slower); machine-code becomes competitive by ~16M work. The
+    /// conv-forward GEMM is the only NN (non-transposed) conv shape that reaches
+    /// this gate — the backward GEMMs are transposed and route to Streaming. Set
+    /// conservatively above the conv-forward shape but well below where the
+    /// machine kernel's throughput dominates (large square GEMMs run 100+ GF/s
+    /// here and stay on the fast path).
+    /// </summary>
+    internal const long MachineKernelMinWork = 4_000_000;
 
     /// <summary>
     /// Sub-issue F (#374): when true, <see cref="Helpers.BlasProvider.TryGemm"/> and
@@ -186,6 +202,7 @@ public static class BlasManaged
 
             var epi409 = options.Epilogue;
             if (mkAvail && m >= mkMr && n >= mkNr
+                && (long)m * n * k >= MachineKernelMinWork
                 && EpilogueFlagsCompute.Compute(in epi409) == EpilogueFlags.None)
             {
                 int mAl = m - (m % mkMr); // interior rows (× Mr)
