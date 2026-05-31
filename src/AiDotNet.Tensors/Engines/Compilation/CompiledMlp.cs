@@ -38,6 +38,11 @@ internal sealed class CompiledMlp
     private readonly int _maxBatch;
     private readonly float[] _bufA;
     private readonly float[] _bufB;
+    // Guards the shared ping-pong buffers (_bufA/_bufB) and the self-tuner state
+    // against concurrent Run calls on the same instance. Uncontended (the common
+    // single-threaded inference path) this is near-free; it only serializes
+    // accidental concurrent use of one CompiledMlp, preventing buffer corruption.
+    private readonly object _runGate = new object();
 
     /// <summary>Input feature count (K of the first layer).</summary>
     public int InputFeatures => _inFeat[0];
@@ -143,30 +148,35 @@ internal sealed class CompiledMlp
         if (output.Length < (long)batch * OutputFeatures)
             throw new ArgumentException($"output must have at least batch*{OutputFeatures} elements.", nameof(output));
 
-        int layers = _weights.Length;
-        float[] src = input;
-        int curK = _inFeat[0];
-        // Resolve the per-layer kernel choice (managed cached-B vs native BLAS)
-        // for this batch from the self-tuner — see SelectKernels.
-        byte[] kernelChoice = SelectKernels(batch);
-        // Ping-pong: layer i writes into dst, which becomes the next src.
-        for (int i = 0; i < layers; i++)
+        // Shared ping-pong buffers + self-tuner state make Run non-reentrant; serialize
+        // concurrent calls on the same instance to prevent interleaved buffer writes.
+        lock (_runGate)
         {
-            int n = _outFeat[i];
-            float[] dst = (i % 2 == 0) ? _bufA : _bufB;   // src=input(layer0) → bufA → bufB → bufA …
+            int layers = _weights.Length;
+            float[] src = input;
+            int curK = _inFeat[0];
+            // Resolve the per-layer kernel choice (managed cached-B vs native BLAS)
+            // for this batch from the self-tuner — see SelectKernels.
+            byte[] kernelChoice = SelectKernels(batch);
+            // Ping-pong: layer i writes into dst, which becomes the next src.
+            for (int i = 0; i < layers; i++)
+            {
+                int n = _outFeat[i];
+                float[] dst = (i % 2 == 0) ? _bufA : _bufB;   // src=input(layer0) → bufA → bufB → bufA …
 
-            RunLayerGemm(kernelChoice[i], src, _weights[i], dst, batch, curK, n);
+                RunLayerGemm(kernelChoice[i], src, _weights[i], dst, batch, curK, n);
 
-            var bArr = _biases[i];
-            if (bArr is not null || _act[i] != FusedActivationType.None)
-                CpuFusedOperations.ApplyBiasActivationInPlace(dst, bArr, batch, n, _act[i], _actParams[i]);
+                var bArr = _biases[i];
+                if (bArr is not null || _act[i] != FusedActivationType.None)
+                    CpuFusedOperations.ApplyBiasActivationInPlace(dst, bArr, batch, n, _act[i], _actParams[i]);
 
-            src = dst;
-            curK = n;
+                src = dst;
+                curK = n;
+            }
+
+            // src now holds the final layer output in a ping-pong buffer; copy out.
+            Array.Copy(src, 0, output, 0, batch * OutputFeatures);
         }
-
-        // src now holds the final layer output in a ping-pong buffer; copy out.
-        Array.Copy(src, 0, output, 0, batch * OutputFeatures);
     }
 
     // Per-layer GEMM kernel selector. KernelManaged = managed cached-B
