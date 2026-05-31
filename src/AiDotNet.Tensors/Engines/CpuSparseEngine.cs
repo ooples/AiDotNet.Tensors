@@ -123,7 +123,7 @@ public sealed class CpuSparseEngine : ISparseEngine
     #region Sparse Matrix-Matrix Operations
 
     /// <inheritdoc/>
-    public Matrix<T> SpMM<T>(SparseTensor<T> sparse, Matrix<T> dense) where T : unmanaged
+    public Matrix<T> SpMM<T>(SparseTensor<T> sparse, Matrix<T> dense)
     {
         if (sparse is null) throw new ArgumentNullException(nameof(sparse));
         if (dense is null) throw new ArgumentNullException(nameof(dense));
@@ -133,14 +133,29 @@ public sealed class CpuSparseEngine : ISparseEngine
                 $"Sparse matrix columns ({sparse.Columns}) must match dense matrix rows ({dense.Rows}).");
         }
 
-        var ops = MathHelper.GetNumericOperations<T>();
-        var result = new Matrix<T>(sparse.Rows, dense.Columns);
+        // The public API is unconstrained over T (no struct/unmanaged constraint) so
+        // unconstrained-T consumers — e.g. the neural-network layers, generic over an
+        // open T backed by INumericOperations<T> — can call it. Route the blittable
+        // element types through the SIMD/parallel BLAS SpMM kernel (#379); fall back to
+        // a generic CSR scalar path for any other T. float/double satisfy `unmanaged`,
+        // so the (object) cast to the concrete type is sound at runtime.
+        if (typeof(T) == typeof(float))
+            return (Matrix<T>)(object)SpMMBlas((SparseTensor<float>)(object)sparse, (Matrix<float>)(object)dense);
+        if (typeof(T) == typeof(double))
+            return (Matrix<T>)(object)SpMMBlas((SparseTensor<double>)(object)sparse, (Matrix<double>)(object)dense);
+        return SpMMGenericScalar(sparse, dense);
+    }
 
-        // #379: route through the SIMD/parallel managed BLAS SpMM kernel (C = 1·A·B + 0·C).
-        // CSR row-parallel, cache-friendly (B rows read contiguously), bit-deterministic —
-        // replaces the prior column-strided naive triple loop.
+    // #379 SIMD/parallel managed BLAS SpMM kernel (C = 1·A·B + 0·C): CSR row-parallel,
+    // cache-friendly (B rows read contiguously), bit-deterministic. Constrained to
+    // unmanaged because the kernel reinterprets element spans (MemoryMarshal.Cast).
+    private static Matrix<TU> SpMMBlas<TU>(SparseTensor<TU> sparse, Matrix<TU> dense) where TU : unmanaged
+    {
+        var ops = MathHelper.GetNumericOperations<TU>();
+        var result = new Matrix<TU>(sparse.Rows, dense.Columns);
+
         var csr = sparse.ToCsr();
-        var layout = new BlasManaged.SparseLayout<T>
+        var layout = new BlasManaged.SparseLayout<TU>
         {
             Rows = sparse.Rows,
             Cols = sparse.Columns,
@@ -150,10 +165,44 @@ public sealed class CpuSparseEngine : ISparseEngine
             Format = BlasManaged.SparseLayoutFormat.Csr,
         };
         int n = dense.Columns;
-        BlasManaged.BlasManaged.SpMM<T>(
+        BlasManaged.BlasManaged.SpMM<TU>(
             ops.One, layout,
             dense.AsSpan(), n, n,
             ops.Zero, result.AsWritableSpan(), n);
+
+        return result;
+    }
+
+    // Generic CSR scalar SpMM for arbitrary T (mirrors SpMV's fully generic
+    // INumericOperations<T> path): C[i, :] += A[i, j] · B[j, :] over the non-zeros of
+    // each sparse row, in the same row-major-over-CSR order the BLAS kernel uses, so
+    // results agree to floating-point rounding.
+    private static Matrix<T> SpMMGenericScalar<T>(SparseTensor<T> sparse, Matrix<T> dense)
+    {
+        var ops = MathHelper.GetNumericOperations<T>();
+        int rows = sparse.Rows;
+        int n = dense.Columns;
+        var result = new Matrix<T>(rows, n);   // T[] backing is zero-initialized
+
+        var csr = sparse.ToCsr();
+        var rowPtrs = csr.RowPointers;
+        var colIndices = csr.ColumnIndices;
+        var values = csr.Values;
+
+        for (int row = 0; row < rows; row++)
+        {
+            int start = rowPtrs[row];
+            int end = rowPtrs[row + 1];
+            for (int idx = start; idx < end; idx++)
+            {
+                int col = colIndices[idx];
+                T val = values[idx];
+                for (int k = 0; k < n; k++)
+                {
+                    result[row, k] = ops.Add(result[row, k], ops.Multiply(val, dense[col, k]));
+                }
+            }
+        }
 
         return result;
     }
