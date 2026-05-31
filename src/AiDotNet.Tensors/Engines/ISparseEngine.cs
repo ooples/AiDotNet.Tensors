@@ -75,11 +75,17 @@ public interface ISparseEngine
     /// </para>
     /// </remarks>
     /// <remarks>
-    /// <para><b>#379:</b> <c>T : unmanaged</c> is required so SpMM can route through
-    /// the SIMD/parallel <see cref="BlasManaged.BlasManaged.SpMM{T}"/> kernel. All
-    /// numeric element types used in this library satisfy it.</para>
+    /// <para><b>Unconstrained <c>T</c>:</b> like every other public engine method
+    /// (and <see cref="SpMV{T}"/> above), this is generic over an unconstrained
+    /// <c>T</c> — the library's public API deliberately carries no <c>struct</c> /
+    /// <c>unmanaged</c> constraint so unconstrained-<c>T</c> consumers (e.g. the
+    /// neural-network layers, which are generic over an open <c>T</c> backed by
+    /// <c>INumericOperations&lt;T&gt;</c>) can call it. The implementation routes
+    /// blittable element types (float/double) through the SIMD/parallel
+    /// <see cref="BlasManaged.BlasManaged.SpMM{T}"/> kernel (#379) and falls back to
+    /// a generic CSR scalar path for any other <c>T</c>.</para>
     /// </remarks>
-    Matrix<T> SpMM<T>(SparseTensor<T> sparse, Matrix<T> dense) where T : unmanaged;
+    Matrix<T> SpMM<T>(SparseTensor<T> sparse, Matrix<T> dense);
 
     /// <summary>
     /// Sparse matrix-sparse matrix multiplication: C = A * B (both sparse)
