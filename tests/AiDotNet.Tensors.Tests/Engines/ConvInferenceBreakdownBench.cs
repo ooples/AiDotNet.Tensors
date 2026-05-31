@@ -29,8 +29,14 @@ public class ConvInferenceBreakdownBench
         if (Environment.GetEnvironmentVariable("AIDOTNET_RUN_JIT_PERF") != "1") return;
 
         var engine = new CpuEngine();
+#if NET5_0_OR_GREATER
+        // System.Runtime.Intrinsics.X86 and OneDnnProvider are .NET-Core-only; net471
+        // lacks both (CS0234 / CS0103), so this richer diagnostic is net5+ only.
         _output.WriteLine($"AVX2={System.Runtime.Intrinsics.X86.Avx2.IsSupported} cores={Environment.ProcessorCount} " +
             $"HasRawSgemm={BlasProvider.HasRawSgemm} OneDnn={OneDnnProvider.IsAvailable}");
+#else
+        _output.WriteLine($"cores={Environment.ProcessorCount} HasRawSgemm={BlasProvider.HasRawSgemm}");
+#endif
 
         // The two CNN conv layers from benchmarks/AiDotNet.PyTorchParity:
         //   Conv2d(1,16,3,pad=1) on 28×28  → [N,16,28,28]
@@ -118,7 +124,7 @@ public class ConvInferenceBreakdownBench
     private static double Bench(Func<Tensor<float>> f, out long bytesPerCall)
     {
         for (int i = 0; i < 20; i++) { var _ = f(); }
-        long before = GC.GetAllocatedBytesForCurrentThread();
+        long before = AllocatedBytes();
         const int reps = 200;
         double best = double.MaxValue;
         for (int r = 0; r < reps; r++)
@@ -128,9 +134,21 @@ public class ConvInferenceBreakdownBench
             sw.Stop();
             best = Math.Min(best, sw.Elapsed.TotalMilliseconds);
         }
-        long after = GC.GetAllocatedBytesForCurrentThread();
+        long after = AllocatedBytes();
         bytesPerCall = (after - before) / reps;
         return best;
+    }
+
+    // GC.GetAllocatedBytesForCurrentThread() is .NET Core 3.0+ only; on net471 the
+    // build broke (CS0117). Fall back to a coarse whole-heap proxy there so this
+    // diagnostic bench compiles and runs on both target frameworks.
+    private static long AllocatedBytes()
+    {
+#if NET5_0_OR_GREATER
+        return GC.GetAllocatedBytesForCurrentThread();
+#else
+        return GC.GetTotalMemory(forceFullCollection: false);
+#endif
     }
 
     private static Tensor<float> MakeTensor(int[] shape, int seed)
