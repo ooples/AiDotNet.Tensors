@@ -12609,7 +12609,23 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
                 else
                 {
-                    for (int ic = 0; ic < inC; ic++) CopyChannel(ic);
+                    // Serial small-shape regime (CNN inference: e.g. 1→16 @28×28
+                    // K·N=7 K, 16→32 @14×14 K·N=28 K). The shared Im2ColHelper.Im2Col
+                    // is markedly faster here than the per-element CopyChannel scalar
+                    // loop above (row-contiguous vectorised copy + block-zeroed padding
+                    // vs a per-output-element `(uint)iw < W` branch). Measured on the
+                    // parity CNN convs (ConvInferenceBreakdownBench): the im2col+GEMM
+                    // total drops ~2.5–3× at bs1 (138→55 / 415→134 µs). Produces the
+                    // identical [K, N] = [(ic,kh,kw), (oh,ow)] layout CopyChannel
+                    // writes (verified bit-identical, maxDiff 0), so the downstream
+                    // GEMM is unchanged. The parallel CopyChannel path is retained
+                    // above for large (ResNet-scale) im2col where channel-parallel
+                    // copy beats a serial helper.
+                    Helpers.Im2ColHelper.Im2Col(
+                        input.AsSpan(b * inC * H * W, inC * H * W),
+                        col.AsSpan(0, K * N),
+                        1, inC, H, W,
+                        kH, kW, sH, sW, padH, padW, dH, dW);
                 }
 
                 // Output slice for this image: [outC, oH*oW] starting at

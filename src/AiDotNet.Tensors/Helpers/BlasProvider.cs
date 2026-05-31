@@ -112,9 +112,17 @@ internal static class BlasProvider
     internal static void TrySetOpenBlasThreads(int n)
     {
         if (!_nativeAvailable.Value) return;
-        if (_openblasThreadCount == n) return;
-        try { openblas_set_num_threads_native(n); _openblasThreadCount = n; }
-        catch { /* libopenblas symbol missing — earlier OpenBLAS builds may lack it. Tolerate. */ }
+        // #513 review: the check-and-set on the static _openblasThreadCount cache must be
+        // atomic, else concurrent callers (e.g. CpuInferenceConfig.PinBlasThreadsForLatency)
+        // race to a "last-writer-wins" OpenBLAS thread count. Use the same lock the
+        // ScopeOpenBlasThreads save/restore path takes (Monitor is re-entrant, so the
+        // in-scope TrySetOpenBlasThreads calls below still work).
+        lock (_openblasScopeLock)
+        {
+            if (_openblasThreadCount == n) return;
+            try { openblas_set_num_threads_native(n); _openblasThreadCount = n; }
+            catch { /* libopenblas symbol missing — earlier OpenBLAS builds may lack it. Tolerate. */ }
+        }
     }
 
     /// <summary>
