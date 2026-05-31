@@ -189,26 +189,34 @@ public static partial class BlasManaged
         ReadOnlySpan<T> b, int ldb, int n, T beta, Span<T> c, int ldc, int rows, int cols) where T : unmanaged
     {
         var ops = MathHelper.GetNumericOperations<T>();
+        // Use long base indices to match the typed float/double pointer paths
+        // (which compute `(long)i * ldc`): rows × ldc can exceed int range.
         for (int i = 0; i < rows; i++)
+        {
+            long cBase = (long)i * ldc;
             for (int j = 0; j < n; j++)
             {
-                int ci = i * ldc + j;
+                int ci = (int)(cBase + j);
                 c[ci] = ops.Multiply(beta, c[ci]);
             }
+        }
 
         if (csr)
         {
             for (int i = 0; i < rows; i++)
             {
                 int s = ptr[i], e = ptr[i + 1];
-                int cBase = i * ldc;
+                long cBase = (long)i * ldc;
                 for (int q = s; q < e; q++)
                 {
                     int k = ind[q];
                     T av = ops.Multiply(alpha, val[q]);
-                    int bBase = k * ldb;
+                    long bBase = (long)k * ldb;
                     for (int j = 0; j < n; j++)
-                        c[cBase + j] = ops.Add(c[cBase + j], ops.Multiply(av, b[bBase + j]));
+                    {
+                        int ci = (int)(cBase + j);
+                        c[ci] = ops.Add(c[ci], ops.Multiply(av, b[(int)(bBase + j)]));
+                    }
                 }
             }
         }
@@ -216,15 +224,18 @@ public static partial class BlasManaged
         {
             for (int k = 0; k < cols; k++)
             {
-                int bBase = k * ldb;
+                long bBase = (long)k * ldb;
                 int s = ptr[k], e = ptr[k + 1];
                 for (int q = s; q < e; q++)
                 {
                     int i = ind[q];
                     T av = ops.Multiply(alpha, val[q]);
-                    int cBase = i * ldc;
+                    long cBase = (long)i * ldc;
                     for (int j = 0; j < n; j++)
-                        c[cBase + j] = ops.Add(c[cBase + j], ops.Multiply(av, b[bBase + j]));
+                    {
+                        int ci = (int)(cBase + j);
+                        c[ci] = ops.Add(c[ci], ops.Multiply(av, b[(int)(bBase + j)]));
+                    }
                 }
             }
         }

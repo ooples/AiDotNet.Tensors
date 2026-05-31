@@ -20,9 +20,27 @@ public static partial class BlasManaged
         in BlasOptions<T> options = default) where T : unmanaged
     {
         if (m <= 0 || n <= 0) return;
+        if (kl < 0 || ku < 0)
+            throw new ArgumentOutOfRangeException(nameof(kl), "kl and ku must be non-negative.");
+        if (incx <= 0 || incy <= 0)
+            throw new ArgumentOutOfRangeException(nameof(incx), "incx and incy must be positive.");
+        if (lda < kl + ku + 1)
+            throw new ArgumentOutOfRangeException(nameof(lda), "lda must be >= kl + ku + 1.");
+
+        int lenX = transA ? m : n;   // length of x (column index range)
+        int lenY = transA ? n : m;   // length of y (row index range)
+        long needA = (long)lda * n;
+        long needX = 1L + (long)(lenX - 1) * incx;
+        long needY = 1L + (long)(lenY - 1) * incy;
+        if (a.Length < needA)
+            throw new ArgumentException("Span 'a' is too short for lda*n band storage.", nameof(a));
+        if (x.Length < needX)
+            throw new ArgumentException("Span 'x' is too short for the given length/incx.", nameof(x));
+        if (y.Length < needY)
+            throw new ArgumentException("Span 'y' is too short for the given length/incy.", nameof(y));
+
         var ops = MathHelper.GetNumericOperations<T>();
 
-        int lenY = transA ? n : m;
         // Scale y by beta.
         for (int o = 0; o < lenY; o++)
         {

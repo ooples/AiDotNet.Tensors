@@ -19,9 +19,25 @@ public static partial class BlasManaged
         Span<T> c, int ldc,
         in BlasOptions<T> options = default) where T : unmanaged
     {
-        if (m <= 0 || n <= 0) return;
+        if (m < 0) throw new ArgumentOutOfRangeException(nameof(m), "m must be non-negative.");
+        if (n < 0) throw new ArgumentOutOfRangeException(nameof(n), "n must be non-negative.");
+        if (m == 0 || n == 0) return;
+        if (side is not Side.Left and not Side.Right)
+            throw new ArgumentOutOfRangeException(nameof(side));
+        if (uplo is not Uplo.Lower and not Uplo.Upper)
+            throw new ArgumentOutOfRangeException(nameof(uplo));
+
         var ops = MathHelper.GetNumericOperations<T>();
         int s = side == Side.Left ? m : n;   // dimension of square symmetric A
+        if (lda < s) throw new ArgumentOutOfRangeException(nameof(lda), "lda must be >= the symmetric matrix dimension.");
+        if (ldb < n) throw new ArgumentOutOfRangeException(nameof(ldb), "ldb must be >= n.");
+        if (ldc < n) throw new ArgumentOutOfRangeException(nameof(ldc), "ldc must be >= n.");
+        if (a.Length < (long)(s - 1) * lda + s)
+            throw new ArgumentException("Span 'a' is too short for the symmetric matrix storage.", nameof(a));
+        if (b.Length < (long)(m - 1) * ldb + n)
+            throw new ArgumentException("Span 'b' is too short.", nameof(b));
+        if (c.Length < (long)(m - 1) * ldc + n)
+            throw new ArgumentException("Span 'c' is too short.", nameof(c));
 
         // Materialize full symmetric A (s×s) from the uplo triangle (mirror).
         T[] full = new T[s * s];

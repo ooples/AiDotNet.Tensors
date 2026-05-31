@@ -100,22 +100,37 @@ public static partial class BlasManaged
         in BlasOptions<T> gemmOpts, INumericOperations<T> ops) where T : unmanaged
     {
         int rRows = rhi - rlo;
-        T[] scratch = new T[rRows * n];
-        var xBlk = b.Slice(i0 * ldb); // bm × n (just solved)
-        if (!transA)
-            // op(A)[rlo:rhi, i0:i0+bm] = A[rlo:rhi, i0:i0+bm] (rRows × bm, NoTrans).
-            Gemm<T>(a.Slice(rlo * lda + i0), lda, false, xBlk, ldb, false, scratch, n, rRows, n, bm, gemmOpts);
-        else
-            // op(A)[rlo:rhi, i0:i0+bm] = (A[i0:i0+bm, rlo:rhi])ᵀ — pass that block with transA=true.
-            Gemm<T>(a.Slice(i0 * lda + rlo), lda, true, xBlk, ldb, false, scratch, n, rRows, n, bm, gemmOpts);
+        // Rent the GEMM-output scratch from the shared pool instead of allocating a
+        // fresh T[] every block iteration: this method runs inside both blocked
+        // loops, so a per-block `new` churns the GC/LOH and offsets the GEMM-path
+        // speedup. The pool reuses one backing buffer across all iterations.
+        int scratchLen = rRows * n;
+        T[] scratch = System.Buffers.ArrayPool<T>.Shared.Rent(scratchLen);
+        try
+        {
+            var xBlk = b.Slice(i0 * ldb); // bm × n (just solved)
+            // ArrayPool may hand back an oversized array; slice to the exact GEMM
+            // output extent so leading dims / indexing stay correct.
+            Span<T> scratchView = scratch.AsSpan(0, scratchLen);
+            if (!transA)
+                // op(A)[rlo:rhi, i0:i0+bm] = A[rlo:rhi, i0:i0+bm] (rRows × bm, NoTrans).
+                Gemm<T>(a.Slice(rlo * lda + i0), lda, false, xBlk, ldb, false, scratchView, n, rRows, n, bm, gemmOpts);
+            else
+                // op(A)[rlo:rhi, i0:i0+bm] = (A[i0:i0+bm, rlo:rhi])ᵀ — pass that block with transA=true.
+                Gemm<T>(a.Slice(i0 * lda + rlo), lda, true, xBlk, ldb, false, scratchView, n, rRows, n, bm, gemmOpts);
 
-        var bRem = b.Slice(rlo * ldb);
-        for (int r = 0; r < rRows; r++)
-            for (int c = 0; c < n; c++)
-            {
-                int bi = r * ldb + c;
-                bRem[bi] = ops.Subtract(bRem[bi], scratch[r * n + c]);
-            }
+            var bRem = b.Slice(rlo * ldb);
+            for (int r = 0; r < rRows; r++)
+                for (int c = 0; c < n; c++)
+                {
+                    int bi = r * ldb + c;
+                    bRem[bi] = ops.Subtract(bRem[bi], scratchView[r * n + c]);
+                }
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<T>.Shared.Return(scratch);
+        }
     }
 
     // A(r,c) honoring transpose. Inlined as a static helper (local functions
