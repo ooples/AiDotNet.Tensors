@@ -32,134 +32,113 @@ public partial class MetalBackend
     /// <param name="batch">Batch size.</param>
     /// <param name="inputSize">Input feature size.</param>
     /// <param name="hiddenSize">Hidden state size.</param>
-    // ── Fused GLA (Gated Linear Attention) scan (#1464) ────────────────────────────────────
-    // Host fallback (mirrors this backend's LstmForwardSequence precedent); a native Metal
-    // compute shader is a follow-up. Correct + GPU-CPU bit-parity via the shared reference.
+    // ── Fused recurrence / LM-head GPU kernels (#1464) ─────────────────────────────────────
+    // Real MSL compute shaders (MetalRecurrenceKernels). One thread per the same work-item the
+    // other backends use. Forward only — the differentiable backward runs through the CpuEngine
+    // tape (the engine override is forward-only and defers to base when a tape is active).
+
+    // Dispatch a recurrence kernel: bind buffers 0..b-1, then int scalars b..b+s-1, over `total` threads.
+    private void DispatchRecurrence(string kernelName, int total, MetalGpuBuffer[] buffers, int[] scalars)
+    {
+        ThrowIfDisposed();
+        var pipeline = GetPipeline("Recurrence", _recurrenceLibrary, kernelName);
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(total);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        int idx = 0;
+        foreach (var buf in buffers) encoder.SetBuffer(buf, idx++);
+        foreach (var sc in scalars) encoder.SetBytes(sc, (ulong)idx++);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+    }
+
+    private static MetalGpuBuffer M(IGpuBuffer b) => (MetalGpuBuffer)b;
+
     public void GlaScanForward(
         IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer gate, IGpuBuffer output,
         int batch, int seqLen, int modelDim, int numHeads, int headDim)
-    {
-        var qd = DownloadBuffer(q);
-        var kd = DownloadBuffer(k);
-        var vd = DownloadBuffer(v);
-        var gd = DownloadBuffer(gate);
-        var outp = new float[batch * seqLen * modelDim];
-        Cpu.RecurrenceCpuKernels.GlaForward(qd, kd, vd, gd, outp, batch, seqLen, modelDim, numHeads, headDim);
-        UploadToBuffer(output, outp);
-    }
+        => DispatchRecurrence("gla_scan_forward", batch * numHeads * headDim,
+            new[] { M(q), M(k), M(v), M(gate), M(output) },
+            new[] { batch, seqLen, modelDim, numHeads, headDim });
 
+    // GLA BPTT backward is never invoked by the IEngine path (the engine override is forward-only;
+    // training flows through the CpuEngine tape). Kept on the host for completeness — HIP/CUDA/OpenCL
+    // carry the real backward kernels; an MSL backward (atomics + trajectory) is a follow-up.
     public void GlaScanBackward(
         IGpuBuffer dOut, IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer gate,
         IGpuBuffer dQ, IGpuBuffer dK, IGpuBuffer dV, IGpuBuffer dG,
         int batch, int seqLen, int modelDim, int numHeads, int headDim)
     {
-        var doData = DownloadBuffer(dOut);
-        var qd = DownloadBuffer(q);
-        var kd = DownloadBuffer(k);
-        var vd = DownloadBuffer(v);
-        var gd = DownloadBuffer(gate);
-        var gq = new float[batch * seqLen * modelDim];
-        var gk = new float[batch * seqLen * modelDim];
-        var gv = new float[batch * seqLen * modelDim];
-        var gG = new float[batch * seqLen * numHeads];
-        Cpu.RecurrenceCpuKernels.GlaBackward(doData, qd, kd, vd, gd, gq, gk, gv, gG,
-            batch, seqLen, modelDim, numHeads, headDim);
-        UploadToBuffer(dQ, gq);
-        UploadToBuffer(dK, gk);
-        UploadToBuffer(dV, gv);
-        UploadToBuffer(dG, gG);
+        var doData = DownloadBuffer(dOut); var qd = DownloadBuffer(q); var kd = DownloadBuffer(k);
+        var vd = DownloadBuffer(v); var gd = DownloadBuffer(gate);
+        var gq = new float[batch * seqLen * modelDim]; var gk = new float[batch * seqLen * modelDim];
+        var gv = new float[batch * seqLen * modelDim]; var gG = new float[batch * seqLen * numHeads];
+        Cpu.RecurrenceCpuKernels.GlaBackward(doData, qd, kd, vd, gd, gq, gk, gv, gG, batch, seqLen, modelDim, numHeads, headDim);
+        UploadToBuffer(dQ, gq); UploadToBuffer(dK, gk); UploadToBuffer(dV, gv); UploadToBuffer(dG, gG);
     }
 
-    // Fused xLSTM (mLSTM) scan forward (#1464) — host fallback via the shared reference.
     public void XLstmScanForward(
         IGpuBuffer q, IGpuBuffer k, IGpuBuffer v,
         IGpuBuffer iGate, IGpuBuffer fGate, IGpuBuffer oGate, IGpuBuffer output,
         int batch, int seqLen, int modelDim, int numHeads, int headDim)
-    {
-        var qd = DownloadBuffer(q); var kd = DownloadBuffer(k); var vd = DownloadBuffer(v);
-        var id = DownloadBuffer(iGate); var fd = DownloadBuffer(fGate); var od = DownloadBuffer(oGate);
-        var outp = new float[batch * seqLen * modelDim];
-        Cpu.RecurrenceCpuKernels.XLstmForward(qd, kd, vd, id, fd, od, outp, batch, seqLen, modelDim, numHeads, headDim);
-        UploadToBuffer(output, outp);
-    }
+        => DispatchRecurrence("xlstm_scan_forward", batch * numHeads,
+            new[] { M(q), M(k), M(v), M(iGate), M(fGate), M(oGate), M(output) },
+            new[] { batch, seqLen, modelDim, numHeads, headDim });
 
-    // Fused Gated DeltaNet scan forward (#1464) — host fallback via the shared reference.
     public void GatedDeltaNetScanForward(
         IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer alpha, IGpuBuffer beta, IGpuBuffer output,
         int batch, int seqLen, int modelDim, int numHeads, int headDim)
-    {
-        var qd = DownloadBuffer(q); var kd = DownloadBuffer(k); var vd = DownloadBuffer(v);
-        var ad = DownloadBuffer(alpha); var bd = DownloadBuffer(beta);
-        var outp = new float[batch * seqLen * modelDim];
-        Cpu.RecurrenceCpuKernels.GatedDeltaNetForward(qd, kd, vd, ad, bd, outp, batch, seqLen, modelDim, numHeads, headDim);
-        UploadToBuffer(output, outp);
-    }
+        => DispatchRecurrence("gated_delta_scan_forward", batch * numHeads * headDim,
+            new[] { M(q), M(k), M(v), M(alpha), M(beta), M(output) },
+            new[] { batch, seqLen, modelDim, numHeads, headDim });
 
-    // Fused RG-LRU scan forward (#1464) — host fallback via the shared reference.
     public void RgLruScanForward(
         IGpuBuffer value, IGpuBuffer recGate, IGpuBuffer inpGate, IGpuBuffer decay, IGpuBuffer output,
         int batch, int seqLen, int recDim)
-    {
-        var vd = DownloadBuffer(value); var rd = DownloadBuffer(recGate);
-        var id = DownloadBuffer(inpGate); var dd = DownloadBuffer(decay);
-        var outp = new float[batch * seqLen * recDim];
-        Cpu.RecurrenceCpuKernels.RgLruForward(vd, rd, id, dd, outp, batch, seqLen, recDim);
-        UploadToBuffer(output, outp);
-    }
+        => DispatchRecurrence("rglru_scan_forward", batch * recDim,
+            new[] { M(value), M(recGate), M(inpGate), M(decay), M(output) },
+            new[] { batch, seqLen, recDim });
 
-    // Fused RWKV-4 WKV scan forward (#1464) — host fallback via the shared reference.
     public void Rwkv4WkvForward(
         IGpuBuffer r, IGpuBuffer k, IGpuBuffer v, IGpuBuffer timeDecay, IGpuBuffer timeFirst, IGpuBuffer output,
         int batch, int seqLen, int modelDim)
-    {
-        var rd = DownloadBuffer(r); var kd = DownloadBuffer(k); var vd = DownloadBuffer(v);
-        var td = DownloadBuffer(timeDecay); var fd = DownloadBuffer(timeFirst);
-        var outp = new float[batch * seqLen * modelDim];
-        Cpu.RecurrenceCpuKernels.Rwkv4WkvForward(rd, kd, vd, td, fd, outp, batch, seqLen, modelDim);
-        UploadToBuffer(output, outp);
-    }
+        => DispatchRecurrence("rwkv4_wkv_forward", batch * modelDim,
+            new[] { M(r), M(k), M(v), M(timeDecay), M(timeFirst), M(output) },
+            new[] { batch, seqLen, modelDim });
 
-    // Fused Mamba selective scan forward (#1464) — host fallback via the shared reference.
     public void MambaSelectiveScanForward(
         IGpuBuffer x, IGpuBuffer delta, IGpuBuffer aLog, IGpuBuffer bParam, IGpuBuffer cParam, IGpuBuffer dParam,
         IGpuBuffer output, int batch, int seqLen, int innerDim, int stateDim)
-    {
-        var xd = DownloadBuffer(x); var dl = DownloadBuffer(delta); var al = DownloadBuffer(aLog);
-        var bp = DownloadBuffer(bParam); var cp = DownloadBuffer(cParam); var dp = DownloadBuffer(dParam);
-        var outp = new float[batch * seqLen * innerDim];
-        Cpu.RecurrenceCpuKernels.MambaSelectiveScanForward(xd, dl, al, bp, cp, dp, outp, batch, seqLen, innerDim, stateDim);
-        UploadToBuffer(output, outp);
-    }
+        => DispatchRecurrence("mamba_selective_scan_forward", batch * innerDim,
+            new[] { M(x), M(delta), M(aLog), M(bParam), M(cParam), M(dParam), M(output) },
+            new[] { batch, seqLen, innerDim, stateDim });
 
-    // Fused Mamba-2 SSD scan forward (#1464) — host fallback via the shared reference.
     public void Mamba2SsdScanForward(
         IGpuBuffer x, IGpuBuffer delta, IGpuBuffer aLog, IGpuBuffer bParam, IGpuBuffer cParam, IGpuBuffer dParam,
         IGpuBuffer output, int batch, int seqLen, int innerDim, int numHeads, int headDim, int stateDim)
-    {
-        var xd = DownloadBuffer(x); var dl = DownloadBuffer(delta); var al = DownloadBuffer(aLog);
-        var bp = DownloadBuffer(bParam); var cp = DownloadBuffer(cParam); var dp = DownloadBuffer(dParam);
-        var outp = new float[batch * seqLen * innerDim];
-        Cpu.RecurrenceCpuKernels.Mamba2SsdScanForward(xd, dl, al, bp, cp, dp, outp, batch, seqLen, innerDim, numHeads, headDim, stateDim);
-        UploadToBuffer(output, outp);
-    }
+        => DispatchRecurrence("mamba2_ssd_scan_forward", batch * innerDim,
+            new[] { M(x), M(delta), M(aLog), M(bParam), M(cParam), M(dParam), M(output) },
+            new[] { batch, seqLen, innerDim, numHeads, headDim, stateDim });
 
-    // Fused linear + cross-entropy (#1464) — host fallback via the shared reference.
+    // CE kernels write a per-row loss vector; the host sums the N-element vector (the expensive
+    // logit work stays on the GPU). Returns the mean cross-entropy.
     public float FusedLinearCrossEntropyIndex(
         IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer targetIds, int n, int d, int vocab)
-    {
-        var hd = DownloadBuffer(hidden); var wd = DownloadBuffer(weight); var bd = DownloadBuffer(bias);
-        var td = DownloadBuffer(targetIds);
-        var ids = new int[n];
-        for (int i = 0; i < n; i++) ids[i] = (int)(td[i] + 0.5f);
-        return Cpu.RecurrenceCpuKernels.FusedLinearCeIndex(hd, wd, bd, ids, n, d, vocab);
-    }
+        => FusedCeRowLoss("fused_linear_ce_index", hidden, weight, bias, targetIds, n, d, vocab);
 
     public float FusedLinearCrossEntropyDense(
         IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer target, int n, int d, int vocab)
+        => FusedCeRowLoss("fused_linear_ce_dense", hidden, weight, bias, target, n, d, vocab);
+
+    private float FusedCeRowLoss(
+        string kernelName, IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer tgt, int n, int d, int vocab)
     {
-        var hd = DownloadBuffer(hidden); var wd = DownloadBuffer(weight); var bd = DownloadBuffer(bias);
-        var td = DownloadBuffer(target);
-        return Cpu.RecurrenceCpuKernels.FusedLinearCeDense(hd, wd, bd, td, n, d, vocab);
+        using var rowLoss = AllocateBuffer(n);
+        DispatchRecurrence(kernelName, n,
+            new[] { M(hidden), M(weight), M(bias), M(tgt), M(rowLoss) }, new[] { n, d, vocab });
+        var rl = DownloadBuffer(rowLoss);
+        double sum = 0.0;
+        for (int i = 0; i < n; i++) sum += rl[i];
+        return (float)(sum / n);
     }
 
     public void LstmForwardSequence(

@@ -47,6 +47,7 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
     // Pre-compiled kernel libraries
     private IntPtr _elementWiseLibrary;
     private IntPtr _activationLibrary;
+    private IntPtr _recurrenceLibrary; // fused recurrence / LM-head kernels (#1464)
     private IntPtr _trigLibrary;
     private IntPtr _reductionLibrary;
     private IntPtr _matrixLibrary;
@@ -211,6 +212,9 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
 
             // Compile octonion algebra operations
             _octonionLibrary = _shaderLibrary.CompileLibrary("Octonion", MetalKernels.OctonionKernels);
+
+            // Compile fused recurrence / LM-head kernels (#1464)
+            _recurrenceLibrary = _shaderLibrary.CompileLibrary("Recurrence", MetalRecurrenceKernels.Source);
         }
         catch (Exception ex)
         {
