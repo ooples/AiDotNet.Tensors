@@ -54,6 +54,11 @@ public partial class MetalBackend
         if (totalLong > int.MaxValue || trajLenLong > int.MaxValue)
             throw new ArgumentOutOfRangeException(nameof(batch), "GLA dimensions exceed Metal launch/buffer limits.");
         int total = (int)totalLong;
+        // dQ/dK/dG are atomic accumulators in the backward kernel — zero them here so the
+        // method is self-contained and correct even if the caller reuses dirty buffers.
+        Fill(dQ, 0f, batch * seqLen * modelDim);
+        Fill(dK, 0f, batch * seqLen * modelDim);
+        Fill(dG, 0f, batch * seqLen * numHeads);
         using var traj = AllocateBuffer((int)trajLenLong);
         DispatchRecurrence("gla_scan_recompute", total,
             new[] { M(k), M(v), M(gate), M(traj) },

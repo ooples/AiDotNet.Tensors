@@ -381,8 +381,8 @@ public sealed partial class HipBackend
         LaunchKernel(kernel, (total + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize, (uint)DefaultBlockSize, args);
     }
 
-    // dQ/dK/dV (each [batch, seqLen, modelDim]) and dG ([batch, seqLen, numHeads]) MUST be
-    // pre-zeroed — the backward kernel accumulates into them via atomicAdd.
+    // dQ/dK/dV (each [batch, seqLen, modelDim]) and dG ([batch, seqLen, numHeads]); dQ/dK/dG are
+    // the atomicAdd accumulators and are zeroed internally below (no caller pre-zeroing required).
     public unsafe void GlaScanBackward(
         IGpuBuffer dOut, IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer gate,
         IGpuBuffer dQ, IGpuBuffer dK, IGpuBuffer dV, IGpuBuffer dG,
@@ -406,6 +406,11 @@ public sealed partial class HipBackend
                 $"GLA trajectory buffer size ({trajLenLong}) exceeds int.MaxValue.");
         int trajLen = (int)trajLenLong;
         using var trajBuf = AllocateBuffer(trajLen);
+        // dQ/dK/dG are the atomicAdd accumulators — zero them here so the method is
+        // self-contained and correct even if the caller reuses dirty buffers.
+        Fill(dQ, 0f, batch * seqLen * modelDim);
+        Fill(dK, 0f, batch * seqLen * modelDim);
+        Fill(dG, 0f, batch * seqLen * numHeads);
         uint total = (uint)(batch * numHeads * headDim);
         uint grid = (total + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize;
 

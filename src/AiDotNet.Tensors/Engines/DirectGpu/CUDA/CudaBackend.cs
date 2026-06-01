@@ -11922,7 +11922,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         LaunchKernel(kernel, (total + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize, (uint)DefaultBlockSize, args);
     }
 
-    // dQ/dK/dV ([batch,seqLen,modelDim]) and dG ([batch,seqLen,numHeads]) MUST be pre-zeroed.
+    // dQ/dK/dV ([batch,seqLen,modelDim]) and dG ([batch,seqLen,numHeads]); dQ/dK/dG are the
+    // atomic accumulators and are zeroed internally below (no caller pre-zeroing required).
     public unsafe void GlaScanBackward(
         IGpuBuffer dOut, IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer gate,
         IGpuBuffer dQ, IGpuBuffer dK, IGpuBuffer dV, IGpuBuffer dG,
@@ -11940,6 +11941,11 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             throw new InvalidOperationException("CUDA kernel not found: gla_scan_recompute / gla_scan_backward");
 
         using var _ = PushContext();
+        // dQ/dK/dG are atomic accumulators in the backward kernel — zero them here so the
+        // method is self-contained and correct even if the caller reuses dirty buffers.
+        Fill(dQ, 0f, batch * seqLen * modelDim);
+        Fill(dK, 0f, batch * seqLen * modelDim);
+        Fill(dG, 0f, batch * seqLen * numHeads);
         long trajLenL = checked((long)batch * numHeads * seqLen * headDim * headDim);
         if (trajLenL > int.MaxValue)
             throw new ArgumentException("GLA trajectory buffer is too large for a single allocation.");
