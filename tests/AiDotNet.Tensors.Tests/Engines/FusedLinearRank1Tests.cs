@@ -37,7 +37,10 @@ public class FusedLinearRank1Tests
 
         Assert.Equal(1, r1.Rank);                             // squeezed back to [N]
         Assert.Equal(N, r1.Shape[0]);
-        Assert.Equal(new[] { 1, N }, r2.Shape);
+        // .ToArray() so the IEnumerable<int> Assert.Equal overload resolves on
+        // net471 too (TensorShape only has an implicit ReadOnlySpan<int> operator,
+        // which xUnit's span overload picks up on net10 but not on net471).
+        Assert.Equal(new[] { 1, N }, r2.Shape.ToArray());
 
         var a = r1.ToArray(); var b = r2.ToArray();
         Assert.Equal(a.Length, b.Length);
@@ -68,6 +71,7 @@ public class FusedLinearRank1Tests
 
         Assert.Equal(dims[2], r1.ToArray().Length);
         var a = r1.ToArray(); var b = r2.ToArray();
+        Assert.Equal(a.Length, b.Length);
         for (int i = 0; i < a.Length; i++)
             Assert.True(Math.Abs(a[i] - b[i]) <= 1e-6f, $"[{i}] {a[i]} vs {b[i]}");
     }
