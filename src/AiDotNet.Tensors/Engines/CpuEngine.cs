@@ -34226,6 +34226,20 @@ public partial class CpuEngine : ITensorLevelEngine
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (weights == null) throw new ArgumentNullException(nameof(weights));
 
+        // Any-rank support: a rank-1 input [K] is a single unbatched sample. The GEMM
+        // fast paths and TensorMatMul below operate on rank >= 2, so promote [K] → [1, K]
+        // (numpy/torch matmul promote a 1-D operand the same way), run the standard path,
+        // and squeeze the leading batch dim back off → [N]. This keeps the fused linear
+        // op rank-agnostic and consistent with the generic per-layer Forward path; the
+        // Reshape is tape/graph-aware, so a rank-1 input under training still records a
+        // correct backward chain.
+        if (input.Rank == 1)
+        {
+            var promotedInput = Reshape(input, new[] { 1, input._shape[0] });
+            var promotedResult = FusedLinear(promotedInput, weights, bias, activation, activationParams);
+            return Reshape(promotedResult, new[] { promotedResult._shape[promotedResult.Rank - 1] });
+        }
+
         // Lazy graph mode: record the fused operation for later compilation
         if (GraphMode.IsActive)
         {
