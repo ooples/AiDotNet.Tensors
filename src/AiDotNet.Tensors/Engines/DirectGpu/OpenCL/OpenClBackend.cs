@@ -540,6 +540,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     _kernelCache[name] = new DirectOpenClKernel(_context, lstmProgram, name);
                 }
 
+                // Compile fused GLA (Gated Linear Attention) scan kernels (#1464)
+                var glaProgram = CompileOrLoadCached(GlaKernels.GetSource(), optimizationFlags, "GLA scan kernels");
+                _programs.Add(glaProgram);
+                foreach (var name in GlaKernels.GetKernelNames())
+                {
+                    _kernelCache[name] = new DirectOpenClKernel(_context, glaProgram, name);
+                }
+
                 // Compile GRU sequence kernels (forward/backward for BPTT training)
                 var gruProgram = CompileOrLoadCached(GruKernels.GetSource(), optimizationFlags, "GRU sequence kernels");
                 _programs.Add(gruProgram);
@@ -11577,6 +11585,84 @@ KERNEL VARIANTS (A/B testing):
         #endregion
 
         #region RNN (LSTM/GRU) Sequence Operations
+
+        // ── Fused GLA (Gated Linear Attention) scan (#1464) ────────────────────────────────
+        public void GlaScanForward(
+            IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer gate, IGpuBuffer output,
+            int batch, int seqLen, int modelDim, int numHeads, int headDim)
+        {
+            if (_context == null)
+                throw new InvalidOperationException("OpenCL context is not initialized. Cannot execute GlaScanForward.");
+            if (headDim > Kernels.GlaKernels.MaxHeadDim)
+                throw new InvalidOperationException($"GLA headDim ({headDim}) exceeds max ({Kernels.GlaKernels.MaxHeadDim}).");
+            if (!_kernelCache.TryGetValue("gla_scan_forward", out var kernel))
+                throw new InvalidOperationException("OpenCL kernel not found: gla_scan_forward");
+
+            kernel.SetArg(0u, ((DirectOpenClGpuBuffer)q).Buffer.Handle);
+            kernel.SetArg(1u, ((DirectOpenClGpuBuffer)k).Buffer.Handle);
+            kernel.SetArg(2u, ((DirectOpenClGpuBuffer)v).Buffer.Handle);
+            kernel.SetArg(3u, ((DirectOpenClGpuBuffer)gate).Buffer.Handle);
+            kernel.SetArg(4u, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            kernel.SetArg(5u, batch);
+            kernel.SetArg(6u, seqLen);
+            kernel.SetArg(7u, modelDim);
+            kernel.SetArg(8u, numHeads);
+            kernel.SetArg(9u, headDim);
+
+            int total = batch * numHeads * headDim;
+            int localSize = CalculateOptimalWorkGroupSize1D(total);
+            int globalSize = ((total + localSize - 1) / localSize) * localSize;
+            kernel.Execute1D(globalSize, localSize);
+        }
+
+        // dQ/dK/dV ([batch,seqLen,modelDim]) and dG ([batch,seqLen,numHeads]) MUST be pre-zeroed.
+        public void GlaScanBackward(
+            IGpuBuffer dOut, IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer gate,
+            IGpuBuffer dQ, IGpuBuffer dK, IGpuBuffer dV, IGpuBuffer dG,
+            int batch, int seqLen, int modelDim, int numHeads, int headDim)
+        {
+            if (_context == null)
+                throw new InvalidOperationException("OpenCL context is not initialized. Cannot execute GlaScanBackward.");
+            if (headDim > Kernels.GlaKernels.MaxHeadDim)
+                throw new InvalidOperationException($"GLA headDim ({headDim}) exceeds max ({Kernels.GlaKernels.MaxHeadDim}).");
+            if (!_kernelCache.TryGetValue("gla_scan_recompute", out var recompute) ||
+                !_kernelCache.TryGetValue("gla_scan_backward", out var backward))
+                throw new InvalidOperationException("OpenCL kernel not found: gla_scan_recompute / gla_scan_backward");
+
+            int trajLen = batch * numHeads * seqLen * headDim * headDim;
+            using var trajBuf = AllocateBuffer(trajLen);
+            int total = batch * numHeads * headDim;
+            int localSize = CalculateOptimalWorkGroupSize1D(total);
+            int globalSize = ((total + localSize - 1) / localSize) * localSize;
+
+            recompute.SetArg(0u, ((DirectOpenClGpuBuffer)k).Buffer.Handle);
+            recompute.SetArg(1u, ((DirectOpenClGpuBuffer)v).Buffer.Handle);
+            recompute.SetArg(2u, ((DirectOpenClGpuBuffer)gate).Buffer.Handle);
+            recompute.SetArg(3u, ((DirectOpenClGpuBuffer)trajBuf).Buffer.Handle);
+            recompute.SetArg(4u, batch);
+            recompute.SetArg(5u, seqLen);
+            recompute.SetArg(6u, modelDim);
+            recompute.SetArg(7u, numHeads);
+            recompute.SetArg(8u, headDim);
+            recompute.Execute1D(globalSize, localSize);
+
+            backward.SetArg(0u, ((DirectOpenClGpuBuffer)dOut).Buffer.Handle);
+            backward.SetArg(1u, ((DirectOpenClGpuBuffer)q).Buffer.Handle);
+            backward.SetArg(2u, ((DirectOpenClGpuBuffer)k).Buffer.Handle);
+            backward.SetArg(3u, ((DirectOpenClGpuBuffer)v).Buffer.Handle);
+            backward.SetArg(4u, ((DirectOpenClGpuBuffer)gate).Buffer.Handle);
+            backward.SetArg(5u, ((DirectOpenClGpuBuffer)trajBuf).Buffer.Handle);
+            backward.SetArg(6u, ((DirectOpenClGpuBuffer)dQ).Buffer.Handle);
+            backward.SetArg(7u, ((DirectOpenClGpuBuffer)dK).Buffer.Handle);
+            backward.SetArg(8u, ((DirectOpenClGpuBuffer)dV).Buffer.Handle);
+            backward.SetArg(9u, ((DirectOpenClGpuBuffer)dG).Buffer.Handle);
+            backward.SetArg(10u, batch);
+            backward.SetArg(11u, seqLen);
+            backward.SetArg(12u, modelDim);
+            backward.SetArg(13u, numHeads);
+            backward.SetArg(14u, headDim);
+            backward.Execute1D(globalSize, localSize);
+        }
 
         public void LstmForwardSequence(
             IGpuBuffer input, IGpuBuffer hInit, IGpuBuffer cInit,
