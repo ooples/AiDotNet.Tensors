@@ -33,12 +33,13 @@ public class GlaScanTests
                     for (int di = 0; di < headDim; di++)
                         for (int ki = 0; ki < headDim; ki++)
                             S[di * headDim + ki] = g * S[di * headDim + ki] + K[off + ki] * V[off + di];
-                    for (int ki = 0; ki < headDim; ki++)
+                    // Readout: O[di] = sum_ki S[di,ki]*Q[ki] (query contracts the key dim).
+                    for (int di = 0; di < headDim; di++)
                     {
                         double o = 0.0;
-                        for (int di = 0; di < headDim; di++)
-                            o += Q[off + di] * S[di * headDim + ki];
-                        outp[off + ki] = o;
+                        for (int ki = 0; ki < headDim; ki++)
+                            o += S[di * headDim + ki] * Q[off + ki];
+                        outp[off + di] = o;
                     }
                 }
             }

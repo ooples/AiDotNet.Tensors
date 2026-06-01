@@ -18,8 +18,8 @@ public partial class CpuEngine
     /// <paramref name="numHeads"/> blocks of headDim, keyDim = headDim), with matrix state S[di,ki] = 0
     /// and a scalar-per-head gate g_t = gate[..., headStart]:
     /// <code>
-    ///   S_t[di,ki] = g_t * S_{t-1}[di,ki] + K_t[ki] * V_t[di]
-    ///   O_t[ki]    = sum_di Q_t[di] * S_t[di,ki]
+    ///   S_t[di,ki] = g_t * S_{t-1}[di,ki] + V_t[di] * K_t[ki]
+    ///   O_t[di]    = sum_ki S_t[di,ki] * Q_t[ki]   (query contracts the key dim, output is the value dim)
     /// </code>
     /// Records one tape node whose backward is the exact BPTT adjoint, so it is differentiable under an
     /// active <c>GradientTape</c>. Inputs are the already-projected q/k/v streams plus a
@@ -104,12 +104,13 @@ public partial class CpuEngine
                         for (int ki = 0; ki < headDim; ki++)
                             S[srow + ki] = g * S[srow + ki] + K[baseOff + ki] * vv;
                     }
-                    for (int ki = 0; ki < headDim; ki++)
+                    for (int di = 0; di < headDim; di++)
                     {
+                        int srow = di * headDim;
                         double o = 0.0;
-                        for (int di = 0; di < headDim; di++)
-                            o += Q[baseOff + di] * S[di * headDim + ki];
-                        outp[baseOff + ki] = o;
+                        for (int ki = 0; ki < headDim; ki++)
+                            o += S[srow + ki] * Q[baseOff + ki];
+                        outp[baseOff + di] = o;
                     }
                 }
             }
@@ -158,15 +159,16 @@ public partial class CpuEngine
                     int sprevOff = (t - 1) * hh;
                     double g = G[gOff];
 
-                    // Output backward: O[ki] = sum_di Q[di]*S_t[di,ki].
-                    for (int ki = 0; ki < headDim; ki++)
+                    // Output backward: O[di] = sum_ki S_t[di,ki]*Q[ki].
+                    for (int di = 0; di < headDim; di++)
                     {
-                        double dOutVal = dOut[baseOff + ki];
-                        for (int di = 0; di < headDim; di++)
+                        double dOutVal = dOut[baseOff + di];
+                        int srow = di * headDim;
+                        for (int ki = 0; ki < headDim; ki++)
                         {
-                            double sval = Straj[stOff + di * headDim + ki];
-                            dQ[baseOff + di] += dOutVal * sval;
-                            dS[di * headDim + ki] += dOutVal * Q[baseOff + di];
+                            double sval = Straj[stOff + srow + ki];
+                            dQ[baseOff + ki] += dOutVal * sval;
+                            dS[srow + ki] += dOutVal * Q[baseOff + ki];
                         }
                     }
 
@@ -219,12 +221,13 @@ public partial class CpuEngine
                         for (int ki = 0; ki < headDim; ki++)
                             S[srow + ki] = ops.Add(ops.Multiply(g, S[srow + ki]), ops.Multiply(K[baseOff + ki], vv));
                     }
-                    for (int ki = 0; ki < headDim; ki++)
+                    for (int di = 0; di < headDim; di++)
                     {
+                        int srow = di * headDim;
                         T o = ops.Zero;
-                        for (int di = 0; di < headDim; di++)
-                            o = ops.Add(o, ops.Multiply(Q[baseOff + di], S[di * headDim + ki]));
-                        outp[baseOff + ki] = o;
+                        for (int ki = 0; ki < headDim; ki++)
+                            o = ops.Add(o, ops.Multiply(S[srow + ki], Q[baseOff + ki]));
+                        outp[baseOff + di] = o;
                     }
                 }
             }
@@ -271,14 +274,15 @@ public partial class CpuEngine
                     int sprevOff = (t - 1) * hh;
                     T g = G[gOff];
 
-                    for (int ki = 0; ki < headDim; ki++)
+                    for (int di = 0; di < headDim; di++)
                     {
-                        T dOutVal = dOut[baseOff + ki];
-                        for (int di = 0; di < headDim; di++)
+                        T dOutVal = dOut[baseOff + di];
+                        int srow = di * headDim;
+                        for (int ki = 0; ki < headDim; ki++)
                         {
-                            T sval = Straj[stOff + di * headDim + ki];
-                            dQ[baseOff + di] = ops.Add(dQ[baseOff + di], ops.Multiply(dOutVal, sval));
-                            dS[di * headDim + ki] = ops.Add(dS[di * headDim + ki], ops.Multiply(dOutVal, Q[baseOff + di]));
+                            T sval = Straj[stOff + srow + ki];
+                            dQ[baseOff + ki] = ops.Add(dQ[baseOff + ki], ops.Multiply(dOutVal, sval));
+                            dS[srow + ki] = ops.Add(dS[srow + ki], ops.Multiply(dOutVal, Q[baseOff + ki]));
                         }
                     }
 
