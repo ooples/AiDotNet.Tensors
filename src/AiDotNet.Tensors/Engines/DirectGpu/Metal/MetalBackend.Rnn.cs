@@ -60,20 +60,22 @@ public partial class MetalBackend
             new[] { M(q), M(k), M(v), M(gate), M(output) },
             new[] { batch, seqLen, modelDim, numHeads, headDim });
 
-    // GLA BPTT backward is never invoked by the IEngine path (the engine override is forward-only;
-    // training flows through the CpuEngine tape). Kept on the host for completeness — HIP/CUDA/OpenCL
-    // carry the real backward kernels; an MSL backward (atomics + trajectory) is a follow-up.
+    // GLA BPTT backward — real MSL kernels (recompute trajectory + reverse sweep with CAS float
+    // atomics for the cross-row dQ/dK/dG). dQ/dK/dG must be pre-zeroed (the atomic accumulators).
     public void GlaScanBackward(
         IGpuBuffer dOut, IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer gate,
         IGpuBuffer dQ, IGpuBuffer dK, IGpuBuffer dV, IGpuBuffer dG,
         int batch, int seqLen, int modelDim, int numHeads, int headDim)
     {
-        var doData = DownloadBuffer(dOut); var qd = DownloadBuffer(q); var kd = DownloadBuffer(k);
-        var vd = DownloadBuffer(v); var gd = DownloadBuffer(gate);
-        var gq = new float[batch * seqLen * modelDim]; var gk = new float[batch * seqLen * modelDim];
-        var gv = new float[batch * seqLen * modelDim]; var gG = new float[batch * seqLen * numHeads];
-        Cpu.RecurrenceCpuKernels.GlaBackward(doData, qd, kd, vd, gd, gq, gk, gv, gG, batch, seqLen, modelDim, numHeads, headDim);
-        UploadToBuffer(dQ, gq); UploadToBuffer(dK, gk); UploadToBuffer(dV, gv); UploadToBuffer(dG, gG);
+        int hh = headDim * headDim;
+        int total = batch * numHeads * headDim;
+        using var traj = AllocateBuffer(batch * numHeads * seqLen * hh);
+        DispatchRecurrence("gla_scan_recompute", total,
+            new[] { M(k), M(v), M(gate), M(traj) },
+            new[] { batch, seqLen, modelDim, numHeads, headDim });
+        DispatchRecurrence("gla_scan_backward", total,
+            new[] { M(dOut), M(q), M(k), M(v), M(gate), M(traj), M(dQ), M(dK), M(dV), M(dG) },
+            new[] { batch, seqLen, modelDim, numHeads, headDim });
     }
 
     public void XLstmScanForward(

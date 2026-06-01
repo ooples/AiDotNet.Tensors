@@ -316,5 +316,77 @@ kernel void fused_linear_ce_dense(
     }
     rowLoss[r] = -rl;
 }
+
+// ── GLA BPTT backward (recompute trajectory + reverse sweep) ─────────────────────────────────
+// Cross-row dQ/dK/dG accumulation uses a CAS-on-uint float atomic add (portable across GPUs that
+// lack native float atomics). dV[baseOff+di] is written by a single (b,h,di) thread → plain store.
+inline void gla_atomic_add_f(device atomic_uint* buf, int idx, float val) {
+    uint oldv = atomic_load_explicit(&buf[idx], memory_order_relaxed);
+    while (true) {
+        uint newv = as_type<uint>(as_type<float>(oldv) + val);
+        if (atomic_compare_exchange_weak_explicit(&buf[idx], &oldv, newv,
+                memory_order_relaxed, memory_order_relaxed)) break;
+    }
+}
+
+kernel void gla_scan_recompute(
+    device const float* K [[buffer(0)]], device const float* V [[buffer(1)]], device const float* G [[buffer(2)]],
+    device float* Straj [[buffer(3)]],
+    constant int& batch [[buffer(4)]], constant int& seqLen [[buffer(5)]], constant int& modelDim [[buffer(6)]],
+    constant int& numHeads [[buffer(7)]], constant int& headDim [[buffer(8)]], uint gid [[thread_position_in_grid]])
+{
+    int total = batch * numHeads * headDim;
+    if ((int)gid >= total) return;
+    int di = (int)gid % headDim; int h = ((int)gid / headDim) % numHeads; int b = (int)gid / (headDim * numHeads);
+    int hOff = h * headDim; int hh = headDim * headDim;
+    float Srow[REC_MAX_HEADDIM];
+    for (int ki = 0; ki < headDim; ki++) Srow[ki] = 0.0f;
+    for (int t = 0; t < seqLen; t++) {
+        int baseOff = (b * seqLen + t) * modelDim + hOff;
+        float g = G[(b * seqLen + t) * numHeads + h];
+        float vd = V[baseOff + di];
+        int trajBase = ((b * numHeads + h) * seqLen + t) * hh + di * headDim;
+        for (int ki = 0; ki < headDim; ki++) { float s = g * Srow[ki] + vd * K[baseOff + ki]; Srow[ki] = s; Straj[trajBase + ki] = s; }
+    }
+}
+
+kernel void gla_scan_backward(
+    device const float* dOut [[buffer(0)]], device const float* Q [[buffer(1)]], device const float* K [[buffer(2)]],
+    device const float* V [[buffer(3)]], device const float* G [[buffer(4)]], device const float* Straj [[buffer(5)]],
+    device atomic_uint* dQ [[buffer(6)]], device atomic_uint* dK [[buffer(7)]], device float* dV [[buffer(8)]], device atomic_uint* dG [[buffer(9)]],
+    constant int& batch [[buffer(10)]], constant int& seqLen [[buffer(11)]], constant int& modelDim [[buffer(12)]],
+    constant int& numHeads [[buffer(13)]], constant int& headDim [[buffer(14)]], uint gid [[thread_position_in_grid]])
+{
+    int total = batch * numHeads * headDim;
+    if ((int)gid >= total) return;
+    int di = (int)gid % headDim; int h = ((int)gid / headDim) % numHeads; int b = (int)gid / (headDim * numHeads);
+    int hOff = h * headDim; int hh = headDim * headDim;
+    float dSrow[REC_MAX_HEADDIM];
+    for (int ki = 0; ki < headDim; ki++) dSrow[ki] = 0.0f;
+    for (int t = seqLen - 1; t >= 0; t--) {
+        int baseOff = (b * seqLen + t) * modelDim + hOff;
+        int gOff = (b * seqLen + t) * numHeads + h;
+        float g = G[gOff];
+        int trajBase = ((b * numHeads + h) * seqLen + t) * hh + di * headDim;
+        int sprevBase = ((b * numHeads + h) * seqLen + (t - 1)) * hh + di * headDim;
+        float dOutVal = dOut[baseOff + di];
+        for (int ki = 0; ki < headDim; ki++) {
+            float sval = Straj[trajBase + ki];
+            gla_atomic_add_f(dQ, baseOff + ki, dOutVal * sval);
+            dSrow[ki] += dOutVal * Q[baseOff + ki];
+        }
+        float vd = V[baseOff + di]; float dg = 0.0f; float dVacc = 0.0f;
+        for (int ki = 0; ki < headDim; ki++) {
+            float dStv = dSrow[ki];
+            float sprev = (t > 0) ? Straj[sprevBase + ki] : 0.0f;
+            dg += dStv * sprev;
+            gla_atomic_add_f(dK, baseOff + ki, dStv * vd);
+            dVacc += dStv * K[baseOff + ki];
+        }
+        dV[baseOff + di] = dVacc;
+        gla_atomic_add_f(dG, gOff, dg);
+        for (int ki = 0; ki < headDim; ki++) dSrow[ki] *= g;
+    }
+}
 ";
 }
