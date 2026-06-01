@@ -29,7 +29,7 @@ public partial class CpuEngine
     /// <param name="weight">LM head weight [d, vocab] (DenseLayer [inputSize, outputSize]).</param>
     /// <param name="bias">LM head bias [vocab].</param>
     /// <param name="targetIds">Per-row class id [N], each in [0, vocab).</param>
-    /// <returns>Scalar (length-1) mean cross-entropy loss.</returns>
+    /// <returns>Scalar (length-1, shape [1]) mean cross-entropy loss.</returns>
     public virtual Tensor<T> FusedLinearCrossEntropyWithLogits<T>(
         Tensor<T> hidden, Tensor<T> weight, Tensor<T> bias, Tensor<int> targetIds)
     {
@@ -45,12 +45,16 @@ public partial class CpuEngine
         int n = hidden.Shape[0];
         int d = hidden.Shape[1];
         int vocab = weight.Shape[1];
+        if (n <= 0)
+            throw new ArgumentException($"hidden must have a non-empty batch (N > 0); got N={n}.", nameof(hidden));
+        if (vocab <= 0)
+            throw new ArgumentException($"weight must have a non-empty vocab (dim1 > 0); got vocab={vocab}.", nameof(weight));
         if (weight.Shape[0] != d)
             throw new ArgumentException($"weight dim0 ({weight.Shape[0]}) must equal hidden dim1 ({d}).", nameof(weight));
         if (bias.Length != vocab)
             throw new ArgumentException($"bias length ({bias.Length}) must equal vocab ({vocab}).", nameof(bias));
         if (targetIds.Rank != 1 || targetIds.Length != n)
-            throw new ArgumentException($"targetIds must be [N={n}].", nameof(targetIds));
+            throw new ArgumentException($"targetIds must be rank-1 [N={n}].", nameof(targetIds));
 
         var ids = (int[])(object)targetIds.GetDataArray()!;
         for (int r = 0; r < n; r++)
@@ -93,7 +97,7 @@ public partial class CpuEngine
     /// <param name="weight">LM head weight [d, vocab] (DenseLayer [inputSize, outputSize]).</param>
     /// <param name="bias">LM head bias [vocab].</param>
     /// <param name="target">Per-row categorical target distribution / one-hot [N, vocab].</param>
-    /// <returns>Scalar (rank-0) mean cross-entropy loss.</returns>
+    /// <returns>Scalar (length-1, shape [1]) mean cross-entropy loss.</returns>
     public virtual Tensor<T> FusedLinearCrossEntropyWithLogits<T>(
         Tensor<T> hidden, Tensor<T> weight, Tensor<T> bias, Tensor<T> target)
     {
@@ -109,12 +113,18 @@ public partial class CpuEngine
         int n = hidden.Shape[0];
         int d = hidden.Shape[1];
         int vocab = weight.Shape[1];
+        if (n <= 0)
+            throw new ArgumentException($"hidden must have a non-empty batch (N > 0); got N={n}.", nameof(hidden));
+        if (vocab <= 0)
+            throw new ArgumentException($"weight must have a non-empty vocab (dim1 > 0); got vocab={vocab}.", nameof(weight));
         if (weight.Shape[0] != d)
             throw new ArgumentException($"weight dim0 ({weight.Shape[0]}) must equal hidden dim1 ({d}).", nameof(weight));
         if (bias.Length != vocab)
             throw new ArgumentException($"bias length ({bias.Length}) must equal vocab ({vocab}).", nameof(bias));
-        if (target.Shape[target.Rank - 1] != vocab || target.Length != (long)n * vocab)
-            throw new ArgumentException($"target must be [N={n}, vocab={vocab}].", nameof(target));
+        // Check rank before indexing Shape[Rank-1] (a rank-0 target would otherwise throw
+        // IndexOutOfRangeException instead of this clear argument error).
+        if (target.Rank != 2 || target.Shape[0] != n || target.Shape[1] != vocab)
+            throw new ArgumentException($"target must be rank-2 [N={n}, vocab={vocab}].", nameof(target));
 
         // logits = hidden·weight + bias, computed via the fast parallel GEMM but NOT recorded
         // (this op records its own single tape node). The logits tensor is transient — it never
