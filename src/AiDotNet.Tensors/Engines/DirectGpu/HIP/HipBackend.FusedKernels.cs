@@ -356,4 +356,59 @@ public sealed partial class HipBackend
         args[10] = &nKeys; args[11] = &nVals;
         LaunchKernel(kernel, grid, (uint)DefaultBlockSize, args);
     }
+
+    // ── Fused GLA (Gated Linear Attention) scan (#1464) ────────────────────────────────────
+    // q/k/v: [batch, seqLen, modelDim]; gate: [batch, seqLen, numHeads]; output: [batch, seqLen, modelDim].
+    public unsafe void GlaScanForward(
+        IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer gate, IGpuBuffer output,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim)
+    {
+        if (headDim > Kernels.HipGlaKernels.MaxHeadDim)
+            throw new InvalidOperationException(
+                $"GLA headDim ({headDim}) exceeds max ({Kernels.HipGlaKernels.MaxHeadDim}).");
+        if (!_kernelCache.TryGetValue("gla_scan_forward", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: gla_scan_forward");
+
+        IntPtr pq = q.Handle, pk = k.Handle, pv = v.Handle, pg = gate.Handle, po = output.Handle;
+        void** args = stackalloc void*[10];
+        args[0] = &pq; args[1] = &pk; args[2] = &pv; args[3] = &pg; args[4] = &po;
+        args[5] = &batch; args[6] = &seqLen; args[7] = &modelDim; args[8] = &numHeads; args[9] = &headDim;
+        uint total = (uint)(batch * numHeads * headDim);
+        LaunchKernel(kernel, (total + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize, (uint)DefaultBlockSize, args);
+    }
+
+    // dQ/dK/dV (each [batch, seqLen, modelDim]) and dG ([batch, seqLen, numHeads]) MUST be
+    // pre-zeroed — the backward kernel accumulates into them via atomicAdd.
+    public unsafe void GlaScanBackward(
+        IGpuBuffer dOut, IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer gate,
+        IGpuBuffer dQ, IGpuBuffer dK, IGpuBuffer dV, IGpuBuffer dG,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim)
+    {
+        if (headDim > Kernels.HipGlaKernels.MaxHeadDim)
+            throw new InvalidOperationException(
+                $"GLA headDim ({headDim}) exceeds max ({Kernels.HipGlaKernels.MaxHeadDim}).");
+        if (!_kernelCache.TryGetValue("gla_scan_recompute", out var recompute) ||
+            !_kernelCache.TryGetValue("gla_scan_backward", out var backward))
+            throw new InvalidOperationException("HIP kernel not found: gla_scan_recompute / gla_scan_backward");
+
+        // State trajectory scratch: [batch * numHeads * seqLen * headDim * headDim].
+        int trajLen = batch * numHeads * seqLen * headDim * headDim;
+        using var trajBuf = AllocateBuffer(trajLen);
+        uint total = (uint)(batch * numHeads * headDim);
+        uint grid = (total + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize;
+
+        IntPtr pk = k.Handle, pv = v.Handle, pg = gate.Handle, ptr = trajBuf.Handle;
+        void** ra = stackalloc void*[9];
+        ra[0] = &pk; ra[1] = &pv; ra[2] = &pg; ra[3] = &ptr;
+        ra[4] = &batch; ra[5] = &seqLen; ra[6] = &modelDim; ra[7] = &numHeads; ra[8] = &headDim;
+        LaunchKernel(recompute, grid, (uint)DefaultBlockSize, ra);
+
+        IntPtr pdo = dOut.Handle, pq = q.Handle;
+        IntPtr pdq = dQ.Handle, pdk = dK.Handle, pdv = dV.Handle, pdg = dG.Handle;
+        void** ba = stackalloc void*[15];
+        ba[0] = &pdo; ba[1] = &pq; ba[2] = &pk; ba[3] = &pv; ba[4] = &pg; ba[5] = &ptr;
+        ba[6] = &pdq; ba[7] = &pdk; ba[8] = &pdv; ba[9] = &pdg;
+        ba[10] = &batch; ba[11] = &seqLen; ba[12] = &modelDim; ba[13] = &numHeads; ba[14] = &headDim;
+        LaunchKernel(backward, grid, (uint)DefaultBlockSize, ba);
+    }
 }
