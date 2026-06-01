@@ -540,6 +540,86 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     _kernelCache[name] = new DirectOpenClKernel(_context, lstmProgram, name);
                 }
 
+                // Fused recurrence / LM-head kernels (#1464) are an OPTIONAL capability: a
+                // driver that rejects one of these sources must not abort the whole backend
+                // init (which would lose every core kernel). Compile them in their own
+                // try/catch — methods that need a missing kernel already throw "kernel not
+                // found" at call time, so a partial compile degrades gracefully.
+                try
+                {
+                // Compile fused GLA (Gated Linear Attention) scan kernels (#1464)
+                var glaProgram = CompileOrLoadCached(GlaKernels.GetSource(), optimizationFlags, "GLA scan kernels");
+                _programs.Add(glaProgram);
+                foreach (var name in GlaKernels.GetKernelNames())
+                {
+                    _kernelCache[name] = new DirectOpenClKernel(_context, glaProgram, name);
+                }
+
+                // Compile fused xLSTM (mLSTM) scan kernels (#1464)
+                var xlstmProgram = CompileOrLoadCached(XLstmKernels.GetSource(), optimizationFlags, "xLSTM scan kernels");
+                _programs.Add(xlstmProgram);
+                foreach (var name in XLstmKernels.GetKernelNames())
+                {
+                    _kernelCache[name] = new DirectOpenClKernel(_context, xlstmProgram, name);
+                }
+
+                // Compile fused Gated DeltaNet scan kernels (#1464)
+                var gdnProgram = CompileOrLoadCached(GatedDeltaNetKernels.GetSource(), optimizationFlags, "Gated DeltaNet scan kernels");
+                _programs.Add(gdnProgram);
+                foreach (var name in GatedDeltaNetKernels.GetKernelNames())
+                {
+                    _kernelCache[name] = new DirectOpenClKernel(_context, gdnProgram, name);
+                }
+
+                // Compile fused RG-LRU scan kernels (#1464)
+                var rglruProgram = CompileOrLoadCached(RgLruKernels.GetSource(), optimizationFlags, "RG-LRU scan kernels");
+                _programs.Add(rglruProgram);
+                foreach (var name in RgLruKernels.GetKernelNames())
+                {
+                    _kernelCache[name] = new DirectOpenClKernel(_context, rglruProgram, name);
+                }
+
+                // Compile fused RWKV-4 WKV scan kernels (#1464)
+                var rwkv4Program = CompileOrLoadCached(Rwkv4Kernels.GetSource(), optimizationFlags, "RWKV-4 WKV scan kernels");
+                _programs.Add(rwkv4Program);
+                foreach (var name in Rwkv4Kernels.GetKernelNames())
+                {
+                    _kernelCache[name] = new DirectOpenClKernel(_context, rwkv4Program, name);
+                }
+
+                // Compile fused Mamba selective scan kernels (#1464)
+                var mambaProgram = CompileOrLoadCached(MambaKernels.GetSource(), optimizationFlags, "Mamba selective scan kernels");
+                _programs.Add(mambaProgram);
+                foreach (var name in MambaKernels.GetKernelNames())
+                {
+                    _kernelCache[name] = new DirectOpenClKernel(_context, mambaProgram, name);
+                }
+
+                // Compile fused Mamba-2 SSD scan kernels (#1464)
+                var mamba2Program = CompileOrLoadCached(Mamba2Kernels.GetSource(), optimizationFlags, "Mamba-2 SSD scan kernels");
+                _programs.Add(mamba2Program);
+                foreach (var name in Mamba2Kernels.GetKernelNames())
+                {
+                    _kernelCache[name] = new DirectOpenClKernel(_context, mamba2Program, name);
+                }
+
+                // Compile fused linear + cross-entropy kernels (#1464)
+                var fusedCeProgram = CompileOrLoadCached(FusedLinearCeKernels.GetSource(), optimizationFlags, "Fused linear cross-entropy kernels");
+                _programs.Add(fusedCeProgram);
+                foreach (var name in FusedLinearCeKernels.GetKernelNames())
+                {
+                    _kernelCache[name] = new DirectOpenClKernel(_context, fusedCeProgram, name);
+                }
+                }
+                catch (OutOfMemoryException)
+                {
+                    throw; // Fatal — never silently downgrade.
+                }
+                catch (Exception fex)
+                {
+                    WriteDiag($"[OpenClBackend] fused recurrence/LM-head kernels (#1464) unavailable: {fex.Message}");
+                }
+
                 // Compile GRU sequence kernels (forward/backward for BPTT training)
                 var gruProgram = CompileOrLoadCached(GruKernels.GetSource(), optimizationFlags, "GRU sequence kernels");
                 _programs.Add(gruProgram);
@@ -11577,6 +11657,325 @@ KERNEL VARIANTS (A/B testing):
         #endregion
 
         #region RNN (LSTM/GRU) Sequence Operations
+
+        // ── Fused GLA (Gated Linear Attention) scan (#1464) ────────────────────────────────
+        public void GlaScanForward(
+            IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer gate, IGpuBuffer output,
+            int batch, int seqLen, int modelDim, int numHeads, int headDim)
+        {
+            if (_context == null)
+                throw new InvalidOperationException("OpenCL context is not initialized. Cannot execute GlaScanForward.");
+            if (batch <= 0 || seqLen <= 0 || modelDim <= 0 || numHeads <= 0 || headDim <= 0)
+                throw new ArgumentOutOfRangeException(nameof(batch), "GLA dimensions must be positive.");
+            if (modelDim != numHeads * headDim)
+                throw new ArgumentException($"modelDim ({modelDim}) must equal numHeads * headDim ({numHeads * headDim}).");
+            if (headDim > Kernels.GlaKernels.MaxHeadDim)
+                throw new InvalidOperationException($"GLA headDim ({headDim}) exceeds max ({Kernels.GlaKernels.MaxHeadDim}).");
+            if (!_kernelCache.TryGetValue("gla_scan_forward", out var kernel))
+                throw new InvalidOperationException("OpenCL kernel not found: gla_scan_forward");
+
+            kernel.SetArg(0u, ((DirectOpenClGpuBuffer)q).Buffer.Handle);
+            kernel.SetArg(1u, ((DirectOpenClGpuBuffer)k).Buffer.Handle);
+            kernel.SetArg(2u, ((DirectOpenClGpuBuffer)v).Buffer.Handle);
+            kernel.SetArg(3u, ((DirectOpenClGpuBuffer)gate).Buffer.Handle);
+            kernel.SetArg(4u, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            kernel.SetArg(5u, batch);
+            kernel.SetArg(6u, seqLen);
+            kernel.SetArg(7u, modelDim);
+            kernel.SetArg(8u, numHeads);
+            kernel.SetArg(9u, headDim);
+
+            int total = batch * numHeads * headDim;
+            int localSize = CalculateOptimalWorkGroupSize1D(total);
+            int globalSize = ((total + localSize - 1) / localSize) * localSize;
+            kernel.Execute1D(globalSize, localSize);
+        }
+
+        // dQ/dK/dV ([batch,seqLen,modelDim]) and dG ([batch,seqLen,numHeads]) MUST be pre-zeroed.
+        public void GlaScanBackward(
+            IGpuBuffer dOut, IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer gate,
+            IGpuBuffer dQ, IGpuBuffer dK, IGpuBuffer dV, IGpuBuffer dG,
+            int batch, int seqLen, int modelDim, int numHeads, int headDim)
+        {
+            if (_context == null)
+                throw new InvalidOperationException("OpenCL context is not initialized. Cannot execute GlaScanBackward.");
+            if (batch <= 0 || seqLen <= 0 || modelDim <= 0 || numHeads <= 0 || headDim <= 0)
+                throw new ArgumentOutOfRangeException(nameof(batch), "GLA dimensions must be positive.");
+            if (modelDim != numHeads * headDim)
+                throw new ArgumentException($"modelDim ({modelDim}) must equal numHeads * headDim ({numHeads * headDim}).");
+            if (headDim > Kernels.GlaKernels.MaxHeadDim)
+                throw new InvalidOperationException($"GLA headDim ({headDim}) exceeds max ({Kernels.GlaKernels.MaxHeadDim}).");
+            if (!_kernelCache.TryGetValue("gla_scan_recompute", out var recompute) ||
+                !_kernelCache.TryGetValue("gla_scan_backward", out var backward))
+                throw new InvalidOperationException("OpenCL kernel not found: gla_scan_recompute / gla_scan_backward");
+
+            long totalLong = checked((long)batch * numHeads * headDim);
+            long trajLenLong = checked(totalLong * seqLen * headDim);
+            if (totalLong > int.MaxValue || trajLenLong > int.MaxValue)
+                throw new ArgumentOutOfRangeException(nameof(batch), "GLA dimensions exceed OpenCL launch/buffer limits.");
+            int trajLen = (int)trajLenLong;
+            using var trajBuf = AllocateBuffer(trajLen);
+            int total = (int)totalLong;
+            int localSize = CalculateOptimalWorkGroupSize1D(total);
+            int globalSize = ((total + localSize - 1) / localSize) * localSize;
+
+            recompute.SetArg(0u, ((DirectOpenClGpuBuffer)k).Buffer.Handle);
+            recompute.SetArg(1u, ((DirectOpenClGpuBuffer)v).Buffer.Handle);
+            recompute.SetArg(2u, ((DirectOpenClGpuBuffer)gate).Buffer.Handle);
+            recompute.SetArg(3u, ((DirectOpenClGpuBuffer)trajBuf).Buffer.Handle);
+            recompute.SetArg(4u, batch);
+            recompute.SetArg(5u, seqLen);
+            recompute.SetArg(6u, modelDim);
+            recompute.SetArg(7u, numHeads);
+            recompute.SetArg(8u, headDim);
+            recompute.Execute1D(globalSize, localSize);
+
+            backward.SetArg(0u, ((DirectOpenClGpuBuffer)dOut).Buffer.Handle);
+            backward.SetArg(1u, ((DirectOpenClGpuBuffer)q).Buffer.Handle);
+            backward.SetArg(2u, ((DirectOpenClGpuBuffer)k).Buffer.Handle);
+            backward.SetArg(3u, ((DirectOpenClGpuBuffer)v).Buffer.Handle);
+            backward.SetArg(4u, ((DirectOpenClGpuBuffer)gate).Buffer.Handle);
+            backward.SetArg(5u, ((DirectOpenClGpuBuffer)trajBuf).Buffer.Handle);
+            backward.SetArg(6u, ((DirectOpenClGpuBuffer)dQ).Buffer.Handle);
+            backward.SetArg(7u, ((DirectOpenClGpuBuffer)dK).Buffer.Handle);
+            backward.SetArg(8u, ((DirectOpenClGpuBuffer)dV).Buffer.Handle);
+            backward.SetArg(9u, ((DirectOpenClGpuBuffer)dG).Buffer.Handle);
+            backward.SetArg(10u, batch);
+            backward.SetArg(11u, seqLen);
+            backward.SetArg(12u, modelDim);
+            backward.SetArg(13u, numHeads);
+            backward.SetArg(14u, headDim);
+            backward.Execute1D(globalSize, localSize);
+        }
+
+        // ── Fused xLSTM (mLSTM) scan forward (#1464) ────────────────────────────────────────
+        public void XLstmScanForward(
+            IGpuBuffer q, IGpuBuffer k, IGpuBuffer v,
+            IGpuBuffer iGate, IGpuBuffer fGate, IGpuBuffer oGate, IGpuBuffer output,
+            int batch, int seqLen, int modelDim, int numHeads, int headDim)
+        {
+            if (_context == null)
+                throw new InvalidOperationException("OpenCL context is not initialized. Cannot execute XLstmScanForward.");
+            if (batch <= 0 || seqLen <= 0 || modelDim <= 0 || numHeads <= 0 || headDim <= 0)
+                throw new ArgumentOutOfRangeException(nameof(batch), "xLSTM dimensions must be positive.");
+            if (modelDim != numHeads * headDim)
+                throw new ArgumentException($"modelDim ({modelDim}) must equal numHeads * headDim ({numHeads * headDim}).");
+            if (headDim > Kernels.XLstmKernels.MaxHeadDim)
+                throw new InvalidOperationException($"xLSTM headDim ({headDim}) exceeds max ({Kernels.XLstmKernels.MaxHeadDim}).");
+            if (!_kernelCache.TryGetValue("xlstm_scan_forward", out var kernel))
+                throw new InvalidOperationException("OpenCL kernel not found: xlstm_scan_forward");
+
+            kernel.SetArg(0u, ((DirectOpenClGpuBuffer)q).Buffer.Handle);
+            kernel.SetArg(1u, ((DirectOpenClGpuBuffer)k).Buffer.Handle);
+            kernel.SetArg(2u, ((DirectOpenClGpuBuffer)v).Buffer.Handle);
+            kernel.SetArg(3u, ((DirectOpenClGpuBuffer)iGate).Buffer.Handle);
+            kernel.SetArg(4u, ((DirectOpenClGpuBuffer)fGate).Buffer.Handle);
+            kernel.SetArg(5u, ((DirectOpenClGpuBuffer)oGate).Buffer.Handle);
+            kernel.SetArg(6u, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            kernel.SetArg(7u, batch);
+            kernel.SetArg(8u, seqLen);
+            kernel.SetArg(9u, modelDim);
+            kernel.SetArg(10u, numHeads);
+            kernel.SetArg(11u, headDim);
+
+            int total = batch * numHeads;
+            int localSize = CalculateOptimalWorkGroupSize1D(total);
+            int globalSize = ((total + localSize - 1) / localSize) * localSize;
+            kernel.Execute1D(globalSize, localSize);
+        }
+
+        // ── Fused Gated DeltaNet scan forward (#1464) ───────────────────────────────────────
+        public void GatedDeltaNetScanForward(
+            IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer alpha, IGpuBuffer beta, IGpuBuffer output,
+            int batch, int seqLen, int modelDim, int numHeads, int headDim)
+        {
+            if (_context == null)
+                throw new InvalidOperationException("OpenCL context is not initialized. Cannot execute GatedDeltaNetScanForward.");
+            if (batch <= 0 || seqLen <= 0 || modelDim <= 0 || numHeads <= 0 || headDim <= 0)
+                throw new ArgumentOutOfRangeException(nameof(batch), "GatedDeltaNet dimensions must be positive.");
+            if (modelDim != numHeads * headDim)
+                throw new ArgumentException($"modelDim ({modelDim}) must equal numHeads * headDim ({numHeads * headDim}).");
+            if (headDim > Kernels.GatedDeltaNetKernels.MaxHeadDim)
+                throw new InvalidOperationException($"GatedDeltaNet headDim ({headDim}) exceeds max ({Kernels.GatedDeltaNetKernels.MaxHeadDim}).");
+            if (!_kernelCache.TryGetValue("gated_delta_scan_forward", out var kernel))
+                throw new InvalidOperationException("OpenCL kernel not found: gated_delta_scan_forward");
+
+            kernel.SetArg(0u, ((DirectOpenClGpuBuffer)q).Buffer.Handle);
+            kernel.SetArg(1u, ((DirectOpenClGpuBuffer)k).Buffer.Handle);
+            kernel.SetArg(2u, ((DirectOpenClGpuBuffer)v).Buffer.Handle);
+            kernel.SetArg(3u, ((DirectOpenClGpuBuffer)alpha).Buffer.Handle);
+            kernel.SetArg(4u, ((DirectOpenClGpuBuffer)beta).Buffer.Handle);
+            kernel.SetArg(5u, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            kernel.SetArg(6u, batch);
+            kernel.SetArg(7u, seqLen);
+            kernel.SetArg(8u, modelDim);
+            kernel.SetArg(9u, numHeads);
+            kernel.SetArg(10u, headDim);
+
+            int total = batch * numHeads * headDim;
+            int localSize = CalculateOptimalWorkGroupSize1D(total);
+            int globalSize = ((total + localSize - 1) / localSize) * localSize;
+            kernel.Execute1D(globalSize, localSize);
+        }
+
+        // ── Fused RG-LRU scan forward (#1464) ───────────────────────────────────────────────
+        public void RgLruScanForward(
+            IGpuBuffer value, IGpuBuffer recGate, IGpuBuffer inpGate, IGpuBuffer decay, IGpuBuffer output,
+            int batch, int seqLen, int recDim)
+        {
+            if (_context == null)
+                throw new InvalidOperationException("OpenCL context is not initialized. Cannot execute RgLruScanForward.");
+            if (batch <= 0 || seqLen <= 0 || recDim <= 0)
+                throw new ArgumentOutOfRangeException(nameof(batch), "RG-LRU dimensions must be positive.");
+            if (!_kernelCache.TryGetValue("rglru_scan_forward", out var kernel))
+                throw new InvalidOperationException("OpenCL kernel not found: rglru_scan_forward");
+
+            kernel.SetArg(0u, ((DirectOpenClGpuBuffer)value).Buffer.Handle);
+            kernel.SetArg(1u, ((DirectOpenClGpuBuffer)recGate).Buffer.Handle);
+            kernel.SetArg(2u, ((DirectOpenClGpuBuffer)inpGate).Buffer.Handle);
+            kernel.SetArg(3u, ((DirectOpenClGpuBuffer)decay).Buffer.Handle);
+            kernel.SetArg(4u, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            kernel.SetArg(5u, batch);
+            kernel.SetArg(6u, seqLen);
+            kernel.SetArg(7u, recDim);
+
+            int total = batch * recDim;
+            int localSize = CalculateOptimalWorkGroupSize1D(total);
+            int globalSize = ((total + localSize - 1) / localSize) * localSize;
+            kernel.Execute1D(globalSize, localSize);
+        }
+
+        // ── Fused RWKV-4 WKV scan forward (#1464) ───────────────────────────────────────────
+        public void Rwkv4WkvForward(
+            IGpuBuffer r, IGpuBuffer k, IGpuBuffer v, IGpuBuffer timeDecay, IGpuBuffer timeFirst, IGpuBuffer output,
+            int batch, int seqLen, int modelDim)
+        {
+            if (_context == null)
+                throw new InvalidOperationException("OpenCL context is not initialized. Cannot execute Rwkv4WkvForward.");
+            if (batch <= 0 || seqLen <= 0 || modelDim <= 0)
+                throw new ArgumentOutOfRangeException(nameof(batch), "RWKV-4 dimensions must be positive.");
+            if (!_kernelCache.TryGetValue("rwkv4_wkv_forward", out var kernel))
+                throw new InvalidOperationException("OpenCL kernel not found: rwkv4_wkv_forward");
+
+            kernel.SetArg(0u, ((DirectOpenClGpuBuffer)r).Buffer.Handle);
+            kernel.SetArg(1u, ((DirectOpenClGpuBuffer)k).Buffer.Handle);
+            kernel.SetArg(2u, ((DirectOpenClGpuBuffer)v).Buffer.Handle);
+            kernel.SetArg(3u, ((DirectOpenClGpuBuffer)timeDecay).Buffer.Handle);
+            kernel.SetArg(4u, ((DirectOpenClGpuBuffer)timeFirst).Buffer.Handle);
+            kernel.SetArg(5u, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            kernel.SetArg(6u, batch);
+            kernel.SetArg(7u, seqLen);
+            kernel.SetArg(8u, modelDim);
+
+            int total = batch * modelDim;
+            int localSize = CalculateOptimalWorkGroupSize1D(total);
+            int globalSize = ((total + localSize - 1) / localSize) * localSize;
+            kernel.Execute1D(globalSize, localSize);
+        }
+
+        // ── Fused Mamba selective scan forward (#1464) ──────────────────────────────────────
+        public void MambaSelectiveScanForward(
+            IGpuBuffer x, IGpuBuffer delta, IGpuBuffer aLog, IGpuBuffer bParam, IGpuBuffer cParam, IGpuBuffer dParam,
+            IGpuBuffer output, int batch, int seqLen, int innerDim, int stateDim)
+        {
+            if (_context == null)
+                throw new InvalidOperationException("OpenCL context is not initialized. Cannot execute MambaSelectiveScanForward.");
+            if (batch <= 0 || seqLen <= 0 || innerDim <= 0 || stateDim <= 0)
+                throw new ArgumentOutOfRangeException(nameof(batch), "Mamba dimensions must be positive.");
+            if (stateDim > Kernels.MambaKernels.MaxStateDim)
+                throw new InvalidOperationException($"Mamba stateDim ({stateDim}) exceeds max ({Kernels.MambaKernels.MaxStateDim}).");
+            if (!_kernelCache.TryGetValue("mamba_selective_scan_forward", out var kernel))
+                throw new InvalidOperationException("OpenCL kernel not found: mamba_selective_scan_forward");
+
+            kernel.SetArg(0u, ((DirectOpenClGpuBuffer)x).Buffer.Handle);
+            kernel.SetArg(1u, ((DirectOpenClGpuBuffer)delta).Buffer.Handle);
+            kernel.SetArg(2u, ((DirectOpenClGpuBuffer)aLog).Buffer.Handle);
+            kernel.SetArg(3u, ((DirectOpenClGpuBuffer)bParam).Buffer.Handle);
+            kernel.SetArg(4u, ((DirectOpenClGpuBuffer)cParam).Buffer.Handle);
+            kernel.SetArg(5u, ((DirectOpenClGpuBuffer)dParam).Buffer.Handle);
+            kernel.SetArg(6u, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            kernel.SetArg(7u, batch);
+            kernel.SetArg(8u, seqLen);
+            kernel.SetArg(9u, innerDim);
+            kernel.SetArg(10u, stateDim);
+
+            int total = batch * innerDim;
+            int localSize = CalculateOptimalWorkGroupSize1D(total);
+            int globalSize = ((total + localSize - 1) / localSize) * localSize;
+            kernel.Execute1D(globalSize, localSize);
+        }
+
+        // ── Fused Mamba-2 SSD scan forward (#1464) ──────────────────────────────────────────
+        public void Mamba2SsdScanForward(
+            IGpuBuffer x, IGpuBuffer delta, IGpuBuffer aLog, IGpuBuffer bParam, IGpuBuffer cParam, IGpuBuffer dParam,
+            IGpuBuffer output, int batch, int seqLen, int innerDim, int numHeads, int headDim, int stateDim)
+        {
+            if (_context == null)
+                throw new InvalidOperationException("OpenCL context is not initialized. Cannot execute Mamba2SsdScanForward.");
+            if (batch <= 0 || seqLen <= 0 || innerDim <= 0 || numHeads <= 0 || headDim <= 0 || stateDim <= 0)
+                throw new ArgumentOutOfRangeException(nameof(batch), "Mamba-2 dimensions must be positive.");
+            if (innerDim != numHeads * headDim)
+                throw new ArgumentException($"innerDim ({innerDim}) must equal numHeads * headDim ({numHeads * headDim}).");
+            if (stateDim > Kernels.Mamba2Kernels.MaxStateDim)
+                throw new InvalidOperationException($"Mamba-2 stateDim ({stateDim}) exceeds max ({Kernels.Mamba2Kernels.MaxStateDim}).");
+            if (!_kernelCache.TryGetValue("mamba2_ssd_scan_forward", out var kernel))
+                throw new InvalidOperationException("OpenCL kernel not found: mamba2_ssd_scan_forward");
+
+            kernel.SetArg(0u, ((DirectOpenClGpuBuffer)x).Buffer.Handle);
+            kernel.SetArg(1u, ((DirectOpenClGpuBuffer)delta).Buffer.Handle);
+            kernel.SetArg(2u, ((DirectOpenClGpuBuffer)aLog).Buffer.Handle);
+            kernel.SetArg(3u, ((DirectOpenClGpuBuffer)bParam).Buffer.Handle);
+            kernel.SetArg(4u, ((DirectOpenClGpuBuffer)cParam).Buffer.Handle);
+            kernel.SetArg(5u, ((DirectOpenClGpuBuffer)dParam).Buffer.Handle);
+            kernel.SetArg(6u, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            kernel.SetArg(7u, batch);
+            kernel.SetArg(8u, seqLen);
+            kernel.SetArg(9u, innerDim);
+            kernel.SetArg(10u, numHeads);
+            kernel.SetArg(11u, headDim);
+            kernel.SetArg(12u, stateDim);
+
+            int total = batch * innerDim;
+            int localSize = CalculateOptimalWorkGroupSize1D(total);
+            int globalSize = ((total + localSize - 1) / localSize) * localSize;
+            kernel.Execute1D(globalSize, localSize);
+        }
+
+        // ── Fused linear (LM head) + cross-entropy (#1464) ──────────────────────────────────
+        public float FusedLinearCrossEntropyIndex(
+            IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer targetIds, int n, int d, int vocab)
+            => FusedCeLaunch("fused_linear_ce_index", hidden, weight, bias, targetIds, n, d, vocab);
+
+        public float FusedLinearCrossEntropyDense(
+            IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer target, int n, int d, int vocab)
+            => FusedCeLaunch("fused_linear_ce_dense", hidden, weight, bias, target, n, d, vocab);
+
+        private float FusedCeLaunch(
+            string kernelName, IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer tgt, int n, int d, int vocab)
+        {
+            if (_context == null)
+                throw new InvalidOperationException("OpenCL context is not initialized. Cannot execute FusedLinearCrossEntropy.");
+            if (n <= 0 || d <= 0 || vocab <= 0)
+                throw new ArgumentOutOfRangeException(nameof(n), "Fused CE dimensions (n, d, vocab) must be positive.");
+            if (!_kernelCache.TryGetValue(kernelName, out var kernel))
+                throw new InvalidOperationException($"OpenCL kernel not found: {kernelName}");
+
+            using var lossBuf = AllocateBuffer(new float[] { 0.0f }); // zeroed accumulator
+            kernel.SetArg(0u, ((DirectOpenClGpuBuffer)hidden).Buffer.Handle);
+            kernel.SetArg(1u, ((DirectOpenClGpuBuffer)weight).Buffer.Handle);
+            kernel.SetArg(2u, ((DirectOpenClGpuBuffer)bias).Buffer.Handle);
+            kernel.SetArg(3u, ((DirectOpenClGpuBuffer)tgt).Buffer.Handle);
+            kernel.SetArg(4u, ((DirectOpenClGpuBuffer)lossBuf).Buffer.Handle);
+            kernel.SetArg(5u, n);
+            kernel.SetArg(6u, d);
+            kernel.SetArg(7u, vocab);
+
+            int localSize = CalculateOptimalWorkGroupSize1D(n);
+            int globalSize = ((n + localSize - 1) / localSize) * localSize;
+            kernel.Execute1D(globalSize, localSize);
+            var loss = DownloadBuffer(lossBuf);
+            return loss[0] / n;
+        }
 
         public void LstmForwardSequence(
             IGpuBuffer input, IGpuBuffer hInit, IGpuBuffer cInit,

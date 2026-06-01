@@ -11,6 +11,130 @@ public partial class MetalBackend
 {
     #region RNN (LSTM/GRU) Sequence Operations
 
+    // ── Fused recurrence / LM-head GPU kernels (#1464) ─────────────────────────────────────
+    // Real MSL compute shaders (MetalRecurrenceKernels). One thread per the same work-item the
+    // other backends use. Forward only — the differentiable backward runs through the CpuEngine
+    // tape (the engine override is forward-only and defers to base when a tape is active).
+
+    // Dispatch a recurrence kernel: bind buffers 0..b-1, then int scalars b..b+s-1, over `total` threads.
+    private void DispatchRecurrence(string kernelName, int total, MetalGpuBuffer[] buffers, int[] scalars)
+    {
+        ThrowIfDisposed();
+        var pipeline = GetPipeline("Recurrence", _recurrenceLibrary, kernelName);
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(total);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        int idx = 0;
+        foreach (var buf in buffers) encoder.SetBuffer(buf, idx++);
+        foreach (var sc in scalars) encoder.SetBytes(sc, (ulong)idx++);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+    }
+
+    private static MetalGpuBuffer M(IGpuBuffer b) => (MetalGpuBuffer)b;
+
+    public void GlaScanForward(
+        IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer gate, IGpuBuffer output,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim)
+        => DispatchRecurrence("gla_scan_forward", batch * numHeads * headDim,
+            new[] { M(q), M(k), M(v), M(gate), M(output) },
+            new[] { batch, seqLen, modelDim, numHeads, headDim });
+
+    // GLA BPTT backward — real MSL kernels (recompute trajectory + reverse sweep with CAS float
+    // atomics for the cross-row dQ/dK/dG). dQ/dK/dG must be pre-zeroed (the atomic accumulators).
+    public void GlaScanBackward(
+        IGpuBuffer dOut, IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer gate,
+        IGpuBuffer dQ, IGpuBuffer dK, IGpuBuffer dV, IGpuBuffer dG,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim)
+    {
+        if (batch <= 0 || seqLen <= 0 || modelDim <= 0 || numHeads <= 0 || headDim <= 0)
+            throw new ArgumentOutOfRangeException(nameof(batch), "GLA dimensions must be positive.");
+        int hh = headDim * headDim;
+        long totalLong = checked((long)batch * numHeads * headDim);
+        long trajLenLong = checked((long)batch * numHeads * seqLen * hh);
+        if (totalLong > int.MaxValue || trajLenLong > int.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(batch), "GLA dimensions exceed Metal launch/buffer limits.");
+        int total = (int)totalLong;
+        // dQ/dK/dG are atomic accumulators in the backward kernel — zero them here so the
+        // method is self-contained and correct even if the caller reuses dirty buffers.
+        Fill(dQ, 0f, batch * seqLen * modelDim);
+        Fill(dK, 0f, batch * seqLen * modelDim);
+        Fill(dG, 0f, batch * seqLen * numHeads);
+        using var traj = AllocateBuffer((int)trajLenLong);
+        DispatchRecurrence("gla_scan_recompute", total,
+            new[] { M(k), M(v), M(gate), M(traj) },
+            new[] { batch, seqLen, modelDim, numHeads, headDim });
+        DispatchRecurrence("gla_scan_backward", total,
+            new[] { M(dOut), M(q), M(k), M(v), M(gate), M(traj), M(dQ), M(dK), M(dV), M(dG) },
+            new[] { batch, seqLen, modelDim, numHeads, headDim });
+    }
+
+    public void XLstmScanForward(
+        IGpuBuffer q, IGpuBuffer k, IGpuBuffer v,
+        IGpuBuffer iGate, IGpuBuffer fGate, IGpuBuffer oGate, IGpuBuffer output,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim)
+        => DispatchRecurrence("xlstm_scan_forward", batch * numHeads,
+            new[] { M(q), M(k), M(v), M(iGate), M(fGate), M(oGate), M(output) },
+            new[] { batch, seqLen, modelDim, numHeads, headDim });
+
+    public void GatedDeltaNetScanForward(
+        IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer alpha, IGpuBuffer beta, IGpuBuffer output,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim)
+        => DispatchRecurrence("gated_delta_scan_forward", batch * numHeads * headDim,
+            new[] { M(q), M(k), M(v), M(alpha), M(beta), M(output) },
+            new[] { batch, seqLen, modelDim, numHeads, headDim });
+
+    public void RgLruScanForward(
+        IGpuBuffer value, IGpuBuffer recGate, IGpuBuffer inpGate, IGpuBuffer decay, IGpuBuffer output,
+        int batch, int seqLen, int recDim)
+        => DispatchRecurrence("rglru_scan_forward", batch * recDim,
+            new[] { M(value), M(recGate), M(inpGate), M(decay), M(output) },
+            new[] { batch, seqLen, recDim });
+
+    public void Rwkv4WkvForward(
+        IGpuBuffer r, IGpuBuffer k, IGpuBuffer v, IGpuBuffer timeDecay, IGpuBuffer timeFirst, IGpuBuffer output,
+        int batch, int seqLen, int modelDim)
+        => DispatchRecurrence("rwkv4_wkv_forward", batch * modelDim,
+            new[] { M(r), M(k), M(v), M(timeDecay), M(timeFirst), M(output) },
+            new[] { batch, seqLen, modelDim });
+
+    public void MambaSelectiveScanForward(
+        IGpuBuffer x, IGpuBuffer delta, IGpuBuffer aLog, IGpuBuffer bParam, IGpuBuffer cParam, IGpuBuffer dParam,
+        IGpuBuffer output, int batch, int seqLen, int innerDim, int stateDim)
+        => DispatchRecurrence("mamba_selective_scan_forward", batch * innerDim,
+            new[] { M(x), M(delta), M(aLog), M(bParam), M(cParam), M(dParam), M(output) },
+            new[] { batch, seqLen, innerDim, stateDim });
+
+    public void Mamba2SsdScanForward(
+        IGpuBuffer x, IGpuBuffer delta, IGpuBuffer aLog, IGpuBuffer bParam, IGpuBuffer cParam, IGpuBuffer dParam,
+        IGpuBuffer output, int batch, int seqLen, int innerDim, int numHeads, int headDim, int stateDim)
+        => DispatchRecurrence("mamba2_ssd_scan_forward", batch * innerDim,
+            new[] { M(x), M(delta), M(aLog), M(bParam), M(cParam), M(dParam), M(output) },
+            new[] { batch, seqLen, innerDim, numHeads, headDim, stateDim });
+
+    // CE kernels write a per-row loss vector; the host sums the N-element vector (the expensive
+    // logit work stays on the GPU). Returns the mean cross-entropy.
+    public float FusedLinearCrossEntropyIndex(
+        IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer targetIds, int n, int d, int vocab)
+        => FusedCeRowLoss("fused_linear_ce_index", hidden, weight, bias, targetIds, n, d, vocab);
+
+    public float FusedLinearCrossEntropyDense(
+        IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer target, int n, int d, int vocab)
+        => FusedCeRowLoss("fused_linear_ce_dense", hidden, weight, bias, target, n, d, vocab);
+
+    private float FusedCeRowLoss(
+        string kernelName, IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer tgt, int n, int d, int vocab)
+    {
+        if (n <= 0 || d <= 0 || vocab <= 0)
+            throw new ArgumentOutOfRangeException(nameof(n), "Fused CE dimensions (n, d, vocab) must be positive.");
+        using var rowLoss = AllocateBuffer(n);
+        DispatchRecurrence(kernelName, n,
+            new[] { M(hidden), M(weight), M(bias), M(tgt), M(rowLoss) }, new[] { n, d, vocab });
+        var rl = DownloadBuffer(rowLoss);
+        double sum = 0.0;
+        for (int i = 0; i < n; i++) sum += rl[i];
+        return (float)(sum / n);
+    }
+
     /// <summary>
     /// Forward pass for LSTM sequence - processes all timesteps in a single kernel launch.
     /// Efficient for BPTT training with minimal kernel launch overhead.

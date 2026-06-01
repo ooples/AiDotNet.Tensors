@@ -789,6 +789,120 @@ public sealed partial class WebGpuBackend
 
     #region RNN Operations
 
+    // ── Fused recurrence / LM-head GPU kernels (#1464) ─────────────────────────────────────
+    // Real WGSL compute shaders (WebGpuRecurrenceKernels). Int params come in via a uniform struct
+    // bound after the storage buffers. Forward only — the differentiable backward runs through the
+    // CpuEngine tape (the engine override is forward-only and defers to base under a tape).
+
+    private async Task DispatchRecurrenceAsync(string key, string wgsl, int total, IGpuBuffer[] buffers, int[] scalars)
+    {
+        var pipe = await GetOrCreatePipelineAsync("Recurrence:" + key, wgsl, "main");
+        using var uniforms = new WebGpuBuffer(UniformInts(scalars), WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst);
+        var wb = new WebGpuBuffer[buffers.Length];
+        for (int i = 0; i < buffers.Length; i++) wb[i] = AsWgpu(buffers[i]);
+        using var bind = new WebGpuBindGroup(pipe, wb);
+        var (wg, _) = _device.CalculateWorkgroups1D(total);
+        await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(pipe, bind.BindGroupId, uniforms.BufferId, wg, 1, 1);
+        await WebGpuNativeBindings.SubmitAndWaitAsync();
+    }
+
+    private void DispatchRecurrence(string key, string wgsl, int total, IGpuBuffer[] buffers, int[] scalars)
+        => DispatchRecurrenceAsync(key, wgsl, total, buffers, scalars).GetAwaiter().GetResult();
+
+    public void GlaScanForward(
+        IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer gate, IGpuBuffer output,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim)
+        => DispatchRecurrence("gla", WebGpuRecurrenceKernels.GlaScan, batch * numHeads * headDim,
+            new[] { q, k, v, gate, output }, new[] { batch, seqLen, modelDim, numHeads, headDim });
+
+    // GLA BPTT backward — real WGSL kernels (recompute trajectory + reverse sweep with bitcast-CAS
+    // u32 float atomics for the cross-row dQ/dK/dG). dQ/dK/dG must be pre-zeroed (the accumulators).
+    public void GlaScanBackward(
+        IGpuBuffer dOut, IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer gate,
+        IGpuBuffer dQ, IGpuBuffer dK, IGpuBuffer dV, IGpuBuffer dG,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim)
+    {
+        if (batch <= 0 || seqLen <= 0 || modelDim <= 0 || numHeads <= 0 || headDim <= 0)
+            throw new ArgumentOutOfRangeException(nameof(batch), "GLA dimensions must be positive.");
+        int hh = headDim * headDim;
+        long totalLong = checked((long)batch * numHeads * headDim);
+        long trajLenLong = checked((long)batch * numHeads * seqLen * hh);
+        if (totalLong > int.MaxValue || trajLenLong > int.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(batch), "GLA dimensions exceed WebGPU launch/buffer limits.");
+        int total = (int)totalLong;
+        // dQ/dK/dG are atomic accumulators in the backward kernel — zero them here so the
+        // method is self-contained and correct even if the caller reuses dirty buffers.
+        Fill(dQ, 0f, batch * seqLen * modelDim);
+        Fill(dK, 0f, batch * seqLen * modelDim);
+        Fill(dG, 0f, batch * seqLen * numHeads);
+        using var traj = AllocateBuffer((int)trajLenLong);
+        var pc = new[] { batch, seqLen, modelDim, numHeads, headDim };
+        DispatchRecurrence("gla_recompute", WebGpuRecurrenceKernels.GlaRecompute, total,
+            new[] { k, v, gate, traj }, pc);
+        DispatchRecurrence("gla_backward", WebGpuRecurrenceKernels.GlaBackward, total,
+            new[] { dOut, q, k, v, gate, traj, dQ, dK, dV, dG }, pc);
+    }
+
+    public void XLstmScanForward(
+        IGpuBuffer q, IGpuBuffer k, IGpuBuffer v,
+        IGpuBuffer iGate, IGpuBuffer fGate, IGpuBuffer oGate, IGpuBuffer output,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim)
+        => DispatchRecurrence("xlstm", WebGpuRecurrenceKernels.XLstmScan, batch * numHeads,
+            new[] { q, k, v, iGate, fGate, oGate, output }, new[] { batch, seqLen, modelDim, numHeads, headDim });
+
+    public void GatedDeltaNetScanForward(
+        IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer alpha, IGpuBuffer beta, IGpuBuffer output,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim)
+        => DispatchRecurrence("gdn", WebGpuRecurrenceKernels.GatedDeltaScan, batch * numHeads * headDim,
+            new[] { q, k, v, alpha, beta, output }, new[] { batch, seqLen, modelDim, numHeads, headDim });
+
+    public void RgLruScanForward(
+        IGpuBuffer value, IGpuBuffer recGate, IGpuBuffer inpGate, IGpuBuffer decay, IGpuBuffer output,
+        int batch, int seqLen, int recDim)
+        => DispatchRecurrence("rglru", WebGpuRecurrenceKernels.RgLruScan, batch * recDim,
+            new[] { value, recGate, inpGate, decay, output }, new[] { batch, seqLen, recDim });
+
+    public void Rwkv4WkvForward(
+        IGpuBuffer r, IGpuBuffer k, IGpuBuffer v, IGpuBuffer timeDecay, IGpuBuffer timeFirst, IGpuBuffer output,
+        int batch, int seqLen, int modelDim)
+        => DispatchRecurrence("rwkv4", WebGpuRecurrenceKernels.Rwkv4Wkv, batch * modelDim,
+            new[] { r, k, v, timeDecay, timeFirst, output }, new[] { batch, seqLen, modelDim });
+
+    public void MambaSelectiveScanForward(
+        IGpuBuffer x, IGpuBuffer delta, IGpuBuffer aLog, IGpuBuffer bParam, IGpuBuffer cParam, IGpuBuffer dParam,
+        IGpuBuffer output, int batch, int seqLen, int innerDim, int stateDim)
+        => DispatchRecurrence("mamba", WebGpuRecurrenceKernels.MambaScan, batch * innerDim,
+            new[] { x, delta, aLog, bParam, cParam, dParam, output }, new[] { batch, seqLen, innerDim, stateDim });
+
+    public void Mamba2SsdScanForward(
+        IGpuBuffer x, IGpuBuffer delta, IGpuBuffer aLog, IGpuBuffer bParam, IGpuBuffer cParam, IGpuBuffer dParam,
+        IGpuBuffer output, int batch, int seqLen, int innerDim, int numHeads, int headDim, int stateDim)
+        => DispatchRecurrence("mamba2", WebGpuRecurrenceKernels.Mamba2Ssd, batch * innerDim,
+            new[] { x, delta, aLog, bParam, cParam, dParam, output },
+            new[] { batch, seqLen, innerDim, numHeads, headDim, stateDim });
+
+    public float FusedLinearCrossEntropyIndex(
+        IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer targetIds, int n, int d, int vocab)
+        => FusedCeRowLoss("ce_index", WebGpuRecurrenceKernels.FusedCeIndex, hidden, weight, bias, targetIds, n, d, vocab);
+
+    public float FusedLinearCrossEntropyDense(
+        IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer target, int n, int d, int vocab)
+        => FusedCeRowLoss("ce_dense", WebGpuRecurrenceKernels.FusedCeDense, hidden, weight, bias, target, n, d, vocab);
+
+    // CE kernels write a per-row loss vector; the host sums the N-element vector. Returns mean CE.
+    private float FusedCeRowLoss(
+        string key, string wgsl, IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer tgt, int n, int d, int vocab)
+    {
+        if (n <= 0 || d <= 0 || vocab <= 0)
+            throw new ArgumentOutOfRangeException(nameof(n), "Fused CE dimensions (n, d, vocab) must be positive.");
+        using var rowLoss = AllocateBuffer(n);
+        DispatchRecurrence(key, wgsl, n, new[] { hidden, weight, bias, tgt, rowLoss }, new[] { n, d, vocab });
+        var rl = DownloadBuffer(rowLoss);
+        double sum = 0.0;
+        for (int i = 0; i < n; i++) sum += rl[i];
+        return (float)(sum / n);
+    }
+
     public void LstmForwardSequence(
         IGpuBuffer input, IGpuBuffer hInit, IGpuBuffer cInit,
         IGpuBuffer weightsIh, IGpuBuffer weightsHh, IGpuBuffer biasIh, IGpuBuffer biasHh,

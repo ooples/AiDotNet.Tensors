@@ -88,6 +88,16 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     private IntPtr _softmaxVarModule;
     private IntPtr _fusedLinearModule;
     private IntPtr _fusedAdvancedModule;
+    // Fused recurrence kernels (#1464): GLA / xLSTM / GatedDeltaNet / RgLRU /
+    // RWKV-4 WKV / Mamba / Mamba-2 SSD / fused-linear-cross-entropy scans.
+    private IntPtr _glaModule;
+    private IntPtr _xlstmModule;
+    private IntPtr _gatedDeltaNetModule;
+    private IntPtr _rgLruModule;
+    private IntPtr _rwkv4Module;
+    private IntPtr _mambaModule;
+    private IntPtr _mamba2Module;
+    private IntPtr _fusedCeModule;
     // True iff the fused-advanced kernel module compiled and registered
     // successfully on this device. Public surface methods gate on this so a
     // partial / failed compile surfaces a clear NotSupportedException at the
@@ -526,6 +536,38 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             // Compile LSTM sequence kernels (forward/backward for BPTT training)
             CompileKernelModule(HipLstmKernels.GetSource(), "lstm", ref _lstmModule,
                 HipLstmKernels.GetKernelNames());
+
+            // Compile fused GLA (Gated Linear Attention) scan kernels (#1464)
+            CompileKernelModule(Kernels.HipGlaKernels.GetSource(), "gla", ref _glaModule,
+                Kernels.HipGlaKernels.GetKernelNames());
+
+            // Compile fused xLSTM (mLSTM) scan kernels (#1464)
+            CompileKernelModule(Kernels.HipXLstmKernels.GetSource(), "xlstm", ref _xlstmModule,
+                Kernels.HipXLstmKernels.GetKernelNames());
+
+            // Compile fused Gated DeltaNet scan kernels (#1464)
+            CompileKernelModule(Kernels.HipGatedDeltaNetKernels.GetSource(), "gated_delta_net", ref _gatedDeltaNetModule,
+                Kernels.HipGatedDeltaNetKernels.GetKernelNames());
+
+            // Compile fused RG-LRU scan kernels (#1464)
+            CompileKernelModule(Kernels.HipRgLruKernels.GetSource(), "rglru", ref _rgLruModule,
+                Kernels.HipRgLruKernels.GetKernelNames());
+
+            // Compile fused RWKV-4 WKV scan kernels (#1464)
+            CompileKernelModule(Kernels.HipRwkv4Kernels.GetSource(), "rwkv4", ref _rwkv4Module,
+                Kernels.HipRwkv4Kernels.GetKernelNames());
+
+            // Compile fused Mamba selective scan kernels (#1464)
+            CompileKernelModule(Kernels.HipMambaKernels.GetSource(), "mamba", ref _mambaModule,
+                Kernels.HipMambaKernels.GetKernelNames());
+
+            // Compile fused Mamba-2 SSD scan kernels (#1464)
+            CompileKernelModule(Kernels.HipMamba2Kernels.GetSource(), "mamba2", ref _mamba2Module,
+                Kernels.HipMamba2Kernels.GetKernelNames());
+
+            // Compile fused linear + cross-entropy kernels (#1464)
+            CompileKernelModule(Kernels.HipFusedLinearCeKernels.GetSource(), "fused_ce", ref _fusedCeModule,
+                Kernels.HipFusedLinearCeKernels.GetKernelNames());
 
             // Compile Fused Linear + Activation kernels
             CompileKernelModule(Kernels.HipFusedLinearKernels.GetSource(), "fused_linear", ref _fusedLinearModule,
@@ -10567,6 +10609,49 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         {
             HipNativeBindings.hipModuleUnload(_gruModule);
             _gruModule = IntPtr.Zero;
+        }
+
+        // Fused recurrence kernels (#1464): unload each loaded module so repeated
+        // backend create/dispose cycles don't leak HIP module handles.
+        if (_glaModule != IntPtr.Zero)
+        {
+            HipNativeBindings.hipModuleUnload(_glaModule);
+            _glaModule = IntPtr.Zero;
+        }
+        if (_xlstmModule != IntPtr.Zero)
+        {
+            HipNativeBindings.hipModuleUnload(_xlstmModule);
+            _xlstmModule = IntPtr.Zero;
+        }
+        if (_gatedDeltaNetModule != IntPtr.Zero)
+        {
+            HipNativeBindings.hipModuleUnload(_gatedDeltaNetModule);
+            _gatedDeltaNetModule = IntPtr.Zero;
+        }
+        if (_rgLruModule != IntPtr.Zero)
+        {
+            HipNativeBindings.hipModuleUnload(_rgLruModule);
+            _rgLruModule = IntPtr.Zero;
+        }
+        if (_rwkv4Module != IntPtr.Zero)
+        {
+            HipNativeBindings.hipModuleUnload(_rwkv4Module);
+            _rwkv4Module = IntPtr.Zero;
+        }
+        if (_mambaModule != IntPtr.Zero)
+        {
+            HipNativeBindings.hipModuleUnload(_mambaModule);
+            _mambaModule = IntPtr.Zero;
+        }
+        if (_mamba2Module != IntPtr.Zero)
+        {
+            HipNativeBindings.hipModuleUnload(_mamba2Module);
+            _mamba2Module = IntPtr.Zero;
+        }
+        if (_fusedCeModule != IntPtr.Zero)
+        {
+            HipNativeBindings.hipModuleUnload(_fusedCeModule);
+            _fusedCeModule = IntPtr.Zero;
         }
 
         if (_capsuleModule != IntPtr.Zero)

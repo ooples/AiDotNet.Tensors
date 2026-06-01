@@ -58,6 +58,14 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     private IntPtr _capsuleModule;
     private IntPtr _specializedModule;
     private IntPtr _lstmModule;
+    private IntPtr _glaModule; // fused GLA scan kernels (#1464)
+    private IntPtr _xlstmModule; // fused xLSTM scan kernels (#1464)
+    private IntPtr _gatedDeltaNetModule; // fused Gated DeltaNet scan kernels (#1464)
+    private IntPtr _rgLruModule; // fused RG-LRU scan kernels (#1464)
+    private IntPtr _rwkv4Module; // fused RWKV-4 WKV scan kernels (#1464)
+    private IntPtr _mambaModule; // fused Mamba selective scan kernels (#1464)
+    private IntPtr _mamba2Module; // fused Mamba-2 SSD scan kernels (#1464)
+    private IntPtr _fusedCeModule; // fused linear + cross-entropy kernels (#1464)
     private IntPtr _gruModule;
     private IntPtr _snnModule;
     private IntPtr _fp16Module;
@@ -761,6 +769,24 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         catch
         {
             // LSTM kernels may need special headers — optional.
+        }
+
+        // Compile fused recurrence / LM-head kernels (#1464) in their OWN try/catch so an
+        // optional-LSTM compile failure above doesn't also disable the recurrence family.
+        try
+        {
+            _glaModule = CompileKernelModule(device, Kernels.CudaGlaKernels.GetSource(), "gla_kernels", Kernels.CudaGlaKernels.GetKernelNames());
+            _xlstmModule = CompileKernelModule(device, Kernels.CudaXLstmKernels.GetSource(), "xlstm_kernels", Kernels.CudaXLstmKernels.GetKernelNames());
+            _gatedDeltaNetModule = CompileKernelModule(device, Kernels.CudaGatedDeltaNetKernels.GetSource(), "gated_delta_net_kernels", Kernels.CudaGatedDeltaNetKernels.GetKernelNames());
+            _rgLruModule = CompileKernelModule(device, Kernels.CudaRgLruKernels.GetSource(), "rglru_kernels", Kernels.CudaRgLruKernels.GetKernelNames());
+            _rwkv4Module = CompileKernelModule(device, Kernels.CudaRwkv4Kernels.GetSource(), "rwkv4_kernels", Kernels.CudaRwkv4Kernels.GetKernelNames());
+            _mambaModule = CompileKernelModule(device, Kernels.CudaMambaKernels.GetSource(), "mamba_kernels", Kernels.CudaMambaKernels.GetKernelNames());
+            _mamba2Module = CompileKernelModule(device, Kernels.CudaMamba2Kernels.GetSource(), "mamba2_kernels", Kernels.CudaMamba2Kernels.GetKernelNames());
+            _fusedCeModule = CompileKernelModule(device, Kernels.CudaFusedLinearCeKernels.GetSource(), "fused_ce_kernels", Kernels.CudaFusedLinearCeKernels.GetKernelNames());
+        }
+        catch
+        {
+            // Fused recurrence / LM-head kernels are optional.
         }
 
         // Compile GRU sequence kernels (forward/backward for BPTT training)
@@ -11863,6 +11889,248 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     #region RNN (LSTM/GRU) Sequence Operations
 
+    // ── Fused GLA (Gated Linear Attention) scan (#1464) ────────────────────────────────────
+    public unsafe void GlaScanForward(
+        IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer gate, IGpuBuffer output,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim)
+    {
+        if (batch <= 0 || seqLen <= 0 || modelDim <= 0 || numHeads <= 0 || headDim <= 0)
+            throw new ArgumentOutOfRangeException(nameof(batch), "GLA dimensions must be positive.");
+        if (modelDim != numHeads * headDim)
+            throw new ArgumentException($"modelDim ({modelDim}) must equal numHeads * headDim ({numHeads * headDim}).");
+        if (headDim > Kernels.CudaGlaKernels.MaxHeadDim)
+            throw new InvalidOperationException(
+                $"GLA headDim ({headDim}) exceeds max ({Kernels.CudaGlaKernels.MaxHeadDim}).");
+
+        long tokenCount = checked((long)batch * seqLen);
+        long qkvElems = checked(tokenCount * modelDim);
+        long gateElems = checked(tokenCount * numHeads);
+        if (q.Size < qkvElems || k.Size < qkvElems || v.Size < qkvElems || output.Size < qkvElems)
+            throw new ArgumentException("Q/K/V/output buffer is too small for the requested GLA shape.");
+        if (gate.Size < gateElems)
+            throw new ArgumentException("gate buffer is too small for the requested GLA shape.");
+
+        if (!_kernelCache.TryGetValue("gla_scan_forward", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: gla_scan_forward");
+
+        using var _ = PushContext();
+        IntPtr pq = q.Handle, pk = k.Handle, pv = v.Handle, pg = gate.Handle, po = output.Handle;
+        void** args = stackalloc void*[10];
+        args[0] = &pq; args[1] = &pk; args[2] = &pv; args[3] = &pg; args[4] = &po;
+        args[5] = &batch; args[6] = &seqLen; args[7] = &modelDim; args[8] = &numHeads; args[9] = &headDim;
+        uint total = (uint)(batch * numHeads * headDim);
+        LaunchKernel(kernel, (total + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize, (uint)DefaultBlockSize, args);
+    }
+
+    // dQ/dK/dV ([batch,seqLen,modelDim]) and dG ([batch,seqLen,numHeads]); dQ/dK/dG are the
+    // atomic accumulators and are zeroed internally below (no caller pre-zeroing required).
+    public unsafe void GlaScanBackward(
+        IGpuBuffer dOut, IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer gate,
+        IGpuBuffer dQ, IGpuBuffer dK, IGpuBuffer dV, IGpuBuffer dG,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim)
+    {
+        if (batch <= 0 || seqLen <= 0 || modelDim <= 0 || numHeads <= 0 || headDim <= 0)
+            throw new ArgumentOutOfRangeException(nameof(batch), "GLA dimensions must be positive.");
+        if (modelDim != numHeads * headDim)
+            throw new ArgumentException($"modelDim ({modelDim}) must equal numHeads * headDim ({numHeads * headDim}).");
+        if (headDim > Kernels.CudaGlaKernels.MaxHeadDim)
+            throw new InvalidOperationException(
+                $"GLA headDim ({headDim}) exceeds max ({Kernels.CudaGlaKernels.MaxHeadDim}).");
+        if (!_kernelCache.TryGetValue("gla_scan_recompute", out var recompute) ||
+            !_kernelCache.TryGetValue("gla_scan_backward", out var backward))
+            throw new InvalidOperationException("CUDA kernel not found: gla_scan_recompute / gla_scan_backward");
+
+        using var _ = PushContext();
+        // dQ/dK/dG are atomic accumulators in the backward kernel — zero them here so the
+        // method is self-contained and correct even if the caller reuses dirty buffers.
+        Fill(dQ, 0f, batch * seqLen * modelDim);
+        Fill(dK, 0f, batch * seqLen * modelDim);
+        Fill(dG, 0f, batch * seqLen * numHeads);
+        long trajLenL = checked((long)batch * numHeads * seqLen * headDim * headDim);
+        if (trajLenL > int.MaxValue)
+            throw new ArgumentException("GLA trajectory buffer is too large for a single allocation.");
+        int trajLen = (int)trajLenL;
+        using var trajBuf = AllocateBuffer(trajLen);
+        uint total = (uint)(batch * numHeads * headDim);
+        uint grid = (total + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize;
+
+        IntPtr pk = k.Handle, pv = v.Handle, pg = gate.Handle, ptr = trajBuf.Handle;
+        void** ra = stackalloc void*[9];
+        ra[0] = &pk; ra[1] = &pv; ra[2] = &pg; ra[3] = &ptr;
+        ra[4] = &batch; ra[5] = &seqLen; ra[6] = &modelDim; ra[7] = &numHeads; ra[8] = &headDim;
+        LaunchKernel(recompute, grid, (uint)DefaultBlockSize, ra);
+
+        IntPtr pdo = dOut.Handle, pq = q.Handle;
+        IntPtr pdq = dQ.Handle, pdk = dK.Handle, pdv = dV.Handle, pdg = dG.Handle;
+        void** ba = stackalloc void*[15];
+        ba[0] = &pdo; ba[1] = &pq; ba[2] = &pk; ba[3] = &pv; ba[4] = &pg; ba[5] = &ptr;
+        ba[6] = &pdq; ba[7] = &pdk; ba[8] = &pdv; ba[9] = &pdg;
+        ba[10] = &batch; ba[11] = &seqLen; ba[12] = &modelDim; ba[13] = &numHeads; ba[14] = &headDim;
+        LaunchKernel(backward, grid, (uint)DefaultBlockSize, ba);
+    }
+
+    // ── Fused xLSTM (mLSTM) scan forward (#1464) ───────────────────────────────────────────
+    public unsafe void XLstmScanForward(
+        IGpuBuffer q, IGpuBuffer k, IGpuBuffer v,
+        IGpuBuffer iGate, IGpuBuffer fGate, IGpuBuffer oGate, IGpuBuffer output,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim)
+    {
+        if (batch <= 0 || seqLen <= 0 || modelDim <= 0 || numHeads <= 0 || headDim <= 0)
+            throw new ArgumentOutOfRangeException(nameof(batch), "xLSTM dimensions must be positive.");
+        if (modelDim != numHeads * headDim)
+            throw new ArgumentException($"modelDim ({modelDim}) must equal numHeads * headDim ({numHeads * headDim}).");
+        if (headDim > Kernels.CudaXLstmKernels.MaxHeadDim)
+            throw new InvalidOperationException(
+                $"xLSTM headDim ({headDim}) exceeds max ({Kernels.CudaXLstmKernels.MaxHeadDim}).");
+        if (!_kernelCache.TryGetValue("xlstm_scan_forward", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: xlstm_scan_forward");
+
+        using var _ = PushContext();
+        IntPtr pq = q.Handle, pk = k.Handle, pv = v.Handle;
+        IntPtr pi = iGate.Handle, pf = fGate.Handle, po = oGate.Handle, pout = output.Handle;
+        void** args = stackalloc void*[12];
+        args[0] = &pq; args[1] = &pk; args[2] = &pv; args[3] = &pi; args[4] = &pf; args[5] = &po; args[6] = &pout;
+        args[7] = &batch; args[8] = &seqLen; args[9] = &modelDim; args[10] = &numHeads; args[11] = &headDim;
+        uint total = (uint)(batch * numHeads);
+        LaunchKernel(kernel, (total + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize, (uint)DefaultBlockSize, args);
+    }
+
+    // ── Fused Gated DeltaNet scan forward (#1464) ──────────────────────────────────────────
+    public unsafe void GatedDeltaNetScanForward(
+        IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer alpha, IGpuBuffer beta, IGpuBuffer output,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim)
+    {
+        if (batch <= 0 || seqLen <= 0 || modelDim <= 0 || numHeads <= 0 || headDim <= 0)
+            throw new ArgumentOutOfRangeException(nameof(batch), "GatedDeltaNet dimensions must be positive.");
+        if (modelDim != numHeads * headDim)
+            throw new ArgumentException($"modelDim ({modelDim}) must equal numHeads * headDim ({numHeads * headDim}).");
+        if (headDim > Kernels.CudaGatedDeltaNetKernels.MaxHeadDim)
+            throw new InvalidOperationException(
+                $"GatedDeltaNet headDim ({headDim}) exceeds max ({Kernels.CudaGatedDeltaNetKernels.MaxHeadDim}).");
+        if (!_kernelCache.TryGetValue("gated_delta_scan_forward", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: gated_delta_scan_forward");
+
+        using var _ = PushContext();
+        IntPtr pq = q.Handle, pk = k.Handle, pv = v.Handle, pa = alpha.Handle, pb = beta.Handle, pout = output.Handle;
+        void** args = stackalloc void*[11];
+        args[0] = &pq; args[1] = &pk; args[2] = &pv; args[3] = &pa; args[4] = &pb; args[5] = &pout;
+        args[6] = &batch; args[7] = &seqLen; args[8] = &modelDim; args[9] = &numHeads; args[10] = &headDim;
+        uint total = (uint)(batch * numHeads * headDim);
+        LaunchKernel(kernel, (total + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize, (uint)DefaultBlockSize, args);
+    }
+
+    // ── Fused RG-LRU scan forward (#1464) ──────────────────────────────────────────────────
+    public unsafe void RgLruScanForward(
+        IGpuBuffer value, IGpuBuffer recGate, IGpuBuffer inpGate, IGpuBuffer decay, IGpuBuffer output,
+        int batch, int seqLen, int recDim)
+    {
+        if (batch <= 0 || seqLen <= 0 || recDim <= 0)
+            throw new ArgumentOutOfRangeException(nameof(batch), "RG-LRU dimensions must be positive.");
+        if (!_kernelCache.TryGetValue("rglru_scan_forward", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: rglru_scan_forward");
+
+        using var _ = PushContext();
+        IntPtr pv = value.Handle, pr = recGate.Handle, pi = inpGate.Handle, pd = decay.Handle, pout = output.Handle;
+        void** args = stackalloc void*[8];
+        args[0] = &pv; args[1] = &pr; args[2] = &pi; args[3] = &pd; args[4] = &pout;
+        args[5] = &batch; args[6] = &seqLen; args[7] = &recDim;
+        uint total = (uint)(batch * recDim);
+        LaunchKernel(kernel, (total + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize, (uint)DefaultBlockSize, args);
+    }
+
+    // ── Fused RWKV-4 WKV scan forward (#1464) ──────────────────────────────────────────────
+    public unsafe void Rwkv4WkvForward(
+        IGpuBuffer r, IGpuBuffer k, IGpuBuffer v, IGpuBuffer timeDecay, IGpuBuffer timeFirst, IGpuBuffer output,
+        int batch, int seqLen, int modelDim)
+    {
+        if (batch <= 0 || seqLen <= 0 || modelDim <= 0)
+            throw new ArgumentOutOfRangeException(nameof(batch), "RWKV-4 dimensions must be positive.");
+        if (!_kernelCache.TryGetValue("rwkv4_wkv_forward", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: rwkv4_wkv_forward");
+
+        using var _ = PushContext();
+        IntPtr pr = r.Handle, pk = k.Handle, pv = v.Handle, pd = timeDecay.Handle, pf = timeFirst.Handle, pout = output.Handle;
+        void** args = stackalloc void*[9];
+        args[0] = &pr; args[1] = &pk; args[2] = &pv; args[3] = &pd; args[4] = &pf; args[5] = &pout;
+        args[6] = &batch; args[7] = &seqLen; args[8] = &modelDim;
+        uint total = (uint)(batch * modelDim);
+        LaunchKernel(kernel, (total + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize, (uint)DefaultBlockSize, args);
+    }
+
+    // ── Fused Mamba selective scan forward (#1464) ─────────────────────────────────────────
+    public unsafe void MambaSelectiveScanForward(
+        IGpuBuffer x, IGpuBuffer delta, IGpuBuffer aLog, IGpuBuffer bParam, IGpuBuffer cParam, IGpuBuffer dParam,
+        IGpuBuffer output, int batch, int seqLen, int innerDim, int stateDim)
+    {
+        if (batch <= 0 || seqLen <= 0 || innerDim <= 0 || stateDim <= 0)
+            throw new ArgumentOutOfRangeException(nameof(batch), "Mamba dimensions must be positive.");
+        if (stateDim > Kernels.CudaMambaKernels.MaxStateDim)
+            throw new InvalidOperationException(
+                $"Mamba stateDim ({stateDim}) exceeds max ({Kernels.CudaMambaKernels.MaxStateDim}).");
+        if (!_kernelCache.TryGetValue("mamba_selective_scan_forward", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: mamba_selective_scan_forward");
+
+        using var _ = PushContext();
+        IntPtr px = x.Handle, pdt = delta.Handle, pa = aLog.Handle, pb = bParam.Handle, pc = cParam.Handle, pd = dParam.Handle, pout = output.Handle;
+        void** args = stackalloc void*[11];
+        args[0] = &px; args[1] = &pdt; args[2] = &pa; args[3] = &pb; args[4] = &pc; args[5] = &pd; args[6] = &pout;
+        args[7] = &batch; args[8] = &seqLen; args[9] = &innerDim; args[10] = &stateDim;
+        uint total = (uint)(batch * innerDim);
+        LaunchKernel(kernel, (total + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize, (uint)DefaultBlockSize, args);
+    }
+
+    // ── Fused Mamba-2 SSD scan forward (#1464) ─────────────────────────────────────────────
+    public unsafe void Mamba2SsdScanForward(
+        IGpuBuffer x, IGpuBuffer delta, IGpuBuffer aLog, IGpuBuffer bParam, IGpuBuffer cParam, IGpuBuffer dParam,
+        IGpuBuffer output, int batch, int seqLen, int innerDim, int numHeads, int headDim, int stateDim)
+    {
+        if (batch <= 0 || seqLen <= 0 || innerDim <= 0 || numHeads <= 0 || headDim <= 0 || stateDim <= 0)
+            throw new ArgumentOutOfRangeException(nameof(batch), "Mamba-2 dimensions must be positive.");
+        if (innerDim != numHeads * headDim)
+            throw new ArgumentException($"innerDim ({innerDim}) must equal numHeads * headDim ({numHeads * headDim}).");
+        if (stateDim > Kernels.CudaMamba2Kernels.MaxStateDim)
+            throw new InvalidOperationException(
+                $"Mamba-2 stateDim ({stateDim}) exceeds max ({Kernels.CudaMamba2Kernels.MaxStateDim}).");
+        if (!_kernelCache.TryGetValue("mamba2_ssd_scan_forward", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: mamba2_ssd_scan_forward");
+
+        using var _ = PushContext();
+        IntPtr px = x.Handle, pdt = delta.Handle, pa = aLog.Handle, pb = bParam.Handle, pc = cParam.Handle, pd = dParam.Handle, pout = output.Handle;
+        void** args = stackalloc void*[13];
+        args[0] = &px; args[1] = &pdt; args[2] = &pa; args[3] = &pb; args[4] = &pc; args[5] = &pd; args[6] = &pout;
+        args[7] = &batch; args[8] = &seqLen; args[9] = &innerDim; args[10] = &numHeads; args[11] = &headDim; args[12] = &stateDim;
+        uint total = (uint)(batch * innerDim);
+        LaunchKernel(kernel, (total + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize, (uint)DefaultBlockSize, args);
+    }
+
+    // ── Fused linear (LM head) + cross-entropy (#1464) ─────────────────────────────────────
+    public unsafe float FusedLinearCrossEntropyIndex(
+        IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer targetIds, int n, int d, int vocab)
+        => FusedCeLaunch("fused_linear_ce_index", hidden, weight, bias, targetIds, n, d, vocab);
+
+    public unsafe float FusedLinearCrossEntropyDense(
+        IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer target, int n, int d, int vocab)
+        => FusedCeLaunch("fused_linear_ce_dense", hidden, weight, bias, target, n, d, vocab);
+
+    private unsafe float FusedCeLaunch(
+        string kernelName, IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer tgt, int n, int d, int vocab)
+    {
+        if (n <= 0 || d <= 0 || vocab <= 0)
+            throw new ArgumentOutOfRangeException(nameof(n), "Fused CE dimensions (n, d, vocab) must be positive.");
+        if (!_kernelCache.TryGetValue(kernelName, out var kernel))
+            throw new InvalidOperationException($"CUDA kernel not found: {kernelName}");
+        using var _ = PushContext();
+        using var lossBuf = AllocateBuffer(1); // zeroed
+        IntPtr ph = hidden.Handle, pw = weight.Handle, pb = bias.Handle, pt = tgt.Handle, pl = lossBuf.Handle;
+        void** args = stackalloc void*[8];
+        args[0] = &ph; args[1] = &pw; args[2] = &pb; args[3] = &pt; args[4] = &pl;
+        args[5] = &n; args[6] = &d; args[7] = &vocab;
+        uint total = (uint)n;
+        LaunchKernel(kernel, (total + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize, (uint)DefaultBlockSize, args);
+        var loss = DownloadBuffer(lossBuf);
+        return loss[0] / n;
+    }
+
     public unsafe void LstmForwardSequence(
         IGpuBuffer input, IGpuBuffer hInit, IGpuBuffer cInit,
         IGpuBuffer weightsIh, IGpuBuffer weightsHh, IGpuBuffer biasIh, IGpuBuffer biasHh,
@@ -12325,6 +12593,54 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         {
             CudaNativeBindings.cuModuleUnload(_lstmModule);
             _lstmModule = IntPtr.Zero;
+        }
+
+        if (_glaModule != IntPtr.Zero)
+        {
+            CudaNativeBindings.cuModuleUnload(_glaModule);
+            _glaModule = IntPtr.Zero;
+        }
+
+        if (_xlstmModule != IntPtr.Zero)
+        {
+            CudaNativeBindings.cuModuleUnload(_xlstmModule);
+            _xlstmModule = IntPtr.Zero;
+        }
+
+        if (_gatedDeltaNetModule != IntPtr.Zero)
+        {
+            CudaNativeBindings.cuModuleUnload(_gatedDeltaNetModule);
+            _gatedDeltaNetModule = IntPtr.Zero;
+        }
+
+        if (_rgLruModule != IntPtr.Zero)
+        {
+            CudaNativeBindings.cuModuleUnload(_rgLruModule);
+            _rgLruModule = IntPtr.Zero;
+        }
+
+        if (_rwkv4Module != IntPtr.Zero)
+        {
+            CudaNativeBindings.cuModuleUnload(_rwkv4Module);
+            _rwkv4Module = IntPtr.Zero;
+        }
+
+        if (_mambaModule != IntPtr.Zero)
+        {
+            CudaNativeBindings.cuModuleUnload(_mambaModule);
+            _mambaModule = IntPtr.Zero;
+        }
+
+        if (_mamba2Module != IntPtr.Zero)
+        {
+            CudaNativeBindings.cuModuleUnload(_mamba2Module);
+            _mamba2Module = IntPtr.Zero;
+        }
+
+        if (_fusedCeModule != IntPtr.Zero)
+        {
+            CudaNativeBindings.cuModuleUnload(_fusedCeModule);
+            _fusedCeModule = IntPtr.Zero;
         }
 
         if (_gruModule != IntPtr.Zero)

@@ -1209,6 +1209,108 @@ public sealed unsafe partial class VulkanBackend
 
     #region RNN (LSTM/GRU) Operations
 
+    // ── Fused recurrence / LM-head GPU kernels (#1464) ─────────────────────────────────────
+    // Real GLSL compute shaders (VulkanRecurrenceKernels), compiled to SPIR-V at runtime. Int
+    // params go through push constants. Forward only — the differentiable backward runs through
+    // the CpuEngine tape (the engine override is forward-only and defers to base under a tape).
+
+    public void GlaScanForward(
+        IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer gate, IGpuBuffer output,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim)
+        => GlslNaryOp(VulkanRecurrenceKernels.GlaScan, new[] { q, k, v, gate, output },
+            batch * numHeads * headDim,
+            new[] { (uint)batch, (uint)seqLen, (uint)modelDim, (uint)numHeads, (uint)headDim });
+
+    // GLA BPTT backward — real GLSL kernels (recompute trajectory + reverse sweep with CAS float
+    // atomics for the cross-row dQ/dK/dG). dQ/dK/dG must be pre-zeroed (the atomic accumulators).
+    public void GlaScanBackward(
+        IGpuBuffer dOut, IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer gate,
+        IGpuBuffer dQ, IGpuBuffer dK, IGpuBuffer dV, IGpuBuffer dG,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim)
+    {
+        if (batch <= 0 || seqLen <= 0 || modelDim <= 0 || numHeads <= 0 || headDim <= 0)
+            throw new ArgumentOutOfRangeException(nameof(batch), "GLA dimensions must be positive.");
+        int hh = headDim * headDim;
+        long totalLong = checked((long)batch * numHeads * headDim);
+        long trajLenLong = checked((long)batch * numHeads * seqLen * hh);
+        if (totalLong > int.MaxValue || trajLenLong > int.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(batch), "GLA dimensions exceed Vulkan launch/buffer limits.");
+        int total = (int)totalLong;
+        // dQ/dK/dG are atomic accumulators in the backward kernel — zero them here so the
+        // method is self-contained and correct even if the caller reuses dirty buffers.
+        Fill(dQ, 0f, batch * seqLen * modelDim);
+        Fill(dK, 0f, batch * seqLen * modelDim);
+        Fill(dG, 0f, batch * seqLen * numHeads);
+        using var traj = AllocateBuffer((int)trajLenLong);
+        var pc = new[] { (uint)batch, (uint)seqLen, (uint)modelDim, (uint)numHeads, (uint)headDim };
+        GlslNaryOp(VulkanRecurrenceKernels.GlaRecompute, new[] { k, v, gate, traj }, total, pc);
+        GlslNaryOp(VulkanRecurrenceKernels.GlaBackward,
+            new[] { dOut, q, k, v, gate, traj, dQ, dK, dV, dG }, total, pc);
+    }
+
+    public void XLstmScanForward(
+        IGpuBuffer q, IGpuBuffer k, IGpuBuffer v,
+        IGpuBuffer iGate, IGpuBuffer fGate, IGpuBuffer oGate, IGpuBuffer output,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim)
+        => GlslNaryOp(VulkanRecurrenceKernels.XLstmScan, new[] { q, k, v, iGate, fGate, oGate, output },
+            batch * numHeads,
+            new[] { (uint)batch, (uint)seqLen, (uint)modelDim, (uint)numHeads, (uint)headDim });
+
+    public void GatedDeltaNetScanForward(
+        IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer alpha, IGpuBuffer beta, IGpuBuffer output,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim)
+        => GlslNaryOp(VulkanRecurrenceKernels.GatedDeltaScan, new[] { q, k, v, alpha, beta, output },
+            batch * numHeads * headDim,
+            new[] { (uint)batch, (uint)seqLen, (uint)modelDim, (uint)numHeads, (uint)headDim });
+
+    public void RgLruScanForward(
+        IGpuBuffer value, IGpuBuffer recGate, IGpuBuffer inpGate, IGpuBuffer decay, IGpuBuffer output,
+        int batch, int seqLen, int recDim)
+        => GlslNaryOp(VulkanRecurrenceKernels.RgLruScan, new[] { value, recGate, inpGate, decay, output },
+            batch * recDim, new[] { (uint)batch, (uint)seqLen, (uint)recDim });
+
+    public void Rwkv4WkvForward(
+        IGpuBuffer r, IGpuBuffer k, IGpuBuffer v, IGpuBuffer timeDecay, IGpuBuffer timeFirst, IGpuBuffer output,
+        int batch, int seqLen, int modelDim)
+        => GlslNaryOp(VulkanRecurrenceKernels.Rwkv4Wkv, new[] { r, k, v, timeDecay, timeFirst, output },
+            batch * modelDim, new[] { (uint)batch, (uint)seqLen, (uint)modelDim });
+
+    public void MambaSelectiveScanForward(
+        IGpuBuffer x, IGpuBuffer delta, IGpuBuffer aLog, IGpuBuffer bParam, IGpuBuffer cParam, IGpuBuffer dParam,
+        IGpuBuffer output, int batch, int seqLen, int innerDim, int stateDim)
+        => GlslNaryOp(VulkanRecurrenceKernels.MambaScan, new[] { x, delta, aLog, bParam, cParam, dParam, output },
+            batch * innerDim, new[] { (uint)batch, (uint)seqLen, (uint)innerDim, (uint)stateDim });
+
+    public void Mamba2SsdScanForward(
+        IGpuBuffer x, IGpuBuffer delta, IGpuBuffer aLog, IGpuBuffer bParam, IGpuBuffer cParam, IGpuBuffer dParam,
+        IGpuBuffer output, int batch, int seqLen, int innerDim, int numHeads, int headDim, int stateDim)
+        => GlslNaryOp(VulkanRecurrenceKernels.Mamba2Ssd, new[] { x, delta, aLog, bParam, cParam, dParam, output },
+            batch * innerDim,
+            new[] { (uint)batch, (uint)seqLen, (uint)innerDim, (uint)numHeads, (uint)headDim, (uint)stateDim });
+
+    public float FusedLinearCrossEntropyIndex(
+        IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer targetIds, int n, int d, int vocab)
+        => FusedCeRowLoss(VulkanRecurrenceKernels.FusedCeIndex, hidden, weight, bias, targetIds, n, d, vocab);
+
+    public float FusedLinearCrossEntropyDense(
+        IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer target, int n, int d, int vocab)
+        => FusedCeRowLoss(VulkanRecurrenceKernels.FusedCeDense, hidden, weight, bias, target, n, d, vocab);
+
+    // CE kernels write a per-row loss vector; the host sums the N-element vector. Returns mean CE.
+    private float FusedCeRowLoss(
+        string glsl, IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer tgt, int n, int d, int vocab)
+    {
+        if (n <= 0 || d <= 0 || vocab <= 0)
+            throw new ArgumentOutOfRangeException(nameof(n), "Fused CE dimensions (n, d, vocab) must be positive.");
+        using var rowLoss = AllocateBuffer(n);
+        GlslNaryOp(glsl, new[] { hidden, weight, bias, tgt, rowLoss }, n,
+            new[] { (uint)n, (uint)d, (uint)vocab });
+        var rl = DownloadBuffer(rowLoss);
+        double sum = 0.0;
+        for (int i = 0; i < n; i++) sum += rl[i];
+        return (float)(sum / n);
+    }
+
     public void LstmForwardSequence(
         IGpuBuffer input, IGpuBuffer hInit, IGpuBuffer cInit,
         IGpuBuffer weightsIh, IGpuBuffer weightsHh, IGpuBuffer biasIh, IGpuBuffer biasHh,

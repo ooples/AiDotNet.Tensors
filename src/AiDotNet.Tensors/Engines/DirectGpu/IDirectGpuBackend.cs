@@ -2659,6 +2659,88 @@ public interface IDirectGpuBackend : IDisposable
         int seqLen, int batch, int inputSize, int hiddenSize);
 
     /// <summary>
+    /// Fused Gated Linear Attention scan forward (#1464). q/k/v: [batch, seqLen, modelDim];
+    /// gate: [batch, seqLen, numHeads]; output: [batch, seqLen, modelDim].
+    /// </summary>
+    void GlaScanForward(
+        IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer gate, IGpuBuffer output,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim);
+
+    /// <summary>
+    /// Fused Gated Linear Attention scan BPTT backward (#1464). dQ/dK/dV: [batch, seqLen, modelDim];
+    /// dG: [batch, seqLen, numHeads]. The gradient buffers must be pre-zeroed (atomic accumulation).
+    /// </summary>
+    void GlaScanBackward(
+        IGpuBuffer dOut, IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer gate,
+        IGpuBuffer dQ, IGpuBuffer dK, IGpuBuffer dV, IGpuBuffer dG,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim);
+
+    /// <summary>
+    /// Fused xLSTM (mLSTM) matrix-memory scan forward (#1464). q/k/v: [batch, seqLen, modelDim];
+    /// i/f/o gates: [batch, seqLen, numHeads]; output: [batch, seqLen, modelDim]. Inference fast
+    /// path; the differentiable backward runs through the CpuEngine tape.
+    /// </summary>
+    void XLstmScanForward(
+        IGpuBuffer q, IGpuBuffer k, IGpuBuffer v,
+        IGpuBuffer iGate, IGpuBuffer fGate, IGpuBuffer oGate, IGpuBuffer output,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim);
+
+    /// <summary>
+    /// Fused Gated DeltaNet (delta-rule) scan forward (#1464). q/k/v: [batch, seqLen, modelDim];
+    /// alpha/beta gates: [batch, seqLen, numHeads]; output: [batch, seqLen, modelDim].
+    /// </summary>
+    void GatedDeltaNetScanForward(
+        IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer alpha, IGpuBuffer beta, IGpuBuffer output,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim);
+
+    /// <summary>
+    /// Fused RG-LRU (real-gated linear recurrent unit) scan forward (#1464).
+    /// value/recGate/inpGate: [batch, seqLen, recDim]; decay: [recDim]; output: [batch, seqLen, recDim].
+    /// </summary>
+    void RgLruScanForward(
+        IGpuBuffer value, IGpuBuffer recGate, IGpuBuffer inpGate, IGpuBuffer decay, IGpuBuffer output,
+        int batch, int seqLen, int recDim);
+
+    /// <summary>
+    /// Fused RWKV-4 time-mixing WKV scan forward (#1464). r/k/v: [batch, seqLen, modelDim];
+    /// timeDecay/timeFirst: [modelDim]; output: [batch, seqLen, modelDim].
+    /// </summary>
+    void Rwkv4WkvForward(
+        IGpuBuffer r, IGpuBuffer k, IGpuBuffer v, IGpuBuffer timeDecay, IGpuBuffer timeFirst, IGpuBuffer output,
+        int batch, int seqLen, int modelDim);
+
+    /// <summary>
+    /// Fused Mamba selective scan forward (#1464). x/delta: [batch, seqLen, innerDim];
+    /// aLog: [innerDim, stateDim]; bParam/cParam: [batch, seqLen, stateDim]; dParam: [innerDim];
+    /// output: [batch, seqLen, innerDim].
+    /// </summary>
+    void MambaSelectiveScanForward(
+        IGpuBuffer x, IGpuBuffer delta, IGpuBuffer aLog, IGpuBuffer bParam, IGpuBuffer cParam, IGpuBuffer dParam,
+        IGpuBuffer output, int batch, int seqLen, int innerDim, int stateDim);
+
+    /// <summary>
+    /// Fused Mamba-2 SSD scan forward (#1464). x: [batch, seqLen, innerDim];
+    /// delta: [batch, seqLen, numHeads]; aLog/dParam: [numHeads]; bParam/cParam: [batch, seqLen, stateDim];
+    /// output: [batch, seqLen, innerDim].
+    /// </summary>
+    void Mamba2SsdScanForward(
+        IGpuBuffer x, IGpuBuffer delta, IGpuBuffer aLog, IGpuBuffer bParam, IGpuBuffer cParam, IGpuBuffer dParam,
+        IGpuBuffer output, int batch, int seqLen, int innerDim, int numHeads, int headDim, int stateDim);
+
+    /// <summary>
+    /// Fused linear (LM head) + cross-entropy with int class-id targets (#1464). hidden: [N, d];
+    /// weight: [d, vocab]; bias: [vocab]; targetIds: [N] (ids stored as floats). Returns mean CE.
+    /// </summary>
+    float FusedLinearCrossEntropyIndex(
+        IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer targetIds, int n, int d, int vocab);
+
+    /// <summary>
+    /// Fused linear (LM head) + cross-entropy with dense [N, vocab] soft targets (#1464). Returns mean CE.
+    /// </summary>
+    float FusedLinearCrossEntropyDense(
+        IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer target, int n, int d, int vocab);
+
+    /// <summary>
     /// Backward pass for LSTM sequence - computes gradients via BPTT.
     /// </summary>
     /// <param name="gradOutput">Gradient from next layer [seqLen * batch * hiddenSize].</param>

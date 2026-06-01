@@ -1640,6 +1640,66 @@ public class DelegatingGpuBackend : IDirectGpuBackend
             output, hFinal, cFinal, allH, allC, cacheGates, seqLen, batch, inputSize, hiddenSize);
 
     /// <inheritdoc/>
+    public virtual void GlaScanForward(
+        IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer gate, IGpuBuffer output,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim)
+        => Inner.GlaScanForward(q, k, v, gate, output, batch, seqLen, modelDim, numHeads, headDim);
+
+    /// <inheritdoc/>
+    public virtual void GlaScanBackward(
+        IGpuBuffer dOut, IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer gate,
+        IGpuBuffer dQ, IGpuBuffer dK, IGpuBuffer dV, IGpuBuffer dG,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim)
+        => Inner.GlaScanBackward(dOut, q, k, v, gate, dQ, dK, dV, dG, batch, seqLen, modelDim, numHeads, headDim);
+
+    /// <inheritdoc/>
+    public virtual void XLstmScanForward(
+        IGpuBuffer q, IGpuBuffer k, IGpuBuffer v,
+        IGpuBuffer iGate, IGpuBuffer fGate, IGpuBuffer oGate, IGpuBuffer output,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim)
+        => Inner.XLstmScanForward(q, k, v, iGate, fGate, oGate, output, batch, seqLen, modelDim, numHeads, headDim);
+
+    /// <inheritdoc/>
+    public virtual void GatedDeltaNetScanForward(
+        IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer alpha, IGpuBuffer beta, IGpuBuffer output,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim)
+        => Inner.GatedDeltaNetScanForward(q, k, v, alpha, beta, output, batch, seqLen, modelDim, numHeads, headDim);
+
+    /// <inheritdoc/>
+    public virtual void RgLruScanForward(
+        IGpuBuffer value, IGpuBuffer recGate, IGpuBuffer inpGate, IGpuBuffer decay, IGpuBuffer output,
+        int batch, int seqLen, int recDim)
+        => Inner.RgLruScanForward(value, recGate, inpGate, decay, output, batch, seqLen, recDim);
+
+    /// <inheritdoc/>
+    public virtual void Rwkv4WkvForward(
+        IGpuBuffer r, IGpuBuffer k, IGpuBuffer v, IGpuBuffer timeDecay, IGpuBuffer timeFirst, IGpuBuffer output,
+        int batch, int seqLen, int modelDim)
+        => Inner.Rwkv4WkvForward(r, k, v, timeDecay, timeFirst, output, batch, seqLen, modelDim);
+
+    /// <inheritdoc/>
+    public virtual void MambaSelectiveScanForward(
+        IGpuBuffer x, IGpuBuffer delta, IGpuBuffer aLog, IGpuBuffer bParam, IGpuBuffer cParam, IGpuBuffer dParam,
+        IGpuBuffer output, int batch, int seqLen, int innerDim, int stateDim)
+        => Inner.MambaSelectiveScanForward(x, delta, aLog, bParam, cParam, dParam, output, batch, seqLen, innerDim, stateDim);
+
+    /// <inheritdoc/>
+    public virtual void Mamba2SsdScanForward(
+        IGpuBuffer x, IGpuBuffer delta, IGpuBuffer aLog, IGpuBuffer bParam, IGpuBuffer cParam, IGpuBuffer dParam,
+        IGpuBuffer output, int batch, int seqLen, int innerDim, int numHeads, int headDim, int stateDim)
+        => Inner.Mamba2SsdScanForward(x, delta, aLog, bParam, cParam, dParam, output, batch, seqLen, innerDim, numHeads, headDim, stateDim);
+
+    /// <inheritdoc/>
+    public virtual float FusedLinearCrossEntropyIndex(
+        IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer targetIds, int n, int d, int vocab)
+        => Inner.FusedLinearCrossEntropyIndex(hidden, weight, bias, targetIds, n, d, vocab);
+
+    /// <inheritdoc/>
+    public virtual float FusedLinearCrossEntropyDense(
+        IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer target, int n, int d, int vocab)
+        => Inner.FusedLinearCrossEntropyDense(hidden, weight, bias, target, n, d, vocab);
+
+    /// <inheritdoc/>
     public virtual void LstmBackwardSequence(
         IGpuBuffer gradOutput, IGpuBuffer allH, IGpuBuffer allC, IGpuBuffer cacheGates,
         IGpuBuffer hInit, IGpuBuffer cInit,

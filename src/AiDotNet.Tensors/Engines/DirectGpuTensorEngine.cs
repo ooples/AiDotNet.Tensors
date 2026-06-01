@@ -6116,6 +6116,417 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// Supports optional attention bias (ALiBi) — the bias is uploaded to GPU and passed to the kernel.
     /// Falls back to CPU implementation when GPU is unavailable or on any GPU error.
     /// </summary>
+    // Fused GLA scan (#1464). The GPU kernel is the inference fast path; when a tape is
+    // active (or T is not float, or no backend), defer to the differentiable CpuEngine path
+    // which records the BPTT backward — same precedent as FlashAttention / MlpForward.
+    public override Tensor<T> GlaScanForward<T>(
+        Tensor<T> qProj, Tensor<T> kProj, Tensor<T> vProj, Tensor<T> gate, int numHeads)
+    {
+        if (IsTapeActive<T>() || typeof(T) != typeof(float) || !TryGetBackend(out var backend))
+            return base.GlaScanForward(qProj, kProj, vProj, gate, numHeads);
+        if (qProj.Rank != 3 || numHeads < 1)
+            return base.GlaScanForward(qProj, kProj, vProj, gate, numHeads);
+
+        int batch = qProj.Shape._dims[0];
+        int seqLen = qProj.Shape._dims[1];
+        int modelDim = qProj.Shape._dims[2];
+        // K/V/gate must share Q's batch/seq (and K/V its model dim); a mismatched
+        // caller would otherwise launch the kernel with Q-derived sizes and read/write
+        // out of bounds. Defer to the safe differentiable fallback instead.
+        if (kProj.Rank != 3 || vProj.Rank != 3 || gate.Rank != 3)
+            return base.GlaScanForward(qProj, kProj, vProj, gate, numHeads);
+        if (kProj.Shape._dims[0] != batch || kProj.Shape._dims[1] != seqLen || kProj.Shape._dims[2] != modelDim)
+            return base.GlaScanForward(qProj, kProj, vProj, gate, numHeads);
+        if (vProj.Shape._dims[0] != batch || vProj.Shape._dims[1] != seqLen || vProj.Shape._dims[2] != modelDim)
+            return base.GlaScanForward(qProj, kProj, vProj, gate, numHeads);
+        if (gate.Shape._dims[0] != batch || gate.Shape._dims[1] != seqLen)
+            return base.GlaScanForward(qProj, kProj, vProj, gate, numHeads);
+        if (numHeads < 1 || modelDim % numHeads != 0)
+            return base.GlaScanForward(qProj, kProj, vProj, gate, numHeads);
+        int headDim = modelDim / numHeads;
+        // Kernel caps the register-resident state row; gate must be scalar-per-head.
+        if (headDim > 256 || gate.Rank != 3 || gate.Shape._dims[2] != numHeads)
+            return base.GlaScanForward(qProj, kProj, vProj, gate, numHeads);
+
+        try
+        {
+            using var qB = GetOrAllocateBuffer(backend, qProj);
+            using var kB = GetOrAllocateBuffer(backend, kProj);
+            using var vB = GetOrAllocateBuffer(backend, vProj);
+            using var gB = GetOrAllocateBuffer(backend, gate);
+            using var outB = AllocateOutputBuffer(backend, batch * seqLen * modelDim);
+
+            backend.GlaScanForward(qB.Buffer, kB.Buffer, vB.Buffer, gB.Buffer, outB.Buffer,
+                batch, seqLen, modelDim, numHeads, headDim);
+
+            float[] outF = new float[batch * seqLen * modelDim];
+            backend.DownloadBuffer(outB.Buffer, outF);
+            T[] outData = DirectGpuEngine.FromFloatArray<T>(outF);
+            return new Tensor<T>(outData, new[] { batch, seqLen, modelDim });
+        }
+        catch
+        {
+            return base.GlaScanForward(qProj, kProj, vProj, gate, numHeads);
+        }
+    }
+
+    // Fused xLSTM scan (#1464). GPU inference fast path; tape-active / non-float / no-backend /
+    // headDim over the kernel cap defer to the differentiable CpuEngine path.
+    public override Tensor<T> XLstmScanForward<T>(
+        Tensor<T> qProj, Tensor<T> kProj, Tensor<T> vProj,
+        Tensor<T> iGate, Tensor<T> fGate, Tensor<T> oGate, int numHeads)
+    {
+        if (IsTapeActive<T>() || typeof(T) != typeof(float) || !TryGetBackend(out var backend))
+            return base.XLstmScanForward(qProj, kProj, vProj, iGate, fGate, oGate, numHeads);
+        if (qProj.Rank != 3 || numHeads < 1)
+            return base.XLstmScanForward(qProj, kProj, vProj, iGate, fGate, oGate, numHeads);
+
+        int batch = qProj.Shape._dims[0];
+        int seqLen = qProj.Shape._dims[1];
+        int modelDim = qProj.Shape._dims[2];
+        // K/V must match Q's [batch, seqLen, modelDim]; mismatched operands would otherwise
+        // reach the kernel with Q-derived launch sizes and read/write out of bounds.
+        if (kProj.Rank != 3 || vProj.Rank != 3 ||
+            kProj.Shape._dims[0] != batch || kProj.Shape._dims[1] != seqLen || kProj.Shape._dims[2] != modelDim ||
+            vProj.Shape._dims[0] != batch || vProj.Shape._dims[1] != seqLen || vProj.Shape._dims[2] != modelDim)
+            return base.XLstmScanForward(qProj, kProj, vProj, iGate, fGate, oGate, numHeads);
+        if (modelDim % numHeads != 0)
+            return base.XLstmScanForward(qProj, kProj, vProj, iGate, fGate, oGate, numHeads);
+        int headDim = modelDim / numHeads;
+        // Gates are per-head [batch, seqLen, numHeads].
+        if (headDim > 64 ||
+            iGate.Rank != 3 || fGate.Rank != 3 || oGate.Rank != 3 ||
+            iGate.Shape._dims[0] != batch || iGate.Shape._dims[1] != seqLen || iGate.Shape._dims[2] != numHeads ||
+            fGate.Shape._dims[0] != batch || fGate.Shape._dims[1] != seqLen || fGate.Shape._dims[2] != numHeads ||
+            oGate.Shape._dims[0] != batch || oGate.Shape._dims[1] != seqLen || oGate.Shape._dims[2] != numHeads)
+            return base.XLstmScanForward(qProj, kProj, vProj, iGate, fGate, oGate, numHeads);
+
+        try
+        {
+            using var qB = GetOrAllocateBuffer(backend, qProj);
+            using var kB = GetOrAllocateBuffer(backend, kProj);
+            using var vB = GetOrAllocateBuffer(backend, vProj);
+            using var iB = GetOrAllocateBuffer(backend, iGate);
+            using var fB = GetOrAllocateBuffer(backend, fGate);
+            using var oB = GetOrAllocateBuffer(backend, oGate);
+            using var outB = AllocateOutputBuffer(backend, batch * seqLen * modelDim);
+
+            backend.XLstmScanForward(qB.Buffer, kB.Buffer, vB.Buffer, iB.Buffer, fB.Buffer, oB.Buffer, outB.Buffer,
+                batch, seqLen, modelDim, numHeads, headDim);
+
+            float[] outF = new float[batch * seqLen * modelDim];
+            backend.DownloadBuffer(outB.Buffer, outF);
+            T[] outData = DirectGpuEngine.FromFloatArray<T>(outF);
+            return new Tensor<T>(outData, new[] { batch, seqLen, modelDim });
+        }
+        catch
+        {
+            return base.XLstmScanForward(qProj, kProj, vProj, iGate, fGate, oGate, numHeads);
+        }
+    }
+
+    // Fused Gated DeltaNet scan (#1464). GPU inference fast path; defer to CpuEngine otherwise.
+    public override Tensor<T> GatedDeltaNetScanForward<T>(
+        Tensor<T> qProj, Tensor<T> kProj, Tensor<T> vProj, Tensor<T> alpha, Tensor<T> beta, int numHeads)
+    {
+        if (IsTapeActive<T>() || typeof(T) != typeof(float) || !TryGetBackend(out var backend))
+            return base.GatedDeltaNetScanForward(qProj, kProj, vProj, alpha, beta, numHeads);
+        if (qProj.Rank != 3 || numHeads < 1)
+            return base.GatedDeltaNetScanForward(qProj, kProj, vProj, alpha, beta, numHeads);
+
+        int batch = qProj.Shape._dims[0];
+        int seqLen = qProj.Shape._dims[1];
+        int modelDim = qProj.Shape._dims[2];
+        if (kProj.Rank != 3 || vProj.Rank != 3 ||
+            kProj.Shape._dims[0] != batch || kProj.Shape._dims[1] != seqLen || kProj.Shape._dims[2] != modelDim ||
+            vProj.Shape._dims[0] != batch || vProj.Shape._dims[1] != seqLen || vProj.Shape._dims[2] != modelDim)
+            return base.GatedDeltaNetScanForward(qProj, kProj, vProj, alpha, beta, numHeads);
+        if (modelDim % numHeads != 0)
+            return base.GatedDeltaNetScanForward(qProj, kProj, vProj, alpha, beta, numHeads);
+        int headDim = modelDim / numHeads;
+        // alpha/beta are per-head gates [batch, seqLen, numHeads].
+        if (headDim > 256 ||
+            alpha.Rank != 3 || beta.Rank != 3 ||
+            alpha.Shape._dims[0] != batch || alpha.Shape._dims[1] != seqLen || alpha.Shape._dims[2] != numHeads ||
+            beta.Shape._dims[0] != batch || beta.Shape._dims[1] != seqLen || beta.Shape._dims[2] != numHeads)
+            return base.GatedDeltaNetScanForward(qProj, kProj, vProj, alpha, beta, numHeads);
+
+        try
+        {
+            using var qB = GetOrAllocateBuffer(backend, qProj);
+            using var kB = GetOrAllocateBuffer(backend, kProj);
+            using var vB = GetOrAllocateBuffer(backend, vProj);
+            using var aB = GetOrAllocateBuffer(backend, alpha);
+            using var bB = GetOrAllocateBuffer(backend, beta);
+            using var outB = AllocateOutputBuffer(backend, batch * seqLen * modelDim);
+
+            backend.GatedDeltaNetScanForward(qB.Buffer, kB.Buffer, vB.Buffer, aB.Buffer, bB.Buffer, outB.Buffer,
+                batch, seqLen, modelDim, numHeads, headDim);
+
+            float[] outF = new float[batch * seqLen * modelDim];
+            backend.DownloadBuffer(outB.Buffer, outF);
+            T[] outData = DirectGpuEngine.FromFloatArray<T>(outF);
+            return new Tensor<T>(outData, new[] { batch, seqLen, modelDim });
+        }
+        catch
+        {
+            return base.GatedDeltaNetScanForward(qProj, kProj, vProj, alpha, beta, numHeads);
+        }
+    }
+
+    // Fused RG-LRU scan (#1464). GPU inference fast path; defer to CpuEngine otherwise.
+    public override Tensor<T> RgLruScanForward<T>(
+        Tensor<T> value, Tensor<T> recGate, Tensor<T> inpGate, Tensor<T> decay)
+    {
+        if (IsTapeActive<T>() || typeof(T) != typeof(float) || !TryGetBackend(out var backend))
+            return base.RgLruScanForward(value, recGate, inpGate, decay);
+        if (value.Rank != 3)
+            return base.RgLruScanForward(value, recGate, inpGate, decay);
+
+        int batch = value.Shape._dims[0];
+        int seqLen = value.Shape._dims[1];
+        int recDim = value.Shape._dims[2];
+        if (decay.Rank != 1 || decay.Shape._dims[0] != recDim)
+            return base.RgLruScanForward(value, recGate, inpGate, decay);
+        // recGate / inpGate must match value's [batch, seqLen, recDim].
+        if (recGate.Rank != 3 || inpGate.Rank != 3 ||
+            recGate.Shape._dims[0] != batch || recGate.Shape._dims[1] != seqLen || recGate.Shape._dims[2] != recDim ||
+            inpGate.Shape._dims[0] != batch || inpGate.Shape._dims[1] != seqLen || inpGate.Shape._dims[2] != recDim)
+            return base.RgLruScanForward(value, recGate, inpGate, decay);
+
+        try
+        {
+            using var vB = GetOrAllocateBuffer(backend, value);
+            using var rB = GetOrAllocateBuffer(backend, recGate);
+            using var iB = GetOrAllocateBuffer(backend, inpGate);
+            using var dB = GetOrAllocateBuffer(backend, decay);
+            using var outB = AllocateOutputBuffer(backend, batch * seqLen * recDim);
+
+            backend.RgLruScanForward(vB.Buffer, rB.Buffer, iB.Buffer, dB.Buffer, outB.Buffer, batch, seqLen, recDim);
+
+            float[] outF = new float[batch * seqLen * recDim];
+            backend.DownloadBuffer(outB.Buffer, outF);
+            T[] outData = DirectGpuEngine.FromFloatArray<T>(outF);
+            return new Tensor<T>(outData, new[] { batch, seqLen, recDim });
+        }
+        catch
+        {
+            return base.RgLruScanForward(value, recGate, inpGate, decay);
+        }
+    }
+
+    // Fused RWKV-4 WKV scan (#1464). GPU inference fast path; defer to CpuEngine otherwise.
+    public override Tensor<T> Rwkv4WkvForward<T>(
+        Tensor<T> rProj, Tensor<T> kProj, Tensor<T> vProj, Tensor<T> timeDecay, Tensor<T> timeFirst)
+    {
+        if (IsTapeActive<T>() || typeof(T) != typeof(float) || !TryGetBackend(out var backend))
+            return base.Rwkv4WkvForward(rProj, kProj, vProj, timeDecay, timeFirst);
+        if (rProj.Rank != 3)
+            return base.Rwkv4WkvForward(rProj, kProj, vProj, timeDecay, timeFirst);
+
+        int batch = rProj.Shape._dims[0];
+        int seqLen = rProj.Shape._dims[1];
+        int modelDim = rProj.Shape._dims[2];
+        if (timeDecay.Rank != 1 || timeDecay.Shape._dims[0] != modelDim ||
+            timeFirst.Rank != 1 || timeFirst.Shape._dims[0] != modelDim)
+            return base.Rwkv4WkvForward(rProj, kProj, vProj, timeDecay, timeFirst);
+        // K/V must match R's [batch, seqLen, modelDim].
+        if (kProj.Rank != 3 || vProj.Rank != 3 ||
+            kProj.Shape._dims[0] != batch || kProj.Shape._dims[1] != seqLen || kProj.Shape._dims[2] != modelDim ||
+            vProj.Shape._dims[0] != batch || vProj.Shape._dims[1] != seqLen || vProj.Shape._dims[2] != modelDim)
+            return base.Rwkv4WkvForward(rProj, kProj, vProj, timeDecay, timeFirst);
+
+        try
+        {
+            using var rB = GetOrAllocateBuffer(backend, rProj);
+            using var kB = GetOrAllocateBuffer(backend, kProj);
+            using var vB = GetOrAllocateBuffer(backend, vProj);
+            using var dB = GetOrAllocateBuffer(backend, timeDecay);
+            using var fB = GetOrAllocateBuffer(backend, timeFirst);
+            using var outB = AllocateOutputBuffer(backend, batch * seqLen * modelDim);
+
+            backend.Rwkv4WkvForward(rB.Buffer, kB.Buffer, vB.Buffer, dB.Buffer, fB.Buffer, outB.Buffer, batch, seqLen, modelDim);
+
+            float[] outF = new float[batch * seqLen * modelDim];
+            backend.DownloadBuffer(outB.Buffer, outF);
+            T[] outData = DirectGpuEngine.FromFloatArray<T>(outF);
+            return new Tensor<T>(outData, new[] { batch, seqLen, modelDim });
+        }
+        catch
+        {
+            return base.Rwkv4WkvForward(rProj, kProj, vProj, timeDecay, timeFirst);
+        }
+    }
+
+    // Fused Mamba selective scan (#1464). GPU inference fast path; defer to CpuEngine otherwise.
+    public override Tensor<T> MambaSelectiveScanForward<T>(
+        Tensor<T> x, Tensor<T> delta, Tensor<T> aLog, Tensor<T> bParam, Tensor<T> cParam, Tensor<T> dParam)
+    {
+        if (IsTapeActive<T>() || typeof(T) != typeof(float) || !TryGetBackend(out var backend))
+            return base.MambaSelectiveScanForward(x, delta, aLog, bParam, cParam, dParam);
+        if (x.Rank != 3 || aLog.Rank != 2)
+            return base.MambaSelectiveScanForward(x, delta, aLog, bParam, cParam, dParam);
+
+        int batch = x.Shape._dims[0];
+        int seqLen = x.Shape._dims[1];
+        int innerDim = x.Shape._dims[2];
+        int stateDim = aLog.Shape._dims[1];
+        if (aLog.Shape._dims[0] != innerDim || stateDim > 256)
+            return base.MambaSelectiveScanForward(x, delta, aLog, bParam, cParam, dParam);
+        // delta matches x [batch, seqLen, innerDim]; B/C are [batch, seqLen, stateDim]; D is [innerDim].
+        if (delta.Rank != 3 ||
+            delta.Shape._dims[0] != batch || delta.Shape._dims[1] != seqLen || delta.Shape._dims[2] != innerDim ||
+            bParam.Rank != 3 || cParam.Rank != 3 ||
+            bParam.Shape._dims[0] != batch || bParam.Shape._dims[1] != seqLen || bParam.Shape._dims[2] != stateDim ||
+            cParam.Shape._dims[0] != batch || cParam.Shape._dims[1] != seqLen || cParam.Shape._dims[2] != stateDim ||
+            dParam.Rank != 1 || dParam.Shape._dims[0] != innerDim)
+            return base.MambaSelectiveScanForward(x, delta, aLog, bParam, cParam, dParam);
+
+        try
+        {
+            using var xB = GetOrAllocateBuffer(backend, x);
+            using var dtB = GetOrAllocateBuffer(backend, delta);
+            using var aB = GetOrAllocateBuffer(backend, aLog);
+            using var bB = GetOrAllocateBuffer(backend, bParam);
+            using var cB = GetOrAllocateBuffer(backend, cParam);
+            using var dB = GetOrAllocateBuffer(backend, dParam);
+            using var outB = AllocateOutputBuffer(backend, batch * seqLen * innerDim);
+
+            backend.MambaSelectiveScanForward(xB.Buffer, dtB.Buffer, aB.Buffer, bB.Buffer, cB.Buffer, dB.Buffer, outB.Buffer,
+                batch, seqLen, innerDim, stateDim);
+
+            float[] outF = new float[batch * seqLen * innerDim];
+            backend.DownloadBuffer(outB.Buffer, outF);
+            T[] outData = DirectGpuEngine.FromFloatArray<T>(outF);
+            return new Tensor<T>(outData, new[] { batch, seqLen, innerDim });
+        }
+        catch
+        {
+            return base.MambaSelectiveScanForward(x, delta, aLog, bParam, cParam, dParam);
+        }
+    }
+
+    // Fused Mamba-2 SSD scan (#1464). GPU inference fast path; defer to CpuEngine otherwise.
+    public override Tensor<T> Mamba2SsdScanForward<T>(
+        Tensor<T> x, Tensor<T> delta, Tensor<T> aLog, Tensor<T> bParam, Tensor<T> cParam, Tensor<T> dParam, int numHeads)
+    {
+        if (IsTapeActive<T>() || typeof(T) != typeof(float) || !TryGetBackend(out var backend))
+            return base.Mamba2SsdScanForward(x, delta, aLog, bParam, cParam, dParam, numHeads);
+        if (x.Rank != 3 || numHeads < 1)
+            return base.Mamba2SsdScanForward(x, delta, aLog, bParam, cParam, dParam, numHeads);
+
+        int batch = x.Shape._dims[0];
+        int seqLen = x.Shape._dims[1];
+        int innerDim = x.Shape._dims[2];
+        if (innerDim % numHeads != 0 || bParam.Rank != 3)
+            return base.Mamba2SsdScanForward(x, delta, aLog, bParam, cParam, dParam, numHeads);
+        int headDim = innerDim / numHeads;
+        int stateDim = bParam.Shape._dims[2];
+        if (stateDim > 256)
+            return base.Mamba2SsdScanForward(x, delta, aLog, bParam, cParam, dParam, numHeads);
+        // Per the CPU reference: delta [batch,seqLen,numHeads], aLog [numHeads], B/C
+        // [batch,seqLen,stateDim], D [numHeads]. Reject any mismatch before dispatch.
+        if (delta.Rank != 3 ||
+            delta.Shape._dims[0] != batch || delta.Shape._dims[1] != seqLen || delta.Shape._dims[2] != numHeads ||
+            bParam.Shape._dims[0] != batch || bParam.Shape._dims[1] != seqLen ||
+            cParam.Rank != 3 ||
+            cParam.Shape._dims[0] != batch || cParam.Shape._dims[1] != seqLen || cParam.Shape._dims[2] != stateDim ||
+            aLog.Rank != 1 || aLog.Shape._dims[0] != numHeads ||
+            dParam.Rank != 1 || dParam.Shape._dims[0] != numHeads)
+            return base.Mamba2SsdScanForward(x, delta, aLog, bParam, cParam, dParam, numHeads);
+
+        try
+        {
+            using var xB = GetOrAllocateBuffer(backend, x);
+            using var dtB = GetOrAllocateBuffer(backend, delta);
+            using var aB = GetOrAllocateBuffer(backend, aLog);
+            using var bB = GetOrAllocateBuffer(backend, bParam);
+            using var cB = GetOrAllocateBuffer(backend, cParam);
+            using var dB = GetOrAllocateBuffer(backend, dParam);
+            using var outB = AllocateOutputBuffer(backend, batch * seqLen * innerDim);
+
+            backend.Mamba2SsdScanForward(xB.Buffer, dtB.Buffer, aB.Buffer, bB.Buffer, cB.Buffer, dB.Buffer, outB.Buffer,
+                batch, seqLen, innerDim, numHeads, headDim, stateDim);
+
+            float[] outF = new float[batch * seqLen * innerDim];
+            backend.DownloadBuffer(outB.Buffer, outF);
+            T[] outData = DirectGpuEngine.FromFloatArray<T>(outF);
+            return new Tensor<T>(outData, new[] { batch, seqLen, innerDim });
+        }
+        catch
+        {
+            return base.Mamba2SsdScanForward(x, delta, aLog, bParam, cParam, dParam, numHeads);
+        }
+    }
+
+    // Fused linear (LM head) + cross-entropy, int-id targets (#1464). GPU inference fast path.
+    public override Tensor<T> FusedLinearCrossEntropyWithLogits<T>(
+        Tensor<T> hidden, Tensor<T> weight, Tensor<T> bias, Tensor<int> targetIds)
+    {
+        if (IsTapeActive<T>() || typeof(T) != typeof(float) || !TryGetBackend(out var backend))
+            return base.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, targetIds);
+        if (hidden.Rank != 2 || weight.Rank != 2)
+            return base.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, targetIds);
+
+        int n = hidden.Shape._dims[0];
+        int d = hidden.Shape._dims[1];
+        int vocab = weight.Shape._dims[1];
+        if (n <= 0 || vocab <= 0 || weight.Shape._dims[0] != d || bias.Length != vocab || targetIds.Length != n)
+            return base.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, targetIds);
+
+        try
+        {
+            var ids = (int[])(object)targetIds.GetDataArray()!;
+            var fids = new float[n];
+            for (int i = 0; i < n; i++) fids[i] = ids[i];
+            using var hB = GetOrAllocateBuffer(backend, hidden);
+            using var wB = GetOrAllocateBuffer(backend, weight);
+            using var bB = GetOrAllocateBuffer(backend, bias);
+            using var tB = GetOrAllocateBuffer(backend, fids);
+            float loss = backend.FusedLinearCrossEntropyIndex(hB.Buffer, wB.Buffer, bB.Buffer, tB.Buffer, n, d, vocab);
+            var outT = new Tensor<T>(new[] { 1 });
+            outT.GetDataArray()![0] = MathHelper.GetNumericOperations<T>().FromDouble(loss);
+            return outT;
+        }
+        catch
+        {
+            return base.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, targetIds);
+        }
+    }
+
+    // Fused linear (LM head) + cross-entropy, dense soft targets (#1464). GPU inference fast path.
+    public override Tensor<T> FusedLinearCrossEntropyWithLogits<T>(
+        Tensor<T> hidden, Tensor<T> weight, Tensor<T> bias, Tensor<T> target)
+    {
+        if (IsTapeActive<T>() || typeof(T) != typeof(float) || !TryGetBackend(out var backend))
+            return base.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, target);
+        if (hidden.Rank != 2 || weight.Rank != 2)
+            return base.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, target);
+
+        int n = hidden.Shape._dims[0];
+        int d = hidden.Shape._dims[1];
+        int vocab = weight.Shape._dims[1];
+        if (n <= 0 || vocab <= 0 || weight.Shape._dims[0] != d || bias.Length != vocab
+            || target.Rank != 2 || target.Shape._dims[0] != n || target.Shape._dims[1] != vocab)
+            return base.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, target);
+
+        try
+        {
+            using var hB = GetOrAllocateBuffer(backend, hidden);
+            using var wB = GetOrAllocateBuffer(backend, weight);
+            using var bB = GetOrAllocateBuffer(backend, bias);
+            using var tB = GetOrAllocateBuffer(backend, target);
+            float loss = backend.FusedLinearCrossEntropyDense(hB.Buffer, wB.Buffer, bB.Buffer, tB.Buffer, n, d, vocab);
+            var outT = new Tensor<T>(new[] { 1 });
+            outT.GetDataArray()![0] = MathHelper.GetNumericOperations<T>().FromDouble(loss);
+            return outT;
+        }
+        catch
+        {
+            return base.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, target);
+        }
+    }
+
     public override Tensor<T> FlashAttention<T>(
         Tensor<T> query,
         Tensor<T> key,
