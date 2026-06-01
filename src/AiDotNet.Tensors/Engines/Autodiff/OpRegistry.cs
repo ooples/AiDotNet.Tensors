@@ -168,16 +168,16 @@ internal static class OpRegistry
         // Fused forward+backward recurrence kernels for the LM family (#1464). Each records ONE tape
         // node for the whole recurrence via DifferentiableOps.RecordIfActive with a custom BPTT
         // backward, replacing the per-timestep tape micro-ops. All differentiable.
-        "Rwkv4Wkv",
-        "MambaSelectiveScan",
-        "RgLruScan",
-        "GlaScan",
-        "GatedDeltaNetScan",
-        "XLstmScan",
-        "Mamba2SsdScan",
+        "Rwkv4WkvForward",
+        "MambaSelectiveScanForward",
+        "RgLruScanForward",
+        "GlaScanForward",
+        "GatedDeltaNetScanForward",
+        "XLstmScanForward",
+        "Mamba2SsdScanForward",
         // Fused linear (LM head) + cross-entropy-with-logits — avoids materializing the [N, vocab]
         // logits on the tape for huge-vocab heads.
-        "FusedLinearCrossEntropy",
+        "FusedLinearCrossEntropyWithLogits",
 
         // Signal
         "RFFT", "IRFFT",

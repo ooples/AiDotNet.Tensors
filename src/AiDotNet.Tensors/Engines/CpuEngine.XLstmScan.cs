@@ -149,6 +149,11 @@ public partial class CpuEngine
         var dC = new double[hh];
         var dN = new double[headDim];
         var dKS = new double[headDim];
+        // Hoisted out of the reverse-time loop below: a fresh new[] per timestep
+        // would create O(batch·heads·seqLen) allocations in this hot backward
+        // kernel. Both are fully overwritten each step before being read.
+        var dCp = new double[hh];
+        var dNp = new double[headDim];
 
         for (int b = 0; b < batch; b++)
         {
@@ -235,8 +240,8 @@ public partial class CpuEngine
                     Array.Clear(dKS, 0, headDim);
                     double dF_acc = 0.0, dI_acc = 0.0;
                     // C_t[di,ki] = f*Cp[di,ki] + iv*V[di]*kS[ki].
-                    var dCp = new double[hh];
-                    var dNp = new double[headDim];
+                    // dCp/dNp hoisted above; every element is written below before
+                    // the Array.Copy carry, so no per-step clear is needed.
                     for (int di = 0; di < headDim; di++)
                     {
                         int srow = di * headDim;

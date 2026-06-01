@@ -51,13 +51,18 @@ public partial class CpuEngine
         if (innerDim % numHeads != 0)
             throw new ArgumentException($"innerDim ({innerDim}) must be divisible by numHeads ({numHeads}).", nameof(numHeads));
         int headDim = innerDim / numHeads;
+        // Validate bParam is fully rank-3 [batch, seqLen, stateDim] BEFORE reading
+        // Shape[2] — otherwise a rank/batch/seq mismatch would misindex or throw a
+        // late IndexOutOfRangeException instead of a clear argument error.
+        if (bParam.Rank != 3 || bParam.Shape[0] != batch || bParam.Shape[1] != seqLen)
+            throw new ArgumentException($"bParam must be [batch={batch}, seqLen={seqLen}, stateDim].", nameof(bParam));
         int stateDim = bParam.Shape[2];
         if (delta.Rank != 3 || delta.Shape[0] != batch || delta.Shape[1] != seqLen || delta.Shape[2] != numHeads)
             throw new ArgumentException($"delta must be [batch={batch}, seqLen={seqLen}, numHeads={numHeads}].", nameof(delta));
         if (aLog.Length != numHeads)
             throw new ArgumentException($"aLog length ({aLog.Length}) must equal numHeads ({numHeads}).", nameof(aLog));
-        if (cParam.Rank != 3 || cParam.Shape[2] != stateDim)
-            throw new ArgumentException($"cParam must be [batch, seqLen, stateDim={stateDim}].", nameof(cParam));
+        if (cParam.Rank != 3 || cParam.Shape[0] != batch || cParam.Shape[1] != seqLen || cParam.Shape[2] != stateDim)
+            throw new ArgumentException($"cParam must be [batch={batch}, seqLen={seqLen}, stateDim={stateDim}].", nameof(cParam));
         if (dParam.Length != numHeads)
             throw new ArgumentException($"dParam length ({dParam.Length}) must equal numHeads ({numHeads}).", nameof(dParam));
 
