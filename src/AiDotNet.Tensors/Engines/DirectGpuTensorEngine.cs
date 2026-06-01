@@ -817,6 +817,29 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     private void InvalidateActivationCacheEntry(object key)
     {
+        // #226 / #1468: NEVER free a GPU buffer that still backs a pending deferred
+        // download. DeferredArrayMaterializer.Register is first-write-wins (TryAdd),
+        // so the array `key` is permanently bound to exactly one materializer that
+        // downloads exactly one buffer — making that buffer's contents the array's
+        // ONLY defined CPU value. Materialize it to the CPU array FIRST (while the
+        // buffer is still alive), THEN dispose, so a later CPU read (e.g. the CNN
+        // backward pass reading an activation in ComputeGradients) gets correct data
+        // instead of crashing with "buffer released before materialization"
+        // (OpenCL -5 / CL_INVALID_MEM_OBJECT). Dropping the registration instead
+        // would leave the array unmaterialized — silent garbage.
+        //
+        // This centralizes, at the single buffer-disposal chokepoint, the guard that
+        // EvictOldestActivationsUnsafe (skip-pending) and InvalidateGpuCacheForTensor
+        // (#283, manual materialize) previously implemented per-caller — so the
+        // unguarded stale-buffer re-upload paths in UploadTensor (and any future
+        // caller) are safe by construction. Idempotent: if a caller already
+        // materialized, IsPending is false and this is a no-op.
+        if (Helpers.DeferredArrayMaterializer.IsPending(key))
+        {
+            try { Helpers.DeferredArrayMaterializer.TryMaterialize(key); }
+            catch { Helpers.DeferredArrayMaterializer.Remove(key); }
+        }
+
         // Byte-accounting units must match the add/remove/evict paths
         // (CacheActivation, RemoveActivationCacheEntry, EvictOldestActivationsUnsafe).
         // All four go through Interlocked.Add(ref _currentActivationCacheBytes, ±SizeInBytes)
