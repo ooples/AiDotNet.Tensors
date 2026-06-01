@@ -864,6 +864,18 @@ public sealed partial class WebGpuBackend
         UploadToBuffer(outp, output);
     }
 
+    // Fused RWKV-4 WKV scan forward (#1464) — host fallback via the shared reference.
+    public void Rwkv4WkvForward(
+        IGpuBuffer r, IGpuBuffer k, IGpuBuffer v, IGpuBuffer timeDecay, IGpuBuffer timeFirst, IGpuBuffer output,
+        int batch, int seqLen, int modelDim)
+    {
+        var rd = DownloadBuffer(r); var kd = DownloadBuffer(k); var vd = DownloadBuffer(v);
+        var td = DownloadBuffer(timeDecay); var fd = DownloadBuffer(timeFirst);
+        var outp = new float[batch * seqLen * modelDim];
+        Cpu.RecurrenceCpuKernels.Rwkv4WkvForward(rd, kd, vd, td, fd, outp, batch, seqLen, modelDim);
+        UploadToBuffer(outp, output);
+    }
+
     public void LstmForwardSequence(
         IGpuBuffer input, IGpuBuffer hInit, IGpuBuffer cInit,
         IGpuBuffer weightsIh, IGpuBuffer weightsHh, IGpuBuffer biasIh, IGpuBuffer biasHh,

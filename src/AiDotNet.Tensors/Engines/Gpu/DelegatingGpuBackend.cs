@@ -1672,6 +1672,12 @@ public class DelegatingGpuBackend : IDirectGpuBackend
         => Inner.RgLruScanForward(value, recGate, inpGate, decay, output, batch, seqLen, recDim);
 
     /// <inheritdoc/>
+    public virtual void Rwkv4WkvForward(
+        IGpuBuffer r, IGpuBuffer k, IGpuBuffer v, IGpuBuffer timeDecay, IGpuBuffer timeFirst, IGpuBuffer output,
+        int batch, int seqLen, int modelDim)
+        => Inner.Rwkv4WkvForward(r, k, v, timeDecay, timeFirst, output, batch, seqLen, modelDim);
+
+    /// <inheritdoc/>
     public virtual void LstmBackwardSequence(
         IGpuBuffer gradOutput, IGpuBuffer allH, IGpuBuffer allC, IGpuBuffer cacheGates,
         IGpuBuffer hInit, IGpuBuffer cInit,

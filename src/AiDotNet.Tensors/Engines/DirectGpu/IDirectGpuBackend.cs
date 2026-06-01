@@ -2702,6 +2702,14 @@ public interface IDirectGpuBackend : IDisposable
         int batch, int seqLen, int recDim);
 
     /// <summary>
+    /// Fused RWKV-4 time-mixing WKV scan forward (#1464). r/k/v: [batch, seqLen, modelDim];
+    /// timeDecay/timeFirst: [modelDim]; output: [batch, seqLen, modelDim].
+    /// </summary>
+    void Rwkv4WkvForward(
+        IGpuBuffer r, IGpuBuffer k, IGpuBuffer v, IGpuBuffer timeDecay, IGpuBuffer timeFirst, IGpuBuffer output,
+        int batch, int seqLen, int modelDim);
+
+    /// <summary>
     /// Backward pass for LSTM sequence - computes gradients via BPTT.
     /// </summary>
     /// <param name="gradOutput">Gradient from next layer [seqLen * batch * hiddenSize].</param>

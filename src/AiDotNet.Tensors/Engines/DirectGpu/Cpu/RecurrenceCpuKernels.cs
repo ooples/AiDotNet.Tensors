@@ -212,6 +212,52 @@ internal static class RecurrenceCpuKernels
         }
     }
 
+    /// <summary>
+    /// RWKV-4 time-mixing WKV forward. r/k/v: [batch, seqLen, modelDim]; timeDecay/timeFirst: [modelDim].
+    /// Per-channel numerically-stable WKV recurrence (running max pp). out = sigmoid(r) * wkv.
+    /// </summary>
+    public static void Rwkv4WkvForward(
+        float[] r, float[] k, float[] v, float[] timeDecay, float[] timeFirst, float[] output,
+        int batch, int seqLen, int modelDim)
+    {
+        var w = new float[modelDim];
+        for (int c = 0; c < modelDim; c++) w[c] = -MathF.Exp(timeDecay[c]);
+        var aa = new float[modelDim];
+        var bb = new float[modelDim];
+        var pp = new float[modelDim];
+        for (int b = 0; b < batch; b++)
+        {
+            Array.Clear(aa, 0, modelDim);
+            Array.Clear(bb, 0, modelDim);
+            for (int c = 0; c < modelDim; c++) pp[c] = float.NegativeInfinity;
+            for (int t = 0; t < seqLen; t++)
+            {
+                int baseOff = (b * seqLen + t) * modelDim;
+                for (int c = 0; c < modelDim; c++)
+                {
+                    float kk = k[baseOff + c];
+                    float vv = v[baseOff + c];
+                    float u = timeFirst[c];
+
+                    float ww = u + kk;
+                    float q = MathF.Max(pp[c], ww);
+                    float e1 = MathF.Exp(pp[c] - q);
+                    float e2 = MathF.Exp(ww - q);
+                    float wkv = (e1 * aa[c] + e2 * vv) / (e1 * bb[c] + e2);
+                    output[baseOff + c] = (1.0f / (1.0f + MathF.Exp(-r[baseOff + c]))) * wkv;
+
+                    float ww2 = pp[c] + w[c];
+                    float q2 = MathF.Max(ww2, kk);
+                    float e1b = MathF.Exp(ww2 - q2);
+                    float e2b = MathF.Exp(kk - q2);
+                    aa[c] = e1b * aa[c] + e2b * vv;
+                    bb[c] = e1b * bb[c] + e2b;
+                    pp[c] = q2;
+                }
+            }
+        }
+    }
+
     private const float XLstmIGateClamp = 4.85e8f;
 
     /// <summary>

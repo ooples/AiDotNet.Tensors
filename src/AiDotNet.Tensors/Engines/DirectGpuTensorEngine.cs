@@ -6280,6 +6280,43 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
     }
 
+    // Fused RWKV-4 WKV scan (#1464). GPU inference fast path; defer to CpuEngine otherwise.
+    public override Tensor<T> Rwkv4WkvForward<T>(
+        Tensor<T> rProj, Tensor<T> kProj, Tensor<T> vProj, Tensor<T> timeDecay, Tensor<T> timeFirst)
+    {
+        if (IsTapeActive<T>() || typeof(T) != typeof(float) || !TryGetBackend(out var backend))
+            return base.Rwkv4WkvForward(rProj, kProj, vProj, timeDecay, timeFirst);
+        if (rProj.Rank != 3)
+            return base.Rwkv4WkvForward(rProj, kProj, vProj, timeDecay, timeFirst);
+
+        int batch = rProj.Shape._dims[0];
+        int seqLen = rProj.Shape._dims[1];
+        int modelDim = rProj.Shape._dims[2];
+        if (timeDecay.Rank != 1 || timeDecay.Shape._dims[0] != modelDim)
+            return base.Rwkv4WkvForward(rProj, kProj, vProj, timeDecay, timeFirst);
+
+        try
+        {
+            using var rB = GetOrAllocateBuffer(backend, rProj);
+            using var kB = GetOrAllocateBuffer(backend, kProj);
+            using var vB = GetOrAllocateBuffer(backend, vProj);
+            using var dB = GetOrAllocateBuffer(backend, timeDecay);
+            using var fB = GetOrAllocateBuffer(backend, timeFirst);
+            using var outB = AllocateOutputBuffer(backend, batch * seqLen * modelDim);
+
+            backend.Rwkv4WkvForward(rB.Buffer, kB.Buffer, vB.Buffer, dB.Buffer, fB.Buffer, outB.Buffer, batch, seqLen, modelDim);
+
+            float[] outF = new float[batch * seqLen * modelDim];
+            backend.DownloadBuffer(outB.Buffer, outF);
+            T[] outData = DirectGpuEngine.FromFloatArray<T>(outF);
+            return new Tensor<T>(outData, new[] { batch, seqLen, modelDim });
+        }
+        catch
+        {
+            return base.Rwkv4WkvForward(rProj, kProj, vProj, timeDecay, timeFirst);
+        }
+    }
+
     public override Tensor<T> FlashAttention<T>(
         Tensor<T> query,
         Tensor<T> key,

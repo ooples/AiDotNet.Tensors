@@ -467,4 +467,20 @@ public sealed partial class HipBackend
         uint total = (uint)(batch * recDim);
         LaunchKernel(kernel, (total + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize, (uint)DefaultBlockSize, args);
     }
+
+    // ── Fused RWKV-4 WKV scan forward (#1464) ──────────────────────────────────────────────
+    public unsafe void Rwkv4WkvForward(
+        IGpuBuffer r, IGpuBuffer k, IGpuBuffer v, IGpuBuffer timeDecay, IGpuBuffer timeFirst, IGpuBuffer output,
+        int batch, int seqLen, int modelDim)
+    {
+        if (!_kernelCache.TryGetValue("rwkv4_wkv_forward", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: rwkv4_wkv_forward");
+
+        IntPtr pr = r.Handle, pk = k.Handle, pv = v.Handle, pd = timeDecay.Handle, pf = timeFirst.Handle, pout = output.Handle;
+        void** args = stackalloc void*[9];
+        args[0] = &pr; args[1] = &pk; args[2] = &pv; args[3] = &pd; args[4] = &pf; args[5] = &pout;
+        args[6] = &batch; args[7] = &seqLen; args[8] = &modelDim;
+        uint total = (uint)(batch * modelDim);
+        LaunchKernel(kernel, (total + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize, (uint)DefaultBlockSize, args);
+    }
 }
