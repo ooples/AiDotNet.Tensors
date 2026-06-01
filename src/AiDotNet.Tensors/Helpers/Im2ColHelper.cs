@@ -739,15 +739,34 @@ internal static class Im2ColHelper
         int padH, int padW,
         int dilationH, int dilationW,
         int outputH, int outputW)
+        => Im2ColStridedSingleChannelRange(input, output, colRowStride, colColOffset,
+            0, channels, height, width, kernelH, kernelW, strideH, strideW,
+            padH, padW, dilationH, dilationW, outputH, outputW);
+
+    /// <summary>Strided-destination im2col for a single image (double), restricted to
+    /// input channels <paramref name="channelStart"/>..<paramref name="channelEnd"/>.
+    /// Each channel owns a disjoint block of <c>kernelH*kernelW</c> destination rows
+    /// (row block base <c>c*kernelH*kernelW</c>), so distinct channel ranges write to
+    /// disjoint rows and the build parallelizes over channels with no synchronization.</summary>
+    public static unsafe void Im2ColStridedSingleChannelRange(
+        ReadOnlySpan<double> input,
+        Span<double> output, int colRowStride, int colColOffset,
+        int channelStart, int channelEnd, int height, int width,
+        int kernelH, int kernelW,
+        int strideH, int strideW,
+        int padH, int padW,
+        int dilationH, int dilationW,
+        int outputH, int outputW)
     {
         int colW = outputH * outputW;
+        int kHW = kernelH * kernelW;
         fixed (double* inputPtr = input)
         fixed (double* outputPtr = output)
         {
             if (strideH == 1 && strideW == 1 && dilationH == 1 && dilationW == 1)
             {
-                int rowIdx = 0;
-                for (int c = 0; c < channels; c++)
+                int rowIdx = channelStart * kHW;
+                for (int c = channelStart; c < channelEnd; c++)
                 {
                     int channelOffset = c * height * width;
                     for (int kh = 0; kh < kernelH; kh++)
@@ -783,8 +802,8 @@ internal static class Im2ColHelper
             }
             else
             {
-                int rowIdx = 0;
-                for (int c = 0; c < channels; c++)
+                int rowIdx = channelStart * kHW;
+                for (int c = channelStart; c < channelEnd; c++)
                 {
                     int channelOffset = c * height * width;
                     for (int kh = 0; kh < kernelH; kh++)
@@ -824,15 +843,34 @@ internal static class Im2ColHelper
         int padH, int padW,
         int dilationH, int dilationW,
         int outputH, int outputW)
+        => Im2ColStridedSingleChannelRange(input, output, colRowStride, colColOffset,
+            0, channels, height, width, kernelH, kernelW, strideH, strideW,
+            padH, padW, dilationH, dilationW, outputH, outputW);
+
+    /// <summary>Strided-destination im2col for a single image (float), restricted to
+    /// input channels <paramref name="channelStart"/>..<paramref name="channelEnd"/>.
+    /// Float counterpart of the <c>double</c> channel-range overload — each channel owns
+    /// a disjoint <c>kernelH*kernelW</c>-row block, so the build parallelizes over
+    /// channels with no synchronization.</summary>
+    public static unsafe void Im2ColStridedSingleChannelRange(
+        ReadOnlySpan<float> input,
+        Span<float> output, int colRowStride, int colColOffset,
+        int channelStart, int channelEnd, int height, int width,
+        int kernelH, int kernelW,
+        int strideH, int strideW,
+        int padH, int padW,
+        int dilationH, int dilationW,
+        int outputH, int outputW)
     {
         int colW = outputH * outputW;
+        int kHW = kernelH * kernelW;
         fixed (float* inputPtr = input)
         fixed (float* outputPtr = output)
         {
             if (strideH == 1 && strideW == 1 && dilationH == 1 && dilationW == 1)
             {
-                int rowIdx = 0;
-                for (int c = 0; c < channels; c++)
+                int rowIdx = channelStart * kHW;
+                for (int c = channelStart; c < channelEnd; c++)
                 {
                     int channelOffset = c * height * width;
                     for (int kh = 0; kh < kernelH; kh++)
@@ -868,8 +906,8 @@ internal static class Im2ColHelper
             }
             else
             {
-                int rowIdx = 0;
-                for (int c = 0; c < channels; c++)
+                int rowIdx = channelStart * kHW;
+                for (int c = channelStart; c < channelEnd; c++)
                 {
                     int channelOffset = c * height * width;
                     for (int kh = 0; kh < kernelH; kh++)
