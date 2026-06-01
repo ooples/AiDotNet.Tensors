@@ -2659,6 +2659,23 @@ public interface IDirectGpuBackend : IDisposable
         int seqLen, int batch, int inputSize, int hiddenSize);
 
     /// <summary>
+    /// Fused Gated Linear Attention scan forward (#1464). q/k/v: [batch, seqLen, modelDim];
+    /// gate: [batch, seqLen, numHeads]; output: [batch, seqLen, modelDim].
+    /// </summary>
+    void GlaScanForward(
+        IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer gate, IGpuBuffer output,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim);
+
+    /// <summary>
+    /// Fused Gated Linear Attention scan BPTT backward (#1464). dQ/dK/dV: [batch, seqLen, modelDim];
+    /// dG: [batch, seqLen, numHeads]. The gradient buffers must be pre-zeroed (atomic accumulation).
+    /// </summary>
+    void GlaScanBackward(
+        IGpuBuffer dOut, IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer gate,
+        IGpuBuffer dQ, IGpuBuffer dK, IGpuBuffer dV, IGpuBuffer dG,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim);
+
+    /// <summary>
     /// Backward pass for LSTM sequence - computes gradients via BPTT.
     /// </summary>
     /// <param name="gradOutput">Gradient from next layer [seqLen * batch * hiddenSize].</param>

@@ -6116,6 +6116,49 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// Supports optional attention bias (ALiBi) — the bias is uploaded to GPU and passed to the kernel.
     /// Falls back to CPU implementation when GPU is unavailable or on any GPU error.
     /// </summary>
+    // Fused GLA scan (#1464). The GPU kernel is the inference fast path; when a tape is
+    // active (or T is not float, or no backend), defer to the differentiable CpuEngine path
+    // which records the BPTT backward — same precedent as FlashAttention / MlpForward.
+    public override Tensor<T> GlaScanForward<T>(
+        Tensor<T> qProj, Tensor<T> kProj, Tensor<T> vProj, Tensor<T> gate, int numHeads)
+    {
+        if (IsTapeActive<T>() || typeof(T) != typeof(float) || !TryGetBackend(out var backend))
+            return base.GlaScanForward(qProj, kProj, vProj, gate, numHeads);
+        if (qProj.Rank != 3 || numHeads < 1)
+            return base.GlaScanForward(qProj, kProj, vProj, gate, numHeads);
+
+        int batch = qProj.Shape._dims[0];
+        int seqLen = qProj.Shape._dims[1];
+        int modelDim = qProj.Shape._dims[2];
+        if (numHeads < 1 || modelDim % numHeads != 0)
+            return base.GlaScanForward(qProj, kProj, vProj, gate, numHeads);
+        int headDim = modelDim / numHeads;
+        // Kernel caps the register-resident state row; gate must be scalar-per-head.
+        if (headDim > 256 || gate.Rank != 3 || gate.Shape._dims[2] != numHeads)
+            return base.GlaScanForward(qProj, kProj, vProj, gate, numHeads);
+
+        try
+        {
+            using var qB = GetOrAllocateBuffer(backend, qProj);
+            using var kB = GetOrAllocateBuffer(backend, kProj);
+            using var vB = GetOrAllocateBuffer(backend, vProj);
+            using var gB = GetOrAllocateBuffer(backend, gate);
+            using var outB = AllocateOutputBuffer(backend, batch * seqLen * modelDim);
+
+            backend.GlaScanForward(qB.Buffer, kB.Buffer, vB.Buffer, gB.Buffer, outB.Buffer,
+                batch, seqLen, modelDim, numHeads, headDim);
+
+            float[] outF = new float[batch * seqLen * modelDim];
+            backend.DownloadBuffer(outB.Buffer, outF);
+            T[] outData = DirectGpuEngine.FromFloatArray<T>(outF);
+            return new Tensor<T>(outData, new[] { batch, seqLen, modelDim });
+        }
+        catch
+        {
+            return base.GlaScanForward(qProj, kProj, vProj, gate, numHeads);
+        }
+    }
+
     public override Tensor<T> FlashAttention<T>(
         Tensor<T> query,
         Tensor<T> key,

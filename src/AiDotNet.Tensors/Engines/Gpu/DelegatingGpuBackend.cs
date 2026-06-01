@@ -1640,6 +1640,19 @@ public class DelegatingGpuBackend : IDirectGpuBackend
             output, hFinal, cFinal, allH, allC, cacheGates, seqLen, batch, inputSize, hiddenSize);
 
     /// <inheritdoc/>
+    public virtual void GlaScanForward(
+        IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer gate, IGpuBuffer output,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim)
+        => Inner.GlaScanForward(q, k, v, gate, output, batch, seqLen, modelDim, numHeads, headDim);
+
+    /// <inheritdoc/>
+    public virtual void GlaScanBackward(
+        IGpuBuffer dOut, IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer gate,
+        IGpuBuffer dQ, IGpuBuffer dK, IGpuBuffer dV, IGpuBuffer dG,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim)
+        => Inner.GlaScanBackward(dOut, q, k, v, gate, dQ, dK, dV, dG, batch, seqLen, modelDim, numHeads, headDim);
+
+    /// <inheritdoc/>
     public virtual void LstmBackwardSequence(
         IGpuBuffer gradOutput, IGpuBuffer allH, IGpuBuffer allC, IGpuBuffer cacheGates,
         IGpuBuffer hInit, IGpuBuffer cInit,
