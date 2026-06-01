@@ -339,6 +339,28 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
     }
 
     /// <summary>
+    /// Executes a GLSL-compiled compute pipeline with N buffers + push constants (#1464 recurrence ops).
+    /// Buffers bind to set=0, binding=0..N-1 in order; pushConstants are the kernel's int params as uints.
+    /// </summary>
+    private void GlslNaryOp(string glslSource, IGpuBuffer[] buffers, int dispatchSize, uint[] pushConstants)
+    {
+        EnsureInitialized();
+        if (dispatchSize <= 0) return;
+        uint pushConstantSize = (uint)(pushConstants.Length * sizeof(uint));
+        var pipeline = GetOrCreateGlslPipeline(glslSource, buffers.Length, pushConstantSize);
+        if (pipeline is null)
+            throw new InvalidOperationException("Failed to create GLSL recurrence pipeline.");
+        var storages = new VulkanBuffer[buffers.Length];
+        for (int i = 0; i < buffers.Length; i++) storages[i] = AsVulkan(buffers[i]).Storage;
+        var threadRes = _device.AcquireThreadResources();
+        lock (_computeLock)
+        {
+            pipeline.UpdateDescriptorSet(storages);
+            RecordAndExecuteWithPushData(pipeline, dispatchSize, pushConstants, pushConstantSize, threadRes);
+        }
+    }
+
+    /// <summary>
     /// Executes a GLSL-compiled compute pipeline with 1 buffer (output only) + push constants.
     /// Used for generate ops like Eye, Linspace, TriangularMask.
     /// </summary>
