@@ -29,7 +29,7 @@ public class GlaScanTests
                 for (int t = 0; t < seqLen; t++)
                 {
                     int off = (b * seqLen + t) * modelDim + hOff;
-                    double g = G[off];
+                    double g = G[(b * seqLen + t) * numHeads + h]; // scalar-per-head gate
                     for (int di = 0; di < headDim; di++)
                         for (int ki = 0; ki < headDim; ki++)
                             S[di * headDim + ki] = g * S[di * headDim + ki] + K[off + ki] * V[off + di];
@@ -61,12 +61,15 @@ public class GlaScanTests
     }
 
     private static (Tensor<double> q, Tensor<double> k, Tensor<double> v, Tensor<double> g)
-        MakeInputs(int batch, int seqLen, int modelDim, int seed)
+        MakeInputs(int batch, int seqLen, int modelDim, int numHeads, int seed)
     {
         int n = batch * seqLen * modelDim;
         var shape = new[] { batch, seqLen, modelDim };
+        // Gate is scalar-per-head: [batch, seqLen, numHeads].
+        int gn = batch * seqLen * numHeads;
+        var gShape = new[] { batch, seqLen, numHeads };
         return (new Tensor<double>(Gen(n, seed), shape), new Tensor<double>(Gen(n, seed + 1), shape),
-                new Tensor<double>(Gen(n, seed + 2), shape), new Tensor<double>(GenGate(n, seed + 3), shape));
+                new Tensor<double>(Gen(n, seed + 2), shape), new Tensor<double>(GenGate(gn, seed + 3), gShape));
     }
 
     [Fact]
@@ -74,7 +77,7 @@ public class GlaScanTests
     {
         var engine = new CpuEngine();
         int batch = 2, seqLen = 5, modelDim = 6, numHeads = 2;
-        var (q, k, v, g) = MakeInputs(batch, seqLen, modelDim, 9);
+        var (q, k, v, g) = MakeInputs(batch, seqLen, modelDim, numHeads, 9);
 
         var outp = engine.GlaScanForward(q, k, v, g, numHeads);
         var expected = ReferenceForward(
@@ -93,7 +96,7 @@ public class GlaScanTests
     {
         var engine = new CpuEngine();
         int batch = 1, seqLen = 4, modelDim = 4, numHeads = 2;
-        var (q, k, v, g) = MakeInputs(batch, seqLen, modelDim, 5);
+        var (q, k, v, g) = MakeInputs(batch, seqLen, modelDim, numHeads, 5);
 
         Tensor<double> outp;
         System.Collections.Generic.Dictionary<Tensor<double>, Tensor<double>> grads;

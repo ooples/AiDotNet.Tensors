@@ -115,4 +115,78 @@ public class FusedLinearCrossEntropyTests
         var loss = engine.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, target);
         return ((double[])(object)loss.GetDataArray()!)[0];
     }
+
+    // ── Index-target (primary) overload ───────────────────────────────────────────────────
+
+    private static int[] Ids(int n, int vocab, int seed)
+    {
+        var a = new int[n];
+        for (int r = 0; r < n; r++) a[r] = (r * 7 + seed) % vocab;
+        return a;
+    }
+
+    private static double[] OneHotFromIds(int[] ids, int vocab)
+    {
+        var a = new double[ids.Length * vocab];
+        for (int r = 0; r < ids.Length; r++) a[r * vocab + ids[r]] = 1.0;
+        return a;
+    }
+
+    [Fact]
+    public void IndexForward_MatchesDenseOneHotReference()
+    {
+        var engine = new CpuEngine();
+        int n = 4, d = 5, vocab = 6;
+        var hidden = new Tensor<double>(Gen(n * d, 1), new[] { n, d });
+        var weight = new Tensor<double>(Gen(d * vocab, 2), new[] { d, vocab });
+        var bias = new Tensor<double>(Gen(vocab, 3, 0.3), new[] { vocab });
+        var ids = Ids(n, vocab, 2);
+
+        var loss = engine.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, new Tensor<int>(ids, new[] { n }));
+        double got = ((double[])(object)loss.GetDataArray()!)[0];
+        // Index-target CE must equal dense CE against the equivalent one-hot distribution.
+        double expected = ReferenceLoss(
+            (double[])(object)hidden.GetDataArray()!, (double[])(object)weight.GetDataArray()!,
+            (double[])(object)bias.GetDataArray()!, OneHotFromIds(ids, vocab), n, d, vocab);
+        Assert.True(Math.Abs(got - expected) < 1e-10, $"index loss {got} vs one-hot reference {expected}");
+    }
+
+    [Fact]
+    public void IndexBackward_MatchesFiniteDifferences()
+    {
+        var engine = new CpuEngine();
+        int n = 3, d = 4, vocab = 5;
+        var hidden = new Tensor<double>(Gen(n * d, 1), new[] { n, d });
+        var weight = new Tensor<double>(Gen(d * vocab, 2), new[] { d, vocab });
+        var bias = new Tensor<double>(Gen(vocab, 3, 0.3), new[] { vocab });
+        var ids = new Tensor<int>(Ids(n, vocab, 2), new[] { n });
+
+        System.Collections.Generic.Dictionary<Tensor<double>, Tensor<double>> grads;
+        using (var tape = new GradientTape<double>())
+        {
+            var loss = engine.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, ids);
+            grads = tape.ComputeGradients(loss, new[] { hidden, weight, bias });
+        }
+
+        const double eps = 1e-6;
+        foreach (var input in new[] { hidden, weight, bias })
+        {
+            var data = (double[])(object)input.GetDataArray()!;
+            var grad = grads[input];
+            for (int i = 0; i < data.Length; i++)
+            {
+                double orig = data[i];
+                data[i] = orig + eps;
+                double lp = ((double[])(object)engine.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, ids).GetDataArray()!)[0];
+                data[i] = orig - eps;
+                double lm = ((double[])(object)engine.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, ids).GetDataArray()!)[0];
+                data[i] = orig;
+                double numeric = (lp - lm) / (2.0 * eps);
+                double analytic = grad.GetFlat(i);
+                double tol = 1e-5 + 1e-4 * Math.Abs(analytic);
+                Assert.True(Math.Abs(numeric - analytic) < tol,
+                    $"grad mismatch at element {i}: analytic={analytic}, finite-diff={numeric}");
+            }
+        }
+    }
 }

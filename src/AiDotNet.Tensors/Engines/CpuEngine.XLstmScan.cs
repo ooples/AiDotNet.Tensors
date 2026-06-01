@@ -25,16 +25,16 @@ public partial class CpuEngine
     ///   nf         = max(|sum_j n_t[j] * Q_t[j]|, 1)
     ///   h_t[di]    = o_t * num[di] / nf
     /// </code>
-    /// The gates are passed post-activation (i = exp(...), f/o = sigmoid(...)); the op uses the per-head
-    /// first element as the scalar gate (and clamps i to <see cref="XLstmIGateClamp"/>). Records one
-    /// differentiable tape node (the BPTT adjoint), so it is safe under an active <c>GradientTape</c>.
+    /// The gates are passed post-activation (i = exp(...), f/o = sigmoid(...)) as scalar-per-head
+    /// values (and i is clamped to <see cref="XLstmIGateClamp"/>). Records one differentiable tape
+    /// node (the BPTT adjoint), so it is safe under an active <c>GradientTape</c>.
     /// </summary>
     /// <param name="qProj">Query projection [batch, seqLen, modelDim].</param>
     /// <param name="kProj">Key projection [batch, seqLen, modelDim] (scaled by 1/sqrt(headDim) internally).</param>
     /// <param name="vProj">Value projection [batch, seqLen, modelDim].</param>
-    /// <param name="iGate">Post-exp input gate [batch, seqLen, modelDim] (per-head first element used).</param>
-    /// <param name="fGate">Post-sigmoid forget gate [batch, seqLen, modelDim] (per-head first element used).</param>
-    /// <param name="oGate">Post-sigmoid output gate [batch, seqLen, modelDim] (per-head first element used).</param>
+    /// <param name="iGate">Post-exp scalar-per-head input gate [batch, seqLen, numHeads].</param>
+    /// <param name="fGate">Post-sigmoid scalar-per-head forget gate [batch, seqLen, numHeads].</param>
+    /// <param name="oGate">Post-sigmoid scalar-per-head output gate [batch, seqLen, numHeads].</param>
     /// <param name="numHeads">Number of heads; modelDim must be divisible by it.</param>
     /// <returns>The pre-output-projection hidden state [batch, seqLen, modelDim].</returns>
     public virtual Tensor<T> XLstmScanForward<T>(
@@ -59,9 +59,10 @@ public partial class CpuEngine
         int headDim = modelDim / numHeads;
         EnsureSameShape(qProj, kProj, nameof(kProj));
         EnsureSameShape(qProj, vProj, nameof(vProj));
-        EnsureSameShape(qProj, iGate, nameof(iGate));
-        EnsureSameShape(qProj, fGate, nameof(fGate));
-        EnsureSameShape(qProj, oGate, nameof(oGate));
+        // Gates are scalar-per-head: [batch, seqLen, numHeads], not the full modelDim.
+        EnsureGateShape(iGate, batch, seqLen, numHeads, nameof(iGate));
+        EnsureGateShape(fGate, batch, seqLen, numHeads, nameof(fGate));
+        EnsureGateShape(oGate, batch, seqLen, numHeads, nameof(oGate));
 
         var output = new Tensor<T>(new[] { batch, seqLen, modelDim });
 
@@ -109,8 +110,9 @@ public partial class CpuEngine
                 for (int t = 0; t < seqLen; t++)
                 {
                     int baseOff = (b * seqLen + t) * modelDim + hOff;
-                    double iv = I[baseOff]; if (iv > XLstmIGateClamp) iv = XLstmIGateClamp;
-                    double f = F[baseOff], o = O[baseOff];
+                    int gOff = (b * seqLen + t) * numHeads + h; // scalar-per-head gate offset
+                    double iv = I[gOff]; if (iv > XLstmIGateClamp) iv = XLstmIGateClamp;
+                    double f = F[gOff], o = O[gOff];
                     for (int di = 0; di < headDim; di++)
                     {
                         double kSdi = K[baseOff + di] * kappa;
@@ -168,8 +170,9 @@ public partial class CpuEngine
                     Array.Copy(C, 0, Ctraj, t * hh, hh);
                     Array.Copy(n, 0, ntraj, t * headDim, headDim);
                     int baseOff = (b * seqLen + t) * modelDim + hOff;
-                    double iv = I[baseOff]; if (iv > XLstmIGateClamp) iv = XLstmIGateClamp;
-                    double f = F[baseOff];
+                    int gOff = (b * seqLen + t) * numHeads + h;
+                    double iv = I[gOff]; if (iv > XLstmIGateClamp) iv = XLstmIGateClamp;
+                    double f = F[gOff];
                     for (int di = 0; di < headDim; di++)
                     {
                         n[di] = f * n[di] + iv * (K[baseOff + di] * kappa);
@@ -185,8 +188,9 @@ public partial class CpuEngine
                 for (int t = seqLen - 1; t >= 0; t--)
                 {
                     int baseOff = (b * seqLen + t) * modelDim + hOff;
-                    double iv = I[baseOff]; bool iClamped = iv > XLstmIGateClamp; if (iClamped) iv = XLstmIGateClamp;
-                    double f = F[baseOff], o = O[baseOff];
+                    int gOff = (b * seqLen + t) * numHeads + h;
+                    double iv = I[gOff]; bool iClamped = iv > XLstmIGateClamp; if (iClamped) iv = XLstmIGateClamp;
+                    double f = F[gOff], o = O[gOff];
                     int cpOff = t * hh, npOff = t * headDim;
 
                     // Recompute post-update C_t, n_t, nq, nf for this step.
@@ -226,7 +230,7 @@ public partial class CpuEngine
                             dQ[baseOff + ki] += dNum * C[srow + ki];
                         }
                     }
-                    dO[baseOff] += dO_acc;
+                    dO[gOff] += dO_acc;
 
                     // nf = max(|nq|,1); nq = sum_j n_t[j]*Q[j].
                     double dnq = dnf * dNfSign;
@@ -272,8 +276,8 @@ public partial class CpuEngine
                     for (int j = 0; j < headDim; j++) dK[baseOff + j] += dKS[j] * kappa;
 
                     // i gate clamp: gradient passes through only when not clamped.
-                    dI[baseOff] += iClamped ? 0.0 : dI_acc;
-                    dF[baseOff] += dF_acc;
+                    dI[gOff] += iClamped ? 0.0 : dI_acc;
+                    dF[gOff] += dF_acc;
 
                     // Carry adjoints to the previous step.
                     Array.Copy(dCp, 0, dC, 0, hh);
@@ -305,8 +309,9 @@ public partial class CpuEngine
                 for (int t = 0; t < seqLen; t++)
                 {
                     int baseOff = (b * seqLen + t) * modelDim + hOff;
-                    T iv = I[baseOff]; if (ops.GreaterThan(iv, clamp)) iv = clamp;
-                    T f = F[baseOff], o = O[baseOff];
+                    int gOff = (b * seqLen + t) * numHeads + h; // scalar-per-head gate offset
+                    T iv = I[gOff]; if (ops.GreaterThan(iv, clamp)) iv = clamp;
+                    T f = F[gOff], o = O[gOff];
                     for (int di = 0; di < headDim; di++)
                     {
                         T kSdi = ops.Multiply(K[baseOff + di], kappa);
@@ -365,8 +370,9 @@ public partial class CpuEngine
                     Array.Copy(C, 0, Ctraj, t * hh, hh);
                     Array.Copy(n, 0, ntraj, t * headDim, headDim);
                     int baseOff = (b * seqLen + t) * modelDim + hOff;
-                    T iv = I[baseOff]; if (ops.GreaterThan(iv, clamp)) iv = clamp;
-                    T f = F[baseOff];
+                    int gOff = (b * seqLen + t) * numHeads + h;
+                    T iv = I[gOff]; if (ops.GreaterThan(iv, clamp)) iv = clamp;
+                    T f = F[gOff];
                     for (int di = 0; di < headDim; di++)
                     {
                         n[di] = ops.Add(ops.Multiply(f, n[di]), ops.Multiply(iv, ops.Multiply(K[baseOff + di], kappa)));
@@ -383,8 +389,9 @@ public partial class CpuEngine
                 for (int t = seqLen - 1; t >= 0; t--)
                 {
                     int baseOff = (b * seqLen + t) * modelDim + hOff;
-                    T iv = I[baseOff]; bool iClamped = ops.GreaterThan(iv, clamp); if (iClamped) iv = clamp;
-                    T f = F[baseOff], o = O[baseOff];
+                    int gOff = (b * seqLen + t) * numHeads + h;
+                    T iv = I[gOff]; bool iClamped = ops.GreaterThan(iv, clamp); if (iClamped) iv = clamp;
+                    T f = F[gOff], o = O[gOff];
                     int cpOff = t * hh, npOff = t * headDim;
 
                     T nq = zero;
@@ -425,7 +432,7 @@ public partial class CpuEngine
                             dQ[baseOff + ki] = ops.Add(dQ[baseOff + ki], ops.Multiply(dNum, C[srow + ki]));
                         }
                     }
-                    dO[baseOff] = ops.Add(dO[baseOff], dO_acc);
+                    dO[gOff] = ops.Add(dO[gOff], dO_acc);
 
                     T dnq = ops.Multiply(dnf, dNfSign);
                     for (int j = 0; j < headDim; j++)
@@ -465,8 +472,8 @@ public partial class CpuEngine
                     }
                     for (int j = 0; j < headDim; j++) dK[baseOff + j] = ops.Add(dK[baseOff + j], ops.Multiply(dKS[j], kappa));
 
-                    if (!iClamped) dI[baseOff] = ops.Add(dI[baseOff], dI_acc);
-                    dF[baseOff] = ops.Add(dF[baseOff], dF_acc);
+                    if (!iClamped) dI[gOff] = ops.Add(dI[gOff], dI_acc);
+                    dF[gOff] = ops.Add(dF[gOff], dF_acc);
 
                     Array.Copy(dCp, 0, dC, 0, hh);
                     Array.Copy(dNp, 0, dN, 0, headDim);
@@ -495,9 +502,9 @@ public partial class CpuEngine
         var dQ = new Tensor<T>(new[] { batch, seqLen, modelDim });
         var dK = new Tensor<T>(new[] { batch, seqLen, modelDim });
         var dV = new Tensor<T>(new[] { batch, seqLen, modelDim });
-        var dI = new Tensor<T>(new[] { batch, seqLen, modelDim });
-        var dF = new Tensor<T>(new[] { batch, seqLen, modelDim });
-        var dO = new Tensor<T>(new[] { batch, seqLen, modelDim });
+        var dI = new Tensor<T>(new[] { batch, seqLen, numHeads }); // scalar-per-head gates
+        var dF = new Tensor<T>(new[] { batch, seqLen, numHeads });
+        var dO = new Tensor<T>(new[] { batch, seqLen, numHeads });
 
         if (typeof(T) == typeof(double))
         {

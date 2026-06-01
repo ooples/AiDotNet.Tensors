@@ -28,6 +28,70 @@ public partial class CpuEngine
     /// <param name="hidden">Pre-head hidden states [N, d] (N = batch·seq).</param>
     /// <param name="weight">LM head weight [d, vocab] (DenseLayer [inputSize, outputSize]).</param>
     /// <param name="bias">LM head bias [vocab].</param>
+    /// <param name="targetIds">Per-row class id [N], each in [0, vocab).</param>
+    /// <returns>Scalar (length-1) mean cross-entropy loss.</returns>
+    public virtual Tensor<T> FusedLinearCrossEntropyWithLogits<T>(
+        Tensor<T> hidden, Tensor<T> weight, Tensor<T> bias, Tensor<int> targetIds)
+    {
+        if (hidden is null) throw new ArgumentNullException(nameof(hidden));
+        if (weight is null) throw new ArgumentNullException(nameof(weight));
+        if (bias is null) throw new ArgumentNullException(nameof(bias));
+        if (targetIds is null) throw new ArgumentNullException(nameof(targetIds));
+        if (hidden.Rank != 2)
+            throw new ArgumentException($"hidden must be rank-2 [N, d]; got rank {hidden.Rank}.", nameof(hidden));
+        if (weight.Rank != 2)
+            throw new ArgumentException($"weight must be rank-2 [d, vocab]; got rank {weight.Rank}.", nameof(weight));
+
+        int n = hidden.Shape[0];
+        int d = hidden.Shape[1];
+        int vocab = weight.Shape[1];
+        if (weight.Shape[0] != d)
+            throw new ArgumentException($"weight dim0 ({weight.Shape[0]}) must equal hidden dim1 ({d}).", nameof(weight));
+        if (bias.Length != vocab)
+            throw new ArgumentException($"bias length ({bias.Length}) must equal vocab ({vocab}).", nameof(bias));
+        if (targetIds.Rank != 1 || targetIds.Length != n)
+            throw new ArgumentException($"targetIds must be [N={n}].", nameof(targetIds));
+
+        var ids = (int[])(object)targetIds.GetDataArray()!;
+        for (int r = 0; r < n; r++)
+            if (ids[r] < 0 || ids[r] >= vocab)
+                throw new ArgumentOutOfRangeException(nameof(targetIds),
+                    $"targetIds[{r}] ({ids[r]}) must be in [0, vocab={vocab}).");
+
+        // logits = hidden·weight + bias, computed off-tape (this op records its own node).
+        Tensor<T> logits;
+        using (new NoGradScope<T>())
+        {
+            logits = TensorMatMul(hidden, weight);
+            AddBiasRows(logits, bias, n, vocab);
+        }
+
+        double lossValue = typeof(T) == typeof(double)
+            ? FusedCeLossIndexDouble((double[])(object)logits.GetDataArray()!, ids, n, vocab)
+            : FusedCeLossIndexGeneric<T>(logits.GetDataArray()!, ids, n, vocab);
+
+        var output = new Tensor<T>(new[] { 1 }); // scalar loss (length-1)
+        output.GetDataArray()![0] = MathHelper.GetNumericOperations<T>().FromDouble(lossValue);
+
+        // target ids are supervision (no gradient): carry them in savedState rather than as a
+        // differentiable tape input. Backward reconstructs dlogits = softmax - onehot(id).
+        DifferentiableOps.RecordIfActive<T>(
+            "FusedLinearCrossEntropy", output,
+            new[] { hidden, weight, bias },
+            FusedLinearCrossEntropyIndexBackward<T>,
+            savedState: new object[] { ids, vocab });
+
+        return output;
+    }
+
+    /// <summary>
+    /// Dense-target overload: <paramref name="target"/> is a full per-row distribution / one-hot
+    /// [N, vocab] for soft / distillation supervision. Prefer the int-id overload for standard LM
+    /// training to avoid the O(N·vocab) dense label storage/bandwidth.
+    /// </summary>
+    /// <param name="hidden">Pre-head hidden states [N, d] (N = batch·seq).</param>
+    /// <param name="weight">LM head weight [d, vocab] (DenseLayer [inputSize, outputSize]).</param>
+    /// <param name="bias">LM head bias [vocab].</param>
     /// <param name="target">Per-row categorical target distribution / one-hot [N, vocab].</param>
     /// <returns>Scalar (rank-0) mean cross-entropy loss.</returns>
     public virtual Tensor<T> FusedLinearCrossEntropyWithLogits<T>(
@@ -145,6 +209,125 @@ public partial class CpuEngine
             total += rowLoss;
         }
         return -total / n;
+    }
+
+    // Index-target mean CE = -(1/N) Σ_r (logit[r, id_r] - logSumExp_r). Numerically stable.
+    private static double FusedCeLossIndexDouble(double[] logits, int[] ids, int n, int vocab)
+    {
+        double total = 0.0;
+        for (int r = 0; r < n; r++)
+        {
+            int off = r * vocab;
+            double max = logits[off];
+            for (int v = 1; v < vocab; v++) if (logits[off + v] > max) max = logits[off + v];
+            double sumExp = 0.0;
+            for (int v = 0; v < vocab; v++) sumExp += Math.Exp(logits[off + v] - max);
+            double lse = max + Math.Log(sumExp);
+            total += logits[off + ids[r]] - lse;
+        }
+        return -total / n;
+    }
+
+    private static double FusedCeLossIndexGeneric<T>(T[] logits, int[] ids, int n, int vocab)
+    {
+        var ops = MathHelper.GetNumericOperations<T>();
+        double total = 0.0;
+        for (int r = 0; r < n; r++)
+        {
+            int off = r * vocab;
+            double max = ops.ToDouble(logits[off]);
+            for (int v = 1; v < vocab; v++) { double lv = ops.ToDouble(logits[off + v]); if (lv > max) max = lv; }
+            double sumExp = 0.0;
+            for (int v = 0; v < vocab; v++) sumExp += Math.Exp(ops.ToDouble(logits[off + v]) - max);
+            double lse = max + Math.Log(sumExp);
+            total += ops.ToDouble(logits[off + ids[r]]) - lse;
+        }
+        return -total / n;
+    }
+
+    // Index-target backward. dlogits[r,v] = (softmax(logits)[r,v] - [v == id_r]) · g/N.
+    private static void FusedLinearCrossEntropyIndexBackward<T>(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output, object[] savedState,
+        IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var hidden = inputs[0];
+        var weight = inputs[1];
+        var bias = inputs[2];
+        var ids = (int[])savedState[0];
+        int vocab = (int)savedState[1];
+
+        int n = hidden.Shape[0];
+        var ops = MathHelper.GetNumericOperations<T>();
+        double g = ops.ToDouble(gradOutput.GetDataArray()![0]);
+
+        var dLogits = new Tensor<T>(new[] { n, vocab });
+        using (new NoGradScope<T>())
+        {
+            var logits = engine.TensorMatMul(hidden, weight);
+            AddBiasRows(logits, bias, n, vocab);
+            if (typeof(T) == typeof(double))
+            {
+                SoftmaxMinusIndexDouble(
+                    (double[])(object)logits.GetDataArray()!, ids,
+                    (double[])(object)dLogits.GetDataArray()!, n, vocab, g);
+            }
+            else
+            {
+                SoftmaxMinusIndexGeneric<T>(logits.GetDataArray()!, ids, dLogits.GetDataArray()!, n, vocab, g);
+            }
+
+            var dHidden = engine.TensorMatMulTransposed(dLogits, weight);
+            var dWeight = engine.TensorMatMul(engine.TensorTranspose(hidden), dLogits);
+            var dBias = ColumnSums(dLogits, n, vocab);
+
+            DifferentiableOps.AccumulateGrad(grads, hidden, dHidden, engine);
+            DifferentiableOps.AccumulateGrad(grads, weight, dWeight, engine);
+            DifferentiableOps.AccumulateGrad(grads, bias, dBias, engine);
+            // target ids are supervision — no gradient flows to them.
+        }
+    }
+
+    private static void SoftmaxMinusIndexDouble(
+        double[] logits, int[] ids, double[] dLogits, int n, int vocab, double g)
+    {
+        double scale = g / n;
+        for (int r = 0; r < n; r++)
+        {
+            int off = r * vocab;
+            double max = logits[off];
+            for (int v = 1; v < vocab; v++) if (logits[off + v] > max) max = logits[off + v];
+            double sumExp = 0.0;
+            for (int v = 0; v < vocab; v++) sumExp += Math.Exp(logits[off + v] - max);
+            double inv = 1.0 / sumExp;
+            int id = ids[r];
+            for (int v = 0; v < vocab; v++)
+            {
+                double sm = Math.Exp(logits[off + v] - max) * inv;
+                dLogits[off + v] = (sm - (v == id ? 1.0 : 0.0)) * scale;
+            }
+        }
+    }
+
+    private static void SoftmaxMinusIndexGeneric<T>(
+        T[] logits, int[] ids, T[] dLogits, int n, int vocab, double g)
+    {
+        var ops = MathHelper.GetNumericOperations<T>();
+        double scale = g / n;
+        for (int r = 0; r < n; r++)
+        {
+            int off = r * vocab;
+            double max = ops.ToDouble(logits[off]);
+            for (int v = 1; v < vocab; v++) { double lv = ops.ToDouble(logits[off + v]); if (lv > max) max = lv; }
+            double sumExp = 0.0;
+            for (int v = 0; v < vocab; v++) sumExp += Math.Exp(ops.ToDouble(logits[off + v]) - max);
+            double inv = 1.0 / sumExp;
+            int id = ids[r];
+            for (int v = 0; v < vocab; v++)
+            {
+                double sm = Math.Exp(ops.ToDouble(logits[off + v]) - max) * inv;
+                dLogits[off + v] = ops.FromDouble((sm - (v == id ? 1.0 : 0.0)) * scale);
+            }
+        }
     }
 
     private static void FusedLinearCrossEntropyBackward<T>(

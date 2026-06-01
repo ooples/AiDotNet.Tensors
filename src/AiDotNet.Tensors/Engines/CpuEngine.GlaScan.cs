@@ -22,13 +22,14 @@ public partial class CpuEngine
     ///   O_t[ki]    = sum_di Q_t[di] * S_t[di,ki]
     /// </code>
     /// Records one tape node whose backward is the exact BPTT adjoint, so it is differentiable under an
-    /// active <c>GradientTape</c>. Inputs are the already-projected q/k/v/gate streams; the gate is the
-    /// post-sigmoid value (the layer's sigmoid records its own tape node).
+    /// active <c>GradientTape</c>. Inputs are the already-projected q/k/v streams plus a
+    /// scalar-per-head gate; the gate is the post-sigmoid value (the layer's sigmoid records
+    /// its own tape node).
     /// </summary>
     /// <param name="qProj">Query projection [batch, seqLen, modelDim].</param>
     /// <param name="kProj">Key projection [batch, seqLen, modelDim].</param>
     /// <param name="vProj">Value projection [batch, seqLen, modelDim].</param>
-    /// <param name="gate">Post-sigmoid gate [batch, seqLen, modelDim]; only the per-head first element is used.</param>
+    /// <param name="gate">Post-sigmoid scalar-per-head gate [batch, seqLen, numHeads].</param>
     /// <param name="numHeads">Number of heads; modelDim must be divisible by it.</param>
     /// <returns>The attention output [batch, seqLen, modelDim].</returns>
     public virtual Tensor<T> GlaScanForward<T>(
@@ -50,7 +51,9 @@ public partial class CpuEngine
         int headDim = modelDim / numHeads;
         EnsureSameShape(qProj, kProj, nameof(kProj));
         EnsureSameShape(qProj, vProj, nameof(vProj));
-        EnsureSameShape(qProj, gate, nameof(gate));
+        // Gate is scalar-per-head: [batch, seqLen, numHeads], not the full modelDim.
+        if (gate.Rank != 3 || gate.Shape[0] != batch || gate.Shape[1] != seqLen || gate.Shape[2] != numHeads)
+            throw new ArgumentException($"gate must be [batch={batch}, seqLen={seqLen}, numHeads={numHeads}].", nameof(gate));
 
         var output = new Tensor<T>(new[] { batch, seqLen, modelDim });
 
@@ -93,7 +96,7 @@ public partial class CpuEngine
                 for (int t = 0; t < seqLen; t++)
                 {
                     int baseOff = (b * seqLen + t) * modelDim + hOff;
-                    double g = G[baseOff];
+                    double g = G[(b * seqLen + t) * numHeads + h];
                     for (int di = 0; di < headDim; di++)
                     {
                         double vv = V[baseOff + di];
@@ -134,7 +137,7 @@ public partial class CpuEngine
                 for (int t = 0; t < seqLen; t++)
                 {
                     int baseOff = (b * seqLen + t) * modelDim + hOff;
-                    double g = G[baseOff];
+                    double g = G[(b * seqLen + t) * numHeads + h];
                     for (int di = 0; di < headDim; di++)
                     {
                         double vv = V[baseOff + di];
@@ -150,9 +153,10 @@ public partial class CpuEngine
                 for (int t = seqLen - 1; t >= 0; t--)
                 {
                     int baseOff = (b * seqLen + t) * modelDim + hOff;
+                    int gOff = (b * seqLen + t) * numHeads + h;
                     int stOff = t * hh;
                     int sprevOff = (t - 1) * hh;
-                    double g = G[baseOff];
+                    double g = G[gOff];
 
                     // Output backward: O[ki] = sum_di Q[di]*S_t[di,ki].
                     for (int ki = 0; ki < headDim; ki++)
@@ -181,7 +185,7 @@ public partial class CpuEngine
                             dV[baseOff + di] += dStv * K[baseOff + ki];
                         }
                     }
-                    dG[baseOff] += dg; // scalar-per-head gate: only the head-start position
+                    dG[gOff] += dg; // scalar-per-head gate [batch, seqLen, numHeads]
 
                     // Propagate adjoint to the previous step: dS_{t-1} = g * dS_t.
                     for (int i = 0; i < hh; i++) dS[i] *= g;
@@ -207,7 +211,7 @@ public partial class CpuEngine
                 for (int t = 0; t < seqLen; t++)
                 {
                     int baseOff = (b * seqLen + t) * modelDim + hOff;
-                    T g = G[baseOff];
+                    T g = G[(b * seqLen + t) * numHeads + h];
                     for (int di = 0; di < headDim; di++)
                     {
                         T vv = V[baseOff + di];
@@ -247,7 +251,7 @@ public partial class CpuEngine
                 for (int t = 0; t < seqLen; t++)
                 {
                     int baseOff = (b * seqLen + t) * modelDim + hOff;
-                    T g = G[baseOff];
+                    T g = G[(b * seqLen + t) * numHeads + h];
                     for (int di = 0; di < headDim; di++)
                     {
                         T vv = V[baseOff + di];
@@ -262,9 +266,10 @@ public partial class CpuEngine
                 for (int t = seqLen - 1; t >= 0; t--)
                 {
                     int baseOff = (b * seqLen + t) * modelDim + hOff;
+                    int gOff = (b * seqLen + t) * numHeads + h;
                     int stOff = t * hh;
                     int sprevOff = (t - 1) * hh;
-                    T g = G[baseOff];
+                    T g = G[gOff];
 
                     for (int ki = 0; ki < headDim; ki++)
                     {
@@ -291,7 +296,7 @@ public partial class CpuEngine
                             dV[baseOff + di] = ops.Add(dV[baseOff + di], ops.Multiply(dStv, K[baseOff + ki]));
                         }
                     }
-                    dG[baseOff] = ops.Add(dG[baseOff], dg);
+                    dG[gOff] = ops.Add(dG[gOff], dg);
 
                     for (int i = 0; i < hh; i++) dS[i] = ops.Multiply(dS[i], g);
                 }
@@ -317,7 +322,7 @@ public partial class CpuEngine
         var dQ = new Tensor<T>(new[] { batch, seqLen, modelDim });
         var dK = new Tensor<T>(new[] { batch, seqLen, modelDim });
         var dV = new Tensor<T>(new[] { batch, seqLen, modelDim });
-        var dG = new Tensor<T>(new[] { batch, seqLen, modelDim });
+        var dG = new Tensor<T>(new[] { batch, seqLen, numHeads }); // scalar-per-head gate
 
         if (typeof(T) == typeof(double))
         {

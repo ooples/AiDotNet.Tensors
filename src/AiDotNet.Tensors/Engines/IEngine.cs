@@ -4127,6 +4127,11 @@ public interface IEngine
     /// Fused Gated Linear Attention recurrence over a whole sequence as one differentiable op
     /// (forward + analytic BPTT backward); see <c>CpuEngine.GlaScan.cs</c> (#1464).
     /// </summary>
+    /// <param name="qProj">Query projection [batch, seqLen, modelDim].</param>
+    /// <param name="kProj">Key projection [batch, seqLen, modelDim].</param>
+    /// <param name="vProj">Value projection [batch, seqLen, modelDim].</param>
+    /// <param name="gate">Post-sigmoid scalar-per-head gate [batch, seqLen, numHeads].</param>
+    /// <param name="numHeads">Number of heads; modelDim must be divisible by it.</param>
     Tensor<T> GlaScanForward<T>(
         Tensor<T> qProj,
         Tensor<T> kProj,
@@ -4150,6 +4155,13 @@ public interface IEngine
     /// Fused xLSTM (mLSTM) matrix-memory recurrence over a whole sequence as one differentiable op
     /// (forward + analytic BPTT backward); see <c>CpuEngine.XLstmScan.cs</c> (#1464).
     /// </summary>
+    /// <param name="qProj">Query projection [batch, seqLen, modelDim].</param>
+    /// <param name="kProj">Key projection [batch, seqLen, modelDim].</param>
+    /// <param name="vProj">Value projection [batch, seqLen, modelDim].</param>
+    /// <param name="iGate">Post-exp scalar-per-head input gate [batch, seqLen, numHeads].</param>
+    /// <param name="fGate">Post-sigmoid scalar-per-head forget gate [batch, seqLen, numHeads].</param>
+    /// <param name="oGate">Post-sigmoid scalar-per-head output gate [batch, seqLen, numHeads].</param>
+    /// <param name="numHeads">Number of heads; modelDim must be divisible by it.</param>
     Tensor<T> XLstmScanForward<T>(
         Tensor<T> qProj,
         Tensor<T> kProj,
@@ -4175,7 +4187,23 @@ public interface IEngine
     /// <summary>
     /// Fused linear (LM head) + cross-entropy-with-logits loss as one differentiable op, without
     /// materializing the [N, vocab] logits on the tape; see
-    /// <c>CpuEngine.FusedLinearCrossEntropy.cs</c> (#1464).
+    /// <c>CpuEngine.FusedLinearCrossEntropy.cs</c> (#1464). This is the primary LM-training contract:
+    /// targets are per-row class ids [N], so there is no O(N·vocab) dense-label storage/bandwidth.
+    /// For soft / distillation targets use the dense [N, vocab] overload below.
+    /// </summary>
+    /// <param name="hidden">Pre-head hidden states [N, d].</param>
+    /// <param name="weight">LM head weight [d, vocab].</param>
+    /// <param name="bias">LM head bias [vocab].</param>
+    /// <param name="targetIds">Per-row class ids [N], each in [0, vocab).</param>
+    Tensor<T> FusedLinearCrossEntropyWithLogits<T>(
+        Tensor<T> hidden,
+        Tensor<T> weight,
+        Tensor<T> bias,
+        Tensor<int> targetIds);
+
+    /// <summary>
+    /// Dense-target variant of <see cref="FusedLinearCrossEntropyWithLogits{T}(Tensor{T},Tensor{T},Tensor{T},Tensor{int})"/>
+    /// for soft / one-hot / distillation supervision; target is a full per-row distribution [N, vocab].
     /// </summary>
     Tensor<T> FusedLinearCrossEntropyWithLogits<T>(
         Tensor<T> hidden,

@@ -97,6 +97,13 @@ public partial class CpuEngine
                 throw new ArgumentException($"{paramName} dim {i} ({other.Shape[i]}) must match ({reference.Shape[i]}).", paramName);
     }
 
+    // Validates a scalar-per-head gate tensor shaped [batch, seqLen, numHeads].
+    private static void EnsureGateShape<T>(Tensor<T> gate, int batch, int seqLen, int numHeads, string paramName)
+    {
+        if (gate.Rank != 3 || gate.Shape[0] != batch || gate.Shape[1] != seqLen || gate.Shape[2] != numHeads)
+            throw new ArgumentException($"{paramName} must be [batch={batch}, seqLen={seqLen}, numHeads={numHeads}].", paramName);
+    }
+
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     private static double Sig(double x) => 1.0 / (1.0 + Math.Exp(-x));
 

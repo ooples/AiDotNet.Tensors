@@ -31,8 +31,9 @@ public class XLstmScanTests
                 for (int t = 0; t < seqLen; t++)
                 {
                     int off = (b * seqLen + t) * modelDim + hOff;
-                    double iv = I[off]; if (iv > 4.85e8) iv = 4.85e8;
-                    double f = F[off], o = O[off];
+                    int gOff = (b * seqLen + t) * numHeads + h; // scalar-per-head gates
+                    double iv = I[gOff]; if (iv > 4.85e8) iv = 4.85e8;
+                    double f = F[gOff], o = O[gOff];
                     for (int di = 0; di < headDim; di++)
                     {
                         n[di] = f * n[di] + iv * (K[off + di] * kappa);
@@ -77,13 +78,16 @@ public class XLstmScanTests
 
     private static (Tensor<double> q, Tensor<double> k, Tensor<double> v,
                     Tensor<double> i, Tensor<double> f, Tensor<double> o)
-        MakeInputs(int batch, int seqLen, int modelDim, int seed)
+        MakeInputs(int batch, int seqLen, int modelDim, int numHeads, int seed)
     {
         int n = batch * seqLen * modelDim;
         var shape = new[] { batch, seqLen, modelDim };
+        // Gates are scalar-per-head: [batch, seqLen, numHeads].
+        int gn = batch * seqLen * numHeads;
+        var gShape = new[] { batch, seqLen, numHeads };
         return (new Tensor<double>(Gen(n, seed), shape), new Tensor<double>(Gen(n, seed + 1), shape),
-                new Tensor<double>(Gen(n, seed + 2), shape), new Tensor<double>(GenExp(n, seed + 3), shape),
-                new Tensor<double>(GenSig(n, seed + 4), shape), new Tensor<double>(GenSig(n, seed + 5), shape));
+                new Tensor<double>(Gen(n, seed + 2), shape), new Tensor<double>(GenExp(gn, seed + 3), gShape),
+                new Tensor<double>(GenSig(gn, seed + 4), gShape), new Tensor<double>(GenSig(gn, seed + 5), gShape));
     }
 
     [Fact]
@@ -91,7 +95,7 @@ public class XLstmScanTests
     {
         var engine = new CpuEngine();
         int batch = 2, seqLen = 5, modelDim = 6, numHeads = 2;
-        var (q, k, v, i, f, o) = MakeInputs(batch, seqLen, modelDim, 17);
+        var (q, k, v, i, f, o) = MakeInputs(batch, seqLen, modelDim, numHeads, 17);
 
         var outp = engine.XLstmScanForward(q, k, v, i, f, o, numHeads);
         var expected = ReferenceForward(
@@ -111,7 +115,7 @@ public class XLstmScanTests
     {
         var engine = new CpuEngine();
         int batch = 1, seqLen = 4, modelDim = 4, numHeads = 2;
-        var (q, k, v, i, f, o) = MakeInputs(batch, seqLen, modelDim, 8);
+        var (q, k, v, i, f, o) = MakeInputs(batch, seqLen, modelDim, numHeads, 8);
 
         Tensor<double> outp;
         System.Collections.Generic.Dictionary<Tensor<double>, Tensor<double>> grads;
