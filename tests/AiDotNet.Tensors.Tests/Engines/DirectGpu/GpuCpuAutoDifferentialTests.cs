@@ -445,6 +445,21 @@ public sealed class GpuCpuAutoDifferentialTests : IDisposable
         "MuLawEncoding(Tensor<T>,Int32)",
         "NativePacFeatures(Tensor<T>,Int32,Int32,Double,Double,ValueTuple<Double,Double>[])",
         "OctonionMatMulTensor(Tensor<T>,Tensor<T>)",
+        // fused recurrence / LM-head scans (#1464) — q/k/v [B,S,D] vs gate/alpha/etc. [B,S,H],
+        // or [N,d]+[d,vocab]+[N] CE shapes: distinct shapes per tensor arg the generic single-shape
+        // generator can't drive. Each has a dedicated GPU-vs-CPU parity suite:
+        //   GlaScanGpuParityTests, XLstmScanGpuParityTests, GatedDeltaNetScanGpuParityTests,
+        //   RgLruScanGpuParityTests, Rwkv4WkvGpuParityTests, MambaScanGpuParityTests,
+        //   Mamba2ScanGpuParityTests, FusedLinearCeGpuParityTests.
+        "GlaScanForward(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Int32)",
+        "XLstmScanForward(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Int32)",
+        "GatedDeltaNetScanForward(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Int32)",
+        "RgLruScanForward(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>)",
+        "Rwkv4WkvForward(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>)",
+        "MambaSelectiveScanForward(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>)",
+        "Mamba2SsdScanForward(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Int32)",
+        "FusedLinearCrossEntropyWithLogits(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<Int32>)",
+        "FusedLinearCrossEntropyWithLogits(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>)",
     };
 }
 
