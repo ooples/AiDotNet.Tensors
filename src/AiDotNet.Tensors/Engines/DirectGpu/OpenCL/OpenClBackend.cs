@@ -588,6 +588,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     _kernelCache[name] = new DirectOpenClKernel(_context, mambaProgram, name);
                 }
 
+                // Compile fused Mamba-2 SSD scan kernels (#1464)
+                var mamba2Program = CompileOrLoadCached(Mamba2Kernels.GetSource(), optimizationFlags, "Mamba-2 SSD scan kernels");
+                _programs.Add(mamba2Program);
+                foreach (var name in Mamba2Kernels.GetKernelNames())
+                {
+                    _kernelCache[name] = new DirectOpenClKernel(_context, mamba2Program, name);
+                }
+
                 // Compile GRU sequence kernels (forward/backward for BPTT training)
                 var gruProgram = CompileOrLoadCached(GruKernels.GetSource(), optimizationFlags, "GRU sequence kernels");
                 _programs.Add(gruProgram);
@@ -11840,6 +11848,38 @@ KERNEL VARIANTS (A/B testing):
             kernel.SetArg(8u, seqLen);
             kernel.SetArg(9u, innerDim);
             kernel.SetArg(10u, stateDim);
+
+            int total = batch * innerDim;
+            int localSize = CalculateOptimalWorkGroupSize1D(total);
+            int globalSize = ((total + localSize - 1) / localSize) * localSize;
+            kernel.Execute1D(globalSize, localSize);
+        }
+
+        // ── Fused Mamba-2 SSD scan forward (#1464) ──────────────────────────────────────────
+        public void Mamba2SsdScanForward(
+            IGpuBuffer x, IGpuBuffer delta, IGpuBuffer aLog, IGpuBuffer bParam, IGpuBuffer cParam, IGpuBuffer dParam,
+            IGpuBuffer output, int batch, int seqLen, int innerDim, int numHeads, int headDim, int stateDim)
+        {
+            if (_context == null)
+                throw new InvalidOperationException("OpenCL context is not initialized. Cannot execute Mamba2SsdScanForward.");
+            if (stateDim > Kernels.Mamba2Kernels.MaxStateDim)
+                throw new InvalidOperationException($"Mamba-2 stateDim ({stateDim}) exceeds max ({Kernels.Mamba2Kernels.MaxStateDim}).");
+            if (!_kernelCache.TryGetValue("mamba2_ssd_scan_forward", out var kernel))
+                throw new InvalidOperationException("OpenCL kernel not found: mamba2_ssd_scan_forward");
+
+            kernel.SetArg(0u, ((DirectOpenClGpuBuffer)x).Buffer.Handle);
+            kernel.SetArg(1u, ((DirectOpenClGpuBuffer)delta).Buffer.Handle);
+            kernel.SetArg(2u, ((DirectOpenClGpuBuffer)aLog).Buffer.Handle);
+            kernel.SetArg(3u, ((DirectOpenClGpuBuffer)bParam).Buffer.Handle);
+            kernel.SetArg(4u, ((DirectOpenClGpuBuffer)cParam).Buffer.Handle);
+            kernel.SetArg(5u, ((DirectOpenClGpuBuffer)dParam).Buffer.Handle);
+            kernel.SetArg(6u, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            kernel.SetArg(7u, batch);
+            kernel.SetArg(8u, seqLen);
+            kernel.SetArg(9u, innerDim);
+            kernel.SetArg(10u, numHeads);
+            kernel.SetArg(11u, headDim);
+            kernel.SetArg(12u, stateDim);
 
             int total = batch * innerDim;
             int localSize = CalculateOptimalWorkGroupSize1D(total);

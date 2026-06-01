@@ -131,6 +131,18 @@ public partial class MetalBackend
         UploadToBuffer(output, outp);
     }
 
+    // Fused Mamba-2 SSD scan forward (#1464) — host fallback via the shared reference.
+    public void Mamba2SsdScanForward(
+        IGpuBuffer x, IGpuBuffer delta, IGpuBuffer aLog, IGpuBuffer bParam, IGpuBuffer cParam, IGpuBuffer dParam,
+        IGpuBuffer output, int batch, int seqLen, int innerDim, int numHeads, int headDim, int stateDim)
+    {
+        var xd = DownloadBuffer(x); var dl = DownloadBuffer(delta); var al = DownloadBuffer(aLog);
+        var bp = DownloadBuffer(bParam); var cp = DownloadBuffer(cParam); var dp = DownloadBuffer(dParam);
+        var outp = new float[batch * seqLen * innerDim];
+        Cpu.RecurrenceCpuKernels.Mamba2SsdScanForward(xd, dl, al, bp, cp, dp, outp, batch, seqLen, innerDim, numHeads, headDim, stateDim);
+        UploadToBuffer(output, outp);
+    }
+
     public void LstmForwardSequence(
         IGpuBuffer input, IGpuBuffer hInit, IGpuBuffer cInit,
         IGpuBuffer weightsIh, IGpuBuffer weightsHh, IGpuBuffer biasIh, IGpuBuffer biasHh,

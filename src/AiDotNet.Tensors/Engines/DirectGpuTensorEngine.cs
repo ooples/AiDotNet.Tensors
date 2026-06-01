@@ -6357,6 +6357,49 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
     }
 
+    // Fused Mamba-2 SSD scan (#1464). GPU inference fast path; defer to CpuEngine otherwise.
+    public override Tensor<T> Mamba2SsdScanForward<T>(
+        Tensor<T> x, Tensor<T> delta, Tensor<T> aLog, Tensor<T> bParam, Tensor<T> cParam, Tensor<T> dParam, int numHeads)
+    {
+        if (IsTapeActive<T>() || typeof(T) != typeof(float) || !TryGetBackend(out var backend))
+            return base.Mamba2SsdScanForward(x, delta, aLog, bParam, cParam, dParam, numHeads);
+        if (x.Rank != 3 || numHeads < 1)
+            return base.Mamba2SsdScanForward(x, delta, aLog, bParam, cParam, dParam, numHeads);
+
+        int batch = x.Shape._dims[0];
+        int seqLen = x.Shape._dims[1];
+        int innerDim = x.Shape._dims[2];
+        if (innerDim % numHeads != 0 || bParam.Rank != 3)
+            return base.Mamba2SsdScanForward(x, delta, aLog, bParam, cParam, dParam, numHeads);
+        int headDim = innerDim / numHeads;
+        int stateDim = bParam.Shape._dims[2];
+        if (stateDim > 256)
+            return base.Mamba2SsdScanForward(x, delta, aLog, bParam, cParam, dParam, numHeads);
+
+        try
+        {
+            using var xB = GetOrAllocateBuffer(backend, x);
+            using var dtB = GetOrAllocateBuffer(backend, delta);
+            using var aB = GetOrAllocateBuffer(backend, aLog);
+            using var bB = GetOrAllocateBuffer(backend, bParam);
+            using var cB = GetOrAllocateBuffer(backend, cParam);
+            using var dB = GetOrAllocateBuffer(backend, dParam);
+            using var outB = AllocateOutputBuffer(backend, batch * seqLen * innerDim);
+
+            backend.Mamba2SsdScanForward(xB.Buffer, dtB.Buffer, aB.Buffer, bB.Buffer, cB.Buffer, dB.Buffer, outB.Buffer,
+                batch, seqLen, innerDim, numHeads, headDim, stateDim);
+
+            float[] outF = new float[batch * seqLen * innerDim];
+            backend.DownloadBuffer(outB.Buffer, outF);
+            T[] outData = DirectGpuEngine.FromFloatArray<T>(outF);
+            return new Tensor<T>(outData, new[] { batch, seqLen, innerDim });
+        }
+        catch
+        {
+            return base.Mamba2SsdScanForward(x, delta, aLog, bParam, cParam, dParam, numHeads);
+        }
+    }
+
     public override Tensor<T> FlashAttention<T>(
         Tensor<T> query,
         Tensor<T> key,

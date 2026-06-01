@@ -64,6 +64,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     private IntPtr _rgLruModule; // fused RG-LRU scan kernels (#1464)
     private IntPtr _rwkv4Module; // fused RWKV-4 WKV scan kernels (#1464)
     private IntPtr _mambaModule; // fused Mamba selective scan kernels (#1464)
+    private IntPtr _mamba2Module; // fused Mamba-2 SSD scan kernels (#1464)
     private IntPtr _gruModule;
     private IntPtr _snnModule;
     private IntPtr _fp16Module;
@@ -769,6 +770,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         _rgLruModule = CompileKernelModule(device, Kernels.CudaRgLruKernels.GetSource(), "rglru_kernels", Kernels.CudaRgLruKernels.GetKernelNames());
         _rwkv4Module = CompileKernelModule(device, Kernels.CudaRwkv4Kernels.GetSource(), "rwkv4_kernels", Kernels.CudaRwkv4Kernels.GetKernelNames());
         _mambaModule = CompileKernelModule(device, Kernels.CudaMambaKernels.GetSource(), "mamba_kernels", Kernels.CudaMambaKernels.GetKernelNames());
+        _mamba2Module = CompileKernelModule(device, Kernels.CudaMamba2Kernels.GetSource(), "mamba2_kernels", Kernels.CudaMamba2Kernels.GetKernelNames());
         }
         catch
         {
@@ -12021,6 +12023,26 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         void** args = stackalloc void*[11];
         args[0] = &px; args[1] = &pdt; args[2] = &pa; args[3] = &pb; args[4] = &pc; args[5] = &pd; args[6] = &pout;
         args[7] = &batch; args[8] = &seqLen; args[9] = &innerDim; args[10] = &stateDim;
+        uint total = (uint)(batch * innerDim);
+        LaunchKernel(kernel, (total + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize, (uint)DefaultBlockSize, args);
+    }
+
+    // ── Fused Mamba-2 SSD scan forward (#1464) ─────────────────────────────────────────────
+    public unsafe void Mamba2SsdScanForward(
+        IGpuBuffer x, IGpuBuffer delta, IGpuBuffer aLog, IGpuBuffer bParam, IGpuBuffer cParam, IGpuBuffer dParam,
+        IGpuBuffer output, int batch, int seqLen, int innerDim, int numHeads, int headDim, int stateDim)
+    {
+        if (stateDim > Kernels.CudaMamba2Kernels.MaxStateDim)
+            throw new InvalidOperationException(
+                $"Mamba-2 stateDim ({stateDim}) exceeds max ({Kernels.CudaMamba2Kernels.MaxStateDim}).");
+        if (!_kernelCache.TryGetValue("mamba2_ssd_scan_forward", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: mamba2_ssd_scan_forward");
+
+        using var _ = PushContext();
+        IntPtr px = x.Handle, pdt = delta.Handle, pa = aLog.Handle, pb = bParam.Handle, pc = cParam.Handle, pd = dParam.Handle, pout = output.Handle;
+        void** args = stackalloc void*[13];
+        args[0] = &px; args[1] = &pdt; args[2] = &pa; args[3] = &pb; args[4] = &pc; args[5] = &pd; args[6] = &pout;
+        args[7] = &batch; args[8] = &seqLen; args[9] = &innerDim; args[10] = &numHeads; args[11] = &headDim; args[12] = &stateDim;
         uint total = (uint)(batch * innerDim);
         LaunchKernel(kernel, (total + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize, (uint)DefaultBlockSize, args);
     }

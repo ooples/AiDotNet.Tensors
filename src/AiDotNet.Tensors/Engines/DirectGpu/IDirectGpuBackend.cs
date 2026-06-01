@@ -2719,6 +2719,15 @@ public interface IDirectGpuBackend : IDisposable
         IGpuBuffer output, int batch, int seqLen, int innerDim, int stateDim);
 
     /// <summary>
+    /// Fused Mamba-2 SSD scan forward (#1464). x: [batch, seqLen, innerDim];
+    /// delta: [batch, seqLen, numHeads]; aLog/dParam: [numHeads]; bParam/cParam: [batch, seqLen, stateDim];
+    /// output: [batch, seqLen, innerDim].
+    /// </summary>
+    void Mamba2SsdScanForward(
+        IGpuBuffer x, IGpuBuffer delta, IGpuBuffer aLog, IGpuBuffer bParam, IGpuBuffer cParam, IGpuBuffer dParam,
+        IGpuBuffer output, int batch, int seqLen, int innerDim, int numHeads, int headDim, int stateDim);
+
+    /// <summary>
     /// Backward pass for LSTM sequence - computes gradients via BPTT.
     /// </summary>
     /// <param name="gradOutput">Gradient from next layer [seqLen * batch * hiddenSize].</param>

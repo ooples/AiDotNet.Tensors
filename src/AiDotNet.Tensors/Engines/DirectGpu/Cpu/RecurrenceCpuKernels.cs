@@ -297,6 +297,51 @@ internal static class RecurrenceCpuKernels
         }
     }
 
+    /// <summary>
+    /// Mamba-2 SSD scan forward. x: [batch, seqLen, innerDim]; delta: [batch, seqLen, numHeads];
+    /// aLog/dParam: [numHeads] (per head); bParam/cParam: [batch, seqLen, stateDim]. Per channel
+    /// flatD = hi*headDim+di carries an independent state h[flatD, 0..stateDim).
+    /// </summary>
+    public static void Mamba2SsdScanForward(
+        float[] x, float[] delta, float[] aLog, float[] bParam, float[] cParam, float[] dParam, float[] output,
+        int batch, int seqLen, int innerDim, int numHeads, int headDim, int sd)
+    {
+        var negA = new float[numHeads];
+        for (int hi = 0; hi < numHeads; hi++) negA[hi] = -MathF.Exp(aLog[hi]);
+        var h = new float[innerDim * sd];
+        for (int b = 0; b < batch; b++)
+        {
+            Array.Clear(h, 0, h.Length);
+            for (int t = 0; t < seqLen; t++)
+            {
+                int btInner = (b * seqLen + t) * innerDim;
+                int btState = (b * seqLen + t) * sd;
+                int btHead = (b * seqLen + t) * numHeads;
+                for (int hi = 0; hi < numHeads; hi++)
+                {
+                    float dt = delta[btHead + hi];
+                    float aBar = MathF.Exp(dt * negA[hi]);
+                    float dv = dParam[hi];
+                    int dimStart = hi * headDim;
+                    for (int di = 0; di < headDim; di++)
+                    {
+                        int flatD = dimStart + di;
+                        float xv = x[btInner + flatD];
+                        int hsBase = flatD * sd;
+                        float y = 0.0f;
+                        for (int n = 0; n < sd; n++)
+                        {
+                            float hNew = aBar * h[hsBase + n] + dt * bParam[btState + n] * xv;
+                            h[hsBase + n] = hNew;
+                            y += cParam[btState + n] * hNew;
+                        }
+                        output[btInner + flatD] = y + dv * xv;
+                    }
+                }
+            }
+        }
+    }
+
     private const float XLstmIGateClamp = 4.85e8f;
 
     /// <summary>

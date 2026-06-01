@@ -1684,6 +1684,12 @@ public class DelegatingGpuBackend : IDirectGpuBackend
         => Inner.MambaSelectiveScanForward(x, delta, aLog, bParam, cParam, dParam, output, batch, seqLen, innerDim, stateDim);
 
     /// <inheritdoc/>
+    public virtual void Mamba2SsdScanForward(
+        IGpuBuffer x, IGpuBuffer delta, IGpuBuffer aLog, IGpuBuffer bParam, IGpuBuffer cParam, IGpuBuffer dParam,
+        IGpuBuffer output, int batch, int seqLen, int innerDim, int numHeads, int headDim, int stateDim)
+        => Inner.Mamba2SsdScanForward(x, delta, aLog, bParam, cParam, dParam, output, batch, seqLen, innerDim, numHeads, headDim, stateDim);
+
+    /// <inheritdoc/>
     public virtual void LstmBackwardSequence(
         IGpuBuffer gradOutput, IGpuBuffer allH, IGpuBuffer allC, IGpuBuffer cacheGates,
         IGpuBuffer hInit, IGpuBuffer cInit,
