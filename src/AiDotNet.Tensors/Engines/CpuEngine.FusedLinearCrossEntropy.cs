@@ -51,8 +51,11 @@ public partial class CpuEngine
             throw new ArgumentException($"weight must have a non-empty vocab (dim1 > 0); got vocab={vocab}.", nameof(weight));
         if (weight.Shape[0] != d)
             throw new ArgumentException($"weight dim0 ({weight.Shape[0]}) must equal hidden dim1 ({d}).", nameof(weight));
-        if (bias.Length != vocab)
-            throw new ArgumentException($"bias length ({bias.Length}) must equal vocab ({vocab}).", nameof(bias));
+        // Require rank-1 [vocab]: the backward returns a rank-1 [vocab] bias gradient, so a
+        // higher-rank bias with the same flat length (e.g. [1, vocab]) would record a tape entry
+        // whose gradient shape does not match the input.
+        if (bias.Rank != 1 || bias.Length != vocab)
+            throw new ArgumentException($"bias must be rank-1 [vocab={vocab}].", nameof(bias));
         if (targetIds.Rank != 1 || targetIds.Length != n)
             throw new ArgumentException($"targetIds must be rank-1 [N={n}].", nameof(targetIds));
 
@@ -78,12 +81,14 @@ public partial class CpuEngine
         output.GetDataArray()![0] = MathHelper.GetNumericOperations<T>().FromDouble(lossValue);
 
         // target ids are supervision (no gradient): carry them in savedState rather than as a
-        // differentiable tape input. Backward reconstructs dlogits = softmax - onehot(id).
+        // differentiable tape input. Save a COPY so the backward is tied to the forward's labels —
+        // targetIds is not a tape input, so mutating/recycling it after forward must not change the
+        // gradient. Backward reconstructs dlogits = softmax - onehot(id).
         DifferentiableOps.RecordIfActive<T>(
             "FusedLinearCrossEntropy", output,
             new[] { hidden, weight, bias },
             FusedLinearCrossEntropyIndexBackward<T>,
-            savedState: new object[] { ids, vocab });
+            savedState: new object[] { (int[])ids.Clone(), vocab });
 
         return output;
     }
@@ -119,8 +124,11 @@ public partial class CpuEngine
             throw new ArgumentException($"weight must have a non-empty vocab (dim1 > 0); got vocab={vocab}.", nameof(weight));
         if (weight.Shape[0] != d)
             throw new ArgumentException($"weight dim0 ({weight.Shape[0]}) must equal hidden dim1 ({d}).", nameof(weight));
-        if (bias.Length != vocab)
-            throw new ArgumentException($"bias length ({bias.Length}) must equal vocab ({vocab}).", nameof(bias));
+        // Require rank-1 [vocab]: the backward returns a rank-1 [vocab] bias gradient, so a
+        // higher-rank bias with the same flat length (e.g. [1, vocab]) would record a tape entry
+        // whose gradient shape does not match the input.
+        if (bias.Rank != 1 || bias.Length != vocab)
+            throw new ArgumentException($"bias must be rank-1 [vocab={vocab}].", nameof(bias));
         // Check rank before indexing Shape[Rank-1] (a rank-0 target would otherwise throw
         // IndexOutOfRangeException instead of this clear argument error).
         if (target.Rank != 2 || target.Shape[0] != n || target.Shape[1] != vocab)
