@@ -451,4 +451,20 @@ public sealed partial class HipBackend
         uint total = (uint)(batch * numHeads * headDim);
         LaunchKernel(kernel, (total + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize, (uint)DefaultBlockSize, args);
     }
+
+    // ── Fused RG-LRU scan forward (#1464) ──────────────────────────────────────────────────
+    public unsafe void RgLruScanForward(
+        IGpuBuffer value, IGpuBuffer recGate, IGpuBuffer inpGate, IGpuBuffer decay, IGpuBuffer output,
+        int batch, int seqLen, int recDim)
+    {
+        if (!_kernelCache.TryGetValue("rglru_scan_forward", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: rglru_scan_forward");
+
+        IntPtr pv = value.Handle, pr = recGate.Handle, pi = inpGate.Handle, pd = decay.Handle, pout = output.Handle;
+        void** args = stackalloc void*[8];
+        args[0] = &pv; args[1] = &pr; args[2] = &pi; args[3] = &pd; args[4] = &pout;
+        args[5] = &batch; args[6] = &seqLen; args[7] = &recDim;
+        uint total = (uint)(batch * recDim);
+        LaunchKernel(kernel, (total + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize, (uint)DefaultBlockSize, args);
+    }
 }

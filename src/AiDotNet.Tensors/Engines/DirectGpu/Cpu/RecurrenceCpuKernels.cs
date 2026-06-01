@@ -182,6 +182,36 @@ internal static class RecurrenceCpuKernels
             }
     }
 
+    /// <summary>
+    /// RG-LRU (real-gated linear recurrent unit) forward. value/recGate/inpGate: [batch, seqLen, recDim];
+    /// decay: [recDim]. base = sigmoid(-decay); a = recGate*base; h = a*h + sqrt(max(0,1-a^2))*(inpGate*value).
+    /// </summary>
+    public static void RgLruForward(
+        float[] value, float[] recGate, float[] inpGate, float[] decay, float[] output,
+        int batch, int seqLen, int recDim)
+    {
+        var baseDecay = new float[recDim];
+        for (int c = 0; c < recDim; c++) baseDecay[c] = 1.0f / (1.0f + MathF.Exp(decay[c])); // sigmoid(-decay)
+        var h = new float[recDim];
+        for (int b = 0; b < batch; b++)
+        {
+            Array.Clear(h, 0, recDim);
+            for (int t = 0; t < seqLen; t++)
+            {
+                int off = (b * seqLen + t) * recDim;
+                for (int c = 0; c < recDim; c++)
+                {
+                    float a = recGate[off + c] * baseDecay[c];
+                    float om = 1.0f - a * a;
+                    float s = om > 0.0f ? MathF.Sqrt(om) : 0.0f;
+                    float hv = a * h[c] + s * (inpGate[off + c] * value[off + c]);
+                    h[c] = hv;
+                    output[off + c] = hv;
+                }
+            }
+        }
+    }
+
     private const float XLstmIGateClamp = 4.85e8f;
 
     /// <summary>

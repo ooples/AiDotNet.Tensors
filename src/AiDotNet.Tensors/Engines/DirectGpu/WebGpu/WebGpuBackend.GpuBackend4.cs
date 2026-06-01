@@ -852,6 +852,18 @@ public sealed partial class WebGpuBackend
         UploadToBuffer(outp, output);
     }
 
+    // Fused RG-LRU scan forward (#1464) — host fallback via the shared reference.
+    public void RgLruScanForward(
+        IGpuBuffer value, IGpuBuffer recGate, IGpuBuffer inpGate, IGpuBuffer decay, IGpuBuffer output,
+        int batch, int seqLen, int recDim)
+    {
+        var vd = DownloadBuffer(value); var rd = DownloadBuffer(recGate);
+        var id = DownloadBuffer(inpGate); var dd = DownloadBuffer(decay);
+        var outp = new float[batch * seqLen * recDim];
+        Cpu.RecurrenceCpuKernels.RgLruForward(vd, rd, id, dd, outp, batch, seqLen, recDim);
+        UploadToBuffer(outp, output);
+    }
+
     public void LstmForwardSequence(
         IGpuBuffer input, IGpuBuffer hInit, IGpuBuffer cInit,
         IGpuBuffer weightsIh, IGpuBuffer weightsHh, IGpuBuffer biasIh, IGpuBuffer biasHh,

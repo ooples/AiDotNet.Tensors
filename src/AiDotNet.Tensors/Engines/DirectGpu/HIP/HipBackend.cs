@@ -93,6 +93,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     private IntPtr _glaModule;
     private IntPtr _xlstmModule;
     private IntPtr _gatedDeltaNetModule;
+    private IntPtr _rgLruModule;
     // True iff the fused-advanced kernel module compiled and registered
     // successfully on this device. Public surface methods gate on this so a
     // partial / failed compile surfaces a clear NotSupportedException at the
@@ -543,6 +544,10 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             // Compile fused Gated DeltaNet scan kernels (#1464)
             CompileKernelModule(Kernels.HipGatedDeltaNetKernels.GetSource(), "gated_delta_net", ref _gatedDeltaNetModule,
                 Kernels.HipGatedDeltaNetKernels.GetKernelNames());
+
+            // Compile fused RG-LRU scan kernels (#1464)
+            CompileKernelModule(Kernels.HipRgLruKernels.GetSource(), "rglru", ref _rgLruModule,
+                Kernels.HipRgLruKernels.GetKernelNames());
 
             // Compile Fused Linear + Activation kernels
             CompileKernelModule(Kernels.HipFusedLinearKernels.GetSource(), "fused_linear", ref _fusedLinearModule,

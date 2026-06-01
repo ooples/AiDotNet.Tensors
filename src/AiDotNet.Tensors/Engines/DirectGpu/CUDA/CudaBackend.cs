@@ -61,6 +61,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     private IntPtr _glaModule; // fused GLA scan kernels (#1464)
     private IntPtr _xlstmModule; // fused xLSTM scan kernels (#1464)
     private IntPtr _gatedDeltaNetModule; // fused Gated DeltaNet scan kernels (#1464)
+    private IntPtr _rgLruModule; // fused RG-LRU scan kernels (#1464)
     private IntPtr _gruModule;
     private IntPtr _snnModule;
     private IntPtr _fp16Module;
@@ -763,6 +764,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         _glaModule = CompileKernelModule(device, Kernels.CudaGlaKernels.GetSource(), "gla_kernels", Kernels.CudaGlaKernels.GetKernelNames());
         _xlstmModule = CompileKernelModule(device, Kernels.CudaXLstmKernels.GetSource(), "xlstm_kernels", Kernels.CudaXLstmKernels.GetKernelNames());
         _gatedDeltaNetModule = CompileKernelModule(device, Kernels.CudaGatedDeltaNetKernels.GetSource(), "gated_delta_net_kernels", Kernels.CudaGatedDeltaNetKernels.GetKernelNames());
+        _rgLruModule = CompileKernelModule(device, Kernels.CudaRgLruKernels.GetSource(), "rglru_kernels", Kernels.CudaRgLruKernels.GetKernelNames());
         }
         catch
         {
@@ -11962,6 +11964,23 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         args[0] = &pq; args[1] = &pk; args[2] = &pv; args[3] = &pa; args[4] = &pb; args[5] = &pout;
         args[6] = &batch; args[7] = &seqLen; args[8] = &modelDim; args[9] = &numHeads; args[10] = &headDim;
         uint total = (uint)(batch * numHeads * headDim);
+        LaunchKernel(kernel, (total + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize, (uint)DefaultBlockSize, args);
+    }
+
+    // ── Fused RG-LRU scan forward (#1464) ──────────────────────────────────────────────────
+    public unsafe void RgLruScanForward(
+        IGpuBuffer value, IGpuBuffer recGate, IGpuBuffer inpGate, IGpuBuffer decay, IGpuBuffer output,
+        int batch, int seqLen, int recDim)
+    {
+        if (!_kernelCache.TryGetValue("rglru_scan_forward", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: rglru_scan_forward");
+
+        using var _ = PushContext();
+        IntPtr pv = value.Handle, pr = recGate.Handle, pi = inpGate.Handle, pd = decay.Handle, pout = output.Handle;
+        void** args = stackalloc void*[8];
+        args[0] = &pv; args[1] = &pr; args[2] = &pi; args[3] = &pd; args[4] = &pout;
+        args[5] = &batch; args[6] = &seqLen; args[7] = &recDim;
+        uint total = (uint)(batch * recDim);
         LaunchKernel(kernel, (total + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize, (uint)DefaultBlockSize, args);
     }
 

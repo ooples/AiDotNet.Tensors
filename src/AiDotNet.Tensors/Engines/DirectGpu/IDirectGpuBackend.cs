@@ -2694,6 +2694,14 @@ public interface IDirectGpuBackend : IDisposable
         int batch, int seqLen, int modelDim, int numHeads, int headDim);
 
     /// <summary>
+    /// Fused RG-LRU (real-gated linear recurrent unit) scan forward (#1464).
+    /// value/recGate/inpGate: [batch, seqLen, recDim]; decay: [recDim]; output: [batch, seqLen, recDim].
+    /// </summary>
+    void RgLruScanForward(
+        IGpuBuffer value, IGpuBuffer recGate, IGpuBuffer inpGate, IGpuBuffer decay, IGpuBuffer output,
+        int batch, int seqLen, int recDim);
+
+    /// <summary>
     /// Backward pass for LSTM sequence - computes gradients via BPTT.
     /// </summary>
     /// <param name="gradOutput">Gradient from next layer [seqLen * batch * hiddenSize].</param>

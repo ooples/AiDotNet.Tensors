@@ -6244,6 +6244,42 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
     }
 
+    // Fused RG-LRU scan (#1464). GPU inference fast path; defer to CpuEngine otherwise.
+    public override Tensor<T> RgLruScanForward<T>(
+        Tensor<T> value, Tensor<T> recGate, Tensor<T> inpGate, Tensor<T> decay)
+    {
+        if (IsTapeActive<T>() || typeof(T) != typeof(float) || !TryGetBackend(out var backend))
+            return base.RgLruScanForward(value, recGate, inpGate, decay);
+        if (value.Rank != 3)
+            return base.RgLruScanForward(value, recGate, inpGate, decay);
+
+        int batch = value.Shape._dims[0];
+        int seqLen = value.Shape._dims[1];
+        int recDim = value.Shape._dims[2];
+        if (decay.Rank != 1 || decay.Shape._dims[0] != recDim)
+            return base.RgLruScanForward(value, recGate, inpGate, decay);
+
+        try
+        {
+            using var vB = GetOrAllocateBuffer(backend, value);
+            using var rB = GetOrAllocateBuffer(backend, recGate);
+            using var iB = GetOrAllocateBuffer(backend, inpGate);
+            using var dB = GetOrAllocateBuffer(backend, decay);
+            using var outB = AllocateOutputBuffer(backend, batch * seqLen * recDim);
+
+            backend.RgLruScanForward(vB.Buffer, rB.Buffer, iB.Buffer, dB.Buffer, outB.Buffer, batch, seqLen, recDim);
+
+            float[] outF = new float[batch * seqLen * recDim];
+            backend.DownloadBuffer(outB.Buffer, outF);
+            T[] outData = DirectGpuEngine.FromFloatArray<T>(outF);
+            return new Tensor<T>(outData, new[] { batch, seqLen, recDim });
+        }
+        catch
+        {
+            return base.RgLruScanForward(value, recGate, inpGate, decay);
+        }
+    }
+
     public override Tensor<T> FlashAttention<T>(
         Tensor<T> query,
         Tensor<T> key,

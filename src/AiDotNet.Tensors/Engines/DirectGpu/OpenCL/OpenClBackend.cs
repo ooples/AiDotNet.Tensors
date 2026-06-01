@@ -564,6 +564,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     _kernelCache[name] = new DirectOpenClKernel(_context, gdnProgram, name);
                 }
 
+                // Compile fused RG-LRU scan kernels (#1464)
+                var rglruProgram = CompileOrLoadCached(RgLruKernels.GetSource(), optimizationFlags, "RG-LRU scan kernels");
+                _programs.Add(rglruProgram);
+                foreach (var name in RgLruKernels.GetKernelNames())
+                {
+                    _kernelCache[name] = new DirectOpenClKernel(_context, rglruProgram, name);
+                }
+
                 // Compile GRU sequence kernels (forward/backward for BPTT training)
                 var gruProgram = CompileOrLoadCached(GruKernels.GetSource(), optimizationFlags, "GRU sequence kernels");
                 _programs.Add(gruProgram);
@@ -11737,6 +11745,31 @@ KERNEL VARIANTS (A/B testing):
             kernel.SetArg(10u, headDim);
 
             int total = batch * numHeads * headDim;
+            int localSize = CalculateOptimalWorkGroupSize1D(total);
+            int globalSize = ((total + localSize - 1) / localSize) * localSize;
+            kernel.Execute1D(globalSize, localSize);
+        }
+
+        // ── Fused RG-LRU scan forward (#1464) ───────────────────────────────────────────────
+        public void RgLruScanForward(
+            IGpuBuffer value, IGpuBuffer recGate, IGpuBuffer inpGate, IGpuBuffer decay, IGpuBuffer output,
+            int batch, int seqLen, int recDim)
+        {
+            if (_context == null)
+                throw new InvalidOperationException("OpenCL context is not initialized. Cannot execute RgLruScanForward.");
+            if (!_kernelCache.TryGetValue("rglru_scan_forward", out var kernel))
+                throw new InvalidOperationException("OpenCL kernel not found: rglru_scan_forward");
+
+            kernel.SetArg(0u, ((DirectOpenClGpuBuffer)value).Buffer.Handle);
+            kernel.SetArg(1u, ((DirectOpenClGpuBuffer)recGate).Buffer.Handle);
+            kernel.SetArg(2u, ((DirectOpenClGpuBuffer)inpGate).Buffer.Handle);
+            kernel.SetArg(3u, ((DirectOpenClGpuBuffer)decay).Buffer.Handle);
+            kernel.SetArg(4u, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            kernel.SetArg(5u, batch);
+            kernel.SetArg(6u, seqLen);
+            kernel.SetArg(7u, recDim);
+
+            int total = batch * recDim;
             int localSize = CalculateOptimalWorkGroupSize1D(total);
             int globalSize = ((total + localSize - 1) / localSize) * localSize;
             kernel.Execute1D(globalSize, localSize);
