@@ -548,6 +548,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     _kernelCache[name] = new DirectOpenClKernel(_context, glaProgram, name);
                 }
 
+                // Compile fused xLSTM (mLSTM) scan kernels (#1464)
+                var xlstmProgram = CompileOrLoadCached(XLstmKernels.GetSource(), optimizationFlags, "xLSTM scan kernels");
+                _programs.Add(xlstmProgram);
+                foreach (var name in XLstmKernels.GetKernelNames())
+                {
+                    _kernelCache[name] = new DirectOpenClKernel(_context, xlstmProgram, name);
+                }
+
                 // Compile GRU sequence kernels (forward/backward for BPTT training)
                 var gruProgram = CompileOrLoadCached(GruKernels.GetSource(), optimizationFlags, "GRU sequence kernels");
                 _programs.Add(gruProgram);
@@ -11662,6 +11670,38 @@ KERNEL VARIANTS (A/B testing):
             backward.SetArg(13u, numHeads);
             backward.SetArg(14u, headDim);
             backward.Execute1D(globalSize, localSize);
+        }
+
+        // ── Fused xLSTM (mLSTM) scan forward (#1464) ────────────────────────────────────────
+        public void XLstmScanForward(
+            IGpuBuffer q, IGpuBuffer k, IGpuBuffer v,
+            IGpuBuffer iGate, IGpuBuffer fGate, IGpuBuffer oGate, IGpuBuffer output,
+            int batch, int seqLen, int modelDim, int numHeads, int headDim)
+        {
+            if (_context == null)
+                throw new InvalidOperationException("OpenCL context is not initialized. Cannot execute XLstmScanForward.");
+            if (headDim > Kernels.XLstmKernels.MaxHeadDim)
+                throw new InvalidOperationException($"xLSTM headDim ({headDim}) exceeds max ({Kernels.XLstmKernels.MaxHeadDim}).");
+            if (!_kernelCache.TryGetValue("xlstm_scan_forward", out var kernel))
+                throw new InvalidOperationException("OpenCL kernel not found: xlstm_scan_forward");
+
+            kernel.SetArg(0u, ((DirectOpenClGpuBuffer)q).Buffer.Handle);
+            kernel.SetArg(1u, ((DirectOpenClGpuBuffer)k).Buffer.Handle);
+            kernel.SetArg(2u, ((DirectOpenClGpuBuffer)v).Buffer.Handle);
+            kernel.SetArg(3u, ((DirectOpenClGpuBuffer)iGate).Buffer.Handle);
+            kernel.SetArg(4u, ((DirectOpenClGpuBuffer)fGate).Buffer.Handle);
+            kernel.SetArg(5u, ((DirectOpenClGpuBuffer)oGate).Buffer.Handle);
+            kernel.SetArg(6u, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            kernel.SetArg(7u, batch);
+            kernel.SetArg(8u, seqLen);
+            kernel.SetArg(9u, modelDim);
+            kernel.SetArg(10u, numHeads);
+            kernel.SetArg(11u, headDim);
+
+            int total = batch * numHeads;
+            int localSize = CalculateOptimalWorkGroupSize1D(total);
+            int globalSize = ((total + localSize - 1) / localSize) * localSize;
+            kernel.Execute1D(globalSize, localSize);
         }
 
         public void LstmForwardSequence(

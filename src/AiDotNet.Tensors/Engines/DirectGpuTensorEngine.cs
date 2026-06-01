@@ -6159,6 +6159,50 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
     }
 
+    // Fused xLSTM scan (#1464). GPU inference fast path; tape-active / non-float / no-backend /
+    // headDim over the kernel cap defer to the differentiable CpuEngine path.
+    public override Tensor<T> XLstmScanForward<T>(
+        Tensor<T> qProj, Tensor<T> kProj, Tensor<T> vProj,
+        Tensor<T> iGate, Tensor<T> fGate, Tensor<T> oGate, int numHeads)
+    {
+        if (IsTapeActive<T>() || typeof(T) != typeof(float) || !TryGetBackend(out var backend))
+            return base.XLstmScanForward(qProj, kProj, vProj, iGate, fGate, oGate, numHeads);
+        if (qProj.Rank != 3 || numHeads < 1)
+            return base.XLstmScanForward(qProj, kProj, vProj, iGate, fGate, oGate, numHeads);
+
+        int batch = qProj.Shape._dims[0];
+        int seqLen = qProj.Shape._dims[1];
+        int modelDim = qProj.Shape._dims[2];
+        if (modelDim % numHeads != 0)
+            return base.XLstmScanForward(qProj, kProj, vProj, iGate, fGate, oGate, numHeads);
+        int headDim = modelDim / numHeads;
+        if (headDim > 64 || iGate.Rank != 3 || iGate.Shape._dims[2] != numHeads)
+            return base.XLstmScanForward(qProj, kProj, vProj, iGate, fGate, oGate, numHeads);
+
+        try
+        {
+            using var qB = GetOrAllocateBuffer(backend, qProj);
+            using var kB = GetOrAllocateBuffer(backend, kProj);
+            using var vB = GetOrAllocateBuffer(backend, vProj);
+            using var iB = GetOrAllocateBuffer(backend, iGate);
+            using var fB = GetOrAllocateBuffer(backend, fGate);
+            using var oB = GetOrAllocateBuffer(backend, oGate);
+            using var outB = AllocateOutputBuffer(backend, batch * seqLen * modelDim);
+
+            backend.XLstmScanForward(qB.Buffer, kB.Buffer, vB.Buffer, iB.Buffer, fB.Buffer, oB.Buffer, outB.Buffer,
+                batch, seqLen, modelDim, numHeads, headDim);
+
+            float[] outF = new float[batch * seqLen * modelDim];
+            backend.DownloadBuffer(outB.Buffer, outF);
+            T[] outData = DirectGpuEngine.FromFloatArray<T>(outF);
+            return new Tensor<T>(outData, new[] { batch, seqLen, modelDim });
+        }
+        catch
+        {
+            return base.XLstmScanForward(qProj, kProj, vProj, iGate, fGate, oGate, numHeads);
+        }
+    }
+
     public override Tensor<T> FlashAttention<T>(
         Tensor<T> query,
         Tensor<T> key,

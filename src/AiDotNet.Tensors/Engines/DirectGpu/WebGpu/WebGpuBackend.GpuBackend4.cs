@@ -827,6 +827,19 @@ public sealed partial class WebGpuBackend
         UploadToBuffer(gG, dG);
     }
 
+    // Fused xLSTM (mLSTM) scan forward (#1464) — host fallback via the shared reference.
+    public void XLstmScanForward(
+        IGpuBuffer q, IGpuBuffer k, IGpuBuffer v,
+        IGpuBuffer iGate, IGpuBuffer fGate, IGpuBuffer oGate, IGpuBuffer output,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim)
+    {
+        var qd = DownloadBuffer(q); var kd = DownloadBuffer(k); var vd = DownloadBuffer(v);
+        var id = DownloadBuffer(iGate); var fd = DownloadBuffer(fGate); var od = DownloadBuffer(oGate);
+        var outp = new float[batch * seqLen * modelDim];
+        Cpu.RecurrenceCpuKernels.XLstmForward(qd, kd, vd, id, fd, od, outp, batch, seqLen, modelDim, numHeads, headDim);
+        UploadToBuffer(outp, output);
+    }
+
     public void LstmForwardSequence(
         IGpuBuffer input, IGpuBuffer hInit, IGpuBuffer cInit,
         IGpuBuffer weightsIh, IGpuBuffer weightsHh, IGpuBuffer biasIh, IGpuBuffer biasHh,

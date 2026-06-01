@@ -411,4 +411,25 @@ public sealed partial class HipBackend
         ba[10] = &batch; ba[11] = &seqLen; ba[12] = &modelDim; ba[13] = &numHeads; ba[14] = &headDim;
         LaunchKernel(backward, grid, (uint)DefaultBlockSize, ba);
     }
+
+    // ── Fused xLSTM (mLSTM) scan forward (#1464) ───────────────────────────────────────────
+    public unsafe void XLstmScanForward(
+        IGpuBuffer q, IGpuBuffer k, IGpuBuffer v,
+        IGpuBuffer iGate, IGpuBuffer fGate, IGpuBuffer oGate, IGpuBuffer output,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim)
+    {
+        if (headDim > Kernels.HipXLstmKernels.MaxHeadDim)
+            throw new InvalidOperationException(
+                $"xLSTM headDim ({headDim}) exceeds max ({Kernels.HipXLstmKernels.MaxHeadDim}).");
+        if (!_kernelCache.TryGetValue("xlstm_scan_forward", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: xlstm_scan_forward");
+
+        IntPtr pq = q.Handle, pk = k.Handle, pv = v.Handle;
+        IntPtr pi = iGate.Handle, pf = fGate.Handle, po = oGate.Handle, pout = output.Handle;
+        void** args = stackalloc void*[12];
+        args[0] = &pq; args[1] = &pk; args[2] = &pv; args[3] = &pi; args[4] = &pf; args[5] = &po; args[6] = &pout;
+        args[7] = &batch; args[8] = &seqLen; args[9] = &modelDim; args[10] = &numHeads; args[11] = &headDim;
+        uint total = (uint)(batch * numHeads);
+        LaunchKernel(kernel, (total + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize, (uint)DefaultBlockSize, args);
+    }
 }

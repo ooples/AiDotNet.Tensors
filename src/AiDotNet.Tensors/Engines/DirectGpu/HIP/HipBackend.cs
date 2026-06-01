@@ -91,6 +91,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     // Fused recurrence kernels (#1464): GLA / xLSTM / GatedDeltaNet / RgLRU /
     // RWKV-4 WKV / Mamba / Mamba-2 SSD / fused-linear-cross-entropy scans.
     private IntPtr _glaModule;
+    private IntPtr _xlstmModule;
     // True iff the fused-advanced kernel module compiled and registered
     // successfully on this device. Public surface methods gate on this so a
     // partial / failed compile surfaces a clear NotSupportedException at the
@@ -533,6 +534,10 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             // Compile fused GLA (Gated Linear Attention) scan kernels (#1464)
             CompileKernelModule(Kernels.HipGlaKernels.GetSource(), "gla", ref _glaModule,
                 Kernels.HipGlaKernels.GetKernelNames());
+
+            // Compile fused xLSTM (mLSTM) scan kernels (#1464)
+            CompileKernelModule(Kernels.HipXLstmKernels.GetSource(), "xlstm", ref _xlstmModule,
+                Kernels.HipXLstmKernels.GetKernelNames());
 
             // Compile Fused Linear + Activation kernels
             CompileKernelModule(Kernels.HipFusedLinearKernels.GetSource(), "fused_linear", ref _fusedLinearModule,

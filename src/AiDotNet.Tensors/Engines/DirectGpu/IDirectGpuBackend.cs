@@ -2676,6 +2676,16 @@ public interface IDirectGpuBackend : IDisposable
         int batch, int seqLen, int modelDim, int numHeads, int headDim);
 
     /// <summary>
+    /// Fused xLSTM (mLSTM) matrix-memory scan forward (#1464). q/k/v: [batch, seqLen, modelDim];
+    /// i/f/o gates: [batch, seqLen, numHeads]; output: [batch, seqLen, modelDim]. Inference fast
+    /// path; the differentiable backward runs through the CpuEngine tape.
+    /// </summary>
+    void XLstmScanForward(
+        IGpuBuffer q, IGpuBuffer k, IGpuBuffer v,
+        IGpuBuffer iGate, IGpuBuffer fGate, IGpuBuffer oGate, IGpuBuffer output,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim);
+
+    /// <summary>
     /// Backward pass for LSTM sequence - computes gradients via BPTT.
     /// </summary>
     /// <param name="gradOutput">Gradient from next layer [seqLen * batch * hiddenSize].</param>

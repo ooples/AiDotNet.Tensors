@@ -1653,6 +1653,13 @@ public class DelegatingGpuBackend : IDirectGpuBackend
         => Inner.GlaScanBackward(dOut, q, k, v, gate, dQ, dK, dV, dG, batch, seqLen, modelDim, numHeads, headDim);
 
     /// <inheritdoc/>
+    public virtual void XLstmScanForward(
+        IGpuBuffer q, IGpuBuffer k, IGpuBuffer v,
+        IGpuBuffer iGate, IGpuBuffer fGate, IGpuBuffer oGate, IGpuBuffer output,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim)
+        => Inner.XLstmScanForward(q, k, v, iGate, fGate, oGate, output, batch, seqLen, modelDim, numHeads, headDim);
+
+    /// <inheritdoc/>
     public virtual void LstmBackwardSequence(
         IGpuBuffer gradOutput, IGpuBuffer allH, IGpuBuffer allC, IGpuBuffer cacheGates,
         IGpuBuffer hInit, IGpuBuffer cInit,

@@ -59,6 +59,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     private IntPtr _specializedModule;
     private IntPtr _lstmModule;
     private IntPtr _glaModule; // fused GLA scan kernels (#1464)
+    private IntPtr _xlstmModule; // fused xLSTM scan kernels (#1464)
     private IntPtr _gruModule;
     private IntPtr _snnModule;
     private IntPtr _fp16Module;
@@ -759,6 +760,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         {
             _lstmModule = CompileKernelModule(device, CudaLstmKernels.GetSource(), "lstm_kernels", CudaLstmKernels.GetKernelNames());
         _glaModule = CompileKernelModule(device, Kernels.CudaGlaKernels.GetSource(), "gla_kernels", Kernels.CudaGlaKernels.GetKernelNames());
+        _xlstmModule = CompileKernelModule(device, Kernels.CudaXLstmKernels.GetSource(), "xlstm_kernels", Kernels.CudaXLstmKernels.GetKernelNames());
         }
         catch
         {
@@ -11917,6 +11919,28 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         ba[6] = &pdq; ba[7] = &pdk; ba[8] = &pdv; ba[9] = &pdg;
         ba[10] = &batch; ba[11] = &seqLen; ba[12] = &modelDim; ba[13] = &numHeads; ba[14] = &headDim;
         LaunchKernel(backward, grid, (uint)DefaultBlockSize, ba);
+    }
+
+    // ── Fused xLSTM (mLSTM) scan forward (#1464) ───────────────────────────────────────────
+    public unsafe void XLstmScanForward(
+        IGpuBuffer q, IGpuBuffer k, IGpuBuffer v,
+        IGpuBuffer iGate, IGpuBuffer fGate, IGpuBuffer oGate, IGpuBuffer output,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim)
+    {
+        if (headDim > Kernels.CudaXLstmKernels.MaxHeadDim)
+            throw new InvalidOperationException(
+                $"xLSTM headDim ({headDim}) exceeds max ({Kernels.CudaXLstmKernels.MaxHeadDim}).");
+        if (!_kernelCache.TryGetValue("xlstm_scan_forward", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: xlstm_scan_forward");
+
+        using var _ = PushContext();
+        IntPtr pq = q.Handle, pk = k.Handle, pv = v.Handle;
+        IntPtr pi = iGate.Handle, pf = fGate.Handle, po = oGate.Handle, pout = output.Handle;
+        void** args = stackalloc void*[12];
+        args[0] = &pq; args[1] = &pk; args[2] = &pv; args[3] = &pi; args[4] = &pf; args[5] = &po; args[6] = &pout;
+        args[7] = &batch; args[8] = &seqLen; args[9] = &modelDim; args[10] = &numHeads; args[11] = &headDim;
+        uint total = (uint)(batch * numHeads);
+        LaunchKernel(kernel, (total + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize, (uint)DefaultBlockSize, args);
     }
 
     public unsafe void LstmForwardSequence(
