@@ -4866,6 +4866,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         IntPtr gradOutPtr = gradOutput.Handle;
         IntPtr indicesPtr = indices.Handle;
         IntPtr gradInPtr = gradInput.Handle;
+        // Both maxpool2d_backward kernels take NINE parameters — the last two are
+        // (outHeight, outWidth). Passing only eight args (a single outWidth) left the
+        // kernel's outWidth reading an unfilled arg slot — garbage — which blew up
+        // outIdx into an out-of-bounds gradOutput/indices read and a hard CUDA access
+        // violation (0xC0000005) one step into CNN backprop (AiDotNet#1468). Pass both.
+        int outH = outHeight;
         int outW = outWidth;
 
         if (GpuDeterminism.IsActive)
@@ -4873,7 +4879,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             // Issue #382: route to atomic-free variant.
             if (!_kernelCache.TryGetValue("maxpool2d_backward_deterministic", out var kernelD))
                 throw new InvalidOperationException("CUDA kernel not found: maxpool2d_backward_deterministic");
-            void** argsD = stackalloc void*[8];
+            void** argsD = stackalloc void*[9];
             argsD[0] = &gradOutPtr;
             argsD[1] = &indicesPtr;
             argsD[2] = &gradInPtr;
@@ -4881,7 +4887,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             argsD[4] = &channels;
             argsD[5] = &inHeight;
             argsD[6] = &inWidth;
-            argsD[7] = &outW;
+            argsD[7] = &outH;
+            argsD[8] = &outW;
             // Deterministic variant grid: per (b, c, ih, iw) input cell.
             uint gridDX = (uint)((inWidth + blockSize - 1) / blockSize);
             uint gridDY = (uint)((inHeight + blockSize - 1) / blockSize);
@@ -4897,7 +4904,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         uint gridY = (uint)((outHeight + blockSize - 1) / blockSize);
         uint gridZ = (uint)(batch * channels);
 
-        void** args = stackalloc void*[8];
+        void** args = stackalloc void*[9];
         args[0] = &gradOutPtr;
         args[1] = &indicesPtr;
         args[2] = &gradInPtr;
@@ -4905,7 +4912,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         args[4] = &channels;
         args[5] = &inHeight;
         args[6] = &inWidth;
-        args[7] = &outW;
+        args[7] = &outH;
+        args[8] = &outW;
         LaunchKernel2D(kernel, gridX, gridY, gridZ, (uint)blockSize, (uint)blockSize, args);
     }
 

@@ -4925,9 +4925,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int outHeight = gradOutput.Shape._dims[2];
         int outWidth = gradOutput.Shape._dims[3];
 
-        // Convert indices to flat GPU buffer
+        // Convert indices to a flat GPU buffer. The maxpool2d_backward kernels on
+        // every backend (CUDA/OpenCL/HIP) declare the indices parameter as
+        // `const int*` and read it as int32, so the buffer MUST hold int32 values
+        // uploaded via AllocateIntBuffer. Uploading a float[] here (the previous bug)
+        // made the kernel reinterpret float bit-patterns as ints — e.g. index 5 →
+        // 5.0f = 0x40A00000 = 1084227584 — producing a wild gradInput offset and an
+        // out-of-bounds write: a hard CUDA access violation (0xC0000005) and, on
+        // OpenCL, GPU-memory corruption that surfaced later as "Failed to read OpenCL
+        // buffer: -5". This crashed AiModelBuilder.BuildAsync for every prebuilt CNN
+        // (AiDotNet#1468).
         int indexCount = batch * channels * outHeight * outWidth;
-        float[] indicesFlat = new float[indexCount];
+        int[] indicesFlat = new int[indexCount];
         for (int b = 0; b < batch; b++)
         {
             for (int c = 0; c < channels; c++)
@@ -4946,7 +4955,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
 
         using var gradOutputBuffer = GetOrAllocateBuffer(backend, gradOutput.GetDataArray());
-        using var indicesBuffer = backend.AllocateBuffer(indicesFlat);
+        using var indicesBuffer = backend.AllocateIntBuffer(indicesFlat);
         using var gradInputBuffer = AllocateOutputBuffer(backend, batch * channels * inHeight * inWidth);
 
         try
