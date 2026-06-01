@@ -34,6 +34,7 @@ extern ""C"" __global__ __launch_bounds__(1024) void mamba2_ssd_scan_forward(
     float negA = -expf(aLog[hi]);
     float dv = D[hi];
 
+    if (sd < 0 || sd > MAMBA2_MAX_STATEDIM) return;
     float h[MAMBA2_MAX_STATEDIM];
     for (int n = 0; n < sd; n++) h[n] = 0.0f;
 

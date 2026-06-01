@@ -22,6 +22,11 @@ extern ""C"" __global__ __launch_bounds__(256) void fused_linear_ce_index(
     if (r >= N) return;
     int hRow = r * d;
     int id = (int)(targetIds[r] + 0.5f);
+    if (id < 0 || id >= vocab) {
+        // Invalid label: surface loudly via the mean rather than a silently-wrong loss.
+        atomicAdd(totalLoss, INFINITY);
+        return;
+    }
 
     float mx = -1.0e38f, logitTarget = 0.0f;
     for (int vv = 0; vv < vocab; vv++) {

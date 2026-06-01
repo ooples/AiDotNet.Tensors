@@ -26,6 +26,7 @@ extern ""C"" __global__ __launch_bounds__(1024) void mamba_selective_scan_forwar
     int gid = blockIdx.x * blockDim.x + threadIdx.x;
     int total = batch * innerDim;
     if (gid >= total) return;
+    if (stateDim < 0 || stateDim > MAMBA_MAX_STATEDIM) return;
 
     int di = gid % innerDim;
     int b = gid / innerDim;

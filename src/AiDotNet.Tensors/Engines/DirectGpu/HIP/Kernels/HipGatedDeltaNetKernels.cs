@@ -33,6 +33,7 @@ extern ""C"" __global__ __launch_bounds__(1024) void gated_delta_scan_forward(
     int hOff = h * headDim;
     float kappa = 1.0f / sqrtf((float)headDim);
 
+    if (headDim < 0 || headDim > GDN_MAX_HEADDIM) return;
     float Srow[GDN_MAX_HEADDIM];
     for (int ki = 0; ki < headDim; ki++) Srow[ki] = 0.0f;
 

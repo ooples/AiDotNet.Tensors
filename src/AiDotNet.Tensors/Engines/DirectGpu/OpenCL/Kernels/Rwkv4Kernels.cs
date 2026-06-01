@@ -8,7 +8,7 @@ internal static class Rwkv4Kernels
     public static string GetSource()
     {
         return @"
-#define RWKV4_NEG_INF (-1.0e38f)
+#define RWKV4_NEG_INF (-INFINITY)
 
 __kernel void rwkv4_wkv_forward(
     __global const float* R, __global const float* K, __global const float* V,

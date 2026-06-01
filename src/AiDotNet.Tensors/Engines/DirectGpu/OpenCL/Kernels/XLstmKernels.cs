@@ -28,6 +28,7 @@ __kernel void xlstm_scan_forward(
     int b = gid / numHeads;
     int hOff = h * headDim;
     int hh = headDim * headDim;
+    if (headDim < 0 || headDim > XLSTM_MAX_HEADDIM || hh > XLSTM_MAX_HH) return;
     float kappa = 1.0f / sqrt((float)headDim);
 
     float C[XLSTM_MAX_HH];
