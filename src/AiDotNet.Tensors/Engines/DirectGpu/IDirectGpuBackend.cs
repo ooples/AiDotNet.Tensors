@@ -2686,6 +2686,14 @@ public interface IDirectGpuBackend : IDisposable
         int batch, int seqLen, int modelDim, int numHeads, int headDim);
 
     /// <summary>
+    /// Fused Gated DeltaNet (delta-rule) scan forward (#1464). q/k/v: [batch, seqLen, modelDim];
+    /// alpha/beta gates: [batch, seqLen, numHeads]; output: [batch, seqLen, modelDim].
+    /// </summary>
+    void GatedDeltaNetScanForward(
+        IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer alpha, IGpuBuffer beta, IGpuBuffer output,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim);
+
+    /// <summary>
     /// Backward pass for LSTM sequence - computes gradients via BPTT.
     /// </summary>
     /// <param name="gradOutput">Gradient from next layer [seqLen * batch * hiddenSize].</param>

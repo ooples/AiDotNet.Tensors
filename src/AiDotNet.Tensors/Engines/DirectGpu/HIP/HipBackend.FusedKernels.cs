@@ -432,4 +432,23 @@ public sealed partial class HipBackend
         uint total = (uint)(batch * numHeads);
         LaunchKernel(kernel, (total + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize, (uint)DefaultBlockSize, args);
     }
+
+    // ── Fused Gated DeltaNet scan forward (#1464) ──────────────────────────────────────────
+    public unsafe void GatedDeltaNetScanForward(
+        IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer alpha, IGpuBuffer beta, IGpuBuffer output,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim)
+    {
+        if (headDim > Kernels.HipGatedDeltaNetKernels.MaxHeadDim)
+            throw new InvalidOperationException(
+                $"GatedDeltaNet headDim ({headDim}) exceeds max ({Kernels.HipGatedDeltaNetKernels.MaxHeadDim}).");
+        if (!_kernelCache.TryGetValue("gated_delta_scan_forward", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: gated_delta_scan_forward");
+
+        IntPtr pq = q.Handle, pk = k.Handle, pv = v.Handle, pa = alpha.Handle, pb = beta.Handle, pout = output.Handle;
+        void** args = stackalloc void*[11];
+        args[0] = &pq; args[1] = &pk; args[2] = &pv; args[3] = &pa; args[4] = &pb; args[5] = &pout;
+        args[6] = &batch; args[7] = &seqLen; args[8] = &modelDim; args[9] = &numHeads; args[10] = &headDim;
+        uint total = (uint)(batch * numHeads * headDim);
+        LaunchKernel(kernel, (total + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize, (uint)DefaultBlockSize, args);
+    }
 }

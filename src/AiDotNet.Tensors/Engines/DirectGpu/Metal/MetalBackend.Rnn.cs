@@ -83,6 +83,18 @@ public partial class MetalBackend
         UploadToBuffer(output, outp);
     }
 
+    // Fused Gated DeltaNet scan forward (#1464) — host fallback via the shared reference.
+    public void GatedDeltaNetScanForward(
+        IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer alpha, IGpuBuffer beta, IGpuBuffer output,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim)
+    {
+        var qd = DownloadBuffer(q); var kd = DownloadBuffer(k); var vd = DownloadBuffer(v);
+        var ad = DownloadBuffer(alpha); var bd = DownloadBuffer(beta);
+        var outp = new float[batch * seqLen * modelDim];
+        Cpu.RecurrenceCpuKernels.GatedDeltaNetForward(qd, kd, vd, ad, bd, outp, batch, seqLen, modelDim, numHeads, headDim);
+        UploadToBuffer(output, outp);
+    }
+
     public void LstmForwardSequence(
         IGpuBuffer input, IGpuBuffer hInit, IGpuBuffer cInit,
         IGpuBuffer weightsIh, IGpuBuffer weightsHh, IGpuBuffer biasIh, IGpuBuffer biasHh,

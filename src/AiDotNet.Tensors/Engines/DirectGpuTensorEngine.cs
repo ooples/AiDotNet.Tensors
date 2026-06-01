@@ -6203,6 +6203,47 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
     }
 
+    // Fused Gated DeltaNet scan (#1464). GPU inference fast path; defer to CpuEngine otherwise.
+    public override Tensor<T> GatedDeltaNetScanForward<T>(
+        Tensor<T> qProj, Tensor<T> kProj, Tensor<T> vProj, Tensor<T> alpha, Tensor<T> beta, int numHeads)
+    {
+        if (IsTapeActive<T>() || typeof(T) != typeof(float) || !TryGetBackend(out var backend))
+            return base.GatedDeltaNetScanForward(qProj, kProj, vProj, alpha, beta, numHeads);
+        if (qProj.Rank != 3 || numHeads < 1)
+            return base.GatedDeltaNetScanForward(qProj, kProj, vProj, alpha, beta, numHeads);
+
+        int batch = qProj.Shape._dims[0];
+        int seqLen = qProj.Shape._dims[1];
+        int modelDim = qProj.Shape._dims[2];
+        if (modelDim % numHeads != 0)
+            return base.GatedDeltaNetScanForward(qProj, kProj, vProj, alpha, beta, numHeads);
+        int headDim = modelDim / numHeads;
+        if (headDim > 256 || alpha.Rank != 3 || alpha.Shape._dims[2] != numHeads)
+            return base.GatedDeltaNetScanForward(qProj, kProj, vProj, alpha, beta, numHeads);
+
+        try
+        {
+            using var qB = GetOrAllocateBuffer(backend, qProj);
+            using var kB = GetOrAllocateBuffer(backend, kProj);
+            using var vB = GetOrAllocateBuffer(backend, vProj);
+            using var aB = GetOrAllocateBuffer(backend, alpha);
+            using var bB = GetOrAllocateBuffer(backend, beta);
+            using var outB = AllocateOutputBuffer(backend, batch * seqLen * modelDim);
+
+            backend.GatedDeltaNetScanForward(qB.Buffer, kB.Buffer, vB.Buffer, aB.Buffer, bB.Buffer, outB.Buffer,
+                batch, seqLen, modelDim, numHeads, headDim);
+
+            float[] outF = new float[batch * seqLen * modelDim];
+            backend.DownloadBuffer(outB.Buffer, outF);
+            T[] outData = DirectGpuEngine.FromFloatArray<T>(outF);
+            return new Tensor<T>(outData, new[] { batch, seqLen, modelDim });
+        }
+        catch
+        {
+            return base.GatedDeltaNetScanForward(qProj, kProj, vProj, alpha, beta, numHeads);
+        }
+    }
+
     public override Tensor<T> FlashAttention<T>(
         Tensor<T> query,
         Tensor<T> key,

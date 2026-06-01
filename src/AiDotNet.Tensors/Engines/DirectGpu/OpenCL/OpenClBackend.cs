@@ -556,6 +556,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     _kernelCache[name] = new DirectOpenClKernel(_context, xlstmProgram, name);
                 }
 
+                // Compile fused Gated DeltaNet scan kernels (#1464)
+                var gdnProgram = CompileOrLoadCached(GatedDeltaNetKernels.GetSource(), optimizationFlags, "Gated DeltaNet scan kernels");
+                _programs.Add(gdnProgram);
+                foreach (var name in GatedDeltaNetKernels.GetKernelNames())
+                {
+                    _kernelCache[name] = new DirectOpenClKernel(_context, gdnProgram, name);
+                }
+
                 // Compile GRU sequence kernels (forward/backward for BPTT training)
                 var gruProgram = CompileOrLoadCached(GruKernels.GetSource(), optimizationFlags, "GRU sequence kernels");
                 _programs.Add(gruProgram);
@@ -11699,6 +11707,36 @@ KERNEL VARIANTS (A/B testing):
             kernel.SetArg(11u, headDim);
 
             int total = batch * numHeads;
+            int localSize = CalculateOptimalWorkGroupSize1D(total);
+            int globalSize = ((total + localSize - 1) / localSize) * localSize;
+            kernel.Execute1D(globalSize, localSize);
+        }
+
+        // ── Fused Gated DeltaNet scan forward (#1464) ───────────────────────────────────────
+        public void GatedDeltaNetScanForward(
+            IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer alpha, IGpuBuffer beta, IGpuBuffer output,
+            int batch, int seqLen, int modelDim, int numHeads, int headDim)
+        {
+            if (_context == null)
+                throw new InvalidOperationException("OpenCL context is not initialized. Cannot execute GatedDeltaNetScanForward.");
+            if (headDim > Kernels.GatedDeltaNetKernels.MaxHeadDim)
+                throw new InvalidOperationException($"GatedDeltaNet headDim ({headDim}) exceeds max ({Kernels.GatedDeltaNetKernels.MaxHeadDim}).");
+            if (!_kernelCache.TryGetValue("gated_delta_scan_forward", out var kernel))
+                throw new InvalidOperationException("OpenCL kernel not found: gated_delta_scan_forward");
+
+            kernel.SetArg(0u, ((DirectOpenClGpuBuffer)q).Buffer.Handle);
+            kernel.SetArg(1u, ((DirectOpenClGpuBuffer)k).Buffer.Handle);
+            kernel.SetArg(2u, ((DirectOpenClGpuBuffer)v).Buffer.Handle);
+            kernel.SetArg(3u, ((DirectOpenClGpuBuffer)alpha).Buffer.Handle);
+            kernel.SetArg(4u, ((DirectOpenClGpuBuffer)beta).Buffer.Handle);
+            kernel.SetArg(5u, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            kernel.SetArg(6u, batch);
+            kernel.SetArg(7u, seqLen);
+            kernel.SetArg(8u, modelDim);
+            kernel.SetArg(9u, numHeads);
+            kernel.SetArg(10u, headDim);
+
+            int total = batch * numHeads * headDim;
             int localSize = CalculateOptimalWorkGroupSize1D(total);
             int globalSize = ((total + localSize - 1) / localSize) * localSize;
             kernel.Execute1D(globalSize, localSize);

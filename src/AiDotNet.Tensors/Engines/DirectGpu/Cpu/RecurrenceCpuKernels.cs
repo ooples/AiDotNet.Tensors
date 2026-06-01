@@ -132,6 +132,56 @@ internal static class RecurrenceCpuKernels
             }
     }
 
+    /// <summary>
+    /// Gated DeltaNet (delta-rule) forward. q/k/v: [batch, seqLen, modelDim];
+    /// alpha (forget) / beta (write): [batch, seqLen, numHeads]; output: [batch, seqLen, modelDim].
+    ///   sK[di]     = sum_ki S[di,ki] * (kappa*K[ki])
+    ///   S[di,ki]  := alpha * S[di,ki] + beta*(V[di]-sK[di]) * (kappa*K[ki])
+    ///   O[di]      = sum_ki S[di,ki] * Q[ki]
+    /// </summary>
+    public static void GatedDeltaNetForward(
+        float[] q, float[] k, float[] v, float[] alpha, float[] beta, float[] output,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim)
+    {
+        int hh = headDim * headDim;
+        float kappa = 1.0f / MathF.Sqrt(headDim);
+        var s = new float[hh];
+        var sK = new float[headDim];
+        for (int b = 0; b < batch; b++)
+            for (int h = 0; h < numHeads; h++)
+            {
+                Array.Clear(s, 0, hh);
+                int hOff = h * headDim;
+                for (int t = 0; t < seqLen; t++)
+                {
+                    int baseOff = (b * seqLen + t) * modelDim + hOff;
+                    int gIdx = (b * seqLen + t) * numHeads + h;
+                    float a = alpha[gIdx], bet = beta[gIdx];
+                    for (int di = 0; di < headDim; di++)
+                    {
+                        int srow = di * headDim;
+                        float acc = 0.0f;
+                        for (int ki = 0; ki < headDim; ki++) acc += s[srow + ki] * (k[baseOff + ki] * kappa);
+                        sK[di] = acc;
+                    }
+                    for (int di = 0; di < headDim; di++)
+                    {
+                        int srow = di * headDim;
+                        float bd = bet * (v[baseOff + di] - sK[di]);
+                        for (int ki = 0; ki < headDim; ki++)
+                            s[srow + ki] = a * s[srow + ki] + bd * (k[baseOff + ki] * kappa);
+                    }
+                    for (int di = 0; di < headDim; di++)
+                    {
+                        int srow = di * headDim;
+                        float o = 0.0f;
+                        for (int ki = 0; ki < headDim; ki++) o += s[srow + ki] * q[baseOff + ki];
+                        output[baseOff + di] = o;
+                    }
+                }
+            }
+    }
+
     private const float XLstmIGateClamp = 4.85e8f;
 
     /// <summary>
