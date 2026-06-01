@@ -7660,7 +7660,15 @@ public partial class CpuEngine : ITensorLevelEngine
             int hw = h * w;
             int ohow = oH * oW;
 
-            if (bc >= CpuParallelSettings.MaxDegreeOfParallelism)
+            // Only take the parallel (delegate + closure) path when there is enough
+            // total work to amortize its fixed dispatch cost. At small batch the pooled
+            // tensor (e.g. bs1: 16ch × 14² = 12 544 < grain) would otherwise route through
+            // ParallelForOrSerial, run *serial anyway* (work < grain), yet still pay the
+            // closure alloc + per-channel delegate dispatch — measured ~25 µs of pure
+            // overhead on top of a ~19 µs kernel. Below the grain the direct serial inline
+            // below is the fast path (no closure, fully JIT-optimized inner loop).
+            if (bc >= CpuParallelSettings.MaxDegreeOfParallelism
+                && (long)bc * hw >= PersistentParallelExecutor.DefaultSerialGrainSize)
             {
                 CpuParallelSettings.ParallelForOrSerial(0, bc, (long)bc * hw, idx =>
                 {
@@ -7731,7 +7739,15 @@ public partial class CpuEngine : ITensorLevelEngine
             int hw = h * w;
             int ohow = oH * oW;
 
-            if (bc >= CpuParallelSettings.MaxDegreeOfParallelism)
+            // Only take the parallel (delegate + closure) path when there is enough
+            // total work to amortize its fixed dispatch cost. At small batch the pooled
+            // tensor (e.g. bs1: 16ch × 14² = 12 544 < grain) would otherwise route through
+            // ParallelForOrSerial, run *serial anyway* (work < grain), yet still pay the
+            // closure alloc + per-channel delegate dispatch — measured ~25 µs of pure
+            // overhead on top of a ~19 µs kernel. Below the grain the direct serial inline
+            // below is the fast path (no closure, fully JIT-optimized inner loop).
+            if (bc >= CpuParallelSettings.MaxDegreeOfParallelism
+                && (long)bc * hw >= PersistentParallelExecutor.DefaultSerialGrainSize)
             {
                 CpuParallelSettings.ParallelForOrSerial(0, bc, (long)bc * hw, idx =>
                 {
@@ -7889,7 +7905,15 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
             }
 
-            if (bc >= CpuParallelSettings.MaxDegreeOfParallelism)
+            // Only take the parallel (delegate + closure) path when there is enough
+            // total work to amortize its fixed dispatch cost. At small batch the pooled
+            // tensor (e.g. bs1: 16ch × 14² = 12 544 < grain) would otherwise route through
+            // ParallelForOrSerial, run *serial anyway* (work < grain), yet still pay the
+            // closure alloc + per-channel delegate dispatch — measured ~25 µs of pure
+            // overhead on top of a ~19 µs kernel. Below the grain the direct serial inline
+            // below is the fast path (no closure, fully JIT-optimized inner loop).
+            if (bc >= CpuParallelSettings.MaxDegreeOfParallelism
+                && (long)bc * hw >= PersistentParallelExecutor.DefaultSerialGrainSize)
             {
                 CpuParallelSettings.ParallelForOrSerial(0, bc, (long)bc * hw, idx =>
                 {
