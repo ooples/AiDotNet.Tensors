@@ -1221,20 +1221,20 @@ public sealed unsafe partial class VulkanBackend
             batch * numHeads * headDim,
             new[] { (uint)batch, (uint)seqLen, (uint)modelDim, (uint)numHeads, (uint)headDim });
 
-    // GLA BPTT backward is never invoked by the IEngine forward-only path; HIP/CUDA/OpenCL carry
-    // the real backward kernel. Kept on host (an atomics-based GLSL backward is a follow-up).
+    // GLA BPTT backward — real GLSL kernels (recompute trajectory + reverse sweep with CAS float
+    // atomics for the cross-row dQ/dK/dG). dQ/dK/dG must be pre-zeroed (the atomic accumulators).
     public void GlaScanBackward(
         IGpuBuffer dOut, IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer gate,
         IGpuBuffer dQ, IGpuBuffer dK, IGpuBuffer dV, IGpuBuffer dG,
         int batch, int seqLen, int modelDim, int numHeads, int headDim)
     {
-        EnsureInitialized();
-        var doData = DownloadBuffer(dOut); var qd = DownloadBuffer(q); var kd = DownloadBuffer(k);
-        var vd = DownloadBuffer(v); var gd = DownloadBuffer(gate);
-        var gq = new float[batch * seqLen * modelDim]; var gk = new float[batch * seqLen * modelDim];
-        var gv = new float[batch * seqLen * modelDim]; var gG = new float[batch * seqLen * numHeads];
-        Cpu.RecurrenceCpuKernels.GlaBackward(doData, qd, kd, vd, gd, gq, gk, gv, gG, batch, seqLen, modelDim, numHeads, headDim);
-        UploadToBuffer(gq, dQ); UploadToBuffer(gk, dK); UploadToBuffer(gv, dV); UploadToBuffer(gG, dG);
+        int hh = headDim * headDim;
+        int total = batch * numHeads * headDim;
+        using var traj = AllocateBuffer(batch * numHeads * seqLen * hh);
+        var pc = new[] { (uint)batch, (uint)seqLen, (uint)modelDim, (uint)numHeads, (uint)headDim };
+        GlslNaryOp(VulkanRecurrenceKernels.GlaRecompute, new[] { k, v, gate, traj }, total, pc);
+        GlslNaryOp(VulkanRecurrenceKernels.GlaBackward,
+            new[] { dOut, q, k, v, gate, traj, dQ, dK, dV, dG }, total, pc);
     }
 
     public void XLstmScanForward(

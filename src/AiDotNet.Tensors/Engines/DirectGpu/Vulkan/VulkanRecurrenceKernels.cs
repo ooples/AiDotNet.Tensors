@@ -234,4 +234,64 @@ void main() {
     for (int vv=0;vv<VC;vv++) { float s=bias[vv]; for (int j=0;j<D;j++) s+=hidden[hRow+j]*weight[j*VC+vv]; rl+=target[tRow+vv]*(s-lse); }
     rowLoss[r]=-rl;
 }";
+
+    // GLA BPTT backward: recompute the state trajectory, then reverse-sweep. dQ/dK/dG are bound as
+    // uint SSBOs and accumulated via a CAS float-atomic add (GLSL has no portable float atomicAdd);
+    // dV is a plain per-thread store. dQ/dK/dG must be pre-zeroed.
+    public static string GlaRecompute => Header + @"
+layout(set=0,binding=0) readonly buffer Kb { float K[]; };
+layout(set=0,binding=1) readonly buffer Vb { float Vd[]; };
+layout(set=0,binding=2) readonly buffer Gb { float G[]; };
+layout(set=0,binding=3) buffer Sb { float Straj[]; };
+layout(push_constant) uniform PC { uint batch; uint seqLen; uint modelDim; uint numHeads; uint headDim; };
+void main() {
+    int gid = int(gl_GlobalInvocationID.x);
+    int B=int(batch), SL=int(seqLen), MD=int(modelDim), NH=int(numHeads), HD=int(headDim);
+    if (gid >= B*NH*HD) return;
+    int di = gid % HD; int h = (gid/HD) % NH; int b = gid/(HD*NH); int hOff = h*HD; int hh = HD*HD;
+    float Srow[256];
+    for (int ki=0; ki<HD; ki++) Srow[ki]=0.0;
+    for (int t=0; t<SL; t++) {
+        int baseOff = (b*SL+t)*MD + hOff;
+        float g = G[(b*SL+t)*NH + h]; float vd = Vd[baseOff+di];
+        int trajBase = ((b*NH+h)*SL+t)*hh + di*HD;
+        for (int ki=0; ki<HD; ki++) { float s=g*Srow[ki]+vd*K[baseOff+ki]; Srow[ki]=s; Straj[trajBase+ki]=s; }
+    }
+}";
+
+    public static string GlaBackward => Header + @"
+layout(set=0,binding=0) readonly buffer DOb { float dOut[]; };
+layout(set=0,binding=1) readonly buffer Qb { float Q[]; };
+layout(set=0,binding=2) readonly buffer Kb { float K[]; };
+layout(set=0,binding=3) readonly buffer Vb { float Vd[]; };
+layout(set=0,binding=4) readonly buffer Gb { float G[]; };
+layout(set=0,binding=5) readonly buffer Sb { float Straj[]; };
+layout(set=0,binding=6) buffer DQb { uint dQ[]; };
+layout(set=0,binding=7) buffer DKb { uint dK[]; };
+layout(set=0,binding=8) buffer DVb { float dV[]; };
+layout(set=0,binding=9) buffer DGb { uint dG[]; };
+layout(push_constant) uniform PC { uint batch; uint seqLen; uint modelDim; uint numHeads; uint headDim; };
+void addDQ(int idx, float val){ uint old=dQ[idx]; uint assumed; do { assumed=old; old=atomicCompSwap(dQ[idx], assumed, floatBitsToUint(uintBitsToFloat(assumed)+val)); } while(old!=assumed); }
+void addDK(int idx, float val){ uint old=dK[idx]; uint assumed; do { assumed=old; old=atomicCompSwap(dK[idx], assumed, floatBitsToUint(uintBitsToFloat(assumed)+val)); } while(old!=assumed); }
+void addDG(int idx, float val){ uint old=dG[idx]; uint assumed; do { assumed=old; old=atomicCompSwap(dG[idx], assumed, floatBitsToUint(uintBitsToFloat(assumed)+val)); } while(old!=assumed); }
+void main() {
+    int gid = int(gl_GlobalInvocationID.x);
+    int B=int(batch), SL=int(seqLen), MD=int(modelDim), NH=int(numHeads), HD=int(headDim);
+    if (gid >= B*NH*HD) return;
+    int di = gid % HD; int h = (gid/HD) % NH; int b = gid/(HD*NH); int hOff = h*HD; int hh = HD*HD;
+    float dSrow[256];
+    for (int ki=0; ki<HD; ki++) dSrow[ki]=0.0;
+    for (int t=SL-1; t>=0; t--) {
+        int baseOff = (b*SL+t)*MD + hOff; int gOff = (b*SL+t)*NH + h; float g = G[gOff];
+        int trajBase = ((b*NH+h)*SL+t)*hh + di*HD;
+        int sprevBase = ((b*NH+h)*SL+(t-1))*hh + di*HD;
+        float dOutVal = dOut[baseOff+di];
+        for (int ki=0; ki<HD; ki++) { float sval=Straj[trajBase+ki]; addDQ(baseOff+ki, dOutVal*sval); dSrow[ki]+=dOutVal*Q[baseOff+ki]; }
+        float vd = Vd[baseOff+di]; float dg=0.0; float dVacc=0.0;
+        for (int ki=0; ki<HD; ki++) { float dStv=dSrow[ki]; float sprev = (t>0) ? Straj[sprevBase+ki] : 0.0; dg+=dStv*sprev; addDK(baseOff+ki, dStv*vd); dVacc+=dStv*K[baseOff+ki]; }
+        dV[baseOff+di] = dVacc;
+        addDG(gOff, dg);
+        for (int ki=0; ki<HD; ki++) dSrow[ki]*=g;
+    }
+}";
 }
