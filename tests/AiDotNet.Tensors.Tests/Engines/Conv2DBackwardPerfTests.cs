@@ -361,6 +361,61 @@ public class Conv2DBackwardPerfTests
         }
     }
 
+    // #403 Phase F: validate the channel-parallel K-concat im2col build at a
+    // high-channel-count shape. The default correctness shape above has inC=3
+    // (colW=36) — this one uses inC=32 (colH = 32·9 = 288, colW = 8·8 = 64 ≤ 256,
+    // batch ≥ 2 → K-concat with the channel-parallel im2col build over 32 disjoint
+    // channel tasks), so the channel-range row-offset math is exercised across many
+    // blocks. Asserted for both element types against the naive reference.
+    [Fact]
+    public void Conv2DBackwardKernel_Correctness_ChannelParallelManyChannels_MatchesNaive()
+    {
+        int batch = 2, inC = 32, outC = 8, h = 10, w = 10, kH = 3, kW = 3;
+        int outH = h - kH + 1, outW = w - kW + 1;
+        int colW = outH * outW;                   // 64 ≤ 256 → channel-parallel build
+        Assert.True(colW <= 256 && inC >= 16);    // guard the precondition
+
+        var rng = new Random(789);
+        var gradOutputF = new float[batch * outC * outH * outW];
+        var inputF = new float[batch * inC * h * w];
+        for (int i = 0; i < gradOutputF.Length; i++) gradOutputF[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < inputF.Length; i++) inputF[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        var kernelShape = new[] { outC, inC, kH, kW };
+        var stride = new[] { 1, 1 };
+        var padding = new[] { 0, 0 };
+        var dilation = new[] { 1, 1 };
+        var gradOutputShape = new[] { batch, outC, outH, outW };
+        var inputShape = new[] { batch, inC, h, w };
+
+        var resultNaive = NaiveConv2DBackwardKernelFloat(
+            gradOutputF, gradOutputShape, inputF, inputShape, kernelShape, stride, padding, dilation);
+
+        // FP32 swapped path
+        var gradOutF = new Tensor<float>(gradOutputShape);
+        var inF = new Tensor<float>(inputShape);
+        for (int i = 0; i < gradOutputF.Length; i++) gradOutF[i] = gradOutputF[i];
+        for (int i = 0; i < inputF.Length; i++) inF[i] = inputF[i];
+        var resultF = _engine.Conv2DBackwardKernel(gradOutF, inF, kernelShape, stride, padding, dilation);
+
+        // FP64 swapped path (same swap+transpose code, double element type)
+        var gradOutD = new Tensor<double>(gradOutputShape);
+        var inD = new Tensor<double>(inputShape);
+        for (int i = 0; i < gradOutputF.Length; i++) gradOutD[i] = gradOutputF[i];
+        for (int i = 0; i < inputF.Length; i++) inD[i] = inputF[i];
+        var resultD = _engine.Conv2DBackwardKernel(gradOutD, inD, kernelShape, stride, padding, dilation);
+
+        for (int i = 0; i < resultNaive.Length; i++)
+        {
+            double diffF = Math.Abs(resultF[i] - resultNaive[i]);
+            Assert.True(diffF < 1e-2,
+                $"FP32 swap mismatch at [{i}]: swap={resultF[i]:F6}, naive={resultNaive[i]:F6}, diff={diffF:E2}");
+            double diffD = Math.Abs(resultD[i] - resultNaive[i]);
+            Assert.True(diffD < 1e-2,
+                $"FP64 swap mismatch at [{i}]: swap={resultD[i]:F6}, naive={resultNaive[i]:F6}, diff={diffD:E2}");
+        }
+    }
+
     [Theory]
     [InlineData(2, 1, 1, 1)]  // stride=2, pad=1, dilation=1
     [InlineData(1, 1, 2, 1)]  // stride=1, pad=1, dilation=2 (dilated)

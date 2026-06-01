@@ -416,6 +416,92 @@ public class DCGANStepProbe
     }
 
     /// <summary>
+    /// Issue #403 Phase F — Conv2DBackwardKernel sub-step breakdown at the full
+    /// batched DCGAN shape. The K-concat path stacks each batch's gradOutput and
+    /// im2col along the GEMM K axis (k = b·colW + n) into [outC, batchColW] /
+    /// [colH, batchColW] buffers, then issues ONE transB GEMM. Splits the wrapper
+    /// into the gradOut repack, the strided im2col build (serial Phase-E vs the
+    /// channel-parallel Phase-F build), and the full-width GEMM so we can see
+    /// where the ~860µs wrapper time actually goes and whether parallelizing the
+    /// strided build moves the needle.
+    /// </summary>
+    public static string RunBackwardKernelBreakdown(int innerReps = 50, int outerSamples = 25)
+    {
+        int colH = InChannels * KernelHW * KernelHW; // 1024
+        int colW = SpatialOut * SpatialOut;          // 49
+        int batchColW = Batch * colW;                // 98
+        int inputSliceSize = InChannels * SpatialIn * SpatialIn;
+        int kHW = KernelHW * KernelHW;
+        var rng = new Random(23);
+        double[] R(int n) { var x = new double[n]; for (int i = 0; i < n; i++) x[i] = rng.NextDouble(); return x; }
+
+        double[] input = R(Batch * inputSliceSize);
+        double[] gradOut = R(Batch * OutChannels * colW);
+        double[] gradOutAll = new double[OutChannels * batchColW];
+        double[] im2colAll = new double[colH * batchColW];
+        double[] gradKernel = new double[OutChannels * colH];
+
+        void Repack()
+        {
+            for (int b = 0; b < Batch; b++)
+            {
+                int off = b * OutChannels * colW;
+                for (int oc = 0; oc < OutChannels; oc++)
+                    Array.Copy(gradOut, off + oc * colW, gradOutAll, oc * batchColW + b * colW, colW);
+            }
+        }
+        void StackSerial()
+        {
+            for (int b = 0; b < Batch; b++)
+                Im2ColHelper.Im2ColStridedSingle(
+                    new ReadOnlySpan<double>(input, b * inputSliceSize, inputSliceSize),
+                    new Span<double>(im2colAll), batchColW, b * colW,
+                    InChannels, SpatialIn, SpatialIn, KernelHW, KernelHW,
+                    Stride, Stride, Padding, Padding, 1, 1, SpatialOut, SpatialOut);
+        }
+        void StackParallel()
+            => AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(
+                0, InChannels, (long)InChannels * Batch * kHW * colW, c =>
+                {
+                    for (int b = 0; b < Batch; b++)
+                        Im2ColHelper.Im2ColStridedSingleChannelRange(
+                            new ReadOnlySpan<double>(input, b * inputSliceSize, inputSliceSize),
+                            new Span<double>(im2colAll), batchColW, b * colW,
+                            c, c + 1, SpatialIn, SpatialIn, KernelHW, KernelHW,
+                            Stride, Stride, Padding, Padding, 1, 1, SpatialOut, SpatialOut);
+                });
+        // Measure the GEMM through the SAME production chokepoint the wrapper
+        // uses (BlasProvider.TryGemmEx), not BlasManaged.Gemm directly — the
+        // routing the wrapper sees is what actually matters. NOTE: a swapped
+        // formulation (gradKernel^T = im2colAll @ gradOutAll^T, M=colH big +
+        // blocked transpose) was profiled here and is ~145µs faster in isolation,
+        // BUT regressed the end-to-end wrapper by ~200µs (the swap packs the
+        // freshly-built im2colAll as its large-M operand cold), so the direct GEMM
+        // is the one shipped. Left as the single GEMM measurement below.
+        double GemmDirect() => MinTime(() =>
+            AiDotNet.Tensors.Helpers.BlasProvider.TryGemmEx(
+                OutChannels, colH, batchColW,
+                gradOutAll, 0, batchColW, false,
+                im2colAll, 0, batchColW, true,
+                gradKernel, 0, colH),
+            innerReps, outerSamples);
+
+        Repack(); StackSerial(); StackParallel(); GemmDirect();
+        double rp = MinTime(Repack, innerReps, outerSamples);
+        double ss = MinTime(StackSerial, innerReps, outerSamples);
+        double sp = MinTime(StackParallel, innerReps, outerSamples);
+        double gDirect = GemmDirect();
+
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine("Conv2DBackwardKernel sub-step breakdown (min-of-many, µs, full batched shape):");
+        sb.AppendLine($"  {rp / 1000.0,10:N3} µs  gradOut repack (outC·colW copies × batch)");
+        sb.AppendLine($"  {ss / 1000.0,10:N3} µs  im2col stack — SERIAL per-batch (Phase E)");
+        sb.AppendLine($"  {sp / 1000.0,10:N3} µs  im2col stack — channel-PARALLEL (Phase F, shipped)");
+        sb.AppendLine($"  {gDirect / 1000.0,10:N3} µs  transB GEMM M=64 N=1024 K=98 via TryGemmEx (gradKernel = gradOut @ im2col^T)");
+        return sb.ToString();
+    }
+
+    /// <summary>
     /// Issue #403 Phase D — strategy sweep for the three conv GEMM shapes.
     /// Each shape is timed under Auto (the deterministic-mode static heuristic)
     /// vs forced Streaming / PackAOnly / PackBoth, so we can see whether the

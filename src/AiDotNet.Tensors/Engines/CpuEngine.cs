@@ -13711,6 +13711,104 @@ public partial class CpuEngine : ITensorLevelEngine
         }
     }
 
+    // #403 Phase F: maximum colW (= outputH·outputW) at which the K-concat
+    // im2col build is parallelized over input channels. At small colW each
+    // im2col row is a tiny scattered strided write, so building channels in
+    // parallel hides the cache-miss latency (DCGAN colW=49 → ~74µs→35µs). At
+    // large colW each row is a big contiguous copy and the build is memory-
+    // bandwidth-bound: extra cores only add dispatch overhead, so those build
+    // serially per batch (a perf-guard at colW=900 regressed under an
+    // unconditional channel-parallel build).
+    private const int ParallelIm2colMaxColW = 256;
+
+    // #403 Phase F: repack gradOutput + build the strided im2col for the K-concat
+    // backward-kernel path (float). gradOutAll[oc, b·colW+n] = gradOutput[b,oc,n];
+    // im2colAll[ki, b·colW+n] = im2col(input[b])[ki, n]. The im2col build is
+    // parallelized over input channels at small colW (each row is a tiny scattered
+    // strided write, so parallelism hides cache-miss latency) and built serially
+    // per batch at large colW (each row is a big contiguous copy → bandwidth-bound,
+    // extra cores only add dispatch overhead). Extracted so Conv2DBackwardKernel's
+    // hot GEMM path keeps its baseline codegen (the inline build bloated the method
+    // and regressed a small-shape perf guard).
+    private static void BuildKConcatStackFloat(
+        float[] gradOutputF, float[] inputF, float[] gradOutAll, float[] im2colAll,
+        int batch, int outChannels, int inChannels, int colW, int colH, int batchColW,
+        int inputSliceSize, int height, int width, int kernelHeight, int kernelWidth,
+        int strideH, int strideW, int padH, int padW, int dilationH, int dilationW,
+        int outputHeight, int outputWidth)
+    {
+        for (int b = 0; b < batch; b++)
+        {
+            int gradOutOff = b * outChannels * colW;
+            for (int oc = 0; oc < outChannels; oc++)
+                Array.Copy(gradOutputF, gradOutOff + oc * colW,
+                           gradOutAll, oc * batchColW + b * colW, colW);
+        }
+        if (colW <= ParallelIm2colMaxColW)
+        {
+            int kHW = kernelHeight * kernelWidth;
+            CpuParallelSettings.ParallelForOrSerial(
+                0, inChannels, (long)inChannels * batch * kHW * colW, c =>
+                {
+                    for (int b = 0; b < batch; b++)
+                        Helpers.Im2ColHelper.Im2ColStridedSingleChannelRange(
+                            new ReadOnlySpan<float>(inputF, b * inputSliceSize, inputSliceSize),
+                            new Span<float>(im2colAll, 0, colH * batchColW), batchColW, b * colW,
+                            c, c + 1, height, width, kernelHeight, kernelWidth,
+                            strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth);
+                });
+        }
+        else
+        {
+            for (int b = 0; b < batch; b++)
+                Helpers.Im2ColHelper.Im2ColStridedSingle(
+                    new ReadOnlySpan<float>(inputF, b * inputSliceSize, inputSliceSize),
+                    new Span<float>(im2colAll, 0, colH * batchColW), batchColW, b * colW,
+                    inChannels, height, width, kernelHeight, kernelWidth,
+                    strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth);
+        }
+    }
+
+    // #403 Phase F: double counterpart of <see cref="BuildKConcatStackFloat"/>.
+    private static void BuildKConcatStackDouble(
+        double[] gradOutputD, double[] inputD, double[] gradOutAll, double[] im2colAll,
+        int batch, int outChannels, int inChannels, int colW, int colH, int batchColW,
+        int inputSliceSize, int height, int width, int kernelHeight, int kernelWidth,
+        int strideH, int strideW, int padH, int padW, int dilationH, int dilationW,
+        int outputHeight, int outputWidth)
+    {
+        for (int b = 0; b < batch; b++)
+        {
+            int gradOutOff = b * outChannels * colW;
+            for (int oc = 0; oc < outChannels; oc++)
+                Array.Copy(gradOutputD, gradOutOff + oc * colW,
+                           gradOutAll, oc * batchColW + b * colW, colW);
+        }
+        if (colW <= ParallelIm2colMaxColW)
+        {
+            int kHW = kernelHeight * kernelWidth;
+            CpuParallelSettings.ParallelForOrSerial(
+                0, inChannels, (long)inChannels * batch * kHW * colW, c =>
+                {
+                    for (int b = 0; b < batch; b++)
+                        Helpers.Im2ColHelper.Im2ColStridedSingleChannelRange(
+                            new ReadOnlySpan<double>(inputD, b * inputSliceSize, inputSliceSize),
+                            new Span<double>(im2colAll, 0, colH * batchColW), batchColW, b * colW,
+                            c, c + 1, height, width, kernelHeight, kernelWidth,
+                            strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth);
+                });
+        }
+        else
+        {
+            for (int b = 0; b < batch; b++)
+                Helpers.Im2ColHelper.Im2ColStridedSingle(
+                    new ReadOnlySpan<double>(inputD, b * inputSliceSize, inputSliceSize),
+                    new Span<double>(im2colAll, 0, colH * batchColW), batchColW, b * colW,
+                    inChannels, height, width, kernelHeight, kernelWidth,
+                    strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth);
+        }
+    }
+
     /// <inheritdoc/>
     public Tensor<T> Conv2DBackwardKernel<T>(Tensor<T> gradOutput, Tensor<T> input, int[] kernelShape, int[] stride, int[] padding, int[] dilation)
     {
@@ -13775,22 +13873,13 @@ public partial class CpuEngine : ITensorLevelEngine
                 var im2colAll = kcPool.Rent(colH * batchColW);
                 try
                 {
-                    for (int b = 0; b < batch; b++)
-                    {
-                        int gradOutOff = b * outChannels * colW;
-                        for (int oc = 0; oc < outChannels; oc++)
-                            Array.Copy(gradOutputF, gradOutOff + oc * colW,
-                                       gradOutAll, oc * batchColW + b * colW, colW);
-
-                        // #403 Phase E: im2col directly into batch b's column block
-                        // (no per-batch temp + strided row-copies).
-                        Im2ColHelper.Im2ColStridedSingle(
-                            new ReadOnlySpan<float>(inputF, b * inputSliceSize, inputSliceSize),
-                            new Span<float>(im2colAll, 0, colH * batchColW), batchColW, b * colW,
-                            inChannels, height, width,
-                            kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW,
-                            outputHeight, outputWidth);
-                    }
+                    // #403 Phase F: repack gradOutput + build the strided im2col
+                    // (channel-parallel at small colW, serial at large colW).
+                    BuildKConcatStackFloat(
+                        gradOutputF, inputF, gradOutAll, im2colAll,
+                        batch, outChannels, inChannels, colW, colH, batchColW,
+                        inputSliceSize, height, width, kernelHeight, kernelWidth,
+                        strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth);
 
                     // gradKernel = gradOutAll @ im2colAll^T — one full-width GEMM.
                     if (!Helpers.BlasProvider.TryGemmEx(
@@ -14010,25 +14099,13 @@ public partial class CpuEngine : ITensorLevelEngine
                 var im2colAll = kcPool.Rent(colH * batchColW);
                 try
                 {
-                    for (int b = 0; b < batch; b++)
-                    {
-                        // gradOutAll[oc, b·colW + n] = gradOutput[b, oc, n]
-                        int gradOutOff = b * outChannels * colW;
-                        for (int oc = 0; oc < outChannels; oc++)
-                            Array.Copy(gradOutputD, gradOutOff + oc * colW,
-                                       gradOutAll, oc * batchColW + b * colW, colW);
-
-                        // #403 Phase E: im2col(input[b]) DIRECTLY into batch b's
-                        // column block of im2colAll (row stride batchColW, col
-                        // offset b·colW) — no per-batch temp buffer + no ~colH
-                        // strided row-copies.
-                        Helpers.Im2ColHelper.Im2ColStridedSingle(
-                            new ReadOnlySpan<double>(inputD, b * inputSliceSize, inputSliceSize),
-                            new Span<double>(im2colAll, 0, colH * batchColW), batchColW, b * colW,
-                            inChannels, height, width,
-                            kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW,
-                            outputHeight, outputWidth);
-                    }
+                    // #403 Phase F: repack gradOutput + build the strided im2col
+                    // (channel-parallel at small colW, serial at large colW).
+                    BuildKConcatStackDouble(
+                        gradOutputD, inputD, gradOutAll, im2colAll,
+                        batch, outChannels, inChannels, colW, colH, batchColW,
+                        inputSliceSize, height, width, kernelHeight, kernelWidth,
+                        strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth);
 
                     // gradKernel = gradOutAll @ im2colAll^T — one full-width GEMM.
                     if (Helpers.BlasProvider.TryGemmEx(

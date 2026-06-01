@@ -195,6 +195,9 @@ class Program
             Console.WriteLine(DCGANStepProbe.RunBackwardInputBreakdown());
 
             Console.WriteLine();
+            Console.WriteLine(DCGANStepProbe.RunBackwardKernelBreakdown());
+
+            Console.WriteLine();
             Console.WriteLine(DCGANStepProbe.RunForwardBreakdown());
 
             Console.WriteLine();
