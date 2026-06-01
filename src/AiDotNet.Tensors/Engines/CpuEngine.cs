@@ -8907,17 +8907,25 @@ public partial class CpuEngine : ITensorLevelEngine
                 $"Output tensor shape [{string.Join(", ", output._shape)}] doesn't match expected shape [{batch}, {outChannels}, {outputHeight}, {outputWidth}].");
         }
 
-        // Use im2col + GEMM for float (significantly faster)
+        // Use im2col + GEMM for float. Route through Conv2DIm2colGemm — the same
+        // maintained fast path the int[] Conv2DInto / allocating Conv2D(int[])
+        // overloads use — rather than Conv2DWithIm2ColFloat (the SIMD-direct /
+        // Winograd cascade). For the small 3×3 stride-1 convs that dominate CNN
+        // inference the direct cascade is ~15× slower than im2col-GEMM (measured:
+        // a 16→32 @14×14 conv at 1967 µs via this overload vs 117 µs via the int[]
+        // overload), so the int and int[] overloads were silently making opposite
+        // kernel choices. Output is numerically equivalent (im2col-GEMM vs direct
+        // differ only by FP summation order).
         if (typeof(T) == typeof(float))
         {
-            Conv2DWithIm2ColFloat(
-                input as Tensor<float> ?? throw new InvalidCastException(),
-                kernel as Tensor<float> ?? throw new InvalidCastException(),
-                output as Tensor<float> ?? throw new InvalidCastException(),
+            Conv2DIm2colGemm(
+                (float[])(object)input.GetDataArray(),
+                (float[])(object)kernel.GetDataArray(),
+                (float[])(object)output.GetDataArray(),
                 batch, inChannels, height, width,
                 outChannels, kernelHeight, kernelWidth,
-                stride, padding, dilation,
-                outputHeight, outputWidth);
+                outputHeight, outputWidth,
+                stride, stride, padding, padding, dilation, dilation);
             return;
         }
 
@@ -34225,6 +34233,20 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (weights == null) throw new ArgumentNullException(nameof(weights));
+
+        // Any-rank support: a rank-1 input [K] is a single unbatched sample. The GEMM
+        // fast paths and TensorMatMul below operate on rank >= 2, so promote [K] → [1, K]
+        // (numpy/torch matmul promote a 1-D operand the same way), run the standard path,
+        // and squeeze the leading batch dim back off → [N]. This keeps the fused linear
+        // op rank-agnostic and consistent with the generic per-layer Forward path; the
+        // Reshape is tape/graph-aware, so a rank-1 input under training still records a
+        // correct backward chain.
+        if (input.Rank == 1)
+        {
+            var promotedInput = Reshape(input, new[] { 1, input._shape[0] });
+            var promotedResult = FusedLinear(promotedInput, weights, bias, activation, activationParams);
+            return Reshape(promotedResult, new[] { promotedResult._shape[promotedResult.Rank - 1] });
+        }
 
         // Lazy graph mode: record the fused operation for later compilation
         if (GraphMode.IsActive)
