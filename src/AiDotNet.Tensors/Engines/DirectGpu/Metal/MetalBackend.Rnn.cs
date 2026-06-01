@@ -11,27 +11,6 @@ public partial class MetalBackend
 {
     #region RNN (LSTM/GRU) Sequence Operations
 
-    /// <summary>
-    /// Forward pass for LSTM sequence - processes all timesteps in a single kernel launch.
-    /// Efficient for BPTT training with minimal kernel launch overhead.
-    /// </summary>
-    /// <param name="input">Input sequence [seqLen * batch * inputSize].</param>
-    /// <param name="hInit">Initial hidden state [batch * hiddenSize].</param>
-    /// <param name="cInit">Initial cell state [batch * hiddenSize].</param>
-    /// <param name="weightsIh">Input-to-hidden weights [4 * hiddenSize * inputSize] (gates: i, f, g, o).</param>
-    /// <param name="weightsHh">Hidden-to-hidden weights [4 * hiddenSize * hiddenSize].</param>
-    /// <param name="biasIh">Input-to-hidden bias [4 * hiddenSize].</param>
-    /// <param name="biasHh">Hidden-to-hidden bias [4 * hiddenSize].</param>
-    /// <param name="output">Output sequence [seqLen * batch * hiddenSize].</param>
-    /// <param name="hFinal">Final hidden state [batch * hiddenSize].</param>
-    /// <param name="cFinal">Final cell state [batch * hiddenSize].</param>
-    /// <param name="allH">All hidden states cache [(seqLen + 1) * batch * hiddenSize] for backward.</param>
-    /// <param name="allC">All cell states cache [(seqLen + 1) * batch * hiddenSize] for backward.</param>
-    /// <param name="cacheGates">Gate cache [seqLen * batch * hiddenSize * 4] for backward.</param>
-    /// <param name="seqLen">Sequence length.</param>
-    /// <param name="batch">Batch size.</param>
-    /// <param name="inputSize">Input feature size.</param>
-    /// <param name="hiddenSize">Hidden state size.</param>
     // ── Fused recurrence / LM-head GPU kernels (#1464) ─────────────────────────────────────
     // Real MSL compute shaders (MetalRecurrenceKernels). One thread per the same work-item the
     // other backends use. Forward only — the differentiable backward runs through the CpuEngine
@@ -67,9 +46,15 @@ public partial class MetalBackend
         IGpuBuffer dQ, IGpuBuffer dK, IGpuBuffer dV, IGpuBuffer dG,
         int batch, int seqLen, int modelDim, int numHeads, int headDim)
     {
+        if (batch <= 0 || seqLen <= 0 || modelDim <= 0 || numHeads <= 0 || headDim <= 0)
+            throw new ArgumentOutOfRangeException(nameof(batch), "GLA dimensions must be positive.");
         int hh = headDim * headDim;
-        int total = batch * numHeads * headDim;
-        using var traj = AllocateBuffer(batch * numHeads * seqLen * hh);
+        long totalLong = checked((long)batch * numHeads * headDim);
+        long trajLenLong = checked((long)batch * numHeads * seqLen * hh);
+        if (totalLong > int.MaxValue || trajLenLong > int.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(batch), "GLA dimensions exceed Metal launch/buffer limits.");
+        int total = (int)totalLong;
+        using var traj = AllocateBuffer((int)trajLenLong);
         DispatchRecurrence("gla_scan_recompute", total,
             new[] { M(k), M(v), M(gate), M(traj) },
             new[] { batch, seqLen, modelDim, numHeads, headDim });
@@ -143,6 +128,27 @@ public partial class MetalBackend
         return (float)(sum / n);
     }
 
+    /// <summary>
+    /// Forward pass for LSTM sequence - processes all timesteps in a single kernel launch.
+    /// Efficient for BPTT training with minimal kernel launch overhead.
+    /// </summary>
+    /// <param name="input">Input sequence [seqLen * batch * inputSize].</param>
+    /// <param name="hInit">Initial hidden state [batch * hiddenSize].</param>
+    /// <param name="cInit">Initial cell state [batch * hiddenSize].</param>
+    /// <param name="weightsIh">Input-to-hidden weights [4 * hiddenSize * inputSize] (gates: i, f, g, o).</param>
+    /// <param name="weightsHh">Hidden-to-hidden weights [4 * hiddenSize * hiddenSize].</param>
+    /// <param name="biasIh">Input-to-hidden bias [4 * hiddenSize].</param>
+    /// <param name="biasHh">Hidden-to-hidden bias [4 * hiddenSize].</param>
+    /// <param name="output">Output sequence [seqLen * batch * hiddenSize].</param>
+    /// <param name="hFinal">Final hidden state [batch * hiddenSize].</param>
+    /// <param name="cFinal">Final cell state [batch * hiddenSize].</param>
+    /// <param name="allH">All hidden states cache [(seqLen + 1) * batch * hiddenSize] for backward.</param>
+    /// <param name="allC">All cell states cache [(seqLen + 1) * batch * hiddenSize] for backward.</param>
+    /// <param name="cacheGates">Gate cache [seqLen * batch * hiddenSize * 4] for backward.</param>
+    /// <param name="seqLen">Sequence length.</param>
+    /// <param name="batch">Batch size.</param>
+    /// <param name="inputSize">Input feature size.</param>
+    /// <param name="hiddenSize">Hidden state size.</param>
     public void LstmForwardSequence(
         IGpuBuffer input, IGpuBuffer hInit, IGpuBuffer cInit,
         IGpuBuffer weightsIh, IGpuBuffer weightsHh, IGpuBuffer biasIh, IGpuBuffer biasHh,

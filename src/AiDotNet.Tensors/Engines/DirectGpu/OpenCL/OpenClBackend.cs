@@ -11649,6 +11649,10 @@ KERNEL VARIANTS (A/B testing):
         {
             if (_context == null)
                 throw new InvalidOperationException("OpenCL context is not initialized. Cannot execute GlaScanForward.");
+            if (batch <= 0 || seqLen <= 0 || modelDim <= 0 || numHeads <= 0 || headDim <= 0)
+                throw new ArgumentOutOfRangeException(nameof(batch), "GLA dimensions must be positive.");
+            if (modelDim != numHeads * headDim)
+                throw new ArgumentException($"modelDim ({modelDim}) must equal numHeads * headDim ({numHeads * headDim}).");
             if (headDim > Kernels.GlaKernels.MaxHeadDim)
                 throw new InvalidOperationException($"GLA headDim ({headDim}) exceeds max ({Kernels.GlaKernels.MaxHeadDim}).");
             if (!_kernelCache.TryGetValue("gla_scan_forward", out var kernel))
@@ -11679,15 +11683,23 @@ KERNEL VARIANTS (A/B testing):
         {
             if (_context == null)
                 throw new InvalidOperationException("OpenCL context is not initialized. Cannot execute GlaScanBackward.");
+            if (batch <= 0 || seqLen <= 0 || modelDim <= 0 || numHeads <= 0 || headDim <= 0)
+                throw new ArgumentOutOfRangeException(nameof(batch), "GLA dimensions must be positive.");
+            if (modelDim != numHeads * headDim)
+                throw new ArgumentException($"modelDim ({modelDim}) must equal numHeads * headDim ({numHeads * headDim}).");
             if (headDim > Kernels.GlaKernels.MaxHeadDim)
                 throw new InvalidOperationException($"GLA headDim ({headDim}) exceeds max ({Kernels.GlaKernels.MaxHeadDim}).");
             if (!_kernelCache.TryGetValue("gla_scan_recompute", out var recompute) ||
                 !_kernelCache.TryGetValue("gla_scan_backward", out var backward))
                 throw new InvalidOperationException("OpenCL kernel not found: gla_scan_recompute / gla_scan_backward");
 
-            int trajLen = batch * numHeads * seqLen * headDim * headDim;
+            long totalLong = checked((long)batch * numHeads * headDim);
+            long trajLenLong = checked(totalLong * seqLen * headDim);
+            if (totalLong > int.MaxValue || trajLenLong > int.MaxValue)
+                throw new ArgumentOutOfRangeException(nameof(batch), "GLA dimensions exceed OpenCL launch/buffer limits.");
+            int trajLen = (int)trajLenLong;
             using var trajBuf = AllocateBuffer(trajLen);
-            int total = batch * numHeads * headDim;
+            int total = (int)totalLong;
             int localSize = CalculateOptimalWorkGroupSize1D(total);
             int globalSize = ((total + localSize - 1) / localSize) * localSize;
 

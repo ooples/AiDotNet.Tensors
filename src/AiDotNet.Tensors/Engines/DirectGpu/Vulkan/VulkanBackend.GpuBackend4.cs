@@ -1228,9 +1228,15 @@ public sealed unsafe partial class VulkanBackend
         IGpuBuffer dQ, IGpuBuffer dK, IGpuBuffer dV, IGpuBuffer dG,
         int batch, int seqLen, int modelDim, int numHeads, int headDim)
     {
+        if (batch <= 0 || seqLen <= 0 || modelDim <= 0 || numHeads <= 0 || headDim <= 0)
+            throw new ArgumentOutOfRangeException(nameof(batch), "GLA dimensions must be positive.");
         int hh = headDim * headDim;
-        int total = batch * numHeads * headDim;
-        using var traj = AllocateBuffer(batch * numHeads * seqLen * hh);
+        long totalLong = checked((long)batch * numHeads * headDim);
+        long trajLenLong = checked((long)batch * numHeads * seqLen * hh);
+        if (totalLong > int.MaxValue || trajLenLong > int.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(batch), "GLA dimensions exceed Vulkan launch/buffer limits.");
+        int total = (int)totalLong;
+        using var traj = AllocateBuffer((int)trajLenLong);
         var pc = new[] { (uint)batch, (uint)seqLen, (uint)modelDim, (uint)numHeads, (uint)headDim };
         GlslNaryOp(VulkanRecurrenceKernels.GlaRecompute, new[] { k, v, gate, traj }, total, pc);
         GlslNaryOp(VulkanRecurrenceKernels.GlaBackward,

@@ -392,7 +392,11 @@ public sealed partial class HipBackend
             throw new InvalidOperationException("HIP kernel not found: gla_scan_recompute / gla_scan_backward");
 
         // State trajectory scratch: [batch * numHeads * seqLen * headDim * headDim].
-        int trajLen = batch * numHeads * seqLen * headDim * headDim;
+        long trajLenLong = (long)batch * numHeads * seqLen * headDim * headDim;
+        if (trajLenLong > int.MaxValue)
+            throw new InvalidOperationException(
+                $"GLA trajectory buffer size ({trajLenLong}) exceeds int.MaxValue.");
+        int trajLen = (int)trajLenLong;
         using var trajBuf = AllocateBuffer(trajLen);
         uint total = (uint)(batch * numHeads * headDim);
         uint grid = (total + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize;

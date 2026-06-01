@@ -10611,6 +10611,49 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             _gruModule = IntPtr.Zero;
         }
 
+        // Fused recurrence kernels (#1464): unload each loaded module so repeated
+        // backend create/dispose cycles don't leak HIP module handles.
+        if (_glaModule != IntPtr.Zero)
+        {
+            HipNativeBindings.hipModuleUnload(_glaModule);
+            _glaModule = IntPtr.Zero;
+        }
+        if (_xlstmModule != IntPtr.Zero)
+        {
+            HipNativeBindings.hipModuleUnload(_xlstmModule);
+            _xlstmModule = IntPtr.Zero;
+        }
+        if (_gatedDeltaNetModule != IntPtr.Zero)
+        {
+            HipNativeBindings.hipModuleUnload(_gatedDeltaNetModule);
+            _gatedDeltaNetModule = IntPtr.Zero;
+        }
+        if (_rgLruModule != IntPtr.Zero)
+        {
+            HipNativeBindings.hipModuleUnload(_rgLruModule);
+            _rgLruModule = IntPtr.Zero;
+        }
+        if (_rwkv4Module != IntPtr.Zero)
+        {
+            HipNativeBindings.hipModuleUnload(_rwkv4Module);
+            _rwkv4Module = IntPtr.Zero;
+        }
+        if (_mambaModule != IntPtr.Zero)
+        {
+            HipNativeBindings.hipModuleUnload(_mambaModule);
+            _mambaModule = IntPtr.Zero;
+        }
+        if (_mamba2Module != IntPtr.Zero)
+        {
+            HipNativeBindings.hipModuleUnload(_mamba2Module);
+            _mamba2Module = IntPtr.Zero;
+        }
+        if (_fusedCeModule != IntPtr.Zero)
+        {
+            HipNativeBindings.hipModuleUnload(_fusedCeModule);
+            _fusedCeModule = IntPtr.Zero;
+        }
+
         if (_capsuleModule != IntPtr.Zero)
         {
             HipNativeBindings.hipModuleUnload(_capsuleModule);

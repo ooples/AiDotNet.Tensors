@@ -11884,9 +11884,22 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer gate, IGpuBuffer output,
         int batch, int seqLen, int modelDim, int numHeads, int headDim)
     {
+        if (batch <= 0 || seqLen <= 0 || modelDim <= 0 || numHeads <= 0 || headDim <= 0)
+            throw new ArgumentOutOfRangeException(nameof(batch), "GLA dimensions must be positive.");
+        if (modelDim != numHeads * headDim)
+            throw new ArgumentException($"modelDim ({modelDim}) must equal numHeads * headDim ({numHeads * headDim}).");
         if (headDim > Kernels.CudaGlaKernels.MaxHeadDim)
             throw new InvalidOperationException(
                 $"GLA headDim ({headDim}) exceeds max ({Kernels.CudaGlaKernels.MaxHeadDim}).");
+
+        long tokenCount = checked((long)batch * seqLen);
+        long qkvElems = checked(tokenCount * modelDim);
+        long gateElems = checked(tokenCount * numHeads);
+        if (q.Size < qkvElems || k.Size < qkvElems || v.Size < qkvElems || output.Size < qkvElems)
+            throw new ArgumentException("Q/K/V/output buffer is too small for the requested GLA shape.");
+        if (gate.Size < gateElems)
+            throw new ArgumentException("gate buffer is too small for the requested GLA shape.");
+
         if (!_kernelCache.TryGetValue("gla_scan_forward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: gla_scan_forward");
 
@@ -11905,6 +11918,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         IGpuBuffer dQ, IGpuBuffer dK, IGpuBuffer dV, IGpuBuffer dG,
         int batch, int seqLen, int modelDim, int numHeads, int headDim)
     {
+        if (batch <= 0 || seqLen <= 0 || modelDim <= 0 || numHeads <= 0 || headDim <= 0)
+            throw new ArgumentOutOfRangeException(nameof(batch), "GLA dimensions must be positive.");
+        if (modelDim != numHeads * headDim)
+            throw new ArgumentException($"modelDim ({modelDim}) must equal numHeads * headDim ({numHeads * headDim}).");
         if (headDim > Kernels.CudaGlaKernels.MaxHeadDim)
             throw new InvalidOperationException(
                 $"GLA headDim ({headDim}) exceeds max ({Kernels.CudaGlaKernels.MaxHeadDim}).");
@@ -11913,7 +11930,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             throw new InvalidOperationException("CUDA kernel not found: gla_scan_recompute / gla_scan_backward");
 
         using var _ = PushContext();
-        int trajLen = batch * numHeads * seqLen * headDim * headDim;
+        long trajLenL = checked((long)batch * numHeads * seqLen * headDim * headDim);
+        if (trajLenL > int.MaxValue)
+            throw new ArgumentException("GLA trajectory buffer is too large for a single allocation.");
+        int trajLen = (int)trajLenL;
         using var trajBuf = AllocateBuffer(trajLen);
         uint total = (uint)(batch * numHeads * headDim);
         uint grid = (total + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize;
@@ -12537,6 +12557,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         {
             CudaNativeBindings.cuModuleUnload(_lstmModule);
             _lstmModule = IntPtr.Zero;
+        }
+
+        if (_glaModule != IntPtr.Zero)
+        {
+            CudaNativeBindings.cuModuleUnload(_glaModule);
+            _glaModule = IntPtr.Zero;
         }
 
         if (_gruModule != IntPtr.Zero)

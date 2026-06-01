@@ -6130,6 +6130,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int batch = qProj.Shape._dims[0];
         int seqLen = qProj.Shape._dims[1];
         int modelDim = qProj.Shape._dims[2];
+        // K/V/gate must share Q's batch/seq (and K/V its model dim); a mismatched
+        // caller would otherwise launch the kernel with Q-derived sizes and read/write
+        // out of bounds. Defer to the safe differentiable fallback instead.
+        if (kProj.Rank != 3 || vProj.Rank != 3 || gate.Rank != 3)
+            return base.GlaScanForward(qProj, kProj, vProj, gate, numHeads);
+        if (kProj.Shape._dims[0] != batch || kProj.Shape._dims[1] != seqLen || kProj.Shape._dims[2] != modelDim)
+            return base.GlaScanForward(qProj, kProj, vProj, gate, numHeads);
+        if (vProj.Shape._dims[0] != batch || vProj.Shape._dims[1] != seqLen || vProj.Shape._dims[2] != modelDim)
+            return base.GlaScanForward(qProj, kProj, vProj, gate, numHeads);
+        if (gate.Shape._dims[0] != batch || gate.Shape._dims[1] != seqLen)
+            return base.GlaScanForward(qProj, kProj, vProj, gate, numHeads);
         if (numHeads < 1 || modelDim % numHeads != 0)
             return base.GlaScanForward(qProj, kProj, vProj, gate, numHeads);
         int headDim = modelDim / numHeads;
