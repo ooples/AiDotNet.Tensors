@@ -349,6 +349,8 @@ internal static class RecurrenceCpuKernels
     public static float FusedLinearCeIndex(
         float[] hidden, float[] weight, float[] bias, int[] targetIds, int n, int d, int vocab)
     {
+        if (n <= 0 || d <= 0 || vocab <= 0)
+            throw new ArgumentOutOfRangeException(nameof(n), "Fused CE dimensions (n, d, vocab) must be positive.");
         double total = 0.0;
         for (int r = 0; r < n; r++)
         {
@@ -356,6 +358,8 @@ internal static class RecurrenceCpuKernels
             float max = float.NegativeInfinity;
             float logitTarget = 0.0f;
             int id = targetIds[r];
+            if (id < 0 || id >= vocab)
+                throw new ArgumentOutOfRangeException(nameof(targetIds), $"targetIds[{r}]={id} is out of range [0, {vocab}).");
             for (int vv = 0; vv < vocab; vv++)
             {
                 float s = bias[vv];

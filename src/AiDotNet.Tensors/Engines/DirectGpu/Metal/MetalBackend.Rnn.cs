@@ -119,6 +119,8 @@ public partial class MetalBackend
     private float FusedCeRowLoss(
         string kernelName, IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer tgt, int n, int d, int vocab)
     {
+        if (n <= 0 || d <= 0 || vocab <= 0)
+            throw new ArgumentOutOfRangeException(nameof(n), "Fused CE dimensions (n, d, vocab) must be positive.");
         using var rowLoss = AllocateBuffer(n);
         DispatchRecurrence(kernelName, n,
             new[] { M(hidden), M(weight), M(bias), M(tgt), M(rowLoss) }, new[] { n, d, vocab });

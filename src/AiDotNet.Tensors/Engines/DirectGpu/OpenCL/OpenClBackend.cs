@@ -540,6 +540,13 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     _kernelCache[name] = new DirectOpenClKernel(_context, lstmProgram, name);
                 }
 
+                // Fused recurrence / LM-head kernels (#1464) are an OPTIONAL capability: a
+                // driver that rejects one of these sources must not abort the whole backend
+                // init (which would lose every core kernel). Compile them in their own
+                // try/catch — methods that need a missing kernel already throw "kernel not
+                // found" at call time, so a partial compile degrades gracefully.
+                try
+                {
                 // Compile fused GLA (Gated Linear Attention) scan kernels (#1464)
                 var glaProgram = CompileOrLoadCached(GlaKernels.GetSource(), optimizationFlags, "GLA scan kernels");
                 _programs.Add(glaProgram);
@@ -602,6 +609,15 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 foreach (var name in FusedLinearCeKernels.GetKernelNames())
                 {
                     _kernelCache[name] = new DirectOpenClKernel(_context, fusedCeProgram, name);
+                }
+                }
+                catch (OutOfMemoryException)
+                {
+                    throw; // Fatal — never silently downgrade.
+                }
+                catch (Exception fex)
+                {
+                    WriteDiag($"[OpenClBackend] fused recurrence/LM-head kernels (#1464) unavailable: {fex.Message}");
                 }
 
                 // Compile GRU sequence kernels (forward/backward for BPTT training)
@@ -11740,6 +11756,10 @@ KERNEL VARIANTS (A/B testing):
         {
             if (_context == null)
                 throw new InvalidOperationException("OpenCL context is not initialized. Cannot execute XLstmScanForward.");
+            if (batch <= 0 || seqLen <= 0 || modelDim <= 0 || numHeads <= 0 || headDim <= 0)
+                throw new ArgumentOutOfRangeException(nameof(batch), "xLSTM dimensions must be positive.");
+            if (modelDim != numHeads * headDim)
+                throw new ArgumentException($"modelDim ({modelDim}) must equal numHeads * headDim ({numHeads * headDim}).");
             if (headDim > Kernels.XLstmKernels.MaxHeadDim)
                 throw new InvalidOperationException($"xLSTM headDim ({headDim}) exceeds max ({Kernels.XLstmKernels.MaxHeadDim}).");
             if (!_kernelCache.TryGetValue("xlstm_scan_forward", out var kernel))
@@ -11771,6 +11791,10 @@ KERNEL VARIANTS (A/B testing):
         {
             if (_context == null)
                 throw new InvalidOperationException("OpenCL context is not initialized. Cannot execute GatedDeltaNetScanForward.");
+            if (batch <= 0 || seqLen <= 0 || modelDim <= 0 || numHeads <= 0 || headDim <= 0)
+                throw new ArgumentOutOfRangeException(nameof(batch), "GatedDeltaNet dimensions must be positive.");
+            if (modelDim != numHeads * headDim)
+                throw new ArgumentException($"modelDim ({modelDim}) must equal numHeads * headDim ({numHeads * headDim}).");
             if (headDim > Kernels.GatedDeltaNetKernels.MaxHeadDim)
                 throw new InvalidOperationException($"GatedDeltaNet headDim ({headDim}) exceeds max ({Kernels.GatedDeltaNetKernels.MaxHeadDim}).");
             if (!_kernelCache.TryGetValue("gated_delta_scan_forward", out var kernel))
@@ -11801,6 +11825,8 @@ KERNEL VARIANTS (A/B testing):
         {
             if (_context == null)
                 throw new InvalidOperationException("OpenCL context is not initialized. Cannot execute RgLruScanForward.");
+            if (batch <= 0 || seqLen <= 0 || recDim <= 0)
+                throw new ArgumentOutOfRangeException(nameof(batch), "RG-LRU dimensions must be positive.");
             if (!_kernelCache.TryGetValue("rglru_scan_forward", out var kernel))
                 throw new InvalidOperationException("OpenCL kernel not found: rglru_scan_forward");
 
@@ -11826,6 +11852,8 @@ KERNEL VARIANTS (A/B testing):
         {
             if (_context == null)
                 throw new InvalidOperationException("OpenCL context is not initialized. Cannot execute Rwkv4WkvForward.");
+            if (batch <= 0 || seqLen <= 0 || modelDim <= 0)
+                throw new ArgumentOutOfRangeException(nameof(batch), "RWKV-4 dimensions must be positive.");
             if (!_kernelCache.TryGetValue("rwkv4_wkv_forward", out var kernel))
                 throw new InvalidOperationException("OpenCL kernel not found: rwkv4_wkv_forward");
 
@@ -11852,6 +11880,8 @@ KERNEL VARIANTS (A/B testing):
         {
             if (_context == null)
                 throw new InvalidOperationException("OpenCL context is not initialized. Cannot execute MambaSelectiveScanForward.");
+            if (batch <= 0 || seqLen <= 0 || innerDim <= 0 || stateDim <= 0)
+                throw new ArgumentOutOfRangeException(nameof(batch), "Mamba dimensions must be positive.");
             if (stateDim > Kernels.MambaKernels.MaxStateDim)
                 throw new InvalidOperationException($"Mamba stateDim ({stateDim}) exceeds max ({Kernels.MambaKernels.MaxStateDim}).");
             if (!_kernelCache.TryGetValue("mamba_selective_scan_forward", out var kernel))
@@ -11882,6 +11912,10 @@ KERNEL VARIANTS (A/B testing):
         {
             if (_context == null)
                 throw new InvalidOperationException("OpenCL context is not initialized. Cannot execute Mamba2SsdScanForward.");
+            if (batch <= 0 || seqLen <= 0 || innerDim <= 0 || numHeads <= 0 || headDim <= 0 || stateDim <= 0)
+                throw new ArgumentOutOfRangeException(nameof(batch), "Mamba-2 dimensions must be positive.");
+            if (innerDim != numHeads * headDim)
+                throw new ArgumentException($"innerDim ({innerDim}) must equal numHeads * headDim ({numHeads * headDim}).");
             if (stateDim > Kernels.Mamba2Kernels.MaxStateDim)
                 throw new InvalidOperationException($"Mamba-2 stateDim ({stateDim}) exceeds max ({Kernels.Mamba2Kernels.MaxStateDim}).");
             if (!_kernelCache.TryGetValue("mamba2_ssd_scan_forward", out var kernel))
@@ -11921,6 +11955,8 @@ KERNEL VARIANTS (A/B testing):
         {
             if (_context == null)
                 throw new InvalidOperationException("OpenCL context is not initialized. Cannot execute FusedLinearCrossEntropy.");
+            if (n <= 0 || d <= 0 || vocab <= 0)
+                throw new ArgumentOutOfRangeException(nameof(n), "Fused CE dimensions (n, d, vocab) must be positive.");
             if (!_kernelCache.TryGetValue(kernelName, out var kernel))
                 throw new InvalidOperationException($"OpenCL kernel not found: {kernelName}");
 

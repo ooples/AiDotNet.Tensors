@@ -363,6 +363,10 @@ public sealed partial class HipBackend
         IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer gate, IGpuBuffer output,
         int batch, int seqLen, int modelDim, int numHeads, int headDim)
     {
+        if (batch <= 0 || seqLen <= 0 || modelDim <= 0 || numHeads <= 0 || headDim <= 0)
+            throw new ArgumentOutOfRangeException(nameof(batch), "GLA dimensions must be positive.");
+        if (modelDim != numHeads * headDim)
+            throw new ArgumentException($"modelDim ({modelDim}) must equal numHeads * headDim ({numHeads * headDim}).");
         if (headDim > Kernels.HipGlaKernels.MaxHeadDim)
             throw new InvalidOperationException(
                 $"GLA headDim ({headDim}) exceeds max ({Kernels.HipGlaKernels.MaxHeadDim}).");
@@ -384,6 +388,10 @@ public sealed partial class HipBackend
         IGpuBuffer dQ, IGpuBuffer dK, IGpuBuffer dV, IGpuBuffer dG,
         int batch, int seqLen, int modelDim, int numHeads, int headDim)
     {
+        if (batch <= 0 || seqLen <= 0 || modelDim <= 0 || numHeads <= 0 || headDim <= 0)
+            throw new ArgumentOutOfRangeException(nameof(batch), "GLA dimensions must be positive.");
+        if (modelDim != numHeads * headDim)
+            throw new ArgumentException($"modelDim ({modelDim}) must equal numHeads * headDim ({numHeads * headDim}).");
         if (headDim > Kernels.HipGlaKernels.MaxHeadDim)
             throw new InvalidOperationException(
                 $"GLA headDim ({headDim}) exceeds max ({Kernels.HipGlaKernels.MaxHeadDim}).");
@@ -422,6 +430,10 @@ public sealed partial class HipBackend
         IGpuBuffer iGate, IGpuBuffer fGate, IGpuBuffer oGate, IGpuBuffer output,
         int batch, int seqLen, int modelDim, int numHeads, int headDim)
     {
+        if (batch <= 0 || seqLen <= 0 || modelDim <= 0 || numHeads <= 0 || headDim <= 0)
+            throw new ArgumentOutOfRangeException(nameof(batch), "xLSTM dimensions must be positive.");
+        if (modelDim != numHeads * headDim)
+            throw new ArgumentException($"modelDim ({modelDim}) must equal numHeads * headDim ({numHeads * headDim}).");
         if (headDim > Kernels.HipXLstmKernels.MaxHeadDim)
             throw new InvalidOperationException(
                 $"xLSTM headDim ({headDim}) exceeds max ({Kernels.HipXLstmKernels.MaxHeadDim}).");
@@ -442,6 +454,10 @@ public sealed partial class HipBackend
         IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer alpha, IGpuBuffer beta, IGpuBuffer output,
         int batch, int seqLen, int modelDim, int numHeads, int headDim)
     {
+        if (batch <= 0 || seqLen <= 0 || modelDim <= 0 || numHeads <= 0 || headDim <= 0)
+            throw new ArgumentOutOfRangeException(nameof(batch), "GatedDeltaNet dimensions must be positive.");
+        if (modelDim != numHeads * headDim)
+            throw new ArgumentException($"modelDim ({modelDim}) must equal numHeads * headDim ({numHeads * headDim}).");
         if (headDim > Kernels.HipGatedDeltaNetKernels.MaxHeadDim)
             throw new InvalidOperationException(
                 $"GatedDeltaNet headDim ({headDim}) exceeds max ({Kernels.HipGatedDeltaNetKernels.MaxHeadDim}).");
@@ -461,6 +477,8 @@ public sealed partial class HipBackend
         IGpuBuffer value, IGpuBuffer recGate, IGpuBuffer inpGate, IGpuBuffer decay, IGpuBuffer output,
         int batch, int seqLen, int recDim)
     {
+        if (batch <= 0 || seqLen <= 0 || recDim <= 0)
+            throw new ArgumentOutOfRangeException(nameof(batch), "RG-LRU dimensions must be positive.");
         if (!_kernelCache.TryGetValue("rglru_scan_forward", out var kernel))
             throw new InvalidOperationException("HIP kernel not found: rglru_scan_forward");
 
@@ -477,6 +495,8 @@ public sealed partial class HipBackend
         IGpuBuffer r, IGpuBuffer k, IGpuBuffer v, IGpuBuffer timeDecay, IGpuBuffer timeFirst, IGpuBuffer output,
         int batch, int seqLen, int modelDim)
     {
+        if (batch <= 0 || seqLen <= 0 || modelDim <= 0)
+            throw new ArgumentOutOfRangeException(nameof(batch), "RWKV-4 dimensions must be positive.");
         if (!_kernelCache.TryGetValue("rwkv4_wkv_forward", out var kernel))
             throw new InvalidOperationException("HIP kernel not found: rwkv4_wkv_forward");
 
@@ -493,6 +513,8 @@ public sealed partial class HipBackend
         IGpuBuffer x, IGpuBuffer delta, IGpuBuffer aLog, IGpuBuffer bParam, IGpuBuffer cParam, IGpuBuffer dParam,
         IGpuBuffer output, int batch, int seqLen, int innerDim, int stateDim)
     {
+        if (batch <= 0 || seqLen <= 0 || innerDim <= 0 || stateDim <= 0)
+            throw new ArgumentOutOfRangeException(nameof(batch), "Mamba dimensions must be positive.");
         if (stateDim > Kernels.HipMambaKernels.MaxStateDim)
             throw new InvalidOperationException(
                 $"Mamba stateDim ({stateDim}) exceeds max ({Kernels.HipMambaKernels.MaxStateDim}).");
@@ -512,6 +534,10 @@ public sealed partial class HipBackend
         IGpuBuffer x, IGpuBuffer delta, IGpuBuffer aLog, IGpuBuffer bParam, IGpuBuffer cParam, IGpuBuffer dParam,
         IGpuBuffer output, int batch, int seqLen, int innerDim, int numHeads, int headDim, int stateDim)
     {
+        if (batch <= 0 || seqLen <= 0 || innerDim <= 0 || numHeads <= 0 || headDim <= 0 || stateDim <= 0)
+            throw new ArgumentOutOfRangeException(nameof(batch), "Mamba-2 dimensions must be positive.");
+        if (innerDim != numHeads * headDim)
+            throw new ArgumentException($"innerDim ({innerDim}) must equal numHeads * headDim ({numHeads * headDim}).");
         if (stateDim > Kernels.HipMamba2Kernels.MaxStateDim)
             throw new InvalidOperationException(
                 $"Mamba-2 stateDim ({stateDim}) exceeds max ({Kernels.HipMamba2Kernels.MaxStateDim}).");
@@ -539,6 +565,8 @@ public sealed partial class HipBackend
     private unsafe float FusedCeLaunch(
         string kernelName, IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer tgt, int n, int d, int vocab)
     {
+        if (n <= 0 || d <= 0 || vocab <= 0)
+            throw new ArgumentOutOfRangeException(nameof(n), "Fused CE dimensions (n, d, vocab) must be positive.");
         if (!_kernelCache.TryGetValue(kernelName, out var kernel))
             throw new InvalidOperationException($"HIP kernel not found: {kernelName}");
         using var lossBuf = AllocateBuffer(1); // zeroed

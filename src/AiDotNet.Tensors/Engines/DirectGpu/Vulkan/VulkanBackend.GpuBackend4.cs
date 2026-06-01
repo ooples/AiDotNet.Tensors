@@ -1295,6 +1295,8 @@ public sealed unsafe partial class VulkanBackend
     private float FusedCeRowLoss(
         string glsl, IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer tgt, int n, int d, int vocab)
     {
+        if (n <= 0 || d <= 0 || vocab <= 0)
+            throw new ArgumentOutOfRangeException(nameof(n), "Fused CE dimensions (n, d, vocab) must be positive.");
         using var rowLoss = AllocateBuffer(n);
         GlslNaryOp(glsl, new[] { hidden, weight, bias, tgt, rowLoss }, n,
             new[] { (uint)n, (uint)d, (uint)vocab });

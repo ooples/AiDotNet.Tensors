@@ -11969,6 +11969,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         IGpuBuffer iGate, IGpuBuffer fGate, IGpuBuffer oGate, IGpuBuffer output,
         int batch, int seqLen, int modelDim, int numHeads, int headDim)
     {
+        if (batch <= 0 || seqLen <= 0 || modelDim <= 0 || numHeads <= 0 || headDim <= 0)
+            throw new ArgumentOutOfRangeException(nameof(batch), "xLSTM dimensions must be positive.");
+        if (modelDim != numHeads * headDim)
+            throw new ArgumentException($"modelDim ({modelDim}) must equal numHeads * headDim ({numHeads * headDim}).");
         if (headDim > Kernels.CudaXLstmKernels.MaxHeadDim)
             throw new InvalidOperationException(
                 $"xLSTM headDim ({headDim}) exceeds max ({Kernels.CudaXLstmKernels.MaxHeadDim}).");
@@ -11990,6 +11994,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer alpha, IGpuBuffer beta, IGpuBuffer output,
         int batch, int seqLen, int modelDim, int numHeads, int headDim)
     {
+        if (batch <= 0 || seqLen <= 0 || modelDim <= 0 || numHeads <= 0 || headDim <= 0)
+            throw new ArgumentOutOfRangeException(nameof(batch), "GatedDeltaNet dimensions must be positive.");
+        if (modelDim != numHeads * headDim)
+            throw new ArgumentException($"modelDim ({modelDim}) must equal numHeads * headDim ({numHeads * headDim}).");
         if (headDim > Kernels.CudaGatedDeltaNetKernels.MaxHeadDim)
             throw new InvalidOperationException(
                 $"GatedDeltaNet headDim ({headDim}) exceeds max ({Kernels.CudaGatedDeltaNetKernels.MaxHeadDim}).");
@@ -12010,6 +12018,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         IGpuBuffer value, IGpuBuffer recGate, IGpuBuffer inpGate, IGpuBuffer decay, IGpuBuffer output,
         int batch, int seqLen, int recDim)
     {
+        if (batch <= 0 || seqLen <= 0 || recDim <= 0)
+            throw new ArgumentOutOfRangeException(nameof(batch), "RG-LRU dimensions must be positive.");
         if (!_kernelCache.TryGetValue("rglru_scan_forward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: rglru_scan_forward");
 
@@ -12027,6 +12037,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         IGpuBuffer r, IGpuBuffer k, IGpuBuffer v, IGpuBuffer timeDecay, IGpuBuffer timeFirst, IGpuBuffer output,
         int batch, int seqLen, int modelDim)
     {
+        if (batch <= 0 || seqLen <= 0 || modelDim <= 0)
+            throw new ArgumentOutOfRangeException(nameof(batch), "RWKV-4 dimensions must be positive.");
         if (!_kernelCache.TryGetValue("rwkv4_wkv_forward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: rwkv4_wkv_forward");
 
@@ -12044,6 +12056,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         IGpuBuffer x, IGpuBuffer delta, IGpuBuffer aLog, IGpuBuffer bParam, IGpuBuffer cParam, IGpuBuffer dParam,
         IGpuBuffer output, int batch, int seqLen, int innerDim, int stateDim)
     {
+        if (batch <= 0 || seqLen <= 0 || innerDim <= 0 || stateDim <= 0)
+            throw new ArgumentOutOfRangeException(nameof(batch), "Mamba dimensions must be positive.");
         if (stateDim > Kernels.CudaMambaKernels.MaxStateDim)
             throw new InvalidOperationException(
                 $"Mamba stateDim ({stateDim}) exceeds max ({Kernels.CudaMambaKernels.MaxStateDim}).");
@@ -12064,6 +12078,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         IGpuBuffer x, IGpuBuffer delta, IGpuBuffer aLog, IGpuBuffer bParam, IGpuBuffer cParam, IGpuBuffer dParam,
         IGpuBuffer output, int batch, int seqLen, int innerDim, int numHeads, int headDim, int stateDim)
     {
+        if (batch <= 0 || seqLen <= 0 || innerDim <= 0 || numHeads <= 0 || headDim <= 0 || stateDim <= 0)
+            throw new ArgumentOutOfRangeException(nameof(batch), "Mamba-2 dimensions must be positive.");
+        if (innerDim != numHeads * headDim)
+            throw new ArgumentException($"innerDim ({innerDim}) must equal numHeads * headDim ({numHeads * headDim}).");
         if (stateDim > Kernels.CudaMamba2Kernels.MaxStateDim)
             throw new InvalidOperationException(
                 $"Mamba-2 stateDim ({stateDim}) exceeds max ({Kernels.CudaMamba2Kernels.MaxStateDim}).");
@@ -12091,6 +12109,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     private unsafe float FusedCeLaunch(
         string kernelName, IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer tgt, int n, int d, int vocab)
     {
+        if (n <= 0 || d <= 0 || vocab <= 0)
+            throw new ArgumentOutOfRangeException(nameof(n), "Fused CE dimensions (n, d, vocab) must be positive.");
         if (!_kernelCache.TryGetValue(kernelName, out var kernel))
             throw new InvalidOperationException($"CUDA kernel not found: {kernelName}");
         using var _ = PushContext();
@@ -12573,6 +12593,48 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         {
             CudaNativeBindings.cuModuleUnload(_glaModule);
             _glaModule = IntPtr.Zero;
+        }
+
+        if (_xlstmModule != IntPtr.Zero)
+        {
+            CudaNativeBindings.cuModuleUnload(_xlstmModule);
+            _xlstmModule = IntPtr.Zero;
+        }
+
+        if (_gatedDeltaNetModule != IntPtr.Zero)
+        {
+            CudaNativeBindings.cuModuleUnload(_gatedDeltaNetModule);
+            _gatedDeltaNetModule = IntPtr.Zero;
+        }
+
+        if (_rgLruModule != IntPtr.Zero)
+        {
+            CudaNativeBindings.cuModuleUnload(_rgLruModule);
+            _rgLruModule = IntPtr.Zero;
+        }
+
+        if (_rwkv4Module != IntPtr.Zero)
+        {
+            CudaNativeBindings.cuModuleUnload(_rwkv4Module);
+            _rwkv4Module = IntPtr.Zero;
+        }
+
+        if (_mambaModule != IntPtr.Zero)
+        {
+            CudaNativeBindings.cuModuleUnload(_mambaModule);
+            _mambaModule = IntPtr.Zero;
+        }
+
+        if (_mamba2Module != IntPtr.Zero)
+        {
+            CudaNativeBindings.cuModuleUnload(_mamba2Module);
+            _mamba2Module = IntPtr.Zero;
+        }
+
+        if (_fusedCeModule != IntPtr.Zero)
+        {
+            CudaNativeBindings.cuModuleUnload(_fusedCeModule);
+            _fusedCeModule = IntPtr.Zero;
         }
 
         if (_gruModule != IntPtr.Zero)

@@ -888,6 +888,8 @@ public sealed partial class WebGpuBackend
     private float FusedCeRowLoss(
         string key, string wgsl, IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer tgt, int n, int d, int vocab)
     {
+        if (n <= 0 || d <= 0 || vocab <= 0)
+            throw new ArgumentOutOfRangeException(nameof(n), "Fused CE dimensions (n, d, vocab) must be positive.");
         using var rowLoss = AllocateBuffer(n);
         DispatchRecurrence(key, wgsl, n, new[] { hidden, weight, bias, tgt, rowLoss }, new[] { n, d, vocab });
         var rl = DownloadBuffer(rowLoss);

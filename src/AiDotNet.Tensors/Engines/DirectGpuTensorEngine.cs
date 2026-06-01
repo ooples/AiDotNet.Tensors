@@ -6184,10 +6184,21 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int batch = qProj.Shape._dims[0];
         int seqLen = qProj.Shape._dims[1];
         int modelDim = qProj.Shape._dims[2];
+        // K/V must match Q's [batch, seqLen, modelDim]; mismatched operands would otherwise
+        // reach the kernel with Q-derived launch sizes and read/write out of bounds.
+        if (kProj.Rank != 3 || vProj.Rank != 3 ||
+            kProj.Shape._dims[0] != batch || kProj.Shape._dims[1] != seqLen || kProj.Shape._dims[2] != modelDim ||
+            vProj.Shape._dims[0] != batch || vProj.Shape._dims[1] != seqLen || vProj.Shape._dims[2] != modelDim)
+            return base.XLstmScanForward(qProj, kProj, vProj, iGate, fGate, oGate, numHeads);
         if (modelDim % numHeads != 0)
             return base.XLstmScanForward(qProj, kProj, vProj, iGate, fGate, oGate, numHeads);
         int headDim = modelDim / numHeads;
-        if (headDim > 64 || iGate.Rank != 3 || iGate.Shape._dims[2] != numHeads)
+        // Gates are per-head [batch, seqLen, numHeads].
+        if (headDim > 64 ||
+            iGate.Rank != 3 || fGate.Rank != 3 || oGate.Rank != 3 ||
+            iGate.Shape._dims[0] != batch || iGate.Shape._dims[1] != seqLen || iGate.Shape._dims[2] != numHeads ||
+            fGate.Shape._dims[0] != batch || fGate.Shape._dims[1] != seqLen || fGate.Shape._dims[2] != numHeads ||
+            oGate.Shape._dims[0] != batch || oGate.Shape._dims[1] != seqLen || oGate.Shape._dims[2] != numHeads)
             return base.XLstmScanForward(qProj, kProj, vProj, iGate, fGate, oGate, numHeads);
 
         try
@@ -6226,10 +6237,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int batch = qProj.Shape._dims[0];
         int seqLen = qProj.Shape._dims[1];
         int modelDim = qProj.Shape._dims[2];
+        if (kProj.Rank != 3 || vProj.Rank != 3 ||
+            kProj.Shape._dims[0] != batch || kProj.Shape._dims[1] != seqLen || kProj.Shape._dims[2] != modelDim ||
+            vProj.Shape._dims[0] != batch || vProj.Shape._dims[1] != seqLen || vProj.Shape._dims[2] != modelDim)
+            return base.GatedDeltaNetScanForward(qProj, kProj, vProj, alpha, beta, numHeads);
         if (modelDim % numHeads != 0)
             return base.GatedDeltaNetScanForward(qProj, kProj, vProj, alpha, beta, numHeads);
         int headDim = modelDim / numHeads;
-        if (headDim > 256 || alpha.Rank != 3 || alpha.Shape._dims[2] != numHeads)
+        // alpha/beta are per-head gates [batch, seqLen, numHeads].
+        if (headDim > 256 ||
+            alpha.Rank != 3 || beta.Rank != 3 ||
+            alpha.Shape._dims[0] != batch || alpha.Shape._dims[1] != seqLen || alpha.Shape._dims[2] != numHeads ||
+            beta.Shape._dims[0] != batch || beta.Shape._dims[1] != seqLen || beta.Shape._dims[2] != numHeads)
             return base.GatedDeltaNetScanForward(qProj, kProj, vProj, alpha, beta, numHeads);
 
         try
@@ -6269,6 +6288,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int recDim = value.Shape._dims[2];
         if (decay.Rank != 1 || decay.Shape._dims[0] != recDim)
             return base.RgLruScanForward(value, recGate, inpGate, decay);
+        // recGate / inpGate must match value's [batch, seqLen, recDim].
+        if (recGate.Rank != 3 || inpGate.Rank != 3 ||
+            recGate.Shape._dims[0] != batch || recGate.Shape._dims[1] != seqLen || recGate.Shape._dims[2] != recDim ||
+            inpGate.Shape._dims[0] != batch || inpGate.Shape._dims[1] != seqLen || inpGate.Shape._dims[2] != recDim)
+            return base.RgLruScanForward(value, recGate, inpGate, decay);
 
         try
         {
@@ -6303,7 +6327,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int batch = rProj.Shape._dims[0];
         int seqLen = rProj.Shape._dims[1];
         int modelDim = rProj.Shape._dims[2];
-        if (timeDecay.Rank != 1 || timeDecay.Shape._dims[0] != modelDim)
+        if (timeDecay.Rank != 1 || timeDecay.Shape._dims[0] != modelDim ||
+            timeFirst.Rank != 1 || timeFirst.Shape._dims[0] != modelDim)
+            return base.Rwkv4WkvForward(rProj, kProj, vProj, timeDecay, timeFirst);
+        // K/V must match R's [batch, seqLen, modelDim].
+        if (kProj.Rank != 3 || vProj.Rank != 3 ||
+            kProj.Shape._dims[0] != batch || kProj.Shape._dims[1] != seqLen || kProj.Shape._dims[2] != modelDim ||
+            vProj.Shape._dims[0] != batch || vProj.Shape._dims[1] != seqLen || vProj.Shape._dims[2] != modelDim)
             return base.Rwkv4WkvForward(rProj, kProj, vProj, timeDecay, timeFirst);
 
         try
@@ -6342,6 +6372,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int innerDim = x.Shape._dims[2];
         int stateDim = aLog.Shape._dims[1];
         if (aLog.Shape._dims[0] != innerDim || stateDim > 256)
+            return base.MambaSelectiveScanForward(x, delta, aLog, bParam, cParam, dParam);
+        // delta matches x [batch, seqLen, innerDim]; B/C are [batch, seqLen, stateDim]; D is [innerDim].
+        if (delta.Rank != 3 ||
+            delta.Shape._dims[0] != batch || delta.Shape._dims[1] != seqLen || delta.Shape._dims[2] != innerDim ||
+            bParam.Rank != 3 || cParam.Rank != 3 ||
+            bParam.Shape._dims[0] != batch || bParam.Shape._dims[1] != seqLen || bParam.Shape._dims[2] != stateDim ||
+            cParam.Shape._dims[0] != batch || cParam.Shape._dims[1] != seqLen || cParam.Shape._dims[2] != stateDim ||
+            dParam.Rank != 1 || dParam.Shape._dims[0] != innerDim)
             return base.MambaSelectiveScanForward(x, delta, aLog, bParam, cParam, dParam);
 
         try
@@ -6385,6 +6423,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int headDim = innerDim / numHeads;
         int stateDim = bParam.Shape._dims[2];
         if (stateDim > 256)
+            return base.Mamba2SsdScanForward(x, delta, aLog, bParam, cParam, dParam, numHeads);
+        // Per the CPU reference: delta [batch,seqLen,numHeads], aLog [numHeads], B/C
+        // [batch,seqLen,stateDim], D [numHeads]. Reject any mismatch before dispatch.
+        if (delta.Rank != 3 ||
+            delta.Shape._dims[0] != batch || delta.Shape._dims[1] != seqLen || delta.Shape._dims[2] != numHeads ||
+            bParam.Shape._dims[0] != batch || bParam.Shape._dims[1] != seqLen ||
+            cParam.Rank != 3 ||
+            cParam.Shape._dims[0] != batch || cParam.Shape._dims[1] != seqLen || cParam.Shape._dims[2] != stateDim ||
+            aLog.Rank != 1 || aLog.Shape._dims[0] != numHeads ||
+            dParam.Rank != 1 || dParam.Shape._dims[0] != numHeads)
             return base.Mamba2SsdScanForward(x, delta, aLog, bParam, cParam, dParam, numHeads);
 
         try
