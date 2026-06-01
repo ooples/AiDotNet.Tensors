@@ -65,6 +65,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     private IntPtr _rwkv4Module; // fused RWKV-4 WKV scan kernels (#1464)
     private IntPtr _mambaModule; // fused Mamba selective scan kernels (#1464)
     private IntPtr _mamba2Module; // fused Mamba-2 SSD scan kernels (#1464)
+    private IntPtr _fusedCeModule; // fused linear + cross-entropy kernels (#1464)
     private IntPtr _gruModule;
     private IntPtr _snnModule;
     private IntPtr _fp16Module;
@@ -771,6 +772,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         _rwkv4Module = CompileKernelModule(device, Kernels.CudaRwkv4Kernels.GetSource(), "rwkv4_kernels", Kernels.CudaRwkv4Kernels.GetKernelNames());
         _mambaModule = CompileKernelModule(device, Kernels.CudaMambaKernels.GetSource(), "mamba_kernels", Kernels.CudaMambaKernels.GetKernelNames());
         _mamba2Module = CompileKernelModule(device, Kernels.CudaMamba2Kernels.GetSource(), "mamba2_kernels", Kernels.CudaMamba2Kernels.GetKernelNames());
+        _fusedCeModule = CompileKernelModule(device, Kernels.CudaFusedLinearCeKernels.GetSource(), "fused_ce_kernels", Kernels.CudaFusedLinearCeKernels.GetKernelNames());
         }
         catch
         {
@@ -12045,6 +12047,32 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         args[7] = &batch; args[8] = &seqLen; args[9] = &innerDim; args[10] = &numHeads; args[11] = &headDim; args[12] = &stateDim;
         uint total = (uint)(batch * innerDim);
         LaunchKernel(kernel, (total + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize, (uint)DefaultBlockSize, args);
+    }
+
+    // ── Fused linear (LM head) + cross-entropy (#1464) ─────────────────────────────────────
+    public unsafe float FusedLinearCrossEntropyIndex(
+        IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer targetIds, int n, int d, int vocab)
+        => FusedCeLaunch("fused_linear_ce_index", hidden, weight, bias, targetIds, n, d, vocab);
+
+    public unsafe float FusedLinearCrossEntropyDense(
+        IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer target, int n, int d, int vocab)
+        => FusedCeLaunch("fused_linear_ce_dense", hidden, weight, bias, target, n, d, vocab);
+
+    private unsafe float FusedCeLaunch(
+        string kernelName, IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer tgt, int n, int d, int vocab)
+    {
+        if (!_kernelCache.TryGetValue(kernelName, out var kernel))
+            throw new InvalidOperationException($"CUDA kernel not found: {kernelName}");
+        using var _ = PushContext();
+        using var lossBuf = AllocateBuffer(1); // zeroed
+        IntPtr ph = hidden.Handle, pw = weight.Handle, pb = bias.Handle, pt = tgt.Handle, pl = lossBuf.Handle;
+        void** args = stackalloc void*[8];
+        args[0] = &ph; args[1] = &pw; args[2] = &pb; args[3] = &pt; args[4] = &pl;
+        args[5] = &n; args[6] = &d; args[7] = &vocab;
+        uint total = (uint)n;
+        LaunchKernel(kernel, (total + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize, (uint)DefaultBlockSize, args);
+        var loss = DownloadBuffer(lossBuf);
+        return loss[0] / n;
     }
 
     public unsafe void LstmForwardSequence(

@@ -2728,6 +2728,19 @@ public interface IDirectGpuBackend : IDisposable
         IGpuBuffer output, int batch, int seqLen, int innerDim, int numHeads, int headDim, int stateDim);
 
     /// <summary>
+    /// Fused linear (LM head) + cross-entropy with int class-id targets (#1464). hidden: [N, d];
+    /// weight: [d, vocab]; bias: [vocab]; targetIds: [N] (ids stored as floats). Returns mean CE.
+    /// </summary>
+    float FusedLinearCrossEntropyIndex(
+        IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer targetIds, int n, int d, int vocab);
+
+    /// <summary>
+    /// Fused linear (LM head) + cross-entropy with dense [N, vocab] soft targets (#1464). Returns mean CE.
+    /// </summary>
+    float FusedLinearCrossEntropyDense(
+        IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer target, int n, int d, int vocab);
+
+    /// <summary>
     /// Backward pass for LSTM sequence - computes gradients via BPTT.
     /// </summary>
     /// <param name="gradOutput">Gradient from next layer [seqLen * batch * hiddenSize].</param>

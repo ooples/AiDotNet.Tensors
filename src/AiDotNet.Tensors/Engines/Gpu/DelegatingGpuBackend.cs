@@ -1690,6 +1690,16 @@ public class DelegatingGpuBackend : IDirectGpuBackend
         => Inner.Mamba2SsdScanForward(x, delta, aLog, bParam, cParam, dParam, output, batch, seqLen, innerDim, numHeads, headDim, stateDim);
 
     /// <inheritdoc/>
+    public virtual float FusedLinearCrossEntropyIndex(
+        IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer targetIds, int n, int d, int vocab)
+        => Inner.FusedLinearCrossEntropyIndex(hidden, weight, bias, targetIds, n, d, vocab);
+
+    /// <inheritdoc/>
+    public virtual float FusedLinearCrossEntropyDense(
+        IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer target, int n, int d, int vocab)
+        => Inner.FusedLinearCrossEntropyDense(hidden, weight, bias, target, n, d, vocab);
+
+    /// <inheritdoc/>
     public virtual void LstmBackwardSequence(
         IGpuBuffer gradOutput, IGpuBuffer allH, IGpuBuffer allC, IGpuBuffer cacheGates,
         IGpuBuffer hInit, IGpuBuffer cInit,

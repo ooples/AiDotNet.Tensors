@@ -596,6 +596,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     _kernelCache[name] = new DirectOpenClKernel(_context, mamba2Program, name);
                 }
 
+                // Compile fused linear + cross-entropy kernels (#1464)
+                var fusedCeProgram = CompileOrLoadCached(FusedLinearCeKernels.GetSource(), optimizationFlags, "Fused linear cross-entropy kernels");
+                _programs.Add(fusedCeProgram);
+                foreach (var name in FusedLinearCeKernels.GetKernelNames())
+                {
+                    _kernelCache[name] = new DirectOpenClKernel(_context, fusedCeProgram, name);
+                }
+
                 // Compile GRU sequence kernels (forward/backward for BPTT training)
                 var gruProgram = CompileOrLoadCached(GruKernels.GetSource(), optimizationFlags, "GRU sequence kernels");
                 _programs.Add(gruProgram);
@@ -11885,6 +11893,40 @@ KERNEL VARIANTS (A/B testing):
             int localSize = CalculateOptimalWorkGroupSize1D(total);
             int globalSize = ((total + localSize - 1) / localSize) * localSize;
             kernel.Execute1D(globalSize, localSize);
+        }
+
+        // ── Fused linear (LM head) + cross-entropy (#1464) ──────────────────────────────────
+        public float FusedLinearCrossEntropyIndex(
+            IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer targetIds, int n, int d, int vocab)
+            => FusedCeLaunch("fused_linear_ce_index", hidden, weight, bias, targetIds, n, d, vocab);
+
+        public float FusedLinearCrossEntropyDense(
+            IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer target, int n, int d, int vocab)
+            => FusedCeLaunch("fused_linear_ce_dense", hidden, weight, bias, target, n, d, vocab);
+
+        private float FusedCeLaunch(
+            string kernelName, IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer tgt, int n, int d, int vocab)
+        {
+            if (_context == null)
+                throw new InvalidOperationException("OpenCL context is not initialized. Cannot execute FusedLinearCrossEntropy.");
+            if (!_kernelCache.TryGetValue(kernelName, out var kernel))
+                throw new InvalidOperationException($"OpenCL kernel not found: {kernelName}");
+
+            using var lossBuf = AllocateBuffer(new float[] { 0.0f }); // zeroed accumulator
+            kernel.SetArg(0u, ((DirectOpenClGpuBuffer)hidden).Buffer.Handle);
+            kernel.SetArg(1u, ((DirectOpenClGpuBuffer)weight).Buffer.Handle);
+            kernel.SetArg(2u, ((DirectOpenClGpuBuffer)bias).Buffer.Handle);
+            kernel.SetArg(3u, ((DirectOpenClGpuBuffer)tgt).Buffer.Handle);
+            kernel.SetArg(4u, ((DirectOpenClGpuBuffer)lossBuf).Buffer.Handle);
+            kernel.SetArg(5u, n);
+            kernel.SetArg(6u, d);
+            kernel.SetArg(7u, vocab);
+
+            int localSize = CalculateOptimalWorkGroupSize1D(n);
+            int globalSize = ((n + localSize - 1) / localSize) * localSize;
+            kernel.Execute1D(globalSize, localSize);
+            var loss = DownloadBuffer(lossBuf);
+            return loss[0] / n;
         }
 
         public void LstmForwardSequence(

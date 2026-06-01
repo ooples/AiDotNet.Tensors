@@ -6400,6 +6400,74 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
     }
 
+    // Fused linear (LM head) + cross-entropy, int-id targets (#1464). GPU inference fast path.
+    public override Tensor<T> FusedLinearCrossEntropyWithLogits<T>(
+        Tensor<T> hidden, Tensor<T> weight, Tensor<T> bias, Tensor<int> targetIds)
+    {
+        if (IsTapeActive<T>() || typeof(T) != typeof(float) || !TryGetBackend(out var backend))
+            return base.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, targetIds);
+        if (hidden.Rank != 2 || weight.Rank != 2)
+            return base.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, targetIds);
+
+        int n = hidden.Shape._dims[0];
+        int d = hidden.Shape._dims[1];
+        int vocab = weight.Shape._dims[1];
+        if (n <= 0 || vocab <= 0 || weight.Shape._dims[0] != d || bias.Length != vocab || targetIds.Length != n)
+            return base.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, targetIds);
+
+        try
+        {
+            var ids = (int[])(object)targetIds.GetDataArray()!;
+            var fids = new float[n];
+            for (int i = 0; i < n; i++) fids[i] = ids[i];
+            using var hB = GetOrAllocateBuffer(backend, hidden);
+            using var wB = GetOrAllocateBuffer(backend, weight);
+            using var bB = GetOrAllocateBuffer(backend, bias);
+            using var tB = GetOrAllocateBuffer(backend, fids);
+            float loss = backend.FusedLinearCrossEntropyIndex(hB.Buffer, wB.Buffer, bB.Buffer, tB.Buffer, n, d, vocab);
+            var outT = new Tensor<T>(new[] { 1 });
+            outT.GetDataArray()![0] = MathHelper.GetNumericOperations<T>().FromDouble(loss);
+            return outT;
+        }
+        catch
+        {
+            return base.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, targetIds);
+        }
+    }
+
+    // Fused linear (LM head) + cross-entropy, dense soft targets (#1464). GPU inference fast path.
+    public override Tensor<T> FusedLinearCrossEntropyWithLogits<T>(
+        Tensor<T> hidden, Tensor<T> weight, Tensor<T> bias, Tensor<T> target)
+    {
+        if (IsTapeActive<T>() || typeof(T) != typeof(float) || !TryGetBackend(out var backend))
+            return base.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, target);
+        if (hidden.Rank != 2 || weight.Rank != 2)
+            return base.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, target);
+
+        int n = hidden.Shape._dims[0];
+        int d = hidden.Shape._dims[1];
+        int vocab = weight.Shape._dims[1];
+        if (n <= 0 || vocab <= 0 || weight.Shape._dims[0] != d || bias.Length != vocab
+            || target.Rank != 2 || target.Shape._dims[0] != n || target.Shape._dims[1] != vocab)
+            return base.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, target);
+
+        try
+        {
+            using var hB = GetOrAllocateBuffer(backend, hidden);
+            using var wB = GetOrAllocateBuffer(backend, weight);
+            using var bB = GetOrAllocateBuffer(backend, bias);
+            using var tB = GetOrAllocateBuffer(backend, target);
+            float loss = backend.FusedLinearCrossEntropyDense(hB.Buffer, wB.Buffer, bB.Buffer, tB.Buffer, n, d, vocab);
+            var outT = new Tensor<T>(new[] { 1 });
+            outT.GetDataArray()![0] = MathHelper.GetNumericOperations<T>().FromDouble(loss);
+            return outT;
+        }
+        catch
+        {
+            return base.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, target);
+        }
+    }
+
     public override Tensor<T> FlashAttention<T>(
         Tensor<T> query,
         Tensor<T> key,

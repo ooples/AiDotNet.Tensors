@@ -521,4 +521,30 @@ public sealed partial class HipBackend
         uint total = (uint)(batch * innerDim);
         LaunchKernel(kernel, (total + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize, (uint)DefaultBlockSize, args);
     }
+
+    // ── Fused linear (LM head) + cross-entropy (#1464) ─────────────────────────────────────
+    // Returns the mean cross-entropy over the N rows. targetIds holds the class ids as floats.
+    public unsafe float FusedLinearCrossEntropyIndex(
+        IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer targetIds, int n, int d, int vocab)
+        => FusedCeLaunch("fused_linear_ce_index", hidden, weight, bias, targetIds, n, d, vocab);
+
+    public unsafe float FusedLinearCrossEntropyDense(
+        IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer target, int n, int d, int vocab)
+        => FusedCeLaunch("fused_linear_ce_dense", hidden, weight, bias, target, n, d, vocab);
+
+    private unsafe float FusedCeLaunch(
+        string kernelName, IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer tgt, int n, int d, int vocab)
+    {
+        if (!_kernelCache.TryGetValue(kernelName, out var kernel))
+            throw new InvalidOperationException($"HIP kernel not found: {kernelName}");
+        using var lossBuf = AllocateBuffer(1); // zeroed
+        IntPtr ph = hidden.Handle, pw = weight.Handle, pb = bias.Handle, pt = tgt.Handle, pl = lossBuf.Handle;
+        void** args = stackalloc void*[8];
+        args[0] = &ph; args[1] = &pw; args[2] = &pb; args[3] = &pt; args[4] = &pl;
+        args[5] = &n; args[6] = &d; args[7] = &vocab;
+        uint total = (uint)n;
+        LaunchKernel(kernel, (total + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize, (uint)DefaultBlockSize, args);
+        var loss = DownloadBuffer(lossBuf);
+        return loss[0] / n;
+    }
 }

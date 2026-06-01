@@ -97,6 +97,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     private IntPtr _rwkv4Module;
     private IntPtr _mambaModule;
     private IntPtr _mamba2Module;
+    private IntPtr _fusedCeModule;
     // True iff the fused-advanced kernel module compiled and registered
     // successfully on this device. Public surface methods gate on this so a
     // partial / failed compile surfaces a clear NotSupportedException at the
@@ -563,6 +564,10 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             // Compile fused Mamba-2 SSD scan kernels (#1464)
             CompileKernelModule(Kernels.HipMamba2Kernels.GetSource(), "mamba2", ref _mamba2Module,
                 Kernels.HipMamba2Kernels.GetKernelNames());
+
+            // Compile fused linear + cross-entropy kernels (#1464)
+            CompileKernelModule(Kernels.HipFusedLinearCeKernels.GetSource(), "fused_ce", ref _fusedCeModule,
+                Kernels.HipFusedLinearCeKernels.GetKernelNames());
 
             // Compile Fused Linear + Activation kernels
             CompileKernelModule(Kernels.HipFusedLinearKernels.GetSource(), "fused_linear", ref _fusedLinearModule,

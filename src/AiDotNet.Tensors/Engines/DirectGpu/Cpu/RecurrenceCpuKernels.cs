@@ -342,6 +342,77 @@ internal static class RecurrenceCpuKernels
         }
     }
 
+    /// <summary>
+    /// Fused linear (LM head) + cross-entropy with int targets, WITHOUT materializing the [N, vocab]
+    /// logits. hidden: [N, d]; weight: [d, vocab]; bias: [vocab]; targetIds: [N]. Returns mean CE.
+    /// </summary>
+    public static float FusedLinearCeIndex(
+        float[] hidden, float[] weight, float[] bias, int[] targetIds, int n, int d, int vocab)
+    {
+        double total = 0.0;
+        for (int r = 0; r < n; r++)
+        {
+            int hRow = r * d;
+            float max = float.NegativeInfinity;
+            float logitTarget = 0.0f;
+            int id = targetIds[r];
+            for (int vv = 0; vv < vocab; vv++)
+            {
+                float s = bias[vv];
+                for (int j = 0; j < d; j++) s += hidden[hRow + j] * weight[j * vocab + vv];
+                if (s > max) max = s;
+                if (vv == id) logitTarget = s;
+            }
+            float sumExp = 0.0f;
+            for (int vv = 0; vv < vocab; vv++)
+            {
+                float s = bias[vv];
+                for (int j = 0; j < d; j++) s += hidden[hRow + j] * weight[j * vocab + vv];
+                sumExp += MathF.Exp(s - max);
+            }
+            total += (max + MathF.Log(sumExp)) - logitTarget;
+        }
+        return (float)(total / n);
+    }
+
+    /// <summary>
+    /// Fused linear (LM head) + cross-entropy with dense [N, vocab] soft targets.
+    /// </summary>
+    public static float FusedLinearCeDense(
+        float[] hidden, float[] weight, float[] bias, float[] target, int n, int d, int vocab)
+    {
+        double total = 0.0;
+        for (int r = 0; r < n; r++)
+        {
+            int hRow = r * d;
+            int tRow = r * vocab;
+            float max = float.NegativeInfinity;
+            for (int vv = 0; vv < vocab; vv++)
+            {
+                float s = bias[vv];
+                for (int j = 0; j < d; j++) s += hidden[hRow + j] * weight[j * vocab + vv];
+                if (s > max) max = s;
+            }
+            float sumExp = 0.0f;
+            for (int vv = 0; vv < vocab; vv++)
+            {
+                float s = bias[vv];
+                for (int j = 0; j < d; j++) s += hidden[hRow + j] * weight[j * vocab + vv];
+                sumExp += MathF.Exp(s - max);
+            }
+            float lse = max + MathF.Log(sumExp);
+            float rowLoss = 0.0f;
+            for (int vv = 0; vv < vocab; vv++)
+            {
+                float s = bias[vv];
+                for (int j = 0; j < d; j++) s += hidden[hRow + j] * weight[j * vocab + vv];
+                rowLoss += target[tRow + vv] * (s - lse);
+            }
+            total += -rowLoss;
+        }
+        return (float)(total / n);
+    }
+
     private const float XLstmIGateClamp = 4.85e8f;
 
     /// <summary>

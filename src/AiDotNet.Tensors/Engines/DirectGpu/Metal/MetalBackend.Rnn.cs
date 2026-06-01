@@ -143,6 +143,25 @@ public partial class MetalBackend
         UploadToBuffer(output, outp);
     }
 
+    // Fused linear + cross-entropy (#1464) — host fallback via the shared reference.
+    public float FusedLinearCrossEntropyIndex(
+        IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer targetIds, int n, int d, int vocab)
+    {
+        var hd = DownloadBuffer(hidden); var wd = DownloadBuffer(weight); var bd = DownloadBuffer(bias);
+        var td = DownloadBuffer(targetIds);
+        var ids = new int[n];
+        for (int i = 0; i < n; i++) ids[i] = (int)(td[i] + 0.5f);
+        return Cpu.RecurrenceCpuKernels.FusedLinearCeIndex(hd, wd, bd, ids, n, d, vocab);
+    }
+
+    public float FusedLinearCrossEntropyDense(
+        IGpuBuffer hidden, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer target, int n, int d, int vocab)
+    {
+        var hd = DownloadBuffer(hidden); var wd = DownloadBuffer(weight); var bd = DownloadBuffer(bias);
+        var td = DownloadBuffer(target);
+        return Cpu.RecurrenceCpuKernels.FusedLinearCeDense(hd, wd, bd, td, n, d, vocab);
+    }
+
     public void LstmForwardSequence(
         IGpuBuffer input, IGpuBuffer hInit, IGpuBuffer cInit,
         IGpuBuffer weightsIh, IGpuBuffer weightsHh, IGpuBuffer biasIh, IGpuBuffer biasHh,
