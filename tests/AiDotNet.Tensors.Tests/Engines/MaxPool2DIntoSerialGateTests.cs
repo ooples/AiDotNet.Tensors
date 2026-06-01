@@ -22,13 +22,14 @@ public class MaxPool2DIntoSerialGateTests
 
     public static TheoryData<int, int, int, int, int, int> Cases => new()
     {
-        // batch, channels, H, W, poolSize, padding  (stride = poolSize)
-        { 1,  16, 28, 28, 2, 0 },    // bs1 below-grain → must hit fast serial inline (the fix)
-        { 1,  32, 14, 14, 2, 0 },    // bs1 pool2
-        { 4,  16, 28, 28, 2, 0 },    // bc=64 ≥ MaxDOP but below grain → fast serial
-        { 128,16, 28, 28, 2, 0 },    // above grain → parallel path
-        { 1,  16, 28, 28, 3, 0 },    // 3×3 NoPad bs1
-        { 64, 16, 28, 28, 3, 0 },    // 3×3 NoPad above grain
+        // batch, channels, H, W, poolSize, padding  (stride = poolSize). Grain = 32768;
+        // "below grain" = bc*hw < grain → fast direct-serial inline (the fix's target path).
+        { 1,  16, 28, 28, 2, 0 },    // bc*hw=12544 < grain → serial inline (the fix)
+        { 1,  32, 14, 14, 2, 0 },    // bc*hw=6272 < grain, bc=32 ≥ MaxDOP → the gate-boundary case the fix re-routes to serial
+        { 4,  16, 28, 28, 2, 0 },    // bc*hw=50176 ≥ grain → parallel path
+        { 128,16, 28, 28, 2, 0 },    // bc*hw=1605632 ≥ grain → parallel path
+        { 1,  16, 28, 28, 3, 0 },    // 3×3 NoPad, bc*hw=12544 < grain → serial inline
+        { 64, 16, 28, 28, 3, 0 },    // 3×3 NoPad, bc*hw=802816 ≥ grain → parallel
         { 1,  16, 28, 28, 3, 1 },    // 3×3 padded (border path)
         { 1,  16, 28, 28, 4, 1 },    // generic (4×4, padded)
         { 128, 8, 16, 16, 2, 0 },    // parallel 2×2
