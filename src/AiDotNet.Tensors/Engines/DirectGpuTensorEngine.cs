@@ -6317,6 +6317,46 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
     }
 
+    // Fused Mamba selective scan (#1464). GPU inference fast path; defer to CpuEngine otherwise.
+    public override Tensor<T> MambaSelectiveScanForward<T>(
+        Tensor<T> x, Tensor<T> delta, Tensor<T> aLog, Tensor<T> bParam, Tensor<T> cParam, Tensor<T> dParam)
+    {
+        if (IsTapeActive<T>() || typeof(T) != typeof(float) || !TryGetBackend(out var backend))
+            return base.MambaSelectiveScanForward(x, delta, aLog, bParam, cParam, dParam);
+        if (x.Rank != 3 || aLog.Rank != 2)
+            return base.MambaSelectiveScanForward(x, delta, aLog, bParam, cParam, dParam);
+
+        int batch = x.Shape._dims[0];
+        int seqLen = x.Shape._dims[1];
+        int innerDim = x.Shape._dims[2];
+        int stateDim = aLog.Shape._dims[1];
+        if (aLog.Shape._dims[0] != innerDim || stateDim > 256)
+            return base.MambaSelectiveScanForward(x, delta, aLog, bParam, cParam, dParam);
+
+        try
+        {
+            using var xB = GetOrAllocateBuffer(backend, x);
+            using var dtB = GetOrAllocateBuffer(backend, delta);
+            using var aB = GetOrAllocateBuffer(backend, aLog);
+            using var bB = GetOrAllocateBuffer(backend, bParam);
+            using var cB = GetOrAllocateBuffer(backend, cParam);
+            using var dB = GetOrAllocateBuffer(backend, dParam);
+            using var outB = AllocateOutputBuffer(backend, batch * seqLen * innerDim);
+
+            backend.MambaSelectiveScanForward(xB.Buffer, dtB.Buffer, aB.Buffer, bB.Buffer, cB.Buffer, dB.Buffer, outB.Buffer,
+                batch, seqLen, innerDim, stateDim);
+
+            float[] outF = new float[batch * seqLen * innerDim];
+            backend.DownloadBuffer(outB.Buffer, outF);
+            T[] outData = DirectGpuEngine.FromFloatArray<T>(outF);
+            return new Tensor<T>(outData, new[] { batch, seqLen, innerDim });
+        }
+        catch
+        {
+            return base.MambaSelectiveScanForward(x, delta, aLog, bParam, cParam, dParam);
+        }
+    }
+
     public override Tensor<T> FlashAttention<T>(
         Tensor<T> query,
         Tensor<T> key,

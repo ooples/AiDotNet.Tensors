@@ -1678,6 +1678,12 @@ public class DelegatingGpuBackend : IDirectGpuBackend
         => Inner.Rwkv4WkvForward(r, k, v, timeDecay, timeFirst, output, batch, seqLen, modelDim);
 
     /// <inheritdoc/>
+    public virtual void MambaSelectiveScanForward(
+        IGpuBuffer x, IGpuBuffer delta, IGpuBuffer aLog, IGpuBuffer bParam, IGpuBuffer cParam, IGpuBuffer dParam,
+        IGpuBuffer output, int batch, int seqLen, int innerDim, int stateDim)
+        => Inner.MambaSelectiveScanForward(x, delta, aLog, bParam, cParam, dParam, output, batch, seqLen, innerDim, stateDim);
+
+    /// <inheritdoc/>
     public virtual void LstmBackwardSequence(
         IGpuBuffer gradOutput, IGpuBuffer allH, IGpuBuffer allC, IGpuBuffer cacheGates,
         IGpuBuffer hInit, IGpuBuffer cInit,

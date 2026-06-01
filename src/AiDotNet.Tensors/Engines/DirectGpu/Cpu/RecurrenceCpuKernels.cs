@@ -258,6 +258,45 @@ internal static class RecurrenceCpuKernels
         }
     }
 
+    /// <summary>
+    /// Mamba selective scan forward. x/delta: [batch, seqLen, innerDim]; aLog: [innerDim, stateDim]
+    /// (A = -exp(aLog)); bParam/cParam: [batch, seqLen, stateDim]; dParam: [innerDim].
+    ///   aBar = exp(delta * A[di,ni]);  h[di,ni] := aBar*h[di,ni] + delta*B[ni]*x[di]
+    ///   y[di] = sum_ni C[ni]*h[di,ni] + D[di]*x[di]
+    /// </summary>
+    public static void MambaSelectiveScanForward(
+        float[] x, float[] delta, float[] aLog, float[] bParam, float[] cParam, float[] dParam, float[] output,
+        int batch, int seqLen, int innerDim, int stateDim)
+    {
+        var negA = new float[innerDim * stateDim];
+        for (int i = 0; i < negA.Length; i++) negA[i] = -MathF.Exp(aLog[i]);
+        var h = new float[innerDim * stateDim];
+        for (int b = 0; b < batch; b++)
+        {
+            Array.Clear(h, 0, h.Length);
+            for (int t = 0; t < seqLen; t++)
+            {
+                int baseID = (b * seqLen + t) * innerDim;
+                int baseSD = (b * seqLen + t) * stateDim;
+                for (int di = 0; di < innerDim; di++)
+                {
+                    float dt = delta[baseID + di];
+                    float xv = x[baseID + di];
+                    int hrow = di * stateDim;
+                    float y = 0.0f;
+                    for (int ni = 0; ni < stateDim; ni++)
+                    {
+                        float aBar = MathF.Exp(dt * negA[hrow + ni]);
+                        float hv = aBar * h[hrow + ni] + dt * bParam[baseSD + ni] * xv;
+                        h[hrow + ni] = hv;
+                        y += cParam[baseSD + ni] * hv;
+                    }
+                    output[baseID + di] = y + dParam[di] * xv;
+                }
+            }
+        }
+    }
+
     private const float XLstmIGateClamp = 4.85e8f;
 
     /// <summary>

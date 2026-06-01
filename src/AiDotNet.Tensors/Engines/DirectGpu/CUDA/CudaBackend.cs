@@ -63,6 +63,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     private IntPtr _gatedDeltaNetModule; // fused Gated DeltaNet scan kernels (#1464)
     private IntPtr _rgLruModule; // fused RG-LRU scan kernels (#1464)
     private IntPtr _rwkv4Module; // fused RWKV-4 WKV scan kernels (#1464)
+    private IntPtr _mambaModule; // fused Mamba selective scan kernels (#1464)
     private IntPtr _gruModule;
     private IntPtr _snnModule;
     private IntPtr _fp16Module;
@@ -767,6 +768,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         _gatedDeltaNetModule = CompileKernelModule(device, Kernels.CudaGatedDeltaNetKernels.GetSource(), "gated_delta_net_kernels", Kernels.CudaGatedDeltaNetKernels.GetKernelNames());
         _rgLruModule = CompileKernelModule(device, Kernels.CudaRgLruKernels.GetSource(), "rglru_kernels", Kernels.CudaRgLruKernels.GetKernelNames());
         _rwkv4Module = CompileKernelModule(device, Kernels.CudaRwkv4Kernels.GetSource(), "rwkv4_kernels", Kernels.CudaRwkv4Kernels.GetKernelNames());
+        _mambaModule = CompileKernelModule(device, Kernels.CudaMambaKernels.GetSource(), "mamba_kernels", Kernels.CudaMambaKernels.GetKernelNames());
         }
         catch
         {
@@ -12000,6 +12002,26 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         args[0] = &pr; args[1] = &pk; args[2] = &pv; args[3] = &pd; args[4] = &pf; args[5] = &pout;
         args[6] = &batch; args[7] = &seqLen; args[8] = &modelDim;
         uint total = (uint)(batch * modelDim);
+        LaunchKernel(kernel, (total + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize, (uint)DefaultBlockSize, args);
+    }
+
+    // ── Fused Mamba selective scan forward (#1464) ─────────────────────────────────────────
+    public unsafe void MambaSelectiveScanForward(
+        IGpuBuffer x, IGpuBuffer delta, IGpuBuffer aLog, IGpuBuffer bParam, IGpuBuffer cParam, IGpuBuffer dParam,
+        IGpuBuffer output, int batch, int seqLen, int innerDim, int stateDim)
+    {
+        if (stateDim > Kernels.CudaMambaKernels.MaxStateDim)
+            throw new InvalidOperationException(
+                $"Mamba stateDim ({stateDim}) exceeds max ({Kernels.CudaMambaKernels.MaxStateDim}).");
+        if (!_kernelCache.TryGetValue("mamba_selective_scan_forward", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: mamba_selective_scan_forward");
+
+        using var _ = PushContext();
+        IntPtr px = x.Handle, pdt = delta.Handle, pa = aLog.Handle, pb = bParam.Handle, pc = cParam.Handle, pd = dParam.Handle, pout = output.Handle;
+        void** args = stackalloc void*[11];
+        args[0] = &px; args[1] = &pdt; args[2] = &pa; args[3] = &pb; args[4] = &pc; args[5] = &pd; args[6] = &pout;
+        args[7] = &batch; args[8] = &seqLen; args[9] = &innerDim; args[10] = &stateDim;
+        uint total = (uint)(batch * innerDim);
         LaunchKernel(kernel, (total + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize, (uint)DefaultBlockSize, args);
     }
 

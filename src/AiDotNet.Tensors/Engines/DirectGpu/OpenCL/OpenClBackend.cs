@@ -580,6 +580,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     _kernelCache[name] = new DirectOpenClKernel(_context, rwkv4Program, name);
                 }
 
+                // Compile fused Mamba selective scan kernels (#1464)
+                var mambaProgram = CompileOrLoadCached(MambaKernels.GetSource(), optimizationFlags, "Mamba selective scan kernels");
+                _programs.Add(mambaProgram);
+                foreach (var name in MambaKernels.GetKernelNames())
+                {
+                    _kernelCache[name] = new DirectOpenClKernel(_context, mambaProgram, name);
+                }
+
                 // Compile GRU sequence kernels (forward/backward for BPTT training)
                 var gruProgram = CompileOrLoadCached(GruKernels.GetSource(), optimizationFlags, "GRU sequence kernels");
                 _programs.Add(gruProgram);
@@ -11804,6 +11812,36 @@ KERNEL VARIANTS (A/B testing):
             kernel.SetArg(8u, modelDim);
 
             int total = batch * modelDim;
+            int localSize = CalculateOptimalWorkGroupSize1D(total);
+            int globalSize = ((total + localSize - 1) / localSize) * localSize;
+            kernel.Execute1D(globalSize, localSize);
+        }
+
+        // ── Fused Mamba selective scan forward (#1464) ──────────────────────────────────────
+        public void MambaSelectiveScanForward(
+            IGpuBuffer x, IGpuBuffer delta, IGpuBuffer aLog, IGpuBuffer bParam, IGpuBuffer cParam, IGpuBuffer dParam,
+            IGpuBuffer output, int batch, int seqLen, int innerDim, int stateDim)
+        {
+            if (_context == null)
+                throw new InvalidOperationException("OpenCL context is not initialized. Cannot execute MambaSelectiveScanForward.");
+            if (stateDim > Kernels.MambaKernels.MaxStateDim)
+                throw new InvalidOperationException($"Mamba stateDim ({stateDim}) exceeds max ({Kernels.MambaKernels.MaxStateDim}).");
+            if (!_kernelCache.TryGetValue("mamba_selective_scan_forward", out var kernel))
+                throw new InvalidOperationException("OpenCL kernel not found: mamba_selective_scan_forward");
+
+            kernel.SetArg(0u, ((DirectOpenClGpuBuffer)x).Buffer.Handle);
+            kernel.SetArg(1u, ((DirectOpenClGpuBuffer)delta).Buffer.Handle);
+            kernel.SetArg(2u, ((DirectOpenClGpuBuffer)aLog).Buffer.Handle);
+            kernel.SetArg(3u, ((DirectOpenClGpuBuffer)bParam).Buffer.Handle);
+            kernel.SetArg(4u, ((DirectOpenClGpuBuffer)cParam).Buffer.Handle);
+            kernel.SetArg(5u, ((DirectOpenClGpuBuffer)dParam).Buffer.Handle);
+            kernel.SetArg(6u, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            kernel.SetArg(7u, batch);
+            kernel.SetArg(8u, seqLen);
+            kernel.SetArg(9u, innerDim);
+            kernel.SetArg(10u, stateDim);
+
+            int total = batch * innerDim;
             int localSize = CalculateOptimalWorkGroupSize1D(total);
             int globalSize = ((total + localSize - 1) / localSize) * localSize;
             kernel.Execute1D(globalSize, localSize);

@@ -2710,6 +2710,15 @@ public interface IDirectGpuBackend : IDisposable
         int batch, int seqLen, int modelDim);
 
     /// <summary>
+    /// Fused Mamba selective scan forward (#1464). x/delta: [batch, seqLen, innerDim];
+    /// aLog: [innerDim, stateDim]; bParam/cParam: [batch, seqLen, stateDim]; dParam: [innerDim];
+    /// output: [batch, seqLen, innerDim].
+    /// </summary>
+    void MambaSelectiveScanForward(
+        IGpuBuffer x, IGpuBuffer delta, IGpuBuffer aLog, IGpuBuffer bParam, IGpuBuffer cParam, IGpuBuffer dParam,
+        IGpuBuffer output, int batch, int seqLen, int innerDim, int stateDim);
+
+    /// <summary>
     /// Backward pass for LSTM sequence - computes gradients via BPTT.
     /// </summary>
     /// <param name="gradOutput">Gradient from next layer [seqLen * batch * hiddenSize].</param>
