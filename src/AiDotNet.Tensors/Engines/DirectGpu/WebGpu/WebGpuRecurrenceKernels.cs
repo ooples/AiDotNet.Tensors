@@ -241,4 +241,66 @@ struct P { N: i32, d: i32, vocab: i32 };
     for (var vv: i32 = 0; vv < VC; vv = vv+1) { var s = bias[vv]; for (var j: i32 = 0; j < D; j = j+1) { s = s + hidden[hRow+j]*weight[j*VC+vv]; } rl = rl + target[tRow+vv]*(s - lse); }
     rowLoss[r] = -rl;
 }";
+
+    // GLA BPTT backward: recompute the state trajectory, then reverse-sweep. WGSL has no float
+    // atomics, so dQ/dK/dG are bound as atomic<u32> and accumulated via a bitcast CAS loop; dV is a
+    // plain per-thread store. dQ/dK/dG must be pre-zeroed.
+    public const string GlaRecompute = @"
+@group(0) @binding(0) var<storage, read> K: array<f32>;
+@group(0) @binding(1) var<storage, read> Vd: array<f32>;
+@group(0) @binding(2) var<storage, read> G: array<f32>;
+@group(0) @binding(3) var<storage, read_write> Straj: array<f32>;
+struct P { batch: i32, seqLen: i32, modelDim: i32, numHeads: i32, headDim: i32 };
+@group(0) @binding(4) var<uniform> p: P;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
+    let gid = i32(gid3.x);
+    let B = p.batch; let SL = p.seqLen; let MD = p.modelDim; let NH = p.numHeads; let HD = p.headDim;
+    if (gid >= B*NH*HD) { return; }
+    let di = gid % HD; let h = (gid/HD) % NH; let b = gid/(HD*NH); let hOff = h*HD; let hh = HD*HD;
+    var Srow: array<f32, 256>;
+    for (var ki: i32 = 0; ki < HD; ki = ki+1) { Srow[ki] = 0.0; }
+    for (var t: i32 = 0; t < SL; t = t+1) {
+        let baseOff = (b*SL+t)*MD + hOff;
+        let g = G[(b*SL+t)*NH + h]; let vd = Vd[baseOff+di];
+        let trajBase = ((b*NH+h)*SL+t)*hh + di*HD;
+        for (var ki: i32 = 0; ki < HD; ki = ki+1) { let s = g*Srow[ki] + vd*K[baseOff+ki]; Srow[ki] = s; Straj[trajBase+ki] = s; }
+    }
+}";
+
+    public const string GlaBackward = @"
+@group(0) @binding(0) var<storage, read> dOut: array<f32>;
+@group(0) @binding(1) var<storage, read> Q: array<f32>;
+@group(0) @binding(2) var<storage, read> K: array<f32>;
+@group(0) @binding(3) var<storage, read> Vd: array<f32>;
+@group(0) @binding(4) var<storage, read> G: array<f32>;
+@group(0) @binding(5) var<storage, read> Straj: array<f32>;
+@group(0) @binding(6) var<storage, read_write> dQ: array<atomic<u32>>;
+@group(0) @binding(7) var<storage, read_write> dK: array<atomic<u32>>;
+@group(0) @binding(8) var<storage, read_write> dV: array<f32>;
+@group(0) @binding(9) var<storage, read_write> dG: array<atomic<u32>>;
+struct P { batch: i32, seqLen: i32, modelDim: i32, numHeads: i32, headDim: i32 };
+@group(0) @binding(10) var<uniform> p: P;
+fn addDQ(idx: i32, val: f32) { var old = atomicLoad(&dQ[idx]); loop { let nv = bitcast<u32>(bitcast<f32>(old) + val); let r = atomicCompareExchangeWeak(&dQ[idx], old, nv); if (r.exchanged) { break; } old = r.old_value; } }
+fn addDK(idx: i32, val: f32) { var old = atomicLoad(&dK[idx]); loop { let nv = bitcast<u32>(bitcast<f32>(old) + val); let r = atomicCompareExchangeWeak(&dK[idx], old, nv); if (r.exchanged) { break; } old = r.old_value; } }
+fn addDG(idx: i32, val: f32) { var old = atomicLoad(&dG[idx]); loop { let nv = bitcast<u32>(bitcast<f32>(old) + val); let r = atomicCompareExchangeWeak(&dG[idx], old, nv); if (r.exchanged) { break; } old = r.old_value; } }
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
+    let gid = i32(gid3.x);
+    let B = p.batch; let SL = p.seqLen; let MD = p.modelDim; let NH = p.numHeads; let HD = p.headDim;
+    if (gid >= B*NH*HD) { return; }
+    let di = gid % HD; let h = (gid/HD) % NH; let b = gid/(HD*NH); let hOff = h*HD; let hh = HD*HD;
+    var dSrow: array<f32, 256>;
+    for (var ki: i32 = 0; ki < HD; ki = ki+1) { dSrow[ki] = 0.0; }
+    for (var t: i32 = SL-1; t >= 0; t = t-1) {
+        let baseOff = (b*SL+t)*MD + hOff; let gOff = (b*SL+t)*NH + h; let g = G[gOff];
+        let trajBase = ((b*NH+h)*SL+t)*hh + di*HD;
+        let sprevBase = ((b*NH+h)*SL+(t-1))*hh + di*HD;
+        let dOutVal = dOut[baseOff+di];
+        for (var ki: i32 = 0; ki < HD; ki = ki+1) { let sval = Straj[trajBase+ki]; addDQ(baseOff+ki, dOutVal*sval); dSrow[ki] = dSrow[ki] + dOutVal*Q[baseOff+ki]; }
+        let vd = Vd[baseOff+di]; var dg: f32 = 0.0; var dVacc: f32 = 0.0;
+        for (var ki: i32 = 0; ki < HD; ki = ki+1) { let dStv = dSrow[ki]; var sprev: f32 = 0.0; if (t > 0) { sprev = Straj[sprevBase+ki]; } dg = dg + dStv*sprev; addDK(baseOff+ki, dStv*vd); dVacc = dVacc + dStv*K[baseOff+ki]; }
+        dV[baseOff+di] = dVacc;
+        addDG(gOff, dg);
+        for (var ki: i32 = 0; ki < HD; ki = ki+1) { dSrow[ki] = dSrow[ki] * g; }
+    }
+}";
 }
