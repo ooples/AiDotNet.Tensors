@@ -765,18 +765,28 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         try
         {
             _lstmModule = CompileKernelModule(device, CudaLstmKernels.GetSource(), "lstm_kernels", CudaLstmKernels.GetKernelNames());
-        _glaModule = CompileKernelModule(device, Kernels.CudaGlaKernels.GetSource(), "gla_kernels", Kernels.CudaGlaKernels.GetKernelNames());
-        _xlstmModule = CompileKernelModule(device, Kernels.CudaXLstmKernels.GetSource(), "xlstm_kernels", Kernels.CudaXLstmKernels.GetKernelNames());
-        _gatedDeltaNetModule = CompileKernelModule(device, Kernels.CudaGatedDeltaNetKernels.GetSource(), "gated_delta_net_kernels", Kernels.CudaGatedDeltaNetKernels.GetKernelNames());
-        _rgLruModule = CompileKernelModule(device, Kernels.CudaRgLruKernels.GetSource(), "rglru_kernels", Kernels.CudaRgLruKernels.GetKernelNames());
-        _rwkv4Module = CompileKernelModule(device, Kernels.CudaRwkv4Kernels.GetSource(), "rwkv4_kernels", Kernels.CudaRwkv4Kernels.GetKernelNames());
-        _mambaModule = CompileKernelModule(device, Kernels.CudaMambaKernels.GetSource(), "mamba_kernels", Kernels.CudaMambaKernels.GetKernelNames());
-        _mamba2Module = CompileKernelModule(device, Kernels.CudaMamba2Kernels.GetSource(), "mamba2_kernels", Kernels.CudaMamba2Kernels.GetKernelNames());
-        _fusedCeModule = CompileKernelModule(device, Kernels.CudaFusedLinearCeKernels.GetSource(), "fused_ce_kernels", Kernels.CudaFusedLinearCeKernels.GetKernelNames());
         }
         catch
         {
             // LSTM kernels may need special headers — optional.
+        }
+
+        // Compile fused recurrence / LM-head kernels (#1464) in their OWN try/catch so an
+        // optional-LSTM compile failure above doesn't also disable the recurrence family.
+        try
+        {
+            _glaModule = CompileKernelModule(device, Kernels.CudaGlaKernels.GetSource(), "gla_kernels", Kernels.CudaGlaKernels.GetKernelNames());
+            _xlstmModule = CompileKernelModule(device, Kernels.CudaXLstmKernels.GetSource(), "xlstm_kernels", Kernels.CudaXLstmKernels.GetKernelNames());
+            _gatedDeltaNetModule = CompileKernelModule(device, Kernels.CudaGatedDeltaNetKernels.GetSource(), "gated_delta_net_kernels", Kernels.CudaGatedDeltaNetKernels.GetKernelNames());
+            _rgLruModule = CompileKernelModule(device, Kernels.CudaRgLruKernels.GetSource(), "rglru_kernels", Kernels.CudaRgLruKernels.GetKernelNames());
+            _rwkv4Module = CompileKernelModule(device, Kernels.CudaRwkv4Kernels.GetSource(), "rwkv4_kernels", Kernels.CudaRwkv4Kernels.GetKernelNames());
+            _mambaModule = CompileKernelModule(device, Kernels.CudaMambaKernels.GetSource(), "mamba_kernels", Kernels.CudaMambaKernels.GetKernelNames());
+            _mamba2Module = CompileKernelModule(device, Kernels.CudaMamba2Kernels.GetSource(), "mamba2_kernels", Kernels.CudaMamba2Kernels.GetKernelNames());
+            _fusedCeModule = CompileKernelModule(device, Kernels.CudaFusedLinearCeKernels.GetSource(), "fused_ce_kernels", Kernels.CudaFusedLinearCeKernels.GetKernelNames());
+        }
+        catch
+        {
+            // Fused recurrence / LM-head kernels are optional.
         }
 
         // Compile GRU sequence kernels (forward/backward for BPTT training)

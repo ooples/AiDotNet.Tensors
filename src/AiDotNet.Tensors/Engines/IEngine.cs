@@ -4195,6 +4195,11 @@ public interface IEngine
     /// <param name="weight">LM head weight [d, vocab].</param>
     /// <param name="bias">LM head bias [vocab].</param>
     /// <param name="targetIds">Per-row class ids [N], each in [0, vocab).</param>
+    /// <returns>
+    /// The mean cross-entropy over the N rows as a scalar (length-1, shape [1]) tensor —
+    /// already reduced, NOT a per-row [N] loss vector. All <see cref="IEngine{T}"/>
+    /// implementations (CPU and every GPU backend) MUST honor this reduced-scalar contract.
+    /// </returns>
     Tensor<T> FusedLinearCrossEntropyWithLogits<T>(
         Tensor<T> hidden,
         Tensor<T> weight,
@@ -4205,6 +4210,19 @@ public interface IEngine
     /// Dense-target variant of <see cref="FusedLinearCrossEntropyWithLogits{T}(Tensor{T},Tensor{T},Tensor{T},Tensor{int})"/>
     /// for soft / one-hot / distillation supervision; target is a full per-row distribution [N, vocab].
     /// </summary>
+    /// <param name="hidden">Pre-head hidden states [N, d].</param>
+    /// <param name="weight">LM head weight [d, vocab].</param>
+    /// <param name="bias">LM head bias [vocab].</param>
+    /// <param name="target">
+    /// Per-row target distribution [N, vocab]. Each row MUST be a normalized probability
+    /// distribution (non-negative and summing to 1) — e.g. a one-hot, label-smoothed, or
+    /// teacher (distillation) distribution; the op does not renormalize.
+    /// </param>
+    /// <returns>
+    /// The mean cross-entropy over the N rows as a scalar (length-1, shape [1]) tensor —
+    /// already reduced, NOT a per-row [N] loss vector. Same reduced-scalar contract as the
+    /// class-id overload, binding on all <see cref="IEngine{T}"/> implementations.
+    /// </returns>
     Tensor<T> FusedLinearCrossEntropyWithLogits<T>(
         Tensor<T> hidden,
         Tensor<T> weight,
