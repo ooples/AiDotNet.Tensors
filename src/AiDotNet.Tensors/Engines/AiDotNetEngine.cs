@@ -181,22 +181,76 @@ public static class AiDotNetEngine
         try
         {
             var gpuEngine = new DirectGpuTensorEngine();
+            bool supportsGpu = gpuEngine.SupportsGpu;
 
-            if (gpuEngine.SupportsGpu)
+            if (supportsGpu && GpuPassesCorrectnessProbe(gpuEngine))
             {
                 Current = gpuEngine;
                 EmitLog($"[AiDotNet] GPU acceleration enabled: {gpuEngine.Name}", verbose);
                 return true;
             }
 
+            // SupportsGpu only reports that a device exists and the engine
+            // constructed — NOT that it computes correctly. Some drivers/devices
+            // (and misconfigured OpenCL stacks) construct fine but then throw or
+            // return garbage at runtime; adopting such a backend makes EVERY
+            // downstream op crash or silently produce wrong results. The probe
+            // above runs a tiny known-answer op and only adopts the GPU when it
+            // returns the right values, else we dispose it and stay on CPU. This
+            // is a self-validation gate, not a CPU force — a working GPU is still
+            // adopted.
             gpuEngine.Dispose();
-            EmitLog("[AiDotNet] GPU not available, using CPU", verbose);
+            EmitLog(supportsGpu
+                ? "[AiDotNet] GPU detected but failed its correctness self-check, using CPU"
+                : "[AiDotNet] GPU not available, using CPU", verbose);
             return false;
         }
         catch (Exception ex)
         {
             EmitLog($"[AiDotNet] Failed to initialize DirectGpu: {ex.Message}", verbose);
             EmitLog("[AiDotNet] Falling back to CPU", verbose);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Runs a tiny known-answer workload on <paramref name="gpuEngine"/> and verifies the
+    /// result, so a device that is present but computes incorrectly (driver/runtime issues,
+    /// misconfigured OpenCL stacks) is rejected before it becomes <see cref="Current"/>.
+    /// </summary>
+    /// <remarks>
+    /// Validates the full compute + host-readback path — the same path that otherwise
+    /// surfaces as a runtime crash or all-zero results downstream. A 2×2 matmul has a unique
+    /// exact integer answer in FP32, so a correct backend matches it bit-for-bit; any throw,
+    /// NaN, or wrong value fails the probe. Returns false (never throws) so module-init
+    /// auto-detection always degrades gracefully to CPU.
+    /// </remarks>
+    private static bool GpuPassesCorrectnessProbe(DirectGpuTensorEngine gpuEngine)
+    {
+        try
+        {
+            // [[1,2],[3,4]] @ [[5,6],[7,8]] == [[19,22],[43,50]]
+            var a = new LinearAlgebra.Tensor<float>(new float[] { 1f, 2f, 3f, 4f }, new[] { 2, 2 });
+            var b = new LinearAlgebra.Tensor<float>(new float[] { 5f, 6f, 7f, 8f }, new[] { 2, 2 });
+            var result = ((IEngine)gpuEngine).TensorMatMul(a, b);
+
+            if (result == null || result.Length != 4)
+                return false;
+
+            ReadOnlySpan<float> expected = stackalloc float[] { 19f, 22f, 43f, 50f };
+            for (int i = 0; i < 4; i++)
+            {
+                float v = result.GetFlatIndexValue(i);
+                if (float.IsNaN(v) || Math.Abs(v - expected[i]) > 1e-3f)
+                    return false;
+            }
+
+            return true;
+        }
+        catch
+        {
+            // Any failure (kernel build, allocation, readback, dispatch) means the
+            // device can't be trusted for real work — reject it and fall back to CPU.
             return false;
         }
     }
