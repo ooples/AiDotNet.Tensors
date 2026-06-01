@@ -32,6 +32,44 @@ public partial class MetalBackend
     /// <param name="batch">Batch size.</param>
     /// <param name="inputSize">Input feature size.</param>
     /// <param name="hiddenSize">Hidden state size.</param>
+    // ── Fused GLA (Gated Linear Attention) scan (#1464) ────────────────────────────────────
+    // Host fallback (mirrors this backend's LstmForwardSequence precedent); a native Metal
+    // compute shader is a follow-up. Correct + GPU-CPU bit-parity via the shared reference.
+    public void GlaScanForward(
+        IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer gate, IGpuBuffer output,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim)
+    {
+        var qd = DownloadBuffer(q);
+        var kd = DownloadBuffer(k);
+        var vd = DownloadBuffer(v);
+        var gd = DownloadBuffer(gate);
+        var outp = new float[batch * seqLen * modelDim];
+        Cpu.RecurrenceCpuKernels.GlaForward(qd, kd, vd, gd, outp, batch, seqLen, modelDim, numHeads, headDim);
+        UploadToBuffer(output, outp);
+    }
+
+    public void GlaScanBackward(
+        IGpuBuffer dOut, IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer gate,
+        IGpuBuffer dQ, IGpuBuffer dK, IGpuBuffer dV, IGpuBuffer dG,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim)
+    {
+        var doData = DownloadBuffer(dOut);
+        var qd = DownloadBuffer(q);
+        var kd = DownloadBuffer(k);
+        var vd = DownloadBuffer(v);
+        var gd = DownloadBuffer(gate);
+        var gq = new float[batch * seqLen * modelDim];
+        var gk = new float[batch * seqLen * modelDim];
+        var gv = new float[batch * seqLen * modelDim];
+        var gG = new float[batch * seqLen * numHeads];
+        Cpu.RecurrenceCpuKernels.GlaBackward(doData, qd, kd, vd, gd, gq, gk, gv, gG,
+            batch, seqLen, modelDim, numHeads, headDim);
+        UploadToBuffer(dQ, gq);
+        UploadToBuffer(dK, gk);
+        UploadToBuffer(dV, gv);
+        UploadToBuffer(dG, gG);
+    }
+
     public void LstmForwardSequence(
         IGpuBuffer input, IGpuBuffer hInit, IGpuBuffer cInit,
         IGpuBuffer weightsIh, IGpuBuffer weightsHh, IGpuBuffer biasIh, IGpuBuffer biasHh,

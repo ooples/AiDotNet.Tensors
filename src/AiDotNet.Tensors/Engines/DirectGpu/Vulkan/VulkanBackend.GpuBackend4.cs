@@ -1209,6 +1209,46 @@ public sealed unsafe partial class VulkanBackend
 
     #region RNN (LSTM/GRU) Operations
 
+    // ── Fused GLA (Gated Linear Attention) scan (#1464) ────────────────────────────────────
+    // Host fallback (mirrors this backend's LstmForwardSequence precedent); a native Vulkan
+    // GLSL compute shader is a follow-up. Correct + GPU-CPU bit-parity via the shared reference.
+    public void GlaScanForward(
+        IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer gate, IGpuBuffer output,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim)
+    {
+        EnsureInitialized();
+        var qd = DownloadBuffer(q);
+        var kd = DownloadBuffer(k);
+        var vd = DownloadBuffer(v);
+        var gd = DownloadBuffer(gate);
+        var outp = new float[batch * seqLen * modelDim];
+        Cpu.RecurrenceCpuKernels.GlaForward(qd, kd, vd, gd, outp, batch, seqLen, modelDim, numHeads, headDim);
+        UploadToBuffer(outp, output);
+    }
+
+    public void GlaScanBackward(
+        IGpuBuffer dOut, IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer gate,
+        IGpuBuffer dQ, IGpuBuffer dK, IGpuBuffer dV, IGpuBuffer dG,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim)
+    {
+        EnsureInitialized();
+        var doData = DownloadBuffer(dOut);
+        var qd = DownloadBuffer(q);
+        var kd = DownloadBuffer(k);
+        var vd = DownloadBuffer(v);
+        var gd = DownloadBuffer(gate);
+        var gq = new float[batch * seqLen * modelDim];
+        var gk = new float[batch * seqLen * modelDim];
+        var gv = new float[batch * seqLen * modelDim];
+        var gG = new float[batch * seqLen * numHeads];
+        Cpu.RecurrenceCpuKernels.GlaBackward(doData, qd, kd, vd, gd, gq, gk, gv, gG,
+            batch, seqLen, modelDim, numHeads, headDim);
+        UploadToBuffer(gq, dQ);
+        UploadToBuffer(gk, dK);
+        UploadToBuffer(gv, dV);
+        UploadToBuffer(gG, dG);
+    }
+
     public void LstmForwardSequence(
         IGpuBuffer input, IGpuBuffer hInit, IGpuBuffer cInit,
         IGpuBuffer weightsIh, IGpuBuffer weightsHh, IGpuBuffer biasIh, IGpuBuffer biasHh,
