@@ -12489,6 +12489,11 @@ public partial class CpuEngine : ITensorLevelEngine
             // CPU-thread time on the nested-scalar-loop fallback below;
             // dgemm via libopenblas cuts that to a tuned BLAS path that
             // hits the same FMA throughput the float SGEMM gets).
+            // NOTE: the register-resident SimdConvHelper.Conv2DDirectDouble
+            // kernel (used by the eager Conv2D path) was measured SLOWER than
+            // this im2col+managed-GEMM route for the compiled/deterministic
+            // CNN shapes (ResNet50 1.21→1.53s, VGG16 6.2→6.9s), so it is NOT
+            // wired here — the double GEMM microkernel itself is the lever.
             Conv2DIm2colGemmDouble(
                 (double[])(object)inputData,
                 (double[])(object)kernelData,
@@ -13551,7 +13556,8 @@ public partial class CpuEngine : ITensorLevelEngine
                 for (int c = 0; c < colH; c++)
                     kernelT[c * outChannels + r] = kernelF[r * colH + c];
             var pool = System.Buffers.ArrayPool<float>.Shared;
-            CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * colH * colW, b =>
+            long col2imWorkF = (long)inChannels * kernelHeight * kernelWidth * colW;
+            void ProcessImageInputF(int b, bool channelParallel)
             {
                 var colBuf = pool.Rent(colW * colH);
                 try
@@ -13569,15 +13575,39 @@ public partial class CpuEngine : ITensorLevelEngine
                             colH, outChannels, colW);
                     }
                     int imgOff = destOff + b * inChannels * height * width;
-                    Im2ColHelper.Col2ImAccumulate(
-                        new ReadOnlySpan<float>(colBuf, 0, colW * colH),
-                        new Span<float>(destF, imgOff, inChannels * height * width),
-                        inChannels, height, width,
-                        kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW,
-                        outputHeight, outputWidth);
+                    if (channelParallel)
+                    {
+                        // Channel-parallel col2im scatter: channel c owns the disjoint
+                        // slab destF[imgOff + c·H·W ..]; deterministic-safe (each output
+                        // element's += reduction stays on one thread in serial order).
+                        CpuParallelSettings.ParallelForOrSerial(0, inChannels, col2imWorkF, c =>
+                        {
+                            Im2ColHelper.Col2ImAccumulateChannelRange(
+                                new ReadOnlySpan<float>(colBuf, 0, colW * colH),
+                                new Span<float>(destF, imgOff, inChannels * height * width),
+                                c, c + 1, height, width,
+                                kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW,
+                                outputHeight, outputWidth);
+                        }, deterministicSafe: true);
+                    }
+                    else
+                    {
+                        Im2ColHelper.Col2ImAccumulate(
+                            new ReadOnlySpan<float>(colBuf, 0, colW * colH),
+                            new Span<float>(destF, imgOff, inChannels * height * width),
+                            inChannels, height, width,
+                            kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW,
+                            outputHeight, outputWidth);
+                    }
                 }
                 finally { pool.Return(colBuf); }
-            });
+            }
+            long perImageGemmF = (long)outChannels * colH * colW;
+            if (batch > 1 && perImageGemmF < ConvBackwardParallelBatchMaxPerImage)
+                CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * colH * colW,
+                    b => ProcessImageInputF(b, channelParallel: false));
+            else
+                for (int b = 0; b < batch; b++) ProcessImageInputF(b, channelParallel: true);
             return;
         }
 
@@ -13659,7 +13689,8 @@ public partial class CpuEngine : ITensorLevelEngine
                 for (int c = 0; c < colH; c++)
                     kernelTD[c * outChannels + r] = kernelD[r * colH + c];
             var poolD = System.Buffers.ArrayPool<double>.Shared;
-            CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * colH * colW, b =>
+            long col2imWorkD = (long)inChannels * kernelHeight * kernelWidth * colW;
+            void ProcessImageInputD(int b, bool channelParallel)
             {
                 var colBuf = poolD.Rent(colW * colH);
                 try
@@ -13677,15 +13708,36 @@ public partial class CpuEngine : ITensorLevelEngine
                             colH, outChannels, colW);
                     }
                     int imgOff = destOff + b * inChannels * height * width;
-                    Helpers.Im2ColHelper.Col2ImAccumulate(
-                        new ReadOnlySpan<double>(colBuf, 0, colW * colH),
-                        new Span<double>(destD, imgOff, inChannels * height * width),
-                        inChannels, height, width,
-                        kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW,
-                        outputHeight, outputWidth);
+                    if (channelParallel)
+                    {
+                        CpuParallelSettings.ParallelForOrSerial(0, inChannels, col2imWorkD, c =>
+                        {
+                            Helpers.Im2ColHelper.Col2ImAccumulateChannelRange(
+                                new ReadOnlySpan<double>(colBuf, 0, colW * colH),
+                                new Span<double>(destD, imgOff, inChannels * height * width),
+                                c, c + 1, height, width,
+                                kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW,
+                                outputHeight, outputWidth);
+                        }, deterministicSafe: true);
+                    }
+                    else
+                    {
+                        Helpers.Im2ColHelper.Col2ImAccumulate(
+                            new ReadOnlySpan<double>(colBuf, 0, colW * colH),
+                            new Span<double>(destD, imgOff, inChannels * height * width),
+                            inChannels, height, width,
+                            kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW,
+                            outputHeight, outputWidth);
+                    }
                 }
                 finally { poolD.Return(colBuf); }
-            });
+            }
+            long perImageGemmD = (long)outChannels * colH * colW;
+            if (batch > 1 && perImageGemmD < ConvBackwardParallelBatchMaxPerImage)
+                CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * colH * colW,
+                    b => ProcessImageInputD(b, channelParallel: false));
+            else
+                for (int b = 0; b < batch; b++) ProcessImageInputD(b, channelParallel: true);
             return;
         }
 
@@ -13720,6 +13772,18 @@ public partial class CpuEngine : ITensorLevelEngine
     // serially per batch (a perf-guard at colW=900 regressed under an
     // unconditional channel-parallel build).
     private const int ParallelIm2colMaxColW = 256;
+
+    // #403: per-image GEMM cost below which Conv2DBackwardInputInto /
+    // Conv2DBackwardKernelInto parallelize over the BATCH axis (inner GEMM +
+    // spatial transform serial per image). Mirrors the forward
+    // Conv2DIm2colGemm 50M threshold. Above this cost — and ALWAYS at batch=1,
+    // the CNN model-family training shape [1,3,224,224] — the batch loop runs
+    // INLINE so the per-image GEMM keeps full thread scaling (routing it through
+    // ParallelForOrSerial(0,1,…) would set _inParallelRegion and collapse the
+    // inner BlasManaged GEMM AND the spatial transform to a single thread), and
+    // the im2col/col2im transform parallelizes over input channels instead
+    // (disjoint c·H·W slabs / kH·kW row blocks → deterministic-safe).
+    private const long ConvBackwardParallelBatchMaxPerImage = 50_000_000L;
 
     // #403 Phase F: repack gradOutput + build the strided im2col for the K-concat
     // backward-kernel path (float). gradOutAll[oc, b·colW+n] = gradOutput[b,oc,n];
@@ -14315,48 +14379,102 @@ public partial class CpuEngine : ITensorLevelEngine
             var gradOutputF = (float[])(object)gradOutput.GetFlattenedData();
             var inputF = (float[])(object)input.GetFlattenedData();
             int inputSliceSize = inChannels * height * width;
-            var perBatchGrads = new float[batch][];
             var kPool = System.Buffers.ArrayPool<float>.Shared;
-            CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * colH * colW, b =>
+            long im2colWorkKF = (long)inChannels * kernelHeight * kernelWidth * colW;
+
+            // Per-image: build im2col(input_b) then GEMM gradOut_b @ im2col^T into
+            // localGrad (overwrite). channelParallel=true builds the im2col across
+            // input channels (Im2ColStridedSingleChannelRange with rowStride=colW →
+            // the contiguous [colH,colW] layout; disjoint kH·kW row blocks) and lets
+            // the GEMM thread at the top level — this is the batch=1 path. When false
+            // (batch-parallel worker) everything inside runs serial; the batch axis
+            // supplies the threads.
+            void ComputeBatchGradF(int b, float[] im2colBuf, float[] localGrad, bool channelParallel)
             {
+                Array.Clear(localGrad, 0, totalLen);
+                if (channelParallel)
+                {
+                    CpuParallelSettings.ParallelForOrSerial(0, inChannels, im2colWorkKF, c =>
+                    {
+                        Im2ColHelper.Im2ColStridedSingleChannelRange(
+                            new ReadOnlySpan<float>(inputF, b * inputSliceSize, inputSliceSize),
+                            new Span<float>(im2colBuf, 0, colH * colW), colW, 0,
+                            c, c + 1, height, width, kernelHeight, kernelWidth,
+                            strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth);
+                    }, deterministicSafe: true);
+                }
+                else
+                {
+                    Im2ColHelper.Im2Col(
+                        new ReadOnlySpan<float>(inputF, b * inputSliceSize, inputSliceSize),
+                        new Span<float>(im2colBuf, 0, colH * colW),
+                        1, inChannels, height, width,
+                        kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW);
+                }
+                int gradOutOff = b * outChannels * colW;
+                if (!Helpers.BlasProvider.TryGemmEx(
+                    outChannels, colH, colW,
+                    gradOutputF, gradOutOff, colW, false,
+                    im2colBuf, 0, colW, true,
+                    localGrad, 0, colH))
+                {
+                    Simd.SimdGemm.Sgemm(
+                        new ReadOnlySpan<float>(gradOutputF, gradOutOff, outChannels * colW), colW, false,
+                        new ReadOnlySpan<float>(im2colBuf, 0, colH * colW), colW, true,
+                        new Span<float>(localGrad, 0, totalLen),
+                        outChannels, colW, colH);
+                }
+            }
+
+            long perImageGemmKF = (long)outChannels * colH * colW;
+            if (batch > 1 && perImageGemmKF < ConvBackwardParallelBatchMaxPerImage)
+            {
+                // Batch-parallel: each worker accumulates into its own buffer; the sum
+                // over batches runs single-threaded afterward (order-independent).
+                var perBatchGrads = new float[batch][];
+                CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * colH * colW, b =>
+                {
+                    var im2colBuf = kPool.Rent(colH * colW);
+                    var localGrad = kPool.Rent(totalLen);
+                    try
+                    {
+                        ComputeBatchGradF(b, im2colBuf, localGrad, channelParallel: false);
+                        var gradCopy = new float[totalLen];
+                        Array.Copy(localGrad, gradCopy, totalLen);
+                        perBatchGrads[b] = gradCopy;
+                    }
+                    finally
+                    {
+                        kPool.Return(im2colBuf);
+                        kPool.Return(localGrad);
+                    }
+                });
+                for (int b = 0; b < batch; b++)
+                {
+                    var lg = perBatchGrads[b];
+                    for (int i = 0; i < totalLen; i++) gradKernelF[i] += lg[i];
+                }
+            }
+            else
+            {
+                // Serial batch loop; im2col + GEMM parallelize inside each image. The
+                // im2col/localGrad buffers are rented once and reused (no per-batch
+                // new float[totalLen] churn).
                 var im2colBuf = kPool.Rent(colH * colW);
                 var localGrad = kPool.Rent(totalLen);
                 try
                 {
-                    Array.Clear(localGrad, 0, totalLen);
-                    Im2ColHelper.Im2Col(
-                        new ReadOnlySpan<float>(inputF, b * inputSliceSize, inputSliceSize),
-                        new Span<float>(im2colBuf),
-                        1, inChannels, height, width,
-                        kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW);
-                    int gradOutOff = b * outChannels * colW;
-                    if (!Helpers.BlasProvider.TryGemmEx(
-                        outChannels, colH, colW,
-                        gradOutputF, gradOutOff, colW, false,
-                        im2colBuf, 0, colW, true,
-                        localGrad, 0, colH))
+                    for (int b = 0; b < batch; b++)
                     {
-                        Simd.SimdGemm.Sgemm(
-                            new ReadOnlySpan<float>(gradOutputF, gradOutOff, outChannels * colW), colW, false,
-                            new ReadOnlySpan<float>(im2colBuf, 0, colH * colW), colW, true,
-                            new Span<float>(localGrad, 0, totalLen),
-                            outChannels, colW, colH);
+                        ComputeBatchGradF(b, im2colBuf, localGrad, channelParallel: true);
+                        for (int i = 0; i < totalLen; i++) gradKernelF[i] += localGrad[i];
                     }
-                    var gradCopy = new float[totalLen];
-                    Array.Copy(localGrad, gradCopy, totalLen);
-                    perBatchGrads[b] = gradCopy;
                 }
                 finally
                 {
                     kPool.Return(im2colBuf);
                     kPool.Return(localGrad);
                 }
-            });
-            for (int b = 0; b < batch; b++)
-            {
-                var lg = perBatchGrads[b];
-                for (int i = 0; i < gradKernelF.Length; i++)
-                    gradKernelF[i] += lg[i];
             }
             // Merge into dest with accumulate flag honoured.
             if (accumulate)
@@ -14424,56 +14542,100 @@ public partial class CpuEngine : ITensorLevelEngine
             }
 
             var gradKernelD = new double[totalLen];
-            var perBatchGradsD = new double[batch][];
             var kPoolD = System.Buffers.ArrayPool<double>.Shared;
-            CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * colH * colW, b =>
+            long im2colWorkKD = (long)inChannels * kernelHeight * kernelWidth * colW;
+
+            // Per-image im2col + GEMM into localGrad (overwrite). See the float
+            // counterpart ComputeBatchGradF for the channel-parallel rationale.
+            void ComputeBatchGradD(int b, double[] im2colBuf, double[] localGrad, bool channelParallel)
+            {
+                Array.Clear(localGrad, 0, totalLen);
+                if (channelParallel)
+                {
+                    CpuParallelSettings.ParallelForOrSerial(0, inChannels, im2colWorkKD, c =>
+                    {
+                        Helpers.Im2ColHelper.Im2ColStridedSingleChannelRange(
+                            new ReadOnlySpan<double>(inputD, b * inputSliceSize, inputSliceSize),
+                            new Span<double>(im2colBuf, 0, colH * colW), colW, 0,
+                            c, c + 1, height, width, kernelHeight, kernelWidth,
+                            strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth);
+                    }, deterministicSafe: true);
+                }
+                else
+                {
+                    Helpers.Im2ColHelper.Im2Col(
+                        new ReadOnlySpan<double>(inputD, b * inputSliceSize, inputSliceSize),
+                        new Span<double>(im2colBuf, 0, colH * colW),
+                        1, inChannels, height, width,
+                        kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW);
+                }
+                int gradOutOff = b * outChannels * colW;
+                if (!Helpers.BlasProvider.TryGemmEx(
+                    outChannels, colH, colW,
+                    gradOutputD, gradOutOff, colW, false,
+                    im2colBuf, 0, colW, true,
+                    localGrad, 0, colH))
+                {
+                    var im2colT = kPoolD.Rent(colW * colH);
+                    try
+                    {
+                        for (int r = 0; r < colH; r++)
+                            for (int c = 0; c < colW; c++)
+                                im2colT[c * colH + r] = im2colBuf[r * colW + c];
+                        Helpers.Im2ColHelper.MultiplyMatrixBlockedDouble(
+                            new ReadOnlySpan<double>(gradOutputD, gradOutOff, outChannels * colW),
+                            new ReadOnlySpan<double>(im2colT, 0, colW * colH),
+                            new Span<double>(localGrad, 0, totalLen),
+                            outChannels, colW, colH);
+                    }
+                    finally { kPoolD.Return(im2colT); }
+                }
+            }
+
+            long perImageGemmKD = (long)outChannels * colH * colW;
+            if (batch > 1 && perImageGemmKD < ConvBackwardParallelBatchMaxPerImage)
+            {
+                var perBatchGradsD = new double[batch][];
+                CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * colH * colW, b =>
+                {
+                    var im2colBuf = kPoolD.Rent(colH * colW);
+                    var localGrad = kPoolD.Rent(totalLen);
+                    try
+                    {
+                        ComputeBatchGradD(b, im2colBuf, localGrad, channelParallel: false);
+                        var gradCopy = new double[totalLen];
+                        Array.Copy(localGrad, gradCopy, totalLen);
+                        perBatchGradsD[b] = gradCopy;
+                    }
+                    finally
+                    {
+                        kPoolD.Return(im2colBuf);
+                        kPoolD.Return(localGrad);
+                    }
+                });
+                for (int b = 0; b < batch; b++)
+                {
+                    var lg = perBatchGradsD[b];
+                    for (int i = 0; i < totalLen; i++) gradKernelD[i] += lg[i];
+                }
+            }
+            else
             {
                 var im2colBuf = kPoolD.Rent(colH * colW);
                 var localGrad = kPoolD.Rent(totalLen);
                 try
                 {
-                    Array.Clear(localGrad, 0, totalLen);
-                    Helpers.Im2ColHelper.Im2Col(
-                        new ReadOnlySpan<double>(inputD, b * inputSliceSize, inputSliceSize),
-                        new Span<double>(im2colBuf),
-                        1, inChannels, height, width,
-                        kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW);
-                    int gradOutOff = b * outChannels * colW;
-                    if (!Helpers.BlasProvider.TryGemmEx(
-                        outChannels, colH, colW,
-                        gradOutputD, gradOutOff, colW, false,
-                        im2colBuf, 0, colW, true,
-                        localGrad, 0, colH))
+                    for (int b = 0; b < batch; b++)
                     {
-                        var im2colT = kPoolD.Rent(colW * colH);
-                        try
-                        {
-                            for (int r = 0; r < colH; r++)
-                                for (int c = 0; c < colW; c++)
-                                    im2colT[c * colH + r] = im2colBuf[r * colW + c];
-                            Helpers.Im2ColHelper.MultiplyMatrixBlockedDouble(
-                                new ReadOnlySpan<double>(gradOutputD, gradOutOff, outChannels * colW),
-                                new ReadOnlySpan<double>(im2colT, 0, colW * colH),
-                                new Span<double>(localGrad, 0, totalLen),
-                                outChannels, colW, colH);
-                        }
-                        finally { kPoolD.Return(im2colT); }
+                        ComputeBatchGradD(b, im2colBuf, localGrad, channelParallel: true);
+                        for (int i = 0; i < totalLen; i++) gradKernelD[i] += localGrad[i];
                     }
-                    var gradCopy = new double[totalLen];
-                    Array.Copy(localGrad, gradCopy, totalLen);
-                    perBatchGradsD[b] = gradCopy;
                 }
                 finally
                 {
                     kPoolD.Return(im2colBuf);
                     kPoolD.Return(localGrad);
                 }
-            });
-            for (int b = 0; b < batch; b++)
-            {
-                var lg = perBatchGradsD[b];
-                for (int i = 0; i < gradKernelD.Length; i++)
-                    gradKernelD[i] += lg[i];
             }
             if (accumulate)
                 for (int i = 0; i < totalLen; i++) destD[destOff + i] += gradKernelD[i];
@@ -27177,33 +27339,26 @@ public partial class CpuEngine : ITensorLevelEngine
             maxIndices[i] = -1;
         }
 
-        var inputStrides = ComputeStrides(inputShape);
-        var outputStrides = ComputeStrides(outputShape);
-
-        for (int i = 0; i < input.Length; i++)
+        // Allocation-free odometer (replaces per-element FlatToMultiIndex +
+        // new List<int> + MultiToFlatIndex + Contains). inputData is logical
+        // row-major; advance the output flat index incrementally as we walk it.
+        int maxRank = inputShape.Length;
+        var maxOutStrideForDim = BuildReducedOutStrideForDim(inputShape, outputShape, normalizedAxes);
+        var maxCoord = new int[maxRank];
+        int maxOutFlat = 0;
+        int maxLen = input.Length;
+        for (int i = 0; i < maxLen; i++)
         {
-            var multiIndex = FlatToMultiIndex(i, inputShape, inputStrides);
-
-            var outputMultiIndex = new List<int>();
-            for (int d = 0; d < inputShape.Length; d++)
+            if (numOps.GreaterThan(inputData[i], outputData[maxOutFlat]))
             {
-                if (normalizedAxes.Contains(d))
-                {
-                    if (keepDims) outputMultiIndex.Add(0);
-                }
-                else
-                {
-                    outputMultiIndex.Add(multiIndex[d]);
-                }
+                outputData[maxOutFlat] = inputData[i];
+                maxIndices[maxOutFlat] = i;
             }
-            if (outputMultiIndex.Count == 0) outputMultiIndex.Add(0);
-
-            int outputIdx = MultiToFlatIndex([.. outputMultiIndex], outputShape, outputStrides);
-
-            if (numOps.GreaterThan(inputData[i], outputData[outputIdx]))
+            for (int d = maxRank - 1; d >= 0; d--)
             {
-                outputData[outputIdx] = inputData[i];
-                maxIndices[outputIdx] = i;
+                maxCoord[d]++; maxOutFlat += maxOutStrideForDim[d];
+                if (maxCoord[d] < inputShape[d]) break;
+                maxCoord[d] = 0; maxOutFlat -= maxOutStrideForDim[d] * inputShape[d];
             }
         }
 
@@ -27367,46 +27522,82 @@ public partial class CpuEngine : ITensorLevelEngine
 
         int outputSize = outputShape.Aggregate(1, (a, b) => a * b);
         var outputData = new T[outputSize];
-        var counts = new int[outputSize];
 
-        for (int i = 0; i < outputSize; i++)
+        // Allocation-free odometer reduction (mirrors the Tensor<T>.Sum fast
+        // path). The previous implementation allocated a FlatToMultiIndex int[]
+        // + a List<int> + a MultiToFlatIndex int[] PER ELEMENT plus a
+        // normalizedAxes.Contains() scan per dim — the same per-element heap-
+        // allocation catastrophe SumRecursive had, on every BatchNorm/LayerNorm
+        // mean over [B,C,H,W]. inputData is logical row-major (GetFlattenedData),
+        // so we walk it once, advancing the output flat index incrementally.
+        int meanRank = inputShape.Length;
+        var meanIsReduced = new bool[meanRank];
+        int reduceCount = 1;
+        for (int a = 0; a < normalizedAxes.Length; a++) { meanIsReduced[normalizedAxes[a]] = true; reduceCount *= inputShape[normalizedAxes[a]]; }
+        var meanOutStrides = ComputeStrides(outputShape);
+        var meanOutStrideForDim = new int[meanRank];
+        if (keepDims)
         {
-            outputData[i] = numOps.Zero;
-            counts[i] = 0;
+            // output rank == input rank; reduced dims have size 1 (coord always 0).
+            for (int d = 0; d < meanRank; d++) meanOutStrideForDim[d] = meanIsReduced[d] ? 0 : meanOutStrides[d];
         }
-
-        var inputStrides = ComputeStrides(inputShape);
-        var outputStrides = ComputeStrides(outputShape);
-
-        for (int i = 0; i < input.Length; i++)
+        else
         {
-            var multiIndex = FlatToMultiIndex(i, inputShape, inputStrides);
-
-            var outputMultiIndex = new List<int>();
-            for (int d = 0; d < inputShape.Length; d++)
+            int oi = 0;
+            for (int d = 0; d < meanRank; d++) meanOutStrideForDim[d] = meanIsReduced[d] ? 0 : meanOutStrides[oi++];
+        }
+        var meanCoord = new int[meanRank];
+        int meanOutFlat = 0;
+        int meanLen = input.Length;
+        if (typeof(T) == typeof(double))
+        {
+            var s = (double[])(object)inputData;
+            var o = (double[])(object)outputData;
+            for (int i = 0; i < meanLen; i++)
             {
-                if (normalizedAxes.Contains(d))
+                o[meanOutFlat] += s[i];
+                for (int d = meanRank - 1; d >= 0; d--)
                 {
-                    if (keepDims) outputMultiIndex.Add(0);
-                }
-                else
-                {
-                    outputMultiIndex.Add(multiIndex[d]);
+                    meanCoord[d]++; meanOutFlat += meanOutStrideForDim[d];
+                    if (meanCoord[d] < inputShape[d]) break;
+                    meanCoord[d] = 0; meanOutFlat -= meanOutStrideForDim[d] * inputShape[d];
                 }
             }
-            if (outputMultiIndex.Count == 0) outputMultiIndex.Add(0);
-
-            int outputIdx = MultiToFlatIndex([.. outputMultiIndex], outputShape, outputStrides);
-            outputData[outputIdx] = numOps.Add(outputData[outputIdx], inputData[i]);
-            counts[outputIdx]++;
+            double inv = 1.0 / reduceCount;
+            for (int i = 0; i < outputSize; i++) o[i] *= inv;
         }
-
-        for (int i = 0; i < outputSize; i++)
+        else if (typeof(T) == typeof(float))
         {
-            if (counts[i] > 0)
+            var s = (float[])(object)inputData;
+            var o = (float[])(object)outputData;
+            for (int i = 0; i < meanLen; i++)
             {
-                outputData[i] = numOps.Divide(outputData[i], numOps.FromDouble(counts[i]));
+                o[meanOutFlat] += s[i];
+                for (int d = meanRank - 1; d >= 0; d--)
+                {
+                    meanCoord[d]++; meanOutFlat += meanOutStrideForDim[d];
+                    if (meanCoord[d] < inputShape[d]) break;
+                    meanCoord[d] = 0; meanOutFlat -= meanOutStrideForDim[d] * inputShape[d];
+                }
             }
+            float inv = 1.0f / reduceCount;
+            for (int i = 0; i < outputSize; i++) o[i] *= inv;
+        }
+        else
+        {
+            for (int i = 0; i < outputSize; i++) outputData[i] = numOps.Zero;
+            for (int i = 0; i < meanLen; i++)
+            {
+                outputData[meanOutFlat] = numOps.Add(outputData[meanOutFlat], inputData[i]);
+                for (int d = meanRank - 1; d >= 0; d--)
+                {
+                    meanCoord[d]++; meanOutFlat += meanOutStrideForDim[d];
+                    if (meanCoord[d] < inputShape[d]) break;
+                    meanCoord[d] = 0; meanOutFlat -= meanOutStrideForDim[d] * inputShape[d];
+                }
+            }
+            T divisor = numOps.FromDouble(reduceCount);
+            for (int i = 0; i < outputSize; i++) outputData[i] = numOps.Divide(outputData[i], divisor);
         }
 
         var result = TensorAllocator.Rent<T>(outputShape, outputData);
@@ -27439,45 +27630,23 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var gradOutputData = gradOutput.GetFlattenedData();
         var gradOutputShape = gradOutput._shape;
-        var inputStrides = ComputeStrides(inputShape);
-        var outputStrides = ComputeStrides(gradOutputShape);
 
+        // Allocation-free odometer: walk gradInput (input-shaped) in row-major
+        // order, advancing the reduced gradOutput flat index incrementally
+        // (replaces per-element FlatToMultiIndex + List + MultiToFlatIndex + Contains).
+        int rmbRank = inputShape.Length;
+        var rmbOutStrideForDim = BuildReducedOutStrideForDim(inputShape, gradOutputShape, normalizedAxes);
+        var rmbCoord = new int[rmbRank];
+        int rmbOutFlat = 0;
         for (int i = 0; i < inputSize; i++)
         {
-            var multiIndex = FlatToMultiIndex(i, inputShape, inputStrides);
-
-            var outputMultiIndex = new List<int>();
-            int d2 = 0;
-            for (int d = 0; d < inputShape.Length; d++)
+            gradInputData[i] = numOps.Multiply(gradOutputData[rmbOutFlat], scale);
+            for (int d = rmbRank - 1; d >= 0; d--)
             {
-                if (normalizedAxes.Contains(d))
-                {
-                    if (d2 < gradOutputShape.Length && gradOutputShape[d2] == 1)
-                    {
-                        outputMultiIndex.Add(0);
-                        d2++;
-                    }
-                }
-                else
-                {
-                    if (d2 < gradOutputShape.Length)
-                    {
-                        outputMultiIndex.Add(multiIndex[d]);
-                        d2++;
-                    }
-                }
+                rmbCoord[d]++; rmbOutFlat += rmbOutStrideForDim[d];
+                if (rmbCoord[d] < inputShape[d]) break;
+                rmbCoord[d] = 0; rmbOutFlat -= rmbOutStrideForDim[d] * inputShape[d];
             }
-            if (outputMultiIndex.Count == 0) outputMultiIndex.Add(0);
-
-            while (outputMultiIndex.Count < gradOutputShape.Length)
-                outputMultiIndex.Add(0);
-            while (outputMultiIndex.Count > gradOutputShape.Length)
-                outputMultiIndex.RemoveAt(outputMultiIndex.Count - 1);
-
-            int outputIdx = MultiToFlatIndex([.. outputMultiIndex], gradOutputShape, outputStrides);
-            if (outputIdx < 0 || outputIdx >= gradOutputData.Length)
-                throw new InvalidOperationException($"Output index {outputIdx} out of range [0, {gradOutputData.Length}). This indicates a shape mismatch between gradOutput and the expected shape.");
-            gradInputData[i] = numOps.Multiply(gradOutputData[outputIdx], scale);
         }
 
         return TensorAllocator.Rent<T>(inputShape, gradInputData);
@@ -27664,46 +27833,27 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         T scale = numOps.Divide(numOps.One, numOps.FromDouble(reduceCount));
 
-        var inputStrides = ComputeStrides(inputShape);
-        var outputStrides = ComputeStrides(outputShape);
-        var meanStrides = ComputeStrides(meanShape);
-
-        // Accumulate squared differences from mean
+        // Accumulate squared differences from mean. Allocation-free odometer:
+        // two incremental flat indices (output + keepDims mean) advanced as we
+        // walk the row-major input once (replaces per-element FlatToMultiIndex +
+        // two List<int> + two MultiToFlatIndex + Contains).
+        int varRank = inputShape.Length;
+        var varOutStrideForDim = BuildReducedOutStrideForDim(inputShape, outputShape, normalizedAxes);
+        var varMeanStrideForDim = BuildReducedOutStrideForDim(inputShape, meanShape, normalizedAxes);
+        var varCoord = new int[varRank];
+        int varOutFlat = 0, varMeanFlat = 0;
         int inputSize = input.Length;
         for (int i = 0; i < inputSize; i++)
         {
-            var multiIndex = FlatToMultiIndex(i, inputShape, inputStrides);
-
-            var outputMultiIndex = new List<int>();
-            for (int d = 0; d < inputShape.Length; d++)
-            {
-                if (normalizedAxes.Contains(d))
-                {
-                    if (keepDims) outputMultiIndex.Add(0);
-                }
-                else
-                {
-                    outputMultiIndex.Add(multiIndex[d]);
-                }
-            }
-            if (outputMultiIndex.Count == 0) outputMultiIndex.Add(0);
-
-            int outputIdx = MultiToFlatIndex([.. outputMultiIndex], outputShape, outputStrides);
-
-            // Get mean value (mean tensor has keepDims=true shape)
-            var meanMultiIndex = new List<int>();
-            for (int d = 0; d < inputShape.Length; d++)
-            {
-                if (normalizedAxes.Contains(d))
-                    meanMultiIndex.Add(0);
-                else
-                    meanMultiIndex.Add(multiIndex[d]);
-            }
-            int meanIdx = MultiToFlatIndex([.. meanMultiIndex], meanShape, meanStrides);
-
-            T diff = numOps.Subtract(inputData[i], meanData[meanIdx]);
+            T diff = numOps.Subtract(inputData[i], meanData[varMeanFlat]);
             T squaredDiff = numOps.Multiply(diff, diff);
-            outputData[outputIdx] = numOps.Add(outputData[outputIdx], squaredDiff);
+            outputData[varOutFlat] = numOps.Add(outputData[varOutFlat], squaredDiff);
+            for (int d = varRank - 1; d >= 0; d--)
+            {
+                varCoord[d]++; varOutFlat += varOutStrideForDim[d]; varMeanFlat += varMeanStrideForDim[d];
+                if (varCoord[d] < inputShape[d]) break;
+                varCoord[d] = 0; varOutFlat -= varOutStrideForDim[d] * inputShape[d]; varMeanFlat -= varMeanStrideForDim[d] * inputShape[d];
+            }
         }
 
         // Divide by count to get variance
@@ -27803,33 +27953,23 @@ public partial class CpuEngine : ITensorLevelEngine
         foreach (var ax in normalizedAxes) reduceCount *= inputShape[ax];
         T scale = numOps.Divide(numOps.One, numOps.FromDouble(reduceCount));
 
-        var inputStrides = ComputeStrides(inputShape);
-        var outputStrides = ComputeStrides(outputShape);
-        var meanStrides = ComputeStrides(meanShape);
-
+        // Allocation-free odometer (output + keepDims mean), see ReduceVariance.
+        int rvtRank = inputShape.Length;
+        var rvtOutStrideForDim = BuildReducedOutStrideForDim(inputShape, outputShape, normalizedAxes);
+        var rvtMeanStrideForDim = BuildReducedOutStrideForDim(inputShape, meanShape, normalizedAxes);
+        var rvtCoord = new int[rvtRank];
+        int rvtOutFlat = 0, rvtMeanFlat = 0;
         int inputSize = input.Length;
         for (int i = 0; i < inputSize; i++)
         {
-            var multiIndex = FlatToMultiIndex(i, inputShape, inputStrides);
-            var outputMultiIndex = new List<int>();
-            for (int d = 0; d < inputShape.Length; d++)
+            T diff = numOps.Subtract(inputData[i], meanData[rvtMeanFlat]);
+            outputData[rvtOutFlat] = numOps.Add(outputData[rvtOutFlat], numOps.Multiply(diff, diff));
+            for (int d = rvtRank - 1; d >= 0; d--)
             {
-                if (normalizedAxes.Contains(d)) { if (keepDims) outputMultiIndex.Add(0); }
-                else outputMultiIndex.Add(multiIndex[d]);
+                rvtCoord[d]++; rvtOutFlat += rvtOutStrideForDim[d]; rvtMeanFlat += rvtMeanStrideForDim[d];
+                if (rvtCoord[d] < inputShape[d]) break;
+                rvtCoord[d] = 0; rvtOutFlat -= rvtOutStrideForDim[d] * inputShape[d]; rvtMeanFlat -= rvtMeanStrideForDim[d] * inputShape[d];
             }
-            if (outputMultiIndex.Count == 0) outputMultiIndex.Add(0);
-            int outputIdx = MultiToFlatIndex([.. outputMultiIndex], outputShape, outputStrides);
-
-            var meanMultiIndex = new List<int>();
-            for (int d = 0; d < inputShape.Length; d++)
-            {
-                if (normalizedAxes.Contains(d)) meanMultiIndex.Add(0);
-                else meanMultiIndex.Add(multiIndex[d]);
-            }
-            int meanIdx = MultiToFlatIndex([.. meanMultiIndex], meanShape, meanStrides);
-
-            T diff = numOps.Subtract(inputData[i], meanData[meanIdx]);
-            outputData[outputIdx] = numOps.Add(outputData[outputIdx], numOps.Multiply(diff, diff));
         }
         for (int i = 0; i < outputSize; i++) outputData[i] = numOps.Multiply(outputData[i], scale);
 
@@ -27872,21 +28012,25 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         T scale = numOps.Divide(numOps.FromDouble(2.0), numOps.FromDouble(reduceCount));
 
-        var inputStrides = ComputeStrides(inputShape);
-        var outputStrides = ComputeStrides(gradOutputShape);
-        var meanStrides = ComputeStrides(meanShape);
-
+        // Allocation-free odometer (gradOutput + keepDims mean) over the
+        // row-major input (replaces per-element FlatToMultiIndex + MapToReducedIndex
+        // + MapToMeanIndex, each of which allocated a List<int> + int[] per call).
+        int rvbRank = inputShape.Length;
+        var rvbOutStrideForDim = BuildReducedOutStrideForDim(inputShape, gradOutputShape, normalizedAxes);
+        var rvbMeanStrideForDim = BuildReducedOutStrideForDim(inputShape, meanShape, normalizedAxes);
+        var rvbCoord = new int[rvbRank];
+        int rvbOutFlat = 0, rvbMeanFlat = 0;
         for (int i = 0; i < inputSize; i++)
         {
-            var multiIndex = FlatToMultiIndex(i, inputShape, inputStrides);
-
-            // Map to output and mean indices using helper methods
-            int outputIdx = MapToReducedIndex(multiIndex, inputShape, gradOutputShape, normalizedAxes, outputStrides);
-            int meanIdx = MapToMeanIndex(multiIndex, inputShape, meanShape, normalizedAxes, meanStrides);
-
             // gradient = 2 * (x - mean) * gradOutput / N
-            T diff = numOps.Subtract(inputData[i], meanData[meanIdx]);
-            gradInputData[i] = numOps.Multiply(numOps.Multiply(diff, scale), gradOutputData[outputIdx]);
+            T diff = numOps.Subtract(inputData[i], meanData[rvbMeanFlat]);
+            gradInputData[i] = numOps.Multiply(numOps.Multiply(diff, scale), gradOutputData[rvbOutFlat]);
+            for (int d = rvbRank - 1; d >= 0; d--)
+            {
+                rvbCoord[d]++; rvbOutFlat += rvbOutStrideForDim[d]; rvbMeanFlat += rvbMeanStrideForDim[d];
+                if (rvbCoord[d] < inputShape[d]) break;
+                rvbCoord[d] = 0; rvbOutFlat -= rvbOutStrideForDim[d] * inputShape[d]; rvbMeanFlat -= rvbMeanStrideForDim[d] * inputShape[d];
+            }
         }
 
         return TensorAllocator.Rent<T>(inputShape, gradInputData);
@@ -27966,64 +28110,35 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         T scale = numOps.Divide(numOps.FromDouble(2.0), numOps.FromDouble(reduceCount));
 
-        var inputStrides = ComputeStrides(inputShape);
-        var outputStrides = ComputeStrides(gradOutputShape);
-        var meanStrides = ComputeStrides(meanShape);
-        var varianceStrides = ComputeStrides(varianceShape);
-
+        // Allocation-free odometer (gradOutput + keepDims mean + variance) over
+        // the row-major input (replaces per-element FlatToMultiIndex + three
+        // List<int> + three MultiToFlatIndex + Contains).
+        int rlvRank = inputShape.Length;
+        var rlvOutStrideForDim = BuildReducedOutStrideForDim(inputShape, gradOutputShape, normalizedAxes);
+        var rlvMeanStrideForDim = BuildReducedOutStrideForDim(inputShape, meanShape, normalizedAxes);
+        var rlvVarStrideForDim = BuildReducedOutStrideForDim(inputShape, varianceShape, normalizedAxes);
+        var rlvCoord = new int[rlvRank];
+        int rlvOutFlat = 0, rlvMeanFlat = 0, rlvVarFlat = 0;
         for (int i = 0; i < inputSize; i++)
         {
-            var multiIndex = FlatToMultiIndex(i, inputShape, inputStrides);
-
-            // Map to output/variance index
-            var outputMultiIndex = new List<int>();
-            int d2 = 0;
-            for (int d = 0; d < inputShape.Length; d++)
-            {
-                if (normalizedAxes.Contains(d))
-                {
-                    if (d2 < gradOutputShape.Length && gradOutputShape[d2] == 1)
-                    {
-                        outputMultiIndex.Add(0);
-                        d2++;
-                    }
-                }
-                else
-                {
-                    if (d2 < gradOutputShape.Length)
-                    {
-                        outputMultiIndex.Add(multiIndex[d]);
-                        d2++;
-                    }
-                }
-            }
-            if (outputMultiIndex.Count == 0) outputMultiIndex.Add(0);
-            while (outputMultiIndex.Count < gradOutputShape.Length) outputMultiIndex.Add(0);
-            while (outputMultiIndex.Count > gradOutputShape.Length) outputMultiIndex.RemoveAt(outputMultiIndex.Count - 1);
-
-            int outputIdx = MultiToFlatIndex([.. outputMultiIndex], gradOutputShape, outputStrides);
-
-            // Map to mean index
-            var meanMultiIndex = new List<int>();
-            for (int d = 0; d < inputShape.Length; d++)
-            {
-                if (normalizedAxes.Contains(d))
-                    meanMultiIndex.Add(0);
-                else
-                    meanMultiIndex.Add(multiIndex[d]);
-            }
-            int meanIdx = MultiToFlatIndex([.. meanMultiIndex], meanShape, meanStrides);
-            int varianceIdx = MultiToFlatIndex([.. outputMultiIndex], varianceShape, varianceStrides);
-
             // gradient = 2 * (x - mean) / (N * variance) * gradOutput
             // = (x - mean) * scale / variance * gradOutput
-            T diff = numOps.Subtract(inputData[i], meanData[meanIdx]);
-            T varianceVal = varianceData[varianceIdx];
+            T diff = numOps.Subtract(inputData[i], meanData[rlvMeanFlat]);
+            T varianceVal = varianceData[rlvVarFlat];
             // Avoid division by zero
             if (numOps.LessThanOrEquals(varianceVal, numOps.Zero))
                 varianceVal = numOps.FromDouble(1e-8);
             T gradScale = numOps.Divide(scale, varianceVal);
-            gradInputData[i] = numOps.Multiply(numOps.Multiply(diff, gradScale), gradOutputData[outputIdx]);
+            gradInputData[i] = numOps.Multiply(numOps.Multiply(diff, gradScale), gradOutputData[rlvOutFlat]);
+            for (int d = rlvRank - 1; d >= 0; d--)
+            {
+                rlvCoord[d]++; rlvOutFlat += rlvOutStrideForDim[d]; rlvMeanFlat += rlvMeanStrideForDim[d]; rlvVarFlat += rlvVarStrideForDim[d];
+                if (rlvCoord[d] < inputShape[d]) break;
+                rlvCoord[d] = 0;
+                rlvOutFlat -= rlvOutStrideForDim[d] * inputShape[d];
+                rlvMeanFlat -= rlvMeanStrideForDim[d] * inputShape[d];
+                rlvVarFlat -= rlvVarStrideForDim[d] * inputShape[d];
+            }
         }
 
         return TensorAllocator.Rent<T>(inputShape, gradInputData);
@@ -28042,74 +28157,43 @@ public partial class CpuEngine : ITensorLevelEngine
         return strides;
     }
 
-    private static int[] FlatToMultiIndex(int flatIndex, int[] shape, int[] strides)
-    {
-        var multiIndex = new int[shape.Length];
-        for (int i = 0; i < shape.Length; i++)
-        {
-            multiIndex[i] = flatIndex / strides[i];
-            flatIndex %= strides[i];
-        }
-        return multiIndex;
-    }
-
-    private static int MultiToFlatIndex(int[] multiIndex, int[] shape, int[] strides)
-    {
-        int flatIndex = 0;
-        for (int i = 0; i < multiIndex.Length; i++)
-        {
-            flatIndex += multiIndex[i] * strides[i];
-        }
-        return flatIndex;
-    }
+    // NOTE: the former per-element FlatToMultiIndex / MultiToFlatIndex /
+    // MapToReducedIndex / MapToMeanIndex helpers were removed — all reduction /
+    // normalization kernels now use the allocation-free odometer driven by
+    // BuildReducedOutStrideForDim below (no per-element int[]/List<int> allocs).
 
     /// <summary>
-    /// Maps a multi-index from input space to reduced output space for variance backward pass.
+    /// Precomputes, for each INPUT dimension, the amount to add to a reduced-output
+    /// flat index when that input dimension's coordinate increments by 1. Reduced
+    /// dimensions contribute 0 (they collapse: in a keepDims output they are size-1
+    /// so the coord is always 0; in a non-keepDims output they are absent). This is
+    /// the allocation-free replacement for the old per-element
+    /// flat-to-multi-index + <c>new List&lt;int&gt;</c> + multi-to-flat-index +
+    /// <c>Contains</c> pattern: callers walk the flat row-major input once and
+    /// advance the output flat index with a reused odometer (see
+    /// <see cref="ReduceMean{T}"/>). Works for both reduced OUTPUT shapes and
+    /// keepDims-style MEAN shapes.
     /// </summary>
-    private static int MapToReducedIndex(int[] multiIndex, int[] inputShape, int[] outputShape, int[] normalizedAxes, int[] outputStrides)
+    private static int[] BuildReducedOutStrideForDim(int[] inputShape, int[] outputShape, int[] normalizedAxes)
     {
-        var outputMultiIndex = new List<int>();
-        int d2 = 0;
-        for (int d = 0; d < inputShape.Length; d++)
+        int rank = inputShape.Length;
+        var isReduced = new bool[rank];
+        foreach (int a in normalizedAxes) isReduced[a] = true;
+        var outStrides = ComputeStrides(outputShape);
+        var map = new int[rank];
+        // keepDims (or same-rank mean shape): output rank == input rank, reduced
+        // dims present with size 1 → contribute 0. Otherwise reduced dims are
+        // dropped and surviving dims keep their relative order.
+        if (outputShape.Length == rank)
         {
-            if (Array.IndexOf(normalizedAxes, d) >= 0)
-            {
-                if (d2 < outputShape.Length && outputShape[d2] == 1)
-                {
-                    outputMultiIndex.Add(0);
-                    d2++;
-                }
-            }
-            else
-            {
-                if (d2 < outputShape.Length)
-                {
-                    outputMultiIndex.Add(multiIndex[d]);
-                    d2++;
-                }
-            }
+            for (int d = 0; d < rank; d++) map[d] = isReduced[d] ? 0 : outStrides[d];
         }
-        if (outputMultiIndex.Count == 0) outputMultiIndex.Add(0);
-        while (outputMultiIndex.Count < outputShape.Length) outputMultiIndex.Add(0);
-        while (outputMultiIndex.Count > outputShape.Length) outputMultiIndex.RemoveAt(outputMultiIndex.Count - 1);
-
-        return MultiToFlatIndex([.. outputMultiIndex], outputShape, outputStrides);
-    }
-
-    /// <summary>
-    /// Maps a multi-index from input space to mean tensor space for variance backward pass.
-    /// </summary>
-    private static int MapToMeanIndex(int[] multiIndex, int[] inputShape, int[] meanShape, int[] normalizedAxes, int[] meanStrides)
-    {
-        var meanMultiIndex = new List<int>();
-        for (int d = 0; d < inputShape.Length; d++)
+        else
         {
-            if (Array.IndexOf(normalizedAxes, d) >= 0)
-                meanMultiIndex.Add(0);
-            else
-                meanMultiIndex.Add(multiIndex[d]);
+            int oi = 0;
+            for (int d = 0; d < rank; d++) map[d] = isReduced[d] ? 0 : outStrides[oi++];
         }
-        return MultiToFlatIndex([.. meanMultiIndex], meanShape, meanStrides);
+        return map;
     }
 
     #endregion
@@ -29410,14 +29494,25 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var tensorData = tensor.GetDataArray();
             var tensorShape = tensor._shape;
-            var tensorStrides = ComputeStrides(tensorShape);
 
-            for (int i = 0; i < tensor.Length; i++)
+            // Allocation-free odometer: output and input share rank; only the
+            // concat axis is offset. outFlat tracks the input coord mapped onto
+            // the output strides; the constant axis offset is added once
+            // (replaces per-element FlatToMultiIndex + MultiToFlatIndex).
+            int cRank = tensorShape.Length;
+            int cBase = axisOffset * outputStrides[axis];
+            var cCoord = new int[cRank];
+            int cOutFlat = 0;
+            int cLen = tensor.Length;
+            for (int i = 0; i < cLen; i++)
             {
-                var multiIndex = FlatToMultiIndex(i, tensorShape, tensorStrides);
-                multiIndex[axis] += axisOffset;
-                int outputIdx = MultiToFlatIndex(multiIndex, outputShape, outputStrides);
-                outputData[outputIdx] = tensorData[i];
+                outputData[cBase + cOutFlat] = tensorData[i];
+                for (int d = cRank - 1; d >= 0; d--)
+                {
+                    cCoord[d]++; cOutFlat += outputStrides[d];
+                    if (cCoord[d] < tensorShape[d]) break;
+                    cCoord[d] = 0; cOutFlat -= outputStrides[d] * tensorShape[d];
+                }
             }
 
             axisOffset += tensor._shape[axis];

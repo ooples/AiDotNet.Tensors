@@ -164,6 +164,15 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         ThrowIfSparse();
         if (IsContiguous && _storageOffset == 0) return this;
 
+        if (Environment.GetEnvironmentVariable("AIDOTNET_DEBUG_CONTIG") == "1" && Length >= 256)
+        {
+            try
+            {
+                Console.Error.WriteLine($"[CONTIG] off={_storageOffset} contig={IsContiguous} shape=[{string.Join(",", _shape)}] strides=[{string.Join(",", _strides)}] len={Length}\n{new System.Diagnostics.StackTrace(1, false)}");
+            }
+            catch { }
+        }
+
         var result = new Tensor<T>(_shape);
         var dstSpan = result._data.AsWritableSpan();
 
@@ -1431,6 +1440,96 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         }
 
         var result = new Tensor<T>(newShape);
+
+        // Fast path: contiguous source with at least one surviving dim. The
+        // recursive fallback below allocates a `new int[result.Rank]` and does
+        // two multi-dim indexer round-trips PLUS an axes.Contains() scan FOR
+        // EVERY ELEMENT — for a [1,64,224,224] gradient reduced over {0,2,3}
+        // (every conv bias / BatchNorm / broadcast backward) that is 3.2M heap
+        // allocations + millions of virtual dispatches per reduction, which
+        // profiled as ~40% of a ResNet CPU train step. This path walks the flat
+        // row-major backing once with a reused odometer, advancing the output
+        // flat index incrementally (no per-element allocation, no indexer, no
+        // Contains). Accumulation order is identical to SumRecursive (source
+        // row-major, innermost dim fastest), so results are bit-identical.
+        int rank = Rank;
+        int outRank = newShape.Length;
+        if (IsContiguous && _storageOffset == 0 && outRank > 0)
+        {
+            // Row-major strides of the output shape.
+            var outStrides = new int[outRank];
+            int strideAcc = 1;
+            for (int i = outRank - 1; i >= 0; i--) { outStrides[i] = strideAcc; strideAcc *= newShape[i]; }
+
+            // Per-source-dim contribution to the output flat index: a reduced
+            // dim contributes 0 (it collapses), a surviving dim contributes its
+            // output stride. Surviving dims keep their original relative order,
+            // matching how newShape was built above.
+            var outStrideForDim = new int[rank];
+            int oi = 0;
+            for (int d = 0; d < rank; d++)
+            {
+                bool reduced = false;
+                for (int a = 0; a < axes.Length; a++) { if (axes[a] == d) { reduced = true; break; } }
+                outStrideForDim[d] = reduced ? 0 : outStrides[oi++];
+            }
+
+            var coord = new int[rank];
+            int len = Length;
+            int outFlat = 0;
+
+            // Typed fast paths: read the raw backing array (offset-adjusted) and
+            // accumulate with the native operator — no INumericOperations virtual
+            // dispatch. float/double cover the overwhelmingly common training dtypes.
+            if (typeof(T) == typeof(float))
+            {
+                var s = (float[])(object)GetDataArray();
+                var r = (float[])(object)result.GetDataArray();
+                for (int i = 0; i < len; i++)
+                {
+                    r[outFlat] += s[i];
+                    for (int d = rank - 1; d >= 0; d--)
+                    {
+                        coord[d]++; outFlat += outStrideForDim[d];
+                        if (coord[d] < _shape[d]) break;
+                        coord[d] = 0; outFlat -= outStrideForDim[d] * _shape[d];
+                    }
+                }
+                return result;
+            }
+            if (typeof(T) == typeof(double))
+            {
+                var s = (double[])(object)GetDataArray();
+                var r = (double[])(object)result.GetDataArray();
+                for (int i = 0; i < len; i++)
+                {
+                    r[outFlat] += s[i];
+                    for (int d = rank - 1; d >= 0; d--)
+                    {
+                        coord[d]++; outFlat += outStrideForDim[d];
+                        if (coord[d] < _shape[d]) break;
+                        coord[d] = 0; outFlat -= outStrideForDim[d] * _shape[d];
+                    }
+                }
+                return result;
+            }
+
+            // Generic T: still allocation-free / indexer-free; only Add is virtual.
+            var src = AsSpan();
+            var rArr = result.GetDataArray();
+            for (int i = 0; i < len; i++)
+            {
+                rArr[outFlat] = _numOps.Add(rArr[outFlat], src[i]);
+                for (int d = rank - 1; d >= 0; d--)
+                {
+                    coord[d]++; outFlat += outStrideForDim[d];
+                    if (coord[d] < _shape[d]) break;
+                    coord[d] = 0; outFlat -= outStrideForDim[d] * _shape[d];
+                }
+            }
+            return result;
+        }
+
         int[] indices = new int[Rank];
         SumRecursive(result, axes, indices, 0);
 
