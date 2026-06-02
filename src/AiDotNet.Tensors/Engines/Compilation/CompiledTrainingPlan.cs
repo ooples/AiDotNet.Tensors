@@ -340,6 +340,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     // them from a test/diag harness via the static accessors below to break
     // down where Step's wall time is going (forward / grad-zero / backward /
     // optimizer). Zero overhead in hot path when disabled — single env-var
+    // Small/medium-M cutover for routing compiled-plan GEMM delegates through the
+    // pack-fresh tiled managed kernel instead of native TryGemm (see the matmul
+    // delegate factory). At/below this M the managed kernel wins; above it native
+    // BLAS's raw throughput wins. Mirrors CpuEngine's TensorMatMul2D cutover.
+    private const int TrainingSmallMCutover = 1024;
+
     // read at static init, then a single bool check per Step.
     private static readonly bool _profileStepEnabled =
         System.Environment.GetEnvironmentVariable("AIDOTNET_PROFILE_STEP") == "1";
@@ -2540,14 +2546,23 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
             // Training plan path: parameters (B) are updated in-place between
             // Step() calls, so the pre-packed-B cache would serve stale weights.
-            // Skip SgemmWithCachedB and re-pack on every call (measurable cost
-            // during training, but correctness-first). Fixes
-            // CompiledTrainingPlanRebindingTests.Step_SeesInPlaceParameterUpdates
-            // and Step_ViaCompiledModelCache_SeesUpdates.
+            // Re-pack on every call (correctness-first) — but use the right kernel:
+            //   * small/medium M (<= cutover): the pack-fresh tiled managed kernel
+            //     (SimdGemm.Sgemm 10-arg) beats native TryGemm ~2-5x at the small-M
+            //     (batch) shapes that dominate training — e.g. [64x784]x[784x512]
+            //     ~83 GFLOP/s vs ~18 for TryGemm (min-of-12, fresh-B every call).
+            //     It packs B fresh each call (NO identity cache), so it correctly
+            //     sees in-place weight updates — verified against
+            //     CompiledTrainingPlanRebindingTests.Step_SeesInPlaceParameterUpdates.
+            //   * large M: native BLAS raw throughput wins, keep TryGemm.
             return eng =>
             {
-                if (!BlasProvider.TryGemm(M, N, K, cA, 0, K, cB, 0, N, cOut, 0, N))
-                    SimdGemm.Sgemm(cA.AsSpan(0, M * K), cB.AsSpan(0, K * N), cOut.AsSpan(0, M * N), M, K, N);
+                if (M <= TrainingSmallMCutover)
+                    SimdGemm.Sgemm(cA.AsSpan(0, M * K), K, false, cB.AsSpan(0, K * N), N, false,
+                                   cOut.AsSpan(0, M * N), M, K, N);
+                else if (!BlasProvider.TryGemm(M, N, K, cA, 0, K, cB, 0, N, cOut, 0, N))
+                    SimdGemm.Sgemm(cA.AsSpan(0, M * K), K, false, cB.AsSpan(0, K * N), N, false,
+                                   cOut.AsSpan(0, M * N), M, K, N);
             };
         }
 

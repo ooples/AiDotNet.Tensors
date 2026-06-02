@@ -11730,6 +11730,14 @@ public partial class CpuEngine : ITensorLevelEngine
         return outShape;
     }
 
+    // Small/medium-M cutover for the auto-caching managed cached-B GEMM in
+    // TensorMatMul2D (see the SgemmWithCachedB route below). At/below this M the
+    // packed managed kernel beats native BLAS; above it native's raw throughput
+    // wins. Calibrated from the GFLOP/s-vs-M crossover; env-overridable.
+    private static readonly int _cachedBMaxM =
+        int.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_CACHEDB_MAXM"), out var cbm) && cbm >= 0
+            ? cbm : 1024;
+
     /// <summary>
     /// Standard 2D matrix multiplication: [M, N] @ [N, P] = [M, P]
     /// Uses BLAS when available for float/double, falls back to parallel loops otherwise.
@@ -11789,6 +11797,27 @@ public partial class CpuEngine : ITensorLevelEngine
                     return result;
                 }
             }
+        }
+
+        // Small/medium-M float fast path: route through the pack-fresh tiled managed
+        // kernel (SimdGemm.Sgemm → SgemmTiled). It packs B every call (NO identity
+        // cache — safe when B is mutated in place between calls, e.g. training weights
+        // updated by the optimizer; the cached-B kernel would serve a stale pack here),
+        // yet still measures ~2.2× over the default TryGemm path at small M:
+        // [64×784]×[784×512] ~40 GFLOP/s (min-of-12, fresh B every call) vs ~19 for
+        // TryGemm, whose small-M native/dispatch path leaves cores idle and pays
+        // worker-pool wakeup overhead. Above the cutover (large M) native BLAS's raw
+        // throughput wins, so keep TryGemm there. Numerically equivalent to the native
+        // path (float reduction-order only). M-cutover env-tunable (AIDOTNET_CACHEDB_MAXM).
+        if (typeof(T) == typeof(float) && a.IsContiguous && b.IsContiguous
+            && m <= _cachedBMaxM)
+        {
+            var aArrF = (float[])(object)a.GetDataArray();
+            var bArrF = (float[])(object)b.GetDataArray();
+            var rArrF = (float[])(object)result.GetDataArray();
+            Simd.SimdGemm.Sgemm(aArrF.AsSpan(0, m * n), n, false, bArrF.AsSpan(0, n * p), p, false,
+                                rArrF.AsSpan(0, m * p), m, n, p);
+            return result;
         }
 
         // Try BLAS-accelerated path for float/double tensors
