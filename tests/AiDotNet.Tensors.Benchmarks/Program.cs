@@ -269,6 +269,15 @@ class Program
             return;
         }
 
+        // Sub-S (#409) S.4 — single-process microkernel correctness verify (vs scalar
+        // reference). Runs fast under Intel SDE so the avx512-verify CI can check the
+        // AVX-512 kernels by emulation on runners without AVX-512 hardware. Exit 1 on
+        // any mismatch so the CI step fails.
+        if (args[0] == "--verify-microkernels")
+        {
+            Environment.Exit(MicrokernelGflopsBench.Verify() ? 0 : 1);
+        }
+
         // #378 AVX-512-BF16 Phase 1 — verify the emitted VDPBF16PS machine code. Run under
         // Intel SDE (`sde64 -spr -- dotnet ... --verify-vdpbf16`) on a non-AVX-512-BF16 host;
         // exits non-zero on a mismatch so a CI step can gate on it.

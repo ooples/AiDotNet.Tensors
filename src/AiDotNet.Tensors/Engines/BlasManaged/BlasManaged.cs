@@ -468,9 +468,10 @@ public static partial class BlasManaged
             case PackingMode.ForcePackAOnly:
                 {
                     // Sub-D D.3 (FP32) + Sub-D2 (FP64): use AVX2 strided-B kernel
-                    // when shape aligns to the tile width.
+                    // when shape aligns to the tile width. Respect PickMicrokernelTile's
+                    // mode-based selection (Fast → 6×8, Deterministic → 4×8 for FP64).
                     //   FP32 — Avx2Fp32_8x8: Mr=8, Nr=8 → requires m%8==0, n%8==0
-                    //   FP64 — Avx2Fp64_4x8: Mr=4, Nr=8 → requires m%4==0, n%8==0
+                    //   FP64 — mode-gated: (6,8) Fast or (4,8) Deterministic → requires m%(6or4)==0, n%8==0
                     int paoMr = 4, paoNr = 4;
                     if (typeof(T) == typeof(float)
                         && Avx2Fp32_8x8.IsSupported
@@ -479,12 +480,22 @@ public static partial class BlasManaged
                         paoMr = 8;
                         paoNr = 8;
                     }
-                    else if (typeof(T) == typeof(double)
-                        && Avx2Fp64_4x8.IsSupported
-                        && m % 4 == 0 && n % 8 == 0)
+                    else if (typeof(T) == typeof(double))
                     {
-                        paoMr = 4;
-                        paoNr = 8;
+                        // Query PickMicrokernelTile to respect Fast/Deterministic mode.
+                        var (tileMr, tileNr) = PickMicrokernelTile<T>();
+                        if (tileMr == 6 && tileNr == 8 && Avx2Fp64_6x8.IsSupported
+                            && m % 6 == 0 && n % 8 == 0)
+                        {
+                            paoMr = 6;
+                            paoNr = 8;
+                        }
+                        else if (Avx2Fp64_4x8.IsSupported
+                            && m % 4 == 0 && n % 8 == 0)
+                        {
+                            paoMr = 4;
+                            paoNr = 8;
+                        }
                     }
                     PackAOnlyStrategy.Run<T>(
                         a, lda, transA,
@@ -836,6 +847,13 @@ public static partial class BlasManaged
         if (typeof(T) == typeof(double))
         {
             if (Avx512Fp64_8x16.IsSupported) return (8, 16);
+            // #409 S.4: the higher-arithmetic-intensity 6×8 FP64 kernel (1.5 FMA/load,
+            // ~82% of peak vs the 4×8's 1.33 / ~75%) is used in FAST (non-deterministic)
+            // mode only — the FP64 analog of the S.3 FP32 6×16 win. Deterministic mode
+            // keeps 4×8 because 6×8's different reduction order (plain K-loop vs the 4×8's
+            // unroll-4) would break the bit-exact invariant the Streaming bypass /
+            // serial-vs-parallel paths assert (acceptable only where Fast mode is set).
+            if (!Helpers.BlasProvider.IsDeterministicMode && Avx2Fp64_6x8.IsSupported) return (6, 8);
             if (Avx2Fp64_4x8.IsSupported) return (4, 8);
             // Neon FP64 uses (4, 4) — same as scalar; DispatchMicrokernel picks the right kernel.
             return (4, 4);
@@ -869,6 +887,14 @@ public static partial class BlasManaged
             && !Avx512Fp32_16x16.IsSupported   // AVX-512 FP32 already uses 16×16 (unchanged)
             && Avx2Fp32_8x8.IsSupported)
             return (8, 8);
+        // #409 S.4: FP64 pre-pack stays on the legacy 4×8 tile regardless of Fast/
+        // Deterministic mode — a pre-packed handle's pack-time and consume-time tiles MUST
+        // agree, and the byte layout + offset math are validated for 4×8. The 6×8 applies
+        // only to the live (non-pre-packed) Fast-mode path.
+        if (typeof(T) == typeof(double)
+            && !Avx512Fp64_8x16.IsSupported   // AVX-512 FP64 already uses 8×16 (unchanged)
+            && Avx2Fp64_4x8.IsSupported)
+            return (4, 8);
         return PickMicrokernelTile<T>();
     }
 }
