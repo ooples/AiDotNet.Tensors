@@ -130,6 +130,7 @@ public class Fp64SixWideTileIntegrationTests
         _out.WriteLine($"  Fast          6×8: {fast6,7:F2} us   {flops / (fast6 * 1e-6) / 1e9,6:F1} GF/s   ({det4 / fast6:F2}x vs 4×8)");
 
         Assert.True(det4 > 0 && fast6 > 0);
+        Assert.True(fast6 <= det4 * 1.05, $"6×8 is slower: {fast6} > {det4}");
     }
 
     private static double[] RandD(int n, Random rng)

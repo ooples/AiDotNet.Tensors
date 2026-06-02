@@ -468,9 +468,10 @@ public static partial class BlasManaged
             case PackingMode.ForcePackAOnly:
                 {
                     // Sub-D D.3 (FP32) + Sub-D2 (FP64): use AVX2 strided-B kernel
-                    // when shape aligns to the tile width.
+                    // when shape aligns to the tile width. Respect PickMicrokernelTile's
+                    // mode-based selection (Fast → 6×8, Deterministic → 4×8 for FP64).
                     //   FP32 — Avx2Fp32_8x8: Mr=8, Nr=8 → requires m%8==0, n%8==0
-                    //   FP64 — Avx2Fp64_4x8: Mr=4, Nr=8 → requires m%4==0, n%8==0
+                    //   FP64 — mode-gated: (6,8) Fast or (4,8) Deterministic → requires m%(6or4)==0, n%8==0
                     int paoMr = 4, paoNr = 4;
                     if (typeof(T) == typeof(float)
                         && Avx2Fp32_8x8.IsSupported
@@ -479,12 +480,22 @@ public static partial class BlasManaged
                         paoMr = 8;
                         paoNr = 8;
                     }
-                    else if (typeof(T) == typeof(double)
-                        && Avx2Fp64_4x8.IsSupported
-                        && m % 4 == 0 && n % 8 == 0)
+                    else if (typeof(T) == typeof(double))
                     {
-                        paoMr = 4;
-                        paoNr = 8;
+                        // Query PickMicrokernelTile to respect Fast/Deterministic mode.
+                        var (tileMr, tileNr) = PickMicrokernelTile<T>();
+                        if (tileMr == 6 && tileNr == 8 && Avx2Fp64_6x8.IsSupported
+                            && m % 6 == 0 && n % 8 == 0)
+                        {
+                            paoMr = 6;
+                            paoNr = 8;
+                        }
+                        else if (Avx2Fp64_4x8.IsSupported
+                            && m % 4 == 0 && n % 8 == 0)
+                        {
+                            paoMr = 4;
+                            paoNr = 8;
+                        }
                     }
                     PackAOnlyStrategy.Run<T>(
                         a, lda, transA,
