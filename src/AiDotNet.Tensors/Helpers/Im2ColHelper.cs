@@ -407,6 +407,103 @@ internal static class Im2ColHelper
     }
 
     /// <summary>
+    /// col2im accumulate (float) restricted to input channels
+    /// <paramref name="channelStart"/>..<paramref name="channelEnd"/>. Each channel
+    /// <c>c</c> scatters into the disjoint image slab <c>imageData[c*H*W .. (c+1)*H*W)</c>,
+    /// reading its rows from the contiguous <c>[colH, colW]</c> source
+    /// (row = <c>(c,kh,kw)</c>, col = <c>(oh,ow)</c>). Distinct channel ranges touch
+    /// disjoint output slabs AND each output element's full <c>+=</c> reduction is
+    /// performed by the single channel-owner in the serial <c>(kh,kw,oh,ow)</c> order,
+    /// so the scatter parallelizes over channels with no synchronization and is
+    /// bit-identical across thread counts (deterministic-safe — same disjoint-write,
+    /// fixed-order-reduction contract as the GEMM M/N-tile splits). The destination
+    /// region for the covered channels must be zero-initialized before calling.
+    /// With <c>channelStart = 0, channelEnd = channels</c> this is identical to
+    /// <see cref="Col2ImAccumulate(ReadOnlySpan{float}, Span{float}, int, int, int, int, int, int, int, int, int, int, int, int)"/>.
+    /// </summary>
+    public static void Col2ImAccumulateChannelRange(
+        ReadOnlySpan<float> colData,
+        Span<float> imageData,
+        int channelStart, int channelEnd,
+        int height, int width,
+        int kernelH, int kernelW,
+        int strideH, int strideW,
+        int padH, int padW,
+        int dilationH, int dilationW,
+        int outputH, int outputW)
+    {
+        int colW = outputH * outputW;
+        int kHW = kernelH * kernelW;
+        int colIdx = channelStart * kHW * colW;
+        for (int c = channelStart; c < channelEnd; c++)
+        {
+            int channelBase = c * height * width;
+            for (int kh = 0; kh < kernelH; kh++)
+            {
+                for (int kw = 0; kw < kernelW; kw++)
+                {
+                    for (int oh = 0; oh < outputH; oh++)
+                    {
+                        int ih = oh * strideH + kh * dilationH - padH;
+                        for (int ow = 0; ow < outputW; ow++)
+                        {
+                            int iw = ow * strideW + kw * dilationW - padW;
+                            if (ih >= 0 && ih < height && iw >= 0 && iw < width)
+                            {
+                                imageData[channelBase + ih * width + iw] += colData[colIdx];
+                            }
+                            colIdx++;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Double-precision counterpart of
+    /// <see cref="Col2ImAccumulateChannelRange(ReadOnlySpan{float}, Span{float}, int, int, int, int, int, int, int, int, int, int, int, int, int, int)"/>.
+    /// </summary>
+    public static void Col2ImAccumulateChannelRange(
+        ReadOnlySpan<double> colData,
+        Span<double> imageData,
+        int channelStart, int channelEnd,
+        int height, int width,
+        int kernelH, int kernelW,
+        int strideH, int strideW,
+        int padH, int padW,
+        int dilationH, int dilationW,
+        int outputH, int outputW)
+    {
+        int colW = outputH * outputW;
+        int kHW = kernelH * kernelW;
+        int colIdx = channelStart * kHW * colW;
+        for (int c = channelStart; c < channelEnd; c++)
+        {
+            int channelBase = c * height * width;
+            for (int kh = 0; kh < kernelH; kh++)
+            {
+                for (int kw = 0; kw < kernelW; kw++)
+                {
+                    for (int oh = 0; oh < outputH; oh++)
+                    {
+                        int ih = oh * strideH + kh * dilationH - padH;
+                        for (int ow = 0; ow < outputW; ow++)
+                        {
+                            int iw = ow * strideW + kw * dilationW - padW;
+                            if (ih >= 0 && ih < height && iw >= 0 && iw < width)
+                            {
+                                imageData[channelBase + ih * width + iw] += colData[colIdx];
+                            }
+                            colIdx++;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// <summary>
     /// col2im: inverse of im2col. Accumulates column matrix values back into a spatial
     /// image buffer. Multiple column entries can map to the same spatial position (due to
     /// overlapping receptive fields), so values are ADDED (not overwritten). The output
