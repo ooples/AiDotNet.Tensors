@@ -23,7 +23,7 @@ internal static class OneDnnProvider
     private static IntPtr _engine;
     private static IntPtr _stream;
     private static readonly bool TraceEnabled = ReadEnvBool("AIDOTNET_ONEDNN_TRACE");
-    private static bool _resolverRegistered;
+    private static bool _resolverRegistered;
 
     // Primitive cache for avoiding recreation overhead
     private static readonly ConcurrentDictionary<Conv2DKey, CachedConv2D> _conv2DCache = new();
@@ -661,6 +661,21 @@ internal static class OneDnnProvider
         uint flags,
         IntPtr attr);
 
+    // oneDNN's stand-alone GEMM C API (dnnl_sgemm). JIT-compiles a shape-
+    // specialized brgemm microkernel for the exact (M,N,K)/ISA — the same
+    // mechanism MKL uses to beat a generic kernel on small-K/N shapes. oneDNN's
+    // dnnl_sgemm interprets A/B/C as ROW-MAJOR (documented difference from
+    // column-major cblas), which matches our Tensor<float> storage directly.
+    // Signature: dnnl_status_t dnnl_sgemm(char transa, char transb,
+    //   dnnl_dim_t M, N, K, float alpha, const float* A, dnnl_dim_t lda,
+    //   const float* B, dnnl_dim_t ldb, float beta, float* C, dnnl_dim_t ldc);
+    [DllImport("dnnl", CallingConvention = CallingConvention.Cdecl)]
+    private static extern unsafe int dnnl_sgemm(
+        byte transa, byte transb,
+        long M, long N, long K, float alpha,
+        float* A, long lda, float* B, long ldb,
+        float beta, float* C, long ldc);
+
     // Pooling algorithm constants
     private const int DnnlPoolingAvgIncludePadding = 0x200;
     private const int DnnlPoolingAvgExcludePadding = 0x201;
@@ -816,7 +831,7 @@ internal static class OneDnnProvider
 
             if (logThis)
             {
-                Console.WriteLine("[oneDNN] Conv2D completed successfully");
+                Console.WriteLine("[oneDNN] Conv2D completed successfully");
             }
             return true;
         }
@@ -824,7 +839,7 @@ internal static class OneDnnProvider
         {
             if (logThis)
             {
-                Console.WriteLine($"[oneDNN] Conv2D exception: {ex.Message}");
+                Console.WriteLine($"[oneDNN] Conv2D exception: {ex.Message}");
             }
             return false;
         }
@@ -839,6 +854,23 @@ internal static class OneDnnProvider
     internal static unsafe bool TryReLU(float* data, int length)
     {
         return TryEltwiseInPlace(data, length, DnnlEltwiseRelu);
+    }
+
+    /// <summary>
+    /// Row-major single-precision GEMM via oneDNN's JIT'd kernel:
+    /// C[M,N] = A[M,K] · B[K,N] (no transpose, alpha=1, beta=0). Returns false
+    /// (no mutation) if oneDNN is unavailable so the caller can fall back to the
+    /// managed kernel. oneDNN JIT-compiles a brgemm microkernel specialized for
+    /// the exact shape/ISA — the head-to-head reference for "can a shape-
+    /// specialized kernel close the managed-AVX2 GFLOP/s gap on small-K/N?".
+    /// </summary>
+    internal static unsafe bool TrySgemm(float* a, float* b, float* c, int m, int k, int n)
+    {
+        if (!EnsureInitialized())
+            return false;
+        const byte N = (byte)'N';
+        int status = dnnl_sgemm(N, N, m, n, k, 1.0f, a, k, b, n, 0.0f, c, n);
+        return status == DnnlSuccess;
     }
 
     /// <summary>

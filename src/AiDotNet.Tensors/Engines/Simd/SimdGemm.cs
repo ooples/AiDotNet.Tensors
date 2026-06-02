@@ -98,6 +98,13 @@ internal static partial class SimdGemm
     // Intended for benchmark A/B iteration, not production config.
     internal static bool UseParallelGemm = true;
 
+    // Opt-in (AIDOTNET_ONEDNN_GEMM=1): route large no-transpose float GEMMs through
+    // oneDNN's JIT'd dnnl_sgemm (shape-specialized brgemm, 5-8× the managed kernel
+    // on small-K/N). Default OFF — managed kernel keeps the supply-chain-independent
+    // path. See the head-to-head in OneDnnProvider.TrySgemm.
+    private static readonly bool _oneDnnGemm =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_ONEDNN_GEMM") == "1";
+
 #if NET5_0_OR_GREATER
     // ─── Path A: pre-packed B cache ────────────────────────────────────────
     //
@@ -970,6 +977,24 @@ internal static partial class SimdGemm
         Span<float> c,
         int m, int k, int n)
     {
+#if !NET471
+        // oneDNN JIT'd GEMM (opt-in). Catches the fused-MHA QKV + output-projection
+        // GEMMs (no transpose, row-major contiguous: lda==k, ldb==n) where oneDNN's
+        // brgemm is 5-8× the managed kernel. Size-gated; the tiny per-head SDPA uses
+        // SgemmSequential (separate entry) so it stays on the managed path.
+        if (_oneDnnGemm && !transA && !transB && lda == k && ldb == n
+            && (long)m * k * n >= 262_144)
+        {
+            unsafe
+            {
+                fixed (float* pa = a, pb = b, pc = c)
+                {
+                    if (Helpers.OneDnnProvider.TrySgemm(pa, pb, pc, m, k, n))
+                        return;
+                }
+            }
+        }
+#endif
         c.Clear();
         SgemmAddInternal(a, lda, transA, b, ldb, transB, c, m, k, n, allowParallel: true, clearedOutput: true);
     }

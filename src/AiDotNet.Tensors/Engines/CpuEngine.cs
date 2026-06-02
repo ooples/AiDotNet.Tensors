@@ -11738,6 +11738,13 @@ public partial class CpuEngine : ITensorLevelEngine
         int.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_CACHEDB_MAXM"), out var cbm) && cbm >= 0
             ? cbm : 1024;
 
+    // Opt-in head-to-head (AIDOTNET_ONEDNN_GEMM=1): route float 2D matmul through
+    // oneDNN's JIT'd dnnl_sgemm (shape-specialized brgemm microkernel, the MKL-
+    // class reference) instead of the managed SimdGemm kernel. Lets us measure
+    // how far a JIT'd kernel closes the small-K/N GFLOP/s gap. Default OFF.
+    private static readonly bool _oneDnnGemm =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_ONEDNN_GEMM") == "1";
+
     /// <summary>
     /// Standard 2D matrix multiplication: [M, N] @ [N, P] = [M, P]
     /// Uses BLAS when available for float/double, falls back to parallel loops otherwise.
@@ -11809,6 +11816,26 @@ public partial class CpuEngine : ITensorLevelEngine
         // worker-pool wakeup overhead. Above the cutover (large M) native BLAS's raw
         // throughput wins, so keep TryGemm there. Numerically equivalent to the native
         // path (float reduction-order only). M-cutover env-tunable (AIDOTNET_CACHEDB_MAXM).
+#if !NET471
+        // oneDNN JIT'd GEMM head-to-head (opt-in). C[m,p] = A[m,n]·B[n,p], row-major
+        // ⇒ TrySgemm(M=m, K=n, N=p). Falls through to the managed kernel if oneDNN
+        // is unavailable (TrySgemm returns false without mutating C).
+        if (_oneDnnGemm && typeof(T) == typeof(float) && a.IsContiguous && b.IsContiguous)
+        {
+            var aArrO = (float[])(object)a.GetDataArray();
+            var bArrO = (float[])(object)b.GetDataArray();
+            var rArrO = (float[])(object)result.GetDataArray();
+            unsafe
+            {
+                fixed (float* pA = aArrO, pB = bArrO, pC = rArrO)
+                {
+                    if (OneDnnProvider.TrySgemm(pA, pB, pC, m, n, p))
+                        return result;
+                }
+            }
+        }
+#endif
+
         if (typeof(T) == typeof(float) && a.IsContiguous && b.IsContiguous
             && m <= _cachedBMaxM)
         {
@@ -34583,6 +34610,26 @@ public partial class CpuEngine : ITensorLevelEngine
                 var outArr = (float[])(object)result.GetDataArray();
 
                 bool blasDone = false;
+
+#if !NET471
+                // Tier -2 (opt-in, AIDOTNET_ONEDNN_GEMM=1): oneDNN JIT'd dnnl_sgemm.
+                // The fused-linear (FFN) GEMM is exactly the small-K/N shape where
+                // oneDNN's shape-specialized brgemm hits 540+ GFLOP/s vs ~70-110 for
+                // the managed kernel (head-to-head measured). Bias+activation still
+                // run in the shared SIMD epilogue below. Size-gated so tiny GEMMs
+                // (where oneDNN's per-call dispatch loses) stay on the managed path.
+                if (!blasDone && _oneDnnGemm && (long)M * K * N >= 262_144)
+                {
+                    unsafe
+                    {
+                        fixed (float* pIn = inArr, pW = wArr, pOut = outArr)
+                        {
+                            if (OneDnnProvider.TrySgemm(pIn, pW, pOut, M, K, N))
+                                blasDone = true;
+                        }
+                    }
+                }
+#endif
 
                 // Phase 1 (compiled-inference): for small/medium inference GEMMs the
                 // managed cached-B path wins 1.3-2.8x over native BLAS + pinned copy —
