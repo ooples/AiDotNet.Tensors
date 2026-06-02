@@ -293,6 +293,33 @@ class Program
             Environment.Exit(MicrokernelGflopsBench.VerifyBf16Gemm() ? 0 : 1);
         }
 
+        // #380 AMX Phase 1 — verify a single tdpbf16ps tile op. Run under Intel SDE
+        // (`sde -spr -- dotnet ... --verify-amx-tile`); exits non-zero on a mismatch.
+        if (args[0] == "--verify-amx-tile")
+        {
+            Environment.Exit(MicrokernelGflopsBench.VerifyAmxTile() ? 0 : 1);
+        }
+
+        // #380 AMX Phase 2 — verify the full tiled AMX GEMM (ragged tiling + K accumulation).
+        // Run under Intel SDE; exits non-zero on a mismatch.
+        if (args[0] == "--verify-amx-gemm")
+        {
+            Environment.Exit(MicrokernelGflopsBench.VerifyAmxGemm() ? 0 : 1);
+        }
+
+        // #380 AMX INT8 — verify a single tdpbssd (int8→int32) tile op. Run under Intel SDE.
+        if (args[0] == "--verify-amx-int8")
+        {
+            Environment.Exit(MicrokernelGflopsBench.VerifyAmxInt8Tile() ? 0 : 1);
+        }
+
+        // #380 AMX detection — read CPUID.(7,0):EDX AMX bits via emitted machine code. Under
+        // `sde -spr` all AMX bits are set (exit 0); on a bare non-AMX host they aren't (exit 1).
+        if (args[0] == "--verify-amx-cpuid")
+        {
+            Environment.Exit(MicrokernelGflopsBench.VerifyAmxCpuid() ? 0 : 1);
+        }
+
 #if !NET462
         // Run cuBLAS vs DirectGpu GEMM benchmark
         if (args[0] == "--cublas")
