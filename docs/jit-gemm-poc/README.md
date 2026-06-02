@@ -23,3 +23,19 @@ Correct (maxErr ~1e-6). 3-base-pointer trick for the 6 strided A rows
 (rows 0/2/4 in RCX/RBX/RSI + index RAX=lda*4). This is the small-K hot path.
 Next: wire into CpuEngine via PersistentParallelExecutor + edge kernels +
 shape->kernel JIT cache, then the 16-shape end-to-end benchmark.
+
+## Phase 2 integration (JitGemmAvx2 wired into dispatch) — end-to-end result
+
+JitGemmAvx2 (emit-once unpacked kernel + PPE-parallel driver w/ serial-small
+fallback + managed M%6/N%16 edges) wired into SimdGemm.Sgemm, FusedLinear,
+TensorMatMul2D (AIDOTNET_JIT_GEMM=1, default OFF). 16-shape bench, min-of-6:
+- MLP b8 -38%, b32/b128 ~-2-3%  (clean big GEMMs -> JIT wins)
+- CNN/LSTM ~neutral
+- transformer REGRESSES (b8 +30%, b1 +24%): the per-6x16-tile prologue (10 XMM
+  save/restore) is paid per tile; the transformer's many-small-tile GEMMs (b8
+  QKV = 504 tiles) pay it 504x while the managed kernel pays 0.
+- net 5/16 (== baseline). Off-by-default, no shipped regression.
+
+NEXT (the transformer win): macro-kernel — prologue once per row-panel, loop the
+N/16 col-blocks internally (amortizes the 10-XMM save/restore ~12x). Then the
+kernel's isolated 600-700 GFLOP/s should translate to the transformer end-to-end.

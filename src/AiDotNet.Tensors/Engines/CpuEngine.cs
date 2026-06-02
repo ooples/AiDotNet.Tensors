@@ -11745,6 +11745,12 @@ public partial class CpuEngine : ITensorLevelEngine
     private static readonly bool _oneDnnGemm =
         System.Environment.GetEnvironmentVariable("AIDOTNET_ONEDNN_GEMM") == "1";
 
+    // Opt-in (AIDOTNET_JIT_GEMM=1): route float matmul through the runtime-JIT'd
+    // AVX2 kernel (Simd.JitGemmAvx2) — beats managed + oneDNN on small-K/N, on our
+    // own thread pool (no oversubscription). Default OFF.
+    private static readonly bool _jitGemm =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_JIT_GEMM") == "1";
+
     /// <summary>
     /// Standard 2D matrix multiplication: [M, N] @ [N, P] = [M, P]
     /// Uses BLAS when available for float/double, falls back to parallel loops otherwise.
@@ -11817,6 +11823,16 @@ public partial class CpuEngine : ITensorLevelEngine
         // throughput wins, so keep TryGemm there. Numerically equivalent to the native
         // path (float reduction-order only). M-cutover env-tunable (AIDOTNET_CACHEDB_MAXM).
 #if !NET471
+        // Our JIT'd AVX2 GEMM (opt-in). C[m,p] = A[m,n]·B[n,p] ⇒ TryMultiply(M=m,N=p,K=n).
+        if (_jitGemm && typeof(T) == typeof(float) && a.IsContiguous && b.IsContiguous)
+        {
+            var aJ = (float[])(object)a.GetDataArray();
+            var bJ = (float[])(object)b.GetDataArray();
+            var rJ = (float[])(object)result.GetDataArray();
+            if (Simd.JitGemmAvx2.TryMultiply(aJ.AsSpan(0, m * n), bJ.AsSpan(0, n * p), rJ.AsSpan(0, m * p), m, p, n))
+                return result;
+        }
+
         // oneDNN JIT'd GEMM head-to-head (opt-in). C[m,p] = A[m,n]·B[n,p], row-major
         // ⇒ TrySgemm(M=m, K=n, N=p). Falls through to the managed kernel if oneDNN
         // is unavailable (TrySgemm returns false without mutating C).
@@ -34612,6 +34628,13 @@ public partial class CpuEngine : ITensorLevelEngine
                 bool blasDone = false;
 
 #if !NET471
+                // Tier -3 (opt-in, AIDOTNET_JIT_GEMM=1): our runtime-JIT'd AVX2 kernel.
+                // Beats managed + oneDNN on the small-K/N FFN shape, on our own pool.
+                // Bias+activation still run in the shared SIMD epilogue below.
+                if (!blasDone && _jitGemm
+                    && Simd.JitGemmAvx2.TryMultiply(inArr.AsSpan(0, M * K), wArr.AsSpan(0, K * N), outArr.AsSpan(0, M * N), M, N, K))
+                    blasDone = true;
+
                 // Tier -2 (opt-in, AIDOTNET_ONEDNN_GEMM=1): oneDNN JIT'd dnnl_sgemm.
                 // The fused-linear (FFN) GEMM is exactly the small-K/N shape where
                 // oneDNN's shape-specialized brgemm hits 540+ GFLOP/s vs ~70-110 for

@@ -105,6 +105,12 @@ internal static partial class SimdGemm
     private static readonly bool _oneDnnGemm =
         System.Environment.GetEnvironmentVariable("AIDOTNET_ONEDNN_GEMM") == "1";
 
+    // Opt-in (AIDOTNET_JIT_GEMM=1): route large no-transpose float GEMMs through
+    // the runtime-JIT'd AVX2 kernel (JitGemmAvx2) — 600-700 GFLOP/s on small-K/N,
+    // beats both the managed kernel and oneDNN, on our own pool. Default OFF.
+    private static readonly bool _jitGemm =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_JIT_GEMM") == "1";
+
 #if NET5_0_OR_GREATER
     // ─── Path A: pre-packed B cache ────────────────────────────────────────
     //
@@ -978,6 +984,12 @@ internal static partial class SimdGemm
         int m, int k, int n)
     {
 #if !NET471
+        // Our JIT'd AVX2 kernel first (opt-in): no transpose, row-major contiguous
+        // (lda==k, ldb==n). Beats managed + oneDNN on small-K/N, on our own pool.
+        if (_jitGemm && !transA && !transB && lda == k && ldb == n
+            && JitGemmAvx2.TryMultiply(a, b, c, m, n, k))
+            return;
+
         // oneDNN JIT'd GEMM (opt-in). Catches the fused-MHA QKV + output-projection
         // GEMMs (no transpose, row-major contiguous: lda==k, ldb==n) where oneDNN's
         // brgemm is 5-8× the managed kernel. Size-gated; the tiny per-head SDPA uses
