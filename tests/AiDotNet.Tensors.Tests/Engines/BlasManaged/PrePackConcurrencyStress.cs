@@ -16,7 +16,20 @@ namespace AiDotNet.Tensors.Tests.Engines.BlasManaged;
 /// do). If a production race exists in the shared allocator / packed-buffer path,
 /// this should surface it locally; if it stays bit-exact under heavy stress, the CI
 /// flake is environment-specific cross-test contamination (→ test isolation).
+///
+/// Outcome: the pack path stays bit-exact under this stress, so there is NO
+/// production race — the CI flake was cross-test contamination. This test's own
+/// background agitator (below) continuously flips the process-global
+/// <see cref="CpuParallelSettings.DeterministicReductions"/> /
+/// <see cref="CpuParallelSettings.MaxDegreeOfParallelism"/>; running un-serialized it
+/// drifted the deterministic GEMMs of CONCURRENT tests (PrePackedB_Output_BitMatches_LivePack,
+/// the ScalarKernel cached-packed-buffer tests) mid-computation. It belongs in the
+/// "every test that mutates process-wide GEMM global state" serial collection — it
+/// was simply missing the attribute. Membership serializes it against those tests so
+/// its agitation can no longer corrupt them; its OWN internal concurrency stress
+/// (8-thread Parallel.For) is unaffected.
 /// </summary>
+[Collection("BlasManaged-Stats-Serial")]
 [Trait("Category", "Performance")] // heavy (19k ops); a concurrency regression guard
 public class PrePackConcurrencyStress
 {
@@ -33,6 +46,13 @@ public class PrePackConcurrencyStress
         double worstDrift = 0;
         var sync = new object();
 
+        // Snapshot the global settings the agitator mutates so they are always
+        // restored — even if the Parallel.For below throws. Leaking a running
+        // agitator (or a flipped global) into the next test in this serial
+        // collection is exactly the contamination this collection exists to prevent.
+        bool savedDeterministic = CpuParallelSettings.DeterministicReductions;
+        int savedMaxDop = CpuParallelSettings.MaxDegreeOfParallelism;
+
         // A background agitator that flips the global parallel settings the way the
         // ParallelFor / DeterministicReductions tests do — to mimic cross-test churn.
         using var stop = new CancellationTokenSource();
@@ -47,39 +67,44 @@ public class PrePackConcurrencyStress
             }
         });
 
-        Parallel.For(0, threads, t =>
+        try
         {
-            var rng = new Random(1234 + t);
-            var a = new float[m * k];
-            var b = new float[k * n];
-            for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() * 2 - 1);
-            for (int i = 0; i < b.Length; i++) b[i] = (float)(rng.NextDouble() * 2 - 1);
-            var cLive = new float[m * n];
-            var cPre = new float[m * n];
-
-            for (int it = 0; it < itersPerThread; it++)
+            Parallel.For(0, threads, t =>
             {
-                BlasManagedLib.Gemm<float>(a, k, false, b, n, false, cLive, n, m, n, k);
-                var handle = BlasManagedLib.PrePackB<float>(b, n, false, k, n);
-                try
+                var rng = new Random(1234 + t);
+                var a = new float[m * k];
+                var b = new float[k * n];
+                for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() * 2 - 1);
+                for (int i = 0; i < b.Length; i++) b[i] = (float)(rng.NextDouble() * 2 - 1);
+                var cLive = new float[m * n];
+                var cPre = new float[m * n];
+
+                for (int it = 0; it < itersPerThread; it++)
                 {
-                    var opts = new BlasOptions<float> { PackedB = handle };
-                    BlasManagedLib.Gemm<float>(a, k, false, b, n, false, cPre, n, m, n, k, opts);
+                    BlasManagedLib.Gemm<float>(a, k, false, b, n, false, cLive, n, m, n, k);
+                    var handle = BlasManagedLib.PrePackB<float>(b, n, false, k, n);
+                    try
+                    {
+                        var opts = new BlasOptions<float> { PackedB = handle };
+                        BlasManagedLib.Gemm<float>(a, k, false, b, n, false, cPre, n, m, n, k, opts);
+                    }
+                    finally { handle.Dispose(); }
+
+                    double drift = 0;
+                    for (int i = 0; i < cLive.Length; i++)
+                        drift = Math.Max(drift, Math.Abs((double)cLive[i] - cPre[i]));
+                    if (drift > 1e-3)
+                        lock (sync) { failures++; worstDrift = Math.Max(worstDrift, drift); }
                 }
-                finally { handle.Dispose(); }
-
-                double drift = 0;
-                for (int i = 0; i < cLive.Length; i++)
-                    drift = Math.Max(drift, Math.Abs((double)cLive[i] - cPre[i]));
-                if (drift > 1e-3)
-                    lock (sync) { failures++; worstDrift = Math.Max(worstDrift, drift); }
-            }
-        });
-
-        stop.Cancel();
-        agitator.Wait();
-        CpuParallelSettings.DeterministicReductions = false;
-        CpuParallelSettings.MaxDegreeOfParallelism = Environment.ProcessorCount;
+            });
+        }
+        finally
+        {
+            stop.Cancel();
+            agitator.Wait();
+            CpuParallelSettings.DeterministicReductions = savedDeterministic;
+            CpuParallelSettings.MaxDegreeOfParallelism = savedMaxDop;
+        }
 
         _output.WriteLine($"threads={threads} iters/thread={itersPerThread} failures={failures} worstDrift={worstDrift:G6}");
         Assert.True(failures == 0,
