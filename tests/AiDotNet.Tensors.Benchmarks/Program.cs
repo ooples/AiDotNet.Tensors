@@ -291,6 +291,13 @@ class Program
             Environment.Exit(MicrokernelGflopsBench.VerifyAmxTile() ? 0 : 1);
         }
 
+        // #380 AMX Phase 2 — verify the full tiled AMX GEMM (ragged tiling + K accumulation).
+        // Run under Intel SDE; exits non-zero on a mismatch.
+        if (args[0] == "--verify-amx-gemm")
+        {
+            Environment.Exit(MicrokernelGflopsBench.VerifyAmxGemm() ? 0 : 1);
+        }
+
 #if !NET462
         // Run cuBLAS vs DirectGpu GEMM benchmark
         if (args[0] == "--cublas")

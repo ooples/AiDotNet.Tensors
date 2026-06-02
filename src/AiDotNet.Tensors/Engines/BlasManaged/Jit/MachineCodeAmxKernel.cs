@@ -133,5 +133,100 @@ internal static class MachineCodeAmxKernel
             fn(ap, bp, cp, cfgp);
         return true;
     }
+
+    // ── Phase 2: full tiled AMX BF16 GEMM ──────────────────────────────────────
+
+    /// <summary>
+    /// Emit <c>void tileMac(ushort* aTile, ushort* bTile, float* cTile, byte* cfg)</c>: a single
+    /// accumulating tile op — load the current C tile (tmm2), the A tile (tmm0) and the VNNI B
+    /// tile (tmm1), run <c>C += A·B</c>, and store C back. The driver clears <c>cTile</c> before a
+    /// K-tile sweep and calls this once per K-tile, so accumulation happens in the C buffer via
+    /// the load-accumulate-store roundtrip (HW FP32 accumulate inside the tile).
+    /// </summary>
+    internal static byte[] EmitTileMacWindows()
+    {
+        var asm = new X64Assembler();
+        asm.Ldtilecfg(R9);              // cfg → r9 (4th arg)
+        asm.MovRegImm32(RAX, RowBytes); // rax = 64
+        asm.TileloadD(2, R8, RAX);      // tmm2 = current C partial   (r8 = cTile)
+        asm.TileloadD(0, RCX, RAX);     // tmm0 = A
+        asm.TileloadD(1, RDX, RAX);     // tmm1 = B (VNNI)
+        asm.Tdpbf16ps(2, /*vvvv=B*/1, /*rm=A*/0); // tmm2 += A · B
+        asm.Tilestored(R8, RAX, 2);     // cTile = tmm2
+        asm.Tilerelease();
+        asm.Ret();
+        return asm.ToArray();
+    }
+
+    /// <summary>
+    /// Tiled AMX BF16 GEMM: <c>C[m,n] = Σ_k A[m,k]·B[k,n]</c> with A (M×K) and B (K×N) as raw BF16
+    /// bit patterns, row-major, and C (M×N) accumulated in FP32. Tiles M by 16, N by 16, K by 32;
+    /// packs each A sub-tile row-major and each B sub-tile into the AMX row-pair VNNI layout,
+    /// zero-padding ragged M/K/N edges (BF16 0x0000 = +0.0). Returns false only if executable
+    /// memory is unavailable. MUST run under Intel SDE on hosts lacking AMX.
+    /// </summary>
+    internal static unsafe bool TryGemm(
+        ReadOnlySpan<ushort> a, ReadOnlySpan<ushort> b, Span<float> c, int m, int k, int n)
+    {
+        if (m <= 0 || k <= 0 || n <= 0) return true;
+        if (a.Length < (long)m * k || b.Length < (long)k * n || c.Length < (long)m * n)
+            throw new ArgumentException("AMX GEMM: a/b/c spans smaller than M·K / K·N / M·N.");
+
+        byte[] code = EmitTileMacWindows();
+        byte[] cfg = BuildTileConfig((TileM, TileK * 2), (TileM, TileN * 4), (TileM, TileN * 4));
+        using var mem = ExecutableMemory.TryAllocate(code);
+        if (mem is null || mem.Pointer == IntPtr.Zero) return false;
+        var fn = (delegate* unmanaged<ushort*, ushort*, float*, byte*, void>)mem.Pointer;
+
+        var aTile = new ushort[TileM * TileK];        // 16×32 BF16
+        var bTile = new ushort[(TileK / 2) * (TileN * 2)]; // 16×32 BF16 (VNNI)
+        var cTile = new float[TileM * TileN];         // 16×16 FP32
+
+        fixed (ushort* atp = aTile)
+        fixed (ushort* btp = bTile)
+        fixed (float* ctp = cTile)
+        fixed (byte* cfgp = cfg)
+        {
+            for (int m0 = 0; m0 < m; m0 += TileM)
+            {
+                int mRows = Math.Min(TileM, m - m0);
+                for (int n0 = 0; n0 < n; n0 += TileN)
+                {
+                    int nCols = Math.Min(TileN, n - n0);
+                    Array.Clear(cTile, 0, cTile.Length);
+
+                    for (int k0 = 0; k0 < k; k0 += TileK)
+                    {
+                        int kCols = Math.Min(TileK, k - k0);
+
+                        // Pack A sub-tile: [mRows][kCols] row-major, zero-padded to 16×32.
+                        Array.Clear(aTile, 0, aTile.Length);
+                        for (int mr = 0; mr < mRows; mr++)
+                            for (int kr = 0; kr < kCols; kr++)
+                                aTile[mr * TileK + kr] = a[(m0 + mr) * k + k0 + kr];
+
+                        // Pack B sub-tile (VNNI): row r holds {B[k0+2r,n], B[k0+2r+1,n]} over n.
+                        Array.Clear(bTile, 0, bTile.Length);
+                        for (int r = 0; r < TileK / 2; r++)
+                        {
+                            int kk0 = 2 * r, kk1 = kk0 + 1;
+                            for (int nc = 0; nc < nCols; nc++)
+                            {
+                                if (kk0 < kCols) bTile[r * (TileN * 2) + 2 * nc] = b[(k0 + kk0) * n + n0 + nc];
+                                if (kk1 < kCols) bTile[r * (TileN * 2) + 2 * nc + 1] = b[(k0 + kk1) * n + n0 + nc];
+                            }
+                        }
+
+                        fn(atp, btp, ctp, cfgp); // cTile += aTile · bTile
+                    }
+
+                    for (int mr = 0; mr < mRows; mr++)
+                        for (int nc = 0; nc < nCols; nc++)
+                            c[(m0 + mr) * n + n0 + nc] = cTile[mr * TileN + nc];
+                }
+            }
+        }
+        return true;
+    }
 }
 #endif

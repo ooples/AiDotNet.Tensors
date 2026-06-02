@@ -442,6 +442,52 @@ public static class MicrokernelGflopsBench
         return pass;
     }
 
+    // #380 AMX Phase 2: verify the full tiled AMX GEMM. Shape M=20,K=40,N=24 is ragged in all
+    // three dims (16+4 / 32+8 / 16+8) so it exercises M/K/N tiling + zero-padded edges and K
+    // accumulation across tiles. Run UNDER INTEL SDE (-spr). Returns false on mismatch.
+    public static bool VerifyAmxGemm()
+    {
+        Console.WriteLine("=== AMX tiled BF16 GEMM (ragged tiling + K accumulation) ===");
+        const int M = 20, K = 40, N = 24;
+        var rng = new Random(41);
+        var a = new ushort[M * K];
+        var b = new ushort[K * N];
+        for (int i = 0; i < a.Length; i++) a[i] = FloatToBf16((float)(rng.NextDouble() * 2 - 1));
+        for (int i = 0; i < b.Length; i++) b[i] = FloatToBf16((float)(rng.NextDouble() * 2 - 1));
+        var c = new float[M * N];
+
+        bool ran;
+        try
+        {
+            ran = AiDotNet.Tensors.Engines.BlasManaged.Jit.MachineCodeAmxKernel.TryGemm(a, b, c, M, K, N);
+        }
+        catch (Exception e)
+        {
+            Console.WriteLine("  GEMM threw (likely #UD — not under SDE, or bad encoding): " + e.Message);
+            return false;
+        }
+        if (!ran)
+        {
+            Console.WriteLine("  executable memory unavailable — cannot verify");
+            return false;
+        }
+
+        bool pass = true;
+        int bad = 0;
+        for (int i = 0; i < M; i++)
+            for (int j = 0; j < N; j++)
+            {
+                double truth = 0;
+                for (int kk = 0; kk < K; kk++)
+                    truth += (double)Bf16ToFloat(a[i * K + kk]) * Bf16ToFloat(b[kk * N + j]);
+                double got = c[i * N + j];
+                bool ok = Math.Abs(got - truth) <= 2e-3 * Math.Max(1.0, Math.Abs(truth));
+                if (!ok) { pass = false; if (bad++ < 6) Console.WriteLine($"  C[{i},{j}] got {got:G6} exp {truth:G6} FAIL"); }
+            }
+        Console.WriteLine(pass ? $"AMX GEMM VERIFIED ({M}x{K}x{N}, all {M * N} elements)" : "AMX GEMM FAILED");
+        return pass;
+    }
+
     private static ushort FloatToBf16(float f) => (ushort)(BitConverter.SingleToUInt32Bits(f) >> 16);
     private static float Bf16ToFloat(ushort h) => BitConverter.UInt32BitsToSingle((uint)h << 16);
 }
