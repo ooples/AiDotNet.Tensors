@@ -284,6 +284,13 @@ class Program
             Environment.Exit(MicrokernelGflopsBench.VerifyBf16Gemm() ? 0 : 1);
         }
 
+        // #380 AMX Phase 1 — verify a single tdpbf16ps tile op. Run under Intel SDE
+        // (`sde -spr -- dotnet ... --verify-amx-tile`); exits non-zero on a mismatch.
+        if (args[0] == "--verify-amx-tile")
+        {
+            Environment.Exit(MicrokernelGflopsBench.VerifyAmxTile() ? 0 : 1);
+        }
+
 #if !NET462
         // Run cuBLAS vs DirectGpu GEMM benchmark
         if (args[0] == "--cublas")

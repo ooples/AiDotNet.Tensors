@@ -385,6 +385,63 @@ public static class MicrokernelGflopsBench
         return pass;
     }
 
+    // #380 AMX Phase 1: verify a single tdpbf16ps tile op — C[16,16] += A[16,32]·B[16,16] in FP32,
+    // B in the AMX row-pair VNNI layout. Run UNDER INTEL SDE (-spr) on a non-AMX host (the tile
+    // instructions are emulated). Returns false on mismatch / no executable memory.
+    public static bool VerifyAmxTile()
+    {
+        Console.WriteLine("=== AMX tdpbf16ps tile op (C16x16 += A16x32 . B16x16, VNNI) ===");
+        const int M = 16, K = 32, N = 16;
+
+        var rng = new Random(31);
+        // Logical A[M,K] and B[K,N] as BF16.
+        var a = new ushort[M * K];
+        var bLogical = new ushort[K * N];
+        for (int i = 0; i < a.Length; i++) a[i] = FloatToBf16((float)(rng.NextDouble() * 2 - 1));
+        for (int i = 0; i < bLogical.Length; i++) bLogical[i] = FloatToBf16((float)(rng.NextDouble() * 2 - 1));
+
+        // Pack B into the AMX VNNI layout: row r (0..K/2-1) = {B[2r,n], B[2r+1,n]} over n.
+        var bVnni = new ushort[(K / 2) * (N * 2)];
+        for (int r = 0; r < K / 2; r++)
+            for (int n = 0; n < N; n++)
+            {
+                bVnni[r * (N * 2) + 2 * n] = bLogical[(2 * r) * N + n];
+                bVnni[r * (N * 2) + 2 * n + 1] = bLogical[(2 * r + 1) * N + n];
+            }
+
+        var c = new float[M * N];
+        bool ran;
+        try
+        {
+            ran = AiDotNet.Tensors.Engines.BlasManaged.Jit.MachineCodeAmxKernel.TryRunTileProbe(a, bVnni, c);
+        }
+        catch (Exception e)
+        {
+            Console.WriteLine("  tile op threw (likely #UD — not under SDE, or bad encoding): " + e.Message);
+            return false;
+        }
+        if (!ran)
+        {
+            Console.WriteLine("  executable memory unavailable — cannot verify");
+            return false;
+        }
+
+        bool pass = true;
+        int bad = 0;
+        for (int i = 0; i < M; i++)
+            for (int j = 0; j < N; j++)
+            {
+                double truth = 0;
+                for (int kk = 0; kk < K; kk++)
+                    truth += (double)Bf16ToFloat(a[i * K + kk]) * Bf16ToFloat(bLogical[kk * N + j]);
+                double got = c[i * N + j];
+                bool ok = Math.Abs(got - truth) <= 1e-3 * Math.Max(1.0, Math.Abs(truth));
+                if (!ok) { pass = false; if (bad++ < 6) Console.WriteLine($"  C[{i},{j}] got {got:G6} exp {truth:G6} FAIL"); }
+            }
+        Console.WriteLine(pass ? $"AMX TILE VERIFIED ({M}x{K}x{N}, all {M * N} elements)" : "AMX TILE FAILED");
+        return pass;
+    }
+
     private static ushort FloatToBf16(float f) => (ushort)(BitConverter.SingleToUInt32Bits(f) >> 16);
     private static float Bf16ToFloat(ushort h) => BitConverter.UInt32BitsToSingle((uint)h << 16);
 }
