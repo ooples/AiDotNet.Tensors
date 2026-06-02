@@ -17,6 +17,13 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
 public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernels, AiDotNet.Tensors.Engines.Gpu.IGpuHalfPrecisionBackend
 {
+    // During teardown the CUDA driver/context may already be destroyed, so calling driver
+    // APIs (cuCtxPushCurrent / cuMemFree / cuCtxPopCurrent / cuCtxDestroy / cuModuleUnload)
+    // from a finalizer raises an access violation (0xC0000005) — a Corrupted-State
+    // Exception that catch cannot trap and that is fatal on the finalizer thread, killing
+    // the whole process. The OS reclaims device memory + the context at exit anyway.
+    private static bool IsRuntimeTearingDown => RuntimeShutdown.IsTearingDown;
+
     private const int DefaultBlockSize = 256;
     private const int MaxRnnBlockSize = 1024;
     private readonly ConcurrentDictionary<string, IntPtr> _kernelCache;
@@ -12481,10 +12488,30 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public void Dispose()
     {
+        Dispose(disposing: true);
+        GC.SuppressFinalize(this);
+    }
+
+    private void Dispose(bool disposing)
+    {
         if (_disposed)
             return;
 
         _disposed = true;
+
+        // Finalizer path (disposing == false) or any process/domain teardown:
+        //   - The managed members (GpuBufferPool's ConcurrentBag/ThreadLocal, the cuDNN
+        //     helpers) may already have been finalized by the runtime — touching them
+        //     throws ObjectDisposedException from the finalizer thread (fatal).
+        //   - The CUDA context may already be destroyed — every driver call below
+        //     (cublasDestroy / cuStreamDestroy / cuModuleUnload / cuCtxDestroy) would
+        //     raise an uncatchable access violation (0xC0000005), also finalizer-fatal.
+        // The OS reclaims the context and all device memory at process exit, so the only
+        // safe action here is to do nothing. Explicit Dispose during normal operation
+        // (disposing == true, not tearing down) still performs the full native cleanup.
+        if (!disposing || IsRuntimeTearingDown)
+            return;
+
         _pinnedPool.Dispose();
         _bufferPool.Dispose();
 
@@ -13443,7 +13470,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     ~CudaBackend()
     {
-        Dispose();
+        // Finalizer: never touch managed members or the CUDA driver — see Dispose(bool).
+        Dispose(disposing: false);
     }
 
     internal sealed class CudaGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
@@ -13479,18 +13507,25 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             if (_devicePtr == IntPtr.Zero)
                 return;
 
-            try
+            // During CLR/AppDomain teardown the CUDA context may already be gone;
+            // calling the driver here raises an uncatchable, finalizer-fatal access
+            // violation. Skip the native free (the OS reclaims device memory at exit)
+            // and just clear the handles.
+            if (!IsRuntimeTearingDown)
             {
-                if (_context != IntPtr.Zero)
+                try
                 {
-                    CuBlasNative.cuCtxPushCurrent(_context);
-                    CuBlasNative.cuMemFree(_devicePtr);
-                    CuBlasNative.cuCtxPopCurrent(out _);
+                    if (_context != IntPtr.Zero)
+                    {
+                        CuBlasNative.cuCtxPushCurrent(_context);
+                        CuBlasNative.cuMemFree(_devicePtr);
+                        CuBlasNative.cuCtxPopCurrent(out _);
+                    }
                 }
-            }
-            catch
-            {
-                // Suppress disposal errors to avoid crashing finalizers.
+                catch
+                {
+                    // Suppress disposal errors to avoid crashing finalizers.
+                }
             }
 
             _devicePtr = IntPtr.Zero;
@@ -13548,18 +13583,23 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             if (_devicePtr == IntPtr.Zero)
                 return;
 
-            try
+            // See CudaGpuBuffer.Release: skip native CUDA calls during teardown to
+            // avoid a finalizer-fatal access violation on an already-destroyed context.
+            if (!IsRuntimeTearingDown)
             {
-                if (_context != IntPtr.Zero)
+                try
                 {
-                    CuBlasNative.cuCtxPushCurrent(_context);
-                    CuBlasNative.cuMemFree(_devicePtr);
-                    CuBlasNative.cuCtxPopCurrent(out _);
+                    if (_context != IntPtr.Zero)
+                    {
+                        CuBlasNative.cuCtxPushCurrent(_context);
+                        CuBlasNative.cuMemFree(_devicePtr);
+                        CuBlasNative.cuCtxPopCurrent(out _);
+                    }
                 }
-            }
-            catch
-            {
-                // Suppress disposal errors to avoid crashing finalizers.
+                catch
+                {
+                    // Suppress disposal errors to avoid crashing finalizers.
+                }
             }
 
             _devicePtr = IntPtr.Zero;
