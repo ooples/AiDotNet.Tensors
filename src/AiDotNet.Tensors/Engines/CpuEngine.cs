@@ -21545,6 +21545,12 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <c>Unsafe.ReadUnaligned</c> / <c>Unsafe.WriteUnaligned</c> for
     /// 32-byte vector load/store, avoiding Span bounds-check overhead.
     /// </summary>
+    // LayerNorm parallel break-even (elements). Below this, run serial to avoid the
+    // worker-pool park/wakeup floor that dominates small-op latency. Env-tunable.
+    private static readonly long _lnParallelMinWork =
+        long.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_LN_PARALLEL_MINWORK"), out var lnw) && lnw > 0
+            ? lnw : 524_288;
+
     private static void ProcessBatchesSimd(
         float[] fInput, float[] fGamma, float[] fBeta,
         float[] fOutput, float[] fMean, float[] fVar,
@@ -21556,7 +21562,18 @@ public partial class CpuEngine : ITensorLevelEngine
 #else
         bool useSimd = false;
 #endif
-        if (batchSize * fs < 50_000)
+        // Serial below the parallel break-even. The old 50K threshold was far too
+        // low: a transformer LayerNorm at [B*seq, d] = [1024, 64] = 65 536 elements
+        // is only ~25 µs of single-pass SIMD work, but dispatching its 1024 tiny rows
+        // to the worker pool — which has parked between this and the previous op
+        // (MHA / FFN / the other 3 LayerNorms in the block) — pays the full park/
+        // wakeup latency (~190 µs measured, profiled as ManualResetEventSlim/semaphore
+        // wait, not compute). Net: parallel was ~7× SLOWER than serial at this size.
+        // Raised to 512K elements so small/medium LayerNorms (transformers at modest
+        // batch×seq) stay serial; large ones (BERT-scale, millions of elements, where
+        // serial is ms and dwarfs the wakeup) still parallelize. Env-tunable.
+        long lnWork = (long)batchSize * fs;
+        if (lnWork < _lnParallelMinWork)
         {
             for (int b = 0; b < batchSize; b++)
                 ProcessRow(fInput, fGamma, fBeta, fOutput, fMean, fVar, b, fs, fEps, useSimd);
