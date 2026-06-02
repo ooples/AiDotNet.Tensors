@@ -21624,6 +21624,17 @@ public partial class CpuEngine : ITensorLevelEngine
         long.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_LN_PARALLEL_MINWORK"), out var lnw) && lnw > 0
             ? lnw : 524_288;
 
+    // Row-count parallel gate: a LayerNorm over many independent rows parallelizes
+    // well even when total elements are below _lnParallelMinWork — the work-only
+    // threshold left the transformer's [4096,64] (262K < 524K) serial, but it has
+    // 4096 independent rows and parallel is 2.5× faster (0.33→0.13 ms/call, −17%
+    // on the bs128 forward). Gate on rows so large-row/small-feature LayerNorms
+    // parallelize while small-row ones (e.g. [1024,64], where the park/wakeup floor
+    // dominated) stay serial. Env-tunable.
+    private static readonly int _lnParallelMinRows =
+        int.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_LN_PARALLEL_MINROWS"), out var lnr) && lnr > 0
+            ? lnr : 2048;
+
     private static void ProcessBatchesSimd(
         float[] fInput, float[] fGamma, float[] fBeta,
         float[] fOutput, float[] fMean, float[] fVar,
@@ -21646,7 +21657,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // batch×seq) stay serial; large ones (BERT-scale, millions of elements, where
         // serial is ms and dwarfs the wakeup) still parallelize. Env-tunable.
         long lnWork = (long)batchSize * fs;
-        if (lnWork < _lnParallelMinWork)
+        if (lnWork < _lnParallelMinWork && batchSize < _lnParallelMinRows)
         {
             for (int b = 0; b < batchSize; b++)
                 ProcessRow(fInput, fGamma, fBeta, fOutput, fMean, fVar, b, fs, fEps, useSimd);
