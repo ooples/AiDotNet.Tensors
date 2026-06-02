@@ -141,6 +141,11 @@ public static class CpuFusedOperations
         FusedGemmBiasActivationUnchecked(A, B, bias, output, M, N, K, activation, activationParams: activationParams);
     }
 
+    // Small/medium-M cutover for routing the fused GEMM through the packed managed
+    // kernel instead of native TryGemm (mirrors CpuEngine.TensorMatMul2D). At/below
+    // this M the managed kernel wins; above it native BLAS's raw throughput wins.
+    private const int SmallMGemmCutover = 1024;
+
     internal static void FusedGemmBiasActivationUnchecked(
         float[] A,
         float[] B,
@@ -151,6 +156,27 @@ public static class CpuFusedOperations
         bool allowCachedB = true,
         FusedActivationParams? activationParams = null)
     {
+        // Small/medium-M fast path: at small M (the batch dimension, e.g. training/
+        // inference at batch 64) native BLAS leaves cores idle and pays worker-pool
+        // dispatch overhead — the packed managed kernel is 2-5.8x faster and clears
+        // 75 GFLOP/s for M up to the cutover (profiled; min-of-N on a noisy rig).
+        // Route here BEFORE TryGemm so the small-M GEMM doesn't fall into the slow
+        // native path. Above the cutover, native BLAS's raw throughput wins (below).
+        //   * allowCachedB (inference, frozen weights): identity-cached pre-pack.
+        //   * else (training, weights mutated in place by optimizer.Step): pack-fresh
+        //     SimdGemm.Sgemm — re-packs B every call so it correctly sees the update
+        //     (the cached kernel would serve a stale pack → wrong gradients).
+        if (M <= SmallMGemmCutover)
+        {
+            if (allowCachedB)
+                SimdGemm.SgemmWithCachedB(A.AsSpan(0, M * K), B, output.AsSpan(0, M * N), M, K, N);
+            else
+                SimdGemm.Sgemm(A.AsSpan(0, M * K), K, false, B.AsSpan(0, K * N), N, false,
+                               output.AsSpan(0, M * N), M, K, N);
+            ApplyBiasActivationInPlace(output, bias, M, N, activation, activationParams);
+            return;
+        }
+
         // Use BLAS for the O(MNK) GEMM, then fuse bias+activation in a cheap O(MN) second pass.
         if (BlasProvider.TryGemm(M, N, K, A, 0, K, B, 0, N, output, 0, N))
         {
