@@ -288,6 +288,9 @@ internal sealed class X64Assembler
     /// <summary>ldtilecfg [base] — load the 64-byte tile configuration. VEX.128.NP.0F38.W0 49 /0.</summary>
     internal void Ldtilecfg(int baseReg) => VexMemDisp8(Map0F38, PpNone, 0, 0, 0x49, 0, baseReg, 0);
 
+    /// <summary>sttilecfg [base] — store the current tile configuration. VEX.128.66.0F38.W0 49 /0.</summary>
+    internal void Sttilecfg(int baseReg) => VexMemDisp8(Map0F38, Pp66, 0, 0, 0x49, 0, baseReg, 0);
+
     /// <summary>tilerelease — reset all tiles to the init state. VEX.128.NP.0F38.W0 49 C0.</summary>
     internal void Tilerelease() => VexRR(Map0F38, PpNone, 0, 0, 0x49, 0, 0, 0);
 
@@ -304,6 +307,41 @@ internal sealed class X64Assembler
     /// reg = tdst (C). NOTE the K-row source (B/VNNI) is VEX.vvvv and the M-row source (A) is ModRM.rm —
     /// i.e. for C = A·B, pass tvvvv = B and trm = A. (Verified against Intel SDE.)</summary>
     internal void Tdpbf16ps(int tdst, int tvvvv, int trm) => VexRR(Map0F38, PpF3, 0, 0, 0x5C, tdst, tvvvv, trm);
+
+    // INT8 tile dot-products → INT32 accumulate (opcode 5E; prefix selects the sign combo).
+    // Same operand convention as tdpbf16ps: the K-row source (B/VNNI-4) is VEX.vvvv (tvvvv),
+    // the M-row source (A) is ModRM.rm (trm). VNNI depth is 4 int8 per group (vs 2 BF16).
+
+    /// <summary>tdpbssd — signed·signed int8 → int32. VEX.128.F2.0F38.W0 5E /r.</summary>
+    internal void Tdpbssd(int tdst, int tvvvv, int trm) => VexRR(Map0F38, PpF2, 0, 0, 0x5E, tdst, tvvvv, trm);
+
+    /// <summary>tdpbsud — signed·unsigned int8 → int32. VEX.128.F3.0F38.W0 5E /r.</summary>
+    internal void Tdpbsud(int tdst, int tvvvv, int trm) => VexRR(Map0F38, PpF3, 0, 0, 0x5E, tdst, tvvvv, trm);
+
+    /// <summary>tdpbusd — unsigned·signed int8 → int32. VEX.128.66.0F38.W0 5E /r.</summary>
+    internal void Tdpbusd(int tdst, int tvvvv, int trm) => VexRR(Map0F38, Pp66, 0, 0, 0x5E, tdst, tvvvv, trm);
+
+    /// <summary>tdpbuud — unsigned·unsigned int8 → int32. VEX.128.NP.0F38.W0 5E /r.</summary>
+    internal void Tdpbuud(int tdst, int tvvvv, int trm) => VexRR(Map0F38, PpNone, 0, 0, 0x5E, tdst, tvvvv, trm);
+
+    /// <summary>cpuid — leaf in eax, sub-leaf in ecx; clobbers eax/ebx/ecx/edx. 0F A2.</summary>
+    internal void Cpuid() => B(0x0F, 0xA2);
+
+    /// <summary>push reg64 (50+rd, REX.B for r8–r15).</summary>
+    internal void PushReg(int reg) { if (reg >= 8) B(0x41); B((byte)(0x50 + (reg & 7))); }
+
+    /// <summary>pop reg64 (58+rd, REX.B for r8–r15).</summary>
+    internal void PopReg(int reg) { if (reg >= 8) B(0x41); B((byte)(0x58 + (reg & 7))); }
+
+    /// <summary>mov [base + disp8], reg32 — store a 32-bit register. 89 /r.</summary>
+    internal void MovMemFromReg32(int baseReg, sbyte disp8, int reg)
+    {
+        byte rex = (byte)((reg >= 8 ? 4 : 0) | (baseReg >= 8 ? 1 : 0));
+        if (rex != 0) B((byte)(0x40 | rex));
+        B(0x89, (byte)(0x40 | ((reg & 7) << 3) | (baseReg & 7)));
+        if ((baseReg & 7) == 4) B(0x24); // SIB for rsp/r12 base
+        B((byte)disp8);
+    }
 
     /// <summary>vxorpd dst, s1, s2. VEX.256.66.0F.WIG 57. (zero a reg: dst=s1=s2)</summary>
     internal void Vxorpd(int dst, int s1, int s2) => VexRR(Map0F, Pp66, 0, 1, 0x57, dst, s1, s2);

@@ -298,6 +298,19 @@ class Program
             Environment.Exit(MicrokernelGflopsBench.VerifyAmxGemm() ? 0 : 1);
         }
 
+        // #380 AMX INT8 — verify a single tdpbssd (int8→int32) tile op. Run under Intel SDE.
+        if (args[0] == "--verify-amx-int8")
+        {
+            Environment.Exit(MicrokernelGflopsBench.VerifyAmxInt8Tile() ? 0 : 1);
+        }
+
+        // #380 AMX detection — read CPUID.(7,0):EDX AMX bits via emitted machine code. Under
+        // `sde -spr` all AMX bits are set (exit 0); on a bare non-AMX host they aren't (exit 1).
+        if (args[0] == "--verify-amx-cpuid")
+        {
+            Environment.Exit(MicrokernelGflopsBench.VerifyAmxCpuid() ? 0 : 1);
+        }
+
 #if !NET462
         // Run cuBLAS vs DirectGpu GEMM benchmark
         if (args[0] == "--cublas")

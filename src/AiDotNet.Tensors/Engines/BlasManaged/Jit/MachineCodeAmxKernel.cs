@@ -134,6 +134,91 @@ internal static class MachineCodeAmxKernel
         return true;
     }
 
+    // ── INT8 tile path (tdpbssd) + AMX CPUID detection ─────────────────────────
+
+    internal const int TileK8 = 64; // INT8 K-depth per tile (4-deep VNNI: 4 int8 per group)
+
+    // CPUID.(EAX=7,ECX=0):EDX feature bits for AMX.
+    internal const uint AmxBf16Bit = 1u << 22, AmxTileBit = 1u << 24, AmxInt8Bit = 1u << 25;
+
+    /// <summary>
+    /// Emit <c>void int8Tile(sbyte* aPacked, sbyte* bVnni4, int* c, byte* cfg)</c>: a single
+    /// <c>tdpbssd</c> (signed·signed int8 → int32) tile op. C[16,16] += A[16,64]·B[16,64], B in
+    /// the AMX 4-deep VNNI layout (row g holds {B[4g+0,n]..B[4g+3,n]} for each column n).
+    /// </summary>
+    internal static byte[] EmitTileGemmProbeInt8Windows()
+    {
+        var asm = new X64Assembler();
+        asm.Ldtilecfg(R9);
+        asm.MovRegImm32(RAX, RowBytes); // 64-byte rows for all three tiles
+        asm.TileloadD(0, RCX, RAX);     // tmm0 = A (int8)
+        asm.TileloadD(1, RDX, RAX);     // tmm1 = B (VNNI-4 int8)
+        asm.Tilezero(2);                // tmm2 = 0 (int32 accumulator)
+        asm.Tdpbssd(2, /*vvvv=B*/1, /*rm=A*/0); // tmm2 += A · B
+        asm.Tilestored(R8, RAX, 2);
+        asm.Tilerelease();
+        asm.Ret();
+        return asm.ToArray();
+    }
+
+    /// <summary>Run the INT8 tile probe. A is 16×64 int8, bVnni4 is 16×64 int8 (VNNI-4), c is 16×16 int32.</summary>
+    internal static unsafe bool TryRunTileProbeInt8(sbyte[] aPacked, sbyte[] bVnni4, int[] c)
+    {
+        if (aPacked.Length < TileM * TileK8 || bVnni4.Length < TileM * (TileN * 4) || c.Length < TileM * TileN)
+            throw new ArgumentException("AMX INT8 tile probe needs A 16×64, B(VNNI4) 16×64 int8, C 16×16 int32.");
+
+        byte[] code = EmitTileGemmProbeInt8Windows();
+        byte[] cfg = BuildTileConfig((TileM, TileK8), (TileM, TileN * 4), (TileM, TileN * 4));
+        using var mem = ExecutableMemory.TryAllocate(code);
+        if (mem is null || mem.Pointer == IntPtr.Zero) return false;
+        var fn = (delegate* unmanaged<sbyte*, sbyte*, int*, byte*, void>)mem.Pointer;
+        fixed (sbyte* ap = aPacked)
+        fixed (sbyte* bp = bVnni4)
+        fixed (int* cp = c)
+        fixed (byte* cfgp = cfg)
+            fn(ap, bp, cp, cfgp);
+        return true;
+    }
+
+    /// <summary>
+    /// Emit <c>void cpuid7Edx(uint* outEdx)</c>: query CPUID leaf 7, sub-leaf 0 and write EDX to
+    /// <paramref name="outEdx"/> — the AMX-TILE/AMX-BF16/AMX-INT8 feature bits. rbx is preserved
+    /// (non-volatile on Win x64); the out pointer is stashed in r9 before <c>cpuid</c> clobbers rcx.
+    /// </summary>
+    internal static byte[] EmitCpuidLeaf7EdxWindows()
+    {
+        var asm = new X64Assembler();
+        asm.PushReg(3);              // push rbx
+        asm.MovRegReg(R9, RCX);      // r9 = outEdx (saved before cpuid clobbers rcx)
+        asm.MovRegImm32(0, 7);       // eax = 7  (leaf)
+        asm.MovRegImm32(1, 0);       // ecx = 0  (sub-leaf)
+        asm.Cpuid();
+        asm.MovMemFromReg32(R9, 0, 2); // [r9] = edx
+        asm.PopReg(3);               // pop rbx
+        asm.Ret();
+        return asm.ToArray();
+    }
+
+    /// <summary>
+    /// Read CPUID.(7,0):EDX via emitted machine code (no .NET intrinsic exposes these bits). Returns
+    /// false only if executable memory is unavailable; otherwise <paramref name="edx"/> holds the
+    /// raw feature dword — test against <see cref="AmxTileBit"/>/<see cref="AmxBf16Bit"/>/
+    /// <see cref="AmxInt8Bit"/>. NOTE: a true result here means the CPU advertises AMX, but real
+    /// use also needs OS XSAVE state enablement (Linux 5.16+ XFD); gate production on both.
+    /// </summary>
+    internal static unsafe bool TryGetAmxCpuidEdx(out uint edx)
+    {
+        edx = 0;
+        byte[] code = EmitCpuidLeaf7EdxWindows();
+        using var mem = ExecutableMemory.TryAllocate(code);
+        if (mem is null || mem.Pointer == IntPtr.Zero) return false;
+        var fn = (delegate* unmanaged<uint*, void>)mem.Pointer;
+        uint local;
+        fn(&local);
+        edx = local;
+        return true;
+    }
+
     // ── Phase 2: full tiled AMX BF16 GEMM ──────────────────────────────────────
 
     /// <summary>

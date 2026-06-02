@@ -488,6 +488,63 @@ public static class MicrokernelGflopsBench
         return pass;
     }
 
+    // #380 AMX INT8: verify a single tdpbssd tile op — C[16,16] int32 += A[16,64]·B[16,64] int8,
+    // B in the AMX 4-deep VNNI layout. Exact integer compare. Run UNDER INTEL SDE (-spr).
+    public static bool VerifyAmxInt8Tile()
+    {
+        Console.WriteLine("=== AMX tdpbssd tile op (C16x16 int32 += A16x64 . B16x64 int8, VNNI-4) ===");
+        const int M = 16, K = 64, N = 16;
+        var rng = new Random(53);
+        var a = new sbyte[M * K];
+        var bLogical = new sbyte[K * N];
+        for (int i = 0; i < a.Length; i++) a[i] = (sbyte)rng.Next(-100, 101);
+        for (int i = 0; i < bLogical.Length; i++) bLogical[i] = (sbyte)rng.Next(-100, 101);
+
+        // VNNI-4: row g (0..K/4-1) holds {B[4g+0,n]..B[4g+3,n]} for each n.
+        var bVnni4 = new sbyte[(K / 4) * (N * 4)];
+        for (int g = 0; g < K / 4; g++)
+            for (int n = 0; n < N; n++)
+                for (int t = 0; t < 4; t++)
+                    bVnni4[g * (N * 4) + 4 * n + t] = bLogical[(4 * g + t) * N + n];
+
+        var c = new int[M * N];
+        bool ran;
+        try { ran = AiDotNet.Tensors.Engines.BlasManaged.Jit.MachineCodeAmxKernel.TryRunTileProbeInt8(a, bVnni4, c); }
+        catch (Exception e) { Console.WriteLine("  int8 tile threw (likely #UD — not under SDE): " + e.Message); return false; }
+        if (!ran) { Console.WriteLine("  executable memory unavailable — cannot verify"); return false; }
+
+        bool pass = true;
+        int bad = 0;
+        for (int i = 0; i < M; i++)
+            for (int j = 0; j < N; j++)
+            {
+                long truth = 0;
+                for (int kk = 0; kk < K; kk++) truth += a[i * K + kk] * bLogical[kk * N + j];
+                if (c[i * N + j] != truth) { pass = false; if (bad++ < 6) Console.WriteLine($"  C[{i},{j}] got {c[i * N + j]} exp {truth} FAIL"); }
+            }
+        Console.WriteLine(pass ? $"AMX INT8 TILE VERIFIED ({M}x{K}x{N}, all {M * N} elements, exact)" : "AMX INT8 TILE FAILED");
+        return pass;
+    }
+
+    // #380 AMX detection: read CPUID.(7,0):EDX via emitted machine code and report the AMX bits.
+    // Under `sde -spr` the AMX-TILE/BF16/INT8 bits must all be set. Returns true iff AMX-TILE present.
+    public static bool VerifyAmxCpuid()
+    {
+        Console.WriteLine("=== AMX CPUID detection (CPUID.7.0:EDX bits 24/22/25) ===");
+        if (!AiDotNet.Tensors.Engines.BlasManaged.Jit.MachineCodeAmxKernel.TryGetAmxCpuidEdx(out uint edx))
+        {
+            Console.WriteLine("  executable memory unavailable — cannot probe CPUID");
+            return false;
+        }
+        bool tile = (edx & AiDotNet.Tensors.Engines.BlasManaged.Jit.MachineCodeAmxKernel.AmxTileBit) != 0;
+        bool bf16 = (edx & AiDotNet.Tensors.Engines.BlasManaged.Jit.MachineCodeAmxKernel.AmxBf16Bit) != 0;
+        bool int8 = (edx & AiDotNet.Tensors.Engines.BlasManaged.Jit.MachineCodeAmxKernel.AmxInt8Bit) != 0;
+        Console.WriteLine($"  EDX=0x{edx:X8}  AMX-TILE={tile}  AMX-BF16={bf16}  AMX-INT8={int8}");
+        bool pass = tile && bf16 && int8; // under sde -spr all three are advertised
+        Console.WriteLine(pass ? "AMX CPUID VERIFIED (all AMX bits set)" : "AMX CPUID: not all AMX bits set (expected on a non-AMX host without SDE)");
+        return pass;
+    }
+
     private static ushort FloatToBf16(float f) => (ushort)(BitConverter.SingleToUInt32Bits(f) >> 16);
     private static float Bf16ToFloat(ushort h) => BitConverter.UInt32BitsToSingle((uint)h << 16);
 }
