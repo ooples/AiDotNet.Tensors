@@ -63,5 +63,126 @@ internal static class MachineCodeBf16Kernel
             fn(ap, bp, cp);
         return true;
     }
+
+    // ── Phase 2: full BF16 GEMM microkernel (MR=4 × NR=8, broadcast-A) ──────────
+
+    private const int MR = 4;   // rows per tile (one accumulator ymm each)
+    private const int NR = 8;   // cols per tile (one ymm of 8 FP32 lanes)
+
+    /// <summary>
+    /// Emit <c>void kernel(uint* packedA, uint* packedB, float* cTile, nuint kPairs)</c> — a
+    /// register-resident MR×NR FP32 GEMM tile driven by VDPBF16PS over a runtime K-pair loop.
+    /// <para>
+    /// Each iteration consumes one K-pair (k0=2·kp, k1=2·kp+1):
+    /// <c>packedB[kp]</c> is a 32-byte vector of NR columns × {B[k0,c], B[k1,c]} (BF16);
+    /// <c>packedA[kp]</c> is MR × {A[m,k0], A[m,k1]} packed as one uint per row. For each row the
+    /// A pair is broadcast (vbroadcastss, 32-bit) across all 8 lanes, then
+    /// <c>vdpbf16ps acc_m, aBroadcast, bVec</c> adds A[m,k0]·B[k0,c]+A[m,k1]·B[k1,c] to lane c —
+    /// i.e. the two-deep K contribution to C[m,c], accumulated in FP32.
+    /// </para>
+    /// Disjoint accumulators → bit-stable; no .NET intrinsic exists for VDPBF16PS so the body is
+    /// raw EVEX. Verify under Intel SDE on non-AVX-512-BF16 hosts.
+    /// </summary>
+    internal static byte[] EmitGemmMicrokernelWindows()
+    {
+        // Windows x64 ABI: rcx=packedA, rdx=packedB, r8=cTile, r9=kPairs.
+        const int RCX = 1, RDX = 2, R8 = 8, R9 = 9;
+        var asm = new X64Assembler();
+
+        for (int m = 0; m < MR; m++) asm.Vxorpd(m, m, m); // zero ymm0..ymm3 accumulators
+
+        int loop = asm.NewLabel();
+        asm.MarkLabel(loop);
+        asm.VmovupdLoad(4, RDX, 0);                 // ymm4 = packedB[kp]  (NR cols × 2 BF16)
+        for (int m = 0; m < MR; m++)
+        {
+            asm.VbroadcastSs(5, RCX, (sbyte)(m * 4)); // ymm5 = broadcast {A[m,k0],A[m,k1]}
+            asm.Vdpbf16ps256(m, 5, 4);                // acc_m += dpbf16(aBroadcast, bVec)
+        }
+        asm.AddRegImm8(RDX, NR * 4);                // advance B one 32-byte K-pair vector
+        asm.AddRegImm8(RCX, MR * 4);                // advance A one K-pair block (MR uints)
+        asm.DecReg(R9);
+        asm.JnzLabel(loop);
+
+        for (int m = 0; m < MR; m++) asm.VmovupdStore(R8, (sbyte)(m * NR * 4), m); // cTile rows
+        asm.Vzeroupper();
+        asm.Ret();
+        return asm.ToArray();
+    }
+
+    /// <summary>
+    /// Native AVX-512-BF16 GEMM: <c>C[m,n] = Σ_k A[m,k]·B[k,n]</c> with A/B as raw BF16 bit
+    /// patterns (row-major, A is M×K, B is K×N) and C accumulated in FP32 (row-major M×N).
+    /// Tiles M by <see cref="MR"/> and N by <see cref="NR"/>, packs each tile into the
+    /// K-pair-interleaved layout the microkernel expects (odd K and ragged M/N edges zero-padded
+    /// — BF16 0x0000 = +0.0, a no-op), and runs the emitted kernel. Returns false only if
+    /// executable memory is unavailable. MUST run under SDE on hosts lacking AVX-512-BF16.
+    /// </summary>
+    internal static unsafe bool TryGemm(
+        ReadOnlySpan<ushort> a, ReadOnlySpan<ushort> b, Span<float> c, int m, int k, int n)
+    {
+        if (m <= 0 || k <= 0 || n <= 0) return true;
+        if (a.Length < m * k || b.Length < k * n || c.Length < m * n)
+            throw new ArgumentException("BF16 GEMM: a/b/c spans smaller than M·K / K·N / M·N.");
+
+        int kPairs = (k + 1) / 2;
+        byte[] code = EmitGemmMicrokernelWindows();
+        using var mem = ExecutableMemory.TryAllocate(code);
+        if (mem is null || mem.Pointer == IntPtr.Zero) return false;
+        var fn = (delegate* unmanaged<uint*, uint*, float*, nuint, void>)mem.Pointer;
+
+        // Per-tile packed buffers (reused across tiles).
+        var packA = new uint[kPairs * MR];
+        var packB = new uint[kPairs * NR];
+        var cTile = new float[MR * NR];
+
+        fixed (uint* pA = packA)
+        fixed (uint* pB = packB)
+        fixed (float* pC = cTile)
+        {
+            for (int n0 = 0; n0 < n; n0 += NR)
+            {
+                int cols = Math.Min(NR, n - n0);
+                // Pack B[*, n0..n0+cols) → [kPairs][NR] of {B[k0,c]|B[k1,c]<<16}; pad cols/k with 0.
+                Array.Clear(packB, 0, packB.Length);
+                for (int kp = 0; kp < kPairs; kp++)
+                {
+                    int k0 = 2 * kp, k1 = k0 + 1;
+                    int baseB = kp * NR;
+                    for (int cc = 0; cc < cols; cc++)
+                    {
+                        uint lo = b[k0 * n + n0 + cc];
+                        uint hi = (k1 < k) ? b[k1 * n + n0 + cc] : 0u;
+                        packB[baseB + cc] = lo | (hi << 16);
+                    }
+                }
+
+                for (int m0 = 0; m0 < m; m0 += MR)
+                {
+                    int rows = Math.Min(MR, m - m0);
+                    // Pack A[m0..m0+rows, *) → [kPairs][MR] of {A[m,k0]|A[m,k1]<<16}; pad rows/k.
+                    Array.Clear(packA, 0, packA.Length);
+                    for (int kp = 0; kp < kPairs; kp++)
+                    {
+                        int k0 = 2 * kp, k1 = k0 + 1;
+                        int baseA = kp * MR;
+                        for (int rr = 0; rr < rows; rr++)
+                        {
+                            uint lo = a[(m0 + rr) * k + k0];
+                            uint hi = (k1 < k) ? a[(m0 + rr) * k + k1] : 0u;
+                            packA[baseA + rr] = lo | (hi << 16);
+                        }
+                    }
+
+                    fn(pA, pB, pC, (nuint)kPairs);
+
+                    for (int rr = 0; rr < rows; rr++)
+                        for (int cc = 0; cc < cols; cc++)
+                            c[(m0 + rr) * n + n0 + cc] = cTile[rr * NR + cc];
+                }
+            }
+        }
+        return true;
+    }
 }
 #endif

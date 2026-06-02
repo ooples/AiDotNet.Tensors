@@ -277,6 +277,13 @@ class Program
             Environment.Exit(MicrokernelGflopsBench.VerifyVdpbf16() ? 0 : 1);
         }
 
+        // #378 AVX-512-BF16 Phase 2 — verify the full BF16 GEMM machine-code microkernel end to
+        // end (tiling + ragged edges). Run under Intel SDE; exits non-zero on a mismatch.
+        if (args[0] == "--verify-bf16gemm")
+        {
+            Environment.Exit(MicrokernelGflopsBench.VerifyBf16Gemm() ? 0 : 1);
+        }
+
 #if !NET462
         // Run cuBLAS vs DirectGpu GEMM benchmark
         if (args[0] == "--cublas")
