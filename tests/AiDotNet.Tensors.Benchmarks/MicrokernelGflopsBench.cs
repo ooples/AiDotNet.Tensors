@@ -96,6 +96,73 @@ public static class MicrokernelGflopsBench
     }
 
     // ─────────────────────────────────────────────────────────────────────
+    // #409 S.4: single-process correctness verification. Runs each supported
+    // microkernel ONCE against a scalar reference (no perf loops, no test host)
+    // so it runs fast under Intel SDE emulation — which is how the avx512-verify
+    // CI checks the AVX-512 kernels on runners that lack AVX-512 hardware.
+    // Returns false if any kernel mismatches (the caller exits non-zero).
+    // ─────────────────────────────────────────────────────────────────────
+    public static bool Verify()
+    {
+        Console.WriteLine("=== Microkernel correctness (vs scalar double reference) ===");
+        bool ok = true;
+        ok &= VerifyF("Avx2Fp32_8x8",    Avx2Fp32_8x8.Mr,    Avx2Fp32_8x8.Nr,    Avx2Fp32_8x8.IsSupported,    Avx2Fp32_8x8.Run);
+        ok &= VerifyF("Avx2Fp32_6x16",   Avx2Fp32_6x16.Mr,   Avx2Fp32_6x16.Nr,   Avx2Fp32_6x16.IsSupported,   Avx2Fp32_6x16.Run);
+        ok &= VerifyD("Avx2Fp64_4x8",    Avx2Fp64_4x8.Mr,    Avx2Fp64_4x8.Nr,    Avx2Fp64_4x8.IsSupported,    Avx2Fp64_4x8.Run);
+        ok &= VerifyD("Avx2Fp64_6x8",    Avx2Fp64_6x8.Mr,    Avx2Fp64_6x8.Nr,    Avx2Fp64_6x8.IsSupported,    Avx2Fp64_6x8.Run);
+        ok &= VerifyF("Avx512Fp32_16x16", Avx512Fp32_16x16.Mr, Avx512Fp32_16x16.Nr, Avx512Fp32_16x16.IsSupported, Avx512Fp32_16x16.Run);
+        ok &= VerifyF("Avx512Fp32_8x32",  Avx512Fp32_8x32.Mr,  Avx512Fp32_8x32.Nr,  Avx512Fp32_8x32.IsSupported,  Avx512Fp32_8x32.Run);
+        ok &= VerifyD("Avx512Fp64_8x16",  Avx512Fp64_8x16.Mr,  Avx512Fp64_8x16.Nr,  Avx512Fp64_8x16.IsSupported,  Avx512Fp64_8x16.Run);
+        Console.WriteLine(ok ? "ALL VERIFIED" : "VERIFICATION FAILED");
+        return ok;
+    }
+
+    private delegate void RunF(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c, int ldc, int kc);
+    private delegate void RunD(ReadOnlySpan<double> a, ReadOnlySpan<double> b, Span<double> c, int ldc, int kc);
+
+    private static bool VerifyF(string name, int mr, int nr, bool supported, RunF run)
+    {
+        if (!supported) { Console.WriteLine($"  {name,-17} SKIP (not supported on this CPU)"); return true; }
+        const int kc = 64;
+        var rng = new Random(12345);
+        var a = new float[kc * mr]; for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() * 2 - 1);
+        var b = new float[kc * nr]; for (int i = 0; i < b.Length; i++) b[i] = (float)(rng.NextDouble() * 2 - 1);
+        var c = new float[mr * nr];
+        run(a, b, c, nr, kc);
+        double maxErr = 0;
+        for (int i = 0; i < mr; i++)
+            for (int j = 0; j < nr; j++)
+            {
+                double exp = 0; for (int k = 0; k < kc; k++) exp += (double)a[k * mr + i] * b[k * nr + j];
+                maxErr = Math.Max(maxErr, Math.Abs(c[i * nr + j] - exp));
+            }
+        bool pass = maxErr < 1e-2;
+        Console.WriteLine($"  {name,-17} {mr}x{nr}: {(pass ? "PASS" : "FAIL")} (max err {maxErr:E2})");
+        return pass;
+    }
+
+    private static bool VerifyD(string name, int mr, int nr, bool supported, RunD run)
+    {
+        if (!supported) { Console.WriteLine($"  {name,-17} SKIP (not supported on this CPU)"); return true; }
+        const int kc = 64;
+        var rng = new Random(54321);
+        var a = new double[kc * mr]; for (int i = 0; i < a.Length; i++) a[i] = rng.NextDouble() * 2 - 1;
+        var b = new double[kc * nr]; for (int i = 0; i < b.Length; i++) b[i] = rng.NextDouble() * 2 - 1;
+        var c = new double[mr * nr];
+        run(a, b, c, nr, kc);
+        double maxErr = 0;
+        for (int i = 0; i < mr; i++)
+            for (int j = 0; j < nr; j++)
+            {
+                double exp = 0; for (int k = 0; k < kc; k++) exp += a[k * mr + i] * b[k * nr + j];
+                maxErr = Math.Max(maxErr, Math.Abs(c[i * nr + j] - exp));
+            }
+        bool pass = maxErr < 1e-9;
+        Console.WriteLine($"  {name,-17} {mr}x{nr}: {(pass ? "PASS" : "FAIL")} (max err {maxErr:E2})");
+        return pass;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
     // Kernel benchmarks. flops/call = 2 · Mr · Nr · Kc (one mul + one add per
     // MAC). Buffers are L1-resident so we measure compute, not bandwidth.
     // ─────────────────────────────────────────────────────────────────────
