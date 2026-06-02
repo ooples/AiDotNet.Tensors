@@ -76,38 +76,6 @@ internal static class MachineCodeAmxKernel
     }
 
     /// <summary>
-    /// Diagnostic: emit <c>void ldst(ushort* src, ushort* dst, byte* cfg)</c> that configures one
-    /// 16×32-BF16 tile, loads it from <c>src</c> (tmm0), and stores it straight back to <c>dst</c>
-    /// — isolating tile config + load/store from the dot-product.
-    /// </summary>
-    internal static byte[] EmitTileLoadStoreProbeWindows()
-    {
-        var asm = new X64Assembler();
-        asm.Ldtilecfg(R8);              // cfg ptr is 3rd arg → r8
-        asm.MovRegImm32(RAX, RowBytes); // rax = 64
-        asm.TileloadD(0, RCX, RAX);     // tmm0 = src
-        asm.Tilestored(RDX, RAX, 0);    // dst = tmm0
-        asm.Tilerelease();
-        asm.Ret();
-        return asm.ToArray();
-    }
-
-    /// <summary>Run the load/store roundtrip; <paramref name="src"/>/<paramref name="dst"/> are 16×32 BF16 (512 each).</summary>
-    internal static unsafe bool TryRunLoadStore(ushort[] src, ushort[] dst)
-    {
-        byte[] code = EmitTileLoadStoreProbeWindows();
-        byte[] cfg = BuildTileConfig((TileM, TileK * 2));
-        using var mem = ExecutableMemory.TryAllocate(code);
-        if (mem is null || mem.Pointer == IntPtr.Zero) return false;
-        var fn = (delegate* unmanaged<ushort*, ushort*, byte*, void>)mem.Pointer;
-        fixed (ushort* sp = src)
-        fixed (ushort* dp = dst)
-        fixed (byte* cfgp = cfg)
-            fn(sp, dp, cfgp);
-        return true;
-    }
-
-    /// <summary>
     /// Emit + execute the one-tile probe. <paramref name="aPacked"/> is 16×32 BF16 (row-major, 64
     /// bytes/row); <paramref name="bVnni"/> is the VNNI-packed B, 16×32 BF16 (row r = {B[2r,n],
     /// B[2r+1,n]} over n=0..15); <paramref name="c"/> receives 16×16 FP32. Returns false only if
