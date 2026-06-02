@@ -39,3 +39,25 @@ TensorMatMul2D (AIDOTNET_JIT_GEMM=1, default OFF). 16-shape bench, min-of-6:
 NEXT (the transformer win): macro-kernel — prologue once per row-panel, loop the
 N/16 col-blocks internally (amortizes the 10-XMM save/restore ~12x). Then the
 kernel's isolated 600-700 GFLOP/s should translate to the transformer end-to-end.
+
+## Macro-kernel experiment: REJECTED (made transformer worse)
+
+Tried a macro-kernel (one row-panel × all N/16 col-blocks per call) to amortize
+the per-tile prologue. Isolated 566 GFLOP/s (below the per-tile 699 — the per-cb
+register resets + serialized col-block loop cost more than the prologue saves).
+End-to-end it REGRESSED the transformer further (+41-51% vs per-tile's +5-30%).
+Reverted to the per-tile kernel.
+
+## KEY CONCLUSION: the transformer is NOT GEMM-throughput-bound end-to-end
+
+The JIT kernel is 600-700 GFLOP/s in ISOLATION (beats oneDNN) yet does not flip
+the transformer end-to-end (per-tile: net-neutral/mild-regress; macro: worse).
+Why: isolated GFLOPS (same GEMM 600x, B hot in cache, threads spawned once) does
+NOT equal end-to-end throughput (each GEMM run once, cold-ish B, interleaved with
+SDPA/LayerNorm/softmax/residuals that evict cache, + per-GEMM dispatch). The
+transformer's time is the aggregate of many ops + dispatch, not GEMM throughput.
+- MLP (3 big GEMMs, weights reused across the batch, little interleaving) IS
+  GEMM-bound -> JIT wins (b8 -38%).
+- Transformer is NOT -> no GEMM kernel (ours at 699 or oneDNN at 543) flips it.
+Next lever for the transformer is whole-forward-pass fusion / dispatch reduction,
+not a faster GEMM. The JIT kernel stays an off-by-default MLP/GEMM-bound win.
