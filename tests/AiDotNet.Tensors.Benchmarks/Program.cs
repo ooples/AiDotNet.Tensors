@@ -269,6 +269,14 @@ class Program
             return;
         }
 
+        // #378 AVX-512-BF16 Phase 1 — verify the emitted VDPBF16PS machine code. Run under
+        // Intel SDE (`sde64 -spr -- dotnet ... --verify-vdpbf16`) on a non-AVX-512-BF16 host;
+        // exits non-zero on a mismatch so a CI step can gate on it.
+        if (args[0] == "--verify-vdpbf16")
+        {
+            Environment.Exit(MicrokernelGflopsBench.VerifyVdpbf16() ? 0 : 1);
+        }
+
 #if !NET462
         // Run cuBLAS vs DirectGpu GEMM benchmark
         if (args[0] == "--cublas")

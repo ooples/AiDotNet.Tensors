@@ -291,4 +291,54 @@ public static class MicrokernelGflopsBench
         for (int i = 0; i < n; i++) a[i] = rng.NextDouble() * 2 - 1;
         return a;
     }
+
+    // #378 AVX-512-BF16 Phase 1: verify the emitted VDPBF16PS machine code. There is no
+    // Avx512Bf16 .NET intrinsic, so the instruction is reached only via raw EVEX bytes; run
+    // this UNDER INTEL SDE on a host without AVX-512-BF16 (SDE emulates VDPBF16PS — natively
+    // it would fault #UD). Returns false on mismatch / no executable memory.
+    public static bool VerifyVdpbf16()
+    {
+        Console.WriteLine("=== VDPBF16PS machine-code probe (EVEX encoding + BF16 dot-product) ===");
+        var rng = new Random(123);
+        var a = new ushort[16];
+        var b = new ushort[16];
+        for (int i = 0; i < 16; i++)
+        {
+            a[i] = FloatToBf16((float)(rng.NextDouble() * 2 - 1));
+            b[i] = FloatToBf16((float)(rng.NextDouble() * 2 - 1));
+        }
+        var c = new float[8];
+
+        bool ran;
+        try
+        {
+            ran = AiDotNet.Tensors.Engines.BlasManaged.Jit.MachineCodeBf16Kernel.TryRunProbe(a, b, c);
+        }
+        catch (Exception e)
+        {
+            Console.WriteLine("  probe threw (likely #UD — not under SDE, or bad encoding): " + e.Message);
+            return false;
+        }
+        if (!ran)
+        {
+            Console.WriteLine("  executable memory unavailable (NativeAOT / hardened) — cannot verify");
+            return false;
+        }
+
+        bool pass = true;
+        for (int i = 0; i < 8; i++)
+        {
+            float exp = Bf16ToFloat(a[2 * i]) * Bf16ToFloat(b[2 * i])
+                      + Bf16ToFloat(a[2 * i + 1]) * Bf16ToFloat(b[2 * i + 1]);
+            float got = c[i];
+            bool ok = Math.Abs(got - exp) <= 1e-4f * Math.Max(1f, Math.Abs(exp));
+            pass &= ok;
+            Console.WriteLine($"  lane {i}: got {got,11:G6}  exp {exp,11:G6}  {(ok ? "OK" : "FAIL")}");
+        }
+        Console.WriteLine(pass ? "VDPBF16PS VERIFIED" : "VDPBF16PS FAILED");
+        return pass;
+    }
+
+    private static ushort FloatToBf16(float f) => (ushort)(BitConverter.SingleToUInt32Bits(f) >> 16);
+    private static float Bf16ToFloat(ushort h) => BitConverter.UInt32BitsToSingle((uint)h << 16);
 }

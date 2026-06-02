@@ -226,10 +226,36 @@ internal sealed class X64Assembler
     }
 
     // pp: 0=none, 1=66, 2=F3, 3=F2.  map: 1=0F, 2=0F38, 3=0F3A.  L: 0=128,1=256.
-    private const int Pp66 = 1, PpNone = 0, Map0F = 1, Map0F38 = 2;
+    private const int Pp66 = 1, PpNone = 0, PpF3 = 2, Map0F = 1, Map0F38 = 2;
 
     /// <summary>vfmadd231pd dst, s1, s2  (dst += s1*s2). VEX.DDS.256.66.0F38.W1 B8.</summary>
     internal void Vfmadd231pd(int dst, int s1, int s2) => VexRR(Map0F38, Pp66, 1, 1, 0xB8, dst, s1, s2);
+
+    // ── EVEX register-register form (#378: AVX-512-BF16) ───────────────────────
+    // 4-byte EVEX: 62 P0 P1 P2  opcode  ModRM(mod=11). Limited to ymm/zmm 0..15
+    // (no mask / broadcast / zeroing), which is all the BF16 microkernel needs —
+    // so EVEX.X=1 (no rm[4]), EVEX.R'=1 (reg<16), EVEX.V'=1 (vvvv<16) are constant.
+    //   P0 = [R X B R' 0 0 m m]   R=~reg[3], B=~rm[3], mm: 1=0F, 2=0F38, 3=0F3A
+    //   P1 = [W v v v v 1 p p]    vvvv=~vvvvReg, pp: 0=none,1=66,2=F3,3=F2
+    //   P2 = [z L'L L'L b V' a a a]  L'L: 0=128,1=256,2=512; here z=b=aaa=0, V'=1
+    private void EvexRR(int mm, int pp, int w, int ll, byte opcode, int reg, int vvvv, int rm)
+    {
+        int rBit = (reg < 8) ? 1 : 0;
+        int bBit = (rm < 8) ? 1 : 0;
+        byte p0 = (byte)((rBit << 7) | (1 << 6) | (bBit << 5) | (1 << 4) | mm);
+        int vv = (~vvvv) & 0xF;
+        byte p1 = (byte)((w << 7) | (vv << 3) | (1 << 2) | pp);
+        byte p2 = (byte)((ll << 5) | (1 << 3)); // z=0, L'L<<5, b=0, V'=1, aaa=000
+        byte modrm = (byte)(0xC0 | ((reg & 7) << 3) | (rm & 7));
+        B(0x62, p0, p1, p2, opcode, modrm);
+    }
+
+    /// <summary>vdpbf16ps ymm_dst, ymm_s1, ymm_s2  (dst[i] += s1[2i]*s2[2i] + s1[2i+1]*s2[2i+1],
+    /// BF16 inputs → FP32 accumulate). EVEX.256.F3.0F38.W0 52 /r (AVX-512-BF16, Sapphire Rapids / Zen 4+).</summary>
+    internal void Vdpbf16ps256(int dst, int s1, int s2) => EvexRR(Map0F38, PpF3, 0, 1, 0x52, dst, s1, s2);
+
+    /// <summary>512-bit vdpbf16ps zmm_dst, zmm_s1, zmm_s2. EVEX.512.F3.0F38.W0 52 /r.</summary>
+    internal void Vdpbf16ps512(int dst, int s1, int s2) => EvexRR(Map0F38, PpF3, 0, 2, 0x52, dst, s1, s2);
 
     /// <summary>vxorpd dst, s1, s2. VEX.256.66.0F.WIG 57. (zero a reg: dst=s1=s2)</summary>
     internal void Vxorpd(int dst, int s1, int s2) => VexRR(Map0F, Pp66, 0, 1, 0x57, dst, s1, s2);
