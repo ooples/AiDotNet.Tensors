@@ -139,7 +139,12 @@ public class Conv2DBackwardChannelParallelTests
             {
                 Assert.True(Math.Abs(allocating[i] - dest[i]) < 1e-3f,
                     $"[{i}] alloc={allocating[i]:F6} into={dest[i]:F6}");
-                Assert.True(Math.Abs(expected[i] - dest[i]) < 1e-2f,
+                // Into vs the double-accumulated scalar reference. The Into path
+                // accumulates K=colW=1024 float terms in one GEMM, so the only gap
+                // is float-vs-double rounding — measured max ≈ 8e-6 at this shape,
+                // so 1e-4f keeps ~12× headroom while still catching real numerical
+                // regressions (was 1e-2f, ~1200× looser than the actual error).
+                Assert.True(Math.Abs(expected[i] - dest[i]) < 1e-4f,
                     $"[{i}] ref={expected[i]:F6} into={dest[i]:F6}");
             }
         }
