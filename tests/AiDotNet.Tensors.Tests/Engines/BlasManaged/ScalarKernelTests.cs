@@ -2309,6 +2309,10 @@ public class ScalarKernelTests
     [Fact]
     public void Gemm_WithPackedAHandle_MatchesUnpackedGemm()
     {
+        // Pin deterministic mode on this thread so a concurrent global-mode flip can't change
+        // the consume-time tiling/autotune and reject the pre-pack handle (see DeterministicModeScope).
+        using var _det = new DeterministicModeScope(deterministic: true);
+
         // Sanity test: when caller supplies a pre-packed handle, the result must
         // still match the unpacked Gemm.
         int m = 8, n = 8, k = 8;
@@ -2398,6 +2402,11 @@ public class ScalarKernelTests
     [Fact]
     public void Gemm_WithoutMarkDirty_UsesCachedPackedBuffer()
     {
+        // Pin deterministic mode on this thread so a concurrent global-mode flip can't change
+        // the consume-time tiling/autotune and reject the still-current handle into a re-pack
+        // from the mutated source array (see DeterministicModeScope).
+        using var _det = new DeterministicModeScope(deterministic: true);
+
         // When the handle is current (no MarkDirty), the strategy uses the cached
         // packed buffer regardless of what's in the source `a` array. This is the
         // intended behavior — the caller is promising the source matches the
