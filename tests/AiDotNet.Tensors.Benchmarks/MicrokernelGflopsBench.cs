@@ -384,4 +384,100 @@ public static class MicrokernelGflopsBench
         for (int i = 0; i < n; i++) a[i] = rng.NextDouble() * 2 - 1;
         return a;
     }
+
+    // #378 AVX-512-BF16 Phase 1: verify the emitted VDPBF16PS machine code. There is no
+    // Avx512Bf16 .NET intrinsic, so the instruction is reached only via raw EVEX bytes; run
+    // this UNDER INTEL SDE on a host without AVX-512-BF16 (SDE emulates VDPBF16PS — natively
+    // it would fault #UD). Returns false on mismatch / no executable memory.
+    public static bool VerifyVdpbf16()
+    {
+        Console.WriteLine("=== VDPBF16PS machine-code probe (EVEX encoding + BF16 dot-product) ===");
+        var rng = new Random(123);
+        var a = new ushort[16];
+        var b = new ushort[16];
+        for (int i = 0; i < 16; i++)
+        {
+            a[i] = FloatToBf16((float)(rng.NextDouble() * 2 - 1));
+            b[i] = FloatToBf16((float)(rng.NextDouble() * 2 - 1));
+        }
+        var c = new float[8];
+
+        bool ran;
+        try
+        {
+            ran = AiDotNet.Tensors.Engines.BlasManaged.Jit.MachineCodeBf16Kernel.TryRunProbe(a, b, c);
+        }
+        catch (Exception e)
+        {
+            Console.WriteLine("  probe threw (likely #UD — not under SDE, or bad encoding): " + e.Message);
+            return false;
+        }
+        if (!ran)
+        {
+            Console.WriteLine("  executable memory unavailable (NativeAOT / hardened) — cannot verify");
+            return false;
+        }
+
+        bool pass = true;
+        for (int i = 0; i < 8; i++)
+        {
+            float exp = Bf16ToFloat(a[2 * i]) * Bf16ToFloat(b[2 * i])
+                      + Bf16ToFloat(a[2 * i + 1]) * Bf16ToFloat(b[2 * i + 1]);
+            float got = c[i];
+            bool ok = Math.Abs(got - exp) <= 1e-4f * Math.Max(1f, Math.Abs(exp));
+            pass &= ok;
+            Console.WriteLine($"  lane {i}: got {got,11:G6}  exp {exp,11:G6}  {(ok ? "OK" : "FAIL")}");
+        }
+        Console.WriteLine(pass ? "VDPBF16PS VERIFIED" : "VDPBF16PS FAILED");
+        return pass;
+    }
+
+    // #378 AVX-512-BF16 Phase 2: verify the full BF16 GEMM machine-code microkernel end to end.
+    // Shape M=5,K=7,N=11 exercises every edge: ragged M (4+1), ragged N (8+3), odd K (pair pad).
+    // Run UNDER INTEL SDE on a non-AVX-512-BF16 host (VDPBF16PS is emulated). False on mismatch.
+    public static bool VerifyBf16Gemm()
+    {
+        Console.WriteLine("=== BF16 GEMM machine-code microkernel (MR4xNR8, VDPBF16PS K-loop) ===");
+        const int m = 5, k = 7, n = 11;
+        var rng = new Random(7);
+        var a = new ushort[m * k];
+        var b = new ushort[k * n];
+        for (int i = 0; i < a.Length; i++) a[i] = FloatToBf16((float)(rng.NextDouble() * 2 - 1));
+        for (int i = 0; i < b.Length; i++) b[i] = FloatToBf16((float)(rng.NextDouble() * 2 - 1));
+        var c = new float[m * n];
+
+        bool ran;
+        try
+        {
+            ran = AiDotNet.Tensors.Engines.BlasManaged.Jit.MachineCodeBf16Kernel.TryGemm(a, b, c, m, k, n);
+        }
+        catch (Exception e)
+        {
+            Console.WriteLine("  GEMM threw (likely #UD — not under SDE, or bad encoding): " + e.Message);
+            return false;
+        }
+        if (!ran)
+        {
+            Console.WriteLine("  executable memory unavailable — cannot verify");
+            return false;
+        }
+
+        bool pass = true;
+        int bad = 0;
+        for (int i = 0; i < m; i++)
+            for (int j = 0; j < n; j++)
+            {
+                double truth = 0;
+                for (int kk = 0; kk < k; kk++)
+                    truth += (double)Bf16ToFloat(a[i * k + kk]) * Bf16ToFloat(b[kk * n + j]);
+                double got = c[i * n + j];
+                bool ok = Math.Abs(got - truth) <= 1e-3 * Math.Max(1.0, Math.Abs(truth));
+                if (!ok) { pass = false; if (bad++ < 6) Console.WriteLine($"  C[{i},{j}] got {got:G6} exp {truth:G6} FAIL"); }
+            }
+        Console.WriteLine(pass ? $"BF16 GEMM VERIFIED ({m}x{k}x{n}, all {m * n} elements)" : "BF16 GEMM FAILED");
+        return pass;
+    }
+
+    private static ushort FloatToBf16(float f) => (ushort)(BitConverter.SingleToUInt32Bits(f) >> 16);
+    private static float Bf16ToFloat(ushort h) => BitConverter.UInt32BitsToSingle((uint)h << 16);
 }

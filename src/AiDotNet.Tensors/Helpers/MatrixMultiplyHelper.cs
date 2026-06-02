@@ -31,9 +31,18 @@ internal static class MatrixMultiplyHelper
             Console.WriteLine($"[MATMUL-TRACE] TryGemm<{typeof(T).Name}>: m={m}, k={k}, n={n}");
         }
 
-        if (!(typeof(T) == typeof(float) || typeof(T) == typeof(double)))
+        // #378: FP16 (System.Half) and BF16 route to their SIMD GEMM microkernels
+        // (HalfKernels / BFloat16Kernels — float-accumulated upcast emulation) on net5.0+;
+        // net471 has no Vector256 intrinsics so they stay on the generic blocked path.
+        bool isSupportedType = typeof(T) == typeof(float) || typeof(T) == typeof(double);
+#if NET5_0_OR_GREATER
+        isSupportedType = isSupportedType
+            || typeof(T) == typeof(Half)
+            || typeof(T) == typeof(AiDotNet.Tensors.NumericOperations.BFloat16);
+#endif
+        if (!isSupportedType)
         {
-            if (TraceEnabled) Console.WriteLine("[MATMUL-TRACE] Type check failed - not float/double");
+            if (TraceEnabled) Console.WriteLine("[MATMUL-TRACE] Type check failed - not a SIMD-GEMM type");
             return false;
         }
 
@@ -290,6 +299,31 @@ internal static class MatrixMultiplyHelper
                 m, k, n);
             return true;
         }
+#if NET5_0_OR_GREATER
+        // #378: FP16 — SIMD upcast-emulation microkernel, float accumulator.
+        else if (typeof(T) == typeof(Half) && a is Half[] ah && b is Half[] bh && c is Half[] ch)
+        {
+            Engines.Simd.HalfKernels.Matmul(
+                ah.AsSpan(aOffset, m * k), k,
+                bh.AsSpan(bOffset, k * n), n,
+                ch.AsSpan(cOffset, m * n), n,
+                m, k, n);
+            return true;
+        }
+        // #378: BF16 — wire the (previously orphan) BF16 microkernel into the GEMM dispatch.
+        else if (typeof(T) == typeof(NumericOperations.BFloat16)
+                 && a is NumericOperations.BFloat16[] abf
+                 && b is NumericOperations.BFloat16[] bbf
+                 && c is NumericOperations.BFloat16[] cbf)
+        {
+            Engines.Simd.BFloat16Kernels.Matmul(
+                abf.AsSpan(aOffset, m * k), k,
+                bbf.AsSpan(bOffset, k * n), n,
+                cbf.AsSpan(cOffset, m * n), n,
+                m, k, n);
+            return true;
+        }
+#endif
 
         return false;
     }
