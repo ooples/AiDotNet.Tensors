@@ -2757,6 +2757,7 @@ public partial class CpuEngine : ITensorLevelEngine
 #endif
     public virtual unsafe Tensor<T> TensorAdd<T>(Tensor<T> a, Tensor<T> b)
     {
+        using var _opScope = AiDotNet.Tensors.Engines.Profiling.Profiler.OpScope("TensorAdd");
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
         if (!ShapesMatch(a._shape, b._shape))
@@ -34516,6 +34517,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
     public virtual Tensor<T> FusedLinear<T>(Tensor<T> input, Tensor<T> weights, Tensor<T>? bias, FusedActivationType activation, FusedActivationParams? activationParams = null)
     {
+        using var _opScope = AiDotNet.Tensors.Engines.Profiling.Profiler.OpScope("FusedLinear");
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (weights == null) throw new ArgumentNullException(nameof(weights));
 
@@ -34626,6 +34628,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var outArr = (float[])(object)result.GetDataArray();
 
                 bool blasDone = false;
+                var _ffnGemmScope = AiDotNet.Tensors.Engines.Profiling.Profiler.OpScope("FFN.GEMM");
 
 #if !NET471
                 // Tier -3 (opt-in, AIDOTNET_JIT_GEMM=1): our runtime-JIT'd AVX2 kernel.
@@ -34731,9 +34734,12 @@ public partial class CpuEngine : ITensorLevelEngine
                     }
                 }
 
+                _ffnGemmScope.Dispose();
+
                 // Fused bias + activation in one pass
                 if (bias != null || activation != FusedActivationType.None)
                 {
+                    using var _ffnEpi = AiDotNet.Tensors.Engines.Profiling.Profiler.OpScope("FFN.Epilogue");
                     var bArr = bias != null ? (float[])(object)bias.GetDataArray() : null;
                     CpuFusedOperations.ApplyBiasActivationInPlace(outArr, bArr, M, N, activation, activationParams);
                 }
