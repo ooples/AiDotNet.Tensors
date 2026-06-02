@@ -71,6 +71,7 @@ public static class MicrokernelGflopsBench
         {
             double peak = MeasureAvx2Fp64PeakGflops();
             BenchAvx2Fp64_4x8(peak);
+            if (Avx2Fp64_6x8.IsSupported) BenchAvx2Fp64_6x8(peak);
         }
         else Console.WriteLine("Avx2Fp64_4x8: not supported on this CPU.\n");
 
@@ -132,6 +133,18 @@ public static class MicrokernelGflopsBench
         Action call = () => Avx2Fp64_4x8.Run(packedA, packedB, c, Nr, Kc);
         double gflops = TimeKernel(call, 2.0 * Mr * Nr * Kc, warmup: 2_000, iters: 2_000_000);
         Report("Avx2Fp64_4x8   ", Mr, Nr, gflops, peakGflops);
+    }
+
+    private static void BenchAvx2Fp64_6x8(double peakGflops)
+    {
+        const int Mr = Avx2Fp64_6x8.Mr, Nr = Avx2Fp64_6x8.Nr;
+        var packedA = MakeRandomD(Kc * Mr);
+        var packedB = MakeRandomD(Kc * Nr);
+        var c = new double[Mr * Nr];
+
+        Action call = () => Avx2Fp64_6x8.Run(packedA, packedB, c, Nr, Kc);
+        double gflops = TimeKernel(call, 2.0 * Mr * Nr * Kc, warmup: 2_000, iters: 2_000_000);
+        Report("Avx2Fp64_6x8   ", Mr, Nr, gflops, peakGflops);
     }
 
     private static void BenchAvx512Fp32_16x16(double peakGflops)

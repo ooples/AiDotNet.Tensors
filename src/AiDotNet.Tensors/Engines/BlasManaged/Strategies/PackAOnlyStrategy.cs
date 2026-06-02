@@ -280,6 +280,15 @@ internal static class PackAOnlyStrategy
         }
         if (typeof(T) == typeof(double))
         {
+            // #409 S.4: higher-intensity 6×8 strided-B FP64 tile (Fast-mode default).
+            if (mr == 6 && nr == 8 && Avx2Fp64_6x8.IsSupported)
+            {
+                Avx2Fp64_6x8.RunStridedB(
+                    MemoryMarshal.Cast<T, double>(packedA),
+                    MemoryMarshal.Cast<T, double>(b), ldb,
+                    MemoryMarshal.Cast<T, double>(c), ldc, kc);
+                return;
+            }
             // Sub-D2 follow-up: AVX2 4×8 strided-B for FP64. Mr=4, Nr=8.
             if (mr == 4 && nr == 8 && Avx2Fp64_4x8.IsSupported)
             {
