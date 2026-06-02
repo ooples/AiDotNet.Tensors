@@ -42,29 +42,86 @@ internal static class PackAOnlyStrategy
     {
         if (mr <= 0 || nr <= 0)
             throw new ArgumentException($"mr and nr must be positive (mr={mr}, nr={nr}).");
-        if ((m % mr) != 0)
-            throw new NotSupportedException(
-                $"PackAOnlyStrategy requires m to be a multiple of mr (m={m}, mr={mr}). " +
-                "Tail row handling is tracked as follow-up work; callers should pad m " +
-                "or route to a strategy that handles remainders.");
-        if ((n % nr) != 0)
-            throw new NotSupportedException(
-                $"PackAOnlyStrategy requires n to be a multiple of nr (n={n}, nr={nr}). " +
-                "Tail column handling is tracked as follow-up work; callers should pad n " +
-                "or route to a strategy that handles remainders.");
 
-        int procs = options.NumThreads > 0 ? options.NumThreads : Environment.ProcessorCount;
-        if (options.NumThreads < 0) procs = 1;
-        bool isDeterministic = BlasProvider.IsDeterministicMode;
+        // M/N tail handling (#409 S.4 follow-through). The strided microkernels operate
+        // on full mr×nr tiles, so the aligned interior [0,mAligned)×[0,nAligned) runs the
+        // fast packed path and the remaining tail rows/columns are computed by a correct
+        // scalar edge pass. This makes the strategy robust to ANY (m, n) regardless of how
+        // the caller chose its tile width — e.g. BlasManaged.Gemm can compute its split
+        // with mr=6 (Fast 6×8) while this strategy runs with mr=4 (a concurrent flip of
+        // the process-global BlasProvider.IsDeterministicMode, or AVX-512-vs-AVX2 hardware
+        // differences, change PickMicrokernelTile's result between the split and dispatch),
+        // which previously threw NotSupportedException for the misaligned remainder.
+        int mAligned = m - (m % mr);
+        int nAligned = n - (n % nr);
 
-        var axis = AxisSelector.Select(m, n, k, mr, nr, procs, isDeterministic);
-        if (axis == ParallelismAxis.N && n >= procs * nr * 2)
+        if (mAligned > 0 && nAligned > 0)
         {
-            RunNParallel(a, lda, transA, b, ldb, c, ldc, m, n, k, mc, kc, mr, nr, in options, procs);
-            return;
+            int procs = options.NumThreads > 0 ? options.NumThreads : Environment.ProcessorCount;
+            if (options.NumThreads < 0) procs = 1;
+            bool isDeterministic = BlasProvider.IsDeterministicMode;
+
+            var axis = AxisSelector.Select(mAligned, nAligned, k, mr, nr, procs, isDeterministic);
+            if (axis == ParallelismAxis.N && nAligned >= procs * nr * 2)
+                RunNParallel(a, lda, transA, b, ldb, c, ldc, mAligned, nAligned, k, mc, kc, mr, nr, in options, procs);
+            else
+                RunSerial(a, lda, transA, b, ldb, c, ldc, mAligned, nAligned, k, mc, kc, mr, nr, in options);
         }
 
-        RunSerial(a, lda, transA, b, ldb, c, ldc, m, n, k, mc, kc, mr, nr, in options);
+        // M-tail: rows [mAligned, m) over ALL columns [0, n).
+        if (m > mAligned)
+            EdgeGemm(a, lda, transA, b, ldb, c, ldc, mAligned, m, 0, n, k);
+        // N-tail: the aligned rows [0, mAligned) over the remaining columns [nAligned, n).
+        if (n > nAligned && mAligned > 0)
+            EdgeGemm(a, lda, transA, b, ldb, c, ldc, 0, mAligned, nAligned, n, k);
+    }
+
+    /// <summary>
+    /// Correct scalar edge pass for tail tiles the strided microkernels can't cover
+    /// (partial mr rows or partial nr columns). Computes <c>C[i,j] += Σₚ A(i,p)·B(p,j)</c>
+    /// over the half-open row/column rectangle, accumulating in the element type to match
+    /// the microkernel's precision. Only float/double are supported (same set as
+    /// <see cref="DispatchStridedMicrokernel{T}"/>).
+    /// </summary>
+    private static void EdgeGemm<T>(
+        ReadOnlySpan<T> a, int lda, bool transA,
+        ReadOnlySpan<T> b, int ldb,
+        Span<T> c, int ldc,
+        int rowStart, int rowEnd, int colStart, int colEnd, int k) where T : unmanaged
+    {
+        if (rowEnd <= rowStart || colEnd <= colStart) return;
+
+        if (typeof(T) == typeof(double))
+        {
+            var ad = MemoryMarshal.Cast<T, double>(a);
+            var bd = MemoryMarshal.Cast<T, double>(b);
+            var cd = MemoryMarshal.Cast<T, double>(c);
+            for (int i = rowStart; i < rowEnd; i++)
+                for (int j = colStart; j < colEnd; j++)
+                {
+                    double acc = 0;
+                    for (int p = 0; p < k; p++)
+                        acc += (transA ? ad[p * lda + i] : ad[i * lda + p]) * bd[p * ldb + j];
+                    cd[i * ldc + j] += acc;
+                }
+            return;
+        }
+        if (typeof(T) == typeof(float))
+        {
+            var af = MemoryMarshal.Cast<T, float>(a);
+            var bf = MemoryMarshal.Cast<T, float>(b);
+            var cf = MemoryMarshal.Cast<T, float>(c);
+            for (int i = rowStart; i < rowEnd; i++)
+                for (int j = colStart; j < colEnd; j++)
+                {
+                    float acc = 0f;
+                    for (int p = 0; p < k; p++)
+                        acc += (transA ? af[p * lda + i] : af[i * lda + p]) * bf[p * ldb + j];
+                    cf[i * ldc + j] += acc;
+                }
+            return;
+        }
+        throw new NotSupportedException($"PackAOnlyStrategy edge does not support T={typeof(T).Name}.");
     }
 
     /// <summary>
