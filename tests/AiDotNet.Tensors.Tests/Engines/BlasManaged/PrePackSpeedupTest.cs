@@ -102,11 +102,6 @@ public class PrePackSpeedupTest
     [InlineData(128, 768, 768)]
     public void PrePackedB_Output_BitMatches_LivePack(int M, int N, int K)
     {
-        // Pin deterministic mode on this thread so the baseline (live-pack, mode-dependent
-        // tile) and the pre-packed run (mode-independent prepack tile) take the SAME path,
-        // immune to a concurrent test flipping the process-global flag — the historical flake.
-        using var _det = new DeterministicModeScope(deterministic: true);
-
         var rng = new Random(42);
         var a = new float[M * K];
         var b = new float[K * N];
