@@ -122,10 +122,14 @@ internal static class MachineCodeBf16Kernel
         ReadOnlySpan<ushort> a, ReadOnlySpan<ushort> b, Span<float> c, int m, int k, int n)
     {
         if (m <= 0 || k <= 0 || n <= 0) return true;
-        if (a.Length < m * k || b.Length < k * n || c.Length < m * n)
+        // Size math in long so large shapes can't wrap int, bypass the guard, and then fault in
+        // packing/allocation with negative lengths (a span never exceeds int.MaxValue, so an
+        // over-large requirement throws here). kPairs likewise from long before the int narrow.
+        long aNeeded = (long)m * k, bNeeded = (long)k * n, cNeeded = (long)m * n;
+        if (aNeeded > a.Length || bNeeded > b.Length || cNeeded > c.Length)
             throw new ArgumentException("BF16 GEMM: a/b/c spans smaller than M·K / K·N / M·N.");
 
-        int kPairs = (k + 1) / 2;
+        int kPairs = (int)(((long)k + 1) / 2);
         byte[] code = EmitGemmMicrokernelWindows();
         using var mem = ExecutableMemory.TryAllocate(code);
         if (mem is null || mem.Pointer == IntPtr.Zero) return false;

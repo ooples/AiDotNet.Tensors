@@ -678,6 +678,8 @@ class Program
         Console.WriteLine("  --linalg   : Run linear algebra benchmarks vs MathNet.Numerics");
         Console.WriteLine("  --cpu-matmul: Run CPU matrix multiply diagnostics");
         Console.WriteLine("  --microkernel-gflops: Microkernel-only GFLOPS vs register-FMA peak (Sub-S #409)");
+        Console.WriteLine("  --verify-vdpbf16: Verify emitted VDPBF16PS (run under Intel SDE); exits non-zero on mismatch (#378)");
+        Console.WriteLine("  --verify-bf16gemm: Verify the BF16 GEMM microkernel end to end (run under Intel SDE); exits non-zero on mismatch (#378)");
 #if !NET462
         Console.WriteLine("  --cublas   : Run cuBLAS vs DirectGpu GEMM benchmark");
         Console.WriteLine("  --opencl   : Run OpenCL GEMM benchmark (AMD/Intel GPUs)");
