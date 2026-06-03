@@ -142,6 +142,14 @@ internal static unsafe class JitGemmAvx2
     }
 
     internal static void RunJit(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c, int M, int N, int K)
+        => RunJit(a, b, c, M, N, K, forceParallel: null);
+
+    /// <summary>
+    /// <paramref name="forceParallel"/>: null = the built-in work heuristic;
+    /// true/false force the PPE-parallel or calling-thread-serial path (benching,
+    /// and serial callers already inside a PPE region).
+    /// </summary>
+    internal static void RunJit(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c, int M, int N, int K, bool? forceParallel)
     {
         int Mfull = M - M % 6, Nfull = N - N % 16;
         int numRB = Mfull / 6, numCB = Nfull / 16;
@@ -159,7 +167,8 @@ internal static unsafe class JitGemmAvx2
                 // calling thread — the per-GEMM PPE wake-up otherwise dwarfs the
                 // compute and regresses the forward pass (the kernel is fast; the
                 // dispatch is the cost). Measured crossover ~ a few M·N·K.
-                bool parallel = (long)M * N * K >= 4_000_000 && numRB >= 2;
+                bool parallel = forceParallel ?? ((long)M * N * K >= 4_000_000 && numRB >= 2);
+                if (parallel && numRB < 2) parallel = false;
                 if (parallel)
                 {
                     int maxT = Helpers.CpuParallelSettings.MaxDegreeOfParallelism;

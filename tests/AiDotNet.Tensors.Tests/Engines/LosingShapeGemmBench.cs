@@ -34,10 +34,9 @@ public class LosingShapeGemmBench
             ("xfmr-FFN b8",    256,  64, 128),
         };
         var rng = new Random(11);
-        bool jitEnabled = Environment.GetEnvironmentVariable("AIDOTNET_JIT_GEMM") == "1";
         bool hasBlas = BlasProvider.HasRawSgemm;
-        _out.WriteLine($"JIT enabled={jitEnabled} (JitGemmAvx2.Available={JitGemmAvx2.Available})  OpenBLAS={hasBlas}");
-        _out.WriteLine($"{"shape",-18}{"managed",12}{"asmJIT",12}{"OpenBLAS",12}   (GFLOP/s)   verdict");
+        _out.WriteLine($"JitAvailable={JitGemmAvx2.Available}  OpenBLAS={hasBlas}  ParallelWorkThreshold={SimdGemm.ParallelWorkThreshold}");
+        _out.WriteLine($"{"shape",-18} GFLOP/s:  mgd-ser  mgd-par  jit-ser  jit-par    blas");
 
         foreach (var (label, M, K, N) in shapes)
         {
@@ -49,12 +48,15 @@ public class LosingShapeGemmBench
 
             double Min(int iters, Action f) { for (int i = 0; i < 100; i++) f(); double m = 1e30; for (int i = 0; i < iters; i++) { var s = Stopwatch.GetTimestamp(); f(); double u = (Stopwatch.GetTimestamp() - s) * 1e6 / Stopwatch.Frequency; if (u < m) m = u; } return m; }
 
-            double tMgd = Min(2000, () => SimdGemm.SgemmAddInternal(A, K, false, B, N, false, C, M, K, N, allowParallel: true, clearedOutput: false));
+            // Managed serial vs parallel. The parallel column needs the work gate open
+            // for sub-20M shapes: run with AIDOTNET_GEMM_PARALLEL_MINWORK=1.
+            double tMgdS = Min(2000, () => SimdGemm.SgemmAddInternal(A, K, false, B, N, false, C, M, K, N, allowParallel: false, clearedOutput: false));
+            double tMgdP = Min(2000, () => SimdGemm.SgemmAddInternal(A, K, false, B, N, false, C, M, K, N, allowParallel: true, clearedOutput: false));
 
-            // Time the JIT panel kernel directly (force it, bypass the auto-tuner) so we
-            // see its real throughput vs managed regardless of the tuner's verdict.
-            bool jitWon = JitGemmAvx2.Available && M >= 6 && N >= 16;
-            double tJit = jitWon ? Min(2000, () => JitGemmAvx2.RunJit(A, B, Cj, M, N, K)) : double.NaN;
+            // Panel JIT, forced serial and forced parallel (bypass heuristics).
+            bool jitOk = JitGemmAvx2.Available && M >= 6 && N >= 16;
+            double tJitS = jitOk ? Min(2000, () => JitGemmAvx2.RunJit(A, B, Cj, M, N, K, forceParallel: false)) : double.NaN;
+            double tJitP = jitOk ? Min(2000, () => JitGemmAvx2.RunJit(A, B, Cj, M, N, K, forceParallel: true)) : double.NaN;
 
             double tBlas = double.NaN;
             if (hasBlas)
@@ -67,8 +69,8 @@ public class LosingShapeGemmBench
                 }
             }
 
-            string G(double us) => double.IsNaN(us) ? "  --" : $"{flop / us / 1e3,7:F0}";
-            _out.WriteLine($"{label,-18}{tMgd,9:F1}us {(double.IsNaN(tJit) ? "  --" : tJit.ToString("F1") + "us"),11} {(double.IsNaN(tBlas) ? "  --" : tBlas.ToString("F1") + "us"),11}   M:{G(tMgd)} J:{G(tJit)} B:{G(tBlas)}  jitWon={jitWon}");
+            string G(double us) => double.IsNaN(us) ? "     --" : $"{flop / us / 1e3,7:F0}";
+            _out.WriteLine($"{label,-18}          {G(tMgdS)}  {G(tMgdP)}  {G(tJitS)}  {G(tJitP)}  {G(tBlas)}");
         }
         Assert.True(true);
     }

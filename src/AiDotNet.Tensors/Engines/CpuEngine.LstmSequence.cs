@@ -445,6 +445,12 @@ public partial class CpuEngine
             // at this small K=hidden). Serial WITHIN a thread — the batch-level fan-out
             // (when present) already supplies the parallelism, and re-threading this tiny
             // per-step GEMM would oversubscribe and lose to dispatch overhead.
+            //
+            // Kernel choice is settled by the LosingShapeGemmBench 4-way matrix at this
+            // exact shape ([128,64,256], GF/s): managed-serial 103 BEATS managed-parallel
+            // 87, the asm panel kernel serial 53 / parallel 88, and OpenBLAS 66. The
+            // managed serial kernel is the measured optimum here — do NOT route this
+            // through JitGemmAvx2 or native BLAS without re-running that bench.
             SimdGemm.SgemmSequential(
                 hP.AsSpan(0, rows * hidden),
                 wHhT.AsSpan(0, hidden * gateRows),

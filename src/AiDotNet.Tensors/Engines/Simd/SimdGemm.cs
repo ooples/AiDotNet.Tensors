@@ -163,6 +163,27 @@ internal static partial class SimdGemm
         long.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_JIT_SMALLK_MINWORK"), out var jw) && jw > 0
             ? jw : 4_000_000;
 
+    // Work CEILING for the panel route. The 6xN panel re-reads the whole B panel
+    // once per 6-row block (it is unpacked by design); B traffic = (M/6)*K*N*4 bytes.
+    // At the proven shapes (M~1024: 4-13M MACs, ~5MB B traffic) that is fine and the
+    // panel wins 227-234 GF/s. At giant-M (transformer bs=128: M=4096, 33-50M MACs,
+    // 22-33MB B re-reads per GEMM) it saturates memory bandwidth and an interleaved
+    // end-to-end A/B showed a 16% regression — those shapes fall through to the
+    // managed kernel, whose packed/blocked path handles large M. Env-tunable.
+    internal static readonly long JitSmallKMaxWork =
+        long.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_JIT_SMALLK_MAXWORK"), out var jmw) && jmw > 0
+            ? jmw : 16_000_000;
+
+    // Row ceiling for the panel route. B-reread traffic scales with the row-block
+    // count (M/6), so giant-M shapes (transformer bs=128: M=4096, 682 row-blocks)
+    // regressed in interleaved A/Bs with ANY giant-M shape routed (FFN, QKV, or just
+    // the input projection) while the proven M~1024 regime kept a 22-24% end-to-end
+    // win. Cap M so the route engages exactly where the bake-off + end-to-end A/Bs
+    // validated it; larger M falls through to the managed packed/blocked kernel.
+    internal static readonly int JitSmallKMaxM =
+        int.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_JIT_SMALLK_MAXM"), out var jmm) && jmm > 0
+            ? jmm : 2048;
+
 #if NET5_0_OR_GREATER
     // ─── Path A: pre-packed B cache ────────────────────────────────────────
     //
@@ -285,6 +306,22 @@ internal static partial class SimdGemm
         // pure-GEMM MLP didn't translate the GFLOP/s win. Row-major contiguous.
         if (_jitGemm && JitGemmAvx2.TryMultiply(a, b.AsSpan(0, k * n), c, m, n, k))
             return;
+
+        // Small-K asm panel kernel (default on; AIDOTNET_JIT_SMALLK=0 disables).
+        // This entry is how FusedLinear routes the transformer FFN GEMMs
+        // ([B*seq,64]@[64,128]: K·N=8K <= 200K prefers cached-B) — without this
+        // hook the panel kernel never reached the FFN, only the MHA projections
+        // (which call Sgemm directly). Same gates as the Sgemm route: the 4-way
+        // bake-off shows the panel-parallel at 227-234 GF/s vs ~100 for managed
+        // (serial OR parallel) and 135-165 for OpenBLAS at these shapes, while
+        // below the work gate (e.g. bs=8's 2.1M) the cached-B/managed path wins.
+        if (_jitSmallK && JitGemmAvx2.Available
+            && k <= JitSmallKMaxK && m >= 6 && m <= JitSmallKMaxM && n >= 16
+            && (long)m * n * k >= JitSmallKMinWork && (long)m * n * k <= JitSmallKMaxWork)
+        {
+            JitGemmAvx2.RunJit(a, b.AsSpan(0, k * n), c, m, n, k);
+            return;
+        }
 #endif
 
         // Cache-eligibility gate: if n > Nc, the outer loop iterates jc multiple
@@ -935,7 +972,9 @@ internal static partial class SimdGemm
     /// <c>BackwardFunctions</c>) can mirror the gate exactly instead of
     /// hardcoding a duplicate value that drifts when this changes.
     /// </summary>
-    internal static readonly long ParallelWorkThreshold = ComputeParallelWorkThreshold();
+    internal static readonly long ParallelWorkThreshold =
+        long.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_GEMM_PARALLEL_MINWORK"), out var gpw) && gpw > 0
+            ? gpw : ComputeParallelWorkThreshold();
 
     private static long ComputeParallelWorkThreshold()
     {
@@ -1074,7 +1113,8 @@ internal static partial class SimdGemm
         // L1-resident at small K, so the 6xN kernel streams B once with no per-tile
         // managed->native transition.
         if (_jitSmallK && JitGemmAvx2.Available && !transA && !transB && lda == k && ldb == n
-            && k <= JitSmallKMaxK && m >= 6 && n >= 16 && (long)m * n * k >= JitSmallKMinWork)
+            && k <= JitSmallKMaxK && m >= 6 && m <= JitSmallKMaxM && n >= 16
+            && (long)m * n * k >= JitSmallKMinWork && (long)m * n * k <= JitSmallKMaxWork)
         {
             JitGemmAvx2.RunJit(a, b, c, m, n, k);
             return;
