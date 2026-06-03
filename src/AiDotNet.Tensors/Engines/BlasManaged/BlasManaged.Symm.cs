@@ -1,4 +1,5 @@
 using System;
+using System.Runtime.InteropServices;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
 
@@ -56,12 +57,44 @@ public static partial class BlasManaged
         else
             Gemm<T>(b, ldb, false, full, s, false, result, n, m, n, s, gemmOpts); // (m×n)(n×n)
 
-        // C = α·result + β·C
+        // C = α·result + β·C. float/double take a typed, JIT-vectorizable per-row AXPBY;
+        // the generic INumericOperations path is per-element interface-dispatched + boxed.
+        if (typeof(T) == typeof(float))
+            SymmEpilogueFloat(m, n, (float)(object)alpha, MemoryMarshal.Cast<T, float>(result),
+                (float)(object)beta, MemoryMarshal.Cast<T, float>(c), ldc);
+        else if (typeof(T) == typeof(double))
+            SymmEpilogueDouble(m, n, (double)(object)alpha, MemoryMarshal.Cast<T, double>(result),
+                (double)(object)beta, MemoryMarshal.Cast<T, double>(c), ldc);
+        else
+            for (int i = 0; i < m; i++)
+                for (int j = 0; j < n; j++)
+                {
+                    int ci = i * ldc + j;
+                    c[ci] = ops.Add(ops.Multiply(alpha, result[i * n + j]), ops.Multiply(beta, c[ci]));
+                }
+    }
+
+    private static void SymmEpilogueFloat(
+        int m, int n, float alpha, ReadOnlySpan<float> result, float beta, Span<float> c, int ldc)
+    {
         for (int i = 0; i < m; i++)
+        {
+            var r = result.Slice(i * n, n);
+            var cc = c.Slice(i * ldc, n);
             for (int j = 0; j < n; j++)
-            {
-                int ci = i * ldc + j;
-                c[ci] = ops.Add(ops.Multiply(alpha, result[i * n + j]), ops.Multiply(beta, c[ci]));
-            }
+                cc[j] = alpha * r[j] + beta * cc[j];
+        }
+    }
+
+    private static void SymmEpilogueDouble(
+        int m, int n, double alpha, ReadOnlySpan<double> result, double beta, Span<double> c, int ldc)
+    {
+        for (int i = 0; i < m; i++)
+        {
+            var r = result.Slice(i * n, n);
+            var cc = c.Slice(i * ldc, n);
+            for (int j = 0; j < n; j++)
+                cc[j] = alpha * r[j] + beta * cc[j];
+        }
     }
 }
