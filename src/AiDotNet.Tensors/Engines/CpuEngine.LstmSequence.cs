@@ -23,6 +23,33 @@ public partial class CpuEngine
     /// </summary>
     private static readonly Tensor<float> s_emptyState = new(new[] { 0 });
 
+    // Batch-parallel recurrence config. The LSTM recurrence is embarrassingly
+    // parallel across the batch dimension — h_t[b] depends only on h_{t-1}[b]
+    // and x_t[b], never on another batch row — so the entire T-timestep loop
+    // (per-step hidden GEMM + fused cell) can be split into contiguous batch
+    // chunks that run with ZERO inter-thread communication. The parallel region
+    // is launched ONCE for the whole sequence (not per timestep): an earlier
+    // attempt that relaunched the region every step lost to 32x dispatch
+    // overhead. Gated on rows-per-chunk so small batches (b=1/8 — which already
+    // beat PyTorch on the serial path) keep a single chunk and never pay the
+    // park/wakeup floor; only large batches (b=32/128, where the serial
+    // per-step M=batch GEMM is the bottleneck) fan out. Env-tunable for A/B.
+    // Default 8 rows/chunk: a MINROWS sweep on the AIsEval LSTM ([*, 32, 32],
+    // hidden=64) found 8 is the sweet spot. It keeps b<=8 on a single chunk (the
+    // serial path they already WIN on — fanning b=8 out to 4 chunks regressed it
+    // from 0.46x to 0.82x of PyTorch), while letting b=32 fan to 4 chunks
+    // (1.58x -> 1.17x) and b=128 saturate the cores (1.89x -> ~1.28x). Going
+    // lower (2/4 rows) over-fragments: the per-chunk M=2/4 recurrent GEMM is too
+    // thin to amortize, so b=32 degraded back to 1.3-1.4x.
+    private static readonly int _lstmParallelMinRowsPerChunk =
+        int.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_LSTM_PARALLEL_MINROWS"), out var lpr) && lpr > 0
+            ? lpr : 8;
+
+    // Master switch (default on). Set AIDOTNET_LSTM_PARALLEL=0 to force the
+    // serial recurrence for drift-cancelled on/off A/B measurement.
+    private static readonly bool _lstmParallelEnabled =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_LSTM_PARALLEL") != "0";
+
     /// <summary>
     /// Fused LSTM sequence forward — processes a full <c>[B, seq, in]</c> sequence
     /// through one LSTM cell in a single call, returning either the entire hidden
@@ -239,11 +266,6 @@ public partial class CpuEngine
         var pool = ArrayPool<float>.Shared;
 
         var wxBuf = pool.Rent(totalRows * gateRows);
-        var hCurrBuf = pool.Rent(batch * hidden);
-        var cCurrBuf = pool.Rent(batch * hidden);
-        var hPrevBuf = pool.Rent(batch * hidden);
-        var cPrevBuf = pool.Rent(batch * hidden);
-        var hhBuf = pool.Rent(batch * gateRows);     // h_prev @ wHh^T scratch (natural layout)
         // #477: pool the transposed hidden weight too. It used to be `new float[]` per
         // call (64 KB at the AIsEval shape) because SgemmWithCachedB keyed its pre-pack
         // cache on the array identity. Now the recurrent GEMM is SgemmSequential (no
@@ -255,6 +277,11 @@ public partial class CpuEngine
         var output = returnSequences
             ? AutoTensorCache.RentOrAllocate<float>(new[] { batch, seqLen, hidden })
             : AutoTensorCache.RentOrAllocate<float>(new[] { batch, hidden });
+
+        // Final-state tensors are allocated up front (when requested) so the
+        // batch-parallel chunks can each write their own row range into them.
+        finalHidden = wantState ? new Tensor<float>(new[] { batch, hidden }) : s_emptyState;
+        finalCell = wantState ? new Tensor<float>(new[] { batch, hidden }) : s_emptyState;
 
         try
         {
@@ -278,183 +305,91 @@ public partial class CpuEngine
                 }
             }
 
-            // Initial states.
-            if (h0 is null) Array.Clear(hPrevBuf, 0, batch * hidden);
-            else h0.AsSpan().Slice(0, batch * hidden).CopyTo(hPrevBuf.AsSpan(0, batch * hidden));
-            if (c0 is null) Array.Clear(cPrevBuf, 0, batch * hidden);
-            else c0.AsSpan().Slice(0, batch * hidden).CopyTo(cPrevBuf.AsSpan(0, batch * hidden));
-
             var wHhSpan = wHh.AsSpan();
-            bool hasBhh = bHh is not null;
-            ReadOnlySpan<float> bHhSpan = hasBhh ? bHh!.AsSpan() : default;
-            var outSpan = output.AsWritableSpan();
+            float[]? bHhArr = bHh?.ToArray();
+            float[]? h0Arr = h0?.ToArray();
+            float[]? c0Arr = c0?.ToArray();
 
-            // #477: the recurrent GEMM h_prev @ wHh^T runs once per timestep (seqLen
-            // serial calls). The old transB=true Sgemm re-transposed wHh on EVERY step.
-            // Pre-transpose wHh [gateRows, hidden] → wHhT [hidden, gateRows] ONCE, then
-            // pass wHhT as the no-transpose B operand to the per-step direct GEMM below
-            // ([hidden, gateRows] is exactly the [K, N] row-major layout SgemmSequential
-            // expects, so the per-step call needs no further transpose or packing setup).
-            // Pooled buffer (ArrayPool may return a larger array; every element of the
-            // [hidden, gateRows] window is overwritten by the transpose, so no stale data,
-            // and the GEMM call below slices to exactly hidden*gateRows).
+            // #477: the recurrent GEMM h_prev @ wHh^T runs once per timestep. The old
+            // transB=true Sgemm re-transposed wHh on EVERY step. Pre-transpose wHh
+            // [gateRows, hidden] → wHhT [hidden, gateRows] ONCE; [hidden, gateRows] is
+            // exactly the [K, N] row-major layout SgemmSequential expects, so the
+            // per-step call needs no further transpose or packing setup.
             var wHhT = wHhTBuf;
             for (int g = 0; g < gateRows; g++)
                 for (int hh2 = 0; hh2 < hidden; hh2++)
                     wHhT[hh2 * gateRows + g] = wHhSpan[g * hidden + hh2];
 
-            // Per-timestep loop.
-            for (int t = 0; t < seqLen; t++)
+            var outArr = (float[])(object)output.GetDataArray();
+            float[]? fhArr = wantState ? (float[])(object)finalHidden.GetDataArray() : null;
+            float[]? fcArr = wantState ? (float[])(object)finalCell.GetDataArray() : null;
+
+            // Decide batch-parallel fan-out. The recurrence is independent across
+            // batch rows, so split [0,batch) into `numChunks` CONTIGUOUS ranges and
+            // run the whole T-step loop per range. Only fan out when each chunk keeps
+            // a GEMM-healthy row count (>= _lstmParallelMinRowsPerChunk): small
+            // batches (b=1/8) collapse to one chunk and take the serial path they
+            // already win on. The parallel region launches ONCE for the sequence.
+            int numChunks = 1;
+            if (_lstmParallelEnabled)
             {
-                // hh = h_prev @ wHh^T = h_prev @ wHhT, [B, hidden] @ [hidden, gateRows].
-                // #477: route through SgemmSequential (the DIRECT 6×16 AVX2 kernel), NOT
-                // SgemmWithCachedB. A min-of-2000 microbench at this exact shape
-                // [M=128, K=64, N=256] showed the cached-pre-packed path runs ~82 GF/s
-                // while the direct kernel runs ~103 GF/s (+24%): for this small K the
-                // cached-B tiling machinery costs more than the direct kernel's lighter
-                // per-call packing, so the "avoid re-packing" optimization was a net loss
-                // here. Kept SERIAL: parallelizing this tiny per-step GEMM across the batch
-                // loses to dispatch overhead over the 32-step sequence (the issue's
-                // thread-insensitive finding).
-                SimdGemm.SgemmSequential(
-                    hPrevBuf.AsSpan(0, batch * hidden),
-                    wHhT.AsSpan(0, hidden * gateRows),
-                    hhBuf.AsSpan(0, batch * gateRows),
-                    batch, hidden, gateRows);
-
-                // #477 FUSED ELEMENTWISE CELL. Replaces the de-interleave + 3 batched
-                // activation passes + the cell-update passes (profiled at ~half the per-step
-                // wall-clock, all memory-bound) with ONE fused vectorized pass. For each
-                // (b, 8-lane h block) it reads the four gate pre-activations straight from
-                // the NATURAL [b][gateRows] Wx + hh (so no de-interleave and no gate buffer
-                // are materialized), applies sigmoid/tanh in registers (the same Padé
-                // FastSigmoid256/FastTanh256 that SimdKernels uses on this CPU), and writes
-                // c = f·c_prev + i·g and h = o·tanh(c) directly — the gate values never
-                // round-trip through memory. This is the memory-pass reduction a fused LSTM
-                // cell (oneDNN/MKL) relies on.
-                bool fusedVec = false;
-#if NET5_0_OR_GREATER
-                fusedVec = Avx2.IsSupported && Fma.IsSupported && (hidden % 8 == 0);
-#endif
-                if (fusedVec)
-                {
-#if NET5_0_OR_GREATER
-                    fixed (float* wxP = wxBuf)
-                    fixed (float* hhP = hhBuf)
-                    fixed (float* cPrevP = cPrevBuf)
-                    fixed (float* cCurrP = cCurrBuf)
-                    fixed (float* hCurrP = hCurrBuf)
-                    fixed (float* bHhP = bHhSpan)
-                    fixed (float* outP = outSpan)
-                    {
-                        for (int b = 0; b < batch; b++)
-                        {
-                            int wxRow = (b * seqLen + t) * gateRows;
-                            int hhRow = b * gateRows;
-                            int cRow = b * hidden;
-                            int outRow = (b * seqLen + t) * hidden;
-                            for (int h = 0; h < hidden; h += 8)
-                            {
-                                var iIn = Avx.Add(Avx.LoadVector256(wxP + wxRow + 0 * hidden + h), Avx.LoadVector256(hhP + hhRow + 0 * hidden + h));
-                                var fIn = Avx.Add(Avx.LoadVector256(wxP + wxRow + 1 * hidden + h), Avx.LoadVector256(hhP + hhRow + 1 * hidden + h));
-                                var gIn = Avx.Add(Avx.LoadVector256(wxP + wxRow + 2 * hidden + h), Avx.LoadVector256(hhP + hhRow + 2 * hidden + h));
-                                var oIn = Avx.Add(Avx.LoadVector256(wxP + wxRow + 3 * hidden + h), Avx.LoadVector256(hhP + hhRow + 3 * hidden + h));
-                                if (hasBhh)
-                                {
-                                    iIn = Avx.Add(iIn, Avx.LoadVector256(bHhP + 0 * hidden + h));
-                                    fIn = Avx.Add(fIn, Avx.LoadVector256(bHhP + 1 * hidden + h));
-                                    gIn = Avx.Add(gIn, Avx.LoadVector256(bHhP + 2 * hidden + h));
-                                    oIn = Avx.Add(oIn, Avx.LoadVector256(bHhP + 3 * hidden + h));
-                                }
-
-                                var iG = SimdKernels.FastSigmoid256(iIn);
-                                var fG = SimdKernels.FastSigmoid256(fIn);
-                                var gG = SimdKernels.FastTanh256(gIn);
-                                var oG = SimdKernels.FastSigmoid256(oIn);
-
-                                var cp = Avx.LoadVector256(cPrevP + cRow + h);
-                                var c = Fma.MultiplyAdd(fG, cp, Avx.Multiply(iG, gG)); // f·c_prev + i·g
-                                Avx.Store(cCurrP + cRow + h, c);
-                                var hv = Avx.Multiply(oG, SimdKernels.FastTanh256(c)); // o·tanh(c)
-                                Avx.Store(hCurrP + cRow + h, hv);
-                                if (returnSequences)
-                                    Avx.Store(outP + outRow + h, hv);
-                            }
-                        }
-                    }
-#endif
-                }
-                else
-                {
-                    // Scalar fused fallback (no AVX2/FMA, or hidden % 8 != 0): same fused
-                    // formula with exact MathF transcendentals.
-                    fixed (float* wxP = wxBuf)
-                    fixed (float* hhP = hhBuf)
-                    fixed (float* cPrevP = cPrevBuf)
-                    fixed (float* cCurrP = cCurrBuf)
-                    fixed (float* hCurrP = hCurrBuf)
-                    fixed (float* bHhP = bHhSpan)
-                    fixed (float* outP = outSpan)
-                    {
-                        for (int b = 0; b < batch; b++)
-                        {
-                            int wxRow = (b * seqLen + t) * gateRows;
-                            int hhRow = b * gateRows;
-                            int cRow = b * hidden;
-                            int outRow = (b * seqLen + t) * hidden;
-                            for (int h = 0; h < hidden; h++)
-                            {
-                                float iIn = wxP[wxRow + 0 * hidden + h] + hhP[hhRow + 0 * hidden + h];
-                                float fIn = wxP[wxRow + 1 * hidden + h] + hhP[hhRow + 1 * hidden + h];
-                                float gIn = wxP[wxRow + 2 * hidden + h] + hhP[hhRow + 2 * hidden + h];
-                                float oIn = wxP[wxRow + 3 * hidden + h] + hhP[hhRow + 3 * hidden + h];
-                                if (hasBhh)
-                                {
-                                    iIn += bHhP[0 * hidden + h]; fIn += bHhP[1 * hidden + h];
-                                    gIn += bHhP[2 * hidden + h]; oIn += bHhP[3 * hidden + h];
-                                }
-                                float iG = 1f / (1f + (float)Math.Exp(-iIn));
-                                float fG = 1f / (1f + (float)Math.Exp(-fIn));
-                                float gG = (float)Math.Tanh(gIn);
-                                float oG = 1f / (1f + (float)Math.Exp(-oIn));
-                                float c = fG * cPrevP[cRow + h] + iG * gG;
-                                cCurrP[cRow + h] = c;
-                                float hv = oG * (float)Math.Tanh(c);
-                                hCurrP[cRow + h] = hv;
-                                if (returnSequences) outP[outRow + h] = hv;
-                            }
-                        }
-                    }
-                }
-
-                // Swap roles: next iter's h_prev/c_prev are this iter's h_curr/c_curr.
-                (hPrevBuf, hCurrBuf) = (hCurrBuf, hPrevBuf);
-                (cPrevBuf, cCurrBuf) = (cCurrBuf, cPrevBuf);
+                int byRows = batch / Math.Max(1, _lstmParallelMinRowsPerChunk);
+                numChunks = Math.Max(1, Math.Min(byRows, CpuParallelSettings.MaxDegreeOfParallelism));
             }
 
-            if (!returnSequences)
+            if (numChunks <= 1)
             {
-                // hPrevBuf now holds the last hCurr (post-swap). Copy it out.
-                hPrevBuf.AsSpan(0, batch * hidden).CopyTo(outSpan);
-            }
-
-            if (wantState)
-            {
-                // Final states (h_n, c_n) for streaming/chunked inference. After the
-                // role-swap at the end of the last timestep, hPrevBuf / cPrevBuf hold
-                // the last step's hidden / cell state. Copy into owned [B, hidden]
-                // tensors so they outlive the pooled scratch returned below.
-                finalHidden = new Tensor<float>(new[] { batch, hidden });
-                finalCell = new Tensor<float>(new[] { batch, hidden });
-                hPrevBuf.AsSpan(0, batch * hidden).CopyTo(finalHidden.AsWritableSpan());
-                cPrevBuf.AsSpan(0, batch * hidden).CopyTo(finalCell.AsWritableSpan());
+                // Serial: one chunk covering the full batch, reusing pooled scratch.
+                var hPrevBuf = pool.Rent(batch * hidden);
+                var hCurrBuf = pool.Rent(batch * hidden);
+                var cPrevBuf = pool.Rent(batch * hidden);
+                var cCurrBuf = pool.Rent(batch * hidden);
+                var hhBuf = pool.Rent(batch * gateRows);
+                try
+                {
+                    RunLstmRecurrenceRange(
+                        wxBuf, wHhT, bHhArr, h0Arr, c0Arr,
+                        hPrevBuf, hCurrBuf, cPrevBuf, cCurrBuf, hhBuf,
+                        outArr, returnSequences, fhArr, fcArr,
+                        r0: 0, rows: batch, seqLen, hidden, gateRows);
+                }
+                finally
+                {
+                    pool.Return(hPrevBuf); pool.Return(hCurrBuf);
+                    pool.Return(cPrevBuf); pool.Return(cCurrBuf); pool.Return(hhBuf);
+                }
             }
             else
             {
-                // Hot path: caller discards state — skip the two [B, hidden]
-                // allocations + copies entirely. Share one cached empty tensor.
-                finalHidden = s_emptyState;
-                finalCell = s_emptyState;
+                // Batch-parallel: contiguous row ranges, one region launch. Each task
+                // rents its own scratch (no shared mutable state across threads — the
+                // only shared reads are wxBuf/wHhT/bHh/h0/c0, the only shared writes are
+                // disjoint row ranges of outArr/fhArr/fcArr).
+                int chunkRows = (batch + numChunks - 1) / numChunks;
+                Helpers.PersistentParallelExecutor.Instance.Execute(numChunks, chunk =>
+                {
+                    int r0 = chunk * chunkRows;
+                    if (r0 >= batch) return;
+                    int rows = Math.Min(chunkRows, batch - r0);
+                    var hPrevL = pool.Rent(rows * hidden);
+                    var hCurrL = pool.Rent(rows * hidden);
+                    var cPrevL = pool.Rent(rows * hidden);
+                    var cCurrL = pool.Rent(rows * hidden);
+                    var hhL = pool.Rent(rows * gateRows);
+                    try
+                    {
+                        RunLstmRecurrenceRange(
+                            wxBuf, wHhT, bHhArr, h0Arr, c0Arr,
+                            hPrevL, hCurrL, cPrevL, cCurrL, hhL,
+                            outArr, returnSequences, fhArr, fcArr,
+                            r0, rows, seqLen, hidden, gateRows);
+                    }
+                    finally
+                    {
+                        pool.Return(hPrevL); pool.Return(hCurrL);
+                        pool.Return(cPrevL); pool.Return(cCurrL); pool.Return(hhL);
+                    }
+                });
             }
 
             return output;
@@ -462,13 +397,168 @@ public partial class CpuEngine
         finally
         {
             pool.Return(wxBuf);
-            pool.Return(hCurrBuf);
-            pool.Return(cCurrBuf);
-            pool.Return(hPrevBuf);
-            pool.Return(cPrevBuf);
-            pool.Return(hhBuf);
             pool.Return(wHhTBuf);
         }
+    }
+
+    /// <summary>
+    /// Runs the full T-timestep LSTM recurrence (per-step recurrent GEMM + fused
+    /// elementwise cell) for a CONTIGUOUS range of batch rows <c>[r0, r0+rows)</c>.
+    /// Shared with the serial path (one call covering the whole batch) and the
+    /// batch-parallel path (one call per chunk). The <paramref name="hPrev"/> /
+    /// <paramref name="hCurr"/> / <paramref name="cPrev"/> / <paramref name="cCurr"/>
+    /// / <paramref name="hh"/> buffers are LOCAL scratch owned by the caller (sized
+    /// for <paramref name="rows"/>, not the full batch) and are mutated/ping-ponged
+    /// here. Shared reads: <paramref name="wxBuf"/> (pre-computed input projection,
+    /// indexed by GLOBAL row), <paramref name="wHhT"/>, bias, h0/c0. Shared writes:
+    /// disjoint global row ranges of <paramref name="outArr"/> and the optional final
+    /// state arrays — no two ranges overlap, so concurrent chunks need no locking.
+    /// </summary>
+    private static unsafe void RunLstmRecurrenceRange(
+        float[] wxBuf, float[] wHhT, float[]? bHhArr, float[]? h0Arr, float[]? c0Arr,
+        float[] hPrev, float[] hCurr, float[] cPrev, float[] cCurr, float[] hh,
+        float[] outArr, bool returnSequences, float[]? fhArr, float[]? fcArr,
+        int r0, int rows, int seqLen, int hidden, int gateRows)
+    {
+        bool hasBhh = bHhArr is not null;
+
+        // Initial states for this row range. Local buffers are indexed [localRow*hidden];
+        // h0/c0 are global [batch, hidden] so they are read at the global offset.
+        if (h0Arr is null) Array.Clear(hPrev, 0, rows * hidden);
+        else Array.Copy(h0Arr, r0 * hidden, hPrev, 0, rows * hidden);
+        if (c0Arr is null) Array.Clear(cPrev, 0, rows * hidden);
+        else Array.Copy(c0Arr, r0 * hidden, cPrev, 0, rows * hidden);
+
+        // Local ping-pong references (swapped each step). Using locals keeps the
+        // caller's array handles fixed for the pool.Return in its finally.
+        float[] hP = hPrev, hC = hCurr, cP = cPrev, cC = cCurr;
+
+        bool fusedVec = false;
+#if NET5_0_OR_GREATER
+        fusedVec = Avx2.IsSupported && Fma.IsSupported && (hidden % 8 == 0);
+#endif
+
+        for (int t = 0; t < seqLen; t++)
+        {
+            // hh = h_prev @ wHhT, [rows, hidden] @ [hidden, gateRows]. SgemmSequential
+            // is the DIRECT 6×16 AVX2 kernel (the cached-pre-packed path measured slower
+            // at this small K=hidden). Serial WITHIN a thread — the batch-level fan-out
+            // (when present) already supplies the parallelism, and re-threading this tiny
+            // per-step GEMM would oversubscribe and lose to dispatch overhead.
+            SimdGemm.SgemmSequential(
+                hP.AsSpan(0, rows * hidden),
+                wHhT.AsSpan(0, hidden * gateRows),
+                hh.AsSpan(0, rows * gateRows),
+                rows, hidden, gateRows);
+
+            // #477 FUSED ELEMENTWISE CELL: read the four gate pre-activations straight
+            // from the natural [row][gateRows] Wx + hh, apply sigmoid/tanh in registers,
+            // and write c = f·c_prev + i·g, h = o·tanh(c) directly — gates never
+            // round-trip through memory. `lr` is the local row; the GLOBAL row r0+lr
+            // indexes the shared wxBuf / outArr / final-state arrays.
+            if (fusedVec)
+            {
+#if NET5_0_OR_GREATER
+                fixed (float* wxP = wxBuf)
+                fixed (float* hhP = hh)
+                fixed (float* cPrevP = cP)
+                fixed (float* cCurrP = cC)
+                fixed (float* hCurrP = hC)
+                fixed (float* bHhP = bHhArr)
+                fixed (float* outP = outArr)
+                {
+                    for (int lr = 0; lr < rows; lr++)
+                    {
+                        int gb = r0 + lr;
+                        int wxRow = (gb * seqLen + t) * gateRows;
+                        int hhRow = lr * gateRows;
+                        int cRow = lr * hidden;
+                        int outRow = (gb * seqLen + t) * hidden;
+                        for (int h = 0; h < hidden; h += 8)
+                        {
+                            var iIn = Avx.Add(Avx.LoadVector256(wxP + wxRow + 0 * hidden + h), Avx.LoadVector256(hhP + hhRow + 0 * hidden + h));
+                            var fIn = Avx.Add(Avx.LoadVector256(wxP + wxRow + 1 * hidden + h), Avx.LoadVector256(hhP + hhRow + 1 * hidden + h));
+                            var gIn = Avx.Add(Avx.LoadVector256(wxP + wxRow + 2 * hidden + h), Avx.LoadVector256(hhP + hhRow + 2 * hidden + h));
+                            var oIn = Avx.Add(Avx.LoadVector256(wxP + wxRow + 3 * hidden + h), Avx.LoadVector256(hhP + hhRow + 3 * hidden + h));
+                            if (hasBhh)
+                            {
+                                iIn = Avx.Add(iIn, Avx.LoadVector256(bHhP + 0 * hidden + h));
+                                fIn = Avx.Add(fIn, Avx.LoadVector256(bHhP + 1 * hidden + h));
+                                gIn = Avx.Add(gIn, Avx.LoadVector256(bHhP + 2 * hidden + h));
+                                oIn = Avx.Add(oIn, Avx.LoadVector256(bHhP + 3 * hidden + h));
+                            }
+
+                            var iG = SimdKernels.FastSigmoid256(iIn);
+                            var fG = SimdKernels.FastSigmoid256(fIn);
+                            var gG = SimdKernels.FastTanh256(gIn);
+                            var oG = SimdKernels.FastSigmoid256(oIn);
+
+                            var cp = Avx.LoadVector256(cPrevP + cRow + h);
+                            var c = Fma.MultiplyAdd(fG, cp, Avx.Multiply(iG, gG)); // f·c_prev + i·g
+                            Avx.Store(cCurrP + cRow + h, c);
+                            var hv = Avx.Multiply(oG, SimdKernels.FastTanh256(c)); // o·tanh(c)
+                            Avx.Store(hCurrP + cRow + h, hv);
+                            if (returnSequences)
+                                Avx.Store(outP + outRow + h, hv);
+                        }
+                    }
+                }
+#endif
+            }
+            else
+            {
+                // Scalar fused fallback (no AVX2/FMA, or hidden % 8 != 0).
+                fixed (float* wxP = wxBuf)
+                fixed (float* hhP = hh)
+                fixed (float* cPrevP = cP)
+                fixed (float* cCurrP = cC)
+                fixed (float* hCurrP = hC)
+                fixed (float* bHhP = bHhArr)
+                fixed (float* outP = outArr)
+                {
+                    for (int lr = 0; lr < rows; lr++)
+                    {
+                        int gb = r0 + lr;
+                        int wxRow = (gb * seqLen + t) * gateRows;
+                        int hhRow = lr * gateRows;
+                        int cRow = lr * hidden;
+                        int outRow = (gb * seqLen + t) * hidden;
+                        for (int h = 0; h < hidden; h++)
+                        {
+                            float iIn = wxP[wxRow + 0 * hidden + h] + hhP[hhRow + 0 * hidden + h];
+                            float fIn = wxP[wxRow + 1 * hidden + h] + hhP[hhRow + 1 * hidden + h];
+                            float gIn = wxP[wxRow + 2 * hidden + h] + hhP[hhRow + 2 * hidden + h];
+                            float oIn = wxP[wxRow + 3 * hidden + h] + hhP[hhRow + 3 * hidden + h];
+                            if (hasBhh)
+                            {
+                                iIn += bHhP[0 * hidden + h]; fIn += bHhP[1 * hidden + h];
+                                gIn += bHhP[2 * hidden + h]; oIn += bHhP[3 * hidden + h];
+                            }
+                            float iG = 1f / (1f + (float)Math.Exp(-iIn));
+                            float fG = 1f / (1f + (float)Math.Exp(-fIn));
+                            float gG = (float)Math.Tanh(gIn);
+                            float oG = 1f / (1f + (float)Math.Exp(-oIn));
+                            float c = fG * cPrevP[cRow + h] + iG * gG;
+                            cCurrP[cRow + h] = c;
+                            float hv = oG * (float)Math.Tanh(c);
+                            hCurrP[cRow + h] = hv;
+                            if (returnSequences) outP[outRow + h] = hv;
+                        }
+                    }
+                }
+            }
+
+            // Swap roles: next iter's prev is this iter's curr.
+            (hP, hC) = (hC, hP);
+            (cP, cC) = (cC, cP);
+        }
+
+        // After the loop, hP/cP hold the last timestep's hidden/cell state for these rows.
+        if (!returnSequences)
+            Array.Copy(hP, 0, outArr, r0 * hidden, rows * hidden);
+
+        if (fhArr is not null) Array.Copy(hP, 0, fhArr, r0 * hidden, rows * hidden);
+        if (fcArr is not null) Array.Copy(cP, 0, fcArr, r0 * hidden, rows * hidden);
     }
 
     /// <summary>
