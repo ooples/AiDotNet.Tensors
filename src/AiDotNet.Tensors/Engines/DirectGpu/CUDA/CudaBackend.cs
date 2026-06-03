@@ -969,7 +969,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             return pooled;
         }
 
-        CuBlasNative.CheckCudaResult(CuBlasNative.cuMemAlloc(out IntPtr devicePtr, byteSize), "cuMemAlloc");
+        IntPtr devicePtr = AllocDeviceMemoryWithRetry(byteSize);
 
         try
         {
@@ -990,6 +990,44 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         }
 
         return new CudaGpuBuffer(_cudaContext, devicePtr, size, _bufferPool.Return);
+    }
+
+    /// <summary>
+    /// Allocates device memory with an OOM-recovery retry. If the driver reports
+    /// out-of-memory, drain the buffer pool — a real <c>cuMemFree</c> of every
+    /// retained-for-reuse buffer — and retry the allocation once. The pool holds
+    /// bounded-but-real device memory (up to <c>_maxPerSize</c> buffers per
+    /// power-of-two bucket); under genuine pressure reclaiming it lets the
+    /// allocation through. This is the fix for the cross-step working-set growth
+    /// that OOM'd a 12 GB card on a tiny d256/L2 cortex past ~200K tokens
+    /// (200K trained, 250K OOM'd at the same per-step cost → accumulation, not a
+    /// single-step peak). If it still OOMs after draining, report the actual
+    /// free/total device memory (cuMemGetInfo) in the exception so the residual
+    /// consumer is visible rather than a bare "Out of memory".
+    /// </summary>
+    private IntPtr AllocDeviceMemoryWithRetry(ulong byteSize)
+    {
+        var result = CuBlasNative.cuMemAlloc(out IntPtr devicePtr, byteSize);
+        if (result == CudaResult.OutOfMemory)
+        {
+            int drained = _bufferPool.DrainAll();
+            result = CuBlasNative.cuMemAlloc(out devicePtr, byteSize);
+            if (result != CudaResult.Success)
+            {
+                ulong free = 0, total = 0;
+                try { CudaNativeBindings.cuMemGetInfo(out free, out total); }
+                catch { /* diagnostic only — never mask the real failure */ }
+                throw new InvalidOperationException(
+                    $"cuMemAlloc failed: {CuBlasNative.GetCudaErrorString(result)} " +
+                    $"(requested {byteSize} bytes; drained {drained} pooled buffers; " +
+                    $"device free={free} total={total} bytes)");
+            }
+        }
+        else
+        {
+            CuBlasNative.CheckCudaResult(result, "cuMemAlloc");
+        }
+        return devicePtr;
     }
 
     public IGpuBuffer AllocateBuffer(int size)
@@ -1013,7 +1051,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         }
 
         ulong byteSize = (ulong)size * sizeof(float);
-        CuBlasNative.CheckCudaResult(CuBlasNative.cuMemAlloc(out IntPtr devicePtr, byteSize), "cuMemAlloc");
+        IntPtr devicePtr = AllocDeviceMemoryWithRetry(byteSize);
         CuBlasNative.CheckCudaResult(CuBlasNative.cuMemsetD32(devicePtr, 0, (ulong)size), "cuMemsetD32");
         return new CudaGpuBuffer(_cudaContext, devicePtr, size, _bufferPool.Return);
     }

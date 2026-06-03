@@ -1179,8 +1179,22 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             if (entries[i].Value.Timestamp <= threshold)
             {
+                // #226: an entry whose key still has a pending deferred download cannot
+                // simply have its buffer dropped — a later CPU read of that array would see
+                // garbage / hit a freed buffer. The original code SKIPPED such entries, but
+                // during pure-GPU training essentially every activation is registered as
+                // pending-deferred and never read on the CPU, so skipping made the cache
+                // un-evictable: it blew past both the count cap AND the 75%-VRAM byte cap and
+                // OOM'd the card (a tiny d256/L2 cortex pegged 12 GB past ~200K tokens — the
+                // long-hunted training OOM). Fix: MATERIALIZE the pending download now (copies
+                // the buffer into its CPU array while the buffer is still alive — the exact
+                // contract InvalidateActivationCacheEntry already relies on), THEN free the
+                // buffer. Correctness preserved; memory actually reclaimed so the cap holds.
                 if (Helpers.DeferredArrayMaterializer.IsPending(entries[i].Key))
-                    continue;
+                {
+                    try { Helpers.DeferredArrayMaterializer.TryMaterialize(entries[i].Key); }
+                    catch { Helpers.DeferredArrayMaterializer.Remove(entries[i].Key); }
+                }
 
                 if (_activationCache.TryRemove(entries[i].Key, out var entry))
                 {
