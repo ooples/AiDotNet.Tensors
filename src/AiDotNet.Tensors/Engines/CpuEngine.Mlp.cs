@@ -149,14 +149,26 @@ public partial class CpuEngine
                 float[] bufB = maxIntermediate > 0 ? pool.Rent(maxIntermediate) : System.Array.Empty<float>();
                 try
                 {
-                    float[] src = (float[])(object)input.GetDataArray();
+                    // #475: read the input/weights through AsSpan (no copy) rather than
+                    // GetDataArray. GetDataArray hands back a *copy* for any tensor whose
+                    // _device != CPU — and the GPU auto-detect ModuleInitializer makes the
+                    // default engine (hence freshly-created tensors) GPU-resident on any box
+                    // with a working accelerator, even when the data lives in a CPU array.
+                    // That made this CPU primitive re-copy every weight on every call
+                    // (~1.5 MB for the 784×512 head alone), dominating per-call allocation
+                    // and feeding the GC tail. AsSpan returns the live CPU span after
+                    // EnsureMaterialized, so it's a no-op on genuinely CPU-resident tensors
+                    // and skips the per-call snapshot on CPU-resident-but-GPU-tagged ones.
+                    // (We're inside the typeof(T)==float branch, so the (object) casts are
+                    // exact reference casts, not boxing.)
+                    var inputF = (Tensor<float>)(object)input;
+                    ReadOnlySpan<float> srcSpan = inputF.AsSpan();
                     int curK = k0;
                     int pingToggle = 0;
                     for (int i = 0; i < weights.Count; i++)
                     {
                         var w = weights[i];
                         int n = w._shape[1];
-                        var wArr = (float[])(object)w.GetDataArray();
                         // Last layer writes directly into the result buffer (no copy).
                         float[] dst = i == last ? outArr : (pingToggle == 0 ? bufA : bufB);
 
@@ -173,20 +185,27 @@ public partial class CpuEngine
                         bool preferManaged = (long)curK * n <= 200_000 || !BlasProvider.HasRawSgemm;
                         if (preferManaged)
                         {
+                            // Managed cached-B keys its pre-pack on the weight array identity,
+                            // so it needs a float[]. The narrow layers it serves are small, so
+                            // the GetDataArray snapshot (a copy only for GPU-tagged weights) is
+                            // cheap relative to the wide-head copy avoided above.
+                            var wArr = (float[])(object)w.GetDataArray();
                             Simd.SimdGemm.SgemmWithCachedB(
-                                src.AsSpan(0, M * curK), wArr, dst.AsSpan(0, M * n), M, curK, n);
+                                srcSpan.Slice(0, M * curK), wArr, dst.AsSpan(0, M * n), M, curK, n);
                         }
                         else
                         {
+                            ReadOnlySpan<float> wSpan = ((Tensor<float>)(object)w).AsSpan();
                             unsafe
                             {
-                                fixed (float* ps = src, pw = wArr, pd = dst)
+                                fixed (float* ps = srcSpan, pw = wSpan, pd = dst)
                                 {
                                     if (BlasProvider.HasRawSgemm)
                                         BlasProvider.SgemmRaw(M, n, curK, ps, curK, pw, n, pd, n);
                                     else
                                         Simd.SimdGemm.SgemmWithCachedB(
-                                            src.AsSpan(0, M * curK), wArr, dst.AsSpan(0, M * n), M, curK, n);
+                                            srcSpan.Slice(0, M * curK), (float[])(object)w.GetDataArray(),
+                                            dst.AsSpan(0, M * n), M, curK, n);
                                 }
                             }
                         }
@@ -198,7 +217,7 @@ public partial class CpuEngine
                         if (bArr is not null || act != FusedActivationType.None)
                             CpuFusedOperations.ApplyBiasActivationInPlace(dst, bArr, M, n, act, ap);
 
-                        src = dst;
+                        srcSpan = dst.AsSpan(0, M * n);
                         curK = n;
                         if (i != last) pingToggle ^= 1;
                     }
