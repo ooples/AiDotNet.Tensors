@@ -107,6 +107,26 @@ internal sealed class OptimizedBackwardPlan<T>
         _inputsBuf2 = BackwardInputBuffers<T>.Get2();
         _inputsBuf3 = BackwardInputBuffers<T>.Get3();
 
+        // OOM fix: free each forward activation's GPU buffer as soon as it is DEAD — right after its entry's backward,
+        // in reverse-topological order its output is fully consumed (every consumer was processed earlier). Previously
+        // all forward activations stayed GPU-pinned for the whole backward, pegging the card at its memory limit →
+        // OOM at scale. Skip the loss + sources/retained tensors: the loss IS an entry.Output (the loss op's
+        // output), and the caller reads its value after backward, so it must never be freed mid-walk — same
+        // contract as CompiledDelegateChain.Execute. (Gated to GPU engine; materialize-then-free is correctness-safe.)
+        var gpuEngine = _engine as AiDotNet.Tensors.Engines.DirectGpuTensorEngine;
+        HashSet<Tensor<T>>? freeSkip = null;
+        if (gpuEngine is not null)
+        {
+            freeSkip = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance) { _loss };
+            if (_sources is not null) foreach (var s in _sources) freeSkip.Add(s);
+            if (_retainGrad is not null) foreach (var r in _retainGrad) freeSkip.Add(r);
+        }
+        void FreeDeadActivation(Tensor<T> t)
+        {
+            if (gpuEngine is not null && (freeSkip is null || !freeSkip.Contains(t)))
+                gpuEngine.InvalidateGpuCacheForTensor(t);
+        }
+
         try
         {
             foreach (int i in _reachableIndices)
@@ -120,7 +140,10 @@ internal sealed class OptimizedBackwardPlan<T>
 
                 // Try optimized path for MatMul operations
                 if (TryOptimizedMatMulBackward(ref entry, gradOutput, cse, grads))
+                {
+                    FreeDeadActivation(entry.Output);
                     continue;
+                }
 
                 // Default path: use the original backward function.
                 // Phase A (#338) timing wrapper records per-op ticks when
@@ -137,6 +160,8 @@ internal sealed class OptimizedBackwardPlan<T>
                     entry.SavedState ?? Array.Empty<object>(), _engine, grads);
                 if (BackwardTiming.Enabled)
                     BackwardTiming.Record(entry.Backward.Method.Name, System.Diagnostics.Stopwatch.GetTimestamp() - _bwdStart);
+
+                FreeDeadActivation(entry.Output);
             }
         }
         finally

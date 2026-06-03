@@ -1,3 +1,4 @@
+#if !NET471 // JitGemmAvx2 is the AVX2 runtime-emit kernel — net5+/x86 only (see JitGemmAvx2.cs).
 // Correctness of the 6×N asm panel kernel (JitGemmAvx2): the runtime-emitted
 // machine code must match a managed reference GEMM across shapes and edges
 // (M%6 != 0, N%16 != 0, various K). Requires AIDOTNET_JIT_GEMM=1 so the panel
@@ -74,3 +75,4 @@ public class JitPanelKernelTests
 
     private static float[] RandF(int n, Random r) { var a = new float[n]; for (int i = 0; i < n; i++) a[i] = (float)(r.NextDouble() * 2 - 1); return a; }
 }
+#endif

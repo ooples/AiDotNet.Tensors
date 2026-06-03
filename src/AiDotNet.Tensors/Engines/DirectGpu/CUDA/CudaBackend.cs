@@ -83,6 +83,21 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     private IntPtr _audioModule;
     private IntPtr _linalgModule;
     private bool _disposed;
+
+    // Process-exit guard: at process/AppDomain teardown the CUDA driver may already be unloaded, so calling ANY
+    // native CUDA API from a finalizer (CudaGpuBuffer.Release, CudaBackend.Dispose) FATAL-crashes the process — it
+    // is NOT a catchable .NET exception. Skip native cleanup when exiting; the OS reclaims GPU memory on process death.
+    internal static volatile bool ProcessExiting;
+    static CudaBackend()
+    {
+        try
+        {
+            AppDomain.CurrentDomain.ProcessExit += (_, __) => ProcessExiting = true;
+            AppDomain.CurrentDomain.DomainUnload += (_, __) => ProcessExiting = true;
+        }
+        catch { }
+    }
+
     private const int MaxPooledBufferElements = 16_777_216;
     private const int MaxPooledBuffersPerSize = 4;
     private readonly GpuBufferPool<CudaGpuBuffer> _bufferPool =
@@ -961,7 +976,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             return pooled;
         }
 
-        CuBlasNative.CheckCudaResult(CuBlasNative.cuMemAlloc(out IntPtr devicePtr, byteSize), "cuMemAlloc");
+        IntPtr devicePtr = AllocDeviceMemoryWithRetry(byteSize);
 
         try
         {
@@ -982,6 +997,44 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         }
 
         return new CudaGpuBuffer(_cudaContext, devicePtr, size, _bufferPool.Return);
+    }
+
+    /// <summary>
+    /// Allocates device memory with an OOM-recovery retry. If the driver reports
+    /// out-of-memory, drain the buffer pool — a real <c>cuMemFree</c> of every
+    /// retained-for-reuse buffer — and retry the allocation once. The pool holds
+    /// bounded-but-real device memory (up to <c>_maxPerSize</c> buffers per
+    /// power-of-two bucket); under genuine pressure reclaiming it lets the
+    /// allocation through. This is the fix for the cross-step working-set growth
+    /// that OOM'd a 12 GB card on a tiny d256/L2 cortex past ~200K tokens
+    /// (200K trained, 250K OOM'd at the same per-step cost → accumulation, not a
+    /// single-step peak). If it still OOMs after draining, report the actual
+    /// free/total device memory (cuMemGetInfo) in the exception so the residual
+    /// consumer is visible rather than a bare "Out of memory".
+    /// </summary>
+    private IntPtr AllocDeviceMemoryWithRetry(ulong byteSize)
+    {
+        var result = CuBlasNative.cuMemAlloc(out IntPtr devicePtr, byteSize);
+        if (result == CudaResult.OutOfMemory)
+        {
+            int drained = _bufferPool.DrainAll();
+            result = CuBlasNative.cuMemAlloc(out devicePtr, byteSize);
+            if (result != CudaResult.Success)
+            {
+                ulong free = 0, total = 0;
+                try { CudaNativeBindings.cuMemGetInfo(out free, out total); }
+                catch { /* diagnostic only — never mask the real failure */ }
+                throw new InvalidOperationException(
+                    $"cuMemAlloc failed: {CuBlasNative.GetCudaErrorString(result)} " +
+                    $"(requested {byteSize} bytes; drained {drained} pooled buffers; " +
+                    $"device free={free} total={total} bytes)");
+            }
+        }
+        else
+        {
+            CuBlasNative.CheckCudaResult(result, "cuMemAlloc");
+        }
+        return devicePtr;
     }
 
     public IGpuBuffer AllocateBuffer(int size)
@@ -1005,7 +1058,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         }
 
         ulong byteSize = (ulong)size * sizeof(float);
-        CuBlasNative.CheckCudaResult(CuBlasNative.cuMemAlloc(out IntPtr devicePtr, byteSize), "cuMemAlloc");
+        IntPtr devicePtr = AllocDeviceMemoryWithRetry(byteSize);
         CuBlasNative.CheckCudaResult(CuBlasNative.cuMemsetD32(devicePtr, 0, (ulong)size), "cuMemsetD32");
         return new CudaGpuBuffer(_cudaContext, devicePtr, size, _bufferPool.Return);
     }
@@ -11373,8 +11426,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         IntPtr pI = input.Handle, pO = output.Handle;
         void** args = stackalloc void*[4];
         args[0] = &pI; args[1] = &pO; args[2] = &rows; args[3] = &cols;
-        CudaNativeBindings.cuLaunchKernel(kernel, grid, 1, 1, (uint)blockSize, 1, 1,
-            (uint)sharedMem, IntPtr.Zero, (IntPtr)args, IntPtr.Zero);
+        // Was an UNCHECKED launch on the DEFAULT stream (IntPtr.Zero) while every other op uses _stream — a fault
+        // here went unsurfaced and could read buffers out of order vs the rest of the pipeline. Check the result and
+        // use _stream for ordering.
+        CuBlasNative.CheckCudaResult(
+            CudaNativeBindings.cuLaunchKernel(kernel, grid, 1, 1, (uint)blockSize, 1, 1,
+                (uint)sharedMem, _stream, (IntPtr)args, IntPtr.Zero),
+            "cuLaunchKernel(softmax_rows)");
     }
 
     // ─── HRR binding primitives (issue #248) ────────────────────────
@@ -12509,7 +12567,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         // The OS reclaims the context and all device memory at process exit, so the only
         // safe action here is to do nothing. Explicit Dispose during normal operation
         // (disposing == true, not tearing down) still performs the full native cleanup.
-        if (!disposing || IsRuntimeTearingDown)
+        // Guard on the union of both teardown signals: IsRuntimeTearingDown (this PR) and
+        // ProcessExiting (the merged #536 CUDA-finalizer-safety fix) — either means the
+        // driver/runtime may be gone, so skip the native + pool cleanup entirely.
+        if (!disposing || IsRuntimeTearingDown || ProcessExiting)
             return;
 
         _pinnedPool.Dispose();
@@ -13470,8 +13531,11 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     ~CudaBackend()
     {
-        // Finalizer: never touch managed members or the CUDA driver — see Dispose(bool).
-        Dispose(disposing: false);
+        // Finalizer: never touch managed members or the CUDA driver — Dispose(bool)'s
+        // !disposing/IsRuntimeTearingDown/ProcessExiting guard makes this a no-op (the OS
+        // reclaims the context + device memory at process exit). The try/catch is
+        // belt-and-suspenders: a finalizer must NEVER throw, even if that contract changes.
+        try { Dispose(disposing: false); } catch { }
     }
 
     internal sealed class CudaGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
@@ -13513,18 +13577,21 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             // and just clear the handles.
             if (!IsRuntimeTearingDown)
             {
-                try
+                // Skip the native free at process exit (the driver is gone — any native CUDA
+                // call FATAL-crashes, uncatchable); otherwise free, suppressing any disposal
+                // error so a finalizer can't crash.
+                if (_context != IntPtr.Zero && !ProcessExiting)
                 {
-                    if (_context != IntPtr.Zero)
+                    try
                     {
                         CuBlasNative.cuCtxPushCurrent(_context);
                         CuBlasNative.cuMemFree(_devicePtr);
                         CuBlasNative.cuCtxPopCurrent(out _);
                     }
-                }
-                catch
-                {
-                    // Suppress disposal errors to avoid crashing finalizers.
+                    catch
+                    {
+                        // Suppress disposal errors to avoid crashing finalizers.
+                    }
                 }
             }
 
@@ -13587,18 +13654,21 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             // avoid a finalizer-fatal access violation on an already-destroyed context.
             if (!IsRuntimeTearingDown)
             {
-                try
+                // Skip the native free at process exit (the driver is gone — any native CUDA
+                // call FATAL-crashes, uncatchable); otherwise free, suppressing any disposal
+                // error so a finalizer can't crash.
+                if (_context != IntPtr.Zero && !ProcessExiting)
                 {
-                    if (_context != IntPtr.Zero)
+                    try
                     {
                         CuBlasNative.cuCtxPushCurrent(_context);
                         CuBlasNative.cuMemFree(_devicePtr);
                         CuBlasNative.cuCtxPopCurrent(out _);
                     }
-                }
-                catch
-                {
-                    // Suppress disposal errors to avoid crashing finalizers.
+                    catch
+                    {
+                        // Suppress disposal errors to avoid crashing finalizers.
+                    }
                 }
             }
 

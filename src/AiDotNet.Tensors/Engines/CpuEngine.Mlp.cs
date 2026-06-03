@@ -149,14 +149,26 @@ public partial class CpuEngine
                 float[] bufB = maxIntermediate > 0 ? pool.Rent(maxIntermediate) : System.Array.Empty<float>();
                 try
                 {
-                    float[] src = (float[])(object)input.GetDataArray();
+                    // #475: read the input/weights through AsSpan (no copy) rather than
+                    // GetDataArray. GetDataArray hands back a *copy* for any tensor whose
+                    // _device != CPU — and the GPU auto-detect ModuleInitializer makes the
+                    // default engine (hence freshly-created tensors) GPU-resident on any box
+                    // with a working accelerator, even when the data lives in a CPU array.
+                    // That made this CPU primitive re-copy every weight on every call
+                    // (~1.5 MB for the 784×512 head alone), dominating per-call allocation
+                    // and feeding the GC tail. AsSpan returns the live CPU span after
+                    // EnsureMaterialized, so it's a no-op on genuinely CPU-resident tensors
+                    // and skips the per-call snapshot on CPU-resident-but-GPU-tagged ones.
+                    // (We're inside the typeof(T)==float branch, so the (object) casts are
+                    // exact reference casts, not boxing.)
+                    var inputF = (Tensor<float>)(object)input;
+                    ReadOnlySpan<float> srcSpan = inputF.AsSpan();
                     int curK = k0;
                     int pingToggle = 0;
                     for (int i = 0; i < weights.Count; i++)
                     {
                         var w = weights[i];
                         int n = w._shape[1];
-                        var wArr = (float[])(object)w.GetDataArray();
                         // Last layer writes directly into the result buffer (no copy).
                         float[] dst = i == last ? outArr : (pingToggle == 0 ? bufA : bufB);
 
@@ -170,13 +182,21 @@ public partial class CpuEngine
                         // cached-B still wins the small layers (low K·N), where native
                         // BLAS dispatch overhead dominates. Mirror that split here without
                         // changing PreferManagedInferenceGemm (which FusedLinear also uses).
+                        // #475 AsSpan contract (see the comment above the loop): read the weight
+                        // as the live CPU span — no GPU-tagged snapshot copy. The JIT and native
+                        // paths use this span directly; the managed cached-B path additionally
+                        // needs the STABLE backing float[] (GetFlattenedData) for its
+                        // identity-keyed pre-pack. AsSpan also materializes lazy data once.
+                        var wT = (Tensor<float>)(object)w;
+                        ReadOnlySpan<float> wSpan = wT.AsSpan();
+
                         bool gemmDone = false;
 #if !NET471
                         // JIT'd AVX2 kernel first (opt-in) — beats both managed cached-B
                         // and native BLAS on the MLP shapes; this is the path the MLP
                         // actually takes (so without it the JIT never reached the MLP).
                         if (_jitGemm && Simd.JitGemmAvx2.TryMultiply(
-                                src.AsSpan(0, M * curK), wArr.AsSpan(0, curK * n), dst.AsSpan(0, M * n), M, n, curK))
+                                srcSpan.Slice(0, M * curK), wSpan.Slice(0, curK * n), dst.AsSpan(0, M * n), M, n, curK))
                             gemmDone = true;
 #endif
                         bool preferManaged = (long)curK * n <= 200_000 || !BlasProvider.HasRawSgemm;
@@ -186,20 +206,36 @@ public partial class CpuEngine
                         }
                         else if (preferManaged)
                         {
+                            // Managed cached-B keys its pre-pack on the weight ARRAY IDENTITY,
+                            // so it must see the SAME float[] on every call. GetDataArray()
+                            // returns a fresh snapshot for GPU-tagged tensors, which both
+                            // defeated the identity-keyed pack cache (a silent re-pack every
+                            // call) and reintroduced the per-call weight copy this PR removes.
+                            // GetFlattenedData() returns the STABLE backing array for the
+                            // standard weight layout (contiguous, zero-offset, exact-fit —
+                            // the same memory AsSpan() reads), preserving identity across
+                            // calls; exotic layouts still get a correct flat copy, merely
+                            // without cross-call pack reuse. (wT/wSpan are hoisted above; the
+                            // AsSpan() there already materialized any lazy data.)
+                            float[] wArr = wT.GetFlattenedData();
                             Simd.SimdGemm.SgemmWithCachedB(
-                                src.AsSpan(0, M * curK), wArr, dst.AsSpan(0, M * n), M, curK, n);
+                                srcSpan.Slice(0, M * curK), wArr, dst.AsSpan(0, M * n), M, curK, n);
                         }
                         else
                         {
                             unsafe
                             {
-                                fixed (float* ps = src, pw = wArr, pd = dst)
+                                fixed (float* ps = srcSpan, pw = wSpan, pd = dst)
                                 {
                                     if (BlasProvider.HasRawSgemm)
                                         BlasProvider.SgemmRaw(M, n, curK, ps, curK, pw, n, pd, n);
                                     else
+                                        // Unreachable in practice (preferManaged already captures
+                                        // !HasRawSgemm); kept as a defensive fallback, on the same
+                                        // stable-array contract as the preferManaged branch above.
                                         Simd.SimdGemm.SgemmWithCachedB(
-                                            src.AsSpan(0, M * curK), wArr, dst.AsSpan(0, M * n), M, curK, n);
+                                            srcSpan.Slice(0, M * curK), wT.GetFlattenedData(),
+                                            dst.AsSpan(0, M * n), M, curK, n);
                                 }
                             }
                         }
@@ -211,7 +247,7 @@ public partial class CpuEngine
                         if (bArr is not null || act != FusedActivationType.None)
                             CpuFusedOperations.ApplyBiasActivationInPlace(dst, bArr, M, n, act, ap);
 
-                        src = dst;
+                        srcSpan = dst.AsSpan(0, M * n);
                         curK = n;
                         if (i != last) pingToggle ^= 1;
                     }
