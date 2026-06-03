@@ -8729,7 +8729,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var inputBuffer = GetOrAllocateBuffer(backend, input.GetDataArray());
             using var gammaBuffer = GetOrCacheWeightBuffer(backend, gamma.GetDataArray(), PersistentTensorRole.Weights);
             using var saveMeanBuffer = GetOrAllocateBuffer(backend, mean.GetDataArray());
-            using var saveVarBuffer = GetOrAllocateBuffer(backend, variance.GetDataArray());
+            // The layernorm_backward + layernorm_grad_params kernels use their "saveInvVar" input DIRECTLY as
+            // inverse-std 1/sqrt(var+eps). But during training the FORWARD runs the managed base path
+            // (IEngine.LayerNorm bails to base while a tape is active), and base's `variance` out-param is TRUE
+            // variance — so passing it raw made the kernels read variance AS invVar, yielding ~zero/garbage
+            // gradInput AND gradGamma. LayerNorm is in every transformer layer, so that zeroed the backward
+            // signal at every layer → GPU cortex training never learned (flat at ln(V), both CUDA and OpenCL),
+            // while the forward + matmul/softmax/embedding backward were all correct (see Phase_GPU_Grad_Check).
+            // Convert variance → invVar here so the kernels get the inverse-std they actually consume.
+            var varF = DirectGpuEngine.ToFloatArray(variance.GetDataArray());
+            var invVarF = new float[varF.Length];
+            for (int i = 0; i < varF.Length; i++) invVarF[i] = 1f / MathF.Sqrt(varF[i] + (float)epsilon);
+            using var saveVarBuffer = GetOrAllocateBuffer(backend, DirectGpuEngine.FromFloatArray<T>(invVarF));
             using var gradInputBuffer = AllocateOutputBuffer(backend, input.Length);
             using var gradGammaBuffer = AllocateOutputBuffer(backend, normalizedSize);
             using var gradBetaBuffer = AllocateOutputBuffer(backend, normalizedSize);
