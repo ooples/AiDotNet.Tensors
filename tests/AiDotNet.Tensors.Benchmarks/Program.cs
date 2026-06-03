@@ -50,6 +50,12 @@ class Program
             return;
         }
 
+        if (args[0] == "--ab-mlp-kernel-bakeoff")
+        {
+            AiDotNet.Tensors.Benchmarks.MlpKernelBakeoffBench.Run();
+            return;
+        }
+
         if (args[0] == "--ab-aiseval-dopsweep")
         {
             AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.DopSweep();
