@@ -251,13 +251,21 @@ public partial class CpuEngine
         int scoff = 3 * seq * dHead;      // dHead*seq == seq*dHead
         int scratchLen = 3 * seq * dHead + seq * seq;
 
-        System.Threading.Tasks.Parallel.For(0, bhCount, bh =>
+        // Parallelize over batch·heads using the SAME PersistentParallelExecutor as
+        // the GEMMs/LayerNorm (NOT Parallel.For/ThreadPool) — a second pool in the
+        // forward pass oversubscribed the cores and forced park/wakeup between ops.
+        // One pool keeps workers hot across QKV-GEMM → SDPA → out-proj. Each chunk
+        // rents scratch once and strides over its (b,h) slices.
+        int _sdpaChunks = Math.Max(1, Math.Min(bhCount, CpuParallelSettings.MaxDegreeOfParallelism));
+        PersistentParallelExecutor.Instance.Execute(_sdpaChunks, chunk =>
         {
-            int b = bh / heads;
-            int h = bh % heads;
             var scratch = pool.Rent(scratchLen);
             try
             {
+                for (int bh = chunk; bh < bhCount; bh += _sdpaChunks)
+                {
+                int b = bh / heads;
+                int h = bh % heads;
                 int hQ = qCol + h * dHead;
                 int hK = kCol + h * dHead;
                 int hV = vCol + h * dHead;
@@ -371,6 +379,7 @@ public partial class CpuEngine
                     for (int d = 0; d < dHead; d++)
                         concat[dst + d] = scratch[src + d];
                 }
+                } // end for bh slice in this chunk
             }
             finally
             {
