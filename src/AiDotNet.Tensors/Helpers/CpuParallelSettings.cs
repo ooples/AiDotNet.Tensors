@@ -323,7 +323,18 @@ public static class CpuParallelSettings
         if (Engines.BlasManaged.Pool.CooperativeGemmScheduler.Enabled)
         {
             int count = toExclusive - fromInclusive;
-            int chunks = Math.Min(maxDegree, count);
+            // Scale the chunk count with the work, not blindly to maxDegree. Waking all
+            // cores-1 workers (plus the participating caller) for a small memory-bound op
+            // oversubscribes the box — the OS preempts active workers and a stolen chunk
+            // stalls the caller's join, which is the entire p95 tail (PR #531 sweep: at the
+            // 64K-relu shape, 8 active threads → p95 29.6us beating Parallel.For's 32.6us,
+            // while 31 → 224us). One chunk per ~16K work units gives each chunk enough to
+            // amortize dispatch, caps active threads for small ops, and still fans a large
+            // compute-bound op out to maxDegree. The pool keeps cores-1 workers parked; only
+            // `chunks` of them wake per dispatch.
+            const long workPerChunk = 8 * 1024;
+            int byWork = (int)Math.Min(count, Math.Max(1, totalWork / workPerChunk));
+            int chunks = Math.Min(maxDegree, byWork);
             int from = fromInclusive;
             Engines.BlasManaged.Pool.CooperativeGemmScheduler.Dispatch(chunks, chunk =>
             {
