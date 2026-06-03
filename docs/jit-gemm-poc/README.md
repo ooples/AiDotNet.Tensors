@@ -61,3 +61,25 @@ transformer's time is the aggregate of many ops + dispatch, not GEMM throughput.
 - Transformer is NOT -> no GEMM kernel (ours at 699 or oneDNN at 543) flips it.
 Next lever for the transformer is whole-forward-pass fusion / dispatch reduction,
 not a faster GEMM. The JIT kernel stays an off-by-default MLP/GEMM-bound win.
+
+## FINAL: the wins came from the OP fixes, not the GEMM JIT (6/16 -> 8/16)
+
+End-to-end op profiling (the decisive step) showed the transformer's pure GEMMs
+are only ~9%; the costs were SDPA (scalar softmax), LayerNorm (serial), and the
+two-thread-pool contention. Fixing those OPS — not the GEMM — delivered the wins:
+
+| fix | effect |
+|---|---|
+| SIMD softmax (Exp8) in SDPA      | SDPA 3.15 -> 1.42 ms/call |
+| LayerNorm row-count parallel gate | 0.33 -> 0.13 ms/call (2.5x) |
+| SDPA -> PersistentParallelExecutor (one pool) | SDPA 1.42 -> 0.86 ms/call |
+| net (16-shape, min-of-6)         | **6/16 -> 8/16**; transformer now wins b1+b8(+b32) |
+
+The JIT GEMM (beats oneDNN isolated at 699, 376 GFLOP/s per-call) is NET-NEGATIVE
+end-to-end (8/16 -> 6/16): it wins large-M (transformer FFN/QKV M=4096) but loses
+medium/small-M (MLP M<=128, transformer b32), and the transformer isn't GEMM-bound
+so the isolated GFLOP/s don't translate. Kept as an off-by-default, M-gated
+(AIDOTNET_JIT_MIN_M=512) opt-in for genuinely GEMM-bound large-M workloads.
+
+Remaining losses (8/16, all op/shape-specific, not GEMM-GFLOPS): MLP (small-M
+GEMM vs MKL's small-GEMM JIT), LSTM/transformer large-batch (aggregate ops).
