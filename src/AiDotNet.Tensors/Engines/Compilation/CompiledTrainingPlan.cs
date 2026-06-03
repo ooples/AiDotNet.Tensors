@@ -170,7 +170,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             }
 
             var step = _forwardSteps[i];
-            var specialized = TryBuildSpecializedForward(step, _pinnedHandles, allowCachedB: true);
+            // Training plans mutate parameters in-place between Step() calls, so the
+            // identity-keyed pre-pack cache would serve stale weights — same policy as
+            // the initial build below. (This site used to pass true, which was
+            // harmlessly ignored while the FusedLinear branch hardcoded false; now that
+            // the branch respects the caller's policy, training must say false here.)
+            var specialized = TryBuildSpecializedForward(step, _pinnedHandles, allowCachedB: false);
             if (specialized != null)
             {
                 rebuiltForward.Add(specialized);
@@ -2909,17 +2914,24 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var bArr = (float[])(object)bias.GetDataArray();
             var oArr = (float[])(object)o.GetDataArray();
 
+            var fusedAllowCachedB = allowCachedB;
             return eng =>
             {
                 // Shapes were validated when the graph was compiled; replay skips
                 // public API argument checks and goes straight to the hot kernel.
                 //
-                // allowCachedB: false because optimizer.Step() mutates wArr in
-                // place between forward calls. The pre-packed B cache keys on
-                // the array's identity, so the cached panels would be stale on
-                // every step after the first.
+                // allowCachedB is the CALLER's policy, threaded through: training
+                // plans pass false because optimizer.Step() mutates wArr in place
+                // between forward calls (the pre-packed B cache keys on array
+                // identity, so cached panels would go stale), while INFERENCE
+                // plans pass true for frozen weights. This branch used to
+                // hardcode false, which forced a full PackB on EVERY replay —
+                // the compiled MLP [128,784] replayed 10-19x SLOWER than the
+                // eager forward it traced (AIsEval compiled-mode finding; pinned
+                // by CompiledInferenceParityTests.Mlp_CompiledReplay_
+                // NotDrasticallySlowerThanEager_AtBs128).
                 CpuFusedOperations.FusedGemmBiasActivationUnchecked(
-                    inArr, wArr, bArr, oArr, M, N, K, activation, allowCachedB: false);
+                    inArr, wArr, bArr, oArr, M, N, K, activation, allowCachedB: fusedAllowCachedB);
             };
         }
 
