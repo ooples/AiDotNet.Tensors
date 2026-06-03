@@ -69,23 +69,64 @@ internal static unsafe class JitGemmAvx2
     private static readonly bool _enabled =
         System.Environment.GetEnvironmentVariable("AIDOTNET_JIT_GEMM") == "1";
 
-    // Minimum M (rows) for the JIT to engage. The JIT wins at large M (many 6-row
-    // blocks to parallelize, prologue amortized — e.g. the transformer FFN/QKV at
-    // M=B*seq=4096), but LOSES at small M (e.g. MLP at M=batch≤128), where the
-    // tuned managed/native kernels (CompiledMlp) beat it and forcing JIT regressed
-    // the MLP ~2×. Below this, TryMultiply declines and the caller keeps its path.
-    private static readonly int _jitMinM =
-        int.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_JIT_MIN_M"), out var jm) && jm > 0 ? jm : 512;
 
     /// <summary>
     /// C[M,N] = A[M,K]·B[K,N], row-major, contiguous (lda=K, ldb=N, ldc=N).
     /// Returns false (no mutation) when unavailable / too small, so the caller
     /// falls back to the managed kernel.
     /// </summary>
+    // Per-shape auto-tune cache: true=JIT wins, false=managed wins. On first
+    // encounter of a (M,N,K) we time both and lock in the winner — so the JIT
+    // engages ONLY where it's actually faster than the managed kernel end-to-end
+    // (it wins large-M GEMM, loses small-M like MLP/LSTM gates), with no fixed
+    // threshold to mis-tune. Weights/shapes are stable across inferences, so the
+    // one-time tuning cost amortizes immediately.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<(int, int, int), bool> _decision = new();
+
     internal static bool TryMultiply(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c, int M, int N, int K)
     {
-        if (!_enabled || !Available || M < _jitMinM || N < 16 || (long)M * N * K < JIT_MIN_WORK) return false;
+        if (!_enabled || !Available || M < 6 || N < 16 || (long)M * N * K < JIT_MIN_WORK) return false;
 
+        var key = (M, N, K);
+        if (_decision.TryGetValue(key, out bool useJit))
+        {
+            if (!useJit) return false;
+            RunJit(a, b, c, M, N, K);
+            return true;
+        }
+        return TuneAndRun(a, b, c, M, N, K, key);
+    }
+
+    // First-encounter tuning: time JIT (into c) vs the managed kernel (into a
+    // scratch), cache the winner. If managed wins, returns false so the caller
+    // runs its own (managed) path into c.
+    private static bool TuneAndRun(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c, int M, int N, int K, (int, int, int) key)
+    {
+        float[] scratch = System.Buffers.ArrayPool<float>.Shared.Rent(M * N);
+        try
+        {
+            long jit = long.MaxValue, mgd = long.MaxValue;
+            for (int r = 0; r < 4; r++)
+            {
+                long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+                RunJit(a, b, c, M, N, K);
+                long t1 = System.Diagnostics.Stopwatch.GetTimestamp();
+                // Managed reference: SgemmAddInternal is the managed core (no JIT re-entry).
+                SimdGemm.SgemmAddInternal(a, K, false, b, N, false, scratch.AsSpan(0, M * N), M, K, N, allowParallel: true, clearedOutput: true);
+                long t2 = System.Diagnostics.Stopwatch.GetTimestamp();
+                if (t1 - t0 < jit) jit = t1 - t0;
+                if (t2 - t1 < mgd) mgd = t2 - t1;
+            }
+            bool jitWins = jit <= mgd;
+            _decision[key] = jitWins;
+            if (jitWins) { RunJit(a, b, c, M, N, K); return true; } // c re-run clean (scratch had managed)
+            return false;
+        }
+        finally { System.Buffers.ArrayPool<float>.Shared.Return(scratch); }
+    }
+
+    private static void RunJit(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c, int M, int N, int K)
+    {
         int Mfull = M - M % 6, Nfull = N - N % 16;
         int numRB = Mfull / 6, numCB = Nfull / 16;
 
@@ -142,7 +183,6 @@ internal static unsafe class JitGemmAvx2
         //      bottom strip rows [Mfull,M) × cols [0,Nfull). No overlap. ----
         if (Nfull < N) EdgeBlock(a, b, c, M, N, K, 0, M, Nfull, N);
         if (Mfull < M && Nfull > 0) EdgeBlock(a, b, c, M, N, K, Mfull, M, 0, Nfull);
-        return true;
     }
 
     private static void EdgeBlock(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c,
