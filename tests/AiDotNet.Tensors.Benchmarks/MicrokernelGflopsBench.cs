@@ -71,14 +71,16 @@ public static class MicrokernelGflopsBench
         {
             double peak = MeasureAvx2Fp64PeakGflops();
             BenchAvx2Fp64_4x8(peak);
+            if (Avx2Fp64_6x8.IsSupported) BenchAvx2Fp64_6x8(peak);
         }
         else Console.WriteLine("Avx2Fp64_4x8: not supported on this CPU.\n");
 
-        // ── AVX-512 FP32 16×16
+        // ── AVX-512 FP32 16×16 (+ the #409 S.4 higher-intensity 8×32 candidate)
         if (Avx512Fp32_16x16.IsSupported)
         {
             double peak = MeasureAvx512Fp32PeakGflops();
             BenchAvx512Fp32_16x16(peak);
+            if (Avx512Fp32_8x32.IsSupported) BenchAvx512Fp32_8x32(peak);
         }
         else Console.WriteLine("Avx512Fp32_16x16: not supported on this CPU.\n");
 
@@ -91,6 +93,73 @@ public static class MicrokernelGflopsBench
         else Console.WriteLine("Avx512Fp64_8x16: not supported on this CPU.\n");
 
         Console.WriteLine($"(sink={s_sink:G4})");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // #409 S.4: single-process correctness verification. Runs each supported
+    // microkernel ONCE against a scalar reference (no perf loops, no test host)
+    // so it runs fast under Intel SDE emulation — which is how the avx512-verify
+    // CI checks the AVX-512 kernels on runners that lack AVX-512 hardware.
+    // Returns false if any kernel mismatches (the caller exits non-zero).
+    // ─────────────────────────────────────────────────────────────────────
+    public static bool Verify()
+    {
+        Console.WriteLine("=== Microkernel correctness (vs scalar double reference) ===");
+        bool ok = true;
+        ok &= VerifyF("Avx2Fp32_8x8",    Avx2Fp32_8x8.Mr,    Avx2Fp32_8x8.Nr,    Avx2Fp32_8x8.IsSupported,    Avx2Fp32_8x8.Run);
+        ok &= VerifyF("Avx2Fp32_6x16",   Avx2Fp32_6x16.Mr,   Avx2Fp32_6x16.Nr,   Avx2Fp32_6x16.IsSupported,   Avx2Fp32_6x16.Run);
+        ok &= VerifyD("Avx2Fp64_4x8",    Avx2Fp64_4x8.Mr,    Avx2Fp64_4x8.Nr,    Avx2Fp64_4x8.IsSupported,    Avx2Fp64_4x8.Run);
+        ok &= VerifyD("Avx2Fp64_6x8",    Avx2Fp64_6x8.Mr,    Avx2Fp64_6x8.Nr,    Avx2Fp64_6x8.IsSupported,    Avx2Fp64_6x8.Run);
+        ok &= VerifyF("Avx512Fp32_16x16", Avx512Fp32_16x16.Mr, Avx512Fp32_16x16.Nr, Avx512Fp32_16x16.IsSupported, Avx512Fp32_16x16.Run);
+        ok &= VerifyF("Avx512Fp32_8x32",  Avx512Fp32_8x32.Mr,  Avx512Fp32_8x32.Nr,  Avx512Fp32_8x32.IsSupported,  Avx512Fp32_8x32.Run);
+        ok &= VerifyD("Avx512Fp64_8x16",  Avx512Fp64_8x16.Mr,  Avx512Fp64_8x16.Nr,  Avx512Fp64_8x16.IsSupported,  Avx512Fp64_8x16.Run);
+        Console.WriteLine(ok ? "ALL VERIFIED" : "VERIFICATION FAILED");
+        return ok;
+    }
+
+    private delegate void RunF(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c, int ldc, int kc);
+    private delegate void RunD(ReadOnlySpan<double> a, ReadOnlySpan<double> b, Span<double> c, int ldc, int kc);
+
+    private static bool VerifyF(string name, int mr, int nr, bool supported, RunF run)
+    {
+        if (!supported) { Console.WriteLine($"  {name,-17} SKIP (not supported on this CPU)"); return true; }
+        const int kc = 64;
+        var rng = new Random(12345);
+        var a = new float[kc * mr]; for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() * 2 - 1);
+        var b = new float[kc * nr]; for (int i = 0; i < b.Length; i++) b[i] = (float)(rng.NextDouble() * 2 - 1);
+        var c = new float[mr * nr];
+        run(a, b, c, nr, kc);
+        double maxErr = 0;
+        for (int i = 0; i < mr; i++)
+            for (int j = 0; j < nr; j++)
+            {
+                double exp = 0; for (int k = 0; k < kc; k++) exp += (double)a[k * mr + i] * b[k * nr + j];
+                maxErr = Math.Max(maxErr, Math.Abs(c[i * nr + j] - exp));
+            }
+        bool pass = maxErr < 1e-2;
+        Console.WriteLine($"  {name,-17} {mr}x{nr}: {(pass ? "PASS" : "FAIL")} (max err {maxErr:E2})");
+        return pass;
+    }
+
+    private static bool VerifyD(string name, int mr, int nr, bool supported, RunD run)
+    {
+        if (!supported) { Console.WriteLine($"  {name,-17} SKIP (not supported on this CPU)"); return true; }
+        const int kc = 64;
+        var rng = new Random(54321);
+        var a = new double[kc * mr]; for (int i = 0; i < a.Length; i++) a[i] = rng.NextDouble() * 2 - 1;
+        var b = new double[kc * nr]; for (int i = 0; i < b.Length; i++) b[i] = rng.NextDouble() * 2 - 1;
+        var c = new double[mr * nr];
+        run(a, b, c, nr, kc);
+        double maxErr = 0;
+        for (int i = 0; i < mr; i++)
+            for (int j = 0; j < nr; j++)
+            {
+                double exp = 0; for (int k = 0; k < kc; k++) exp += a[k * mr + i] * b[k * nr + j];
+                maxErr = Math.Max(maxErr, Math.Abs(c[i * nr + j] - exp));
+            }
+        bool pass = maxErr < 1e-9;
+        Console.WriteLine($"  {name,-17} {mr}x{nr}: {(pass ? "PASS" : "FAIL")} (max err {maxErr:E2})");
+        return pass;
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -134,6 +203,18 @@ public static class MicrokernelGflopsBench
         Report("Avx2Fp64_4x8   ", Mr, Nr, gflops, peakGflops);
     }
 
+    private static void BenchAvx2Fp64_6x8(double peakGflops)
+    {
+        const int Mr = Avx2Fp64_6x8.Mr, Nr = Avx2Fp64_6x8.Nr;
+        var packedA = MakeRandomD(Kc * Mr);
+        var packedB = MakeRandomD(Kc * Nr);
+        var c = new double[Mr * Nr];
+
+        Action call = () => Avx2Fp64_6x8.Run(packedA, packedB, c, Nr, Kc);
+        double gflops = TimeKernel(call, 2.0 * Mr * Nr * Kc, warmup: 2_000, iters: 2_000_000);
+        Report("Avx2Fp64_6x8   ", Mr, Nr, gflops, peakGflops);
+    }
+
     private static void BenchAvx512Fp32_16x16(double peakGflops)
     {
         const int Mr = Avx512Fp32_16x16.Mr, Nr = Avx512Fp32_16x16.Nr;
@@ -144,6 +225,18 @@ public static class MicrokernelGflopsBench
         Action call = () => Avx512Fp32_16x16.Run(packedA, packedB, c, Nr, Kc);
         double gflops = TimeKernel(call, 2.0 * Mr * Nr * Kc, warmup: 2_000, iters: 1_000_000);
         Report("Avx512Fp32_16x16", Mr, Nr, gflops, peakGflops);
+    }
+
+    private static void BenchAvx512Fp32_8x32(double peakGflops)
+    {
+        const int Mr = Avx512Fp32_8x32.Mr, Nr = Avx512Fp32_8x32.Nr;
+        var packedA = MakeRandomF(Kc * Mr);
+        var packedB = MakeRandomF(Kc * Nr);
+        var c = new float[Mr * Nr];
+
+        Action call = () => Avx512Fp32_8x32.Run(packedA, packedB, c, Nr, Kc);
+        double gflops = TimeKernel(call, 2.0 * Mr * Nr * Kc, warmup: 2_000, iters: 1_000_000);
+        Report("Avx512Fp32_8x32 ", Mr, Nr, gflops, peakGflops);
     }
 
     private static void BenchAvx512Fp64_8x16(double peakGflops)
@@ -291,4 +384,260 @@ public static class MicrokernelGflopsBench
         for (int i = 0; i < n; i++) a[i] = rng.NextDouble() * 2 - 1;
         return a;
     }
+
+    // #378 AVX-512-BF16 Phase 1: verify the emitted VDPBF16PS machine code. There is no
+    // Avx512Bf16 .NET intrinsic, so the instruction is reached only via raw EVEX bytes; run
+    // this UNDER INTEL SDE on a host without AVX-512-BF16 (SDE emulates VDPBF16PS — natively
+    // it would fault #UD). Returns false on mismatch / no executable memory.
+    public static bool VerifyVdpbf16()
+    {
+        Console.WriteLine("=== VDPBF16PS machine-code probe (EVEX encoding + BF16 dot-product) ===");
+        var rng = new Random(123);
+        var a = new ushort[16];
+        var b = new ushort[16];
+        for (int i = 0; i < 16; i++)
+        {
+            a[i] = FloatToBf16((float)(rng.NextDouble() * 2 - 1));
+            b[i] = FloatToBf16((float)(rng.NextDouble() * 2 - 1));
+        }
+        var c = new float[8];
+
+        bool ran;
+        try
+        {
+            ran = AiDotNet.Tensors.Engines.BlasManaged.Jit.MachineCodeBf16Kernel.TryRunProbe(a, b, c);
+        }
+        catch (Exception e)
+        {
+            Console.WriteLine("  probe threw (likely #UD — not under SDE, or bad encoding): " + e.Message);
+            return false;
+        }
+        if (!ran)
+        {
+            Console.WriteLine("  executable memory unavailable (NativeAOT / hardened) — cannot verify");
+            return false;
+        }
+
+        bool pass = true;
+        for (int i = 0; i < 8; i++)
+        {
+            float exp = Bf16ToFloat(a[2 * i]) * Bf16ToFloat(b[2 * i])
+                      + Bf16ToFloat(a[2 * i + 1]) * Bf16ToFloat(b[2 * i + 1]);
+            float got = c[i];
+            bool ok = Math.Abs(got - exp) <= 1e-4f * Math.Max(1f, Math.Abs(exp));
+            pass &= ok;
+            Console.WriteLine($"  lane {i}: got {got,11:G6}  exp {exp,11:G6}  {(ok ? "OK" : "FAIL")}");
+        }
+        Console.WriteLine(pass ? "VDPBF16PS VERIFIED" : "VDPBF16PS FAILED");
+        return pass;
+    }
+
+    // #378 AVX-512-BF16 Phase 2: verify the full BF16 GEMM machine-code microkernel end to end.
+    // Shape M=5,K=7,N=11 exercises every edge: ragged M (4+1), ragged N (8+3), odd K (pair pad).
+    // Run UNDER INTEL SDE on a non-AVX-512-BF16 host (VDPBF16PS is emulated). False on mismatch.
+    public static bool VerifyBf16Gemm()
+    {
+        Console.WriteLine("=== BF16 GEMM machine-code microkernel (MR4xNR8, VDPBF16PS K-loop) ===");
+        const int m = 5, k = 7, n = 11;
+        var rng = new Random(7);
+        var a = new ushort[m * k];
+        var b = new ushort[k * n];
+        for (int i = 0; i < a.Length; i++) a[i] = FloatToBf16((float)(rng.NextDouble() * 2 - 1));
+        for (int i = 0; i < b.Length; i++) b[i] = FloatToBf16((float)(rng.NextDouble() * 2 - 1));
+        var c = new float[m * n];
+
+        bool ran;
+        try
+        {
+            ran = AiDotNet.Tensors.Engines.BlasManaged.Jit.MachineCodeBf16Kernel.TryGemm(a, b, c, m, k, n);
+        }
+        catch (Exception e)
+        {
+            Console.WriteLine("  GEMM threw (likely #UD — not under SDE, or bad encoding): " + e.Message);
+            return false;
+        }
+        if (!ran)
+        {
+            Console.WriteLine("  executable memory unavailable — cannot verify");
+            return false;
+        }
+
+        bool pass = true;
+        int bad = 0;
+        for (int i = 0; i < m; i++)
+            for (int j = 0; j < n; j++)
+            {
+                double truth = 0;
+                for (int kk = 0; kk < k; kk++)
+                    truth += (double)Bf16ToFloat(a[i * k + kk]) * Bf16ToFloat(b[kk * n + j]);
+                double got = c[i * n + j];
+                bool ok = Math.Abs(got - truth) <= 1e-3 * Math.Max(1.0, Math.Abs(truth));
+                if (!ok) { pass = false; if (bad++ < 6) Console.WriteLine($"  C[{i},{j}] got {got:G6} exp {truth:G6} FAIL"); }
+            }
+        Console.WriteLine(pass ? $"BF16 GEMM VERIFIED ({m}x{k}x{n}, all {m * n} elements)" : "BF16 GEMM FAILED");
+        return pass;
+    }
+
+    // #380 AMX Phase 1: verify a single tdpbf16ps tile op — C[16,16] += A[16,32]·B[16,16] in FP32,
+    // B in the AMX row-pair VNNI layout. Run UNDER INTEL SDE (-spr) on a non-AMX host (the tile
+    // instructions are emulated). Returns false on mismatch / no executable memory.
+    public static bool VerifyAmxTile()
+    {
+        Console.WriteLine("=== AMX tdpbf16ps tile op (C16x16 += A16x32 . B16x16, VNNI) ===");
+        const int M = 16, K = 32, N = 16;
+
+        var rng = new Random(31);
+        // Logical A[M,K] and B[K,N] as BF16.
+        var a = new ushort[M * K];
+        var bLogical = new ushort[K * N];
+        for (int i = 0; i < a.Length; i++) a[i] = FloatToBf16((float)(rng.NextDouble() * 2 - 1));
+        for (int i = 0; i < bLogical.Length; i++) bLogical[i] = FloatToBf16((float)(rng.NextDouble() * 2 - 1));
+
+        // Pack B into the AMX VNNI layout: row r (0..K/2-1) = {B[2r,n], B[2r+1,n]} over n.
+        var bVnni = new ushort[(K / 2) * (N * 2)];
+        for (int r = 0; r < K / 2; r++)
+            for (int n = 0; n < N; n++)
+            {
+                bVnni[r * (N * 2) + 2 * n] = bLogical[(2 * r) * N + n];
+                bVnni[r * (N * 2) + 2 * n + 1] = bLogical[(2 * r + 1) * N + n];
+            }
+
+        var c = new float[M * N];
+        bool ran;
+        try
+        {
+            ran = AiDotNet.Tensors.Engines.BlasManaged.Jit.MachineCodeAmxKernel.TryRunTileProbe(a, bVnni, c);
+        }
+        catch (Exception e)
+        {
+            Console.WriteLine("  tile op threw (likely #UD — not under SDE, or bad encoding): " + e.Message);
+            return false;
+        }
+        if (!ran)
+        {
+            Console.WriteLine("  executable memory unavailable — cannot verify");
+            return false;
+        }
+
+        bool pass = true;
+        int bad = 0;
+        for (int i = 0; i < M; i++)
+            for (int j = 0; j < N; j++)
+            {
+                double truth = 0;
+                for (int kk = 0; kk < K; kk++)
+                    truth += (double)Bf16ToFloat(a[i * K + kk]) * Bf16ToFloat(bLogical[kk * N + j]);
+                double got = c[i * N + j];
+                bool ok = Math.Abs(got - truth) <= 1e-3 * Math.Max(1.0, Math.Abs(truth));
+                if (!ok) { pass = false; if (bad++ < 6) Console.WriteLine($"  C[{i},{j}] got {got:G6} exp {truth:G6} FAIL"); }
+            }
+        Console.WriteLine(pass ? $"AMX TILE VERIFIED ({M}x{K}x{N}, all {M * N} elements)" : "AMX TILE FAILED");
+        return pass;
+    }
+
+    // #380 AMX Phase 2: verify the full tiled AMX GEMM. Shape M=20,K=40,N=24 is ragged in all
+    // three dims (16+4 / 32+8 / 16+8) so it exercises M/K/N tiling + zero-padded edges and K
+    // accumulation across tiles. Run UNDER INTEL SDE (-spr). Returns false on mismatch.
+    public static bool VerifyAmxGemm()
+    {
+        Console.WriteLine("=== AMX tiled BF16 GEMM (ragged tiling + K accumulation) ===");
+        const int M = 20, K = 40, N = 24;
+        var rng = new Random(41);
+        var a = new ushort[M * K];
+        var b = new ushort[K * N];
+        for (int i = 0; i < a.Length; i++) a[i] = FloatToBf16((float)(rng.NextDouble() * 2 - 1));
+        for (int i = 0; i < b.Length; i++) b[i] = FloatToBf16((float)(rng.NextDouble() * 2 - 1));
+        var c = new float[M * N];
+
+        bool ran;
+        try
+        {
+            ran = AiDotNet.Tensors.Engines.BlasManaged.Jit.MachineCodeAmxKernel.TryGemm(a, b, c, M, K, N);
+        }
+        catch (Exception e)
+        {
+            Console.WriteLine("  GEMM threw (likely #UD — not under SDE, or bad encoding): " + e.Message);
+            return false;
+        }
+        if (!ran)
+        {
+            Console.WriteLine("  executable memory unavailable — cannot verify");
+            return false;
+        }
+
+        bool pass = true;
+        int bad = 0;
+        for (int i = 0; i < M; i++)
+            for (int j = 0; j < N; j++)
+            {
+                double truth = 0;
+                for (int kk = 0; kk < K; kk++)
+                    truth += (double)Bf16ToFloat(a[i * K + kk]) * Bf16ToFloat(b[kk * N + j]);
+                double got = c[i * N + j];
+                bool ok = Math.Abs(got - truth) <= 2e-3 * Math.Max(1.0, Math.Abs(truth));
+                if (!ok) { pass = false; if (bad++ < 6) Console.WriteLine($"  C[{i},{j}] got {got:G6} exp {truth:G6} FAIL"); }
+            }
+        Console.WriteLine(pass ? $"AMX GEMM VERIFIED ({M}x{K}x{N}, all {M * N} elements)" : "AMX GEMM FAILED");
+        return pass;
+    }
+
+    // #380 AMX INT8: verify a single tdpbssd tile op — C[16,16] int32 += A[16,64]·B[16,64] int8,
+    // B in the AMX 4-deep VNNI layout. Exact integer compare. Run UNDER INTEL SDE (-spr).
+    public static bool VerifyAmxInt8Tile()
+    {
+        Console.WriteLine("=== AMX tdpbssd tile op (C16x16 int32 += A16x64 . B16x64 int8, VNNI-4) ===");
+        const int M = 16, K = 64, N = 16;
+        var rng = new Random(53);
+        var a = new sbyte[M * K];
+        var bLogical = new sbyte[K * N];
+        for (int i = 0; i < a.Length; i++) a[i] = (sbyte)rng.Next(-100, 101);
+        for (int i = 0; i < bLogical.Length; i++) bLogical[i] = (sbyte)rng.Next(-100, 101);
+
+        // VNNI-4: row g (0..K/4-1) holds {B[4g+0,n]..B[4g+3,n]} for each n.
+        var bVnni4 = new sbyte[(K / 4) * (N * 4)];
+        for (int g = 0; g < K / 4; g++)
+            for (int n = 0; n < N; n++)
+                for (int t = 0; t < 4; t++)
+                    bVnni4[g * (N * 4) + 4 * n + t] = bLogical[(4 * g + t) * N + n];
+
+        var c = new int[M * N];
+        bool ran;
+        try { ran = AiDotNet.Tensors.Engines.BlasManaged.Jit.MachineCodeAmxKernel.TryRunTileProbeInt8(a, bVnni4, c); }
+        catch (Exception e) { Console.WriteLine("  int8 tile threw (likely #UD — not under SDE): " + e.Message); return false; }
+        if (!ran) { Console.WriteLine("  executable memory unavailable — cannot verify"); return false; }
+
+        bool pass = true;
+        int bad = 0;
+        for (int i = 0; i < M; i++)
+            for (int j = 0; j < N; j++)
+            {
+                long truth = 0;
+                for (int kk = 0; kk < K; kk++) truth += a[i * K + kk] * bLogical[kk * N + j];
+                if (c[i * N + j] != truth) { pass = false; if (bad++ < 6) Console.WriteLine($"  C[{i},{j}] got {c[i * N + j]} exp {truth} FAIL"); }
+            }
+        Console.WriteLine(pass ? $"AMX INT8 TILE VERIFIED ({M}x{K}x{N}, all {M * N} elements, exact)" : "AMX INT8 TILE FAILED");
+        return pass;
+    }
+
+    // #380 AMX detection: read CPUID.(7,0):EDX via emitted machine code and report the AMX bits.
+    // Under `sde -spr` the AMX-TILE/BF16/INT8 bits must all be set. Returns true iff AMX-TILE present.
+    public static bool VerifyAmxCpuid()
+    {
+        Console.WriteLine("=== AMX CPUID detection (CPUID.7.0:EDX bits 24/22/25) ===");
+        if (!AiDotNet.Tensors.Engines.BlasManaged.Jit.MachineCodeAmxKernel.TryGetAmxCpuidEdx(out uint edx))
+        {
+            Console.WriteLine("  executable memory unavailable — cannot probe CPUID");
+            return false;
+        }
+        bool tile = (edx & AiDotNet.Tensors.Engines.BlasManaged.Jit.MachineCodeAmxKernel.AmxTileBit) != 0;
+        bool bf16 = (edx & AiDotNet.Tensors.Engines.BlasManaged.Jit.MachineCodeAmxKernel.AmxBf16Bit) != 0;
+        bool int8 = (edx & AiDotNet.Tensors.Engines.BlasManaged.Jit.MachineCodeAmxKernel.AmxInt8Bit) != 0;
+        Console.WriteLine($"  EDX=0x{edx:X8}  AMX-TILE={tile}  AMX-BF16={bf16}  AMX-INT8={int8}");
+        bool pass = tile && bf16 && int8; // under sde -spr all three are advertised
+        Console.WriteLine(pass ? "AMX CPUID VERIFIED (all AMX bits set)" : "AMX CPUID: not all AMX bits set (expected on a non-AMX host without SDE)");
+        return pass;
+    }
+
+    private static ushort FloatToBf16(float f) => (ushort)(BitConverter.SingleToUInt32Bits(f) >> 16);
+    private static float Bf16ToFloat(ushort h) => BitConverter.UInt32BitsToSingle((uint)h << 16);
 }

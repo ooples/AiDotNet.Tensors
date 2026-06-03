@@ -107,5 +107,19 @@ public class MicrokernelCorrectnessTests
         Avx512Fp64_8x16.Run(a, b, c, nr, Kc);
         AssertMatchesReferenceD(a, b, c, mr, nr, Kc, 1e-10);
     }
+
+    // #409 S.4: the higher-intensity AVX-512 FP32 candidate (8×32, 1.6 FMA/load vs the
+    // 16×16's load-bound 0.94). Verified on AVX-512 hardware via the avx512-verify CI.
+    [Fact]
+    public void Avx512Fp32_8x32_MatchesReference()
+    {
+        if (!Avx512Fp32_8x32.IsSupported) return;
+        int mr = Avx512Fp32_8x32.Mr, nr = Avx512Fp32_8x32.Nr;
+        var a = RandomF(Kc * mr, 99);
+        var b = RandomF(Kc * nr, 110);
+        var c = new float[mr * nr];
+        Avx512Fp32_8x32.Run(a, b, c, nr, Kc);
+        AssertMatchesReferenceF(a, b, c, mr, nr, Kc, 1e-3);
+    }
 }
 #endif

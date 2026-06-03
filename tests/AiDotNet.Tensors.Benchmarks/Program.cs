@@ -281,6 +281,57 @@ class Program
             return;
         }
 
+        // Sub-S (#409) S.4 — single-process microkernel correctness verify (vs scalar
+        // reference). Runs fast under Intel SDE so the avx512-verify CI can check the
+        // AVX-512 kernels by emulation on runners without AVX-512 hardware. Exit 1 on
+        // any mismatch so the CI step fails.
+        if (args[0] == "--verify-microkernels")
+        {
+            Environment.Exit(MicrokernelGflopsBench.Verify() ? 0 : 1);
+        }
+
+        // #378 AVX-512-BF16 Phase 1 — verify the emitted VDPBF16PS machine code. Run under
+        // Intel SDE (`sde64 -spr -- dotnet ... --verify-vdpbf16`) on a non-AVX-512-BF16 host;
+        // exits non-zero on a mismatch so a CI step can gate on it.
+        if (args[0] == "--verify-vdpbf16")
+        {
+            Environment.Exit(MicrokernelGflopsBench.VerifyVdpbf16() ? 0 : 1);
+        }
+
+        // #378 AVX-512-BF16 Phase 2 — verify the full BF16 GEMM machine-code microkernel end to
+        // end (tiling + ragged edges). Run under Intel SDE; exits non-zero on a mismatch.
+        if (args[0] == "--verify-bf16gemm")
+        {
+            Environment.Exit(MicrokernelGflopsBench.VerifyBf16Gemm() ? 0 : 1);
+        }
+
+        // #380 AMX Phase 1 — verify a single tdpbf16ps tile op. Run under Intel SDE
+        // (`sde -spr -- dotnet ... --verify-amx-tile`); exits non-zero on a mismatch.
+        if (args[0] == "--verify-amx-tile")
+        {
+            Environment.Exit(MicrokernelGflopsBench.VerifyAmxTile() ? 0 : 1);
+        }
+
+        // #380 AMX Phase 2 — verify the full tiled AMX GEMM (ragged tiling + K accumulation).
+        // Run under Intel SDE; exits non-zero on a mismatch.
+        if (args[0] == "--verify-amx-gemm")
+        {
+            Environment.Exit(MicrokernelGflopsBench.VerifyAmxGemm() ? 0 : 1);
+        }
+
+        // #380 AMX INT8 — verify a single tdpbssd (int8→int32) tile op. Run under Intel SDE.
+        if (args[0] == "--verify-amx-int8")
+        {
+            Environment.Exit(MicrokernelGflopsBench.VerifyAmxInt8Tile() ? 0 : 1);
+        }
+
+        // #380 AMX detection — read CPUID.(7,0):EDX AMX bits via emitted machine code. Under
+        // `sde -spr` all AMX bits are set (exit 0); on a bare non-AMX host they aren't (exit 1).
+        if (args[0] == "--verify-amx-cpuid")
+        {
+            Environment.Exit(MicrokernelGflopsBench.VerifyAmxCpuid() ? 0 : 1);
+        }
+
 #if !NET462
         // Run cuBLAS vs DirectGpu GEMM benchmark
         if (args[0] == "--cublas")
@@ -675,6 +726,8 @@ class Program
         Console.WriteLine("  --linalg   : Run linear algebra benchmarks vs MathNet.Numerics");
         Console.WriteLine("  --cpu-matmul: Run CPU matrix multiply diagnostics");
         Console.WriteLine("  --microkernel-gflops: Microkernel-only GFLOPS vs register-FMA peak (Sub-S #409)");
+        Console.WriteLine("  --verify-vdpbf16: Verify emitted VDPBF16PS (run under Intel SDE); exits non-zero on mismatch (#378)");
+        Console.WriteLine("  --verify-bf16gemm: Verify the BF16 GEMM microkernel end to end (run under Intel SDE); exits non-zero on mismatch (#378)");
 #if !NET462
         Console.WriteLine("  --cublas   : Run cuBLAS vs DirectGpu GEMM benchmark");
         Console.WriteLine("  --opencl   : Run OpenCL GEMM benchmark (AMD/Intel GPUs)");

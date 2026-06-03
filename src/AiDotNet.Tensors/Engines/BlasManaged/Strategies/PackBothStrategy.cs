@@ -858,6 +858,16 @@ internal static class PackBothStrategy
                     ldc, kc);
                 return;
             }
+            // #409 S.4: higher-intensity 6×8 FP64 tile (Fast-mode default via PickMicrokernelTile).
+            if (mr == 6 && nr == 8 && Avx2Fp64_6x8.IsSupported)
+            {
+                Avx2Fp64_6x8.Run(
+                    MemoryMarshal.Cast<T, double>(packedA),
+                    MemoryMarshal.Cast<T, double>(packedB),
+                    MemoryMarshal.Cast<T, double>(c),
+                    ldc, kc);
+                return;
+            }
             if (mr == 4 && nr == 8 && Avx2Fp64_4x8.IsSupported)
             {
                 Avx2Fp64_4x8.Run(
