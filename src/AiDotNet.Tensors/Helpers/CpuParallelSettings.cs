@@ -307,6 +307,34 @@ public static class CpuParallelSettings
             if (firstException is not null) throw firstException;
             return;
         }
+        System.Threading.Interlocked.Increment(ref s_parallelForInvocations);
+
+        // PR #531: route the general parallel-op path off raw Parallel.For (the .NET
+        // ThreadPool — high dispatch latency + per-call task/range allocation, and the
+        // LowLevelLifoSemaphore park/wakeup that dominated the small-op trace) onto the
+        // low-latency cooperative pool when it's enabled. The scheduler's fixed worker
+        // set + caller-participation gives cheaper dispatch and no oversubscription under
+        // concurrent inference; it serializes concurrent callers' chunks cooperatively
+        // rather than spawning per-call threads. Disjoint-iteration safety is the same
+        // contract Parallel.For already requires of its callers. Chunk the [from,to)
+        // range into maxDegree contiguous sub-ranges so the scheduler distributes whole
+        // stripes (not one work-item per index). Default-off via the existing master
+        // switch; the legacy Parallel.For path is unchanged when disabled.
+        if (Engines.BlasManaged.Pool.CooperativeGemmScheduler.Enabled)
+        {
+            int count = toExclusive - fromInclusive;
+            int chunks = Math.Min(maxDegree, count);
+            int from = fromInclusive;
+            Engines.BlasManaged.Pool.CooperativeGemmScheduler.Dispatch(chunks, chunk =>
+            {
+                using var _region = EnterParallelRegion();
+                int cs = from + (int)((long)chunk * count / chunks);
+                int ce = from + (int)((long)(chunk + 1) * count / chunks);
+                for (int i = cs; i < ce; i++) body(i);
+            });
+            return;
+        }
+
         System.Threading.Tasks.Parallel.For(
             fromInclusive,
             toExclusive,
@@ -319,6 +347,14 @@ public static class CpuParallelSettings
                 body(i);
             });
     }
+
+    // PR #531 diagnostic: how often the general op path actually dispatches through
+    // System.Threading.Tasks.Parallel.For (the .NET ThreadPool — the LowLevelLifoSemaphore
+    // in the small-op trace) versus the low-latency StreamingWorkerPool (which is wired only
+    // into StreamingStrategy). Counts the Action overload's parallel/serial branches.
+    internal static long s_parallelForInvocations;
+    internal static long ParallelForStatsSnapshot() => System.Threading.Volatile.Read(ref s_parallelForInvocations);
+    internal static void ResetParallelForStats() { s_parallelForInvocations = 0; }
 
     /// <summary>
     /// Grain-size-aware drop-in for the localInit/localFinally overload of
