@@ -105,6 +105,34 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
         bucket.Buffers.Add(buffer);
     }
 
+    /// <summary>
+    /// Releases every pooled buffer back to the driver (a real free via
+    /// <see cref="IPoolableGpuBuffer.Release"/>, NOT a retain) while leaving the
+    /// pool usable for subsequent rents. Called under device-memory pressure —
+    /// when an allocation OOMs — to reclaim the bounded-but-real device memory
+    /// the pool holds for reuse before the caller gives up. Returns the number
+    /// of buffers released.
+    /// </summary>
+    public int DrainAll()
+    {
+        if (Volatile.Read(ref _disposed) != 0)
+        {
+            return 0;
+        }
+
+        int released = 0;
+        foreach (var bucket in _buckets.Values)
+        {
+            while (bucket.Buffers.TryTake(out var buffer))
+            {
+                Interlocked.Decrement(ref bucket.Count);
+                buffer.Release();
+                released++;
+            }
+        }
+        return released;
+    }
+
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)

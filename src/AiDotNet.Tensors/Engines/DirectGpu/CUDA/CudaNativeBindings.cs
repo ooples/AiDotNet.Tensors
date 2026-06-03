@@ -306,6 +306,10 @@ internal static class CudaNativeBindings
     [DllImport(CudaLibrary, EntryPoint = "cuMemAlloc_v2")]
     public static extern CudaResult cuMemAlloc(out IntPtr dptr, ulong bytesize);
 
+    /// <summary>Returns free and total device memory in bytes (diagnostic).</summary>
+    [DllImport(CudaLibrary, EntryPoint = "cuMemGetInfo_v2")]
+    public static extern CudaResult cuMemGetInfo(out ulong free, out ulong total);
+
     /// <summary>Frees a device buffer allocated via <see cref="cuMemAlloc"/>.</summary>
     [DllImport(CudaLibrary, EntryPoint = "cuMemFree_v2")]
     public static extern CudaResult cuMemFree(IntPtr dptr);

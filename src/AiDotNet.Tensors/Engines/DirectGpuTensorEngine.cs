@@ -1179,8 +1179,22 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             if (entries[i].Value.Timestamp <= threshold)
             {
+                // #226: an entry whose key still has a pending deferred download cannot
+                // simply have its buffer dropped — a later CPU read of that array would see
+                // garbage / hit a freed buffer. The original code SKIPPED such entries, but
+                // during pure-GPU training essentially every activation is registered as
+                // pending-deferred and never read on the CPU, so skipping made the cache
+                // un-evictable: it blew past both the count cap AND the 75%-VRAM byte cap and
+                // OOM'd the card (a tiny d256/L2 cortex pegged 12 GB past ~200K tokens — the
+                // long-hunted training OOM). Fix: MATERIALIZE the pending download now (copies
+                // the buffer into its CPU array while the buffer is still alive — the exact
+                // contract InvalidateActivationCacheEntry already relies on), THEN free the
+                // buffer. Correctness preserved; memory actually reclaimed so the cap holds.
                 if (Helpers.DeferredArrayMaterializer.IsPending(entries[i].Key))
-                    continue;
+                {
+                    try { Helpers.DeferredArrayMaterializer.TryMaterialize(entries[i].Key); }
+                    catch { Helpers.DeferredArrayMaterializer.Remove(entries[i].Key); }
+                }
 
                 if (_activationCache.TryRemove(entries[i].Key, out var entry))
                 {
@@ -2779,9 +2793,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 var gpuOut = gpuBackend.AllocateBuffer(input.Length);
                 try
                 {
-                    // GPU softmax kernel
+                    // GPU softmax kernel. batchSize = number of softmax ROWS = total / axisSize (NOT input.Length).
+                    // Passing input.Length made the kernel index input[row*axisSize + f] for row up to input.Length →
+                    // up to input.Length*axisSize accesses on an input.Length buffer = OOB illegal address
+                    // (CUDA 700 / OpenCL -5). This was THE bug blocking all GPU training.
                     int axisSize = input.Shape._dims[axis < 0 ? input.Rank + axis : axis];
-                    gpuBackend.Softmax(gpuIn, gpuOut, input.Length, axisSize);
+                    if (axisSize <= 0 || input.Length % axisSize != 0)
+                        throw new InvalidOperationException($"softmax axisSize={axisSize} does not divide length={input.Length}");
+                    gpuBackend.Softmax(gpuIn, gpuOut, input.Length / axisSize, axisSize);
                     DownloadIntoTensor(gpuBackend, gpuOut, floatDest);
                 }
                 finally
@@ -8710,7 +8729,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var inputBuffer = GetOrAllocateBuffer(backend, input.GetDataArray());
             using var gammaBuffer = GetOrCacheWeightBuffer(backend, gamma.GetDataArray(), PersistentTensorRole.Weights);
             using var saveMeanBuffer = GetOrAllocateBuffer(backend, mean.GetDataArray());
-            using var saveVarBuffer = GetOrAllocateBuffer(backend, variance.GetDataArray());
+            // The layernorm_backward + layernorm_grad_params kernels use their "saveInvVar" input DIRECTLY as
+            // inverse-std 1/sqrt(var+eps). But during training the FORWARD runs the managed base path
+            // (IEngine.LayerNorm bails to base while a tape is active), and base's `variance` out-param is TRUE
+            // variance — so passing it raw made the kernels read variance AS invVar, yielding ~zero/garbage
+            // gradInput AND gradGamma. LayerNorm is in every transformer layer, so that zeroed the backward
+            // signal at every layer → GPU cortex training never learned (flat at ln(V), both CUDA and OpenCL),
+            // while the forward + matmul/softmax/embedding backward were all correct (see Phase_GPU_Grad_Check).
+            // Convert variance → invVar here so the kernels get the inverse-std they actually consume.
+            var varF = DirectGpuEngine.ToFloatArray(variance.GetDataArray());
+            var invVarF = new float[varF.Length];
+            for (int i = 0; i < varF.Length; i++) invVarF[i] = 1f / MathF.Sqrt(varF[i] + (float)epsilon);
+            using var saveVarBuffer = GetOrAllocateBuffer(backend, DirectGpuEngine.FromFloatArray<T>(invVarF));
             using var gradInputBuffer = AllocateOutputBuffer(backend, input.Length);
             using var gradGammaBuffer = AllocateOutputBuffer(backend, normalizedSize);
             using var gradBetaBuffer = AllocateOutputBuffer(backend, normalizedSize);
