@@ -184,6 +184,37 @@ internal static partial class SimdGemm
         int.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_JIT_SMALLK_MAXM"), out var jmm) && jmm > 0
             ? jmm : 2048;
 
+    // ─── Stale-weight invalidation epoch ────────────────────────────────────
+    // The identity-keyed weight caches (pre-packed B below on net5+, the
+    // Conv2D kernel-transpose cache in CpuEngine) never re-read the weight
+    // array's contents. In-place weight mutation (optimizer steps,
+    // SetParameters/WithParameters-style bulk loads) therefore left the
+    // derived copy STALE: inference after a weight update silently used the
+    // old weights (caught by AiDotNet's Issue1296 grad-accum equivalence
+    // probe — two models with bit-identical parameters produced different
+    // forwards because one had a pack from its pre-load random init).
+    //
+    // Invalidation is a single global epoch counter rather than per-array
+    // removal because the thread-static MRU slots (_threadPrePackedBKey0/1)
+    // live on OTHER threads and cannot be cleared from the invalidating
+    // thread — an epoch comparison on every hit path covers them all. Cost
+    // per lookup is one Interlocked read; cost per invalidation is a full
+    // repack of every live weight on next use, which is inherent (the
+    // weights changed). Exposed publicly via Engines.InferenceWeightCache.
+    // Lives OUTSIDE the NET5_0_OR_GREATER region: the kernel-transpose cache
+    // consumes the epoch on every target framework.
+    private static long _weightCacheEpoch;
+
+    internal static long WeightCacheEpoch => System.Threading.Interlocked.Read(ref _weightCacheEpoch);
+
+    /// <summary>
+    /// Invalidate every cached derived weight (pre-packed float/int8 B,
+    /// transposed conv kernels). Must be called after mutating a weight
+    /// array in place that may have been consumed by a weight-cached fast
+    /// path; the next call re-derives from the live array contents.
+    /// </summary>
+    internal static void InvalidateCachedWeights() => System.Threading.Interlocked.Increment(ref _weightCacheEpoch);
+
 #if NET5_0_OR_GREATER
     // ─── Path A: pre-packed B cache ────────────────────────────────────────
     //
@@ -210,6 +241,9 @@ internal static partial class SimdGemm
         // Flat index: pcIter * NumColSubBlocks + csIdx.
         internal float[][] PackedSubs = System.Array.Empty<float[]>();
         internal int NumPcIters;
+        // WeightCacheEpoch value at build time. A hit is only valid while
+        // this matches the current global epoch — see _weightCacheEpoch.
+        internal long Epoch;
     }
 
     private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<float[], PrePackedB> _prePackedBCache = new();
@@ -278,6 +312,7 @@ internal static partial class SimdGemm
             ColSubSize = colSubSize,
             PackedSubs = packedSubs,
             NumPcIters = numPcIters,
+            Epoch = WeightCacheEpoch,
         };
     }
 
@@ -374,9 +409,11 @@ internal static partial class SimdGemm
         if (TryGetThreadPrePackedB(b, k, n, expectedMc, out var threadCached) && threadCached is not null)
             return threadCached;
 
+        long epoch = WeightCacheEpoch;
         if (_prePackedBCache.TryGetValue(b, out var existing)
             && existing.K == k && existing.N == n
-            && existing.Mc == expectedMc)
+            && existing.Mc == expectedMc
+            && existing.Epoch == epoch)
         {
             RememberThreadPrePackedB(b, existing);
             return existing;
@@ -387,7 +424,8 @@ internal static partial class SimdGemm
             if (_prePackedBCache.TryGetValue(b, out existing))
             {
                 if (existing.K == k && existing.N == n
-                    && existing.Mc == expectedMc)
+                    && existing.Mc == expectedMc
+                    && existing.Epoch == epoch)
                 {
                     RememberThreadPrePackedB(b, existing);
                     return existing;
@@ -431,6 +469,7 @@ internal static partial class SimdGemm
         if (valueRef is not null
             && valueRef.TryGetTarget(out var value)
             && value.K == k && value.N == n && value.Mc == expectedMc
+            && value.Epoch == WeightCacheEpoch
             && keyRef is not null
             && keyRef.TryGetTarget(out var key)
             && ReferenceEquals(key, b))
@@ -498,6 +537,8 @@ internal static partial class SimdGemm
         internal sbyte[][] PackedSubs = System.Array.Empty<sbyte[]>();
         internal int NumPcIters;
         internal float Scale;
+        // WeightCacheEpoch value at build time — see _weightCacheEpoch.
+        internal long Epoch;
     }
 
     private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<float[], Int8PrePackedB> _int8PrePackedBCache = new();
@@ -564,6 +605,7 @@ internal static partial class SimdGemm
             PackedSubs = packedSubs,
             NumPcIters = numPcIters,
             Scale = scale,
+            Epoch = WeightCacheEpoch,
         };
     }
 
@@ -601,9 +643,11 @@ internal static partial class SimdGemm
 
     private static Int8PrePackedB GetOrBuildInt8PrePackedB(float[] b, int k, int n, int m, int expectedMc)
     {
+        long epoch = WeightCacheEpoch;
         if (_int8PrePackedBCache.TryGetValue(b, out var existing)
             && existing.K == k && existing.N == n
-            && existing.Mc == expectedMc)
+            && existing.Mc == expectedMc
+            && existing.Epoch == epoch)
         {
             return existing;
         }
@@ -613,7 +657,8 @@ internal static partial class SimdGemm
             if (_int8PrePackedBCache.TryGetValue(b, out existing))
             {
                 if (existing.K == k && existing.N == n
-                    && existing.Mc == expectedMc)
+                    && existing.Mc == expectedMc
+                    && existing.Epoch == epoch)
                 {
                     return existing;
                 }

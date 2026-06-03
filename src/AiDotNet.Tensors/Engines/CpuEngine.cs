@@ -12629,7 +12629,22 @@ public partial class CpuEngine : ITensorLevelEngine
     // populates the cache and every subsequent call reuses the transposed
     // buffer for ~0 µs. Multi-threaded callers are handled inside
     // ConditionalWeakTable.GetValue which is documented thread-safe.
-    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<float[], float[]>
+    //
+    // Entries carry the SimdGemm.WeightCacheEpoch at build time: the cache
+    // keys on ARRAY IDENTITY and never re-reads contents, so an in-place
+    // kernel mutation (optimizer step, SetParameters bulk load) would
+    // otherwise leave a stale transpose serving old weights — the same
+    // stale-weight class of bug as SimdGemm's pre-packed-B caches. A hit is
+    // only valid while the entry's epoch matches the current global epoch
+    // (bumped via Engines.InferenceWeightCache.InvalidateAll()).
+    private sealed class KernelTransposeEntry
+    {
+        internal KernelTransposeEntry(float[] data, long epoch) { Data = data; Epoch = epoch; }
+        internal readonly float[] Data;
+        internal readonly long Epoch;
+    }
+
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<float[], KernelTransposeEntry>
         _kernelTransposeCache = new();
 
     /// <summary>
@@ -12839,12 +12854,22 @@ public partial class CpuEngine : ITensorLevelEngine
         // kernel array is GC'd.
         static float[] GetOrBuildTransposedKernel(float[] kernel, int rows, int cols)
         {
+            long epoch = AiDotNet.Tensors.Engines.Simd.SimdGemm.WeightCacheEpoch;
+            if (_kernelTransposeCache.TryGetValue(kernel, out var entry) && entry.Epoch == epoch)
+                return entry.Data;
+
+            // Stale (weights mutated in place since the transpose was built)
+            // or missing — rebuild from the live kernel contents. Remove+
+            // GetValue rather than AddOrUpdate: net471's ConditionalWeakTable
+            // has no AddOrUpdate, and a concurrent racer at worst redoes the
+            // transpose once.
+            _kernelTransposeCache.Remove(kernel);
             return _kernelTransposeCache.GetValue(kernel, k =>
             {
                 var kernelT = new float[cols * rows];
                 TransposeFloatParallel(k, 0, kernelT, 0, rows, cols);
-                return kernelT;
-            });
+                return new KernelTransposeEntry(kernelT, epoch);
+            }).Data;
         }
 
         /// <summary>
