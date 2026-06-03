@@ -145,6 +145,24 @@ internal static partial class SimdGemm
         int.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_OPENBLAS_MINK"), out var obk) && obk > 0
             ? obk : 256;
 
+    // Small-K asm panel kernel (JitGemmAvx2 6xN). Measured to beat BOTH the managed
+    // RyuJIT kernel AND OpenBLAS at small contraction depth with enough row-blocks to
+    // parallelize: transformer FFN [1024,64,128] 285 vs 111(mgd)/164(blas) GF/s, QKV
+    // [1024,64,192] 260 vs 93/200. At small K the 6-row A panel stays L1-resident, so
+    // streaming B across all column-blocks in one call (no per-tile transition) is a
+    // pure win. Default ON when the kernel is available; AIDOTNET_JIT_SMALLK=0 disables.
+    // Gated to: K <= JitSmallKMaxK (above it A[6,K] spills L1 and OpenBLAS/managed win),
+    // work >= JitSmallKMinWork (below it the serial path loses — needs parallel row-blocks),
+    // and the no-transpose contiguous top-level path.
+    private static readonly bool _jitSmallK =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_JIT_SMALLK") != "0";
+    internal static readonly int JitSmallKMaxK =
+        int.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_JIT_SMALLK_MAXK"), out var jk) && jk > 0
+            ? jk : 128;
+    internal static readonly long JitSmallKMinWork =
+        long.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_JIT_SMALLK_MINWORK"), out var jw) && jw > 0
+            ? jw : 4_000_000;
+
 #if NET5_0_OR_GREATER
     // ─── Path A: pre-packed B cache ────────────────────────────────────────
     //
@@ -1048,6 +1066,18 @@ internal static partial class SimdGemm
                         return;
                 }
             }
+        }
+
+        // Small-K asm panel kernel (default on): beats managed AND OpenBLAS at K<=128
+        // with enough row-blocks to parallelize (the transformer's FFN/QKV GEMMs).
+        // 285/260 GF/s vs 111/93 managed on FFN/QKV b32. The 6-row A panel stays
+        // L1-resident at small K, so the 6xN kernel streams B once with no per-tile
+        // managed->native transition.
+        if (_jitSmallK && JitGemmAvx2.Available && !transA && !transB && lda == k && ldb == n
+            && k <= JitSmallKMaxK && m >= 6 && n >= 16 && (long)m * n * k >= JitSmallKMinWork)
+        {
+            JitGemmAvx2.RunJit(a, b, c, m, n, k);
+            return;
         }
 #endif
         // Native OpenBLAS kernel on OUR pool for large no-transpose contiguous GEMMs.

@@ -51,10 +51,10 @@ public class LosingShapeGemmBench
 
             double tMgd = Min(2000, () => SimdGemm.SgemmAddInternal(A, K, false, B, N, false, C, M, K, N, allowParallel: true, clearedOutput: false));
 
-            // asm-JIT verdict + time. TryMultiply auto-tunes on first call then caches;
-            // a true return means the auto-tuner judged JIT faster and ran it.
-            bool jitWon = JitGemmAvx2.TryMultiply(A, B, Cj, M, N, K);
-            double tJit = jitWon ? Min(2000, () => JitGemmAvx2.TryMultiply(A, B, Cj, M, N, K)) : double.NaN;
+            // Time the JIT panel kernel directly (force it, bypass the auto-tuner) so we
+            // see its real throughput vs managed regardless of the tuner's verdict.
+            bool jitWon = JitGemmAvx2.Available && M >= 6 && N >= 16;
+            double tJit = jitWon ? Min(2000, () => JitGemmAvx2.RunJit(A, B, Cj, M, N, K)) : double.NaN;
 
             double tBlas = double.NaN;
             if (hasBlas)

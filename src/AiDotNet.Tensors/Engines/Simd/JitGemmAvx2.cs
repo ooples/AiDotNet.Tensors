@@ -36,6 +36,14 @@ internal static unsafe class JitGemmAvx2
     // void kernel(float* A, float* B, float* C, long K, long lda, long ldb, long ldc)
     private static readonly delegate* unmanaged[Cdecl]<float*, float*, float*, long, long, long, long, void> _kernel;
 
+    // void panel(float* A, float* B, float* C, long K, long lda, long ldb, long ldc, long numCB)
+    // Does 6 rows × (numCB*16) cols in ONE call — the column-block loop lives INSIDE
+    // the asm, so for small K the per-call managed->native transition + Win64
+    // prologue (save/restore xmm6-15) is paid once per ROW-block instead of once per
+    // (row,col)-block. That overhead is what made the per-tile _kernel lose to the
+    // managed kernel on the K=64 shapes (transformer FFN/QKV, LSTM recurrence).
+    private static readonly delegate* unmanaged[Cdecl]<float*, float*, float*, long, long, long, long, long, void> _panelKernel;
+
     /// <summary>True when the JIT kernel was emitted successfully (Windows x64 + AVX2 + FMA).</summary>
     internal static readonly bool Available;
 
@@ -50,15 +58,23 @@ internal static unsafe class JitGemmAvx2
                 Available = false;
                 return;
             }
-            byte[] mc = Emit6x16Unpacked();
-            IntPtr mem = VirtualAlloc(IntPtr.Zero, (UIntPtr)mc.Length, MEM_COMMIT | MEM_RESERVE, PAGE_RW);
-            if (mem == IntPtr.Zero) { Available = false; return; }
-            Marshal.Copy(mc, 0, mem, mc.Length);
-            if (!VirtualProtect(mem, (UIntPtr)mc.Length, PAGE_EXEC_R, out _)) { Available = false; return; }
-            _kernel = (delegate* unmanaged[Cdecl]<float*, float*, float*, long, long, long, long, void>)mem;
-            Available = true;
+            _kernel = (delegate* unmanaged[Cdecl]<float*, float*, float*, long, long, long, long, void>)
+                Publish(Emit6x16Unpacked());
+            _panelKernel = (delegate* unmanaged[Cdecl]<float*, float*, float*, long, long, long, long, long, void>)
+                Publish(Emit6xNPanel());
+            Available = _kernel != null && _panelKernel != null;
         }
         catch { Available = false; }
+    }
+
+    // Copy machine code into W^X executable memory and return the entry pointer.
+    private static IntPtr Publish(byte[] mc)
+    {
+        IntPtr mem = VirtualAlloc(IntPtr.Zero, (UIntPtr)mc.Length, MEM_COMMIT | MEM_RESERVE, PAGE_RW);
+        if (mem == IntPtr.Zero) return IntPtr.Zero;
+        Marshal.Copy(mc, 0, mem, mc.Length);
+        if (!VirtualProtect(mem, (UIntPtr)mc.Length, PAGE_EXEC_R, out _)) return IntPtr.Zero;
+        return mem;
     }
 
     private const int JIT_MIN_WORK = 1 << 18; // skip tiny GEMMs (dispatch not amortized)
@@ -125,7 +141,7 @@ internal static unsafe class JitGemmAvx2
         finally { System.Buffers.ArrayPool<float>.Shared.Return(scratch); }
     }
 
-    private static void RunJit(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c, int M, int N, int K)
+    internal static void RunJit(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c, int M, int N, int K)
     {
         int Mfull = M - M % 6, Nfull = N - N % 16;
         int numRB = Mfull / 6, numCB = Nfull / 16;
@@ -153,27 +169,26 @@ internal static unsafe class JitGemmAvx2
                     Helpers.PersistentParallelExecutor.Instance.Execute(chunks, chunk =>
                     {
                         int lo = chunk * perChunk, hi = Math.Min(lo + perChunk, totalRB);
-                        var kf = _kernel;
+                        var pk = _panelKernel;
                         float* aP = (float*)A, bP = (float*)B, cP = (float*)C;
                         for (int rb = lo; rb < hi; rb++)
                         {
                             float* aRow = aP + (long)(rb * 6) * kk;
                             float* cRow = cP + (long)(rb * 6) * nn;
-                            for (int cb = 0; cb < ncb; cb++)
-                                kf(aRow, bP + cb * 16, cRow + cb * 16, kk, kk, nn, nn);
+                            // One call does all ncb column-blocks for this row-block.
+                            pk(aRow, bP, cRow, kk, kk, nn, nn, ncb);
                         }
                     });
                 }
                 else
                 {
-                    var kf = _kernel;
+                    var pk = _panelKernel;
                     float* aP = (float*)A, bP = (float*)B, cP = (float*)C;
                     for (int rb = 0; rb < numRB; rb++)
                     {
                         float* aRow = aP + (long)(rb * 6) * kk;
                         float* cRow = cP + (long)(rb * 6) * nn;
-                        for (int cb = 0; cb < ncb; cb++)
-                            kf(aRow, bP + cb * 16, cRow + cb * 16, kk, kk, nn, nn);
+                        pk(aRow, bP, cRow, kk, kk, nn, nn, ncb);
                     }
                 }
             }
@@ -281,6 +296,120 @@ internal static unsafe class JitGemmAvx2
         for (int x = 6; x <= 15; x++) Mov128(0x10, x, RSP, (x - 6) * 16); // restore xmm
         Bytes(0x48, 0x81, 0xC4, 160, 0, 0, 0);                 // add rsp,160
         Pop(RSI); Pop(RBX);
+        Bytes(0xC5, 0xF8, 0x77); Bytes(0xC3);                  // vzeroupper; ret
+        return code.ToArray();
+    }
+
+    // ===================== 6×N panel kernel =====================
+    // void panel(A, B, C, K, lda, ldb, ldc, numCB): C[6, numCB*16] = A[6,K]·B[K, numCB*16].
+    // Same 6×16 microkernel as above, but the column-block loop is emitted INSIDE so
+    // the prologue/epilogue + managed->native transition is paid once per row-block,
+    // not once per tile. Win64 args: RCX=A RDX=B R8=C R9=K ;
+    // lda=[rsp+0x28] ldb=[rsp+0x30] ldc=[rsp+0x38] numCB=[rsp+0x40].
+    // Register map inside: RAX=lda*4, R10=ldb*4, R11=ldc*4 (consts);
+    // R12=A base, R13=B column base (advances 64B/cb), R14=C column base (advances 64B/cb),
+    // R15=K, RBP=cb counter; RCX/RBX/RSI=A row bases, RDX=B, R8=C, R9=k (per-cb working).
+    private static byte[] Emit6xNPanel()
+    {
+        var code = new List<byte>(700);
+        void Bytes(params byte[] bs) => code.AddRange(bs);
+        void Vrr(int mm, int pp, byte op, int reg, int vvvv, int rm) => Bytes(0xC4,
+            (byte)(((reg < 8 ? 1 : 0) << 7) | (1 << 6) | ((rm < 8 ? 1 : 0) << 5) | mm),
+            (byte)((((~vvvv) & 0xF) << 3) | (1 << 2) | pp),
+            op, (byte)(0xC0 | ((reg & 7) << 3) | (rm & 7)));
+        void Vrm(int mm, int pp, byte op, int reg, int b, int disp)
+        {
+            Bytes(0xC4, (byte)(((reg < 8 ? 1 : 0) << 7) | (1 << 6) | ((b < 8 ? 1 : 0) << 5) | mm),
+                  (byte)((0xF << 3) | (1 << 2) | pp), op);
+            int rm = b & 7; bool sib = rm == 4; int mod = disp == 0 ? 0 : (disp is >= -128 and <= 127 ? 1 : 2);
+            Bytes((byte)((mod << 6) | ((reg & 7) << 3) | rm));
+            if (sib) Bytes(0x24);
+            if (mod == 1) Bytes((byte)(sbyte)disp);
+            else if (mod == 2) Bytes((byte)disp, (byte)(disp >> 8), (byte)(disp >> 16), (byte)(disp >> 24));
+        }
+        void VrmBase(int mm, int pp, byte op, int reg, int b) => Bytes(0xC4,
+            (byte)(((reg < 8 ? 1 : 0) << 7) | (1 << 6) | ((b < 8 ? 1 : 0) << 5) | mm),
+            (byte)((0xF << 3) | (1 << 2) | pp), op, (byte)(((reg & 7) << 3) | (b & 7)));
+        void VrmIdx(int mm, int pp, byte op, int reg, int b, int idx) => Bytes(0xC4,
+            (byte)(((reg < 8 ? 1 : 0) << 7) | ((idx < 8 ? 1 : 0) << 6) | ((b < 8 ? 1 : 0) << 5) | mm),
+            (byte)((0xF << 3) | (1 << 2) | pp), op, (byte)(((reg & 7) << 3) | 4), (byte)(((idx & 7) << 3) | (b & 7)));
+        void Mov128(byte op, int reg, int b, int disp)
+        {
+            Bytes(0xC4, (byte)(((reg < 8 ? 1 : 0) << 7) | (1 << 6) | ((b < 8 ? 1 : 0) << 5) | 1),
+                  (byte)((0xF << 3) | 0), op);
+            int rm = b & 7; bool sib = rm == 4; int mod = disp == 0 ? 0 : 1;
+            Bytes((byte)((mod << 6) | ((reg & 7) << 3) | rm)); if (sib) Bytes(0x24); if (mod == 1) Bytes((byte)disp);
+        }
+        void MovFromStack(int dst, byte disp) => Bytes((byte)(0x48 | (dst >= 8 ? 4 : 0)), 0x8B, (byte)(0x44 | ((dst & 7) << 3)), 0x24, disp);
+        void Shl4(int r) => Bytes((byte)(0x48 | (r >= 8 ? 1 : 0)), 0xC1, (byte)(0xE0 | (r & 7)), 2);
+        void Lea(int dst, int b, int idx, int scale)
+        {
+            int sc = scale == 2 ? 1 : scale == 4 ? 2 : scale == 8 ? 3 : 0;
+            Bytes((byte)(0x48 | (dst >= 8 ? 4 : 0) | (idx >= 8 ? 2 : 0) | (b >= 8 ? 1 : 0)), 0x8D,
+                  (byte)(((dst & 7) << 3) | 4), (byte)((sc << 6) | ((idx & 7) << 3) | (b & 7)));
+        }
+        void AddImm(int r, byte imm) => Bytes((byte)(0x48 | (r >= 8 ? 1 : 0)), 0x83, (byte)(0xC0 | (r & 7)), imm);
+        void AddRegReg(int dst, int src) => Bytes((byte)(0x48 | (src >= 8 ? 4 : 0) | (dst >= 8 ? 1 : 0)), 0x01, (byte)(0xC0 | ((src & 7) << 3) | (dst & 7)));
+        void MovRR(int dst, int src) => Bytes((byte)(0x48 | (src >= 8 ? 4 : 0) | (dst >= 8 ? 1 : 0)), 0x89, (byte)(0xC0 | ((src & 7) << 3) | (dst & 7)));
+        void Push(int r) { if (r >= 8) Bytes(0x41); Bytes((byte)(0x50 | (r & 7))); }
+        void Pop(int r) { if (r >= 8) Bytes(0x41); Bytes((byte)(0x58 | (r & 7))); }
+        const int RAX = 0, RCX = 1, RDX = 2, RBX = 3, RSP = 4, RBP = 5, RSI = 6, R8 = 8, R9 = 9, R10 = 10, R11 = 11, R12 = 12, R13 = 13, R14 = 14, R15 = 15;
+
+        // Prologue: save 7 callee-saved GPRs (rbx,rsi,rbp,r12-r15). After these the
+        // caller's stack args sit at +0x28+0x38 = +0x60 (lda) … +0x78 (numCB).
+        Push(RBX); Push(RSI); Push(RBP); Push(R12); Push(R13); Push(R14); Push(R15);
+        MovRR(R12, RCX);                    // r12 = A base
+        MovRR(R13, RDX);                    // r13 = B column base
+        MovRR(R14, R8);                     // r14 = C column base
+        MovRR(R15, R9);                     // r15 = K
+        MovFromStack(RAX, 0x60); Shl4(RAX); // rax = lda*4
+        MovFromStack(R10, 0x68); Shl4(R10); // r10 = ldb*4
+        MovFromStack(R11, 0x70); Shl4(R11); // r11 = ldc*4
+        MovFromStack(RBP, 0x78);            // rbp = numCB
+        Bytes(0x48, 0x81, 0xEC, 160, 0, 0, 0);                 // sub rsp,160
+        for (int x = 6; x <= 15; x++) Mov128(0x11, x, RSP, (x - 6) * 16); // save xmm6..15
+
+        int cbLoop = code.Count;
+        // Per-column-block setup: reset A row bases, B/C working pointers, K.
+        MovRR(RCX, R12);            // rcx = A row0 base
+        Lea(RBX, R12, RAX, 2);      // rbx = A + 2*lda  (row2 base)
+        Lea(RSI, R12, RAX, 4);      // rsi = A + 4*lda  (row4 base)
+        MovRR(RDX, R13);            // rdx = B (this column block)
+        MovRR(R8, R14);             // r8  = C (this column block)
+        MovRR(R9, R15);             // r9  = k counter
+        for (int d = 0; d < 12; d++) Vrr(1, 0, 0x57, d, d, d);  // zero ymm0..11
+
+        int kLoop = code.Count;
+        Vrm(1, 0, 0x10, 12, RDX, 0); Vrm(1, 0, 0x10, 13, RDX, 32);   // B halves
+        VrmBase(2, 1, 0x18, 14, RCX); Vrr(2, 1, 0xB8, 0, 14, 12); Vrr(2, 1, 0xB8, 1, 14, 13);
+        VrmIdx(2, 1, 0x18, 14, RCX, RAX); Vrr(2, 1, 0xB8, 2, 14, 12); Vrr(2, 1, 0xB8, 3, 14, 13);
+        VrmBase(2, 1, 0x18, 14, RBX); Vrr(2, 1, 0xB8, 4, 14, 12); Vrr(2, 1, 0xB8, 5, 14, 13);
+        VrmIdx(2, 1, 0x18, 14, RBX, RAX); Vrr(2, 1, 0xB8, 6, 14, 12); Vrr(2, 1, 0xB8, 7, 14, 13);
+        VrmBase(2, 1, 0x18, 14, RSI); Vrr(2, 1, 0xB8, 8, 14, 12); Vrr(2, 1, 0xB8, 9, 14, 13);
+        VrmIdx(2, 1, 0x18, 14, RSI, RAX); Vrr(2, 1, 0xB8, 10, 14, 12); Vrr(2, 1, 0xB8, 11, 14, 13);
+        AddImm(RCX, 4); AddImm(RBX, 4); AddImm(RSI, 4); AddRegReg(RDX, R10);
+        Bytes(0x49, 0xFF, 0xC9);                               // dec r9
+        int afterK = code.Count;
+        Bytes(0x75, (byte)(sbyte)(kLoop - (afterK + 2)));      // jnz kLoop
+
+        // Store the 6×16 accumulators to C (r8), advancing by ldc between rows.
+        for (int r = 0; r < 6; r++)
+        {
+            Vrm(1, 0, 0x11, r * 2, R8, 0); Vrm(1, 0, 0x11, r * 2 + 1, R8, 32);
+            if (r < 5) AddRegReg(R8, R11);
+        }
+
+        // Next column block: B and C advance by 16 floats (64 bytes); dec cb; loop.
+        AddImm(R13, 64); AddImm(R14, 64);
+        Bytes(0x48, 0xFF, 0xCD);                               // dec rbp
+        int afterCb = code.Count;
+        int rel = cbLoop - (afterCb + 2);
+        if (rel is >= -128 and <= 127) Bytes(0x75, (byte)(sbyte)rel);  // jnz cbLoop (short)
+        else { int r32 = cbLoop - (afterCb + 6); Bytes(0x0F, 0x85, (byte)r32, (byte)(r32 >> 8), (byte)(r32 >> 16), (byte)(r32 >> 24)); }
+
+        for (int x = 6; x <= 15; x++) Mov128(0x10, x, RSP, (x - 6) * 16); // restore xmm
+        Bytes(0x48, 0x81, 0xC4, 160, 0, 0, 0);                 // add rsp,160
+        Pop(R15); Pop(R14); Pop(R13); Pop(R12); Pop(RBP); Pop(RSI); Pop(RBX);
         Bytes(0xC5, 0xF8, 0x77); Bytes(0xC3);                  // vzeroupper; ret
         return code.ToArray();
     }
