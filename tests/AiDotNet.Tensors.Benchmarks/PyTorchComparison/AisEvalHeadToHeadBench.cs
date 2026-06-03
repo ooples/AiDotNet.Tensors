@@ -260,6 +260,19 @@ internal static class AisEvalHeadToHeadBench
             BlasProvider.MklSgemmZeroOffset(bs, 10, 128, h1, 128, w2, 10, y, 10);
         };
 
+        // Managed variant: all 3 layers through SgemmWithCachedB (the BlasManaged
+        // cached-B machine-code path, #409). Weights are stable arrays so the
+        // pre-pack cache hits. Tests whether the managed microkernel beats native
+        // BLAS at these small inference shapes (the #475 routing question).
+        Action gemm3Managed = () =>
+        {
+            AiDotNet.Tensors.Engines.Simd.SimdGemm.SgemmWithCachedB(x0.AsSpan(0, bs * 784), w0, h0.AsSpan(0, bs * 512), bs, 784, 512);
+            for (int i = 0; i < bs * 512; i++) if (h0[i] < 0) h0[i] = 0;
+            AiDotNet.Tensors.Engines.Simd.SimdGemm.SgemmWithCachedB(h0.AsSpan(0, bs * 512), w1, h1.AsSpan(0, bs * 128), bs, 512, 128);
+            for (int i = 0; i < bs * 128; i++) if (h1[i] < 0) h1[i] = 0;
+            AiDotNet.Tensors.Engines.Simd.SimdGemm.SgemmWithCachedB(h1.AsSpan(0, bs * 128), w2, y.AsSpan(0, bs * 10), bs, 128, 10);
+        };
+
         // OpenBLAS thread-count sweep: tiny GEMMs (esp. 128x10x128) may be hurt
         // by spinning all cores — torch's MKL uses small-GEMM thread heuristics.
         var sw = new Stopwatch();
@@ -297,6 +310,13 @@ internal static class AisEvalHeadToHeadBench
             (mklMed, mklP95) = Percentiles(mt);
         }
 
+        // Managed machine-code path timing
+        for (int i = 0; i < Warmup; i++) gemm3Managed();
+        SettleGc();
+        var gt = new double[Iters];
+        for (int i = 0; i < Iters; i++) { sw.Restart(); gemm3Managed(); sw.Stop(); gt[i] = sw.Elapsed.TotalMilliseconds; }
+        var (mgMed, mgP95) = Percentiles(gt);
+
         // torch reference at the same shapes
         var mlp = torch.nn.Sequential(
             ("fc1", torch.nn.Linear(784, 512)), ("relu1", torch.nn.ReLU()),
@@ -309,6 +329,7 @@ internal static class AisEvalHeadToHeadBench
         Console.WriteLine($"  raw 3xGEMM (OpenBLAS fptr) : med {med,7:F3}ms  p95 {p95,7:F3}ms");
         if (!double.IsNaN(mklMed))
             Console.WriteLine($"  raw 3xGEMM (MKL verified) : med {mklMed,7:F3}ms  p95 {mklP95,7:F3}ms");
+        Console.WriteLine($"  raw 3xGEMM (managed mc)   : med {mgMed,7:F3}ms  p95 {mgP95,7:F3}ms");
         Console.WriteLine($"  torch MLP                 : med {tMed,7:F3}ms  p95 {tP95,7:F3}ms");
         Console.WriteLine();
         double bestFloor = double.IsNaN(mklMed) ? med : Math.Min(med, mklMed);
