@@ -185,17 +185,28 @@ public partial class CpuEngine
                         bool preferManaged = (long)curK * n <= 200_000 || !BlasProvider.HasRawSgemm;
                         if (preferManaged)
                         {
-                            // Managed cached-B keys its pre-pack on the weight array identity,
-                            // so it needs a float[]. The narrow layers it serves are small, so
-                            // the GetDataArray snapshot (a copy only for GPU-tagged weights) is
-                            // cheap relative to the wide-head copy avoided above.
-                            var wArr = (float[])(object)w.GetDataArray();
+                            // Managed cached-B keys its pre-pack on the weight ARRAY IDENTITY,
+                            // so it must see the SAME float[] on every call. GetDataArray()
+                            // returns a fresh snapshot for GPU-tagged tensors, which both
+                            // defeated the identity-keyed pack cache (a silent re-pack every
+                            // call) and reintroduced the per-call weight copy this PR removes.
+                            // GetFlattenedData() returns the STABLE backing array for the
+                            // standard weight layout (contiguous, zero-offset, exact-fit —
+                            // the same memory AsSpan() reads), preserving identity across
+                            // calls; exotic layouts still get a correct flat copy, merely
+                            // without cross-call pack reuse. The AsSpan() touch first
+                            // materializes lazy data under the same contiguous-weight
+                            // contract the wide-layer branch below already relies on.
+                            var wT = (Tensor<float>)(object)w;
+                            _ = wT.AsSpan();
+                            float[] wArr = wT.GetFlattenedData();
                             Simd.SimdGemm.SgemmWithCachedB(
                                 srcSpan.Slice(0, M * curK), wArr, dst.AsSpan(0, M * n), M, curK, n);
                         }
                         else
                         {
-                            ReadOnlySpan<float> wSpan = ((Tensor<float>)(object)w).AsSpan();
+                            var wT = (Tensor<float>)(object)w;
+                            ReadOnlySpan<float> wSpan = wT.AsSpan();
                             unsafe
                             {
                                 fixed (float* ps = srcSpan, pw = wSpan, pd = dst)
@@ -203,8 +214,11 @@ public partial class CpuEngine
                                     if (BlasProvider.HasRawSgemm)
                                         BlasProvider.SgemmRaw(M, n, curK, ps, curK, pw, n, pd, n);
                                     else
+                                        // Unreachable in practice (preferManaged already captures
+                                        // !HasRawSgemm); kept as a defensive fallback, on the same
+                                        // stable-array contract as the preferManaged branch above.
                                         Simd.SimdGemm.SgemmWithCachedB(
-                                            srcSpan.Slice(0, M * curK), (float[])(object)w.GetDataArray(),
+                                            srcSpan.Slice(0, M * curK), wT.GetFlattenedData(),
                                             dst.AsSpan(0, M * n), M, curK, n);
                                 }
                             }
