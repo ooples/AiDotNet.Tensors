@@ -14771,11 +14771,16 @@ public partial class CpuEngine : ITensorLevelEngine
         //
         // The indices side-output cannot be computed here: under an active trace the
         // input buffer is a graph placeholder (values do not flow at trace time), so it
-        // is returned zero-filled. That is sound for the compiled-INFERENCE path —
-        // indices feed only the training backward, and the traced Predict runs under
+        // is returned zero-filled. That is sound ONLY for the compiled-INFERENCE path —
+        // indices feed the training backward, and the traced Predict runs under
         // NoGradScope — while the recorded node's replay closure recomputes the pooled
-        // VALUES, which is all the inference plan needs.
-        if (GraphMode.IsActive)
+        // VALUES, which is all the inference plan needs. TRAINING traces (an active
+        // GradientTape) must NOT take this branch: the recorded node's saved zero-filled
+        // indices would corrupt MaxPool2DWithIndicesBackward's gradient routing
+        // (surfaced as Issue1296 gradient-accumulation mismatches). They keep the
+        // eager path below, exactly as before this recording existed.
+        if (GraphMode.IsActive
+            && Autodiff.GradientTape<T>.Current is null)
         {
             var scope = GraphMode.Current;
             if (scope != null)
