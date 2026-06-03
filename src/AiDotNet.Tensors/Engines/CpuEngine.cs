@@ -14761,6 +14761,47 @@ public partial class CpuEngine : ITensorLevelEngine
         if (outputHeight <= 0 || outputWidth <= 0)
             throw new ArgumentException($"Invalid output dimensions ({outputHeight}x{outputWidth}). Check pool size and stride.");
 
+        // Lazy graph mode (compiled-inference trace): record the pool as a graph node
+        // so the captured plan stays CONNECTED end-to-end. This entry is what
+        // MaxPoolingLayer.Forward calls, and it previously had NO GraphMode recording —
+        // tracing a conv net captured a graph with both pools missing, which fell apart
+        // into disconnected segments bridged by stale trace-time buffers and a scrambled
+        // topological order (the dense head executed BEFORE the convs). Replay returned
+        // relErr=1.0 garbage (CompiledInferenceParityTests.Cnn_CompiledReplay_MatchesEager).
+        //
+        // The indices side-output cannot be computed here: under an active trace the
+        // input buffer is a graph placeholder (values do not flow at trace time), so it
+        // is returned zero-filled. That is sound for the compiled-INFERENCE path —
+        // indices feed only the training backward, and the traced Predict runs under
+        // NoGradScope — while the recorded node's replay closure recomputes the pooled
+        // VALUES, which is all the inference plan needs.
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                maxIndices = new int[batch, channels, outputHeight, outputWidth, 2];
+                var captured = input;
+                int ph = poolH, pw = poolW, sh = strideH, sw = strideW;
+                return scope.RecordUnary(LazyNodeType.MaxPool2D, "MaxPool2DWithIndices", input,
+                    new[] { batch, channels, outputHeight, outputWidth },
+                    (eng, output) =>
+                    {
+                        if (eng is CpuEngine cpuEng && ph == pw && sh == sw)
+                        {
+                            cpuEng.MaxPool2DInto(output, captured, ph, sh, 0);
+                        }
+                        else
+                        {
+                            var eager = eng.MaxPool2DWithIndices(captured, new[] { ph, pw }, new[] { sh, sw }, out _);
+                            eager.AsSpan().CopyTo(output.AsWritableSpan());
+                        }
+                    },
+                    BackwardFunctions<T>.MaxPool2DWithIndicesBackward,
+                    new object[] { maxIndices, poolSize, stride });
+            }
+        }
+
         var result = TensorAllocator.Rent<T>([batch, channels, outputHeight, outputWidth]);
         // Use local variable to avoid capturing out parameter in lambda
         var indices = new int[batch, channels, outputHeight, outputWidth, 2];
