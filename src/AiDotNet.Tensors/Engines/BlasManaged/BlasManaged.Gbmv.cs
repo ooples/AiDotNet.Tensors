@@ -1,4 +1,5 @@
 using System;
+using System.Runtime.InteropServices;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
 
@@ -41,6 +42,21 @@ public static partial class BlasManaged
 
         var ops = MathHelper.GetNumericOperations<T>();
 
+        // float/double take a typed band matvec (typed AXPY accumulation over the band +
+        // typed β-scale); the generic INumericOperations path is kept for other types.
+        if (typeof(T) == typeof(float))
+        {
+            GbmvFloat(transA, m, n, kl, ku, (float)(object)alpha, MemoryMarshal.Cast<T, float>(a), lda,
+                MemoryMarshal.Cast<T, float>(x), incx, (float)(object)beta, MemoryMarshal.Cast<T, float>(y), incy, lenY);
+            return;
+        }
+        if (typeof(T) == typeof(double))
+        {
+            GbmvDouble(transA, m, n, kl, ku, (double)(object)alpha, MemoryMarshal.Cast<T, double>(a), lda,
+                MemoryMarshal.Cast<T, double>(x), incx, (double)(object)beta, MemoryMarshal.Cast<T, double>(y), incy, lenY);
+            return;
+        }
+
         // Scale y by beta.
         for (int o = 0; o < lenY; o++)
         {
@@ -82,5 +98,59 @@ public static partial class BlasManaged
                 y[yj] = ops.Add(y[yj], ops.Multiply(alpha, acc));
             }
         }
+    }
+
+    private static void GbmvFloat(
+        bool transA, int m, int n, int kl, int ku, float alpha,
+        ReadOnlySpan<float> a, int lda, ReadOnlySpan<float> x, int incx, float beta,
+        Span<float> y, int incy, int lenY)
+    {
+        if (beta != 1f)
+            for (int o = 0; o < lenY; o++) y[o * incy] *= beta;
+        if (!transA)
+            for (int i = 0; i < m; i++)
+            {
+                int jlo = Math.Max(0, i - kl), jhi = Math.Min(n - 1, i + ku);
+                float acc = 0f;
+                for (int j = jlo; j <= jhi; j++)
+                    acc += a[j * lda + (ku - j + i)] * x[j * incx];
+                y[i * incy] += alpha * acc;
+            }
+        else
+            for (int j = 0; j < n; j++)
+            {
+                int ilo = Math.Max(0, j - ku), ihi = Math.Min(m - 1, j + kl);
+                float acc = 0f;
+                for (int i = ilo; i <= ihi; i++)
+                    acc += a[j * lda + (ku - j + i)] * x[i * incx];
+                y[j * incy] += alpha * acc;
+            }
+    }
+
+    private static void GbmvDouble(
+        bool transA, int m, int n, int kl, int ku, double alpha,
+        ReadOnlySpan<double> a, int lda, ReadOnlySpan<double> x, int incx, double beta,
+        Span<double> y, int incy, int lenY)
+    {
+        if (beta != 1.0)
+            for (int o = 0; o < lenY; o++) y[o * incy] *= beta;
+        if (!transA)
+            for (int i = 0; i < m; i++)
+            {
+                int jlo = Math.Max(0, i - kl), jhi = Math.Min(n - 1, i + ku);
+                double acc = 0.0;
+                for (int j = jlo; j <= jhi; j++)
+                    acc += a[j * lda + (ku - j + i)] * x[j * incx];
+                y[i * incy] += alpha * acc;
+            }
+        else
+            for (int j = 0; j < n; j++)
+            {
+                int ilo = Math.Max(0, j - ku), ihi = Math.Min(m - 1, j + kl);
+                double acc = 0.0;
+                for (int i = ilo; i <= ihi; i++)
+                    acc += a[j * lda + (ku - j + i)] * x[i * incx];
+                y[j * incy] += alpha * acc;
+            }
     }
 }
