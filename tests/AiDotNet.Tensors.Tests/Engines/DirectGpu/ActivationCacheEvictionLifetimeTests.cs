@@ -18,12 +18,16 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// freed OpenCL buffer, producing <c>CL_INVALID_MEM_OBJECT</c> (OpenCL error -38)
 /// one epoch into Transformer training on AMD <c>gfx1012</c>.
 ///
-/// The fix replaces the old containsKey eviction guard with the unified
-/// <see cref="Helpers.DeferredArrayMaterializer.IsPending(object)"/> check and
-/// makes the materializer registry the single source of truth for pending
-/// downloads. These tests reach through reflection into the engine's private
-/// eviction method to assert the new invariant on any CI host — without
-/// requiring a real OpenCL runtime.
+/// The eviction guard is the unified
+/// <see cref="Helpers.DeferredArrayMaterializer.IsPending(object)"/> check, with the
+/// materializer registry as the single source of truth for pending downloads. A pending
+/// entry in the eviction window is NOT skipped — during pure-GPU training essentially every
+/// activation is pending-deferred and never read on the CPU, so skipping made the cache
+/// un-evictable and OOM'd the card (the long-hunted training OOM). Instead its deferred
+/// download is MATERIALIZED (the buffer is copied into its CPU array while still alive) and
+/// only THEN is the buffer freed — correctness preserved, memory actually reclaimed. These
+/// tests reach through reflection into the engine's private eviction method to assert the
+/// invariant on any CI host — without requiring a real OpenCL runtime.
 /// </summary>
 public class ActivationCacheEvictionLifetimeTests
 {
@@ -58,12 +62,12 @@ public class ActivationCacheEvictionLifetimeTests
     }
 
     [Fact]
-    public void EvictOldest_SkipsEntriesWithPendingMaterializer()
+    public void EvictOldest_MaterializesPendingEntryBeforeFreeing()
     {
         // The fix: EvictOldestActivationsUnsafe must consult the global
         // DeferredArrayMaterializer registry. This test reaches past CacheActivation
         // and directly populates _activationCache so the assertion focuses purely
-        // on the eviction predicate's skip behaviour.
+        // on the eviction predicate's pending-entry handling.
         using var engine = new DirectGpuTensorEngine();
 
         var engineType = typeof(DirectGpuTensorEngine);
@@ -83,11 +87,15 @@ public class ActivationCacheEvictionLifetimeTests
         object activationCache = activationCacheField.GetValue(engine)!;
         object cacheLock = activationCacheLockField.GetValue(engine)!;
 
-        // Four cache entries: the oldest is protected by a pending materializer;
-        // the other three are unprotected and eligible for eviction. EvictOldest
-        // removes entries.Length / 2 = 2 entries, scanning by timestamp from
-        // oldest up to the median. Without the skip-check, the protected entry
-        // would be disposed — that is the #226 regression this test pins.
+        // Four cache entries: the oldest carries a pending materializer; the other
+        // three are unprotected. EvictOldest removes entries.Length / 2 = 2 entries,
+        // scanning by timestamp from oldest up to the median — so the oldest (pending)
+        // entry is in the eviction window. The contract this pins: a pending entry is
+        // NOT skipped (skipping made the cache un-evictable in pure-GPU training and
+        // OOM'd the card, the bug this PR fixes); instead its deferred download is
+        // MATERIALIZED — copied into its CPU array while the buffer is still alive —
+        // and only THEN is the buffer freed. Correctness preserved (a later CPU read
+        // sees the materialized array, never a freed buffer); memory reclaimed.
         var protectedKey = new object();
         var victimKey1 = new object();
         var victimKey2 = new object();
@@ -118,11 +126,12 @@ public class ActivationCacheEvictionLifetimeTests
         Assert.True((bool)tryAdd.Invoke(activationCache, new[] { victimKey3, victimEntry3 })!);
         timestampField.SetValue(engine, 4L);
 
-        // Register a materializer for the protected key. IsPending(protectedKey) now true.
-        // DeferredArrayMaterializer is process-global state, so any test body that
-        // registers into it must guarantee cleanup even on assertion failure —
-        // hence the try/finally.
-        AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.Register(protectedKey, _ => { });
+        // Register a materializer for the protected key that records whether it ran.
+        // IsPending(protectedKey) is now true. DeferredArrayMaterializer is process-global
+        // state, so any test body that registers into it must guarantee cleanup even on
+        // assertion failure — hence the try/finally.
+        bool materializerInvoked = false;
+        AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.Register(protectedKey, _ => materializerInvoked = true);
         try
         {
             Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(protectedKey));
@@ -134,13 +143,23 @@ public class ActivationCacheEvictionLifetimeTests
                     .Cast<object>().ToArray();
             }
 
+            // The pending download must have been MATERIALIZED during eviction (copied out
+            // while the buffer was still alive), and consumed from the registry — so the
+            // later buffer free is safe and the entry no longer reads as pending.
+            Assert.True(materializerInvoked,
+                "A pending entry in the eviction window must have its deferred download materialized " +
+                "(buffer copied to its CPU array) before the buffer is freed — not skipped.");
+            Assert.False(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(protectedKey),
+                "TryMaterialize must consume the pending registration so the entry isn't materialized twice.");
+
             // Dispose like the real code does (outside the cache lock).
             var disposeMethod = activationCacheEntryType.GetMethod("Dispose")!;
             foreach (var e in evictedList) disposeMethod.Invoke(e, null);
 
-            // The protected entry's buffer MUST NOT have been disposed; at least one of the
-            // unprotected victims should have been swept (eviction removes entries.Length/2).
-            Assert.Equal(0, protectedBuffer.DisposeCount);
+            // Memory is actually reclaimed: the (materialized) pending entry's buffer IS freed
+            // now — that's the OOM fix vs the old skip-forever behaviour — and so is at least
+            // one of the unprotected victims (eviction removes entries.Length/2 = 2).
+            Assert.Equal(1, protectedBuffer.DisposeCount);
             int totalVictimDisposes =
                 victimBuffer1.DisposeCount + victimBuffer2.DisposeCount + victimBuffer3.DisposeCount;
             Assert.True(totalVictimDisposes >= 1,
