@@ -63,6 +63,20 @@ internal static unsafe class JitGemmAvx2
 
     private const int JIT_MIN_WORK = 1 << 18; // skip tiny GEMMs (dispatch not amortized)
 
+    // Opt-in master gate (AIDOTNET_JIT_GEMM=1). Centralized here so every GEMM
+    // entry point (Sgemm, SgemmWithCachedB, TensorMatMul2D, FusedLinear, MlpForward,
+    // CompiledMlp) can route through TryMultiply without each re-reading the env.
+    private static readonly bool _enabled =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_JIT_GEMM") == "1";
+
+    // Minimum M (rows) for the JIT to engage. The JIT wins at large M (many 6-row
+    // blocks to parallelize, prologue amortized — e.g. the transformer FFN/QKV at
+    // M=B*seq=4096), but LOSES at small M (e.g. MLP at M=batch≤128), where the
+    // tuned managed/native kernels (CompiledMlp) beat it and forcing JIT regressed
+    // the MLP ~2×. Below this, TryMultiply declines and the caller keeps its path.
+    private static readonly int _jitMinM =
+        int.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_JIT_MIN_M"), out var jm) && jm > 0 ? jm : 512;
+
     /// <summary>
     /// C[M,N] = A[M,K]·B[K,N], row-major, contiguous (lda=K, ldb=N, ldc=N).
     /// Returns false (no mutation) when unavailable / too small, so the caller
@@ -70,7 +84,7 @@ internal static unsafe class JitGemmAvx2
     /// </summary>
     internal static bool TryMultiply(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c, int M, int N, int K)
     {
-        if (!Available || M < 6 || N < 16 || (long)M * N * K < JIT_MIN_WORK) return false;
+        if (!_enabled || !Available || M < _jitMinM || N < 16 || (long)M * N * K < JIT_MIN_WORK) return false;
 
         int Mfull = M - M % 6, Nfull = N - N % 16;
         int numRB = Mfull / 6, numCB = Nfull / 16;

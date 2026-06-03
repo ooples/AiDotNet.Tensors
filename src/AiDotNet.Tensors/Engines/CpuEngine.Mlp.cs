@@ -170,8 +170,21 @@ public partial class CpuEngine
                         // cached-B still wins the small layers (low K·N), where native
                         // BLAS dispatch overhead dominates. Mirror that split here without
                         // changing PreferManagedInferenceGemm (which FusedLinear also uses).
+                        bool gemmDone = false;
+#if !NET471
+                        // JIT'd AVX2 kernel first (opt-in) — beats both managed cached-B
+                        // and native BLAS on the MLP shapes; this is the path the MLP
+                        // actually takes (so without it the JIT never reached the MLP).
+                        if (_jitGemm && Simd.JitGemmAvx2.TryMultiply(
+                                src.AsSpan(0, M * curK), wArr.AsSpan(0, curK * n), dst.AsSpan(0, M * n), M, n, curK))
+                            gemmDone = true;
+#endif
                         bool preferManaged = (long)curK * n <= 200_000 || !BlasProvider.HasRawSgemm;
-                        if (preferManaged)
+                        if (gemmDone)
+                        {
+                            // done by JIT
+                        }
+                        else if (preferManaged)
                         {
                             Simd.SimdGemm.SgemmWithCachedB(
                                 src.AsSpan(0, M * curK), wArr, dst.AsSpan(0, M * n), M, curK, n);

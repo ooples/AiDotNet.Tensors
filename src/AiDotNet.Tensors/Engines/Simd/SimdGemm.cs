@@ -226,6 +226,15 @@ internal static partial class SimdGemm
         System.Span<float> c,
         int m, int k, int n)
     {
+#if !NET471
+        // Our JIT'd AVX2 kernel first (opt-in). This is the entry the MLP's
+        // MlpForward path and FusedLinear's tier-3 fallback use — without this
+        // hook the JIT (376-700 GFLOP/s) never reached the MLP, which is why a
+        // pure-GEMM MLP didn't translate the GFLOP/s win. Row-major contiguous.
+        if (_jitGemm && JitGemmAvx2.TryMultiply(a, b.AsSpan(0, k * n), c, m, n, k))
+            return;
+#endif
+
         // Cache-eligibility gate: if n > Nc, the outer loop iterates jc multiple
         // times and our single-jc assumption breaks. Also skip if AVX-512 path is
         // eligible (the specialised kernel's layout differs).
