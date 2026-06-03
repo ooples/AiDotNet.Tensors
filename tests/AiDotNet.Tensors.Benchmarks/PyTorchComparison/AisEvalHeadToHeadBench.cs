@@ -451,7 +451,7 @@ internal static class AisEvalHeadToHeadBench
             var refOut = new float[src.Length];
             for (int i = 0; i < src.Length; i++) refOut[i] = MathF.Max(0f, src[i] * 2f);
 
-            AiDotNet.Tensors.Engines.BlasManaged.Pool.CooperativeGemmScheduler.Enabled = true;
+            AiDotNet.Tensors.Helpers.CpuParallelSettings.UseCooperativePool = true;
             var o1 = new float[src.Length];
             AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, src.Length, src.Length, i => o1[i] = MathF.Max(0f, src[i] * 2f));
             bool single = true;
@@ -475,7 +475,7 @@ internal static class AisEvalHeadToHeadBench
                 threads[t].Start();
             }
             foreach (var th in threads) th.Join();
-            AiDotNet.Tensors.Engines.BlasManaged.Pool.CooperativeGemmScheduler.Enabled = false;
+            AiDotNet.Tensors.Helpers.CpuParallelSettings.UseCooperativePool = false;
             Console.WriteLine($"  correctness: single={(single ? "PASS" : "FAIL")}  concurrent(8x50)={(badThreads == 0 ? "PASS" : $"FAIL({badThreads})")}");
         }
 
@@ -494,7 +494,7 @@ internal static class AisEvalHeadToHeadBench
 
         void Measure(string label, bool coop)
         {
-            AiDotNet.Tensors.Engines.BlasManaged.Pool.CooperativeGemmScheduler.Enabled = coop;
+            AiDotNet.Tensors.Helpers.CpuParallelSettings.UseCooperativePool = coop;
             for (int i = 0; i < 500; i++) op(); // warm
             SettleGc();
             long a0 = GC.GetAllocatedBytesForCurrentThread();
@@ -511,7 +511,7 @@ internal static class AisEvalHeadToHeadBench
         Measure("cooperative", true);
         Measure("Parallel.For", false); // re-measure to confirm the delta isn't drift
         Measure("cooperative", true);
-        AiDotNet.Tensors.Engines.BlasManaged.Pool.CooperativeGemmScheduler.Enabled = false;
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.UseCooperativePool = false;
     }
 
     private static (double median, double p95) TimeAi(Func<Tensor<float>> forward)

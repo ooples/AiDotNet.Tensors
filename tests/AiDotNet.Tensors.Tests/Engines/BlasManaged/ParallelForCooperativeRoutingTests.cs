@@ -6,7 +6,7 @@
 // iterations write disjoint outputs, so order is irrelevant) — including under many
 // concurrent callers, which is the scheduler's reason to exist.
 //
-// Serialized (it toggles the process-wide CooperativeGemmScheduler.Enabled) and restores
+// Serialized (it toggles the process-wide CpuParallelSettings.UseCooperativePool) and restores
 // the prior value in a finally so it can't leak into other tests.
 
 using System;
@@ -30,21 +30,21 @@ public class ParallelForCooperativeRoutingTests
         var rng = new Random(7);
         for (int i = 0; i < n; i++) src[i] = rng.NextDouble() * 2 - 1;
 
-        bool prev = CooperativeGemmScheduler.Enabled;
+        bool prev = CpuParallelSettings.UseCooperativePool;
         try
         {
             var reference = new double[n];
-            CooperativeGemmScheduler.Enabled = false;
+            CpuParallelSettings.UseCooperativePool = false;
             CpuParallelSettings.ParallelForOrSerial(0, n, n, i => reference[i] = Kernel(src[i]));
 
             var coop = new double[n];
-            CooperativeGemmScheduler.Enabled = true;
+            CpuParallelSettings.UseCooperativePool = true;
             CpuParallelSettings.ParallelForOrSerial(0, n, n, i => coop[i] = Kernel(src[i]));
 
             for (int i = 0; i < n; i++)
                 Assert.Equal(reference[i], coop[i]); // exact — disjoint writes, no reduction
         }
-        finally { CooperativeGemmScheduler.Enabled = prev; }
+        finally { CpuParallelSettings.UseCooperativePool = prev; }
     }
 
     [Fact]
@@ -57,10 +57,10 @@ public class ParallelForCooperativeRoutingTests
         var expected = new double[n];
         for (int i = 0; i < n; i++) expected[i] = Kernel(src[i]);
 
-        bool prev = CooperativeGemmScheduler.Enabled;
+        bool prev = CpuParallelSettings.UseCooperativePool;
         try
         {
-            CooperativeGemmScheduler.Enabled = true;
+            CpuParallelSettings.UseCooperativePool = true;
             int mismatches = 0;
             var threads = new Thread[8];
             for (int t = 0; t < threads.Length; t++)
@@ -80,16 +80,16 @@ public class ParallelForCooperativeRoutingTests
             foreach (var th in threads) th.Join();
             Assert.Equal(0, mismatches);
         }
-        finally { CooperativeGemmScheduler.Enabled = prev; }
+        finally { CpuParallelSettings.UseCooperativePool = prev; }
     }
 
     [Fact]
     public void Cooperative_RethrowsBodyException()
     {
-        bool prev = CooperativeGemmScheduler.Enabled;
+        bool prev = CpuParallelSettings.UseCooperativePool;
         try
         {
-            CooperativeGemmScheduler.Enabled = true;
+            CpuParallelSettings.UseCooperativePool = true;
             var ex = Assert.ThrowsAny<Exception>(() =>
                 CpuParallelSettings.ParallelForOrSerial(0, 40_000, 40_000, i =>
                 {
@@ -97,6 +97,6 @@ public class ParallelForCooperativeRoutingTests
                 }));
             Assert.Contains("boom-12345", ex.Message);
         }
-        finally { CooperativeGemmScheduler.Enabled = prev; }
+        finally { CpuParallelSettings.UseCooperativePool = prev; }
     }
 }
