@@ -1,4 +1,5 @@
-﻿using System.Collections.Generic;
+﻿using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Helpers;
@@ -89,12 +90,24 @@ public class PerformanceRegressionTests
     // primitive at ~1.65 ms median / 3.24 ms p95, and the native-BLAS
     // thread-cap (one thread per 16 rows; see CpuEngine.Mlp.cs) brought it to
     // ~1.37 ms median / 1.75 ms p95 on a 16-core box — the thread cap removed
-    // the small-GEMM oversubscription jitter. Budget tightened to 4 ms: it still
-    // catches a regression to the 8.94 ms unfused path or the un-capped p95
-    // (~3.2 ms) while leaving ~2.9x headroom over the capped median for slower
+    // the small-GEMM oversubscription jitter. Budget tightened to 4 ms (net10.0):
+    // it still catches a regression to the 8.94 ms unfused path or the un-capped
+    // p95 (~3.2 ms) while leaving ~2.9x headroom over the capped median for slower
     // CI hardware. (Beating PyTorch's ~0.6 ms median outright is blocked by
     // OpenBLAS-vs-MKL small-GEMM kernel quality — tracked as a follow-up.)
+    //
+    // net471 has no System.Runtime.Intrinsics.X86, so MlpForward's fused
+    // elementwise path falls back to scalar Math and BlasManaged runs the
+    // Vector<T> kernels (no AVX2 microkernel) — the same fused stack measures
+    // ~4.9 ms median on net471 vs ~1.37 ms on net10.0. The budget is loosened to
+    // 7 ms there: still comfortably under the 8.94 ms unfused-dispatch regression
+    // it guards, with ~1.4x headroom over the measured net471 fused number. This
+    // is a platform floor (no intrinsics), not a regression to hide.
+#if NET471
+    private const double MlpAiseval_BudgetMs = 7.0;
+#else
     private const double MlpAiseval_BudgetMs = 4.0;
+#endif
 
     public PerformanceRegressionTests(ITestOutputHelper output) => _output = output;
 
@@ -412,21 +425,38 @@ public class PerformanceRegressionTests
             "Stage 6 float fast path measured 10.13 ms on net10.0; a regression to the Stage 4 wrapper path would push this back to ~22 ms.");
     }
 
-    [Fact(Skip = "Performance guard — run manually with --filter PerformanceRegression")]
+    [Fact]
+    [Trait("Category", "Perf")]
     public void MlpForward_Aiseval_FusedDispatch_BeatsUnfusedPath()
     {
         // AIsEval MLP inference shape: Dense(784->512)->Dense(512->128)->Dense(128->10)
         // at bs=128 — three GEMMs of (128,784,512), (128,512,128), (128,128,10).
         // PyTorch did this in 1.91 ms; the framework's per-layer
         // MatMul+Add+Activation Predict path measured 8.94 ms (issue #436 P1).
-        // MlpForward collapses the 3-layer stack to 3 fused-linear dispatches and
-        // measured 2.95 ms/iter on net10.0 (Release) on the dev host — i.e. it
-        // already meets the issue's <= 3 ms acceptance (1.54x PyTorch), so the
-        // remaining work is framework-side wiring (ooples/AiDotNet#1447).
-        // Budget at 8 ms catches a regression back to the unfused dispatch path
-        // (which the issue measured at 8.94 ms) while leaving ~2.7x headroom over
-        // the measured fused number for CI noise. Skip-by-default to match the
-        // repo perf-gate convention (run via --filter PerformanceRegression).
+        // MlpForward collapses the 3-layer stack to 3 fused-linear dispatches; the
+        // #436 head-to-head measured it at ~1.65 ms median pre-cap and ~1.37 ms
+        // median / 1.75 ms p95 once the native-BLAS thread cap (one thread / 16
+        // rows; see CpuEngine.Mlp.cs) removed the small-GEMM oversubscription
+        // jitter — i.e. it already meets the issue's <= 3 ms acceptance, so the
+        // remaining work is framework-side wiring to consume it (ooples/AiDotNet#1447).
+        // The MlpAiseval_BudgetMs budget (4 ms on net10.0; 7 ms on net471, where the
+        // fused path has no AVX2 intrinsics and runs ~4.9 ms) catches a regression
+        // back to the 8.94 ms unfused dispatch while leaving headroom over the
+        // measured fused median for CI noise.
+        //
+        // Runnable perf gate (repo convention; see FusedConv2DResnetSpeedupTests):
+        // Category=Perf is excluded from the default CI filter, and the env gate
+        // makes this a no-op unless AIDOTNET_RUN_PERF_GATES=1, so shared runners —
+        // which can't measure a sub-millisecond-stable latency — never fail it;
+        // dedicated hardware opts in. Uses the per-iter MEDIAN over 50 iters (robust
+        // to a single GC pause), not the mean. (A bare [Fact(Skip=...)] is never
+        // runnable even with --filter, so the old form could not actually gate.)
+        if (Environment.GetEnvironmentVariable("AIDOTNET_RUN_PERF_GATES") != "1")
+        {
+            _output.WriteLine("Skip: AIDOTNET_RUN_PERF_GATES != 1 (shared-runner perf gates are flaky).");
+            return;
+        }
+
         var input = Tensor<float>.CreateRandom([128, 784]);
         var weights = new List<Tensor<float>>
         {
@@ -446,17 +476,22 @@ public class PerformanceRegressionTests
         for (int w = 0; w < 5; w++)
             _ = _engine.MlpForward(input, weights, biases, FusedActivationType.ReLU, FusedActivationType.None);
 
-        var sw = Stopwatch.StartNew();
         const int iters = 50;
+        var samples = new double[iters];
         for (int i = 0; i < iters; i++)
+        {
+            var sw = Stopwatch.StartNew();
             _ = _engine.MlpForward(input, weights, biases, FusedActivationType.ReLU, FusedActivationType.None);
-        sw.Stop();
-        double ms = sw.Elapsed.TotalMilliseconds / iters;
+            sw.Stop();
+            samples[i] = sw.Elapsed.TotalMilliseconds;
+        }
+        Array.Sort(samples);
+        double ms = samples[iters / 2];   // per-iter median
 
-        _output.WriteLine($"MlpForward AIsEval [128,784->512->128->10]: {ms:F3} ms/iter " +
+        _output.WriteLine($"MlpForward AIsEval [128,784->512->128->10]: {ms:F3} ms/iter median " +
             $"(budget: {MlpAiseval_BudgetMs} ms; PyTorch baseline 1.91 ms; framework unfused path 8.94 ms)");
         Assert.True(ms < MlpAiseval_BudgetMs,
-            $"MlpForward took {ms:F3} ms — exceeds {MlpAiseval_BudgetMs} ms budget. " +
+            $"MlpForward took {ms:F3} ms median — exceeds {MlpAiseval_BudgetMs} ms budget. " +
             "The fused 3-dispatch path should stay below the 8.94 ms unfused-dispatch number " +
             "from issue #436; a regression here means the primitive is no longer collapsing the dense stack.");
     }
