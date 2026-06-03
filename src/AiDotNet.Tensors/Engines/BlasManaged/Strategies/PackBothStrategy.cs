@@ -213,7 +213,13 @@ internal static class PackBothStrategy
                 if (options.PackedB != null && WeightPackCache.IsCacheCurrent(options.PackedB))
                 {
                     var pkdB = options.PackedB;
-                    if (pkdB.MultiPanelStride > 0)
+                    // PackNr gate: the packed panel is interleaved in nr-column
+                    // stripes; consuming with a different active nr (e.g. the
+                    // dispatcher's scalar (4,4) too-small-shape fallback on a
+                    // machine whose prepack tile is 8/16-wide) reads the stripes
+                    // at the wrong stride and yields garbage. Mismatch -> live
+                    // pack below (correct, just unaccelerated).
+                    if (pkdB.PackNr == nr && pkdB.MultiPanelStride > 0)
                     {
                         // Multi-panel: jc-blocks live in NumIcBlocks slot for PackedB.
                         if (pkdB.TileMc == nc && pkdB.TileKc == kc)
@@ -228,7 +234,7 @@ internal static class PackBothStrategy
                             }
                         }
                     }
-                    else if (pkdB.PackedBuffer.Length >= packedBByteCount)
+                    else if (pkdB.PackNr == nr && pkdB.PackedBuffer.Length >= packedBByteCount)
                     {
                         // Legacy single-panel.
                         activePackB = MemoryMarshal.Cast<byte, T>(pkdB.PackedBuffer.AsSpan(0, packedBByteCount));
@@ -263,7 +269,14 @@ internal static class PackBothStrategy
                     if (options.PackedA != null && WeightPackCache.IsCacheCurrent(options.PackedA))
                     {
                         var pkdA = options.PackedA;
-                        if (pkdA.MultiPanelStride > 0)
+                        // PackMr gate: the packed panel is interleaved in mr-row
+                        // stripes; a consumer running a different active mr (the
+                        // dispatcher's scalar (4,4) too-small-shape fallback on a
+                        // machine whose prepack tile is 8 rows wide) reads the
+                        // stripes at the wrong stride and yields garbage —
+                        // exactly the CI-only ScalarKernelTests failures on
+                        // AVX-512 runners. Mismatch -> live pack (correct).
+                        if (pkdA.PackMr == mr && pkdA.MultiPanelStride > 0)
                         {
                             if (pkdA.TileMc == mc && pkdA.TileKc == kc)
                             {
@@ -277,7 +290,7 @@ internal static class PackBothStrategy
                                 }
                             }
                         }
-                        else if (pkdA.PackedBuffer.Length >= effectivePackABytes)
+                        else if (pkdA.PackMr == mr && pkdA.PackedBuffer.Length >= effectivePackABytes)
                         {
                             activePackA = MemoryMarshal.Cast<byte, T>(pkdA.PackedBuffer.AsSpan(0, effectivePackABytes));
                             packAFromPrePack = true;
@@ -432,7 +445,10 @@ internal static class PackBothStrategy
                 // multi-panel and (TileMc, TileKc) match (nc, kc), copy from
                 // the specific (jcIdx, pcIdx) tile rather than offset 0. The
                 // pre-Sub-E single-panel path stays as the fallback else-branch.
-                if (packedB != null && WeightPackCache.IsCacheCurrent(packedB))
+                // PackNr gate (see WeightPackHandle.PackNr): the panel stripes are
+                // nr-interleaved; an active-nr mismatch (scalar fallback on small
+                // shapes vs a wide prepack tile) reads garbage. Mismatch -> live pack.
+                if (packedB != null && WeightPackCache.IsCacheCurrent(packedB) && packedB.PackNr == nr)
                 {
                     if (packedB.MultiPanelStride > 0
                         && packedB.TileMc == nc && packedB.TileKc == kc)
@@ -735,6 +751,7 @@ internal static class PackBothStrategy
                 Span<T> activePackA;
                 bool packAFromPrePack = false;
                 if (packedA != null && WeightPackCache.IsCacheCurrent(packedA)
+                    && packedA.PackMr == mr // stripe-interleave gate (WeightPackHandle.PackMr)
                     && packedA.MultiPanelStride > 0
                     && packedA.TileMc == mc && packedA.TileKc == kc)
                 {
@@ -777,6 +794,7 @@ internal static class PackBothStrategy
                 Span<T> activePackB;
                 bool packBFromPrePack = false;
                 if (packedB != null && WeightPackCache.IsCacheCurrent(packedB)
+                    && packedB.PackNr == nr // stripe-interleave gate (WeightPackHandle.PackNr)
                     && packedB.MultiPanelStride > 0
                     && packedB.TileMc == nc && packedB.TileKc == kc)
                 {

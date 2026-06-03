@@ -227,8 +227,12 @@ internal static class PackAOnlyStrategy
 
         // Sub-E (#373): detect multi-panel PackedA layout so the (ic, pc) loop
         // below picks the right tile slice rather than always reading offset 0.
+        // PackMr gate: the panel stripes are mr-interleaved at pack time; a
+        // consumer running a different active mr would read them at the wrong
+        // stride (see WeightPackHandle.PackMr). Mismatch -> live pack below.
         bool multiPanelA = options.PackedA != null
             && WeightPackCache.IsCacheCurrent(options.PackedA)
+            && options.PackedA.PackMr == mr
             && options.PackedA.TilingMatches(mc, kc)
             && options.PackedA.FullM >= m
             && options.PackedA.FullK >= k;
