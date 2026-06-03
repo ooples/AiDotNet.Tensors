@@ -76,6 +76,21 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     private IntPtr _audioModule;
     private IntPtr _linalgModule;
     private bool _disposed;
+
+    // Process-exit guard: at process/AppDomain teardown the CUDA driver may already be unloaded, so calling ANY
+    // native CUDA API from a finalizer (CudaGpuBuffer.Release, CudaBackend.Dispose) FATAL-crashes the process — it
+    // is NOT a catchable .NET exception. Skip native cleanup when exiting; the OS reclaims GPU memory on process death.
+    internal static volatile bool ProcessExiting;
+    static CudaBackend()
+    {
+        try
+        {
+            AppDomain.CurrentDomain.ProcessExit += (_, __) => ProcessExiting = true;
+            AppDomain.CurrentDomain.DomainUnload += (_, __) => ProcessExiting = true;
+        }
+        catch { }
+    }
+
     private const int MaxPooledBufferElements = 16_777_216;
     private const int MaxPooledBuffersPerSize = 4;
     private readonly GpuBufferPool<CudaGpuBuffer> _bufferPool =
@@ -11366,8 +11381,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         IntPtr pI = input.Handle, pO = output.Handle;
         void** args = stackalloc void*[4];
         args[0] = &pI; args[1] = &pO; args[2] = &rows; args[3] = &cols;
-        CudaNativeBindings.cuLaunchKernel(kernel, grid, 1, 1, (uint)blockSize, 1, 1,
-            (uint)sharedMem, IntPtr.Zero, (IntPtr)args, IntPtr.Zero);
+        // Was an UNCHECKED launch on the DEFAULT stream (IntPtr.Zero) while every other op uses _stream — a fault
+        // here went unsurfaced and could read buffers out of order vs the rest of the pipeline. Check the result and
+        // use _stream for ordering.
+        CuBlasNative.CheckCudaResult(
+            CudaNativeBindings.cuLaunchKernel(kernel, grid, 1, 1, (uint)blockSize, 1, 1,
+                (uint)sharedMem, _stream, (IntPtr)args, IntPtr.Zero),
+            "cuLaunchKernel(softmax_rows)");
     }
 
     // ─── HRR binding primitives (issue #248) ────────────────────────
@@ -12485,6 +12505,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             return;
 
         _disposed = true;
+        if (ProcessExiting) return;   // driver torn down at process exit — skip native+pool cleanup (OS reclaims)
         _pinnedPool.Dispose();
         _bufferPool.Dispose();
 
@@ -13443,7 +13464,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     ~CudaBackend()
     {
-        Dispose();
+        // A finalizer must NEVER throw — Dispose() touches managed pools that may already be finalized during GC
+        // (ObjectDisposedException). Swallow so an undisposed backend (e.g. one created during backend auto-detection)
+        // tears down cleanly.
+        try { Dispose(); } catch { }
     }
 
     internal sealed class CudaGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
@@ -13481,8 +13505,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
             try
             {
-                if (_context != IntPtr.Zero)
-                {
+                if (_context != IntPtr.Zero && !ProcessExiting)   // at process exit the CUDA driver is gone — any
+                {                                                 // native CUDA call FATAL-crashes (uncatchable); skip it
                     CuBlasNative.cuCtxPushCurrent(_context);
                     CuBlasNative.cuMemFree(_devicePtr);
                     CuBlasNative.cuCtxPopCurrent(out _);
@@ -13550,8 +13574,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
             try
             {
-                if (_context != IntPtr.Zero)
-                {
+                if (_context != IntPtr.Zero && !ProcessExiting)   // at process exit the CUDA driver is gone — any
+                {                                                 // native CUDA call FATAL-crashes (uncatchable); skip it
                     CuBlasNative.cuCtxPushCurrent(_context);
                     CuBlasNative.cuMemFree(_devicePtr);
                     CuBlasNative.cuCtxPopCurrent(out _);

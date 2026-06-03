@@ -2779,9 +2779,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 var gpuOut = gpuBackend.AllocateBuffer(input.Length);
                 try
                 {
-                    // GPU softmax kernel
+                    // GPU softmax kernel. batchSize = number of softmax ROWS = total / axisSize (NOT input.Length).
+                    // Passing input.Length made the kernel index input[row*axisSize + f] for row up to input.Length →
+                    // up to input.Length*axisSize accesses on an input.Length buffer = OOB illegal address
+                    // (CUDA 700 / OpenCL -5). This was THE bug blocking all GPU training.
                     int axisSize = input.Shape._dims[axis < 0 ? input.Rank + axis : axis];
-                    gpuBackend.Softmax(gpuIn, gpuOut, input.Length, axisSize);
+                    if (axisSize <= 0 || input.Length % axisSize != 0)
+                        throw new InvalidOperationException($"softmax axisSize={axisSize} does not divide length={input.Length}");
+                    gpuBackend.Softmax(gpuIn, gpuOut, input.Length / axisSize, axisSize);
                     DownloadIntoTensor(gpuBackend, gpuOut, floatDest);
                 }
                 finally
