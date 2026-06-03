@@ -1,0 +1,190 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
+
+// Phase 2: UNPACKED stride-reading 6×16 AVX2 microkernel — no A-pack, no scatter.
+//   C[6,16] = sum_k A[row,k]·B[k,0..15], reading A via lda, B via ldb, C via ldc.
+// This is the small-K hot path (QKV/FFN): packing overhead is what sank the
+// packed driver (47 GFLOP/s) below the unpacked managed kernel (70-113).
+// 6 strided A rows addressed with a 3-base-pointer trick (rows 0/2/4 in
+// RCX/RBX/RSI) + index RAX=lda*4, so [base] and [base+RAX] cover all 6 rows.
+// Signature void mk(float* A, float* B, float* C, long K, long lda, long ldb, long ldc)
+// Win64: RCX=A RDX=B R8=C R9=K ; lda=[rsp+0x28] ldb=[rsp+0x30] ldc=[rsp+0x38].
+
+[DllImport("kernel32.dll", SetLastError = true)]
+static extern IntPtr VirtualAlloc(IntPtr a, UIntPtr s, uint t, uint p);
+[DllImport("kernel32.dll", SetLastError = true)]
+static extern bool VirtualProtect(IntPtr a, UIntPtr s, uint np, out uint op);
+const uint MEM_COMMIT = 0x1000, MEM_RESERVE = 0x2000, PAGE_RW = 0x04, PAGE_EXEC_R = 0x20;
+
+var code = new List<byte>();
+void Bytes(params byte[] bs) => code.AddRange(bs);
+
+// VEX reg-reg (mod=11): op ymmReg, ymmVvvv, ymmRm
+void Vrr(int mm, int pp, byte op, int reg, int vvvv, int rm) =>
+    Bytes(0xC4,
+        (byte)(((reg < 8 ? 1 : 0) << 7) | (1 << 6) | ((rm < 8 ? 1 : 0) << 5) | mm),
+        (byte)((((~vvvv) & 0xF) << 3) | (1 << 2) | pp),
+        op, (byte)(0xC0 | ((reg & 7) << 3) | (rm & 7)));
+// VEX reg-[base+disp]
+void Vrm(int mm, int pp, byte op, int reg, int b, int disp)
+{
+    Bytes(0xC4, (byte)(((reg < 8 ? 1 : 0) << 7) | (1 << 6) | ((b < 8 ? 1 : 0) << 5) | mm),
+          (byte)((0xF << 3) | (1 << 2) | pp), op);
+    int rm = b & 7; bool sib = rm == 4; int mod = disp == 0 ? 0 : (disp is >= -128 and <= 127 ? 1 : 2);
+    Bytes((byte)((mod << 6) | ((reg & 7) << 3) | rm));
+    if (sib) Bytes(0x24);
+    if (mod == 1) Bytes((byte)(sbyte)disp);
+    else if (mod == 2) Bytes((byte)disp, (byte)(disp >> 8), (byte)(disp >> 16), (byte)(disp >> 24));
+}
+// VEX reg-[base] (mod=00, base not rsp/rbp)
+void VrmBase(int mm, int pp, byte op, int reg, int b) =>
+    Bytes(0xC4, (byte)(((reg < 8 ? 1 : 0) << 7) | (1 << 6) | ((b < 8 ? 1 : 0) << 5) | mm),
+          (byte)((0xF << 3) | (1 << 2) | pp), op, (byte)(((reg & 7) << 3) | (b & 7)));
+// VEX reg-[base+index*1] (SIB)
+void VrmIdx(int mm, int pp, byte op, int reg, int b, int idx) =>
+    Bytes(0xC4,
+        (byte)(((reg < 8 ? 1 : 0) << 7) | ((idx < 8 ? 1 : 0) << 6) | ((b < 8 ? 1 : 0) << 5) | mm),
+        (byte)((0xF << 3) | (1 << 2) | pp), op,
+        (byte)(((reg & 7) << 3) | 4),            // rm=100 -> SIB
+        (byte)(((idx & 7) << 3) | (b & 7)));      // scale=0
+void VXor(int d) => Vrr(1, 0, 0x57, d, d, d);
+void VLoad(int d, int b, int disp) => Vrm(1, 0, 0x10, d, b, disp);
+void VStore(int s, int b, int disp) => Vrm(1, 0, 0x11, s, b, disp);
+void VBcastB(int d, int b) => VrmBase(2, 1, 0x18, d, b);
+void VBcastI(int d, int b, int idx) => VrmIdx(2, 1, 0x18, d, b, idx);
+void VFma(int acc, int s1, int s2) => Vrr(2, 1, 0xB8, acc, s1, s2);
+void Vmovups128St(int reg, int b, int disp) // movups [b+disp], xmm  (L=0)
+{
+    Bytes(0xC4, (byte)(((reg < 8 ? 1 : 0) << 7) | (1 << 6) | ((b < 8 ? 1 : 0) << 5) | 1),
+          (byte)((0xF << 3) | (0 << 2) | 0), 0x11);
+    int rm = b & 7; bool sib = rm == 4; int mod = disp == 0 ? 0 : 1;
+    Bytes((byte)((mod << 6) | ((reg & 7) << 3) | rm)); if (sib) Bytes(0x24); if (mod == 1) Bytes((byte)disp);
+}
+void Vmovups128Ld(int reg, int b, int disp)
+{
+    Bytes(0xC4, (byte)(((reg < 8 ? 1 : 0) << 7) | (1 << 6) | ((b < 8 ? 1 : 0) << 5) | 1),
+          (byte)((0xF << 3) | (0 << 2) | 0), 0x10);
+    int rm = b & 7; bool sib = rm == 4; int mod = disp == 0 ? 0 : 1;
+    Bytes((byte)((mod << 6) | ((reg & 7) << 3) | rm)); if (sib) Bytes(0x24); if (mod == 1) Bytes((byte)disp);
+}
+// GP helpers (reg ids: rax=0 rcx=1 rdx=2 rbx=3 rsp=4 rsi=6 r8=8 r9=9 r10=10 r11=11)
+void MovFromStack(int dst, byte disp) // mov dst, [rsp+disp8]
+    => Bytes((byte)(0x48 | (dst >= 8 ? 4 : 0)), 0x8B, (byte)(0x44 | ((dst & 7) << 3)), 0x24, disp);
+void Shl4(int r) => Bytes((byte)(0x48 | (r >= 8 ? 1 : 0)), 0xC1, (byte)(0xE0 | (r & 7)), 2); // shl r, 2
+void Lea(int dst, int b, int idx, int scale) // lea dst,[b+idx*scale]
+{
+    int sc = scale == 2 ? 1 : scale == 4 ? 2 : scale == 8 ? 3 : 0;
+    Bytes((byte)(0x48 | (dst >= 8 ? 4 : 0) | (idx >= 8 ? 2 : 0) | (b >= 8 ? 1 : 0)), 0x8D,
+          (byte)(((dst & 7) << 3) | 4), (byte)((sc << 6) | ((idx & 7) << 3) | (b & 7)));
+}
+void AddImm(int r, byte imm) => Bytes((byte)(0x48 | (r >= 8 ? 1 : 0)), 0x83, (byte)(0xC0 | (r & 7)), imm);
+void AddRegReg(int dst, int src) // add dst, src  (r/m=dst, reg=src)
+    => Bytes((byte)(0x48 | (src >= 8 ? 4 : 0) | (dst >= 8 ? 1 : 0)), 0x01, (byte)(0xC0 | ((src & 7) << 3) | (dst & 7)));
+void Push(int r) { if (r >= 8) Bytes(0x41); Bytes((byte)(0x50 | (r & 7))); }
+void Pop(int r) { if (r >= 8) Bytes(0x41); Bytes((byte)(0x58 | (r & 7))); }
+const int RAX = 0, RCX = 1, RDX = 2, RBX = 3, RSP = 4, RSI = 6, R8 = 8, R9 = 9, R10 = 10, R11 = 11;
+
+// ---- prologue: load strides (relative to ENTRY rsp, before push/sub) ----
+MovFromStack(RAX, 0x28); Shl4(RAX);   // rax = lda*4
+MovFromStack(R10, 0x30); Shl4(R10);   // r10 = ldb*4
+MovFromStack(R11, 0x38); Shl4(R11);   // r11 = ldc*4
+Push(RBX); Push(RSI);                 // save non-volatile GP
+int subAmt = 160;
+Bytes(0x48, 0x81, 0xEC, (byte)subAmt, 0, 0, 0); // sub rsp,160
+for (int x = 6; x <= 15; x++) Vmovups128St(x, RSP, (x - 6) * 16); // save xmm6..15
+Lea(RBX, RCX, RAX, 2);  // rbx = A + 2*lda  (row2 base)
+Lea(RSI, RCX, RAX, 4);  // rsi = A + 4*lda  (row4 base)
+
+for (int d = 0; d < 12; d++) VXor(d);
+
+int loop = code.Count;
+VLoad(12, RDX, 0); VLoad(13, RDX, 32);            // B[k,0:8],[8:16]
+VBcastB(14, RCX); VFma(0, 14, 12); VFma(1, 14, 13);        // row0 = [rcx]
+VBcastI(14, RCX, RAX); VFma(2, 14, 12); VFma(3, 14, 13);   // row1 = [rcx+lda]
+VBcastB(14, RBX); VFma(4, 14, 12); VFma(5, 14, 13);        // row2 = [rbx]
+VBcastI(14, RBX, RAX); VFma(6, 14, 12); VFma(7, 14, 13);   // row3 = [rbx+lda]
+VBcastB(14, RSI); VFma(8, 14, 12); VFma(9, 14, 13);        // row4 = [rsi]
+VBcastI(14, RSI, RAX); VFma(10, 14, 12); VFma(11, 14, 13); // row5 = [rsi+lda]
+AddImm(RCX, 4); AddImm(RBX, 4); AddImm(RSI, 4);   // advance A bases by 1 col
+AddRegReg(RDX, R10);                              // B += ldb*4
+Bytes(0x49, 0xFF, 0xC9);                          // dec r9
+int after = code.Count;
+Bytes(0x75, (byte)(sbyte)(loop - (after + 2)));   // jnz loop
+
+// store C[6,16] with row stride r11 (=ldc*4)
+for (int r = 0; r < 6; r++) { VStore(r * 2, R8, 0); VStore(r * 2 + 1, R8, 32); if (r < 5) AddRegReg(R8, R11); }
+
+for (int x = 6; x <= 15; x++) Vmovups128Ld(x, RSP, (x - 6) * 16);
+Bytes(0x48, 0x81, 0xC4, (byte)subAmt, 0, 0, 0);   // add rsp,160
+Pop(RSI); Pop(RBX);
+Bytes(0xC5, 0xF8, 0x77); Bytes(0xC3);             // vzeroupper; ret
+
+byte[] mc = code.ToArray();
+Console.WriteLine($"emitted {mc.Length} bytes (unpacked 6x16)");
+IntPtr mem = VirtualAlloc(IntPtr.Zero, (UIntPtr)mc.Length, MEM_COMMIT | MEM_RESERVE, PAGE_RW);
+Marshal.Copy(mc, 0, mem, mc.Length);
+VirtualProtect(mem, (UIntPtr)mc.Length, PAGE_EXEC_R, out _);
+
+unsafe
+{
+    var k = (delegate* unmanaged[Cdecl]<float*, float*, float*, long, long, long, long, void>)mem;
+    // correctness: a single 6×16 block of a [6,K]·[K,16] (lda=K, ldb=16, ldc=16)
+    int K = 64;
+    var A = new float[6 * K]; var B = new float[K * 16]; var C = new float[6 * 16];
+    var rnd = new Random(1);
+    for (int i = 0; i < A.Length; i++) A[i] = (float)(rnd.NextDouble() - 0.5);
+    for (int i = 0; i < B.Length; i++) B[i] = (float)(rnd.NextDouble() - 0.5);
+    fixed (float* a = A, b = B, c = C) k(a, b, c, K, K, 16, 16);
+    double err = 0;
+    for (int r = 0; r < 6; r++) for (int cc = 0; cc < 16; cc++)
+    { double acc = 0; for (int kk = 0; kk < K; kk++) acc += (double)A[r * K + kk] * B[kk * 16 + cc]; err = Math.Max(err, Math.Abs(acc - C[r * 16 + cc])); }
+    Console.WriteLine($"[correctness] unpacked 6x16 maxErr = {err:E3}  ({(err < 1e-2 ? "PASS" : "FAIL")})");
+
+    // driver: full GEMM C[M,N]=A·B, no pack/scatter, parallel over row-blocks, 16 threads
+    void Drive(string name, int M, int N, int Kk)
+    {
+        int nRB = M / 6, nCB = N / 16;
+        var Am = new float[(long)M * Kk]; var Bm = new float[(long)Kk * N]; var Cm = new float[(long)M * N];
+        var r2 = new Random(3);
+        for (long i = 0; i < Am.LongLength; i++) Am[i] = (float)(r2.NextDouble() - 0.5);
+        for (long i = 0; i < Bm.LongLength; i++) Bm[i] = (float)(r2.NextDouble() - 0.5);
+        nint memN = mem; int T = 16;
+        // Spawn threads ONCE; each does `reps` full passes internally (avoids the
+        // per-pass thread-creation overhead that masks kernel throughput).
+        void RunReps(int reps)
+        {
+            var ths = new System.Threading.Thread[T]; int per = (nRB + T - 1) / T;
+            for (int t = 0; t < T; t++)
+            {
+                int lo = t * per, hi = Math.Min(lo + per, nRB);
+                ths[t] = new System.Threading.Thread(() =>
+                {
+                    unsafe
+                    {
+                        var kf = (delegate* unmanaged[Cdecl]<float*, float*, float*, long, long, long, long, void>)memN;
+                        fixed (float* aP = Am, bP = Bm, cP = Cm)
+                            for (int rep = 0; rep < reps; rep++)
+                                for (int rb = lo; rb < hi; rb++)
+                                    for (int cb = 0; cb < nCB; cb++)
+                                        kf(aP + (long)(rb * 6) * Kk, bP + cb * 16, cP + (long)(rb * 6) * N + cb * 16, Kk, Kk, N, N);
+                    }
+                });
+            }
+            foreach (var t in ths) t.Start(); foreach (var t in ths) t.Join();
+        }
+        RunReps(1);
+        double e2 = 0; var rr = new Random(9);
+        for (int s = 0; s < 200; s++) { int i = rr.Next(M), j = rr.Next(N); double acc = 0; for (int kk = 0; kk < Kk; kk++) acc += (double)Am[(long)i * Kk + kk] * Bm[(long)kk * N + j]; e2 = Math.Max(e2, Math.Abs(acc - Cm[(long)i * N + j])); }
+        RunReps(40);
+        int reps = 600; var sw = Stopwatch.StartNew(); RunReps(reps); sw.Stop();
+        Console.WriteLine($"  {name} [{M},{Kk}]x[{Kk},{N}]  {(double)M * N * Kk * 2 * reps / sw.Elapsed.TotalSeconds / 1e9,6:F0} GFLOP/s (16t, UNPACKED)  maxErr={e2:E2}");
+    }
+    Console.WriteLine("--- unpacked driver: transformer shapes (no pack, no scatter) ---");
+    Drive("QKV ", 4092, 192, 64);
+    Drive("FFN1", 4092, 128, 64);
+    Drive("FFN2", 4092, 64, 128);
+}

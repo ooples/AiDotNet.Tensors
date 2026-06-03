@@ -64,11 +64,31 @@ internal sealed class PersistentParallelExecutor
     // Captured worker exception (first one wins)
     private volatile Exception? _workerException;
 
+    // Warm-pool keep-alive: after finishing an op, busy-spin checking for the next
+    // dispatch for up to this many SpinWait rounds before falling back to the
+    // blocking Wait(). The MRES spinCount (2047, ~tens of µs) is too short to bridge
+    // the inter-op gaps in a forward pass (LayerNorm→MHA→FFN→…), so workers block and
+    // pay the full wakeup latency on EVERY op — profiled as the dominant small-op cost
+    // (a transformer LayerNorm measured 192 µs parked vs ~65 µs of actual work). A
+    // longer warm window keeps workers hot ACROSS the forward pass so back-to-back ops
+    // find them spinning (≈ free dispatch). Trade-off: CPU burned during genuinely-idle
+    // gaps; bounded by the spin count, then it parks. Env-tunable; 0 = original (park
+    // immediately via MRES spin only). Each SpinWait(32) ≈ ~1 µs, so 256 ≈ ~256 µs warm.
+    private static readonly int _warmSpins =
+        int.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_PPE_WARMSPIN"), out var ws) && ws > 0 ? ws : 0;
+
     private void WorkerLoop(int slot)
     {
         while (true)
         {
-            // Wait for work signal (very low latency — ManualResetEventSlim spins briefly then blocks)
+            // Warm-spin for the next dispatch before blocking (keeps the pool hot across
+            // a forward pass so small back-to-back ops skip the park/wakeup latency).
+            if (_warmSpins > 0)
+            {
+                for (int s = 0; s < _warmSpins && !_workReady[slot].IsSet; s++)
+                    System.Threading.Thread.SpinWait(32);
+            }
+            // Wait for work signal (returns immediately if a warm-spin already saw it).
             _workReady[slot].Wait();
             _workReady[slot].Reset();
 

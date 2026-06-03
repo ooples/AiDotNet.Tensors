@@ -1,6 +1,10 @@
 using System;
 using System.Buffers;
 using System.Runtime.CompilerServices;
+#if NET5_0_OR_GREATER
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
+#endif
 using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Engines.Simd;
 using AiDotNet.Tensors.Helpers;
@@ -174,6 +178,7 @@ public partial class CpuEngine
                     vWS.Slice(kk * dModel, dModel).CopyTo(fW.Slice(dstRow + 2 * dModel, dModel));
                 }
             }
+            using (Profiling.Profiler.OpScope("MHA.QKVproj"))
             SimdGemm.Sgemm(
                 inputSpan, dModel, false,
                 fusedWBuf.AsSpan(0, dModel * dModel3), dModel3, false,
@@ -191,6 +196,7 @@ public partial class CpuEngine
             // gather/scatter is the same byte movement but fused with the GEMMs
             // (per-slice locality, no separate memory round-trips).
             double scaleVal = 1.0 / Math.Sqrt(dHead);
+            using (Profiling.Profiler.OpScope("MHA.SDPA"))
             MultiHeadAttentionFusedSdpa(
                 qkvFlatBuf, dModel3, /*qCol*/0, /*kCol*/dModel, /*vCol*/2 * dModel,
                 mask, scaleVal,
@@ -198,6 +204,7 @@ public partial class CpuEngine
                 concatBuf, dModel);
 
             // ---- Output projection: [B*seq, dModel] @ outWeight [dModel, dModel] -> output. ----
+            using (Profiling.Profiler.OpScope("MHA.OutProj"))
             SimdGemm.Sgemm(
                 concatBuf.AsSpan(0, totalRows * dModel), dModel, false,
                 outWeight.AsSpan(), dModel, false,
@@ -226,7 +233,7 @@ public partial class CpuEngine
     /// <param name="qkv">Fused projection buffer; row r=(b*seq+s) has stride
     /// <paramref name="qkvRowStride"/>; q/k/v blocks start at qCol/kCol/vCol and
     /// within a block the per-head layout is [..., h*dHead + d].</param>
-    private void MultiHeadAttentionFusedSdpa(
+    private unsafe void MultiHeadAttentionFusedSdpa(
         float[] qkv, int qkvRowStride, int qCol, int kCol, int vCol,
         Tensor<bool>? mask, double scaleValue,
         int batch, int heads, int seq, int dHead,
@@ -244,13 +251,21 @@ public partial class CpuEngine
         int scoff = 3 * seq * dHead;      // dHead*seq == seq*dHead
         int scratchLen = 3 * seq * dHead + seq * seq;
 
-        System.Threading.Tasks.Parallel.For(0, bhCount, bh =>
+        // Parallelize over batch·heads using the SAME PersistentParallelExecutor as
+        // the GEMMs/LayerNorm (NOT Parallel.For/ThreadPool) — a second pool in the
+        // forward pass oversubscribed the cores and forced park/wakeup between ops.
+        // One pool keeps workers hot across QKV-GEMM → SDPA → out-proj. Each chunk
+        // rents scratch once and strides over its (b,h) slices.
+        int _sdpaChunks = Math.Max(1, Math.Min(bhCount, CpuParallelSettings.MaxDegreeOfParallelism));
+        PersistentParallelExecutor.Instance.Execute(_sdpaChunks, chunk =>
         {
-            int b = bh / heads;
-            int h = bh % heads;
             var scratch = pool.Rent(scratchLen);
             try
             {
+                for (int bh = chunk; bh < bhCount; bh += _sdpaChunks)
+                {
+                int b = bh / heads;
+                int h = bh % heads;
                 int hQ = qCol + h * dHead;
                 int hK = kCol + h * dHead;
                 int hV = vCol + h * dHead;
@@ -278,32 +293,74 @@ public partial class CpuEngine
                     scratch.AsSpan(scoff, seq * seq),
                     seq, dHead, seq);
 
-                // In-place scale + mask + numerically-stable softmax, row by row.
-                for (int i = 0; i < seq; i++)
+                // In-place scale + numerically-stable softmax, row by row.
+                // SIMD fast path: no mask + seq%8==0 (the transformer-encoder case)
+                // — vectorized scale/max, SIMD exp (HerumiExp256.Exp8), vectorized
+                // sum/normalize. The scalar MathF.Exp loop (524K exp/forward at
+                // bs128) was profiled as ~31% of the whole transformer forward.
+#if NET5_0_OR_GREATER
+                if (mask == null && (seq & 7) == 0 && Avx2.IsSupported && Fma.IsSupported)
                 {
-                    int rowOff = scoff + i * seq;
-                    float maxVal = negInfF;
-                    for (int j = 0; j < seq; j++)
+                    fixed (float* scPtr = scratch)
+                    fixed (float* tbl = HerumiExp256._table)
                     {
-                        float v = scratch[rowOff + j] * scaleF;
-                        if (mask != null && !mask[b, h, i, j]) v = negInfF;
-                        if (v > maxVal) maxVal = v;
-                        scratch[rowOff + j] = v;
+                        var vScale = Vector256.Create(scaleF);
+                        for (int i = 0; i < seq; i++)
+                        {
+                            float* row = scPtr + scoff + i * seq;
+                            var vmax = Vector256.Create(negInfF);
+                            for (int j = 0; j < seq; j += 8)
+                            {
+                                var v = Avx.Multiply(Avx.LoadVector256(row + j), vScale);
+                                Avx.Store(row + j, v);
+                                vmax = Avx.Max(vmax, v);
+                            }
+                            float maxVal = HMax256(vmax);
+                            var vMaxB = Vector256.Create(maxVal);
+                            var vsum = Vector256<float>.Zero;
+                            for (int j = 0; j < seq; j += 8)
+                            {
+                                var e = HerumiExp256.Exp8(Avx.Subtract(Avx.LoadVector256(row + j), vMaxB), tbl);
+                                Avx.Store(row + j, e);
+                                vsum = Avx.Add(vsum, e);
+                            }
+                            float sumExp = HSum256(vsum);
+                            float inv = sumExp != 0f ? 1f / sumExp : 0f;
+                            var vinv = Vector256.Create(inv);
+                            for (int j = 0; j < seq; j += 8)
+                                Avx.Store(row + j, Avx.Multiply(Avx.LoadVector256(row + j), vinv));
+                        }
                     }
-                    if (float.IsNegativeInfinity(maxVal))
+                }
+                else
+#endif
+                {
+                    for (int i = 0; i < seq; i++)
                     {
-                        for (int j = 0; j < seq; j++) scratch[rowOff + j] = 0f;
-                        continue;
+                        int rowOff = scoff + i * seq;
+                        float maxVal = negInfF;
+                        for (int j = 0; j < seq; j++)
+                        {
+                            float v = scratch[rowOff + j] * scaleF;
+                            if (mask != null && !mask[b, h, i, j]) v = negInfF;
+                            if (v > maxVal) maxVal = v;
+                            scratch[rowOff + j] = v;
+                        }
+                        if (float.IsNegativeInfinity(maxVal))
+                        {
+                            for (int j = 0; j < seq; j++) scratch[rowOff + j] = 0f;
+                            continue;
+                        }
+                        float sumExp = 0f;
+                        for (int j = 0; j < seq; j++)
+                        {
+                            float e = MathF.Exp(scratch[rowOff + j] - maxVal);
+                            scratch[rowOff + j] = e;
+                            sumExp += e;
+                        }
+                        float inv = sumExp != 0f ? 1f / sumExp : 0f;
+                        for (int j = 0; j < seq; j++) scratch[rowOff + j] *= inv;
                     }
-                    float sumExp = 0f;
-                    for (int j = 0; j < seq; j++)
-                    {
-                        float e = MathF.Exp(scratch[rowOff + j] - maxVal);
-                        scratch[rowOff + j] = e;
-                        sumExp += e;
-                    }
-                    float inv = sumExp != 0f ? 1f / sumExp : 0f;
-                    for (int j = 0; j < seq; j++) scratch[rowOff + j] *= inv;
                 }
 
                 // out[seq×dHead] = P[seq×seq] · V[seq×dHead]. Reuse the Q region
@@ -322,6 +379,7 @@ public partial class CpuEngine
                     for (int d = 0; d < dHead; d++)
                         concat[dst + d] = scratch[src + d];
                 }
+                } // end for bh slice in this chunk
             }
             finally
             {
@@ -329,6 +387,24 @@ public partial class CpuEngine
             }
         });
     }
+
+#if NET5_0_OR_GREATER
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe float HSum256(Vector256<float> v)
+    {
+        float* t = stackalloc float[8]; Avx.Store(t, v);
+        return t[0] + t[1] + t[2] + t[3] + t[4] + t[5] + t[6] + t[7];
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe float HMax256(Vector256<float> v)
+    {
+        float* t = stackalloc float[8]; Avx.Store(t, v);
+        float m = t[0];
+        for (int i = 1; i < 8; i++) if (t[i] > m) m = t[i];
+        return m;
+    }
+#endif
 
     /// <summary>
     /// Generic-T path. Composes existing tensor-level primitives. Used for

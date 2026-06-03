@@ -37,6 +37,10 @@
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
     <PackageReference Include="Xunit.SkippableFact" Version="1.5.61" />
+    <!-- Optional oneDNN native accelerator (dnnl.dll) — present here so tests can
+         validate the OneDnnProvider native-dispatch path. The core library does NOT
+         reference this; consuming apps opt in via AiDotNet.Native.OneDNN. (#1478) -->
+    <PackageReference Include="AiDotNet.Native.OneDNN" Version="0.91.1" />
   </ItemGroup>
 
   <ItemGroup>
