@@ -21578,6 +21578,17 @@ public partial class CpuEngine : ITensorLevelEngine
     private static readonly bool _layerNormFusedFs64Enabled =
         Environment.GetEnvironmentVariable("AIDOTNET_LAYERNORM_FUSED_FS64") != "0";
 
+    // Batch-size ceiling for the register-resident single-pass fs=64 LayerNorm.
+    // A/B verdict (recorded inline at the fast path): the fused form WINS at small
+    // batch ([1024,64]: 133µs->117µs, +13%) — the transformer/LSTM inference shapes —
+    // but LOSES at BERT-scale ([32768,64]: +5% for 2-pass), because at huge batch the
+    // streaming prefetcher already hides the second read and the fused form's larger
+    // register footprint/code dominates. So the fused path is gated to batchSize at or
+    // below this ceiling; larger LayerNorms take the 4-way-unrolled 2-pass form.
+    private static readonly int _lnFusedFs64MaxBatch =
+        int.TryParse(Environment.GetEnvironmentVariable("AIDOTNET_LN_FUSED_MAXBATCH"), out var lfm) && lfm > 0
+            ? lfm : 8192;
+
     internal void LayerNormFloatInto(
         Tensor<float> input, Tensor<float> gamma, Tensor<float> beta,
         double epsilon, Tensor<float> output)
@@ -21656,11 +21667,16 @@ public partial class CpuEngine : ITensorLevelEngine
         // Raised to 512K elements so small/medium LayerNorms (transformers at modest
         // batch×seq) stay serial; large ones (BERT-scale, millions of elements, where
         // serial is ms and dwarfs the wakeup) still parallelize. Env-tunable.
+        // Enable the register-resident single-pass fs=64 fast path only for batch
+        // sizes where it is profiled to win (see _lnFusedFs64MaxBatch). fs==64 is the
+        // common transformer/LSTM hidden width; the path requires the AVX2 branch.
+        bool fusedFs64 = useSimd && _layerNormFusedFs64Enabled && fs == 64 && batchSize <= _lnFusedFs64MaxBatch;
+
         long lnWork = (long)batchSize * fs;
         if (lnWork < _lnParallelMinWork && batchSize < _lnParallelMinRows)
         {
             for (int b = 0; b < batchSize; b++)
-                ProcessRow(fInput, fGamma, fBeta, fOutput, fMean, fVar, b, fs, fEps, useSimd);
+                ProcessRow(fInput, fGamma, fBeta, fOutput, fMean, fVar, b, fs, fEps, useSimd, fusedFs64);
         }
         else
         {
@@ -21679,7 +21695,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 int start = c * chunkSize;
                 int end = Math.Min(start + chunkSize, totalBatch);
                 for (int b = start; b < end; b++)
-                    ProcessRow(fInput, fGamma, fBeta, fOutput, fMean, fVar, b, fs, fEps, useSimd);
+                    ProcessRow(fInput, fGamma, fBeta, fOutput, fMean, fVar, b, fs, fEps, useSimd, fusedFs64);
             });
         }
     }
@@ -21688,7 +21704,7 @@ public partial class CpuEngine : ITensorLevelEngine
     private static void ProcessRow(
         float[] fInput, float[] fGamma, float[] fBeta,
         float[] fOutput, float[] fMean, float[] fVar,
-        int b, int fs, float fEps, bool useSimd)
+        int b, int fs, float fEps, bool useSimd, bool fusedFs64 = false)
     {
         int off = b * fs;
         float m, v2;
@@ -21784,7 +21800,7 @@ public partial class CpuEngine : ITensorLevelEngine
             // fast path — keeping this comment so the lesson is preserved.
             // To re-attempt later, write the kernel with explicit XSAVE-aware
             // accumulator passing.
-            if (false && _layerNormFusedFs64Enabled)
+            if (fusedFs64)
             {
                 // Load all 8 input vectors once.
                 var v0 = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(
