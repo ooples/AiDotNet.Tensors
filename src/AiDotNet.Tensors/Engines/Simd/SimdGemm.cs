@@ -111,6 +111,40 @@ internal static partial class SimdGemm
     private static readonly bool _jitGemm =
         System.Environment.GetEnvironmentVariable("AIDOTNET_JIT_GEMM") == "1";
 
+    // Route large no-transpose float GEMMs through native OpenBLAS (cblas_sgemm).
+    // A per-shape bake-off on the AIsEval losing shapes (LosingShapeGemmBench)
+    // showed OpenBLAS at 2-3x the managed RyuJIT-compiled kernel on exactly the
+    // GEMM-bound losers — mlp L1 [.,784,512] 199 vs 66 GF/s, transformer FFN/QKV
+    // [1024,64,*] 226-280 vs 93-121 — while managed still wins the small/thin
+    // shapes (LSTM recurrence K=64, tiny-batch transformer). RyuJIT's codegen is
+    // the gap; OpenBLAS (hand-written asm) is the proven workaround, already loaded.
+    // Default ON when OpenBLAS is present; gated to large work (>= OpenBlasMinWork)
+    // and the top-level no-transpose contiguous path only — SgemmSequential (used
+    // inside PPE regions: SDPA, batch-parallel LSTM) never routes here, so no
+    // OpenBLAS-threads x our-pool oversubscription. Set AIDOTNET_OPENBLAS_GEMM=0
+    // to force the managed kernel for A/B.
+    private static readonly bool _openBlasGemm =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_OPENBLAS_GEMM") != "0";
+
+    // Crossover from the bake-off: below ~4M MACs the managed kernel wins (native
+    // call + thread-fan-out overhead dominates the tiny compute); above it OpenBLAS
+    // pulls ahead and widens. Env-tunable.
+    internal static readonly long OpenBlasMinWork =
+        long.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_OPENBLAS_MINWORK"), out var obw) && obw > 0
+            ? obw : 4_000_000;
+
+    // Minimum contraction depth K to route to OpenBLAS-on-PPE. The bake-off shows
+    // OpenBLAS winning the isolated GEMM at all K, but END-TO-END it only wins for
+    // LARGE K (the MLP's 512/784, where B-packing + K-blocking dominate): there it
+    // flipped mlp bs=32 from 1.87x to 0.94x. At small K (=64: transformer FFN/QKV,
+    // LSTM recurrence) the managed kernel on our hot PPE wins end-to-end — the many
+    // per-GEMM OpenBLAS entries in a multi-op model (transformer: ~15 GEMMs/predict)
+    // cost more than the kernel saves. K is the clean discriminator: MLP K>=512,
+    // transformer/LSTM K=64. Env-tunable.
+    internal static readonly int OpenBlasMinK =
+        int.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_OPENBLAS_MINK"), out var obk) && obk > 0
+            ? obk : 256;
+
 #if NET5_0_OR_GREATER
     // ─── Path A: pre-packed B cache ────────────────────────────────────────
     //
@@ -1016,8 +1050,67 @@ internal static partial class SimdGemm
             }
         }
 #endif
+        // Native OpenBLAS kernel on OUR pool for large no-transpose contiguous GEMMs.
+        // The bake-off showed OpenBLAS's microkernel at 2-3x the managed RyuJIT kernel,
+        // but routing whole calls to OpenBLAS regressed end-to-end: OpenBLAS spins its
+        // own ~N-thread pool PER CALL, and a many-GEMM model (transformer) pays that
+        // thread-sync floor on every op. The fix: pin OpenBLAS to ONE thread and supply
+        // the parallelism ourselves over the PersistentParallelExecutor (hot, spin-based,
+        // ~zero wakeup) by splitting the M rows into chunks — each chunk a single-thread
+        // OpenBLAS call. We get OpenBLAS's kernel quality with our cheap dispatch.
+        // Top-level only (SgemmSequential, used inside PPE regions, never reaches here).
+        if (_openBlasGemm && !transA && !transB && lda == k && ldb == n
+            && k >= OpenBlasMinK && (long)m * k * n >= OpenBlasMinWork && Helpers.BlasProvider.HasRawSgemm)
+        {
+            RunOpenBlasParallel(a, b, c, m, k, n);
+            return;
+        }
+
         c.Clear();
         SgemmAddInternal(a, lda, transA, b, ldb, transB, c, m, k, n, allowParallel: true, clearedOutput: true);
+    }
+
+    // Set to 1 once OpenBLAS is pinned single-thread (we own the parallelism).
+    private static int _openBlasThreadsPinned;
+
+    /// <summary>
+    /// C[m,n] = A[m,k]·B[k,n] (row-major, no-trans) using OpenBLAS's single-thread
+    /// microkernel, parallelized over M-row chunks on the PersistentParallelExecutor.
+    /// Captures OpenBLAS's kernel quality (2-3x the managed RyuJIT kernel at the MLP/
+    /// transformer shapes) without OpenBLAS's per-call thread-pool spin-up — the
+    /// reason whole-call native routing regressed the many-GEMM transformer.
+    /// </summary>
+    private static unsafe void RunOpenBlasParallel(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c, int m, int k, int n)
+    {
+        // Pin OpenBLAS to a single thread once — its internal threading is what we're
+        // replacing with our own pool.
+        if (System.Threading.Interlocked.CompareExchange(ref _openBlasThreadsPinned, 1, 0) == 0)
+            Helpers.BlasProvider.TrySetOpenBlasThreads(1);
+
+        int maxT = Helpers.CpuParallelSettings.MaxDegreeOfParallelism;
+        // One chunk per worker, but keep >= 8 rows/chunk so each single-thread call
+        // amortizes its own (small) entry cost.
+        int chunks = Math.Max(1, Math.Min(maxT, m / 8));
+
+        fixed (float* pa = a, pb = b, pc = c)
+        {
+            if (chunks <= 1)
+            {
+                Helpers.BlasProvider.SgemmRaw(m, n, k, pa, k, pb, n, pc, n);
+                return;
+            }
+            nint A = (nint)pa, B = (nint)pb, C = (nint)pc;
+            int kk = k, nn = n, mm = m, per = (m + chunks - 1) / chunks;
+            Helpers.PersistentParallelExecutor.Instance.Execute(chunks, chunk =>
+            {
+                int r0 = chunk * per;
+                if (r0 >= mm) return;
+                int rows = System.Math.Min(per, mm - r0);
+                float* aP = (float*)A + (long)r0 * kk;
+                float* cP = (float*)C + (long)r0 * nn;
+                Helpers.BlasProvider.SgemmRaw(rows, nn, kk, aP, kk, (float*)B, nn, cP, nn);
+            });
+        }
     }
 
     /// <summary>
