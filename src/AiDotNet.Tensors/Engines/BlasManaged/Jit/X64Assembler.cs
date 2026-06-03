@@ -226,10 +226,122 @@ internal sealed class X64Assembler
     }
 
     // pp: 0=none, 1=66, 2=F3, 3=F2.  map: 1=0F, 2=0F38, 3=0F3A.  L: 0=128,1=256.
-    private const int Pp66 = 1, PpNone = 0, Map0F = 1, Map0F38 = 2;
+    private const int Pp66 = 1, PpNone = 0, PpF3 = 2, Map0F = 1, Map0F38 = 2;
 
     /// <summary>vfmadd231pd dst, s1, s2  (dst += s1*s2). VEX.DDS.256.66.0F38.W1 B8.</summary>
     internal void Vfmadd231pd(int dst, int s1, int s2) => VexRR(Map0F38, Pp66, 1, 1, 0xB8, dst, s1, s2);
+
+    // ── EVEX register-register form (#378: AVX-512-BF16) ───────────────────────
+    // 4-byte EVEX: 62 P0 P1 P2  opcode  ModRM(mod=11). Limited to ymm/zmm 0..15
+    // (no mask / broadcast / zeroing), which is all the BF16 microkernel needs —
+    // so EVEX.X=1 (no rm[4]), EVEX.R'=1 (reg<16), EVEX.V'=1 (vvvv<16) are constant.
+    //   P0 = [R X B R' 0 0 m m]   R=~reg[3], B=~rm[3], mm: 1=0F, 2=0F38, 3=0F3A
+    //   P1 = [W v v v v 1 p p]    vvvv=~vvvvReg, pp: 0=none,1=66,2=F3,3=F2
+    //   P2 = [z L'L L'L b V' a a a]  L'L: 0=128,1=256,2=512; here z=b=aaa=0, V'=1
+    private void EvexRR(int mm, int pp, int w, int ll, byte opcode, int reg, int vvvv, int rm)
+    {
+        int rBit = (reg < 8) ? 1 : 0;
+        int bBit = (rm < 8) ? 1 : 0;
+        byte p0 = (byte)((rBit << 7) | (1 << 6) | (bBit << 5) | (1 << 4) | mm);
+        int vv = (~vvvv) & 0xF;
+        byte p1 = (byte)((w << 7) | (vv << 3) | (1 << 2) | pp);
+        byte p2 = (byte)((ll << 5) | (1 << 3)); // z=0, L'L<<5, b=0, V'=1, aaa=000
+        byte modrm = (byte)(0xC0 | ((reg & 7) << 3) | (rm & 7));
+        B(0x62, p0, p1, p2, opcode, modrm);
+    }
+
+    /// <summary>vdpbf16ps ymm_dst, ymm_s1, ymm_s2  (dst[i] += s1[2i]*s2[2i] + s1[2i+1]*s2[2i+1],
+    /// BF16 inputs → FP32 accumulate). EVEX.256.F3.0F38.W0 52 /r (AVX-512-BF16, Sapphire Rapids / Zen 4+).</summary>
+    internal void Vdpbf16ps256(int dst, int s1, int s2) => EvexRR(Map0F38, PpF3, 0, 1, 0x52, dst, s1, s2);
+
+    /// <summary>512-bit vdpbf16ps zmm_dst, zmm_s1, zmm_s2. EVEX.512.F3.0F38.W0 52 /r.</summary>
+    internal void Vdpbf16ps512(int dst, int s1, int s2) => EvexRR(Map0F38, PpF3, 0, 2, 0x52, dst, s1, s2);
+
+    // ── AMX tile instructions (#380: Sapphire Rapids tensor cores) ─────────────
+    // All VEX.128.*.0F38.W0; tile regs tmm0..7 encode in ModRM.reg/.rm and VEX.vvvv
+    // (3 bits, no extension). TILELOADD/TILESTORED take a sibmem operand (base+index,
+    // index = row-stride in bytes, scale 1) — hence the dedicated SIB emitter below.
+    private const int PpF2 = 3; // F2 prefix (pp=11); complements PpNone/Pp66/PpF3 above.
+
+    // VEX memory form with an explicit SIB (mod=00, rm=100): [base + index*1]. Requires
+    // base ∉ {rbp,r13} (those select disp32 at mod=00); callers pick base accordingly.
+    private void VexSib(int map, int pp, int w, int L, byte opcode, int reg, int baseReg, int indexReg, int scale)
+    {
+        int rBit = (reg < 8) ? 1 : 0;
+        int xBit = (indexReg < 8) ? 1 : 0;
+        int bBit = (baseReg < 8) ? 1 : 0;
+        byte b1 = (byte)((rBit << 7) | (xBit << 6) | (bBit << 5) | map);
+        byte b2 = (byte)((w << 7) | (0xF << 3) | (L << 2) | pp);
+        byte modrm = (byte)(((reg & 7) << 3) | 0x4); // mod=00, rm=100 → SIB follows
+        byte sib = (byte)((scale << 6) | ((indexReg & 7) << 3) | (baseReg & 7));
+        B(0xC4, b1, b2, opcode, modrm, sib);
+    }
+
+    /// <summary>mov reg32, imm32 (zero-extends to 64-bit). B8+rd id. For tile row strides.</summary>
+    internal void MovRegImm32(int reg, int imm)
+    {
+        if (reg >= 8) B(0x41); // REX.B
+        B((byte)(0xB8 + (reg & 7)));
+        Imm32(imm);
+    }
+
+    /// <summary>ldtilecfg [base] — load the 64-byte tile configuration. VEX.128.NP.0F38.W0 49 /0.</summary>
+    internal void Ldtilecfg(int baseReg) => VexMemDisp8(Map0F38, PpNone, 0, 0, 0x49, 0, baseReg, 0);
+
+    /// <summary>sttilecfg [base] — store the current tile configuration. VEX.128.66.0F38.W0 49 /0.</summary>
+    internal void Sttilecfg(int baseReg) => VexMemDisp8(Map0F38, Pp66, 0, 0, 0x49, 0, baseReg, 0);
+
+    /// <summary>tilerelease — reset all tiles to the init state. VEX.128.NP.0F38.W0 49 C0.</summary>
+    internal void Tilerelease() => VexRR(Map0F38, PpNone, 0, 0, 0x49, 0, 0, 0);
+
+    /// <summary>tilezero tmm — zero a tile (the C accumulator). VEX.128.F2.0F38.W0 49 /r (mod=11).</summary>
+    internal void Tilezero(int tmm) => VexRR(Map0F38, PpF2, 0, 0, 0x49, tmm, 0, 0);
+
+    /// <summary>tileloadd tmm, [base + index*1] — load a tile, index = row stride bytes. VEX.128.F2.0F38.W0 4B /r.</summary>
+    internal void TileloadD(int tmm, int baseReg, int indexReg) => VexSib(Map0F38, PpF2, 0, 0, 0x4B, tmm, baseReg, indexReg, 0);
+
+    /// <summary>tilestored [base + index*1], tmm — store a tile. VEX.128.F3.0F38.W0 4B /r.</summary>
+    internal void Tilestored(int baseReg, int indexReg, int tmm) => VexSib(Map0F38, PpF3, 0, 0, 0x4B, tmm, baseReg, indexReg, 0);
+
+    /// <summary>tdpbf16ps tdst, tvvvv, trm — tile BF16 dot-product accumulate (FP32). VEX.128.F3.0F38.W0 5C /r;
+    /// reg = tdst (C). NOTE the K-row source (B/VNNI) is VEX.vvvv and the M-row source (A) is ModRM.rm —
+    /// i.e. for C = A·B, pass tvvvv = B and trm = A. (Verified against Intel SDE.)</summary>
+    internal void Tdpbf16ps(int tdst, int tvvvv, int trm) => VexRR(Map0F38, PpF3, 0, 0, 0x5C, tdst, tvvvv, trm);
+
+    // INT8 tile dot-products → INT32 accumulate (opcode 5E; prefix selects the sign combo).
+    // Same operand convention as tdpbf16ps: the K-row source (B/VNNI-4) is VEX.vvvv (tvvvv),
+    // the M-row source (A) is ModRM.rm (trm). VNNI depth is 4 int8 per group (vs 2 BF16).
+
+    /// <summary>tdpbssd — signed·signed int8 → int32. VEX.128.F2.0F38.W0 5E /r.</summary>
+    internal void Tdpbssd(int tdst, int tvvvv, int trm) => VexRR(Map0F38, PpF2, 0, 0, 0x5E, tdst, tvvvv, trm);
+
+    /// <summary>tdpbsud — signed·unsigned int8 → int32. VEX.128.F3.0F38.W0 5E /r.</summary>
+    internal void Tdpbsud(int tdst, int tvvvv, int trm) => VexRR(Map0F38, PpF3, 0, 0, 0x5E, tdst, tvvvv, trm);
+
+    /// <summary>tdpbusd — unsigned·signed int8 → int32. VEX.128.66.0F38.W0 5E /r.</summary>
+    internal void Tdpbusd(int tdst, int tvvvv, int trm) => VexRR(Map0F38, Pp66, 0, 0, 0x5E, tdst, tvvvv, trm);
+
+    /// <summary>tdpbuud — unsigned·unsigned int8 → int32. VEX.128.NP.0F38.W0 5E /r.</summary>
+    internal void Tdpbuud(int tdst, int tvvvv, int trm) => VexRR(Map0F38, PpNone, 0, 0, 0x5E, tdst, tvvvv, trm);
+
+    /// <summary>cpuid — leaf in eax, sub-leaf in ecx; clobbers eax/ebx/ecx/edx. 0F A2.</summary>
+    internal void Cpuid() => B(0x0F, 0xA2);
+
+    /// <summary>push reg64 (50+rd, REX.B for r8–r15).</summary>
+    internal void PushReg(int reg) { if (reg >= 8) B(0x41); B((byte)(0x50 + (reg & 7))); }
+
+    /// <summary>pop reg64 (58+rd, REX.B for r8–r15).</summary>
+    internal void PopReg(int reg) { if (reg >= 8) B(0x41); B((byte)(0x58 + (reg & 7))); }
+
+    /// <summary>mov [base + disp8], reg32 — store a 32-bit register. 89 /r.</summary>
+    internal void MovMemFromReg32(int baseReg, sbyte disp8, int reg)
+    {
+        byte rex = (byte)((reg >= 8 ? 4 : 0) | (baseReg >= 8 ? 1 : 0));
+        if (rex != 0) B((byte)(0x40 | rex));
+        B(0x89, (byte)(0x40 | ((reg & 7) << 3) | (baseReg & 7)));
+        if ((baseReg & 7) == 4) B(0x24); // SIB for rsp/r12 base
+        B((byte)disp8);
+    }
 
     /// <summary>vxorpd dst, s1, s2. VEX.256.66.0F.WIG 57. (zero a reg: dst=s1=s2)</summary>
     internal void Vxorpd(int dst, int s1, int s2) => VexRR(Map0F, Pp66, 0, 1, 0x57, dst, s1, s2);

@@ -241,7 +241,36 @@ jobs:
     - name: Run machine-kernel tests (AVX-512 gated tests run only on AVX-512 hardware)
       run: |
         dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --no-build --framework net10.0 \
-          --filter "FullyQualifiedName~MachineCodeKernelTests|FullyQualifiedName~MachineKernelGemmTests"
+          --filter "FullyQualifiedName~MachineCodeKernelTests|FullyQualifiedName~MachineKernelGemmTests|FullyQualifiedName~MicrokernelCorrectnessTests|FullyQualifiedName~Avx512"
+
+    # Sub-S (#409) S.4: VERIFY the AVX-512 microkernels under Intel SDE emulation.
+    # SDE emulates AVX-512 on ANY x86-64 host (incl. the AMD ubuntu-latest runner), and
+    # on Linux .NET's Avx512F.IsSupported is satisfied under it — so this checks the
+    # Avx512Fp32_16x16 / Avx512Fp32_8x32 / Avx512Fp64_8x16 kernels against a scalar
+    # reference with NO AVX-512 hardware required. --verify-microkernels exits non-zero on
+    # any mismatch, so a wrong AVX-512 kernel fails the job (this is the real correctness
+    # gate the skipped hardware tests could not provide).
+    - name: Verify AVX-512 microkernels under Intel SDE emulation
+      run: |
+        SDE_DIR="$RUNNER_TEMP/sde"
+        mkdir -p "$SDE_DIR"
+        curl -fsSL "https://downloadmirror.intel.com/843185/sde-external-9.48.0-2024-11-25-lin.tar.xz" -o "$RUNNER_TEMP/sde.tar.xz"
+        tar -xf "$RUNNER_TEMP/sde.tar.xz" -C "$SDE_DIR" --strip-components=1
+        dotnet build tests/AiDotNet.Tensors.Benchmarks/AiDotNet.Tensors.Benchmarks.csproj --configuration Release --framework net10.0
+        DLL="tests/AiDotNet.Tensors.Benchmarks/bin/Release/net10.0/AiDotNet.Tensors.Benchmarks.dll"
+        echo "Native run (no SDE): the AVX-512 kernels SKIP on a non-AVX-512 host —"
+        dotnet "$DLL" --verify-microkernels
+        echo "Under Intel SDE (-spr, emulates Sapphire Rapids AVX-512):"
+        "$SDE_DIR/sde64" -spr -- dotnet "$DLL" --verify-microkernels
+
+    # Sub-S (#409) S.4: report the per-microkernel GFLOPS (% of a measured register-FMA
+    # ceiling) on this runner. On a real AVX-512 runner this prints the Avx512Fp32_16x16 /
+    # 8x32 / Avx512Fp64_8x16 numbers we cannot measure on AVX2-only dev boxes (SDE GFLOPS
+    # are emulation speed, not meaningful — perf still needs an AVX-512 runner via
+    # AVX512_RUNNER). Informational (does not fail the job); read the values in the log.
+    - name: Microkernel GFLOPS report (AVX-512 numbers on AVX-512 runners)
+      continue-on-error: true
+      run: dotnet run --project tests/AiDotNet.Tensors.Benchmarks --configuration Release --framework net10.0 -- --microkernel-gflops
 
   publish:
     needs: build

@@ -155,11 +155,18 @@ public static class BFloat16Kernels
             throw new ArgumentException($"bRowStride {bRowStride} must be ≥ n {n}.");
         if (cRowStride < n)
             throw new ArgumentException($"cRowStride {cRowStride} must be ≥ n {n}.");
-        if (m > 0 && a.Length < (m - 1) * aRowStride + k)
+        // Offset math in long so large m/stride can't overflow int and silently skip the guard
+        // (a span never exceeds int.MaxValue, so any required length past that correctly throws).
+        // Once these pass, every inner index below is < the validated span length, hence in-range
+        // for the int row-offset arithmetic in the loops.
+        long aRequired = m > 0 ? (long)(m - 1) * aRowStride + k : 0;
+        long bRequired = k > 0 ? (long)(k - 1) * bRowStride + n : 0;
+        long cRequired = m > 0 ? (long)(m - 1) * cRowStride + n : 0;
+        if (aRequired > a.Length)
             throw new ArgumentException($"a span ({a.Length}) too short for m={m}, k={k}, stride={aRowStride}.");
-        if (k > 0 && b.Length < (k - 1) * bRowStride + n)
+        if (bRequired > b.Length)
             throw new ArgumentException($"b span ({b.Length}) too short for k={k}, n={n}, stride={bRowStride}.");
-        if (m > 0 && c.Length < (m - 1) * cRowStride + n)
+        if (cRequired > c.Length)
             throw new ArgumentException($"c span ({c.Length}) too short for m={m}, n={n}, stride={cRowStride}.");
         Span<float> tmpB = stackalloc float[8];
         for (int i = 0; i < m; i++)

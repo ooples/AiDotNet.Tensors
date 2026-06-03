@@ -377,6 +377,143 @@ internal static class AisEvalHeadToHeadBench
         Console.WriteLine($"  {label}  med {med,7:F3}ms  p95 {p95,7:F3}ms  alloc {allocPerCall,10:F0} B/call");
     }
 
+    /// <summary>
+    /// PR #531 validation: count StreamingWorkerPool dispatch/park events per primitive
+    /// to see whether the low-latency-pool keep-alive even targets these workloads'
+    /// critical path. Run: --ab-aiseval-poolstats.
+    /// </summary>
+    public static void PoolStats()
+    {
+        Console.WriteLine("=== PR #531 — StreamingWorkerPool usage per AIsEval primitive ===");
+        Console.WriteLine($"Host: cores={Environment.ProcessorCount}. Counters: parallel dispatch / serial<grain / serial-contended / park events.");
+        Console.WriteLine();
+        var engine = new CpuEngine();
+        const int reps = 200;
+
+        void Probe(string name, Action run)
+        {
+            for (int i = 0; i < 20; i++) run(); // warm
+            AiDotNet.Tensors.Engines.BlasManaged.Pool.StreamingWorkerPool.ResetPoolStats();
+            AiDotNet.Tensors.Helpers.CpuParallelSettings.ResetParallelForStats();
+            for (int i = 0; i < reps; i++) run();
+            var (par, serG, serC, park) = AiDotNet.Tensors.Engines.BlasManaged.Pool.StreamingWorkerPool.PoolStatsSnapshot();
+            long pfor = AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForStatsSnapshot();
+            Console.WriteLine($"  {name,-12} over {reps} calls: StreamingPool[parallel={par} parks={park}]  vs  Parallel.For dispatches={pfor}");
+            Console.WriteLine($"  {name,-12} per call         : StreamingPool parallel={par / (double)reps:F1}  Parallel.For={pfor / (double)reps:F1}");
+        }
+
+        bool managedPass = Environment.GetEnvironmentVariable("POOLSTATS_MANAGED") == "1";
+        if (managedPass)
+        {
+            AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.PreferManaged = true;
+            Console.WriteLine("  (BlasManaged.PreferManaged = true — forcing GEMMs onto the managed StreamingWorkerPool path)");
+        }
+
+        {
+            const int bs = 128;
+            var input = Tensor<float>.CreateRandom(bs, 784);
+            var weights = new List<Tensor<float>> { Tensor<float>.CreateRandom(784, 512), Tensor<float>.CreateRandom(512, 128), Tensor<float>.CreateRandom(128, 10) };
+            var biases = new List<Tensor<float>?> { Tensor<float>.CreateRandom(512), Tensor<float>.CreateRandom(128), Tensor<float>.CreateRandom(10) };
+            Probe("MLP", () => engine.MlpForward(input, weights, biases, FusedActivationType.ReLU, FusedActivationType.None));
+        }
+        {
+            const int batch = 128, seq = 32, dModel = 64, heads = 4;
+            var input = Tensor<float>.CreateRandom(batch, seq, dModel);
+            var qW = Tensor<float>.CreateRandom(dModel, dModel); var kW = Tensor<float>.CreateRandom(dModel, dModel);
+            var vW = Tensor<float>.CreateRandom(dModel, dModel); var oW = Tensor<float>.CreateRandom(dModel, dModel);
+            Probe("Transformer", () => engine.MultiHeadAttentionForward(input, qW, kW, vW, oW, heads));
+        }
+        {
+            const int batch = 128, seq = 32, inF = 32, hidden = 64;
+            var input = Tensor<float>.CreateRandom(batch, seq, inF);
+            var wIh = Tensor<float>.CreateRandom(4 * hidden, inF); var wHh = Tensor<float>.CreateRandom(4 * hidden, hidden);
+            Probe("LSTM", () => engine.LstmSequenceForward(input, null, null, wIh, wHh, null, null));
+        }
+    }
+
+    /// <summary>
+    /// PR #531 validation: per-dispatch latency + allocation of the general parallel-op
+    /// path (CpuParallelSettings.ParallelForOrSerial) through raw Parallel.For (the .NET
+    /// ThreadPool) vs the low-latency cooperative pool. This is the regime the prototype
+    /// targeted — many small back-to-back parallel dispatches. Run: --ab-pool-wiring.
+    /// </summary>
+    public static void PoolWiringBench()
+    {
+        Console.WriteLine("=== PR #531 — ParallelForOrSerial: Parallel.For vs cooperative pool ===");
+        Console.WriteLine($"Host: cores={Environment.ProcessorCount}");
+
+        // Correctness: the cooperative path must match a serial reference — including
+        // when many threads dispatch concurrently (the scheduler's reason to exist).
+        {
+            var src = new float[20000];
+            var r2 = new Random(5);
+            for (int i = 0; i < src.Length; i++) src[i] = (float)(r2.NextDouble() * 2 - 1);
+            var refOut = new float[src.Length];
+            for (int i = 0; i < src.Length; i++) refOut[i] = MathF.Max(0f, src[i] * 2f);
+
+            AiDotNet.Tensors.Helpers.CpuParallelSettings.UseCooperativePool = true;
+            var o1 = new float[src.Length];
+            AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, src.Length, src.Length, i => o1[i] = MathF.Max(0f, src[i] * 2f));
+            bool single = true;
+            for (int i = 0; i < src.Length; i++) if (o1[i] != refOut[i]) single = false;
+
+            // Concurrent: raw threads (not Parallel.For, which would set _inParallelRegion
+            // and serialize the nested dispatch) each run their own dispatch simultaneously.
+            int badThreads = 0;
+            var threads = new System.Threading.Thread[8];
+            for (int t = 0; t < threads.Length; t++)
+            {
+                threads[t] = new System.Threading.Thread(() =>
+                {
+                    for (int rep = 0; rep < 50; rep++)
+                    {
+                        var ot = new float[src.Length];
+                        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, src.Length, src.Length, i => ot[i] = MathF.Max(0f, src[i] * 2f));
+                        for (int i = 0; i < src.Length; i++) if (ot[i] != refOut[i]) { System.Threading.Interlocked.Increment(ref badThreads); break; }
+                    }
+                });
+                threads[t].Start();
+            }
+            foreach (var th in threads) th.Join();
+            AiDotNet.Tensors.Helpers.CpuParallelSettings.UseCooperativePool = false;
+            Console.WriteLine($"  correctness: single={(single ? "PASS" : "FAIL")}  concurrent(8x50)={(badThreads == 0 ? "PASS" : $"FAIL({badThreads})")}");
+        }
+
+        const int rows = 256;
+        const long totalWork = 64 * 1024; // above the 32K serial grain → parallel path
+        var buf = new float[rows * 256];
+        var rng = new Random(1);
+        for (int i = 0; i < buf.Length; i++) buf[i] = (float)(rng.NextDouble() * 2 - 1);
+        int cols = buf.Length / rows;
+
+        Action op = () => AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, rows, totalWork, r =>
+        {
+            int b = r * cols;
+            for (int j = 0; j < cols; j++) { var v = buf[b + j]; buf[b + j] = v < 0 ? 0 : v; }
+        });
+
+        void Measure(string label, bool coop)
+        {
+            AiDotNet.Tensors.Helpers.CpuParallelSettings.UseCooperativePool = coop;
+            for (int i = 0; i < 500; i++) op(); // warm
+            SettleGc();
+            long a0 = GC.GetAllocatedBytesForCurrentThread();
+            const int n = 4000;
+            var times = new double[n];
+            var sw = new Stopwatch();
+            for (int i = 0; i < n; i++) { sw.Restart(); op(); sw.Stop(); times[i] = sw.Elapsed.TotalMilliseconds * 1000.0; }
+            double alloc = (GC.GetAllocatedBytesForCurrentThread() - a0) / (double)n;
+            var (med, p95) = Percentiles(times);
+            Console.WriteLine($"  {label,-14}: med {med,7:F2}us  p95 {p95,7:F2}us  alloc {alloc,7:F0} B/dispatch");
+        }
+
+        Measure("Parallel.For", false);
+        Measure("cooperative", true);
+        Measure("Parallel.For", false); // re-measure to confirm the delta isn't drift
+        Measure("cooperative", true);
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.UseCooperativePool = false;
+    }
+
     private static (double median, double p95) TimeAi(Func<Tensor<float>> forward)
         => MeasureRobust(() => forward());
 

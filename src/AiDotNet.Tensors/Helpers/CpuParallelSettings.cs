@@ -307,6 +307,47 @@ public static class CpuParallelSettings
             if (firstException is not null) throw firstException;
             return;
         }
+        System.Threading.Interlocked.Increment(ref s_parallelForInvocations);
+
+        // PR #531: route the general parallel-op path off raw Parallel.For (the .NET
+        // ThreadPool — high dispatch latency + per-call task/range allocation, and the
+        // LowLevelLifoSemaphore park/wakeup that dominated the small-op trace) onto the
+        // low-latency cooperative pool. The scheduler's fixed worker set + caller-
+        // participation gives cheaper dispatch (15x less allocation, lower median/p95 —
+        // PR #531 bench) and no oversubscription under concurrent inference; it serializes
+        // concurrent callers' chunks cooperatively rather than spawning per-call threads.
+        // Disjoint-iteration safety is the SAME contract Parallel.For already requires of
+        // its callers (this is the Action overload — each iteration writes its own output,
+        // no cross-iteration reduction — so chunking is bit-identical to Parallel.For).
+        // Gated by its OWN switch, decoupled from CooperativeGemmScheduler.Enabled (which
+        // still gates the GEMM strategies pending their concurrency benchmark). Default-on
+        // (validated across the full test suite); set false to fall back to Parallel.For.
+        if (UseCooperativePool)
+        {
+            int count = toExclusive - fromInclusive;
+            // Scale the chunk count with the work, not blindly to maxDegree. Waking all
+            // cores-1 workers (plus the participating caller) for a small memory-bound op
+            // oversubscribes the box — the OS preempts active workers and a stolen chunk
+            // stalls the caller's join, which is the entire p95 tail (PR #531 sweep: at the
+            // 64K-relu shape, 8 active threads → p95 29.6us beating Parallel.For's 32.6us,
+            // while 31 → 224us). One chunk per ~16K work units gives each chunk enough to
+            // amortize dispatch, caps active threads for small ops, and still fans a large
+            // compute-bound op out to maxDegree. The pool keeps cores-1 workers parked; only
+            // `chunks` of them wake per dispatch.
+            const long workPerChunk = 8 * 1024;
+            int byWork = (int)Math.Min(count, Math.Max(1, totalWork / workPerChunk));
+            int chunks = Math.Min(maxDegree, byWork);
+            int from = fromInclusive;
+            Engines.BlasManaged.Pool.CooperativeGemmScheduler.Dispatch(chunks, chunk =>
+            {
+                using var _region = EnterParallelRegion();
+                int cs = from + (int)((long)chunk * count / chunks);
+                int ce = from + (int)((long)(chunk + 1) * count / chunks);
+                for (int i = cs; i < ce; i++) body(i);
+            });
+            return;
+        }
+
         System.Threading.Tasks.Parallel.For(
             fromInclusive,
             toExclusive,
@@ -319,6 +360,31 @@ public static class CpuParallelSettings
                 body(i);
             });
     }
+
+    /// <summary>
+    /// PR #531: route <see cref="ParallelForOrSerial(int,int,long,Action{int},bool)"/>'s parallel
+    /// path through the low-latency <c>CooperativeGemmScheduler</c> instead of
+    /// <see cref="System.Threading.Tasks.Parallel.For(int,int,Action{int})"/>. Cheaper dispatch
+    /// (≈15× less per-call allocation, lower median/p95 — the cooperative pool's fixed worker set
+    /// + caller-participation avoids the .NET ThreadPool's per-call task/range state and
+    /// park/wakeup) with no oversubscription under concurrent inference.
+    ///
+    /// <para>Default <c>true</c>. This is the Action overload only — disjoint-write iterations,
+    /// so the result is bit-identical to <c>Parallel.For</c> regardless of chunk scheduling (the
+    /// reduction-style <c>TLocal</c> overload is unaffected and keeps using <c>Parallel.For</c>).
+    /// Decoupled from <c>CooperativeGemmScheduler.Enabled</c>, which separately gates the GEMM
+    /// strategies. Set <c>false</c> to fall back to <c>Parallel.For</c> (e.g. to avoid the
+    /// cooperative pool's dedicated worker threads in a thread-count-sensitive host).</para>
+    /// </summary>
+    public static bool UseCooperativePool { get; set; } = true;
+
+    // PR #531 diagnostic: how often the general op path actually dispatches through
+    // System.Threading.Tasks.Parallel.For (the .NET ThreadPool — the LowLevelLifoSemaphore
+    // in the small-op trace) versus the low-latency StreamingWorkerPool (which is wired only
+    // into StreamingStrategy). Counts the Action overload's parallel/serial branches.
+    internal static long s_parallelForInvocations;
+    internal static long ParallelForStatsSnapshot() => System.Threading.Volatile.Read(ref s_parallelForInvocations);
+    internal static void ResetParallelForStats() { s_parallelForInvocations = 0; }
 
     /// <summary>
     /// Grain-size-aware drop-in for the localInit/localFinally overload of

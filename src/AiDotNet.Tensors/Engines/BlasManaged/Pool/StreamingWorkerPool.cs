@@ -66,6 +66,14 @@ internal static class StreamingWorkerPool
         }
     }
 
+    // DIAGNOSTIC (PR #531 validation): is this pool even on the small-op critical path?
+    internal static long s_parallelDispatches, s_serialBelowGrain, s_serialContended, s_parkEvents;
+    internal static (long par, long serGrain, long serCont, long park) PoolStatsSnapshot()
+        => (Volatile.Read(ref s_parallelDispatches), Volatile.Read(ref s_serialBelowGrain),
+            Volatile.Read(ref s_serialContended), Volatile.Read(ref s_parkEvents));
+    internal static void ResetPoolStats()
+    { s_parallelDispatches = 0; s_serialBelowGrain = 0; s_serialContended = 0; s_parkEvents = 0; }
+
     private static void WorkerLoop(int slot)
     {
         long lastSeq = 0;
@@ -102,7 +110,10 @@ internal static class StreamingWorkerPool
                     Thread.MemoryBarrier();
                     // Re-check under park to avoid lost wakeup.
                     if (Volatile.Read(ref _slots[slot].Seq) == lastSeq)
+                    {
+                        Interlocked.Increment(ref s_parkEvents);
                         _slots[slot].ParkEvent!.Wait();
+                    }
                     _slots[slot].ParkEvent!.Reset();
                     Volatile.Write(ref _slots[slot].ParkPending, 0);
                     spinCount = 0;
@@ -153,6 +164,7 @@ internal static class StreamingWorkerPool
         if (numChunks <= 0) return;
         if (totalWork < DefaultSerialGrainSize)
         {
+            Interlocked.Increment(ref s_serialBelowGrain);
             Exception? first = null;
             for (int c = 0; c < numChunks; c++)
             {
@@ -195,10 +207,12 @@ internal static class StreamingWorkerPool
         // stall — at most one runs parallel while the rest run serial.
         if (numChunks == 1 || _isExecuting || !Monitor.TryEnter(_dispatchLock))
         {
+            Interlocked.Increment(ref s_serialContended);
             for (int c = 0; c < numChunks; c++) action(c);
             return;
         }
 
+        Interlocked.Increment(ref s_parallelDispatches);
         EnsureInitialized();
         _isExecuting = true;
         try
