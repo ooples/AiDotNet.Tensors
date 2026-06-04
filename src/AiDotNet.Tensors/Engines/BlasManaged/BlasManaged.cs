@@ -60,6 +60,57 @@ public static partial class BlasManaged
     private const int ThinMDirectMaxN = 512;    // above this B re-stream dominates
     private const int ThinMDirectMaxK = 1024;   // tested winning range
 
+#if NET5_0_OR_GREATER
+    /// <summary>
+    /// #368 thin-M fast path (see the call site in <see cref="Gemm{T}"/>). Routes the
+    /// measured winning regime to the no-pack direct-parallel kernel
+    /// (<see cref="Simd.SimdGemm.SgemmDirectParallelMInto"/> /
+    /// <see cref="Simd.SimdGemm.DgemmDirectParallelMInto"/>) and returns true; returns
+    /// false to fall through to the tuned strategy paths. Transposed operands are
+    /// transposed into pooled scratch (cheap relative to the GEMM at thin-M, and far
+    /// faster than the ~57 GF/s the packed/strategy path gives transposed thin-M); a
+    /// fused bias/activation epilogue is applied after the GEMM. The kernels write
+    /// disjoint output rows in fixed K order, so the result is deterministic across
+    /// thread counts.
+    /// </summary>
+    private static bool TryThinMDirect<T>(
+        ReadOnlySpan<T> a, int lda, bool transA,
+        ReadOnlySpan<T> b, int ldb, bool transB,
+        Span<T> c, int ldc, int m, int n, int k,
+        in BlasOptions<T> options) where T : unmanaged
+    {
+        if (!(typeof(T) == typeof(float) || typeof(T) == typeof(double))) return false;
+        if (!System.Runtime.Intrinsics.X86.Fma.IsSupported) return false;
+        if (options.PackingMode != PackingMode.Auto && options.PackingMode != PackingMode.DisableAutotune) return false;
+        if (options.PackedA is not null || options.PackedB is not null) return false;
+        // Transposed is intentionally NOT routed here: materializing op(A)/op(B) into
+        // contiguous scratch costs a serial transpose that dominates the (parallel)
+        // GEMM at thin-M — measured transB 27 / transA 53 GF/s, both at or below the
+        // ~57 the packed strategy already gives, i.e. a regression. Transposed thin-M
+        // wants a dedicated strided/transpose-aware kernel (separate work); for now it
+        // stays on the tuned strategy path.
+        if (transA || transB) return false;
+        if (lda != k || ldb != n || ldc != n) return false;
+        if ((n & 7) != 0) return false;
+        if (m < ThinMDirectMinM || m > ThinMDirectMaxM || n > ThinMDirectMaxN || k > ThinMDirectMaxK) return false;
+
+        if (typeof(T) == typeof(float))
+            Simd.SimdGemm.SgemmDirectParallelMInto(
+                MemoryMarshal.Cast<T, float>(a), MemoryMarshal.Cast<T, float>(b),
+                MemoryMarshal.Cast<T, float>(c), m, k, n);
+        else
+            Simd.SimdGemm.DgemmDirectParallelMInto(
+                MemoryMarshal.Cast<T, double>(a), MemoryMarshal.Cast<T, double>(b),
+                MemoryMarshal.Cast<T, double>(c), m, k, n);
+
+        // Fused bias/activation epilogue applied after the GEMM (a cheap elementwise
+        // pass) — lets thin-M FusedLinear hit the fast kernel instead of the strategy.
+        var epi = options.Epilogue;
+        EpilogueChain.Apply<T>(c, ldc, m, n, in epi);
+        return true;
+    }
+#endif
+
     /// <summary>
     /// Sub-issue F (#374): when true, <see cref="Helpers.BlasProvider.TryGemm"/> and
     /// <see cref="Helpers.BlasProvider.TryGemmEx"/> route through <see cref="Gemm{T}"/>
@@ -200,45 +251,18 @@ public static partial class BlasManaged
 
 #if NET5_0_OR_GREATER
         // #368 thin-M fast path: BlasManaged's general dispatch parallelises thin-M
-        // GEMM poorly — at the AIsEval MLP L0 128×784×512 it falls to the #409
-        // machine-code path (~55 GF/s), and double likewise stays ~60 — both LOSING
-        // to a no-pack direct parallel kernel that splits disjoint output-row blocks
-        // (float 6×16 ~400-464 GF/s, beating OpenBLAS ~335; double 4×8 well over the
-        // ~60 the packed/machine-code paths give). Disjoint rows → bit-deterministic
-        // across thread counts (no K-split → no Deterministic-mode concern). Bounded
-        // to the measured winning regime; float/double, FMA, contiguous, no transpose
-        // / pack / epilogue (those take their tuned paths below).
-        // Fire for the two "let the library decide" modes (Auto + DisableAutotune,
-        // the latter is what the SimdGemm.Sgemm shim passes); the Force* modes mean
-        // the caller pinned a strategy, so leave those alone.
-        if ((typeof(T) == typeof(float) || typeof(T) == typeof(double))
-            && System.Runtime.Intrinsics.X86.Fma.IsSupported
-            && (options.PackingMode == PackingMode.Auto || options.PackingMode == PackingMode.DisableAutotune)
-            && !transA && !transB
-            && options.PackedA is null && options.PackedB is null
-            && lda == k && ldb == n && ldc == n
-            && (n & 7) == 0
-            && m >= ThinMDirectMinM && m <= ThinMDirectMaxM
-            && n <= ThinMDirectMaxN && k <= ThinMDirectMaxK)
-        {
-            var thinMEpi = options.Epilogue;
-            if (EpilogueFlagsCompute.Compute(in thinMEpi) == EpilogueFlags.None)
-            {
-                if (typeof(T) == typeof(float))
-                    Simd.SimdGemm.SgemmDirectParallelMInto(
-                        MemoryMarshal.Cast<T, float>(a),
-                        MemoryMarshal.Cast<T, float>(b),
-                        MemoryMarshal.Cast<T, float>(c),
-                        m, k, n);
-                else
-                    Simd.SimdGemm.DgemmDirectParallelMInto(
-                        MemoryMarshal.Cast<T, double>(a),
-                        MemoryMarshal.Cast<T, double>(b),
-                        MemoryMarshal.Cast<T, double>(c),
-                        m, k, n);
-                return;
-            }
-        }
+        // GEMM poorly — at the AIsEval MLP L0 128×784×512 float falls to the #409
+        // machine-code path (~55 GF/s) and double stays ~60, both LOSING to a no-pack
+        // direct parallel kernel that splits disjoint output-row blocks (float 6×16
+        // ~400-464 GF/s, beating OpenBLAS ~335; double 4×8 ~172). Disjoint rows →
+        // bit-deterministic across thread counts (no K-split → no Deterministic-mode
+        // concern). Also applies a fused bias/activation epilogue after the GEMM, so
+        // thin-M FusedLinear hits the fast kernel. Bounded to the measured winning
+        // regime; the Force* pack modes (caller pinned a strategy), pre-packed operands,
+        // transposed (its serial transpose regresses thin-M — see TryThinMDirect),
+        // out-of-box and non-FMA shapes fall through to the tuned strategy paths.
+        if (TryThinMDirect<T>(a, lda, transA, b, ldb, transB, c, ldc, m, n, k, in options))
+            return;
 #endif
 
         // Sub-S (#409): machine-code microkernel fast path. The tile-aligned interior

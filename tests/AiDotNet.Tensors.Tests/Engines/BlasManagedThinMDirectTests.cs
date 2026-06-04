@@ -108,6 +108,39 @@ public class BlasManagedThinMDirectTests
             $"BlasManaged.Gemm<double> thin-M carve-out rel error at {m}x{k}x{n}.");
     }
 
+    // Fused bias+activation epilogue at thin-M: #368 applies it after the direct
+    // kernel so FusedLinear hits the fast path. Verify out = ReLU(A·B + bias).
+    [Theory]
+    [InlineData(128, 784, 512)]
+    [InlineData(256, 512, 256)]
+    public void Gemm_ThinMEpilogue_BiasReLU_MatchesReference(int m, int k, int n)
+    {
+        var rng = RandomHelper.CreateSeededRandom(910);
+        var a = RandF(m * k, rng);
+        var b = RandF(k * n, rng);
+        var bias = RandF(n, rng);
+        var got = new float[m * n];
+        var want = new float[m * n];
+
+        Reference(a, b, want, m, k, n);
+        for (int i = 0; i < m; i++)
+            for (int j = 0; j < n; j++)
+                want[i * n + j] = Math.Max(0f, want[i * n + j] + bias[j]);
+
+        var opts = new AiDotNet.Tensors.Engines.BlasManaged.BlasOptions<float>
+        {
+            Epilogue = new AiDotNet.Tensors.Engines.BlasManaged.Epilogue<float>
+            {
+                BiasN = bias,
+                Activation = AiDotNet.Tensors.Engines.FusedActivationType.ReLU,
+            },
+        };
+        AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.Gemm<float>(
+            a, k, false, b, n, false, got, n, m, n, k, opts);
+
+        Assert.True(RelErr(got, want) < 1e-3, $"thin-M bias+ReLU epilogue at {m}x{k}x{n}.");
+    }
+
     [Fact]
     [Trait("Category", "Perf")]
     public unsafe void Gemm_ThinM_NowBeatsMachineCodePath()
