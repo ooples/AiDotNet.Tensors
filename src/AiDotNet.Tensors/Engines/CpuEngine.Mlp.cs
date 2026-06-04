@@ -206,20 +206,21 @@ public partial class CpuEngine
                         }
                         else if (preferManaged)
                         {
-                            // Managed cached-B keys its pre-pack on the weight ARRAY IDENTITY,
-                            // so it must see the SAME float[] on every call. GetDataArray()
-                            // returns a fresh snapshot for GPU-tagged tensors, which both
-                            // defeated the identity-keyed pack cache (a silent re-pack every
-                            // call) and reintroduced the per-call weight copy this PR removes.
-                            // GetFlattenedData() returns the STABLE backing array for the
-                            // standard weight layout (contiguous, zero-offset, exact-fit —
-                            // the same memory AsSpan() reads), preserving identity across
-                            // calls; exotic layouts still get a correct flat copy, merely
-                            // without cross-call pack reuse. (wT/wSpan are hoisted above; the
-                            // AsSpan() there already materialized any lazy data.)
-                            float[] wArr = wT.GetFlattenedData();
-                            Simd.SimdGemm.SgemmWithCachedB(
-                                srcSpan.Slice(0, M * curK), wArr, dst.AsSpan(0, M * n), M, curK, n);
+                            // #475: at these small managed shapes (curK*n <= 200K) the direct
+                            // serial AVX2 microkernel beats the BlasManaged cached-B dispatch.
+                            // For small K/N the pack overhead isn't amortized across the M-loop,
+                            // so the packing machinery costs more than it saves — measured on a
+                            // Ryzen 9 3950X (min-of-2000, B-pack already warm): the AIsEval
+                            // layers L1 128x512x128 +12% (86→97 GF/s) and L2 128x128x10 +81%
+                            // (15.6→28.2 GF/s). Same finding as the LSTM routing fix (#503).
+                            // These shapes are far below the parallel threshold (20M), so the
+                            // dispatch path runs serial anyway — SgemmSequential loses no
+                            // parallelism, is concurrency-safe (no shared pack-cache state),
+                            // and reads wSpan directly (no GetFlattenedData() float[] copy, no
+                            // pack-cache identity concerns). (wT/wSpan hoisted above.)
+                            Simd.SimdGemm.SgemmSequential(
+                                srcSpan.Slice(0, M * curK), wSpan.Slice(0, curK * n),
+                                dst.AsSpan(0, M * n), M, curK, n);
                         }
                         else
                         {
