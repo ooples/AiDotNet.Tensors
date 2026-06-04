@@ -98,6 +98,123 @@ internal static partial class SimdGemm
     // Intended for benchmark A/B iteration, not production config.
     internal static bool UseParallelGemm = true;
 
+    // Opt-in (AIDOTNET_ONEDNN_GEMM=1): route large no-transpose float GEMMs through
+    // oneDNN's JIT'd dnnl_sgemm (shape-specialized brgemm, 5-8× the managed kernel
+    // on small-K/N). Default OFF — managed kernel keeps the supply-chain-independent
+    // path. See the head-to-head in OneDnnProvider.TrySgemm.
+    private static readonly bool _oneDnnGemm =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_ONEDNN_GEMM") == "1";
+
+    // Opt-in (AIDOTNET_JIT_GEMM=1): route large no-transpose float GEMMs through
+    // the runtime-JIT'd AVX2 kernel (JitGemmAvx2) — 600-700 GFLOP/s on small-K/N,
+    // beats both the managed kernel and oneDNN, on our own pool. Default OFF.
+    private static readonly bool _jitGemm =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_JIT_GEMM") == "1";
+
+    // Route large no-transpose float GEMMs through native OpenBLAS (cblas_sgemm).
+    // A per-shape bake-off on the AIsEval losing shapes (LosingShapeGemmBench)
+    // showed OpenBLAS at 2-3x the managed RyuJIT-compiled kernel on exactly the
+    // GEMM-bound losers — mlp L1 [.,784,512] 199 vs 66 GF/s, transformer FFN/QKV
+    // [1024,64,*] 226-280 vs 93-121 — while managed still wins the small/thin
+    // shapes (LSTM recurrence K=64, tiny-batch transformer). RyuJIT's codegen is
+    // the gap; OpenBLAS (hand-written asm) is the proven workaround, already loaded.
+    // Default ON when OpenBLAS is present; gated to large work (>= OpenBlasMinWork)
+    // and the top-level no-transpose contiguous path only — SgemmSequential (used
+    // inside PPE regions: SDPA, batch-parallel LSTM) never routes here, so no
+    // OpenBLAS-threads x our-pool oversubscription. Set AIDOTNET_OPENBLAS_GEMM=0
+    // to force the managed kernel for A/B.
+    private static readonly bool _openBlasGemm =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_OPENBLAS_GEMM") != "0";
+
+    // Crossover from the bake-off: below ~4M MACs the managed kernel wins (native
+    // call + thread-fan-out overhead dominates the tiny compute); above it OpenBLAS
+    // pulls ahead and widens. Env-tunable.
+    internal static readonly long OpenBlasMinWork =
+        long.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_OPENBLAS_MINWORK"), out var obw) && obw > 0
+            ? obw : 4_000_000;
+
+    // Minimum contraction depth K to route to OpenBLAS-on-PPE. The bake-off shows
+    // OpenBLAS winning the isolated GEMM at all K, but END-TO-END it only wins for
+    // LARGE K (the MLP's 512/784, where B-packing + K-blocking dominate): there it
+    // flipped mlp bs=32 from 1.87x to 0.94x. At small K (=64: transformer FFN/QKV,
+    // LSTM recurrence) the managed kernel on our hot PPE wins end-to-end — the many
+    // per-GEMM OpenBLAS entries in a multi-op model (transformer: ~15 GEMMs/predict)
+    // cost more than the kernel saves. K is the clean discriminator: MLP K>=512,
+    // transformer/LSTM K=64. Env-tunable.
+    internal static readonly int OpenBlasMinK =
+        int.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_OPENBLAS_MINK"), out var obk) && obk > 0
+            ? obk : 256;
+
+    // Small-K asm panel kernel (JitGemmAvx2 6xN). Measured to beat BOTH the managed
+    // RyuJIT kernel AND OpenBLAS at small contraction depth with enough row-blocks to
+    // parallelize: transformer FFN [1024,64,128] 285 vs 111(mgd)/164(blas) GF/s, QKV
+    // [1024,64,192] 260 vs 93/200. At small K the 6-row A panel stays L1-resident, so
+    // streaming B across all column-blocks in one call (no per-tile transition) is a
+    // pure win. Default ON when the kernel is available; AIDOTNET_JIT_SMALLK=0 disables.
+    // Gated to: K <= JitSmallKMaxK (above it A[6,K] spills L1 and OpenBLAS/managed win),
+    // work >= JitSmallKMinWork (below it the serial path loses — needs parallel row-blocks),
+    // and the no-transpose contiguous top-level path.
+    private static readonly bool _jitSmallK =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_JIT_SMALLK") != "0";
+    internal static readonly int JitSmallKMaxK =
+        int.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_JIT_SMALLK_MAXK"), out var jk) && jk > 0
+            ? jk : 128;
+    internal static readonly long JitSmallKMinWork =
+        long.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_JIT_SMALLK_MINWORK"), out var jw) && jw > 0
+            ? jw : 4_000_000;
+
+    // Work CEILING for the panel route. The 6xN panel re-reads the whole B panel
+    // once per 6-row block (it is unpacked by design); B traffic = (M/6)*K*N*4 bytes.
+    // At the proven shapes (M~1024: 4-13M MACs, ~5MB B traffic) that is fine and the
+    // panel wins 227-234 GF/s. At giant-M (transformer bs=128: M=4096, 33-50M MACs,
+    // 22-33MB B re-reads per GEMM) it saturates memory bandwidth and an interleaved
+    // end-to-end A/B showed a 16% regression — those shapes fall through to the
+    // managed kernel, whose packed/blocked path handles large M. Env-tunable.
+    internal static readonly long JitSmallKMaxWork =
+        long.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_JIT_SMALLK_MAXWORK"), out var jmw) && jmw > 0
+            ? jmw : 16_000_000;
+
+    // Row ceiling for the panel route. B-reread traffic scales with the row-block
+    // count (M/6), so giant-M shapes (transformer bs=128: M=4096, 682 row-blocks)
+    // regressed in interleaved A/Bs with ANY giant-M shape routed (FFN, QKV, or just
+    // the input projection) while the proven M~1024 regime kept a 22-24% end-to-end
+    // win. Cap M so the route engages exactly where the bake-off + end-to-end A/Bs
+    // validated it; larger M falls through to the managed packed/blocked kernel.
+    internal static readonly int JitSmallKMaxM =
+        int.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_JIT_SMALLK_MAXM"), out var jmm) && jmm > 0
+            ? jmm : 2048;
+
+    // ─── Stale-weight invalidation epoch ────────────────────────────────────
+    // The identity-keyed weight caches (pre-packed B below on net5+, the
+    // Conv2D kernel-transpose cache in CpuEngine) never re-read the weight
+    // array's contents. In-place weight mutation (optimizer steps,
+    // SetParameters/WithParameters-style bulk loads) therefore left the
+    // derived copy STALE: inference after a weight update silently used the
+    // old weights (caught by AiDotNet's Issue1296 grad-accum equivalence
+    // probe — two models with bit-identical parameters produced different
+    // forwards because one had a pack from its pre-load random init).
+    //
+    // Invalidation is a single global epoch counter rather than per-array
+    // removal because the thread-static MRU slots (_threadPrePackedBKey0/1)
+    // live on OTHER threads and cannot be cleared from the invalidating
+    // thread — an epoch comparison on every hit path covers them all. Cost
+    // per lookup is one Interlocked read; cost per invalidation is a full
+    // repack of every live weight on next use, which is inherent (the
+    // weights changed). Exposed publicly via Engines.InferenceWeightCache.
+    // Lives OUTSIDE the NET5_0_OR_GREATER region: the kernel-transpose cache
+    // consumes the epoch on every target framework.
+    private static long _weightCacheEpoch;
+
+    internal static long WeightCacheEpoch => System.Threading.Interlocked.Read(ref _weightCacheEpoch);
+
+    /// <summary>
+    /// Invalidate every cached derived weight (pre-packed float/int8 B,
+    /// transposed conv kernels). Must be called after mutating a weight
+    /// array in place that may have been consumed by a weight-cached fast
+    /// path; the next call re-derives from the live array contents.
+    /// </summary>
+    internal static void InvalidateCachedWeights() => System.Threading.Interlocked.Increment(ref _weightCacheEpoch);
+
 #if NET5_0_OR_GREATER
     // ─── Path A: pre-packed B cache ────────────────────────────────────────
     //
@@ -124,6 +241,9 @@ internal static partial class SimdGemm
         // Flat index: pcIter * NumColSubBlocks + csIdx.
         internal float[][] PackedSubs = System.Array.Empty<float[]>();
         internal int NumPcIters;
+        // WeightCacheEpoch value at build time. A hit is only valid while
+        // this matches the current global epoch — see _weightCacheEpoch.
+        internal long Epoch;
     }
 
     private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<float[], PrePackedB> _prePackedBCache = new();
@@ -192,6 +312,7 @@ internal static partial class SimdGemm
             ColSubSize = colSubSize,
             PackedSubs = packedSubs,
             NumPcIters = numPcIters,
+            Epoch = WeightCacheEpoch,
         };
     }
 
@@ -213,6 +334,31 @@ internal static partial class SimdGemm
         System.Span<float> c,
         int m, int k, int n)
     {
+#if !NET471
+        // Our JIT'd AVX2 kernel first (opt-in). This is the entry the MLP's
+        // MlpForward path and FusedLinear's tier-3 fallback use — without this
+        // hook the JIT (376-700 GFLOP/s) never reached the MLP, which is why a
+        // pure-GEMM MLP didn't translate the GFLOP/s win. Row-major contiguous.
+        if (_jitGemm && JitGemmAvx2.TryMultiply(a, b.AsSpan(0, k * n), c, m, n, k))
+            return;
+
+        // Small-K asm panel kernel (default on; AIDOTNET_JIT_SMALLK=0 disables).
+        // This entry is how FusedLinear routes the transformer FFN GEMMs
+        // ([B*seq,64]@[64,128]: K·N=8K <= 200K prefers cached-B) — without this
+        // hook the panel kernel never reached the FFN, only the MHA projections
+        // (which call Sgemm directly). Same gates as the Sgemm route: the 4-way
+        // bake-off shows the panel-parallel at 227-234 GF/s vs ~100 for managed
+        // (serial OR parallel) and 135-165 for OpenBLAS at these shapes, while
+        // below the work gate (e.g. bs=8's 2.1M) the cached-B/managed path wins.
+        if (_jitSmallK && JitGemmAvx2.Available
+            && k <= JitSmallKMaxK && m >= 6 && m <= JitSmallKMaxM && n >= 16
+            && (long)m * n * k >= JitSmallKMinWork && (long)m * n * k <= JitSmallKMaxWork)
+        {
+            JitGemmAvx2.RunJit(a, b.AsSpan(0, k * n), c, m, n, k);
+            return;
+        }
+#endif
+
         // Cache-eligibility gate: if n > Nc, the outer loop iterates jc multiple
         // times and our single-jc assumption breaks. Also skip if AVX-512 path is
         // eligible (the specialised kernel's layout differs).
@@ -263,9 +409,11 @@ internal static partial class SimdGemm
         if (TryGetThreadPrePackedB(b, k, n, expectedMc, out var threadCached) && threadCached is not null)
             return threadCached;
 
+        long epoch = WeightCacheEpoch;
         if (_prePackedBCache.TryGetValue(b, out var existing)
             && existing.K == k && existing.N == n
-            && existing.Mc == expectedMc)
+            && existing.Mc == expectedMc
+            && existing.Epoch == epoch)
         {
             RememberThreadPrePackedB(b, existing);
             return existing;
@@ -276,7 +424,8 @@ internal static partial class SimdGemm
             if (_prePackedBCache.TryGetValue(b, out existing))
             {
                 if (existing.K == k && existing.N == n
-                    && existing.Mc == expectedMc)
+                    && existing.Mc == expectedMc
+                    && existing.Epoch == epoch)
                 {
                     RememberThreadPrePackedB(b, existing);
                     return existing;
@@ -320,6 +469,7 @@ internal static partial class SimdGemm
         if (valueRef is not null
             && valueRef.TryGetTarget(out var value)
             && value.K == k && value.N == n && value.Mc == expectedMc
+            && value.Epoch == WeightCacheEpoch
             && keyRef is not null
             && keyRef.TryGetTarget(out var key)
             && ReferenceEquals(key, b))
@@ -387,6 +537,8 @@ internal static partial class SimdGemm
         internal sbyte[][] PackedSubs = System.Array.Empty<sbyte[]>();
         internal int NumPcIters;
         internal float Scale;
+        // WeightCacheEpoch value at build time — see _weightCacheEpoch.
+        internal long Epoch;
     }
 
     private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<float[], Int8PrePackedB> _int8PrePackedBCache = new();
@@ -453,6 +605,7 @@ internal static partial class SimdGemm
             PackedSubs = packedSubs,
             NumPcIters = numPcIters,
             Scale = scale,
+            Epoch = WeightCacheEpoch,
         };
     }
 
@@ -490,9 +643,11 @@ internal static partial class SimdGemm
 
     private static Int8PrePackedB GetOrBuildInt8PrePackedB(float[] b, int k, int n, int m, int expectedMc)
     {
+        long epoch = WeightCacheEpoch;
         if (_int8PrePackedBCache.TryGetValue(b, out var existing)
             && existing.K == k && existing.N == n
-            && existing.Mc == expectedMc)
+            && existing.Mc == expectedMc
+            && existing.Epoch == epoch)
         {
             return existing;
         }
@@ -502,7 +657,8 @@ internal static partial class SimdGemm
             if (_int8PrePackedBCache.TryGetValue(b, out existing))
             {
                 if (existing.K == k && existing.N == n
-                    && existing.Mc == expectedMc)
+                    && existing.Mc == expectedMc
+                    && existing.Epoch == epoch)
                 {
                     return existing;
                 }
@@ -861,7 +1017,9 @@ internal static partial class SimdGemm
     /// <c>BackwardFunctions</c>) can mirror the gate exactly instead of
     /// hardcoding a duplicate value that drifts when this changes.
     /// </summary>
-    internal static readonly long ParallelWorkThreshold = ComputeParallelWorkThreshold();
+    internal static readonly long ParallelWorkThreshold =
+        long.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_GEMM_PARALLEL_MINWORK"), out var gpw) && gpw > 0
+            ? gpw : ComputeParallelWorkThreshold();
 
     private static long ComputeParallelWorkThreshold()
     {
@@ -970,8 +1128,104 @@ internal static partial class SimdGemm
         Span<float> c,
         int m, int k, int n)
     {
+#if !NET471
+        // Our JIT'd AVX2 kernel first (opt-in): no transpose, row-major contiguous
+        // (lda==k, ldb==n). Beats managed + oneDNN on small-K/N, on our own pool.
+        if (_jitGemm && !transA && !transB && lda == k && ldb == n
+            && JitGemmAvx2.TryMultiply(a, b, c, m, n, k))
+            return;
+
+        // oneDNN JIT'd GEMM (opt-in). Catches the fused-MHA QKV + output-projection
+        // GEMMs (no transpose, row-major contiguous: lda==k, ldb==n) where oneDNN's
+        // brgemm is 5-8× the managed kernel. Size-gated; the tiny per-head SDPA uses
+        // SgemmSequential (separate entry) so it stays on the managed path.
+        if (_oneDnnGemm && !transA && !transB && lda == k && ldb == n
+            && (long)m * k * n >= 262_144)
+        {
+            unsafe
+            {
+                fixed (float* pa = a, pb = b, pc = c)
+                {
+                    if (Helpers.OneDnnProvider.TrySgemm(pa, pb, pc, m, k, n))
+                        return;
+                }
+            }
+        }
+
+        // Small-K asm panel kernel (default on): beats managed AND OpenBLAS at K<=128
+        // with enough row-blocks to parallelize (the transformer's FFN/QKV GEMMs).
+        // 285/260 GF/s vs 111/93 managed on FFN/QKV b32. The 6-row A panel stays
+        // L1-resident at small K, so the 6xN kernel streams B once with no per-tile
+        // managed->native transition.
+        if (_jitSmallK && JitGemmAvx2.Available && !transA && !transB && lda == k && ldb == n
+            && k <= JitSmallKMaxK && m >= 6 && m <= JitSmallKMaxM && n >= 16
+            && (long)m * n * k >= JitSmallKMinWork && (long)m * n * k <= JitSmallKMaxWork)
+        {
+            JitGemmAvx2.RunJit(a, b, c, m, n, k);
+            return;
+        }
+#endif
+        // Native OpenBLAS kernel on OUR pool for large no-transpose contiguous GEMMs.
+        // The bake-off showed OpenBLAS's microkernel at 2-3x the managed RyuJIT kernel,
+        // but routing whole calls to OpenBLAS regressed end-to-end: OpenBLAS spins its
+        // own ~N-thread pool PER CALL, and a many-GEMM model (transformer) pays that
+        // thread-sync floor on every op. The fix: pin OpenBLAS to ONE thread and supply
+        // the parallelism ourselves over the PersistentParallelExecutor (hot, spin-based,
+        // ~zero wakeup) by splitting the M rows into chunks — each chunk a single-thread
+        // OpenBLAS call. We get OpenBLAS's kernel quality with our cheap dispatch.
+        // Top-level only (SgemmSequential, used inside PPE regions, never reaches here).
+        if (_openBlasGemm && !transA && !transB && lda == k && ldb == n
+            && k >= OpenBlasMinK && (long)m * k * n >= OpenBlasMinWork && Helpers.BlasProvider.HasRawSgemm)
+        {
+            RunOpenBlasParallel(a, b, c, m, k, n);
+            return;
+        }
+
         c.Clear();
         SgemmAddInternal(a, lda, transA, b, ldb, transB, c, m, k, n, allowParallel: true, clearedOutput: true);
+    }
+
+    // Set to 1 once OpenBLAS is pinned single-thread (we own the parallelism).
+    private static int _openBlasThreadsPinned;
+
+    /// <summary>
+    /// C[m,n] = A[m,k]·B[k,n] (row-major, no-trans) using OpenBLAS's single-thread
+    /// microkernel, parallelized over M-row chunks on the PersistentParallelExecutor.
+    /// Captures OpenBLAS's kernel quality (2-3x the managed RyuJIT kernel at the MLP/
+    /// transformer shapes) without OpenBLAS's per-call thread-pool spin-up — the
+    /// reason whole-call native routing regressed the many-GEMM transformer.
+    /// </summary>
+    private static unsafe void RunOpenBlasParallel(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c, int m, int k, int n)
+    {
+        // Pin OpenBLAS to a single thread once — its internal threading is what we're
+        // replacing with our own pool.
+        if (System.Threading.Interlocked.CompareExchange(ref _openBlasThreadsPinned, 1, 0) == 0)
+            Helpers.BlasProvider.TrySetOpenBlasThreads(1);
+
+        int maxT = Helpers.CpuParallelSettings.MaxDegreeOfParallelism;
+        // One chunk per worker, but keep >= 8 rows/chunk so each single-thread call
+        // amortizes its own (small) entry cost.
+        int chunks = Math.Max(1, Math.Min(maxT, m / 8));
+
+        fixed (float* pa = a, pb = b, pc = c)
+        {
+            if (chunks <= 1)
+            {
+                Helpers.BlasProvider.SgemmRaw(m, n, k, pa, k, pb, n, pc, n);
+                return;
+            }
+            nint A = (nint)pa, B = (nint)pb, C = (nint)pc;
+            int kk = k, nn = n, mm = m, per = (m + chunks - 1) / chunks;
+            Helpers.PersistentParallelExecutor.Instance.Execute(chunks, chunk =>
+            {
+                int r0 = chunk * per;
+                if (r0 >= mm) return;
+                int rows = System.Math.Min(per, mm - r0);
+                float* aP = (float*)A + (long)r0 * kk;
+                float* cP = (float*)C + (long)r0 * nn;
+                Helpers.BlasProvider.SgemmRaw(rows, nn, kk, aP, kk, (float*)B, nn, cP, nn);
+            });
+        }
     }
 
     /// <summary>

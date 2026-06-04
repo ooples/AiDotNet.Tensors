@@ -62,6 +62,23 @@ public sealed class WeightPackHandle : IDisposable
     internal int NumPcBlocks;
     internal int MultiPanelStride;  // bytes per tile in PackedBuffer
 
+    /// <summary>
+    /// The microkernel row tile (Mr, for A-handles) / column tile (Nr, for
+    /// B-handles) the buffer was PACKED with. Avx2Pack interleaves the panel in
+    /// mr-row (nr-column) stripes, so a consumer running a DIFFERENT microkernel
+    /// tile would read the stripes at the wrong stride and produce garbage.
+    /// Consume sites must verify this matches their active tile and fall back to
+    /// live packing otherwise. The mismatch is real, not theoretical: the Gemm
+    /// dispatcher's too-small-shape fallback drops (mr, nr) to the scalar (4, 4)
+    /// tile whenever m &lt; mr or n &lt; nr — so on an AVX-512 machine (prepack
+    /// tile 8x16/16x16) an 8x8 GEMM consumed a 8/16-stride pack with a 4-stride
+    /// reader (CI: ScalarKernelTests + PrePackedB_Output_BitMatches_LivePack
+    /// failing with deterministic wrong values on AVX-512 runners only).
+    /// 0 = unset (legacy/unknown) — consumers must treat as a mismatch.
+    /// </summary>
+    internal int PackMr;
+    internal int PackNr;
+
     internal WeightPackHandle(
         byte[] packedBuffer,
         (int Mc, int Kc, bool TransA, PackingMode Mode, Type ElemType) key,

@@ -128,4 +128,39 @@ public class SyrkTests
             for (int j = 0; j <= i; j++)
                 Assert.Equal(expectedFull[i * n + j], actual[i * n + j], 8);
     }
+
+    // #379: the typed-fast-path rework recomputed the blocked tile-write's triangle
+    // bounds per row; this pins the UPPER blocked path (n>64) for both trans and both
+    // element types — the combination the existing blocked test (Lower only) didn't cover.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Syrk_LargeN_BlockedPath_Upper_MatchesReference(bool trans)
+    {
+        const int n = 150, k = 40; // n > SyrkBlock(64)
+        var rng = new Random(7777);
+        int aRows = trans ? k : n, aCols = trans ? n : k, lda = aCols;
+        double[] a = new double[aRows * aCols];
+        for (int i = 0; i < a.Length; i++) a[i] = rng.NextDouble() * 2 - 1;
+        double[] c = new double[n * n];
+        for (int i = 0; i < c.Length; i++) c[i] = rng.NextDouble() * 2 - 1;
+
+        double alpha = -1.3, beta = 0.7;
+        double[] expectedFull = ReferenceSyrk(trans, n, k, alpha, a, lda, beta, c, n);
+
+        // FP64 typed path.
+        double[] actualD = (double[])c.Clone();
+        BlasManagedLib.Syrk<double>(Uplo.Upper, trans, n, k, alpha, a, lda, beta, actualD, n);
+        // FP32 typed path (same inputs, looser tolerance).
+        float[] aF = Array.ConvertAll(a, x => (float)x);
+        float[] cF = Array.ConvertAll(c, x => (float)x);
+        BlasManagedLib.Syrk<float>(Uplo.Upper, trans, n, k, (float)alpha, aF, lda, (float)beta, cF, n);
+
+        for (int i = 0; i < n; i++)
+            for (int j = i; j < n; j++) // upper triangle
+            {
+                Assert.Equal(expectedFull[i * n + j], actualD[i * n + j], 8);
+                Assert.Equal((float)expectedFull[i * n + j], cF[i * n + j], 2);
+            }
+    }
 }

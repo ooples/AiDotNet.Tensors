@@ -2404,7 +2404,17 @@ public class ScalarKernelTests
         // cache. We verify this by mutating `a` WITHOUT calling MarkDirty: the
         // Gemm result must match the ORIGINAL weight (the one captured in PrePackA),
         // not the mutated one.
-        int m = 8, n = 8, k = 8;
+        //
+        // Shape note: m and n must be >= the WIDEST microkernel tile any CPU
+        // selects (AVX-512 fp64 prepack tile is 8x16), or the dispatcher's
+        // too-small-shape fallback drops to the scalar (4,4) tile, the
+        // PackMr stripe-interleave gate correctly REJECTS the 8-striped
+        // prepack, and the live-pack fallback reads the CURRENT (mutated)
+        // source — flipping this test's expected value on AVX-512 runners
+        // only (the original 8x8x8 shape did exactly that on CI). 16x16
+        // guarantees the prepack is consumable on every tile config, which
+        // is the precondition for the stale-cache semantics asserted here.
+        int m = 16, n = 16, k = 8;
         var (a, b) = GenerateRandomMatrices(m, n, k, transA: false, transB: false, seed: 42);
         double[] aOriginal = (double[])a.Clone();
 

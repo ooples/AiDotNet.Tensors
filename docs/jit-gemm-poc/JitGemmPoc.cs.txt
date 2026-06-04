@@ -1,0 +1,316 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
+
+// Phase 1: a COMPUTE-BOUND 6×16 register-blocked AVX2 microkernel emitted as raw
+// machine code — the regime where RyuJIT spills at 12-accumulator pressure and a
+// hand-emitter with explicit register allocation wins.
+//   C[6,16] = sum_k packedA[k,0..5] · packedB[k,0..15]
+// packedA [K,6] k-major (24 B/k), packedB [K,16] k-major (64 B/k), C [6,16] row-major.
+// Registers: ymm0..11 = 12 accumulators (6 rows × 2 cols), ymm12/13 = B halves,
+// ymm14 = A broadcast. Windows x64: XMM6..15 low-128 are non-volatile → save/restore.
+// Args (Win64): RCX=packedA, RDX=packedB, R8=C, R9=K.
+
+[DllImport("kernel32.dll", SetLastError = true)]
+static extern IntPtr VirtualAlloc(IntPtr a, UIntPtr s, uint t, uint p);
+[DllImport("kernel32.dll", SetLastError = true)]
+static extern bool VirtualProtect(IntPtr a, UIntPtr s, uint np, out uint op);
+const uint MEM_COMMIT = 0x1000, MEM_RESERVE = 0x2000, PAGE_RW = 0x04, PAGE_EXEC_R = 0x20;
+
+var code = new List<byte>();
+void Bytes(params byte[] bs) => code.AddRange(bs);
+
+// ---- general AVX2 VEX encoder (registers 0..15) ----
+// 3-byte VEX reg-reg (modrm mod=11): opcode ymmReg, ymmVvvv, ymmRm  (map mm, prefix pp, W)
+void Vrr(int mm, int pp, int w, byte op, int reg, int vvvv, int rm)
+{
+    byte b2 = (byte)(((reg < 8 ? 1 : 0) << 7) | (1 << 6) | ((rm < 8 ? 1 : 0) << 5) | mm);
+    byte b3 = (byte)((w << 7) | (((~vvvv) & 0xF) << 3) | (1 << 2) | pp);
+    Bytes(0xC4, b2, b3, op, (byte)(0xC0 | ((reg & 7) << 3) | (rm & 7)));
+}
+// 3-byte VEX reg-mem: opcode ymmReg, [baseGp + disp]   (vvvv unused = 1111)
+void EmitMem(int reg, int baseGp, int disp)
+{
+    int rm = baseGp & 7;
+    bool rsp = rm == 4; // rsp/r12 need SIB
+    int mod = disp == 0 ? 0 : (disp >= -128 && disp <= 127 ? 1 : 2); // 0=none,1=disp8,2=disp32
+    Bytes((byte)((mod << 6) | ((reg & 7) << 3) | rm));
+    if (rsp) Bytes(0x24); // SIB: base=rsp, no index, scale 1
+    if (mod == 1) Bytes((byte)(sbyte)disp);
+    else if (mod == 2) Bytes((byte)disp, (byte)(disp >> 8), (byte)(disp >> 16), (byte)(disp >> 24));
+}
+void Vrm(int mm, int pp, int w, byte op, int reg, int baseGp, int disp)
+{
+    byte b2 = (byte)(((reg < 8 ? 1 : 0) << 7) | (1 << 6) | ((baseGp < 8 ? 1 : 0) << 5) | mm);
+    byte b3 = (byte)((w << 7) | (0xF << 3) | (1 << 2) | pp);
+    Bytes(0xC4, b2, b3, op);
+    EmitMem(reg, baseGp, disp);
+}
+// 128-bit vmovups variants for xmm save/restore (L=0)
+void Vrm128(byte op, int reg, int baseGp, int disp) // op 0x10=load,0x11=store
+{
+    byte b2 = (byte)(((reg < 8 ? 1 : 0) << 7) | (1 << 6) | ((baseGp < 8 ? 1 : 0) << 5) | 0x01); // map 0F
+    byte b3 = (byte)((0 << 7) | (0xF << 3) | (0 << 2) | 0); // W0,vvvv=1111,L=0,pp=00
+    Bytes(0xC4, b2, b3, op);
+    EmitMem(reg, baseGp, disp);
+}
+void VXor(int d) => Vrr(1, 0, 0, 0x57, d, d, d);                 // vxorps ymmd,ymmd,ymmd (zero)
+void VLoad(int d, int baseGp, int disp) => Vrm(1, 0, 0, 0x10, d, baseGp, disp);   // vmovups ymmd,[base+disp]
+void VStore(int s, int baseGp, int disp) => Vrm(1, 0, 0, 0x11, s, baseGp, disp);  // vmovups [base+disp],ymms
+void VBcast(int d, int baseGp, int disp) => Vrm(2, 1, 0, 0x18, d, baseGp, disp);  // vbroadcastss ymmd,[base+disp] (66.0F38.W0)
+void VFma(int acc, int s1, int s2) => Vrr(2, 1, 0, 0xB8, acc, s1, s2);            // vfmadd231ps acc += s1*s2 (66.0F38.W0)
+void AddR(int gp, byte imm) => Bytes((byte)(gp < 8 ? 0x48 : 0x49), 0x83, (byte)(0xC0 | (gp & 7)), imm); // add r64,imm8
+void SubRsp(int imm) => Bytes(0x48, 0x81, 0xEC, (byte)imm, (byte)(imm >> 8), (byte)(imm >> 16), (byte)(imm >> 24));
+void AddRsp(int imm) => Bytes(0x48, 0x81, 0xC4, (byte)imm, (byte)(imm >> 8), (byte)(imm >> 16), (byte)(imm >> 24));
+void MovR10Stack(byte disp) => Bytes(0x4C, 0x8B, 0x54, 0x24, disp); // mov r10, [rsp+disp8]
+void ShlR10(byte imm) => Bytes(0x49, 0xC1, 0xE2, imm);             // shl r10, imm8
+void AddR8R10() => Bytes(0x4D, 0x01, 0xD0);                        // add r8, r10
+const int RCX = 1, RDX = 2, RSP = 4, R8 = 8, R9 = 9;
+
+// ---- load ldc (5th arg, [rsp+0x28] at entry) into r10, ×4 for byte stride ----
+MovR10Stack(0x28);
+ShlR10(2);
+
+// ---- prologue: save xmm6..15 (non-volatile low-128) ----
+SubRsp(160);
+for (int x = 6; x <= 15; x++) Vrm128(0x11, x, RSP, (x - 6) * 16);  // movups [rsp+..], xmm_x
+
+// ---- zero 12 accumulators ----
+for (int d = 0; d < 12; d++) VXor(d);
+
+// ---- K loop ----
+int loopStart = code.Count;
+VLoad(12, RDX, 0);    // B[k,0:8]
+VLoad(13, RDX, 32);   // B[k,8:16]
+for (int r = 0; r < 6; r++)
+{
+    VBcast(14, RCX, r * 4);        // A[k,r]
+    VFma(r * 2, 14, 12);           // acc(row r, cols0-7)  += A * B0
+    VFma(r * 2 + 1, 14, 13);       // acc(row r, cols8-15) += A * B1
+}
+AddR(RDX, 64);
+AddR(RCX, 24);
+Bytes((byte)(0x49), 0xFF, 0xC9);   // dec r9
+int afterDec = code.Count;
+Bytes(0x75, (byte)(sbyte)(loopStart - (afterDec + 2)));  // jnz loopStart
+
+// ---- store C[6,16] directly with row-stride ldc (r10 = ldc*4 bytes) ----
+for (int r = 0; r < 6; r++)
+{
+    VStore(r * 2, R8, 0);          // C[row, 0:8]
+    VStore(r * 2 + 1, R8, 32);     // C[row, 8:16]
+    if (r < 5) AddR8R10();         // advance C to next row
+}
+
+// ---- epilogue: restore xmm6..15, ret ----
+for (int x = 6; x <= 15; x++) Vrm128(0x10, x, RSP, (x - 6) * 16);
+AddRsp(160);
+Bytes(0xC5, 0xF8, 0x77);  // vzeroupper
+Bytes(0xC3);              // ret
+
+byte[] mc = code.ToArray();
+Console.WriteLine($"emitted {mc.Length} bytes (6x16 microkernel)");
+
+IntPtr mem = VirtualAlloc(IntPtr.Zero, (UIntPtr)mc.Length, MEM_COMMIT | MEM_RESERVE, PAGE_RW);
+Marshal.Copy(mc, 0, mem, mc.Length);
+VirtualProtect(mem, (UIntPtr)mc.Length, PAGE_EXEC_R, out _);
+
+unsafe
+{
+    var kernel = (delegate* unmanaged[Cdecl]<float*, float*, float*, long, long, void>)mem;
+    int K = 256; // packedB [256,16]=16KB fits L1 -> compute-bound
+    var pa = new float[K * 6]; var pb = new float[K * 16]; var C = new float[6 * 16];
+    var rnd = new Random(1);
+    for (int i = 0; i < pa.Length; i++) pa[i] = (float)(rnd.NextDouble() - 0.5);
+    for (int i = 0; i < pb.Length; i++) pb[i] = (float)(rnd.NextDouble() - 0.5);
+
+    fixed (float* xa = pa, xb = pb, xc = C) kernel(xa, xb, xc, K, 16);
+    double maxErr = 0;
+    for (int r = 0; r < 6; r++) for (int c = 0; c < 16; c++)
+    {
+        double acc = 0; for (int k = 0; k < K; k++) acc += (double)pa[k * 6 + r] * pb[k * 16 + c];
+        maxErr = Math.Max(maxErr, Math.Abs(acc - C[r * 16 + c]));
+    }
+    Console.WriteLine($"[correctness] JIT 6x16 vs scalar maxErr = {maxErr:E3}  ({(maxErr < 1e-2 ? "PASS" : "FAIL")})");
+
+    double Flop = 6.0 * 16.0 * K * 2.0;
+    fixed (float* xa = pa, xb = pb, xc = C)
+    {
+        for (int i = 0; i < 20000; i++) kernel(xa, xb, xc, K, 16);
+        int reps = 1_000_000; var sw = Stopwatch.StartNew();
+        for (int i = 0; i < reps; i++) kernel(xa, xb, xc, K, 16);
+        sw.Stop();
+        Console.WriteLine($"[JIT 6x16]      {Flop * reps / sw.Elapsed.TotalSeconds / 1e9:F1} GFLOP/s single-core");
+    }
+    fixed (float* xa = pa, xb = pb, xc = C)
+    {
+        for (int i = 0; i < 20000; i++) Managed6x16(xa, xb, xc, K);
+        int reps = 1_000_000; var sw = Stopwatch.StartNew();
+        for (int i = 0; i < reps; i++) Managed6x16(xa, xb, xc, K);
+        sw.Stop();
+        Console.WriteLine($"[managed 6x16]  {Flop * reps / sw.Elapsed.TotalSeconds / 1e9:F1} GFLOP/s single-core (RyuJIT)");
+    }
+
+    // ---- multi-core scaling on a SINGLE pool (the thing oneDNN couldn't do) ----
+    // Tiled GEMM C[M,N]=A·B over numRB×numCB independent 6×16 tiles, each computed
+    // by the JIT kernel. We fan out tiles across T worker threads (one pool, no
+    // second runtime) and measure GFLOP/s vs T. Packed operands live in native
+    // memory so pointers are stable across threads.
+    int M = 1536, N = 512;                  // 256 row-blocks × 32 col-blocks = 8192 tiles
+    int numRB = M / 6, numCB = N / 16;
+    int totalTiles = numRB * numCB;
+    nuint paBytes = (nuint)((long)numRB * K * 6 * sizeof(float));
+    nuint pbBytes = (nuint)((long)numCB * K * 16 * sizeof(float));
+    float* PA = (float*)NativeMemory.AlignedAlloc(paBytes, 32);
+    float* PB = (float*)NativeMemory.AlignedAlloc(pbBytes, 32);
+    var rnd2 = new Random(7);
+    for (long i = 0; i < (long)numRB * K * 6; i++) PA[i] = (float)(rnd2.NextDouble() - 0.5);
+    for (long i = 0; i < (long)numCB * K * 16; i++) PB[i] = (float)(rnd2.NextDouble() - 0.5);
+
+    nint memN = mem, paN = (nint)PA, pbN = (nint)PB;
+    int Kc = K, numCBc = numCB, repsPass = 200;
+    double passFlop = (double)M * N * K * 2.0;
+    double single = 0;
+    Console.WriteLine("--- multi-core scaling (JIT 6x16 tiles, one thread pool) ---");
+    foreach (int T in new[] { 1, 2, 4, 8, 16 })
+    {
+        // warm
+        RunTiled(T);
+        var sw = Stopwatch.StartNew();
+        RunTiled(T);
+        sw.Stop();
+        double g = passFlop * repsPass / sw.Elapsed.TotalSeconds / 1e9;
+        if (T == 1) single = g;
+        Console.WriteLine($"  threads={T,2}  {g,7:F0} GFLOP/s   scaling={g / single:F2}x");
+
+        void RunTiled(int threads)
+        {
+            var ths = new System.Threading.Thread[threads];
+            int per = (totalTiles + threads - 1) / threads;
+            for (int t = 0; t < threads; t++)
+            {
+                int lo = t * per, hi = Math.Min(lo + per, totalTiles);
+                ths[t] = new System.Threading.Thread(() =>
+                {
+                    unsafe
+                    {
+                        var kf = (delegate* unmanaged[Cdecl]<float*, float*, float*, long, long, void>)memN;
+                        float* pa2 = (float*)paN, pb2 = (float*)pbN;
+                        float* tile = stackalloc float[96];
+                        for (int rep = 0; rep < repsPass; rep++)
+                            for (int ti = lo; ti < hi; ti++)
+                            {
+                                int rb = ti / numCBc, cb = ti % numCBc;
+                                kf(pa2 + (long)rb * Kc * 6, pb2 + (long)cb * Kc * 16, tile, Kc, 16);
+                            }
+                    }
+                });
+            }
+            foreach (var th in ths) th.Start();
+            foreach (var th in ths) th.Join();
+        }
+    }
+    NativeMemory.AlignedFree(PA); NativeMemory.AlignedFree(PB);
+
+    // ---- Phase 2: real-shape driver (pack A + pre-packed B + parallel tiles) ----
+    // Measures the JIT GEMM on the actual transformer GEMM shapes vs the managed
+    // numbers we recorded earlier (QKV 91, FFN1 113, FFN2 66 GFLOP/s) and oneDNN
+    // (543/564/541). M rounded to a multiple of 6 for the PoC (edge kernels = Phase 2b).
+    Console.WriteLine("--- Phase 2 driver: transformer GEMM shapes, JIT on our pool ---");
+    DriveShape("QKV ", 4092, 192, 64);
+    DriveShape("FFN1", 4092, 128, 64);
+    DriveShape("FFN2", 4092, 64, 128);
+    DriveShape("K256", 4092, 192, 256);   // diagnostic: same driver, larger K — isolates small-K/per-call overhead
+    DriveShape("K512", 4092, 192, 512);
+
+    void DriveShape(string name, int Mm, int Nn, int Kk)
+    {
+        int nRB = Mm / 6, nCB = Nn / 16;
+        var A = new float[(long)Mm * Kk]; var B = new float[(long)Kk * Nn]; var C = new float[(long)Mm * Nn];
+        var r3 = new Random(11);
+        for (long i = 0; i < A.LongLength; i++) A[i] = (float)(r3.NextDouble() - 0.5);
+        for (long i = 0; i < B.LongLength; i++) B[i] = (float)(r3.NextDouble() - 0.5);
+        // pre-pack B (weights: packed once for inference)
+        float* pbk = (float*)NativeMemory.AlignedAlloc((nuint)((long)nCB * Kk * 16 * sizeof(float)), 32);
+        for (int cb = 0; cb < nCB; cb++)
+            for (int k = 0; k < Kk; k++)
+                for (int c = 0; c < 16; c++) pbk[(long)cb * Kk * 16 + k * 16 + c] = B[(long)k * Nn + cb * 16 + c];
+        float* pak = (float*)NativeMemory.AlignedAlloc((nuint)((long)nRB * Kk * 6 * sizeof(float)), 32);
+        nint memX = mem, pakN = (nint)pak, pbkN = (nint)pbk;
+        int Kx = Kk, nCBx = nCB, Nx = Nn;
+        var Carr = C;
+
+        void OnePass(int threads)
+        {
+            // pack A (per call — activations change) in parallel, then compute tiles.
+            var ths = new System.Threading.Thread[threads];
+            int perR = (nRB + threads - 1) / threads;
+            for (int t = 0; t < threads; t++)
+            {
+                int lo = t * perR, hi = Math.Min(lo + perR, nRB);
+                ths[t] = new System.Threading.Thread(() =>
+                {
+                    unsafe
+                    {
+                        var kf = (delegate* unmanaged[Cdecl]<float*, float*, float*, long, long, void>)memX;
+                        float* pa2 = (float*)pakN, pb2 = (float*)pbkN;
+                        fixed (float* aP = A, cP = Carr)
+                        {
+                            for (int rb = lo; rb < hi; rb++)
+                            {
+                                float* myPa = pa2 + (long)rb * Kx * 6;
+                                for (int k = 0; k < Kx; k++)
+                                    for (int r = 0; r < 6; r++) myPa[k * 6 + r] = aP[(long)(rb * 6 + r) * Kx + k];
+                                // direct write into C[M,N] at this row/col block, ldc=N — no scatter.
+                                for (int cb = 0; cb < nCBx; cb++)
+                                    kf(myPa, pb2 + (long)cb * Kx * 16,
+                                       cP + (long)(rb * 6) * Nx + cb * 16, Kx, Nx);
+                            }
+                        }
+                    }
+                });
+            }
+            foreach (var th in ths) th.Start();
+            foreach (var th in ths) th.Join();
+        }
+        // correctness (single pass) vs scalar on a sample
+        OnePass(16);
+        double err = 0; var rr = new Random(5);
+        for (int s = 0; s < 200; s++)
+        {
+            int i = rr.Next(Mm), j = rr.Next(Nn); double acc = 0;
+            for (int k = 0; k < Kk; k++) acc += (double)A[(long)i * Kk + k] * B[(long)k * Nn + j];
+            err = Math.Max(err, Math.Abs(acc - C[(long)i * Nn + j]));
+        }
+        for (int i = 0; i < 30; i++) OnePass(16);
+        int reps = 300; var sw = Stopwatch.StartNew();
+        for (int i = 0; i < reps; i++) OnePass(16);
+        sw.Stop();
+        double g = (double)Mm * Nn * Kk * 2.0 * reps / sw.Elapsed.TotalSeconds / 1e9;
+        Console.WriteLine($"  {name} [{Mm},{Kk}]x[{Kk},{Nn}]  {g,6:F0} GFLOP/s (16t, pack+compute)  maxErr={err:E2}");
+        NativeMemory.AlignedFree(pak); NativeMemory.AlignedFree(pbk);
+    }
+}
+
+static unsafe void Managed6x16(float* pa, float* pb, float* pc, long K)
+{
+    Vector256<float> c0 = default, c1 = default, c2 = default, c3 = default, c4 = default, c5 = default,
+                     c6 = default, c7 = default, c8 = default, c9 = default, c10 = default, c11 = default;
+    for (long k = 0; k < K; k++)
+    {
+        var b0 = Avx.LoadVector256(pb + k * 16);
+        var b1 = Avx.LoadVector256(pb + k * 16 + 8);
+        var a = Vector256.Create(pa[k * 6 + 0]); c0 = Fma.MultiplyAdd(a, b0, c0); c1 = Fma.MultiplyAdd(a, b1, c1);
+        a = Vector256.Create(pa[k * 6 + 1]); c2 = Fma.MultiplyAdd(a, b0, c2); c3 = Fma.MultiplyAdd(a, b1, c3);
+        a = Vector256.Create(pa[k * 6 + 2]); c4 = Fma.MultiplyAdd(a, b0, c4); c5 = Fma.MultiplyAdd(a, b1, c5);
+        a = Vector256.Create(pa[k * 6 + 3]); c6 = Fma.MultiplyAdd(a, b0, c6); c7 = Fma.MultiplyAdd(a, b1, c7);
+        a = Vector256.Create(pa[k * 6 + 4]); c8 = Fma.MultiplyAdd(a, b0, c8); c9 = Fma.MultiplyAdd(a, b1, c9);
+        a = Vector256.Create(pa[k * 6 + 5]); c10 = Fma.MultiplyAdd(a, b0, c10); c11 = Fma.MultiplyAdd(a, b1, c11);
+    }
+    Avx.Store(pc + 0, c0); Avx.Store(pc + 8, c1); Avx.Store(pc + 16, c2); Avx.Store(pc + 24, c3);
+    Avx.Store(pc + 32, c4); Avx.Store(pc + 40, c5); Avx.Store(pc + 48, c6); Avx.Store(pc + 56, c7);
+    Avx.Store(pc + 64, c8); Avx.Store(pc + 72, c9); Avx.Store(pc + 80, c10); Avx.Store(pc + 88, c11);
+}

@@ -2757,6 +2757,7 @@ public partial class CpuEngine : ITensorLevelEngine
 #endif
     public virtual unsafe Tensor<T> TensorAdd<T>(Tensor<T> a, Tensor<T> b)
     {
+        using var _opScope = AiDotNet.Tensors.Engines.Profiling.Profiler.OpScope("TensorAdd");
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
         if (!ShapesMatch(a._shape, b._shape))
@@ -11738,6 +11739,19 @@ public partial class CpuEngine : ITensorLevelEngine
         int.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_CACHEDB_MAXM"), out var cbm) && cbm >= 0
             ? cbm : 1024;
 
+    // Opt-in head-to-head (AIDOTNET_ONEDNN_GEMM=1): route float 2D matmul through
+    // oneDNN's JIT'd dnnl_sgemm (shape-specialized brgemm microkernel, the MKL-
+    // class reference) instead of the managed SimdGemm kernel. Lets us measure
+    // how far a JIT'd kernel closes the small-K/N GFLOP/s gap. Default OFF.
+    private static readonly bool _oneDnnGemm =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_ONEDNN_GEMM") == "1";
+
+    // Opt-in (AIDOTNET_JIT_GEMM=1): route float matmul through the runtime-JIT'd
+    // AVX2 kernel (Simd.JitGemmAvx2) — beats managed + oneDNN on small-K/N, on our
+    // own thread pool (no oversubscription). Default OFF.
+    private static readonly bool _jitGemm =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_JIT_GEMM") == "1";
+
     /// <summary>
     /// Standard 2D matrix multiplication: [M, N] @ [N, P] = [M, P]
     /// Uses BLAS when available for float/double, falls back to parallel loops otherwise.
@@ -11809,6 +11823,36 @@ public partial class CpuEngine : ITensorLevelEngine
         // worker-pool wakeup overhead. Above the cutover (large M) native BLAS's raw
         // throughput wins, so keep TryGemm there. Numerically equivalent to the native
         // path (float reduction-order only). M-cutover env-tunable (AIDOTNET_CACHEDB_MAXM).
+#if !NET471
+        // Our JIT'd AVX2 GEMM (opt-in). C[m,p] = A[m,n]·B[n,p] ⇒ TryMultiply(M=m,N=p,K=n).
+        if (_jitGemm && typeof(T) == typeof(float) && a.IsContiguous && b.IsContiguous)
+        {
+            var aJ = (float[])(object)a.GetDataArray();
+            var bJ = (float[])(object)b.GetDataArray();
+            var rJ = (float[])(object)result.GetDataArray();
+            if (Simd.JitGemmAvx2.TryMultiply(aJ.AsSpan(0, m * n), bJ.AsSpan(0, n * p), rJ.AsSpan(0, m * p), m, p, n))
+                return result;
+        }
+
+        // oneDNN JIT'd GEMM head-to-head (opt-in). C[m,p] = A[m,n]·B[n,p], row-major
+        // ⇒ TrySgemm(M=m, K=n, N=p). Falls through to the managed kernel if oneDNN
+        // is unavailable (TrySgemm returns false without mutating C).
+        if (_oneDnnGemm && typeof(T) == typeof(float) && a.IsContiguous && b.IsContiguous)
+        {
+            var aArrO = (float[])(object)a.GetDataArray();
+            var bArrO = (float[])(object)b.GetDataArray();
+            var rArrO = (float[])(object)result.GetDataArray();
+            unsafe
+            {
+                fixed (float* pA = aArrO, pB = bArrO, pC = rArrO)
+                {
+                    if (OneDnnProvider.TrySgemm(pA, pB, pC, m, n, p))
+                        return result;
+                }
+            }
+        }
+#endif
+
         if (typeof(T) == typeof(float) && a.IsContiguous && b.IsContiguous
             && m <= _cachedBMaxM)
         {
@@ -12585,7 +12629,22 @@ public partial class CpuEngine : ITensorLevelEngine
     // populates the cache and every subsequent call reuses the transposed
     // buffer for ~0 µs. Multi-threaded callers are handled inside
     // ConditionalWeakTable.GetValue which is documented thread-safe.
-    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<float[], float[]>
+    //
+    // Entries carry the SimdGemm.WeightCacheEpoch at build time: the cache
+    // keys on ARRAY IDENTITY and never re-reads contents, so an in-place
+    // kernel mutation (optimizer step, SetParameters bulk load) would
+    // otherwise leave a stale transpose serving old weights — the same
+    // stale-weight class of bug as SimdGemm's pre-packed-B caches. A hit is
+    // only valid while the entry's epoch matches the current global epoch
+    // (bumped via Engines.InferenceWeightCache.InvalidateAll()).
+    private sealed class KernelTransposeEntry
+    {
+        internal KernelTransposeEntry(float[] data, long epoch) { Data = data; Epoch = epoch; }
+        internal readonly float[] Data;
+        internal readonly long Epoch;
+    }
+
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<float[], KernelTransposeEntry>
         _kernelTransposeCache = new();
 
     /// <summary>
@@ -12795,12 +12854,22 @@ public partial class CpuEngine : ITensorLevelEngine
         // kernel array is GC'd.
         static float[] GetOrBuildTransposedKernel(float[] kernel, int rows, int cols)
         {
+            long epoch = AiDotNet.Tensors.Engines.Simd.SimdGemm.WeightCacheEpoch;
+            if (_kernelTransposeCache.TryGetValue(kernel, out var entry) && entry.Epoch == epoch)
+                return entry.Data;
+
+            // Stale (weights mutated in place since the transpose was built)
+            // or missing — rebuild from the live kernel contents. Remove+
+            // GetValue rather than AddOrUpdate: net471's ConditionalWeakTable
+            // has no AddOrUpdate, and a concurrent racer at worst redoes the
+            // transpose once.
+            _kernelTransposeCache.Remove(kernel);
             return _kernelTransposeCache.GetValue(kernel, k =>
             {
                 var kernelT = new float[cols * rows];
                 TransposeFloatParallel(k, 0, kernelT, 0, rows, cols);
-                return kernelT;
-            });
+                return new KernelTransposeEntry(kernelT, epoch);
+            }).Data;
         }
 
         /// <summary>
@@ -14716,6 +14785,58 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (outputHeight <= 0 || outputWidth <= 0)
             throw new ArgumentException($"Invalid output dimensions ({outputHeight}x{outputWidth}). Check pool size and stride.");
+
+        // Lazy graph mode (compiled-inference trace): record the pool as a graph node
+        // so the captured plan stays CONNECTED end-to-end. This entry is what
+        // MaxPoolingLayer.Forward calls, and it previously had NO GraphMode recording —
+        // tracing a conv net captured a graph with both pools missing, which fell apart
+        // into disconnected segments bridged by stale trace-time buffers and a scrambled
+        // topological order (the dense head executed BEFORE the convs). Replay returned
+        // relErr=1.0 garbage (CompiledInferenceParityTests.Cnn_CompiledReplay_MatchesEager).
+        //
+        // The indices side-output cannot be computed here: under an active trace the
+        // input buffer is a graph placeholder (values do not flow at trace time), so it
+        // is returned zero-filled. That is sound ONLY for the compiled-INFERENCE path —
+        // indices feed the training backward, and the traced Predict runs under
+        // NoGradScope — while the recorded node's replay closure recomputes the pooled
+        // VALUES, which is all the inference plan needs. TRAINING traces (an active
+        // GradientTape) must NOT take this branch: the recorded node's saved zero-filled
+        // indices would corrupt MaxPool2DWithIndicesBackward's gradient routing
+        // (surfaced as Issue1296 gradient-accumulation mismatches). They keep the
+        // eager path below, exactly as before this recording existed.
+        if (GraphMode.IsActive
+            && Autodiff.GradientTape<T>.Current is null)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                maxIndices = new int[batch, channels, outputHeight, outputWidth, 2];
+                var captured = input;
+                int ph = poolH, pw = poolW, sh = strideH, sw = strideW;
+                // No backwardFn / savedState: this branch is gated to
+                // GradientTape<T>.Current is null (inference-only trace), so
+                // replay never runs a backward. Recording
+                // MaxPool2DWithIndicesBackward + the zero-filled maxIndices
+                // here would (a) pin a potentially large
+                // int[batch, channels, outH, outW, 2] for the lifetime of
+                // the lazy graph / compiled plan, and (b) hand any future
+                // backward consumer corrupt all-zero routing indices.
+                return scope.RecordUnary(LazyNodeType.MaxPool2D, "MaxPool2DWithIndices", input,
+                    new[] { batch, channels, outputHeight, outputWidth },
+                    (eng, output) =>
+                    {
+                        if (eng is CpuEngine cpuEng && ph == pw && sh == sw)
+                        {
+                            cpuEng.MaxPool2DInto(output, captured, ph, sh, 0);
+                        }
+                        else
+                        {
+                            var eager = eng.MaxPool2DWithIndices(captured, new[] { ph, pw }, new[] { sh, sw }, out _);
+                            eager.AsSpan().CopyTo(output.AsWritableSpan());
+                        }
+                    });
+            }
+        }
 
         var result = TensorAllocator.Rent<T>([batch, channels, outputHeight, outputWidth]);
         // Use local variable to avoid capturing out parameter in lambda
@@ -21534,6 +21655,17 @@ public partial class CpuEngine : ITensorLevelEngine
     private static readonly bool _layerNormFusedFs64Enabled =
         Environment.GetEnvironmentVariable("AIDOTNET_LAYERNORM_FUSED_FS64") != "0";
 
+    // Batch-size ceiling for the register-resident single-pass fs=64 LayerNorm.
+    // A/B verdict (recorded inline at the fast path): the fused form WINS at small
+    // batch ([1024,64]: 133µs->117µs, +13%) — the transformer/LSTM inference shapes —
+    // but LOSES at BERT-scale ([32768,64]: +5% for 2-pass), because at huge batch the
+    // streaming prefetcher already hides the second read and the fused form's larger
+    // register footprint/code dominates. So the fused path is gated to batchSize at or
+    // below this ceiling; larger LayerNorms take the 4-way-unrolled 2-pass form.
+    private static readonly int _lnFusedFs64MaxBatch =
+        int.TryParse(Environment.GetEnvironmentVariable("AIDOTNET_LN_FUSED_MAXBATCH"), out var lfm) && lfm > 0
+            ? lfm : 8192;
+
     internal void LayerNormFloatInto(
         Tensor<float> input, Tensor<float> gamma, Tensor<float> beta,
         double epsilon, Tensor<float> output)
@@ -21574,6 +21706,23 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <c>Unsafe.ReadUnaligned</c> / <c>Unsafe.WriteUnaligned</c> for
     /// 32-byte vector load/store, avoiding Span bounds-check overhead.
     /// </summary>
+    // LayerNorm parallel break-even (elements). Below this, run serial to avoid the
+    // worker-pool park/wakeup floor that dominates small-op latency. Env-tunable.
+    private static readonly long _lnParallelMinWork =
+        long.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_LN_PARALLEL_MINWORK"), out var lnw) && lnw > 0
+            ? lnw : 524_288;
+
+    // Row-count parallel gate: a LayerNorm over many independent rows parallelizes
+    // well even when total elements are below _lnParallelMinWork — the work-only
+    // threshold left the transformer's [4096,64] (262K < 524K) serial, but it has
+    // 4096 independent rows and parallel is 2.5× faster (0.33→0.13 ms/call, −17%
+    // on the bs128 forward). Gate on rows so large-row/small-feature LayerNorms
+    // parallelize while small-row ones (e.g. [1024,64], where the park/wakeup floor
+    // dominated) stay serial. Env-tunable.
+    private static readonly int _lnParallelMinRows =
+        int.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_LN_PARALLEL_MINROWS"), out var lnr) && lnr > 0
+            ? lnr : 2048;
+
     private static void ProcessBatchesSimd(
         float[] fInput, float[] fGamma, float[] fBeta,
         float[] fOutput, float[] fMean, float[] fVar,
@@ -21585,10 +21734,26 @@ public partial class CpuEngine : ITensorLevelEngine
 #else
         bool useSimd = false;
 #endif
-        if (batchSize * fs < 50_000)
+        // Serial below the parallel break-even. The old 50K threshold was far too
+        // low: a transformer LayerNorm at [B*seq, d] = [1024, 64] = 65 536 elements
+        // is only ~25 µs of single-pass SIMD work, but dispatching its 1024 tiny rows
+        // to the worker pool — which has parked between this and the previous op
+        // (MHA / FFN / the other 3 LayerNorms in the block) — pays the full park/
+        // wakeup latency (~190 µs measured, profiled as ManualResetEventSlim/semaphore
+        // wait, not compute). Net: parallel was ~7× SLOWER than serial at this size.
+        // Raised to 512K elements so small/medium LayerNorms (transformers at modest
+        // batch×seq) stay serial; large ones (BERT-scale, millions of elements, where
+        // serial is ms and dwarfs the wakeup) still parallelize. Env-tunable.
+        // Enable the register-resident single-pass fs=64 fast path only for batch
+        // sizes where it is profiled to win (see _lnFusedFs64MaxBatch). fs==64 is the
+        // common transformer/LSTM hidden width; the path requires the AVX2 branch.
+        bool fusedFs64 = useSimd && _layerNormFusedFs64Enabled && fs == 64 && batchSize <= _lnFusedFs64MaxBatch;
+
+        long lnWork = (long)batchSize * fs;
+        if (lnWork < _lnParallelMinWork && batchSize < _lnParallelMinRows)
         {
             for (int b = 0; b < batchSize; b++)
-                ProcessRow(fInput, fGamma, fBeta, fOutput, fMean, fVar, b, fs, fEps, useSimd);
+                ProcessRow(fInput, fGamma, fBeta, fOutput, fMean, fVar, b, fs, fEps, useSimd, fusedFs64);
         }
         else
         {
@@ -21607,7 +21772,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 int start = c * chunkSize;
                 int end = Math.Min(start + chunkSize, totalBatch);
                 for (int b = start; b < end; b++)
-                    ProcessRow(fInput, fGamma, fBeta, fOutput, fMean, fVar, b, fs, fEps, useSimd);
+                    ProcessRow(fInput, fGamma, fBeta, fOutput, fMean, fVar, b, fs, fEps, useSimd, fusedFs64);
             });
         }
     }
@@ -21616,7 +21781,7 @@ public partial class CpuEngine : ITensorLevelEngine
     private static void ProcessRow(
         float[] fInput, float[] fGamma, float[] fBeta,
         float[] fOutput, float[] fMean, float[] fVar,
-        int b, int fs, float fEps, bool useSimd)
+        int b, int fs, float fEps, bool useSimd, bool fusedFs64 = false)
     {
         int off = b * fs;
         float m, v2;
@@ -21712,7 +21877,7 @@ public partial class CpuEngine : ITensorLevelEngine
             // fast path — keeping this comment so the lesson is preserved.
             // To re-attempt later, write the kernel with explicit XSAVE-aware
             // accumulator passing.
-            if (false && _layerNormFusedFs64Enabled)
+            if (fusedFs64)
             {
                 // Load all 8 input vectors once.
                 var v0 = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(
@@ -34456,6 +34621,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
     public virtual Tensor<T> FusedLinear<T>(Tensor<T> input, Tensor<T> weights, Tensor<T>? bias, FusedActivationType activation, FusedActivationParams? activationParams = null)
     {
+        using var _opScope = AiDotNet.Tensors.Engines.Profiling.Profiler.OpScope("FusedLinear");
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (weights == null) throw new ArgumentNullException(nameof(weights));
 
@@ -34566,6 +34732,34 @@ public partial class CpuEngine : ITensorLevelEngine
                 var outArr = (float[])(object)result.GetDataArray();
 
                 bool blasDone = false;
+                var _ffnGemmScope = AiDotNet.Tensors.Engines.Profiling.Profiler.OpScope("FFN.GEMM");
+
+#if !NET471
+                // Tier -3 (opt-in, AIDOTNET_JIT_GEMM=1): our runtime-JIT'd AVX2 kernel.
+                // Beats managed + oneDNN on the small-K/N FFN shape, on our own pool.
+                // Bias+activation still run in the shared SIMD epilogue below.
+                if (!blasDone && _jitGemm
+                    && Simd.JitGemmAvx2.TryMultiply(inArr.AsSpan(0, M * K), wArr.AsSpan(0, K * N), outArr.AsSpan(0, M * N), M, N, K))
+                    blasDone = true;
+
+                // Tier -2 (opt-in, AIDOTNET_ONEDNN_GEMM=1): oneDNN JIT'd dnnl_sgemm.
+                // The fused-linear (FFN) GEMM is exactly the small-K/N shape where
+                // oneDNN's shape-specialized brgemm hits 540+ GFLOP/s vs ~70-110 for
+                // the managed kernel (head-to-head measured). Bias+activation still
+                // run in the shared SIMD epilogue below. Size-gated so tiny GEMMs
+                // (where oneDNN's per-call dispatch loses) stay on the managed path.
+                if (!blasDone && _oneDnnGemm && (long)M * K * N >= 262_144)
+                {
+                    unsafe
+                    {
+                        fixed (float* pIn = inArr, pW = wArr, pOut = outArr)
+                        {
+                            if (OneDnnProvider.TrySgemm(pIn, pW, pOut, M, K, N))
+                                blasDone = true;
+                        }
+                    }
+                }
+#endif
 
                 // Phase 1 (compiled-inference): for small/medium inference GEMMs the
                 // managed cached-B path wins 1.3-2.8x over native BLAS + pinned copy —
@@ -34644,9 +34838,12 @@ public partial class CpuEngine : ITensorLevelEngine
                     }
                 }
 
+                _ffnGemmScope.Dispose();
+
                 // Fused bias + activation in one pass
                 if (bias != null || activation != FusedActivationType.None)
                 {
+                    using var _ffnEpi = AiDotNet.Tensors.Engines.Profiling.Profiler.OpScope("FFN.Epilogue");
                     var bArr = bias != null ? (float[])(object)bias.GetDataArray() : null;
                     CpuFusedOperations.ApplyBiasActivationInPlace(outArr, bArr, M, N, activation, activationParams);
                 }

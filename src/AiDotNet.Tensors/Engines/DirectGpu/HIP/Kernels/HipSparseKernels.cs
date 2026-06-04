@@ -76,6 +76,35 @@ extern ""C"" __global__ __launch_bounds__(256) void csr_spmm_warp(
     }
 }
 
+// CSR SpMM, FP64 (issue #515): double-precision analog of csr_spmm. Same per-output
+// reduction order as the float kernel and the managed CPU reference → deterministic.
+extern ""C"" __global__ __launch_bounds__(256) void csr_spmm_double(
+    const double* __restrict__ csrValues,
+    const int* __restrict__ csrColIndices,
+    const int* __restrict__ csrRowPointers,
+    const double* __restrict__ denseB,
+    double* __restrict__ output,
+    int M, int K, int N, int nnz)
+{
+    int row = blockIdx.x;
+    int col = blockIdx.y * blockDim.x + threadIdx.x;
+
+    if (row >= M || col >= N) return;
+
+    int rowStart = csrRowPointers[row];
+    int rowEnd = csrRowPointers[row + 1];
+
+    double sum = 0.0;
+    for (int i = rowStart; i < rowEnd; i++)
+    {
+        int colA = csrColIndices[i];
+        double valA = csrValues[i];
+        sum += valA * denseB[colA * N + col];
+    }
+
+    output[row * N + col] = sum;
+}
+
 extern ""C"" __global__ __launch_bounds__(256) void csr_spmm_bias(
     const float* __restrict__ csrValues,
     const int* __restrict__ csrColIndices,
@@ -464,6 +493,7 @@ extern ""C"" __global__ __launch_bounds__(256) void symmetric_degree_normalize(
         [
             "csr_spmm",
             "csr_spmm_warp",
+            "csr_spmm_double",
             "csr_spmm_bias",
             "csr_spmm_bias_relu",
             "scatter_add_edges",

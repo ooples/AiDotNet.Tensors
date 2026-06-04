@@ -140,14 +140,31 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
             return;
         }
 
-        foreach (var bucket in _buckets.Values)
+        // At process/AppDomain teardown the ConcurrentBag's backing ThreadLocal may
+        // already be finalized (TryTake then throws ObjectDisposedException) and the GPU
+        // context may be gone (buffer.Release would fault). Either is fatal on the
+        // finalizer thread. The OS reclaims all device memory at exit, so skip the drain.
+        if (AiDotNet.Tensors.Engines.RuntimeShutdown.IsTearingDown)
         {
-            while (bucket.Buffers.TryTake(out var buffer))
-            {
-                buffer.Release();
-            }
+            return;
         }
 
-        _buckets.Clear();
+        try
+        {
+            foreach (var bucket in _buckets.Values)
+            {
+                while (bucket.Buffers.TryTake(out var buffer))
+                {
+                    buffer.Release();
+                }
+            }
+
+            _buckets.Clear();
+        }
+        catch (ObjectDisposedException)
+        {
+            // A concurrent teardown disposed the bag's ThreadLocal mid-drain. Cleanup is
+            // best-effort here (OS reclaims at exit); never let it crash the finalizer.
+        }
     }
 }

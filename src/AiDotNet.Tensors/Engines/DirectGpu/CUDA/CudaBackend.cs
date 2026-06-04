@@ -17,6 +17,13 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
 public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernels, AiDotNet.Tensors.Engines.Gpu.IGpuHalfPrecisionBackend
 {
+    // During teardown the CUDA driver/context may already be destroyed, so calling driver
+    // APIs (cuCtxPushCurrent / cuMemFree / cuCtxPopCurrent / cuCtxDestroy / cuModuleUnload)
+    // from a finalizer raises an access violation (0xC0000005) — a Corrupted-State
+    // Exception that catch cannot trap and that is fatal on the finalizer thread, killing
+    // the whole process. The OS reclaims device memory + the context at exit anyway.
+    private static bool IsRuntimeTearingDown => RuntimeShutdown.IsTearingDown;
+
     private const int DefaultBlockSize = 256;
     private const int MaxRnnBlockSize = 1024;
     private readonly ConcurrentDictionary<string, IntPtr> _kernelCache;
@@ -2585,6 +2592,97 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         using var _ = PushContext();
 
         // Launch configuration: rows x ceil(N/blockSize) grid
+        uint gridX = (uint)M;
+        uint gridY = (uint)((N + DefaultBlockSize - 1) / DefaultBlockSize);
+
+        IntPtr valuesPtr = csrValues.Handle;
+        IntPtr colIndicesPtr = csrColIndices.Handle;
+        IntPtr rowPointersPtr = csrRowPointers.Handle;
+        IntPtr denseBPtr = denseB.Handle;
+        IntPtr outputPtr = output.Handle;
+
+        void** args = stackalloc void*[9];
+        args[0] = &valuesPtr;
+        args[1] = &colIndicesPtr;
+        args[2] = &rowPointersPtr;
+        args[3] = &denseBPtr;
+        args[4] = &outputPtr;
+        args[5] = &M;
+        args[6] = &K;
+        args[7] = &N;
+        args[8] = &nnz;
+
+        LaunchKernel2D(kernel, gridX, gridY, (uint)DefaultBlockSize, 1, args);
+    }
+
+    /// <summary>
+    /// Warp-per-row CSR SpMM (issue #515): launches <c>csr_spmm_warp</c>, where each
+    /// warp (32 lanes) owns one output row and the lanes stride over columns. Best
+    /// for small/moderate N (the lanes cover the columns with coalesced B reads);
+    /// the 2-D <see cref="CsrSpMM"/> is better for wide N. Same numerics as
+    /// <see cref="CsrSpMM"/> (per-output sequential reduction → deterministic).
+    /// </summary>
+    public unsafe void CsrSpMMWarp(
+        IGpuBuffer csrValues,
+        IGpuBuffer csrColIndices,
+        IGpuBuffer csrRowPointers,
+        IGpuBuffer denseB,
+        IGpuBuffer output,
+        int M, int K, int N, int nnz)
+    {
+        if (!IsAvailable)
+            throw new InvalidOperationException("CUDA backend is not available.");
+
+        if (!_kernelCache.TryGetValue("csr_spmm_warp", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: csr_spmm_warp");
+
+        using var _ = PushContext();
+
+        // One warp (32 lanes) per row; DefaultBlockSize threads/block => 8 warps/block.
+        uint gridX = (uint)((M + 7) / 8);
+
+        IntPtr valuesPtr = csrValues.Handle;
+        IntPtr colIndicesPtr = csrColIndices.Handle;
+        IntPtr rowPointersPtr = csrRowPointers.Handle;
+        IntPtr denseBPtr = denseB.Handle;
+        IntPtr outputPtr = output.Handle;
+
+        void** args = stackalloc void*[9];
+        args[0] = &valuesPtr;
+        args[1] = &colIndicesPtr;
+        args[2] = &rowPointersPtr;
+        args[3] = &denseBPtr;
+        args[4] = &outputPtr;
+        args[5] = &M;
+        args[6] = &K;
+        args[7] = &N;
+        args[8] = &nnz;
+
+        LaunchKernel(kernel, gridX, (uint)DefaultBlockSize, args);
+    }
+
+    /// <summary>
+    /// FP64 CSR SpMM (issue #515): launches <c>csr_spmm_double</c>. The CSR-value /
+    /// dense-B / output buffers carry <c>double</c> payloads (byte buffers); the int
+    /// CSR index buffers are unchanged. Same 2-D launch + numerics as the float
+    /// <see cref="CsrSpMM"/>.
+    /// </summary>
+    public unsafe void CsrSpMMDouble(
+        IGpuBuffer csrValues,
+        IGpuBuffer csrColIndices,
+        IGpuBuffer csrRowPointers,
+        IGpuBuffer denseB,
+        IGpuBuffer output,
+        int M, int K, int N, int nnz)
+    {
+        if (!IsAvailable)
+            throw new InvalidOperationException("CUDA backend is not available.");
+
+        if (!_kernelCache.TryGetValue("csr_spmm_double", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: csr_spmm_double");
+
+        using var _ = PushContext();
+
         uint gridX = (uint)M;
         uint gridY = (uint)((N + DefaultBlockSize - 1) / DefaultBlockSize);
 
@@ -12539,11 +12637,32 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public void Dispose()
     {
+        Dispose(disposing: true);
+        GC.SuppressFinalize(this);
+    }
+
+    private void Dispose(bool disposing)
+    {
         if (_disposed)
             return;
 
         _disposed = true;
-        if (ProcessExiting) return;   // driver torn down at process exit — skip native+pool cleanup (OS reclaims)
+        // Finalizer path (disposing == false) or any process/domain teardown:
+        //   - The managed members (GpuBufferPool's ConcurrentBag/ThreadLocal, the cuDNN
+        //     helpers) may already have been finalized by the runtime — touching them
+        //     throws ObjectDisposedException from the finalizer thread (fatal).
+        //   - The CUDA context may already be destroyed — every driver call below
+        //     (cublasDestroy / cuStreamDestroy / cuModuleUnload / cuCtxDestroy) would
+        //     raise an uncatchable access violation (0xC0000005), also finalizer-fatal.
+        // The OS reclaims the context and all device memory at process exit, so the only
+        // safe action here is to do nothing. Explicit Dispose during normal operation
+        // (disposing == true, not tearing down) still performs the full native cleanup.
+        // Guard on the union of both teardown signals: IsRuntimeTearingDown (this PR) and
+        // ProcessExiting (the merged #536 CUDA-finalizer-safety fix) — either means the
+        // driver/runtime may be gone, so skip the native + pool cleanup entirely.
+        if (!disposing || IsRuntimeTearingDown || ProcessExiting)
+            return;
+
         _pinnedPool.Dispose();
         _bufferPool.Dispose();
 
@@ -13502,10 +13621,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     ~CudaBackend()
     {
-        // A finalizer must NEVER throw — Dispose() touches managed pools that may already be finalized during GC
-        // (ObjectDisposedException). Swallow so an undisposed backend (e.g. one created during backend auto-detection)
-        // tears down cleanly.
-        try { Dispose(); } catch { }
+        // Finalizer: never touch managed members or the CUDA driver — Dispose(bool)'s
+        // !disposing/IsRuntimeTearingDown/ProcessExiting guard makes this a no-op (the OS
+        // reclaims the context + device memory at process exit). The try/catch is
+        // belt-and-suspenders: a finalizer must NEVER throw, even if that contract changes
+        // or a future undisposed-backend path reaches managed pools that are already
+        // finalized during GC (ObjectDisposedException).
+        try { Dispose(disposing: false); } catch { }
     }
 
     internal sealed class CudaGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
@@ -13541,18 +13663,28 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             if (_devicePtr == IntPtr.Zero)
                 return;
 
-            try
+            // During CLR/AppDomain teardown the CUDA context may already be gone;
+            // calling the driver here raises an uncatchable, finalizer-fatal access
+            // violation. Skip the native free (the OS reclaims device memory at exit)
+            // and just clear the handles.
+            if (!IsRuntimeTearingDown)
             {
-                if (_context != IntPtr.Zero && !ProcessExiting)   // at process exit the CUDA driver is gone — any
-                {                                                 // native CUDA call FATAL-crashes (uncatchable); skip it
-                    CuBlasNative.cuCtxPushCurrent(_context);
-                    CuBlasNative.cuMemFree(_devicePtr);
-                    CuBlasNative.cuCtxPopCurrent(out _);
+                // Skip the native free at process exit (the driver is gone — any native CUDA
+                // call FATAL-crashes, uncatchable); otherwise free, suppressing any disposal
+                // error so a finalizer can't crash.
+                if (_context != IntPtr.Zero && !ProcessExiting)
+                {
+                    try
+                    {
+                        CuBlasNative.cuCtxPushCurrent(_context);
+                        CuBlasNative.cuMemFree(_devicePtr);
+                        CuBlasNative.cuCtxPopCurrent(out _);
+                    }
+                    catch
+                    {
+                        // Suppress disposal errors to avoid crashing finalizers.
+                    }
                 }
-            }
-            catch
-            {
-                // Suppress disposal errors to avoid crashing finalizers.
             }
 
             _devicePtr = IntPtr.Zero;
@@ -13610,18 +13742,26 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             if (_devicePtr == IntPtr.Zero)
                 return;
 
-            try
+            // See CudaGpuBuffer.Release: skip native CUDA calls during teardown to
+            // avoid a finalizer-fatal access violation on an already-destroyed context.
+            if (!IsRuntimeTearingDown)
             {
-                if (_context != IntPtr.Zero && !ProcessExiting)   // at process exit the CUDA driver is gone — any
-                {                                                 // native CUDA call FATAL-crashes (uncatchable); skip it
-                    CuBlasNative.cuCtxPushCurrent(_context);
-                    CuBlasNative.cuMemFree(_devicePtr);
-                    CuBlasNative.cuCtxPopCurrent(out _);
+                // Skip the native free at process exit (the driver is gone — any native CUDA
+                // call FATAL-crashes, uncatchable); otherwise free, suppressing any disposal
+                // error so a finalizer can't crash.
+                if (_context != IntPtr.Zero && !ProcessExiting)
+                {
+                    try
+                    {
+                        CuBlasNative.cuCtxPushCurrent(_context);
+                        CuBlasNative.cuMemFree(_devicePtr);
+                        CuBlasNative.cuCtxPopCurrent(out _);
+                    }
+                    catch
+                    {
+                        // Suppress disposal errors to avoid crashing finalizers.
+                    }
                 }
-            }
-            catch
-            {
-                // Suppress disposal errors to avoid crashing finalizers.
             }
 
             _devicePtr = IntPtr.Zero;
