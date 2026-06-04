@@ -108,6 +108,78 @@ public class BlasManagedThinMDirectTests
             $"BlasManaged.Gemm<double> thin-M carve-out rel error at {m}x{k}x{n}.");
     }
 
+    // Transposed thin-M (#368 strided kernels — no transpose materialised).
+    // transA: C = Aᵀ·B, A stored [k,m]. transB: C = A·Bᵀ, B stored [n,k].
+    [Theory]
+    [MemberData(nameof(Shapes))]
+    public void GemmDouble_ThinM_TransA_MatchesReference(int m, int k, int n)
+    {
+        var rng = RandomHelper.CreateSeededRandom(820);
+        var A = RandD(m * k, rng); var B = RandD(k * n, rng); // logical A[m,k], B[k,n]
+        var aStored = TransposeD(A, m, k);                    // [k,m] = Aᵀ (lda=m)
+        var got = new double[m * n]; var want = new double[m * n];
+        ReferenceD(A, B, want, m, k, n);
+        AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.Gemm<double>(
+            aStored, m, true, B, n, false, got, n, m, n, k, default);
+        Assert.True(RelErrD(got, want) < 1e-10, $"double transA at {m}x{k}x{n}.");
+    }
+
+    [Theory]
+    [MemberData(nameof(Shapes))]
+    public void GemmDouble_ThinM_TransB_MatchesReference(int m, int k, int n)
+    {
+        var rng = RandomHelper.CreateSeededRandom(821);
+        var A = RandD(m * k, rng); var B = RandD(k * n, rng); // logical A[m,k], B[k,n]
+        var bStored = TransposeD(B, k, n);                    // [n,k] = Bᵀ (ldb=k)
+        var got = new double[m * n]; var want = new double[m * n];
+        ReferenceD(A, B, want, m, k, n);
+        AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.Gemm<double>(
+            A, k, false, bStored, k, true, got, n, m, n, k, default);
+        Assert.True(RelErrD(got, want) < 1e-10, $"double transB at {m}x{k}x{n}.");
+    }
+
+    private static double[] TransposeD(double[] src, int rows, int cols)
+    {
+        var d = new double[rows * cols];
+        for (int i = 0; i < rows; i++) for (int j = 0; j < cols; j++) d[j * rows + i] = src[i * cols + j];
+        return d;
+    }
+
+    [Theory]
+    [MemberData(nameof(Shapes))]
+    public void GemmFloat_ThinM_TransA_MatchesReference(int m, int k, int n)
+    {
+        var rng = RandomHelper.CreateSeededRandom(822);
+        var A = RandF(m * k, rng); var B = RandF(k * n, rng);
+        var aStored = TransposeF(A, m, k);
+        var got = new float[m * n]; var want = new float[m * n];
+        Reference(A, B, want, m, k, n);
+        AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.Gemm<float>(
+            aStored, m, true, B, n, false, got, n, m, n, k, default);
+        Assert.True(RelErr(got, want) < 1e-3, $"float transA at {m}x{k}x{n}.");
+    }
+
+    [Theory]
+    [MemberData(nameof(Shapes))]
+    public void GemmFloat_ThinM_TransB_MatchesReference(int m, int k, int n)
+    {
+        var rng = RandomHelper.CreateSeededRandom(823);
+        var A = RandF(m * k, rng); var B = RandF(k * n, rng);
+        var bStored = TransposeF(B, k, n);
+        var got = new float[m * n]; var want = new float[m * n];
+        Reference(A, B, want, m, k, n);
+        AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.Gemm<float>(
+            A, k, false, bStored, k, true, got, n, m, n, k, default);
+        Assert.True(RelErr(got, want) < 1e-3, $"float transB at {m}x{k}x{n}.");
+    }
+
+    private static float[] TransposeF(float[] src, int rows, int cols)
+    {
+        var d = new float[rows * cols];
+        for (int i = 0; i < rows; i++) for (int j = 0; j < cols; j++) d[j * rows + i] = src[i * cols + j];
+        return d;
+    }
+
     // Fused bias+activation epilogue at thin-M: #368 applies it after the direct
     // kernel so FusedLinear hits the fast path. Verify out = ReLU(A·B + bias).
     [Theory]
@@ -172,6 +244,27 @@ public class BlasManagedThinMDirectTests
             ad, K, false, bd, N, false, cd, N, M, N, K, default));
         double dGf = flop / (dMs * 1e6);
         _out.WriteLine($"BlasManaged.Gemm<double> thin-M L0 [128x784x512]: {dGf:F0} GF/s (pre-#368 ~60).");
+
+        // transposed (strided kernels — pre-#368 the strategy gave ~57).
+        var bT = new double[N * K]; for (int i = 0; i < bT.Length; i++) bT[i] = rng.NextDouble() * 2 - 1;
+        var cTb = new double[M * N];
+        double tbMs = Min(() => AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.Gemm<double>(
+            ad, K, false, bT, K, true, cTb, N, M, N, K, default));
+        _out.WriteLine($"BlasManaged.Gemm<double> thin-M L0 transB: {flop / (tbMs * 1e6):F0} GF/s (pre-#368 ~57).");
+        var aT = new double[K * M]; for (int i = 0; i < aT.Length; i++) aT[i] = rng.NextDouble() * 2 - 1;
+        var cTa = new double[M * N];
+        double taMs = Min(() => AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.Gemm<double>(
+            aT, M, true, bd, N, false, cTa, N, M, N, K, default));
+        _out.WriteLine($"BlasManaged.Gemm<double> thin-M L0 transA: {flop / (taMs * 1e6):F0} GF/s (pre-#368 ~53).");
+
+        var bTf = RandF(N * K, rng); var cTbf = new float[M * N];
+        double tbfMs = Min(() => AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.Gemm<float>(
+            a, K, false, bTf, K, true, cTbf, N, M, N, K, default));
+        _out.WriteLine($"BlasManaged.Gemm<float>  thin-M L0 transB: {flop / (tbfMs * 1e6):F0} GF/s");
+        var aTf = RandF(K * M, rng); var cTaf = new float[M * N];
+        double tafMs = Min(() => AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.Gemm<float>(
+            aTf, M, true, b, N, false, cTaf, N, M, N, K, default));
+        _out.WriteLine($"BlasManaged.Gemm<float>  thin-M L0 transA: {flop / (tafMs * 1e6):F0} GF/s");
         // Pre-#368 double routed to the ~60 GF/s machine-code/strategy path; the new
         // 4x8 direct kernel clears it comfortably. 100 GF/s floor catches a regression.
         Assert.True(dGf > 100, $"BlasManaged.Gemm<double> thin-M L0 = {dGf:F0} GF/s — below the 100 GF/s floor (regressed off the #368 FP64 direct path?).");
