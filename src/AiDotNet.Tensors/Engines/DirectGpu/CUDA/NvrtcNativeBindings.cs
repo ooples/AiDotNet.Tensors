@@ -55,6 +55,16 @@ internal static class NvrtcNativeBindings
     /// </summary>
     private static void EnsureCudaOnPath()
     {
+        // Out-of-the-box discovery (like PyTorch shipping cudart/cublas/nvrtc in its wheels):
+        // before the classic CUDA_PATH/toolkit probe, make the CUDA *runtime* loadable when it
+        // was installed WITHOUT a full toolkit — the common cases being an explicit override or
+        // the `nvidia-*-cu12` pip wheels (nvidia-cuda-nvrtc-cu12 / nvidia-cublas-cu12 /
+        // nvidia-cuda-runtime-cu12) that lay cublas/nvrtc/cudart out under
+        // {site-packages}/nvidia/<component>/bin. Without this, DllImport("cublas64_12") fails
+        // with DllNotFoundException and CudaBackend silently falls back to OpenCL (a 2nd-class
+        // path on NVIDIA). Best-effort + fully guarded: it can never break initialization.
+        try { PrependDiscoveredCudaRuntimeDirs(); } catch { /* discovery is best-effort */ }
+
         var cudaPath = Environment.GetEnvironmentVariable("CUDA_PATH");
 
         // On Windows, also check system environment variables directly
@@ -114,6 +124,88 @@ internal static class NvrtcNativeBindings
             }
             Environment.SetEnvironmentVariable("LD_LIBRARY_PATH", ldPath);
         }
+    }
+
+    /// <summary>
+    /// Prepends explicitly-configured and auto-discovered CUDA-runtime directories to the OS
+    /// native-library search path (PATH on Windows, LD_LIBRARY_PATH on Linux) so the loader can
+    /// resolve cublas/nvrtc/cudart and their transitive deps. Sources, in priority order:
+    /// (1) the <c>AIDOTNET_CUDA_DIR</c> env var (path-separator list of dirs that hold the DLLs);
+    /// (2) the <c>nvidia-*-cu12</c> pip wheels, found under common site-packages locations as
+    /// <c>{site-packages}/nvidia/&lt;component&gt;/{bin|lib}</c>.
+    /// </summary>
+    private static void PrependDiscoveredCudaRuntimeDirs()
+    {
+        bool win = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
+        string leaf = win ? "bin" : "lib";
+        var dirs = new System.Collections.Generic.List<string>();
+
+        var explicitDirs = Environment.GetEnvironmentVariable("AIDOTNET_CUDA_DIR");
+        if (!string.IsNullOrEmpty(explicitDirs))
+            dirs.AddRange(explicitDirs.Split(new[] { Path.PathSeparator }, StringSplitOptions.RemoveEmptyEntries));
+
+        foreach (var sp in EnumerateCandidateSitePackages())
+        {
+            var nv = Path.Combine(sp, "nvidia");
+            if (!Directory.Exists(nv)) continue;
+            string[] components;
+            try { components = Directory.GetDirectories(nv); } catch { continue; }
+            foreach (var comp in components)
+            {
+                var d = Path.Combine(comp, leaf);
+                if (Directory.Exists(d)) dirs.Add(d);
+            }
+        }
+
+        if (dirs.Count == 0) return;
+        string varName = win ? "PATH" : "LD_LIBRARY_PATH";
+        var cur = Environment.GetEnvironmentVariable(varName) ?? "";
+        foreach (var d in dirs)
+        {
+            if (Directory.Exists(d) && !cur.Contains(d, StringComparison.OrdinalIgnoreCase))
+                cur = d + Path.PathSeparator + cur;
+        }
+        Environment.SetEnvironmentVariable(varName, cur);
+    }
+
+    /// <summary>Best-effort enumeration of common CPython site-packages locations (pip user/base,
+    /// active virtualenv, conda prefix). Failures are swallowed — discovery must never throw.</summary>
+    private static System.Collections.Generic.List<string> EnumerateCandidateSitePackages()
+    {
+        var result = new System.Collections.Generic.List<string>();
+        var roots = new System.Collections.Generic.List<string>();
+        try
+        {
+            var appData = Environment.GetEnvironmentVariable("APPDATA");                 // Windows pip --user
+            if (!string.IsNullOrEmpty(appData)) roots.Add(Path.Combine(appData, "Python"));
+            var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            if (!string.IsNullOrEmpty(home)) roots.Add(Path.Combine(home, ".local", "lib")); // Linux pip --user
+            foreach (var ev in new[] { "VIRTUAL_ENV", "CONDA_PREFIX" })
+            {
+                var v = Environment.GetEnvironmentVariable(ev);
+                if (!string.IsNullOrEmpty(v)) roots.Add(v);
+            }
+        }
+        catch { return result; }
+
+        foreach (var root in roots)
+        {
+            try
+            {
+                if (!Directory.Exists(root)) continue;
+                var direct = Path.Combine(root, "site-packages");
+                if (Directory.Exists(direct)) result.Add(direct);
+                foreach (var s in Directory.GetDirectories(root))   // {root}/PythonXY/(Lib/)site-packages
+                {
+                    var sp = Path.Combine(s, "site-packages");
+                    if (Directory.Exists(sp)) result.Add(sp);
+                    var sp2 = Path.Combine(s, "Lib", "site-packages");
+                    if (Directory.Exists(sp2)) result.Add(sp2);
+                }
+            }
+            catch { /* skip unreadable root */ }
+        }
+        return result;
     }
 
     private static INvrtcApi? ResolveApi()
