@@ -126,6 +126,42 @@ extern ""C"" __global__ __launch_bounds__(256) void csr_spmm_double(
     output[row * N + col] = sum;
 }
 
+// CSR SpMM, 128-bit vectorized dense loads (issue #515): each thread computes 4
+// adjacent output columns, reading denseB as a 16-byte-aligned float4. Requires
+// N % 4 == 0 (the caller's gate); cudaMalloc gives 256-byte base alignment and
+// colA*N + col4 is a multiple of 4, so the float4 load/store are aligned. Same
+// per-output reduction order as csr_spmm → deterministic + parity-checkable.
+extern ""C"" __global__ __launch_bounds__(256) void csr_spmm_vec4(
+    const float* __restrict__ csrValues,
+    const int* __restrict__ csrColIndices,
+    const int* __restrict__ csrRowPointers,
+    const float* __restrict__ denseB,
+    float* __restrict__ output,
+    int M, int K, int N, int nnz)
+{
+    int row = blockIdx.x;
+    int col4 = (blockIdx.y * blockDim.x + threadIdx.x) * 4;
+
+    if (row >= M || col4 >= N) return;
+
+    int rowStart = csrRowPointers[row];
+    int rowEnd = csrRowPointers[row + 1];
+
+    float4 sum = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    for (int i = rowStart; i < rowEnd; i++)
+    {
+        int colA = csrColIndices[i];
+        float valA = csrValues[i];
+        float4 bv = *reinterpret_cast<const float4*>(&denseB[colA * N + col4]);
+        sum.x += valA * bv.x;
+        sum.y += valA * bv.y;
+        sum.z += valA * bv.z;
+        sum.w += valA * bv.w;
+    }
+
+    *reinterpret_cast<float4*>(&output[row * N + col4]) = sum;
+}
+
 // CSR SpMM with fused bias addition: C[M,N] = A[M,K] * B[K,N] + bias[N]
 extern ""C"" __global__ __launch_bounds__(256) void csr_spmm_bias(
     const float* __restrict__ csrValues,
@@ -568,6 +604,7 @@ extern ""C"" __global__ __launch_bounds__(256) void symmetric_degree_normalize(
             "csr_spmm",
             "csr_spmm_warp",
             "csr_spmm_double",
+            "csr_spmm_vec4",
             "csr_spmm_bias",
             "csr_spmm_bias_relu",
             // GNN message passing (issue #382: deterministic variants for bit-reproducible scatter)
