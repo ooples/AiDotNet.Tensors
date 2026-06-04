@@ -2005,6 +2005,330 @@ internal static partial class SimdGemm
     }
 
     /// <summary>
+    /// FP64 thin-M GEMM with A transposed (#368): C = Aᵀ·B where A is stored [k,m]
+    /// (lda=m) and B is [k,n]. Same broadcast-A 4×8 kernel as
+    /// <see cref="DgemmDirectParallelMInto"/> but A is read strided (a[i,p] = A[p·m+i],
+    /// the 4 row values at a depth are contiguous), so NO transpose is materialised —
+    /// the transpose-into-scratch alternative regresses at thin-M. n % 8 == 0; n-major
+    /// contiguous B and C; parallel over disjoint M-row-blocks (deterministic).
+    /// </summary>
+    [MethodImpl(Hot)]
+    public static unsafe void DgemmDirectParallelMIntoTransA(
+        ReadOnlySpan<double> a, ReadOnlySpan<double> b, Span<double> c, int m, int k, int n)
+    {
+        const int MRd = 4;
+        int mFull = (m / MRd) * MRd;
+        int numFullBlocks = mFull / MRd;
+        int cores = Math.Max(1, Helpers.CpuParallelSettings.MaxDegreeOfParallelism);
+        int numChunks = Math.Min(cores, Math.Max(1, (numFullBlocks + 1) / 2));
+        fixed (double* pA = a, pB = b, pC = c)
+        {
+            IntPtr ipA = (IntPtr)pA, ipB = (IntPtr)pB, ipC = (IntPtr)pC;
+            int kCap = k, nCap = n, mCap = m;
+            if (numChunks <= 1 || numFullBlocks == 0)
+                DgemmTransABlock(pA, pB, pC, 0, numFullBlocks, kCap, nCap, mCap);
+            else
+            {
+                int blocksPerChunk = (numFullBlocks + numChunks - 1) / numChunks;
+                Helpers.PersistentParallelExecutor.Instance.Execute(numChunks, chunk =>
+                {
+                    int bs = chunk * blocksPerChunk, be = Math.Min(bs + blocksPerChunk, numFullBlocks);
+                    if (bs < be) DgemmTransABlock((double*)ipA, (double*)ipB, (double*)ipC, bs, be, kCap, nCap, mCap);
+                });
+            }
+            for (int i = mFull; i < m; i++)
+            {
+                double* ci = pC + (long)i * n;
+                for (int j = 0; j < n; j++)
+                {
+                    double acc = 0.0;
+                    for (int p = 0; p < k; p++) acc += pA[(long)p * m + i] * pB[(long)p * n + j];
+                    ci[j] = acc;
+                }
+            }
+        }
+    }
+
+    private static unsafe void DgemmTransABlock(double* A, double* B, double* C, int blockStart, int blockEnd, int k, int n, int m)
+    {
+        const int MRd = 4;
+        for (int blk = blockStart; blk < blockEnd; blk++)
+        {
+            int i0 = blk * MRd;
+            for (int j = 0; j < n; j += 8)
+            {
+                var c00 = Vector256<double>.Zero; var c01 = Vector256<double>.Zero;
+                var c10 = Vector256<double>.Zero; var c11 = Vector256<double>.Zero;
+                var c20 = Vector256<double>.Zero; var c21 = Vector256<double>.Zero;
+                var c30 = Vector256<double>.Zero; var c31 = Vector256<double>.Zero;
+                double* bj = B + j;
+                for (int p = 0; p < k; p++)
+                {
+                    double* bp = bj + (long)p * n;
+                    var b0 = Avx.LoadVector256(bp);
+                    var b1 = Avx.LoadVector256(bp + 4);
+                    double* ap = A + (long)p * m + i0; // 4 row values, contiguous
+                    var av = Vector256.Create(ap[0]); c00 = Fma.MultiplyAdd(av, b0, c00); c01 = Fma.MultiplyAdd(av, b1, c01);
+                    av = Vector256.Create(ap[1]); c10 = Fma.MultiplyAdd(av, b0, c10); c11 = Fma.MultiplyAdd(av, b1, c11);
+                    av = Vector256.Create(ap[2]); c20 = Fma.MultiplyAdd(av, b0, c20); c21 = Fma.MultiplyAdd(av, b1, c21);
+                    av = Vector256.Create(ap[3]); c30 = Fma.MultiplyAdd(av, b0, c30); c31 = Fma.MultiplyAdd(av, b1, c31);
+                }
+                double* o0 = C + (long)(i0 + 0) * n + j; Avx.Store(o0, c00); Avx.Store(o0 + 4, c01);
+                double* o1 = C + (long)(i0 + 1) * n + j; Avx.Store(o1, c10); Avx.Store(o1 + 4, c11);
+                double* o2 = C + (long)(i0 + 2) * n + j; Avx.Store(o2, c20); Avx.Store(o2 + 4, c21);
+                double* o3 = C + (long)(i0 + 3) * n + j; Avx.Store(o3, c30); Avx.Store(o3 + 4, c31);
+            }
+        }
+    }
+
+    /// <summary>
+    /// FP64 thin-M GEMM with B transposed (#368): C = A·Bᵀ where B is stored [n,k]
+    /// (ldb=k). Both A[i,:] and Bstored[j,:] are contiguous rows of length k, so this
+    /// is the NT (dot-product) microkernel — 4 A-rows × 2 Bstored-rows, vector-FMA over
+    /// k with a horizontal reduce, no transpose materialised. n % 2 == 0; parallel over
+    /// disjoint M-row-blocks (deterministic). Slightly lower peak than the no-trans
+    /// kernel (the horizontal reductions) but far above the ~57 GF/s the packed path
+    /// gives transposed thin-M.
+    /// </summary>
+    [MethodImpl(Hot)]
+    public static unsafe void DgemmDirectParallelMIntoTransB(
+        ReadOnlySpan<double> a, ReadOnlySpan<double> b, Span<double> c, int m, int k, int n)
+    {
+        const int MRd = 4;
+        int mFull = (m / MRd) * MRd;
+        int numFullBlocks = mFull / MRd;
+        int cores = Math.Max(1, Helpers.CpuParallelSettings.MaxDegreeOfParallelism);
+        int numChunks = Math.Min(cores, Math.Max(1, (numFullBlocks + 1) / 2));
+        fixed (double* pA = a, pB = b, pC = c)
+        {
+            IntPtr ipA = (IntPtr)pA, ipB = (IntPtr)pB, ipC = (IntPtr)pC;
+            int kCap = k, nCap = n;
+            if (numChunks <= 1 || numFullBlocks == 0)
+                DgemmTransBBlock(pA, pB, pC, 0, numFullBlocks, kCap, nCap);
+            else
+            {
+                int blocksPerChunk = (numFullBlocks + numChunks - 1) / numChunks;
+                Helpers.PersistentParallelExecutor.Instance.Execute(numChunks, chunk =>
+                {
+                    int bs = chunk * blocksPerChunk, be = Math.Min(bs + blocksPerChunk, numFullBlocks);
+                    if (bs < be) DgemmTransBBlock((double*)ipA, (double*)ipB, (double*)ipC, bs, be, kCap, nCap);
+                });
+            }
+            for (int i = mFull; i < m; i++)
+            {
+                double* ai = pA + (long)i * k;
+                double* ci = pC + (long)i * n;
+                for (int j = 0; j < n; j++)
+                {
+                    double* bj = pB + (long)j * k;
+                    double acc = 0.0;
+                    for (int p = 0; p < k; p++) acc += ai[p] * bj[p];
+                    ci[j] = acc;
+                }
+            }
+        }
+    }
+
+    private static unsafe void DgemmTransBBlock(double* A, double* B, double* C, int blockStart, int blockEnd, int k, int n)
+    {
+        const int MRd = 4, NRd = 2;
+        int kVec = (k / 4) * 4;
+        for (int blk = blockStart; blk < blockEnd; blk++)
+        {
+            int i0 = blk * MRd;
+            double* a0 = A + (long)(i0 + 0) * k; double* a1 = A + (long)(i0 + 1) * k;
+            double* a2 = A + (long)(i0 + 2) * k; double* a3 = A + (long)(i0 + 3) * k;
+            for (int j = 0; j + NRd <= n; j += NRd)
+            {
+                double* bj0 = B + (long)(j + 0) * k; double* bj1 = B + (long)(j + 1) * k;
+                var acc00 = Vector256<double>.Zero; var acc01 = Vector256<double>.Zero;
+                var acc10 = Vector256<double>.Zero; var acc11 = Vector256<double>.Zero;
+                var acc20 = Vector256<double>.Zero; var acc21 = Vector256<double>.Zero;
+                var acc30 = Vector256<double>.Zero; var acc31 = Vector256<double>.Zero;
+                for (int p = 0; p < kVec; p += 4)
+                {
+                    var av0 = Avx.LoadVector256(a0 + p); var av1 = Avx.LoadVector256(a1 + p);
+                    var av2 = Avx.LoadVector256(a2 + p); var av3 = Avx.LoadVector256(a3 + p);
+                    var bv0 = Avx.LoadVector256(bj0 + p); var bv1 = Avx.LoadVector256(bj1 + p);
+                    acc00 = Fma.MultiplyAdd(av0, bv0, acc00); acc01 = Fma.MultiplyAdd(av0, bv1, acc01);
+                    acc10 = Fma.MultiplyAdd(av1, bv0, acc10); acc11 = Fma.MultiplyAdd(av1, bv1, acc11);
+                    acc20 = Fma.MultiplyAdd(av2, bv0, acc20); acc21 = Fma.MultiplyAdd(av2, bv1, acc21);
+                    acc30 = Fma.MultiplyAdd(av3, bv0, acc30); acc31 = Fma.MultiplyAdd(av3, bv1, acc31);
+                }
+                double s00 = Vector256.Sum(acc00), s01 = Vector256.Sum(acc01);
+                double s10 = Vector256.Sum(acc10), s11 = Vector256.Sum(acc11);
+                double s20 = Vector256.Sum(acc20), s21 = Vector256.Sum(acc21);
+                double s30 = Vector256.Sum(acc30), s31 = Vector256.Sum(acc31);
+                for (int p = kVec; p < k; p++)
+                {
+                    double a0p = a0[p], a1p = a1[p], a2p = a2[p], a3p = a3[p], b0p = bj0[p], b1p = bj1[p];
+                    s00 += a0p * b0p; s01 += a0p * b1p; s10 += a1p * b0p; s11 += a1p * b1p;
+                    s20 += a2p * b0p; s21 += a2p * b1p; s30 += a3p * b0p; s31 += a3p * b1p;
+                }
+                double* r0 = C + (long)(i0 + 0) * n + j; r0[0] = s00; r0[1] = s01;
+                double* r1 = C + (long)(i0 + 1) * n + j; r1[0] = s10; r1[1] = s11;
+                double* r2 = C + (long)(i0 + 2) * n + j; r2[0] = s20; r2[1] = s21;
+                double* r3 = C + (long)(i0 + 3) * n + j; r3[0] = s30; r3[1] = s31;
+            }
+        }
+    }
+
+    /// <summary>FP32 thin-M GEMM with A transposed (#368): C = Aᵀ·B, A stored [k,m]
+    /// (lda=m), strided-A 4×8 broadcast kernel (no transpose). n % 8 == 0; parallel-M
+    /// (deterministic). Float analog of <see cref="DgemmDirectParallelMIntoTransA"/>.</summary>
+    [MethodImpl(Hot)]
+    public static unsafe void SgemmDirectParallelMIntoTransA(
+        ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c, int m, int k, int n)
+    {
+        const int MRf = 4;
+        int mFull = (m / MRf) * MRf;
+        int numFullBlocks = mFull / MRf;
+        int cores = Math.Max(1, Helpers.CpuParallelSettings.MaxDegreeOfParallelism);
+        int numChunks = Math.Min(cores, Math.Max(1, (numFullBlocks + 1) / 2));
+        fixed (float* pA = a, pB = b, pC = c)
+        {
+            IntPtr ipA = (IntPtr)pA, ipB = (IntPtr)pB, ipC = (IntPtr)pC;
+            int kCap = k, nCap = n, mCap = m;
+            if (numChunks <= 1 || numFullBlocks == 0)
+                SgemmTransABlock(pA, pB, pC, 0, numFullBlocks, kCap, nCap, mCap);
+            else
+            {
+                int blocksPerChunk = (numFullBlocks + numChunks - 1) / numChunks;
+                Helpers.PersistentParallelExecutor.Instance.Execute(numChunks, chunk =>
+                {
+                    int bs = chunk * blocksPerChunk, be = Math.Min(bs + blocksPerChunk, numFullBlocks);
+                    if (bs < be) SgemmTransABlock((float*)ipA, (float*)ipB, (float*)ipC, bs, be, kCap, nCap, mCap);
+                });
+            }
+            for (int i = mFull; i < m; i++)
+            {
+                float* ci = pC + (long)i * n;
+                for (int j = 0; j < n; j++)
+                {
+                    float acc = 0f;
+                    for (int p = 0; p < k; p++) acc += pA[(long)p * m + i] * pB[(long)p * n + j];
+                    ci[j] = acc;
+                }
+            }
+        }
+    }
+
+    private static unsafe void SgemmTransABlock(float* A, float* B, float* C, int blockStart, int blockEnd, int k, int n, int m)
+    {
+        const int MRf = 4;
+        for (int blk = blockStart; blk < blockEnd; blk++)
+        {
+            int i0 = blk * MRf;
+            for (int j = 0; j < n; j += 8)
+            {
+                var c0 = Vector256<float>.Zero; var c1 = Vector256<float>.Zero;
+                var c2 = Vector256<float>.Zero; var c3 = Vector256<float>.Zero;
+                float* bj = B + j;
+                for (int p = 0; p < k; p++)
+                {
+                    var b0 = Avx.LoadVector256(bj + (long)p * n);
+                    float* ap = A + (long)p * m + i0;
+                    c0 = Fma.MultiplyAdd(Vector256.Create(ap[0]), b0, c0);
+                    c1 = Fma.MultiplyAdd(Vector256.Create(ap[1]), b0, c1);
+                    c2 = Fma.MultiplyAdd(Vector256.Create(ap[2]), b0, c2);
+                    c3 = Fma.MultiplyAdd(Vector256.Create(ap[3]), b0, c3);
+                }
+                Avx.Store(C + (long)(i0 + 0) * n + j, c0);
+                Avx.Store(C + (long)(i0 + 1) * n + j, c1);
+                Avx.Store(C + (long)(i0 + 2) * n + j, c2);
+                Avx.Store(C + (long)(i0 + 3) * n + j, c3);
+            }
+        }
+    }
+
+    /// <summary>FP32 thin-M GEMM with B transposed (#368): C = A·Bᵀ, B stored [n,k]
+    /// (ldb=k), NT 4×2 dot-product kernel (Bstored rows contiguous; no transpose).
+    /// parallel-M (deterministic). Float analog of
+    /// <see cref="DgemmDirectParallelMIntoTransB"/>.</summary>
+    [MethodImpl(Hot)]
+    public static unsafe void SgemmDirectParallelMIntoTransB(
+        ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c, int m, int k, int n)
+    {
+        const int MRf = 4;
+        int mFull = (m / MRf) * MRf;
+        int numFullBlocks = mFull / MRf;
+        int cores = Math.Max(1, Helpers.CpuParallelSettings.MaxDegreeOfParallelism);
+        int numChunks = Math.Min(cores, Math.Max(1, (numFullBlocks + 1) / 2));
+        fixed (float* pA = a, pB = b, pC = c)
+        {
+            IntPtr ipA = (IntPtr)pA, ipB = (IntPtr)pB, ipC = (IntPtr)pC;
+            int kCap = k, nCap = n;
+            if (numChunks <= 1 || numFullBlocks == 0)
+                SgemmTransBBlock(pA, pB, pC, 0, numFullBlocks, kCap, nCap);
+            else
+            {
+                int blocksPerChunk = (numFullBlocks + numChunks - 1) / numChunks;
+                Helpers.PersistentParallelExecutor.Instance.Execute(numChunks, chunk =>
+                {
+                    int bs = chunk * blocksPerChunk, be = Math.Min(bs + blocksPerChunk, numFullBlocks);
+                    if (bs < be) SgemmTransBBlock((float*)ipA, (float*)ipB, (float*)ipC, bs, be, kCap, nCap);
+                });
+            }
+            for (int i = mFull; i < m; i++)
+            {
+                float* ai = pA + (long)i * k;
+                float* ci = pC + (long)i * n;
+                for (int j = 0; j < n; j++)
+                {
+                    float* bj = pB + (long)j * k;
+                    float acc = 0f;
+                    for (int p = 0; p < k; p++) acc += ai[p] * bj[p];
+                    ci[j] = acc;
+                }
+            }
+        }
+    }
+
+    private static unsafe void SgemmTransBBlock(float* A, float* B, float* C, int blockStart, int blockEnd, int k, int n)
+    {
+        const int MRf = 4, NRf = 2;
+        int kVec = (k / 8) * 8;
+        for (int blk = blockStart; blk < blockEnd; blk++)
+        {
+            int i0 = blk * MRf;
+            float* a0 = A + (long)(i0 + 0) * k; float* a1 = A + (long)(i0 + 1) * k;
+            float* a2 = A + (long)(i0 + 2) * k; float* a3 = A + (long)(i0 + 3) * k;
+            for (int j = 0; j + NRf <= n; j += NRf)
+            {
+                float* bj0 = B + (long)(j + 0) * k; float* bj1 = B + (long)(j + 1) * k;
+                var acc00 = Vector256<float>.Zero; var acc01 = Vector256<float>.Zero;
+                var acc10 = Vector256<float>.Zero; var acc11 = Vector256<float>.Zero;
+                var acc20 = Vector256<float>.Zero; var acc21 = Vector256<float>.Zero;
+                var acc30 = Vector256<float>.Zero; var acc31 = Vector256<float>.Zero;
+                for (int p = 0; p < kVec; p += 8)
+                {
+                    var av0 = Avx.LoadVector256(a0 + p); var av1 = Avx.LoadVector256(a1 + p);
+                    var av2 = Avx.LoadVector256(a2 + p); var av3 = Avx.LoadVector256(a3 + p);
+                    var bv0 = Avx.LoadVector256(bj0 + p); var bv1 = Avx.LoadVector256(bj1 + p);
+                    acc00 = Fma.MultiplyAdd(av0, bv0, acc00); acc01 = Fma.MultiplyAdd(av0, bv1, acc01);
+                    acc10 = Fma.MultiplyAdd(av1, bv0, acc10); acc11 = Fma.MultiplyAdd(av1, bv1, acc11);
+                    acc20 = Fma.MultiplyAdd(av2, bv0, acc20); acc21 = Fma.MultiplyAdd(av2, bv1, acc21);
+                    acc30 = Fma.MultiplyAdd(av3, bv0, acc30); acc31 = Fma.MultiplyAdd(av3, bv1, acc31);
+                }
+                float s00 = Vector256.Sum(acc00), s01 = Vector256.Sum(acc01);
+                float s10 = Vector256.Sum(acc10), s11 = Vector256.Sum(acc11);
+                float s20 = Vector256.Sum(acc20), s21 = Vector256.Sum(acc21);
+                float s30 = Vector256.Sum(acc30), s31 = Vector256.Sum(acc31);
+                for (int p = kVec; p < k; p++)
+                {
+                    float a0p = a0[p], a1p = a1[p], a2p = a2[p], a3p = a3[p], b0p = bj0[p], b1p = bj1[p];
+                    s00 += a0p * b0p; s01 += a0p * b1p; s10 += a1p * b0p; s11 += a1p * b1p;
+                    s20 += a2p * b0p; s21 += a2p * b1p; s30 += a3p * b0p; s31 += a3p * b1p;
+                }
+                float* r0 = C + (long)(i0 + 0) * n + j; r0[0] = s00; r0[1] = s01;
+                float* r1 = C + (long)(i0 + 1) * n + j; r1[0] = s10; r1[1] = s11;
+                float* r2 = C + (long)(i0 + 2) * n + j; r2[0] = s20; r2[1] = s21;
+                float* r3 = C + (long)(i0 + 3) * n + j; r3[0] = s30; r3[1] = s31;
+            }
+        }
+    }
+
+    /// <summary>
     /// #209 close-parity: parallel-M wrapper around SgemmDirect's tile loop.
     /// Distributes the outer-M loop's Mr=6 blocks across cores via the
     /// persistent thread pool. Each chunk handles a contiguous range of
