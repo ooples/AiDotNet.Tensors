@@ -74,6 +74,14 @@ public static class SparseOps
                 // HIP/Metal mirrors + FP64 + the perf bar land (tracked in #515).
                 if (CudaSparseBackend.IsAvailable)
                     outArr = CudaSparseBackend.SpMM(rowPtr, colIdx, valsArr, bArr, rows, k, n);
+                // NOTE (#515): the managed HIP custom kernel (HipCustomSparseBackend)
+                // is implemented + compiled but intentionally NOT routed here yet. Its
+                // only cheap availability signal, HipBackend.IsHipAvailable, reports
+                // true whenever the HIP runtime sees a device even when the HIP kernel
+                // toolchain can't actually build a binary (e.g. a gfx-mismatched /
+                // header-missing install), which would regress this path to a failing
+                // backend instead of the CPU/vendor fallbacks. Wiring it needs a
+                // kernel-load-strict gate validated on a healthy ROCm runner.
                 else if (CuSparseBackend.IsAvailable)
                     outArr = CuSparseBackend.SpMM(rowPtr, colIdx, valsArr, bArr, rows, k, n);
                 else if (HipSparseBackend.IsAvailable)
@@ -98,16 +106,35 @@ public static class SparseOps
             }
             // else fall through to scalar tier below.
         }
-        if (typeof(T) == typeof(double) && System.Numerics.Vector.IsHardwareAccelerated)
+        if (typeof(T) == typeof(double))
         {
             var valsArr = (double[])(object)csr.DataVector.ToArray();
             var bArr = (double[])(object)b.ToArray();
-            var outArr = new double[rows * n];
-            CsrDenseSimd.MultiplyDouble(rowPtr, colIdx, valsArr, bArr, outArr, rows, n);
-            var outSpanDouble = output.AsWritableSpan();
-            for (int i = 0; i < outSpanDouble.Length; i++) outSpanDouble[i] = (T)(object)outArr[i];
-            _ = k;
-            return output;
+            double[]? outArr = null;
+
+            // Tier 0 — GPU dispatch via the managed FP64 CSR kernel (#515). The
+            // vendor host-array paths (cuSPARSE/rocSPARSE) aren't wired for FP64, so
+            // the managed CUDA kernel is the only GPU double path; previously double
+            // had no GPU tier at all and went straight to CPU. (The HIP FP64 mirror
+            // exists but isn't routed yet — see the float tier's note.)
+            if (rows * (long)n >= GpuDispatchThreshold && CudaSparseBackend.IsAvailable)
+                outArr = CudaSparseBackend.SpMM(rowPtr, colIdx, valsArr, bArr, rows, k, n);
+
+            // Tier 1 — CPU SIMD on hardware-accelerated Vector<T>.
+            if (outArr is null && System.Numerics.Vector.IsHardwareAccelerated)
+            {
+                outArr = new double[rows * n];
+                CsrDenseSimd.MultiplyDouble(rowPtr, colIdx, valsArr, bArr, outArr, rows, n);
+            }
+
+            if (outArr is not null)
+            {
+                var outSpanDouble = output.AsWritableSpan();
+                for (int i = 0; i < outSpanDouble.Length; i++) outSpanDouble[i] = (T)(object)outArr[i];
+                _ = k;
+                return output;
+            }
+            // else fall through to the generic scalar tier below.
         }
 
         var valsT = csr.DataVector;

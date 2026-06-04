@@ -2615,6 +2615,97 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         LaunchKernel2D(kernel, gridX, gridY, (uint)DefaultBlockSize, 1, args);
     }
 
+    /// <summary>
+    /// Warp-per-row CSR SpMM (issue #515): launches <c>csr_spmm_warp</c>, where each
+    /// warp (32 lanes) owns one output row and the lanes stride over columns. Best
+    /// for small/moderate N (the lanes cover the columns with coalesced B reads);
+    /// the 2-D <see cref="CsrSpMM"/> is better for wide N. Same numerics as
+    /// <see cref="CsrSpMM"/> (per-output sequential reduction → deterministic).
+    /// </summary>
+    public unsafe void CsrSpMMWarp(
+        IGpuBuffer csrValues,
+        IGpuBuffer csrColIndices,
+        IGpuBuffer csrRowPointers,
+        IGpuBuffer denseB,
+        IGpuBuffer output,
+        int M, int K, int N, int nnz)
+    {
+        if (!IsAvailable)
+            throw new InvalidOperationException("CUDA backend is not available.");
+
+        if (!_kernelCache.TryGetValue("csr_spmm_warp", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: csr_spmm_warp");
+
+        using var _ = PushContext();
+
+        // One warp (32 lanes) per row; DefaultBlockSize threads/block => 8 warps/block.
+        uint gridX = (uint)((M + 7) / 8);
+
+        IntPtr valuesPtr = csrValues.Handle;
+        IntPtr colIndicesPtr = csrColIndices.Handle;
+        IntPtr rowPointersPtr = csrRowPointers.Handle;
+        IntPtr denseBPtr = denseB.Handle;
+        IntPtr outputPtr = output.Handle;
+
+        void** args = stackalloc void*[9];
+        args[0] = &valuesPtr;
+        args[1] = &colIndicesPtr;
+        args[2] = &rowPointersPtr;
+        args[3] = &denseBPtr;
+        args[4] = &outputPtr;
+        args[5] = &M;
+        args[6] = &K;
+        args[7] = &N;
+        args[8] = &nnz;
+
+        LaunchKernel(kernel, gridX, (uint)DefaultBlockSize, args);
+    }
+
+    /// <summary>
+    /// FP64 CSR SpMM (issue #515): launches <c>csr_spmm_double</c>. The CSR-value /
+    /// dense-B / output buffers carry <c>double</c> payloads (byte buffers); the int
+    /// CSR index buffers are unchanged. Same 2-D launch + numerics as the float
+    /// <see cref="CsrSpMM"/>.
+    /// </summary>
+    public unsafe void CsrSpMMDouble(
+        IGpuBuffer csrValues,
+        IGpuBuffer csrColIndices,
+        IGpuBuffer csrRowPointers,
+        IGpuBuffer denseB,
+        IGpuBuffer output,
+        int M, int K, int N, int nnz)
+    {
+        if (!IsAvailable)
+            throw new InvalidOperationException("CUDA backend is not available.");
+
+        if (!_kernelCache.TryGetValue("csr_spmm_double", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: csr_spmm_double");
+
+        using var _ = PushContext();
+
+        uint gridX = (uint)M;
+        uint gridY = (uint)((N + DefaultBlockSize - 1) / DefaultBlockSize);
+
+        IntPtr valuesPtr = csrValues.Handle;
+        IntPtr colIndicesPtr = csrColIndices.Handle;
+        IntPtr rowPointersPtr = csrRowPointers.Handle;
+        IntPtr denseBPtr = denseB.Handle;
+        IntPtr outputPtr = output.Handle;
+
+        void** args = stackalloc void*[9];
+        args[0] = &valuesPtr;
+        args[1] = &colIndicesPtr;
+        args[2] = &rowPointersPtr;
+        args[3] = &denseBPtr;
+        args[4] = &outputPtr;
+        args[5] = &M;
+        args[6] = &K;
+        args[7] = &N;
+        args[8] = &nnz;
+
+        LaunchKernel2D(kernel, gridX, gridY, (uint)DefaultBlockSize, 1, args);
+    }
+
     /// <inheritdoc/>
     public unsafe void CsrSpMMBias(
         IGpuBuffer csrValues,
