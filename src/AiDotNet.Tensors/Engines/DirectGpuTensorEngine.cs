@@ -229,7 +229,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // unused intermediates rode along until the next deliberate cache clear.
     // 512 keeps long-loop memory pressure bounded while leaving headroom for
     // chained-op GPU pipelines (BatchNorm/LayerNorm get unhappy below ~128).
-    private const int DefaultActivationCacheSize = 512;
+    // The entry-count cap is a backstop only; the 75%-VRAM byte cap (_maxActivationCacheBytes)
+    // is the real memory guard. It was 512, but a single cortex/transformer TRAINING STEP caches
+    // far more than 512 activations, so a 512 cap fired eviction EVERY step and offloaded
+    // (downloaded) forward activations that backward then re-uploaded — a GPU->CPU->GPU thrash
+    // that starved the GPU to ~13% utilization. Raised to 131072 so eviction is driven by actual
+    // VRAM pressure: a model whose per-step working set fits in 75% VRAM stays fully resident
+    // (full GPU util), and the byte cap still bounds memory for large models.
+    private const int DefaultActivationCacheSize = 131072;
     private int _maxActivationCacheSize = DefaultActivationCacheSize;
 
     /// <summary>
@@ -1078,8 +1085,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // for the unit-consistency contract.
             bool overMemory = _maxActivationCacheBytes > 0
                 && _currentActivationCacheBytes + buffer.SizeInBytes > _maxActivationCacheBytes;
-            if (overCount || overMemory)
+            if (overMemory || overCount)
             {
+                // Evict the oldest activations, offloading any pending deferred downloads so a
+                // later CPU read / backward re-upload still sees correct data (#226 contract).
+                //
+                // GPU-utilization fix: the REAL guard is the 75%-VRAM byte cap (overMemory).
+                // The entry-COUNT cap is now deliberately huge (see DefaultActivationCacheSize)
+                // so it does NOT fire mid-training-step. A training step's forward activations
+                // must stay GPU-resident because backward re-reads them; evicting them early
+                // (the old 512 count cap fired every step) forced a download-in-forward +
+                // re-upload-in-backward thrash that starved the GPU to ~13% util. With the count
+                // cap raised, a model whose per-step working set fits in VRAM keeps everything
+                // resident → no offload → full GPU utilization; only genuine VRAM pressure
+                // triggers the (correct, bounded) offload. Memory stays bounded by the byte cap.
                 evicted = EvictOldestActivationsUnsafe();
             }
 
@@ -1170,39 +1189,31 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         long threshold = timestamps[removeCount - 1];
 
         // Remove entries at or below threshold, collect for disposal outside lock.
-        // Skip entries whose key still has a pending deferred materializer — otherwise
-        // the later TryMaterialize call reads a freed OpenCL buffer and crashes with
-        // CL_INVALID_MEM_OBJECT (issue #226). DeferredArrayMaterializer is the single
-        // source of truth; both FinishGpuOp and DeferTensorResult register here.
         int removed = 0;
         for (int i = 0; i < entries.Length && removed < removeCount; i++)
         {
-            if (entries[i].Value.Timestamp <= threshold)
-            {
-                // #226: an entry whose key still has a pending deferred download cannot
-                // simply have its buffer dropped — a later CPU read of that array would see
-                // garbage / hit a freed buffer. The original code SKIPPED such entries, but
-                // during pure-GPU training essentially every activation is registered as
-                // pending-deferred and never read on the CPU, so skipping made the cache
-                // un-evictable: it blew past both the count cap AND the 75%-VRAM byte cap and
-                // OOM'd the card (a tiny d256/L2 cortex pegged 12 GB past ~200K tokens — the
-                // long-hunted training OOM). Fix: MATERIALIZE the pending download now (copies
-                // the buffer into its CPU array while the buffer is still alive — the exact
-                // contract InvalidateActivationCacheEntry already relies on), THEN free the
-                // buffer. Correctness preserved; memory actually reclaimed so the cap holds.
-                if (Helpers.DeferredArrayMaterializer.IsPending(entries[i].Key))
-                {
-                    try { Helpers.DeferredArrayMaterializer.TryMaterialize(entries[i].Key); }
-                    catch { Helpers.DeferredArrayMaterializer.Remove(entries[i].Key); }
-                }
+            if (entries[i].Value.Timestamp > threshold) continue;
 
-                if (_activationCache.TryRemove(entries[i].Key, out var entry))
-                {
-                    System.Threading.Interlocked.Add(ref _currentActivationCacheBytes,
-                        -entry.Buffer.SizeInBytes);
-                    toDispose.Add(entry);
-                    removed++;
-                }
+            // #226: an entry whose key still has a pending deferred download owns the ONLY
+            // copy of its data (the CPU array hasn't been populated yet). Dropping its buffer
+            // outright would make a later CPU read / backward re-upload see garbage / hit a
+            // freed buffer (CL_INVALID_MEM_OBJECT). So MATERIALIZE the pending download now
+            // (copy the buffer into its CPU array while the buffer is still alive — the exact
+            // contract InvalidateActivationCacheEntry relies on), THEN free the buffer below.
+            // Eviction only fires under real VRAM pressure now (the count cap is huge — see
+            // CacheActivation), so this offload is rare, not the per-step thrash it used to be.
+            if (Helpers.DeferredArrayMaterializer.IsPending(entries[i].Key))
+            {
+                try { Helpers.DeferredArrayMaterializer.TryMaterialize(entries[i].Key); }
+                catch { Helpers.DeferredArrayMaterializer.Remove(entries[i].Key); }
+            }
+
+            if (_activationCache.TryRemove(entries[i].Key, out var entry))
+            {
+                System.Threading.Interlocked.Add(ref _currentActivationCacheBytes,
+                    -entry.Buffer.SizeInBytes);
+                toDispose.Add(entry);
+                removed++;
             }
         }
 

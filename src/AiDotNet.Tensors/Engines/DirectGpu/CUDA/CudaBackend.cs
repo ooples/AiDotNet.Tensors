@@ -12647,7 +12647,6 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             return;
 
         _disposed = true;
-
         // Finalizer path (disposing == false) or any process/domain teardown:
         //   - The managed members (GpuBufferPool's ConcurrentBag/ThreadLocal, the cuDNN
         //     helpers) may already have been finalized by the runtime — touching them
@@ -13625,7 +13624,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         // Finalizer: never touch managed members or the CUDA driver — Dispose(bool)'s
         // !disposing/IsRuntimeTearingDown/ProcessExiting guard makes this a no-op (the OS
         // reclaims the context + device memory at process exit). The try/catch is
-        // belt-and-suspenders: a finalizer must NEVER throw, even if that contract changes.
+        // belt-and-suspenders: a finalizer must NEVER throw, even if that contract changes
+        // or a future undisposed-backend path reaches managed pools that are already
+        // finalized during GC (ObjectDisposedException).
         try { Dispose(disposing: false); } catch { }
     }
 

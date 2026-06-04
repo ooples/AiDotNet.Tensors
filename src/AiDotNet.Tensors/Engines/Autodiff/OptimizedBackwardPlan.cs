@@ -112,7 +112,9 @@ internal sealed class OptimizedBackwardPlan<T>
         // all forward activations stayed GPU-pinned for the whole backward, pegging the card at its memory limit →
         // OOM at scale. Skip the loss + sources/retained tensors: the loss IS an entry.Output (the loss op's
         // output), and the caller reads its value after backward, so it must never be freed mid-walk — same
-        // contract as CompiledDelegateChain.Execute. (Gated to GPU engine; materialize-then-free is correctness-safe.)
+        // contract as CompiledDelegateChain.Execute. Sources and retain-grad tensors are likewise consumed by
+        // the caller after backward and must survive too. (Gated to GPU engine; materialize-then-free is
+        // correctness-safe.)
         var gpuEngine = _engine as AiDotNet.Tensors.Engines.DirectGpuTensorEngine;
         HashSet<Tensor<T>>? freeSkip = null;
         if (gpuEngine is not null)
