@@ -3124,6 +3124,71 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             M, K, N, nnz);
     }
 
+    /// <summary>Warp-per-row CSR SpMM (issue #515): launches <c>csr_spmm_warp</c>
+    /// (one warp per output row). The kernel uses only blockIdx.x/threadIdx.x, so it
+    /// runs on the shared 2-D launcher with gridY=1. Same numerics as
+    /// <see cref="CsrSpMM"/>. CUDA mirror: <see cref="CUDA.CudaBackend.CsrSpMMWarp"/>.</summary>
+    public void CsrSpMMWarp(
+        IGpuBuffer csrValues,
+        IGpuBuffer csrColIndices,
+        IGpuBuffer csrRowPointers,
+        IGpuBuffer denseB,
+        IGpuBuffer output,
+        int M, int K, int N, int nnz)
+    {
+        if (!IsAvailable)
+            throw new InvalidOperationException("HIP backend is not available.");
+
+        if (!_kernelCache.TryGetValue("csr_spmm_warp", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: csr_spmm_warp");
+
+        // One warp (32 lanes) per row; DefaultBlockSize threads/block => 8 warps/block.
+        int gridX = (M * 32 + DefaultBlockSize - 1) / DefaultBlockSize;
+        int gridY = 1;
+
+        var valuesHandle = ((HipGpuBuffer)csrValues).Handle;
+        var colIndicesHandle = ((HipGpuBuffer)csrColIndices).Handle;
+        var rowPointersHandle = ((HipGpuBuffer)csrRowPointers).Handle;
+        var denseBHandle = ((HipGpuBuffer)denseB).Handle;
+        var outputHandle = ((HipGpuBuffer)output).Handle;
+
+        LaunchKernel2D(kernel, gridX, gridY, DefaultBlockSize, 1,
+            valuesHandle, colIndicesHandle, rowPointersHandle, denseBHandle, outputHandle,
+            M, K, N, nnz);
+    }
+
+    /// <summary>FP64 CSR SpMM (issue #515): launches <c>csr_spmm_double</c>. The
+    /// value / dense / output buffers carry <c>double</c> payloads (byte buffers); the
+    /// int CSR index buffers are unchanged. CUDA mirror:
+    /// <see cref="CUDA.CudaBackend.CsrSpMMDouble"/>.</summary>
+    public void CsrSpMMDouble(
+        IGpuBuffer csrValues,
+        IGpuBuffer csrColIndices,
+        IGpuBuffer csrRowPointers,
+        IGpuBuffer denseB,
+        IGpuBuffer output,
+        int M, int K, int N, int nnz)
+    {
+        if (!IsAvailable)
+            throw new InvalidOperationException("HIP backend is not available.");
+
+        if (!_kernelCache.TryGetValue("csr_spmm_double", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: csr_spmm_double");
+
+        int gridX = M;
+        int gridY = (N + DefaultBlockSize - 1) / DefaultBlockSize;
+
+        var valuesHandle = ((HipGpuBuffer)csrValues).Handle;
+        var colIndicesHandle = ((HipGpuBuffer)csrColIndices).Handle;
+        var rowPointersHandle = ((HipGpuBuffer)csrRowPointers).Handle;
+        var denseBHandle = ((HipGpuBuffer)denseB).Handle;
+        var outputHandle = ((HipGpuBuffer)output).Handle;
+
+        LaunchKernel2D(kernel, gridX, gridY, DefaultBlockSize, 1,
+            valuesHandle, colIndicesHandle, rowPointersHandle, denseBHandle, outputHandle,
+            M, K, N, nnz);
+    }
+
     /// <inheritdoc/>
     public void CsrSpMMBias(
         IGpuBuffer csrValues,
