@@ -70,6 +70,9 @@ public class InferenceWeightCacheInvalidationTests
         }
     }
 
+#if NET5_0_OR_GREATER
+    // SgemmWithInt8CachedB (and the int8 pre-packed cache) only exist on
+    // net5+ — the whole Path-D region in SimdGemm is NET5_0_OR_GREATER.
     [Fact]
     public void SgemmWithInt8CachedB_AfterInPlaceWeightMutation_InvalidateAll_UsesFreshWeights()
     {
@@ -121,6 +124,7 @@ public class InferenceWeightCacheInvalidationTests
             }
         }
     }
+#endif
 
     private static void AssertMatchesNaive(
         float[] a, float[] b, float[] c, int m, int k, int n, string label)
