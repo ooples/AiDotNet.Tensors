@@ -707,6 +707,15 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         // Compile SNN kernels (STDP, spike traces, RBF, PRNG, 2:4 structured sparsity)
         _snnModule = CompileKernelModule(device, CudaSnnKernels.GetSource(), "snn_kernels", CudaSnnKernels.GetKernelNames());
 
+        // Compile GPU-resident optimizer kernels (adam/adamw/sgd/momentum/nag/
+        // adagrad/rmsprop/adadelta/adamax/nadam/lamb/lars/lion/amsgrad/ftrl
+        // *_update). Without this the in-place GPU optimizer step (GpuOptimizer.
+        // TryXStep → IDirectGpuBackend.XUpdate) throws "CUDA kernel not found:
+        // <name>_update" for every kernel that is NOT also duplicated into the
+        // neuralnet module (adam/adagrad/rmsprop/lamb/adamw/sgd/... were dead),
+        // so every optimizer silently fell back to the CPU weight update.
+        CompileKernelModule(device, CudaOptimizerKernels.GetSource(), "optimizer_kernels", CudaOptimizerKernels.GetKernelNames());
+
         // Compile reduction kernels (mean, variance, std, norm, logsumexp, product, cumsum)
         CompileKernelModule(device, CudaReductionKernels.GetSource(), "reduction_kernels", CudaReductionKernels.GetKernelNames());
 
@@ -1093,6 +1102,19 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             throw new ArgumentException("Destination array is too small.", nameof(destination));
 
         using var _ = PushContext();
+
+        // Synchronize the compute stream before the device→host copy. Kernels
+        // launch on `_stream` (a non-default stream), but cuMemcpyDtoH below
+        // issues on the null stream. With a non-blocking compute stream the
+        // null stream does NOT implicitly wait for it, so the copy can race
+        // ahead of a just-launched kernel and read stale device memory — most
+        // visibly the in-place GPU-resident optimizer update, whose write would
+        // then be silently lost on the immediately-following host read (the
+        // value oscillated run-to-run between updated and pre-step). One stream
+        // sync on the host-read path (already a synchronization point) closes
+        // the race with no effect on the GPU-resident training hot path.
+        CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamSynchronize(_stream), "cuStreamSynchronize(download)");
+
         ulong byteSize = (ulong)(buffer.Size * sizeof(float));
 
         unsafe
