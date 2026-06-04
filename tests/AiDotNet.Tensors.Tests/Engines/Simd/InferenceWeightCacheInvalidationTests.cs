@@ -70,6 +70,58 @@ public class InferenceWeightCacheInvalidationTests
         }
     }
 
+    [Fact]
+    public void SgemmWithInt8CachedB_AfterInPlaceWeightMutation_InvalidateAll_UsesFreshWeights()
+    {
+        // Same contract as the float path, on the weight-only int8 cache.
+        // Tolerance is the int8 quantization error (per-tensor symmetric,
+        // 35-40 dB SNR), not float rounding.
+        const int m = 8, k = 512, n = 64;
+        var rng = new Random(540);
+        var a = new float[m * k];
+        var b = new float[k * n];
+        for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < b.Length; i++) b[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        var c1 = new float[m * n];
+        SimdGemm.SgemmWithInt8CachedB(a, b, c1, m, k, n);
+        AssertMatchesNaiveQuantized(a, b, c1, m, k, n, "initial int8 call");
+
+        for (int i = 0; i < b.Length; i++) b[i] = -b[i] * 0.5f + 0.25f;
+        InferenceWeightCache.InvalidateAll();
+
+        var c2 = new float[m * n];
+        SimdGemm.SgemmWithInt8CachedB(a, b, c2, m, k, n);
+        AssertMatchesNaiveQuantized(a, b, c2, m, k, n, "post-mutation int8 call");
+    }
+
+    private static void AssertMatchesNaiveQuantized(
+        float[] a, float[] b, float[] c, int m, int k, int n, string label)
+    {
+        // Per-element bound: int8 symmetric quantization of B contributes
+        // |err| <= scale/2 per product term; accumulate over K with the A
+        // magnitudes. A loose absolute bound of 2% of the accumulated
+        // |a|·|b| magnitude comfortably covers it while still failing hard
+        // on stale weights (B's mutation flips sign and shifts by 0.25 —
+        // stale results differ by O(1), not O(0.02)).
+        for (int i = 0; i < m; i++)
+        {
+            for (int j = 0; j < n; j++)
+            {
+                double acc = 0, mag = 0;
+                for (int p = 0; p < k; p++)
+                {
+                    acc += (double)a[i * k + p] * b[p * n + j];
+                    mag += Math.Abs((double)a[i * k + p] * b[p * n + j]);
+                }
+                double got = c[i * n + j];
+                double tol = 0.02 * Math.Max(1.0, mag);
+                Assert.True(Math.Abs(got - acc) <= tol,
+                    $"{label}: C[{i},{j}] = {got}, expected {acc} ± {tol} (stale packed int8 weights?)");
+            }
+        }
+    }
+
     private static void AssertMatchesNaive(
         float[] a, float[] b, float[] c, int m, int k, int n, string label)
     {

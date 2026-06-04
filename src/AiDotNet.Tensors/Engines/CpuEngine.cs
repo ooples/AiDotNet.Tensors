@@ -14813,6 +14813,14 @@ public partial class CpuEngine : ITensorLevelEngine
                 maxIndices = new int[batch, channels, outputHeight, outputWidth, 2];
                 var captured = input;
                 int ph = poolH, pw = poolW, sh = strideH, sw = strideW;
+                // No backwardFn / savedState: this branch is gated to
+                // GradientTape<T>.Current is null (inference-only trace), so
+                // replay never runs a backward. Recording
+                // MaxPool2DWithIndicesBackward + the zero-filled maxIndices
+                // here would (a) pin a potentially large
+                // int[batch, channels, outH, outW, 2] for the lifetime of
+                // the lazy graph / compiled plan, and (b) hand any future
+                // backward consumer corrupt all-zero routing indices.
                 return scope.RecordUnary(LazyNodeType.MaxPool2D, "MaxPool2DWithIndices", input,
                     new[] { batch, channels, outputHeight, outputWidth },
                     (eng, output) =>
@@ -14826,9 +14834,7 @@ public partial class CpuEngine : ITensorLevelEngine
                             var eager = eng.MaxPool2DWithIndices(captured, new[] { ph, pw }, new[] { sh, sw }, out _);
                             eager.AsSpan().CopyTo(output.AsWritableSpan());
                         }
-                    },
-                    BackwardFunctions<T>.MaxPool2DWithIndicesBackward,
-                    new object[] { maxIndices, poolSize, stride });
+                    });
             }
         }
 
