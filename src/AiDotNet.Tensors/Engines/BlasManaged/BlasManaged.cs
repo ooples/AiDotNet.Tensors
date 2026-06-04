@@ -45,6 +45,22 @@ public static partial class BlasManaged
     internal const long MachineKernelMinWork = 4_000_000;
 
     /// <summary>
+    /// #368 thin-M fast path bounds. The no-pack direct 6×16 parallel kernel
+    /// (<see cref="Simd.SimdGemm.SgemmDirectParallelMInto"/>) beats both the
+    /// machine-code path and native OpenBLAS for thin/moderate-M, N-aligned GEMMs
+    /// (measured on a 32-thread AVX2 box, K=784, N=512: M128 464 vs OpenBLAS 335,
+    /// M512 745 vs 523 GF/s; the general dispatch otherwise routes these to the
+    /// #409 machine-code path at ~55 GF/s). It loses past these bounds, where the
+    /// B re-stream cost dominates and the packed paths win (M2048 613 vs 692,
+    /// N1024 510 vs 629). Bounds are deliberately conservative — only the proven
+    /// winning box — to keep every other shape on its tuned path.
+    /// </summary>
+    private const int ThinMDirectMinM = 64;     // enough Mr=6 blocks to parallelize
+    private const int ThinMDirectMaxM = 1024;   // above this the packed path wins
+    private const int ThinMDirectMaxN = 512;    // above this B re-stream dominates
+    private const int ThinMDirectMaxK = 1024;   // tested winning range
+
+    /// <summary>
     /// Sub-issue F (#374): when true, <see cref="Helpers.BlasProvider.TryGemm"/> and
     /// <see cref="Helpers.BlasProvider.TryGemmEx"/> route through <see cref="Gemm{T}"/>
     /// instead of the native cblas P/Invoke. Provides a single flag to opt all 144
@@ -181,6 +197,41 @@ public static partial class BlasManaged
             EpilogueChain.Apply<T>(c, ldc, m, n, in fastEpilogue);
             return;
         }
+
+#if NET5_0_OR_GREATER
+        // #368 thin-M fast path: BlasManaged's general dispatch parallelises thin-M
+        // GEMM poorly — at the AIsEval MLP L0 128×784×512 it falls to the #409
+        // machine-code path (~55 GF/s) whose macro-loop overhead dominates this
+        // medium-thin shape, LOSING to the no-pack direct 6×16 parallel kernel
+        // (~464 GF/s, which also beats native OpenBLAS's ~335). The direct kernel
+        // writes disjoint output rows, so it is bit-deterministic across thread
+        // counts (no K-split → no Deterministic-mode concern). Bounded to the
+        // measured winning regime; float-only, contiguous, no transpose / pack /
+        // epilogue (those take their tuned paths below).
+        // Fire for the two "let the library decide" modes (Auto + DisableAutotune,
+        // the latter is what the SimdGemm.Sgemm shim passes); the Force* modes mean
+        // the caller pinned a strategy, so leave those alone.
+        if (typeof(T) == typeof(float)
+            && (options.PackingMode == PackingMode.Auto || options.PackingMode == PackingMode.DisableAutotune)
+            && !transA && !transB
+            && options.PackedA is null && options.PackedB is null
+            && lda == k && ldb == n && ldc == n
+            && (n & 7) == 0
+            && m >= ThinMDirectMinM && m <= ThinMDirectMaxM
+            && n <= ThinMDirectMaxN && k <= ThinMDirectMaxK)
+        {
+            var thinMEpi = options.Epilogue;
+            if (EpilogueFlagsCompute.Compute(in thinMEpi) == EpilogueFlags.None)
+            {
+                Simd.SimdGemm.SgemmDirectParallelMInto(
+                    MemoryMarshal.Cast<T, float>(a),
+                    MemoryMarshal.Cast<T, float>(b),
+                    MemoryMarshal.Cast<T, float>(c),
+                    m, k, n);
+                return;
+            }
+        }
+#endif
 
         // Sub-S (#409): machine-code microkernel fast path. The tile-aligned interior
         // runs on the hand-emitted kernel (FP64 6×8 ~57 GFLOPS/core ~95% of OpenBLAS;

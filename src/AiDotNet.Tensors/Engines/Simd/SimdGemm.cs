@@ -1823,6 +1823,26 @@ internal static partial class SimdGemm
     }
 
     /// <summary>
+    /// Overwrite GEMM (C = A·B) via the no-pack direct 6×16 kernel with parallel
+    /// M-stripes (<see cref="SgemmDirectParallelM"/>), bypassing the small-matmul
+    /// gate. For thin/moderate-M, N-aligned, large-K shapes (the AIsEval MLP L0
+    /// 128×784×512 regime) this beats both the packed path and native OpenBLAS — the
+    /// no-pack kernel keeps B resident in cache while every core works on disjoint
+    /// output rows (so it is also deterministic across thread counts). Contiguous
+    /// row-major operands (lda=k, ldb=n, ldc=n). <b>Precondition:</b> n % 8 == 0 (the
+    /// masked 6×8 edge kernel); callers gate on shape — outside the winning regime
+    /// (large M or large N) the packed path / OpenBLAS win (see #368 thin-M, #475).
+    /// </summary>
+    [MethodImpl(Hot)]
+    public static void SgemmDirectParallelMInto(
+        ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c,
+        int m, int k, int n)
+    {
+        c.Clear();
+        SgemmDirectParallelM(a, k, b, n, c, m, k, n, clearedOutput: true);
+    }
+
+    /// <summary>
     /// #209 close-parity: parallel-M wrapper around SgemmDirect's tile loop.
     /// Distributes the outer-M loop's Mr=6 blocks across cores via the
     /// persistent thread pool. Each chunk handles a contiguous range of
