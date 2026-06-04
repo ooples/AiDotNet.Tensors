@@ -201,17 +201,18 @@ public static partial class BlasManaged
 #if NET5_0_OR_GREATER
         // #368 thin-M fast path: BlasManaged's general dispatch parallelises thin-M
         // GEMM poorly — at the AIsEval MLP L0 128×784×512 it falls to the #409
-        // machine-code path (~55 GF/s) whose macro-loop overhead dominates this
-        // medium-thin shape, LOSING to the no-pack direct 6×16 parallel kernel
-        // (~464 GF/s, which also beats native OpenBLAS's ~335). The direct kernel
-        // writes disjoint output rows, so it is bit-deterministic across thread
-        // counts (no K-split → no Deterministic-mode concern). Bounded to the
-        // measured winning regime; float-only, contiguous, no transpose / pack /
-        // epilogue (those take their tuned paths below).
+        // machine-code path (~55 GF/s), and double likewise stays ~60 — both LOSING
+        // to a no-pack direct parallel kernel that splits disjoint output-row blocks
+        // (float 6×16 ~400-464 GF/s, beating OpenBLAS ~335; double 4×8 well over the
+        // ~60 the packed/machine-code paths give). Disjoint rows → bit-deterministic
+        // across thread counts (no K-split → no Deterministic-mode concern). Bounded
+        // to the measured winning regime; float/double, FMA, contiguous, no transpose
+        // / pack / epilogue (those take their tuned paths below).
         // Fire for the two "let the library decide" modes (Auto + DisableAutotune,
         // the latter is what the SimdGemm.Sgemm shim passes); the Force* modes mean
         // the caller pinned a strategy, so leave those alone.
-        if (typeof(T) == typeof(float)
+        if ((typeof(T) == typeof(float) || typeof(T) == typeof(double))
+            && System.Runtime.Intrinsics.X86.Fma.IsSupported
             && (options.PackingMode == PackingMode.Auto || options.PackingMode == PackingMode.DisableAutotune)
             && !transA && !transB
             && options.PackedA is null && options.PackedB is null
@@ -223,11 +224,18 @@ public static partial class BlasManaged
             var thinMEpi = options.Epilogue;
             if (EpilogueFlagsCompute.Compute(in thinMEpi) == EpilogueFlags.None)
             {
-                Simd.SimdGemm.SgemmDirectParallelMInto(
-                    MemoryMarshal.Cast<T, float>(a),
-                    MemoryMarshal.Cast<T, float>(b),
-                    MemoryMarshal.Cast<T, float>(c),
-                    m, k, n);
+                if (typeof(T) == typeof(float))
+                    Simd.SimdGemm.SgemmDirectParallelMInto(
+                        MemoryMarshal.Cast<T, float>(a),
+                        MemoryMarshal.Cast<T, float>(b),
+                        MemoryMarshal.Cast<T, float>(c),
+                        m, k, n);
+                else
+                    Simd.SimdGemm.DgemmDirectParallelMInto(
+                        MemoryMarshal.Cast<T, double>(a),
+                        MemoryMarshal.Cast<T, double>(b),
+                        MemoryMarshal.Cast<T, double>(c),
+                        m, k, n);
                 return;
             }
         }

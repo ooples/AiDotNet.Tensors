@@ -71,6 +71,43 @@ public class BlasManagedThinMDirectTests
             $"BlasManaged.Gemm thin-M carve-out rel error at {m}x{k}x{n}.");
     }
 
+    [Theory]
+    [MemberData(nameof(Shapes))]
+    public void DgemmDirectParallelMInto_MatchesReference(int m, int k, int n)
+    {
+        var rng = RandomHelper.CreateSeededRandom(640);
+        var a = RandD(m * k, rng);
+        var b = RandD(k * n, rng);
+        var got = new double[m * n];
+        var want = new double[m * n];
+
+        ReferenceD(a, b, want, m, k, n);
+        SimdGemm.DgemmDirectParallelMInto(a, b, got, m, k, n);
+
+        Assert.True(RelErrD(got, want) < 1e-10,
+            $"DgemmDirectParallelMInto rel error at {m}x{k}x{n} — tail/launch bug.");
+    }
+
+    [Theory]
+    [MemberData(nameof(Shapes))]
+    public void GemmDouble_ThinMCarveout_MatchesReference(int m, int k, int n)
+    {
+        // BlasManaged.Gemm<double> routes this thin-M regime through the FP64 direct
+        // kernel (#368). Verify end-to-end vs a naive reference.
+        var rng = RandomHelper.CreateSeededRandom(641);
+        var a = RandD(m * k, rng);
+        var b = RandD(k * n, rng);
+        var got = new double[m * n];
+        var want = new double[m * n];
+
+        ReferenceD(a, b, want, m, k, n);
+        AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.Gemm<double>(
+            a, k, false, b, n, false, got, n, m, n, k, default);
+
+        Assert.True(RelErrD(got, want) < 1e-10,
+            $"BlasManaged.Gemm<double> thin-M carve-out rel error at {m}x{k}x{n}.");
+    }
+
     [Fact]
     [Trait("Category", "Perf")]
     public unsafe void Gemm_ThinM_NowBeatsMachineCodePath()
@@ -91,7 +128,20 @@ public class BlasManagedThinMDirectTests
         double gemmMs = Min(() => SimdGemm.Sgemm(a, b, c, M, K, N));
 #pragma warning restore CS0618
         double gemmGf = flop / (gemmMs * 1e6);
-        _out.WriteLine($"BlasManaged.Gemm thin-M L0 [128x784x512]: {gemmGf:F0} GF/s (pre-#368 ~55 on the strategy/machine-code path).");
+        _out.WriteLine($"BlasManaged.Gemm<float> thin-M L0 [128x784x512]: {gemmGf:F0} GF/s (pre-#368 ~55).");
+
+        // FP64 thin-M at the same shape — is double also slow (no direct-parallel
+        // double kernel exists) or does the machine-code FP64 6x8 path handle it?
+        var ad = new double[M * K]; var bd = new double[K * N]; var cd = new double[M * N];
+        for (int i = 0; i < ad.Length; i++) ad[i] = rng.NextDouble() * 2 - 1;
+        for (int i = 0; i < bd.Length; i++) bd[i] = rng.NextDouble() * 2 - 1;
+        double dMs = Min(() => AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.Gemm<double>(
+            ad, K, false, bd, N, false, cd, N, M, N, K, default));
+        double dGf = flop / (dMs * 1e6);
+        _out.WriteLine($"BlasManaged.Gemm<double> thin-M L0 [128x784x512]: {dGf:F0} GF/s (pre-#368 ~60).");
+        // Pre-#368 double routed to the ~60 GF/s machine-code/strategy path; the new
+        // 4x8 direct kernel clears it comfortably. 100 GF/s floor catches a regression.
+        Assert.True(dGf > 100, $"BlasManaged.Gemm<double> thin-M L0 = {dGf:F0} GF/s — below the 100 GF/s floor (regressed off the #368 FP64 direct path?).");
         // Pre-#368 this routed to the ~55 GF/s machine-code path; the direct kernel
         // is ~200-464 GF/s here. A generous 100 GF/s floor catches a regression to
         // the slow path without being flaky on shared hardware.
@@ -124,6 +174,35 @@ public class BlasManagedThinMDirectTests
     {
         var a = new float[len];
         for (int i = 0; i < len; i++) a[i] = (float)(rng.NextDouble() * 2 - 1);
+        return a;
+    }
+
+    private static void ReferenceD(double[] a, double[] b, double[] c, int m, int k, int n)
+    {
+        for (int i = 0; i < m; i++)
+            for (int j = 0; j < n; j++)
+            {
+                double acc = 0.0;
+                for (int p = 0; p < k; p++) acc += a[i * k + p] * b[p * n + j];
+                c[i * n + j] = acc;
+            }
+    }
+
+    private static double RelErrD(double[] got, double[] want)
+    {
+        double maxAbs = 0, maxMag = 0;
+        for (int i = 0; i < want.Length; i++)
+        {
+            maxAbs = Math.Max(maxAbs, Math.Abs(got[i] - want[i]));
+            maxMag = Math.Max(maxMag, Math.Abs(want[i]));
+        }
+        return maxAbs / Math.Max(1e-9, maxMag);
+    }
+
+    private static double[] RandD(int len, Random rng)
+    {
+        var a = new double[len];
+        for (int i = 0; i < len; i++) a[i] = rng.NextDouble() * 2 - 1;
         return a;
     }
 }
