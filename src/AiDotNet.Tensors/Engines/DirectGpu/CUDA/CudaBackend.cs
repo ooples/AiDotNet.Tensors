@@ -2723,6 +2723,17 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (!IsAvailable)
             throw new InvalidOperationException("CUDA backend is not available.");
 
+        // Fail fast on misaligned N: each thread computes 4 adjacent output
+        // columns via float4 loads, so a non-multiple-of-4 N would silently
+        // TRUNCATE the grid to N/4 thread-columns and leave the last
+        // N % 4 output columns unwritten. Upstream routing gates on this,
+        // but a direct call must not rely on it.
+        if ((N & 3) != 0)
+            throw new ArgumentException(
+                $"CsrSpMMVec4 requires N divisible by 4 (got {N}); the float4-vectorized kernel " +
+                "would silently skip the last N % 4 output columns. Use CsrSpMM for unaligned N.",
+                nameof(N));
+
         if (!_kernelCache.TryGetValue("csr_spmm_vec4", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: csr_spmm_vec4");
 
