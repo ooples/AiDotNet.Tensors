@@ -101,14 +101,15 @@ public class CudaSparseBackendSpMMTests
         return maxAbs / Math.Max(1e-9, maxMag);
     }
 
-    // N <= 64 routes to csr_spmm_warp, N > 64 to the 2-D scalar csr_spmm, so the
-    // cases below exercise BOTH float kernels against the same CPU reference.
+    // Kernel pick: N%4==0 -> vec4, else N<=64 -> warp, else 2-D scalar. The cases
+    // below exercise ALL THREE float kernels against the same CPU reference.
     public static IEnumerable<object[]> Shapes() => new[]
     {
-        new object[] { 64, 48, 16, 0.20 },    // small N -> warp kernel
-        new object[] { 128, 96, 128, 0.10 },  // wide N  -> scalar kernel
-        new object[] { 256, 256, 64, 0.05 },  // N == threshold -> warp
-        new object[] { 100, 70, 1, 0.30 },    // N=1 (SpMV-like) edge -> warp
+        new object[] { 64, 48, 16, 0.20 },    // N%4==0 -> vec4 (128-bit loads)
+        new object[] { 128, 96, 128, 0.10 },  // N%4==0 -> vec4
+        new object[] { 256, 256, 64, 0.05 },  // N%4==0 -> vec4
+        new object[] { 100, 70, 1, 0.30 },    // N=1 (SpMV-like), N<=64 -> warp
+        new object[] { 200, 100, 130, 0.08 }, // N>64, N%4!=0 -> 2-D scalar
     };
 
     [SkippableTheory]

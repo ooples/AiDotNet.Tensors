@@ -70,10 +70,16 @@ internal static class CudaSparseBackend
             UploadInts(rowPtrBuf.Handle, rowPtr);
             UploadInts(colIdxBuf.Handle, colIdx);
 
-            // Warp-per-row for small/moderate N, 2-D scalar for wide N. Argument
-            // order matches IDirectGpuBackend.CsrSpMM:
+            // Kernel pick (first-cut; to be tuned by the #515 perf bar):
+            //   N % 4 == 0      -> vec4 (128-bit aligned float4 dense loads)
+            //   N <= 64         -> warp-per-row (coalesced lane-per-column)
+            //   otherwise       -> 2-D scalar
+            // Argument order matches IDirectGpuBackend.CsrSpMM:
             // (values, colIndices, rowPointers, denseB, output, M, K, N, nnz).
-            if (n <= WarpColumnThreshold)
+            if (n % 4 == 0)
+                backend.CsrSpMMVec4(valuesBuf, colIdxBuf, rowPtrBuf, bBuf, outBuf,
+                    rows, cols, n, values.Length);
+            else if (n <= WarpColumnThreshold)
                 backend.CsrSpMMWarp(valuesBuf, colIdxBuf, rowPtrBuf, bBuf, outBuf,
                     rows, cols, n, values.Length);
             else

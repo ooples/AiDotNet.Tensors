@@ -2706,6 +2706,63 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         LaunchKernel2D(kernel, gridX, gridY, (uint)DefaultBlockSize, 1, args);
     }
 
+    /// <summary>
+    /// 128-bit-vectorized CSR SpMM (issue #515): launches <c>csr_spmm_vec4</c>, where
+    /// each thread computes 4 adjacent output columns via aligned <c>float4</c> loads.
+    /// Requires <paramref name="N"/> % 4 == 0 (the caller's gate). Same numerics as
+    /// <see cref="CsrSpMM"/> (per-output sequential reduction → deterministic).
+    /// </summary>
+    public unsafe void CsrSpMMVec4(
+        IGpuBuffer csrValues,
+        IGpuBuffer csrColIndices,
+        IGpuBuffer csrRowPointers,
+        IGpuBuffer denseB,
+        IGpuBuffer output,
+        int M, int K, int N, int nnz)
+    {
+        if (!IsAvailable)
+            throw new InvalidOperationException("CUDA backend is not available.");
+
+        // Fail fast on misaligned N: each thread computes 4 adjacent output
+        // columns via float4 loads, so a non-multiple-of-4 N would silently
+        // TRUNCATE the grid to N/4 thread-columns and leave the last
+        // N % 4 output columns unwritten. Upstream routing gates on this,
+        // but a direct call must not rely on it.
+        if ((N & 3) != 0)
+            throw new ArgumentException(
+                $"CsrSpMMVec4 requires N divisible by 4 (got {N}); the float4-vectorized kernel " +
+                "would silently skip the last N % 4 output columns. Use CsrSpMM for unaligned N.",
+                nameof(N));
+
+        if (!_kernelCache.TryGetValue("csr_spmm_vec4", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: csr_spmm_vec4");
+
+        using var _ = PushContext();
+
+        // Each thread owns 4 columns, so the y-grid spans N/4 thread-columns.
+        uint gridX = (uint)M;
+        uint gridY = (uint)((N / 4 + DefaultBlockSize - 1) / DefaultBlockSize);
+
+        IntPtr valuesPtr = csrValues.Handle;
+        IntPtr colIndicesPtr = csrColIndices.Handle;
+        IntPtr rowPointersPtr = csrRowPointers.Handle;
+        IntPtr denseBPtr = denseB.Handle;
+        IntPtr outputPtr = output.Handle;
+
+        void** args = stackalloc void*[9];
+        args[0] = &valuesPtr;
+        args[1] = &colIndicesPtr;
+        args[2] = &rowPointersPtr;
+        args[3] = &denseBPtr;
+        args[4] = &outputPtr;
+        args[5] = &M;
+        args[6] = &K;
+        args[7] = &N;
+        args[8] = &nnz;
+
+        LaunchKernel2D(kernel, gridX, gridY, (uint)DefaultBlockSize, 1, args);
+    }
+
     /// <inheritdoc/>
     public unsafe void CsrSpMMBias(
         IGpuBuffer csrValues,
