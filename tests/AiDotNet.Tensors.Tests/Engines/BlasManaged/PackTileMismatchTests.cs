@@ -36,7 +36,13 @@ public class PackTileMismatchTests
         {
             // Simulate the dispatcher consuming with a different microkernel tile
             // than the buffer was packed with (the AVX-512-runner scenario).
-            handle.PackMr = handle.PackMr == 4 ? 8 : 4;
+            // Use an impossible tile value: flipping 4<->8 can ACCIDENTALLY
+            // MATCH the consumer's active tile on machines whose real pack
+            // tile differs from this box's (e.g. AVX-512: pack mr=8, consume
+            // falls back to scalar mr=4 — flipping 8->4 then EQUALS the
+            // active tile and the mispacked buffer is consumed). -1 never
+            // matches any kernel tile, so the gate must always reject.
+            handle.PackMr = -1;
 
             var options = new BlasOptions<double> { PackedA = handle, PackingMode = PackingMode.ForcePackBoth };
             var result = new double[m * n];
@@ -58,7 +64,9 @@ public class PackTileMismatchTests
         var handle = BlasManagedLib.PrePackB<double>(b, ldb: n, transB: false, k, n);
         try
         {
-            handle.PackNr = handle.PackNr == 8 ? 16 : 8;
+            // Impossible tile value — see the PackMr test for why a 8<->16
+            // flip could accidentally match the consumer's active tile.
+            handle.PackNr = -1;
 
             var options = new BlasOptions<double> { PackedB = handle, PackingMode = PackingMode.ForcePackBoth };
             var result = new double[m * n];

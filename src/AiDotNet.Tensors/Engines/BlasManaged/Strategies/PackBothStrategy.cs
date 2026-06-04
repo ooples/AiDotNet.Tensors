@@ -576,7 +576,11 @@ internal static class PackBothStrategy
                     Span<T> activePackA;
                     bool prePackHitParallel = false;
                     Span<byte> packAByteSlice = default;
-                    if (packedA != null && WeightPackCache.IsCacheCurrent(packedA))
+                    // PackMr gate (see WeightPackHandle.PackMr): the panel stripes
+                    // are mr-interleaved at PACK time; consuming with a different
+                    // active mr reads the wrong stride and yields garbage. Both
+                    // branches below require the recorded tile to match.
+                    if (packedA != null && WeightPackCache.IsCacheCurrent(packedA) && packedA.PackMr == mr)
                     {
                         if (packedA.MultiPanelStride > 0)
                         {

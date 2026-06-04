@@ -261,9 +261,12 @@ internal static class PackAOnlyStrategy
                     }
                 }
                 else if (options.PackedA != null && WeightPackCache.IsCacheCurrent(options.PackedA)
+                    && options.PackedA.PackMr == mr
                     && options.PackedA.PackedBuffer.Length >= effectivePackABytes)
                 {
                     // Legacy single-panel pre-pack: only valid when the entire weight fits one tile.
+                    // PackMr gate as above — the buffer is striped at the PACK-time mr;
+                    // consuming with a different active mr reads the wrong stride.
                     activePackA = MemoryMarshal.Cast<byte, T>(options.PackedA.PackedBuffer.AsSpan(0, effectivePackABytes));
                     packAFromPrePack = true;
                 }
