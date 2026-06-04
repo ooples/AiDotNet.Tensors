@@ -50,6 +50,49 @@ public class InferenceWeightCacheInvalidationTests
     }
 
     [Fact]
+    public void SgemmWithCachedB_AfterInPlaceWeightMutation_TargetedInvalidate_UsesFreshWeights()
+    {
+        // Per-array invalidation (review AiDotNet#1488): mutating ONE weight
+        // and invalidating ONLY that array must produce fresh results for it
+        // — while a second, untouched weight keeps producing correct results
+        // throughout (its cached pack stays valid; no global eviction).
+        const int m = 8, k = 512, n = 64;
+        var rng = new Random(1488);
+        var a = new float[m * k];
+        var b1 = new float[k * n];
+        var b2 = new float[k * n];
+        for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < b1.Length; i++) b1[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < b2.Length; i++) b2[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        // Populate caches for BOTH weights.
+        var c1 = new float[m * n];
+        var c2 = new float[m * n];
+        SimdGemm.SgemmWithCachedB(a, b1, c1, m, k, n);
+        SimdGemm.SgemmWithCachedB(a, b2, c2, m, k, n);
+        AssertMatchesNaive(a, b1, c1, m, k, n, "b1 initial");
+        AssertMatchesNaive(a, b2, c2, m, k, n, "b2 initial");
+
+        // Mutate ONLY b1; invalidate ONLY b1.
+        for (int i = 0; i < b1.Length; i++) b1[i] = -b1[i] * 0.5f + 0.25f;
+        InferenceWeightCache.Invalidate(b1);
+
+        var c1b = new float[m * n];
+        var c2b = new float[m * n];
+        SimdGemm.SgemmWithCachedB(a, b1, c1b, m, k, n);
+        SimdGemm.SgemmWithCachedB(a, b2, c2b, m, k, n);
+        AssertMatchesNaive(a, b1, c1b, m, k, n, "b1 post-targeted-invalidate");
+        AssertMatchesNaive(a, b2, c2b, m, k, n, "b2 untouched");
+    }
+
+    [Fact]
+    public void Invalidate_NullOrEmpty_IsSafeNoOp()
+    {
+        InferenceWeightCache.Invalidate(null);
+        InferenceWeightCache.Invalidate(Array.Empty<float>());
+    }
+
+    [Fact]
     public void SgemmWithCachedB_RepeatedCallsSameWeights_StayCorrect()
     {
         // Companion guard: the epoch gate must not break the steady-state
