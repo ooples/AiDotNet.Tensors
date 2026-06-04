@@ -62,12 +62,19 @@ public static class SparseOps
             var bArr = (float[])(object)b.ToArray();
             float[]? outArr = null;
 
-            // Tier 0 — GPU dispatch (cuSPARSE / rocSPARSE / MPS) gated
-            // by host availability + a size threshold; small problems
-            // pay more in upload/download than they save in compute.
+            // Tier 0 — GPU dispatch gated by host availability + a size
+            // threshold; small problems pay more in upload/download than
+            // they save in compute.
             if (rows * (long)n >= GpuDispatchThreshold)
             {
-                if (CuSparseBackend.IsAvailable)
+                // #515 (P6): AiDotNet's own managed CSR-SpMM CUDA kernel is the
+                // default GPU path — it needs only the CUDA driver, removing the
+                // native cuSPARSE dependency. The vendor backends (cuSPARSE /
+                // rocSPARSE / MPS) stay as availability fallbacks until the custom
+                // HIP/Metal mirrors + FP64 + the perf bar land (tracked in #515).
+                if (CudaSparseBackend.IsAvailable)
+                    outArr = CudaSparseBackend.SpMM(rowPtr, colIdx, valsArr, bArr, rows, k, n);
+                else if (CuSparseBackend.IsAvailable)
                     outArr = CuSparseBackend.SpMM(rowPtr, colIdx, valsArr, bArr, rows, k, n);
                 else if (HipSparseBackend.IsAvailable)
                     outArr = HipSparseBackend.SpMM(rowPtr, colIdx, valsArr, bArr, rows, k, n);
