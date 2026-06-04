@@ -37,9 +37,31 @@ public static class InferenceWeightCache
 {
     /// <summary>
     /// Invalidate every cached derived weight form (packed GEMM panels,
-    /// int8 packs, transposed conv kernels). Call after any in-place weight
-    /// mutation so the next inference re-derives from live weight contents.
-    /// Thread-safe; O(1).
+    /// int8 packs, transposed conv kernels) for EVERY weight array in the
+    /// process. Call after a bulk in-place mutation whose touched-array set
+    /// is unknown; when the mutated arrays are known, prefer the targeted
+    /// <see cref="Invalidate(System.Array)"/> so other models' hot caches
+    /// stay warm. Thread-safe; O(1).
     /// </summary>
     public static void InvalidateAll() => Simd.SimdGemm.InvalidateCachedWeights();
+
+    /// <summary>
+    /// Invalidate the cached derived forms of ONE weight array, leaving all
+    /// other arrays' caches hot. Call after mutating that array in place
+    /// (an optimizer step on its tensor, a bulk parameter load, a layer
+    /// fusion rewrite). Preferred over <see cref="InvalidateAll"/> for
+    /// per-model invalidation in multi-model processes: a training loop
+    /// flushing globally per step would keep evicting every OTHER model's
+    /// hot packs. Thread-safe; O(1) per array. No-op for nulls and for
+    /// element types the CPU caches never derive from (only
+    /// <c>float[]</c>-sourced forms are cached today, but versions are
+    /// tracked per <see cref="System.Array"/> so future caches inherit the
+    /// contract).
+    /// </summary>
+    /// <param name="weights">The weight array that was mutated in place.</param>
+    public static void Invalidate(System.Array? weights)
+    {
+        if (weights is null || weights.Length == 0) return;
+        Simd.SimdGemm.MarkWeightDirty(weights);
+    }
 }

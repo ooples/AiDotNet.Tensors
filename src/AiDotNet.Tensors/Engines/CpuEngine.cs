@@ -12639,9 +12639,19 @@ public partial class CpuEngine : ITensorLevelEngine
     // (bumped via Engines.InferenceWeightCache.InvalidateAll()).
     private sealed class KernelTransposeEntry
     {
-        internal KernelTransposeEntry(float[] data, long epoch) { Data = data; Epoch = epoch; }
+        internal KernelTransposeEntry(float[] data, long epoch, long sourceVersion)
+        {
+            Data = data;
+            Epoch = epoch;
+            SourceVersion = sourceVersion;
+        }
+
         internal readonly float[] Data;
         internal readonly long Epoch;
+        // Per-array mutation version at build time — targeted invalidation
+        // via InferenceWeightCache.Invalidate(array) (see
+        // SimdGemm.MarkWeightDirty). Checked alongside the global epoch.
+        internal readonly long SourceVersion;
     }
 
     private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<float[], KernelTransposeEntry>
@@ -12855,8 +12865,13 @@ public partial class CpuEngine : ITensorLevelEngine
         static float[] GetOrBuildTransposedKernel(float[] kernel, int rows, int cols)
         {
             long epoch = AiDotNet.Tensors.Engines.Simd.SimdGemm.WeightCacheEpoch;
-            if (_kernelTransposeCache.TryGetValue(kernel, out var entry) && entry.Epoch == epoch)
+            long sourceVersion = AiDotNet.Tensors.Engines.Simd.SimdGemm.WeightArrayVersionOf(kernel);
+            if (_kernelTransposeCache.TryGetValue(kernel, out var entry)
+                && entry.Epoch == epoch
+                && entry.SourceVersion == sourceVersion)
+            {
                 return entry.Data;
+            }
 
             // Stale (weights mutated in place since the transpose was built)
             // or missing — rebuild from the live kernel contents. Remove+
@@ -12868,7 +12883,7 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var kernelT = new float[cols * rows];
                 TransposeFloatParallel(k, 0, kernelT, 0, rows, cols);
-                return new KernelTransposeEntry(kernelT, epoch);
+                return new KernelTransposeEntry(kernelT, epoch, sourceVersion);
             }).Data;
         }
 

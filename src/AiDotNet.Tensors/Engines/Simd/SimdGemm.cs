@@ -215,6 +215,43 @@ internal static partial class SimdGemm
     /// </summary>
     internal static void InvalidateCachedWeights() => System.Threading.Interlocked.Increment(ref _weightCacheEpoch);
 
+    // ─── Per-array invalidation (review AiDotNet#1488) ──────────────────────
+    // The global epoch above evicts EVERY model's derived-weight caches; a
+    // training loop calling it per optimizer step keeps evicting the hot
+    // packs of every other model in the process. Per-array versions give
+    // targeted invalidation: each weight array gets a monotonically
+    // increasing version (CWT-keyed by identity, GC'd with the array), the
+    // cache entry records the version it was built from, and every hit path
+    // — including the cross-thread MRU slots, which per-array REMOVAL could
+    // never reach — requires it to match. A hit is therefore valid iff
+    //   entry.Epoch == WeightCacheEpoch            (no global flush since)
+    //   AND entry.SourceVersion == version(array)  (this array not dirtied)
+    private sealed class WeightArrayVersion
+    {
+        internal long Version;
+    }
+
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<System.Array, WeightArrayVersion> _weightArrayVersions = new();
+
+    /// <summary>Current mutation version of <paramref name="weights"/>;
+    /// 0 until the first <see cref="MarkWeightDirty"/>.</summary>
+    internal static long WeightArrayVersionOf(System.Array weights)
+        => _weightArrayVersions.TryGetValue(weights, out var v)
+            ? System.Threading.Interlocked.Read(ref v.Version)
+            : 0L;
+
+    /// <summary>
+    /// Invalidate the cached derived forms of ONE weight array (packed
+    /// GEMM panels, int8 packs, transposed conv kernels built from it),
+    /// leaving every other array's caches hot. Call after mutating that
+    /// array in place.
+    /// </summary>
+    internal static void MarkWeightDirty(System.Array weights)
+    {
+        var box = _weightArrayVersions.GetValue(weights, static _ => new WeightArrayVersion());
+        System.Threading.Interlocked.Increment(ref box.Version);
+    }
+
 #if NET5_0_OR_GREATER
     // ─── Path A: pre-packed B cache ────────────────────────────────────────
     //
@@ -244,6 +281,9 @@ internal static partial class SimdGemm
         // WeightCacheEpoch value at build time. A hit is only valid while
         // this matches the current global epoch — see _weightCacheEpoch.
         internal long Epoch;
+        // WeightArrayVersionOf(b) at build time — per-array invalidation
+        // (see MarkWeightDirty). Checked alongside Epoch on every hit path.
+        internal long SourceVersion;
     }
 
     private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<float[], PrePackedB> _prePackedBCache = new();
@@ -313,6 +353,7 @@ internal static partial class SimdGemm
             PackedSubs = packedSubs,
             NumPcIters = numPcIters,
             Epoch = WeightCacheEpoch,
+            SourceVersion = WeightArrayVersionOf(b),
         };
     }
 
@@ -410,10 +451,12 @@ internal static partial class SimdGemm
             return threadCached;
 
         long epoch = WeightCacheEpoch;
+        long sourceVersion = WeightArrayVersionOf(b);
         if (_prePackedBCache.TryGetValue(b, out var existing)
             && existing.K == k && existing.N == n
             && existing.Mc == expectedMc
-            && existing.Epoch == epoch)
+            && existing.Epoch == epoch
+            && existing.SourceVersion == sourceVersion)
         {
             RememberThreadPrePackedB(b, existing);
             return existing;
@@ -425,7 +468,8 @@ internal static partial class SimdGemm
             {
                 if (existing.K == k && existing.N == n
                     && existing.Mc == expectedMc
-                    && existing.Epoch == epoch)
+                    && existing.Epoch == epoch
+                    && existing.SourceVersion == sourceVersion)
                 {
                     RememberThreadPrePackedB(b, existing);
                     return existing;
@@ -470,6 +514,11 @@ internal static partial class SimdGemm
             && valueRef.TryGetTarget(out var value)
             && value.K == k && value.N == n && value.Mc == expectedMc
             && value.Epoch == WeightCacheEpoch
+            // Per-array invalidation reaches the cross-thread MRU slots
+            // through this version comparison — the invalidating thread
+            // cannot CLEAR another thread's slot, but it CAN make the
+            // recorded SourceVersion stale.
+            && value.SourceVersion == WeightArrayVersionOf(b)
             && keyRef is not null
             && keyRef.TryGetTarget(out var key)
             && ReferenceEquals(key, b))
@@ -539,6 +588,8 @@ internal static partial class SimdGemm
         internal float Scale;
         // WeightCacheEpoch value at build time — see _weightCacheEpoch.
         internal long Epoch;
+        // WeightArrayVersionOf(b) at build time — see MarkWeightDirty.
+        internal long SourceVersion;
     }
 
     private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<float[], Int8PrePackedB> _int8PrePackedBCache = new();
@@ -606,6 +657,7 @@ internal static partial class SimdGemm
             NumPcIters = numPcIters,
             Scale = scale,
             Epoch = WeightCacheEpoch,
+            SourceVersion = WeightArrayVersionOf(b),
         };
     }
 
@@ -644,10 +696,12 @@ internal static partial class SimdGemm
     private static Int8PrePackedB GetOrBuildInt8PrePackedB(float[] b, int k, int n, int m, int expectedMc)
     {
         long epoch = WeightCacheEpoch;
+        long sourceVersion = WeightArrayVersionOf(b);
         if (_int8PrePackedBCache.TryGetValue(b, out var existing)
             && existing.K == k && existing.N == n
             && existing.Mc == expectedMc
-            && existing.Epoch == epoch)
+            && existing.Epoch == epoch
+            && existing.SourceVersion == sourceVersion)
         {
             return existing;
         }
@@ -658,7 +712,8 @@ internal static partial class SimdGemm
             {
                 if (existing.K == k && existing.N == n
                     && existing.Mc == expectedMc
-                    && existing.Epoch == epoch)
+                    && existing.Epoch == epoch
+                    && existing.SourceVersion == sourceVersion)
                 {
                     return existing;
                 }
