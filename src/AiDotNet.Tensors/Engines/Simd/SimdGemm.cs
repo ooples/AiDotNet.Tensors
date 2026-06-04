@@ -307,6 +307,14 @@ internal static partial class SimdGemm
     /// </summary>
     private static PrePackedB BuildPrePackedB(float[] b, int k, int n, int m)
     {
+        // Capture the mutation version BEFORE reading any of b's contents.
+        // Stamping at the end would race MarkWeightDirty: a mutation landing
+        // mid-pack could leave PRE-mutation data stamped with the POST-
+        // mutation version, and future hits would accept the stale pack as
+        // current. Capturing first is conservatively safe — the same race
+        // then leaves the entry stamped with the OLD version, the next
+        // lookup sees a mismatch, and the pack rebuilds.
+        long sourceVersion = WeightArrayVersionOf(b);
         int Mc = ChooseAdaptiveMc(m, k, n);
         int numRowBlocks = (m + Mc - 1) / Mc;
         int maxThreads = Helpers.CpuParallelSettings.MaxDegreeOfParallelism;
@@ -353,7 +361,7 @@ internal static partial class SimdGemm
             PackedSubs = packedSubs,
             NumPcIters = numPcIters,
             Epoch = WeightCacheEpoch,
-            SourceVersion = WeightArrayVersionOf(b),
+            SourceVersion = sourceVersion,
         };
     }
 
@@ -604,6 +612,8 @@ internal static partial class SimdGemm
     /// </summary>
     private static Int8PrePackedB BuildInt8PrePackedB(float[] b, int k, int n, int m)
     {
+        // Capture BEFORE reading b — see BuildPrePackedB for the race.
+        long sourceVersion = WeightArrayVersionOf(b);
         float scale = Int8Quantizer.ComputeSymmetricScale(b);
 
         int Mc = ChooseAdaptiveMc(m, k, n);
@@ -657,7 +667,7 @@ internal static partial class SimdGemm
             NumPcIters = numPcIters,
             Scale = scale,
             Epoch = WeightCacheEpoch,
-            SourceVersion = WeightArrayVersionOf(b),
+            SourceVersion = sourceVersion,
         };
     }
 
