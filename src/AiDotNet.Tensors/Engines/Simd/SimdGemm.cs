@@ -1823,6 +1823,123 @@ internal static partial class SimdGemm
     }
 
     /// <summary>
+    /// Overwrite GEMM (C = A·B) via the no-pack direct 6×16 kernel with parallel
+    /// M-stripes (<see cref="SgemmDirectParallelM"/>), bypassing the small-matmul
+    /// gate. For thin/moderate-M, N-aligned, large-K shapes (the AIsEval MLP L0
+    /// 128×784×512 regime) this beats both the packed path and native OpenBLAS — the
+    /// no-pack kernel keeps B resident in cache while every core works on disjoint
+    /// output rows (so it is also deterministic across thread counts). Contiguous
+    /// row-major operands (lda=k, ldb=n, ldc=n). <b>Precondition:</b> n % 8 == 0 (the
+    /// masked 6×8 edge kernel); callers gate on shape — outside the winning regime
+    /// (large M or large N) the packed path / OpenBLAS win (see #368 thin-M, #475).
+    /// </summary>
+    [MethodImpl(Hot)]
+    public static void SgemmDirectParallelMInto(
+        ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c,
+        int m, int k, int n)
+    {
+        c.Clear();
+        SgemmDirectParallelM(a, k, b, n, c, m, k, n, clearedOutput: true);
+    }
+
+    /// <summary>
+    /// FP64 analog of <see cref="SgemmDirectParallelMInto"/> (#368): overwrite GEMM
+    /// (C = A·B) via a no-pack register-blocked 4×8 <see cref="Vector256{T}"/> double
+    /// microkernel, parallelised over disjoint M-row-blocks. For thin/moderate-M
+    /// shapes this beats the packed-strategy and #409 machine-code FP64 paths (which
+    /// carry pack / macro-loop overhead at thin-M, ~60 GF/s). Each output row is
+    /// written by exactly one thread in fixed K order, so it is deterministic across
+    /// thread counts. Contiguous row-major (lda=k, ldb=n, ldc=n); requires Fma +
+    /// n % 8 == 0 (caller gates). Every C element is overwritten (full 4-row × 8-col
+    /// tiles cover the M-full / N region; the M%4 tail rows are computed scalar), so
+    /// no pre-clear is needed.
+    /// </summary>
+    [MethodImpl(Hot)]
+    public static unsafe void DgemmDirectParallelMInto(
+        ReadOnlySpan<double> a, ReadOnlySpan<double> b, Span<double> c,
+        int m, int k, int n)
+    {
+        const int MRd = 4;
+        int mFull = (m / MRd) * MRd;
+        int numFullBlocks = mFull / MRd;
+        int cores = Math.Max(1, Helpers.CpuParallelSettings.MaxDegreeOfParallelism);
+        int numChunks = Math.Min(cores, Math.Max(1, (numFullBlocks + 1) / 2));
+
+        fixed (double* pA = a, pB = b, pC = c)
+        {
+            IntPtr ipA = (IntPtr)pA, ipB = (IntPtr)pB, ipC = (IntPtr)pC;
+            int kCap = k, nCap = n;
+
+            if (numChunks <= 1 || numFullBlocks == 0)
+            {
+                DgemmDirectBlockRange(pA, pB, pC, 0, numFullBlocks, kCap, nCap);
+            }
+            else
+            {
+                int blocksPerChunk = (numFullBlocks + numChunks - 1) / numChunks;
+                Helpers.PersistentParallelExecutor.Instance.Execute(numChunks, chunk =>
+                {
+                    int bs = chunk * blocksPerChunk;
+                    int be = Math.Min(bs + blocksPerChunk, numFullBlocks);
+                    if (bs < be)
+                        DgemmDirectBlockRange((double*)ipA, (double*)ipB, (double*)ipC, bs, be, kCap, nCap);
+                });
+            }
+
+            // M-tail rows [mFull, m) — at most MRd-1 rows; scalar (negligible).
+            for (int i = mFull; i < m; i++)
+            {
+                double* ci = pC + (long)i * n;
+                double* ai = pA + (long)i * k;
+                for (int j = 0; j < n; j++)
+                {
+                    double acc = 0.0;
+                    for (int p = 0; p < k; p++) acc += ai[p] * pB[(long)p * n + j];
+                    ci[j] = acc;
+                }
+            }
+        }
+    }
+
+    /// <summary>4-row × 8-col register-blocked FP64 microkernel over M-blocks
+    /// [blockStart, blockEnd). n % 8 == 0 (caller-guaranteed); overwrites C.</summary>
+    private static unsafe void DgemmDirectBlockRange(
+        double* A, double* B, double* C, int blockStart, int blockEnd, int k, int n)
+    {
+        const int MRd = 4;
+        for (int blk = blockStart; blk < blockEnd; blk++)
+        {
+            int i0 = blk * MRd;
+            double* a0 = A + (long)(i0 + 0) * k;
+            double* a1 = A + (long)(i0 + 1) * k;
+            double* a2 = A + (long)(i0 + 2) * k;
+            double* a3 = A + (long)(i0 + 3) * k;
+            for (int j = 0; j < n; j += 8)
+            {
+                var c00 = Vector256<double>.Zero; var c01 = Vector256<double>.Zero;
+                var c10 = Vector256<double>.Zero; var c11 = Vector256<double>.Zero;
+                var c20 = Vector256<double>.Zero; var c21 = Vector256<double>.Zero;
+                var c30 = Vector256<double>.Zero; var c31 = Vector256<double>.Zero;
+                double* bj = B + j;
+                for (int p = 0; p < k; p++)
+                {
+                    double* bp = bj + (long)p * n;
+                    var b0 = Avx.LoadVector256(bp);
+                    var b1 = Avx.LoadVector256(bp + 4);
+                    var av = Vector256.Create(a0[p]); c00 = Fma.MultiplyAdd(av, b0, c00); c01 = Fma.MultiplyAdd(av, b1, c01);
+                    av = Vector256.Create(a1[p]); c10 = Fma.MultiplyAdd(av, b0, c10); c11 = Fma.MultiplyAdd(av, b1, c11);
+                    av = Vector256.Create(a2[p]); c20 = Fma.MultiplyAdd(av, b0, c20); c21 = Fma.MultiplyAdd(av, b1, c21);
+                    av = Vector256.Create(a3[p]); c30 = Fma.MultiplyAdd(av, b0, c30); c31 = Fma.MultiplyAdd(av, b1, c31);
+                }
+                double* o0 = C + (long)(i0 + 0) * n + j; Avx.Store(o0, c00); Avx.Store(o0 + 4, c01);
+                double* o1 = C + (long)(i0 + 1) * n + j; Avx.Store(o1, c10); Avx.Store(o1 + 4, c11);
+                double* o2 = C + (long)(i0 + 2) * n + j; Avx.Store(o2, c20); Avx.Store(o2 + 4, c21);
+                double* o3 = C + (long)(i0 + 3) * n + j; Avx.Store(o3, c30); Avx.Store(o3 + 4, c31);
+            }
+        }
+    }
+
+    /// <summary>
     /// #209 close-parity: parallel-M wrapper around SgemmDirect's tile loop.
     /// Distributes the outer-M loop's Mr=6 blocks across cores via the
     /// persistent thread pool. Each chunk handles a contiguous range of
