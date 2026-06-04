@@ -12629,7 +12629,22 @@ public partial class CpuEngine : ITensorLevelEngine
     // populates the cache and every subsequent call reuses the transposed
     // buffer for ~0 µs. Multi-threaded callers are handled inside
     // ConditionalWeakTable.GetValue which is documented thread-safe.
-    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<float[], float[]>
+    //
+    // Entries carry the SimdGemm.WeightCacheEpoch at build time: the cache
+    // keys on ARRAY IDENTITY and never re-reads contents, so an in-place
+    // kernel mutation (optimizer step, SetParameters bulk load) would
+    // otherwise leave a stale transpose serving old weights — the same
+    // stale-weight class of bug as SimdGemm's pre-packed-B caches. A hit is
+    // only valid while the entry's epoch matches the current global epoch
+    // (bumped via Engines.InferenceWeightCache.InvalidateAll()).
+    private sealed class KernelTransposeEntry
+    {
+        internal KernelTransposeEntry(float[] data, long epoch) { Data = data; Epoch = epoch; }
+        internal readonly float[] Data;
+        internal readonly long Epoch;
+    }
+
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<float[], KernelTransposeEntry>
         _kernelTransposeCache = new();
 
     /// <summary>
@@ -12839,12 +12854,22 @@ public partial class CpuEngine : ITensorLevelEngine
         // kernel array is GC'd.
         static float[] GetOrBuildTransposedKernel(float[] kernel, int rows, int cols)
         {
+            long epoch = AiDotNet.Tensors.Engines.Simd.SimdGemm.WeightCacheEpoch;
+            if (_kernelTransposeCache.TryGetValue(kernel, out var entry) && entry.Epoch == epoch)
+                return entry.Data;
+
+            // Stale (weights mutated in place since the transpose was built)
+            // or missing — rebuild from the live kernel contents. Remove+
+            // GetValue rather than AddOrUpdate: net471's ConditionalWeakTable
+            // has no AddOrUpdate, and a concurrent racer at worst redoes the
+            // transpose once.
+            _kernelTransposeCache.Remove(kernel);
             return _kernelTransposeCache.GetValue(kernel, k =>
             {
                 var kernelT = new float[cols * rows];
                 TransposeFloatParallel(k, 0, kernelT, 0, rows, cols);
-                return kernelT;
-            });
+                return new KernelTransposeEntry(kernelT, epoch);
+            }).Data;
         }
 
         /// <summary>
@@ -14760,6 +14785,58 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (outputHeight <= 0 || outputWidth <= 0)
             throw new ArgumentException($"Invalid output dimensions ({outputHeight}x{outputWidth}). Check pool size and stride.");
+
+        // Lazy graph mode (compiled-inference trace): record the pool as a graph node
+        // so the captured plan stays CONNECTED end-to-end. This entry is what
+        // MaxPoolingLayer.Forward calls, and it previously had NO GraphMode recording —
+        // tracing a conv net captured a graph with both pools missing, which fell apart
+        // into disconnected segments bridged by stale trace-time buffers and a scrambled
+        // topological order (the dense head executed BEFORE the convs). Replay returned
+        // relErr=1.0 garbage (CompiledInferenceParityTests.Cnn_CompiledReplay_MatchesEager).
+        //
+        // The indices side-output cannot be computed here: under an active trace the
+        // input buffer is a graph placeholder (values do not flow at trace time), so it
+        // is returned zero-filled. That is sound ONLY for the compiled-INFERENCE path —
+        // indices feed the training backward, and the traced Predict runs under
+        // NoGradScope — while the recorded node's replay closure recomputes the pooled
+        // VALUES, which is all the inference plan needs. TRAINING traces (an active
+        // GradientTape) must NOT take this branch: the recorded node's saved zero-filled
+        // indices would corrupt MaxPool2DWithIndicesBackward's gradient routing
+        // (surfaced as Issue1296 gradient-accumulation mismatches). They keep the
+        // eager path below, exactly as before this recording existed.
+        if (GraphMode.IsActive
+            && Autodiff.GradientTape<T>.Current is null)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                maxIndices = new int[batch, channels, outputHeight, outputWidth, 2];
+                var captured = input;
+                int ph = poolH, pw = poolW, sh = strideH, sw = strideW;
+                // No backwardFn / savedState: this branch is gated to
+                // GradientTape<T>.Current is null (inference-only trace), so
+                // replay never runs a backward. Recording
+                // MaxPool2DWithIndicesBackward + the zero-filled maxIndices
+                // here would (a) pin a potentially large
+                // int[batch, channels, outH, outW, 2] for the lifetime of
+                // the lazy graph / compiled plan, and (b) hand any future
+                // backward consumer corrupt all-zero routing indices.
+                return scope.RecordUnary(LazyNodeType.MaxPool2D, "MaxPool2DWithIndices", input,
+                    new[] { batch, channels, outputHeight, outputWidth },
+                    (eng, output) =>
+                    {
+                        if (eng is CpuEngine cpuEng && ph == pw && sh == sw)
+                        {
+                            cpuEng.MaxPool2DInto(output, captured, ph, sh, 0);
+                        }
+                        else
+                        {
+                            var eager = eng.MaxPool2DWithIndices(captured, new[] { ph, pw }, new[] { sh, sw }, out _);
+                            eager.AsSpan().CopyTo(output.AsWritableSpan());
+                        }
+                    });
+            }
+        }
 
         var result = TensorAllocator.Rent<T>([batch, channels, outputHeight, outputWidth]);
         // Use local variable to avoid capturing out parameter in lambda

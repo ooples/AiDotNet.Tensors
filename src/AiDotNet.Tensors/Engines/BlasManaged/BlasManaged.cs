@@ -642,6 +642,10 @@ public static partial class BlasManaged
         handle.NumIcBlocks = numIcBlocks;
         handle.NumPcBlocks = numPcBlocks;
         handle.MultiPanelStride = tileBytes;
+        // Record the microkernel row tile the panel stripes are interleaved with —
+        // consumers must run the SAME mr or fall back to live packing (see
+        // WeightPackHandle.PackMr).
+        handle.PackMr = mr;
         BlasManagedStatsTracker.AddPackCacheBytes(packedBytes);
 
         // Snapshot Version BEFORE packing so a concurrent MarkDirty doesn't
@@ -761,6 +765,10 @@ public static partial class BlasManaged
         handle.NumIcBlocks = numJcBlocks;  // B-side: jc-blocks live in NumIcBlocks slot
         handle.NumPcBlocks = numPcBlocks;
         handle.MultiPanelStride = tileBytes;
+        // Record the microkernel column tile the panel stripes are interleaved
+        // with — consumers must run the SAME nr or fall back to live packing (see
+        // WeightPackHandle.PackNr).
+        handle.PackNr = nr;
         BlasManagedStatsTracker.AddPackCacheBytes(packedBytes);
 
         long packedVersion = Interlocked.Read(ref handle.Version);
