@@ -1175,8 +1175,23 @@ internal static class BackwardFunctions<T>
         var embeddingDim = (int)savedState[3];
 
         var indices = new Tensor<long>(indicesData, indicesShape);
-        var grad = engine.TensorEmbeddingLookupBackward<T, long>(gradOutput, indices, vocabSize, embeddingDim);
-        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+
+        // Parallel sparse-grad recording: (gradOutput, indices) is everything a
+        // sparse-aware optimizer needs to scatter-update only the accessed rows of the
+        // embedding table. No allocation here — the Build factory just wraps the existing
+        // tensor references. Sparse-aware Adam/AdamW pick this up via
+        // DifferentiableOps.GetSparseEmbeddingGradsFor.
+        var sparseGrad = SparseEmbeddingGradient<T>.Build(gradOutput, indices, vocabSize, embeddingDim);
+        DifferentiableOps.AccumulateSparseEmbeddingGrad(inputs[0], sparseGrad);
+
+        // Dense seeding for backward-compat with the 15 in-tree optimizers that don't yet
+        // consume sparse contributions directly. This is the existing [vocabSize, embeddingDim]
+        // allocation path; once an optimizer is updated to read GetSparseEmbeddingGradsFor
+        // first and skip dense for sparse-only params, the allocation can be skipped for
+        // that optimizer (the planned follow-up). Until then, both forms coexist so no
+        // existing optimizer breaks on the upgrade.
+        var dense = engine.TensorEmbeddingLookupBackward<T, long>(gradOutput, indices, vocabSize, embeddingDim);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], dense, engine);
     }
 
     /// <summary>
@@ -1208,10 +1223,20 @@ internal static class BackwardFunctions<T>
 
         var indicesShape = (int[])capturedFloatIdx._shape.Clone();
         var indicesTensor = new Tensor<long>(idxLong, indicesShape);
-        var grad = engine.TensorEmbeddingLookupBackward<T, long>(gradOutput, indicesTensor, vocabSize, embeddingDim);
+
+        // Sparse-grad path (same rationale as TensorEmbeddingLookupBackward above):
+        // record (gradOutput, indices) without scattering into [vocabSize, embeddingDim].
         // inputs[0] is the embedding table — the only trainable input.
         // inputs[1] is the float-indices tensor; it carries no gradient.
-        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+        var sparseGrad = SparseEmbeddingGradient<T>.Build(gradOutput, indicesTensor, vocabSize, embeddingDim);
+        DifferentiableOps.AccumulateSparseEmbeddingGrad(inputs[0], sparseGrad);
+
+        // Dense fallback for callers without the sparse-grad array wired in.
+        if (DifferentiableOps.GetSparseEmbeddingGradsFor(inputs[0]) is null)
+        {
+            var dense = engine.TensorEmbeddingLookupBackward<T, long>(gradOutput, indicesTensor, vocabSize, embeddingDim);
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], dense, engine);
+        }
     }
 
     /// <summary>GeGLU backward: dispatches to engine.GeGLUBackward(gradOutput, input, dim).</summary>

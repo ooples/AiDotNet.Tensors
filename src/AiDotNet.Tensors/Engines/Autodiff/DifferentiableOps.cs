@@ -90,6 +90,77 @@ internal static class DifferentiableOps
     /// <summary>Clears the indexed gradient array after backward completes.</summary>
     internal static void ClearIndexedGrads() => _indexedGrads = null;
 
+    // Parallel sparse-gradient array for embedding-table parameters. Same
+    // ThreadStatic + index-by-_gradIndex pattern as _indexedGrads, but each slot
+    // holds a List<SparseEmbeddingGradient<T>> (object-typed for type-erasure)
+    // instead of a Tensor<T>. Lets an embedding-lookup backward record its sparse
+    // contribution (16 rows × 768 dim ≈ 49 KB) instead of materializing the dense
+    // [vocab × dim] gradient (≈ 768 MB for paper-default LayoutXLM). Sparse-aware
+    // optimizers query GetSparseEmbeddingGradsFor; dense-only optimizers fall back
+    // to the existing grads dict (the dense materialization happens lazily, only
+    // when ToDense is called).
+    [ThreadStatic]
+    internal static object?[]? _indexedSparseGrads;
+
+    /// <summary>Sets the indexed sparse-gradient array for the current backward pass.</summary>
+    internal static void SetIndexedSparseGrads(object?[] sparseGrads) => _indexedSparseGrads = sparseGrads;
+
+    /// <summary>Clears the indexed sparse-gradient array after backward completes.</summary>
+    internal static void ClearIndexedSparseGrads() => _indexedSparseGrads = null;
+
+    /// <summary>
+    /// Records a sparse embedding-table gradient contribution for <paramref name="param"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Callers (embedding-lookup backward functions) pre-build the
+    /// <see cref="SparseEmbeddingGradient{T}"/> via the engine-free
+    /// <see cref="SparseEmbeddingGradient{T}.Build{TIndex}"/> factory so no
+    /// <c>[vocabSize, embeddingDim]</c> tensor is allocated at scatter time. Multiple
+    /// contributions to the same parameter (e.g. an embedding table read in several
+    /// places during the same forward pass) are accumulated as a list so the optimizer
+    /// can fold them per-accessed-row at step time.
+    /// </para>
+    /// <para>
+    /// If the sparse-grad array hasn't been wired in by the active backward pass
+    /// (legacy callers, tests that bypass <see cref="GradientTape{T}.ComputeGradients"/>),
+    /// this method is a no-op. Callers that want a guaranteed gradient contribution
+    /// should also call <see cref="AccumulateGrad{T}"/> after a <c>ToDense</c>
+    /// materialization — but the canonical path is sparse-only.
+    /// </para>
+    /// </remarks>
+    internal static void AccumulateSparseEmbeddingGrad<T>(Tensor<T> param, SparseEmbeddingGradient<T> grad)
+    {
+        if (param is null) throw new ArgumentNullException(nameof(param));
+        int idx = param._gradIndex;
+        if (idx < 0 || _indexedSparseGrads is null || idx >= _indexedSparseGrads.Length)
+            return; // No sparse-grads array wired in — the dense fallback path is the caller's responsibility.
+
+        var existing = _indexedSparseGrads[idx] as System.Collections.Generic.List<SparseEmbeddingGradient<T>>;
+        if (existing is null)
+        {
+            existing = new System.Collections.Generic.List<SparseEmbeddingGradient<T>>(capacity: 1);
+            _indexedSparseGrads[idx] = existing;
+        }
+        existing.Add(grad);
+    }
+
+    /// <summary>
+    /// Returns the list of sparse embedding-gradient contributions accumulated for
+    /// <paramref name="param"/> during the current backward pass, or <c>null</c> if
+    /// none were recorded (the parameter's gradient should be read from the dense
+    /// <c>grads</c> dictionary instead). Sparse-aware optimizers call this first;
+    /// dense-only optimizers ignore the sparse dict.
+    /// </summary>
+    public static System.Collections.Generic.IReadOnlyList<SparseEmbeddingGradient<T>>? GetSparseEmbeddingGradsFor<T>(Tensor<T> param)
+    {
+        if (param is null) throw new ArgumentNullException(nameof(param));
+        int idx = param._gradIndex;
+        if (idx < 0 || _indexedSparseGrads is null || idx >= _indexedSparseGrads.Length)
+            return null;
+        return _indexedSparseGrads[idx] as System.Collections.Generic.List<SparseEmbeddingGradient<T>>;
+    }
+
     /// <summary>
     /// True when a backward pass is running with <c>createGraph=true</c> —
     /// backward ops are themselves recorded on the tape for higher-order
