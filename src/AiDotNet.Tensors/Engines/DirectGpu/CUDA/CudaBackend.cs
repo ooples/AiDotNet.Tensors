@@ -305,6 +305,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             CompileAllKernels(device);
 
             IsAvailable = true;
+
+            // CUDA-graph feasibility/benefit probe (AIDOTNET_CUDA_GRAPH_PROBE=1): capture a pure-GPU op
+            // sequence into a cudaGraph and compare graph-replay vs individual-launch latency. Quantifies
+            // whether capture works on this stream and how much per-launch overhead replay removes — the
+            // evidence basis for the CUDA-graph training-step work. Trace-only; no effect on normal runs.
+            if (Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_PROBE") == "1")
+                RunCudaGraphProbe();
         }
         catch (Exception ex)
         {
@@ -3181,6 +3188,46 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             args[2] = &outer;
             args[3] = &reduce;
             LaunchKernel(kernel, grid, DefaultBlockSize, args);
+        }
+    }
+
+    /// <summary>Probe (AIDOTNET_CUDA_GRAPH_PROBE=1): confirms CUDA graph capture/instantiate/launch work on
+    /// this backend's stream, and measures how much per-launch overhead graph replay removes vs issuing each
+    /// op individually. Pure-GPU op sequence (DtoD copies) — the capturable subset; downloads can't be captured.</summary>
+    private void RunCudaGraphProbe()
+    {
+        void Log(string s) => System.Diagnostics.Trace.WriteLine("[CUDA-GRAPH-PROBE] " + s);
+        IntPtr src = IntPtr.Zero, dst = IntPtr.Zero, graph = IntPtr.Zero, exec = IntPtr.Zero;
+        try
+        {
+            const ulong N = 4096;
+            Log($"alloc src={CudaNativeBindings.cuMemAlloc(out src, N)} dst={CudaNativeBindings.cuMemAlloc(out dst, N)}");
+            const int OPS = 16;
+            var rb = CudaNativeBindings.cuStreamBeginCapture(_stream, CudaNativeBindings.CU_STREAM_CAPTURE_MODE_GLOBAL);
+            for (int i = 0; i < OPS; i++) CudaNativeBindings.cuMemcpyDtoDAsync(dst, src, N, _stream);
+            var re = CudaNativeBindings.cuStreamEndCapture(_stream, out graph);
+            var ri = CudaNativeBindings.cuGraphInstantiate(out exec, graph, 0);
+            Log($"beginCapture={rb} endCapture={re} instantiate={ri} graph={graph != IntPtr.Zero} exec={exec != IntPtr.Zero}");
+            if ((int)ri != 0 || exec == IntPtr.Zero) { Log("INSTANTIATE FAILED -> capture not usable as-is on this stream"); return; }
+            CudaNativeBindings.cuGraphLaunch(exec, _stream); CudaNativeBindings.cuStreamSynchronize(_stream); // warm
+            const int REP = 2000;
+            var swG = System.Diagnostics.Stopwatch.StartNew();
+            for (int i = 0; i < REP; i++) CudaNativeBindings.cuGraphLaunch(exec, _stream);
+            CudaNativeBindings.cuStreamSynchronize(_stream); swG.Stop();
+            var swD = System.Diagnostics.Stopwatch.StartNew();
+            for (int i = 0; i < REP * OPS; i++) CudaNativeBindings.cuMemcpyDtoDAsync(dst, src, N, _stream);
+            CudaNativeBindings.cuStreamSynchronize(_stream); swD.Stop();
+            double g = swG.Elapsed.TotalMilliseconds, d = swD.Elapsed.TotalMilliseconds;
+            Log($"{REP} graph-replays ({REP * OPS} ops): {g:F1}ms  |  {REP * OPS} direct launches: {d:F1}ms");
+            Log($"VERDICT: capture WORKS; replay removes per-launch overhead -> {d / System.Math.Max(0.01, g):F2}x fewer launch-cost for the same op count");
+        }
+        catch (Exception ex) { Log("EXCEPTION " + ex.GetType().Name + ": " + ex.Message); }
+        finally
+        {
+            if (exec != IntPtr.Zero) CudaNativeBindings.cuGraphExecDestroy(exec);
+            if (graph != IntPtr.Zero) CudaNativeBindings.cuGraphDestroy(graph);
+            if (src != IntPtr.Zero) CudaNativeBindings.cuMemFree(src);
+            if (dst != IntPtr.Zero) CudaNativeBindings.cuMemFree(dst);
         }
     }
 
