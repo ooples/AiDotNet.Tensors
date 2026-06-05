@@ -1150,20 +1150,26 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
 
         // Dispose evicted GPU buffers OUTSIDE the lock to avoid blocking cache lookups.
-        // #226 race fix (approach 1): a step's forward/backward enqueues a long async
-        // kernel chain on the stream; freeing an evicted buffer while a kernel that still
-        // references it is in flight is an illegal access (CUDA 700 at the next sync). Fully
-        // synchronize the backend stream FIRST so every enqueued kernel has finished and no
-        // GPU op references the buffers we are about to free. This makes within-step offload
-        // safe, so eviction (and thus host-RAM offload) can run during a step without the
-        // suspend — trading a (rare, only-under-VRAM-pressure) sync for a 700 corruption.
+        // #226 race fix (#555): a step's forward/backward enqueues a long async kernel chain
+        // on the stream; returning an evicted buffer to the pool (for reuse OR a real cuMemFree
+        // when the bucket is full) while a kernel that still references it is in flight is an
+        // illegal access (CUDA 700 at the next sync). On CUDA, route the free through the
+        // event-based deferred-free queue: the buffer is held until a stream event marking its
+        // last use completes (polled NON-blocking), so offload is race-free AND does not stall
+        // the pipeline (the earlier full-stream-sync fix was correct but impractically slow).
         if (evicted.Count > 0)
         {
-            try { backend.Synchronize(); } catch { /* best-effort; dispose still proceeds */ }
-        }
-        foreach (var entry in evicted)
-        {
-            entry.Dispose();
+            if (backend is DirectGpu.CUDA.CudaBackend cudaBackend)
+            {
+                foreach (var entry in evicted)
+                    cudaBackend.FreeBufferDeferred(entry.Buffer);
+            }
+            else
+            {
+                // Non-CUDA backends keep the synchronous free (no deferred-free path yet).
+                foreach (var entry in evicted)
+                    entry.Dispose();
+            }
         }
     }
 

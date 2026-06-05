@@ -102,6 +102,14 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     private const int MaxPooledBuffersPerSize = 4;
     private readonly GpuBufferPool<CudaGpuBuffer> _bufferPool =
         new GpuBufferPool<CudaGpuBuffer>(MaxPooledBuffersPerSize, MaxPooledBufferElements);
+    // Event-based deferred buffer free (#555 / #226). A buffer evicted mid-step may still
+    // be referenced by an in-flight async kernel; returning it to the pool (for reuse OR a
+    // real cuMemFree when the bucket is full) before that kernel finishes is the CUDA-700
+    // illegal-access race. Instead we record a lightweight (timing-disabled) event on the
+    // compute stream and hold the buffer in this queue until the event completes — polled
+    // NON-blocking (cuEventQuery) so there is no host stall (unlike a full cuStreamSynchronize).
+    private readonly object _deferredFreeLock = new();
+    private readonly Queue<(IGpuBuffer Buffer, CudaEvent Event)> _deferredFrees = new();
     private bool _supportsCooperativeLaunch;
     private int _multiProcessorCount;
     private readonly CudaPinnedBufferPool _pinnedPool = new();
@@ -1016,6 +1024,50 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     }
 
     /// <summary>
+    /// Race-free deferred free of a GPU buffer (#555). Records a stream event marking the
+    /// buffer's last enqueued use and holds the buffer until that event completes, so it is
+    /// never returned to the pool (and therefore never reused or cuMemFree'd) while an
+    /// in-flight kernel still references it. Non-blocking: drains already-completed deferrals
+    /// each call. Use this instead of <c>buffer.Dispose()</c> for activations freed during a
+    /// training step (the within-step VRAM-pressure offload path).
+    /// </summary>
+    public void FreeBufferDeferred(IGpuBuffer? buffer)
+    {
+        if (buffer == null) return;
+        CudaEvent evt;
+        using (PushContext())
+            evt = new CudaEvent(this, _defaultStream, enableTiming: false); // creates + records on the compute stream
+        lock (_deferredFreeLock)
+            _deferredFrees.Enqueue((buffer, evt));
+        DrainDeferredFrees(blockOldest: false);
+    }
+
+    /// <summary>
+    /// Returns buffers whose deferred-free event has completed to the pool. With
+    /// <paramref name="blockOldest"/> = true, waits on the front event (used to reclaim
+    /// memory under genuine allocation pressure). FIFO: events recorded later complete
+    /// later, so once the front is incomplete the rest are too (fast early-out).
+    /// </summary>
+    public void DrainDeferredFrees(bool blockOldest)
+    {
+        lock (_deferredFreeLock)
+        {
+            while (_deferredFrees.Count > 0)
+            {
+                var (buf, evt) = _deferredFrees.Peek();
+                if (!evt.IsComplete)
+                {
+                    if (!blockOldest) break;
+                    evt.Synchronize();
+                }
+                _deferredFrees.Dequeue();
+                buf.Dispose();   // returns to the pool — now provably safe
+                evt.Dispose();
+            }
+        }
+    }
+
+    /// <summary>
     /// Allocates device memory with an OOM-recovery retry. If the driver reports
     /// out-of-memory, drain the buffer pool — a real <c>cuMemFree</c> of every
     /// retained-for-reuse buffer — and retry the allocation once. The pool holds
@@ -1033,6 +1085,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         var result = CuBlasNative.cuMemAlloc(out IntPtr devicePtr, byteSize);
         if (result == CudaResult.OutOfMemory)
         {
+            // Reclaim event-deferred frees first (#555) — under genuine pressure block on
+            // their events so their device memory returns to the pool — then drain the pool.
+            DrainDeferredFrees(blockOldest: true);
             int drained = _bufferPool.DrainAll();
             result = CuBlasNative.cuMemAlloc(out devicePtr, byteSize);
             if (result != CudaResult.Success)
