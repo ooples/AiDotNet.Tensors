@@ -239,6 +239,29 @@ internal static class CudaNativeBindings
     [DllImport(CudaLibrary, EntryPoint = "cuStreamIsCapturing")]
     public static extern CudaResult cuStreamIsCapturing(IntPtr stream, out int captureStatus);
 
+    [DllImport(CudaLibrary, EntryPoint = "cuMemsetD8Async")]
+    public static extern CudaResult cuMemsetD8Async(IntPtr dstDevice, byte uc, ulong n, IntPtr stream);
+
+    /// <summary>
+    /// Result of cuGraphExecUpdate_v2 (CUgraphExecUpdateResultInfo). `result` 0
+    /// (CU_GRAPH_EXEC_UPDATE_SUCCESS) means the existing exec was updated in place
+    /// from the new graph — far cheaper than re-instantiating — so a captured step
+    /// whose only change is a scalar kernel arg (e.g. Adam's bias-correction step)
+    /// can be replayed across steps. Non-zero means topology changed too much and
+    /// the caller must re-instantiate.
+    /// </summary>
+    [StructLayout(LayoutKind.Sequential)]
+    public struct CUgraphExecUpdateResultInfo
+    {
+        public int result;          // CUgraphExecUpdateResult enum
+        public IntPtr errorNode;    // CUgraphNode
+        public IntPtr errorFromNode;// CUgraphNode
+    }
+
+    [DllImport(CudaLibrary, EntryPoint = "cuGraphExecUpdate_v2")]
+    public static extern CudaResult cuGraphExecUpdate(
+        IntPtr hGraphExec, IntPtr hGraph, ref CUgraphExecUpdateResultInfo resultInfo);
+
     // ──────────────────────────────────────────────────────────────
     // Multi-GPU context management
     // ──────────────────────────────────────────────────────────────

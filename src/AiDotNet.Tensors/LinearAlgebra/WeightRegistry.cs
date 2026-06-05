@@ -102,6 +102,15 @@ public static class WeightRegistry
         get { lock (_lock) return _offloadAllocator; }
     }
 
+    /// <summary>The currently-active offload options. Lets a caller that wants
+    /// to attach an offload allocator (e.g. GPU adoption auto-registering the
+    /// CUDA allocator) re-Configure without clobbering options another caller
+    /// already set.</summary>
+    public static GpuOffloadOptions CurrentOptions
+    {
+        get { lock (_lock) return _options; }
+    }
+
     /// <summary>Registers a weight tensor with the registry. Routes to
     /// the streaming pool / offload allocator based on the tensor's
     /// <see cref="Tensor{T}.Lifetime"/>.</summary>

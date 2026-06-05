@@ -714,6 +714,15 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         // Compile SNN kernels (STDP, spike traces, RBF, PRNG, 2:4 structured sparsity)
         _snnModule = CompileKernelModule(device, CudaSnnKernels.GetSource(), "snn_kernels", CudaSnnKernels.GetKernelNames());
 
+        // Compile GPU-resident optimizer kernels (adam/adamw/sgd/momentum/nag/
+        // adagrad/rmsprop/adadelta/adamax/nadam/lamb/lars/lion/amsgrad/ftrl
+        // *_update). Without this the in-place GPU optimizer step (GpuOptimizer.
+        // TryXStep → IDirectGpuBackend.XUpdate) throws "CUDA kernel not found:
+        // <name>_update" for every kernel that is NOT also duplicated into the
+        // neuralnet module (adam/adagrad/rmsprop/lamb/adamw/sgd/... were dead),
+        // so every optimizer silently fell back to the CPU weight update.
+        CompileKernelModule(device, CudaOptimizerKernels.GetSource(), "optimizer_kernels", CudaOptimizerKernels.GetKernelNames());
+
         // Compile reduction kernels (mean, variance, std, norm, logsumexp, product, cumsum)
         CompileKernelModule(device, CudaReductionKernels.GetSource(), "reduction_kernels", CudaReductionKernels.GetKernelNames());
 
@@ -1100,6 +1109,19 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             throw new ArgumentException("Destination array is too small.", nameof(destination));
 
         using var _ = PushContext();
+
+        // Synchronize the compute stream before the device→host copy. Kernels
+        // launch on `_stream` (a non-default stream), but cuMemcpyDtoH below
+        // issues on the null stream. With a non-blocking compute stream the
+        // null stream does NOT implicitly wait for it, so the copy can race
+        // ahead of a just-launched kernel and read stale device memory — most
+        // visibly the in-place GPU-resident optimizer update, whose write would
+        // then be silently lost on the immediately-following host read (the
+        // value oscillated run-to-run between updated and pre-step). One stream
+        // sync on the host-read path (already a synchronization point) closes
+        // the race with no effect on the GPU-resident training hot path.
+        CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamSynchronize(_stream), "cuStreamSynchronize(download)");
+
         ulong byteSize = (ulong)(buffer.Size * sizeof(float));
 
         unsafe
@@ -10108,6 +10130,77 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         args[3] = &weightDecay;
         args[4] = &size;
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    /// <summary>
+    /// Proximal gradient (ISTA) step with L1 soft-threshold prox, in place on the GPU:
+    /// <c>tmp = param - lr*grad; param = sign(tmp)*max(|tmp| - l1Strength, 0)</c>.
+    /// </summary>
+    public unsafe void ProximalL1Update(IGpuBuffer param, IGpuBuffer gradient,
+        float learningRate, float l1Strength, int size)
+    {
+        if (param is null) throw new ArgumentNullException(nameof(param));
+        if (gradient is null) throw new ArgumentNullException(nameof(gradient));
+        if (size <= 0)
+            throw new ArgumentOutOfRangeException(nameof(size), "Size must be positive.");
+        // Validate device-buffer capacity before launch: GpuOptimizer passes p.Length
+        // for `size` without cross-checking the gradient buffer, so a shape mismatch
+        // (gradient.Size < size) would otherwise read past gradient.Handle — an illegal
+        // device access / silent corruption instead of a clear managed exception.
+        if (param.Size < size)
+            throw new ArgumentException($"param buffer too small: capacity={param.Size}, required={size}.", nameof(param));
+        if (gradient.Size < size)
+            throw new ArgumentException($"gradient buffer too small: capacity={gradient.Size}, required={size}.", nameof(gradient));
+
+        if (!_kernelCache.TryGetValue("proximal_l1_update", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: proximal_l1_update");
+
+        using var _ = PushContext();
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr paramPtr = param.Handle;
+        IntPtr gradPtr = gradient.Handle;
+        void** args = stackalloc void*[5];
+        args[0] = &paramPtr;
+        args[1] = &gradPtr;
+        args[2] = &learningRate;
+        args[3] = &l1Strength;
+        args[4] = &size;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    /// <summary>
+    /// 8-bit Adam blockwise update in place on the GPU. mQ/vQ are int8 quantized
+    /// moments (one byte per element); mScales/vScales are one double per block.
+    /// One CUDA block per quant block, 256 threads, shared-memory maxAbs reduction.
+    /// Matches the CPU Adam8BitOptimizer's CompressBothMoments / percentile>=100 /
+    /// deterministic-rounding path.
+    /// </summary>
+    public unsafe void Adam8BitUpdate(IGpuBuffer param, IGpuBuffer gradient,
+        IGpuBuffer mQuant, IGpuBuffer vQuant, IGpuBuffer mScales, IGpuBuffer vScales,
+        float learningRate, float beta1, float beta2, float epsilon,
+        float oneMinusBeta1, float oneMinusBeta2, float biasCorrection1, float biasCorrection2,
+        int blockSize, int paramLength, int numBlocks)
+    {
+        if (param is null) throw new ArgumentNullException(nameof(param));
+        if (gradient is null) throw new ArgumentNullException(nameof(gradient));
+        if (mQuant is null || vQuant is null || mScales is null || vScales is null)
+            throw new ArgumentNullException(nameof(mQuant));
+        if (paramLength <= 0 || blockSize <= 0 || numBlocks <= 0)
+            throw new ArgumentOutOfRangeException(nameof(paramLength));
+
+        if (!_kernelCache.TryGetValue("adam8bit_update", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: adam8bit_update");
+
+        using var _ = PushContext();
+        IntPtr pPtr = param.Handle, gPtr = gradient.Handle;
+        IntPtr mqPtr = mQuant.Handle, vqPtr = vQuant.Handle, msPtr = mScales.Handle, vsPtr = vScales.Handle;
+        void** args = stackalloc void*[17];
+        args[0] = &pPtr; args[1] = &gPtr; args[2] = &mqPtr; args[3] = &vqPtr; args[4] = &msPtr; args[5] = &vsPtr;
+        args[6] = &learningRate; args[7] = &beta1; args[8] = &beta2; args[9] = &epsilon;
+        args[10] = &oneMinusBeta1; args[11] = &oneMinusBeta2; args[12] = &biasCorrection1; args[13] = &biasCorrection2;
+        args[14] = &blockSize; args[15] = &paramLength; args[16] = &numBlocks;
+        // One CUDA block per quant block (256 threads); the kernel grid-strides within each.
+        LaunchKernel(kernel, (uint)numBlocks, 256u, args);
     }
 
     /// <inheritdoc/>
