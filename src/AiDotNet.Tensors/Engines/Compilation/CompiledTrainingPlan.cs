@@ -34,6 +34,20 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private readonly Action<IEngine>[] _backwardActions;
     private readonly Tensor<T> _lossOutput;
     private readonly IEngine _engine;
+
+    // ---- CUDA-graph capture of the whole compiled training step (opt-in, default OFF) ----
+    // When AIDOTNET_CUDA_GRAPH_STEP=1 on a CUDA float plan, the fixed forward+grad-zero+
+    // backward+optimizer kernel sequence (already on STABLE pre-allocated buffers) is
+    // captured once and replayed with a single cuGraphLaunch — collapsing hundreds of
+    // per-kernel launch overheads/step into 1 (the launch-bound bottleneck for small
+    // models). Default OFF => existing training is byte-identical; eligibility is
+    // narrowly gated and any capture failure falls back to eager permanently.
+    private static readonly bool s_graphStepEnabled =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_STEP") == "1";
+    private IntPtr _stepGraphExec;
+    private long _graphStepCalls;
+    private bool _graphStepDisabled;
+    private const int GraphWarmupSteps = 3;   // eager first so cuBLAS workspace / lazy buffers stabilize
     private readonly Tensor<T>[] _parameters;
     private readonly Tensor<T>[] _gradients;
     private readonly Tensor<T>[] _preAllocatedGrads;
@@ -128,6 +142,15 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         foreach (var buf in _gpuOptimizerBuffers)
             buf.Dispose();
         _gpuOptimizerBuffers.Clear();
+
+        // Free the captured training-step graph, if any.
+        if (_stepGraphExec != IntPtr.Zero
+            && _engine is Engines.DirectGpuTensorEngine gte
+            && gte.GetBackend() is Engines.DirectGpu.CUDA.CudaBackend cb)
+        {
+            cb.DestroyCapturedGraph(_stepGraphExec);
+            _stepGraphExec = IntPtr.Zero;
+        }
     }
 
     public Tensor<T>[] Gradients => _gradients;
@@ -399,6 +422,75 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public Tensor<T> Step()
+    {
+        // Opt-in CUDA-graph replay of the whole compiled step. Narrowly gated:
+        // float + CUDA backend + no grad-norm clip (a per-step host read) + no
+        // checkpointing. Anything else, or any capture failure, runs eager.
+        if (s_graphStepEnabled && !_graphStepDisabled && typeof(T) == typeof(float)
+            && _checkpointing is null && _maxGradNorm <= 0.0
+            && _engine is Engines.DirectGpuTensorEngine gte
+            && gte.GetBackend() is Engines.DirectGpu.CUDA.CudaBackend cb)
+        {
+            _graphStepCalls++;
+            if (_graphStepCalls > GraphWarmupSteps)
+            {
+                if (_stepGraphExec == IntPtr.Zero)
+                {
+                    // Record the GPU forward+grad-zero+backward+optimizer sequence into a
+                    // graph, then launch once to actually execute THIS step (capture only
+                    // records). The caller has already refreshed the persistent input
+                    // buffer's CONTENTS, so the stable pointers stay valid across replays.
+                    var exec = cb.CaptureGraph(() => RunGpuStepBodyForCapture(cb));
+                    if (exec == IntPtr.Zero) { _graphStepDisabled = true; return StepEager(); }
+                    _stepGraphExec = exec;
+                    cb.LaunchCapturedGraph(exec);
+                    return _lossOutput;
+                }
+                cb.LaunchCapturedGraph(_stepGraphExec);
+                return _lossOutput;
+            }
+        }
+        return StepEager();
+    }
+
+    /// <summary>
+    /// The GPU-only body of a training step (forward → grad-zero → loss-grad reseed →
+    /// backward → optimizer), with grad-zero and loss-grad reseed done as GPU ops so a
+    /// cuGraphLaunch replay re-does them (a host Array.Clear/Copy would run only at
+    /// capture time). Used solely under the captured graph path.
+    /// </summary>
+    private void RunGpuStepBodyForCapture(Engines.DirectGpu.CUDA.CudaBackend cb)
+    {
+        var engine = _engine;
+        _preForwardParamTransform?.Invoke();
+        var fwd = _forwardActions;
+        for (int i = 0; i < fwd.Length; i++) fwd[i](engine);
+
+        int esz = System.Runtime.CompilerServices.Unsafe.SizeOf<T>();
+        if (_genericGradIndices != null)
+        {
+            for (int i = 0; i < _genericGradIndices.Length; i++)
+            {
+                int idx = _genericGradIndices[i];
+                if (_preAllocatedGrads[idx].TryGetGpuBuffer() is { } gb)
+                    cb.MemsetBuffer(gb, 0, (long)_preAllocatedGrads[idx].Length * esz);
+            }
+        }
+        else
+        {
+            for (int i = 0; i < _preAllocatedGrads.Length; i++)
+                if (_preAllocatedGrads[i].TryGetGpuBuffer() is { } gb)
+                    cb.MemsetBuffer(gb, 0, (long)_preAllocatedGrads[i].Length * esz);
+        }
+        if (_lossGradSeed.TryGetGpuBuffer() is { } seedBuf && _lossGradDest?.TryGetGpuBuffer() is { } destBuf)
+            cb.CopyBufferDtoD(seedBuf, destBuf, (long)_lossGradSeed.Length * esz);
+
+        var bwd = _backwardActions;
+        for (int i = 0; i < bwd.Length; i++) bwd[i](engine);
+        _optimizerUpdate?.Invoke();
+    }
+
+    private Tensor<T> StepEager()
     {
         var engine = _engine;
         // Two independent profile surfaces: PR #352's per-step

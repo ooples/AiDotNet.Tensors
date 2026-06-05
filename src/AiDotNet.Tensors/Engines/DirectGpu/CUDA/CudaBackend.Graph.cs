@@ -156,6 +156,34 @@ public sealed partial class CudaBackend
         return dst;
     }
 
+    /// <summary>
+    /// Sets <paramref name="byteCount"/> bytes of <paramref name="buffer"/> to
+    /// <paramref name="value"/> on the compute stream (cuMemsetD8Async). Used by the
+    /// compiled-training-step graph capture to zero accumulating gradient buffers AS
+    /// A GPU OP inside the captured sequence — a host-side Array.Clear would not be
+    /// replayed by cuGraphLaunch, so the grads would accumulate across replays.
+    /// </summary>
+    public void MemsetBuffer(IGpuBuffer buffer, byte value, long byteCount)
+    {
+        if (buffer is null || byteCount <= 0) return;
+        using var _ = PushContext();
+        CuBlasNative.CheckCudaResult(
+            CudaNativeBindings.cuMemsetD8Async(buffer.Handle, value, (ulong)byteCount, _stream), "cuMemsetD8Async");
+    }
+
+    /// <summary>
+    /// Async device→device copy on the compute stream (cuMemcpyDtoDAsync). The
+    /// synchronous CopyBuffer/cuMemcpyDtoD would abort stream capture, so the
+    /// graph-captured step re-seeds the loss gradient through this instead.
+    /// </summary>
+    public void CopyBufferDtoD(IGpuBuffer source, IGpuBuffer destination, long byteCount)
+    {
+        if (source is null || destination is null || byteCount <= 0) return;
+        using var _ = PushContext();
+        CuBlasNative.CheckCudaResult(
+            CudaNativeBindings.cuMemcpyDtoDAsync(destination.Handle, source.Handle, (ulong)byteCount, _stream), "cuMemcpyDtoDAsync(graph)");
+    }
+
     /// <summary>True while this backend's stream is mid-capture (diagnostics).</summary>
     public bool IsStreamCapturing()
     {

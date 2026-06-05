@@ -239,6 +239,9 @@ internal static class CudaNativeBindings
     [DllImport(CudaLibrary, EntryPoint = "cuStreamIsCapturing")]
     public static extern CudaResult cuStreamIsCapturing(IntPtr stream, out int captureStatus);
 
+    [DllImport(CudaLibrary, EntryPoint = "cuMemsetD8Async")]
+    public static extern CudaResult cuMemsetD8Async(IntPtr dstDevice, byte uc, ulong n, IntPtr stream);
+
     /// <summary>
     /// Result of cuGraphExecUpdate_v2 (CUgraphExecUpdateResultInfo). `result` 0
     /// (CU_GRAPH_EXEC_UPDATE_SUCCESS) means the existing exec was updated in place
