@@ -106,4 +106,75 @@ public readonly struct SparseEmbeddingGradient<T>
         if (engine is null) throw new ArgumentNullException(nameof(engine));
         return engine.TensorEmbeddingLookupBackward<T, long>(Values, Indices, VocabSize, EmbeddingDim);
     }
+
+    /// <summary>
+    /// Engine-free sparse factory. The embedding-lookup backward is conceptually
+    /// just "wrap the per-position gradients + their row indices" — there is no
+    /// scatter and no [vocabSize, embeddingDim] allocation in the sparse path,
+    /// so the factory does not need an <see cref="IEngine"/> at all. Use this in
+    /// place of <see cref="IEngine.TensorEmbeddingLookupBackward{TValue, TIndex}"/>
+    /// whenever the downstream consumer can handle the sparse representation
+    /// (optimizer-side scatter-update path).
+    /// </summary>
+    /// <param name="gradOutput">
+    /// Per-position gradient produced by upstream layers, shape
+    /// <c>[numIndices, embeddingDim]</c>. The same tensor that the dense backward
+    /// would scatter into <c>[vocabSize, embeddingDim]</c>.
+    /// </param>
+    /// <param name="indices">
+    /// Row indices into the embedding table, shape <c>[numIndices]</c>. Any unmanaged
+    /// integer width is widened to <c>long</c> so consumers don't have to branch on
+    /// <typeparamref name="TIndex"/>; large-vocab models (over 2 billion rows, e.g.
+    /// retrieval indices) round-trip without overflow.
+    /// </param>
+    /// <param name="vocabSize">Vocabulary size of the embedding table.</param>
+    /// <param name="embeddingDim">Embedding dimension of the embedding table.</param>
+    public static SparseEmbeddingGradient<T> Build<TIndex>(
+        Tensor<T> gradOutput, Tensor<TIndex> indices, int vocabSize, int embeddingDim)
+        where TIndex : unmanaged
+    {
+        if (gradOutput is null) throw new ArgumentNullException(nameof(gradOutput));
+        if (indices is null) throw new ArgumentNullException(nameof(indices));
+        if (vocabSize <= 0)
+            throw new ArgumentOutOfRangeException(nameof(vocabSize), "Vocabulary size must be positive.");
+        if (embeddingDim <= 0)
+            throw new ArgumentOutOfRangeException(nameof(embeddingDim), "Embedding dimension must be positive.");
+
+        // Normalize per-position gradients to the canonical [numIndices, embeddingDim]
+        // shape. The embedding-lookup forward produced an output the consumer wrote
+        // gradients into, and that output's rank depends on the caller's input rank:
+        // a rank-1 [seqLen] token input produces a rank-2 [seqLen, embeddingDim] grad;
+        // a rank-2 [batch, seqLen] input produces rank-3 [batch, seqLen, embeddingDim].
+        // The sparse representation only cares about (position → row), so flatten the
+        // leading axes when they exist.
+        var flatValues = gradOutput;
+        int totalIndices = indices.Length;
+        int gradLastDim = gradOutput.Shape[gradOutput.Rank - 1];
+        if (gradLastDim != embeddingDim)
+        {
+            throw new ArgumentException(
+                $"gradOutput last axis ({gradLastDim}) must equal embeddingDim ({embeddingDim}).",
+                nameof(gradOutput));
+        }
+        if (gradOutput.Rank != 2 || gradOutput.Shape[0] != totalIndices)
+        {
+            flatValues = new Tensor<T>(gradOutput.GetDataArray(), new[] { totalIndices, embeddingDim });
+        }
+
+        // Widen indices to long so downstream consumers don't branch on TIndex.
+        Tensor<long> longIndices;
+        if (typeof(TIndex) == typeof(long) && indices is Tensor<long> alreadyLong)
+        {
+            longIndices = alreadyLong;
+        }
+        else
+        {
+            var src = indices.GetDataArray();
+            var dst = new long[totalIndices];
+            for (int i = 0; i < totalIndices; i++) dst[i] = Convert.ToInt64(src[i]);
+            longIndices = new Tensor<long>(dst, new[] { totalIndices });
+        }
+
+        return new SparseEmbeddingGradient<T>(flatValues, longIndices, vocabSize, embeddingDim);
+    }
 }

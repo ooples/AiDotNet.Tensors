@@ -106,4 +106,41 @@ public class SparseEmbeddingGradientTests
         Assert.Throws<System.ArgumentException>(() =>
             new SparseEmbeddingGradient<float>(values, indices, vocabSize: 5, embeddingDim: 8)); // 4 != 8
     }
+
+    /// <summary>
+    /// End-to-end parity: SparseEmbeddingGradient.Build → ToDense should reproduce the exact
+    /// dense gradient the existing engine.TensorEmbeddingLookupBackward path emits — i.e. the
+    /// sparse representation is a drop-in for the dense one. This is the contract a future
+    /// sparse-aware optimizer relies on: every consumer that still wants dense semantics gets
+    /// them bit-exact, and the alloc savings come only from skipping the materialization when
+    /// the consumer doesn't need it.
+    /// </summary>
+    [Fact]
+    public void Build_ThenToDense_MatchesEngineBackward()
+    {
+        const int vocabSize = 16;
+        const int embeddingDim = 6;
+        // Rank-3 [batch=2, seq=4, dim=6] gradOutput shape — the common case from a [batch, seq] token input.
+        var gradOutput = new Tensor<float>(new[] { 2, 4, embeddingDim });
+        for (int n = 0; n < 2; n++)
+            for (int t = 0; t < 4; t++)
+                for (int d = 0; d < embeddingDim; d++)
+                    gradOutput[n, t, d] = n * 0.13f + t * 0.21f + d * 0.07f;
+
+        // 8 indices = 2 * 4 positions. Includes duplicates within and across rows.
+        var intIndices = new Tensor<int>(new[] { 3, 12, 3, 7, 12, 0, 7, 3 }, new[] { 8 });
+
+        var sparse = SparseEmbeddingGradient<float>.Build(gradOutput, intIndices, vocabSize, embeddingDim);
+        var fromSparse = sparse.ToDense(Engine);
+
+        // Reference: feed the same flattened grad + widened-long indices to the existing dense engine call.
+        var flatGrad = new Tensor<float>(gradOutput.GetDataArray(), new[] { 8, embeddingDim });
+        var longIndices = new Tensor<long>(new long[] { 3, 12, 3, 7, 12, 0, 7, 3 }, new[] { 8 });
+        var reference = Engine.TensorEmbeddingLookupBackward<float, long>(flatGrad, longIndices, vocabSize, embeddingDim);
+
+        Assert.Equal(new[] { vocabSize, embeddingDim }, fromSparse.Shape.ToArray());
+        for (int i = 0; i < vocabSize; i++)
+            for (int d = 0; d < embeddingDim; d++)
+                Assert.Equal(reference[i, d], fromSparse[i, d], precision: 5);
+    }
 }
