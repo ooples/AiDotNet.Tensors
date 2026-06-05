@@ -8696,6 +8696,26 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             if (batchSize * normalizedSize != input.Length)
                 return base.LayerNorm(input, gamma, beta, epsilon, out mean, out variance);
 
+            // mean/variance MUST be shaped like CpuEngine.LayerNorm's batchShape — the
+            // NON-normalized leading dims (e.g. [B,S] for a [B,S,D] input), NOT a flat
+            // [batchSize]. The compiled-training plan compares the eager-shadow LayerNorm
+            // shape (this path) against the realize-time shape; a rank mismatch here
+            // ([batchSize] vs [B,S]) mis-sizes every downstream gradient buffer and
+            // throws "Source array was not long enough" in LayerNormBackward, silently
+            // disabling the fused path for ALL transformers. Match CpuEngine exactly.
+            int normalizedDims = gamma.Shape.Length;
+            int batchDims = input.Shape.Length - normalizedDims;
+            int[] batchShape;
+            if (batchDims <= 0)
+            {
+                batchShape = new[] { 1 };
+            }
+            else
+            {
+                batchShape = new int[batchDims];
+                for (int i = 0; i < batchDims; i++) batchShape[i] = input.Shape[i];
+            }
+
             using var inputBuffer = GetOrAllocateBuffer(backend, input.GetDataArray());
             using var gammaBuffer = GetOrCacheWeightBuffer(backend, gamma.GetDataArray(), PersistentTensorRole.Weights);
             using var betaBuffer = GetOrCacheWeightBuffer(backend, beta.GetDataArray(), PersistentTensorRole.Biases);
@@ -8710,8 +8730,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             float[] meanFloat = backend.DownloadBuffer(saveMeanBuffer.Buffer);
             float[] varFloat = backend.DownloadBuffer(saveVarBuffer.Buffer);
 
-            mean = new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(meanFloat), new[] { batchSize });
-            variance = new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(varFloat), new[] { batchSize });
+            mean = new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(meanFloat), batchShape);
+            variance = new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(varFloat), batchShape);
             return new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(outputFloat), input.Shape.ToArray());
         }
         catch

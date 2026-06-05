@@ -6,6 +6,22 @@ using AiDotNet.Tensors.LinearAlgebra;
 namespace AiDotNet.Tensors.Engines.Autodiff;
 
 /// <summary>
+/// Mutable holder for a LayerNorm op's mean/variance, used so the lazy/compiled
+/// realize-time forward can hand the correctly-shaped statistics to the backward
+/// pass by reference. The eager path stores raw <see cref="Tensor{T}"/> directly;
+/// the lazy path stores this holder (same instance for both savedState slots) and
+/// the realize callback swaps in the fresh tensors each replay. This avoids the
+/// trace-vs-replay rank mismatch (compile-time mean sized for [B], replay needs
+/// [B,S]) that previously threw "Destination is too short" and silently disabled
+/// the fused compiled-training path for every transformer.
+/// </summary>
+internal sealed class LayerNormStateRef<T>
+{
+    public Tensor<T>? Mean;
+    public Tensor<T>? Variance;
+}
+
+/// <summary>
 /// Contains backward function implementations for all differentiable engine operations.
 /// Each method is a <see cref="BackwardFunction{T}"/> that computes input gradients
 /// and accumulates them into the gradient dictionary.
@@ -1041,8 +1057,13 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        var mean = (Tensor<T>)savedState[0];
-        var variance = (Tensor<T>)savedState[1];
+        // savedState[0]/[1] are either raw Tensor<T> (eager path) or a shared
+        // LayerNormStateRef<T> holder (lazy/compiled path). The holder lets the
+        // realize-time forward hand correctly-shaped mean/variance to backward by
+        // reference, sidestepping the trace-vs-replay rank mismatch that otherwise
+        // threw "Destination is too short" and disabled the fused path entirely.
+        var mean = savedState[0] is LayerNormStateRef<T> mref ? mref.Mean! : (Tensor<T>)savedState[0];
+        var variance = savedState[1] is LayerNormStateRef<T> vref ? vref.Variance! : (Tensor<T>)savedState[1];
         var epsilon = (double)savedState[2];
 
         var gradInput = engine.LayerNormBackward(
