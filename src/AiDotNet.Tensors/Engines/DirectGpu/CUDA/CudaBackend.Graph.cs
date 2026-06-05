@@ -125,6 +125,37 @@ public sealed partial class CudaBackend
         CudaNativeBindings.cuGraphExecDestroy(graphExec);
     }
 
+    /// <summary>
+    /// Host→device copy of raw bytes into a byte/blob GPU buffer (e.g. the int8
+    /// quantized moments and double per-block scales of the 8-bit optimizer).
+    /// </summary>
+    public unsafe void UploadBytes(IGpuBuffer buffer, byte[] data)
+    {
+        if (buffer is null) throw new ArgumentNullException(nameof(buffer));
+        if (data is null) throw new ArgumentNullException(nameof(data));
+        using var _ = PushContext();
+        fixed (byte* src = data)
+        {
+            CuBlasNative.CheckCudaResult(
+                CuBlasNative.cuMemcpyHtoD(buffer.Handle, (IntPtr)src, (ulong)data.Length), "cuMemcpyHtoD(bytes)");
+        }
+    }
+
+    /// <summary>Device→host copy of raw bytes (synchronizes the compute stream first).</summary>
+    public unsafe byte[] DownloadBytes(IGpuBuffer buffer, int byteCount)
+    {
+        if (buffer is null) throw new ArgumentNullException(nameof(buffer));
+        using var _ = PushContext();
+        CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamSynchronize(_stream), "cuStreamSynchronize(downloadBytes)");
+        var dst = new byte[byteCount];
+        fixed (byte* d = dst)
+        {
+            CuBlasNative.CheckCudaResult(
+                CuBlasNative.cuMemcpyDtoH((IntPtr)d, buffer.Handle, (ulong)byteCount), "cuMemcpyDtoH(bytes)");
+        }
+        return dst;
+    }
+
     /// <summary>True while this backend's stream is mid-capture (diagnostics).</summary>
     public bool IsStreamCapturing()
     {

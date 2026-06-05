@@ -10113,6 +10113,41 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
+    /// <summary>
+    /// 8-bit Adam blockwise update in place on the GPU. mQ/vQ are int8 quantized
+    /// moments (one byte per element); mScales/vScales are one double per block.
+    /// One CUDA block per quant block, 256 threads, shared-memory maxAbs reduction.
+    /// Matches the CPU Adam8BitOptimizer's CompressBothMoments / percentile>=100 /
+    /// deterministic-rounding path.
+    /// </summary>
+    public unsafe void Adam8BitUpdate(IGpuBuffer param, IGpuBuffer gradient,
+        IGpuBuffer mQuant, IGpuBuffer vQuant, IGpuBuffer mScales, IGpuBuffer vScales,
+        float learningRate, float beta1, float beta2, float epsilon,
+        float oneMinusBeta1, float oneMinusBeta2, float biasCorrection1, float biasCorrection2,
+        int blockSize, int paramLength, int numBlocks)
+    {
+        if (param is null) throw new ArgumentNullException(nameof(param));
+        if (gradient is null) throw new ArgumentNullException(nameof(gradient));
+        if (mQuant is null || vQuant is null || mScales is null || vScales is null)
+            throw new ArgumentNullException(nameof(mQuant));
+        if (paramLength <= 0 || blockSize <= 0 || numBlocks <= 0)
+            throw new ArgumentOutOfRangeException(nameof(paramLength));
+
+        if (!_kernelCache.TryGetValue("adam8bit_update", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: adam8bit_update");
+
+        using var _ = PushContext();
+        IntPtr pPtr = param.Handle, gPtr = gradient.Handle;
+        IntPtr mqPtr = mQuant.Handle, vqPtr = vQuant.Handle, msPtr = mScales.Handle, vsPtr = vScales.Handle;
+        void** args = stackalloc void*[17];
+        args[0] = &pPtr; args[1] = &gPtr; args[2] = &mqPtr; args[3] = &vqPtr; args[4] = &msPtr; args[5] = &vsPtr;
+        args[6] = &learningRate; args[7] = &beta1; args[8] = &beta2; args[9] = &epsilon;
+        args[10] = &oneMinusBeta1; args[11] = &oneMinusBeta2; args[12] = &biasCorrection1; args[13] = &biasCorrection2;
+        args[14] = &blockSize; args[15] = &paramLength; args[16] = &numBlocks;
+        // One CUDA block per quant block (256 threads); the kernel grid-strides within each.
+        LaunchKernel(kernel, (uint)numBlocks, 256u, args);
+    }
+
     /// <inheritdoc/>
     public unsafe void AdadeltaUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer accumGrad, IGpuBuffer accumUpdate,
         float rho, float epsilon, float weightDecay, int size)

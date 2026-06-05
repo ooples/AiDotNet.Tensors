@@ -428,6 +428,81 @@ extern ""C"" __global__ __launch_bounds__(256) void proximal_l1_update(
     float sgn = (tmp > 0.0f) ? 1.0f : ((tmp < 0.0f) ? -1.0f : 0.0f);
     param[idx] = sgn * (a > 0.0f ? a : 0.0f);
 }
+
+// ---------------------------------------------------------------------------
+// 8-bit Adam (bitsandbytes-style blockwise dynamic quantization). Matches the
+// CPU Adam8BitOptimizer (CompressBothMoments, QuantizationPercentile>=100,
+// no stochastic rounding) per block: m is SIGNED int8 (scale=maxAbs/127, stored
+// as q+128), v is UNSIGNED int8 (scale=maxAbs/255). One CUDA block per quant
+// block; blockDim=256; shared-memory maxAbs reduction recomputes the per-block
+// scale before requantizing. Adam math is float (matching the CPU Tensor ops);
+// quant/dequant scaling is double (matching NumOps.ToDouble); rint() = round-
+// half-to-even = C# Math.Round. Launch with gridDim.x = numBlocks.
+// ---------------------------------------------------------------------------
+extern ""C"" __global__ __launch_bounds__(256) void adam8bit_update(
+    float* __restrict__ param, const float* __restrict__ gradient,
+    unsigned char* __restrict__ mQ, unsigned char* __restrict__ vQ,
+    double* __restrict__ mScales, double* __restrict__ vScales,
+    float learningRate, float beta1, float beta2, float epsilon,
+    float oneMinusBeta1, float oneMinusBeta2, float biasCorrection1, float biasCorrection2,
+    int blockSize, int paramLength, int numBlocks)
+{
+    int blk = blockIdx.x;
+    if (blk >= numBlocks) return;
+    int start = blk * blockSize;
+    int endIdx = start + blockSize; if (endIdx > paramLength) endIdx = paramLength;
+    double mScale = mScales[blk];
+    double vScale = vScales[blk];
+
+    __shared__ float sMaxM[256];
+    __shared__ float sMaxV[256];
+
+    // Phase 1: compute newM/newV, reduce per-block maxAbs for the new scales.
+    float locM = 0.0f, locV = 0.0f;
+    for (int i = start + threadIdx.x; i < endIdx; i += blockDim.x) {
+        float m_i = (float)((double)((int)mQ[i] - 128) * mScale);
+        float v_i = (float)((double)((int)vQ[i]) * vScale);
+        float g = gradient[i];
+        float newM = beta1 * m_i + oneMinusBeta1 * g;
+        float newV = beta2 * v_i + oneMinusBeta2 * (g * g);
+        locM = fmaxf(locM, fabsf(newM));
+        locV = fmaxf(locV, fabsf(newV));
+    }
+    sMaxM[threadIdx.x] = locM; sMaxV[threadIdx.x] = locV;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            sMaxM[threadIdx.x] = fmaxf(sMaxM[threadIdx.x], sMaxM[threadIdx.x + s]);
+            sMaxV[threadIdx.x] = fmaxf(sMaxV[threadIdx.x], sMaxV[threadIdx.x + s]);
+        }
+        __syncthreads();
+    }
+    double newMScale = (double)sMaxM[0] / 127.0; if (newMScale < 1e-10) newMScale = 1e-10;
+    double newVScale = (double)sMaxV[0] / 255.0; if (newVScale < 1e-10) newVScale = 1e-10;
+    if (threadIdx.x == 0) { mScales[blk] = newMScale; vScales[blk] = newVScale; }
+    __syncthreads();
+
+    // Phase 2: recompute, apply bias-corrected param update, requantize.
+    for (int i = start + threadIdx.x; i < endIdx; i += blockDim.x) {
+        float m_i = (float)((double)((int)mQ[i] - 128) * mScale);
+        float v_i = (float)((double)((int)vQ[i]) * vScale);
+        float g = gradient[i];
+        float newM = beta1 * m_i + oneMinusBeta1 * g;
+        float newV = beta2 * v_i + oneMinusBeta2 * (g * g);
+
+        float mHat = newM / biasCorrection1;
+        float vHat = newV / biasCorrection2;
+        param[i] = param[i] - learningRate * mHat / (sqrtf(vHat) + epsilon);
+
+        int qm = (int)rint((double)newM / newMScale);
+        if (qm < -127) qm = -127; if (qm > 127) qm = 127;
+        mQ[i] = (unsigned char)(qm + 128);
+
+        int qv = (int)rint((double)newV / newVScale);
+        if (qv < 0) qv = 0; if (qv > 255) qv = 255;
+        vQ[i] = (unsigned char)qv;
+    }
+}
 ";
     }
 
@@ -453,7 +528,8 @@ extern ""C"" __global__ __launch_bounds__(256) void proximal_l1_update(
             "lion_update",
             "nadam_update",
             "ftrl_update",
-            "proximal_l1_update"
+            "proximal_l1_update",
+            "adam8bit_update"
         };
     }
 }
