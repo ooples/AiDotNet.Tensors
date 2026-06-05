@@ -47,6 +47,13 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private IntPtr _stepGraphExec;
     private long _graphStepCalls;
     private bool _graphStepDisabled;
+    // Capture is sound only when EVERY forward+backward action enqueues its real
+    // work on the GPU stream. Host-only specialized closures (CPU-SIMD ReLU,
+    // host-.Data GEMM, fused/analytic/slice/batched-dW kernels) run once at capture
+    // time and are NOT re-executed by cuGraphLaunch, so their outputs would freeze.
+    // Set at build time = true only for all-generic (engine-dispatched) plans; any
+    // installed host-only specialization (incl. frozen-weight rebuild) clears it.
+    private bool _graphStepEligible;
     private const int GraphWarmupSteps = 3;   // eager first so cuBLAS workspace / lazy buffers stabilize
     private readonly Tensor<T>[] _parameters;
     private readonly Tensor<T>[] _gradients;
@@ -104,10 +111,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         int[]? compiledInputShape = null,
         Tensor<T>? compiledInputTensor = null,
         int[]? fusedStepIndices = null,
-        Action<IEngine>[]? fusedForwardActions = null)
+        Action<IEngine>[]? fusedForwardActions = null,
+        bool graphStepEligible = false)
     {
         _forwardActions = forwardActions;
         _backwardActions = backwardActions;
+        _graphStepEligible = graphStepEligible;
         _lossOutput = lossOutput;
         _engine = engine;
         _parameters = parameters;
@@ -144,13 +153,26 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         _gpuOptimizerBuffers.Clear();
 
         // Free the captured training-step graph, if any.
+        InvalidateCapturedStepGraph();
+    }
+
+    /// <summary>
+    /// Destroys the captured CUDA step graph (if any) and resets the warmup counter
+    /// so the next eligible Step() re-captures. MUST be called whenever the captured
+    /// kernel sequence's inputs change — optimizer reconfigure (new state buffers /
+    /// optimizer wiring) or a forward-action rebuild — otherwise replay would launch
+    /// kernels against freed or stale buffers.
+    /// </summary>
+    private void InvalidateCapturedStepGraph()
+    {
         if (_stepGraphExec != IntPtr.Zero
             && _engine is Engines.DirectGpuTensorEngine gte
             && gte.GetBackend() is Engines.DirectGpu.CUDA.CudaBackend cb)
         {
             cb.DestroyCapturedGraph(_stepGraphExec);
-            _stepGraphExec = IntPtr.Zero;
         }
+        _stepGraphExec = IntPtr.Zero;
+        _graphStepCalls = 0;
     }
 
     public Tensor<T>[] Gradients => _gradients;
@@ -177,6 +199,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             ? null
             : new HashSet<int>(_fusedStepIndices);
         var rebuiltForward = new List<Action<IEngine>>(_forwardSteps.Length);
+        bool installedSpecialization = false;
         int nextFusedGroupIdx = 0;
         for (int i = 0; i < _forwardSteps.Length; i++)
         {
@@ -202,6 +225,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             if (specialized != null)
             {
                 rebuiltForward.Add(specialized);
+                installedSpecialization = true;
             }
             else
             {
@@ -212,6 +236,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         }
         _forwardActions = rebuiltForward.ToArray();
         _isFrozenWeights = true;
+        // Installing host-only forward specializations makes the action set unsafe for
+        // CUDA-graph capture (they'd freeze under replay); the forward delegates also
+        // just changed identity, so drop eligibility and any captured graph.
+        if (installedSpecialization)
+        {
+            _graphStepEligible = false;
+            InvalidateCapturedStepGraph();
+        }
     }
 
     /// <inheritdoc/>
@@ -425,8 +457,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     {
         // Opt-in CUDA-graph replay of the whole compiled step. Narrowly gated:
         // float + CUDA backend + no grad-norm clip (a per-step host read) + no
-        // checkpointing. Anything else, or any capture failure, runs eager.
-        if (s_graphStepEnabled && !_graphStepDisabled && typeof(T) == typeof(float)
+        // checkpointing + an all-GPU-pure action set (_graphStepEligible — host-only
+        // specialized closures would freeze under replay). Anything else, or any
+        // capture failure, runs eager.
+        if (s_graphStepEnabled && !_graphStepDisabled && _graphStepEligible && typeof(T) == typeof(float)
             && _checkpointing is null && _maxGradNorm <= 0.0
             && _engine is Engines.DirectGpuTensorEngine gte
             && gte.GetBackend() is Engines.DirectGpu.CUDA.CudaBackend cb)
@@ -436,17 +470,24 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             {
                 if (_stepGraphExec == IntPtr.Zero)
                 {
-                    // Record the GPU forward+grad-zero+backward+optimizer sequence into a
-                    // graph, then launch once to actually execute THIS step (capture only
+                    // Record the GPU forward+grad-zero+backward sequence into a graph,
+                    // then launch once to actually execute THIS step (capture only
                     // records). The caller has already refreshed the persistent input
                     // buffer's CONTENTS, so the stable pointers stay valid across replays.
                     var exec = cb.CaptureGraph(() => RunGpuStepBodyForCapture(cb));
                     if (exec == IntPtr.Zero) { _graphStepDisabled = true; return StepEager(); }
                     _stepGraphExec = exec;
                     cb.LaunchCapturedGraph(exec);
+                    // The optimizer update is run eagerly (NOT captured): its closure
+                    // increments _optimizerStep and re-evaluates lrSchedule.GetLr +
+                    // Adam/AdamW bias-correction each step, and bakes those scalars into
+                    // the kernel args — a captured replay would freeze them at the
+                    // capture step. Its kernels enqueue (in order) after the graph launch.
+                    _optimizerUpdate?.Invoke();
                     return _lossOutput;
                 }
                 cb.LaunchCapturedGraph(_stepGraphExec);
+                _optimizerUpdate?.Invoke();
                 return _lossOutput;
             }
         }
@@ -455,9 +496,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
     /// <summary>
     /// The GPU-only body of a training step (forward → grad-zero → loss-grad reseed →
-    /// backward → optimizer), with grad-zero and loss-grad reseed done as GPU ops so a
+    /// backward), with grad-zero and loss-grad reseed done as GPU ops so a
     /// cuGraphLaunch replay re-does them (a host Array.Clear/Copy would run only at
-    /// capture time). Used solely under the captured graph path.
+    /// capture time). Used solely under the captured graph path. The optimizer update
+    /// is deliberately NOT captured — it runs eagerly in Step() so its per-step LR /
+    /// bias-correction scalars are recomputed each replay instead of frozen at capture.
     /// </summary>
     private void RunGpuStepBodyForCapture(Engines.DirectGpu.CUDA.CudaBackend cb)
     {
@@ -487,7 +530,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
         var bwd = _backwardActions;
         for (int i = 0; i < bwd.Length; i++) bwd[i](engine);
-        _optimizerUpdate?.Invoke();
+        // NOTE: _optimizerUpdate is intentionally NOT invoked here — it runs eagerly
+        // in Step() after LaunchCapturedGraph so the LR schedule / Adam bias-correction
+        // scalars are fresh per step rather than frozen at capture time.
     }
 
     private Tensor<T> StepEager()
@@ -869,6 +914,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         foreach (var buf in _gpuOptimizerBuffers)
             buf.Dispose();
         _gpuOptimizerBuffers.Clear();
+        // A captured step graph holds kernel nodes wired to the OLD optimizer state
+        // buffers + update; those are about to be freed/replaced, so drop it (replay
+        // would otherwise launch against freed device memory or stale wiring).
+        InvalidateCapturedStepGraph();
 
         // Pre-allocate optimizer state buffers for each parameter
         int paramCount = _parameters.Length;
@@ -1349,6 +1398,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         foreach (var buf in _gpuOptimizerBuffers)
             buf.Dispose();
         _gpuOptimizerBuffers.Clear();
+        // Drop any captured step graph wired to the old optimizer state (see
+        // ConfigureOptimizerFloat — replay would target freed/stale buffers).
+        InvalidateCapturedStepGraph();
 
         int paramCount = _parameters.Length;
         int groupCount = groupSchedules.Count;
@@ -2093,6 +2145,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // constituent steps at the position of the first fused step in each group,
         // ensuring non-fused producers that appear before a fused block still run first.
         var allForwardActions = new List<Action<IEngine>>();
+        int genericForwardCount = 0; // engine-dispatched forward actions (for CUDA-graph eligibility)
         int nextFusedGroupIdx = 0; // index into fusedForwardActions
         for (int i = 0; i < forwardSteps.Count; i++)
         {
@@ -2148,9 +2201,15 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 var output = step.OutputBuffer;
                 var exec = step.Execute;
                 allForwardActions.Add(eng => exec(eng, output));
+                genericForwardCount++;  // engine-dispatched (GPU-pure on a GPU engine)
             }
         }
         var forwardActions = allForwardActions.ToArray();
+        // CUDA-graph eligibility (forward half): pure only if every forward action is
+        // the generic engine-dispatched form — any specialized/fused closure is
+        // host-only and would freeze under graph replay. (No forward pruning, so the
+        // count comparison is exact.)
+        bool graphForwardPure = genericForwardCount == allForwardActions.Count;
 
         // Build backward actions: specialized per-step + fused backward for fused groups
         var backwardActions = new List<Action<IEngine>>();
@@ -2270,6 +2329,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 gradients[i] = gradMap[parameters[i]];
         }
 
+        // CUDA-graph eligibility (backward half): pure only if every backward action
+        // is the generic engine-dispatched accumulator — analytic/slice/specialized/
+        // fused/batched-dW closures are host-only and would freeze under graph replay.
+        // Computed BEFORE pruning (pruning only removes actions, so an all-generic set
+        // stays all-generic, and a mixed set is already flagged impure here).
+        bool graphBackwardPure = genericBackwardCount == backwardActions.Count;
+        bool graphStepEligible = graphForwardPure && graphBackwardPure;
+
         // Phase 6.3: Backward pruning — skip gradient computation for non-trainable tensors
         var paramSet = new HashSet<Tensor<T>>(parameters);
         backwardActions = BackwardPruningPass.Prune(backwardActions, forwardSteps, parameters, gradMap);
@@ -2334,7 +2401,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             compiledInputShape,
             compiledInputTensor,
             fusedStepIndices.Count > 0 ? fusedStepIndices.ToArray() : null,
-            fusedForwardActions.Count > 0 ? fusedForwardActions.ToArray() : null);
+            fusedForwardActions.Count > 0 ? fusedForwardActions.ToArray() : null,
+            graphStepEligible);
     }
 
     /// <summary>

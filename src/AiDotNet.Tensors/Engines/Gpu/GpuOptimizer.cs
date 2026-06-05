@@ -148,15 +148,31 @@ public static class GpuOptimizer
         if (!(AiDotNetEngine.Current is DirectGpuTensorEngine e)) return false;
         if (!(e.GetBackend() is DirectGpu.CUDA.CudaBackend cb)) return false;
         int nb = (length + blockSize - 1) / blockSize;
-        mQ = cb.AllocateByteBuffer(length);
-        vQ = cb.AllocateByteBuffer(length);
-        mScales = cb.AllocateByteBuffer(nb * 8);
-        vScales = cb.AllocateByteBuffer(nb * 8);
-        var im = new byte[length]; for (int i = 0; i < length; i++) im[i] = 128; // signed-zero
-        var iv = new byte[length];                                              // unsigned-zero (already 0)
-        var isc = new byte[nb * 8]; for (int b = 0; b < nb; b++) BitConverter.GetBytes(1e-10).CopyTo(isc, b * 8);
-        cb.UploadBytes(mQ, im); cb.UploadBytes(vQ, iv);
-        cb.UploadBytes(mScales, isc); cb.UploadBytes(vScales, (byte[])isc.Clone());
+
+        // Allocate into locals first. If a later AllocateByteBuffer / UploadBytes
+        // throws (e.g. device OOM), free whatever was already allocated so the GPU
+        // buffers don't leak, leave the out-params null (no dangling references),
+        // and let the exception surface — masking an OOM as a `false` "fall back to
+        // CPU" would silently hide a real device failure.
+        DirectGpu.IGpuBuffer? lmQ = null, lvQ = null, lmScales = null, lvScales = null;
+        try
+        {
+            lmQ = cb.AllocateByteBuffer(length);
+            lvQ = cb.AllocateByteBuffer(length);
+            lmScales = cb.AllocateByteBuffer(nb * 8);
+            lvScales = cb.AllocateByteBuffer(nb * 8);
+            var im = new byte[length]; for (int i = 0; i < length; i++) im[i] = 128; // signed-zero
+            var iv = new byte[length];                                              // unsigned-zero (already 0)
+            var isc = new byte[nb * 8]; for (int b = 0; b < nb; b++) BitConverter.GetBytes(1e-10).CopyTo(isc, b * 8);
+            cb.UploadBytes(lmQ, im); cb.UploadBytes(lvQ, iv);
+            cb.UploadBytes(lmScales, isc); cb.UploadBytes(lvScales, (byte[])isc.Clone());
+        }
+        catch
+        {
+            FreeGpuBuffer(lmQ); FreeGpuBuffer(lvQ); FreeGpuBuffer(lmScales); FreeGpuBuffer(lvScales);
+            throw;
+        }
+        mQ = lmQ; vQ = lvQ; mScales = lmScales; vScales = lvScales;
         return true;
     }
 
@@ -175,7 +191,11 @@ public static class GpuOptimizer
         DirectGpu.IGpuBuffer? mQ, DirectGpu.IGpuBuffer? vQ, DirectGpu.IGpuBuffer? mScales, DirectGpu.IGpuBuffer? vScales,
         float lr, float beta1, float beta2, float epsilon, float biasCorrection1, float biasCorrection2, int blockSize)
     {
-        if (p is null || g is null) return false;
+        if (p is null) throw new ArgumentNullException(nameof(p));
+        if (g is null) throw new ArgumentNullException(nameof(g));
+        // The four state buffers are optional inputs: a null one means the caller
+        // hasn't allocated GPU-resident 8-bit Adam state, so signal CPU fallback
+        // (matching the documented contract) rather than throwing.
         if (mQ is null || vQ is null || mScales is null || vScales is null) return false;
         if (!(AiDotNetEngine.Current is DirectGpuTensorEngine e)) return false;
         if (!(e.GetBackend() is DirectGpu.CUDA.CudaBackend cb)) return false;
