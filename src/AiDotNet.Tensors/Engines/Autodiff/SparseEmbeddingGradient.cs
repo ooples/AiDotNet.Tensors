@@ -161,11 +161,19 @@ public readonly struct SparseEmbeddingGradient<T>
             flatValues = new Tensor<T>(gradOutput.GetDataArray(), new[] { totalIndices, embeddingDim });
         }
 
-        // Widen indices to long so downstream consumers don't branch on TIndex.
+        // Widen indices to long AND normalize to rank-1 [totalIndices]. Callers commonly
+        // hand a rank-2 [batch, seq] indices tensor (the natural input shape for an
+        // embedding-lookup forward); the sparse representation only tracks "position →
+        // row", so the leading axes flatten away. We never alias a higher-rank input —
+        // the rebuilt rank-1 view is cheap because Tensor's data array is already flat.
         Tensor<long> longIndices;
-        if (typeof(TIndex) == typeof(long) && indices is Tensor<long> alreadyLong)
+        if (typeof(TIndex) == typeof(long) && indices is Tensor<long> alreadyLong && alreadyLong.Rank == 1)
         {
             longIndices = alreadyLong;
+        }
+        else if (typeof(TIndex) == typeof(long) && indices is Tensor<long> alreadyLongMulti)
+        {
+            longIndices = new Tensor<long>(alreadyLongMulti.GetDataArray(), new[] { totalIndices });
         }
         else
         {

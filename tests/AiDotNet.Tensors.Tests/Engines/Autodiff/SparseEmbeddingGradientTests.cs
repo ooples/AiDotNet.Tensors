@@ -143,4 +143,43 @@ public class SparseEmbeddingGradientTests
             for (int d = 0; d < embeddingDim; d++)
                 Assert.Equal(reference[i, d], fromSparse[i, d], precision: 5);
     }
+
+    /// <summary>
+    /// Real backward-callers hand <c>Build</c> a rank-2 indices tensor (the common
+    /// <c>[batch, seq]</c> token input shape), not the canonical rank-1 form. The existing
+    /// dense path flattens internally and round-trips; the sparse Build factory must do the
+    /// same or it regresses every model that calls embedding-lookup with a 2-D index input.
+    /// </summary>
+    [Fact]
+    public void Build_AcceptsRank2Indices_ParityWithDense()
+    {
+        const int vocabSize = 16;
+        const int embeddingDim = 6;
+        const int batch = 2;
+        const int seq = 4;
+        // Rank-3 [batch, seq, dim] gradOutput AND rank-2 [batch, seq] indices — the shape
+        // pair the existing dense backward path is exercised with by every realistic caller.
+        var gradOutput = new Tensor<float>(new[] { batch, seq, embeddingDim });
+        for (int n = 0; n < batch; n++)
+            for (int t = 0; t < seq; t++)
+                for (int d = 0; d < embeddingDim; d++)
+                    gradOutput[n, t, d] = n * 0.13f + t * 0.21f + d * 0.07f;
+
+        // Use Tensor<long> so the rank-2 passthrough fast-path is exercised — that's the
+        // real callsite (BackwardFunctions.TensorEmbeddingLookupBackward widens to long
+        // BEFORE calling Build, so the passthrough branch runs in production).
+        var rank2Indices = new Tensor<long>(new long[] { 3, 12, 3, 7, 12, 0, 7, 3 }, new[] { batch, seq });
+
+        var sparse = SparseEmbeddingGradient<float>.Build(gradOutput, rank2Indices, vocabSize, embeddingDim);
+        var fromSparse = sparse.ToDense(Engine);
+
+        var flatGrad = new Tensor<float>(gradOutput.GetDataArray(), new[] { batch * seq, embeddingDim });
+        var longIndices = new Tensor<long>(new long[] { 3, 12, 3, 7, 12, 0, 7, 3 }, new[] { batch * seq });
+        var reference = Engine.TensorEmbeddingLookupBackward<float, long>(flatGrad, longIndices, vocabSize, embeddingDim);
+
+        Assert.Equal(new[] { vocabSize, embeddingDim }, fromSparse.Shape.ToArray());
+        for (int i = 0; i < vocabSize; i++)
+            for (int d = 0; d < embeddingDim; d++)
+                Assert.Equal(reference[i, d], fromSparse[i, d], precision: 5);
+    }
 }

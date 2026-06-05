@@ -367,6 +367,15 @@ public sealed class GradientTape<T> : IDisposable
         var indexedGrads = new object?[gradIndexCount];
         DifferentiableOps.SetIndexedGrads(indexedGrads);
 
+        // Parallel sparse-gradient array for embedding-table parameters. Same _gradIndex
+        // basis as indexedGrads; each slot holds a List<SparseEmbeddingGradient<T>>.
+        // Sparse-aware optimizers (Adam/AdamW with the sparse-scatter step) check this
+        // first to skip the dense [vocab, dim] gradient that dominates per-step alloc
+        // on token-embedding-bearing models — LayoutXLM 768 MB, Amphion 1045 MB,
+        // AVHuBERT 900 MB, AST 877 MB, AudioFlamingo2 610 MB per backward without it.
+        var indexedSparseGrads = new object?[gradIndexCount];
+        DifferentiableOps.SetIndexedSparseGrads(indexedSparseGrads);
+
         // Dictionary facade: backward functions still receive Dictionary<Tensor<T>, Tensor<T>>.
         // AccumulateGrad writes to both the array and dictionary.
         var grads = new Dictionary<Tensor<T>, Tensor<T>>(
@@ -607,6 +616,7 @@ public sealed class GradientTape<T> : IDisposable
             DifferentiableOps._isBackwardCreateGraph = savedBackwardCreateGraph;
             // Clear indexed gradient array and reset tensor grad indices
             DifferentiableOps.ClearIndexedGrads();
+            DifferentiableOps.ClearIndexedSparseGrads();
             for (int i = 0; i < _entries.Count; i++)
             {
                 ref var e = ref _entries[i];
