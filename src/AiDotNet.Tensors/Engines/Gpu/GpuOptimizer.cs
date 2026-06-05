@@ -132,6 +132,61 @@ public static class GpuOptimizer
         return true;
     }
 
+    /// <summary>
+    /// Allocates + initializes GPU-resident 8-bit Adam state (int8 m/v + per-block
+    /// double scales) for a parameter of <paramref name="length"/> elements. m starts
+    /// at the signed-zero byte (128), v at 0, scales at 1e-10 (matching the CPU
+    /// Adam8BitOptimizer's m_0=v_0=0 init). The caller keeps the four buffers
+    /// resident across steps and frees them with <see cref="FreeGpuBuffer"/>.
+    /// Returns false (buffers null) on any non-CUDA backend.
+    /// </summary>
+    public static bool TryAllocAdam8BitState(int length, int blockSize,
+        out DirectGpu.IGpuBuffer? mQ, out DirectGpu.IGpuBuffer? vQ,
+        out DirectGpu.IGpuBuffer? mScales, out DirectGpu.IGpuBuffer? vScales)
+    {
+        mQ = vQ = mScales = vScales = null;
+        if (!(AiDotNetEngine.Current is DirectGpuTensorEngine e)) return false;
+        if (!(e.GetBackend() is DirectGpu.CUDA.CudaBackend cb)) return false;
+        int nb = (length + blockSize - 1) / blockSize;
+        mQ = cb.AllocateByteBuffer(length);
+        vQ = cb.AllocateByteBuffer(length);
+        mScales = cb.AllocateByteBuffer(nb * 8);
+        vScales = cb.AllocateByteBuffer(nb * 8);
+        var im = new byte[length]; for (int i = 0; i < length; i++) im[i] = 128; // signed-zero
+        var iv = new byte[length];                                              // unsigned-zero (already 0)
+        var isc = new byte[nb * 8]; for (int b = 0; b < nb; b++) BitConverter.GetBytes(1e-10).CopyTo(isc, b * 8);
+        cb.UploadBytes(mQ, im); cb.UploadBytes(vQ, iv);
+        cb.UploadBytes(mScales, isc); cb.UploadBytes(vScales, (byte[])isc.Clone());
+        return true;
+    }
+
+    /// <summary>Frees a GPU buffer allocated by <see cref="TryAllocAdam8BitState"/> (safe on null / non-CUDA).</summary>
+    public static void FreeGpuBuffer(DirectGpu.IGpuBuffer? buffer)
+    {
+        if (buffer is IDisposable d) d.Dispose();
+    }
+
+    /// <summary>
+    /// GPU-resident 8-bit Adam step: dequantize → Adam → param update → requantize,
+    /// in place on the GPU (no host download of moments). CUDA-only; returns false
+    /// (→ CPU fallback) when param/grad aren't GPU-resident or any state buffer is null.
+    /// </summary>
+    public static bool TryAdam8BitStep(Tensor<float> p, Tensor<float> g,
+        DirectGpu.IGpuBuffer? mQ, DirectGpu.IGpuBuffer? vQ, DirectGpu.IGpuBuffer? mScales, DirectGpu.IGpuBuffer? vScales,
+        float lr, float beta1, float beta2, float epsilon, float biasCorrection1, float biasCorrection2, int blockSize)
+    {
+        if (p is null || g is null) return false;
+        if (mQ is null || vQ is null || mScales is null || vScales is null) return false;
+        if (!(AiDotNetEngine.Current is DirectGpuTensorEngine e)) return false;
+        if (!(e.GetBackend() is DirectGpu.CUDA.CudaBackend cb)) return false;
+        var pb = p.TryGetGpuBuffer(); var gb = g.TryGetGpuBuffer();
+        if (pb is null || gb is null) return false;
+        int nb = (p.Length + blockSize - 1) / blockSize;
+        cb.Adam8BitUpdate(pb, gb, mQ, vQ, mScales, vScales,
+            lr, beta1, beta2, epsilon, 1f - beta1, 1f - beta2, biasCorrection1, biasCorrection2, blockSize, p.Length, nb);
+        return true;
+    }
+
     // ---- GPU-resident steps for the rest of the backend optimizer kernels (same contract as TryAdamStep:
     //      returns false if not on a GPU engine or any tensor isn't GPU-resident, so the caller falls back to CPU).
     //      All buffers must be GPU-resident; the kernel updates param + state IN PLACE with no host download. ----
