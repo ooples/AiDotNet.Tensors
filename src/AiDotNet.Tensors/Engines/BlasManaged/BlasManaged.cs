@@ -59,6 +59,11 @@ public static partial class BlasManaged
     private const int ThinMDirectMaxM = 1024;   // above this the packed path wins
     private const int ThinMDirectMaxN = 512;    // above this B re-stream dominates
     private const int ThinMDirectMaxK = 1024;   // tested winning range
+    // Tiny GEMMs (e.g. 72×72×48 ≈ 0.25M) gain nothing from the parallel direct kernel
+    // and should stay on the strategy/autotune path (which learns + caches a winner for
+    // repeated small shapes). The validated wins are at the MLP-layer scale (L1 ≈ 8.4M,
+    // L0 ≈ 51M), so a 1M floor excludes only negligible shapes.
+    private const long ThinMDirectMinWork = 1L << 20; // 1,048,576
 
 #if NET5_0_OR_GREATER
     /// <summary>
@@ -88,6 +93,7 @@ public static partial class BlasManaged
         if (transA && transB) return false;
         if (ldc != n || (n & 7) != 0) return false;
         if (m < ThinMDirectMinM || m > ThinMDirectMaxM || n > ThinMDirectMaxN || k > ThinMDirectMaxK) return false;
+        if ((long)m * n * k < ThinMDirectMinWork) return false; // tiny GEMMs stay on the strategy/autotune path
         // Each operand must be contiguous in its stored (possibly transposed) layout:
         // !transA → A is [m,k] (lda=k); transA → Aᵀ is [k,m] (lda=m). Likewise B.
         if (lda != (transA ? m : k)) return false;
