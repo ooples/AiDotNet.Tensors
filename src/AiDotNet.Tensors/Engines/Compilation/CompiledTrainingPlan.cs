@@ -538,6 +538,17 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private Tensor<T> StepEager()
     {
         var engine = _engine;
+        // #226 race fix: a compiled training step is ATOMIC — every forward activation it
+        // caches is consumed by its own backward. Suspend the engine's mid-step activation
+        // eviction for the duration of the step so the within-step VRAM-pressure offload
+        // (materialize-then-free) can no longer race the deferred-download materializers
+        // (CUDA 700 "buffer released before materialization"). The plan reuses stable
+        // buffers each step, so this does not accumulate; a step that truly exceeds VRAM
+        // now surfaces as a clean CUDA OOM instead of a 700 corruption.
+        var evictGuard = engine as AiDotNet.Tensors.Engines.DirectGpuTensorEngine;
+        evictGuard?.SuspendActivationEviction();
+        try
+        {
         // Two independent profile surfaces: PR #352's per-step
         // ProfForward/ProfBackward via _profileStepEnabled, and main's
         // Phase F StepTiming aggregator via StepTiming.Enabled. Both
@@ -713,6 +724,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         }
 
         return _lossOutput;
+        }
+        finally
+        {
+            evictGuard?.ResumeActivationEviction();
+        }
     }
 
     public unsafe void ConfigureOptimizer(

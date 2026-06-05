@@ -249,6 +249,26 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private long _currentActivationCacheBytes;
     private long _activationCacheTimestamp = 0;
 
+    // Eviction-suspend depth (#226 race fix). A training step (compiled-plan StepEager,
+    // or an eager forward+backward) is ATOMIC: every forward activation it caches is
+    // consumed by its own backward. The within-step VRAM-pressure eviction used to
+    // OFFLOAD (materialize-then-free) those activations mid-step, and that offload
+    // raced the compiled plan's DEFERRED downloads — the buffer was freed before its
+    // materializer ran → "buffer released before materialization" / CUDA error 700.
+    // Fix (PyTorch/JAX semantics): suspend mid-step eviction while a step runs, then
+    // free that step's activations deterministically AFTER it (EvictActivationsCreatedAfter).
+    // If a single step genuinely exceeds VRAM, the result is a clean CUDA OOM (reduce
+    // batch / enable gradient checkpointing / use mixed precision) instead of a 700.
+    // Instance field + Interlocked so it is visible across the BLAS thread pool.
+    private int _evictionSuspendDepth;
+    internal bool EvictionSuspended => System.Threading.Volatile.Read(ref _evictionSuspendDepth) > 0;
+    internal void SuspendActivationEviction() => System.Threading.Interlocked.Increment(ref _evictionSuspendDepth);
+    internal void ResumeActivationEviction()
+    {
+        if (System.Threading.Interlocked.Decrement(ref _evictionSuspendDepth) < 0)
+            System.Threading.Interlocked.Increment(ref _evictionSuspendDepth); // clamp at 0
+    }
+
     // Deferred download tracking for GPU-resident execution
     // When GpuScope is active, intermediate results skip the blocking download.
     // The GPU buffer stays in the activation cache for direct GPU-to-GPU chaining.
@@ -1085,7 +1105,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // for the unit-consistency contract.
             bool overMemory = _maxActivationCacheBytes > 0
                 && _currentActivationCacheBytes + buffer.SizeInBytes > _maxActivationCacheBytes;
-            if (overMemory || overCount)
+            // #226 race fix: never evict (offload) an activation while a training step is
+            // in flight — every cached forward activation is consumed by THIS step's
+            // backward, and the mid-step materialize-then-free races the compiled plan's
+            // deferred downloads (CUDA 700 "buffer released before materialization"). The
+            // compiled plan reuses STABLE buffers each step, so suspending eviction here
+            // does not accumulate across steps; a step that genuinely exceeds VRAM now
+            // fails as a clean CUDA OOM instead of a 700 corruption.
+            if ((overMemory || overCount) && !EvictionSuspended)
             {
                 // Evict the oldest activations, offloading any pending deferred downloads so a
                 // later CPU read / backward re-upload still sees correct data (#226 contract).
