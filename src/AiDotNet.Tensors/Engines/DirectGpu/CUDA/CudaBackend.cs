@@ -10096,6 +10096,14 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (gradient is null) throw new ArgumentNullException(nameof(gradient));
         if (size <= 0)
             throw new ArgumentOutOfRangeException(nameof(size), "Size must be positive.");
+        // Validate device-buffer capacity before launch: GpuOptimizer passes p.Length
+        // for `size` without cross-checking the gradient buffer, so a shape mismatch
+        // (gradient.Size < size) would otherwise read past gradient.Handle — an illegal
+        // device access / silent corruption instead of a clear managed exception.
+        if (param.Size < size)
+            throw new ArgumentException($"param buffer too small: capacity={param.Size}, required={size}.", nameof(param));
+        if (gradient.Size < size)
+            throw new ArgumentException($"gradient buffer too small: capacity={gradient.Size}, required={size}.", nameof(gradient));
 
         if (!_kernelCache.TryGetValue("proximal_l1_update", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: proximal_l1_update");
