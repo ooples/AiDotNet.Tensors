@@ -59,6 +59,11 @@ public static partial class BlasManaged
     private const int ThinMDirectMaxM = 1024;   // above this the packed path wins
     private const int ThinMDirectMaxN = 512;    // above this B re-stream dominates
     private const int ThinMDirectMaxK = 1024;   // tested winning range
+    // Tiny GEMMs (e.g. 72×72×48 ≈ 0.25M) gain nothing from the parallel direct kernel
+    // and should stay on the strategy/autotune path (which learns + caches a winner for
+    // repeated small shapes). The validated wins are at the MLP-layer scale (L1 ≈ 8.4M,
+    // L0 ≈ 51M), so a 1M floor excludes only negligible shapes.
+    private const long ThinMDirectMinWork = 1L << 20; // 1,048,576
 
 #if NET5_0_OR_GREATER
     /// <summary>
@@ -83,18 +88,43 @@ public static partial class BlasManaged
         if (!System.Runtime.Intrinsics.X86.Fma.IsSupported) return false;
         if (options.PackingMode != PackingMode.Auto && options.PackingMode != PackingMode.DisableAutotune) return false;
         if (options.PackedA is not null || options.PackedB is not null) return false;
-        // Transposed is intentionally NOT routed here: materializing op(A)/op(B) into
-        // contiguous scratch costs a serial transpose that dominates the (parallel)
-        // GEMM at thin-M — measured transB 27 / transA 53 GF/s, both at or below the
-        // ~57 the packed strategy already gives, i.e. a regression. Transposed thin-M
-        // wants a dedicated strided/transpose-aware kernel (separate work); for now it
-        // stays on the tuned strategy path.
-        if (transA || transB) return false;
-        if (lda != k || ldb != n || ldc != n) return false;
-        if ((n & 7) != 0) return false;
+        // both-transposed is rare and would need strided A *and* strided B (no
+        // contiguous vector dimension) — left on the strategy.
+        if (transA && transB) return false;
+        if (ldc != n || (n & 7) != 0) return false;
         if (m < ThinMDirectMinM || m > ThinMDirectMaxM || n > ThinMDirectMaxN || k > ThinMDirectMaxK) return false;
+        if ((long)m * n * k < ThinMDirectMinWork) return false; // tiny GEMMs stay on the strategy/autotune path
+        // Each operand must be contiguous in its stored (possibly transposed) layout:
+        // !transA → A is [m,k] (lda=k); transA → Aᵀ is [k,m] (lda=m). Likewise B.
+        if (lda != (transA ? m : k)) return false;
+        if (ldb != (transB ? k : n)) return false;
 
-        if (typeof(T) == typeof(float))
+        bool isFloat = typeof(T) == typeof(float);
+        if (transA)
+        {
+            // Aᵀ·B via the strided-A kernel (no transpose materialised).
+            if (isFloat)
+                Simd.SimdGemm.SgemmDirectParallelMIntoTransA(
+                    MemoryMarshal.Cast<T, float>(a), MemoryMarshal.Cast<T, float>(b),
+                    MemoryMarshal.Cast<T, float>(c), m, k, n);
+            else
+                Simd.SimdGemm.DgemmDirectParallelMIntoTransA(
+                    MemoryMarshal.Cast<T, double>(a), MemoryMarshal.Cast<T, double>(b),
+                    MemoryMarshal.Cast<T, double>(c), m, k, n);
+        }
+        else if (transB)
+        {
+            // A·Bᵀ via the NT dot-product kernel (Bstored rows are contiguous).
+            if (isFloat)
+                Simd.SimdGemm.SgemmDirectParallelMIntoTransB(
+                    MemoryMarshal.Cast<T, float>(a), MemoryMarshal.Cast<T, float>(b),
+                    MemoryMarshal.Cast<T, float>(c), m, k, n);
+            else
+                Simd.SimdGemm.DgemmDirectParallelMIntoTransB(
+                    MemoryMarshal.Cast<T, double>(a), MemoryMarshal.Cast<T, double>(b),
+                    MemoryMarshal.Cast<T, double>(c), m, k, n);
+        }
+        else if (isFloat)
             Simd.SimdGemm.SgemmDirectParallelMInto(
                 MemoryMarshal.Cast<T, float>(a), MemoryMarshal.Cast<T, float>(b),
                 MemoryMarshal.Cast<T, float>(c), m, k, n);
