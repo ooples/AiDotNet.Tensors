@@ -156,6 +156,17 @@ public readonly struct SparseEmbeddingGradient<T>
                 $"gradOutput last axis ({gradLastDim}) must equal embeddingDim ({embeddingDim}).",
                 nameof(gradOutput));
         }
+        // Ensure leading-axis flattening will round-trip: rank-3 [batch, seq, dim] must have
+        // batch*seq == totalIndices, otherwise the reshape below would silently slice or
+        // wrap-around. The Tensor ctor would catch this, but a domain-specific message
+        // explaining the tri-axis relationship makes the misuse far easier to debug.
+        long expectedCount = (long)totalIndices * embeddingDim;
+        if (gradOutput.Length != expectedCount)
+        {
+            throw new ArgumentException(
+                $"gradOutput total elements ({gradOutput.Length}) must equal indices.Length * embeddingDim ({totalIndices} * {embeddingDim} = {expectedCount}).",
+                nameof(gradOutput));
+        }
         if (gradOutput.Rank != 2 || gradOutput.Shape[0] != totalIndices)
         {
             flatValues = new Tensor<T>(gradOutput.GetDataArray(), new[] { totalIndices, embeddingDim });
