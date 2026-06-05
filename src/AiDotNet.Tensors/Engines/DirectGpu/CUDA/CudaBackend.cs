@@ -5913,6 +5913,25 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         args[10] = &epsilon;
         // 2 shared arrays for sumDy and sumDyXmu
         LaunchKernelWithSharedMem(kernel, gridX, DefaultBlockSize, (uint)(2 * DefaultBlockSize * sizeof(float)), args);
+
+        // The layernorm_backward kernel above computes ONLY gradInput — it leaves
+        // gradGamma/gradBeta untouched (they require a reduction ACROSS the batch, not a
+        // per-row block result). Launch the dedicated param-gradient kernel; without it,
+        // LayerNorm's affine gamma/beta receive ZERO gradient on GPU and never train
+        // (every transformer layer has a LayerNorm — caught by LayerNormGradientCheckTests).
+        if (!_kernelCache.TryGetValue("layernorm_grad_params", out var paramKernel))
+            throw new InvalidOperationException("CUDA kernel not found: layernorm_grad_params");
+        uint paramGrid = (uint)((normalizedSize + DefaultBlockSize - 1) / DefaultBlockSize);
+        void** pargs = stackalloc void*[8];
+        pargs[0] = &gradOutputPtr;
+        pargs[1] = &inputPtr;
+        pargs[2] = &saveMeanPtr;
+        pargs[3] = &saveInvVarPtr;
+        pargs[4] = &gradGammaPtr;
+        pargs[5] = &gradBetaPtr;
+        pargs[6] = &batchSize;
+        pargs[7] = &normalizedSize;
+        LaunchKernel(paramKernel, paramGrid, DefaultBlockSize, pargs);
     }
 
     public unsafe void GroupNorm(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,

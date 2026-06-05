@@ -21455,18 +21455,30 @@ public partial class CpuEngine : ITensorLevelEngine
                 // out-param overload and copies them into the SAME tensor
                 // instances the savedState slot holds, so the backward
                 // reads fresh values on every plan.Step().
-                var capturedMean = mean;
-                var capturedVar = variance;
+                // AiDotNet#1331 follow-up (2026-06-05): the compile-time mean/variance
+                // (captured here) can be sized for a DIFFERENT input rank than the
+                // realize-time forward computes — the lazy graph fed LayerNorm a
+                // [B, D] tensor at trace but [B, S, D] at replay, so the trace-time
+                // mean is [B] (32) while replay needs [B, S] (1024). The old code
+                // CopyTo'd fresh -> captured and threw "Destination is too short",
+                // which silently disabled the ENTIRE fused compiled-training path for
+                // every transformer (LayerNorm is in every block). Fix: route the
+                // realize-time mean/variance to the backward via a mutable holder
+                // (reference swap, no copy, no size assumption). LayerNormBackward
+                // unwraps the holder; the eager paths still pass raw tensors.
+                var stateRef = new LayerNormStateRef<T> { Mean = mean, Variance = variance };
                 var lazyResult = scope.RecordVariadic(LazyNodeType.Custom, "LayerNorm",
                     new[] { input, gamma, beta }, eagerResult._shape,
                     (eng, output) =>
                     {
                         var r = eng.LayerNorm(ci, cg, cb, ce, out var freshMean, out var freshVar);
                         r.AsSpan().CopyTo(output.AsWritableSpan());
-                        freshMean.AsSpan().CopyTo(capturedMean.AsWritableSpan());
-                        freshVar.AsSpan().CopyTo(capturedVar.AsWritableSpan());
+                        // Hand the correctly-shaped realize-time stats to backward
+                        // by reference — avoids the trace-vs-replay size mismatch.
+                        stateRef.Mean = freshMean;
+                        stateRef.Variance = freshVar;
                     },
-                    BackwardFunctions<T>.LayerNormBackward, new object[] { mean, variance, epsilon });
+                    BackwardFunctions<T>.LayerNormBackward, new object[] { stateRef, stateRef, epsilon });
                 eagerResult.AsSpan().CopyTo(lazyResult.AsWritableSpan());
                 return lazyResult;
             }
