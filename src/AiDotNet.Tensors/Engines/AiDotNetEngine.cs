@@ -286,10 +286,16 @@ public static class AiDotNetEngine
             if (LinearAlgebra.WeightRegistry.OffloadAllocator is not null)
                 return;
 
-            var backendName = ((IEngine)gpuEngine).DirectGpu?.BackendName?.ToUpperInvariant();
+            var directGpu = ((IEngine)gpuEngine).DirectGpu;
+            var backendName = directGpu?.BackendName?.ToUpperInvariant();
             DirectGpu.IGpuOffloadAllocator? allocator = backendName switch
             {
-                "CUDA" or "NVIDIA" => new DirectGpu.CUDA.CudaOffloadAllocator(),
+                // Share the compute backend's CUDA context so pinned moment/weight
+                // buffers live in the SAME context as the optimizer kernels that
+                // read them — no cross-context access (which made the GPU-resident
+                // optimizer's host-readback sync flaky).
+                "CUDA" or "NVIDIA" => new DirectGpu.CUDA.CudaOffloadAllocator(
+                    directGpu?.Backend is DirectGpu.CUDA.CudaBackend cudaBackend ? cudaBackend.CudaContextHandle : IntPtr.Zero),
                 // Hip/Metal/OpenCl/Vulkan/WebGpu offload allocators exist but are
                 // not IGpuDevicePointerWrapper yet, so they cannot back a
                 // GPU-resident weight buffer. Leave the registry unconfigured for

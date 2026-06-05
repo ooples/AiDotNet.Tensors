@@ -24,7 +24,31 @@ public sealed class CudaOffloadAllocator : IGpuOffloadAllocator, IGpuDevicePoint
     // create + push our own. Field stays IntPtr.Zero until first
     // Allocate; Dispose destroys it iff non-zero.
     private IntPtr _context;
+    // True when this allocator created _context itself (standalone offload path)
+    // and must destroy it on Dispose. False when _context is SHARED with an
+    // existing CudaBackend — then the offload buffers live in the SAME context
+    // as the compute kernels (no cross-context access), so the optimizer kernel
+    // reading the pinned moments and the stream sync that orders it are in one
+    // context. Sharing must NOT destroy a context the backend still owns.
+    private readonly bool _ownsContext = true;
     private bool _disposed;
+
+    /// <summary>Standalone offload allocator — lazily creates and owns its own CUDA context.</summary>
+    public CudaOffloadAllocator() { }
+
+    /// <summary>
+    /// Offload allocator that SHARES an existing CUDA context (the compute
+    /// backend's). Pinned moment/weight buffers then live in the same context as
+    /// the kernels that read them, so cross-context access and its murky
+    /// cross-context synchronization (the source of the GPU-resident-optimizer
+    /// host-readback flakiness) are eliminated. The shared context is owned by
+    /// the caller and is NOT destroyed on <see cref="Dispose"/>.
+    /// </summary>
+    public CudaOffloadAllocator(IntPtr sharedContext)
+    {
+        _context = sharedContext;
+        _ownsContext = sharedContext == IntPtr.Zero; // zero -> behave like the default ctor (create our own)
+    }
 
     public bool IsAvailable => CudaNativeBindings.IsAvailable;
 
@@ -236,7 +260,10 @@ public sealed class CudaOffloadAllocator : IGpuOffloadAllocator, IGpuDevicePoint
                 {
                     foreach (var h in snapshot) FreeNative(h);
                 }
-                CuBlasNative.cuCtxDestroy(ctxToDestroy);
+                // Only destroy the context if WE created it. A shared backend
+                // context must outlive this allocator (the backend still uses it).
+                if (_ownsContext)
+                    CuBlasNative.cuCtxDestroy(ctxToDestroy);
             }
             else
             {

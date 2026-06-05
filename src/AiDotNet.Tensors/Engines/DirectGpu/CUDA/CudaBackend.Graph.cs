@@ -29,6 +29,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 public sealed partial class CudaBackend
 {
     /// <summary>
+    /// This backend's CUDA context handle. Exposed so the GPU offload allocator
+    /// can SHARE it (allocate pinned moment/weight buffers in the same context
+    /// as the compute kernels), avoiding cross-context access in the
+    /// GPU-resident optimizer step.
+    /// </summary>
+    internal IntPtr CudaContextHandle => _cudaContext;
+
+    /// <summary>
     /// Records the GPU kernel launches issued by <paramref name="launch"/> on this
     /// backend's stream into a CUDA graph and returns an instantiated, replayable
     /// graph-exec handle (or <see cref="IntPtr.Zero"/> on failure / unavailable GPU).
