@@ -10085,6 +10085,34 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
+    /// <summary>
+    /// Proximal gradient (ISTA) step with L1 soft-threshold prox, in place on the GPU:
+    /// <c>tmp = param - lr*grad; param = sign(tmp)*max(|tmp| - l1Strength, 0)</c>.
+    /// </summary>
+    public unsafe void ProximalL1Update(IGpuBuffer param, IGpuBuffer gradient,
+        float learningRate, float l1Strength, int size)
+    {
+        if (param is null) throw new ArgumentNullException(nameof(param));
+        if (gradient is null) throw new ArgumentNullException(nameof(gradient));
+        if (size <= 0)
+            throw new ArgumentOutOfRangeException(nameof(size), "Size must be positive.");
+
+        if (!_kernelCache.TryGetValue("proximal_l1_update", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: proximal_l1_update");
+
+        using var _ = PushContext();
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr paramPtr = param.Handle;
+        IntPtr gradPtr = gradient.Handle;
+        void** args = stackalloc void*[5];
+        args[0] = &paramPtr;
+        args[1] = &gradPtr;
+        args[2] = &learningRate;
+        args[3] = &l1Strength;
+        args[4] = &size;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
     /// <inheritdoc/>
     public unsafe void AdadeltaUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer accumGrad, IGpuBuffer accumUpdate,
         float rho, float epsilon, float weightDecay, int size)

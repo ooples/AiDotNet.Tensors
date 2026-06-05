@@ -409,6 +409,25 @@ extern ""C"" __global__ __launch_bounds__(256) void ftrl_update(
         param[idx] = -zSign * (zAbs - l1Reg) / denom;
     }
 }
+
+// ---------------------------------------------------------------------------
+// Proximal gradient (ISTA) with L1 soft-threshold prox. Matches the CPU
+// ProximalGradientDescentOptimizer + L1Regularization path exactly:
+//   tmp = param - lr*grad;  param = sign(tmp) * max(|tmp| - l1Strength, 0)
+// Note the threshold is the raw L1 strength (not lr*strength), per L1Regularization.
+// ---------------------------------------------------------------------------
+extern ""C"" __global__ __launch_bounds__(256) void proximal_l1_update(
+    float* __restrict__ param, const float* __restrict__ gradient,
+    float learningRate, float l1Strength, int size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+
+    float tmp = param[idx] - learningRate * gradient[idx];
+    float a = fabsf(tmp) - l1Strength;
+    float sgn = (tmp > 0.0f) ? 1.0f : ((tmp < 0.0f) ? -1.0f : 0.0f);
+    param[idx] = sgn * (a > 0.0f ? a : 0.0f);
+}
 ";
     }
 
@@ -433,7 +452,8 @@ extern ""C"" __global__ __launch_bounds__(256) void ftrl_update(
             "adamax_update",
             "lion_update",
             "nadam_update",
-            "ftrl_update"
+            "ftrl_update",
+            "proximal_l1_update"
         };
     }
 }

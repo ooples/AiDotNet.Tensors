@@ -114,6 +114,24 @@ public static class GpuOptimizer
         return true;
     }
 
+    /// <summary>
+    /// Proximal gradient (ISTA) step with L1 soft-threshold prox, in place on the GPU.
+    /// CUDA-only (proximal_l1_update lives on CudaBackend); returns false on any
+    /// other backend or when param/grad aren't GPU-resident, so the caller falls
+    /// back to the CPU path.
+    /// </summary>
+    public static bool TryProximalL1Step(Tensor<float> p, Tensor<float> g, float lr, float l1Strength)
+    {
+        if (p is null) throw new ArgumentNullException(nameof(p));
+        if (g is null) throw new ArgumentNullException(nameof(g));
+        if (!(AiDotNetEngine.Current is DirectGpuTensorEngine e)) return false;
+        if (!(e.GetBackend() is DirectGpu.CUDA.CudaBackend cb)) return false;
+        var pb = p.TryGetGpuBuffer(); var gb = g.TryGetGpuBuffer();
+        if (pb is null || gb is null) return false;
+        cb.ProximalL1Update(pb, gb, lr, l1Strength, p.Length);
+        return true;
+    }
+
     // ---- GPU-resident steps for the rest of the backend optimizer kernels (same contract as TryAdamStep:
     //      returns false if not on a GPU engine or any tensor isn't GPU-resident, so the caller falls back to CPU).
     //      All buffers must be GPU-resident; the kernel updates param + state IN PLACE with no host download. ----
