@@ -61,6 +61,15 @@ public sealed class GradientTape<T> : IDisposable
     private bool _engineExplicitlyBound;
     private readonly bool _savedReplayMode; // Saved ReplayMode from outer scope for nested tapes
     private bool _disposed;
+    // Deterministic per-step activation lifetime (GPU): the DirectGpu activation
+    // cache that an outermost tape's forward populates is released wholesale on
+    // Dispose via EvictActivationsCreatedAfter(_activationSnapshot), giving ~one-step
+    // steady-state memory (PyTorch/JAX semantics) instead of leaning on the LRU byte
+    // cap to drain a backlog. Only the engine instance captured at construction is
+    // touched, and only entries newer than the snapshot — pre-existing cross-tape
+    // intermediates are preserved. Null engine / non-GPU / nested tape => no-op.
+    private readonly Engines.DirectGpuTensorEngine? _snapshotEngine;
+    private readonly long _activationSnapshot;
 
 
     /// <summary>
@@ -148,6 +157,17 @@ public sealed class GradientTape<T> : IDisposable
         _engineExplicitlyBound = false;
         _parent = _current;
         _savedReplayMode = Compilation.AutoTrainingCompiler.ReplayMode;
+
+        // Capture the activation-cache baseline for the OUTERMOST tape on a GPU engine.
+        // On Dispose, every activation cached at a higher timestamp (i.e. produced by
+        // this forward+backward) is released deterministically — see _snapshotEngine.
+        // Captured from the construction-time engine; only used at Dispose if the tape
+        // still bound to that same instance (guards the rare CPU<->GPU rebind, #350).
+        if (_parent is null && _engine is Engines.DirectGpuTensorEngine snapEngine)
+        {
+            _snapshotEngine = snapEngine;
+            _activationSnapshot = snapEngine.ActivationCacheTimestampSnapshot();
+        }
 
         if (_options.EnableHooks)
         {
@@ -1742,17 +1762,24 @@ public sealed class GradientTape<T> : IDisposable
         // Only the OUTERMOST tape invalidates — nested tapes
         // (Hvp/Hessian) must not clear their parent's pending
         // materializers mid-backward. Detect outermost via
-        // _parent == null. Engine check gates the virtual dispatch.
-        if (_parent is null && _entries.Count > 0
-            && _engine is Engines.DirectGpuTensorEngine gpuEngine)
+        // _parent == null.
+        //
+        // 2026-06-05: this used to walk _entries and invalidate only each recorded
+        // op's `entry.Output`. That was INCOMPLETE — activations cached under keys
+        // that were never a recorded tape Output (e.g. the [B,H,ctx,ctx] attention
+        // scores re-uploaded during backward) leaked: gcroot traced 36GB+ of live
+        // float[] back to DirectGpuTensorEngine._activationCache surviving across
+        // training steps. The deterministic fix releases EVERY activation this
+        // forward+backward produced (timestamp > the snapshot captured at ctor),
+        // which is a strict superset of the old per-Output walk and bounds memory
+        // to ~one step. Entries created before the tape are preserved, so the
+        // cross-tape inference-reuse scenarios the old walk protected still hold.
+        // Guard on the SAME engine instance the snapshot came from (CPU<->GPU
+        // rebind, #350); the byte/managed caps remain as a backstop either way.
+        if (_parent is null && _snapshotEngine is not null
+            && ReferenceEquals(_snapshotEngine, _engine))
         {
-            for (int i = 0; i < _entries.Count; i++)
-            {
-                ref var entry = ref _entries[i];
-                var output = entry.Output;
-                if (output is null) continue;
-                gpuEngine.InvalidateGpuCacheForTensor(output);
-            }
+            _snapshotEngine.EvictActivationsCreatedAfter(_activationSnapshot);
         }
 
         // Return arena to thread-local cache for reuse by next GradientTape
