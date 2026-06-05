@@ -545,7 +545,13 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // (CUDA 700 "buffer released before materialization"). The plan reuses stable
         // buffers each step, so this does not accumulate; a step that truly exceeds VRAM
         // now surfaces as a clean CUDA OOM instead of a 700 corruption.
-        var evictGuard = engine as AiDotNet.Tensors.Engines.DirectGpuTensorEngine;
+        // AIDOTNET_GPU_OFFLOAD=1 opts into within-step eviction (host-RAM offload) made
+        // race-free by the stream-sync-before-free in EvictOldestActivationsUnsafe — lower
+        // GPU memory at the cost of a sync under VRAM pressure. Default = suspend (keep the
+        // whole step resident; safest, what shipped in the #226 fix).
+        var evictGuard = System.Environment.GetEnvironmentVariable("AIDOTNET_GPU_OFFLOAD") == "1"
+            ? null
+            : engine as AiDotNet.Tensors.Engines.DirectGpuTensorEngine;
         evictGuard?.SuspendActivationEviction();
         try
         {

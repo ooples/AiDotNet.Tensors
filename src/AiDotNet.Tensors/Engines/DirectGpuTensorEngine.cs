@@ -1149,7 +1149,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
         }
 
-        // Dispose evicted GPU buffers OUTSIDE the lock to avoid blocking cache lookups
+        // Dispose evicted GPU buffers OUTSIDE the lock to avoid blocking cache lookups.
+        // #226 race fix (approach 1): a step's forward/backward enqueues a long async
+        // kernel chain on the stream; freeing an evicted buffer while a kernel that still
+        // references it is in flight is an illegal access (CUDA 700 at the next sync). Fully
+        // synchronize the backend stream FIRST so every enqueued kernel has finished and no
+        // GPU op references the buffers we are about to free. This makes within-step offload
+        // safe, so eviction (and thus host-RAM offload) can run during a step without the
+        // suspend — trading a (rare, only-under-VRAM-pressure) sync for a 700 corruption.
+        if (evicted.Count > 0)
+        {
+            try { backend.Synchronize(); } catch { /* best-effort; dispose still proceeds */ }
+        }
         foreach (var entry in evicted)
         {
             entry.Dispose();
