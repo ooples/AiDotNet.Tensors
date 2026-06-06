@@ -86,6 +86,16 @@ But GPU measurement on the cortex shows it does **NOT** reduce GPU VRAM (5918 vs
 
 **Net honest status:** FP16 *compute* on matmuls works; FP16 activation-storage *format* + *CPU paging* work and are tested; the **GPU resident-memory win remains unachieved** and is now precisely localized to the DirectGpu activation-cache layer. All flags OFF by default; nothing regresses.
 
+## Layer 5 design (DirectGpu activation-cache FP16) — primitives, seam, blocker
+
+**Primitives (verified present):** `CudaBackend.AllocateByteBuffer(n)` = exactly `n` bytes (raw `cuMemAlloc`), so a true ½-size FP16 activation = `AllocateByteBuffer(elements*2)`. `ConvertToFp16(fp32,fp16,elements)` / `ConvertToFp32(fp16,fp32,elements)` convert between a float buffer and a half buffer (Tensor-Core path). `IGpuBuffer.SizeInBytes` makes the cache byte-accounting (`_currentActivationCacheBytes`) automatically correct for a half buffer.
+
+**Secondary finding:** the shipped autocast `AutocastScope.MaybeConvertInput` allocates its fp16 buffer via `AllocateBuffer(size)` = `size*4` bytes (FLOAT-sized). So FP16-compute GEMM inputs are stored float-sized — the fp16 buffers save no memory. Fixing this to `AllocateByteBuffer(size*2)` is a contained ½-size win on the transient GEMM inputs (separate, smaller).
+
+**Seam:** cache as FP16 in `CacheActivation` (compress `fp32 → AllocateByteBuffer(elements*2)` via `ConvertToFp16`); upcast on read at the two chokepoints `GetOrAllocateBuffer` / `UploadTensor` (cache hit + `entry.IsFp16` ⇒ allocate transient FP32, `ConvertToFp32`, return owned-transient). `ActivationCacheEntry` gains `IsFp16` + `ElementCount`.
+
+**BLOCKER (why this is a careful redesign, not a patch):** the resident activation's FP32 buffer is owned JOINTLY by the cache AND the producing tensor (`tensor._gpuBuffer`, set on the fast path in `UploadTensor`). To free the FP32 and keep only the FP16, BOTH references must be redirected to the upcast-on-read path. `CacheActivation` only has the backing-array key, not the tensor, so it cannot clear `tensor._gpuBuffer` — freeing the FP32 there would dangle the tensor's pointer (use-after-free / CUDA-700, the #226/#552/#554 race class). The correct fix threads tensor-buffer invalidation through the cache→tensor boundary (e.g. cache owns the activation buffer exclusively and the tensor always re-resolves via `GetOrAllocateBuffer`, never caching `_gpuBuffer` for fp16-cached activations) — a deliberate buffer-lifecycle change validated step-by-step on GPU. This is the genuine remaining work; rushing it regresses the buffer-lifecycle safety the earlier PRs (#552/#554) established.
+
 ## Test gate (non-negotiable, every phase)
 - `LayerNormGradientCheckTests`-style finite-diff vs analytic, extended to the mixed-precision node.
 - Resident-memory measurement via `opt-parity LEAKPROBE` (no HE rebuild).
