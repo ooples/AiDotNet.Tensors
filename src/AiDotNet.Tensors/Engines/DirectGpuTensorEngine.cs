@@ -3330,6 +3330,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         using var bufferA = GetOrAllocateBuffer(backend, aData);
         using var bufferB = GetOrAllocateBuffer(backend, bData);
 
+        // A cached buffer (persistent/activation cache, keyed by the array
+        // reference) can be SMALLER than the logical array when a pooled
+        // backing array is reused at a new, larger shape — the cache still
+        // maps that reference to the old, smaller buffer. Running the op at
+        // aData.Length would index past the device allocation, and the
+        // short download would then throw "source array was not long enough"
+        // in the copy-back (seen crashing eager LayerNormBackward on the GPU
+        // when a varying-shape step falls off the fused path). Bail to the
+        // correct CPU implementation instead of corrupting device memory.
+        // (A LARGER cached buffer — e.g. power-of-two padded — is fine: the op
+        // touches the first aData.Length elements and the copy-back is bounded.)
+        if (bufferA.Buffer.Size < aData.Length || bufferB.Buffer.Size < bData.Length)
+            return false;
+
         op(backend, bufferA.Buffer, bufferB.Buffer, aData.Length);
 
         // Download result back into a's backing array
@@ -3358,6 +3372,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         var data = tensor.GetDataArray();
         using var buffer = GetOrAllocateBuffer(backend, data);
+
+        // See TryRunBinaryInPlace: a stale cached buffer can be smaller than the
+        // logical array when a pooled backing array is reused at a larger shape.
+        // Bail to the correct CPU path rather than index past the allocation.
+        if (buffer.Buffer.Size < data.Length)
+            return false;
 
         op(backend, buffer.Buffer, data.Length);
 
