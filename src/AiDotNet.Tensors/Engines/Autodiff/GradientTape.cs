@@ -407,6 +407,27 @@ public sealed class GradientTape<T> : IDisposable
                 ref var step = ref steps[i];
                 if (grads.TryGetValue(step.Output, out var gradOutput))
                 {
+                    // Weight-streaming integration: rehydrate any paged-out input
+                    // weights before the backward reads them. The forward path does
+                    // this through StreamingAutogradHook.OnInputAccessed; the plain
+                    // streaming-backward walk bypasses that hook, so materialize
+                    // explicitly here. Materialize is a no-op for tensors that are
+                    // resident or not registered with the streaming pool, so this is
+                    // free when weight streaming is off. The pool evicts other LRU
+                    // weights to stay under its resident cap, keeping peak bounded —
+                    // and the just-materialized weight is resident when its gradient
+                    // completes (its last use), so the optimizer epilogue can update
+                    // it in place; eviction later writes the update back to disk.
+                    var stepInputs = step.Inputs;
+                    if (stepInputs is not null)
+                    {
+                        for (int j = 0; j < stepInputs.Length; j++)
+                        {
+                            var inp = stepInputs[j];
+                            if (inp is not null) WeightRegistry.Materialize(inp);
+                        }
+                    }
+
                     step.Backward(gradOutput, step.Inputs, step.Output,
                         step.SavedState ?? Array.Empty<object>(), engine, grads);
                 }
