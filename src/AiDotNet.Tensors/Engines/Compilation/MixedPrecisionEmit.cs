@@ -66,16 +66,14 @@ internal static class MixedPrecisionEmit
     {
         if (scope is null) throw new ArgumentNullException(nameof(scope));
 
-        // 1. Down-cast inputs FP32 -> FP16. Backward: bridge the FP16 grad up to the FP32 input space.
-        var aH = scope.RecordCrossTypeWithBackward<float, Half>(
-            LazyNodeType.Custom, opName + ".castA16", a, a._shape,
-            (e, o) => MixedPrecisionCast.CastToFp16(a).AsSpan().CopyTo(o.AsWritableSpan()),
-            (gradOut, input, output, state, e) => MixedPrecisionCast.CastToFp16Backward(gradOut));
-
-        var bH = scope.RecordCrossTypeWithBackward<float, Half>(
-            LazyNodeType.Custom, opName + ".castB16", b, b._shape,
-            (e, o) => MixedPrecisionCast.CastToFp16(b).AsSpan().CopyTo(o.AsWritableSpan()),
-            (gradOut, input, output, state, e) => MixedPrecisionCast.CastToFp16Backward(gradOut));
+        // 1. Get inputs as FP16. CRITICAL for the memory win: if an input is already the up-cast output
+        // of a prior FP16 op (a matmul-stack intermediate), REUSE that op's existing Half tensor instead
+        // of down-casting the float copy again. This keeps activations FP16 across the whole eligible
+        // region — the intermediate float up-cast becomes unreachable from the loss and is dropped by the
+        // plan's topo-from-output (so it's never resident). Without this, every matmul kept BOTH its Half
+        // output AND a float up-cast, so the net footprint went UP, not down (measured: +1GB vs FP32).
+        var aH = ToFp16Input(scope, a, opName + ".castA16");
+        var bH = ToFp16Input(scope, b, opName + ".castB16");
 
         // 2. FP16 matmul — the OUTPUT BUFFER is Half (the 2-byte activation = the memory win).
         var cH = scope.RecordBinary<Half>(
@@ -94,5 +92,21 @@ internal static class MixedPrecisionEmit
             (gradOut, input, output, state, e) => MixedPrecisionCast.CastToFp32Backward(gradOut));
 
         return cF;
+    }
+
+    /// <summary>
+    /// Returns <paramref name="x"/> as an FP16 tensor for an FP16-eligible op input. If <paramref name="x"/>
+    /// is the float output of a prior FP16 op's up-cast, reuses that op's Half output directly (no new
+    /// cast node) so consecutive FP16 ops keep their activations in FP16 and the intermediate float
+    /// up-cast is left dead. Otherwise records a down-cast (the FP32→FP16 boundary into the region).
+    /// </summary>
+    private static Tensor<Half> ToFp16Input(LazyTensorScope scope, Tensor<float> x, string name)
+    {
+        if (x.LazySource is CrossTypeLazyNode<Half, float> up)
+            return up.Input; // already FP16 upstream — reuse it, skip the float round-trip
+        return scope.RecordCrossTypeWithBackward<float, Half>(
+            LazyNodeType.Custom, name, x, x._shape,
+            (e, o) => MixedPrecisionCast.CastToFp16(x).AsSpan().CopyTo(o.AsWritableSpan()),
+            (gradOut, input, output, state, e) => MixedPrecisionCast.CastToFp16Backward(gradOut));
     }
 }
