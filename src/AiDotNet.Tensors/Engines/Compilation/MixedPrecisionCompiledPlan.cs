@@ -162,6 +162,86 @@ public sealed class MixedPrecisionCompiledPlan
         return new StepResult(loss, infNan);
     }
 
+    // FP32 Adam master state (moments live in FP32 alongside the FP32 master weights — Micikevicius AMP).
+    private Dictionary<Tensor<float>, (float[] M, float[] V)>? _adamState;
+    private int _adamStep;
+
+    /// <summary>
+    /// Phase (fused-Adam): one compiled mixed-precision training step with the Adam optimizer. Identical
+    /// to <see cref="Step"/> but the FP32 master update is Adam (m/v moments kept in FP32, bias-corrected),
+    /// matching the optimizer Adam-configured models (e.g. the cortex) use. Loss scaling + skip-on-overflow
+    /// via <paramref name="scaler"/> as in <see cref="Step"/>. The plan output must be the scalar loss.
+    /// </summary>
+    public StepResult StepAdam(
+        IReadOnlyList<Tensor<float>> parameters,
+        float learningRate,
+        float beta1 = 0.9f, float beta2 = 0.999f, float epsilon = 1e-8f, float weightDecay = 0f,
+        GradScaler? scaler = null)
+    {
+        if (parameters is null) throw new ArgumentNullException(nameof(parameters));
+        var eng = _engine;
+
+        Forward();
+        float loss = _output.Length > 0 ? _output.ToArray()[0] : 0f;
+
+        float scale = scaler?.Scale ?? 1f;
+        var grads = MixedPrecisionGraphBackward.BackwardOverOrder(_order, _output, eng, scale);
+        float invScale = 1f / scale;
+
+        var pgrads = new Tensor<float>[parameters.Count];
+        bool infNan = false;
+        for (int i = 0; i < parameters.Count; i++)
+        {
+            if (!grads.Fp32.TryGetValue(parameters[i], out var g)) continue;
+            var span = g.AsWritableSpan();
+            for (int k = 0; k < span.Length; k++)
+            {
+                span[k] *= invScale;
+                if (float.IsNaN(span[k]) || float.IsInfinity(span[k])) infNan = true;
+            }
+            pgrads[i] = g;
+        }
+
+        // Skip the Adam update (and the step-count/moment advance) on overflow — corrupt grads must never
+        // touch the master weights or moments; the scaler backs off and the step is retried at lower scale.
+        if (!infNan)
+        {
+            _adamStep++;
+            float bc1 = 1f - (float)Math.Pow(beta1, _adamStep);
+            float bc2 = 1f - (float)Math.Pow(beta2, _adamStep);
+            _adamState ??= new Dictionary<Tensor<float>, (float[], float[])>(ReferenceEqualityComparer<Tensor<float>>.Instance);
+
+            for (int i = 0; i < parameters.Count; i++)
+            {
+                var g = pgrads[i];
+                if (g is null) continue;
+                var p = parameters[i];
+                if (!_adamState.TryGetValue(p, out var st))
+                {
+                    st = (new float[p.Length], new float[p.Length]);
+                    _adamState[p] = st;
+                }
+                var w = p.AsWritableSpan();
+                var gs = g.AsSpan();
+                var m = st.M; var v = st.V;
+                for (int k = 0; k < w.Length; k++)
+                {
+                    float gk = gs[k];
+                    if (weightDecay != 0f) gk += weightDecay * w[k]; // L2 (matches AiDotNet's Adam)
+                    m[k] = beta1 * m[k] + (1f - beta1) * gk;
+                    v[k] = beta2 * v[k] + (1f - beta2) * gk * gk;
+                    float mhat = m[k] / bc1;
+                    float vhat = v[k] / bc2;
+                    w[k] -= learningRate * mhat / ((float)Math.Sqrt(vhat) + epsilon);
+                }
+                p.IncrementVersion();
+            }
+        }
+
+        scaler?.Update(infNan);
+        return new StepResult(loss, infNan);
+    }
+
     private static void RunForward(ILazyNode node, IEngine eng)
     {
         switch (node)
