@@ -10597,6 +10597,50 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public unsafe void ConvertToFp32Native(IGpuBuffer input, IGpuBuffer output, int size)
         => LaunchConvertFp16("convert_fp16_to_fp32_native", input, output, size);
 
+    /// <summary>
+    /// FP16 Tensor-Core GEMM for the hot single-matmul path (#558 layer 7): row-major C[M,N] = A[M,K]·B[K,N]
+    /// with FP16 inputs and an FP32 output. Multiplies in FP16 on the Tensor Cores, accumulates in FP32
+    /// (<c>CUBLAS_COMPUTE_32F</c>) — full-rate Tensor-Core throughput (≈2× the TF32 <c>cublasSgemm</c> the
+    /// default <see cref="Gemm"/> uses) at half the input bandwidth. This is the de-batched mirror of the
+    /// proven <see cref="BatchedGemmExFanout"/> convention; <paramref name="Ahalf"/>/<paramref name="Bhalf"/>
+    /// are FP16 (byte) buffers, <paramref name="C"/> is FP32. cuBLAS is column-major, so we compute
+    /// Cᵀ = Bᵀ·Aᵀ by passing (N,M,K) with B then A — identical to the FP32 path. <c>cublasGemmEx</c> needs
+    /// no <c>cuda_fp16.h</c> (the half pointers are runtime, not compile-time), so this works driver-only —
+    /// pair with <see cref="ConvertToFp16Native"/> to feed it from FP32, or with FP16-resident activations
+    /// to skip the convert entirely.
+    /// </summary>
+    public unsafe void GemmFp16(IGpuBuffer Ahalf, IGpuBuffer Bhalf, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
+    {
+        if (!IsAvailable) throw new InvalidOperationException("CUDA backend is not available.");
+        if (Ahalf is null) throw new ArgumentNullException(nameof(Ahalf));
+        if (Bhalf is null) throw new ArgumentNullException(nameof(Bhalf));
+        if (C is null) throw new ArgumentNullException(nameof(C));
+        if (M <= 0 || N <= 0 || K <= 0) throw new ArgumentException($"GEMM dims must be positive (M={M}, N={N}, K={K}).");
+        // A,B are 2-byte half; C is 4-byte float. Reject undersized buffers (byte-aware, since the
+        // element-count view would misread half buffers as float-sized).
+        if (Ahalf.SizeInBytes < (long)M * K * 2) throw new ArgumentException($"A half buffer too small: {Ahalf.SizeInBytes} < {(long)M * K * 2}.");
+        if (Bhalf.SizeInBytes < (long)K * N * 2) throw new ArgumentException($"B half buffer too small: {Bhalf.SizeInBytes} < {(long)K * N * 2}.");
+        if (C.SizeInBytes < (long)M * N * sizeof(float)) throw new ArgumentException($"C buffer too small: {C.SizeInBytes} < {(long)M * N * sizeof(float)}.");
+
+        using var _ = PushContext();
+        float aVal = alpha, bVal = beta;
+        IntPtr alphaPtr = (IntPtr)(&aVal);
+        IntPtr betaPtr = (IntPtr)(&bVal);
+        CuBlasNative.CheckCublasStatus(
+            CuBlasNative.cublasGemmEx(
+                _cublasHandle,
+                CublasOperation.None, CublasOperation.None,
+                N, M, K,
+                alphaPtr,
+                Bhalf.Handle, CuBlasNative.CUDA_R_16F, N,
+                Ahalf.Handle, CuBlasNative.CUDA_R_16F, K,
+                betaPtr,
+                C.Handle, CuBlasNative.CUDA_R_32F, N,
+                CuBlasNative.CUBLAS_COMPUTE_32F,
+                0 /* CUBLAS_GEMM_DEFAULT — selects Tensor Cores under the handle's math mode */),
+            "cublasGemmEx(GemmFp16)");
+    }
+
     private unsafe void LaunchUnaryFp16(string kernelName, IGpuBuffer input, IGpuBuffer output, int size)
     {
         if (!_kernelCache.TryGetValue(kernelName, out var kernel))
