@@ -106,9 +106,12 @@ public sealed class MixedPrecisionCompiledPlan
     public Tensor<float> Forward()
     {
         var eng = _engine;
-        if (_paging) RestoreDroppedForReplay(); // re-give storage to activations paged out on the prior step
         for (int i = 0; i < _order.Length; i++)
         {
+            // Just-in-time: re-give storage to THIS node's output if it was paged/freed last step, right
+            // before its Execute writes into it. Restoring all upfront would re-inflate to full float and
+            // erase the win; per-node keeps resident float = the live working set.
+            if (_paging) RestoreOutputForReplay(_order[i]);
             RunForward(_order[i], eng);
             if (_paging)
                 foreach (var t in _pageOutAt![i]) PageOut(t);
@@ -116,15 +119,17 @@ public sealed class MixedPrecisionCompiledPlan
         return _output;
     }
 
-    // A paged-out activation's storage was freed last step; the next Forward re-executes into it, so it
-    // needs allocated storage again. The data is overwritten by Execute, so restore with zeros (cheap).
-    private void RestoreDroppedForReplay()
+    // A node's float output may have had its backing freed on the prior step (paged out / backward-freed);
+    // it is re-executed this step, so give it allocated storage just before. Data is overwritten by Execute.
+    private void RestoreOutputForReplay(ILazyNode node)
     {
-        if (_droppedThisStep!.Count == 0) return;
-        foreach (var t in _droppedThisStep)
-            t.RestoreStorageFromBytes(new byte[(long)t.Length * sizeof(float)]);
-        _droppedThisStep.Clear();
-        _halfStore!.Clear();
+        var o = FloatOutputOf(node);
+        if (o is null) return;
+        if (_droppedThisStep!.Remove(o))
+        {
+            _halfStore!.Remove(o);
+            o.RestoreStorageFromBytes(new byte[(long)o.Length * sizeof(float)]);
+        }
     }
 
     /// <summary>Backward over the captured order, with FP16 activation paging (page-in/free) when on.</summary>
