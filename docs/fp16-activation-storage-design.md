@@ -29,6 +29,24 @@
 - Any host-specialized GEMM closures in a plan need FP16 variants (separate, smaller item, also tracked in #555).
 - Regression to the verified FP32 fused path: every phase is behind `AIDOTNET_AUTOCAST=fp16`; default stays FP32-exact.
 
+## Phase 1 finding — the real crux, and why we take the HARD (industry-standard) path
+Investigating the keystone pinned the core difficulty precisely:
+
+- AiDotNet's autodiff is **statically single-type**: `GradientTape<T>`, `TapeEntry<T>`, and a `Dictionary<Tensor<T>,Tensor<T>>` grads map — one element type per tape. The compiled plan's backward (built from the lazy graph) is likewise single-type. There is no mixed-dtype gradient flow today (`CrossTypeLazyNode` is forward-only, used for Complex↔real FFT, with no backward).
+- **Industry-standard AMP (PyTorch/JAX) is mixed-dtype autograd:** FP16 activations are *first-class `Tensor<Half>` nodes in the graph*; the backward computes FP16 activation grads; gradients are cast at FP16↔FP32 boundaries; params/grads/optimizer stay FP32 (master weights); `GradScaler` prevents FP16 grad underflow. The memory win is a *consequence* of activations genuinely being FP16 in the graph — not a storage trick on logically-FP32 tensors.
+- A buffer-compression shortcut (store FP16, keep the graph FP32) would hit the memory number but is **not** real mixed precision and not PyTorch parity. We reject it.
+
+**Therefore Phase 1 is the genuine hard core: extend the autodiff to support mixed-dtype graphs** so a `Tensor<Half>` activation can carry a backward that bridges FP16↔FP32 gradient spaces. Concretely:
+- A **cross-type differentiable cast** (`CastToFp16` / `CastToFp32`) recorded on the tape with a backward that converts the incoming gradient to the input dtype and accumulates into the input's grad space.
+- The backward walk (`GradientTape.ComputeGradients` and the compiled-plan backward) extended to carry a **secondary `Half` grads map** alongside the `float` one, with the cast nodes as the bridge between them.
+- This is the change that makes ALL of FP16/BF16 mixed precision work, so it is gated hard: a finite-difference gradient-check on a 2-op FP16↔FP32 chain MUST match FP32 before anything builds on it (kill-on-mismatch). It is careful autograd surgery — done wrong it corrupts every model's gradients, not just FP16 — so it is implemented and tested in isolation first, behind `AIDOTNET_AUTOCAST`, with the default FP32 path byte-identical.
+
+**Phases (industry-standard):**
+- P1: mixed-dtype autograd keystone — the cross-type cast-with-backward + the secondary Half grads space, with a finite-diff gradient-check gate. (In progress.)
+- P2: FP16-eligible ops (matmul/conv/FF) emit `Tensor<Half>` activations in the graph under autocast (`Hgemm` output); norm/softmax/loss insert boundary casts. Gradient-check each.
+- P3: `GradScaler` loss scaling wired into `CompiledTrainingPlan` (scale loss seed, unscale param grads, dynamic backoff on inf/nan).
+- P4: validate d512/L6/B256 resident ≈ ½ (≤ ~12GB), loss-parity to AMP tolerance, 0 NaN end-to-end.
+
 ## Test gate (non-negotiable, every phase)
 - `LayerNormGradientCheckTests`-style finite-diff vs analytic, extended to the mixed-precision node.
 - Resident-memory measurement via `opt-parity LEAKPROBE` (no HE rebuild).
