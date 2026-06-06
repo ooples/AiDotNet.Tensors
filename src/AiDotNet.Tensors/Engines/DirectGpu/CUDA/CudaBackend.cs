@@ -30,6 +30,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     private IntPtr _cudaContext;
     private IntPtr _stream;
     private IntPtr _cublasHandle;
+    // Stream-ordered allocator (#558 layer 6): when enabled, device buffers are allocated/freed via
+    // cuMemAllocAsync/cuMemFreeAsync on _stream, so freed memory is reused in stream order without a host
+    // sync (race-free + bounds mid-step peak). Opt-in via AIDOTNET_CUDA_ASYNC_ALLOC; default off.
+    private bool _asyncAlloc;
     // cuDNN helpers — lazily initialized on first Conv2D call that routes
     // through the cuDNN dispatch path. Kept private so disposal is linked
     // to this backend's lifetime; the helpers' cuDNN handles survive
@@ -266,6 +270,20 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             CuBlasNative.CheckCudaResult(CuBlasNative.cuCtxCreate(out _cudaContext, 0, device), "cuCtxCreate");
             CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamCreate(out _stream, 0), "cuStreamCreate");
             _defaultStream = new CudaStream(this, _stream, GpuStreamType.Default, ownsHandle: false);
+
+            // Stream-ordered allocator setup (#558 layer 6). Retain freed memory in the pool for reuse
+            // (caching-allocator behaviour) by maxing the release threshold; disable if the pool query
+            // fails (older driver / no pool support) so AllocateBuffer falls back to the sync path.
+            _asyncAlloc = Environment.GetEnvironmentVariable("AIDOTNET_CUDA_ASYNC_ALLOC") == "1";
+            if (_asyncAlloc)
+            {
+                if (CuBlasNative.cuDeviceGetDefaultMemPool(out var memPool, device) == CudaResult.Success)
+                {
+                    ulong threshold = ulong.MaxValue; // CU_MEMPOOL_ATTR_RELEASE_THRESHOLD = 4
+                    CuBlasNative.cuMemPoolSetAttribute(memPool, 4, ref threshold);
+                }
+                else { _asyncAlloc = false; }
+            }
 
             CuBlasNative.CheckCublasStatus(CuBlasNative.cublasCreate(out _cublasHandle), "cublasCreate");
             CuBlasNative.CheckCublasStatus(CuBlasNative.cublasSetStream(_cublasHandle, _stream), "cublasSetStream");
@@ -1034,6 +1052,14 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public void FreeBufferDeferred(IGpuBuffer? buffer)
     {
         if (buffer == null) return;
+        // Stream-ordered buffers (#558 layer 6): cuMemFreeAsync is already ordered after prior stream
+        // work, so free immediately — deferring via an event would delay pool reclamation and erase the
+        // mid-step reuse that bounds peak. Disposing routes to cuMemFreeAsync (see CudaGpuBuffer.Release).
+        if ((buffer is CudaGpuBuffer cb && cb.IsAsyncFreed) || (buffer is CudaGpuByteBuffer bb && bb.IsAsyncFreed))
+        {
+            buffer.Dispose();
+            return;
+        }
         CudaEvent evt;
         using (PushContext())
             evt = new CudaEvent(this, _defaultStream, enableTiming: false); // creates + records on the compute stream
@@ -1120,6 +1146,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
         // CUDA driver API calls are required for device memory operations.
         using var _ = PushContext();
+        if (_asyncAlloc)
+        {
+            var p = AllocDeviceMemoryAsync((ulong)size * sizeof(float));
+            CuBlasNative.CheckCudaResult(CuBlasNative.cuMemsetD32(p, 0, (ulong)size), "cuMemsetD32");
+            return new CudaGpuBuffer(_cudaContext, p, size, returnToPool: null, asyncFreeStream: _stream);
+        }
         if (_bufferPool.TryRent(size, out var pooled) && pooled != null)
         {
             CuBlasNative.CheckCudaResult(
@@ -1144,11 +1176,30 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         GpuBufferSizeGuard.EnsureFits("CUDA", size, MaxBufferAllocBytes, DeviceName);
 
         using var _ = PushContext();
+        if (_asyncAlloc)
+        {
+            var pA = AllocDeviceMemoryAsync((ulong)size);
+            return new CudaGpuByteBuffer(_cudaContext, pA, size, asyncFreeStream: _stream);
+        }
         CuBlasNative.CheckCudaResult(
             CuBlasNative.cuMemAlloc(out IntPtr devicePtr, (ulong)size),
             "cuMemAlloc(byte)");
 
         return new CudaGpuByteBuffer(_cudaContext, devicePtr, size);
+    }
+
+    // Stream-ordered device allocation (#558 layer 6). On OOM, sync the context (lets pending
+    // cuMemFreeAsync reclamations complete) and retry once before surfacing the error.
+    private IntPtr AllocDeviceMemoryAsync(ulong byteSize)
+    {
+        var r = CuBlasNative.cuMemAllocAsync(out IntPtr p, byteSize, _stream);
+        if (r != CudaResult.Success)
+        {
+            CuBlasNative.cuCtxSynchronize();
+            r = CuBlasNative.cuMemAllocAsync(out p, byteSize, _stream);
+        }
+        CuBlasNative.CheckCudaResult(r, "cuMemAllocAsync");
+        return p;
     }
 
     public float[] DownloadBuffer(IGpuBuffer buffer)
@@ -13906,19 +13957,23 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         private IntPtr _context;
         private IntPtr _devicePtr;
         private readonly Action<CudaGpuBuffer>? _returnToPool;
+        private readonly IntPtr _asyncFreeStream; // non-zero ⇒ free via cuMemFreeAsync on this stream (#558 layer 6)
         private int _poolState;
 
         public int Size { get; }
         public long SizeInBytes { get; }
         public IntPtr Handle => _devicePtr;
+        internal bool IsAsyncFreed => _asyncFreeStream != IntPtr.Zero;
 
-        public CudaGpuBuffer(IntPtr context, IntPtr devicePtr, int size, Action<CudaGpuBuffer>? returnToPool = null)
+        public CudaGpuBuffer(IntPtr context, IntPtr devicePtr, int size, Action<CudaGpuBuffer>? returnToPool = null,
+            IntPtr asyncFreeStream = default)
         {
             _context = context;
             _devicePtr = devicePtr;
             Size = size;
             SizeInBytes = (long)size * sizeof(float);
             _returnToPool = returnToPool;
+            _asyncFreeStream = asyncFreeStream;
         }
 
         public void MarkRented()
@@ -13948,7 +14003,11 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                     try
                     {
                         CuBlasNative.cuCtxPushCurrent(_context);
-                        CuBlasNative.cuMemFree(_devicePtr);
+                        // Stream-ordered free (#558 layer 6): race-safe + pool-reused in stream order.
+                        if (_asyncFreeStream != IntPtr.Zero)
+                            CuBlasNative.cuMemFreeAsync(_devicePtr, _asyncFreeStream);
+                        else
+                            CuBlasNative.cuMemFree(_devicePtr);
                         CuBlasNative.cuCtxPopCurrent(out _);
                     }
                     catch
@@ -13995,17 +14054,20 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     {
         private IntPtr _context;
         private IntPtr _devicePtr;
+        private readonly IntPtr _asyncFreeStream; // #558 layer 6: free via cuMemFreeAsync when non-zero
 
         public int Size { get; }
         public long SizeInBytes { get; }
         public IntPtr Handle => _devicePtr;
+        internal bool IsAsyncFreed => _asyncFreeStream != IntPtr.Zero;
 
-        public CudaGpuByteBuffer(IntPtr context, IntPtr devicePtr, int size)
+        public CudaGpuByteBuffer(IntPtr context, IntPtr devicePtr, int size, IntPtr asyncFreeStream = default)
         {
             _context = context;
             _devicePtr = devicePtr;
             Size = size;
             SizeInBytes = size;
+            _asyncFreeStream = asyncFreeStream;
         }
 
         public void Dispose()
@@ -14025,7 +14087,11 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                     try
                     {
                         CuBlasNative.cuCtxPushCurrent(_context);
-                        CuBlasNative.cuMemFree(_devicePtr);
+                        // Stream-ordered free (#558 layer 6): race-safe + pool-reused in stream order.
+                        if (_asyncFreeStream != IntPtr.Zero)
+                            CuBlasNative.cuMemFreeAsync(_devicePtr, _asyncFreeStream);
+                        else
+                            CuBlasNative.cuMemFree(_devicePtr);
                         CuBlasNative.cuCtxPopCurrent(out _);
                     }
                     catch
