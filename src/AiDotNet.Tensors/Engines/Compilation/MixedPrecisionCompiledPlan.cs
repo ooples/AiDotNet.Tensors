@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Runtime.InteropServices;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.LinearAlgebra;
 
@@ -29,11 +30,28 @@ public sealed class MixedPrecisionCompiledPlan
     internal IReadOnlyList<ILazyNode> Order => _order;
     internal Tensor<float> Output => _output;
 
-    private MixedPrecisionCompiledPlan(IEngine engine, ILazyNode[] order, Tensor<float> output)
+    // ── FP16 activation paging (Tensors #558): store the FP32-op activations as Half between their last
+    // forward use and their backward use, freeing the float backing in between, so peak resident float
+    // memory is the working set rather than the whole activation set. This is the piece that actually
+    // realizes the resident-memory win on transformers (matmul outputs are already Half; the big FP32
+    // activations — norm/GELU/residual outputs — are what these page). Opt-in (test override or env).
+    internal static bool? PagingTestOverride;
+    private static bool PagingEnabledDefault =>
+        PagingTestOverride ?? (Environment.GetEnvironmentVariable("AIDOTNET_FP16_PAGING") == "1");
+
+    private readonly bool _paging;
+    private Dictionary<Tensor<float>, Half[]>? _halfStore;                 // dropped activations, held as Half
+    private List<Tensor<float>>[]? _pageOutAt;                             // per fwd step: page out after running it
+    private Dictionary<ILazyNode, List<Tensor<float>>>? _bwdReadByNode;    // float activations a node's backward reads
+    private Dictionary<Tensor<float>, int>? _bwdConsumerCount;            // total backward reads per activation
+
+    private MixedPrecisionCompiledPlan(IEngine engine, ILazyNode[] order, Tensor<float> output, bool paging)
     {
         _engine = engine;
         _order = order;
         _output = output;
+        _paging = paging;
+        if (_paging) BuildPagingSchedule();
     }
 
     /// <summary>
@@ -78,16 +96,143 @@ public sealed class MixedPrecisionCompiledPlan
         // Detach outputs so AsWritableSpan/AsSpan during replay don't re-trigger Realize.
         foreach (var n in order) n.ClearOutputLazySource();
 
-        return new MixedPrecisionCompiledPlan(engine, order, finalOutput);
+        return new MixedPrecisionCompiledPlan(engine, order, finalOutput, PagingEnabledDefault);
     }
 
-    /// <summary>Replay the forward: run every node's Execute into its stable buffer; return the output.</summary>
+    /// <summary>Replay the forward: run every node's Execute into its stable buffer; return the output.
+    /// With paging on, each activation is downcast to Half and its float backing freed after its last
+    /// forward use, so peak resident float = the live working set, not the whole activation set.</summary>
     public Tensor<float> Forward()
     {
         var eng = _engine;
         for (int i = 0; i < _order.Length; i++)
+        {
             RunForward(_order[i], eng);
+            if (_paging)
+                foreach (var t in _pageOutAt![i]) PageOut(t);
+        }
         return _output;
+    }
+
+    /// <summary>Backward over the captured order, with FP16 activation paging (page-in/free) when on.</summary>
+    private MixedPrecisionGraphBackward.Result RunBackward(float seedScale)
+    {
+        if (!_paging)
+            return MixedPrecisionGraphBackward.BackwardOverOrder(_order, _output, _engine, seedScale);
+
+        // Refcount backward reads; page-in before a node's backward reads an activation, free after the last.
+        var remaining = new Dictionary<Tensor<float>, int>(_bwdConsumerCount!, ReferenceEqualityComparer<Tensor<float>>.Instance);
+        return MixedPrecisionGraphBackward.BackwardOverOrder(_order, _output, _engine, seedScale,
+            onBeforeNodeBackward: node =>
+            {
+                if (_bwdReadByNode!.TryGetValue(node, out var reads))
+                    foreach (var t in reads) PageIn(t);
+            },
+            onAfterNodeBackward: node =>
+            {
+                if (_bwdReadByNode!.TryGetValue(node, out var reads))
+                    foreach (var t in reads)
+                        if (--remaining[t] == 0) FreeFloat(t);
+            });
+    }
+
+    // ── Paging schedule + primitives ──────────────────────────────────────────────────────────────
+    internal int PageOutCount { get; private set; }
+
+    private void BuildPagingSchedule()
+    {
+        _halfStore = new Dictionary<Tensor<float>, Half[]>(ReferenceEqualityComparer<Tensor<float>>.Instance);
+        _bwdConsumerCount = new Dictionary<Tensor<float>, int>(ReferenceEqualityComparer<Tensor<float>>.Instance);
+        _bwdReadByNode = new Dictionary<ILazyNode, List<Tensor<float>>>(ReferenceEqualityComparer<ILazyNode>.Instance);
+        int n = _order.Length;
+        _pageOutAt = new List<Tensor<float>>[n];
+        for (int i = 0; i < n; i++) _pageOutAt[i] = new List<Tensor<float>>();
+
+        // Intermediate float activations (node outputs), excluding the loss.
+        var floatOutputs = new HashSet<Tensor<float>>(ReferenceEqualityComparer<Tensor<float>>.Instance);
+        foreach (var node in _order)
+        {
+            var o = FloatOutputOf(node);
+            if (o is not null && !ReferenceEquals(o, _output)) floatOutputs.Add(o);
+        }
+
+        var lastFwdUse = new Dictionary<Tensor<float>, int>(ReferenceEqualityComparer<Tensor<float>>.Instance);
+        for (int i = 0; i < n; i++)
+        {
+            var node = _order[i];
+            foreach (var t in FloatInputsOf(node))
+                if (floatOutputs.Contains(t)) lastFwdUse[t] = i;
+
+            List<Tensor<float>>? reads = null;
+            foreach (var t in BwdReadsFloat(node))
+            {
+                if (!floatOutputs.Contains(t)) continue;
+                (reads ??= new List<Tensor<float>>()).Add(t);
+                _bwdConsumerCount[t] = (_bwdConsumerCount.TryGetValue(t, out var c) ? c : 0) + 1;
+            }
+            if (reads is not null) _bwdReadByNode[node] = reads;
+        }
+
+        // Page out an activation after its last forward use — only if its backward actually reads it.
+        foreach (var kv in lastFwdUse)
+            if (_bwdConsumerCount.TryGetValue(kv.Key, out var c) && c > 0)
+                _pageOutAt[kv.Value].Add(kv.Key);
+    }
+
+    private static Tensor<float>? FloatOutputOf(ILazyNode node) => node switch
+    {
+        LazyNode<float> lf => lf.Output,
+        CrossTypeLazyNode<Half, float> up => up.Output,
+        _ => null
+    };
+
+    private static IEnumerable<Tensor<float>> FloatInputsOf(ILazyNode node)
+    {
+        switch (node)
+        {
+            case LazyNode<float> lf:
+                foreach (var t in lf.GetInputsArray()) yield return t;
+                break;
+            case CrossTypeLazyNode<float, Half> down:
+                yield return down.Input;
+                break;
+        }
+    }
+
+    // Only LazyNode<float> backward reads float activations (its inputs + output). Cross-type backwards
+    // just cast gradients; LazyNode<Half> backwards read Half (already small, not paged).
+    private static IEnumerable<Tensor<float>> BwdReadsFloat(ILazyNode node)
+    {
+        if (node is LazyNode<float> lf)
+        {
+            foreach (var t in lf.GetInputsArray()) yield return t;
+            yield return lf.Output;
+        }
+    }
+
+    private void PageOut(Tensor<float> t)
+    {
+        if (_halfStore!.ContainsKey(t)) return;
+        var span = t.AsSpan();
+        var h = new Half[span.Length];
+        for (int i = 0; i < span.Length; i++) h[i] = (Half)span[i];
+        if (t.TryDropStorageForStreaming()) { _halfStore[t] = h; PageOutCount++; }
+        // else: shared/view storage — can't drop safely; leave float resident (discard h).
+    }
+
+    private void PageIn(Tensor<float> t)
+    {
+        if (!_halfStore!.TryGetValue(t, out var h)) return; // already float-resident
+        var f = new float[h.Length];
+        for (int i = 0; i < h.Length; i++) f[i] = (float)h[i];
+        t.RestoreStorageFromBytes(MemoryMarshal.AsBytes(f.AsSpan()));
+        _halfStore.Remove(t);
+    }
+
+    private void FreeFloat(Tensor<float> t)
+    {
+        // After the last backward read the activation is float-resident (paged in) and never read again.
+        if (!_halfStore!.ContainsKey(t)) t.TryDropStorageForStreaming();
     }
 
     /// <summary>
@@ -98,7 +243,7 @@ public sealed class MixedPrecisionCompiledPlan
     /// <see cref="MixedPrecisionGraphBackward.BackwardOverOrder"/>.
     /// </summary>
     internal MixedPrecisionGraphBackward.Result Backward()
-        => MixedPrecisionGraphBackward.BackwardOverOrder(_order, _output, _engine);
+        => RunBackward(1f);
 
     /// <summary>Outcome of one <see cref="Step"/>: the (unscaled) loss value and whether FP16 overflowed.</summary>
     public readonly struct StepResult
@@ -124,7 +269,7 @@ public sealed class MixedPrecisionCompiledPlan
         float loss = _output.Length > 0 ? _output.ToArray()[0] : 0f;
 
         float scale = scaler?.Scale ?? 1f;
-        var grads = MixedPrecisionGraphBackward.BackwardOverOrder(_order, _output, eng, scale);
+        var grads = RunBackward(scale);
         float invScale = 1f / scale;
 
         // Collect each param's grad (FP32 master space), unscale, check finiteness.
@@ -185,7 +330,7 @@ public sealed class MixedPrecisionCompiledPlan
         float loss = _output.Length > 0 ? _output.ToArray()[0] : 0f;
 
         float scale = scaler?.Scale ?? 1f;
-        var grads = MixedPrecisionGraphBackward.BackwardOverOrder(_order, _output, eng, scale);
+        var grads = RunBackward(scale);
         float invScale = 1f / scale;
 
         var pgrads = new Tensor<float>[parameters.Count];

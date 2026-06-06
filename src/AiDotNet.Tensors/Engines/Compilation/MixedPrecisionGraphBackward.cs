@@ -63,7 +63,8 @@ internal static class MixedPrecisionGraphBackward
     /// <see cref="MixedPrecisionCompiledPlan"/>, whose captured order survives lazy-source detachment
     /// (so it can't re-topo from <c>loss.LazySource</c>). Single source of the per-node backward dispatch.
     /// </summary>
-    internal static Result BackwardOverOrder(IReadOnlyList<ILazyNode> producersFirstOrder, Tensor<float> lossOutput, IEngine engine, float seedScale = 1f)
+    internal static Result BackwardOverOrder(IReadOnlyList<ILazyNode> producersFirstOrder, Tensor<float> lossOutput, IEngine engine, float seedScale = 1f,
+        Action<ILazyNode>? onBeforeNodeBackward = null, Action<ILazyNode>? onAfterNodeBackward = null)
     {
         var fp32 = new Dictionary<Tensor<float>, Tensor<float>>(ReferenceEqualityComparer<Tensor<float>>.Instance);
         var fp16 = new Dictionary<Tensor<Half>, Tensor<Half>>(ReferenceEqualityComparer<Tensor<Half>>.Instance);
@@ -76,6 +77,9 @@ internal static class MixedPrecisionGraphBackward
 
         for (int i = producersFirstOrder.Count - 1; i >= 0; i--)
         {
+            // FP16 activation paging hook: restore (upcast) this node's paged activations before its
+            // backward reads them (MixedPrecisionCompiledPlan.PageIn); free them again after (PageOut).
+            onBeforeNodeBackward?.Invoke(producersFirstOrder[i]);
             switch (producersFirstOrder[i])
             {
                 case LazyNode<float> lf:
@@ -100,6 +104,7 @@ internal static class MixedPrecisionGraphBackward
                     break;
                 // Other cross-type nodes (e.g. Complex FFT) are forward-only here — no grad edge.
             }
+            onAfterNodeBackward?.Invoke(producersFirstOrder[i]);
         }
 
         return new Result(fp32, fp16);
