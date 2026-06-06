@@ -63,15 +63,16 @@ internal static class MixedPrecisionGraphBackward
     /// <see cref="MixedPrecisionCompiledPlan"/>, whose captured order survives lazy-source detachment
     /// (so it can't re-topo from <c>loss.LazySource</c>). Single source of the per-node backward dispatch.
     /// </summary>
-    internal static Result BackwardOverOrder(IReadOnlyList<ILazyNode> producersFirstOrder, Tensor<float> lossOutput, IEngine engine)
+    internal static Result BackwardOverOrder(IReadOnlyList<ILazyNode> producersFirstOrder, Tensor<float> lossOutput, IEngine engine, float seedScale = 1f)
     {
         var fp32 = new Dictionary<Tensor<float>, Tensor<float>>(ReferenceEqualityComparer<Tensor<float>>.Instance);
         var fp16 = new Dictionary<Tensor<Half>, Tensor<Half>>(ReferenceEqualityComparer<Tensor<Half>>.Instance);
 
-        // Seed dL/dL = ones (FP32).
-        var ones = new float[lossOutput.Length];
-        for (int i = 0; i < ones.Length; i++) ones[i] = 1f;
-        fp32[lossOutput] = new Tensor<float>(ones, lossOutput._shape);
+        // Seed dL/dL = seedScale (ones, optionally pre-multiplied by the loss scale so small FP16
+        // gradients stay representable — see GradScaler; default 1 = unscaled).
+        var seed = new float[lossOutput.Length];
+        for (int i = 0; i < seed.Length; i++) seed[i] = seedScale;
+        fp32[lossOutput] = new Tensor<float>(seed, lossOutput._shape);
 
         for (int i = producersFirstOrder.Count - 1; i >= 0; i--)
         {

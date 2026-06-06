@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Engines.Compilation;
@@ -72,6 +73,68 @@ internal sealed class MixedPrecisionCompiledPlan
     /// </summary>
     public MixedPrecisionGraphBackward.Result Backward()
         => MixedPrecisionGraphBackward.BackwardOverOrder(_order, _output, _engine);
+
+    /// <summary>Outcome of one <see cref="Step"/>: the (unscaled) loss value and whether FP16 overflowed.</summary>
+    public readonly struct StepResult
+    {
+        public readonly float Loss;
+        public readonly bool FoundInfNan;
+        public StepResult(float loss, bool infNan) { Loss = loss; FoundInfNan = infNan; }
+    }
+
+    /// <summary>
+    /// Phase C — one compiled mixed-precision training step: replay forward, scaled mixed-dtype backward,
+    /// SGD update on the FP32 master <paramref name="parameters"/>. With a <paramref name="scaler"/> the
+    /// backward seed is loss-scaled and grads are unscaled in FP32 (cannot re-underflow); on FP16 overflow
+    /// the optimizer step is SKIPPED and the scaler backs off (Micikevicius et al. AMP). Returns the
+    /// (unscaled) scalar loss and the overflow flag. The plan output must be the scalar loss.
+    /// </summary>
+    public StepResult Step(IReadOnlyList<Tensor<float>> parameters, float learningRate, GradScaler? scaler = null)
+    {
+        if (parameters is null) throw new ArgumentNullException(nameof(parameters));
+        var eng = _engine;
+
+        Forward();
+        float loss = _output.Length > 0 ? _output.ToArray()[0] : 0f;
+
+        float scale = scaler?.Scale ?? 1f;
+        var grads = MixedPrecisionGraphBackward.BackwardOverOrder(_order, _output, eng, scale);
+        float invScale = 1f / scale;
+
+        // Collect each param's grad (FP32 master space), unscale, check finiteness.
+        var pgrads = new Tensor<float>[parameters.Count];
+        bool infNan = false;
+        for (int i = 0; i < parameters.Count; i++)
+        {
+            var p = parameters[i];
+            Tensor<float>? g = grads.Fp32.TryGetValue(p, out var gf) ? gf : null;
+            if (g is null) continue; // param not on the path this step
+            var span = g.AsWritableSpan();
+            for (int k = 0; k < span.Length; k++)
+            {
+                span[k] *= invScale;
+                if (float.IsNaN(span[k]) || float.IsInfinity(span[k])) infNan = true;
+            }
+            pgrads[i] = g;
+        }
+
+        // Skip the update on overflow so a corrupted (inf/nan) gradient never touches the master weights.
+        if (!infNan)
+        {
+            for (int i = 0; i < parameters.Count; i++)
+            {
+                var g = pgrads[i];
+                if (g is null) continue;
+                var w = parameters[i].AsWritableSpan();
+                var gs = g.AsSpan();
+                for (int k = 0; k < w.Length; k++) w[k] -= learningRate * gs[k];
+                parameters[i].IncrementVersion();
+            }
+        }
+
+        scaler?.Update(infNan);
+        return new StepResult(loss, infNan);
+    }
 
     private static void RunForward(ILazyNode node, IEngine eng)
     {
