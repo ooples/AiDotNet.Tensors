@@ -63,6 +63,16 @@ internal sealed class MixedPrecisionCompiledPlan
         return _output;
     }
 
+    /// <summary>
+    /// Phase B — compiled mixed-dtype backward. Reverse pass over the captured node order (no re-topo,
+    /// and it works after <see cref="Compile"/> detached the lazy sources), seeding dL/dL=ones at the
+    /// plan output. Returns the FP32 + FP16 gradient maps. Forward must have been replayed first so the
+    /// activations are current. Delegates to the single shared dispatch in
+    /// <see cref="MixedPrecisionGraphBackward.BackwardOverOrder"/>.
+    /// </summary>
+    public MixedPrecisionGraphBackward.Result Backward()
+        => MixedPrecisionGraphBackward.BackwardOverOrder(_order, _output, _engine);
+
     private static void RunForward(ILazyNode node, IEngine eng)
     {
         switch (node)

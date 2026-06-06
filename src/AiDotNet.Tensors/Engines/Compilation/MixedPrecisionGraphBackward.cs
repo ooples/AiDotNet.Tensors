@@ -46,24 +46,36 @@ internal static class MixedPrecisionGraphBackward
         if (loss is null) throw new ArgumentNullException(nameof(loss));
         engine ??= AiDotNetEngine.Current;
 
-        var fp32 = new Dictionary<Tensor<float>, Tensor<float>>(ReferenceEqualityComparer<Tensor<float>>.Instance);
-        var fp16 = new Dictionary<Tensor<Half>, Tensor<Half>>(ReferenceEqualityComparer<Tensor<Half>>.Instance);
-
         if (loss.LazySource is not ILazyNode root)
-            return new Result(fp32, fp16); // nothing recorded — loss is a leaf
-
-        // Seed dL/dL = ones (FP32).
-        var ones = new float[loss.Length];
-        for (int i = 0; i < ones.Length; i++) ones[i] = 1f;
-        fp32[loss] = new Tensor<float>(ones, loss._shape);
+            return new Result(
+                new Dictionary<Tensor<float>, Tensor<float>>(ReferenceEqualityComparer<Tensor<float>>.Instance),
+                new Dictionary<Tensor<Half>, Tensor<Half>>(ReferenceEqualityComparer<Tensor<Half>>.Instance));
 
         // Producers-first topological order via iterative post-order DFS (graphs can be deep —
         // avoid recursion). Reverse of this list is consumers-first = correct backward order.
         var topo = TopoOrder(root);
+        return BackwardOverOrder(topo, loss, engine);
+    }
 
-        for (int i = topo.Count - 1; i >= 0; i--)
+    /// <summary>
+    /// Reverse pass over a PRE-COMPUTED producers-first node order, seeding dL/dL = ones at
+    /// <paramref name="lossOutput"/>. Shared by the topo-from-loss <see cref="Backward"/> and by
+    /// <see cref="MixedPrecisionCompiledPlan"/>, whose captured order survives lazy-source detachment
+    /// (so it can't re-topo from <c>loss.LazySource</c>). Single source of the per-node backward dispatch.
+    /// </summary>
+    internal static Result BackwardOverOrder(IReadOnlyList<ILazyNode> producersFirstOrder, Tensor<float> lossOutput, IEngine engine)
+    {
+        var fp32 = new Dictionary<Tensor<float>, Tensor<float>>(ReferenceEqualityComparer<Tensor<float>>.Instance);
+        var fp16 = new Dictionary<Tensor<Half>, Tensor<Half>>(ReferenceEqualityComparer<Tensor<Half>>.Instance);
+
+        // Seed dL/dL = ones (FP32).
+        var ones = new float[lossOutput.Length];
+        for (int i = 0; i < ones.Length; i++) ones[i] = 1f;
+        fp32[lossOutput] = new Tensor<float>(ones, lossOutput._shape);
+
+        for (int i = producersFirstOrder.Count - 1; i >= 0; i--)
         {
-            switch (topo[i])
+            switch (producersFirstOrder[i])
             {
                 case LazyNode<float> lf:
                     RunSingleType(lf.Output, lf.BackwardFn, lf.GetInputsArray, lf.SavedState, fp32, engine);
