@@ -19155,13 +19155,25 @@ public partial class CpuEngine : ITensorLevelEngine
         for (int i = 0; i < axis; i++) outerSize *= output._shape[i];
         for (int i = axis + 1; i < rank; i++) innerSize *= output._shape[i];
 
+        // Logical element count == product(output._shape) == outerSize*axisSize*innerSize. A GPU-origin
+        // tensor can carry a backing array (or a view into a bigger buffer) PADDED to a power of two, so
+        // GetFlattenedData().Length may EXCEED the logical count. The result gradient must have the logical
+        // shape (Rent below validates data.Length == shape total), and the kernels index row*axisSize within
+        // [0,total) — so re-materialize the logical contiguous elements via ToArray() (respects
+        // shape/strides/offset) whenever the raw backing is longer, and allocate the result at `total`.
+        // (Re-applies 4c23f5f, which a later merge on this branch dropped — the padded backing crashed eager
+        // SoftmaxBackward on the GPU fused→eager fallback: "Data length 1048576 must match shape total 983040".)
+        int total = outerSize * axisSize * innerSize;
+
 #if NET5_0_OR_GREATER
         // Float SIMD fast path for last-axis softmax backward (innerSize == 1)
         if (typeof(T) == typeof(float) && innerSize == 1
-            && gradOutput.GetFlattenedData() is float[] gOutF
-            && output.GetFlattenedData() is float[] outF)
+            && gradOutput.GetFlattenedData() is float[] gOutF0
+            && output.GetFlattenedData() is float[] outF0)
         {
-            var gInF = new float[outF.Length];
+            var gOutF = gOutF0.Length == total ? gOutF0 : (float[])(object)gradOutput.ToArray();
+            var outF = outF0.Length == total ? outF0 : (float[])(object)output.ToArray();
+            var gInF = new float[total];
             SoftmaxBackwardFloat(gOutF, outF, gInF, outerSize, axisSize);
             return (Tensor<T>)(object)TensorAllocator.Rent<T>(output._shape, (T[])(object)gInF);
         }
@@ -19173,10 +19185,12 @@ public partial class CpuEngine : ITensorLevelEngine
         // (4 doubles per Vector256, vs 8 floats). Falls through to scalar
         // when AVX/FMA aren't available (net471 / non-x86).
         if (typeof(T) == typeof(double) && innerSize == 1
-            && gradOutput.GetFlattenedData() is double[] gOutD
-            && output.GetFlattenedData() is double[] outD)
+            && gradOutput.GetFlattenedData() is double[] gOutD0
+            && output.GetFlattenedData() is double[] outD0)
         {
-            var gInD = new double[outD.Length];
+            var gOutD = gOutD0.Length == total ? gOutD0 : (double[])(object)gradOutput.ToArray();
+            var outD = outD0.Length == total ? outD0 : (double[])(object)output.ToArray();
+            var gInD = new double[total];
             bool useParallel = outerSize >= 4 && (long)outerSize * axisSize >= 32768;
             int axisSz = axisSize;
             Action<int> rowKernel = row => SoftmaxBackwardDoubleRow(gOutD, outD, gInD, row, axisSz);
@@ -19191,7 +19205,9 @@ public partial class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         var gradOutputData = gradOutput.GetFlattenedData();
         var outputData = output.GetFlattenedData();
-        var gradInputData = new T[outputData.Length];
+        if (gradOutputData.Length != total) gradOutputData = gradOutput.ToArray();
+        if (outputData.Length != total) outputData = output.ToArray();
+        var gradInputData = new T[total];
 
         CpuParallelSettings.ParallelForOrSerial(0, outerSize * innerSize, (long)outerSize * innerSize * axisSize, idx =>
         {
