@@ -44,6 +44,7 @@ public sealed class MixedPrecisionCompiledPlan
     private List<Tensor<float>>[]? _pageOutAt;                             // per fwd step: page out after running it
     private Dictionary<ILazyNode, List<Tensor<float>>>? _bwdReadByNode;    // float activations a node's backward reads
     private Dictionary<Tensor<float>, int>? _bwdConsumerCount;            // total backward reads per activation
+    private HashSet<Tensor<float>>? _droppedThisStep;                     // storage freed this step; restore next Forward
 
     private MixedPrecisionCompiledPlan(IEngine engine, ILazyNode[] order, Tensor<float> output, bool paging)
     {
@@ -105,6 +106,7 @@ public sealed class MixedPrecisionCompiledPlan
     public Tensor<float> Forward()
     {
         var eng = _engine;
+        if (_paging) RestoreDroppedForReplay(); // re-give storage to activations paged out on the prior step
         for (int i = 0; i < _order.Length; i++)
         {
             RunForward(_order[i], eng);
@@ -112,6 +114,17 @@ public sealed class MixedPrecisionCompiledPlan
                 foreach (var t in _pageOutAt![i]) PageOut(t);
         }
         return _output;
+    }
+
+    // A paged-out activation's storage was freed last step; the next Forward re-executes into it, so it
+    // needs allocated storage again. The data is overwritten by Execute, so restore with zeros (cheap).
+    private void RestoreDroppedForReplay()
+    {
+        if (_droppedThisStep!.Count == 0) return;
+        foreach (var t in _droppedThisStep)
+            t.RestoreStorageFromBytes(new byte[(long)t.Length * sizeof(float)]);
+        _droppedThisStep.Clear();
+        _halfStore!.Clear();
     }
 
     /// <summary>Backward over the captured order, with FP16 activation paging (page-in/free) when on.</summary>
@@ -142,6 +155,7 @@ public sealed class MixedPrecisionCompiledPlan
     private void BuildPagingSchedule()
     {
         _halfStore = new Dictionary<Tensor<float>, Half[]>(ReferenceEqualityComparer<Tensor<float>>.Instance);
+        _droppedThisStep = new HashSet<Tensor<float>>(ReferenceEqualityComparer<Tensor<float>>.Instance);
         _bwdConsumerCount = new Dictionary<Tensor<float>, int>(ReferenceEqualityComparer<Tensor<float>>.Instance);
         _bwdReadByNode = new Dictionary<ILazyNode, List<Tensor<float>>>(ReferenceEqualityComparer<ILazyNode>.Instance);
         int n = _order.Length;
@@ -216,7 +230,7 @@ public sealed class MixedPrecisionCompiledPlan
         var span = t.AsSpan();
         var h = new Half[span.Length];
         for (int i = 0; i < span.Length; i++) h[i] = (Half)span[i];
-        if (t.TryDropStorageForStreaming()) { _halfStore[t] = h; PageOutCount++; }
+        if (t.TryDropStorageForStreaming()) { _halfStore[t] = h; _droppedThisStep!.Add(t); PageOutCount++; }
         // else: shared/view storage — can't drop safely; leave float resident (discard h).
     }
 
@@ -232,7 +246,7 @@ public sealed class MixedPrecisionCompiledPlan
     private void FreeFloat(Tensor<float> t)
     {
         // After the last backward read the activation is float-resident (paged in) and never read again.
-        if (!_halfStore!.ContainsKey(t)) t.TryDropStorageForStreaming();
+        if (!_halfStore!.ContainsKey(t) && t.TryDropStorageForStreaming()) _droppedThisStep!.Add(t);
     }
 
     /// <summary>
