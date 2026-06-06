@@ -76,6 +76,16 @@ End-to-end GPU measurement through the fused-Adam path on the cortex (d512/L6/B6
 
 **Status correction:** the mixed-dtype autograd engine, compiled plan (A–D), Adam, and routing (E) are built, tested, and train correctly — but the headline **resident-memory win is unachieved** and needs the FP16-storage-aware-FP32-ops work above. The `AIDOTNET_FP16_ACTIVATIONS` flag stays OFF by default; nothing regresses, but it should not be presented as a memory win yet.
 
+## ⚠️ SECOND GPU FINDING — CPU-storage activation paging does NOT free GPU activation memory
+
+Built `SaveFp16` (the FP16 activation-storage recipe) + a full **CPU activation-paging** scheduler in `MixedPrecisionCompiledPlan` (`AIDOTNET_FP16_PAGING`): page each FP32-op activation to Half after its last forward use (`TryDropStorageForStreaming`), upcast on demand in backward (`RestoreStorageFromBytes`), refcounted free. It is **CPU-correct and transparent** (gradients match within FP16; multi-step replay works — `MixedPrecisionPagingTests`).
+
+But GPU measurement on the cortex shows it does **NOT** reduce GPU VRAM (5918 vs 4671 FP32, and ~10× slower). Root cause: on a CUDA backend the dominant activation memory lives in **DirectGpu's GPU-buffer activation cache** (`_activationCache`, evicted by VRAM cap), NOT in the `Tensor`'s CPU `_data` that `DropStorageForStreaming` frees. So CPU-storage paging frees host storage the cortex isn't bottlenecked on, while the GPU buffers stay resident — and `RestoreStorageFromBytes` adds host allocations + CPU↔GPU thrash each step.
+
+**What the GPU memory win actually requires:** FP16 compression at the **GPU-buffer level**, integrated with the DirectGpu activation cache — store evicted/retained activation buffers as FP16 on-device (or Half host-offload) and upcast in the backward kernel. That is a DirectGpu-activation-cache change, distinct from both the autograd-graph dtype and the CPU saved-tensor paging. The CPU paging IS a real memory lever for **CPU** training; the GPU path needs this additional layer.
+
+**Net honest status:** FP16 *compute* on matmuls works; FP16 activation-storage *format* + *CPU paging* work and are tested; the **GPU resident-memory win remains unachieved** and is now precisely localized to the DirectGpu activation-cache layer. All flags OFF by default; nothing regresses.
+
 ## Test gate (non-negotiable, every phase)
 - `LayerNormGradientCheckTests`-style finite-diff vs analytic, extended to the mixed-precision node.
 - Resident-memory measurement via `opt-parity LEAKPROBE` (no HE rebuild).
