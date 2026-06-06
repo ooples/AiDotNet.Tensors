@@ -19,7 +19,7 @@ namespace AiDotNet.Tensors.Engines.Compilation;
 /// into a matching replayable pass; C adds the optimizer + loss scaling; D/E take it to GPU + AiDotNet.
 /// Gated behind <c>AIDOTNET_FP16_ACTIVATIONS</c>; the default FP32 fused path is untouched.</para>
 /// </summary>
-internal sealed class MixedPrecisionCompiledPlan
+public sealed class MixedPrecisionCompiledPlan
 {
     private readonly IEngine _engine;
     private readonly ILazyNode[] _order;   // producers-first topological order
@@ -34,6 +34,32 @@ internal sealed class MixedPrecisionCompiledPlan
         _engine = engine;
         _order = order;
         _output = output;
+    }
+
+    /// <summary>
+    /// Public entry point (Phase E): trace <paramref name="forward"/> under an FP16 autocast scope with
+    /// activation storage forced on, then compile the resulting mixed-dtype graph. The delegate builds the
+    /// loss by calling ordinary engine ops on the parameter/input tensors (matmuls auto-emit FP16
+    /// activations); it must return the scalar loss tensor. The caller then drives training via
+    /// <see cref="Step"/>. This is the surface AiDotNet's training path calls — it manages the internal
+    /// GraphMode / AutocastScope / activation-storage flag so external callers don't touch internals.
+    /// </summary>
+    public static MixedPrecisionCompiledPlan Trace(Func<Tensor<float>> forward, IEngine? engine = null)
+    {
+        if (forward is null) throw new ArgumentNullException(nameof(forward));
+        engine ??= AiDotNetEngine.Current;
+
+        var scope = new LazyTensorScope(null);
+        var prevForce = MixedPrecisionEmit.TestOverrideEnabled;
+        MixedPrecisionEmit.TestOverrideEnabled = true; // force FP16 activation emission for this trace
+        Tensor<float> loss;
+        using (new Gpu.AutocastScope(Gpu.PrecisionMode.Float16))
+        {
+            GraphMode.SetCurrent(scope);
+            try { loss = forward(); }
+            finally { GraphMode.SetCurrent(null); MixedPrecisionEmit.TestOverrideEnabled = prevForce; }
+        }
+        return Compile(loss, engine);
     }
 
     /// <summary>
@@ -71,7 +97,7 @@ internal sealed class MixedPrecisionCompiledPlan
     /// activations are current. Delegates to the single shared dispatch in
     /// <see cref="MixedPrecisionGraphBackward.BackwardOverOrder"/>.
     /// </summary>
-    public MixedPrecisionGraphBackward.Result Backward()
+    internal MixedPrecisionGraphBackward.Result Backward()
         => MixedPrecisionGraphBackward.BackwardOverOrder(_order, _output, _engine);
 
     /// <summary>Outcome of one <see cref="Step"/>: the (unscaled) loss value and whether FP16 overflowed.</summary>
