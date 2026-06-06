@@ -66,6 +66,16 @@ The mixed-dtype mechanism AND the memory win are done via the lazy-graph path. W
 
 Phases A–D landed (CPU + GPU verified) behind `AIDOTNET_FP16_ACTIVATIONS`; default FP32 fused path byte-identical. **Phase E** (public API + AiDotNet wiring + GPU validation through the high-level path) is the remaining cross-repo step.
 
+## ⚠️ CRITICAL FINDING (GPU validation on the real cortex) — the net memory win is NOT yet realized
+
+End-to-end GPU measurement through the fused-Adam path on the cortex (d512/L6/B64) shows the mixed path **uses MORE VRAM, not less**: FP32 = 4671 MiB, FP16-activations = 5712 MiB (after the consecutive-op FP16-reuse fix; 5745 before). Training is correct (engages, descends, 0 NaN) — but the memory goal fails.
+
+**Root cause:** the earlier "0.500×" was measured on a *pure matmul stack*, which is unrepresentative. A real transformer separates matmuls with **FP32 ops** (LayerNorm, softmax, GELU, residual add). Each matmul's output is up-cast to FP32 and consumed by the next FP32 op, which **saves that FP32 tensor for its own backward** — so the dominant saved activation stays FP32. Emitting the matmul output as Half merely adds *transient* Half buffers (down-cast inputs + Half matmul output) on top of the still-resident FP32 activation → net footprint rises. The `ToFp16Input` reuse only helps for *directly consecutive* matmuls, which transformers rarely have.
+
+**What the win actually requires (much larger, pervasive):** the FP32 ops between matmuls (norm/softmax/GELU/residual) must become **FP16-storage-aware** — read a Half input, up-cast internally only for their FP32 math, and **save the Half (not FP32) for backward** — so the activation chain stays Half end-to-end. That is an op-by-op change across the whole eligible surface, not a matmul-emission tweak. Until then, `AIDOTNET_FP16_ACTIVATIONS` delivers FP16 *compute* on matmuls (Tensor Cores) but **not** the resident-memory reduction.
+
+**Status correction:** the mixed-dtype autograd engine, compiled plan (A–D), Adam, and routing (E) are built, tested, and train correctly — but the headline **resident-memory win is unachieved** and needs the FP16-storage-aware-FP32-ops work above. The `AIDOTNET_FP16_ACTIVATIONS` flag stays OFF by default; nothing regresses, but it should not be presented as a memory win yet.
+
 ## Test gate (non-negotiable, every phase)
 - `LayerNormGradientCheckTests`-style finite-diff vs analytic, extended to the mixed-precision node.
 - Resident-memory measurement via `opt-parity LEAKPROBE` (no HE rebuild).
