@@ -553,6 +553,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             ? null
             : engine as AiDotNet.Tensors.Engines.DirectGpuTensorEngine;
         evictGuard?.SuspendActivationEviction();
+        // FP16 mixed precision on the FUSED path (AiDotNet #1354 / #555). The fused plan
+        // ignores AiDotNet's _mixedPrecisionContext, but the Tensors-level AutocastScope is
+        // honored by the engine's matmul/conv/elementwise GPU ops (norms, softmax, loss and
+        // reductions deliberately stay FP32 — see AutocastScope._fp16AllowedOps). Activating
+        // it for the step's forward+backward runs the dominant matmuls on FP16 Tensor Cores.
+        // Opt-in via AIDOTNET_AUTOCAST=fp16 (EnableFromEnvironment); the optimizer update's
+        // Adam/SGD ops aren't in the allowlist, so master weights/moments stay FP32.
+        using var _autocast = AiDotNet.Tensors.Engines.Gpu.AutocastScope.EnableFromEnvironment();
         try
         {
         // Two independent profile surfaces: PR #352's per-step
