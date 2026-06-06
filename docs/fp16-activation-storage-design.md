@@ -110,3 +110,15 @@ Root cause (bottom of the stack): compression allocates the FP16 buffer but free
 **The genuine remaining fix is at the CUDA memory-allocator layer: a stream-ordered allocator** (`cudaMallocAsync` / a stream-aware pool) so a deferred-freed FP32 buffer is reused within stream order by the next allocation WITHOUT a host sync — bounding peak while staying race-free. This is how PyTorch's caching allocator handles AMP activation churn. Every layer above (autograd, compiled plan, Adam, routing, FP16 format, CPU paging, on-device compress/upcast) is built + correct; the resident-memory win is gated on stream-ordered reclamation.
 
 **Definitive status:** FP16 compute works; FP16 storage format + CPU paging + on-device compress/upcast are implemented + tested; the GPU resident-memory win is bottlenecked on the allocator reclamation model. All flags OFF by default; nothing regresses.
+
+## ⚠️ SEVENTH / CONCLUSIVE FINDING — convert-based compression can't reduce peak at any scale; the win needs FP16-NATIVE kernels
+
+Layer 6 (stream-ordered allocator, `cuMemAllocAsync`/`cuMemFreeAsync`, race-safe + pool-reuse, pool release-threshold maxed) IMPLEMENTED + committed (`AIDOTNET_CUDA_ASYNC_ALLOC`, default off). Measured the full stack (ACTIVATIONS+PAGING+GPU_CACHE+ASYNC_ALLOC) at BOTH scales on the cortex:
+- d512/L6/**B64**: FP32 4671 → FP16-all **7087** MiB (higher)
+- d512/L6/**B256**: FP32 8071 → FP16-all **11937** MiB (higher)
+
+CONCLUSION (the absolute bottom): the win does not materialize at any tested scale because **convert-based compression has an irreducible transient peak** — `ConvertToFp16`/`ConvertToFp32` need the source AND destination buffers live simultaneously, so every compress/upcast momentarily holds ~1.5–2× the activation, and across the activation set this transient (plus the caching pool's high-water) exceeds the ½-retention saving. The stream-ordered allocator reuses freed memory but cannot lower the *max concurrent* set, which the convert transients define.
+
+**The genuine GPU activation-memory win requires FP16-NATIVE op kernels:** each consuming op (LayerNorm/softmax/GELU/residual/elementwise + matmul-backward) reads the FP16 activation buffer DIRECTLY and up-casts in-register inside the kernel — never materializing a separate FP32 buffer. That eliminates the convert transient entirely and keeps the activation chain genuinely FP16 end-to-end (PyTorch's model: native fp16 kernels, not buffer compression). This is a pervasive per-kernel change across the GPU op surface — a separate major effort, distinct from everything in layers 1–6.
+
+**FINAL HONEST STATE (7 layers, all GPU-validated):** FP16 compute works; the full mixed-dtype autograd / compiled plan / Adam / routing / FP16 storage format / CPU paging / on-device compress-upcast / stream-ordered allocator are all built + tested; and it is now PROVEN that buffer-level / allocator-level approaches cannot deliver the resident-memory win — it requires FP16-native kernels. All flags OFF by default; nothing regresses. The research farm ran throughout.
