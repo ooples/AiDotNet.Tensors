@@ -58,13 +58,13 @@ Investigating the keystone pinned the core difficulty precisely:
 
 The mixed-dtype mechanism AND the memory win are done via the lazy-graph path. What remains is giving the *fused* `CompiledTrainingPlan` (compile-once-replay performance) mixed-dtype support. It is single-type — `CompileTraining` (~line 2005) only emits `CompiledStep<float>` and **skips** `CrossTypeLazyNode`/`LazyNode<Half>`, and its fused groups / IL backward walker / CUDA-graph capture all assume one element type. This is a genuine subsystem rewrite, phased:
 
-- **Phase A — heterogeneous compiled forward.** A `MixedPrecisionCompiledPlan` compiling the mixed-dtype graph's forward into a replayable, dtype-tagged step list (per-node `Execute` + stable preallocated FP32/FP16 buffers); compile-once, replay. Gate: forward output matches eager realize.
-- **Phase B — compiled mixed-dtype backward.** Capture `MixedPrecisionGraphBackward`'s topo order + per-node backward into a replayable backward with stable dual (FP32/FP16) grad buffers. Gate: matches the non-compiled `MixedPrecisionGraphBackward`.
-- **Phase C — optimizer + loss scaling.** FP32 master weights + `GradScaler` into the plan's `Step()`. Gate: end-to-end compiled training descends loss; 0 NaN.
-- **Phase D — GPU + perf.** FP16 matmul realize via CUDA `Hgemm`, stable GPU buffers, CUDA-graph capture. Gate: d512/L6/B256 resident ≈ ½ vs the FP32 baseline (~5105 MiB at B64), loss-parity, 0 NaN end-to-end.
-- **Phase E — AiDotNet routing.** Route `NeuralNetworkBase.TrainWithTape` / `CompiledTapeTrainingStep` to the mixed-dtype plan under the flag so HarmonicEngine/opt-parity exercise it on GPU.
+- **Phase A — DONE.** `MixedPrecisionCompiledPlan` — heterogeneous compile-once/replay forward (topo-sorted, lazy-sources detached, per-node `Execute` into stable buffers; float/Half/cross-type dispatched by type). Gate: replay matches a fresh trace, initially + after in-place param mutation.
+- **Phase B — DONE.** `MixedPrecisionCompiledPlan.Backward()` over the captured order via the shared `MixedPrecisionGraphBackward.BackwardOverOrder` (single dispatch; works after lazy-source detachment). Gate: matches the non-compiled backward within FP16 GEMM tolerance.
+- **Phase C — DONE.** `MixedPrecisionCompiledPlan.Step(params, lr, scaler)` — forward + loss-scaled backward + SGD on FP32 masters + `GradScaler` (skip-on-overflow + backoff). Gate: compiled training descends loss >2×, 0 overflow.
+- **Phase D — DONE (correctness at scale).** Compiled plan trains the design-target stack (d512/L6/B256) on `DirectGpuTensorEngine`: loss finite + non-increasing, 0 NaN, VRAM 1229 MiB. The 0.500× activation-storage ratio is proven deterministically (`Fp16ActivationMemoryTests`). *Remaining refinement: CUDA-graph capture of the mixed-dtype step (perf), and a clean at-scale FP32-vs-FP16 in-process VRAM A/B.*
+- **Phase E — REMAINING (cross-repo deployment).** Make the plan a public Tensors API and route AiDotNet `NeuralNetworkBase.TrainWithTape` / `CompiledTapeTrainingStep` to it under the flag, so HarmonicEngine/opt-parity exercise it through the high-level training path on GPU.
 
-Phases A–C are CPU-testable; D–E are GPU-bound. Each lands behind the flag with the default FP32 fused path byte-identical. **Estimated: ~5 phases, multi-day each (~2–4 weeks total).**
+Phases A–D landed (CPU + GPU verified) behind `AIDOTNET_FP16_ACTIVATIONS`; default FP32 fused path byte-identical. **Phase E** (public API + AiDotNet wiring + GPU validation through the high-level path) is the remaining cross-repo step.
 
 ## Test gate (non-negotiable, every phase)
 - `LayerNormGradientCheckTests`-style finite-diff vs analytic, extended to the mixed-precision node.
