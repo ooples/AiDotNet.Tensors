@@ -100,3 +100,13 @@ But GPU measurement on the cortex shows it does **NOT** reduce GPU VRAM (5918 vs
 - `LayerNormGradientCheckTests`-style finite-diff vs analytic, extended to the mixed-precision node.
 - Resident-memory measurement via `opt-parity LEAKPROBE` (no HE rebuild).
 - End-to-end cortex: loss drops, param-L1 moves, **0 NaN**.
+
+## ⚠️ SIXTH / BOTTOM FINDING — race-safe deferred-free defeats mid-step compression; real fix is a stream-ordered allocator
+
+Layer 5 IMPLEMENTED (on-device `CompressActivationFp16`/`UpcastActivationFp32` swap the cache entry FP32↔FP16, schedule-driven, defensive read upcast; behind `AIDOTNET_FP16_GPU_CACHE`; CPU paths 51/51 green). GPU-measured on the cortex: **7155 MiB vs 4671 FP32 — higher again**, and ~10× slower.
+
+Root cause (bottom of the stack): compression allocates the FP16 buffer but frees the FP32 via the race-safe deferred-free (`CudaBackend.FreeBufferDeferred`, the #226 fix), which holds the FP32 until a stream event — NOT reclaimed until step-end sync. So mid-step the FP16 AND the not-yet-reclaimed FP32 coexist → peak rises. A prompt synchronous free would reclaim it but reintroduces the #226 CUDA-700 race.
+
+**The genuine remaining fix is at the CUDA memory-allocator layer: a stream-ordered allocator** (`cudaMallocAsync` / a stream-aware pool) so a deferred-freed FP32 buffer is reused within stream order by the next allocation WITHOUT a host sync — bounding peak while staying race-free. This is how PyTorch's caching allocator handles AMP activation churn. Every layer above (autograd, compiled plan, Adam, routing, FP16 format, CPU paging, on-device compress/upcast) is built + correct; the resident-memory win is gated on stream-ordered reclamation.
+
+**Definitive status:** FP16 compute works; FP16 storage format + CPU paging + on-device compress/upcast are implemented + tested; the GPU resident-memory win is bottlenecked on the allocator reclamation model. All flags OFF by default; nothing regresses.
