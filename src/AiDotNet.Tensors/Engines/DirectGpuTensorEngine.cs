@@ -102,12 +102,20 @@ internal sealed class ActivationCacheEntry : IDisposable
     public long Timestamp { get; }
     public IDirectGpuBackend Backend { get; }
 
-    public ActivationCacheEntry(IGpuBuffer buffer, int[] shape, long timestamp, IDirectGpuBackend backend)
+    // FP16 GPU activation storage (#558 layer 5): when true, Buffer holds ElementCount FP16 values
+    // (half the bytes). A consumer/backward read re-inflates it to FP32 via TryUpcastActivationFp32.
+    public bool IsFp16 { get; }
+    public int ElementCount { get; }
+
+    public ActivationCacheEntry(IGpuBuffer buffer, int[] shape, long timestamp, IDirectGpuBackend backend,
+        bool isFp16 = false, int elementCount = 0)
     {
         Buffer = buffer;
         Shape = shape;
         Timestamp = timestamp;
         Backend = backend;
+        IsFp16 = isFp16;
+        ElementCount = elementCount;
     }
 
     public void Dispose()
@@ -896,12 +904,24 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return new OwnedBuffer(cached, ownsBuffer: false);
 
         // Check activation cache (for intermediate layer outputs)
+        bool upcastNeeded = false;
         lock (_activationCacheLock)
         {
             if (_activationCache.TryGetValue(data, out var activationEntry) &&
                 ReferenceEquals(activationEntry.Backend, backend))
             {
-                return new OwnedBuffer(activationEntry.Buffer, ownsBuffer: false);
+                if (activationEntry.IsFp16) upcastNeeded = true;  // #558: re-inflate before returning
+                else return new OwnedBuffer(activationEntry.Buffer, ownsBuffer: false);
+            }
+        }
+        if (upcastNeeded)
+        {
+            TryUpcastActivationFp32ByKey(data);
+            lock (_activationCacheLock)
+            {
+                if (_activationCache.TryGetValue(data, out var e2) &&
+                    ReferenceEquals(e2.Backend, backend) && !e2.IsFp16)
+                    return new OwnedBuffer(e2.Buffer, ownsBuffer: false);
             }
         }
 
@@ -976,11 +996,25 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var cached = TryGetCachedBuffer(backingArray);
             if (cached != null) return new OwnedBuffer(cached, ownsBuffer: false);
 
+            bool upcastNeeded2 = false;
             lock (_activationCacheLock)
             {
                 if (_activationCache.TryGetValue(backingArray, out var entry) &&
                     ReferenceEquals(entry.Backend, backend))
-                    return new OwnedBuffer(entry.Buffer, ownsBuffer: false);
+                {
+                    if (entry.IsFp16) upcastNeeded2 = true;  // #558: re-inflate before returning
+                    else return new OwnedBuffer(entry.Buffer, ownsBuffer: false);
+                }
+            }
+            if (upcastNeeded2)
+            {
+                TryUpcastActivationFp32ByKey(backingArray);
+                lock (_activationCacheLock)
+                {
+                    if (_activationCache.TryGetValue(backingArray, out var e2) &&
+                        ReferenceEquals(e2.Backend, backend) && !e2.IsFp16)
+                        return new OwnedBuffer(e2.Buffer, ownsBuffer: false);
+                }
             }
         }
 
@@ -1187,6 +1221,83 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
 
         removed?.Dispose();
+    }
+
+    // ── FP16 GPU activation storage (#558 layer 5) ──────────────────────────────────────────────────
+    // Compress a cached activation's GPU buffer to FP16 (half VRAM); upcast back to FP32 on demand. The
+    // entry stays CACHE-MANAGED (swapped in place), so the read paths and UploadTensorRaw still see a
+    // cache-owned buffer — no transient-ownership churn. The plan's paging schedule decides timing
+    // (compress after last forward use, upcast before backward use); the read paths upcast defensively.
+
+    private bool TryCompressActivationFp16ByKey(object key, int elementCount)
+    {
+        if (elementCount <= 0) return false;
+        ActivationCacheEntry? old = null;
+        lock (_activationCacheLock)
+        {
+            if (!_activationCache.TryGetValue(key, out var e)) return false;
+            if (e.IsFp16) return true;
+            if (e.Backend is not DirectGpu.CUDA.CudaBackend cuda) return false;
+            // Only compress genuine FP32 buffers (elementCount*4 bytes); skip anything unexpected.
+            if (e.Buffer.SizeInBytes != (long)elementCount * sizeof(float)) return false;
+            IGpuBuffer fp16;
+            try
+            {
+                fp16 = cuda.AllocateByteBuffer(elementCount * 2);
+                cuda.ConvertToFp16(e.Buffer, fp16, elementCount);
+            }
+            catch { return false; }
+            _activationCache[key] = new ActivationCacheEntry(fp16, e.Shape, e.Timestamp, e.Backend, isFp16: true, elementCount: elementCount);
+            System.Threading.Interlocked.Add(ref _currentActivationCacheBytes, fp16.SizeInBytes - e.Buffer.SizeInBytes);
+            old = e;
+        }
+        if (old is not null && old.Backend is DirectGpu.CUDA.CudaBackend c) c.FreeBufferDeferred(old.Buffer);
+        else old?.Dispose();
+        return true;
+    }
+
+    private bool TryUpcastActivationFp32ByKey(object key)
+    {
+        ActivationCacheEntry? old = null;
+        lock (_activationCacheLock)
+        {
+            if (!_activationCache.TryGetValue(key, out var e)) return false;
+            if (!e.IsFp16) return true;
+            if (e.Backend is not DirectGpu.CUDA.CudaBackend cuda) return false;
+            IGpuBuffer fp32;
+            try
+            {
+                fp32 = cuda.AllocateBuffer(e.ElementCount);   // float-sized
+                cuda.ConvertToFp32(e.Buffer, fp32, e.ElementCount);
+            }
+            catch { return false; }
+            _activationCache[key] = new ActivationCacheEntry(fp32, e.Shape, e.Timestamp, e.Backend, isFp16: false, elementCount: e.ElementCount);
+            System.Threading.Interlocked.Add(ref _currentActivationCacheBytes, fp32.SizeInBytes - e.Buffer.SizeInBytes);
+            old = e;
+        }
+        if (old is not null && old.Backend is DirectGpu.CUDA.CudaBackend c) c.FreeBufferDeferred(old.Buffer);
+        else old?.Dispose();
+        return true;
+    }
+
+    /// <summary>Compress a tensor's cached GPU activation to FP16 (half VRAM). Nulls the tensor's direct
+    /// buffer pointer so subsequent reads re-resolve through the cache (which upcasts). Called by the
+    /// mixed-precision plan's paging after the activation's last forward use.</summary>
+    internal void CompressActivationFp16(Tensor<float> t)
+    {
+        int n = t.Length;
+        bool any = TryCompressActivationFp16ByKey(t.DataVector, n);
+        var arr = t.DataVector.GetBackingArrayUnsafe();
+        if (!any && arr is not null) any = TryCompressActivationFp16ByKey(arr, n);
+        if (any) { t._gpuBuffer = null; t._gpuBufferVersion = -1; }
+    }
+
+    /// <summary>Upcast a tensor's cached FP16 activation back to FP32 before its backward reads it.</summary>
+    internal void UpcastActivationFp32(Tensor<float> t)
+    {
+        TryUpcastActivationFp32ByKey(t.DataVector);
+        var arr = t.DataVector.GetBackingArrayUnsafe();
+        if (arr is not null) TryUpcastActivationFp32ByKey(arr);
     }
 
     private bool TryReplacePersistentBuffer<T>(T[] data, IGpuBuffer buffer)

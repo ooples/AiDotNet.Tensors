@@ -40,7 +40,8 @@ public sealed class MixedPrecisionCompiledPlan
         PagingTestOverride ?? (Environment.GetEnvironmentVariable("AIDOTNET_FP16_PAGING") == "1");
 
     private readonly bool _paging;
-    private Dictionary<Tensor<float>, Half[]>? _halfStore;                 // dropped activations, held as Half
+    private readonly DirectGpuTensorEngine? _gpuFp16;                      // non-null ⇒ page via on-device FP16 compression
+    private Dictionary<Tensor<float>, Half[]>? _halfStore;                 // dropped activations, held as Half (CPU paging)
     private List<Tensor<float>>[]? _pageOutAt;                             // per fwd step: page out after running it
     private Dictionary<ILazyNode, List<Tensor<float>>>? _bwdReadByNode;    // float activations a node's backward reads
     private Dictionary<Tensor<float>, int>? _bwdConsumerCount;            // total backward reads per activation
@@ -52,6 +53,8 @@ public sealed class MixedPrecisionCompiledPlan
         _order = order;
         _output = output;
         _paging = paging;
+        _gpuFp16 = (paging && engine is DirectGpuTensorEngine dg
+                    && Environment.GetEnvironmentVariable("AIDOTNET_FP16_GPU_CACHE") == "1") ? dg : null;
         if (_paging) BuildPagingSchedule();
     }
 
@@ -123,6 +126,7 @@ public sealed class MixedPrecisionCompiledPlan
     // it is re-executed this step, so give it allocated storage just before. Data is overwritten by Execute.
     private void RestoreOutputForReplay(ILazyNode node)
     {
+        if (_gpuFp16 is not null) return; // GPU mode: the op re-executes + re-caches a fresh FP32 buffer
         var o = FloatOutputOf(node);
         if (o is null) return;
         if (_droppedThisStep!.Remove(o))
@@ -231,6 +235,7 @@ public sealed class MixedPrecisionCompiledPlan
 
     private void PageOut(Tensor<float> t)
     {
+        if (_gpuFp16 is not null) { _gpuFp16.CompressActivationFp16(t); PageOutCount++; return; }
         if (_halfStore!.ContainsKey(t)) return;
         var span = t.AsSpan();
         var h = new Half[span.Length];
@@ -241,6 +246,7 @@ public sealed class MixedPrecisionCompiledPlan
 
     private void PageIn(Tensor<float> t)
     {
+        if (_gpuFp16 is not null) { _gpuFp16.UpcastActivationFp32(t); return; }
         if (!_halfStore!.TryGetValue(t, out var h)) return; // already float-resident
         var f = new float[h.Length];
         for (int i = 0; i < h.Length; i++) f[i] = (float)h[i];
@@ -250,7 +256,9 @@ public sealed class MixedPrecisionCompiledPlan
 
     private void FreeFloat(Tensor<float> t)
     {
-        // After the last backward read the activation is float-resident (paged in) and never read again.
+        // GPU FP16 mode: re-compress after the last backward read (frees the upcast FP32 GPU buffer).
+        if (_gpuFp16 is not null) { _gpuFp16.CompressActivationFp16(t); return; }
+        // CPU mode: after the last backward read the activation is float-resident and never read again.
         if (!_halfStore!.ContainsKey(t) && t.TryDropStorageForStreaming()) _droppedThisStep!.Add(t);
     }
 
