@@ -896,6 +896,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         removed?.Dispose();
     }
 
+    /// <summary>Test-only: the fully-initialized GPU backend (kernels compiled). Not part of the public API.</summary>
+    internal IDirectGpuBackend? TestBackend => _directGpu?.Backend;
+
     private OwnedBuffer GetOrAllocateBuffer<T>(IDirectGpuBackend backend, T[] data)
     {
         // First check persistent tensor cache (for weights/biases)

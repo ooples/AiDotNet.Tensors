@@ -34,6 +34,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     // cuMemAllocAsync/cuMemFreeAsync on _stream, so freed memory is reused in stream order without a host
     // sync (race-free + bounds mid-step peak). Opt-in via AIDOTNET_CUDA_ASYNC_ALLOC; default off.
     private bool _asyncAlloc;
+    /// <summary>Diagnostic (#558): the nvrtc error if the FP16 kernel module failed to compile (which
+    /// silently disables the whole FP16 GPU path). Null when FP16 compiled successfully.</summary>
+    internal static string? Fp16ModuleCompileError;
     // cuDNN helpers — lazily initialized on first Conv2D call that routes
     // through the cuDNN dispatch path. Kept private so disposal is linked
     // to this backend's lifetime; the helpers' cuDNN handles survive
@@ -814,15 +817,23 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         // Compile softmax variant + GEMM extension kernels
         CompileKernelModule(device, CudaSoftmaxVariantKernels.GetSource(), "softmax_variant_kernels", CudaSoftmaxVariantKernels.GetKernelNames());
 
+        // Self-contained FP16 kernels (#558 layer 7): manual IEEE-754 half<->float, NO cuda_fp16.h, so
+        // they compile with the driver alone (the header-based CudaFp16Kernels below silently fails on
+        // driver-only machines). This is the FP16 path that actually works without a CUDA Toolkit.
+        CompileKernelModule(device, Kernels.CudaFp16NativeKernels.GetSource(), "fp16_native_kernels", Kernels.CudaFp16NativeKernels.GetKernelNames());
+
         // Compile FP16 conversion kernels (half-precision float conversion)
         // May fail if NVRTC doesn't have cuda_fp16.h (minimal CUDA Toolkit install).
         try
         {
             _fp16Module = CompileKernelModule(device, CudaFp16Kernels.GetSource(), "fp16_kernels", CudaFp16Kernels.GetKernelNames());
         }
-        catch
+        catch (Exception fp16Ex)
         {
-            // FP16 kernels are optional — fall back to FP32 paths.
+            // FP16 kernels are optional — fall back to FP32 paths. Capture the error: a silent failure
+            // here disables the ENTIRE FP16 GPU path (convert + half activations + Tensor-Core throughput),
+            // which is invisible otherwise (#558). Surfaced via Fp16ModuleCompileError for diagnostics.
+            Fp16ModuleCompileError = fp16Ex.Message;
         }
 
         // Compile LSTM sequence kernels (forward/backward for BPTT training)
@@ -10567,6 +10578,39 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         args[2] = &size;
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
+
+    /// <summary>
+    /// FP16-NATIVE GELU (#558 layer 7 pilot): reads the FP16 activation buffer DIRECTLY, computes GELU in
+    /// FP32 in-register (__half2 packed, 2 elems/thread), writes FP16 — no separate FP32 buffer is ever
+    /// materialized, so there is no convert transient and the activation stays half-size end-to-end. This
+    /// is the kernel shape the GPU memory win + Tensor-Core throughput require. <paramref name="size"/> is
+    /// the element count; <paramref name="input"/>/<paramref name="output"/> are FP16 (byte) buffers.
+    /// </summary>
+    public unsafe void Fp16Gelu(IGpuBuffer input, IGpuBuffer output, int size)
+        => LaunchUnaryFp16("fp16_gelu_native", input, output, size);
+
+    /// <summary>FP32→FP16 via the self-contained native kernel (no cuda_fp16.h). Output is a half buffer.</summary>
+    public unsafe void ConvertToFp16Native(IGpuBuffer input, IGpuBuffer output, int size)
+        => LaunchConvertFp16("convert_fp32_to_fp16_native", input, output, size);
+
+    /// <summary>FP16→FP32 via the self-contained native kernel (no cuda_fp16.h). Input is a half buffer.</summary>
+    public unsafe void ConvertToFp32Native(IGpuBuffer input, IGpuBuffer output, int size)
+        => LaunchConvertFp16("convert_fp16_to_fp32_native", input, output, size);
+
+    private unsafe void LaunchUnaryFp16(string kernelName, IGpuBuffer input, IGpuBuffer output, int size)
+    {
+        if (!_kernelCache.TryGetValue(kernelName, out var kernel))
+            throw new InvalidOperationException($"CUDA kernel not found: {kernelName}");
+        using var _ = PushContext();
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);  // 1 elem/thread
+        IntPtr inPtr = input.Handle, outPtr = output.Handle;
+        void** args = stackalloc void*[3];
+        args[0] = &inPtr; args[1] = &outPtr; args[2] = &size;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    private unsafe void LaunchConvertFp16(string kernelName, IGpuBuffer input, IGpuBuffer output, int size)
+        => LaunchUnaryFp16(kernelName, input, output, size);
 
     /// <inheritdoc/>
     public unsafe void ConvertToFp32(IGpuBuffer input, IGpuBuffer output, int size)
