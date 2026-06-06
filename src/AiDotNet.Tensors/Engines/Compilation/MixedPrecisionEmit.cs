@@ -27,12 +27,30 @@ namespace AiDotNet.Tensors.Engines.Compilation;
 internal static class MixedPrecisionEmit
 {
     /// <summary>
+    /// Opt-in master switch for FP16 ACTIVATION STORAGE (the buffer-level win), distinct from the
+    /// shipped FP16-compute autocast. Read once: <c>AIDOTNET_FP16_ACTIVATIONS=1</c>. It is separate from
+    /// the autocast flag because emitting <see cref="Tensor{Half}"/> activation nodes produces a
+    /// mixed-dtype graph that ONLY a mixed-dtype-aware backward (<see cref="MixedPrecisionGraphBackward"/>)
+    /// can consume — the single-type fused <c>CompiledTrainingPlan&lt;float&gt;</c> must NOT see it. So a
+    /// caller turns this on exactly when it drives the mixed-dtype path. Default off ⇒ existing autocast
+    /// (FP16 compute / FP32 storage) and the fused plan are byte-identical.
+    /// </summary>
+    /// <summary>Test-only override; null ⇒ read the env var. Not part of the public API.</summary>
+    internal static bool? TestOverrideEnabled;
+
+    public static bool Fp16ActivationStorageEnabled =>
+        TestOverrideEnabled ?? (Environment.GetEnvironmentVariable("AIDOTNET_FP16_ACTIVATIONS") == "1");
+
+    /// <summary>
     /// True when graph tracing should emit FP16 activation buffers: an FP16 autocast scope is active.
     /// </summary>
     public static bool ShouldEmitFp16<T>() =>
         typeof(T) == typeof(float)
         && Gpu.AutocastScope.IsEnabled
         && Gpu.AutocastScope.ActivePrecision == Gpu.PrecisionMode.Float16;
+
+    /// <summary>Both the autocast scope and the activation-storage opt-in are active.</summary>
+    public static bool ActivationStorageActive<T>() => Fp16ActivationStorageEnabled && ShouldEmitFp16<T>();
 
     /// <summary>
     /// Emits <c>a · b</c> onto <paramref name="scope"/> with the matmul activation stored as FP16.
