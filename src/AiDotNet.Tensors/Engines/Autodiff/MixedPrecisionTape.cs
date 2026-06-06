@@ -84,6 +84,23 @@ internal sealed class MixedPrecisionTape : IDisposable
         }
     }
 
+    /// <summary>Result of a loss-scaled mixed-precision backward. All gradients are FP32 (the
+    /// optimizer's master-weight space), already unscaled by the loss scale. <see cref="FoundInfNan"/>
+    /// signals an FP16 overflow this step (drives <see cref="GradScaler.Update"/> backoff; the caller
+    /// should skip the optimizer step).</summary>
+    public sealed class ScaledMixedGrads
+    {
+        public Dictionary<Tensor<float>, Tensor<float>> Fp32 { get; }
+        public Dictionary<Tensor<Half>, Tensor<float>> Fp16Params { get; }
+        public bool FoundInfNan { get; }
+        public ScaledMixedGrads(Dictionary<Tensor<float>, Tensor<float>> fp32, Dictionary<Tensor<Half>, Tensor<float>> fp16Params, bool foundInfNan)
+        {
+            Fp32 = fp32;
+            Fp16Params = fp16Params;
+            FoundInfNan = foundInfNan;
+        }
+    }
+
     /// <summary>
     /// Reverse-mode gradients of <paramref name="loss"/> (FP32 scalar) across the mixed-dtype graph.
     /// Returns the last sweep's FP32 and FP16 grad dictionaries (exact reverse-mode values).
@@ -92,10 +109,53 @@ internal sealed class MixedPrecisionTape : IDisposable
     {
         if (_disposed) throw new ObjectDisposedException(nameof(MixedPrecisionTape));
         if (loss is null) throw new ArgumentNullException(nameof(loss));
+        return RunSweep(loss, 1f);
+    }
 
-        // Ones seed at the loss (FP32), constructed once.
+    /// <summary>
+    /// Loss-scaled mixed-precision backward (Micikevicius et al. AMP). The backward seed is multiplied
+    /// by <paramref name="scaler"/>.Scale so small FP16 gradients stay in FP16's representable range
+    /// instead of flushing to zero; the returned gradients are cast UP to FP32 and then unscaled, so the
+    /// unscale itself cannot re-underflow (PyTorch keeps the grad accumulator in FP32 for exactly this
+    /// reason). An FP16 overflow surfaces as inf/nan after the up-cast and is reported in
+    /// <see cref="ScaledMixedGrads.FoundInfNan"/> for the dynamic backoff schedule.
+    /// </summary>
+    public ScaledMixedGrads ComputeGradients(Tensor<float> loss, GradScaler scaler)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(MixedPrecisionTape));
+        if (loss is null) throw new ArgumentNullException(nameof(loss));
+        if (scaler is null) throw new ArgumentNullException(nameof(scaler));
+
+        var scaled = RunSweep(loss, scaler.Scale);
+
+        // Move everything into FP32 (optimizer master space) BEFORE unscaling.
+        var fp32 = new Dictionary<Tensor<float>, Tensor<float>>(scaled.Fp32, ReferenceEqualityComparer<Tensor<float>>.Instance);
+        var fp16Params = new Dictionary<Tensor<Half>, Tensor<float>>(ReferenceEqualityComparer<Tensor<Half>>.Instance);
+        foreach (var kv in scaled.Fp16)
+            fp16Params[kv.Key] = MixedPrecisionCast.CastToFp16Backward(kv.Value); // FP16 grad -> FP32 (lossless up-cast)
+
+        // Unscale in FP32; OR the inf/nan flags from both spaces. fp16Params has Half keys / float
+        // values (already up-cast above), so it isn't a Tensor<T>->Tensor<T> map — unscale its float
+        // values directly with the same 1/scale factor.
+        bool infNan = scaler.UnscaleGradients(fp32);
+        float invScale = 1f / scaler.Scale;
+        foreach (var kv in fp16Params)
+        {
+            var span = kv.Value.AsWritableSpan();
+            for (int i = 0; i < span.Length; i++)
+            {
+                span[i] *= invScale;
+                if (float.IsNaN(span[i]) || float.IsInfinity(span[i])) infNan = true;
+            }
+        }
+        return new ScaledMixedGrads(fp32, fp16Params, infNan);
+    }
+
+    private MixedGrads RunSweep(Tensor<float> loss, float seedValue)
+    {
+        // Seed at the loss (FP32) = seedValue * dL/dL. seedValue folds in the loss scale (1 when unscaled).
         var onesData = new float[loss.Length];
-        for (int i = 0; i < onesData.Length; i++) onesData[i] = 1f;
+        for (int i = 0; i < onesData.Length; i++) onesData[i] = seedValue;
         var lossSeed = new Tensor<float>(onesData, loss._shape);
 
         // Boundary seeds carried across sweeps.
