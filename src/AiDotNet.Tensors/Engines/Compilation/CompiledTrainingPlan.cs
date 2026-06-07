@@ -2106,7 +2106,16 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // detected pattern, reused by both forward and backward analytic
         // versions. Empty otherwise.
         var sharedRowSumCache = new Dictionary<int, float[]>();
-        if (typeof(T) == typeof(float))
+        // CUDA-graph eligibility + GPU utilization: on a GPU engine, prefer the GENERIC engine-dispatched
+        // (GPU-stream) path over the CPU-BLAS/SIMD host specializations below. Those specializations are a
+        // CPU optimization (SimdGemm / BlasProvider.TryGemmEx on host .Data arrays); on a GPU engine they
+        // (1) run the heavy GEMMs + elementwise on the CPU, starving the device (cortex GPU util ~7%), and
+        // (2) are host-only, so the fixed kernel sequence can't be CUDA-graph captured (AIDOTNET_CUDA_GRAPH_STEP).
+        // Routing to generic moves the work onto the GPU AND makes the whole step graph-eligible. Default ON
+        // for GPU engines; opt out with AIDOTNET_GPU_PREFER_GENERIC=0 to restore the CPU-specialized path.
+        bool preferGenericForGpu = engine.SupportsGpu
+            && Environment.GetEnvironmentVariable("AIDOTNET_GPU_PREFER_GENERIC") != "0";
+        if (typeof(T) == typeof(float) && !preferGenericForGpu)
         {
             DetectAnalyticLossMatMulBackward(forwardSteps, consumerCount, gradMap, analyticBackwardSpecs, skippableReduceSumIndices, analyticForwardSpecs, skippableReduceSumForwardIndices, sharedRowSumCache);
         }
@@ -2221,7 +2230,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // so the SgemmWithCachedB pre-pack cache (keyed on B's array
             // reference) would serve stale weights. Disable the cached path
             // for training specialization; correctness over cache-hit speed.
-            var specialized = TryBuildSpecializedForward(step, pinnedHandles, allowCachedB: false);
+            // On a GPU engine, skip the host CPU-SIMD specialization entirely (preferGenericForGpu) so the
+            // op runs on the GPU and stays CUDA-graph-capturable.
+            var specialized = preferGenericForGpu ? null : TryBuildSpecializedForward(step, pinnedHandles, allowCachedB: false);
             if (specialized != null)
             {
                 allForwardActions.Add(specialized);
@@ -2286,7 +2297,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // dW GEMM would run twice (once in the per-step backward,
             // once in the batched-dW append), defeating the optimization
             // and doubling the dominant backward cost.
-            var action = BuildSpecializedBackward(step, gradMap, consumerCount, engine, pinnedHandles,
+            // On a GPU engine, skip the host BLAS specialization (preferGenericForGpu) so the backward
+            // runs on the GPU stream and the fixed sequence stays CUDA-graph-capturable.
+            var action = preferGenericForGpu ? null : BuildSpecializedBackward(step, gradMap, consumerCount, engine, pinnedHandles,
                 dWPeeled: dWPeeledIndices.Contains(i));
             if (action != null)
             {
@@ -2366,6 +2379,28 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // stays all-generic, and a mixed set is already flagged impure here).
         bool graphBackwardPure = genericBackwardCount == backwardActions.Count;
         bool graphStepEligible = graphForwardPure && graphBackwardPure;
+
+        // DIAGNOSTIC (AIDOTNET_CUDA_GRAPH_STEP=1 + ineligible): record WHY the plan can't be CUDA-graph
+        // captured — the specialized/fused (host-only) actions listed here are exactly the port-to-GPU-pure
+        // targets. Written to %TEMP%/aidotnet_graphstep_diag.txt (survives xunit's console redirection) and
+        // Trace. Gated on the flag so it costs nothing in normal runs.
+        if (s_graphStepEnabled && !graphStepEligible && typeof(T) == typeof(float))
+        {
+            try
+            {
+                var specBwd = new List<string>();
+                foreach (var n in backwardStepNames)
+                    if (!n.StartsWith("generic:", StringComparison.Ordinal)) specBwd.Add(n);
+                string msg = $"[GRAPHSTEP-DIAG] INELIGIBLE fwdPure={graphForwardPure}({genericForwardCount}/{allForwardActions.Count}) "
+                    + $"bwdPure={graphBackwardPure}({genericBackwardCount}/{backwardActions.Count}); "
+                    + $"nonGenericFwd={allForwardActions.Count - genericForwardCount}; "
+                    + $"nonGenericBwd=[{string.Join(", ", specBwd)}]" + System.Environment.NewLine;
+                System.IO.File.AppendAllText(
+                    System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_graphstep_diag.txt"), msg);
+                System.Diagnostics.Trace.WriteLine(msg);
+            }
+            catch { /* diagnostic must never break the build */ }
+        }
 
         // Phase 6.3: Backward pruning — skip gradient computation for non-trainable tensors
         var paramSet = new HashSet<Tensor<T>>(parameters);
