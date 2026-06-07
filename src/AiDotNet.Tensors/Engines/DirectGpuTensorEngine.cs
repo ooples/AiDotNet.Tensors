@@ -112,8 +112,20 @@ internal sealed class ActivationCacheEntry : IDisposable
     public bool IsFp16 { get; }
     public int ElementCount { get; }
 
+    // 5-arg overload preserved for reflection-based callers (test helpers like
+    // EvictActivationsCreatedAfterLifetimeTests.GetActivationCacheEntryCtor
+    // resolve ctors by exact-arity signature, which doesn't honor C# default
+    // parameters). Without this, the existing tests that pass managedBytes
+    // and let isFp16/elementCount default break with "No matching ctor" the
+    // moment the FP16 storage params are added to the canonical ctor.
     public ActivationCacheEntry(IGpuBuffer buffer, int[] shape, long timestamp, IDirectGpuBackend backend,
-        long managedBytes = 0, bool isFp16 = false, int elementCount = 0)
+        long managedBytes)
+        : this(buffer, shape, timestamp, backend, managedBytes, isFp16: false, elementCount: 0)
+    {
+    }
+
+    public ActivationCacheEntry(IGpuBuffer buffer, int[] shape, long timestamp, IDirectGpuBackend backend,
+        long managedBytes, bool isFp16, int elementCount)
     {
         Buffer = buffer;
         Shape = shape;
