@@ -50,12 +50,17 @@ public class ActivationCacheEvictionLifetimeTests
     /// </summary>
     private static ConstructorInfo GetActivationCacheEntryCtor(Type activationCacheEntryType)
     {
+        // Matches the 5-parameter ctor introduced with the managed-byte backstop:
+        // (buffer, shape, timestamp, backend, managedBytes). managedBytes carries
+        // the approximate managed-array footprint the entry pins; eviction itself
+        // doesn't read it so the tests pass 0.
         var ctor = activationCacheEntryType.GetConstructor(new[]
         {
             typeof(IGpuBuffer),
             typeof(int[]),
             typeof(long),
-            typeof(IDirectGpuBackend)
+            typeof(IDirectGpuBackend),
+            typeof(long)
         });
         Assert.NotNull(ctor);
         return ctor!;
@@ -110,13 +115,13 @@ public class ActivationCacheEvictionLifetimeTests
         // entries; eviction itself only calls Buffer.Dispose(), so a null backend
         // is safe for this test.
         object protectedEntry = entryCtor.Invoke(
-            new object?[] { protectedBuffer, new[] { 4 }, 1L, null });
+            new object?[] { protectedBuffer, new[] { 4 }, 1L, null, 0L });
         object victimEntry1 = entryCtor.Invoke(
-            new object?[] { victimBuffer1, new[] { 4 }, 2L, null });
+            new object?[] { victimBuffer1, new[] { 4 }, 2L, null, 0L });
         object victimEntry2 = entryCtor.Invoke(
-            new object?[] { victimBuffer2, new[] { 4 }, 3L, null });
+            new object?[] { victimBuffer2, new[] { 4 }, 3L, null, 0L });
         object victimEntry3 = entryCtor.Invoke(
-            new object?[] { victimBuffer3, new[] { 4 }, 4L, null });
+            new object?[] { victimBuffer3, new[] { 4 }, 4L, null, 0L });
 
         // ConcurrentDictionary<object, ActivationCacheEntry>.TryAdd via runtime dispatch.
         var tryAdd = activationCache.GetType().GetMethod("TryAdd")!;
@@ -200,8 +205,8 @@ public class ActivationCacheEvictionLifetimeTests
         var buffer1 = new TrackingGpuBuffer(size: 4);
         var buffer2 = new TrackingGpuBuffer(size: 4);
 
-        object entry1 = entryCtor.Invoke(new object?[] { buffer1, new[] { 4 }, 1L, null });
-        object entry2 = entryCtor.Invoke(new object?[] { buffer2, new[] { 4 }, 2L, null });
+        object entry1 = entryCtor.Invoke(new object?[] { buffer1, new[] { 4 }, 1L, null, 0L });
+        object entry2 = entryCtor.Invoke(new object?[] { buffer2, new[] { 4 }, 2L, null, 0L });
 
         var tryAdd = activationCache.GetType().GetMethod("TryAdd")!;
         Assert.True((bool)tryAdd.Invoke(activationCache, new[] { key1, entry1 })!);

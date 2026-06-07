@@ -101,6 +101,11 @@ internal sealed class ActivationCacheEntry : IDisposable
     public int[] Shape { get; }
     public long Timestamp { get; }
     public IDirectGpuBackend Backend { get; }
+    // Approximate size of the MANAGED backing array this entry's key pins alive
+    // (product(Shape) * 4, float). Tracked separately from Buffer.SizeInBytes (GPU
+    // bytes) so the cache can bound MANAGED-heap retention independently of VRAM —
+    // see _maxActivationManagedBytes in DirectGpuTensorEngine.
+    public long ManagedBytes { get; }
 
     // FP16 GPU activation storage (#558 layer 5): when true, Buffer holds ElementCount FP16 values
     // (half the bytes). A consumer/backward read re-inflates it to FP32 via TryUpcastActivationFp32.
@@ -108,12 +113,13 @@ internal sealed class ActivationCacheEntry : IDisposable
     public int ElementCount { get; }
 
     public ActivationCacheEntry(IGpuBuffer buffer, int[] shape, long timestamp, IDirectGpuBackend backend,
-        bool isFp16 = false, int elementCount = 0)
+        long managedBytes = 0, bool isFp16 = false, int elementCount = 0)
     {
         Buffer = buffer;
         Shape = shape;
         Timestamp = timestamp;
         Backend = backend;
+        ManagedBytes = managedBytes;
         IsFp16 = isFp16;
         ElementCount = elementCount;
     }
@@ -277,6 +283,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             System.Threading.Interlocked.Increment(ref _evictionSuspendDepth); // clamp at 0
     }
 
+    // MANAGED-heap bound for the activation cache (independent of the VRAM byte cap).
+    // Root cause of the cortex training OOM/crash (2026-06-05, gcroot): the cache keys
+    // are the managed float[] backing arrays, but eviction was driven ONLY by GPU-buffer
+    // bytes (_currentActivationCacheBytes) and a huge 131072 entry cap. When a step's GPU
+    // buffers are freed/deferred but their managed keys linger (stale cross-step entries),
+    // nothing bounded the MANAGED heap — it grew to 36GB+ (live after GC) and crashed the
+    // process while VRAM stayed capped at ~75%. This cap evicts the OLDEST entries (exactly
+    // those stale prior-step activations) once managed retention exceeds the limit, while
+    // the current step's newest activations stay resident (no GPU<->CPU thrash for the live
+    // step). Tunable via AIDOTNET_ACT_CACHE_MANAGED_MB (default 8192 MB); 0 disables.
+    private long _maxActivationManagedBytes;
+    private long _currentActivationManagedBytes;
+
     // Deferred download tracking for GPU-resident execution
     // When GpuScope is active, intermediate results skip the blocking download.
     // The GPU buffer stays in the activation cache for direct GPU-to-GPU chaining.
@@ -289,6 +308,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         _directGpu = new DirectGpuEngine();
         _ownsDirectGpu = true;
         _maxActivationCacheBytes = _directGpu.GlobalMemoryBytes * 3 / 4; // 75% of GPU memory
+        _maxActivationManagedBytes = ResolveManagedCacheCapBytes();
     }
 
     public DirectGpuTensorEngine(DirectGpuEngine directGpu)
@@ -296,6 +316,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         _directGpu = directGpu;
         _ownsDirectGpu = false;
         _maxActivationCacheBytes = directGpu?.GlobalMemoryBytes * 3 / 4 ?? 0;
+        _maxActivationManagedBytes = ResolveManagedCacheCapBytes();
+    }
+
+    // Managed-heap cap for the activation cache. Default 8 GB; AIDOTNET_ACT_CACHE_MANAGED_MB
+    // overrides (set to 0 to disable the managed bound and rely on the VRAM cap alone).
+    private static long ResolveManagedCacheCapBytes()
+    {
+        const long defaultMb = 8192;
+        var env = Environment.GetEnvironmentVariable("AIDOTNET_ACT_CACHE_MANAGED_MB");
+        if (env is not null && long.TryParse(env, out var mb) && mb >= 0)
+            return mb * 1024L * 1024L;
+        return defaultMb * 1024L * 1024L;
     }
 
     public bool IsGpuAvailable => _directGpu?.IsAvailable == true;
@@ -890,6 +922,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 System.Threading.Interlocked.Add(ref _currentActivationCacheBytes,
                     -entry.Buffer.SizeInBytes);
+                System.Threading.Interlocked.Add(ref _currentActivationManagedBytes, -entry.ManagedBytes);
                 removed = entry;
             }
         }
@@ -1131,6 +1164,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     private void CacheActivation(object cacheKey, IGpuBuffer buffer, int[] shape, IDirectGpuBackend backend)
     {
+        // Approximate managed-heap footprint of the key array this entry pins
+        // (product(shape) * 4 bytes; activation backing arrays are float[]). Bounds
+        // managed retention independently of the VRAM byte cap — see overManaged below.
+        long managedBytes = 4L;
+        for (int d = 0; d < shape.Length; d++) managedBytes *= shape[d];
+
         List<ActivationCacheEntry> evicted = new List<ActivationCacheEntry>();
         lock (_activationCacheLock)
         {
@@ -1142,14 +1181,23 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // for the unit-consistency contract.
             bool overMemory = _maxActivationCacheBytes > 0
                 && _currentActivationCacheBytes + buffer.SizeInBytes > _maxActivationCacheBytes;
+            // MANAGED-heap guard: the cache keys strong-root their float[] backing
+            // arrays, so stale cross-step entries can balloon the managed heap even
+            // while VRAM stays capped. Evicting the oldest (stale prior-step) entries
+            // here is what bounds the training-loop leak (gcroot 2026-06-05).
+            bool overManaged = _maxActivationManagedBytes > 0
+                && _currentActivationManagedBytes + managedBytes > _maxActivationManagedBytes;
             // #226 race fix: never evict (offload) an activation while a training step is
             // in flight — every cached forward activation is consumed by THIS step's
             // backward, and the mid-step materialize-then-free races the compiled plan's
             // deferred downloads (CUDA 700 "buffer released before materialization"). The
             // compiled plan reuses STABLE buffers each step, so suspending eviction here
             // does not accumulate across steps; a step that genuinely exceeds VRAM now
-            // fails as a clean CUDA OOM instead of a 700 corruption.
-            if ((overMemory || overCount) && !EvictionSuspended)
+            // fails as a clean CUDA OOM instead of a 700 corruption. The managed-heap
+            // guard composes the same way: stale CROSS-step entries are evicted on the
+            // next non-suspended insert (or the deterministic post-step release), so
+            // suspending within the step does not unbound the managed leak fix.
+            if ((overMemory || overCount || overManaged) && !EvictionSuspended)
             {
                 // Evict the oldest activations, offloading any pending deferred downloads so a
                 // later CPU read / backward re-upload still sees correct data (#226 contract).
@@ -1167,7 +1215,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
 
             var timestamp = System.Threading.Interlocked.Increment(ref _activationCacheTimestamp);
-            var entry = new ActivationCacheEntry(buffer, shape, timestamp, backend);
+            var entry = new ActivationCacheEntry(buffer, shape, timestamp, backend, managedBytes);
             bool added = false;
             try
             {
@@ -1182,6 +1230,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 else
                 {
                     System.Threading.Interlocked.Add(ref _currentActivationCacheBytes, buffer.SizeInBytes);
+                    System.Threading.Interlocked.Add(ref _currentActivationManagedBytes, managedBytes);
                 }
             }
         }
@@ -1219,6 +1268,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 System.Threading.Interlocked.Add(ref _currentActivationCacheBytes,
                     -entry.Buffer.SizeInBytes);
+                System.Threading.Interlocked.Add(ref _currentActivationManagedBytes, -entry.ManagedBytes);
                 removed = entry;
             }
         }
@@ -1250,7 +1300,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 cuda.ConvertToFp16(e.Buffer, fp16, elementCount);
             }
             catch { return false; }
-            _activationCache[key] = new ActivationCacheEntry(fp16, e.Shape, e.Timestamp, e.Backend, isFp16: true, elementCount: elementCount);
+            // Carry ManagedBytes through: the cache KEY (the managed float[] backing array)
+            // is unchanged by the FP16 swap, so the managed-heap retention it pins is too.
+            // Dropping it would make RemoveActivationCacheEntry decrement 0 against the
+            // insert-time add and drift _currentActivationManagedBytes upward.
+            _activationCache[key] = new ActivationCacheEntry(fp16, e.Shape, e.Timestamp, e.Backend, managedBytes: e.ManagedBytes, isFp16: true, elementCount: elementCount);
             System.Threading.Interlocked.Add(ref _currentActivationCacheBytes, fp16.SizeInBytes - e.Buffer.SizeInBytes);
             old = e;
         }
@@ -1274,7 +1328,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 cuda.ConvertToFp32(e.Buffer, fp32, e.ElementCount);
             }
             catch { return false; }
-            _activationCache[key] = new ActivationCacheEntry(fp32, e.Shape, e.Timestamp, e.Backend, isFp16: false, elementCount: e.ElementCount);
+            // Same ManagedBytes carry-through as the FP16 compress swap above.
+            _activationCache[key] = new ActivationCacheEntry(fp32, e.Shape, e.Timestamp, e.Backend, managedBytes: e.ManagedBytes, isFp16: false, elementCount: e.ElementCount);
             System.Threading.Interlocked.Add(ref _currentActivationCacheBytes, fp32.SizeInBytes - e.Buffer.SizeInBytes);
             old = e;
         }
@@ -1370,12 +1425,61 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 System.Threading.Interlocked.Add(ref _currentActivationCacheBytes,
                     -entry.Buffer.SizeInBytes);
+                System.Threading.Interlocked.Add(ref _currentActivationManagedBytes, -entry.ManagedBytes);
                 toDispose.Add(entry);
                 removed++;
             }
         }
 
         return toDispose;
+    }
+
+    /// <summary>
+    /// Monotonic snapshot of the activation-cache timestamp counter. Capture this
+    /// at the start of a forward+backward pass (the outermost GradientTape) and pass
+    /// it to <see cref="EvictActivationsCreatedAfter"/> on tape dispose to release
+    /// EXACTLY that pass's intermediate activations — the deterministic per-step
+    /// lifetime that bounds steady-state memory to ~one step (PyTorch/JAX semantics),
+    /// instead of relying on the LRU byte cap to evict a backlog. Entries created
+    /// BEFORE the snapshot (cross-tape cached intermediates an outer scope still
+    /// wants) are preserved.
+    /// </summary>
+    internal long ActivationCacheTimestampSnapshot()
+        => System.Threading.Interlocked.Read(ref _activationCacheTimestamp);
+
+    /// <summary>
+    /// Deterministically evicts every activation-cache entry created AFTER
+    /// <paramref name="snapshot"/> (i.e. during the just-finished forward+backward).
+    /// Mirrors the #226 materialize-then-free contract of
+    /// <see cref="EvictOldestActivationsUnsafe"/> so any pending deferred download is
+    /// flushed to its CPU array before the GPU buffer is freed. Safe no-op when the
+    /// engine isn't GPU-backed or nothing was cached this pass.
+    /// </summary>
+    internal void EvictActivationsCreatedAfter(long snapshot)
+    {
+        List<ActivationCacheEntry> toDispose;
+        lock (_activationCacheLock)
+        {
+            if (_activationCache.IsEmpty) return;
+            var entries = _activationCache.ToArray();
+            toDispose = new List<ActivationCacheEntry>();
+            for (int i = 0; i < entries.Length; i++)
+            {
+                if (entries[i].Value.Timestamp <= snapshot) continue;   // pre-existing — keep
+                if (Helpers.DeferredArrayMaterializer.IsPending(entries[i].Key))
+                {
+                    try { Helpers.DeferredArrayMaterializer.TryMaterialize(entries[i].Key); }
+                    catch { Helpers.DeferredArrayMaterializer.Remove(entries[i].Key); }
+                }
+                if (_activationCache.TryRemove(entries[i].Key, out var entry))
+                {
+                    System.Threading.Interlocked.Add(ref _currentActivationCacheBytes, -entry.Buffer.SizeInBytes);
+                    System.Threading.Interlocked.Add(ref _currentActivationManagedBytes, -entry.ManagedBytes);
+                    toDispose.Add(entry);
+                }
+            }
+        }
+        foreach (var entry in toDispose) entry.Dispose();
     }
 
     /// <summary>
@@ -1394,6 +1498,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             toDispose = new List<ActivationCacheEntry>(_activationCache.Values);
             _activationCache.Clear();
+            System.Threading.Interlocked.Exchange(ref _currentActivationCacheBytes, 0);
+            System.Threading.Interlocked.Exchange(ref _currentActivationManagedBytes, 0);
         }
 
         // Dispose GPU buffers outside the lock

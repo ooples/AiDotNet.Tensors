@@ -368,6 +368,27 @@ jobs:
             Write-Host "Skipping AiDotNet.Native.ROCm - native binaries not present"
           }
 
+          # Pack CUDA native package (NVIDIA GPU: cudart + cuBLAS + cuBLASLt + nvRTC).
+          # Binaries (~770MB) are gitignored; stage them from the official NVIDIA
+          # redistributable archives first, then pack (industry-standard, no toolkit install).
+          $cudaProj = "src/AiDotNet.Native.CUDA/AiDotNet.Native.CUDA.csproj"
+          if (Test-Path $cudaProj) {
+            Write-Host "Staging CUDA runtime from NVIDIA redist..."
+            pwsh ./tools/stage-cuda-redist.ps1
+            $cudaNative = "src/AiDotNet.Native.CUDA/runtimes/win-x64/native"
+            if ((Test-Path "$cudaNative/cudart64_12.dll") -and (Test-Path "$cudaNative/nvrtc64_120_0.dll")) {
+              Write-Host "Packing AiDotNet.Native.CUDA..."
+              dotnet restore $cudaProj
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+              dotnet build $cudaProj -c Release --no-restore
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+              dotnet pack $cudaProj -c Release -o out --no-build /p:PackageVersion=$VERSION
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            } else {
+              Write-Host "Skipping AiDotNet.Native.CUDA - staging did not produce the required runtime DLLs"
+            }
+          }
+
           # Pack MoltenVK native package (Vulkan on macOS via Metal translation)
           # Only pack if all required native binaries are present for both architectures
           # Note: MoltenVK is not in the solution file, so dotnet restore/build above skips it.
@@ -530,7 +551,7 @@ jobs:
             ## Packages
 
             ${{ steps.packages.outputs.list }}
-            > Note: AiDotNet.Native.CUDA must be built locally due to large binary size (770MB).
+            > Note: AiDotNet.Native.CUDA (~770MB) bundles the NVIDIA CUDA 12 runtime (cudart / cuBLAS / cuBLASLt / nvRTC). It is published by this pipeline (binaries staged from the official NVIDIA redist) and is opt-in — add it alongside AiDotNet.Tensors only on NVIDIA GPU machines.
             > Note: AiDotNet.Native.ROCm requires ROCm installed on the target machine for the kernel library (~496MB).
 
             ## Installation

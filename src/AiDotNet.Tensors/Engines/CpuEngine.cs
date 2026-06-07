@@ -19155,14 +19155,13 @@ public partial class CpuEngine : ITensorLevelEngine
         for (int i = 0; i < axis; i++) outerSize *= output._shape[i];
         for (int i = axis + 1; i < rank; i++) innerSize *= output._shape[i];
 
-        // Logical element count == product(output._shape) == outerSize*axisSize*innerSize. A GPU-origin
-        // tensor can carry a backing array (or a view into a bigger buffer) PADDED to a power of two, so
-        // GetFlattenedData().Length may EXCEED the logical count. The result gradient must have the logical
-        // shape (Rent below validates data.Length == shape total), and the kernels index row*axisSize within
-        // [0,total) — so re-materialize the logical contiguous elements via ToArray() (respects
-        // shape/strides/offset) whenever the raw backing is longer, and allocate the result at `total`.
-        // (Re-applies 4c23f5f, which a later merge on this branch dropped — the padded backing crashed eager
-        // SoftmaxBackward on the GPU fused→eager fallback: "Data length 1048576 must match shape total 983040".)
+        // Logical element count == product(output._shape). A GPU-origin tensor can carry a backing
+        // buffer LARGER than this — capacity-padded to a power of two (e.g. B*ctx 6144 rounded to 8192),
+        // or a view into a bigger buffer — so GetFlattenedData().Length may exceed the logical count.
+        // The result gradient must have the logical shape (Rent below validates length == shape total),
+        // and the kernels index row*axisSize within [0,total), so re-materialize the logical contiguous
+        // elements whenever the raw backing is longer. ToArray() respects shape/strides/offset; this is a
+        // no-op on the hot path (lengths already match). Mirrors GumbelSoftmaxBackward's contiguity guard.
         int total = outerSize * axisSize * innerSize;
 
 #if NET5_0_OR_GREATER
