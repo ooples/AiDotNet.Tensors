@@ -16,6 +16,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 /// and backprop'd with the non-compiled walk (reference), once compiled and backprop'd via the plan. The
 /// FP32 parameter/input gradients must match.
 /// </summary>
+[Collection(MixedPrecisionTestCollection.Name)] // serializes MixedPrecisionEmit.TestOverrideEnabled mutators
 public class MixedPrecisionCompiledBackwardTests
 {
     private readonly IEngine _engine = AiDotNetEngine.Current;

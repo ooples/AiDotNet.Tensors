@@ -65,6 +65,9 @@ internal static class MixedPrecisionEmit
         string opName = "TensorMatMul")
     {
         if (scope is null) throw new ArgumentNullException(nameof(scope));
+        if (a is null) throw new ArgumentNullException(nameof(a));
+        if (b is null) throw new ArgumentNullException(nameof(b));
+        if (outShape is null) throw new ArgumentNullException(nameof(outShape));
 
         // 1. Get inputs as FP16. CRITICAL for the memory win: if an input is already the up-cast output
         // of a prior FP16 op (a matmul-stack intermediate), REUSE that op's existing Half tensor instead

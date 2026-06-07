@@ -15,6 +15,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 /// per-step retrace. Learns y = x·W toward a target with a GradScaler active and asserts the loss
 /// descends with zero FP16 overflow.
 /// </summary>
+[Collection(MixedPrecisionTestCollection.Name)] // serializes MixedPrecisionEmit.TestOverrideEnabled mutators
 public class MixedPrecisionCompiledStepTests
 {
     private readonly IEngine _engine = AiDotNetEngine.Current;

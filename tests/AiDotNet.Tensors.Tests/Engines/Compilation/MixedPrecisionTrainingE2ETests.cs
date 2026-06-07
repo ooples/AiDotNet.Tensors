@@ -18,6 +18,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 /// proving the activation is half-precision AND the gradients are good enough to train, not just to pass
 /// an isolated gradient check.
 /// </summary>
+[Collection(MixedPrecisionTestCollection.Name)] // serializes MixedPrecisionEmit.TestOverrideEnabled mutators
 public class MixedPrecisionTrainingE2ETests
 {
     private readonly IEngine _engine = AiDotNetEngine.Current;

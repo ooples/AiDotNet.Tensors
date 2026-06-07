@@ -13073,6 +13073,14 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (!disposing || IsRuntimeTearingDown || ProcessExiting)
             return;
 
+        // Flush every event-deferred free BEFORE tearing down the pool/context, blocking
+        // on incomplete events (the stream/context are still alive right here, so the
+        // waits are safe). Anything left queued would survive this Dispose holding its
+        // now-stale _context handle; when those CudaGpuBuffer instances later finalize
+        // they would cuCtxPushCurrent/cuMemFree against a DESTROYED context — the exact
+        // finalizer-fatal 0xC0000005 path this method's teardown guards exist to prevent.
+        DrainDeferredFrees(blockOldest: true);
+
         _pinnedPool.Dispose();
         _bufferPool.Dispose();
 

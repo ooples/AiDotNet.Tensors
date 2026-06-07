@@ -19,6 +19,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 /// (not just the first) — the property the ~50% resident win depends on. When run on a CUDA backend it
 /// also reports real device VRAM via nvidia-smi as an on-hardware datapoint.
 /// </summary>
+[Collection(MixedPrecisionTestCollection.Name)] // serializes MixedPrecisionEmit.TestOverrideEnabled mutators
 public class Fp16ActivationMemoryTests
 {
     private readonly IEngine _engine = AiDotNetEngine.Current;
@@ -89,8 +90,16 @@ public class Fp16ActivationMemoryTests
             { RedirectStandardOutput = true, UseShellExecute = false, CreateNoWindow = true };
             using var p = Process.Start(psi);
             if (p is null) return null;
+            // Enforce the timeout BEFORE reading stdout: ReadLine() blocks indefinitely,
+            // so a stalled nvidia-smi would hang the test before WaitForExit was reached.
+            // The one-line output fits comfortably in the pipe buffer, so the process
+            // exits without needing a concurrent reader.
+            if (!p.WaitForExit(5000))
+            {
+                try { p.Kill(entireProcessTree: true); } catch { /* already exited / no access — give up on the probe */ }
+                return null;
+            }
             string outp = p.StandardOutput.ReadLine() ?? "";
-            p.WaitForExit(5000);
             return long.TryParse(outp.Trim(), out var v) ? v : (long?)null;
         }
         catch { return null; }

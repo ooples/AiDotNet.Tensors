@@ -14,6 +14,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 /// mutated in place (proving the plan reuses stable buffers and reads current leaf data on each pass,
 /// i.e. it is usable as a training-step forward).
 /// </summary>
+[Collection(MixedPrecisionTestCollection.Name)] // serializes MixedPrecisionEmit.TestOverrideEnabled mutators
 public class MixedPrecisionCompiledForwardTests
 {
     private readonly IEngine _engine = AiDotNetEngine.Current;

@@ -46,9 +46,22 @@ internal sealed class MixedPrecisionTape : IDisposable
     public MixedPrecisionTape(GradientTapeOptions? options = null)
     {
         _engine = AiDotNetEngine.Current;
+        // The Gauss-Seidel sweep in RunSweep calls ComputeGradients on BOTH inner tapes
+        // once per round. A non-persistent GradientTape clears its entries after the
+        // first ComputeGradients, so every later round would silently no-op and
+        // truncate the boundary propagation — gradients would be WRONG, not slow.
+        // Persistent inner tapes are therefore a hard requirement, not a preference.
+        var tapeOptions = options ?? GradientTapeOptions.Default;
+        if (!tapeOptions.Persistent)
+        {
+            throw new ArgumentException(
+                "MixedPrecisionTape requires GradientTapeOptions.Persistent=true: its multi-round " +
+                "cast-boundary sweep re-runs ComputeGradients over the same recorded graph, which a " +
+                "non-persistent tape clears after the first call.", nameof(options));
+        }
         // Order matters only for disposal symmetry; both set their own ThreadStatic Current<T>.
-        _fp32 = new GradientTape<float>(options);
-        _fp16 = new GradientTape<Half>(options);
+        _fp32 = new GradientTape<float>(tapeOptions);
+        _fp16 = new GradientTape<Half>(tapeOptions);
     }
 
     public GradientTape<float> Fp32Tape => _fp32;

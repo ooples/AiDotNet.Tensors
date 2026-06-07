@@ -17,6 +17,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 /// finite, descends, and never NaNs, and reporting device VRAM. Skipped when no CUDA backend is active
 /// (the activation-storage 0.500x ratio itself is proven deterministically in Fp16ActivationMemoryTests).
 /// </summary>
+[Collection(MixedPrecisionTestCollection.Name)] // serializes MixedPrecisionEmit.TestOverrideEnabled mutators
 public class MixedPrecisionCompiledScaleGpuTests
 {
     private readonly IEngine _engine = AiDotNetEngine.Current;

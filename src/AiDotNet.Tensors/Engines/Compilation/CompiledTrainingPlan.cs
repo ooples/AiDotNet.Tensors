@@ -472,27 +472,54 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             _graphStepCalls++;
             if (_graphStepCalls > GraphWarmupSteps)
             {
-                if (_stepGraphExec == IntPtr.Zero)
+                // Same step-atomicity contracts as StepEager (review #557 — the graph path
+                // bypasses StepEager after warmup, so without these the protections silently
+                // vanish once the graph engages):
+                //  • SuspendActivationEviction — the CAPTURE body caches activations exactly
+                //    like an eager step (the mid-step offload would race its deferred
+                //    downloads, #226 CUDA 700), and on REPLAY the eager optimizer update's
+                //    host-side ops can trigger cache inserts/evictions while the graph's
+                //    async kernel chain is still in flight.
+                //  • AutocastScope — the kernels recorded at capture must be chosen under the
+                //    SAME autocast the warmup StepEager steps ran with, or
+                //    AIDOTNET_CUDA_GRAPH_STEP=1 changes numerics after warmup (FP16
+                //    activation storage silently falling back to the non-autocast path).
+                //    AutocastScope is a thread-static stack, so nesting with StepEager's own
+                //    scope on the capture-failure fallback is safe; eviction suspension is
+                //    refcounted for the same reason.
+                var evictGuard = System.Environment.GetEnvironmentVariable("AIDOTNET_GPU_OFFLOAD") == "1"
+                    ? null
+                    : gte;
+                evictGuard?.SuspendActivationEviction();
+                using var _graphAutocast = AiDotNet.Tensors.Engines.Gpu.AutocastScope.EnableFromEnvironment();
+                try
                 {
-                    // Record the GPU forward+grad-zero+backward sequence into a graph,
-                    // then launch once to actually execute THIS step (capture only
-                    // records). The caller has already refreshed the persistent input
-                    // buffer's CONTENTS, so the stable pointers stay valid across replays.
-                    var exec = cb.CaptureGraph(() => RunGpuStepBodyForCapture(cb));
-                    if (exec == IntPtr.Zero) { _graphStepDisabled = true; return StepEager(); }
-                    _stepGraphExec = exec;
-                    cb.LaunchCapturedGraph(exec);
-                    // The optimizer update is run eagerly (NOT captured): its closure
-                    // increments _optimizerStep and re-evaluates lrSchedule.GetLr +
-                    // Adam/AdamW bias-correction each step, and bakes those scalars into
-                    // the kernel args — a captured replay would freeze them at the
-                    // capture step. Its kernels enqueue (in order) after the graph launch.
+                    if (_stepGraphExec == IntPtr.Zero)
+                    {
+                        // Record the GPU forward+grad-zero+backward sequence into a graph,
+                        // then launch once to actually execute THIS step (capture only
+                        // records). The caller has already refreshed the persistent input
+                        // buffer's CONTENTS, so the stable pointers stay valid across replays.
+                        var exec = cb.CaptureGraph(() => RunGpuStepBodyForCapture(cb));
+                        if (exec == IntPtr.Zero) { _graphStepDisabled = true; return StepEager(); }
+                        _stepGraphExec = exec;
+                        cb.LaunchCapturedGraph(exec);
+                        // The optimizer update is run eagerly (NOT captured): its closure
+                        // increments _optimizerStep and re-evaluates lrSchedule.GetLr +
+                        // Adam/AdamW bias-correction each step, and bakes those scalars into
+                        // the kernel args — a captured replay would freeze them at the
+                        // capture step. Its kernels enqueue (in order) after the graph launch.
+                        _optimizerUpdate?.Invoke();
+                        return _lossOutput;
+                    }
+                    cb.LaunchCapturedGraph(_stepGraphExec);
                     _optimizerUpdate?.Invoke();
                     return _lossOutput;
                 }
-                cb.LaunchCapturedGraph(_stepGraphExec);
-                _optimizerUpdate?.Invoke();
-                return _lossOutput;
+                finally
+                {
+                    evictGuard?.ResumeActivationEviction();
+                }
             }
         }
         return StepEager();
