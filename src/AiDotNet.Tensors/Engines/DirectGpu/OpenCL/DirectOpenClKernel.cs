@@ -67,7 +67,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             => Pending.Add(new PendingArg(index, ArgKind.Int32, value));
 
         public void SetArg(uint index, float value)
-            => Pending.Add(new PendingArg(index, ArgKind.Float, BitConverter.SingleToInt32Bits(value)));
+            => Pending.Add(new PendingArg(index, ArgKind.Float, BitConverter.ToInt32(BitConverter.GetBytes(value), 0)));
 
         public void SetArg(uint index, ulong value)
             => Pending.Add(new PendingArg(index, ArgKind.UInt64, unchecked((long)value)));
@@ -110,7 +110,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     case ArgKind.Float:
                     {
                         IntPtr ptr = Marshal.AllocHGlobal(sizeof(float));
-                        try { Marshal.Copy(new float[] { BitConverter.Int32BitsToSingle((int)a.Raw) }, 0, ptr, 1); err = OpenClNativeBindings.SetKernelArg(_kernel, a.Index, (UIntPtr)sizeof(float), ptr); }
+                        try { Marshal.Copy(new float[] { BitConverter.ToSingle(BitConverter.GetBytes((int)a.Raw), 0) }, 0, ptr, 1); err = OpenClNativeBindings.SetKernelArg(_kernel, a.Index, (UIntPtr)sizeof(float), ptr); }
                         finally { Marshal.FreeHGlobal(ptr); }
                         break;
                     }
