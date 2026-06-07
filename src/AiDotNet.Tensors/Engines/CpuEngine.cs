@@ -29951,6 +29951,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var capturedVocab = vocabSize;
                 var capturedDim = embeddingDim;
                 int n = numIndices;
+                var capturedIndices = indices;   // LIVE reference — see #1331-for-embeddings below
                 var idxSnap = SnapshotIndicesToLongArray(indices);
                 var idxShapeSnap = (int[])indices._shape.Clone();
                 return scope.RecordUnary(
@@ -29960,6 +29961,16 @@ public partial class CpuEngine : ITensorLevelEngine
                     outputShape,
                     (eng, output) =>
                     {
+                        // #1331-for-embeddings: re-read the LIVE indices each replay. The compiled plan is
+                        // traced once and replayed across steps; the higher-level Train() loop refreshes the
+                        // input tensor's data IN PLACE (persistent-input fix). But the indices were captured
+                        // as a FROZEN snapshot here, so the compiled embedding gathered the TRACE-batch tokens
+                        // every step — freezing the whole transformer on batch #0 (overfit-one-batch; near-zero
+                        // held-out). Refresh the shared idxSnap from the live indices tensor so BOTH this
+                        // forward gather AND the matching backward (which holds the same idxSnap array) use the
+                        // current step's tokens. Covered by EmbeddingIndicesMustRefreshAcrossStep_NotFrozenAtCompileTime.
+                        var liveRaw = capturedIndices.GetDataArray();
+                        for (int i = 0; i < n; i++) idxSnap[i] = Convert.ToInt64(liveRaw[i]);
                         // Replay forward: re-execute the row-gather into
                         // the pre-allocated output buffer.
                         var embDataLocal = capturedEmb.GetDataArray();
