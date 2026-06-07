@@ -29905,6 +29905,61 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 #endif
 
+    /// <summary>
+    /// Sparse-CE true-class gather: returns out[i] = logP[i, round(target[i])] for [B,V] log-probs and
+    /// [B] FLOAT class targets — the differentiable core of GpuSparseCrossEntropyLoss WITHOUT a [B,V]
+    /// one-hot. Targets are re-read LIVE each compiled-plan replay (and at backward time), so it does NOT
+    /// freeze at the trace batch (the #1331 bug class that killed HE_SPARSE_CE training). Backward scatters
+    /// the upstream gradient to logP[i, target[i]]. virtual so a GPU engine may override with a kernel.
+    /// </summary>
+    public virtual Tensor<float> SparseCEGatherTrueClass(Tensor<float> logP, Tensor<float> targetFloat)
+    {
+        if (logP == null) throw new ArgumentNullException(nameof(logP));
+        if (targetFloat == null) throw new ArgumentNullException(nameof(targetFloat));
+        int rank = logP._shape.Length;
+        int V = logP._shape[rank - 1];
+        int B = logP.Length / V;
+        if (targetFloat.Length != B)
+            throw new ArgumentException($"SparseCEGatherTrueClass expects {B} targets for [{B},{V}] logP, got {targetFloat.Length}.");
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope is not null)
+            {
+                var capLogP = logP; var capTarget = targetFloat; int capV = V, capB = B;
+                return scope.RecordUnary(LazyNodeType.Custom, "SparseCEGatherTrueClass", logP, new[] { B },
+                    (eng, output) =>
+                    {
+                        var lp = capLogP.GetDataArray();
+                        var tg = capTarget.GetDataArray();          // LIVE target — re-read each replay
+                        var o = output.GetDataArray();
+                        for (int i = 0; i < capB; i++)
+                        {
+                            int c = (int)Math.Round((double)tg[i]);
+                            if (c < 0 || c >= capV) throw new ArgumentOutOfRangeException(nameof(targetFloat), $"target[{i}]={c} out of [0,{capV}).");
+                            o[i] = lp[i * capV + c];
+                        }
+                    },
+                    BackwardFunctions<float>.SparseCEGatherBackward, new object[] { capTarget, capV });
+            }
+        }
+
+        var lpD = logP.GetDataArray();
+        var tgD = targetFloat.GetDataArray();
+        var res = new Tensor<float>(new[] { B });
+        var rD = res.GetDataArray();
+        for (int i = 0; i < B; i++)
+        {
+            int c = (int)Math.Round((double)tgD[i]);
+            if (c < 0 || c >= V) throw new ArgumentOutOfRangeException(nameof(targetFloat), $"target[{i}]={c} out of [0,{V}).");
+            rD[i] = lpD[i * V + c];
+        }
+        if (DifferentiableOps.IsTapeActiveForThread<float>())
+            DifferentiableOps.RecordUnary("SparseCEGatherTrueClass", res, logP, BackwardFunctions<float>.SparseCEGatherBackward, new object[] { targetFloat, V });
+        return res;
+    }
+
     /// <inheritdoc/>
     public Tensor<TValue> TensorEmbeddingLookup<TValue, TIndex>(Tensor<TValue> embeddings, Tensor<TIndex> indices)
         where TIndex : unmanaged

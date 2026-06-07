@@ -1271,6 +1271,34 @@ internal static class BackwardFunctions<T>
         }
     }
 
+    /// <summary>
+    /// Backward for the sparse-CE true-class gather (CpuEngine.SparseCEGatherTrueClass): forward returns
+    /// out[i] = logP[i, target[i]]; backward scatters gradOutput[i] back to grad_logP[i, target[i]] and 0
+    /// elsewhere. Targets are read FRESH from the captured float tensor (savedState[0]) at backward time —
+    /// like the #1331 embedding companion — so a plan.Step() after the target was updated in place gathers
+    /// AND scatters against the SAME current tokens (no trace-time freeze).
+    /// </summary>
+    internal static void SparseCEGatherBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var capturedTarget = (Tensor<T>)savedState[0];   // live [B] float targets
+        int V = (int)savedState[1];
+        var logP = inputs[0];                            // [B, V]
+        int B = capturedTarget.Length;
+        var nops = MathHelper.GetNumericOperations<T>();
+        var go = gradOutput.GetDataArray();              // [B]
+        var tg = capturedTarget.GetDataArray();          // [B] live
+        var gradLogP = new Tensor<T>(logP._shape);       // zeros [B,V]
+        var gl = gradLogP.GetDataArray();
+        for (int i = 0; i < B; i++)
+        {
+            int c = (int)Math.Round(nops.ToDouble(tg[i]));
+            if (c >= 0 && c < V) gl[i * V + c] = go[i];   // scatter upstream grad to the true class
+        }
+        DifferentiableOps.AccumulateGrad(grads, logP, gradLogP, engine);
+    }
+
     /// <summary>GeGLU backward: dispatches to engine.GeGLUBackward(gradOutput, input, dim).</summary>
     internal static void GeGLUBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,

@@ -478,6 +478,38 @@ public class MultiMatMulFusedAdamParamUpdateTests
         }
     }
 
+    /// <summary>Isolates the sparse-CE gather op: change the target token in place between steps; the
+    /// compiled loss MUST track the fresh token (not freeze at the trace batch). Proves the op itself is
+    /// live + differentiable, separating it from the harness-side persistent-target plumbing.</summary>
+    [Fact]
+    public void SparseCEGather_LiveTarget_TracksFreshTargetAcrossStep()
+    {
+        var engine = new CpuEngine();
+        const int B = 2, V = 4;
+        var logits = FilledRand(new[] { B, V }, seed: 888);
+        var target = new Tensor<float>(new[] { B });
+        target[0] = 0f; target[1] = 1f;
+
+        ICompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            var logP = engine.TensorLogSoftmax(logits, 1);
+            var g = engine.SparseCEGatherTrueClass(logP, target);
+            engine.ReduceSum(g, null, false);
+            plan = scope.CompileTraining(new[] { logits });
+        }
+        using (plan)
+        {
+            plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.0f);  // freeze logits → loss = Σ logP[i,target[i]]
+            var loss0 = plan.Step().AsSpan()[0];
+            target[1] = 3f;                                                  // change token IN-PLACE
+            var loss1 = plan.Step().AsSpan()[0];
+            _output.WriteLine($"  loss0(tok 0,1)={loss0:F6} loss1(tok 0,3)={loss1:F6}");
+            Assert.True(System.Math.Abs(loss1 - loss0) > 1e-5,
+                $"SparseCEGatherTrueClass FROZE the target: loss0={loss0:F5}==loss1={loss1:F5}. The op must re-read live targets.");
+        }
+    }
+
     /// <summary>
     /// Larger Transformer-shaped chain: embedding → multi-head projection
     /// pattern (Reshape + Permute) → attention-like matmul + softmax →
