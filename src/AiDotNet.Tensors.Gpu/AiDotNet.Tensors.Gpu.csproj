@@ -1,0 +1,41 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    GPU meta-package (PyTorch/ONNX-Runtime style). Installing AiDotNet.Tensors.Gpu pulls in
+    AiDotNet.Tensors PLUS the full NVIDIA CUDA runtime (cuBLAS + nvRTC) so NVIDIA GPU acceleration
+    works out of the box with no CUDA Toolkit install. CPU-only consumers keep using the lean base
+    AiDotNet.Tensors package and never download the ~900MB of CUDA DLLs.
+  -->
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <PackageId>AiDotNet.Tensors.Gpu</PackageId>
+    <!-- Tracks the AiDotNet.Tensors version it bundles. -->
+    <Version>0.91.46</Version>
+    <Authors>AiDotNet Contributors</Authors>
+    <Company>AiDotNet</Company>
+    <Description>GPU meta-package: AiDotNet.Tensors + the full NVIDIA CUDA runtime (cuBLAS + nvRTC) for out-of-the-box NVIDIA GPU acceleration — no CUDA Toolkit install required. Install this instead of AiDotNet.Tensors to get GPU support by default.</Description>
+    <PackageTags>aidotnet;tensors;gpu;cuda;nvidia;machine-learning;deep-learning</PackageTags>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/ooples/AiDotNet.Tensors</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/ooples/AiDotNet.Tensors</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+
+    <!-- Meta-package: dependencies only, no managed output. Keep the package dependencies (do NOT
+         suppress) so a consumer gets the full transitive GPU stack. -->
+    <IncludeBuildOutput>false</IncludeBuildOutput>
+    <SuppressDependenciesWhenPacking>false</SuppressDependenciesWhenPacking>
+    <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
+    <NoWarn>$(NoWarn);NU5128</NoWarn> <!-- meta-package has deps but no lib/ — by design -->
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="AiDotNet.Tensors" Version="0.91.46" />
+    <PackageReference Include="AiDotNet.Native.CUDA" Version="12.5.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+</Project>

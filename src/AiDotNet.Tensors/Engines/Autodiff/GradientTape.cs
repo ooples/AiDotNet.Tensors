@@ -472,6 +472,23 @@ public sealed class GradientTape<T> : IDisposable
         Tensor<T> loss,
         IReadOnlyList<Tensor<T>>? sources = null,
         bool createGraph = false)
+        => ComputeGradients(loss, sources, createGraph, seedOverride: null);
+
+    /// <summary>
+    /// Backward with an optional custom gradient seed. When <paramref name="seedOverride"/>
+    /// is null this is byte-identical to the public <see cref="ComputeGradients(Tensor{T},IReadOnlyList{Tensor{T}},bool)"/>
+    /// (ones-at-loss seeding, compiled/graph fast paths eligible). When it is supplied, the
+    /// listed (tensor, grad) pairs are seeded into the backward instead of ones-at-loss, and
+    /// the slow tape walk is forced (the compiled/graph fast paths assume a single ones seed at
+    /// <paramref name="loss"/>). This is the mixed-precision bridge entry point: the FP16 sub-tape's
+    /// backward is seeded with the FP32 grad cast down at each up-cast boundary (see
+    /// <see cref="MixedPrecisionTape"/>). Not public — mixed-dtype autograd is the only caller.
+    /// </summary>
+    internal Dictionary<Tensor<T>, Tensor<T>> ComputeGradients(
+        Tensor<T> loss,
+        IReadOnlyList<Tensor<T>>? sources,
+        bool createGraph,
+        IReadOnlyList<KeyValuePair<Tensor<T>, Tensor<T>>>? seedOverride)
     {
         if (_disposed)
         {
@@ -493,7 +510,7 @@ public sealed class GradientTape<T> : IDisposable
         bool hasHooksRegistered = (_hooks is not null && _hooks.Count > 0)
             || (_nodeHooks is not null && _nodeHooks.Count > 0)
             || (_nodePredicateHooks is not null && _nodePredicateHooks.Count > 0);
-        if (_options.Persistent && !createGraph)
+        if (_options.Persistent && !createGraph && seedOverride is null)
         {
             var compiledBwd = Compilation.AutoTrainingCompiler.TryGetCompiledBackward(this, loss, sources?.ToArray());
             if (compiledBwd is not null)
@@ -533,7 +550,7 @@ public sealed class GradientTape<T> : IDisposable
         // tape path whenever anomaly detection is on, either via the
         // per-tape flag or an ambient AnomalyModeScope. Same reasoning
         // that exists for DetectAnomaly extends to the scope.
-        if (loss.GradFn is not null && !createGraph && !DetectAnomaly && !AnomalyModeScope.IsActive && !hasHooksRegistered)
+        if (loss.GradFn is not null && !createGraph && !DetectAnomaly && !AnomalyModeScope.IsActive && !hasHooksRegistered && seedOverride is null)
         {
             // Record step pattern BEFORE backward — backward ops get recorded on the tape
             // (since DifferentiableOps always records), which would make the hash nondeterministic.
@@ -593,26 +610,50 @@ public sealed class GradientTape<T> : IDisposable
             Math.Min(gradIndexCount + 1, 1024),
             ReferenceEqualityComparer<Tensor<T>>.Instance);
 
-        // Seed: gradient of loss w.r.t. itself is ones with the same shape.
-        // Fast path for scalar loss (the overwhelmingly common case in training).
-        // Reuse cached scalar seed across training steps to avoid per-backward allocation.
-        Tensor<T> seedGrad;
-        if (loss.Length == 1)
+        if (seedOverride is not null)
         {
-            // Use loss's actual shape (could be [1] or [] for 0-dim scalar)
-            seedGrad = _cachedScalarSeed ??= new Tensor<T>(new[] { numOps.One }, (int[])loss._shape.Clone());
+            // Mixed-precision bridge: seed the supplied (tensor, grad) pairs directly instead
+            // of ones-at-loss. Each tensor is an interior node of this (sub-)tape that received
+            // its gradient from the other-dtype tape across a differentiable cast boundary.
+            for (int s = 0; s < seedOverride.Count; s++)
+            {
+                var t = seedOverride[s].Key;
+                var g = seedOverride[s].Value;
+                if (grads.TryGetValue(t, out var existing))
+                {
+                    grads[t] = engine.TensorAdd(existing, g);
+                }
+                else
+                {
+                    grads[t] = g;
+                }
+                if (t._gradIndex >= 0 && t._gradIndex < indexedGrads.Length)
+                    indexedGrads[t._gradIndex] = grads[t];
+            }
         }
         else
         {
-            var onesData = new T[loss.Length];
-            var one = numOps.One;
-            for (int j = 0; j < onesData.Length; j++)
-                onesData[j] = one;
-            seedGrad = new Tensor<T>(onesData, loss._shape);
+            // Seed: gradient of loss w.r.t. itself is ones with the same shape.
+            // Fast path for scalar loss (the overwhelmingly common case in training).
+            // Reuse cached scalar seed across training steps to avoid per-backward allocation.
+            Tensor<T> seedGrad;
+            if (loss.Length == 1)
+            {
+                // Use loss's actual shape (could be [1] or [] for 0-dim scalar)
+                seedGrad = _cachedScalarSeed ??= new Tensor<T>(new[] { numOps.One }, (int[])loss._shape.Clone());
+            }
+            else
+            {
+                var onesData = new T[loss.Length];
+                var one = numOps.One;
+                for (int j = 0; j < onesData.Length; j++)
+                    onesData[j] = one;
+                seedGrad = new Tensor<T>(onesData, loss._shape);
+            }
+            grads[loss] = seedGrad;
+            if (loss._gradIndex >= 0 && loss._gradIndex < indexedGrads.Length)
+                indexedGrads[loss._gradIndex] = seedGrad;
         }
-        grads[loss] = seedGrad;
-        if (loss._gradIndex >= 0 && loss._gradIndex < indexedGrads.Length)
-            indexedGrads[loss._gradIndex] = seedGrad;
 
         // When createGraph=false (default): suspend recording so backward engine calls
         // don't append to this tape — they'd corrupt persistent tapes and shift bounded tapes.
