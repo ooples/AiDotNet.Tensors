@@ -387,11 +387,14 @@ public sealed class GradientTape<T> : IDisposable
             var grads = new Dictionary<Tensor<T>, Tensor<T>>(
                 stepCount + 1, ReferenceEqualityComparer<Tensor<T>>.Instance);
 
-            // Seed gradient (dL/dL = 1), same construction as the chain executor.
+            // Seed gradient (dL/dL = 1), same construction as ComputeGradients:
+            // use the loss's ACTUAL shape (which may be [] for a 0-dim scalar or
+            // [1]), not a hardcoded [1] — a hardcoded rank-1 seed mismatches a
+            // 0-dim scalar loss and can break shape-checked backward ops.
             Tensor<T> seedGrad;
             if (loss.Length == 1)
             {
-                seedGrad = new Tensor<T>(new[] { numOps.One }, new[] { 1 });
+                seedGrad = new Tensor<T>(new[] { numOps.One }, (int[])loss._shape.Clone());
             }
             else
             {
