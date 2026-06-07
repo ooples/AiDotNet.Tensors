@@ -96,7 +96,13 @@ public class Fp16ActivationMemoryTests
             // exits without needing a concurrent reader.
             if (!p.WaitForExit(5000))
             {
+#if NET5_0_OR_GREATER
                 try { p.Kill(entireProcessTree: true); } catch { /* already exited / no access — give up on the probe */ }
+#else
+                // net471: the entireProcessTree overload doesn't exist; nvidia-smi spawns
+                // no children, so the plain Kill is equivalent here.
+                try { p.Kill(); } catch { /* already exited / no access — give up on the probe */ }
+#endif
                 return null;
             }
             string outp = p.StandardOutput.ReadLine() ?? "";
