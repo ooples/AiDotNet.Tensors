@@ -27,80 +27,107 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 throw new InvalidOperationException($"Failed to create OpenCL kernel '{kernelName}': {err}");
         }
 
+        // ── Thread-safety: a cl_kernel object is SHARED (cached per name) across all
+        // threads, and clSetKernelArg mutates it. Two threads doing SetArg+Execute
+        // concurrently would stomp each other's args (undefined behavior / crashes —
+        // the root cause of concurrent-tape GPU corruption). Fix: SetArg only RECORDS
+        // the argument into a per-thread pending list; Execute then applies the args
+        // and enqueues ATOMICALLY under a single process-wide submit lock. Because
+        // clEnqueueNDRangeKernel snapshots the kernel's current args into the queued
+        // command, the lock only needs to span apply-args + enqueue — the GPU work
+        // itself still runs asynchronously, so submission is serialized but execution
+        // pipelines. A single GPU has one in-order queue, so this is the natural model.
+        private enum ArgKind { Buffer, Int32, Float, UInt64, Local }
+        private readonly struct PendingArg
+        {
+            public readonly uint Index;
+            public readonly ArgKind Kind;
+            public readonly long Raw; // buffer handle / int / float-bits / ulong / local byte size
+            public PendingArg(uint index, ArgKind kind, long raw) { Index = index; Kind = kind; Raw = raw; }
+        }
+
+        // Per-thread pending args. Each op sets a kernel's args then immediately
+        // Executes it on the same thread, so the list holds exactly that kernel's
+        // args at Execute time; Execute clears it.
+        [ThreadStatic] private static System.Collections.Generic.List<PendingArg>? _pendingArgs;
+
+        // Serializes the apply-args + enqueue critical section across ALL kernels
+        // (the shared cl_kernel arg state and the shared command queue both require it).
+        private static readonly object _submitLock = new object();
+
+        private static System.Collections.Generic.List<PendingArg> Pending
+            => _pendingArgs ??= new System.Collections.Generic.List<PendingArg>(8);
+
         #region SetArg Overloads
 
         public void SetArg(uint index, IntPtr bufferHandle)
-        {
-            IntPtr ptr = Marshal.AllocHGlobal(IntPtr.Size);
-            try
-            {
-                Marshal.WriteIntPtr(ptr, bufferHandle);
-                int err = OpenClNativeBindings.SetKernelArg(_kernel, index, (UIntPtr)IntPtr.Size, ptr);
-                if (err != OpenClNativeBindings.CL_SUCCESS)
-                    throw new InvalidOperationException($"Failed to set kernel arg {index}: {err}");
-            }
-            finally
-            {
-                Marshal.FreeHGlobal(ptr);
-            }
-        }
+            => Pending.Add(new PendingArg(index, ArgKind.Buffer, (long)bufferHandle));
 
         public void SetArg(uint index, int value)
-        {
-            IntPtr ptr = Marshal.AllocHGlobal(sizeof(int));
-            try
-            {
-                Marshal.WriteInt32(ptr, value);
-                int err = OpenClNativeBindings.SetKernelArg(_kernel, index, (UIntPtr)sizeof(int), ptr);
-                if (err != OpenClNativeBindings.CL_SUCCESS)
-                    throw new InvalidOperationException($"Failed to set kernel arg {index}: {err}");
-            }
-            finally
-            {
-                Marshal.FreeHGlobal(ptr);
-            }
-        }
+            => Pending.Add(new PendingArg(index, ArgKind.Int32, value));
 
         public void SetArg(uint index, float value)
-        {
-            IntPtr ptr = Marshal.AllocHGlobal(sizeof(float));
-            try
-            {
-                Marshal.Copy(new float[] { value }, 0, ptr, 1);
-                int err = OpenClNativeBindings.SetKernelArg(_kernel, index, (UIntPtr)sizeof(float), ptr);
-                if (err != OpenClNativeBindings.CL_SUCCESS)
-                    throw new InvalidOperationException($"Failed to set kernel arg {index}: {err}");
-            }
-            finally
-            {
-                Marshal.FreeHGlobal(ptr);
-            }
-        }
+            => Pending.Add(new PendingArg(index, ArgKind.Float, BitConverter.SingleToInt32Bits(value)));
 
         public void SetArg(uint index, ulong value)
-        {
-            IntPtr ptr = Marshal.AllocHGlobal(sizeof(ulong));
-            try
-            {
-                Marshal.WriteInt64(ptr, unchecked((long)value));
-                int err = OpenClNativeBindings.SetKernelArg(_kernel, index, (UIntPtr)sizeof(ulong), ptr);
-                if (err != OpenClNativeBindings.CL_SUCCESS)
-                    throw new InvalidOperationException($"Failed to set kernel arg {index}: {err}");
-            }
-            finally
-            {
-                Marshal.FreeHGlobal(ptr);
-            }
-        }
+            => Pending.Add(new PendingArg(index, ArgKind.UInt64, unchecked((long)value)));
 
         /// <summary>
         /// Sets a local memory argument (for shared memory allocation).
         /// </summary>
         public void SetLocalArg(uint index, int sizeInBytes)
+            => Pending.Add(new PendingArg(index, ArgKind.Local, sizeInBytes));
+
+        // Applies the per-thread pending args to the shared kernel. MUST be called
+        // while holding _submitLock and immediately before the matching enqueue.
+        private void ApplyPendingArgsLocked()
         {
-            int err = OpenClNativeBindings.SetKernelArg(_kernel, index, (UIntPtr)sizeInBytes, IntPtr.Zero);
-            if (err != OpenClNativeBindings.CL_SUCCESS)
-                throw new InvalidOperationException($"Failed to set local arg {index}: {err}");
+            var pending = _pendingArgs;
+            if (pending == null) return;
+            for (int i = 0; i < pending.Count; i++)
+            {
+                var a = pending[i];
+                int err;
+                switch (a.Kind)
+                {
+                    case ArgKind.Local:
+                        err = OpenClNativeBindings.SetKernelArg(_kernel, a.Index, (UIntPtr)a.Raw, IntPtr.Zero);
+                        break;
+                    case ArgKind.Buffer:
+                    {
+                        IntPtr ptr = Marshal.AllocHGlobal(IntPtr.Size);
+                        try { Marshal.WriteIntPtr(ptr, (IntPtr)a.Raw); err = OpenClNativeBindings.SetKernelArg(_kernel, a.Index, (UIntPtr)IntPtr.Size, ptr); }
+                        finally { Marshal.FreeHGlobal(ptr); }
+                        break;
+                    }
+                    case ArgKind.Int32:
+                    {
+                        IntPtr ptr = Marshal.AllocHGlobal(sizeof(int));
+                        try { Marshal.WriteInt32(ptr, (int)a.Raw); err = OpenClNativeBindings.SetKernelArg(_kernel, a.Index, (UIntPtr)sizeof(int), ptr); }
+                        finally { Marshal.FreeHGlobal(ptr); }
+                        break;
+                    }
+                    case ArgKind.Float:
+                    {
+                        IntPtr ptr = Marshal.AllocHGlobal(sizeof(float));
+                        try { Marshal.Copy(new float[] { BitConverter.Int32BitsToSingle((int)a.Raw) }, 0, ptr, 1); err = OpenClNativeBindings.SetKernelArg(_kernel, a.Index, (UIntPtr)sizeof(float), ptr); }
+                        finally { Marshal.FreeHGlobal(ptr); }
+                        break;
+                    }
+                    default: // UInt64
+                    {
+                        IntPtr ptr = Marshal.AllocHGlobal(sizeof(ulong));
+                        try { Marshal.WriteInt64(ptr, a.Raw); err = OpenClNativeBindings.SetKernelArg(_kernel, a.Index, (UIntPtr)sizeof(ulong), ptr); }
+                        finally { Marshal.FreeHGlobal(ptr); }
+                        break;
+                    }
+                }
+                if (err != OpenClNativeBindings.CL_SUCCESS)
+                {
+                    pending.Clear();
+                    throw new InvalidOperationException($"Failed to set kernel arg {a.Index}: {err}");
+                }
+            }
         }
 
         #endregion
@@ -118,16 +145,22 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             var globalSizes = new UIntPtr[] { (UIntPtr)alignedGlobal };
             var localSizes = new UIntPtr[] { (UIntPtr)localSize };
 
-            int err = OpenClNativeBindings.EnqueueNDRangeKernel(
-                _context.CommandQueue,
-                _kernel,
-                1, // work_dim
-                null, // global_work_offset
-                globalSizes,
-                localSizes,
-                0,
-                IntPtr.Zero,
-                IntPtr.Zero);
+            int err;
+            lock (_submitLock)
+            {
+                ApplyPendingArgsLocked();
+                err = OpenClNativeBindings.EnqueueNDRangeKernel(
+                    _context.CommandQueue,
+                    _kernel,
+                    1, // work_dim
+                    null, // global_work_offset
+                    globalSizes,
+                    localSizes,
+                    0,
+                    IntPtr.Zero,
+                    IntPtr.Zero);
+                _pendingArgs?.Clear();
+            }
 
             if (err != OpenClNativeBindings.CL_SUCCESS)
                 throw new InvalidOperationException($"Failed to enqueue kernel: {err}");
@@ -145,16 +178,22 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             var globalSizes = new UIntPtr[] { (UIntPtr)alignedGlobalX, (UIntPtr)alignedGlobalY };
             var localSizes = new UIntPtr[] { (UIntPtr)localSizeX, (UIntPtr)localSizeY };
 
-            int err = OpenClNativeBindings.EnqueueNDRangeKernel(
-                _context.CommandQueue,
-                _kernel,
-                2, // work_dim
-                null, // global_work_offset
-                globalSizes,
-                localSizes,
-                0,
-                IntPtr.Zero,
-                IntPtr.Zero);
+            int err;
+            lock (_submitLock)
+            {
+                ApplyPendingArgsLocked();
+                err = OpenClNativeBindings.EnqueueNDRangeKernel(
+                    _context.CommandQueue,
+                    _kernel,
+                    2, // work_dim
+                    null, // global_work_offset
+                    globalSizes,
+                    localSizes,
+                    0,
+                    IntPtr.Zero,
+                    IntPtr.Zero);
+                _pendingArgs?.Clear();
+            }
 
             if (err != OpenClNativeBindings.CL_SUCCESS)
                 throw new InvalidOperationException($"Failed to enqueue kernel: {err}");
@@ -173,16 +212,22 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             var globalSizes = new UIntPtr[] { (UIntPtr)alignedGlobalX, (UIntPtr)alignedGlobalY, (UIntPtr)alignedGlobalZ };
             var localSizes = new UIntPtr[] { (UIntPtr)localSizeX, (UIntPtr)localSizeY, (UIntPtr)localSizeZ };
 
-            int err = OpenClNativeBindings.EnqueueNDRangeKernel(
-                _context.CommandQueue,
-                _kernel,
-                3, // work_dim
-                null, // global_work_offset
-                globalSizes,
-                localSizes,
-                0,
-                IntPtr.Zero,
-                IntPtr.Zero);
+            int err;
+            lock (_submitLock)
+            {
+                ApplyPendingArgsLocked();
+                err = OpenClNativeBindings.EnqueueNDRangeKernel(
+                    _context.CommandQueue,
+                    _kernel,
+                    3, // work_dim
+                    null, // global_work_offset
+                    globalSizes,
+                    localSizes,
+                    0,
+                    IntPtr.Zero,
+                    IntPtr.Zero);
+                _pendingArgs?.Clear();
+            }
 
             if (err != OpenClNativeBindings.CL_SUCCESS)
                 throw new InvalidOperationException($"Failed to enqueue kernel: {err}");
@@ -206,16 +251,22 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             var globalSizes = new UIntPtr[] { (UIntPtr)alignedGlobal };
             var localSizes = new UIntPtr[] { (UIntPtr)localSize };
 
-            int err = OpenClNativeBindings.EnqueueNDRangeKernel(
-                commandQueue,
-                _kernel,
-                1, // work_dim
-                null, // global_work_offset
-                globalSizes,
-                localSizes,
-                0,
-                IntPtr.Zero,
-                IntPtr.Zero);
+            int err;
+            lock (_submitLock)
+            {
+                ApplyPendingArgsLocked();
+                err = OpenClNativeBindings.EnqueueNDRangeKernel(
+                    commandQueue,
+                    _kernel,
+                    1, // work_dim
+                    null, // global_work_offset
+                    globalSizes,
+                    localSizes,
+                    0,
+                    IntPtr.Zero,
+                    IntPtr.Zero);
+                _pendingArgs?.Clear();
+            }
 
             if (err != OpenClNativeBindings.CL_SUCCESS)
                 throw new InvalidOperationException($"Failed to enqueue kernel on queue: {err}");
@@ -238,16 +289,22 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             var globalSizes = new UIntPtr[] { (UIntPtr)alignedGlobalX, (UIntPtr)alignedGlobalY };
             var localSizes = new UIntPtr[] { (UIntPtr)localSizeX, (UIntPtr)localSizeY };
 
-            int err = OpenClNativeBindings.EnqueueNDRangeKernel(
-                commandQueue,
-                _kernel,
-                2, // work_dim
-                null, // global_work_offset
-                globalSizes,
-                localSizes,
-                0,
-                IntPtr.Zero,
-                IntPtr.Zero);
+            int err;
+            lock (_submitLock)
+            {
+                ApplyPendingArgsLocked();
+                err = OpenClNativeBindings.EnqueueNDRangeKernel(
+                    commandQueue,
+                    _kernel,
+                    2, // work_dim
+                    null, // global_work_offset
+                    globalSizes,
+                    localSizes,
+                    0,
+                    IntPtr.Zero,
+                    IntPtr.Zero);
+                _pendingArgs?.Clear();
+            }
 
             if (err != OpenClNativeBindings.CL_SUCCESS)
                 throw new InvalidOperationException($"Failed to enqueue kernel on queue: {err}");
@@ -274,16 +331,22 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             var globalSizes = new UIntPtr[] { (UIntPtr)alignedGlobalX, (UIntPtr)alignedGlobalY, (UIntPtr)alignedGlobalZ };
             var localSizes = new UIntPtr[] { (UIntPtr)localSizeX, (UIntPtr)localSizeY, (UIntPtr)localSizeZ };
 
-            int err = OpenClNativeBindings.EnqueueNDRangeKernel(
-                commandQueue,
-                _kernel,
-                3, // work_dim
-                null, // global_work_offset
-                globalSizes,
-                localSizes,
-                0,
-                IntPtr.Zero,
-                IntPtr.Zero);
+            int err;
+            lock (_submitLock)
+            {
+                ApplyPendingArgsLocked();
+                err = OpenClNativeBindings.EnqueueNDRangeKernel(
+                    commandQueue,
+                    _kernel,
+                    3, // work_dim
+                    null, // global_work_offset
+                    globalSizes,
+                    localSizes,
+                    0,
+                    IntPtr.Zero,
+                    IntPtr.Zero);
+                _pendingArgs?.Clear();
+            }
 
             if (err != OpenClNativeBindings.CL_SUCCESS)
                 throw new InvalidOperationException($"Failed to enqueue kernel on queue: {err}");
@@ -318,16 +381,22 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             IntPtr eventHandle = Marshal.AllocHGlobal(IntPtr.Size);
             try
             {
-                int err = OpenClNativeBindings.EnqueueNDRangeKernel(
-                    _context.ProfilingCommandQueue,
-                    _kernel,
-                    2, // work_dim
-                    null, // global_work_offset
-                    globalSizes,
-                    localSizes,
-                    0,
-                    IntPtr.Zero,
-                    eventHandle);
+                int err;
+                lock (_submitLock)
+                {
+                    ApplyPendingArgsLocked();
+                    err = OpenClNativeBindings.EnqueueNDRangeKernel(
+                        _context.ProfilingCommandQueue,
+                        _kernel,
+                        2, // work_dim
+                        null, // global_work_offset
+                        globalSizes,
+                        localSizes,
+                        0,
+                        IntPtr.Zero,
+                        eventHandle);
+                    _pendingArgs?.Clear();
+                }
 
                 if (err != OpenClNativeBindings.CL_SUCCESS)
                     throw new InvalidOperationException($"Failed to enqueue kernel: {err}");
@@ -361,16 +430,22 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             IntPtr eventHandle = Marshal.AllocHGlobal(IntPtr.Size);
             try
             {
-                int err = OpenClNativeBindings.EnqueueNDRangeKernel(
-                    _context.ProfilingCommandQueue,
-                    _kernel,
-                    1,
-                    null,
-                    globalSizes,
-                    localSizes,
-                    0,
-                    IntPtr.Zero,
-                    eventHandle);
+                int err;
+                lock (_submitLock)
+                {
+                    ApplyPendingArgsLocked();
+                    err = OpenClNativeBindings.EnqueueNDRangeKernel(
+                        _context.ProfilingCommandQueue,
+                        _kernel,
+                        1,
+                        null,
+                        globalSizes,
+                        localSizes,
+                        0,
+                        IntPtr.Zero,
+                        eventHandle);
+                    _pendingArgs?.Clear();
+                }
 
                 if (err != OpenClNativeBindings.CL_SUCCESS)
                     throw new InvalidOperationException($"Failed to enqueue kernel: {err}");
