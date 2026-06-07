@@ -277,6 +277,197 @@ public sealed class GradientTape<T> : IDisposable
         return new GradientsScope<T>(grads);
     }
 
+    /// <summary>
+    /// Memory-bounded streaming backward. Computes the gradient of
+    /// <paramref name="loss"/> w.r.t. each tensor in <paramref name="sources"/>
+    /// (the model parameters) and hands each one to
+    /// <paramref name="onSourceGradient"/> at the exact backward step where its
+    /// last contribution lands — its provably-earliest safe release point — then
+    /// drops the reference so the gradient set is reclaimed incrementally. The
+    /// full parameter-gradient set is therefore NEVER resident at once, which is
+    /// what lets a model whose gradients exceed RAM still take a training step
+    /// (the per-parameter optimizer update happens inside the callback).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is the single-process, deterministic analogue of PyTorch's
+    /// optimizer-in-backward (<c>_apply_optimizer_in_backward</c>) / FSDP
+    /// CPU-offload, but it frees each gradient at its topological last-use rather
+    /// than at parameter-registration granularity, minimizing the peak resident
+    /// gradient set. Gradients are accumulated in the same reverse-topological
+    /// order the standard <see cref="ComputeGradients"/> path uses, so the values
+    /// handed to the callback are bit-identical to the non-streaming result.
+    /// </para>
+    /// <para>
+    /// The callback MUST consume its gradient synchronously (apply the optimizer
+    /// step) and must NOT retain the reference — the gradient buffer is released
+    /// for collection as soon as the callback returns. A source that receives no
+    /// gradient contribution gets no callback (mirrors <see cref="ComputeGradients"/>
+    /// omitting it from the returned dictionary).
+    /// </para>
+    /// </remarks>
+    /// <param name="loss">The scalar loss tensor to differentiate. Must be
+    /// tape-connected (non-null <c>GradFn</c>).</param>
+    /// <param name="sources">Parameter tensors whose gradients to stream. Each is
+    /// emitted exactly once, when complete.</param>
+    /// <param name="onSourceGradient">Invoked as <c>(source, gradient)</c> the
+    /// moment <paramref name="loss"/>'s gradient w.r.t. that source is final.</param>
+    public void ComputeGradientsStreaming(
+        Tensor<T> loss,
+        IReadOnlyList<Tensor<T>> sources,
+        Action<Tensor<T>, Tensor<T>> onSourceGradient)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(GradientTape<T>));
+        if (sources is null) throw new ArgumentNullException(nameof(sources));
+        if (onSourceGradient is null) throw new ArgumentNullException(nameof(onSourceGradient));
+        if (_entries.Count == 0)
+            throw new InvalidOperationException("Cannot compute gradients: the tape has no recorded operations.");
+        if (loss.GradFn is null)
+            throw new InvalidOperationException(
+                "Streaming backward requires a tape-connected loss (loss.GradFn is null).");
+
+        var engine = _engine;
+        var numOps = Helpers.MathHelper.GetNumericOperations<T>();
+
+        // Suspend recording so the backward ops invoked below don't append fresh
+        // tape entries (parity with the non-streaming graph path, which also
+        // suspends — see ComputeGradients line ~306).
+        var savedCurrent = _current;
+        SetCurrentTape(null);
+        try
+        {
+            // Forward topological order; reverse is the backward execution order.
+            var visited = new HashSet<GradNode<T>>();
+            var topoOrder = new List<GradNode<T>>();
+            TopologicalSort(loss.GradFn!, visited, topoOrder);
+            int stepCount = topoOrder.Count;
+
+            var steps = new BackwardStep<T>[stepCount];
+            for (int i = 0; i < stepCount; i++)
+            {
+                var node = topoOrder[stepCount - 1 - i]; // reverse for backward
+                steps[i] = new BackwardStep<T>
+                {
+                    Output = node.Output,
+                    Inputs = node.GetInputsArray(),
+                    Backward = node.Backward,
+                    SavedState = node.SavedState,
+                };
+            }
+
+            // Last backward step that contributes to each source's gradient.
+            // A source is a leaf parameter: it only ever appears as an op INPUT,
+            // so its gradient is only written (accumulated), never read as a
+            // step output — making the last write its safe release point.
+            var lastUse = new Dictionary<Tensor<T>, int>(
+                ReferenceEqualityComparer<Tensor<T>>.Instance);
+            foreach (var s in sources)
+                if (s is not null && !lastUse.ContainsKey(s)) lastUse[s] = -1;
+            for (int i = 0; i < stepCount; i++)
+            {
+                var inputs = steps[i].Inputs;
+                if (inputs is null) continue;
+                for (int j = 0; j < inputs.Length; j++)
+                {
+                    var inp = inputs[j];
+                    if (inp is not null && lastUse.ContainsKey(inp))
+                        lastUse[inp] = i; // later step overwrites → keeps the last
+                }
+            }
+            // stepIndex -> sources to emit+release right after that step runs.
+            var emitAt = new Dictionary<int, List<Tensor<T>>>();
+            foreach (var kv in lastUse)
+            {
+                if (kv.Value < 0) continue; // source never used → no gradient
+                if (!emitAt.TryGetValue(kv.Value, out var list))
+                    emitAt[kv.Value] = list = new List<Tensor<T>>();
+                list.Add(kv.Key);
+            }
+
+            var grads = new Dictionary<Tensor<T>, Tensor<T>>(
+                stepCount + 1, ReferenceEqualityComparer<Tensor<T>>.Instance);
+
+            // Seed gradient (dL/dL = 1), same construction as ComputeGradients:
+            // use the loss's ACTUAL shape (which may be [] for a 0-dim scalar or
+            // [1]), not a hardcoded [1] — a hardcoded rank-1 seed mismatches a
+            // 0-dim scalar loss and can break shape-checked backward ops.
+            Tensor<T> seedGrad;
+            if (loss.Length == 1)
+            {
+                seedGrad = new Tensor<T>(new[] { numOps.One }, (int[])loss._shape.Clone());
+            }
+            else
+            {
+                var onesData = new T[loss.Length];
+                var one = numOps.One;
+                for (int j = 0; j < onesData.Length; j++) onesData[j] = one;
+                seedGrad = new Tensor<T>(onesData, loss._shape);
+            }
+            grads[loss] = seedGrad;
+
+            for (int i = 0; i < stepCount; i++)
+            {
+                ref var step = ref steps[i];
+                if (grads.TryGetValue(step.Output, out var gradOutput))
+                {
+                    // Weight-streaming integration: rehydrate any paged-out input
+                    // weights before the backward reads them. The forward path does
+                    // this through StreamingAutogradHook.OnInputAccessed; the plain
+                    // streaming-backward walk bypasses that hook, so materialize
+                    // explicitly here. Materialize is a no-op for tensors that are
+                    // resident or not registered with the streaming pool, so this is
+                    // free when weight streaming is off. The pool evicts other LRU
+                    // weights to stay under its resident cap, keeping peak bounded —
+                    // and the just-materialized weight is resident when its gradient
+                    // completes (its last use), so the optimizer epilogue can update
+                    // it in place; eviction later writes the update back to disk.
+                    var stepInputs = step.Inputs;
+                    if (stepInputs is not null)
+                    {
+                        for (int j = 0; j < stepInputs.Length; j++)
+                        {
+                            var inp = stepInputs[j];
+                            if (inp is not null) WeightRegistry.Materialize(inp);
+                        }
+                    }
+
+                    step.Backward(gradOutput, step.Inputs, step.Output,
+                        step.SavedState ?? Array.Empty<object>(), engine, grads);
+                }
+
+                // Emit + release every source whose gradient just completed.
+                if (emitAt.TryGetValue(i, out var ready))
+                {
+                    for (int k = 0; k < ready.Count; k++)
+                    {
+                        var src = ready[k];
+                        if (grads.TryGetValue(src, out var g))
+                        {
+                            onSourceGradient(src, g);
+                            grads.Remove(src);   // drop the dict reference …
+                            src.Grad = null;     // … and the per-tensor mirror → reclaimable
+                        }
+                    }
+                }
+            }
+
+            // Clear .Grad on forward intermediates (parity with the non-persistent
+            // cleanup in ComputeGradientsViaGraphCore) so they don't pin a full
+            // backward's worth of gradient tensors after we return.
+            foreach (var node in topoOrder)
+            {
+                var outp = node.Output;
+                if (outp is not null && !lastUse.ContainsKey(outp))
+                    outp.Grad = null;
+            }
+        }
+        finally
+        {
+            SetCurrentTape(savedCurrent);
+            if (!_options.Persistent) _entries.Reset();
+        }
+    }
+
     public Dictionary<Tensor<T>, Tensor<T>> ComputeGradients(
         Tensor<T> loss,
         IReadOnlyList<Tensor<T>>? sources = null,
