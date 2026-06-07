@@ -3,11 +3,11 @@
   <PropertyGroup>
     <TargetFramework>netstandard2.0</TargetFramework>
     <PackageId>AiDotNet.Native.CUDA</PackageId>
-    <Version>12.4.0</Version>
+    <Version>12.5.0</Version>
     <Authors>AiDotNet Contributors</Authors>
     <Company>AiDotNet</Company>
-    <Description>Native CUDA binaries for NVIDIA GPU-accelerated operations. This package provides cuBLAS libraries required by AiDotNet.Tensors for NVIDIA GPU acceleration.</Description>
-    <PackageTags>cuda;nvidia;gpu;blas;native;cublas</PackageTags>
+    <Description>Native CUDA binaries for NVIDIA GPU-accelerated operations. Provides cuBLAS + the nvRTC runtime kernel compiler required by AiDotNet.Tensors for NVIDIA GPU acceleration (no CUDA Toolkit install needed).</Description>
+    <PackageTags>cuda;nvidia;gpu;blas;native;cublas;nvrtc</PackageTags>
     <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
     <PackageProjectUrl>https://github.com/ooples/AiDotNet.Tensors</PackageProjectUrl>
     <RepositoryUrl>https://github.com/ooples/AiDotNet.Tensors</RepositoryUrl>
@@ -27,6 +27,13 @@
     <None Include="runtimes\win-x64\native\cublas64_12.dll" Pack="true" PackagePath="runtimes\win-x64\native" />
     <None Include="runtimes\win-x64\native\cublasLt64_12.dll" Pack="true" PackagePath="runtimes\win-x64\native" />
     <None Include="runtimes\win-x64\native\cudart64_12.dll" Pack="true" PackagePath="runtimes\win-x64\native" />
+    <!-- nvRTC runtime kernel compiler — REQUIRED so the DirectGpu CUDA backend can compile its
+         kernels without a CUDA Toolkit install. nvrtc64_120_0.dll is the compiler; the .alt variant
+         is the JIT-fallback NVIDIA ships alongside it; nvrtc-builtins is the companion the compiler
+         dlopens. All three must be present together or kernel compilation fails at runtime. -->
+    <None Include="runtimes\win-x64\native\nvrtc64_120_0.dll" Pack="true" PackagePath="runtimes\win-x64\native" />
+    <None Include="runtimes\win-x64\native\nvrtc64_120_0.alt.dll" Pack="true" PackagePath="runtimes\win-x64\native" />
+    <None Include="runtimes\win-x64\native\nvrtc-builtins64_129.dll" Pack="true" PackagePath="runtimes\win-x64\native" />
   </ItemGroup>
 
   <!-- Future: Linux x64 native libraries -->
