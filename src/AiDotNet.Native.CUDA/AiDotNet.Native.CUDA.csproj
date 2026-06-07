@@ -22,11 +22,13 @@
     <ContentTargetFolders>content</ContentTargetFolders>
   </PropertyGroup>
 
-  <!-- Windows x64 native libraries -->
+  <!-- Windows x64 native libraries: cudart, cuBLAS, cuBLASLt, AND nvRTC (+ builtins).
+       nvRTC is required by AiDotNet.Tensors' CUDA backend for runtime kernel JIT;
+       without it CUDA ops fail (cuMemAlloc/cuMemcpyHtoD error 700). Binaries are
+       staged by tools/stage-cuda-redist.ps1 (gitignored, ~770MB) and packed via a
+       wildcard so the full runtime is always included. -->
   <ItemGroup>
-    <None Include="runtimes\win-x64\native\cublas64_12.dll" Pack="true" PackagePath="runtimes\win-x64\native" />
-    <None Include="runtimes\win-x64\native\cublasLt64_12.dll" Pack="true" PackagePath="runtimes\win-x64\native" />
-    <None Include="runtimes\win-x64\native\cudart64_12.dll" Pack="true" PackagePath="runtimes\win-x64\native" />
+    <None Include="runtimes\win-x64\native\*.dll" Pack="true" PackagePath="runtimes\win-x64\native" />
   </ItemGroup>
 
   <!-- Future: Linux x64 native libraries -->
