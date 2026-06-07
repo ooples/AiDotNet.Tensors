@@ -41,6 +41,18 @@ internal static class OneDnnProvider
     private static readonly ReaderWriterLockSlim _eltwiseCacheLock = new(LockRecursionPolicy.NoRecursion);
     private static readonly ReaderWriterLockSlim _binaryCacheLock = new(LockRecursionPolicy.NoRecursion);
 
+    // Serializes primitive EXECUTION. A cached primitive owns shared dnnl_memory
+    // objects whose data handles are rebound per call (dnnl_memory_set_data_handle),
+    // and the engine has a single shared _stream — neither is safe for concurrent
+    // use. Without this, two threads executing the same cached primitive (or any two
+    // sharing _stream) stomp each other's data handles → silently wrong results
+    // (e.g. concurrent TensorAddInPlace in independent backward passes). The cache
+    // R/W locks only guard eviction, NOT the set-handle+execute+wait sequence, which
+    // the read lock lets run concurrently. Each execute already calls
+    // dnnl_stream_wait (synchronous), so serializing here adds ~zero cost in the
+    // common single-threaded case and only serializes genuinely concurrent submits.
+    private static readonly object _executeLock = new object();
+
     // Windows API for DLL search path manipulation
     [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
     private static extern bool SetDllDirectory(string lpPathName);
@@ -761,6 +773,11 @@ internal static class OneDnnProvider
         {
             int status;
 
+            // Serialize the whole set-handles + reorders + conv + stream_wait sequence:
+            // the cached memory objects, scratchpad, WeightsReordered flag and shared
+            // _stream are all mutated/used here and are not safe for concurrent execution.
+            lock (_executeLock)
+            {
             // Step 1: Set user memory data handles to point to user data
             status = dnnl_memory_set_data_handle(cached.UserSrcMem, (IntPtr)input);
             if (status != DnnlSuccess) { if (logThis) Console.WriteLine($"[oneDNN] Failed to set src handle: {status}"); return false; }
@@ -828,6 +845,7 @@ internal static class OneDnnProvider
             }
 
             dnnl_stream_wait(_stream);
+            } // _executeLock
 
             if (logThis)
             {
@@ -961,24 +979,28 @@ internal static class OneDnnProvider
     {
         try
         {
-            // Update memory handle to point to user data
-            int status = dnnl_memory_set_data_handle(cached.SrcMem, (IntPtr)data);
-            if (status != DnnlSuccess)
-                return false;
+            // Serialize: shared cached memory objects + _stream (see _executeLock).
+            lock (_executeLock)
+            {
+                // Update memory handle to point to user data
+                int status = dnnl_memory_set_data_handle(cached.SrcMem, (IntPtr)data);
+                if (status != DnnlSuccess)
+                    return false;
 
-            // Execute eltwise in-place (src and dst point to same memory)
-            DnnlExecArg* args = stackalloc DnnlExecArg[2];
-            args[0].Arg = DnnlArgSrc;
-            args[0].Memory = cached.SrcMem;
-            args[1].Arg = DnnlArgDst;
-            args[1].Memory = cached.SrcMem; // In-place
+                // Execute eltwise in-place (src and dst point to same memory)
+                DnnlExecArg* args = stackalloc DnnlExecArg[2];
+                args[0].Arg = DnnlArgSrc;
+                args[0].Memory = cached.SrcMem;
+                args[1].Arg = DnnlArgDst;
+                args[1].Memory = cached.SrcMem; // In-place
 
-            status = dnnl_primitive_execute(cached.Primitive, _stream, 2, args);
-            if (status != DnnlSuccess)
-                return false;
+                status = dnnl_primitive_execute(cached.Primitive, _stream, 2, args);
+                if (status != DnnlSuccess)
+                    return false;
 
-            dnnl_stream_wait(_stream);
-            return true;
+                dnnl_stream_wait(_stream);
+                return true;
+            }
         }
         catch
         {
@@ -1129,23 +1151,27 @@ internal static class OneDnnProvider
     {
         try
         {
-            int status = dnnl_memory_set_data_handle(cached.SrcMem, (IntPtr)src);
-            if (status != DnnlSuccess) return false;
+            // Serialize: shared cached memory objects + _stream (see _executeLock).
+            lock (_executeLock)
+            {
+                int status = dnnl_memory_set_data_handle(cached.SrcMem, (IntPtr)src);
+                if (status != DnnlSuccess) return false;
 
-            status = dnnl_memory_set_data_handle(cached.DstMem, (IntPtr)dst);
-            if (status != DnnlSuccess) return false;
+                status = dnnl_memory_set_data_handle(cached.DstMem, (IntPtr)dst);
+                if (status != DnnlSuccess) return false;
 
-            DnnlExecArg* args = stackalloc DnnlExecArg[2];
-            args[0].Arg = DnnlArgSrc;
-            args[0].Memory = cached.SrcMem;
-            args[1].Arg = DnnlArgDst;
-            args[1].Memory = cached.DstMem;
+                DnnlExecArg* args = stackalloc DnnlExecArg[2];
+                args[0].Arg = DnnlArgSrc;
+                args[0].Memory = cached.SrcMem;
+                args[1].Arg = DnnlArgDst;
+                args[1].Memory = cached.DstMem;
 
-            status = dnnl_primitive_execute(cached.Primitive, _stream, 2, args);
-            if (status != DnnlSuccess) return false;
+                status = dnnl_primitive_execute(cached.Primitive, _stream, 2, args);
+                if (status != DnnlSuccess) return false;
 
-            dnnl_stream_wait(_stream);
-            return true;
+                dnnl_stream_wait(_stream);
+                return true;
+            }
         }
         catch
         {
@@ -1281,34 +1307,39 @@ internal static class OneDnnProvider
     {
         try
         {
-            // Update memory handles
-            int status = dnnl_memory_set_data_handle(cached.Src0Mem, (IntPtr)src0);
-            if (status != DnnlSuccess)
-                return false;
+            // Serialize: the cached primitive's memory objects + the shared _stream are
+            // mutated/used here and are NOT safe for concurrent execution (see _executeLock).
+            lock (_executeLock)
+            {
+                // Update memory handles
+                int status = dnnl_memory_set_data_handle(cached.Src0Mem, (IntPtr)src0);
+                if (status != DnnlSuccess)
+                    return false;
 
-            status = dnnl_memory_set_data_handle(cached.Src1Mem, (IntPtr)src1);
-            if (status != DnnlSuccess)
-                return false;
+                status = dnnl_memory_set_data_handle(cached.Src1Mem, (IntPtr)src1);
+                if (status != DnnlSuccess)
+                    return false;
 
-            status = dnnl_memory_set_data_handle(cached.DstMem, (IntPtr)dst);
-            if (status != DnnlSuccess)
-                return false;
+                status = dnnl_memory_set_data_handle(cached.DstMem, (IntPtr)dst);
+                if (status != DnnlSuccess)
+                    return false;
 
-            // Execute with 3 arguments: src0, src1, dst
-            DnnlExecArg* args = stackalloc DnnlExecArg[3];
-            args[0].Arg = DnnlArgSrc0;
-            args[0].Memory = cached.Src0Mem;
-            args[1].Arg = DnnlArgSrc1;
-            args[1].Memory = cached.Src1Mem;
-            args[2].Arg = DnnlArgDst;
-            args[2].Memory = cached.DstMem;
+                // Execute with 3 arguments: src0, src1, dst
+                DnnlExecArg* args = stackalloc DnnlExecArg[3];
+                args[0].Arg = DnnlArgSrc0;
+                args[0].Memory = cached.Src0Mem;
+                args[1].Arg = DnnlArgSrc1;
+                args[1].Memory = cached.Src1Mem;
+                args[2].Arg = DnnlArgDst;
+                args[2].Memory = cached.DstMem;
 
-            status = dnnl_primitive_execute(cached.Primitive, _stream, 3, args);
-            if (status != DnnlSuccess)
-                return false;
+                status = dnnl_primitive_execute(cached.Primitive, _stream, 3, args);
+                if (status != DnnlSuccess)
+                    return false;
 
-            dnnl_stream_wait(_stream);
-            return true;
+                dnnl_stream_wait(_stream);
+                return true;
+            }
         }
         catch
         {
@@ -1840,13 +1871,15 @@ internal static class OneDnnProvider
             dnnl_memory_desc_destroy(srcDesc);
             dnnl_memory_desc_destroy(dstDesc);
 
-            // Execute
+            // Execute (serialize on the shared, non-thread-safe _stream — see _executeLock)
             DnnlExecArg* args = stackalloc DnnlExecArg[2];
             args[0] = new DnnlExecArg { Arg = DnnlArgSrc, Memory = srcMem };
             args[1] = new DnnlExecArg { Arg = DnnlArgDst, Memory = dstMem };
-            rc = dnnl_primitive_execute(prim, _stream, 2, args);
-
-            dnnl_stream_wait(_stream);
+            lock (_executeLock)
+            {
+                rc = dnnl_primitive_execute(prim, _stream, 2, args);
+                dnnl_stream_wait(_stream);
+            }
             dnnl_primitive_destroy(prim);
             dnnl_memory_destroy(srcMem);
             dnnl_memory_destroy(dstMem);
@@ -1949,8 +1982,12 @@ internal static class OneDnnProvider
             args[3] = new DnnlExecArg { Arg = DnnlArgVariance, Memory = varMem };
             args[4] = new DnnlExecArg { Arg = DnnlArgWeights, Memory = scaleMem };
             args[5] = new DnnlExecArg { Arg = DnnlArgBias, Memory = shiftMem };
-            rc = dnnl_primitive_execute(prim, _stream, 6, args);
-            dnnl_stream_wait(_stream);
+            // Serialize on the shared, non-thread-safe _stream — see _executeLock.
+            lock (_executeLock)
+            {
+                rc = dnnl_primitive_execute(prim, _stream, 6, args);
+                dnnl_stream_wait(_stream);
+            }
 
             dnnl_primitive_destroy(prim);
             dnnl_memory_destroy(srcMem);
