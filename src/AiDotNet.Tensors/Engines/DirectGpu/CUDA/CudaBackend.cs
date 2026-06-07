@@ -1222,6 +1222,16 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public void DownloadBuffer(IGpuBuffer buffer, float[] destination)
     {
+        // #226: never issue a device→host copy from a released buffer. After CudaGpuBuffer.Release
+        // the device pointer is zeroed; cuMemcpyDtoH from a null/freed pointer is an ILLEGAL memory
+        // access that corrupts the CUDA context — every subsequent driver call then fails with error
+        // 700, cascading across the whole process. Surface a clean managed exception BEFORE touching
+        // the driver so the deferred-materializer caller (and the fused-training fault handler) can
+        // recover on the eager path instead, leaving the context intact.
+        if (buffer.Handle == IntPtr.Zero)
+            throw new ObjectDisposedException(nameof(buffer),
+                "GPU buffer was released before its deferred download (issue #226).");
+
         if (destination.Length < buffer.Size)
             throw new ArgumentException("Destination array is too small.", nameof(destination));
 

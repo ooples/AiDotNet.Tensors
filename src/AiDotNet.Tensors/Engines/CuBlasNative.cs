@@ -647,7 +647,19 @@ public static class CuBlasNative
     public static void CheckCudaResult(CudaResult result, string operation = "CUDA operation")
     {
         if (result != CudaResult.Success)
+        {
+            // Sticky/context-corrupting faults (illegal address 700, context destroyed 709, launch
+            // failed 719) leave the CUDA context unusable — every subsequent driver call returns the
+            // same error. Trip the GPU circuit breaker so the engine permanently falls back to CPU
+            // instead of cascading the fault across the rest of the process.
+            int code = (int)result;
+            if (code is 700 or 709 or 719)
+            {
+                AiDotNetEngine.TripGpuCircuitBreaker(operation, code);
+            }
+
             throw new InvalidOperationException($"{operation} failed: {GetCudaErrorString(result)}");
+        }
     }
 
     /// <summary>
