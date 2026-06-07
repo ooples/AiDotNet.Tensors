@@ -42,8 +42,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     // per-kernel launch overheads/step into 1 (the launch-bound bottleneck for small
     // models). Default OFF => existing training is byte-identical; eligibility is
     // narrowly gated and any capture failure falls back to eager permanently.
+    // Default ON so users get the whole-step CUDA-graph capture (collapses per-kernel launch
+    // overhead → full GPU power) automatically; opt out with AIDOTNET_CUDA_GRAPH_STEP=0. Still
+    // narrowly gated at the call site (float + CUDA + eligible + no clip/checkpoint) and any
+    // capture failure falls back to eager permanently, so default-on can't change correctness.
     private static readonly bool s_graphStepEnabled =
-        System.Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_STEP") == "1";
+        System.Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_STEP") != "0";
     private IntPtr _stepGraphExec;
     private long _graphStepCalls;
     private bool _graphStepDisabled;
