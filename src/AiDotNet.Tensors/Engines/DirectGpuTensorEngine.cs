@@ -757,7 +757,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // the GPU pointer and force a re-upload.
         if (tensor._gpuBuffer is not null && ReferenceEquals(tensor._gpuBackend, backend))
         {
-            if (tensor._gpuBufferVersion == tensor.Version)
+            if (tensor._gpuBufferVersion == tensor.Version && IsCachedGpuBufferLive(tensor, backend))
                 return new OwnedBuffer(tensor._gpuBuffer, ownsBuffer: false);
 
             // Stale snapshot — also clear any matching activation-cache entry so
@@ -815,6 +815,29 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         // Not in any cache — fall back to GetDataArray (triggers lazy allocation + GPU download if needed)
         return GetOrAllocateBuffer(backend, tensor.GetDataArray());
+    }
+
+    /// <summary>
+    /// True when a CPU tensor's cached <c>_gpuBuffer</c> field can still be trusted by the
+    /// upload fast paths. The field is set when an input is uploaded and cached as an
+    /// activation, but the activation cache can EVICT + dispose (and the backend then
+    /// recycle) that buffer for an unrelated tensor without ever clearing this field —
+    /// leaving a stale pointer that, with a matching Version, would serve another tensor's
+    /// data (e.g. a persistent input uploaded during a tape, then reaped by
+    /// <see cref="EvictActivationsCreatedAfter"/> on tape dispose, then handed to the next
+    /// forward call's upload). For a CPU tensor we therefore confirm the activation cache
+    /// STILL maps this tensor's key to the very same buffer; if not, the field is stale and
+    /// the caller must re-upload. GPU-resident results are not tracked by the activation
+    /// cache, so their field stays authoritative.
+    /// </summary>
+    private bool IsCachedGpuBufferLive<T>(Tensor<T> tensor, IDirectGpuBackend backend)
+    {
+        if (tensor.IsGpuResident) return true;
+        var key = (object?)tensor.DataVector.GetBackingArrayUnsafe() ?? tensor.DataVector;
+        // _activationCache is a ConcurrentDictionary — this read is lock-free.
+        return _activationCache.TryGetValue(key, out var entry)
+            && ReferenceEquals(entry.Buffer, tensor._gpuBuffer)
+            && ReferenceEquals(entry.Backend, backend);
     }
 
     /// <summary>
@@ -971,7 +994,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // buffer to UploadTensorRaw callers.
         if (tensor._gpuBuffer is not null && ReferenceEquals(tensor._gpuBackend, backend))
         {
-            if (tensor._gpuBufferVersion == tensor.Version)
+            if (tensor._gpuBufferVersion == tensor.Version && IsCachedGpuBufferLive(tensor, backend))
                 return new OwnedBuffer(tensor._gpuBuffer, ownsBuffer: false);
 
             var staleArray = tensor.DataVector.GetBackingArrayUnsafe();
