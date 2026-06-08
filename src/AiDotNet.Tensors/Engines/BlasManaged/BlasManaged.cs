@@ -236,11 +236,23 @@ public static partial class BlasManaged
     // (512³, 256×784×128, 128×64×256), where its low per-call overhead dominates.
     private static bool PrefersStrategyOverMachineKernel(int m, int n, int k, bool isFloat)
     {
+        long work = (long)m * n * k;
         if (n < 128 && k >= 128) return true;                 // thin-N (both dtypes)
-        if ((long)m * n * k >= 4_000_000_000L) return true;   // very large (both dtypes)
-        if (!isFloat) return false;                            // FP64 microkernel is competitive on the rest
-        if (n >= 1024 && n > 2L * m) return true;              // FP32 wide-N skew (FFN-up)
-        if (k >= 1024 && k > 2L * m) return true;              // FP32 wide-K skew (FFN-down)
+        if (!isFloat)
+            // FP64 microkernel is competitive on FFN and mid squares (1024³ double 211 > packed
+            // 172); packed only pays at very large work (2048³: 316 -> 323). So FP64 defers only
+            // for thin-N (above) and the very-large tail.
+            return work >= 4_000_000_000L;
+        // FP32: the cache-blocking packed strategy wins on all mid-large work — squares from
+        // ~640³ (microkernel 110 -> packed ~192 GF/s; 1024³ 178 -> 315; stable across runs) and
+        // FFN (106 -> 174) — and on wide-N/wide-K skew. The microkernel only leads on SMALL
+        // near-square shapes (512³ 552, 256×784×128 674), where packing overhead would crater
+        // the packed path (512³ packed is only 45 GF/s). The cutoff sits just below 640³
+        // (2.6e8) and safely above 512³ (1.3e8) — conservative because mis-routing a small shape
+        // to the packed path is a ~12× loss, while mis-keeping a mid shape on the microkernel is mild.
+        if (work >= 250_000_000L) return true;                // FP32 mid-large (squares ≥ ~640³, FFN)
+        if (n >= 1024 && n > 2L * m) return true;             // FP32 wide-N skew below the cutoff
+        if (k >= 1024 && k > 2L * m) return true;             // FP32 wide-K skew below the cutoff
         return false;
     }
 

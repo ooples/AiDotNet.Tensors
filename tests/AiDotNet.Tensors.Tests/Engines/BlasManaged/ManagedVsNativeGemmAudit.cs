@@ -22,6 +22,7 @@ public class ManagedVsNativeGemmAudit
     private static readonly (int M, int K, int N, string Note)[] Shapes =
     {
         (512, 512, 512,   "square-med / attn-proj"),
+        (640, 640, 640,   "square-mid (microkernel→packed crossover)"),
         (1024, 1024, 1024,"square-large"),
         (2048, 2048, 2048,"square-xl"),
         (512, 512, 2048,  "ffn-up (d->4d)"),
@@ -144,7 +145,9 @@ public class ManagedVsNativeGemmAudit
             GflopsOf(flops, det), GflopsOf(flops, detPB), GflopsOf(flops, fast), GflopsOf(flops, fastPB), GflopsOf(flops, nat));
     }
 
-    private static int IterFor(long flops) => flops > 500_000_000L ? 8 : flops > 50_000_000L ? 30 : 200;
+    // More iters → better chance of catching an uncontended sample (min-of-N is the robust
+    // "peak achievable" estimator on a loaded box). Large shapes were too noisy at 8 iters.
+    private static int IterFor(long flops) => flops > 4_000_000_000L ? 40 : flops > 200_000_000L ? 60 : flops > 20_000_000L ? 120 : 300;
 
     private static double BestMs(Action op, int warm, int iters)
     {
