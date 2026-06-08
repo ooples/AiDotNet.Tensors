@@ -178,6 +178,20 @@ public static class AiDotNetEngine
     /// <returns>True if GPU was successfully configured, false otherwise.</returns>
     public static bool AutoDetectAndConfigureGpu(bool verbose)
     {
+        // Honor the AIDOTNET_DISABLE_GPU opt-out HERE, not only at module-init. Callers such as the
+        // AiModelBuilder facade re-enter this method on every BuildAsync (its default, no-GPU-config
+        // path auto-detects), so a process that disabled GPU must stay on CPU instead of repeatedly
+        // re-adopting the GPU engine (the "GPU acceleration enabled" churn seen in CPU-only runs).
+        if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("AIDOTNET_DISABLE_GPU")))
+        {
+            if (Current is DirectGpuTensorEngine)
+            {
+                Current = new CpuEngine();
+            }
+
+            return false;
+        }
+
         // Once the GPU circuit breaker has tripped (a sticky CUDA fault corrupted the context),
         // never re-adopt the GPU for the rest of the process — re-engaging would immediately fault
         // again on the dead context. Stay on CPU.
