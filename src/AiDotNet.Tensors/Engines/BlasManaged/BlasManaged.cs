@@ -436,6 +436,18 @@ public static partial class BlasManaged
             ? PickMicrokernelTile<T>()
             : PickMicrokernelTilePrePack<T>();
 
+        // The FP32 6×16 kernel is PackBoth-ONLY: PackAOnly's strided-B path uses an 8×8
+        // (Avx2Fp32_8x8) tile, so the tail-split alignment and packing layout must stay on 8×8
+        // when the dispatcher picked PackAOnly. Without this, the interior is aligned to mr=6 and
+        // then handed to PackAOnly, which needs a multiple of 8 and slices out of range
+        // (ArgumentOutOfRangeException). PackBoth keeps the faster 6×16 tile.
+        if (strategy == PackingMode.ForcePackAOnly && typeof(T) == typeof(float)
+            && mr == 6 && Avx2Fp32_8x8.IsSupported)
+        {
+            mr = 8;
+            nr = 8;
+        }
+
         // Sub-D4 (#372 follow-up): partial-M/N tail splitting. When the shape is
         // big enough for the SIMD tile (m >= mr AND n >= nr) but not aligned
         // (m % mr != 0 OR n % nr != 0), split the work into:
@@ -462,18 +474,37 @@ public static partial class BlasManaged
         // get an inner options with Epilogue stripped to avoid double-application.
         int splitMAligned = m - (m % mr);
         int splitNAligned = n - (n % nr);
-        // Honor NumThreads = -1 as explicit single-thread (deterministic mode).
-        // Pre-fix: -1 fell into the "> 0 is false" branch and used all processors,
-        // breaking determinism/perf expectations. PR #402 CodeRabbit fix.
-        int splitProcs = options.NumThreads switch
+        // CORRECTNESS (reproducibility): the tail-split decomposition — aligned interior via the
+        // SIMD microkernel + Streaming for the M/N tails — picks which kernel computes each output
+        // element. It MUST be a function of the shape and the MACHINE only, never the per-call
+        // thread count, or the same shape takes a different path (and a different microkernel) at
+        // different thread counts and the output stops being bit-identical across them, violating
+        // the deterministic-mode contract. The old gate used options.NumThreads, so a tailed shape
+        // tail-split at NumThreads=1 (interior on the fast kernel) but fell through to all-Streaming
+        // at NumThreads=N — different bits. This was a LATENT reproducibility bug that the FP32 6×16
+        // tile (Mr=6 leaves an M-tail on most shapes) exposes; 8×8 only escaped because the test
+        // shapes are 8-aligned. Gate on the fixed machine core count instead — a thread-count-
+        // INVARIANT measure of "is the aligned interior big enough for its fast kernel to beat
+        // all-Streaming?" The actual parallel degree still honours options.NumThreads downstream.
+        int gateProcs = System.Environment.ProcessorCount;
+        if (m >= mr && n >= nr && (m % mr != 0 || n % nr != 0))
         {
-            -1 => 1,
-            > 0 => options.NumThreads,
-            _ => System.Environment.ProcessorCount,
-        };
-        if (m >= mr && n >= nr && (m % mr != 0 || n % nr != 0)
-            && splitMAligned >= splitProcs * mr)
-        {
+            if (splitMAligned < gateProcs * mr && options.PackingMode == PackingMode.Auto)
+            {
+                // Auto + too few aligned mr-blocks for the packed kernel to beat all-Streaming,
+                // and a tail IS present — route the WHOLE shape to Streaming, which handles the
+                // m%mr / n%nr tails internally and parallelizes the N axis. Decided by the fixed
+                // machine core count (NOT options.NumThreads), so the same shape takes this path
+                // at every thread count → bit-identical across thread counts. Force* pack modes
+                // skip this and tail-split below (the caller explicitly asked for that strategy);
+                // the tail-split keeps PackBoth's "caller guarantees m%mr==0" contract intact (it
+                // never receives an unaligned m, which it would silently skip).
+                StreamingStrategy.Run<T>(a, lda, transA, b, ldb, transB, c, ldc, m, n, k, in options);
+                var streamWholeEpi = options.Epilogue;
+                EpilogueChain.Apply<T>(c, ldc, m, n, in streamWholeEpi);
+                return;
+            }
+
             int m_aligned = splitMAligned;
             int n_aligned = splitNAligned;
             int m_tail = m - m_aligned;
@@ -1054,7 +1085,7 @@ public static partial class BlasManaged
             // boundary, a row flips between 6×16 and Streaming and the output stops being
             // bit-identical across thread counts (verified: 6×16 fails 4 bit-exact tests, incl.
             // DeterministicParallelGemmContractTests at m=16). Acceptable only in Fast mode.
-            if (!Helpers.BlasProvider.IsDeterministicMode && Avx2Fp32_6x16.IsSupported) return (6, 16);
+            if (Avx2Fp32_6x16.IsSupported) return (6, 16);   // now deterministic too — see gate fix in Gemm
             if (Avx2Fp32_8x8.IsSupported) return (8, 8);
             if (NeonFp32_8x4.IsSupported) return (8, 4);
             return (4, 4);
