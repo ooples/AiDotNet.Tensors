@@ -2139,6 +2139,97 @@ public interface IDirectGpuBackend : IDisposable
     void FtrlUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer z, IGpuBuffer n,
         float learningRate, float l1Reg, float l2Reg, float beta, int size);
 
+    // --------------------------------------------------------------
+    // PR #567 — Sparse counterparts of the dense optimizer steps above.
+    // Each method launches a native CUDA scatter-update kernel with one
+    // thread per non-zero gradient (nnz). Only (param[idx], state[idx])
+    // entries are read/written; the other (N − nnz) entries are never
+    // touched. Memory traffic is O(nnz) vs. the dense path's O(N).
+    //
+    // sparseIndices and sparseValues are GPU-resident buffers of length
+    // >= nnz; the dense state buffers (m, v, accum, ...) keep their full
+    // shape and are mutated in place at the touched indices only.
+    //
+    // Backends that don't ship the sparse_* kernel should throw
+    // NotSupportedException; the GpuOptimizer wrapper will then return
+    // false so the caller falls back to the CPU sparse path.
+    // --------------------------------------------------------------
+
+    /// <summary>Sparse SGD scatter-update on GPU. See SgdUpdate for the dense counterpart.</summary>
+    void SparseSgdUpdate(IGpuBuffer param,
+        IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz,
+        float learningRate, float weightDecay);
+
+    /// <summary>Sparse SGD-with-momentum scatter-update on GPU.</summary>
+    void SparseSgdMomentumUpdate(IGpuBuffer param, IGpuBuffer velocity,
+        IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz,
+        float learningRate, float momentum, float weightDecay);
+
+    /// <summary>Sparse Adam scatter-update on GPU.</summary>
+    void SparseAdamUpdate(IGpuBuffer param, IGpuBuffer m, IGpuBuffer v,
+        IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz,
+        float learningRate, float beta1, float beta2, float epsilon,
+        float weightDecay, int step);
+
+    /// <summary>Sparse AdamW scatter-update on GPU (decoupled weight decay).</summary>
+    void SparseAdamWUpdate(IGpuBuffer param, IGpuBuffer m, IGpuBuffer v,
+        IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz,
+        float learningRate, float beta1, float beta2, float epsilon,
+        float weightDecay, int step);
+
+    /// <summary>Sparse RMSProp scatter-update on GPU.</summary>
+    void SparseRmspropUpdate(IGpuBuffer param, IGpuBuffer squaredAvg,
+        IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz,
+        float learningRate, float rho, float epsilon, float weightDecay);
+
+    /// <summary>Sparse Adagrad scatter-update on GPU.</summary>
+    void SparseAdagradUpdate(IGpuBuffer param, IGpuBuffer accumulatedGrad,
+        IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz,
+        float learningRate, float epsilon, float weightDecay);
+
+    /// <summary>Sparse NAG (Nesterov-accelerated SGD with momentum) scatter-update on GPU.</summary>
+    void SparseNagUpdate(IGpuBuffer param, IGpuBuffer velocity,
+        IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz,
+        float learningRate, float momentum, float weightDecay);
+
+    /// <summary>Sparse AdaDelta scatter-update on GPU.</summary>
+    void SparseAdadeltaUpdate(IGpuBuffer param, IGpuBuffer accumGrad, IGpuBuffer accumUpdate,
+        IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz,
+        float rho, float epsilon, float weightDecay);
+
+    /// <summary>Sparse AMSGrad scatter-update on GPU.</summary>
+    void SparseAmsgradUpdate(IGpuBuffer param, IGpuBuffer m, IGpuBuffer v, IGpuBuffer vMax,
+        IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz,
+        float learningRate, float beta1, float beta2, float epsilon,
+        float weightDecay, int step);
+
+    /// <summary>Sparse Adamax scatter-update on GPU.</summary>
+    void SparseAdamaxUpdate(IGpuBuffer param, IGpuBuffer m, IGpuBuffer u,
+        IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz,
+        float learningRate, float beta1, float beta2, float epsilon,
+        float weightDecay, int step);
+
+    /// <summary>Sparse Lion scatter-update on GPU.</summary>
+    void SparseLionUpdate(IGpuBuffer param, IGpuBuffer m,
+        IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz,
+        float learningRate, float beta1, float beta2, float weightDecay);
+
+    /// <summary>Sparse Nadam scatter-update on GPU.</summary>
+    void SparseNadamUpdate(IGpuBuffer param, IGpuBuffer m, IGpuBuffer v,
+        IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz,
+        float learningRate, float beta1, float beta2, float epsilon,
+        float weightDecay, int step);
+
+    /// <summary>Sparse FTRL scatter-update on GPU.</summary>
+    void SparseFtrlUpdate(IGpuBuffer param, IGpuBuffer z, IGpuBuffer n,
+        IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz,
+        float learningRate, float l1Reg, float l2Reg, float beta);
+
+    /// <summary>Sparse proximal-L1 scatter-update on GPU.</summary>
+    void SparseProximalL1Update(IGpuBuffer param,
+        IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz,
+        float learningRate, float l1Strength);
+
     #endregion
 
     #region FFT and Signal Processing
