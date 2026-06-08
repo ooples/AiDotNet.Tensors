@@ -674,18 +674,28 @@ public static partial class BlasManaged
         // fits an L3 budget: numNB collapses to 1 and A is packed ONCE (this is why OpenBLAS uses a
         // large Nc). Pure win — fewer pack passes, identical reduction order (bit-exact).
         if (strategy == PackingMode.ForcePackBoth
-            && options.PackedA is null && options.PackedB is null)
+            && options.PackedA is null && options.PackedB is null && m >= 256)
         {
             int elemSz = System.Runtime.CompilerServices.Unsafe.SizeOf<T>();
             const long L3PanelBudgetBytes = 8L * 1024 * 1024;
             long fullPanelBytes = (long)kcFromAutotune * n * elemSz;
-            int numMBnow = (m + mcFromAutotune - 1) / mcFromAutotune;
-            // Skip 2D-eligible shapes (few M-blocks, numMB*4 ≤ procs): they rely on the 2D MN-grid's
-            // N-parallelism, and collapsing numNB to 1 here would disable 2D and strand them on a
-            // thin M-axis split (e.g. FFN-up 512×512×2048 → numMB=8 wants 2D's 32-way, not M-axis 8).
-            if (numMBnow * 4 > procs && n > ncFromAutotune && fullPanelBytes <= L3PanelBudgetBytes)
+            if (n > ncFromAutotune && fullPanelBytes <= L3PanelBudgetBytes)
             {
                 ncFromAutotune = ((n + nr - 1) / nr) * nr; // span all of N → numNB == 1, A packed once
+
+                // With numNB now == 1, A is packed ONCE regardless of mc (total A-pack = M×K either
+                // way), so the small-mc A-repack penalty that the floor avoids no longer applies.
+                // That lets a wide-N moderate-M shape (e.g. FFN-up 512×512×2048, numMB=8) fill the
+                // cores via the shared-B M-axis with NO redundant B-pack — strictly better than the
+                // 2D grid, which re-packs B per ic-block. Shrink mc to ~physical M-blocks when under.
+                int physicalCores = Math.Max(1, procs / 2); // 2-way SMT assumption
+                int numMBwide = (m + mcFromAutotune - 1) / mcFromAutotune;
+                if (numMBwide < physicalCores && mcFromAutotune > 2 * mr)
+                {
+                    int targetMc = Math.Max(2 * mr, (m + physicalCores - 1) / physicalCores);
+                    targetMc = ((targetMc + mr - 1) / mr) * mr; // round up to a whole mr tile
+                    if (targetMc < mcFromAutotune) mcFromAutotune = targetMc;
+                }
             }
         }
 
