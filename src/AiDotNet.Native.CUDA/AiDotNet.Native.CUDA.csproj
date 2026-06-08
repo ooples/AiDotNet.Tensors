@@ -22,21 +22,17 @@
     <ContentTargetFolders>content</ContentTargetFolders>
   </PropertyGroup>
 
-  <!-- Windows x64 native libraries: cudart, cuBLAS, cuBLASLt, AND nvRTC (+ builtins).
-       nvRTC is required by AiDotNet.Tensors' CUDA backend for runtime kernel JIT;
-       without it CUDA ops fail (cuMemAlloc/cuMemcpyHtoD error 700). Binaries are
-       staged by tools/stage-cuda-redist.ps1 (gitignored, ~770MB) and packed via a
-       wildcard so the full runtime is always included. -->
-  <ItemGroup>
-    <None Include="runtimes\win-x64\native\*.dll" Pack="true" PackagePath="runtimes\win-x64\native" />
-  </ItemGroup>
+  <!-- Windows x64 native libraries: cudart, cuBLAS, cuBLASLt, AND nvRTC (+ builtins),
+       staged by tools/stage-cuda-redist.ps1 (gitignored, ~770MB).
 
-  <!-- Future: Linux x64 native libraries -->
-  <!-- <None Include="runtimes\linux-x64\native\libcublas.so.12" Pack="true" PackagePath="runtimes\linux-x64\native" /> -->
-  <!-- <None Include="runtimes\linux-x64\native\libcublasLt.so.12" Pack="true" PackagePath="runtimes\linux-x64\native" /> -->
-  <!-- <None Include="runtimes\linux-x64\native\libcudart.so.12" Pack="true" PackagePath="runtimes\linux-x64\native" /> -->
+       IMPORTANT: this project does NOT pack the DLLs directly — the full runtime is far
+       over nuget.org's 250 MB per-package limit (cuBLAS / cuBLASLt EACH exceed it). The
+       shipped package is produced by tools/pack-cuda-split.ps1, which splits the runtime
+       into <250 MB AiDotNet.Native.CUDA.Fragments.* packages plus a meta package whose
+       build/AiDotNet.Native.CUDA.targets reassembles the DLLs at the consumer's build.
+       The items below only copy the staged DLLs to THIS project's output for local dev. -->
 
-  <!-- Ensure the native libraries are copied to output -->
+  <!-- Ensure the native libraries are copied to output for local development/debugging. -->
   <ItemGroup>
     <None Include="runtimes\**\*.dll" CopyToOutputDirectory="PreserveNewest" Link="%(RecursiveDir)%(Filename)%(Extension)" />
   </ItemGroup>

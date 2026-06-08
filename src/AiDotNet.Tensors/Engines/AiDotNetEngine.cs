@@ -188,7 +188,6 @@ public static class AiDotNetEngine
             {
                 Current = new CpuEngine();
             }
-
             return false;
         }
 

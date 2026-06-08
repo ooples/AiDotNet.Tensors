@@ -306,4 +306,251 @@ public static class GpuOptimizer
         if (pb is null || gb is null || zb is null || nb is null) return false;
         b.FtrlUpdate(pb, gb, zb, nb, lr, l1Reg, l2Reg, beta, p!.Length); return true;
     }
+
+    // ==================================================================
+    // SPARSE-AWARE GPU OPTIMIZER WRAPPERS — PR #567
+    // ==================================================================
+    //
+    // Each wrapper below dispatches the matching NATIVE sparse_*_update
+    // CUDA kernel (defined in CudaOptimizerKernels.cs, launched by
+    // CudaBackend.SparseXUpdate). Grid dim = ceil(nnz / 256); each kernel
+    // thread reads exactly one (idx[k], val[k]) and scatter-updates only
+    // (param[idx], state[idx]). Memory traffic is O(nnz) — the other
+    // (param.Length - nnz) entries are never read or written.
+    //
+    // sparseIndices and sparseValues must already be GPU-resident
+    // (TryGetGpuBuffer must succeed for them). The dense state buffers
+    // (m, v, accum, ...) keep their full shape and are mutated in place
+    // at the touched indices.
+    //
+    // Returns false on:
+    //   * non-GPU engine (caller should run CPU sparse path)
+    //   * any tensor missing its GPU buffer
+    //   * backend NotSupportedException (non-CUDA backends without the
+    //     native sparse kernel yet — HIP/Metal/Vulkan/WebGpu/OpenCL)
+    // ==================================================================
+
+    private static bool TryPrepareSparse(
+        Tensor<float> param, Tensor<int> sparseIndices, Tensor<float> sparseValues, int nnz,
+        out IDirectGpuBackend? backend, out IGpuBuffer? pBuf, out IGpuBuffer? idxBuf, out IGpuBuffer? valBuf)
+    {
+        backend = null; pBuf = null; idxBuf = null; valBuf = null;
+        if (param is null) throw new ArgumentNullException(nameof(param));
+        if (sparseIndices is null) throw new ArgumentNullException(nameof(sparseIndices));
+        if (sparseValues is null) throw new ArgumentNullException(nameof(sparseValues));
+        if (nnz < 0) throw new ArgumentOutOfRangeException(nameof(nnz));
+        if (nnz > sparseIndices.Length || nnz > sparseValues.Length)
+            throw new ArgumentException("nnz exceeds the supplied sparse buffers.", nameof(nnz));
+
+        if (!(AiDotNetEngine.Current is DirectGpuTensorEngine engine)) return false;
+        backend = engine.GetBackend();
+        if (backend is null) return false;
+        pBuf = param.TryGetGpuBuffer();
+        idxBuf = sparseIndices.TryGetGpuBuffer();
+        valBuf = sparseValues.TryGetGpuBuffer();
+        return pBuf is not null && idxBuf is not null && valBuf is not null;
+    }
+
+    /// <summary>Adam GPU step driven by a sparse gradient — dispatches the native
+    /// sparse_adam_update kernel (one thread per nnz, scatter-update). Returns false
+    /// when any tensor isn't GPU-resident or the backend has no native sparse kernel.</summary>
+    public static bool TryAdamStepSparse(
+        Tensor<float> param, Tensor<float> m, Tensor<float> v,
+        Tensor<int> sparseIndices, Tensor<float> sparseValues, int nnz,
+        float learningRate, float beta1, float beta2, float epsilon,
+        float weightDecay, int step)
+    {
+        if (m is null) throw new ArgumentNullException(nameof(m));
+        if (v is null) throw new ArgumentNullException(nameof(v));
+        if (!TryPrepareSparse(param, sparseIndices, sparseValues, nnz, out var b, out var pb, out var iBuf, out var vBuf)) return false;
+        var mb = m.TryGetGpuBuffer(); var vbState = v.TryGetGpuBuffer();
+        if (mb is null || vbState is null) return false;
+        try { b!.SparseAdamUpdate(pb!, mb, vbState, iBuf!, vBuf!, nnz, learningRate, beta1, beta2, epsilon, weightDecay, step); return true; }
+        catch (NotSupportedException) { return false; }
+    }
+
+    /// <summary>AdamW GPU step driven by a sparse gradient (native sparse_adamw_update kernel).</summary>
+    public static bool TryAdamWStepSparse(
+        Tensor<float> param, Tensor<float> m, Tensor<float> v,
+        Tensor<int> sparseIndices, Tensor<float> sparseValues, int nnz,
+        float learningRate, float beta1, float beta2, float epsilon,
+        float weightDecay, int step)
+    {
+        if (m is null) throw new ArgumentNullException(nameof(m));
+        if (v is null) throw new ArgumentNullException(nameof(v));
+        if (!TryPrepareSparse(param, sparseIndices, sparseValues, nnz, out var b, out var pb, out var iBuf, out var vBuf)) return false;
+        var mb = m.TryGetGpuBuffer(); var vbState = v.TryGetGpuBuffer();
+        if (mb is null || vbState is null) return false;
+        try { b!.SparseAdamWUpdate(pb!, mb, vbState, iBuf!, vBuf!, nnz, learningRate, beta1, beta2, epsilon, weightDecay, step); return true; }
+        catch (NotSupportedException) { return false; }
+    }
+
+    /// <summary>SGD GPU step driven by a sparse gradient (native sparse_sgd_update kernel).</summary>
+    public static bool TrySgdStepSparse(
+        Tensor<float> param,
+        Tensor<int> sparseIndices, Tensor<float> sparseValues, int nnz,
+        float learningRate, float weightDecay = 0f)
+    {
+        if (!TryPrepareSparse(param, sparseIndices, sparseValues, nnz, out var b, out var pb, out var iBuf, out var vBuf)) return false;
+        try { b!.SparseSgdUpdate(pb!, iBuf!, vBuf!, nnz, learningRate, weightDecay); return true; }
+        catch (NotSupportedException) { return false; }
+    }
+
+    /// <summary>SGD-momentum GPU step driven by a sparse gradient.</summary>
+    public static bool TrySgdMomentumStepSparse(
+        Tensor<float> param, Tensor<float> velocity,
+        Tensor<int> sparseIndices, Tensor<float> sparseValues, int nnz,
+        float learningRate, float momentum, float weightDecay)
+    {
+        if (velocity is null) throw new ArgumentNullException(nameof(velocity));
+        if (!TryPrepareSparse(param, sparseIndices, sparseValues, nnz, out var b, out var pb, out var iBuf, out var vBuf)) return false;
+        var velBuf = velocity.TryGetGpuBuffer();
+        if (velBuf is null) return false;
+        try { b!.SparseSgdMomentumUpdate(pb!, velBuf, iBuf!, vBuf!, nnz, learningRate, momentum, weightDecay); return true; }
+        catch (NotSupportedException) { return false; }
+    }
+
+    /// <summary>RMSProp GPU step driven by a sparse gradient.</summary>
+    public static bool TryRmspropStepSparse(
+        Tensor<float> param, Tensor<float> squaredAvg,
+        Tensor<int> sparseIndices, Tensor<float> sparseValues, int nnz,
+        float lr, float rho, float epsilon, float weightDecay)
+    {
+        if (squaredAvg is null) throw new ArgumentNullException(nameof(squaredAvg));
+        if (!TryPrepareSparse(param, sparseIndices, sparseValues, nnz, out var b, out var pb, out var iBuf, out var vBuf)) return false;
+        var sb = squaredAvg.TryGetGpuBuffer();
+        if (sb is null) return false;
+        try { b!.SparseRmspropUpdate(pb!, sb, iBuf!, vBuf!, nnz, lr, rho, epsilon, weightDecay); return true; }
+        catch (NotSupportedException) { return false; }
+    }
+
+    /// <summary>Adagrad GPU step driven by a sparse gradient.</summary>
+    public static bool TryAdagradStepSparse(
+        Tensor<float> param, Tensor<float> accum,
+        Tensor<int> sparseIndices, Tensor<float> sparseValues, int nnz,
+        float lr, float epsilon, float weightDecay)
+    {
+        if (accum is null) throw new ArgumentNullException(nameof(accum));
+        if (!TryPrepareSparse(param, sparseIndices, sparseValues, nnz, out var b, out var pb, out var iBuf, out var vBuf)) return false;
+        var ab = accum.TryGetGpuBuffer();
+        if (ab is null) return false;
+        try { b!.SparseAdagradUpdate(pb!, ab, iBuf!, vBuf!, nnz, lr, epsilon, weightDecay); return true; }
+        catch (NotSupportedException) { return false; }
+    }
+
+    /// <summary>NAG GPU step driven by a sparse gradient.</summary>
+    public static bool TryNagStepSparse(
+        Tensor<float> param, Tensor<float> velocity,
+        Tensor<int> sparseIndices, Tensor<float> sparseValues, int nnz,
+        float lr, float momentum, float weightDecay)
+    {
+        if (velocity is null) throw new ArgumentNullException(nameof(velocity));
+        if (!TryPrepareSparse(param, sparseIndices, sparseValues, nnz, out var b, out var pb, out var iBuf, out var vBuf)) return false;
+        var velBuf = velocity.TryGetGpuBuffer();
+        if (velBuf is null) return false;
+        try { b!.SparseNagUpdate(pb!, velBuf, iBuf!, vBuf!, nnz, lr, momentum, weightDecay); return true; }
+        catch (NotSupportedException) { return false; }
+    }
+
+    /// <summary>AdaDelta GPU step driven by a sparse gradient.</summary>
+    public static bool TryAdadeltaStepSparse(
+        Tensor<float> param, Tensor<float> accumGrad, Tensor<float> accumUpdate,
+        Tensor<int> sparseIndices, Tensor<float> sparseValues, int nnz,
+        float rho, float epsilon, float weightDecay)
+    {
+        if (accumGrad is null) throw new ArgumentNullException(nameof(accumGrad));
+        if (accumUpdate is null) throw new ArgumentNullException(nameof(accumUpdate));
+        if (!TryPrepareSparse(param, sparseIndices, sparseValues, nnz, out var b, out var pb, out var iBuf, out var vBuf)) return false;
+        var agb = accumGrad.TryGetGpuBuffer();
+        var aub = accumUpdate.TryGetGpuBuffer();
+        if (agb is null || aub is null) return false;
+        try { b!.SparseAdadeltaUpdate(pb!, agb, aub, iBuf!, vBuf!, nnz, rho, epsilon, weightDecay); return true; }
+        catch (NotSupportedException) { return false; }
+    }
+
+    /// <summary>AMSGrad GPU step driven by a sparse gradient.</summary>
+    public static bool TryAmsgradStepSparse(
+        Tensor<float> param, Tensor<float> m, Tensor<float> v, Tensor<float> vMax,
+        Tensor<int> sparseIndices, Tensor<float> sparseValues, int nnz,
+        float lr, float beta1, float beta2, float epsilon, float weightDecay, int step)
+    {
+        if (m is null) throw new ArgumentNullException(nameof(m));
+        if (v is null) throw new ArgumentNullException(nameof(v));
+        if (vMax is null) throw new ArgumentNullException(nameof(vMax));
+        if (!TryPrepareSparse(param, sparseIndices, sparseValues, nnz, out var b, out var pb, out var iBuf, out var vBuf)) return false;
+        var mb = m.TryGetGpuBuffer(); var vbState = v.TryGetGpuBuffer(); var vmb = vMax.TryGetGpuBuffer();
+        if (mb is null || vbState is null || vmb is null) return false;
+        try { b!.SparseAmsgradUpdate(pb!, mb, vbState, vmb, iBuf!, vBuf!, nnz, lr, beta1, beta2, epsilon, weightDecay, step); return true; }
+        catch (NotSupportedException) { return false; }
+    }
+
+    /// <summary>Adamax GPU step driven by a sparse gradient.</summary>
+    public static bool TryAdamaxStepSparse(
+        Tensor<float> param, Tensor<float> m, Tensor<float> u,
+        Tensor<int> sparseIndices, Tensor<float> sparseValues, int nnz,
+        float lr, float beta1, float beta2, float epsilon, float weightDecay, int step)
+    {
+        if (m is null) throw new ArgumentNullException(nameof(m));
+        if (u is null) throw new ArgumentNullException(nameof(u));
+        if (!TryPrepareSparse(param, sparseIndices, sparseValues, nnz, out var b, out var pb, out var iBuf, out var vBuf)) return false;
+        var mb = m.TryGetGpuBuffer(); var ub = u.TryGetGpuBuffer();
+        if (mb is null || ub is null) return false;
+        try { b!.SparseAdamaxUpdate(pb!, mb, ub, iBuf!, vBuf!, nnz, lr, beta1, beta2, epsilon, weightDecay, step); return true; }
+        catch (NotSupportedException) { return false; }
+    }
+
+    /// <summary>Lion GPU step driven by a sparse gradient.</summary>
+    public static bool TryLionStepSparse(
+        Tensor<float> param, Tensor<float> m,
+        Tensor<int> sparseIndices, Tensor<float> sparseValues, int nnz,
+        float lr, float beta1, float beta2, float weightDecay)
+    {
+        if (m is null) throw new ArgumentNullException(nameof(m));
+        if (!TryPrepareSparse(param, sparseIndices, sparseValues, nnz, out var b, out var pb, out var iBuf, out var vBuf)) return false;
+        var mb = m.TryGetGpuBuffer();
+        if (mb is null) return false;
+        try { b!.SparseLionUpdate(pb!, mb, iBuf!, vBuf!, nnz, lr, beta1, beta2, weightDecay); return true; }
+        catch (NotSupportedException) { return false; }
+    }
+
+    /// <summary>Nadam GPU step driven by a sparse gradient.</summary>
+    public static bool TryNadamStepSparse(
+        Tensor<float> param, Tensor<float> m, Tensor<float> v,
+        Tensor<int> sparseIndices, Tensor<float> sparseValues, int nnz,
+        float lr, float beta1, float beta2, float epsilon, float weightDecay, int step)
+    {
+        if (m is null) throw new ArgumentNullException(nameof(m));
+        if (v is null) throw new ArgumentNullException(nameof(v));
+        if (!TryPrepareSparse(param, sparseIndices, sparseValues, nnz, out var b, out var pb, out var iBuf, out var vBuf)) return false;
+        var mb = m.TryGetGpuBuffer(); var vbState = v.TryGetGpuBuffer();
+        if (mb is null || vbState is null) return false;
+        try { b!.SparseNadamUpdate(pb!, mb, vbState, iBuf!, vBuf!, nnz, lr, beta1, beta2, epsilon, weightDecay, step); return true; }
+        catch (NotSupportedException) { return false; }
+    }
+
+    /// <summary>FTRL GPU step driven by a sparse gradient.</summary>
+    public static bool TryFtrlStepSparse(
+        Tensor<float> param, Tensor<float> z, Tensor<float> n,
+        Tensor<int> sparseIndices, Tensor<float> sparseValues, int nnz,
+        float lr, float l1Reg, float l2Reg, float beta)
+    {
+        if (z is null) throw new ArgumentNullException(nameof(z));
+        if (n is null) throw new ArgumentNullException(nameof(n));
+        if (!TryPrepareSparse(param, sparseIndices, sparseValues, nnz, out var b, out var pb, out var iBuf, out var vBuf)) return false;
+        var zb = z.TryGetGpuBuffer(); var nb = n.TryGetGpuBuffer();
+        if (zb is null || nb is null) return false;
+        try { b!.SparseFtrlUpdate(pb!, zb, nb, iBuf!, vBuf!, nnz, lr, l1Reg, l2Reg, beta); return true; }
+        catch (NotSupportedException) { return false; }
+    }
+
+    /// <summary>Proximal-L1 GPU step driven by a sparse gradient.</summary>
+    public static bool TryProximalL1StepSparse(
+        Tensor<float> param,
+        Tensor<int> sparseIndices, Tensor<float> sparseValues, int nnz,
+        float lr, float l1Strength)
+    {
+        if (!TryPrepareSparse(param, sparseIndices, sparseValues, nnz, out var b, out var pb, out var iBuf, out var vBuf)) return false;
+        try { b!.SparseProximalL1Update(pb!, iBuf!, vBuf!, nnz, lr, l1Strength); return true; }
+        catch (NotSupportedException) { return false; }
+    }
 }

@@ -106,6 +106,14 @@ internal sealed class ActivationCacheEntry : IDisposable
     // bytes) so the cache can bound MANAGED-heap retention independently of VRAM —
     // see _maxActivationManagedBytes in DirectGpuTensorEngine.
     public long ManagedBytes { get; }
+    // Managed thread that created this activation. The engine + activation cache are a
+    // process-wide singleton; a GPU buffer is only ever used by the thread that created
+    // it (each independent GradientTape runs on one thread). Eviction therefore frees
+    // ONLY the calling thread's entries — otherwise one thread's eviction (per-step or
+    // VRAM-pressure) would dispose a buffer another thread's in-flight kernel is still
+    // reading, a use-after-free that crashes the process (0xC0000005) under concurrent
+    // tapes.
+    public int ThreadId { get; }
 
     // FP16 GPU activation storage (#558 layer 5): when true, Buffer holds ElementCount FP16 values
     // (half the bytes). A consumer/backward read re-inflates it to FP32 via TryUpcastActivationFp32.
@@ -132,6 +140,7 @@ internal sealed class ActivationCacheEntry : IDisposable
         Timestamp = timestamp;
         Backend = backend;
         ManagedBytes = managedBytes;
+        ThreadId = System.Environment.CurrentManagedThreadId;
         IsFp16 = isFp16;
         ElementCount = elementCount;
     }
@@ -808,7 +817,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // the GPU pointer and force a re-upload.
         if (tensor._gpuBuffer is not null && ReferenceEquals(tensor._gpuBackend, backend))
         {
-            if (tensor._gpuBufferVersion == tensor.Version)
+            if (tensor._gpuBufferVersion == tensor.Version && IsCachedGpuBufferLive(tensor, backend))
                 return new OwnedBuffer(tensor._gpuBuffer, ownsBuffer: false);
 
             // Stale snapshot — also clear any matching activation-cache entry so
@@ -866,6 +875,29 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         // Not in any cache — fall back to GetDataArray (triggers lazy allocation + GPU download if needed)
         return GetOrAllocateBuffer(backend, tensor.GetDataArray());
+    }
+
+    /// <summary>
+    /// True when a CPU tensor's cached <c>_gpuBuffer</c> field can still be trusted by the
+    /// upload fast paths. The field is set when an input is uploaded and cached as an
+    /// activation, but the activation cache can EVICT + dispose (and the backend then
+    /// recycle) that buffer for an unrelated tensor without ever clearing this field —
+    /// leaving a stale pointer that, with a matching Version, would serve another tensor's
+    /// data (e.g. a persistent input uploaded during a tape, then reaped by
+    /// <see cref="EvictActivationsCreatedAfter"/> on tape dispose, then handed to the next
+    /// forward call's upload). For a CPU tensor we therefore confirm the activation cache
+    /// STILL maps this tensor's key to the very same buffer; if not, the field is stale and
+    /// the caller must re-upload. GPU-resident results are not tracked by the activation
+    /// cache, so their field stays authoritative.
+    /// </summary>
+    private bool IsCachedGpuBufferLive<T>(Tensor<T> tensor, IDirectGpuBackend backend)
+    {
+        if (tensor.IsGpuResident) return true;
+        var key = (object?)tensor.DataVector.GetBackingArrayUnsafe() ?? tensor.DataVector;
+        // _activationCache is a ConcurrentDictionary — this read is lock-free.
+        return _activationCache.TryGetValue(key, out var entry)
+            && ReferenceEquals(entry.Buffer, tensor._gpuBuffer)
+            && ReferenceEquals(entry.Backend, backend);
     }
 
     /// <summary>
@@ -1037,7 +1069,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // buffer to UploadTensorRaw callers.
         if (tensor._gpuBuffer is not null && ReferenceEquals(tensor._gpuBackend, backend))
         {
-            if (tensor._gpuBufferVersion == tensor.Version)
+            if (tensor._gpuBufferVersion == tensor.Version && IsCachedGpuBufferLive(tensor, backend))
                 return new OwnedBuffer(tensor._gpuBuffer, ownsBuffer: false);
 
             var staleArray = tensor.DataVector.GetBackingArrayUnsafe();
@@ -1410,7 +1442,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     private List<ActivationCacheEntry> EvictOldestActivationsUnsafe()
     {
-        var entries = _activationCache.ToArray();
+        // Only free THIS thread's activations — another thread's buffer may be in-flight
+        // on a kernel right now (freeing it = use-after-free / 0xC0000005). A thread's
+        // GPU buffers are only ever used by that thread, so this is the safe set.
+        int callerThreadId = System.Environment.CurrentManagedThreadId;
+        var entries = Array.FindAll(_activationCache.ToArray(), kv => kv.Value.ThreadId == callerThreadId);
         var toDispose = new List<ActivationCacheEntry>();
         if (entries.Length == 0) return toDispose;
 
@@ -1480,6 +1516,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     internal void EvictActivationsCreatedAfter(long snapshot)
     {
+        // The activation timestamp counter is process-wide, so "created after my snapshot"
+        // also matches a CONCURRENT tape's activations on another thread. Free only THIS
+        // thread's entries — disposing another thread's in-flight buffer is a use-after-free
+        // (0xC0000005) under concurrent tapes.
+        int callerThreadId = System.Environment.CurrentManagedThreadId;
         List<ActivationCacheEntry> toDispose;
         lock (_activationCacheLock)
         {
@@ -1489,6 +1530,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             for (int i = 0; i < entries.Length; i++)
             {
                 if (entries[i].Value.Timestamp <= snapshot) continue;   // pre-existing — keep
+                if (entries[i].Value.ThreadId != callerThreadId) continue; // another thread's live buffer
                 if (Helpers.DeferredArrayMaterializer.IsPending(entries[i].Key))
                 {
                     try { Helpers.DeferredArrayMaterializer.TryMaterialize(entries[i].Key); }
@@ -1512,23 +1554,33 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     public void ClearActivationCache()
     {
-        // Materialize any deferred downloads before clearing — otherwise CPU arrays
-        // would be left empty because the GPU buffers they depend on get disposed.
-        MaterializeAllDeferred();
-
-        List<ActivationCacheEntry> toDispose;
+        // Snapshot the (key, entry) pairs this cache owns, then clear.
+        List<KeyValuePair<object, ActivationCacheEntry>> toDispose;
         lock (_activationCacheLock)
         {
-            toDispose = new List<ActivationCacheEntry>(_activationCache.Values);
+            toDispose = new List<KeyValuePair<object, ActivationCacheEntry>>(_activationCache);
             _activationCache.Clear();
             System.Threading.Interlocked.Exchange(ref _currentActivationCacheBytes, 0);
             System.Threading.Interlocked.Exchange(ref _currentActivationManagedBytes, 0);
         }
 
-        // Dispose GPU buffers outside the lock
-        foreach (var entry in toDispose)
+        // Materialize each pending deferred download into its CPU array BEFORE freeing the
+        // buffer (otherwise a later CPU read hits a freed buffer). Per-entry over THIS cache's
+        // own keys — NOT the global MaterializeAllDeferred, which would drain (download) other
+        // engines'/threads' in-flight buffers and race them (the -38 / GPU-fault hazard).
+        foreach (var kv in toDispose)
         {
-            entry.Dispose();
+            if (Helpers.DeferredArrayMaterializer.IsPending(kv.Key))
+            {
+                try { Helpers.DeferredArrayMaterializer.TryMaterialize(kv.Key); }
+                catch { Helpers.DeferredArrayMaterializer.Remove(kv.Key); }
+            }
+        }
+
+        // Dispose GPU buffers outside the lock
+        foreach (var kv in toDispose)
+        {
+            kv.Value.Dispose();
         }
     }
 

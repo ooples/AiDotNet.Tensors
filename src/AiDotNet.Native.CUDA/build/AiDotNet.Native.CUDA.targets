@@ -2,32 +2,125 @@
 <Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
 
   <!--
-    This targets file copies CUDA native libraries to the output directory
-    when a project references AiDotNet.Native.CUDA.
+    AiDotNet.Native.CUDA ships its ~770 MB CUDA 12 runtime as a set of <250 MB fragment
+    packages (AiDotNet.Native.CUDA.Fragments.N) because nuget.org rejects any single
+    package over 250 MB. This .targets reassembles each native DLL from its ordered
+    fragment chunks at the consumer's build, on win-x64, then lets the normal build/publish
+    copy place them next to the app (where the CUDA backend's DllImports resolve them).
+    See tools/pack-cuda-split.ps1 for how the fragments + manifest are produced.
   -->
 
+  <!-- Inline reassembly task: concatenates each DLL's chunks (restored from the fragment
+       packages alongside this meta package) into DestDir. Located relative to THIS file,
+       so it works regardless of the NuGet global-packages folder layout. -->
+  <UsingTask TaskName="ReassembleCudaRuntime"
+             TaskFactory="RoslynCodeTaskFactory"
+             AssemblyFile="$(MSBuildToolsPath)\Microsoft.Build.Tasks.Core.dll">
+    <ParameterGroup>
+      <MetaDir ParameterType="System.String" Required="true" />
+      <ManifestPath ParameterType="System.String" Required="true" />
+      <DestDir ParameterType="System.String" Required="true" />
+    </ParameterGroup>
+    <Task>
+      <Using Namespace="System" />
+      <Using Namespace="System.IO" />
+      <Using Namespace="System.Collections.Generic" />
+      <Code Type="Fragment" Language="cs"><![CDATA[
+        // MetaDir = <packagesRoot>/aidotnet.native.cuda/<version>/build/
+        var meta = new DirectoryInfo(MetaDir.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+        var version = meta.Parent.Name;                       // <version>
+        var packagesRoot = meta.Parent.Parent.Parent;         // <packagesRoot>
+        Directory.CreateDirectory(DestDir);
+
+        // Index every restored fragment chunk by file name.
+        var chunks = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var frag in packagesRoot.GetDirectories("aidotnet.native.cuda.fragments.*"))
+        {
+            var cf = Path.Combine(frag.FullName, version, "cuda-fragments");
+            if (!Directory.Exists(cf)) continue;
+            foreach (var f in Directory.GetFiles(cf)) chunks[Path.GetFileName(f)] = f;
+        }
+
+        foreach (var raw in File.ReadAllLines(ManifestPath))
+        {
+            var line = raw.Trim();
+            if (line.Length == 0) continue;
+            var parts = line.Split('|');               // <dll>|<totalBytes>|<chunkCount>
+            var dll = parts[0];
+            long total = long.Parse(parts[1]);
+            int count = int.Parse(parts[2]);
+
+            var dest = Path.Combine(DestDir, dll);
+            if (File.Exists(dest) && new FileInfo(dest).Length == total)
+            {
+                Log.LogMessage(MessageImportance.Low, "AiDotNet.Native.CUDA: " + dll + " already reassembled.");
+                continue;
+            }
+
+            var tmp = dest + ".tmp";
+            using (var outFs = File.Create(tmp))
+            {
+                for (int i = 0; i < count; i++)
+                {
+                    var name = string.Format("{0}.{1:D3}", dll, i);
+                    string src;
+                    if (!chunks.TryGetValue(name, out src))
+                        throw new FileNotFoundException("AiDotNet.Native.CUDA reassembly: missing chunk '" + name +
+                            "'. The AiDotNet.Native.CUDA.Fragments.* packages may not have been restored.");
+                    using (var inFs = File.OpenRead(src)) inFs.CopyTo(outFs);
+                }
+            }
+            long got = new FileInfo(tmp).Length;
+            if (got != total)
+            {
+                File.Delete(tmp);
+                throw new Exception("AiDotNet.Native.CUDA reassembly: " + dll + " is " + got + " bytes, expected " + total + ".");
+            }
+            if (File.Exists(dest)) File.Delete(dest);
+            File.Move(tmp, dest);
+            Log.LogMessage(MessageImportance.High, "AiDotNet.Native.CUDA: reassembled " + dll + " (" + total + " bytes) from " + count + " chunk(s).");
+        }
+      ]]></Code>
+    </Task>
+  </UsingTask>
+
+  <!-- Gate: only on win-x64 (the CUDA runtime is win-x64) and only when the manifest
+       shipped (i.e. this really is a split package). -->
   <PropertyGroup>
-    <AiDotNetNativeCudaPackagePath>$(MSBuildThisFileDirectory)..</AiDotNetNativeCudaPackagePath>
+    <_AiDotNetCudaEnabled Condition="('$(RuntimeIdentifier)' == 'win-x64' Or ('$(RuntimeIdentifier)' == '' And $([MSBuild]::IsOSPlatform('Windows')))) And Exists('$(MSBuildThisFileDirectory)cuda-fragments.manifest')">true</_AiDotNetCudaEnabled>
+    <_AiDotNetCudaReassembleDir>$(IntermediateOutputPath)cuda-native\</_AiDotNetCudaReassembleDir>
   </PropertyGroup>
 
-  <!-- Windows x64 -->
-  <ItemGroup Condition="'$(RuntimeIdentifier)' == 'win-x64' Or ('$(RuntimeIdentifier)' == '' And '$(Platform)' == 'x64' And $([MSBuild]::IsOSPlatform('Windows')))">
-    <None Include="$(AiDotNetNativeCudaPackagePath)\runtimes\win-x64\native\*.dll"
-          Condition="Exists('$(AiDotNetNativeCudaPackagePath)\runtimes\win-x64\native\')">
-      <Link>%(Filename)%(Extension)</Link>
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-      <Visible>false</Visible>
-    </None>
-  </ItemGroup>
+  <!-- Reassemble the native DLLs from their fragment chunks into obj/. Idempotent. -->
+  <Target Name="_AiDotNetReassembleCuda" Condition="'$(_AiDotNetCudaEnabled)' == 'true'">
+    <ReassembleCudaRuntime MetaDir="$(MSBuildThisFileDirectory)"
+                           ManifestPath="$(MSBuildThisFileDirectory)cuda-fragments.manifest"
+                           DestDir="$(_AiDotNetCudaReassembleDir)" />
+  </Target>
 
-  <!-- Linux x64 -->
-  <ItemGroup Condition="'$(RuntimeIdentifier)' == 'linux-x64' Or ('$(RuntimeIdentifier)' == '' And $([MSBuild]::IsOSPlatform('Linux')))">
-    <None Include="$(AiDotNetNativeCudaPackagePath)\runtimes\linux-x64\native\*.so*"
-          Condition="Exists('$(AiDotNetNativeCudaPackagePath)\runtimes\linux-x64\native\')">
-      <Link>%(Filename)%(Extension)</Link>
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-      <Visible>false</Visible>
-    </None>
-  </ItemGroup>
+  <!-- Copy the reassembled DLLs next to the app on build (so the CUDA backend's DllImports
+       resolve them at run time), mirroring the old directly-packed-DLL behaviour. Explicit
+       <Copy> rather than CopyToOutputDirectory items, because the DLLs are generated during
+       the build and dynamically-added None items don't flow into the copy machinery. -->
+  <Target Name="_AiDotNetCopyCudaToOutput"
+          AfterTargets="Build"
+          DependsOnTargets="_AiDotNetReassembleCuda"
+          Condition="'$(_AiDotNetCudaEnabled)' == 'true'">
+    <ItemGroup>
+      <_AiDotNetCudaDll Include="$(_AiDotNetCudaReassembleDir)*.dll" />
+    </ItemGroup>
+    <Copy SourceFiles="@(_AiDotNetCudaDll)" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
+  </Target>
+
+  <!-- And into the publish output. -->
+  <Target Name="_AiDotNetCopyCudaToPublish"
+          AfterTargets="Publish"
+          DependsOnTargets="_AiDotNetReassembleCuda"
+          Condition="'$(_AiDotNetCudaEnabled)' == 'true'">
+    <ItemGroup>
+      <_AiDotNetCudaDll Include="$(_AiDotNetCudaReassembleDir)*.dll" />
+    </ItemGroup>
+    <Copy SourceFiles="@(_AiDotNetCudaDll)" DestinationFolder="$(PublishDir)" SkipUnchangedFiles="true" />
+  </Target>
 
 </Project>
