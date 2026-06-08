@@ -1048,9 +1048,12 @@ public static partial class BlasManaged
             if (Avx512Fp32_16x16.IsSupported) return (16, 16);
             // #409 S.3: the higher-arithmetic-intensity 6×16 kernel (1.5 FMA/load, ~66% of
             // peak vs the load-bound 8×8's ~0.89 / ~49-59%) is used in FAST (non-deterministic)
-            // mode only. Deterministic mode keeps 8×8 because 6×16's different float reduction
-            // order would break the bit-exact invariant the Streaming bypass / serial-vs-parallel
-            // paths assert — acceptable only where bit-reproducibility isn't promised (Fast mode).
+            // mode only. Deterministic mode keeps 8×8 because 6×16's Mr=6 leaves an M-tail on
+            // most shapes that gets computed by Streaming, and 6×16's interior bits do NOT match
+            // Streaming's (8×8's DO) — so when the parallel M-split shifts the interior/tail
+            // boundary, a row flips between 6×16 and Streaming and the output stops being
+            // bit-identical across thread counts (verified: 6×16 fails 4 bit-exact tests, incl.
+            // DeterministicParallelGemmContractTests at m=16). Acceptable only in Fast mode.
             if (!Helpers.BlasProvider.IsDeterministicMode && Avx2Fp32_6x16.IsSupported) return (6, 16);
             if (Avx2Fp32_8x8.IsSupported) return (8, 8);
             if (NeonFp32_8x4.IsSupported) return (8, 4);
