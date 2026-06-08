@@ -498,7 +498,27 @@ jobs:
             exit 1
           fi
 
+          # NuGet.org rejects packages larger than 250 MB with HTTP 413. The native
+          # CUDA package (cudart + cuBLAS + nvRTC redist, ~hundreds of MB) exceeds
+          # that and CANNOT be pushed to nuget.org — it ships as a GitHub Release
+          # asset instead (the github-release job attaches out/*.nupkg). Previously
+          # its 413 aborted the whole step (GitHub Actions runs bash with `set -e`,
+          # so the failing `dotnet nuget push` killed the loop before the status
+          # check), which blocked the managed AiDotNet.Tensors package — the one
+          # downstream consumers actually pin — from ever publishing. Skip
+          # over-limit packages with a warning and make per-package pushes
+          # genuinely non-fatal so one bad package can't strand the rest.
+          NUGET_MAX_BYTES=$((250 * 1000 * 1000))
+
+          set +e
+          failed=()
           for pkg in "${pkgs[@]}"; do
+            size=$(stat -c%s "$pkg")
+            if [ "$size" -gt "$NUGET_MAX_BYTES" ]; then
+              echo "::warning::Skipping $(basename "$pkg") ($((size / 1000 / 1000)) MB) — exceeds NuGet's 250 MB limit; distributed via the GitHub Release instead."
+              continue
+            fi
+
             echo "Publishing $pkg to NuGet..."
             dotnet nuget push "$pkg" \
               --api-key ${{ secrets.NUGET_API_KEY }} \
@@ -508,9 +528,17 @@ jobs:
             if [ $? -eq 0 ]; then
               echo "Successfully published $pkg"
             else
-              echo "Warning: Failed to publish $pkg (may already exist)"
+              echo "::error::Failed to publish $pkg"
+              failed+=("$pkg")
             fi
           done
+          set -e
+
+          if [ ${#failed[@]} -gt 0 ]; then
+            echo "The following under-limit packages failed to publish:"
+            printf '  %s\n' "${failed[@]}"
+            exit 1
+          fi
 
   github-release:
     name: Create GitHub Release
