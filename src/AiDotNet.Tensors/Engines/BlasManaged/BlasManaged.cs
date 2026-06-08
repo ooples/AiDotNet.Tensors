@@ -605,6 +605,31 @@ public static partial class BlasManaged
             kcFromAutotune = options.PackedB.TileKc;
         }
 
+        // Parallelism floor (PackBoth, no pre-pack): the autotuner sizes mc/nc for cache, but
+        // on high core counts a shape can yield fewer (m/mc)×(n/nc) blocks than cores, leaving
+        // cores idle. When N fits a single nc-block the 2D MN-grid can't add N-parallelism
+        // (PackBothStrategy handles the multi-N-block case), so the only lever is mc. Shrink it
+        // toward ~procs M-blocks — bounded to a multiple of mr (panels stay tile-aligned) and
+        // never below 2·mr — so e.g. FFN-down 512×2048×512 (mc=64 → 8 M-blocks on 32 cores)
+        // parallelizes across all cores via the shared-B M-axis path (no redundant B-pack).
+        //
+        // Gated to LARGE K (≥1024): a smaller mc means more A-panels and thus more pack passes,
+        // which only pays off when K is large enough to amortize the pack over the FMA work.
+        // On small-K shapes (e.g. 640³, K=640) the extra pack overhead dominates and the shrink
+        // REGRESSES — so leave those on the autotuner's larger mc.
+        if (strategy == PackingMode.ForcePackBoth && k >= 1024
+            && options.PackedA is null && options.PackedB is null && procs > 1)
+        {
+            int numNB = (n + ncFromAutotune - 1) / ncFromAutotune;
+            int numMB = (m + mcFromAutotune - 1) / mcFromAutotune;
+            if (numNB == 1 && numMB < procs && mcFromAutotune > 2 * mr)
+            {
+                int targetMc = Math.Max(2 * mr, (m + procs - 1) / procs);
+                targetMc = ((targetMc + mr - 1) / mr) * mr; // round up to a whole mr tile
+                if (targetMc < mcFromAutotune) mcFromAutotune = targetMc;
+            }
+        }
+
         switch (strategy)
         {
             case PackingMode.ForcePackBoth:
