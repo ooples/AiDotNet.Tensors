@@ -648,6 +648,11 @@ public static partial class BlasManaged
         // which only pays off when K is large enough to amortize the pack over the FMA work.
         // On small-K shapes (e.g. 640³, K=640) the extra pack overhead dominates and the shrink
         // REGRESSES — so leave those on the autotuner's larger mc.
+        //
+        // NOTE: this is deliberately limited to numNB==1 (genuinely under-parallelized, ≤8 blocks).
+        // Extending it to multi-N-block shapes (e.g. 1024³, mc=64 → 16 M-blocks) REGRESSED them:
+        // the box is 16 PHYSICAL cores (32 SMT threads) and compute-bound GEMM gets nothing from
+        // SMT, so 16 M-blocks already saturates the cores — shrinking mc only shrinks the panels.
         if (strategy == PackingMode.ForcePackBoth && k >= 1024
             && options.PackedA is null && options.PackedB is null && procs > 1)
         {

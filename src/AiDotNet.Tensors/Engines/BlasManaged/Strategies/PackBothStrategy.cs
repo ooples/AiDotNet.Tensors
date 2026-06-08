@@ -937,6 +937,10 @@ internal static class PackBothStrategy
                 return;
             }
             // #409 S.3: higher-intensity 6×16 FP32 tile (Fast-mode default via SelectMrNr).
+            // NOTE: tried driving the AVX2 6×16 MACHINE-CODE kernel here — it REGRESSED (per-
+            // micro-tile fixed + indirect-call overhead; 1024³ 393→369, FFN-up 266→210). The
+            // C# kernel already saturates the harness, so the kernel is NOT the bottleneck in
+            // PackBoth — the gap to native is the macro-harness (packing / blocking / bandwidth).
             if (mr == 6 && nr == 16 && Avx2Fp32_6x16.IsSupported)
             {
                 Avx2Fp32_6x16.Run(
