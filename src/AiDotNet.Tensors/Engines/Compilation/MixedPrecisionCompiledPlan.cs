@@ -414,6 +414,58 @@ public sealed class MixedPrecisionCompiledPlan
         return new StepResult(loss, infNan);
     }
 
+    /// <summary>Outcome of one <see cref="ComputeGradients"/>: the (unscaled) scalar loss, the FP16
+    /// overflow flag, and the per-parameter FP32 gradients (index-aligned with the supplied
+    /// <c>parameters</c>; an entry is <c>null</c> when that parameter wasn't on the path this step).</summary>
+    public readonly struct GradientResult
+    {
+        public readonly float Loss;
+        public readonly bool FoundInfNan;
+        public readonly IReadOnlyList<Tensor<float>?> Gradients;
+        public GradientResult(float loss, bool infNan, IReadOnlyList<Tensor<float>?> grads)
+        { Loss = loss; FoundInfNan = infNan; Gradients = grads; }
+    }
+
+    /// <summary>
+    /// One compiled mixed-precision forward + scaled mixed-dtype backward that RETURNS the unscaled FP32
+    /// master gradients instead of applying any optimizer update. This is the optimizer-agnostic surface:
+    /// the FP16 activation-storage + grad-bridging lives here, and the caller applies whatever optimizer's
+    /// master-weight update it likes (Lion, RMSprop, LAMB, Adagrad, …) using its own state — so the memory
+    /// win is available to every optimizer, not just the inline SGD (<see cref="Step"/>) and Adam
+    /// (<see cref="StepAdam"/>) fast paths. Loss scaling + skip-on-overflow semantics match those methods:
+    /// with a <paramref name="scaler"/> the backward seed is loss-scaled and grads are unscaled in FP32;
+    /// on FP16 overflow <see cref="GradientResult.FoundInfNan"/> is true and the caller MUST skip its update
+    /// (the scaler has already backed off). The plan output must be the scalar loss.
+    /// </summary>
+    public GradientResult ComputeGradients(IReadOnlyList<Tensor<float>> parameters, GradScaler? scaler = null)
+    {
+        if (parameters is null) throw new ArgumentNullException(nameof(parameters));
+
+        Forward();
+        float loss = _output.Length > 0 ? _output.ToArray()[0] : 0f;
+
+        float scale = scaler?.Scale ?? 1f;
+        var grads = RunBackward(scale);
+        float invScale = 1f / scale;
+
+        var pgrads = new Tensor<float>?[parameters.Count];
+        bool infNan = false;
+        for (int i = 0; i < parameters.Count; i++)
+        {
+            if (!grads.Fp32.TryGetValue(parameters[i], out var g)) continue;
+            var span = g.AsWritableSpan();
+            for (int k = 0; k < span.Length; k++)
+            {
+                span[k] *= invScale;
+                if (float.IsNaN(span[k]) || float.IsInfinity(span[k])) infNan = true;
+            }
+            pgrads[i] = g;
+        }
+
+        scaler?.Update(infNan);
+        return new GradientResult(loss, infNan, pgrads);
+    }
+
     private static void RunForward(ILazyNode node, IEngine eng)
     {
         switch (node)

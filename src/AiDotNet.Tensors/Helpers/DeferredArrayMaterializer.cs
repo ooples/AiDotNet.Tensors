@@ -15,7 +15,14 @@ namespace AiDotNet.Tensors.Helpers;
 /// </summary>
 internal static class DeferredArrayMaterializer
 {
-    private static readonly ConcurrentDictionary<object, Action<object>> _pendingMaterializations = new();
+    private readonly struct Pending
+    {
+        public readonly Action<object> Callback;
+        public readonly int ThreadId;
+        public Pending(Action<object> callback, int threadId) { Callback = callback; ThreadId = threadId; }
+    }
+
+    private static readonly ConcurrentDictionary<object, Pending> _pendingMaterializations = new();
 
     /// <summary>
     /// Lock-free fast-path indicator. Incremented by <see cref="Register"/>, decremented
@@ -46,7 +53,11 @@ internal static class DeferredArrayMaterializer
     internal static void Register(object array, Action<object> materializeCallback)
     {
         Interlocked.Increment(ref _pendingCount);
-        if (!_pendingMaterializations.TryAdd(array, materializeCallback))
+        // Tag with the registering thread. The bulk drain (MaterializeAll) only fires
+        // THIS thread's entries — downloading another thread's buffer in a bulk drain
+        // would read a GPU buffer that thread's kernel is still writing (shared queue) →
+        // CL_INVALID_MEM_OBJECT or a GPU driver fault. See MaterializeAll.
+        if (!_pendingMaterializations.TryAdd(array, new Pending(materializeCallback, Environment.CurrentManagedThreadId)))
             Interlocked.Decrement(ref _pendingCount);
     }
 
@@ -66,10 +77,10 @@ internal static class DeferredArrayMaterializer
         if (Volatile.Read(ref _pendingCount) == 0)
             return false;
 
-        if (_pendingMaterializations.TryRemove(array, out var callback))
+        if (_pendingMaterializations.TryRemove(array, out var pending))
         {
             Interlocked.Decrement(ref _pendingCount);
-            callback(array);
+            pending.Callback(array);
             return true;
         }
         return false;
@@ -118,17 +129,31 @@ internal static class DeferredArrayMaterializer
         if (_pendingMaterializations.IsEmpty)
             return;
 
-        // Snapshot keys so we can safely mutate the dictionary from each callback
-        // (Register's semantics are "remove on fire" via TryRemove).
+        // THREAD-SCOPED drain. Only fire the callbacks registered on the CURRENT thread.
+        // A bulk drain at scope/engine teardown previously fired EVERY thread's pending
+        // download — so one parallel test exiting its GPU scope would DownloadBuffer
+        // another concurrent test's IN-FLIGHT buffer (the registry + GPU queue are shared
+        // process-wide). That cross-thread read of a buffer a kernel is still writing
+        // surfaced as "Failed to read OpenCL buffer: -38" and, when the GPU driver faulted,
+        // a hard process kill (no managed/native exception to catch). Each thread flushes
+        // only its OWN deferred tensors here; on-demand access (TryMaterialize for a specific
+        // array) still works from any thread, and other threads flush at their own scope exit.
+        int callerThreadId = Environment.CurrentManagedThreadId;
         var keys = _pendingMaterializations.Keys.ToArray();
         List<Exception>? failures = null;
         foreach (var key in keys)
         {
-            if (!_pendingMaterializations.TryRemove(key, out var callback))
+            // Only claim entries owned by this thread (TryGetValue first to check the owner
+            // without removing other threads' entries).
+            if (!_pendingMaterializations.TryGetValue(key, out var pending))
+                continue;
+            if (pending.ThreadId != callerThreadId)
+                continue;
+            if (!_pendingMaterializations.TryRemove(key, out pending))
                 continue;
             Interlocked.Decrement(ref _pendingCount);
 
-            try { callback(key); }
+            try { pending.Callback(key); }
             catch (InvalidOperationException) when (swallowErrors)
             {
                 // GPU buffer may be torn down; the entry was already removed
@@ -137,11 +162,9 @@ internal static class DeferredArrayMaterializer
             }
             catch (Exception ex)
             {
-                // Drain-all semantics: a single failing callback must not pin
-                // the remaining entries. Collect the exceptions and surface
-                // them after the loop finishes so the registry ends in a
-                // clean "no pending" state regardless of how many entries
-                // raised.
+                // Drain semantics: a single failing callback must not pin the
+                // remaining entries. Collect and surface after the loop so the
+                // registry ends in a clean state regardless of how many raised.
                 (failures ??= new List<Exception>()).Add(ex);
             }
         }

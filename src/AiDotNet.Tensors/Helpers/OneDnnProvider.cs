@@ -41,6 +41,76 @@ internal static class OneDnnProvider
     private static readonly ReaderWriterLockSlim _eltwiseCacheLock = new(LockRecursionPolicy.NoRecursion);
     private static readonly ReaderWriterLockSlim _binaryCacheLock = new(LockRecursionPolicy.NoRecursion);
 
+    // Serializes primitive EXECUTION. A cached primitive owns shared dnnl_memory
+    // objects whose data handles are rebound per call (dnnl_memory_set_data_handle),
+    // and the engine has a single shared _stream — neither is safe for concurrent
+    // use. Without this, two threads executing the same cached primitive (or any two
+    // sharing _stream) stomp each other's data handles → silently wrong results
+    // (e.g. concurrent TensorAddInPlace in independent backward passes). The cache
+    // R/W locks only guard eviction, NOT the set-handle+execute+wait sequence, which
+    // the read lock lets run concurrently. Each execute already calls
+    // dnnl_stream_wait (synchronous), so serializing here adds ~zero cost in the
+    // common single-threaded case and only serializes genuinely concurrent submits.
+    //
+    // OPPORTUNISTIC, NON-BLOCKING gate. The bundled dnnl.dll uses a shared internal
+    // threadpool, so two oneDNN primitives CANNOT execute at the same time (concurrent
+    // dnnl_primitive_execute faults the process — confirmed by a crash dump and by the full
+    // suite running clean with oneDNN disabled). Rather than BLOCK (serialize) — which would
+    // defeat parallelism — each oneDNN entry does Monitor.TryEnter: if another thread is
+    // already in oneDNN, it returns false WITHOUT waiting and the caller falls back to the
+    // thread-safe, parallel managed AVX kernel. So one tape gets oneDNN while concurrent tapes
+    // run truly in parallel on managed code, and concurrent oneDNN execution never happens.
+    private static readonly object _executeLock = new object();
+
+    // Per-thread oneDNN stream. A dnnl_stream is NOT safe to use from multiple threads
+    // concurrently, but the engine IS thread-safe to share and primitives are stateless.
+    // So each thread gets its own stream (lazily created from the shared engine) and the
+    // execute paths bind data via per-call memory objects — enabling genuinely concurrent
+    // execution with no global lock. Streams are tiny; per-thread instances are not
+    // reclaimed until process exit (bounded by the live thread count).
+    [ThreadStatic] private static IntPtr _threadStream;
+
+    private static IntPtr GetThreadStream()
+    {
+        if (_threadStream == IntPtr.Zero)
+        {
+            if (_engine == IntPtr.Zero) return IntPtr.Zero;
+            int rc = dnnl_stream_create(out _threadStream, _engine, 0 /* default flags */);
+            if (rc != DnnlSuccess) { _threadStream = IntPtr.Zero; }
+        }
+        return _threadStream;
+    }
+
+    // USER scratchpad mode (dnnl_scratchpad_mode_user = 1). A shared, immutable attribute
+    // handed to every primitive descriptor we create so the primitive does NOT use oneDNN's
+    // single global library scratchpad — each EXECUTE provides its own scratchpad instead,
+    // which is the only way concurrent executions are safe. Created once at init.
+    private const int DnnlScratchpadModeUser = 1;
+    private static IntPtr _userScratchpadAttr;
+
+    // Per-thread scratchpad backing buffer (grown to the largest size seen). The scratchpad
+    // holds a primitive's transient working memory; one per thread is sufficient because a
+    // thread runs one oneDNN execute at a time. Never shared across threads.
+    [ThreadStatic] private static IntPtr _scratchpadBuf;
+    [ThreadStatic] private static long _scratchpadCap;
+
+    private static IntPtr GetThreadScratchpad(long size)
+    {
+        if (size <= 0) return IntPtr.Zero;
+        if (_scratchpadCap < size)
+        {
+            // Allocate the new buffer BEFORE freeing the old one. If AllocHGlobal throws
+            // (e.g. OOM), the previous buffer and capacity stay valid — otherwise
+            // _scratchpadBuf would be left pointing at freed memory and the next call would
+            // hand a dangling pointer to dnnl_memory_create (use-after-free).
+            IntPtr newBuf = Marshal.AllocHGlobal((IntPtr)size);
+            if (_scratchpadBuf != IntPtr.Zero) Marshal.FreeHGlobal(_scratchpadBuf);
+            _scratchpadBuf = newBuf;
+            _scratchpadCap = size;
+        }
+        return _scratchpadBuf;
+    }
+
     // Windows API for DLL search path manipulation
     [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
     private static extern bool SetDllDirectory(string lpPathName);
@@ -373,6 +443,7 @@ internal static class OneDnnProvider
         public IntPtr Primitive;
         public IntPtr PrimDesc;
         public IntPtr SrcDesc;
+        public IntPtr ScratchpadDesc;   // const md owned by PrimDesc (do not destroy)
         public IntPtr SrcMem;
         private bool _disposed;
 
@@ -420,6 +491,7 @@ internal static class OneDnnProvider
         public IntPtr Src0Desc;
         public IntPtr Src1Desc;
         public IntPtr DstDesc;
+        public IntPtr ScratchpadDesc;   // const md owned by PrimDesc (do not destroy)
         public IntPtr Src0Mem;
         public IntPtr Src1Mem;
         public IntPtr DstMem;
@@ -471,6 +543,7 @@ internal static class OneDnnProvider
         public IntPtr PrimDesc;
         public IntPtr SrcDesc;
         public IntPtr DstDesc;
+        public IntPtr ScratchpadDesc;   // const md owned by PrimDesc (do not destroy)
         public IntPtr SrcMem;
         public IntPtr DstMem;
         private bool _disposed;
@@ -582,6 +655,17 @@ internal static class OneDnnProvider
 
     [DllImport("dnnl", CallingConvention = CallingConvention.Cdecl)]
     private static extern IntPtr dnnl_primitive_desc_query_md(IntPtr primitiveDesc, int what, int index);
+
+    // Primitive attributes — used to request USER scratchpad mode so each execution
+    // supplies its own scratchpad (no shared global library scratchpad → concurrency-safe).
+    [DllImport("dnnl", CallingConvention = CallingConvention.Cdecl)]
+    private static extern int dnnl_primitive_attr_create(out IntPtr attr);
+
+    [DllImport("dnnl", CallingConvention = CallingConvention.Cdecl)]
+    private static extern int dnnl_primitive_attr_set_scratchpad_mode(IntPtr attr, int mode);
+
+    [DllImport("dnnl", CallingConvention = CallingConvention.Cdecl)]
+    private static extern int dnnl_primitive_attr_destroy(IntPtr attr);
 
     [DllImport("dnnl", CallingConvention = CallingConvention.Cdecl)]
     private static extern int dnnl_primitive_create(out IntPtr primitive, IntPtr primitiveDesc);
@@ -761,6 +845,12 @@ internal static class OneDnnProvider
         {
             int status;
 
+            // Conv uses shared cached memory objects + a shared scratchpad + the WeightsReordered
+            // flag, so only one oneDNN op may run at a time. Opportunistic (non-blocking): if
+            // another oneDNN op is running, bail so the caller uses the managed conv. See _executeLock.
+            if (!System.Threading.Monitor.TryEnter(_executeLock)) return false;
+            try
+            {
             // Step 1: Set user memory data handles to point to user data
             status = dnnl_memory_set_data_handle(cached.UserSrcMem, (IntPtr)input);
             if (status != DnnlSuccess) { if (logThis) Console.WriteLine($"[oneDNN] Failed to set src handle: {status}"); return false; }
@@ -828,6 +918,8 @@ internal static class OneDnnProvider
             }
 
             dnnl_stream_wait(_stream);
+            }
+            finally { System.Threading.Monitor.Exit(_executeLock); }
 
             if (logThis)
             {
@@ -868,9 +960,15 @@ internal static class OneDnnProvider
     {
         if (!EnsureInitialized())
             return false;
-        const byte N = (byte)'N';
-        int status = dnnl_sgemm(N, N, m, n, k, 1.0f, a, k, b, n, 0.0f, c, n);
-        return status == DnnlSuccess;
+        // Opportunistic (non-blocking): one oneDNN op at a time; contended -> managed fallback.
+        if (!System.Threading.Monitor.TryEnter(_executeLock)) return false;
+        try
+        {
+            const byte N = (byte)'N';
+            int status = dnnl_sgemm(N, N, m, n, k, 1.0f, a, k, b, n, 0.0f, c, n);
+            return status == DnnlSuccess;
+        }
+        finally { System.Threading.Monitor.Exit(_executeLock); }
     }
 
     /// <summary>
@@ -959,30 +1057,43 @@ internal static class OneDnnProvider
     /// </summary>
     private static unsafe bool ExecuteEltwiseOperation(CachedEltwise cached, float* data)
     {
+        // True-parallel: per-thread stream + a per-call memory object bound to this call's
+        // data (shared primitive/descriptor are stateless/immutable). See ExecuteBinaryOperation.
+        if (!System.Threading.Monitor.TryEnter(_executeLock)) return false;   // opportunistic — see _executeLock
+        IntPtr mem = IntPtr.Zero, msp = IntPtr.Zero;
         try
         {
-            // Update memory handle to point to user data
-            int status = dnnl_memory_set_data_handle(cached.SrcMem, (IntPtr)data);
-            if (status != DnnlSuccess)
-                return false;
+            IntPtr stream = GetThreadStream();
+            if (stream == IntPtr.Zero) return false;
+            if (dnnl_memory_create(out mem, cached.SrcDesc, _engine, (IntPtr)data) != DnnlSuccess) return false;
 
-            // Execute eltwise in-place (src and dst point to same memory)
-            DnnlExecArg* args = stackalloc DnnlExecArg[2];
-            args[0].Arg = DnnlArgSrc;
-            args[0].Memory = cached.SrcMem;
-            args[1].Arg = DnnlArgDst;
-            args[1].Memory = cached.SrcMem; // In-place
+            // Execute eltwise in-place (src and dst point to the same memory).
+            int nargs = 2;
+            DnnlExecArg* args = stackalloc DnnlExecArg[3];
+            args[0].Arg = DnnlArgSrc; args[0].Memory = mem;
+            args[1].Arg = DnnlArgDst; args[1].Memory = mem;
 
-            status = dnnl_primitive_execute(cached.Primitive, _stream, 2, args);
-            if (status != DnnlSuccess)
-                return false;
+            long spSize = cached.ScratchpadDesc != IntPtr.Zero ? dnnl_memory_desc_get_size(cached.ScratchpadDesc) : 0;
+            if (spSize > 0)
+            {
+                if (dnnl_memory_create(out msp, cached.ScratchpadDesc, _engine, GetThreadScratchpad(spSize)) != DnnlSuccess) return false;
+                args[2].Arg = DnnlArgScratchpad; args[2].Memory = msp;
+                nargs = 3;
+            }
 
-            dnnl_stream_wait(_stream);
+            if (dnnl_primitive_execute(cached.Primitive, stream, nargs, args) != DnnlSuccess) return false;
+            dnnl_stream_wait(stream);
             return true;
         }
         catch
         {
             return false;
+        }
+        finally
+        {
+            if (mem != IntPtr.Zero) dnnl_memory_destroy(mem);
+            if (msp != IntPtr.Zero) dnnl_memory_destroy(msp);
+            System.Threading.Monitor.Exit(_executeLock);
         }
     }
 
@@ -1009,15 +1120,16 @@ internal static class OneDnnProvider
                 return null;
             }
 
-            // Create eltwise primitive descriptor
+            // Create eltwise primitive descriptor (user-scratchpad for concurrency safety)
             status = dnnl_eltwise_forward_primitive_desc_create(
                 out cached.PrimDesc, _engine, DnnlForwardInference, algorithm,
-                cached.SrcDesc, cached.SrcDesc, 0.0f, 0.0f, IntPtr.Zero);
+                cached.SrcDesc, cached.SrcDesc, 0.0f, 0.0f, _userScratchpadAttr);
             if (status != DnnlSuccess)
             {
                 cached.Dispose();
                 return null;
             }
+            cached.ScratchpadDesc = dnnl_primitive_desc_query_md(cached.PrimDesc, DnnlQueryScratchpadMd, 0);
 
             // Create primitive
             status = dnnl_primitive_create(out cached.Primitive, cached.PrimDesc);
@@ -1127,29 +1239,43 @@ internal static class OneDnnProvider
 
     private static unsafe bool ExecuteSoftmaxOperation(CachedSoftmax cached, float* src, float* dst)
     {
+        // True-parallel: per-thread stream + per-call memory objects (see ExecuteBinaryOperation).
+        if (!System.Threading.Monitor.TryEnter(_executeLock)) return false;   // opportunistic — see _executeLock
+        IntPtr ms = IntPtr.Zero, md = IntPtr.Zero, msp = IntPtr.Zero;
         try
         {
-            int status = dnnl_memory_set_data_handle(cached.SrcMem, (IntPtr)src);
-            if (status != DnnlSuccess) return false;
+            IntPtr stream = GetThreadStream();
+            if (stream == IntPtr.Zero) return false;
+            if (dnnl_memory_create(out ms, cached.SrcDesc, _engine, (IntPtr)src) != DnnlSuccess) return false;
+            if (dnnl_memory_create(out md, cached.DstDesc, _engine, (IntPtr)dst) != DnnlSuccess) return false;
 
-            status = dnnl_memory_set_data_handle(cached.DstMem, (IntPtr)dst);
-            if (status != DnnlSuccess) return false;
+            int nargs = 2;
+            DnnlExecArg* args = stackalloc DnnlExecArg[3];
+            args[0].Arg = DnnlArgSrc; args[0].Memory = ms;
+            args[1].Arg = DnnlArgDst; args[1].Memory = md;
 
-            DnnlExecArg* args = stackalloc DnnlExecArg[2];
-            args[0].Arg = DnnlArgSrc;
-            args[0].Memory = cached.SrcMem;
-            args[1].Arg = DnnlArgDst;
-            args[1].Memory = cached.DstMem;
+            long spSize = cached.ScratchpadDesc != IntPtr.Zero ? dnnl_memory_desc_get_size(cached.ScratchpadDesc) : 0;
+            if (spSize > 0)
+            {
+                if (dnnl_memory_create(out msp, cached.ScratchpadDesc, _engine, GetThreadScratchpad(spSize)) != DnnlSuccess) return false;
+                args[2].Arg = DnnlArgScratchpad; args[2].Memory = msp;
+                nargs = 3;
+            }
 
-            status = dnnl_primitive_execute(cached.Primitive, _stream, 2, args);
-            if (status != DnnlSuccess) return false;
-
-            dnnl_stream_wait(_stream);
+            if (dnnl_primitive_execute(cached.Primitive, stream, nargs, args) != DnnlSuccess) return false;
+            dnnl_stream_wait(stream);
             return true;
         }
         catch
         {
             return false;
+        }
+        finally
+        {
+            if (ms != IntPtr.Zero) dnnl_memory_destroy(ms);
+            if (md != IntPtr.Zero) dnnl_memory_destroy(md);
+            if (msp != IntPtr.Zero) dnnl_memory_destroy(msp);
+            System.Threading.Monitor.Exit(_executeLock);
         }
     }
 
@@ -1180,8 +1306,9 @@ internal static class OneDnnProvider
             // Create softmax primitive descriptor — axis=1 (softmax along the class dimension)
             status = dnnl_softmax_forward_primitive_desc_create(
                 out cached.PrimDesc, _engine, DnnlForwardInference, DnnlSoftmaxAccurate,
-                cached.SrcDesc, cached.DstDesc, 1, IntPtr.Zero);
+                cached.SrcDesc, cached.DstDesc, 1, _userScratchpadAttr);
             if (status != DnnlSuccess) { cached.Dispose(); return null; }
+            cached.ScratchpadDesc = dnnl_primitive_desc_query_md(cached.PrimDesc, DnnlQueryScratchpadMd, 0);
 
             // Create primitive
             status = dnnl_primitive_create(out cached.Primitive, cached.PrimDesc);
@@ -1279,40 +1406,57 @@ internal static class OneDnnProvider
     /// </summary>
     private static unsafe bool ExecuteBinaryOperation(CachedBinary cached, float* src0, float* src1, float* dst)
     {
+        // TRUE-PARALLEL execution (no global lock). The cached PRIMITIVE and memory
+        // DESCRIPTORS are immutable and oneDNN primitives are stateless/thread-safe, so they
+        // are shared. The only per-call state — the data handles and the stream — is made
+        // thread-local: create fresh dnnl_memory objects bound to THIS call's pointers (from
+        // the cached descriptors) and run on a PER-THREAD stream. Nothing mutable is shared
+        // across threads, so independent threads execute concurrently. (The old design rebound
+        // shared memory handles on a single shared stream — undefined under concurrency and the
+        // source of the dnnl.dll access violations.)
+        // Opportunistic: if another thread is already in oneDNN, bail (caller uses the managed
+        // kernel) — never block, never run two oneDNN executes at once. See _executeLock.
+        if (!System.Threading.Monitor.TryEnter(_executeLock)) return false;
+        IntPtr m0 = IntPtr.Zero, m1 = IntPtr.Zero, md = IntPtr.Zero, msp = IntPtr.Zero;
         try
         {
-            // Update memory handles
-            int status = dnnl_memory_set_data_handle(cached.Src0Mem, (IntPtr)src0);
-            if (status != DnnlSuccess)
-                return false;
+            IntPtr stream = GetThreadStream();
+            if (stream == IntPtr.Zero) return false;
+            if (dnnl_memory_create(out m0, cached.Src0Desc, _engine, (IntPtr)src0) != DnnlSuccess) return false;
+            if (dnnl_memory_create(out m1, cached.Src1Desc, _engine, (IntPtr)src1) != DnnlSuccess) return false;
+            if (dnnl_memory_create(out md, cached.DstDesc, _engine, (IntPtr)dst) != DnnlSuccess) return false;
 
-            status = dnnl_memory_set_data_handle(cached.Src1Mem, (IntPtr)src1);
-            if (status != DnnlSuccess)
-                return false;
+            int nargs = 3;
+            DnnlExecArg* args = stackalloc DnnlExecArg[4];
+            args[0].Arg = DnnlArgSrc0; args[0].Memory = m0;
+            args[1].Arg = DnnlArgSrc1; args[1].Memory = m1;
+            args[2].Arg = DnnlArgDst;  args[2].Memory = md;
 
-            status = dnnl_memory_set_data_handle(cached.DstMem, (IntPtr)dst);
-            if (status != DnnlSuccess)
-                return false;
+            // Per-call scratchpad bound to this thread's buffer (user-scratchpad mode).
+            long spSize = cached.ScratchpadDesc != IntPtr.Zero ? dnnl_memory_desc_get_size(cached.ScratchpadDesc) : 0;
+            if (spSize > 0)
+            {
+                IntPtr spBuf = GetThreadScratchpad(spSize);
+                if (dnnl_memory_create(out msp, cached.ScratchpadDesc, _engine, spBuf) != DnnlSuccess) return false;
+                args[3].Arg = DnnlArgScratchpad; args[3].Memory = msp;
+                nargs = 4;
+            }
 
-            // Execute with 3 arguments: src0, src1, dst
-            DnnlExecArg* args = stackalloc DnnlExecArg[3];
-            args[0].Arg = DnnlArgSrc0;
-            args[0].Memory = cached.Src0Mem;
-            args[1].Arg = DnnlArgSrc1;
-            args[1].Memory = cached.Src1Mem;
-            args[2].Arg = DnnlArgDst;
-            args[2].Memory = cached.DstMem;
-
-            status = dnnl_primitive_execute(cached.Primitive, _stream, 3, args);
-            if (status != DnnlSuccess)
-                return false;
-
-            dnnl_stream_wait(_stream);
+            if (dnnl_primitive_execute(cached.Primitive, stream, nargs, args) != DnnlSuccess) return false;
+            dnnl_stream_wait(stream);
             return true;
         }
         catch
         {
             return false;
+        }
+        finally
+        {
+            if (m0 != IntPtr.Zero) dnnl_memory_destroy(m0);
+            if (m1 != IntPtr.Zero) dnnl_memory_destroy(m1);
+            if (md != IntPtr.Zero) dnnl_memory_destroy(md);
+            if (msp != IntPtr.Zero) dnnl_memory_destroy(msp);
+            System.Threading.Monitor.Exit(_executeLock);
         }
     }
 
@@ -1356,12 +1500,16 @@ internal static class OneDnnProvider
             // Create binary primitive descriptor
             status = dnnl_binary_primitive_desc_create(
                 out cached.PrimDesc, _engine, algorithm,
-                cached.Src0Desc, cached.Src1Desc, cached.DstDesc, IntPtr.Zero);
+                cached.Src0Desc, cached.Src1Desc, cached.DstDesc, _userScratchpadAttr);
             if (status != DnnlSuccess)
             {
                 cached.Dispose();
                 return null;
             }
+
+            // User-scratchpad: record the scratchpad descriptor so each execute can supply its
+            // own scratchpad buffer (concurrency-safe). Const md owned by PrimDesc — do not free.
+            cached.ScratchpadDesc = dnnl_primitive_desc_query_md(cached.PrimDesc, DnnlQueryScratchpadMd, 0);
 
             // Create primitive
             status = dnnl_primitive_create(out cached.Primitive, cached.PrimDesc);
@@ -1730,6 +1878,12 @@ internal static class OneDnnProvider
                 return false;
             }
 
+            // Shared USER-scratchpad attribute for all primitive descriptors (concurrency-safe).
+            if (dnnl_primitive_attr_create(out _userScratchpadAttr) == DnnlSuccess && _userScratchpadAttr != IntPtr.Zero)
+                dnnl_primitive_attr_set_scratchpad_mode(_userScratchpadAttr, DnnlScratchpadModeUser);
+            else
+                _userScratchpadAttr = IntPtr.Zero;
+
             status = dnnl_stream_create(out _stream, _engine, 0);
             if (status != DnnlSuccess)
             {
@@ -1840,13 +1994,25 @@ internal static class OneDnnProvider
             dnnl_memory_desc_destroy(srcDesc);
             dnnl_memory_desc_destroy(dstDesc);
 
-            // Execute
+            // Execute on the per-thread stream (this path already uses per-call prim + memory,
+            // so it is concurrent-safe once the stream is thread-local).
             DnnlExecArg* args = stackalloc DnnlExecArg[2];
             args[0] = new DnnlExecArg { Arg = DnnlArgSrc, Memory = srcMem };
             args[1] = new DnnlExecArg { Arg = DnnlArgDst, Memory = dstMem };
-            rc = dnnl_primitive_execute(prim, _stream, 2, args);
-
-            dnnl_stream_wait(_stream);
+            // This per-call path uses oneDNN's library scratchpad, so only one oneDNN op may run
+            // at a time. Opportunistic (non-blocking): bail to the managed path if contended.
+            if (!System.Threading.Monitor.TryEnter(_executeLock))
+            {
+                dnnl_primitive_destroy(prim); dnnl_memory_destroy(srcMem); dnnl_memory_destroy(dstMem);
+                return false;
+            }
+            try
+            {
+                IntPtr stream = GetThreadStream();
+                rc = dnnl_primitive_execute(prim, stream, 2, args);
+                dnnl_stream_wait(stream);
+            }
+            finally { System.Threading.Monitor.Exit(_executeLock); }
             dnnl_primitive_destroy(prim);
             dnnl_memory_destroy(srcMem);
             dnnl_memory_destroy(dstMem);
@@ -1949,8 +2115,22 @@ internal static class OneDnnProvider
             args[3] = new DnnlExecArg { Arg = DnnlArgVariance, Memory = varMem };
             args[4] = new DnnlExecArg { Arg = DnnlArgWeights, Memory = scaleMem };
             args[5] = new DnnlExecArg { Arg = DnnlArgBias, Memory = shiftMem };
-            rc = dnnl_primitive_execute(prim, _stream, 6, args);
-            dnnl_stream_wait(_stream);
+            // Library-scratchpad path -> only one oneDNN op at a time. Opportunistic (non-blocking).
+            if (!System.Threading.Monitor.TryEnter(_executeLock))
+            {
+                dnnl_primitive_destroy(prim);
+                dnnl_memory_destroy(srcMem); dnnl_memory_destroy(dstMem);
+                dnnl_memory_destroy(meanMem); dnnl_memory_destroy(varMem);
+                dnnl_memory_destroy(scaleMem); dnnl_memory_destroy(shiftMem);
+                return false;
+            }
+            try
+            {
+                IntPtr stream = GetThreadStream();
+                rc = dnnl_primitive_execute(prim, stream, 6, args);
+                dnnl_stream_wait(stream);
+            }
+            finally { System.Threading.Monitor.Exit(_executeLock); }
 
             dnnl_primitive_destroy(prim);
             dnnl_memory_destroy(srcMem);
