@@ -666,6 +666,29 @@ public static partial class BlasManaged
             }
         }
 
+        // A-repack reduction (run AFTER the floor so it doesn't perturb the floor's numNB check):
+        // the M-axis path re-packs A[ic,pc] once per nc-panel because the jc loop is outermost, so
+        // numNB nc-blocks means A is packed numNB times. The autotuner sizes nc for L2 B-residency
+        // (~512), but the kernel only ever reads a Kc×Nr B micro-panel (L1-sized) at a time — the
+        // full Kc×Nc B-panel merely has to fit L3. So widen nc to span all of N when the Kc×N panel
+        // fits an L3 budget: numNB collapses to 1 and A is packed ONCE (this is why OpenBLAS uses a
+        // large Nc). Pure win — fewer pack passes, identical reduction order (bit-exact).
+        if (strategy == PackingMode.ForcePackBoth
+            && options.PackedA is null && options.PackedB is null)
+        {
+            int elemSz = System.Runtime.CompilerServices.Unsafe.SizeOf<T>();
+            const long L3PanelBudgetBytes = 8L * 1024 * 1024;
+            long fullPanelBytes = (long)kcFromAutotune * n * elemSz;
+            int numMBnow = (m + mcFromAutotune - 1) / mcFromAutotune;
+            // Skip 2D-eligible shapes (few M-blocks, numMB*4 ≤ procs): they rely on the 2D MN-grid's
+            // N-parallelism, and collapsing numNB to 1 here would disable 2D and strand them on a
+            // thin M-axis split (e.g. FFN-up 512×512×2048 → numMB=8 wants 2D's 32-way, not M-axis 8).
+            if (numMBnow * 4 > procs && n > ncFromAutotune && fullPanelBytes <= L3PanelBudgetBytes)
+            {
+                ncFromAutotune = ((n + nr - 1) / nr) * nr; // span all of N → numNB == 1, A packed once
+            }
+        }
+
         switch (strategy)
         {
             case PackingMode.ForcePackBoth:
