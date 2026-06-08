@@ -59,6 +59,7 @@ public sealed class ShampooOptimizer : OptimizerBase
     /// <inheritdoc />
     public override void Step()
     {
+        try {
         for (int gi = 0; gi < ParamGroups.Count; gi++)
         {
             var g = ParamGroups[gi];
@@ -81,9 +82,6 @@ public sealed class ShampooOptimizer : OptimizerBase
             {
                 float[] p = g.Parameters[pi];
                 float[] grad = g.Gradients[pi];
-                if (wd != 0f)
-                    for (int i = 0; i < p.Length; i++) grad[i] += wd * p[i];
-
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 int step = (slot["step"].IntValue ?? 0) + 1;
                 slot["step"].IntValue = step;
@@ -92,6 +90,47 @@ public sealed class ShampooOptimizer : OptimizerBase
                 bool useFull = has2D
                     && shape.d1 <= maxDim && shape.d2 <= maxDim
                     && shape.d1 > 1 && shape.d2 > 1;
+
+                // Sparse fast path for diagonal mode (the dominant case for embedding tables
+                // — vocab usually >> max_precondition_dim so Shampoo always falls back to
+                // diagonal here). The full-matrix path keeps the dense materialize fallback:
+                // sparse outer-product updates to L = Σ g·gᵀ are possible but expensive to
+                // implement correctly when sparse indices span multiple matrix columns, and
+                // the use case (small param dims that fit under max_precondition_dim) doesn't
+                // benefit much from sparse gradients to begin with.
+                if (TryGetSparseGradient(gi, pi, out var sIdx, out var sVal, out var sNnz))
+                {
+                    if (useFull)
+                    {
+                        // Full-matrix path: materialize sparse → dense and use the existing kernel.
+                        MaterializeSparseIntoDense(gi, pi, grad);
+                        if (wd != 0f) for (int i = 0; i < p.Length; i++) grad[i] += wd * p[i];
+                        EnsureFullState(slot, shape.d1, shape.d2);
+                        UpdateFull(slot, grad, p, shape.d1, shape.d2, step, lr, momentum, preFreq, eps);
+                        continue;
+                    }
+
+                    // Diagonal sparse: per-element math, scatter at touched indices.
+                    if (sNnz == 0) continue;
+                    EnsureDiagonalState(slot, p.Length);
+                    var acc = slot["diag_acc"].Tensor!;
+                    var mb  = slot["momentum_buffer"].Tensor!;
+                    for (int k = 0; k < sNnz; k++)
+                    {
+                        int i = sIdx[k];
+                        float gV = sVal[k];
+                        if (wd != 0f) gV += wd * p[i];
+                        acc[i] += gV * gV;
+                        float invRoot = 1f / MathF.Sqrt(MathF.Sqrt(acc[i] + eps));
+                        float pre = gV * invRoot;
+                        mb[i] = momentum * mb[i] + pre;
+                        p[i] -= lr * mb[i];
+                    }
+                    continue;
+                }
+
+                if (wd != 0f)
+                    for (int i = 0; i < p.Length; i++) grad[i] += wd * p[i];
 
                 if (useFull)
                 {
@@ -105,6 +144,7 @@ public sealed class ShampooOptimizer : OptimizerBase
                 }
             }
         }
+        } finally { ClearAutoClearSparseGrads(); }
     }
 
     private static void EnsureFullState(Dictionary<string, OptimizerStateValue> slot, int d1, int d2)
