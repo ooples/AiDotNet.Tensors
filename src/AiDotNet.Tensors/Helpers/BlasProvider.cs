@@ -120,7 +120,22 @@ internal static class BlasProvider
         lock (_openblasScopeLock)
         {
             if (_openblasThreadCount == n) return;
-            try { openblas_set_num_threads_native(n); _openblasThreadCount = n; }
+            // CRITICAL: openblas_set_num_threads reconfigures OpenBLAS's internal thread
+            // pool / scratch buffers. Calling it CONCURRENTLY with an in-flight cblas_*gemm
+            // corrupts that state -> native access violation (0xC0000005). The GEMM entry
+            // points serialize on _nativeGemmGate, NOT _openblasScopeLock, so we must take
+            // _nativeGemmGate here too — otherwise a ScopeOpenBlasThreads on one thread
+            // races a GEMM on another (the residual full-suite crash). Lock order is always
+            // _openblasScopeLock -> _nativeGemmGate (GEMM paths take only _nativeGemmGate),
+            // so no deadlock.
+            try
+            {
+                lock (_nativeGemmGate)
+                {
+                    openblas_set_num_threads_native(n);
+                }
+                _openblasThreadCount = n;
+            }
             catch { /* libopenblas symbol missing — earlier OpenBLAS builds may lack it. Tolerate. */ }
         }
     }
