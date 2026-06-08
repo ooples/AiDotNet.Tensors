@@ -52,6 +52,10 @@ public sealed class BF16AdamOptimizer : OptimizerBase
                 {
                     float[] p = g.Parameters[pi];
                     float[] grad = g.Gradients[pi];
+                    // BF16Adam quantizes moments per-element; the dequant/requant round-trip
+                    // requires touching every position even when only a few have non-zero
+                    // gradient. Materialize any sparse-published grad into the dense buffer.
+                    MaterializeSparseIntoDense(gi, pi, grad);
                     var slot = GetOrCreateState(gi, pi, p.Length);
 
                     // Lazy-allocate the BF16 moments + FP32 master copy on first step.
@@ -92,7 +96,7 @@ public sealed class BF16AdamOptimizer : OptimizerBase
                 }
             }
         }
-        finally { if (maximized) UnflipMaximize(); }
+        finally { if (maximized) UnflipMaximize(); ClearAutoClearSparseGrads(); }
     }
 
     // BF16 = upper 16 bits of FP32. Packed two-per-float[] cell: low 16 bits = even index, high 16 bits = odd index.
@@ -148,6 +152,7 @@ public sealed class FP8LionOptimizer : OptimizerBase
     /// <inheritdoc />
     public override void Step()
     {
+        try {
         for (int gi = 0; gi < ParamGroups.Count; gi++)
         {
             var g = ParamGroups[gi];
@@ -159,6 +164,9 @@ public sealed class FP8LionOptimizer : OptimizerBase
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
                 float[] p = g.Parameters[pi]; float[] grad = g.Gradients[pi];
+                // FP8-Lion's per-tensor dynamic scale needs every position to update its scale
+                // tracking. Materialize sparse into dense before processing.
+                MaterializeSparseIntoDense(gi, pi, grad);
                 var slot = GetOrCreateState(gi, pi, p.Length);
 
                 if (!slot.ContainsKey("exp_avg_fp8"))
@@ -208,6 +216,7 @@ public sealed class FP8LionOptimizer : OptimizerBase
                 }
             }
         }
+        } finally { ClearAutoClearSparseGrads(); }
     }
 
     private static byte ReadFp8(float[] packed, int i)

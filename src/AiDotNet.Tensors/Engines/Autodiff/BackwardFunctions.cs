@@ -1550,7 +1550,37 @@ internal static class BackwardFunctions<T>
         var indices = (Tensor<int>)savedState[0];
         var axis = (int)savedState[1];
 
-        var grad = engine.ScatterAddBackward(gradOutput, indices, inputs[0]._shape, axis);
+        // Sparse-grad fast path mirroring TensorEmbeddingLookupBackward: when the input
+        // is a 2-D table (rank-2 axis-0 gather is structurally identical to an embedding
+        // lookup over [vocab, dim]), record the gradient as a SparseEmbeddingGradient
+        // wrapper instead of scattering into the full [vocab, dim] dense buffer. This
+        // covers every Gather-as-embedding pattern (token embeddings, type embeddings,
+        // segment embeddings, codebook gathers, MoE routing tables) without the
+        // forward op needing to opt-in.
+        var inputShape = inputs[0]._shape;
+        bool sparseEligible = axis == 0 && inputShape.Length == 2;
+        if (sparseEligible)
+        {
+            int vocabSize = inputShape[0];
+            int embeddingDim = inputShape[1];
+            // gradOutput shape = indices.shape ⨯ [embeddingDim], same contract as
+            // SparseEmbeddingGradient.Build expects.
+            var sparseGrad = SparseEmbeddingGradient<T>.Build(gradOutput, indices, vocabSize, embeddingDim);
+            DifferentiableOps.AccumulateSparseEmbeddingGrad(inputs[0], sparseGrad);
+
+            if (DifferentiableOps.GetSparseEmbeddingGradsFor(inputs[0]) is null)
+            {
+                var dense = engine.ScatterAddBackward(gradOutput, indices, inputShape, axis);
+                DifferentiableOps.AccumulateGrad(grads, inputs[0], dense, engine);
+            }
+            return;
+        }
+
+        // Non-embedding-shaped Gather (rank > 2 or axis != 0): keep the dense path.
+        // Generalizing SparseEmbeddingGradient to N-D / arbitrary-axis gathers is a
+        // forward-ledger surface change for a future PR. For now, the perf win we
+        // care about (embedding-table lookups) is covered.
+        var grad = engine.ScatterAddBackward(gradOutput, indices, inputShape, axis);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 

@@ -306,4 +306,347 @@ public static class GpuOptimizer
         if (pb is null || gb is null || zb is null || nb is null) return false;
         b.FtrlUpdate(pb, gb, zb, nb, lr, l1Reg, l2Reg, beta, p!.Length); return true;
     }
+
+    // ==================================================================
+    // SPARSE-AWARE GPU OPTIMIZER WRAPPERS
+    // ==================================================================
+    //
+    // Mirror surface for the dense GPU optimizer wrappers above (issue #336),
+    // accepting caller-supplied sparse gradient representation (GPU-resident
+    // <c>sparseIndices</c>/<c>sparseValues</c>) instead of a dense gradient buffer.
+    //
+    // Implementation strategy — "materialize then dense":
+    //   1. Zero the GPU-resident <paramref name="gradScratch"/> buffer (Fill 0f).
+    //   2. ScatterAdd sparse (indices, values) → gradScratch (writes only the
+    //      <paramref name="nnz"/> touched positions; the rest stay 0).
+    //   3. Dispatch the existing dense per-optimizer kernel against gradScratch.
+    //
+    // This keeps the dense kernels unchanged (no new CUDA code needed) while
+    // exposing a sparse entry point that mirrors the AiDotNet-side optimizer
+    // wiring. The consumer never has to materialize sparse→dense on the host
+    // and shuttle the dense gradient across PCIe.
+    //
+    // A future PR can replace the dense-kernel call with a native sparse
+    // scatter-update kernel (sparse_adam_step_kernel etc.) without changing
+    // this API surface — at that point both compute and bandwidth wins land.
+    // For now, perf wins are bandwidth-only (smaller upload).
+    //
+    // All wrappers return false on any failed precondition (non-GPU engine,
+    // missing buffer, backend without scatter/fill); caller falls back to
+    // the CPU sparse path in OptimizerBase / Optimizers.cs.
+    // ==================================================================
+
+    private static bool TryMaterializeSparseIntoDense(
+        Tensor<float> gradScratch, Tensor<int> sparseIndices, Tensor<float> sparseValues, int nnz,
+        out IGpuBuffer? gradBuf, out IDirectGpuBackend? backend)
+    {
+        gradBuf = null;
+        backend = null;
+        if (gradScratch is null) throw new ArgumentNullException(nameof(gradScratch));
+        if (sparseIndices is null) throw new ArgumentNullException(nameof(sparseIndices));
+        if (sparseValues is null) throw new ArgumentNullException(nameof(sparseValues));
+        if (nnz < 0) throw new ArgumentOutOfRangeException(nameof(nnz));
+        if (nnz > sparseIndices.Length || nnz > sparseValues.Length)
+            throw new ArgumentException("nnz exceeds the supplied sparse buffers.", nameof(nnz));
+
+        if (!(AiDotNetEngine.Current is DirectGpuTensorEngine engine)) return false;
+        var b = engine.GetBackend();
+        if (b is null) return false;
+        var gb = gradScratch.TryGetGpuBuffer();
+        var iBuf = sparseIndices.TryGetGpuBuffer();
+        var vBuf = sparseValues.TryGetGpuBuffer();
+        if (gb is null || iBuf is null || vBuf is null) return false;
+
+        b.Fill(gb, 0f, gradScratch.Length);
+        if (nnz > 0)
+            b.ScatterAdd(vBuf, iBuf, gb, sourceSize: nnz, destSize: gradScratch.Length);
+
+        gradBuf = gb;
+        backend = b;
+        return true;
+    }
+
+    /// <summary>Adam GPU step driven by a sparse gradient (indices + values).
+    /// Caller supplies a GPU-resident <paramref name="gradScratch"/> buffer of the same
+    /// shape as <paramref name="param"/> — this is overwritten with the materialized
+    /// dense view of the sparse gradient before the dense kernel runs. Returns false
+    /// when any tensor isn't GPU-resident (caller falls back to CPU sparse path).</summary>
+    public static bool TryAdamStepSparse(
+        Tensor<float> param, Tensor<float> gradScratch,
+        Tensor<float> m, Tensor<float> v,
+        Tensor<int> sparseIndices, Tensor<float> sparseValues, int nnz,
+        float learningRate, float beta1, float beta2, float epsilon,
+        float weightDecay, int step)
+    {
+        if (param is null) throw new ArgumentNullException(nameof(param));
+        if (m is null) throw new ArgumentNullException(nameof(m));
+        if (v is null) throw new ArgumentNullException(nameof(v));
+        if (!TryMaterializeSparseIntoDense(gradScratch, sparseIndices, sparseValues, nnz, out var gb, out var backend))
+            return false;
+        var pb = param.TryGetGpuBuffer();
+        var mb = m.TryGetGpuBuffer();
+        var vb = v.TryGetGpuBuffer();
+        if (pb is null || mb is null || vb is null) return false;
+        backend!.AdamUpdate(pb, gb!, mb, vb, learningRate, beta1, beta2, epsilon, weightDecay, step, param.Length);
+        return true;
+    }
+
+    /// <summary>AdamW GPU step driven by a sparse gradient. See <see cref="TryAdamStepSparse"/>.</summary>
+    public static bool TryAdamWStepSparse(
+        Tensor<float> param, Tensor<float> gradScratch,
+        Tensor<float> m, Tensor<float> v,
+        Tensor<int> sparseIndices, Tensor<float> sparseValues, int nnz,
+        float learningRate, float beta1, float beta2, float epsilon,
+        float weightDecay, int step)
+        => TryAdamStepSparse(param, gradScratch, m, v, sparseIndices, sparseValues, nnz,
+            learningRate, beta1, beta2, epsilon, weightDecay, step);
+
+    /// <summary>SGD GPU step driven by a sparse gradient.</summary>
+    public static bool TrySgdStepSparse(
+        Tensor<float> param, Tensor<float> gradScratch,
+        Tensor<int> sparseIndices, Tensor<float> sparseValues, int nnz,
+        float learningRate)
+    {
+        if (param is null) throw new ArgumentNullException(nameof(param));
+        if (!TryMaterializeSparseIntoDense(gradScratch, sparseIndices, sparseValues, nnz, out var gb, out var backend))
+            return false;
+        var pb = param.TryGetGpuBuffer();
+        if (pb is null) return false;
+        backend!.SgdUpdate(pb, gb!, learningRate, weightDecay: 0f, param.Length);
+        return true;
+    }
+
+    /// <summary>SGD-momentum GPU step driven by a sparse gradient.</summary>
+    public static bool TrySgdMomentumStepSparse(
+        Tensor<float> param, Tensor<float> gradScratch, Tensor<float> velocity,
+        Tensor<int> sparseIndices, Tensor<float> sparseValues, int nnz,
+        float learningRate, float momentum, float weightDecay)
+    {
+        if (param is null) throw new ArgumentNullException(nameof(param));
+        if (velocity is null) throw new ArgumentNullException(nameof(velocity));
+        if (!TryMaterializeSparseIntoDense(gradScratch, sparseIndices, sparseValues, nnz, out var gb, out var backend))
+            return false;
+        var pb = param.TryGetGpuBuffer();
+        var vb = velocity.TryGetGpuBuffer();
+        if (pb is null || vb is null) return false;
+        backend!.SgdMomentumUpdate(pb, gb!, vb, learningRate, momentum, weightDecay, param.Length);
+        return true;
+    }
+
+    /// <summary>RMSProp GPU step driven by a sparse gradient.</summary>
+    public static bool TryRmspropStepSparse(
+        Tensor<float> param, Tensor<float> gradScratch, Tensor<float> squaredAvg,
+        Tensor<int> sparseIndices, Tensor<float> sparseValues, int nnz,
+        float lr, float rho, float epsilon, float weightDecay)
+    {
+        if (param is null) throw new ArgumentNullException(nameof(param));
+        if (squaredAvg is null) throw new ArgumentNullException(nameof(squaredAvg));
+        if (!TryMaterializeSparseIntoDense(gradScratch, sparseIndices, sparseValues, nnz, out var gb, out var backend))
+            return false;
+        var pb = param.TryGetGpuBuffer();
+        var sb = squaredAvg.TryGetGpuBuffer();
+        if (pb is null || sb is null) return false;
+        backend!.RmspropUpdate(pb, gb!, sb, lr, rho, epsilon, weightDecay, param.Length);
+        return true;
+    }
+
+    /// <summary>Adagrad GPU step driven by a sparse gradient.</summary>
+    public static bool TryAdagradStepSparse(
+        Tensor<float> param, Tensor<float> gradScratch, Tensor<float> accum,
+        Tensor<int> sparseIndices, Tensor<float> sparseValues, int nnz,
+        float lr, float epsilon, float weightDecay)
+    {
+        if (param is null) throw new ArgumentNullException(nameof(param));
+        if (accum is null) throw new ArgumentNullException(nameof(accum));
+        if (!TryMaterializeSparseIntoDense(gradScratch, sparseIndices, sparseValues, nnz, out var gb, out var backend))
+            return false;
+        var pb = param.TryGetGpuBuffer();
+        var ab = accum.TryGetGpuBuffer();
+        if (pb is null || ab is null) return false;
+        backend!.AdagradUpdate(pb, gb!, ab, lr, epsilon, weightDecay, param.Length);
+        return true;
+    }
+
+    /// <summary>NAG GPU step driven by a sparse gradient.</summary>
+    public static bool TryNagStepSparse(
+        Tensor<float> param, Tensor<float> gradScratch, Tensor<float> velocity,
+        Tensor<int> sparseIndices, Tensor<float> sparseValues, int nnz,
+        float lr, float momentum, float weightDecay)
+    {
+        if (param is null) throw new ArgumentNullException(nameof(param));
+        if (velocity is null) throw new ArgumentNullException(nameof(velocity));
+        if (!TryMaterializeSparseIntoDense(gradScratch, sparseIndices, sparseValues, nnz, out var gb, out var backend))
+            return false;
+        var pb = param.TryGetGpuBuffer();
+        var vb = velocity.TryGetGpuBuffer();
+        if (pb is null || vb is null) return false;
+        backend!.NagUpdate(pb, gb!, vb, lr, momentum, weightDecay, param.Length);
+        return true;
+    }
+
+    /// <summary>LARS GPU step driven by a sparse gradient. (Note: LARS trust-ratio is
+    /// computed over the FULL gradient norm; materializing sparse→dense first preserves
+    /// the dense math exactly.)</summary>
+    public static bool TryLarsStepSparse(
+        Tensor<float> param, Tensor<float> gradScratch, Tensor<float> velocity,
+        Tensor<int> sparseIndices, Tensor<float> sparseValues, int nnz,
+        float lr, float momentum, float weightDecay, float trustCoeff)
+    {
+        if (param is null) throw new ArgumentNullException(nameof(param));
+        if (velocity is null) throw new ArgumentNullException(nameof(velocity));
+        if (!TryMaterializeSparseIntoDense(gradScratch, sparseIndices, sparseValues, nnz, out var gb, out var backend))
+            return false;
+        var pb = param.TryGetGpuBuffer();
+        var vb = velocity.TryGetGpuBuffer();
+        if (pb is null || vb is null) return false;
+        backend!.LarsUpdate(pb, gb!, vb, lr, momentum, weightDecay, trustCoeff, param.Length);
+        return true;
+    }
+
+    /// <summary>LAMB GPU step driven by a sparse gradient. (Note: LAMB trust-ratio is
+    /// computed over the FULL gradient norm; materializing sparse→dense first preserves
+    /// the dense math exactly.)</summary>
+    public static bool TryLambStepSparse(
+        Tensor<float> param, Tensor<float> gradScratch, Tensor<float> m, Tensor<float> v,
+        Tensor<int> sparseIndices, Tensor<float> sparseValues, int nnz,
+        float lr, float beta1, float beta2, float epsilon, float weightDecay, int step)
+    {
+        if (param is null) throw new ArgumentNullException(nameof(param));
+        if (m is null) throw new ArgumentNullException(nameof(m));
+        if (v is null) throw new ArgumentNullException(nameof(v));
+        if (!TryMaterializeSparseIntoDense(gradScratch, sparseIndices, sparseValues, nnz, out var gb, out var backend))
+            return false;
+        var pb = param.TryGetGpuBuffer();
+        var mb = m.TryGetGpuBuffer();
+        var vb = v.TryGetGpuBuffer();
+        if (pb is null || mb is null || vb is null) return false;
+        backend!.LambUpdate(pb, gb!, mb, vb, lr, beta1, beta2, epsilon, weightDecay, step, param.Length);
+        return true;
+    }
+
+    /// <summary>AdaDelta GPU step driven by a sparse gradient.</summary>
+    public static bool TryAdadeltaStepSparse(
+        Tensor<float> param, Tensor<float> gradScratch, Tensor<float> accumGrad, Tensor<float> accumUpdate,
+        Tensor<int> sparseIndices, Tensor<float> sparseValues, int nnz,
+        float rho, float epsilon, float weightDecay)
+    {
+        if (param is null) throw new ArgumentNullException(nameof(param));
+        if (accumGrad is null) throw new ArgumentNullException(nameof(accumGrad));
+        if (accumUpdate is null) throw new ArgumentNullException(nameof(accumUpdate));
+        if (!TryMaterializeSparseIntoDense(gradScratch, sparseIndices, sparseValues, nnz, out var gb, out var backend))
+            return false;
+        var pb = param.TryGetGpuBuffer();
+        var agb = accumGrad.TryGetGpuBuffer();
+        var aub = accumUpdate.TryGetGpuBuffer();
+        if (pb is null || agb is null || aub is null) return false;
+        backend!.AdadeltaUpdate(pb, gb!, agb, aub, rho, epsilon, weightDecay, param.Length);
+        return true;
+    }
+
+    /// <summary>AMSGrad GPU step driven by a sparse gradient.</summary>
+    public static bool TryAmsgradStepSparse(
+        Tensor<float> param, Tensor<float> gradScratch, Tensor<float> m, Tensor<float> v, Tensor<float> vMax,
+        Tensor<int> sparseIndices, Tensor<float> sparseValues, int nnz,
+        float lr, float beta1, float beta2, float epsilon, float weightDecay, int step)
+    {
+        if (param is null) throw new ArgumentNullException(nameof(param));
+        if (m is null) throw new ArgumentNullException(nameof(m));
+        if (v is null) throw new ArgumentNullException(nameof(v));
+        if (vMax is null) throw new ArgumentNullException(nameof(vMax));
+        if (!TryMaterializeSparseIntoDense(gradScratch, sparseIndices, sparseValues, nnz, out var gb, out var backend))
+            return false;
+        var pb = param.TryGetGpuBuffer();
+        var mb = m.TryGetGpuBuffer();
+        var vb = v.TryGetGpuBuffer();
+        var xb = vMax.TryGetGpuBuffer();
+        if (pb is null || mb is null || vb is null || xb is null) return false;
+        backend!.AmsgradUpdate(pb, gb!, mb, vb, xb, lr, beta1, beta2, epsilon, weightDecay, step, param.Length);
+        return true;
+    }
+
+    /// <summary>Adamax GPU step driven by a sparse gradient.</summary>
+    public static bool TryAdamaxStepSparse(
+        Tensor<float> param, Tensor<float> gradScratch, Tensor<float> m, Tensor<float> u,
+        Tensor<int> sparseIndices, Tensor<float> sparseValues, int nnz,
+        float lr, float beta1, float beta2, float epsilon, float weightDecay, int step)
+    {
+        if (param is null) throw new ArgumentNullException(nameof(param));
+        if (m is null) throw new ArgumentNullException(nameof(m));
+        if (u is null) throw new ArgumentNullException(nameof(u));
+        if (!TryMaterializeSparseIntoDense(gradScratch, sparseIndices, sparseValues, nnz, out var gb, out var backend))
+            return false;
+        var pb = param.TryGetGpuBuffer();
+        var mb = m.TryGetGpuBuffer();
+        var ub = u.TryGetGpuBuffer();
+        if (pb is null || mb is null || ub is null) return false;
+        backend!.AdamaxUpdate(pb, gb!, mb, ub, lr, beta1, beta2, epsilon, weightDecay, step, param.Length);
+        return true;
+    }
+
+    /// <summary>Lion GPU step driven by a sparse gradient.</summary>
+    public static bool TryLionStepSparse(
+        Tensor<float> param, Tensor<float> gradScratch, Tensor<float> m,
+        Tensor<int> sparseIndices, Tensor<float> sparseValues, int nnz,
+        float lr, float beta1, float beta2, float weightDecay)
+    {
+        if (param is null) throw new ArgumentNullException(nameof(param));
+        if (m is null) throw new ArgumentNullException(nameof(m));
+        if (!TryMaterializeSparseIntoDense(gradScratch, sparseIndices, sparseValues, nnz, out var gb, out var backend))
+            return false;
+        var pb = param.TryGetGpuBuffer();
+        var mb = m.TryGetGpuBuffer();
+        if (pb is null || mb is null) return false;
+        backend!.LionUpdate(pb, gb!, mb, lr, beta1, beta2, weightDecay, param.Length);
+        return true;
+    }
+
+    /// <summary>Nadam GPU step driven by a sparse gradient.</summary>
+    public static bool TryNadamStepSparse(
+        Tensor<float> param, Tensor<float> gradScratch, Tensor<float> m, Tensor<float> v,
+        Tensor<int> sparseIndices, Tensor<float> sparseValues, int nnz,
+        float lr, float beta1, float beta2, float epsilon, float weightDecay, int step)
+    {
+        if (param is null) throw new ArgumentNullException(nameof(param));
+        if (m is null) throw new ArgumentNullException(nameof(m));
+        if (v is null) throw new ArgumentNullException(nameof(v));
+        if (!TryMaterializeSparseIntoDense(gradScratch, sparseIndices, sparseValues, nnz, out var gb, out var backend))
+            return false;
+        var pb = param.TryGetGpuBuffer();
+        var mb = m.TryGetGpuBuffer();
+        var vb = v.TryGetGpuBuffer();
+        if (pb is null || mb is null || vb is null) return false;
+        backend!.NadamUpdate(pb, gb!, mb, vb, lr, beta1, beta2, epsilon, weightDecay, step, param.Length);
+        return true;
+    }
+
+    /// <summary>FTRL GPU step driven by a sparse gradient.</summary>
+    public static bool TryFtrlStepSparse(
+        Tensor<float> param, Tensor<float> gradScratch, Tensor<float> z, Tensor<float> n,
+        Tensor<int> sparseIndices, Tensor<float> sparseValues, int nnz,
+        float lr, float l1Reg, float l2Reg, float beta)
+    {
+        if (param is null) throw new ArgumentNullException(nameof(param));
+        if (z is null) throw new ArgumentNullException(nameof(z));
+        if (n is null) throw new ArgumentNullException(nameof(n));
+        if (!TryMaterializeSparseIntoDense(gradScratch, sparseIndices, sparseValues, nnz, out var gb, out var backend))
+            return false;
+        var pb = param.TryGetGpuBuffer();
+        var zb = z.TryGetGpuBuffer();
+        var nb = n.TryGetGpuBuffer();
+        if (pb is null || zb is null || nb is null) return false;
+        backend!.FtrlUpdate(pb, gb!, zb, nb, lr, l1Reg, l2Reg, beta, param.Length);
+        return true;
+    }
+
+    /// <summary>Proximal-L1 GPU step driven by a sparse gradient.</summary>
+    public static bool TryProximalL1StepSparse(
+        Tensor<float> param, Tensor<float> gradScratch,
+        Tensor<int> sparseIndices, Tensor<float> sparseValues, int nnz,
+        float lr, float l1Strength)
+    {
+        if (param is null) throw new ArgumentNullException(nameof(param));
+        if (!TryMaterializeSparseIntoDense(gradScratch, sparseIndices, sparseValues, nnz, out var gb, out var backend))
+            return false;
+        return TryProximalL1Step(param, gradScratch, lr, l1Strength);
+    }
 }

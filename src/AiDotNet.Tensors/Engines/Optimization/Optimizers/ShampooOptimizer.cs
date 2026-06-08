@@ -59,6 +59,7 @@ public sealed class ShampooOptimizer : OptimizerBase
     /// <inheritdoc />
     public override void Step()
     {
+        try {
         for (int gi = 0; gi < ParamGroups.Count; gi++)
         {
             var g = ParamGroups[gi];
@@ -81,6 +82,9 @@ public sealed class ShampooOptimizer : OptimizerBase
             {
                 float[] p = g.Parameters[pi];
                 float[] grad = g.Gradients[pi];
+                // Shampoo's L⁻¹ᐟ⁴ and R⁻¹ᐟ⁴ preconditioners are matrix-state — they aggregate
+                // over the full grad. Materialize any caller-published sparse grad first.
+                MaterializeSparseIntoDense(gi, pi, grad);
                 if (wd != 0f)
                     for (int i = 0; i < p.Length; i++) grad[i] += wd * p[i];
 
@@ -105,6 +109,7 @@ public sealed class ShampooOptimizer : OptimizerBase
                 }
             }
         }
+        } finally { ClearAutoClearSparseGrads(); }
     }
 
     private static void EnsureFullState(Dictionary<string, OptimizerStateValue> slot, int d1, int d2)
