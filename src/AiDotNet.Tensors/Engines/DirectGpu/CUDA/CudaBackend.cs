@@ -10636,19 +10636,33 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         float aVal = alpha, bVal = beta;
         IntPtr alphaPtr = (IntPtr)(&aVal);
         IntPtr betaPtr = (IntPtr)(&bVal);
-        CuBlasNative.CheckCublasStatus(
-            CuBlasNative.cublasGemmEx(
-                _cublasHandle,
-                CublasOperation.None, CublasOperation.None,
-                N, M, K,
-                alphaPtr,
-                Bhalf.Handle, CuBlasNative.CUDA_R_16F, N,
-                Ahalf.Handle, CuBlasNative.CUDA_R_16F, K,
-                betaPtr,
-                C.Handle, CuBlasNative.CUDA_R_32F, N,
-                CuBlasNative.CUBLAS_COMPUTE_32F,
-                0 /* CUBLAS_GEMM_DEFAULT — selects Tensor Cores under the handle's math mode */),
-            "cublasGemmEx(GemmFp16)");
+        var status = CuBlasNative.cublasGemmEx(
+            _cublasHandle,
+            CublasOperation.None, CublasOperation.None,
+            N, M, K,
+            alphaPtr,
+            Bhalf.Handle, CuBlasNative.CUDA_R_16F, N,
+            Ahalf.Handle, CuBlasNative.CUDA_R_16F, K,
+            betaPtr,
+            C.Handle, CuBlasNative.CUDA_R_32F, N,
+            CuBlasNative.CUBLAS_COMPUTE_32F,
+            0 /* CUBLAS_GEMM_DEFAULT — selects Tensor Cores under the handle's math mode */);
+
+        // CUBLAS_STATUS_NOT_SUPPORTED is a CAPABILITY signal, not an operational failure:
+        // the FP16-in / FP32-compute cublasGemmEx config isn't available on this device
+        // (some GPUs/driver combos lack it even at compute capability >= 5). Surface it as
+        // NotSupportedException — the semantically correct type — so callers can cleanly
+        // fall back to the TF32 cublasSgemm path instead of treating it as a hard error.
+        // The compute-capability floor (SupportsHgemm, cc >= 5) is necessary but not
+        // sufficient, so we key off the authoritative runtime status here.
+        if (status == AiDotNet.Tensors.Engines.CublasStatus.NotSupported)
+        {
+            throw new NotSupportedException(
+                $"FP16 Tensor-Core GEMM (cublasGemmEx CUDA_R_16F in / CUBLAS_COMPUTE_32F) is not " +
+                $"supported on this device (compute capability {_ccMajor}.{_ccMinor}); " +
+                $"use the TF32 Gemm path instead.");
+        }
+        CuBlasNative.CheckCublasStatus(status, "cublasGemmEx(GemmFp16)");
     }
 
     private unsafe void LaunchUnaryFp16(string kernelName, IGpuBuffer input, IGpuBuffer output, int size)
