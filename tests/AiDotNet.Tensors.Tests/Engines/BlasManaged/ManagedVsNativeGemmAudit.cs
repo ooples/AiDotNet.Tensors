@@ -133,7 +133,7 @@ public class ManagedVsNativeGemmAudit
         }, 3, iters);
 
         double nat = double.PositiveInfinity;
-        if (BlasProvider.HasRawSgemm)
+        if (BlasProvider.HasRawDgemm)
             nat = BestMs(() =>
             {
                 fixed (double* pa = a) fixed (double* pb = b) fixed (double* pc = cN)
