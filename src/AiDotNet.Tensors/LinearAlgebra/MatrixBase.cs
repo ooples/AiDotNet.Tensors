@@ -923,6 +923,12 @@ public abstract class MatrixBase<T>
             return result;
         }
 
+        // The BLOCKED and RECURSIVE fallbacks accumulate into the result (C += A·B), so it must start
+        // at zero. CreateInstance returns RentUninitialized (pooled) memory whose stale contents would
+        // otherwise corrupt the accumulation — a source of non-deterministic results under buffer
+        // reuse. (The BLAS path above overwrites every element with beta = 0 and so skips this.)
+        result._memory.Span.Clear();
+
         if (MatrixMultiplyHelper.ShouldUseBlocked<T>(M, K, N))
         {
             MatrixMultiplyHelper.TraceMatmul("BLOCKED", M, N, K);
