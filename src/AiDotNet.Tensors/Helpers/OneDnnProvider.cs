@@ -51,7 +51,14 @@ internal static class OneDnnProvider
     // the read lock lets run concurrently. Each execute already calls
     // dnnl_stream_wait (synchronous), so serializing here adds ~zero cost in the
     // common single-threaded case and only serializes genuinely concurrent submits.
-    private static readonly object _executeLock = new object();
+    //
+    // SHARED with BlasProvider (NativeComputeGate): oneDNN execute and OpenBLAS GEMM must
+    // also never run concurrently with EACH OTHER — the two native libraries fight over
+    // each other's OpenMP/threadpool runtime and intermittently fault the process
+    // (0xC0000005; a full-suite crash dump caught one thread in cblas_sgemm while another
+    // was in dnnl_primitive_execute). Using the shared gate covers both that cross-library
+    // exclusion and this provider's own cached-handle/stream serialization.
+    private static readonly object _executeLock = NativeComputeGate.Instance;
 
     // Windows API for DLL search path manipulation
     [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]

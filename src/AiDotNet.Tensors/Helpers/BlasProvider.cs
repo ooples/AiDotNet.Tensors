@@ -1196,7 +1196,10 @@ internal static class BlasProvider
     // DgemmRaw) always use the BLOCKING wrappers regardless of mode — BlasManaged.Gemm
     // computes only C:=A·B (no α/β), so there's no one-line managed fallback for them.
     // They're conv/backward (training) paths, not the inference forward hot path.
-    private static readonly object _nativeGemmGate = new();
+    // Shared with OneDnnProvider: OpenBLAS GEMM and oneDNN primitive execute must never
+    // run concurrently (they fight over each other's OpenMP/threadpool runtime → native
+    // access violation). See NativeComputeGate.
+    private static readonly object _nativeGemmGate = NativeComputeGate.Instance;
 
     // ── OpenBLAS is driven from a SINGLE dedicated thread. ─────────────────────
     // OpenBLAS keeps a FIXED-SIZE per-CALLING-THREAD scratch-buffer table (size =
