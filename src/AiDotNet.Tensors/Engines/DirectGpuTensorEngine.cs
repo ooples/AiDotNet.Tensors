@@ -1543,23 +1543,33 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     public void ClearActivationCache()
     {
-        // Materialize any deferred downloads before clearing — otherwise CPU arrays
-        // would be left empty because the GPU buffers they depend on get disposed.
-        MaterializeAllDeferred();
-
-        List<ActivationCacheEntry> toDispose;
+        // Snapshot the (key, entry) pairs this cache owns, then clear.
+        List<KeyValuePair<object, ActivationCacheEntry>> toDispose;
         lock (_activationCacheLock)
         {
-            toDispose = new List<ActivationCacheEntry>(_activationCache.Values);
+            toDispose = new List<KeyValuePair<object, ActivationCacheEntry>>(_activationCache);
             _activationCache.Clear();
             System.Threading.Interlocked.Exchange(ref _currentActivationCacheBytes, 0);
             System.Threading.Interlocked.Exchange(ref _currentActivationManagedBytes, 0);
         }
 
-        // Dispose GPU buffers outside the lock
-        foreach (var entry in toDispose)
+        // Materialize each pending deferred download into its CPU array BEFORE freeing the
+        // buffer (otherwise a later CPU read hits a freed buffer). Per-entry over THIS cache's
+        // own keys — NOT the global MaterializeAllDeferred, which would drain (download) other
+        // engines'/threads' in-flight buffers and race them (the -38 / GPU-fault hazard).
+        foreach (var kv in toDispose)
         {
-            entry.Dispose();
+            if (Helpers.DeferredArrayMaterializer.IsPending(kv.Key))
+            {
+                try { Helpers.DeferredArrayMaterializer.TryMaterialize(kv.Key); }
+                catch { Helpers.DeferredArrayMaterializer.Remove(kv.Key); }
+            }
+        }
+
+        // Dispose GPU buffers outside the lock
+        foreach (var kv in toDispose)
+        {
+            kv.Value.Dispose();
         }
     }
 
