@@ -106,6 +106,14 @@ internal sealed class ActivationCacheEntry : IDisposable
     // bytes) so the cache can bound MANAGED-heap retention independently of VRAM —
     // see _maxActivationManagedBytes in DirectGpuTensorEngine.
     public long ManagedBytes { get; }
+    // Managed thread that created this activation. The engine + activation cache are a
+    // process-wide singleton; a GPU buffer is only ever used by the thread that created
+    // it (each independent GradientTape runs on one thread). Eviction therefore frees
+    // ONLY the calling thread's entries — otherwise one thread's eviction (per-step or
+    // VRAM-pressure) would dispose a buffer another thread's in-flight kernel is still
+    // reading, a use-after-free that crashes the process (0xC0000005) under concurrent
+    // tapes.
+    public int ThreadId { get; }
 
     public ActivationCacheEntry(IGpuBuffer buffer, int[] shape, long timestamp, IDirectGpuBackend backend, long managedBytes = 0)
     {
@@ -114,6 +122,7 @@ internal sealed class ActivationCacheEntry : IDisposable
         Timestamp = timestamp;
         Backend = backend;
         ManagedBytes = managedBytes;
+        ThreadId = System.Environment.CurrentManagedThreadId;
     }
 
     public void Dispose()
@@ -1244,7 +1253,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     private List<ActivationCacheEntry> EvictOldestActivationsUnsafe()
     {
-        var entries = _activationCache.ToArray();
+        // Only free THIS thread's activations — another thread's buffer may be in-flight
+        // on a kernel right now (freeing it = use-after-free / 0xC0000005). A thread's
+        // GPU buffers are only ever used by that thread, so this is the safe set.
+        int callerThreadId = System.Environment.CurrentManagedThreadId;
+        var entries = Array.FindAll(_activationCache.ToArray(), kv => kv.Value.ThreadId == callerThreadId);
         var toDispose = new List<ActivationCacheEntry>();
         if (entries.Length == 0) return toDispose;
 
@@ -1314,6 +1327,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     internal void EvictActivationsCreatedAfter(long snapshot)
     {
+        // The activation timestamp counter is process-wide, so "created after my snapshot"
+        // also matches a CONCURRENT tape's activations on another thread. Free only THIS
+        // thread's entries — disposing another thread's in-flight buffer is a use-after-free
+        // (0xC0000005) under concurrent tapes.
+        int callerThreadId = System.Environment.CurrentManagedThreadId;
         List<ActivationCacheEntry> toDispose;
         lock (_activationCacheLock)
         {
@@ -1323,6 +1341,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             for (int i = 0; i < entries.Length; i++)
             {
                 if (entries[i].Value.Timestamp <= snapshot) continue;   // pre-existing — keep
+                if (entries[i].Value.ThreadId != callerThreadId) continue; // another thread's live buffer
                 if (Helpers.DeferredArrayMaterializer.IsPending(entries[i].Key))
                 {
                     try { Helpers.DeferredArrayMaterializer.TryMaterialize(entries[i].Key); }
