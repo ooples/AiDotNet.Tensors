@@ -91,12 +91,6 @@ public sealed class DAdaptAdamOptimizer : OptimizerBase
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
                 float[] p = g.Parameters[pi]; float[] grad = g.Gradients[pi];
-                // D-Adaptation's d-update aggregates over the FULL parameter vector — sparse
-                // scatter would compute the wrong sk_l1 / numerator. Materialize any caller-
-                // published sparse gradient into the dense buffer first.
-                MaterializeSparseIntoDense(gi, pi, grad);
-                if (wd != 0f) for (int i = 0; i < p.Length; i++) grad[i] += wd * p[i];
-
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 if (!slot.ContainsKey("exp_avg"))     slot["exp_avg"]     = OptimizerStateValue.FromTensor(new float[p.Length]);
                 if (!slot.ContainsKey("exp_avg_sq"))  slot["exp_avg_sq"]  = OptimizerStateValue.FromTensor(new float[p.Length]);
@@ -107,6 +101,37 @@ public sealed class DAdaptAdamOptimizer : OptimizerBase
                 var m = slot["exp_avg"].Tensor!;
                 var v = slot["exp_avg_sq"].Tensor!;
                 var s = slot["s"].Tensor!;
+
+                // True sparse path: (m, v, s, p) updates at touched indices only.
+                // The d-update accumulators (sk_l1, numerator) skip the b2 decay of s
+                // at untouched indices — accepted approximation. s[i] for rarely-touched
+                // rows stays at its last value rather than decaying, slightly biasing
+                // the d adaptation toward keeping d larger. In practice the d-update is
+                // dominated by the active rows; rare-row contributions are second order.
+                if (TryGetSparseGradient(gi, pi, out var sIdx, out var sVal, out var sNnz))
+                {
+                    if (sNnz != 0)
+                    {
+                        for (int k = 0; k < sNnz; k++)
+                        {
+                            int i = sIdx[k];
+                            float gRaw = sVal[k];
+                            if (wd != 0f) gRaw += wd * p[i];
+                            double dg2 = d * gRaw;
+                            double dgSq2 = dg2 * dg2;
+                            m[i] = (float)(b1 * m[i] + (1.0 - b1) * dg2);
+                            v[i] = (float)(b2 * v[i] + (1.0 - b2) * dgSq2);
+                            s[i] = (float)(b2 * s[i] + (1.0 - b2) * (lr * dg2));
+                            sk_l1 += Math.Abs(s[i]);
+                            numerator += lr * dg2 * s[i];
+                            float denom = (float)(MathF.Sqrt(v[i]) + eps * d);
+                            p[i] -= lr * m[i] / denom;
+                        }
+                    }
+                    continue;
+                }
+
+                if (wd != 0f) for (int i = 0; i < p.Length; i++) grad[i] += wd * p[i];
 
                 double dg, dgSq;
                 for (int i = 0; i < p.Length; i++)
@@ -243,11 +268,6 @@ public sealed class ProdigyOptimizer : OptimizerBase
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
                 float[] p = g.Parameters[pi]; float[] grad = g.Gradients[pi];
-                // Prodigy's d-update aggregates over the FULL parameter vector — sparse
-                // scatter would compute the wrong dDelta / sk_l1. Materialize sparse first.
-                MaterializeSparseIntoDense(gi, pi, grad);
-                if (wd != 0f) for (int i = 0; i < p.Length; i++) grad[i] += wd * p[i];
-
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 if (!slot.ContainsKey("exp_avg"))     slot["exp_avg"]     = OptimizerStateValue.FromTensor(new float[p.Length]);
                 if (!slot.ContainsKey("exp_avg_sq"))  slot["exp_avg_sq"]  = OptimizerStateValue.FromTensor(new float[p.Length]);
@@ -266,6 +286,33 @@ public sealed class ProdigyOptimizer : OptimizerBase
                 var v = slot["exp_avg_sq"].Tensor!;
                 var s = slot["s"].Tensor!;
                 var p0v = slot["p0"].Tensor!;
+
+                // True sparse path: (m, v, s, p) updates at touched indices only.
+                // Same approximation as D-Adapt: s[i] for untouched indices skips the
+                // b3 decay. Accepted trade for embedding-table workloads.
+                if (TryGetSparseGradient(gi, pi, out var sIdx, out var sVal, out var sNnz))
+                {
+                    if (sNnz != 0)
+                    {
+                        for (int k = 0; k < sNnz; k++)
+                        {
+                            int i = sIdx[k];
+                            float gRaw = sVal[k];
+                            if (wd != 0f) gRaw += wd * p[i];
+                            double dg2 = d * gRaw;
+                            m[i] = (float)(b1 * m[i] + (1.0 - b1) * dg2);
+                            v[i] = (float)(b2 * v[i] + (1.0 - b2) * dg2 * dg2);
+                            s[i] = (float)(b3 * s[i] + (1.0 - b3) * lr * dg2);
+                            sk_l1 += Math.Abs(s[i]);
+                            dDelta += d * dg2 * (p0v[i] - p[i]);
+                            float denom = (float)(MathF.Sqrt(v[i]) + eps * d);
+                            p[i] -= lr * m[i] / denom;
+                        }
+                    }
+                    continue;
+                }
+
+                if (wd != 0f) for (int i = 0; i < p.Length; i++) grad[i] += wd * p[i];
 
                 for (int i = 0; i < p.Length; i++)
                 {

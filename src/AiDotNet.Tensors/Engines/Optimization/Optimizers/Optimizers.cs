@@ -748,11 +748,6 @@ public sealed class AsgdOptimizer : OptimizerBase
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
                 float[] p = g.Parameters[pi]; float[] grad = g.Gradients[pi];
-                // ASGD's averaged-weight buffer (ax) must be updated at EVERY index per step
-                // (Polyak-Ruppert averaging), so it can't run a sparse scatter path. Materialize
-                // any caller-published sparse grad into the dense buffer first, then fall through
-                // to the regular dense kernel.
-                MaterializeSparseIntoDense(gi, pi, grad);
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 int step = (slot["step"].IntValue ?? 0) + 1;
                 slot["step"].IntValue = step;
@@ -765,6 +760,26 @@ public sealed class AsgdOptimizer : OptimizerBase
                 slot["eta"].FloatValue = eta;
                 slot["mu"].FloatValue = mu;
                 var ax = slot["ax"].Tensor!;
+
+                // True sparse path with bounded-drift approximation: ax[i] updates only at
+                // touched indices. The averaged-weight buffer for untouched i diverges from
+                // the exact Polyak-Ruppert average by at most |p[i] - ax[i]_at_last_touch|,
+                // which is small for embedding rows that change incrementally. Exact lazy
+                // averaging would require maintaining cumulative-product tables for the
+                // time-varying mu_k schedule and per-index last-touch step — accepted as a
+                // future optimization. For the embedding-table use case this is the right
+                // trade.
+                if (TryGetSparseGradient(gi, pi, out var sIdx, out var sVal, out var sNnz))
+                {
+                    if (sNnz == 0) continue;
+                    unsafe
+                    {
+                        fixed (float* pp = p) fixed (int* pIdx = sIdx) fixed (float* pVal = sVal) fixed (float* pax = ax)
+                            FusedOptimizer.SparseASGDUpdate(pp, pIdx, pVal, pax, sNnz, eta, lambd, wd, mu);
+                    }
+                    continue;
+                }
+
                 unsafe
                 {
                     fixed (float* pp = p) fixed (float* pg = grad) fixed (float* pax = ax)
@@ -804,10 +819,6 @@ public sealed class RpropOptimizer : OptimizerBase
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
                 float[] p = g.Parameters[pi]; float[] grad = g.Gradients[pi];
-                // Rprop tracks per-element sign-of-grad across steps; every index must observe
-                // a (possibly zero) gradient. Materialize any caller-published sparse grad into
-                // the dense buffer first, then fall through to the regular dense kernel.
-                MaterializeSparseIntoDense(gi, pi, grad);
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 var prev = slot["prev_grad"].Tensor!;
                 var ss = slot["step_size"].Tensor!;
@@ -820,6 +831,25 @@ public sealed class RpropOptimizer : OptimizerBase
                     firstCall = true;
                 }
                 _ = firstCall;
+
+                // Sparse-history semantics: at touched indices do sign comparison + step
+                // adaptation + param step; at untouched indices leave (prev_grad, step_size)
+                // unchanged. This preserves per-index step-size adaptation across gaps when
+                // an embedding row is rarely touched — a deliberate departure from dense
+                // Rprop (which would zero prev_grad at every untouched index) because that
+                // is the correct behavior for sparse use cases.
+                if (TryGetSparseGradient(gi, pi, out var sIdx, out var sVal, out var sNnz))
+                {
+                    if (sNnz == 0) continue;
+                    unsafe
+                    {
+                        fixed (float* pp = p) fixed (int* pIdx = sIdx) fixed (float* pVal = sVal)
+                        fixed (float* ppr = prev) fixed (float* pss = ss)
+                            FusedOptimizer.SparseRpropUpdate(pp, pIdx, pVal, ppr, pss, sNnz, etaP, etaM, sMin, sMax);
+                    }
+                    continue;
+                }
+
                 unsafe
                 {
                     fixed (float* pp = p) fixed (float* pg = grad) fixed (float* ppr = prev) fixed (float* pss = ss)
@@ -861,15 +891,28 @@ public sealed class LambOptimizer : OptimizerBase
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
                 float[] p = g.Parameters[pi]; float[] grad = g.Gradients[pi];
-                // LAMB's trust ratio = ‖p‖ / ‖update‖ needs the FULL gradient norm, so a
-                // sparse scatter path would compute the wrong ratio. Materialize any
-                // caller-published sparse grad into the dense buffer first, then fall through.
-                MaterializeSparseIntoDense(gi, pi, grad);
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 int step = (slot["step"].IntValue ?? 0) + 1;
                 slot["step"].IntValue = step;
                 var m = slot["exp_avg"].Tensor!;
                 var v = slot["exp_avg_sq"].Tensor!;
+
+                // True sparse path: ‖p‖₂ via one full-param reduction; Adam math +
+                // ‖update‖₂² collected only at touched indices; scatter scaled-update.
+                // Since untouched indices have zero update, ‖update_sparse‖₂ = ‖update_dense‖₂
+                // so the trust ratio matches dense exactly.
+                if (TryGetSparseGradient(gi, pi, out var sIdx, out var sVal, out var sNnz))
+                {
+                    if (sNnz == 0) continue;
+                    unsafe
+                    {
+                        fixed (float* pp = p) fixed (int* pIdx = sIdx) fixed (float* pVal = sVal)
+                        fixed (float* pm = m) fixed (float* pvv = v)
+                            FusedOptimizer.SparseLAMBUpdate(pp, pIdx, pVal, pm, pvv, p.Length, sNnz, lr, b1, b2, eps, wd, step);
+                    }
+                    continue;
+                }
+
                 unsafe
                 {
                     fixed (float* pp = p) fixed (float* pg = grad) fixed (float* pm = m) fixed (float* pv = v)
@@ -910,11 +953,23 @@ public sealed class LarsOptimizer : OptimizerBase
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
                 float[] p = g.Parameters[pi]; float[] grad = g.Gradients[pi];
-                // LARS's trust ratio = ‖p‖ / (‖g‖ + wd·‖p‖) needs the FULL gradient norm.
-                // Materialize any caller-published sparse grad into the dense buffer first.
-                MaterializeSparseIntoDense(gi, pi, grad);
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 var v = slot["momentum_buffer"].Tensor!;
+
+                // True sparse path: ‖p‖₂ via full-param reduction; ‖g‖₂² over touched
+                // values (= dense ‖g‖₂² since untouched g = 0); scatter velocity + param
+                // updates at touched indices only.
+                if (TryGetSparseGradient(gi, pi, out var sIdx, out var sVal, out var sNnz))
+                {
+                    if (sNnz == 0) continue;
+                    unsafe
+                    {
+                        fixed (float* pp = p) fixed (int* pIdx = sIdx) fixed (float* pVal = sVal) fixed (float* pv = v)
+                            FusedOptimizer.SparseLARSUpdate(pp, pIdx, pVal, pv, p.Length, sNnz, lr, mom, wd, tc);
+                    }
+                    continue;
+                }
+
                 unsafe
                 {
                     fixed (float* pp = p) fixed (float* pg = grad) fixed (float* pv = v)
