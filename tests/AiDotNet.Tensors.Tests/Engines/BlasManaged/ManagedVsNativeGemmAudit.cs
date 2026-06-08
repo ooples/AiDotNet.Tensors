@@ -5,6 +5,10 @@ using System.Text;
 using AiDotNet.Tensors.Helpers;
 using Xunit;
 using ManagedBlas = AiDotNet.Tensors.Engines.BlasManaged.BlasManaged;
+using BMode = AiDotNet.Tensors.Engines.BlasManaged.BlasMode;
+using PMode = AiDotNet.Tensors.Engines.BlasManaged.PackingMode;
+using BOptF = AiDotNet.Tensors.Engines.BlasManaged.BlasOptions<float>;
+using BOptD = AiDotNet.Tensors.Engines.BlasManaged.BlasOptions<double>;
 
 namespace AiDotNet.Tensors.Tests.Engines.BlasManaged;
 
@@ -45,7 +49,7 @@ public class ManagedVsNativeGemmAudit
         // Give native all cores for a fair comparison (det mode pins it to 1).
         BlasProvider.TrySetOpenBlasThreads(Environment.ProcessorCount);
 
-        sb.AppendLine($"{"shape",-22} {"dtype",-6} {"managed GF",12} {"native GF",12} {"ratio",8}  winner");
+        sb.AppendLine($"{"shape",-18} {"dt",-6} {"det GF",9} {"detPB GF",10} {"fast GF",9} {"fastPB GF",10} {"native GF",10} {"best/nat",9}  winner");
         foreach (var (m, k, n, note) in Shapes)
         {
             RunFloat(sb, m, k, n, note);
@@ -68,21 +72,36 @@ public class ManagedVsNativeGemmAudit
         for (int i = 0; i < a.Length; i++) a[i] = (float)(rnd.NextDouble() - 0.5);
         for (int i = 0; i < b.Length; i++) b[i] = (float)(rnd.NextDouble() - 0.5);
         long flops = 2L * m * n * k;
+        int iters = IterFor(flops);
 
-        double mManaged = BestMs(() =>
-            ManagedBlas.Gemm<float>(a, k, false, b, n, false, cM, n, m, n, k), warm: 3, iters: IterFor(flops));
-
-        double mNative = double.PositiveInfinity;
-        if (BlasProvider.HasRawSgemm)
+        double det = BestMs(() =>
+            ManagedBlas.Gemm<float>(a, k, false, b, n, false, cM, n, m, n, k), 3, iters);
+        double detPB = BestMs(() =>
         {
-            mNative = BestMs(() =>
+            var o = new BOptF { PackingMode = PMode.ForcePackBoth };
+            ManagedBlas.Gemm<float>(a, k, false, b, n, false, cM, n, m, n, k, in o);
+        }, 3, iters);
+        double fast = BestMs(() =>
+        {
+            var o = new BOptF { Mode = BMode.Fast };
+            ManagedBlas.Gemm<float>(a, k, false, b, n, false, cM, n, m, n, k, in o);
+        }, 3, iters);
+        double fastPB = BestMs(() =>
+        {
+            var o = new BOptF { Mode = BMode.Fast, PackingMode = PMode.ForcePackBoth };
+            ManagedBlas.Gemm<float>(a, k, false, b, n, false, cM, n, m, n, k, in o);
+        }, 3, iters);
+
+        double nat = double.PositiveInfinity;
+        if (BlasProvider.HasRawSgemm)
+            nat = BestMs(() =>
             {
                 fixed (float* pa = a) fixed (float* pb = b) fixed (float* pc = cN)
                     BlasProvider.SgemmRaw(m, n, k, pa, k, pb, n, pc, n);
-            }, warm: 3, iters: IterFor(flops));
-        }
+            }, 3, iters);
 
-        Emit(sb, m, k, n, "float", note, GflopsOf(flops, mManaged), GflopsOf(flops, mNative));
+        Emit(sb, m, k, n, "float", note,
+            GflopsOf(flops, det), GflopsOf(flops, detPB), GflopsOf(flops, fast), GflopsOf(flops, fastPB), GflopsOf(flops, nat));
     }
 
     private static unsafe void RunDouble(StringBuilder sb, int m, int k, int n, string note)
@@ -93,21 +112,36 @@ public class ManagedVsNativeGemmAudit
         for (int i = 0; i < a.Length; i++) a[i] = rnd.NextDouble() - 0.5;
         for (int i = 0; i < b.Length; i++) b[i] = rnd.NextDouble() - 0.5;
         long flops = 2L * m * n * k;
+        int iters = IterFor(flops);
 
-        double mManaged = BestMs(() =>
-            ManagedBlas.Gemm<double>(a, k, false, b, n, false, cM, n, m, n, k), warm: 3, iters: IterFor(flops));
-
-        double mNative = double.PositiveInfinity;
-        if (BlasProvider.HasRawSgemm)
+        double det = BestMs(() =>
+            ManagedBlas.Gemm<double>(a, k, false, b, n, false, cM, n, m, n, k), 3, iters);
+        double detPB = BestMs(() =>
         {
-            mNative = BestMs(() =>
+            var o = new BOptD { PackingMode = PMode.ForcePackBoth };
+            ManagedBlas.Gemm<double>(a, k, false, b, n, false, cM, n, m, n, k, in o);
+        }, 3, iters);
+        double fast = BestMs(() =>
+        {
+            var o = new BOptD { Mode = BMode.Fast };
+            ManagedBlas.Gemm<double>(a, k, false, b, n, false, cM, n, m, n, k, in o);
+        }, 3, iters);
+        double fastPB = BestMs(() =>
+        {
+            var o = new BOptD { Mode = BMode.Fast, PackingMode = PMode.ForcePackBoth };
+            ManagedBlas.Gemm<double>(a, k, false, b, n, false, cM, n, m, n, k, in o);
+        }, 3, iters);
+
+        double nat = double.PositiveInfinity;
+        if (BlasProvider.HasRawSgemm)
+            nat = BestMs(() =>
             {
                 fixed (double* pa = a) fixed (double* pb = b) fixed (double* pc = cN)
                     BlasProvider.DgemmRaw(m, n, k, pa, k, pb, n, pc, n);
-            }, warm: 3, iters: IterFor(flops));
-        }
+            }, 3, iters);
 
-        Emit(sb, m, k, n, "double", note, GflopsOf(flops, mManaged), GflopsOf(flops, mNative));
+        Emit(sb, m, k, n, "double", note,
+            GflopsOf(flops, det), GflopsOf(flops, detPB), GflopsOf(flops, fast), GflopsOf(flops, fastPB), GflopsOf(flops, nat));
     }
 
     private static int IterFor(long flops) => flops > 500_000_000L ? 8 : flops > 50_000_000L ? 30 : 200;
@@ -128,11 +162,13 @@ public class ManagedVsNativeGemmAudit
         return best;
     }
 
-    private static void Emit(StringBuilder sb, int m, int k, int n, string dtype, string note, double managedGf, double nativeGf)
+    private static void Emit(StringBuilder sb, int m, int k, int n, string dtype, string note,
+        double detGf, double detPbGf, double fastGf, double fastPbGf, double nativeGf)
     {
-        double ratio = nativeGf > 0 ? managedGf / nativeGf : 0;
+        double bestManaged = Math.Max(Math.Max(detGf, detPbGf), Math.Max(fastGf, fastPbGf));
+        double ratio = nativeGf > 0 ? bestManaged / nativeGf : 0;
         string winner = double.IsInfinity(nativeGf) || nativeGf == 0 ? "(no native)"
             : ratio >= 1.0 ? "MANAGED" : $"native (+{(1 / ratio - 1) * 100:F0}%)";
-        sb.AppendLine($"{$"{m}x{k}x{n}",-22} {dtype,-6} {managedGf,12:F1} {nativeGf,12:F1} {ratio,8:F2}  {winner}  [{note}]");
+        sb.AppendLine($"{$"{m}x{k}x{n}",-18} {dtype,-6} {detGf,9:F1} {detPbGf,10:F1} {fastGf,9:F1} {fastPbGf,10:F1} {nativeGf,10:F1} {ratio,9:F2}  {winner}  [{note}]");
     }
 }

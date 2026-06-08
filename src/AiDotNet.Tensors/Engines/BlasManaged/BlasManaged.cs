@@ -218,6 +218,32 @@ public static partial class BlasManaged
     /// Defaults when omitted: no epilogue, single-threaded, no autotune key.
     /// </para>
     /// </summary>
+    // Shapes where the cache-blocking packed strategy (Dispatcher → PackBoth) beats the
+    // #409 machine-code microkernel in PRODUCTION (deterministic) mode, so the Sub-S
+    // interception below should DEFER to the strategy path instead. Measured by
+    // ManagedVsNativeGemmAudit (perf/managed-blas-vs-native-audit) on a 32-core Ryzen:
+    //   • thin-N (n < 128, k ≥ 128): the 6×Nr microkernel can't fill its Nr-wide tile when
+    //     n is tiny → idle SIMD lanes. Packed wins ~3.6× for BOTH dtypes (4096×512×16:
+    //     float 22→80, double 14→50 GF/s).
+    //   • very large work (≥ 4e9): aggressive cache blocking pays for both dtypes
+    //     (2048³: float 290→462, double 285→319). 1024³ (1.07e9) stays on the microkernel
+    //     (153>81), so the cutoff is above it.
+    //   • FP32-only wide-N / wide-K skew (FFN): packed wins big (512×512×2048 106→174;
+    //     512×2048×512 101→177). FP64 is EXCLUDED — its microkernel BEATS packed on FFN
+    //     (512×512×2048 double: 187 microkernel vs 80 packed), so FP64 falls through to the
+    //     microkernel for these shapes.
+    // The microkernel still wins (and is kept) for small/medium near-square shapes
+    // (512³, 256×784×128, 128×64×256), where its low per-call overhead dominates.
+    private static bool PrefersStrategyOverMachineKernel(int m, int n, int k, bool isFloat)
+    {
+        if (n < 128 && k >= 128) return true;                 // thin-N (both dtypes)
+        if ((long)m * n * k >= 4_000_000_000L) return true;   // very large (both dtypes)
+        if (!isFloat) return false;                            // FP64 microkernel is competitive on the rest
+        if (n >= 1024 && n > 2L * m) return true;              // FP32 wide-N skew (FFN-up)
+        if (k >= 1024 && k > 2L * m) return true;              // FP32 wide-K skew (FFN-down)
+        return false;
+    }
+
     public static void Gemm<T>(
         ReadOnlySpan<T> a, int lda, bool transA,
         ReadOnlySpan<T> b, int ldb, bool transB,
@@ -316,6 +342,7 @@ public static partial class BlasManaged
             var epi409 = options.Epilogue;
             if (mkAvail && m >= mkMr && n >= mkNr
                 && (long)m * n * k >= MachineKernelMinWork
+                && !PrefersStrategyOverMachineKernel(m, n, k, typeof(T) == typeof(float))
                 && EpilogueFlagsCompute.Compute(in epi409) == EpilogueFlags.None)
             {
                 int mAl = m - (m % mkMr); // interior rows (× Mr)
