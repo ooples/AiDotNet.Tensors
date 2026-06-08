@@ -11382,6 +11382,16 @@ public partial class CpuEngine : ITensorLevelEngine
             var scope = GraphMode.Current;
             if (scope != null)
             {
+                // FP16 activation storage (#555 P2c): under an FP16 autocast scope + the opt-in flag,
+                // emit a down-cast -> FP16 matmul -> up-cast triple so the activation BUFFER is Half
+                // (2 bytes). Produces a mixed-dtype graph consumed by MixedPrecisionGraphBackward; gated
+                // off by default so the single-type fused plan and FP16-compute autocast are unchanged.
+                if (Compilation.MixedPrecisionEmit.ActivationStorageActive<T>())
+                {
+                    var yF = Compilation.MixedPrecisionEmit.MatMul(
+                        scope, (Tensor<float>)(object)a, (Tensor<float>)(object)b, outShape);
+                    return (Tensor<T>)(object)yF;
+                }
                 var capturedA = a;
                 var capturedB = b;
                 return scope.RecordBinary(LazyNodeType.MatMul, "TensorMatMul", a, b, outShape,

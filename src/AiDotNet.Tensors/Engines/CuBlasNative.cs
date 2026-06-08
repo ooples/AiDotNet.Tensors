@@ -292,6 +292,26 @@ public static class CuBlasNative
     [DllImport(CudaLibrary, EntryPoint = "cuMemFree_v2")]
     public static extern CudaResult cuMemFree(IntPtr devicePtr);
 
+    // ── Stream-ordered memory allocator (CUDA 11.2+; #558 layer 6) ──────────────────────────────────
+    // cuMemAllocAsync / cuMemFreeAsync allocate/free from the device's default memory pool, ordered with
+    // respect to the stream's work. A cuMemFreeAsync is therefore race-safe (the free happens AFTER prior
+    // stream kernels finish, in stream order — no host sync, no CUDA-700) AND the freed memory is reused
+    // by a subsequent cuMemAllocAsync on the same stream WITHOUT a host sync, which bounds mid-step peak.
+    [DllImport(CudaLibrary, EntryPoint = "cuMemAllocAsync")]
+    public static extern CudaResult cuMemAllocAsync(out IntPtr devicePtr, ulong byteSize, IntPtr hStream);
+
+    [DllImport(CudaLibrary, EntryPoint = "cuMemFreeAsync")]
+    public static extern CudaResult cuMemFreeAsync(IntPtr devicePtr, IntPtr hStream);
+
+    [DllImport(CudaLibrary, EntryPoint = "cuDeviceGetDefaultMemPool")]
+    public static extern CudaResult cuDeviceGetDefaultMemPool(out IntPtr pool, int device);
+
+    // CU_MEMPOOL_ATTR_RELEASE_THRESHOLD = 4: bytes the pool retains (does NOT release to the OS) when the
+    // stream syncs — set high so freed activation buffers stay in the pool for reuse (caching-allocator
+    // behaviour, like PyTorch). cuMemPoolSetAttribute(pool, attr, &value).
+    [DllImport(CudaLibrary, EntryPoint = "cuMemPoolSetAttribute")]
+    public static extern CudaResult cuMemPoolSetAttribute(IntPtr pool, int attr, ref ulong value);
+
     /// <summary>
     /// Allocates page-locked (pinned) host memory.
     /// Pinned memory enables true async DMA transfers without requiring

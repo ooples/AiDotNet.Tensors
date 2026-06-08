@@ -317,6 +317,33 @@ public static class SavedTensorRecipes
             });
 
     /// <summary>
+    /// Activates FP16 (half-precision) activation saving for float tensors — the industry-standard AMP
+    /// activation-storage format (Tensors #558). Pack: downcast each saved activation to <see cref="Half"/>
+    /// (2 bytes/elem); unpack: upcast back to float in the backward pass. Exactly 2× memory reduction on
+    /// the retained activations with FP16 rounding (~2^-11 relative) — the same precision trade modern
+    /// mixed-precision training accepts for activations (gradients/master weights stay FP32). Cheaper and
+    /// higher-fidelity than <see cref="SaveQuantizedInt8"/> for activation magnitudes that span more than
+    /// int8's per-tensor range; lossless-free unlike <see cref="SaveCompressed"/> but with no CPU cost.
+    /// </summary>
+    /// <remarks>Float only — the dominant activation dtype. Other element types use <see cref="SaveOnCpu{T}"/>.</remarks>
+    public static IDisposable SaveFp16()
+        => SavedTensorHooks.Push<float>(
+            pack: tensor =>
+            {
+                var src = tensor.AsSpan();
+                var half = new Half[src.Length];
+                for (int i = 0; i < src.Length; i++) half[i] = (Half)src[i];
+                return new HalfSaved(half, tensor.Shape.ToArray());
+            },
+            unpack: packed =>
+            {
+                var saved = (HalfSaved)packed;
+                var data = new float[saved.Data.Length];
+                for (int i = 0; i < data.Length; i++) data[i] = (float)saved.Data[i];
+                return new Tensor<float>(data, saved.Shape);
+            });
+
+    /// <summary>
     /// Activates int8 quantized activation saving for float tensors.
     /// Pack: per-tensor symmetric min-max quantization to a byte[]
     /// plus a scale factor. Unpack: dequantize to float. Achieves a
@@ -513,6 +540,13 @@ public static class SavedTensorRecipes
         public T[] Data { get; }
         public int[] Shape { get; }
         public CpuSaved(T[] data, int[] shape) { Data = data; Shape = shape; }
+    }
+
+    private sealed class HalfSaved
+    {
+        public Half[] Data { get; }
+        public int[] Shape { get; }
+        public HalfSaved(Half[] data, int[] shape) { Data = data; Shape = shape; }
     }
 
     private sealed class QuantizedSaved

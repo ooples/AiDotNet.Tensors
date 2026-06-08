@@ -3,11 +3,11 @@
   <PropertyGroup>
     <TargetFramework>netstandard2.0</TargetFramework>
     <PackageId>AiDotNet.Native.CUDA</PackageId>
-    <Version>12.4.0</Version>
+    <Version>12.5.0</Version>
     <Authors>AiDotNet Contributors</Authors>
     <Company>AiDotNet</Company>
-    <Description>Native CUDA binaries for NVIDIA GPU-accelerated operations. This package provides cuBLAS libraries required by AiDotNet.Tensors for NVIDIA GPU acceleration.</Description>
-    <PackageTags>cuda;nvidia;gpu;blas;native;cublas</PackageTags>
+    <Description>Native CUDA binaries for NVIDIA GPU-accelerated operations. Provides cuBLAS + the nvRTC runtime kernel compiler required by AiDotNet.Tensors for NVIDIA GPU acceleration (no CUDA Toolkit install needed).</Description>
+    <PackageTags>cuda;nvidia;gpu;blas;native;cublas;nvrtc</PackageTags>
     <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
     <PackageProjectUrl>https://github.com/ooples/AiDotNet.Tensors</PackageProjectUrl>
     <RepositoryUrl>https://github.com/ooples/AiDotNet.Tensors</RepositoryUrl>

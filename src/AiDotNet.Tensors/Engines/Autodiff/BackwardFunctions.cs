@@ -1062,8 +1062,19 @@ internal static class BackwardFunctions<T>
         // realize-time forward hand correctly-shaped mean/variance to backward by
         // reference, sidestepping the trace-vs-replay rank mismatch that otherwise
         // threw "Destination is too short" and disabled the fused path entirely.
-        var mean = savedState[0] is LayerNormStateRef<T> mref ? mref.Mean! : (Tensor<T>)savedState[0];
-        var variance = savedState[1] is LayerNormStateRef<T> vref ? vref.Variance! : (Tensor<T>)savedState[1];
+        // Fail FAST when the holder was never populated (a realize-time wiring bug):
+        // letting a null flow into engine.LayerNormBackward would crash deeper with
+        // far less actionable context.
+        var mean = savedState[0] is LayerNormStateRef<T> mref
+            ? mref.Mean ?? throw new InvalidOperationException(
+                "LayerNorm backward: state holder has no Mean — the realize-time forward " +
+                "never populated it before this replay (lazy/compiled-path wiring bug).")
+            : (Tensor<T>)savedState[0];
+        var variance = savedState[1] is LayerNormStateRef<T> vref
+            ? vref.Variance ?? throw new InvalidOperationException(
+                "LayerNorm backward: state holder has no Variance — the realize-time forward " +
+                "never populated it before this replay (lazy/compiled-path wiring bug).")
+            : (Tensor<T>)savedState[1];
         var epsilon = (double)savedState[2];
 
         var gradInput = engine.LayerNormBackward(

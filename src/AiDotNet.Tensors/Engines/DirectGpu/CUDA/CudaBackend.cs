@@ -30,6 +30,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     private IntPtr _cudaContext;
     private IntPtr _stream;
     private IntPtr _cublasHandle;
+    // Stream-ordered allocator (#558 layer 6): when enabled, device buffers are allocated/freed via
+    // cuMemAllocAsync/cuMemFreeAsync on _stream, so freed memory is reused in stream order without a host
+    // sync (race-free + bounds mid-step peak). Opt-in via AIDOTNET_CUDA_ASYNC_ALLOC; default off.
+    private bool _asyncAlloc;
+    /// <summary>Diagnostic (#558): the nvrtc error if the FP16 kernel module failed to compile (which
+    /// silently disables the whole FP16 GPU path). Null when FP16 compiled successfully.</summary>
+    internal static string? Fp16ModuleCompileError;
     // cuDNN helpers — lazily initialized on first Conv2D call that routes
     // through the cuDNN dispatch path. Kept private so disposal is linked
     // to this backend's lifetime; the helpers' cuDNN handles survive
@@ -102,6 +109,14 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     private const int MaxPooledBuffersPerSize = 4;
     private readonly GpuBufferPool<CudaGpuBuffer> _bufferPool =
         new GpuBufferPool<CudaGpuBuffer>(MaxPooledBuffersPerSize, MaxPooledBufferElements);
+    // Event-based deferred buffer free (#555 / #226). A buffer evicted mid-step may still
+    // be referenced by an in-flight async kernel; returning it to the pool (for reuse OR a
+    // real cuMemFree when the bucket is full) before that kernel finishes is the CUDA-700
+    // illegal-access race. Instead we record a lightweight (timing-disabled) event on the
+    // compute stream and hold the buffer in this queue until the event completes — polled
+    // NON-blocking (cuEventQuery) so there is no host stall (unlike a full cuStreamSynchronize).
+    private readonly object _deferredFreeLock = new();
+    private readonly Queue<(IGpuBuffer Buffer, CudaEvent Event)> _deferredFrees = new();
     private bool _supportsCooperativeLaunch;
     private int _multiProcessorCount;
     private readonly CudaPinnedBufferPool _pinnedPool = new();
@@ -258,6 +273,20 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             CuBlasNative.CheckCudaResult(CuBlasNative.cuCtxCreate(out _cudaContext, 0, device), "cuCtxCreate");
             CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamCreate(out _stream, 0), "cuStreamCreate");
             _defaultStream = new CudaStream(this, _stream, GpuStreamType.Default, ownsHandle: false);
+
+            // Stream-ordered allocator setup (#558 layer 6). Retain freed memory in the pool for reuse
+            // (caching-allocator behaviour) by maxing the release threshold; disable if the pool query
+            // fails (older driver / no pool support) so AllocateBuffer falls back to the sync path.
+            _asyncAlloc = Environment.GetEnvironmentVariable("AIDOTNET_CUDA_ASYNC_ALLOC") == "1";
+            if (_asyncAlloc)
+            {
+                if (CuBlasNative.cuDeviceGetDefaultMemPool(out var memPool, device) == CudaResult.Success)
+                {
+                    ulong threshold = ulong.MaxValue; // CU_MEMPOOL_ATTR_RELEASE_THRESHOLD = 4
+                    CuBlasNative.cuMemPoolSetAttribute(memPool, 4, ref threshold);
+                }
+                else { _asyncAlloc = false; }
+            }
 
             CuBlasNative.CheckCublasStatus(CuBlasNative.cublasCreate(out _cublasHandle), "cublasCreate");
             CuBlasNative.CheckCublasStatus(CuBlasNative.cublasSetStream(_cublasHandle, _stream), "cublasSetStream");
@@ -788,15 +817,23 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         // Compile softmax variant + GEMM extension kernels
         CompileKernelModule(device, CudaSoftmaxVariantKernels.GetSource(), "softmax_variant_kernels", CudaSoftmaxVariantKernels.GetKernelNames());
 
+        // Self-contained FP16 kernels (#558 layer 7): manual IEEE-754 half<->float, NO cuda_fp16.h, so
+        // they compile with the driver alone (the header-based CudaFp16Kernels below silently fails on
+        // driver-only machines). This is the FP16 path that actually works without a CUDA Toolkit.
+        CompileKernelModule(device, Kernels.CudaFp16NativeKernels.GetSource(), "fp16_native_kernels", Kernels.CudaFp16NativeKernels.GetKernelNames());
+
         // Compile FP16 conversion kernels (half-precision float conversion)
         // May fail if NVRTC doesn't have cuda_fp16.h (minimal CUDA Toolkit install).
         try
         {
             _fp16Module = CompileKernelModule(device, CudaFp16Kernels.GetSource(), "fp16_kernels", CudaFp16Kernels.GetKernelNames());
         }
-        catch
+        catch (Exception fp16Ex)
         {
-            // FP16 kernels are optional — fall back to FP32 paths.
+            // FP16 kernels are optional — fall back to FP32 paths. Capture the error: a silent failure
+            // here disables the ENTIRE FP16 GPU path (convert + half activations + Tensor-Core throughput),
+            // which is invisible otherwise (#558). Surfaced via Fp16ModuleCompileError for diagnostics.
+            Fp16ModuleCompileError = fp16Ex.Message;
         }
 
         // Compile LSTM sequence kernels (forward/backward for BPTT training)
@@ -1016,6 +1053,58 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     }
 
     /// <summary>
+    /// Race-free deferred free of a GPU buffer (#555). Records a stream event marking the
+    /// buffer's last enqueued use and holds the buffer until that event completes, so it is
+    /// never returned to the pool (and therefore never reused or cuMemFree'd) while an
+    /// in-flight kernel still references it. Non-blocking: drains already-completed deferrals
+    /// each call. Use this instead of <c>buffer.Dispose()</c> for activations freed during a
+    /// training step (the within-step VRAM-pressure offload path).
+    /// </summary>
+    public void FreeBufferDeferred(IGpuBuffer? buffer)
+    {
+        if (buffer == null) return;
+        // Stream-ordered buffers (#558 layer 6): cuMemFreeAsync is already ordered after prior stream
+        // work, so free immediately — deferring via an event would delay pool reclamation and erase the
+        // mid-step reuse that bounds peak. Disposing routes to cuMemFreeAsync (see CudaGpuBuffer.Release).
+        if ((buffer is CudaGpuBuffer cb && cb.IsAsyncFreed) || (buffer is CudaGpuByteBuffer bb && bb.IsAsyncFreed))
+        {
+            buffer.Dispose();
+            return;
+        }
+        CudaEvent evt;
+        using (PushContext())
+            evt = new CudaEvent(this, _defaultStream, enableTiming: false); // creates + records on the compute stream
+        lock (_deferredFreeLock)
+            _deferredFrees.Enqueue((buffer, evt));
+        DrainDeferredFrees(blockOldest: false);
+    }
+
+    /// <summary>
+    /// Returns buffers whose deferred-free event has completed to the pool. With
+    /// <paramref name="blockOldest"/> = true, waits on the front event (used to reclaim
+    /// memory under genuine allocation pressure). FIFO: events recorded later complete
+    /// later, so once the front is incomplete the rest are too (fast early-out).
+    /// </summary>
+    public void DrainDeferredFrees(bool blockOldest)
+    {
+        lock (_deferredFreeLock)
+        {
+            while (_deferredFrees.Count > 0)
+            {
+                var (buf, evt) = _deferredFrees.Peek();
+                if (!evt.IsComplete)
+                {
+                    if (!blockOldest) break;
+                    evt.Synchronize();
+                }
+                _deferredFrees.Dequeue();
+                buf.Dispose();   // returns to the pool — now provably safe
+                evt.Dispose();
+            }
+        }
+    }
+
+    /// <summary>
     /// Allocates device memory with an OOM-recovery retry. If the driver reports
     /// out-of-memory, drain the buffer pool — a real <c>cuMemFree</c> of every
     /// retained-for-reuse buffer — and retry the allocation once. The pool holds
@@ -1033,6 +1122,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         var result = CuBlasNative.cuMemAlloc(out IntPtr devicePtr, byteSize);
         if (result == CudaResult.OutOfMemory)
         {
+            // Reclaim event-deferred frees first (#555) — under genuine pressure block on
+            // their events so their device memory returns to the pool — then drain the pool.
+            DrainDeferredFrees(blockOldest: true);
             int drained = _bufferPool.DrainAll();
             result = CuBlasNative.cuMemAlloc(out devicePtr, byteSize);
             if (result != CudaResult.Success)
@@ -1065,6 +1157,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
         // CUDA driver API calls are required for device memory operations.
         using var _ = PushContext();
+        if (_asyncAlloc)
+        {
+            var p = AllocDeviceMemoryAsync((ulong)size * sizeof(float));
+            CuBlasNative.CheckCudaResult(CuBlasNative.cuMemsetD32(p, 0, (ulong)size), "cuMemsetD32");
+            return new CudaGpuBuffer(_cudaContext, p, size, returnToPool: null, asyncFreeStream: _stream);
+        }
         if (_bufferPool.TryRent(size, out var pooled) && pooled != null)
         {
             CuBlasNative.CheckCudaResult(
@@ -1089,11 +1187,30 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         GpuBufferSizeGuard.EnsureFits("CUDA", size, MaxBufferAllocBytes, DeviceName);
 
         using var _ = PushContext();
+        if (_asyncAlloc)
+        {
+            var pA = AllocDeviceMemoryAsync((ulong)size);
+            return new CudaGpuByteBuffer(_cudaContext, pA, size, asyncFreeStream: _stream);
+        }
         CuBlasNative.CheckCudaResult(
             CuBlasNative.cuMemAlloc(out IntPtr devicePtr, (ulong)size),
             "cuMemAlloc(byte)");
 
         return new CudaGpuByteBuffer(_cudaContext, devicePtr, size);
+    }
+
+    // Stream-ordered device allocation (#558 layer 6). On OOM, sync the context (lets pending
+    // cuMemFreeAsync reclamations complete) and retry once before surfacing the error.
+    private IntPtr AllocDeviceMemoryAsync(ulong byteSize)
+    {
+        var r = CuBlasNative.cuMemAllocAsync(out IntPtr p, byteSize, _stream);
+        if (r != CudaResult.Success)
+        {
+            CuBlasNative.cuCtxSynchronize();
+            r = CuBlasNative.cuMemAllocAsync(out p, byteSize, _stream);
+        }
+        CuBlasNative.CheckCudaResult(r, "cuMemAllocAsync");
+        return p;
     }
 
     public float[] DownloadBuffer(IGpuBuffer buffer)
@@ -10462,6 +10579,83 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
+    /// <summary>
+    /// FP16-NATIVE GELU (#558 layer 7 pilot): reads the FP16 activation buffer DIRECTLY, computes GELU in
+    /// FP32 in-register (__half2 packed, 2 elems/thread), writes FP16 — no separate FP32 buffer is ever
+    /// materialized, so there is no convert transient and the activation stays half-size end-to-end. This
+    /// is the kernel shape the GPU memory win + Tensor-Core throughput require. <paramref name="size"/> is
+    /// the element count; <paramref name="input"/>/<paramref name="output"/> are FP16 (byte) buffers.
+    /// </summary>
+    public unsafe void Fp16Gelu(IGpuBuffer input, IGpuBuffer output, int size)
+        => LaunchUnaryFp16("fp16_gelu_native", input, output, size);
+
+    /// <summary>FP32→FP16 via the self-contained native kernel (no cuda_fp16.h). Output is a half buffer.</summary>
+    public unsafe void ConvertToFp16Native(IGpuBuffer input, IGpuBuffer output, int size)
+        => LaunchConvertFp16("convert_fp32_to_fp16_native", input, output, size);
+
+    /// <summary>FP16→FP32 via the self-contained native kernel (no cuda_fp16.h). Input is a half buffer.</summary>
+    public unsafe void ConvertToFp32Native(IGpuBuffer input, IGpuBuffer output, int size)
+        => LaunchConvertFp16("convert_fp16_to_fp32_native", input, output, size);
+
+    /// <summary>
+    /// FP16 Tensor-Core GEMM for the hot single-matmul path (#558 layer 7): row-major C[M,N] = A[M,K]·B[K,N]
+    /// with FP16 inputs and an FP32 output. Multiplies in FP16 on the Tensor Cores, accumulates in FP32
+    /// (<c>CUBLAS_COMPUTE_32F</c>) — full-rate Tensor-Core throughput (≈2× the TF32 <c>cublasSgemm</c> the
+    /// default <see cref="Gemm"/> uses) at half the input bandwidth. This is the de-batched mirror of the
+    /// proven <see cref="BatchedGemmExFanout"/> convention; <paramref name="Ahalf"/>/<paramref name="Bhalf"/>
+    /// are FP16 (byte) buffers, <paramref name="C"/> is FP32. cuBLAS is column-major, so we compute
+    /// Cᵀ = Bᵀ·Aᵀ by passing (N,M,K) with B then A — identical to the FP32 path. <c>cublasGemmEx</c> needs
+    /// no <c>cuda_fp16.h</c> (the half pointers are runtime, not compile-time), so this works driver-only —
+    /// pair with <see cref="ConvertToFp16Native"/> to feed it from FP32, or with FP16-resident activations
+    /// to skip the convert entirely.
+    /// </summary>
+    public unsafe void GemmFp16(IGpuBuffer Ahalf, IGpuBuffer Bhalf, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
+    {
+        if (!IsAvailable) throw new InvalidOperationException("CUDA backend is not available.");
+        if (Ahalf is null) throw new ArgumentNullException(nameof(Ahalf));
+        if (Bhalf is null) throw new ArgumentNullException(nameof(Bhalf));
+        if (C is null) throw new ArgumentNullException(nameof(C));
+        if (M <= 0 || N <= 0 || K <= 0) throw new ArgumentException($"GEMM dims must be positive (M={M}, N={N}, K={K}).");
+        // A,B are 2-byte half; C is 4-byte float. Reject undersized buffers (byte-aware, since the
+        // element-count view would misread half buffers as float-sized).
+        if (Ahalf.SizeInBytes < (long)M * K * 2) throw new ArgumentException($"A half buffer too small: {Ahalf.SizeInBytes} < {(long)M * K * 2}.");
+        if (Bhalf.SizeInBytes < (long)K * N * 2) throw new ArgumentException($"B half buffer too small: {Bhalf.SizeInBytes} < {(long)K * N * 2}.");
+        if (C.SizeInBytes < (long)M * N * sizeof(float)) throw new ArgumentException($"C buffer too small: {C.SizeInBytes} < {(long)M * N * sizeof(float)}.");
+
+        using var _ = PushContext();
+        float aVal = alpha, bVal = beta;
+        IntPtr alphaPtr = (IntPtr)(&aVal);
+        IntPtr betaPtr = (IntPtr)(&bVal);
+        CuBlasNative.CheckCublasStatus(
+            CuBlasNative.cublasGemmEx(
+                _cublasHandle,
+                CublasOperation.None, CublasOperation.None,
+                N, M, K,
+                alphaPtr,
+                Bhalf.Handle, CuBlasNative.CUDA_R_16F, N,
+                Ahalf.Handle, CuBlasNative.CUDA_R_16F, K,
+                betaPtr,
+                C.Handle, CuBlasNative.CUDA_R_32F, N,
+                CuBlasNative.CUBLAS_COMPUTE_32F,
+                0 /* CUBLAS_GEMM_DEFAULT — selects Tensor Cores under the handle's math mode */),
+            "cublasGemmEx(GemmFp16)");
+    }
+
+    private unsafe void LaunchUnaryFp16(string kernelName, IGpuBuffer input, IGpuBuffer output, int size)
+    {
+        if (!_kernelCache.TryGetValue(kernelName, out var kernel))
+            throw new InvalidOperationException($"CUDA kernel not found: {kernelName}");
+        using var _ = PushContext();
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);  // 1 elem/thread
+        IntPtr inPtr = input.Handle, outPtr = output.Handle;
+        void** args = stackalloc void*[3];
+        args[0] = &inPtr; args[1] = &outPtr; args[2] = &size;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    private unsafe void LaunchConvertFp16(string kernelName, IGpuBuffer input, IGpuBuffer output, int size)
+        => LaunchUnaryFp16(kernelName, input, output, size);
+
     /// <inheritdoc/>
     public unsafe void ConvertToFp32(IGpuBuffer input, IGpuBuffer output, int size)
     {
@@ -12879,6 +13073,14 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (!disposing || IsRuntimeTearingDown || ProcessExiting)
             return;
 
+        // Flush every event-deferred free BEFORE tearing down the pool/context, blocking
+        // on incomplete events (the stream/context are still alive right here, so the
+        // waits are safe). Anything left queued would survive this Dispose holding its
+        // now-stale _context handle; when those CudaGpuBuffer instances later finalize
+        // they would cuCtxPushCurrent/cuMemFree against a DESTROYED context — the exact
+        // finalizer-fatal 0xC0000005 path this method's teardown guards exist to prevent.
+        DrainDeferredFrees(blockOldest: true);
+
         _pinnedPool.Dispose();
         _bufferPool.Dispose();
 
@@ -13851,19 +14053,23 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         private IntPtr _context;
         private IntPtr _devicePtr;
         private readonly Action<CudaGpuBuffer>? _returnToPool;
+        private readonly IntPtr _asyncFreeStream; // non-zero ⇒ free via cuMemFreeAsync on this stream (#558 layer 6)
         private int _poolState;
 
         public int Size { get; }
         public long SizeInBytes { get; }
         public IntPtr Handle => _devicePtr;
+        internal bool IsAsyncFreed => _asyncFreeStream != IntPtr.Zero;
 
-        public CudaGpuBuffer(IntPtr context, IntPtr devicePtr, int size, Action<CudaGpuBuffer>? returnToPool = null)
+        public CudaGpuBuffer(IntPtr context, IntPtr devicePtr, int size, Action<CudaGpuBuffer>? returnToPool = null,
+            IntPtr asyncFreeStream = default)
         {
             _context = context;
             _devicePtr = devicePtr;
             Size = size;
             SizeInBytes = (long)size * sizeof(float);
             _returnToPool = returnToPool;
+            _asyncFreeStream = asyncFreeStream;
         }
 
         public void MarkRented()
@@ -13893,7 +14099,11 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                     try
                     {
                         CuBlasNative.cuCtxPushCurrent(_context);
-                        CuBlasNative.cuMemFree(_devicePtr);
+                        // Stream-ordered free (#558 layer 6): race-safe + pool-reused in stream order.
+                        if (_asyncFreeStream != IntPtr.Zero)
+                            CuBlasNative.cuMemFreeAsync(_devicePtr, _asyncFreeStream);
+                        else
+                            CuBlasNative.cuMemFree(_devicePtr);
                         CuBlasNative.cuCtxPopCurrent(out _);
                     }
                     catch
@@ -13940,17 +14150,20 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     {
         private IntPtr _context;
         private IntPtr _devicePtr;
+        private readonly IntPtr _asyncFreeStream; // #558 layer 6: free via cuMemFreeAsync when non-zero
 
         public int Size { get; }
         public long SizeInBytes { get; }
         public IntPtr Handle => _devicePtr;
+        internal bool IsAsyncFreed => _asyncFreeStream != IntPtr.Zero;
 
-        public CudaGpuByteBuffer(IntPtr context, IntPtr devicePtr, int size)
+        public CudaGpuByteBuffer(IntPtr context, IntPtr devicePtr, int size, IntPtr asyncFreeStream = default)
         {
             _context = context;
             _devicePtr = devicePtr;
             Size = size;
             SizeInBytes = size;
+            _asyncFreeStream = asyncFreeStream;
         }
 
         public void Dispose()
@@ -13970,7 +14183,11 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                     try
                     {
                         CuBlasNative.cuCtxPushCurrent(_context);
-                        CuBlasNative.cuMemFree(_devicePtr);
+                        // Stream-ordered free (#558 layer 6): race-safe + pool-reused in stream order.
+                        if (_asyncFreeStream != IntPtr.Zero)
+                            CuBlasNative.cuMemFreeAsync(_devicePtr, _asyncFreeStream);
+                        else
+                            CuBlasNative.cuMemFree(_devicePtr);
                         CuBlasNative.cuCtxPopCurrent(out _);
                     }
                     catch
