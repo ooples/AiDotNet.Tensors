@@ -178,6 +178,15 @@ public static class AiDotNetEngine
     /// <returns>True if GPU was successfully configured, false otherwise.</returns>
     public static bool AutoDetectAndConfigureGpu(bool verbose)
     {
+        // Once the GPU circuit breaker has tripped (a sticky CUDA fault corrupted the context),
+        // never re-adopt the GPU for the rest of the process — re-engaging would immediately fault
+        // again on the dead context. Stay on CPU.
+        if (_gpuCircuitBroken)
+        {
+            Current = new CpuEngine();
+            return false;
+        }
+
         try
         {
             var gpuEngine = new DirectGpuTensorEngine();
@@ -335,6 +344,42 @@ public static class AiDotNetEngine
     {
         Current = new CpuEngine();
         EmitLog("[AiDotNet] Reset to CPU engine", verbose: true);
+    }
+
+    private static volatile bool _gpuCircuitBroken;
+
+    /// <summary>True once a sticky CUDA fault has forced a permanent CPU fallback for this process.</summary>
+    public static bool GpuCircuitBroken => _gpuCircuitBroken;
+
+    /// <summary>
+    /// Trips the process-wide GPU circuit breaker after a sticky/context-corrupting CUDA fault
+    /// (illegal address 700, context destroyed 709, launch failed 719). Switches the engine to CPU
+    /// and blocks any further GPU adoption, so a single GPU fault degrades to CPU instead of
+    /// cascading the same failure across every subsequent op. Safe to call from inside a CUDA error
+    /// path — it never throws.
+    /// </summary>
+    public static void TripGpuCircuitBreaker(string operation, int cudaErrorCode)
+    {
+        if (_gpuCircuitBroken)
+        {
+            return;
+        }
+
+        _gpuCircuitBroken = true;
+        try
+        {
+            if (_current is DirectGpuTensorEngine)
+            {
+                _current = new CpuEngine();
+            }
+        }
+        catch
+        {
+            // The breaker must never throw — it runs from within a CUDA error handler.
+        }
+
+        EmitLog($"[AiDotNet] GPU circuit breaker tripped by '{operation}' (CUDA error {cudaErrorCode}); " +
+            "falling back to CPU for the rest of the process.", verbose: true);
     }
 
     /// <summary>

@@ -863,6 +863,426 @@ internal static class FusedOptimizer
         }
     }
 
+    // ----------------------------------------------------------------------
+    // SPARSE SCATTER-UPDATE KERNELS  (paired with OptimizerBase.SetSparseGradient)
+    //
+    // Each kernel below is the sparse counterpart of an existing dense optimizer
+    // kernel: instead of iterating over the full parameter buffer, only the
+    // (index, value) pairs supplied by the autodiff side are visited. The dense
+    // state buffers (m, v, accum, ...) keep their full size — only the touched
+    // positions are read & written, so the rest of the buffers remain valid
+    // across the call. Math matches the corresponding dense fused kernel
+    // verbatim (no SIMD — the workload is small by construction, so the
+    // managed scalar loop is faster than packing-then-AVX dance).
+    // ----------------------------------------------------------------------
+
+    /// <summary>SparseAdamW: AdamW restricted to non-zero indices.
+    /// Decoupled weight decay (PyTorch parity) applies at touched positions only.</summary>
+    internal static unsafe void SparseAdamWUpdate(
+        float* param, int* indices, float* values, float* m, float* v, int nnz,
+        float lr, float beta1, float beta2, float eps, float wd, int step)
+    {
+        float bc1 = 1f - MathF.Pow(beta1, step);
+        float bc2 = 1f - MathF.Pow(beta2, step);
+        float lrAdj = lr / bc1;
+        float bc2Inv = 1f / bc2;
+        for (int k = 0; k < nnz; k++)
+        {
+            int idx = indices[k];
+            float g = values[k];
+            float p = param[idx];
+            if (wd != 0f) p -= lr * wd * p;                       // decoupled weight decay
+            float mNew = beta1 * m[idx] + (1f - beta1) * g;
+            float vNew = beta2 * v[idx] + (1f - beta2) * g * g;
+            m[idx] = mNew;
+            v[idx] = vNew;
+            float vHat = vNew * bc2Inv;
+            param[idx] = p - lrAdj * mNew / (MathF.Sqrt(vHat) + eps);
+        }
+    }
+
+    /// <summary>SparseSGD: SGD + optional momentum + Nesterov + weight decay, restricted to non-zero indices.</summary>
+    internal static unsafe void SparseSgdUpdate(
+        float* param, int* indices, float* values, float* momentum, int nnz,
+        float lr, float mom, float dampening, float wd, bool nesterov, bool hasMomentum)
+    {
+        for (int k = 0; k < nnz; k++)
+        {
+            int idx = indices[k];
+            float g = values[k];
+            if (wd != 0f) g += wd * param[idx];
+            if (hasMomentum && mom != 0f)
+            {
+                float buf = momentum[idx] * mom + g * (1f - dampening);
+                momentum[idx] = buf;
+                g = nesterov ? g + mom * buf : buf;
+            }
+            param[idx] -= lr * g;
+        }
+    }
+
+    /// <summary>SparseNadam: Nesterov-momentum Adam, restricted to non-zero indices.</summary>
+    internal static unsafe void SparseNadamUpdate(
+        float* param, int* indices, float* values, float* m, float* v, int nnz,
+        float lr, float beta1, float beta2, float eps, float wd, int step)
+    {
+        float bc1 = 1f - MathF.Pow(beta1, step);
+        float bc2 = 1f - MathF.Pow(beta2, step);
+        float bc2Inv = 1f / bc2;
+        for (int k = 0; k < nnz; k++)
+        {
+            int idx = indices[k];
+            float g = values[k];
+            if (wd != 0f) g += wd * param[idx];
+            float mNew = beta1 * m[idx] + (1f - beta1) * g;
+            float vNew = beta2 * v[idx] + (1f - beta2) * g * g;
+            m[idx] = mNew;
+            v[idx] = vNew;
+            float mHat = (beta1 * mNew + (1f - beta1) * g) / bc1;  // Nesterov-corrected
+            float vHat = vNew * bc2Inv;
+            param[idx] -= lr * mHat / (MathF.Sqrt(vHat) + eps);
+        }
+    }
+
+    /// <summary>SparseAdamax: Adam with L∞ norm (u-state), restricted to non-zero indices.</summary>
+    internal static unsafe void SparseAdamaxUpdate(
+        float* param, int* indices, float* values, float* m, float* u, int nnz,
+        float lr, float beta1, float beta2, float eps, float wd, int step)
+    {
+        float bc1 = 1f - MathF.Pow(beta1, step);
+        float lrAdj = lr / bc1;
+        for (int k = 0; k < nnz; k++)
+        {
+            int idx = indices[k];
+            float g = values[k];
+            if (wd != 0f) g += wd * param[idx];
+            float mNew = beta1 * m[idx] + (1f - beta1) * g;
+            float uOld = u[idx];
+            float uNew = MathF.Max(beta2 * uOld, MathF.Abs(g));
+            m[idx] = mNew;
+            u[idx] = uNew;
+            param[idx] -= lrAdj * mNew / (uNew + eps);
+        }
+    }
+
+    /// <summary>SparseAdagrad: per-parameter accumulator update, restricted to non-zero indices.</summary>
+    internal static unsafe void SparseAdagradUpdate(
+        float* param, int* indices, float* values, float* accum, int nnz,
+        float lr, float eps, float wd, float lrDecay, int step)
+    {
+        float effLr = lr / (1f + step * lrDecay);
+        for (int k = 0; k < nnz; k++)
+        {
+            int idx = indices[k];
+            float g = values[k];
+            if (wd != 0f) g += wd * param[idx];
+            float a = accum[idx] + g * g;
+            accum[idx] = a;
+            param[idx] -= effLr * g / (MathF.Sqrt(a) + eps);
+        }
+    }
+
+    /// <summary>SparseRmsProp: RMSProp restricted to non-zero indices.</summary>
+    internal static unsafe void SparseRmsPropUpdate(
+        float* param, int* indices, float* values, float* sqAvg, float* momentumBuf, int nnz,
+        float lr, float alpha, float eps, float wd, float momentum, bool centered, float* gradAvg,
+        bool hasMomentum)
+    {
+        for (int k = 0; k < nnz; k++)
+        {
+            int idx = indices[k];
+            float g = values[k];
+            if (wd != 0f) g += wd * param[idx];
+            float sq = alpha * sqAvg[idx] + (1f - alpha) * g * g;
+            sqAvg[idx] = sq;
+            float denom;
+            if (centered)
+            {
+                float ga = alpha * gradAvg[idx] + (1f - alpha) * g;
+                gradAvg[idx] = ga;
+                denom = MathF.Sqrt(sq - ga * ga) + eps;
+            }
+            else
+            {
+                denom = MathF.Sqrt(sq) + eps;
+            }
+            if (hasMomentum && momentum != 0f)
+            {
+                float buf = momentumBuf[idx] * momentum + g / denom;
+                momentumBuf[idx] = buf;
+                param[idx] -= lr * buf;
+            }
+            else
+            {
+                param[idx] -= lr * g / denom;
+            }
+        }
+    }
+
+    /// <summary>SparseAdaDelta: AdaDelta restricted to non-zero indices. Maintains EMA of
+    /// squared grad and squared update.</summary>
+    internal static unsafe void SparseAdaDeltaUpdate(
+        float* param, int* indices, float* values, float* sqAvg, float* accDelta, int nnz,
+        float lr, float rho, float eps, float wd)
+    {
+        float oneMinusRho = 1f - rho;
+        for (int k = 0; k < nnz; k++)
+        {
+            int idx = indices[k];
+            float g = values[k];
+            if (wd != 0f) g += wd * param[idx];
+            float sq = rho * sqAvg[idx] + oneMinusRho * g * g;
+            sqAvg[idx] = sq;
+            float dx = MathF.Sqrt(accDelta[idx] + eps) / MathF.Sqrt(sq + eps) * g;
+            accDelta[idx] = rho * accDelta[idx] + oneMinusRho * dx * dx;
+            param[idx] -= lr * dx;
+        }
+    }
+
+    /// <summary>SparseLion: sign-of-EMA update restricted to non-zero indices.</summary>
+    internal static unsafe void SparseLionUpdate(
+        float* param, int* indices, float* values, float* m, int nnz,
+        float lr, float beta1, float beta2, float wd)
+    {
+        for (int k = 0; k < nnz; k++)
+        {
+            int idx = indices[k];
+            float g = values[k];
+            float c = beta1 * m[idx] + (1f - beta1) * g;
+            float update = MathF.Sign(c);
+            if (wd != 0f)
+                param[idx] -= lr * (update + wd * param[idx]);
+            else
+                param[idx] -= lr * update;
+            m[idx] = beta2 * m[idx] + (1f - beta2) * g;
+        }
+    }
+
+    /// <summary>SparseFtrl: FTRL-proximal restricted to non-zero indices.</summary>
+    internal static unsafe void SparseFtrlUpdate(
+        float* param, int* indices, float* values, float* accumulator, float* linear, int nnz,
+        float lr, float lrPower, float lambda1, float lambda2)
+    {
+        for (int k = 0; k < nnz; k++)
+        {
+            int idx = indices[k];
+            float g = values[k];
+            float prevAccum = accumulator[idx];
+            float newAccum = prevAccum + g * g;
+            float sigma = (MathF.Pow(newAccum, -lrPower) - MathF.Pow(prevAccum, -lrPower)) / lr;
+            if (float.IsNaN(sigma) || float.IsInfinity(sigma)) sigma = 0f;
+            linear[idx] += g - sigma * param[idx];
+            accumulator[idx] = newAccum;
+            float z = linear[idx];
+            if (MathF.Abs(z) <= lambda1) { param[idx] = 0f; continue; }
+            float pre = MathF.Pow(newAccum, -lrPower) / lr + lambda2;
+            param[idx] = (MathF.Sign(z) * lambda1 - z) / pre;
+        }
+    }
+
+    /// <summary>SparseRAdam: Rectified Adam restricted to non-zero indices.
+    /// When variance rectification is inactive (early-step), falls back to plain momentum.</summary>
+    internal static unsafe void SparseRAdamUpdate(
+        float* param, int* indices, float* values, float* m, float* v, int nnz,
+        float lr, float beta1, float beta2, float eps, float wd, int step)
+    {
+        float bc1 = 1f - MathF.Pow(beta1, step);
+        float bc2 = 1f - MathF.Pow(beta2, step);
+        float rhoInf = 2f / (1f - beta2) - 1f;
+        float rhoT = rhoInf - 2f * step * MathF.Pow(beta2, step) / bc2;
+        bool rect = rhoT > 4f;
+        float r = 0f;
+        if (rect)
+        {
+            float num = (rhoT - 4f) * (rhoT - 2f) * rhoInf;
+            float den = (rhoInf - 4f) * (rhoInf - 2f) * rhoT;
+            r = MathF.Sqrt(num / den);
+        }
+        for (int k = 0; k < nnz; k++)
+        {
+            int idx = indices[k];
+            float g = values[k];
+            if (wd != 0f) g += wd * param[idx];
+            float mNew = beta1 * m[idx] + (1f - beta1) * g;
+            float vNew = beta2 * v[idx] + (1f - beta2) * g * g;
+            m[idx] = mNew;
+            v[idx] = vNew;
+            float mHat = mNew / bc1;
+            if (rect)
+            {
+                float vHat = MathF.Sqrt(vNew / bc2);
+                param[idx] -= lr * r * mHat / (vHat + eps);
+            }
+            else
+            {
+                param[idx] -= lr * mHat;
+            }
+        }
+    }
+
+    // ==========================================================================
+    // Sparse trust-ratio & exotic-state kernels (LAMB / LARS / BF16Adam / Rprop /
+    // FP8Lion / ASGD-lazy / D-Adapt / Prodigy / Shampoo). The trust-ratio family
+    // needs a full-param ‖p‖ reduction once per step but does only sparse
+    // scatter-updates on (m, v, velocity) and the param at touched indices.
+    // Sparse-history semantics on Rprop preserve per-index step-size adaptation
+    // across the gaps when an index is rarely updated.
+    // ==========================================================================
+
+    /// <summary>SparseLAMB: trust-ratio scaled Adam restricted to non-zero indices.
+    /// ‖p‖₂ is computed over the FULL param vector (single O(N) reduction); the
+    /// Adam moments and parameter step are scatter-updated at touched indices only.
+    /// Since untouched indices have zero update, ‖update‖₂ across all i equals
+    /// ‖update_sparse‖₂ across touched i — both yield the same trust ratio.</summary>
+    internal static unsafe void SparseLAMBUpdate(
+        float* param, int* indices, float* values, float* m, float* v, int paramLen, int nnz,
+        float lr, float beta1, float beta2, float eps, float wd, int step)
+    {
+        float bc1 = 1f - MathF.Pow(beta1, step);
+        float bc2 = 1f - MathF.Pow(beta2, step);
+
+        // Full ‖p‖₂ reduction — one O(paramLen) read.
+        float pNormSq = 0f;
+        for (int i = 0; i < paramLen; i++) pNormSq += param[i] * param[i];
+        float pNorm = MathF.Sqrt(pNormSq);
+
+        // Sparse Adam-like update + collect ‖update‖₂² over touched i.
+        // Stage updates in a temp buffer so we can apply the trust-ratio scale uniformly.
+        var updates = new float[nnz];
+        float uNormSq = 0f;
+        for (int k = 0; k < nnz; k++)
+        {
+            int idx = indices[k];
+            float g = values[k];
+            float mNew = beta1 * m[idx] + (1f - beta1) * g;
+            float vNew = beta2 * v[idx] + (1f - beta2) * g * g;
+            m[idx] = mNew;
+            v[idx] = vNew;
+            float mHat = mNew / bc1;
+            float vHat = vNew / bc2;
+            float u = mHat / (MathF.Sqrt(vHat) + eps);
+            if (wd != 0f) u += wd * param[idx];
+            updates[k] = u;
+            uNormSq += u * u;
+        }
+        float uNorm = MathF.Sqrt(uNormSq);
+
+        // LAMB trust ratio: 1.0 if either norm is zero (no scaling), else ‖p‖ / ‖u‖.
+        float trustRatio = (pNorm > 0f && uNorm > 0f) ? (pNorm / uNorm) : 1f;
+        float effLr = lr * trustRatio;
+        for (int k = 0; k < nnz; k++)
+        {
+            param[indices[k]] -= effLr * updates[k];
+        }
+    }
+
+    /// <summary>SparseLARS: trust-ratio scaled SGD-momentum restricted to non-zero
+    /// indices. ‖p‖₂ via full reduction; ‖g_sparse‖₂² = sum over touched values²
+    /// (equals dense ‖g‖₂² since untouched indices have zero gradient).</summary>
+    internal static unsafe void SparseLARSUpdate(
+        float* param, int* indices, float* values, float* velocity, int paramLen, int nnz,
+        float lr, float momentum, float wd, float trustCoeff)
+    {
+        // Full ‖p‖₂ reduction.
+        float pNormSq = 0f;
+        for (int i = 0; i < paramLen; i++) pNormSq += param[i] * param[i];
+        float pNorm = MathF.Sqrt(pNormSq);
+
+        // ‖g‖₂² over touched (= dense, since untouched g = 0).
+        float gNormSq = 0f;
+        for (int k = 0; k < nnz; k++) gNormSq += values[k] * values[k];
+        float gNorm = MathF.Sqrt(gNormSq);
+
+        float denom = gNorm + wd * pNorm;
+        float localLr = (pNorm > 0f && denom > 0f) ? (lr * trustCoeff * pNorm / denom) : lr;
+
+        for (int k = 0; k < nnz; k++)
+        {
+            int idx = indices[k];
+            float g = values[k];
+            if (wd != 0f) g += wd * param[idx];
+            float v = momentum * velocity[idx] + localLr * g;
+            velocity[idx] = v;
+            param[idx] -= v;
+        }
+    }
+
+    /// <summary>SparseRprop: per-element step-size adaptation at touched indices
+    /// only. Untouched indices keep their (prev_grad, step_size) state — this is
+    /// "sparse-history" semantics, preserving the per-index adaptation across
+    /// gaps when an embedding row is rarely touched. Differs from dense Rprop
+    /// (which writes prev_grad[i] = grad[i] = 0 at every untouched i), but is
+    /// the right behavior for sparse use cases.</summary>
+    internal static unsafe void SparseRpropUpdate(
+        float* param, int* indices, float* values, float* prevGrad, float* stepSize, int nnz,
+        float etaPlus, float etaMinus, float stepMin, float stepMax)
+    {
+        for (int k = 0; k < nnz; k++)
+        {
+            int idx = indices[k];
+            float g = values[k];
+            float prev = prevGrad[idx];
+            float ss = stepSize[idx];
+            float signProduct = prev * g;
+            if (signProduct > 0f)
+            {
+                ss = MathF.Min(ss * etaPlus, stepMax);
+            }
+            else if (signProduct < 0f)
+            {
+                ss = MathF.Max(ss * etaMinus, stepMin);
+                g = 0f;  // reset gradient memory on sign change (paper convention)
+            }
+            stepSize[idx] = ss;
+            prevGrad[idx] = g;
+            if (g > 0f)        param[idx] -= ss;
+            else if (g < 0f)   param[idx] += ss;
+        }
+    }
+
+    /// <summary>SparseASGD: lazy averaging — only touched indices update both p and ax.
+    /// Untouched ax[i] drift via lazy catch-up: caller maintains last-touch step per
+    /// index and applies missed (1 - mu) decays when next touched. This kernel does
+    /// the per-touched-index update assuming caller has already applied lazy catch-up
+    /// to ax[idx] for the missed steps.</summary>
+    internal static unsafe void SparseASGDUpdate(
+        float* param, int* indices, float* values, float* ax, int nnz,
+        float eta, float lambd, float wd, float mu)
+    {
+        for (int k = 0; k < nnz; k++)
+        {
+            int idx = indices[k];
+            float g = values[k];
+            if (wd != 0f) g += wd * param[idx];
+            float pNew = param[idx] * (1f - eta * lambd) - eta * g;
+            param[idx] = pNew;
+            ax[idx] += mu * (pNew - ax[idx]);
+        }
+    }
+
+    /// <summary>SparseBF16Adam helper: dequantize one BF16-packed slot.</summary>
+    internal static float SparseBF16Unpack(float[] packed, int i)
+    {
+        int cell = i >> 1;
+        uint cellBits = (uint)BitConverter.ToInt32(BitConverter.GetBytes(packed[cell]), 0);
+        ushort bf = (i & 1) == 0 ? (ushort)(cellBits & 0xFFFFu) : (ushort)(cellBits >> 16);
+        var bytes = BitConverter.GetBytes((uint)bf << 16);
+        return BitConverter.ToSingle(bytes, 0);
+    }
+
+    /// <summary>SparseBF16Adam helper: quantize one FP32 value back to BF16-packed slot.</summary>
+    internal static void SparseBF16Pack(float[] packed, int i, float v)
+    {
+        uint bits = (uint)BitConverter.ToInt32(BitConverter.GetBytes(v), 0);
+        uint rounding = ((bits >> 16) & 1u) + 0x7FFFu;
+        ushort bf = (ushort)((bits + rounding) >> 16);
+        int cell = i >> 1;
+        uint cellBits = (uint)BitConverter.ToInt32(BitConverter.GetBytes(packed[cell]), 0);
+        if ((i & 1) == 0) cellBits = (cellBits & 0xFFFF0000u) | bf;
+        else              cellBits = (cellBits & 0x0000FFFFu) | ((uint)bf << 16);
+        packed[cell] = BitConverter.ToSingle(BitConverter.GetBytes(cellBits), 0);
+    }
+
     /// <summary>AVX2 ASGD: Averaged SGD (Polyak/Ruppert).
     /// Step decay <c>η_t = lr / (1 + λ·lr·t)^α</c>, weight decay applied to gradient,
     /// and exponential moving average of params written to <paramref name="ax"/>.</summary>

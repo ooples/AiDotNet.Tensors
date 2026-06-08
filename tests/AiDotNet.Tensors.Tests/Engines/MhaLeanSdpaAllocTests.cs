@@ -14,6 +14,18 @@ namespace AiDotNet.Tensors.Tests.Engines;
 /// allocation from ~7.2 MB to ~1.0 MB (~6.9×) and sustained mean latency ~2.7×. This test
 /// fails if the forward regresses back to the weight-materializing path.
 /// </summary>
+// Disable xUnit parallel execution for this class — the gate samples
+// GC.GetTotalAllocatedBytes, a PROCESS-WIDE counter (deliberately, so it also
+// catches the SDPA path's parallel per-head worker-thread allocations that a
+// thread-local counter would miss). If any other test class allocates
+// concurrently during the measured window, those bytes are attributed to our
+// per-call figure and the threshold trips on the noise — observed as 37986 KB/call
+// under a full parallel suite run while the real path is ~1024 KB (passes in
+// isolation). Same rationale and pattern as OptimizerKernelsAllocSerial.
+[CollectionDefinition("MhaLeanSdpaAllocSerial", DisableParallelization = true)]
+public class MhaLeanSdpaAllocSerialCollection { }
+
+[Collection("MhaLeanSdpaAllocSerial")]
 public class MhaLeanSdpaAllocTests
 {
     private static Tensor<float> Rand(Random r, params int[] s)

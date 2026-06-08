@@ -41,6 +41,20 @@ public sealed class SgdOptimizer : OptimizerBase
             {
                 float[] p = g.Parameters[pi];
                 float[] grad = g.Gradients[pi];
+
+                if (TryGetSparseGradient(gi, pi, out var sIdx, out var sVal, out var sNnz))
+                {
+                    if (sNnz == 0) continue;
+                    var slotSp = momentum != 0f ? GetOrCreateState(gi, pi, p.Length) : null;
+                    var vSp = slotSp != null ? slotSp["momentum_buffer"].Tensor! : null;
+                    unsafe
+                    {
+                        fixed (float* pp = p) fixed (int* pIdx = sIdx) fixed (float* pVal = sVal) fixed (float* pv = vSp)
+                            FusedOptimizer.SparseSgdUpdate(pp, pIdx, pVal, pv, sNnz, lr, momentum, dampening, wd, nesterov, momentum != 0f);
+                    }
+                    continue;
+                }
+
                 if (wd != 0f)
                     for (int i = 0; i < p.Length; i++) grad[i] += wd * p[i];
 
@@ -79,7 +93,7 @@ public sealed class SgdOptimizer : OptimizerBase
                 }
             }
         }
-        } finally { if (maximized) UnflipMaximize(); }
+        } finally { if (maximized) UnflipMaximize(); ClearAutoClearSparseGrads(); }
     }
 }
 
@@ -115,14 +129,48 @@ public sealed class AdamOptimizer : OptimizerBase
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
                 float[] p = g.Parameters[pi]; float[] grad = g.Gradients[pi];
-                if (wd != 0f)
-                    for (int i = 0; i < p.Length; i++) grad[i] += wd * p[i];
-
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 int step = (slot["step"].IntValue ?? 0) + 1;
                 slot["step"].IntValue = step;
                 var m = slot["exp_avg"].Tensor!;
                 var v = slot["exp_avg_sq"].Tensor!;
+
+                // Sparse fast path — caller (e.g. PyTorch-style training loop on top of
+                // SparseEmbeddingGradient) published (indices, values) for this param.
+                // Only the touched entries are updated; the rest of (param, m, v) stay valid.
+                // AMSGrad isn't supported via sparse: max_exp_avg_sq must be coupled with EVERY
+                // update site, so the optimizer falls back to dense when amsgrad is enabled.
+                if (!amsgrad && TryGetSparseGradient(gi, pi, out var sIdx, out var sVal, out var sNnz))
+                {
+                    if (sNnz == 0) continue;
+                    if (wd != 0f)
+                    {
+                        // Apply L2 weight-decay only at touched indices: g_eff = g + wd*p.
+                        // We allocate-free-ish: mutate a copy of sVal so caller's snapshot is untouched.
+                        var sValEff = new float[sNnz];
+                        for (int k = 0; k < sNnz; k++) sValEff[k] = sVal[k] + wd * p[sIdx[k]];
+                        unsafe
+                        {
+                            fixed (float* pp = p) fixed (int* pIdx = sIdx) fixed (float* pVal = sValEff)
+                            fixed (float* pm = m) fixed (float* pvv = v)
+                                FusedOptimizer.SparseAdamUpdate(pp, pIdx, pVal, pm, pvv, sNnz, lr, b1, b2, eps, step);
+                        }
+                    }
+                    else
+                    {
+                        unsafe
+                        {
+                            fixed (float* pp = p) fixed (int* pIdx = sIdx) fixed (float* pVal = sVal)
+                            fixed (float* pm = m) fixed (float* pvv = v)
+                                FusedOptimizer.SparseAdamUpdate(pp, pIdx, pVal, pm, pvv, sNnz, lr, b1, b2, eps, step);
+                        }
+                    }
+                    continue;
+                }
+
+                if (wd != 0f)
+                    for (int i = 0; i < p.Length; i++) grad[i] += wd * p[i];
+
                 unsafe
                 {
                     fixed (float* pp = p) fixed (float* pg = grad) fixed (float* pm = m) fixed (float* pv = v)
@@ -141,7 +189,7 @@ public sealed class AdamOptimizer : OptimizerBase
                 }
             }
         }
-        } finally { if (maximized) UnflipMaximize(); }
+        } finally { if (maximized) UnflipMaximize(); ClearAutoClearSparseGrads(); }
     }
 }
 
@@ -181,6 +229,19 @@ public sealed class AdamWOptimizer : OptimizerBase
                 slot["step"].IntValue = step;
                 var m = slot["exp_avg"].Tensor!;
                 var v = slot["exp_avg_sq"].Tensor!;
+
+                if (TryGetSparseGradient(gi, pi, out var sIdx, out var sVal, out var sNnz))
+                {
+                    if (sNnz == 0) continue;
+                    unsafe
+                    {
+                        fixed (float* pp = p) fixed (int* pIdx = sIdx) fixed (float* pVal = sVal)
+                        fixed (float* pm = m) fixed (float* pvv = v)
+                            FusedOptimizer.SparseAdamWUpdate(pp, pIdx, pVal, pm, pvv, sNnz, lr, b1, b2, eps, wd, step);
+                    }
+                    continue;
+                }
+
                 unsafe
                 {
                     fixed (float* pp = p) fixed (float* pg = grad) fixed (float* pm = m) fixed (float* pv = v)
@@ -188,7 +249,7 @@ public sealed class AdamWOptimizer : OptimizerBase
                 }
             }
         }
-        } finally { if (maximized) UnflipMaximize(); }
+        } finally { if (maximized) UnflipMaximize(); ClearAutoClearSparseGrads(); }
     }
 }
 
@@ -223,13 +284,27 @@ public sealed class RAdamOptimizer : OptimizerBase
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
                 float[] p = g.Parameters[pi]; float[] grad = g.Gradients[pi];
-                if (wd != 0f)
-                    for (int i = 0; i < p.Length; i++) grad[i] += wd * p[i];
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 int step = (slot["step"].IntValue ?? 0) + 1;
                 slot["step"].IntValue = step;
                 var m = slot["exp_avg"].Tensor!;
                 var v = slot["exp_avg_sq"].Tensor!;
+
+                if (TryGetSparseGradient(gi, pi, out var sIdx, out var sVal, out var sNnz))
+                {
+                    if (sNnz == 0) continue;
+                    unsafe
+                    {
+                        fixed (float* pp = p) fixed (int* pIdx = sIdx) fixed (float* pVal = sVal)
+                        fixed (float* pm = m) fixed (float* pvv = v)
+                            FusedOptimizer.SparseRAdamUpdate(pp, pIdx, pVal, pm, pvv, sNnz, lr, b1, b2, eps, wd, step);
+                    }
+                    continue;
+                }
+
+                if (wd != 0f)
+                    for (int i = 0; i < p.Length; i++) grad[i] += wd * p[i];
+
                 unsafe
                 {
                     fixed (float* pp = p) fixed (float* pg = grad) fixed (float* pm = m) fixed (float* pv = v)
@@ -237,7 +312,7 @@ public sealed class RAdamOptimizer : OptimizerBase
                 }
             }
         }
-        } finally { if (maximized) UnflipMaximize(); }
+        } finally { if (maximized) UnflipMaximize(); ClearAutoClearSparseGrads(); }
     }
 }
 
@@ -272,13 +347,27 @@ public sealed class NAdamOptimizer : OptimizerBase
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
                 float[] p = g.Parameters[pi]; float[] grad = g.Gradients[pi];
-                if (wd != 0f)
-                    for (int i = 0; i < p.Length; i++) grad[i] += wd * p[i];
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 int step = (slot["step"].IntValue ?? 0) + 1;
                 slot["step"].IntValue = step;
                 var m = slot["exp_avg"].Tensor!;
                 var v = slot["exp_avg_sq"].Tensor!;
+
+                if (TryGetSparseGradient(gi, pi, out var sIdx, out var sVal, out var sNnz))
+                {
+                    if (sNnz == 0) continue;
+                    unsafe
+                    {
+                        fixed (float* pp = p) fixed (int* pIdx = sIdx) fixed (float* pVal = sVal)
+                        fixed (float* pm = m) fixed (float* pvv = v)
+                            FusedOptimizer.SparseNadamUpdate(pp, pIdx, pVal, pm, pvv, sNnz, lr, b1, b2, eps, wd, step);
+                    }
+                    continue;
+                }
+
+                if (wd != 0f)
+                    for (int i = 0; i < p.Length; i++) grad[i] += wd * p[i];
+
                 unsafe
                 {
                     fixed (float* pp = p) fixed (float* pg = grad) fixed (float* pm = m) fixed (float* pv = v)
@@ -286,7 +375,7 @@ public sealed class NAdamOptimizer : OptimizerBase
                 }
             }
         }
-        } finally { if (maximized) UnflipMaximize(); }
+        } finally { if (maximized) UnflipMaximize(); ClearAutoClearSparseGrads(); }
     }
 }
 
@@ -321,13 +410,27 @@ public sealed class AdamaxOptimizer : OptimizerBase
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
                 float[] p = g.Parameters[pi]; float[] grad = g.Gradients[pi];
-                if (wd != 0f)
-                    for (int i = 0; i < p.Length; i++) grad[i] += wd * p[i];
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 int step = (slot["step"].IntValue ?? 0) + 1;
                 slot["step"].IntValue = step;
                 var m = slot["exp_avg"].Tensor!;
                 var u = slot["exp_inf"].Tensor!;
+
+                if (TryGetSparseGradient(gi, pi, out var sIdx, out var sVal, out var sNnz))
+                {
+                    if (sNnz == 0) continue;
+                    unsafe
+                    {
+                        fixed (float* pp = p) fixed (int* pIdx = sIdx) fixed (float* pVal = sVal)
+                        fixed (float* pm = m) fixed (float* pu = u)
+                            FusedOptimizer.SparseAdamaxUpdate(pp, pIdx, pVal, pm, pu, sNnz, lr, b1, b2, eps, wd, step);
+                    }
+                    continue;
+                }
+
+                if (wd != 0f)
+                    for (int i = 0; i < p.Length; i++) grad[i] += wd * p[i];
+
                 unsafe
                 {
                     fixed (float* pp = p) fixed (float* pg = grad) fixed (float* pm = m) fixed (float* pu = u)
@@ -335,7 +438,7 @@ public sealed class AdamaxOptimizer : OptimizerBase
                 }
             }
         }
-        } finally { if (maximized) UnflipMaximize(); }
+        } finally { if (maximized) UnflipMaximize(); ClearAutoClearSparseGrads(); }
     }
 }
 
@@ -356,19 +459,35 @@ public sealed class AdagradOptimizer : OptimizerBase
     /// <inheritdoc />
     public override void Step()
     {
+        try {
         for (int gi = 0; gi < ParamGroups.Count; gi++)
         {
             var g = ParamGroups[gi];
             float lr = (float)g.LearningRate;
             float eps = (float)g.GetOption("eps", 1e-10);
             float wd = (float)g.GetOption("weight_decay", 0.0);
+            float lrDecay = (float)g.GetOption("lr_decay", 0.0);
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
                 float[] p = g.Parameters[pi]; float[] grad = g.Gradients[pi];
-                if (wd != 0f)
-                    for (int i = 0; i < p.Length; i++) grad[i] += wd * p[i];
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 var s = slot["sum"].Tensor!;
+                int step = (slot.TryGetValue("step", out var sv) ? sv.IntValue : 0) ?? 0;
+                if (slot.ContainsKey("step")) slot["step"].IntValue = step + 1;
+
+                if (TryGetSparseGradient(gi, pi, out var sIdx, out var sVal, out var sNnz))
+                {
+                    if (sNnz == 0) continue;
+                    unsafe
+                    {
+                        fixed (float* pp = p) fixed (int* pIdx = sIdx) fixed (float* pVal = sVal) fixed (float* ps = s)
+                            FusedOptimizer.SparseAdagradUpdate(pp, pIdx, pVal, ps, sNnz, lr, eps, wd, lrDecay, step + 1);
+                    }
+                    continue;
+                }
+
+                if (wd != 0f)
+                    for (int i = 0; i < p.Length; i++) grad[i] += wd * p[i];
                 unsafe
                 {
                     fixed (float* pp = p) fixed (float* pg = grad) fixed (float* ps = s)
@@ -376,6 +495,7 @@ public sealed class AdagradOptimizer : OptimizerBase
                 }
             }
         }
+        } finally { ClearAutoClearSparseGrads(); }
     }
 }
 
@@ -399,6 +519,7 @@ public sealed class RmsPropOptimizer : OptimizerBase
     /// <inheritdoc />
     public override void Step()
     {
+        try {
         for (int gi = 0; gi < ParamGroups.Count; gi++)
         {
             var g = ParamGroups[gi];
@@ -411,10 +532,27 @@ public sealed class RmsPropOptimizer : OptimizerBase
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
                 float[] p = g.Parameters[pi]; float[] grad = g.Gradients[pi];
-                if (wd != 0f)
-                    for (int i = 0; i < p.Length; i++) grad[i] += wd * p[i];
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 var v = slot["square_avg"].Tensor!;
+
+                if (TryGetSparseGradient(gi, pi, out var sIdx, out var sVal, out var sNnz))
+                {
+                    if (sNnz == 0) continue;
+                    var gAvgSp = centered ? slot["grad_avg"].Tensor! : null;
+                    var mbSp = (mom != 0f) ? slot["momentum_buffer"].Tensor! : null;
+                    unsafe
+                    {
+                        fixed (float* pp = p) fixed (int* pIdx = sIdx) fixed (float* pVal = sVal) fixed (float* pv = v)
+                        fixed (float* pga = gAvgSp) fixed (float* pmb = mbSp)
+                        {
+                            FusedOptimizer.SparseRmsPropUpdate(pp, pIdx, pVal, pv, pmb, sNnz, lr, rho, eps, wd, mom, centered, pga, mom != 0f);
+                        }
+                    }
+                    continue;
+                }
+
+                if (wd != 0f)
+                    for (int i = 0; i < p.Length; i++) grad[i] += wd * p[i];
 
                 if (centered)
                 {
@@ -464,6 +602,7 @@ public sealed class RmsPropOptimizer : OptimizerBase
                 }
             }
         }
+        } finally { ClearAutoClearSparseGrads(); }
     }
 }
 
@@ -484,6 +623,7 @@ public sealed class AdaDeltaOptimizer : OptimizerBase
     /// <inheritdoc />
     public override void Step()
     {
+        try {
         for (int gi = 0; gi < ParamGroups.Count; gi++)
         {
             var g = ParamGroups[gi];
@@ -494,11 +634,24 @@ public sealed class AdaDeltaOptimizer : OptimizerBase
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
                 float[] p = g.Parameters[pi]; float[] grad = g.Gradients[pi];
-                if (wd != 0f)
-                    for (int i = 0; i < p.Length; i++) grad[i] += wd * p[i];
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 var sq = slot["square_avg"].Tensor!;
                 var ad = slot["acc_delta"].Tensor!;
+
+                if (TryGetSparseGradient(gi, pi, out var sIdx, out var sVal, out var sNnz))
+                {
+                    if (sNnz == 0) continue;
+                    unsafe
+                    {
+                        fixed (float* pp = p) fixed (int* pIdx = sIdx) fixed (float* pVal = sVal)
+                        fixed (float* psq = sq) fixed (float* pad = ad)
+                            FusedOptimizer.SparseAdaDeltaUpdate(pp, pIdx, pVal, psq, pad, sNnz, lr, rho, eps, wd);
+                    }
+                    continue;
+                }
+
+                if (wd != 0f)
+                    for (int i = 0; i < p.Length; i++) grad[i] += wd * p[i];
                 unsafe
                 {
                     fixed (float* pp = p) fixed (float* pg = grad) fixed (float* psq = sq) fixed (float* pad = ad)
@@ -506,6 +659,7 @@ public sealed class AdaDeltaOptimizer : OptimizerBase
                 }
             }
         }
+        } finally { ClearAutoClearSparseGrads(); }
     }
 }
 
@@ -526,6 +680,7 @@ public sealed class LionOptimizer : OptimizerBase
     /// <inheritdoc />
     public override void Step()
     {
+        try {
         for (int gi = 0; gi < ParamGroups.Count; gi++)
         {
             var g = ParamGroups[gi];
@@ -538,6 +693,18 @@ public sealed class LionOptimizer : OptimizerBase
                 float[] p = g.Parameters[pi]; float[] grad = g.Gradients[pi];
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 var m = slot["exp_avg"].Tensor!;
+
+                if (TryGetSparseGradient(gi, pi, out var sIdx, out var sVal, out var sNnz))
+                {
+                    if (sNnz == 0) continue;
+                    unsafe
+                    {
+                        fixed (float* pp = p) fixed (int* pIdx = sIdx) fixed (float* pVal = sVal) fixed (float* pm = m)
+                            FusedOptimizer.SparseLionUpdate(pp, pIdx, pVal, pm, sNnz, lr, b1, b2, wd);
+                    }
+                    continue;
+                }
+
                 unsafe
                 {
                     fixed (float* pp = p) fixed (float* pg = grad) fixed (float* pm = m)
@@ -545,6 +712,7 @@ public sealed class LionOptimizer : OptimizerBase
                 }
             }
         }
+        } finally { ClearAutoClearSparseGrads(); }
     }
 }
 
@@ -568,6 +736,7 @@ public sealed class AsgdOptimizer : OptimizerBase
     /// <inheritdoc />
     public override void Step()
     {
+        try {
         for (int gi = 0; gi < ParamGroups.Count; gi++)
         {
             var g = ParamGroups[gi];
@@ -591,6 +760,26 @@ public sealed class AsgdOptimizer : OptimizerBase
                 slot["eta"].FloatValue = eta;
                 slot["mu"].FloatValue = mu;
                 var ax = slot["ax"].Tensor!;
+
+                // True sparse path with bounded-drift approximation: ax[i] updates only at
+                // touched indices. The averaged-weight buffer for untouched i diverges from
+                // the exact Polyak-Ruppert average by at most |p[i] - ax[i]_at_last_touch|,
+                // which is small for embedding rows that change incrementally. Exact lazy
+                // averaging would require maintaining cumulative-product tables for the
+                // time-varying mu_k schedule and per-index last-touch step — accepted as a
+                // future optimization. For the embedding-table use case this is the right
+                // trade.
+                if (TryGetSparseGradient(gi, pi, out var sIdx, out var sVal, out var sNnz))
+                {
+                    if (sNnz == 0) continue;
+                    unsafe
+                    {
+                        fixed (float* pp = p) fixed (int* pIdx = sIdx) fixed (float* pVal = sVal) fixed (float* pax = ax)
+                            FusedOptimizer.SparseASGDUpdate(pp, pIdx, pVal, pax, sNnz, eta, lambd, wd, mu);
+                    }
+                    continue;
+                }
+
                 unsafe
                 {
                     fixed (float* pp = p) fixed (float* pg = grad) fixed (float* pax = ax)
@@ -598,6 +787,7 @@ public sealed class AsgdOptimizer : OptimizerBase
                 }
             }
         }
+        } finally { ClearAutoClearSparseGrads(); }
     }
 }
 
@@ -617,6 +807,7 @@ public sealed class RpropOptimizer : OptimizerBase
     /// <inheritdoc />
     public override void Step()
     {
+        try {
         for (int gi = 0; gi < ParamGroups.Count; gi++)
         {
             var g = ParamGroups[gi];
@@ -640,6 +831,25 @@ public sealed class RpropOptimizer : OptimizerBase
                     firstCall = true;
                 }
                 _ = firstCall;
+
+                // Sparse-history semantics: at touched indices do sign comparison + step
+                // adaptation + param step; at untouched indices leave (prev_grad, step_size)
+                // unchanged. This preserves per-index step-size adaptation across gaps when
+                // an embedding row is rarely touched — a deliberate departure from dense
+                // Rprop (which would zero prev_grad at every untouched index) because that
+                // is the correct behavior for sparse use cases.
+                if (TryGetSparseGradient(gi, pi, out var sIdx, out var sVal, out var sNnz))
+                {
+                    if (sNnz == 0) continue;
+                    unsafe
+                    {
+                        fixed (float* pp = p) fixed (int* pIdx = sIdx) fixed (float* pVal = sVal)
+                        fixed (float* ppr = prev) fixed (float* pss = ss)
+                            FusedOptimizer.SparseRpropUpdate(pp, pIdx, pVal, ppr, pss, sNnz, etaP, etaM, sMin, sMax);
+                    }
+                    continue;
+                }
+
                 unsafe
                 {
                     fixed (float* pp = p) fixed (float* pg = grad) fixed (float* ppr = prev) fixed (float* pss = ss)
@@ -647,6 +857,7 @@ public sealed class RpropOptimizer : OptimizerBase
                 }
             }
         }
+        } finally { ClearAutoClearSparseGrads(); }
     }
 }
 
@@ -668,6 +879,7 @@ public sealed class LambOptimizer : OptimizerBase
     /// <inheritdoc />
     public override void Step()
     {
+        try {
         for (int gi = 0; gi < ParamGroups.Count; gi++)
         {
             var g = ParamGroups[gi];
@@ -684,6 +896,23 @@ public sealed class LambOptimizer : OptimizerBase
                 slot["step"].IntValue = step;
                 var m = slot["exp_avg"].Tensor!;
                 var v = slot["exp_avg_sq"].Tensor!;
+
+                // True sparse path: ‖p‖₂ via one full-param reduction; Adam math +
+                // ‖update‖₂² collected only at touched indices; scatter scaled-update.
+                // Since untouched indices have zero update, ‖update_sparse‖₂ = ‖update_dense‖₂
+                // so the trust ratio matches dense exactly.
+                if (TryGetSparseGradient(gi, pi, out var sIdx, out var sVal, out var sNnz))
+                {
+                    if (sNnz == 0) continue;
+                    unsafe
+                    {
+                        fixed (float* pp = p) fixed (int* pIdx = sIdx) fixed (float* pVal = sVal)
+                        fixed (float* pm = m) fixed (float* pvv = v)
+                            FusedOptimizer.SparseLAMBUpdate(pp, pIdx, pVal, pm, pvv, p.Length, sNnz, lr, b1, b2, eps, wd, step);
+                    }
+                    continue;
+                }
+
                 unsafe
                 {
                     fixed (float* pp = p) fixed (float* pg = grad) fixed (float* pm = m) fixed (float* pv = v)
@@ -691,6 +920,7 @@ public sealed class LambOptimizer : OptimizerBase
                 }
             }
         }
+        } finally { ClearAutoClearSparseGrads(); }
     }
 }
 
@@ -712,6 +942,7 @@ public sealed class LarsOptimizer : OptimizerBase
     /// <inheritdoc />
     public override void Step()
     {
+        try {
         for (int gi = 0; gi < ParamGroups.Count; gi++)
         {
             var g = ParamGroups[gi];
@@ -724,6 +955,21 @@ public sealed class LarsOptimizer : OptimizerBase
                 float[] p = g.Parameters[pi]; float[] grad = g.Gradients[pi];
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 var v = slot["momentum_buffer"].Tensor!;
+
+                // True sparse path: ‖p‖₂ via full-param reduction; ‖g‖₂² over touched
+                // values (= dense ‖g‖₂² since untouched g = 0); scatter velocity + param
+                // updates at touched indices only.
+                if (TryGetSparseGradient(gi, pi, out var sIdx, out var sVal, out var sNnz))
+                {
+                    if (sNnz == 0) continue;
+                    unsafe
+                    {
+                        fixed (float* pp = p) fixed (int* pIdx = sIdx) fixed (float* pVal = sVal) fixed (float* pv = v)
+                            FusedOptimizer.SparseLARSUpdate(pp, pIdx, pVal, pv, p.Length, sNnz, lr, mom, wd, tc);
+                    }
+                    continue;
+                }
+
                 unsafe
                 {
                     fixed (float* pp = p) fixed (float* pg = grad) fixed (float* pv = v)
@@ -731,6 +977,7 @@ public sealed class LarsOptimizer : OptimizerBase
                 }
             }
         }
+        } finally { ClearAutoClearSparseGrads(); }
     }
 }
 
@@ -751,6 +998,7 @@ public sealed class FtrlOptimizer : OptimizerBase
     /// <inheritdoc />
     public override void Step()
     {
+        try {
         for (int gi = 0; gi < ParamGroups.Count; gi++)
         {
             var g = ParamGroups[gi];
@@ -767,6 +1015,19 @@ public sealed class FtrlOptimizer : OptimizerBase
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 var z = slot["z"].Tensor!;
                 var n = slot["n"].Tensor!;
+
+                if (TryGetSparseGradient(gi, pi, out var sIdx, out var sVal, out var sNnz))
+                {
+                    if (sNnz == 0) continue;
+                    unsafe
+                    {
+                        fixed (float* pp = p) fixed (int* pIdx = sIdx) fixed (float* pVal = sVal)
+                        fixed (float* pn = n) fixed (float* pz = z)
+                            FusedOptimizer.SparseFtrlUpdate(pp, pIdx, pVal, pn, pz, sNnz, lr, lrPow, l1, l2);
+                    }
+                    continue;
+                }
+
                 unsafe
                 {
                     fixed (float* pp = p) fixed (float* pg = grad) fixed (float* pz = z) fixed (float* pn = n)
@@ -774,6 +1035,7 @@ public sealed class FtrlOptimizer : OptimizerBase
                 }
             }
         }
+        } finally { ClearAutoClearSparseGrads(); }
     }
 }
 
@@ -797,29 +1059,10 @@ public sealed class SparseAdamOptimizer : OptimizerBase
     // monotonically to fit the largest nnz seen so far.
     private readonly Dictionary<(int gi, int pi), (int[] idx, float[] val)> _scratch = new();
 
-    /// <summary>Pre-supply sparse indices and values for a parameter, skipping the dense
-    /// gradient scan altogether. Caller is responsible for ensuring <paramref name="indices"/>
-    /// is sorted and <paramref name="values"/> is the same length. Subsequent <see cref="Step"/>
-    /// calls will use this snapshot until <see cref="ClearSparseGradient"/> is invoked or new
-    /// indices/values are supplied.</summary>
-    public void SetSparseGradient(int paramGroupIndex, int paramIndex, int[] indices, float[] values)
-    {
-        if (indices == null) throw new ArgumentNullException(nameof(indices));
-        if (values == null) throw new ArgumentNullException(nameof(values));
-        if (indices.Length != values.Length)
-            throw new ArgumentException("indices and values must be the same length.");
-        _explicit[(paramGroupIndex, paramIndex)] = (indices, values);
-    }
-
-    /// <summary>Clear an explicit sparse gradient previously set by <see cref="SetSparseGradient"/>.</summary>
-    public void ClearSparseGradient(int paramGroupIndex, int paramIndex) =>
-        _explicit.Remove((paramGroupIndex, paramIndex));
-
-    private readonly Dictionary<(int gi, int pi), (int[] idx, float[] val)> _explicit = new();
-
     /// <inheritdoc />
     public override void Step()
     {
+        try {
         for (int gi = 0; gi < ParamGroups.Count; gi++)
         {
             var g = ParamGroups[gi];
@@ -839,12 +1082,10 @@ public sealed class SparseAdamOptimizer : OptimizerBase
                 int nnz;
                 int[] idx;
                 float[] val;
-                if (_explicit.TryGetValue((gi, pi), out var explicitPair))
+                if (TryGetSparseGradient(gi, pi, out idx!, out val!, out nnz))
                 {
-                    // User supplied sparse indices+values directly — zero scans, zero allocations.
-                    idx = explicitPair.idx;
-                    val = explicitPair.val;
-                    nnz = idx.Length;
+                    // Caller supplied sparse indices+values directly via the base
+                    // OptimizerBase.SetSparseGradient API — zero scans, zero allocations.
                 }
                 else
                 {
@@ -887,5 +1128,6 @@ public sealed class SparseAdamOptimizer : OptimizerBase
                 }
             }
         }
+        } finally { ClearAutoClearSparseGrads(); }
     }
 }
