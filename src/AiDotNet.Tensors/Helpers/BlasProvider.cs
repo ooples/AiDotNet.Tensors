@@ -120,7 +120,25 @@ internal static class BlasProvider
         lock (_openblasScopeLock)
         {
             if (_openblasThreadCount == n) return;
-            try { openblas_set_num_threads_native(n); _openblasThreadCount = n; }
+            // CRITICAL: openblas_set_num_threads reconfigures OpenBLAS's internal thread
+            // pool / scratch buffers. Calling it CONCURRENTLY with an in-flight cblas_*gemm
+            // corrupts that state -> native access violation (0xC0000005). The GEMM entry
+            // points serialize on _nativeGemmGate, NOT _openblasScopeLock, so we must take
+            // _nativeGemmGate here too — otherwise a ScopeOpenBlasThreads on one thread
+            // races a GEMM on another (the residual full-suite crash). Lock order is always
+            // _openblasScopeLock -> _nativeGemmGate (GEMM paths take only _nativeGemmGate),
+            // so no deadlock.
+            try
+            {
+                // Run on the dedicated BLAS thread (same thread that runs every gemm) so
+                // OpenBLAS's thread-pool reconfiguration happens on its single caller and
+                // can't race a gemm. See the _blasThread / DispatchSetThreads notes.
+                lock (_nativeGemmGate)
+                {
+                    DispatchSetThreads(n);
+                }
+                _openblasThreadCount = n;
+            }
             catch { /* libopenblas symbol missing — earlier OpenBLAS builds may lack it. Tolerate. */ }
         }
     }
@@ -659,8 +677,14 @@ internal static class BlasProvider
             var a = new float[] { 2.0f };
             var b = new float[] { 3.0f };
             var c = new float[] { 0.0f };
-            cblas_sgemm_native(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                1, 1, 1, 1.0f, a, 1, b, 1, 0.0f, c, 1);
+            // Run the probe on the dedicated BLAS thread too, so OpenBLAS's very first
+            // call comes from the same single thread that runs every later gemm.
+            unsafe
+            {
+                fixed (float* pa = a) fixed (float* pb = b) fixed (float* pc = c)
+                    lock (_nativeGemmGate)
+                        DispatchSgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, 1, 1, 1, 1.0f, pa, 1, pb, 1, 0.0f, pc, 1);
+            }
             if (c[0] == 6.0f) return true;
             _loadError = $"native CPU BLAS loaded but returned an incorrect result for the 1x1 probe GEMM (expected 6.0, got {c[0]}) — the library may be corrupt or ABI-incompatible";
             return false;
@@ -1172,22 +1196,123 @@ internal static class BlasProvider
     // DgemmRaw) always use the BLOCKING wrappers regardless of mode — BlasManaged.Gemm
     // computes only C:=A·B (no α/β), so there's no one-line managed fallback for them.
     // They're conv/backward (training) paths, not the inference forward hot path.
-    private static readonly object _nativeGemmGate = new();
+    // Shared with OneDnnProvider: OpenBLAS GEMM and oneDNN primitive execute must never
+    // run concurrently (they fight over each other's OpenMP/threadpool runtime → native
+    // access violation). See NativeComputeGate.
+    private static readonly object _nativeGemmGate = NativeComputeGate.Instance;
+
+    // ── OpenBLAS is driven from a SINGLE dedicated thread. ─────────────────────
+    // OpenBLAS keeps a FIXED-SIZE per-CALLING-THREAD scratch-buffer table (size =
+    // its compile-time NUM_THREADS). When it is called from more DISTINCT threads
+    // than that over the process lifetime — exactly what an xUnit run with hundreds
+    // of churning thread-pool threads does — the table overflows and OpenBLAS writes
+    // out of bounds → native access violation (0xC0000005) that kills the process.
+    // Serializing entry (_nativeGemmGate) bounds CONCURRENCY but not the NUMBER of
+    // distinct callers, so it alone does not prevent the crash. Confining every
+    // native cblas / openblas_set_num_threads / probe call to one long-lived thread
+    // means OpenBLAS only ever sees a single caller → one buffer slot → no overflow.
+    // Native GEMM was already serialized via the gate, so this costs no throughput.
+    // Callers hold _nativeGemmGate across the handoff, so the static job fields and
+    // the two semaphores are accessed serially (max count 1 each).
+    private enum BlasJobKind { Sgemm, Dgemm, SetThreads }
+    private static BlasJobKind _blasJobKind;
+    private static int _bOrder, _bTransA, _bTransB, _bM, _bN, _bK, _bLda, _bLdb, _bLdc, _bThreads;
+    private static IntPtr _bA, _bB, _bC;
+    private static float _bAlphaF, _bBetaF;
+    private static double _bAlphaD, _bBetaD;
+    private static Exception? _blasError;
+    private static readonly System.Threading.SemaphoreSlim _blasWork = new(0, 1);
+    private static readonly System.Threading.SemaphoreSlim _blasDone = new(0, 1);
+    private static readonly System.Threading.Thread _blasThread = StartBlasThread();
+
+    private static System.Threading.Thread StartBlasThread()
+    {
+        var t = new System.Threading.Thread(BlasThreadLoop)
+        {
+            IsBackground = true,
+            Name = "AiDotNet-OpenBLAS",
+        };
+        t.Start();
+        return t;
+    }
+
+    private static unsafe void BlasThreadLoop()
+    {
+        while (true)
+        {
+            _blasWork.Wait();
+            _blasError = null;
+            try
+            {
+                switch (_blasJobKind)
+                {
+                    case BlasJobKind.Sgemm:
+                        cblas_sgemm_native(_bOrder, _bTransA, _bTransB, _bM, _bN, _bK,
+                            _bAlphaF, (float*)_bA, _bLda, (float*)_bB, _bLdb, _bBetaF, (float*)_bC, _bLdc);
+                        break;
+                    case BlasJobKind.Dgemm:
+                        cblas_dgemm_native(_bOrder, _bTransA, _bTransB, _bM, _bN, _bK,
+                            _bAlphaD, (double*)_bA, _bLda, (double*)_bB, _bLdb, _bBetaD, (double*)_bC, _bLdc);
+                        break;
+                    case BlasJobKind.SetThreads:
+                        openblas_set_num_threads_native(_bThreads);
+                        break;
+                }
+            }
+            catch (Exception ex) { _blasError = ex; }
+            finally { _blasDone.Release(); }
+        }
+    }
+
+    // Run a native OpenBLAS sgemm on the dedicated BLAS thread and block until done.
+    // MUST be called while holding _nativeGemmGate. The caller's enclosing `fixed`
+    // block keeps a/b/c pinned for the whole wait, so the BLAS thread's pointers stay valid.
+    private static unsafe void DispatchSgemm(int order, int transA, int transB, int m, int n, int k,
+        float alpha, float* a, int lda, float* b, int ldb, float beta, float* c, int ldc)
+    {
+        _blasJobKind = BlasJobKind.Sgemm;
+        _bOrder = order; _bTransA = transA; _bTransB = transB; _bM = m; _bN = n; _bK = k;
+        _bAlphaF = alpha; _bA = (IntPtr)a; _bLda = lda; _bB = (IntPtr)b; _bLdb = ldb; _bBetaF = beta; _bC = (IntPtr)c; _bLdc = ldc;
+        _blasWork.Release();
+        _blasDone.Wait();
+        if (_blasError is not null) { var e = _blasError; _blasError = null; throw e; }
+    }
+
+    private static unsafe void DispatchDgemm(int order, int transA, int transB, int m, int n, int k,
+        double alpha, double* a, int lda, double* b, int ldb, double beta, double* c, int ldc)
+    {
+        _blasJobKind = BlasJobKind.Dgemm;
+        _bOrder = order; _bTransA = transA; _bTransB = transB; _bM = m; _bN = n; _bK = k;
+        _bAlphaD = alpha; _bA = (IntPtr)a; _bLda = lda; _bB = (IntPtr)b; _bLdb = ldb; _bBetaD = beta; _bC = (IntPtr)c; _bLdc = ldc;
+        _blasWork.Release();
+        _blasDone.Wait();
+        if (_blasError is not null) { var e = _blasError; _blasError = null; throw e; }
+    }
+
+    // Run openblas_set_num_threads on the dedicated BLAS thread. MUST hold _nativeGemmGate.
+    private static void DispatchSetThreads(int threads)
+    {
+        _blasJobKind = BlasJobKind.SetThreads;
+        _bThreads = threads;
+        _blasWork.Release();
+        _blasDone.Wait();
+        if (_blasError is not null) { var e = _blasError; _blasError = null; throw e; }
+    }
 
     // Blocking-gated wrappers carrying the historical cblas_*gemm_ptr names. Used by the
     // deterministic-mode hot paths and the α/β + raw paths (which have no managed
     // fallback). The non-deterministic hot paths instead TryEnter _nativeGemmGate
-    // themselves and call cblas_*gemm_native directly, so they never double-acquire.
+    // themselves and dispatch to the BLAS thread, so they never double-acquire.
     [MethodImpl(MethodImplOptions.NoInlining)]
     private static unsafe void cblas_sgemm_ptr(
         int order, int transA, int transB, int m, int n, int k,
         float alpha, float* a, int lda, float* b, int ldb, float beta, float* c, int ldc)
     {
         // Pointers are pinned by the caller's enclosing `fixed` block, which
-        // encloses this call — the GC can't move the backing arrays for the
-        // call's duration even though the lock is held inside this method.
+        // encloses this call (and the blocking wait below) — the GC can't move the
+        // backing arrays while the dedicated BLAS thread runs the native gemm.
         lock (_nativeGemmGate)
-            cblas_sgemm_native(order, transA, transB, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc);
+            DispatchSgemm(order, transA, transB, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc);
     }
 
     [MethodImpl(MethodImplOptions.NoInlining)]
@@ -1196,7 +1321,7 @@ internal static class BlasProvider
         double alpha, double* a, int lda, double* b, int ldb, double beta, double* c, int ldc)
     {
         lock (_nativeGemmGate)
-            cblas_dgemm_native(order, transA, transB, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc);
+            DispatchDgemm(order, transA, transB, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc);
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -1282,7 +1407,7 @@ internal static class BlasProvider
                         cblas_sgemm_ptr(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                             m, n, k, 1.0f, pa, lda, pb, ldb, 0.0f, pc, ldc);
                     else
-                        cblas_sgemm_native(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                        DispatchSgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                             m, n, k, 1.0f, pa, lda, pb, ldb, 0.0f, pc, ldc);
                 }
             }
@@ -1332,7 +1457,7 @@ internal static class BlasProvider
                         cblas_dgemm_ptr(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                             m, n, k, 1.0, pa, lda, pb, ldb, 0.0, pc, ldc);
                     else
-                        cblas_dgemm_native(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                        DispatchDgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                             m, n, k, 1.0, pa, lda, pb, ldb, 0.0, pc, ldc);
                 }
             }
@@ -1372,7 +1497,7 @@ internal static class BlasProvider
                         cblas_sgemm_ptr(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                             m, n, k, 1.0f, pa, lda, pb, ldb, 0.0f, pc, ldc);
                     else
-                        cblas_sgemm_native(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                        DispatchSgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                             m, n, k, 1.0f, pa, lda, pb, ldb, 0.0f, pc, ldc);
                 }
             }
@@ -1412,7 +1537,7 @@ internal static class BlasProvider
                         cblas_dgemm_ptr(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                             m, n, k, 1.0, pa, lda, pb, ldb, 0.0, pc, ldc);
                     else
-                        cblas_dgemm_native(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                        DispatchDgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                             m, n, k, 1.0, pa, lda, pb, ldb, 0.0, pc, ldc);
                 }
             }
@@ -1518,7 +1643,7 @@ internal static class BlasProvider
                         cblas_sgemm_ptr(CblasRowMajor, cblasTA, cblasTB,
                             m, n, k, 1.0f, pa, lda, pb, ldb, 0.0f, pc, ldc);
                     else
-                        cblas_sgemm_native(CblasRowMajor, cblasTA, cblasTB,
+                        DispatchSgemm(CblasRowMajor, cblasTA, cblasTB,
                             m, n, k, 1.0f, pa, lda, pb, ldb, 0.0f, pc, ldc);
                 }
             }
@@ -1576,7 +1701,7 @@ internal static class BlasProvider
                         cblas_dgemm_ptr(CblasRowMajor, cblasTA, cblasTB,
                             m, n, k, 1.0, pa, lda, pb, ldb, 0.0, pc, ldc);
                     else
-                        cblas_dgemm_native(CblasRowMajor, cblasTA, cblasTB,
+                        DispatchDgemm(CblasRowMajor, cblasTA, cblasTB,
                             m, n, k, 1.0, pa, lda, pb, ldb, 0.0, pc, ldc);
                 }
             }
@@ -1681,17 +1806,22 @@ internal static class BlasProvider
         => DgemmRaw(m, n, k, a, lda, b, ldb, c, ldc);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    internal static void MklSgemmZeroOffset(int m, int n, int k, float[] a, int lda, float[] b, int ldb, float[] c, int ldc)
+    internal static unsafe void MklSgemmZeroOffset(int m, int n, int k, float[] a, int lda, float[] b, int ldb, float[] c, int ldc)
     {
         if (!_nativeAvailable.Value) ThrowDisabled();
-        cblas_sgemm_native(CblasRowMajor, CblasNoTrans, CblasNoTrans, m, n, k, 1.0f, a, lda, b, ldb, 0.0f, c, ldc);
+        // Route through the dedicated BLAS thread (confines OpenBLAS to one caller).
+        fixed (float* pa = a) fixed (float* pb = b) fixed (float* pc = c)
+            lock (_nativeGemmGate)
+                DispatchSgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, m, n, k, 1.0f, pa, lda, pb, ldb, 0.0f, pc, ldc);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    internal static void MklDgemmZeroOffset(int m, int n, int k, double[] a, int lda, double[] b, int ldb, double[] c, int ldc)
+    internal static unsafe void MklDgemmZeroOffset(int m, int n, int k, double[] a, int lda, double[] b, int ldb, double[] c, int ldc)
     {
         if (!_nativeAvailable.Value) ThrowDisabled();
-        cblas_dgemm_native(CblasRowMajor, CblasNoTrans, CblasNoTrans, m, n, k, 1.0, a, lda, b, ldb, 0.0, c, ldc);
+        fixed (double* pa = a) fixed (double* pb = b) fixed (double* pc = c)
+            lock (_nativeGemmGate)
+                DispatchDgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, m, n, k, 1.0, pa, lda, pb, ldb, 0.0, pc, ldc);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
