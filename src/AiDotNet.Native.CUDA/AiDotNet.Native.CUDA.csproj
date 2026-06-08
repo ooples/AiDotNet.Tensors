@@ -3,11 +3,11 @@
   <PropertyGroup>
     <TargetFramework>netstandard2.0</TargetFramework>
     <PackageId>AiDotNet.Native.CUDA</PackageId>
-    <Version>12.4.0</Version>
+    <Version>12.5.0</Version>
     <Authors>AiDotNet Contributors</Authors>
     <Company>AiDotNet</Company>
-    <Description>Native CUDA binaries for NVIDIA GPU-accelerated operations. This package provides cuBLAS libraries required by AiDotNet.Tensors for NVIDIA GPU acceleration.</Description>
-    <PackageTags>cuda;nvidia;gpu;blas;native;cublas</PackageTags>
+    <Description>Native CUDA binaries for NVIDIA GPU-accelerated operations. Provides cuBLAS + the nvRTC runtime kernel compiler required by AiDotNet.Tensors for NVIDIA GPU acceleration (no CUDA Toolkit install needed).</Description>
+    <PackageTags>cuda;nvidia;gpu;blas;native;cublas;nvrtc</PackageTags>
     <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
     <PackageProjectUrl>https://github.com/ooples/AiDotNet.Tensors</PackageProjectUrl>
     <RepositoryUrl>https://github.com/ooples/AiDotNet.Tensors</RepositoryUrl>
@@ -22,19 +22,17 @@
     <ContentTargetFolders>content</ContentTargetFolders>
   </PropertyGroup>
 
-  <!-- Windows x64 native libraries -->
-  <ItemGroup>
-    <None Include="runtimes\win-x64\native\cublas64_12.dll" Pack="true" PackagePath="runtimes\win-x64\native" />
-    <None Include="runtimes\win-x64\native\cublasLt64_12.dll" Pack="true" PackagePath="runtimes\win-x64\native" />
-    <None Include="runtimes\win-x64\native\cudart64_12.dll" Pack="true" PackagePath="runtimes\win-x64\native" />
-  </ItemGroup>
+  <!-- Windows x64 native libraries: cudart, cuBLAS, cuBLASLt, AND nvRTC (+ builtins),
+       staged by tools/stage-cuda-redist.ps1 (gitignored, ~770MB).
 
-  <!-- Future: Linux x64 native libraries -->
-  <!-- <None Include="runtimes\linux-x64\native\libcublas.so.12" Pack="true" PackagePath="runtimes\linux-x64\native" /> -->
-  <!-- <None Include="runtimes\linux-x64\native\libcublasLt.so.12" Pack="true" PackagePath="runtimes\linux-x64\native" /> -->
-  <!-- <None Include="runtimes\linux-x64\native\libcudart.so.12" Pack="true" PackagePath="runtimes\linux-x64\native" /> -->
+       IMPORTANT: this project does NOT pack the DLLs directly — the full runtime is far
+       over nuget.org's 250 MB per-package limit (cuBLAS / cuBLASLt EACH exceed it). The
+       shipped package is produced by tools/pack-cuda-split.ps1, which splits the runtime
+       into <250 MB AiDotNet.Native.CUDA.Fragments.* packages plus a meta package whose
+       build/AiDotNet.Native.CUDA.targets reassembles the DLLs at the consumer's build.
+       The items below only copy the staged DLLs to THIS project's output for local dev. -->
 
-  <!-- Ensure the native libraries are copied to output -->
+  <!-- Ensure the native libraries are copied to output for local development/debugging. -->
   <ItemGroup>
     <None Include="runtimes\**\*.dll" CopyToOutputDirectory="PreserveNewest" Link="%(RecursiveDir)%(Filename)%(Extension)" />
   </ItemGroup>

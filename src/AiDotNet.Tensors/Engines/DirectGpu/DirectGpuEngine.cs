@@ -546,6 +546,32 @@ public sealed class DirectGpuEngine : IDisposable
         // than silently downcasting through the FP32 GPU boundary.
         if (ShouldFallbackForPrecision<T>()) return null;
 
+        // FP16 Tensor-Core fast path (composes with the #557 mixed-precision infra):
+        // a raw Half matmul routes to cublasGemmEx (FP16 multiply / FP32 accumulate)
+        // on the Tensor Cores instead of an FP32-downcast SGEMM. Half is a
+        // reduced-precision type whose whole point is speed, so — unlike double —
+        // the right behaviour is to run it on the GPU, not bail to the CPU. Falls
+        // through to the FP32 path below if the backend has no Hgemm support.
+        if (typeof(T) == typeof(Half)
+            && _backend is AiDotNet.Tensors.Engines.Gpu.IGpuHalfPrecisionBackend halfBackend
+            && halfBackend.SupportsHgemm)
+        {
+            float[] aHalfIn = ToFloatArray(A);
+            float[] bHalfIn = ToFloatArray(B);
+            using var aFp32 = _backend.AllocateBuffer(aHalfIn);
+            using var bFp32 = _backend.AllocateBuffer(bHalfIn);
+            using var aFp16 = _backend.AllocateBuffer(aHalfIn.Length);
+            using var bFp16 = _backend.AllocateBuffer(bHalfIn.Length);
+            _backend.ConvertToFp16(aFp32, aFp16, aHalfIn.Length);
+            _backend.ConvertToFp16(bFp32, bFp16, bHalfIn.Length);
+            using var cHalfOut = _backend.AllocateBuffer(M * N);
+            halfBackend.GemmFp16In32fOut(aFp16, bFp16, cHalfOut, M, N, K);
+            float[] halfResult = _backend.DownloadBuffer(cHalfOut);
+            if (GemmValidateEnabled && IsAnyNonFinite(halfResult, out _))
+                return null;
+            return FromFloatArray<T>(halfResult);
+        }
+
         // Convert to float
         float[] aFloat = ToFloatArray(A);
         float[] bFloat = ToFloatArray(B);

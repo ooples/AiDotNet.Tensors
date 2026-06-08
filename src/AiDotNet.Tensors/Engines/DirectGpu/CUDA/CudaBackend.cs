@@ -17,12 +17,26 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
 public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernels, AiDotNet.Tensors.Engines.Gpu.IGpuHalfPrecisionBackend
 {
+    // During teardown the CUDA driver/context may already be destroyed, so calling driver
+    // APIs (cuCtxPushCurrent / cuMemFree / cuCtxPopCurrent / cuCtxDestroy / cuModuleUnload)
+    // from a finalizer raises an access violation (0xC0000005) — a Corrupted-State
+    // Exception that catch cannot trap and that is fatal on the finalizer thread, killing
+    // the whole process. The OS reclaims device memory + the context at exit anyway.
+    private static bool IsRuntimeTearingDown => RuntimeShutdown.IsTearingDown;
+
     private const int DefaultBlockSize = 256;
     private const int MaxRnnBlockSize = 1024;
     private readonly ConcurrentDictionary<string, IntPtr> _kernelCache;
     private IntPtr _cudaContext;
     private IntPtr _stream;
     private IntPtr _cublasHandle;
+    // Stream-ordered allocator (#558 layer 6): when enabled, device buffers are allocated/freed via
+    // cuMemAllocAsync/cuMemFreeAsync on _stream, so freed memory is reused in stream order without a host
+    // sync (race-free + bounds mid-step peak). Opt-in via AIDOTNET_CUDA_ASYNC_ALLOC; default off.
+    private bool _asyncAlloc;
+    /// <summary>Diagnostic (#558): the nvrtc error if the FP16 kernel module failed to compile (which
+    /// silently disables the whole FP16 GPU path). Null when FP16 compiled successfully.</summary>
+    internal static string? Fp16ModuleCompileError;
     // cuDNN helpers — lazily initialized on first Conv2D call that routes
     // through the cuDNN dispatch path. Kept private so disposal is linked
     // to this backend's lifetime; the helpers' cuDNN handles survive
@@ -76,10 +90,33 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     private IntPtr _audioModule;
     private IntPtr _linalgModule;
     private bool _disposed;
+
+    // Process-exit guard: at process/AppDomain teardown the CUDA driver may already be unloaded, so calling ANY
+    // native CUDA API from a finalizer (CudaGpuBuffer.Release, CudaBackend.Dispose) FATAL-crashes the process — it
+    // is NOT a catchable .NET exception. Skip native cleanup when exiting; the OS reclaims GPU memory on process death.
+    internal static volatile bool ProcessExiting;
+    static CudaBackend()
+    {
+        try
+        {
+            AppDomain.CurrentDomain.ProcessExit += (_, __) => ProcessExiting = true;
+            AppDomain.CurrentDomain.DomainUnload += (_, __) => ProcessExiting = true;
+        }
+        catch { }
+    }
+
     private const int MaxPooledBufferElements = 16_777_216;
     private const int MaxPooledBuffersPerSize = 4;
     private readonly GpuBufferPool<CudaGpuBuffer> _bufferPool =
         new GpuBufferPool<CudaGpuBuffer>(MaxPooledBuffersPerSize, MaxPooledBufferElements);
+    // Event-based deferred buffer free (#555 / #226). A buffer evicted mid-step may still
+    // be referenced by an in-flight async kernel; returning it to the pool (for reuse OR a
+    // real cuMemFree when the bucket is full) before that kernel finishes is the CUDA-700
+    // illegal-access race. Instead we record a lightweight (timing-disabled) event on the
+    // compute stream and hold the buffer in this queue until the event completes — polled
+    // NON-blocking (cuEventQuery) so there is no host stall (unlike a full cuStreamSynchronize).
+    private readonly object _deferredFreeLock = new();
+    private readonly Queue<(IGpuBuffer Buffer, CudaEvent Event)> _deferredFrees = new();
     private bool _supportsCooperativeLaunch;
     private int _multiProcessorCount;
     private readonly CudaPinnedBufferPool _pinnedPool = new();
@@ -237,6 +274,20 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamCreate(out _stream, 0), "cuStreamCreate");
             _defaultStream = new CudaStream(this, _stream, GpuStreamType.Default, ownsHandle: false);
 
+            // Stream-ordered allocator setup (#558 layer 6). Retain freed memory in the pool for reuse
+            // (caching-allocator behaviour) by maxing the release threshold; disable if the pool query
+            // fails (older driver / no pool support) so AllocateBuffer falls back to the sync path.
+            _asyncAlloc = Environment.GetEnvironmentVariable("AIDOTNET_CUDA_ASYNC_ALLOC") == "1";
+            if (_asyncAlloc)
+            {
+                if (CuBlasNative.cuDeviceGetDefaultMemPool(out var memPool, device) == CudaResult.Success)
+                {
+                    ulong threshold = ulong.MaxValue; // CU_MEMPOOL_ATTR_RELEASE_THRESHOLD = 4
+                    CuBlasNative.cuMemPoolSetAttribute(memPool, 4, ref threshold);
+                }
+                else { _asyncAlloc = false; }
+            }
+
             CuBlasNative.CheckCublasStatus(CuBlasNative.cublasCreate(out _cublasHandle), "cublasCreate");
             CuBlasNative.CheckCublasStatus(CuBlasNative.cublasSetStream(_cublasHandle, _stream), "cublasSetStream");
 
@@ -283,6 +334,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             CompileAllKernels(device);
 
             IsAvailable = true;
+
+            // CUDA-graph feasibility/benefit probe (AIDOTNET_CUDA_GRAPH_PROBE=1): capture a pure-GPU op
+            // sequence into a cudaGraph and compare graph-replay vs individual-launch latency. Quantifies
+            // whether capture works on this stream and how much per-launch overhead replay removes — the
+            // evidence basis for the CUDA-graph training-step work. Trace-only; no effect on normal runs.
+            if (Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_PROBE") == "1")
+                RunCudaGraphProbe();
         }
         catch (Exception ex)
         {
@@ -685,6 +743,15 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         // Compile SNN kernels (STDP, spike traces, RBF, PRNG, 2:4 structured sparsity)
         _snnModule = CompileKernelModule(device, CudaSnnKernels.GetSource(), "snn_kernels", CudaSnnKernels.GetKernelNames());
 
+        // Compile GPU-resident optimizer kernels (adam/adamw/sgd/momentum/nag/
+        // adagrad/rmsprop/adadelta/adamax/nadam/lamb/lars/lion/amsgrad/ftrl
+        // *_update). Without this the in-place GPU optimizer step (GpuOptimizer.
+        // TryXStep → IDirectGpuBackend.XUpdate) throws "CUDA kernel not found:
+        // <name>_update" for every kernel that is NOT also duplicated into the
+        // neuralnet module (adam/adagrad/rmsprop/lamb/adamw/sgd/... were dead),
+        // so every optimizer silently fell back to the CPU weight update.
+        CompileKernelModule(device, CudaOptimizerKernels.GetSource(), "optimizer_kernels", CudaOptimizerKernels.GetKernelNames());
+
         // Compile reduction kernels (mean, variance, std, norm, logsumexp, product, cumsum)
         CompileKernelModule(device, CudaReductionKernels.GetSource(), "reduction_kernels", CudaReductionKernels.GetKernelNames());
 
@@ -750,15 +817,23 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         // Compile softmax variant + GEMM extension kernels
         CompileKernelModule(device, CudaSoftmaxVariantKernels.GetSource(), "softmax_variant_kernels", CudaSoftmaxVariantKernels.GetKernelNames());
 
+        // Self-contained FP16 kernels (#558 layer 7): manual IEEE-754 half<->float, NO cuda_fp16.h, so
+        // they compile with the driver alone (the header-based CudaFp16Kernels below silently fails on
+        // driver-only machines). This is the FP16 path that actually works without a CUDA Toolkit.
+        CompileKernelModule(device, Kernels.CudaFp16NativeKernels.GetSource(), "fp16_native_kernels", Kernels.CudaFp16NativeKernels.GetKernelNames());
+
         // Compile FP16 conversion kernels (half-precision float conversion)
         // May fail if NVRTC doesn't have cuda_fp16.h (minimal CUDA Toolkit install).
         try
         {
             _fp16Module = CompileKernelModule(device, CudaFp16Kernels.GetSource(), "fp16_kernels", CudaFp16Kernels.GetKernelNames());
         }
-        catch
+        catch (Exception fp16Ex)
         {
-            // FP16 kernels are optional — fall back to FP32 paths.
+            // FP16 kernels are optional — fall back to FP32 paths. Capture the error: a silent failure
+            // here disables the ENTIRE FP16 GPU path (convert + half activations + Tensor-Core throughput),
+            // which is invisible otherwise (#558). Surfaced via Fp16ModuleCompileError for diagnostics.
+            Fp16ModuleCompileError = fp16Ex.Message;
         }
 
         // Compile LSTM sequence kernels (forward/backward for BPTT training)
@@ -954,7 +1029,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             return pooled;
         }
 
-        CuBlasNative.CheckCudaResult(CuBlasNative.cuMemAlloc(out IntPtr devicePtr, byteSize), "cuMemAlloc");
+        IntPtr devicePtr = AllocDeviceMemoryWithRetry(byteSize);
 
         try
         {
@@ -977,6 +1052,99 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         return new CudaGpuBuffer(_cudaContext, devicePtr, size, _bufferPool.Return);
     }
 
+    /// <summary>
+    /// Race-free deferred free of a GPU buffer (#555). Records a stream event marking the
+    /// buffer's last enqueued use and holds the buffer until that event completes, so it is
+    /// never returned to the pool (and therefore never reused or cuMemFree'd) while an
+    /// in-flight kernel still references it. Non-blocking: drains already-completed deferrals
+    /// each call. Use this instead of <c>buffer.Dispose()</c> for activations freed during a
+    /// training step (the within-step VRAM-pressure offload path).
+    /// </summary>
+    public void FreeBufferDeferred(IGpuBuffer? buffer)
+    {
+        if (buffer == null) return;
+        // Stream-ordered buffers (#558 layer 6): cuMemFreeAsync is already ordered after prior stream
+        // work, so free immediately — deferring via an event would delay pool reclamation and erase the
+        // mid-step reuse that bounds peak. Disposing routes to cuMemFreeAsync (see CudaGpuBuffer.Release).
+        if ((buffer is CudaGpuBuffer cb && cb.IsAsyncFreed) || (buffer is CudaGpuByteBuffer bb && bb.IsAsyncFreed))
+        {
+            buffer.Dispose();
+            return;
+        }
+        CudaEvent evt;
+        using (PushContext())
+            evt = new CudaEvent(this, _defaultStream, enableTiming: false); // creates + records on the compute stream
+        lock (_deferredFreeLock)
+            _deferredFrees.Enqueue((buffer, evt));
+        DrainDeferredFrees(blockOldest: false);
+    }
+
+    /// <summary>
+    /// Returns buffers whose deferred-free event has completed to the pool. With
+    /// <paramref name="blockOldest"/> = true, waits on the front event (used to reclaim
+    /// memory under genuine allocation pressure). FIFO: events recorded later complete
+    /// later, so once the front is incomplete the rest are too (fast early-out).
+    /// </summary>
+    public void DrainDeferredFrees(bool blockOldest)
+    {
+        lock (_deferredFreeLock)
+        {
+            while (_deferredFrees.Count > 0)
+            {
+                var (buf, evt) = _deferredFrees.Peek();
+                if (!evt.IsComplete)
+                {
+                    if (!blockOldest) break;
+                    evt.Synchronize();
+                }
+                _deferredFrees.Dequeue();
+                buf.Dispose();   // returns to the pool — now provably safe
+                evt.Dispose();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Allocates device memory with an OOM-recovery retry. If the driver reports
+    /// out-of-memory, drain the buffer pool — a real <c>cuMemFree</c> of every
+    /// retained-for-reuse buffer — and retry the allocation once. The pool holds
+    /// bounded-but-real device memory (up to <c>_maxPerSize</c> buffers per
+    /// power-of-two bucket); under genuine pressure reclaiming it lets the
+    /// allocation through. This is the fix for the cross-step working-set growth
+    /// that OOM'd a 12 GB card on a tiny d256/L2 cortex past ~200K tokens
+    /// (200K trained, 250K OOM'd at the same per-step cost → accumulation, not a
+    /// single-step peak). If it still OOMs after draining, report the actual
+    /// free/total device memory (cuMemGetInfo) in the exception so the residual
+    /// consumer is visible rather than a bare "Out of memory".
+    /// </summary>
+    private IntPtr AllocDeviceMemoryWithRetry(ulong byteSize)
+    {
+        var result = CuBlasNative.cuMemAlloc(out IntPtr devicePtr, byteSize);
+        if (result == CudaResult.OutOfMemory)
+        {
+            // Reclaim event-deferred frees first (#555) — under genuine pressure block on
+            // their events so their device memory returns to the pool — then drain the pool.
+            DrainDeferredFrees(blockOldest: true);
+            int drained = _bufferPool.DrainAll();
+            result = CuBlasNative.cuMemAlloc(out devicePtr, byteSize);
+            if (result != CudaResult.Success)
+            {
+                ulong free = 0, total = 0;
+                try { CudaNativeBindings.cuMemGetInfo(out free, out total); }
+                catch { /* diagnostic only — never mask the real failure */ }
+                throw new InvalidOperationException(
+                    $"cuMemAlloc failed: {CuBlasNative.GetCudaErrorString(result)} " +
+                    $"(requested {byteSize} bytes; drained {drained} pooled buffers; " +
+                    $"device free={free} total={total} bytes)");
+            }
+        }
+        else
+        {
+            CuBlasNative.CheckCudaResult(result, "cuMemAlloc");
+        }
+        return devicePtr;
+    }
+
     public IGpuBuffer AllocateBuffer(int size)
     {
         if (!IsAvailable)
@@ -989,6 +1157,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
         // CUDA driver API calls are required for device memory operations.
         using var _ = PushContext();
+        if (_asyncAlloc)
+        {
+            var p = AllocDeviceMemoryAsync((ulong)size * sizeof(float));
+            CuBlasNative.CheckCudaResult(CuBlasNative.cuMemsetD32(p, 0, (ulong)size), "cuMemsetD32");
+            return new CudaGpuBuffer(_cudaContext, p, size, returnToPool: null, asyncFreeStream: _stream);
+        }
         if (_bufferPool.TryRent(size, out var pooled) && pooled != null)
         {
             CuBlasNative.CheckCudaResult(
@@ -998,7 +1172,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         }
 
         ulong byteSize = (ulong)size * sizeof(float);
-        CuBlasNative.CheckCudaResult(CuBlasNative.cuMemAlloc(out IntPtr devicePtr, byteSize), "cuMemAlloc");
+        IntPtr devicePtr = AllocDeviceMemoryWithRetry(byteSize);
         CuBlasNative.CheckCudaResult(CuBlasNative.cuMemsetD32(devicePtr, 0, (ulong)size), "cuMemsetD32");
         return new CudaGpuBuffer(_cudaContext, devicePtr, size, _bufferPool.Return);
     }
@@ -1013,11 +1187,30 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         GpuBufferSizeGuard.EnsureFits("CUDA", size, MaxBufferAllocBytes, DeviceName);
 
         using var _ = PushContext();
+        if (_asyncAlloc)
+        {
+            var pA = AllocDeviceMemoryAsync((ulong)size);
+            return new CudaGpuByteBuffer(_cudaContext, pA, size, asyncFreeStream: _stream);
+        }
         CuBlasNative.CheckCudaResult(
             CuBlasNative.cuMemAlloc(out IntPtr devicePtr, (ulong)size),
             "cuMemAlloc(byte)");
 
         return new CudaGpuByteBuffer(_cudaContext, devicePtr, size);
+    }
+
+    // Stream-ordered device allocation (#558 layer 6). On OOM, sync the context (lets pending
+    // cuMemFreeAsync reclamations complete) and retry once before surfacing the error.
+    private IntPtr AllocDeviceMemoryAsync(ulong byteSize)
+    {
+        var r = CuBlasNative.cuMemAllocAsync(out IntPtr p, byteSize, _stream);
+        if (r != CudaResult.Success)
+        {
+            CuBlasNative.cuCtxSynchronize();
+            r = CuBlasNative.cuMemAllocAsync(out p, byteSize, _stream);
+        }
+        CuBlasNative.CheckCudaResult(r, "cuMemAllocAsync");
+        return p;
     }
 
     public float[] DownloadBuffer(IGpuBuffer buffer)
@@ -1029,10 +1222,33 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public void DownloadBuffer(IGpuBuffer buffer, float[] destination)
     {
+        // #226: never issue a device→host copy from a released buffer. After CudaGpuBuffer.Release
+        // the device pointer is zeroed; cuMemcpyDtoH from a null/freed pointer is an ILLEGAL memory
+        // access that corrupts the CUDA context — every subsequent driver call then fails with error
+        // 700, cascading across the whole process. Surface a clean managed exception BEFORE touching
+        // the driver so the deferred-materializer caller (and the fused-training fault handler) can
+        // recover on the eager path instead, leaving the context intact.
+        if (buffer.Handle == IntPtr.Zero)
+            throw new ObjectDisposedException(nameof(buffer),
+                "GPU buffer was released before its deferred download (issue #226).");
+
         if (destination.Length < buffer.Size)
             throw new ArgumentException("Destination array is too small.", nameof(destination));
 
         using var _ = PushContext();
+
+        // Synchronize the compute stream before the device→host copy. Kernels
+        // launch on `_stream` (a non-default stream), but cuMemcpyDtoH below
+        // issues on the null stream. With a non-blocking compute stream the
+        // null stream does NOT implicitly wait for it, so the copy can race
+        // ahead of a just-launched kernel and read stale device memory — most
+        // visibly the in-place GPU-resident optimizer update, whose write would
+        // then be silently lost on the immediately-following host read (the
+        // value oscillated run-to-run between updated and pre-step). One stream
+        // sync on the host-read path (already a synchronization point) closes
+        // the race with no effect on the GPU-resident training hot path.
+        CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamSynchronize(_stream), "cuStreamSynchronize(download)");
+
         ulong byteSize = (ulong)(buffer.Size * sizeof(float));
 
         unsafe
@@ -2555,6 +2771,154 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         LaunchKernel2D(kernel, gridX, gridY, (uint)DefaultBlockSize, 1, args);
     }
 
+    /// <summary>
+    /// Warp-per-row CSR SpMM (issue #515): launches <c>csr_spmm_warp</c>, where each
+    /// warp (32 lanes) owns one output row and the lanes stride over columns. Best
+    /// for small/moderate N (the lanes cover the columns with coalesced B reads);
+    /// the 2-D <see cref="CsrSpMM"/> is better for wide N. Same numerics as
+    /// <see cref="CsrSpMM"/> (per-output sequential reduction → deterministic).
+    /// </summary>
+    public unsafe void CsrSpMMWarp(
+        IGpuBuffer csrValues,
+        IGpuBuffer csrColIndices,
+        IGpuBuffer csrRowPointers,
+        IGpuBuffer denseB,
+        IGpuBuffer output,
+        int M, int K, int N, int nnz)
+    {
+        if (!IsAvailable)
+            throw new InvalidOperationException("CUDA backend is not available.");
+
+        if (!_kernelCache.TryGetValue("csr_spmm_warp", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: csr_spmm_warp");
+
+        using var _ = PushContext();
+
+        // One warp (32 lanes) per row; DefaultBlockSize threads/block => 8 warps/block.
+        uint gridX = (uint)((M + 7) / 8);
+
+        IntPtr valuesPtr = csrValues.Handle;
+        IntPtr colIndicesPtr = csrColIndices.Handle;
+        IntPtr rowPointersPtr = csrRowPointers.Handle;
+        IntPtr denseBPtr = denseB.Handle;
+        IntPtr outputPtr = output.Handle;
+
+        void** args = stackalloc void*[9];
+        args[0] = &valuesPtr;
+        args[1] = &colIndicesPtr;
+        args[2] = &rowPointersPtr;
+        args[3] = &denseBPtr;
+        args[4] = &outputPtr;
+        args[5] = &M;
+        args[6] = &K;
+        args[7] = &N;
+        args[8] = &nnz;
+
+        LaunchKernel(kernel, gridX, (uint)DefaultBlockSize, args);
+    }
+
+    /// <summary>
+    /// FP64 CSR SpMM (issue #515): launches <c>csr_spmm_double</c>. The CSR-value /
+    /// dense-B / output buffers carry <c>double</c> payloads (byte buffers); the int
+    /// CSR index buffers are unchanged. Same 2-D launch + numerics as the float
+    /// <see cref="CsrSpMM"/>.
+    /// </summary>
+    public unsafe void CsrSpMMDouble(
+        IGpuBuffer csrValues,
+        IGpuBuffer csrColIndices,
+        IGpuBuffer csrRowPointers,
+        IGpuBuffer denseB,
+        IGpuBuffer output,
+        int M, int K, int N, int nnz)
+    {
+        if (!IsAvailable)
+            throw new InvalidOperationException("CUDA backend is not available.");
+
+        if (!_kernelCache.TryGetValue("csr_spmm_double", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: csr_spmm_double");
+
+        using var _ = PushContext();
+
+        uint gridX = (uint)M;
+        uint gridY = (uint)((N + DefaultBlockSize - 1) / DefaultBlockSize);
+
+        IntPtr valuesPtr = csrValues.Handle;
+        IntPtr colIndicesPtr = csrColIndices.Handle;
+        IntPtr rowPointersPtr = csrRowPointers.Handle;
+        IntPtr denseBPtr = denseB.Handle;
+        IntPtr outputPtr = output.Handle;
+
+        void** args = stackalloc void*[9];
+        args[0] = &valuesPtr;
+        args[1] = &colIndicesPtr;
+        args[2] = &rowPointersPtr;
+        args[3] = &denseBPtr;
+        args[4] = &outputPtr;
+        args[5] = &M;
+        args[6] = &K;
+        args[7] = &N;
+        args[8] = &nnz;
+
+        LaunchKernel2D(kernel, gridX, gridY, (uint)DefaultBlockSize, 1, args);
+    }
+
+    /// <summary>
+    /// 128-bit-vectorized CSR SpMM (issue #515): launches <c>csr_spmm_vec4</c>, where
+    /// each thread computes 4 adjacent output columns via aligned <c>float4</c> loads.
+    /// Requires <paramref name="N"/> % 4 == 0 (the caller's gate). Same numerics as
+    /// <see cref="CsrSpMM"/> (per-output sequential reduction → deterministic).
+    /// </summary>
+    public unsafe void CsrSpMMVec4(
+        IGpuBuffer csrValues,
+        IGpuBuffer csrColIndices,
+        IGpuBuffer csrRowPointers,
+        IGpuBuffer denseB,
+        IGpuBuffer output,
+        int M, int K, int N, int nnz)
+    {
+        if (!IsAvailable)
+            throw new InvalidOperationException("CUDA backend is not available.");
+
+        // Fail fast on misaligned N: each thread computes 4 adjacent output
+        // columns via float4 loads, so a non-multiple-of-4 N would silently
+        // TRUNCATE the grid to N/4 thread-columns and leave the last
+        // N % 4 output columns unwritten. Upstream routing gates on this,
+        // but a direct call must not rely on it.
+        if ((N & 3) != 0)
+            throw new ArgumentException(
+                $"CsrSpMMVec4 requires N divisible by 4 (got {N}); the float4-vectorized kernel " +
+                "would silently skip the last N % 4 output columns. Use CsrSpMM for unaligned N.",
+                nameof(N));
+
+        if (!_kernelCache.TryGetValue("csr_spmm_vec4", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: csr_spmm_vec4");
+
+        using var _ = PushContext();
+
+        // Each thread owns 4 columns, so the y-grid spans N/4 thread-columns.
+        uint gridX = (uint)M;
+        uint gridY = (uint)((N / 4 + DefaultBlockSize - 1) / DefaultBlockSize);
+
+        IntPtr valuesPtr = csrValues.Handle;
+        IntPtr colIndicesPtr = csrColIndices.Handle;
+        IntPtr rowPointersPtr = csrRowPointers.Handle;
+        IntPtr denseBPtr = denseB.Handle;
+        IntPtr outputPtr = output.Handle;
+
+        void** args = stackalloc void*[9];
+        args[0] = &valuesPtr;
+        args[1] = &colIndicesPtr;
+        args[2] = &rowPointersPtr;
+        args[3] = &denseBPtr;
+        args[4] = &outputPtr;
+        args[5] = &M;
+        args[6] = &K;
+        args[7] = &N;
+        args[8] = &nnz;
+
+        LaunchKernel2D(kernel, gridX, gridY, (uint)DefaultBlockSize, 1, args);
+    }
+
     /// <inheritdoc/>
     public unsafe void CsrSpMMBias(
         IGpuBuffer csrValues,
@@ -2951,6 +3315,46 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             args[2] = &outer;
             args[3] = &reduce;
             LaunchKernel(kernel, grid, DefaultBlockSize, args);
+        }
+    }
+
+    /// <summary>Probe (AIDOTNET_CUDA_GRAPH_PROBE=1): confirms CUDA graph capture/instantiate/launch work on
+    /// this backend's stream, and measures how much per-launch overhead graph replay removes vs issuing each
+    /// op individually. Pure-GPU op sequence (DtoD copies) — the capturable subset; downloads can't be captured.</summary>
+    private void RunCudaGraphProbe()
+    {
+        void Log(string s) => System.Diagnostics.Trace.WriteLine("[CUDA-GRAPH-PROBE] " + s);
+        IntPtr src = IntPtr.Zero, dst = IntPtr.Zero, graph = IntPtr.Zero, exec = IntPtr.Zero;
+        try
+        {
+            const ulong N = 4096;
+            Log($"alloc src={CudaNativeBindings.cuMemAlloc(out src, N)} dst={CudaNativeBindings.cuMemAlloc(out dst, N)}");
+            const int OPS = 16;
+            var rb = CudaNativeBindings.cuStreamBeginCapture(_stream, CudaNativeBindings.CU_STREAM_CAPTURE_MODE_GLOBAL);
+            for (int i = 0; i < OPS; i++) CudaNativeBindings.cuMemcpyDtoDAsync(dst, src, N, _stream);
+            var re = CudaNativeBindings.cuStreamEndCapture(_stream, out graph);
+            var ri = CudaNativeBindings.cuGraphInstantiate(out exec, graph, 0);
+            Log($"beginCapture={rb} endCapture={re} instantiate={ri} graph={graph != IntPtr.Zero} exec={exec != IntPtr.Zero}");
+            if ((int)ri != 0 || exec == IntPtr.Zero) { Log("INSTANTIATE FAILED -> capture not usable as-is on this stream"); return; }
+            CudaNativeBindings.cuGraphLaunch(exec, _stream); CudaNativeBindings.cuStreamSynchronize(_stream); // warm
+            const int REP = 2000;
+            var swG = System.Diagnostics.Stopwatch.StartNew();
+            for (int i = 0; i < REP; i++) CudaNativeBindings.cuGraphLaunch(exec, _stream);
+            CudaNativeBindings.cuStreamSynchronize(_stream); swG.Stop();
+            var swD = System.Diagnostics.Stopwatch.StartNew();
+            for (int i = 0; i < REP * OPS; i++) CudaNativeBindings.cuMemcpyDtoDAsync(dst, src, N, _stream);
+            CudaNativeBindings.cuStreamSynchronize(_stream); swD.Stop();
+            double g = swG.Elapsed.TotalMilliseconds, d = swD.Elapsed.TotalMilliseconds;
+            Log($"{REP} graph-replays ({REP * OPS} ops): {g:F1}ms  |  {REP * OPS} direct launches: {d:F1}ms");
+            Log($"VERDICT: capture WORKS; replay removes per-launch overhead -> {d / System.Math.Max(0.01, g):F2}x fewer launch-cost for the same op count");
+        }
+        catch (Exception ex) { Log("EXCEPTION " + ex.GetType().Name + ": " + ex.Message); }
+        finally
+        {
+            if (exec != IntPtr.Zero) CudaNativeBindings.cuGraphExecDestroy(exec);
+            if (graph != IntPtr.Zero) CudaNativeBindings.cuGraphDestroy(graph);
+            if (src != IntPtr.Zero) CudaNativeBindings.cuMemFree(src);
+            if (dst != IntPtr.Zero) CudaNativeBindings.cuMemFree(dst);
         }
     }
 
@@ -5636,6 +6040,25 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         args[10] = &epsilon;
         // 2 shared arrays for sumDy and sumDyXmu
         LaunchKernelWithSharedMem(kernel, gridX, DefaultBlockSize, (uint)(2 * DefaultBlockSize * sizeof(float)), args);
+
+        // The layernorm_backward kernel above computes ONLY gradInput — it leaves
+        // gradGamma/gradBeta untouched (they require a reduction ACROSS the batch, not a
+        // per-row block result). Launch the dedicated param-gradient kernel; without it,
+        // LayerNorm's affine gamma/beta receive ZERO gradient on GPU and never train
+        // (every transformer layer has a LayerNorm — caught by LayerNormGradientCheckTests).
+        if (!_kernelCache.TryGetValue("layernorm_grad_params", out var paramKernel))
+            throw new InvalidOperationException("CUDA kernel not found: layernorm_grad_params");
+        uint paramGrid = (uint)((normalizedSize + DefaultBlockSize - 1) / DefaultBlockSize);
+        void** pargs = stackalloc void*[8];
+        pargs[0] = &gradOutputPtr;
+        pargs[1] = &inputPtr;
+        pargs[2] = &saveMeanPtr;
+        pargs[3] = &saveInvVarPtr;
+        pargs[4] = &gradGammaPtr;
+        pargs[5] = &gradBetaPtr;
+        pargs[6] = &batchSize;
+        pargs[7] = &normalizedSize;
+        LaunchKernel(paramKernel, paramGrid, DefaultBlockSize, pargs);
     }
 
     public unsafe void GroupNorm(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
@@ -9855,6 +10278,77 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
+    /// <summary>
+    /// Proximal gradient (ISTA) step with L1 soft-threshold prox, in place on the GPU:
+    /// <c>tmp = param - lr*grad; param = sign(tmp)*max(|tmp| - l1Strength, 0)</c>.
+    /// </summary>
+    public unsafe void ProximalL1Update(IGpuBuffer param, IGpuBuffer gradient,
+        float learningRate, float l1Strength, int size)
+    {
+        if (param is null) throw new ArgumentNullException(nameof(param));
+        if (gradient is null) throw new ArgumentNullException(nameof(gradient));
+        if (size <= 0)
+            throw new ArgumentOutOfRangeException(nameof(size), "Size must be positive.");
+        // Validate device-buffer capacity before launch: GpuOptimizer passes p.Length
+        // for `size` without cross-checking the gradient buffer, so a shape mismatch
+        // (gradient.Size < size) would otherwise read past gradient.Handle — an illegal
+        // device access / silent corruption instead of a clear managed exception.
+        if (param.Size < size)
+            throw new ArgumentException($"param buffer too small: capacity={param.Size}, required={size}.", nameof(param));
+        if (gradient.Size < size)
+            throw new ArgumentException($"gradient buffer too small: capacity={gradient.Size}, required={size}.", nameof(gradient));
+
+        if (!_kernelCache.TryGetValue("proximal_l1_update", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: proximal_l1_update");
+
+        using var _ = PushContext();
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr paramPtr = param.Handle;
+        IntPtr gradPtr = gradient.Handle;
+        void** args = stackalloc void*[5];
+        args[0] = &paramPtr;
+        args[1] = &gradPtr;
+        args[2] = &learningRate;
+        args[3] = &l1Strength;
+        args[4] = &size;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    /// <summary>
+    /// 8-bit Adam blockwise update in place on the GPU. mQ/vQ are int8 quantized
+    /// moments (one byte per element); mScales/vScales are one double per block.
+    /// One CUDA block per quant block, 256 threads, shared-memory maxAbs reduction.
+    /// Matches the CPU Adam8BitOptimizer's CompressBothMoments / percentile>=100 /
+    /// deterministic-rounding path.
+    /// </summary>
+    public unsafe void Adam8BitUpdate(IGpuBuffer param, IGpuBuffer gradient,
+        IGpuBuffer mQuant, IGpuBuffer vQuant, IGpuBuffer mScales, IGpuBuffer vScales,
+        float learningRate, float beta1, float beta2, float epsilon,
+        float oneMinusBeta1, float oneMinusBeta2, float biasCorrection1, float biasCorrection2,
+        int blockSize, int paramLength, int numBlocks)
+    {
+        if (param is null) throw new ArgumentNullException(nameof(param));
+        if (gradient is null) throw new ArgumentNullException(nameof(gradient));
+        if (mQuant is null || vQuant is null || mScales is null || vScales is null)
+            throw new ArgumentNullException(nameof(mQuant));
+        if (paramLength <= 0 || blockSize <= 0 || numBlocks <= 0)
+            throw new ArgumentOutOfRangeException(nameof(paramLength));
+
+        if (!_kernelCache.TryGetValue("adam8bit_update", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: adam8bit_update");
+
+        using var _ = PushContext();
+        IntPtr pPtr = param.Handle, gPtr = gradient.Handle;
+        IntPtr mqPtr = mQuant.Handle, vqPtr = vQuant.Handle, msPtr = mScales.Handle, vsPtr = vScales.Handle;
+        void** args = stackalloc void*[17];
+        args[0] = &pPtr; args[1] = &gPtr; args[2] = &mqPtr; args[3] = &vqPtr; args[4] = &msPtr; args[5] = &vsPtr;
+        args[6] = &learningRate; args[7] = &beta1; args[8] = &beta2; args[9] = &epsilon;
+        args[10] = &oneMinusBeta1; args[11] = &oneMinusBeta2; args[12] = &biasCorrection1; args[13] = &biasCorrection2;
+        args[14] = &blockSize; args[15] = &paramLength; args[16] = &numBlocks;
+        // One CUDA block per quant block (256 threads); the kernel grid-strides within each.
+        LaunchKernel(kernel, (uint)numBlocks, 256u, args);
+    }
+
     /// <inheritdoc/>
     public unsafe void AdadeltaUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer accumGrad, IGpuBuffer accumUpdate,
         float rho, float epsilon, float weightDecay, int size)
@@ -10078,6 +10572,321 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
+    // ==================================================================
+    // PR #567 — Native sparse scatter-update kernels
+    // ==================================================================
+    // Each method below launches the matching sparse_*_update CUDA kernel
+    // (defined in CudaOptimizerKernels.cs) with one thread per non-zero
+    // gradient entry. Reads / writes only (param[idx], state[idx]) for the
+    // nnz indices the autodiff producer published; the other (size - nnz)
+    // entries are never touched. Memory traffic is O(nnz) vs. the dense
+    // path's O(size).
+    // ==================================================================
+
+    private static void EnsureSparseArgs(IGpuBuffer? param, IGpuBuffer? sparseIndices, IGpuBuffer? sparseValues, int nnz)
+    {
+        if (param is null) throw new ArgumentNullException(nameof(param));
+        if (sparseIndices is null) throw new ArgumentNullException(nameof(sparseIndices));
+        if (sparseValues is null) throw new ArgumentNullException(nameof(sparseValues));
+        if (nnz < 0) throw new ArgumentOutOfRangeException(nameof(nnz));
+    }
+
+    /// <inheritdoc/>
+    public unsafe void SparseSgdUpdate(IGpuBuffer param,
+        IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz,
+        float learningRate, float weightDecay)
+    {
+        EnsureSparseArgs(param, sparseIndices, sparseValues, nnz);
+        if (nnz == 0) return;
+        if (!_kernelCache.TryGetValue("sparse_sgd_update", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: sparse_sgd_update");
+        using var _ = PushContext();
+        uint grid = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr pP = param.Handle, pI = sparseIndices.Handle, pV = sparseValues.Handle;
+        void** args = stackalloc void*[6];
+        args[0] = &pP; args[1] = &pI; args[2] = &pV;
+        args[3] = &learningRate; args[4] = &weightDecay; args[5] = &nnz;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    /// <inheritdoc/>
+    public unsafe void SparseSgdMomentumUpdate(IGpuBuffer param, IGpuBuffer velocity,
+        IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz,
+        float learningRate, float momentum, float weightDecay)
+    {
+        EnsureSparseArgs(param, sparseIndices, sparseValues, nnz);
+        if (velocity is null) throw new ArgumentNullException(nameof(velocity));
+        if (nnz == 0) return;
+        if (!_kernelCache.TryGetValue("sparse_sgd_momentum_update", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: sparse_sgd_momentum_update");
+        using var _ = PushContext();
+        uint grid = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr pP = param.Handle, pI = sparseIndices.Handle, pV = sparseValues.Handle, pVel = velocity.Handle;
+        void** args = stackalloc void*[8];
+        args[0] = &pP; args[1] = &pI; args[2] = &pV; args[3] = &pVel;
+        args[4] = &learningRate; args[5] = &momentum; args[6] = &weightDecay; args[7] = &nnz;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    /// <inheritdoc/>
+    public unsafe void SparseAdamUpdate(IGpuBuffer param, IGpuBuffer m, IGpuBuffer v,
+        IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz,
+        float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step)
+    {
+        EnsureSparseArgs(param, sparseIndices, sparseValues, nnz);
+        if (m is null) throw new ArgumentNullException(nameof(m));
+        if (v is null) throw new ArgumentNullException(nameof(v));
+        if (step < 1) throw new ArgumentOutOfRangeException(nameof(step));
+        if (epsilon <= 0) throw new ArgumentOutOfRangeException(nameof(epsilon));
+        if (nnz == 0) return;
+        if (!_kernelCache.TryGetValue("sparse_adam_update", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: sparse_adam_update");
+        using var _ = PushContext();
+        uint grid = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr pP = param.Handle, pI = sparseIndices.Handle, pV = sparseValues.Handle;
+        IntPtr pM = m.Handle, pVv = v.Handle;
+        void** args = stackalloc void*[12];
+        args[0] = &pP; args[1] = &pI; args[2] = &pV;
+        args[3] = &pM; args[4] = &pVv;
+        args[5] = &learningRate; args[6] = &beta1; args[7] = &beta2;
+        args[8] = &epsilon; args[9] = &weightDecay; args[10] = &step; args[11] = &nnz;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    /// <inheritdoc/>
+    public unsafe void SparseAdamWUpdate(IGpuBuffer param, IGpuBuffer m, IGpuBuffer v,
+        IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz,
+        float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step)
+    {
+        EnsureSparseArgs(param, sparseIndices, sparseValues, nnz);
+        if (m is null) throw new ArgumentNullException(nameof(m));
+        if (v is null) throw new ArgumentNullException(nameof(v));
+        if (step < 1) throw new ArgumentOutOfRangeException(nameof(step));
+        if (nnz == 0) return;
+        if (!_kernelCache.TryGetValue("sparse_adamw_update", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: sparse_adamw_update");
+        using var _ = PushContext();
+        uint grid = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr pP = param.Handle, pI = sparseIndices.Handle, pV = sparseValues.Handle;
+        IntPtr pM = m.Handle, pVv = v.Handle;
+        void** args = stackalloc void*[12];
+        args[0] = &pP; args[1] = &pI; args[2] = &pV;
+        args[3] = &pM; args[4] = &pVv;
+        args[5] = &learningRate; args[6] = &beta1; args[7] = &beta2;
+        args[8] = &epsilon; args[9] = &weightDecay; args[10] = &step; args[11] = &nnz;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    /// <inheritdoc/>
+    public unsafe void SparseRmspropUpdate(IGpuBuffer param, IGpuBuffer squaredAvg,
+        IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz,
+        float learningRate, float rho, float epsilon, float weightDecay)
+    {
+        EnsureSparseArgs(param, sparseIndices, sparseValues, nnz);
+        if (squaredAvg is null) throw new ArgumentNullException(nameof(squaredAvg));
+        if (nnz == 0) return;
+        if (!_kernelCache.TryGetValue("sparse_rmsprop_update", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: sparse_rmsprop_update");
+        using var _ = PushContext();
+        uint grid = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr pP = param.Handle, pI = sparseIndices.Handle, pV = sparseValues.Handle, pSq = squaredAvg.Handle;
+        void** args = stackalloc void*[9];
+        args[0] = &pP; args[1] = &pI; args[2] = &pV; args[3] = &pSq;
+        args[4] = &learningRate; args[5] = &rho; args[6] = &epsilon; args[7] = &weightDecay; args[8] = &nnz;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    /// <inheritdoc/>
+    public unsafe void SparseAdagradUpdate(IGpuBuffer param, IGpuBuffer accumulatedGrad,
+        IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz,
+        float learningRate, float epsilon, float weightDecay)
+    {
+        EnsureSparseArgs(param, sparseIndices, sparseValues, nnz);
+        if (accumulatedGrad is null) throw new ArgumentNullException(nameof(accumulatedGrad));
+        if (nnz == 0) return;
+        if (!_kernelCache.TryGetValue("sparse_adagrad_update", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: sparse_adagrad_update");
+        using var _ = PushContext();
+        uint grid = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr pP = param.Handle, pI = sparseIndices.Handle, pV = sparseValues.Handle, pA = accumulatedGrad.Handle;
+        void** args = stackalloc void*[8];
+        args[0] = &pP; args[1] = &pI; args[2] = &pV; args[3] = &pA;
+        args[4] = &learningRate; args[5] = &epsilon; args[6] = &weightDecay; args[7] = &nnz;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    /// <inheritdoc/>
+    public unsafe void SparseNagUpdate(IGpuBuffer param, IGpuBuffer velocity,
+        IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz,
+        float learningRate, float momentum, float weightDecay)
+    {
+        EnsureSparseArgs(param, sparseIndices, sparseValues, nnz);
+        if (velocity is null) throw new ArgumentNullException(nameof(velocity));
+        if (nnz == 0) return;
+        if (!_kernelCache.TryGetValue("sparse_nag_update", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: sparse_nag_update");
+        using var _ = PushContext();
+        uint grid = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr pP = param.Handle, pI = sparseIndices.Handle, pV = sparseValues.Handle, pVel = velocity.Handle;
+        void** args = stackalloc void*[8];
+        args[0] = &pP; args[1] = &pI; args[2] = &pV; args[3] = &pVel;
+        args[4] = &learningRate; args[5] = &momentum; args[6] = &weightDecay; args[7] = &nnz;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    /// <inheritdoc/>
+    public unsafe void SparseAdadeltaUpdate(IGpuBuffer param, IGpuBuffer accumGrad, IGpuBuffer accumUpdate,
+        IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz,
+        float rho, float epsilon, float weightDecay)
+    {
+        EnsureSparseArgs(param, sparseIndices, sparseValues, nnz);
+        if (accumGrad is null) throw new ArgumentNullException(nameof(accumGrad));
+        if (accumUpdate is null) throw new ArgumentNullException(nameof(accumUpdate));
+        if (nnz == 0) return;
+        if (!_kernelCache.TryGetValue("sparse_adadelta_update", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: sparse_adadelta_update");
+        using var _ = PushContext();
+        uint grid = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr pP = param.Handle, pI = sparseIndices.Handle, pV = sparseValues.Handle;
+        IntPtr pAg = accumGrad.Handle, pAu = accumUpdate.Handle;
+        void** args = stackalloc void*[9];
+        args[0] = &pP; args[1] = &pI; args[2] = &pV; args[3] = &pAg; args[4] = &pAu;
+        args[5] = &rho; args[6] = &epsilon; args[7] = &weightDecay; args[8] = &nnz;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    /// <inheritdoc/>
+    public unsafe void SparseAmsgradUpdate(IGpuBuffer param, IGpuBuffer m, IGpuBuffer v, IGpuBuffer vMax,
+        IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz,
+        float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step)
+    {
+        EnsureSparseArgs(param, sparseIndices, sparseValues, nnz);
+        if (m is null) throw new ArgumentNullException(nameof(m));
+        if (v is null) throw new ArgumentNullException(nameof(v));
+        if (vMax is null) throw new ArgumentNullException(nameof(vMax));
+        if (step < 1) throw new ArgumentOutOfRangeException(nameof(step));
+        if (nnz == 0) return;
+        if (!_kernelCache.TryGetValue("sparse_amsgrad_update", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: sparse_amsgrad_update");
+        using var _ = PushContext();
+        uint grid = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr pP = param.Handle, pI = sparseIndices.Handle, pV = sparseValues.Handle;
+        IntPtr pM = m.Handle, pVv = v.Handle, pVm = vMax.Handle;
+        void** args = stackalloc void*[13];
+        args[0] = &pP; args[1] = &pI; args[2] = &pV;
+        args[3] = &pM; args[4] = &pVv; args[5] = &pVm;
+        args[6] = &learningRate; args[7] = &beta1; args[8] = &beta2;
+        args[9] = &epsilon; args[10] = &weightDecay; args[11] = &step; args[12] = &nnz;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    /// <inheritdoc/>
+    public unsafe void SparseAdamaxUpdate(IGpuBuffer param, IGpuBuffer m, IGpuBuffer u,
+        IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz,
+        float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step)
+    {
+        EnsureSparseArgs(param, sparseIndices, sparseValues, nnz);
+        if (m is null) throw new ArgumentNullException(nameof(m));
+        if (u is null) throw new ArgumentNullException(nameof(u));
+        if (step < 1) throw new ArgumentOutOfRangeException(nameof(step));
+        if (nnz == 0) return;
+        if (!_kernelCache.TryGetValue("sparse_adamax_update", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: sparse_adamax_update");
+        using var _ = PushContext();
+        uint grid = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr pP = param.Handle, pI = sparseIndices.Handle, pV = sparseValues.Handle;
+        IntPtr pM = m.Handle, pU = u.Handle;
+        void** args = stackalloc void*[12];
+        args[0] = &pP; args[1] = &pI; args[2] = &pV;
+        args[3] = &pM; args[4] = &pU;
+        args[5] = &learningRate; args[6] = &beta1; args[7] = &beta2;
+        args[8] = &epsilon; args[9] = &weightDecay; args[10] = &step; args[11] = &nnz;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    /// <inheritdoc/>
+    public unsafe void SparseLionUpdate(IGpuBuffer param, IGpuBuffer m,
+        IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz,
+        float learningRate, float beta1, float beta2, float weightDecay)
+    {
+        EnsureSparseArgs(param, sparseIndices, sparseValues, nnz);
+        if (m is null) throw new ArgumentNullException(nameof(m));
+        if (nnz == 0) return;
+        if (!_kernelCache.TryGetValue("sparse_lion_update", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: sparse_lion_update");
+        using var _ = PushContext();
+        uint grid = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr pP = param.Handle, pI = sparseIndices.Handle, pV = sparseValues.Handle, pM = m.Handle;
+        void** args = stackalloc void*[9];
+        args[0] = &pP; args[1] = &pI; args[2] = &pV; args[3] = &pM;
+        args[4] = &learningRate; args[5] = &beta1; args[6] = &beta2; args[7] = &weightDecay; args[8] = &nnz;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    /// <inheritdoc/>
+    public unsafe void SparseNadamUpdate(IGpuBuffer param, IGpuBuffer m, IGpuBuffer v,
+        IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz,
+        float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step)
+    {
+        EnsureSparseArgs(param, sparseIndices, sparseValues, nnz);
+        if (m is null) throw new ArgumentNullException(nameof(m));
+        if (v is null) throw new ArgumentNullException(nameof(v));
+        if (step < 1) throw new ArgumentOutOfRangeException(nameof(step));
+        if (nnz == 0) return;
+        if (!_kernelCache.TryGetValue("sparse_nadam_update", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: sparse_nadam_update");
+        using var _ = PushContext();
+        uint grid = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr pP = param.Handle, pI = sparseIndices.Handle, pV = sparseValues.Handle;
+        IntPtr pM = m.Handle, pVv = v.Handle;
+        void** args = stackalloc void*[12];
+        args[0] = &pP; args[1] = &pI; args[2] = &pV;
+        args[3] = &pM; args[4] = &pVv;
+        args[5] = &learningRate; args[6] = &beta1; args[7] = &beta2;
+        args[8] = &epsilon; args[9] = &weightDecay; args[10] = &step; args[11] = &nnz;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    /// <inheritdoc/>
+    public unsafe void SparseFtrlUpdate(IGpuBuffer param, IGpuBuffer z, IGpuBuffer n,
+        IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz,
+        float learningRate, float l1Reg, float l2Reg, float beta)
+    {
+        EnsureSparseArgs(param, sparseIndices, sparseValues, nnz);
+        if (z is null) throw new ArgumentNullException(nameof(z));
+        if (n is null) throw new ArgumentNullException(nameof(n));
+        if (nnz == 0) return;
+        if (!_kernelCache.TryGetValue("sparse_ftrl_update", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: sparse_ftrl_update");
+        using var _ = PushContext();
+        uint grid = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr pP = param.Handle, pI = sparseIndices.Handle, pV = sparseValues.Handle;
+        IntPtr pZ = z.Handle, pN = n.Handle;
+        void** args = stackalloc void*[10];
+        args[0] = &pP; args[1] = &pI; args[2] = &pV;
+        args[3] = &pZ; args[4] = &pN;
+        args[5] = &learningRate; args[6] = &l1Reg; args[7] = &l2Reg; args[8] = &beta; args[9] = &nnz;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    /// <inheritdoc/>
+    public unsafe void SparseProximalL1Update(IGpuBuffer param,
+        IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz,
+        float learningRate, float l1Strength)
+    {
+        EnsureSparseArgs(param, sparseIndices, sparseValues, nnz);
+        if (nnz == 0) return;
+        if (!_kernelCache.TryGetValue("sparse_proximal_l1_update", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: sparse_proximal_l1_update");
+        using var _ = PushContext();
+        uint grid = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr pP = param.Handle, pI = sparseIndices.Handle, pV = sparseValues.Handle;
+        void** args = stackalloc void*[6];
+        args[0] = &pP; args[1] = &pI; args[2] = &pV;
+        args[3] = &learningRate; args[4] = &l1Strength; args[5] = &nnz;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
     /// <inheritdoc/>
     public unsafe void ConvertToFp16(IGpuBuffer input, IGpuBuffer output, int size)
     {
@@ -10094,6 +10903,97 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         args[2] = &size;
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
+
+    /// <summary>
+    /// FP16-NATIVE GELU (#558 layer 7 pilot): reads the FP16 activation buffer DIRECTLY, computes GELU in
+    /// FP32 in-register (__half2 packed, 2 elems/thread), writes FP16 — no separate FP32 buffer is ever
+    /// materialized, so there is no convert transient and the activation stays half-size end-to-end. This
+    /// is the kernel shape the GPU memory win + Tensor-Core throughput require. <paramref name="size"/> is
+    /// the element count; <paramref name="input"/>/<paramref name="output"/> are FP16 (byte) buffers.
+    /// </summary>
+    public unsafe void Fp16Gelu(IGpuBuffer input, IGpuBuffer output, int size)
+        => LaunchUnaryFp16("fp16_gelu_native", input, output, size);
+
+    /// <summary>FP32→FP16 via the self-contained native kernel (no cuda_fp16.h). Output is a half buffer.</summary>
+    public unsafe void ConvertToFp16Native(IGpuBuffer input, IGpuBuffer output, int size)
+        => LaunchConvertFp16("convert_fp32_to_fp16_native", input, output, size);
+
+    /// <summary>FP16→FP32 via the self-contained native kernel (no cuda_fp16.h). Input is a half buffer.</summary>
+    public unsafe void ConvertToFp32Native(IGpuBuffer input, IGpuBuffer output, int size)
+        => LaunchConvertFp16("convert_fp16_to_fp32_native", input, output, size);
+
+    /// <summary>
+    /// FP16 Tensor-Core GEMM for the hot single-matmul path (#558 layer 7): row-major C[M,N] = A[M,K]·B[K,N]
+    /// with FP16 inputs and an FP32 output. Multiplies in FP16 on the Tensor Cores, accumulates in FP32
+    /// (<c>CUBLAS_COMPUTE_32F</c>) — full-rate Tensor-Core throughput (≈2× the TF32 <c>cublasSgemm</c> the
+    /// default <see cref="Gemm"/> uses) at half the input bandwidth. This is the de-batched mirror of the
+    /// proven <see cref="BatchedGemmExFanout"/> convention; <paramref name="Ahalf"/>/<paramref name="Bhalf"/>
+    /// are FP16 (byte) buffers, <paramref name="C"/> is FP32. cuBLAS is column-major, so we compute
+    /// Cᵀ = Bᵀ·Aᵀ by passing (N,M,K) with B then A — identical to the FP32 path. <c>cublasGemmEx</c> needs
+    /// no <c>cuda_fp16.h</c> (the half pointers are runtime, not compile-time), so this works driver-only —
+    /// pair with <see cref="ConvertToFp16Native"/> to feed it from FP32, or with FP16-resident activations
+    /// to skip the convert entirely.
+    /// </summary>
+    public unsafe void GemmFp16(IGpuBuffer Ahalf, IGpuBuffer Bhalf, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
+    {
+        if (!IsAvailable) throw new InvalidOperationException("CUDA backend is not available.");
+        if (Ahalf is null) throw new ArgumentNullException(nameof(Ahalf));
+        if (Bhalf is null) throw new ArgumentNullException(nameof(Bhalf));
+        if (C is null) throw new ArgumentNullException(nameof(C));
+        if (M <= 0 || N <= 0 || K <= 0) throw new ArgumentException($"GEMM dims must be positive (M={M}, N={N}, K={K}).");
+        // A,B are 2-byte half; C is 4-byte float. Reject undersized buffers (byte-aware, since the
+        // element-count view would misread half buffers as float-sized).
+        if (Ahalf.SizeInBytes < (long)M * K * 2) throw new ArgumentException($"A half buffer too small: {Ahalf.SizeInBytes} < {(long)M * K * 2}.");
+        if (Bhalf.SizeInBytes < (long)K * N * 2) throw new ArgumentException($"B half buffer too small: {Bhalf.SizeInBytes} < {(long)K * N * 2}.");
+        if (C.SizeInBytes < (long)M * N * sizeof(float)) throw new ArgumentException($"C buffer too small: {C.SizeInBytes} < {(long)M * N * sizeof(float)}.");
+
+        using var _ = PushContext();
+        float aVal = alpha, bVal = beta;
+        IntPtr alphaPtr = (IntPtr)(&aVal);
+        IntPtr betaPtr = (IntPtr)(&bVal);
+        var status = CuBlasNative.cublasGemmEx(
+            _cublasHandle,
+            CublasOperation.None, CublasOperation.None,
+            N, M, K,
+            alphaPtr,
+            Bhalf.Handle, CuBlasNative.CUDA_R_16F, N,
+            Ahalf.Handle, CuBlasNative.CUDA_R_16F, K,
+            betaPtr,
+            C.Handle, CuBlasNative.CUDA_R_32F, N,
+            CuBlasNative.CUBLAS_COMPUTE_32F,
+            0 /* CUBLAS_GEMM_DEFAULT — selects Tensor Cores under the handle's math mode */);
+
+        // CUBLAS_STATUS_NOT_SUPPORTED is a CAPABILITY signal, not an operational failure:
+        // the FP16-in / FP32-compute cublasGemmEx config isn't available on this device
+        // (some GPUs/driver combos lack it even at compute capability >= 5). Surface it as
+        // NotSupportedException — the semantically correct type — so callers can cleanly
+        // fall back to the TF32 cublasSgemm path instead of treating it as a hard error.
+        // The compute-capability floor (SupportsHgemm, cc >= 5) is necessary but not
+        // sufficient, so we key off the authoritative runtime status here.
+        if (status == AiDotNet.Tensors.Engines.CublasStatus.NotSupported)
+        {
+            throw new NotSupportedException(
+                $"FP16 Tensor-Core GEMM (cublasGemmEx CUDA_R_16F in / CUBLAS_COMPUTE_32F) is not " +
+                $"supported on this device (compute capability {_ccMajor}.{_ccMinor}); " +
+                $"use the TF32 Gemm path instead.");
+        }
+        CuBlasNative.CheckCublasStatus(status, "cublasGemmEx(GemmFp16)");
+    }
+
+    private unsafe void LaunchUnaryFp16(string kernelName, IGpuBuffer input, IGpuBuffer output, int size)
+    {
+        if (!_kernelCache.TryGetValue(kernelName, out var kernel))
+            throw new InvalidOperationException($"CUDA kernel not found: {kernelName}");
+        using var _ = PushContext();
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);  // 1 elem/thread
+        IntPtr inPtr = input.Handle, outPtr = output.Handle;
+        void** args = stackalloc void*[3];
+        args[0] = &inPtr; args[1] = &outPtr; args[2] = &size;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    private unsafe void LaunchConvertFp16(string kernelName, IGpuBuffer input, IGpuBuffer output, int size)
+        => LaunchUnaryFp16(kernelName, input, output, size);
 
     /// <inheritdoc/>
     public unsafe void ConvertToFp32(IGpuBuffer input, IGpuBuffer output, int size)
@@ -11366,8 +12266,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         IntPtr pI = input.Handle, pO = output.Handle;
         void** args = stackalloc void*[4];
         args[0] = &pI; args[1] = &pO; args[2] = &rows; args[3] = &cols;
-        CudaNativeBindings.cuLaunchKernel(kernel, grid, 1, 1, (uint)blockSize, 1, 1,
-            (uint)sharedMem, IntPtr.Zero, (IntPtr)args, IntPtr.Zero);
+        // Was an UNCHECKED launch on the DEFAULT stream (IntPtr.Zero) while every other op uses _stream — a fault
+        // here went unsurfaced and could read buffers out of order vs the rest of the pipeline. Check the result and
+        // use _stream for ordering.
+        CuBlasNative.CheckCudaResult(
+            CudaNativeBindings.cuLaunchKernel(kernel, grid, 1, 1, (uint)blockSize, 1, 1,
+                (uint)sharedMem, _stream, (IntPtr)args, IntPtr.Zero),
+            "cuLaunchKernel(softmax_rows)");
     }
 
     // ─── HRR binding primitives (issue #248) ────────────────────────
@@ -12481,10 +13386,40 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     public void Dispose()
     {
+        Dispose(disposing: true);
+        GC.SuppressFinalize(this);
+    }
+
+    private void Dispose(bool disposing)
+    {
         if (_disposed)
             return;
 
         _disposed = true;
+        // Finalizer path (disposing == false) or any process/domain teardown:
+        //   - The managed members (GpuBufferPool's ConcurrentBag/ThreadLocal, the cuDNN
+        //     helpers) may already have been finalized by the runtime — touching them
+        //     throws ObjectDisposedException from the finalizer thread (fatal).
+        //   - The CUDA context may already be destroyed — every driver call below
+        //     (cublasDestroy / cuStreamDestroy / cuModuleUnload / cuCtxDestroy) would
+        //     raise an uncatchable access violation (0xC0000005), also finalizer-fatal.
+        // The OS reclaims the context and all device memory at process exit, so the only
+        // safe action here is to do nothing. Explicit Dispose during normal operation
+        // (disposing == true, not tearing down) still performs the full native cleanup.
+        // Guard on the union of both teardown signals: IsRuntimeTearingDown (this PR) and
+        // ProcessExiting (the merged #536 CUDA-finalizer-safety fix) — either means the
+        // driver/runtime may be gone, so skip the native + pool cleanup entirely.
+        if (!disposing || IsRuntimeTearingDown || ProcessExiting)
+            return;
+
+        // Flush every event-deferred free BEFORE tearing down the pool/context, blocking
+        // on incomplete events (the stream/context are still alive right here, so the
+        // waits are safe). Anything left queued would survive this Dispose holding its
+        // now-stale _context handle; when those CudaGpuBuffer instances later finalize
+        // they would cuCtxPushCurrent/cuMemFree against a DESTROYED context — the exact
+        // finalizer-fatal 0xC0000005 path this method's teardown guards exist to prevent.
+        DrainDeferredFrees(blockOldest: true);
+
         _pinnedPool.Dispose();
         _bufferPool.Dispose();
 
@@ -13443,7 +14378,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     ~CudaBackend()
     {
-        Dispose();
+        // Finalizer: never touch managed members or the CUDA driver — Dispose(bool)'s
+        // !disposing/IsRuntimeTearingDown/ProcessExiting guard makes this a no-op (the OS
+        // reclaims the context + device memory at process exit). The try/catch is
+        // belt-and-suspenders: a finalizer must NEVER throw, even if that contract changes
+        // or a future undisposed-backend path reaches managed pools that are already
+        // finalized during GC (ObjectDisposedException).
+        try { Dispose(disposing: false); } catch { }
     }
 
     internal sealed class CudaGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
@@ -13451,19 +14392,23 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         private IntPtr _context;
         private IntPtr _devicePtr;
         private readonly Action<CudaGpuBuffer>? _returnToPool;
+        private readonly IntPtr _asyncFreeStream; // non-zero ⇒ free via cuMemFreeAsync on this stream (#558 layer 6)
         private int _poolState;
 
         public int Size { get; }
         public long SizeInBytes { get; }
         public IntPtr Handle => _devicePtr;
+        internal bool IsAsyncFreed => _asyncFreeStream != IntPtr.Zero;
 
-        public CudaGpuBuffer(IntPtr context, IntPtr devicePtr, int size, Action<CudaGpuBuffer>? returnToPool = null)
+        public CudaGpuBuffer(IntPtr context, IntPtr devicePtr, int size, Action<CudaGpuBuffer>? returnToPool = null,
+            IntPtr asyncFreeStream = default)
         {
             _context = context;
             _devicePtr = devicePtr;
             Size = size;
             SizeInBytes = (long)size * sizeof(float);
             _returnToPool = returnToPool;
+            _asyncFreeStream = asyncFreeStream;
         }
 
         public void MarkRented()
@@ -13479,18 +14424,32 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             if (_devicePtr == IntPtr.Zero)
                 return;
 
-            try
+            // During CLR/AppDomain teardown the CUDA context may already be gone;
+            // calling the driver here raises an uncatchable, finalizer-fatal access
+            // violation. Skip the native free (the OS reclaims device memory at exit)
+            // and just clear the handles.
+            if (!IsRuntimeTearingDown)
             {
-                if (_context != IntPtr.Zero)
+                // Skip the native free at process exit (the driver is gone — any native CUDA
+                // call FATAL-crashes, uncatchable); otherwise free, suppressing any disposal
+                // error so a finalizer can't crash.
+                if (_context != IntPtr.Zero && !ProcessExiting)
                 {
-                    CuBlasNative.cuCtxPushCurrent(_context);
-                    CuBlasNative.cuMemFree(_devicePtr);
-                    CuBlasNative.cuCtxPopCurrent(out _);
+                    try
+                    {
+                        CuBlasNative.cuCtxPushCurrent(_context);
+                        // Stream-ordered free (#558 layer 6): race-safe + pool-reused in stream order.
+                        if (_asyncFreeStream != IntPtr.Zero)
+                            CuBlasNative.cuMemFreeAsync(_devicePtr, _asyncFreeStream);
+                        else
+                            CuBlasNative.cuMemFree(_devicePtr);
+                        CuBlasNative.cuCtxPopCurrent(out _);
+                    }
+                    catch
+                    {
+                        // Suppress disposal errors to avoid crashing finalizers.
+                    }
                 }
-            }
-            catch
-            {
-                // Suppress disposal errors to avoid crashing finalizers.
             }
 
             _devicePtr = IntPtr.Zero;
@@ -13530,17 +14489,20 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     {
         private IntPtr _context;
         private IntPtr _devicePtr;
+        private readonly IntPtr _asyncFreeStream; // #558 layer 6: free via cuMemFreeAsync when non-zero
 
         public int Size { get; }
         public long SizeInBytes { get; }
         public IntPtr Handle => _devicePtr;
+        internal bool IsAsyncFreed => _asyncFreeStream != IntPtr.Zero;
 
-        public CudaGpuByteBuffer(IntPtr context, IntPtr devicePtr, int size)
+        public CudaGpuByteBuffer(IntPtr context, IntPtr devicePtr, int size, IntPtr asyncFreeStream = default)
         {
             _context = context;
             _devicePtr = devicePtr;
             Size = size;
             SizeInBytes = size;
+            _asyncFreeStream = asyncFreeStream;
         }
 
         public void Dispose()
@@ -13548,18 +14510,30 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             if (_devicePtr == IntPtr.Zero)
                 return;
 
-            try
+            // See CudaGpuBuffer.Release: skip native CUDA calls during teardown to
+            // avoid a finalizer-fatal access violation on an already-destroyed context.
+            if (!IsRuntimeTearingDown)
             {
-                if (_context != IntPtr.Zero)
+                // Skip the native free at process exit (the driver is gone — any native CUDA
+                // call FATAL-crashes, uncatchable); otherwise free, suppressing any disposal
+                // error so a finalizer can't crash.
+                if (_context != IntPtr.Zero && !ProcessExiting)
                 {
-                    CuBlasNative.cuCtxPushCurrent(_context);
-                    CuBlasNative.cuMemFree(_devicePtr);
-                    CuBlasNative.cuCtxPopCurrent(out _);
+                    try
+                    {
+                        CuBlasNative.cuCtxPushCurrent(_context);
+                        // Stream-ordered free (#558 layer 6): race-safe + pool-reused in stream order.
+                        if (_asyncFreeStream != IntPtr.Zero)
+                            CuBlasNative.cuMemFreeAsync(_devicePtr, _asyncFreeStream);
+                        else
+                            CuBlasNative.cuMemFree(_devicePtr);
+                        CuBlasNative.cuCtxPopCurrent(out _);
+                    }
+                    catch
+                    {
+                        // Suppress disposal errors to avoid crashing finalizers.
+                    }
                 }
-            }
-            catch
-            {
-                // Suppress disposal errors to avoid crashing finalizers.
             }
 
             _devicePtr = IntPtr.Zero;

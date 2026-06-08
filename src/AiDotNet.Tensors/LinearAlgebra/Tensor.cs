@@ -4320,8 +4320,11 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         if (!IsGpuResident)
             return this;
 
-        // Force materialization of deferred download if pending
-        var arr = GetDataArray();
+        // Force realization of any pending lazy upstream (side-effect only;
+        // the returned snapshot is intentionally discarded — for a GPU-resident
+        // tensor it is a copy, so the actual download below targets the backing
+        // storage directly).
+        _ = GetDataArray();
 
         // If the backing array still has a deferred download pending, force it
         var backingArray = _data.GetBackingArrayUnsafe();
@@ -4331,12 +4334,34 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         }
 
         // If we have a GPU buffer but data was never materialized through the deferred
-        // path (e.g., tensor was created via .Gpu()), download now
+        // path (e.g., tensor was created via .Gpu()), download now.
+        //
+        // IMPORTANT: write into the BACKING storage, not the `arr` returned by
+        // GetDataArray(). For a GPU-resident tensor GetDataArray() returns a
+        // COPY (it routes through ToArray() — see GetDataArray's remarks), so
+        // Array.Copy(converted, arr, ...) lands the download in a throwaway
+        // buffer and `_data` is never updated. That silently dropped the result
+        // of any in-place GPU write — notably the GPU-resident optimizer step,
+        // which updates the weight's device buffer directly: the kernel ran and
+        // the buffer changed, but Cpu()/host reads still saw the pre-step value.
+        // AsWritableSpan() hands back the real backing span (offset/length
+        // aware), matching the engine's own DownloadIntoTensor helper.
         if (_gpuBuffer is not null && _gpuBackend is not null && _device != TensorDevice.CPU)
         {
             float[] floatData = _gpuBackend.DownloadBuffer(_gpuBuffer);
             var converted = Engines.DirectGpu.DirectGpuEngine.FromFloatArray<T>(floatData);
-            Array.Copy(converted, arr, Math.Min(converted.Length, arr.Length));
+            if (IsContiguous)
+            {
+                var dst = AsWritableSpan();
+                converted.AsSpan(0, Math.Min(converted.Length, dst.Length)).CopyTo(dst);
+            }
+            else
+            {
+                // Non-contiguous view: fall back to the element-wise setter,
+                // which routes through the storage offset/stride correctly.
+                int n = Math.Min(converted.Length, Length);
+                for (int i = 0; i < n; i++) SetFlatIndexValue(i, converted[i]);
+            }
         }
 
         _device = TensorDevice.CPU;

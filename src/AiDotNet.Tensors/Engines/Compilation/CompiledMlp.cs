@@ -191,6 +191,13 @@ internal sealed class CompiledMlp
 
     private static unsafe void RunLayerGemm(byte kernel, float[] src, float[] weight, float[] dst, int m, int k, int n)
     {
+#if !NET471
+        // JIT'd AVX2 kernel first (opt-in, gated inside TryMultiply). CompiledMlp is
+        // the path the AIsEval MLP actually takes; without this hook the JIT never
+        // reached it (the kernel auto-tuner only chose between managed/native).
+        if (Simd.JitGemmAvx2.TryMultiply(src.AsSpan(0, m * k), weight.AsSpan(0, k * n), dst.AsSpan(0, m * n), m, n, k))
+            return;
+#endif
         if (kernel == KernelNative && BlasProvider.HasRawSgemm)
         {
             // Direct native BLAS sgemm (overwrite C). Goes straight to the

@@ -202,6 +202,20 @@ internal sealed class CompiledDelegateChain<T>
         // Replay chain — straight-line delegate calls, no traversal.
         // Iterate only over the live range [0, _count).
         bool timing = BackwardTiming.Enabled;
+
+        // OOM fix: free each forward activation's GPU buffer on its LAST use — right after its step's backward; in
+        // reverse-topological order a step's output is fully consumed once its step runs (every consumer was an
+        // earlier step). Previously all forward activations stayed GPU-pinned for the whole backward, so the working
+        // set pegged at the card memory limit → OOM at scale (a tiny d256/L2 model OOM'd a 12 GB card past ~200K
+        // tokens). Skip the loss + sources (leaf params). Gated to the GPU engine; materialize-then-free is safe.
+        var gpuEngine = engine as AiDotNet.Tensors.Engines.DirectGpuTensorEngine;
+        HashSet<Tensor<T>>? freeSkip = null;
+        if (gpuEngine is not null)
+        {
+            freeSkip = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance) { loss };
+            if (sources is not null) foreach (var s in sources) freeSkip.Add(s);
+        }
+
         for (int i = 0; i < _count; i++)
         {
             ref var step = ref _steps[i];
@@ -216,6 +230,9 @@ internal sealed class CompiledDelegateChain<T>
                 long ticks = Stopwatch.GetTimestamp() - start;
                 BackwardTiming.Record(step.Backward.Method.Name, ticks);
             }
+
+            if (gpuEngine is not null && !freeSkip!.Contains(step.Output))
+                gpuEngine.InvalidateGpuCacheForTensor(step.Output);
         }
 
         if (sources is not null)

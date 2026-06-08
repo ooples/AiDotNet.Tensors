@@ -1557,6 +1557,62 @@ public class DelegatingGpuBackend : IDirectGpuBackend
         => Inner.FtrlUpdate(param, gradient, z, n, learningRate, l1Reg, l2Reg, beta, size);
 
     /// <inheritdoc/>
+    public virtual void SparseSgdUpdate(IGpuBuffer param, IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz, float learningRate, float weightDecay)
+        => Inner.SparseSgdUpdate(param, sparseIndices, sparseValues, nnz, learningRate, weightDecay);
+
+    /// <inheritdoc/>
+    public virtual void SparseSgdMomentumUpdate(IGpuBuffer param, IGpuBuffer velocity, IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz, float learningRate, float momentum, float weightDecay)
+        => Inner.SparseSgdMomentumUpdate(param, velocity, sparseIndices, sparseValues, nnz, learningRate, momentum, weightDecay);
+
+    /// <inheritdoc/>
+    public virtual void SparseAdamUpdate(IGpuBuffer param, IGpuBuffer m, IGpuBuffer v, IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz, float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step)
+        => Inner.SparseAdamUpdate(param, m, v, sparseIndices, sparseValues, nnz, learningRate, beta1, beta2, epsilon, weightDecay, step);
+
+    /// <inheritdoc/>
+    public virtual void SparseAdamWUpdate(IGpuBuffer param, IGpuBuffer m, IGpuBuffer v, IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz, float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step)
+        => Inner.SparseAdamWUpdate(param, m, v, sparseIndices, sparseValues, nnz, learningRate, beta1, beta2, epsilon, weightDecay, step);
+
+    /// <inheritdoc/>
+    public virtual void SparseRmspropUpdate(IGpuBuffer param, IGpuBuffer squaredAvg, IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz, float learningRate, float rho, float epsilon, float weightDecay)
+        => Inner.SparseRmspropUpdate(param, squaredAvg, sparseIndices, sparseValues, nnz, learningRate, rho, epsilon, weightDecay);
+
+    /// <inheritdoc/>
+    public virtual void SparseAdagradUpdate(IGpuBuffer param, IGpuBuffer accumulatedGrad, IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz, float learningRate, float epsilon, float weightDecay)
+        => Inner.SparseAdagradUpdate(param, accumulatedGrad, sparseIndices, sparseValues, nnz, learningRate, epsilon, weightDecay);
+
+    /// <inheritdoc/>
+    public virtual void SparseNagUpdate(IGpuBuffer param, IGpuBuffer velocity, IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz, float learningRate, float momentum, float weightDecay)
+        => Inner.SparseNagUpdate(param, velocity, sparseIndices, sparseValues, nnz, learningRate, momentum, weightDecay);
+
+    /// <inheritdoc/>
+    public virtual void SparseAdadeltaUpdate(IGpuBuffer param, IGpuBuffer accumGrad, IGpuBuffer accumUpdate, IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz, float rho, float epsilon, float weightDecay)
+        => Inner.SparseAdadeltaUpdate(param, accumGrad, accumUpdate, sparseIndices, sparseValues, nnz, rho, epsilon, weightDecay);
+
+    /// <inheritdoc/>
+    public virtual void SparseAmsgradUpdate(IGpuBuffer param, IGpuBuffer m, IGpuBuffer v, IGpuBuffer vMax, IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz, float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step)
+        => Inner.SparseAmsgradUpdate(param, m, v, vMax, sparseIndices, sparseValues, nnz, learningRate, beta1, beta2, epsilon, weightDecay, step);
+
+    /// <inheritdoc/>
+    public virtual void SparseAdamaxUpdate(IGpuBuffer param, IGpuBuffer m, IGpuBuffer u, IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz, float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step)
+        => Inner.SparseAdamaxUpdate(param, m, u, sparseIndices, sparseValues, nnz, learningRate, beta1, beta2, epsilon, weightDecay, step);
+
+    /// <inheritdoc/>
+    public virtual void SparseLionUpdate(IGpuBuffer param, IGpuBuffer m, IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz, float learningRate, float beta1, float beta2, float weightDecay)
+        => Inner.SparseLionUpdate(param, m, sparseIndices, sparseValues, nnz, learningRate, beta1, beta2, weightDecay);
+
+    /// <inheritdoc/>
+    public virtual void SparseNadamUpdate(IGpuBuffer param, IGpuBuffer m, IGpuBuffer v, IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz, float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step)
+        => Inner.SparseNadamUpdate(param, m, v, sparseIndices, sparseValues, nnz, learningRate, beta1, beta2, epsilon, weightDecay, step);
+
+    /// <inheritdoc/>
+    public virtual void SparseFtrlUpdate(IGpuBuffer param, IGpuBuffer z, IGpuBuffer n, IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz, float learningRate, float l1Reg, float l2Reg, float beta)
+        => Inner.SparseFtrlUpdate(param, z, n, sparseIndices, sparseValues, nnz, learningRate, l1Reg, l2Reg, beta);
+
+    /// <inheritdoc/>
+    public virtual void SparseProximalL1Update(IGpuBuffer param, IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz, float learningRate, float l1Strength)
+        => Inner.SparseProximalL1Update(param, sparseIndices, sparseValues, nnz, learningRate, l1Strength);
+
+    /// <inheritdoc/>
     public virtual void ConvertToFp16(IGpuBuffer input, IGpuBuffer output, int size)
         => Inner.ConvertToFp16(input, output, size);
 

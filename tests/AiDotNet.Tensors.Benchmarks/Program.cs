@@ -50,9 +50,27 @@ class Program
             return;
         }
 
+        if (args[0] == "--ab-mlp-kernel-bakeoff")
+        {
+            AiDotNet.Tensors.Benchmarks.MlpKernelBakeoffBench.Run();
+            return;
+        }
+
         if (args[0] == "--ab-aiseval-dopsweep")
         {
             AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.DopSweep();
+            return;
+        }
+
+        if (args[0] == "--ab-aiseval-poolstats")
+        {
+            AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.PoolStats();
+            return;
+        }
+
+        if (args[0] == "--ab-pool-wiring")
+        {
+            AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.PoolWiringBench();
             return;
         }
 

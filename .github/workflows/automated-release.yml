@@ -368,6 +368,27 @@ jobs:
             Write-Host "Skipping AiDotNet.Native.ROCm - native binaries not present"
           }
 
+          # Pack CUDA native package (NVIDIA GPU: cudart + cuBLAS + cuBLASLt + nvRTC).
+          # Binaries (~770MB) are gitignored; stage them from the official NVIDIA
+          # redistributable archives first. The runtime is far over nuget.org's 250 MB
+          # per-package limit (cuBLAS / cuBLASLt EACH exceed it), so it is published as a
+          # meta package + a set of <250 MB byte-chunk "fragment" packages that the meta's
+          # build targets reassemble into the full DLLs at the consumer's build — the same
+          # multi-part approach TorchSharp uses for its CUDA runtime. See
+          # tools/pack-cuda-split.ps1 (round-trip validated: chunks reassemble byte-for-byte).
+          $cudaNative = "src/AiDotNet.Native.CUDA/runtimes/win-x64/native"
+          if (Test-Path "src/AiDotNet.Native.CUDA/AiDotNet.Native.CUDA.csproj") {
+            Write-Host "Staging CUDA runtime from NVIDIA redist..."
+            pwsh ./tools/stage-cuda-redist.ps1
+            if ((Test-Path "$cudaNative/cudart64_12.dll") -and (Test-Path "$cudaNative/nvrtc64_120_0.dll")) {
+              Write-Host "Packing AiDotNet.Native.CUDA (split into <250MB fragment packages)..."
+              pwsh ./tools/pack-cuda-split.ps1 -Version $VERSION -OutDir out
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            } else {
+              Write-Host "Skipping AiDotNet.Native.CUDA - staging did not produce the required runtime DLLs"
+            }
+          }
+
           # Pack MoltenVK native package (Vulkan on macOS via Metal translation)
           # Only pack if all required native binaries are present for both architectures
           # Note: MoltenVK is not in the solution file, so dotnet restore/build above skips it.
@@ -477,18 +498,19 @@ jobs:
             exit 1
           fi
 
+          # Every package (including the CUDA meta + its fragment packages) is now under
+          # nuget.org's 250 MB limit, so push them all. --skip-duplicate keeps a re-run of
+          # an already-published version green; a genuine push failure (bad API key,
+          # validation, an unexpectedly over-limit package) still fails the job under
+          # `bash -e`, which is what we want — a silent skip would hide a broken release.
           for pkg in "${pkgs[@]}"; do
-            echo "Publishing $pkg to NuGet..."
+            size=$(stat -c%s "$pkg")
+            echo "Publishing $pkg to NuGet ($((size / 1024 / 1024)) MB)..."
             dotnet nuget push "$pkg" \
               --api-key ${{ secrets.NUGET_API_KEY }} \
               --source https://api.nuget.org/v3/index.json \
               --skip-duplicate
-
-            if [ $? -eq 0 ]; then
-              echo "Successfully published $pkg"
-            else
-              echo "Warning: Failed to publish $pkg (may already exist)"
-            fi
+            echo "Successfully published $pkg"
           done
 
   github-release:
@@ -530,7 +552,7 @@ jobs:
             ## Packages
 
             ${{ steps.packages.outputs.list }}
-            > Note: AiDotNet.Native.CUDA must be built locally due to large binary size (770MB).
+            > Note: AiDotNet.Native.CUDA bundles the NVIDIA CUDA 12 runtime (cudart / cuBLAS / cuBLASLt / nvRTC, ~770MB). Because that exceeds nuget.org's 250 MB per-package limit, it ships as a small meta package plus a set of `AiDotNet.Native.CUDA.Fragments.*` chunk packages that are reassembled into the full DLLs at your build (win-x64) — just `dotnet add package AiDotNet.Native.CUDA` alongside AiDotNet.Tensors on NVIDIA GPU machines; the fragments restore automatically.
             > Note: AiDotNet.Native.ROCm requires ROCm installed on the target machine for the kernel library (~496MB).
 
             ## Installation

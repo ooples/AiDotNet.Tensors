@@ -115,6 +115,18 @@ internal static class AutoTrainingCompiler
         if (!tape.Options.Persistent) return;
         if (!State.ShouldCompile) return;
 
+        // Size gate: only compile steps whose forward activation volume is large enough to benefit
+        // from GPU-resident execution. Tiny models (small RL policies, shallow tabular nets) gain
+        // nothing from compilation — kernel-launch/transfer overhead dominates — and on the GPU
+        // buffer-cache path they can trip the deferred-materializer-vs-eviction race (#226), so we
+        // keep them on the eager path. Large models (transformer-scale training) still compile.
+        if (TotalForwardElements(tape) < CompiledTrainingMinForwardElements)
+        {
+            // Mark this pattern as not-to-compile so we don't re-evaluate every step; it runs eager.
+            State.MarkCompilationFailed();
+            return;
+        }
+
         // Clone-then-train safety: when `sources` is null the cache key
         // collapses to structure-only, which would let a cloned model with
         // identical architecture hit the original's compiled plan and replay
@@ -226,6 +238,58 @@ internal static class AutoTrainingCompiler
             }
         }
         return hash;
+    }
+
+    /// <summary>
+    /// Minimum total forward-activation element count for a training step to be worth compiling.
+    /// Below this, eager execution is used: compilation overhead exceeds any GPU benefit at this
+    /// size and the GPU buffer-cache deferred-materializer path (#226) is avoided. Override with the
+    /// AIDOTNET_COMPILE_MIN_ELEMENTS environment variable (read once at type load).
+    /// </summary>
+    private static readonly long CompiledTrainingMinForwardElementsDefault =
+        long.TryParse(Environment.GetEnvironmentVariable("AIDOTNET_COMPILE_MIN_ELEMENTS"), out var configured) && configured > 0
+            ? configured
+            : 1_000_000L;
+
+    /// <summary>
+    /// Test-only override of the compile size gate. The env-backed default is a
+    /// <c>static readonly</c> read once at type load, so tests that exercise the
+    /// replay mechanism on deliberately tiny tapes cannot lower it via the env var
+    /// after the type is initialized. Set this (and reset to <c>null</c> in teardown)
+    /// to force compilation of small steps without a real million-element model.
+    /// Null = use the env-or-1M default. Mirrors the established test-hook pattern
+    /// (e.g. MixedPrecisionEmit.TestOverrideEnabled).
+    /// </summary>
+    internal static long? TestMinForwardElementsOverride { get; set; }
+
+    /// <summary>Effective size-gate threshold: the test override when set, else the env-or-1M default.</summary>
+    private static long CompiledTrainingMinForwardElements
+        => TestMinForwardElementsOverride ?? CompiledTrainingMinForwardElementsDefault;
+
+    /// <summary>Sum of forward-activation element counts on the tape (early-exits once the threshold is reached).</summary>
+    private static long TotalForwardElements<T>(GradientTape<T> tape)
+    {
+        long total = 0;
+        int count = tape.EntryCount;
+        for (int i = 0; i < count; i++)
+        {
+            ref var entry = ref tape.Entries[i];
+            var output = entry.Output;
+            if (output is null) continue;
+            long elements = 1;
+            foreach (int dim in output._shape)
+            {
+                elements *= dim;
+            }
+
+            total += elements;
+            if (total >= CompiledTrainingMinForwardElements)
+            {
+                return total;
+            }
+        }
+
+        return total;
     }
 }
 

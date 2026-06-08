@@ -96,6 +96,28 @@ internal sealed class LazyTensorScope : IDisposable
         return output;
     }
 
+    /// <summary>
+    /// Records a cross-type operation WITH a backward — the mixed-precision (#555) cast node. Identical
+    /// to <see cref="RecordCrossType{TIn,TOut}"/> for the forward, but the node carries a
+    /// <see cref="CrossTypeBackwardFunction{TIn,TOut}"/> so the compiled backward walk can bridge the
+    /// gradient from the output's dtype grad space into the input's.
+    /// </summary>
+    internal Tensor<TOut> RecordCrossTypeWithBackward<TIn, TOut>(
+        LazyNodeType opType,
+        string opName,
+        Tensor<TIn> input,
+        int[] outputShape,
+        Action<IEngine, Tensor<TOut>> execute,
+        CrossTypeBackwardFunction<TIn, TOut> backwardFn,
+        object[]? savedState = null)
+    {
+        var output = TensorAllocator.RentUninitialized<TOut>(outputShape);
+        var node = new CrossTypeLazyNode<TIn, TOut>(opType, opName, input, output, execute, backwardFn, savedState);
+        output.LazySource = node;
+        _nodes.Add(node);
+        return output;
+    }
+
     /// <summary>Records a binary operation as a lazy node.</summary>
     internal Tensor<T> RecordBinary<T>(
         LazyNodeType opType,

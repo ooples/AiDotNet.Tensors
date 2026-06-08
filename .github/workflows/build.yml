@@ -252,16 +252,39 @@ jobs:
     # gate the skipped hardware tests could not provide).
     - name: Verify AVX-512 microkernels under Intel SDE emulation
       run: |
-        SDE_DIR="$RUNNER_TEMP/sde"
-        mkdir -p "$SDE_DIR"
-        curl -fsSL "https://downloadmirror.intel.com/843185/sde-external-9.48.0-2024-11-25-lin.tar.xz" -o "$RUNNER_TEMP/sde.tar.xz"
-        tar -xf "$RUNNER_TEMP/sde.tar.xz" -C "$SDE_DIR" --strip-components=1
+        set -uo pipefail
+        # The native --verify-microkernels run is the HARD gate (always runs, exits
+        # non-zero on any microkernel mismatch). The SDE-emulated AVX-512 run is
+        # best-effort: Intel rotates the downloadmirror URLs frequently and a broken
+        # link must NOT block every PR. If the SDE download/extract fails (or the body
+        # isn't a valid tarball — a redirect HTML page returns 200), warn and skip.
         dotnet build tests/AiDotNet.Tensors.Benchmarks/AiDotNet.Tensors.Benchmarks.csproj --configuration Release --framework net10.0
         DLL="tests/AiDotNet.Tensors.Benchmarks/bin/Release/net10.0/AiDotNet.Tensors.Benchmarks.dll"
         echo "Native run (no SDE): the AVX-512 kernels SKIP on a non-AVX-512 host —"
         dotnet "$DLL" --verify-microkernels
-        echo "Under Intel SDE (-spr, emulates Sapphire Rapids AVX-512):"
-        "$SDE_DIR/sde64" -spr -- dotnet "$DLL" --verify-microkernels
+
+        SDE_DIR="$RUNNER_TEMP/sde"
+        SDE_TAR="$RUNNER_TEMP/sde.tar.xz"
+        mkdir -p "$SDE_DIR"
+        # Try mirrors in order; first one that yields a valid .tar.xz with sde64 wins.
+        SDE_URLS="https://downloadmirror.intel.com/843185/sde-external-9.48.0-2024-11-25-lin.tar.xz https://downloadmirror.intel.com/788820/sde-external-9.33.0-2024-01-07-lin.tar.xz"
+        SDE_OK=0
+        for url in $SDE_URLS; do
+          echo "Fetching Intel SDE: $url"
+          if curl -fsSL --retry 3 --retry-delay 5 "$url" -o "$SDE_TAR" \
+             && tar -tJf "$SDE_TAR" >/dev/null 2>&1 \
+             && tar -xf "$SDE_TAR" -C "$SDE_DIR" --strip-components=1 \
+             && [ -x "$SDE_DIR/sde64" ]; then
+            SDE_OK=1; break
+          fi
+          echo "  ... that mirror did not yield a usable SDE; trying the next."
+        done
+        if [ "$SDE_OK" = "1" ]; then
+          echo "Under Intel SDE (-spr, emulates Sapphire Rapids AVX-512):"
+          "$SDE_DIR/sde64" -spr -- dotnet "$DLL" --verify-microkernels
+        else
+          echo "::warning::Intel SDE download/extract failed for all mirrors (Intel rotated the URL). Skipping the SDE-emulated AVX-512 verification — the native --verify-microkernels above still ran. Update SDE_URLS in .github/workflows/build.yml with a current mirror link to re-enable it."
+        fi
 
     # Sub-S (#409) S.4: report the per-microkernel GFLOPS (% of a measured register-FMA
     # ceiling) on this runner. On a real AVX-512 runner this prints the Avx512Fp32_16x16 /

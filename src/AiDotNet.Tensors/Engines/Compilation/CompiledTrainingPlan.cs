@@ -34,6 +34,31 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private readonly Action<IEngine>[] _backwardActions;
     private readonly Tensor<T> _lossOutput;
     private readonly IEngine _engine;
+
+    // ---- CUDA-graph capture of the whole compiled training step (opt-in, default OFF) ----
+    // When AIDOTNET_CUDA_GRAPH_STEP=1 on a CUDA float plan, the fixed forward+grad-zero+
+    // backward+optimizer kernel sequence (already on STABLE pre-allocated buffers) is
+    // captured once and replayed with a single cuGraphLaunch — collapsing hundreds of
+    // per-kernel launch overheads/step into 1 (the launch-bound bottleneck for small
+    // models). Default OFF => existing training is byte-identical; eligibility is
+    // narrowly gated and any capture failure falls back to eager permanently.
+    // Default ON so users get the whole-step CUDA-graph capture (collapses per-kernel launch
+    // overhead → full GPU power) automatically; opt out with AIDOTNET_CUDA_GRAPH_STEP=0. Still
+    // narrowly gated at the call site (float + CUDA + eligible + no clip/checkpoint) and any
+    // capture failure falls back to eager permanently, so default-on can't change correctness.
+    private static readonly bool s_graphStepEnabled =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_STEP") != "0";
+    private IntPtr _stepGraphExec;
+    private long _graphStepCalls;
+    private bool _graphStepDisabled;
+    // Capture is sound only when EVERY forward+backward action enqueues its real
+    // work on the GPU stream. Host-only specialized closures (CPU-SIMD ReLU,
+    // host-.Data GEMM, fused/analytic/slice/batched-dW kernels) run once at capture
+    // time and are NOT re-executed by cuGraphLaunch, so their outputs would freeze.
+    // Set at build time = true only for all-generic (engine-dispatched) plans; any
+    // installed host-only specialization (incl. frozen-weight rebuild) clears it.
+    private bool _graphStepEligible;
+    private const int GraphWarmupSteps = 3;   // eager first so cuBLAS workspace / lazy buffers stabilize
     private readonly Tensor<T>[] _parameters;
     private readonly Tensor<T>[] _gradients;
     private readonly Tensor<T>[] _preAllocatedGrads;
@@ -90,10 +115,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         int[]? compiledInputShape = null,
         Tensor<T>? compiledInputTensor = null,
         int[]? fusedStepIndices = null,
-        Action<IEngine>[]? fusedForwardActions = null)
+        Action<IEngine>[]? fusedForwardActions = null,
+        bool graphStepEligible = false)
     {
         _forwardActions = forwardActions;
         _backwardActions = backwardActions;
+        _graphStepEligible = graphStepEligible;
         _lossOutput = lossOutput;
         _engine = engine;
         _parameters = parameters;
@@ -128,6 +155,28 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         foreach (var buf in _gpuOptimizerBuffers)
             buf.Dispose();
         _gpuOptimizerBuffers.Clear();
+
+        // Free the captured training-step graph, if any.
+        InvalidateCapturedStepGraph();
+    }
+
+    /// <summary>
+    /// Destroys the captured CUDA step graph (if any) and resets the warmup counter
+    /// so the next eligible Step() re-captures. MUST be called whenever the captured
+    /// kernel sequence's inputs change — optimizer reconfigure (new state buffers /
+    /// optimizer wiring) or a forward-action rebuild — otherwise replay would launch
+    /// kernels against freed or stale buffers.
+    /// </summary>
+    private void InvalidateCapturedStepGraph()
+    {
+        if (_stepGraphExec != IntPtr.Zero
+            && _engine is Engines.DirectGpuTensorEngine gte
+            && gte.GetBackend() is Engines.DirectGpu.CUDA.CudaBackend cb)
+        {
+            cb.DestroyCapturedGraph(_stepGraphExec);
+        }
+        _stepGraphExec = IntPtr.Zero;
+        _graphStepCalls = 0;
     }
 
     public Tensor<T>[] Gradients => _gradients;
@@ -154,6 +203,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             ? null
             : new HashSet<int>(_fusedStepIndices);
         var rebuiltForward = new List<Action<IEngine>>(_forwardSteps.Length);
+        bool installedSpecialization = false;
         int nextFusedGroupIdx = 0;
         for (int i = 0; i < _forwardSteps.Length; i++)
         {
@@ -170,10 +220,16 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             }
 
             var step = _forwardSteps[i];
-            var specialized = TryBuildSpecializedForward(step, _pinnedHandles, allowCachedB: true);
+            // Training plans mutate parameters in-place between Step() calls, so the
+            // identity-keyed pre-pack cache would serve stale weights — same policy as
+            // the initial build below. (This site used to pass true, which was
+            // harmlessly ignored while the FusedLinear branch hardcoded false; now that
+            // the branch respects the caller's policy, training must say false here.)
+            var specialized = TryBuildSpecializedForward(step, _pinnedHandles, allowCachedB: false);
             if (specialized != null)
             {
                 rebuiltForward.Add(specialized);
+                installedSpecialization = true;
             }
             else
             {
@@ -184,6 +240,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         }
         _forwardActions = rebuiltForward.ToArray();
         _isFrozenWeights = true;
+        // Installing host-only forward specializations makes the action set unsafe for
+        // CUDA-graph capture (they'd freeze under replay); the forward delegates also
+        // just changed identity, so drop eligibility and any captured graph.
+        if (installedSpecialization)
+        {
+            _graphStepEligible = false;
+            InvalidateCapturedStepGraph();
+        }
     }
 
     /// <inheritdoc/>
@@ -395,7 +459,141 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public Tensor<T> Step()
     {
+        // Opt-in CUDA-graph replay of the whole compiled step. Narrowly gated:
+        // float + CUDA backend + no grad-norm clip (a per-step host read) + no
+        // checkpointing + an all-GPU-pure action set (_graphStepEligible — host-only
+        // specialized closures would freeze under replay). Anything else, or any
+        // capture failure, runs eager.
+        if (s_graphStepEnabled && !_graphStepDisabled && _graphStepEligible && typeof(T) == typeof(float)
+            && _checkpointing is null && _maxGradNorm <= 0.0
+            && _engine is Engines.DirectGpuTensorEngine gte
+            && gte.GetBackend() is Engines.DirectGpu.CUDA.CudaBackend cb)
+        {
+            _graphStepCalls++;
+            if (_graphStepCalls > GraphWarmupSteps)
+            {
+                // Same step-atomicity contracts as StepEager (review #557 — the graph path
+                // bypasses StepEager after warmup, so without these the protections silently
+                // vanish once the graph engages):
+                //  • SuspendActivationEviction — the CAPTURE body caches activations exactly
+                //    like an eager step (the mid-step offload would race its deferred
+                //    downloads, #226 CUDA 700), and on REPLAY the eager optimizer update's
+                //    host-side ops can trigger cache inserts/evictions while the graph's
+                //    async kernel chain is still in flight.
+                //  • AutocastScope — the kernels recorded at capture must be chosen under the
+                //    SAME autocast the warmup StepEager steps ran with, or
+                //    AIDOTNET_CUDA_GRAPH_STEP=1 changes numerics after warmup (FP16
+                //    activation storage silently falling back to the non-autocast path).
+                //    AutocastScope is a thread-static stack, so nesting with StepEager's own
+                //    scope on the capture-failure fallback is safe; eviction suspension is
+                //    refcounted for the same reason.
+                var evictGuard = System.Environment.GetEnvironmentVariable("AIDOTNET_GPU_OFFLOAD") == "1"
+                    ? null
+                    : gte;
+                evictGuard?.SuspendActivationEviction();
+                using var _graphAutocast = AiDotNet.Tensors.Engines.Gpu.AutocastScope.EnableFromEnvironment();
+                try
+                {
+                    if (_stepGraphExec == IntPtr.Zero)
+                    {
+                        // Record the GPU forward+grad-zero+backward sequence into a graph,
+                        // then launch once to actually execute THIS step (capture only
+                        // records). The caller has already refreshed the persistent input
+                        // buffer's CONTENTS, so the stable pointers stay valid across replays.
+                        var exec = cb.CaptureGraph(() => RunGpuStepBodyForCapture(cb));
+                        if (exec == IntPtr.Zero) { _graphStepDisabled = true; return StepEager(); }
+                        _stepGraphExec = exec;
+                        cb.LaunchCapturedGraph(exec);
+                        // The optimizer update is run eagerly (NOT captured): its closure
+                        // increments _optimizerStep and re-evaluates lrSchedule.GetLr +
+                        // Adam/AdamW bias-correction each step, and bakes those scalars into
+                        // the kernel args — a captured replay would freeze them at the
+                        // capture step. Its kernels enqueue (in order) after the graph launch.
+                        _optimizerUpdate?.Invoke();
+                        return _lossOutput;
+                    }
+                    cb.LaunchCapturedGraph(_stepGraphExec);
+                    _optimizerUpdate?.Invoke();
+                    return _lossOutput;
+                }
+                finally
+                {
+                    evictGuard?.ResumeActivationEviction();
+                }
+            }
+        }
+        return StepEager();
+    }
+
+    /// <summary>
+    /// The GPU-only body of a training step (forward → grad-zero → loss-grad reseed →
+    /// backward), with grad-zero and loss-grad reseed done as GPU ops so a
+    /// cuGraphLaunch replay re-does them (a host Array.Clear/Copy would run only at
+    /// capture time). Used solely under the captured graph path. The optimizer update
+    /// is deliberately NOT captured — it runs eagerly in Step() so its per-step LR /
+    /// bias-correction scalars are recomputed each replay instead of frozen at capture.
+    /// </summary>
+    private void RunGpuStepBodyForCapture(Engines.DirectGpu.CUDA.CudaBackend cb)
+    {
         var engine = _engine;
+        _preForwardParamTransform?.Invoke();
+        var fwd = _forwardActions;
+        for (int i = 0; i < fwd.Length; i++) fwd[i](engine);
+
+        int esz = System.Runtime.CompilerServices.Unsafe.SizeOf<T>();
+        if (_genericGradIndices != null)
+        {
+            for (int i = 0; i < _genericGradIndices.Length; i++)
+            {
+                int idx = _genericGradIndices[i];
+                if (_preAllocatedGrads[idx].TryGetGpuBuffer() is { } gb)
+                    cb.MemsetBuffer(gb, 0, (long)_preAllocatedGrads[idx].Length * esz);
+            }
+        }
+        else
+        {
+            for (int i = 0; i < _preAllocatedGrads.Length; i++)
+                if (_preAllocatedGrads[i].TryGetGpuBuffer() is { } gb)
+                    cb.MemsetBuffer(gb, 0, (long)_preAllocatedGrads[i].Length * esz);
+        }
+        if (_lossGradSeed.TryGetGpuBuffer() is { } seedBuf && _lossGradDest?.TryGetGpuBuffer() is { } destBuf)
+            cb.CopyBufferDtoD(seedBuf, destBuf, (long)_lossGradSeed.Length * esz);
+
+        var bwd = _backwardActions;
+        for (int i = 0; i < bwd.Length; i++) bwd[i](engine);
+        // NOTE: _optimizerUpdate is intentionally NOT invoked here — it runs eagerly
+        // in Step() after LaunchCapturedGraph so the LR schedule / Adam bias-correction
+        // scalars are fresh per step rather than frozen at capture time.
+    }
+
+    private Tensor<T> StepEager()
+    {
+        var engine = _engine;
+        // #226 race fix: a compiled training step is ATOMIC — every forward activation it
+        // caches is consumed by its own backward. Suspend the engine's mid-step activation
+        // eviction for the duration of the step so the within-step VRAM-pressure offload
+        // (materialize-then-free) can no longer race the deferred-download materializers
+        // (CUDA 700 "buffer released before materialization"). The plan reuses stable
+        // buffers each step, so this does not accumulate; a step that truly exceeds VRAM
+        // now surfaces as a clean CUDA OOM instead of a 700 corruption.
+        // AIDOTNET_GPU_OFFLOAD=1 opts into within-step eviction (host-RAM offload) made
+        // race-free by the stream-sync-before-free in EvictOldestActivationsUnsafe — lower
+        // GPU memory at the cost of a sync under VRAM pressure. Default = suspend (keep the
+        // whole step resident; safest, what shipped in the #226 fix).
+        var evictGuard = System.Environment.GetEnvironmentVariable("AIDOTNET_GPU_OFFLOAD") == "1"
+            ? null
+            : engine as AiDotNet.Tensors.Engines.DirectGpuTensorEngine;
+        evictGuard?.SuspendActivationEviction();
+        // FP16 mixed precision on the FUSED path (AiDotNet #1354 / #555). The fused plan
+        // ignores AiDotNet's _mixedPrecisionContext, but the Tensors-level AutocastScope is
+        // honored by the engine's matmul/conv/elementwise GPU ops (norms, softmax, loss and
+        // reductions deliberately stay FP32 — see AutocastScope._fp16AllowedOps). Activating
+        // it for the step's forward+backward runs the dominant matmuls on FP16 Tensor Cores.
+        // Opt-in via AIDOTNET_AUTOCAST=fp16 (EnableFromEnvironment); the optimizer update's
+        // Adam/SGD ops aren't in the allowlist, so master weights/moments stay FP32.
+        using var _autocast = AiDotNet.Tensors.Engines.Gpu.AutocastScope.EnableFromEnvironment();
+        try
+        {
         // Two independent profile surfaces: PR #352's per-step
         // ProfForward/ProfBackward via _profileStepEnabled, and main's
         // Phase F StepTiming aggregator via StepTiming.Enabled. Both
@@ -571,6 +769,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         }
 
         return _lossOutput;
+        }
+        finally
+        {
+            evictGuard?.ResumeActivationEviction();
+        }
     }
 
     public unsafe void ConfigureOptimizer(
@@ -772,6 +975,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         foreach (var buf in _gpuOptimizerBuffers)
             buf.Dispose();
         _gpuOptimizerBuffers.Clear();
+        // A captured step graph holds kernel nodes wired to the OLD optimizer state
+        // buffers + update; those are about to be freed/replaced, so drop it (replay
+        // would otherwise launch against freed device memory or stale wiring).
+        InvalidateCapturedStepGraph();
 
         // Pre-allocate optimizer state buffers for each parameter
         int paramCount = _parameters.Length;
@@ -1252,6 +1459,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         foreach (var buf in _gpuOptimizerBuffers)
             buf.Dispose();
         _gpuOptimizerBuffers.Clear();
+        // Drop any captured step graph wired to the old optimizer state (see
+        // ConfigureOptimizerFloat — replay would target freed/stale buffers).
+        InvalidateCapturedStepGraph();
 
         int paramCount = _parameters.Length;
         int groupCount = groupSchedules.Count;
@@ -1927,7 +2137,16 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // detected pattern, reused by both forward and backward analytic
         // versions. Empty otherwise.
         var sharedRowSumCache = new Dictionary<int, float[]>();
-        if (typeof(T) == typeof(float))
+        // CUDA-graph eligibility + GPU utilization: on a GPU engine, prefer the GENERIC engine-dispatched
+        // (GPU-stream) path over the CPU-BLAS/SIMD host specializations below. Those specializations are a
+        // CPU optimization (SimdGemm / BlasProvider.TryGemmEx on host .Data arrays); on a GPU engine they
+        // (1) run the heavy GEMMs + elementwise on the CPU, starving the device (cortex GPU util ~7%), and
+        // (2) are host-only, so the fixed kernel sequence can't be CUDA-graph captured (AIDOTNET_CUDA_GRAPH_STEP).
+        // Routing to generic moves the work onto the GPU AND makes the whole step graph-eligible. Default ON
+        // for GPU engines; opt out with AIDOTNET_GPU_PREFER_GENERIC=0 to restore the CPU-specialized path.
+        bool preferGenericForGpu = engine.SupportsGpu
+            && Environment.GetEnvironmentVariable("AIDOTNET_GPU_PREFER_GENERIC") != "0";
+        if (typeof(T) == typeof(float) && !preferGenericForGpu)
         {
             DetectAnalyticLossMatMulBackward(forwardSteps, consumerCount, gradMap, analyticBackwardSpecs, skippableReduceSumIndices, analyticForwardSpecs, skippableReduceSumForwardIndices, sharedRowSumCache);
         }
@@ -1996,6 +2215,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // constituent steps at the position of the first fused step in each group,
         // ensuring non-fused producers that appear before a fused block still run first.
         var allForwardActions = new List<Action<IEngine>>();
+        int genericForwardCount = 0; // engine-dispatched forward actions (for CUDA-graph eligibility)
         int nextFusedGroupIdx = 0; // index into fusedForwardActions
         for (int i = 0; i < forwardSteps.Count; i++)
         {
@@ -2041,7 +2261,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // so the SgemmWithCachedB pre-pack cache (keyed on B's array
             // reference) would serve stale weights. Disable the cached path
             // for training specialization; correctness over cache-hit speed.
-            var specialized = TryBuildSpecializedForward(step, pinnedHandles, allowCachedB: false);
+            // On a GPU engine, skip the host CPU-SIMD specialization entirely (preferGenericForGpu) so the
+            // op runs on the GPU and stays CUDA-graph-capturable.
+            var specialized = preferGenericForGpu ? null : TryBuildSpecializedForward(step, pinnedHandles, allowCachedB: false);
             if (specialized != null)
             {
                 allForwardActions.Add(specialized);
@@ -2051,9 +2273,15 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 var output = step.OutputBuffer;
                 var exec = step.Execute;
                 allForwardActions.Add(eng => exec(eng, output));
+                genericForwardCount++;  // engine-dispatched (GPU-pure on a GPU engine)
             }
         }
         var forwardActions = allForwardActions.ToArray();
+        // CUDA-graph eligibility (forward half): pure only if every forward action is
+        // the generic engine-dispatched form — any specialized/fused closure is
+        // host-only and would freeze under graph replay. (No forward pruning, so the
+        // count comparison is exact.)
+        bool graphForwardPure = genericForwardCount == allForwardActions.Count;
 
         // Build backward actions: specialized per-step + fused backward for fused groups
         var backwardActions = new List<Action<IEngine>>();
@@ -2100,7 +2328,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // dW GEMM would run twice (once in the per-step backward,
             // once in the batched-dW append), defeating the optimization
             // and doubling the dominant backward cost.
-            var action = BuildSpecializedBackward(step, gradMap, consumerCount, engine, pinnedHandles,
+            // On a GPU engine, skip the host BLAS specialization (preferGenericForGpu) so the backward
+            // runs on the GPU stream and the fixed sequence stays CUDA-graph-capturable.
+            var action = preferGenericForGpu ? null : BuildSpecializedBackward(step, gradMap, consumerCount, engine, pinnedHandles,
                 dWPeeled: dWPeeledIndices.Contains(i));
             if (action != null)
             {
@@ -2173,6 +2403,36 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 gradients[i] = gradMap[parameters[i]];
         }
 
+        // CUDA-graph eligibility (backward half): pure only if every backward action
+        // is the generic engine-dispatched accumulator — analytic/slice/specialized/
+        // fused/batched-dW closures are host-only and would freeze under graph replay.
+        // Computed BEFORE pruning (pruning only removes actions, so an all-generic set
+        // stays all-generic, and a mixed set is already flagged impure here).
+        bool graphBackwardPure = genericBackwardCount == backwardActions.Count;
+        bool graphStepEligible = graphForwardPure && graphBackwardPure;
+
+        // DIAGNOSTIC (AIDOTNET_CUDA_GRAPH_STEP=1 + ineligible): record WHY the plan can't be CUDA-graph
+        // captured — the specialized/fused (host-only) actions listed here are exactly the port-to-GPU-pure
+        // targets. Written to %TEMP%/aidotnet_graphstep_diag.txt (survives xunit's console redirection) and
+        // Trace. Gated on the flag so it costs nothing in normal runs.
+        if (s_graphStepEnabled && !graphStepEligible && typeof(T) == typeof(float))
+        {
+            try
+            {
+                var specBwd = new List<string>();
+                foreach (var n in backwardStepNames)
+                    if (!n.StartsWith("generic:", StringComparison.Ordinal)) specBwd.Add(n);
+                string msg = $"[GRAPHSTEP-DIAG] INELIGIBLE fwdPure={graphForwardPure}({genericForwardCount}/{allForwardActions.Count}) "
+                    + $"bwdPure={graphBackwardPure}({genericBackwardCount}/{backwardActions.Count}); "
+                    + $"nonGenericFwd={allForwardActions.Count - genericForwardCount}; "
+                    + $"nonGenericBwd=[{string.Join(", ", specBwd)}]" + System.Environment.NewLine;
+                System.IO.File.AppendAllText(
+                    System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_graphstep_diag.txt"), msg);
+                System.Diagnostics.Trace.WriteLine(msg);
+            }
+            catch { /* diagnostic must never break the build */ }
+        }
+
         // Phase 6.3: Backward pruning — skip gradient computation for non-trainable tensors
         var paramSet = new HashSet<Tensor<T>>(parameters);
         backwardActions = BackwardPruningPass.Prune(backwardActions, forwardSteps, parameters, gradMap);
@@ -2237,7 +2497,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             compiledInputShape,
             compiledInputTensor,
             fusedStepIndices.Count > 0 ? fusedStepIndices.ToArray() : null,
-            fusedForwardActions.Count > 0 ? fusedForwardActions.ToArray() : null);
+            fusedForwardActions.Count > 0 ? fusedForwardActions.ToArray() : null,
+            graphStepEligible);
     }
 
     /// <summary>
@@ -2909,17 +3170,24 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var bArr = (float[])(object)bias.GetDataArray();
             var oArr = (float[])(object)o.GetDataArray();
 
+            var fusedAllowCachedB = allowCachedB;
             return eng =>
             {
                 // Shapes were validated when the graph was compiled; replay skips
                 // public API argument checks and goes straight to the hot kernel.
                 //
-                // allowCachedB: false because optimizer.Step() mutates wArr in
-                // place between forward calls. The pre-packed B cache keys on
-                // the array's identity, so the cached panels would be stale on
-                // every step after the first.
+                // allowCachedB is the CALLER's policy, threaded through: training
+                // plans pass false because optimizer.Step() mutates wArr in place
+                // between forward calls (the pre-packed B cache keys on array
+                // identity, so cached panels would go stale), while INFERENCE
+                // plans pass true for frozen weights. This branch used to
+                // hardcode false, which forced a full PackB on EVERY replay —
+                // the compiled MLP [128,784] replayed 10-19x SLOWER than the
+                // eager forward it traced (AIsEval compiled-mode finding; pinned
+                // by CompiledInferenceParityTests.Mlp_CompiledReplay_
+                // NotDrasticallySlowerThanEager_AtBs128).
                 CpuFusedOperations.FusedGemmBiasActivationUnchecked(
-                    inArr, wArr, bArr, oArr, M, N, K, activation, allowCachedB: false);
+                    inArr, wArr, bArr, oArr, M, N, K, activation, allowCachedB: fusedAllowCachedB);
             };
         }
 

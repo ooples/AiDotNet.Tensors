@@ -188,7 +188,15 @@ public static class AiDotNetEngine
             {
                 Current = new CpuEngine();
             }
+            return false;
+        }
 
+        // Once the GPU circuit breaker has tripped (a sticky CUDA fault corrupted the context),
+        // never re-adopt the GPU for the rest of the process — re-engaging would immediately fault
+        // again on the dead context. Stay on CPU.
+        if (_gpuCircuitBroken)
+        {
+            Current = new CpuEngine();
             return false;
         }
 
@@ -200,6 +208,7 @@ public static class AiDotNetEngine
             if (supportsGpu && GpuPassesCorrectnessProbe(gpuEngine))
             {
                 Current = gpuEngine;
+                TryRegisterGpuOffloadAllocator(gpuEngine, verbose);
                 EmitLog($"[AiDotNet] GPU acceleration enabled: {gpuEngine.Name}", verbose);
                 return true;
             }
@@ -270,6 +279,73 @@ public static class AiDotNetEngine
     }
 
     /// <summary>
+    /// Auto-registers the GPU offload allocator that matches the adopted backend
+    /// so weights/optimizer-moments tagged <see cref="LinearAlgebra.WeightLifetime.GpuPinned"/>
+    /// (via <c>TensorAllocator.RentPinnedOnGpu</c>) actually become GPU-resident.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Without this, <see cref="LinearAlgebra.WeightRegistry.OffloadAllocator"/> stays
+    /// null after GPU adoption, <c>RentPinnedOnGpu</c> silently falls back to CPU-pinned
+    /// memory, <c>Tensor.TryGetGpuBuffer()</c> returns null for those tensors, and the
+    /// GPU-resident optimizer step (<c>GpuOptimizer.TryXStep</c> → <c>backend.XUpdate</c>)
+    /// can never fire — every optimizer silently runs the CPU weight update. This was the
+    /// missing keystone behind the GPU-resident-optimizer path never executing on GPU.
+    /// </para>
+    /// <para>
+    /// Only CUDA ships an offload allocator that is also an
+    /// <c>IGpuDevicePointerWrapper</c> (the contract <c>TryGetGpuBuffer</c> needs to wrap
+    /// an externally-owned device pointer), so GPU-resident weights are CUDA-only today;
+    /// other backends keep CPU-resident moments and the optimizer falls back to CPU there.
+    /// Best-effort: any failure leaves the registry unconfigured and GPU compute still works.
+    /// </para>
+    /// </remarks>
+    private static void TryRegisterGpuOffloadAllocator(DirectGpuTensorEngine gpuEngine, bool verbose)
+    {
+        try
+        {
+            // Respect an allocator a caller already configured — don't stomp it.
+            if (LinearAlgebra.WeightRegistry.OffloadAllocator is not null)
+                return;
+
+            var directGpu = ((IEngine)gpuEngine).DirectGpu;
+            var backendName = directGpu?.BackendName?.ToUpperInvariant();
+            DirectGpu.IGpuOffloadAllocator? allocator = backendName switch
+            {
+                // Share the compute backend's CUDA context so pinned moment/weight
+                // buffers live in the SAME context as the optimizer kernels that
+                // read them — no cross-context access (which made the GPU-resident
+                // optimizer's host-readback sync flaky).
+                "CUDA" or "NVIDIA" => new DirectGpu.CUDA.CudaOffloadAllocator(
+                    directGpu?.Backend is DirectGpu.CUDA.CudaBackend cudaBackend ? cudaBackend.CudaContextHandle : IntPtr.Zero),
+                // Hip/Metal/OpenCl/Vulkan/WebGpu offload allocators exist but are
+                // not IGpuDevicePointerWrapper yet, so they cannot back a
+                // GPU-resident weight buffer. Leave the registry unconfigured for
+                // them (CPU-resident moments, CPU optimizer fallback).
+                _ => null,
+            };
+
+            if (allocator is null)
+                return;
+
+            if (!allocator.IsAvailable)
+            {
+                allocator.Dispose();
+                return;
+            }
+
+            LinearAlgebra.WeightRegistry.Configure(LinearAlgebra.WeightRegistry.CurrentOptions, allocator);
+            EmitLog($"[AiDotNet] GPU offload allocator registered ({backendName}) — weights/optimizer moments can be GPU-resident", verbose);
+        }
+        catch (Exception ex)
+        {
+            // Non-fatal: GPU compute works without GPU-resident weights; the
+            // optimizer simply keeps its CPU fallback.
+            EmitLog($"[AiDotNet] GPU offload allocator registration skipped: {ex.Message}", verbose);
+        }
+    }
+
+    /// <summary>
     /// Resets the engine to the default CPU engine.
     /// </summary>
     /// <remarks>
@@ -281,6 +357,42 @@ public static class AiDotNetEngine
     {
         Current = new CpuEngine();
         EmitLog("[AiDotNet] Reset to CPU engine", verbose: true);
+    }
+
+    private static volatile bool _gpuCircuitBroken;
+
+    /// <summary>True once a sticky CUDA fault has forced a permanent CPU fallback for this process.</summary>
+    public static bool GpuCircuitBroken => _gpuCircuitBroken;
+
+    /// <summary>
+    /// Trips the process-wide GPU circuit breaker after a sticky/context-corrupting CUDA fault
+    /// (illegal address 700, context destroyed 709, launch failed 719). Switches the engine to CPU
+    /// and blocks any further GPU adoption, so a single GPU fault degrades to CPU instead of
+    /// cascading the same failure across every subsequent op. Safe to call from inside a CUDA error
+    /// path — it never throws.
+    /// </summary>
+    public static void TripGpuCircuitBreaker(string operation, int cudaErrorCode)
+    {
+        if (_gpuCircuitBroken)
+        {
+            return;
+        }
+
+        _gpuCircuitBroken = true;
+        try
+        {
+            if (_current is DirectGpuTensorEngine)
+            {
+                _current = new CpuEngine();
+            }
+        }
+        catch
+        {
+            // The breaker must never throw — it runs from within a CUDA error handler.
+        }
+
+        EmitLog($"[AiDotNet] GPU circuit breaker tripped by '{operation}' (CUDA error {cudaErrorCode}); " +
+            "falling back to CPU for the rest of the process.", verbose: true);
     }
 
     /// <summary>

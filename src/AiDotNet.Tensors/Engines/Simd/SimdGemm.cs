@@ -98,6 +98,160 @@ internal static partial class SimdGemm
     // Intended for benchmark A/B iteration, not production config.
     internal static bool UseParallelGemm = true;
 
+    // Opt-in (AIDOTNET_ONEDNN_GEMM=1): route large no-transpose float GEMMs through
+    // oneDNN's JIT'd dnnl_sgemm (shape-specialized brgemm, 5-8× the managed kernel
+    // on small-K/N). Default OFF — managed kernel keeps the supply-chain-independent
+    // path. See the head-to-head in OneDnnProvider.TrySgemm.
+    private static readonly bool _oneDnnGemm =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_ONEDNN_GEMM") == "1";
+
+    // Opt-in (AIDOTNET_JIT_GEMM=1): route large no-transpose float GEMMs through
+    // the runtime-JIT'd AVX2 kernel (JitGemmAvx2) — 600-700 GFLOP/s on small-K/N,
+    // beats both the managed kernel and oneDNN, on our own pool. Default OFF.
+    private static readonly bool _jitGemm =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_JIT_GEMM") == "1";
+
+    // Route large no-transpose float GEMMs through native OpenBLAS (cblas_sgemm).
+    // A per-shape bake-off on the AIsEval losing shapes (LosingShapeGemmBench)
+    // showed OpenBLAS at 2-3x the managed RyuJIT-compiled kernel on exactly the
+    // GEMM-bound losers — mlp L1 [.,784,512] 199 vs 66 GF/s, transformer FFN/QKV
+    // [1024,64,*] 226-280 vs 93-121 — while managed still wins the small/thin
+    // shapes (LSTM recurrence K=64, tiny-batch transformer). RyuJIT's codegen is
+    // the gap; OpenBLAS (hand-written asm) is the proven workaround, already loaded.
+    // Default ON when OpenBLAS is present; gated to large work (>= OpenBlasMinWork)
+    // and the top-level no-transpose contiguous path only — SgemmSequential (used
+    // inside PPE regions: SDPA, batch-parallel LSTM) never routes here, so no
+    // OpenBLAS-threads x our-pool oversubscription. Set AIDOTNET_OPENBLAS_GEMM=0
+    // to force the managed kernel for A/B.
+    private static readonly bool _openBlasGemm =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_OPENBLAS_GEMM") != "0";
+
+    // Crossover from the bake-off: below ~4M MACs the managed kernel wins (native
+    // call + thread-fan-out overhead dominates the tiny compute); above it OpenBLAS
+    // pulls ahead and widens. Env-tunable.
+    internal static readonly long OpenBlasMinWork =
+        long.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_OPENBLAS_MINWORK"), out var obw) && obw > 0
+            ? obw : 4_000_000;
+
+    // Minimum contraction depth K to route to OpenBLAS-on-PPE. The bake-off shows
+    // OpenBLAS winning the isolated GEMM at all K, but END-TO-END it only wins for
+    // LARGE K (the MLP's 512/784, where B-packing + K-blocking dominate): there it
+    // flipped mlp bs=32 from 1.87x to 0.94x. At small K (=64: transformer FFN/QKV,
+    // LSTM recurrence) the managed kernel on our hot PPE wins end-to-end — the many
+    // per-GEMM OpenBLAS entries in a multi-op model (transformer: ~15 GEMMs/predict)
+    // cost more than the kernel saves. K is the clean discriminator: MLP K>=512,
+    // transformer/LSTM K=64. Env-tunable.
+    internal static readonly int OpenBlasMinK =
+        int.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_OPENBLAS_MINK"), out var obk) && obk > 0
+            ? obk : 256;
+
+    // Small-K asm panel kernel (JitGemmAvx2 6xN). Measured to beat BOTH the managed
+    // RyuJIT kernel AND OpenBLAS at small contraction depth with enough row-blocks to
+    // parallelize: transformer FFN [1024,64,128] 285 vs 111(mgd)/164(blas) GF/s, QKV
+    // [1024,64,192] 260 vs 93/200. At small K the 6-row A panel stays L1-resident, so
+    // streaming B across all column-blocks in one call (no per-tile transition) is a
+    // pure win. Default ON when the kernel is available; AIDOTNET_JIT_SMALLK=0 disables.
+    // Gated to: K <= JitSmallKMaxK (above it A[6,K] spills L1 and OpenBLAS/managed win),
+    // work >= JitSmallKMinWork (below it the serial path loses — needs parallel row-blocks),
+    // and the no-transpose contiguous top-level path.
+    private static readonly bool _jitSmallK =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_JIT_SMALLK") != "0";
+    internal static readonly int JitSmallKMaxK =
+        int.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_JIT_SMALLK_MAXK"), out var jk) && jk > 0
+            ? jk : 128;
+    internal static readonly long JitSmallKMinWork =
+        long.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_JIT_SMALLK_MINWORK"), out var jw) && jw > 0
+            ? jw : 4_000_000;
+
+    // Work CEILING for the panel route. The 6xN panel re-reads the whole B panel
+    // once per 6-row block (it is unpacked by design); B traffic = (M/6)*K*N*4 bytes.
+    // At the proven shapes (M~1024: 4-13M MACs, ~5MB B traffic) that is fine and the
+    // panel wins 227-234 GF/s. At giant-M (transformer bs=128: M=4096, 33-50M MACs,
+    // 22-33MB B re-reads per GEMM) it saturates memory bandwidth and an interleaved
+    // end-to-end A/B showed a 16% regression — those shapes fall through to the
+    // managed kernel, whose packed/blocked path handles large M. Env-tunable.
+    internal static readonly long JitSmallKMaxWork =
+        long.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_JIT_SMALLK_MAXWORK"), out var jmw) && jmw > 0
+            ? jmw : 16_000_000;
+
+    // Row ceiling for the panel route. B-reread traffic scales with the row-block
+    // count (M/6), so giant-M shapes (transformer bs=128: M=4096, 682 row-blocks)
+    // regressed in interleaved A/Bs with ANY giant-M shape routed (FFN, QKV, or just
+    // the input projection) while the proven M~1024 regime kept a 22-24% end-to-end
+    // win. Cap M so the route engages exactly where the bake-off + end-to-end A/Bs
+    // validated it; larger M falls through to the managed packed/blocked kernel.
+    internal static readonly int JitSmallKMaxM =
+        int.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_JIT_SMALLK_MAXM"), out var jmm) && jmm > 0
+            ? jmm : 2048;
+
+    // ─── Stale-weight invalidation epoch ────────────────────────────────────
+    // The identity-keyed weight caches (pre-packed B below on net5+, the
+    // Conv2D kernel-transpose cache in CpuEngine) never re-read the weight
+    // array's contents. In-place weight mutation (optimizer steps,
+    // SetParameters/WithParameters-style bulk loads) therefore left the
+    // derived copy STALE: inference after a weight update silently used the
+    // old weights (caught by AiDotNet's Issue1296 grad-accum equivalence
+    // probe — two models with bit-identical parameters produced different
+    // forwards because one had a pack from its pre-load random init).
+    //
+    // Invalidation is a single global epoch counter rather than per-array
+    // removal because the thread-static MRU slots (_threadPrePackedBKey0/1)
+    // live on OTHER threads and cannot be cleared from the invalidating
+    // thread — an epoch comparison on every hit path covers them all. Cost
+    // per lookup is one Interlocked read; cost per invalidation is a full
+    // repack of every live weight on next use, which is inherent (the
+    // weights changed). Exposed publicly via Engines.InferenceWeightCache.
+    // Lives OUTSIDE the NET5_0_OR_GREATER region: the kernel-transpose cache
+    // consumes the epoch on every target framework.
+    private static long _weightCacheEpoch;
+
+    internal static long WeightCacheEpoch => System.Threading.Interlocked.Read(ref _weightCacheEpoch);
+
+    /// <summary>
+    /// Invalidate every cached derived weight (pre-packed float/int8 B,
+    /// transposed conv kernels). Must be called after mutating a weight
+    /// array in place that may have been consumed by a weight-cached fast
+    /// path; the next call re-derives from the live array contents.
+    /// </summary>
+    internal static void InvalidateCachedWeights() => System.Threading.Interlocked.Increment(ref _weightCacheEpoch);
+
+    // ─── Per-array invalidation (review AiDotNet#1488) ──────────────────────
+    // The global epoch above evicts EVERY model's derived-weight caches; a
+    // training loop calling it per optimizer step keeps evicting the hot
+    // packs of every other model in the process. Per-array versions give
+    // targeted invalidation: each weight array gets a monotonically
+    // increasing version (CWT-keyed by identity, GC'd with the array), the
+    // cache entry records the version it was built from, and every hit path
+    // — including the cross-thread MRU slots, which per-array REMOVAL could
+    // never reach — requires it to match. A hit is therefore valid iff
+    //   entry.Epoch == WeightCacheEpoch            (no global flush since)
+    //   AND entry.SourceVersion == version(array)  (this array not dirtied)
+    private sealed class WeightArrayVersion
+    {
+        internal long Version;
+    }
+
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<System.Array, WeightArrayVersion> _weightArrayVersions = new();
+
+    /// <summary>Current mutation version of <paramref name="weights"/>;
+    /// 0 until the first <see cref="MarkWeightDirty"/>.</summary>
+    internal static long WeightArrayVersionOf(System.Array weights)
+        => _weightArrayVersions.TryGetValue(weights, out var v)
+            ? System.Threading.Interlocked.Read(ref v.Version)
+            : 0L;
+
+    /// <summary>
+    /// Invalidate the cached derived forms of ONE weight array (packed
+    /// GEMM panels, int8 packs, transposed conv kernels built from it),
+    /// leaving every other array's caches hot. Call after mutating that
+    /// array in place.
+    /// </summary>
+    internal static void MarkWeightDirty(System.Array weights)
+    {
+        var box = _weightArrayVersions.GetValue(weights, static _ => new WeightArrayVersion());
+        System.Threading.Interlocked.Increment(ref box.Version);
+    }
+
 #if NET5_0_OR_GREATER
     // ─── Path A: pre-packed B cache ────────────────────────────────────────
     //
@@ -124,6 +278,12 @@ internal static partial class SimdGemm
         // Flat index: pcIter * NumColSubBlocks + csIdx.
         internal float[][] PackedSubs = System.Array.Empty<float[]>();
         internal int NumPcIters;
+        // WeightCacheEpoch value at build time. A hit is only valid while
+        // this matches the current global epoch — see _weightCacheEpoch.
+        internal long Epoch;
+        // WeightArrayVersionOf(b) at build time — per-array invalidation
+        // (see MarkWeightDirty). Checked alongside Epoch on every hit path.
+        internal long SourceVersion;
     }
 
     private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<float[], PrePackedB> _prePackedBCache = new();
@@ -147,6 +307,14 @@ internal static partial class SimdGemm
     /// </summary>
     private static PrePackedB BuildPrePackedB(float[] b, int k, int n, int m)
     {
+        // Capture the mutation version BEFORE reading any of b's contents.
+        // Stamping at the end would race MarkWeightDirty: a mutation landing
+        // mid-pack could leave PRE-mutation data stamped with the POST-
+        // mutation version, and future hits would accept the stale pack as
+        // current. Capturing first is conservatively safe — the same race
+        // then leaves the entry stamped with the OLD version, the next
+        // lookup sees a mismatch, and the pack rebuilds.
+        long sourceVersion = WeightArrayVersionOf(b);
         int Mc = ChooseAdaptiveMc(m, k, n);
         int numRowBlocks = (m + Mc - 1) / Mc;
         int maxThreads = Helpers.CpuParallelSettings.MaxDegreeOfParallelism;
@@ -192,6 +360,8 @@ internal static partial class SimdGemm
             ColSubSize = colSubSize,
             PackedSubs = packedSubs,
             NumPcIters = numPcIters,
+            Epoch = WeightCacheEpoch,
+            SourceVersion = sourceVersion,
         };
     }
 
@@ -213,6 +383,31 @@ internal static partial class SimdGemm
         System.Span<float> c,
         int m, int k, int n)
     {
+#if !NET471
+        // Our JIT'd AVX2 kernel first (opt-in). This is the entry the MLP's
+        // MlpForward path and FusedLinear's tier-3 fallback use — without this
+        // hook the JIT (376-700 GFLOP/s) never reached the MLP, which is why a
+        // pure-GEMM MLP didn't translate the GFLOP/s win. Row-major contiguous.
+        if (_jitGemm && JitGemmAvx2.TryMultiply(a, b.AsSpan(0, k * n), c, m, n, k))
+            return;
+
+        // Small-K asm panel kernel (default on; AIDOTNET_JIT_SMALLK=0 disables).
+        // This entry is how FusedLinear routes the transformer FFN GEMMs
+        // ([B*seq,64]@[64,128]: K·N=8K <= 200K prefers cached-B) — without this
+        // hook the panel kernel never reached the FFN, only the MHA projections
+        // (which call Sgemm directly). Same gates as the Sgemm route: the 4-way
+        // bake-off shows the panel-parallel at 227-234 GF/s vs ~100 for managed
+        // (serial OR parallel) and 135-165 for OpenBLAS at these shapes, while
+        // below the work gate (e.g. bs=8's 2.1M) the cached-B/managed path wins.
+        if (_jitSmallK && JitGemmAvx2.Available
+            && k <= JitSmallKMaxK && m >= 6 && m <= JitSmallKMaxM && n >= 16
+            && (long)m * n * k >= JitSmallKMinWork && (long)m * n * k <= JitSmallKMaxWork)
+        {
+            JitGemmAvx2.RunJit(a, b.AsSpan(0, k * n), c, m, n, k);
+            return;
+        }
+#endif
+
         // Cache-eligibility gate: if n > Nc, the outer loop iterates jc multiple
         // times and our single-jc assumption breaks. Also skip if AVX-512 path is
         // eligible (the specialised kernel's layout differs).
@@ -263,9 +458,13 @@ internal static partial class SimdGemm
         if (TryGetThreadPrePackedB(b, k, n, expectedMc, out var threadCached) && threadCached is not null)
             return threadCached;
 
+        long epoch = WeightCacheEpoch;
+        long sourceVersion = WeightArrayVersionOf(b);
         if (_prePackedBCache.TryGetValue(b, out var existing)
             && existing.K == k && existing.N == n
-            && existing.Mc == expectedMc)
+            && existing.Mc == expectedMc
+            && existing.Epoch == epoch
+            && existing.SourceVersion == sourceVersion)
         {
             RememberThreadPrePackedB(b, existing);
             return existing;
@@ -276,7 +475,9 @@ internal static partial class SimdGemm
             if (_prePackedBCache.TryGetValue(b, out existing))
             {
                 if (existing.K == k && existing.N == n
-                    && existing.Mc == expectedMc)
+                    && existing.Mc == expectedMc
+                    && existing.Epoch == epoch
+                    && existing.SourceVersion == sourceVersion)
                 {
                     RememberThreadPrePackedB(b, existing);
                     return existing;
@@ -320,6 +521,12 @@ internal static partial class SimdGemm
         if (valueRef is not null
             && valueRef.TryGetTarget(out var value)
             && value.K == k && value.N == n && value.Mc == expectedMc
+            && value.Epoch == WeightCacheEpoch
+            // Per-array invalidation reaches the cross-thread MRU slots
+            // through this version comparison — the invalidating thread
+            // cannot CLEAR another thread's slot, but it CAN make the
+            // recorded SourceVersion stale.
+            && value.SourceVersion == WeightArrayVersionOf(b)
             && keyRef is not null
             && keyRef.TryGetTarget(out var key)
             && ReferenceEquals(key, b))
@@ -387,6 +594,10 @@ internal static partial class SimdGemm
         internal sbyte[][] PackedSubs = System.Array.Empty<sbyte[]>();
         internal int NumPcIters;
         internal float Scale;
+        // WeightCacheEpoch value at build time — see _weightCacheEpoch.
+        internal long Epoch;
+        // WeightArrayVersionOf(b) at build time — see MarkWeightDirty.
+        internal long SourceVersion;
     }
 
     private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<float[], Int8PrePackedB> _int8PrePackedBCache = new();
@@ -401,6 +612,8 @@ internal static partial class SimdGemm
     /// </summary>
     private static Int8PrePackedB BuildInt8PrePackedB(float[] b, int k, int n, int m)
     {
+        // Capture BEFORE reading b — see BuildPrePackedB for the race.
+        long sourceVersion = WeightArrayVersionOf(b);
         float scale = Int8Quantizer.ComputeSymmetricScale(b);
 
         int Mc = ChooseAdaptiveMc(m, k, n);
@@ -453,6 +666,8 @@ internal static partial class SimdGemm
             PackedSubs = packedSubs,
             NumPcIters = numPcIters,
             Scale = scale,
+            Epoch = WeightCacheEpoch,
+            SourceVersion = sourceVersion,
         };
     }
 
@@ -490,9 +705,13 @@ internal static partial class SimdGemm
 
     private static Int8PrePackedB GetOrBuildInt8PrePackedB(float[] b, int k, int n, int m, int expectedMc)
     {
+        long epoch = WeightCacheEpoch;
+        long sourceVersion = WeightArrayVersionOf(b);
         if (_int8PrePackedBCache.TryGetValue(b, out var existing)
             && existing.K == k && existing.N == n
-            && existing.Mc == expectedMc)
+            && existing.Mc == expectedMc
+            && existing.Epoch == epoch
+            && existing.SourceVersion == sourceVersion)
         {
             return existing;
         }
@@ -502,7 +721,9 @@ internal static partial class SimdGemm
             if (_int8PrePackedBCache.TryGetValue(b, out existing))
             {
                 if (existing.K == k && existing.N == n
-                    && existing.Mc == expectedMc)
+                    && existing.Mc == expectedMc
+                    && existing.Epoch == epoch
+                    && existing.SourceVersion == sourceVersion)
                 {
                     return existing;
                 }
@@ -861,7 +1082,9 @@ internal static partial class SimdGemm
     /// <c>BackwardFunctions</c>) can mirror the gate exactly instead of
     /// hardcoding a duplicate value that drifts when this changes.
     /// </summary>
-    internal static readonly long ParallelWorkThreshold = ComputeParallelWorkThreshold();
+    internal static readonly long ParallelWorkThreshold =
+        long.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_GEMM_PARALLEL_MINWORK"), out var gpw) && gpw > 0
+            ? gpw : ComputeParallelWorkThreshold();
 
     private static long ComputeParallelWorkThreshold()
     {
@@ -970,8 +1193,104 @@ internal static partial class SimdGemm
         Span<float> c,
         int m, int k, int n)
     {
+#if !NET471
+        // Our JIT'd AVX2 kernel first (opt-in): no transpose, row-major contiguous
+        // (lda==k, ldb==n). Beats managed + oneDNN on small-K/N, on our own pool.
+        if (_jitGemm && !transA && !transB && lda == k && ldb == n
+            && JitGemmAvx2.TryMultiply(a, b, c, m, n, k))
+            return;
+
+        // oneDNN JIT'd GEMM (opt-in). Catches the fused-MHA QKV + output-projection
+        // GEMMs (no transpose, row-major contiguous: lda==k, ldb==n) where oneDNN's
+        // brgemm is 5-8× the managed kernel. Size-gated; the tiny per-head SDPA uses
+        // SgemmSequential (separate entry) so it stays on the managed path.
+        if (_oneDnnGemm && !transA && !transB && lda == k && ldb == n
+            && (long)m * k * n >= 262_144)
+        {
+            unsafe
+            {
+                fixed (float* pa = a, pb = b, pc = c)
+                {
+                    if (Helpers.OneDnnProvider.TrySgemm(pa, pb, pc, m, k, n))
+                        return;
+                }
+            }
+        }
+
+        // Small-K asm panel kernel (default on): beats managed AND OpenBLAS at K<=128
+        // with enough row-blocks to parallelize (the transformer's FFN/QKV GEMMs).
+        // 285/260 GF/s vs 111/93 managed on FFN/QKV b32. The 6-row A panel stays
+        // L1-resident at small K, so the 6xN kernel streams B once with no per-tile
+        // managed->native transition.
+        if (_jitSmallK && JitGemmAvx2.Available && !transA && !transB && lda == k && ldb == n
+            && k <= JitSmallKMaxK && m >= 6 && m <= JitSmallKMaxM && n >= 16
+            && (long)m * n * k >= JitSmallKMinWork && (long)m * n * k <= JitSmallKMaxWork)
+        {
+            JitGemmAvx2.RunJit(a, b, c, m, n, k);
+            return;
+        }
+#endif
+        // Native OpenBLAS kernel on OUR pool for large no-transpose contiguous GEMMs.
+        // The bake-off showed OpenBLAS's microkernel at 2-3x the managed RyuJIT kernel,
+        // but routing whole calls to OpenBLAS regressed end-to-end: OpenBLAS spins its
+        // own ~N-thread pool PER CALL, and a many-GEMM model (transformer) pays that
+        // thread-sync floor on every op. The fix: pin OpenBLAS to ONE thread and supply
+        // the parallelism ourselves over the PersistentParallelExecutor (hot, spin-based,
+        // ~zero wakeup) by splitting the M rows into chunks — each chunk a single-thread
+        // OpenBLAS call. We get OpenBLAS's kernel quality with our cheap dispatch.
+        // Top-level only (SgemmSequential, used inside PPE regions, never reaches here).
+        if (_openBlasGemm && !transA && !transB && lda == k && ldb == n
+            && k >= OpenBlasMinK && (long)m * k * n >= OpenBlasMinWork && Helpers.BlasProvider.HasRawSgemm)
+        {
+            RunOpenBlasParallel(a, b, c, m, k, n);
+            return;
+        }
+
         c.Clear();
         SgemmAddInternal(a, lda, transA, b, ldb, transB, c, m, k, n, allowParallel: true, clearedOutput: true);
+    }
+
+    // Set to 1 once OpenBLAS is pinned single-thread (we own the parallelism).
+    private static int _openBlasThreadsPinned;
+
+    /// <summary>
+    /// C[m,n] = A[m,k]·B[k,n] (row-major, no-trans) using OpenBLAS's single-thread
+    /// microkernel, parallelized over M-row chunks on the PersistentParallelExecutor.
+    /// Captures OpenBLAS's kernel quality (2-3x the managed RyuJIT kernel at the MLP/
+    /// transformer shapes) without OpenBLAS's per-call thread-pool spin-up — the
+    /// reason whole-call native routing regressed the many-GEMM transformer.
+    /// </summary>
+    private static unsafe void RunOpenBlasParallel(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c, int m, int k, int n)
+    {
+        // Pin OpenBLAS to a single thread once — its internal threading is what we're
+        // replacing with our own pool.
+        if (System.Threading.Interlocked.CompareExchange(ref _openBlasThreadsPinned, 1, 0) == 0)
+            Helpers.BlasProvider.TrySetOpenBlasThreads(1);
+
+        int maxT = Helpers.CpuParallelSettings.MaxDegreeOfParallelism;
+        // One chunk per worker, but keep >= 8 rows/chunk so each single-thread call
+        // amortizes its own (small) entry cost.
+        int chunks = Math.Max(1, Math.Min(maxT, m / 8));
+
+        fixed (float* pa = a, pb = b, pc = c)
+        {
+            if (chunks <= 1)
+            {
+                Helpers.BlasProvider.SgemmRaw(m, n, k, pa, k, pb, n, pc, n);
+                return;
+            }
+            nint A = (nint)pa, B = (nint)pb, C = (nint)pc;
+            int kk = k, nn = n, mm = m, per = (m + chunks - 1) / chunks;
+            Helpers.PersistentParallelExecutor.Instance.Execute(chunks, chunk =>
+            {
+                int r0 = chunk * per;
+                if (r0 >= mm) return;
+                int rows = System.Math.Min(per, mm - r0);
+                float* aP = (float*)A + (long)r0 * kk;
+                float* cP = (float*)C + (long)r0 * nn;
+                Helpers.BlasProvider.SgemmRaw(rows, nn, kk, aP, kk, (float*)B, nn, cP, nn);
+            });
+        }
     }
 
     /// <summary>
@@ -1564,6 +1883,447 @@ internal static partial class SimdGemm
                             k, mcActual: mcTail, ncActual: ncTail);
                     }
                 }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Overwrite GEMM (C = A·B) via the no-pack direct 6×16 kernel with parallel
+    /// M-stripes (<see cref="SgemmDirectParallelM"/>), bypassing the small-matmul
+    /// gate. For thin/moderate-M, N-aligned, large-K shapes (the AIsEval MLP L0
+    /// 128×784×512 regime) this beats both the packed path and native OpenBLAS — the
+    /// no-pack kernel keeps B resident in cache while every core works on disjoint
+    /// output rows (so it is also deterministic across thread counts). Contiguous
+    /// row-major operands (lda=k, ldb=n, ldc=n). <b>Precondition:</b> n % 8 == 0 (the
+    /// masked 6×8 edge kernel); callers gate on shape — outside the winning regime
+    /// (large M or large N) the packed path / OpenBLAS win (see #368 thin-M, #475).
+    /// </summary>
+    [MethodImpl(Hot)]
+    public static void SgemmDirectParallelMInto(
+        ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c,
+        int m, int k, int n)
+    {
+        c.Clear();
+        SgemmDirectParallelM(a, k, b, n, c, m, k, n, clearedOutput: true);
+    }
+
+    /// <summary>
+    /// FP64 analog of <see cref="SgemmDirectParallelMInto"/> (#368): overwrite GEMM
+    /// (C = A·B) via a no-pack register-blocked 4×8 <see cref="Vector256{T}"/> double
+    /// microkernel, parallelised over disjoint M-row-blocks. For thin/moderate-M
+    /// shapes this beats the packed-strategy and #409 machine-code FP64 paths (which
+    /// carry pack / macro-loop overhead at thin-M, ~60 GF/s). Each output row is
+    /// written by exactly one thread in fixed K order, so it is deterministic across
+    /// thread counts. Contiguous row-major (lda=k, ldb=n, ldc=n); requires Fma +
+    /// n % 8 == 0 (caller gates). Every C element is overwritten (full 4-row × 8-col
+    /// tiles cover the M-full / N region; the M%4 tail rows are computed scalar), so
+    /// no pre-clear is needed.
+    /// </summary>
+    [MethodImpl(Hot)]
+    public static unsafe void DgemmDirectParallelMInto(
+        ReadOnlySpan<double> a, ReadOnlySpan<double> b, Span<double> c,
+        int m, int k, int n)
+    {
+        const int MRd = 4;
+        int mFull = (m / MRd) * MRd;
+        int numFullBlocks = mFull / MRd;
+        int cores = Math.Max(1, Helpers.CpuParallelSettings.MaxDegreeOfParallelism);
+        int numChunks = Math.Min(cores, Math.Max(1, (numFullBlocks + 1) / 2));
+
+        fixed (double* pA = a, pB = b, pC = c)
+        {
+            IntPtr ipA = (IntPtr)pA, ipB = (IntPtr)pB, ipC = (IntPtr)pC;
+            int kCap = k, nCap = n;
+
+            if (numChunks <= 1 || numFullBlocks == 0)
+            {
+                DgemmDirectBlockRange(pA, pB, pC, 0, numFullBlocks, kCap, nCap);
+            }
+            else
+            {
+                int blocksPerChunk = (numFullBlocks + numChunks - 1) / numChunks;
+                Helpers.PersistentParallelExecutor.Instance.Execute(numChunks, chunk =>
+                {
+                    int bs = chunk * blocksPerChunk;
+                    int be = Math.Min(bs + blocksPerChunk, numFullBlocks);
+                    if (bs < be)
+                        DgemmDirectBlockRange((double*)ipA, (double*)ipB, (double*)ipC, bs, be, kCap, nCap);
+                });
+            }
+
+            // M-tail rows [mFull, m) — at most MRd-1 rows; scalar (negligible).
+            for (int i = mFull; i < m; i++)
+            {
+                double* ci = pC + (long)i * n;
+                double* ai = pA + (long)i * k;
+                for (int j = 0; j < n; j++)
+                {
+                    double acc = 0.0;
+                    for (int p = 0; p < k; p++) acc += ai[p] * pB[(long)p * n + j];
+                    ci[j] = acc;
+                }
+            }
+        }
+    }
+
+    /// <summary>4-row × 8-col register-blocked FP64 microkernel over M-blocks
+    /// [blockStart, blockEnd). n % 8 == 0 (caller-guaranteed); overwrites C.</summary>
+    private static unsafe void DgemmDirectBlockRange(
+        double* A, double* B, double* C, int blockStart, int blockEnd, int k, int n)
+    {
+        const int MRd = 4;
+        for (int blk = blockStart; blk < blockEnd; blk++)
+        {
+            int i0 = blk * MRd;
+            double* a0 = A + (long)(i0 + 0) * k;
+            double* a1 = A + (long)(i0 + 1) * k;
+            double* a2 = A + (long)(i0 + 2) * k;
+            double* a3 = A + (long)(i0 + 3) * k;
+            for (int j = 0; j < n; j += 8)
+            {
+                var c00 = Vector256<double>.Zero; var c01 = Vector256<double>.Zero;
+                var c10 = Vector256<double>.Zero; var c11 = Vector256<double>.Zero;
+                var c20 = Vector256<double>.Zero; var c21 = Vector256<double>.Zero;
+                var c30 = Vector256<double>.Zero; var c31 = Vector256<double>.Zero;
+                double* bj = B + j;
+                for (int p = 0; p < k; p++)
+                {
+                    double* bp = bj + (long)p * n;
+                    var b0 = Avx.LoadVector256(bp);
+                    var b1 = Avx.LoadVector256(bp + 4);
+                    var av = Vector256.Create(a0[p]); c00 = Fma.MultiplyAdd(av, b0, c00); c01 = Fma.MultiplyAdd(av, b1, c01);
+                    av = Vector256.Create(a1[p]); c10 = Fma.MultiplyAdd(av, b0, c10); c11 = Fma.MultiplyAdd(av, b1, c11);
+                    av = Vector256.Create(a2[p]); c20 = Fma.MultiplyAdd(av, b0, c20); c21 = Fma.MultiplyAdd(av, b1, c21);
+                    av = Vector256.Create(a3[p]); c30 = Fma.MultiplyAdd(av, b0, c30); c31 = Fma.MultiplyAdd(av, b1, c31);
+                }
+                double* o0 = C + (long)(i0 + 0) * n + j; Avx.Store(o0, c00); Avx.Store(o0 + 4, c01);
+                double* o1 = C + (long)(i0 + 1) * n + j; Avx.Store(o1, c10); Avx.Store(o1 + 4, c11);
+                double* o2 = C + (long)(i0 + 2) * n + j; Avx.Store(o2, c20); Avx.Store(o2 + 4, c21);
+                double* o3 = C + (long)(i0 + 3) * n + j; Avx.Store(o3, c30); Avx.Store(o3 + 4, c31);
+            }
+        }
+    }
+
+    /// <summary>
+    /// FP64 thin-M GEMM with A transposed (#368): C = Aᵀ·B where A is stored [k,m]
+    /// (lda=m) and B is [k,n]. Same broadcast-A 4×8 kernel as
+    /// <see cref="DgemmDirectParallelMInto"/> but A is read strided (a[i,p] = A[p·m+i],
+    /// the 4 row values at a depth are contiguous), so NO transpose is materialised —
+    /// the transpose-into-scratch alternative regresses at thin-M. n % 8 == 0; n-major
+    /// contiguous B and C; parallel over disjoint M-row-blocks (deterministic).
+    /// </summary>
+    [MethodImpl(Hot)]
+    public static unsafe void DgemmDirectParallelMIntoTransA(
+        ReadOnlySpan<double> a, ReadOnlySpan<double> b, Span<double> c, int m, int k, int n)
+    {
+        const int MRd = 4;
+        int mFull = (m / MRd) * MRd;
+        int numFullBlocks = mFull / MRd;
+        int cores = Math.Max(1, Helpers.CpuParallelSettings.MaxDegreeOfParallelism);
+        int numChunks = Math.Min(cores, Math.Max(1, (numFullBlocks + 1) / 2));
+        fixed (double* pA = a, pB = b, pC = c)
+        {
+            IntPtr ipA = (IntPtr)pA, ipB = (IntPtr)pB, ipC = (IntPtr)pC;
+            int kCap = k, nCap = n, mCap = m;
+            if (numChunks <= 1 || numFullBlocks == 0)
+                DgemmTransABlock(pA, pB, pC, 0, numFullBlocks, kCap, nCap, mCap);
+            else
+            {
+                int blocksPerChunk = (numFullBlocks + numChunks - 1) / numChunks;
+                Helpers.PersistentParallelExecutor.Instance.Execute(numChunks, chunk =>
+                {
+                    int bs = chunk * blocksPerChunk, be = Math.Min(bs + blocksPerChunk, numFullBlocks);
+                    if (bs < be) DgemmTransABlock((double*)ipA, (double*)ipB, (double*)ipC, bs, be, kCap, nCap, mCap);
+                });
+            }
+            for (int i = mFull; i < m; i++)
+            {
+                double* ci = pC + (long)i * n;
+                for (int j = 0; j < n; j++)
+                {
+                    double acc = 0.0;
+                    for (int p = 0; p < k; p++) acc += pA[(long)p * m + i] * pB[(long)p * n + j];
+                    ci[j] = acc;
+                }
+            }
+        }
+    }
+
+    private static unsafe void DgemmTransABlock(double* A, double* B, double* C, int blockStart, int blockEnd, int k, int n, int m)
+    {
+        const int MRd = 4;
+        for (int blk = blockStart; blk < blockEnd; blk++)
+        {
+            int i0 = blk * MRd;
+            for (int j = 0; j < n; j += 8)
+            {
+                var c00 = Vector256<double>.Zero; var c01 = Vector256<double>.Zero;
+                var c10 = Vector256<double>.Zero; var c11 = Vector256<double>.Zero;
+                var c20 = Vector256<double>.Zero; var c21 = Vector256<double>.Zero;
+                var c30 = Vector256<double>.Zero; var c31 = Vector256<double>.Zero;
+                double* bj = B + j;
+                for (int p = 0; p < k; p++)
+                {
+                    double* bp = bj + (long)p * n;
+                    var b0 = Avx.LoadVector256(bp);
+                    var b1 = Avx.LoadVector256(bp + 4);
+                    double* ap = A + (long)p * m + i0; // 4 row values, contiguous
+                    var av = Vector256.Create(ap[0]); c00 = Fma.MultiplyAdd(av, b0, c00); c01 = Fma.MultiplyAdd(av, b1, c01);
+                    av = Vector256.Create(ap[1]); c10 = Fma.MultiplyAdd(av, b0, c10); c11 = Fma.MultiplyAdd(av, b1, c11);
+                    av = Vector256.Create(ap[2]); c20 = Fma.MultiplyAdd(av, b0, c20); c21 = Fma.MultiplyAdd(av, b1, c21);
+                    av = Vector256.Create(ap[3]); c30 = Fma.MultiplyAdd(av, b0, c30); c31 = Fma.MultiplyAdd(av, b1, c31);
+                }
+                double* o0 = C + (long)(i0 + 0) * n + j; Avx.Store(o0, c00); Avx.Store(o0 + 4, c01);
+                double* o1 = C + (long)(i0 + 1) * n + j; Avx.Store(o1, c10); Avx.Store(o1 + 4, c11);
+                double* o2 = C + (long)(i0 + 2) * n + j; Avx.Store(o2, c20); Avx.Store(o2 + 4, c21);
+                double* o3 = C + (long)(i0 + 3) * n + j; Avx.Store(o3, c30); Avx.Store(o3 + 4, c31);
+            }
+        }
+    }
+
+    /// <summary>
+    /// FP64 thin-M GEMM with B transposed (#368): C = A·Bᵀ where B is stored [n,k]
+    /// (ldb=k). Both A[i,:] and Bstored[j,:] are contiguous rows of length k, so this
+    /// is the NT (dot-product) microkernel — 4 A-rows × 2 Bstored-rows, vector-FMA over
+    /// k with a horizontal reduce, no transpose materialised. n % 2 == 0; parallel over
+    /// disjoint M-row-blocks (deterministic). Slightly lower peak than the no-trans
+    /// kernel (the horizontal reductions) but far above the ~57 GF/s the packed path
+    /// gives transposed thin-M.
+    /// </summary>
+    [MethodImpl(Hot)]
+    public static unsafe void DgemmDirectParallelMIntoTransB(
+        ReadOnlySpan<double> a, ReadOnlySpan<double> b, Span<double> c, int m, int k, int n)
+    {
+        const int MRd = 4;
+        int mFull = (m / MRd) * MRd;
+        int numFullBlocks = mFull / MRd;
+        int cores = Math.Max(1, Helpers.CpuParallelSettings.MaxDegreeOfParallelism);
+        int numChunks = Math.Min(cores, Math.Max(1, (numFullBlocks + 1) / 2));
+        fixed (double* pA = a, pB = b, pC = c)
+        {
+            IntPtr ipA = (IntPtr)pA, ipB = (IntPtr)pB, ipC = (IntPtr)pC;
+            int kCap = k, nCap = n;
+            if (numChunks <= 1 || numFullBlocks == 0)
+                DgemmTransBBlock(pA, pB, pC, 0, numFullBlocks, kCap, nCap);
+            else
+            {
+                int blocksPerChunk = (numFullBlocks + numChunks - 1) / numChunks;
+                Helpers.PersistentParallelExecutor.Instance.Execute(numChunks, chunk =>
+                {
+                    int bs = chunk * blocksPerChunk, be = Math.Min(bs + blocksPerChunk, numFullBlocks);
+                    if (bs < be) DgemmTransBBlock((double*)ipA, (double*)ipB, (double*)ipC, bs, be, kCap, nCap);
+                });
+            }
+            for (int i = mFull; i < m; i++)
+            {
+                double* ai = pA + (long)i * k;
+                double* ci = pC + (long)i * n;
+                for (int j = 0; j < n; j++)
+                {
+                    double* bj = pB + (long)j * k;
+                    double acc = 0.0;
+                    for (int p = 0; p < k; p++) acc += ai[p] * bj[p];
+                    ci[j] = acc;
+                }
+            }
+        }
+    }
+
+    private static unsafe void DgemmTransBBlock(double* A, double* B, double* C, int blockStart, int blockEnd, int k, int n)
+    {
+        const int MRd = 4, NRd = 2;
+        int kVec = (k / 4) * 4;
+        for (int blk = blockStart; blk < blockEnd; blk++)
+        {
+            int i0 = blk * MRd;
+            double* a0 = A + (long)(i0 + 0) * k; double* a1 = A + (long)(i0 + 1) * k;
+            double* a2 = A + (long)(i0 + 2) * k; double* a3 = A + (long)(i0 + 3) * k;
+            for (int j = 0; j + NRd <= n; j += NRd)
+            {
+                double* bj0 = B + (long)(j + 0) * k; double* bj1 = B + (long)(j + 1) * k;
+                var acc00 = Vector256<double>.Zero; var acc01 = Vector256<double>.Zero;
+                var acc10 = Vector256<double>.Zero; var acc11 = Vector256<double>.Zero;
+                var acc20 = Vector256<double>.Zero; var acc21 = Vector256<double>.Zero;
+                var acc30 = Vector256<double>.Zero; var acc31 = Vector256<double>.Zero;
+                for (int p = 0; p < kVec; p += 4)
+                {
+                    var av0 = Avx.LoadVector256(a0 + p); var av1 = Avx.LoadVector256(a1 + p);
+                    var av2 = Avx.LoadVector256(a2 + p); var av3 = Avx.LoadVector256(a3 + p);
+                    var bv0 = Avx.LoadVector256(bj0 + p); var bv1 = Avx.LoadVector256(bj1 + p);
+                    acc00 = Fma.MultiplyAdd(av0, bv0, acc00); acc01 = Fma.MultiplyAdd(av0, bv1, acc01);
+                    acc10 = Fma.MultiplyAdd(av1, bv0, acc10); acc11 = Fma.MultiplyAdd(av1, bv1, acc11);
+                    acc20 = Fma.MultiplyAdd(av2, bv0, acc20); acc21 = Fma.MultiplyAdd(av2, bv1, acc21);
+                    acc30 = Fma.MultiplyAdd(av3, bv0, acc30); acc31 = Fma.MultiplyAdd(av3, bv1, acc31);
+                }
+                double s00 = Vector256.Sum(acc00), s01 = Vector256.Sum(acc01);
+                double s10 = Vector256.Sum(acc10), s11 = Vector256.Sum(acc11);
+                double s20 = Vector256.Sum(acc20), s21 = Vector256.Sum(acc21);
+                double s30 = Vector256.Sum(acc30), s31 = Vector256.Sum(acc31);
+                for (int p = kVec; p < k; p++)
+                {
+                    double a0p = a0[p], a1p = a1[p], a2p = a2[p], a3p = a3[p], b0p = bj0[p], b1p = bj1[p];
+                    s00 += a0p * b0p; s01 += a0p * b1p; s10 += a1p * b0p; s11 += a1p * b1p;
+                    s20 += a2p * b0p; s21 += a2p * b1p; s30 += a3p * b0p; s31 += a3p * b1p;
+                }
+                double* r0 = C + (long)(i0 + 0) * n + j; r0[0] = s00; r0[1] = s01;
+                double* r1 = C + (long)(i0 + 1) * n + j; r1[0] = s10; r1[1] = s11;
+                double* r2 = C + (long)(i0 + 2) * n + j; r2[0] = s20; r2[1] = s21;
+                double* r3 = C + (long)(i0 + 3) * n + j; r3[0] = s30; r3[1] = s31;
+            }
+        }
+    }
+
+    /// <summary>FP32 thin-M GEMM with A transposed (#368): C = Aᵀ·B, A stored [k,m]
+    /// (lda=m), strided-A 4×8 broadcast kernel (no transpose). n % 8 == 0; parallel-M
+    /// (deterministic). Float analog of <see cref="DgemmDirectParallelMIntoTransA"/>.</summary>
+    [MethodImpl(Hot)]
+    public static unsafe void SgemmDirectParallelMIntoTransA(
+        ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c, int m, int k, int n)
+    {
+        const int MRf = 4;
+        int mFull = (m / MRf) * MRf;
+        int numFullBlocks = mFull / MRf;
+        int cores = Math.Max(1, Helpers.CpuParallelSettings.MaxDegreeOfParallelism);
+        int numChunks = Math.Min(cores, Math.Max(1, (numFullBlocks + 1) / 2));
+        fixed (float* pA = a, pB = b, pC = c)
+        {
+            IntPtr ipA = (IntPtr)pA, ipB = (IntPtr)pB, ipC = (IntPtr)pC;
+            int kCap = k, nCap = n, mCap = m;
+            if (numChunks <= 1 || numFullBlocks == 0)
+                SgemmTransABlock(pA, pB, pC, 0, numFullBlocks, kCap, nCap, mCap);
+            else
+            {
+                int blocksPerChunk = (numFullBlocks + numChunks - 1) / numChunks;
+                Helpers.PersistentParallelExecutor.Instance.Execute(numChunks, chunk =>
+                {
+                    int bs = chunk * blocksPerChunk, be = Math.Min(bs + blocksPerChunk, numFullBlocks);
+                    if (bs < be) SgemmTransABlock((float*)ipA, (float*)ipB, (float*)ipC, bs, be, kCap, nCap, mCap);
+                });
+            }
+            for (int i = mFull; i < m; i++)
+            {
+                float* ci = pC + (long)i * n;
+                for (int j = 0; j < n; j++)
+                {
+                    float acc = 0f;
+                    for (int p = 0; p < k; p++) acc += pA[(long)p * m + i] * pB[(long)p * n + j];
+                    ci[j] = acc;
+                }
+            }
+        }
+    }
+
+    private static unsafe void SgemmTransABlock(float* A, float* B, float* C, int blockStart, int blockEnd, int k, int n, int m)
+    {
+        const int MRf = 4;
+        for (int blk = blockStart; blk < blockEnd; blk++)
+        {
+            int i0 = blk * MRf;
+            for (int j = 0; j < n; j += 8)
+            {
+                var c0 = Vector256<float>.Zero; var c1 = Vector256<float>.Zero;
+                var c2 = Vector256<float>.Zero; var c3 = Vector256<float>.Zero;
+                float* bj = B + j;
+                for (int p = 0; p < k; p++)
+                {
+                    var b0 = Avx.LoadVector256(bj + (long)p * n);
+                    float* ap = A + (long)p * m + i0;
+                    c0 = Fma.MultiplyAdd(Vector256.Create(ap[0]), b0, c0);
+                    c1 = Fma.MultiplyAdd(Vector256.Create(ap[1]), b0, c1);
+                    c2 = Fma.MultiplyAdd(Vector256.Create(ap[2]), b0, c2);
+                    c3 = Fma.MultiplyAdd(Vector256.Create(ap[3]), b0, c3);
+                }
+                Avx.Store(C + (long)(i0 + 0) * n + j, c0);
+                Avx.Store(C + (long)(i0 + 1) * n + j, c1);
+                Avx.Store(C + (long)(i0 + 2) * n + j, c2);
+                Avx.Store(C + (long)(i0 + 3) * n + j, c3);
+            }
+        }
+    }
+
+    /// <summary>FP32 thin-M GEMM with B transposed (#368): C = A·Bᵀ, B stored [n,k]
+    /// (ldb=k), NT 4×2 dot-product kernel (Bstored rows contiguous; no transpose).
+    /// parallel-M (deterministic). Float analog of
+    /// <see cref="DgemmDirectParallelMIntoTransB"/>.</summary>
+    [MethodImpl(Hot)]
+    public static unsafe void SgemmDirectParallelMIntoTransB(
+        ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c, int m, int k, int n)
+    {
+        const int MRf = 4;
+        int mFull = (m / MRf) * MRf;
+        int numFullBlocks = mFull / MRf;
+        int cores = Math.Max(1, Helpers.CpuParallelSettings.MaxDegreeOfParallelism);
+        int numChunks = Math.Min(cores, Math.Max(1, (numFullBlocks + 1) / 2));
+        fixed (float* pA = a, pB = b, pC = c)
+        {
+            IntPtr ipA = (IntPtr)pA, ipB = (IntPtr)pB, ipC = (IntPtr)pC;
+            int kCap = k, nCap = n;
+            if (numChunks <= 1 || numFullBlocks == 0)
+                SgemmTransBBlock(pA, pB, pC, 0, numFullBlocks, kCap, nCap);
+            else
+            {
+                int blocksPerChunk = (numFullBlocks + numChunks - 1) / numChunks;
+                Helpers.PersistentParallelExecutor.Instance.Execute(numChunks, chunk =>
+                {
+                    int bs = chunk * blocksPerChunk, be = Math.Min(bs + blocksPerChunk, numFullBlocks);
+                    if (bs < be) SgemmTransBBlock((float*)ipA, (float*)ipB, (float*)ipC, bs, be, kCap, nCap);
+                });
+            }
+            for (int i = mFull; i < m; i++)
+            {
+                float* ai = pA + (long)i * k;
+                float* ci = pC + (long)i * n;
+                for (int j = 0; j < n; j++)
+                {
+                    float* bj = pB + (long)j * k;
+                    float acc = 0f;
+                    for (int p = 0; p < k; p++) acc += ai[p] * bj[p];
+                    ci[j] = acc;
+                }
+            }
+        }
+    }
+
+    private static unsafe void SgemmTransBBlock(float* A, float* B, float* C, int blockStart, int blockEnd, int k, int n)
+    {
+        const int MRf = 4, NRf = 2;
+        int kVec = (k / 8) * 8;
+        for (int blk = blockStart; blk < blockEnd; blk++)
+        {
+            int i0 = blk * MRf;
+            float* a0 = A + (long)(i0 + 0) * k; float* a1 = A + (long)(i0 + 1) * k;
+            float* a2 = A + (long)(i0 + 2) * k; float* a3 = A + (long)(i0 + 3) * k;
+            for (int j = 0; j + NRf <= n; j += NRf)
+            {
+                float* bj0 = B + (long)(j + 0) * k; float* bj1 = B + (long)(j + 1) * k;
+                var acc00 = Vector256<float>.Zero; var acc01 = Vector256<float>.Zero;
+                var acc10 = Vector256<float>.Zero; var acc11 = Vector256<float>.Zero;
+                var acc20 = Vector256<float>.Zero; var acc21 = Vector256<float>.Zero;
+                var acc30 = Vector256<float>.Zero; var acc31 = Vector256<float>.Zero;
+                for (int p = 0; p < kVec; p += 8)
+                {
+                    var av0 = Avx.LoadVector256(a0 + p); var av1 = Avx.LoadVector256(a1 + p);
+                    var av2 = Avx.LoadVector256(a2 + p); var av3 = Avx.LoadVector256(a3 + p);
+                    var bv0 = Avx.LoadVector256(bj0 + p); var bv1 = Avx.LoadVector256(bj1 + p);
+                    acc00 = Fma.MultiplyAdd(av0, bv0, acc00); acc01 = Fma.MultiplyAdd(av0, bv1, acc01);
+                    acc10 = Fma.MultiplyAdd(av1, bv0, acc10); acc11 = Fma.MultiplyAdd(av1, bv1, acc11);
+                    acc20 = Fma.MultiplyAdd(av2, bv0, acc20); acc21 = Fma.MultiplyAdd(av2, bv1, acc21);
+                    acc30 = Fma.MultiplyAdd(av3, bv0, acc30); acc31 = Fma.MultiplyAdd(av3, bv1, acc31);
+                }
+                float s00 = Vector256.Sum(acc00), s01 = Vector256.Sum(acc01);
+                float s10 = Vector256.Sum(acc10), s11 = Vector256.Sum(acc11);
+                float s20 = Vector256.Sum(acc20), s21 = Vector256.Sum(acc21);
+                float s30 = Vector256.Sum(acc30), s31 = Vector256.Sum(acc31);
+                for (int p = kVec; p < k; p++)
+                {
+                    float a0p = a0[p], a1p = a1[p], a2p = a2[p], a3p = a3[p], b0p = bj0[p], b1p = bj1[p];
+                    s00 += a0p * b0p; s01 += a0p * b1p; s10 += a1p * b0p; s11 += a1p * b1p;
+                    s20 += a2p * b0p; s21 += a2p * b1p; s30 += a3p * b0p; s31 += a3p * b1p;
+                }
+                float* r0 = C + (long)(i0 + 0) * n + j; r0[0] = s00; r0[1] = s01;
+                float* r1 = C + (long)(i0 + 1) * n + j; r1[0] = s10; r1[1] = s11;
+                float* r2 = C + (long)(i0 + 2) * n + j; r2[0] = s20; r2[1] = s21;
+                float* r3 = C + (long)(i0 + 3) * n + j; r3[0] = s30; r3[1] = s31;
             }
         }
     }

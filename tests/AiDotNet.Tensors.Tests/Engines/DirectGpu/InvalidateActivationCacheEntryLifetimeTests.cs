@@ -43,12 +43,17 @@ public class InvalidateActivationCacheEntryLifetimeTests
 
     private static ConstructorInfo GetActivationCacheEntryCtor(Type activationCacheEntryType)
     {
+        // Matches the 5-parameter ctor introduced with the managed-byte backstop:
+        // (buffer, shape, timestamp, backend, managedBytes). managedBytes is the
+        // approximate managed-array footprint the entry pins; this test doesn't
+        // exercise the byte-cap, so the caller passes 0.
         var ctor = activationCacheEntryType.GetConstructor(new[]
         {
             typeof(IGpuBuffer),
             typeof(int[]),
             typeof(long),
-            typeof(IDirectGpuBackend)
+            typeof(IDirectGpuBackend),
+            typeof(long)
         });
         Assert.NotNull(ctor);
         return ctor!;
@@ -75,7 +80,7 @@ public class InvalidateActivationCacheEntryLifetimeTests
         // this buffer's contents into the key array — its only defined CPU value.
         var key = new float[4];
         var buffer = new TrackingGpuBuffer(size: 4);
-        object entry = entryCtor.Invoke(new object?[] { buffer, new[] { 4 }, 1L, null });
+        object entry = entryCtor.Invoke(new object?[] { buffer, new[] { 4 }, 1L, null, 0L });
         Assert.True((bool)tryAdd.Invoke(activationCache, new[] { (object)key, entry })!);
 
         // Register a pending materializer. It records the buffer's DisposeCount at the

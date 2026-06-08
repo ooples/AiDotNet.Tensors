@@ -6,6 +6,22 @@ using AiDotNet.Tensors.LinearAlgebra;
 namespace AiDotNet.Tensors.Engines.Autodiff;
 
 /// <summary>
+/// Mutable holder for a LayerNorm op's mean/variance, used so the lazy/compiled
+/// realize-time forward can hand the correctly-shaped statistics to the backward
+/// pass by reference. The eager path stores raw <see cref="Tensor{T}"/> directly;
+/// the lazy path stores this holder (same instance for both savedState slots) and
+/// the realize callback swaps in the fresh tensors each replay. This avoids the
+/// trace-vs-replay rank mismatch (compile-time mean sized for [B], replay needs
+/// [B,S]) that previously threw "Destination is too short" and silently disabled
+/// the fused compiled-training path for every transformer.
+/// </summary>
+internal sealed class LayerNormStateRef<T>
+{
+    public Tensor<T>? Mean;
+    public Tensor<T>? Variance;
+}
+
+/// <summary>
 /// Contains backward function implementations for all differentiable engine operations.
 /// Each method is a <see cref="BackwardFunction{T}"/> that computes input gradients
 /// and accumulates them into the gradient dictionary.
@@ -1041,8 +1057,24 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        var mean = (Tensor<T>)savedState[0];
-        var variance = (Tensor<T>)savedState[1];
+        // savedState[0]/[1] are either raw Tensor<T> (eager path) or a shared
+        // LayerNormStateRef<T> holder (lazy/compiled path). The holder lets the
+        // realize-time forward hand correctly-shaped mean/variance to backward by
+        // reference, sidestepping the trace-vs-replay rank mismatch that otherwise
+        // threw "Destination is too short" and disabled the fused path entirely.
+        // Fail FAST when the holder was never populated (a realize-time wiring bug):
+        // letting a null flow into engine.LayerNormBackward would crash deeper with
+        // far less actionable context.
+        var mean = savedState[0] is LayerNormStateRef<T> mref
+            ? mref.Mean ?? throw new InvalidOperationException(
+                "LayerNorm backward: state holder has no Mean — the realize-time forward " +
+                "never populated it before this replay (lazy/compiled-path wiring bug).")
+            : (Tensor<T>)savedState[0];
+        var variance = savedState[1] is LayerNormStateRef<T> vref
+            ? vref.Variance ?? throw new InvalidOperationException(
+                "LayerNorm backward: state holder has no Variance — the realize-time forward " +
+                "never populated it before this replay (lazy/compiled-path wiring bug).")
+            : (Tensor<T>)savedState[1];
         var epsilon = (double)savedState[2];
 
         var gradInput = engine.LayerNormBackward(
@@ -1175,8 +1207,31 @@ internal static class BackwardFunctions<T>
         var embeddingDim = (int)savedState[3];
 
         var indices = new Tensor<long>(indicesData, indicesShape);
-        var grad = engine.TensorEmbeddingLookupBackward<T, long>(gradOutput, indices, vocabSize, embeddingDim);
-        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+
+        // Sparse-grad recording: (gradOutput, indices) is everything a
+        // sparse-aware optimizer needs to scatter-update only the accessed rows of the
+        // embedding table. No allocation here — the Build factory just wraps the existing
+        // tensor references. Sparse-aware Adam/AdamW pick this up via
+        // DifferentiableOps.GetSparseEmbeddingGradsFor; dense-path optimizers consume the
+        // same sparse contribution via SparseEmbeddingGradient.ToDense(engine).
+        var sparseGrad = SparseEmbeddingGradient<T>.Build(gradOutput, indices, vocabSize, embeddingDim);
+        DifferentiableOps.AccumulateSparseEmbeddingGrad(inputs[0], sparseGrad);
+
+        // Dense fallback ONLY when the tape isn't wired with the sparse-grad array
+        // (compiled-plan paths and other non-GradientTape backward drivers that
+        // never call SetIndexedSparseGrads). In every other case the sparse-grad
+        // array is the single source of truth — the consumer optimizers
+        // (sparse-aware Adam/AdamW scatter direct; the 17 dense-path optimizers
+        // ToDense internally) cover both representations. Skipping the dense
+        // alloc here is the actual perf win — for paper-default LayoutXLM the
+        // saved [vocabSize=250002, embeddingDim=768] tensor is 768 MB per
+        // backward, against ~16 rows of real signal. Mirrors the
+        // TensorEmbeddingLookupFromFloatIndicesBackward sister path.
+        if (DifferentiableOps.GetSparseEmbeddingGradsFor(inputs[0]) is null)
+        {
+            var dense = engine.TensorEmbeddingLookupBackward<T, long>(gradOutput, indices, vocabSize, embeddingDim);
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], dense, engine);
+        }
     }
 
     /// <summary>
@@ -1208,10 +1263,20 @@ internal static class BackwardFunctions<T>
 
         var indicesShape = (int[])capturedFloatIdx._shape.Clone();
         var indicesTensor = new Tensor<long>(idxLong, indicesShape);
-        var grad = engine.TensorEmbeddingLookupBackward<T, long>(gradOutput, indicesTensor, vocabSize, embeddingDim);
+
+        // Sparse-grad path (same rationale as TensorEmbeddingLookupBackward above):
+        // record (gradOutput, indices) without scattering into [vocabSize, embeddingDim].
         // inputs[0] is the embedding table — the only trainable input.
         // inputs[1] is the float-indices tensor; it carries no gradient.
-        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+        var sparseGrad = SparseEmbeddingGradient<T>.Build(gradOutput, indicesTensor, vocabSize, embeddingDim);
+        DifferentiableOps.AccumulateSparseEmbeddingGrad(inputs[0], sparseGrad);
+
+        // Dense fallback for callers without the sparse-grad array wired in.
+        if (DifferentiableOps.GetSparseEmbeddingGradsFor(inputs[0]) is null)
+        {
+            var dense = engine.TensorEmbeddingLookupBackward<T, long>(gradOutput, indicesTensor, vocabSize, embeddingDim);
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], dense, engine);
+        }
     }
 
     /// <summary>GeGLU backward: dispatches to engine.GeGLUBackward(gradOutput, input, dim).</summary>
@@ -1485,7 +1550,37 @@ internal static class BackwardFunctions<T>
         var indices = (Tensor<int>)savedState[0];
         var axis = (int)savedState[1];
 
-        var grad = engine.ScatterAddBackward(gradOutput, indices, inputs[0]._shape, axis);
+        // Sparse-grad fast path mirroring TensorEmbeddingLookupBackward: when the input
+        // is a 2-D table (rank-2 axis-0 gather is structurally identical to an embedding
+        // lookup over [vocab, dim]), record the gradient as a SparseEmbeddingGradient
+        // wrapper instead of scattering into the full [vocab, dim] dense buffer. This
+        // covers every Gather-as-embedding pattern (token embeddings, type embeddings,
+        // segment embeddings, codebook gathers, MoE routing tables) without the
+        // forward op needing to opt-in.
+        var inputShape = inputs[0]._shape;
+        bool sparseEligible = axis == 0 && inputShape.Length == 2;
+        if (sparseEligible)
+        {
+            int vocabSize = inputShape[0];
+            int embeddingDim = inputShape[1];
+            // gradOutput shape = indices.shape ⨯ [embeddingDim], same contract as
+            // SparseEmbeddingGradient.Build expects.
+            var sparseGrad = SparseEmbeddingGradient<T>.Build(gradOutput, indices, vocabSize, embeddingDim);
+            DifferentiableOps.AccumulateSparseEmbeddingGrad(inputs[0], sparseGrad);
+
+            if (DifferentiableOps.GetSparseEmbeddingGradsFor(inputs[0]) is null)
+            {
+                var dense = engine.ScatterAddBackward(gradOutput, indices, inputShape, axis);
+                DifferentiableOps.AccumulateGrad(grads, inputs[0], dense, engine);
+            }
+            return;
+        }
+
+        // Non-embedding-shaped Gather (rank > 2 or axis != 0): keep the dense path.
+        // Generalizing SparseEmbeddingGradient to N-D / arbitrary-axis gathers is a
+        // forward-ledger surface change for a future PR. For now, the perf win we
+        // care about (embedding-table lookups) is covered.
+        var grad = engine.ScatterAddBackward(gradOutput, indices, inputShape, axis);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 

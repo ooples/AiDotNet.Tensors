@@ -61,6 +61,15 @@ public sealed class GradientTape<T> : IDisposable
     private bool _engineExplicitlyBound;
     private readonly bool _savedReplayMode; // Saved ReplayMode from outer scope for nested tapes
     private bool _disposed;
+    // Deterministic per-step activation lifetime (GPU): the DirectGpu activation
+    // cache that an outermost tape's forward populates is released wholesale on
+    // Dispose via EvictActivationsCreatedAfter(_activationSnapshot), giving ~one-step
+    // steady-state memory (PyTorch/JAX semantics) instead of leaning on the LRU byte
+    // cap to drain a backlog. Only the engine instance captured at construction is
+    // touched, and only entries newer than the snapshot — pre-existing cross-tape
+    // intermediates are preserved. Null engine / non-GPU / nested tape => no-op.
+    private readonly Engines.DirectGpuTensorEngine? _snapshotEngine;
+    private readonly long _activationSnapshot;
 
 
     /// <summary>
@@ -148,6 +157,17 @@ public sealed class GradientTape<T> : IDisposable
         _engineExplicitlyBound = false;
         _parent = _current;
         _savedReplayMode = Compilation.AutoTrainingCompiler.ReplayMode;
+
+        // Capture the activation-cache baseline for the OUTERMOST tape on a GPU engine.
+        // On Dispose, every activation cached at a higher timestamp (i.e. produced by
+        // this forward+backward) is released deterministically — see _snapshotEngine.
+        // Captured from the construction-time engine; only used at Dispose if the tape
+        // still bound to that same instance (guards the rare CPU<->GPU rebind, #350).
+        if (_parent is null && _engine is Engines.DirectGpuTensorEngine snapEngine)
+        {
+            _snapshotEngine = snapEngine;
+            _activationSnapshot = snapEngine.ActivationCacheTimestampSnapshot();
+        }
 
         if (_options.EnableHooks)
         {
@@ -257,10 +277,218 @@ public sealed class GradientTape<T> : IDisposable
         return new GradientsScope<T>(grads);
     }
 
+    /// <summary>
+    /// Memory-bounded streaming backward. Computes the gradient of
+    /// <paramref name="loss"/> w.r.t. each tensor in <paramref name="sources"/>
+    /// (the model parameters) and hands each one to
+    /// <paramref name="onSourceGradient"/> at the exact backward step where its
+    /// last contribution lands — its provably-earliest safe release point — then
+    /// drops the reference so the gradient set is reclaimed incrementally. The
+    /// full parameter-gradient set is therefore NEVER resident at once, which is
+    /// what lets a model whose gradients exceed RAM still take a training step
+    /// (the per-parameter optimizer update happens inside the callback).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is the single-process, deterministic analogue of PyTorch's
+    /// optimizer-in-backward (<c>_apply_optimizer_in_backward</c>) / FSDP
+    /// CPU-offload, but it frees each gradient at its topological last-use rather
+    /// than at parameter-registration granularity, minimizing the peak resident
+    /// gradient set. Gradients are accumulated in the same reverse-topological
+    /// order the standard <see cref="ComputeGradients"/> path uses, so the values
+    /// handed to the callback are bit-identical to the non-streaming result.
+    /// </para>
+    /// <para>
+    /// The callback MUST consume its gradient synchronously (apply the optimizer
+    /// step) and must NOT retain the reference — the gradient buffer is released
+    /// for collection as soon as the callback returns. A source that receives no
+    /// gradient contribution gets no callback (mirrors <see cref="ComputeGradients"/>
+    /// omitting it from the returned dictionary).
+    /// </para>
+    /// </remarks>
+    /// <param name="loss">The scalar loss tensor to differentiate. Must be
+    /// tape-connected (non-null <c>GradFn</c>).</param>
+    /// <param name="sources">Parameter tensors whose gradients to stream. Each is
+    /// emitted exactly once, when complete.</param>
+    /// <param name="onSourceGradient">Invoked as <c>(source, gradient)</c> the
+    /// moment <paramref name="loss"/>'s gradient w.r.t. that source is final.</param>
+    public void ComputeGradientsStreaming(
+        Tensor<T> loss,
+        IReadOnlyList<Tensor<T>> sources,
+        Action<Tensor<T>, Tensor<T>> onSourceGradient)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(GradientTape<T>));
+        if (sources is null) throw new ArgumentNullException(nameof(sources));
+        if (onSourceGradient is null) throw new ArgumentNullException(nameof(onSourceGradient));
+        if (_entries.Count == 0)
+            throw new InvalidOperationException("Cannot compute gradients: the tape has no recorded operations.");
+        if (loss.GradFn is null)
+            throw new InvalidOperationException(
+                "Streaming backward requires a tape-connected loss (loss.GradFn is null).");
+
+        var engine = _engine;
+        var numOps = Helpers.MathHelper.GetNumericOperations<T>();
+
+        // Suspend recording so the backward ops invoked below don't append fresh
+        // tape entries (parity with the non-streaming graph path, which also
+        // suspends — see ComputeGradients line ~306).
+        var savedCurrent = _current;
+        SetCurrentTape(null);
+        try
+        {
+            // Forward topological order; reverse is the backward execution order.
+            var visited = new HashSet<GradNode<T>>();
+            var topoOrder = new List<GradNode<T>>();
+            TopologicalSort(loss.GradFn!, visited, topoOrder);
+            int stepCount = topoOrder.Count;
+
+            var steps = new BackwardStep<T>[stepCount];
+            for (int i = 0; i < stepCount; i++)
+            {
+                var node = topoOrder[stepCount - 1 - i]; // reverse for backward
+                steps[i] = new BackwardStep<T>
+                {
+                    Output = node.Output,
+                    Inputs = node.GetInputsArray(),
+                    Backward = node.Backward,
+                    SavedState = node.SavedState,
+                };
+            }
+
+            // Last backward step that contributes to each source's gradient.
+            // A source is a leaf parameter: it only ever appears as an op INPUT,
+            // so its gradient is only written (accumulated), never read as a
+            // step output — making the last write its safe release point.
+            var lastUse = new Dictionary<Tensor<T>, int>(
+                ReferenceEqualityComparer<Tensor<T>>.Instance);
+            foreach (var s in sources)
+                if (s is not null && !lastUse.ContainsKey(s)) lastUse[s] = -1;
+            for (int i = 0; i < stepCount; i++)
+            {
+                var inputs = steps[i].Inputs;
+                if (inputs is null) continue;
+                for (int j = 0; j < inputs.Length; j++)
+                {
+                    var inp = inputs[j];
+                    if (inp is not null && lastUse.ContainsKey(inp))
+                        lastUse[inp] = i; // later step overwrites → keeps the last
+                }
+            }
+            // stepIndex -> sources to emit+release right after that step runs.
+            var emitAt = new Dictionary<int, List<Tensor<T>>>();
+            foreach (var kv in lastUse)
+            {
+                if (kv.Value < 0) continue; // source never used → no gradient
+                if (!emitAt.TryGetValue(kv.Value, out var list))
+                    emitAt[kv.Value] = list = new List<Tensor<T>>();
+                list.Add(kv.Key);
+            }
+
+            var grads = new Dictionary<Tensor<T>, Tensor<T>>(
+                stepCount + 1, ReferenceEqualityComparer<Tensor<T>>.Instance);
+
+            // Seed gradient (dL/dL = 1), same construction as ComputeGradients:
+            // use the loss's ACTUAL shape (which may be [] for a 0-dim scalar or
+            // [1]), not a hardcoded [1] — a hardcoded rank-1 seed mismatches a
+            // 0-dim scalar loss and can break shape-checked backward ops.
+            Tensor<T> seedGrad;
+            if (loss.Length == 1)
+            {
+                seedGrad = new Tensor<T>(new[] { numOps.One }, (int[])loss._shape.Clone());
+            }
+            else
+            {
+                var onesData = new T[loss.Length];
+                var one = numOps.One;
+                for (int j = 0; j < onesData.Length; j++) onesData[j] = one;
+                seedGrad = new Tensor<T>(onesData, loss._shape);
+            }
+            grads[loss] = seedGrad;
+
+            for (int i = 0; i < stepCount; i++)
+            {
+                ref var step = ref steps[i];
+                if (grads.TryGetValue(step.Output, out var gradOutput))
+                {
+                    // Weight-streaming integration: rehydrate any paged-out input
+                    // weights before the backward reads them. The forward path does
+                    // this through StreamingAutogradHook.OnInputAccessed; the plain
+                    // streaming-backward walk bypasses that hook, so materialize
+                    // explicitly here. Materialize is a no-op for tensors that are
+                    // resident or not registered with the streaming pool, so this is
+                    // free when weight streaming is off. The pool evicts other LRU
+                    // weights to stay under its resident cap, keeping peak bounded —
+                    // and the just-materialized weight is resident when its gradient
+                    // completes (its last use), so the optimizer epilogue can update
+                    // it in place; eviction later writes the update back to disk.
+                    var stepInputs = step.Inputs;
+                    if (stepInputs is not null)
+                    {
+                        for (int j = 0; j < stepInputs.Length; j++)
+                        {
+                            var inp = stepInputs[j];
+                            if (inp is not null) WeightRegistry.Materialize(inp);
+                        }
+                    }
+
+                    step.Backward(gradOutput, step.Inputs, step.Output,
+                        step.SavedState ?? Array.Empty<object>(), engine, grads);
+                }
+
+                // Emit + release every source whose gradient just completed.
+                if (emitAt.TryGetValue(i, out var ready))
+                {
+                    for (int k = 0; k < ready.Count; k++)
+                    {
+                        var src = ready[k];
+                        if (grads.TryGetValue(src, out var g))
+                        {
+                            onSourceGradient(src, g);
+                            grads.Remove(src);   // drop the dict reference …
+                            src.Grad = null;     // … and the per-tensor mirror → reclaimable
+                        }
+                    }
+                }
+            }
+
+            // Clear .Grad on forward intermediates (parity with the non-persistent
+            // cleanup in ComputeGradientsViaGraphCore) so they don't pin a full
+            // backward's worth of gradient tensors after we return.
+            foreach (var node in topoOrder)
+            {
+                var outp = node.Output;
+                if (outp is not null && !lastUse.ContainsKey(outp))
+                    outp.Grad = null;
+            }
+        }
+        finally
+        {
+            SetCurrentTape(savedCurrent);
+            if (!_options.Persistent) _entries.Reset();
+        }
+    }
+
     public Dictionary<Tensor<T>, Tensor<T>> ComputeGradients(
         Tensor<T> loss,
         IReadOnlyList<Tensor<T>>? sources = null,
         bool createGraph = false)
+        => ComputeGradients(loss, sources, createGraph, seedOverride: null);
+
+    /// <summary>
+    /// Backward with an optional custom gradient seed. When <paramref name="seedOverride"/>
+    /// is null this is byte-identical to the public <see cref="ComputeGradients(Tensor{T},IReadOnlyList{Tensor{T}},bool)"/>
+    /// (ones-at-loss seeding, compiled/graph fast paths eligible). When it is supplied, the
+    /// listed (tensor, grad) pairs are seeded into the backward instead of ones-at-loss, and
+    /// the slow tape walk is forced (the compiled/graph fast paths assume a single ones seed at
+    /// <paramref name="loss"/>). This is the mixed-precision bridge entry point: the FP16 sub-tape's
+    /// backward is seeded with the FP32 grad cast down at each up-cast boundary (see
+    /// <see cref="MixedPrecisionTape"/>). Not public — mixed-dtype autograd is the only caller.
+    /// </summary>
+    internal Dictionary<Tensor<T>, Tensor<T>> ComputeGradients(
+        Tensor<T> loss,
+        IReadOnlyList<Tensor<T>>? sources,
+        bool createGraph,
+        IReadOnlyList<KeyValuePair<Tensor<T>, Tensor<T>>>? seedOverride)
     {
         if (_disposed)
         {
@@ -282,7 +510,7 @@ public sealed class GradientTape<T> : IDisposable
         bool hasHooksRegistered = (_hooks is not null && _hooks.Count > 0)
             || (_nodeHooks is not null && _nodeHooks.Count > 0)
             || (_nodePredicateHooks is not null && _nodePredicateHooks.Count > 0);
-        if (_options.Persistent && !createGraph)
+        if (_options.Persistent && !createGraph && seedOverride is null)
         {
             var compiledBwd = Compilation.AutoTrainingCompiler.TryGetCompiledBackward(this, loss, sources?.ToArray());
             if (compiledBwd is not null)
@@ -322,7 +550,7 @@ public sealed class GradientTape<T> : IDisposable
         // tape path whenever anomaly detection is on, either via the
         // per-tape flag or an ambient AnomalyModeScope. Same reasoning
         // that exists for DetectAnomaly extends to the scope.
-        if (loss.GradFn is not null && !createGraph && !DetectAnomaly && !AnomalyModeScope.IsActive && !hasHooksRegistered)
+        if (loss.GradFn is not null && !createGraph && !DetectAnomaly && !AnomalyModeScope.IsActive && !hasHooksRegistered && seedOverride is null)
         {
             // Record step pattern BEFORE backward — backward ops get recorded on the tape
             // (since DifferentiableOps always records), which would make the hash nondeterministic.
@@ -367,32 +595,65 @@ public sealed class GradientTape<T> : IDisposable
         var indexedGrads = new object?[gradIndexCount];
         DifferentiableOps.SetIndexedGrads(indexedGrads);
 
+        // Parallel sparse-gradient array for embedding-table parameters. Same _gradIndex
+        // basis as indexedGrads; each slot holds a List<SparseEmbeddingGradient<T>>.
+        // Sparse-aware optimizers (Adam/AdamW with the sparse-scatter step) check this
+        // first to skip the dense [vocab, dim] gradient that dominates per-step alloc
+        // on token-embedding-bearing models — LayoutXLM 768 MB, Amphion 1045 MB,
+        // AVHuBERT 900 MB, AST 877 MB, AudioFlamingo2 610 MB per backward without it.
+        var indexedSparseGrads = new object?[gradIndexCount];
+        DifferentiableOps.SetIndexedSparseGrads(indexedSparseGrads);
+
         // Dictionary facade: backward functions still receive Dictionary<Tensor<T>, Tensor<T>>.
         // AccumulateGrad writes to both the array and dictionary.
         var grads = new Dictionary<Tensor<T>, Tensor<T>>(
             Math.Min(gradIndexCount + 1, 1024),
             ReferenceEqualityComparer<Tensor<T>>.Instance);
 
-        // Seed: gradient of loss w.r.t. itself is ones with the same shape.
-        // Fast path for scalar loss (the overwhelmingly common case in training).
-        // Reuse cached scalar seed across training steps to avoid per-backward allocation.
-        Tensor<T> seedGrad;
-        if (loss.Length == 1)
+        if (seedOverride is not null)
         {
-            // Use loss's actual shape (could be [1] or [] for 0-dim scalar)
-            seedGrad = _cachedScalarSeed ??= new Tensor<T>(new[] { numOps.One }, (int[])loss._shape.Clone());
+            // Mixed-precision bridge: seed the supplied (tensor, grad) pairs directly instead
+            // of ones-at-loss. Each tensor is an interior node of this (sub-)tape that received
+            // its gradient from the other-dtype tape across a differentiable cast boundary.
+            for (int s = 0; s < seedOverride.Count; s++)
+            {
+                var t = seedOverride[s].Key;
+                var g = seedOverride[s].Value;
+                if (grads.TryGetValue(t, out var existing))
+                {
+                    grads[t] = engine.TensorAdd(existing, g);
+                }
+                else
+                {
+                    grads[t] = g;
+                }
+                if (t._gradIndex >= 0 && t._gradIndex < indexedGrads.Length)
+                    indexedGrads[t._gradIndex] = grads[t];
+            }
         }
         else
         {
-            var onesData = new T[loss.Length];
-            var one = numOps.One;
-            for (int j = 0; j < onesData.Length; j++)
-                onesData[j] = one;
-            seedGrad = new Tensor<T>(onesData, loss._shape);
+            // Seed: gradient of loss w.r.t. itself is ones with the same shape.
+            // Fast path for scalar loss (the overwhelmingly common case in training).
+            // Reuse cached scalar seed across training steps to avoid per-backward allocation.
+            Tensor<T> seedGrad;
+            if (loss.Length == 1)
+            {
+                // Use loss's actual shape (could be [1] or [] for 0-dim scalar)
+                seedGrad = _cachedScalarSeed ??= new Tensor<T>(new[] { numOps.One }, (int[])loss._shape.Clone());
+            }
+            else
+            {
+                var onesData = new T[loss.Length];
+                var one = numOps.One;
+                for (int j = 0; j < onesData.Length; j++)
+                    onesData[j] = one;
+                seedGrad = new Tensor<T>(onesData, loss._shape);
+            }
+            grads[loss] = seedGrad;
+            if (loss._gradIndex >= 0 && loss._gradIndex < indexedGrads.Length)
+                indexedGrads[loss._gradIndex] = seedGrad;
         }
-        grads[loss] = seedGrad;
-        if (loss._gradIndex >= 0 && loss._gradIndex < indexedGrads.Length)
-            indexedGrads[loss._gradIndex] = seedGrad;
 
         // When createGraph=false (default): suspend recording so backward engine calls
         // don't append to this tape — they'd corrupt persistent tapes and shift bounded tapes.
@@ -607,6 +868,7 @@ public sealed class GradientTape<T> : IDisposable
             DifferentiableOps._isBackwardCreateGraph = savedBackwardCreateGraph;
             // Clear indexed gradient array and reset tensor grad indices
             DifferentiableOps.ClearIndexedGrads();
+            DifferentiableOps.ClearIndexedSparseGrads();
             for (int i = 0; i < _entries.Count; i++)
             {
                 ref var e = ref _entries[i];
@@ -1742,17 +2004,24 @@ public sealed class GradientTape<T> : IDisposable
         // Only the OUTERMOST tape invalidates — nested tapes
         // (Hvp/Hessian) must not clear their parent's pending
         // materializers mid-backward. Detect outermost via
-        // _parent == null. Engine check gates the virtual dispatch.
-        if (_parent is null && _entries.Count > 0
-            && _engine is Engines.DirectGpuTensorEngine gpuEngine)
+        // _parent == null.
+        //
+        // 2026-06-05: this used to walk _entries and invalidate only each recorded
+        // op's `entry.Output`. That was INCOMPLETE — activations cached under keys
+        // that were never a recorded tape Output (e.g. the [B,H,ctx,ctx] attention
+        // scores re-uploaded during backward) leaked: gcroot traced 36GB+ of live
+        // float[] back to DirectGpuTensorEngine._activationCache surviving across
+        // training steps. The deterministic fix releases EVERY activation this
+        // forward+backward produced (timestamp > the snapshot captured at ctor),
+        // which is a strict superset of the old per-Output walk and bounds memory
+        // to ~one step. Entries created before the tape are preserved, so the
+        // cross-tape inference-reuse scenarios the old walk protected still hold.
+        // Guard on the SAME engine instance the snapshot came from (CPU<->GPU
+        // rebind, #350); the byte/managed caps remain as a backstop either way.
+        if (_parent is null && _snapshotEngine is not null
+            && ReferenceEquals(_snapshotEngine, _engine))
         {
-            for (int i = 0; i < _entries.Count; i++)
-            {
-                ref var entry = ref _entries[i];
-                var output = entry.Output;
-                if (output is null) continue;
-                gpuEngine.InvalidateGpuCacheForTensor(output);
-            }
+            _snapshotEngine.EvictActivationsCreatedAfter(_activationSnapshot);
         }
 
         // Return arena to thread-local cache for reuse by next GradientTape
