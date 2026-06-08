@@ -304,6 +304,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             System.Threading.Interlocked.Increment(ref _evictionSuspendDepth); // clamp at 0
     }
 
+    /// <summary>
+    /// Per-training-step hook: bound cross-step VRAM growth from dereferenced-but-not-yet-finalized
+    /// transient activation buffers by forcing a finalizer-backed reclaim under memory pressure.
+    /// Cheap when not pressured (one cuMemGetInfo). See <c>CudaBackend.ReclaimUnderPressure</c>.
+    /// </summary>
+    internal void ReclaimGpuMemoryUnderPressure()
+    {
+        if (TryGetBackend(out var backend) && backend is DirectGpu.CUDA.CudaBackend cudaBackend)
+            cudaBackend.ReclaimUnderPressure();
+    }
+
     // MANAGED-heap bound for the activation cache (independent of the VRAM byte cap).
     // Root cause of the cortex training OOM/crash (2026-06-05, gcroot): the cache keys
     // are the managed float[] backing arrays, but eviction was driven ONLY by GPU-buffer

@@ -773,6 +773,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         finally
         {
             evictGuard?.ResumeActivationEviction();
+            // Bound cross-step VRAM growth: per-step transient activation buffers are dereferenced
+            // here but their device memory is only released by the GC finalizer, which cannot keep
+            // pace under fast stepping (steady climb to OOM, "drained 0 pooled buffers"). Force a
+            // finalizer-backed reclaim under memory pressure (cheap no-op when not pressured).
+            (engine as AiDotNet.Tensors.Engines.DirectGpuTensorEngine)?.ReclaimGpuMemoryUnderPressure();
         }
     }
 

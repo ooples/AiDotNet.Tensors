@@ -435,6 +435,82 @@ public class MultiMatMulFusedAdamParamUpdateTests
     }
 
     /// <summary>
+    /// #1331 for EMBEDDINGS: the persistent-input fix refreshes DIRECT ops (FusedLinear reads the live
+    /// input tensor), but TensorEmbeddingLookup snapshots its indices to a FROZEN long[] at trace time
+    /// and the compiled replay reads that snapshot — so an in-place index change between steps may be
+    /// IGNORED, freezing the model on the trace batch (overfit-one-batch; explains chronically low
+    /// held-out on compiled transformer training). This test changes the token index in place and
+    /// asserts the compiled embedding output tracks the FRESH token, not the trace-time one.
+    /// </summary>
+    [Fact]
+    public void EmbeddingIndicesMustRefreshAcrossStep_NotFrozenAtCompileTime()
+    {
+        var engine = new CpuEngine();
+        const int vocab = 8, dim = 4;
+        var embeddings = FilledRand(new[] { vocab, dim }, seed: 777);   // distinct rows per token
+        var indices = new Tensor<int>(new[] { 1 });
+        indices[0] = 0;                                                  // start: token 0
+
+        ICompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            var emb = engine.TensorEmbeddingLookup(embeddings, indices); // [1, dim]
+            engine.ReduceSum(emb, null);
+            plan = scope.CompileTraining(new[] { embeddings });
+        }
+
+        using (plan)
+        {
+            plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.0f);  // freeze table → loss = row sum
+            var loss0 = plan.Step().AsSpan()[0];
+
+            indices[0] = 1;                                              // change token IN-PLACE to token 1
+            var loss1 = plan.Step().AsSpan()[0];
+
+            double rowSum0 = 0, rowSum1 = 0;
+            for (int j = 0; j < dim; j++) { rowSum0 += embeddings[0, j]; rowSum1 += embeddings[1, j]; }
+            _output.WriteLine($"  loss0(tok0)={loss0:F6} loss1(tok1)={loss1:F6} rowSum0={rowSum0:F6} rowSum1={rowSum1:F6}");
+
+            Assert.True(System.Math.Abs(loss1 - rowSum1) < 1e-4,
+                $"Compiled embedding IGNORED the in-place index update: loss1={loss1:F4}, expected ≈ row1 sum " +
+                $"{rowSum1:F4}; got ≈ row0 sum {rowSum0:F4} = FROZEN trace-time idxSnap. #1331 does not cover " +
+                "TensorEmbeddingLookup indices — compiled transformer training freezes on the trace batch.");
+        }
+    }
+
+    /// <summary>Isolates the sparse-CE gather op: change the target token in place between steps; the
+    /// compiled loss MUST track the fresh token (not freeze at the trace batch). Proves the op itself is
+    /// live + differentiable, separating it from the harness-side persistent-target plumbing.</summary>
+    [Fact]
+    public void SparseCEGather_LiveTarget_TracksFreshTargetAcrossStep()
+    {
+        var engine = new CpuEngine();
+        const int B = 2, V = 4;
+        var logits = FilledRand(new[] { B, V }, seed: 888);
+        var target = new Tensor<float>(new[] { B });
+        target[0] = 0f; target[1] = 1f;
+
+        ICompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            var logP = engine.TensorLogSoftmax(logits, 1);
+            var g = engine.SparseCEGatherTrueClass(logP, target);
+            engine.ReduceSum(g, null, false);
+            plan = scope.CompileTraining(new[] { logits });
+        }
+        using (plan)
+        {
+            plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.0f);  // freeze logits → loss = Σ logP[i,target[i]]
+            var loss0 = plan.Step().AsSpan()[0];
+            target[1] = 3f;                                                  // change token IN-PLACE
+            var loss1 = plan.Step().AsSpan()[0];
+            _output.WriteLine($"  loss0(tok 0,1)={loss0:F6} loss1(tok 0,3)={loss1:F6}");
+            Assert.True(System.Math.Abs(loss1 - loss0) > 1e-5,
+                $"SparseCEGatherTrueClass FROZE the target: loss0={loss0:F5}==loss1={loss1:F5}. The op must re-read live targets.");
+        }
+    }
+
+    /// <summary>
     /// Larger Transformer-shaped chain: embedding → multi-head projection
     /// pattern (Reshape + Permute) → attention-like matmul + softmax →
     /// Reshape back → LayerNorm. Tries to reproduce the buffer-aliasing
