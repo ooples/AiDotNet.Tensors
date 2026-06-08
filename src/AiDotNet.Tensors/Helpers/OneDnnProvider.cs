@@ -99,8 +99,13 @@ internal static class OneDnnProvider
         if (size <= 0) return IntPtr.Zero;
         if (_scratchpadCap < size)
         {
+            // Allocate the new buffer BEFORE freeing the old one. If AllocHGlobal throws
+            // (e.g. OOM), the previous buffer and capacity stay valid — otherwise
+            // _scratchpadBuf would be left pointing at freed memory and the next call would
+            // hand a dangling pointer to dnnl_memory_create (use-after-free).
+            IntPtr newBuf = Marshal.AllocHGlobal((IntPtr)size);
             if (_scratchpadBuf != IntPtr.Zero) Marshal.FreeHGlobal(_scratchpadBuf);
-            _scratchpadBuf = Marshal.AllocHGlobal((IntPtr)size);
+            _scratchpadBuf = newBuf;
             _scratchpadCap = size;
         }
         return _scratchpadBuf;

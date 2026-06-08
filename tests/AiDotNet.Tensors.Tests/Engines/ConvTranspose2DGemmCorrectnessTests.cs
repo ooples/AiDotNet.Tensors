@@ -283,7 +283,14 @@ public class ConvTranspose2DGemmCorrectnessTests
         // (the kernel falling back to the BLAS/scalar cliff, ~40× slower at this shape)
         // still blows past even the scaled budget — the threshold is normalized, not weakened.
         double effectiveCores = MeasureEffectiveCores();
-        double loadFactor = Math.Min(Environment.ProcessorCount, Math.Max(1.0, Environment.ProcessorCount / effectiveCores));
+        double rawLoadFactor = Math.Min(Environment.ProcessorCount, Math.Max(1.0, Environment.ProcessorCount / effectiveCores));
+        // Cap the relaxation so the load-adjusted budget can NEVER reach the known regression
+        // boundary — otherwise a fully-contended loadFactor (up to ProcessorCount×) could lift
+        // the budget past the ~215 ms OpenBLAS/scalar-cliff latency and let a genuine regression
+        // pass, nullifying the sentinel. Keep adaptation up to 90% of that boundary.
+        const double openBlasRegressionMs = 215.0;
+        double maxSafeFactor = Math.Max(1.0, (openBlasRegressionMs * 0.9) / budgetMs);
+        double loadFactor = Math.Min(rawLoadFactor, maxSafeFactor);
         double effectiveBudgetMs = budgetMs * loadFactor;
         Assert.True(msPerCall < effectiveBudgetMs,
             $"L2 ConvTranspose2D took {msPerCall:F1} ms/call — exceeds load-adjusted {effectiveBudgetMs:F0} ms " +
