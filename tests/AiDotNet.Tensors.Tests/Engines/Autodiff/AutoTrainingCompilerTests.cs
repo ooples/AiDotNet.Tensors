@@ -22,12 +22,19 @@ public class AutoTrainingCompilerTests : IDisposable
     {
         AutoTrainingCompiler.ResetState();
         AutoTrainingCompiler.Enabled = true;
+        // These tests exercise the compile/replay MECHANISM on deliberately tiny
+        // (2x2) tapes. The production size gate (default 1M forward elements) would
+        // otherwise route such steps to the eager path and never activate ReplayMode.
+        // Drop the gate to 1 so the smallest tape still compiles — the gate's own
+        // heuristic isn't what these tests cover.
+        AutoTrainingCompiler.TestMinForwardElementsOverride = 1;
     }
 
     public void Dispose()
     {
         AutoTrainingCompiler.ResetState();
         AutoTrainingCompiler.Enabled = true;
+        AutoTrainingCompiler.TestMinForwardElementsOverride = null;
     }
 
     // ──────────────────────────────────────────────────────────────

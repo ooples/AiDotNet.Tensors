@@ -244,12 +244,27 @@ internal static class AutoTrainingCompiler
     /// Minimum total forward-activation element count for a training step to be worth compiling.
     /// Below this, eager execution is used: compilation overhead exceeds any GPU benefit at this
     /// size and the GPU buffer-cache deferred-materializer path (#226) is avoided. Override with the
-    /// AIDOTNET_COMPILE_MIN_ELEMENTS environment variable.
+    /// AIDOTNET_COMPILE_MIN_ELEMENTS environment variable (read once at type load).
     /// </summary>
-    private static readonly long CompiledTrainingMinForwardElements =
+    private static readonly long CompiledTrainingMinForwardElementsDefault =
         long.TryParse(Environment.GetEnvironmentVariable("AIDOTNET_COMPILE_MIN_ELEMENTS"), out var configured) && configured > 0
             ? configured
             : 1_000_000L;
+
+    /// <summary>
+    /// Test-only override of the compile size gate. The env-backed default is a
+    /// <c>static readonly</c> read once at type load, so tests that exercise the
+    /// replay mechanism on deliberately tiny tapes cannot lower it via the env var
+    /// after the type is initialized. Set this (and reset to <c>null</c> in teardown)
+    /// to force compilation of small steps without a real million-element model.
+    /// Null = use the env-or-1M default. Mirrors the established test-hook pattern
+    /// (e.g. MixedPrecisionEmit.TestOverrideEnabled).
+    /// </summary>
+    internal static long? TestMinForwardElementsOverride { get; set; }
+
+    /// <summary>Effective size-gate threshold: the test override when set, else the env-or-1M default.</summary>
+    private static long CompiledTrainingMinForwardElements
+        => TestMinForwardElementsOverride ?? CompiledTrainingMinForwardElementsDefault;
 
     /// <summary>Sum of forward-activation element counts on the tape (early-exits once the threshold is reached).</summary>
     private static long TotalForwardElements<T>(GradientTape<T> tape)
