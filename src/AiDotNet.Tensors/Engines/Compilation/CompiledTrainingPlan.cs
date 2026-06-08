@@ -2107,7 +2107,15 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var fusedBackwardActions = new List<Action<IEngine>>();
         var fusedStepIndices = new HashSet<int>(); // indices consumed by fusion
 
-        if (typeof(T) == typeof(float) && Optimization.TensorCodecOptions.Current.EnableDataflowFusion)
+        // CUDA-graph eligibility: on a GPU engine, prefer the generic engine-dispatched (GPU-stream) path over
+        // host CPU-BLAS/SIMD specializations AND over dataflow FUSION — both build host-side closures that break
+        // graph purity and starve the device. Computed here (before fusion) so fusion can be skipped on GPU.
+        // CPU engines are unaffected (preferGenericForGpu == false → fusion + specialization unchanged).
+        bool preferGenericForGpu = engine.SupportsGpu
+            && Environment.GetEnvironmentVariable("AIDOTNET_GPU_PREFER_GENERIC") != "0";
+
+        if (typeof(T) == typeof(float) && Optimization.TensorCodecOptions.Current.EnableDataflowFusion
+            && !preferGenericForGpu)
         {
             TryFuseForwardBackward(forwardSteps, gradMap, consumerCount, engine,
                 fusedForwardActions, fusedBackwardActions, fusedStepIndices);
@@ -2148,9 +2156,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // (1) run the heavy GEMMs + elementwise on the CPU, starving the device (cortex GPU util ~7%), and
         // (2) are host-only, so the fixed kernel sequence can't be CUDA-graph captured (AIDOTNET_CUDA_GRAPH_STEP).
         // Routing to generic moves the work onto the GPU AND makes the whole step graph-eligible. Default ON
-        // for GPU engines; opt out with AIDOTNET_GPU_PREFER_GENERIC=0 to restore the CPU-specialized path.
-        bool preferGenericForGpu = engine.SupportsGpu
-            && Environment.GetEnvironmentVariable("AIDOTNET_GPU_PREFER_GENERIC") != "0";
+        // for GPU engines; opt out with AIDOTNET_GPU_PREFER_GENERIC=0 (preferGenericForGpu computed above).
         if (typeof(T) == typeof(float) && !preferGenericForGpu)
         {
             DetectAnalyticLossMatMulBackward(forwardSteps, consumerCount, gradMap, analyticBackwardSpecs, skippableReduceSumIndices, analyticForwardSpecs, skippableReduceSumForwardIndices, sharedRowSumCache);
