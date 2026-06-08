@@ -116,8 +116,14 @@ internal static class PackBothStrategy
             // Threshold 256 = empirical from baseline-after-B5 sweep on
             // x64-amd-avx2-cpu16. Future autotune (#374 F.3 deferred) should
             // measure both paths per-shape and cache the winner.
+            // The m < 256 guard kept moderate-M shapes on the M-axis path (where its shared
+            // packed-B avoids 2D's redundant per-thread B-pack). But on high core counts a
+            // wide-N shape with moderate M (e.g. FFN 512×512×2048: numMBlocks≈2-4 vs 32 cores)
+            // leaves ≥75% of cores idle on the M-axis path — there the extra MN parallelism of
+            // the 2D grid wins despite the redundant B-pack. So ALSO take 2D when the M-axis
+            // would use ≤ a quarter of the cores (numMBlocks*4 < procs), regardless of absolute M.
             bool use2D = MN2DDriver.ShouldUse2DGrid(numMBlocks, numNBlocks, procs)
-                         && m < 256;
+                         && (m < 256 || numMBlocks * 4 <= procs);
 
             // Pin a, b, c for the duration of the parallel region. Both paths use
             // unsafe pointer access from worker threads.
