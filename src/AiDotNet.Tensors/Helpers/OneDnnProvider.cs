@@ -62,6 +62,29 @@ internal static class OneDnnProvider
     // run truly in parallel on managed code, and concurrent oneDNN execution never happens.
     private static readonly object _executeLock = new object();
 
+    // Acquire the oneDNN execute lock with mode-aware contention behavior. Returns true if the
+    // caller should run the oneDNN primitive (and must Monitor.Exit(_executeLock) when done).
+    //
+    // In FAST mode: opportunistic (TryEnter). Contended -> false -> caller uses the parallel managed
+    // kernel. Maximizes parallelism; the managed result differing in the last ULP doesn't matter.
+    //
+    // In DETERMINISTIC mode: BLOCK (Enter). The opportunistic managed fallback is NOT bit-identical
+    // to oneDNN, so under contention a deterministic op's output would depend on whether the lock
+    // happened to be free — i.e. it would vary run-to-run / call-to-call (this is the root cause of
+    // the Conv2D_IsDeterministic flake: in a parallel suite some calls hit oneDNN and some fell back
+    // to managed). Blocking forces the SAME path (oneDNN) every time, which is what bit-exact
+    // reproducibility requires. It still serializes oneDNN execute (only one thread inside at a
+    // time), so the concurrent-execute crash guard that motivated this lock is fully preserved.
+    private static bool TryEnterExecute()
+    {
+        if (BlasProvider.IsDeterministicMode)
+        {
+            System.Threading.Monitor.Enter(_executeLock);
+            return true;
+        }
+        return System.Threading.Monitor.TryEnter(_executeLock);
+    }
+
     // Per-thread oneDNN stream. A dnnl_stream is NOT safe to use from multiple threads
     // concurrently, but the engine IS thread-safe to share and primitives are stateless.
     // So each thread gets its own stream (lazily created from the shared engine) and the
@@ -848,7 +871,7 @@ internal static class OneDnnProvider
             // Conv uses shared cached memory objects + a shared scratchpad + the WeightsReordered
             // flag, so only one oneDNN op may run at a time. Opportunistic (non-blocking): if
             // another oneDNN op is running, bail so the caller uses the managed conv. See _executeLock.
-            if (!System.Threading.Monitor.TryEnter(_executeLock)) return false;
+            if (!TryEnterExecute()) return false;
             try
             {
             // Step 1: Set user memory data handles to point to user data
@@ -961,7 +984,7 @@ internal static class OneDnnProvider
         if (!EnsureInitialized())
             return false;
         // Opportunistic (non-blocking): one oneDNN op at a time; contended -> managed fallback.
-        if (!System.Threading.Monitor.TryEnter(_executeLock)) return false;
+        if (!TryEnterExecute()) return false;
         try
         {
             const byte N = (byte)'N';
@@ -1059,7 +1082,7 @@ internal static class OneDnnProvider
     {
         // True-parallel: per-thread stream + a per-call memory object bound to this call's
         // data (shared primitive/descriptor are stateless/immutable). See ExecuteBinaryOperation.
-        if (!System.Threading.Monitor.TryEnter(_executeLock)) return false;   // opportunistic — see _executeLock
+        if (!TryEnterExecute()) return false;   // opportunistic — see _executeLock
         IntPtr mem = IntPtr.Zero, msp = IntPtr.Zero;
         try
         {
@@ -1240,7 +1263,7 @@ internal static class OneDnnProvider
     private static unsafe bool ExecuteSoftmaxOperation(CachedSoftmax cached, float* src, float* dst)
     {
         // True-parallel: per-thread stream + per-call memory objects (see ExecuteBinaryOperation).
-        if (!System.Threading.Monitor.TryEnter(_executeLock)) return false;   // opportunistic — see _executeLock
+        if (!TryEnterExecute()) return false;   // opportunistic — see _executeLock
         IntPtr ms = IntPtr.Zero, md = IntPtr.Zero, msp = IntPtr.Zero;
         try
         {
@@ -1416,7 +1439,7 @@ internal static class OneDnnProvider
         // source of the dnnl.dll access violations.)
         // Opportunistic: if another thread is already in oneDNN, bail (caller uses the managed
         // kernel) — never block, never run two oneDNN executes at once. See _executeLock.
-        if (!System.Threading.Monitor.TryEnter(_executeLock)) return false;
+        if (!TryEnterExecute()) return false;
         IntPtr m0 = IntPtr.Zero, m1 = IntPtr.Zero, md = IntPtr.Zero, msp = IntPtr.Zero;
         try
         {
@@ -2001,7 +2024,7 @@ internal static class OneDnnProvider
             args[1] = new DnnlExecArg { Arg = DnnlArgDst, Memory = dstMem };
             // This per-call path uses oneDNN's library scratchpad, so only one oneDNN op may run
             // at a time. Opportunistic (non-blocking): bail to the managed path if contended.
-            if (!System.Threading.Monitor.TryEnter(_executeLock))
+            if (!TryEnterExecute())
             {
                 dnnl_primitive_destroy(prim); dnnl_memory_destroy(srcMem); dnnl_memory_destroy(dstMem);
                 return false;
@@ -2116,7 +2139,7 @@ internal static class OneDnnProvider
             args[4] = new DnnlExecArg { Arg = DnnlArgWeights, Memory = scaleMem };
             args[5] = new DnnlExecArg { Arg = DnnlArgBias, Memory = shiftMem };
             // Library-scratchpad path -> only one oneDNN op at a time. Opportunistic (non-blocking).
-            if (!System.Threading.Monitor.TryEnter(_executeLock))
+            if (!TryEnterExecute())
             {
                 dnnl_primitive_destroy(prim);
                 dnnl_memory_destroy(srcMem); dnnl_memory_destroy(dstMem);
