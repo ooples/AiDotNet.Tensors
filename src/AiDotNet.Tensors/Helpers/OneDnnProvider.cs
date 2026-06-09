@@ -67,21 +67,18 @@ internal static class OneDnnProvider
     //
     // In FAST mode: opportunistic (TryEnter). Contended -> false -> caller uses the parallel managed
     // kernel. Maximizes parallelism; the managed result differing in the last ULP doesn't matter.
+    // TryEnter keeps oneDNN strictly one-at-a-time (the concurrent-execute crash guard).
     //
-    // In DETERMINISTIC mode: BLOCK (Enter). The opportunistic managed fallback is NOT bit-identical
-    // to oneDNN, so under contention a deterministic op's output would depend on whether the lock
-    // happened to be free — i.e. it would vary run-to-run / call-to-call (this is the root cause of
-    // the Conv2D_IsDeterministic flake: in a parallel suite some calls hit oneDNN and some fell back
-    // to managed). Blocking forces the SAME path (oneDNN) every time, which is what bit-exact
-    // reproducibility requires. It still serializes oneDNN execute (only one thread inside at a
-    // time), so the concurrent-execute crash guard that motivated this lock is fully preserved.
+    // In DETERMINISTIC mode: SKIP oneDNN entirely (return false -> caller uses the managed kernel).
+    // The managed deterministic kernels are bit-exact by contract, so taking the SAME (managed) path
+    // every time is what reproducibility requires — and it sidesteps oneDNN completely. (An earlier
+    // attempt BLOCKED here to force the oneDNN path instead; that fixed the Conv2D_IsDeterministic
+    // flake but drove far more traffic through oneDNN and surfaced a fatal concurrent-oneDNN fault
+    // under full-suite load. Skipping is both correct for determinism and strictly less oneDNN.)
     private static bool TryEnterExecute()
     {
         if (BlasProvider.IsDeterministicMode)
-        {
-            System.Threading.Monitor.Enter(_executeLock);
-            return true;
-        }
+            return false;
         return System.Threading.Monitor.TryEnter(_executeLock);
     }
 
