@@ -1809,10 +1809,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (ReferenceEquals(src, dest)) return true;            // in-place op already resident; nothing to copy
         if (!TryGetBackend(out var backend)) { AliasDiag("skip: no backend"); return false; }
 
-        // Resolve src's resident GPU buffer WITHOUT triggering an upload/download.
+        // Resolve src's resident GPU buffer WITHOUT triggering an upload/download. We accept src._gpuBuffer on
+        // backend match alone (no version / IsCachedGpuBufferLive gate) — eviction is suspended for the whole
+        // compiled step so the buffer is guaranteed live, and an ALIASED buffer (a prior CopyResultInto borrow,
+        // or a reshape/permute that shares a base buffer) is NOT in the activation cache under this tensor's key,
+        // so the stricter gate would wrongly decline and force a host-copy that fires a deferred download = CUDA
+        // 900 inside the capture. This matches GetOrAllocateContiguousInputBuffer's resolution.
         IGpuBuffer? srcBuf = null;
-        if (src._gpuBuffer is not null && ReferenceEquals(src._gpuBackend, backend)
-            && src._gpuBufferVersion == src.Version && IsCachedGpuBufferLive(src, backend))
+        if (src._gpuBuffer is not null && ReferenceEquals(src._gpuBackend, backend))
         {
             srcBuf = src._gpuBuffer;
         }
@@ -2750,6 +2754,30 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         catch (Exception bex) { AliasDiag($"BA-resident FELLBACK full=[{string.Join(",", full._shape)}] bias=[{string.Join(",", bias._shape)}]: {bex.GetType().Name}: {bex.Message}"); return false; }
     }
 
+    // Resolve a compiled-step binary/scalar INPUT to a resident GPU buffer. A resident activation (produced by a
+    // prior forward op) is found via _gpuBuffer / the persistent / activation caches — no upload. A non-resident
+    // input during a compiled step is a STABLE parameter/constant (operand never on the forward chain, e.g. a
+    // learned scale or a recording-time constant); route it through the PERSISTENT weight cache so it's uploaded
+    // ONCE rather than every step (a per-step cuMemcpyHtoD inside a stream capture = CUDA 900 → invalidates the
+    // whole graph). Falls back to the transient path if it has no backing array.
+    private OwnedBuffer GetResidentOrPersistentInputBuffer<T>(IDirectGpuBackend backend, Tensor<T> t)
+    {
+        if (t._gpuBuffer is not null && ReferenceEquals(t._gpuBackend, backend))
+            return new OwnedBuffer(t._gpuBuffer, ownsBuffer: false);
+        var arr = t.DataVector.GetBackingArrayUnsafe();
+        if (arr is not null)
+        {
+            var cached = TryGetCachedBuffer(arr);
+            if (cached != null) return new OwnedBuffer(cached, ownsBuffer: false);
+            lock (_activationCacheLock)
+                if (_activationCache.TryGetValue(arr, out var e) && ReferenceEquals(e.Backend, backend) && !e.IsFp16)
+                    return new OwnedBuffer(e.Buffer, ownsBuffer: false);
+            if (t.IsContiguous)
+                return GetOrCacheWeightBuffer(backend, t.GetDataArray(), PersistentTensorRole.Weights);
+        }
+        return GetOrAllocateContiguousInputBuffer(backend, t);
+    }
+
     private bool TryRunBinaryInto<T>(
         Tensor<T> destination,
         Tensor<T> left,
@@ -2769,8 +2797,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             try
             {
-                using var bA = GetOrAllocateContiguousInputBuffer(backend, left);
-                using var bB = GetOrAllocateContiguousInputBuffer(backend, right);
+                using var bA = GetResidentOrPersistentInputBuffer(backend, left);
+                using var bB = GetResidentOrPersistentInputBuffer(backend, right);
                 var destBuf = GetOrCreateResidentBuffer(backend, destination, left.Length);
                 op(backend, bA.Buffer, bB.Buffer, destBuf, left.Length);
                 BindResidentBuffer(destination, destBuf, backend);
@@ -2852,7 +2880,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             try
             {
-                using var bA = GetOrAllocateContiguousInputBuffer(backend, input);
+                using var bA = GetResidentOrPersistentInputBuffer(backend, input);
                 var destBuf = GetOrCreateResidentBuffer(backend, destination, input.Length);
                 op(backend, bA.Buffer, destBuf, ToFloatScalar(scalar), input.Length);
                 BindResidentBuffer(destination, destBuf, backend);

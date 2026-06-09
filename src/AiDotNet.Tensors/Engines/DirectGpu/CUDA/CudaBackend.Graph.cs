@@ -202,4 +202,15 @@ public sealed partial class CudaBackend
             return false;
         return status != 0;
     }
+
+    /// <summary>Raw capture status (0=NONE, 1=ACTIVE, 2=INVALIDATED, -1=unknown). Used to pinpoint the FIRST
+    /// op that issues a non-capturable operation (which silently invalidates the whole capture).</summary>
+    public int StreamCaptureStatusRaw()
+    {
+        if (!IsAvailable) return -1;
+        using var _ = PushContext();
+        if (CudaNativeBindings.cuStreamIsCapturing(_stream, out int status) != CudaResult.Success)
+            return -1;
+        return status;
+    }
 }

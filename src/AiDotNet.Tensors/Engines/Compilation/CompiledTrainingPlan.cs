@@ -588,7 +588,17 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var fwd = _forwardActions;
         // The whole forward (INCLUDING the embedding, which gathers on-device from the externally-refreshed stable
         // index buffer) is captured. _graphEagerFwd is 0 in capture mode (no eager prefix).
-        for (int i = _graphEagerFwd; i < fwd.Length; i++) fwd[i](engine);
+        bool capDiag = System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") == "1" && cb.IsStreamCapturing();
+        for (int i = _graphEagerFwd; i < fwd.Length; i++)
+        {
+            fwd[i](engine);
+            if (capDiag && cb.StreamCaptureStatusRaw() == 2)
+            {
+                try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_graphcapture_diag.txt"),
+                    $"[CAPTURE-INVALIDATED-BY] forwardAction#{i} op={Engines.DirectGpuTensorEngine.s_currentForwardOp}" + System.Environment.NewLine); } catch { }
+                capDiag = false;   // log only the FIRST invalidation
+            }
+        }
 
         int esz = System.Runtime.CompilerServices.Unsafe.SizeOf<T>();
         if (_genericGradIndices != null)
