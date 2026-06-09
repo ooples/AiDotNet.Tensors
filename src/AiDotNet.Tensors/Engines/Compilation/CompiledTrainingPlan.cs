@@ -146,9 +146,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // lives in the embedding step's saved state ({ indices }); grab it to refresh the buffer each step.
         _graphEagerFwd = 0;
         if (_forwardSteps != null && _forwardSteps.Length > 0 && _forwardSteps[0].OpType == OpType.Embedding
-            && _forwardSteps[0].SavedState is { Length: > 0 } ss && ss[0] is Tensor<int> embIdx)
+            && _forwardSteps[0].SavedState is { } ss)
         {
-            _graphEmbIndices = embIdx;
+            // The live token-index tensor lives in the embedding step's saved state, but at different positions
+            // per op (Embedding<T> stores it at [0]; TensorEmbeddingLookup stores it after idxSnap/shape/vocab/dim).
+            // Scan for the first Tensor<int> so both ops compile to the in-graph capture path.
+            foreach (var o in ss) if (o is Tensor<int> ti) { _graphEmbIndices = ti; break; }
         }
         _compiledInputShape = compiledInputShape;
         _compiledInputTensor = compiledInputTensor;

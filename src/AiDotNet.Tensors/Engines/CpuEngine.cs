@@ -30016,6 +30016,12 @@ public partial class CpuEngine : ITensorLevelEngine
                     outputShape,
                     (eng, output) =>
                     {
+                        // On a GPU engine, gather on-device straight into the output buffer so this embedding is
+                        // CUDA-graph-CAPTURABLE (the host Array.Copy gather below can't be recorded into a graph).
+                        // Managed-index path (capture/replay) reads the externally-refreshed stable index buffer;
+                        // eager path uploads inline. Falls through to the host gather when not GPU-resident.
+                        if (eng is DirectGpuTensorEngine gpuEng && capturedIndices is Tensor<int> idxInt
+                            && gpuEng.TryEmbeddingLookupGpuInto(capturedEmb, idxInt, output)) return;
                         // #1331-for-embeddings: re-read the LIVE indices each replay. The compiled plan is
                         // traced once and replayed across steps; the higher-level Train() loop refreshes the
                         // input tensor's data IN PLACE (persistent-input fix). But the indices were captured
@@ -30044,7 +30050,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         }
                     },
                     BackwardFunctions<TValue>.TensorEmbeddingLookupBackward,
-                    new object[] { idxSnap, idxShapeSnap, capturedVocab, capturedDim });
+                    new object[] { idxSnap, idxShapeSnap, capturedVocab, capturedDim, capturedIndices });
             }
         }
 
