@@ -30020,8 +30020,11 @@ public partial class CpuEngine : ITensorLevelEngine
                         // CUDA-graph-CAPTURABLE (the host Array.Copy gather below can't be recorded into a graph).
                         // Managed-index path (capture/replay) reads the externally-refreshed stable index buffer;
                         // eager path uploads inline. Falls through to the host gather when not GPU-resident.
-                        if (eng is DirectGpuTensorEngine gpuEng && capturedIndices is Tensor<int> idxInt
-                            && gpuEng.TryEmbeddingLookupGpuInto(capturedEmb, idxInt, output)) return;
+                        if (eng is DirectGpuTensorEngine gpuEng)
+                        {
+                            gpuEng.RegisterEmbIndexRefresh(() => gpuEng.UploadEmbeddingIndices(capturedIndices, n));
+                            if (gpuEng.TryEmbeddingGatherGpu(capturedEmb, capturedIndices, n, output)) return;
+                        }
                         // #1331-for-embeddings: re-read the LIVE indices each replay. The compiled plan is
                         // traced once and replayed across steps; the higher-level Train() loop refreshes the
                         // input tensor's data IN PLACE (persistent-input fix). But the indices were captured
@@ -37697,10 +37700,13 @@ public partial class CpuEngine : ITensorLevelEngine
                 return scope.RecordUnary(LazyNodeType.Custom, "Embedding", embeddingTable, outShape,
                     (eng, output) =>
                     {
-                        // On the GPU engine, gather on-device straight into the output buffer (no host round-trip)
-                        // so the eager-prefix embedding doesn't stall GPU util; fall back to the host gather + copy
-                        // when the table/output aren't GPU-resident (CPU engine, or not-yet-resident tensors).
-                        if (eng is DirectGpuTensorEngine gpuEng && gpuEng.TryEmbeddingLookupGpuInto(ct, ci, output)) return;
+                        // On the GPU engine, gather on-device straight into the output buffer (graph-capturable);
+                        // fall back to the host gather + copy when not GPU-resident (CPU engine / not-yet-resident).
+                        if (eng is DirectGpuTensorEngine gpuEng)
+                        {
+                            gpuEng.RegisterEmbIndexRefresh(() => gpuEng.UploadEmbeddingIndices(ci, ci.Length));
+                            if (gpuEng.TryEmbeddingGatherGpu(ct, ci, ci.Length, output)) return;
+                        }
                         var r = eng.Embedding(ci, ct); r.AsSpan().CopyTo(output.AsWritableSpan());
                     },
                     BackwardFunctions<T>.EmbeddingBackward, new object[] { indices });

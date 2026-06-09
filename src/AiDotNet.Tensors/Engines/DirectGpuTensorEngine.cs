@@ -10570,57 +10570,54 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private IGpuBuffer? _cachedEmbIndexBuffer;   // stable embedding-index buffer (single alloc; refreshed in place)
     private int _cachedEmbIndexCapacity;
 
+    private int[]? _embIndexScratch;             // host int[] scratch for TIndex→int conversion (long/int tokens)
+    private System.Action? _embIndexRefresh;     // refreshes the index buffer from the LIVE indices (closure knows TIndex)
+
     /// <summary>When true, the embedding index buffer is refreshed EXTERNALLY (by the compiled plan, OUTSIDE any
-    /// graph capture) via <see cref="RefreshGraphEmbeddingIndices"/>, so the captured gather kernel reads a stable
+    /// graph capture) via <see cref="RefreshGraphEmbeddingIndicesNow"/>, so the captured gather kernel reads a stable
     /// device buffer with NO host upload inside the capture (which would be CUDA 906). The eager/non-graph path
     /// leaves this false and uploads inline.</summary>
     internal bool EmbeddingIndexExternallyManaged;
 
-    /// <summary>Upload the given token indices into the stable embedding-index buffer (host→device, OUTSIDE any
-    /// capture). The compiled plan calls this before each graph launch so the captured gather reads THIS step's
-    /// indices. The buffer keeps a STABLE pointer across launches (allocated once), so the captured kernel that
-    /// baked that pointer stays valid.</summary>
-    internal void RefreshGraphEmbeddingIndices(Tensor<int> indices)
+    /// <summary>The embedding op delegate registers a closure here that uploads its LIVE (typed) token indices into
+    /// the stable buffer — so the compiled plan can refresh the buffer for ANY TIndex (int/long) without knowing
+    /// the type. Invoked by <see cref="RefreshGraphEmbeddingIndicesNow"/> before each graph launch.</summary>
+    internal void RegisterEmbIndexRefresh(System.Action refresh) => _embIndexRefresh = refresh;
+    internal void RefreshGraphEmbeddingIndicesNow() => _embIndexRefresh?.Invoke();
+
+    /// <summary>Convert any-typed token indices to int and upload them into the stable index buffer (allocated once,
+    /// refreshed in place — no per-step cuMemAlloc). Used inline on the eager path and via the registered action on
+    /// the managed (graph) path.</summary>
+    internal void UploadEmbeddingIndices<TIndex>(Tensor<TIndex> indices, int n)
     {
         if (!TryGetBackend(out var backend)) return;
-        int n = indices.Length;
         if (_cachedEmbIndexBuffer is null || _cachedEmbIndexCapacity < n)
         {
             _cachedEmbIndexBuffer?.Dispose();
             _cachedEmbIndexBuffer = backend.AllocateIntBuffer(n);
             _cachedEmbIndexCapacity = n;
         }
-        backend.UploadIntBufferInPlace(indices.GetDataArray(), _cachedEmbIndexBuffer);
+        if (_embIndexScratch is null || _embIndexScratch.Length < n) _embIndexScratch = new int[n];
+        var raw = indices.GetDataArray();
+        for (int i = 0; i < n; i++) _embIndexScratch[i] = System.Convert.ToInt32((object)raw[i]!);
+        backend.UploadIntBufferInPlace(_embIndexScratch, _cachedEmbIndexBuffer);
     }
 
-    internal bool TryEmbeddingLookupGpuInto<T>(Tensor<T> embeddingTable, Tensor<int> indices, Tensor<T> output)
+    /// <summary>On-device embedding gather straight into the output's GPU buffer — CUDA-graph-CAPTURABLE. Resolves
+    /// the resident embedding-table weight buffer (host-cached weight the optimizer updates in place). On the eager
+    /// path it uploads THIS call's indices inline; on the managed (capture/replay) path it reads the stable buffer
+    /// the plan already refreshed via the registered action, so no host upload happens inside the captured region.</summary>
+    internal bool TryEmbeddingGatherGpu<T, TIndex>(Tensor<T> embeddingTable, Tensor<TIndex> indices, int n, Tensor<T> output)
     {
         if (!TryGetBackend(out var backend)) return false;
         var outBuf = output.TryGetGpuBuffer();
-        // The embedding table is usually a HOST-cached weight (no GPU buffer on the tensor itself), which would
-        // null here and force the host fallback → breaking stream capture. Resolve its RESIDENT weight buffer —
-        // the same buffer the captured MatMul reads and the optimizer updates IN PLACE — so the gather reads the
-        // CURRENT trained embeddings and records cleanly into the graph.
         var tableBuf = embeddingTable.TryGetGpuBuffer() ?? ResolveResidentEmbeddingTable(backend, embeddingTable);
         if (outBuf is null || tableBuf is null) return false;
-        int numIndices = indices.Length;
         int embeddingDim = embeddingTable.Shape._dims[^1];
-        if ((long)numIndices * embeddingDim > outBuf.Size) return false;
-        if (!EmbeddingIndexExternallyManaged)
-        {
-            // Eager / non-graph path: refresh the stable index buffer inline (reuse it to avoid per-step cuMemAlloc).
-            if (_cachedEmbIndexBuffer is null || _cachedEmbIndexCapacity < numIndices)
-            {
-                _cachedEmbIndexBuffer?.Dispose();
-                _cachedEmbIndexBuffer = backend.AllocateIntBuffer(numIndices);
-                _cachedEmbIndexCapacity = numIndices;
-            }
-            backend.UploadIntBufferInPlace(indices.GetDataArray(), _cachedEmbIndexBuffer);
-        }
-        // Managed path: RefreshGraphEmbeddingIndices already uploaded THIS step's indices OUTSIDE capture, so this
-        // is a pure GPU gather kernel over stable device buffers — safe to RECORD into a CUDA graph and replay.
+        if ((long)n * embeddingDim > outBuf.Size) return false;
+        if (!EmbeddingIndexExternallyManaged) UploadEmbeddingIndices(indices, n);   // eager: refresh inline
         if (_cachedEmbIndexBuffer is null) return false;
-        backend.Embedding(_cachedEmbIndexBuffer, tableBuf, outBuf, numIndices, embeddingDim);
+        backend.Embedding(_cachedEmbIndexBuffer, tableBuf, outBuf, n, embeddingDim);
         return true;
     }
 
