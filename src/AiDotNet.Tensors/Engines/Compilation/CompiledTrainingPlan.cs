@@ -44,12 +44,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     // narrowly gated and any capture failure falls back to eager permanently.
     // Default ON so users get the whole-step CUDA-graph capture (collapses per-kernel launch
     // overhead → full GPU power) automatically; opt out with AIDOTNET_CUDA_GRAPH_STEP=0. Still
-    // narrowly gated at the call site (float + CUDA + eligible + no clip/checkpoint). OPT-IN
-    // (default OFF): for an embedding-input model (token LM cortex), the captured graph still trains
-    // on the capture step's STALE token indices (loss frozen at ln V) — the embedding-boundary "forward
-    // not stream-pure" root (#558) is not fully solved, so enabling the graph by default would silently
-    // break correctness on the cortex. Opt in with AIDOTNET_CUDA_GRAPH_STEP=1 once that is fixed; the
-    // default path (generic GPU-pure ops, no graph) is correct + already moves all work onto the device.
+    // narrowly gated at the call site (float + CUDA + eligible + no clip/checkpoint). OPT-IN (default OFF).
+    // The embedding-input correctness root (#558 — captured graph trained on STALE token indices, loss frozen
+    // at ln V) is now FIXED via the prefix-eager embedding (run it outside capture + refresh its output each
+    // step; see _graphEagerFwd / RunEagerForwardPrefix) — VERIFIED: the d256/L2 cortex loss drops 9.59→7.20
+    // under the graph. Kept OPT-IN conservatively because (a) a NON-embedding leading host op would need the
+    // same eager-prefix treatment, and (b) for a token LM the eager host embedding currently caps GPU util
+    // (~15%) until the gather is GPU-ized — a perf follow-up, not a correctness gate. Enable for the GPU-op
+    // acceleration with AIDOTNET_CUDA_GRAPH_STEP=1; the default (generic GPU-pure ops, no graph) is correct.
     private static readonly bool s_graphStepEnabled =
         System.Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_STEP") == "1";
     private IntPtr _stepGraphExec;
