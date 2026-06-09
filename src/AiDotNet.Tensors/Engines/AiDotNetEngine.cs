@@ -201,6 +201,18 @@ public static class AiDotNetEngine
             return false;
         }
 
+        // Reuse the already-adopted, working GPU engine instead of reconstructing the CUDA context,
+        // cuBLAS handle, and ~47 kernel modules on every call. The AiModelBuilder facade re-enters this
+        // method on every BuildAsync (its default, no-GPU-config path auto-detects), so without this
+        // guard each model build paid a full GPU re-init — and leaked the previous engine, since the
+        // success path below overwrites Current without disposing it. A whole tournament of small models
+        // therefore spent most of its time rebuilding (and leaking) GPU contexts. The circuit-breaker and
+        // disable checks above already cover the cases where the current engine must NOT be reused.
+        if (Current is DirectGpuTensorEngine adopted && adopted.SupportsGpu)
+        {
+            return true;
+        }
+
         try
         {
             var gpuEngine = new DirectGpuTensorEngine();
