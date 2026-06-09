@@ -1118,6 +1118,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     /// </summary>
     public void ReclaimUnderPressure(double freeFractionThreshold = 0.20)
     {
+        // Bounds: a free-fraction threshold only makes sense in (0, 1]. > 1 would force the full
+        // GC/finalizer sweep on EVERY call (free/total can never exceed 1), and <= 0 (or NaN) would
+        // disable reclamation entirely — both defeat the purpose, so reject rather than silently misbehave.
+        if (!(freeFractionThreshold > 0.0 && freeFractionThreshold <= 1.0))
+            throw new ArgumentOutOfRangeException(nameof(freeFractionThreshold), freeFractionThreshold,
+                "freeFractionThreshold must be in the range (0, 1].");
         if (!IsAvailable) return;
         ulong free, total;
         using (PushContext())
@@ -3511,6 +3517,14 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     {
         if (data == null) throw new ArgumentNullException(nameof(data));
         if (buffer == null) throw new ArgumentNullException(nameof(buffer));
+        // Fail fast with a managed exception BEFORE touching the driver — matches the rest of the
+        // backend. Without this, a failed backend init or a freed graph-input buffer (zero handle)
+        // would fall through to a raw cuMemcpyHtoD and fault the CUDA context (error 700) instead.
+        if (!IsAvailable)
+            throw new InvalidOperationException("CUDA backend is not available.");
+        if (buffer.Handle == IntPtr.Zero)
+            throw new ObjectDisposedException(nameof(buffer),
+                "GPU buffer was released before its in-place upload.");
         if (data.Length > buffer.Size)
             throw new ArgumentException($"Host data ({data.Length}) exceeds buffer ({buffer.Size}).");
         using var _ = PushContext();

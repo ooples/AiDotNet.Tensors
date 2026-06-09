@@ -186,7 +186,7 @@ public static class AiDotNetEngine
         {
             if (Current is DirectGpuTensorEngine)
             {
-                Current = new CpuEngine();
+                SwitchToCpuEngine();
             }
 
             return false;
@@ -197,7 +197,7 @@ public static class AiDotNetEngine
         // again on the dead context. Stay on CPU.
         if (_gpuCircuitBroken)
         {
-            Current = new CpuEngine();
+            SwitchToCpuEngine();
             return false;
         }
 
@@ -359,6 +359,20 @@ public static class AiDotNetEngine
     }
 
     /// <summary>
+    /// Swaps <see cref="Current"/> to a fresh <see cref="CpuEngine"/> and disposes the GPU engine
+    /// being demoted, so forcing CPU (the AIDOTNET_DISABLE_GPU opt-out, the circuit-breaker check, or
+    /// an explicit reset) does not leak the previous <see cref="DirectGpuTensorEngine"/>'s CUDA
+    /// context, cuBLAS handle, and kernel modules. Swaps FIRST then disposes, so a concurrent reader
+    /// of <see cref="Current"/> never observes a disposed engine.
+    /// </summary>
+    private static void SwitchToCpuEngine()
+    {
+        var demoted = Current as DirectGpuTensorEngine;
+        Current = new CpuEngine();
+        demoted?.Dispose();
+    }
+
+    /// <summary>
     /// Resets the engine to the default CPU engine.
     /// </summary>
     /// <remarks>
@@ -368,7 +382,7 @@ public static class AiDotNetEngine
     /// </remarks>
     public static void ResetToCpu()
     {
-        Current = new CpuEngine();
+        SwitchToCpuEngine();
         EmitLog("[AiDotNet] Reset to CPU engine", verbose: true);
     }
 
@@ -396,6 +410,12 @@ public static class AiDotNetEngine
         {
             if (_current is DirectGpuTensorEngine)
             {
+                // Deliberately do NOT Dispose() the demoted engine here (unlike SwitchToCpuEngine).
+                // This runs from inside a CUDA fault handler on an already-corrupted context; calling
+                // cuCtxDestroy/cuMemFree on a dead context can raise an uncatchable native 0xC0000005,
+                // crashing the very process the breaker is trying to keep alive on CPU. The breaker
+                // trips at most once per process, so leaking this one context until process exit (the
+                // OS reclaims it) is the strictly safer trade than risking a fatal teardown.
                 _current = new CpuEngine();
             }
         }
