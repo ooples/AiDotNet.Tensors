@@ -2600,6 +2600,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (destination.IsSparse || !destination.IsContiguous || destination.Length < elementCount)
             return false;
 
+        // The destination is about to be OVERWRITTEN. Drop any pending deferred GPU download on its backing array
+        // FIRST: firing it here is wasteful (its bytes are about to be replaced) and crashes if the source buffer
+        // was already recycled ("buffer released before materialization"). Reading the unsafe reference does not
+        // fire the materializer; Remove clears it so a later host read can't resurrect obsolete GPU bytes either.
+        var rawArr = destination.DataVector.GetBackingArrayUnsafe();
+        if (rawArr is not null) Helpers.DeferredArrayMaterializer.Remove(rawArr);
+
         destinationArray = destination.GetLiveBackingArrayOrNull()!;
         return destinationArray is not null;
     }
@@ -2676,7 +2683,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 BindResidentBuffer(destination, destBuf, backend);
                 return true;
             }
-            catch { /* fall through to the host-download path below */ }
+            catch (Exception rex)
+            {
+                AliasDiag($"binary-into FELLBACK op={callerName} L=[{string.Join(",", left._shape)}]contig={left.IsContiguous} R=[{string.Join(",", right._shape)}]contig={right.IsContiguous}: {rex.GetType().Name}: {rex.Message}");
+                /* fall through to the host-download path below */
+            }
         }
 
         if (!TryGetSimpleCpuDestinationArray(destination, left.Length, out var destinationArray))
