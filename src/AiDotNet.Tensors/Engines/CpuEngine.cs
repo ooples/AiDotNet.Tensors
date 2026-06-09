@@ -11224,13 +11224,10 @@ public partial class CpuEngine : ITensorLevelEngine
                 int cols0 = tensor._shape[1];
                 var captured = tensor;
                 return scope.RecordUnary(LazyNodeType.Transpose, "TensorTranspose", tensor, new[] { cols0, rows0 },
-                    (eng, output) =>
-                    {
-                        // TensorTranspose returns a view — need to materialize contiguous data into the output buffer
-                        var transposed = eng.TensorTranspose(captured);
-                        var data = transposed.ToArray();
-                        data.AsSpan().CopyTo(output.AsWritableSpan());
-                    },
+                    // 2-D transpose = permute [1,0], routed through the resident TensorPermuteInto so on GPU it
+                    // writes backend.Permute into output's resident buffer (no host ToArray that breaks the
+                    // residency chain / CUDA-graph capture); CPU path is the base strided copy into output.
+                    (eng, output) => eng.TensorPermuteInto(output, captured, new[] { 1, 0 }),
                     BackwardFunctions<T>.TransposeBackward);
             }
         }
@@ -31022,11 +31019,13 @@ public partial class CpuEngine : ITensorLevelEngine
                 var outShape = new int[axes.Length];
                 for (int i = 0; i < axes.Length; i++) outShape[i] = tensor._shape[axes[i]];
                 return scope.RecordUnary(LazyNodeType.Custom, "TensorPermute", tensor, outShape,
-                    // Permute's eager path returns a strided view; .Contiguous()
-                    // materializes it into row-major memory so AsSpan doesn't
-                    // throw "non-contiguous" when copying into the pre-allocated
-                    // output. O(n) materialization cost, paid once per Execute.
-                    (eng, output) => { var r = eng.TensorPermute(captured, capturedAxes).Contiguous(); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
+                    // Permute directly INTO the pre-allocated output via TensorPermuteInto: on the GPU engine
+                    // this runs backend.Permute into output's resident buffer and leaves it GPU-resident (no
+                    // host materialize/download — which would break the residency chain + abort CUDA-graph
+                    // capture); on the CPU engine it's the base strided copy into output. Replaces the prior
+                    // eng.TensorPermute(...).Contiguous() + CopyResultInto, which host-materialized the strided
+                    // view (non-resident src → the alias couldn't fire → the next op re-uploaded = CUDA 906).
+                    (eng, output) => eng.TensorPermuteInto(output, captured, capturedAxes),
                     BackwardFunctions<T>.PermuteBackward, new object[] { capturedAxes });
             }
         }

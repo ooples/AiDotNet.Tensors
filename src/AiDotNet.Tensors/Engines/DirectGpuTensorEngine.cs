@@ -14402,24 +14402,56 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         try
         {
-            // CUDA / HIP / Metal / OpenCL / Vulkan / WebGpu all already
-            // implement Permute(input, output, shape, axes) — the GPU
-            // kernels were written around an explicit destination buffer
-            // from day one, so the Into form just plumbs the caller's
-            // output buffer's existing array through. We download the
-            // result directly into output.GetDataArray() instead of into a
-            // freshly-allocated managed array, so the per-call allocation
-            // the API docs promise to skip is actually skipped on the hot
-            // path (FinishGpuOp's default behavior allocates and copies).
-            using var bufIn = GetOrAllocateBuffer(backend, tensor.GetDataArray());
-            var bufOut = AllocateOutputBuffer(backend, tensor.Length);
-            backend.Permute(bufIn.Buffer, bufOut.Buffer, tensor.Shape._dims, axes);
-            // Download directly into the caller's existing array. This
-            // keeps output's identity stable for repeated calls AND avoids
-            // the materialize-then-copy pattern that would otherwise
-            // double the per-call CPU memory traffic.
-            var dst = output.GetDataArray();
-            DownloadGpuBufferInto(backend, bufOut, dst, output.Length);
+            // CUDA / HIP / Metal / OpenCL / Vulkan / WebGpu all already implement Permute(input, output, shape,
+            // axes) writing into an explicit destination buffer. The bug for CUDA-graph capture / GPU util was the
+            // DOWNLOAD that followed: the GPU permute ran resident but the result was then DtoH-copied to host,
+            // breaking the residency chain (the next op re-uploaded = cuMemcpyHtoD = a non-capturable 906; and the
+            // GPU↔host ping-pong every op = the low-util cause).
+            if (EvictionSuspended)
+            {
+                // COMPILED-STEP GPU-RESIDENT PATH: read the (resident) input, permute into a STABLE cached output
+                // buffer, leave output resident (no download). The output buffer is cached by output's backing
+                // array so it's allocated ONCE (in the pre-residency pass) and reused on capture/replay — no
+                // per-call cuMemAlloc (which would itself abort the capture). Host reads of output download lazily
+                // via the registered materializer.
+                using var bufIn = GetOrAllocateBuffer(backend, tensor);   // Tensor overload: resident fast-path, no forced download
+                var arr = output.DataVector.GetBackingArrayUnsafe();
+                IGpuBuffer? outBuf = null;
+                if (output._gpuBuffer is not null && ReferenceEquals(output._gpuBackend, backend) && IsCachedGpuBufferLive(output, backend))
+                    outBuf = output._gpuBuffer;
+                else if (arr is not null)
+                    lock (_activationCacheLock)
+                        if (_activationCache.TryGetValue(arr, out var e) && ReferenceEquals(e.Backend, backend) && !e.IsFp16)
+                            outBuf = e.Buffer;
+                if (outBuf is null)
+                {
+                    outBuf = backend.AllocateBuffer(output.Length);
+                    if (arr is not null) CacheActivation(arr, outBuf, output._shape, backend);
+                }
+                backend.Permute(bufIn.Buffer, outBuf, tensor.Shape._dims, axes);
+                output._gpuBuffer = outBuf;
+                output._gpuBackend = backend;
+                output._gpuBufferVersion = output.Version;
+                if (arr is not null)
+                {
+                    var capBuf = outBuf; var capBackend = backend;
+                    Helpers.DeferredArrayMaterializer.Register(arr, a =>
+                    {
+                        float[] f = capBackend.DownloadBuffer(capBuf);
+                        var conv = DirectGpuEngine.FromFloatArray<T>(f);
+                        System.Array.Copy(conv, (T[])a, System.Math.Min(conv.Length, ((T[])a).Length));
+                    });
+                }
+            }
+            else
+            {
+                // Eager/inference path (unchanged): permute on GPU, download directly into output's array.
+                using var bufIn = GetOrAllocateBuffer(backend, tensor.GetDataArray());
+                var bufOut = AllocateOutputBuffer(backend, tensor.Length);
+                backend.Permute(bufIn.Buffer, bufOut.Buffer, tensor.Shape._dims, axes);
+                var dst = output.GetDataArray();
+                DownloadGpuBufferInto(backend, bufOut, dst, output.Length);
+            }
         }
         catch (Exception)
         {
