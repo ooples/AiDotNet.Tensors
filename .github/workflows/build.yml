@@ -55,10 +55,25 @@ jobs:
       run: |
         dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --no-build --verbosity normal --framework net10.0 \
           --filter "Category!=Benchmark&Category!=Performance" \
+          --blame-hang --blame-hang-timeout 300s --blame-crash \
           --collect:"XPlat Code Coverage" \
           --results-directory ./coverage \
           -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Format=cobertura \
           DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Exclude="[*]AiDotNet.Tensors.Engines.DirectGpu.*,[*]AiDotNet.Tensors.Engines.Cu*,[*]AiDotNet.Tensors.Engines.ClBlast*,[*]AiDotNet.Tensors.Engines.OpenCl*"
+
+    # If --blame-hang-timeout (a test made no progress for 300s) or --blame-crash (test host
+    # native-crashed, e.g. a CUDA-finalizer 0xC0000005) fired, the hang/crash dump + the
+    # Sequence_*.xml naming the culprit test land under ./coverage. Upload them so the
+    # intermittent deadlock can be diagnosed instead of the run silently stalling for hours.
+    - name: Upload hang/crash dumps
+      uses: actions/upload-artifact@v4
+      if: failure()
+      with:
+        name: blame-dumps
+        path: |
+          ./coverage/**/*.dmp
+          ./coverage/**/Sequence_*.xml
+        if-no-files-found: ignore
 
     - name: Test enterprise license validator
       run: dotnet test build/LicenseValidator.Tests/AiDotNet.Tensors.LicenseValidator.Tests.csproj --configuration Release --verbosity normal
