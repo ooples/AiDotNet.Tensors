@@ -10715,6 +10715,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!EmbeddingIndexExternallyManaged) UploadEmbeddingIndices(indices, n);   // eager: refresh inline
         if (_cachedEmbIndexBuffer is null) return false;
         backend.Embedding(_cachedEmbIndexBuffer, tableBuf, outBuf, n, embeddingDim);
+        // Leave the gathered output GPU-resident + version-current so EVERY downstream op (and the
+        // CopyResultInto residency alias) resolves it via the _gpuBuffer fast path instead of re-uploading its
+        // stale host data — this is the SOURCE of the forward residency chain that keeps the whole step
+        // on-device for CUDA-graph capture. Without it, the first consumer re-uploads and the chain collapses.
+        output._gpuBuffer = outBuf;
+        output._gpuBackend = backend;
+        output._gpuBufferVersion = output.Version;
         return true;
     }
 
