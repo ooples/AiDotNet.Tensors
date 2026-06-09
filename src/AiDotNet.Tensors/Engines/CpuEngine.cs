@@ -29917,7 +29917,11 @@ public partial class CpuEngine : ITensorLevelEngine
         if (logP == null) throw new ArgumentNullException(nameof(logP));
         if (targetFloat == null) throw new ArgumentNullException(nameof(targetFloat));
         int rank = logP._shape.Length;
+        if (rank == 0)
+            throw new ArgumentException("SparseCEGatherTrueClass requires [B,V] log-probs (rank >= 1), got a scalar.", nameof(logP));
         int V = logP._shape[rank - 1];
+        if (V <= 0)
+            throw new ArgumentException($"SparseCEGatherTrueClass requires logP's last dimension V > 0, got {V}.", nameof(logP));
         int B = logP.Length / V;
         if (targetFloat.Length != B)
             throw new ArgumentException($"SparseCEGatherTrueClass expects {B} targets for [{B},{V}] logP, got {targetFloat.Length}.");
