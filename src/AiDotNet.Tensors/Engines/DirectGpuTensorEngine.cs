@@ -10567,6 +10567,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// The embedding table is read from its LIVE GPU buffer (updated in place by the GPU optimizer), so the
     /// gather sees the current trained embeddings; only the small index vector is uploaded per step.
     /// </summary>
+    private IGpuBuffer? _cachedEmbIndexBuffer;   // stable per-step embedding-index buffer (avoids per-step cuMemAlloc)
+    private int _cachedEmbIndexCapacity;
+
     internal bool TryEmbeddingLookupGpuInto<T>(Tensor<T> embeddingTable, Tensor<int> indices, Tensor<T> output)
     {
         if (!TryGetBackend(out var backend)) return false;
@@ -10576,8 +10579,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int numIndices = indices.Length;
         int embeddingDim = embeddingTable.Shape._dims[^1];
         if ((long)numIndices * embeddingDim > outBuf.Size) return false;
-        using var idxBuf = backend.AllocateIntBuffer(indices.GetDataArray());
-        backend.Embedding(idxBuf, tableBuf, outBuf, numIndices, embeddingDim);
+        // Reuse a STABLE index buffer across steps. A per-step AllocateIntBuffer would cuMemAlloc — which is
+        // SYNCHRONOUS — between graph launches, serializing the step and collapsing GPU util. Allocate once,
+        // then only upload the (small) index vector in place each step so the eager-prefix stays async.
+        if (_cachedEmbIndexBuffer is null || _cachedEmbIndexCapacity < numIndices)
+        {
+            _cachedEmbIndexBuffer?.Dispose();
+            _cachedEmbIndexBuffer = backend.AllocateIntBuffer(numIndices);
+            _cachedEmbIndexCapacity = numIndices;
+        }
+        backend.UploadIntBufferInPlace(indices.GetDataArray(), _cachedEmbIndexBuffer);
+        backend.Embedding(_cachedEmbIndexBuffer, tableBuf, outBuf, numIndices, embeddingDim);
         return true;
     }
 

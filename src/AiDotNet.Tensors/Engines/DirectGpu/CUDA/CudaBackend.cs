@@ -3521,6 +3521,22 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                 "cuMemcpyHtoD(graph input refresh in-place)");
     }
 
+    /// <summary>In-place int upload (no allocation) — used to refresh a STABLE embedding-index buffer each
+    /// step so the per-step path has no <c>cuMemAlloc</c> (which is synchronous and serializes the step).</summary>
+    public unsafe void UploadIntBufferInPlace(int[] data, IGpuBuffer buffer)
+    {
+        if (data == null) throw new ArgumentNullException(nameof(data));
+        if (buffer == null) throw new ArgumentNullException(nameof(buffer));
+        if (data.Length > buffer.Size)
+            throw new ArgumentException($"Host data ({data.Length}) exceeds buffer ({buffer.Size}).");
+        using var _ = PushContext();
+        ulong byteSize = (ulong)data.Length * sizeof(int);
+        fixed (int* src = data)
+            CuBlasNative.CheckCudaResult(
+                CuBlasNative.cuMemcpyHtoD(buffer.Handle, (IntPtr)src, byteSize),
+                "cuMemcpyHtoD(embedding index refresh in-place)");
+    }
+
     /// <inheritdoc/>
     public unsafe void UploadBufferAsync(ReadOnlySpan<float> data, IGpuBuffer buffer, IGpuStream stream)
     {

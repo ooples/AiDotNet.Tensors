@@ -997,6 +997,10 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
     public bool SupportsBatchExecution => true;
 
     /// <inheritdoc/>
+    public void UploadIntBufferInPlace(int[] data, IGpuBuffer buffer)
+        => throw new NotSupportedException("UploadIntBufferInPlace is not supported by the Vulkan backend.");
+
+    /// <inheritdoc/>
     public IGpuBuffer AllocateWorkspaceBuffer(int totalElements)
     {
         return AllocateBuffer(totalElements);

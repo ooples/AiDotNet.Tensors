@@ -5459,6 +5459,10 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         return new HipGpuBuffer(devicePtr, size);
     }
 
+    /// <inheritdoc/>
+    public void UploadIntBufferInPlace(int[] data, IGpuBuffer buffer)
+        => throw new NotSupportedException("UploadIntBufferInPlace is not supported by the HIP backend.");
+
     public IGpuBuffer AllocateIntBuffer(int[] data)
     {
         IntPtr devicePtr = IntPtr.Zero;

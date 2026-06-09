@@ -522,6 +522,10 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
     /// <summary>
     /// Allocates an integer buffer with initial data.
     /// </summary>
+    /// <inheritdoc/>
+    public void UploadIntBufferInPlace(int[] data, IGpuBuffer buffer)
+        => throw new NotSupportedException("UploadIntBufferInPlace is not supported by the Metal backend.");
+
     public IGpuBuffer AllocateIntBuffer(int[] data)
     {
         ThrowIfDisposed();
