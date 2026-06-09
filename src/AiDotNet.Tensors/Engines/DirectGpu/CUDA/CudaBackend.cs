@@ -1124,6 +1124,38 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     }
 
     /// <summary>
+    /// Bounds cross-step VRAM growth from per-step transient activation buffers that are
+    /// dereferenced but not yet GC-finalized (their device memory is only released by the
+    /// <c>OwnedBuffer</c>/<c>CudaGpuBuffer</c> finalizer, which under fast training stepping
+    /// cannot keep pace — manifesting as a steady ~1 GB/min climb to OOM with "drained 0
+    /// pooled buffers", because the leaked bytes are held by un-collected managed objects,
+    /// not the pool). Cheap when not pressured: one <c>cuMemGetInfo</c> and a fraction check.
+    /// Under pressure (free fraction below <paramref name="freeFractionThreshold"/>) it forces
+    /// the pending finalizers to run — reclaiming the transient device memory deterministically
+    /// — then drains completed deferred frees back to the pool. Called once per training step
+    /// from <c>CompiledTrainingPlan.StepEager</c>.
+    /// </summary>
+    public void ReclaimUnderPressure(double freeFractionThreshold = 0.20)
+    {
+        if (!IsAvailable) return;
+        ulong free, total;
+        using (PushContext())
+        {
+            if (CudaNativeBindings.cuMemGetInfo(out free, out total) != CudaResult.Success || total == 0)
+                return;
+        }
+        if ((double)free / total > freeFractionThreshold) return; // not pressured — fast path
+
+        // Pressured: run pending finalizers so dereferenced transient GPU buffers are released,
+        // then reclaim any completed deferred frees. Two collects bracket the finalizer wait so
+        // objects promoted to the finalizer queue on the first pass are reclaimed on the second.
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+        DrainDeferredFrees(blockOldest: false);
+    }
+
+    /// <summary>
     /// Allocates device memory with an OOM-recovery retry. If the driver reports
     /// out-of-memory, drain the buffer pool — a real <c>cuMemFree</c> of every
     /// retained-for-reuse buffer — and retry the allocation once. The pool holds

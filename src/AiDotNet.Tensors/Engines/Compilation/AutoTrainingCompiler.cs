@@ -265,7 +265,6 @@ internal static class AutoTrainingCompiler
     /// <summary>Effective size-gate threshold: the test override when set, else the env-or-1M default.</summary>
     private static long CompiledTrainingMinForwardElements
         => TestMinForwardElementsOverride ?? CompiledTrainingMinForwardElementsDefault;
-
     /// <summary>Sum of forward-activation element counts on the tape (early-exits once the threshold is reached).</summary>
     private static long TotalForwardElements<T>(GradientTape<T> tape)
     {
