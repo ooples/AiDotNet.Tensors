@@ -43,13 +43,20 @@ public sealed partial class CudaBackend
     /// The caller owns the handle and must free it with
     /// <see cref="DestroyCapturedGraph"/>.
     /// </summary>
+    private static void GcDiag(string s)
+    {
+        if (System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") != "1") return;
+        try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(),
+            "aidotnet_graphcapture_diag.txt"), "[GRAPH-CAPTURE] " + s + System.Environment.NewLine); } catch { }
+    }
+
     public IntPtr CaptureGraph(Action launch)
     {
         if (!IsAvailable || launch is null) return IntPtr.Zero;
         using var _ = PushContext();
 
         var rc = CudaNativeBindings.cuStreamBeginCapture(_stream, CudaNativeBindings.CU_STREAM_CAPTURE_MODE_THREAD_LOCAL);
-        if (rc != CudaResult.Success) return IntPtr.Zero;
+        if (rc != CudaResult.Success) { GcDiag($"beginCapture FAILED rc={rc}"); return IntPtr.Zero; }
 
         // If the action throws, abort the capture so the stream is not left in
         // capturing state (which would break every subsequent op on it).
@@ -57,20 +64,22 @@ public sealed partial class CudaBackend
         {
             launch();
         }
-        catch
+        catch (Exception ex)
         {
+            { var st = ex.StackTrace?.Replace("\r", "").Replace("\n", " >> ") ?? ""; GcDiag($"launch() THREW {ex.GetType().Name}: {ex.Message} | {st.Substring(0, System.Math.Min(2500, st.Length))}"); }
             CudaNativeBindings.cuStreamEndCapture(_stream, out var abortedGraph);
             if (abortedGraph != IntPtr.Zero) CudaNativeBindings.cuGraphDestroy(abortedGraph);
             return IntPtr.Zero;
         }
 
         rc = CudaNativeBindings.cuStreamEndCapture(_stream, out var graph);
-        if (rc != CudaResult.Success || graph == IntPtr.Zero) return IntPtr.Zero;
+        if (rc != CudaResult.Success || graph == IntPtr.Zero) { GcDiag($"endCapture FAILED rc={rc} graph={(graph != IntPtr.Zero)} (a non-capturable op — sync HtoD/DtoH or cuMemAlloc — was issued during launch)"); return IntPtr.Zero; }
 
         rc = CudaNativeBindings.cuGraphInstantiate(out var graphExec, graph, 0UL);
         CudaNativeBindings.cuGraphDestroy(graph); // exec holds its own copy; the template graph is no longer needed
-        if (rc != CudaResult.Success) return IntPtr.Zero;
+        if (rc != CudaResult.Success) { GcDiag($"instantiate FAILED rc={rc}"); return IntPtr.Zero; }
 
+        GcDiag("capture+instantiate SUCCEEDED");
         return graphExec;
     }
 

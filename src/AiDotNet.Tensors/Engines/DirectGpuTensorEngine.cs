@@ -3660,9 +3660,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         // Use cache-aware buffer allocation — checks _gpuBuffer and activation cache first
         using var inputBuffer = GetOrAllocateBuffer(backend, input);
-        // Auto-cache weights and biases so they stay on GPU for subsequent calls
-        using var weightsBuffer = GetOrAllocateBuffer(backend, weights);
-        using var biasBuffer = bias != null ? GetOrAllocateBuffer(backend, bias) : default;
+        // PERSISTENTLY cache weights and biases (not the transient GetOrAllocateBuffer, which returns an
+        // ownsBuffer:true fresh allocation that the `using` disposes — re-uploading the weights on EVERY call).
+        // That per-call cuMemcpyHtoD is both a steady-state waste AND fatal under CUDA-graph capture: a
+        // synchronous HtoD inside a stream capture throws CUDA 906 (STREAM_CAPTURE_UNSUPPORTED), aborting the
+        // whole-step graph and pinning the cortex to the launch-bound eager path (~14% util). GetOrCacheWeightBuffer
+        // adds to _persistentBufferCache — the same cache the optimizer updates in place — so the weights stay
+        // resident AND fresh. Matches the sibling fused-op path below (#GPU-graph-capture).
+        using var weightsBuffer = GetOrCacheWeightBuffer(backend, weights.GetDataArray(), PersistentTensorRole.Weights);
+        using var biasBuffer = bias != null ? GetOrCacheWeightBuffer(backend, bias.GetDataArray(), PersistentTensorRole.Biases) : default;
 
         try
         {
