@@ -10599,7 +10599,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         if (_embIndexScratch is null || _embIndexScratch.Length < n) _embIndexScratch = new int[n];
         var raw = indices.GetDataArray();
-        for (int i = 0; i < n; i++) _embIndexScratch[i] = System.Convert.ToInt32((object)raw[i]!);
+        // Typed fast paths avoid boxing every token each step (Convert.ToInt32((object)x) on ~B*ctx elements
+        // per step is heavy GC pressure). Token indices are int or long in practice.
+        if (raw is int[] ir) System.Array.Copy(ir, _embIndexScratch, n);
+        else if (raw is long[] lr) { for (int i = 0; i < n; i++) _embIndexScratch[i] = (int)lr[i]; }
+        else { for (int i = 0; i < n; i++) _embIndexScratch[i] = System.Convert.ToInt32((object)raw[i]!); }
         backend.UploadIntBufferInPlace(_embIndexScratch, _cachedEmbIndexBuffer);
     }
 
