@@ -10636,6 +10636,321 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
+    // ==================================================================
+    // PR #567 — Native sparse scatter-update kernels
+    // ==================================================================
+    // Each method below launches the matching sparse_*_update CUDA kernel
+    // (defined in CudaOptimizerKernels.cs) with one thread per non-zero
+    // gradient entry. Reads / writes only (param[idx], state[idx]) for the
+    // nnz indices the autodiff producer published; the other (size - nnz)
+    // entries are never touched. Memory traffic is O(nnz) vs. the dense
+    // path's O(size).
+    // ==================================================================
+
+    private static void EnsureSparseArgs(IGpuBuffer? param, IGpuBuffer? sparseIndices, IGpuBuffer? sparseValues, int nnz)
+    {
+        if (param is null) throw new ArgumentNullException(nameof(param));
+        if (sparseIndices is null) throw new ArgumentNullException(nameof(sparseIndices));
+        if (sparseValues is null) throw new ArgumentNullException(nameof(sparseValues));
+        if (nnz < 0) throw new ArgumentOutOfRangeException(nameof(nnz));
+    }
+
+    /// <inheritdoc/>
+    public unsafe void SparseSgdUpdate(IGpuBuffer param,
+        IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz,
+        float learningRate, float weightDecay)
+    {
+        EnsureSparseArgs(param, sparseIndices, sparseValues, nnz);
+        if (nnz == 0) return;
+        if (!_kernelCache.TryGetValue("sparse_sgd_update", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: sparse_sgd_update");
+        using var _ = PushContext();
+        uint grid = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr pP = param.Handle, pI = sparseIndices.Handle, pV = sparseValues.Handle;
+        void** args = stackalloc void*[6];
+        args[0] = &pP; args[1] = &pI; args[2] = &pV;
+        args[3] = &learningRate; args[4] = &weightDecay; args[5] = &nnz;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    /// <inheritdoc/>
+    public unsafe void SparseSgdMomentumUpdate(IGpuBuffer param, IGpuBuffer velocity,
+        IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz,
+        float learningRate, float momentum, float weightDecay)
+    {
+        EnsureSparseArgs(param, sparseIndices, sparseValues, nnz);
+        if (velocity is null) throw new ArgumentNullException(nameof(velocity));
+        if (nnz == 0) return;
+        if (!_kernelCache.TryGetValue("sparse_sgd_momentum_update", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: sparse_sgd_momentum_update");
+        using var _ = PushContext();
+        uint grid = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr pP = param.Handle, pI = sparseIndices.Handle, pV = sparseValues.Handle, pVel = velocity.Handle;
+        void** args = stackalloc void*[8];
+        args[0] = &pP; args[1] = &pI; args[2] = &pV; args[3] = &pVel;
+        args[4] = &learningRate; args[5] = &momentum; args[6] = &weightDecay; args[7] = &nnz;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    /// <inheritdoc/>
+    public unsafe void SparseAdamUpdate(IGpuBuffer param, IGpuBuffer m, IGpuBuffer v,
+        IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz,
+        float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step)
+    {
+        EnsureSparseArgs(param, sparseIndices, sparseValues, nnz);
+        if (m is null) throw new ArgumentNullException(nameof(m));
+        if (v is null) throw new ArgumentNullException(nameof(v));
+        if (step < 1) throw new ArgumentOutOfRangeException(nameof(step));
+        if (epsilon <= 0) throw new ArgumentOutOfRangeException(nameof(epsilon));
+        if (nnz == 0) return;
+        if (!_kernelCache.TryGetValue("sparse_adam_update", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: sparse_adam_update");
+        using var _ = PushContext();
+        uint grid = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr pP = param.Handle, pI = sparseIndices.Handle, pV = sparseValues.Handle;
+        IntPtr pM = m.Handle, pVv = v.Handle;
+        void** args = stackalloc void*[12];
+        args[0] = &pP; args[1] = &pI; args[2] = &pV;
+        args[3] = &pM; args[4] = &pVv;
+        args[5] = &learningRate; args[6] = &beta1; args[7] = &beta2;
+        args[8] = &epsilon; args[9] = &weightDecay; args[10] = &step; args[11] = &nnz;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    /// <inheritdoc/>
+    public unsafe void SparseAdamWUpdate(IGpuBuffer param, IGpuBuffer m, IGpuBuffer v,
+        IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz,
+        float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step)
+    {
+        EnsureSparseArgs(param, sparseIndices, sparseValues, nnz);
+        if (m is null) throw new ArgumentNullException(nameof(m));
+        if (v is null) throw new ArgumentNullException(nameof(v));
+        if (step < 1) throw new ArgumentOutOfRangeException(nameof(step));
+        if (nnz == 0) return;
+        if (!_kernelCache.TryGetValue("sparse_adamw_update", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: sparse_adamw_update");
+        using var _ = PushContext();
+        uint grid = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr pP = param.Handle, pI = sparseIndices.Handle, pV = sparseValues.Handle;
+        IntPtr pM = m.Handle, pVv = v.Handle;
+        void** args = stackalloc void*[12];
+        args[0] = &pP; args[1] = &pI; args[2] = &pV;
+        args[3] = &pM; args[4] = &pVv;
+        args[5] = &learningRate; args[6] = &beta1; args[7] = &beta2;
+        args[8] = &epsilon; args[9] = &weightDecay; args[10] = &step; args[11] = &nnz;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    /// <inheritdoc/>
+    public unsafe void SparseRmspropUpdate(IGpuBuffer param, IGpuBuffer squaredAvg,
+        IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz,
+        float learningRate, float rho, float epsilon, float weightDecay)
+    {
+        EnsureSparseArgs(param, sparseIndices, sparseValues, nnz);
+        if (squaredAvg is null) throw new ArgumentNullException(nameof(squaredAvg));
+        if (nnz == 0) return;
+        if (!_kernelCache.TryGetValue("sparse_rmsprop_update", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: sparse_rmsprop_update");
+        using var _ = PushContext();
+        uint grid = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr pP = param.Handle, pI = sparseIndices.Handle, pV = sparseValues.Handle, pSq = squaredAvg.Handle;
+        void** args = stackalloc void*[9];
+        args[0] = &pP; args[1] = &pI; args[2] = &pV; args[3] = &pSq;
+        args[4] = &learningRate; args[5] = &rho; args[6] = &epsilon; args[7] = &weightDecay; args[8] = &nnz;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    /// <inheritdoc/>
+    public unsafe void SparseAdagradUpdate(IGpuBuffer param, IGpuBuffer accumulatedGrad,
+        IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz,
+        float learningRate, float epsilon, float weightDecay)
+    {
+        EnsureSparseArgs(param, sparseIndices, sparseValues, nnz);
+        if (accumulatedGrad is null) throw new ArgumentNullException(nameof(accumulatedGrad));
+        if (nnz == 0) return;
+        if (!_kernelCache.TryGetValue("sparse_adagrad_update", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: sparse_adagrad_update");
+        using var _ = PushContext();
+        uint grid = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr pP = param.Handle, pI = sparseIndices.Handle, pV = sparseValues.Handle, pA = accumulatedGrad.Handle;
+        void** args = stackalloc void*[8];
+        args[0] = &pP; args[1] = &pI; args[2] = &pV; args[3] = &pA;
+        args[4] = &learningRate; args[5] = &epsilon; args[6] = &weightDecay; args[7] = &nnz;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    /// <inheritdoc/>
+    public unsafe void SparseNagUpdate(IGpuBuffer param, IGpuBuffer velocity,
+        IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz,
+        float learningRate, float momentum, float weightDecay)
+    {
+        EnsureSparseArgs(param, sparseIndices, sparseValues, nnz);
+        if (velocity is null) throw new ArgumentNullException(nameof(velocity));
+        if (nnz == 0) return;
+        if (!_kernelCache.TryGetValue("sparse_nag_update", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: sparse_nag_update");
+        using var _ = PushContext();
+        uint grid = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr pP = param.Handle, pI = sparseIndices.Handle, pV = sparseValues.Handle, pVel = velocity.Handle;
+        void** args = stackalloc void*[8];
+        args[0] = &pP; args[1] = &pI; args[2] = &pV; args[3] = &pVel;
+        args[4] = &learningRate; args[5] = &momentum; args[6] = &weightDecay; args[7] = &nnz;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    /// <inheritdoc/>
+    public unsafe void SparseAdadeltaUpdate(IGpuBuffer param, IGpuBuffer accumGrad, IGpuBuffer accumUpdate,
+        IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz,
+        float rho, float epsilon, float weightDecay)
+    {
+        EnsureSparseArgs(param, sparseIndices, sparseValues, nnz);
+        if (accumGrad is null) throw new ArgumentNullException(nameof(accumGrad));
+        if (accumUpdate is null) throw new ArgumentNullException(nameof(accumUpdate));
+        if (nnz == 0) return;
+        if (!_kernelCache.TryGetValue("sparse_adadelta_update", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: sparse_adadelta_update");
+        using var _ = PushContext();
+        uint grid = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr pP = param.Handle, pI = sparseIndices.Handle, pV = sparseValues.Handle;
+        IntPtr pAg = accumGrad.Handle, pAu = accumUpdate.Handle;
+        void** args = stackalloc void*[9];
+        args[0] = &pP; args[1] = &pI; args[2] = &pV; args[3] = &pAg; args[4] = &pAu;
+        args[5] = &rho; args[6] = &epsilon; args[7] = &weightDecay; args[8] = &nnz;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    /// <inheritdoc/>
+    public unsafe void SparseAmsgradUpdate(IGpuBuffer param, IGpuBuffer m, IGpuBuffer v, IGpuBuffer vMax,
+        IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz,
+        float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step)
+    {
+        EnsureSparseArgs(param, sparseIndices, sparseValues, nnz);
+        if (m is null) throw new ArgumentNullException(nameof(m));
+        if (v is null) throw new ArgumentNullException(nameof(v));
+        if (vMax is null) throw new ArgumentNullException(nameof(vMax));
+        if (step < 1) throw new ArgumentOutOfRangeException(nameof(step));
+        if (nnz == 0) return;
+        if (!_kernelCache.TryGetValue("sparse_amsgrad_update", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: sparse_amsgrad_update");
+        using var _ = PushContext();
+        uint grid = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr pP = param.Handle, pI = sparseIndices.Handle, pV = sparseValues.Handle;
+        IntPtr pM = m.Handle, pVv = v.Handle, pVm = vMax.Handle;
+        void** args = stackalloc void*[13];
+        args[0] = &pP; args[1] = &pI; args[2] = &pV;
+        args[3] = &pM; args[4] = &pVv; args[5] = &pVm;
+        args[6] = &learningRate; args[7] = &beta1; args[8] = &beta2;
+        args[9] = &epsilon; args[10] = &weightDecay; args[11] = &step; args[12] = &nnz;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    /// <inheritdoc/>
+    public unsafe void SparseAdamaxUpdate(IGpuBuffer param, IGpuBuffer m, IGpuBuffer u,
+        IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz,
+        float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step)
+    {
+        EnsureSparseArgs(param, sparseIndices, sparseValues, nnz);
+        if (m is null) throw new ArgumentNullException(nameof(m));
+        if (u is null) throw new ArgumentNullException(nameof(u));
+        if (step < 1) throw new ArgumentOutOfRangeException(nameof(step));
+        if (nnz == 0) return;
+        if (!_kernelCache.TryGetValue("sparse_adamax_update", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: sparse_adamax_update");
+        using var _ = PushContext();
+        uint grid = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr pP = param.Handle, pI = sparseIndices.Handle, pV = sparseValues.Handle;
+        IntPtr pM = m.Handle, pU = u.Handle;
+        void** args = stackalloc void*[12];
+        args[0] = &pP; args[1] = &pI; args[2] = &pV;
+        args[3] = &pM; args[4] = &pU;
+        args[5] = &learningRate; args[6] = &beta1; args[7] = &beta2;
+        args[8] = &epsilon; args[9] = &weightDecay; args[10] = &step; args[11] = &nnz;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    /// <inheritdoc/>
+    public unsafe void SparseLionUpdate(IGpuBuffer param, IGpuBuffer m,
+        IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz,
+        float learningRate, float beta1, float beta2, float weightDecay)
+    {
+        EnsureSparseArgs(param, sparseIndices, sparseValues, nnz);
+        if (m is null) throw new ArgumentNullException(nameof(m));
+        if (nnz == 0) return;
+        if (!_kernelCache.TryGetValue("sparse_lion_update", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: sparse_lion_update");
+        using var _ = PushContext();
+        uint grid = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr pP = param.Handle, pI = sparseIndices.Handle, pV = sparseValues.Handle, pM = m.Handle;
+        void** args = stackalloc void*[9];
+        args[0] = &pP; args[1] = &pI; args[2] = &pV; args[3] = &pM;
+        args[4] = &learningRate; args[5] = &beta1; args[6] = &beta2; args[7] = &weightDecay; args[8] = &nnz;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    /// <inheritdoc/>
+    public unsafe void SparseNadamUpdate(IGpuBuffer param, IGpuBuffer m, IGpuBuffer v,
+        IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz,
+        float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step)
+    {
+        EnsureSparseArgs(param, sparseIndices, sparseValues, nnz);
+        if (m is null) throw new ArgumentNullException(nameof(m));
+        if (v is null) throw new ArgumentNullException(nameof(v));
+        if (step < 1) throw new ArgumentOutOfRangeException(nameof(step));
+        if (nnz == 0) return;
+        if (!_kernelCache.TryGetValue("sparse_nadam_update", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: sparse_nadam_update");
+        using var _ = PushContext();
+        uint grid = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr pP = param.Handle, pI = sparseIndices.Handle, pV = sparseValues.Handle;
+        IntPtr pM = m.Handle, pVv = v.Handle;
+        void** args = stackalloc void*[12];
+        args[0] = &pP; args[1] = &pI; args[2] = &pV;
+        args[3] = &pM; args[4] = &pVv;
+        args[5] = &learningRate; args[6] = &beta1; args[7] = &beta2;
+        args[8] = &epsilon; args[9] = &weightDecay; args[10] = &step; args[11] = &nnz;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    /// <inheritdoc/>
+    public unsafe void SparseFtrlUpdate(IGpuBuffer param, IGpuBuffer z, IGpuBuffer n,
+        IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz,
+        float learningRate, float l1Reg, float l2Reg, float beta)
+    {
+        EnsureSparseArgs(param, sparseIndices, sparseValues, nnz);
+        if (z is null) throw new ArgumentNullException(nameof(z));
+        if (n is null) throw new ArgumentNullException(nameof(n));
+        if (nnz == 0) return;
+        if (!_kernelCache.TryGetValue("sparse_ftrl_update", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: sparse_ftrl_update");
+        using var _ = PushContext();
+        uint grid = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr pP = param.Handle, pI = sparseIndices.Handle, pV = sparseValues.Handle;
+        IntPtr pZ = z.Handle, pN = n.Handle;
+        void** args = stackalloc void*[10];
+        args[0] = &pP; args[1] = &pI; args[2] = &pV;
+        args[3] = &pZ; args[4] = &pN;
+        args[5] = &learningRate; args[6] = &l1Reg; args[7] = &l2Reg; args[8] = &beta; args[9] = &nnz;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    /// <inheritdoc/>
+    public unsafe void SparseProximalL1Update(IGpuBuffer param,
+        IGpuBuffer sparseIndices, IGpuBuffer sparseValues, int nnz,
+        float learningRate, float l1Strength)
+    {
+        EnsureSparseArgs(param, sparseIndices, sparseValues, nnz);
+        if (nnz == 0) return;
+        if (!_kernelCache.TryGetValue("sparse_proximal_l1_update", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: sparse_proximal_l1_update");
+        using var _ = PushContext();
+        uint grid = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr pP = param.Handle, pI = sparseIndices.Handle, pV = sparseValues.Handle;
+        void** args = stackalloc void*[6];
+        args[0] = &pP; args[1] = &pI; args[2] = &pV;
+        args[3] = &learningRate; args[4] = &l1Strength; args[5] = &nnz;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
     /// <inheritdoc/>
     public unsafe void ConvertToFp16(IGpuBuffer input, IGpuBuffer output, int size)
     {
@@ -10700,19 +11015,33 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         float aVal = alpha, bVal = beta;
         IntPtr alphaPtr = (IntPtr)(&aVal);
         IntPtr betaPtr = (IntPtr)(&bVal);
-        CuBlasNative.CheckCublasStatus(
-            CuBlasNative.cublasGemmEx(
-                _cublasHandle,
-                CublasOperation.None, CublasOperation.None,
-                N, M, K,
-                alphaPtr,
-                Bhalf.Handle, CuBlasNative.CUDA_R_16F, N,
-                Ahalf.Handle, CuBlasNative.CUDA_R_16F, K,
-                betaPtr,
-                C.Handle, CuBlasNative.CUDA_R_32F, N,
-                CuBlasNative.CUBLAS_COMPUTE_32F,
-                0 /* CUBLAS_GEMM_DEFAULT — selects Tensor Cores under the handle's math mode */),
-            "cublasGemmEx(GemmFp16)");
+        var status = CuBlasNative.cublasGemmEx(
+            _cublasHandle,
+            CublasOperation.None, CublasOperation.None,
+            N, M, K,
+            alphaPtr,
+            Bhalf.Handle, CuBlasNative.CUDA_R_16F, N,
+            Ahalf.Handle, CuBlasNative.CUDA_R_16F, K,
+            betaPtr,
+            C.Handle, CuBlasNative.CUDA_R_32F, N,
+            CuBlasNative.CUBLAS_COMPUTE_32F,
+            0 /* CUBLAS_GEMM_DEFAULT — selects Tensor Cores under the handle's math mode */);
+
+        // CUBLAS_STATUS_NOT_SUPPORTED is a CAPABILITY signal, not an operational failure:
+        // the FP16-in / FP32-compute cublasGemmEx config isn't available on this device
+        // (some GPUs/driver combos lack it even at compute capability >= 5). Surface it as
+        // NotSupportedException — the semantically correct type — so callers can cleanly
+        // fall back to the TF32 cublasSgemm path instead of treating it as a hard error.
+        // The compute-capability floor (SupportsHgemm, cc >= 5) is necessary but not
+        // sufficient, so we key off the authoritative runtime status here.
+        if (status == AiDotNet.Tensors.Engines.CublasStatus.NotSupported)
+        {
+            throw new NotSupportedException(
+                $"FP16 Tensor-Core GEMM (cublasGemmEx CUDA_R_16F in / CUBLAS_COMPUTE_32F) is not " +
+                $"supported on this device (compute capability {_ccMajor}.{_ccMinor}); " +
+                $"use the TF32 Gemm path instead.");
+        }
+        CuBlasNative.CheckCublasStatus(status, "cublasGemmEx(GemmFp16)");
     }
 
     private unsafe void LaunchUnaryFp16(string kernelName, IGpuBuffer input, IGpuBuffer output, int size)

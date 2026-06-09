@@ -89,6 +89,108 @@ public abstract class OptimizerBase : IOptimizer
                 Array.Clear(g.Gradients[i], 0, g.Gradients[i].Length);
     }
 
+    // ------------------------------------------------------------------
+    // Sparse-gradient plumbing (shared by every concrete optimizer).
+    //
+    // The autodiff side (BackwardFunctions / DifferentiableOps / SparseEmbeddingGradient)
+    // records embedding-style gradients as (row-indices, row-values) instead of dense
+    // [vocab, dim] tensors. Consumers (PyTorch-style training loops) bridge that sparse
+    // representation onto the optimizer by calling SetSparseGradient(gi, pi, idx, vals)
+    // before Step(). Each Step() then sees the sparse view via TryGetSparseGradient and
+    // scatter-updates only the touched indices, skipping the full-parameter scan that
+    // is wasteful when the dense gradient is mostly zero.
+    //
+    // This mirrors what SparseAdamOptimizer (the only sparse-aware optimizer prior to
+    // PR #567) already did, but lifted into the base class so EVERY optimizer
+    // automatically gains the same fast path with zero per-subclass boilerplate.
+    // Optimizers whose update math doesn't decompose elementwise (Rprop sign tracking,
+    // LBFGS / Shampoo matrix state, Asgd's averaged-weight buffer) opt out by simply
+    // not calling TryGetSparseGradient.
+    // ------------------------------------------------------------------
+
+    private readonly Dictionary<(int gi, int pi), (int[] idx, float[] val, bool autoClear)> _sparseGrads =
+        new Dictionary<(int gi, int pi), (int[], float[], bool)>();
+
+    /// <summary>Publish a sparse gradient (row-indices + row-values) for the next <see cref="Step"/> call.
+    /// Indices are flat positions into the parameter buffer (not row indices into a 2D view) so this works
+    /// for any rank/layout; embedding callers feed in <c>row*embDim + col</c> flat indices.
+    /// When <paramref name="autoClear"/> is true (the default) the entry is removed at the end of <see cref="Step"/>
+    /// so each step re-publishes — matching the AccumulateGrad / SparseEmbeddingGradient lifecycle on the
+    /// autodiff side. Pass false for static masks that persist across steps.</summary>
+    public void SetSparseGradient(int paramGroupIndex, int paramIndex, int[] indices, float[] values, bool autoClear = true)
+    {
+        if (indices == null) throw new ArgumentNullException(nameof(indices));
+        if (values == null) throw new ArgumentNullException(nameof(values));
+        if (indices.Length != values.Length)
+            throw new ArgumentException("indices and values must be the same length.", nameof(values));
+        _sparseGrads[(paramGroupIndex, paramIndex)] = (indices, values, autoClear);
+    }
+
+    /// <summary>Drop a sparse gradient previously published via <see cref="SetSparseGradient"/>.</summary>
+    public void ClearSparseGradient(int paramGroupIndex, int paramIndex)
+        => _sparseGrads.Remove((paramGroupIndex, paramIndex));
+
+    /// <summary>Drop every sparse-gradient entry (both auto-clear and sticky).</summary>
+    public void ClearAllSparseGradients() => _sparseGrads.Clear();
+
+    /// <summary>Subclass probe: returns true and yields the published (indices, values) when
+    /// a sparse override has been wired for this parameter. Subclasses that can decompose
+    /// their update elementwise should consume the sparse view; others should fall through
+    /// to their existing dense kernel.</summary>
+    protected bool TryGetSparseGradient(int paramGroupIndex, int paramIndex, out int[] idx, out float[] val, out int nnz)
+    {
+        if (_sparseGrads.TryGetValue((paramGroupIndex, paramIndex), out var pair))
+        {
+            idx = pair.idx;
+            val = pair.val;
+            nnz = pair.idx.Length;
+            return true;
+        }
+        idx = null!;
+        val = null!;
+        nnz = 0;
+        return false;
+    }
+
+    /// <summary>Returns true iff a sparse gradient is wired for the given param. Cheap probe
+    /// for subclasses that want to short-circuit before touching the dense buffer.</summary>
+    protected bool HasSparseGradient(int paramGroupIndex, int paramIndex)
+        => _sparseGrads.ContainsKey((paramGroupIndex, paramIndex));
+
+    /// <summary>Materialize the published sparse gradient (if any) into the supplied dense
+    /// buffer: zeros <paramref name="dense"/> first, then scatter-adds <c>(idx, val)</c> pairs.
+    /// Used by optimizers whose update math does NOT decompose elementwise (LAMB / LARS /
+    /// ASGD / Rprop — trust-ratio, averaged-weight, sign-tracking) so they can still consume
+    /// a sparse-published gradient via the regular dense kernel. No-op if no sparse grad is
+    /// published for this (gi, pi).</summary>
+    protected void MaterializeSparseIntoDense(int paramGroupIndex, int paramIndex, float[] dense)
+    {
+        if (dense == null) throw new ArgumentNullException(nameof(dense));
+        if (!_sparseGrads.TryGetValue((paramGroupIndex, paramIndex), out var pair)) return;
+        Array.Clear(dense, 0, dense.Length);
+        var idx = pair.idx;
+        var val = pair.val;
+        for (int k = 0; k < idx.Length; k++) dense[idx[k]] += val[k];
+    }
+
+    /// <summary>Remove all auto-clear sparse-grad entries. Subclasses MUST call this from
+    /// the <c>finally</c> block of <see cref="Step"/> so each step starts with a clean slate.</summary>
+    protected void ClearAutoClearSparseGrads()
+    {
+        if (_sparseGrads.Count == 0) return;
+        List<(int, int)>? toRemove = null;
+        foreach (var kv in _sparseGrads)
+        {
+            if (kv.Value.autoClear)
+            {
+                toRemove ??= new List<(int, int)>();
+                toRemove.Add(kv.Key);
+            }
+        }
+        if (toRemove != null)
+            foreach (var key in toRemove) _sparseGrads.Remove(key);
+    }
+
     /// <summary>If a group's <c>"maximize"</c> option is true, flip the sign of each gradient
     /// in-place so the downstream descent kernel performs an ascent step. Gradients are written
     /// back to their original sign at the end of <see cref="Step"/> via <see cref="UnflipMaximize"/>.</summary>

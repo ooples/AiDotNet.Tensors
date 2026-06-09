@@ -62,7 +62,20 @@ public class Fp16TensorCoreGemmTests
         Assert.Equal((long)K * N * 2, hB.SizeInBytes);
 
         using var dC16 = b.AllocateBuffer(M * N); // FP32 accumulate output
-        b.GemmFp16(hA, hB, dC16, M, N, K);
+        // Not every CUDA device/driver supports the FP16-in / FP32-compute cublasGemmEx
+        // config (it returns CUBLAS_STATUS_NOT_SUPPORTED, surfaced as NotSupportedException).
+        // The compute-capability guards above can't predict it precisely, so skip on the
+        // authoritative runtime signal — the test validates correctness only where the
+        // Tensor-Core path actually runs.
+        try
+        {
+            b.GemmFp16(hA, hB, dC16, M, N, K);
+        }
+        catch (NotSupportedException ex)
+        {
+            Skip.If(true, $"FP16 Tensor-Core GEMM not supported on this device: {ex.Message}");
+            return;
+        }
         var got16 = b.DownloadBuffer(dC16);
 
         // Relative Frobenius error ||got - ref|| / ||ref|| — the standard GEMM accuracy metric.

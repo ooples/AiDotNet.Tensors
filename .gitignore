@@ -76,3 +76,7 @@ src/AiDotNet.Native.CUDA/runtimes/*/native/*.dll
 .resnet50.log
 .bert100.log
 TR/
+
+# Generated at release time by tools/pack-cuda-split.ps1 (CUDA fragment manifest)
+src/AiDotNet.Native.CUDA/build/cuda-fragments.manifest
+src/AiDotNet.Native.CUDA/obj/cuda-split/
