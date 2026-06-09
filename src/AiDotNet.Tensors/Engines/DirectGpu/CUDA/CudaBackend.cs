@@ -1137,6 +1137,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     /// </summary>
     public void ReclaimUnderPressure(double freeFractionThreshold = 0.20)
     {
+        // Bounds: a free-fraction threshold only makes sense in (0, 1]. > 1 would force the full
+        // GC/finalizer sweep on EVERY call (free/total can never exceed 1), and <= 0 (or NaN) would
+        // disable reclamation entirely — both defeat the purpose, so reject rather than silently misbehave.
+        if (!(freeFractionThreshold > 0.0 && freeFractionThreshold <= 1.0))
+            throw new ArgumentOutOfRangeException(nameof(freeFractionThreshold), freeFractionThreshold,
+                "freeFractionThreshold must be in the range (0, 1].");
         if (!IsAvailable) return;
         ulong free, total;
         using (PushContext())
@@ -3520,6 +3526,32 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         {
             _pinnedPool.Return(pinnedPtr, byteSize);
         }
+    }
+
+    /// <summary>Synchronously overwrite an EXISTING buffer's contents in place (stable pointer, no
+    /// realloc). Used to refresh the persistent CUDA-graph input each step OUTSIDE capture so the
+    /// captured forward reads fresh data without a re-upload INSIDE capture (which is CUDA 906
+    /// STREAM_CAPTURE_UNSUPPORTED). Keeping the pointer stable preserves the captured graph's validity.</summary>
+    public unsafe void UploadBufferInPlace(float[] data, IGpuBuffer buffer)
+    {
+        if (data == null) throw new ArgumentNullException(nameof(data));
+        if (buffer == null) throw new ArgumentNullException(nameof(buffer));
+        // Fail fast with a managed exception BEFORE touching the driver — matches the rest of the
+        // backend. Without this, a failed backend init or a freed graph-input buffer (zero handle)
+        // would fall through to a raw cuMemcpyHtoD and fault the CUDA context (error 700) instead.
+        if (!IsAvailable)
+            throw new InvalidOperationException("CUDA backend is not available.");
+        if (buffer.Handle == IntPtr.Zero)
+            throw new ObjectDisposedException(nameof(buffer),
+                "GPU buffer was released before its in-place upload.");
+        if (data.Length > buffer.Size)
+            throw new ArgumentException($"Host data ({data.Length}) exceeds buffer ({buffer.Size}).");
+        using var _ = PushContext();
+        ulong byteSize = (ulong)data.Length * sizeof(float);
+        fixed (float* src = data)
+            CuBlasNative.CheckCudaResult(
+                CuBlasNative.cuMemcpyHtoD(buffer.Handle, (IntPtr)src, byteSize),
+                "cuMemcpyHtoD(graph input refresh in-place)");
     }
 
     /// <inheritdoc/>

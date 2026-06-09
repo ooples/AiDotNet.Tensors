@@ -89,6 +89,9 @@ internal enum OpType : byte
     MSELoss,
     CrossEntropyLoss,
     BinaryCrossEntropy,
+
+    // Embedding (int→float gather; a host op the captured GPU graph cannot replay — run eagerly)
+    Embedding,
 }
 
 internal static class OpTypeParser
@@ -155,6 +158,7 @@ internal static class OpTypeParser
         "MSELoss" => OpType.MSELoss,
         "TensorCrossEntropyLoss" or "CrossEntropyLoss" => OpType.CrossEntropyLoss,
         "TensorBinaryCrossEntropy" => OpType.BinaryCrossEntropy,
+        "Embedding" or "TensorEmbeddingLookup" => OpType.Embedding,
         _ => OpType.Unknown,
     };
 }
