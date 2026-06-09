@@ -5369,6 +5369,15 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (!_kernelCache.TryGetValue("maxpool2d_backward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: maxpool2d_backward");
 
+        // The non-deterministic kernel SCATTERS via atomicAdd to max cells only — non-max cells get no
+        // write, so gradInput must read as zero. AllocateBuffer zeroes it via a null-stream cuMemsetD32,
+        // which is NOT ordered against this kernel's non-blocking compute stream and can lag under load
+        // (the deterministic kernel sidesteps this by assigning every cell; this scatter cannot). Zero
+        // it again STREAM-ORDERED on _stream so the memset strictly precedes the kernel, no host sync.
+        CuBlasNative.CheckCudaResult(
+            CudaNativeBindings.cuMemsetD8Async(gradInPtr, 0, (ulong)((long)gradInput.Size * sizeof(float)), _stream),
+            "cuMemsetD8Async(maxpool2d_backward gradInput)");
+
         uint gridX = (uint)((outWidth + blockSize - 1) / blockSize);
         uint gridY = (uint)((outHeight + blockSize - 1) / blockSize);
         uint gridZ = (uint)(batch * channels);
