@@ -58,7 +58,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private long _graphStepCalls;
     private bool _graphStepDisabled;
     private bool _graphEvictionSuspended;   // eviction suspended for the graph lifetime (resumed on Dispose)
-    private int _graphEagerFwd;              // # leading forward steps (the embedding) run EAGERLY outside the captured graph
+    private int _graphEagerFwd;              // # leading forward steps run EAGERLY outside the captured graph (0 in capture mode)
+    private Tensor<int>? _graphEmbIndices;   // the captured embedding's token-index tensor; refreshed (small int HtoD)
+                                             // into the engine's stable index buffer before each launch, OUTSIDE capture,
+                                             // so the embedding gather runs INSIDE the graph at full util (no eager prefix)
     // Capture is sound only when EVERY forward+backward action enqueues its real
     // work on the GPU stream. Host-only specialized closures (CPU-SIMD ReLU,
     // host-.Data GEMM, fused/analytic/slice/batched-dW kernels) run once at capture
@@ -137,10 +140,16 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         _lossGradSeed = lossGradSeed;
         _genericGradIndices = genericGradIndices;
         _forwardSteps = forwardSteps;
-        // A leading "Embedding" forward step is a host int→float gather that the captured GPU graph cannot
-        // replay (its output upload would freeze at capture). Run it EAGERLY outside the captured region and
-        // refresh its output into the graph each step (see RunEagerForwardPrefix + RefreshGraphInputInPlace).
-        _graphEagerFwd = (_forwardSteps != null && _forwardSteps.Length > 0 && _forwardSteps[0].OpType == OpType.Embedding) ? 1 : 0;
+        // A leading "Embedding" step is an int→float gather. Capture it INSIDE the graph (a pure on-device gather
+        // over a STABLE index buffer) and refresh just the small index vector before each launch — so the whole
+        // step is one cuGraphLaunch at full util, no eager prefix (_graphEagerFwd stays 0). The token-index tensor
+        // lives in the embedding step's saved state ({ indices }); grab it to refresh the buffer each step.
+        _graphEagerFwd = 0;
+        if (_forwardSteps != null && _forwardSteps.Length > 0 && _forwardSteps[0].OpType == OpType.Embedding
+            && _forwardSteps[0].SavedState is { Length: > 0 } ss && ss[0] is Tensor<int> embIdx)
+        {
+            _graphEmbIndices = embIdx;
+        }
         _compiledInputShape = compiledInputShape;
         _compiledInputTensor = compiledInputTensor;
         _fusedStepIndices = fusedStepIndices;
@@ -514,10 +523,15 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 if (!_graphEvictionSuspended) { gte.SuspendActivationEviction(); _graphEvictionSuspended = true; }
                 if (_stepGraphExec == IntPtr.Zero)
                 {
-                    // Run the embedding EAGERLY (host int→float gather, re-reading LIVE token indices) and upload
-                    // its fresh output into the graph's stable input buffer, so the pre-residency body AND the
-                    // captured graph read THIS step's embeddings rather than a frozen snapshot.
-                    RunEagerForwardPrefix();
+                    // CAPTURE (first step): refresh THIS step's small index vector into the stable buffer OUTSIDE
+                    // capture, and flag the engine so the embedding delegate (run by the pre-residency body + the
+                    // capture) gathers from that buffer WITHOUT an inline upload — a cuMemcpyHtoD inside capture is
+                    // CUDA 906. The flag is cleared right after capture so the eager fallback uploads inline again.
+                    if (_graphEmbIndices is not null)
+                    {
+                        gte.EmbeddingIndexExternallyManaged = true;
+                        gte.RefreshGraphEmbeddingIndices(_graphEmbIndices);
+                    }
                     RefreshGraphInputInPlace(cb);
                     // PRE-RESIDENCY PASS: run the step body once EAGERLY so every host-backed tensor the
                     // captured ops touch (weights/bias AND the input) is uploaded + cached OUTSIDE
@@ -525,6 +539,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     // is CUDA 906 STREAM_CAPTURE_UNSUPPORTED). First step does one extra (redundant) body.
                     RunGpuStepBodyForCapture(cb);
                     var exec = cb.CaptureGraph(() => RunGpuStepBodyForCapture(cb));
+                    // The embedding delegate has now run (pre-residency + capture); clear the flag so a capture-failure
+                    // fallback to StepEager (and any later eager step) refreshes the index buffer inline again.
+                    gte.EmbeddingIndexExternallyManaged = false;
                     if (exec == IntPtr.Zero) { _graphStepDisabled = true; return StepEager(); }
                     _stepGraphExec = exec;
                     cb.LaunchCapturedGraph(exec);   // executes THIS step on the just-uploaded input
@@ -540,7 +557,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 // version. Refresh the persistent input BUFFER in place (stable pointer) OUTSIDE capture
                 // so the replayed graph reads fresh data; then replay. Without this the graph would
                 // recompute on the captured step's stale input (silently wrong training).
-                RunEagerForwardPrefix();   // re-run the embedding (host gather, live token indices) for THIS step
+                // Upload THIS step's token indices into the stable buffer (OUTSIDE capture) so the captured
+                // embedding gather replays on fresh indices; then replay the whole step as one graph launch.
+                if (_graphEmbIndices is not null) gte.RefreshGraphEmbeddingIndices(_graphEmbIndices);
                 RefreshGraphInputInPlace(cb);
                 cb.LaunchCapturedGraph(_stepGraphExec);
                 _optimizerUpdate?.Invoke();
@@ -572,25 +591,13 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         inT._gpuBufferVersion = inT.Version;
     }
 
-    /// <summary>
-    /// Runs the EAGER forward prefix — the leading "Embedding" step (a host int→float gather the captured GPU
-    /// graph cannot replay). Re-reads the LIVE token indices each call (the compiled-embedding refresh), so the
-    /// embedding's output tensor holds THIS step's data; <see cref="RefreshGraphInputInPlace"/> then uploads it
-    /// into the graph's stable input buffer. No-op when there is no embedding prefix (_graphEagerFwd == 0).
-    /// </summary>
-    private void RunEagerForwardPrefix()
-    {
-        var fwd = _forwardActions;
-        for (int i = 0; i < _graphEagerFwd && i < fwd.Length; i++) fwd[i](_engine);
-    }
-
     private void RunGpuStepBodyForCapture(Engines.DirectGpu.CUDA.CudaBackend cb)
     {
         var engine = _engine;
         _preForwardParamTransform?.Invoke();
         var fwd = _forwardActions;
-        // Skip the eager prefix (the embedding) — it runs OUTSIDE the captured graph via RunEagerForwardPrefix
-        // each step, so the captured GPU sequence reads the embedding's freshly-refreshed output buffer.
+        // The whole forward (INCLUDING the embedding, which gathers on-device from the externally-refreshed stable
+        // index buffer) is captured. _graphEagerFwd is 0 in capture mode (no eager prefix).
         for (int i = _graphEagerFwd; i < fwd.Length; i++) fwd[i](engine);
 
         int esz = System.Runtime.CompilerServices.Unsafe.SizeOf<T>();
@@ -2539,16 +2546,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         //   FusedOptimizer.AppendFusedUpdates(plan.BackwardActions, params, grads, lr)
         // This avoids hard-coding the learning rate into the compiled plan.
 
-        // Determine the per-step persistent input for CUDA-graph refresh. For a token-LM whose FIRST forward
-        // step is the EMBEDDING (a host int→float gather the captured GPU graph cannot re-run), the float
-        // graph's true per-step input is the embedding's OUTPUT (it varies every step with the token indices).
-        // forwardSteps[0].Inputs[0] is the embeddings MATRIX (a trained param) — refreshing that leaves the
-        // token indices FROZEN at the capture step → loss stuck at ln V. So point the refresh at the embedding
-        // OUTPUT, and run the embedding eagerly each step (see _graphEagerFwd / RunEagerForwardPrefix) so its
-        // output is fresh before each graph launch.
+        // Determine the per-step persistent input for the CUDA-graph float-input refresh. When the FIRST step is
+        // the EMBEDDING, it is now CAPTURED inside the graph (a pure on-device gather over a stable index buffer
+        // refreshed via RefreshGraphEmbeddingIndices), so there is NO float input to refresh — leave it null
+        // (refreshing the embedding output would DtoH+HtoD the whole activation each step, the util killer). For a
+        // non-embedding graph plan, the persistent input is forwardSteps[0].Inputs[0] (the generic input-feed case).
         bool firstIsEmbedding = forwardSteps.Count > 0 && forwardSteps[0].OpType == OpType.Embedding;
         Tensor<T>? compiledInputTensor = firstIsEmbedding
-            ? forwardSteps[0].OutputBuffer
+            ? null
             : (forwardSteps.Count > 0 && forwardSteps[0].Inputs.Length > 0 ? forwardSteps[0].Inputs[0] : null);
         int[] compiledInputShape = compiledInputTensor is not null
             ? (int[])compiledInputTensor._shape.Clone() : Array.Empty<int>();
