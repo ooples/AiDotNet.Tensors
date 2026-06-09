@@ -813,6 +813,12 @@ internal static class OneDnnProvider
         float* output, int outHeight, int outWidth,
         int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
     {
+        // In deterministic mode, skip oneDNN entirely BEFORE any native setup (primitive
+        // creation, cache population, descriptor/memory-object building). TryEnterExecute()
+        // only gates the final execute step, so the deterministic "skip oneDNN" contract has
+        // to be enforced here at the entry point to avoid wasted native work.
+        if (BlasProvider.IsDeterministicMode) return false;
+
         // Gate all chatter behind the trace flag so production output stays clean.
         bool logThis = TraceEnabled;
 
@@ -1008,6 +1014,9 @@ internal static class OneDnnProvider
     /// </summary>
     private static unsafe bool TryEltwiseInPlace(float* data, int length, int algorithm)
     {
+        // Deterministic mode: skip oneDNN before any cache lookup or primitive creation.
+        if (BlasProvider.IsDeterministicMode) return false;
+
         if (!EnsureInitialized())
             return false;
 
@@ -1204,6 +1213,9 @@ internal static class OneDnnProvider
     /// <param name="axisSize">Size of the softmax axis (number of classes).</param>
     internal static unsafe bool TrySoftmax(float* input, float* output, int outerSize, int axisSize)
     {
+        // Deterministic mode: skip oneDNN before any cache lookup or primitive creation.
+        if (BlasProvider.IsDeterministicMode) return false;
+
         if (!EnsureInitialized())
             return false;
 
@@ -1356,6 +1368,9 @@ internal static class OneDnnProvider
     /// </summary>
     private static unsafe bool TryBinary(float* src0, float* src1, float* dst, int length, int algorithm)
     {
+        // Deterministic mode: skip oneDNN before any cache lookup or primitive creation.
+        if (BlasProvider.IsDeterministicMode) return false;
+
         if (!EnsureInitialized())
             return false;
 
@@ -1958,6 +1973,9 @@ internal static class OneDnnProvider
         int poolH, int poolW, int strideH, int strideW, int padH, int padW,
         int outH, int outW)
     {
+        // Deterministic mode: skip oneDNN before building any descriptors or memory objects.
+        if (BlasProvider.IsDeterministicMode) return false;
+
         if (!EnsureInitialized()) return false;
 
         try
@@ -2056,6 +2074,9 @@ internal static class OneDnnProvider
         int batch, int channels, int height, int width,
         float epsilon)
     {
+        // Deterministic mode: skip oneDNN before building any descriptors or memory objects.
+        if (BlasProvider.IsDeterministicMode) return false;
+
         if (!EnsureInitialized()) return false;
 
         try
