@@ -10560,6 +10560,28 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     }
 
     /// <summary>
+    /// GPU embedding gather that writes directly INTO an existing output tensor's GPU buffer — no allocation,
+    /// no host round-trip. Used by the compiled embedding forward action so the (prefix-eager) embedding runs
+    /// fully on-device each step and does NOT stall GPU util the way the host gather + full-output HtoD did.
+    /// Returns false (caller falls back to the host path) if the table/output are not GPU-resident.
+    /// The embedding table is read from its LIVE GPU buffer (updated in place by the GPU optimizer), so the
+    /// gather sees the current trained embeddings; only the small index vector is uploaded per step.
+    /// </summary>
+    internal bool TryEmbeddingLookupGpuInto<T>(Tensor<T> embeddingTable, Tensor<int> indices, Tensor<T> output)
+    {
+        if (!TryGetBackend(out var backend)) return false;
+        var outBuf = output.TryGetGpuBuffer();
+        var tableBuf = embeddingTable.TryGetGpuBuffer();
+        if (outBuf is null || tableBuf is null) return false;
+        int numIndices = indices.Length;
+        int embeddingDim = embeddingTable.Shape._dims[^1];
+        if ((long)numIndices * embeddingDim > outBuf.Size) return false;
+        using var idxBuf = backend.AllocateIntBuffer(indices.GetDataArray());
+        backend.Embedding(idxBuf, tableBuf, outBuf, numIndices, embeddingDim);
+        return true;
+    }
+
+    /// <summary>
     /// GPU-resident embedding backward operation.
     /// Computes gradients for the embedding table on GPU.
     /// </summary>

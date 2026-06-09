@@ -37689,7 +37689,14 @@ public partial class CpuEngine : ITensorLevelEngine
                 int embDim = embeddingTable._shape[^1];
                 var outShape = new[] { indices.Length, embDim };
                 return scope.RecordUnary(LazyNodeType.Custom, "Embedding", embeddingTable, outShape,
-                    (eng, output) => { var r = eng.Embedding(ci, ct); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) =>
+                    {
+                        // On the GPU engine, gather on-device straight into the output buffer (no host round-trip)
+                        // so the eager-prefix embedding doesn't stall GPU util; fall back to the host gather + copy
+                        // when the table/output aren't GPU-resident (CPU engine, or not-yet-resident tensors).
+                        if (eng is DirectGpuTensorEngine gpuEng && gpuEng.TryEmbeddingLookupGpuInto(ct, ci, output)) return;
+                        var r = eng.Embedding(ci, ct); r.AsSpan().CopyTo(output.AsWritableSpan());
+                    },
                     BackwardFunctions<T>.EmbeddingBackward, new object[] { indices });
             }
         }
