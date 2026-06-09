@@ -10597,7 +10597,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (!TryGetBackend(out var backend)) return false;
         var outBuf = output.TryGetGpuBuffer();
-        var tableBuf = embeddingTable.TryGetGpuBuffer();
+        // The embedding table is usually a HOST-cached weight (no GPU buffer on the tensor itself), which would
+        // null here and force the host fallback → breaking stream capture. Resolve its RESIDENT weight buffer —
+        // the same buffer the captured MatMul reads and the optimizer updates IN PLACE — so the gather reads the
+        // CURRENT trained embeddings and records cleanly into the graph.
+        var tableBuf = embeddingTable.TryGetGpuBuffer() ?? ResolveResidentEmbeddingTable(backend, embeddingTable);
         if (outBuf is null || tableBuf is null) return false;
         int numIndices = indices.Length;
         int embeddingDim = embeddingTable.Shape._dims[^1];
@@ -10618,6 +10622,23 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (_cachedEmbIndexBuffer is null) return false;
         backend.Embedding(_cachedEmbIndexBuffer, tableBuf, outBuf, numIndices, embeddingDim);
         return true;
+    }
+
+    private IGpuBuffer? _cachedEmbTableBuffer;   // resolved-once resident embedding-table weight buffer
+
+    /// <summary>Resolve the embedding table's RESIDENT weight buffer (the cached weight uploaded once + updated in
+    /// place by the optimizer — exactly the buffer the captured MatMul reads). Cached after first resolution so
+    /// capture/replay never re-read host data or re-upload (no DtoH/HtoD inside the captured region).</summary>
+    private IGpuBuffer? ResolveResidentEmbeddingTable<T>(IDirectGpuBackend backend, Tensor<T> embeddingTable)
+    {
+        if (_cachedEmbTableBuffer is not null) return _cachedEmbTableBuffer;
+        try
+        {
+            var owned = GetOrCacheWeightBuffer(backend, embeddingTable.GetDataArray(), PersistentTensorRole.Embeddings);
+            _cachedEmbTableBuffer = owned.Buffer;
+        }
+        catch { return null; }
+        return _cachedEmbTableBuffer;
     }
 
     /// <summary>
