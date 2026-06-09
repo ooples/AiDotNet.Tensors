@@ -20,7 +20,7 @@ internal static class StreamingWorkerPool
 {
     [ThreadStatic] private static bool _isExecuting;
 
-    private static readonly int _numWorkers = Math.Max(1, Environment.ProcessorCount - 1);
+    private static readonly int _numWorkers = AiDotNet.Tensors.Helpers.CpuParallelSettings.WorkerPoolThreads;   // capped (was ProcessorCount-1)
     private static readonly WorkerSlot[] _slots = new WorkerSlot[_numWorkers];
     private static readonly Thread[] _workers = new Thread[_numWorkers];
 
