@@ -1770,6 +1770,93 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     }
 
     /// <summary>
+    /// Central output-write for the compiled-plan GraphMode Execute delegates (replaces the inline
+    /// <c>src.AsSpan().CopyTo(dest.AsWritableSpan())</c> at ~183 sites). On a GPU engine DURING a compiled step
+    /// (eviction suspended → activation buffers are pinned/stable for the whole step), aliases <paramref name="dest"/>
+    /// to <paramref name="src"/>'s RESIDENT GPU buffer instead of host-copying, so the activation chain stays
+    /// GPU-resident: the next op resolves dest via the <c>_gpuBuffer</c> fast path (no host round-trip, no
+    /// <c>cuMemcpyHtoD</c> re-upload). That re-upload was BOTH the per-op GPU↔host ping-pong (the real low-util
+    /// cause) AND a hard CUDA-graph capture abort (CUDA 906 STREAM_CAPTURE_UNSUPPORTED). Falls back to the exact
+    /// prior host-copy when not on GPU / not in a suspended-eviction step / src isn't resident — so CPU + eager
+    /// behavior is byte-identical. A deferred materializer keeps host reads of dest correct.
+    /// </summary>
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, int> s_aliasDiag = new();
+    private static void AliasDiag(string reason)
+    {
+        if (System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") != "1") return;
+        int n = s_aliasDiag.AddOrUpdate(reason, 1, (_, c) => c + 1);
+        if (n <= 3) try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(),
+            "aidotnet_graphcapture_diag.txt"), "[ALIAS] " + reason + System.Environment.NewLine); } catch { }
+    }
+
+    internal static void CopyResultInto<T>(IEngine eng, Tensor<T> src, Tensor<T> dest)
+    {
+        if (eng is DirectGpuTensorEngine gpu && gpu.TryAliasResidentOutput(src, dest))
+        { AliasDiag("OK aliased"); return; }
+        AliasDiag(eng is DirectGpuTensorEngine ? "FELLBACK host-copy" : "not-gpu-engine");
+        src.AsSpan().CopyTo(dest.AsWritableSpan());
+    }
+
+    private bool TryAliasResidentOutput<T>(Tensor<T> src, Tensor<T> dest)
+    {
+        // Only safe while the step has eviction suspended: the source buffer is then guaranteed live for the
+        // whole step (and across the captured graph's stable-buffer replay), so dest can borrow it.
+        if (!EvictionSuspended) { AliasDiag("skip: eviction not suspended"); return false; }
+        if (ReferenceEquals(src, dest)) return true;            // in-place op already resident; nothing to copy
+        if (!TryGetBackend(out var backend)) { AliasDiag("skip: no backend"); return false; }
+
+        // Resolve src's resident GPU buffer WITHOUT triggering an upload/download.
+        IGpuBuffer? srcBuf = null;
+        if (src._gpuBuffer is not null && ReferenceEquals(src._gpuBackend, backend)
+            && src._gpuBufferVersion == src.Version && IsCachedGpuBufferLive(src, backend))
+        {
+            srcBuf = src._gpuBuffer;
+        }
+        else
+        {
+            var srcArr = src.DataVector.GetBackingArrayUnsafe();
+            lock (_activationCacheLock)
+            {
+                if (srcArr is not null && _activationCache.TryGetValue(srcArr, out var e1)
+                    && ReferenceEquals(e1.Backend, backend) && !e1.IsFp16)
+                    srcBuf = e1.Buffer;
+                else if (_activationCache.TryGetValue(src.DataVector, out var e2)
+                    && ReferenceEquals(e2.Backend, backend) && !e2.IsFp16)
+                    srcBuf = e2.Buffer;
+            }
+        }
+        if (srcBuf is null)
+        {
+            bool capturing = backend is Engines.DirectGpu.CUDA.CudaBackend cbk && cbk.IsStreamCapturing();
+            AliasDiag($"skip: src not resident shape=[{string.Join(",", src._shape)}] hasArr={src.DataVector.GetBackingArrayUnsafe() is not null} capturing={capturing}");
+            return false;
+        }
+
+        // dest needs a backing array as the deferred-materializer key (for any host read of dest).
+        var destArr = dest.DataVector.GetBackingArrayUnsafe();
+        if (destArr is null) { AliasDiag("skip: dest has no backing array"); return false; }
+
+        // Borrow src's buffer: consumers resolve dest via the _gpuBuffer fast path. We do NOT add a second
+        // activation-cache entry under destArr — aliasing one buffer under two keys would double-free on
+        // eviction. The _gpuBuffer pointer + the IsCachedGpuBufferLive liveness check is the single source of
+        // truth; if src's buffer is later evicted, the consumer cleanly falls back to a re-upload.
+        dest._gpuBuffer = srcBuf;
+        dest._gpuBackend = backend;
+        dest._gpuBufferVersion = dest.Version;
+
+        // Host reads of dest (the loss scalar, a debug checksum, a host op) download from the borrowed buffer.
+        var capturedBuf = srcBuf;
+        var capturedBackend = backend;
+        Helpers.DeferredArrayMaterializer.Register(destArr, arr =>
+        {
+            float[] floatData = capturedBackend.DownloadBuffer(capturedBuf);
+            var converted = DirectGpuEngine.FromFloatArray<T>(floatData);
+            System.Array.Copy(converted, (T[])arr, System.Math.Min(converted.Length, ((T[])arr).Length));
+        });
+        return true;
+    }
+
+    /// <summary>
     /// Variant of <see cref="FinishGpuOp{T}"/> that registers the deferred-download
     /// materializer directly against a caller-supplied destination array, so an
     /// <c>*Into</c> API doesn't need to allocate an intermediate result array and

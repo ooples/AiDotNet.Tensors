@@ -2023,7 +2023,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var capturedShape = newShape;
                 var origShape = tensor.Shape.ToArray();
                 return scope.RecordUnary(LazyNodeType.Reshape, "Reshape", tensor, newShape,
-                    (eng, output) => { captured.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { DirectGpuTensorEngine.CopyResultInto(eng, captured, output); },
                     BackwardFunctions<T>.ReshapeBackward, new object[] { origShape });
             }
         }
@@ -2064,7 +2064,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     (eng, output) =>
                     {
                         var eager = eng.ReorderToNchwc(captured, capturedLayout);
-                        eager.AsSpan().CopyTo(output.AsWritableSpan());
+                        DirectGpuTensorEngine.CopyResultInto(eng, eager, output);
                         output.Layout = capturedLayout;
                     });
                 // Mirror the layout on the placeholder at RECORD time. A later
@@ -2134,7 +2134,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     (eng, output) =>
                     {
                         var eager = eng.ReorderToNchw(captured);
-                        eager.AsSpan().CopyTo(output.AsWritableSpan());
+                        DirectGpuTensorEngine.CopyResultInto(eng, eager, output);
                         output.Layout = LinearAlgebra.TensorLayout.Nchw;
                     });
                 // Propagate Layout at record time (see matching comment in
@@ -2326,7 +2326,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         else
                         {
                             var r = eng.BatchNormInference(capX, capG, capB, capM, capV, capE);
-                            r.AsSpan().CopyTo(output.AsWritableSpan());
+                            DirectGpuTensorEngine.CopyResultInto(eng, r, output);
                             output.Layout = r.Layout;
                         }
                     },
@@ -2483,7 +2483,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         else
                         {
                             var eager = eng.BatchMatMul(capturedA, capturedB);
-                            eager.AsSpan().CopyTo(output.AsWritableSpan());
+                            DirectGpuTensorEngine.CopyResultInto(eng, eager, output);
                         }
                     },
                     BackwardFunctions<T>.BatchMatMulBackward);
@@ -3130,7 +3130,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var capturedB = b;
                 var broadcastShape = ComputeBroadcastShape(a._shape, b._shape);
                 return scope.RecordBinary(LazyNodeType.BroadcastAdd, "TensorBroadcastAdd", a, b, broadcastShape,
-                    (eng, output) => { var eager = eng.TensorBroadcastAdd(capturedA, capturedB); eager.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var eager = eng.TensorBroadcastAdd(capturedA, capturedB); DirectGpuTensorEngine.CopyResultInto(eng, eager, output); },
                     BackwardFunctions<T>.BroadcastAddBackward);
             }
         }
@@ -3229,7 +3229,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 // a._shape is not always the final broadcast shape.
                 var broadcastShape = ComputeBroadcastShape(a._shape, b._shape);
                 return scope.RecordBinary(LazyNodeType.BroadcastSubtract, "TensorBroadcastSubtract", a, b, broadcastShape,
-                    (eng, output) => { var r = eng.TensorBroadcastSubtract(capturedA, capturedB); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.TensorBroadcastSubtract(capturedA, capturedB); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.BroadcastSubtractBackward);
             }
         }
@@ -3339,7 +3339,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 // Same broadcast-shape fix as TensorBroadcastMultiply.
                 var broadcastShape = ComputeBroadcastShape(a._shape, b._shape);
                 return scope.RecordBinary(LazyNodeType.BroadcastDivide, "TensorBroadcastDivide", a, b, broadcastShape,
-                    (eng, output) => { var r = eng.TensorBroadcastDivide(capturedA, capturedB); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.TensorBroadcastDivide(capturedA, capturedB); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.BroadcastDivideBackward);
             }
         }
@@ -3397,7 +3397,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 // inside the closure overran it with "Destination is too short".
                 var broadcastShape = ComputeBroadcastShape(a._shape, b._shape);
                 return scope.RecordBinary(LazyNodeType.BroadcastMultiply, "TensorBroadcastMultiply", a, b, broadcastShape,
-                    (eng, output) => { var r = eng.TensorBroadcastMultiply(capturedA, capturedB); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.TensorBroadcastMultiply(capturedA, capturedB); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.BroadcastMultiplyBackward);
             }
         }
@@ -4769,7 +4769,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var captured = tensors.ToArray(); return scope.RecordVariadic(LazyNodeType.Custom, "TensorAddMany", captured, referenceShape, (eng, output) => { var r = eng.TensorAddMany(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.AddManyBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var captured = tensors.ToArray(); return scope.RecordVariadic(LazyNodeType.Custom, "TensorAddMany", captured, referenceShape, (eng, output) => { var r = eng.TensorAddMany(captured); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.AddManyBackward); } }
 
         var numOps = MathHelper.GetNumericOperations<T>();
         int length = tensors[0].Length;
@@ -5579,7 +5579,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var captured = tensors.ToArray(); return scope.RecordVariadic(LazyNodeType.Custom, "TensorMultiplyMany", captured, referenceShape, (eng, output) => { var r = eng.TensorMultiplyMany(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.MultiplyManyBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var captured = tensors.ToArray(); return scope.RecordVariadic(LazyNodeType.Custom, "TensorMultiplyMany", captured, referenceShape, (eng, output) => { var r = eng.TensorMultiplyMany(captured); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.MultiplyManyBackward); } }
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
@@ -5615,7 +5615,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     (eng, output) =>
                     {
                         if (eng is CpuEngine cpuEng) cpuEng.TensorMultiplyScalarInto(output, captured, capturedScalar);
-                        else { var r = eng.TensorMultiplyScalar(captured, capturedScalar); r.AsSpan().CopyTo(output.AsWritableSpan()); }
+                        else { var r = eng.TensorMultiplyScalar(captured, capturedScalar); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.MultiplyScalarBackward, scalar != null ? new object[] { scalar } : Array.Empty<object>());
             }
@@ -5966,7 +5966,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     (eng, output) =>
                     {
                         if (eng is CpuEngine cpuEng) cpuEng.TensorLogInto(output, captured);
-                        else { var r = eng.TensorLog(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); }
+                        else { var r = eng.TensorLog(captured); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.LogBackward);
             }
@@ -6030,7 +6030,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     (eng, output) =>
                     {
                         if (eng is CpuEngine cpuEng) cpuEng.TensorExpInto(output, captured);
-                        else { var r = eng.TensorExp(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); }
+                        else { var r = eng.TensorExp(captured); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.ExpBackward);
             }
@@ -6099,7 +6099,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     (eng, output) =>
                     {
                         if (eng is CpuEngine cpuEng) cpuEng.TensorSqrtInto(output, captured);
-                        else { var r = eng.TensorSqrt(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); }
+                        else { var r = eng.TensorSqrt(captured); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.SqrtBackward);
             }
@@ -6149,7 +6149,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     (eng, output) =>
                     {
                         if (eng is CpuEngine cpuEng) cpuEng.TensorAbsInto(output, captured);
-                        else { var r = eng.TensorAbs(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); }
+                        else { var r = eng.TensorAbs(captured); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.AbsBackward);
             }
@@ -6262,7 +6262,7 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var captured = tensor; var capturedExp = exponent;
                 return scope.RecordUnary(LazyNodeType.Custom, "TensorPower", tensor, tensor._shape,
-                    (eng, output) => { var r = eng.TensorPower(captured, capturedExp); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.TensorPower(captured, capturedExp); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.PowerBackward, exponent is not null ? new object[] { exponent } : Array.Empty<object>());
             }
         }
@@ -6338,7 +6338,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (bases == null) throw new ArgumentNullException(nameof(bases));
         if (exponents == null) throw new ArgumentNullException(nameof(exponents));
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_bases = bases; var c_exponents = exponents; return scope.RecordBinary(LazyNodeType.Custom, "TensorPowerTensor", bases, exponents, bases._shape, (eng, output) => { var r = eng.TensorPower(c_bases, c_exponents); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.PowerTensorBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_bases = bases; var c_exponents = exponents; return scope.RecordBinary(LazyNodeType.Custom, "TensorPowerTensor", bases, exponents, bases._shape, (eng, output) => { var r = eng.TensorPower(c_bases, c_exponents); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.PowerTensorBackward); } }
 
         var basesOrig = bases;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!bases.IsContiguous) bases = bases.Contiguous();
@@ -6505,7 +6505,7 @@ public partial class CpuEngine : ITensorLevelEngine
     public Tensor<T> TensorFrac<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_tensor = tensor; return scope.RecordUnary(LazyNodeType.Custom, "TensorFrac", tensor, tensor._shape, (eng, output) => { var r = eng.TensorFrac(c_tensor); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.FracBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_tensor = tensor; return scope.RecordUnary(LazyNodeType.Custom, "TensorFrac", tensor, tensor._shape, (eng, output) => { var r = eng.TensorFrac(c_tensor); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.FracBackward); } }
 
 
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
@@ -6541,7 +6541,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     (eng, output) =>
                     {
                         if (eng is CpuEngine cpuEng) cpuEng.TensorSinInto(output, captured);
-                        else { var r = eng.TensorSin(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); }
+                        else { var r = eng.TensorSin(captured); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.SinBackward);
             }
@@ -6596,7 +6596,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     (eng, output) =>
                     {
                         if (eng is CpuEngine cpuEng) cpuEng.TensorCosInto(output, captured);
-                        else { var r = eng.TensorCos(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); }
+                        else { var r = eng.TensorCos(captured); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.CosBackward);
             }
@@ -6643,7 +6643,7 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentException("Grid must be 4D tensor of shape [D, H, W, C]", nameof(grid));
         if (positions._shape.Length != 2 || positions._shape[1] != 3)
             throw new ArgumentException("Positions must be 2D tensor of shape [N, 3]", nameof(positions));
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_grid = grid; var c_positions = positions; return scope.RecordBinary(LazyNodeType.Custom, "TensorTrilinearInterpolate", grid, positions, grid._shape, (eng, output) => { var r = eng.TensorTrilinearInterpolate(c_grid, c_positions); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.TrilinearInterpolateBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_grid = grid; var c_positions = positions; return scope.RecordBinary(LazyNodeType.Custom, "TensorTrilinearInterpolate", grid, positions, grid._shape, (eng, output) => { var r = eng.TensorTrilinearInterpolate(c_grid, c_positions); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.TrilinearInterpolateBackward); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorTrilinearInterpolate", grid._shape); if (ac is not null) return ac.Execute(); }
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -6840,7 +6840,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var capturedExponent = exponent;
                 object boxedExp = exponent is not null ? (object)exponent : throw new InvalidOperationException("Exponent cannot be null");
                 return scope.RecordUnary(LazyNodeType.Custom, "TensorPow", tensor, tensor._shape,
-                    (eng, output) => { var r = eng.TensorPow(captured, capturedExponent); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.TensorPow(captured, capturedExponent); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.TensorPowBackward, new object[] { boxedExp });
             }
         }
@@ -6878,7 +6878,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var capturedA = a;
                 var capturedB = b;
                 return scope.RecordBinary(LazyNodeType.Custom, "TensorMax", a, b, a._shape,
-                    (eng, output) => { var r = eng.TensorMax(capturedA, capturedB); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.TensorMax(capturedA, capturedB); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.MaxBackward);
             }
         }
@@ -6970,7 +6970,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var capturedA = a;
                 var capturedB = b;
                 return scope.RecordBinary(LazyNodeType.Custom, "TensorMin", a, b, a._shape,
-                    (eng, output) => { var r = eng.TensorMin(capturedA, capturedB); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.TensorMin(capturedA, capturedB); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.MinBackward);
             }
         }
@@ -7063,7 +7063,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var capturedMax = max;
                 var numOpsLazy = MathHelper.GetNumericOperations<T>();
                 return scope.RecordUnary(LazyNodeType.Custom, "Clamp", captured, captured._shape,
-                    (eng, output) => { var r = eng.TensorClamp(captured, capturedMin, capturedMax); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.TensorClamp(captured, capturedMin, capturedMax); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.ClampBackward, new object[] { numOpsLazy.ToDouble(min), numOpsLazy.ToDouble(max) });
             }
         }
@@ -7244,7 +7244,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     (eng, output) =>
                     {
                         var eager = eng.ReduceSum(captured, capturedAxes, capturedKeepDims);
-                        eager.AsSpan().CopyTo(output.AsWritableSpan());
+                        DirectGpuTensorEngine.CopyResultInto(eng, eager, output);
                     },
                     BackwardFunctions<T>.ReduceSumBackward,
                     new object[] { axes ?? Array.Empty<int>(), keepDims });
@@ -7973,7 +7973,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     (eng, output) =>
                     {
                         if (eng is CpuEngine cpuEng) cpuEng.MaxPool2DInto(output, captured, ps, st, pd);
-                        else { var eager = eng.MaxPool2D(captured, ps, st, pd); eager.AsSpan().CopyTo(output.AsWritableSpan()); }
+                        else { var eager = eng.MaxPool2D(captured, ps, st, pd); DirectGpuTensorEngine.CopyResultInto(eng, eager, output); }
                     },
                     BackwardFunctions<T>.MaxPool2DBackward, new object[] { new[] { poolSize, poolSize }, new[] { stride, stride } });
             }
@@ -8412,7 +8412,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     (eng, output) =>
                     {
                         if (eng is CpuEngine cpuEng) cpuEng.AvgPool2DInto(output, captured, ps, s, p);
-                        else { var r = eng.AvgPool2D(captured, ps, s, p); r.AsSpan().CopyTo(output.AsWritableSpan()); }
+                        else { var r = eng.AvgPool2D(captured, ps, s, p); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.AvgPool2DBackward, new object[] { new[] { poolSize, poolSize }, new[] { st, st } });
             }
@@ -8586,7 +8586,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var capturedKernel = kernel;
                 int s = stride, p = padding, d = dilation;
                 return scope.RecordBinary(LazyNodeType.Custom, "Conv1D", input, kernel, outShape,
-                    (eng, output) => { var r = eng.Conv1D(capturedInput, capturedKernel, s, p, d); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.Conv1D(capturedInput, capturedKernel, s, p, d); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.Conv1DBackward, new object[] { stride, padding, dilation });
             }
         }
@@ -8696,7 +8696,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     (eng, output) =>
                     {
                         if (eng is CpuEngine cpuEng) cpuEng.Conv2DInto(output, capturedInput, capturedKernel, s, p, d);
-                        else { var eager = eng.Conv2D(capturedInput, capturedKernel, s, p, d); eager.AsSpan().CopyTo(output.AsWritableSpan()); }
+                        else { var eager = eng.Conv2D(capturedInput, capturedKernel, s, p, d); DirectGpuTensorEngine.CopyResultInto(eng, eager, output); }
                     },
                     BackwardFunctions<T>.Conv2DBackward, new object[] { new[] { stride, stride }, new[] { padding, padding }, new[] { dilation, dilation } });
             }
@@ -10389,7 +10389,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     (eng, output) =>
                     {
                         if (eng is CpuEngine cpuEng) cpuEng.MishInto(output, captured);
-                        else { var r = eng.Mish(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); }
+                        else { var r = eng.Mish(captured); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.MishBackward);
             }
@@ -10519,7 +10519,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     (eng, output) =>
                     {
                         if (eng is CpuEngine cpuEng) cpuEng.ELUInto(output, captured, capturedAlpha);
-                        else { var r = eng.ELU(captured, capturedAlpha); r.AsSpan().CopyTo(output.AsWritableSpan()); }
+                        else { var r = eng.ELU(captured, capturedAlpha); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.ELUBackward, new object[] { alpha });
             }
@@ -10711,7 +10711,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var outShape = input.Shape.ToArray();
                 outShape[actualDim] = input._shape[actualDim] / 2;
                 return scope.RecordUnary(LazyNodeType.Custom, "GLU", input, outShape,
-                    (eng, output) => { var r = eng.GLU(captured, capDim); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.GLU(captured, capDim); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.GLUBackward, new object[] { actualDim });
             }
         }
@@ -11286,7 +11286,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     (eng, output) =>
                     {
                         var eager = eng.TensorMatMulTransposed(capturedA, capturedB);
-                        eager.AsSpan().CopyTo(output.AsWritableSpan());
+                        DirectGpuTensorEngine.CopyResultInto(eng, eager, output);
                     },
                     BackwardFunctions<T>.MatMulTransposedBackward);
             }
@@ -11420,7 +11420,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         else
                         {
                             var eager = eng.TensorMatMul(capturedA, capturedB);
-                            eager.AsSpan().CopyTo(output.AsWritableSpan());
+                            DirectGpuTensorEngine.CopyResultInto(eng, eager, output);
                         }
                     },
                     BackwardFunctions<T>.MatMulBackward);
@@ -12451,7 +12451,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         // allocating an intermediate tensor.
                         if (eng is CpuEngine cpuEng)
                             cpuEng.Conv2DInto(output, capturedInput, capturedKernel, capturedStride, capturedPad, capturedDil);
-                        else { var eager = eng.Conv2D(capturedInput, capturedKernel, capturedStride, capturedPad, capturedDil); eager.AsSpan().CopyTo(output.AsWritableSpan()); }
+                        else { var eager = eng.Conv2D(capturedInput, capturedKernel, capturedStride, capturedPad, capturedDil); DirectGpuTensorEngine.CopyResultInto(eng, eager, output); }
                     },
                     BackwardFunctions<T>.Conv2DBackward, new object[] { stride, padding, dilation });
             }
@@ -14857,7 +14857,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         else
                         {
                             var eager = eng.MaxPool2DWithIndices(captured, new[] { ph, pw }, new[] { sh, sw }, out _);
-                            eager.AsSpan().CopyTo(output.AsWritableSpan());
+                            DirectGpuTensorEngine.CopyResultInto(eng, eager, output);
                         }
                     });
             }
@@ -15059,7 +15059,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         // which the int-scalar AvgPool2D doesn't support. Compute
                         // via the int[] path on replay to preserve rect semantics.
                         var r = eng.AvgPool2D(capturedInput, capturedPool, capturedStride);
-                        r.AsSpan().CopyTo(output.AsWritableSpan());
+                        DirectGpuTensorEngine.CopyResultInto(eng, r, output);
                     },
                     BackwardFunctions<T>.AvgPool2DBackward, new object[] { capturedPool, capturedStride });
             }
@@ -15268,7 +15268,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     (eng, output) =>
                     {
                         if (eng is CpuEngine cpuEng) cpuEng.DepthwiseConv2DInto(output, capturedInput, capturedKernel, capturedStride, capturedPadding);
-                        else { var r = eng.DepthwiseConv2D(capturedInput, capturedKernel, capturedStride, capturedPadding); r.AsSpan().CopyTo(output.AsWritableSpan()); }
+                        else { var r = eng.DepthwiseConv2D(capturedInput, capturedKernel, capturedStride, capturedPadding); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.DepthwiseConv2DBackward, new object[] { stride, padding });
             }
@@ -15538,7 +15538,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var capturedPadding = (int[])padding.Clone();
                 var capturedOutputPadding = (int[])outputPadding.Clone();
                 return scope.RecordBinary(LazyNodeType.Custom, "ConvTranspose2D", input, kernel, outShape,
-                    (eng, output) => { var r = eng.ConvTranspose2D(capturedInput, capturedKernel, capturedStride, capturedPadding, capturedOutputPadding); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.ConvTranspose2D(capturedInput, capturedKernel, capturedStride, capturedPadding, capturedOutputPadding); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.ConvTranspose2DBackward, new object[] { (int[])stride.Clone(), (int[])padding.Clone() });
             }
         }
@@ -16140,7 +16140,7 @@ public partial class CpuEngine : ITensorLevelEngine
                                 capturedInput, capturedKernel, capturedOffset,
                                 mask: null,
                                 capturedStride, capturedPadding, capturedDilation);
-                            replayed.AsSpan().CopyTo(output.AsWritableSpan());
+                            DirectGpuTensorEngine.CopyResultInto(eng, replayed, output);
                         },
                         BackwardFunctions<T>.DeformableConv2DBackward,
                         savedState);
@@ -17133,7 +17133,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var capturedPadding = padding;
                 var capturedDilation = dilation;
                 return scope.RecordBinary(LazyNodeType.Custom, "Conv3D", input, kernel, outShape,
-                    (eng, output) => { var r = eng.Conv3D(capturedInput, capturedKernel, capturedStride, capturedPadding, capturedDilation); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.Conv3D(capturedInput, capturedKernel, capturedStride, capturedPadding, capturedDilation); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.Conv3DBackward, new object[] { stride, padding, dilation });
             }
         }
@@ -17646,7 +17646,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var capturedStride = stride;
                 var capturedPadding = padding;
                 return scope.RecordUnary(LazyNodeType.Custom, "MaxPool3D", input, outShape,
-                    (eng, output) => { var r = eng.MaxPool3D(capturedInput, capturedPool, capturedStride, capturedPadding); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.MaxPool3D(capturedInput, capturedPool, capturedStride, capturedPadding); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     backwardFn: null, savedState: new object[] { capturedPool, capturedStride, capturedPadding });
             }
         }
@@ -17942,7 +17942,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var capturedStride = stride;
                 var capturedPadding = padding;
                 return scope.RecordUnary(LazyNodeType.Custom, "AvgPool3D", input, outShape,
-                    (eng, output) => { var r = eng.AvgPool3D(capturedInput, capturedPool, capturedStride, capturedPadding); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.AvgPool3D(capturedInput, capturedPool, capturedStride, capturedPadding); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     backwardFn: null, savedState: new object[] { capturedPool, capturedStride, capturedPadding });
             }
         }
@@ -17967,7 +17967,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var capturedStride = stride;
                 var capturedPadding = padding;
                 return scope.RecordUnary(LazyNodeType.Custom, "AvgPool3D", input, outShape,
-                    (eng, output) => { var r = eng.AvgPool3D(captured, capturedPool, capturedStride, capturedPadding); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.AvgPool3D(captured, capturedPool, capturedStride, capturedPadding); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.AvgPool3DBackward, new object[] { poolSize, stride, padding });
             }
         }
@@ -18167,7 +18167,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var outShape = new[] { input._shape[0], input._shape[1],
                     input._shape[2] * scaleD, input._shape[3] * scaleH, input._shape[4] * scaleW };
                 return scope.RecordUnary(LazyNodeType.Custom, "Upsample3D", input, outShape,
-                    (eng, output) => { var r = eng.Upsample3D(captured, capD, capH, capW); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.Upsample3D(captured, capD, capH, capW); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.Upsample3DBackward, new object[] { capD, capH, capW });
             }
         }
@@ -18319,7 +18319,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var ci = input; var ck = kernel;
                 var cs = (int[])stride.Clone(); var cp = (int[])padding.Clone(); var cop = (int[])outputPadding.Clone();
                 return scope.RecordBinary(LazyNodeType.Custom, "ConvTranspose3D", input, kernel, outShape,
-                    (eng, output) => { var r = eng.ConvTranspose3D(ci, ck, cs, cp, cop); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.ConvTranspose3D(ci, ck, cs, cp, cop); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.ConvTranspose3DBackward, new object[] { (int[])stride.Clone(), (int[])padding.Clone() });
             }
         }
@@ -18573,7 +18573,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var ci = input; var cw = weights; var cb = bias; var cs = (int[])stride.Clone();
                 var inputs = bias is not null ? new[] { input, weights, bias } : new[] { input, weights };
                 return scope.RecordVariadic(LazyNodeType.Custom, "LocallyConnectedConv2D", inputs, outShape,
-                    (eng, output) => { var r = eng.LocallyConnectedConv2D(ci, cw, cb, cs); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.LocallyConnectedConv2D(ci, cw, cb, cs); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.LocallyConnectedConv2DBackward, new object[] { (int[])stride.Clone() });
             }
         }
@@ -19547,7 +19547,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (order < 1)
             throw new ArgumentOutOfRangeException(nameof(order), order, "Order must be at least 1.");
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; var c_order = order; var c_axis = axis; return scope.RecordUnary(LazyNodeType.Custom, "TaylorSoftmax", input, input._shape, (eng, output) => { var r = eng.TaylorSoftmax(c_input, c_order, c_axis); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.SoftmaxBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; var c_order = order; var c_axis = axis; return scope.RecordUnary(LazyNodeType.Custom, "TaylorSoftmax", input, input._shape, (eng, output) => { var r = eng.TaylorSoftmax(c_input, c_order, c_axis); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.SoftmaxBackward); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("TaylorSoftmax", input._shape); if (ac is not null) return ac.Execute(); }
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -19719,7 +19719,7 @@ public partial class CpuEngine : ITensorLevelEngine
     public Tensor<T> Sparsemax<T>(Tensor<T> input, int axis = -1)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; var c_axis = axis; return scope.RecordUnary(LazyNodeType.Custom, "Sparsemax", input, input._shape, (eng, output) => { var r = eng.Sparsemax(c_input, c_axis); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.SparsemaxBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; var c_axis = axis; return scope.RecordUnary(LazyNodeType.Custom, "Sparsemax", input, input._shape, (eng, output) => { var r = eng.Sparsemax(c_input, c_axis); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.SparsemaxBackward); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("Sparsemax", input._shape); if (ac is not null) return ac.Execute(); }
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -20052,7 +20052,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         var r = eng.BatchNorm(ci, cg, cb, ce, out var freshMean, out var freshVar);
                         try
                         {
-                            r.AsSpan().CopyTo(output.AsWritableSpan());
+                            DirectGpuTensorEngine.CopyResultInto(eng, r, output);
                             freshMean.AsSpan().CopyTo(capturedMean.AsWritableSpan());
                             freshVar.AsSpan().CopyTo(capturedVar.AsWritableSpan());
                         }
@@ -21497,7 +21497,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     (eng, output) =>
                     {
                         var r = eng.LayerNorm(ci, cg, cb, ce, out var freshMean, out var freshVar);
-                        r.AsSpan().CopyTo(output.AsWritableSpan());
+                        DirectGpuTensorEngine.CopyResultInto(eng, r, output);
                         // Hand the correctly-shaped realize-time stats to backward
                         // by reference — avoids the trace-vs-replay size mismatch.
                         stateRef.Mean = freshMean;
@@ -22832,7 +22832,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     (eng, output) =>
                     {
                         var r = eng.GroupNorm(ci, cn, cg, cb, ce, out var freshMean, out var freshVar);
-                        r.AsSpan().CopyTo(output.AsWritableSpan());
+                        DirectGpuTensorEngine.CopyResultInto(eng, r, output);
                         freshMean.AsSpan().CopyTo(capturedGNMean.AsWritableSpan());
                         freshVar.AsSpan().CopyTo(capturedGNVar.AsWritableSpan());
                     },
@@ -23292,7 +23292,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     (eng, output) =>
                     {
                         var r = eng.RMSNorm(ci, cg, ce, out var freshRms);
-                        r.AsSpan().CopyTo(output.AsWritableSpan());
+                        DirectGpuTensorEngine.CopyResultInto(eng, r, output);
                         freshRms.AsSpan().CopyTo(capturedRms.AsWritableSpan());
                     },
                     BackwardFunctions<T>.RMSNormBackward, new object[] { rms, epsilon });
@@ -24879,7 +24879,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         var freshOut = eng.FlashAttention(
                             capturedQuery, capturedKey, capturedValue,
                             capturedScale, capturedIsCausal, out var freshStats, capturedBias);
-                        freshOut.AsSpan().CopyTo(output.AsWritableSpan());
+                        DirectGpuTensorEngine.CopyResultInto(eng, freshOut, output);
                         freshStats.AsSpan().CopyTo(capturedStats.AsWritableSpan());
                     },
                     BackwardFunctions<T>.FlashAttentionBackward,
@@ -26432,7 +26432,7 @@ public partial class CpuEngine : ITensorLevelEngine
                                 capturedNode, capturedSrcIdx, capturedTgtIdx,
                                 capturedSrc, capturedTgt, capturedAlpha,
                                 out _);
-                            replayed.AsSpan().CopyTo(output.AsWritableSpan());
+                            DirectGpuTensorEngine.CopyResultInto(eng, replayed, output);
                         },
                         BackwardFunctions<T>.GraphAttentionBackward,
                         savedState);
@@ -26757,7 +26757,7 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentNullException(nameof(source));
         if (indices == null)
             throw new ArgumentNullException(nameof(indices));
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_source = source; var c_indices = indices; var c_dim = dim; var c_outputSize = outputSize; return scope.RecordUnary(LazyNodeType.Custom, "ScatterAdd", source, source._shape, (eng, output) => { var r = eng.ScatterAdd(c_source, c_indices, c_dim, c_outputSize); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.ScatterAddBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_source = source; var c_indices = indices; var c_dim = dim; var c_outputSize = outputSize; return scope.RecordUnary(LazyNodeType.Custom, "ScatterAdd", source, source._shape, (eng, output) => { var r = eng.ScatterAdd(c_source, c_indices, c_dim, c_outputSize); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.ScatterAddBackward); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("ScatterAdd", source._shape); if (ac is not null) return ac.Execute(); }
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -26900,7 +26900,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     (eng, output) =>
                     {
                         var r = eng.ScatterMean(cs, ci, out var freshCounts, cd, co);
-                        r.AsSpan().CopyTo(output.AsWritableSpan());
+                        DirectGpuTensorEngine.CopyResultInto(eng, r, output);
                         if (capturedCounts is not null && freshCounts is not null
                             && capturedCounts.Length == freshCounts.Length)
                             freshCounts.AsSpan().CopyTo(capturedCounts.AsWritableSpan());
@@ -27255,7 +27255,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (indices == null)
             throw new ArgumentNullException(nameof(indices));
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var cs = source; var ci = indices; var cd = dim; var co = outputSize; return scope.RecordUnary(LazyNodeType.Custom, "ScatterSoftmax", source, source._shape, (eng, output) => { var r = eng.ScatterSoftmax(cs, ci, cd, co); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.ScatterSoftmaxBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var cs = source; var ci = indices; var cd = dim; var co = outputSize; return scope.RecordUnary(LazyNodeType.Custom, "ScatterSoftmax", source, source._shape, (eng, output) => { var r = eng.ScatterSoftmax(cs, ci, cd, co); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.ScatterSoftmaxBackward); } }
 
         { var ac = AutoTracer.TryGetCompiledPlan<T>("ScatterSoftmax", source._shape); if (ac is not null) return ac.Execute(); }
 
@@ -27659,7 +27659,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
                 var outShape = shapeList.Count > 0 ? shapeList.ToArray() : new[] { 1 };
                 return scope.RecordUnary(LazyNodeType.ReduceMean, "ReduceMean", input, outShape,
-                    (eng, output) => { var r = eng.ReduceMean(captured, capturedAxes, capturedKeepDims); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.ReduceMean(captured, capturedAxes, capturedKeepDims); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.ReduceMeanBackward, new object[] { axes, keepDims });
             }
         }
@@ -28161,7 +28161,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     {
                         // Replay: re-run the math into the pre-allocated output.
                         var replayed = eng.ReduceVariance(capturedInput, capturedAxes, capturedKeepDims);
-                        replayed.AsSpan().CopyTo(output.AsWritableSpan());
+                        DirectGpuTensorEngine.CopyResultInto(eng, replayed, output);
                     },
                     BackwardFunctions<T>.ReduceVarianceBackward,
                     new object[] { (int[])capturedAxes.Clone(), meanForBackward });
@@ -28287,7 +28287,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (input == null)
             throw new ArgumentNullException(nameof(input));
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; var c_axes = axes; var c_keepDims = keepDims; var c_epsilon = epsilon; return scope.RecordUnary(LazyNodeType.Custom, "ReduceLogVariance", input, input._shape, (eng, output) => { var r = eng.ReduceLogVariance(c_input, c_axes, c_keepDims, c_epsilon); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.ReduceLogVarianceBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; var c_axes = axes; var c_keepDims = keepDims; var c_epsilon = epsilon; return scope.RecordUnary(LazyNodeType.Custom, "ReduceLogVariance", input, input._shape, (eng, output) => { var r = eng.ReduceLogVariance(c_input, c_axes, c_keepDims, c_epsilon); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.ReduceLogVarianceBackward); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("ReduceLogVariance", input._shape); if (ac is not null) return ac.Execute(); }
 
         var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
@@ -28537,7 +28537,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     (eng, output) =>
                     {
                         if (eng is CpuEngine cpuEng) cpuEng.UpsampleInto(output, captured, capScaleH, capScaleW);
-                        else { var r = eng.Upsample(captured, capScaleH, capScaleW); r.AsSpan().CopyTo(output.AsWritableSpan()); }
+                        else { var r = eng.Upsample(captured, capScaleH, capScaleW); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.UpsampleBackward, new object[] { capScaleH, capScaleW });
             }
@@ -28810,7 +28810,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     (eng, output) =>
                     {
                         if (eng is CpuEngine cpuEng) cpuEng.PixelShuffleInto(output, c_input, c_upscaleFactor);
-                        else { var r = eng.PixelShuffle(c_input, c_upscaleFactor); r.AsSpan().CopyTo(output.AsWritableSpan()); }
+                        else { var r = eng.PixelShuffle(c_input, c_upscaleFactor); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.PixelShuffleBackward, new object[] { c_upscaleFactor });
             }
@@ -28936,7 +28936,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var ci = input; var cg = grid;
                 var outShape = new[] { input._shape[0], grid._shape[1], grid._shape[2], input._shape[3] };
                 return scope.RecordBinary(LazyNodeType.Custom, "GridSample", input, grid, outShape,
-                    (eng, output) => { var r = eng.GridSample(ci, cg); r.AsSpan().CopyTo(output.AsWritableSpan()); });
+                    (eng, output) => { var r = eng.GridSample(ci, cg); DirectGpuTensorEngine.CopyResultInto(eng, r, output); });
             }
         }
 
@@ -29033,7 +29033,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 int oW = (input._shape[3] + 2 * lpW - lkW) / lsW + 1;
                 var outShape = new[] { input._shape[0], input._shape[1] * lkH * lkW, oH * oW };
                 return scope.RecordUnary(LazyNodeType.Custom, "Unfold", input, outShape,
-                    (eng, output) => { var r = eng.Unfold(ci, ck, cs, cp); r.AsSpan().CopyTo(output.AsWritableSpan()); });
+                    (eng, output) => { var r = eng.Unfold(ci, ck, cs, cp); DirectGpuTensorEngine.CopyResultInto(eng, r, output); });
             }
         }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("Unfold", input._shape); if (ac is not null) return ac.Execute(); }
@@ -29127,7 +29127,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 int lCh = input._shape[1] / (lkH * lkW);
                 var outShape = new[] { lBatch, lCh, outputSize[0], outputSize[1] };
                 return scope.RecordUnary(LazyNodeType.Custom, "Fold", input, outShape,
-                    (eng, output) => { var r = eng.Fold(ci, co, ck, cs, cp); r.AsSpan().CopyTo(output.AsWritableSpan()); });
+                    (eng, output) => { var r = eng.Fold(ci, co, ck, cs, cp); DirectGpuTensorEngine.CopyResultInto(eng, r, output); });
             }
         }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("Fold", input._shape); if (ac is not null) return ac.Execute(); }
@@ -29255,7 +29255,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (real == null || imag == null)
             throw new ArgumentNullException("ComplexMagnitudeSquared inputs cannot be null");
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_real = real; var c_imag = imag; return scope.RecordBinary(LazyNodeType.Custom, "ComplexMagnitudeSquared", real, imag, real._shape, (eng, output) => { var r = eng.ComplexMagnitudeSquared(c_real, c_imag); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.ComplexMagnitudeSquaredBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_real = real; var c_imag = imag; return scope.RecordBinary(LazyNodeType.Custom, "ComplexMagnitudeSquared", real, imag, real._shape, (eng, output) => { var r = eng.ComplexMagnitudeSquared(c_real, c_imag); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.ComplexMagnitudeSquaredBackward); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("ComplexMagnitudeSquared", real._shape); if (ac is not null) return ac.Execute(); }
 
         if (!real._shape.SequenceEqual(imag._shape))
@@ -29388,7 +29388,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     (eng, output) =>
                     {
                         if (eng is CpuEngine cpuEng) cpuEng.CropInto(output, c_input, c_top, c_left, c_height, c_width);
-                        else { var r = eng.Crop(c_input, c_top, c_left, c_height, c_width); r.AsSpan().CopyTo(output.AsWritableSpan()); }
+                        else { var r = eng.Crop(c_input, c_top, c_left, c_height, c_width); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.CropBackward, new object[] { c_top, c_left });
             }
@@ -29580,7 +29580,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     (eng, output) =>
                     {
                         if (eng is CpuEngine cpuEng) cpuEng.PadInto(output, captured, capTop, capBottom, capLeft, capRight, capValue);
-                        else { var r = eng.Pad(captured, capTop, capBottom, capLeft, capRight, capValue); r.AsSpan().CopyTo(output.AsWritableSpan()); }
+                        else { var r = eng.Pad(captured, capTop, capBottom, capLeft, capRight, capValue); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.PadBackward, new object[] { capTop, capLeft });
             }
@@ -29661,7 +29661,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     (eng, output) =>
                     {
                         if (eng is CpuEngine cpuEng) cpuEng.ConcatInto(output, captured, capturedAxis);
-                        else { var r = eng.Concat(captured, capturedAxis); r.AsSpan().CopyTo(output.AsWritableSpan()); }
+                        else { var r = eng.Concat(captured, capturedAxis); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.ConcatenateBackward, new object[] { capturedAxis });
             }
@@ -30248,7 +30248,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (centers == null) throw new ArgumentNullException(nameof(centers));
         if (epsilons == null) throw new ArgumentNullException(nameof(epsilons));
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; var c_centers = centers; var c_epsilons = epsilons; return scope.RecordVariadic(LazyNodeType.Custom, "RBFKernel", new[] { input, centers, epsilons }, input._shape, (eng, output) => { var r = eng.RBFKernel(c_input, c_centers, c_epsilons); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.RBFKernelBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; var c_centers = centers; var c_epsilons = epsilons; return scope.RecordVariadic(LazyNodeType.Custom, "RBFKernel", new[] { input, centers, epsilons }, input._shape, (eng, output) => { var r = eng.RBFKernel(c_input, c_centers, c_epsilons); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.RBFKernelBackward); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("RBFKernel", input._shape); if (ac is not null) return ac.Execute(); }
 
         if (input.Rank != 2)
@@ -30414,7 +30414,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (repeats < 1) throw new ArgumentOutOfRangeException(nameof(repeats), "Repeats must be at least 1");
         if (axis < 0 || axis >= tensor._shape.Length)
             throw new ArgumentOutOfRangeException(nameof(axis), $"Axis {axis} out of range for tensor with {tensor._shape.Length} dimensions");
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_tensor = tensor; var c_repeats = repeats; var c_axis = axis; return scope.RecordUnary(LazyNodeType.Custom, "TensorRepeatElements", tensor, tensor._shape, (eng, output) => { var r = eng.TensorRepeatElements(c_tensor, c_repeats, c_axis); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.RepeatElementsBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_tensor = tensor; var c_repeats = repeats; var c_axis = axis; return scope.RecordUnary(LazyNodeType.Custom, "TensorRepeatElements", tensor, tensor._shape, (eng, output) => { var r = eng.TensorRepeatElements(c_tensor, c_repeats, c_axis); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.RepeatElementsBackward); } }
 
 
         // Calculate output shape
@@ -30479,7 +30479,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 for (int i = 0; i < tensor._shape.Length; i++)
                     outShape[i] = tensor._shape[i] * multiples[i];
                 return scope.RecordUnary(LazyNodeType.Custom, "Tile", tensor, outShape,
-                    (eng, output) => { var r = eng.TensorTile(captured, capMultiples); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.TensorTile(captured, capMultiples); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.TileBackward);
             }
         }
@@ -30557,7 +30557,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var capStart = (int[])start.Clone();
                 var capLength = (int[])length.Clone();
                 return scope.RecordUnary(LazyNodeType.Custom, "TensorSlice", tensor, capLength,
-                    (eng, output) => { var r = eng.TensorSlice(captured, capStart, capLength); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.TensorSlice(captured, capStart, capLength); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.SliceBackward, new object[] { capStart });
             }
         }
@@ -30664,7 +30664,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var cc = condition; var cx = x; var cy = y;
                 return scope.RecordVariadic(LazyNodeType.Custom, "TensorWhere",
                     new[] { condition, x, y }, x._shape,
-                    (eng, output) => { var r = eng.TensorWhere(cc, cx, cy); r.AsSpan().CopyTo(output.AsWritableSpan()); });
+                    (eng, output) => { var r = eng.TensorWhere(cc, cx, cy); DirectGpuTensorEngine.CopyResultInto(eng, r, output); });
             }
         }
         if (y == null) throw new ArgumentNullException(nameof(y));
@@ -30737,7 +30737,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_a = a; var c_b = b; return scope.RecordBinary(LazyNodeType.Custom, "TensorOuterProduct", a, b, a._shape, (eng, output) => { var r = eng.TensorOuterProduct(c_a, c_b); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.OuterProductBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_a = a; var c_b = b; return scope.RecordBinary(LazyNodeType.Custom, "TensorOuterProduct", a, b, a._shape, (eng, output) => { var r = eng.TensorOuterProduct(c_a, c_b); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.OuterProductBackward); } }
 
 
         // Flatten both tensors to 1D
@@ -30774,7 +30774,7 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentException("Both tensors must be 2D [batch, features]");
         if (a._shape[0] != b._shape[0])
             throw new ArgumentException("Batch sizes must match");
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_a = a; var c_b = b; return scope.RecordBinary(LazyNodeType.Custom, "TensorBatchOuterProduct", a, b, a._shape, (eng, output) => { var r = eng.TensorBatchOuterProduct(c_a, c_b); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.OuterProductBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_a = a; var c_b = b; return scope.RecordBinary(LazyNodeType.Custom, "TensorBatchOuterProduct", a, b, a._shape, (eng, output) => { var r = eng.TensorBatchOuterProduct(c_a, c_b); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.OuterProductBackward); } }
 
 
         int batch = a._shape[0];
@@ -31026,7 +31026,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     // materializes it into row-major memory so AsSpan doesn't
                     // throw "non-contiguous" when copying into the pre-allocated
                     // output. O(n) materialization cost, paid once per Execute.
-                    (eng, output) => { var r = eng.TensorPermute(captured, capturedAxes).Contiguous(); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.TensorPermute(captured, capturedAxes).Contiguous(); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.PermuteBackward, new object[] { capturedAxes });
             }
         }
@@ -31064,7 +31064,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 outShape[capturedAxis] = 1;
                 for (int i = capturedAxis; i < rank; i++) outShape[i + 1] = tensor._shape[i];
                 return scope.RecordUnary(LazyNodeType.Custom, "TensorExpandDims", tensor, outShape,
-                    (eng, output) => { var r = eng.TensorExpandDims(captured, capturedAxis); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.TensorExpandDims(captured, capturedAxis); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.ExpandDimsBackward, new object[] { capturedAxis });
             }
         }
@@ -31102,7 +31102,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 if (capturedAxis == -1) { shapeList = shapeList.Where(s => s != 1).ToList(); if (shapeList.Count == 0) shapeList.Add(1); }
                 else { int normAxis = capturedAxis < 0 ? shapeList.Count + capturedAxis : capturedAxis; shapeList.RemoveAt(normAxis); if (shapeList.Count == 0) shapeList.Add(1); }
                 return scope.RecordUnary(LazyNodeType.Custom, "TensorSqueeze", tensor, shapeList.ToArray(),
-                    (eng, output) => { var r = eng.TensorSqueeze(captured, capturedAxis); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.TensorSqueeze(captured, capturedAxis); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.SqueezeBackward, new object[] { capturedAxis });
             }
         }
@@ -31141,7 +31141,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (destination == null) throw new ArgumentNullException(nameof(destination));
         if (indices == null) throw new ArgumentNullException(nameof(indices));
         if (updates == null) throw new ArgumentNullException(nameof(updates));
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_destination = destination; var c_indices = indices; var c_updates = updates; var c_axis = axis; return scope.RecordBinary(LazyNodeType.Custom, "TensorScatterAdd", destination, updates, destination._shape, (eng, output) => { var r = eng.TensorScatterAdd(c_destination, c_indices, c_updates, c_axis); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.ScatterAddBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_destination = destination; var c_indices = indices; var c_updates = updates; var c_axis = axis; return scope.RecordBinary(LazyNodeType.Custom, "TensorScatterAdd", destination, updates, destination._shape, (eng, output) => { var r = eng.TensorScatterAdd(c_destination, c_indices, c_updates, c_axis); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.ScatterAddBackward); } }
 
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
 
@@ -31240,7 +31240,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 // Compute output shape: replace source._shape[axis] with indices shape
                 var outShape = ComputeGatherOutputShape(source._shape, indices._shape, capAxis);
                 return scope.RecordUnary(LazyNodeType.Custom, "TensorGather", source, outShape,
-                    (eng, output) => { var r = eng.TensorGather(captured, capIndices, capAxis); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.TensorGather(captured, capIndices, capAxis); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.GatherBackward, new object[] { capIndices, capAxis });
             }
         }
@@ -31333,7 +31333,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var captured = tensor;
                 var capturedAxis = axis;
                 return scope.RecordUnary(LazyNodeType.Custom, "TensorCumSum", tensor, tensor._shape,
-                    (eng, output) => { var r = eng.TensorCumSum(captured, capturedAxis); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.TensorCumSum(captured, capturedAxis); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.CumSumBackward, new object[] { capturedAxis });
             }
         }
@@ -31473,7 +31473,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
                 if (outShape.Count == 0) outShape.Add(1);
                 return scope.RecordUnary(LazyNodeType.Custom, "LogSumExp", tensor, outShape.ToArray(),
-                    (eng, output) => { var r = eng.TensorLogSumExp(captured, capAxis, capKeepDims); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.TensorLogSumExp(captured, capAxis, capKeepDims); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.LogSumExpBackward, new object[] { capAxis });
             }
         }
@@ -31934,7 +31934,7 @@ public partial class CpuEngine : ITensorLevelEngine
     public Tensor<T> ScalarMinusTensor<T>(T scalar, Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_scalar = scalar; var c_tensor = tensor; return scope.RecordUnary(LazyNodeType.Custom, "ScalarMinusTensor", tensor, tensor._shape, (eng, output) => { var r = eng.ScalarMinusTensor(c_scalar, c_tensor); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.NegateBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_scalar = scalar; var c_tensor = tensor; return scope.RecordUnary(LazyNodeType.Custom, "ScalarMinusTensor", tensor, tensor._shape, (eng, output) => { var r = eng.ScalarMinusTensor(c_scalar, c_tensor); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.NegateBackward); } }
 
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
@@ -31996,7 +31996,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (tensor._shape.Length != 2)
             throw new ArgumentException("Tensor must be 2D");
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_tensor = tensor; return scope.RecordUnary(LazyNodeType.Custom, "TensorDiagonal", tensor, tensor._shape, (eng, output) => { var r = eng.TensorDiagonal(c_tensor); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.DiagonalBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_tensor = tensor; return scope.RecordUnary(LazyNodeType.Custom, "TensorDiagonal", tensor, tensor._shape, (eng, output) => { var r = eng.TensorDiagonal(c_tensor); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.DiagonalBackward); } }
 
 
         int n = Math.Min(tensor._shape[0], tensor._shape[1]);
@@ -32121,7 +32121,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var captured = tensor;
                 var capturedScalar = scalar;
                 return scope.RecordUnary(LazyNodeType.AddScalar, "TensorAddScalar", tensor, tensor._shape,
-                    (eng, output) => { var r = eng.TensorAddScalar(captured, capturedScalar); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.TensorAddScalar(captured, capturedScalar); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.AddScalarBackward);
             }
         }
@@ -32151,7 +32151,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var captured = tensor;
                 var capturedScalar = scalar;
                 return scope.RecordUnary(LazyNodeType.Custom, "TensorSubtractScalar", tensor, tensor._shape,
-                    (eng, output) => { var r = eng.TensorSubtractScalar(captured, capturedScalar); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.TensorSubtractScalar(captured, capturedScalar); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.SubtractScalarBackward);
             }
         }
@@ -32181,7 +32181,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var captured = tensor;
                 var capturedScalar = scalar;
                 return scope.RecordUnary(LazyNodeType.DivideScalar, "TensorDivideScalar", tensor, tensor._shape,
-                    (eng, output) => { var r = eng.TensorDivideScalar(captured, capturedScalar); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.TensorDivideScalar(captured, capturedScalar); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.DivideScalarBackward, scalar != null ? new object[] { scalar } : Array.Empty<object>());
             }
         }
@@ -32359,7 +32359,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
                 if (outShape.Count == 0) outShape.Add(1);
                 return scope.RecordUnary(LazyNodeType.Custom, "Norm", tensor, outShape.ToArray(),
-                    (eng, output) => { var r = eng.TensorNorm(captured, capAxis, capKeepDims); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.TensorNorm(captured, capAxis, capKeepDims); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.NormBackward, new object[] { capAxis });
             }
         }
@@ -32558,7 +32558,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
                 outShape[normAxis] = totalAxis;
                 return scope.RecordVariadic(LazyNodeType.Custom, "Concatenate", captured, outShape,
-                    (eng, output) => { var r = eng.TensorConcatenate(captured, capturedAxis); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.TensorConcatenate(captured, capturedAxis); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.ConcatenateBackward, new object[] { capturedAxis });
             }
         }
@@ -32634,7 +32634,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     var outShape = (int[])tensor._shape.Clone();
                     outShape[ca] = splitSizeLazy;
                     lazyResults[s] = scope.RecordUnary(LazyNodeType.Custom, "TensorSplit", tensor, outShape,
-                        (eng, output) => { var r = eng.TensorSplit(ct, cn, ca)[splitIdx]; r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                        (eng, output) => { var r = eng.TensorSplit(ct, cn, ca)[splitIdx]; DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                         BackwardFunctions<T>.SplitBackward, new object[] { numSplits, axis, s });
                 }
                 return lazyResults;
@@ -32845,7 +32845,7 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var cp = predictions; var ct = targets; var ce = epsilon;
                 return scope.RecordBinary(LazyNodeType.Custom, "TensorBinaryCrossEntropy", predictions, targets, predictions._shape,
-                    (eng, output) => { var r = ((CpuEngine)eng).TensorBinaryCrossEntropy(cp, ct, ce); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = ((CpuEngine)eng).TensorBinaryCrossEntropy(cp, ct, ce); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.BinaryCrossEntropyBackward, new object[] { (object)epsilon! });
             }
         }
@@ -33069,7 +33069,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var captured = tensor;
                 int capAxis = axis, capIndex = index;
                 return scope.RecordUnary(LazyNodeType.Custom, "TensorSliceAxis", tensor, outShape,
-                    (eng, output) => { var r = eng.TensorSliceAxis(captured, capAxis, capIndex); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.TensorSliceAxis(captured, capAxis, capIndex); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.SliceAxisBackward, new object[] { axis, index });
             }
         }
@@ -33175,7 +33175,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 $"TensorBatchMatMul requires a to be 3D and b to be 2D or 3D. Got ranks {a.Rank} and {b.Rank}.");
         }
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ca = a; var cb = b; var outShape = new[] { a._shape[0], a._shape[1], b._shape[1] }; return scope.RecordBinary(LazyNodeType.Custom, "TensorBatchMatMul", a, b, outShape, (eng, output) => { var r = eng.TensorBatchMatMul(ca, cb); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.BatchMatMulBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ca = a; var cb = b; var outShape = new[] { a._shape[0], a._shape[1], b._shape[1] }; return scope.RecordBinary(LazyNodeType.Custom, "TensorBatchMatMul", a, b, outShape, (eng, output) => { var r = eng.TensorBatchMatMul(ca, cb); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.BatchMatMulBackward); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorBatchMatMul", a._shape); if (ac is not null) return ac.Execute(); }
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -33310,7 +33310,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var captured = tensor;
                 var capturedAxis = axis;
                 return scope.RecordUnary(LazyNodeType.Custom, "LogSoftmax", tensor, tensor._shape,
-                    (eng, output) => { var r = eng.TensorLogSoftmax(captured, capturedAxis); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.TensorLogSoftmax(captured, capturedAxis); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.LogSoftmaxBackward);
             }
         }
@@ -33555,7 +33555,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var outShape = (int[])tensor._shape.Clone();
                 outShape[axis] = indices.Length;
                 return scope.RecordUnary(LazyNodeType.Custom, "TensorIndexSelect", tensor, outShape,
-                    (eng, output) => { var r = eng.TensorIndexSelect(captured, capIndices, capAxis); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.TensorIndexSelect(captured, capIndices, capAxis); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.IndexSelectBackward, new object[] { capIndices, capAxis });
             }
         }
@@ -33644,7 +33644,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 outShape[axis] = numTensors;
                 for (int i = axis; i < firstShape.Length; i++) outShape[i + 1] = firstShape[i];
                 return scope.RecordVariadic(LazyNodeType.Custom, "TensorStack", captured, outShape,
-                    (eng, output) => { var r = eng.TensorStack(captured, capAxis); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.TensorStack(captured, capAxis); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.StackBackward, new object[] { capAxis });
             }
         }
@@ -33759,7 +33759,7 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var ct = tensor; var cm = mask; var cv = value;
                 return scope.RecordUnary(LazyNodeType.Custom, "TensorMaskedFill", tensor, tensor._shape,
-                    (eng, output) => { var r = eng.TensorMaskedFill(ct, cm, cv); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.TensorMaskedFill(ct, cm, cv); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.MaskedFillBackward, new object[] { mask });
             }
         }
@@ -33795,7 +33795,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!tensor._shape.SequenceEqual(mask._shape))
             throw new ArgumentException($"Tensor shape [{string.Join(", ", tensor._shape)}] must match mask shape [{string.Join(", ", mask._shape)}].");
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ct = tensor; var cm = mask; var cv = value; return scope.RecordUnary(LazyNodeType.Custom, "MaskedFill", tensor, tensor._shape, (eng, output) => { var r = eng.TensorMaskedFill(ct, cm, cv); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.MaskedFillBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ct = tensor; var cm = mask; var cv = value; return scope.RecordUnary(LazyNodeType.Custom, "MaskedFill", tensor, tensor._shape, (eng, output) => { var r = eng.TensorMaskedFill(ct, cm, cv); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.MaskedFillBackward); } }
 
         { var ac = AutoTracer.TryGetCompiledPlan<T>("MaskedFill", tensor._shape); if (ac is not null) return ac.Execute(); }
 
@@ -34448,7 +34448,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 for (int i = 0; i < input._shape.Length; i++)
                     outShape[i] = i == axis ? indices.Length : input._shape[i];
                 return scope.RecordUnary(LazyNodeType.Custom, "Gather", input, outShape,
-                    (eng, output) => { var r = eng.Gather(captured, capIndices, capAxis); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.Gather(captured, capIndices, capAxis); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.GatherBackward, new object[] { capIndices, capAxis });
             }
         }
@@ -34495,7 +34495,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> Scatter<T>(Tensor<T> input, Tensor<int> indices, Tensor<T> values, int axis)
     {
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; var cind = indices; var cv = values; var ca = axis; return scope.RecordBinary(LazyNodeType.Custom, "Scatter", input, values, input._shape, (eng, output) => { var r = eng.Scatter(ci, cind, cv, ca); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.ScatterBackward, new object[] { indices, axis }); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; var cind = indices; var cv = values; var ca = axis; return scope.RecordBinary(LazyNodeType.Custom, "Scatter", input, values, input._shape, (eng, output) => { var r = eng.Scatter(ci, cind, cv, ca); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.ScatterBackward, new object[] { indices, axis }); } }
 
         { var ac = AutoTracer.TryGetCompiledPlan<T>("Scatter", input._shape); if (ac is not null) return ac.Execute(); }
 
@@ -34606,7 +34606,7 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var captured = tensor;
                 return scope.RecordUnary(LazyNodeType.Custom, "TensorCosh", tensor, tensor._shape,
-                    (eng, output) => { var r = eng.TensorCosh(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.TensorCosh(captured); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.CoshBackward);
             }
         }
@@ -34660,7 +34660,7 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var captured = tensor;
                 return scope.RecordUnary(LazyNodeType.Custom, "TensorSinh", tensor, tensor._shape,
-                    (eng, output) => { var r = eng.TensorSinh(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.TensorSinh(captured); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.SinhBackward);
             }
         }
@@ -34707,7 +34707,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (a._shape.Length != 1 || b._shape.Length != 1)
             throw new ArgumentException("Both inputs must be 1D tensors");
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_a = a; var c_b = b; return scope.RecordBinary(LazyNodeType.Custom, "TensorOuter", a, b, a._shape, (eng, output) => { var r = eng.TensorOuter(c_a, c_b); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.OuterProductBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_a = a; var c_b = b; return scope.RecordBinary(LazyNodeType.Custom, "TensorOuter", a, b, a._shape, (eng, output) => { var r = eng.TensorOuter(c_a, c_b); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.OuterProductBackward); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorOuter", a._shape); if (ac is not null) return ac.Execute(); }
 
         int n = a._shape[0];
@@ -34789,7 +34789,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     {
                         var eager = eng.FusedLinear(inputs[0], inputs[1],
                             inputs.Length > 2 ? inputs[2] : null, capturedActivation, capturedParams);
-                        eager.AsSpan().CopyTo(output.AsWritableSpan());
+                        DirectGpuTensorEngine.CopyResultInto(eng, eager, output);
                     },
                     BackwardFunctions<T>.FusedLinearWithActivationBackward,
                     // savedState layout [0]=activation, [1]=preActivation (null here ⇒ backward
@@ -35610,7 +35610,7 @@ public partial class CpuEngine : ITensorLevelEngine
     public Tensor<T> RFFT<T>(Tensor<T> input)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; return scope.RecordUnary(LazyNodeType.Custom, "RFFT", input, input._shape, (eng, output) => { var r = eng.RFFT(c_input); r.AsSpan().CopyTo(output.AsWritableSpan()); }, null); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; return scope.RecordUnary(LazyNodeType.Custom, "RFFT", input, input._shape, (eng, output) => { var r = eng.RFFT(c_input); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, null); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("RFFT", input._shape); if (ac is not null) return ac.Execute(); }
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -35669,7 +35669,7 @@ public partial class CpuEngine : ITensorLevelEngine
     public Tensor<T> IRFFT<T>(Tensor<T> input, int outputLength)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; var c_outputLength = outputLength; return scope.RecordUnary(LazyNodeType.Custom, "IRFFT", input, input._shape, (eng, output) => { var r = eng.IRFFT(c_input, c_outputLength); r.AsSpan().CopyTo(output.AsWritableSpan()); }, null); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; var c_outputLength = outputLength; return scope.RecordUnary(LazyNodeType.Custom, "IRFFT", input, input._shape, (eng, output) => { var r = eng.IRFFT(c_input, c_outputLength); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, null); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("IRFFT", input._shape); if (ac is not null) return ac.Execute(); }
 
         var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
@@ -36612,7 +36612,7 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var captured = input;
                 return scope.RecordUnary(LazyNodeType.Custom, "Softplus", captured, captured._shape,
-                    (eng, output) => { var r = eng.Softplus(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.Softplus(captured); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.SoftplusBackward);
             }
         }
@@ -36663,7 +36663,7 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var captured = input;
                 return scope.RecordUnary(LazyNodeType.Custom, "HardSwish", captured, captured._shape,
-                    (eng, output) => { var r = eng.HardSwish(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.HardSwish(captured); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.HardSwishBackward);
             }
         }
@@ -37372,7 +37372,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     (eng, output) =>
                     {
                         var r = eng.InstanceNorm(ci, cg, cb, ce, out var freshMean, out var freshVar);
-                        r.AsSpan().CopyTo(output.AsWritableSpan());
+                        DirectGpuTensorEngine.CopyResultInto(eng, r, output);
                         freshMean.AsSpan().CopyTo(capturedINMean.AsWritableSpan());
                         freshVar.AsSpan().CopyTo(capturedINVar.AsWritableSpan());
                     },
@@ -37574,7 +37574,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     (eng, output) =>
                     {
                         var r = eng.Dropout(ci, cdr, ct, out var freshMask);
-                        r.AsSpan().CopyTo(output.AsWritableSpan());
+                        DirectGpuTensorEngine.CopyResultInto(eng, r, output);
                         freshMask.AsSpan().CopyTo(capturedMask.AsWritableSpan());
                     },
                     BackwardFunctions<T>.DropoutBackward, new object[] { mask, dropoutRate });
@@ -37707,7 +37707,7 @@ public partial class CpuEngine : ITensorLevelEngine
                             gpuEng.RegisterEmbIndexRefresh(() => gpuEng.UploadEmbeddingIndices(ci, ci.Length));
                             if (gpuEng.TryEmbeddingGatherGpu(ct, ci, ci.Length, output)) return;
                         }
-                        var r = eng.Embedding(ci, ct); r.AsSpan().CopyTo(output.AsWritableSpan());
+                        var r = eng.Embedding(ci, ct); DirectGpuTensorEngine.CopyResultInto(eng, r, output);
                     },
                     BackwardFunctions<T>.EmbeddingBackward, new object[] { indices });
             }
@@ -38286,7 +38286,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     (eng, output) =>
                     {
                         if (eng is CpuEngine cpuEng) cpuEng.AdaptiveAvgPool2DInto(output, captured, capOutH, capOutW);
-                        else { var r = eng.AdaptiveAvgPool2D(captured, capOutH, capOutW); r.AsSpan().CopyTo(output.AsWritableSpan()); }
+                        else { var r = eng.AdaptiveAvgPool2D(captured, capOutH, capOutW); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.AdaptiveAvgPool2DBackward, new object[] { capOutH, capOutW });
             }
@@ -38508,7 +38508,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var ci = input; var cg = gamma; var cb = beta; double ce = epsilon;
                 return scope.RecordVariadic(LazyNodeType.Custom, "TensorLayerNorm",
                     new[] { input, gamma, beta }, input._shape,
-                    (eng, output) => { var r = eng.TensorLayerNorm(ci, cg, cb, ce); r.AsSpan().CopyTo(output.AsWritableSpan()); });
+                    (eng, output) => { var r = eng.TensorLayerNorm(ci, cg, cb, ce); DirectGpuTensorEngine.CopyResultInto(eng, r, output); });
             }
         }
         var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
@@ -38532,7 +38532,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var lazyVar = ReduceVariance(input, axes, keepDims);
                 var outShape = lazyVar._shape;
                 return scope.RecordUnary(LazyNodeType.Custom, "ReduceStd", input, outShape,
-                    (eng, output) => { var r = eng.ReduceStd(ci, ca, ck); r.AsSpan().CopyTo(output.AsWritableSpan()); });
+                    (eng, output) => { var r = eng.ReduceStd(ci, ca, ck); DirectGpuTensorEngine.CopyResultInto(eng, r, output); });
             }
         }
         // ReduceVariance is already stride-aware — no Contiguous() needed here
@@ -38592,7 +38592,7 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var ca = a; var cb = b; var csA = scaleA; var csB = scaleB;
                 return scope.RecordBinary(LazyNodeType.Custom, "TensorAddScaled", a, b, a._shape,
-                    (eng, output) => { var r = eng.TensorAddScaled(ca, cb, csA, csB); r.AsSpan().CopyTo(output.AsWritableSpan()); });
+                    (eng, output) => { var r = eng.TensorAddScaled(ca, cb, csA, csB); DirectGpuTensorEngine.CopyResultInto(eng, r, output); });
             }
         }
 
@@ -38738,7 +38738,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var capturedPred = predictions;
                 var capturedTarget = targets;
                 return scope.RecordBinary(LazyNodeType.MSELoss, "MSELoss", predictions, targets, new[] { 1 },
-                    (eng, output) => { var r = eng.TensorMSELoss(capturedPred, capturedTarget); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.TensorMSELoss(capturedPred, capturedTarget); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.MSELossBackward);
             }
         }
@@ -38808,7 +38808,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var capturedP = predictions;
                 var capturedT = targets;
                 return scope.RecordBinary(LazyNodeType.Custom, "L1Loss", predictions, targets, new[] { 1 },
-                    (eng, output) => { var r = eng.TensorL1Loss(capturedP, capturedT); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.TensorL1Loss(capturedP, capturedT); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.L1LossBackward);
             }
         }
@@ -38873,7 +38873,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var capturedT = targets;
                 double capturedDelta = delta;
                 return scope.RecordBinary(LazyNodeType.Custom, "HuberLoss", predictions, targets, new[] { 1 },
-                    (eng, output) => { var r = eng.TensorHuberLoss(capturedP, capturedT, capturedDelta); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.TensorHuberLoss(capturedP, capturedT, capturedDelta); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.HuberLossBackward, new object[] { delta });
             }
         }
@@ -38954,7 +38954,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var capturedLogits = logits;
                 var capturedTargets = targets;
                 return scope.RecordBinary(LazyNodeType.Custom, "BCEWithLogitsLoss", logits, targets, new[] { 1 },
-                    (eng, output) => { var r = eng.TensorBCEWithLogitsLoss(capturedLogits, capturedTargets); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.TensorBCEWithLogitsLoss(capturedLogits, capturedTargets); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.BCEWithLogitsLossBackward);
             }
         }
@@ -39033,7 +39033,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var capturedLogits = logits;
                 var capturedTargets = targets;
                 return scope.RecordBinary(LazyNodeType.CrossEntropyLoss, "CrossEntropyLoss", logits, targets, new[] { 1 },
-                    (eng, output) => { var r = eng.TensorCrossEntropyLoss(capturedLogits, capturedTargets); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.TensorCrossEntropyLoss(capturedLogits, capturedTargets); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.CrossEntropyLossBackward);
             }
         }
@@ -39078,7 +39078,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var capturedLogProbs = logProbs;
                 var capturedTargets = targets;
                 return scope.RecordBinary(LazyNodeType.Custom, "NLLLoss", logProbs, targets, new[] { 1 },
-                    (eng, output) => { var r = eng.TensorNLLLoss(capturedLogProbs, capturedTargets); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.TensorNLLLoss(capturedLogProbs, capturedTargets); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.NLLLossBackward);
             }
         }
@@ -39117,7 +39117,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var capturedInput = input;
                 var capturedTarget = target;
                 return scope.RecordBinary(LazyNodeType.Custom, "KLDivLoss", input, target, new[] { 1 },
-                    (eng, output) => { var r = eng.TensorKLDivLoss(capturedInput, capturedTarget); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.TensorKLDivLoss(capturedInput, capturedTarget); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.KLDivLossBackward);
             }
         }
@@ -39155,7 +39155,7 @@ public partial class CpuEngine : ITensorLevelEngine
             normB += vb * vb;
         }
         double sim = dotProd / (Math.Sqrt(normA) * Math.Sqrt(normB) + 1e-8);
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_a = a; var c_b = b; return scope.RecordBinary(LazyNodeType.Custom, "CosineSimilarity", a, b, a._shape, (eng, output) => { var r = eng.TensorCosineSimilarityLoss(c_a, c_b); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.CosineSimilarityBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_a = a; var c_b = b; return scope.RecordBinary(LazyNodeType.Custom, "CosineSimilarity", a, b, a._shape, (eng, output) => { var r = eng.TensorCosineSimilarityLoss(c_a, c_b); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.CosineSimilarityBackward); } }
 
         var result = new Tensor<T>(new[] { numOps.FromDouble(sim) }, [1]);
         DifferentiableOps.RecordBinary("CosineSimilarity", result, a, b,
@@ -39179,7 +39179,7 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var captured = tensor;
                 return scope.RecordUnary(LazyNodeType.Custom, "SELU", captured, captured._shape,
-                    (eng, output) => { var r = eng.TensorSELU(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.TensorSELU(captured); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.SELUBackward);
             }
         }
@@ -39241,7 +39241,7 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var captured = tensor;
                 return scope.RecordUnary(LazyNodeType.Custom, "HardSigmoid", captured, captured._shape,
-                    (eng, output) => { var r = eng.TensorHardSigmoid(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.TensorHardSigmoid(captured); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.HardSigmoidBackward);
             }
         }
@@ -39297,7 +39297,7 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var captured = tensor;
                 return scope.RecordUnary(LazyNodeType.Custom, "ReLU6", captured, captured._shape,
-                    (eng, output) => { var r = eng.TensorReLU6(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.TensorReLU6(captured); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.ReLU6Backward);
             }
         }
@@ -39351,7 +39351,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 int capChannels = alpha.Length;
                 int capSpatialSize = tensor.Rank >= 4 ? tensor._shape[^2] * tensor._shape[^1] : 1;
                 return scope.RecordBinary(LazyNodeType.Custom, "PReLU", tensor, alpha, tensor._shape,
-                    (eng, output) => { var r = eng.TensorPReLU(captured, capAlpha); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.TensorPReLU(captured, capAlpha); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.PReLUBackward, new object[] { capChannels, capSpatialSize });
             }
         }
@@ -39438,7 +39438,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 double capLower = lower, capUpper = upper;
                 bool capTraining = training;
                 return scope.RecordUnary(LazyNodeType.Custom, "RReLU", tensor, tensor._shape,
-                    (eng, output) => { var r = eng.TensorRReLU(captured, capLower, capUpper, capTraining); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.TensorRReLU(captured, capLower, capUpper, capTraining); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.RReLUBackward);
             }
         }
@@ -39474,7 +39474,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 T capValue = value;
                 var numOpsLazy = MathHelper.GetNumericOperations<T>();
                 return scope.RecordUnary(LazyNodeType.Custom, "Threshold", tensor, tensor._shape,
-                    (eng, output) => { var r = eng.TensorThreshold(captured, capThreshold, capValue); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.TensorThreshold(captured, capThreshold, capValue); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.ThresholdBackward, new object[] { numOpsLazy.ToDouble(threshold) });
             }
         }
@@ -39503,7 +39503,7 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var captured = tensor;
                 return scope.RecordUnary(LazyNodeType.Custom, "Reciprocal", captured, captured._shape,
-                    (eng, output) => { var r = eng.TensorReciprocal(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.TensorReciprocal(captured); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.ReciprocalBackward);
             }
         }
@@ -39547,7 +39547,7 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var captured = tensor;
                 return scope.RecordUnary(LazyNodeType.Custom, "Sign", captured, captured._shape,
-                    (eng, output) => { var r = eng.TensorSign(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.TensorSign(captured); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.SignBackward);
             }
         }
@@ -39594,7 +39594,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var captured = tensor;
                 var outShape = new int[] { tensor.Length };
                 return scope.RecordUnary(LazyNodeType.Custom, "Flatten", tensor, outShape,
-                    (eng, output) => { var r = captured.Reshape(new int[] { captured.Length }); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = captured.Reshape(new int[] { captured.Length }); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.FlattenBackward);
             }
         }
@@ -39620,7 +39620,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var outShape = (int[])tensor._shape.Clone();
                 outShape[dim] = length;
                 return scope.RecordUnary(LazyNodeType.Custom, "Narrow", tensor, outShape,
-                    (eng, output) => { var r = eng.TensorNarrow(captured, capDim, capStart, capLen); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.TensorNarrow(captured, capDim, capStart, capLen); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.NarrowBackward, new object[] { dim, start, length });
             }
         }
@@ -39660,7 +39660,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     outShape[dim] += padding[2 * i] + padding[2 * i + 1];
                 }
                 return scope.RecordUnary(LazyNodeType.Custom, "ConstantPad", tensor, outShape,
-                    (eng, output) => { var r = eng.TensorConstantPad(captured, capPadding, capValue); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.TensorConstantPad(captured, capPadding, capValue); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.ConstantPadBackward, new object[] { capPadding });
             }
         }
@@ -39896,7 +39896,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     (eng, output) =>
                     {
                         if (eng is CpuEngine cpuEng) cpuEng.TensorUpsampleBilinearInto(output, captured, capOutputSize);
-                        else { var r = eng.TensorUpsampleBilinear(captured, capOutputSize); r.AsSpan().CopyTo(output.AsWritableSpan()); }
+                        else { var r = eng.TensorUpsampleBilinear(captured, capOutputSize); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.UpsampleBilinearBackward, new object[] { new[] { capH, capW } });
             }
@@ -39931,7 +39931,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var captured = input;
                 int ks = kernelSize, st = stride;
                 return scope.RecordUnary(LazyNodeType.Custom, "AvgPool1D", input, outShape,
-                    (eng, output) => { var r = eng.TensorAvgPool1D(captured, ks, st); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.TensorAvgPool1D(captured, ks, st); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.AvgPool1DBackward, new object[] { kernelSize, stride });
             }
         }
@@ -39974,7 +39974,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var captured = input;
                 int ks = kernelSize, st = stride;
                 return scope.RecordUnary(LazyNodeType.Custom, "MaxPool1D", input, outShape,
-                    (eng, output) => { var r = eng.TensorMaxPool1D(captured, ks, st); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.TensorMaxPool1D(captured, ks, st); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.MaxPool1DBackward, new object[] { kernelSize, stride });
             }
         }
@@ -40026,7 +40026,7 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var captured = tensor;
                 return scope.RecordUnary(LazyNodeType.Custom, "Mean", captured, new int[] { 1 },
-                    (eng, output) => { var r = eng.TensorMeanDiff(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.TensorMeanDiff(captured); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.MeanBackward);
             }
         }
@@ -40063,7 +40063,7 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var captured = tensor;
                 return scope.RecordUnary(LazyNodeType.Custom, "Var", captured, new int[] { 1 },
-                    (eng, output) => { var r = eng.TensorVar(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.TensorVar(captured); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.VarBackward);
             }
         }
@@ -40097,7 +40097,7 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var captured = tensor;
                 return scope.RecordUnary(LazyNodeType.Custom, "Std", captured, new int[] { 1 },
-                    (eng, output) => { var r = eng.TensorStd(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.TensorStd(captured); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.StdBackward);
             }
         }
@@ -40141,7 +40141,7 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var captured = tensor;
                 return scope.RecordUnary(LazyNodeType.Custom, "LogSumExp", tensor, new int[] { 1 },
-                    (eng, output) => { var r = eng.TensorLogSumExp(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.TensorLogSumExp(captured); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.LogSumExpBackward);
             }
         }
@@ -40172,7 +40172,7 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var captured = tensor;
                 return scope.RecordUnary(LazyNodeType.Custom, "Norm", tensor, new int[] { 1 },
-                    (eng, output) => { var r = eng.TensorNorm(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.TensorNorm(captured); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.NormBackward);
             }
         }
@@ -40204,7 +40204,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var capOutputSize = (int[])outputSize.Clone();
                 var outShape = new[] { input._shape[0], input._shape[1], outputSize[0], outputSize[1] };
                 return scope.RecordUnary(LazyNodeType.Custom, "AdaptiveMaxPool2D", input, outShape,
-                    (eng, output) => { var r = eng.TensorAdaptiveMaxPool2D(captured, capOutputSize); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.TensorAdaptiveMaxPool2D(captured, capOutputSize); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.AdaptiveMaxPool2DBackward);
             }
         }
@@ -40256,7 +40256,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var capturedY = y;
                 var capturedCond = condition;
                 return scope.RecordBinary(LazyNodeType.Custom, "Where", x, y, x._shape,
-                    (eng, output) => { var r = eng.TensorWhere(capturedCond, capturedX, capturedY); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) => { var r = eng.TensorWhere(capturedCond, capturedX, capturedY); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.WhereBackward, new object[] { condition });
             }
         }
@@ -40349,7 +40349,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> FusedLinearReLU<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias)
     {
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; var cw = weight; var cb = bias; return scope.RecordVariadic(LazyNodeType.FusedLinearReLU, "FusedLinearReLU", new[] { input, weight, bias }, input._shape, (eng, output) => { var r = eng.FusedLinearReLU(ci, cw, cb); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.FusedMatMulAddReLUBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; var cw = weight; var cb = bias; return scope.RecordVariadic(LazyNodeType.FusedLinearReLU, "FusedLinearReLU", new[] { input, weight, bias }, input._shape, (eng, output) => { var r = eng.FusedLinearReLU(ci, cw, cb); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.FusedMatMulAddReLUBackward); } }
 
         var linear = TensorMatMul(input, weight);
         var biased = TensorBroadcastAdd(linear, bias);
@@ -40367,7 +40367,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> FusedLinearSigmoid<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias)
     {
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; var cw = weight; var cb = bias; return scope.RecordVariadic(LazyNodeType.FusedLinearSigmoid, "FusedLinearSigmoid", new[] { input, weight, bias }, input._shape, (eng, output) => { var r = eng.FusedLinearSigmoid(ci, cw, cb); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.FusedMatMulAddSigmoidBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; var cw = weight; var cb = bias; return scope.RecordVariadic(LazyNodeType.FusedLinearSigmoid, "FusedLinearSigmoid", new[] { input, weight, bias }, input._shape, (eng, output) => { var r = eng.FusedLinearSigmoid(ci, cw, cb); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.FusedMatMulAddSigmoidBackward); } }
 
         var linear = TensorMatMul(input, weight);
         var biased = TensorBroadcastAdd(linear, bias);
@@ -40383,7 +40383,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> FusedLinearTanh<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias)
     {
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; var cw = weight; var cb = bias; return scope.RecordVariadic(LazyNodeType.Custom, "FusedLinearTanh", new[] { input, weight, bias }, input._shape, (eng, output) => { var r = eng.FusedLinearTanh(ci, cw, cb); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.FusedMatMulAddTanhBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; var cw = weight; var cb = bias; return scope.RecordVariadic(LazyNodeType.Custom, "FusedLinearTanh", new[] { input, weight, bias }, input._shape, (eng, output) => { var r = eng.FusedLinearTanh(ci, cw, cb); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.FusedMatMulAddTanhBackward); } }
 
         var linear = TensorMatMul(input, weight);
         var biased = TensorBroadcastAdd(linear, bias);
@@ -40399,7 +40399,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> FusedLinearGELU<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias)
     {
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; var cw = weight; var cb = bias; return scope.RecordVariadic(LazyNodeType.FusedLinearGELU, "FusedLinearGELU", new[] { input, weight, bias }, input._shape, (eng, output) => { var r = eng.FusedLinearGELU(ci, cw, cb); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.FusedMatMulAddGELUBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; var cw = weight; var cb = bias; return scope.RecordVariadic(LazyNodeType.FusedLinearGELU, "FusedLinearGELU", new[] { input, weight, bias }, input._shape, (eng, output) => { var r = eng.FusedLinearGELU(ci, cw, cb); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.FusedMatMulAddGELUBackward); } }
 
         var linear = TensorMatMul(input, weight);
         var biased = TensorBroadcastAdd(linear, bias);
@@ -40417,7 +40417,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> FusedLinearSwish<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias)
     {
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; var cw = weight; var cb = bias; return scope.RecordVariadic(LazyNodeType.Custom, "FusedLinearSwish", new[] { input, weight, bias }, input._shape, (eng, output) => { var r = eng.FusedLinearSwish(ci, cw, cb); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.FusedMatMulAddSwishBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; var cw = weight; var cb = bias; return scope.RecordVariadic(LazyNodeType.Custom, "FusedLinearSwish", new[] { input, weight, bias }, input._shape, (eng, output) => { var r = eng.FusedLinearSwish(ci, cw, cb); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.FusedMatMulAddSwishBackward); } }
 
         var linear = TensorMatMul(input, weight);
         var biased = TensorBroadcastAdd(linear, bias);
@@ -40463,7 +40463,7 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var cp = predicted; var ct = target;
                 return scope.RecordBinary(LazyNodeType.Custom, "TensorIoULoss", predicted, target, new[] { predicted._shape[0] },
-                    (eng, output) => { var r = eng.TensorIoULoss(cp, ct); r.AsSpan().CopyTo(output.AsWritableSpan()); });
+                    (eng, output) => { var r = eng.TensorIoULoss(cp, ct); DirectGpuTensorEngine.CopyResultInto(eng, r, output); });
             }
         }
         if (predicted.Shape.Length != 2 || predicted.Shape[1] != 4)
@@ -40529,7 +40529,7 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var cp = predicted; var ct = target;
                 return scope.RecordBinary(LazyNodeType.Custom, "TensorGIoULoss", predicted, target, new[] { predicted._shape[0] },
-                    (eng, output) => { var r = eng.TensorGIoULoss(cp, ct); r.AsSpan().CopyTo(output.AsWritableSpan()); });
+                    (eng, output) => { var r = eng.TensorGIoULoss(cp, ct); DirectGpuTensorEngine.CopyResultInto(eng, r, output); });
             }
         }
         if (predicted.Shape.Length != 2 || predicted.Shape[1] != 4)
@@ -40599,7 +40599,7 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var cp = predicted; var ct = target;
                 return scope.RecordBinary(LazyNodeType.Custom, "TensorDIoULoss", predicted, target, new[] { predicted._shape[0] },
-                    (eng, output) => { var r = eng.TensorDIoULoss(cp, ct); r.AsSpan().CopyTo(output.AsWritableSpan()); });
+                    (eng, output) => { var r = eng.TensorDIoULoss(cp, ct); DirectGpuTensorEngine.CopyResultInto(eng, r, output); });
             }
         }
 
@@ -40677,7 +40677,7 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var cp = predicted; var ct = target;
                 return scope.RecordBinary(LazyNodeType.Custom, "TensorCIoULoss", predicted, target, new[] { predicted._shape[0] },
-                    (eng, output) => { var r = eng.TensorCIoULoss(cp, ct); r.AsSpan().CopyTo(output.AsWritableSpan()); });
+                    (eng, output) => { var r = eng.TensorCIoULoss(cp, ct); DirectGpuTensorEngine.CopyResultInto(eng, r, output); });
             }
         }
 
@@ -40931,7 +40931,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (input._shape[1] != weight._shape[1])
             throw new ArgumentException($"Input features ({input._shape[1]}) must match weight input dimension ({weight._shape[1]}).");
         var outputShape = new[] { input._shape[0], weight._shape[0], 8 };
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; var c_weight = weight; return scope.RecordBinary(LazyNodeType.Custom, "OctonionMatMulTensor", input, weight, outputShape, (eng, output) => { var r = eng.OctonionMatMulTensor(c_input, c_weight); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.OctonionMatMulBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; var c_weight = weight; return scope.RecordBinary(LazyNodeType.Custom, "OctonionMatMulTensor", input, weight, outputShape, (eng, output) => { var r = eng.OctonionMatMulTensor(c_input, c_weight); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.OctonionMatMulBackward); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("OctonionMatMulTensor", outputShape); if (ac is not null) return ac.Execute(); }
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -41103,7 +41103,7 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentException($"Tensor lengths must match: {a.Length} vs {b.Length}");
         if (a.Length % 2 != 0 || (a.Rank > 0 && a._shape[a.Rank - 1] % 2 != 0))
             throw new ArgumentException("Complex tensors must have even length with the last axis divisible by 2 (interleaved re/im).");
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_a = a; var c_b = b; return scope.RecordBinary(LazyNodeType.Custom, "ComplexMultiply", a, b, a._shape, (eng, output) => { var r = eng.TensorComplexMultiply(c_a, c_b); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.ComplexMultiplyBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_a = a; var c_b = b; return scope.RecordBinary(LazyNodeType.Custom, "ComplexMultiply", a, b, a._shape, (eng, output) => { var r = eng.TensorComplexMultiply(c_a, c_b); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.ComplexMultiplyBackward); } }
 
 
         var ops = MathHelper.GetNumericOperations<T>();
@@ -41131,7 +41131,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (a.Length % 2 != 0)
             throw new ArgumentException("Complex tensors must have even length (interleaved re/im).");
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_a = a; return scope.RecordUnary(LazyNodeType.Custom, "ComplexConjugate", a, a._shape, (eng, output) => { var r = eng.TensorComplexConjugate(c_a); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.ComplexConjugateBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_a = a; return scope.RecordUnary(LazyNodeType.Custom, "ComplexConjugate", a, a._shape, (eng, output) => { var r = eng.TensorComplexConjugate(c_a); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.ComplexConjugateBackward); } }
 
 
         var ops = MathHelper.GetNumericOperations<T>();
@@ -41153,7 +41153,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (a.Length % 2 != 0)
             throw new ArgumentException("Complex tensors must have even length (interleaved re/im).");
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c = a; return scope.RecordUnary(LazyNodeType.Custom, "ComplexMagnitude", a, a._shape, (eng, output) => { var r = eng.TensorComplexMagnitude(c); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.ComplexMagnitudeBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c = a; return scope.RecordUnary(LazyNodeType.Custom, "ComplexMagnitude", a, a._shape, (eng, output) => { var r = eng.TensorComplexMagnitude(c); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.ComplexMagnitudeBackward); } }
 
 
         var ops = MathHelper.GetNumericOperations<T>();
@@ -41276,7 +41276,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var (batchCount, fftSize) = GetBatchedFFTDims(input._shape);
         ValidatePowerOfTwo(fftSize, nameof(input));
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; return scope.RecordCrossType<T, Complex<T>>(LazyNodeType.Custom, "NativeComplexFFT", input, input._shape, (eng, output) => { var r = eng.NativeComplexFFT(ci); r.AsSpan().CopyTo(output.AsWritableSpan()); }); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; return scope.RecordCrossType<T, Complex<T>>(LazyNodeType.Custom, "NativeComplexFFT", input, input._shape, (eng, output) => { var r = eng.NativeComplexFFT(ci); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }); } }
         { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexFFT", input._shape); if (ac is not null) return ac.Execute(); }
 
         var ops = MathHelper.GetNumericOperations<T>();
@@ -41602,7 +41602,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var (batchCount, fftSize) = GetBatchedFFTDims(input._shape);
         ValidatePowerOfTwo(fftSize, nameof(input));
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; var fL = freqLow; var fH = freqHigh; var sr = sampleRate; return scope.RecordCrossType<T, Complex<T>>(LazyNodeType.Custom, "NativeAnalyticSignal", input, input._shape, (eng, output) => { var r = eng.NativeAnalyticSignal(ci, fL, fH, sr); r.AsSpan().CopyTo(output.AsWritableSpan()); }); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; var fL = freqLow; var fH = freqHigh; var sr = sampleRate; return scope.RecordCrossType<T, Complex<T>>(LazyNodeType.Custom, "NativeAnalyticSignal", input, input._shape, (eng, output) => { var r = eng.NativeAnalyticSignal(ci, fL, fH, sr); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }); } }
 
         var ops = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<Complex<T>>(input._shape);
@@ -42546,7 +42546,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var (batchCount, fftSize) = GetBatchedFFTDims(input._shape);
         ValidatePowerOfTwo(fftSize, nameof(input));
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; return scope.RecordCrossType<Complex<T>, T>(LazyNodeType.Custom, "NativeComplexIFFTReal", input, input._shape, (eng, output) => { var r = eng.NativeComplexIFFTReal(ci); r.AsSpan().CopyTo(output.AsWritableSpan()); }); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; return scope.RecordCrossType<Complex<T>, T>(LazyNodeType.Custom, "NativeComplexIFFTReal", input, input._shape, (eng, output) => { var r = eng.NativeComplexIFFTReal(ci); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("NativeComplexIFFTReal", input._shape); if (ac is not null) return ac.Execute(); }
 
         var ops = MathHelper.GetNumericOperations<T>();
@@ -42576,7 +42576,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var (batchCount, fftSize) = GetBatchedFFTDims(input._shape);
         ValidatePowerOfTwo(fftSize, nameof(input));
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; return scope.RecordUnary(LazyNodeType.Custom, "NativeComplexIFFT", input, input._shape, (eng, output) => { var r = eng.NativeComplexIFFT(ci); r.AsSpan().CopyTo(output.AsWritableSpan()); }, null); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; return scope.RecordUnary(LazyNodeType.Custom, "NativeComplexIFFT", input, input._shape, (eng, output) => { var r = eng.NativeComplexIFFT(ci); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, null); } }
         { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexIFFT", input._shape); if (ac is not null) return ac.Execute(); }
 
         var ops = MathHelper.GetNumericOperations<T>();
@@ -42608,7 +42608,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var (batchCount, fftSize) = GetBatchedFFTDims(input._shape);
         ValidatePowerOfTwo(fftSize, nameof(input));
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; return scope.RecordUnary(LazyNodeType.Custom, "NativeComplexFFTComplex", input, input._shape, (eng, output) => { var r = eng.NativeComplexFFTComplex(ci); r.AsSpan().CopyTo(output.AsWritableSpan()); }, null); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; return scope.RecordUnary(LazyNodeType.Custom, "NativeComplexFFTComplex", input, input._shape, (eng, output) => { var r = eng.NativeComplexFFTComplex(ci); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, null); } }
         { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexFFTComplex", input._shape); if (ac is not null) return ac.Execute(); }
 
         var ops = MathHelper.GetNumericOperations<T>();
@@ -42672,7 +42672,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (input is null) throw new ArgumentNullException(nameof(input));
         if (input.Rank != 2) throw new ArgumentException("TensorSoftmaxRows requires a 2D tensor.", nameof(input));
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; return scope.RecordUnary(LazyNodeType.Custom, "TensorSoftmaxRows", input, input._shape, (eng, output) => { var r = eng.TensorSoftmaxRows(ci); r.AsSpan().CopyTo(output.AsWritableSpan()); }, null); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; return scope.RecordUnary(LazyNodeType.Custom, "TensorSoftmaxRows", input, input._shape, (eng, output) => { var r = eng.TensorSoftmaxRows(ci); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, null); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorSoftmaxRows", input._shape); if (ac is not null) return ac.Execute(); }
 
         var ops = MathHelper.GetNumericOperations<T>();
@@ -42718,7 +42718,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (a.Length != b.Length)
             throw new ArgumentException($"Tensor lengths must match: {a.Length} vs {b.Length}");
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ca = a; var cb = b; return scope.RecordBinary(LazyNodeType.Custom, "NativeComplexMultiply", a, b, a._shape, (eng, output) => { var r = eng.NativeComplexMultiply(ca, cb); r.AsSpan().CopyTo(output.AsWritableSpan()); }, null); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ca = a; var cb = b; return scope.RecordBinary(LazyNodeType.Custom, "NativeComplexMultiply", a, b, a._shape, (eng, output) => { var r = eng.NativeComplexMultiply(ca, cb); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, null); } }
         { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexMultiply", a._shape); if (ac is not null) return ac.Execute(); }
 
         var ops = MathHelper.GetNumericOperations<T>();
@@ -43136,7 +43136,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (a is null) throw new ArgumentNullException(nameof(a));
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ca = a; return scope.RecordUnary(LazyNodeType.Custom, "NativeComplexConjugate", a, a._shape, (eng, output) => { var r = eng.NativeComplexConjugate(ca); r.AsSpan().CopyTo(output.AsWritableSpan()); }, null); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ca = a; return scope.RecordUnary(LazyNodeType.Custom, "NativeComplexConjugate", a, a._shape, (eng, output) => { var r = eng.NativeComplexConjugate(ca); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, null); } }
         { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexConjugate", a._shape); if (ac is not null) return ac.Execute(); }
 
         var ops = MathHelper.GetNumericOperations<T>();
@@ -43172,7 +43172,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (a is null) throw new ArgumentNullException(nameof(a));
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ca = a; return scope.RecordCrossType<Complex<T>, T>(LazyNodeType.Custom, "NativeComplexMagnitude", a, a._shape, (eng, output) => { var r = eng.NativeComplexMagnitude(ca); r.AsSpan().CopyTo(output.AsWritableSpan()); }); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ca = a; return scope.RecordCrossType<Complex<T>, T>(LazyNodeType.Custom, "NativeComplexMagnitude", a, a._shape, (eng, output) => { var r = eng.NativeComplexMagnitude(ca); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("NativeComplexMagnitude", a._shape); if (ac is not null) return ac.Execute(); }
 
         var ops = MathHelper.GetNumericOperations<T>();
@@ -43212,7 +43212,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (a is null) throw new ArgumentNullException(nameof(a));
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ca = a; return scope.RecordCrossType<Complex<T>, T>(LazyNodeType.Custom, "NativeComplexMagnitudeSquared", a, a._shape, (eng, output) => { var r = eng.NativeComplexMagnitudeSquared(ca); r.AsSpan().CopyTo(output.AsWritableSpan()); }); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ca = a; return scope.RecordCrossType<Complex<T>, T>(LazyNodeType.Custom, "NativeComplexMagnitudeSquared", a, a._shape, (eng, output) => { var r = eng.NativeComplexMagnitudeSquared(ca); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("NativeComplexMagnitudeSquared", a._shape); if (ac is not null) return ac.Execute(); }
 
         var ops = MathHelper.GetNumericOperations<T>();
@@ -43250,7 +43250,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (a is null) throw new ArgumentNullException(nameof(a));
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ca = a; return scope.RecordCrossType<Complex<T>, T>(LazyNodeType.Custom, "NativeComplexPhase", a, a._shape, (eng, output) => { var r = eng.NativeComplexPhase(ca); r.AsSpan().CopyTo(output.AsWritableSpan()); }); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ca = a; return scope.RecordCrossType<Complex<T>, T>(LazyNodeType.Custom, "NativeComplexPhase", a, a._shape, (eng, output) => { var r = eng.NativeComplexPhase(ca); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("NativeComplexPhase", a._shape); if (ac is not null) return ac.Execute(); }
 
         var ops = MathHelper.GetNumericOperations<T>();
@@ -43284,7 +43284,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (magnitudes.Length != phases.Length)
             throw new ArgumentException($"Tensor lengths must match: {magnitudes.Length} vs {phases.Length}");
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { _ = phases.Length; var cm = magnitudes; var cp = phases; return scope.RecordCrossType<T, Complex<T>>(LazyNodeType.Custom, "NativeComplexFromPolar", magnitudes, magnitudes._shape, (eng, output) => { var r = eng.NativeComplexFromPolar(cm, cp); r.AsSpan().CopyTo(output.AsWritableSpan()); }); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { _ = phases.Length; var cm = magnitudes; var cp = phases; return scope.RecordCrossType<T, Complex<T>>(LazyNodeType.Custom, "NativeComplexFromPolar", magnitudes, magnitudes._shape, (eng, output) => { var r = eng.NativeComplexFromPolar(cm, cp); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }); } }
         { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexFromPolar", magnitudes._shape); if (ac is not null) return ac.Execute(); }
 
         var ops = MathHelper.GetNumericOperations<T>();
@@ -43325,7 +43325,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (a is null) throw new ArgumentNullException(nameof(a));
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ca = a; var cs = scalar; return scope.RecordUnary(LazyNodeType.Custom, "NativeComplexScale", a, a._shape, (eng, output) => { var r = eng.NativeComplexScale(ca, cs); r.AsSpan().CopyTo(output.AsWritableSpan()); }, null); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ca = a; var cs = scalar; return scope.RecordUnary(LazyNodeType.Custom, "NativeComplexScale", a, a._shape, (eng, output) => { var r = eng.NativeComplexScale(ca, cs); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, null); } }
         { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexScale", a._shape); if (ac is not null) return ac.Execute(); }
 
         var ops = MathHelper.GetNumericOperations<T>();
@@ -43366,7 +43366,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (x.Length != y.Length)
             throw new ArgumentException($"Tensor lengths must match: {x.Length} vs {y.Length}");
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var cx = x; var cy = y; return scope.RecordBinary(LazyNodeType.Custom, "NativeComplexCrossSpectral", x, y, x._shape, (eng, output) => { var r = eng.NativeComplexCrossSpectral(cx, cy); r.AsSpan().CopyTo(output.AsWritableSpan()); }, null); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var cx = x; var cy = y; return scope.RecordBinary(LazyNodeType.Custom, "NativeComplexCrossSpectral", x, y, x._shape, (eng, output) => { var r = eng.NativeComplexCrossSpectral(cx, cy); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, null); } }
         { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexCrossSpectral", x._shape); if (ac is not null) return ac.Execute(); }
 
         var ops = MathHelper.GetNumericOperations<T>();
@@ -43412,7 +43412,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (input.Rank < 2)
             throw new ArgumentException("NativeComplexFFT2D requires at least a 2D tensor.", nameof(input));
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c = input; return scope.RecordCrossType<T, Complex<T>>(LazyNodeType.Custom, "NativeComplexFFT2D", input, input._shape, (eng, output) => { var r = eng.NativeComplexFFT2D(c); r.AsSpan().CopyTo(output.AsWritableSpan()); }); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c = input; return scope.RecordCrossType<T, Complex<T>>(LazyNodeType.Custom, "NativeComplexFFT2D", input, input._shape, (eng, output) => { var r = eng.NativeComplexFFT2D(c); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }); } }
         { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexFFT2D", input._shape); if (ac is not null) return ac.Execute(); }
 
         int h = input._shape[^2];
@@ -43451,7 +43451,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if ((iw & (iw - 1)) != 0 || iw <= 0)
             throw new ArgumentException($"Width {iw} must be a positive power of 2.", nameof(input));
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c = input; return scope.RecordCrossType<Complex<T>, T>(LazyNodeType.Custom, "NativeComplexIFFT2DReal", input, input._shape, (eng, output) => { var r = eng.NativeComplexIFFT2DReal(c); r.AsSpan().CopyTo(output.AsWritableSpan()); }); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c = input; return scope.RecordCrossType<Complex<T>, T>(LazyNodeType.Custom, "NativeComplexIFFT2DReal", input, input._shape, (eng, output) => { var r = eng.NativeComplexIFFT2DReal(c); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("NativeComplexIFFT2DReal", input._shape); if (ac is not null) return ac.Execute(); }
 
         // Step 1: Transpose so columns are last axis
@@ -43481,7 +43481,7 @@ public partial class CpuEngine : ITensorLevelEngine
         for (int i = 0; i < axes.Length; i++)
             axesHash = axesHash * 31 + axes[i];
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c = input; var ca = axes; return scope.RecordCrossType<T, Complex<T>>(LazyNodeType.Custom, "NativeComplexFFTND", input, input._shape, (eng, output) => { var r = eng.NativeComplexFFTND(c, ca); r.AsSpan().CopyTo(output.AsWritableSpan()); }); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c = input; var ca = axes; return scope.RecordCrossType<T, Complex<T>>(LazyNodeType.Custom, "NativeComplexFFTND", input, input._shape, (eng, output) => { var r = eng.NativeComplexFFTND(c, ca); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }); } }
         { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexFFTND", input._shape, paramHash: axesHash); if (ac is not null) return ac.Execute(); }
 
         // Normalize negative axes and reject duplicates (matches NumPy/PyTorch behavior)
@@ -43519,7 +43519,7 @@ public partial class CpuEngine : ITensorLevelEngine
         for (int i = 0; i < axes.Length; i++)
             axesHash = axesHash * 31 + axes[i];
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c = input; var ca = axes; return scope.RecordCrossType<Complex<T>, T>(LazyNodeType.Custom, "NativeComplexIFFTNDReal", input, input._shape, (eng, output) => { var r = eng.NativeComplexIFFTNDReal(c, ca); r.AsSpan().CopyTo(output.AsWritableSpan()); }); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c = input; var ca = axes; return scope.RecordCrossType<Complex<T>, T>(LazyNodeType.Custom, "NativeComplexIFFTNDReal", input, input._shape, (eng, output) => { var r = eng.NativeComplexIFFTNDReal(c, ca); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("NativeComplexIFFTNDReal", input._shape, paramHash: axesHash); if (ac is not null) return ac.Execute(); }
 
         int rank = input.Rank;
@@ -43860,7 +43860,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (a.Length != b.Length)
             throw new ArgumentException($"Tensor lengths must match: {a.Length} vs {b.Length}");
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ca = a; var cb = b; return scope.RecordBinary(LazyNodeType.Custom, "NativeComplexAdd", a, b, a._shape, (eng, output) => { var r = eng.NativeComplexAdd(ca, cb); r.AsSpan().CopyTo(output.AsWritableSpan()); }, null); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ca = a; var cb = b; return scope.RecordBinary(LazyNodeType.Custom, "NativeComplexAdd", a, b, a._shape, (eng, output) => { var r = eng.NativeComplexAdd(ca, cb); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, null); } }
         { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexAdd", a._shape); if (ac is not null) return ac.Execute(); }
 
         var ops = MathHelper.GetNumericOperations<T>();
@@ -44098,7 +44098,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (logProbs.Rank != 3)
             throw new ArgumentException("logProbs must be 3D [T, N, C].");
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var clp = logProbs; var ct = targets; var cil = inputLengths; var ctl = targetLengths; var cb = blank; var outShape = new[] { logProbs._shape[1] }; return scope.RecordUnary(LazyNodeType.Custom, "CTCLoss", logProbs, outShape, (eng, output) => { var r = eng.TensorCTCLoss(clp, ct, cil, ctl, cb); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.CTCLossBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var clp = logProbs; var ct = targets; var cil = inputLengths; var ctl = targetLengths; var cb = blank; var outShape = new[] { logProbs._shape[1] }; return scope.RecordUnary(LazyNodeType.Custom, "CTCLoss", logProbs, outShape, (eng, output) => { var r = eng.TensorCTCLoss(clp, ct, cil, ctl, cb); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.CTCLossBackward); } }
 
         var ops = MathHelper.GetNumericOperations<T>();
         int maxT = logProbs._shape[0];
