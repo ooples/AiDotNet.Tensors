@@ -3503,6 +3503,24 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         }
     }
 
+    /// <summary>Synchronously overwrite an EXISTING buffer's contents in place (stable pointer, no
+    /// realloc). Used to refresh the persistent CUDA-graph input each step OUTSIDE capture so the
+    /// captured forward reads fresh data without a re-upload INSIDE capture (which is CUDA 906
+    /// STREAM_CAPTURE_UNSUPPORTED). Keeping the pointer stable preserves the captured graph's validity.</summary>
+    public unsafe void UploadBufferInPlace(float[] data, IGpuBuffer buffer)
+    {
+        if (data == null) throw new ArgumentNullException(nameof(data));
+        if (buffer == null) throw new ArgumentNullException(nameof(buffer));
+        if (data.Length > buffer.Size)
+            throw new ArgumentException($"Host data ({data.Length}) exceeds buffer ({buffer.Size}).");
+        using var _ = PushContext();
+        ulong byteSize = (ulong)data.Length * sizeof(float);
+        fixed (float* src = data)
+            CuBlasNative.CheckCudaResult(
+                CuBlasNative.cuMemcpyHtoD(buffer.Handle, (IntPtr)src, byteSize),
+                "cuMemcpyHtoD(graph input refresh in-place)");
+    }
+
     /// <inheritdoc/>
     public unsafe void UploadBufferAsync(ReadOnlySpan<float> data, IGpuBuffer buffer, IGpuStream stream)
     {
