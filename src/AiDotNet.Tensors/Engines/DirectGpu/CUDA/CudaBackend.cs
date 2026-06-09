@@ -34,6 +34,14 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     // cuCtxCreate, removed immediately before cuCtxDestroy.
     internal static readonly ConcurrentDictionary<IntPtr, byte> LiveContexts = new();
 
+    // Serializes a buffer's native free against its context's destruction. The LiveContexts check
+    // alone is a TOCTOU race: a GC-thread buffer finalizer can observe its context as live, then a
+    // concurrent engine Dispose removes + cuCtxDestroys it, and the finalizer's cuCtxPushCurrent /
+    // cuMemFree then hit the just-freed context → uncatchable 0xC0000005. Holding this lock across
+    // {check-live + free} on the finalizer side and {remove + cuCtxDestroy} on the dispose side makes
+    // the two mutually exclusive: a buffer either frees before the destroy or is skipped after it.
+    internal static readonly object ContextLifecycleLock = new();
+
     private const int DefaultBlockSize = 256;
     private const int MaxRnnBlockSize = 1024;
     private readonly ConcurrentDictionary<string, IntPtr> _kernelCache;
@@ -3939,6 +3947,52 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         args[2] = &r;
         args[3] = &c;
         LaunchKernel2D(kernel, gridX, gridY, DefaultBlockSize, 1, args);
+    }
+
+    // CUDA's "current context" is PER-THREAD: cuCtxCreate makes the context current only on the
+    // CREATING thread. This backend otherwise never re-establishes it, so every native call assumes
+    // it runs on that thread. Under xUnit's parallel / thread-pooled test execution (and any caller
+    // that drives a GPU op from a different thread than the one that built the engine), the executing
+    // thread may have NO context — or a DIFFERENT engine's context — current, so cuLaunchKernel /
+    // cuMemcpy / cuMemAlloc operate on the wrong context and fault with an uncatchable 0xC0000005.
+    // Re-assert this engine's context on the calling thread before native work. cuCtxSetCurrent is a
+    // cheap per-thread driver call (no cross-thread effect); skipped once the context is torn down.
+    internal void EnsureContextCurrent()
+    {
+        IntPtr ctx = _cudaContext;
+        if (ctx != IntPtr.Zero && !IsRuntimeTearingDown && LiveContexts.ContainsKey(ctx))
+            CudaNativeBindings.cuCtxSetCurrent(ctx);
+        DrainPendingFinalizerFrees();
+    }
+
+    // Device frees DEFERRED from buffer FINALIZERS. Calling the CUDA driver (cuCtxPushCurrent /
+    // cuMemFree) from the GC finalizer thread races with op threads' driver entry and faults with an
+    // uncatchable 0xC0000005 under the heavy GC the full test suite produces (DirectGpu-only, with low
+    // GC, never crashes). Instead the finalizer just enqueues the pointer, and the free runs here on a
+    // real op thread (with this engine's context current) at the next GPU op. A pending entry whose
+    // context was meanwhile destroyed is dropped — cuCtxDestroy already reclaimed that memory.
+    internal static readonly ConcurrentQueue<(IntPtr Ptr, IntPtr Ctx, IntPtr Stream)> PendingFinalizerFrees = new();
+
+    internal static void DrainPendingFinalizerFrees()
+    {
+        while (PendingFinalizerFrees.TryDequeue(out var f))
+        {
+            if (f.Ptr == IntPtr.Zero) continue;
+            lock (ContextLifecycleLock)
+            {
+                if (f.Ctx == IntPtr.Zero || IsRuntimeTearingDown || ProcessExiting
+                    || !LiveContexts.ContainsKey(f.Ctx))
+                    continue; // context gone — its device memory was reclaimed by cuCtxDestroy
+                try
+                {
+                    CuBlasNative.cuCtxPushCurrent(f.Ctx);
+                    if (f.Stream != IntPtr.Zero) CuBlasNative.cuMemFreeAsync(f.Ptr, f.Stream);
+                    else CuBlasNative.cuMemFree(f.Ptr);
+                    CuBlasNative.cuCtxPopCurrent(out _);
+                }
+                catch { }
+            }
+        }
     }
 
     private unsafe void LaunchKernel(IntPtr kernel, uint gridX, uint blockX, void** args)
@@ -13671,11 +13725,16 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
         if (_cudaContext != IntPtr.Zero)
         {
-            // Unregister BEFORE destroy so any buffer finalized after this point skips its native
-            // free (its memory is reclaimed by cuCtxDestroy below) instead of faulting on a dead context.
-            LiveContexts.TryRemove(_cudaContext, out _);
-            CuBlasNative.cuCtxDestroy(_cudaContext);
-            _cudaContext = IntPtr.Zero;
+            // Unregister + destroy under the lifecycle lock so a concurrent buffer finalizer can't
+            // observe the context as live and then fault on it after we destroy it (TOCTOU). A buffer
+            // finalized after this point sees it gone and skips its native free (cuCtxDestroy reclaims
+            // that memory anyway).
+            lock (ContextLifecycleLock)
+            {
+                LiveContexts.TryRemove(_cudaContext, out _);
+                CuBlasNative.cuCtxDestroy(_cudaContext);
+                _cudaContext = IntPtr.Zero;
+            }
         }
 
         GC.SuppressFinalize(this);
@@ -14447,21 +14506,26 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                 // Skip the native free at process exit (the driver is gone — any native CUDA
                 // call FATAL-crashes, uncatchable); otherwise free, suppressing any disposal
                 // error so a finalizer can't crash.
-                if (_context != IntPtr.Zero && !ProcessExiting && LiveContexts.ContainsKey(_context))
+                // Hold the lifecycle lock across the live-check + free so a concurrent engine Dispose
+                // can't cuCtxDestroy this context between the check and the cuCtxPushCurrent/free.
+                lock (ContextLifecycleLock)
                 {
-                    try
+                    if (_context != IntPtr.Zero && !ProcessExiting && LiveContexts.ContainsKey(_context))
                     {
-                        CuBlasNative.cuCtxPushCurrent(_context);
-                        // Stream-ordered free (#558 layer 6): race-safe + pool-reused in stream order.
-                        if (_asyncFreeStream != IntPtr.Zero)
-                            CuBlasNative.cuMemFreeAsync(_devicePtr, _asyncFreeStream);
-                        else
-                            CuBlasNative.cuMemFree(_devicePtr);
-                        CuBlasNative.cuCtxPopCurrent(out _);
-                    }
-                    catch
-                    {
-                        // Suppress disposal errors to avoid crashing finalizers.
+                        try
+                        {
+                            CuBlasNative.cuCtxPushCurrent(_context);
+                            // Stream-ordered free (#558 layer 6): race-safe + pool-reused in stream order.
+                            if (_asyncFreeStream != IntPtr.Zero)
+                                CuBlasNative.cuMemFreeAsync(_devicePtr, _asyncFreeStream);
+                            else
+                                CuBlasNative.cuMemFree(_devicePtr);
+                            CuBlasNative.cuCtxPopCurrent(out _);
+                        }
+                        catch
+                        {
+                            // Suppress disposal errors to avoid crashing finalizers.
+                        }
                     }
                 }
             }
@@ -14495,7 +14559,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
         ~CudaGpuBuffer()
         {
-            Release();
+            // NEVER call the CUDA driver on the GC finalizer thread (races with op threads →
+            // 0xC0000005). Defer the device free to a real op thread via the pending-free queue.
+            var ptr = _devicePtr;
+            if (ptr != IntPtr.Zero && !IsRuntimeTearingDown && !ProcessExiting)
+                PendingFinalizerFrees.Enqueue((ptr, _context, _asyncFreeStream));
+            _devicePtr = IntPtr.Zero;
+            _context = IntPtr.Zero;
         }
     }
 
@@ -14531,21 +14601,26 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                 // Skip the native free at process exit (the driver is gone — any native CUDA
                 // call FATAL-crashes, uncatchable); otherwise free, suppressing any disposal
                 // error so a finalizer can't crash.
-                if (_context != IntPtr.Zero && !ProcessExiting && LiveContexts.ContainsKey(_context))
+                // Hold the lifecycle lock across the live-check + free so a concurrent engine Dispose
+                // can't cuCtxDestroy this context between the check and the cuCtxPushCurrent/free.
+                lock (ContextLifecycleLock)
                 {
-                    try
+                    if (_context != IntPtr.Zero && !ProcessExiting && LiveContexts.ContainsKey(_context))
                     {
-                        CuBlasNative.cuCtxPushCurrent(_context);
-                        // Stream-ordered free (#558 layer 6): race-safe + pool-reused in stream order.
-                        if (_asyncFreeStream != IntPtr.Zero)
-                            CuBlasNative.cuMemFreeAsync(_devicePtr, _asyncFreeStream);
-                        else
-                            CuBlasNative.cuMemFree(_devicePtr);
-                        CuBlasNative.cuCtxPopCurrent(out _);
-                    }
-                    catch
-                    {
-                        // Suppress disposal errors to avoid crashing finalizers.
+                        try
+                        {
+                            CuBlasNative.cuCtxPushCurrent(_context);
+                            // Stream-ordered free (#558 layer 6): race-safe + pool-reused in stream order.
+                            if (_asyncFreeStream != IntPtr.Zero)
+                                CuBlasNative.cuMemFreeAsync(_devicePtr, _asyncFreeStream);
+                            else
+                                CuBlasNative.cuMemFree(_devicePtr);
+                            CuBlasNative.cuCtxPopCurrent(out _);
+                        }
+                        catch
+                        {
+                            // Suppress disposal errors to avoid crashing finalizers.
+                        }
                     }
                 }
             }
@@ -14557,7 +14632,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
         ~CudaGpuByteBuffer()
         {
-            Dispose();
+            // NEVER call the CUDA driver on the GC finalizer thread — defer the device free to a real
+            // op thread via the pending-free queue (see CudaBackend.PendingFinalizerFrees).
+            var ptr = _devicePtr;
+            if (ptr != IntPtr.Zero && !IsRuntimeTearingDown && !ProcessExiting)
+                PendingFinalizerFrees.Enqueue((ptr, _context, _asyncFreeStream));
+            _devicePtr = IntPtr.Zero;
+            _context = IntPtr.Zero;
         }
     }
 }
