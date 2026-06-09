@@ -3130,7 +3130,15 @@ public partial class CpuEngine : ITensorLevelEngine
                 var capturedB = b;
                 var broadcastShape = ComputeBroadcastShape(a._shape, b._shape);
                 return scope.RecordBinary(LazyNodeType.BroadcastAdd, "TensorBroadcastAdd", a, b, broadcastShape,
-                    (eng, output) => { var eager = eng.TensorBroadcastAdd(capturedA, capturedB); DirectGpuTensorEngine.CopyResultInto(eng, eager, output); },
+                    (eng, output) =>
+                    {
+                        // GPU-resident trailing-broadcast add into output's stable buffer (no host fallback that
+                        // breaks CUDA-graph capture); else the eager allocating path.
+                        if (eng is DirectGpuTensorEngine baGpu && baGpu.TryBroadcastAddResidentInto(output, capturedA, capturedB))
+                            return;
+                        var eager = eng.TensorBroadcastAdd(capturedA, capturedB);
+                        DirectGpuTensorEngine.CopyResultInto(eng, eager, output);
+                    },
                     BackwardFunctions<T>.BroadcastAddBackward);
             }
         }
@@ -21493,6 +21501,15 @@ public partial class CpuEngine : ITensorLevelEngine
                     new[] { input, gamma, beta }, eagerResult._shape,
                     (eng, output) =>
                     {
+                        // GPU-resident compiled-step path: normalize into output's stable buffer + stable mean/var
+                        // scratch (no fresh alloc that aborts CUDA-graph capture). Falls back to the eager path.
+                        if (eng is DirectGpuTensorEngine lnGpu
+                            && lnGpu.TryLayerNormResidentInto(output, ci, cg, cb, ce, out var rMean, out var rVar))
+                        {
+                            stateRef.Mean = rMean!;
+                            stateRef.Variance = rVar!;
+                            return;
+                        }
                         var r = eng.LayerNorm(ci, cg, cb, ce, out var freshMean, out var freshVar);
                         DirectGpuTensorEngine.CopyResultInto(eng, r, output);
                         // Hand the correctly-shaped realize-time stats to backward

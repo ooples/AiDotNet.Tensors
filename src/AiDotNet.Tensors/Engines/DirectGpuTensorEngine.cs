@@ -1780,6 +1780,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// prior host-copy when not on GPU / not in a suspended-eviction step / src isn't resident — so CPU + eager
     /// behavior is byte-identical. A deferred materializer keeps host reads of dest correct.
     /// </summary>
+    // Diagnostic: the OpName of the compiled forward action currently executing (set by the generic forward
+    // action in CompiledTrainingPlan), so a "src not resident" log names the PRODUCER op.
+    [System.ThreadStatic] internal static string? s_currentForwardOp;
+
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, int> s_aliasDiag = new();
     private static void AliasDiag(string reason)
     {
@@ -1830,7 +1834,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             bool capturing = backend is Engines.DirectGpu.CUDA.CudaBackend cbk && cbk.IsStreamCapturing();
             bool hasBuf = src._gpuBuffer is not null;
             bool verMatch = hasBuf && src._gpuBufferVersion == src.Version;
-            AliasDiag($"skip: src not resident shape=[{string.Join(",", src._shape)}] hasBuf={hasBuf} verMatch={verMatch} bkndMatch={hasBuf && ReferenceEquals(src._gpuBackend, backend)} capturing={capturing}");
+            AliasDiag($"skip: src not resident producerOp={s_currentForwardOp} shape=[{string.Join(",", src._shape)}] hasBuf={hasBuf} capturing={capturing}");
             return false;
         }
 
@@ -2655,6 +2659,95 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var conv = DirectGpuEngine.FromFloatArray<T>(f);
             System.Array.Copy(conv, (T[])a, System.Math.Min(conv.Length, ((T[])a).Length));
         });
+    }
+
+    // Stable per-LayerNorm mean/variance scratch buffers (keyed by the LN output's backing array), allocated
+    // once so capture/replay don't cuMemAlloc them. The backward reads these (resident) via the state ref.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<object, (IGpuBuffer mean, IGpuBuffer var)> _lnStatsScratch = new();
+
+    /// <summary>GPU-RESIDENT LayerNorm for the compiled step: normalize into the destination's stable buffer and
+    /// compute mean/var into stable scratch — no fresh AllocateOutputBuffer (which cuMemAllocs → aborts capture →
+    /// falls to host → breaks the residency chain). Returns false to fall back to the eager allocating path.</summary>
+    internal bool TryLayerNormResidentInto<T>(Tensor<T> output, Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T>? mean, out Tensor<T>? variance)
+    {
+        mean = null; variance = null;
+        if (!EvictionSuspended || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
+        if (!TryGetBackend(out var backend) || input.Rank < 2) return false;
+        var arr = output.DataVector.GetBackingArrayUnsafe();
+        if (arr is null) return false;
+        try
+        {
+            // LayerNorm normalizes over the LAST dimension (gamma/beta length); outerSize = all the leading
+            // positions. The legacy GPU path used dims[0] which is only correct for a rank-2 [B*S, D] input —
+            // wrong for the cortex's rank-3 [B, S, D] (it would normalize over S*D and corrupt the result).
+            int normSize = gamma.Length > 0 ? gamma.Length : input.Shape._dims[input.Rank - 1];
+            int outerSize = input.Length / normSize;
+            using var bufIn = GetOrAllocateContiguousInputBuffer(backend, input);
+            using var bufGamma = GetOrCacheWeightBuffer(backend, gamma.GetDataArray(), PersistentTensorRole.Weights);
+            using var bufBeta = GetOrCacheWeightBuffer(backend, beta.GetDataArray(), PersistentTensorRole.Biases);
+            var outBuf = GetOrCreateResidentBuffer(backend, output, input.Length);
+            if (!_lnStatsScratch.TryGetValue(arr, out var stats))
+            {
+                stats = (backend.AllocateBuffer(outerSize), backend.AllocateBuffer(outerSize));
+                _lnStatsScratch[arr] = stats;
+            }
+            backend.LayerNorm(bufIn.Buffer, outBuf, bufGamma.Buffer, bufBeta.Buffer, stats.mean, stats.var, outerSize, normSize, (float)epsilon);
+            BindResidentBuffer(output, outBuf, backend);
+            var meanT = new Tensor<T>(new T[outerSize], new[] { outerSize });
+            var varT = new Tensor<T>(new T[outerSize], new[] { outerSize });
+            BindResidentBuffer(meanT, stats.mean, backend);
+            BindResidentBuffer(varT, stats.var, backend);
+            mean = meanT; variance = varT;
+            return true;
+        }
+        catch (Exception lex) { AliasDiag($"LN-resident FELLBACK in=[{string.Join(",", input._shape)}] inContig={input.IsContiguous}: {lex.GetType().Name}: {lex.Message}"); return false; }
+    }
+
+    private static bool IsTrailingBroadcast(int[] fullShape, int[] biasShape)
+    {
+        // Strip leading 1s from the bias (numpy/torch broadcast: leading singleton dims broadcast over the
+        // full tensor's leading dims, e.g. positional [1,S,D] over [B,S,D]). The remaining bias dims must match
+        // the full tensor's trailing dims exactly — then bias-flattened is the per-leading-row vector BiasAdd wants.
+        int bstart = 0;
+        while (bstart < biasShape.Length && biasShape[bstart] == 1) bstart++;
+        int effLen = biasShape.Length - bstart;
+        if (effLen > fullShape.Length) return false;
+        int off = fullShape.Length - effLen;
+        for (int i = 0; i < effLen; i++)
+            if (biasShape[bstart + i] != fullShape[off + i]) return false;
+        return true;
+    }
+
+    /// <summary>GPU-RESIDENT broadcast-add for the compiled step (the common trailing-broadcast case, e.g. the
+    /// positional-embedding add [B,S,D] + [S,D], or a bias [D]): maps to backend.BiasAdd(full[M,N] + bias[N])
+    /// into the destination's stable buffer — no fresh alloc / no host fallback that breaks CUDA-graph capture.</summary>
+    internal bool TryBroadcastAddResidentInto<T>(Tensor<T> output, Tensor<T> a, Tensor<T> b)
+    {
+        if (!EvictionSuspended || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
+        if (!TryGetBackend(out var backend)) return false;
+        Tensor<T> full, bias;
+        if (a.Length == output.Length && b.Length > 0 && b.Length < a.Length) { full = a; bias = b; }
+        else if (b.Length == output.Length && a.Length > 0 && a.Length < b.Length) { full = b; bias = a; }
+        else { AliasDiag($"BA-skip operands a=[{string.Join(",", a._shape)}] b=[{string.Join(",", b._shape)}] out=[{string.Join(",", output._shape)}]"); return false; }
+        if (full.Length % bias.Length != 0 || !IsTrailingBroadcast(full._shape, bias._shape))
+        { AliasDiag($"BA-skip not-trailing full=[{string.Join(",", full._shape)}] bias=[{string.Join(",", bias._shape)}]"); return false; }
+        if (!full.IsContiguous || !bias.IsContiguous) { AliasDiag($"BA-skip noncontig full={full.IsContiguous} bias={bias.IsContiguous}"); return false; }
+        int N = bias.Length;
+        int M = full.Length / N;
+        try
+        {
+            using var bufFull = GetOrAllocateContiguousInputBuffer(backend, full);
+            // The broadcast operand (positional embedding / bias vector) is a stable PARAMETER, not an
+            // activation — resolve it through the PERSISTENT weight cache (uploaded once, kept fresh by the
+            // optimizer) so capture/replay don't re-upload it (the transient GetOrAllocateBuffer path would
+            // cuMemcpyHtoD every step → aborts the CUDA-graph capture).
+            using var bufBias = GetOrCacheWeightBuffer(backend, bias.GetDataArray(), PersistentTensorRole.Biases);
+            var outBuf = GetOrCreateResidentBuffer(backend, output, full.Length);
+            backend.BiasAdd(bufFull.Buffer, bufBias.Buffer, outBuf, M, N);
+            BindResidentBuffer(output, outBuf, backend);
+            return true;
+        }
+        catch (Exception bex) { AliasDiag($"BA-resident FELLBACK full=[{string.Join(",", full._shape)}] bias=[{string.Join(",", bias._shape)}]: {bex.GetType().Name}: {bex.Message}"); return false; }
     }
 
     private bool TryRunBinaryInto<T>(
