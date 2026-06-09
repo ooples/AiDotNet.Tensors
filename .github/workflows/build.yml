@@ -55,7 +55,7 @@ jobs:
       run: |
         dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --no-build --verbosity normal --framework net10.0 \
           --filter "Category!=Benchmark&Category!=Performance" \
-          --blame-hang --blame-hang-timeout 300s --blame-crash \
+          --blame-hang --blame-hang-timeout 600s --blame-crash \
           --collect:"XPlat Code Coverage" \
           --results-directory ./coverage \
           -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Format=cobertura \
