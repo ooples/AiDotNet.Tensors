@@ -24,6 +24,16 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     // the whole process. The OS reclaims device memory + the context at exit anyway.
     private static bool IsRuntimeTearingDown => RuntimeShutdown.IsTearingDown;
 
+    // Live CUDA contexts. A device-buffer finalizer must NOT free against a context that has already
+    // been destroyed — under per-test engine teardown (each test builds its own CudaBackend/context),
+    // a buffer that escapes explicit Dispose is GC-finalized LATER and would call cuCtxPushCurrent /
+    // cuMemFree on a dead context, raising an uncatchable, finalizer-fatal 0xC0000005 that kills the
+    // whole process (the documented "no suite crash" hazard — IsRuntimeTearingDown only covers PROCESS
+    // exit, not per-test context destruction). cuCtxDestroy already reclaimed that buffer's memory, so
+    // the finalizer skips the native free when its context is no longer registered here. Added at
+    // cuCtxCreate, removed immediately before cuCtxDestroy.
+    internal static readonly ConcurrentDictionary<IntPtr, byte> LiveContexts = new();
+
     private const int DefaultBlockSize = 256;
     private const int MaxRnnBlockSize = 1024;
     private readonly ConcurrentDictionary<string, IntPtr> _kernelCache;
@@ -271,6 +281,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             MaxBufferAllocBytes = (long)totalMem;
 
             CuBlasNative.CheckCudaResult(CuBlasNative.cuCtxCreate(out _cudaContext, 0, device), "cuCtxCreate");
+            LiveContexts[_cudaContext] = 0; // register: a buffer finalizer may only free against a live context
             CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamCreate(out _stream, 0), "cuStreamCreate");
             _defaultStream = new CudaStream(this, _stream, GpuStreamType.Default, ownsHandle: false);
 
@@ -13660,6 +13671,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
         if (_cudaContext != IntPtr.Zero)
         {
+            // Unregister BEFORE destroy so any buffer finalized after this point skips its native
+            // free (its memory is reclaimed by cuCtxDestroy below) instead of faulting on a dead context.
+            LiveContexts.TryRemove(_cudaContext, out _);
             CuBlasNative.cuCtxDestroy(_cudaContext);
             _cudaContext = IntPtr.Zero;
         }
@@ -14433,7 +14447,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                 // Skip the native free at process exit (the driver is gone — any native CUDA
                 // call FATAL-crashes, uncatchable); otherwise free, suppressing any disposal
                 // error so a finalizer can't crash.
-                if (_context != IntPtr.Zero && !ProcessExiting)
+                if (_context != IntPtr.Zero && !ProcessExiting && LiveContexts.ContainsKey(_context))
                 {
                     try
                     {
@@ -14517,7 +14531,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                 // Skip the native free at process exit (the driver is gone — any native CUDA
                 // call FATAL-crashes, uncatchable); otherwise free, suppressing any disposal
                 // error so a finalizer can't crash.
-                if (_context != IntPtr.Zero && !ProcessExiting)
+                if (_context != IntPtr.Zero && !ProcessExiting && LiveContexts.ContainsKey(_context))
                 {
                     try
                     {
