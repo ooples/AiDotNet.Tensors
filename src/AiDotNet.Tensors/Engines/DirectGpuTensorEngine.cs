@@ -435,7 +435,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         // No deferred scope - use regular backend
         backend = _directGpu?.Backend!;
-        return IsGpuAvailable && backend != null;
+        bool available = IsGpuAvailable && backend != null;
+        if (available)
+        {
+            // CUDA's current context is PER-THREAD and set only on the engine's creating thread.
+            // This is the common entry point for ~every GPU op, so re-assert the context here so an
+            // op driven from a different thread (parallel test execution, thread-pool continuation)
+            // doesn't launch kernels / copy memory against the wrong (or no) context — the cause of
+            // the intermittent concurrent-GPU 0xC0000005. No-op when already current.
+            (backend as DirectGpu.CUDA.CudaBackend)?.EnsureContextCurrent();
+        }
+        return available;
     }
 
     /// <summary>

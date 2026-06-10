@@ -109,6 +109,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private readonly CompiledStep<T>[]? _forwardSteps;
     private readonly int[]? _compiledInputShape;
     private readonly Tensor<T>? _compiledInputTensor;
+    // Per-step buffer the CUDA-graph replay refreshes in place. Equals _compiledInputTensor for ordinary
+    // plans, but for an embedding-first (token-LM) plan it is the embedding's OUTPUT — see RefreshGraphInputInPlace.
+    private readonly Tensor<T>? _graphRefreshTensor;
 
     private CompiledTrainingPlan(
         Action<IEngine>[] forwardActions,
@@ -125,6 +128,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         CompiledStep<T>[]? forwardSteps = null,
         int[]? compiledInputShape = null,
         Tensor<T>? compiledInputTensor = null,
+        Tensor<T>? graphRefreshTensor = null,
         int[]? fusedStepIndices = null,
         Action<IEngine>[]? fusedForwardActions = null,
         bool graphStepEligible = false)
@@ -149,6 +153,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             && _forwardSteps[0].OpType == OpType.Embedding;
         _compiledInputShape = compiledInputShape;
         _compiledInputTensor = compiledInputTensor;
+        // Fall back to the compiled input when no distinct refresh tensor was supplied (non-graph / non-embedding).
+        _graphRefreshTensor = graphRefreshTensor ?? compiledInputTensor;
         _fusedStepIndices = fusedStepIndices;
         _fusedForwardActions = fusedForwardActions;
         _lossGradDest = lossGradDest;
@@ -532,7 +538,18 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     if (_graphHasEmbedding) gte.EmbeddingIndexExternallyManaged = true;
                     var exec = cb.CaptureGraph(() => RunGpuStepBodyForCapture(cb));
                     if (_graphHasEmbedding) gte.EmbeddingIndexExternallyManaged = false;
-                    if (exec == IntPtr.Zero) { _graphStepDisabled = true; return StepEager(); }
+                    if (exec == IntPtr.Zero)
+                    {
+                        // Capture failed → the graph is permanently abandoned for this plan. Resume the
+                        // eviction suspension we took above right now: StepEager doesn't need stable device
+                        // pointers, and leaving it suspended for the plan's whole lifetime pins every offload
+                        // buffer non-evictable, silently defeating AIDOTNET_GPU_OFFLOAD and risking OOM. The
+                        // _graphEvictionSuspended flag also gates Dispose, so clearing it prevents a double-resume.
+                        _graphStepDisabled = true;
+                        gte.ResumeActivationEviction();
+                        _graphEvictionSuspended = false;
+                        return StepEager();
+                    }
                     _stepGraphExec = exec;
                     cb.LaunchCapturedGraph(exec);   // executes THIS step on the just-uploaded indices
                     // The optimizer update is run eagerly (NOT captured): its closure
@@ -573,6 +590,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// host tensor). No-op until the input has a resident buffer (the pre-residency pass allocates it).</summary>
     private void RefreshGraphInputInPlace(Engines.DirectGpu.CUDA.CudaBackend cb)
     {
+        // In-graph embedding design: for an embedding-first plan there is NO float input to refresh (the gather
+        // happens on-device inside the captured graph; only the small index buffer is refreshed, via
+        // RefreshGraphEmbeddingIndicesNow). _compiledInputTensor is null for those plans → no-op here.
         if (_compiledInputTensor is not { } inT) return;
         if (inT._gpuBuffer is not { } buf || !ReferenceEquals(inT._gpuBackend, cb)) return;
         var data = inT.GetDataArray();                 // host backing (T==float on the graph path)
@@ -2558,6 +2578,13 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             : (forwardSteps.Count > 0 && forwardSteps[0].Inputs.Length > 0 ? forwardSteps[0].Inputs[0] : null);
         int[] compiledInputShape = compiledInputTensor is not null
             ? (int[])compiledInputTensor._shape.Clone() : Array.Empty<int>();
+        // SEPARATE tensor for CUDA-graph replay refresh: for a token-LM whose first step is the EMBEDDING
+        // (a host int→float gather the captured graph cannot re-run), the graph's true per-step input is
+        // the embedding's OUTPUT — refreshed each step via RunEagerForwardPrefix + RefreshGraphInputInPlace.
+        // For every other plan it is just the compiled input, so non-embedding behavior is unchanged.
+        Tensor<T>? graphRefreshTensor = firstIsEmbedding
+            ? forwardSteps[0].OutputBuffer
+            : compiledInputTensor;
 
         return new CompiledTrainingPlan<T>(
             forwardActions,
@@ -2574,6 +2601,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             forwardSteps.ToArray(),
             compiledInputShape,
             compiledInputTensor,
+            graphRefreshTensor,
             fusedStepIndices.Count > 0 ? fusedStepIndices.ToArray() : null,
             fusedForwardActions.Count > 0 ? fusedForwardActions.ToArray() : null,
             graphStepEligible);
