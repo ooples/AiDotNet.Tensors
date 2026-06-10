@@ -163,6 +163,10 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
     /// <summary>
     /// Allocates a GPU buffer with the specified element count.
     /// </summary>
+    /// <inheritdoc/>
+    public void UploadIntBufferInPlace(int[] data, IGpuBuffer buffer)
+        => throw new NotSupportedException("UploadIntBufferInPlace is not supported by the WebGPU backend.");
+
     /// <param name="elementCount">Number of float elements.</param>
     /// <returns>A new GPU buffer.</returns>
     public IGpuBuffer AllocateBuffer(int elementCount)

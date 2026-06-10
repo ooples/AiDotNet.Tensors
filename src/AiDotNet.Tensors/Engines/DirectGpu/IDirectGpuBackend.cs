@@ -1367,6 +1367,10 @@ public interface IDirectGpuBackend : IDisposable
     IGpuBuffer AllocateIntBuffer(int size);
     IGpuBuffer AllocateIntBuffer(int[] data);
 
+    /// <summary>In-place int upload (no allocation) — refreshes a stable embedding-index buffer each step.
+    /// Only the CUDA graph-capture cortex path needs it; other backends may throw NotSupported.</summary>
+    void UploadIntBufferInPlace(int[] data, IGpuBuffer buffer);
+
     #endregion
 
     #region Dot Product Operations
