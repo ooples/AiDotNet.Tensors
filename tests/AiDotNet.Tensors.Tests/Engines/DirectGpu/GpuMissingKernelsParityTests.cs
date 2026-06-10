@@ -756,6 +756,25 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
     }
 
     [Fact]
+    public void Resample_GpuMatchesCpu()
+    {
+        if (!EnsureGpuReady()) return;
+        var wave = Rand(370, 64);
+        AssertMatch(_gpu.Resample(wave, 4, 8), _cpu.Resample(wave, 4, 8), "Resample-up2x");
+        AssertMatch(_gpu.Resample(wave, 8, 4), _cpu.Resample(wave, 8, 4), "Resample-down2x");
+    }
+
+    [Fact]
+    public void PitchShift_GpuMatchesCpu()
+    {
+        if (!EnsureGpuReady()) return;
+        // nSteps must keep TimeStretch's outFrames <= nFft or the CPU ISTFT indexes out of bounds
+        // (pitchrate~2 overflows). 3 semitones -> pitchrate~1.19, outFrames floor(9/0.84)=10 <= 16.
+        var wave = Rand(371, 256);
+        AssertMatch(_gpu.PitchShift(wave, 16000, 3.0, 16, 4), _cpu.PitchShift(wave, 16000, 3.0, 16, 4), "PitchShift");
+    }
+
+    [Fact]
     public void TimeStretch_GpuMatchesCpu()
     {
         if (!EnsureGpuReady()) return;
