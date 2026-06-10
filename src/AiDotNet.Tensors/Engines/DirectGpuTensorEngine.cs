@@ -1843,14 +1843,33 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         else
         {
             var srcArr = src.DataVector.GetBackingArrayUnsafe();
-            lock (_activationCacheLock)
+            // Persistent weight cache first — a reshape/view of a PARAMETER (e.g. positional embedding) has the
+            // param resident in _persistentBufferCache (uploaded once by the optimizer / an earlier op) but NOT in
+            // the activation cache; without this the alias declines and host-copies, dropping the param's reshape
+            // off the residency chain.
+            if (srcArr is not null) { var pc = TryGetCachedBuffer(srcArr); if (pc != null) srcBuf = pc; }
+            if (srcBuf is null)
+                lock (_activationCacheLock)
+                {
+                    if (srcArr is not null && _activationCache.TryGetValue(srcArr, out var e1)
+                        && ReferenceEquals(e1.Backend, backend) && !e1.IsFp16)
+                        srcBuf = e1.Buffer;
+                    else if (_activationCache.TryGetValue(src.DataVector, out var e2)
+                        && ReferenceEquals(e2.Backend, backend) && !e2.IsFp16)
+                        srcBuf = e2.Buffer;
+                }
+        }
+        // Last resort: a non-resident CONTIGUOUS src with a real host backing array and NO pending deferred
+        // download is a stable host CONSTANT/parameter (e.g. a sinusoidal positional encoding, or a param not yet
+        // touched by a GPU op) — upload it ONCE to the persistent cache and alias to that. Guard on no-pending so we
+        // never fire a materializer (a DtoH that 900s) for a real activation that merely hasn't been bound yet.
+        if (srcBuf is null)
+        {
+            var cArr = src.DataVector.GetBackingArrayUnsafe();
+            if (cArr is not null && src.IsContiguous && !Helpers.DeferredArrayMaterializer.IsPending(cArr))
             {
-                if (srcArr is not null && _activationCache.TryGetValue(srcArr, out var e1)
-                    && ReferenceEquals(e1.Backend, backend) && !e1.IsFp16)
-                    srcBuf = e1.Buffer;
-                else if (_activationCache.TryGetValue(src.DataVector, out var e2)
-                    && ReferenceEquals(e2.Backend, backend) && !e2.IsFp16)
-                    srcBuf = e2.Buffer;
+                try { srcBuf = GetOrCacheWeightBuffer(backend, src.GetDataArray(), PersistentTensorRole.Weights).Buffer; }
+                catch { srcBuf = null; }
             }
         }
         if (srcBuf is null)
