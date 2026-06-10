@@ -811,6 +811,26 @@ public partial class DirectGpuTensorEngine
     }
 
     /// <inheritdoc/>
+    public override Tensor<T> TensorPDist<T>(Tensor<T> input, double p = 2.0)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (typeof(T) != typeof(float) || input.Rank != 2 || input._shape[0] < 2 || !TryGetBackend(out var backend))
+            return base.TensorPDist(input, p);
+        try
+        {
+            var c = input.IsContiguous ? input : (Tensor<T>)input.Contiguous();
+            int n = input._shape[0], d = input._shape[1];
+            int outN = n * (n - 1) / 2;
+            using var bufIn = GetOrAllocateBuffer(backend, c.GetDataArray());
+            var bufOut = AllocateOutputBuffer(backend, outN);
+            backend.PDist(bufIn.Buffer, bufOut.Buffer, n, d, (float)p);
+            var arr = FinishGpuOp<T>(backend, bufOut, outN);
+            return new Tensor<T>(arr, new[] { outN });
+        }
+        catch (Exception) { return base.TensorPDist(input, p); }
+    }
+
+    /// <inheritdoc/>
     public override Tensor<T> TensorCDist<T>(Tensor<T> x1, Tensor<T> x2, double p = 2.0)
     {
         if (x1 is null) throw new ArgumentNullException(nameof(x1));

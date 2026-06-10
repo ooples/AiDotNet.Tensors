@@ -522,6 +522,17 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
     }
 
     [Theory]
+    [InlineData(5, 3, 2.0)]
+    [InlineData(8, 4, 1.0)]
+    [InlineData(4, 6, 3.0)]
+    public void TensorPDist_GpuMatchesCpu(int n, int d, double p)
+    {
+        if (!EnsureGpuReady()) return;
+        var x = Rand(204, n, d);
+        AssertMatch(_gpu.TensorPDist(x, p), _cpu.TensorPDist(x, p), $"PDist[{n}x{d};p={p}]");
+    }
+
+    [Theory]
     [InlineData(4, 5, 3, 2.0)]
     [InlineData(6, 6, 8, 1.0)]
     [InlineData(3, 7, 4, 3.0)]

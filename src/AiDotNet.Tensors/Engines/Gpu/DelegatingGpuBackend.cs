@@ -1446,6 +1446,8 @@ public class DelegatingGpuBackend : IDirectGpuBackend
     public virtual void IndexWrite(IGpuBuffer output, IGpuBuffer indices, IGpuBuffer source, float fillValue, int mode, int outerSize, int idxAxis, int innerSize, int dstAxis) => Inner.IndexWrite(output, indices, source, fillValue, mode, outerSize, idxAxis, innerSize, dstAxis);
     /// <inheritdoc/>
     public virtual void CDist(IGpuBuffer x1, IGpuBuffer x2, IGpuBuffer output, int m, int n, int d, float p) => Inner.CDist(x1, x2, output, m, n, d, p);
+    /// <inheritdoc/>
+    public virtual void PDist(IGpuBuffer input, IGpuBuffer output, int n, int d, float p) => Inner.PDist(input, output, n, d, p);
 
     /// <inheritdoc/>
     public virtual void Where(IGpuBuffer condition, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)

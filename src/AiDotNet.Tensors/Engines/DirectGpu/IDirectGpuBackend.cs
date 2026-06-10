@@ -1939,6 +1939,12 @@ public interface IDirectGpuBackend : IDisposable
     /// </summary>
     void CDist(IGpuBuffer x1, IGpuBuffer x2, IGpuBuffer output, int m, int n, int d, float p);
 
+    /// <summary>
+    /// Condensed pairwise p-norm distance over the n rows of input [n, d]. Output is 1-D of length
+    /// n*(n-1)/2 in row-major upper-triangle order (0,1),(0,2),...,(1,2),...
+    /// </summary>
+    void PDist(IGpuBuffer input, IGpuBuffer output, int n, int d, float p);
+
     #region Comparison Operations
 
     void GreaterThan(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size);
