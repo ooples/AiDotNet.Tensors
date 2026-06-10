@@ -218,6 +218,44 @@ public static partial class BlasManaged
     /// Defaults when omitted: no epilogue, single-threaded, no autotune key.
     /// </para>
     /// </summary>
+    // Shapes where the cache-blocking packed strategy (Dispatcher → PackBoth) beats the
+    // #409 machine-code microkernel in PRODUCTION (deterministic) mode, so the Sub-S
+    // interception below should DEFER to the strategy path instead. Measured by
+    // ManagedVsNativeGemmAudit (perf/managed-blas-vs-native-audit) on a 32-core Ryzen:
+    //   • thin-N (n < 128, k ≥ 128): the 6×Nr microkernel can't fill its Nr-wide tile when
+    //     n is tiny → idle SIMD lanes. Packed wins ~3.6× for BOTH dtypes (4096×512×16:
+    //     float 22→80, double 14→50 GF/s).
+    //   • very large work (≥ 4e9): aggressive cache blocking pays for both dtypes
+    //     (2048³: float 290→462, double 285→319). 1024³ (1.07e9) stays on the microkernel
+    //     (153>81), so the cutoff is above it.
+    //   • FP32-only wide-N / wide-K skew (FFN): packed wins big (512×512×2048 106→174;
+    //     512×2048×512 101→177). FP64 is EXCLUDED — its microkernel BEATS packed on FFN
+    //     (512×512×2048 double: 187 microkernel vs 80 packed), so FP64 falls through to the
+    //     microkernel for these shapes.
+    // The microkernel still wins (and is kept) for small/medium near-square shapes
+    // (512³, 256×784×128, 128×64×256), where its low per-call overhead dominates.
+    private static bool PrefersStrategyOverMachineKernel(int m, int n, int k, bool isFloat)
+    {
+        long work = (long)m * n * k;
+        if (n < 128 && k >= 128) return true;                 // thin-N (both dtypes)
+        if (!isFloat)
+            // FP64 microkernel is competitive on FFN and mid squares (1024³ double 211 > packed
+            // 172); packed only pays at very large work (2048³: 316 -> 323). So FP64 defers only
+            // for thin-N (above) and the very-large tail.
+            return work >= 4_000_000_000L;
+        // FP32: the cache-blocking packed strategy wins on all mid-large work — squares from
+        // ~640³ (microkernel 110 -> packed ~192 GF/s; 1024³ 178 -> 315; stable across runs) and
+        // FFN (106 -> 174) — and on wide-N/wide-K skew. The microkernel only leads on SMALL
+        // near-square shapes (512³ 552, 256×784×128 674), where packing overhead would crater
+        // the packed path (512³ packed is only 45 GF/s). The cutoff sits just below 640³
+        // (2.6e8) and safely above 512³ (1.3e8) — conservative because mis-routing a small shape
+        // to the packed path is a ~12× loss, while mis-keeping a mid shape on the microkernel is mild.
+        if (work >= 250_000_000L) return true;                // FP32 mid-large (squares ≥ ~640³, FFN)
+        if (n >= 1024 && n > 2L * m) return true;             // FP32 wide-N skew below the cutoff
+        if (k >= 1024 && k > 2L * m) return true;             // FP32 wide-K skew below the cutoff
+        return false;
+    }
+
     public static void Gemm<T>(
         ReadOnlySpan<T> a, int lda, bool transA,
         ReadOnlySpan<T> b, int ldb, bool transB,
@@ -316,6 +354,7 @@ public static partial class BlasManaged
             var epi409 = options.Epilogue;
             if (mkAvail && m >= mkMr && n >= mkNr
                 && (long)m * n * k >= MachineKernelMinWork
+                && !PrefersStrategyOverMachineKernel(m, n, k, typeof(T) == typeof(float))
                 && EpilogueFlagsCompute.Compute(in epi409) == EpilogueFlags.None)
             {
                 int mAl = m - (m % mkMr); // interior rows (× Mr)
@@ -397,6 +436,18 @@ public static partial class BlasManaged
             ? PickMicrokernelTile<T>()
             : PickMicrokernelTilePrePack<T>();
 
+        // The FP32 6×16 kernel is PackBoth-ONLY: PackAOnly's strided-B path uses an 8×8
+        // (Avx2Fp32_8x8) tile, so the tail-split alignment and packing layout must stay on 8×8
+        // when the dispatcher picked PackAOnly. Without this, the interior is aligned to mr=6 and
+        // then handed to PackAOnly, which needs a multiple of 8 and slices out of range
+        // (ArgumentOutOfRangeException). PackBoth keeps the faster 6×16 tile.
+        if (strategy == PackingMode.ForcePackAOnly && typeof(T) == typeof(float)
+            && mr == 6 && Avx2Fp32_8x8.IsSupported)
+        {
+            mr = 8;
+            nr = 8;
+        }
+
         // Sub-D4 (#372 follow-up): partial-M/N tail splitting. When the shape is
         // big enough for the SIMD tile (m >= mr AND n >= nr) but not aligned
         // (m % mr != 0 OR n % nr != 0), split the work into:
@@ -423,18 +474,37 @@ public static partial class BlasManaged
         // get an inner options with Epilogue stripped to avoid double-application.
         int splitMAligned = m - (m % mr);
         int splitNAligned = n - (n % nr);
-        // Honor NumThreads = -1 as explicit single-thread (deterministic mode).
-        // Pre-fix: -1 fell into the "> 0 is false" branch and used all processors,
-        // breaking determinism/perf expectations. PR #402 CodeRabbit fix.
-        int splitProcs = options.NumThreads switch
+        // CORRECTNESS (reproducibility): the tail-split decomposition — aligned interior via the
+        // SIMD microkernel + Streaming for the M/N tails — picks which kernel computes each output
+        // element. It MUST be a function of the shape and the MACHINE only, never the per-call
+        // thread count, or the same shape takes a different path (and a different microkernel) at
+        // different thread counts and the output stops being bit-identical across them, violating
+        // the deterministic-mode contract. The old gate used options.NumThreads, so a tailed shape
+        // tail-split at NumThreads=1 (interior on the fast kernel) but fell through to all-Streaming
+        // at NumThreads=N — different bits. This was a LATENT reproducibility bug that the FP32 6×16
+        // tile (Mr=6 leaves an M-tail on most shapes) exposes; 8×8 only escaped because the test
+        // shapes are 8-aligned. Gate on the fixed machine core count instead — a thread-count-
+        // INVARIANT measure of "is the aligned interior big enough for its fast kernel to beat
+        // all-Streaming?" The actual parallel degree still honours options.NumThreads downstream.
+        int gateProcs = System.Environment.ProcessorCount;
+        if (m >= mr && n >= nr && (m % mr != 0 || n % nr != 0))
         {
-            -1 => 1,
-            > 0 => options.NumThreads,
-            _ => System.Environment.ProcessorCount,
-        };
-        if (m >= mr && n >= nr && (m % mr != 0 || n % nr != 0)
-            && splitMAligned >= splitProcs * mr)
-        {
+            if (splitMAligned < gateProcs * mr && options.PackingMode == PackingMode.Auto)
+            {
+                // Auto + too few aligned mr-blocks for the packed kernel to beat all-Streaming,
+                // and a tail IS present — route the WHOLE shape to Streaming, which handles the
+                // m%mr / n%nr tails internally and parallelizes the N axis. Decided by the fixed
+                // machine core count (NOT options.NumThreads), so the same shape takes this path
+                // at every thread count → bit-identical across thread counts. Force* pack modes
+                // skip this and tail-split below (the caller explicitly asked for that strategy);
+                // the tail-split keeps PackBoth's "caller guarantees m%mr==0" contract intact (it
+                // never receives an unaligned m, which it would silently skip).
+                StreamingStrategy.Run<T>(a, lda, transA, b, ldb, transB, c, ldc, m, n, k, in options);
+                var streamWholeEpi = options.Epilogue;
+                EpilogueChain.Apply<T>(c, ldc, m, n, in streamWholeEpi);
+                return;
+            }
+
             int m_aligned = splitMAligned;
             int n_aligned = splitNAligned;
             int m_tail = m - m_aligned;
@@ -564,6 +634,69 @@ public static partial class BlasManaged
         {
             ncFromAutotune = options.PackedB.TileMc;  // PackedB stores Nc in TileMc slot
             kcFromAutotune = options.PackedB.TileKc;
+        }
+
+        // Parallelism floor (PackBoth, no pre-pack): the autotuner sizes mc/nc for cache, but
+        // on high core counts a shape can yield fewer (m/mc)×(n/nc) blocks than cores, leaving
+        // cores idle. When N fits a single nc-block the 2D MN-grid can't add N-parallelism
+        // (PackBothStrategy handles the multi-N-block case), so the only lever is mc. Shrink it
+        // toward ~procs M-blocks — bounded to a multiple of mr (panels stay tile-aligned) and
+        // never below 2·mr — so e.g. FFN-down 512×2048×512 (mc=64 → 8 M-blocks on 32 cores)
+        // parallelizes across all cores via the shared-B M-axis path (no redundant B-pack).
+        //
+        // Gated to LARGE K (≥1024): a smaller mc means more A-panels and thus more pack passes,
+        // which only pays off when K is large enough to amortize the pack over the FMA work.
+        // On small-K shapes (e.g. 640³, K=640) the extra pack overhead dominates and the shrink
+        // REGRESSES — so leave those on the autotuner's larger mc.
+        //
+        // NOTE: this is deliberately limited to numNB==1 (genuinely under-parallelized, ≤8 blocks).
+        // Extending it to multi-N-block shapes (e.g. 1024³, mc=64 → 16 M-blocks) REGRESSED them:
+        // the box is 16 PHYSICAL cores (32 SMT threads) and compute-bound GEMM gets nothing from
+        // SMT, so 16 M-blocks already saturates the cores — shrinking mc only shrinks the panels.
+        if (strategy == PackingMode.ForcePackBoth && k >= 1024
+            && options.PackedA is null && options.PackedB is null && procs > 1)
+        {
+            int numNB = (n + ncFromAutotune - 1) / ncFromAutotune;
+            int numMB = (m + mcFromAutotune - 1) / mcFromAutotune;
+            if (numNB == 1 && numMB < procs && mcFromAutotune > 2 * mr)
+            {
+                int targetMc = Math.Max(2 * mr, (m + procs - 1) / procs);
+                targetMc = ((targetMc + mr - 1) / mr) * mr; // round up to a whole mr tile
+                if (targetMc < mcFromAutotune) mcFromAutotune = targetMc;
+            }
+        }
+
+        // A-repack reduction (run AFTER the floor so it doesn't perturb the floor's numNB check):
+        // the M-axis path re-packs A[ic,pc] once per nc-panel because the jc loop is outermost, so
+        // numNB nc-blocks means A is packed numNB times. The autotuner sizes nc for L2 B-residency
+        // (~512), but the kernel only ever reads a Kc×Nr B micro-panel (L1-sized) at a time — the
+        // full Kc×Nc B-panel merely has to fit L3. So widen nc to span all of N when the Kc×N panel
+        // fits an L3 budget: numNB collapses to 1 and A is packed ONCE (this is why OpenBLAS uses a
+        // large Nc). Pure win — fewer pack passes, identical reduction order (bit-exact).
+        if (strategy == PackingMode.ForcePackBoth
+            && options.PackedA is null && options.PackedB is null && m >= 256)
+        {
+            int elemSz = System.Runtime.CompilerServices.Unsafe.SizeOf<T>();
+            const long L3PanelBudgetBytes = 8L * 1024 * 1024;
+            long fullPanelBytes = (long)kcFromAutotune * n * elemSz;
+            if (n > ncFromAutotune && fullPanelBytes <= L3PanelBudgetBytes)
+            {
+                ncFromAutotune = ((n + nr - 1) / nr) * nr; // span all of N → numNB == 1, A packed once
+
+                // With numNB now == 1, A is packed ONCE regardless of mc (total A-pack = M×K either
+                // way), so the small-mc A-repack penalty that the floor avoids no longer applies.
+                // That lets a wide-N moderate-M shape (e.g. FFN-up 512×512×2048, numMB=8) fill the
+                // cores via the shared-B M-axis with NO redundant B-pack — strictly better than the
+                // 2D grid, which re-packs B per ic-block. Shrink mc to ~physical M-blocks when under.
+                int physicalCores = Math.Max(1, procs / 2); // 2-way SMT assumption
+                int numMBwide = (m + mcFromAutotune - 1) / mcFromAutotune;
+                if (numMBwide < physicalCores && mcFromAutotune > 2 * mr)
+                {
+                    int targetMc = Math.Max(2 * mr, (m + physicalCores - 1) / physicalCores);
+                    targetMc = ((targetMc + mr - 1) / mr) * mr; // round up to a whole mr tile
+                    if (targetMc < mcFromAutotune) mcFromAutotune = targetMc;
+                }
+            }
         }
 
         switch (strategy)
@@ -984,10 +1117,13 @@ public static partial class BlasManaged
             if (Avx512Fp32_16x16.IsSupported) return (16, 16);
             // #409 S.3: the higher-arithmetic-intensity 6×16 kernel (1.5 FMA/load, ~66% of
             // peak vs the load-bound 8×8's ~0.89 / ~49-59%) is used in FAST (non-deterministic)
-            // mode only. Deterministic mode keeps 8×8 because 6×16's different float reduction
-            // order would break the bit-exact invariant the Streaming bypass / serial-vs-parallel
-            // paths assert — acceptable only where bit-reproducibility isn't promised (Fast mode).
-            if (!Helpers.BlasProvider.IsDeterministicMode && Avx2Fp32_6x16.IsSupported) return (6, 16);
+            // mode only. Deterministic mode keeps 8×8 because 6×16's Mr=6 leaves an M-tail on
+            // most shapes that gets computed by Streaming, and 6×16's interior bits do NOT match
+            // Streaming's (8×8's DO) — so when the parallel M-split shifts the interior/tail
+            // boundary, a row flips between 6×16 and Streaming and the output stops being
+            // bit-identical across thread counts (verified: 6×16 fails 4 bit-exact tests, incl.
+            // DeterministicParallelGemmContractTests at m=16). Acceptable only in Fast mode.
+            if (Avx2Fp32_6x16.IsSupported) return (6, 16);   // now deterministic too — see gate fix in Gemm
             if (Avx2Fp32_8x8.IsSupported) return (8, 8);
             if (NeonFp32_8x4.IsSupported) return (8, 4);
             return (4, 4);

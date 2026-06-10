@@ -62,6 +62,26 @@ internal static class OneDnnProvider
     // run truly in parallel on managed code, and concurrent oneDNN execution never happens.
     private static readonly object _executeLock = new object();
 
+    // Acquire the oneDNN execute lock with mode-aware contention behavior. Returns true if the
+    // caller should run the oneDNN primitive (and must Monitor.Exit(_executeLock) when done).
+    //
+    // In FAST mode: opportunistic (TryEnter). Contended -> false -> caller uses the parallel managed
+    // kernel. Maximizes parallelism; the managed result differing in the last ULP doesn't matter.
+    // TryEnter keeps oneDNN strictly one-at-a-time (the concurrent-execute crash guard).
+    //
+    // In DETERMINISTIC mode: SKIP oneDNN entirely (return false -> caller uses the managed kernel).
+    // The managed deterministic kernels are bit-exact by contract, so taking the SAME (managed) path
+    // every time is what reproducibility requires — and it sidesteps oneDNN completely. (An earlier
+    // attempt BLOCKED here to force the oneDNN path instead; that fixed the Conv2D_IsDeterministic
+    // flake but drove far more traffic through oneDNN and surfaced a fatal concurrent-oneDNN fault
+    // under full-suite load. Skipping is both correct for determinism and strictly less oneDNN.)
+    private static bool TryEnterExecute()
+    {
+        if (BlasProvider.IsDeterministicMode)
+            return false;
+        return System.Threading.Monitor.TryEnter(_executeLock);
+    }
+
     // Per-thread oneDNN stream. A dnnl_stream is NOT safe to use from multiple threads
     // concurrently, but the engine IS thread-safe to share and primitives are stateless.
     // So each thread gets its own stream (lazily created from the shared engine) and the
@@ -793,6 +813,12 @@ internal static class OneDnnProvider
         float* output, int outHeight, int outWidth,
         int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
     {
+        // In deterministic mode, skip oneDNN entirely BEFORE any native setup (primitive
+        // creation, cache population, descriptor/memory-object building). TryEnterExecute()
+        // only gates the final execute step, so the deterministic "skip oneDNN" contract has
+        // to be enforced here at the entry point to avoid wasted native work.
+        if (BlasProvider.IsDeterministicMode) return false;
+
         // Gate all chatter behind the trace flag so production output stays clean.
         bool logThis = TraceEnabled;
 
@@ -848,7 +874,7 @@ internal static class OneDnnProvider
             // Conv uses shared cached memory objects + a shared scratchpad + the WeightsReordered
             // flag, so only one oneDNN op may run at a time. Opportunistic (non-blocking): if
             // another oneDNN op is running, bail so the caller uses the managed conv. See _executeLock.
-            if (!System.Threading.Monitor.TryEnter(_executeLock)) return false;
+            if (!TryEnterExecute()) return false;
             try
             {
             // Step 1: Set user memory data handles to point to user data
@@ -961,7 +987,7 @@ internal static class OneDnnProvider
         if (!EnsureInitialized())
             return false;
         // Opportunistic (non-blocking): one oneDNN op at a time; contended -> managed fallback.
-        if (!System.Threading.Monitor.TryEnter(_executeLock)) return false;
+        if (!TryEnterExecute()) return false;
         try
         {
             const byte N = (byte)'N';
@@ -988,6 +1014,9 @@ internal static class OneDnnProvider
     /// </summary>
     private static unsafe bool TryEltwiseInPlace(float* data, int length, int algorithm)
     {
+        // Deterministic mode: skip oneDNN before any cache lookup or primitive creation.
+        if (BlasProvider.IsDeterministicMode) return false;
+
         if (!EnsureInitialized())
             return false;
 
@@ -1059,7 +1088,7 @@ internal static class OneDnnProvider
     {
         // True-parallel: per-thread stream + a per-call memory object bound to this call's
         // data (shared primitive/descriptor are stateless/immutable). See ExecuteBinaryOperation.
-        if (!System.Threading.Monitor.TryEnter(_executeLock)) return false;   // opportunistic — see _executeLock
+        if (!TryEnterExecute()) return false;   // opportunistic — see _executeLock
         IntPtr mem = IntPtr.Zero, msp = IntPtr.Zero;
         try
         {
@@ -1184,6 +1213,9 @@ internal static class OneDnnProvider
     /// <param name="axisSize">Size of the softmax axis (number of classes).</param>
     internal static unsafe bool TrySoftmax(float* input, float* output, int outerSize, int axisSize)
     {
+        // Deterministic mode: skip oneDNN before any cache lookup or primitive creation.
+        if (BlasProvider.IsDeterministicMode) return false;
+
         if (!EnsureInitialized())
             return false;
 
@@ -1240,7 +1272,7 @@ internal static class OneDnnProvider
     private static unsafe bool ExecuteSoftmaxOperation(CachedSoftmax cached, float* src, float* dst)
     {
         // True-parallel: per-thread stream + per-call memory objects (see ExecuteBinaryOperation).
-        if (!System.Threading.Monitor.TryEnter(_executeLock)) return false;   // opportunistic — see _executeLock
+        if (!TryEnterExecute()) return false;   // opportunistic — see _executeLock
         IntPtr ms = IntPtr.Zero, md = IntPtr.Zero, msp = IntPtr.Zero;
         try
         {
@@ -1336,6 +1368,9 @@ internal static class OneDnnProvider
     /// </summary>
     private static unsafe bool TryBinary(float* src0, float* src1, float* dst, int length, int algorithm)
     {
+        // Deterministic mode: skip oneDNN before any cache lookup or primitive creation.
+        if (BlasProvider.IsDeterministicMode) return false;
+
         if (!EnsureInitialized())
             return false;
 
@@ -1416,7 +1451,7 @@ internal static class OneDnnProvider
         // source of the dnnl.dll access violations.)
         // Opportunistic: if another thread is already in oneDNN, bail (caller uses the managed
         // kernel) — never block, never run two oneDNN executes at once. See _executeLock.
-        if (!System.Threading.Monitor.TryEnter(_executeLock)) return false;
+        if (!TryEnterExecute()) return false;
         IntPtr m0 = IntPtr.Zero, m1 = IntPtr.Zero, md = IntPtr.Zero, msp = IntPtr.Zero;
         try
         {
@@ -1938,6 +1973,9 @@ internal static class OneDnnProvider
         int poolH, int poolW, int strideH, int strideW, int padH, int padW,
         int outH, int outW)
     {
+        // Deterministic mode: skip oneDNN before building any descriptors or memory objects.
+        if (BlasProvider.IsDeterministicMode) return false;
+
         if (!EnsureInitialized()) return false;
 
         try
@@ -2001,7 +2039,7 @@ internal static class OneDnnProvider
             args[1] = new DnnlExecArg { Arg = DnnlArgDst, Memory = dstMem };
             // This per-call path uses oneDNN's library scratchpad, so only one oneDNN op may run
             // at a time. Opportunistic (non-blocking): bail to the managed path if contended.
-            if (!System.Threading.Monitor.TryEnter(_executeLock))
+            if (!TryEnterExecute())
             {
                 dnnl_primitive_destroy(prim); dnnl_memory_destroy(srcMem); dnnl_memory_destroy(dstMem);
                 return false;
@@ -2036,6 +2074,9 @@ internal static class OneDnnProvider
         int batch, int channels, int height, int width,
         float epsilon)
     {
+        // Deterministic mode: skip oneDNN before building any descriptors or memory objects.
+        if (BlasProvider.IsDeterministicMode) return false;
+
         if (!EnsureInitialized()) return false;
 
         try
@@ -2116,7 +2157,7 @@ internal static class OneDnnProvider
             args[4] = new DnnlExecArg { Arg = DnnlArgWeights, Memory = scaleMem };
             args[5] = new DnnlExecArg { Arg = DnnlArgBias, Memory = shiftMem };
             // Library-scratchpad path -> only one oneDNN op at a time. Opportunistic (non-blocking).
-            if (!System.Threading.Monitor.TryEnter(_executeLock))
+            if (!TryEnterExecute())
             {
                 dnnl_primitive_destroy(prim);
                 dnnl_memory_destroy(srcMem); dnnl_memory_destroy(dstMem);
