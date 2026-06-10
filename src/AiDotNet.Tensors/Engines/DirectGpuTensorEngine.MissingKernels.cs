@@ -723,6 +723,51 @@ public partial class DirectGpuTensorEngine
         return true;
     }
 
+    // ----- Category B: composite forwards -----
+
+    /// <inheritdoc/>
+    public override Tensor<T> MlpForward<T>(
+        Tensor<T> input,
+        System.Collections.Generic.IReadOnlyList<Tensor<T>> weights,
+        System.Collections.Generic.IReadOnlyList<Tensor<T>?> biases,
+        FusedActivationType hiddenActivation,
+        FusedActivationType outputActivation = FusedActivationType.None,
+        FusedActivationParams? hiddenActivationParams = null,
+        FusedActivationParams? outputActivationParams = null)
+    {
+        // The CPU base runs a native-BLAS GEMM chain on the host (downloads input, the whole MLP
+        // forward computes on CPU). Decompose into per-layer GPU FusedLinear instead so every layer's
+        // GEMM+bias+activation runs on the device and the intermediates stay resident between layers
+        // (safe now that strided/chained buffers are handled). Inference-only contract is unchanged:
+        // GraphMode disables the GPU backend, so we fall back to base (which throws for tape use).
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (weights is null) throw new ArgumentNullException(nameof(weights));
+        if (biases is null) throw new ArgumentNullException(nameof(biases));
+        if (weights.Count == 0 || biases.Count != weights.Count || !TryGetBackend(out _))
+        {
+            return base.MlpForward(input, weights, biases, hiddenActivation, outputActivation,
+                hiddenActivationParams, outputActivationParams);
+        }
+
+        try
+        {
+            int last = weights.Count - 1;
+            var cur = input;
+            for (int i = 0; i < weights.Count; i++)
+            {
+                var act = (i == last) ? outputActivation : hiddenActivation;
+                var ap = (i == last) ? outputActivationParams : hiddenActivationParams;
+                cur = FusedLinear(cur, weights[i], biases[i], act, ap);   // GPU-resident per layer
+            }
+            return cur;
+        }
+        catch (Exception)
+        {
+            return base.MlpForward(input, weights, biases, hiddenActivation, outputActivation,
+                hiddenActivationParams, outputActivationParams);
+        }
+    }
+
     // Materializing GPU permute: unlike the public TensorPermute (a metadata-only STRIDED VIEW that
     // shares the input's buffer — whose cached contiguous data does NOT reflect the permuted strides,
     // the source of the deep interleaved-chain divergence), this runs the backend Permute kernel into a

@@ -500,6 +500,36 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         AssertMatch(gpu, cpu, $"TensorRepeatInterleave[{string.Join("x", shape)};r={repeats}]");
     }
 
+    // Whole MLP forward (chain of FusedLinear layers) — now decomposed onto the GPU.
+    public static IEnumerable<object[]> MlpCases() => new List<object[]>
+    {
+        new object[] { 4, new[] { 8, 16, 10 } },        // 1 hidden layer
+        new object[] { 2, new[] { 6, 12, 12, 4 } },     // 2 hidden layers
+        new object[] { 8, new[] { 32, 64 } },           // single layer
+    };
+
+    [Theory]
+    [MemberData(nameof(MlpCases))]
+    public void MlpForward_GpuMatchesCpu(int batch, int[] dims)
+    {
+        if (!EnsureGpuReady()) return;
+        int layers = dims.Length - 1;
+        var input = Rand(150, batch, dims[0]);
+        var weights = new Tensor<float>[layers];
+        var biases = new Tensor<float>?[layers];
+        for (int i = 0; i < layers; i++)
+        {
+            weights[i] = Rand(151 + i, dims[i], dims[i + 1]);
+            biases[i] = Rand(171 + i, dims[i + 1]);
+        }
+        var hid = AiDotNet.Tensors.Engines.FusedActivationType.ReLU;
+        var outAct = AiDotNet.Tensors.Engines.FusedActivationType.None;
+
+        var cpu = _cpu.MlpForward(input, weights, biases, hid, outAct);
+        var gpu = _gpu.MlpForward(input, weights, biases, hid, outAct);
+        AssertMatch(gpu, cpu, $"MlpForward[b{batch};{string.Join("x", dims)}]");
+    }
+
     // General broadcast (size-1 → N at arbitrary axes, incl. rank expansion).
     public static IEnumerable<object[]> BroadcastCases() => new List<object[]>
     {
