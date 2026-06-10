@@ -194,6 +194,25 @@ __kernel void hsoftmax_paths(__global const float* acts, __global float* out, in
     }
     out[idx] = prob;
 }
+// scatter_reduce: atomic reduce of source into output along a dim. mode 0=sum,1=prod,2=amax,3=amin.
+// output is pre-seeded with the original tensor (includeSelf=true). source/index viewed [outer,srcDim,inner].
+inline void atomicReduceF(volatile __global float* addr, float val, int mode) {
+    union { int i; float f; } prev, next;
+    do {
+        prev.f = *addr;
+        float nv = (mode == 0) ? (prev.f + val) : (mode == 1) ? (prev.f * val) : (mode == 2) ? fmax(prev.f, val) : fmin(prev.f, val);
+        next.f = nv;
+    } while (atomic_cmpxchg((volatile __global int*)addr, prev.i, next.i) != prev.i);
+}
+__kernel void scatter_reduce(__global float* output, __global const float* source, __global const int* index,
+    int outerSize, int srcDim, int dstDim, int innerSize, int mode) {
+    int idx = get_global_id(0); int total = outerSize * srcDim * innerSize; if (idx >= total) return;
+    int inner = idx % innerSize; int tmp = idx / innerSize;
+    int outer = tmp / srcDim;
+    int t = index[idx];
+    if (t < 0 || t >= dstDim) return;
+    atomicReduceF(&output[(outer * dstDim + t) * innerSize + inner], source[idx], mode);
+}
 // copy_block_2d: place a [blockRows, blockCols] block at (rowOff, colOff) inside a totalCols-wide matrix.
 __kernel void copy_block_2d(__global const float* block, __global float* output, int blockRows, int blockCols, int totalCols, int rowOff, int colOff) {
     int idx = get_global_id(0); if (idx >= blockRows * blockCols) return;
@@ -336,7 +355,7 @@ __kernel void next_after(__global const float* a, __global const float* b, __glo
             "masked_fill_kernel", "index_select", "take_along_dim",
             "cross3", "ldexp_kernel", "kron2d", "search_sorted", "next_after", "index_write", "cdist", "pdist",
             "histc", "bitonic_step", "copy_rows", "iota_pad", "rwkv7_forward", "hsoftmax_paths",
-            "isin", "unfold", "copy_block_2d"
+            "isin", "unfold", "copy_block_2d", "scatter_reduce"
         };
     }
 }

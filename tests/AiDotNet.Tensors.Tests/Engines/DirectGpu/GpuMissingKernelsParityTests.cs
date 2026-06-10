@@ -574,6 +574,25 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         AssertMatch(gpu, cpu, $"MHA[b{batch};s{seq};d{dModel};h{numHeads}]");
     }
 
+    [Theory]
+    [InlineData("Sum")]
+    [InlineData("Prod")]
+    [InlineData("AMax")]
+    [InlineData("AMin")]
+    public void TensorScatterReduce_GpuMatchesCpu(string modeName)
+    {
+        if (!EnsureGpuReady()) return;
+        var mode = (AiDotNet.Tensors.Engines.ScatterReduceMode)System.Enum.Parse(typeof(AiDotNet.Tensors.Engines.ScatterReduceMode), modeName);
+        var t = Rand(300, 4, 5);
+        var rng = new Random(301);
+        var idxData = new int[20];
+        for (int i = 0; i < 20; i++) idxData[i] = rng.Next(4);   // scatter along dim 0 (dstDim=4)
+        var indices = new Tensor<int>(idxData, new[] { 4, 5 });
+        var src = Rand(302, 4, 5);
+        AssertMatch(_gpu.TensorScatterReduce(t, 0, indices, src, mode, true),
+                    _cpu.TensorScatterReduce(t, 0, indices, src, mode, true), $"ScatterReduce[{modeName}]");
+    }
+
     [Fact]
     public void TensorBlockDiag_GpuMatchesCpu()
     {

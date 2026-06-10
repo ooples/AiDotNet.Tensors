@@ -1363,6 +1363,50 @@ public partial class DirectGpuTensorEngine
     }
 
     /// <inheritdoc/>
+    public override Tensor<T> TensorScatterReduce<T>(
+        Tensor<T> tensor, int dim, Tensor<int> indices, Tensor<T> source, ScatterReduceMode mode, bool includeSelf = true)
+    {
+        if (tensor is null) throw new ArgumentNullException(nameof(tensor));
+        if (indices is null) throw new ArgumentNullException(nameof(indices));
+        if (source is null) throw new ArgumentNullException(nameof(source));
+        int rank = tensor.Rank;
+        int d = dim < 0 ? dim + rank : dim;
+        // kernel modes: 0=sum,1=prod,2=amax,3=amin. Mean / includeSelf=false defer to base.
+        int kmode = mode switch
+        {
+            ScatterReduceMode.Sum => 0,
+            ScatterReduceMode.Prod => 1,
+            ScatterReduceMode.AMax => 2,
+            ScatterReduceMode.AMin => 3,
+            _ => -1,
+        };
+        if (typeof(T) != typeof(float) || !includeSelf || kmode < 0 || d < 0 || d >= rank
+            || indices.Rank != rank || !ShapesEqual(indices._shape, source._shape) || !TryGetBatchBackend(out var backend))
+            return base.TensorScatterReduce(tensor, dim, indices, source, mode, includeSelf);
+        for (int k = 0; k < rank; k++)
+            if (k != d && source._shape[k] != tensor._shape[k])
+                return base.TensorScatterReduce(tensor, dim, indices, source, mode, includeSelf);
+        try
+        {
+            int dstDim = tensor._shape[d], srcDim = source._shape[d], n = tensor.Length;
+            int outerSize = 1; for (int k = 0; k < d; k++) outerSize *= tensor._shape[k];
+            int innerSize = 1; for (int k = d + 1; k < rank; k++) innerSize *= tensor._shape[k];
+            var ct = tensor.IsContiguous ? tensor : (Tensor<T>)tensor.Contiguous();
+            var cs = source.IsContiguous ? source : (Tensor<T>)source.Contiguous();
+            var ci = indices.IsContiguous ? indices : (Tensor<int>)indices.Contiguous();
+            using var bufIn = GetOrAllocateBuffer(backend, ct.GetDataArray());
+            using var bufSrc = GetOrAllocateBuffer(backend, cs.GetDataArray());
+            using var bufIdx = backend.AllocateIntBuffer(ci.GetDataArray());
+            var bufOut = AllocateOutputBuffer(backend, n);
+            backend.Copy(bufIn.Buffer, bufOut.Buffer, n);   // seed with the original tensor (includeSelf)
+            backend.ScatterReduce(bufOut.Buffer, bufSrc.Buffer, bufIdx, outerSize, srcDim, dstDim, innerSize, kmode);
+            var arr = FinishGpuOp<T>(backend, bufOut, n);
+            return new Tensor<T>(arr, (int[])tensor._shape.Clone());
+        }
+        catch (Exception) { return base.TensorScatterReduce(tensor, dim, indices, source, mode, includeSelf); }
+    }
+
+    /// <inheritdoc/>
     public override Tensor<T> TensorSliceScatter<T>(Tensor<T> tensor, Tensor<T> source, int dim, int start, int length)
     {
         if (tensor is null) throw new ArgumentNullException(nameof(tensor));

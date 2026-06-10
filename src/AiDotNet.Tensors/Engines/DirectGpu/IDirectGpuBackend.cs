@@ -1985,6 +1985,12 @@ public interface IDirectGpuBackend : IDisposable
     void CopyBlock2D(IGpuBuffer block, IGpuBuffer output, int blockRows, int blockCols, int totalCols, int rowOff, int colOff);
 
     /// <summary>
+    /// scatter_reduce along a dim with atomic reduction (mode 0=sum,1=prod,2=amax,3=amin). output is
+    /// pre-seeded with the original tensor (includeSelf); source/index viewed [outerSize, srcDim, innerSize].
+    /// </summary>
+    void ScatterReduce(IGpuBuffer output, IGpuBuffer source, IGpuBuffer index, int outerSize, int srcDim, int dstDim, int innerSize, int mode);
+
+    /// <summary>
     /// Sliding-window unfold along a dim. src viewed [outerSize, dimSize, innerSize]; output
     /// [outerSize, nWindows, innerSize, size] with out[o,w,i,s] = src[o, w*step+s, i].
     /// </summary>
