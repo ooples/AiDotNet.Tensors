@@ -457,5 +457,26 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         var gpu = _gpu.TensorScatterAdd(dest, indices, updates, 0);
         AssertMatch(gpu, cpu, $"TensorScatterAdd_1D[n={n};m={idxArr.Length}]");
     }
+
+    [Theory]
+    [MemberData(nameof(ScatterAddCases))]
+    public void TensorIndexAdd_1D_GpuMatchesCpu(int n, int[] explicitIdx)
+    {
+        if (!EnsureGpuReady()) return;
+        var t = Rand(104, n);
+        int[] idxArr = explicitIdx;
+        if (idxArr == null)
+        {
+            var rng = new Random(205);
+            idxArr = new int[n];
+            for (int i = 0; i < n; i++) idxArr[i] = rng.Next(n);
+        }
+        var indices = new Tensor<int>(idxArr, new[] { idxArr.Length });
+        var source = Rand(106, idxArr.Length);
+
+        var cpu = _cpu.TensorIndexAdd(t, 0, indices, source);
+        var gpu = _gpu.TensorIndexAdd(t, 0, indices, source);
+        AssertMatch(gpu, cpu, $"TensorIndexAdd_1D[n={n};m={idxArr.Length}]");
+    }
 }
 #endif

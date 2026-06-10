@@ -578,4 +578,36 @@ public partial class DirectGpuTensorEngine
         }
         catch (Exception) { return base.TensorScatterAdd(destination, indices, updates, axis); }
     }
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorIndexAdd<T>(Tensor<T> tensor, int axis, Tensor<int> indices, Tensor<T> source)
+    {
+        if (tensor is null) throw new ArgumentNullException(nameof(tensor));
+        if (indices is null) throw new ArgumentNullException(nameof(indices));
+        if (source is null) throw new ArgumentNullException(nameof(source));
+        if (axis < 0) axis += tensor.Rank;
+
+        // index_add: result = clone(tensor); result[index[i]] += source[i]. Same on-device path as
+        // TensorScatterAdd (seed the output with the base, then atomic-add) — only the 1-D / axis-0
+        // case the flat backend kernel covers; the rest defer to base.
+        if (IsTapeActive<T>() || axis != 0
+            || tensor.Rank != 1 || source.Rank != 1 || indices.Rank != 1
+            || indices.Length != source.Length
+            || !TryGetBackend(out var backend))
+            return base.TensorIndexAdd(tensor, axis, indices, source);
+
+        try
+        {
+            int destSize = tensor.Length;
+            using var bufDest = GetOrAllocateBuffer(backend, tensor.GetDataArray());
+            using var bufSrc = GetOrAllocateBuffer(backend, source.GetDataArray());
+            using var bufIdx = backend.AllocateIntBuffer(indices.GetDataArray());
+            var bufOut = AllocateOutputBuffer(backend, destSize);
+            backend.Copy(bufDest.Buffer, bufOut.Buffer, destSize);
+            backend.ScatterAdd(bufSrc.Buffer, bufIdx, bufOut.Buffer, source.Length, destSize);
+            var result = FinishGpuOp<T>(backend, bufOut, destSize);
+            return new Tensor<T>(result, (int[])tensor._shape.Clone());
+        }
+        catch (Exception) { return base.TensorIndexAdd(tensor, axis, indices, source); }
+    }
 }
