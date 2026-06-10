@@ -1978,6 +1978,15 @@ public interface IDirectGpuBackend : IDisposable
     /// </summary>
     void HierarchicalSoftmaxPaths(IGpuBuffer acts, IGpuBuffer output, int rows, int treeDepth, int numClasses);
 
+    /// <summary>isin membership mask: mask[i] = elements[i] ∈ ascending sortedTest ? 1 : 0.</summary>
+    void IsIn(IGpuBuffer elements, IGpuBuffer sortedTest, IGpuBuffer mask, int numElements, int testLen);
+
+    /// <summary>
+    /// Sliding-window unfold along a dim. src viewed [outerSize, dimSize, innerSize]; output
+    /// [outerSize, nWindows, innerSize, size] with out[o,w,i,s] = src[o, w*step+s, i].
+    /// </summary>
+    void Unfold(IGpuBuffer src, IGpuBuffer dst, int outerSize, int dimSize, int innerSize, int nWindows, int size, int step);
+
     #region Comparison Operations
 
     void GreaterThan(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size);

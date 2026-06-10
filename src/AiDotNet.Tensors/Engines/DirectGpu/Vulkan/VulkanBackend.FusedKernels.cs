@@ -88,6 +88,8 @@ public sealed partial class VulkanBackend
     public void IotaPad(IGpuBuffer idx, int l, int p, int numRows) => throw new NotSupportedException("IotaPad not yet implemented on the Vulkan backend.");
     public void Rwkv7Forward(IGpuBuffer r, IGpuBuffer k, IGpuBuffer v, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, IGpuBuffer sbuf, int batch, int seqLen, int modelDim, int numHeads, int headDim) => throw new NotSupportedException("Rwkv7Forward not yet implemented on the Vulkan backend.");
     public void HierarchicalSoftmaxPaths(IGpuBuffer acts, IGpuBuffer output, int rows, int treeDepth, int numClasses) => throw new NotSupportedException("HierarchicalSoftmaxPaths not yet implemented on the Vulkan backend.");
+    public void IsIn(IGpuBuffer elements, IGpuBuffer sortedTest, IGpuBuffer mask, int numElements, int testLen) => throw new NotSupportedException("IsIn not yet implemented on the Vulkan backend.");
+    public void Unfold(IGpuBuffer src, IGpuBuffer dst, int outerSize, int dimSize, int innerSize, int nWindows, int size, int step) => throw new NotSupportedException("Unfold not yet implemented on the Vulkan backend.");
 
     #endregion
 

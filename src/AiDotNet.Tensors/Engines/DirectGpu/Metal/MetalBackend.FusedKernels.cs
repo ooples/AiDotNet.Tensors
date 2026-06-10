@@ -32,6 +32,8 @@ public sealed partial class MetalBackend
     public void IotaPad(IGpuBuffer idx, int l, int p, int numRows) => throw new NotSupportedException("IotaPad not yet implemented on the Metal backend.");
     public void Rwkv7Forward(IGpuBuffer r, IGpuBuffer k, IGpuBuffer v, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, IGpuBuffer sbuf, int batch, int seqLen, int modelDim, int numHeads, int headDim) => throw new NotSupportedException("Rwkv7Forward not yet implemented on the Metal backend.");
     public void HierarchicalSoftmaxPaths(IGpuBuffer acts, IGpuBuffer output, int rows, int treeDepth, int numClasses) => throw new NotSupportedException("HierarchicalSoftmaxPaths not yet implemented on the Metal backend.");
+    public void IsIn(IGpuBuffer elements, IGpuBuffer sortedTest, IGpuBuffer mask, int numElements, int testLen) => throw new NotSupportedException("IsIn not yet implemented on the Metal backend.");
+    public void Unfold(IGpuBuffer src, IGpuBuffer dst, int outerSize, int dimSize, int innerSize, int nWindows, int size, int step) => throw new NotSupportedException("Unfold not yet implemented on the Metal backend.");
     public void OuterProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int M, int N) { SimpleBinary("Reduction", _reductionLibrary, "outer_product", a, b, o, M*N); }
     public void BatchDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int bs, int dim) { SimpleBinary("Reduction", _reductionLibrary, "batch_dot_product", a, b, o, bs); }
     public void GluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd) { SimpleUnary("Activation", _activationLibrary, "glu_forward", i, o, os*hd); }

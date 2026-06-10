@@ -574,6 +574,28 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         AssertMatch(gpu, cpu, $"MHA[b{batch};s{seq};d{dModel};h{numHeads}]");
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void TensorIsIn_GpuMatchesCpu(bool invert)
+    {
+        if (!EnsureGpuReady()) return;
+        var elements = new Tensor<float>(new float[] { 1, 2, 3, 4, 5, 6 }, new[] { 2, 3 });
+        var test = new Tensor<float>(new float[] { 5, 2, 9, 4 }, new[] { 4 });
+        AssertBitMatch(_gpu.TensorIsIn(elements, test, invert), _cpu.TensorIsIn(elements, test, invert), "IsIn");
+    }
+
+    [Theory]
+    [InlineData(new[] { 10 }, 0, 3, 2)]
+    [InlineData(new[] { 4, 8 }, 1, 4, 2)]
+    [InlineData(new[] { 3, 6, 5 }, 1, 3, 1)]
+    public void TensorUnfold_GpuMatchesCpu(int[] shape, int dim, int size, int step)
+    {
+        if (!EnsureGpuReady()) return;
+        var t = Rand(295, shape);
+        AssertMatch(_gpu.TensorUnfold(t, dim, size, step), _cpu.TensorUnfold(t, dim, size, step), $"Unfold[{string.Join("x", shape)};d{dim};sz{size};st{step}]");
+    }
+
     [Fact]
     public void TensorPut_MaskedScatter_GpuMatchesCpu()
     {

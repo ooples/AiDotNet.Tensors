@@ -194,6 +194,23 @@ __kernel void hsoftmax_paths(__global const float* acts, __global float* out, in
     }
     out[idx] = prob;
 }
+// isin: mask[i] = (elements[i] is present in the ascending sortedTest) ? 1 : 0 (binary search + equality).
+__kernel void isin(__global const float* elements, __global const float* sortedTest, __global float* mask, int numElements, int testLen) {
+    int idx = get_global_id(0); if (idx >= numElements) return;
+    float v = elements[idx];
+    int lo = 0, hi = testLen;
+    while (lo < hi) { int mid = (lo + hi) >> 1; if (sortedTest[mid] < v) lo = mid + 1; else hi = mid; }
+    mask[idx] = (lo < testLen && sortedTest[lo] == v) ? 1.0f : 0.0f;
+}
+// unfold: sliding windows along a dim. src viewed [outer, dimSize, inner]; dst [outer, nWindows, inner, size];
+// dst[outer,w,inner,s] = src[outer, w*step+s, inner].
+__kernel void unfold(__global const float* src, __global float* dst, int outerSize, int dimSize, int innerSize, int nWindows, int size, int step) {
+    int idx = get_global_id(0); int total = outerSize * nWindows * innerSize * size; if (idx >= total) return;
+    int s = idx % size; int tmp = idx / size;
+    int inner = tmp % innerSize; tmp /= innerSize;
+    int w = tmp % nWindows; int outer = tmp / nWindows;
+    dst[idx] = src[(outer * dimSize + (w * step + s)) * innerSize + inner];
+}
 // RWKV-7 (WKV7 generalized delta rule) sequence forward. One thread per (batch, head); the sequence is
 // scanned sequentially while a per-(b,h) state matrix S[headDim,headDim] lives in global scratch Sbuf.
 // State: S[di,vi] = sig(A)*S[di,vi] + (sig(B[di])*K[di])*V[vi]; readout: out[di] = sig(R[di]) * sum_vi S[di,vi]*K[vi].
@@ -312,7 +329,8 @@ __kernel void next_after(__global const float* a, __global const float* b, __glo
             "diag_kernel", "extract_diag_kernel", "triangular_mask",
             "masked_fill_kernel", "index_select", "take_along_dim",
             "cross3", "ldexp_kernel", "kron2d", "search_sorted", "next_after", "index_write", "cdist", "pdist",
-            "histc", "bitonic_step", "copy_rows", "iota_pad", "rwkv7_forward", "hsoftmax_paths"
+            "histc", "bitonic_step", "copy_rows", "iota_pad", "rwkv7_forward", "hsoftmax_paths",
+            "isin", "unfold"
         };
     }
 }

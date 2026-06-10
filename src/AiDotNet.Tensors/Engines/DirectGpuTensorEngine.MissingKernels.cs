@@ -724,6 +724,59 @@ public partial class DirectGpuTensorEngine
         return true;
     }
 
+    /// <inheritdoc/>
+    public override Tensor<Bit> TensorIsIn<T>(Tensor<T> elements, Tensor<T> testElements, bool invert = false)
+    {
+        if (elements is null) throw new ArgumentNullException(nameof(elements));
+        if (testElements is null) throw new ArgumentNullException(nameof(testElements));
+        if (typeof(T) != typeof(float) || elements.Length == 0 || testElements.Length == 0 || !TryGetBackend(out var backend))
+            return base.TensorIsIn(elements, testElements, invert);
+        try
+        {
+            var ce = elements.IsContiguous ? elements : (Tensor<T>)elements.Contiguous();
+            var ct = testElements.IsContiguous ? testElements : (Tensor<T>)testElements.Contiguous();
+            int testLen = testElements.Length, n = elements.Length;
+            var (sortedTest, _) = BitonicSortRows(backend, (float[])(object)ct.GetDataArray(), 1, testLen, false);
+            using var bufElem = GetOrAllocateBuffer(backend, ce.GetDataArray());
+            using var bufTest = GetOrAllocateBuffer(backend, (T[])(object)sortedTest);
+            using var bufMask = AllocateOutputBuffer(backend, n);
+            backend.IsIn(bufElem.Buffer, bufTest.Buffer, bufMask.Buffer, n, testLen);
+            backend.Synchronize();
+            return PackMask(backend, bufMask, elements._shape, n, invert);
+        }
+        catch (Exception) { return base.TensorIsIn(elements, testElements, invert); }
+    }
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorUnfold<T>(Tensor<T> tensor, int dim, int size, int step)
+    {
+        if (tensor is null) throw new ArgumentNullException(nameof(tensor));
+        if (size <= 0) throw new ArgumentOutOfRangeException(nameof(size), "size must be positive");
+        if (step <= 0) throw new ArgumentOutOfRangeException(nameof(step), "step must be positive");
+        int rank = tensor.Rank;
+        int d = dim < 0 ? dim + rank : dim;
+        if (typeof(T) != typeof(float) || d < 0 || d >= rank || size > tensor._shape[d] || !TryGetBackend(out var backend))
+            return base.TensorUnfold(tensor, dim, size, step);
+        try
+        {
+            int dimSize = tensor._shape[d];
+            int nWindows = (dimSize - size) / step + 1;
+            int outerSize = 1; for (int k = 0; k < d; k++) outerSize *= tensor._shape[k];
+            int innerSize = 1; for (int k = d + 1; k < rank; k++) innerSize *= tensor._shape[k];
+            int outN = outerSize * nWindows * innerSize * size;
+            var c = tensor.IsContiguous ? tensor : (Tensor<T>)tensor.Contiguous();
+            using var bufSrc = GetOrAllocateBuffer(backend, c.GetDataArray());
+            var bufOut = AllocateOutputBuffer(backend, outN);
+            backend.Unfold(bufSrc.Buffer, bufOut.Buffer, outerSize, dimSize, innerSize, nWindows, size, step);
+            var arr = FinishGpuOp<T>(backend, bufOut, outN);
+            var outShape = new int[rank + 1];
+            for (int i = 0; i < rank; i++) outShape[i] = tensor._shape[i];
+            outShape[d] = nWindows; outShape[rank] = size;
+            return new Tensor<T>(arr, outShape);
+        }
+        catch (Exception) { return base.TensorUnfold(tensor, dim, size, step); }
+    }
+
     // ----- Misc reductions / construction -----
 
     /// <inheritdoc/>

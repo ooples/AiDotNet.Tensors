@@ -1460,6 +1460,10 @@ public class DelegatingGpuBackend : IDirectGpuBackend
     public virtual void Rwkv7Forward(IGpuBuffer r, IGpuBuffer k, IGpuBuffer v, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, IGpuBuffer sbuf, int batch, int seqLen, int modelDim, int numHeads, int headDim) => Inner.Rwkv7Forward(r, k, v, a, b, output, sbuf, batch, seqLen, modelDim, numHeads, headDim);
     /// <inheritdoc/>
     public virtual void HierarchicalSoftmaxPaths(IGpuBuffer acts, IGpuBuffer output, int rows, int treeDepth, int numClasses) => Inner.HierarchicalSoftmaxPaths(acts, output, rows, treeDepth, numClasses);
+    /// <inheritdoc/>
+    public virtual void IsIn(IGpuBuffer elements, IGpuBuffer sortedTest, IGpuBuffer mask, int numElements, int testLen) => Inner.IsIn(elements, sortedTest, mask, numElements, testLen);
+    /// <inheritdoc/>
+    public virtual void Unfold(IGpuBuffer src, IGpuBuffer dst, int outerSize, int dimSize, int innerSize, int nWindows, int size, int step) => Inner.Unfold(src, dst, outerSize, dimSize, innerSize, nWindows, size, step);
 
     /// <inheritdoc/>
     public virtual void Where(IGpuBuffer condition, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
