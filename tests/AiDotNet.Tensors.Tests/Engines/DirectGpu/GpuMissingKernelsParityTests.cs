@@ -9,8 +9,10 @@
 using System;
 using System.Collections.Generic;
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.BlasManaged;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
+using BM = AiDotNet.Tensors.Engines.BlasManaged.BlasManaged;
 
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
@@ -118,6 +120,43 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         var cpu = _cpu.TensorAddMM(input, a, b, alpha, beta);
         var gpu = _gpu.TensorAddMM(input, a, b, alpha, beta);
         AssertMatch(gpu, cpu, $"TensorAddMM_ab[{m},{k},{n}]");
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(7)]
+    [InlineData(64)]
+    [InlineData(257)]
+    [InlineData(4096)]
+    public void TensorVecDot_GpuMatchesCpu(int n)
+    {
+        if (!EnsureGpuReady()) return;
+        var a = Rand(21, n);
+        var b = Rand(22, n);
+
+        float cpu = _cpu.TensorVecDot(a, b);
+        float gpu = _gpu.TensorVecDot(a, b);
+        // Relative tolerance: a length-4096 dot accumulates more abs error than the
+        // 1e-3 elementwise bar, so scale by the magnitude of the result.
+        double tol = 1e-3 * Math.Max(1.0, Math.Abs((double)cpu));
+        Assert.False(float.IsNaN(gpu) || float.IsInfinity(gpu), $"VecDot[{n}] GPU non-finite: {gpu}");
+        Assert.True(Math.Abs((double)gpu - cpu) < tol, $"VecDot[{n}]: GPU {gpu} vs CPU {cpu} (tol {tol:E3})");
+    }
+
+    [Theory]
+    [MemberData(nameof(AddMMSizes))]
+    public void TensorMatMul2DWithPrePackedB_GpuMatchesCpu(int m, int k, int n)
+    {
+        if (!EnsureGpuReady()) return;
+        var a = Rand(31, m, k);
+        var b = Rand(32, k, n);
+        // Build a CPU managed-BLAS pre-packed handle for B ([k,n], row-major => ldb=n).
+        WeightPackHandle packed = BM.PrePackB<float>(b.ToArray(), n, false, k, n);
+
+        // Trusted reference is plain a@b; the pre-pack must not change the result.
+        var cpu = _cpu.TensorMatMul(a, b);
+        var gpu = _gpu.TensorMatMul2DWithPrePackedB(a, b, packed);
+        AssertMatch(gpu, cpu, $"TensorMatMul2DWithPrePackedB[{m},{k},{n}]");
     }
 }
 #endif

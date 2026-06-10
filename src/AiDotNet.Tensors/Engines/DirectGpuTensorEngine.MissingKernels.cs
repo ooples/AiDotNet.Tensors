@@ -48,4 +48,52 @@ public partial class DirectGpuTensorEngine
             return base.TensorAddMM(input, a, b, alpha, beta);
         }
     }
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorMatMul2DWithPrePackedB<T>(
+        Tensor<T> a, Tensor<T> b, BlasManaged.WeightPackHandle prePackedB)
+    {
+        if (a is null) throw new ArgumentNullException(nameof(a));
+        if (b is null) throw new ArgumentNullException(nameof(b));
+        if (prePackedB is null) throw new ArgumentNullException(nameof(prePackedB));
+
+        // prePackedB is a CPU managed-BLAS panel layout — meaningless on the GPU; `b` is the
+        // original right-hand matrix. The CPU path downloads a/b to run the managed pre-packed
+        // GEMM; route to the GPU GEMM (a@b) instead so the op stays device-resident. The pre-pack
+        // was only a CPU speedup, so dropping it on the GPU changes nothing about the result.
+        // Non-2-D / GraphMode / no-GPU defer to base (which also falls back to TensorMatMul for
+        // unsupported dtypes).
+        if (a.Rank != 2 || b.Rank != 2 || !TryGetBackend(out _))
+            return base.TensorMatMul2DWithPrePackedB(a, b, prePackedB);
+
+        try { return TensorMatMul(a, b); }
+        catch (Exception) { return base.TensorMatMul2DWithPrePackedB(a, b, prePackedB); }
+    }
+
+    /// <inheritdoc/>
+    public override T TensorVecDot<T>(Tensor<T> a, Tensor<T> b)
+    {
+        if (a is null) throw new ArgumentNullException(nameof(a));
+        if (b is null) throw new ArgumentNullException(nameof(b));
+
+        // VecDot(a,b) = sum(a[i]*b[i]) over two equal-length 1-D vectors, returning a scalar.
+        // The CPU base downloads BOTH whole vectors to multiply-accumulate on the host; instead
+        // do the elementwise multiply + full reduction on the GPU (the expensive O(n) part) and
+        // download only the single scalar result. Defer non-conforming shapes / no-GPU to base.
+        if (a.Rank != 1 || b.Rank != 1 || a.Length != b.Length || !TryGetBackend(out _))
+            return base.TensorVecDot(a, b);
+
+        try
+        {
+            var prod = TensorMultiply(a, b);           // GPU elementwise [n]
+            var sum = ReduceSum(prod, null, false);    // GPU reduce-all -> 1 element
+            var span = sum.AsSpan();
+            if (span.Length != 1) return base.TensorVecDot(a, b);
+            return span[0];
+        }
+        catch (Exception)
+        {
+            return base.TensorVecDot(a, b);
+        }
+    }
 }
