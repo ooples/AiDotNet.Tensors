@@ -575,6 +575,42 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
     }
 
     [Fact]
+    public void TensorCountNonzero_NanMedian_GpuMatchesCpu()
+    {
+        if (!EnsureGpuReady()) return;
+        var data = new float[] { 0f, 1f, 0f, -2f, 3f, 0f, 0f, 5f };
+        var t = new Tensor<float>(data, new[] { 8 });
+        Assert.Equal(_cpu.TensorCountNonzero(t), _gpu.TensorCountNonzero(t));
+        var nanData = new float[] { 3f, float.NaN, 1f, 2f, float.NaN, 5f, 4f };
+        var nt = new Tensor<float>(nanData, new[] { 7 });
+        Assert.Equal((double)_cpu.TensorNanMedian(nt), (double)_gpu.TensorNanMedian(nt), 4);
+    }
+
+    [Theory]
+    [InlineData(3, 4)]
+    [InlineData(2, 3)]
+    public void TensorCartesianProd_GpuMatchesCpu(int n0, int n1)
+    {
+        if (!EnsureGpuReady()) return;
+        var a = Rand(280, n0);
+        var b = Rand(281, n1);
+        AssertMatch(_gpu.TensorCartesianProd(new[] { a, b }), _cpu.TensorCartesianProd(new[] { a, b }), "CartesianProd");
+    }
+
+    [Theory]
+    [InlineData(10, 0f, 1f)]
+    [InlineData(6, -2f, 4f)]
+    public void TensorHistogram_GpuMatchesCpu(int bins, float mn, float mx)
+    {
+        if (!EnsureGpuReady()) return;
+        var rng = new Random(282);
+        var data = new float[400];
+        for (int i = 0; i < data.Length; i++) data[i] = (float)(rng.NextDouble() * (mx - mn) + mn);
+        var t = new Tensor<float>(data, new[] { data.Length });
+        Assert.Equal(_cpu.TensorHistogram(t, bins, mn, mx).ToArray(), _gpu.TensorHistogram(t, bins, mn, mx).ToArray());
+    }
+
+    [Fact]
     public void TensorMaskedSelect_GpuMatchesCpu()
     {
         if (!EnsureGpuReady()) return;

@@ -724,6 +724,106 @@ public partial class DirectGpuTensorEngine
         return true;
     }
 
+    // ----- Misc reductions / construction -----
+
+    /// <inheritdoc/>
+    public override int TensorCountNonzero<T>(Tensor<T> tensor)
+    {
+        if (tensor is null) throw new ArgumentNullException(nameof(tensor));
+        if (typeof(T) != typeof(float) || tensor.Length == 0 || !TryGetBackend(out var backend))
+            return base.TensorCountNonzero(tensor);
+        try
+        {
+            var c = tensor.IsContiguous ? tensor : (Tensor<T>)tensor.Contiguous();
+            int n = tensor.Length;
+            using var bufX = GetOrAllocateBuffer(backend, c.GetDataArray());
+            var bufMask = AllocateOutputBuffer(backend, n);
+            backend.NotEqualScalar(bufX.Buffer, bufMask.Buffer, 0f, n);   // 1.0 where x != 0
+            var maskArr = FinishGpuOp<T>(backend, bufMask, n);
+            var sum = ReduceSum(new Tensor<T>(maskArr, new[] { n }), null, false);
+            var sArr = (float[])(object)sum.GetDataArray();
+            return (int)System.Math.Round(sArr[0]);
+        }
+        catch (Exception) { return base.TensorCountNonzero(tensor); }
+    }
+
+    /// <inheritdoc/>
+    public override T TensorNanMedian<T>(Tensor<T> input)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (input.Length == 0) throw new ArgumentException("NanMedian requires a non-empty tensor");
+        if (typeof(T) != typeof(float) || !TryGetBackend(out var backend))
+            return base.TensorNanMedian(input);
+        try
+        {
+            var c = input.IsContiguous ? input : (Tensor<T>)input.Contiguous();
+            int L = input.Length;
+            var (vals, _) = BitonicSortRows(backend, (float[])(object)c.GetDataArray(), 1, L, false);
+            // Ascending with NaN sorted to the end: finite values fill [0, numFinite).
+            int numFinite = 0; while (numFinite < L && !float.IsNaN(vals[numFinite])) numFinite++;
+            if (numFinite == 0) return (T)(object)float.NaN;
+            int k = (numFinite + 1) / 2;   // lower median of the finite values
+            return (T)(object)vals[k - 1];
+        }
+        catch (Exception) { return base.TensorNanMedian(input); }
+    }
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorCartesianProd<T>(Tensor<T>[] tensors)
+    {
+        if (tensors is null) throw new ArgumentNullException(nameof(tensors));
+        if (tensors.Length < 2 || typeof(T) != typeof(float) || !TryGetBackend(out _))
+            return base.TensorCartesianProd(tensors);
+        foreach (var t in tensors)
+        {
+            if (t is null) throw new ArgumentNullException(nameof(tensors));
+            if (t.Rank != 1) return base.TensorCartesianProd(tensors);
+        }
+        try
+        {
+            // ij-meshgrid, give each grid a trailing size-1 axis, concatenate along it, then flatten to
+            // [prod, numInputs] — all GPU-resident (Meshgrid + Reshape + Concatenate).
+            int m = tensors.Length;
+            var grids = TensorMeshgrid(tensors, "ij");
+            var gshape = grids[0]._shape;
+            var withOne = new int[gshape.Length + 1];
+            for (int i = 0; i < gshape.Length; i++) withOne[i] = gshape[i];
+            withOne[gshape.Length] = 1;
+            var reshaped = new Tensor<T>[m];
+            for (int k = 0; k < m; k++) reshaped[k] = grids[k].Reshape(withOne);
+            var stacked = TensorConcatenate(reshaped, gshape.Length);
+            int prod = 1; foreach (var t in tensors) prod *= t._shape[0];
+            return stacked.Reshape(new[] { prod, m });
+        }
+        catch (Exception) { return base.TensorCartesianProd(tensors); }
+    }
+
+    /// <inheritdoc/>
+    public override Tensor<int> TensorHistogram<T>(Tensor<T> input, int bins, T min, T max)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (typeof(T) != typeof(float) || bins <= 0 || !TryGetBackend(out var backend))
+            return base.TensorHistogram(input, bins, min, max);
+        float mn = ToFloatScalar(min), mx = ToFloatScalar(max);
+        if (!(mn < mx)) return base.TensorHistogram(input, bins, min, max);
+        try
+        {
+            var c = input.IsContiguous ? input : (Tensor<T>)input.Contiguous();
+            int n = input.Length;
+            using var bufIn = GetOrAllocateBuffer(backend, c.GetDataArray());
+            using var bufHist = AllocateOutputBuffer(backend, bins);
+            backend.Fill(bufHist.Buffer, 0f, bins);
+            backend.Histc(bufIn.Buffer, bufHist.Buffer, n, bins, mn, mx);
+            backend.Synchronize();
+            var f = backend.DownloadBuffer(bufHist.Buffer);
+            var res = new Tensor<int>(new[] { bins });
+            var dst = res.AsWritableSpan();
+            for (int i = 0; i < bins; i++) dst[i] = (int)f[i];
+            return res;
+        }
+        catch (Exception) { return base.TensorHistogram(input, bins, min, max); }
+    }
+
     // ----- Stream-compaction family -----
 
     /// <inheritdoc/>
