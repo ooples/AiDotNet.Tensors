@@ -679,6 +679,30 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
     }
 
     [Fact]
+    public void TensorZeta_GpuMatchesCpu()
+    {
+        if (!EnsureGpuReady()) return;
+        var x = new Tensor<float>(new float[] { 2f, 2.5f, 3f, 4f, 6f, 5f }, new[] { 6 });
+        var q = new Tensor<float>(new float[] { 1f, 2f, 0.5f, 1.5f, 3f, 2f }, new[] { 6 });
+        var ca = _cpu.TensorZeta(x, q).ToArray(); var ga = _gpu.TensorZeta(x, q).ToArray();
+        for (int i = 0; i < ca.Length; i++)
+            Assert.True(Math.Abs((double)ga[i] - ca[i]) < 1e-3 * Math.Max(1.0, Math.Abs((double)ca[i])), $"Zeta[{i}]: gpu {ga[i]} vs cpu {ca[i]}");
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    public void TensorPolygamma_GpuMatchesCpu(int n)
+    {
+        if (!EnsureGpuReady()) return;
+        var x = new Tensor<float>(new float[] { 1f, 1.5f, 2f, 3f, 5f, 8f }, new[] { 6 });
+        var ca = _cpu.TensorPolygamma(n, x).ToArray(); var ga = _gpu.TensorPolygamma(n, x).ToArray();
+        for (int i = 0; i < ca.Length; i++)
+            Assert.True(Math.Abs((double)ga[i] - ca[i]) < 1e-3 * Math.Max(1.0, Math.Abs((double)ca[i])), $"Polygamma(n={n})[{i}]: gpu {ga[i]} vs cpu {ca[i]}");
+    }
+
+    [Fact]
     public void TensorMaskedSelect_GpuMatchesCpu()
     {
         if (!EnsureGpuReady()) return;

@@ -194,6 +194,57 @@ __kernel void hsoftmax_paths(__global const float* acts, __global float* out, in
     }
     out[idx] = prob;
 }
+// Hurwitz zeta zeta(x,q) = sum (k+q)^-x via Euler-Maclaurin with 8 Bernoulli corrections (mirrors CPU).
+float zeta_scalar(float x, float q) {
+    if (x == 1.0f) return INFINITY;
+    if (q <= 0.0f && q == floor(q)) return INFINITY;
+    float sum = 0.0f;
+    for (int k = 0; k < 12; k++) sum += pow(q + (float)k, -x);
+    float Nq = 12.0f + q;
+    float lnNq = log(Nq);
+    float cont = exp((1.0f - x) * lnNq) / (x - 1.0f);
+    float halfTerm = 0.5f * exp(-x * lnNq);
+    const float b2k[8] = { 1.0f/6.0f, -1.0f/30.0f, 1.0f/42.0f, -1.0f/30.0f, 5.0f/66.0f, -691.0f/2730.0f, 7.0f/6.0f, -3617.0f/510.0f };
+    const float fact2k[8] = { 2.0f, 24.0f, 720.0f, 40320.0f, 3628800.0f, 479001600.0f, 87178291200.0f, 20922789888000.0f };
+    float corr = 0.0f;
+    float xPow = exp(-x * lnNq) / Nq;
+    float invNq2 = 1.0f / (Nq * Nq);
+    float rising = x;
+    for (int j = 1; j <= 8; j++) {
+        if (j > 1) { rising *= (x + 2.0f*(float)(j-1) - 2.0f) * (x + 2.0f*(float)(j-1) - 1.0f); xPow *= invNq2; }
+        corr += (b2k[j-1] / fact2k[j-1]) * rising * xPow;
+    }
+    return sum + cont + halfTerm + corr;
+}
+__kernel void zeta_kernel(__global const float* x, __global const float* q, __global float* out, int size) {
+    int i = get_global_id(0); if (i >= size) return;
+    out[i] = zeta_scalar(x[i], q[i]);
+}
+// Polygamma psi^(n)(x), n>=1, via shift-up recurrence + Bernoulli asymptotic (mirrors CPU). FactorialLogD(k)=lgamma(k+1).
+float polygamma_scalar(int n, float x) {
+    if (x <= 0.0f && x == floor(x)) return INFINITY;
+    float recurrence = 0.0f;
+    float xd = x;
+    int signN = (n & 1) == 1 ? 1 : -1;
+    while (xd < 10.0f) {
+        recurrence += (float)signN * exp(lgamma((float)(n+1)) - (float)(n+1) * log(xd));
+        xd += 1.0f;
+    }
+    float lnX = log(xd);
+    float asympt = exp(lgamma((float)n) - (float)n * lnX) + 0.5f * exp(lgamma((float)(n+1)) - (float)(n+1) * lnX);
+    const float b2k[8] = { 1.0f/6.0f, -1.0f/30.0f, 1.0f/42.0f, -1.0f/30.0f, 5.0f/66.0f, -691.0f/2730.0f, 7.0f/6.0f, -3617.0f/510.0f };
+    float invX2 = 1.0f / (xd * xd);
+    float xPow = exp(-(float)n * lnX);
+    for (int k = 1; k <= 8; k++) {
+        xPow *= invX2;
+        asympt += b2k[k-1] * exp(lgamma((float)(2*k+n)) - lgamma((float)(2*k+1))) * xPow;
+    }
+    return recurrence + (float)signN * asympt;
+}
+__kernel void polygamma_kernel(__global const float* x, __global float* out, int n, int size) {
+    int i = get_global_id(0); if (i >= size) return;
+    out[i] = polygamma_scalar(n, x[i]);
+}
 // scatter_reduce: atomic reduce of source into output along a dim. mode 0=sum,1=prod,2=amax,3=amin.
 // output is pre-seeded with the original tensor (includeSelf=true). source/index viewed [outer,srcDim,inner].
 inline void atomicReduceF(volatile __global float* addr, float val, int mode) {
@@ -355,7 +406,7 @@ __kernel void next_after(__global const float* a, __global const float* b, __glo
             "masked_fill_kernel", "index_select", "take_along_dim",
             "cross3", "ldexp_kernel", "kron2d", "search_sorted", "next_after", "index_write", "cdist", "pdist",
             "histc", "bitonic_step", "copy_rows", "iota_pad", "rwkv7_forward", "hsoftmax_paths",
-            "isin", "unfold", "copy_block_2d", "scatter_reduce"
+            "isin", "unfold", "copy_block_2d", "scatter_reduce", "zeta_kernel", "polygamma_kernel"
         };
     }
 }

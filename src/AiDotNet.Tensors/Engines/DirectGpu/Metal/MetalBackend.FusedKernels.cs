@@ -34,6 +34,8 @@ public sealed partial class MetalBackend
     public void HierarchicalSoftmaxPaths(IGpuBuffer acts, IGpuBuffer output, int rows, int treeDepth, int numClasses) => throw new NotSupportedException("HierarchicalSoftmaxPaths not yet implemented on the Metal backend.");
     public void IsIn(IGpuBuffer elements, IGpuBuffer sortedTest, IGpuBuffer mask, int numElements, int testLen) => throw new NotSupportedException("IsIn not yet implemented on the Metal backend.");
     public void CopyBlock2D(IGpuBuffer block, IGpuBuffer output, int blockRows, int blockCols, int totalCols, int rowOff, int colOff) => throw new NotSupportedException("CopyBlock2D not yet implemented on the Metal backend.");
+    public void Zeta(IGpuBuffer x, IGpuBuffer q, IGpuBuffer output, int size) => throw new NotSupportedException("Zeta not yet implemented on the Metal backend.");
+    public void Polygamma(IGpuBuffer x, IGpuBuffer output, int n, int size) => throw new NotSupportedException("Polygamma not yet implemented on the Metal backend.");
     public void ScatterReduce(IGpuBuffer output, IGpuBuffer source, IGpuBuffer index, int outerSize, int srcDim, int dstDim, int innerSize, int mode) => throw new NotSupportedException("ScatterReduce not yet implemented on the Metal backend.");
     public void Unfold(IGpuBuffer src, IGpuBuffer dst, int outerSize, int dimSize, int innerSize, int nWindows, int size, int step) => throw new NotSupportedException("Unfold not yet implemented on the Metal backend.");
     public void OuterProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int M, int N) { SimpleBinary("Reduction", _reductionLibrary, "outer_product", a, b, o, M*N); }

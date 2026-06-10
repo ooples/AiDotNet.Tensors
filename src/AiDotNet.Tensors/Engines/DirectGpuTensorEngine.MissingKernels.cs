@@ -1525,6 +1525,47 @@ public partial class DirectGpuTensorEngine
     }
 
     /// <inheritdoc/>
+    public override Tensor<T> TensorZeta<T>(Tensor<T> x, Tensor<T> q)
+    {
+        if (x is null) throw new ArgumentNullException(nameof(x));
+        if (q is null) throw new ArgumentNullException(nameof(q));
+        if (typeof(T) != typeof(float) || !ShapesEqual(x._shape, q._shape) || !TryGetBackend(out var backend))
+            return base.TensorZeta(x, q);
+        try
+        {
+            var cx = x.IsContiguous ? x : (Tensor<T>)x.Contiguous();
+            var cq = q.IsContiguous ? q : (Tensor<T>)q.Contiguous();
+            int n = x.Length;
+            using var bufX = GetOrAllocateBuffer(backend, cx.GetDataArray());
+            using var bufQ = GetOrAllocateBuffer(backend, cq.GetDataArray());
+            var bufOut = AllocateOutputBuffer(backend, n);
+            backend.Zeta(bufX.Buffer, bufQ.Buffer, bufOut.Buffer, n);
+            var arr = FinishGpuOp<T>(backend, bufOut, n);
+            return new Tensor<T>(arr, (int[])x._shape.Clone());
+        }
+        catch (Exception) { return base.TensorZeta(x, q); }
+    }
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorPolygamma<T>(int n, Tensor<T> tensor)
+    {
+        if (tensor is null) throw new ArgumentNullException(nameof(tensor));
+        if (typeof(T) != typeof(float) || n < 1 || !TryGetBackend(out var backend))
+            return base.TensorPolygamma(n, tensor);
+        try
+        {
+            var c = tensor.IsContiguous ? tensor : (Tensor<T>)tensor.Contiguous();
+            int len = tensor.Length;
+            using var bufX = GetOrAllocateBuffer(backend, c.GetDataArray());
+            var bufOut = AllocateOutputBuffer(backend, len);
+            backend.Polygamma(bufX.Buffer, bufOut.Buffer, n, len);
+            var arr = FinishGpuOp<T>(backend, bufOut, len);
+            return new Tensor<T>(arr, (int[])tensor._shape.Clone());
+        }
+        catch (Exception) { return base.TensorPolygamma(n, tensor); }
+    }
+
+    /// <inheritdoc/>
     public override Tensor<T> TensorNextAfter<T>(Tensor<T> a, Tensor<T> b)
     {
         if (a is null) throw new ArgumentNullException(nameof(a));

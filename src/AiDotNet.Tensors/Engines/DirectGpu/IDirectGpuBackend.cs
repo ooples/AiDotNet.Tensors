@@ -1984,6 +1984,12 @@ public interface IDirectGpuBackend : IDisposable
     /// <summary>Place a [blockRows, blockCols] block at (rowOff, colOff) in a totalCols-wide output matrix.</summary>
     void CopyBlock2D(IGpuBuffer block, IGpuBuffer output, int blockRows, int blockCols, int totalCols, int rowOff, int colOff);
 
+    /// <summary>Elementwise Hurwitz zeta zeta(x[i], q[i]).</summary>
+    void Zeta(IGpuBuffer x, IGpuBuffer q, IGpuBuffer output, int size);
+
+    /// <summary>Elementwise polygamma psi^(n)(x[i]) for n>=1.</summary>
+    void Polygamma(IGpuBuffer x, IGpuBuffer output, int n, int size);
+
     /// <summary>
     /// scatter_reduce along a dim with atomic reduction (mode 0=sum,1=prod,2=amax,3=amin). output is
     /// pre-seeded with the original tensor (includeSelf); source/index viewed [outerSize, srcDim, innerSize].
