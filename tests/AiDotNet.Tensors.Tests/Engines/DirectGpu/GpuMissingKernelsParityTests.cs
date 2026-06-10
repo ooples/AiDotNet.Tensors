@@ -424,5 +424,38 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         var gpu = _gpu.TensorTake(t, idx);
         AssertMatch(gpu, cpu, $"TensorTake[{string.Join("x", shape)};n={flatIndices.Length}]");
     }
+
+    // 1-D index_add (the case the backend ScatterAdd kernel covers). Includes [257] — the exact
+    // shape the prior wiring diverged on — and heavy-collision cases that exercise atomicAdd.
+    public static IEnumerable<object[]> ScatterAddCases() => new List<object[]>
+    {
+        new object[] { 8, new[] { 0, 3, 3, 7, 0 } },                         // collisions on 0 and 3
+        new object[] { 257, null },                                         // the prior-failure shape (random idx)
+        new object[] { 16, new[] { 5, 5, 5, 5, 5, 5 } },                    // all-same index (max collision)
+        new object[] { 4, new[] { 0, 1, 2, 3 } },                          // bijective, no collision
+        new object[] { 100, null },
+    };
+
+    [Theory]
+    [MemberData(nameof(ScatterAddCases))]
+    public void TensorScatterAdd_1D_GpuMatchesCpu(int n, int[] explicitIdx)
+    {
+        if (!EnsureGpuReady()) return;
+        var dest = Rand(101, n);
+        int[] idxArr = explicitIdx;
+        if (idxArr == null)
+        {
+            // Random indices (with collisions) of length ~n.
+            var rng = new Random(202);
+            idxArr = new int[n];
+            for (int i = 0; i < n; i++) idxArr[i] = rng.Next(n);
+        }
+        var indices = new Tensor<int>(idxArr, new[] { idxArr.Length });
+        var updates = Rand(103, idxArr.Length);
+
+        var cpu = _cpu.TensorScatterAdd(dest, indices, updates, 0);
+        var gpu = _gpu.TensorScatterAdd(dest, indices, updates, 0);
+        AssertMatch(gpu, cpu, $"TensorScatterAdd_1D[n={n};m={idxArr.Length}]");
+    }
 }
 #endif

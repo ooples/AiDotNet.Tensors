@@ -543,4 +543,39 @@ public partial class DirectGpuTensorEngine
         }
         catch (Exception) { return base.TensorTake(tensor, indices); }
     }
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorScatterAdd<T>(Tensor<T> destination, Tensor<int> indices, Tensor<T> updates, int axis = 0)
+    {
+        if (destination is null) throw new ArgumentNullException(nameof(destination));
+        if (indices is null) throw new ArgumentNullException(nameof(indices));
+        if (updates is null) throw new ArgumentNullException(nameof(updates));
+        if (axis < 0) axis += destination.Rank;
+
+        // index_add: result = copy(destination); result[index[i]] += updates[i]. The backend ScatterAdd
+        // kernel is FLAT (featureSize=1), so only the 1-D / axis-0 case maps; higher-rank / featured /
+        // non-zero-axis fall back to the (correct) base. Tape-active also defers (the scatter backward
+        // stays on the base's recording). The prior engine wiring diverged because it did NOT seed the
+        // output buffer with the base destination — scatter is an ADD onto the existing values — so the
+        // base contribution was missing. Seed it with backend.Copy first, then atomic-add the updates.
+        if (IsTapeActive<T>() || axis != 0
+            || destination.Rank != 1 || updates.Rank != 1 || indices.Rank != 1
+            || indices.Length != updates.Length
+            || !TryGetBackend(out var backend))
+            return base.TensorScatterAdd(destination, indices, updates, axis);
+
+        try
+        {
+            int destSize = destination.Length;
+            using var bufDest = GetOrAllocateBuffer(backend, destination.GetDataArray());
+            using var bufUpd = GetOrAllocateBuffer(backend, updates.GetDataArray());
+            using var bufIdx = backend.AllocateIntBuffer(indices.GetDataArray());
+            var bufOut = AllocateOutputBuffer(backend, destSize);
+            backend.Copy(bufDest.Buffer, bufOut.Buffer, destSize);   // seed with the base (the += target)
+            backend.ScatterAdd(bufUpd.Buffer, bufIdx, bufOut.Buffer, updates.Length, destSize);
+            var result = FinishGpuOp<T>(backend, bufOut, destSize);
+            return new Tensor<T>(result, (int[])destination._shape.Clone());
+        }
+        catch (Exception) { return base.TensorScatterAdd(destination, indices, updates, axis); }
+    }
 }
