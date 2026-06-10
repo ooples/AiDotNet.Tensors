@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.LinearAlgebra;
 
@@ -214,18 +215,109 @@ public partial class DirectGpuTensorEngine
         if (a is null) throw new ArgumentNullException(nameof(a));
         if (b is null) throw new ArgumentNullException(nameof(b));
 
-        // Inner product contracts the LAST axis: a[M,K], b[N,K] -> [M,N] with out[i,j]=Σ_k a[i,k]b[j,k]
-        // = a @ bᵀ — exactly TensorMatMulTransposed, which is GPU-resident (this is the Q·Kᵀ attention
-        // score pattern). The CPU base routes through TensorEinsum (host). Handle the 2-D × 2-D case on
-        // the GPU; higher-rank inner products need a host reshape/transpose dance, so defer those to base.
-        if (a.Rank != 2 || b.Rank != 2
-            || a._shape[a.Rank - 1] != b._shape[b.Rank - 1]
+        int ra = a.Rank, rb = b.Rank;
+        // Inner product contracts the LAST axis of each operand (sizes must match) and produces
+        // out-shape a.shape[:-1] ++ b.shape[:-1]. Flatten the free dims: a -> [Ma,K], b -> [Mb,K],
+        // then out2d = a2 @ b2ᵀ (= TensorMatMulTransposed, GPU-resident) reshaped to the full out-shape.
+        // Reshape preserves GPU residency (the view shares the cached buffer), so the whole chain stays
+        // on the device — no host round-trip, unlike the CPU base's TensorEinsum path. The rank-1×rank-1
+        // pure scalar dot (empty out-shape / rank-0) is left to base; TensorVecDot covers that case.
+        if (ra < 1 || rb < 1 || (ra == 1 && rb == 1)
+            || a._shape[ra - 1] != b._shape[rb - 1]
             || !TryGetBackend(out _))
         {
             return base.TensorInner(a, b);
         }
 
-        try { return TensorMatMulTransposed(a, b); }
+        try
+        {
+            int k = a._shape[ra - 1];
+            int ma = a.Length / k;
+            int mb = b.Length / k;
+            var a2 = ra == 2 ? a : a.Reshape(ma, k);
+            var b2 = rb == 2 ? b : b.Reshape(mb, k);
+            var r2 = TensorMatMulTransposed(a2, b2);   // [ma, mb], device-resident
+
+            if (ra == 2 && rb == 2) return r2;          // already the right shape
+
+            var outShape = new int[(ra - 1) + (rb - 1)];
+            for (int i = 0; i < ra - 1; i++) outShape[i] = a._shape[i];
+            for (int i = 0; i < rb - 1; i++) outShape[ra - 1 + i] = b._shape[i];
+            return r2.Reshape(outShape);
+        }
         catch (Exception) { return base.TensorInner(a, b); }
+    }
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorDot<T>(Tensor<T> a, Tensor<T> b, int[] axesA, int[] axesB)
+    {
+        if (a is null) throw new ArgumentNullException(nameof(a));
+        if (b is null) throw new ArgumentNullException(nameof(b));
+        if (axesA is null) throw new ArgumentNullException(nameof(axesA));
+        if (axesB is null) throw new ArgumentNullException(nameof(axesB));
+
+        int ra = a.Rank, rb = b.Rank, na = axesA.Length;
+
+        // The CPU base routes through TensorEinsum (host). Implement the general contraction on the
+        // GPU as permute(a)→reshape→GEMM→reshape, which stays device-resident (GPU TensorPermute +
+        // residency-preserving Reshape + GPU TensorMatMul). Defer to base for: mismatched axis counts,
+        // the no-contraction (outer-product, na==0) and full-contraction-to-scalar (rank-0 output)
+        // edges, invalid/negative/duplicate axes, int-overflowing sizes, and no-GPU.
+        if (na != axesB.Length || na == 0 || !TryGetBackend(out _))
+            return base.TensorDot(a, b, axesA, axesB);
+
+        var inA = new bool[ra];
+        var inB = new bool[rb];
+        long k = 1;
+        for (int i = 0; i < na; i++)
+        {
+            int ax = axesA[i], bx = axesB[i];
+            if (ax < 0 || ax >= ra || bx < 0 || bx >= rb || inA[ax] || inB[bx]
+                || a._shape[ax] != b._shape[bx])
+                return base.TensorDot(a, b, axesA, axesB);
+            inA[ax] = true; inB[bx] = true;
+            k *= a._shape[ax];
+        }
+
+        var freeA = new List<int>(ra - na);
+        for (int i = 0; i < ra; i++) if (!inA[i]) freeA.Add(i);
+        var freeB = new List<int>(rb - na);
+        for (int i = 0; i < rb; i++) if (!inB[i]) freeB.Add(i);
+        if (freeA.Count == 0 && freeB.Count == 0)
+            return base.TensorDot(a, b, axesA, axesB);   // scalar (rank-0) result → base
+
+        long faL = 1; foreach (var ax in freeA) faL *= a._shape[ax];
+        long fbL = 1; foreach (var bx in freeB) fbL *= b._shape[bx];
+        if (faL > int.MaxValue || fbL > int.MaxValue || k > int.MaxValue)
+            return base.TensorDot(a, b, axesA, axesB);
+
+        try
+        {
+            // Permute a to [free_a..., contracted...] and b to [contracted..., free_b...] so the
+            // contraction becomes a plain 2-D GEMM aP[Fa,K] @ bP[K,Fb].
+            var permA = new int[ra];
+            { int p = 0; foreach (var ax in freeA) permA[p++] = ax; for (int i = 0; i < na; i++) permA[p++] = axesA[i]; }
+            var permB = new int[rb];
+            { int p = 0; for (int i = 0; i < na; i++) permB[p++] = axesB[i]; foreach (var bx in freeB) permB[p++] = bx; }
+
+            var aP = IsIdentityPerm(permA) ? a : TensorPermute(a, permA);
+            var bP = IsIdentityPerm(permB) ? b : TensorPermute(b, permB);
+            var a2 = aP.Reshape((int)faL, (int)k);
+            var b2 = bP.Reshape((int)k, (int)fbL);
+            var r2 = TensorMatMul(a2, b2);   // [Fa, Fb], device-resident
+
+            var outShape = new int[freeA.Count + freeB.Count];
+            int oi = 0;
+            foreach (var ax in freeA) outShape[oi++] = a._shape[ax];
+            foreach (var bx in freeB) outShape[oi++] = b._shape[bx];
+            return r2.Reshape(outShape);
+        }
+        catch (Exception) { return base.TensorDot(a, b, axesA, axesB); }
+    }
+
+    private static bool IsIdentityPerm(int[] perm)
+    {
+        for (int i = 0; i < perm.Length; i++) if (perm[i] != i) return false;
+        return true;
     }
 }

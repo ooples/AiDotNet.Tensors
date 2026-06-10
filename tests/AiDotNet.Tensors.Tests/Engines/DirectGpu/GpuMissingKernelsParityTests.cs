@@ -236,5 +236,56 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         var gpu = _gpu.TensorInner(a, b);
         AssertMatch(gpu, cpu, $"TensorInner[{mRows},{k},{nRows}]");
     }
+
+    // Higher-rank inner product (contract last axis), now handled on-GPU via reshape+GEMM.
+    public static IEnumerable<object[]> InnerNdShapes() => new List<object[]>
+    {
+        new object[] { new[] { 3, 4 }, new[] { 2, 5, 4 } },        // 2-D ⋅ 3-D
+        new object[] { new[] { 2, 3, 8 }, new[] { 4, 8 } },        // 3-D ⋅ 2-D
+        new object[] { new[] { 2, 3, 6 }, new[] { 5, 7, 6 } },     // 3-D ⋅ 3-D
+        new object[] { new[] { 4, 9 }, new[] { 9 } },              // 2-D ⋅ 1-D
+        new object[] { new[] { 9 }, new[] { 3, 5, 9 } },           // 1-D ⋅ 3-D
+    };
+
+    [Theory]
+    [MemberData(nameof(InnerNdShapes))]
+    public void TensorInner_HigherRank_GpuMatchesCpu(int[] shapeA, int[] shapeB)
+    {
+        if (!EnsureGpuReady()) return;
+        var a = Rand(71, shapeA);
+        var b = Rand(72, shapeB);
+
+        var cpu = _cpu.TensorInner(a, b);
+        var gpu = _gpu.TensorInner(a, b);
+        AssertMatch(gpu, cpu, $"TensorInnerND[{string.Join("x", shapeA)};{string.Join("x", shapeB)}]");
+    }
+
+    // General tensor contraction. Each case: shapeA, shapeB, axesA, axesB.
+    public static IEnumerable<object[]> DotCases() => new List<object[]>
+    {
+        // standard matmul as a dot: [M,K]·[K,N] over (1),(0)
+        new object[] { new[] { 6, 8 }, new[] { 8, 5 }, new[] { 1 }, new[] { 0 } },
+        // 3-D ⋅ 2-D, contract a's last with b's first
+        new object[] { new[] { 2, 3, 8 }, new[] { 8, 4 }, new[] { 2 }, new[] { 0 } },
+        // permuted: contract a's MIDDLE axis (needs permute) with b's last
+        new object[] { new[] { 4, 6, 5 }, new[] { 7, 6 }, new[] { 1 }, new[] { 1 } },
+        // multi-axis contraction (na=2): [2,3,4]·[3,4,5] over (1,2),(0,1)
+        new object[] { new[] { 2, 3, 4 }, new[] { 3, 4, 5 }, new[] { 1, 2 }, new[] { 0, 1 } },
+        // multi-axis with permutation: [3,4,2]·[2,3,6] over (0,1),(1,?) ...
+        new object[] { new[] { 3, 4, 2 }, new[] { 4, 3, 6 }, new[] { 0, 1 }, new[] { 1, 0 } },
+    };
+
+    [Theory]
+    [MemberData(nameof(DotCases))]
+    public void TensorDot_GpuMatchesCpu(int[] shapeA, int[] shapeB, int[] axesA, int[] axesB)
+    {
+        if (!EnsureGpuReady()) return;
+        var a = Rand(81, shapeA);
+        var b = Rand(82, shapeB);
+
+        var cpu = _cpu.TensorDot(a, b, axesA, axesB);
+        var gpu = _gpu.TensorDot(a, b, axesA, axesB);
+        AssertMatch(gpu, cpu, $"TensorDot[{string.Join("x", shapeA)};{string.Join("x", shapeB)};a={string.Join(",", axesA)};b={string.Join(",", axesB)}]");
+    }
 }
 #endif
