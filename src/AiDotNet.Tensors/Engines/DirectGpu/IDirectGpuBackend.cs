@@ -1916,6 +1916,13 @@ public interface IDirectGpuBackend : IDisposable
     /// </summary>
     void SearchSorted(IGpuBuffer sortedSeq, IGpuBuffer values, IGpuBuffer output, int seqLen, int numValues, int right);
 
+    /// <summary>
+    /// IEEE nextafter: output[i] = the next representable float after a[i] in the direction of b[i].
+    /// Implementations MUST detect NaN via the bit pattern (fast-math hazard) and manipulate the float
+    /// bits directly.
+    /// </summary>
+    void NextAfter(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int size);
+
     #region Comparison Operations
 
     void GreaterThan(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size);

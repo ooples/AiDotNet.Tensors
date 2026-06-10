@@ -151,6 +151,21 @@ __kernel void search_sorted(__global const float* seq, __global const float* val
     }
     output[idx] = (float)lo;
 }
+// IEEE nextafter via direct bit manipulation; NaN detected by bit pattern (fast-math safe).
+__kernel void next_after(__global const float* a, __global const float* b, __global float* output, int size) {
+    int idx = get_global_id(0); if (idx >= size) return;
+    float av = a[idx], bv = b[idx];
+    uint ua = as_uint(av), ub = as_uint(bv);
+    int aNan = (((ua >> 23) & 0xFFu) == 0xFFu) && ((ua & 0x7FFFFFu) != 0u);
+    int bNan = (((ub >> 23) & 0xFFu) == 0xFFu) && ((ub & 0x7FFFFFu) != 0u);
+    if (aNan || bNan) { output[idx] = as_float(0x7FC00000u); return; }
+    if (av == bv) { output[idx] = bv; return; }
+    if (av == 0.0f) { output[idx] = as_float(bv > 0.0f ? 0x00000001u : 0x80000001u); return; }
+    uint r = ua;
+    if (bv > av) r = (av > 0.0f) ? (r + 1u) : (r - 1u);
+    else         r = (av > 0.0f) ? (r - 1u) : (r + 1u);
+    output[idx] = as_float(r);
+}
 ";
     }
 
@@ -164,7 +179,7 @@ __kernel void search_sorted(__global const float* seq, __global const float* val
             "eye_kernel", "linspace_kernel", "one_hot_kernel",
             "diag_kernel", "extract_diag_kernel", "triangular_mask",
             "masked_fill_kernel", "index_select", "take_along_dim",
-            "cross3", "ldexp_kernel", "kron2d", "search_sorted"
+            "cross3", "ldexp_kernel", "kron2d", "search_sorted", "next_after"
         };
     }
 }

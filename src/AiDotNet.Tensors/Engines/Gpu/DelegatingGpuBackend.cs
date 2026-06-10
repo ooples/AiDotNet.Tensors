@@ -1440,6 +1440,8 @@ public class DelegatingGpuBackend : IDirectGpuBackend
     public virtual void Kron2D(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int am, int an, int bp, int bq) => Inner.Kron2D(a, b, output, am, an, bp, bq);
     /// <inheritdoc/>
     public virtual void SearchSorted(IGpuBuffer sortedSeq, IGpuBuffer values, IGpuBuffer output, int seqLen, int numValues, int right) => Inner.SearchSorted(sortedSeq, values, output, seqLen, numValues, right);
+    /// <inheritdoc/>
+    public virtual void NextAfter(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int size) => Inner.NextAfter(a, b, output, size);
 
     /// <inheritdoc/>
     public virtual void Where(IGpuBuffer condition, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)

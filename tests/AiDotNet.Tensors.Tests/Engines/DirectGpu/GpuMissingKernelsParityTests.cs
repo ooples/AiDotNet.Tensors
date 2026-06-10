@@ -521,6 +521,15 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         AssertBitMatch(_gpu.TensorEq(a, b), _cpu.TensorEq(a, b), "TensorEq");
     }
 
+    [Fact]
+    public void TensorNextAfter_GpuMatchesCpu()
+    {
+        if (!EnsureGpuReady()) return;
+        var a = new Tensor<float>(new float[] { 1f, 2f, -3f, 0f, 0f, 5f, 100f, -0.5f }, new[] { 8 });
+        var b = new Tensor<float>(new float[] { 2f, 1f, -2f, 1f, -1f, 5f, 99f, -0.6f }, new[] { 8 });
+        AssertMatch(_gpu.TensorNextAfter(a, b), _cpu.TensorNextAfter(a, b), "NextAfter");
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]

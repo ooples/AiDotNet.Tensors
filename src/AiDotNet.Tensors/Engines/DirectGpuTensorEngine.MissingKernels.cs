@@ -811,6 +811,28 @@ public partial class DirectGpuTensorEngine
     }
 
     /// <inheritdoc/>
+    public override Tensor<T> TensorNextAfter<T>(Tensor<T> a, Tensor<T> b)
+    {
+        if (a is null) throw new ArgumentNullException(nameof(a));
+        if (b is null) throw new ArgumentNullException(nameof(b));
+        if (typeof(T) != typeof(float) || !ShapesEqual(a._shape, b._shape) || !TryGetBackend(out var backend))
+            return base.TensorNextAfter(a, b);
+        try
+        {
+            var ca = a.IsContiguous ? a : (Tensor<T>)a.Contiguous();
+            var cb = b.IsContiguous ? b : (Tensor<T>)b.Contiguous();
+            int n = a.Length;
+            using var bufA = GetOrAllocateBuffer(backend, ca.GetDataArray());
+            using var bufB = GetOrAllocateBuffer(backend, cb.GetDataArray());
+            var bufOut = AllocateOutputBuffer(backend, n);
+            backend.NextAfter(bufA.Buffer, bufB.Buffer, bufOut.Buffer, n);
+            var arr = FinishGpuOp<T>(backend, bufOut, n);
+            return new Tensor<T>(arr, (int[])a._shape.Clone());
+        }
+        catch (Exception) { return base.TensorNextAfter(a, b); }
+    }
+
+    /// <inheritdoc/>
     public override Tensor<T> TensorCross<T>(Tensor<T> a, Tensor<T> b, int dim = -1)
     {
         if (a is null) throw new ArgumentNullException(nameof(a));
