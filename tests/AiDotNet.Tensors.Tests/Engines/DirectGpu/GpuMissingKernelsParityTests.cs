@@ -501,6 +501,23 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
     }
 
     [Theory]
+    [InlineData(2, 5, 4, 6, false)]
+    [InlineData(2, 5, 4, 6, true)]
+    [InlineData(3, 7, 8, 5, true)]
+    public void LstmSequenceForward_GpuMatchesCpu(int batch, int seq, int inF, int hidden, bool returnSeq)
+    {
+        if (!EnsureGpuReady()) return;
+        var input = Rand(250, batch, seq, inF);
+        var wIh = Rand(251, 4 * hidden, inF);
+        var wHh = Rand(252, 4 * hidden, hidden);
+        var bIh = Rand(253, 4 * hidden);
+        var bHh = Rand(254, 4 * hidden);
+        var cpu = _cpu.LstmSequenceForward(input, null, null, wIh, wHh, bIh, bHh, returnSeq);
+        var gpu = _gpu.LstmSequenceForward(input, null, null, wIh, wHh, bIh, bHh, returnSeq);
+        AssertMatch(gpu, cpu, $"LSTM[b{batch};s{seq};in{inF};h{hidden};seq={returnSeq}]");
+    }
+
+    [Theory]
     [InlineData(1, 4, 8, 2)]
     [InlineData(2, 6, 12, 3)]
     [InlineData(1, 3, 16, 4)]

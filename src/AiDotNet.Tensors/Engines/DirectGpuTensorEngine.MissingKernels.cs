@@ -1494,6 +1494,78 @@ public partial class DirectGpuTensorEngine
 
     // ----- Category B: composite forwards -----
 
+    // Returns the contiguous float data of an optional tensor, or a zero array of `size` when null.
+    private float[] ZerosOrData<T>(Tensor<T>? t, int size)
+    {
+        if (t is null) return new float[size];
+        var c = t.IsContiguous ? t : (Tensor<T>)t.Contiguous();
+        return (float[])(object)c.GetDataArray();
+    }
+
+    /// <inheritdoc/>
+    public override Tensor<T> LstmSequenceForward<T>(
+        Tensor<T> input, Tensor<T>? h0, Tensor<T>? c0, Tensor<T> wIh, Tensor<T> wHh,
+        Tensor<T>? bIh, Tensor<T>? bHh, bool returnSequences = false)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (wIh is null) throw new ArgumentNullException(nameof(wIh));
+        if (wHh is null) throw new ArgumentNullException(nameof(wHh));
+        if (typeof(T) != typeof(float) || input.Rank != 3 || !TryGetBatchBackend(out var backend))
+            return base.LstmSequenceForward(input, h0, c0, wIh, wHh, bIh, bHh, returnSequences);
+
+        int B = input._shape[0], S = input._shape[1], In = input._shape[2];
+        int gateRows = wIh._shape[0];
+        if (gateRows % 4 != 0 || wIh._shape[1] != In || wHh._shape[0] != gateRows || wHh._shape[1] != gateRows / 4)
+            return base.LstmSequenceForward(input, h0, c0, wIh, wHh, bIh, bHh, returnSequences);
+        int Hd = gateRows / 4;
+        if (B == 0 || S == 0)
+            return base.LstmSequenceForward(input, h0, c0, wIh, wHh, bIh, bHh, returnSequences);
+
+        // Engine weights/bias/gates (PyTorch i,f,g,o; [4*hidden, *]) match the kernel exactly. Only the
+        // sequence layout differs: the kernel wants [seq, batch, *], the engine uses [batch, seq, *], so
+        // transpose in and (for returnSequences) out.
+        try
+        {
+            var inBSI = input.IsContiguous ? input : (Tensor<T>)input.Contiguous();
+            var inSBI = PermuteResidentGpu(backend, inBSI, new[] { 1, 0, 2 });   // [S, B, In]
+
+            using var bufInput = GetOrAllocateBuffer(backend, inSBI.GetDataArray());
+            using var bufWih = GetOrAllocateBuffer(backend, (wIh.IsContiguous ? wIh : (Tensor<T>)wIh.Contiguous()).GetDataArray());
+            using var bufWhh = GetOrAllocateBuffer(backend, (wHh.IsContiguous ? wHh : (Tensor<T>)wHh.Contiguous()).GetDataArray());
+            using var bufH0 = GetOrAllocateBuffer(backend, (T[])(object)ZerosOrData(h0, B * Hd));
+            using var bufC0 = GetOrAllocateBuffer(backend, (T[])(object)ZerosOrData(c0, B * Hd));
+            using var bufBih = GetOrAllocateBuffer(backend, (T[])(object)ZerosOrData(bIh, gateRows));
+            using var bufBhh = GetOrAllocateBuffer(backend, (T[])(object)ZerosOrData(bHh, gateRows));
+
+            using var bufHf = AllocateOutputBuffer(backend, B * Hd);
+            using var bufCf = AllocateOutputBuffer(backend, B * Hd);
+            using var bufAllH = AllocateOutputBuffer(backend, (S + 1) * B * Hd);
+            using var bufAllC = AllocateOutputBuffer(backend, (S + 1) * B * Hd);
+            using var bufGates = AllocateOutputBuffer(backend, S * B * Hd * 4);
+            var bufOut = AllocateOutputBuffer(backend, S * B * Hd);
+
+            backend.LstmForwardSequence(
+                bufInput.Buffer, bufH0.Buffer, bufC0.Buffer, bufWih.Buffer, bufWhh.Buffer, bufBih.Buffer, bufBhh.Buffer,
+                bufOut.Buffer, bufHf.Buffer, bufCf.Buffer, bufAllH.Buffer, bufAllC.Buffer, bufGates.Buffer,
+                S, B, In, Hd);
+
+            if (returnSequences)
+            {
+                var outArr = FinishGpuOp<T>(backend, bufOut, S * B * Hd);
+                var outSBH = new Tensor<T>(outArr, new[] { S, B, Hd });
+                return PermuteResidentGpu(backend, outSBH, new[] { 1, 0, 2 });   // [B, S, Hd]
+            }
+            backend.Synchronize();
+            var hf = backend.DownloadBuffer(bufHf.Buffer);
+            bufOut.Dispose();
+            return new Tensor<T>((T[])(object)hf, new[] { B, Hd });
+        }
+        catch (Exception)
+        {
+            return base.LstmSequenceForward(input, h0, c0, wIh, wHh, bIh, bHh, returnSequences);
+        }
+    }
+
     // Row-wise softmax over the last axis, GPU-resident.
     private Tensor<T> SoftmaxLastAxisGpu<T>(IDirectGpuBackend backend, Tensor<T> x)
     {
