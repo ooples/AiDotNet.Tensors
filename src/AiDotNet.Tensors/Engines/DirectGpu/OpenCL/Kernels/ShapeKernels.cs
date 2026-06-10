@@ -104,12 +104,12 @@ __kernel void index_select(__global const float* input, __global const float* in
 }
 // Gather along one axis (take_along_dim/gather): input viewed [outer, axisIn, inner], indices/output
 // viewed [outer, axisOut, inner]; output[o,j,i] = input[o, indices[o,j,i], i].
-__kernel void take_along_dim(__global const float* input, __global const int* indices, __global float* output,
+__kernel void take_along_dim(__global const float* input, __global const float* indices, __global float* output,
     int outerSize, int axisOut, int innerSize, int axisIn) {
     int idx = get_global_id(0); int total = outerSize * axisOut * innerSize; if (idx >= total) return;
     int inner = idx % innerSize;
     int outer = (idx / innerSize) / axisOut;
-    int srcJ = indices[idx];
+    int srcJ = (int)indices[idx];
     if (srcJ < 0 || srcJ >= axisIn) { output[idx] = 0.0f; return; }
     output[idx] = input[(outer * axisIn + srcJ) * innerSize + inner];
 }

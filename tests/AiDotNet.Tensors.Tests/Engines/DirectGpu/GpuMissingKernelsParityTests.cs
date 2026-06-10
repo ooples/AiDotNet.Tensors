@@ -679,6 +679,21 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
     }
 
     [Fact]
+    public void ArgsortToTakeAlongDim_ResidentChain_GpuMatchesCpu()
+    {
+        if (!EnsureGpuReady()) return;
+        var x = DistinctRand(330, 4, 8);
+        // Argsort -> gather along the last axis: indices stay GPU-resident through the chain and must
+        // reproduce the sorted values.
+        var gIdx = _gpu.TensorArgsort(x, -1, false);
+        var gSorted = _gpu.TensorTakeAlongDim(x, gIdx, -1);
+        var cIdx = _cpu.TensorArgsort(x, -1, false);
+        var cSorted = _cpu.TensorTakeAlongDim(x, cIdx, -1);
+        Assert.Equal(cIdx.ToArray(), gIdx.ToArray());
+        AssertMatch(gSorted, cSorted, "argsort->takeAlongDim");
+    }
+
+    [Fact]
     public void PredicateToLogical_ResidentChain_GpuMatchesCpu()
     {
         if (!EnsureGpuReady()) return;

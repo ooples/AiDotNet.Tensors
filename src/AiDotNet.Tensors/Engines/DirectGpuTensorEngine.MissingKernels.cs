@@ -979,7 +979,10 @@ public partial class DirectGpuTensorEngine
     // power of two on the device (ascending pad = NaN -> +inf -> tail; descending pad = -inf -> tail);
     // the host drives the O(log^2 P) bitonic (k, j) schedule. Indices ride along as floats (exact for
     // the index range). Verified against the CPU reference.
-    private (float[] vals, int[] idx) BitonicSortRows(IDirectGpuBackend backend, float[] data, int numRows, int L, bool descending)
+    // Sorts numRows rows of length L on the GPU and returns the un-padded sorted VALUE + INDEX buffers
+    // (index buffer holds the original positions as float; caller owns both — NOT downloaded). This is
+    // the resident core; download wrappers and FinishGpuOp callers build on it.
+    private (OwnedBuffer outVal, OwnedBuffer outIdx) BitonicSortRowsToBuffers(IDirectGpuBackend backend, float[] data, int numRows, int L, bool descending)
     {
         int P = 1; while (P < L) P <<= 1;
         float padVal = descending ? float.NegativeInfinity : float.NaN;
@@ -993,16 +996,26 @@ public partial class DirectGpuTensorEngine
         for (int k = 2; k <= P; k <<= 1)
             for (int j = k >> 1; j > 0; j >>= 1)
                 backend.BitonicStep(valBuf.Buffer, idxBuf.Buffer, P, k, j, numRows, desc);
-        using var outVal = AllocateOutputBuffer(backend, numRows * L);
-        using var outIdx = AllocateOutputBuffer(backend, numRows * L);
+        var outVal = AllocateOutputBuffer(backend, numRows * L);
+        var outIdx = AllocateOutputBuffer(backend, numRows * L);
         backend.CopyRows(valBuf.Buffer, outVal.Buffer, P, L, numRows, L);   // un-pad P -> L (drop tail)
         backend.CopyRows(idxBuf.Buffer, outIdx.Buffer, P, L, numRows, L);
-        backend.Synchronize();
-        var vals = backend.DownloadBuffer(outVal.Buffer);
-        var idxF = backend.DownloadBuffer(outIdx.Buffer);
-        var idx = new int[numRows * L];
-        for (int i = 0; i < idx.Length; i++) idx[i] = (int)idxF[i];
-        return (vals, idx);
+        return (outVal, outIdx);
+    }
+
+    private (float[] vals, int[] idx) BitonicSortRows(IDirectGpuBackend backend, float[] data, int numRows, int L, bool descending)
+    {
+        var (outVal, outIdx) = BitonicSortRowsToBuffers(backend, data, numRows, L, descending);
+        using (outVal)
+        using (outIdx)
+        {
+            backend.Synchronize();
+            var vals = backend.DownloadBuffer(outVal.Buffer);
+            var idxF = backend.DownloadBuffer(outIdx.Buffer);
+            var idx = new int[numRows * L];
+            for (int i = 0; i < idx.Length; i++) idx[i] = (int)idxF[i];
+            return (vals, idx);
+        }
     }
 
     /// <inheritdoc/>
@@ -1021,9 +1034,14 @@ public partial class DirectGpuTensorEngine
             int numRows = L == 0 ? 0 : input.Length / L;
             if (numRows == 0 || L == 0) return base.TensorSort(input, axis, descending);
             var data = (float[])(object)c.GetDataArray();
-            var (vals, idx) = BitonicSortRows(backend, data, numRows, L, descending);
-            var valuesT = new Tensor<T>((T[])(object)vals, (int[])input._shape.Clone());
-            var indicesT = new Tensor<int>(idx, (int[])input._shape.Clone());
+            // Resident: keep the sorted values AND the int indices on the GPU (FinishGpuOp). The index
+            // tensor rides as a float buffer (int-as-float); downstream TakeAlongDim/gather reuse it in
+            // place (no re-upload) — completing the argsort -> gather int-residency chain.
+            var (outVal, outIdx) = BitonicSortRowsToBuffers(backend, data, numRows, L, descending);
+            var valuesArr = FinishGpuOp<T>(backend, outVal, numRows * L);
+            var indicesArr = FinishGpuOp<int>(backend, outIdx, numRows * L);
+            var valuesT = new Tensor<T>(valuesArr, (int[])input._shape.Clone());
+            var indicesT = new Tensor<int>(indicesArr, (int[])input._shape.Clone());
             return (valuesT, indicesT);
         }
         catch (Exception) { return base.TensorSort(input, axis, descending); }
@@ -1124,9 +1142,11 @@ public partial class DirectGpuTensorEngine
             int outN = outerSize * axisOut * innerSize;
 
             using var bufIn = GetOrAllocateBuffer(backend, ct.GetDataArray());
-            using var bufIdx = backend.AllocateIntBuffer(ci.GetDataArray());
+            // Indices ride as a FLOAT buffer (int values, cast in-kernel) so a RESIDENT int-index tensor
+            // (e.g. from Argsort) is reused in place instead of re-uploaded — the int-residency chain.
+            using var bufIdx = GetOrAllocateBuffer(backend, ci);
             var bufOut = AllocateOutputBuffer(backend, outN);
-            backend.TakeAlongDim(bufIn.Buffer, bufIdx, bufOut.Buffer, outerSize, axisOut, innerSize, axisIn);
+            backend.TakeAlongDim(bufIn.Buffer, bufIdx.Buffer, bufOut.Buffer, outerSize, axisOut, innerSize, axisIn);
             var arr = FinishGpuOp<T>(backend, bufOut, outN);
             return new Tensor<T>(arr, (int[])indices._shape.Clone());
         }
