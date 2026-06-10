@@ -1481,6 +1481,8 @@ public class DelegatingGpuBackend : IDirectGpuBackend
     /// <inheritdoc/>
     public virtual void GridSampleBackwardInputNhwc(IGpuBuffer gradOut, IGpuBuffer grid, IGpuBuffer gradIn, int batch, int h, int w, int c, int outH, int outW) => Inner.GridSampleBackwardInputNhwc(gradOut, grid, gradIn, batch, h, w, c, outH, outW);
     /// <inheritdoc/>
+    public virtual void GridSampleBackwardGridNhwc(IGpuBuffer gradOut, IGpuBuffer input, IGpuBuffer grid, IGpuBuffer gradGrid, int batch, int h, int w, int c, int outH, int outW) => Inner.GridSampleBackwardGridNhwc(gradOut, input, grid, gradGrid, batch, h, w, c, outH, outW);
+    /// <inheritdoc/>
     public virtual void ScatterReduce(IGpuBuffer output, IGpuBuffer source, IGpuBuffer index, int outerSize, int srcDim, int dstDim, int innerSize, int mode) => Inner.ScatterReduce(output, source, index, outerSize, srcDim, dstDim, innerSize, mode);
     /// <inheritdoc/>
     public virtual void Unfold(IGpuBuffer src, IGpuBuffer dst, int outerSize, int dimSize, int innerSize, int nWindows, int size, int step) => Inner.Unfold(src, dst, outerSize, dimSize, innerSize, nWindows, size, step);

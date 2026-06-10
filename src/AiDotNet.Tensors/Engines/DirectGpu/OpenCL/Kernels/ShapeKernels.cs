@@ -431,6 +431,35 @@ __kernel void gridsample_backward_input(__global const float* gradOut, __global 
     if (h1>=0 && h1<H && w0>=0 && w0<W) atomicAddF(&gradIn[((b*H+h1)*W+w0)*C+c], g*lh*(1.0f-lw));
     if (h1>=0 && h1<H && w1>=0 && w1<W) atomicAddF(&gradIn[((b*H+h1)*W+w1)*C+c], g*lh*lw);
 }
+// GridSample bilinear backward-to-grid (NHWC). One thread per (b,oh,ow): gradGrid = d(out)/d(g) summed
+// over channels via the bilinear coordinate derivative, chain-ruled by (size-1)/2. No atomics.
+__kernel void gridsample_backward_grid(__global const float* gradOut, __global const float* input,
+    __global const float* grid, __global float* gradGrid, int batch, int H, int W, int C, int outH, int outW) {
+    int idx = get_global_id(0); if (idx >= batch*outH*outW) return;
+    int ow = idx % outW; int tmp = idx / outW; int oh = tmp % outH; int b = tmp / outH;
+    int gridBase = ((b*outH+oh)*outW+ow)*2;
+    float gx = grid[gridBase]; float gy = grid[gridBase+1];
+    float srcH = (gy+1.0f)*0.5f*(float)(H-1); float srcW = (gx+1.0f)*0.5f*(float)(W-1);
+    float gradGx = 0.0f; float gradGy = 0.0f;
+    if (!(srcH <= -1.0f || srcH >= (float)H || srcW <= -1.0f || srcW >= (float)W)) {
+        int h0 = (int)floor(srcH); int h1 = h0+1; int w0 = (int)floor(srcW); int w1 = w0+1;
+        float lh = srcH-(float)h0; float lw = srcW-(float)w0;
+        int in00 = (h0>=0&&h0<H&&w0>=0&&w0<W); int in01 = (h0>=0&&h0<H&&w1>=0&&w1<W);
+        int in10 = (h1>=0&&h1<H&&w0>=0&&w0<W); int in11 = (h1>=0&&h1<H&&w1>=0&&w1<W);
+        for (int c = 0; c < C; c++) {
+            float v00 = in00 ? input[((b*H+h0)*W+w0)*C+c] : 0.0f;
+            float v01 = in01 ? input[((b*H+h0)*W+w1)*C+c] : 0.0f;
+            float v10 = in10 ? input[((b*H+h1)*W+w0)*C+c] : 0.0f;
+            float v11 = in11 ? input[((b*H+h1)*W+w1)*C+c] : 0.0f;
+            float dH = (1.0f-lw)*(v10-v00) + lw*(v11-v01);
+            float dW = (1.0f-lh)*(v01-v00) + lh*(v11-v10);
+            float go = gradOut[((b*outH+oh)*outW+ow)*C+c];
+            gradGx += go * dW * (float)(W-1)*0.5f;
+            gradGy += go * dH * (float)(H-1)*0.5f;
+        }
+    }
+    gradGrid[gridBase] = gradGx; gradGrid[gridBase+1] = gradGy;
+}
 // Condensed pairwise p-norm over rows of input[n,d]; output 1-D upper-triangle (i<j) order.
 __kernel void pdist(__global const float* input, __global float* output, int n, int d, float p) {
     int flat = get_global_id(0); if (flat >= n * n) return;
@@ -477,7 +506,7 @@ __kernel void next_after(__global const float* a, __global const float* b, __glo
             "masked_fill_kernel", "index_select", "take_along_dim",
             "cross3", "ldexp_kernel", "kron2d", "search_sorted", "next_after", "index_write", "cdist", "pdist",
             "histc", "bitonic_step", "copy_rows", "iota_pad", "rwkv7_forward", "hsoftmax_paths",
-            "isin", "unfold", "copy_block_2d", "scatter_reduce", "zeta_kernel", "polygamma_kernel", "shifted_diff", "histogramdd", "masks_to_boxes", "logical_op", "logical_not", "gridsample_backward_input"
+            "isin", "unfold", "copy_block_2d", "scatter_reduce", "zeta_kernel", "polygamma_kernel", "shifted_diff", "histogramdd", "masks_to_boxes", "logical_op", "logical_not", "gridsample_backward_input", "gridsample_backward_grid"
         };
     }
 }

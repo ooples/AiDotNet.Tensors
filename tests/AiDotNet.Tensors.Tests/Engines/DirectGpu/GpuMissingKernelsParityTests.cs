@@ -724,16 +724,19 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
     }
 
     [Fact]
-    public void GridSampleBackwardInput_GpuMatchesCpu()
+    public void GridSampleBackward_GpuMatchesCpu()
     {
         if (!EnsureGpuReady()) return;
         int N = 2, H = 4, W = 5, C = 3, outH = 3, outW = 4;   // NHWC
         var gradOut = Rand(340, N, outH, outW, C);
+        var input = Rand(342, N, H, W, C);
         var grid = Rand(341, N, outH, outW, 2);               // normalized coords ~[-1,1]
         var mode = AiDotNet.Tensors.Engines.GridSampleMode.Bilinear;
         var pad = AiDotNet.Tensors.Engines.GridSamplePadding.Zeros;
         AssertMatch(_gpu.GridSampleBackwardInput(gradOut, grid, new[] { N, H, W, C }, mode, pad, false),
                     _cpu.GridSampleBackwardInput(gradOut, grid, new[] { N, H, W, C }, mode, pad, false), "GSBackwardInput");
+        AssertMatch(_gpu.GridSampleBackwardGrid(gradOut, input, grid, mode, pad, false),
+                    _cpu.GridSampleBackwardGrid(gradOut, input, grid, mode, pad, false), "GSBackwardGrid");
     }
 
     [Fact]

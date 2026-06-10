@@ -1631,6 +1631,35 @@ public partial class DirectGpuTensorEngine
     }
 
     /// <inheritdoc/>
+    public override Tensor<T> GridSampleBackwardGrid<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> grid,
+        GridSampleMode mode, GridSamplePadding padding, bool alignCorners)
+    {
+        if (gradOutput is null) throw new ArgumentNullException(nameof(gradOutput));
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (grid is null) throw new ArgumentNullException(nameof(grid));
+        if (typeof(T) != typeof(float) || mode != GridSampleMode.Bilinear || padding != GridSamplePadding.Zeros
+            || alignCorners || input.Rank != 4 || gradOutput.Rank != 4 || grid.Rank != 4 || !TryGetBackend(out var backend))
+            return base.GridSampleBackwardGrid(gradOutput, input, grid, mode, padding, alignCorners);
+        int N = input._shape[0], H = input._shape[1], W = input._shape[2], C = input._shape[3];
+        int outH = grid._shape[1], outW = grid._shape[2];
+        try
+        {
+            var cgo = gradOutput.IsContiguous ? gradOutput : (Tensor<T>)gradOutput.Contiguous();
+            var ci = input.IsContiguous ? input : (Tensor<T>)input.Contiguous();
+            var cg = grid.IsContiguous ? grid : (Tensor<T>)grid.Contiguous();
+            int gridSize = N * outH * outW * 2;
+            using var bufGO = GetOrAllocateBuffer(backend, cgo.GetDataArray());
+            using var bufIn = GetOrAllocateBuffer(backend, ci.GetDataArray());
+            using var bufGrid = GetOrAllocateBuffer(backend, cg.GetDataArray());
+            var bufGradGrid = AllocateOutputBuffer(backend, gridSize);
+            backend.GridSampleBackwardGridNhwc(bufGO.Buffer, bufIn.Buffer, bufGrid.Buffer, bufGradGrid.Buffer, N, H, W, C, outH, outW);
+            var arr = FinishGpuOp<T>(backend, bufGradGrid, gridSize);
+            return new Tensor<T>(arr, (int[])grid._shape.Clone());
+        }
+        catch (Exception) { return base.GridSampleBackwardGrid(gradOutput, input, grid, mode, padding, alignCorners); }
+    }
+
+    /// <inheritdoc/>
     public override Tensor<T> TensorZeta<T>(Tensor<T> x, Tensor<T> q)
     {
         if (x is null) throw new ArgumentNullException(nameof(x));

@@ -8111,6 +8111,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public void LogicalOp(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int mode, int n) => throw new NotSupportedException("LogicalOp not yet implemented on the HIP backend.");
     public void LogicalNot(IGpuBuffer a, IGpuBuffer output, int n) => throw new NotSupportedException("LogicalNot not yet implemented on the HIP backend.");
     public void GridSampleBackwardInputNhwc(IGpuBuffer gradOut, IGpuBuffer grid, IGpuBuffer gradIn, int batch, int h, int w, int c, int outH, int outW) => throw new NotSupportedException("GridSampleBackwardInputNhwc not yet implemented on the HIP backend.");
+    public void GridSampleBackwardGridNhwc(IGpuBuffer gradOut, IGpuBuffer input, IGpuBuffer grid, IGpuBuffer gradGrid, int batch, int h, int w, int c, int outH, int outW) => throw new NotSupportedException("GridSampleBackwardGridNhwc not yet implemented on the HIP backend.");
     public void ScatterReduce(IGpuBuffer output, IGpuBuffer source, IGpuBuffer index, int outerSize, int srcDim, int dstDim, int innerSize, int mode) => throw new NotSupportedException("ScatterReduce not yet implemented on the HIP backend.");
     public void Unfold(IGpuBuffer src, IGpuBuffer dst, int outerSize, int dimSize, int innerSize, int nWindows, int size, int step) => throw new NotSupportedException("Unfold not yet implemented on the HIP backend.");
 
