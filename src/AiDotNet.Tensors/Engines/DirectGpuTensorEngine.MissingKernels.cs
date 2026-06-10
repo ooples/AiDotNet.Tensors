@@ -787,6 +787,46 @@ public partial class DirectGpuTensorEngine
     }
 
     /// <inheritdoc/>
+    public override Tensor<T>[] TensorMeshgrid<T>(Tensor<T>[] tensors, string indexing = "ij")
+    {
+        if (tensors is null) throw new ArgumentNullException(nameof(tensors));
+        if (tensors.Length == 0) return System.Array.Empty<Tensor<T>>();
+        foreach (var t in tensors)
+        {
+            if (t is null) throw new ArgumentNullException(nameof(tensors));
+            if (t.Rank != 1) return base.TensorMeshgrid(tensors, indexing);
+        }
+        if (indexing != "ij" && indexing != "xy")
+            throw new ArgumentException("indexing must be 'ij' or 'xy'");
+        if (typeof(T) != typeof(float) || !TryGetBackend(out _))
+            return base.TensorMeshgrid(tensors, indexing);
+
+        // Each output grid k = input k reshaped onto its output axis (size n_k, 1s elsewhere) then
+        // broadcast to the full grid shape — both GPU-resident ops, so the grids stay on the device.
+        try
+        {
+            int d = tensors.Length;
+            var outShape = new int[d];
+            for (int i = 0; i < d; i++) outShape[i] = tensors[i]._shape[0];
+            bool xy = indexing == "xy" && d >= 2;
+            if (xy) { int tmp = outShape[0]; outShape[0] = outShape[1]; outShape[1] = tmp; }
+
+            var result = new Tensor<T>[d];
+            for (int k = 0; k < d; k++)
+            {
+                int axis = k;
+                if (xy) { if (k == 0) axis = 1; else if (k == 1) axis = 0; }
+                var rshape = new int[d];
+                for (int i = 0; i < d; i++) rshape[i] = 1;
+                rshape[axis] = tensors[k]._shape[0];
+                result[k] = TensorBroadcastTo(tensors[k].Reshape(rshape), outShape);
+            }
+            return result;
+        }
+        catch (Exception) { return base.TensorMeshgrid(tensors, indexing); }
+    }
+
+    /// <inheritdoc/>
     public override Tensor<T> TensorKron<T>(Tensor<T> a, Tensor<T> b)
     {
         if (a is null) throw new ArgumentNullException(nameof(a));

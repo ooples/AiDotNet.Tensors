@@ -522,6 +522,23 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
     }
 
     [Theory]
+    [InlineData("ij")]
+    [InlineData("xy")]
+    public void TensorMeshgrid_GpuMatchesCpu(string indexing)
+    {
+        if (!EnsureGpuReady()) return;
+        var a = Rand(206, 3);
+        var b = Rand(207, 4);
+        var c = Rand(208, 2);
+        var inputs = new[] { a, b, c };
+        var gpu = _gpu.TensorMeshgrid(inputs, indexing);
+        var cpu = _cpu.TensorMeshgrid(inputs, indexing);
+        Assert.Equal(cpu.Length, gpu.Length);
+        for (int k = 0; k < cpu.Length; k++)
+            AssertMatch(gpu[k], cpu[k], $"Meshgrid[{indexing}][{k}]");
+    }
+
+    [Theory]
     [InlineData(10, 0f, 1f)]
     [InlineData(8, -2f, 2f)]
     [InlineData(5, 0f, 10f)]
