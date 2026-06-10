@@ -1073,8 +1073,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // buffer to UploadTensorRaw callers.
         if (tensor._gpuBuffer is not null && ReferenceEquals(tensor._gpuBackend, backend))
         {
-            if (tensor._gpuBufferVersion == tensor.Version && IsCachedGpuBufferLive(tensor, backend))
-                return new OwnedBuffer(tensor._gpuBuffer, ownsBuffer: false);
+            if (EvictionSuspended || (tensor._gpuBufferVersion == tensor.Version && IsCachedGpuBufferLive(tensor, backend)))
+                return new OwnedBuffer(tensor._gpuBuffer, ownsBuffer: false);   // compiled step: buffers pinned, don't orphan aliases
 
             var staleArray = tensor.DataVector.GetBackingArrayUnsafe();
             if (staleArray is not null)
