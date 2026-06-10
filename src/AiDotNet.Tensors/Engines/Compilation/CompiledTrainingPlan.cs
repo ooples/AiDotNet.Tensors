@@ -532,12 +532,31 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     // embedding gather reads the now-resident index buffer WITHOUT an inline upload (a cuMemcpyHtoD
                     // inside capture is CUDA 906 STREAM_CAPTURE_UNSUPPORTED). Flag cleared after capture so the eager
                     // fallback (and warmup steps) upload inline again.
-                    if (_graphHasEmbedding) gte.EmbeddingIndexExternallyManaged = false;
-                    RefreshGraphInputInPlace(cb);
-                    RunGpuStepBodyForCapture(cb);
-                    if (_graphHasEmbedding) gte.EmbeddingIndexExternallyManaged = true;
-                    var exec = cb.CaptureGraph(() => RunGpuStepBodyForCapture(cb));
-                    if (_graphHasEmbedding) gte.EmbeddingIndexExternallyManaged = false;
+                    IntPtr exec;
+                    try
+                    {
+                        if (_graphHasEmbedding) gte.EmbeddingIndexExternallyManaged = false;
+                        RefreshGraphInputInPlace(cb);
+                        RunGpuStepBodyForCapture(cb);
+                        if (_graphHasEmbedding) gte.EmbeddingIndexExternallyManaged = true;
+                        exec = cb.CaptureGraph(() => RunGpuStepBodyForCapture(cb));
+                    }
+                    catch
+                    {
+                        // A throw during pre-residency/capture (not just exec==Zero) must also roll back the
+                        // graph-lifetime state — otherwise eviction stays suspended (pins every offload buffer,
+                        // risking OOM) and the embedding stays in externally-managed mode (the eager fallback
+                        // would skip its inline index upload and silently train on stale indices). PR #581 review.
+                        _graphStepDisabled = true;
+                        if (_graphHasEmbedding) gte.EmbeddingIndexExternallyManaged = false;
+                        gte.ResumeActivationEviction();
+                        _graphEvictionSuspended = false;
+                        throw;
+                    }
+                    finally
+                    {
+                        if (_graphHasEmbedding) gte.EmbeddingIndexExternallyManaged = false;
+                    }
                     if (exec == IntPtr.Zero)
                     {
                         // Capture failed → the graph is permanently abandoned for this plan. Resume the
@@ -592,7 +611,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     {
         // In-graph embedding design: for an embedding-first plan there is NO float input to refresh (the gather
         // happens on-device inside the captured graph; only the small index buffer is refreshed, via
-        // RefreshGraphEmbeddingIndicesNow). _compiledInputTensor is null for those plans → no-op here.
+        // RefreshGraphEmbeddingIndicesNow). _compiledInputTensor stays set for SetInput/SetInputs API
+        // compatibility (it's the embeddings matrix there), so gate on the flag, not on null.
+        if (_graphHasEmbedding) return;
         if (_compiledInputTensor is not { } inT) return;
         if (inT._gpuBuffer is not { } buf || !ReferenceEquals(inT._gpuBackend, cb)) return;
         var data = inT.GetDataArray();                 // host backing (T==float on the graph path)
@@ -2567,15 +2588,15 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         //   FusedOptimizer.AppendFusedUpdates(plan.BackwardActions, params, grads, lr)
         // This avoids hard-coding the learning rate into the compiled plan.
 
-        // Determine the per-step persistent input for the CUDA-graph float-input refresh. When the FIRST step is
-        // the EMBEDDING, it is now CAPTURED inside the graph (a pure on-device gather over a stable index buffer
-        // refreshed via RefreshGraphEmbeddingIndices), so there is NO float input to refresh — leave it null
-        // (refreshing the embedding output would DtoH+HtoD the whole activation each step, the util killer). For a
-        // non-embedding graph plan, the persistent input is forwardSteps[0].Inputs[0] (the generic input-feed case).
+        // _compiledInputTensor stays the caller-visible captured input (forwardSteps[0].Inputs[0]) for ALL plans
+        // so SetInput/SetInputs and the serialized input-shape metadata keep working on embedding-first plans
+        // (nulling it made SetInput throw — PR #581 review). The CUDA-graph float-input refresh is instead gated
+        // by _graphHasEmbedding in RefreshGraphInputInPlace: an embedding-first plan gathers ON-DEVICE inside the
+        // captured graph (only the small index buffer is refreshed, via RefreshGraphEmbeddingIndicesNow), so it
+        // must NOT upload a float input each step (the DtoH+HtoD round-trip is the util killer).
         bool firstIsEmbedding = forwardSteps.Count > 0 && forwardSteps[0].OpType == OpType.Embedding;
-        Tensor<T>? compiledInputTensor = firstIsEmbedding
-            ? null
-            : (forwardSteps.Count > 0 && forwardSteps[0].Inputs.Length > 0 ? forwardSteps[0].Inputs[0] : null);
+        Tensor<T>? compiledInputTensor =
+            forwardSteps.Count > 0 && forwardSteps[0].Inputs.Length > 0 ? forwardSteps[0].Inputs[0] : null;
         int[] compiledInputShape = compiledInputTensor is not null
             ? (int[])compiledInputTensor._shape.Clone() : Array.Empty<int>();
         // SEPARATE tensor for CUDA-graph replay refresh: for a token-LM whose first step is the EMBEDDING
