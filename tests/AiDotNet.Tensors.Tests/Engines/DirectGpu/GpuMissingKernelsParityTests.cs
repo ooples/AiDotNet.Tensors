@@ -679,6 +679,24 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
     }
 
     [Fact]
+    public void TensorLogical_GpuMatchesCpu_AndResidentChain()
+    {
+        if (!EnsureGpuReady()) return;
+        AiDotNet.Tensors.Bit[] ad = { true, true, false, false, true, false };
+        AiDotNet.Tensors.Bit[] bd = { true, false, true, false, false, true };
+        var a = new Tensor<AiDotNet.Tensors.Bit>(ad, new[] { 6 });
+        var b = new Tensor<AiDotNet.Tensors.Bit>(bd, new[] { 6 });
+        AssertBitMatch(_gpu.TensorLogicalAnd(a, b), _cpu.TensorLogicalAnd(a, b), "And");
+        AssertBitMatch(_gpu.TensorLogicalOr(a, b), _cpu.TensorLogicalOr(a, b), "Or");
+        AssertBitMatch(_gpu.TensorLogicalXor(a, b), _cpu.TensorLogicalXor(a, b), "Xor");
+        AssertBitMatch(_gpu.TensorLogicalNot(a), _cpu.TensorLogicalNot(a), "Not");
+        // Boolean expression chain: (a & b) | !a  — the intermediate Bit masks stay GPU-resident.
+        var chainG = _gpu.TensorLogicalOr(_gpu.TensorLogicalAnd(a, b), _gpu.TensorLogicalNot(a));
+        var chainC = _cpu.TensorLogicalOr(_cpu.TensorLogicalAnd(a, b), _cpu.TensorLogicalNot(a));
+        AssertBitMatch(chainG, chainC, "chain");
+    }
+
+    [Fact]
     public void MasksToBoxes_GpuMatchesCpu()
     {
         if (!EnsureGpuReady()) return;

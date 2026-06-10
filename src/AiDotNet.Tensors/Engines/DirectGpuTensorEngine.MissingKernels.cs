@@ -1761,6 +1761,58 @@ public partial class DirectGpuTensorEngine
     // resident) input tensors on the device instead of forcing the base to download them to scan on
     // the host. We download only the mask and pack it into Bit. `invert` flips the predicate (used for
     // Eq-via-NotEqual). Float-only. Caller disposes maskBuf.
+
+    // ----- Logical ops on Tensor<Bit> (GPU-RESIDENT boolean expressions) -----
+    // Bit masks ride the GPU as float-0/1 buffers (BitOperations converts Bit<->float). Inputs use the
+    // tensor overload of GetOrAllocateBuffer (resident masks stay on-device, no re-download), and the
+    // result is a DEFERRED Tensor<Bit> via FinishGpuOp<Bit> — so chains like (a==b) & (c<d) | !e keep
+    // every intermediate on the GPU and only materialize at the final CPU read.
+    private Tensor<Bit> LogicalBinaryGpu(Tensor<Bit> a, Tensor<Bit> b, int mode, System.Func<Tensor<Bit>, Tensor<Bit>, Tensor<Bit>> fallback)
+    {
+        if (a is null) throw new ArgumentNullException(nameof(a));
+        if (b is null) throw new ArgumentNullException(nameof(b));
+        if (!ShapesEqual(a._shape, b._shape) || !TryGetBackend(out var backend))
+            return fallback(a, b);
+        try
+        {
+            var ca = a.IsContiguous ? a : (Tensor<Bit>)a.Contiguous();
+            var cb = b.IsContiguous ? b : (Tensor<Bit>)b.Contiguous();
+            int n = a.Length;
+            using var bufA = GetOrAllocateBuffer(backend, ca);
+            using var bufB = GetOrAllocateBuffer(backend, cb);
+            var bufOut = AllocateOutputBuffer(backend, n);
+            backend.LogicalOp(bufA.Buffer, bufB.Buffer, bufOut.Buffer, mode, n);
+            var arr = FinishGpuOp<Bit>(backend, bufOut, n);
+            return new Tensor<Bit>(arr, (int[])a._shape.Clone());
+        }
+        catch (Exception) { return fallback(a, b); }
+    }
+
+    /// <inheritdoc/>
+    public override Tensor<Bit> TensorLogicalAnd(Tensor<Bit> a, Tensor<Bit> b) => LogicalBinaryGpu(a, b, 0, base.TensorLogicalAnd);
+    /// <inheritdoc/>
+    public override Tensor<Bit> TensorLogicalOr(Tensor<Bit> a, Tensor<Bit> b) => LogicalBinaryGpu(a, b, 1, base.TensorLogicalOr);
+    /// <inheritdoc/>
+    public override Tensor<Bit> TensorLogicalXor(Tensor<Bit> a, Tensor<Bit> b) => LogicalBinaryGpu(a, b, 2, base.TensorLogicalXor);
+
+    /// <inheritdoc/>
+    public override Tensor<Bit> TensorLogicalNot(Tensor<Bit> a)
+    {
+        if (a is null) throw new ArgumentNullException(nameof(a));
+        if (!TryGetBackend(out var backend)) return base.TensorLogicalNot(a);
+        try
+        {
+            var ca = a.IsContiguous ? a : (Tensor<Bit>)a.Contiguous();
+            int n = a.Length;
+            using var bufA = GetOrAllocateBuffer(backend, ca);
+            var bufOut = AllocateOutputBuffer(backend, n);
+            backend.LogicalNot(bufA.Buffer, bufOut.Buffer, n);
+            var arr = FinishGpuOp<Bit>(backend, bufOut, n);
+            return new Tensor<Bit>(arr, (int[])a._shape.Clone());
+        }
+        catch (Exception) { return base.TensorLogicalNot(a); }
+    }
+
     private static Tensor<Bit> PackMask(IDirectGpuBackend backend, OwnedBuffer maskBuf, int[] shape, int n, bool invert)
     {
         var span = backend.DownloadBuffer(maskBuf.Buffer);

@@ -1999,6 +1999,12 @@ public interface IDirectGpuBackend : IDisposable
     /// <summary>Per-mask bounding box (xMin,yMin,xMax,yMax of nonzero pixels) for masks [N,H,W] -> out [N,4].</summary>
     void MasksToBoxes(IGpuBuffer masks, IGpuBuffer output, int n, int h, int w);
 
+    /// <summary>Boolean op on float-0/1 masks. mode 0=and,1=or,2=xor.</summary>
+    void LogicalOp(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int mode, int n);
+
+    /// <summary>Logical NOT on a float-0/1 mask.</summary>
+    void LogicalNot(IGpuBuffer a, IGpuBuffer output, int n);
+
     /// <summary>
     /// scatter_reduce along a dim with atomic reduction (mode 0=sum,1=prod,2=amax,3=amin). output is
     /// pre-seeded with the original tensor (includeSelf); source/index viewed [outerSize, srcDim, innerSize].

@@ -211,6 +211,17 @@ __kernel void masks_to_boxes(__global const float* masks, __global float* out, i
     if (xMax < 0) { out[o]=0.0f; out[o+1]=0.0f; out[o+2]=0.0f; out[o+3]=0.0f; }
     else { out[o]=(float)xMin; out[o+1]=(float)yMin; out[o+2]=(float)xMax; out[o+3]=(float)yMax; }
 }
+// logical_op: boolean op on float-0/1 masks. mode 0=and, 1=or, 2=xor. out is float-0/1.
+__kernel void logical_op(__global const float* a, __global const float* b, __global float* out, int mode, int n) {
+    int i = get_global_id(0); if (i >= n) return;
+    int ba = (a[i] != 0.0f); int bb = (b[i] != 0.0f);
+    int r = (mode == 0) ? (ba && bb) : (mode == 1) ? (ba || bb) : (ba != bb);
+    out[i] = r ? 1.0f : 0.0f;
+}
+__kernel void logical_not(__global const float* a, __global float* out, int n) {
+    int i = get_global_id(0); if (i >= n) return;
+    out[i] = (a[i] != 0.0f) ? 0.0f : 1.0f;
+}
 // shifted_diff: mask[i] = (i==0 || x[i] != x[i-1]) ? 1 : 0  (consecutive-unique keep mask).
 __kernel void shifted_diff(__global const float* x, __global float* mask, int n) {
     int i = get_global_id(0); if (i >= n) return;
@@ -445,7 +456,7 @@ __kernel void next_after(__global const float* a, __global const float* b, __glo
             "masked_fill_kernel", "index_select", "take_along_dim",
             "cross3", "ldexp_kernel", "kron2d", "search_sorted", "next_after", "index_write", "cdist", "pdist",
             "histc", "bitonic_step", "copy_rows", "iota_pad", "rwkv7_forward", "hsoftmax_paths",
-            "isin", "unfold", "copy_block_2d", "scatter_reduce", "zeta_kernel", "polygamma_kernel", "shifted_diff", "histogramdd", "masks_to_boxes"
+            "isin", "unfold", "copy_block_2d", "scatter_reduce", "zeta_kernel", "polygamma_kernel", "shifted_diff", "histogramdd", "masks_to_boxes", "logical_op", "logical_not"
         };
     }
 }
