@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using AiDotNet.Tensors;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.LinearAlgebra;
 
@@ -722,6 +723,73 @@ public partial class DirectGpuTensorEngine
         for (int i = 0; i < a.Length; i++) if (a[i] != b[i]) return false;
         return true;
     }
+
+    // ----- Category D: Tensor<Bit> comparison predicates -----
+    // The backend comparison kernels write a FLOAT mask (1.0/0.0). The result is a Tensor<Bit> (one
+    // byte/elem), which leaves the device — but computing the compare on the GPU keeps the (often
+    // resident) input tensors on the device instead of forcing the base to download them to scan on
+    // the host. We download only the mask and pack it into Bit. `invert` flips the predicate (used for
+    // Eq-via-NotEqual). Float-only. Caller disposes maskBuf.
+    private static Tensor<Bit> PackMask(IDirectGpuBackend backend, OwnedBuffer maskBuf, int[] shape, int n, bool invert)
+    {
+        var span = backend.DownloadBuffer(maskBuf.Buffer);
+        var result = new Tensor<Bit>((int[])shape.Clone());
+        var dst = result.AsWritableSpan();
+        for (int i = 0; i < n; i++)
+        {
+            bool set = span[i] != 0f;
+            dst[i] = (set ^ invert) ? Bit.True : Bit.False;
+        }
+        return result;
+    }
+
+    /// <inheritdoc/>
+    public override Tensor<Bit> TensorEq<T>(Tensor<T> a, Tensor<T> b)
+    {
+        if (a is null) throw new ArgumentNullException(nameof(a));
+        if (b is null) throw new ArgumentNullException(nameof(b));
+        if (typeof(T) != typeof(float) || !ShapesEqual(a._shape, b._shape) || !TryGetBackend(out var backend))
+            return base.TensorEq(a, b);
+        try
+        {
+            var ca = a.IsContiguous ? a : (Tensor<T>)a.Contiguous();
+            var cb = b.IsContiguous ? b : (Tensor<T>)b.Contiguous();
+            int n = a.Length;
+            using var bufA = GetOrAllocateBuffer(backend, ca.GetDataArray());
+            using var bufB = GetOrAllocateBuffer(backend, cb.GetDataArray());
+            using var bufOut = AllocateOutputBuffer(backend, n);
+            backend.Equal(bufA.Buffer, bufB.Buffer, bufOut.Buffer, n);
+            backend.Synchronize();
+            return PackMask(backend, bufOut, a._shape, n, invert: false);
+        }
+        catch (Exception) { return base.TensorEq(a, b); }
+    }
+
+    /// <inheritdoc/>
+    public override Tensor<Bit> TensorEqScalar<T>(Tensor<T> a, T scalar)
+    {
+        if (a is null) throw new ArgumentNullException(nameof(a));
+        if (typeof(T) != typeof(float) || !TryGetBackend(out var backend))
+            return base.TensorEqScalar(a, scalar);
+        try
+        {
+            var ca = a.IsContiguous ? a : (Tensor<T>)a.Contiguous();
+            int n = a.Length;
+            float s = ToFloatScalar(scalar);
+            using var bufA = GetOrAllocateBuffer(backend, ca.GetDataArray());
+            using var bufOut = AllocateOutputBuffer(backend, n);
+            // NotEqualScalar gives (a != s); invert to get equality.
+            backend.NotEqualScalar(bufA.Buffer, bufOut.Buffer, s, n);
+            backend.Synchronize();
+            return PackMask(backend, bufOut, a._shape, n, invert: true);
+        }
+        catch (Exception) { return base.TensorEqScalar(a, scalar); }
+    }
+
+    // NOTE: TensorIsNan / IsInf / IsFinite are NOT wired here. The obvious x!=x NaN trick fails on the
+    // GPU: the OpenCL compiler folds `a[idx] != a[idx]` to false under fast/relaxed-math (verified —
+    // GPU returned "not NaN" for a NaN element). These need a dedicated isnan/isinf kernel (the
+    // new-kernel phase), so they stay on the correct CPU base for now.
 
     // ----- Category B: composite forwards -----
 

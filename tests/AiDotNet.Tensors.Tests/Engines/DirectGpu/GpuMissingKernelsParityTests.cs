@@ -500,6 +500,37 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         AssertMatch(gpu, cpu, $"TensorRepeatInterleave[{string.Join("x", shape)};r={repeats}]");
     }
 
+    private static void AssertBitMatch(Tensor<AiDotNet.Tensors.Bit> gpu, Tensor<AiDotNet.Tensors.Bit> cpu, string op)
+    {
+        Assert.Equal(cpu.Shape.ToArray(), gpu.Shape.ToArray());
+        var g = gpu.ToArray();
+        var c = cpu.ToArray();
+        for (int i = 0; i < c.Length; i++)
+            Assert.True(g[i].Equals(c[i]), $"{op}: mismatch at {i} (gpu {g[i]} vs cpu {c[i]})");
+    }
+
+    [Fact]
+    public void TensorEq_GpuMatchesCpu()
+    {
+        if (!EnsureGpuReady()) return;
+        // Build a with some elements equal to b.
+        var aData = new float[] { 1, 2, 3, 4, 5, 6, 7, 8 };
+        var bData = new float[] { 1, 0, 3, 0, 5, 6, 0, 8 };
+        var a = new Tensor<float>(aData, new[] { 2, 4 });
+        var b = new Tensor<float>(bData, new[] { 2, 4 });
+        AssertBitMatch(_gpu.TensorEq(a, b), _cpu.TensorEq(a, b), "TensorEq");
+    }
+
+    [Theory]
+    [InlineData(3f)]
+    [InlineData(0f)]
+    public void TensorEqScalar_GpuMatchesCpu(float scalar)
+    {
+        if (!EnsureGpuReady()) return;
+        var a = new Tensor<float>(new float[] { 0, 3, 3, 1, 0, 3, 7, 3 }, new[] { 8 });
+        AssertBitMatch(_gpu.TensorEqScalar(a, scalar), _cpu.TensorEqScalar(a, scalar), "TensorEqScalar");
+    }
+
     [Theory]
     [InlineData(2, 2)]
     [InlineData(4, 4)]
