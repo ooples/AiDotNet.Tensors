@@ -576,6 +576,34 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
     }
 
     [Theory]
+    [InlineData(new[] { 6, 4 }, 0, 1, 3)]
+    [InlineData(new[] { 6, 4 }, 1, 0, 2)]
+    [InlineData(new[] { 3, 5, 4 }, 1, 2, 2)]
+    public void TensorSliceScatter_GpuMatchesCpu(int[] shape, int dim, int start, int length)
+    {
+        if (!EnsureGpuReady()) return;
+        var t = Rand(210, shape);
+        var srcShape = (int[])shape.Clone(); srcShape[dim] = length;
+        var src = Rand(211, srcShape);
+        AssertMatch(_gpu.TensorSliceScatter(t, src, dim, start, length), _cpu.TensorSliceScatter(t, src, dim, start, length),
+            $"SliceScatter[{string.Join("x", shape)};dim={dim};{start}:{start + length}]");
+    }
+
+    [Theory]
+    [InlineData(new[] { 6, 4 }, 0, 2)]
+    [InlineData(new[] { 3, 5, 4 }, 1, 3)]
+    public void TensorSelectScatter_GpuMatchesCpu(int[] shape, int dim, int index)
+    {
+        if (!EnsureGpuReady()) return;
+        var t = Rand(212, shape);
+        var srcShapeList = new List<int>();
+        for (int i = 0; i < shape.Length; i++) if (i != dim) srcShapeList.Add(shape[i]);
+        var src = Rand(213, srcShapeList.ToArray());
+        AssertMatch(_gpu.TensorSelectScatter(t, src, dim, index), _cpu.TensorSelectScatter(t, src, dim, index),
+            $"SelectScatter[{string.Join("x", shape)};dim={dim};idx={index}]");
+    }
+
+    [Theory]
     [InlineData(new[] { 5, 4 }, 0)]
     [InlineData(new[] { 5, 4 }, 1)]
     [InlineData(new[] { 3, 4, 5 }, 1)]

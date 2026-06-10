@@ -919,6 +919,63 @@ public partial class DirectGpuTensorEngine
     }
 
     /// <inheritdoc/>
+    public override Tensor<T> TensorSliceScatter<T>(Tensor<T> tensor, Tensor<T> source, int dim, int start, int length)
+    {
+        if (tensor is null) throw new ArgumentNullException(nameof(tensor));
+        if (source is null) throw new ArgumentNullException(nameof(source));
+        int rank = tensor.Rank;
+        int d = dim < 0 ? dim + rank : dim;
+        if (typeof(T) != typeof(float) || d < 0 || d >= rank || source.Rank != rank
+            || source._shape[d] != length || start < 0 || start + length > tensor._shape[d]
+            || !TryGetBatchBackend(out var backend))
+            return base.TensorSliceScatter(tensor, source, dim, start, length);
+        for (int k = 0; k < rank; k++)
+            if (k != d && source._shape[k] != tensor._shape[k])
+                return base.TensorSliceScatter(tensor, source, dim, start, length);
+        try
+        {
+            var ct = tensor.IsContiguous ? tensor : (Tensor<T>)tensor.Contiguous();
+            var cs = source.IsContiguous ? source : (Tensor<T>)source.Contiguous();
+            int dstAxis = tensor._shape[d], n = tensor.Length;
+            int outerSize = 1; for (int k = 0; k < d; k++) outerSize *= tensor._shape[k];
+            int innerSize = 1; for (int k = d + 1; k < rank; k++) innerSize *= tensor._shape[k];
+            var idxData = new int[length]; for (int i = 0; i < length; i++) idxData[i] = start + i;
+
+            using var bufIn = GetOrAllocateBuffer(backend, ct.GetDataArray());
+            using var bufSrc = GetOrAllocateBuffer(backend, cs.GetDataArray());
+            using var bufIdx = backend.AllocateIntBuffer(idxData);
+            var bufOut = AllocateOutputBuffer(backend, n);
+            backend.Copy(bufIn.Buffer, bufOut.Buffer, n);
+            backend.IndexWrite(bufOut.Buffer, bufIdx, bufSrc.Buffer, 0f, 0, outerSize, length, innerSize, dstAxis);
+            var arr = FinishGpuOp<T>(backend, bufOut, n);
+            return new Tensor<T>(arr, (int[])tensor._shape.Clone());
+        }
+        catch (Exception) { return base.TensorSliceScatter(tensor, source, dim, start, length); }
+    }
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorSelectScatter<T>(Tensor<T> tensor, Tensor<T> source, int dim, int index)
+    {
+        if (tensor is null) throw new ArgumentNullException(nameof(tensor));
+        if (source is null) throw new ArgumentNullException(nameof(source));
+        int rank = tensor.Rank;
+        int d = dim < 0 ? dim + rank : dim;
+        int ix = index < 0 ? index + (d >= 0 && d < rank ? tensor._shape[d] : 0) : index;
+        if (typeof(T) != typeof(float) || d < 0 || d >= rank || source.Rank != rank - 1
+            || ix < 0 || ix >= tensor._shape[d] || !TryGetBatchBackend(out _))
+            return base.TensorSelectScatter(tensor, source, dim, index);
+        try
+        {
+            // Insert a size-1 axis at d so the slice-scatter path (length 1) applies.
+            var srcShape = (int[])tensor._shape.Clone();
+            srcShape[d] = 1;
+            var reshaped = source.Reshape(srcShape);
+            return TensorSliceScatter(tensor, reshaped, d, ix, 1);
+        }
+        catch (Exception) { return base.TensorSelectScatter(tensor, source, dim, index); }
+    }
+
+    /// <inheritdoc/>
     public override Tensor<T> TensorIndexCopy<T>(Tensor<T> tensor, int axis, Tensor<int> indices, Tensor<T> source)
     {
         if (tensor is null) throw new ArgumentNullException(nameof(tensor));
