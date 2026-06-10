@@ -11408,6 +11408,10 @@ public partial class CpuEngine : ITensorLevelEngine
                     // 2D/ND×2D/ND×ND cases to write-through kernels.
                     (eng, output) =>
                     {
+                        // GPU-resident 2D / ND×2D matmul into output's stable buffer (no host materialize that
+                        // breaks CUDA-graph capture); else the host write-through path.
+                        if (eng is DirectGpuTensorEngine mmGpu && mmGpu.TryMatMulResidentInto(output, capturedA, capturedB))
+                            return;
                         if (typeof(T) == typeof(float) && eng is CpuEngine cpuEngF)
                         {
                             cpuEngF.TensorMatMulFloatInto(
@@ -33085,7 +33089,14 @@ public partial class CpuEngine : ITensorLevelEngine
                 var captured = tensor;
                 int capAxis = axis, capIndex = index;
                 return scope.RecordUnary(LazyNodeType.Custom, "TensorSliceAxis", tensor, outShape,
-                    (eng, output) => { var r = eng.TensorSliceAxis(captured, capAxis, capIndex); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
+                    (eng, output) =>
+                    {
+                        // GPU-resident slice into output's stable buffer (no host materialize that breaks capture).
+                        if (eng is DirectGpuTensorEngine slGpu && slGpu.TrySliceAxisResidentInto(output, captured, capAxis, capIndex))
+                            return;
+                        var r = eng.TensorSliceAxis(captured, capAxis, capIndex);
+                        DirectGpuTensorEngine.CopyResultInto(eng, r, output);
+                    },
                     BackwardFunctions<T>.SliceAxisBackward, new object[] { axis, index });
             }
         }

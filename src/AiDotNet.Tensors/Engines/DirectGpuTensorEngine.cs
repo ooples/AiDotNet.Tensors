@@ -817,7 +817,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // the GPU pointer and force a re-upload.
         if (tensor._gpuBuffer is not null && ReferenceEquals(tensor._gpuBackend, backend))
         {
-            if (tensor._gpuBufferVersion == tensor.Version && IsCachedGpuBufferLive(tensor, backend))
+            // During a compiled step (eviction suspended) the activation buffers are pinned/stable, so _gpuBuffer
+            // is the LIVE data regardless of the host Version snapshot — accept it. Clearing it on a version
+            // mismatch (the path below) would orphan a deferred materializer registered by BindResidentBuffer →
+            // a later host read fires it on a recycled buffer = #226 "buffer released before materialization".
+            if (EvictionSuspended || (tensor._gpuBufferVersion == tensor.Version && IsCachedGpuBufferLive(tensor, backend)))
                 return new OwnedBuffer(tensor._gpuBuffer, ownsBuffer: false);
 
             // Stale snapshot — also clear any matching activation-cache entry so
@@ -2705,6 +2709,55 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return true;
         }
         catch (Exception lex) { AliasDiag($"LN-resident FELLBACK in=[{string.Join(",", input._shape)}] inContig={input.IsContiguous}: {lex.GetType().Name}: {lex.Message}"); return false; }
+    }
+
+    /// <summary>GPU-RESIDENT 2-D / ND×2-D matmul for the compiled step (e.g. attention out-proj / LM-head /
+    /// any TensorMatMul against a 2-D weight): collapse A's leading dims into M and run backend.Gemm (C=A@B)
+    /// into the destination's stable buffer — no host TensorMatMulFloatInto (which materializes inputs → a DtoH
+    /// download that's a non-capturable CUDA-900 inside the graph capture). Returns false to fall back.</summary>
+    internal bool TryMatMulResidentInto<T>(Tensor<T> output, Tensor<T> a, Tensor<T> b)
+    {
+        if (!EvictionSuspended || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
+        if (!TryGetBackend(out var backend)) return false;
+        if (a.Rank < 2 || b.Rank != 2 || !a.IsContiguous || !b.IsContiguous) return false;
+        int K = b.Shape._dims[0];
+        int N = b.Shape._dims[1];
+        if (a.Shape._dims[a.Rank - 1] != K) return false;
+        int M = a.Length / K;
+        if ((long)M * N != output.Length) return false;
+        try
+        {
+            using var bufA = GetResidentOrPersistentInputBuffer(backend, a);
+            using var bufB = GetResidentOrPersistentInputBuffer(backend, b);
+            var outBuf = GetOrCreateResidentBuffer(backend, output, M * N);
+            backend.Gemm(bufA.Buffer, bufB.Buffer, outBuf, M, N, K, 1.0f, 0.0f);
+            BindResidentBuffer(output, outBuf, backend);
+            return true;
+        }
+        catch (Exception mex) { AliasDiag($"MM-resident FELLBACK a=[{string.Join(",", a._shape)}] b=[{string.Join(",", b._shape)}]: {mex.GetType().Name}: {mex.Message}"); return false; }
+    }
+
+    /// <summary>GPU-RESIDENT slice-along-axis for the compiled step (e.g. the LM-head last-token select
+    /// [B,S,D]→[B,D]): backend.SliceAxis into the destination's stable buffer — no host TensorSliceAxis that
+    /// materializes the input (DtoH download = non-capturable CUDA-900). Returns false to fall back.</summary>
+    internal bool TrySliceAxisResidentInto<T>(Tensor<T> output, Tensor<T> input, int axis, int index)
+    {
+        if (!EvictionSuspended || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
+        if (!TryGetBackend(out var backend) || !input.IsContiguous) return false;
+        if (axis < 0 || axis >= input.Rank) return false;
+        int outerSize = 1; for (int i = 0; i < axis; i++) outerSize *= input.Shape._dims[i];
+        int axisSize = input.Shape._dims[axis];
+        int stride = 1; for (int i = axis + 1; i < input.Rank; i++) stride *= input.Shape._dims[i];
+        if (index < 0 || index >= axisSize || (long)outerSize * stride != output.Length) return false;
+        try
+        {
+            using var bufIn = GetResidentOrPersistentInputBuffer(backend, input);
+            var outBuf = GetOrCreateResidentBuffer(backend, output, outerSize * stride);
+            backend.SliceAxis(bufIn.Buffer, outBuf, outerSize, axisSize, stride, index);
+            BindResidentBuffer(output, outBuf, backend);
+            return true;
+        }
+        catch (Exception sex) { AliasDiag($"Slice-resident FELLBACK in=[{string.Join(",", input._shape)}] axis={axis} idx={index}: {sex.GetType().Name}: {sex.Message}"); return false; }
     }
 
     private static bool IsTrailingBroadcast(int[] fullShape, int[] biasShape)
