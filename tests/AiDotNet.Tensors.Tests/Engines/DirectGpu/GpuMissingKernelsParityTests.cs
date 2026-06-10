@@ -478,5 +478,26 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         var gpu = _gpu.TensorIndexAdd(t, 0, indices, source);
         AssertMatch(gpu, cpu, $"TensorIndexAdd_1D[n={n};m={idxArr.Length}]");
     }
+
+    // repeat_interleave along the LAST axis (the case the backend kernel covers).
+    public static IEnumerable<object[]> RepeatInterleaveCases() => new List<object[]>
+    {
+        new object[] { new[] { 6 }, 3 },
+        new object[] { new[] { 4, 5 }, 2 },
+        new object[] { new[] { 2, 3, 4 }, 4 },
+        new object[] { new[] { 8 }, 1 },
+    };
+
+    [Theory]
+    [MemberData(nameof(RepeatInterleaveCases))]
+    public void TensorRepeatInterleave_LastDim_GpuMatchesCpu(int[] shape, int repeats)
+    {
+        if (!EnsureGpuReady()) return;
+        var t = Rand(108, shape);
+        int dim = shape.Length - 1;
+        var cpu = _cpu.TensorRepeatInterleave(t, repeats, dim);
+        var gpu = _gpu.TensorRepeatInterleave(t, repeats, dim);
+        AssertMatch(gpu, cpu, $"TensorRepeatInterleave[{string.Join("x", shape)};r={repeats}]");
+    }
 }
 #endif

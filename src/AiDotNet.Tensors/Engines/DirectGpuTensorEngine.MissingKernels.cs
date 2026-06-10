@@ -610,4 +610,40 @@ public partial class DirectGpuTensorEngine
         }
         catch (Exception) { return base.TensorIndexAdd(tensor, axis, indices, source); }
     }
+
+    // ----- Category F: repeat -----
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorRepeatInterleave<T>(Tensor<T> tensor, int repeats, int dim)
+    {
+        if (tensor is null) throw new ArgumentNullException(nameof(tensor));
+        if (repeats < 1) throw new ArgumentOutOfRangeException(nameof(repeats), "repeats must be >= 1");
+        int rank = tensor.Rank;
+        if (dim < 0) dim += rank;
+
+        // The backend repeat_elements kernel writes the `repeats` copies immediately after each element
+        // (output[outer, inner*repeats + r] = input[outer, inner]), which matches repeat_interleave only
+        // when `dim` is the LAST axis (no inner block after it). Middle dims defer to base.
+        if (dim != rank - 1 || dim < 0 || !TryGetBatchBackend(out var backend))
+            return base.TensorRepeatInterleave(tensor, repeats, dim);
+
+        try
+        {
+            var src = tensor.IsContiguous ? tensor : tensor.Contiguous();
+            int innerSize = tensor._shape[dim];
+            int outer = tensor.Length / innerSize;
+            int outLen = tensor.Length * repeats;
+            using var bufIn = GetOrAllocateBuffer(backend, src.GetDataArray());
+            var bufOut = AllocateOutputBuffer(backend, outLen);
+            backend.RepeatElements(bufIn.Buffer, bufOut.Buffer, outer, innerSize, repeats);
+            var result = FinishGpuOp<T>(backend, bufOut, outLen);
+            var outShape = (int[])tensor._shape.Clone();
+            outShape[dim] = innerSize * repeats;
+            var output = new Tensor<T>(result, outShape);
+            Autodiff.DifferentiableOps.RecordUnary("TensorRepeatInterleave", output, tensor,
+                Autodiff.BackwardFunctions<T>.RepeatInterleaveBackward, new object[] { repeats, dim });
+            return output;
+        }
+        catch (Exception) { return base.TensorRepeatInterleave(tensor, repeats, dim); }
+    }
 }
