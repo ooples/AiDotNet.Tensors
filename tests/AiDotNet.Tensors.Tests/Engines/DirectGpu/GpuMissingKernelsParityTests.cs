@@ -374,5 +374,33 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         var gpu = _gpu.TensorTensorSplit(t, indices, dim);
         AssertChunksMatch(gpu, cpu, $"TensorTensorSplit[{string.Join("x", shape)};idx={string.Join(",", indices)};dim{dim}]");
     }
+
+    // ----- Category D -----
+
+    [Theory]
+    [InlineData(0.0f)]
+    [InlineData(0.25f)]
+    [InlineData(-0.5f)]
+    public void TensorClampMin_GpuMatchesCpu(float min)
+    {
+        if (!EnsureGpuReady()) return;
+        var t = Rand(96, 4, 16);
+        var cpu = _cpu.TensorClampMin(t, min);
+        var gpu = _gpu.TensorClampMin(t, min);
+        AssertMatch(gpu, cpu, $"TensorClampMin[{min}]");
+    }
+
+    [Theory]
+    [InlineData(0.0f)]
+    [InlineData(0.25f)]
+    [InlineData(-0.5f)]
+    public void TensorClampMax_GpuMatchesCpu(float max)
+    {
+        if (!EnsureGpuReady()) return;
+        var t = Rand(97, 4, 16);
+        var cpu = _cpu.TensorClampMax(t, max);
+        var gpu = _gpu.TensorClampMax(t, max);
+        AssertMatch(gpu, cpu, $"TensorClampMax[{max}]");
+    }
 }
 #endif

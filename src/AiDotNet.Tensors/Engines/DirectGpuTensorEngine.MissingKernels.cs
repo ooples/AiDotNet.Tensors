@@ -463,4 +463,50 @@ public partial class DirectGpuTensorEngine
         }
         catch (Exception) { return base.TensorSplit(tensor, numSplits, axis); }
     }
+
+    // ----- Category D: elementwise (wiring existing backend kernels) -----
+    // (Reciprocal/Sin/Tanh in the audit are Vector<T> helpers, not Tensor ops — not GPU-residency
+    // gaps. The Tensor<Bit>/bool predicates (Eq/IsNan/…) don't fit the float-buffer residency model
+    // cleanly and are deferred.)
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorClampMin<T>(Tensor<T> tensor, T min)
+    {
+        if (tensor is null) throw new ArgumentNullException(nameof(tensor));
+        // Tape-active defers to base (preserves the boxed-double backward contract, like TensorClamp).
+        if (IsTapeActive<T>() || !TryGetBackend(out var backend))
+            return base.TensorClampMin(tensor, min);
+
+        try
+        {
+            // clamp(x, min, +inf) == max(x, min) exactly (no MaxValue capping of large/inf inputs).
+            float minF = ToFloatScalar(min);
+            using var bufA = GetOrAllocateBuffer(backend, tensor.GetDataArray());
+            var bufOut = AllocateOutputBuffer(backend, tensor.Length);
+            backend.Clamp(bufA.Buffer, bufOut.Buffer, minF, float.PositiveInfinity, tensor.Length);
+            var result = FinishGpuOp<T>(backend, bufOut, tensor.Length);
+            return new Tensor<T>(result, tensor.Shape._dims);
+        }
+        catch (Exception) { return base.TensorClampMin(tensor, min); }
+    }
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorClampMax<T>(Tensor<T> tensor, T max)
+    {
+        if (tensor is null) throw new ArgumentNullException(nameof(tensor));
+        if (IsTapeActive<T>() || !TryGetBackend(out var backend))
+            return base.TensorClampMax(tensor, max);
+
+        try
+        {
+            // clamp(x, -inf, max) == min(x, max) exactly.
+            float maxF = ToFloatScalar(max);
+            using var bufA = GetOrAllocateBuffer(backend, tensor.GetDataArray());
+            var bufOut = AllocateOutputBuffer(backend, tensor.Length);
+            backend.Clamp(bufA.Buffer, bufOut.Buffer, float.NegativeInfinity, maxF, tensor.Length);
+            var result = FinishGpuOp<T>(backend, bufOut, tensor.Length);
+            return new Tensor<T>(result, tensor.Shape._dims);
+        }
+        catch (Exception) { return base.TensorClampMax(tensor, max); }
+    }
 }
