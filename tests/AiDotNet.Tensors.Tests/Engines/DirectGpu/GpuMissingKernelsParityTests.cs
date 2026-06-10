@@ -500,6 +500,22 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         AssertMatch(gpu, cpu, $"TensorRepeatInterleave[{string.Join("x", shape)};r={repeats}]");
     }
 
+    // Engine-fix regression: a deep INTERLEAVED chain of the view-returning TensorPermute and
+    // TensorFlip (flip∘permute∘flip∘permute). Before the GetOrAllocateBuffer materialize-strided-views
+    // fix, this diverged (~1.6) because a strided permute view of a deferred tensor read the source's
+    // un-permuted cached buffer. Must now match CPU bit-for-bit.
+    [Fact]
+    public void InterleavedPermuteFlipChain_ViewPermute_GpuMatchesCpu()
+    {
+        if (!EnsureGpuReady()) return;
+        var x = Rand(130, 4, 6);
+        var perm = new[] { 1, 0 };
+
+        var cpu = _cpu.TensorFlip(_cpu.TensorPermute(_cpu.TensorFlip(_cpu.TensorPermute(x, perm), new[] { 0 }), perm), new[] { 0 });
+        var gpu = _gpu.TensorFlip(_gpu.TensorPermute(_gpu.TensorFlip(_gpu.TensorPermute(x, perm), new[] { 0 }), perm), new[] { 0 });
+        AssertMatch(gpu, cpu, "InterleavedPermuteFlipChain(view)");
+    }
+
     public static IEnumerable<object[]> Rot90Cases() => new List<object[]>
     {
         new object[] { new[] { 4, 6 }, 1, new[] { 0, 1 } },
