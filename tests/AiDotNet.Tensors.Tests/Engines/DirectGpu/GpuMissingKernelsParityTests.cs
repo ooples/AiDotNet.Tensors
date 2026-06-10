@@ -756,6 +756,20 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
     }
 
     [Fact]
+    public void BatchedNms_GpuMatchesCpu()
+    {
+        if (!EnsureGpuReady()) return;
+        var boxes = new Tensor<float>(new float[]
+        {
+            0, 0, 10, 10,     1, 1, 11, 11,     20, 20, 30, 30,
+            21, 21, 31, 31,   0, 0, 5, 5,       2, 2, 12, 12,
+        }, new[] { 6, 4 });
+        var scores = new Tensor<float>(new float[] { 0.9f, 0.8f, 0.95f, 0.7f, 0.6f, 0.85f }, new[] { 6 });
+        var classes = new Tensor<int>(new[] { 0, 0, 1, 1, 0, 1 }, new[] { 6 });
+        Assert.Equal(_cpu.BatchedNms(boxes, scores, classes, 0.5).ToArray(), _gpu.BatchedNms(boxes, scores, classes, 0.5).ToArray());
+    }
+
+    [Fact]
     public void MasksToBoxes_GpuMatchesCpu()
     {
         if (!EnsureGpuReady()) return;
