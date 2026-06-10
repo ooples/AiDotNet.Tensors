@@ -24,6 +24,9 @@ public sealed partial class WebGpuBackend
     { try { Dispatch3BufferAsync("Comparison", WebGpuKernels.ComparisonSource, "equal_to", a, b, o, new float[]{BitConverter.Int32BitsToSingle(sz)}, sz).GetAwaiter().GetResult(); } catch { float[] ad=DownloadBuffer(a);float[] bd=DownloadBuffer(b);float[] r=new float[sz];for(int j=0;j<sz;j++)r[j]=ad[j]==bd[j]?1f:0f;((WebGpuBuffer)o).CopyFrom(r); } }
     public void NotEqualsKernel(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int sz)
     { try { Dispatch3BufferAsync("Comparison", WebGpuKernels.ComparisonSource, "not_equal_to", a, b, o, new float[]{BitConverter.Int32BitsToSingle(sz)}, sz).GetAwaiter().GetResult(); } catch { float[] ad=DownloadBuffer(a);float[] bd=DownloadBuffer(b);float[] r=new float[sz];for(int j=0;j<sz;j++)r[j]=ad[j]!=bd[j]?1f:0f;((WebGpuBuffer)o).CopyFrom(r); } }
+    // IEEE classify (isnan/isinf/isfinite): a real WGSL kernel is a HW-validation follow-up; the engine
+    // catches this and falls back to the correct CPU path until then.
+    public void ClassifyFloat(IGpuBuffer A, IGpuBuffer C, int mode, int size) => throw new NotSupportedException("ClassifyFloat not yet implemented on the WebGPU backend.");
     public void OuterProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int M, int N)
     { try { Dispatch3BufferAsync("OuterProduct", WebGpuKernels.OuterProductSource, "outer_product", a, b, o, new float[]{BitConverter.Int32BitsToSingle(M),BitConverter.Int32BitsToSingle(N)}, M*N).GetAwaiter().GetResult(); } catch { float[] ad=DownloadBuffer(a); float[] bd=DownloadBuffer(b); float[] r=new float[M*N]; for(int i2=0;i2<M;i2++) for(int j=0;j<N;j++) r[i2*N+j]=ad[i2]*bd[j]; ((WebGpuBuffer)o).CopyFrom(r); } }
     public void BatchDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int bs, int dim)

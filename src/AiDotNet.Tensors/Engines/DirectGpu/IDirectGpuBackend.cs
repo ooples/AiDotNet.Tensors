@@ -1890,6 +1890,14 @@ public interface IDirectGpuBackend : IDisposable
     void Where(IGpuBuffer condition, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size);
 
     /// <summary>
+    /// IEEE-754 classification predicate: C[i] = predicate(A[i]) ? 1.0 : 0.0. The predicate is selected
+    /// by <paramref name="mode"/>: 0 = isnan, 1 = isinf, 2 = isfinite. Implementations MUST use the
+    /// float's bit pattern (exponent == 0xFF; mantissa != 0 for NaN, == 0 for Inf), NOT the language
+    /// <c>!=</c>/<c>isnan</c> built-ins, because GPU compilers under fast/finite-math fold those away.
+    /// </summary>
+    void ClassifyFloat(IGpuBuffer A, IGpuBuffer C, int mode, int size);
+
+    /// <summary>
     /// Element-wise not-equal comparison against a scalar: C[i] = (A[i] != scalar) ? 1.0f : 0.0f
     /// </summary>
     /// <param name="A">Input buffer.</param>

@@ -521,6 +521,17 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         AssertBitMatch(_gpu.TensorEq(a, b), _cpu.TensorEq(a, b), "TensorEq");
     }
 
+    [Fact]
+    public void TensorIsNan_IsInf_IsFinite_GpuMatchesCpu()
+    {
+        if (!EnsureGpuReady()) return;
+        var data = new float[] { 1f, float.NaN, 3f, float.PositiveInfinity, float.NegativeInfinity, 0f, -2.5f, float.NaN };
+        var t = new Tensor<float>(data, new[] { 8 });
+        AssertBitMatch(_gpu.TensorIsNan(t), _cpu.TensorIsNan(t), "TensorIsNan");
+        AssertBitMatch(_gpu.TensorIsInf(t), _cpu.TensorIsInf(t), "TensorIsInf");
+        AssertBitMatch(_gpu.TensorIsFinite(t), _cpu.TensorIsFinite(t), "TensorIsFinite");
+    }
+
     [Theory]
     [InlineData(3f)]
     [InlineData(0f)]

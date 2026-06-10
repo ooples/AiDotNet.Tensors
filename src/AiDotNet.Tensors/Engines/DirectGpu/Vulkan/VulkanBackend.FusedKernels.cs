@@ -70,6 +70,9 @@ public sealed partial class VulkanBackend
 
     public void EqualsKernel(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int sz) => GlslBinaryOp(VulkanGlslKernels.EqualsKernel, a, b, o, sz, new uint[] { (uint)sz }, sizeof(uint));
     public void NotEqualsKernel(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int sz) => GlslBinaryOp(VulkanGlslKernels.NotEqualsKernel, a, b, o, sz, new uint[] { (uint)sz }, sizeof(uint));
+    // IEEE classify (isnan/isinf/isfinite): a real Vulkan GLSL/SPIR-V kernel is a HW-validation
+    // follow-up; the engine catches this and falls back to the correct CPU path until then.
+    public void ClassifyFloat(IGpuBuffer A, IGpuBuffer C, int mode, int size) => throw new NotSupportedException("ClassifyFloat not yet implemented on the Vulkan backend.");
 
     #endregion
 

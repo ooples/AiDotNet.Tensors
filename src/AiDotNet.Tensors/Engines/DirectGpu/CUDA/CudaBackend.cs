@@ -9877,6 +9877,11 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
+    // IEEE classify (isnan/isinf/isfinite): a real CUDA kernel (bit-pattern, like the OpenCL
+    // classify_float) is a HW-validation follow-up; the engine catches this and falls back to the
+    // correct CPU path until then.
+    public void ClassifyFloat(IGpuBuffer A, IGpuBuffer C, int mode, int size) => throw new NotSupportedException("ClassifyFloat not yet implemented on the CUDA backend.");
+
     public unsafe void Equal(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
     {
         if (!_kernelCache.TryGetValue("equal", out var kernel))

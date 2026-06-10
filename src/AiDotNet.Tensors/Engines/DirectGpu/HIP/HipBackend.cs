@@ -8082,6 +8082,11 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         LaunchBinaryOp(krnl, A, B, C, size);
     }
 
+    // IEEE classify (isnan/isinf/isfinite): a real HIP kernel (bit-pattern, like the OpenCL
+    // classify_float) is a HW-validation follow-up; the engine catches this and falls back to the
+    // correct CPU path until then.
+    public void ClassifyFloat(IGpuBuffer A, IGpuBuffer C, int mode, int size) => throw new NotSupportedException("ClassifyFloat not yet implemented on the HIP backend.");
+
     public unsafe void Equal(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
     {
         if (!_kernelCache.TryGetValue("equals", out var krnl))

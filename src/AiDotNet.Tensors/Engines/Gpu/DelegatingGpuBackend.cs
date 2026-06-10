@@ -1428,6 +1428,8 @@ public class DelegatingGpuBackend : IDirectGpuBackend
 
     /// <inheritdoc/>
     public virtual void Equal(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) => Inner.Equal(A, B, C, size);
+    /// <inheritdoc/>
+    public virtual void ClassifyFloat(IGpuBuffer A, IGpuBuffer C, int mode, int size) => Inner.ClassifyFloat(A, C, mode, size);
 
     /// <inheritdoc/>
     public virtual void Where(IGpuBuffer condition, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)

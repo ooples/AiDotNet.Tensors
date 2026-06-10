@@ -786,10 +786,33 @@ public partial class DirectGpuTensorEngine
         catch (Exception) { return base.TensorEqScalar(a, scalar); }
     }
 
-    // NOTE: TensorIsNan / IsInf / IsFinite are NOT wired here. The obvious x!=x NaN trick fails on the
-    // GPU: the OpenCL compiler folds `a[idx] != a[idx]` to false under fast/relaxed-math (verified —
-    // GPU returned "not NaN" for a NaN element). These need a dedicated isnan/isinf kernel (the
-    // new-kernel phase), so they stay on the correct CPU base for now.
+    // IEEE classification predicates via the new ClassifyFloat backend kernel (bit-pattern based, so it
+    // survives the GPU compilers' fast/finite-math that folds isnan/x!=x away). Backends without the
+    // kernel yet throw NotSupportedException, which the try/catch turns into the correct CPU fallback.
+    /// <inheritdoc/>
+    public override Tensor<Bit> TensorIsNan<T>(Tensor<T> tensor) => ClassifyToBit(tensor, 0, base.TensorIsNan);
+    /// <inheritdoc/>
+    public override Tensor<Bit> TensorIsInf<T>(Tensor<T> tensor) => ClassifyToBit(tensor, 1, base.TensorIsInf);
+    /// <inheritdoc/>
+    public override Tensor<Bit> TensorIsFinite<T>(Tensor<T> tensor) => ClassifyToBit(tensor, 2, base.TensorIsFinite);
+
+    private Tensor<Bit> ClassifyToBit<T>(Tensor<T> tensor, int mode, System.Func<Tensor<T>, Tensor<Bit>> fallback)
+    {
+        if (tensor is null) throw new ArgumentNullException(nameof(tensor));
+        if (typeof(T) != typeof(float) || !TryGetBackend(out var backend))
+            return fallback(tensor);
+        try
+        {
+            var ct = tensor.IsContiguous ? tensor : (Tensor<T>)tensor.Contiguous();
+            int n = tensor.Length;
+            using var bufA = GetOrAllocateBuffer(backend, ct.GetDataArray());
+            using var bufOut = AllocateOutputBuffer(backend, n);
+            backend.ClassifyFloat(bufA.Buffer, bufOut.Buffer, mode, n);
+            backend.Synchronize();
+            return PackMask(backend, bufOut, tensor._shape, n, invert: false);
+        }
+        catch (Exception) { return fallback(tensor); }
+    }
 
     // ----- Category B: composite forwards -----
 
