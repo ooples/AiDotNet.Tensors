@@ -1933,6 +1933,12 @@ public interface IDirectGpuBackend : IDisposable
     void IndexWrite(IGpuBuffer output, IGpuBuffer indices, IGpuBuffer source, float fillValue, int mode,
         int outerSize, int idxAxis, int innerSize, int dstAxis);
 
+    /// <summary>
+    /// Cross pairwise p-norm distance: x1 is [m, d], x2 is [n, d], output is [m, n] with
+    /// output[i,j] = ‖x1[i] − x2[j]‖_p.
+    /// </summary>
+    void CDist(IGpuBuffer x1, IGpuBuffer x2, IGpuBuffer output, int m, int n, int d, float p);
+
     #region Comparison Operations
 
     void GreaterThan(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size);

@@ -811,6 +811,30 @@ public partial class DirectGpuTensorEngine
     }
 
     /// <inheritdoc/>
+    public override Tensor<T> TensorCDist<T>(Tensor<T> x1, Tensor<T> x2, double p = 2.0)
+    {
+        if (x1 is null) throw new ArgumentNullException(nameof(x1));
+        if (x2 is null) throw new ArgumentNullException(nameof(x2));
+        if (typeof(T) != typeof(float) || x1.Rank != 2 || x2.Rank != 2
+            || x1._shape[1] != x2._shape[1] || !TryGetBackend(out var backend))
+            return base.TensorCDist(x1, x2, p);
+        try
+        {
+            var c1 = x1.IsContiguous ? x1 : (Tensor<T>)x1.Contiguous();
+            var c2 = x2.IsContiguous ? x2 : (Tensor<T>)x2.Contiguous();
+            int m = x1._shape[0], n = x2._shape[0], d = x1._shape[1];
+            int outN = m * n;
+            using var buf1 = GetOrAllocateBuffer(backend, c1.GetDataArray());
+            using var buf2 = GetOrAllocateBuffer(backend, c2.GetDataArray());
+            var bufOut = AllocateOutputBuffer(backend, outN);
+            backend.CDist(buf1.Buffer, buf2.Buffer, bufOut.Buffer, m, n, d, (float)p);
+            var arr = FinishGpuOp<T>(backend, bufOut, outN);
+            return new Tensor<T>(arr, new[] { m, n });
+        }
+        catch (Exception) { return base.TensorCDist(x1, x2, p); }
+    }
+
+    /// <inheritdoc/>
     public override Tensor<T> TensorIndexCopy<T>(Tensor<T> tensor, int axis, Tensor<int> indices, Tensor<T> source)
     {
         if (tensor is null) throw new ArgumentNullException(nameof(tensor));

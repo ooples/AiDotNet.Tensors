@@ -164,6 +164,19 @@ __kernel void index_write(__global float* output, __global const int* indices, _
     float v = (mode == 0) ? source[idx] : fillValue;
     output[(outer * dstAxis + dstJ) * innerSize + inner] = v;
 }
+// Cross pairwise p-norm distance: x1[m,d], x2[n,d] -> out[m,n], out[i,j]=||x1[i]-x2[j]||_p.
+__kernel void cdist(__global const float* x1, __global const float* x2, __global float* output, int m, int n, int d, float p) {
+    int idx = get_global_id(0); if (idx >= m * n) return;
+    int j = idx % n; int i = idx / n;
+    float sum = 0.0f;
+    for (int k = 0; k < d; k++) {
+        float diff = fabs(x1[i * d + k] - x2[j * d + k]);
+        if (p == 1.0f) sum += diff;
+        else if (p == 2.0f) sum += diff * diff;
+        else sum += pow(diff, p);
+    }
+    output[idx] = (p == 1.0f) ? sum : (p == 2.0f) ? sqrt(sum) : pow(sum, 1.0f / p);
+}
 // IEEE nextafter via direct bit manipulation; NaN detected by bit pattern (fast-math safe).
 __kernel void next_after(__global const float* a, __global const float* b, __global float* output, int size) {
     int idx = get_global_id(0); if (idx >= size) return;
@@ -192,7 +205,7 @@ __kernel void next_after(__global const float* a, __global const float* b, __glo
             "eye_kernel", "linspace_kernel", "one_hot_kernel",
             "diag_kernel", "extract_diag_kernel", "triangular_mask",
             "masked_fill_kernel", "index_select", "take_along_dim",
-            "cross3", "ldexp_kernel", "kron2d", "search_sorted", "next_after", "index_write"
+            "cross3", "ldexp_kernel", "kron2d", "search_sorted", "next_after", "index_write", "cdist"
         };
     }
 }
