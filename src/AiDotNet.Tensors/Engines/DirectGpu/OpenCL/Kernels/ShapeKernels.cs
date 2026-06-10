@@ -222,6 +222,19 @@ __kernel void logical_not(__global const float* a, __global float* out, int n) {
     int i = get_global_id(0); if (i >= n) return;
     out[i] = (a[i] != 0.0f) ? 0.0f : 1.0f;
 }
+// pairwise_iou: iou[i*N+j] = IoU(box_i, box_j) for boxes [N,4] = (x1,y1,x2,y2). area=0 if w<=0 or h<=0.
+__kernel void pairwise_iou(__global const float* boxes, __global float* iou, int N) {
+    int idx = get_global_id(0); if (idx >= N*N) return;
+    int j = idx % N; int i = idx / N;
+    float ix1=boxes[i*4], iy1=boxes[i*4+1], ix2=boxes[i*4+2], iy2=boxes[i*4+3];
+    float jx1=boxes[j*4], jy1=boxes[j*4+1], jx2=boxes[j*4+2], jy2=boxes[j*4+3];
+    float ai = fmax(0.0f, ix2-ix1)*fmax(0.0f, iy2-iy1);
+    float aj = fmax(0.0f, jx2-jx1)*fmax(0.0f, jy2-jy1);
+    float iw = fmax(0.0f, fmin(ix2,jx2)-fmax(ix1,jx1));
+    float ih = fmax(0.0f, fmin(iy2,jy2)-fmax(iy1,jy1));
+    float inter = iw*ih; float uni = ai+aj-inter;
+    iou[idx] = (uni > 0.0f) ? inter/uni : 0.0f;
+}
 // shifted_diff: mask[i] = (i==0 || x[i] != x[i-1]) ? 1 : 0  (consecutive-unique keep mask).
 __kernel void shifted_diff(__global const float* x, __global float* mask, int n) {
     int i = get_global_id(0); if (i >= n) return;
@@ -506,7 +519,7 @@ __kernel void next_after(__global const float* a, __global const float* b, __glo
             "masked_fill_kernel", "index_select", "take_along_dim",
             "cross3", "ldexp_kernel", "kron2d", "search_sorted", "next_after", "index_write", "cdist", "pdist",
             "histc", "bitonic_step", "copy_rows", "iota_pad", "rwkv7_forward", "hsoftmax_paths",
-            "isin", "unfold", "copy_block_2d", "scatter_reduce", "zeta_kernel", "polygamma_kernel", "shifted_diff", "histogramdd", "masks_to_boxes", "logical_op", "logical_not", "gridsample_backward_input", "gridsample_backward_grid"
+            "isin", "unfold", "copy_block_2d", "scatter_reduce", "zeta_kernel", "polygamma_kernel", "shifted_diff", "histogramdd", "masks_to_boxes", "pairwise_iou", "logical_op", "logical_not", "gridsample_backward_input", "gridsample_backward_grid"
         };
     }
 }

@@ -1999,6 +1999,9 @@ public interface IDirectGpuBackend : IDisposable
     /// <summary>Per-mask bounding box (xMin,yMin,xMax,yMax of nonzero pixels) for masks [N,H,W] -> out [N,4].</summary>
     void MasksToBoxes(IGpuBuffer masks, IGpuBuffer output, int n, int h, int w);
 
+    /// <summary>Pairwise IoU matrix iou[i*N+j] for boxes [N,4] (x1,y1,x2,y2).</summary>
+    void PairwiseIou(IGpuBuffer boxes, IGpuBuffer iou, int n);
+
     /// <summary>Boolean op on float-0/1 masks. mode 0=and,1=or,2=xor.</summary>
     void LogicalOp(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int mode, int n);
 

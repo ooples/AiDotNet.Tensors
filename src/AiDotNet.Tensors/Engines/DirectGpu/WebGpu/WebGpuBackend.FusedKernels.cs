@@ -49,6 +49,7 @@ public sealed partial class WebGpuBackend
     public void ShiftedDiff(IGpuBuffer x, IGpuBuffer mask, int n) => throw new NotSupportedException("ShiftedDiff not yet implemented on the WebGPU backend.");
     public void HistogramDD(IGpuBuffer samples, IGpuBuffer hist, IGpuBuffer bins, IGpuBuffer mins, IGpuBuffer maxs, int n, int d) => throw new NotSupportedException("HistogramDD not yet implemented on the WebGPU backend.");
     public void MasksToBoxes(IGpuBuffer masks, IGpuBuffer output, int n, int h, int w) => throw new NotSupportedException("MasksToBoxes not yet implemented on the WebGPU backend.");
+    public void PairwiseIou(IGpuBuffer boxes, IGpuBuffer iou, int n) => throw new NotSupportedException("PairwiseIou not yet implemented on the WebGPU backend.");
     public void LogicalOp(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int mode, int n) => throw new NotSupportedException("LogicalOp not yet implemented on the WebGPU backend.");
     public void LogicalNot(IGpuBuffer a, IGpuBuffer output, int n) => throw new NotSupportedException("LogicalNot not yet implemented on the WebGPU backend.");
     public void GridSampleBackwardInputNhwc(IGpuBuffer gradOut, IGpuBuffer grid, IGpuBuffer gradIn, int batch, int h, int w, int c, int outH, int outW) => throw new NotSupportedException("GridSampleBackwardInputNhwc not yet implemented on the WebGPU backend.");

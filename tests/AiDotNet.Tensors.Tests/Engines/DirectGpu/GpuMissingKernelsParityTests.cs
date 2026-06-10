@@ -739,6 +739,22 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
                     _cpu.GridSampleBackwardGrid(gradOut, input, grid, mode, pad, false), "GSBackwardGrid");
     }
 
+    [Theory]
+    [InlineData(0.5)]
+    [InlineData(0.3)]
+    [InlineData(0.7)]
+    public void Nms_GpuMatchesCpu(double iou)
+    {
+        if (!EnsureGpuReady()) return;
+        var boxes = new Tensor<float>(new float[]
+        {
+            0, 0, 10, 10,     1, 1, 11, 11,     20, 20, 30, 30,
+            21, 21, 31, 31,   0, 0, 5, 5,       100, 100, 120, 120,
+        }, new[] { 6, 4 });
+        var scores = new Tensor<float>(new float[] { 0.9f, 0.8f, 0.95f, 0.7f, 0.6f, 0.85f }, new[] { 6 });
+        Assert.Equal(_cpu.Nms(boxes, scores, iou).ToArray(), _gpu.Nms(boxes, scores, iou).ToArray());
+    }
+
     [Fact]
     public void MasksToBoxes_GpuMatchesCpu()
     {

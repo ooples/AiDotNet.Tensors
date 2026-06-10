@@ -1475,6 +1475,8 @@ public class DelegatingGpuBackend : IDirectGpuBackend
     /// <inheritdoc/>
     public virtual void MasksToBoxes(IGpuBuffer masks, IGpuBuffer output, int n, int h, int w) => Inner.MasksToBoxes(masks, output, n, h, w);
     /// <inheritdoc/>
+    public virtual void PairwiseIou(IGpuBuffer boxes, IGpuBuffer iou, int n) => Inner.PairwiseIou(boxes, iou, n);
+    /// <inheritdoc/>
     public virtual void LogicalOp(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int mode, int n) => Inner.LogicalOp(a, b, output, mode, n);
     /// <inheritdoc/>
     public virtual void LogicalNot(IGpuBuffer a, IGpuBuffer output, int n) => Inner.LogicalNot(a, output, n);

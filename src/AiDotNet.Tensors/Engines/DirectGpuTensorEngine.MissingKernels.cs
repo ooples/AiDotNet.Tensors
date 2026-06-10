@@ -1544,6 +1544,49 @@ public partial class DirectGpuTensorEngine
     }
 
     /// <inheritdoc/>
+    public override Tensor<int> Nms<T>(Tensor<T> boxes, Tensor<T> scores, double iouThreshold)
+    {
+        if (boxes is null) throw new ArgumentNullException(nameof(boxes));
+        if (scores is null) throw new ArgumentNullException(nameof(scores));
+        if (scores.Rank != 1 || scores._shape[0] != boxes._shape[0])
+            throw new ArgumentException("scores must be rank-1 with length N.");
+        int N = boxes._shape[0];
+        if (typeof(T) != typeof(float) || boxes.Rank != 2 || boxes._shape[1] != 4 || N == 0 || !TryGetBackend(out var backend))
+            return base.Nms(boxes, scores, iouThreshold);
+        try
+        {
+            // Pairwise IoU on the GPU (boxes stay resident), then the greedy score-ordered suppression on
+            // the host (inherently sequential) — matching the CPU exactly.
+            var cb = boxes.IsContiguous ? boxes : (Tensor<T>)boxes.Contiguous();
+            using var bufBoxes = GetOrAllocateBuffer(backend, cb.GetDataArray());
+            using var bufIou = AllocateOutputBuffer(backend, N * N);
+            backend.PairwiseIou(bufBoxes.Buffer, bufIou.Buffer, N);
+            backend.Synchronize();
+            var iou = backend.DownloadBuffer(bufIou.Buffer);
+            var s = (float[])(object)(scores.IsContiguous ? scores : (Tensor<T>)scores.Contiguous()).GetDataArray();
+            var order = new int[N];
+            for (int i = 0; i < N; i++) order[i] = i;
+            System.Array.Sort(order, (x, y) => s[y].CompareTo(s[x]));
+            var keep = new List<int>(N);
+            var suppressed = new bool[N];
+            float thresh = (float)iouThreshold;
+            for (int oi = 0; oi < N; oi++)
+            {
+                int i = order[oi];
+                if (suppressed[i]) continue;
+                keep.Add(i);
+                for (int oj = oi + 1; oj < N; oj++)
+                {
+                    int j = order[oj];
+                    if (!suppressed[j] && iou[i * N + j] > thresh) suppressed[j] = true;
+                }
+            }
+            return new Tensor<int>(keep.ToArray(), new[] { keep.Count });
+        }
+        catch (Exception) { return base.Nms(boxes, scores, iouThreshold); }
+    }
+
+    /// <inheritdoc/>
     public override Tensor<int> MasksToBoxes<T>(Tensor<T> masks)
     {
         if (masks is null) throw new ArgumentNullException(nameof(masks));
