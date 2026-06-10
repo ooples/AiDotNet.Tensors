@@ -284,6 +284,52 @@ internal static partial class SimdGemm
         // WeightArrayVersionOf(b) at build time — per-array invalidation
         // (see MarkWeightDirty). Checked alongside Epoch on every hit path.
         internal long SourceVersion;
+        // Content fingerprint of the source weight (first K*N elements) at
+        // build time. Re-checked on every cache hit so an IN-PLACE mutation of
+        // the weight buffer — an optimizer step or any raw Data.Span write that
+        // does NOT call MarkWeightDirty — is detected and forces a re-pack.
+        // Without this the cache served stale packed weights after training
+        // mutated them in place (the post-train / clone inference divergence,
+        // AiDotNet #1221 / #1331). The explicit FrozenWeightRegistry path keeps
+        // its zero-overhead "caller guarantees immutability" contract instead.
+        internal ulong Fingerprint;
+    }
+
+    /// <summary>
+    /// Content fingerprint (FNV-1a over the float bit-patterns + length) used to
+    /// validate the transparent prepacked-B cache against an in-place weight
+    /// mutation that bypasses the MarkWeightDirty version path (an optimizer
+    /// step / raw Data.Span write).
+    /// </summary>
+    /// <remarks>
+    /// EXACT for small weights (full scan, cheap) and a fixed STRIDED SAMPLE for
+    /// large ones, so the per-hit cost stays O(~1K) regardless of weight size and
+    /// does not erode the prepacked-cache speedup (PrePackSpeedupTest). A training
+    /// step or a weight reload changes essentially every element, so the sample
+    /// reliably detects the "weights changed" case this guards against (AiDotNet
+    /// #1221 / #1331). Callers with genuinely immutable weights should use the
+    /// zero-overhead <see cref="FrozenWeightRegistry"/> path instead, which trades
+    /// this validation for an explicit MarkDirty contract.
+    /// </remarks>
+    internal static ulong ComputeWeightFingerprint(System.ReadOnlySpan<float> data)
+    {
+        var bits = MemoryMarshal.Cast<float, uint>(data);
+        int n = bits.Length;
+        unchecked
+        {
+            ulong h = 1469598103934665603UL ^ (ulong)(uint)n; // FNV offset basis ⊕ length
+            if (n == 0) return h;
+            const int FullScanMax = 16384;
+            const int Samples = 1024;
+            int stride = n <= FullScanMax ? 1 : n / Samples;
+            for (int i = 0; i < n; i += stride)
+                h = (h ^ bits[i]) * 1099511628211UL;
+            h = (h ^ bits[n - 1]) * 1099511628211UL; // always fold the tail element
+            h ^= h >> 33;
+            h *= 0xff51afd7ed558ccdUL;
+            h ^= h >> 29;
+            return h;
+        }
     }
 
     private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<float[], PrePackedB> _prePackedBCache = new();
@@ -362,6 +408,7 @@ internal static partial class SimdGemm
             NumPcIters = numPcIters,
             Epoch = WeightCacheEpoch,
             SourceVersion = sourceVersion,
+            Fingerprint = ComputeWeightFingerprint(new System.ReadOnlySpan<float>(b, 0, k * n)),
         };
     }
 
@@ -455,7 +502,13 @@ internal static partial class SimdGemm
 
     private static PrePackedB GetOrBuildPrePackedB(float[] b, int k, int n, int m, int expectedMc)
     {
-        if (TryGetThreadPrePackedB(b, k, n, expectedMc, out var threadCached) && threadCached is not null)
+        // Content fingerprint of the live weight — re-validated against the
+        // cached entry so an in-place mutation that bypassed MarkWeightDirty
+        // (optimizer step / raw Data.Span write) is caught and forces a re-pack
+        // instead of serving stale packed weights (AiDotNet #1221 / #1331).
+        ulong fingerprint = ComputeWeightFingerprint(new System.ReadOnlySpan<float>(b, 0, k * n));
+
+        if (TryGetThreadPrePackedB(b, k, n, expectedMc, fingerprint, out var threadCached) && threadCached is not null)
             return threadCached;
 
         long epoch = WeightCacheEpoch;
@@ -464,7 +517,8 @@ internal static partial class SimdGemm
             && existing.K == k && existing.N == n
             && existing.Mc == expectedMc
             && existing.Epoch == epoch
-            && existing.SourceVersion == sourceVersion)
+            && existing.SourceVersion == sourceVersion
+            && existing.Fingerprint == fingerprint)
         {
             RememberThreadPrePackedB(b, existing);
             return existing;
@@ -477,7 +531,8 @@ internal static partial class SimdGemm
                 if (existing.K == k && existing.N == n
                     && existing.Mc == expectedMc
                     && existing.Epoch == epoch
-                    && existing.SourceVersion == sourceVersion)
+                    && existing.SourceVersion == sourceVersion
+                    && existing.Fingerprint == fingerprint)
                 {
                     RememberThreadPrePackedB(b, existing);
                     return existing;
@@ -494,16 +549,16 @@ internal static partial class SimdGemm
     }
 
     private static bool TryGetThreadPrePackedB(
-        float[] b, int k, int n, int expectedMc, out PrePackedB? cached)
+        float[] b, int k, int n, int expectedMc, ulong fingerprint, out PrePackedB? cached)
     {
         if (TryGetThreadPrePackedBSlot(_threadPrePackedBKey0, _threadPrePackedBValue0,
-                b, k, n, expectedMc, out cached))
+                b, k, n, expectedMc, fingerprint, out cached))
         {
             return true;
         }
 
         if (TryGetThreadPrePackedBSlot(_threadPrePackedBKey1, _threadPrePackedBValue1,
-                b, k, n, expectedMc, out cached))
+                b, k, n, expectedMc, fingerprint, out cached))
         {
             return true;
         }
@@ -515,7 +570,7 @@ internal static partial class SimdGemm
     private static bool TryGetThreadPrePackedBSlot(
         WeakReference<float[]>? keyRef,
         WeakReference<PrePackedB>? valueRef,
-        float[] b, int k, int n, int expectedMc,
+        float[] b, int k, int n, int expectedMc, ulong fingerprint,
         out PrePackedB? cached)
     {
         if (valueRef is not null
@@ -527,6 +582,10 @@ internal static partial class SimdGemm
             // cannot CLEAR another thread's slot, but it CAN make the
             // recorded SourceVersion stale.
             && value.SourceVersion == WeightArrayVersionOf(b)
+            // Content fingerprint guards against an in-place weight mutation
+            // that bypassed MarkWeightDirty (so SourceVersion alone wouldn't
+            // catch it) — see ComputeWeightFingerprint / AiDotNet #1221.
+            && value.Fingerprint == fingerprint
             && keyRef is not null
             && keyRef.TryGetTarget(out var key)
             && ReferenceEquals(key, b))
