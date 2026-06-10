@@ -724,6 +724,65 @@ public partial class DirectGpuTensorEngine
         return true;
     }
 
+    // ----- Stream-compaction family -----
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorMaskedSelect<T>(Tensor<T> tensor, Tensor<Bit> mask)
+    {
+        if (tensor is null) throw new ArgumentNullException(nameof(tensor));
+        if (mask is null) throw new ArgumentNullException(nameof(mask));
+        if (typeof(T) != typeof(float) || !ShapesEqual(tensor._shape, mask._shape) || !TryGetBackend(out var backend))
+            return base.TensorMaskedSelect(tensor, mask);
+        try
+        {
+            // The mask is a CPU Bit tensor, so build the kept flat-index list on the host, then GATHER the
+            // (resident) tensor values on the GPU — the tensor never leaves the device, only the count
+            // selected elements come back. Order is preserved (indices ascending).
+            var cm = mask.IsContiguous ? mask : (Tensor<Bit>)mask.Contiguous();
+            var mspan = cm.GetDataArray();
+            int n = tensor.Length;
+            var kept = new List<int>();
+            for (int i = 0; i < n; i++) if (mspan[i]) kept.Add(i);
+            int count = kept.Count;
+            if (count == 0) return new Tensor<T>(System.Array.Empty<T>(), new[] { 0 });
+
+            var ct = tensor.IsContiguous ? tensor : (Tensor<T>)tensor.Contiguous();
+            using var inBuf = GetOrAllocateBuffer(backend, ct.GetDataArray());
+            using var idxBuf = new OwnedBuffer(backend.AllocateIntBuffer(kept.ToArray()), true);
+            var outBuf = AllocateOutputBuffer(backend, count);
+            backend.Gather(inBuf.Buffer, idxBuf.Buffer, outBuf.Buffer, count, 1);
+            var arr = FinishGpuOp<T>(backend, outBuf, count);
+            return new Tensor<T>(arr, new[] { count });
+        }
+        catch (Exception) { return base.TensorMaskedSelect(tensor, mask); }
+    }
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorUnique<T>(Tensor<T> input, bool sorted = true)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        // Only the sorted form maps to the bitonic sort; unsorted / non-float defer to base.
+        if (typeof(T) != typeof(float) || !sorted || input.Length == 0 || !TryGetBackend(out var backend))
+            return base.TensorUnique(input, sorted);
+        try
+        {
+            var c = input.IsContiguous ? input : (Tensor<T>)input.Contiguous();
+            int L = input.Length;
+            var (vals, _) = BitonicSortRows(backend, (float[])(object)c.GetDataArray(), 1, L, false);
+            // Dedup consecutive over the GPU-sorted values; collapse all NaN to one (torch.unique semantics).
+            var uniq = new List<float>();
+            for (int i = 0; i < L; i++)
+            {
+                if (i == 0) { uniq.Add(vals[i]); continue; }
+                bool bothNan = float.IsNaN(vals[i]) && float.IsNaN(vals[i - 1]);
+                if (!bothNan && vals[i] != vals[i - 1]) uniq.Add(vals[i]);
+            }
+            var arr = uniq.ToArray();
+            return new Tensor<T>((T[])(object)arr, new[] { arr.Length });
+        }
+        catch (Exception) { return base.TensorUnique(input, sorted); }
+    }
+
     // ----- Sort family (GPU bitonic sort) -----
 
     // Sorts numRows contiguous rows of length L on the GPU (NaN-aware, torch order) and returns the

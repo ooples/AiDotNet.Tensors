@@ -500,6 +500,27 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         AssertMatch(gpu, cpu, $"TensorRepeatInterleave[{string.Join("x", shape)};r={repeats}]");
     }
 
+    [Fact]
+    public void TensorMaskedSelect_GpuMatchesCpu()
+    {
+        if (!EnsureGpuReady()) return;
+        var t = Rand(230, 4, 5);
+        var rng = new Random(231);
+        var bits = new AiDotNet.Tensors.Bit[20];
+        for (int i = 0; i < 20; i++) bits[i] = rng.Next(2) == 1;
+        var mask = new Tensor<AiDotNet.Tensors.Bit>(bits, new[] { 4, 5 });
+        AssertMatch(_gpu.TensorMaskedSelect(t, mask), _cpu.TensorMaskedSelect(t, mask), "MaskedSelect");
+    }
+
+    [Fact]
+    public void TensorUnique_GpuMatchesCpu()
+    {
+        if (!EnsureGpuReady()) return;
+        var data = new float[] { 3f, 1f, 2f, 3f, 1f, 5f, 2f, 3f, 4f };
+        var t = new Tensor<float>(data, new[] { data.Length });
+        AssertMatch(_gpu.TensorUnique(t, true), _cpu.TensorUnique(t, true), "Unique");
+    }
+
     // Distinct shuffled values so the sort permutation (and therefore indices) is unambiguous.
     private static Tensor<float> DistinctRand(int seed, params int[] shape)
     {
