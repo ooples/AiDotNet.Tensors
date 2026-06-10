@@ -1646,6 +1646,72 @@ public partial class DirectGpuTensorEngine
     }
 
     /// <inheritdoc/>
+    public override Tensor<T> TimeStretch<T>(Tensor<T> waveform, double rate, int nFft = 512, int hopLength = 128)
+    {
+        if (waveform is null) throw new ArgumentNullException(nameof(waveform));
+        if (rate <= 0) throw new ArgumentException("rate must be positive.");
+        if (nFft < 2) throw new ArgumentException("nFft must be at least 2 (Hann window divides by nFft-1).");
+        if (hopLength <= 0) throw new ArgumentException("hopLength must be positive.");
+        if (System.Math.Abs(rate - 1.0) < 1e-12) return (Tensor<T>)waveform.Clone();
+        if (typeof(T) != typeof(float) || !TryGetBackend(out var backend))
+            return base.TimeStretch(waveform, rate, nFft, hopLength);
+        try
+        {
+            int rank0 = waveform.Rank;
+            int L = waveform._shape[rank0 - 1];
+            int pad = nFft / 2; int Lp = L + 2 * pad;
+            int batch = L == 0 ? 0 : waveform.Length / L;
+            int numFrames = (Lp - nFft) / hopLength + 1;
+            int numFreqs = nFft / 2 + 1;
+            if (batch == 0 || numFrames <= 0 || pad >= L)
+                return base.TimeStretch(waveform, rate, nFft, hopLength);
+            // STFT output is [.., numFreqs, numFrames]; the CPU phase vocoder reads it with its own
+            // (axis-flipped) convention: nFramesV = mag._shape[^2] = numFreqs, nFreqV = mag._shape[^1] = numFrames.
+            int nFreqV = numFrames, nFramesV = numFreqs, leading = batch;
+            int outFrames = (int)System.Math.Floor(nFramesV / rate);
+            int targetLen = (int)System.Math.Round((double)L / rate);
+            int outputLength = targetLen - nFft;   // ISTFT center subtracts nFft even when length is given
+            if (outFrames <= 0 || outputLength <= 0)
+                return base.TimeStretch(waveform, rate, nFft, hopLength);
+
+            var warr = new float[nFft];
+            for (int i = 0; i < nFft; i++) warr[i] = (float)(0.5 - 0.5 * System.Math.Cos(2.0 * System.Math.PI * i / (nFft - 1)));
+            var cw = waveform.IsContiguous ? waveform : (Tensor<T>)waveform.Contiguous();
+            using var bufWave = GetOrAllocateBuffer(backend, cw.GetDataArray());
+            using var bufWin = GetOrAllocateBuffer(backend, (T[])(object)warr);
+            using var bufPadded = AllocateOutputBuffer(backend, batch * Lp);
+            backend.ReflectPad1d(bufWave.Buffer, bufPadded.Buffer, batch, L, Lp, pad);
+            int stftLen = batch * numFreqs * numFrames;
+            using var bufMag = AllocateOutputBuffer(backend, stftLen);
+            using var bufPhase = AllocateOutputBuffer(backend, stftLen);
+            backend.StftMagPhase(bufPadded.Buffer, bufWin.Buffer, bufMag.Buffer, bufPhase.Buffer, batch, Lp, nFft, hopLength, numFrames, numFreqs);
+            int newLen = leading * outFrames * nFreqV;
+            using var bufNewMag = AllocateOutputBuffer(backend, newLen);
+            using var bufNewPhase = AllocateOutputBuffer(backend, newLen);
+            backend.PhaseVocoder(bufMag.Buffer, bufPhase.Buffer, bufNewMag.Buffer, bufNewPhase.Buffer, leading, nFramesV, nFreqV, outFrames, (float)rate);
+            int outTotal = batch * outputLength;
+            // ISTFT sees numFreqs=outFrames, numFrames=nFreqV (the vocoder output axes). Build the full
+            // conj-symmetric spectrum first (replays the CPU two passes in order), then inverse-DFT it.
+            using var bufSpecRe = AllocateOutputBuffer(backend, batch * nFreqV * nFft);
+            using var bufSpecIm = AllocateOutputBuffer(backend, batch * nFreqV * nFft);
+            backend.BuildSpectrum(bufNewMag.Buffer, bufNewPhase.Buffer, bufSpecRe.Buffer, bufSpecIm.Buffer, batch, outFrames, nFreqV, nFft);
+            using var bufWinSum = AllocateOutputBuffer(backend, outTotal);
+            var bufResult = AllocateOutputBuffer(backend, outTotal);   // NOT using — FinishGpuOp owns it
+            backend.Fill(bufResult.Buffer, 0f, outTotal);
+            backend.Fill(bufWinSum.Buffer, 0f, outTotal);
+            backend.IstftFromSpectrum(bufSpecRe.Buffer, bufSpecIm.Buffer, bufWin.Buffer, bufResult.Buffer, bufWinSum.Buffer, batch, nFreqV, nFft, hopLength, outputLength, 1);
+            backend.IstftNormalize(bufResult.Buffer, bufWinSum.Buffer, outTotal);
+            backend.Synchronize();   // all `using` intermediates feed the deferred result — force compute first
+            var outArr = FinishGpuOp<T>(backend, bufResult, outTotal);
+            var outShape = new int[rank0];
+            for (int i = 0; i < rank0 - 1; i++) outShape[i] = waveform._shape[i];
+            outShape[rank0 - 1] = outputLength;
+            return new Tensor<T>(outArr, outShape);
+        }
+        catch (Exception) { return base.TimeStretch(waveform, rate, nFft, hopLength); }
+    }
+
+    /// <inheritdoc/>
     public override Tensor<T> Spectrogram<T>(Tensor<T> waveform, int nFft, int hopLength, int winLength, Tensor<T>? window = null)
     {
         if (waveform is null) throw new ArgumentNullException(nameof(waveform));

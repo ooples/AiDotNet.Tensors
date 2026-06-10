@@ -1475,6 +1475,14 @@ public class DelegatingGpuBackend : IDirectGpuBackend
     /// <inheritdoc/>
     public virtual void StftMagPhase(IGpuBuffer padded, IGpuBuffer window, IGpuBuffer mag, IGpuBuffer phase, int batch, int lp, int nFft, int hop, int numFrames, int numFreqs) => Inner.StftMagPhase(padded, window, mag, phase, batch, lp, nFft, hop, numFrames, numFreqs);
     /// <inheritdoc/>
+    public virtual void PhaseVocoder(IGpuBuffer mag, IGpuBuffer phase, IGpuBuffer newMag, IGpuBuffer newPhase, int leading, int nFramesV, int nFreqV, int outFrames, float rate) => Inner.PhaseVocoder(mag, phase, newMag, newPhase, leading, nFramesV, nFreqV, outFrames, rate);
+    /// <inheritdoc/>
+    public virtual void BuildSpectrum(IGpuBuffer mag, IGpuBuffer phase, IGpuBuffer specRe, IGpuBuffer specIm, int batch, int numFreqs, int numFrames, int nFft) => Inner.BuildSpectrum(mag, phase, specRe, specIm, batch, numFreqs, numFrames, nFft);
+    /// <inheritdoc/>
+    public virtual void IstftFromSpectrum(IGpuBuffer specRe, IGpuBuffer specIm, IGpuBuffer window, IGpuBuffer result, IGpuBuffer windowSum, int batch, int numFrames, int nFft, int hop, int outputLength, int center) => Inner.IstftFromSpectrum(specRe, specIm, window, result, windowSum, batch, numFrames, nFft, hop, outputLength, center);
+    /// <inheritdoc/>
+    public virtual void IstftNormalize(IGpuBuffer result, IGpuBuffer windowSum, int total) => Inner.IstftNormalize(result, windowSum, total);
+    /// <inheritdoc/>
     public virtual void HistogramDD(IGpuBuffer samples, IGpuBuffer hist, IGpuBuffer bins, IGpuBuffer mins, IGpuBuffer maxs, int n, int d) => Inner.HistogramDD(samples, hist, bins, mins, maxs, n, d);
     /// <inheritdoc/>
     public virtual void MasksToBoxes(IGpuBuffer masks, IGpuBuffer output, int n, int h, int w) => Inner.MasksToBoxes(masks, output, n, h, w);

@@ -264,6 +264,28 @@ __kernel void stft_mag_phase(__global const float* padded, __global const float*
     mag[outOff] = sqrt(re*re + im*im);
     phase[outOff] = atan2(im, re);
 }
+// phase_vocoder: one thread per (b,f) runs the sequential t-scan internally (accPhase carries over t).
+// Mirrors CpuEngine.TimeStretch index math EXACTLY (its 'nFrames'=outer axis, 'nFreq'=inner axis).
+__kernel void phase_vocoder(__global const float* mag, __global const float* phase,
+    __global float* newMag, __global float* newPhase, int leading, int nFramesV, int nFreqV, int outFrames, float rate) {
+    int idx = get_global_id(0); if (idx >= leading*nFreqV) return;
+    int f = idx % nFreqV; int b = idx / nFreqV;
+    int stride = nFramesV*nFreqV; int outStride = outFrames*nFreqV;
+    float accPhase = 0.0f;
+    for (int t = 0; t < outFrames; t++) {
+        float srcT = (float)t * rate;
+        int t0 = (int)floor(srcT); int t1 = min(t0+1, nFramesV-1); float frac = srcT - (float)t0;
+        float m0 = mag[b*stride + t0*nFreqV + f]; float m1 = mag[b*stride + t1*nFreqV + f];
+        newMag[b*outStride + t*nFreqV + f] = (1.0f-frac)*m0 + frac*m1;
+        float dp = 0.0f;
+        if (t0+1 < nFramesV) {
+            dp = phase[b*stride + (t0+1)*nFreqV + f] - phase[b*stride + t0*nFreqV + f];
+            dp -= 2.0f*M_PI_F * round(dp/(2.0f*M_PI_F));
+        }
+        accPhase += dp;
+        newPhase[b*outStride + t*nFreqV + f] = accPhase;
+    }
+}
 // shifted_diff: mask[i] = (i==0 || x[i] != x[i-1]) ? 1 : 0  (consecutive-unique keep mask).
 __kernel void shifted_diff(__global const float* x, __global float* mask, int n) {
     int i = get_global_id(0); if (i >= n) return;
@@ -502,6 +524,52 @@ __kernel void gridsample_backward_grid(__global const float* gradOut, __global c
     }
     gradGrid[gridBase] = gradGx; gradGrid[gridBase+1] = gradGy;
 }
+// build_spectrum: one thread per (b,frame) replays CpuEngine.ISTFT's TWO passes IN ORDER (positive
+// freqs [0,numFreqs), then conjugate writes nFft-k = realIn[k] for k in [1,numFreqs-1)). Doing both in a
+// single thread reproduces the sequential-overwrite behaviour when numFreqs > nFft/2+1 (TimeStretch
+// rate<1) that a per-bin closed form cannot. spec* layout [(b*numFrames+frame)*nFft + k].
+__kernel void build_spectrum(__global const float* mag, __global const float* phase,
+    __global float* specRe, __global float* specIm, int batch, int numFreqs, int numFrames, int nFft) {
+    int idx = get_global_id(0); if (idx >= batch*numFrames) return;
+    int frame = idx % numFrames; int b = idx / numFrames;
+    int magOff = b*numFreqs*numFrames; int specOff = idx * nFft;
+    for (int k = 0; k < nFft; k++) { specRe[specOff+k] = 0.0f; specIm[specOff+k] = 0.0f; }
+    for (int k = 0; k < numFreqs && k < nFft; k++) {
+        float m = mag[magOff + k*numFrames + frame]; float p = phase[magOff + k*numFrames + frame];
+        specRe[specOff+k] = m*cos(p); specIm[specOff+k] = m*sin(p);
+    }
+    for (int k = 1; k < numFreqs - 1; k++) {
+        int dst = nFft - k;
+        if (dst >= 0 && dst < nFft && k < nFft) {
+            specRe[specOff+dst] = specRe[specOff+k];
+            specIm[specOff+dst] = -specIm[specOff+k];
+        }
+    }
+}
+// istft_from_spectrum: per (b,frame,i) inverse-DFT sample from the full spectrum, windowed overlap-add.
+__kernel void istft_from_spectrum(__global const float* specRe, __global const float* specIm, __global const float* window,
+    volatile __global float* result, volatile __global float* windowSum,
+    int batch, int numFrames, int nFft, int hop, int outputLength, int center) {
+    int idx = get_global_id(0); int total = batch*numFrames*nFft; if (idx >= total) return;
+    int i = idx % nFft; int tmp = idx / nFft; int frame = tmp % numFrames; int b = tmp / numFrames;
+    int specOff = (b*numFrames + frame) * nFft;
+    float acc = 0.0f;
+    for (int k = 0; k < nFft; k++) {
+        float a = 2.0f*M_PI_F*(float)k*(float)i/(float)nFft;
+        acc += specRe[specOff+k]*cos(a) - specIm[specOff+k]*sin(a);
+    }
+    int writeStart = center ? max(0, frame*hop - nFft/2) : frame*hop;
+    int outIdx = writeStart + i;
+    if (outIdx >= 0 && outIdx < outputLength) {
+        float w = window[i];
+        atomicAddF(&result[b*outputLength + outIdx], acc*(1.0f/(float)nFft)*w);
+        atomicAddF(&windowSum[b*outputLength + outIdx], w*w);
+    }
+}
+__kernel void istft_normalize(__global float* result, __global const float* windowSum, int total) {
+    int idx = get_global_id(0); if (idx >= total) return;
+    float ws = windowSum[idx]; if (ws > 1e-8f) result[idx] = result[idx] / ws;
+}
 // Condensed pairwise p-norm over rows of input[n,d]; output 1-D upper-triangle (i<j) order.
 __kernel void pdist(__global const float* input, __global float* output, int n, int d, float p) {
     int flat = get_global_id(0); if (flat >= n * n) return;
@@ -548,7 +616,7 @@ __kernel void next_after(__global const float* a, __global const float* b, __glo
             "masked_fill_kernel", "index_select", "take_along_dim",
             "cross3", "ldexp_kernel", "kron2d", "search_sorted", "next_after", "index_write", "cdist", "pdist",
             "histc", "bitonic_step", "copy_rows", "iota_pad", "rwkv7_forward", "hsoftmax_paths",
-            "isin", "unfold", "copy_block_2d", "scatter_reduce", "zeta_kernel", "polygamma_kernel", "reflect_pad_1d", "stft_mag_phase", "shifted_diff", "histogramdd", "masks_to_boxes", "pairwise_iou", "logical_op", "logical_not", "gridsample_backward_input", "gridsample_backward_grid"
+            "isin", "unfold", "copy_block_2d", "scatter_reduce", "zeta_kernel", "polygamma_kernel", "reflect_pad_1d", "stft_mag_phase", "phase_vocoder", "build_spectrum", "istft_from_spectrum", "istft_normalize", "shifted_diff", "histogramdd", "masks_to_boxes", "pairwise_iou", "logical_op", "logical_not", "gridsample_backward_input", "gridsample_backward_grid"
         };
     }
 }

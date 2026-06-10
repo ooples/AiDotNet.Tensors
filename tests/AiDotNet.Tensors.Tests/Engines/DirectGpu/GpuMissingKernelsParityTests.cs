@@ -756,6 +756,16 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
     }
 
     [Fact]
+    public void TimeStretch_GpuMatchesCpu()
+    {
+        if (!EnsureGpuReady()) return;
+        int nFft = 16, hop = 4;
+        var wave = Rand(360, 128);
+        AssertMatch(_gpu.TimeStretch(wave, 1.5, nFft, hop), _cpu.TimeStretch(wave, 1.5, nFft, hop), "TimeStretch1.5");
+        AssertMatch(_gpu.TimeStretch(wave, 0.8, nFft, hop), _cpu.TimeStretch(wave, 0.8, nFft, hop), "TimeStretch0.8");
+    }
+
+    [Fact]
     public void Spectrogram_GpuMatchesCpu()
     {
         if (!EnsureGpuReady()) return;

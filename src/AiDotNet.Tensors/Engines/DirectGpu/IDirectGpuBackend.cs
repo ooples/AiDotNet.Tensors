@@ -1999,6 +1999,18 @@ public interface IDirectGpuBackend : IDisposable
     /// <summary>STFT magnitude+phase: per (b,k,frame) DFT bin of the windowed frame. out [b][k*numFrames+frame].</summary>
     void StftMagPhase(IGpuBuffer padded, IGpuBuffer window, IGpuBuffer mag, IGpuBuffer phase, int batch, int lp, int nFft, int hop, int numFrames, int numFreqs);
 
+    /// <summary>Phase vocoder time-axis remap + phase accumulation (one thread per (b,f)).</summary>
+    void PhaseVocoder(IGpuBuffer mag, IGpuBuffer phase, IGpuBuffer newMag, IGpuBuffer newPhase, int leading, int nFramesV, int nFreqV, int outFrames, float rate);
+
+    /// <summary>Build the full conj-symmetric spectrum (two CPU passes in order) from mag/phase.</summary>
+    void BuildSpectrum(IGpuBuffer mag, IGpuBuffer phase, IGpuBuffer specRe, IGpuBuffer specIm, int batch, int numFreqs, int numFrames, int nFft);
+
+    /// <summary>Inverse STFT from the full spectrum: windowed overlap-add (atomic) into result + windowSum.</summary>
+    void IstftFromSpectrum(IGpuBuffer specRe, IGpuBuffer specIm, IGpuBuffer window, IGpuBuffer result, IGpuBuffer windowSum, int batch, int numFrames, int nFft, int hop, int outputLength, int center);
+
+    /// <summary>ISTFT normalize: result /= windowSum where windowSum &gt; 1e-8.</summary>
+    void IstftNormalize(IGpuBuffer result, IGpuBuffer windowSum, int total);
+
     /// <summary>D-dim histogram (atomic). bins int[D], mins/maxs float[D]; hist pre-zeroed length prod(bins).</summary>
     void HistogramDD(IGpuBuffer samples, IGpuBuffer hist, IGpuBuffer bins, IGpuBuffer mins, IGpuBuffer maxs, int n, int d);
 
