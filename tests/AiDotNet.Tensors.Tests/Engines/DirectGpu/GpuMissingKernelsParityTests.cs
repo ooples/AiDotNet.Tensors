@@ -679,6 +679,21 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
     }
 
     [Fact]
+    public void TensorHistogramDD_GpuMatchesCpu()
+    {
+        if (!EnsureGpuReady()) return;
+        var rng = new Random(320);
+        var data = new float[200 * 2];
+        for (int i = 0; i < data.Length; i++) data[i] = (float)rng.NextDouble();
+        var samples = new Tensor<float>(data, new[] { 200, 2 });
+        var bins = new[] { 4, 5 };
+        var mins = new[] { 0f, 0f };
+        var maxs = new[] { 1f, 1f };
+        Assert.Equal(_cpu.TensorHistogramDD(samples, bins, mins, maxs).ToArray(),
+                     _gpu.TensorHistogramDD(samples, bins, mins, maxs).ToArray());
+    }
+
+    [Fact]
     public void TensorNonzero_GpuMatchesCpu()
     {
         if (!EnsureGpuReady()) return;

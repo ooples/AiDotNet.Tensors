@@ -365,6 +365,23 @@ __kernel void histc(__global const float* input, volatile __global float* hist, 
     if (b < 0) b = 0;
     atomicAddF(&hist[b], 1.0f);
 }
+// histogramdd: D-dim histogram. One thread per sample; per-dim bin, row-major linearize, atomic-add.
+// (placed after atomicAddF is defined). bins int[D], mins/maxs float[D]; hist pre-zeroed length prod(bins).
+__kernel void histogramdd(__global const float* samples, volatile __global float* hist,
+    __global const int* bins, __global const float* mins, __global const float* maxs, int n, int d) {
+    int i = get_global_id(0); if (i >= n) return;
+    int linIdx = 0; int valid = 1;
+    for (int k = 0; k < d; k++) {
+        float v = samples[i*d + k]; float mn = mins[k]; float mx = maxs[k];
+        if (v < mn || v > mx) { valid = 0; break; }
+        float width = (mx - mn) / (float)bins[k];
+        int kIdx = (int)floor((v - mn) / width);
+        if (kIdx >= bins[k]) kIdx = bins[k] - 1;
+        if (kIdx < 0) kIdx = 0;
+        linIdx = linIdx * bins[k] + kIdx;
+    }
+    if (valid) atomicAddF(&hist[linIdx], 1.0f);
+}
 // Condensed pairwise p-norm over rows of input[n,d]; output 1-D upper-triangle (i<j) order.
 __kernel void pdist(__global const float* input, __global float* output, int n, int d, float p) {
     int flat = get_global_id(0); if (flat >= n * n) return;
@@ -411,7 +428,7 @@ __kernel void next_after(__global const float* a, __global const float* b, __glo
             "masked_fill_kernel", "index_select", "take_along_dim",
             "cross3", "ldexp_kernel", "kron2d", "search_sorted", "next_after", "index_write", "cdist", "pdist",
             "histc", "bitonic_step", "copy_rows", "iota_pad", "rwkv7_forward", "hsoftmax_paths",
-            "isin", "unfold", "copy_block_2d", "scatter_reduce", "zeta_kernel", "polygamma_kernel", "shifted_diff"
+            "isin", "unfold", "copy_block_2d", "scatter_reduce", "zeta_kernel", "polygamma_kernel", "shifted_diff", "histogramdd"
         };
     }
 }

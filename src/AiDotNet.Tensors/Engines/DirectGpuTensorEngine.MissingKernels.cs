@@ -1525,6 +1525,39 @@ public partial class DirectGpuTensorEngine
     }
 
     /// <inheritdoc/>
+    public override Tensor<int> TensorHistogramDD<T>(Tensor<T> samples, int[] bins, T[] mins, T[] maxs)
+    {
+        if (samples is null) throw new ArgumentNullException(nameof(samples));
+        if (bins is null) throw new ArgumentNullException(nameof(bins));
+        if (mins is null) throw new ArgumentNullException(nameof(mins));
+        if (maxs is null) throw new ArgumentNullException(nameof(maxs));
+        if (typeof(T) != typeof(float) || samples.Rank != 2 || bins.Length != samples._shape[1]
+            || mins.Length != samples._shape[1] || maxs.Length != samples._shape[1] || !TryGetBatchBackend(out var backend))
+            return base.TensorHistogramDD(samples, bins, mins, maxs);
+        int n = samples._shape[0], d = samples._shape[1];
+        int total = 1; foreach (var bb in bins) total *= bb;
+        if (total <= 0) return base.TensorHistogramDD(samples, bins, mins, maxs);
+        try
+        {
+            var cs = samples.IsContiguous ? samples : (Tensor<T>)samples.Contiguous();
+            using var bufSamp = GetOrAllocateBuffer(backend, cs.GetDataArray());
+            using var bufBins = new OwnedBuffer(backend.AllocateIntBuffer(bins), true);
+            using var bufMins = GetOrAllocateBuffer(backend, (T[])(object)((float[])(object)mins).Clone());
+            using var bufMaxs = GetOrAllocateBuffer(backend, (T[])(object)((float[])(object)maxs).Clone());
+            using var bufHist = AllocateOutputBuffer(backend, total);
+            backend.Fill(bufHist.Buffer, 0f, total);
+            backend.HistogramDD(bufSamp.Buffer, bufHist.Buffer, bufBins.Buffer, bufMins.Buffer, bufMaxs.Buffer, n, d);
+            backend.Synchronize();
+            var f = backend.DownloadBuffer(bufHist.Buffer);
+            var res = new Tensor<int>((int[])bins.Clone());
+            var dst = res.AsWritableSpan();
+            for (int i = 0; i < total; i++) dst[i] = (int)f[i];
+            return res;
+        }
+        catch (Exception) { return base.TensorHistogramDD(samples, bins, mins, maxs); }
+    }
+
+    /// <inheritdoc/>
     public override Tensor<T> TensorZeta<T>(Tensor<T> x, Tensor<T> q)
     {
         if (x is null) throw new ArgumentNullException(nameof(x));
