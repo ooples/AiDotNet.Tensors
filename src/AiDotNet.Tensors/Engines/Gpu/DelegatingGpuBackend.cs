@@ -1450,6 +1450,12 @@ public class DelegatingGpuBackend : IDirectGpuBackend
     public virtual void PDist(IGpuBuffer input, IGpuBuffer output, int n, int d, float p) => Inner.PDist(input, output, n, d, p);
     /// <inheritdoc/>
     public virtual void Histc(IGpuBuffer input, IGpuBuffer hist, int n, int bins, float mn, float mx) => Inner.Histc(input, hist, n, bins, mn, mx);
+    /// <inheritdoc/>
+    public virtual void BitonicStep(IGpuBuffer values, IGpuBuffer indices, int rowLen, int k, int j, int numRows, int descending) => Inner.BitonicStep(values, indices, rowLen, k, j, numRows, descending);
+    /// <inheritdoc/>
+    public virtual void CopyRows(IGpuBuffer src, IGpuBuffer dst, int srcRowLen, int dstRowLen, int numRows, int copyLen) => Inner.CopyRows(src, dst, srcRowLen, dstRowLen, numRows, copyLen);
+    /// <inheritdoc/>
+    public virtual void IotaPad(IGpuBuffer idx, int l, int p, int numRows) => Inner.IotaPad(idx, l, p, numRows);
 
     /// <inheritdoc/>
     public virtual void Where(IGpuBuffer condition, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)

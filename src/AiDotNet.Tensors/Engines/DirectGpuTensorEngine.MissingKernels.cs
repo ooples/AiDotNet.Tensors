@@ -724,6 +724,132 @@ public partial class DirectGpuTensorEngine
         return true;
     }
 
+    // ----- Sort family (GPU bitonic sort) -----
+
+    // Sorts numRows contiguous rows of length L on the GPU (NaN-aware, torch order) and returns the
+    // sorted values and original-position indices in the SAME [numRows*L] layout. Rows are padded to a
+    // power of two on the device (ascending pad = NaN -> +inf -> tail; descending pad = -inf -> tail);
+    // the host drives the O(log^2 P) bitonic (k, j) schedule. Indices ride along as floats (exact for
+    // the index range). Verified against the CPU reference.
+    private (float[] vals, int[] idx) BitonicSortRows(IDirectGpuBackend backend, float[] data, int numRows, int L, bool descending)
+    {
+        int P = 1; while (P < L) P <<= 1;
+        float padVal = descending ? float.NegativeInfinity : float.NaN;
+        using var srcBuf = GetOrAllocateBuffer(backend, data);
+        using var valBuf = AllocateOutputBuffer(backend, numRows * P);
+        using var idxBuf = AllocateOutputBuffer(backend, numRows * P);
+        backend.Fill(valBuf.Buffer, padVal, numRows * P);
+        backend.CopyRows(srcBuf.Buffer, valBuf.Buffer, L, P, numRows, L);   // pad rows L -> P
+        backend.IotaPad(idxBuf.Buffer, L, P, numRows);
+        int desc = descending ? 1 : 0;
+        for (int k = 2; k <= P; k <<= 1)
+            for (int j = k >> 1; j > 0; j >>= 1)
+                backend.BitonicStep(valBuf.Buffer, idxBuf.Buffer, P, k, j, numRows, desc);
+        using var outVal = AllocateOutputBuffer(backend, numRows * L);
+        using var outIdx = AllocateOutputBuffer(backend, numRows * L);
+        backend.CopyRows(valBuf.Buffer, outVal.Buffer, P, L, numRows, L);   // un-pad P -> L (drop tail)
+        backend.CopyRows(idxBuf.Buffer, outIdx.Buffer, P, L, numRows, L);
+        backend.Synchronize();
+        var vals = backend.DownloadBuffer(outVal.Buffer);
+        var idxF = backend.DownloadBuffer(outIdx.Buffer);
+        var idx = new int[numRows * L];
+        for (int i = 0; i < idx.Length; i++) idx[i] = (int)idxF[i];
+        return (vals, idx);
+    }
+
+    /// <inheritdoc/>
+    public override (Tensor<T> Values, Tensor<int> Indices) TensorSort<T>(Tensor<T> input, int axis = -1, bool descending = false)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        int rank = input.Rank;
+        int ax = axis < 0 ? axis + rank : axis;
+        // GPU bitonic handles the contiguous last-axis case (torch default); other axes defer to base.
+        if (typeof(T) != typeof(float) || ax != rank - 1 || !TryGetBackend(out var backend))
+            return base.TensorSort(input, axis, descending);
+        try
+        {
+            var c = input.IsContiguous ? input : (Tensor<T>)input.Contiguous();
+            int L = input._shape[rank - 1];
+            int numRows = L == 0 ? 0 : input.Length / L;
+            if (numRows == 0 || L == 0) return base.TensorSort(input, axis, descending);
+            var data = (float[])(object)c.GetDataArray();
+            var (vals, idx) = BitonicSortRows(backend, data, numRows, L, descending);
+            var valuesT = new Tensor<T>((T[])(object)vals, (int[])input._shape.Clone());
+            var indicesT = new Tensor<int>(idx, (int[])input._shape.Clone());
+            return (valuesT, indicesT);
+        }
+        catch (Exception) { return base.TensorSort(input, axis, descending); }
+    }
+
+    /// <inheritdoc/>
+    public override Tensor<int> TensorArgsort<T>(Tensor<T> input, int axis = -1, bool descending = false)
+    {
+        // Argsort = Sort's indices; the GPU Sort override above carries it.
+        var (_, indices) = TensorSort(input, axis, descending);
+        return indices;
+    }
+
+    /// <inheritdoc/>
+    public override T TensorMedian<T>(Tensor<T> input)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (input.Length == 0) throw new ArgumentException("Median requires a non-empty tensor");
+        if (typeof(T) != typeof(float) || !TryGetBackend(out var backend))
+            return base.TensorMedian(input);
+        try
+        {
+            var c = input.IsContiguous ? input : (Tensor<T>)input.Contiguous();
+            int L = input.Length;
+            var (vals, _) = BitonicSortRows(backend, (float[])(object)c.GetDataArray(), 1, L, false);
+            int k = (L + 1) / 2;   // lower median (torch)
+            return (T)(object)vals[k - 1];
+        }
+        catch (Exception) { return base.TensorMedian(input); }
+    }
+
+    /// <inheritdoc/>
+    public override (T Value, int Index) TensorKthvalue<T>(Tensor<T> input, int k)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (k < 1 || k > input.Length) throw new ArgumentOutOfRangeException(nameof(k));
+        if (typeof(T) != typeof(float) || !TryGetBackend(out var backend))
+            return base.TensorKthvalue(input, k);
+        try
+        {
+            var c = input.IsContiguous ? input : (Tensor<T>)input.Contiguous();
+            int L = input.Length;
+            var (vals, idx) = BitonicSortRows(backend, (float[])(object)c.GetDataArray(), 1, L, false);
+            return ((T)(object)vals[k - 1], idx[k - 1]);
+        }
+        catch (Exception) { return base.TensorKthvalue(input, k); }
+    }
+
+    /// <inheritdoc/>
+    public override (T Value, int Count) TensorMode<T>(Tensor<T> input)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (input.Length == 0) throw new ArgumentException("Mode requires a non-empty tensor");
+        if (typeof(T) != typeof(float) || !TryGetBackend(out var backend))
+            return base.TensorMode(input);
+        try
+        {
+            var c = input.IsContiguous ? input : (Tensor<T>)input.Contiguous();
+            int L = input.Length;
+            var (vals, _) = BitonicSortRows(backend, (float[])(object)c.GetDataArray(), 1, L, false);
+            // Sorted ascending -> equal values are contiguous; longest run wins, ties -> smallest value
+            // (the first run in ascending order). Strict '>' keeps the earliest (smallest-value) run.
+            float bestVal = vals[0]; int bestCount = 1, run = 1;
+            for (int i = 1; i < L; i++)
+            {
+                if (vals[i] == vals[i - 1]) run++;
+                else { if (run > bestCount) { bestCount = run; bestVal = vals[i - 1]; } run = 1; }
+            }
+            if (run > bestCount) { bestCount = run; bestVal = vals[L - 1]; }
+            return ((T)(object)bestVal, bestCount);
+        }
+        catch (Exception) { return base.TensorMode(input); }
+    }
+
     /// <inheritdoc/>
     public override Tensor<T> TensorTakeAlongDim<T>(Tensor<T> tensor, Tensor<int> indices, int dim)
     {

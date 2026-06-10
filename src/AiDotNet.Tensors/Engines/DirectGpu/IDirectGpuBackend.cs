@@ -1952,6 +1952,19 @@ public interface IDirectGpuBackend : IDisposable
     /// </summary>
     void Histc(IGpuBuffer input, IGpuBuffer hist, int n, int bins, float mn, float mx);
 
+    /// <summary>
+    /// One bitonic compare-exchange step over numRows rows of length rowLen (a power of two). k is the
+    /// current bitonic sequence size, j the compare distance; the host drives the (k, j) schedule.
+    /// values and indices are co-permuted; NaN sorts as +inf (torch.sort order).
+    /// </summary>
+    void BitonicStep(IGpuBuffer values, IGpuBuffer indices, int rowLen, int k, int j, int numRows, int descending);
+
+    /// <summary>Copy the first copyLen elements of each row (src stride srcRowLen → dst stride dstRowLen).</summary>
+    void CopyRows(IGpuBuffer src, IGpuBuffer dst, int srcRowLen, int dstRowLen, int numRows, int copyLen);
+
+    /// <summary>Initialize padded index rows: idx[r*P + i] = (i &lt; L) ? i : -1.</summary>
+    void IotaPad(IGpuBuffer idx, int l, int p, int numRows);
+
     #region Comparison Operations
 
     void GreaterThan(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size);

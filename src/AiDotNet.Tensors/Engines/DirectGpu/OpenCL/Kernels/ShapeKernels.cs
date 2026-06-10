@@ -177,6 +177,36 @@ __kernel void cdist(__global const float* x1, __global const float* x2, __global
     }
     output[idx] = (p == 1.0f) ? sum : (p == 2.0f) ? sqrt(sum) : pow(sum, 1.0f / p);
 }
+// One bitonic compare-exchange step. values/indices are numRows rows of length rowLen (a power of 2).
+// k = current bitonic sequence size, j = compare distance. NaN is treated as +inf (torch.sort order).
+__kernel void bitonic_step(__global float* values, __global float* indices, int rowLen, int k, int j, int numRows, int descending) {
+    int gid = get_global_id(0); if (gid >= numRows * rowLen) return;
+    int i = gid % rowLen; int ixj = i ^ j;
+    if (ixj <= i) return;
+    int base = (gid / rowLen) * rowLen;
+    float a = values[base + i], b = values[base + ixj];
+    uint ua = as_uint(a), ub = as_uint(b);
+    float ka = (((ua >> 23) & 0xFFu) == 0xFFu && (ua & 0x7FFFFFu) != 0u) ? INFINITY : a;
+    float kb = (((ub >> 23) & 0xFFu) == 0xFFu && (ub & 0x7FFFFFu) != 0u) ? INFINITY : b;
+    int up = ((i & k) == 0); if (descending != 0) up = !up;
+    int doSwap = up ? (ka > kb) : (ka < kb);
+    if (doSwap) {
+        values[base + i] = b; values[base + ixj] = a;
+        float t = indices[base + i]; indices[base + i] = indices[base + ixj]; indices[base + ixj] = t;
+    }
+}
+// Copy the first copyLen elements of each row (src stride srcRowLen -> dst stride dstRowLen).
+// Used both to pad (L->P, into a pre-filled buffer) and to un-pad (P->L) bitonic rows.
+__kernel void copy_rows(__global const float* src, __global float* dst, int srcRowLen, int dstRowLen, int numRows, int copyLen) {
+    int gid = get_global_id(0); if (gid >= numRows * copyLen) return;
+    int i = gid % copyLen; int r = gid / copyLen;
+    dst[r * dstRowLen + i] = src[r * srcRowLen + i];
+}
+// Initialize padded index rows (stored as float): idx[r*P + i] = (i < L) ? i : -1.
+__kernel void iota_pad(__global float* idx, int L, int P, int numRows) {
+    int gid = get_global_id(0); if (gid >= numRows * P) return;
+    int i = gid % P; idx[gid] = (i < L) ? (float)i : -1.0f;
+}
 // Histogram into `bins` equal-width bins over [mn,mx]; out-of-range dropped, mx in last bin.
 // hist must be pre-zeroed. Float atomic add via int cmpxchg loop (core int32 atomics).
 inline void atomicAddF(volatile __global float* addr, float val) {
@@ -239,7 +269,7 @@ __kernel void next_after(__global const float* a, __global const float* b, __glo
             "diag_kernel", "extract_diag_kernel", "triangular_mask",
             "masked_fill_kernel", "index_select", "take_along_dim",
             "cross3", "ldexp_kernel", "kron2d", "search_sorted", "next_after", "index_write", "cdist", "pdist",
-            "histc"
+            "histc", "bitonic_step", "copy_rows", "iota_pad"
         };
     }
 }

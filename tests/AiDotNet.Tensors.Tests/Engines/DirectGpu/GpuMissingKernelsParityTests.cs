@@ -500,6 +500,57 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         AssertMatch(gpu, cpu, $"TensorRepeatInterleave[{string.Join("x", shape)};r={repeats}]");
     }
 
+    // Distinct shuffled values so the sort permutation (and therefore indices) is unambiguous.
+    private static Tensor<float> DistinctRand(int seed, params int[] shape)
+    {
+        int n = 1; foreach (var s in shape) n *= s;
+        var vals = new float[n];
+        for (int i = 0; i < n; i++) vals[i] = i - n / 2 + 0.25f;
+        var rng = new Random(seed);
+        for (int i = n - 1; i > 0; i--) { int j = rng.Next(i + 1); (vals[i], vals[j]) = (vals[j], vals[i]); }
+        return new Tensor<float>(vals, shape);
+    }
+
+    [Theory]
+    [InlineData(new[] { 16 }, false)]
+    [InlineData(new[] { 16 }, true)]
+    [InlineData(new[] { 5 }, false)]      // non power-of-two row
+    [InlineData(new[] { 4, 7 }, false)]   // multi-row, last axis
+    [InlineData(new[] { 3, 4, 6 }, true)]
+    public void TensorSort_Argsort_GpuMatchesCpu(int[] shape, bool descending)
+    {
+        if (!EnsureGpuReady()) return;
+        var t = DistinctRand(220, shape);
+        var (gv, gi) = _gpu.TensorSort(t, -1, descending);
+        var (cv, ci) = _cpu.TensorSort(t, -1, descending);
+        AssertMatch(gv, cv, "Sort.values");
+        Assert.Equal(ci.ToArray(), gi.ToArray());
+        Assert.Equal(_cpu.TensorArgsort(t, -1, descending).ToArray(), _gpu.TensorArgsort(t, -1, descending).ToArray());
+    }
+
+    [Theory]
+    [InlineData(15)]
+    [InlineData(16)]
+    [InlineData(100)]
+    public void TensorMedian_Kthvalue_Mode_GpuMatchesCpu(int n)
+    {
+        if (!EnsureGpuReady()) return;
+        var t = DistinctRand(221, n);
+        Assert.Equal((double)_cpu.TensorMedian(t), (double)_gpu.TensorMedian(t), 4);
+        int k = n / 3 + 1;
+        var (cv, cidx) = _cpu.TensorKthvalue(t, k);
+        var (gv, gidx) = _gpu.TensorKthvalue(t, k);
+        Assert.Equal((double)cv, (double)gv, 4);
+        Assert.Equal(cidx, gidx);
+        // Mode: use a tensor with a clear most-frequent value.
+        var modeData = new float[] { 1, 2, 2, 3, 3, 3, 4, 5 };
+        var mt = new Tensor<float>(modeData, new[] { modeData.Length });
+        var (cmv, cmc) = _cpu.TensorMode(mt);
+        var (gmv, gmc) = _gpu.TensorMode(mt);
+        Assert.Equal((double)cmv, (double)gmv, 4);
+        Assert.Equal(cmc, gmc);
+    }
+
     private static void AssertBitMatch(Tensor<AiDotNet.Tensors.Bit> gpu, Tensor<AiDotNet.Tensors.Bit> cpu, string op)
     {
         Assert.Equal(cpu.Shape.ToArray(), gpu.Shape.ToArray());
