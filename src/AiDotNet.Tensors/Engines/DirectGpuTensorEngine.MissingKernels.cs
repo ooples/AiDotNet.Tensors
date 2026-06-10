@@ -1204,6 +1204,75 @@ public partial class DirectGpuTensorEngine
     }
 
     /// <inheritdoc/>
+    public override Tensor<T> TensorPut<T>(Tensor<T> tensor, Tensor<int> indices, Tensor<T> source)
+    {
+        if (tensor is null) throw new ArgumentNullException(nameof(tensor));
+        if (indices is null) throw new ArgumentNullException(nameof(indices));
+        if (source is null) throw new ArgumentNullException(nameof(source));
+        if (indices.Length != source.Length)
+            throw new ArgumentException("indices and source must have the same element count");
+        if (typeof(T) != typeof(float) || !TryGetBatchBackend(out var backend))
+            return base.TensorPut(tensor, indices, source);
+        try
+        {
+            // Flat scatter: output[indices[k]] = source[k] (IndexWrite over the flattened tensor).
+            var ct = tensor.IsContiguous ? tensor : (Tensor<T>)tensor.Contiguous();
+            var cs = source.IsContiguous ? source : (Tensor<T>)source.Contiguous();
+            var ci = indices.IsContiguous ? indices : (Tensor<int>)indices.Contiguous();
+            int n = tensor.Length, count = indices.Length;
+            using var bufIn = GetOrAllocateBuffer(backend, ct.GetDataArray());
+            var bufOut = AllocateOutputBuffer(backend, n);
+            backend.Copy(bufIn.Buffer, bufOut.Buffer, n);
+            if (count > 0)
+            {
+                using var bufSrc = GetOrAllocateBuffer(backend, cs.GetDataArray());
+                using var bufIdx = backend.AllocateIntBuffer(ci.GetDataArray());
+                backend.IndexWrite(bufOut.Buffer, bufIdx, bufSrc.Buffer, 0f, 0, 1, count, 1, n);
+            }
+            var arr = FinishGpuOp<T>(backend, bufOut, n);
+            return new Tensor<T>(arr, (int[])tensor._shape.Clone());
+        }
+        catch (Exception) { return base.TensorPut(tensor, indices, source); }
+    }
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorMaskedScatter<T>(Tensor<T> tensor, Tensor<Bit> mask, Tensor<T> source)
+    {
+        if (tensor is null) throw new ArgumentNullException(nameof(tensor));
+        if (mask is null) throw new ArgumentNullException(nameof(mask));
+        if (source is null) throw new ArgumentNullException(nameof(source));
+        if (typeof(T) != typeof(float) || !ShapesEqual(tensor._shape, mask._shape) || !TryGetBatchBackend(out var backend))
+            return base.TensorMaskedScatter(tensor, mask, source);
+        try
+        {
+            // Sequentially fill the masked (flat) positions from source[0..count) — IndexWrite over the
+            // flattened tensor with the CPU-built masked index list.
+            var cm = mask.IsContiguous ? mask : (Tensor<Bit>)mask.Contiguous();
+            var mspan = cm.GetDataArray();
+            int n = tensor.Length;
+            var masked = new List<int>();
+            for (int i = 0; i < n; i++) if (mspan[i]) masked.Add(i);
+            int count = masked.Count;
+            if (count > source.Length) return base.TensorMaskedScatter(tensor, mask, source);
+
+            var ct = tensor.IsContiguous ? tensor : (Tensor<T>)tensor.Contiguous();
+            using var bufIn = GetOrAllocateBuffer(backend, ct.GetDataArray());
+            var bufOut = AllocateOutputBuffer(backend, n);
+            backend.Copy(bufIn.Buffer, bufOut.Buffer, n);
+            if (count > 0)
+            {
+                var cs = source.IsContiguous ? source : (Tensor<T>)source.Contiguous();
+                using var bufSrc = GetOrAllocateBuffer(backend, cs.GetDataArray());
+                using var bufIdx = backend.AllocateIntBuffer(masked.ToArray());
+                backend.IndexWrite(bufOut.Buffer, bufIdx, bufSrc.Buffer, 0f, 0, 1, count, 1, n);
+            }
+            var arr = FinishGpuOp<T>(backend, bufOut, n);
+            return new Tensor<T>(arr, (int[])tensor._shape.Clone());
+        }
+        catch (Exception) { return base.TensorMaskedScatter(tensor, mask, source); }
+    }
+
+    /// <inheritdoc/>
     public override Tensor<T> TensorSliceScatter<T>(Tensor<T> tensor, Tensor<T> source, int dim, int start, int length)
     {
         if (tensor is null) throw new ArgumentNullException(nameof(tensor));

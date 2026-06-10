@@ -575,6 +575,23 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
     }
 
     [Fact]
+    public void TensorPut_MaskedScatter_GpuMatchesCpu()
+    {
+        if (!EnsureGpuReady()) return;
+        var t = Rand(290, 4, 5);
+        var idx = new Tensor<int>(new[] { 0, 7, 13, 19, 3 }, new[] { 5 });
+        var src = Rand(291, 5);
+        AssertMatch(_gpu.TensorPut(t, idx, src), _cpu.TensorPut(t, idx, src), "Put");
+
+        var rng = new Random(292);
+        var bits = new AiDotNet.Tensors.Bit[20];
+        for (int i = 0; i < 20; i++) bits[i] = rng.Next(2) == 1;
+        var mask = new Tensor<AiDotNet.Tensors.Bit>(bits, new[] { 4, 5 });
+        var source = Rand(293, 20);
+        AssertMatch(_gpu.TensorMaskedScatter(t, mask, source), _cpu.TensorMaskedScatter(t, mask, source), "MaskedScatter");
+    }
+
+    [Fact]
     public void TensorCountNonzero_NanMedian_GpuMatchesCpu()
     {
         if (!EnsureGpuReady()) return;
