@@ -76,6 +76,7 @@ public sealed partial class VulkanBackend
     public void TakeAlongDim(IGpuBuffer input, IGpuBuffer indices, IGpuBuffer output, int outerSize, int axisOut, int innerSize, int axisIn) => throw new NotSupportedException("TakeAlongDim not yet implemented on the Vulkan backend.");
     public void Cross3(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int outerSize, int innerSize) => throw new NotSupportedException("Cross3 not yet implemented on the Vulkan backend.");
     public void Ldexp(IGpuBuffer input, IGpuBuffer exponents, IGpuBuffer output, int size) => throw new NotSupportedException("Ldexp not yet implemented on the Vulkan backend.");
+    public void Kron2D(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int am, int an, int bp, int bq) => throw new NotSupportedException("Kron2D not yet implemented on the Vulkan backend.");
 
     #endregion
 

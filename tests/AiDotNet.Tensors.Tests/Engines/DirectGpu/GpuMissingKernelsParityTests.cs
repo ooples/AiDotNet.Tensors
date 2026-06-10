@@ -522,6 +522,18 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
     }
 
     [Theory]
+    [InlineData(2, 3, 2, 2)]
+    [InlineData(3, 1, 2, 4)]
+    [InlineData(4, 4, 3, 3)]
+    public void TensorKron_GpuMatchesCpu(int am, int an, int bp, int bq)
+    {
+        if (!EnsureGpuReady()) return;
+        var a = Rand(196, am, an);
+        var b = Rand(197, bp, bq);
+        AssertMatch(_gpu.TensorKron(a, b), _cpu.TensorKron(a, b), $"Kron[{am}x{an} (x) {bp}x{bq}]");
+    }
+
+    [Theory]
     [InlineData(new[] { 3 }, -1)]
     [InlineData(new[] { 4, 3 }, 1)]
     [InlineData(new[] { 3, 5 }, 0)]

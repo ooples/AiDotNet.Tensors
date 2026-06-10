@@ -129,6 +129,15 @@ __kernel void ldexp_kernel(__global const float* input, __global const int* expo
     int idx = get_global_id(0); if (idx >= size) return;
     output[idx] = ldexp(input[idx], exponents[idx]);
 }
+// 2-D Kronecker product: a[am,an] (X) b[bp,bq] -> out[am*bp, an*bq].
+__kernel void kron2d(__global const float* a, __global const float* b, __global float* output, int am, int an, int bp, int bq) {
+    int idx = get_global_id(0);
+    int outCols = an * bq; int total = (am * bp) * outCols; if (idx >= total) return;
+    int oc = idx % outCols; int orow = idx / outCols;
+    int i = orow / bp; int k = orow % bp;
+    int j = oc / bq;   int l = oc % bq;
+    output[idx] = a[i * an + j] * b[k * bq + l];
+}
 ";
     }
 
@@ -142,7 +151,7 @@ __kernel void ldexp_kernel(__global const float* input, __global const int* expo
             "eye_kernel", "linspace_kernel", "one_hot_kernel",
             "diag_kernel", "extract_diag_kernel", "triangular_mask",
             "masked_fill_kernel", "index_select", "take_along_dim",
-            "cross3", "ldexp_kernel"
+            "cross3", "ldexp_kernel", "kron2d"
         };
     }
 }

@@ -760,6 +760,30 @@ public partial class DirectGpuTensorEngine
     }
 
     /// <inheritdoc/>
+    public override Tensor<T> TensorKron<T>(Tensor<T> a, Tensor<T> b)
+    {
+        if (a is null) throw new ArgumentNullException(nameof(a));
+        if (b is null) throw new ArgumentNullException(nameof(b));
+        // GPU path handles the classic 2-D Kronecker product; general N-D defers to base.
+        if (typeof(T) != typeof(float) || a.Rank != 2 || b.Rank != 2 || !TryGetBackend(out var backend))
+            return base.TensorKron(a, b);
+        try
+        {
+            var ca = a.IsContiguous ? a : (Tensor<T>)a.Contiguous();
+            var cb = b.IsContiguous ? b : (Tensor<T>)b.Contiguous();
+            int am = a._shape[0], an = a._shape[1], bp = b._shape[0], bq = b._shape[1];
+            int outN = am * bp * an * bq;
+            using var bufA = GetOrAllocateBuffer(backend, ca.GetDataArray());
+            using var bufB = GetOrAllocateBuffer(backend, cb.GetDataArray());
+            var bufOut = AllocateOutputBuffer(backend, outN);
+            backend.Kron2D(bufA.Buffer, bufB.Buffer, bufOut.Buffer, am, an, bp, bq);
+            var arr = FinishGpuOp<T>(backend, bufOut, outN);
+            return new Tensor<T>(arr, new[] { am * bp, an * bq });
+        }
+        catch (Exception) { return base.TensorKron(a, b); }
+    }
+
+    /// <inheritdoc/>
     public override Tensor<T> TensorCross<T>(Tensor<T> a, Tensor<T> b, int dim = -1)
     {
         if (a is null) throw new ArgumentNullException(nameof(a));

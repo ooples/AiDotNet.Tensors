@@ -1902,6 +1902,12 @@ public interface IDirectGpuBackend : IDisposable
     /// </summary>
     void Ldexp(IGpuBuffer input, IGpuBuffer exponents, IGpuBuffer output, int size);
 
+    /// <summary>
+    /// 2-D Kronecker product: a is [am, an], b is [bp, bq], output is [am*bp, an*bq] with
+    /// output[i*bp+k, j*bq+l] = a[i,j] * b[k,l].
+    /// </summary>
+    void Kron2D(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int am, int an, int bp, int bq);
+
     #region Comparison Operations
 
     void GreaterThan(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size);

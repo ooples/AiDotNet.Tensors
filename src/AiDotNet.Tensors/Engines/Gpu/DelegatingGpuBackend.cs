@@ -1436,6 +1436,8 @@ public class DelegatingGpuBackend : IDirectGpuBackend
     public virtual void Cross3(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int outerSize, int innerSize) => Inner.Cross3(a, b, output, outerSize, innerSize);
     /// <inheritdoc/>
     public virtual void Ldexp(IGpuBuffer input, IGpuBuffer exponents, IGpuBuffer output, int size) => Inner.Ldexp(input, exponents, output, size);
+    /// <inheritdoc/>
+    public virtual void Kron2D(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int am, int an, int bp, int bq) => Inner.Kron2D(a, b, output, am, an, bp, bq);
 
     /// <inheritdoc/>
     public virtual void Where(IGpuBuffer condition, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
