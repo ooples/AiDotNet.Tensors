@@ -1,3 +1,4 @@
+using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Engines;
@@ -156,5 +157,54 @@ public partial class DirectGpuTensorEngine
         var left = MultiplyChainOnGpu(m, split, i, s);
         var right = MultiplyChainOnGpu(m, split, s + 1, j);
         return TensorMatMul(left, right);
+    }
+
+    /// <inheritdoc/>
+    public override Tensor<T> BatchNormInference<T>(
+        Tensor<T> x, Tensor<T> gamma, Tensor<T> beta, Tensor<T> mean, Tensor<T> variance, double epsilon)
+    {
+        if (x is null) throw new ArgumentNullException(nameof(x));
+        if (gamma is null) throw new ArgumentNullException(nameof(gamma));
+        if (beta is null) throw new ArgumentNullException(nameof(beta));
+        if (mean is null) throw new ArgumentNullException(nameof(mean));
+        if (variance is null) throw new ArgumentNullException(nameof(variance));
+
+        // The CPU base normalizes (x-mean)/sqrt(var+eps)*gamma+beta on the host, downloading x.
+        // The backend BatchNorm kernel with training:false does exactly this using the PROVIDED
+        // running mean/variance — a single on-device kernel. The op's contract is rank-4 NCHW;
+        // defer non-rank-4 to base (it throws the proper error). Tape-active / no-GPU also defer
+        // (BatchNormInference is an eval-mode op, so the tape is normally inactive).
+        if (IsTapeActive<T>() || x.Rank != 4 || !TryGetBackend(out var backend))
+            return base.BatchNormInference(x, gamma, beta, mean, variance, epsilon);
+
+        var bufOut = default(OwnedBuffer);
+        bool ownershipTransferred = false;
+        try
+        {
+            int batch = x.Shape._dims[0];
+            int channels = x.Shape._dims[1];
+            int spatial = x.Length / (batch * channels);
+            using var bufIn = GetOrAllocateBuffer(backend, x.GetDataArray());
+            using var bufGamma = GetOrAllocateBuffer(backend, gamma.GetDataArray());
+            using var bufBeta = GetOrAllocateBuffer(backend, beta.GetDataArray());
+            using var bufMean = GetOrAllocateBuffer(backend, mean.GetDataArray());
+            using var bufVar = GetOrAllocateBuffer(backend, variance.GetDataArray());
+            bufOut = AllocateOutputBuffer(backend, x.Length);
+            // saveMean/saveInvVar are training-only outputs; the inference path ignores them but
+            // the kernel signature requires the buffers, so hand it scratch of size [channels].
+            using var bufSaveMean = AllocateOutputBuffer(backend, channels);
+            using var bufSaveInvVar = AllocateOutputBuffer(backend, channels);
+            backend.BatchNorm(bufIn.Buffer, bufOut.Buffer, bufGamma.Buffer, bufBeta.Buffer,
+                bufMean.Buffer, bufVar.Buffer, bufSaveMean.Buffer, bufSaveInvVar.Buffer,
+                batch, channels, spatial, (float)epsilon, 0.1f, /*training:*/ false);
+            var result = FinishGpuOp<T>(backend, bufOut, x.Length);
+            ownershipTransferred = true;
+            return new Tensor<T>(result, x.Shape._dims);
+        }
+        catch (Exception)
+        {
+            if (!ownershipTransferred) bufOut.Dispose();
+            return base.BatchNormInference(x, gamma, beta, mean, variance, epsilon);
+        }
     }
 }

@@ -182,5 +182,36 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         var gpu = _gpu.TensorMultiDot(mats);
         AssertMatch(gpu, cpu, $"TensorMultiDot[{string.Join("x", dims)}]");
     }
+
+    // BatchNormInference's contract is rank-4 NCHW.
+    public static IEnumerable<object[]> BnShapes() => new List<object[]>
+    {
+        new object[] { new[] { 2, 16, 3, 3 } },      // [N, C, H, W]
+        new object[] { new[] { 1, 3, 8, 8 } },       // single image, 3 channels
+        new object[] { new[] { 4, 8, 1, 1 } },       // 1x1 spatial
+        new object[] { new[] { 2, 32, 5, 7 } },      // non-square spatial
+    };
+
+    [Theory]
+    [MemberData(nameof(BnShapes))]
+    public void BatchNormInference_GpuMatchesCpu(int[] shape)
+    {
+        if (!EnsureGpuReady()) return;
+        int channels = shape[1];
+        var x = Rand(50, shape);
+        var gamma = Rand(51, channels);
+        var beta = Rand(52, channels);
+        var mean = Rand(53, channels);
+        // variance must be positive.
+        var varArr = new float[channels];
+        var rng = new Random(54);
+        for (int i = 0; i < channels; i++) varArr[i] = (float)(rng.NextDouble() * 2.0 + 0.1);
+        var variance = new Tensor<float>(varArr, new[] { channels });
+        const double eps = 1e-5;
+
+        var cpu = _cpu.BatchNormInference(x, gamma, beta, mean, variance, eps);
+        var gpu = _gpu.BatchNormInference(x, gamma, beta, mean, variance, eps);
+        AssertMatch(gpu, cpu, $"BatchNormInference[{string.Join("x", shape)}]");
+    }
 }
 #endif
