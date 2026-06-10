@@ -522,6 +522,19 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
     }
 
     [Fact]
+    public void TensorEqual_GpuMatchesCpu()
+    {
+        if (!EnsureGpuReady()) return;
+        var a = new Tensor<float>(new float[] { 1, 2, 3, 4 }, new[] { 2, 2 });
+        var bSame = new Tensor<float>(new float[] { 1, 2, 3, 4 }, new[] { 2, 2 });
+        var bDiff = new Tensor<float>(new float[] { 1, 2, 3, 5 }, new[] { 2, 2 });
+        Assert.Equal(_cpu.TensorEqual(a, bSame), _gpu.TensorEqual(a, bSame));
+        Assert.Equal(_cpu.TensorEqual(a, bDiff), _gpu.TensorEqual(a, bDiff));
+        Assert.True(_gpu.TensorEqual(a, bSame));
+        Assert.False(_gpu.TensorEqual(a, bDiff));
+    }
+
+    [Fact]
     public void TensorIsNan_IsInf_IsFinite_GpuMatchesCpu()
     {
         if (!EnsureGpuReady()) return;

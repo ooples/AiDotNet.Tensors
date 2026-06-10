@@ -796,6 +796,37 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<Bit> TensorIsFinite<T>(Tensor<T> tensor) => ClassifyToBit(tensor, 2, base.TensorIsFinite);
 
+    /// <inheritdoc/>
+    public override bool TensorEqual<T>(Tensor<T> a, Tensor<T> b)
+    {
+        if (a is null) throw new ArgumentNullException(nameof(a));
+        if (b is null) throw new ArgumentNullException(nameof(b));
+        if (typeof(T) != typeof(float) || !ShapesEqual(a._shape, b._shape) || !TryGetBackend(out var backend))
+            return base.TensorEqual(a, b);
+
+        // all-equal iff min over the equality mask == 1. Compute the mask on the GPU (Equal), then
+        // min = -max(-mask) via Negate+MaxAxis; only the scalar comes back (the base downloaded both
+        // tensors to compare on the host).
+        try
+        {
+            var ca = a.IsContiguous ? a : (Tensor<T>)a.Contiguous();
+            var cb = b.IsContiguous ? b : (Tensor<T>)b.Contiguous();
+            int n = a.Length;
+            using var bufA = GetOrAllocateBuffer(backend, ca.GetDataArray());
+            using var bufB = GetOrAllocateBuffer(backend, cb.GetDataArray());
+            using var bufMask = AllocateOutputBuffer(backend, n);
+            using var bufNeg = AllocateOutputBuffer(backend, n);
+            using var bufMin = AllocateOutputBuffer(backend, 1);
+            backend.Equal(bufA.Buffer, bufB.Buffer, bufMask.Buffer, n);   // 1.0 where equal
+            backend.Negate(bufMask.Buffer, bufNeg.Buffer, n);
+            backend.MaxAxis(bufNeg.Buffer, bufMin.Buffer, 1, n);          // = -min(mask)
+            backend.Synchronize();
+            float minMask = -backend.DownloadBuffer(bufMin.Buffer)[0];
+            return minMask > 0.5f;   // mask is 0/1; min==1 iff every element matched
+        }
+        catch (Exception) { return base.TensorEqual(a, b); }
+    }
+
     private Tensor<Bit> ClassifyToBit<T>(Tensor<T> tensor, int mode, System.Func<Tensor<T>, Tensor<Bit>> fallback)
     {
         if (tensor is null) throw new ArgumentNullException(nameof(tensor));
