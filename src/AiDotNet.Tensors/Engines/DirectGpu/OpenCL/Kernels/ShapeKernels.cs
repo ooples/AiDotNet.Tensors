@@ -194,6 +194,23 @@ __kernel void hsoftmax_paths(__global const float* acts, __global float* out, in
     }
     out[idx] = prob;
 }
+// masks_to_boxes: one thread per mask n; bbox (xMin,yMin,xMax,yMax) of nonzero pixels. Empty -> 0,0,0,0.
+__kernel void masks_to_boxes(__global const float* masks, __global float* out, int N, int H, int W) {
+    int n = get_global_id(0); if (n >= N) return;
+    int xMin = W, yMin = H, xMax = -1, yMax = -1;
+    int planeOff = n * H * W;
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++)
+            if (masks[planeOff + y*W + x] != 0.0f) {
+                if (x < xMin) xMin = x;
+                if (x > xMax) xMax = x;
+                if (y < yMin) yMin = y;
+                if (y > yMax) yMax = y;
+            }
+    int o = n * 4;
+    if (xMax < 0) { out[o]=0.0f; out[o+1]=0.0f; out[o+2]=0.0f; out[o+3]=0.0f; }
+    else { out[o]=(float)xMin; out[o+1]=(float)yMin; out[o+2]=(float)xMax; out[o+3]=(float)yMax; }
+}
 // shifted_diff: mask[i] = (i==0 || x[i] != x[i-1]) ? 1 : 0  (consecutive-unique keep mask).
 __kernel void shifted_diff(__global const float* x, __global float* mask, int n) {
     int i = get_global_id(0); if (i >= n) return;
@@ -428,7 +445,7 @@ __kernel void next_after(__global const float* a, __global const float* b, __glo
             "masked_fill_kernel", "index_select", "take_along_dim",
             "cross3", "ldexp_kernel", "kron2d", "search_sorted", "next_after", "index_write", "cdist", "pdist",
             "histc", "bitonic_step", "copy_rows", "iota_pad", "rwkv7_forward", "hsoftmax_paths",
-            "isin", "unfold", "copy_block_2d", "scatter_reduce", "zeta_kernel", "polygamma_kernel", "shifted_diff", "histogramdd"
+            "isin", "unfold", "copy_block_2d", "scatter_reduce", "zeta_kernel", "polygamma_kernel", "shifted_diff", "histogramdd", "masks_to_boxes"
         };
     }
 }

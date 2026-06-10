@@ -1996,6 +1996,9 @@ public interface IDirectGpuBackend : IDisposable
     /// <summary>D-dim histogram (atomic). bins int[D], mins/maxs float[D]; hist pre-zeroed length prod(bins).</summary>
     void HistogramDD(IGpuBuffer samples, IGpuBuffer hist, IGpuBuffer bins, IGpuBuffer mins, IGpuBuffer maxs, int n, int d);
 
+    /// <summary>Per-mask bounding box (xMin,yMin,xMax,yMax of nonzero pixels) for masks [N,H,W] -> out [N,4].</summary>
+    void MasksToBoxes(IGpuBuffer masks, IGpuBuffer output, int n, int h, int w);
+
     /// <summary>
     /// scatter_reduce along a dim with atomic reduction (mode 0=sum,1=prod,2=amax,3=amin). output is
     /// pre-seeded with the original tensor (includeSelf); source/index viewed [outerSize, srcDim, innerSize].

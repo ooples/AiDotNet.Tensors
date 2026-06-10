@@ -1473,6 +1473,8 @@ public class DelegatingGpuBackend : IDirectGpuBackend
     /// <inheritdoc/>
     public virtual void HistogramDD(IGpuBuffer samples, IGpuBuffer hist, IGpuBuffer bins, IGpuBuffer mins, IGpuBuffer maxs, int n, int d) => Inner.HistogramDD(samples, hist, bins, mins, maxs, n, d);
     /// <inheritdoc/>
+    public virtual void MasksToBoxes(IGpuBuffer masks, IGpuBuffer output, int n, int h, int w) => Inner.MasksToBoxes(masks, output, n, h, w);
+    /// <inheritdoc/>
     public virtual void ScatterReduce(IGpuBuffer output, IGpuBuffer source, IGpuBuffer index, int outerSize, int srcDim, int dstDim, int innerSize, int mode) => Inner.ScatterReduce(output, source, index, outerSize, srcDim, dstDim, innerSize, mode);
     /// <inheritdoc/>
     public virtual void Unfold(IGpuBuffer src, IGpuBuffer dst, int outerSize, int dimSize, int innerSize, int nWindows, int size, int step) => Inner.Unfold(src, dst, outerSize, dimSize, innerSize, nWindows, size, step);

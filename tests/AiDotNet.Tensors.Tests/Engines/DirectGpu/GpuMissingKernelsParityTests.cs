@@ -679,6 +679,21 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
     }
 
     [Fact]
+    public void MasksToBoxes_GpuMatchesCpu()
+    {
+        if (!EnsureGpuReady()) return;
+        // 3 masks [3,5,6]: one with a box, one empty, one full-edge.
+        var data = new float[3 * 5 * 6];
+        // mask 0: rectangle rows 1..3, cols 2..4
+        for (int y = 1; y <= 3; y++) for (int x = 2; x <= 4; x++) data[0 * 30 + y * 6 + x] = 1f;
+        // mask 1: empty (all zero)
+        // mask 2: single pixel at (4,5)
+        data[2 * 30 + 4 * 6 + 5] = 1f;
+        var masks = new Tensor<float>(data, new[] { 3, 5, 6 });
+        Assert.Equal(_cpu.MasksToBoxes(masks).ToArray(), _gpu.MasksToBoxes(masks).ToArray());
+    }
+
+    [Fact]
     public void TensorHistogramDD_GpuMatchesCpu()
     {
         if (!EnsureGpuReady()) return;

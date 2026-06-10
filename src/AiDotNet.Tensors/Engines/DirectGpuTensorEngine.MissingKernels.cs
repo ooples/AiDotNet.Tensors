@@ -1525,6 +1525,31 @@ public partial class DirectGpuTensorEngine
     }
 
     /// <inheritdoc/>
+    public override Tensor<int> MasksToBoxes<T>(Tensor<T> masks)
+    {
+        if (masks is null) throw new ArgumentNullException(nameof(masks));
+        if (masks.Rank != 3) throw new ArgumentException("MasksToBoxes requires rank-3 masks [N, H, W].");
+        if (typeof(T) != typeof(float) || !TryGetBackend(out var backend))
+            return base.MasksToBoxes(masks);
+        int N = masks._shape[0], H = masks._shape[1], W = masks._shape[2];
+        if (N == 0) return base.MasksToBoxes(masks);
+        try
+        {
+            var c = masks.IsContiguous ? masks : (Tensor<T>)masks.Contiguous();
+            using var bufIn = GetOrAllocateBuffer(backend, c.GetDataArray());
+            using var bufOut = AllocateOutputBuffer(backend, N * 4);
+            backend.MasksToBoxes(bufIn.Buffer, bufOut.Buffer, N, H, W);
+            backend.Synchronize();
+            var f = backend.DownloadBuffer(bufOut.Buffer);
+            var res = new Tensor<int>(new[] { N, 4 });
+            var dst = res.AsWritableSpan();
+            for (int i = 0; i < N * 4; i++) dst[i] = (int)f[i];
+            return res;
+        }
+        catch (Exception) { return base.MasksToBoxes(masks); }
+    }
+
+    /// <inheritdoc/>
     public override Tensor<int> TensorHistogramDD<T>(Tensor<T> samples, int[] bins, T[] mins, T[] maxs)
     {
         if (samples is null) throw new ArgumentNullException(nameof(samples));
