@@ -797,6 +797,30 @@ public partial class DirectGpuTensorEngine
     public override Tensor<Bit> TensorIsFinite<T>(Tensor<T> tensor) => ClassifyToBit(tensor, 2, base.TensorIsFinite);
 
     /// <inheritdoc/>
+    public override Tensor<T> TensorClampTensor<T>(Tensor<T> tensor, Tensor<T>? min, Tensor<T>? max)
+    {
+        if (tensor is null) throw new ArgumentNullException(nameof(tensor));
+        if (min is null && max is null)
+            throw new ArgumentException("At least one of min / max must be supplied");
+
+        // clamp(x, min, max) = min(max(x, min), max), elementwise via the GPU binary Max/Min. Only the
+        // same-shape (no-broadcast) bound case maps cleanly; broadcast bounds / dtype / no-GPU defer.
+        if (typeof(T) != typeof(float) || !TryGetBackend(out _)
+            || (min is not null && !ShapesEqual(min._shape, tensor._shape))
+            || (max is not null && !ShapesEqual(max._shape, tensor._shape)))
+            return base.TensorClampTensor(tensor, min, max);
+
+        try
+        {
+            var cur = tensor;
+            if (min is not null) cur = TensorMax(cur, min);   // lower bound: max(x, min)
+            if (max is not null) cur = TensorMin(cur, max);   // upper bound: min(x, max)
+            return cur;
+        }
+        catch (Exception) { return base.TensorClampTensor(tensor, min, max); }
+    }
+
+    /// <inheritdoc/>
     public override bool TensorEqual<T>(Tensor<T> a, Tensor<T> b)
     {
         if (a is null) throw new ArgumentNullException(nameof(a));
@@ -825,6 +849,61 @@ public partial class DirectGpuTensorEngine
             return minMask > 0.5f;   // mask is 0/1; min==1 iff every element matched
         }
         catch (Exception) { return base.TensorEqual(a, b); }
+    }
+
+    /// <inheritdoc/>
+    public override Tensor<Bit> TensorIsClose<T>(Tensor<T> a, Tensor<T> b, T rtol, T atol, bool equalNan = false)
+    {
+        if (a is null) throw new ArgumentNullException(nameof(a));
+        if (b is null) throw new ArgumentNullException(nameof(b));
+        // equalNan handling needs an extra isnan path; defer it (and non-float / shape-mismatch) to base.
+        if (typeof(T) != typeof(float) || equalNan || !ShapesEqual(a._shape, b._shape) || !TryGetBackend(out var backend))
+            return base.TensorIsClose(a, b, rtol, atol, equalNan);
+        try
+        {
+            using var maskBuf = AllocCloseMask(backend, a, b, rtol, atol, out int n);
+            return PackMask(backend, maskBuf, a._shape, n, invert: false);
+        }
+        catch (Exception) { return base.TensorIsClose(a, b, rtol, atol, equalNan); }
+    }
+
+    /// <inheritdoc/>
+    public override bool TensorAllClose<T>(Tensor<T> a, Tensor<T> b, T rtol, T atol, bool equalNan = false)
+    {
+        if (a is null) throw new ArgumentNullException(nameof(a));
+        if (b is null) throw new ArgumentNullException(nameof(b));
+        if (typeof(T) != typeof(float) || equalNan || !ShapesEqual(a._shape, b._shape) || !TryGetBackend(out var backend))
+            return base.TensorAllClose(a, b, rtol, atol, equalNan);
+        try
+        {
+            using var maskBuf = AllocCloseMask(backend, a, b, rtol, atol, out int n);
+            // allclose iff EVERY element is close (mask all 1) iff min(mask) == 1.  min = -max(-mask).
+            using var bufNeg = AllocateOutputBuffer(backend, n);
+            using var bufMin = AllocateOutputBuffer(backend, 1);
+            backend.Negate(maskBuf.Buffer, bufNeg.Buffer, n);
+            backend.MaxAxis(bufNeg.Buffer, bufMin.Buffer, 1, n);
+            backend.Synchronize();
+            float minMask = -backend.DownloadBuffer(bufMin.Buffer)[0];
+            return minMask > 0.5f;
+        }
+        catch (Exception) { return base.TensorAllClose(a, b, rtol, atol, equalNan); }
+    }
+
+    // Builds the "close" mask on the GPU: 1.0 where |a-b| < atol + rtol*|b|, else 0.0. Uses LessThan
+    // (strict) on purpose — it correctly yields "not close" for NaN (NaN < x is false), whereas the
+    // GreaterThan-then-invert form would wrongly call NaN close. The < vs <= boundary (|a-b| EXACTLY
+    // == threshold) is measure-zero for floats and benign. Caller disposes the returned buffer.
+    private OwnedBuffer AllocCloseMask<T>(IDirectGpuBackend backend, Tensor<T> a, Tensor<T> b, T rtol, T atol, out int n)
+    {
+        n = a.Length;
+        var diff = TensorAbs(TensorSubtract(a, b));                                  // |a-b|, GPU
+        var thr = TensorAddScalar(TensorMultiplyScalar(TensorAbs(b), rtol), atol);   // atol + rtol*|b|, GPU
+        using var diffBuf = GetOrAllocateBuffer(backend, diff);
+        using var thrBuf = GetOrAllocateBuffer(backend, thr);
+        var maskBuf = AllocateOutputBuffer(backend, n);
+        backend.LessThan(diffBuf.Buffer, thrBuf.Buffer, maskBuf.Buffer, n);
+        backend.Synchronize();
+        return maskBuf;
     }
 
     private Tensor<Bit> ClassifyToBit<T>(Tensor<T> tensor, int mode, System.Func<Tensor<T>, Tensor<Bit>> fallback)

@@ -522,6 +522,36 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
     }
 
     [Fact]
+    public void TensorClampTensor_GpuMatchesCpu()
+    {
+        if (!EnsureGpuReady()) return;
+        var t = Rand(180, 4, 8);
+        var lo = Rand(181, 4, 8);
+        var hi = new float[32];
+        var loArr = lo.ToArray();
+        for (int i = 0; i < 32; i++) hi[i] = loArr[i] + 0.5f; // ensure hi >= lo
+        var hiT = new Tensor<float>(hi, new[] { 4, 8 });
+        AssertMatch(_gpu.TensorClampTensor(t, lo, hiT), _cpu.TensorClampTensor(t, lo, hiT), "ClampTensor both");
+        AssertMatch(_gpu.TensorClampTensor(t, lo, null), _cpu.TensorClampTensor(t, lo, null), "ClampTensor minonly");
+        AssertMatch(_gpu.TensorClampTensor(t, null, hiT), _cpu.TensorClampTensor(t, null, hiT), "ClampTensor maxonly");
+    }
+
+    [Fact]
+    public void TensorIsClose_AllClose_GpuMatchesCpu()
+    {
+        if (!EnsureGpuReady()) return;
+        var a = new Tensor<float>(new float[] { 1f, 2f, 3f, float.NaN, 5f }, new[] { 5 });
+        var bClose = new Tensor<float>(new float[] { 1.0000001f, 2f, 3.0000002f, float.NaN, 5f }, new[] { 5 });
+        var bFar = new Tensor<float>(new float[] { 1.5f, 2f, 3f, 4f, 5f }, new[] { 5 });
+        AssertBitMatch(_gpu.TensorIsClose(a, bClose, 1e-5f, 1e-8f), _cpu.TensorIsClose(a, bClose, 1e-5f, 1e-8f), "IsClose(close+nan)");
+        AssertBitMatch(_gpu.TensorIsClose(a, bFar, 1e-5f, 1e-8f), _cpu.TensorIsClose(a, bFar, 1e-5f, 1e-8f), "IsClose(far)");
+        var x = Rand(182, 64);
+        var xCopy = new Tensor<float>((float[])x.ToArray().Clone(), new[] { 64 });
+        Assert.Equal(_cpu.TensorAllClose(x, xCopy, 1e-5f, 1e-8f), _gpu.TensorAllClose(x, xCopy, 1e-5f, 1e-8f));
+        Assert.Equal(_cpu.TensorAllClose(a, bFar, 1e-5f, 1e-8f), _gpu.TensorAllClose(a, bFar, 1e-5f, 1e-8f));
+    }
+
+    [Fact]
     public void TensorEqual_GpuMatchesCpu()
     {
         if (!EnsureGpuReady()) return;
