@@ -679,6 +679,18 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
     }
 
     [Fact]
+    public void PredicateToLogical_ResidentChain_GpuMatchesCpu()
+    {
+        if (!EnsureGpuReady()) return;
+        var a = new Tensor<float>(new float[] { 1f, 2f, 3f, float.NaN, 5f, 0f }, new[] { 6 });
+        var b = new Tensor<float>(new float[] { 1f, 0f, 3f, 4f, 0f, 0f }, new[] { 6 });
+        // (a == b) & isfinite(a) | isnan(a)  — predicate results stay GPU-resident through the logical ops.
+        var gpu = _gpu.TensorLogicalOr(_gpu.TensorLogicalAnd(_gpu.TensorEq(a, b), _gpu.TensorIsFinite(a)), _gpu.TensorIsNan(a));
+        var cpu = _cpu.TensorLogicalOr(_cpu.TensorLogicalAnd(_cpu.TensorEq(a, b), _cpu.TensorIsFinite(a)), _cpu.TensorIsNan(a));
+        AssertBitMatch(gpu, cpu, "predicate->logical chain");
+    }
+
+    [Fact]
     public void TensorLogical_GpuMatchesCpu_AndResidentChain()
     {
         if (!EnsureGpuReady()) return;

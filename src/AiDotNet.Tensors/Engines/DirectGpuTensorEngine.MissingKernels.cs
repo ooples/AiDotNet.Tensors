@@ -739,10 +739,9 @@ public partial class DirectGpuTensorEngine
             var (sortedTest, _) = BitonicSortRows(backend, (float[])(object)ct.GetDataArray(), 1, testLen, false);
             using var bufElem = GetOrAllocateBuffer(backend, ce.GetDataArray());
             using var bufTest = GetOrAllocateBuffer(backend, (T[])(object)sortedTest);
-            using var bufMask = AllocateOutputBuffer(backend, n);
+            var bufMask = AllocateOutputBuffer(backend, n);
             backend.IsIn(bufElem.Buffer, bufTest.Buffer, bufMask.Buffer, n, testLen);
-            backend.Synchronize();
-            return PackMask(backend, bufMask, elements._shape, n, invert);
+            return PackMaskResident(backend, bufMask, elements._shape, n, invert);
         }
         catch (Exception) { return base.TensorIsIn(elements, testElements, invert); }
     }
@@ -1813,6 +1812,17 @@ public partial class DirectGpuTensorEngine
         catch (Exception) { return base.TensorLogicalNot(a); }
     }
 
+    // Deferred (GPU-RESIDENT) variant of PackMask: keeps the float-0/1 mask on the device as a
+    // Tensor<Bit> (materialized on first CPU read via FinishGpuOp<Bit> + BitOperations), so
+    // predicate -> logical chains stay resident. `invert` flips 0<->1 in-place on the GPU first.
+    // Takes ownership of maskBuf (do NOT `using` it at the call site).
+    private Tensor<Bit> PackMaskResident(IDirectGpuBackend backend, OwnedBuffer maskBuf, int[] shape, int n, bool invert)
+    {
+        if (invert) backend.LogicalNot(maskBuf.Buffer, maskBuf.Buffer, n);
+        var arr = FinishGpuOp<Bit>(backend, maskBuf, n);
+        return new Tensor<Bit>(arr, (int[])shape.Clone());
+    }
+
     private static Tensor<Bit> PackMask(IDirectGpuBackend backend, OwnedBuffer maskBuf, int[] shape, int n, bool invert)
     {
         var span = backend.DownloadBuffer(maskBuf.Buffer);
@@ -1840,10 +1850,9 @@ public partial class DirectGpuTensorEngine
             int n = a.Length;
             using var bufA = GetOrAllocateBuffer(backend, ca.GetDataArray());
             using var bufB = GetOrAllocateBuffer(backend, cb.GetDataArray());
-            using var bufOut = AllocateOutputBuffer(backend, n);
+            var bufOut = AllocateOutputBuffer(backend, n);
             backend.Equal(bufA.Buffer, bufB.Buffer, bufOut.Buffer, n);
-            backend.Synchronize();
-            return PackMask(backend, bufOut, a._shape, n, invert: false);
+            return PackMaskResident(backend, bufOut, a._shape, n, invert: false);
         }
         catch (Exception) { return base.TensorEq(a, b); }
     }
@@ -1860,11 +1869,10 @@ public partial class DirectGpuTensorEngine
             int n = a.Length;
             float s = ToFloatScalar(scalar);
             using var bufA = GetOrAllocateBuffer(backend, ca.GetDataArray());
-            using var bufOut = AllocateOutputBuffer(backend, n);
+            var bufOut = AllocateOutputBuffer(backend, n);
             // NotEqualScalar gives (a != s); invert to get equality.
             backend.NotEqualScalar(bufA.Buffer, bufOut.Buffer, s, n);
-            backend.Synchronize();
-            return PackMask(backend, bufOut, a._shape, n, invert: true);
+            return PackMaskResident(backend, bufOut, a._shape, n, invert: true);
         }
         catch (Exception) { return base.TensorEqScalar(a, scalar); }
     }
@@ -1944,8 +1952,8 @@ public partial class DirectGpuTensorEngine
             return base.TensorIsClose(a, b, rtol, atol, equalNan);
         try
         {
-            using var maskBuf = AllocCloseMask(backend, a, b, rtol, atol, out int n);
-            return PackMask(backend, maskBuf, a._shape, n, invert: false);
+            var maskBuf = AllocCloseMask(backend, a, b, rtol, atol, out int n);
+            return PackMaskResident(backend, maskBuf, a._shape, n, invert: false);
         }
         catch (Exception) { return base.TensorIsClose(a, b, rtol, atol, equalNan); }
     }
@@ -1999,10 +2007,9 @@ public partial class DirectGpuTensorEngine
             var ct = tensor.IsContiguous ? tensor : (Tensor<T>)tensor.Contiguous();
             int n = tensor.Length;
             using var bufA = GetOrAllocateBuffer(backend, ct.GetDataArray());
-            using var bufOut = AllocateOutputBuffer(backend, n);
+            var bufOut = AllocateOutputBuffer(backend, n);
             backend.ClassifyFloat(bufA.Buffer, bufOut.Buffer, mode, n);
-            backend.Synchronize();
-            return PackMask(backend, bufOut, tensor._shape, n, invert: false);
+            return PackMaskResident(backend, bufOut, tensor._shape, n, invert: false);
         }
         catch (Exception) { return fallback(tensor); }
     }
