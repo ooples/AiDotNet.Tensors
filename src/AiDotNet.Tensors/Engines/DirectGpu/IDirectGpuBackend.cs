@@ -1981,6 +1981,9 @@ public interface IDirectGpuBackend : IDisposable
     /// <summary>isin membership mask: mask[i] = elements[i] ∈ ascending sortedTest ? 1 : 0.</summary>
     void IsIn(IGpuBuffer elements, IGpuBuffer sortedTest, IGpuBuffer mask, int numElements, int testLen);
 
+    /// <summary>Place a [blockRows, blockCols] block at (rowOff, colOff) in a totalCols-wide output matrix.</summary>
+    void CopyBlock2D(IGpuBuffer block, IGpuBuffer output, int blockRows, int blockCols, int totalCols, int rowOff, int colOff);
+
     /// <summary>
     /// Sliding-window unfold along a dim. src viewed [outerSize, dimSize, innerSize]; output
     /// [outerSize, nWindows, innerSize, size] with out[o,w,i,s] = src[o, w*step+s, i].

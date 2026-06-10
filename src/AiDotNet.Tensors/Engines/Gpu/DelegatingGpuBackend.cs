@@ -1463,6 +1463,8 @@ public class DelegatingGpuBackend : IDirectGpuBackend
     /// <inheritdoc/>
     public virtual void IsIn(IGpuBuffer elements, IGpuBuffer sortedTest, IGpuBuffer mask, int numElements, int testLen) => Inner.IsIn(elements, sortedTest, mask, numElements, testLen);
     /// <inheritdoc/>
+    public virtual void CopyBlock2D(IGpuBuffer block, IGpuBuffer output, int blockRows, int blockCols, int totalCols, int rowOff, int colOff) => Inner.CopyBlock2D(block, output, blockRows, blockCols, totalCols, rowOff, colOff);
+    /// <inheritdoc/>
     public virtual void Unfold(IGpuBuffer src, IGpuBuffer dst, int outerSize, int dimSize, int innerSize, int nWindows, int size, int step) => Inner.Unfold(src, dst, outerSize, dimSize, innerSize, nWindows, size, step);
 
     /// <inheritdoc/>

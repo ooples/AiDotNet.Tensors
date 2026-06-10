@@ -574,6 +574,16 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         AssertMatch(gpu, cpu, $"MHA[b{batch};s{seq};d{dModel};h{numHeads}]");
     }
 
+    [Fact]
+    public void TensorBlockDiag_GpuMatchesCpu()
+    {
+        if (!EnsureGpuReady()) return;
+        var a = Rand(296, 2, 3);
+        var b = Rand(297, 3, 2);
+        var c = Rand(298, 1, 4);
+        AssertMatch(_gpu.TensorBlockDiag(new[] { a, b, c }), _cpu.TensorBlockDiag(new[] { a, b, c }), "BlockDiag");
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]

@@ -822,6 +822,43 @@ public partial class DirectGpuTensorEngine
     }
 
     /// <inheritdoc/>
+    public override Tensor<T> TensorBlockDiag<T>(Tensor<T>[] matrices)
+    {
+        if (matrices is null) throw new ArgumentNullException(nameof(matrices));
+        if (matrices.Length == 0) throw new ArgumentException("BlockDiag requires at least one matrix");
+        if (typeof(T) != typeof(float) || !TryGetBackend(out var backend))
+            return base.TensorBlockDiag(matrices);
+        foreach (var m in matrices)
+        {
+            if (m is null) throw new ArgumentNullException(nameof(matrices));
+            if (m.Rank != 2) return base.TensorBlockDiag(matrices);
+        }
+        int totalRows = 0, totalCols = 0;
+        foreach (var m in matrices) { totalRows += m._shape[0]; totalCols += m._shape[1]; }
+        try
+        {
+            int outN = totalRows * totalCols;
+            var bufOut = AllocateOutputBuffer(backend, outN);
+            backend.Fill(bufOut.Buffer, 0f, outN);
+            var blockBufs = new List<OwnedBuffer>();
+            int rowOff = 0, colOff = 0;
+            foreach (var m in matrices)
+            {
+                int r = m._shape[0], c = m._shape[1];
+                var cm = m.IsContiguous ? m : (Tensor<T>)m.Contiguous();
+                var bufBlock = GetOrAllocateBuffer(backend, cm.GetDataArray());
+                blockBufs.Add(bufBlock);
+                backend.CopyBlock2D(bufBlock.Buffer, bufOut.Buffer, r, c, totalCols, rowOff, colOff);
+                rowOff += r; colOff += c;
+            }
+            var arr = FinishGpuOp<T>(backend, bufOut, outN);
+            foreach (var b in blockBufs) b.Dispose();
+            return new Tensor<T>(arr, new[] { totalRows, totalCols });
+        }
+        catch (Exception) { return base.TensorBlockDiag(matrices); }
+    }
+
+    /// <inheritdoc/>
     public override Tensor<T> TensorCartesianProd<T>(Tensor<T>[] tensors)
     {
         if (tensors is null) throw new ArgumentNullException(nameof(tensors));

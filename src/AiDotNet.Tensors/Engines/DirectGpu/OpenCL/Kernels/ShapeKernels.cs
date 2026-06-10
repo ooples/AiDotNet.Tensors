@@ -194,6 +194,12 @@ __kernel void hsoftmax_paths(__global const float* acts, __global float* out, in
     }
     out[idx] = prob;
 }
+// copy_block_2d: place a [blockRows, blockCols] block at (rowOff, colOff) inside a totalCols-wide matrix.
+__kernel void copy_block_2d(__global const float* block, __global float* output, int blockRows, int blockCols, int totalCols, int rowOff, int colOff) {
+    int idx = get_global_id(0); if (idx >= blockRows * blockCols) return;
+    int j = idx % blockCols; int i = idx / blockCols;
+    output[(rowOff + i) * totalCols + (colOff + j)] = block[i * blockCols + j];
+}
 // isin: mask[i] = (elements[i] is present in the ascending sortedTest) ? 1 : 0 (binary search + equality).
 __kernel void isin(__global const float* elements, __global const float* sortedTest, __global float* mask, int numElements, int testLen) {
     int idx = get_global_id(0); if (idx >= numElements) return;
@@ -330,7 +336,7 @@ __kernel void next_after(__global const float* a, __global const float* b, __glo
             "masked_fill_kernel", "index_select", "take_along_dim",
             "cross3", "ldexp_kernel", "kron2d", "search_sorted", "next_after", "index_write", "cdist", "pdist",
             "histc", "bitonic_step", "copy_rows", "iota_pad", "rwkv7_forward", "hsoftmax_paths",
-            "isin", "unfold"
+            "isin", "unfold", "copy_block_2d"
         };
     }
 }
