@@ -381,17 +381,45 @@ public partial class DirectGpuTensorEngine
         catch (Exception) { return base.TensorMoveDim(tensor, source, destination); }
     }
 
-    // NOTE: TensorRot90 is intentionally NOT overridden — and the root cause is now understood.
-    // A focused diagnostic showed: TensorFlip, TensorPermute, and every 2-deep chain (flip(permute),
-    // permute(flip)) match CPU exactly (err 0); homogeneous 3-deep chains (permute^3, flip^3) also
-    // match (so it is NOT depth / buffer-pool exhaustion). But the INTERLEAVED 2-step rot90 chain
-    // flip→permute→flip→permute diverges (err ~1.6), and FORCE-MATERIALIZING the intermediate (download
-    // + re-wrap) makes it match again. => a pre-existing engine bug in the DEFERRED-materialization /
-    // activation-cache path: a deferred (not-yet-downloaded) intermediate of an interleaved flip↔permute
-    // chain is read stale by the next op. This is a real correctness bug worth a dedicated engine fix
-    // (FinishGpuOp / activation cache / buffer lifetime); the Category-A/F ops here are unaffected
-    // (their chains are permute→reshape(view)→matmul or homogeneous matmul chains, all tested clean).
-    // Rot90 stays on the correct CPU base until the engine deferred-buffer bug is fixed.
+    /// <inheritdoc/>
+    public override Tensor<T> TensorRot90<T>(Tensor<T> tensor, int k = 1, int[]? axes = null)
+    {
+        if (tensor is null) throw new ArgumentNullException(nameof(tensor));
+        axes ??= new[] { 0, 1 };
+        if (axes.Length != 2 || axes[0] == axes[1] || !TryGetBackend(out var backend))
+            return base.TensorRot90(tensor, k, axes);
+
+        int steps = ((k % 4) + 4) % 4;
+        if (steps == 0)
+            return base.TensorRot90(tensor, k, axes);
+
+        try
+        {
+            int a0 = axes[0], a1 = axes[1];
+            if (a0 < 0) a0 += tensor.Rank;
+            if (a1 < 0) a1 += tensor.Rank;
+            if (a0 < 0 || a0 >= tensor.Rank || a1 < 0 || a1 >= tensor.Rank)
+                return base.TensorRot90(tensor, k, axes);
+
+            // Each 90° step = swap the two axes + flip the (new) axes[0]. Use the MATERIALIZING GPU
+            // permute (PermuteResidentGpu), NOT the view-returning TensorPermute: the strided permute
+            // view shares the un-permuted buffer, and interleaving that with TensorFlip across multiple
+            // steps fed the next op a stale/mis-laid-out buffer (the root-caused deep-chain divergence).
+            // Materializing each permute hands TensorFlip a correctly-laid-out contiguous resident buffer.
+            var result = tensor;
+            for (int s = 0; s < steps; s++)
+            {
+                var perm = new int[result.Rank];
+                for (int i = 0; i < result.Rank; i++) perm[i] = i;
+                perm[a0] = a1;
+                perm[a1] = a0;
+                result = PermuteResidentGpu(backend, result, perm);
+                result = TensorFlip(result, new[] { a0 });
+            }
+            return result;
+        }
+        catch (Exception) { return base.TensorRot90(tensor, k, axes); }
+    }
 
     /// <inheritdoc/>
     public override Tensor<T>[] TensorTensorSplit<T>(Tensor<T> tensor, int[] indices, int dim = 0)
@@ -693,5 +721,22 @@ public partial class DirectGpuTensorEngine
         if (a.Length != b.Length) return false;
         for (int i = 0; i < a.Length; i++) if (a[i] != b[i]) return false;
         return true;
+    }
+
+    // Materializing GPU permute: unlike the public TensorPermute (a metadata-only STRIDED VIEW that
+    // shares the input's buffer — whose cached contiguous data does NOT reflect the permuted strides,
+    // the source of the deep interleaved-chain divergence), this runs the backend Permute kernel into a
+    // fresh CONTIGUOUS device buffer and returns a deferred GPU-resident result. Use this for multi-step
+    // GPU compositions so each stage hands the next a correctly-laid-out resident buffer.
+    private Tensor<T> PermuteResidentGpu<T>(IDirectGpuBackend backend, Tensor<T> tensor, int[] axes)
+    {
+        var src = tensor.IsContiguous ? tensor : (Tensor<T>)tensor.Contiguous();
+        using var bufIn = GetOrAllocateBuffer(backend, src.GetDataArray());
+        var bufOut = AllocateOutputBuffer(backend, tensor.Length);
+        backend.Permute(bufIn.Buffer, bufOut.Buffer, src.Shape._dims, axes);
+        var result = FinishGpuOp<T>(backend, bufOut, tensor.Length);
+        var outShape = new int[tensor.Rank];
+        for (int i = 0; i < tensor.Rank; i++) outShape[i] = src.Shape._dims[axes[i]];
+        return new Tensor<T>(result, outShape);
     }
 }

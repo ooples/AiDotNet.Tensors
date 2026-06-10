@@ -500,6 +500,27 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         AssertMatch(gpu, cpu, $"TensorRepeatInterleave[{string.Join("x", shape)};r={repeats}]");
     }
 
+    public static IEnumerable<object[]> Rot90Cases() => new List<object[]>
+    {
+        new object[] { new[] { 4, 6 }, 1, new[] { 0, 1 } },
+        new object[] { new[] { 4, 6 }, 2, new[] { 0, 1 } },
+        new object[] { new[] { 4, 6 }, 3, new[] { 0, 1 } },
+        new object[] { new[] { 3, 4, 5 }, 1, new[] { 1, 2 } },
+        new object[] { new[] { 3, 4, 5 }, 3, new[] { 0, 2 } },
+        new object[] { new[] { 4, 4 }, -1, new[] { 0, 1 } },
+    };
+
+    [Theory]
+    [MemberData(nameof(Rot90Cases))]
+    public void TensorRot90_GpuMatchesCpu(int[] shape, int k, int[] axes)
+    {
+        if (!EnsureGpuReady()) return;
+        var t = Rand(120, shape);
+        var cpu = _cpu.TensorRot90(t, k, axes);
+        var gpu = _gpu.TensorRot90(t, k, axes);
+        AssertMatch(gpu, cpu, $"TensorRot90[{string.Join("x", shape)};k={k};axes={string.Join(",", axes)}]");
+    }
+
     // cosine similarity along the last axis (the case the backend kernel covers).
     public static IEnumerable<object[]> CosSimShapes() => new List<object[]>
     {
