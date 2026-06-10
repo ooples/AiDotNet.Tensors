@@ -2863,12 +2863,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int M = full.Length / N;
         try
         {
-            using var bufFull = GetOrAllocateContiguousInputBuffer(backend, full);
+            using var bufFull = GetResidentOrPersistentInputBuffer(backend, full);
             // The broadcast operand (positional embedding / bias vector) is a stable PARAMETER, not an
             // activation — resolve it through the PERSISTENT weight cache (uploaded once, kept fresh by the
             // optimizer) so capture/replay don't re-upload it (the transient GetOrAllocateBuffer path would
             // cuMemcpyHtoD every step → aborts the CUDA-graph capture).
-            using var bufBias = GetOrCacheWeightBuffer(backend, bias.GetDataArray(), PersistentTensorRole.Biases);
+            using var bufBias = GetResidentOrPersistentInputBuffer(backend, bias);
             var outBuf = GetOrCreateResidentBuffer(backend, output, full.Length);
             backend.BiasAdd(bufFull.Buffer, bufBias.Buffer, outBuf, M, N);
             BindResidentBuffer(output, outBuf, backend);
