@@ -1882,6 +1882,15 @@ public interface IDirectGpuBackend : IDisposable
 
     void Gather(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output, int numIndices, int featureSize);
 
+    /// <summary>
+    /// Gather along one axis (torch.take_along_dim / gather): output[outer, j, inner] =
+    /// input[outer, indices[outer, j, inner], inner]. The tensor is viewed as [outerSize, axisIn,
+    /// innerSize]; the index tensor (and the output) as [outerSize, axisOut, innerSize]; indices select
+    /// positions along the axis (each must be in [0, axisIn)).
+    /// </summary>
+    void TakeAlongDim(IGpuBuffer input, IGpuBuffer indices, IGpuBuffer output,
+        int outerSize, int axisOut, int innerSize, int axisIn);
+
     #region Comparison Operations
 
     void GreaterThan(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size);

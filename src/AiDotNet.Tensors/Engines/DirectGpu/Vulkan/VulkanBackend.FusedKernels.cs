@@ -73,6 +73,7 @@ public sealed partial class VulkanBackend
     // IEEE classify (isnan/isinf/isfinite): a real Vulkan GLSL/SPIR-V kernel is a HW-validation
     // follow-up; the engine catches this and falls back to the correct CPU path until then.
     public void ClassifyFloat(IGpuBuffer A, IGpuBuffer C, int mode, int size) => throw new NotSupportedException("ClassifyFloat not yet implemented on the Vulkan backend.");
+    public void TakeAlongDim(IGpuBuffer input, IGpuBuffer indices, IGpuBuffer output, int outerSize, int axisOut, int innerSize, int axisIn) => throw new NotSupportedException("TakeAlongDim not yet implemented on the Vulkan backend.");
 
     #endregion
 

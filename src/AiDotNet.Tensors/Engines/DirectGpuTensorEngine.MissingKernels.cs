@@ -724,6 +724,41 @@ public partial class DirectGpuTensorEngine
         return true;
     }
 
+    /// <inheritdoc/>
+    public override Tensor<T> TensorTakeAlongDim<T>(Tensor<T> tensor, Tensor<int> indices, int dim)
+    {
+        if (tensor is null) throw new ArgumentNullException(nameof(tensor));
+        if (indices is null) throw new ArgumentNullException(nameof(indices));
+        int rank = tensor.Rank;
+        int d = dim < 0 ? dim + rank : dim;
+        if (typeof(T) != typeof(float) || d < 0 || d >= rank || indices.Rank != rank || !TryGetBatchBackend(out var backend))
+            return base.TensorTakeAlongDim(tensor, indices, dim);
+        for (int k = 0; k < rank; k++)
+            if (k != d && indices._shape[k] != tensor._shape[k])
+                return base.TensorTakeAlongDim(tensor, indices, dim);
+
+        // Gather along axis d on the device with the new TakeAlongDim kernel: view as
+        // [outer, axisIn, inner] / [outer, axisOut, inner]. Indices upload as an int buffer.
+        try
+        {
+            var ct = tensor.IsContiguous ? tensor : (Tensor<T>)tensor.Contiguous();
+            var ci = indices.IsContiguous ? indices : (Tensor<int>)indices.Contiguous();
+            int axisIn = tensor._shape[d];
+            int axisOut = indices._shape[d];
+            int outerSize = 1; for (int k = 0; k < d; k++) outerSize *= tensor._shape[k];
+            int innerSize = 1; for (int k = d + 1; k < rank; k++) innerSize *= tensor._shape[k];
+            int outN = outerSize * axisOut * innerSize;
+
+            using var bufIn = GetOrAllocateBuffer(backend, ct.GetDataArray());
+            using var bufIdx = backend.AllocateIntBuffer(ci.GetDataArray());
+            var bufOut = AllocateOutputBuffer(backend, outN);
+            backend.TakeAlongDim(bufIn.Buffer, bufIdx, bufOut.Buffer, outerSize, axisOut, innerSize, axisIn);
+            var arr = FinishGpuOp<T>(backend, bufOut, outN);
+            return new Tensor<T>(arr, (int[])indices._shape.Clone());
+        }
+        catch (Exception) { return base.TensorTakeAlongDim(tensor, indices, dim); }
+    }
+
     // ----- Category D: Tensor<Bit> comparison predicates -----
     // The backend comparison kernels write a FLOAT mask (1.0/0.0). The result is a Tensor<Bit> (one
     // byte/elem), which leaves the device — but computing the compare on the GPU keeps the (often

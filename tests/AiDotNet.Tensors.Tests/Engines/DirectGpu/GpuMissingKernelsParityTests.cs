@@ -521,6 +521,32 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         AssertBitMatch(_gpu.TensorEq(a, b), _cpu.TensorEq(a, b), "TensorEq");
     }
 
+    public static IEnumerable<object[]> TakeAlongDimCases() => new List<object[]>
+    {
+        new object[] { new[] { 4, 5 }, 1, 3 },     // gather along last axis
+        new object[] { new[] { 4, 5 }, 0, 6 },     // gather along axis 0 (axisOut>axisIn)
+        new object[] { new[] { 3, 4, 5 }, 2, 2 },  // 3-D, last axis
+        new object[] { new[] { 3, 4, 5 }, 1, 7 },  // 3-D, middle axis
+    };
+
+    [Theory]
+    [MemberData(nameof(TakeAlongDimCases))]
+    public void TensorTakeAlongDim_GpuMatchesCpu(int[] shape, int dim, int axisOut)
+    {
+        if (!EnsureGpuReady()) return;
+        var t = Rand(190, shape);
+        int axisIn = shape[dim];
+        var idxShape = (int[])shape.Clone();
+        idxShape[dim] = axisOut;
+        int idxLen = 1; foreach (var s in idxShape) idxLen *= s;
+        var rng = new Random(191);
+        var idxData = new int[idxLen];
+        for (int i = 0; i < idxLen; i++) idxData[i] = rng.Next(axisIn);
+        var indices = new Tensor<int>(idxData, idxShape);
+        AssertMatch(_gpu.TensorTakeAlongDim(t, indices, dim), _cpu.TensorTakeAlongDim(t, indices, dim),
+            $"TakeAlongDim[{string.Join("x", shape)};dim={dim};out={axisOut}]");
+    }
+
     [Fact]
     public void TensorClampTensor_GpuMatchesCpu()
     {

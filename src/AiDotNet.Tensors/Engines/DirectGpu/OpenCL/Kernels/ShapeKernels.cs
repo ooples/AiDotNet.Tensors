@@ -102,6 +102,17 @@ __kernel void index_select(__global const float* input, __global const float* in
         output[idx] = 0.0f;
     }
 }
+// Gather along one axis (take_along_dim/gather): input viewed [outer, axisIn, inner], indices/output
+// viewed [outer, axisOut, inner]; output[o,j,i] = input[o, indices[o,j,i], i].
+__kernel void take_along_dim(__global const float* input, __global const int* indices, __global float* output,
+    int outerSize, int axisOut, int innerSize, int axisIn) {
+    int idx = get_global_id(0); int total = outerSize * axisOut * innerSize; if (idx >= total) return;
+    int inner = idx % innerSize;
+    int outer = (idx / innerSize) / axisOut;
+    int srcJ = indices[idx];
+    if (srcJ < 0 || srcJ >= axisIn) { output[idx] = 0.0f; return; }
+    output[idx] = input[(outer * axisIn + srcJ) * innerSize + inner];
+}
 ";
     }
 
@@ -114,7 +125,7 @@ __kernel void index_select(__global const float* input, __global const float* in
             "pixel_shuffle", "pixel_shuffle_backward", "crop_2d",
             "eye_kernel", "linspace_kernel", "one_hot_kernel",
             "diag_kernel", "extract_diag_kernel", "triangular_mask",
-            "masked_fill_kernel", "index_select"
+            "masked_fill_kernel", "index_select", "take_along_dim"
         };
     }
 }
