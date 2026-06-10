@@ -500,6 +500,23 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         AssertMatch(gpu, cpu, $"TensorRepeatInterleave[{string.Join("x", shape)};r={repeats}]");
     }
 
+    [Theory]
+    [InlineData(1, 4, 8, 2)]
+    [InlineData(2, 6, 12, 3)]
+    [InlineData(1, 3, 16, 4)]
+    public void MultiHeadAttentionForward_GpuMatchesCpu(int batch, int seq, int dModel, int numHeads)
+    {
+        if (!EnsureGpuReady()) return;
+        var input = Rand(240, batch, seq, dModel);
+        var qW = Rand(241, dModel, dModel);
+        var kW = Rand(242, dModel, dModel);
+        var vW = Rand(243, dModel, dModel);
+        var oW = Rand(244, dModel, dModel);
+        var cpu = _cpu.MultiHeadAttentionForward(input, qW, kW, vW, oW, numHeads, null);
+        var gpu = _gpu.MultiHeadAttentionForward(input, qW, kW, vW, oW, numHeads, null);
+        AssertMatch(gpu, cpu, $"MHA[b{batch};s{seq};d{dModel};h{numHeads}]");
+    }
+
     [Fact]
     public void TensorMaskedSelect_GpuMatchesCpu()
     {

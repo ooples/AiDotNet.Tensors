@@ -1494,6 +1494,83 @@ public partial class DirectGpuTensorEngine
 
     // ----- Category B: composite forwards -----
 
+    // Row-wise softmax over the last axis, GPU-resident.
+    private Tensor<T> SoftmaxLastAxisGpu<T>(IDirectGpuBackend backend, Tensor<T> x)
+    {
+        int cols = x._shape[x.Rank - 1];
+        int rows = cols == 0 ? 0 : x.Length / cols;
+        var c = x.IsContiguous ? x : (Tensor<T>)x.Contiguous();
+        using var inBuf = GetOrAllocateBuffer(backend, c.GetDataArray());
+        var outBuf = AllocateOutputBuffer(backend, x.Length);
+        backend.SoftmaxRows(inBuf.Buffer, outBuf.Buffer, rows, cols);
+        var arr = FinishGpuOp<T>(backend, outBuf, x.Length);
+        return new Tensor<T>(arr, (int[])x._shape.Clone());
+    }
+
+    // [B*S, D] -> [B,S,H,d] -> (materialized) [B,H,S,d] -> [B*H, S, d].
+    private Tensor<T> ReshapePermuteHeads<T>(IDirectGpuBackend backend, Tensor<T> x, int B, int S, int H, int d)
+    {
+        var bshd = x.Reshape(new[] { B, S, H, d });
+        var bhsd = PermuteResidentGpu(backend, bshd, new[] { 0, 2, 1, 3 });   // [B,H,S,d]
+        return bhsd.Reshape(new[] { B * H, S, d });
+    }
+
+    /// <inheritdoc/>
+    public override Tensor<T> MultiHeadAttentionForward<T>(
+        Tensor<T> input, Tensor<T> qWeight, Tensor<T> kWeight, Tensor<T> vWeight, Tensor<T> outWeight,
+        int numHeads, Tensor<bool>? mask = null)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (qWeight is null) throw new ArgumentNullException(nameof(qWeight));
+        if (kWeight is null) throw new ArgumentNullException(nameof(kWeight));
+        if (vWeight is null) throw new ArgumentNullException(nameof(vWeight));
+        if (outWeight is null) throw new ArgumentNullException(nameof(outWeight));
+
+        // GPU path: float, rank-3 input, divisible heads, no mask (masked attention defers to base for
+        // now), inference only. Anything else uses the validated CPU base.
+        if (typeof(T) != typeof(float) || input.Rank != 3 || numHeads <= 0 || mask is not null
+            || input._shape[2] % numHeads != 0 || !TryGetBackend(out var backend))
+            return base.MultiHeadAttentionForward(input, qWeight, kWeight, vWeight, outWeight, numHeads, mask);
+
+        int B = input._shape[0], S = input._shape[1], D = input._shape[2];
+        int H = numHeads, d = D / H;
+        if (qWeight.Rank != 2 || qWeight._shape[0] != D || qWeight._shape[1] != D ||
+            kWeight.Rank != 2 || kWeight._shape[0] != D || kWeight._shape[1] != D ||
+            vWeight.Rank != 2 || vWeight._shape[0] != D || vWeight._shape[1] != D ||
+            outWeight.Rank != 2 || outWeight._shape[0] != D || outWeight._shape[1] != D)
+            return base.MultiHeadAttentionForward(input, qWeight, kWeight, vWeight, outWeight, numHeads, mask);
+
+        try
+        {
+            float scale = (float)(1.0 / System.Math.Sqrt(d));
+            T scaleT = (T)(object)scale;
+            var input2d = (input.IsContiguous ? input : (Tensor<T>)input.Contiguous()).Reshape(new[] { B * S, D });
+            // Q/K/V projections on the GPU (2-D GEMM), then split into [B*H, S, d].
+            var qh = ReshapePermuteHeads(backend, TensorMatMul(input2d, qWeight), B, S, H, d);
+            var kh = ReshapePermuteHeads(backend, TensorMatMul(input2d, kWeight), B, S, H, d);
+            var vh = ReshapePermuteHeads(backend, TensorMatMul(input2d, vWeight), B, S, H, d);
+
+            var headOuts = new Tensor<T>[B * H];
+            for (int bh = 0; bh < B * H; bh++)
+            {
+                var qbh = TensorSlice(qh, new[] { bh, 0, 0 }, new[] { 1, S, d }).Reshape(new[] { S, d });
+                var kbh = TensorSlice(kh, new[] { bh, 0, 0 }, new[] { 1, S, d }).Reshape(new[] { S, d });
+                var vbh = TensorSlice(vh, new[] { bh, 0, 0 }, new[] { 1, S, d }).Reshape(new[] { S, d });
+                var scores = TensorMultiplyScalar(TensorMatMulTransposed(qbh, kbh), scaleT);  // [S,S] = (q·kᵀ)·scale
+                var attn = SoftmaxLastAxisGpu(backend, scores);                                // softmax over keys
+                headOuts[bh] = TensorMatMul(attn, vbh).Reshape(new[] { 1, S, d });            // [1,S,d]
+            }
+
+            var oBHSD = TensorConcatenate(headOuts, 0).Reshape(new[] { B, H, S, d });
+            var oBSHD = PermuteResidentGpu(backend, oBHSD, new[] { 0, 2, 1, 3 }).Reshape(new[] { B * S, D });
+            return TensorMatMul(oBSHD, outWeight).Reshape(new[] { B, S, D });
+        }
+        catch (Exception)
+        {
+            return base.MultiHeadAttentionForward(input, qWeight, kWeight, vWeight, outWeight, numHeads, mask);
+        }
+    }
+
     /// <inheritdoc/>
     public override Tensor<T> MlpForward<T>(
         Tensor<T> input,
