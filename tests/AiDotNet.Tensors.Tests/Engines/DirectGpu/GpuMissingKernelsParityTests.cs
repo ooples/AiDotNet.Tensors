@@ -521,6 +521,34 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         AssertBitMatch(_gpu.TensorEq(a, b), _cpu.TensorEq(a, b), "TensorEq");
     }
 
+    [Theory]
+    [InlineData(new[] { 3 }, -1)]
+    [InlineData(new[] { 4, 3 }, 1)]
+    [InlineData(new[] { 3, 5 }, 0)]
+    [InlineData(new[] { 2, 3, 4 }, 1)]
+    public void TensorCross_GpuMatchesCpu(int[] shape, int dim)
+    {
+        if (!EnsureGpuReady()) return;
+        var a = Rand(192, shape);
+        var b = Rand(193, shape);
+        AssertMatch(_gpu.TensorCross(a, b, dim), _cpu.TensorCross(a, b, dim), $"Cross[{string.Join("x", shape)};dim={dim}]");
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(17)]
+    [InlineData(256)]
+    public void TensorLdexp_GpuMatchesCpu(int n)
+    {
+        if (!EnsureGpuReady()) return;
+        var x = Rand(194, n);
+        var rng = new Random(195);
+        var expData = new int[n];
+        for (int i = 0; i < n; i++) expData[i] = rng.Next(-6, 7);
+        var exp = new Tensor<int>(expData, new[] { n });
+        AssertMatch(_gpu.TensorLdexp(x, exp), _cpu.TensorLdexp(x, exp), $"Ldexp[{n}]");
+    }
+
     public static IEnumerable<object[]> TakeAlongDimCases() => new List<object[]>
     {
         new object[] { new[] { 4, 5 }, 1, 3 },     // gather along last axis

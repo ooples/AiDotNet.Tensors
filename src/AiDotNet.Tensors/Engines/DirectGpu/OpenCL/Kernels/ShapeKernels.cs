@@ -113,6 +113,22 @@ __kernel void take_along_dim(__global const float* input, __global const int* in
     if (srcJ < 0 || srcJ >= axisIn) { output[idx] = 0.0f; return; }
     output[idx] = input[(outer * axisIn + srcJ) * innerSize + inner];
 }
+// 3-vector cross product along an axis of size 3 (viewed [outer, 3, inner]).
+__kernel void cross3(__global const float* a, __global const float* b, __global float* output, int outerSize, int innerSize) {
+    int idx = get_global_id(0); if (idx >= outerSize * innerSize) return;
+    int inner = idx % innerSize; int outer = idx / innerSize;
+    int p = outer * 3 * innerSize + inner;
+    float a0 = a[p], a1 = a[p + innerSize], a2 = a[p + 2 * innerSize];
+    float b0 = b[p], b1 = b[p + innerSize], b2 = b[p + 2 * innerSize];
+    output[p]                  = a1 * b2 - a2 * b1;
+    output[p + innerSize]      = a2 * b0 - a0 * b2;
+    output[p + 2 * innerSize]  = a0 * b1 - a1 * b0;
+}
+// Ldexp: output[i] = input[i] * 2^exponents[i] (ldexp is exact; no fast-math hazard).
+__kernel void ldexp_kernel(__global const float* input, __global const int* exponents, __global float* output, int size) {
+    int idx = get_global_id(0); if (idx >= size) return;
+    output[idx] = ldexp(input[idx], exponents[idx]);
+}
 ";
     }
 
@@ -125,7 +141,8 @@ __kernel void take_along_dim(__global const float* input, __global const int* in
             "pixel_shuffle", "pixel_shuffle_backward", "crop_2d",
             "eye_kernel", "linspace_kernel", "one_hot_kernel",
             "diag_kernel", "extract_diag_kernel", "triangular_mask",
-            "masked_fill_kernel", "index_select", "take_along_dim"
+            "masked_fill_kernel", "index_select", "take_along_dim",
+            "cross3", "ldexp_kernel"
         };
     }
 }

@@ -759,6 +759,55 @@ public partial class DirectGpuTensorEngine
         catch (Exception) { return base.TensorTakeAlongDim(tensor, indices, dim); }
     }
 
+    /// <inheritdoc/>
+    public override Tensor<T> TensorCross<T>(Tensor<T> a, Tensor<T> b, int dim = -1)
+    {
+        if (a is null) throw new ArgumentNullException(nameof(a));
+        if (b is null) throw new ArgumentNullException(nameof(b));
+        int rank = a.Rank;
+        int d = dim < 0 ? dim + rank : dim;
+        if (typeof(T) != typeof(float) || !ShapesEqual(a._shape, b._shape)
+            || d < 0 || d >= rank || a._shape[d] != 3 || !TryGetBackend(out var backend))
+            return base.TensorCross(a, b, dim);
+        try
+        {
+            var ca = a.IsContiguous ? a : (Tensor<T>)a.Contiguous();
+            var cb = b.IsContiguous ? b : (Tensor<T>)b.Contiguous();
+            int outerSize = 1; for (int k = 0; k < d; k++) outerSize *= a._shape[k];
+            int innerSize = 1; for (int k = d + 1; k < rank; k++) innerSize *= a._shape[k];
+            int n = a.Length;
+            using var bufA = GetOrAllocateBuffer(backend, ca.GetDataArray());
+            using var bufB = GetOrAllocateBuffer(backend, cb.GetDataArray());
+            var bufOut = AllocateOutputBuffer(backend, n);
+            backend.Cross3(bufA.Buffer, bufB.Buffer, bufOut.Buffer, outerSize, innerSize);
+            var arr = FinishGpuOp<T>(backend, bufOut, n);
+            return new Tensor<T>(arr, (int[])a._shape.Clone());
+        }
+        catch (Exception) { return base.TensorCross(a, b, dim); }
+    }
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorLdexp<T>(Tensor<T> x, Tensor<int> exp)
+    {
+        if (x is null) throw new ArgumentNullException(nameof(x));
+        if (exp is null) throw new ArgumentNullException(nameof(exp));
+        if (typeof(T) != typeof(float) || !ShapesEqual(x._shape, exp._shape) || !TryGetBackend(out var backend))
+            return base.TensorLdexp(x, exp);
+        try
+        {
+            var cx = x.IsContiguous ? x : (Tensor<T>)x.Contiguous();
+            var ce = exp.IsContiguous ? exp : (Tensor<int>)exp.Contiguous();
+            int n = x.Length;
+            using var bufX = GetOrAllocateBuffer(backend, cx.GetDataArray());
+            using var bufE = backend.AllocateIntBuffer(ce.GetDataArray());
+            var bufOut = AllocateOutputBuffer(backend, n);
+            backend.Ldexp(bufX.Buffer, bufE, bufOut.Buffer, n);
+            var arr = FinishGpuOp<T>(backend, bufOut, n);
+            return new Tensor<T>(arr, (int[])x._shape.Clone());
+        }
+        catch (Exception) { return base.TensorLdexp(x, exp); }
+    }
+
     // ----- Category D: Tensor<Bit> comparison predicates -----
     // The backend comparison kernels write a FLOAT mask (1.0/0.0). The result is a Tensor<Bit> (one
     // byte/elem), which leaves the device — but computing the compare on the GPU keeps the (often

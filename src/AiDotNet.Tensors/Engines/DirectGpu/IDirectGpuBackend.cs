@@ -1891,6 +1891,17 @@ public interface IDirectGpuBackend : IDisposable
     void TakeAlongDim(IGpuBuffer input, IGpuBuffer indices, IGpuBuffer output,
         int outerSize, int axisOut, int innerSize, int axisIn);
 
+    /// <summary>
+    /// 3-vector cross product along an axis of size 3. a/b/output viewed as [outerSize, 3, innerSize];
+    /// out[o,:,i] = a[o,:,i] × b[o,:,i].
+    /// </summary>
+    void Cross3(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int outerSize, int innerSize);
+
+    /// <summary>
+    /// Ldexp: output[i] = input[i] * 2^exponents[i], where <paramref name="exponents"/> is an INT buffer.
+    /// </summary>
+    void Ldexp(IGpuBuffer input, IGpuBuffer exponents, IGpuBuffer output, int size);
+
     #region Comparison Operations
 
     void GreaterThan(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size);
