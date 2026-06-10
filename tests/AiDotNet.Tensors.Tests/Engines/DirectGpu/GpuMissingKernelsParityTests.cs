@@ -522,6 +522,23 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
     }
 
     [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void TensorSearchSorted_Bucketize_GpuMatchesCpu(bool right)
+    {
+        if (!EnsureGpuReady()) return;
+        var seq = new Tensor<float>(new float[] { 0f, 1f, 2.5f, 5f, 9f }, new[] { 5 });
+        var vals = new Tensor<float>(new float[] { -1f, 0f, 1f, 2f, 2.5f, 7f, 9f, 12f }, new[] { 8 });
+        var gSS = _gpu.TensorSearchSorted(seq, vals, right);
+        var cSS = _cpu.TensorSearchSorted(seq, vals, right);
+        Assert.Equal(cSS.ToArray(), gSS.ToArray());
+        // Bucketize delegates to SearchSorted -> auto-on-GPU.
+        var gB = _gpu.TensorBucketize(vals, seq, right);
+        var cB = _cpu.TensorBucketize(vals, seq, right);
+        Assert.Equal(cB.ToArray(), gB.ToArray());
+    }
+
+    [Theory]
     [InlineData(2, 3, 2, 2)]
     [InlineData(3, 1, 2, 4)]
     [InlineData(4, 4, 3, 3)]

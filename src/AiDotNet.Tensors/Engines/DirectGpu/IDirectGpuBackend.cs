@@ -1908,6 +1908,14 @@ public interface IDirectGpuBackend : IDisposable
     /// </summary>
     void Kron2D(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int am, int an, int bp, int bq);
 
+    /// <summary>
+    /// searchsorted/bucketize: per value, binary-search its insertion index into the 1-D sorted
+    /// sequence. <paramref name="right"/>=0 is lower_bound (seq[i-1] &lt; v &lt;= seq[i]); =1 is
+    /// upper_bound (seq[i-1] &lt;= v &lt; seq[i]). The index is written as a float (exact for the small
+    /// index range).
+    /// </summary>
+    void SearchSorted(IGpuBuffer sortedSeq, IGpuBuffer values, IGpuBuffer output, int seqLen, int numValues, int right);
+
     #region Comparison Operations
 
     void GreaterThan(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size);

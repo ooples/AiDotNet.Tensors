@@ -760,6 +760,33 @@ public partial class DirectGpuTensorEngine
     }
 
     /// <inheritdoc/>
+    public override Tensor<int> TensorSearchSorted<T>(Tensor<T> sortedSequence, Tensor<T> values, bool right = false)
+    {
+        if (sortedSequence is null) throw new ArgumentNullException(nameof(sortedSequence));
+        if (values is null) throw new ArgumentNullException(nameof(values));
+        if (typeof(T) != typeof(float) || sortedSequence.Rank != 1 || !TryGetBackend(out var backend))
+            return base.TensorSearchSorted(sortedSequence, values, right);
+        try
+        {
+            var seq = sortedSequence.IsContiguous ? sortedSequence : (Tensor<T>)sortedSequence.Contiguous();
+            var vals = values.IsContiguous ? values : (Tensor<T>)values.Contiguous();
+            int seqLen = sortedSequence.Length;
+            int nv = values.Length;
+            using var bufSeq = GetOrAllocateBuffer(backend, seq.GetDataArray());
+            using var bufVal = GetOrAllocateBuffer(backend, vals.GetDataArray());
+            using var bufOut = AllocateOutputBuffer(backend, nv);
+            backend.SearchSorted(bufSeq.Buffer, bufVal.Buffer, bufOut.Buffer, seqLen, nv, right ? 1 : 0);
+            backend.Synchronize();
+            var f = backend.DownloadBuffer(bufOut.Buffer);
+            var result = new Tensor<int>((int[])values._shape.Clone());
+            var dst = result.AsWritableSpan();
+            for (int i = 0; i < nv; i++) dst[i] = (int)f[i];
+            return result;
+        }
+        catch (Exception) { return base.TensorSearchSorted(sortedSequence, values, right); }
+    }
+
+    /// <inheritdoc/>
     public override Tensor<T> TensorKron<T>(Tensor<T> a, Tensor<T> b)
     {
         if (a is null) throw new ArgumentNullException(nameof(a));

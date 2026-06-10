@@ -138,6 +138,19 @@ __kernel void kron2d(__global const float* a, __global const float* b, __global 
     int j = oc / bq;   int l = oc % bq;
     output[idx] = a[i * an + j] * b[k * bq + l];
 }
+// searchsorted/bucketize: binary search per value into the 1-D sorted sequence. right=0 lower_bound,
+// right=1 upper_bound. Index written as float (exact in the small index range).
+__kernel void search_sorted(__global const float* seq, __global const float* values, __global float* output, int seqLen, int numValues, int right) {
+    int idx = get_global_id(0); if (idx >= numValues) return;
+    float v = values[idx];
+    int lo = 0, hi = seqLen;
+    while (lo < hi) {
+        int mid = (lo + hi) >> 1;
+        int cond = (right != 0) ? (seq[mid] <= v) : (seq[mid] < v);
+        if (cond) lo = mid + 1; else hi = mid;
+    }
+    output[idx] = (float)lo;
+}
 ";
     }
 
@@ -151,7 +164,7 @@ __kernel void kron2d(__global const float* a, __global const float* b, __global 
             "eye_kernel", "linspace_kernel", "one_hot_kernel",
             "diag_kernel", "extract_diag_kernel", "triangular_mask",
             "masked_fill_kernel", "index_select", "take_along_dim",
-            "cross3", "ldexp_kernel", "kron2d"
+            "cross3", "ldexp_kernel", "kron2d", "search_sorted"
         };
     }
 }
