@@ -1789,6 +1789,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     [System.ThreadStatic] internal static string? s_currentForwardOp;
 
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, int> s_aliasDiag = new();
+    // Diagnostic: maps a (compiled-plan output) backing array → the op that produced it, so a "src not resident"
+    // log names the actual PRODUCER (not the consuming op). Tagged in CopyResultInto.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<object, string> s_producerOf = new();
+    /// <summary>Tag a forward-action's OUTPUT with the producing op name (diagnostics), covering ops that write
+    /// output directly (no CopyResultInto/BindResidentBuffer). Called by the generic forward action after exec.</summary>
+    internal static void TagProducer<T>(Tensor<T> output, string? op)
+    {
+        if (op is null || s_currentForwardOp is null) return;
+        var arr = output.DataVector.GetBackingArrayUnsafe();
+        if (arr is not null) s_producerOf[arr] = op;
+    }
     private static void AliasDiag(string reason)
     {
         if (System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") != "1") return;
@@ -1799,6 +1810,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     internal static void CopyResultInto<T>(IEngine eng, Tensor<T> src, Tensor<T> dest)
     {
+        if (s_currentForwardOp is not null)
+        {
+            var dArr = dest.DataVector.GetBackingArrayUnsafe();
+            if (dArr is not null) s_producerOf[dArr] = s_currentForwardOp;
+        }
         if (eng is DirectGpuTensorEngine gpu && gpu.TryAliasResidentOutput(src, dest))
         { AliasDiag("OK aliased"); return; }
         AliasDiag(eng is DirectGpuTensorEngine ? "FELLBACK host-copy" : "not-gpu-engine");
@@ -1842,7 +1858,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             bool capturing = backend is Engines.DirectGpu.CUDA.CudaBackend cbk && cbk.IsStreamCapturing();
             bool hasBuf = src._gpuBuffer is not null;
             bool verMatch = hasBuf && src._gpuBufferVersion == src.Version;
-            AliasDiag($"skip: src not resident producerOp={s_currentForwardOp} shape=[{string.Join(",", src._shape)}] hasBuf={hasBuf} capturing={capturing}");
+            var srcArr2 = src.DataVector.GetBackingArrayUnsafe();
+            string realProducer = (srcArr2 is not null && s_producerOf.TryGetValue(srcArr2, out var rp)) ? rp : "<untagged/host>";
+            AliasDiag($"skip: src not resident PRODUCER={realProducer} consumer={s_currentForwardOp} shape=[{string.Join(",", src._shape)}] hasBuf={hasBuf} capturing={capturing}");
             return false;
         }
 
@@ -2660,6 +2678,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         t._gpuBuffer = buf; t._gpuBackend = backend; t._gpuBufferVersion = t.Version;
         var arr = t.DataVector.GetBackingArrayUnsafe();
         if (arr is null) return;
+        if (s_currentForwardOp is not null) s_producerOf[arr] = s_currentForwardOp;
         var capBuf = buf; var capBackend = backend;
         Helpers.DeferredArrayMaterializer.Register(arr, a =>
         {
@@ -2735,6 +2754,28 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return true;
         }
         catch (Exception mex) { AliasDiag($"MM-resident FELLBACK a=[{string.Join(",", a._shape)}] b=[{string.Join(",", b._shape)}]: {mex.GetType().Name}: {mex.Message}"); return false; }
+    }
+
+    /// <summary>GPU-RESIDENT embedding lookup from FLOAT indices for the compiled step (the cortex's actual
+    /// embedding op): backend.Embedding (the kernel casts float→int) into the destination's stable buffer, with
+    /// the table from the PERSISTENT weight cache and the indices from the resident input buffer — no host gather
+    /// (3× GetDataArray = DtoH downloads = non-capturable CUDA-900 that invalidates the whole graph capture).
+    /// This is the SOURCE of the forward residency chain; without it every downstream op re-uploads.</summary>
+    internal bool TryEmbeddingFromFloatIndicesResidentInto<T>(Tensor<T> output, Tensor<T> embeddings, Tensor<T> floatIndices, int numIndices, int embeddingDim)
+    {
+        if (!EvictionSuspended || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
+        if (!TryGetBackend(out var backend) || !embeddings.IsContiguous || !floatIndices.IsContiguous) return false;
+        if ((long)numIndices * embeddingDim != output.Length) return false;
+        try
+        {
+            using var idxBuf = GetOrAllocateContiguousInputBuffer(backend, floatIndices);            // resident step input
+            using var tableBuf = GetOrCacheWeightBuffer(backend, embeddings.GetDataArray(), PersistentTensorRole.Embeddings);
+            var outBuf = GetOrCreateResidentBuffer(backend, output, numIndices * embeddingDim);
+            backend.Embedding(idxBuf.Buffer, tableBuf.Buffer, outBuf, numIndices, embeddingDim);
+            BindResidentBuffer(output, outBuf, backend);
+            return true;
+        }
+        catch (Exception eex) { AliasDiag($"EmbFloat-resident FELLBACK n={numIndices} dim={embeddingDim}: {eex.GetType().Name}: {eex.Message}"); return false; }
     }
 
     /// <summary>GPU-RESIDENT slice-along-axis for the compiled step (e.g. the LM-head last-token select

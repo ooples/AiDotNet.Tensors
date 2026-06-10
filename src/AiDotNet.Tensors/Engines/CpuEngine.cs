@@ -30158,6 +30158,12 @@ public partial class CpuEngine : ITensorLevelEngine
                     embeddings, floatIndices, outputShape,
                     (eng, output) =>
                     {
+                        // GPU-resident embedding gather into output's stable buffer (the embedding_forward kernel
+                        // casts float→int) — keeps the whole forward chain on-device for CUDA-graph capture. Else
+                        // the host gather below.
+                        if (eng is DirectGpuTensorEngine embGpu
+                            && embGpu.TryEmbeddingFromFloatIndicesResidentInto(output, capturedEmb, capturedFloatIdx, n, dim))
+                            return;
                         // Read fresh float indices each replay; convert to int
                         // via banker's rounding (matches Convert.ToInt32(double)
                         // semantics used by the eager path so any code that flips

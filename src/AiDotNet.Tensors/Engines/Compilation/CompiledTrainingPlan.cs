@@ -2344,7 +2344,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 var output = step.OutputBuffer;
                 var exec = step.Execute;
                 var opName = step.OpName;
-                allForwardActions.Add(eng => { Engines.DirectGpuTensorEngine.s_currentForwardOp = opName; exec(eng, output); });
+                allForwardActions.Add(eng => { Engines.DirectGpuTensorEngine.s_currentForwardOp = opName; exec(eng, output); Engines.DirectGpuTensorEngine.TagProducer(output, opName); });
                 genericForwardCount++;  // engine-dispatched (GPU-pure on a GPU engine)
             }
         }
