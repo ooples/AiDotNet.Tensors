@@ -151,6 +151,19 @@ __kernel void search_sorted(__global const float* seq, __global const float* val
     }
     output[idx] = (float)lo;
 }
+// index_copy/index_fill scatter-write. output pre-seeded with the original tensor; overwrite selected
+// slices. mode 0 = copy from source[outer,j,inner]; mode 1 = write fillValue. indices is 1-D [idxAxis].
+__kernel void index_write(__global float* output, __global const int* indices, __global const float* source,
+    float fillValue, int mode, int outerSize, int idxAxis, int innerSize, int dstAxis) {
+    int idx = get_global_id(0); int total = outerSize * idxAxis * innerSize; if (idx >= total) return;
+    int inner = idx % innerSize;
+    int j = (idx / innerSize) % idxAxis;
+    int outer = (idx / innerSize) / idxAxis;
+    int dstJ = indices[j];
+    if (dstJ < 0 || dstJ >= dstAxis) return;
+    float v = (mode == 0) ? source[idx] : fillValue;
+    output[(outer * dstAxis + dstJ) * innerSize + inner] = v;
+}
 // IEEE nextafter via direct bit manipulation; NaN detected by bit pattern (fast-math safe).
 __kernel void next_after(__global const float* a, __global const float* b, __global float* output, int size) {
     int idx = get_global_id(0); if (idx >= size) return;
@@ -179,7 +192,7 @@ __kernel void next_after(__global const float* a, __global const float* b, __glo
             "eye_kernel", "linspace_kernel", "one_hot_kernel",
             "diag_kernel", "extract_diag_kernel", "triangular_mask",
             "masked_fill_kernel", "index_select", "take_along_dim",
-            "cross3", "ldexp_kernel", "kron2d", "search_sorted", "next_after"
+            "cross3", "ldexp_kernel", "kron2d", "search_sorted", "next_after", "index_write"
         };
     }
 }

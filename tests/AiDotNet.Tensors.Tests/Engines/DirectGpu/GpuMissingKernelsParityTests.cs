@@ -521,6 +521,23 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         AssertBitMatch(_gpu.TensorEq(a, b), _cpu.TensorEq(a, b), "TensorEq");
     }
 
+    [Theory]
+    [InlineData(new[] { 5, 4 }, 0)]
+    [InlineData(new[] { 5, 4 }, 1)]
+    [InlineData(new[] { 3, 4, 5 }, 1)]
+    public void TensorIndexCopy_GpuMatchesCpu(int[] shape, int axis)
+    {
+        if (!EnsureGpuReady()) return;
+        var t = Rand(200, shape);
+        // pick 2 unique indices along axis
+        int dstAxis = shape[axis];
+        var idx = new Tensor<int>(new[] { 0, Math.Min(2, dstAxis - 1) }, new[] { 2 });
+        var srcShape = (int[])shape.Clone(); srcShape[axis] = 2;
+        var src = Rand(201, srcShape);
+        AssertMatch(_gpu.TensorIndexCopy(t, axis, idx, src), _cpu.TensorIndexCopy(t, axis, idx, src), $"IndexCopy[{string.Join("x", shape)};ax={axis}]");
+        AssertMatch(_gpu.TensorIndexFill(t, axis, idx, 9.5f), _cpu.TensorIndexFill(t, axis, idx, 9.5f), $"IndexFill[{string.Join("x", shape)};ax={axis}]");
+    }
+
     [Fact]
     public void TensorNextAfter_GpuMatchesCpu()
     {

@@ -811,6 +811,67 @@ public partial class DirectGpuTensorEngine
     }
 
     /// <inheritdoc/>
+    public override Tensor<T> TensorIndexCopy<T>(Tensor<T> tensor, int axis, Tensor<int> indices, Tensor<T> source)
+    {
+        if (tensor is null) throw new ArgumentNullException(nameof(tensor));
+        if (indices is null) throw new ArgumentNullException(nameof(indices));
+        if (source is null) throw new ArgumentNullException(nameof(source));
+        int rank = tensor.Rank;
+        int ax = axis < 0 ? axis + rank : axis;
+        if (typeof(T) != typeof(float) || ax < 0 || ax >= rank || indices.Rank != 1 || !TryGetBatchBackend(out var backend))
+            return base.TensorIndexCopy(tensor, axis, indices, source);
+        try
+        {
+            var ct = tensor.IsContiguous ? tensor : (Tensor<T>)tensor.Contiguous();
+            var cs = source.IsContiguous ? source : (Tensor<T>)source.Contiguous();
+            var ci = indices.IsContiguous ? indices : (Tensor<int>)indices.Contiguous();
+            int dstAxis = tensor._shape[ax], idxAxis = indices.Length, n = tensor.Length;
+            int outerSize = 1; for (int k = 0; k < ax; k++) outerSize *= tensor._shape[k];
+            int innerSize = 1; for (int k = ax + 1; k < rank; k++) innerSize *= tensor._shape[k];
+
+            using var bufIn = GetOrAllocateBuffer(backend, ct.GetDataArray());
+            using var bufSrc = GetOrAllocateBuffer(backend, cs.GetDataArray());
+            using var bufIdx = backend.AllocateIntBuffer(ci.GetDataArray());
+            var bufOut = AllocateOutputBuffer(backend, n);
+            backend.Copy(bufIn.Buffer, bufOut.Buffer, n);   // seed with the original tensor
+            backend.IndexWrite(bufOut.Buffer, bufIdx, bufSrc.Buffer, 0f, /*mode copy*/0, outerSize, idxAxis, innerSize, dstAxis);
+            var arr = FinishGpuOp<T>(backend, bufOut, n);
+            return new Tensor<T>(arr, (int[])tensor._shape.Clone());
+        }
+        catch (Exception) { return base.TensorIndexCopy(tensor, axis, indices, source); }
+    }
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorIndexFill<T>(Tensor<T> tensor, int axis, Tensor<int> indices, T value)
+    {
+        if (tensor is null) throw new ArgumentNullException(nameof(tensor));
+        if (indices is null) throw new ArgumentNullException(nameof(indices));
+        int rank = tensor.Rank;
+        int ax = axis < 0 ? axis + rank : axis;
+        if (typeof(T) != typeof(float) || ax < 0 || ax >= rank || indices.Rank != 1 || !TryGetBatchBackend(out var backend))
+            return base.TensorIndexFill(tensor, axis, indices, value);
+        try
+        {
+            var ct = tensor.IsContiguous ? tensor : (Tensor<T>)tensor.Contiguous();
+            var ci = indices.IsContiguous ? indices : (Tensor<int>)indices.Contiguous();
+            int dstAxis = tensor._shape[ax], idxAxis = indices.Length, n = tensor.Length;
+            int outerSize = 1; for (int k = 0; k < ax; k++) outerSize *= tensor._shape[k];
+            int innerSize = 1; for (int k = ax + 1; k < rank; k++) innerSize *= tensor._shape[k];
+            float fill = ToFloatScalar(value);
+
+            using var bufIn = GetOrAllocateBuffer(backend, ct.GetDataArray());
+            using var bufIdx = backend.AllocateIntBuffer(ci.GetDataArray());
+            var bufOut = AllocateOutputBuffer(backend, n);
+            backend.Copy(bufIn.Buffer, bufOut.Buffer, n);
+            // mode 1 = fill; source unused, pass bufIn as a non-null placeholder.
+            backend.IndexWrite(bufOut.Buffer, bufIdx, bufIn.Buffer, fill, /*mode fill*/1, outerSize, idxAxis, innerSize, dstAxis);
+            var arr = FinishGpuOp<T>(backend, bufOut, n);
+            return new Tensor<T>(arr, (int[])tensor._shape.Clone());
+        }
+        catch (Exception) { return base.TensorIndexFill(tensor, axis, indices, value); }
+    }
+
+    /// <inheritdoc/>
     public override Tensor<T> TensorNextAfter<T>(Tensor<T> a, Tensor<T> b)
     {
         if (a is null) throw new ArgumentNullException(nameof(a));

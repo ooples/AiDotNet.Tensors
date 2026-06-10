@@ -1923,6 +1923,16 @@ public interface IDirectGpuBackend : IDisposable
     /// </summary>
     void NextAfter(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int size);
 
+    /// <summary>
+    /// index_copy / index_fill scatter-write along an axis. <paramref name="output"/> must already hold
+    /// the original tensor. Viewing output as [outerSize, dstAxis, innerSize] and the 1-D index list of
+    /// length idxAxis: for each (outer, j, inner), output[outer, indices[j], inner] = mode==0 ?
+    /// source[outer, j, inner] : fillValue. Out-of-range index entries are skipped. (Duplicate indices
+    /// in copy-mode are unspecified, matching torch.index_copy.)
+    /// </summary>
+    void IndexWrite(IGpuBuffer output, IGpuBuffer indices, IGpuBuffer source, float fillValue, int mode,
+        int outerSize, int idxAxis, int innerSize, int dstAxis);
+
     #region Comparison Operations
 
     void GreaterThan(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size);

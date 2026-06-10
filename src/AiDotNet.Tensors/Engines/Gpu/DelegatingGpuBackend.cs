@@ -1442,6 +1442,8 @@ public class DelegatingGpuBackend : IDirectGpuBackend
     public virtual void SearchSorted(IGpuBuffer sortedSeq, IGpuBuffer values, IGpuBuffer output, int seqLen, int numValues, int right) => Inner.SearchSorted(sortedSeq, values, output, seqLen, numValues, right);
     /// <inheritdoc/>
     public virtual void NextAfter(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int size) => Inner.NextAfter(a, b, output, size);
+    /// <inheritdoc/>
+    public virtual void IndexWrite(IGpuBuffer output, IGpuBuffer indices, IGpuBuffer source, float fillValue, int mode, int outerSize, int idxAxis, int innerSize, int dstAxis) => Inner.IndexWrite(output, indices, source, fillValue, mode, outerSize, idxAxis, innerSize, dstAxis);
 
     /// <inheritdoc/>
     public virtual void Where(IGpuBuffer condition, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)

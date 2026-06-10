@@ -33,6 +33,7 @@ public sealed partial class WebGpuBackend
     public void Kron2D(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int am, int an, int bp, int bq) => throw new NotSupportedException("Kron2D not yet implemented on the WebGPU backend.");
     public void SearchSorted(IGpuBuffer sortedSeq, IGpuBuffer values, IGpuBuffer output, int seqLen, int numValues, int right) => throw new NotSupportedException("SearchSorted not yet implemented on the WebGPU backend.");
     public void NextAfter(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int size) => throw new NotSupportedException("NextAfter not yet implemented on the WebGPU backend.");
+    public void IndexWrite(IGpuBuffer output, IGpuBuffer indices, IGpuBuffer source, float fillValue, int mode, int outerSize, int idxAxis, int innerSize, int dstAxis) => throw new NotSupportedException("IndexWrite not yet implemented on the WebGPU backend.");
     public void OuterProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int M, int N)
     { try { Dispatch3BufferAsync("OuterProduct", WebGpuKernels.OuterProductSource, "outer_product", a, b, o, new float[]{BitConverter.Int32BitsToSingle(M),BitConverter.Int32BitsToSingle(N)}, M*N).GetAwaiter().GetResult(); } catch { float[] ad=DownloadBuffer(a); float[] bd=DownloadBuffer(b); float[] r=new float[M*N]; for(int i2=0;i2<M;i2++) for(int j=0;j<N;j++) r[i2*N+j]=ad[i2]*bd[j]; ((WebGpuBuffer)o).CopyFrom(r); } }
     public void BatchDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int bs, int dim)
