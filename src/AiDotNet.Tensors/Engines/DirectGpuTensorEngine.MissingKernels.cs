@@ -858,6 +858,31 @@ public partial class DirectGpuTensorEngine
         catch (Exception) { return base.TensorAminmax(tensor); }
     }
 
+    /// <inheritdoc/>
+    public override T TensorTrace<T>(Tensor<T> tensor)
+    {
+        if (tensor is null) throw new ArgumentNullException(nameof(tensor));
+        if (typeof(T) != typeof(float) || tensor.Rank != 2 || !TryGetBatchBackend(out var backend))
+            return base.TensorTrace(tensor);
+
+        // trace = sum of the diagonal. Extract the diagonal with the GPU kernel, then GPU reduce-sum;
+        // only the scalar comes back instead of the host scanning the whole matrix.
+        try
+        {
+            int rows = tensor._shape[0], cols = tensor._shape[1];
+            int n = System.Math.Min(rows, cols);
+            var src = tensor.IsContiguous ? tensor : (Tensor<T>)tensor.Contiguous();
+            using var bufIn = GetOrAllocateBuffer(backend, src.GetDataArray());
+            var bufDiag = AllocateOutputBuffer(backend, n);
+            backend.ExtractDiagKernel(bufIn.Buffer, bufDiag.Buffer, n, cols);
+            var diagArr = FinishGpuOp<T>(backend, bufDiag, n);
+            var diag = new Tensor<T>(diagArr, new[] { n });
+            var sum = ReduceSum(diag, null, false);
+            return sum.AsSpan()[0];
+        }
+        catch (Exception) { return base.TensorTrace(tensor); }
+    }
+
     private Tensor<T> PermuteResidentGpu<T>(IDirectGpuBackend backend, Tensor<T> tensor, int[] axes)
     {
         var src = tensor.IsContiguous ? tensor : (Tensor<T>)tensor.Contiguous();

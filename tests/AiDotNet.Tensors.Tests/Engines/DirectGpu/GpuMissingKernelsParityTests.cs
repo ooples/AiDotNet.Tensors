@@ -501,6 +501,21 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
     }
 
     [Theory]
+    [InlineData(2, 2)]
+    [InlineData(4, 4)]
+    [InlineData(3, 5)]
+    [InlineData(6, 3)]
+    [InlineData(64, 64)]
+    public void TensorTrace_GpuMatchesCpu(int rows, int cols)
+    {
+        if (!EnsureGpuReady()) return;
+        var t = Rand(165, rows, cols);
+        float cpu = _cpu.TensorTrace(t);
+        float gpu = _gpu.TensorTrace(t);
+        Assert.True(Math.Abs((double)gpu - cpu) < 1e-3, $"Trace[{rows}x{cols}]: gpu {gpu} vs cpu {cpu}");
+    }
+
+    [Theory]
     [InlineData(1)]
     [InlineData(33)]
     [InlineData(1024)]
