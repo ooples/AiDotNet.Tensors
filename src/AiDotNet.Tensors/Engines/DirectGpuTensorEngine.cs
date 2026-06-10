@@ -2787,11 +2787,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if ((long)numIndices * embeddingDim != output.Length) return false;
         try
         {
-            using var idxBuf = GetOrAllocateContiguousInputBuffer(backend, floatIndices);            // resident step input
-            using var tableBuf = GetOrCacheWeightBuffer(backend, embeddings.GetDataArray(), PersistentTensorRole.Embeddings);
-            var outBuf = GetOrCreateResidentBuffer(backend, output, numIndices * embeddingDim);
-            backend.Embedding(idxBuf.Buffer, tableBuf.Buffer, outBuf, numIndices, embeddingDim);
-            BindResidentBuffer(output, outBuf, backend);
+            var tableBuf = ResolveResidentEmbeddingTable(backend, embeddings);
+            if (tableBuf is null) return false;
+            var outBuf = output.TryGetGpuBuffer() ?? GetOrCreateResidentBuffer(backend, output, numIndices * embeddingDim);
+            // Indices via the EXTERNALLY-MANAGED stable buffer (mirrors TryEmbeddingGatherGpu): register the refresh
+            // so the plan re-uploads fresh indices before each captured replay; upload inline only on the eager
+            // (non-managed) pass. The index upload (the only HtoD) thus never happens INSIDE the capture (= the 906).
+            var capIdx = floatIndices; var capN = numIndices;
+            RegisterEmbIndexRefresh(() => UploadEmbeddingIndices(capIdx, capN));
+            if (!EmbeddingIndexExternallyManaged) UploadEmbeddingIndices(floatIndices, numIndices);
+            if (_cachedEmbIndexBuffer is null) return false;
+            backend.Embedding(_cachedEmbIndexBuffer, tableBuf, outBuf, numIndices, embeddingDim);
+            output._gpuBuffer = outBuf; output._gpuBackend = backend; output._gpuBufferVersion = output.Version;
+            var oArr = output.DataVector.GetBackingArrayUnsafe();
+            if (oArr is not null && s_currentForwardOp is not null) s_producerOf[oArr] = s_currentForwardOp;
             return true;
         }
         catch (Exception eex) { AliasDiag($"EmbFloat-resident FELLBACK n={numIndices} dim={embeddingDim}: {eex.GetType().Name}: {eex.Message}"); return false; }

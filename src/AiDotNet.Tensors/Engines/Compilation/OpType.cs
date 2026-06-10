@@ -158,7 +158,7 @@ internal static class OpTypeParser
         "MSELoss" => OpType.MSELoss,
         "TensorCrossEntropyLoss" or "CrossEntropyLoss" => OpType.CrossEntropyLoss,
         "TensorBinaryCrossEntropy" => OpType.BinaryCrossEntropy,
-        "Embedding" or "TensorEmbeddingLookup" => OpType.Embedding,
+        "Embedding" or "TensorEmbeddingLookup" or "TensorEmbeddingLookupFromFloatIndices" => OpType.Embedding,
         _ => OpType.Unknown,
     };
 }
