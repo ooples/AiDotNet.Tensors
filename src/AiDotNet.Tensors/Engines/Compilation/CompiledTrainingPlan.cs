@@ -546,12 +546,15 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         // A throw during pre-residency/capture (not just exec==Zero) must also roll back the
                         // graph-lifetime state — otherwise eviction stays suspended (pins every offload buffer,
                         // risking OOM) and the embedding stays in externally-managed mode (the eager fallback
-                        // would skip its inline index upload and silently train on stale indices). PR #581 review.
+                        // would skip its inline index upload and silently train on stale indices). With the state
+                        // rolled back and the graph permanently disabled, the eager path is fully valid — fall
+                        // back NOW rather than aborting this step (PR #581 review: a one-off capture hiccup
+                        // shouldn't kill a training run when every later step would succeed eagerly anyway).
                         _graphStepDisabled = true;
                         if (_graphHasEmbedding) gte.EmbeddingIndexExternallyManaged = false;
                         gte.ResumeActivationEviction();
                         _graphEvictionSuspended = false;
-                        throw;
+                        return StepEager();
                     }
                     finally
                     {
