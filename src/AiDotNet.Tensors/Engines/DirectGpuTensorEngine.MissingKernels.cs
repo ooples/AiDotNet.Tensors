@@ -1503,6 +1503,67 @@ public partial class DirectGpuTensorEngine
     }
 
     /// <inheritdoc/>
+    public override Tensor<T> FusedHierarchicalSoftmax<T>(Tensor<T> input, Tensor<T> nodeWeights, int numClasses)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (nodeWeights is null) throw new ArgumentNullException(nameof(nodeWeights));
+        if (numClasses < 2) throw new ArgumentException("numClasses must be >= 2.", nameof(numClasses));
+        if (typeof(T) != typeof(float) || nodeWeights.Rank != 2 || !TryGetBackend(out var backend))
+            return base.FusedHierarchicalSoftmax(input, nodeWeights, numClasses);
+        int d = input._shape[input.Rank - 1];
+        int treeDepth = nodeWeights._shape[0];
+        int minDepth = 0; while ((1 << minDepth) < numClasses) minDepth++;
+        if (nodeWeights._shape[1] != d || treeDepth < minDepth)
+            return base.FusedHierarchicalSoftmax(input, nodeWeights, numClasses);
+        try
+        {
+            // Per-level node activations on the GPU (input · nodeWeightsᵀ), then the leaf-probability
+            // path products (sigmoid folded into the kernel).
+            int rows = input.Length / d;
+            var input2d = (input.IsContiguous ? input : (Tensor<T>)input.Contiguous()).Reshape(new[] { rows, d });
+            var acts = TensorMatMulTransposed(input2d, nodeWeights);   // [rows, treeDepth]
+            var actsC = acts.IsContiguous ? acts : (Tensor<T>)acts.Contiguous();
+            using var bufActs = GetOrAllocateBuffer(backend, actsC.GetDataArray());
+            var bufOut = AllocateOutputBuffer(backend, rows * numClasses);
+            backend.HierarchicalSoftmaxPaths(bufActs.Buffer, bufOut.Buffer, rows, treeDepth, numClasses);
+            var arr = FinishGpuOp<T>(backend, bufOut, rows * numClasses);
+            var outShape = (int[])input._shape.Clone();
+            outShape[outShape.Length - 1] = numClasses;
+            return new Tensor<T>(arr, outShape);
+        }
+        catch (Exception) { return base.FusedHierarchicalSoftmax(input, nodeWeights, numClasses); }
+    }
+
+    /// <inheritdoc/>
+    public override Tensor<T> FusedLinearMaxout<T>(Tensor<T> input, Tensor<T> weights, Tensor<T>? bias, int numPieces)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (weights is null) throw new ArgumentNullException(nameof(weights));
+        if (numPieces < 2) throw new ArgumentException("numPieces must be >= 2.", nameof(numPieces));
+        if (typeof(T) != typeof(float) || !TryGetBackend(out var backend))
+            return base.FusedLinearMaxout(input, weights, bias, numPieces);
+        try
+        {
+            // GEMM+bias on the GPU, then maxout = max over each unit's numPieces consecutive features
+            // (MaxAxis with reduceSize = numPieces).
+            var pre = FusedLinear(input, weights, bias, FusedActivationType.None);
+            int n = pre._shape[pre.Rank - 1];
+            if (n % numPieces != 0) return base.FusedLinearMaxout(input, weights, bias, numPieces);
+            int units = n / numPieces;
+            int rows = pre.Length / n;
+            var preC = pre.IsContiguous ? pre : (Tensor<T>)pre.Contiguous();
+            using var bufPre = GetOrAllocateBuffer(backend, preC.GetDataArray());
+            var bufOut = AllocateOutputBuffer(backend, rows * units);
+            backend.MaxAxis(bufPre.Buffer, bufOut.Buffer, rows * units, numPieces);
+            var arr = FinishGpuOp<T>(backend, bufOut, rows * units);
+            var outShape = (int[])pre._shape.Clone();
+            outShape[outShape.Length - 1] = units;
+            return new Tensor<T>(arr, outShape);
+        }
+        catch (Exception) { return base.FusedLinearMaxout(input, weights, bias, numPieces); }
+    }
+
+    /// <inheritdoc/>
     public override Tensor<T> Rwkv7SequenceForward<T>(
         Tensor<T> rProj, Tensor<T> kProj, Tensor<T> vProj, Tensor<T> aProj, Tensor<T> bProj, int numHeads)
     {

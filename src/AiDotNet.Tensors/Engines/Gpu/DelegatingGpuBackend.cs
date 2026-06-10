@@ -1458,6 +1458,8 @@ public class DelegatingGpuBackend : IDirectGpuBackend
     public virtual void IotaPad(IGpuBuffer idx, int l, int p, int numRows) => Inner.IotaPad(idx, l, p, numRows);
     /// <inheritdoc/>
     public virtual void Rwkv7Forward(IGpuBuffer r, IGpuBuffer k, IGpuBuffer v, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, IGpuBuffer sbuf, int batch, int seqLen, int modelDim, int numHeads, int headDim) => Inner.Rwkv7Forward(r, k, v, a, b, output, sbuf, batch, seqLen, modelDim, numHeads, headDim);
+    /// <inheritdoc/>
+    public virtual void HierarchicalSoftmaxPaths(IGpuBuffer acts, IGpuBuffer output, int rows, int treeDepth, int numClasses) => Inner.HierarchicalSoftmaxPaths(acts, output, rows, treeDepth, numClasses);
 
     /// <inheritdoc/>
     public virtual void Where(IGpuBuffer condition, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)

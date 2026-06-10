@@ -1972,6 +1972,12 @@ public interface IDirectGpuBackend : IDisposable
     void Rwkv7Forward(IGpuBuffer r, IGpuBuffer k, IGpuBuffer v, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output,
         IGpuBuffer sbuf, int batch, int seqLen, int modelDim, int numHeads, int headDim);
 
+    /// <summary>
+    /// Hierarchical-softmax leaf probabilities from raw per-level node activations `acts` [rows, treeDepth]
+    /// (sigmoid applied internally). Output is [rows, numClasses].
+    /// </summary>
+    void HierarchicalSoftmaxPaths(IGpuBuffer acts, IGpuBuffer output, int rows, int treeDepth, int numClasses);
+
     #region Comparison Operations
 
     void GreaterThan(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size);

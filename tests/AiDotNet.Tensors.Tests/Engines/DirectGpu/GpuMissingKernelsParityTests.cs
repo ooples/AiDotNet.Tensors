@@ -501,6 +501,29 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
     }
 
     [Theory]
+    [InlineData(4, 8, 12, 2)]
+    [InlineData(6, 16, 8, 4)]
+    public void FusedLinearMaxout_GpuMatchesCpu(int rows, int inF, int outFull, int numPieces)
+    {
+        if (!EnsureGpuReady()) return;
+        var input = Rand(270, rows, inF);
+        var weights = Rand(271, inF, outFull);   // outFull = units*numPieces
+        var bias = Rand(272, outFull);
+        AssertMatch(_gpu.FusedLinearMaxout(input, weights, bias, numPieces), _cpu.FusedLinearMaxout(input, weights, bias, numPieces), $"Maxout[{rows}x{inF};{outFull};p{numPieces}]");
+    }
+
+    [Theory]
+    [InlineData(4, 6, 5, 8)]
+    [InlineData(3, 8, 4, 6)]
+    public void FusedHierarchicalSoftmax_GpuMatchesCpu(int rows, int d, int treeDepth, int numClasses)
+    {
+        if (!EnsureGpuReady()) return;
+        var input = Rand(273, rows, d);
+        var nodeWeights = Rand(274, treeDepth, d);
+        AssertMatch(_gpu.FusedHierarchicalSoftmax(input, nodeWeights, numClasses), _cpu.FusedHierarchicalSoftmax(input, nodeWeights, numClasses), $"HSoftmax[{rows}x{d};td{treeDepth};nc{numClasses}]");
+    }
+
+    [Theory]
     [InlineData(1, 4, 8, 2)]
     [InlineData(2, 5, 12, 3)]
     [InlineData(2, 6, 16, 4)]

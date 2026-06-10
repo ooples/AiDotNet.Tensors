@@ -177,6 +177,23 @@ __kernel void cdist(__global const float* x1, __global const float* x2, __global
     }
     output[idx] = (p == 1.0f) ? sum : (p == 2.0f) ? sqrt(sum) : pow(sum, 1.0f / p);
 }
+// Hierarchical-softmax leaf probabilities from raw per-level node activations `acts` [rows, treeDepth].
+// gate = sigmoid(acts[level]); per class c, prob = product over levels of (bit ? gate : 1-gate), with the
+// balanced-tree early stop once the node index reaches numClasses. Output [rows, numClasses].
+__kernel void hsoftmax_paths(__global const float* acts, __global float* out, int rows, int treeDepth, int numClasses) {
+    int idx = get_global_id(0); if (idx >= rows * numClasses) return;
+    int c = idx % numClasses; int r = idx / numClasses;
+    int gbase = r * treeDepth;
+    float prob = 1.0f; int node = 1;
+    for (int level = 0; level < treeDepth; level++) {
+        int goRight = (c & (1 << (treeDepth - level - 1))) != 0;
+        float g = 1.0f / (1.0f + exp(-acts[gbase + level]));
+        prob *= goRight ? g : (1.0f - g);
+        node = node * 2 + (goRight ? 1 : 0);
+        if (node >= numClasses) break;
+    }
+    out[idx] = prob;
+}
 // RWKV-7 (WKV7 generalized delta rule) sequence forward. One thread per (batch, head); the sequence is
 // scanned sequentially while a per-(b,h) state matrix S[headDim,headDim] lives in global scratch Sbuf.
 // State: S[di,vi] = sig(A)*S[di,vi] + (sig(B[di])*K[di])*V[vi]; readout: out[di] = sig(R[di]) * sum_vi S[di,vi]*K[vi].
@@ -295,7 +312,7 @@ __kernel void next_after(__global const float* a, __global const float* b, __glo
             "diag_kernel", "extract_diag_kernel", "triangular_mask",
             "masked_fill_kernel", "index_select", "take_along_dim",
             "cross3", "ldexp_kernel", "kron2d", "search_sorted", "next_after", "index_write", "cdist", "pdist",
-            "histc", "bitonic_step", "copy_rows", "iota_pad", "rwkv7_forward"
+            "histc", "bitonic_step", "copy_rows", "iota_pad", "rwkv7_forward", "hsoftmax_paths"
         };
     }
 }
