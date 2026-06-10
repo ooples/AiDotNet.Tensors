@@ -500,6 +500,21 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         AssertMatch(gpu, cpu, $"TensorRepeatInterleave[{string.Join("x", shape)};r={repeats}]");
     }
 
+    [Theory]
+    [InlineData(1)]
+    [InlineData(33)]
+    [InlineData(1024)]
+    [InlineData(5000)]
+    public void TensorAminmax_GpuMatchesCpu(int n)
+    {
+        if (!EnsureGpuReady()) return;
+        var t = Rand(160, n);
+        var (cMin, cMax) = _cpu.TensorAminmax(t);
+        var (gMin, gMax) = _gpu.TensorAminmax(t);
+        Assert.True(Math.Abs((double)gMin - cMin) < 1e-4, $"Aminmax[{n}] min: gpu {gMin} vs cpu {cMin}");
+        Assert.True(Math.Abs((double)gMax - cMax) < 1e-4, $"Aminmax[{n}] max: gpu {gMax} vs cpu {cMax}");
+    }
+
     // Whole MLP forward (chain of FusedLinear layers) — now decomposed onto the GPU.
     public static IEnumerable<object[]> MlpCases() => new List<object[]>
     {

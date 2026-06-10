@@ -824,6 +824,40 @@ public partial class DirectGpuTensorEngine
         catch (Exception) { return base.TensorBroadcastTo(input, targetShape); }
     }
 
+    // ----- Category E: full min/max reduction -----
+
+    /// <inheritdoc/>
+    public override (T Min, T Max) TensorAminmax<T>(Tensor<T> tensor)
+    {
+        if (tensor is null) throw new ArgumentNullException(nameof(tensor));
+        // float-only (the backend reduce kernels are float); other dtypes / no-GPU defer to base.
+        if (typeof(T) != typeof(float) || tensor.Length == 0 || !TryGetBackend(out var backend))
+            return base.TensorAminmax(tensor);
+
+        // max via MaxAxis over the whole tensor (outerSize=1); min via -max(-x) using Negate.
+        // The O(n) reduction runs on the GPU; only the two scalars come back, instead of the base
+        // downloading the entire tensor to scan on the host.
+        try
+        {
+            var src = tensor.IsContiguous ? tensor : (Tensor<T>)tensor.Contiguous();
+            int n = tensor.Length;
+            using var bufIn = GetOrAllocateBuffer(backend, src.GetDataArray());
+            using var bufMax = AllocateOutputBuffer(backend, 1);
+            using var bufNeg = AllocateOutputBuffer(backend, n);
+            using var bufNegMax = AllocateOutputBuffer(backend, 1);
+
+            backend.MaxAxis(bufIn.Buffer, bufMax.Buffer, 1, n);
+            backend.Negate(bufIn.Buffer, bufNeg.Buffer, n);
+            backend.MaxAxis(bufNeg.Buffer, bufNegMax.Buffer, 1, n);
+            backend.Synchronize();
+
+            float maxV = backend.DownloadBuffer(bufMax.Buffer)[0];
+            float minV = -backend.DownloadBuffer(bufNegMax.Buffer)[0];
+            return ((T)(object)minV, (T)(object)maxV);
+        }
+        catch (Exception) { return base.TensorAminmax(tensor); }
+    }
+
     private Tensor<T> PermuteResidentGpu<T>(IDirectGpuBackend backend, Tensor<T> tensor, int[] axes)
     {
         var src = tensor.IsContiguous ? tensor : (Tensor<T>)tensor.Contiguous();
