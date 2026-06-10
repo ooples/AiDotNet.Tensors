@@ -8095,6 +8095,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public void IndexWrite(IGpuBuffer output, IGpuBuffer indices, IGpuBuffer source, float fillValue, int mode, int outerSize, int idxAxis, int innerSize, int dstAxis) => throw new NotSupportedException("IndexWrite not yet implemented on the HIP backend.");
     public void CDist(IGpuBuffer x1, IGpuBuffer x2, IGpuBuffer output, int m, int n, int d, float p) => throw new NotSupportedException("CDist not yet implemented on the HIP backend.");
     public void PDist(IGpuBuffer input, IGpuBuffer output, int n, int d, float p) => throw new NotSupportedException("PDist not yet implemented on the HIP backend.");
+    public void Histc(IGpuBuffer input, IGpuBuffer hist, int n, int bins, float mn, float mx) => throw new NotSupportedException("Histc not yet implemented on the HIP backend.");
 
     public unsafe void Equal(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
     {

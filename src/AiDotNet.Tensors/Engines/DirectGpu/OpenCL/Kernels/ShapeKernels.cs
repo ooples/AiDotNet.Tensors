@@ -177,6 +177,23 @@ __kernel void cdist(__global const float* x1, __global const float* x2, __global
     }
     output[idx] = (p == 1.0f) ? sum : (p == 2.0f) ? sqrt(sum) : pow(sum, 1.0f / p);
 }
+// Histogram into `bins` equal-width bins over [mn,mx]; out-of-range dropped, mx in last bin.
+// hist must be pre-zeroed. Float atomic add via int cmpxchg loop (core int32 atomics).
+inline void atomicAddF(volatile __global float* addr, float val) {
+    union { int i; float f; } prev, next;
+    do { prev.f = *addr; next.f = prev.f + val; }
+    while (atomic_cmpxchg((volatile __global int*)addr, prev.i, next.i) != prev.i);
+}
+__kernel void histc(__global const float* input, volatile __global float* hist, int n, int bins, float mn, float mx) {
+    int idx = get_global_id(0); if (idx >= n) return;
+    float x = input[idx];
+    if (x < mn || x > mx) return;
+    float bw = (mx - mn) / (float)bins;
+    int b = (int)((x - mn) / bw);
+    if (b >= bins) b = bins - 1;
+    if (b < 0) b = 0;
+    atomicAddF(&hist[b], 1.0f);
+}
 // Condensed pairwise p-norm over rows of input[n,d]; output 1-D upper-triangle (i<j) order.
 __kernel void pdist(__global const float* input, __global float* output, int n, int d, float p) {
     int flat = get_global_id(0); if (flat >= n * n) return;
@@ -221,7 +238,8 @@ __kernel void next_after(__global const float* a, __global const float* b, __glo
             "eye_kernel", "linspace_kernel", "one_hot_kernel",
             "diag_kernel", "extract_diag_kernel", "triangular_mask",
             "masked_fill_kernel", "index_select", "take_along_dim",
-            "cross3", "ldexp_kernel", "kron2d", "search_sorted", "next_after", "index_write", "cdist", "pdist"
+            "cross3", "ldexp_kernel", "kron2d", "search_sorted", "next_after", "index_write", "cdist", "pdist",
+            "histc"
         };
     }
 }

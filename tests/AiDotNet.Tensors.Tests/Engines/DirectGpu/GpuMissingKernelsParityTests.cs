@@ -522,6 +522,20 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
     }
 
     [Theory]
+    [InlineData(10, 0f, 1f)]
+    [InlineData(8, -2f, 2f)]
+    [InlineData(5, 0f, 10f)]
+    public void TensorHistc_GpuMatchesCpu(int bins, float mn, float mx)
+    {
+        if (!EnsureGpuReady()) return;
+        var rng = new Random(205);
+        var data = new float[500];
+        for (int i = 0; i < data.Length; i++) data[i] = (float)(rng.NextDouble() * (mx - mn) + mn) * 1.2f - 0.1f; // some out of range
+        var t = new Tensor<float>(data, new[] { data.Length });
+        AssertMatch(_gpu.TensorHistc(t, bins, mn, mx), _cpu.TensorHistc(t, bins, mn, mx), $"Histc[bins={bins};{mn}..{mx}]");
+    }
+
+    [Theory]
     [InlineData(5, 3, 2.0)]
     [InlineData(8, 4, 1.0)]
     [InlineData(4, 6, 3.0)]

@@ -1448,6 +1448,8 @@ public class DelegatingGpuBackend : IDirectGpuBackend
     public virtual void CDist(IGpuBuffer x1, IGpuBuffer x2, IGpuBuffer output, int m, int n, int d, float p) => Inner.CDist(x1, x2, output, m, n, d, p);
     /// <inheritdoc/>
     public virtual void PDist(IGpuBuffer input, IGpuBuffer output, int n, int d, float p) => Inner.PDist(input, output, n, d, p);
+    /// <inheritdoc/>
+    public virtual void Histc(IGpuBuffer input, IGpuBuffer hist, int n, int bins, float mn, float mx) => Inner.Histc(input, hist, n, bins, mn, mx);
 
     /// <inheritdoc/>
     public virtual void Where(IGpuBuffer condition, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)

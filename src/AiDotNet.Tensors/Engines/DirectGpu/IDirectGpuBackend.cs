@@ -1945,6 +1945,13 @@ public interface IDirectGpuBackend : IDisposable
     /// </summary>
     void PDist(IGpuBuffer input, IGpuBuffer output, int n, int d, float p);
 
+    /// <summary>
+    /// Histogram of <paramref name="input"/> into <paramref name="bins"/> equal-width bins over
+    /// [mn, mx]; values outside the range are dropped, mx falls in the last bin. <paramref name="hist"/>
+    /// must be pre-zeroed (length bins). Counts accumulate via an atomic float add.
+    /// </summary>
+    void Histc(IGpuBuffer input, IGpuBuffer hist, int n, int bins, float mn, float mx);
+
     #region Comparison Operations
 
     void GreaterThan(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size);

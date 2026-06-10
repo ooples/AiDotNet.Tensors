@@ -811,6 +811,30 @@ public partial class DirectGpuTensorEngine
     }
 
     /// <inheritdoc/>
+    public override Tensor<T> TensorHistc<T>(Tensor<T> input, int bins, T min, T max)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (typeof(T) != typeof(float) || bins <= 0 || !TryGetBackend(out var backend))
+            return base.TensorHistc(input, bins, min, max);
+        float mn = ToFloatScalar(min), mx = ToFloatScalar(max);
+        // min==max means "use the data's own range" — that needs a reduction first, so defer to base.
+        if (!(mn < mx))
+            return base.TensorHistc(input, bins, min, max);
+        try
+        {
+            var c = input.IsContiguous ? input : (Tensor<T>)input.Contiguous();
+            int n = input.Length;
+            using var bufIn = GetOrAllocateBuffer(backend, c.GetDataArray());
+            var bufHist = AllocateOutputBuffer(backend, bins);
+            backend.Fill(bufHist.Buffer, 0f, bins);
+            backend.Histc(bufIn.Buffer, bufHist.Buffer, n, bins, mn, mx);
+            var arr = FinishGpuOp<T>(backend, bufHist, bins);
+            return new Tensor<T>(arr, new[] { bins });
+        }
+        catch (Exception) { return base.TensorHistc(input, bins, min, max); }
+    }
+
+    /// <inheritdoc/>
     public override Tensor<T> TensorPDist<T>(Tensor<T> input, double p = 2.0)
     {
         if (input is null) throw new ArgumentNullException(nameof(input));
