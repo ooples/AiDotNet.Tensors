@@ -330,5 +330,49 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         AssertMatch(gpu, cpu, $"TensorMoveDim[{string.Join("x", shape)};{source}->{destination}]");
     }
 
+    private void AssertChunksMatch(Tensor<float>[] gpu, Tensor<float>[] cpu, string op)
+    {
+        Assert.Equal(cpu.Length, gpu.Length);
+        for (int i = 0; i < cpu.Length; i++)
+            AssertMatch(gpu[i], cpu[i], $"{op}#{i}");
+    }
+
+    public static IEnumerable<object[]> SplitCases() => new List<object[]>
+    {
+        new object[] { new[] { 8, 4 }, 2, 0 },
+        new object[] { new[] { 4, 9 }, 3, 1 },
+        new object[] { new[] { 2, 6, 5 }, 3, 1 },
+        new object[] { new[] { 2, 3, 8 }, 4, 2 },
+        new object[] { new[] { 12 }, 4, 0 },
+    };
+
+    [Theory]
+    [MemberData(nameof(SplitCases))]
+    public void TensorSplit_GpuMatchesCpu(int[] shape, int numSplits, int axis)
+    {
+        if (!EnsureGpuReady()) return;
+        var t = Rand(94, shape);
+        var cpu = _cpu.TensorSplit(t, numSplits, axis);
+        var gpu = _gpu.TensorSplit(t, numSplits, axis);
+        AssertChunksMatch(gpu, cpu, $"TensorSplit[{string.Join("x", shape)};{numSplits};ax{axis}]");
+    }
+
+    public static IEnumerable<object[]> TensorSplitIdxCases() => new List<object[]>
+    {
+        new object[] { new[] { 10, 4 }, new[] { 3, 7 }, 0 },
+        new object[] { new[] { 4, 10 }, new[] { 2, 5, 8 }, 1 },
+        new object[] { new[] { 2, 9, 5 }, new[] { 3 }, 1 },
+    };
+
+    [Theory]
+    [MemberData(nameof(TensorSplitIdxCases))]
+    public void TensorTensorSplit_Indices_GpuMatchesCpu(int[] shape, int[] indices, int dim)
+    {
+        if (!EnsureGpuReady()) return;
+        var t = Rand(95, shape);
+        var cpu = _cpu.TensorTensorSplit(t, indices, dim);
+        var gpu = _gpu.TensorTensorSplit(t, indices, dim);
+        AssertChunksMatch(gpu, cpu, $"TensorTensorSplit[{string.Join("x", shape)};idx={string.Join(",", indices)};dim{dim}]");
+    }
 }
 #endif

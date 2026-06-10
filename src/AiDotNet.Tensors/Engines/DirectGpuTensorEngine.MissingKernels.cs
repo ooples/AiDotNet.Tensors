@@ -386,4 +386,81 @@ public partial class DirectGpuTensorEngine
     // so rather than ship a subtly-wrong niche kernel it stays on the base. Revisit with a single
     // net-transform (k=1/3: one permute+flip; k=2: two flips) once the multi-step GPU chaining
     // divergence is root-caused.
+
+    /// <inheritdoc/>
+    public override Tensor<T>[] TensorTensorSplit<T>(Tensor<T> tensor, int[] indices, int dim = 0)
+    {
+        if (tensor is null) throw new ArgumentNullException(nameof(tensor));
+        if (indices is null) throw new ArgumentNullException(nameof(indices));
+        int rank = tensor.Rank;
+        if (dim < 0) dim += rank;
+        if (dim < 0 || dim >= rank || !TryGetBackend(out _))
+            return base.TensorTensorSplit(tensor, indices, dim);
+
+        // The CPU base slices each chunk on the host (SliceAlongAxis → GetDataArray loops). Extract
+        // every chunk with the GPU-resident TensorSlice instead. The sections/H/V/D-split variants
+        // all funnel through this virtual overload, so they ride along automatically. Empty chunks
+        // (degenerate split points) fall back to base, which handles the zero-length-dim case.
+        try
+        {
+            int dimSize = tensor._shape[dim];
+            var result = new Tensor<T>[indices.Length + 1];
+            int prev = 0;
+            for (int i = 0; i <= indices.Length; i++)
+            {
+                int cur = i < indices.Length ? Math.Min(Math.Max(indices[i], prev), dimSize) : dimSize;
+                int len = cur - prev;
+                if (len <= 0)
+                    return base.TensorTensorSplit(tensor, indices, dim);
+
+                var start = new int[rank];
+                var length = new int[rank];
+                for (int k = 0; k < rank; k++) { start[k] = 0; length[k] = tensor._shape[k]; }
+                start[dim] = prev;
+                length[dim] = len;
+                result[i] = TensorSlice(tensor, start, length);
+                prev = cur;
+            }
+            return result;
+        }
+        catch (Exception) { return base.TensorTensorSplit(tensor, indices, dim); }
+    }
+
+    /// <inheritdoc/>
+    public override Tensor<T>[] TensorSplit<T>(Tensor<T> tensor, int numSplits, int axis = 0)
+    {
+        if (tensor is null) throw new ArgumentNullException(nameof(tensor));
+        if (numSplits <= 0) throw new ArgumentException("Number of splits must be positive", nameof(numSplits));
+        int rank = tensor.Rank;
+        if (axis < 0) axis += rank;
+
+        // Defer: GraphMode/no-GPU (TryGetBackend false → base records the lazy nodes), the packed
+        // NCHWc8 layout (its slicing is physical-layout-specific), and non-divisible sizes (base
+        // throws the proper error). TensorHSplit/VSplit/DSplit funnel through this virtual overload.
+        if (axis < 0 || axis >= rank
+            || tensor.Layout == LinearAlgebra.TensorLayout.Nchwc8
+            || !TryGetBackend(out _))
+            return base.TensorSplit(tensor, numSplits, axis);
+
+        int axisSize = tensor._shape[axis];
+        if (axisSize % numSplits != 0)
+            return base.TensorSplit(tensor, numSplits, axis);
+
+        try
+        {
+            int splitSize = axisSize / numSplits;
+            var result = new Tensor<T>[numSplits];
+            for (int i = 0; i < numSplits; i++)
+            {
+                var start = new int[rank];
+                var length = new int[rank];
+                for (int k = 0; k < rank; k++) { start[k] = 0; length[k] = tensor._shape[k]; }
+                start[axis] = i * splitSize;
+                length[axis] = splitSize;
+                result[i] = TensorSlice(tensor, start, length);   // GPU-resident chunk
+            }
+            return result;
+        }
+        catch (Exception) { return base.TensorSplit(tensor, numSplits, axis); }
+    }
 }
