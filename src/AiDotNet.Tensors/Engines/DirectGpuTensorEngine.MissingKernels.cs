@@ -509,4 +509,38 @@ public partial class DirectGpuTensorEngine
         }
         catch (Exception) { return base.TensorClampMax(tensor, max); }
     }
+
+    // ----- Category C: gather / scatter (wiring existing backend kernels) -----
+    // Gather ops are read-only (no atomics) so they wire safely. Scatter-add (atomicAdd) is
+    // deliberately NOT wired here — a prior engine-level ScatterAdd wiring diverged from CPU
+    // (see the note at DirectGpuTensorEngine.TensorGather), so it needs careful A/B validation
+    // across the shape grid before re-adding; until then it stays on the correct CPU base.
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorTake<T>(Tensor<T> tensor, Tensor<int> indices)
+    {
+        if (tensor is null) throw new ArgumentNullException(nameof(tensor));
+        if (indices is null) throw new ArgumentNullException(nameof(indices));
+        if (!TryGetBackend(out var backend))
+            return base.TensorTake(tensor, indices);
+
+        // Flat gather: dst[i] = flat(tensor)[indices[i]]. The backend Gather kernel with featureSize=1
+        // is exactly this (output[i] = source[indices[i]]). Output shape = indices.shape.
+        try
+        {
+            var src = tensor.IsContiguous ? tensor : tensor.Contiguous();
+            int n = indices.Length;
+            using var bufSrc = GetOrAllocateBuffer(backend, src.GetDataArray());
+            using var bufIdx = backend.AllocateIntBuffer(indices.GetDataArray());
+            var bufOut = AllocateOutputBuffer(backend, n);
+            backend.Gather(bufSrc.Buffer, bufIdx, bufOut.Buffer, n, 1);
+            var result = FinishGpuOp<T>(backend, bufOut, n);
+            var output = new Tensor<T>(result, (int[])indices._shape.Clone());
+            Autodiff.DifferentiableOps.RecordUnary("TensorTake", output, tensor,
+                Autodiff.BackwardFunctions<T>.TakeBackward,
+                new object[] { indices, (int[])tensor._shape.Clone() });
+            return output;
+        }
+        catch (Exception) { return base.TensorTake(tensor, indices); }
+    }
 }

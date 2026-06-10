@@ -402,5 +402,27 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         var gpu = _gpu.TensorClampMax(t, max);
         AssertMatch(gpu, cpu, $"TensorClampMax[{max}]");
     }
+
+    // ----- Category C: gather -----
+
+    public static IEnumerable<object[]> TakeCases() => new List<object[]>
+    {
+        new object[] { new[] { 5, 4 }, new[] { 0, 7, 19, 3 } },              // flat indices into [5,4]=20
+        new object[] { new[] { 12 }, new[] { 11, 0, 5, 5, 2 } },             // 1-D, repeats
+        new object[] { new[] { 3, 3, 3 }, new[] { 26, 0, 13 } },             // 3-D source
+        new object[] { new[] { 8 }, new[] { 7 } },                          // single
+    };
+
+    [Theory]
+    [MemberData(nameof(TakeCases))]
+    public void TensorTake_GpuMatchesCpu(int[] shape, int[] flatIndices)
+    {
+        if (!EnsureGpuReady()) return;
+        var t = Rand(98, shape);
+        var idx = new Tensor<int>(flatIndices, new[] { flatIndices.Length });
+        var cpu = _cpu.TensorTake(t, idx);
+        var gpu = _gpu.TensorTake(t, idx);
+        AssertMatch(gpu, cpu, $"TensorTake[{string.Join("x", shape)};n={flatIndices.Length}]");
+    }
 }
 #endif
