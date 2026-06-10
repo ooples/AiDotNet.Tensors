@@ -177,6 +177,32 @@ __kernel void cdist(__global const float* x1, __global const float* x2, __global
     }
     output[idx] = (p == 1.0f) ? sum : (p == 2.0f) ? sqrt(sum) : pow(sum, 1.0f / p);
 }
+// RWKV-7 (WKV7 generalized delta rule) sequence forward. One thread per (batch, head); the sequence is
+// scanned sequentially while a per-(b,h) state matrix S[headDim,headDim] lives in global scratch Sbuf.
+// State: S[di,vi] = sig(A)*S[di,vi] + (sig(B[di])*K[di])*V[vi]; readout: out[di] = sig(R[di]) * sum_vi S[di,vi]*K[vi].
+__kernel void rwkv7_forward(__global const float* R, __global const float* K, __global const float* V,
+    __global const float* A, __global const float* B, __global float* outp, __global float* Sbuf,
+    int batch, int seqLen, int modelDim, int numHeads, int headDim) {
+    int bh = get_global_id(0); if (bh >= batch * numHeads) return;
+    int b = bh / numHeads; int h = bh % numHeads;
+    int hOff = h * headDim; int hh = headDim * headDim;
+    __global float* S = Sbuf + bh * hh;
+    for (int i = 0; i < hh; i++) S[i] = 0.0f;
+    for (int t = 0; t < seqLen; t++) {
+        int baseOff = (b * seqLen + t) * modelDim + hOff;
+        for (int di = 0; di < headDim; di++) {
+            float ga = 1.0f / (1.0f + exp(-A[baseOff + di]));
+            float gbk = (1.0f / (1.0f + exp(-B[baseOff + di]))) * K[baseOff + di];
+            int srow = di * headDim;
+            for (int vi = 0; vi < headDim; vi++) S[srow + vi] = ga * S[srow + vi] + gbk * V[baseOff + vi];
+        }
+        for (int di = 0; di < headDim; di++) {
+            int srow = di * headDim; float sk = 0.0f;
+            for (int vi = 0; vi < headDim; vi++) sk += S[srow + vi] * K[baseOff + vi];
+            outp[baseOff + di] = (1.0f / (1.0f + exp(-R[baseOff + di]))) * sk;
+        }
+    }
+}
 // One bitonic compare-exchange step. values/indices are numRows rows of length rowLen (a power of 2).
 // k = current bitonic sequence size, j = compare distance. NaN is treated as +inf (torch.sort order).
 __kernel void bitonic_step(__global float* values, __global float* indices, int rowLen, int k, int j, int numRows, int descending) {
@@ -269,7 +295,7 @@ __kernel void next_after(__global const float* a, __global const float* b, __glo
             "diag_kernel", "extract_diag_kernel", "triangular_mask",
             "masked_fill_kernel", "index_select", "take_along_dim",
             "cross3", "ldexp_kernel", "kron2d", "search_sorted", "next_after", "index_write", "cdist", "pdist",
-            "histc", "bitonic_step", "copy_rows", "iota_pad"
+            "histc", "bitonic_step", "copy_rows", "iota_pad", "rwkv7_forward"
         };
     }
 }

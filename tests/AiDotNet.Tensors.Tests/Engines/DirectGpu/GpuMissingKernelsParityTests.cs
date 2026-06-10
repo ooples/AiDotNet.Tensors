@@ -501,6 +501,23 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
     }
 
     [Theory]
+    [InlineData(1, 4, 8, 2)]
+    [InlineData(2, 5, 12, 3)]
+    [InlineData(2, 6, 16, 4)]
+    public void Rwkv7SequenceForward_GpuMatchesCpu(int batch, int seq, int modelDim, int numHeads)
+    {
+        if (!EnsureGpuReady()) return;
+        var r = Rand(260, batch, seq, modelDim);
+        var k = Rand(261, batch, seq, modelDim);
+        var v = Rand(262, batch, seq, modelDim);
+        var a = Rand(263, batch, seq, modelDim);
+        var b = Rand(264, batch, seq, modelDim);
+        var cpu = _cpu.Rwkv7SequenceForward(r, k, v, a, b, numHeads);
+        var gpu = _gpu.Rwkv7SequenceForward(r, k, v, a, b, numHeads);
+        AssertMatch(gpu, cpu, $"RWKV7[b{batch};s{seq};d{modelDim};h{numHeads}]");
+    }
+
+    [Theory]
     [InlineData(2, 5, 4, 6, false)]
     [InlineData(2, 5, 4, 6, true)]
     [InlineData(3, 7, 8, 5, true)]

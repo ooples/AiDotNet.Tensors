@@ -1503,6 +1503,49 @@ public partial class DirectGpuTensorEngine
     }
 
     /// <inheritdoc/>
+    public override Tensor<T> Rwkv7SequenceForward<T>(
+        Tensor<T> rProj, Tensor<T> kProj, Tensor<T> vProj, Tensor<T> aProj, Tensor<T> bProj, int numHeads)
+    {
+        if (rProj is null) throw new ArgumentNullException(nameof(rProj));
+        if (kProj is null) throw new ArgumentNullException(nameof(kProj));
+        if (vProj is null) throw new ArgumentNullException(nameof(vProj));
+        if (aProj is null) throw new ArgumentNullException(nameof(aProj));
+        if (bProj is null) throw new ArgumentNullException(nameof(bProj));
+        if (typeof(T) != typeof(float) || rProj.Rank != 3 || numHeads < 1 || !TryGetBackend(out var backend))
+            return base.Rwkv7SequenceForward(rProj, kProj, vProj, aProj, bProj, numHeads);
+        int batch = rProj._shape[0], seqLen = rProj._shape[1], modelDim = rProj._shape[2];
+        if (modelDim % numHeads != 0
+            || !ShapesEqual(kProj._shape, rProj._shape) || !ShapesEqual(vProj._shape, rProj._shape)
+            || !ShapesEqual(aProj._shape, rProj._shape) || !ShapesEqual(bProj._shape, rProj._shape))
+            return base.Rwkv7SequenceForward(rProj, kProj, vProj, aProj, bProj, numHeads);
+        int headDim = modelDim / numHeads;
+        try
+        {
+            var cr = rProj.IsContiguous ? rProj : (Tensor<T>)rProj.Contiguous();
+            var ck = kProj.IsContiguous ? kProj : (Tensor<T>)kProj.Contiguous();
+            var cv = vProj.IsContiguous ? vProj : (Tensor<T>)vProj.Contiguous();
+            var ca = aProj.IsContiguous ? aProj : (Tensor<T>)aProj.Contiguous();
+            var cb = bProj.IsContiguous ? bProj : (Tensor<T>)bProj.Contiguous();
+            int total = batch * seqLen * modelDim;
+            using var bufR = GetOrAllocateBuffer(backend, cr.GetDataArray());
+            using var bufK = GetOrAllocateBuffer(backend, ck.GetDataArray());
+            using var bufV = GetOrAllocateBuffer(backend, cv.GetDataArray());
+            using var bufA = GetOrAllocateBuffer(backend, ca.GetDataArray());
+            using var bufB = GetOrAllocateBuffer(backend, cb.GetDataArray());
+            using var bufS = AllocateOutputBuffer(backend, batch * numHeads * headDim * headDim);
+            var bufOut = AllocateOutputBuffer(backend, total);
+            backend.Rwkv7Forward(bufR.Buffer, bufK.Buffer, bufV.Buffer, bufA.Buffer, bufB.Buffer, bufOut.Buffer,
+                bufS.Buffer, batch, seqLen, modelDim, numHeads, headDim);
+            var arr = FinishGpuOp<T>(backend, bufOut, total);
+            return new Tensor<T>(arr, new[] { batch, seqLen, modelDim });
+        }
+        catch (Exception)
+        {
+            return base.Rwkv7SequenceForward(rProj, kProj, vProj, aProj, bProj, numHeads);
+        }
+    }
+
+    /// <inheritdoc/>
     public override Tensor<T> LstmSequenceForward<T>(
         Tensor<T> input, Tensor<T>? h0, Tensor<T>? c0, Tensor<T> wIh, Tensor<T> wHh,
         Tensor<T>? bIh, Tensor<T>? bHh, bool returnSequences = false)

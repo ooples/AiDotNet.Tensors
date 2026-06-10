@@ -1965,6 +1965,13 @@ public interface IDirectGpuBackend : IDisposable
     /// <summary>Initialize padded index rows: idx[r*P + i] = (i &lt; L) ? i : -1.</summary>
     void IotaPad(IGpuBuffer idx, int l, int p, int numRows);
 
+    /// <summary>
+    /// RWKV-7 (WKV7 generalized delta rule) sequence forward, parallel over (batch, head) with a
+    /// per-(b,h) [headDim,headDim] state in the <paramref name="sbuf"/> scratch (size batch*numHeads*headDim^2).
+    /// </summary>
+    void Rwkv7Forward(IGpuBuffer r, IGpuBuffer k, IGpuBuffer v, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output,
+        IGpuBuffer sbuf, int batch, int seqLen, int modelDim, int numHeads, int headDim);
+
     #region Comparison Operations
 
     void GreaterThan(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size);

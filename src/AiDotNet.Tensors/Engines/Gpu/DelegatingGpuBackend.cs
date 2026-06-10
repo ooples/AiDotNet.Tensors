@@ -1456,6 +1456,8 @@ public class DelegatingGpuBackend : IDirectGpuBackend
     public virtual void CopyRows(IGpuBuffer src, IGpuBuffer dst, int srcRowLen, int dstRowLen, int numRows, int copyLen) => Inner.CopyRows(src, dst, srcRowLen, dstRowLen, numRows, copyLen);
     /// <inheritdoc/>
     public virtual void IotaPad(IGpuBuffer idx, int l, int p, int numRows) => Inner.IotaPad(idx, l, p, numRows);
+    /// <inheritdoc/>
+    public virtual void Rwkv7Forward(IGpuBuffer r, IGpuBuffer k, IGpuBuffer v, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, IGpuBuffer sbuf, int batch, int seqLen, int modelDim, int numHeads, int headDim) => Inner.Rwkv7Forward(r, k, v, a, b, output, sbuf, batch, seqLen, modelDim, numHeads, headDim);
 
     /// <inheritdoc/>
     public virtual void Where(IGpuBuffer condition, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
