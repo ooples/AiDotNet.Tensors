@@ -158,5 +158,29 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         var gpu = _gpu.TensorMatMul2DWithPrePackedB(a, b, packed);
         AssertMatch(gpu, cpu, $"TensorMatMul2DWithPrePackedB[{m},{k},{n}]");
     }
+
+    public static IEnumerable<object[]> ChainDims() => new List<object[]>
+    {
+        new object[] { new[] { 4, 4 } },                 // single product
+        new object[] { new[] { 8, 16, 8 } },             // 2 products, narrow middle
+        new object[] { new[] { 32, 4, 64, 8 } },         // 3 products, order matters
+        new object[] { new[] { 5, 7, 3, 9, 4 } },        // 4 products, irregular dims
+        new object[] { new[] { 64, 64, 64, 64 } },       // square chain
+    };
+
+    [Theory]
+    [MemberData(nameof(ChainDims))]
+    public void TensorMultiDot_GpuMatchesCpu(int[] dims)
+    {
+        if (!EnsureGpuReady()) return;
+        int count = dims.Length - 1;
+        var mats = new Tensor<float>[count];
+        for (int i = 0; i < count; i++)
+            mats[i] = Rand(40 + i, dims[i], dims[i + 1]);
+
+        var cpu = _cpu.TensorMultiDot(mats);
+        var gpu = _gpu.TensorMultiDot(mats);
+        AssertMatch(gpu, cpu, $"TensorMultiDot[{string.Join("x", dims)}]");
+    }
 }
 #endif

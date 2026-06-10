@@ -96,4 +96,65 @@ public partial class DirectGpuTensorEngine
             return base.TensorVecDot(a, b);
         }
     }
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorMultiDot<T>(Tensor<T>[] matrices)
+    {
+        if (matrices is null) throw new ArgumentNullException(nameof(matrices));
+        if (matrices.Length == 0) throw new ArgumentException("MultiDot requires at least one matrix");
+        if (matrices.Length == 1) return matrices[0];
+
+        // The CPU base routes the chain through TensorEinsum (host). Multiply the chain with the
+        // device-resident GPU GEMM instead. Require all-2-D with chained inner dims (the GPU GEMM
+        // path); otherwise defer to base. GraphMode / no-GPU also defer.
+        if (!TryGetBackend(out _))
+            return base.TensorMultiDot(matrices);
+        foreach (var mt in matrices)
+            if (mt is null || mt.Rank != 2)
+                return base.TensorMultiDot(matrices);
+        for (int i = 1; i < matrices.Length; i++)
+            if (matrices[i - 1]._shape[1] != matrices[i]._shape[0])
+                return base.TensorMultiDot(matrices);
+
+        try
+        {
+            // Classic matrix-chain DP to pick the parenthesization that minimizes total GEMM
+            // FLOPs (same optimization the CPU einsum greedy-path does), then multiply on the GPU.
+            int nM = matrices.Length;
+            var dims = new int[nM + 1];
+            dims[0] = matrices[0]._shape[0];
+            for (int i = 0; i < nM; i++) dims[i + 1] = matrices[i]._shape[1];
+
+            var cost = new long[nM, nM];
+            var split = new int[nM, nM];
+            for (int len = 2; len <= nM; len++)
+                for (int i = 0; i + len - 1 < nM; i++)
+                {
+                    int j = i + len - 1;
+                    cost[i, j] = long.MaxValue;
+                    for (int s = i; s < j; s++)
+                    {
+                        long c = cost[i, s] + cost[s + 1, j] + (long)dims[i] * dims[s + 1] * dims[j + 1];
+                        if (c < cost[i, j]) { cost[i, j] = c; split[i, j] = s; }
+                    }
+                }
+
+            return MultiplyChainOnGpu(matrices, split, 0, nM - 1);
+        }
+        catch (Exception)
+        {
+            return base.TensorMultiDot(matrices);
+        }
+    }
+
+    // Recursively multiply matrices[i..j] in the optimal order from the chain-DP split table,
+    // using the GPU-resident TensorMatMul (which records MatMulBackward for each product).
+    private Tensor<T> MultiplyChainOnGpu<T>(Tensor<T>[] m, int[,] split, int i, int j)
+    {
+        if (i == j) return m[i];
+        int s = split[i, j];
+        var left = MultiplyChainOnGpu(m, split, i, s);
+        var right = MultiplyChainOnGpu(m, split, s + 1, j);
+        return TensorMatMul(left, right);
+    }
 }
