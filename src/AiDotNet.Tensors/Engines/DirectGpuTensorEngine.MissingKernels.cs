@@ -728,6 +728,57 @@ public partial class DirectGpuTensorEngine
     // the source of the deep interleaved-chain divergence), this runs the backend Permute kernel into a
     // fresh CONTIGUOUS device buffer and returns a deferred GPU-resident result. Use this for multi-step
     // GPU compositions so each stage hands the next a correctly-laid-out resident buffer.
+    /// <inheritdoc/>
+    public override Tensor<T> TensorBroadcastTo<T>(Tensor<T> input, int[] targetShape)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (targetShape is null) throw new ArgumentNullException(nameof(targetShape));
+
+        // Tape-active / no-GPU / rank-shrink defer to base (which records BroadcastToBackward and
+        // validates). The base also keeps Tier 1 (identity) and Tier 2 (pure size-1 prepend == Reshape)
+        // already GPU-resident, so we only need the genuine Tier-3 size-1→N expansion here.
+        if (IsTapeActive<T>() || targetShape.Length < input.Rank || !TryGetBatchBackend(out var backend))
+            return base.TensorBroadcastTo(input, targetShape);
+
+        try
+        {
+            // Align to the target rank by prepending size-1 axes (a residency-preserving reshape).
+            Tensor<T> cur = input;
+            if (targetShape.Length > input.Rank)
+            {
+                var aligned = new int[targetShape.Length];
+                int rd = targetShape.Length - input.Rank;
+                for (int i = 0; i < rd; i++) aligned[i] = 1;
+                for (int i = 0; i < input.Rank; i++) aligned[rd + i] = input._shape[i];
+                cur = cur.Reshape(aligned);
+            }
+
+            // Expand each broadcast axis (size 1 → target) with the GPU TileAxis kernel. With the
+            // strided-view materialize fix in GetOrAllocateBuffer, this multi-step chain stays correct
+            // and device-resident. A genuinely incompatible axis falls back to base (which throws).
+            for (int d = 0; d < targetShape.Length; d++)
+            {
+                if (cur._shape[d] == targetShape[d]) continue;
+                if (cur._shape[d] != 1) return base.TensorBroadcastTo(input, targetShape);
+
+                int repeats = targetShape[d];
+                int outerSize = 1; for (int i = 0; i < d; i++) outerSize *= cur._shape[i];
+                int innerSize = 1; for (int i = d + 1; i < cur.Rank; i++) innerSize *= cur._shape[i];
+
+                var src = cur.IsContiguous ? cur : (Tensor<T>)cur.Contiguous();
+                using var bufIn = GetOrAllocateBuffer(backend, src.GetDataArray());
+                var bufOut = AllocateOutputBuffer(backend, src.Length * repeats);
+                backend.TileAxis(bufIn.Buffer, bufOut.Buffer, outerSize, /*axisSize:*/ 1, innerSize, repeats);
+                var arr = FinishGpuOp<T>(backend, bufOut, src.Length * repeats);
+                var newShape = (int[])cur._shape.Clone();
+                newShape[d] = repeats;
+                cur = new Tensor<T>(arr, newShape);
+            }
+            return cur;
+        }
+        catch (Exception) { return base.TensorBroadcastTo(input, targetShape); }
+    }
+
     private Tensor<T> PermuteResidentGpu<T>(IDirectGpuBackend backend, Tensor<T> tensor, int[] axes)
     {
         var src = tensor.IsContiguous ? tensor : (Tensor<T>)tensor.Contiguous();

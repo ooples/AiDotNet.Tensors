@@ -500,6 +500,27 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         AssertMatch(gpu, cpu, $"TensorRepeatInterleave[{string.Join("x", shape)};r={repeats}]");
     }
 
+    // General broadcast (size-1 → N at arbitrary axes, incl. rank expansion).
+    public static IEnumerable<object[]> BroadcastCases() => new List<object[]>
+    {
+        new object[] { new[] { 1, 4 }, new[] { 3, 4 } },           // broadcast axis 0
+        new object[] { new[] { 4, 1 }, new[] { 4, 5 } },           // broadcast axis 1
+        new object[] { new[] { 1, 3, 1 }, new[] { 2, 3, 5 } },     // two broadcast axes
+        new object[] { new[] { 4 }, new[] { 2, 3, 4 } },           // rank expansion + identical tail
+        new object[] { new[] { 3, 1 }, new[] { 2, 3, 6 } },        // rank expansion + broadcast
+    };
+
+    [Theory]
+    [MemberData(nameof(BroadcastCases))]
+    public void TensorBroadcastTo_GpuMatchesCpu(int[] shape, int[] target)
+    {
+        if (!EnsureGpuReady()) return;
+        var t = Rand(140, shape);
+        var cpu = _cpu.TensorBroadcastTo(t, target);
+        var gpu = _gpu.TensorBroadcastTo(t, target);
+        AssertMatch(gpu, cpu, $"TensorBroadcastTo[{string.Join("x", shape)}->{string.Join("x", target)}]");
+    }
+
     // Engine-fix regression: a deep INTERLEAVED chain of the view-returning TensorPermute and
     // TensorFlip (flip∘permute∘flip∘permute). Before the GetOrAllocateBuffer materialize-strided-views
     // fix, this diverged (~1.6) because a strided permute view of a deferred tensor read the source's
