@@ -1471,6 +1471,10 @@ public class DelegatingGpuBackend : IDirectGpuBackend
     /// <inheritdoc/>
     public virtual void ShiftedDiff(IGpuBuffer x, IGpuBuffer mask, int n) => Inner.ShiftedDiff(x, mask, n);
     /// <inheritdoc/>
+    public virtual void ReflectPad1d(IGpuBuffer input, IGpuBuffer output, int batch, int l, int lp, int pad) => Inner.ReflectPad1d(input, output, batch, l, lp, pad);
+    /// <inheritdoc/>
+    public virtual void StftMagPhase(IGpuBuffer padded, IGpuBuffer window, IGpuBuffer mag, IGpuBuffer phase, int batch, int lp, int nFft, int hop, int numFrames, int numFreqs) => Inner.StftMagPhase(padded, window, mag, phase, batch, lp, nFft, hop, numFrames, numFreqs);
+    /// <inheritdoc/>
     public virtual void HistogramDD(IGpuBuffer samples, IGpuBuffer hist, IGpuBuffer bins, IGpuBuffer mins, IGpuBuffer maxs, int n, int d) => Inner.HistogramDD(samples, hist, bins, mins, maxs, n, d);
     /// <inheritdoc/>
     public virtual void MasksToBoxes(IGpuBuffer masks, IGpuBuffer output, int n, int h, int w) => Inner.MasksToBoxes(masks, output, n, h, w);

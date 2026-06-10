@@ -235,6 +235,35 @@ __kernel void pairwise_iou(__global const float* boxes, __global float* iou, int
     float inter = iw*ih; float uni = ai+aj-inter;
     iou[idx] = (uni > 0.0f) ? inter/uni : 0.0f;
 }
+// reflect_pad_1d: numpy-style reflect pad of the last axis by `pad` each side (edge sample excluded).
+__kernel void reflect_pad_1d(__global const float* inp, __global float* outp, int batch, int L, int Lp, int pad) {
+    int idx = get_global_id(0); if (idx >= batch*Lp) return;
+    int j = idx % Lp; int b = idx / Lp;
+    int src;
+    if (j < pad) src = pad - j;
+    else if (j < pad + L) src = j - pad;
+    else src = L - 2 - (j - pad - L);
+    outp[idx] = inp[b*L + src];
+}
+// stft_mag_phase: per (b,k,frame) compute the DFT bin k of the windowed frame -> magnitude + phase.
+// out layout [b][k*numFrames + frame]. Matches CpuEngine.STFT (window applied, mag=hypot, phase=atan2).
+__kernel void stft_mag_phase(__global const float* padded, __global const float* window,
+    __global float* mag, __global float* phase, int batch, int Lp, int nFft, int hop, int numFrames, int numFreqs) {
+    int idx = get_global_id(0); int total = batch*numFreqs*numFrames; if (idx >= total) return;
+    int frame = idx % numFrames; int tmp = idx / numFrames;
+    int k = tmp % numFreqs; int b = tmp / numFreqs;
+    int start = frame * hop; int inOff = b * Lp;
+    float re = 0.0f; float im = 0.0f;
+    float bk = -2.0f * M_PI_F * (float)k / (float)nFft;
+    for (int i = 0; i < nFft; i++) {
+        float x = padded[inOff + start + i] * window[i];
+        float a = bk * (float)i;
+        re += x * cos(a); im += x * sin(a);
+    }
+    int outOff = b*numFreqs*numFrames + k*numFrames + frame;
+    mag[outOff] = sqrt(re*re + im*im);
+    phase[outOff] = atan2(im, re);
+}
 // shifted_diff: mask[i] = (i==0 || x[i] != x[i-1]) ? 1 : 0  (consecutive-unique keep mask).
 __kernel void shifted_diff(__global const float* x, __global float* mask, int n) {
     int i = get_global_id(0); if (i >= n) return;
@@ -519,7 +548,7 @@ __kernel void next_after(__global const float* a, __global const float* b, __glo
             "masked_fill_kernel", "index_select", "take_along_dim",
             "cross3", "ldexp_kernel", "kron2d", "search_sorted", "next_after", "index_write", "cdist", "pdist",
             "histc", "bitonic_step", "copy_rows", "iota_pad", "rwkv7_forward", "hsoftmax_paths",
-            "isin", "unfold", "copy_block_2d", "scatter_reduce", "zeta_kernel", "polygamma_kernel", "shifted_diff", "histogramdd", "masks_to_boxes", "pairwise_iou", "logical_op", "logical_not", "gridsample_backward_input", "gridsample_backward_grid"
+            "isin", "unfold", "copy_block_2d", "scatter_reduce", "zeta_kernel", "polygamma_kernel", "reflect_pad_1d", "stft_mag_phase", "shifted_diff", "histogramdd", "masks_to_boxes", "pairwise_iou", "logical_op", "logical_not", "gridsample_backward_input", "gridsample_backward_grid"
         };
     }
 }

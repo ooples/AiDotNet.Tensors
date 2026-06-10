@@ -756,6 +756,17 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
     }
 
     [Fact]
+    public void Spectrogram_GpuMatchesCpu()
+    {
+        if (!EnsureGpuReady()) return;
+        int nFft = 16, hop = 4;
+        var wave = Rand(350, 64);                 // rank-1 waveform
+        AssertMatch(_gpu.Spectrogram(wave, nFft, hop, nFft), _cpu.Spectrogram(wave, nFft, hop, nFft), "Spectrogram1d");
+        var waveB = Rand(351, 2, 48);             // batched waveform
+        AssertMatch(_gpu.Spectrogram(waveB, nFft, hop, nFft), _cpu.Spectrogram(waveB, nFft, hop, nFft), "SpectrogramBatch");
+    }
+
+    [Fact]
     public void BatchedNms_GpuMatchesCpu()
     {
         if (!EnsureGpuReady()) return;

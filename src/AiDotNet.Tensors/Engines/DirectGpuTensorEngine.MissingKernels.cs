@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using AiDotNet.Tensors;
+using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.LinearAlgebra;
 
@@ -1642,6 +1643,69 @@ public partial class DirectGpuTensorEngine
             return res;
         }
         catch (Exception) { return base.TensorHistogramDD(samples, bins, mins, maxs); }
+    }
+
+    /// <inheritdoc/>
+    public override Tensor<T> Spectrogram<T>(Tensor<T> waveform, int nFft, int hopLength, int winLength, Tensor<T>? window = null)
+    {
+        if (waveform is null) throw new ArgumentNullException(nameof(waveform));
+        if (typeof(T) != typeof(float) || nFft <= 0 || hopLength <= 0 || !TryGetBackend(out var backend))
+            return base.Spectrogram(waveform, nFft, hopLength, winLength, window);
+        // Build the window (must be length nFft for STFT). Match CpuEngine.HannWindow exactly.
+        Tensor<T> win;
+        if (window is not null) win = window;
+        else
+        {
+            var warr = new T[winLength];
+            var wf = (float[])(object)warr;
+            for (int i = 0; i < winLength; i++)
+                wf[i] = (float)(0.5 - 0.5 * System.Math.Cos(2.0 * System.Math.PI * i / System.Math.Max(1, winLength - 1)));
+            win = new Tensor<T>(warr, new[] { winLength });
+        }
+        if (win.Length != nFft)
+            return base.Spectrogram(waveform, nFft, hopLength, winLength, window);
+        try
+        {
+            int rank = waveform.Rank;
+            int L = waveform._shape[rank - 1];
+            int pad = nFft / 2;                 // Spectrogram always uses STFT center:true
+            int Lp = L + 2 * pad;
+            int batch = L == 0 ? 0 : waveform.Length / L;
+            int numFrames = (Lp - nFft) / hopLength + 1;
+            int numFreqs = nFft / 2 + 1;
+            if (batch == 0 || numFrames <= 0 || pad >= L)   // reflect needs pad < L
+                return base.Spectrogram(waveform, nFft, hopLength, winLength, window);
+            var newShape = new int[rank + 1];
+            for (int i = 0; i < rank - 1; i++) newShape[i] = waveform._shape[i];
+            newShape[rank - 1] = numFreqs;
+            newShape[rank] = numFrames;
+            int outLen = batch * numFreqs * numFrames;
+
+            var cw = waveform.IsContiguous ? waveform : (Tensor<T>)waveform.Contiguous();
+            var cwin = win.IsContiguous ? win : (Tensor<T>)win.Contiguous();
+            using var bufWave = GetOrAllocateBuffer(backend, cw.GetDataArray());     // waveform stays resident
+            using var bufWin = GetOrAllocateBuffer(backend, cwin.GetDataArray());
+            using var bufPadded = AllocateOutputBuffer(backend, batch * Lp);
+            backend.ReflectPad1d(bufWave.Buffer, bufPadded.Buffer, batch, L, Lp, pad);
+            var bufMag = AllocateOutputBuffer(backend, outLen);
+            var bufPhase = AllocateOutputBuffer(backend, outLen);
+            backend.StftMagPhase(bufPadded.Buffer, bufWin.Buffer, bufMag.Buffer, bufPhase.Buffer, batch, Lp, nFft, hopLength, numFrames, numFreqs);
+            // Force the stft compute to finish while the intermediate `bufPadded` is still alive (it is
+            // `using` and feeds the kernel). FinishGpuOp only defers the DOWNLOAD, not the compute, so
+            // without this the padded buffer could be freed before a deferred materialization runs the
+            // kernel — a use-after-free. mag/phase still stay GPU-resident (deferred download).
+            backend.Synchronize();
+            var magArr = FinishGpuOp<T>(backend, bufMag, outLen);
+            var phaseArr = FinishGpuOp<T>(backend, bufPhase, outLen);
+            var mag = new Tensor<T>(magArr, newShape);
+            var phase = new Tensor<T>(phaseArr, (int[])newShape.Clone());
+            int origLength = waveform._shape[rank - 1];
+            // Same backward contract as the base (phase piped through ISTFT); no-op when no tape is active.
+            DifferentiableOps.RecordUnary("Spectrogram", mag, waveform,
+                BackwardFunctions<T>.SpectrogramBackward, new object[] { nFft, hopLength, win, phase, origLength });
+            return mag;
+        }
+        catch (Exception) { return base.Spectrogram(waveform, nFft, hopLength, winLength, window); }
     }
 
     /// <inheritdoc/>

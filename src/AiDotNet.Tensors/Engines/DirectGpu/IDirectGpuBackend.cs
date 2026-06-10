@@ -1993,6 +1993,12 @@ public interface IDirectGpuBackend : IDisposable
     /// <summary>mask[i] = (i==0 || x[i] != x[i-1]) ? 1 : 0 (consecutive-unique keep mask).</summary>
     void ShiftedDiff(IGpuBuffer x, IGpuBuffer mask, int n);
 
+    /// <summary>Reflect-pad the last axis by `pad` each side (numpy reflect, edge excluded).</summary>
+    void ReflectPad1d(IGpuBuffer input, IGpuBuffer output, int batch, int l, int lp, int pad);
+
+    /// <summary>STFT magnitude+phase: per (b,k,frame) DFT bin of the windowed frame. out [b][k*numFrames+frame].</summary>
+    void StftMagPhase(IGpuBuffer padded, IGpuBuffer window, IGpuBuffer mag, IGpuBuffer phase, int batch, int lp, int nFft, int hop, int numFrames, int numFreqs);
+
     /// <summary>D-dim histogram (atomic). bins int[D], mins/maxs float[D]; hist pre-zeroed length prod(bins).</summary>
     void HistogramDD(IGpuBuffer samples, IGpuBuffer hist, IGpuBuffer bins, IGpuBuffer mins, IGpuBuffer maxs, int n, int d);
 
