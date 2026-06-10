@@ -679,6 +679,24 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
     }
 
     [Fact]
+    public void TensorNonzero_GpuMatchesCpu()
+    {
+        if (!EnsureGpuReady()) return;
+        var data = new float[] { 0f, 1f, 0f, 0f, 2f, 0f, 3f, 0f, 0f, 4f, 5f, 0f };
+        var t = new Tensor<float>(data, new[] { 3, 4 });
+        Assert.Equal(_cpu.TensorNonzero(t).ToArray(), _gpu.TensorNonzero(t).ToArray());
+    }
+
+    [Fact]
+    public void TensorUniqueConsecutive_GpuMatchesCpu()
+    {
+        if (!EnsureGpuReady()) return;
+        var data = new float[] { 1f, 1f, 2f, 2f, 2f, 3f, 1f, 1f, 4f };
+        var t = new Tensor<float>(data, new[] { 9 });
+        AssertMatch(_gpu.TensorUniqueConsecutive(t), _cpu.TensorUniqueConsecutive(t), "UniqueConsecutive");
+    }
+
+    [Fact]
     public void TensorZeta_GpuMatchesCpu()
     {
         if (!EnsureGpuReady()) return;

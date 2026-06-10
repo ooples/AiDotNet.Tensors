@@ -194,6 +194,11 @@ __kernel void hsoftmax_paths(__global const float* acts, __global float* out, in
     }
     out[idx] = prob;
 }
+// shifted_diff: mask[i] = (i==0 || x[i] != x[i-1]) ? 1 : 0  (consecutive-unique keep mask).
+__kernel void shifted_diff(__global const float* x, __global float* mask, int n) {
+    int i = get_global_id(0); if (i >= n) return;
+    mask[i] = (i == 0 || x[i] != x[i-1]) ? 1.0f : 0.0f;
+}
 // Hurwitz zeta zeta(x,q) = sum (k+q)^-x via Euler-Maclaurin with 8 Bernoulli corrections (mirrors CPU).
 float zeta_scalar(float x, float q) {
     if (x == 1.0f) return INFINITY;
@@ -406,7 +411,7 @@ __kernel void next_after(__global const float* a, __global const float* b, __glo
             "masked_fill_kernel", "index_select", "take_along_dim",
             "cross3", "ldexp_kernel", "kron2d", "search_sorted", "next_after", "index_write", "cdist", "pdist",
             "histc", "bitonic_step", "copy_rows", "iota_pad", "rwkv7_forward", "hsoftmax_paths",
-            "isin", "unfold", "copy_block_2d", "scatter_reduce", "zeta_kernel", "polygamma_kernel"
+            "isin", "unfold", "copy_block_2d", "scatter_reduce", "zeta_kernel", "polygamma_kernel", "shifted_diff"
         };
     }
 }

@@ -1469,6 +1469,8 @@ public class DelegatingGpuBackend : IDirectGpuBackend
     /// <inheritdoc/>
     public virtual void Polygamma(IGpuBuffer x, IGpuBuffer output, int n, int size) => Inner.Polygamma(x, output, n, size);
     /// <inheritdoc/>
+    public virtual void ShiftedDiff(IGpuBuffer x, IGpuBuffer mask, int n) => Inner.ShiftedDiff(x, mask, n);
+    /// <inheritdoc/>
     public virtual void ScatterReduce(IGpuBuffer output, IGpuBuffer source, IGpuBuffer index, int outerSize, int srcDim, int dstDim, int innerSize, int mode) => Inner.ScatterReduce(output, source, index, outerSize, srcDim, dstDim, innerSize, mode);
     /// <inheritdoc/>
     public virtual void Unfold(IGpuBuffer src, IGpuBuffer dst, int outerSize, int dimSize, int innerSize, int nWindows, int size, int step) => Inner.Unfold(src, dst, outerSize, dimSize, innerSize, nWindows, size, step);

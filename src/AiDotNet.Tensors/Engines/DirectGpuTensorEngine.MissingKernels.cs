@@ -1566,6 +1566,67 @@ public partial class DirectGpuTensorEngine
     }
 
     /// <inheritdoc/>
+    public override Tensor<int> TensorNonzero<T>(Tensor<T> tensor)
+    {
+        if (tensor is null) throw new ArgumentNullException(nameof(tensor));
+        if (typeof(T) != typeof(float) || tensor.Length == 0 || !TryGetBackend(out var backend))
+            return base.TensorNonzero(tensor);
+        try
+        {
+            var c = tensor.IsContiguous ? tensor : (Tensor<T>)tensor.Contiguous();
+            int len = tensor.Length, rank = tensor.Rank;
+            using var bufIn = GetOrAllocateBuffer(backend, c.GetDataArray());
+            using var bufMask = AllocateOutputBuffer(backend, len);
+            backend.NotEqualScalar(bufIn.Buffer, bufMask.Buffer, 0f, len);   // nonzero mask on GPU (input stays resident)
+            backend.Synchronize();
+            var mask = backend.DownloadBuffer(bufMask.Buffer);
+            int nnz = 0; for (int i = 0; i < len; i++) if (mask[i] != 0f) nnz++;
+            var strides = new int[rank];
+            strides[rank - 1] = 1;
+            for (int d = rank - 2; d >= 0; d--) strides[d] = strides[d + 1] * tensor._shape[d + 1];
+            var result = new Tensor<int>(new[] { nnz, rank });
+            var dst = result.AsWritableSpan();
+            int w = 0;
+            for (int i = 0; i < len; i++)
+                if (mask[i] != 0f)
+                {
+                    int rem = i;
+                    for (int d = 0; d < rank; d++) { dst[w * rank + d] = rem / strides[d]; rem %= strides[d]; }
+                    w++;
+                }
+            return result;
+        }
+        catch (Exception) { return base.TensorNonzero(tensor); }
+    }
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorUniqueConsecutive<T>(Tensor<T> input)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (typeof(T) != typeof(float) || input.Length == 0 || !TryGetBatchBackend(out var backend))
+            return base.TensorUniqueConsecutive(input);
+        try
+        {
+            var c = input.IsContiguous ? input : (Tensor<T>)input.Contiguous();
+            int n = input.Length;
+            using var bufIn = GetOrAllocateBuffer(backend, c.GetDataArray());
+            using var bufMask = AllocateOutputBuffer(backend, n);
+            backend.ShiftedDiff(bufIn.Buffer, bufMask.Buffer, n);   // keep mask on GPU
+            backend.Synchronize();
+            var mask = backend.DownloadBuffer(bufMask.Buffer);
+            var kept = new List<int>();
+            for (int i = 0; i < n; i++) if (mask[i] != 0f) kept.Add(i);
+            int count = kept.Count;
+            using var bufIdx = new OwnedBuffer(backend.AllocateIntBuffer(kept.ToArray()), true);
+            var bufOut = AllocateOutputBuffer(backend, count);
+            backend.Gather(bufIn.Buffer, bufIdx.Buffer, bufOut.Buffer, count, 1);   // gather kept values (resident)
+            var arr = FinishGpuOp<T>(backend, bufOut, count);
+            return new Tensor<T>(arr, new[] { count });
+        }
+        catch (Exception) { return base.TensorUniqueConsecutive(input); }
+    }
+
+    /// <inheritdoc/>
     public override Tensor<T> TensorNextAfter<T>(Tensor<T> a, Tensor<T> b)
     {
         if (a is null) throw new ArgumentNullException(nameof(a));

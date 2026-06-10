@@ -1990,6 +1990,9 @@ public interface IDirectGpuBackend : IDisposable
     /// <summary>Elementwise polygamma psi^(n)(x[i]) for n>=1.</summary>
     void Polygamma(IGpuBuffer x, IGpuBuffer output, int n, int size);
 
+    /// <summary>mask[i] = (i==0 || x[i] != x[i-1]) ? 1 : 0 (consecutive-unique keep mask).</summary>
+    void ShiftedDiff(IGpuBuffer x, IGpuBuffer mask, int n);
+
     /// <summary>
     /// scatter_reduce along a dim with atomic reduction (mode 0=sum,1=prod,2=amax,3=amin). output is
     /// pre-seeded with the original tensor (includeSelf); source/index viewed [outerSize, srcDim, innerSize].
