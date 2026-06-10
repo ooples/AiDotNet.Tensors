@@ -410,6 +410,27 @@ __kernel void histogramdd(__global const float* samples, volatile __global float
     }
     if (valid) atomicAddF(&hist[linIdx], 1.0f);
 }
+// GridSample bilinear backward-to-input (NHWC, zeros pad, alignCorners=false-as-CPU). One thread per
+// (b,oh,ow,c) output: scatter gradOut into the 4 bilinear input corners (atomic). gradIn pre-zeroed.
+__kernel void gridsample_backward_input(__global const float* gradOut, __global const float* grid,
+    volatile __global float* gradIn, int batch, int H, int W, int C, int outH, int outW) {
+    int idx = get_global_id(0); int total = batch*outH*outW*C; if (idx >= total) return;
+    int c = idx % C; int tmp = idx / C;
+    int ow = tmp % outW; tmp /= outW;
+    int oh = tmp % outH; int b = tmp / outH;
+    int gridBase = ((b*outH + oh)*outW + ow)*2;
+    float gx = grid[gridBase]; float gy = grid[gridBase+1];
+    float srcH = (gy + 1.0f) * 0.5f * (float)(H - 1);
+    float srcW = (gx + 1.0f) * 0.5f * (float)(W - 1);
+    if (srcH <= -1.0f || srcH >= (float)H || srcW <= -1.0f || srcW >= (float)W) return;
+    int h0 = (int)floor(srcH); int h1 = h0 + 1; int w0 = (int)floor(srcW); int w1 = w0 + 1;
+    float lh = srcH - (float)h0; float lw = srcW - (float)w0;
+    float g = gradOut[idx];
+    if (h0>=0 && h0<H && w0>=0 && w0<W) atomicAddF(&gradIn[((b*H+h0)*W+w0)*C+c], g*(1.0f-lh)*(1.0f-lw));
+    if (h0>=0 && h0<H && w1>=0 && w1<W) atomicAddF(&gradIn[((b*H+h0)*W+w1)*C+c], g*(1.0f-lh)*lw);
+    if (h1>=0 && h1<H && w0>=0 && w0<W) atomicAddF(&gradIn[((b*H+h1)*W+w0)*C+c], g*lh*(1.0f-lw));
+    if (h1>=0 && h1<H && w1>=0 && w1<W) atomicAddF(&gradIn[((b*H+h1)*W+w1)*C+c], g*lh*lw);
+}
 // Condensed pairwise p-norm over rows of input[n,d]; output 1-D upper-triangle (i<j) order.
 __kernel void pdist(__global const float* input, __global float* output, int n, int d, float p) {
     int flat = get_global_id(0); if (flat >= n * n) return;
@@ -456,7 +477,7 @@ __kernel void next_after(__global const float* a, __global const float* b, __glo
             "masked_fill_kernel", "index_select", "take_along_dim",
             "cross3", "ldexp_kernel", "kron2d", "search_sorted", "next_after", "index_write", "cdist", "pdist",
             "histc", "bitonic_step", "copy_rows", "iota_pad", "rwkv7_forward", "hsoftmax_paths",
-            "isin", "unfold", "copy_block_2d", "scatter_reduce", "zeta_kernel", "polygamma_kernel", "shifted_diff", "histogramdd", "masks_to_boxes", "logical_op", "logical_not"
+            "isin", "unfold", "copy_block_2d", "scatter_reduce", "zeta_kernel", "polygamma_kernel", "shifted_diff", "histogramdd", "masks_to_boxes", "logical_op", "logical_not", "gridsample_backward_input"
         };
     }
 }

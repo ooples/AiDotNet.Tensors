@@ -2005,6 +2005,9 @@ public interface IDirectGpuBackend : IDisposable
     /// <summary>Logical NOT on a float-0/1 mask.</summary>
     void LogicalNot(IGpuBuffer a, IGpuBuffer output, int n);
 
+    /// <summary>GridSample bilinear backward-to-input (NHWC, zeros pad). gradIn pre-zeroed.</summary>
+    void GridSampleBackwardInputNhwc(IGpuBuffer gradOut, IGpuBuffer grid, IGpuBuffer gradIn, int batch, int h, int w, int c, int outH, int outW);
+
     /// <summary>
     /// scatter_reduce along a dim with atomic reduction (mode 0=sum,1=prod,2=amax,3=amin). output is
     /// pre-seeded with the original tensor (includeSelf); source/index viewed [outerSize, srcDim, innerSize].
