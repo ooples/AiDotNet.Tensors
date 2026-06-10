@@ -652,4 +652,46 @@ public partial class DirectGpuTensorEngine
         }
         catch (Exception) { return base.TensorRepeatInterleave(tensor, repeats, dim); }
     }
+
+    // ----- Category E: cosine similarity (last-axis reduction) -----
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorCosineSimilarity<T>(Tensor<T> x1, Tensor<T> x2, int dim = -1, double eps = 1e-8)
+    {
+        if (x1 is null) throw new ArgumentNullException(nameof(x1));
+        if (x2 is null) throw new ArgumentNullException(nameof(x2));
+        int rank = x1.Rank;
+        if (dim < 0) dim += rank;
+
+        // The backend CosineSimilarity kernel reduces the LAST axis (batchSize × axisLen); middle-dim
+        // reductions and shape mismatches defer to base (which validates and handles the general case).
+        if (dim != rank - 1 || dim < 0 || x2.Rank != rank || x1.Length != x2.Length
+            || !ShapesEqual(x1._shape, x2._shape)
+            || !TryGetBatchBackend(out var backend))
+            return base.TensorCosineSimilarity(x1, x2, dim, eps);
+
+        try
+        {
+            var a = x1.IsContiguous ? x1 : x1.Contiguous();
+            var b = x2.IsContiguous ? x2 : x2.Contiguous();
+            int axisLen = x1._shape[dim];
+            int batchSize = x1.Length / axisLen;
+            using var bufA = GetOrAllocateBuffer(backend, a.GetDataArray());
+            using var bufB = GetOrAllocateBuffer(backend, b.GetDataArray());
+            var bufOut = AllocateOutputBuffer(backend, batchSize);
+            backend.CosineSimilarity(bufA.Buffer, bufB.Buffer, bufOut.Buffer, batchSize, axisLen);
+            var result = FinishGpuOp<T>(backend, bufOut, batchSize);
+            var outShape = new int[rank - 1];
+            for (int i = 0; i < rank - 1; i++) outShape[i] = x1._shape[i];
+            return new Tensor<T>(result, outShape.Length == 0 ? new[] { 1 } : outShape);
+        }
+        catch (Exception) { return base.TensorCosineSimilarity(x1, x2, dim, eps); }
+    }
+
+    private static bool ShapesEqual(int[] a, int[] b)
+    {
+        if (a.Length != b.Length) return false;
+        for (int i = 0; i < a.Length; i++) if (a[i] != b[i]) return false;
+        return true;
+    }
 }

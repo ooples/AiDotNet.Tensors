@@ -499,5 +499,26 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         var gpu = _gpu.TensorRepeatInterleave(t, repeats, dim);
         AssertMatch(gpu, cpu, $"TensorRepeatInterleave[{string.Join("x", shape)};r={repeats}]");
     }
+
+    // cosine similarity along the last axis (the case the backend kernel covers).
+    public static IEnumerable<object[]> CosSimShapes() => new List<object[]>
+    {
+        new object[] { new[] { 1, 8 } },
+        new object[] { new[] { 4, 16 } },
+        new object[] { new[] { 2, 3, 32 } },
+        new object[] { new[] { 10, 64 } },
+    };
+
+    [Theory]
+    [MemberData(nameof(CosSimShapes))]
+    public void TensorCosineSimilarity_LastDim_GpuMatchesCpu(int[] shape)
+    {
+        if (!EnsureGpuReady()) return;
+        var x1 = Rand(110, shape);
+        var x2 = Rand(111, shape);
+        var cpu = _cpu.TensorCosineSimilarity(x1, x2, -1);
+        var gpu = _gpu.TensorCosineSimilarity(x1, x2, -1);
+        AssertMatch(gpu, cpu, $"TensorCosineSimilarity[{string.Join("x", shape)}]");
+    }
 }
 #endif
