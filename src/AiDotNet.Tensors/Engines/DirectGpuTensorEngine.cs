@@ -2749,11 +2749,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int axisSize = input.Shape._dims[axis];
         int stride = 1; for (int i = axis + 1; i < input.Rank; i++) stride *= input.Shape._dims[i];
         if (index < 0 || index >= axisSize || (long)outerSize * stride != output.Length) return false;
+        if (backend is not Engines.DirectGpu.CUDA.CudaBackend cudaB) return false;   // SliceAxis is a CudaBackend op
         try
         {
             using var bufIn = GetResidentOrPersistentInputBuffer(backend, input);
             var outBuf = GetOrCreateResidentBuffer(backend, output, outerSize * stride);
-            backend.SliceAxis(bufIn.Buffer, outBuf, outerSize, axisSize, stride, index);
+            cudaB.SliceAxis(bufIn.Buffer, outBuf, outerSize, axisSize, stride, index);
             BindResidentBuffer(output, outBuf, backend);
             return true;
         }
