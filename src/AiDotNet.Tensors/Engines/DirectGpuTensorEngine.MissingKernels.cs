@@ -207,4 +207,25 @@ public partial class DirectGpuTensorEngine
             return base.BatchNormInference(x, gamma, beta, mean, variance, epsilon);
         }
     }
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorInner<T>(Tensor<T> a, Tensor<T> b)
+    {
+        if (a is null) throw new ArgumentNullException(nameof(a));
+        if (b is null) throw new ArgumentNullException(nameof(b));
+
+        // Inner product contracts the LAST axis: a[M,K], b[N,K] -> [M,N] with out[i,j]=Σ_k a[i,k]b[j,k]
+        // = a @ bᵀ — exactly TensorMatMulTransposed, which is GPU-resident (this is the Q·Kᵀ attention
+        // score pattern). The CPU base routes through TensorEinsum (host). Handle the 2-D × 2-D case on
+        // the GPU; higher-rank inner products need a host reshape/transpose dance, so defer those to base.
+        if (a.Rank != 2 || b.Rank != 2
+            || a._shape[a.Rank - 1] != b._shape[b.Rank - 1]
+            || !TryGetBackend(out _))
+        {
+            return base.TensorInner(a, b);
+        }
+
+        try { return TensorMatMulTransposed(a, b); }
+        catch (Exception) { return base.TensorInner(a, b); }
+    }
 }

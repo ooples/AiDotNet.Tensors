@@ -213,5 +213,28 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         var gpu = _gpu.BatchNormInference(x, gamma, beta, mean, variance, eps);
         AssertMatch(gpu, cpu, $"BatchNormInference[{string.Join("x", shape)}]");
     }
+
+    // Inner product over last axis: a[M,K], b[N,K] -> [M,N].
+    public static IEnumerable<object[]> InnerSizes() => new List<object[]>
+    {
+        new object[] { 1, 1, 1 },
+        new object[] { 4, 8, 3 },
+        new object[] { 32, 64, 16 },
+        new object[] { 128, 32, 256 },   // attention-ish Q·Kᵀ
+        new object[] { 7, 5, 11 },
+    };
+
+    [Theory]
+    [MemberData(nameof(InnerSizes))]
+    public void TensorInner_GpuMatchesCpu(int mRows, int k, int nRows)
+    {
+        if (!EnsureGpuReady()) return;
+        var a = Rand(61, mRows, k);
+        var b = Rand(62, nRows, k);
+
+        var cpu = _cpu.TensorInner(a, b);
+        var gpu = _gpu.TensorInner(a, b);
+        AssertMatch(gpu, cpu, $"TensorInner[{mRows},{k},{nRows}]");
+    }
 }
 #endif
