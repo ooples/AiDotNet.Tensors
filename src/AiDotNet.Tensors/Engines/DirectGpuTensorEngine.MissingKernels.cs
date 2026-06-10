@@ -320,4 +320,64 @@ public partial class DirectGpuTensorEngine
         for (int i = 0; i < perm.Length; i++) if (perm[i] != i) return false;
         return true;
     }
+
+    // ----- Category F: shape / view / layout -----
+    // The CPU base implements these as tensor.Transpose(perm), which returns a STRIDED view.
+    // Feeding a strided view to a GPU op forces a host materialization (download + CPU permute +
+    // re-upload). Routing through the GPU TensorPermute override physically reorders on the device
+    // into a contiguous resident buffer instead — same permutation, no host round-trip.
+    // (TensorAtLeast1D/2D/3D are deliberately NOT overridden: they delegate to Reshape, which already
+    // preserves GPU residency, so the base is fine.)
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorSwapAxes<T>(Tensor<T> tensor, int axis1, int axis2)
+    {
+        if (tensor is null) throw new ArgumentNullException(nameof(tensor));
+        int rank = tensor.Rank;
+        if (axis1 < 0) axis1 += rank;
+        if (axis2 < 0) axis2 += rank;
+        if (axis1 < 0 || axis1 >= rank || axis2 < 0 || axis2 >= rank || !TryGetBackend(out _))
+            return base.TensorSwapAxes(tensor, axis1, axis2);
+
+        try
+        {
+            var perm = new int[rank];
+            for (int i = 0; i < rank; i++) perm[i] = i;
+            perm[axis1] = axis2;
+            perm[axis2] = axis1;
+            return TensorPermute(tensor, perm);
+        }
+        catch (Exception) { return base.TensorSwapAxes(tensor, axis1, axis2); }
+    }
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorMoveDim<T>(Tensor<T> tensor, int source, int destination)
+    {
+        if (tensor is null) throw new ArgumentNullException(nameof(tensor));
+        int rank = tensor.Rank;
+        if (source < 0) source += rank;
+        if (destination < 0) destination += rank;
+        if (source < 0 || source >= rank || destination < 0 || destination >= rank || !TryGetBackend(out _))
+            return base.TensorMoveDim(tensor, source, destination);
+
+        try
+        {
+            // Build the SAME permutation the CPU base does (pull out `source`, insert at
+            // `destination`), then materialize it on the GPU.
+            var perm = new int[rank];
+            int w = 0;
+            for (int i = 0; i < rank; i++)
+            {
+                if (w == destination) { perm[w++] = source; }
+                if (i != source)
+                {
+                    if (w == destination) { perm[w++] = source; }
+                    perm[w++] = i;
+                }
+            }
+            if (w < rank) perm[w++] = source;
+            return TensorPermute(tensor, perm);
+        }
+        catch (Exception) { return base.TensorMoveDim(tensor, source, destination); }
+    }
 }

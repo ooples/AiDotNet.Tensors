@@ -287,5 +287,47 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         var gpu = _gpu.TensorDot(a, b, axesA, axesB);
         AssertMatch(gpu, cpu, $"TensorDot[{string.Join("x", shapeA)};{string.Join("x", shapeB)};a={string.Join(",", axesA)};b={string.Join(",", axesB)}]");
     }
+
+    // ----- Category F: shape / view / layout -----
+
+    public static IEnumerable<object[]> SwapAxesCases() => new List<object[]>
+    {
+        new object[] { new[] { 4, 6 }, 0, 1 },
+        new object[] { new[] { 2, 3, 5 }, 0, 2 },
+        new object[] { new[] { 2, 3, 5 }, 1, 2 },
+        new object[] { new[] { 2, 3, 4, 5 }, 1, 3 },
+        new object[] { new[] { 2, 3, 5 }, -1, 0 },     // negative axis
+    };
+
+    [Theory]
+    [MemberData(nameof(SwapAxesCases))]
+    public void TensorSwapAxes_GpuMatchesCpu(int[] shape, int axis1, int axis2)
+    {
+        if (!EnsureGpuReady()) return;
+        var t = Rand(91, shape);
+        var cpu = _cpu.TensorSwapAxes(t, axis1, axis2);
+        var gpu = _gpu.TensorSwapAxes(t, axis1, axis2);
+        AssertMatch(gpu, cpu, $"TensorSwapAxes[{string.Join("x", shape)};{axis1},{axis2}]");
+    }
+
+    public static IEnumerable<object[]> MoveDimCases() => new List<object[]>
+    {
+        new object[] { new[] { 2, 3, 5 }, 0, 2 },
+        new object[] { new[] { 2, 3, 5 }, 2, 0 },
+        new object[] { new[] { 2, 3, 4, 5 }, 1, 3 },
+        new object[] { new[] { 2, 3, 4, 5 }, 3, 0 },
+        new object[] { new[] { 4, 6 }, 0, 1 },
+    };
+
+    [Theory]
+    [MemberData(nameof(MoveDimCases))]
+    public void TensorMoveDim_GpuMatchesCpu(int[] shape, int source, int destination)
+    {
+        if (!EnsureGpuReady()) return;
+        var t = Rand(92, shape);
+        var cpu = _cpu.TensorMoveDim(t, source, destination);
+        var gpu = _gpu.TensorMoveDim(t, source, destination);
+        AssertMatch(gpu, cpu, $"TensorMoveDim[{string.Join("x", shape)};{source}->{destination}]");
+    }
 }
 #endif
