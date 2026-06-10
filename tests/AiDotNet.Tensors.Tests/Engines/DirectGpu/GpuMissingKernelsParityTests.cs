@@ -329,5 +329,6 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         var gpu = _gpu.TensorMoveDim(t, source, destination);
         AssertMatch(gpu, cpu, $"TensorMoveDim[{string.Join("x", shape)};{source}->{destination}]");
     }
+
 }
 #endif

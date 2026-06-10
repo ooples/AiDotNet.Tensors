@@ -380,4 +380,10 @@ public partial class DirectGpuTensorEngine
         }
         catch (Exception) { return base.TensorMoveDim(tensor, source, destination); }
     }
+
+    // NOTE: TensorRot90 is intentionally NOT overridden. A per-step GPU
+    // permute→flip→permute chain produced wrong values for k>=2 (the single-step k=1 was correct),
+    // so rather than ship a subtly-wrong niche kernel it stays on the base. Revisit with a single
+    // net-transform (k=1/3: one permute+flip; k=2: two flips) once the multi-step GPU chaining
+    // divergence is root-caused.
 }
