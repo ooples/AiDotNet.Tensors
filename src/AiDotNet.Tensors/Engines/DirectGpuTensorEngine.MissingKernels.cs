@@ -381,11 +381,17 @@ public partial class DirectGpuTensorEngine
         catch (Exception) { return base.TensorMoveDim(tensor, source, destination); }
     }
 
-    // NOTE: TensorRot90 is intentionally NOT overridden. A per-step GPU
-    // permute→flip→permute chain produced wrong values for k>=2 (the single-step k=1 was correct),
-    // so rather than ship a subtly-wrong niche kernel it stays on the base. Revisit with a single
-    // net-transform (k=1/3: one permute+flip; k=2: two flips) once the multi-step GPU chaining
-    // divergence is root-caused.
+    // NOTE: TensorRot90 is intentionally NOT overridden — and the root cause is now understood.
+    // A focused diagnostic showed: TensorFlip, TensorPermute, and every 2-deep chain (flip(permute),
+    // permute(flip)) match CPU exactly (err 0); homogeneous 3-deep chains (permute^3, flip^3) also
+    // match (so it is NOT depth / buffer-pool exhaustion). But the INTERLEAVED 2-step rot90 chain
+    // flip→permute→flip→permute diverges (err ~1.6), and FORCE-MATERIALIZING the intermediate (download
+    // + re-wrap) makes it match again. => a pre-existing engine bug in the DEFERRED-materialization /
+    // activation-cache path: a deferred (not-yet-downloaded) intermediate of an interleaved flip↔permute
+    // chain is read stale by the next op. This is a real correctness bug worth a dedicated engine fix
+    // (FinishGpuOp / activation cache / buffer lifetime); the Category-A/F ops here are unaffected
+    // (their chains are permute→reshape(view)→matmul or homogeneous matmul chains, all tested clean).
+    // Rot90 stays on the correct CPU base until the engine deferred-buffer bug is fixed.
 
     /// <inheritdoc/>
     public override Tensor<T>[] TensorTensorSplit<T>(Tensor<T> tensor, int[] indices, int dim = 0)
