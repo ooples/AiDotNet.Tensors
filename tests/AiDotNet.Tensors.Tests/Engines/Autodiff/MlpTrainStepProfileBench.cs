@@ -76,8 +76,28 @@ public class MlpTrainStepProfileBench
             tape.ComputeGradients(loss, new[] { W[0], bb[0], W[1], bb[1], W[2], bb[2], W[3], bb[3] });
         }
 
+        // Same step, but via ComputeGradientsScope — gradient tensors are returned to the pool
+        // on scope dispose and reused by the next step's backward (the existing #327 mechanism).
+        var sources = new[] { W[0], bb[0], W[1], bb[1], W[2], bb[2], W[3], bb[3] };
+        float sink = 0f;
+        void TrainStepScoped()
+        {
+            using var tape = new GradientTape<float>();
+            var h = x;
+            for (int l = 0; l < 4; l++)
+            {
+                var lin = _engine.TensorMatMul(h, W[l]);
+                var bia = _engine.TensorBroadcastAdd(lin, bb[l]);
+                h = l < 3 ? _engine.ReLU(bia) : bia;
+            }
+            var loss = _engine.ReduceSum(h, new[] { 0, 1 }, keepDims: false);
+            using var scope = tape.ComputeGradientsScope(loss, sources);
+            // Touch each gradient like an optimizer would (so the buffers are genuinely produced).
+            foreach (var g in scope.Grads.Values) sink += g.GetFlat(0);
+        }
+
         // Warmup (JIT + autotune).
-        for (int i = 0; i < 30; i++) { InferenceForward(); TrainStep(); }
+        for (int i = 0; i < 30; i++) { InferenceForward(); TrainStep(); TrainStepScoped(); }
 
         double MinMs(Action a, int iters)
         {
@@ -128,6 +148,13 @@ public class MlpTrainStepProfileBench
         long fa = GC.GetAllocatedBytesForCurrentThread();
         double fwdTapeKb = (fa - fb) / 1024.0 / allocIters;
 
+        // Allocation with ComputeGradientsScope (pooled gradient buffers across steps).
+        for (int i = 0; i < 10; i++) TrainStepScoped();
+        long sb = GC.GetAllocatedBytesForCurrentThread();
+        for (int i = 0; i < allocIters; i++) TrainStepScoped();
+        long sa = GC.GetAllocatedBytesForCurrentThread();
+        double scopedKb = (sa - sb) / 1024.0 / allocIters;
+
         // Raw single GEMM [64,256]x[256,512] to separate dispatch overhead from GEMM speed.
         var w0 = W[0];
         double rawGemmMs = MinMs(() => _engine.TensorMatMul(x, w0), 500);
@@ -152,6 +179,7 @@ public class MlpTrainStepProfileBench
         _output.WriteLine($"  inference forward (no tape): {infMs:F3} ms,  alloc {infAllocKb:F1} KB/step");
         _output.WriteLine($"  forward WITH tape (no bwd):  alloc {fwdTapeKb:F1} KB/step  (tape-record cost {fwdTapeKb - infAllocKb:F1} KB)");
         _output.WriteLine($"  full train step (fwd+bwd):   {trainMs:F3} ms,  alloc {allocKbPerStep:F1} KB/step  (backward cost {allocKbPerStep - fwdTapeKb:F1} KB)");
+        _output.WriteLine($"  train step via ComputeGradientsScope (pooled): alloc {scopedKb:F1} KB/step  ({allocKbPerStep - scopedKb:F1} KB saved, {(1 - scopedKb / Math.Max(allocKbPerStep, 1e-9)) * 100:F0}%)  sink={sink:E1}");
         _output.WriteLine($"  backward overhead (train-inf): {trainMs - infMs:F3} ms  ({(trainMs / Math.Max(infMs, 1e-9)):F1}× inference)");
         _output.WriteLine($"  alloc amplification (train/inf): {allocKbPerStep / Math.Max(infAllocKb, 1e-6):F1}×");
 
