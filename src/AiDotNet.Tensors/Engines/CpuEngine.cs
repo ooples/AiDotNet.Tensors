@@ -13963,6 +13963,63 @@ public partial class CpuEngine : ITensorLevelEngine
     // extra cores only add dispatch overhead). Extracted so Conv2DBackwardKernel's
     // hot GEMM path keeps its baseline codegen (the inline build bloated the method
     // and regressed a small-shape perf guard).
+    // Conv-backward small-GEMM routing (#573 follow-up). Below this output-tile size the K-concat
+    // weight GEMM runs inline single-threaded (no worker-pool wakeup variance); above it the parallel
+    // dispatcher wins on throughput. The tiny benchmark conv (colH·oc = 72·16 = 1152) is well under;
+    // the larger conv (576·64 = 36864) routes to the parallel path.
+    private const long ConvSmallGemmOutputMax = 8192;
+    private const int ConvSmallGemmMr = 6;
+
+    /// <summary>
+    /// Single-threaded packed SGEMM for the K-concat conv weight gradient:
+    /// C[M=colH, N=oc] = A[M, K=batchColW] · B[K, N] (all row-major), accumulating fresh (C := A·B).
+    /// Packs each Mr-row panel of A so the inner loop reads contiguously, holds the C tile in
+    /// <see cref="Vector{T}"/> accumulators, and streams K once — ~20 GF/s/core with no worker-pool
+    /// dispatch. Bit-exact: each C element is one fixed-order K reduction. <paramref name="packBuf"/>
+    /// must be at least K·<see cref="ConvSmallGemmMr"/> long.
+    /// </summary>
+    private static void ConvWeightGemmSingleThreadFloat(
+        float[] a, float[] b, float[] c, int m, int n, int k, float[] packBuf)
+    {
+        Array.Clear(c, 0, m * n);
+        int vw = System.Numerics.Vector<float>.Count;
+        const int Mr = ConvSmallGemmMr;
+        var acc = new System.Numerics.Vector<float>[Mr];
+        for (int m0 = 0; m0 < m; m0 += Mr)
+        {
+            int mr = Math.Min(Mr, m - m0);
+            // Pack A[m0..m0+mr, :] into packBuf[k*Mr + i] (read each A row contiguously).
+            for (int i = 0; i < mr; i++)
+            {
+                int aRow = (m0 + i) * k;
+                for (int kk = 0; kk < k; kk++) packBuf[kk * Mr + i] = a[aRow + kk];
+            }
+            int n0 = 0;
+            for (; n0 + vw <= n; n0 += vw)
+            {
+                for (int i = 0; i < mr; i++) acc[i] = System.Numerics.Vector<float>.Zero;
+                for (int kk = 0; kk < k; kk++)
+                {
+                    var bv = new System.Numerics.Vector<float>(b, kk * n + n0);
+                    int pk = kk * Mr;
+                    for (int i = 0; i < mr; i++)
+                        acc[i] += new System.Numerics.Vector<float>(packBuf[pk + i]) * bv;
+                }
+                for (int i = 0; i < mr; i++) acc[i].CopyTo(c, (m0 + i) * n + n0);
+            }
+            // Scalar N-tail (n0 .. n).
+            for (; n0 < n; n0++)
+            {
+                for (int kk = 0; kk < k; kk++)
+                {
+                    float bs = b[kk * n + n0];
+                    int pk = kk * Mr;
+                    for (int i = 0; i < mr; i++) c[(m0 + i) * n + n0] += packBuf[pk + i] * bs;
+                }
+            }
+        }
+    }
+
     // Cache-blocked row-major transpose: src[rows, cols] -> dst[cols, rows]. Used by the
     // K-concat conv-backward path to avoid the cache-hostile transB GEMM (#573 follow-up).
     private static void TransposeFloatRowMajor(float[] src, float[] dst, int rows, int cols)
@@ -14146,12 +14203,26 @@ public partial class CpuEngine : ITensorLevelEngine
                     // #573 follow-up: the natural GEMM gradKernel = gradOut·im2colAllᵀ is transB=true with
                     // M = outChannels (often thin, e.g. 16) — no microkernel handles that shape well
                     // (~2 GF/s; transposed B access with K=batchColW stride is cache-hostile). gradOut is
-                    // built TRANSPOSED above so the result transpose is a NON-transposed GEMM whose M is
-                    // colH (= inC·kH·kW, ≥64 for real conv shapes) → hits the fast machine-code kernel:
-                    //   gradKernelᵀ[colH, oc] = im2colAll[colH, bcw] · gradOutAllᵀ[bcw, oc]
-                    // then transpose [colH, oc] back to gradKernelF[oc, colH]. Fixes the tiny-conv perf
-                    // gate AND removes the contention-variable transB tuned-strategy on large shapes.
-                    if (!Helpers.BlasProvider.TryGemmEx(
+                    // built TRANSPOSED above so the result is a NON-transposed GEMM whose M is colH
+                    // (= inC·kH·kW): gradKernelᵀ[colH, oc] = im2colAll[colH, bcw] · gradOutAllᵀ[bcw, oc],
+                    // then transposed back to gradKernelF[oc, colH].
+                    //
+                    // Routing: for a SMALL output tile (colH·oc ≤ threshold) run a single-threaded packed
+                    // microkernel inline. The parallel BlasManaged dispatcher's per-call worker-pool wakeup
+                    // adds ~1 ms of variable latency that dwarfs the tiny GEMM's actual compute (~0.1 ms)
+                    // and makes the timing flaky under load; the inline kernel has none and is bit-exact.
+                    // Large outputs keep the parallel dispatcher (its throughput genuinely wins there).
+                    if ((long)colH * outChannels <= ConvSmallGemmOutputMax)
+                    {
+                        var pack = kcPool.Rent(batchColW * ConvSmallGemmMr);
+                        try
+                        {
+                            ConvWeightGemmSingleThreadFloat(
+                                im2colAll, gradOutAllT, gradKernelT, colH, outChannels, batchColW, pack);
+                        }
+                        finally { kcPool.Return(pack); }
+                    }
+                    else if (!Helpers.BlasProvider.TryGemmEx(
                         colH, outChannels, batchColW,
                         im2colAll, 0, batchColW, false,
                         gradOutAllT, 0, outChannels, false,
