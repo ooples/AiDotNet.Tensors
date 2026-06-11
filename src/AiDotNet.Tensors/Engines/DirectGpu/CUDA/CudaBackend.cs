@@ -7118,6 +7118,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         LaunchKernel3D(kernel, gridX, gridY, gridZ, blockX, blockY, 1, args);
     }
 
+    // content-keyed meta buffers for the general permute kernel (see Permute) — capture-safe reuse
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, (IGpuBuffer inS, IGpuBuffer outS, IGpuBuffer perm)> _permuteMetaCache = new();
+
     public unsafe void Permute(IGpuBuffer input, IGpuBuffer output, int[] shape, int[] permutation)
     {
         // Handle common fast paths first
@@ -7168,17 +7171,29 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         for (int i = ndims - 2; i >= 0; i--)
             outputStrides[i] = outputStrides[i + 1] * outputShape[i + 1];
 
-        // Allocate device memory for strides and permutation
-        using var inputStridesBuffer = AllocateIntBuffer(inputStrides);
-        using var outputStridesBuffer = AllocateIntBuffer(outputStrides);
-        using var permutationBuffer = AllocateIntBuffer(permutation);
+        // Meta buffers (strides + permutation) are CACHED by content signature: a compiled plan replays the
+        // same (shape, permutation) every step, and a per-call AllocateIntBuffer = cuMemAlloc + cuMemcpyHtoD —
+        // both ILLEGAL inside a CUDA-graph capture (this was the 0.92-line capture abort: the rank-4 attention
+        // head-split permute [B,ctx,heads,hd] takes this general path; rank-2/3 use the fast paths above).
+        // First call (the plan's pre-residency pass, outside capture) warms the cache; capture/replay reuse.
+        // Bounded: a handful of distinct signatures per model; freed on backend dispose.
+        string metaKey = string.Join(",", shape) + "|" + string.Join(",", permutation);
+        if (!_permuteMetaCache.TryGetValue(metaKey, out var meta))
+        {
+            meta = (AllocateIntBuffer(inputStrides), AllocateIntBuffer(outputStrides), AllocateIntBuffer(permutation));
+            if (!_permuteMetaCache.TryAdd(metaKey, meta))
+            {
+                meta.inS.Dispose(); meta.outS.Dispose(); meta.perm.Dispose();
+                meta = _permuteMetaCache[metaKey];
+            }
+        }
 
         uint grid = (uint)((totalSize + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr inputPtr = input.Handle;
         IntPtr outputPtr = output.Handle;
-        IntPtr inputStridesPtr = inputStridesBuffer.Handle;
-        IntPtr outputStridesPtr = outputStridesBuffer.Handle;
-        IntPtr permutationPtr = permutationBuffer.Handle;
+        IntPtr inputStridesPtr = meta.inS.Handle;
+        IntPtr outputStridesPtr = meta.outS.Handle;
+        IntPtr permutationPtr = meta.perm.Handle;
 
         void** args = stackalloc void*[7];
         args[0] = &inputPtr;

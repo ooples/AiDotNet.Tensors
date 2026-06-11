@@ -98,6 +98,22 @@ internal static class DeferredArrayMaterializer
     /// <summary>
     /// Removes a pending materialization without executing it (e.g., when the GPU buffer is reused).
     /// </summary>
+    /// <summary>Drains EVERY pending materializer regardless of registering thread. ONLY safe when the
+    /// device is quiesced (e.g. the compiled plan's capture-failure rollback, after the capture stream is
+    /// abandoned and before eviction frees the buffers) — the per-thread affinity in MaterializeAll guards
+    /// against racing in-flight kernels, which cannot exist at that point.</summary>
+    internal static void FlushAllAnyThread()
+    {
+        foreach (var kv in _pendingMaterializations)
+        {
+            if (_pendingMaterializations.TryRemove(kv.Key, out var pending))
+            {
+                Interlocked.Decrement(ref _pendingCount);
+                try { pending.Callback(kv.Key); } catch { /* buffer may already be gone; the host copy stays stale */ }
+            }
+        }
+    }
+
     internal static void Remove(object array)
     {
         if (_pendingMaterializations.TryRemove(array, out _))
