@@ -1792,13 +1792,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // Diagnostic: maps a (compiled-plan output) backing array → the op that produced it, so a "src not resident"
     // log names the actual PRODUCER (not the consuming op). Tagged in CopyResultInto.
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<object, string> s_producerOf = new();
+    // DIAGNOSTIC-ONLY map (leak hotfix): strong array keys + per-step writes retained every step's host
+    // activations (28.8GB live heap measured) -> only populate under the capture-debug env, hard-capped.
+    private static readonly bool s_producerDiagEnabled =
+        (System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") ?? "") == "1";
+    private const int ProducerDiagCap = 4096;
     /// <summary>Tag a forward-action's OUTPUT with the producing op name (diagnostics), covering ops that write
     /// output directly (no CopyResultInto/BindResidentBuffer). Called by the generic forward action after exec.</summary>
     internal static void TagProducer<T>(Tensor<T> output, string? op)
     {
         if (op is null || s_currentForwardOp is null) return;
         var arr = output.DataVector.GetBackingArrayUnsafe();
-        if (arr is not null) s_producerOf[arr] = op;
+        if (arr is not null) if (s_producerDiagEnabled && s_producerOf.Count < ProducerDiagCap) s_producerOf[arr] = op;
     }
     private static void AliasDiag(string reason)
     {
@@ -1813,7 +1818,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (s_currentForwardOp is not null)
         {
             var dArr = dest.DataVector.GetBackingArrayUnsafe();
-            if (dArr is not null) s_producerOf[dArr] = s_currentForwardOp;
+            if (dArr is not null) if (s_producerDiagEnabled && s_producerOf.Count < ProducerDiagCap) s_producerOf[dArr] = s_currentForwardOp;
         }
         if (eng is DirectGpuTensorEngine gpu && gpu.TryAliasResidentOutput(src, dest))
         { AliasDiag("OK aliased"); return; }
@@ -2697,7 +2702,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         t._gpuBuffer = buf; t._gpuBackend = backend; t._gpuBufferVersion = t.Version;
         var arr = t.DataVector.GetBackingArrayUnsafe();
         if (arr is null) return;
-        if (s_currentForwardOp is not null) s_producerOf[arr] = s_currentForwardOp;
+        if (s_currentForwardOp is not null) if (s_producerDiagEnabled && s_producerOf.Count < ProducerDiagCap) s_producerOf[arr] = s_currentForwardOp;
         var capBuf = buf; var capBackend = backend;
         Helpers.DeferredArrayMaterializer.Register(arr, a =>
         {
@@ -2800,7 +2805,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             backend.Embedding(_cachedEmbIndexBuffer, tableBuf, outBuf, numIndices, embeddingDim);
             output._gpuBuffer = outBuf; output._gpuBackend = backend; output._gpuBufferVersion = output.Version;
             var oArr = output.DataVector.GetBackingArrayUnsafe();
-            if (oArr is not null && s_currentForwardOp is not null) s_producerOf[oArr] = s_currentForwardOp;
+            if (oArr is not null && s_currentForwardOp is not null) if (s_producerDiagEnabled && s_producerOf.Count < ProducerDiagCap) s_producerOf[oArr] = s_currentForwardOp;
             return true;
         }
         catch (Exception eex) { AliasDiag($"EmbFloat-resident FELLBACK n={numIndices} dim={embeddingDim}: {eex.GetType().Name}: {eex.Message}"); return false; }
