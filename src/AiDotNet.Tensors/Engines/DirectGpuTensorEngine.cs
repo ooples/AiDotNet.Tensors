@@ -298,32 +298,39 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private int _evictionSuspendDepth;
     internal bool EvictionSuspended => System.Threading.Volatile.Read(ref _evictionSuspendDepth) > 0;
 
-    /// <summary>TRUE only while the compiled plan runs the CAPTURE-PATH step body (pre-residency pass or inside
-    /// cuStreamBeginCapture) — set by CompiledTrainingPlan via <see cref="CompiledCapturePathScope"/>. The
+    /// <summary>Nonzero only while the compiled plan runs the CAPTURE-PATH step body (pre-residency pass or inside
+    /// cuStreamBeginCapture) — set by CompiledTrainingPlan via <see cref="EnterCompiledCapturePath"/>. The
     /// GPU-RESIDENT op branches (stable cached output buffers, persistent-input resolution, output aliasing) gate
     /// on THIS, not on EvictionSuspended alone: eviction stays suspended for the whole GRAPH LIFETIME, and routing
     /// the NON-captured per-step work (the eager optimizer update, warmup steps, shape-mismatch eager fallbacks)
     /// into resident allocations leaks VRAM every step — nothing is evictable, so a long epoch OOMs (issue #26:
-    /// canary 76 steps trained clean, a 488-step epoch OOM'd mid-epoch at two model sizes).</summary>
-    [ThreadStatic] internal static bool s_inCompiledCapturePath;
+    /// canary 76 steps trained clean, a 488-step epoch OOM'd mid-epoch at two model sizes).
+    /// INSTANCE field + Interlocked (NOT [ThreadStatic]): op execution fans out to the BLAS pool threads — a
+    /// thread-local flag is invisible there, the resident branches decline, and a host download aborts the
+    /// capture (verified on the d256/L2 smoke).</summary>
+    private int _capturePathDepth;
 
     /// <summary>The correct gate for compiled-step resident-buffer behavior: buffers pinned (eviction suspended)
     /// AND on the capture path (work the captured graph will replay).</summary>
-    internal bool ResidentStepActive => s_inCompiledCapturePath && EvictionSuspended;
+    internal bool ResidentStepActive =>
+        System.Threading.Volatile.Read(ref _capturePathDepth) > 0 && EvictionSuspended;
 
-    /// <summary>RAII scope marking the compiled capture path (thread-static; nesting-safe).</summary>
-    internal struct CompiledCapturePathScope : IDisposable
+    /// <summary>RAII scope marking the compiled capture path (instance depth; nesting-safe).</summary>
+    internal IDisposable EnterCompiledCapturePath()
     {
-        private readonly bool _prev;
-        private bool _disposed;
-        public static CompiledCapturePathScope Enter()
+        System.Threading.Interlocked.Increment(ref _capturePathDepth);
+        return new CapturePathScope(this);
+    }
+
+    private sealed class CapturePathScope : IDisposable
+    {
+        private DirectGpuTensorEngine? _e;
+        public CapturePathScope(DirectGpuTensorEngine e) { _e = e; }
+        public void Dispose()
         {
-            var s = new CompiledCapturePathScope(s_inCompiledCapturePath);
-            s_inCompiledCapturePath = true;
-            return s;
+            var e = System.Threading.Interlocked.Exchange(ref _e, null);
+            if (e is not null) System.Threading.Interlocked.Decrement(ref e._capturePathDepth);
         }
-        private CompiledCapturePathScope(bool prev) { _prev = prev; _disposed = false; }
-        public void Dispose() { if (!_disposed) { s_inCompiledCapturePath = _prev; _disposed = true; } }
     }
     internal void SuspendActivationEviction() => System.Threading.Interlocked.Increment(ref _evictionSuspendDepth);
     internal void ResumeActivationEviction()

@@ -539,8 +539,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         // scope. The eager optimizer update, warmup steps, and any shape-mismatch eager fallback
                         // run OUTSIDE it and take the normal transient-alloc path — without this, their per-step
                         // work allocated resident buffers under graph-lifetime eviction suspension and leaked
-                        // VRAM every step (a 488-step epoch OOM'd; the 76-step canary survived).
-                        using var _cap = Engines.DirectGpuTensorEngine.CompiledCapturePathScope.Enter();
+                        // VRAM every step (a 488-step epoch OOM'd; the 76-step canary survived). Instance-scoped
+                        // (not thread-local): op execution fans out to the BLAS pool threads.
+                        using var _cap = gte.EnterCompiledCapturePath();
                         if (_graphHasEmbedding) gte.EmbeddingIndexExternallyManaged = false;
                         RefreshGraphInputInPlace(cb);
                         RunGpuStepBodyForCapture(cb);
