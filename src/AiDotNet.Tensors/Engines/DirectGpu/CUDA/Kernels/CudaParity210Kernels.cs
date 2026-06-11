@@ -49,6 +49,13 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels
             // Logical/detection/geometry/misc audit
             "parity210_logical_op","parity210_logical_not","parity210_shifted_diff","parity210_masks_to_boxes",
             "parity210_pairwise_iou","parity210_histogramdd","parity210_gridsample_backward_input","parity210_gridsample_backward_grid",
+            // Movement/indexing/special/sort audit
+            "parity210_take_along_dim_f","parity210_cross3","parity210_ldexp","parity210_kron2d",
+            "parity210_search_sorted","parity210_next_after","parity210_index_write","parity210_cdist",
+            "parity210_pdist","parity210_histc","parity210_bitonic_step","parity210_copy_rows",
+            "parity210_iota_pad","parity210_hsoftmax_paths","parity210_isin","parity210_copy_block_2d",
+            "parity210_scatter_reduce","parity210_unfold","parity210_classify_float","parity210_zeta",
+            "parity210_polygamma","parity210_rwkv7_forward",
         };
 
         public static string GetSource() => @"
@@ -1026,6 +1033,155 @@ extern ""C"" __global__ void parity210_gridsample_backward_grid(const float* __r
         }
     }
     gradGrid[gridBase] = gradGx; gradGrid[gridBase+1] = gradGy;
+}
+
+// ==========================================================================
+// REMAINING AUDIT OPS (movement/indexing/special/sort/etc.) — from verified OpenCL.
+// ==========================================================================
+__device__ void p210_atomicReduceF(float* addr, float val, int mode) {
+    int* ia = (int*)addr; int old = *ia; int assumed;
+    do { assumed = old; float pf = __int_as_float(assumed);
+         float nv = (mode==0)?(pf+val):(mode==1)?(pf*val):(mode==2)?fmaxf(pf,val):fminf(pf,val);
+         old = atomicCAS(ia, assumed, __float_as_int(nv));
+    } while (assumed != old);
+}
+__device__ float p210_zeta_scalar(float x, float q) {
+    if (x == 1.0f) return INFINITY;
+    if (q <= 0.0f && q == floorf(q)) return INFINITY;
+    float sum = 0.0f;
+    for (int k = 0; k < 12; k++) sum += powf(q + (float)k, -x);
+    float Nq = 12.0f + q; float lnNq = logf(Nq);
+    float cont = expf((1.0f - x) * lnNq) / (x - 1.0f);
+    float halfTerm = 0.5f * expf(-x * lnNq);
+    const float b2k[8] = { 1.0f/6.0f, -1.0f/30.0f, 1.0f/42.0f, -1.0f/30.0f, 5.0f/66.0f, -691.0f/2730.0f, 7.0f/6.0f, -3617.0f/510.0f };
+    const float fact2k[8] = { 2.0f, 24.0f, 720.0f, 40320.0f, 3628800.0f, 479001600.0f, 87178291200.0f, 20922789888000.0f };
+    float corr = 0.0f; float xPow = expf(-x * lnNq) / Nq; float invNq2 = 1.0f / (Nq * Nq); float rising = x;
+    for (int j = 1; j <= 8; j++) {
+        if (j > 1) { rising *= (x + 2.0f*(float)(j-1) - 2.0f) * (x + 2.0f*(float)(j-1) - 1.0f); xPow *= invNq2; }
+        corr += (b2k[j-1] / fact2k[j-1]) * rising * xPow;
+    }
+    return sum + cont + halfTerm + corr;
+}
+__device__ float p210_polygamma_scalar(int n, float x) {
+    if (x <= 0.0f && x == floorf(x)) return INFINITY;
+    float recurrence = 0.0f; float xd = x; int signN = (n & 1) == 1 ? 1 : -1;
+    while (xd < 10.0f) { recurrence += (float)signN * expf(lgammaf((float)(n+1)) - (float)(n+1) * logf(xd)); xd += 1.0f; }
+    float lnX = logf(xd);
+    float asympt = expf(lgammaf((float)n) - (float)n * lnX) + 0.5f * expf(lgammaf((float)(n+1)) - (float)(n+1) * lnX);
+    const float b2k[8] = { 1.0f/6.0f, -1.0f/30.0f, 1.0f/42.0f, -1.0f/30.0f, 5.0f/66.0f, -691.0f/2730.0f, 7.0f/6.0f, -3617.0f/510.0f };
+    float invX2 = 1.0f / (xd * xd); float xPow = expf(-(float)n * lnX);
+    for (int k = 1; k <= 8; k++) { xPow *= invX2; asympt += b2k[k-1] * expf(lgammaf((float)(2*k+n)) - lgammaf((float)(2*k+1))) * xPow; }
+    return recurrence + (float)signN * asympt;
+}
+extern ""C"" __global__ void parity210_take_along_dim_f(const float* __restrict__ input, const float* __restrict__ indices, float* __restrict__ output, int outerSize, int axisOut, int innerSize, int axisIn) {
+    int idx = blockIdx.x*blockDim.x+threadIdx.x; int total = outerSize*axisOut*innerSize; if (idx >= total) return;
+    int inner = idx % innerSize; int outer = (idx / innerSize) / axisOut; int srcJ = (int)indices[idx];
+    if (srcJ < 0 || srcJ >= axisIn) { output[idx] = 0.0f; return; }
+    output[idx] = input[(outer * axisIn + srcJ) * innerSize + inner];
+}
+extern ""C"" __global__ void parity210_cross3(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ output, int outerSize, int innerSize) {
+    int idx = blockIdx.x*blockDim.x+threadIdx.x; if (idx >= outerSize * innerSize) return;
+    int inner = idx % innerSize; int outer = idx / innerSize; int p = outer * 3 * innerSize + inner;
+    float a0=a[p],a1=a[p+innerSize],a2=a[p+2*innerSize]; float b0=b[p],b1=b[p+innerSize],b2=b[p+2*innerSize];
+    output[p]=a1*b2-a2*b1; output[p+innerSize]=a2*b0-a0*b2; output[p+2*innerSize]=a0*b1-a1*b0;
+}
+extern ""C"" __global__ void parity210_ldexp(const float* __restrict__ input, const int* __restrict__ exponents, float* __restrict__ output, int size) {
+    int idx = blockIdx.x*blockDim.x+threadIdx.x; if (idx >= size) return; output[idx] = ldexpf(input[idx], exponents[idx]);
+}
+extern ""C"" __global__ void parity210_kron2d(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ output, int am, int an, int bp, int bq) {
+    int idx = blockIdx.x*blockDim.x+threadIdx.x; int outCols = an*bq; int total=(am*bp)*outCols; if (idx>=total) return;
+    int oc=idx%outCols; int orow=idx/outCols; int i=orow/bp; int k=orow%bp; int j=oc/bq; int l=oc%bq;
+    output[idx] = a[i*an+j] * b[k*bq+l];
+}
+extern ""C"" __global__ void parity210_search_sorted(const float* __restrict__ seq, const float* __restrict__ values, float* __restrict__ output, int seqLen, int numValues, int right) {
+    int idx = blockIdx.x*blockDim.x+threadIdx.x; if (idx >= numValues) return; float v = values[idx]; int lo=0, hi=seqLen;
+    while (lo < hi) { int mid=(lo+hi)>>1; int cond=(right!=0)?(seq[mid]<=v):(seq[mid]<v); if (cond) lo=mid+1; else hi=mid; }
+    output[idx] = (float)lo;
+}
+extern ""C"" __global__ void parity210_next_after(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ output, int size) {
+    int idx = blockIdx.x*blockDim.x+threadIdx.x; if (idx >= size) return; float av=a[idx], bv=b[idx];
+    unsigned int ua=__float_as_uint(av), ub=__float_as_uint(bv);
+    int aNan=(((ua>>23)&0xFFu)==0xFFu)&&((ua&0x7FFFFFu)!=0u); int bNan=(((ub>>23)&0xFFu)==0xFFu)&&((ub&0x7FFFFFu)!=0u);
+    if (aNan||bNan) { output[idx]=__uint_as_float(0x7FC00000u); return; }
+    if (av==bv) { output[idx]=bv; return; }
+    if (av==0.0f) { output[idx]=__uint_as_float(bv>0.0f?0x00000001u:0x80000001u); return; }
+    unsigned int r=ua;
+    if (bv>av) r=(av>0.0f)?(r+1u):(r-1u); else r=(av>0.0f)?(r-1u):(r+1u);
+    output[idx]=__uint_as_float(r);
+}
+extern ""C"" __global__ void parity210_index_write(float* __restrict__ output, const int* __restrict__ indices, const float* __restrict__ source, float fillValue, int mode, int outerSize, int idxAxis, int innerSize, int dstAxis) {
+    int idx = blockIdx.x*blockDim.x+threadIdx.x; int total=outerSize*idxAxis*innerSize; if (idx>=total) return;
+    int inner=idx%innerSize; int j=(idx/innerSize)%idxAxis; int outer=(idx/innerSize)/idxAxis; int dstJ=indices[j];
+    if (dstJ<0||dstJ>=dstAxis) return; float v=(mode==0)?source[idx]:fillValue;
+    output[(outer*dstAxis+dstJ)*innerSize+inner]=v;
+}
+extern ""C"" __global__ void parity210_cdist(const float* __restrict__ x1, const float* __restrict__ x2, float* __restrict__ output, int m, int n, int d, float p) {
+    int idx = blockIdx.x*blockDim.x+threadIdx.x; if (idx>=m*n) return; int j=idx%n; int i=idx/n; float sum=0.0f;
+    for (int k=0;k<d;k++){ float diff=fabsf(x1[i*d+k]-x2[j*d+k]); if (p==1.0f) sum+=diff; else if (p==2.0f) sum+=diff*diff; else sum+=powf(diff,p); }
+    output[idx]=(p==1.0f)?sum:(p==2.0f)?sqrtf(sum):powf(sum,1.0f/p);
+}
+extern ""C"" __global__ void parity210_pdist(const float* __restrict__ input, float* __restrict__ output, int n, int d, float p) {
+    int flat = blockIdx.x*blockDim.x+threadIdx.x; if (flat>=n*n) return; int j=flat%n; int i=flat/n; if (i>=j) return; float sum=0.0f;
+    for (int k=0;k<d;k++){ float diff=fabsf(input[i*d+k]-input[j*d+k]); if (p==1.0f) sum+=diff; else if (p==2.0f) sum+=diff*diff; else sum+=powf(diff,p); }
+    float dist=(p==1.0f)?sum:(p==2.0f)?sqrtf(sum):powf(sum,1.0f/p); int outIdx=i*n-(i*(i+1))/2+(j-i-1); output[outIdx]=dist;
+}
+extern ""C"" __global__ void parity210_histc(const float* __restrict__ input, float* __restrict__ hist, int n, int bins, float mn, float mx) {
+    int idx = blockIdx.x*blockDim.x+threadIdx.x; if (idx>=n) return; float x=input[idx]; if (x<mn||x>mx) return;
+    float bw=(mx-mn)/(float)bins; int b=(int)((x-mn)/bw); if (b>=bins) b=bins-1; if (b<0) b=0; atomicAdd(&hist[b], 1.0f);
+}
+extern ""C"" __global__ void parity210_bitonic_step(float* __restrict__ values, float* __restrict__ indices, int rowLen, int k, int j, int numRows, int descending) {
+    int gid = blockIdx.x*blockDim.x+threadIdx.x; if (gid>=numRows*rowLen) return; int i=gid%rowLen; int ixj=i^j; if (ixj<=i) return;
+    int base=(gid/rowLen)*rowLen; float a=values[base+i], b=values[base+ixj];
+    unsigned int ua=__float_as_uint(a), ub=__float_as_uint(b);
+    float ka=(((ua>>23)&0xFFu)==0xFFu&&(ua&0x7FFFFFu)!=0u)?INFINITY:a; float kb=(((ub>>23)&0xFFu)==0xFFu&&(ub&0x7FFFFFu)!=0u)?INFINITY:b;
+    int up=((i&k)==0); if (descending!=0) up=!up; int doSwap=up?(ka>kb):(ka<kb);
+    if (doSwap) { values[base+i]=b; values[base+ixj]=a; float t=indices[base+i]; indices[base+i]=indices[base+ixj]; indices[base+ixj]=t; }
+}
+extern ""C"" __global__ void parity210_copy_rows(const float* __restrict__ src, float* __restrict__ dst, int srcRowLen, int dstRowLen, int numRows, int copyLen) {
+    int gid = blockIdx.x*blockDim.x+threadIdx.x; if (gid>=numRows*copyLen) return; int i=gid%copyLen; int r=gid/copyLen; dst[r*dstRowLen+i]=src[r*srcRowLen+i];
+}
+extern ""C"" __global__ void parity210_iota_pad(float* __restrict__ idx, int L, int P, int numRows) {
+    int gid = blockIdx.x*blockDim.x+threadIdx.x; if (gid>=numRows*P) return; int i=gid%P; idx[gid]=(i<L)?(float)i:-1.0f;
+}
+extern ""C"" __global__ void parity210_hsoftmax_paths(const float* __restrict__ acts, float* __restrict__ out, int rows, int treeDepth, int numClasses) {
+    int idx = blockIdx.x*blockDim.x+threadIdx.x; if (idx>=rows*numClasses) return; int c=idx%numClasses; int r=idx/numClasses; int gbase=r*treeDepth; float prob=1.0f; int node=1;
+    for (int level=0; level<treeDepth; level++) { int goRight=(c&(1<<(treeDepth-level-1)))!=0; float g=1.0f/(1.0f+expf(-acts[gbase+level])); prob*=goRight?g:(1.0f-g); node=node*2+(goRight?1:0); if (node>=numClasses) break; }
+    out[idx]=prob;
+}
+extern ""C"" __global__ void parity210_isin(const float* __restrict__ elements, const float* __restrict__ sortedTest, float* __restrict__ mask, int numElements, int testLen) {
+    int idx = blockIdx.x*blockDim.x+threadIdx.x; if (idx>=numElements) return; float v=elements[idx]; int lo=0, hi=testLen;
+    while (lo<hi) { int mid=(lo+hi)>>1; if (sortedTest[mid]<v) lo=mid+1; else hi=mid; } mask[idx]=(lo<testLen&&sortedTest[lo]==v)?1.0f:0.0f;
+}
+extern ""C"" __global__ void parity210_copy_block_2d(const float* __restrict__ block, float* __restrict__ output, int blockRows, int blockCols, int totalCols, int rowOff, int colOff) {
+    int idx = blockIdx.x*blockDim.x+threadIdx.x; if (idx>=blockRows*blockCols) return; int j=idx%blockCols; int i=idx/blockCols; output[(rowOff+i)*totalCols+(colOff+j)]=block[i*blockCols+j];
+}
+extern ""C"" __global__ void parity210_scatter_reduce(float* __restrict__ output, const float* __restrict__ source, const int* __restrict__ index, int outerSize, int srcDim, int dstDim, int innerSize, int mode) {
+    int idx = blockIdx.x*blockDim.x+threadIdx.x; int total=outerSize*srcDim*innerSize; if (idx>=total) return; int inner=idx%innerSize; int tmp=idx/innerSize; int outer=tmp/srcDim; int t=index[idx];
+    if (t<0||t>=dstDim) return; p210_atomicReduceF(&output[(outer*dstDim+t)*innerSize+inner], source[idx], mode);
+}
+extern ""C"" __global__ void parity210_unfold(const float* __restrict__ src, float* __restrict__ dst, int outerSize, int dimSize, int innerSize, int nWindows, int size, int step) {
+    int idx = blockIdx.x*blockDim.x+threadIdx.x; int total=outerSize*nWindows*innerSize*size; if (idx>=total) return; int s=idx%size; int tmp=idx/size; int inner=tmp%innerSize; tmp/=innerSize; int w=tmp%nWindows; int outer=tmp/nWindows;
+    dst[idx]=src[(outer*dimSize+(w*step+s))*innerSize+inner];
+}
+extern ""C"" __global__ void parity210_classify_float(const float* __restrict__ a, float* __restrict__ output, int mode, int size) {
+    int idx = blockIdx.x*blockDim.x+threadIdx.x; if (idx>=size) return; unsigned int bits=__float_as_uint(a[idx]); unsigned int expo=(bits>>23)&0xFFu; unsigned int mant=bits&0x7FFFFFu;
+    int isNan=(expo==0xFFu)&&(mant!=0u); int isInf=(expo==0xFFu)&&(mant==0u); float r;
+    if (mode==0) r=isNan?1.0f:0.0f; else if (mode==1) r=isInf?1.0f:0.0f; else r=(!isNan&&!isInf)?1.0f:0.0f; output[idx]=r;
+}
+extern ""C"" __global__ void parity210_zeta(const float* __restrict__ x, const float* __restrict__ q, float* __restrict__ out, int size) {
+    int i = blockIdx.x*blockDim.x+threadIdx.x; if (i>=size) return; out[i]=p210_zeta_scalar(x[i], q[i]);
+}
+extern ""C"" __global__ void parity210_polygamma(const float* __restrict__ x, float* __restrict__ out, int n, int size) {
+    int i = blockIdx.x*blockDim.x+threadIdx.x; if (i>=size) return; out[i]=p210_polygamma_scalar(n, x[i]);
+}
+extern ""C"" __global__ void parity210_rwkv7_forward(const float* __restrict__ R, const float* __restrict__ K, const float* __restrict__ V, const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ outp, float* __restrict__ Sbuf, int batch, int seqLen, int modelDim, int numHeads, int headDim) {
+    int bh = blockIdx.x*blockDim.x+threadIdx.x; if (bh>=batch*numHeads) return; int b=bh/numHeads; int h=bh%numHeads; int hOff=h*headDim; int hh=headDim*headDim; float* S=Sbuf+bh*hh;
+    for (int i=0;i<hh;i++) S[i]=0.0f;
+    for (int t=0;t<seqLen;t++) {
+        int baseOff=(b*seqLen+t)*modelDim+hOff;
+        for (int di=0;di<headDim;di++) { float ga=1.0f/(1.0f+expf(-A[baseOff+di])); float gbk=(1.0f/(1.0f+expf(-B[baseOff+di])))*K[baseOff+di]; int srow=di*headDim; for (int vi=0;vi<headDim;vi++) S[srow+vi]=ga*S[srow+vi]+gbk*V[baseOff+vi]; }
+        for (int di=0;di<headDim;di++) { int srow=di*headDim; float sk=0.0f; for (int vi=0;vi<headDim;vi++) sk+=S[srow+vi]*K[baseOff+vi]; outp[baseOff+di]=(1.0f/(1.0f+expf(-R[baseOff+di])))*sk; }
+    }
 }
 ";
     }

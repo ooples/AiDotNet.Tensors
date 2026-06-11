@@ -9880,26 +9880,226 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     // IEEE classify (isnan/isinf/isfinite): a real CUDA kernel (bit-pattern, like the OpenCL
     // classify_float) is a HW-validation follow-up; the engine catches this and falls back to the
     // correct CPU path until then.
-    public void ClassifyFloat(IGpuBuffer A, IGpuBuffer C, int mode, int size) => throw new NotSupportedException("ClassifyFloat not yet implemented on the CUDA backend.");
-    public void TakeAlongDim(IGpuBuffer input, IGpuBuffer indices, IGpuBuffer output, int outerSize, int axisOut, int innerSize, int axisIn) => throw new NotSupportedException("TakeAlongDim not yet implemented on the CUDA backend.");
-    public void Cross3(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int outerSize, int innerSize) => throw new NotSupportedException("Cross3 not yet implemented on the CUDA backend.");
-    public void Ldexp(IGpuBuffer input, IGpuBuffer exponents, IGpuBuffer output, int size) => throw new NotSupportedException("Ldexp not yet implemented on the CUDA backend.");
-    public void Kron2D(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int am, int an, int bp, int bq) => throw new NotSupportedException("Kron2D not yet implemented on the CUDA backend.");
-    public void SearchSorted(IGpuBuffer sortedSeq, IGpuBuffer values, IGpuBuffer output, int seqLen, int numValues, int right) => throw new NotSupportedException("SearchSorted not yet implemented on the CUDA backend.");
-    public void NextAfter(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int size) => throw new NotSupportedException("NextAfter not yet implemented on the CUDA backend.");
-    public void IndexWrite(IGpuBuffer output, IGpuBuffer indices, IGpuBuffer source, float fillValue, int mode, int outerSize, int idxAxis, int innerSize, int dstAxis) => throw new NotSupportedException("IndexWrite not yet implemented on the CUDA backend.");
-    public void CDist(IGpuBuffer x1, IGpuBuffer x2, IGpuBuffer output, int m, int n, int d, float p) => throw new NotSupportedException("CDist not yet implemented on the CUDA backend.");
-    public void PDist(IGpuBuffer input, IGpuBuffer output, int n, int d, float p) => throw new NotSupportedException("PDist not yet implemented on the CUDA backend.");
-    public void Histc(IGpuBuffer input, IGpuBuffer hist, int n, int bins, float mn, float mx) => throw new NotSupportedException("Histc not yet implemented on the CUDA backend.");
-    public void BitonicStep(IGpuBuffer values, IGpuBuffer indices, int rowLen, int k, int j, int numRows, int descending) => throw new NotSupportedException("BitonicStep not yet implemented on the CUDA backend.");
-    public void CopyRows(IGpuBuffer src, IGpuBuffer dst, int srcRowLen, int dstRowLen, int numRows, int copyLen) => throw new NotSupportedException("CopyRows not yet implemented on the CUDA backend.");
-    public void IotaPad(IGpuBuffer idx, int l, int p, int numRows) => throw new NotSupportedException("IotaPad not yet implemented on the CUDA backend.");
-    public void Rwkv7Forward(IGpuBuffer r, IGpuBuffer k, IGpuBuffer v, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, IGpuBuffer sbuf, int batch, int seqLen, int modelDim, int numHeads, int headDim) => throw new NotSupportedException("Rwkv7Forward not yet implemented on the CUDA backend.");
-    public void HierarchicalSoftmaxPaths(IGpuBuffer acts, IGpuBuffer output, int rows, int treeDepth, int numClasses) => throw new NotSupportedException("HierarchicalSoftmaxPaths not yet implemented on the CUDA backend.");
-    public void IsIn(IGpuBuffer elements, IGpuBuffer sortedTest, IGpuBuffer mask, int numElements, int testLen) => throw new NotSupportedException("IsIn not yet implemented on the CUDA backend.");
-    public void CopyBlock2D(IGpuBuffer block, IGpuBuffer output, int blockRows, int blockCols, int totalCols, int rowOff, int colOff) => throw new NotSupportedException("CopyBlock2D not yet implemented on the CUDA backend.");
-    public void Zeta(IGpuBuffer x, IGpuBuffer q, IGpuBuffer output, int size) => throw new NotSupportedException("Zeta not yet implemented on the CUDA backend.");
-    public void Polygamma(IGpuBuffer x, IGpuBuffer output, int n, int size) => throw new NotSupportedException("Polygamma not yet implemented on the CUDA backend.");
+    public unsafe void ClassifyFloat(IGpuBuffer A, IGpuBuffer C, int mode, int size)
+    {
+        var kernel = ResolveParity210Kernel("parity210_classify_float");
+        using var _ = PushContext();
+        int __total = size; if (__total <= 0) return;
+        uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = A.Handle; IntPtr la1 = C.Handle; int la2 = mode; int la3 = size;
+        void** args = stackalloc void*[4];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3;
+        LaunchKernel(kernel, gsz, DefaultBlockSize, args);
+    }
+    public unsafe void TakeAlongDim(IGpuBuffer input, IGpuBuffer indices, IGpuBuffer output, int outerSize, int axisOut, int innerSize, int axisIn)
+    {
+        var kernel = ResolveParity210Kernel("parity210_take_along_dim_f");
+        using var _ = PushContext();
+        int __total = outerSize*axisOut*innerSize; if (__total <= 0) return;
+        uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = input.Handle; IntPtr la1 = indices.Handle; IntPtr la2 = output.Handle; int la3 = outerSize; int la4 = axisOut; int la5 = innerSize; int la6 = axisIn;
+        void** args = stackalloc void*[7];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5; args[6] = &la6;
+        LaunchKernel(kernel, gsz, DefaultBlockSize, args);
+    }
+    public unsafe void Cross3(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int outerSize, int innerSize)
+    {
+        var kernel = ResolveParity210Kernel("parity210_cross3");
+        using var _ = PushContext();
+        int __total = outerSize*innerSize; if (__total <= 0) return;
+        uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = a.Handle; IntPtr la1 = b.Handle; IntPtr la2 = output.Handle; int la3 = outerSize; int la4 = innerSize;
+        void** args = stackalloc void*[5];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4;
+        LaunchKernel(kernel, gsz, DefaultBlockSize, args);
+    }
+    public unsafe void Ldexp(IGpuBuffer input, IGpuBuffer exponents, IGpuBuffer output, int size)
+    {
+        var kernel = ResolveParity210Kernel("parity210_ldexp");
+        using var _ = PushContext();
+        int __total = size; if (__total <= 0) return;
+        uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = input.Handle; IntPtr la1 = exponents.Handle; IntPtr la2 = output.Handle; int la3 = size;
+        void** args = stackalloc void*[4];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3;
+        LaunchKernel(kernel, gsz, DefaultBlockSize, args);
+    }
+    public unsafe void Kron2D(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int am, int an, int bp, int bq)
+    {
+        var kernel = ResolveParity210Kernel("parity210_kron2d");
+        using var _ = PushContext();
+        int __total = (am*bp)*(an*bq); if (__total <= 0) return;
+        uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = a.Handle; IntPtr la1 = b.Handle; IntPtr la2 = output.Handle; int la3 = am; int la4 = an; int la5 = bp; int la6 = bq;
+        void** args = stackalloc void*[7];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5; args[6] = &la6;
+        LaunchKernel(kernel, gsz, DefaultBlockSize, args);
+    }
+    public unsafe void SearchSorted(IGpuBuffer sortedSeq, IGpuBuffer values, IGpuBuffer output, int seqLen, int numValues, int right)
+    {
+        var kernel = ResolveParity210Kernel("parity210_search_sorted");
+        using var _ = PushContext();
+        int __total = numValues; if (__total <= 0) return;
+        uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = sortedSeq.Handle; IntPtr la1 = values.Handle; IntPtr la2 = output.Handle; int la3 = seqLen; int la4 = numValues; int la5 = right;
+        void** args = stackalloc void*[6];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5;
+        LaunchKernel(kernel, gsz, DefaultBlockSize, args);
+    }
+    public unsafe void NextAfter(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int size)
+    {
+        var kernel = ResolveParity210Kernel("parity210_next_after");
+        using var _ = PushContext();
+        int __total = size; if (__total <= 0) return;
+        uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = a.Handle; IntPtr la1 = b.Handle; IntPtr la2 = output.Handle; int la3 = size;
+        void** args = stackalloc void*[4];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3;
+        LaunchKernel(kernel, gsz, DefaultBlockSize, args);
+    }
+    public unsafe void IndexWrite(IGpuBuffer output, IGpuBuffer indices, IGpuBuffer source, float fillValue, int mode, int outerSize, int idxAxis, int innerSize, int dstAxis)
+    {
+        var kernel = ResolveParity210Kernel("parity210_index_write");
+        using var _ = PushContext();
+        int __total = outerSize*idxAxis*innerSize; if (__total <= 0) return;
+        uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = output.Handle; IntPtr la1 = indices.Handle; IntPtr la2 = source.Handle; float la3 = fillValue; int la4 = mode; int la5 = outerSize; int la6 = idxAxis; int la7 = innerSize; int la8 = dstAxis;
+        void** args = stackalloc void*[9];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5; args[6] = &la6; args[7] = &la7; args[8] = &la8;
+        LaunchKernel(kernel, gsz, DefaultBlockSize, args);
+    }
+    public unsafe void CDist(IGpuBuffer x1, IGpuBuffer x2, IGpuBuffer output, int m, int n, int d, float p)
+    {
+        var kernel = ResolveParity210Kernel("parity210_cdist");
+        using var _ = PushContext();
+        int __total = m*n; if (__total <= 0) return;
+        uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = x1.Handle; IntPtr la1 = x2.Handle; IntPtr la2 = output.Handle; int la3 = m; int la4 = n; int la5 = d; float la6 = p;
+        void** args = stackalloc void*[7];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5; args[6] = &la6;
+        LaunchKernel(kernel, gsz, DefaultBlockSize, args);
+    }
+    public unsafe void PDist(IGpuBuffer input, IGpuBuffer output, int n, int d, float p)
+    {
+        var kernel = ResolveParity210Kernel("parity210_pdist");
+        using var _ = PushContext();
+        int __total = n*n; if (__total <= 0) return;
+        uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = input.Handle; IntPtr la1 = output.Handle; int la2 = n; int la3 = d; float la4 = p;
+        void** args = stackalloc void*[5];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4;
+        LaunchKernel(kernel, gsz, DefaultBlockSize, args);
+    }
+    public unsafe void Histc(IGpuBuffer input, IGpuBuffer hist, int n, int bins, float mn, float mx)
+    {
+        var kernel = ResolveParity210Kernel("parity210_histc");
+        using var _ = PushContext();
+        int __total = n; if (__total <= 0) return;
+        uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = input.Handle; IntPtr la1 = hist.Handle; int la2 = n; int la3 = bins; float la4 = mn; float la5 = mx;
+        void** args = stackalloc void*[6];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5;
+        LaunchKernel(kernel, gsz, DefaultBlockSize, args);
+    }
+    public unsafe void BitonicStep(IGpuBuffer values, IGpuBuffer indices, int rowLen, int k, int j, int numRows, int descending)
+    {
+        var kernel = ResolveParity210Kernel("parity210_bitonic_step");
+        using var _ = PushContext();
+        int __total = numRows*rowLen; if (__total <= 0) return;
+        uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = values.Handle; IntPtr la1 = indices.Handle; int la2 = rowLen; int la3 = k; int la4 = j; int la5 = numRows; int la6 = descending;
+        void** args = stackalloc void*[7];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5; args[6] = &la6;
+        LaunchKernel(kernel, gsz, DefaultBlockSize, args);
+    }
+    public unsafe void CopyRows(IGpuBuffer src, IGpuBuffer dst, int srcRowLen, int dstRowLen, int numRows, int copyLen)
+    {
+        var kernel = ResolveParity210Kernel("parity210_copy_rows");
+        using var _ = PushContext();
+        int __total = numRows*copyLen; if (__total <= 0) return;
+        uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = src.Handle; IntPtr la1 = dst.Handle; int la2 = srcRowLen; int la3 = dstRowLen; int la4 = numRows; int la5 = copyLen;
+        void** args = stackalloc void*[6];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5;
+        LaunchKernel(kernel, gsz, DefaultBlockSize, args);
+    }
+    public unsafe void IotaPad(IGpuBuffer idx, int l, int p, int numRows)
+    {
+        var kernel = ResolveParity210Kernel("parity210_iota_pad");
+        using var _ = PushContext();
+        int __total = numRows*p; if (__total <= 0) return;
+        uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = idx.Handle; int la1 = l; int la2 = p; int la3 = numRows;
+        void** args = stackalloc void*[4];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3;
+        LaunchKernel(kernel, gsz, DefaultBlockSize, args);
+    }
+    public unsafe void Rwkv7Forward(IGpuBuffer r, IGpuBuffer k, IGpuBuffer v, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, IGpuBuffer sbuf, int batch, int seqLen, int modelDim, int numHeads, int headDim)
+    {
+        var kernel = ResolveParity210Kernel("parity210_rwkv7_forward");
+        using var _ = PushContext();
+        int __total = batch*numHeads; if (__total <= 0) return;
+        uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = r.Handle; IntPtr la1 = k.Handle; IntPtr la2 = v.Handle; IntPtr la3 = a.Handle; IntPtr la4 = b.Handle; IntPtr la5 = output.Handle; IntPtr la6 = sbuf.Handle; int la7 = batch; int la8 = seqLen; int la9 = modelDim; int la10 = numHeads; int la11 = headDim;
+        void** args = stackalloc void*[12];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5; args[6] = &la6; args[7] = &la7; args[8] = &la8; args[9] = &la9; args[10] = &la10; args[11] = &la11;
+        LaunchKernel(kernel, gsz, DefaultBlockSize, args);
+    }
+    public unsafe void HierarchicalSoftmaxPaths(IGpuBuffer acts, IGpuBuffer output, int rows, int treeDepth, int numClasses)
+    {
+        var kernel = ResolveParity210Kernel("parity210_hsoftmax_paths");
+        using var _ = PushContext();
+        int __total = rows*numClasses; if (__total <= 0) return;
+        uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = acts.Handle; IntPtr la1 = output.Handle; int la2 = rows; int la3 = treeDepth; int la4 = numClasses;
+        void** args = stackalloc void*[5];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4;
+        LaunchKernel(kernel, gsz, DefaultBlockSize, args);
+    }
+    public unsafe void IsIn(IGpuBuffer elements, IGpuBuffer sortedTest, IGpuBuffer mask, int numElements, int testLen)
+    {
+        var kernel = ResolveParity210Kernel("parity210_isin");
+        using var _ = PushContext();
+        int __total = numElements; if (__total <= 0) return;
+        uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = elements.Handle; IntPtr la1 = sortedTest.Handle; IntPtr la2 = mask.Handle; int la3 = numElements; int la4 = testLen;
+        void** args = stackalloc void*[5];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4;
+        LaunchKernel(kernel, gsz, DefaultBlockSize, args);
+    }
+    public unsafe void CopyBlock2D(IGpuBuffer block, IGpuBuffer output, int blockRows, int blockCols, int totalCols, int rowOff, int colOff)
+    {
+        var kernel = ResolveParity210Kernel("parity210_copy_block_2d");
+        using var _ = PushContext();
+        int __total = blockRows*blockCols; if (__total <= 0) return;
+        uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = block.Handle; IntPtr la1 = output.Handle; int la2 = blockRows; int la3 = blockCols; int la4 = totalCols; int la5 = rowOff; int la6 = colOff;
+        void** args = stackalloc void*[7];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5; args[6] = &la6;
+        LaunchKernel(kernel, gsz, DefaultBlockSize, args);
+    }
+    public unsafe void Zeta(IGpuBuffer x, IGpuBuffer q, IGpuBuffer output, int size)
+    {
+        var kernel = ResolveParity210Kernel("parity210_zeta");
+        using var _ = PushContext();
+        int __total = size; if (__total <= 0) return;
+        uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = x.Handle; IntPtr la1 = q.Handle; IntPtr la2 = output.Handle; int la3 = size;
+        void** args = stackalloc void*[4];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3;
+        LaunchKernel(kernel, gsz, DefaultBlockSize, args);
+    }
+    public unsafe void Polygamma(IGpuBuffer x, IGpuBuffer output, int n, int size)
+    {
+        var kernel = ResolveParity210Kernel("parity210_polygamma");
+        using var _ = PushContext();
+        int __total = size; if (__total <= 0) return;
+        uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = x.Handle; IntPtr la1 = output.Handle; int la2 = n; int la3 = size;
+        void** args = stackalloc void*[4];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3;
+        LaunchKernel(kernel, gsz, DefaultBlockSize, args);
+    }
     public unsafe void ShiftedDiff(IGpuBuffer x, IGpuBuffer mask, int n)
     {
         var kernel = ResolveParity210Kernel("parity210_shifted_diff");
@@ -10054,8 +10254,28 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5; args[6] = &la6; args[7] = &la7; args[8] = &la8; args[9] = &la9;
         LaunchKernel(kernel, gsz, DefaultBlockSize, args);
     }
-    public void ScatterReduce(IGpuBuffer output, IGpuBuffer source, IGpuBuffer index, int outerSize, int srcDim, int dstDim, int innerSize, int mode) => throw new NotSupportedException("ScatterReduce not yet implemented on the CUDA backend.");
-    public void Unfold(IGpuBuffer src, IGpuBuffer dst, int outerSize, int dimSize, int innerSize, int nWindows, int size, int step) => throw new NotSupportedException("Unfold not yet implemented on the CUDA backend.");
+    public unsafe void ScatterReduce(IGpuBuffer output, IGpuBuffer source, IGpuBuffer index, int outerSize, int srcDim, int dstDim, int innerSize, int mode)
+    {
+        var kernel = ResolveParity210Kernel("parity210_scatter_reduce");
+        using var _ = PushContext();
+        int __total = outerSize*srcDim*innerSize; if (__total <= 0) return;
+        uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = output.Handle; IntPtr la1 = source.Handle; IntPtr la2 = index.Handle; int la3 = outerSize; int la4 = srcDim; int la5 = dstDim; int la6 = innerSize; int la7 = mode;
+        void** args = stackalloc void*[8];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5; args[6] = &la6; args[7] = &la7;
+        LaunchKernel(kernel, gsz, DefaultBlockSize, args);
+    }
+    public unsafe void Unfold(IGpuBuffer src, IGpuBuffer dst, int outerSize, int dimSize, int innerSize, int nWindows, int size, int step)
+    {
+        var kernel = ResolveParity210Kernel("parity210_unfold");
+        using var _ = PushContext();
+        int __total = outerSize*nWindows*innerSize*size; if (__total <= 0) return;
+        uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = src.Handle; IntPtr la1 = dst.Handle; int la2 = outerSize; int la3 = dimSize; int la4 = innerSize; int la5 = nWindows; int la6 = size; int la7 = step;
+        void** args = stackalloc void*[8];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5; args[6] = &la6; args[7] = &la7;
+        LaunchKernel(kernel, gsz, DefaultBlockSize, args);
+    }
 
     public unsafe void Equal(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
     {
