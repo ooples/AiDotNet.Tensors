@@ -13963,19 +13963,47 @@ public partial class CpuEngine : ITensorLevelEngine
     // extra cores only add dispatch overhead). Extracted so Conv2DBackwardKernel's
     // hot GEMM path keeps its baseline codegen (the inline build bloated the method
     // and regressed a small-shape perf guard).
+    // Cache-blocked row-major transpose: src[rows, cols] -> dst[cols, rows]. Used by the
+    // K-concat conv-backward path to avoid the cache-hostile transB GEMM (#573 follow-up).
+    private static void TransposeFloatRowMajor(float[] src, float[] dst, int rows, int cols)
+    {
+        const int Blk = 32;
+        for (int r0 = 0; r0 < rows; r0 += Blk)
+        {
+            int rMax = Math.Min(r0 + Blk, rows);
+            for (int c0 = 0; c0 < cols; c0 += Blk)
+            {
+                int cMax = Math.Min(c0 + Blk, cols);
+                for (int r = r0; r < rMax; r++)
+                {
+                    int srcRow = r * cols;
+                    for (int c = c0; c < cMax; c++)
+                        dst[c * rows + r] = src[srcRow + c];
+                }
+            }
+        }
+    }
+
     private static void BuildKConcatStackFloat(
-        float[] gradOutputF, float[] inputF, float[] gradOutAll, float[] im2colAll,
+        float[] gradOutputF, float[] inputF, float[] gradOutAllT, float[] im2colAll,
         int batch, int outChannels, int inChannels, int colW, int colH, int batchColW,
         int inputSliceSize, int height, int width, int kernelHeight, int kernelWidth,
         int strideH, int strideW, int padH, int padW, int dilationH, int dilationW,
         int outputHeight, int outputWidth)
     {
+        // gradOutAllT[(b·colW+n), oc] = gradOutput[b, oc, n] — built TRANSPOSED so the K-concat
+        // backward GEMM is non-transposed (im2colAll · gradOutAllT) with M = colH, hitting the
+        // fast machine-code kernel (#573 follow-up; the transposed-B form was ~2 GF/s).
         for (int b = 0; b < batch; b++)
         {
             int gradOutOff = b * outChannels * colW;
+            int bColOff = b * colW;
             for (int oc = 0; oc < outChannels; oc++)
-                Array.Copy(gradOutputF, gradOutOff + oc * colW,
-                           gradOutAll, oc * batchColW + b * colW, colW);
+            {
+                int srcBase = gradOutOff + oc * colW;
+                for (int n = 0; n < colW; n++)
+                    gradOutAllT[(bColOff + n) * outChannels + oc] = gradOutputF[srcBase + n];
+            }
         }
         if (colW <= ParallelIm2colMaxColW)
         {
@@ -14102,33 +14130,43 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 int batchColW = batch * colW;
                 var kcPool = System.Buffers.ArrayPool<float>.Shared;
-                var gradOutAll = kcPool.Rent(outChannels * batchColW);
                 var im2colAll = kcPool.Rent(colH * batchColW);
+                var gradOutAllT = kcPool.Rent(batchColW * outChannels);
+                var gradKernelT = kcPool.Rent(colH * outChannels);
                 try
                 {
-                    // #403 Phase F: repack gradOutput + build the strided im2col
-                    // (channel-parallel at small colW, serial at large colW).
+                    // #403 Phase F: repack gradOutput (TRANSPOSED — see method) + build the strided
+                    // im2col (channel-parallel at small colW, serial at large colW).
                     BuildKConcatStackFloat(
-                        gradOutputF, inputF, gradOutAll, im2colAll,
+                        gradOutputF, inputF, gradOutAllT, im2colAll,
                         batch, outChannels, inChannels, colW, colH, batchColW,
                         inputSliceSize, height, width, kernelHeight, kernelWidth,
                         strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth);
 
-                    // gradKernel = gradOutAll @ im2colAll^T — one full-width GEMM.
+                    // #573 follow-up: the natural GEMM gradKernel = gradOut·im2colAllᵀ is transB=true with
+                    // M = outChannels (often thin, e.g. 16) — no microkernel handles that shape well
+                    // (~2 GF/s; transposed B access with K=batchColW stride is cache-hostile). gradOut is
+                    // built TRANSPOSED above so the result transpose is a NON-transposed GEMM whose M is
+                    // colH (= inC·kH·kW, ≥64 for real conv shapes) → hits the fast machine-code kernel:
+                    //   gradKernelᵀ[colH, oc] = im2colAll[colH, bcw] · gradOutAllᵀ[bcw, oc]
+                    // then transpose [colH, oc] back to gradKernelF[oc, colH]. Fixes the tiny-conv perf
+                    // gate AND removes the contention-variable transB tuned-strategy on large shapes.
                     if (!Helpers.BlasProvider.TryGemmEx(
-                        outChannels, colH, batchColW,
-                        gradOutAll, 0, batchColW, false,
-                        im2colAll, 0, batchColW, true,
-                        gradKernelF, 0, colH))
+                        colH, outChannels, batchColW,
+                        im2colAll, 0, batchColW, false,
+                        gradOutAllT, 0, outChannels, false,
+                        gradKernelT, 0, outChannels))
                     {
-                        // Top-level (not in a parallel region) so the parallel
-                        // SimdGemm.Sgemm self-parallelizes at full width.
-                        Simd.SimdGemm.Sgemm(
-                            new ReadOnlySpan<float>(gradOutAll, 0, outChannels * batchColW), batchColW, false,
-                            new ReadOnlySpan<float>(im2colAll, 0, colH * batchColW), batchColW, true,
-                            new Span<float>(gradKernelF, 0, outChannels * colH),
-                            outChannels, batchColW, colH);
+                        // PackingMode.Auto (default) so the no-trans machine-code 6×16 microkernel fires
+                        // (gated on Auto; handles any K, unlike TryThinMDirect which caps K at 1024) with
+                        // no autotune benchmark — it's deterministic (disjoint output tiles, fixed K order).
+                        Engines.BlasManaged.BlasManaged.Gemm<float>(
+                            new ReadOnlySpan<float>(im2colAll, 0, colH * batchColW), batchColW, false,
+                            new ReadOnlySpan<float>(gradOutAllT, 0, batchColW * outChannels), outChannels, false,
+                            new Span<float>(gradKernelT, 0, colH * outChannels), outChannels,
+                            colH, outChannels, batchColW);
                     }
+                    TransposeFloatRowMajor(gradKernelT, gradKernelF, colH, outChannels);
 
                     var opsKc = MathHelper.GetNumericOperations<T>();
                     var resultKc = new T[gradKernelF.Length];
@@ -14137,8 +14175,9 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
                 finally
                 {
-                    kcPool.Return(gradOutAll);
                     kcPool.Return(im2colAll);
+                    kcPool.Return(gradOutAllT);
+                    kcPool.Return(gradKernelT);
                 }
             }
 
