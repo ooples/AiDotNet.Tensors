@@ -559,6 +559,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         // shouldn't kill a training run when every later step would succeed eagerly anyway).
                         _graphStepDisabled = true;
                         if (_graphHasEmbedding) gte.EmbeddingIndexExternallyManaged = false;
+                        // Flush every pending deferred download BEFORE resuming eviction: the pre-residency pass
+                        // registered materializers against buffers that eviction will free — a later host read
+                        // would fire them on recycled memory ('released before materialization', the 12s C-BUILD
+                        // death observed on the 0.92.2 smoke).
+                        gte.MaterializeAllDeferred();
                         gte.ResumeActivationEviction();
                         _graphEvictionSuspended = false;
                         return StepEager();
@@ -575,6 +580,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         // buffer non-evictable, silently defeating AIDOTNET_GPU_OFFLOAD and risking OOM. The
                         // _graphEvictionSuspended flag also gates Dispose, so clearing it prevents a double-resume.
                         _graphStepDisabled = true;
+                        gte.MaterializeAllDeferred();   // flush pending downloads before their buffers are freed
                         gte.ResumeActivationEviction();
                         _graphEvictionSuspended = false;
                         return StepEager();

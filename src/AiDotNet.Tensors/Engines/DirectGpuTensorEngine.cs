@@ -1870,7 +1870,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         // Only safe while the step has eviction suspended: the source buffer is then guaranteed live for the
         // whole step (and across the captured graph's stable-buffer replay), so dest can borrow it.
-        if (!ResidentStepActive) { AliasDiag("skip: not on the compiled capture path"); return false; }
+        if (!ResidentStepActive)
+        {
+            bool capn = TryGetBackend(out var bk0) && bk0 is Engines.DirectGpu.CUDA.CudaBackend cbk0 && cbk0.IsStreamCapturing();
+            AliasDiag($"skip: not on capture path (depth={System.Threading.Volatile.Read(ref _capturePathDepth)} evict={EvictionSuspended} capturing={capn})");
+            return false;
+        }
         if (ReferenceEquals(src, dest)) return true;            // in-place op already resident; nothing to copy
         if (!TryGetBackend(out var backend)) { AliasDiag("skip: no backend"); return false; }
 
@@ -14822,10 +14827,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 DownloadGpuBufferInto(backend, bufOut, dst, output.Length);
             }
         }
-        catch (Exception)
+        catch (Exception pex)
         {
             // Any backend hiccup (allocation failure, kernel launch error)
-            // — fall back to the CPU strided-copy.
+            // — fall back to the CPU strided-copy. The swallowed exception is the ROOT CAUSE when this
+            // fallback then aborts a CUDA-graph capture (the host copy downloads) — log it for the diag.
+            AliasDiag($"PERMUTE-resident FELLBACK in=[{string.Join(",", tensor._shape)}]: {pex.GetType().Name}: {pex.Message}");
             base.TensorPermuteInto(output, tensor, axes);
         }
     }
