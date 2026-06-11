@@ -11878,8 +11878,30 @@ public partial class CpuEngine : ITensorLevelEngine
             var aArrF = (float[])(object)a.GetDataArray();
             var bArrF = (float[])(object)b.GetDataArray();
             var rArrF = (float[])(object)result.GetDataArray();
-            Simd.SimdGemm.Sgemm(aArrF.AsSpan(0, m * n), n, false, bArrF.AsSpan(0, n * p), p, false,
-                                rArrF.AsSpan(0, m * p), m, n, p);
+            // #573 follow-up: above a row-count floor, route through BlasManaged.Gemm (the same
+            // dispatcher the pre-packed path above uses) instead of the legacy full-trans
+            // SimdGemm.Sgemm overload. With NO PackedB handle it still packs B fresh every call
+            // (safe for in-place-mutated training weights), but it parallelizes the M-axis across
+            // cores — the legacy overload ran essentially single-threaded (~17 GF/s vs ~390 GF/s at
+            // [256,256]x[256,512] on a 32-core box; the MLP inference forward dropped 3.15→0.39 ms).
+            // DisableAutotune keeps the static-heuristic kernel choice (matching the
+            // Sgemm(a,b,c,m,k,n) shim's determinism contract); M-axis parallelism is bit-exact (each
+            // C element is one thread's full-K reduction, no cross-thread accumulation).
+            // Below the floor the parallel-dispatch overhead dominates the tiny per-row work, so the
+            // legacy single-pass kernel stays faster — keep it for m < BlasManagedParallelMinM.
+            const int BlasManagedParallelMinM = 64;
+            if (m >= BlasManagedParallelMinM)
+            {
+                Engines.BlasManaged.BlasManaged.Gemm<float>(
+                    aArrF.AsSpan(0, m * n), n, false, bArrF.AsSpan(0, n * p), p, false,
+                    rArrF.AsSpan(0, m * p), p, m, p, n,
+                    new Engines.BlasManaged.BlasOptions<float> { PackingMode = Engines.BlasManaged.PackingMode.DisableAutotune });
+            }
+            else
+            {
+                Simd.SimdGemm.Sgemm(aArrF.AsSpan(0, m * n), n, false, bArrF.AsSpan(0, n * p), p, false,
+                                    rArrF.AsSpan(0, m * p), m, n, p);
+            }
             return result;
         }
 

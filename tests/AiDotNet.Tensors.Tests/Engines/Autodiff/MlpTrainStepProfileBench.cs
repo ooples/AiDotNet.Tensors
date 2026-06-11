@@ -166,6 +166,30 @@ public class MlpTrainStepProfileBench
 
         _output.WriteLine($"ENGINE = {_engine.GetType().Name}");
         _output.WriteLine($"  raw GEMM [64,256]x[256,512]: {rawGemmMs:F4} ms ({gemmGflops:F1} GFLOP/s), alloc {rawGemmKb:F1} KB");
+        // Direct BlasManaged.Gemm (no engine dispatch, pre-allocated C) at M=256 — isolates the
+        // kernel from the eager TensorMatMul path (tape check, alloc, contiguity, dispatch).
+        {
+            int dm = 256, dk = 256, dn = 512;
+            var daArr = Rand(new[] { dm, dk }, 7).GetDataArray();
+            var dbArr = w0.GetDataArray();
+            var dc = new float[dm * dn];
+            void DirectGemm() => AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.Gemm<float>(
+                daArr.AsSpan(), dk, false, dbArr.AsSpan(), dn, false, dc.AsSpan(), dn, dm, dn, dk,
+                new AiDotNet.Tensors.Engines.BlasManaged.BlasOptions<float>());
+            for (int i = 0; i < 30; i++) DirectGemm();
+            double dms = MinMs(DirectGemm, 300);
+            double dgf = (2.0 * dm * dk * dn) / (dms * 1e6);
+            _output.WriteLine($"  DIRECT BlasManaged.Gemm M=256 (autotune ON):  {dms:F4} ms, {dgf:F1} GFLOP/s");
+            // Same, but DisableAutotune — exactly what the engine's SimdGemm.Sgemm shim passes.
+            void DirectGemmNoAuto() => AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.Gemm<float>(
+                daArr.AsSpan(), dk, false, dbArr.AsSpan(), dn, false, dc.AsSpan(), dn, dm, dn, dk,
+                new AiDotNet.Tensors.Engines.BlasManaged.BlasOptions<float>
+                { PackingMode = AiDotNet.Tensors.Engines.BlasManaged.PackingMode.DisableAutotune });
+            for (int i = 0; i < 30; i++) DirectGemmNoAuto();
+            double dms2 = MinMs(DirectGemmNoAuto, 300);
+            double dgf2 = (2.0 * dm * dk * dn) / (dms2 * 1e6);
+            _output.WriteLine($"  DIRECT BlasManaged.Gemm M=256 (DisableAutotune=engine path): {dms2:F4} ms, {dgf2:F1} GFLOP/s");
+        }
         // M-scaling: same K=256,N=512, growing M — isolates per-call packing/dispatch overhead.
         foreach (int m in new[] { 32, 64, 128, 256, 512, 1024 })
         {
