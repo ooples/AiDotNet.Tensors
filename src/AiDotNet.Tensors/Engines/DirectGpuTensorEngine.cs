@@ -1847,10 +1847,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     }
     private static void AliasDiag(string reason)
     {
-        if (System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") != "1") return;
+        string dbg = System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") ?? "";
+        if (dbg != "1" && dbg != "2") return;
         int n = s_aliasDiag.AddOrUpdate(reason, 1, (_, c) => c + 1);
-        if (n <= 3) try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(),
-            "aidotnet_graphcapture_diag.txt"), "[ALIAS] " + reason + System.Environment.NewLine); } catch { }
+        // "1" = dedupe to the first 3 occurrences of each distinct message; "2" = NO dedupe (every
+        // occurrence logged, prefixed with its count) — needed when an identical message from a legal
+        // phase (warmup) masks the same message from an illegal one (inside capture). Issue #584 tail.
+        if (dbg == "2" || n <= 3) try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(),
+            "aidotnet_graphcapture_diag.txt"), $"[ALIAS#{n}] " + reason + System.Environment.NewLine); } catch { }
+    } catch { }
     }
 
     internal static void CopyResultInto<T>(IEngine eng, Tensor<T> src, Tensor<T> dest)
