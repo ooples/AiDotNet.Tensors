@@ -879,7 +879,7 @@ extern ""C"" __global__ void parity210_pairwise_iou(const float* __restrict__ bo
 extern ""C"" __global__ void parity210_histogramdd(const float* __restrict__ samples, float* __restrict__ hist, const int* __restrict__ bins, const float* __restrict__ mins, const float* __restrict__ maxs, int n, int d)
 {
     int i = blockIdx.x*blockDim.x+threadIdx.x; if (i >= n) return; int linIdx = 0; int valid = 1;
-    for (int k = 0; k < d; k++) { float v = samples[i*d + k]; float mn = mins[k]; float mx = maxs[k]; if (v < mn || v > mx) { valid = 0; break; } float width = (mx - mn) / (float)bins[k]; int kIdx = (int)floorf((v - mn) / width); if (kIdx >= bins[k]) kIdx = bins[k] - 1; if (kIdx < 0) kIdx = 0; linIdx = linIdx * bins[k] + kIdx; }
+    for (int k = 0; k < d; k++) { float v = samples[i*d + k]; float mn = mins[k]; float mx = maxs[k]; if (!(v >= mn && v <= mx)) { valid = 0; break; } float width = (mx - mn) / (float)bins[k]; int kIdx = (int)floorf((v - mn) / width); if (kIdx >= bins[k]) kIdx = bins[k] - 1; if (kIdx < 0) kIdx = 0; linIdx = linIdx * bins[k] + kIdx; }
     if (valid) atomicAdd(&hist[linIdx], 1.0f);
 }
 extern ""C"" __global__ void parity210_gridsample_backward_input(const float* __restrict__ gradOut, const float* __restrict__ grid, float* __restrict__ gradIn, int batch, int H, int W, int C, int outH, int outW)
@@ -1010,7 +1010,7 @@ extern ""C"" __global__ void parity210_pdist(const float* __restrict__ input, fl
     float dist=(p==1.0f)?sum:(p==2.0f)?sqrtf(sum):powf(sum,1.0f/p); int outIdx=i*n-(i*(i+1))/2+(j-i-1); output[outIdx]=dist;
 }
 extern ""C"" __global__ void parity210_histc(const float* __restrict__ input, float* __restrict__ hist, int n, int bins, float mn, float mx) {
-    int idx = blockIdx.x*blockDim.x+threadIdx.x; if (idx>=n) return; float x=input[idx]; if (x<mn||x>mx) return;
+    int idx = blockIdx.x*blockDim.x+threadIdx.x; if (idx>=n) return; float x=input[idx]; if (!(x>=mn&&x<=mx)) return;
     float bw=(mx-mn)/(float)bins; int b=(int)((x-mn)/bw); if (b>=bins) b=bins-1; if (b<0) b=0; atomicAdd(&hist[b], 1.0f);
 }
 extern ""C"" __global__ void parity210_bitonic_step(float* __restrict__ values, float* __restrict__ indices, int rowLen, int k, int j, int numRows, int descending) {

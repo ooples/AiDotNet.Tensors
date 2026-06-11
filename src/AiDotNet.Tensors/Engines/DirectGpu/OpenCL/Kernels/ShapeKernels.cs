@@ -450,7 +450,7 @@ inline void atomicAddF(volatile __global float* addr, float val) {
 __kernel void histc(__global const float* input, volatile __global float* hist, int n, int bins, float mn, float mx) {
     int idx = get_global_id(0); if (idx >= n) return;
     float x = input[idx];
-    if (x < mn || x > mx) return;
+    if (!(x >= mn && x <= mx)) return; // drops NaN + out-of-range (matches torch.histc)
     float bw = (mx - mn) / (float)bins;
     int b = (int)((x - mn) / bw);
     if (b >= bins) b = bins - 1;
@@ -465,7 +465,7 @@ __kernel void histogramdd(__global const float* samples, volatile __global float
     int linIdx = 0; int valid = 1;
     for (int k = 0; k < d; k++) {
         float v = samples[i*d + k]; float mn = mins[k]; float mx = maxs[k];
-        if (v < mn || v > mx) { valid = 0; break; }
+        if (!(v >= mn && v <= mx)) { valid = 0; break; } // drops NaN + out-of-range
         float width = (mx - mn) / (float)bins[k];
         int kIdx = (int)floor((v - mn) / width);
         if (kIdx >= bins[k]) kIdx = bins[k] - 1;
@@ -474,7 +474,9 @@ __kernel void histogramdd(__global const float* samples, volatile __global float
     }
     if (valid) atomicAddF(&hist[linIdx], 1.0f);
 }
-// GridSample bilinear backward-to-input (NHWC, zeros pad, alignCorners=false-as-CPU). One thread per
+// GridSample bilinear backward-to-input (NHWC, zeros pad). Coordinate mapping is the align_corners=true
+// convention src=(g+1)/2*(size-1), exactly matching CpuEngine.GridSampleBackwardInput (the hard-coded
+// 3-arg reference these kernels are parity-tested against). One thread per
 // (b,oh,ow,c) output: scatter gradOut into the 4 bilinear input corners (atomic). gradIn pre-zeroed.
 __kernel void gridsample_backward_input(__global const float* gradOut, __global const float* grid,
     volatile __global float* gradIn, int batch, int H, int W, int C, int outH, int outW) {

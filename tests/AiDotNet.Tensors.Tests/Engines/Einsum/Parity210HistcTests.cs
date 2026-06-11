@@ -52,4 +52,15 @@ public class Parity210HistcTests
         var r = E.TensorHistc(x, bins: 3, min: 0f, max: 3f);
         Assert.Equal(new[] { 0f, 0f, 1f }, r.GetDataArray());
     }
+
+    [Fact]
+    public void Histc_NaNDropped()
+    {
+        // torch.histc ignores NaN (like out-of-range values). NaN must NOT be cast into
+        // a bin index — only the two finite in-range values are counted.
+        var x = new Tensor<float>(new[] { float.NaN, 1f, 2f, float.NaN }, new[] { 4 });
+        var r = E.TensorHistc(x, bins: 3, min: 0f, max: 3f);
+        Assert.Equal(2f, r[0] + r[1] + r[2]);
+        Assert.Equal(new[] { 0f, 1f, 1f }, r.GetDataArray());
+    }
 }

@@ -359,7 +359,7 @@ float p210_lgamma(float x) {
 void main() {
 
     int i = int(gl_GlobalInvocationID.x); if (i >= n) return; int linIdx = 0; int valid = 1;
-    for (int k = 0; k < d; k++) { float v = samples[i*d + k]; float mn = mins[k]; float mx = maxs[k]; if (v < mn || v > mx) { valid = 0; break; } float width = (mx - mn) / float(bins[k]); int kIdx = int(floor((v - mn) / width)); if (kIdx >= bins[k]) kIdx = bins[k] - 1; if (kIdx < 0) kIdx = 0; linIdx = linIdx * bins[k] + kIdx; }
+    for (int k = 0; k < d; k++) { float v = samples[i*d + k]; float mn = mins[k]; float mx = maxs[k]; if (!(v >= mn && v <= mx)) { valid = 0; break; } float width = (mx - mn) / float(bins[k]); int kIdx = int(floor((v - mn) / width)); if (kIdx >= bins[k]) kIdx = bins[k] - 1; if (kIdx < 0) kIdx = 0; linIdx = linIdx * bins[k] + kIdx; }
     if (valid) atomicAdd(hist[linIdx], 1.0);
 
 }";
@@ -734,7 +734,7 @@ float p210_lgamma(float x) {
 
 void main() {
 
-    int idx = int(gl_GlobalInvocationID.x); if (idx>=n) return; float x=input[idx]; if (x<mn||x>mx) return;
+    int idx = int(gl_GlobalInvocationID.x); if (idx>=n) return; float x=input[idx]; if (!(x>=mn&&x<=mx)) return;
     float bw=(mx-mn)/float(bins); int b=int(((x-mn)/bw)); if (b>=bins) b=bins-1; if (b<0) b=0; atomicAdd(hist[b], 1.0);
 
 }";

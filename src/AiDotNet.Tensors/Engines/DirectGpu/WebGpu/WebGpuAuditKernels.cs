@@ -439,7 +439,7 @@ fn p210_atomicAddF(buf: ptr<storage, array<atomic<u32>>, read_write>, idx: i32, 
 struct P { n: i32, bins: i32, mn: f32, mx: f32 };
 @group(0) @binding(2) var<uniform> pc : P;
 @compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-  let idx = i32(gid.x); if (idx >= pc.n) { return; } let x = inp[idx]; if (x < pc.mn || x > pc.mx) { return; }
+  let idx = i32(gid.x); if (idx >= pc.n) { return; } let x = inp[idx]; if (!(x >= pc.mn && x <= pc.mx)) { return; }
   let bw = (pc.mx - pc.mn) / f32(pc.bins); var b = i32((x - pc.mn) / bw); if (b >= pc.bins) { b = pc.bins - 1; } if (b < 0) { b = 0; }
   p210_atomicAddF(&hist, b, 1.0);
 }";
@@ -455,7 +455,7 @@ struct P { n: i32, d: i32 };
 @compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let i = i32(gid.x); if (i >= pc.n) { return; } var linIdx = 0; var valid = true;
   for (var k = 0; k < pc.d; k = k + 1) {
-    let v = samples[i * pc.d + k]; let mn = mins[k]; let mx = maxs[k]; if (v < mn || v > mx) { valid = false; break; }
+    let v = samples[i * pc.d + k]; let mn = mins[k]; let mx = maxs[k]; if (!(v >= mn && v <= mx)) { valid = false; break; }
     let width = (mx - mn) / f32(bins[k]); var kIdx = i32(floor((v - mn) / width)); if (kIdx >= bins[k]) { kIdx = bins[k] - 1; } if (kIdx < 0) { kIdx = 0; }
     linIdx = linIdx * bins[k] + kIdx;
   }

@@ -852,7 +852,7 @@ kernel void parity210_reflect_pad_1d(
     constant int& Lp [[buffer(4)]],
     constant int& pad [[buffer(5)]],
     uint gid [[thread_position_in_grid]]) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x; if (idx >= batch*Lp) return;
+    int idx = (int)gid; if (idx >= batch*Lp) return;
     int j = idx % Lp; int b = idx / Lp; int src;
     if (j < pad) src = pad - j; else if (j < pad + L) src = j - pad; else src = L - 2 - (j - pad - L);
     outp[idx] = inp[b*L + src];
@@ -870,7 +870,7 @@ kernel void parity210_stft_mag_phase(
     constant int& numFrames [[buffer(8)]],
     constant int& numFreqs [[buffer(9)]],
     uint gid [[thread_position_in_grid]]) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x; int total = batch*numFreqs*numFrames; if (idx >= total) return;
+    int idx = (int)gid; int total = batch*numFreqs*numFrames; if (idx >= total) return;
     int frame = idx % numFrames; int tmp = idx / numFrames; int k = tmp % numFreqs; int b = tmp / numFreqs;
     int start = frame * hop; int inOff = b * Lp; float re = 0.0f, im = 0.0f;
     float bk = -2.0f * M_PI_F * (float)k / (float)nFft;
@@ -890,7 +890,7 @@ kernel void parity210_phase_vocoder(
     constant int& outFrames [[buffer(7)]],
     constant float& rate [[buffer(8)]],
     uint gid [[thread_position_in_grid]]) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x; if (idx >= leading*nFreqV) return;
+    int idx = (int)gid; if (idx >= leading*nFreqV) return;
     int f = idx % nFreqV; int b = idx / nFreqV; int stride = nFramesV*nFreqV; int outStride = outFrames*nFreqV;
     float accPhase = 0.0f;
     for (int t = 0; t < outFrames; t++) {
@@ -913,7 +913,7 @@ kernel void parity210_build_spectrum(
     constant int& numFrames [[buffer(6)]],
     constant int& nFft [[buffer(7)]],
     uint gid [[thread_position_in_grid]]) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x; if (idx >= batch*numFrames) return;
+    int idx = (int)gid; if (idx >= batch*numFrames) return;
     int frame = idx % numFrames; int b = idx / numFrames; int magOff = b*numFreqs*numFrames; int specOff = idx * nFft;
     for (int k = 0; k < nFft; k++) { specRe[specOff+k] = 0.0f; specIm[specOff+k] = 0.0f; }
     for (int k = 0; k < numFreqs && k < nFft; k++) { float m = mag[magOff + k*numFrames + frame]; float p = phase[magOff + k*numFrames + frame]; specRe[specOff+k] = m*cos(p); specIm[specOff+k] = m*sin(p); }
@@ -933,7 +933,7 @@ kernel void parity210_istft_from_spectrum(
     constant int& outputLength [[buffer(9)]],
     constant int& center [[buffer(10)]],
     uint gid [[thread_position_in_grid]]) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x; int total = batch*numFrames*nFft; if (idx >= total) return;
+    int idx = (int)gid; int total = batch*numFrames*nFft; if (idx >= total) return;
     int i = idx % nFft; int tmp = idx / nFft; int frame = tmp % numFrames; int b = tmp / numFrames; int specOff = (b*numFrames + frame) * nFft;
     float acc = 0.0f;
     for (int k = 0; k < nFft; k++) { float a = 2.0f*M_PI_F*(float)k*(float)i/(float)nFft; acc += specRe[specOff+k]*cos(a) - specIm[specOff+k]*sin(a); }
@@ -946,7 +946,7 @@ kernel void parity210_istft_normalize(
     device const float* windowSum [[buffer(1)]],
     constant int& total [[buffer(2)]],
     uint gid [[thread_position_in_grid]]) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x; if (idx >= total) return;
+    int idx = (int)gid; if (idx >= total) return;
     float ws = windowSum[idx]; if (ws > 1e-8f) result[idx] = result[idx] / ws;
 }
 
@@ -1019,7 +1019,7 @@ kernel void parity210_histogramdd(
     constant int& d [[buffer(6)]],
     uint gid [[thread_position_in_grid]]) {
     int i = (int)gid; if (i >= n) return; int linIdx = 0; int valid = 1;
-    for (int k = 0; k < d; k++) { float v = samples[i*d + k]; float mn = mins[k]; float mx = maxs[k]; if (v < mn || v > mx) { valid = 0; break; } float width = (mx - mn) / (float)bins[k]; int kIdx = (int)floor((v - mn) / width); if (kIdx >= bins[k]) kIdx = bins[k] - 1; if (kIdx < 0) kIdx = 0; linIdx = linIdx * bins[k] + kIdx; }
+    for (int k = 0; k < d; k++) { float v = samples[i*d + k]; float mn = mins[k]; float mx = maxs[k]; if (!(v >= mn && v <= mx)) { valid = 0; break; } float width = (mx - mn) / (float)bins[k]; int kIdx = (int)floor((v - mn) / width); if (kIdx >= bins[k]) kIdx = bins[k] - 1; if (kIdx < 0) kIdx = 0; linIdx = linIdx * bins[k] + kIdx; }
     if (valid) atomic_fetch_add_explicit(&hist[linIdx], 1.0f, memory_order_relaxed);
 }
 
@@ -1212,7 +1212,7 @@ kernel void parity210_histc(
     constant float& mn [[buffer(4)]],
     constant float& mx [[buffer(5)]],
     uint gid [[thread_position_in_grid]]) {
-    int idx = (int)gid; if (idx>=n) return; float x=input[idx]; if (x<mn||x>mx) return;
+    int idx = (int)gid; if (idx>=n) return; float x=input[idx]; if (!(x>=mn&&x<=mx)) return;
     float bw=(mx-mn)/(float)bins; int b=(int)((x-mn)/bw); if (b>=bins) b=bins-1; if (b<0) b=0; atomic_fetch_add_explicit(&hist[b], 1.0f, memory_order_relaxed);
 }
 
@@ -1225,8 +1225,8 @@ kernel void parity210_bitonic_step(
     constant int& numRows [[buffer(5)]],
     constant int& descending [[buffer(6)]],
     uint gid [[thread_position_in_grid]]) {
-    int gid = (int)gid; if (gid>=numRows*rowLen) return; int i=gid%rowLen; int ixj=i^j; if (ixj<=i) return;
-    int base=(gid/rowLen)*rowLen; float a=values[base+i], b=values[base+ixj];
+    int gi = (int)gid; if (gi>=numRows*rowLen) return; int i=gi%rowLen; int ixj=i^j; if (ixj<=i) return;
+    int base=(gi/rowLen)*rowLen; float a=values[base+i], b=values[base+ixj];
     uint ua=as_type<uint>(a), ub=as_type<uint>(b);
     float ka=(((ua>>23)&0xFFu)==0xFFu&&(ua&0x7FFFFFu)!=0u)?INFINITY:a; float kb=(((ub>>23)&0xFFu)==0xFFu&&(ub&0x7FFFFFu)!=0u)?INFINITY:b;
     int up=((i&k)==0); if (descending!=0) up=!up; int doSwap=up?(ka>kb):(ka<kb);
@@ -1241,7 +1241,7 @@ kernel void parity210_copy_rows(
     constant int& numRows [[buffer(4)]],
     constant int& copyLen [[buffer(5)]],
     uint gid [[thread_position_in_grid]]) {
-    int gid = (int)gid; if (gid>=numRows*copyLen) return; int i=gid%copyLen; int r=gid/copyLen; dst[r*dstRowLen+i]=src[r*srcRowLen+i];
+    int gi = (int)gid; if (gi>=numRows*copyLen) return; int i=gi%copyLen; int r=gi/copyLen; dst[r*dstRowLen+i]=src[r*srcRowLen+i];
 }
 
 kernel void parity210_iota_pad(
@@ -1250,7 +1250,7 @@ kernel void parity210_iota_pad(
     constant int& P [[buffer(2)]],
     constant int& numRows [[buffer(3)]],
     uint gid [[thread_position_in_grid]]) {
-    int gid = (int)gid; if (gid>=numRows*P) return; int i=gid%P; idx[gid]=(i<L)?(float)i:-1.0f;
+    int gi = (int)gid; if (gi>=numRows*P) return; int i=gi%P; idx[gi]=(i<L)?(float)i:-1.0f;
 }
 
 kernel void parity210_hsoftmax_paths(
