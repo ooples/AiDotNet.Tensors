@@ -2807,7 +2807,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
         if (!TryGetBackend(out var backend)) return false;
-        if (a.Rank < 2 || !a.IsContiguous || !b.IsContiguous) return false;
+        if (a.Rank < 2 || !a.IsContiguous || !b.IsContiguous)
+        {
+            AliasDiag($"MM-decline rankA={a.Rank} contigA={a.IsContiguous} contigB={b.IsContiguous} a=[{string.Join(",", a._shape)}] b=[{string.Join(",", b._shape)}]");
+            return false;
+        }
         try
         {
             if (b.Rank == 2)
@@ -2847,6 +2851,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 BindResidentBuffer(output, outBuf, backend);
                 return true;
             }
+            AliasDiag($"MM-decline-shape rankA={a.Rank} rankB={b.Rank} a=[{string.Join(",", a._shape)}] b=[{string.Join(",", b._shape)}]");
             return false;
         }
         catch (Exception mex) { AliasDiag($"MM-resident FELLBACK a=[{string.Join(",", a._shape)}] b=[{string.Join(",", b._shape)}]: {mex.GetType().Name}: {mex.Message}"); return false; }
@@ -14580,6 +14585,31 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (!TryGetBackend(out var backend))
             return base.TensorMatMul(a, b);
+
+        // COMPILED CAPTURE PATH: main's BLAS routing records some matmul actions as `eng => eng.TensorMatMul(...)`
+        // (the allocating form) — without this branch the result is computed HOST-side and downloaded, firing a
+        // deferred materializer inside cuStreamBeginCapture (the 0.92-line capture abort). Allocate the output
+        // shape and run the resident GEMM/BatchedGemm into a stable cached buffer instead.
+        if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float))
+        {
+            int[] oShape;
+            if (b.Rank == 2 && a.Rank >= 2)
+            {
+                oShape = (int[])a._shape.Clone();
+                oShape[oShape.Length - 1] = b.Shape._dims[1];
+            }
+            else if (a.Rank == b.Rank && a.Rank >= 3)
+            {
+                oShape = (int[])a._shape.Clone();
+                oShape[oShape.Length - 1] = b.Shape._dims[b.Rank - 1];
+            }
+            else { oShape = System.Array.Empty<int>(); }
+            if (oShape.Length > 0)
+            {
+                var resOut = new Tensor<T>(oShape);
+                if (TryMatMulResidentInto(resOut, a, b)) return resOut;
+            }
+        }
 
         // Only the 2D × 2D case has a single-call GPU GEMM here. The rank-3+
         // shapes (broadcast 2D weights over batch dims, full ND × ND, etc.)
