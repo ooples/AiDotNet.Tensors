@@ -930,6 +930,21 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
         await WebGpuNativeBindings.SubmitAndWaitAsync();
     }
 
+    internal async System.Threading.Tasks.Task DispatchNBufferAsync(string moduleName, string source, string kernelName,
+        IGpuBuffer[] buffers, float[] uniformParams, int workSize)
+    {
+        ThrowIfNotInitialized();
+        var wbufs = new WebGpuBuffer[buffers.Length];
+        for (int i = 0; i < buffers.Length; i++) wbufs[i] = (WebGpuBuffer)buffers[i];
+        var pipelineId = await GetOrCreatePipelineAsync(moduleName, source, kernelName);
+        using var uniformBuffer = new WebGpuBuffer(uniformParams, WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst);
+        using var bindGroup = new WebGpuBindGroup(pipelineId, wbufs);
+        var (workgroups, _) = _device.CalculateWorkgroups1D(workSize);
+        await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(
+            pipelineId, bindGroup.BindGroupId, uniformBuffer.BufferId, workgroups, 1, 1);
+        await WebGpuNativeBindings.SubmitAndWaitAsync();
+    }
+
     internal async Task Dispatch3Buffer2DAsync(string moduleName, string source, string kernelName,
         IGpuBuffer a, IGpuBuffer b, IGpuBuffer c, float[] uniformParams, int workgroupsX, int workgroupsY)
     {
