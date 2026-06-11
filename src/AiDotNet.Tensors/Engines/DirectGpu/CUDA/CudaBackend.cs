@@ -9901,12 +9901,72 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public void Zeta(IGpuBuffer x, IGpuBuffer q, IGpuBuffer output, int size) => throw new NotSupportedException("Zeta not yet implemented on the CUDA backend.");
     public void Polygamma(IGpuBuffer x, IGpuBuffer output, int n, int size) => throw new NotSupportedException("Polygamma not yet implemented on the CUDA backend.");
     public void ShiftedDiff(IGpuBuffer x, IGpuBuffer mask, int n) => throw new NotSupportedException("ShiftedDiff not yet implemented on the CUDA backend.");
-    public void ReflectPad1d(IGpuBuffer input, IGpuBuffer output, int batch, int l, int lp, int pad) => throw new NotSupportedException("ReflectPad1d not yet implemented on the CUDA backend.");
-    public void StftMagPhase(IGpuBuffer padded, IGpuBuffer window, IGpuBuffer mag, IGpuBuffer phase, int batch, int lp, int nFft, int hop, int numFrames, int numFreqs) => throw new NotSupportedException("StftMagPhase not yet implemented on the CUDA backend.");
-    public void PhaseVocoder(IGpuBuffer mag, IGpuBuffer phase, IGpuBuffer newMag, IGpuBuffer newPhase, int leading, int nFramesV, int nFreqV, int outFrames, float rate) => throw new NotSupportedException("PhaseVocoder not yet implemented on the CUDA backend.");
-    public void BuildSpectrum(IGpuBuffer mag, IGpuBuffer phase, IGpuBuffer specRe, IGpuBuffer specIm, int batch, int numFreqs, int numFrames, int nFft) => throw new NotSupportedException("BuildSpectrum not yet implemented on the CUDA backend.");
-    public void IstftFromSpectrum(IGpuBuffer specRe, IGpuBuffer specIm, IGpuBuffer window, IGpuBuffer result, IGpuBuffer windowSum, int batch, int numFrames, int nFft, int hop, int outputLength, int center) => throw new NotSupportedException("IstftFromSpectrum not yet implemented on the CUDA backend.");
-    public void IstftNormalize(IGpuBuffer result, IGpuBuffer windowSum, int total) => throw new NotSupportedException("IstftNormalize not yet implemented on the CUDA backend.");
+    public unsafe void ReflectPad1d(IGpuBuffer input, IGpuBuffer output, int batch, int l, int lp, int pad)
+    {
+        var kernel = ResolveParity210Kernel("parity210_reflect_pad_1d");
+        using var _ = PushContext();
+        int __total = batch*lp; if (__total <= 0) return;
+        uint grid = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = input.Handle; IntPtr la1 = output.Handle; int la2 = batch; int la3 = l; int la4 = lp; int la5 = pad;
+        void** args = stackalloc void*[6];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+    public unsafe void StftMagPhase(IGpuBuffer padded, IGpuBuffer window, IGpuBuffer mag, IGpuBuffer phase, int batch, int lp, int nFft, int hop, int numFrames, int numFreqs)
+    {
+        var kernel = ResolveParity210Kernel("parity210_stft_mag_phase");
+        using var _ = PushContext();
+        int __total = batch*numFreqs*numFrames; if (__total <= 0) return;
+        uint grid = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = padded.Handle; IntPtr la1 = window.Handle; IntPtr la2 = mag.Handle; IntPtr la3 = phase.Handle; int la4 = batch; int la5 = lp; int la6 = nFft; int la7 = hop; int la8 = numFrames; int la9 = numFreqs;
+        void** args = stackalloc void*[10];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5; args[6] = &la6; args[7] = &la7; args[8] = &la8; args[9] = &la9;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+    public unsafe void PhaseVocoder(IGpuBuffer mag, IGpuBuffer phase, IGpuBuffer newMag, IGpuBuffer newPhase, int leading, int nFramesV, int nFreqV, int outFrames, float rate)
+    {
+        var kernel = ResolveParity210Kernel("parity210_phase_vocoder");
+        using var _ = PushContext();
+        int __total = leading*nFreqV; if (__total <= 0) return;
+        uint grid = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = mag.Handle; IntPtr la1 = phase.Handle; IntPtr la2 = newMag.Handle; IntPtr la3 = newPhase.Handle; int la4 = leading; int la5 = nFramesV; int la6 = nFreqV; int la7 = outFrames; float la8 = rate;
+        void** args = stackalloc void*[9];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5; args[6] = &la6; args[7] = &la7; args[8] = &la8;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+    public unsafe void BuildSpectrum(IGpuBuffer mag, IGpuBuffer phase, IGpuBuffer specRe, IGpuBuffer specIm, int batch, int numFreqs, int numFrames, int nFft)
+    {
+        var kernel = ResolveParity210Kernel("parity210_build_spectrum");
+        using var _ = PushContext();
+        int __total = batch*numFrames; if (__total <= 0) return;
+        uint grid = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = mag.Handle; IntPtr la1 = phase.Handle; IntPtr la2 = specRe.Handle; IntPtr la3 = specIm.Handle; int la4 = batch; int la5 = numFreqs; int la6 = numFrames; int la7 = nFft;
+        void** args = stackalloc void*[8];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5; args[6] = &la6; args[7] = &la7;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+    public unsafe void IstftFromSpectrum(IGpuBuffer specRe, IGpuBuffer specIm, IGpuBuffer window, IGpuBuffer result, IGpuBuffer windowSum, int batch, int numFrames, int nFft, int hop, int outputLength, int center)
+    {
+        var kernel = ResolveParity210Kernel("parity210_istft_from_spectrum");
+        using var _ = PushContext();
+        int __total = batch*numFrames*nFft; if (__total <= 0) return;
+        uint grid = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = specRe.Handle; IntPtr la1 = specIm.Handle; IntPtr la2 = window.Handle; IntPtr la3 = result.Handle; IntPtr la4 = windowSum.Handle; int la5 = batch; int la6 = numFrames; int la7 = nFft; int la8 = hop; int la9 = outputLength; int la10 = center;
+        void** args = stackalloc void*[11];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5; args[6] = &la6; args[7] = &la7; args[8] = &la8; args[9] = &la9; args[10] = &la10;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+    public unsafe void IstftNormalize(IGpuBuffer result, IGpuBuffer windowSum, int total)
+    {
+        var kernel = ResolveParity210Kernel("parity210_istft_normalize");
+        using var _ = PushContext();
+        int __total = total; if (__total <= 0) return;
+        uint grid = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = result.Handle; IntPtr la1 = windowSum.Handle; int la2 = total;
+        void** args = stackalloc void*[3];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
     public void HistogramDD(IGpuBuffer samples, IGpuBuffer hist, IGpuBuffer bins, IGpuBuffer mins, IGpuBuffer maxs, int n, int d) => throw new NotSupportedException("HistogramDD not yet implemented on the CUDA backend.");
     public void MasksToBoxes(IGpuBuffer masks, IGpuBuffer output, int n, int h, int w) => throw new NotSupportedException("MasksToBoxes not yet implemented on the CUDA backend.");
     public void PairwiseIou(IGpuBuffer boxes, IGpuBuffer iou, int n) => throw new NotSupportedException("PairwiseIou not yet implemented on the CUDA backend.");

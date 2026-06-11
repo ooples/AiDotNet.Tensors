@@ -43,6 +43,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels
             "parity210_cosine_similarity_last","parity210_cdist_l2",
             // Triangular + bitwise helpers
             "parity210_clamp_min_max",
+            // Audio/FFT audit
+            "parity210_reflect_pad_1d","parity210_stft_mag_phase","parity210_phase_vocoder",
+            "parity210_build_spectrum","parity210_istft_from_spectrum","parity210_istft_normalize",
         };
 
         public static string GetSource() => @"
@@ -873,6 +876,72 @@ extern ""C"" __global__ __launch_bounds__(256) void parity210_clamp_min_max(
     if (hasLo) { float l = lo[idx]; if (x < l) x = l; }
     if (hasHi) { float h = hi[idx]; if (x > h) x = h; }
     output[idx] = x;
+}
+
+// ==========================================================================
+// AUDIO / FFT (missing-kernels audit) — translated from the verified OpenCL kernels.
+// ==========================================================================
+extern ""C"" __global__ void parity210_reflect_pad_1d(
+    const float* __restrict__ inp, float* __restrict__ outp, int batch, int L, int Lp, int pad)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x; if (idx >= batch*Lp) return;
+    int j = idx % Lp; int b = idx / Lp; int src;
+    if (j < pad) src = pad - j; else if (j < pad + L) src = j - pad; else src = L - 2 - (j - pad - L);
+    outp[idx] = inp[b*L + src];
+}
+extern ""C"" __global__ void parity210_stft_mag_phase(
+    const float* __restrict__ padded, const float* __restrict__ window,
+    float* __restrict__ mag, float* __restrict__ phase, int batch, int Lp, int nFft, int hop, int numFrames, int numFreqs)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x; int total = batch*numFreqs*numFrames; if (idx >= total) return;
+    int frame = idx % numFrames; int tmp = idx / numFrames; int k = tmp % numFreqs; int b = tmp / numFreqs;
+    int start = frame * hop; int inOff = b * Lp; float re = 0.0f, im = 0.0f;
+    float bk = -2.0f * (float)M_PI * (float)k / (float)nFft;
+    for (int i = 0; i < nFft; i++) { float x = padded[inOff + start + i] * window[i]; float a = bk * (float)i; re += x*cosf(a); im += x*sinf(a); }
+    int outOff = b*numFreqs*numFrames + k*numFrames + frame;
+    mag[outOff] = sqrtf(re*re + im*im); phase[outOff] = atan2f(im, re);
+}
+extern ""C"" __global__ void parity210_phase_vocoder(
+    const float* __restrict__ mag, const float* __restrict__ phase,
+    float* __restrict__ newMag, float* __restrict__ newPhase, int leading, int nFramesV, int nFreqV, int outFrames, float rate)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x; if (idx >= leading*nFreqV) return;
+    int f = idx % nFreqV; int b = idx / nFreqV; int stride = nFramesV*nFreqV; int outStride = outFrames*nFreqV;
+    float accPhase = 0.0f;
+    for (int t = 0; t < outFrames; t++) {
+        float srcT = (float)t * rate; int t0 = (int)floorf(srcT); int t1 = min(t0+1, nFramesV-1); float frac = srcT - (float)t0;
+        float m0 = mag[b*stride + t0*nFreqV + f]; float m1 = mag[b*stride + t1*nFreqV + f];
+        newMag[b*outStride + t*nFreqV + f] = (1.0f-frac)*m0 + frac*m1;
+        float dp = 0.0f;
+        if (t0+1 < nFramesV) { dp = phase[b*stride + (t0+1)*nFreqV + f] - phase[b*stride + t0*nFreqV + f]; dp -= 2.0f*(float)M_PI * roundf(dp/(2.0f*(float)M_PI)); }
+        accPhase += dp; newPhase[b*outStride + t*nFreqV + f] = accPhase;
+    }
+}
+extern ""C"" __global__ void parity210_build_spectrum(
+    const float* __restrict__ mag, const float* __restrict__ phase,
+    float* __restrict__ specRe, float* __restrict__ specIm, int batch, int numFreqs, int numFrames, int nFft)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x; if (idx >= batch*numFrames) return;
+    int frame = idx % numFrames; int b = idx / numFrames; int magOff = b*numFreqs*numFrames; int specOff = idx * nFft;
+    for (int k = 0; k < nFft; k++) { specRe[specOff+k] = 0.0f; specIm[specOff+k] = 0.0f; }
+    for (int k = 0; k < numFreqs && k < nFft; k++) { float m = mag[magOff + k*numFrames + frame]; float p = phase[magOff + k*numFrames + frame]; specRe[specOff+k] = m*cosf(p); specIm[specOff+k] = m*sinf(p); }
+    for (int k = 1; k < numFreqs - 1; k++) { int dst = nFft - k; if (dst >= 0 && dst < nFft && k < nFft) { specRe[specOff+dst] = specRe[specOff+k]; specIm[specOff+dst] = -specIm[specOff+k]; } }
+}
+extern ""C"" __global__ void parity210_istft_from_spectrum(
+    const float* __restrict__ specRe, const float* __restrict__ specIm, const float* __restrict__ window,
+    float* __restrict__ result, float* __restrict__ windowSum, int batch, int numFrames, int nFft, int hop, int outputLength, int center)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x; int total = batch*numFrames*nFft; if (idx >= total) return;
+    int i = idx % nFft; int tmp = idx / nFft; int frame = tmp % numFrames; int b = tmp / numFrames; int specOff = (b*numFrames + frame) * nFft;
+    float acc = 0.0f;
+    for (int k = 0; k < nFft; k++) { float a = 2.0f*(float)M_PI*(float)k*(float)i/(float)nFft; acc += specRe[specOff+k]*cosf(a) - specIm[specOff+k]*sinf(a); }
+    int writeStart = center ? max(0, frame*hop - nFft/2) : frame*hop; int outIdx = writeStart + i;
+    if (outIdx >= 0 && outIdx < outputLength) { float w = window[i]; atomicAdd(&result[b*outputLength + outIdx], acc*(1.0f/(float)nFft)*w); atomicAdd(&windowSum[b*outputLength + outIdx], w*w); }
+}
+extern ""C"" __global__ void parity210_istft_normalize(float* __restrict__ result, const float* __restrict__ windowSum, int total)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x; if (idx >= total) return;
+    float ws = windowSum[idx]; if (ws > 1e-8f) result[idx] = result[idx] / ws;
 }
 ";
     }
