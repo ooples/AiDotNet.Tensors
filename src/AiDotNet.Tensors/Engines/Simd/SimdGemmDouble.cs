@@ -447,9 +447,42 @@ internal static partial class SimdGemm
         internal double[][] PackedPanels = System.Array.Empty<double[]>();
         internal int NumJcIters;
         internal int NumPcIters;
+        // Content fingerprint of the first K*N source elements at build time.
+        // Re-checked on every cache hit so an IN-PLACE weight mutation (an
+        // optimizer step / raw Data.Span write that doesn't notify the cache)
+        // is detected and forces a re-pack instead of serving stale packed
+        // weights — the double analogue of the float fix for AiDotNet #1221/#1331.
+        internal ulong Fingerprint;
     }
 
     private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<double[], PrePackedBDouble> _prePackedBDoubleCache = new();
+
+    /// <summary>
+    /// Content fingerprint over the double bit-patterns — the double analogue of
+    /// <see cref="SimdGemm.ComputeWeightFingerprint"/> (exact for small weights,
+    /// strided sample for large). Validates the transparent prepacked-B cache
+    /// against in-place weight mutation.
+    /// </summary>
+    internal static ulong ComputeWeightFingerprintDouble(System.ReadOnlySpan<double> data)
+    {
+        var bits = System.Runtime.InteropServices.MemoryMarshal.Cast<double, ulong>(data);
+        int n = bits.Length;
+        unchecked
+        {
+            ulong h = 1469598103934665603UL ^ (ulong)(uint)n;
+            if (n == 0) return h;
+            const int FullScanMax = 16384;
+            const int Samples = 1024;
+            int stride = n <= FullScanMax ? 1 : n / Samples;
+            for (int i = 0; i < n; i += stride)
+                h = (h ^ bits[i]) * 1099511628211UL;
+            h = (h ^ bits[n - 1]) * 1099511628211UL;
+            h ^= h >> 33;
+            h *= 0xff51afd7ed558ccdUL;
+            h ^= h >> 29;
+            return h;
+        }
+    }
     private static readonly object _prePackedBDoubleCacheLock = new();
 
     /// <summary>
@@ -483,6 +516,7 @@ internal static partial class SimdGemm
             PackedPanels = panels,
             NumJcIters = numJcIters,
             NumPcIters = numPcIters,
+            Fingerprint = ComputeWeightFingerprintDouble(new ReadOnlySpan<double>(b, 0, k * n)),
         };
     }
 
@@ -494,8 +528,16 @@ internal static partial class SimdGemm
     private static PrePackedBDouble? GetOrAddPrePackedBDouble(double[] b, int k, int n, int m)
     {
         if (b == null || b.Length == 0) return null;
+
+        // Content fingerprint of the live weight — re-validated against the
+        // cached entry so an in-place mutation that the cache wasn't notified
+        // of (optimizer step / raw Data.Span write) forces a re-pack instead of
+        // serving stale packed weights (AiDotNet #1221 / #1331).
+        ulong fingerprint = ComputeWeightFingerprintDouble(new ReadOnlySpan<double>(b, 0, k * n));
+
         if (_prePackedBDoubleCache.TryGetValue(b, out var existing)
-            && existing.K == k && existing.N == n && existing.Kc == DKc)
+            && existing.K == k && existing.N == n && existing.Kc == DKc
+            && existing.Fingerprint == fingerprint)
             return existing;
 
         // Build under lock to avoid two threads packing the same B
@@ -506,7 +548,8 @@ internal static partial class SimdGemm
             // Same-shape race: another thread added between our TryGetValue
             // and the lock — reuse theirs and skip rebuild.
             if (_prePackedBDoubleCache.TryGetValue(b, out var existing2)
-                && existing2.K == k && existing2.N == n && existing2.Kc == DKc)
+                && existing2.K == k && existing2.N == n && existing2.Kc == DKc
+                && existing2.Fingerprint == fingerprint)
                 return existing2;
 
             // Different-shape collision: the same b[] is in the cache but

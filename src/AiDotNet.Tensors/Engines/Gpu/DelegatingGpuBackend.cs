@@ -837,6 +837,9 @@ public class DelegatingGpuBackend : IDirectGpuBackend
     /// <inheritdoc/>
     public virtual IGpuBuffer AllocateIntBuffer(int[] data) => Inner.AllocateIntBuffer(data);
 
+    /// <inheritdoc/>
+    public virtual void UploadIntBufferInPlace(int[] data, IGpuBuffer buffer) => Inner.UploadIntBufferInPlace(data, buffer);
+
     #endregion
 
     #region Attention Operations

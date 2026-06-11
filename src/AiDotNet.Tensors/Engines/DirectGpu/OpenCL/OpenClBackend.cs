@@ -7427,6 +7427,10 @@ KERNEL VARIANTS (A/B testing):
             return new DirectOpenClGpuBuffer(buffer);
         }
 
+        /// <inheritdoc/>
+        public void UploadIntBufferInPlace(int[] data, IGpuBuffer buffer)
+            => throw new NotSupportedException("UploadIntBufferInPlace is not supported by the OpenCL backend.");
+
         public IGpuBuffer AllocateIntBuffer(int[] data)
         {
             if (_context == null)

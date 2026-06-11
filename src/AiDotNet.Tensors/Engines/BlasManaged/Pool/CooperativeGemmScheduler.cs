@@ -100,7 +100,7 @@ internal static class CooperativeGemmScheduler
             // .NET runtime threads exceed the logical cores, so the OS preempts active
             // workers and a stolen chunk stalls the caller's join — the p95 tail. Tunable
             // to leave runtime headroom (AIDOTNET_COOP_WORKERS).
-            _numWorkers = Math.Max(1, Environment.ProcessorCount - 1);
+            _numWorkers = AiDotNet.Tensors.Helpers.CpuParallelSettings.WorkerPoolThreads;   // capped (was ProcessorCount-1)
             if (int.TryParse(Environment.GetEnvironmentVariable("AIDOTNET_COOP_WORKERS"), out var wOverride) && wOverride >= 1)
                 _numWorkers = Math.Min(wOverride, Math.Max(1, Environment.ProcessorCount - 1));
             for (int i = 0; i < _numWorkers; i++)
