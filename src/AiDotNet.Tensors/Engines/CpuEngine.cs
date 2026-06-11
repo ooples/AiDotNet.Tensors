@@ -5973,7 +5973,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 return scope.RecordUnary(LazyNodeType.Custom, "TensorLog", tensor, tensor._shape,
                     (eng, output) =>
                     {
-                        if (eng is CpuEngine cpuEng) ((IEngine)cpuEng).TensorLogInto(output, captured);
+                        if (eng is CpuEngine cpuEng) cpuEng.TensorLogInto(output, captured);
                         else { var r = eng.TensorLog(captured); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.LogBackward);
@@ -6037,7 +6037,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 return scope.RecordUnary(LazyNodeType.Custom, "TensorExp", tensor, tensor._shape,
                     (eng, output) =>
                     {
-                        if (eng is CpuEngine cpuEng) ((IEngine)cpuEng).TensorExpInto(output, captured);
+                        if (eng is CpuEngine cpuEng) cpuEng.TensorExpInto(output, captured);
                         else { var r = eng.TensorExp(captured); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.ExpBackward);
@@ -6106,7 +6106,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 return scope.RecordUnary(LazyNodeType.Custom, "TensorSqrt", tensor, tensor._shape,
                     (eng, output) =>
                     {
-                        if (eng is CpuEngine cpuEng) ((IEngine)cpuEng).TensorSqrtInto(output, captured);
+                        if (eng is CpuEngine cpuEng) cpuEng.TensorSqrtInto(output, captured);
                         else { var r = eng.TensorSqrt(captured); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.SqrtBackward);
@@ -6156,7 +6156,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 return scope.RecordUnary(LazyNodeType.Custom, "TensorAbs", tensor, tensor._shape,
                     (eng, output) =>
                     {
-                        if (eng is CpuEngine cpuEng) ((IEngine)cpuEng).TensorAbsInto(output, captured);
+                        if (eng is CpuEngine cpuEng) cpuEng.TensorAbsInto(output, captured);
                         else { var r = eng.TensorAbs(captured); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.AbsBackward);
@@ -6548,7 +6548,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 return scope.RecordUnary(LazyNodeType.Custom, "Sin", tensor, tensor._shape,
                     (eng, output) =>
                     {
-                        if (eng is CpuEngine cpuEng) ((IEngine)cpuEng).TensorSinInto(output, captured);
+                        if (eng is CpuEngine cpuEng) cpuEng.TensorSinInto(output, captured);
                         else { var r = eng.TensorSin(captured); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.SinBackward);
@@ -6603,7 +6603,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 return scope.RecordUnary(LazyNodeType.Custom, "Cos", tensor, tensor._shape,
                     (eng, output) =>
                     {
-                        if (eng is CpuEngine cpuEng) ((IEngine)cpuEng).TensorCosInto(output, captured);
+                        if (eng is CpuEngine cpuEng) cpuEng.TensorCosInto(output, captured);
                         else { var r = eng.TensorCos(captured); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.CosBackward);
@@ -10526,7 +10526,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 return scope.RecordUnary(LazyNodeType.ELU, "ELU", tensor, tensor._shape,
                     (eng, output) =>
                     {
-                        if (eng is CpuEngine cpuEng) ((IEngine)cpuEng).ELUInto(output, captured, capturedAlpha);
+                        if (eng is CpuEngine cpuEng) cpuEng.ELUInto(output, captured, capturedAlpha);
                         else { var r = eng.ELU(captured, capturedAlpha); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.ELUBackward, new object[] { alpha });
