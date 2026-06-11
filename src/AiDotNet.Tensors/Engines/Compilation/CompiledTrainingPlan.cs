@@ -535,6 +535,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     IntPtr exec;
                     try
                     {
+                        // CAPTURE-PATH SCOPE (issue #26): the resident-buffer op branches engage ONLY inside this
+                        // scope. The eager optimizer update, warmup steps, and any shape-mismatch eager fallback
+                        // run OUTSIDE it and take the normal transient-alloc path — without this, their per-step
+                        // work allocated resident buffers under graph-lifetime eviction suspension and leaked
+                        // VRAM every step (a 488-step epoch OOM'd; the 76-step canary survived).
+                        using var _cap = Engines.DirectGpuTensorEngine.CompiledCapturePathScope.Enter();
                         if (_graphHasEmbedding) gte.EmbeddingIndexExternallyManaged = false;
                         RefreshGraphInputInPlace(cb);
                         RunGpuStepBodyForCapture(cb);

@@ -297,6 +297,34 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // Instance field + Interlocked so it is visible across the BLAS thread pool.
     private int _evictionSuspendDepth;
     internal bool EvictionSuspended => System.Threading.Volatile.Read(ref _evictionSuspendDepth) > 0;
+
+    /// <summary>TRUE only while the compiled plan runs the CAPTURE-PATH step body (pre-residency pass or inside
+    /// cuStreamBeginCapture) — set by CompiledTrainingPlan via <see cref="CompiledCapturePathScope"/>. The
+    /// GPU-RESIDENT op branches (stable cached output buffers, persistent-input resolution, output aliasing) gate
+    /// on THIS, not on EvictionSuspended alone: eviction stays suspended for the whole GRAPH LIFETIME, and routing
+    /// the NON-captured per-step work (the eager optimizer update, warmup steps, shape-mismatch eager fallbacks)
+    /// into resident allocations leaks VRAM every step — nothing is evictable, so a long epoch OOMs (issue #26:
+    /// canary 76 steps trained clean, a 488-step epoch OOM'd mid-epoch at two model sizes).</summary>
+    [ThreadStatic] internal static bool s_inCompiledCapturePath;
+
+    /// <summary>The correct gate for compiled-step resident-buffer behavior: buffers pinned (eviction suspended)
+    /// AND on the capture path (work the captured graph will replay).</summary>
+    internal bool ResidentStepActive => s_inCompiledCapturePath && EvictionSuspended;
+
+    /// <summary>RAII scope marking the compiled capture path (thread-static; nesting-safe).</summary>
+    internal struct CompiledCapturePathScope : IDisposable
+    {
+        private readonly bool _prev;
+        private bool _disposed;
+        public static CompiledCapturePathScope Enter()
+        {
+            var s = new CompiledCapturePathScope(s_inCompiledCapturePath);
+            s_inCompiledCapturePath = true;
+            return s;
+        }
+        private CompiledCapturePathScope(bool prev) { _prev = prev; _disposed = false; }
+        public void Dispose() { if (!_disposed) { s_inCompiledCapturePath = _prev; _disposed = true; } }
+    }
     internal void SuspendActivationEviction() => System.Threading.Interlocked.Increment(ref _evictionSuspendDepth);
     internal void ResumeActivationEviction()
     {
@@ -831,7 +859,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // is the LIVE data regardless of the host Version snapshot — accept it. Clearing it on a version
             // mismatch (the path below) would orphan a deferred materializer registered by BindResidentBuffer →
             // a later host read fires it on a recycled buffer = #226 "buffer released before materialization".
-            if (EvictionSuspended || (tensor._gpuBufferVersion == tensor.Version && IsCachedGpuBufferLive(tensor, backend)))
+            if (ResidentStepActive || (tensor._gpuBufferVersion == tensor.Version && IsCachedGpuBufferLive(tensor, backend)))
                 return new OwnedBuffer(tensor._gpuBuffer, ownsBuffer: false);
 
             // Stale snapshot — also clear any matching activation-cache entry so
@@ -1083,7 +1111,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // buffer to UploadTensorRaw callers.
         if (tensor._gpuBuffer is not null && ReferenceEquals(tensor._gpuBackend, backend))
         {
-            if (EvictionSuspended || (tensor._gpuBufferVersion == tensor.Version && IsCachedGpuBufferLive(tensor, backend)))
+            if (ResidentStepActive || (tensor._gpuBufferVersion == tensor.Version && IsCachedGpuBufferLive(tensor, backend)))
                 return new OwnedBuffer(tensor._gpuBuffer, ownsBuffer: false);   // compiled step: buffers pinned, don't orphan aliases
 
             var staleArray = tensor.DataVector.GetBackingArrayUnsafe();
@@ -1835,7 +1863,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         // Only safe while the step has eviction suspended: the source buffer is then guaranteed live for the
         // whole step (and across the captured graph's stable-buffer replay), so dest can borrow it.
-        if (!EvictionSuspended) { AliasDiag("skip: eviction not suspended"); return false; }
+        if (!ResidentStepActive) { AliasDiag("skip: not on the compiled capture path"); return false; }
         if (ReferenceEquals(src, dest)) return true;            // in-place op already resident; nothing to copy
         if (!TryGetBackend(out var backend)) { AliasDiag("skip: no backend"); return false; }
 
@@ -2727,7 +2755,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     internal bool TryLayerNormResidentInto<T>(Tensor<T> output, Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T>? mean, out Tensor<T>? variance)
     {
         mean = null; variance = null;
-        if (!EvictionSuspended || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
+        if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
         if (!TryGetBackend(out var backend) || input.Rank < 2) return false;
         var arr = output.DataVector.GetBackingArrayUnsafe();
         if (arr is null) return false;
@@ -2765,7 +2793,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// download that's a non-capturable CUDA-900 inside the graph capture). Returns false to fall back.</summary>
     internal bool TryMatMulResidentInto<T>(Tensor<T> output, Tensor<T> a, Tensor<T> b)
     {
-        if (!EvictionSuspended || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
+        if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
         if (!TryGetBackend(out var backend)) return false;
         if (a.Rank < 2 || b.Rank != 2 || !a.IsContiguous || !b.IsContiguous) return false;
         int K = b.Shape._dims[0];
@@ -2792,7 +2820,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// This is the SOURCE of the forward residency chain; without it every downstream op re-uploads.</summary>
     internal bool TryEmbeddingFromFloatIndicesResidentInto<T>(Tensor<T> output, Tensor<T> embeddings, Tensor<T> floatIndices, int numIndices, int embeddingDim)
     {
-        if (!EvictionSuspended || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
+        if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
         if (!TryGetBackend(out var backend) || !embeddings.IsContiguous || !floatIndices.IsContiguous) return false;
         if ((long)numIndices * embeddingDim != output.Length) return false;
         try
@@ -2821,7 +2849,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// materializes the input (DtoH download = non-capturable CUDA-900). Returns false to fall back.</summary>
     internal bool TrySliceAxisResidentInto<T>(Tensor<T> output, Tensor<T> input, int axis, int index)
     {
-        if (!EvictionSuspended || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
+        if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
         if (!TryGetBackend(out var backend) || !input.IsContiguous) return false;
         if (axis < 0 || axis >= input.Rank) return false;
         int outerSize = 1; for (int i = 0; i < axis; i++) outerSize *= input.Shape._dims[i];
@@ -2860,7 +2888,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// into the destination's stable buffer — no fresh alloc / no host fallback that breaks CUDA-graph capture.</summary>
     internal bool TryBroadcastAddResidentInto<T>(Tensor<T> output, Tensor<T> a, Tensor<T> b)
     {
-        if (!EvictionSuspended || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
+        if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
         if (!TryGetBackend(out var backend)) return false;
         Tensor<T> full, bias;
         if (a.Length == output.Length && b.Length > 0 && b.Length < a.Length) { full = a; bias = b; }
@@ -2926,7 +2954,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // GPU-RESIDENT compiled-step path: op directly into destination's stable buffer — no temp output
         // allocation and no DtoH download (both abort CUDA-graph capture + ping-pong host every op). Gated on
         // suspended eviction (the compiled step pins buffers) and no autocast fp16 remap.
-        if (EvictionSuspended && !Gpu.AutocastScope.IsEnabled)
+        if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled)
         {
             try
             {
@@ -3009,7 +3037,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         // GPU-RESIDENT compiled-step path (see TryRunBinaryInto): op into destination's stable buffer, no temp
         // alloc / no download — keeps the activation chain on-device for CUDA-graph capture.
-        if (EvictionSuspended && !Gpu.AutocastScope.IsEnabled)
+        if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled)
         {
             try
             {
@@ -14741,7 +14769,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // DOWNLOAD that followed: the GPU permute ran resident but the result was then DtoH-copied to host,
             // breaking the residency chain (the next op re-uploaded = cuMemcpyHtoD = a non-capturable 906; and the
             // GPU↔host ping-pong every op = the low-util cause).
-            if (EvictionSuspended)
+            if (ResidentStepActive)
             {
                 // COMPILED-STEP GPU-RESIDENT PATH: read the (resident) input, permute into a STABLE cached output
                 // buffer, leave output resident (no download). The output buffer is cached by output's backing
