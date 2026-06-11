@@ -2585,7 +2585,22 @@ public partial class CpuEngine : ITensorLevelEngine
                 var bFloat = new ReadOnlySpan<float>((float[])(object)bArr).Slice(b._storageOffset);
                 var cFloat = new Span<float>((float[])(object)rArr);
 
-                Simd.SimdGemm.Sgemm(aFloat, lda, transA, bFloat, ldb, transB, cFloat, m, k, n);
+                // #573 follow-up: route the (non-both-transpose) m>=64 case through the parallel
+                // BlasManaged.Gemm dispatcher instead of the single-threaded legacy SimdGemm.Sgemm
+                // overload — speeds the 2-D / batched-slice matmul used by attention (Q·Kᵀ, attn·V)
+                // and transformer forward. DisableAutotune = static-heuristic kernel (deterministic);
+                // M-axis split is bit-exact. Both-transpose (rare) and tiny-M keep the legacy kernel
+                // (BlasManaged's fast path declines transA&&transB; parallel dispatch loses on few rows).
+                if (m >= 64 && !(transA && transB))
+                {
+                    Engines.BlasManaged.BlasManaged.Gemm<float>(
+                        aFloat, lda, transA, bFloat, ldb, transB, cFloat, n, m, n, k,
+                        new Engines.BlasManaged.BlasOptions<float> { PackingMode = Engines.BlasManaged.PackingMode.DisableAutotune });
+                }
+                else
+                {
+                    Simd.SimdGemm.Sgemm(aFloat, lda, transA, bFloat, ldb, transB, cFloat, m, k, n);
+                }
                 DifferentiableOps.RecordBinary("BatchMatMul", result, aOrig, bOrig, BackwardFunctions<T>.BatchMatMulBackward);
                 { var ca = a; var cb = b; AutoTracer.RecordOp("BatchMatMul", result, eng => eng.BatchMatMul(ca, cb)); }
                 return result;

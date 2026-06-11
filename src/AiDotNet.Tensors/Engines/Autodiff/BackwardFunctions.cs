@@ -583,14 +583,24 @@ internal static class BackwardFunctions<T>
 
                             if (backwardWork >= MatMulBackwardSimdThreshold)
                             {
-                                // gradA[Mflat,K] = dC[Mflat,N] · Bᵀ[N,K]. Contiguous
-                                // leading-dim collapse lets us treat the rank-3 input
-                                // as rank-2 [Mflat, K] (same memory layout).
-                                SimdGemm.Sgemm(dCArr, N, false, bArr, N, true,
-                                    gradAData.AsSpan(0, Mflat * K), Mflat, N, K);
+                                // #573 follow-up: parallel transposed GEMMs via BlasManaged.Gemm —
+                                // the legacy full-trans SimdGemm.Sgemm overload these replaced ran
+                                // single-threaded (~17 GF/s vs ~435 parallel). This branch is gated
+                                // on backwardWork >= 20M, so M is always large enough to amortize
+                                // parallel dispatch (no per-call floor needed). DisableAutotune keeps
+                                // the static-heuristic kernel; transposed M-axis split is bit-exact
+                                // (each C element is one thread's full-K reduction).
+                                // gradA[Mflat,K] = dC[Mflat,N] · Bᵀ[N,K]. Contiguous leading-dim
+                                // collapse lets us treat the rank-3 input as rank-2 [Mflat,K].
+                                Engines.BlasManaged.BlasManaged.Gemm<float>(
+                                    dCArr, N, false, bArr, N, true,
+                                    gradAData.AsSpan(0, Mflat * K), K, Mflat, K, N,
+                                    new Engines.BlasManaged.BlasOptions<float> { PackingMode = Engines.BlasManaged.PackingMode.DisableAutotune });
                                 // gradB[K,N] = Aᵀ[K,Mflat] · dC[Mflat,N].
-                                SimdGemm.Sgemm(aArr, K, true, dCArr, N, false,
-                                    gradBData.AsSpan(0, K * N), K, Mflat, N);
+                                Engines.BlasManaged.BlasManaged.Gemm<float>(
+                                    aArr, K, true, dCArr, N, false,
+                                    gradBData.AsSpan(0, K * N), N, K, N, Mflat,
+                                    new Engines.BlasManaged.BlasOptions<float> { PackingMode = Engines.BlasManaged.PackingMode.DisableAutotune });
 
                                 DifferentiableOps.AccumulateGrad(grads, inputs[0], gradATensor, engine);
                                 DifferentiableOps.AccumulateGrad(grads, inputs[1], gradBTensor, engine);
