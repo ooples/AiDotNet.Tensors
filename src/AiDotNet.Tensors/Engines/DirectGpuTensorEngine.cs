@@ -2807,20 +2807,47 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
         if (!TryGetBackend(out var backend)) return false;
-        if (a.Rank < 2 || b.Rank != 2 || !a.IsContiguous || !b.IsContiguous) return false;
-        int K = b.Shape._dims[0];
-        int N = b.Shape._dims[1];
-        if (a.Shape._dims[a.Rank - 1] != K) return false;
-        int M = a.Length / K;
-        if ((long)M * N != output.Length) return false;
+        if (a.Rank < 2 || !a.IsContiguous || !b.IsContiguous) return false;
         try
         {
-            using var bufA = GetResidentOrPersistentInputBuffer(backend, a);
-            using var bufB = GetResidentOrPersistentInputBuffer(backend, b);
-            var outBuf = GetOrCreateResidentBuffer(backend, output, M * N);
-            backend.Gemm(bufA.Buffer, bufB.Buffer, outBuf, M, N, K, 1.0f, 0.0f);
-            BindResidentBuffer(output, outBuf, backend);
-            return true;
+            if (b.Rank == 2)
+            {
+                int K = b.Shape._dims[0];
+                int N = b.Shape._dims[1];
+                if (a.Shape._dims[a.Rank - 1] != K) return false;
+                int M = a.Length / K;
+                if ((long)M * N != output.Length) return false;
+                using var bufA = GetResidentOrPersistentInputBuffer(backend, a);
+                using var bufB = GetResidentOrPersistentInputBuffer(backend, b);
+                var outBuf = GetOrCreateResidentBuffer(backend, output, M * N);
+                backend.Gemm(bufA.Buffer, bufB.Buffer, outBuf, M, N, K, 1.0f, 0.0f);
+                BindResidentBuffer(output, outBuf, backend);
+                return true;
+            }
+            // BATCHED case (under merged main the rank-4 attention matmuls route through TensorMatMul):
+            // a = [..., M, K], b = [..., K, N] with identical leading batch dims — backend.BatchedGemm.
+            if (a.Rank == b.Rank && a.Rank >= 3)
+            {
+                int rk = a.Rank;
+                int Mb = a.Shape._dims[rk - 2];
+                int Kb = a.Shape._dims[rk - 1];
+                if (b.Shape._dims[rk - 2] != Kb) return false;
+                int Nb = b.Shape._dims[rk - 1];
+                int batch = 1;
+                for (int i = 0; i < rk - 2; i++)
+                {
+                    if (a.Shape._dims[i] != b.Shape._dims[i]) return false;
+                    batch *= a.Shape._dims[i];
+                }
+                if ((long)batch * Mb * Nb != output.Length) return false;
+                using var bufA = GetResidentOrPersistentInputBuffer(backend, a);
+                using var bufB = GetResidentOrPersistentInputBuffer(backend, b);
+                var outBuf = GetOrCreateResidentBuffer(backend, output, batch * Mb * Nb);
+                backend.BatchedGemm(bufA.Buffer, bufB.Buffer, outBuf, Mb, Nb, Kb, batch, 1.0f, 0.0f);
+                BindResidentBuffer(output, outBuf, backend);
+                return true;
+            }
+            return false;
         }
         catch (Exception mex) { AliasDiag($"MM-resident FELLBACK a=[{string.Join(",", a._shape)}] b=[{string.Join(",", b._shape)}]: {mex.GetType().Name}: {mex.Message}"); return false; }
     }
