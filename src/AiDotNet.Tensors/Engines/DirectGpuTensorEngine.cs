@@ -281,6 +281,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// Set to 0 to disable memory-based eviction (count-based only).
     /// </summary>
     private long _maxActivationCacheBytes;
+
+    // VRAM byte cap for the activation cache. Default = 75% of TOTAL device memory — which over-commits when
+    // other processes (the Windows desktop holds GBs) occupy the card: the cache saturates toward the cap and
+    // per-step transients then OOM at a fixed step horizon. AIDOTNET_ACT_CACHE_VRAM_MB overrides (MB).
+    private static long ResolveActCacheVramCap(long globalBytes)
+    {
+        var env = System.Environment.GetEnvironmentVariable("AIDOTNET_ACT_CACHE_VRAM_MB");
+        if (long.TryParse(env, out var mb) && mb > 0) return mb * 1024L * 1024L;
+        return globalBytes * 3 / 4;
+    }
+
     private long _currentActivationCacheBytes;
     private long _activationCacheTimestamp = 0;
 
@@ -339,7 +350,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         _directGpu = new DirectGpuEngine();
         _ownsDirectGpu = true;
-        _maxActivationCacheBytes = _directGpu.GlobalMemoryBytes * 3 / 4; // 75% of GPU memory
+        _maxActivationCacheBytes = ResolveActCacheVramCap(_directGpu.GlobalMemoryBytes); // see helper — env-overridablery
         _maxActivationManagedBytes = ResolveManagedCacheCapBytes();
     }
 
@@ -347,7 +358,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         _directGpu = directGpu;
         _ownsDirectGpu = false;
-        _maxActivationCacheBytes = directGpu?.GlobalMemoryBytes * 3 / 4 ?? 0;
+        _maxActivationCacheBytes = directGpu is null ? 0 : ResolveActCacheVramCap(directGpu.GlobalMemoryBytes);
         _maxActivationManagedBytes = ResolveManagedCacheCapBytes();
     }
 
