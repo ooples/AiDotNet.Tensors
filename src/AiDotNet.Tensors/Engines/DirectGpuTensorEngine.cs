@@ -855,6 +855,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     private OwnedBuffer GetOrAllocateBuffer<T>(IDirectGpuBackend backend, Tensor<T> tensor)
     {
+        // A non-contiguous tensor (or one with a nonzero storage offset) is a STRIDED VIEW: it shares
+        // its source's backing array, and any GPU buffer cached against that array holds the SOURCE's
+        // contiguous layout — NOT the view's permuted/sliced layout. The fast paths below all key off
+        // that shared backing array, so they would hand the kernel the source's data and silently
+        // ignore the view's strides (root cause of the deep permute<->flip chain divergence: a strided
+        // permute view of a deferred tensor read the un-permuted buffer). Materialize the view's logical
+        // layout into a fresh contiguous tensor first — Contiguous() reads via AsSpan (which triggers any
+        // pending deferred GPU download of the source) and applies the strides, so the buffer we upload
+        // matches the view. Contiguous() is a no-op (returns `this`) for already-contiguous, offset-0
+        // tensors, so this costs nothing on the hot contiguous path.
+        if (!tensor.IsContiguous || tensor._storageOffset != 0)
+            tensor = (Tensor<T>)tensor.Contiguous();
+
         // Fast path: tensor already has a GPU buffer from a previous GPU operation
         // AND nothing has mutated the tensor's CPU data since that upload (Version
         // bumps on IncrementVersion). If Version mismatched, the cached buffer

@@ -2638,7 +2638,8 @@ public partial class CpuEngine
         for (int i = 0; i < src.Length; i++)
         {
             var v = src[i];
-            if (ops.LessThan(v, loBound) || ops.GreaterThan(v, hiBound)) continue;
+            // NaN is ignored (matches torch.histc, which drops NaN/out-of-range values).
+            if (ops.IsNaN(v) || ops.LessThan(v, loBound) || ops.GreaterThan(v, hiBound)) continue;
             int idx;
             if (ops.Equals(v, hiBound)) idx = bins - 1;
             else
@@ -3198,7 +3199,8 @@ public partial class CpuEngine
             for (int k = 0; k < d; k++)
             {
                 var v = src[i * d + k];
-                if (ops.LessThan(v, mins[k]) || ops.GreaterThan(v, maxs[k]))
+                // NaN is ignored (a NaN in any dim drops the whole sample), matching torch.
+                if (ops.IsNaN(v) || ops.LessThan(v, mins[k]) || ops.GreaterThan(v, maxs[k]))
                 {
                     inRange = false; break;
                 }
@@ -3237,7 +3239,8 @@ public partial class CpuEngine
         for (int i = 0; i < src.Length; i++)
         {
             var v = src[i];
-            if (numOps.LessThan(v, min) || numOps.GreaterThan(v, max)) continue;
+            // NaN is ignored (matches torch histogram semantics).
+            if (numOps.IsNaN(v) || numOps.LessThan(v, min) || numOps.GreaterThan(v, max)) continue;
             // Bin index: floor((v - min) / width). Clamp the last-bin edge so
             // the upper boundary maps into the final bin.
             int idx;

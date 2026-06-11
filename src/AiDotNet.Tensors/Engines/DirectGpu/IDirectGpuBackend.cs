@@ -1886,12 +1886,182 @@ public interface IDirectGpuBackend : IDisposable
 
     void Gather(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output, int numIndices, int featureSize);
 
+    /// <summary>
+    /// Gather along one axis (torch.take_along_dim / gather): output[outer, j, inner] =
+    /// input[outer, indices[outer, j, inner], inner]. The tensor is viewed as [outerSize, axisIn,
+    /// innerSize]; the index tensor (and the output) as [outerSize, axisOut, innerSize]; indices select
+    /// positions along the axis (each must be in [0, axisIn)).
+    /// </summary>
+    void TakeAlongDim(IGpuBuffer input, IGpuBuffer indices, IGpuBuffer output,
+        int outerSize, int axisOut, int innerSize, int axisIn);
+
+    /// <summary>
+    /// 3-vector cross product along an axis of size 3. a/b/output viewed as [outerSize, 3, innerSize];
+    /// out[o,:,i] = a[o,:,i] × b[o,:,i].
+    /// </summary>
+    void Cross3(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int outerSize, int innerSize);
+
+    /// <summary>
+    /// Ldexp: output[i] = input[i] * 2^exponents[i], where <paramref name="exponents"/> is an INT buffer.
+    /// </summary>
+    void Ldexp(IGpuBuffer input, IGpuBuffer exponents, IGpuBuffer output, int size);
+
+    /// <summary>
+    /// 2-D Kronecker product: a is [am, an], b is [bp, bq], output is [am*bp, an*bq] with
+    /// output[i*bp+k, j*bq+l] = a[i,j] * b[k,l].
+    /// </summary>
+    void Kron2D(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int am, int an, int bp, int bq);
+
+    /// <summary>
+    /// searchsorted/bucketize: per value, binary-search its insertion index into the 1-D sorted
+    /// sequence. <paramref name="right"/>=0 is lower_bound (seq[i-1] &lt; v &lt;= seq[i]); =1 is
+    /// upper_bound (seq[i-1] &lt;= v &lt; seq[i]). The index is written as a float (exact for the small
+    /// index range).
+    /// </summary>
+    void SearchSorted(IGpuBuffer sortedSeq, IGpuBuffer values, IGpuBuffer output, int seqLen, int numValues, int right);
+
+    /// <summary>
+    /// IEEE nextafter: output[i] = the next representable float after a[i] in the direction of b[i].
+    /// Implementations MUST detect NaN via the bit pattern (fast-math hazard) and manipulate the float
+    /// bits directly.
+    /// </summary>
+    void NextAfter(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int size);
+
+    /// <summary>
+    /// index_copy / index_fill scatter-write along an axis. <paramref name="output"/> must already hold
+    /// the original tensor. Viewing output as [outerSize, dstAxis, innerSize] and the 1-D index list of
+    /// length idxAxis: for each (outer, j, inner), output[outer, indices[j], inner] = mode==0 ?
+    /// source[outer, j, inner] : fillValue. Out-of-range index entries are skipped. (Duplicate indices
+    /// in copy-mode are unspecified, matching torch.index_copy.)
+    /// </summary>
+    void IndexWrite(IGpuBuffer output, IGpuBuffer indices, IGpuBuffer source, float fillValue, int mode,
+        int outerSize, int idxAxis, int innerSize, int dstAxis);
+
+    /// <summary>
+    /// Cross pairwise p-norm distance: x1 is [m, d], x2 is [n, d], output is [m, n] with
+    /// output[i,j] = ‖x1[i] − x2[j]‖_p.
+    /// </summary>
+    void CDist(IGpuBuffer x1, IGpuBuffer x2, IGpuBuffer output, int m, int n, int d, float p);
+
+    /// <summary>
+    /// Condensed pairwise p-norm distance over the n rows of input [n, d]. Output is 1-D of length
+    /// n*(n-1)/2 in row-major upper-triangle order (0,1),(0,2),...,(1,2),...
+    /// </summary>
+    void PDist(IGpuBuffer input, IGpuBuffer output, int n, int d, float p);
+
+    /// <summary>
+    /// Histogram of <paramref name="input"/> into <paramref name="bins"/> equal-width bins over
+    /// [mn, mx]; values outside the range are dropped, mx falls in the last bin. <paramref name="hist"/>
+    /// must be pre-zeroed (length bins). Counts accumulate via an atomic float add.
+    /// </summary>
+    void Histc(IGpuBuffer input, IGpuBuffer hist, int n, int bins, float mn, float mx);
+
+    /// <summary>
+    /// One bitonic compare-exchange step over numRows rows of length rowLen (a power of two). k is the
+    /// current bitonic sequence size, j the compare distance; the host drives the (k, j) schedule.
+    /// values and indices are co-permuted; NaN sorts as +inf (torch.sort order).
+    /// </summary>
+    void BitonicStep(IGpuBuffer values, IGpuBuffer indices, int rowLen, int k, int j, int numRows, int descending);
+
+    /// <summary>Copy the first copyLen elements of each row (src stride srcRowLen → dst stride dstRowLen).</summary>
+    void CopyRows(IGpuBuffer src, IGpuBuffer dst, int srcRowLen, int dstRowLen, int numRows, int copyLen);
+
+    /// <summary>Initialize padded index rows: idx[r*P + i] = (i &lt; L) ? i : -1.</summary>
+    void IotaPad(IGpuBuffer idx, int l, int p, int numRows);
+
+    /// <summary>
+    /// RWKV-7 (WKV7 generalized delta rule) sequence forward, parallel over (batch, head) with a
+    /// per-(b,h) [headDim,headDim] state in the <paramref name="sbuf"/> scratch (size batch*numHeads*headDim^2).
+    /// </summary>
+    void Rwkv7Forward(IGpuBuffer r, IGpuBuffer k, IGpuBuffer v, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output,
+        IGpuBuffer sbuf, int batch, int seqLen, int modelDim, int numHeads, int headDim);
+
+    /// <summary>
+    /// Hierarchical-softmax leaf probabilities from raw per-level node activations `acts` [rows, treeDepth]
+    /// (sigmoid applied internally). Output is [rows, numClasses].
+    /// </summary>
+    void HierarchicalSoftmaxPaths(IGpuBuffer acts, IGpuBuffer output, int rows, int treeDepth, int numClasses);
+
+    /// <summary>isin membership mask: mask[i] = elements[i] ∈ ascending sortedTest ? 1 : 0.</summary>
+    void IsIn(IGpuBuffer elements, IGpuBuffer sortedTest, IGpuBuffer mask, int numElements, int testLen);
+
+    /// <summary>Place a [blockRows, blockCols] block at (rowOff, colOff) in a totalCols-wide output matrix.</summary>
+    void CopyBlock2D(IGpuBuffer block, IGpuBuffer output, int blockRows, int blockCols, int totalCols, int rowOff, int colOff);
+
+    /// <summary>Elementwise Hurwitz zeta zeta(x[i], q[i]).</summary>
+    void Zeta(IGpuBuffer x, IGpuBuffer q, IGpuBuffer output, int size);
+
+    /// <summary>Elementwise polygamma psi^(n)(x[i]) for n>=1.</summary>
+    void Polygamma(IGpuBuffer x, IGpuBuffer output, int n, int size);
+
+    /// <summary>mask[i] = (i==0 || x[i] != x[i-1]) ? 1 : 0 (consecutive-unique keep mask).</summary>
+    void ShiftedDiff(IGpuBuffer x, IGpuBuffer mask, int n);
+
+    /// <summary>Reflect-pad the last axis by `pad` each side (numpy reflect, edge excluded).</summary>
+    void ReflectPad1d(IGpuBuffer input, IGpuBuffer output, int batch, int l, int lp, int pad);
+
+    /// <summary>STFT magnitude+phase: per (b,k,frame) DFT bin of the windowed frame. out [b][k*numFrames+frame].</summary>
+    void StftMagPhase(IGpuBuffer padded, IGpuBuffer window, IGpuBuffer mag, IGpuBuffer phase, int batch, int lp, int nFft, int hop, int numFrames, int numFreqs);
+
+    /// <summary>Phase vocoder time-axis remap + phase accumulation (one thread per (b,f)).</summary>
+    void PhaseVocoder(IGpuBuffer mag, IGpuBuffer phase, IGpuBuffer newMag, IGpuBuffer newPhase, int leading, int nFramesV, int nFreqV, int outFrames, float rate);
+
+    /// <summary>Build the full conj-symmetric spectrum (two CPU passes in order) from mag/phase.</summary>
+    void BuildSpectrum(IGpuBuffer mag, IGpuBuffer phase, IGpuBuffer specRe, IGpuBuffer specIm, int batch, int numFreqs, int numFrames, int nFft);
+
+    /// <summary>Inverse STFT from the full spectrum: windowed overlap-add (atomic) into result + windowSum.</summary>
+    void IstftFromSpectrum(IGpuBuffer specRe, IGpuBuffer specIm, IGpuBuffer window, IGpuBuffer result, IGpuBuffer windowSum, int batch, int numFrames, int nFft, int hop, int outputLength, int center);
+
+    /// <summary>ISTFT normalize: result /= windowSum where windowSum &gt; 1e-8.</summary>
+    void IstftNormalize(IGpuBuffer result, IGpuBuffer windowSum, int total);
+
+    /// <summary>D-dim histogram (atomic). bins int[D], mins/maxs float[D]; hist pre-zeroed length prod(bins).</summary>
+    void HistogramDD(IGpuBuffer samples, IGpuBuffer hist, IGpuBuffer bins, IGpuBuffer mins, IGpuBuffer maxs, int n, int d);
+
+    /// <summary>Per-mask bounding box (xMin,yMin,xMax,yMax of nonzero pixels) for masks [N,H,W] -> out [N,4].</summary>
+    void MasksToBoxes(IGpuBuffer masks, IGpuBuffer output, int n, int h, int w);
+
+    /// <summary>Pairwise IoU matrix iou[i*N+j] for boxes [N,4] (x1,y1,x2,y2).</summary>
+    void PairwiseIou(IGpuBuffer boxes, IGpuBuffer iou, int n);
+
+    /// <summary>Boolean op on float-0/1 masks. mode 0=and,1=or,2=xor.</summary>
+    void LogicalOp(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int mode, int n);
+
+    /// <summary>Logical NOT on a float-0/1 mask.</summary>
+    void LogicalNot(IGpuBuffer a, IGpuBuffer output, int n);
+
+    /// <summary>GridSample bilinear backward-to-input (NHWC, zeros pad). gradIn pre-zeroed.</summary>
+    void GridSampleBackwardInputNhwc(IGpuBuffer gradOut, IGpuBuffer grid, IGpuBuffer gradIn, int batch, int h, int w, int c, int outH, int outW);
+
+    /// <summary>GridSample bilinear backward-to-grid (NHWC). gradGrid is [batch,outH,outW,2].</summary>
+    void GridSampleBackwardGridNhwc(IGpuBuffer gradOut, IGpuBuffer input, IGpuBuffer grid, IGpuBuffer gradGrid, int batch, int h, int w, int c, int outH, int outW);
+
+    /// <summary>
+    /// scatter_reduce along a dim with atomic reduction (mode 0=sum,1=prod,2=amax,3=amin). output is
+    /// pre-seeded with the original tensor (includeSelf); source/index viewed [outerSize, srcDim, innerSize].
+    /// </summary>
+    void ScatterReduce(IGpuBuffer output, IGpuBuffer source, IGpuBuffer index, int outerSize, int srcDim, int dstDim, int innerSize, int mode);
+
+    /// <summary>
+    /// Sliding-window unfold along a dim. src viewed [outerSize, dimSize, innerSize]; output
+    /// [outerSize, nWindows, innerSize, size] with out[o,w,i,s] = src[o, w*step+s, i].
+    /// </summary>
+    void Unfold(IGpuBuffer src, IGpuBuffer dst, int outerSize, int dimSize, int innerSize, int nWindows, int size, int step);
+
     #region Comparison Operations
 
     void GreaterThan(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size);
     void LessThan(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size);
     void Equal(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size);
     void Where(IGpuBuffer condition, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size);
+
+    /// <summary>
+    /// IEEE-754 classification predicate: C[i] = predicate(A[i]) ? 1.0 : 0.0. The predicate is selected
+    /// by <paramref name="mode"/>: 0 = isnan, 1 = isinf, 2 = isfinite. Implementations MUST use the
+    /// float's bit pattern (exponent == 0xFF; mantissa != 0 for NaN, == 0 for Inf), NOT the language
+    /// <c>!=</c>/<c>isnan</c> built-ins, because GPU compilers under fast/finite-math fold those away.
+    /// </summary>
+    void ClassifyFloat(IGpuBuffer A, IGpuBuffer C, int mode, int size);
 
     /// <summary>
     /// Element-wise not-equal comparison against a scalar: C[i] = (A[i] != scalar) ? 1.0f : 0.0f

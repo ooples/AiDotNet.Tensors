@@ -1431,6 +1431,78 @@ public class DelegatingGpuBackend : IDirectGpuBackend
 
     /// <inheritdoc/>
     public virtual void Equal(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) => Inner.Equal(A, B, C, size);
+    /// <inheritdoc/>
+    public virtual void ClassifyFloat(IGpuBuffer A, IGpuBuffer C, int mode, int size) => Inner.ClassifyFloat(A, C, mode, size);
+    /// <inheritdoc/>
+    public virtual void TakeAlongDim(IGpuBuffer input, IGpuBuffer indices, IGpuBuffer output, int outerSize, int axisOut, int innerSize, int axisIn) => Inner.TakeAlongDim(input, indices, output, outerSize, axisOut, innerSize, axisIn);
+    /// <inheritdoc/>
+    public virtual void Cross3(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int outerSize, int innerSize) => Inner.Cross3(a, b, output, outerSize, innerSize);
+    /// <inheritdoc/>
+    public virtual void Ldexp(IGpuBuffer input, IGpuBuffer exponents, IGpuBuffer output, int size) => Inner.Ldexp(input, exponents, output, size);
+    /// <inheritdoc/>
+    public virtual void Kron2D(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int am, int an, int bp, int bq) => Inner.Kron2D(a, b, output, am, an, bp, bq);
+    /// <inheritdoc/>
+    public virtual void SearchSorted(IGpuBuffer sortedSeq, IGpuBuffer values, IGpuBuffer output, int seqLen, int numValues, int right) => Inner.SearchSorted(sortedSeq, values, output, seqLen, numValues, right);
+    /// <inheritdoc/>
+    public virtual void NextAfter(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int size) => Inner.NextAfter(a, b, output, size);
+    /// <inheritdoc/>
+    public virtual void IndexWrite(IGpuBuffer output, IGpuBuffer indices, IGpuBuffer source, float fillValue, int mode, int outerSize, int idxAxis, int innerSize, int dstAxis) => Inner.IndexWrite(output, indices, source, fillValue, mode, outerSize, idxAxis, innerSize, dstAxis);
+    /// <inheritdoc/>
+    public virtual void CDist(IGpuBuffer x1, IGpuBuffer x2, IGpuBuffer output, int m, int n, int d, float p) => Inner.CDist(x1, x2, output, m, n, d, p);
+    /// <inheritdoc/>
+    public virtual void PDist(IGpuBuffer input, IGpuBuffer output, int n, int d, float p) => Inner.PDist(input, output, n, d, p);
+    /// <inheritdoc/>
+    public virtual void Histc(IGpuBuffer input, IGpuBuffer hist, int n, int bins, float mn, float mx) => Inner.Histc(input, hist, n, bins, mn, mx);
+    /// <inheritdoc/>
+    public virtual void BitonicStep(IGpuBuffer values, IGpuBuffer indices, int rowLen, int k, int j, int numRows, int descending) => Inner.BitonicStep(values, indices, rowLen, k, j, numRows, descending);
+    /// <inheritdoc/>
+    public virtual void CopyRows(IGpuBuffer src, IGpuBuffer dst, int srcRowLen, int dstRowLen, int numRows, int copyLen) => Inner.CopyRows(src, dst, srcRowLen, dstRowLen, numRows, copyLen);
+    /// <inheritdoc/>
+    public virtual void IotaPad(IGpuBuffer idx, int l, int p, int numRows) => Inner.IotaPad(idx, l, p, numRows);
+    /// <inheritdoc/>
+    public virtual void Rwkv7Forward(IGpuBuffer r, IGpuBuffer k, IGpuBuffer v, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, IGpuBuffer sbuf, int batch, int seqLen, int modelDim, int numHeads, int headDim) => Inner.Rwkv7Forward(r, k, v, a, b, output, sbuf, batch, seqLen, modelDim, numHeads, headDim);
+    /// <inheritdoc/>
+    public virtual void HierarchicalSoftmaxPaths(IGpuBuffer acts, IGpuBuffer output, int rows, int treeDepth, int numClasses) => Inner.HierarchicalSoftmaxPaths(acts, output, rows, treeDepth, numClasses);
+    /// <inheritdoc/>
+    public virtual void IsIn(IGpuBuffer elements, IGpuBuffer sortedTest, IGpuBuffer mask, int numElements, int testLen) => Inner.IsIn(elements, sortedTest, mask, numElements, testLen);
+    /// <inheritdoc/>
+    public virtual void CopyBlock2D(IGpuBuffer block, IGpuBuffer output, int blockRows, int blockCols, int totalCols, int rowOff, int colOff) => Inner.CopyBlock2D(block, output, blockRows, blockCols, totalCols, rowOff, colOff);
+    /// <inheritdoc/>
+    public virtual void Zeta(IGpuBuffer x, IGpuBuffer q, IGpuBuffer output, int size) => Inner.Zeta(x, q, output, size);
+    /// <inheritdoc/>
+    public virtual void Polygamma(IGpuBuffer x, IGpuBuffer output, int n, int size) => Inner.Polygamma(x, output, n, size);
+    /// <inheritdoc/>
+    public virtual void ShiftedDiff(IGpuBuffer x, IGpuBuffer mask, int n) => Inner.ShiftedDiff(x, mask, n);
+    /// <inheritdoc/>
+    public virtual void ReflectPad1d(IGpuBuffer input, IGpuBuffer output, int batch, int l, int lp, int pad) => Inner.ReflectPad1d(input, output, batch, l, lp, pad);
+    /// <inheritdoc/>
+    public virtual void StftMagPhase(IGpuBuffer padded, IGpuBuffer window, IGpuBuffer mag, IGpuBuffer phase, int batch, int lp, int nFft, int hop, int numFrames, int numFreqs) => Inner.StftMagPhase(padded, window, mag, phase, batch, lp, nFft, hop, numFrames, numFreqs);
+    /// <inheritdoc/>
+    public virtual void PhaseVocoder(IGpuBuffer mag, IGpuBuffer phase, IGpuBuffer newMag, IGpuBuffer newPhase, int leading, int nFramesV, int nFreqV, int outFrames, float rate) => Inner.PhaseVocoder(mag, phase, newMag, newPhase, leading, nFramesV, nFreqV, outFrames, rate);
+    /// <inheritdoc/>
+    public virtual void BuildSpectrum(IGpuBuffer mag, IGpuBuffer phase, IGpuBuffer specRe, IGpuBuffer specIm, int batch, int numFreqs, int numFrames, int nFft) => Inner.BuildSpectrum(mag, phase, specRe, specIm, batch, numFreqs, numFrames, nFft);
+    /// <inheritdoc/>
+    public virtual void IstftFromSpectrum(IGpuBuffer specRe, IGpuBuffer specIm, IGpuBuffer window, IGpuBuffer result, IGpuBuffer windowSum, int batch, int numFrames, int nFft, int hop, int outputLength, int center) => Inner.IstftFromSpectrum(specRe, specIm, window, result, windowSum, batch, numFrames, nFft, hop, outputLength, center);
+    /// <inheritdoc/>
+    public virtual void IstftNormalize(IGpuBuffer result, IGpuBuffer windowSum, int total) => Inner.IstftNormalize(result, windowSum, total);
+    /// <inheritdoc/>
+    public virtual void HistogramDD(IGpuBuffer samples, IGpuBuffer hist, IGpuBuffer bins, IGpuBuffer mins, IGpuBuffer maxs, int n, int d) => Inner.HistogramDD(samples, hist, bins, mins, maxs, n, d);
+    /// <inheritdoc/>
+    public virtual void MasksToBoxes(IGpuBuffer masks, IGpuBuffer output, int n, int h, int w) => Inner.MasksToBoxes(masks, output, n, h, w);
+    /// <inheritdoc/>
+    public virtual void PairwiseIou(IGpuBuffer boxes, IGpuBuffer iou, int n) => Inner.PairwiseIou(boxes, iou, n);
+    /// <inheritdoc/>
+    public virtual void LogicalOp(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int mode, int n) => Inner.LogicalOp(a, b, output, mode, n);
+    /// <inheritdoc/>
+    public virtual void LogicalNot(IGpuBuffer a, IGpuBuffer output, int n) => Inner.LogicalNot(a, output, n);
+    /// <inheritdoc/>
+    public virtual void GridSampleBackwardInputNhwc(IGpuBuffer gradOut, IGpuBuffer grid, IGpuBuffer gradIn, int batch, int h, int w, int c, int outH, int outW) => Inner.GridSampleBackwardInputNhwc(gradOut, grid, gradIn, batch, h, w, c, outH, outW);
+    /// <inheritdoc/>
+    public virtual void GridSampleBackwardGridNhwc(IGpuBuffer gradOut, IGpuBuffer input, IGpuBuffer grid, IGpuBuffer gradGrid, int batch, int h, int w, int c, int outH, int outW) => Inner.GridSampleBackwardGridNhwc(gradOut, input, grid, gradGrid, batch, h, w, c, outH, outW);
+    /// <inheritdoc/>
+    public virtual void ScatterReduce(IGpuBuffer output, IGpuBuffer source, IGpuBuffer index, int outerSize, int srcDim, int dstDim, int innerSize, int mode) => Inner.ScatterReduce(output, source, index, outerSize, srcDim, dstDim, innerSize, mode);
+    /// <inheritdoc/>
+    public virtual void Unfold(IGpuBuffer src, IGpuBuffer dst, int outerSize, int dimSize, int innerSize, int nWindows, int size, int step) => Inner.Unfold(src, dst, outerSize, dimSize, innerSize, nWindows, size, step);
 
     /// <inheritdoc/>
     public virtual void Where(IGpuBuffer condition, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)

@@ -69,6 +69,21 @@ __kernel void not_equals_kernel(__global const float* a, __global const float* b
     int idx = get_global_id(0); if (idx >= size) return;
     output[idx] = (a[idx] != b[idx]) ? 1.0f : 0.0f;
 }
+// IEEE-754 classify via the bit pattern (robust to fast/finite-math which folds isnan/!= away).
+// mode: 0 = isnan, 1 = isinf, 2 = isfinite.
+__kernel void classify_float(__global const float* a, __global float* output, int mode, int size) {
+    int idx = get_global_id(0); if (idx >= size) return;
+    uint bits = as_uint(a[idx]);
+    uint expo = (bits >> 23) & 0xFFu;
+    uint mant = bits & 0x7FFFFFu;
+    int isNan = (expo == 0xFFu) && (mant != 0u);
+    int isInf = (expo == 0xFFu) && (mant == 0u);
+    float r;
+    if (mode == 0)      r = isNan ? 1.0f : 0.0f;
+    else if (mode == 1) r = isInf ? 1.0f : 0.0f;
+    else                r = (!isNan && !isInf) ? 1.0f : 0.0f;
+    output[idx] = r;
+}
 ";
     }
 
@@ -80,7 +95,7 @@ __kernel void not_equals_kernel(__global const float* a, __global const float* b
             "broadcast_add_first", "broadcast_mul_first",
             "add_scalar", "sub_scalar", "div_scalar", "pow_scalar",
             "frac_kernel", "clip_kernel", "rsqrt_kernel",
-            "equals_kernel", "not_equals_kernel"
+            "equals_kernel", "not_equals_kernel", "classify_float"
         };
     }
 }

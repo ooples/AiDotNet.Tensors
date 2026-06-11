@@ -102,6 +102,507 @@ __kernel void index_select(__global const float* input, __global const float* in
         output[idx] = 0.0f;
     }
 }
+// Gather along one axis (take_along_dim/gather): input viewed [outer, axisIn, inner], indices/output
+// viewed [outer, axisOut, inner]; output[o,j,i] = input[o, indices[o,j,i], i].
+__kernel void take_along_dim(__global const float* input, __global const float* indices, __global float* output,
+    int outerSize, int axisOut, int innerSize, int axisIn) {
+    int idx = get_global_id(0); int total = outerSize * axisOut * innerSize; if (idx >= total) return;
+    int inner = idx % innerSize;
+    int outer = (idx / innerSize) / axisOut;
+    int srcJ = (int)indices[idx];
+    if (srcJ < 0 || srcJ >= axisIn) { output[idx] = 0.0f; return; }
+    output[idx] = input[(outer * axisIn + srcJ) * innerSize + inner];
+}
+// 3-vector cross product along an axis of size 3 (viewed [outer, 3, inner]).
+__kernel void cross3(__global const float* a, __global const float* b, __global float* output, int outerSize, int innerSize) {
+    int idx = get_global_id(0); if (idx >= outerSize * innerSize) return;
+    int inner = idx % innerSize; int outer = idx / innerSize;
+    int p = outer * 3 * innerSize + inner;
+    float a0 = a[p], a1 = a[p + innerSize], a2 = a[p + 2 * innerSize];
+    float b0 = b[p], b1 = b[p + innerSize], b2 = b[p + 2 * innerSize];
+    output[p]                  = a1 * b2 - a2 * b1;
+    output[p + innerSize]      = a2 * b0 - a0 * b2;
+    output[p + 2 * innerSize]  = a0 * b1 - a1 * b0;
+}
+// Ldexp: output[i] = input[i] * 2^exponents[i] (ldexp is exact; no fast-math hazard).
+__kernel void ldexp_kernel(__global const float* input, __global const int* exponents, __global float* output, int size) {
+    int idx = get_global_id(0); if (idx >= size) return;
+    output[idx] = ldexp(input[idx], exponents[idx]);
+}
+// 2-D Kronecker product: a[am,an] (X) b[bp,bq] -> out[am*bp, an*bq].
+__kernel void kron2d(__global const float* a, __global const float* b, __global float* output, int am, int an, int bp, int bq) {
+    int idx = get_global_id(0);
+    int outCols = an * bq; int total = (am * bp) * outCols; if (idx >= total) return;
+    int oc = idx % outCols; int orow = idx / outCols;
+    int i = orow / bp; int k = orow % bp;
+    int j = oc / bq;   int l = oc % bq;
+    output[idx] = a[i * an + j] * b[k * bq + l];
+}
+// searchsorted/bucketize: binary search per value into the 1-D sorted sequence. right=0 lower_bound,
+// right=1 upper_bound. Index written as float (exact in the small index range).
+__kernel void search_sorted(__global const float* seq, __global const float* values, __global float* output, int seqLen, int numValues, int right) {
+    int idx = get_global_id(0); if (idx >= numValues) return;
+    float v = values[idx];
+    int lo = 0, hi = seqLen;
+    while (lo < hi) {
+        int mid = (lo + hi) >> 1;
+        int cond = (right != 0) ? (seq[mid] <= v) : (seq[mid] < v);
+        if (cond) lo = mid + 1; else hi = mid;
+    }
+    output[idx] = (float)lo;
+}
+// index_copy/index_fill scatter-write. output pre-seeded with the original tensor; overwrite selected
+// slices. mode 0 = copy from source[outer,j,inner]; mode 1 = write fillValue. indices is 1-D [idxAxis].
+__kernel void index_write(__global float* output, __global const int* indices, __global const float* source,
+    float fillValue, int mode, int outerSize, int idxAxis, int innerSize, int dstAxis) {
+    int idx = get_global_id(0); int total = outerSize * idxAxis * innerSize; if (idx >= total) return;
+    int inner = idx % innerSize;
+    int j = (idx / innerSize) % idxAxis;
+    int outer = (idx / innerSize) / idxAxis;
+    int dstJ = indices[j];
+    if (dstJ < 0 || dstJ >= dstAxis) return;
+    float v = (mode == 0) ? source[idx] : fillValue;
+    output[(outer * dstAxis + dstJ) * innerSize + inner] = v;
+}
+// Cross pairwise p-norm distance: x1[m,d], x2[n,d] -> out[m,n], out[i,j]=||x1[i]-x2[j]||_p.
+__kernel void cdist(__global const float* x1, __global const float* x2, __global float* output, int m, int n, int d, float p) {
+    int idx = get_global_id(0); if (idx >= m * n) return;
+    int j = idx % n; int i = idx / n;
+    float sum = 0.0f;
+    for (int k = 0; k < d; k++) {
+        float diff = fabs(x1[i * d + k] - x2[j * d + k]);
+        if (p == 1.0f) sum += diff;
+        else if (p == 2.0f) sum += diff * diff;
+        else sum += pow(diff, p);
+    }
+    output[idx] = (p == 1.0f) ? sum : (p == 2.0f) ? sqrt(sum) : pow(sum, 1.0f / p);
+}
+// Hierarchical-softmax leaf probabilities from raw per-level node activations `acts` [rows, treeDepth].
+// gate = sigmoid(acts[level]); per class c, prob = product over levels of (bit ? gate : 1-gate), with the
+// balanced-tree early stop once the node index reaches numClasses. Output [rows, numClasses].
+__kernel void hsoftmax_paths(__global const float* acts, __global float* out, int rows, int treeDepth, int numClasses) {
+    int idx = get_global_id(0); if (idx >= rows * numClasses) return;
+    int c = idx % numClasses; int r = idx / numClasses;
+    int gbase = r * treeDepth;
+    float prob = 1.0f; int node = 1;
+    for (int level = 0; level < treeDepth; level++) {
+        int goRight = (c & (1 << (treeDepth - level - 1))) != 0;
+        float g = 1.0f / (1.0f + exp(-acts[gbase + level]));
+        prob *= goRight ? g : (1.0f - g);
+        node = node * 2 + (goRight ? 1 : 0);
+        if (node >= numClasses) break;
+    }
+    out[idx] = prob;
+}
+// masks_to_boxes: one thread per mask n; bbox (xMin,yMin,xMax,yMax) of nonzero pixels. Empty -> 0,0,0,0.
+__kernel void masks_to_boxes(__global const float* masks, __global float* out, int N, int H, int W) {
+    int n = get_global_id(0); if (n >= N) return;
+    int xMin = W, yMin = H, xMax = -1, yMax = -1;
+    int planeOff = n * H * W;
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++)
+            if (masks[planeOff + y*W + x] != 0.0f) {
+                if (x < xMin) xMin = x;
+                if (x > xMax) xMax = x;
+                if (y < yMin) yMin = y;
+                if (y > yMax) yMax = y;
+            }
+    int o = n * 4;
+    if (xMax < 0) { out[o]=0.0f; out[o+1]=0.0f; out[o+2]=0.0f; out[o+3]=0.0f; }
+    else { out[o]=(float)xMin; out[o+1]=(float)yMin; out[o+2]=(float)xMax; out[o+3]=(float)yMax; }
+}
+// logical_op: boolean op on float-0/1 masks. mode 0=and, 1=or, 2=xor. out is float-0/1.
+__kernel void logical_op(__global const float* a, __global const float* b, __global float* out, int mode, int n) {
+    int i = get_global_id(0); if (i >= n) return;
+    int ba = (a[i] != 0.0f); int bb = (b[i] != 0.0f);
+    int r = (mode == 0) ? (ba && bb) : (mode == 1) ? (ba || bb) : (ba != bb);
+    out[i] = r ? 1.0f : 0.0f;
+}
+__kernel void logical_not(__global const float* a, __global float* out, int n) {
+    int i = get_global_id(0); if (i >= n) return;
+    out[i] = (a[i] != 0.0f) ? 0.0f : 1.0f;
+}
+// pairwise_iou: iou[i*N+j] = IoU(box_i, box_j) for boxes [N,4] = (x1,y1,x2,y2). area=0 if w<=0 or h<=0.
+__kernel void pairwise_iou(__global const float* boxes, __global float* iou, int N) {
+    int idx = get_global_id(0); if (idx >= N*N) return;
+    int j = idx % N; int i = idx / N;
+    float ix1=boxes[i*4], iy1=boxes[i*4+1], ix2=boxes[i*4+2], iy2=boxes[i*4+3];
+    float jx1=boxes[j*4], jy1=boxes[j*4+1], jx2=boxes[j*4+2], jy2=boxes[j*4+3];
+    float ai = fmax(0.0f, ix2-ix1)*fmax(0.0f, iy2-iy1);
+    float aj = fmax(0.0f, jx2-jx1)*fmax(0.0f, jy2-jy1);
+    float iw = fmax(0.0f, fmin(ix2,jx2)-fmax(ix1,jx1));
+    float ih = fmax(0.0f, fmin(iy2,jy2)-fmax(iy1,jy1));
+    float inter = iw*ih; float uni = ai+aj-inter;
+    iou[idx] = (uni > 0.0f) ? inter/uni : 0.0f;
+}
+// reflect_pad_1d: numpy-style reflect pad of the last axis by `pad` each side (edge sample excluded).
+__kernel void reflect_pad_1d(__global const float* inp, __global float* outp, int batch, int L, int Lp, int pad) {
+    int idx = get_global_id(0); if (idx >= batch*Lp) return;
+    int j = idx % Lp; int b = idx / Lp;
+    int src;
+    if (j < pad) src = pad - j;
+    else if (j < pad + L) src = j - pad;
+    else src = L - 2 - (j - pad - L);
+    outp[idx] = inp[b*L + src];
+}
+// stft_mag_phase: per (b,k,frame) compute the DFT bin k of the windowed frame -> magnitude + phase.
+// out layout [b][k*numFrames + frame]. Matches CpuEngine.STFT (window applied, mag=hypot, phase=atan2).
+__kernel void stft_mag_phase(__global const float* padded, __global const float* window,
+    __global float* mag, __global float* phase, int batch, int Lp, int nFft, int hop, int numFrames, int numFreqs) {
+    int idx = get_global_id(0); int total = batch*numFreqs*numFrames; if (idx >= total) return;
+    int frame = idx % numFrames; int tmp = idx / numFrames;
+    int k = tmp % numFreqs; int b = tmp / numFreqs;
+    int start = frame * hop; int inOff = b * Lp;
+    float re = 0.0f; float im = 0.0f;
+    float bk = -2.0f * M_PI_F * (float)k / (float)nFft;
+    for (int i = 0; i < nFft; i++) {
+        float x = padded[inOff + start + i] * window[i];
+        float a = bk * (float)i;
+        re += x * cos(a); im += x * sin(a);
+    }
+    int outOff = b*numFreqs*numFrames + k*numFrames + frame;
+    mag[outOff] = sqrt(re*re + im*im);
+    phase[outOff] = atan2(im, re);
+}
+// phase_vocoder: one thread per (b,f) runs the sequential t-scan internally (accPhase carries over t).
+// Mirrors CpuEngine.TimeStretch index math EXACTLY (its 'nFrames'=outer axis, 'nFreq'=inner axis).
+__kernel void phase_vocoder(__global const float* mag, __global const float* phase,
+    __global float* newMag, __global float* newPhase, int leading, int nFramesV, int nFreqV, int outFrames, float rate) {
+    int idx = get_global_id(0); if (idx >= leading*nFreqV) return;
+    int f = idx % nFreqV; int b = idx / nFreqV;
+    int stride = nFramesV*nFreqV; int outStride = outFrames*nFreqV;
+    float accPhase = 0.0f;
+    for (int t = 0; t < outFrames; t++) {
+        float srcT = (float)t * rate;
+        int t0 = (int)floor(srcT); int t1 = min(t0+1, nFramesV-1); float frac = srcT - (float)t0;
+        float m0 = mag[b*stride + t0*nFreqV + f]; float m1 = mag[b*stride + t1*nFreqV + f];
+        newMag[b*outStride + t*nFreqV + f] = (1.0f-frac)*m0 + frac*m1;
+        float dp = 0.0f;
+        if (t0+1 < nFramesV) {
+            dp = phase[b*stride + (t0+1)*nFreqV + f] - phase[b*stride + t0*nFreqV + f];
+            dp -= 2.0f*M_PI_F * round(dp/(2.0f*M_PI_F));
+        }
+        accPhase += dp;
+        newPhase[b*outStride + t*nFreqV + f] = accPhase;
+    }
+}
+// shifted_diff: mask[i] = (i==0 || x[i] != x[i-1]) ? 1 : 0  (consecutive-unique keep mask).
+__kernel void shifted_diff(__global const float* x, __global float* mask, int n) {
+    int i = get_global_id(0); if (i >= n) return;
+    mask[i] = (i == 0 || x[i] != x[i-1]) ? 1.0f : 0.0f;
+}
+// Hurwitz zeta zeta(x,q) = sum (k+q)^-x via Euler-Maclaurin with 8 Bernoulli corrections (mirrors CPU).
+float zeta_scalar(float x, float q) {
+    if (x == 1.0f) return INFINITY;
+    if (q <= 0.0f && q == floor(q)) return INFINITY;
+    float sum = 0.0f;
+    for (int k = 0; k < 12; k++) sum += pow(q + (float)k, -x);
+    float Nq = 12.0f + q;
+    float lnNq = log(Nq);
+    float cont = exp((1.0f - x) * lnNq) / (x - 1.0f);
+    float halfTerm = 0.5f * exp(-x * lnNq);
+    const float b2k[8] = { 1.0f/6.0f, -1.0f/30.0f, 1.0f/42.0f, -1.0f/30.0f, 5.0f/66.0f, -691.0f/2730.0f, 7.0f/6.0f, -3617.0f/510.0f };
+    const float fact2k[8] = { 2.0f, 24.0f, 720.0f, 40320.0f, 3628800.0f, 479001600.0f, 87178291200.0f, 20922789888000.0f };
+    float corr = 0.0f;
+    float xPow = exp(-x * lnNq) / Nq;
+    float invNq2 = 1.0f / (Nq * Nq);
+    float rising = x;
+    for (int j = 1; j <= 8; j++) {
+        if (j > 1) { rising *= (x + 2.0f*(float)(j-1) - 2.0f) * (x + 2.0f*(float)(j-1) - 1.0f); xPow *= invNq2; }
+        corr += (b2k[j-1] / fact2k[j-1]) * rising * xPow;
+    }
+    return sum + cont + halfTerm + corr;
+}
+__kernel void zeta_kernel(__global const float* x, __global const float* q, __global float* out, int size) {
+    int i = get_global_id(0); if (i >= size) return;
+    out[i] = zeta_scalar(x[i], q[i]);
+}
+// Polygamma psi^(n)(x), n>=1, via shift-up recurrence + Bernoulli asymptotic (mirrors CPU). FactorialLogD(k)=lgamma(k+1).
+float polygamma_scalar(int n, float x) {
+    if (x <= 0.0f && x == floor(x)) return INFINITY;
+    float recurrence = 0.0f;
+    float xd = x;
+    int signN = (n & 1) == 1 ? 1 : -1;
+    while (xd < 10.0f) {
+        recurrence += (float)signN * exp(lgamma((float)(n+1)) - (float)(n+1) * log(xd));
+        xd += 1.0f;
+    }
+    float lnX = log(xd);
+    float asympt = exp(lgamma((float)n) - (float)n * lnX) + 0.5f * exp(lgamma((float)(n+1)) - (float)(n+1) * lnX);
+    const float b2k[8] = { 1.0f/6.0f, -1.0f/30.0f, 1.0f/42.0f, -1.0f/30.0f, 5.0f/66.0f, -691.0f/2730.0f, 7.0f/6.0f, -3617.0f/510.0f };
+    float invX2 = 1.0f / (xd * xd);
+    float xPow = exp(-(float)n * lnX);
+    for (int k = 1; k <= 8; k++) {
+        xPow *= invX2;
+        asympt += b2k[k-1] * exp(lgamma((float)(2*k+n)) - lgamma((float)(2*k+1))) * xPow;
+    }
+    return recurrence + (float)signN * asympt;
+}
+__kernel void polygamma_kernel(__global const float* x, __global float* out, int n, int size) {
+    int i = get_global_id(0); if (i >= size) return;
+    out[i] = polygamma_scalar(n, x[i]);
+}
+// scatter_reduce: atomic reduce of source into output along a dim. mode 0=sum,1=prod,2=amax,3=amin.
+// output is pre-seeded with the original tensor (includeSelf=true). source/index viewed [outer,srcDim,inner].
+inline void atomicReduceF(volatile __global float* addr, float val, int mode) {
+    union { int i; float f; } prev, next;
+    do {
+        prev.f = *addr;
+        float nv = (mode == 0) ? (prev.f + val) : (mode == 1) ? (prev.f * val) : (mode == 2) ? fmax(prev.f, val) : fmin(prev.f, val);
+        next.f = nv;
+    } while (atomic_cmpxchg((volatile __global int*)addr, prev.i, next.i) != prev.i);
+}
+__kernel void scatter_reduce(__global float* output, __global const float* source, __global const int* index,
+    int outerSize, int srcDim, int dstDim, int innerSize, int mode) {
+    int idx = get_global_id(0); int total = outerSize * srcDim * innerSize; if (idx >= total) return;
+    int inner = idx % innerSize; int tmp = idx / innerSize;
+    int outer = tmp / srcDim;
+    int t = index[idx];
+    if (t < 0 || t >= dstDim) return;
+    atomicReduceF(&output[(outer * dstDim + t) * innerSize + inner], source[idx], mode);
+}
+// copy_block_2d: place a [blockRows, blockCols] block at (rowOff, colOff) inside a totalCols-wide matrix.
+__kernel void copy_block_2d(__global const float* block, __global float* output, int blockRows, int blockCols, int totalCols, int rowOff, int colOff) {
+    int idx = get_global_id(0); if (idx >= blockRows * blockCols) return;
+    int j = idx % blockCols; int i = idx / blockCols;
+    output[(rowOff + i) * totalCols + (colOff + j)] = block[i * blockCols + j];
+}
+// isin: mask[i] = (elements[i] is present in the ascending sortedTest) ? 1 : 0 (binary search + equality).
+__kernel void isin(__global const float* elements, __global const float* sortedTest, __global float* mask, int numElements, int testLen) {
+    int idx = get_global_id(0); if (idx >= numElements) return;
+    float v = elements[idx];
+    int lo = 0, hi = testLen;
+    while (lo < hi) { int mid = (lo + hi) >> 1; if (sortedTest[mid] < v) lo = mid + 1; else hi = mid; }
+    mask[idx] = (lo < testLen && sortedTest[lo] == v) ? 1.0f : 0.0f;
+}
+// unfold: sliding windows along a dim. src viewed [outer, dimSize, inner]; dst [outer, nWindows, inner, size];
+// dst[outer,w,inner,s] = src[outer, w*step+s, inner].
+__kernel void unfold(__global const float* src, __global float* dst, int outerSize, int dimSize, int innerSize, int nWindows, int size, int step) {
+    int idx = get_global_id(0); int total = outerSize * nWindows * innerSize * size; if (idx >= total) return;
+    int s = idx % size; int tmp = idx / size;
+    int inner = tmp % innerSize; tmp /= innerSize;
+    int w = tmp % nWindows; int outer = tmp / nWindows;
+    dst[idx] = src[(outer * dimSize + (w * step + s)) * innerSize + inner];
+}
+// RWKV-7 (WKV7 generalized delta rule) sequence forward. One thread per (batch, head); the sequence is
+// scanned sequentially while a per-(b,h) state matrix S[headDim,headDim] lives in global scratch Sbuf.
+// State: S[di,vi] = sig(A)*S[di,vi] + (sig(B[di])*K[di])*V[vi]; readout: out[di] = sig(R[di]) * sum_vi S[di,vi]*K[vi].
+__kernel void rwkv7_forward(__global const float* R, __global const float* K, __global const float* V,
+    __global const float* A, __global const float* B, __global float* outp, __global float* Sbuf,
+    int batch, int seqLen, int modelDim, int numHeads, int headDim) {
+    int bh = get_global_id(0); if (bh >= batch * numHeads) return;
+    int b = bh / numHeads; int h = bh % numHeads;
+    int hOff = h * headDim; int hh = headDim * headDim;
+    __global float* S = Sbuf + bh * hh;
+    for (int i = 0; i < hh; i++) S[i] = 0.0f;
+    for (int t = 0; t < seqLen; t++) {
+        int baseOff = (b * seqLen + t) * modelDim + hOff;
+        for (int di = 0; di < headDim; di++) {
+            float ga = 1.0f / (1.0f + exp(-A[baseOff + di]));
+            float gbk = (1.0f / (1.0f + exp(-B[baseOff + di]))) * K[baseOff + di];
+            int srow = di * headDim;
+            for (int vi = 0; vi < headDim; vi++) S[srow + vi] = ga * S[srow + vi] + gbk * V[baseOff + vi];
+        }
+        for (int di = 0; di < headDim; di++) {
+            int srow = di * headDim; float sk = 0.0f;
+            for (int vi = 0; vi < headDim; vi++) sk += S[srow + vi] * K[baseOff + vi];
+            outp[baseOff + di] = (1.0f / (1.0f + exp(-R[baseOff + di]))) * sk;
+        }
+    }
+}
+// One bitonic compare-exchange step. values/indices are numRows rows of length rowLen (a power of 2).
+// k = current bitonic sequence size, j = compare distance. NaN is treated as +inf (torch.sort order).
+__kernel void bitonic_step(__global float* values, __global float* indices, int rowLen, int k, int j, int numRows, int descending) {
+    int gid = get_global_id(0); if (gid >= numRows * rowLen) return;
+    int i = gid % rowLen; int ixj = i ^ j;
+    if (ixj <= i) return;
+    int base = (gid / rowLen) * rowLen;
+    float a = values[base + i], b = values[base + ixj];
+    uint ua = as_uint(a), ub = as_uint(b);
+    float ka = (((ua >> 23) & 0xFFu) == 0xFFu && (ua & 0x7FFFFFu) != 0u) ? INFINITY : a;
+    float kb = (((ub >> 23) & 0xFFu) == 0xFFu && (ub & 0x7FFFFFu) != 0u) ? INFINITY : b;
+    int up = ((i & k) == 0); if (descending != 0) up = !up;
+    int doSwap = up ? (ka > kb) : (ka < kb);
+    if (doSwap) {
+        values[base + i] = b; values[base + ixj] = a;
+        float t = indices[base + i]; indices[base + i] = indices[base + ixj]; indices[base + ixj] = t;
+    }
+}
+// Copy the first copyLen elements of each row (src stride srcRowLen -> dst stride dstRowLen).
+// Used both to pad (L->P, into a pre-filled buffer) and to un-pad (P->L) bitonic rows.
+__kernel void copy_rows(__global const float* src, __global float* dst, int srcRowLen, int dstRowLen, int numRows, int copyLen) {
+    int gid = get_global_id(0); if (gid >= numRows * copyLen) return;
+    int i = gid % copyLen; int r = gid / copyLen;
+    dst[r * dstRowLen + i] = src[r * srcRowLen + i];
+}
+// Initialize padded index rows (stored as float): idx[r*P + i] = (i < L) ? i : -1.
+__kernel void iota_pad(__global float* idx, int L, int P, int numRows) {
+    int gid = get_global_id(0); if (gid >= numRows * P) return;
+    int i = gid % P; idx[gid] = (i < L) ? (float)i : -1.0f;
+}
+// Histogram into `bins` equal-width bins over [mn,mx]; out-of-range dropped, mx in last bin.
+// hist must be pre-zeroed. Float atomic add via int cmpxchg loop (core int32 atomics).
+inline void atomicAddF(volatile __global float* addr, float val) {
+    union { int i; float f; } prev, next;
+    do { prev.f = *addr; next.f = prev.f + val; }
+    while (atomic_cmpxchg((volatile __global int*)addr, prev.i, next.i) != prev.i);
+}
+__kernel void histc(__global const float* input, volatile __global float* hist, int n, int bins, float mn, float mx) {
+    int idx = get_global_id(0); if (idx >= n) return;
+    float x = input[idx];
+    if (!(x >= mn && x <= mx)) return; // drops NaN + out-of-range (matches torch.histc)
+    float bw = (mx - mn) / (float)bins;
+    int b = (int)((x - mn) / bw);
+    if (b >= bins) b = bins - 1;
+    if (b < 0) b = 0;
+    atomicAddF(&hist[b], 1.0f);
+}
+// histogramdd: D-dim histogram. One thread per sample; per-dim bin, row-major linearize, atomic-add.
+// (placed after atomicAddF is defined). bins int[D], mins/maxs float[D]; hist pre-zeroed length prod(bins).
+__kernel void histogramdd(__global const float* samples, volatile __global float* hist,
+    __global const int* bins, __global const float* mins, __global const float* maxs, int n, int d) {
+    int i = get_global_id(0); if (i >= n) return;
+    int linIdx = 0; int valid = 1;
+    for (int k = 0; k < d; k++) {
+        float v = samples[i*d + k]; float mn = mins[k]; float mx = maxs[k];
+        if (!(v >= mn && v <= mx)) { valid = 0; break; } // drops NaN + out-of-range
+        float width = (mx - mn) / (float)bins[k];
+        int kIdx = (int)floor((v - mn) / width);
+        if (kIdx >= bins[k]) kIdx = bins[k] - 1;
+        if (kIdx < 0) kIdx = 0;
+        linIdx = linIdx * bins[k] + kIdx;
+    }
+    if (valid) atomicAddF(&hist[linIdx], 1.0f);
+}
+// GridSample bilinear backward-to-input (NHWC, zeros pad). Coordinate mapping is the align_corners=true
+// convention src=(g+1)/2*(size-1), exactly matching CpuEngine.GridSampleBackwardInput (the hard-coded
+// 3-arg reference these kernels are parity-tested against). One thread per
+// (b,oh,ow,c) output: scatter gradOut into the 4 bilinear input corners (atomic). gradIn pre-zeroed.
+__kernel void gridsample_backward_input(__global const float* gradOut, __global const float* grid,
+    volatile __global float* gradIn, int batch, int H, int W, int C, int outH, int outW) {
+    int idx = get_global_id(0); int total = batch*outH*outW*C; if (idx >= total) return;
+    int c = idx % C; int tmp = idx / C;
+    int ow = tmp % outW; tmp /= outW;
+    int oh = tmp % outH; int b = tmp / outH;
+    int gridBase = ((b*outH + oh)*outW + ow)*2;
+    float gx = grid[gridBase]; float gy = grid[gridBase+1];
+    float srcH = (gy + 1.0f) * 0.5f * (float)(H - 1);
+    float srcW = (gx + 1.0f) * 0.5f * (float)(W - 1);
+    if (srcH <= -1.0f || srcH >= (float)H || srcW <= -1.0f || srcW >= (float)W) return;
+    int h0 = (int)floor(srcH); int h1 = h0 + 1; int w0 = (int)floor(srcW); int w1 = w0 + 1;
+    float lh = srcH - (float)h0; float lw = srcW - (float)w0;
+    float g = gradOut[idx];
+    if (h0>=0 && h0<H && w0>=0 && w0<W) atomicAddF(&gradIn[((b*H+h0)*W+w0)*C+c], g*(1.0f-lh)*(1.0f-lw));
+    if (h0>=0 && h0<H && w1>=0 && w1<W) atomicAddF(&gradIn[((b*H+h0)*W+w1)*C+c], g*(1.0f-lh)*lw);
+    if (h1>=0 && h1<H && w0>=0 && w0<W) atomicAddF(&gradIn[((b*H+h1)*W+w0)*C+c], g*lh*(1.0f-lw));
+    if (h1>=0 && h1<H && w1>=0 && w1<W) atomicAddF(&gradIn[((b*H+h1)*W+w1)*C+c], g*lh*lw);
+}
+// GridSample bilinear backward-to-grid (NHWC). One thread per (b,oh,ow): gradGrid = d(out)/d(g) summed
+// over channels via the bilinear coordinate derivative, chain-ruled by (size-1)/2. No atomics.
+__kernel void gridsample_backward_grid(__global const float* gradOut, __global const float* input,
+    __global const float* grid, __global float* gradGrid, int batch, int H, int W, int C, int outH, int outW) {
+    int idx = get_global_id(0); if (idx >= batch*outH*outW) return;
+    int ow = idx % outW; int tmp = idx / outW; int oh = tmp % outH; int b = tmp / outH;
+    int gridBase = ((b*outH+oh)*outW+ow)*2;
+    float gx = grid[gridBase]; float gy = grid[gridBase+1];
+    float srcH = (gy+1.0f)*0.5f*(float)(H-1); float srcW = (gx+1.0f)*0.5f*(float)(W-1);
+    float gradGx = 0.0f; float gradGy = 0.0f;
+    if (!(srcH <= -1.0f || srcH >= (float)H || srcW <= -1.0f || srcW >= (float)W)) {
+        int h0 = (int)floor(srcH); int h1 = h0+1; int w0 = (int)floor(srcW); int w1 = w0+1;
+        float lh = srcH-(float)h0; float lw = srcW-(float)w0;
+        int in00 = (h0>=0&&h0<H&&w0>=0&&w0<W); int in01 = (h0>=0&&h0<H&&w1>=0&&w1<W);
+        int in10 = (h1>=0&&h1<H&&w0>=0&&w0<W); int in11 = (h1>=0&&h1<H&&w1>=0&&w1<W);
+        for (int c = 0; c < C; c++) {
+            float v00 = in00 ? input[((b*H+h0)*W+w0)*C+c] : 0.0f;
+            float v01 = in01 ? input[((b*H+h0)*W+w1)*C+c] : 0.0f;
+            float v10 = in10 ? input[((b*H+h1)*W+w0)*C+c] : 0.0f;
+            float v11 = in11 ? input[((b*H+h1)*W+w1)*C+c] : 0.0f;
+            float dH = (1.0f-lw)*(v10-v00) + lw*(v11-v01);
+            float dW = (1.0f-lh)*(v01-v00) + lh*(v11-v10);
+            float go = gradOut[((b*outH+oh)*outW+ow)*C+c];
+            gradGx += go * dW * (float)(W-1)*0.5f;
+            gradGy += go * dH * (float)(H-1)*0.5f;
+        }
+    }
+    gradGrid[gridBase] = gradGx; gradGrid[gridBase+1] = gradGy;
+}
+// build_spectrum: one thread per (b,frame) replays CpuEngine.ISTFT's TWO passes IN ORDER (positive
+// freqs [0,numFreqs), then conjugate writes nFft-k = realIn[k] for k in [1,numFreqs-1)). Doing both in a
+// single thread reproduces the sequential-overwrite behaviour when numFreqs > nFft/2+1 (TimeStretch
+// rate<1) that a per-bin closed form cannot. spec* layout [(b*numFrames+frame)*nFft + k].
+__kernel void build_spectrum(__global const float* mag, __global const float* phase,
+    __global float* specRe, __global float* specIm, int batch, int numFreqs, int numFrames, int nFft) {
+    int idx = get_global_id(0); if (idx >= batch*numFrames) return;
+    int frame = idx % numFrames; int b = idx / numFrames;
+    int magOff = b*numFreqs*numFrames; int specOff = idx * nFft;
+    for (int k = 0; k < nFft; k++) { specRe[specOff+k] = 0.0f; specIm[specOff+k] = 0.0f; }
+    for (int k = 0; k < numFreqs && k < nFft; k++) {
+        float m = mag[magOff + k*numFrames + frame]; float p = phase[magOff + k*numFrames + frame];
+        specRe[specOff+k] = m*cos(p); specIm[specOff+k] = m*sin(p);
+    }
+    for (int k = 1; k < numFreqs - 1; k++) {
+        int dst = nFft - k;
+        if (dst >= 0 && dst < nFft && k < nFft) {
+            specRe[specOff+dst] = specRe[specOff+k];
+            specIm[specOff+dst] = -specIm[specOff+k];
+        }
+    }
+}
+// istft_from_spectrum: per (b,frame,i) inverse-DFT sample from the full spectrum, windowed overlap-add.
+__kernel void istft_from_spectrum(__global const float* specRe, __global const float* specIm, __global const float* window,
+    volatile __global float* result, volatile __global float* windowSum,
+    int batch, int numFrames, int nFft, int hop, int outputLength, int center) {
+    int idx = get_global_id(0); int total = batch*numFrames*nFft; if (idx >= total) return;
+    int i = idx % nFft; int tmp = idx / nFft; int frame = tmp % numFrames; int b = tmp / numFrames;
+    int specOff = (b*numFrames + frame) * nFft;
+    float acc = 0.0f;
+    for (int k = 0; k < nFft; k++) {
+        float a = 2.0f*M_PI_F*(float)k*(float)i/(float)nFft;
+        acc += specRe[specOff+k]*cos(a) - specIm[specOff+k]*sin(a);
+    }
+    int writeStart = center ? max(0, frame*hop - nFft/2) : frame*hop;
+    int outIdx = writeStart + i;
+    if (outIdx >= 0 && outIdx < outputLength) {
+        float w = window[i];
+        atomicAddF(&result[b*outputLength + outIdx], acc*(1.0f/(float)nFft)*w);
+        atomicAddF(&windowSum[b*outputLength + outIdx], w*w);
+    }
+}
+__kernel void istft_normalize(__global float* result, __global const float* windowSum, int total) {
+    int idx = get_global_id(0); if (idx >= total) return;
+    float ws = windowSum[idx]; if (ws > 1e-8f) result[idx] = result[idx] / ws;
+}
+// Condensed pairwise p-norm over rows of input[n,d]; output 1-D upper-triangle (i<j) order.
+__kernel void pdist(__global const float* input, __global float* output, int n, int d, float p) {
+    int flat = get_global_id(0); if (flat >= n * n) return;
+    int j = flat % n; int i = flat / n;
+    if (i >= j) return;
+    float sum = 0.0f;
+    for (int k = 0; k < d; k++) {
+        float diff = fabs(input[i * d + k] - input[j * d + k]);
+        if (p == 1.0f) sum += diff;
+        else if (p == 2.0f) sum += diff * diff;
+        else sum += pow(diff, p);
+    }
+    float dist = (p == 1.0f) ? sum : (p == 2.0f) ? sqrt(sum) : pow(sum, 1.0f / p);
+    int outIdx = i * n - (i * (i + 1)) / 2 + (j - i - 1);
+    output[outIdx] = dist;
+}
+// IEEE nextafter via direct bit manipulation; NaN detected by bit pattern (fast-math safe).
+__kernel void next_after(__global const float* a, __global const float* b, __global float* output, int size) {
+    int idx = get_global_id(0); if (idx >= size) return;
+    float av = a[idx], bv = b[idx];
+    uint ua = as_uint(av), ub = as_uint(bv);
+    int aNan = (((ua >> 23) & 0xFFu) == 0xFFu) && ((ua & 0x7FFFFFu) != 0u);
+    int bNan = (((ub >> 23) & 0xFFu) == 0xFFu) && ((ub & 0x7FFFFFu) != 0u);
+    if (aNan || bNan) { output[idx] = as_float(0x7FC00000u); return; }
+    if (av == bv) { output[idx] = bv; return; }
+    if (av == 0.0f) { output[idx] = as_float(bv > 0.0f ? 0x00000001u : 0x80000001u); return; }
+    uint r = ua;
+    if (bv > av) r = (av > 0.0f) ? (r + 1u) : (r - 1u);
+    else         r = (av > 0.0f) ? (r - 1u) : (r + 1u);
+    output[idx] = as_float(r);
+}
 ";
     }
 
@@ -114,7 +615,10 @@ __kernel void index_select(__global const float* input, __global const float* in
             "pixel_shuffle", "pixel_shuffle_backward", "crop_2d",
             "eye_kernel", "linspace_kernel", "one_hot_kernel",
             "diag_kernel", "extract_diag_kernel", "triangular_mask",
-            "masked_fill_kernel", "index_select"
+            "masked_fill_kernel", "index_select", "take_along_dim",
+            "cross3", "ldexp_kernel", "kron2d", "search_sorted", "next_after", "index_write", "cdist", "pdist",
+            "histc", "bitonic_step", "copy_rows", "iota_pad", "rwkv7_forward", "hsoftmax_paths",
+            "isin", "unfold", "copy_block_2d", "scatter_reduce", "zeta_kernel", "polygamma_kernel", "reflect_pad_1d", "stft_mag_phase", "phase_vocoder", "build_spectrum", "istft_from_spectrum", "istft_normalize", "shifted_diff", "histogramdd", "masks_to_boxes", "pairwise_iou", "logical_op", "logical_not", "gridsample_backward_input", "gridsample_backward_grid"
         };
     }
 }
