@@ -2805,7 +2805,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// download that's a non-capturable CUDA-900 inside the graph capture). Returns false to fall back.</summary>
     internal bool TryMatMulResidentInto<T>(Tensor<T> output, Tensor<T> a, Tensor<T> b)
     {
-        if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
+        if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float))
+        {
+            AliasDiag($"MM-gate1 active={ResidentStepActive} depth={System.Threading.Volatile.Read(ref _capturePathDepth)} evict={EvictionSuspended} autocast={Gpu.AutocastScope.IsEnabled} T={typeof(T).Name} thr={System.Environment.CurrentManagedThreadId}");
+            return false;
+        }
         if (!TryGetBackend(out var backend)) return false;
         if (a.Rank < 2 || !a.IsContiguous || !b.IsContiguous)
         {
