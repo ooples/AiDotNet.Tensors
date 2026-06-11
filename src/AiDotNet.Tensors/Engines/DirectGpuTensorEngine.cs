@@ -1855,7 +1855,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // phase (warmup) masks the same message from an illegal one (inside capture). Issue #584 tail.
         if (dbg == "2" || n <= 3) try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(),
             "aidotnet_graphcapture_diag.txt"), $"[ALIAS#{n}] " + reason + System.Environment.NewLine); } catch { }
-    } catch { }
     }
 
     internal static void CopyResultInto<T>(IEngine eng, Tensor<T> src, Tensor<T> dest)
