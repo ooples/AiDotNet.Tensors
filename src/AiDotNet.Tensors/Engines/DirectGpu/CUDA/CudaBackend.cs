@@ -9900,7 +9900,17 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public void CopyBlock2D(IGpuBuffer block, IGpuBuffer output, int blockRows, int blockCols, int totalCols, int rowOff, int colOff) => throw new NotSupportedException("CopyBlock2D not yet implemented on the CUDA backend.");
     public void Zeta(IGpuBuffer x, IGpuBuffer q, IGpuBuffer output, int size) => throw new NotSupportedException("Zeta not yet implemented on the CUDA backend.");
     public void Polygamma(IGpuBuffer x, IGpuBuffer output, int n, int size) => throw new NotSupportedException("Polygamma not yet implemented on the CUDA backend.");
-    public void ShiftedDiff(IGpuBuffer x, IGpuBuffer mask, int n) => throw new NotSupportedException("ShiftedDiff not yet implemented on the CUDA backend.");
+    public unsafe void ShiftedDiff(IGpuBuffer x, IGpuBuffer mask, int n)
+    {
+        var kernel = ResolveParity210Kernel("parity210_shifted_diff");
+        using var _ = PushContext();
+        int __total = n; if (__total <= 0) return;
+        uint grid = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = x.Handle; IntPtr la1 = mask.Handle; int la2 = n;
+        void** args = stackalloc void*[3];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
     public unsafe void ReflectPad1d(IGpuBuffer input, IGpuBuffer output, int batch, int l, int lp, int pad)
     {
         var kernel = ResolveParity210Kernel("parity210_reflect_pad_1d");
@@ -9967,13 +9977,83 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         args[0] = &la0; args[1] = &la1; args[2] = &la2;
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
-    public void HistogramDD(IGpuBuffer samples, IGpuBuffer hist, IGpuBuffer bins, IGpuBuffer mins, IGpuBuffer maxs, int n, int d) => throw new NotSupportedException("HistogramDD not yet implemented on the CUDA backend.");
-    public void MasksToBoxes(IGpuBuffer masks, IGpuBuffer output, int n, int h, int w) => throw new NotSupportedException("MasksToBoxes not yet implemented on the CUDA backend.");
-    public void PairwiseIou(IGpuBuffer boxes, IGpuBuffer iou, int n) => throw new NotSupportedException("PairwiseIou not yet implemented on the CUDA backend.");
-    public void LogicalOp(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int mode, int n) => throw new NotSupportedException("LogicalOp not yet implemented on the CUDA backend.");
-    public void LogicalNot(IGpuBuffer a, IGpuBuffer output, int n) => throw new NotSupportedException("LogicalNot not yet implemented on the CUDA backend.");
-    public void GridSampleBackwardInputNhwc(IGpuBuffer gradOut, IGpuBuffer grid, IGpuBuffer gradIn, int batch, int h, int w, int c, int outH, int outW) => throw new NotSupportedException("GridSampleBackwardInputNhwc not yet implemented on the CUDA backend.");
-    public void GridSampleBackwardGridNhwc(IGpuBuffer gradOut, IGpuBuffer input, IGpuBuffer grid, IGpuBuffer gradGrid, int batch, int h, int w, int c, int outH, int outW) => throw new NotSupportedException("GridSampleBackwardGridNhwc not yet implemented on the CUDA backend.");
+    public unsafe void HistogramDD(IGpuBuffer samples, IGpuBuffer hist, IGpuBuffer bins, IGpuBuffer mins, IGpuBuffer maxs, int n, int d)
+    {
+        var kernel = ResolveParity210Kernel("parity210_histogramdd");
+        using var _ = PushContext();
+        int __total = n; if (__total <= 0) return;
+        uint grid = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = samples.Handle; IntPtr la1 = hist.Handle; IntPtr la2 = bins.Handle; IntPtr la3 = mins.Handle; IntPtr la4 = maxs.Handle; int la5 = n; int la6 = d;
+        void** args = stackalloc void*[7];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5; args[6] = &la6;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+    public unsafe void MasksToBoxes(IGpuBuffer masks, IGpuBuffer output, int n, int h, int w)
+    {
+        var kernel = ResolveParity210Kernel("parity210_masks_to_boxes");
+        using var _ = PushContext();
+        int __total = n; if (__total <= 0) return;
+        uint grid = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = masks.Handle; IntPtr la1 = output.Handle; int la2 = n; int la3 = h; int la4 = w;
+        void** args = stackalloc void*[5];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+    public unsafe void PairwiseIou(IGpuBuffer boxes, IGpuBuffer iou, int n)
+    {
+        var kernel = ResolveParity210Kernel("parity210_pairwise_iou");
+        using var _ = PushContext();
+        int __total = n*n; if (__total <= 0) return;
+        uint grid = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = boxes.Handle; IntPtr la1 = iou.Handle; int la2 = n;
+        void** args = stackalloc void*[3];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+    public unsafe void LogicalOp(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int mode, int n)
+    {
+        var kernel = ResolveParity210Kernel("parity210_logical_op");
+        using var _ = PushContext();
+        int __total = n; if (__total <= 0) return;
+        uint grid = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = a.Handle; IntPtr la1 = b.Handle; IntPtr la2 = output.Handle; int la3 = mode; int la4 = n;
+        void** args = stackalloc void*[5];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+    public unsafe void LogicalNot(IGpuBuffer a, IGpuBuffer output, int n)
+    {
+        var kernel = ResolveParity210Kernel("parity210_logical_not");
+        using var _ = PushContext();
+        int __total = n; if (__total <= 0) return;
+        uint grid = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = a.Handle; IntPtr la1 = output.Handle; int la2 = n;
+        void** args = stackalloc void*[3];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+    public unsafe void GridSampleBackwardInputNhwc(IGpuBuffer gradOut, IGpuBuffer grid, IGpuBuffer gradIn, int batch, int h, int w, int c, int outH, int outW)
+    {
+        var kernel = ResolveParity210Kernel("parity210_gridsample_backward_input");
+        using var _ = PushContext();
+        int __total = batch*outH*outW*c; if (__total <= 0) return;
+        uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = gradOut.Handle; IntPtr la1 = grid.Handle; IntPtr la2 = gradIn.Handle; int la3 = batch; int la4 = h; int la5 = w; int la6 = c; int la7 = outH; int la8 = outW;
+        void** args = stackalloc void*[9];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5; args[6] = &la6; args[7] = &la7; args[8] = &la8;
+        LaunchKernel(kernel, gsz, DefaultBlockSize, args);
+    }
+    public unsafe void GridSampleBackwardGridNhwc(IGpuBuffer gradOut, IGpuBuffer input, IGpuBuffer grid, IGpuBuffer gradGrid, int batch, int h, int w, int c, int outH, int outW)
+    {
+        var kernel = ResolveParity210Kernel("parity210_gridsample_backward_grid");
+        using var _ = PushContext();
+        int __total = batch*outH*outW; if (__total <= 0) return;
+        uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = gradOut.Handle; IntPtr la1 = input.Handle; IntPtr la2 = grid.Handle; IntPtr la3 = gradGrid.Handle; int la4 = batch; int la5 = h; int la6 = w; int la7 = c; int la8 = outH; int la9 = outW;
+        void** args = stackalloc void*[10];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5; args[6] = &la6; args[7] = &la7; args[8] = &la8; args[9] = &la9;
+        LaunchKernel(kernel, gsz, DefaultBlockSize, args);
+    }
     public void ScatterReduce(IGpuBuffer output, IGpuBuffer source, IGpuBuffer index, int outerSize, int srcDim, int dstDim, int innerSize, int mode) => throw new NotSupportedException("ScatterReduce not yet implemented on the CUDA backend.");
     public void Unfold(IGpuBuffer src, IGpuBuffer dst, int outerSize, int dimSize, int innerSize, int nWindows, int size, int step) => throw new NotSupportedException("Unfold not yet implemented on the CUDA backend.");
 

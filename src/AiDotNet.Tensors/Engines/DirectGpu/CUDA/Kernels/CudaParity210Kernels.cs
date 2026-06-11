@@ -46,6 +46,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels
             // Audio/FFT audit
             "parity210_reflect_pad_1d","parity210_stft_mag_phase","parity210_phase_vocoder",
             "parity210_build_spectrum","parity210_istft_from_spectrum","parity210_istft_normalize",
+            // Logical/detection/geometry/misc audit
+            "parity210_logical_op","parity210_logical_not","parity210_shifted_diff","parity210_masks_to_boxes",
+            "parity210_pairwise_iou","parity210_histogramdd","parity210_gridsample_backward_input","parity210_gridsample_backward_grid",
         };
 
         public static string GetSource() => @"
@@ -942,6 +945,87 @@ extern ""C"" __global__ void parity210_istft_normalize(float* __restrict__ resul
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x; if (idx >= total) return;
     float ws = windowSum[idx]; if (ws > 1e-8f) result[idx] = result[idx] / ws;
+}
+
+// ==========================================================================
+// LOGICAL / DETECTION / GEOMETRY / MISC (audit) — from verified OpenCL kernels.
+// ==========================================================================
+extern ""C"" __global__ void parity210_logical_op(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ out, int mode, int n)
+{
+    int i = blockIdx.x*blockDim.x+threadIdx.x; if (i >= n) return;
+    int ba = (a[i] != 0.0f); int bb = (b[i] != 0.0f);
+    int r = (mode == 0) ? (ba && bb) : (mode == 1) ? (ba || bb) : (ba != bb);
+    out[i] = r ? 1.0f : 0.0f;
+}
+extern ""C"" __global__ void parity210_logical_not(const float* __restrict__ a, float* __restrict__ out, int n)
+{
+    int i = blockIdx.x*blockDim.x+threadIdx.x; if (i >= n) return;
+    out[i] = (a[i] != 0.0f) ? 0.0f : 1.0f;
+}
+extern ""C"" __global__ void parity210_shifted_diff(const float* __restrict__ x, float* __restrict__ mask, int n)
+{
+    int i = blockIdx.x*blockDim.x+threadIdx.x; if (i >= n) return;
+    mask[i] = (i == 0 || x[i] != x[i-1]) ? 1.0f : 0.0f;
+}
+extern ""C"" __global__ void parity210_masks_to_boxes(const float* __restrict__ masks, float* __restrict__ out, int N, int H, int W)
+{
+    int n = blockIdx.x*blockDim.x+threadIdx.x; if (n >= N) return;
+    int xMin = W, yMin = H, xMax = -1, yMax = -1; int planeOff = n * H * W;
+    for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) if (masks[planeOff + y*W + x] != 0.0f) { if (x<xMin)xMin=x; if (x>xMax)xMax=x; if (y<yMin)yMin=y; if (y>yMax)yMax=y; }
+    int o = n * 4;
+    if (xMax < 0) { out[o]=0.0f; out[o+1]=0.0f; out[o+2]=0.0f; out[o+3]=0.0f; }
+    else { out[o]=(float)xMin; out[o+1]=(float)yMin; out[o+2]=(float)xMax; out[o+3]=(float)yMax; }
+}
+extern ""C"" __global__ void parity210_pairwise_iou(const float* __restrict__ boxes, float* __restrict__ iou, int N)
+{
+    int idx = blockIdx.x*blockDim.x+threadIdx.x; if (idx >= N*N) return; int j = idx % N; int i = idx / N;
+    float ix1=boxes[i*4],iy1=boxes[i*4+1],ix2=boxes[i*4+2],iy2=boxes[i*4+3];
+    float jx1=boxes[j*4],jy1=boxes[j*4+1],jx2=boxes[j*4+2],jy2=boxes[j*4+3];
+    float ai=fmaxf(0.0f,ix2-ix1)*fmaxf(0.0f,iy2-iy1); float aj=fmaxf(0.0f,jx2-jx1)*fmaxf(0.0f,jy2-jy1);
+    float iw=fmaxf(0.0f,fminf(ix2,jx2)-fmaxf(ix1,jx1)); float ih=fmaxf(0.0f,fminf(iy2,jy2)-fmaxf(iy1,jy1));
+    float inter=iw*ih; float uni=ai+aj-inter; iou[idx]=(uni>0.0f)?inter/uni:0.0f;
+}
+extern ""C"" __global__ void parity210_histogramdd(const float* __restrict__ samples, float* __restrict__ hist, const int* __restrict__ bins, const float* __restrict__ mins, const float* __restrict__ maxs, int n, int d)
+{
+    int i = blockIdx.x*blockDim.x+threadIdx.x; if (i >= n) return; int linIdx = 0; int valid = 1;
+    for (int k = 0; k < d; k++) { float v = samples[i*d + k]; float mn = mins[k]; float mx = maxs[k]; if (v < mn || v > mx) { valid = 0; break; } float width = (mx - mn) / (float)bins[k]; int kIdx = (int)floorf((v - mn) / width); if (kIdx >= bins[k]) kIdx = bins[k] - 1; if (kIdx < 0) kIdx = 0; linIdx = linIdx * bins[k] + kIdx; }
+    if (valid) atomicAdd(&hist[linIdx], 1.0f);
+}
+extern ""C"" __global__ void parity210_gridsample_backward_input(const float* __restrict__ gradOut, const float* __restrict__ grid, float* __restrict__ gradIn, int batch, int H, int W, int C, int outH, int outW)
+{
+    int idx = blockIdx.x*blockDim.x+threadIdx.x; int total = batch*outH*outW*C; if (idx >= total) return;
+    int c = idx % C; int tmp = idx / C; int ow = tmp % outW; tmp /= outW; int oh = tmp % outH; int b = tmp / outH;
+    int gridBase = ((b*outH + oh)*outW + ow)*2; float gx = grid[gridBase]; float gy = grid[gridBase+1];
+    float srcH = (gy + 1.0f) * 0.5f * (float)(H - 1); float srcW = (gx + 1.0f) * 0.5f * (float)(W - 1);
+    if (srcH <= -1.0f || srcH >= (float)H || srcW <= -1.0f || srcW >= (float)W) return;
+    int h0 = (int)floorf(srcH); int h1 = h0 + 1; int w0 = (int)floorf(srcW); int w1 = w0 + 1;
+    float lh = srcH - (float)h0; float lw = srcW - (float)w0; float g = gradOut[idx];
+    if (h0>=0 && h0<H && w0>=0 && w0<W) atomicAdd(&gradIn[((b*H+h0)*W+w0)*C+c], g*(1.0f-lh)*(1.0f-lw));
+    if (h0>=0 && h0<H && w1>=0 && w1<W) atomicAdd(&gradIn[((b*H+h0)*W+w1)*C+c], g*(1.0f-lh)*lw);
+    if (h1>=0 && h1<H && w0>=0 && w0<W) atomicAdd(&gradIn[((b*H+h1)*W+w0)*C+c], g*lh*(1.0f-lw));
+    if (h1>=0 && h1<H && w1>=0 && w1<W) atomicAdd(&gradIn[((b*H+h1)*W+w1)*C+c], g*lh*lw);
+}
+extern ""C"" __global__ void parity210_gridsample_backward_grid(const float* __restrict__ gradOut, const float* __restrict__ input, const float* __restrict__ grid, float* __restrict__ gradGrid, int batch, int H, int W, int C, int outH, int outW)
+{
+    int idx = blockIdx.x*blockDim.x+threadIdx.x; if (idx >= batch*outH*outW) return;
+    int ow = idx % outW; int tmp = idx / outW; int oh = tmp % outH; int b = tmp / outH;
+    int gridBase = ((b*outH+oh)*outW+ow)*2; float gx = grid[gridBase]; float gy = grid[gridBase+1];
+    float srcH = (gy+1.0f)*0.5f*(float)(H-1); float srcW = (gx+1.0f)*0.5f*(float)(W-1);
+    float gradGx = 0.0f; float gradGy = 0.0f;
+    if (!(srcH <= -1.0f || srcH >= (float)H || srcW <= -1.0f || srcW >= (float)W)) {
+        int h0 = (int)floorf(srcH); int h1 = h0+1; int w0 = (int)floorf(srcW); int w1 = w0+1;
+        float lh = srcH-(float)h0; float lw = srcW-(float)w0;
+        int in00 = (h0>=0&&h0<H&&w0>=0&&w0<W); int in01 = (h0>=0&&h0<H&&w1>=0&&w1<W);
+        int in10 = (h1>=0&&h1<H&&w0>=0&&w0<W); int in11 = (h1>=0&&h1<H&&w1>=0&&w1<W);
+        for (int c = 0; c < C; c++) {
+            float v00 = in00 ? input[((b*H+h0)*W+w0)*C+c] : 0.0f; float v01 = in01 ? input[((b*H+h0)*W+w1)*C+c] : 0.0f;
+            float v10 = in10 ? input[((b*H+h1)*W+w0)*C+c] : 0.0f; float v11 = in11 ? input[((b*H+h1)*W+w1)*C+c] : 0.0f;
+            float dH = (1.0f-lw)*(v10-v00) + lw*(v11-v01); float dW = (1.0f-lh)*(v01-v00) + lh*(v11-v10);
+            float go = gradOut[((b*outH+oh)*outW+ow)*C+c];
+            gradGx += go * dW * (float)(W-1)*0.5f; gradGy += go * dH * (float)(H-1)*0.5f;
+        }
+    }
+    gradGrid[gridBase] = gradGx; gradGrid[gridBase+1] = gradGy;
 }
 ";
     }
