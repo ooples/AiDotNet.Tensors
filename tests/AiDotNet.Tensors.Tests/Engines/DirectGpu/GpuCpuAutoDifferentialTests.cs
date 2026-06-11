@@ -460,6 +460,38 @@ public sealed class GpuCpuAutoDifferentialTests : IDisposable
         "Mamba2SsdScanForward(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Int32)",
         "FusedLinearCrossEntropyWithLogits(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<Int32>)",
         "FusedLinearCrossEntropyWithLogits(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>)",
+        // GPU-missing-kernels audit (PR #582): each is verified by a dedicated GPU-vs-CPU parity
+        // assertion in GpuMissingKernelsParityTests.cs. They are not driveable by the generic
+        // single-shape harness here because they need distinct shapes per tensor argument, a
+        // non-Tensor<float> return (Bit masks / int index buffers the comparator can't diff),
+        // list-of-tensors / pre-packed-weight params, or domain-specific input semantics
+        // (audio STFT windowing / sample-rate, box geometry, grid-sample coordinates).
+        "GridSampleBackwardGrid(Tensor<T>,Tensor<T>,Tensor<T>,GridSampleMode,GridSamplePadding,Boolean)",
+        "GridSampleBackwardInput(Tensor<T>,Tensor<T>,Int32[],GridSampleMode,GridSamplePadding,Boolean)",
+        "LstmSequenceForward(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Boolean)",
+        "MasksToBoxes(Tensor<T>)",
+        "MlpForward(Tensor<T>,IReadOnlyList<Tensor<T>>,IReadOnlyList<Tensor<T>>,FusedActivationType,FusedActivationType,FusedActivationParams,FusedActivationParams)",
+        "MultiHeadAttentionForward(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Int32,Tensor<Boolean>)",
+        "Nms(Tensor<T>,Tensor<T>,Double)",
+        "Spectrogram(Tensor<T>,Int32,Int32,Int32,Tensor<T>)",
+        "TensorArgsort(Tensor<T>,Int32,Boolean)",
+        "TensorCross(Tensor<T>,Tensor<T>,Int32)",
+        "TensorEq(Tensor<T>,Tensor<T>)",
+        "TensorEqScalar(Tensor<T>,T)",
+        "TensorHistogram(Tensor<T>,Int32,T,T)",
+        "TensorHistogramDD(Tensor<T>,Int32[],T[],T[])",
+        "TensorIsClose(Tensor<T>,Tensor<T>,T,T,Boolean)",
+        "TensorIsFinite(Tensor<T>)",
+        "TensorIsIn(Tensor<T>,Tensor<T>,Boolean)",
+        "TensorIsInf(Tensor<T>)",
+        "TensorIsNan(Tensor<T>)",
+        "TensorMaskedScatter(Tensor<T>,Tensor<Bit>,Tensor<T>)",
+        "TensorMaskedSelect(Tensor<T>,Tensor<Bit>)",
+        "TensorMatMul2DWithPrePackedB(Tensor<T>,Tensor<T>,WeightPackHandle)",
+        "TensorNonzero(Tensor<T>)",
+        "TensorSearchSorted(Tensor<T>,Tensor<T>,Boolean)",
+        "TensorSelectScatter(Tensor<T>,Tensor<T>,Int32,Int32)",
+        "TimeStretch(Tensor<T>,Double,Int32,Int32)",
     };
 }
 
