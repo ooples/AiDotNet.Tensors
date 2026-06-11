@@ -109,6 +109,25 @@ public class MlpTrainStepProfileBench
         long ia = GC.GetAllocatedBytesForCurrentThread();
         double infAllocKb = (ia - ib) / 1024.0 / allocIters;
 
+        // Forward WITH tape recording but NO backward — isolates tape-recording allocation
+        // from backward (gradient output + intermediate) allocation.
+        void ForwardWithTape()
+        {
+            using var tape = new GradientTape<float>();
+            var h = x;
+            for (int l = 0; l < 4; l++)
+            {
+                var lin = _engine.TensorMatMul(h, W[l]);
+                var bia = _engine.TensorBroadcastAdd(lin, bb[l]);
+                h = l < 3 ? _engine.ReLU(bia) : bia;
+            }
+            _engine.ReduceSum(h, new[] { 0, 1 }, keepDims: false);
+        }
+        long fb = GC.GetAllocatedBytesForCurrentThread();
+        for (int i = 0; i < allocIters; i++) ForwardWithTape();
+        long fa = GC.GetAllocatedBytesForCurrentThread();
+        double fwdTapeKb = (fa - fb) / 1024.0 / allocIters;
+
         // Raw single GEMM [64,256]x[256,512] to separate dispatch overhead from GEMM speed.
         var w0 = W[0];
         double rawGemmMs = MinMs(() => _engine.TensorMatMul(x, w0), 500);
@@ -131,7 +150,8 @@ public class MlpTrainStepProfileBench
         }
         _output.WriteLine($"MLP {string.Join("→", dims)} batch={B}");
         _output.WriteLine($"  inference forward (no tape): {infMs:F3} ms,  alloc {infAllocKb:F1} KB/step");
-        _output.WriteLine($"  full train step (fwd+bwd):   {trainMs:F3} ms,  alloc {allocKbPerStep:F1} KB/step");
+        _output.WriteLine($"  forward WITH tape (no bwd):  alloc {fwdTapeKb:F1} KB/step  (tape-record cost {fwdTapeKb - infAllocKb:F1} KB)");
+        _output.WriteLine($"  full train step (fwd+bwd):   {trainMs:F3} ms,  alloc {allocKbPerStep:F1} KB/step  (backward cost {allocKbPerStep - fwdTapeKb:F1} KB)");
         _output.WriteLine($"  backward overhead (train-inf): {trainMs - infMs:F3} ms  ({(trainMs / Math.Max(infMs, 1e-9)):F1}× inference)");
         _output.WriteLine($"  alloc amplification (train/inf): {allocKbPerStep / Math.Max(infAllocKb, 1e-6):F1}×");
 
