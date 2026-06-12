@@ -74,6 +74,21 @@ internal static class StreamingWorkerPool
     internal static void ResetPoolStats()
     { s_parallelDispatches = 0; s_serialBelowGrain = 0; s_serialContended = 0; s_parkEvents = 0; }
 
+    /// <summary>
+    /// Idle SpinWait budget before an idle worker parks on its event (issue #589).
+    /// SpinWait(1) emits a HT-friendly `pause` and covers the sub-10µs gaps between
+    /// back-to-back GEMM dispatches so a burst stays hot without park/wake churn. The
+    /// old loop ALSO spent iterations 1000-5000 in Thread.Yield(), which under a busy
+    /// co-running workload (e.g. conv on the other parallel path) returns immediately —
+    /// keeping the idle worker runnable, re-checking, yielding again, and oversubscribing
+    /// the cores the real work needs (measured: ~47% of busy CPU wasted in the worker
+    /// loops during conv-dominated diffusion sampling). Parking right after the SpinWait
+    /// budget makes idle workers release the cores within ~10µs; the next dispatch wakes
+    /// them via the park event. GEMM dispatch is grain-gated, so the µs-scale wake latency
+    /// is negligible against the pooled work.
+    /// </summary>
+    private const int IdleSpinBeforePark = 1000;
+
     private static void WorkerLoop(int slot)
     {
         long lastSeq = 0;
@@ -83,14 +98,9 @@ internal static class StreamingWorkerPool
             int spinCount = 0;
             while (Volatile.Read(ref _slots[slot].Seq) == lastSeq)
             {
-                if (spinCount < 1000)
+                if (spinCount < IdleSpinBeforePark)
                 {
                     Thread.SpinWait(1);
-                    spinCount++;
-                }
-                else if (spinCount < 5000)
-                {
-                    Thread.Yield();
                     spinCount++;
                 }
                 else
