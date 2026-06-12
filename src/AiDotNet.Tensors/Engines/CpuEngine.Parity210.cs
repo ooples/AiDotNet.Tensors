@@ -3389,12 +3389,45 @@ public partial class CpuEngine
         var dst = result.AsWritableSpan();
         for (int i = 0; i < src.Length; i++)
         {
-            double scale = System.Math.Pow(2.0, e[i]);
-            dst[i] = ops.Multiply(src[i], ops.FromDouble(scale));
+            // ldexp(x, n) = x · 2ⁿ. Computing as `Math.Pow(2, n) * x` (the
+            // previous body) loses correctness when n exceeds the float
+            // exponent range BUT x compensates with a small magnitude: e.g.
+            // ldexp(1e-30, 130) is 1.07e9 (finite), but Math.Pow(2.0, 130)
+            // overflows the float→+Inf cast and then Inf*1e-30 = +Inf, so
+            // the CPU returned +Inf where the GPU's ldexpf returned the
+            // correct finite value (GpuCpuAutoDifferential parity bug).
+            dst[i] = ops.FromDouble(LdexpScalar(ops.ToDouble(src[i]), e[i]));
         }
         DifferentiableOps.RecordUnary("TensorLdexp", result, x,
             BackwardFunctions<T>.LdexpBackward, new object[] { exp });
         return result;
+    }
+
+    /// <summary>
+    /// ldexp(x, n) = x · 2ⁿ, computed without a (Math.Pow(2,n) → cast → multiply)
+    /// intermediate that overflows independently of x's magnitude.
+    /// Uses <see cref="System.Math.ScaleB(double,int)"/> on net6+ (direct exponent
+    /// biasing) and a chunked-shift fallback on net471 (where ScaleB is unavailable):
+    /// step n in increments of ±1023 so each individual multiply by 2¹⁰²³ stays
+    /// inside the double range, then a final multiply for the remainder.
+    /// </summary>
+    private static double LdexpScalar(double x, int n)
+    {
+#if NET6_0_OR_GREATER
+        return System.Math.ScaleB(x, n);
+#else
+        if (x == 0.0 || double.IsNaN(x) || double.IsInfinity(x) || n == 0) return x;
+        // Iteratively multiply by 2¹⁰²³ (≈8.99e307, just under double.MaxValue)
+        // until the remaining n is within [-1023, 1023]. This avoids
+        // Math.Pow(2.0, n) overflowing when n alone is too large.
+        const double Pow2_1023 = 8.98846567431158e307;       // 2^1023
+        const double Pow2_minus1022 = 2.2250738585072014e-308; // 2^-1022 (smallest normal)
+        double r = x;
+        while (n > 1023) { r *= Pow2_1023; n -= 1023; }
+        while (n < -1022) { r *= Pow2_minus1022; n += 1022; }
+        if (n != 0) r *= System.Math.Pow(2.0, n);   // n now in [-1022, 1023], safe
+        return r;
+#endif
     }
 
     /// <inheritdoc/>
