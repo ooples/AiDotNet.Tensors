@@ -14222,7 +14222,11 @@ public partial class CpuEngine : ITensorLevelEngine
                     // im2col (channel-parallel at small colW, serial at large colW).
                     // Match the GEMM routing: small convs build serially (the im2col pool wakeup adds
                     // timing variance that makes the tiny-conv perf gate flaky under concurrent load).
-                    bool convParallel = (long)colH * outChannels > ConvSmallGemmOutputMax;
+                    // Fold batchColW into the heuristic — both BuildKConcatStackFloat and
+                    // ConvWeightGemmFloat do work proportional to colH·outChannels·batchColW, so a
+                    // thin output (small colH·outChannels) with a very large K still has enough
+                    // total work to amortize the parallel-pool wakeup.
+                    bool convParallel = (long)colH * outChannels * batchColW > ConvSmallGemmOutputMax;
                     BuildKConcatStackFloat(
                         gradOutputF, inputF, gradOutAllT, im2colAll,
                         batch, outChannels, inChannels, colW, colH, batchColW,
