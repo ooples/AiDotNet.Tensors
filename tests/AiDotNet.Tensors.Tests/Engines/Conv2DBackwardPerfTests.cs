@@ -6,11 +6,19 @@ using Xunit.Abstractions;
 
 namespace AiDotNet.Tensors.Tests.Engines;
 
+/// <summary>Runs the conv perf tests serially and NOT in parallel with any other collection, so the
+/// wall-clock im2col+GEMM-vs-naive timings aren't corrupted by oversubscription from concurrent tests
+/// (a Category=Performance timing test under heavy pool contention measures the scheduler, not the
+/// kernel). Mirrors the repo's BlasManaged-Perf-Serial collection.</summary>
+[CollectionDefinition("ConvPerfSerial", DisableParallelization = true)]
+public class ConvPerfSerialCollection { }
+
 /// <summary>
 /// Performance tests proving Conv2DBackwardInput/BackwardKernel im2col+GEMM
 /// is significantly faster than naive loops. Gated by Category=Performance
 /// trait on timing methods only — correctness tests always run.
 /// </summary>
+[Collection("ConvPerfSerial")]
 public class Conv2DBackwardPerfTests
 {
     private readonly ITestOutputHelper _output;
@@ -247,20 +255,31 @@ public class Conv2DBackwardPerfTests
         _engine.Conv2DBackwardKernel(gradOutput, input, kernelShape, stride, padding, dilation);
         NaiveConv2DBackwardKernelFloat(gradOutputF, gradOutputShape, inputF, inputShape, kernelShape, stride, padding, dilation);
 
-        // Time the float im2col+GEMM fast path
-        var sw = Stopwatch.StartNew();
-        int iters = 10;
+        // Measure each path as the MIN over iterations, not the average. This is a
+        // [Category=Performance] test (excluded from the parallel CI run) and is sometimes executed
+        // alongside other parallel tests; under that oversubscription the OS preempts iterations and
+        // the *average* reflects scheduler noise rather than kernel speed, while the min recovers the
+        // least-preempted (true-kernel-speed) run. Mirrors PrePackSpeedupTest's min-of-repeats
+        // methodology — the gate is unchanged, only the estimator is the standard noisy-box one.
+        const int iters = 15;
+        var sw = new Stopwatch();
+        double gemmMs = double.MaxValue;
         for (int i = 0; i < iters; i++)
+        {
+            sw.Restart();
             _engine.Conv2DBackwardKernel(gradOutput, input, kernelShape, stride, padding, dilation);
-        sw.Stop();
-        double gemmMs = sw.Elapsed.TotalMilliseconds / iters;
+            sw.Stop();
+            gemmMs = Math.Min(gemmMs, sw.Elapsed.TotalMilliseconds);
+        }
 
-        // Time the naive float loop baseline (same data type — apples to apples)
-        sw.Restart();
+        double naiveMs = double.MaxValue;
         for (int i = 0; i < iters; i++)
+        {
+            sw.Restart();
             NaiveConv2DBackwardKernelFloat(gradOutputF, gradOutputShape, inputF, inputShape, kernelShape, stride, padding, dilation);
-        sw.Stop();
-        double naiveMs = sw.Elapsed.TotalMilliseconds / iters;
+            sw.Stop();
+            naiveMs = Math.Min(naiveMs, sw.Elapsed.TotalMilliseconds);
+        }
 
         double speedup = naiveMs / gemmMs;
         _output.WriteLine($"Conv2DBackwardKernel [{batch},{inC},{h},{w}] outC={outC} kernel {kH}x{kW}:");

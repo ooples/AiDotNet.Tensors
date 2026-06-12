@@ -108,7 +108,21 @@ public partial class CpuEngine
         // Math.Clamp isn't available on net471 — use Max/Min (see the same
         // pattern in CpuEngine.Geometry.cs / FusedPointwise.cs).
         int blasThreads = Math.Max(1, Math.Min((int)(rows / 16), Environment.ProcessorCount));
-        using var _blasScope = Helpers.BlasProvider.ScopeOpenBlasThreads(blasThreads);
+        // ScopeOpenBlasThreads is NOT free: it marshals an openblas_set_num_threads
+        // onto a dedicated BLAS thread (a semaphore round-trip) on BOTH entry and
+        // restore — ~0.1 ms of the measured ~0.29 ms batch-1 MlpForward (issue #475 /
+        // small-batch inference loss vs PyTorch). At small effective M the per-layer
+        // GEMMs are GEMV-tiny (e.g. 1×784×512) and OpenBLAS runs them single-threaded
+        // by its own size heuristic, so forcing the global pool to 1 thread changes
+        // nothing — the reconfiguration is pure overhead. Only enter the scope once
+        // there are enough output rows that native BLAS would actually multithread and
+        // oversubscribe (the #436 case was bs=128; blasThreads only drops below the
+        // core count from bs≈32 up). default(OpenBlasThreadScope) is an inert token
+        // whose Dispose is a no-op, so the small-batch path pays nothing.
+        const long BlasThreadScopeMinRows = 32;
+        using var _blasScope = rows >= BlasThreadScopeMinRows
+            ? Helpers.BlasProvider.ScopeOpenBlasThreads(blasThreads)
+            : default;
 
         int last = weights.Count - 1;
 

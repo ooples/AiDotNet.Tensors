@@ -265,6 +265,36 @@ public static partial class BlasManaged
     {
         if (m <= 0 || n <= 0 || k <= 0) return;
 
+        // Thin-M pre-packed B re-dispatch: the fast thin-M / machine-code kernels below cannot
+        // consume pre-packed tiles (they're gated on PackedB == null), so a pre-packed thin-M GEMM
+        // falls to the slow tuned strategy. That strategy parallelizes over the M-axis, so with few
+        // M-rows AND heavy per-row work (large N·K) it leaves cores idle — measured ~7× slower than
+        // fresh-pack at M=8/N=1024/K=1024 (PrePackSpeedupTest). Re-dispatch without the handle so it
+        // takes the fast fresh-pack path (machine-code kernel parallelizes the N-axis); the result is
+        // bit-identical (packing is only a memory-layout optimization). The per-row-work guard keeps
+        // the handle for small-N·K thin-M GEMMs (e.g. M=32 K=128 N=64) where the tuned strategy is
+        // already fast and dropping it would skip the pre-pack consumption other callers rely on.
+        const long ThinMPrePackDropMinRowWork = 1L << 16; // 64K = N·K above which thin-M pre-pack stalls
+        if (options.PackedB is not null && options.PackedA is null && m < ThinMDirectMinM
+            && (long)n * k >= ThinMPrePackDropMinRowWork
+            && !transA && !transB && options.PackingMode == PackingMode.Auto)
+        {
+            Gemm<T>(a, lda, transA, b, ldb, transB, c, ldc, m, n, k,
+                new BlasOptions<T>
+                {
+                    PackingMode = options.PackingMode,
+                    Epilogue = options.Epilogue,
+                    Workspace = options.Workspace,
+                    PackedA = options.PackedA,
+                    PackedB = null,
+                    NumThreads = options.NumThreads,
+                    AutotuneKey = options.AutotuneKey,
+                    MaxJitCacheBytes = options.MaxJitCacheBytes,
+                    Mode = options.Mode,
+                });
+            return;
+        }
+
         // Strategies do read-modify-write on C; zero it here so the first call
         // produces C = A · B (not C += A · B). Future versions may expose a
         // beta=1 option that skips this zero, but Phase B's contract is C := A · B.
