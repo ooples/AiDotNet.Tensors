@@ -580,40 +580,16 @@ public partial class DirectGpuTensorEngine
         catch (Exception) { return base.TensorTake(tensor, indices); }
     }
 
-    /// <inheritdoc/>
-    public override Tensor<T> TensorScatterAdd<T>(Tensor<T> destination, Tensor<int> indices, Tensor<T> updates, int axis = 0)
-    {
-        if (destination is null) throw new ArgumentNullException(nameof(destination));
-        if (indices is null) throw new ArgumentNullException(nameof(indices));
-        if (updates is null) throw new ArgumentNullException(nameof(updates));
-        if (axis < 0) axis += destination.Rank;
+    // TensorScatterAdd<T>: GPU override removed pending root-cause investigation.
+    // The wrapper seeded the output buffer with destination via backend.Copy and called the
+    // atomic embedding_backward kernel (embDim=1), but the result diverged from CPU by 174× the
+    // generic differential-test tolerance at shape [257] (GpuCpuAutoDifferentialTests, post-PR
+    // #582 audit). Until the divergence is isolated (seed-vs-cache vs atomic-add ordering vs
+    // kernel index width), fall back to the (correct) CPU base via inheritance. This restores
+    // bit-for-bit GPU/CPU parity at a perf cost only for this op — scatter-add is not a hot
+    // path. A follow-up correctness PR with a controlled-input GPU test will reinstate the
+    // override once the kernel matches CPU on the differential harness.
 
-        // index_add: result = copy(destination); result[index[i]] += updates[i]. The backend ScatterAdd
-        // kernel is FLAT (featureSize=1), so only the 1-D / axis-0 case maps; higher-rank / featured /
-        // non-zero-axis fall back to the (correct) base. Tape-active also defers (the scatter backward
-        // stays on the base's recording). The prior engine wiring diverged because it did NOT seed the
-        // output buffer with the base destination — scatter is an ADD onto the existing values — so the
-        // base contribution was missing. Seed it with backend.Copy first, then atomic-add the updates.
-        if (IsTapeActive<T>() || axis != 0
-            || destination.Rank != 1 || updates.Rank != 1 || indices.Rank != 1
-            || indices.Length != updates.Length
-            || !TryGetBackend(out var backend))
-            return base.TensorScatterAdd(destination, indices, updates, axis);
-
-        try
-        {
-            int destSize = destination.Length;
-            using var bufDest = GetOrAllocateBuffer(backend, destination.GetDataArray());
-            using var bufUpd = GetOrAllocateBuffer(backend, updates.GetDataArray());
-            using var bufIdx = backend.AllocateIntBuffer(indices.GetDataArray());
-            var bufOut = AllocateOutputBuffer(backend, destSize);
-            backend.Copy(bufDest.Buffer, bufOut.Buffer, destSize);   // seed with the base (the += target)
-            backend.ScatterAdd(bufUpd.Buffer, bufIdx, bufOut.Buffer, updates.Length, destSize);
-            var result = FinishGpuOp<T>(backend, bufOut, destSize);
-            return new Tensor<T>(result, (int[])destination._shape.Clone());
-        }
-        catch (Exception) { return base.TensorScatterAdd(destination, indices, updates, axis); }
-    }
 
     /// <inheritdoc/>
     public override Tensor<T> TensorIndexAdd<T>(Tensor<T> tensor, int axis, Tensor<int> indices, Tensor<T> source)
@@ -1290,28 +1266,15 @@ public partial class DirectGpuTensorEngine
     }
 
     /// <inheritdoc/>
-    public override Tensor<T> TensorCDist<T>(Tensor<T> x1, Tensor<T> x2, double p = 2.0)
-    {
-        if (x1 is null) throw new ArgumentNullException(nameof(x1));
-        if (x2 is null) throw new ArgumentNullException(nameof(x2));
-        if (typeof(T) != typeof(float) || x1.Rank != 2 || x2.Rank != 2
-            || x1._shape[1] != x2._shape[1] || !TryGetBackend(out var backend))
-            return base.TensorCDist(x1, x2, p);
-        try
-        {
-            var c1 = x1.IsContiguous ? x1 : (Tensor<T>)x1.Contiguous();
-            var c2 = x2.IsContiguous ? x2 : (Tensor<T>)x2.Contiguous();
-            int m = x1._shape[0], n = x2._shape[0], d = x1._shape[1];
-            int outN = m * n;
-            using var buf1 = GetOrAllocateBuffer(backend, c1.GetDataArray());
-            using var buf2 = GetOrAllocateBuffer(backend, c2.GetDataArray());
-            var bufOut = AllocateOutputBuffer(backend, outN);
-            backend.CDist(buf1.Buffer, buf2.Buffer, bufOut.Buffer, m, n, d, (float)p);
-            var arr = FinishGpuOp<T>(backend, bufOut, outN);
-            return new Tensor<T>(arr, new[] { m, n });
-        }
-        catch (Exception) { return base.TensorCDist(x1, x2, p); }
-    }
+    // TensorCDist<T>: GPU override removed pending precision fix. The CPU reference
+    // accumulates sum-of-p-norms in DOUBLE precision (PNormCross uses `double acc` and
+    // `Math.Pow(|diff|, p)`); the GPU kernel accumulates in FLOAT32 (`sum += diff*diff`)
+    // and produces a noticeably-different result at shape [129,129] (max_abs_err 1.17e-2,
+    // ~1% of typical magnitude — beyond pure fp32 noise for this width). A correct GPU
+    // implementation would mirror the CPU's double-precision accumulation (or use a
+    // Kahan/pairwise reduction to get fp32 closer to double-accuracy). Until that lands,
+    // fall back to the (correct) CPU base.
+
 
     /// <inheritdoc/>
     public override Tensor<T> TensorPut<T>(Tensor<T> tensor, Tensor<int> indices, Tensor<T> source)
@@ -2275,37 +2238,15 @@ public partial class DirectGpuTensorEngine
         return (float[])(object)c.GetDataArray();
     }
 
-    /// <inheritdoc/>
-    public override Tensor<T> FusedHierarchicalSoftmax<T>(Tensor<T> input, Tensor<T> nodeWeights, int numClasses)
-    {
-        if (input is null) throw new ArgumentNullException(nameof(input));
-        if (nodeWeights is null) throw new ArgumentNullException(nameof(nodeWeights));
-        if (numClasses < 2) throw new ArgumentException("numClasses must be >= 2.", nameof(numClasses));
-        if (typeof(T) != typeof(float) || nodeWeights.Rank != 2 || !TryGetBackend(out var backend))
-            return base.FusedHierarchicalSoftmax(input, nodeWeights, numClasses);
-        int d = input._shape[input.Rank - 1];
-        int treeDepth = nodeWeights._shape[0];
-        int minDepth = 0; while ((1 << minDepth) < numClasses) minDepth++;
-        if (nodeWeights._shape[1] != d || treeDepth < minDepth)
-            return base.FusedHierarchicalSoftmax(input, nodeWeights, numClasses);
-        try
-        {
-            // Per-level node activations on the GPU (input · nodeWeightsᵀ), then the leaf-probability
-            // path products (sigmoid folded into the kernel).
-            int rows = input.Length / d;
-            var input2d = (input.IsContiguous ? input : (Tensor<T>)input.Contiguous()).Reshape(new[] { rows, d });
-            var acts = TensorMatMulTransposed(input2d, nodeWeights);   // [rows, treeDepth]
-            var actsC = acts.IsContiguous ? acts : (Tensor<T>)acts.Contiguous();
-            using var bufActs = GetOrAllocateBuffer(backend, actsC.GetDataArray());
-            var bufOut = AllocateOutputBuffer(backend, rows * numClasses);
-            backend.HierarchicalSoftmaxPaths(bufActs.Buffer, bufOut.Buffer, rows, treeDepth, numClasses);
-            var arr = FinishGpuOp<T>(backend, bufOut, rows * numClasses);
-            var outShape = (int[])input._shape.Clone();
-            outShape[outShape.Length - 1] = numClasses;
-            return new Tensor<T>(arr, outShape);
-        }
-        catch (Exception) { return base.FusedHierarchicalSoftmax(input, nodeWeights, numClasses); }
-    }
+    // FusedHierarchicalSoftmax<T>: GPU override removed pending root-cause investigation.
+    // The fused path ran (input · nodeWeightsᵀ) via TensorMatMulTransposed followed by the
+    // HierarchicalSoftmaxPaths kernel, but the result diverged from CPU by 100× the generic
+    // differential-test tolerance at shape [129,129] (GpuCpuAutoDifferentialTests, post-PR
+    // #582 audit). Both halves (the GEMM and the softmax kernel) need to be ruled out
+    // individually against the CPU reference. Until that's done, fall back to the (correct)
+    // CPU base via inheritance to restore bit-for-bit parity. A follow-up correctness PR
+    // with per-half tests will reinstate the override once the kernel matches CPU.
+
 
     /// <inheritdoc/>
     public override Tensor<T> FusedLinearMaxout<T>(Tensor<T> input, Tensor<T> weights, Tensor<T>? bias, int numPieces)

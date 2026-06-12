@@ -102,16 +102,6 @@ public sealed class GpuCpuAutoDifferentialTests : IDisposable
         ["RMSNorm"] = "gamma must be [C] (last dim), not full input shape",
         // transcendental composite precision (NOT a structural bug)
         ["TensorLogSumExp"] = "per-row reduction verified exact; multi-row uses a composite GPU path (reduce-max/exp/reduce-sum, each <1e-2) that accumulates ~0.058 (<1%) at width 129 — precision, not garbage",
-        ["TensorCDist"] = "sqrt(sum-of-squared-diffs) accumulates fp32 noise; 1.17e-2 at shape [129,129] is on the edge of the 1e-2 generic gate (~1% of typical magnitude). Precision-not-garbage; dedicated test with relaxed tolerance pending.",
-
-        // FLAGGED — suspected real GPU/CPU divergence in kernels added by PR #582 (commit 70e761f4,
-        // "audit + fix GPU-missing kernels that silently fall back to CPU"). The PR added new GPU
-        // overrides for ops that previously CPU-fell-back; the overrides compile but diverge from
-        // the CPU reference by 100×-174× the generic tolerance. Exempted here to unblock CI; tracked
-        // for a follow-up correctness PR that either fixes the kernels or reverts the specific
-        // overrides so the CPU fallback (which was correct) keeps running.
-        ["TensorScatterAdd"] = "FLAGGED: max_abs_err 1.74E+0 at shape [257] (atomic-add seed path). The wrapper seeds the output buffer via backend.Copy then calls the embedding_backward kernel with embDim=1 (atomic-add); test still diverges. Needs dedicated test with controlled (non-duplicate) indices to isolate seed vs atomic-add vs kernel issue.",
-        ["FusedHierarchicalSoftmax"] = "FLAGGED: max_abs_err 1.0E+0 at shape [129,129]. Fused path runs TensorMatMulTransposed → HierarchicalSoftmaxPaths kernel; each step needs to be ruled out individually against the CPU reference.",
     };
 
     // Stochastic / non-deterministic kernels — substring match on the method name.
