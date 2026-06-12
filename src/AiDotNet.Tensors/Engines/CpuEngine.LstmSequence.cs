@@ -186,14 +186,40 @@ public partial class CpuEngine
         if (bHh is not null && (bHh.Rank != 1 || bHh.Shape[0] != gateRows))
             throw new ArgumentException($"bHh must be [{gateRows}].", nameof(bHh));
 
-        // GraphMode is unsupported in this revision — backward is not yet
-        // implemented. Training paths should not call this; they should use
-        // the existing per-step LSTMLayer.Forward which has tape coverage.
+        // Under an active gradient tape, float routes to the fused training path: exact
+        // activations, saved per-timestep state, and a single fused BPTT node
+        // (CpuEngine.LstmSequenceBackward.cs). Collapses the per-timestep training graph
+        // into one node (ooples/AiDotNet#1566). The tape (not GraphMode) is what
+        // RecordIfActive keys on — GraphMode is the separate graph-compilation flag.
+        if (Autodiff.DifferentiableOps.IsRecording<T>())
+        {
+            if (typeof(T) == typeof(float))
+            {
+                var trainOut = LstmSequenceForwardFloatTrain(
+                    (Tensor<float>)(object)input,
+                    (Tensor<float>?)(object?)h0,
+                    (Tensor<float>?)(object?)c0,
+                    (Tensor<float>)(object)wIh,
+                    (Tensor<float>)(object)wHh,
+                    (Tensor<float>?)(object?)bIh,
+                    (Tensor<float>?)(object?)bHh,
+                    batch, seqLen, inFeatures, hidden, gateRows, returnSequences, wantState,
+                    out var hnT, out var cnT);
+                finalHidden = (Tensor<T>)(object)hnT;
+                finalCell = (Tensor<T>)(object)cnT;
+                return (Tensor<T>)(object)trainOut;
+            }
+
+            throw new InvalidOperationException(
+                "LstmSequenceForward supports GradientTape for float only in this revision. " +
+                "Route non-float training through the decomposed LSTMLayer.Forward path.");
+        }
+
+        // Graph-compilation mode (distinct from the eager tape) is not yet supported.
         if (GraphMode.IsActive)
             throw new InvalidOperationException(
-                "LstmSequenceForward is inference-only and does not yet support GradientTape. " +
-                "Call it outside an active graph-mode scope, or route training through the " +
-                "decomposed LSTMLayer.Forward path.");
+                "LstmSequenceForward does not yet support graph-compilation mode. " +
+                "Call it outside an active graph-mode scope.");
 
         // Float fast path: SimdGemm + vectorized sigmoid/tanh + ArrayPool
         // scratch buffers reused across timesteps. This is the path that

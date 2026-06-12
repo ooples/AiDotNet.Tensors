@@ -1,0 +1,123 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+language: en-US
+tone_instructions: "Be thorough and aggressive about code quality. Flag stubs, TODOs, non-production code, and CPU-only kernels missing GPU coverage as BLOCKING. See path_instructions for the six-backend kernel-coverage rule."
+early_access: true
+enable_free_tier: true
+
+reviews:
+  profile: assertive
+  request_changes_workflow: true
+  high_level_summary: true
+  high_level_summary_placeholder: "@coderabbitai summary"
+  auto_title_placeholder: "@coderabbitai"
+  review_status: true
+  commit_status: true
+  poem: true
+  collapse_walkthrough: false
+  sequence_diagrams: true
+  changed_files_summary: true
+  labeling_instructions: []
+  path_filters: []
+  path_instructions:
+    - path: "src/**"
+      instructions: |
+        ## AiDotNet.Tensors Core Guidelines
+
+        ### Production Readiness (CRITICAL - Flag as BLOCKING)
+        **Every PR must contain production-ready code. Flag ALL of the following as blocking issues:**
+
+        - **Stubs/Placeholders**: Methods with `throw new NotImplementedException()`, empty method bodies, `// TODO` comments, placeholder return values, or `// Future enhancement` comments
+        - **Simplified implementations**: Hardcoded values instead of proper logic, missing error handling at system boundaries, missing validation of external inputs, methods that just log/print instead of doing real work
+        - **Incomplete features**: Half-implemented patterns where some code paths work but others silently do nothing
+        - **Non-production patterns**: Using `Console.WriteLine` for logging, hardcoded paths, magic numbers without named constants
+        - **Dead code**: Commented-out code blocks, unreachable code paths, unused parameters that suggest incomplete refactoring
+
+    - path: "src/AiDotNet.Tensors/Engines/CpuEngine*.cs"
+      instructions: |
+        ## CRITICAL: GPU Kernel Coverage Requirement (BLOCKING)
+
+        Adding a new tensor operation to the CPU engine REQUIRES that the same op be
+        implemented (or explicitly stubbed-with-clear-error) on **all six GPU backends**:
+
+          1. CUDA          → src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/
+          2. HIP/ROCm      → src/AiDotNet.Tensors/Engines/DirectGpu/HIP/
+          3. Metal/MPS     → src/AiDotNet.Tensors/Engines/DirectGpu/Metal/
+          4. OpenCL        → src/AiDotNet.Tensors/Engines/DirectGpu/OpenCL/
+          5. Vulkan        → src/AiDotNet.Tensors/Engines/DirectGpu/Vulkan/
+          6. WebGPU        → src/AiDotNet.Tensors/Engines/DirectGpu/WebGpu/
+
+        If a CPU-engine method:
+          * is **virtual** (i.e. user code can call it on a GPU engine that inherits from CpuEngine), OR
+          * is dispatched-from inside a tape/graph path that GPU engines participate in,
+
+        then the GPU side MUST either:
+          (a) **Implement** the kernel in each backend (preferred), OR
+          (b) **Override** the method in `DirectGpuTensorEngine` (or the relevant subclass) with a
+              clear `throw new NotSupportedException(...)` that names the backend and points the
+              caller at a documented fallback / workaround, OR
+          (c) **Explicitly document** in the new file's XML/doc-comment block that the op
+              intentionally falls through to CPU for GPU engines, with a tracked follow-up
+              issue link and a rationale (e.g. "small/rare op, GPU dispatch overhead would
+              dominate — see issue #N").
+
+        **Flag any PR that adds a new CPU virtual without one of (a)/(b)/(c) as BLOCKING.**
+        Silent CPU fall-through from a GPU engine is the worst outcome: the model "works"
+        but training quietly runs at 10-100× CPU latency and host↔device ping-pongs.
+
+        ### Review checklist for new CPU kernels
+        - [ ] Identify each GPU backend that already implements the non-fused / non-training
+              version of this op. New CPU kernel must extend ALL of them.
+        - [ ] If the new CPU op is part of a tape/autodiff path (e.g. `LstmSequenceForwardFloatTrain`),
+              the GPU engine MUST either (a) implement the same fused path natively, or (b)
+              override the dispatch entry-point to throw a clear NotSupportedException naming the
+              GPU backend instead of inheriting CpuEngine's path silently.
+        - [ ] Documented follow-up issue for GPU coverage MUST be linked in the PR description
+              when path (c) is taken. Path (c) is only acceptable for ops where GPU is provably
+              the wrong target (e.g. tiny scalar ops below GPU dispatch overhead).
+
+    - path: "src/AiDotNet.Tensors/Engines/DirectGpu/**"
+      instructions: |
+        ## GPU Backend Review Guidelines
+
+        Each of the six GPU backends (CUDA, HIP, Metal, OpenCL, Vulkan, WebGPU) is a peer.
+        Flag the following as BLOCKING:
+
+        - **Kernel parity**: A new kernel/op added to one backend MUST land on all six in the
+          same PR (or have a documented follow-up issue per backend covering the gap).
+        - **Backend-specific shortcuts**: Code that runs on one GPU vendor but silently falls
+          back to host memcpy on others. Either implement the kernel everywhere or throw a
+          clear NotSupportedException naming the backend.
+        - **Tape-aware dispatch**: Any op called under an active gradient tape must either
+          record gradients correctly on the GPU backend OR throw a clear error before the
+          forward returns a detached tensor. Returning a detached tensor under a tape is
+          a SILENT correctness bug — see the LSTM `wantState+tape` rejection in
+          `CpuEngine.LstmSequenceBackward.cs` for the established pattern.
+
+    - path: "tests/**"
+      instructions: |
+        ## Test Review Guidelines
+
+        ### Test Quality (CRITICAL - Flag as BLOCKING)
+        - **Always-passing tests**: Tests with conditional assertions that skip verification when things fail
+        - **Missing assertions**: Test methods that call code but don't assert anything meaningful
+        - **Trivial assertions**: Tests that only check `Assert.NotNull` when they should verify actual behavior/values
+        - **Placeholder tests**: Tests with `// TODO: add assertions` or empty test bodies
+
+        ### TFM Coverage
+        - The test project multi-targets `net10.0` and `net471`. New APIs used in test code that don't exist on net471
+          (e.g. `GC.GetTotalAllocatedBytes`, init-only `record` types added post .NET 5) MUST be guarded behind
+          `#if NET6_0_OR_GREATER` (or appropriate symbol) with a sensible net471 fallback. Flag missing guards as BLOCKING.
+        - Benchmark / kernel timing classes commonly use TFM-conditional alloc counters — see
+          `MlpTrainStepProfileBench.AllocatedBytes()` for the established pattern.
+
+chat:
+  auto_reply: true
+
+knowledge_base:
+  opt_out: false
+  learnings:
+    scope: auto
+  issues:
+    scope: auto
+  pull_requests:
+    scope: auto
