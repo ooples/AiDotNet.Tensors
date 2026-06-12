@@ -63,13 +63,14 @@ public class MatrixMultiplyResidencyTests
         return m;
     }
 
-    [Fact]
+    [SkippableFact]
+    [Trait("Category", "CudaRequired")]
     public void MatrixMultiply_ChainedFloat_KeepsIntermediatesResident()
     {
         // #562 regression: chained C=A·B, E=C·D inside a GpuScope must find C's
         // buffer in the activation cache for the second MatMul. Pre-fix, C was
         // downloaded after the first MatMul and re-uploaded for the second.
-        if (!TryGetGpuEngine(out var engine)) return;
+        Skip.IfNot(TryGetGpuEngine(out var engine), "GPU not available — DirectGpuTensorEngine declined");
         using (engine)
         {
             var a = RandomFloat(64, 64, seed: 1);
@@ -107,13 +108,14 @@ AssertCloseFloat(e.AsSpan().ToArray(), eRef.AsSpan().ToArray(), absTol: 1e-2f, r
         }
     }
 
-    [Fact]
+    [SkippableFact]
+    [Trait("Category", "CudaRequired")]
     public void MatrixMultiply_Float_ResultIsDeferredAndCorrect()
     {
         // #561 regression: a single MatMul under GpuScope used to download
         // synchronously. Now the result is deferred, the array materializes on
         // first read, and the final value still matches CPU.
-        if (!TryGetGpuEngine(out var engine)) return;
+        Skip.IfNot(TryGetGpuEngine(out var engine), "GPU not available — DirectGpuTensorEngine declined");
         using (engine)
         {
             var a = RandomFloat(48, 48, seed: 10);
@@ -136,7 +138,8 @@ AssertCloseFloat(c.AsSpan().ToArray(), cRef.AsSpan().ToArray(), absTol: 5e-3f, r
         }
     }
 
-    [Fact]
+    [SkippableFact]
+    [Trait("Category", "CudaRequired")]
     public void MatrixMultiply_Half_RunsOnGpu_AndIsCorrect()
     {
         // #560 regression: MatrixMultiply<Half> must NOT fall to the scalar
@@ -146,7 +149,7 @@ AssertCloseFloat(c.AsSpan().ToArray(), cRef.AsSpan().ToArray(), absTol: 5e-3f, r
         // scalar code. We use a smaller (256²) matrix so the test stays
         // under 5s even on the slow CPU path; the cliff would still show
         // there if the GPU path were declining.
-        if (!TryGetGpuEngine(out var engine)) return;
+        Skip.IfNot(TryGetGpuEngine(out var engine), "GPU not available — DirectGpuTensorEngine declined");
         using (engine)
         {
             const int N = 256;
@@ -204,7 +207,8 @@ AssertCloseFloat(c.AsSpan().ToArray(), cRef.AsSpan().ToArray(), absTol: 5e-3f, r
     // bounds are generous (we just want "did the fix engage", not exact
     // numbers from a specific GPU SKU).
 
-    [Fact]
+    [SkippableFact]
+    [Trait("Category", "CudaRequired")]
     public void Benchmark_Fp16_VsFp32()
     {
         // #560: pre-fix, FP16 MatMul hit a CPU scalar path because the GPU
@@ -225,7 +229,7 @@ AssertCloseFloat(c.AsSpan().ToArray(), cRef.AsSpan().ToArray(), absTol: 5e-3f, r
         // of FP32). On tensor-core hardware FP16 should be ≤ FP32; on
         // non-tensor-core hardware (GTX 16-series) FP16 is bounded by SGEMM
         // + the small conversion overhead.
-        if (!TryGetGpuEngine(out var engine)) { _output.WriteLine("SKIP: no GPU"); return; }
+        Skip.IfNot(TryGetGpuEngine(out var engine), "GPU not available — DirectGpuTensorEngine declined");
         using (engine)
         {
             const int N = 512;
@@ -265,7 +269,8 @@ AssertCloseFloat(c.AsSpan().ToArray(), cRef.AsSpan().ToArray(), absTol: 5e-3f, r
         }
     }
 
-    [Fact]
+    [SkippableFact]
+    [Trait("Category", "CudaRequired")]
     public void Benchmark_ChainedGemm_InsideVsOutsideGpuScope()
     {
         // #561 / #562: pre-fix, a 20-step chained N=2048 GEMM was SLOWER
@@ -273,7 +278,7 @@ AssertCloseFloat(c.AsSpan().ToArray(), cRef.AsSpan().ToArray(), absTol: 5e-3f, r
         // because the scope's deferred-download path went unused and added
         // overhead. After the fix it should be FASTER inside (no host
         // round-trip per step).
-        if (!TryGetGpuEngine(out var engine)) { _output.WriteLine("SKIP: no GPU"); return; }
+        Skip.IfNot(TryGetGpuEngine(out var engine), "GPU not available — DirectGpuTensorEngine declined");
         using (engine)
         {
             const int N = 1024;   // smaller than 2048 to keep test under ~10s
