@@ -3356,15 +3356,80 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (a.Columns != b.Rows)
             return base.MatrixMultiply(a, b);
 
+        // Issue #415: FP64 (and anything else that can't roundtrip through FP32
+        // without precision loss) bails to CPU rather than silently downcasting.
+        if (Engines.DirectGpu.DirectGpuEngine.ShouldFallbackForPrecision<T>())
+            return base.MatrixMultiply(a, b);
+
+        if (!TryGetBackend(out var backend))
+            return base.MatrixMultiply(a, b);
+
         try
         {
-            var resultData = _directGpu.MatMul(a.AsSpan().ToArray(), b.AsSpan().ToArray(), a.Rows, a.Columns, b.Columns);
-            if (resultData == null)
-                return base.MatrixMultiply(a, b);
+            int M = a.Rows, K = a.Columns, N = b.Columns;
+            int outLen = M * N;
 
-            var result = new Matrix<T>(a.Rows, b.Columns);
-            resultData.AsSpan().CopyTo(result.AsWritableSpan());
-            return result;
+            // Issues #561 / #562: resolve A and B through the activation /
+            // persistent cache instead of re-uploading from host every call.
+            // The previous implementation called
+            //   _directGpu.MatMul(a.AsSpan().ToArray(), b.AsSpan().ToArray(), …)
+            // which allocated fresh GPU buffers AND downloaded the result on
+            // every call, so a chained C=A·B, E=C·D paid a full
+            // device→host→device round-trip for the intermediate C (74 GF/s
+            // measured on N=2048 chained vs 601 GF/s on a single GEMM, RTX 3080).
+            // Routing through GetOrAllocateBuffer + FinishGpuOp lets the second
+            // MatMul find C's buffer in the activation cache and lets GpuScope
+            // defer the host download until the chain's final value is read.
+            //
+            // Use GetBackingArrayUnsafe (not GetDataArray) so a deferred input
+            // does NOT trigger its own download here — its GPU buffer is still
+            // resident under the same array key, and GetOrAllocateBuffer will
+            // find it via the activation-cache hit. If neither cache has the
+            // buffer, GetOrAllocateBuffer falls through to MaterializeIfDeferred
+            // + a fresh upload, which is the correct behavior for the
+            // GPU-input + host-resident-A pattern.
+            var aBacking = a.GetBackingArrayUnsafe() ?? a.GetDataArray();
+            var bBacking = b.GetBackingArrayUnsafe() ?? b.GetDataArray();
+            using var bufA = GetOrAllocateBuffer(backend, aBacking);
+            using var bufB = GetOrAllocateBuffer(backend, bBacking);
+
+            var bufOut = AllocateOutputBuffer(backend, outLen);
+
+            if (typeof(T) == typeof(Half)
+                && backend is Engines.Gpu.IGpuHalfPrecisionBackend halfBackend
+                && halfBackend.SupportsHgemm)
+            {
+                // Issue #560: FP16 tensor-core fast path. cublasGemmEx with
+                // FP16 inputs and an FP32 accumulator is the standard
+                // mixed-precision matmul (matches the AMP forward pass): the
+                // multiply runs on tensor cores, the FP32 accumulator preserves
+                // long-chain precision, and the FP32 output flows back into
+                // the activation cache so downstream FP32 ops can consume it
+                // directly. The two FP32→FP16 conversions are O(MK+KN) —
+                // negligible against the O(MKN) GEMM. The previous code path
+                // never reached this branch (Half went through
+                // a.AsSpan().ToArray() into DirectGpuEngine.MatMul, but the
+                // chained-IEngine entry never resolved inputs from cache, so
+                // a residency-aware Half user still paid the upload tax).
+                using var aFp16 = AllocateOutputBuffer(backend, M * K);
+                using var bFp16 = AllocateOutputBuffer(backend, K * N);
+                backend.ConvertToFp16(bufA.Buffer, aFp16.Buffer, M * K);
+                backend.ConvertToFp16(bufB.Buffer, bFp16.Buffer, K * N);
+                halfBackend.GemmFp16In32fOut(aFp16.Buffer, bFp16.Buffer, bufOut.Buffer, M, N, K);
+            }
+            else
+            {
+                backend.Gemm(bufA.Buffer, bufB.Buffer, bufOut.Buffer, M, N, K);
+            }
+
+            // Defer the download: the result T[] is registered with
+            // DeferredArrayMaterializer so a chained next-MatMul that consumes
+            // this Matrix finds the buffer in the activation cache (no
+            // download, no re-upload), and host reads materialize lazily on
+            // first access. Matrix<T>.FromMemory wraps the deferred array
+            // zero-copy.
+            var resultData = FinishGpuOp<T>(backend, bufOut, outLen);
+            return Matrix<T>.FromMemory(resultData, M, N);
         }
         catch
         {
