@@ -19503,33 +19503,120 @@ public partial class CpuEngine : ITensorLevelEngine
                 var ci = input; var cg = gamma; var cb = beta; double ce = epsilon;
                 var savedScope = GraphMode.Current;
                 GraphMode.SetCurrent(null);
-                var eagerResult = LayerNorm(ci, cg, cb, ce, out mean, out variance);
-                GraphMode.SetCurrent(savedScope);
-                // AiDotNet#1331: mean/variance returned by the compile-time
-                // eager call are stale once the lazy graph replays — the
-                // forward replay re-runs LayerNorm on the freshly-computed
-                // input, but the savedState mean/variance tensors are NOT
-                // re-updated, so the backward kernel reads compile-time
-                // values (zero, since the lazy input was uninitialized at
-                // compile time). The result: gradGamma and dL/dInput silently
-                // become zero, gamma never trains, and every parameter
-                // upstream of any LayerNorm stops learning. Fix: the lazy
-                // execute callback recomputes mean/variance via the
-                // out-param overload and copies them into the SAME tensor
-                // instances the savedState slot holds, so the backward
-                // reads fresh values on every plan.Step().
-                var capturedMean = mean;
-                var capturedVar = variance;
+                Tensor<T> eagerResult;
+                try
+                {
+                    eagerResult = LayerNorm(ci, cg, cb, ce, out mean, out variance);
+                }
+                finally
+                {
+                    // AiDotNet#1352: mirror BatchNorm's try/finally guard so a
+                    // throw from the eager recursive call (e.g., gamma/input
+                    // rank mismatch) cannot leave GraphMode disabled. Without
+                    // this, subsequent graph-mode ops on the same thread
+                    // would silently degrade to eager and surface as
+                    // "Destination is too short" or wrong-shape errors at
+                    // scope dispose.
+                    GraphMode.SetCurrent(savedScope);
+                }
+                // Mirror BatchNorm's PR #352 fix: bind THIS engine to the
+                // scope so the compiled plan replays on the engine the user
+                // called the op on (issue #350). LayerNorm previously
+                // omitted this — on auto-detect-GPU hosts the scope captures
+                // the ambient GPU engine even when the user explicitly
+                // created a new CpuEngine, leading to LayerNorm replay
+                // routing to the wrong engine.
+                scope.BindEngineIfUnset(this);
+                // AiDotNet#1331 + #1353: the lazy execute callback needs to
+                // refresh mean/variance on every plan.Step so the backward
+                // pass reads stats from the freshly-computed input. The
+                // historical implementation aliased the SAME mean/variance
+                // tensor instances both as the LayerNorm out-params handed
+                // back to the caller AND as the savedState slot the lazy
+                // callback writes into on every replay. That alias was
+                // unsafe for two reasons:
+                //   (a) AiDotNet#1352 — a failed trace whose dispose path
+                //       re-runs the callback unconditionally mutated the
+                //       caller-visible mean/variance, corrupting any code
+                //       that captured the out-params (`LayerNormalizationLayer
+                //       <T>._lastMean/._lastVariance` in training mode, or
+                //       any consumer of the BackwardFunctions savedState
+                //       slot in inference mode);
+                //   (b) AiDotNet#1353 — a partial trace failure (forward
+                //       throws after this LayerNorm records but before the
+                //       scope reaches CompileInference) would write fresh
+                //       values into the caller-visible mean/variance during
+                //       Dispose-driven Realize cleanup, with the writeback
+                //       happening AFTER the consumer's try/catch had
+                //       already swallowed the forward exception. The model
+                //       state was then permanently shifted in a way the
+                //       consumer could not detect.
+                // Fix: allocate SEPARATE savedState tensors for the lazy
+                // callback to refresh, and copy the trace-time eager
+                // mean/variance values into them once. The lazy callback
+                // refreshes those private tensors instead of the caller's
+                // out-params on every replay. The caller's `mean`/`variance`
+                // out-params stay write-frozen at their trace-time values,
+                // so any failure path (dispose-cascade Realize, callback
+                // exception, partial copy) cannot corrupt them.
+                var savedMean = TensorAllocator.Rent<T>(mean._shape,
+                    new T[mean.Length]);
+                var savedVar = TensorAllocator.Rent<T>(variance._shape,
+                    new T[variance.Length]);
+                mean.AsSpan().CopyTo(savedMean.AsWritableSpan());
+                variance.AsSpan().CopyTo(savedVar.AsWritableSpan());
+
                 var lazyResult = scope.RecordVariadic(LazyNodeType.Custom, "LayerNorm",
                     new[] { input, gamma, beta }, eagerResult._shape,
                     (eng, output) =>
                     {
                         var r = eng.LayerNorm(ci, cg, cb, ce, out var freshMean, out var freshVar);
-                        r.AsSpan().CopyTo(output.AsWritableSpan());
-                        freshMean.AsSpan().CopyTo(capturedMean.AsWritableSpan());
-                        freshVar.AsSpan().CopyTo(capturedVar.AsWritableSpan());
+                        try
+                        {
+                            // AiDotNet#1352: validate element-count (Length)
+                            // before any write so a stale-shape replay throws
+                            // a clear error instead of surfacing as
+                            // "Destination is too short" from inside
+                            // Span.CopyTo. We compare Length rather than
+                            // _shape because legitimate flows pair a trace-
+                            // time view of one rank with a replay-time view
+                            // of a different rank but identical element count
+                            // (e.g., FusedLinear → reshape → reshape →
+                            // LayerNorm pattern where the reshape views
+                            // resolve to a flat buffer at replay).
+                            if (r.Length != output.Length
+                                || freshMean.Length != savedMean.Length
+                                || freshVar.Length != savedVar.Length)
+                            {
+                                throw new InvalidOperationException(
+                                    "LayerNorm lazy replay element-count mismatch: " +
+                                    "input element count changed between trace and " +
+                                    "replay. Trace output Length=" + output.Length +
+                                    ", savedMean Length=" + savedMean.Length +
+                                    "; replay output Length=" + r.Length +
+                                    ", freshMean Length=" + freshMean.Length + ". " +
+                                    "This usually means the input tensor was reshaped " +
+                                    "in place after the trace captured its reference, " +
+                                    "or the model emitted a different rank under JIT " +
+                                    "than under eager forward.");
+                            }
+                            r.AsSpan().CopyTo(output.AsWritableSpan());
+                            freshMean.AsSpan().CopyTo(savedMean.AsWritableSpan());
+                            freshVar.AsSpan().CopyTo(savedVar.AsWritableSpan());
+                        }
+                        finally
+                        {
+                            // Mirror BatchNorm's PR #359 cleanup: return the
+                            // per-call rented eager result + mean + variance
+                            // to the pool so the LayerNorm GraphMode path
+                            // does not leak three tensors per replay.
+                            Helpers.TensorAllocator.Return(r);
+                            Helpers.TensorAllocator.Return(freshMean);
+                            Helpers.TensorAllocator.Return(freshVar);
+                        }
                     },
-                    BackwardFunctions<T>.LayerNormBackward, new object[] { mean, variance, epsilon });
+                    BackwardFunctions<T>.LayerNormBackward,
+                    new object[] { savedMean, savedVar, epsilon });
                 eagerResult.AsSpan().CopyTo(lazyResult.AsWritableSpan());
                 return lazyResult;
             }

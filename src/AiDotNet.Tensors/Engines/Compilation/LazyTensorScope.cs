@@ -372,16 +372,29 @@ internal sealed class LazyTensorScope : IDisposable
         if (_disposed) return;
         _disposed = true;
 
-        try
-        {
-            // Auto-realize on dispose if not yet done (safety net)
-            if (!_realized)
-                Realize();
-        }
-        finally
-        {
-            // Always restore parent scope, even if Realize() throws
-            GraphMode.SetCurrent(_parent);
-        }
+        // AiDotNet#1353: the auto-realize-on-dispose safety net used to re-run
+        // every recorded lazy node when the scope was disposed without an
+        // explicit CompileInference / CompileTraining / Realize call. That
+        // path was destructive — for ops whose lazy callback writes back into
+        // trace-time captured tensors (LayerNorm copies fresh mean/variance
+        // into a savedState slot so the backward kernel sees fresh stats
+        // every plan.Step; BatchNorm does the same), a partial trace that
+        // threw mid-forward would silently re-execute the callback against
+        // a possibly-stale input during dispose-driven cleanup. The mutation
+        // was invisible to a try/catch around the consumer-side
+        // `GetOrCompileInference` call.
+        //
+        // All public consumers of GraphMode.Enable() either reach an explicit
+        // CompileInference / CompileTraining call (which sets _realized via
+        // MarkCompiled) or use `scope.Realize()` directly when they want
+        // eager-equivalent semantics. The auto-realize-on-dispose path was
+        // dead code for the success cases (CompileInference's MarkCompiled
+        // already set _realized=true, so Realize would early-return) and
+        // destructive on the failure path. Remove it. Tensors whose ops
+        // were recorded but never explicitly realized still auto-materialize
+        // on first AsSpan / AsWritableSpan access (LazySource fanout), so
+        // any caller that genuinely needed eager semantics from a forward
+        // lambda still sees the data populated when they touch it.
+        GraphMode.SetCurrent(_parent);
     }
 }
