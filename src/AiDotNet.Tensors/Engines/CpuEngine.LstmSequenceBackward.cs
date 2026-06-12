@@ -25,6 +25,23 @@ public partial class CpuEngine
     // Gate layout matches the inference path and PyTorch nn.LSTM: rows of the [4H, *]
     // weights are ordered i (input), f (forget), g (cell candidate), o (output).
     //   c_t = f·c_{t-1} + i·g     h_t = o·tanh(c_t)
+    //
+    // ┌─ GPU BACKEND COVERAGE (per .coderabbit.yaml kernel-coverage rule) ──────
+    // │ This fused training path is currently CPU-ONLY. The six GPU backends
+    // │ (CUDA, HIP, Metal, OpenCL, Vulkan, WebGPU) all inherit CpuEngine's
+    // │ LstmSequenceForward dispatch — under an active gradient tape they
+    // │ FALL THROUGH to LstmSequenceForwardFloatTrain on the CPU.
+    // │
+    // │ For inference, four of the six backends ship native LSTM kernels
+    // │ (CudaLstmKernels, HipLstmKernels, MpsLstm, OpenCL LstmKernels);
+    // │ Vulkan / WebGPU LSTM inference is also CPU-routed today.
+    // │
+    // │ Tracked follow-up: ooples/AiDotNet.Tensors#587 — native fused-training
+    // │ kernels on each GPU backend so a GPU model under tape doesn't pay the
+    // │ host↔device round-trip for every step. Until those land, GPU users
+    // │ training small LSTMs see correct gradients but on the CPU clock; the
+    // │ DirectGpu compiled-plan path bypasses this dispatch entirely.
+    // └─────────────────────────────────────────────────────────────────────────
     // ──────────────────────────────────────────────────────────────────────────
 
     /// <summary>
