@@ -45,6 +45,25 @@ public partial class CpuEngine
     // ──────────────────────────────────────────────────────────────────────────
 
     /// <summary>
+    /// Routes a LARGE float GEMM to the parallel BlasManaged dispatcher. Same argument
+    /// order as <see cref="SimdGemm.Sgemm"/> (result is [m, n], k is the contraction).
+    /// The fused LSTM kernel originally ran every GEMM single-threaded (Sgemm /
+    /// SgemmSequential), which left the big forward Wx and backward dInput/dWih/dWhh GEMMs
+    /// serial and capped the fused-training speedup. These have large m (totalRows or 4·H),
+    /// so the M-axis-parallel dispatcher wins; the per-timestep recurrent GEMMs stay on
+    /// SgemmSequential (tiny m, and inherently serial across the BPTT recurrence — parallel
+    /// dispatch overhead per step would not pay off). DisableAutotune = the static-heuristic
+    /// kernel (same determinism contract as the eager-matmul fast path).
+    /// </summary>
+    private static void GemmBig(System.ReadOnlySpan<float> a, int lda, bool transA,
+                                System.ReadOnlySpan<float> b, int ldb, bool transB,
+                                System.Span<float> c, int m, int k, int n)
+    {
+        BlasManaged.BlasManaged.Gemm<float>(a, lda, transA, b, ldb, transB, c, n, m, n, k,
+            new BlasManaged.BlasOptions<float> { PackingMode = BlasManaged.PackingMode.DisableAutotune });
+    }
+
+    /// <summary>
     /// Float training forward: exact activations, saves per-timestep state, and records
     /// a single fused BPTT node on the active tape. Called from LstmSequenceForward when
     /// a gradient tape is active and T == float.
@@ -104,8 +123,8 @@ public partial class CpuEngine
 
         // Wx[b,t,:] = wIh @ x[b,t] (+ bIh), one big GEMM into [totalRows, G].
         var wx = new float[totalRows * G];
-        SimdGemm.Sgemm(inSpan, inFeatures, false, wIhSpan, inFeatures, true,
-                       wx.AsSpan(0, totalRows * G), totalRows, inFeatures, G);
+        GemmBig(inSpan, inFeatures, false, wIhSpan, inFeatures, true,
+                wx.AsSpan(0, totalRows * G), totalRows, inFeatures, G);
         if (bIhArr is not null)
         {
             for (int r = 0; r < totalRows; r++)
@@ -365,15 +384,16 @@ public partial class CpuEngine
 
         // gradInput = dgatesAll @ wIh  → [totalRows, inFeatures]
         var gradInput = new Tensor<float>(new[] { batch, seqLen, inFeatures });
-        SimdGemm.SgemmSequential(dgatesAll.AsSpan(0, totalRows * G), wIh.AsSpan().Slice(0, G * inFeatures),
-                                 gradInput.AsWritableSpan(), totalRows, G, inFeatures);
+        GemmBig(dgatesAll.AsSpan(0, totalRows * G), G, false,
+                wIh.AsSpan().Slice(0, G * inFeatures), inFeatures, false,
+                gradInput.AsWritableSpan(), totalRows, G, inFeatures);
         DifferentiableOps.AccumulateGrad(grads, input, gradInput, engine);
 
         // gradWIh = dgatesAll^T @ input2d  → [G, inFeatures]
         var gradWIh = new Tensor<float>(new[] { G, inFeatures });
-        SimdGemm.Sgemm(dgatesAll.AsSpan(0, totalRows * G), G, true,
-                       input.AsSpan(), inFeatures, false,
-                       gradWIh.AsWritableSpan(), G, totalRows, inFeatures);
+        GemmBig(dgatesAll.AsSpan(0, totalRows * G), G, true,
+                input.AsSpan(), inFeatures, false,
+                gradWIh.AsWritableSpan(), G, totalRows, inFeatures);
         DifferentiableOps.AccumulateGrad(grads, wIh, gradWIh, engine);
 
         // gradWHh = dgatesAll^T @ hPrevAll  → [G, hidden]; hPrevAll[b,t] = h_{t-1}.
@@ -383,9 +403,9 @@ public partial class CpuEngine
                 Array.Copy(hiddens, (b * (seqLen + 1) + t) * hidden,
                            hPrevAll, (b * seqLen + t) * hidden, hidden);
         var gradWHh = new Tensor<float>(new[] { G, hidden });
-        SimdGemm.Sgemm(dgatesAll.AsSpan(0, totalRows * G), G, true,
-                       hPrevAll.AsSpan(0, totalRows * hidden), hidden, false,
-                       gradWHh.AsWritableSpan(), G, totalRows, hidden);
+        GemmBig(dgatesAll.AsSpan(0, totalRows * G), G, true,
+                hPrevAll.AsSpan(0, totalRows * hidden), hidden, false,
+                gradWHh.AsWritableSpan(), G, totalRows, hidden);
         DifferentiableOps.AccumulateGrad(grads, wHh, gradWHh, engine);
 
         // gradBIh = gradBHh = column-sum of dgatesAll over (b,t) → [G].
