@@ -90,7 +90,9 @@ public class StreamingWorkerPoolTests
             StreamingWorkerPool.Dispatch(8, c => { /* no-op */ });
 
         // Measure: 1000 minimal dispatches. Median wall-time per dispatch
-        // should be ≤25 µs on a multi-core box (spin-then-park hot path).
+        // is sub-µs on dedicated workstations but GitHub Actions runners
+        // routinely see 30-80 µs from shared-hypervisor jitter alone — see
+        // PR #587 build run (44.8 µs median on a clean main, no code change).
         var times = new double[1000];
         var sw = new System.Diagnostics.Stopwatch();
         for (int i = 0; i < 1000; i++)
@@ -103,8 +105,17 @@ public class StreamingWorkerPoolTests
         Array.Sort(times);
         double medianUs = times[500];
 
-        // Gate: 25 µs is generous. The aspirational sub-µs is hardware-dependent.
-        // This catches order-of-magnitude regressions (e.g., accidental TPL fallback).
-        Assert.True(medianUs < 25.0, $"Median dispatch latency {medianUs:F1} µs exceeds 25 µs sentinel.");
+        // ORDER-OF-MAGNITUDE gate, not a precise perf assertion. A TPL.Parallel
+        // fallback would be in the millisecond range (>= 1000 µs); a healthy
+        // spin-then-park hot path stays well under 100 µs even on noisy CI
+        // runners. The previous 25 µs threshold matched dedicated hardware but
+        // flaked on GitHub Actions; widening to 250 µs preserves the
+        // regression-catch (anything > 100× the workstation baseline is still
+        // a real bug to investigate) without false-positiving on shared-host
+        // jitter. The aspirational sub-µs target stays in this docstring;
+        // this gate is the floor, not the target.
+        Assert.True(medianUs < 250.0,
+            $"Median dispatch latency {medianUs:F1} µs exceeds 250 µs CI-tolerant sentinel " +
+            "(TPL fallback would be >1000 µs).");
     }
 }

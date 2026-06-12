@@ -1,6 +1,6 @@
 # yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
 language: en-US
-tone_instructions: "Be thorough and aggressive about code quality. Flag ALL stubs, placeholders, TODO comments, simplified implementations, and non-production-ready code as BLOCKING issues. Flag CPU-only kernels that are missing GPU backend coverage as BLOCKING — the AiDotNet.Tensors contract is that every kernel ships across all six GPU backends or has an explicit, documented fallback policy."
+tone_instructions: "Be thorough and aggressive about code quality. Flag stubs, TODOs, non-production code, and CPU-only kernels missing GPU coverage as BLOCKING. See path_instructions for the six-backend kernel-coverage rule."
 early_access: true
 enable_free_tier: true
 
