@@ -794,6 +794,32 @@ public partial class CpuEngine
     private static T PNormCross<T>(Interfaces.INumericOperations<T> ops,
         System.ReadOnlySpan<T> a, int offA, System.ReadOnlySpan<T> b, int offB, int d, double p)
     {
+        // Float-typed input → accumulate in float to match parity210_cdist on
+        // the GPU (the library uses float across the board for performance;
+        // upgrading the CPU to double accumulation would diverge from the GPU
+        // by exactly the fp32 rounding noise of d squared-diff terms — ~1% at
+        // d=129 — and force every consumer-GPU CDist call to either pay 32-64×
+        // FP64 throughput penalty or accept the mismatch).
+        if (typeof(T) == typeof(float))
+        {
+            var fa = System.Runtime.InteropServices.MemoryMarshal.Cast<T, float>(a);
+            var fb = System.Runtime.InteropServices.MemoryMarshal.Cast<T, float>(b);
+            float pf = (float)p;
+            float sumF = 0f;
+            for (int k = 0; k < d; k++)
+            {
+                float diff = System.Math.Abs(fa[offA + k] - fb[offB + k]);
+                if (pf == 1f) sumF += diff;
+                else if (pf == 2f) sumF += diff * diff;
+                else sumF += (float)System.Math.Pow(diff, p);
+            }
+            float resF = pf == 1f ? sumF : pf == 2f ? (float)System.Math.Sqrt(sumF) : (float)System.Math.Pow(sumF, 1.0 / p);
+            return (T)(object)resF;
+        }
+
+        // Non-float T (e.g. double) keeps the double-precision path — the
+        // library only commits to GPU/CPU bit-equivalence for the float fast
+        // path, and a double-typed caller is opting in to higher precision.
         double acc = 0;
         for (int k = 0; k < d; k++)
         {

@@ -1116,16 +1116,9 @@ extern ""C"" __global__ void parity210_index_write(float* __restrict__ output, c
     output[(outer*dstAxis+dstJ)*innerSize+inner]=v;
 }
 extern ""C"" __global__ void parity210_cdist(const float* __restrict__ x1, const float* __restrict__ x2, float* __restrict__ output, int m, int n, int d, float p) {
-    int idx = blockIdx.x*blockDim.x+threadIdx.x; if (idx>=m*n) return; int j=idx%n; int i=idx/n;
-    // Accumulate the per-element norm contributions in DOUBLE precision to match
-    // CpuEngine.Parity210.PNormCross (which uses `double acc` + Math.Pow). fp32
-    // accumulation of d≈129 squared-diff terms drifted ~1% off the CPU reference
-    // at random-input scale; double keeps GPU/CPU bit-equivalent within
-    // sqrt's fp32 rounding.
-    double sum = 0.0;
-    for (int k=0;k<d;k++){ double diff=(double)fabsf(x1[i*d+k]-x2[j*d+k]); if (p==1.0f) sum+=diff; else if (p==2.0f) sum+=diff*diff; else sum+=pow(diff,(double)p); }
-    double r = (p==1.0f) ? sum : (p==2.0f) ? sqrt(sum) : pow(sum, 1.0/(double)p);
-    output[idx] = (float)r;
+    int idx = blockIdx.x*blockDim.x+threadIdx.x; if (idx>=m*n) return; int j=idx%n; int i=idx/n; float sum=0.0f;
+    for (int k=0;k<d;k++){ float diff=fabsf(x1[i*d+k]-x2[j*d+k]); if (p==1.0f) sum+=diff; else if (p==2.0f) sum+=diff*diff; else sum+=powf(diff,p); }
+    output[idx]=(p==1.0f)?sum:(p==2.0f)?sqrtf(sum):powf(sum,1.0f/p);
 }
 extern ""C"" __global__ void parity210_pdist(const float* __restrict__ input, float* __restrict__ output, int n, int d, float p) {
     int flat = blockIdx.x*blockDim.x+threadIdx.x; if (flat>=n*n) return; int j=flat%n; int i=flat/n; if (i>=j) return; float sum=0.0f;
