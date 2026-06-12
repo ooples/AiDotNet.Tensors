@@ -48,6 +48,13 @@ public class LstmFusedBackwardPerfBench
         }
 
         for (int i = 0; i < 50; i++) Step(); // warm
+
+        long a0 = GC.GetAllocatedBytesForCurrentThread();
+        const int allocIters = 100;
+        for (int i = 0; i < allocIters; i++) Step();
+        double kbPerStep = (GC.GetAllocatedBytesForCurrentThread() - a0) / 1024.0 / allocIters;
+        _o.WriteLine($"alloc/step = {kbPerStep:F1} KB");
+
         const int iters = 500;
         double best = double.MaxValue, sum = 0;
         var sw = new Stopwatch();

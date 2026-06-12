@@ -318,14 +318,22 @@ public partial class CpuEngine
         var wHhSpan = wHh.AsSpan();          // [G, hidden]
         var gradOutSpan = gradOutput.AsSpan();
 
+        // Pool the backward scratch (it otherwise allocates several MB/step — dgatesAll and
+        // hPrevAll dominate — churning Gen0 GC during training). Returned at method end.
+        // ArrayPool.Rent does NOT zero, so the read-accumulate carries (dhNext/dcNext, which
+        // the t=seqLen-1 iteration reads before writing) must be cleared; dgatesAll/dgatesT/
+        // dhPrev are fully written before any read, so they need no clear.
+        var pool = System.Buffers.ArrayPool<float>.Shared;
         // dgatesAll [b,t] pre-activation gate grads, row (b*seqLen+t)*G.
-        var dgatesAll = new float[totalRows * G];
+        var dgatesAll = pool.Rent(totalRows * G);
         // Recurrent carries, indexed [b, hidden].
-        var dhNext = new float[batch * hidden];
-        var dcNext = new float[batch * hidden];
+        var dhNext = pool.Rent(batch * hidden);
+        var dcNext = pool.Rent(batch * hidden);
+        System.Array.Clear(dhNext, 0, batch * hidden);
+        System.Array.Clear(dcNext, 0, batch * hidden);
         // Per-timestep scratch for the recurrent dh_prev = dgates_t @ wHh GEMM.
-        var dgatesT = new float[batch * G];
-        var dhPrev = new float[batch * hidden];
+        var dgatesT = pool.Rent(batch * G);
+        var dhPrev = pool.Rent(batch * hidden);
 
         for (int t = seqLen - 1; t >= 0; t--)
         {
@@ -397,7 +405,7 @@ public partial class CpuEngine
         DifferentiableOps.AccumulateGrad(grads, wIh, gradWIh, engine);
 
         // gradWHh = dgatesAll^T @ hPrevAll  → [G, hidden]; hPrevAll[b,t] = h_{t-1}.
-        var hPrevAll = new float[totalRows * hidden];
+        var hPrevAll = pool.Rent(totalRows * hidden);
         for (int b = 0; b < batch; b++)
             for (int t = 0; t < seqLen; t++)
                 Array.Copy(hiddens, (b * (seqLen + 1) + t) * hidden,
@@ -444,5 +452,14 @@ public partial class CpuEngine
             dcNext.AsSpan(0, batch * hidden).CopyTo(gc0.AsWritableSpan());
             DifferentiableOps.AccumulateGrad(grads, inp[idxC0], gc0, engine);
         }
+
+        // Return the pooled backward scratch (all consumers above are done). On an exception
+        // mid-backward these leak, which is benign for ArrayPool (the pool just allocates anew).
+        pool.Return(dgatesAll);
+        pool.Return(dhNext);
+        pool.Return(dcNext);
+        pool.Return(dgatesT);
+        pool.Return(dhPrev);
+        pool.Return(hPrevAll);
     }
 }
