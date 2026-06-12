@@ -167,6 +167,20 @@ public sealed class GradientTape<T> : IDisposable
         {
             _snapshotEngine = snapEngine;
             _activationSnapshot = snapEngine.ActivationCacheTimestampSnapshot();
+
+            // Atomic-step semantics for EAGER training (PR #586 follow-up). The
+            // compiled-plan StepEager already brackets its forward+backward with
+            // SuspendActivationEviction so the byte-cap eviction path can't run
+            // mid-step and free buffers a still-queued kernel will reference
+            // (#226-class CUDA error 700). Eager training under a tape needs the
+            // same atomicity: the OUTERMOST tape on a GPU engine matches the
+            // compiled plan's "one step" granularity — every activation it caches
+            // is consumed by its own backward, and freeing them mid-step is the
+            // race the PR body documents (4 GB cap exposes it; 6 GB workaround
+            // hides it). The deterministic per-step eviction
+            // (EvictActivationsCreatedAfter, above-Dispose) takes over the
+            // memory-bounding role that mid-step eviction was trying to play.
+            snapEngine.SuspendActivationEviction();
         }
 
         if (_options.EnableHooks)
@@ -2021,6 +2035,13 @@ public sealed class GradientTape<T> : IDisposable
         if (_parent is null && _snapshotEngine is not null
             && ReferenceEquals(_snapshotEngine, _engine))
         {
+            // Pair the SuspendActivationEviction taken in the ctor BEFORE the
+            // deterministic eviction below. ResumeActivationEviction first so
+            // EvictActivationsCreatedAfter (which respects the suspend flag)
+            // actually runs — otherwise the step's activations would linger
+            // until the next non-suspended insert and the steady-state memory
+            // bound (~one step) would not hold for back-to-back tape scopes.
+            _snapshotEngine.ResumeActivationEviction();
             _snapshotEngine.EvictActivationsCreatedAfter(_activationSnapshot);
         }
 
