@@ -10349,7 +10349,21 @@ public partial class CpuEngine : ITensorLevelEngine
                 var idxBuf = new int[tensor.Length];
                 tensor.FillStorageIndices(idxBuf);
                 for (int i = 0; i < tensor.Length; i++)
-                    { T v = srcRaw[idxBuf[i]]; T z = ops.Multiply(ops.FromDouble(0.7978845608), ops.Add(v, ops.Multiply(ops.FromDouble(0.044715), ops.Multiply(v, ops.Multiply(v, v))))); T e2z = ops.Exp(ops.Multiply(ops.FromDouble(2.0), z)); T th = ops.Divide(ops.Subtract(e2z, ops.One), ops.Add(e2z, ops.One)); T cdf = ops.Divide(ops.Add(ops.One, th), ops.FromDouble(2.0)); dstArr[i] = ops.Multiply(v, cdf); }
+                {
+                    T v = srcRaw[idxBuf[i]];
+                    T z = ops.Multiply(ops.FromDouble(0.7978845608), ops.Add(v, ops.Multiply(ops.FromDouble(0.044715), ops.Multiply(v, ops.Multiply(v, v)))));
+                    // Clamp the tanh argument to ±20 (tanh(±20) == ±1 to T's
+                    // precision) so exp(2z) can't overflow to Inf and make
+                    // (e^{2z}−1)/(e^{2z}+1) = Inf/Inf = NaN — same guard as the
+                    // SIMD GELU kernels (SimdKernels.GELUUnsafe).
+                    double zd = ops.ToDouble(z);
+                    if (zd > 20.0) z = ops.FromDouble(20.0);
+                    else if (zd < -20.0) z = ops.FromDouble(-20.0);
+                    T e2z = ops.Exp(ops.Multiply(ops.FromDouble(2.0), z));
+                    T th = ops.Divide(ops.Subtract(e2z, ops.One), ops.Add(e2z, ops.One));
+                    T cdf = ops.Divide(ops.Add(ops.One, th), ops.FromDouble(2.0));
+                    dstArr[i] = ops.Multiply(v, cdf);
+                }
                 DifferentiableOps.RecordUnary("GELU", resultS, tensor, BackwardFunctions<T>.GELUBackward);
                 { var c = tensor; AutoTracer.RecordOp("GELU", resultS, eng => eng.GELU(c)); }
                 return resultS;

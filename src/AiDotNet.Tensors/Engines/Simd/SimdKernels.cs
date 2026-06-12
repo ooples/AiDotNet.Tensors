@@ -2983,17 +2983,24 @@ namespace AiDotNet.Tensors.Engines.Simd
             int i = 0;
 
 #if NET5_0_OR_GREATER
-            // tanh(x) = (exp(2x) - 1) / (exp(2x) + 1)
+            // tanh(x) = (exp(2x) - 1) / (exp(2x) + 1). Clamp x to ±20 first:
+            // tanh(±20) rounds to exactly ±1.0 in double, and an unclamped
+            // x ≥ ~355 drives FastExpDouble256's 2^n reconstruction into the
+            // biased-exponent-2047 (Inf) pattern, making the division
+            // Inf/Inf = NaN — see GELUUnsafe(double*) for the training
+            // failure this caused.
             if (Avx2.IsSupported && Fma.IsSupported && length >= 16)
             {
                 var two = Vector256.Create(2.0);
                 var one = Vector256.Create(1.0);
+                var clampHi = Vector256.Create(20.0);
+                var clampLo = Vector256.Create(-20.0);
                 int simdLength = length & ~15;
                 for (; i < simdLength; i += 16)
                 {
                     for (int k = 0; k < 16; k += 4)
                     {
-                        var x = ReadVector256Double(input, i + k);
+                        var x = Avx.Min(Avx.Max(ReadVector256Double(input, i + k), clampLo), clampHi);
                         var e2x = FastExpDouble256(Avx.Multiply(two, x));
                         WriteVector256Double(output, i + k,
                             Avx.Divide(Avx.Subtract(e2x, one), Avx.Add(e2x, one)));
@@ -3005,10 +3012,12 @@ namespace AiDotNet.Tensors.Engines.Simd
             {
                 var two = Vector256.Create(2.0);
                 var one = Vector256.Create(1.0);
+                var clampHi = Vector256.Create(20.0);
+                var clampLo = Vector256.Create(-20.0);
                 int simdLength = i + ((length - i) & ~3);
                 for (; i < simdLength; i += 4)
                 {
-                    var x = ReadVector256Double(input, i);
+                    var x = Avx.Min(Avx.Max(ReadVector256Double(input, i), clampLo), clampHi);
                     var e2x = FastExpDouble256(Avx.Multiply(two, x));
                     WriteVector256Double(output, i,
                         Avx.Divide(Avx.Subtract(e2x, one), Avx.Add(e2x, one)));
@@ -5743,19 +5752,25 @@ namespace AiDotNet.Tensors.Engines.Simd
         {
             int i = 0;
 #if NET5_0_OR_GREATER
+            // Clamp inputs to ±20 before the exp decomposition: tanh(±20)
+            // rounds to exactly ±1.0 in double, while an unclamped |x| ≥ ~355
+            // drives FastExpDouble256's 2^n reconstruction into the
+            // biased-exponent-2047 (Inf) pattern and (e−1)/(e+1) = Inf/Inf =
+            // NaN. See GELUUnsafe(double*) for the training failure this caused.
             if (Avx2.IsSupported && Fma.IsSupported && length >= 16)
             {
                 var one = Vector256.Create(1.0);
                 var two = Vector256.Create(2.0);
-                var negOne = Vector256.Create(-1.0);
+                var clampHi = Vector256.Create(20.0);
+                var clampLo = Vector256.Create(-20.0);
                 int simdLen = length & ~15;
                 for (; i < simdLen; i += 16)
                 {
-                    var x0 = Avx.LoadVector256(input + i);
-                    var x1 = Avx.LoadVector256(input + i + 4);
-                    var x2 = Avx.LoadVector256(input + i + 8);
-                    var x3 = Avx.LoadVector256(input + i + 12);
-                    // sigmoid(-2x) = 1/(1+exp(2x)), tanh = 1 - 2*sigmoid(-2x)
+                    var x0 = Avx.Min(Avx.Max(Avx.LoadVector256(input + i), clampLo), clampHi);
+                    var x1 = Avx.Min(Avx.Max(Avx.LoadVector256(input + i + 4), clampLo), clampHi);
+                    var x2 = Avx.Min(Avx.Max(Avx.LoadVector256(input + i + 8), clampLo), clampHi);
+                    var x3 = Avx.Min(Avx.Max(Avx.LoadVector256(input + i + 12), clampLo), clampHi);
+                    // tanh = (exp(2x)-1)/(exp(2x)+1)
                     var e0 = FastExpDouble256(Avx.Multiply(two, x0));
                     var e1 = FastExpDouble256(Avx.Multiply(two, x1));
                     var e2 = FastExpDouble256(Avx.Multiply(two, x2));
@@ -5770,10 +5785,12 @@ namespace AiDotNet.Tensors.Engines.Simd
             {
                 var one = Vector256.Create(1.0);
                 var two = Vector256.Create(2.0);
+                var clampHi = Vector256.Create(20.0);
+                var clampLo = Vector256.Create(-20.0);
                 int simdLen = i + ((length - i) & ~3);
                 for (; i < simdLen; i += 4)
                 {
-                    var x0 = Avx.LoadVector256(input + i);
+                    var x0 = Avx.Min(Avx.Max(Avx.LoadVector256(input + i), clampLo), clampHi);
                     var e0 = FastExpDouble256(Avx.Multiply(two, x0));
                     Avx.Store(output + i, Avx.Divide(Avx.Subtract(e0, one), Avx.Add(e0, one)));
                 }
@@ -5796,6 +5813,15 @@ namespace AiDotNet.Tensors.Engines.Simd
                 var vHalf = Vector256.Create(0.5);
                 var vOne = Vector256.Create(1.0);
                 var vTwo = Vector256.Create(2.0);
+                // tanh saturates: tanh(±20) rounds to exactly ±1.0 in double
+                // (1 − 2e^{−40} is within half an ulp of 1). Clamp BEFORE the
+                // exp so (e^{2z}−1)/(e^{2z}+1) never hits Inf/Inf = NaN — an
+                // unclamped z ≥ ~355 (GELU input x ≥ ~19.8) overflowed
+                // e^{2z} and poisoned training forwards with NaN at exactly
+                // the cells the SIMD lanes processed (scalar tail uses
+                // Math.Tanh and was safe), AiDotNet ACEStepTests class.
+                var vTanhClampHi = Vector256.Create(20.0);
+                var vTanhClampLo = Vector256.Create(-20.0);
 
                 int simdLen = length & ~3;
                 for (; i < simdLen; i += 4)
@@ -5803,7 +5829,7 @@ namespace AiDotNet.Tensors.Engines.Simd
                     var x = Avx.LoadVector256(input + i);
                     var x3 = Avx.Multiply(Avx.Multiply(x, x), x);
                     var inner = Fma.MultiplyAdd(vCoeff, x3, x);
-                    var tanhArg = Avx.Multiply(vSqrt2OverPi, inner);
+                    var tanhArg = Avx.Min(Avx.Max(Avx.Multiply(vSqrt2OverPi, inner), vTanhClampLo), vTanhClampHi);
                     // tanh(z) = (exp(2z)-1)/(exp(2z)+1)
                     var e2z = FastExpDouble256(Avx.Multiply(vTwo, tanhArg));
                     var tanhVal = Avx.Divide(Avx.Subtract(e2z, vOne), Avx.Add(e2z, vOne));
@@ -6264,6 +6290,11 @@ namespace AiDotNet.Tensors.Engines.Simd
                 var vTwo = Vector256.Create(2.0);
                 var vCoeff = Vector256.Create(0.044715);
                 var vSqrt2OverPi = Vector256.Create(0.7978845608028654);
+                // Clamp the tanh argument to ±20 (tanh(±20) == ±1.0 exactly in
+                // double) so e^{2t} can't overflow to Inf and yield Inf/Inf =
+                // NaN — see GELUUnsafe(double*) for the failure mode.
+                var vTanhClampHi = Vector256.Create(20.0);
+                var vTanhClampLo = Vector256.Create(-20.0);
 
                 int simdLength = i + ((length - i) & ~3);
                 for (; i < simdLength; i += 4)
@@ -6271,7 +6302,7 @@ namespace AiDotNet.Tensors.Engines.Simd
                     var x = ReadVector256Double(input, i);
                     var x3 = Avx.Multiply(Avx.Multiply(x, x), x);
                     var inner = Fma.MultiplyAdd(vCoeff, x3, x);
-                    var tanhArg = Avx.Multiply(vSqrt2OverPi, inner);
+                    var tanhArg = Avx.Min(Avx.Max(Avx.Multiply(vSqrt2OverPi, inner), vTanhClampLo), vTanhClampHi);
                     // tanh via (exp(2t)-1)/(exp(2t)+1)
                     var e2t = FastExpDouble256(Avx.Multiply(vTwo, tanhArg));
                     var tanhVal = Avx.Divide(Avx.Subtract(e2t, vOne), Avx.Add(e2t, vOne));
@@ -6311,14 +6342,25 @@ namespace AiDotNet.Tensors.Engines.Simd
             {
                 var vOne = Vector256.Create(1.0);
                 var vTwo = Vector256.Create(2.0);
+                // Two overflow guards (mirrors the scalar tail's `x > 20 ? x : …`):
+                // (1) softplus(x) ≈ x for x ≥ 20 and ln(1+e^x) overflows the
+                //     intermediate e^x for x ≥ ~709 — clamp the exp argument and
+                //     blend the identity for large x;
+                // (2) tanh(softplus) via (e^{2sp}−1)/(e^{2sp}+1) hits Inf/Inf =
+                //     NaN for sp ≥ ~355 — clamp sp to 20 (tanh(20) == 1.0 in
+                //     double). See GELUUnsafe(double*) for the failure mode.
+                var vSpClamp = Vector256.Create(20.0);
 
                 int simdLength = i + ((length - i) & ~3);
                 for (; i < simdLength; i += 4)
                 {
                     var x = ReadVector256Double(input, i);
-                    // softplus = ln(1 + exp(x))
-                    var expX = FastExpDouble256(x);
-                    var softplus = FastLogDouble256(Avx.Add(vOne, expX));
+                    // softplus = ln(1 + exp(min(x, 20))); for x > 20 softplus(x) == x
+                    // to double precision, and the tanh argument is clamped to 20
+                    // anyway, so feeding the clamped value through is exact.
+                    var xCapped = Avx.Min(x, vSpClamp);
+                    var expX = FastExpDouble256(xCapped);
+                    var softplus = Avx.Min(FastLogDouble256(Avx.Add(vOne, expX)), vSpClamp);
                     // tanh(softplus) via (exp(2*sp)-1)/(exp(2*sp)+1)
                     var e2sp = FastExpDouble256(Avx.Multiply(vTwo, softplus));
                     var tanhSp = Avx.Divide(Avx.Subtract(e2sp, vOne), Avx.Add(e2sp, vOne));
@@ -8235,6 +8277,11 @@ namespace AiDotNet.Tensors.Engines.Simd
                 var vOne = Vector256.Create(1.0);
                 var vTwo = Vector256.Create(2.0);
                 var vThreeCoeff = Vector256.Create(3.0 * 0.044715);
+                // Clamp the tanh argument to ±20 (tanh(±20) == ±1.0 exactly in
+                // double, sech² == 0) so e^{2z} can't overflow to Inf and yield
+                // Inf/Inf = NaN gradients — see GELUUnsafe(double*).
+                var vTanhClampHi = Vector256.Create(20.0);
+                var vTanhClampLo = Vector256.Create(-20.0);
 
                 int simdLen = length & ~3;
                 for (; i < simdLen; i += 4)
@@ -8244,7 +8291,7 @@ namespace AiDotNet.Tensors.Engines.Simd
                     var x2 = Avx.Multiply(x, x);
                     var x3 = Avx.Multiply(x2, x);
                     var inner = Fma.MultiplyAdd(vCoeff, x3, x);     // x + 0.044715·x³
-                    var tanhArg = Avx.Multiply(vSqrt2OverPi, inner);
+                    var tanhArg = Avx.Min(Avx.Max(Avx.Multiply(vSqrt2OverPi, inner), vTanhClampLo), vTanhClampHi);
                     var e2z = FastExpDouble256(Avx.Multiply(vTwo, tanhArg));
                     var tanhVal = Avx.Divide(Avx.Subtract(e2z, vOne), Avx.Add(e2z, vOne));
                     var sechSq = Fma.MultiplyAddNegated(tanhVal, tanhVal, vOne);   // 1 − t²
