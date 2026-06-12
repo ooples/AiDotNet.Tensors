@@ -3403,7 +3403,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var bufB = GetOrAllocateBuffer(backend, bBacking);
 
             var bufOut = AllocateOutputBuffer(backend, outLen);
-
+            // The buffer is owned (ownsBuffer:true) and will be transferred to
+            // the activation cache by FinishGpuOp at the end of the try block.
+            // Any exception thrown by ConvertToFp16 / GemmFp16In32fOut /
+            // backend.Gemm BEFORE the FinishGpuOp call leaks the underlying
+            // device allocation — the outer catch only swallows the throw and
+            // falls back to CPU. Track ownership transfer explicitly so the
+            // finally can dispose the buffer if the GPU path bailed before
+            // FinishGpuOp consumed it.
+            bool finishedOwnershipTransfer = false;
+            try {
             bool fp16PathRan = false;
             if (typeof(T) == typeof(Half)
                 && backend is Engines.Gpu.IGpuHalfPrecisionBackend halfBackend
@@ -3458,7 +3467,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // first access. Matrix<T>.FromMemory wraps the deferred array
             // zero-copy.
             var resultData = FinishGpuOp<T>(backend, bufOut, outLen);
+            finishedOwnershipTransfer = true;
             return Matrix<T>.FromMemory(resultData, M, N);
+            }
+            finally
+            {
+                if (!finishedOwnershipTransfer)
+                    bufOut.Dispose();
+            }
         }
         catch
         {
