@@ -374,11 +374,24 @@ public abstract class MatrixBase<T>
         get
         {
             ValidateIndices(row, col);
+            // A Matrix returned by a deferred GPU op holds an uninitialized
+            // backing array whose values only get populated when its
+            // DeferredArrayMaterializer callback fires. The span accessors
+            // already trigger materialization; the indexer was bypassing it,
+            // so matrix[i,j] silently read zeros until something else hit
+            // the deferred path. Mirror AsSpan's TryMaterialize call here.
+            if (_cachedArray is not null)
+                Helpers.DeferredArrayMaterializer.TryMaterialize(_cachedArray);
             return _memory.Span[row * _cols + col];
         }
         set
         {
             ValidateIndices(row, col);
+            // Writers must observe materialized data too — a read-modify-write
+            // pattern (`m[i,j] += x`) reads the slot first and would otherwise
+            // overwrite the not-yet-downloaded GPU result with `0 + x`.
+            if (_cachedArray is not null)
+                Helpers.DeferredArrayMaterializer.TryMaterialize(_cachedArray);
             MarkDirty();
             _memory.Span[row * _cols + col] = value;
         }
