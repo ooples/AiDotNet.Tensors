@@ -1116,9 +1116,16 @@ extern ""C"" __global__ void parity210_index_write(float* __restrict__ output, c
     output[(outer*dstAxis+dstJ)*innerSize+inner]=v;
 }
 extern ""C"" __global__ void parity210_cdist(const float* __restrict__ x1, const float* __restrict__ x2, float* __restrict__ output, int m, int n, int d, float p) {
-    int idx = blockIdx.x*blockDim.x+threadIdx.x; if (idx>=m*n) return; int j=idx%n; int i=idx/n; float sum=0.0f;
-    for (int k=0;k<d;k++){ float diff=fabsf(x1[i*d+k]-x2[j*d+k]); if (p==1.0f) sum+=diff; else if (p==2.0f) sum+=diff*diff; else sum+=powf(diff,p); }
-    output[idx]=(p==1.0f)?sum:(p==2.0f)?sqrtf(sum):powf(sum,1.0f/p);
+    int idx = blockIdx.x*blockDim.x+threadIdx.x; if (idx>=m*n) return; int j=idx%n; int i=idx/n;
+    // Accumulate the per-element norm contributions in DOUBLE precision to match
+    // CpuEngine.Parity210.PNormCross (which uses `double acc` + Math.Pow). fp32
+    // accumulation of d≈129 squared-diff terms drifted ~1% off the CPU reference
+    // at random-input scale; double keeps GPU/CPU bit-equivalent within
+    // sqrt's fp32 rounding.
+    double sum = 0.0;
+    for (int k=0;k<d;k++){ double diff=(double)fabsf(x1[i*d+k]-x2[j*d+k]); if (p==1.0f) sum+=diff; else if (p==2.0f) sum+=diff*diff; else sum+=pow(diff,(double)p); }
+    double r = (p==1.0f) ? sum : (p==2.0f) ? sqrt(sum) : pow(sum, 1.0/(double)p);
+    output[idx] = (float)r;
 }
 extern ""C"" __global__ void parity210_pdist(const float* __restrict__ input, float* __restrict__ output, int n, int d, float p) {
     int flat = blockIdx.x*blockDim.x+threadIdx.x; if (flat>=n*n) return; int j=flat%n; int i=flat/n; if (i>=j) return; float sum=0.0f;
@@ -1145,7 +1152,20 @@ extern ""C"" __global__ void parity210_iota_pad(float* __restrict__ idx, int L, 
 }
 extern ""C"" __global__ void parity210_hsoftmax_paths(const float* __restrict__ acts, float* __restrict__ out, int rows, int treeDepth, int numClasses) {
     int idx = blockIdx.x*blockDim.x+threadIdx.x; if (idx>=rows*numClasses) return; int c=idx%numClasses; int r=idx/numClasses; int gbase=r*treeDepth; float prob=1.0f; int node=1;
-    for (int level=0; level<treeDepth; level++) { int goRight=(c&(1<<(treeDepth-level-1)))!=0; float g=1.0f/(1.0f+expf(-acts[gbase+level])); prob*=goRight?g:(1.0f-g); node=node*2+(goRight?1:0); if (node>=numClasses) break; }
+    // Shift count must be in [0, 32) — `1 << 128` is undefined in C++/CUDA and
+    // PTX's `shl.b32` returns 0 for shift >= 32, while C# (the CPU reference)
+    // masks the shift to 5 bits per ECMA-335 and returns 1. To stay GPU/CPU
+    // identical, treat any out-of-int-range bit as 0 (semantic intent: a tree
+    // of depth > 32 can't address a 32-bit class index past bit 31, so those
+    // bits are 0 by definition).
+    for (int level=0; level<treeDepth; level++) {
+        int sh = treeDepth - level - 1;
+        int goRight = (sh < 32) ? ((c & (1 << sh)) != 0) : 0;
+        float g=1.0f/(1.0f+expf(-acts[gbase+level]));
+        prob*=goRight?g:(1.0f-g);
+        node=node*2+(goRight?1:0);
+        if (node>=numClasses) break;
+    }
     out[idx]=prob;
 }
 extern ""C"" __global__ void parity210_isin(const float* __restrict__ elements, const float* __restrict__ sortedTest, float* __restrict__ mask, int numElements, int testLen) {
