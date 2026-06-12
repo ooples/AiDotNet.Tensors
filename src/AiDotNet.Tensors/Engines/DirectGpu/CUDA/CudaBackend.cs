@@ -11445,18 +11445,32 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     /// <inheritdoc/>
     public unsafe void ConvertToFp16(IGpuBuffer input, IGpuBuffer output, int size)
     {
-        if (!_kernelCache.TryGetValue("convert_fp32_to_fp16", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: convert_fp32_to_fp16");
+        // The toolkit (cuda_fp16.h-based) kernel is the faster __half2 packed
+        // path, but it only compiles on machines with the CUDA Toolkit
+        // header. On driver-only hosts CompileKernelModule(... CudaFp16Kernels)
+        // silently fails (see CudaBackend ctor) and the toolkit kernel never
+        // registers — which used to make MatrixMultiply<Half> throw
+        // "CUDA kernel not found: convert_fp32_to_fp16" and fall to the
+        // 56-second CPU scalar path (#560). Fall through to the self-contained
+        // native kernel here so the public API works on every CUDA system.
+        if (_kernelCache.TryGetValue("convert_fp32_to_fp16", out var kernel))
+        {
+            using var _ = PushContext();
+            uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+            IntPtr inPtr = input.Handle;
+            IntPtr outPtr = output.Handle;
+            void** args = stackalloc void*[3];
+            args[0] = &inPtr;
+            args[1] = &outPtr;
+            args[2] = &size;
+            LaunchKernel(kernel, grid, DefaultBlockSize, args);
+            return;
+        }
 
-        using var _ = PushContext();
-        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
-        IntPtr inPtr = input.Handle;
-        IntPtr outPtr = output.Handle;
-        void** args = stackalloc void*[3];
-        args[0] = &inPtr;
-        args[1] = &outPtr;
-        args[2] = &size;
-        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+        // Driver-only fallback — exists by construction (compiled in the
+        // ctor as part of fp16_native_kernels, not the optional fp16_kernels
+        // module). Same FP32→FP16 semantics.
+        ConvertToFp16Native(input, output, size);
     }
 
     /// <summary>

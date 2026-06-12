@@ -26,11 +26,16 @@ using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
+using Xunit.Abstractions;
 
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
 public class MatrixMultiplyResidencyTests
 {
+    private readonly ITestOutputHelper _output;
+
+    public MatrixMultiplyResidencyTests(ITestOutputHelper output) { _output = output; }
+
     private static bool TryGetGpuEngine(out DirectGpuTensorEngine engine)
     {
         engine = new DirectGpuTensorEngine();
@@ -188,6 +193,131 @@ AssertCloseFloat(c.AsSpan().ToArray(), cRef.AsSpan().ToArray(), absTol: 5e-3f, r
                 Assert.True(diff < tol,
                     $"FP16 GEMM mismatch at [{i}]: got={g}, want={want[i]}, diff={diff}, tol={tol}");
             }
+        }
+    }
+
+    // ── perf benchmarks reproducing the timing claims from #560/#561/#562 ──
+    //
+    // These print the actual measured numbers so the regression issue's perf
+    // claim isn't a trust-the-comments problem. They use [Fact] (not Theory)
+    // so the output appears in the test runner. Tolerances on the assertion
+    // bounds are generous (we just want "did the fix engage", not exact
+    // numbers from a specific GPU SKU).
+
+    [Fact]
+    public void Benchmark_Fp16_VsFp32()
+    {
+        // #560: pre-fix, FP16 MatMul hit a CPU scalar path because the GPU
+        // dispatch declined (kernel-not-found / FP16-not-supported); on
+        // an RTX 3080 with N=2048 that was 280s vs 195ms FP32 (1437× — the
+        // raw repro number from the issue body).
+        //
+        // The fix has two layers:
+        //   (1) ConvertToFp16 falls back to the driver-only native kernel when
+        //       the cuda_fp16.h-based kernel didn't compile.
+        //   (2) The dispatch in IEngine.MatrixMultiply<Half> catches
+        //       cublasGemmEx-not-supported (Turing TU116/TU117 advertise FP16
+        //       but lack tensor cores) and falls through to SGEMM on the same
+        //       cached FP32 buffers — so non-tensor-core GPUs get FP32 speed
+        //       instead of the multi-second CPU scalar.
+        //
+        // We assert the GPU vs CPU-fallback cliff is gone (FP16 within 20×
+        // of FP32). On tensor-core hardware FP16 should be ≤ FP32; on
+        // non-tensor-core hardware (GTX 16-series) FP16 is bounded by SGEMM
+        // + the small conversion overhead.
+        if (!TryGetGpuEngine(out var engine)) { _output.WriteLine("SKIP: no GPU"); return; }
+        using (engine)
+        {
+            const int N = 512;
+            var aF = RandomFloat(N, N, seed: 200);
+            var bF = RandomFloat(N, N, seed: 201);
+            var aH = new Matrix<Half>(N, N);
+            var bH = new Matrix<Half>(N, N);
+            { var aFs = aF.AsSpan(); var aHs = aH.AsWritableSpan(); for (int i = 0; i < aFs.Length; i++) aHs[i] = (Half)aFs[i]; }
+            { var bFs = bF.AsSpan(); var bHs = bH.AsWritableSpan(); for (int i = 0; i < bFs.Length; i++) bHs[i] = (Half)bFs[i]; }
+
+            // Warm up (driver/JIT/buffer pool).
+            _ = ((IEngine)engine).MatrixMultiply(aF, bF);
+            _ = ((IEngine)engine).MatrixMultiply(aH, bH);
+
+            // FP32
+            var sw32 = System.Diagnostics.Stopwatch.StartNew();
+            var c32 = ((IEngine)engine).MatrixMultiply(aF, bF);
+            _ = c32.AsSpan()[0]; // force download/materialize
+            sw32.Stop();
+
+            // FP16
+            var sw16 = System.Diagnostics.Stopwatch.StartNew();
+            var c16 = ((IEngine)engine).MatrixMultiply(aH, bH);
+            _ = c16.AsSpan()[0]; // force download/materialize
+            sw16.Stop();
+
+            double ms32 = sw32.Elapsed.TotalMilliseconds;
+            double ms16 = sw16.Elapsed.TotalMilliseconds;
+            _output.WriteLine($"#560 N={N}: FP32={ms32:F1}ms, FP16={ms16:F1}ms, ratio={ms16 / ms32:F2}x");
+
+            // Pre-fix: ms16/ms32 ≈ 1000×. The fix puts them on the same order;
+            // an FP16 path that's even WITHIN 10× of FP32 means it's on the
+            // GPU (not the 1000× scalar-CPU fallback). We assert 20× as a very
+            // generous bound that still catches the regression.
+            Assert.True(ms16 < ms32 * 20.0,
+                $"FP16 must not be >20× slower than FP32 (#560). FP32={ms32:F1}ms FP16={ms16:F1}ms");
+        }
+    }
+
+    [Fact]
+    public void Benchmark_ChainedGemm_InsideVsOutsideGpuScope()
+    {
+        // #561 / #562: pre-fix, a 20-step chained N=2048 GEMM was SLOWER
+        // inside BeginGpuScope() (5722 ms) than outside (4673 ms) — 0.82× —
+        // because the scope's deferred-download path went unused and added
+        // overhead. After the fix it should be FASTER inside (no host
+        // round-trip per step).
+        if (!TryGetGpuEngine(out var engine)) { _output.WriteLine("SKIP: no GPU"); return; }
+        using (engine)
+        {
+            const int N = 1024;   // smaller than 2048 to keep test under ~10s
+            const int Steps = 8;
+            var a = RandomFloat(N, N, seed: 300);
+            var b = RandomFloat(N, N, seed: 301);
+
+            // Warm up (cache, driver, JIT).
+            _ = ((IEngine)engine).MatrixMultiply(a, b);
+
+            // Without scope: each MatMul downloads + the next one re-uploads.
+            var swOut = System.Diagnostics.Stopwatch.StartNew();
+            var cOut = a;
+            for (int i = 0; i < Steps; i++)
+                cOut = ((IEngine)engine).MatrixMultiply(cOut, b);
+            _ = cOut.AsSpan()[0];
+            swOut.Stop();
+
+            // With scope: intermediates stay GPU-resident, host download
+            // happens once at the end.
+            var swIn = System.Diagnostics.Stopwatch.StartNew();
+            Matrix<float> cIn;
+            using (var scope = engine.BeginGpuScope())
+            {
+                cIn = a;
+                for (int i = 0; i < Steps; i++)
+                    cIn = ((IEngine)engine).MatrixMultiply(cIn, b);
+            }
+            _ = cIn.AsSpan()[0];
+            swIn.Stop();
+
+            double msOut = swOut.Elapsed.TotalMilliseconds;
+            double msIn = swIn.Elapsed.TotalMilliseconds;
+            double flops = 2.0 * N * N * N * Steps;
+            double gfOut = flops / 1e6 / msOut;
+            double gfIn = flops / 1e6 / msIn;
+            _output.WriteLine($"#561/#562 N={N} {Steps}-step chained GEMM: outside={msOut:F1}ms ({gfOut:F1} GF/s), inside={msIn:F1}ms ({gfIn:F1} GF/s), inside/outside={msIn / msOut:F2}x");
+
+            // Inside the scope must be NO SLOWER than outside (within 10%
+            // jitter floor). Pre-fix this was 0.82× (inside slower). We
+            // accept ≤1.10× (inside marginally slower) as "fix engaged" —
+            // the original cliff was much sharper.
+            Assert.True(msIn <= msOut * 1.10,
+                $"GpuScope must not slow chained GEMM (#561). outside={msOut:F1}ms inside={msIn:F1}ms ratio={msIn / msOut:F2}x");
         }
     }
 

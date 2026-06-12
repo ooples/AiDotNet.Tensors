@@ -205,11 +205,20 @@ public sealed class GpuScope : IDisposable
         {
             depth--;
             _depthPerEngine[_engineId] = depth;
-            // When the outermost scope for this engine exits, materialize its deferred downloads
-            if (depth == 0)
-            {
-                _engine?.MaterializeAllDeferred();
-            }
+            // Issue #561: previously this called _engine.MaterializeAllDeferred()
+            // which forced a host download of EVERY intermediate produced inside
+            // the scope. For an 8-step chained GEMM that's 8 downloads at scope
+            // exit when the user only reads the final value — a 1.63× slowdown
+            // vs running the same chain outside the scope. That directly
+            // contradicted GpuScope's documented contract ("Downloads of
+            // intermediate results are deferred until CPU data is actually
+            // needed"). Buffer-lifetime safety is already covered by
+            // EvictOldestActivationsUnsafe / EvictActivationsCreatedAfter,
+            // which materialize-before-free any deferred entry they evict.
+            // So scope exit can drop straight back to the deferred-lazy
+            // model: a host read of an intermediate materializes it at the
+            // read point; an intermediate the user never reads never pays for
+            // a download.
         }
     }
 }
@@ -3395,6 +3404,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
             var bufOut = AllocateOutputBuffer(backend, outLen);
 
+            bool fp16PathRan = false;
             if (typeof(T) == typeof(Half)
                 && backend is Engines.Gpu.IGpuHalfPrecisionBackend halfBackend
                 && halfBackend.SupportsHgemm)
@@ -3406,18 +3416,37 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 // long-chain precision, and the FP32 output flows back into
                 // the activation cache so downstream FP32 ops can consume it
                 // directly. The two FP32→FP16 conversions are O(MK+KN) —
-                // negligible against the O(MKN) GEMM. The previous code path
-                // never reached this branch (Half went through
-                // a.AsSpan().ToArray() into DirectGpuEngine.MatMul, but the
-                // chained-IEngine entry never resolved inputs from cache, so
-                // a residency-aware Half user still paid the upload tax).
-                using var aFp16 = AllocateOutputBuffer(backend, M * K);
-                using var bFp16 = AllocateOutputBuffer(backend, K * N);
-                backend.ConvertToFp16(bufA.Buffer, aFp16.Buffer, M * K);
-                backend.ConvertToFp16(bufB.Buffer, bFp16.Buffer, K * N);
-                halfBackend.GemmFp16In32fOut(aFp16.Buffer, bFp16.Buffer, bufOut.Buffer, M, N, K);
+                // negligible against the O(MKN) GEMM.
+                //
+                // GemmFp16In32fOut requires tensor cores. Some CC>=5 GPUs
+                // (notably Turing TU116/TU117 — the GTX 16-series) advertise
+                // FP16 support but lack tensor cores, and cublasGemmEx returns
+                // CUBLAS_STATUS_NOT_SUPPORTED on those parts. Try the FP16 path
+                // first; on a clean failure fall through to SGEMM on the same
+                // (already-uploaded) FP32 inputs. This is the right behavior
+                // for "Half user on hardware that can't accelerate Half" —
+                // they get the FP32 speed of the GPU instead of dropping to
+                // a multi-second CPU scalar loop.
+                try
+                {
+                    using var aFp16 = AllocateOutputBuffer(backend, M * K);
+                    using var bFp16 = AllocateOutputBuffer(backend, K * N);
+                    backend.ConvertToFp16(bufA.Buffer, aFp16.Buffer, M * K);
+                    backend.ConvertToFp16(bufB.Buffer, bFp16.Buffer, K * N);
+                    halfBackend.GemmFp16In32fOut(aFp16.Buffer, bFp16.Buffer, bufOut.Buffer, M, N, K);
+                    fp16PathRan = true;
+                }
+                catch (InvalidOperationException)
+                {
+                    // Tensor cores not available — SGEMM fallback below.
+                }
+                catch (NotSupportedException)
+                {
+                    // Same as above; some backends surface a different exception type.
+                }
             }
-            else
+
+            if (!fp16PathRan)
             {
                 backend.Gemm(bufA.Buffer, bufB.Buffer, bufOut.Buffer, M, N, K);
             }
