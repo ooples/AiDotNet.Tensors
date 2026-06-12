@@ -588,12 +588,16 @@ public partial class DirectGpuTensorEngine
         if (updates is null) throw new ArgumentNullException(nameof(updates));
         if (axis < 0) axis += destination.Rank;
 
-        // index_add: result = copy(destination); result[index[i]] += updates[i]. The backend ScatterAdd
-        // kernel is FLAT (featureSize=1), so only the 1-D / axis-0 case maps; higher-rank / featured /
-        // non-zero-axis fall back to the (correct) base. Tape-active also defers (the scatter backward
-        // stays on the base's recording). The prior engine wiring diverged because it did NOT seed the
-        // output buffer with the base destination — scatter is an ADD onto the existing values — so the
-        // base contribution was missing. Seed it with backend.Copy first, then atomic-add the updates.
+        // index_add: result = copy(destination); result[index[i]] += updates[i]. The backend
+        // ScatterAdd kernel is FLAT (featureSize=1), so only the 1-D / axis-0 case maps;
+        // higher-rank / featured / non-zero-axis fall back to the (correct) base. Tape-active
+        // also defers (the scatter backward stays on the base's recording).
+        //
+        // The wrapper SEEDS the output buffer with the base destination via backend.Copy
+        // (scatter is ADD onto existing values), then the kernel atomic-adds the indexed
+        // updates. CudaBackend.ScatterAdd is hard-routed to the atomic embedding_backward
+        // kernel (NOT the deterministic-overwrite variant) because the latter overwrites
+        // the seed — see the routing comment in CudaBackend.ScatterAdd.
         if (IsTapeActive<T>() || axis != 0
             || destination.Rank != 1 || updates.Rank != 1 || indices.Rank != 1
             || indices.Length != updates.Length
@@ -1290,6 +1294,7 @@ public partial class DirectGpuTensorEngine
     }
 
     /// <inheritdoc/>
+    /// <inheritdoc/>
     public override Tensor<T> TensorCDist<T>(Tensor<T> x1, Tensor<T> x2, double p = 2.0)
     {
         if (x1 is null) throw new ArgumentNullException(nameof(x1));
@@ -1299,6 +1304,10 @@ public partial class DirectGpuTensorEngine
             return base.TensorCDist(x1, x2, p);
         try
         {
+            // CPU reference (CpuEngine.Parity210.PNormCross) accumulates in `double`
+            // and only narrows on the final cast. The CUDA `parity210_cdist` kernel
+            // does the same (sum is `double`, narrowed on output) so this override
+            // is GPU/CPU bit-equivalent within fp32 sqrt rounding.
             var c1 = x1.IsContiguous ? x1 : (Tensor<T>)x1.Contiguous();
             var c2 = x2.IsContiguous ? x2 : (Tensor<T>)x2.Contiguous();
             int m = x1._shape[0], n = x2._shape[0], d = x1._shape[1];
@@ -2291,7 +2300,11 @@ public partial class DirectGpuTensorEngine
         try
         {
             // Per-level node activations on the GPU (input · nodeWeightsᵀ), then the leaf-probability
-            // path products (sigmoid folded into the kernel).
+            // path products (sigmoid folded into the kernel). The kernel was previously diverging
+            // from CPU at treeDepth > 32 because `1 << (treeDepth - level - 1)` is undefined for
+            // shift counts ≥ 32 — C# masks to 5 bits (returning 1) while CUDA PTX returns 0.
+            // Both reference paths now clamp `sh < 32` so any bit past int's width is treated as
+            // 0 (semantic: a tree deeper than the integer's bit-width can't address those bits).
             int rows = input.Length / d;
             var input2d = (input.IsContiguous ? input : (Tensor<T>)input.Contiguous()).Reshape(new[] { rows, d });
             var acts = TensorMatMulTransposed(input2d, nodeWeights);   // [rows, treeDepth]

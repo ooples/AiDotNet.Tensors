@@ -35389,7 +35389,15 @@ public partial class CpuEngine : ITensorLevelEngine
                 int node = 1;
                 for (int level = 0; level < treeDepth; level++)
                 {
-                    bool goRight = (c & (1 << (treeDepth - level - 1))) != 0;
+                    // Shift count must stay in [0, 32) — `1 << 128` is masked to 5
+                    // bits in C# (returning 1) but PTX's shl.b32 yields 0 on the
+                    // GPU, so the two reference implementations would diverge for
+                    // treeDepth > 32. Treat any bit past int's width as 0 (semantic
+                    // intent: a tree deeper than the integer's bit-width can't
+                    // address class indices past bit 31, so the bit is 0 by
+                    // definition). Matches parity210_hsoftmax_paths.
+                    int sh = treeDepth - level - 1;
+                    bool goRight = sh < 32 && (c & (1 << sh)) != 0;
                     prob = numOps.Multiply(prob, goRight ? gates[level] : numOps.Subtract(one, gates[level]));
                     node = node * 2 + (goRight ? 1 : 0);
                     if (node >= numClasses) break;

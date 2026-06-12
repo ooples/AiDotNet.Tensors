@@ -1145,7 +1145,20 @@ extern ""C"" __global__ void parity210_iota_pad(float* __restrict__ idx, int L, 
 }
 extern ""C"" __global__ void parity210_hsoftmax_paths(const float* __restrict__ acts, float* __restrict__ out, int rows, int treeDepth, int numClasses) {
     int idx = blockIdx.x*blockDim.x+threadIdx.x; if (idx>=rows*numClasses) return; int c=idx%numClasses; int r=idx/numClasses; int gbase=r*treeDepth; float prob=1.0f; int node=1;
-    for (int level=0; level<treeDepth; level++) { int goRight=(c&(1<<(treeDepth-level-1)))!=0; float g=1.0f/(1.0f+expf(-acts[gbase+level])); prob*=goRight?g:(1.0f-g); node=node*2+(goRight?1:0); if (node>=numClasses) break; }
+    // Shift count must be in [0, 32) — `1 << 128` is undefined in C++/CUDA and
+    // PTX's `shl.b32` returns 0 for shift >= 32, while C# (the CPU reference)
+    // masks the shift to 5 bits per ECMA-335 and returns 1. To stay GPU/CPU
+    // identical, treat any out-of-int-range bit as 0 (semantic intent: a tree
+    // of depth > 32 can't address a 32-bit class index past bit 31, so those
+    // bits are 0 by definition).
+    for (int level=0; level<treeDepth; level++) {
+        int sh = treeDepth - level - 1;
+        int goRight = (sh < 32) ? ((c & (1 << sh)) != 0) : 0;
+        float g=1.0f/(1.0f+expf(-acts[gbase+level]));
+        prob*=goRight?g:(1.0f-g);
+        node=node*2+(goRight?1:0);
+        if (node>=numClasses) break;
+    }
     out[idx]=prob;
 }
 extern ""C"" __global__ void parity210_isin(const float* __restrict__ elements, const float* __restrict__ sortedTest, float* __restrict__ mask, int numElements, int testLen) {

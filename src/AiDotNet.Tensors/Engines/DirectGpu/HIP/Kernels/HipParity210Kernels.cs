@@ -1029,7 +1029,16 @@ extern ""C"" __global__ void parity210_iota_pad(float* __restrict__ idx, int L, 
 }
 extern ""C"" __global__ void parity210_hsoftmax_paths(const float* __restrict__ acts, float* __restrict__ out, int rows, int treeDepth, int numClasses) {
     int idx = blockIdx.x*blockDim.x+threadIdx.x; if (idx>=rows*numClasses) return; int c=idx%numClasses; int r=idx/numClasses; int gbase=r*treeDepth; float prob=1.0f; int node=1;
-    for (int level=0; level<treeDepth; level++) { int goRight=(c&(1<<(treeDepth-level-1)))!=0; float g=1.0f/(1.0f+expf(-acts[gbase+level])); prob*=goRight?g:(1.0f-g); node=node*2+(goRight?1:0); if (node>=numClasses) break; }
+    // sh<32 guard: `1 << sh` is undefined for sh >= 32 in CUDA/HIP. Treat
+    // bit-past-int-width as 0 (matches CpuEngine.FusedHierarchicalSoftmax).
+    for (int level=0; level<treeDepth; level++) {
+        int sh = treeDepth-level-1;
+        int goRight = (sh < 32) ? ((c & (1 << sh)) != 0) : 0;
+        float g=1.0f/(1.0f+expf(-acts[gbase+level]));
+        prob*=goRight?g:(1.0f-g);
+        node=node*2+(goRight?1:0);
+        if (node>=numClasses) break;
+    }
     out[idx]=prob;
 }
 extern ""C"" __global__ void parity210_isin(const float* __restrict__ elements, const float* __restrict__ sortedTest, float* __restrict__ mask, int numElements, int testLen) {

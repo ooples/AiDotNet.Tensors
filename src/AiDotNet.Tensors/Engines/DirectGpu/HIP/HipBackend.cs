@@ -8033,18 +8033,31 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe void ScatterAdd(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer destination, int sourceSize, int destSize)
     {
-        // CPU fallback for scatter - no dedicated kernel
+        // CPU fallback for HIP scatter (no dedicated kernel yet). The caller passes an
+        // INT buffer for `indices` (AllocateIntBuffer in the wrapper); the previous code
+        // downloaded that buffer into a `float[]` and then did `(int)idxData[i]` — which
+        // bit-reinterpreted each int as a float, producing a denormal-near-zero value
+        // that truncated to 0 on the cast. Every update then accumulated at dest[0]
+        // (max_abs_err ≈ sourceSize × meanUpdate in the differential test).
+        //
+        // Fix: download into a float[] (HIP doesn't expose a typed int download today,
+        // but int and float are both 4 bytes so the underlying bit pattern is identical)
+        // then Buffer.BlockCopy the bytes into an int[] so we read the original index
+        // bit pattern instead of float-casting it. Destination is seeded by the wrapper
+        // via backend.Copy(destination, output) and this routine ACCUMULATES on top.
         var srcData = new float[sourceSize];
-        var idxData = new float[sourceSize];
+        var idxRaw = new float[sourceSize];     // raw transport — same 4-byte width as int
+        var idxData = new int[sourceSize];
         var dstData = new float[destSize];
 
         DownloadBuffer(source, srcData);
-        DownloadBuffer(indices, idxData);
+        DownloadBuffer(indices, idxRaw);
+        System.Buffer.BlockCopy(idxRaw, 0, idxData, 0, sourceSize * sizeof(int));
         DownloadBuffer(destination, dstData);
 
         for (int i = 0; i < sourceSize; i++)
         {
-            int idx = (int)idxData[i];
+            int idx = idxData[i];
             if (idx >= 0 && idx < destSize)
                 dstData[idx] += srcData[i];
         }

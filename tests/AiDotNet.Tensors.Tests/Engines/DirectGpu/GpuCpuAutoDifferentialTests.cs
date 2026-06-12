@@ -314,7 +314,21 @@ public sealed class GpuCpuAutoDifferentialTests : IDisposable
             double m = 0;
             for (int i = 0; i < ca.Length; i++)
             {
-                Assert.False(float.IsNaN(ga[i]) || float.IsInfinity(ga[i]), $"GPU produced non-finite value at index {i}");
+                // Non-finite (Inf / NaN) is a SEMANTIC match if both backends produce
+                // it — ops like ldexp on large exponents overflow to Inf identically
+                // on CPU and GPU, and that's correct mathematical behaviour, not a
+                // GPU bug. Only fail when the GPU diverges from the CPU reference
+                // (GPU non-finite where CPU is finite, or vice versa). Otherwise
+                // skip the element from the error sum.
+                bool gNonFinite = float.IsNaN(ga[i]) || float.IsInfinity(ga[i]);
+                bool cNonFinite = float.IsNaN(ca[i]) || float.IsInfinity(ca[i]);
+                if (gNonFinite || cNonFinite)
+                {
+                    Assert.True(gNonFinite == cNonFinite,
+                        $"GPU/CPU diverged at index {i}: GPU={ga[i]} CPU={ca[i]} (one non-finite, the other finite — real bug, not just overflow parity)");
+                    // Both non-finite — treat as match for tolerance accounting.
+                    continue;
+                }
                 double e = Math.Abs((double)ga[i] - ca[i]); if (e > m) m = e;
             }
             return m;
