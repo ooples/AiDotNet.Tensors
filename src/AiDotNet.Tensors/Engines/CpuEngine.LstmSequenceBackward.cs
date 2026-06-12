@@ -39,6 +39,22 @@ public partial class CpuEngine
         bool returnSequences, bool wantState,
         out Tensor<float> finalHidden, out Tensor<float> finalCell)
     {
+        // The fused BPTT node records gradients only for `output`; `finalHidden`
+        // / `finalCell` are returned as fresh detached tensors. Letting a tape
+        // see them would silently stop gradients at the LSTM boundary, so
+        // explicitly reject the (wantState ∧ active-tape) combination. Callers
+        // that want differentiable state at chunk boundaries should slice them
+        // out of `output` (or call the unfused path that records each timestep).
+        if (wantState && DifferentiableOps.ThreadTapeActive())
+        {
+            throw new ArgumentException(
+                "LstmSequenceForwardFloatTrain: wantState=true is not yet supported under an active gradient tape. " +
+                "The fused BPTT node records gradients only for the sequence output; the returned finalHidden / " +
+                "finalCell tensors carry no backward edge and would silently detach the graph. " +
+                "Either set wantState=false, or slice the final hidden/cell out of the returned output tensor.",
+                nameof(wantState));
+        }
+
         int G = gateRows;                 // 4 * hidden
         int totalRows = batch * seqLen;
 
@@ -92,6 +108,47 @@ public partial class CpuEngine
             ? new Tensor<float>(new[] { batch, seqLen, hidden })
             : new Tensor<float>(new[] { batch, hidden });
         var outSpan = output.AsWritableSpan();
+
+        // seqLen == 0 corner case: the timestep loop below is skipped, so the
+        // last-hidden output stays at its default zero-init. Match the generic
+        // (unfused) LSTM implementation, which returns "last hidden = h0" when
+        // there are no timesteps: copy the seeded h_0 into the [batch, hidden]
+        // output here (returnSequences=true yields an empty [batch, 0, hidden]
+        // tensor and needs no fill).
+        if (seqLen == 0)
+        {
+            if (!returnSequences)
+            {
+                for (int b = 0; b < batch; b++)
+                    for (int h = 0; h < hidden; h++)
+                        outSpan[b * hidden + h] = h0Arr is null ? 0f : h0Arr[b * hidden + h];
+            }
+
+            if (wantState)
+            {
+                finalHidden = new Tensor<float>(new[] { batch, hidden });
+                finalCell = new Tensor<float>(new[] { batch, hidden });
+                var fhSpan0 = finalHidden.AsWritableSpan();
+                var fcSpan0 = finalCell.AsWritableSpan();
+                for (int b = 0; b < batch; b++)
+                    for (int h = 0; h < hidden; h++)
+                    {
+                        fhSpan0[b * hidden + h] = h0Arr is null ? 0f : h0Arr[b * hidden + h];
+                        fcSpan0[b * hidden + h] = c0Arr is null ? 0f : c0Arr[b * hidden + h];
+                    }
+            }
+            else
+            {
+                finalHidden = s_emptyState;
+                finalCell = s_emptyState;
+            }
+
+            // No timesteps means no gates were computed — there's nothing for
+            // BPTT to consume, so don't record a tape node. Callers that pass
+            // a gradient of `output` against h0 still get correct semantics
+            // because the framework handles "no recorded op" as a no-op edge.
+            return output;
+        }
 
         // Per-timestep scratch: hh = h_prev @ wHhT, [batch, G].
         var hPrev = new float[batch * hidden];
