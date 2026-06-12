@@ -1134,6 +1134,14 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     /// the pending finalizers to run — reclaiming the transient device memory deterministically
     /// — then drains completed deferred frees back to the pool. Called once per training step
     /// from <c>CompiledTrainingPlan.StepEager</c>.
+    ///
+    /// Hysteresis: a workload whose healthy steady state holds most of the device (e.g. a large
+    /// compiled-graph training run with a sized activation cache) sits below the threshold on
+    /// EVERY step, and an unconditional sweep there costs two full GCs plus a finalizer wait per
+    /// step (measured ~19x wall-clock on a 12 GB card at ~71% resident). Each ineffective sweep
+    /// (reclaimed less than 1% of the device) doubles a step cooldown up to 256; any effective
+    /// sweep or a return to an unpressured state resets it, so genuine leaks are still reclaimed
+    /// at full cadence.
     /// </summary>
     public void ReclaimUnderPressure(double freeFractionThreshold = 0.20)
     {
@@ -1144,13 +1152,22 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             throw new ArgumentOutOfRangeException(nameof(freeFractionThreshold), freeFractionThreshold,
                 "freeFractionThreshold must be in the range (0, 1].");
         if (!IsAvailable) return;
+        if (_reclaimCooldownRemaining > 0)
+        {
+            _reclaimCooldownRemaining--;
+            return;
+        }
         ulong free, total;
         using (PushContext())
         {
             if (CudaNativeBindings.cuMemGetInfo(out free, out total) != CudaResult.Success || total == 0)
                 return;
         }
-        if ((double)free / total > freeFractionThreshold) return; // not pressured — fast path
+        if ((double)free / total > freeFractionThreshold)
+        {
+            _reclaimBackoffSteps = 1; // unpressured — re-arm full cadence
+            return;
+        }
 
         // Pressured: run pending finalizers so dereferenced transient GPU buffers are released,
         // then reclaim any completed deferred frees. Two collects bracket the finalizer wait so
@@ -1159,7 +1176,23 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         GC.WaitForPendingFinalizers();
         GC.Collect();
         DrainDeferredFrees(blockOldest: false);
+
+        // Effectiveness check: a workload legitimately resident below the threshold reclaims ~nothing;
+        // back off exponentially so the per-step GC tax amortizes away. A sweep that frees >=1% of the
+        // device means transient garbage IS accumulating — keep full cadence.
+        ulong freeAfter = free;
+        using (PushContext())
+        {
+            if (CudaNativeBindings.cuMemGetInfo(out var f2, out _) == CudaResult.Success)
+                freeAfter = f2;
+        }
+        bool effective = freeAfter > free && (freeAfter - free) >= total / 100;
+        _reclaimBackoffSteps = effective ? 1 : Math.Min(_reclaimBackoffSteps * 2, 256);
+        _reclaimCooldownRemaining = effective ? 0 : _reclaimBackoffSteps;
     }
+
+    private int _reclaimCooldownRemaining;
+    private int _reclaimBackoffSteps = 1;
 
     /// <summary>
     /// Allocates device memory with an OOM-recovery retry. If the driver reports
