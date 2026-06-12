@@ -24,6 +24,23 @@ public static class CpuParallelSettings
     public static int MaxDegreeOfParallelism { get; set; } = Environment.ProcessorCount;
 
     /// <summary>
+    /// Worker-thread count for the library's persistent custom thread pools (PersistentParallelExecutor,
+    /// StreamingWorkerPool, CooperativeGemmScheduler). Honors <see cref="MaxDegreeOfParallelism"/> and clamps to
+    /// a ceiling so a high-core box (e.g. 64 logical processors) does NOT spawn ~63 threads PER pool — three such
+    /// pools at 63 each = ~189 mostly-parked threads of pure oversubscription tax. Each pool reads this once at
+    /// construction. Override the ceiling with AIDOTNET_POOL_THREADS.
+    /// </summary>
+    public static int WorkerPoolThreads
+    {
+        get
+        {
+            int ceiling = 32;
+            if (int.TryParse(Environment.GetEnvironmentVariable("AIDOTNET_POOL_THREADS"), out var c) && c > 0) ceiling = c;
+            return Math.Max(1, Math.Min(Math.Min(MaxDegreeOfParallelism, Environment.ProcessorCount) - 1, ceiling));
+        }
+    }
+
+    /// <summary>
     /// When true, the grain-size-gated <see cref="ParallelForOrSerial(int,int,long,System.Action{int})"/>
     /// helpers run serially regardless of work size. This is for the order-dependent reduction/
     /// accumulation kernels routed through these helpers, whose multi-threaded partial-sum

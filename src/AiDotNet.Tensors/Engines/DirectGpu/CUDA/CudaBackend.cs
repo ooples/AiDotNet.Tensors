@@ -24,6 +24,24 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     // the whole process. The OS reclaims device memory + the context at exit anyway.
     private static bool IsRuntimeTearingDown => RuntimeShutdown.IsTearingDown;
 
+    // Live CUDA contexts. A device-buffer finalizer must NOT free against a context that has already
+    // been destroyed — under per-test engine teardown (each test builds its own CudaBackend/context),
+    // a buffer that escapes explicit Dispose is GC-finalized LATER and would call cuCtxPushCurrent /
+    // cuMemFree on a dead context, raising an uncatchable, finalizer-fatal 0xC0000005 that kills the
+    // whole process (the documented "no suite crash" hazard — IsRuntimeTearingDown only covers PROCESS
+    // exit, not per-test context destruction). cuCtxDestroy already reclaimed that buffer's memory, so
+    // the finalizer skips the native free when its context is no longer registered here. Added at
+    // cuCtxCreate, removed immediately before cuCtxDestroy.
+    internal static readonly ConcurrentDictionary<IntPtr, byte> LiveContexts = new();
+
+    // Serializes a buffer's native free against its context's destruction. The LiveContexts check
+    // alone is a TOCTOU race: a GC-thread buffer finalizer can observe its context as live, then a
+    // concurrent engine Dispose removes + cuCtxDestroys it, and the finalizer's cuCtxPushCurrent /
+    // cuMemFree then hit the just-freed context → uncatchable 0xC0000005. Holding this lock across
+    // {check-live + free} on the finalizer side and {remove + cuCtxDestroy} on the dispose side makes
+    // the two mutually exclusive: a buffer either frees before the destroy or is skipped after it.
+    internal static readonly object ContextLifecycleLock = new();
+
     private const int DefaultBlockSize = 256;
     private const int MaxRnnBlockSize = 1024;
     private readonly ConcurrentDictionary<string, IntPtr> _kernelCache;
@@ -271,6 +289,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             MaxBufferAllocBytes = (long)totalMem;
 
             CuBlasNative.CheckCudaResult(CuBlasNative.cuCtxCreate(out _cudaContext, 0, device), "cuCtxCreate");
+            LiveContexts[_cudaContext] = 0; // register: a buffer finalizer may only free against a live context
             CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamCreate(out _stream, 0), "cuStreamCreate");
             _defaultStream = new CudaStream(this, _stream, GpuStreamType.Default, ownsHandle: false);
 
@@ -1118,6 +1137,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     /// </summary>
     public void ReclaimUnderPressure(double freeFractionThreshold = 0.20)
     {
+        // Bounds: a free-fraction threshold only makes sense in (0, 1]. > 1 would force the full
+        // GC/finalizer sweep on EVERY call (free/total can never exceed 1), and <= 0 (or NaN) would
+        // disable reclamation entirely — both defeat the purpose, so reject rather than silently misbehave.
+        if (!(freeFractionThreshold > 0.0 && freeFractionThreshold <= 1.0))
+            throw new ArgumentOutOfRangeException(nameof(freeFractionThreshold), freeFractionThreshold,
+                "freeFractionThreshold must be in the range (0, 1].");
         if (!IsAvailable) return;
         ulong free, total;
         using (PushContext())
@@ -3511,6 +3536,14 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     {
         if (data == null) throw new ArgumentNullException(nameof(data));
         if (buffer == null) throw new ArgumentNullException(nameof(buffer));
+        // Fail fast with a managed exception BEFORE touching the driver — matches the rest of the
+        // backend. Without this, a failed backend init or a freed graph-input buffer (zero handle)
+        // would fall through to a raw cuMemcpyHtoD and fault the CUDA context (error 700) instead.
+        if (!IsAvailable)
+            throw new InvalidOperationException("CUDA backend is not available.");
+        if (buffer.Handle == IntPtr.Zero)
+            throw new ObjectDisposedException(nameof(buffer),
+                "GPU buffer was released before its in-place upload.");
         if (data.Length > buffer.Size)
             throw new ArgumentException($"Host data ({data.Length}) exceeds buffer ({buffer.Size}).");
         using var _ = PushContext();
@@ -3527,6 +3560,11 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     {
         if (data == null) throw new ArgumentNullException(nameof(data));
         if (buffer == null) throw new ArgumentNullException(nameof(buffer));
+        if (!IsAvailable)
+            throw new InvalidOperationException("CUDA backend is not available.");
+        if (buffer.Handle == IntPtr.Zero)
+            throw new ObjectDisposedException(nameof(buffer),
+                "GPU buffer was released before its in-place upload.");
         if (data.Length > buffer.Size)
             throw new ArgumentException($"Host data ({data.Length}) exceeds buffer ({buffer.Size}).");
         using var _ = PushContext();
@@ -3536,6 +3574,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                 CuBlasNative.cuMemcpyHtoD(buffer.Handle, (IntPtr)src, byteSize),
                 "cuMemcpyHtoD(embedding index refresh in-place)");
     }
+
 
     /// <inheritdoc/>
     public unsafe void UploadBufferAsync(ReadOnlySpan<float> data, IGpuBuffer buffer, IGpuStream stream)
@@ -3994,6 +4033,52 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         args[2] = &r;
         args[3] = &c;
         LaunchKernel2D(kernel, gridX, gridY, DefaultBlockSize, 1, args);
+    }
+
+    // CUDA's "current context" is PER-THREAD: cuCtxCreate makes the context current only on the
+    // CREATING thread. This backend otherwise never re-establishes it, so every native call assumes
+    // it runs on that thread. Under xUnit's parallel / thread-pooled test execution (and any caller
+    // that drives a GPU op from a different thread than the one that built the engine), the executing
+    // thread may have NO context — or a DIFFERENT engine's context — current, so cuLaunchKernel /
+    // cuMemcpy / cuMemAlloc operate on the wrong context and fault with an uncatchable 0xC0000005.
+    // Re-assert this engine's context on the calling thread before native work. cuCtxSetCurrent is a
+    // cheap per-thread driver call (no cross-thread effect); skipped once the context is torn down.
+    internal void EnsureContextCurrent()
+    {
+        IntPtr ctx = _cudaContext;
+        if (ctx != IntPtr.Zero && !IsRuntimeTearingDown && LiveContexts.ContainsKey(ctx))
+            CudaNativeBindings.cuCtxSetCurrent(ctx);
+        DrainPendingFinalizerFrees();
+    }
+
+    // Device frees DEFERRED from buffer FINALIZERS. Calling the CUDA driver (cuCtxPushCurrent /
+    // cuMemFree) from the GC finalizer thread races with op threads' driver entry and faults with an
+    // uncatchable 0xC0000005 under the heavy GC the full test suite produces (DirectGpu-only, with low
+    // GC, never crashes). Instead the finalizer just enqueues the pointer, and the free runs here on a
+    // real op thread (with this engine's context current) at the next GPU op. A pending entry whose
+    // context was meanwhile destroyed is dropped — cuCtxDestroy already reclaimed that memory.
+    internal static readonly ConcurrentQueue<(IntPtr Ptr, IntPtr Ctx, IntPtr Stream)> PendingFinalizerFrees = new();
+
+    internal static void DrainPendingFinalizerFrees()
+    {
+        while (PendingFinalizerFrees.TryDequeue(out var f))
+        {
+            if (f.Ptr == IntPtr.Zero) continue;
+            lock (ContextLifecycleLock)
+            {
+                if (f.Ctx == IntPtr.Zero || IsRuntimeTearingDown || ProcessExiting
+                    || !LiveContexts.ContainsKey(f.Ctx))
+                    continue; // context gone — its device memory was reclaimed by cuCtxDestroy
+                try
+                {
+                    CuBlasNative.cuCtxPushCurrent(f.Ctx);
+                    if (f.Stream != IntPtr.Zero) CuBlasNative.cuMemFreeAsync(f.Ptr, f.Stream);
+                    else CuBlasNative.cuMemFree(f.Ptr);
+                    CuBlasNative.cuCtxPopCurrent(out _);
+                }
+                catch { }
+            }
+        }
     }
 
     private unsafe void LaunchKernel(IntPtr kernel, uint gridX, uint blockX, void** args)
@@ -5369,6 +5454,15 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
         if (!_kernelCache.TryGetValue("maxpool2d_backward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: maxpool2d_backward");
+
+        // The non-deterministic kernel SCATTERS via atomicAdd to max cells only — non-max cells get no
+        // write, so gradInput must read as zero. AllocateBuffer zeroes it via a null-stream cuMemsetD32,
+        // which is NOT ordered against this kernel's non-blocking compute stream and can lag under load
+        // (the deterministic kernel sidesteps this by assigning every cell; this scatter cannot). Zero
+        // it again STREAM-ORDERED on _stream so the memset strictly precedes the kernel, no host sync.
+        CuBlasNative.CheckCudaResult(
+            CudaNativeBindings.cuMemsetD8Async(gradInPtr, 0, (ulong)((long)gradInput.Size * sizeof(float)), _stream),
+            "cuMemsetD8Async(maxpool2d_backward gradInput)");
 
         uint gridX = (uint)((outWidth + blockSize - 1) / blockSize);
         uint gridY = (uint)((outHeight + blockSize - 1) / blockSize);
@@ -9805,6 +9899,406 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
+    // IEEE classify (isnan/isinf/isfinite): a real CUDA kernel (bit-pattern, like the OpenCL
+    // classify_float) is a HW-validation follow-up; the engine catches this and falls back to the
+    // correct CPU path until then.
+    public unsafe void ClassifyFloat(IGpuBuffer A, IGpuBuffer C, int mode, int size)
+    {
+        var kernel = ResolveParity210Kernel("parity210_classify_float");
+        using var _ = PushContext();
+        int __total = size; if (__total <= 0) return;
+        uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = A.Handle; IntPtr la1 = C.Handle; int la2 = mode; int la3 = size;
+        void** args = stackalloc void*[4];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3;
+        LaunchKernel(kernel, gsz, DefaultBlockSize, args);
+    }
+    public unsafe void TakeAlongDim(IGpuBuffer input, IGpuBuffer indices, IGpuBuffer output, int outerSize, int axisOut, int innerSize, int axisIn)
+    {
+        var kernel = ResolveParity210Kernel("parity210_take_along_dim_f");
+        using var _ = PushContext();
+        int __total = outerSize*axisOut*innerSize; if (__total <= 0) return;
+        uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = input.Handle; IntPtr la1 = indices.Handle; IntPtr la2 = output.Handle; int la3 = outerSize; int la4 = axisOut; int la5 = innerSize; int la6 = axisIn;
+        void** args = stackalloc void*[7];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5; args[6] = &la6;
+        LaunchKernel(kernel, gsz, DefaultBlockSize, args);
+    }
+    public unsafe void Cross3(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int outerSize, int innerSize)
+    {
+        var kernel = ResolveParity210Kernel("parity210_cross3");
+        using var _ = PushContext();
+        int __total = outerSize*innerSize; if (__total <= 0) return;
+        uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = a.Handle; IntPtr la1 = b.Handle; IntPtr la2 = output.Handle; int la3 = outerSize; int la4 = innerSize;
+        void** args = stackalloc void*[5];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4;
+        LaunchKernel(kernel, gsz, DefaultBlockSize, args);
+    }
+    public unsafe void Ldexp(IGpuBuffer input, IGpuBuffer exponents, IGpuBuffer output, int size)
+    {
+        var kernel = ResolveParity210Kernel("parity210_ldexp");
+        using var _ = PushContext();
+        int __total = size; if (__total <= 0) return;
+        uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = input.Handle; IntPtr la1 = exponents.Handle; IntPtr la2 = output.Handle; int la3 = size;
+        void** args = stackalloc void*[4];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3;
+        LaunchKernel(kernel, gsz, DefaultBlockSize, args);
+    }
+    public unsafe void Kron2D(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int am, int an, int bp, int bq)
+    {
+        var kernel = ResolveParity210Kernel("parity210_kron2d");
+        using var _ = PushContext();
+        int __total = (am*bp)*(an*bq); if (__total <= 0) return;
+        uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = a.Handle; IntPtr la1 = b.Handle; IntPtr la2 = output.Handle; int la3 = am; int la4 = an; int la5 = bp; int la6 = bq;
+        void** args = stackalloc void*[7];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5; args[6] = &la6;
+        LaunchKernel(kernel, gsz, DefaultBlockSize, args);
+    }
+    public unsafe void SearchSorted(IGpuBuffer sortedSeq, IGpuBuffer values, IGpuBuffer output, int seqLen, int numValues, int right)
+    {
+        var kernel = ResolveParity210Kernel("parity210_search_sorted");
+        using var _ = PushContext();
+        int __total = numValues; if (__total <= 0) return;
+        uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = sortedSeq.Handle; IntPtr la1 = values.Handle; IntPtr la2 = output.Handle; int la3 = seqLen; int la4 = numValues; int la5 = right;
+        void** args = stackalloc void*[6];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5;
+        LaunchKernel(kernel, gsz, DefaultBlockSize, args);
+    }
+    public unsafe void NextAfter(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int size)
+    {
+        var kernel = ResolveParity210Kernel("parity210_next_after");
+        using var _ = PushContext();
+        int __total = size; if (__total <= 0) return;
+        uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = a.Handle; IntPtr la1 = b.Handle; IntPtr la2 = output.Handle; int la3 = size;
+        void** args = stackalloc void*[4];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3;
+        LaunchKernel(kernel, gsz, DefaultBlockSize, args);
+    }
+    public unsafe void IndexWrite(IGpuBuffer output, IGpuBuffer indices, IGpuBuffer source, float fillValue, int mode, int outerSize, int idxAxis, int innerSize, int dstAxis)
+    {
+        var kernel = ResolveParity210Kernel("parity210_index_write");
+        using var _ = PushContext();
+        int __total = outerSize*idxAxis*innerSize; if (__total <= 0) return;
+        uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = output.Handle; IntPtr la1 = indices.Handle; IntPtr la2 = source.Handle; float la3 = fillValue; int la4 = mode; int la5 = outerSize; int la6 = idxAxis; int la7 = innerSize; int la8 = dstAxis;
+        void** args = stackalloc void*[9];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5; args[6] = &la6; args[7] = &la7; args[8] = &la8;
+        LaunchKernel(kernel, gsz, DefaultBlockSize, args);
+    }
+    public unsafe void CDist(IGpuBuffer x1, IGpuBuffer x2, IGpuBuffer output, int m, int n, int d, float p)
+    {
+        var kernel = ResolveParity210Kernel("parity210_cdist");
+        using var _ = PushContext();
+        int __total = m*n; if (__total <= 0) return;
+        uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = x1.Handle; IntPtr la1 = x2.Handle; IntPtr la2 = output.Handle; int la3 = m; int la4 = n; int la5 = d; float la6 = p;
+        void** args = stackalloc void*[7];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5; args[6] = &la6;
+        LaunchKernel(kernel, gsz, DefaultBlockSize, args);
+    }
+    public unsafe void PDist(IGpuBuffer input, IGpuBuffer output, int n, int d, float p)
+    {
+        var kernel = ResolveParity210Kernel("parity210_pdist");
+        using var _ = PushContext();
+        int __total = n*n; if (__total <= 0) return;
+        uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = input.Handle; IntPtr la1 = output.Handle; int la2 = n; int la3 = d; float la4 = p;
+        void** args = stackalloc void*[5];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4;
+        LaunchKernel(kernel, gsz, DefaultBlockSize, args);
+    }
+    public unsafe void Histc(IGpuBuffer input, IGpuBuffer hist, int n, int bins, float mn, float mx)
+    {
+        var kernel = ResolveParity210Kernel("parity210_histc");
+        using var _ = PushContext();
+        int __total = n; if (__total <= 0) return;
+        uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = input.Handle; IntPtr la1 = hist.Handle; int la2 = n; int la3 = bins; float la4 = mn; float la5 = mx;
+        void** args = stackalloc void*[6];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5;
+        LaunchKernel(kernel, gsz, DefaultBlockSize, args);
+    }
+    public unsafe void BitonicStep(IGpuBuffer values, IGpuBuffer indices, int rowLen, int k, int j, int numRows, int descending)
+    {
+        var kernel = ResolveParity210Kernel("parity210_bitonic_step");
+        using var _ = PushContext();
+        int __total = numRows*rowLen; if (__total <= 0) return;
+        uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = values.Handle; IntPtr la1 = indices.Handle; int la2 = rowLen; int la3 = k; int la4 = j; int la5 = numRows; int la6 = descending;
+        void** args = stackalloc void*[7];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5; args[6] = &la6;
+        LaunchKernel(kernel, gsz, DefaultBlockSize, args);
+    }
+    public unsafe void CopyRows(IGpuBuffer src, IGpuBuffer dst, int srcRowLen, int dstRowLen, int numRows, int copyLen)
+    {
+        var kernel = ResolveParity210Kernel("parity210_copy_rows");
+        using var _ = PushContext();
+        int __total = numRows*copyLen; if (__total <= 0) return;
+        uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = src.Handle; IntPtr la1 = dst.Handle; int la2 = srcRowLen; int la3 = dstRowLen; int la4 = numRows; int la5 = copyLen;
+        void** args = stackalloc void*[6];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5;
+        LaunchKernel(kernel, gsz, DefaultBlockSize, args);
+    }
+    public unsafe void IotaPad(IGpuBuffer idx, int l, int p, int numRows)
+    {
+        var kernel = ResolveParity210Kernel("parity210_iota_pad");
+        using var _ = PushContext();
+        int __total = numRows*p; if (__total <= 0) return;
+        uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = idx.Handle; int la1 = l; int la2 = p; int la3 = numRows;
+        void** args = stackalloc void*[4];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3;
+        LaunchKernel(kernel, gsz, DefaultBlockSize, args);
+    }
+    public unsafe void Rwkv7Forward(IGpuBuffer r, IGpuBuffer k, IGpuBuffer v, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, IGpuBuffer sbuf, int batch, int seqLen, int modelDim, int numHeads, int headDim)
+    {
+        var kernel = ResolveParity210Kernel("parity210_rwkv7_forward");
+        using var _ = PushContext();
+        int __total = batch*numHeads; if (__total <= 0) return;
+        uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = r.Handle; IntPtr la1 = k.Handle; IntPtr la2 = v.Handle; IntPtr la3 = a.Handle; IntPtr la4 = b.Handle; IntPtr la5 = output.Handle; IntPtr la6 = sbuf.Handle; int la7 = batch; int la8 = seqLen; int la9 = modelDim; int la10 = numHeads; int la11 = headDim;
+        void** args = stackalloc void*[12];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5; args[6] = &la6; args[7] = &la7; args[8] = &la8; args[9] = &la9; args[10] = &la10; args[11] = &la11;
+        LaunchKernel(kernel, gsz, DefaultBlockSize, args);
+    }
+    public unsafe void HierarchicalSoftmaxPaths(IGpuBuffer acts, IGpuBuffer output, int rows, int treeDepth, int numClasses)
+    {
+        var kernel = ResolveParity210Kernel("parity210_hsoftmax_paths");
+        using var _ = PushContext();
+        int __total = rows*numClasses; if (__total <= 0) return;
+        uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = acts.Handle; IntPtr la1 = output.Handle; int la2 = rows; int la3 = treeDepth; int la4 = numClasses;
+        void** args = stackalloc void*[5];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4;
+        LaunchKernel(kernel, gsz, DefaultBlockSize, args);
+    }
+    public unsafe void IsIn(IGpuBuffer elements, IGpuBuffer sortedTest, IGpuBuffer mask, int numElements, int testLen)
+    {
+        var kernel = ResolveParity210Kernel("parity210_isin");
+        using var _ = PushContext();
+        int __total = numElements; if (__total <= 0) return;
+        uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = elements.Handle; IntPtr la1 = sortedTest.Handle; IntPtr la2 = mask.Handle; int la3 = numElements; int la4 = testLen;
+        void** args = stackalloc void*[5];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4;
+        LaunchKernel(kernel, gsz, DefaultBlockSize, args);
+    }
+    public unsafe void CopyBlock2D(IGpuBuffer block, IGpuBuffer output, int blockRows, int blockCols, int totalCols, int rowOff, int colOff)
+    {
+        var kernel = ResolveParity210Kernel("parity210_copy_block_2d");
+        using var _ = PushContext();
+        int __total = blockRows*blockCols; if (__total <= 0) return;
+        uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = block.Handle; IntPtr la1 = output.Handle; int la2 = blockRows; int la3 = blockCols; int la4 = totalCols; int la5 = rowOff; int la6 = colOff;
+        void** args = stackalloc void*[7];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5; args[6] = &la6;
+        LaunchKernel(kernel, gsz, DefaultBlockSize, args);
+    }
+    public unsafe void Zeta(IGpuBuffer x, IGpuBuffer q, IGpuBuffer output, int size)
+    {
+        var kernel = ResolveParity210Kernel("parity210_zeta");
+        using var _ = PushContext();
+        int __total = size; if (__total <= 0) return;
+        uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = x.Handle; IntPtr la1 = q.Handle; IntPtr la2 = output.Handle; int la3 = size;
+        void** args = stackalloc void*[4];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3;
+        LaunchKernel(kernel, gsz, DefaultBlockSize, args);
+    }
+    public unsafe void Polygamma(IGpuBuffer x, IGpuBuffer output, int n, int size)
+    {
+        var kernel = ResolveParity210Kernel("parity210_polygamma");
+        using var _ = PushContext();
+        int __total = size; if (__total <= 0) return;
+        uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = x.Handle; IntPtr la1 = output.Handle; int la2 = n; int la3 = size;
+        void** args = stackalloc void*[4];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3;
+        LaunchKernel(kernel, gsz, DefaultBlockSize, args);
+    }
+    public unsafe void ShiftedDiff(IGpuBuffer x, IGpuBuffer mask, int n)
+    {
+        var kernel = ResolveParity210Kernel("parity210_shifted_diff");
+        using var _ = PushContext();
+        int __total = n; if (__total <= 0) return;
+        uint grid = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = x.Handle; IntPtr la1 = mask.Handle; int la2 = n;
+        void** args = stackalloc void*[3];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+    public unsafe void ReflectPad1d(IGpuBuffer input, IGpuBuffer output, int batch, int l, int lp, int pad)
+    {
+        var kernel = ResolveParity210Kernel("parity210_reflect_pad_1d");
+        using var _ = PushContext();
+        int __total = batch*lp; if (__total <= 0) return;
+        uint grid = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = input.Handle; IntPtr la1 = output.Handle; int la2 = batch; int la3 = l; int la4 = lp; int la5 = pad;
+        void** args = stackalloc void*[6];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+    public unsafe void StftMagPhase(IGpuBuffer padded, IGpuBuffer window, IGpuBuffer mag, IGpuBuffer phase, int batch, int lp, int nFft, int hop, int numFrames, int numFreqs)
+    {
+        var kernel = ResolveParity210Kernel("parity210_stft_mag_phase");
+        using var _ = PushContext();
+        int __total = batch*numFreqs*numFrames; if (__total <= 0) return;
+        uint grid = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = padded.Handle; IntPtr la1 = window.Handle; IntPtr la2 = mag.Handle; IntPtr la3 = phase.Handle; int la4 = batch; int la5 = lp; int la6 = nFft; int la7 = hop; int la8 = numFrames; int la9 = numFreqs;
+        void** args = stackalloc void*[10];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5; args[6] = &la6; args[7] = &la7; args[8] = &la8; args[9] = &la9;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+    public unsafe void PhaseVocoder(IGpuBuffer mag, IGpuBuffer phase, IGpuBuffer newMag, IGpuBuffer newPhase, int leading, int nFramesV, int nFreqV, int outFrames, float rate)
+    {
+        var kernel = ResolveParity210Kernel("parity210_phase_vocoder");
+        using var _ = PushContext();
+        int __total = leading*nFreqV; if (__total <= 0) return;
+        uint grid = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = mag.Handle; IntPtr la1 = phase.Handle; IntPtr la2 = newMag.Handle; IntPtr la3 = newPhase.Handle; int la4 = leading; int la5 = nFramesV; int la6 = nFreqV; int la7 = outFrames; float la8 = rate;
+        void** args = stackalloc void*[9];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5; args[6] = &la6; args[7] = &la7; args[8] = &la8;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+    public unsafe void BuildSpectrum(IGpuBuffer mag, IGpuBuffer phase, IGpuBuffer specRe, IGpuBuffer specIm, int batch, int numFreqs, int numFrames, int nFft)
+    {
+        var kernel = ResolveParity210Kernel("parity210_build_spectrum");
+        using var _ = PushContext();
+        int __total = batch*numFrames; if (__total <= 0) return;
+        uint grid = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = mag.Handle; IntPtr la1 = phase.Handle; IntPtr la2 = specRe.Handle; IntPtr la3 = specIm.Handle; int la4 = batch; int la5 = numFreqs; int la6 = numFrames; int la7 = nFft;
+        void** args = stackalloc void*[8];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5; args[6] = &la6; args[7] = &la7;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+    public unsafe void IstftFromSpectrum(IGpuBuffer specRe, IGpuBuffer specIm, IGpuBuffer window, IGpuBuffer result, IGpuBuffer windowSum, int batch, int numFrames, int nFft, int hop, int outputLength, int center)
+    {
+        var kernel = ResolveParity210Kernel("parity210_istft_from_spectrum");
+        using var _ = PushContext();
+        int __total = batch*numFrames*nFft; if (__total <= 0) return;
+        uint grid = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = specRe.Handle; IntPtr la1 = specIm.Handle; IntPtr la2 = window.Handle; IntPtr la3 = result.Handle; IntPtr la4 = windowSum.Handle; int la5 = batch; int la6 = numFrames; int la7 = nFft; int la8 = hop; int la9 = outputLength; int la10 = center;
+        void** args = stackalloc void*[11];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5; args[6] = &la6; args[7] = &la7; args[8] = &la8; args[9] = &la9; args[10] = &la10;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+    public unsafe void IstftNormalize(IGpuBuffer result, IGpuBuffer windowSum, int total)
+    {
+        var kernel = ResolveParity210Kernel("parity210_istft_normalize");
+        using var _ = PushContext();
+        int __total = total; if (__total <= 0) return;
+        uint grid = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = result.Handle; IntPtr la1 = windowSum.Handle; int la2 = total;
+        void** args = stackalloc void*[3];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+    public unsafe void HistogramDD(IGpuBuffer samples, IGpuBuffer hist, IGpuBuffer bins, IGpuBuffer mins, IGpuBuffer maxs, int n, int d)
+    {
+        var kernel = ResolveParity210Kernel("parity210_histogramdd");
+        using var _ = PushContext();
+        int __total = n; if (__total <= 0) return;
+        uint grid = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = samples.Handle; IntPtr la1 = hist.Handle; IntPtr la2 = bins.Handle; IntPtr la3 = mins.Handle; IntPtr la4 = maxs.Handle; int la5 = n; int la6 = d;
+        void** args = stackalloc void*[7];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5; args[6] = &la6;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+    public unsafe void MasksToBoxes(IGpuBuffer masks, IGpuBuffer output, int n, int h, int w)
+    {
+        var kernel = ResolveParity210Kernel("parity210_masks_to_boxes");
+        using var _ = PushContext();
+        int __total = n; if (__total <= 0) return;
+        uint grid = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = masks.Handle; IntPtr la1 = output.Handle; int la2 = n; int la3 = h; int la4 = w;
+        void** args = stackalloc void*[5];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+    public unsafe void PairwiseIou(IGpuBuffer boxes, IGpuBuffer iou, int n)
+    {
+        var kernel = ResolveParity210Kernel("parity210_pairwise_iou");
+        using var _ = PushContext();
+        int __total = n*n; if (__total <= 0) return;
+        uint grid = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = boxes.Handle; IntPtr la1 = iou.Handle; int la2 = n;
+        void** args = stackalloc void*[3];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+    public unsafe void LogicalOp(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int mode, int n)
+    {
+        var kernel = ResolveParity210Kernel("parity210_logical_op");
+        using var _ = PushContext();
+        int __total = n; if (__total <= 0) return;
+        uint grid = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = a.Handle; IntPtr la1 = b.Handle; IntPtr la2 = output.Handle; int la3 = mode; int la4 = n;
+        void** args = stackalloc void*[5];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+    public unsafe void LogicalNot(IGpuBuffer a, IGpuBuffer output, int n)
+    {
+        var kernel = ResolveParity210Kernel("parity210_logical_not");
+        using var _ = PushContext();
+        int __total = n; if (__total <= 0) return;
+        uint grid = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = a.Handle; IntPtr la1 = output.Handle; int la2 = n;
+        void** args = stackalloc void*[3];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+    public unsafe void GridSampleBackwardInputNhwc(IGpuBuffer gradOut, IGpuBuffer grid, IGpuBuffer gradIn, int batch, int h, int w, int c, int outH, int outW)
+    {
+        var kernel = ResolveParity210Kernel("parity210_gridsample_backward_input");
+        using var _ = PushContext();
+        int __total = batch*outH*outW*c; if (__total <= 0) return;
+        uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = gradOut.Handle; IntPtr la1 = grid.Handle; IntPtr la2 = gradIn.Handle; int la3 = batch; int la4 = h; int la5 = w; int la6 = c; int la7 = outH; int la8 = outW;
+        void** args = stackalloc void*[9];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5; args[6] = &la6; args[7] = &la7; args[8] = &la8;
+        LaunchKernel(kernel, gsz, DefaultBlockSize, args);
+    }
+    public unsafe void GridSampleBackwardGridNhwc(IGpuBuffer gradOut, IGpuBuffer input, IGpuBuffer grid, IGpuBuffer gradGrid, int batch, int h, int w, int c, int outH, int outW)
+    {
+        var kernel = ResolveParity210Kernel("parity210_gridsample_backward_grid");
+        using var _ = PushContext();
+        int __total = batch*outH*outW; if (__total <= 0) return;
+        uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = gradOut.Handle; IntPtr la1 = input.Handle; IntPtr la2 = grid.Handle; IntPtr la3 = gradGrid.Handle; int la4 = batch; int la5 = h; int la6 = w; int la7 = c; int la8 = outH; int la9 = outW;
+        void** args = stackalloc void*[10];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5; args[6] = &la6; args[7] = &la7; args[8] = &la8; args[9] = &la9;
+        LaunchKernel(kernel, gsz, DefaultBlockSize, args);
+    }
+    public unsafe void ScatterReduce(IGpuBuffer output, IGpuBuffer source, IGpuBuffer index, int outerSize, int srcDim, int dstDim, int innerSize, int mode)
+    {
+        var kernel = ResolveParity210Kernel("parity210_scatter_reduce");
+        using var _ = PushContext();
+        int __total = outerSize*srcDim*innerSize; if (__total <= 0) return;
+        uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = output.Handle; IntPtr la1 = source.Handle; IntPtr la2 = index.Handle; int la3 = outerSize; int la4 = srcDim; int la5 = dstDim; int la6 = innerSize; int la7 = mode;
+        void** args = stackalloc void*[8];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5; args[6] = &la6; args[7] = &la7;
+        LaunchKernel(kernel, gsz, DefaultBlockSize, args);
+    }
+    public unsafe void Unfold(IGpuBuffer src, IGpuBuffer dst, int outerSize, int dimSize, int innerSize, int nWindows, int size, int step)
+    {
+        var kernel = ResolveParity210Kernel("parity210_unfold");
+        using var _ = PushContext();
+        int __total = outerSize*nWindows*innerSize*size; if (__total <= 0) return;
+        uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = src.Handle; IntPtr la1 = dst.Handle; int la2 = outerSize; int la3 = dimSize; int la4 = innerSize; int la5 = nWindows; int la6 = size; int la7 = step;
+        void** args = stackalloc void*[8];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5; args[6] = &la6; args[7] = &la7;
+        LaunchKernel(kernel, gsz, DefaultBlockSize, args);
+    }
+
     public unsafe void Equal(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
     {
         if (!_kernelCache.TryGetValue("equal", out var kernel))
@@ -13726,8 +14220,16 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
         if (_cudaContext != IntPtr.Zero)
         {
-            CuBlasNative.cuCtxDestroy(_cudaContext);
-            _cudaContext = IntPtr.Zero;
+            // Unregister + destroy under the lifecycle lock so a concurrent buffer finalizer can't
+            // observe the context as live and then fault on it after we destroy it (TOCTOU). A buffer
+            // finalized after this point sees it gone and skips its native free (cuCtxDestroy reclaims
+            // that memory anyway).
+            lock (ContextLifecycleLock)
+            {
+                LiveContexts.TryRemove(_cudaContext, out _);
+                CuBlasNative.cuCtxDestroy(_cudaContext);
+                _cudaContext = IntPtr.Zero;
+            }
         }
 
         GC.SuppressFinalize(this);
@@ -14499,21 +15001,26 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                 // Skip the native free at process exit (the driver is gone — any native CUDA
                 // call FATAL-crashes, uncatchable); otherwise free, suppressing any disposal
                 // error so a finalizer can't crash.
-                if (_context != IntPtr.Zero && !ProcessExiting)
+                // Hold the lifecycle lock across the live-check + free so a concurrent engine Dispose
+                // can't cuCtxDestroy this context between the check and the cuCtxPushCurrent/free.
+                lock (ContextLifecycleLock)
                 {
-                    try
+                    if (_context != IntPtr.Zero && !ProcessExiting && LiveContexts.ContainsKey(_context))
                     {
-                        CuBlasNative.cuCtxPushCurrent(_context);
-                        // Stream-ordered free (#558 layer 6): race-safe + pool-reused in stream order.
-                        if (_asyncFreeStream != IntPtr.Zero)
-                            CuBlasNative.cuMemFreeAsync(_devicePtr, _asyncFreeStream);
-                        else
-                            CuBlasNative.cuMemFree(_devicePtr);
-                        CuBlasNative.cuCtxPopCurrent(out _);
-                    }
-                    catch
-                    {
-                        // Suppress disposal errors to avoid crashing finalizers.
+                        try
+                        {
+                            CuBlasNative.cuCtxPushCurrent(_context);
+                            // Stream-ordered free (#558 layer 6): race-safe + pool-reused in stream order.
+                            if (_asyncFreeStream != IntPtr.Zero)
+                                CuBlasNative.cuMemFreeAsync(_devicePtr, _asyncFreeStream);
+                            else
+                                CuBlasNative.cuMemFree(_devicePtr);
+                            CuBlasNative.cuCtxPopCurrent(out _);
+                        }
+                        catch
+                        {
+                            // Suppress disposal errors to avoid crashing finalizers.
+                        }
                     }
                 }
             }
@@ -14547,7 +15054,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
         ~CudaGpuBuffer()
         {
-            Release();
+            // NEVER call the CUDA driver on the GC finalizer thread (races with op threads →
+            // 0xC0000005). Defer the device free to a real op thread via the pending-free queue.
+            var ptr = _devicePtr;
+            if (ptr != IntPtr.Zero && !IsRuntimeTearingDown && !ProcessExiting)
+                PendingFinalizerFrees.Enqueue((ptr, _context, _asyncFreeStream));
+            _devicePtr = IntPtr.Zero;
+            _context = IntPtr.Zero;
         }
     }
 
@@ -14583,21 +15096,26 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                 // Skip the native free at process exit (the driver is gone — any native CUDA
                 // call FATAL-crashes, uncatchable); otherwise free, suppressing any disposal
                 // error so a finalizer can't crash.
-                if (_context != IntPtr.Zero && !ProcessExiting)
+                // Hold the lifecycle lock across the live-check + free so a concurrent engine Dispose
+                // can't cuCtxDestroy this context between the check and the cuCtxPushCurrent/free.
+                lock (ContextLifecycleLock)
                 {
-                    try
+                    if (_context != IntPtr.Zero && !ProcessExiting && LiveContexts.ContainsKey(_context))
                     {
-                        CuBlasNative.cuCtxPushCurrent(_context);
-                        // Stream-ordered free (#558 layer 6): race-safe + pool-reused in stream order.
-                        if (_asyncFreeStream != IntPtr.Zero)
-                            CuBlasNative.cuMemFreeAsync(_devicePtr, _asyncFreeStream);
-                        else
-                            CuBlasNative.cuMemFree(_devicePtr);
-                        CuBlasNative.cuCtxPopCurrent(out _);
-                    }
-                    catch
-                    {
-                        // Suppress disposal errors to avoid crashing finalizers.
+                        try
+                        {
+                            CuBlasNative.cuCtxPushCurrent(_context);
+                            // Stream-ordered free (#558 layer 6): race-safe + pool-reused in stream order.
+                            if (_asyncFreeStream != IntPtr.Zero)
+                                CuBlasNative.cuMemFreeAsync(_devicePtr, _asyncFreeStream);
+                            else
+                                CuBlasNative.cuMemFree(_devicePtr);
+                            CuBlasNative.cuCtxPopCurrent(out _);
+                        }
+                        catch
+                        {
+                            // Suppress disposal errors to avoid crashing finalizers.
+                        }
                     }
                 }
             }
@@ -14609,7 +15127,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
         ~CudaGpuByteBuffer()
         {
-            Dispose();
+            // NEVER call the CUDA driver on the GC finalizer thread — defer the device free to a real
+            // op thread via the pending-free queue (see CudaBackend.PendingFinalizerFrees).
+            var ptr = _devicePtr;
+            if (ptr != IntPtr.Zero && !IsRuntimeTearingDown && !ProcessExiting)
+                PendingFinalizerFrees.Enqueue((ptr, _context, _asyncFreeStream));
+            _devicePtr = IntPtr.Zero;
+            _context = IntPtr.Zero;
         }
     }
 }

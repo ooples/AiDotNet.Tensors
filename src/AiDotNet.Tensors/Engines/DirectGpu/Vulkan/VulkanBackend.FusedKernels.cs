@@ -70,6 +70,224 @@ public sealed partial class VulkanBackend
 
     public void EqualsKernel(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int sz) => GlslBinaryOp(VulkanGlslKernels.EqualsKernel, a, b, o, sz, new uint[] { (uint)sz }, sizeof(uint));
     public void NotEqualsKernel(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int sz) => GlslBinaryOp(VulkanGlslKernels.NotEqualsKernel, a, b, o, sz, new uint[] { (uint)sz }, sizeof(uint));
+    // IEEE classify (isnan/isinf/isfinite): a real Vulkan GLSL/SPIR-V kernel is a HW-validation
+    // follow-up; the engine catches this and falls back to the correct CPU path until then.
+    public void ClassifyFloat(IGpuBuffer A, IGpuBuffer C, int mode, int size)
+    {
+        GlslDispatchN(VulkanAuditKernels.ClassifyFloat, size,
+            new IGpuBuffer[] { A, C },
+            new uint[] { (uint)mode, (uint)size });
+    }
+    public void TakeAlongDim(IGpuBuffer input, IGpuBuffer indices, IGpuBuffer output, int outerSize, int axisOut, int innerSize, int axisIn)
+    {
+        GlslDispatchN(VulkanAuditKernels.TakeAlongDimF, outerSize*axisOut*innerSize,
+            new IGpuBuffer[] { input, indices, output },
+            new uint[] { (uint)outerSize, (uint)axisOut, (uint)innerSize, (uint)axisIn });
+    }
+    public void Cross3(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int outerSize, int innerSize)
+    {
+        GlslDispatchN(VulkanAuditKernels.Cross3, outerSize*innerSize,
+            new IGpuBuffer[] { a, b, output },
+            new uint[] { (uint)outerSize, (uint)innerSize });
+    }
+    public void Ldexp(IGpuBuffer input, IGpuBuffer exponents, IGpuBuffer output, int size)
+    {
+        GlslDispatchN(VulkanAuditKernels.Ldexp, size,
+            new IGpuBuffer[] { input, exponents, output },
+            new uint[] { (uint)size });
+    }
+    public void Kron2D(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int am, int an, int bp, int bq)
+    {
+        GlslDispatchN(VulkanAuditKernels.Kron2d, (am*bp)*(an*bq),
+            new IGpuBuffer[] { a, b, output },
+            new uint[] { (uint)am, (uint)an, (uint)bp, (uint)bq });
+    }
+    public void SearchSorted(IGpuBuffer sortedSeq, IGpuBuffer values, IGpuBuffer output, int seqLen, int numValues, int right)
+    {
+        GlslDispatchN(VulkanAuditKernels.SearchSorted, numValues,
+            new IGpuBuffer[] { sortedSeq, values, output },
+            new uint[] { (uint)seqLen, (uint)numValues, (uint)right });
+    }
+    public void NextAfter(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int size)
+    {
+        GlslDispatchN(VulkanAuditKernels.NextAfter, size,
+            new IGpuBuffer[] { a, b, output },
+            new uint[] { (uint)size });
+    }
+    public void IndexWrite(IGpuBuffer output, IGpuBuffer indices, IGpuBuffer source, float fillValue, int mode, int outerSize, int idxAxis, int innerSize, int dstAxis)
+    {
+        GlslDispatchN(VulkanAuditKernels.IndexWrite, outerSize*idxAxis*innerSize,
+            new IGpuBuffer[] { output, indices, source },
+            new uint[] { FloatBits(fillValue), (uint)mode, (uint)outerSize, (uint)idxAxis, (uint)innerSize, (uint)dstAxis });
+    }
+    public void CDist(IGpuBuffer x1, IGpuBuffer x2, IGpuBuffer output, int m, int n, int d, float p)
+    {
+        GlslDispatchN(VulkanAuditKernels.Cdist, m*n,
+            new IGpuBuffer[] { x1, x2, output },
+            new uint[] { (uint)m, (uint)n, (uint)d, FloatBits(p) });
+    }
+    public void PDist(IGpuBuffer input, IGpuBuffer output, int n, int d, float p)
+    {
+        GlslDispatchN(VulkanAuditKernels.Pdist, n*n,
+            new IGpuBuffer[] { input, output },
+            new uint[] { (uint)n, (uint)d, FloatBits(p) });
+    }
+    public void Histc(IGpuBuffer input, IGpuBuffer hist, int n, int bins, float mn, float mx)
+    {
+        GlslDispatchN(VulkanAuditKernels.Histc, n,
+            new IGpuBuffer[] { input, hist },
+            new uint[] { (uint)n, (uint)bins, FloatBits(mn), FloatBits(mx) });
+    }
+    public void BitonicStep(IGpuBuffer values, IGpuBuffer indices, int rowLen, int k, int j, int numRows, int descending)
+    {
+        GlslDispatchN(VulkanAuditKernels.BitonicStep, numRows*rowLen,
+            new IGpuBuffer[] { values, indices },
+            new uint[] { (uint)rowLen, (uint)k, (uint)j, (uint)numRows, (uint)descending });
+    }
+    public void CopyRows(IGpuBuffer src, IGpuBuffer dst, int srcRowLen, int dstRowLen, int numRows, int copyLen)
+    {
+        GlslDispatchN(VulkanAuditKernels.CopyRows, numRows*copyLen,
+            new IGpuBuffer[] { src, dst },
+            new uint[] { (uint)srcRowLen, (uint)dstRowLen, (uint)numRows, (uint)copyLen });
+    }
+    public void IotaPad(IGpuBuffer idx, int l, int p, int numRows)
+    {
+        GlslDispatchN(VulkanAuditKernels.IotaPad, numRows*p,
+            new IGpuBuffer[] { idx },
+            new uint[] { (uint)l, (uint)p, (uint)numRows });
+    }
+    public void Rwkv7Forward(IGpuBuffer r, IGpuBuffer k, IGpuBuffer v, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, IGpuBuffer sbuf, int batch, int seqLen, int modelDim, int numHeads, int headDim)
+    {
+        GlslDispatchN(VulkanAuditKernels.Rwkv7Forward, batch*numHeads,
+            new IGpuBuffer[] { r, k, v, a, b, output, sbuf },
+            new uint[] { (uint)batch, (uint)seqLen, (uint)modelDim, (uint)numHeads, (uint)headDim });
+    }
+    public void HierarchicalSoftmaxPaths(IGpuBuffer acts, IGpuBuffer output, int rows, int treeDepth, int numClasses)
+    {
+        GlslDispatchN(VulkanAuditKernels.HsoftmaxPaths, rows*numClasses,
+            new IGpuBuffer[] { acts, output },
+            new uint[] { (uint)rows, (uint)treeDepth, (uint)numClasses });
+    }
+    public void IsIn(IGpuBuffer elements, IGpuBuffer sortedTest, IGpuBuffer mask, int numElements, int testLen)
+    {
+        GlslDispatchN(VulkanAuditKernels.Isin, numElements,
+            new IGpuBuffer[] { elements, sortedTest, mask },
+            new uint[] { (uint)numElements, (uint)testLen });
+    }
+    public void CopyBlock2D(IGpuBuffer block, IGpuBuffer output, int blockRows, int blockCols, int totalCols, int rowOff, int colOff)
+    {
+        GlslDispatchN(VulkanAuditKernels.CopyBlock2d, blockRows*blockCols,
+            new IGpuBuffer[] { block, output },
+            new uint[] { (uint)blockRows, (uint)blockCols, (uint)totalCols, (uint)rowOff, (uint)colOff });
+    }
+    public void Zeta(IGpuBuffer x, IGpuBuffer q, IGpuBuffer output, int size)
+    {
+        GlslDispatchN(VulkanAuditKernels.Zeta, size,
+            new IGpuBuffer[] { x, q, output },
+            new uint[] { (uint)size });
+    }
+    public void Polygamma(IGpuBuffer x, IGpuBuffer output, int n, int size)
+    {
+        GlslDispatchN(VulkanAuditKernels.Polygamma, size,
+            new IGpuBuffer[] { x, output },
+            new uint[] { (uint)n, (uint)size });
+    }
+    public void ShiftedDiff(IGpuBuffer x, IGpuBuffer mask, int n)
+    {
+        GlslDispatchN(VulkanAuditKernels.ShiftedDiff, n,
+            new IGpuBuffer[] { x, mask },
+            new uint[] { (uint)n });
+    }
+    public void ReflectPad1d(IGpuBuffer input, IGpuBuffer output, int batch, int l, int lp, int pad)
+    {
+        GlslDispatchN(VulkanAuditKernels.ReflectPad1d, batch*lp,
+            new IGpuBuffer[] { input, output },
+            new uint[] { (uint)batch, (uint)l, (uint)lp, (uint)pad });
+    }
+    public void StftMagPhase(IGpuBuffer padded, IGpuBuffer window, IGpuBuffer mag, IGpuBuffer phase, int batch, int lp, int nFft, int hop, int numFrames, int numFreqs)
+    {
+        GlslDispatchN(VulkanAuditKernels.StftMagPhase, batch*numFreqs*numFrames,
+            new IGpuBuffer[] { padded, window, mag, phase },
+            new uint[] { (uint)batch, (uint)lp, (uint)nFft, (uint)hop, (uint)numFrames, (uint)numFreqs });
+    }
+    public void PhaseVocoder(IGpuBuffer mag, IGpuBuffer phase, IGpuBuffer newMag, IGpuBuffer newPhase, int leading, int nFramesV, int nFreqV, int outFrames, float rate)
+    {
+        GlslDispatchN(VulkanAuditKernels.PhaseVocoder, leading*nFreqV,
+            new IGpuBuffer[] { mag, phase, newMag, newPhase },
+            new uint[] { (uint)leading, (uint)nFramesV, (uint)nFreqV, (uint)outFrames, FloatBits(rate) });
+    }
+    public void BuildSpectrum(IGpuBuffer mag, IGpuBuffer phase, IGpuBuffer specRe, IGpuBuffer specIm, int batch, int numFreqs, int numFrames, int nFft)
+    {
+        GlslDispatchN(VulkanAuditKernels.BuildSpectrum, batch*numFrames,
+            new IGpuBuffer[] { mag, phase, specRe, specIm },
+            new uint[] { (uint)batch, (uint)numFreqs, (uint)numFrames, (uint)nFft });
+    }
+    public void IstftFromSpectrum(IGpuBuffer specRe, IGpuBuffer specIm, IGpuBuffer window, IGpuBuffer result, IGpuBuffer windowSum, int batch, int numFrames, int nFft, int hop, int outputLength, int center)
+    {
+        GlslDispatchN(VulkanAuditKernels.IstftFromSpectrum, batch*numFrames*nFft,
+            new IGpuBuffer[] { specRe, specIm, window, result, windowSum },
+            new uint[] { (uint)batch, (uint)numFrames, (uint)nFft, (uint)hop, (uint)outputLength, (uint)center });
+    }
+    public void IstftNormalize(IGpuBuffer result, IGpuBuffer windowSum, int total)
+    {
+        GlslDispatchN(VulkanAuditKernels.IstftNormalize, total,
+            new IGpuBuffer[] { result, windowSum },
+            new uint[] { (uint)total });
+    }
+    public void HistogramDD(IGpuBuffer samples, IGpuBuffer hist, IGpuBuffer bins, IGpuBuffer mins, IGpuBuffer maxs, int n, int d)
+    {
+        GlslDispatchN(VulkanAuditKernels.Histogramdd, n,
+            new IGpuBuffer[] { samples, hist, bins, mins, maxs },
+            new uint[] { (uint)n, (uint)d });
+    }
+    public void MasksToBoxes(IGpuBuffer masks, IGpuBuffer output, int n, int h, int w)
+    {
+        GlslDispatchN(VulkanAuditKernels.MasksToBoxes, n,
+            new IGpuBuffer[] { masks, output },
+            new uint[] { (uint)n, (uint)h, (uint)w });
+    }
+    public void PairwiseIou(IGpuBuffer boxes, IGpuBuffer iou, int n)
+    {
+        GlslDispatchN(VulkanAuditKernels.PairwiseIou, n*n,
+            new IGpuBuffer[] { boxes, iou },
+            new uint[] { (uint)n });
+    }
+    public void LogicalOp(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int mode, int n)
+    {
+        GlslDispatchN(VulkanAuditKernels.LogicalOp, n,
+            new IGpuBuffer[] { a, b, output },
+            new uint[] { (uint)mode, (uint)n });
+    }
+    public void LogicalNot(IGpuBuffer a, IGpuBuffer output, int n)
+    {
+        GlslDispatchN(VulkanAuditKernels.LogicalNot, n,
+            new IGpuBuffer[] { a, output },
+            new uint[] { (uint)n });
+    }
+    public void GridSampleBackwardInputNhwc(IGpuBuffer gradOut, IGpuBuffer grid, IGpuBuffer gradIn, int batch, int h, int w, int c, int outH, int outW)
+    {
+        GlslDispatchN(VulkanAuditKernels.GridsampleBackwardInput, batch*outH*outW*c,
+            new IGpuBuffer[] { gradOut, grid, gradIn },
+            new uint[] { (uint)batch, (uint)h, (uint)w, (uint)c, (uint)outH, (uint)outW });
+    }
+    public void GridSampleBackwardGridNhwc(IGpuBuffer gradOut, IGpuBuffer input, IGpuBuffer grid, IGpuBuffer gradGrid, int batch, int h, int w, int c, int outH, int outW)
+    {
+        GlslDispatchN(VulkanAuditKernels.GridsampleBackwardGrid, batch*outH*outW,
+            new IGpuBuffer[] { gradOut, input, grid, gradGrid },
+            new uint[] { (uint)batch, (uint)h, (uint)w, (uint)c, (uint)outH, (uint)outW });
+    }
+    public void ScatterReduce(IGpuBuffer output, IGpuBuffer source, IGpuBuffer index, int outerSize, int srcDim, int dstDim, int innerSize, int mode)
+    {
+        GlslDispatchN(VulkanAuditKernels.ScatterReduce, outerSize*srcDim*innerSize,
+            new IGpuBuffer[] { output, source, index },
+            new uint[] { (uint)outerSize, (uint)srcDim, (uint)dstDim, (uint)innerSize, (uint)mode });
+    }
+    public void Unfold(IGpuBuffer src, IGpuBuffer dst, int outerSize, int dimSize, int innerSize, int nWindows, int size, int step)
+    {
+        GlslDispatchN(VulkanAuditKernels.Unfold, outerSize*nWindows*innerSize*size,
+            new IGpuBuffer[] { src, dst },
+            new uint[] { (uint)outerSize, (uint)dimSize, (uint)innerSize, (uint)nWindows, (uint)size, (uint)step });
+    }
 
     #endregion
 

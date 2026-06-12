@@ -41,6 +41,15 @@ public class Parity210HistogramDDTests
     }
 
     [Fact]
+    public void HistogramDD_DropsSampleWithNaNInAnyDim()
+    {
+        // A NaN in any dimension drops the whole sample (matches torch). Only (5,5) is counted.
+        var samples = T(new[] { float.NaN, 5f, 5f, 5f, 5f, float.NaN }, 3, 2);
+        var h = E.TensorHistogramDD(samples, new[] { 2, 2 }, new[] { 0f, 0f }, new[] { 10f, 10f });
+        Assert.Equal(1, h[0, 0] + h[0, 1] + h[1, 0] + h[1, 1]);
+    }
+
+    [Fact]
     public void HistogramDD_WrongLengthArray_Throws()
     {
         var samples = T(new[] { 1f, 1f }, 1, 2);

@@ -106,7 +106,13 @@ extern ""C"" __global__ __launch_bounds__(256) void maxpool2d_backward_determini
             }
         }
     }
-    gradInput[((b * channels + c) * inHeight + ih) * inWidth + iw] += sum;
+    // WRITE (not +=): each thread owns exactly one (b,c,ih,iw) input cell and computes its COMPLETE
+    // gradient in `sum`, so assignment is correct and — unlike +=, which leaves non-max cells holding
+    // whatever stale value the freshly-cuMemAlloc'd buffer carried — it does not depend on gradInput
+    // having been zeroed first. The zeroing (cuMemsetD32 on the null stream) is NOT ordered against
+    // this kernel's non-blocking compute stream, so under load it could lag and += would preserve
+    // garbage (observed: a non-max cell read -1.045 instead of 0). Assignment removes that race.
+    gradInput[((b * channels + c) * inHeight + ih) * inWidth + iw] = sum;
 }
 
 // Average Pooling 2D

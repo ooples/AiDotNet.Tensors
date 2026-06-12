@@ -37,7 +37,7 @@ internal sealed class PersistentParallelExecutor
 
     private PersistentParallelExecutor()
     {
-        _numWorkers = Math.Max(1, Environment.ProcessorCount - 1);
+        _numWorkers = CpuParallelSettings.WorkerPoolThreads;   // capped (was ProcessorCount-1 = ~63 on a 64-core box)
         _workers = new Thread[_numWorkers];
         _workReady = new ManualResetEventSlim[_numWorkers];
 
