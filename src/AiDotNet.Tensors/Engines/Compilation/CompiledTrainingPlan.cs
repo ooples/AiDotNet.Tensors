@@ -441,6 +441,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     // BLAS's raw throughput wins. Mirrors CpuEngine's TensorMatMul2D cutover.
     private const int TrainingSmallMCutover = 1024;
 
+    // Below this M, parallel-dispatch overhead dominates the tiny GEMM, so the direct
+    // single-threaded SimdGemm kernel wins. At/above it (up to TrainingSmallMCutover),
+    // BlasManaged's M-axis-parallel ThinMDirect path beats single-threaded SimdGemm at
+    // the square-ish K=N batch shapes that dominate MLP/FFN training.
+    private const int TrainingParallelMinM = 64;
+
     // read at static init, then a single bool check per Step.
     private static readonly bool _profileStepEnabled =
         System.Environment.GetEnvironmentVariable("AIDOTNET_PROFILE_STEP") == "1";
@@ -2955,7 +2961,25 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             //   * large M: native BLAS raw throughput wins, keep TryGemm.
             return eng =>
             {
-                if (M <= TrainingSmallMCutover)
+                // Pick the kernel by shape — neither is universally best (measured,
+                // CompiledTrainingPlanGemmPerfBench, Ryzen, AIDOTNET_DISABLE_GPU=1):
+                //   * In BlasManaged's M-axis-parallel ThinMDirect range
+                //     (64<=M<=1024, N<=512, K<=1024) it packs B fresh and runs
+                //     535-666 GF/s — vs SimdGemm's single-thread-bound 18-25 GF/s
+                //     at the square-ish K=N=256 batch shapes that dominate MLP/FFN
+                //     training (the compiled forward is 94-99% of an AiDotNet step).
+                //     Fresh pack (no PackedB handle) => it correctly sees in-place
+                //     weight updates (CompiledTrainingPlanRebindingTests.Step_Sees-
+                //     InPlaceParameterUpdates).
+                //   * Outside that range — tall-skinny large-M (M>1024) or small
+                //     K·N — BlasManaged's packed path collapses (~6 GF/s at
+                //     [2048,128]x[128,128]) while SimdGemm hits 600+ GF/s; keep it.
+                if (M >= TrainingParallelMinM && M <= TrainingSmallMCutover && N <= 512 && K <= 1024)
+                    Engines.BlasManaged.BlasManaged.Gemm<float>(
+                        cA.AsSpan(0, M * K), K, false, cB.AsSpan(0, K * N), N, false,
+                        cOut.AsSpan(0, M * N), N, M, N, K,
+                        new Engines.BlasManaged.BlasOptions<float> { PackingMode = Engines.BlasManaged.PackingMode.DisableAutotune });
+                else if (M <= TrainingSmallMCutover)
                     SimdGemm.Sgemm(cA.AsSpan(0, M * K), K, false, cB.AsSpan(0, K * N), N, false,
                                    cOut.AsSpan(0, M * N), M, K, N);
                 else if (!BlasProvider.TryGemm(M, N, K, cA, 0, K, cB, 0, N, cOut, 0, N))
