@@ -210,25 +210,28 @@ internal static class NvrtcNativeBindings
 
     private static INvrtcApi? ResolveApi()
     {
-#if WINDOWS
-        INvrtcApi[] candidates =
-        {
-            new NvrtcApi130(),
-            new NvrtcApi120(),
-            new NvrtcApi12(),
-            new NvrtcApi118(),
-            new NvrtcApi112()
-        };
-#else
-        INvrtcApi[] candidates =
-        {
-            new NvrtcApi130Linux(),
-            new NvrtcApi12(),
-            new NvrtcApi118(),
-            new NvrtcApi11(),
-            new NvrtcApiDefault()
-        };
-#endif
+        // Runtime OS selection (NOT #if): the package ships one assembly for all platforms,
+        // so a compile-time switch bakes in the build machine's OS — a Linux-built package
+        // probed only libnvrtc.so.* on Windows, nvrtc never resolved, and the CUDA backend
+        // silently fell back to OpenCL. Both candidate sets are always compiled; the right
+        // one is chosen on the machine that's actually running.
+        INvrtcApi[] candidates = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+            ? new INvrtcApi[]
+            {
+                new NvrtcApi130(),
+                new NvrtcApi120(),
+                new NvrtcApi12(),
+                new NvrtcApi118(),
+                new NvrtcApi112()
+            }
+            : new INvrtcApi[]
+            {
+                new NvrtcApi130Linux(),
+                new NvrtcApi12Linux(),
+                new NvrtcApi118Linux(),
+                new NvrtcApi11(),
+                new NvrtcApiDefault()
+            };
 
         foreach (var candidate in candidates)
         {
@@ -353,7 +356,7 @@ internal interface INvrtcApi
     IntPtr GetErrorString(NvrtcResult result);
 }
 
-#if WINDOWS
+// Both OS class sets are ALWAYS compiled; ResolveApi selects at runtime (see above).
 internal sealed class NvrtcApi130 : INvrtcApi
 {
     private const string Library = "nvrtc64_130_0";
@@ -653,7 +656,7 @@ internal sealed class NvrtcApi112 : INvrtcApi
     public NvrtcResult DestroyProgram(ref IntPtr prog) => nvrtcDestroyProgram(ref prog);
     public IntPtr GetErrorString(NvrtcResult result) => nvrtcGetErrorString(result);
 }
-#else
+
 internal sealed class NvrtcApi130Linux : INvrtcApi
 {
     private const string Library = "libnvrtc.so.13";
@@ -714,7 +717,7 @@ internal sealed class NvrtcApi130Linux : INvrtcApi
     public IntPtr GetErrorString(NvrtcResult result) => nvrtcGetErrorString(result);
 }
 
-internal sealed class NvrtcApi12 : INvrtcApi
+internal sealed class NvrtcApi12Linux : INvrtcApi
 {
     private const string Library = "libnvrtc.so.12";
 
@@ -774,7 +777,7 @@ internal sealed class NvrtcApi12 : INvrtcApi
     public IntPtr GetErrorString(NvrtcResult result) => nvrtcGetErrorString(result);
 }
 
-internal sealed class NvrtcApi118 : INvrtcApi
+internal sealed class NvrtcApi118Linux : INvrtcApi
 {
     private const string Library = "libnvrtc.so.11.8";
 
@@ -953,4 +956,4 @@ internal sealed class NvrtcApiDefault : INvrtcApi
     public NvrtcResult DestroyProgram(ref IntPtr prog) => nvrtcDestroyProgram(ref prog);
     public IntPtr GetErrorString(NvrtcResult result) => nvrtcGetErrorString(result);
 }
-#endif
+

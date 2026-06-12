@@ -36,7 +36,7 @@
   </PropertyGroup>
 
   <!-- Define WINDOWS for correct DLL names on Windows -->
-  <PropertyGroup Condition="$([MSBuild]::IsOSPlatform('Windows'))">
+  <PropertyGroup Condition="$([MSBuild]::IsOSPlatform('Windows')) or '$(TargetFramework)' == 'net471'">
     <DefineConstants>$(DefineConstants);WINDOWS</DefineConstants>
   </PropertyGroup>
 
