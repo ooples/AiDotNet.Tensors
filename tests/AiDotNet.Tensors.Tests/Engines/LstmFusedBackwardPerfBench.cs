@@ -49,10 +49,20 @@ public class LstmFusedBackwardPerfBench
 
         for (int i = 0; i < 50; i++) Step(); // warm
 
-        long a0 = GC.GetAllocatedBytesForCurrentThread();
+        // GC.GetAllocatedBytesForCurrentThread is netcoreapp3.0+, not on net471.
+        // Fall back to GC.GetTotalMemory on net471 — same shape (relative delta
+        // around the timed loop), coarser absolute number, but the perf-bench
+        // readout is only a diagnostic for the dev box anyway.
         const int allocIters = 100;
+#if NET6_0_OR_GREATER
+        long a0 = GC.GetAllocatedBytesForCurrentThread();
         for (int i = 0; i < allocIters; i++) Step();
         double kbPerStep = (GC.GetAllocatedBytesForCurrentThread() - a0) / 1024.0 / allocIters;
+#else
+        long a0 = GC.GetTotalMemory(forceFullCollection: false);
+        for (int i = 0; i < allocIters; i++) Step();
+        double kbPerStep = (GC.GetTotalMemory(forceFullCollection: false) - a0) / 1024.0 / allocIters;
+#endif
         _o.WriteLine($"alloc/step = {kbPerStep:F1} KB");
 
         const int iters = 500;
