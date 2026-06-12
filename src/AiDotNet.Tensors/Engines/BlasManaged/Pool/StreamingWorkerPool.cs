@@ -34,6 +34,17 @@ internal static class StreamingWorkerPool
     private static int _initialized; // 0 = not started; 1 = workers spawned
     private static readonly object _initLock = new();
 
+    // The pool has ONE shared set of worker slots (_slots) plus _remaining /
+    // _firstException, so only a single dispatch can drive it at a time. The
+    // [ThreadStatic] _isExecuting flag only guards NESTED (same-thread) re-entry;
+    // it does NOT stop a DIFFERENT thread from calling Dispatch concurrently. Two
+    // concurrent GEMMs would otherwise both overwrite _slots and _remaining, so the
+    // workers run a mix of the two actions and write into the wrong output buffers
+    // (observed as large nondeterministic GEMM result drift under a parallel test
+    // suite). Dispatch acquires this lock; a concurrent caller that can't acquire it
+    // runs its chunks serially on itself instead of racing the shared state.
+    private static readonly object _dispatchLock = new();
+
     private static void EnsureInitialized()
     {
         if (Volatile.Read(ref _initialized) == 1) return;
@@ -151,7 +162,15 @@ internal static class StreamingWorkerPool
     public static void Dispatch(int numChunks, Action<int> action)
     {
         if (numChunks <= 0) return;
-        if (numChunks == 1 || _isExecuting)
+        // Run serially on the caller when: a single chunk; this thread is already
+        // driving a dispatch (nested — avoids ThreadPool starvation); or ANOTHER
+        // thread is currently driving the shared worker slots. The last case is the
+        // concurrency fix: the pool has one shared _slots set, so a second concurrent
+        // dispatch must fall back to serial rather than overwrite the in-flight
+        // dispatch's slots (which corrupted both callers' GEMM results).
+        // Monitor.TryEnter is non-blocking, so concurrent GEMMs never deadlock or
+        // stall — at most one runs parallel while the rest run serial.
+        if (numChunks == 1 || _isExecuting || !Monitor.TryEnter(_dispatchLock))
         {
             for (int c = 0; c < numChunks; c++) action(c);
             return;
@@ -214,6 +233,10 @@ internal static class StreamingWorkerPool
             var pooledEx = _firstException ?? callerException;
             if (pooledEx is not null) throw pooledEx;
         }
-        finally { _isExecuting = false; }
+        finally
+        {
+            _isExecuting = false;
+            Monitor.Exit(_dispatchLock);
+        }
     }
 }
