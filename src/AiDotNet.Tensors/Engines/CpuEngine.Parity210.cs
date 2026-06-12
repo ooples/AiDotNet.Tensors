@@ -802,19 +802,23 @@ public partial class CpuEngine
         // FP64 throughput penalty or accept the mismatch).
         if (typeof(T) == typeof(float))
         {
-            var fa = System.Runtime.InteropServices.MemoryMarshal.Cast<T, float>(a);
-            var fb = System.Runtime.InteropServices.MemoryMarshal.Cast<T, float>(b);
+            // Accumulate in float (not double) to match the GPU's fp32 parity210_cdist.
+            // The engine keeps T unconstrained on purpose, so MemoryMarshal.Cast<T,float> is
+            // unavailable (it needs a value-type constraint, CS0453). Convert through the
+            // INumericOperations seam (ops.ToFloat / ops.FromFloat) — the codebase's
+            // constraint-free conversion mechanism — which for typeof(T)==float is the exact
+            // float value with no precision loss.
             float pf = (float)p;
             float sumF = 0f;
             for (int k = 0; k < d; k++)
             {
-                float diff = System.Math.Abs(fa[offA + k] - fb[offB + k]);
+                float diff = System.Math.Abs(ops.ToFloat(a[offA + k]) - ops.ToFloat(b[offB + k]));
                 if (pf == 1f) sumF += diff;
                 else if (pf == 2f) sumF += diff * diff;
                 else sumF += (float)System.Math.Pow(diff, p);
             }
             float resF = pf == 1f ? sumF : pf == 2f ? (float)System.Math.Sqrt(sumF) : (float)System.Math.Pow(sumF, 1.0 / p);
-            return (T)(object)resF;
+            return ops.FromFloat(resF);
         }
 
         // Non-float T (e.g. double) keeps the double-precision path — the
