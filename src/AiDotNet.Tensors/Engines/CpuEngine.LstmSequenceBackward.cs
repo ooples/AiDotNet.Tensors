@@ -64,6 +64,39 @@ public partial class CpuEngine
     }
 
     /// <summary>
+    /// In-place exact sigmoid over <c>buf[off..off+len)</c>: 1/(1+exp(-x)). Uses
+    /// <see cref="SimdKernels.ExpUnsafe"/> (near-exact VML/Herumi vectorized exp on AVX, scalar
+    /// elsewhere) for the expensive transcendental; the cheap negate/reciprocal stay scalar. The
+    /// exp(-x) form is overflow-safe (large |x| → 0 or 1, never NaN). Result matches the scalar
+    /// Math.Exp sigmoid to ~1e-6, so the saved gate values — and the σ(1-σ) gradients computed
+    /// from them — are unchanged within the finite-difference tolerance.
+    /// </summary>
+    private static unsafe void SigmoidExactInPlace(float[] buf, int off, int len)
+    {
+        fixed (float* p = &buf[off])
+        {
+            for (int i = 0; i < len; i++) p[i] = -p[i];
+            SimdKernels.ExpUnsafe(p, p, len);
+            for (int i = 0; i < len; i++) p[i] = 1f / (1f + p[i]);
+        }
+    }
+
+    /// <summary>
+    /// In-place exact tanh over <c>buf[off..off+len)</c> via the overflow-safe identity
+    /// tanh(x) = 2/(1+exp(-2x)) - 1 (no e^{2x}, so large x → ±1, never NaN). Same exp seam and
+    /// ~1e-6 accuracy as <see cref="SigmoidExactInPlace"/>.
+    /// </summary>
+    private static unsafe void TanhExactInPlace(float[] buf, int off, int len)
+    {
+        fixed (float* p = &buf[off])
+        {
+            for (int i = 0; i < len; i++) p[i] = -2f * p[i];
+            SimdKernels.ExpUnsafe(p, p, len);
+            for (int i = 0; i < len; i++) p[i] = 2f / (1f + p[i]) - 1f;
+        }
+    }
+
+    /// <summary>
     /// Float training forward: exact activations, saves per-timestep state, and records
     /// a single fused BPTT node on the active tape. Called from LstmSequenceForward when
     /// a gradient tape is active and T == float.
@@ -193,51 +226,77 @@ public partial class CpuEngine
         for (int b = 0; b < batch; b++)
             Array.Copy(hiddens, b * (seqLen + 1) * hidden, hPrev, b * hidden, hidden);
 
+        // Gate-major activation scratch so each gate's batch*hidden pre-activations are
+        // contiguous for ONE vectorized exact activation call (vs scalar Math.Exp/Tanh per
+        // element, which dominated the cell). act[g*bh + b*hidden + h]; cbuf holds c for tanh(c).
+        int bh = batch * hidden;
+        var act = new float[4 * bh];
+        var cbuf = new float[bh];
+
         for (int t = 0; t < seqLen; t++)
         {
             // hh = h_prev @ wHhT  → [batch, G]
             SimdGemm.SgemmSequential(hPrev.AsSpan(0, batch * hidden), wHhT.AsSpan(0, hidden * G),
                                      hh.AsSpan(0, batch * G), batch, hidden, G);
 
+            // Gather: act[g] = wx + hh (+ bHh), gate-major. Gate order i,f,g(=cell candidate),o.
             for (int b = 0; b < batch; b++)
             {
-                int wxRow = (b * seqLen + t) * G;
-                int hhRow = b * G;
-                int gateRow = (b * seqLen + t) * G;
-                int cPrevRow = (b * (seqLen + 1) + t) * hidden;
-                int cCurRow = (b * (seqLen + 1) + t + 1) * hidden;
-                int outRow = returnSequences ? (b * seqLen + t) * hidden : b * hidden;
-
-                for (int h = 0; h < hidden; h++)
+                int wxBase = (b * seqLen + t) * G;
+                int hhBase = b * G;
+                for (int g = 0; g < 4; g++)
                 {
-                    float iIn = wx[wxRow + 0 * hidden + h] + hh[hhRow + 0 * hidden + h];
-                    float fIn = wx[wxRow + 1 * hidden + h] + hh[hhRow + 1 * hidden + h];
-                    float gIn = wx[wxRow + 2 * hidden + h] + hh[hhRow + 2 * hidden + h];
-                    float oIn = wx[wxRow + 3 * hidden + h] + hh[hhRow + 3 * hidden + h];
+                    int wxg = wxBase + g * hidden, hhg = hhBase + g * hidden, dst = g * bh + b * hidden;
                     if (bHhArr is not null)
                     {
-                        iIn += bHhArr[0 * hidden + h]; fIn += bHhArr[1 * hidden + h];
-                        gIn += bHhArr[2 * hidden + h]; oIn += bHhArr[3 * hidden + h];
+                        int bOff = g * hidden;
+                        for (int h = 0; h < hidden; h++) act[dst + h] = wx[wxg + h] + hh[hhg + h] + bHhArr[bOff + h];
                     }
+                    else
+                    {
+                        for (int h = 0; h < hidden; h++) act[dst + h] = wx[wxg + h] + hh[hhg + h];
+                    }
+                }
+            }
 
-                    float ig = 1f / (1f + (float)Math.Exp(-iIn));
-                    float fg = 1f / (1f + (float)Math.Exp(-fIn));
-                    float gg = (float)Math.Tanh(gIn);
-                    float og = 1f / (1f + (float)Math.Exp(-oIn));
+            // Exact vectorized activations: i,f,o → sigmoid; g → tanh.
+            SigmoidExactInPlace(act, 0 * bh, bh);
+            SigmoidExactInPlace(act, 1 * bh, bh);
+            TanhExactInPlace(act, 2 * bh, bh);
+            SigmoidExactInPlace(act, 3 * bh, bh);
 
-                    float cPrev = cells[cPrevRow + h];
-                    float c = fg * cPrev + ig * gg;
-                    float hOut = og * (float)Math.Tanh(c);
-
-                    gates[gateRow + 0 * hidden + h] = ig;
-                    gates[gateRow + 1 * hidden + h] = fg;
-                    gates[gateRow + 2 * hidden + h] = gg;
-                    gates[gateRow + 3 * hidden + h] = og;
+            // Cell: c = f·c_prev + i·g (write raw c to cells; copy to cbuf for tanh(c)).
+            for (int b = 0; b < batch; b++)
+            {
+                int cPrevRow = (b * (seqLen + 1) + t) * hidden;
+                int cCurRow = (b * (seqLen + 1) + t + 1) * hidden;
+                int gb = b * hidden;
+                for (int h = 0; h < hidden; h++)
+                {
+                    float c = act[1 * bh + gb + h] * cells[cPrevRow + h] + act[0 * bh + gb + h] * act[2 * bh + gb + h];
                     cells[cCurRow + h] = c;
-                    hiddens[cCurRow + h] = hOut;
+                    cbuf[gb + h] = c;
+                }
+            }
+            TanhExactInPlace(cbuf, 0, bh); // cbuf = tanh(c)
 
-                    if (returnSequences) outSpan[outRow + h] = hOut;
-                    else if (t == seqLen - 1) outSpan[outRow + h] = hOut;
+            // h = o·tanh(c); scatter saved gates + hiddens + output.
+            for (int b = 0; b < batch; b++)
+            {
+                int gateRow = (b * seqLen + t) * G;
+                int cCurRow = (b * (seqLen + 1) + t + 1) * hidden;
+                int outRow = returnSequences ? (b * seqLen + t) * hidden : b * hidden;
+                int gb = b * hidden;
+                bool writeOut = returnSequences || t == seqLen - 1;
+                for (int h = 0; h < hidden; h++)
+                {
+                    float hOut = act[3 * bh + gb + h] * cbuf[gb + h];
+                    gates[gateRow + 0 * hidden + h] = act[0 * bh + gb + h];
+                    gates[gateRow + 1 * hidden + h] = act[1 * bh + gb + h];
+                    gates[gateRow + 2 * hidden + h] = act[2 * bh + gb + h];
+                    gates[gateRow + 3 * hidden + h] = act[3 * bh + gb + h];
+                    hiddens[cCurRow + h] = hOut;
+                    if (writeOut) outSpan[outRow + h] = hOut;
                 }
             }
 
