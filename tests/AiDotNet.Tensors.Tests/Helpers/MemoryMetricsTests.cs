@@ -7,16 +7,20 @@ namespace AiDotNet.Tensors.Tests.Helpers;
 public class MemoryMetricsTests
 {
     [Fact]
-    public void ProcessRss_IsPositive_AndAtLeastManagedHeap()
+    public void ProcessRss_AndManagedHeap_AreBothPositive()
     {
         long rss = MemoryMetrics.CurrentProcessRssBytes;
         long managed = MemoryMetrics.ManagedHeapBytes;
         Assert.True(rss > 0, "current process RSS should be positive");
         Assert.True(managed > 0, "managed heap should be positive");
-        // RSS is the whole-process resident set; the managed heap is a subset, so RSS >= managed
-        // (allow a small slack for sampling skew between the two reads).
-        Assert.True(rss + (8L << 20) >= managed,
-            $"process RSS ({rss}) should be >= managed heap ({managed})");
+        // We previously asserted `rss >= managed`, but that inequality doesn't
+        // actually hold: GC.GetTotalMemory reports committed managed-heap
+        // allocations, including segments whose pages aren't currently
+        // resident (paged out under CI memory pressure, or reserved-but-not-
+        // resident in server GC). On the GHA Linux runner this PR's full-
+        // suite execution accumulated ~2.69 GB committed heap against
+        // ~1.93 GB RSS — a real OS reality, not a metric bug. The remaining
+        // checks still verify the API returns meaningful positive values.
     }
 
     [Fact]
