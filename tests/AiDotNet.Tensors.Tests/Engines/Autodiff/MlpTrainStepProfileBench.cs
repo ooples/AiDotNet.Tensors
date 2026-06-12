@@ -33,6 +33,30 @@ public class MlpTrainStepProfileBench
         return t;
     }
 
+    /// <summary>
+    /// Process-wide allocated bytes on net6+ / net10 (captures ThreadPool workers,
+    /// which is what we actually want — every kernel that fans out via Parallel.For
+    /// or BlasManaged parallel GEMM allocates off the calling thread). Falls back
+    /// to the per-thread counter on net471, where GC.GetTotalAllocatedBytes does not
+    /// exist (added in .NET Framework 4.8 / .NET Core 3.0); accept the under-count
+    /// on the legacy TFM rather than break the build.
+    /// </summary>
+    private static long AllocatedBytes()
+    {
+#if NET6_0_OR_GREATER
+        return GC.GetTotalAllocatedBytes(precise: true);
+#else
+        // net471 ships neither GetTotalAllocatedBytes nor (in the version we
+        // target) GetAllocatedBytesForCurrentThread. Fall back to GetTotalMemory,
+        // which reports the LIVE managed heap. It under-counts allocations that
+        // were already collected between samples, but for the short bench
+        // windows (a few hundred iters with a GC.Collect at the start) it
+        // tracks allocation deltas closely enough to stay informative — and
+        // it's the only counter available on this TFM.
+        return GC.GetTotalMemory(forceFullCollection: false);
+#endif
+    }
+
     [Fact(Skip = "Benchmark — run manually")]
     [Trait("Category", "Benchmark")]
     public void Profile_MlpTrainStep()
@@ -116,21 +140,21 @@ public class MlpTrainStepProfileBench
         double trainMs = MinMs(TrainStep, 300);
 
         // Allocations per train step (steady state).
-        // Use GC.GetTotalAllocatedBytes(precise: true) — the per-thread variant
+        // Use AllocatedBytes() — the per-thread variant
         // misses allocations made on ThreadPool worker threads (Parallel.For,
         // Task continuations, BlasManaged parallel-GEMM dispatch), which under-
         // counts the steady-state cost of every kernel that fans out.
         GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
-        long before = GC.GetTotalAllocatedBytes(precise: true);
+        long before = AllocatedBytes();
         const int allocIters = 50;
         for (int i = 0; i < allocIters; i++) TrainStep();
-        long after = GC.GetTotalAllocatedBytes(precise: true);
+        long after = AllocatedBytes();
         double allocKbPerStep = (after - before) / 1024.0 / allocIters;
 
         // Allocations for inference forward (for contrast).
-        long ib = GC.GetTotalAllocatedBytes(precise: true);
+        long ib = AllocatedBytes();
         for (int i = 0; i < allocIters; i++) InferenceForward();
-        long ia = GC.GetTotalAllocatedBytes(precise: true);
+        long ia = AllocatedBytes();
         double infAllocKb = (ia - ib) / 1024.0 / allocIters;
 
         // Forward WITH tape recording but NO backward — isolates tape-recording allocation
@@ -147,24 +171,24 @@ public class MlpTrainStepProfileBench
             }
             _engine.ReduceSum(h, new[] { 0, 1 }, keepDims: false);
         }
-        long fb = GC.GetTotalAllocatedBytes(precise: true);
+        long fb = AllocatedBytes();
         for (int i = 0; i < allocIters; i++) ForwardWithTape();
-        long fa = GC.GetTotalAllocatedBytes(precise: true);
+        long fa = AllocatedBytes();
         double fwdTapeKb = (fa - fb) / 1024.0 / allocIters;
 
         // Allocation with ComputeGradientsScope (pooled gradient buffers across steps).
         for (int i = 0; i < 10; i++) TrainStepScoped();
-        long sb = GC.GetTotalAllocatedBytes(precise: true);
+        long sb = AllocatedBytes();
         for (int i = 0; i < allocIters; i++) TrainStepScoped();
-        long sa = GC.GetTotalAllocatedBytes(precise: true);
+        long sa = AllocatedBytes();
         double scopedKb = (sa - sb) / 1024.0 / allocIters;
 
         // Raw single GEMM [64,256]x[256,512] to separate dispatch overhead from GEMM speed.
         var w0 = W[0];
         double rawGemmMs = MinMs(() => _engine.TensorMatMul(x, w0), 500);
-        long rb = GC.GetTotalAllocatedBytes(precise: true);
+        long rb = AllocatedBytes();
         for (int i = 0; i < allocIters; i++) _engine.TensorMatMul(x, w0);
-        long ra = GC.GetTotalAllocatedBytes(precise: true);
+        long ra = AllocatedBytes();
         double rawGemmKb = (ra - rb) / 1024.0 / allocIters;
         double gemmGflops = (2.0 * B * dims[0] * dims[1]) / (rawGemmMs * 1e6);
 

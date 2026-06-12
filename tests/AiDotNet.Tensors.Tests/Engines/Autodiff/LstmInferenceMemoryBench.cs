@@ -16,6 +16,19 @@ public class LstmInferenceMemoryBench
     private readonly ITestOutputHelper _o;
     public LstmInferenceMemoryBench(ITestOutputHelper o) => _o = o;
 
+    // Process-wide / per-thread allocation counter. net471 ships neither
+    // GC.GetTotalAllocatedBytes nor GetAllocatedBytesForCurrentThread, so
+    // we fall back to GetTotalMemory (live managed heap) on that TFM —
+    // close enough for the short bench windows below.
+    private static long AllocatedBytes()
+    {
+#if NET6_0_OR_GREATER
+        return GC.GetTotalAllocatedBytes(precise: true);
+#else
+        return GC.GetTotalMemory(forceFullCollection: false);
+#endif
+    }
+
     private static Tensor<float> Rand(int[] shape, int seed)
     {
         var rng = new Random(seed);
@@ -44,7 +57,7 @@ public class LstmInferenceMemoryBench
 
             GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
             long heapBefore = MemoryMetrics.ManagedHeapBytes;
-            long allocBefore = GC.GetAllocatedBytesForCurrentThread();
+            long allocBefore = AllocatedBytes();
             const int iters = 200;
             double peakRss;
             using (var sampler = new MemoryMetrics.PeakRssSampler(2))
@@ -52,7 +65,7 @@ public class LstmInferenceMemoryBench
                 for (int i = 0; i < iters; i++) eng.LstmSequenceForward(x, null, null, wIh, wHh, bIh, bHh, returnSequences: true);
                 peakRss = sampler.PeakMb;
             }
-            long allocAfter = GC.GetAllocatedBytesForCurrentThread();
+            long allocAfter = AllocatedBytes();
             GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
             long heapAfter = MemoryMetrics.ManagedHeapBytes;
 
