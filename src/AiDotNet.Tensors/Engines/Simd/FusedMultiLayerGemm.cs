@@ -150,9 +150,19 @@ internal static class FusedMultiLayerGemm
 #if NET5_0_OR_GREATER
         hasFma = Fma.IsSupported;
 #endif
-        if (tileBytes > 28_000 || !hasFma)
+        if (tileBytes > 28_000 || !hasFma || m >= 64)
         {
-            // Fallback: separate GEMM + activation + GEMM
+            // Separate full-matrix GEMM + activation + GEMM via FullGemm (managed-first).
+            //
+            // This BEATS the Mr-row strip loop below for any real batch: the strip loop
+            // issues m/Mr (e.g. 85 for m=512, Mr=6) tiny per-strip GEMM calls per layer
+            // whose per-call overhead dominates — measured 25 GF/s for the forward vs the
+            // backward's full-matrix GEMMs at 150+ GF/s on the same shape
+            // (CompiledTrainingPlanGemmPerfBench: forward 42ms -> ~1ms). FullGemm picks
+            // the managed M-axis-parallel BlasManaged in its sweet spot (matches native at
+            // square shapes) or managed SimdGemm for tall-skinny (6x native), so this path
+            // needs no native BLAS. The L1-resident strip fusion below is kept only for
+            // tiny batches (m < 64) where parallel dispatch can't amortise.
             FallbackSeparate(input, w1, w2, output, activated, m, k, h, n, applyActivation, preActivation);
             return;
         }
@@ -383,7 +393,7 @@ internal static class FusedMultiLayerGemm
     {
         // GEMM1: hidden = input @ W1 (reuse activated buffer as scratch — same size [m*h])
         Array.Clear(activated, 0, m * h);
-        SimdGemm.Sgemm(input.AsSpan(0, m * k), w1.AsSpan(0, k * h), activated.AsSpan(0, m * h), m, k, h);
+        FullGemm(input, k, w1, h, activated, h, m, h, k);
 
         // Capture pre-activation if requested (Phase G.2 GELU support)
         if (preActivation is not null)
@@ -393,8 +403,59 @@ internal static class FusedMultiLayerGemm
         for (int i = 0; i < m * h; i++)
             activated[i] = applyActivation(activated[i]);
 
-        // GEMM2: output = activated @ W2 (clear first since SimdGemm accumulates)
+        // GEMM2: output = activated @ W2 (clear first since the managed fallback accumulates)
         Array.Clear(output, 0, m * n);
-        SimdGemm.Sgemm(activated.AsSpan(0, m * h), w2.AsSpan(0, h * n), output.AsSpan(0, m * n), m, h, n);
+        FullGemm(activated, h, w2, n, output, n, m, n, h);
+    }
+
+    /// <summary>
+    /// Full-matrix GEMM C[mm,nn] = A[mm,kk] @ B[kk,nn] (no transpose, row-major).
+    /// <para>
+    /// Managed-first by design (the library is replacing native BLAS with managed
+    /// kernels that match or beat it). Head-to-head (raw GEMM, Ryzen, GF/s):
+    /// </para>
+    /// <list type="bullet">
+    /// <item>square K=N=256: <see cref="BlasManaged"/> 518-551 ≈ native 526-580,
+    /// both ~30x single-threaded SimdGemm — so the M-axis-parallel BlasManaged
+    /// ThinMDirect path (64&lt;=m&lt;=1024, n&lt;=512, k&lt;=1024) replaces native at
+    /// parity here;</item>
+    /// <item>tall-skinny m=2048,k=n=128: SimdGemm 600 >> native 96 >> BlasManaged 5.8
+    /// — SimdGemm (also managed) beats native 6x where BlasManaged's packed path
+    /// collapses.</item>
+    /// </list>
+    /// <para>
+    /// Native <see cref="BlasProvider.TryGemm"/> is only a last-resort fallback for the
+    /// long-tail shapes neither managed kernel handles well yet (e.g. large-k moderate-m),
+    /// then SimdGemm if native is absent too.
+    /// </para>
+    /// </summary>
+    private static void FullGemm(
+        float[] a, int lda, float[] b, int ldb, float[] c, int ldc, int mm, int nn, int kk)
+    {
+        // Managed parallel path — replaces native at parity for the square K=N
+        // batch shapes that dominate MLP/FFN training.
+        if (mm >= 64 && mm <= 1024 && nn <= 512 && kk <= 1024)
+        {
+            BlasManaged.BlasManaged.Gemm<float>(
+                a.AsSpan(0, mm * kk), lda, false, b.AsSpan(0, kk * nn), ldb, false,
+                c.AsSpan(0, mm * nn), ldc, mm, nn, kk,
+                new BlasManaged.BlasOptions<float> { PackingMode = BlasManaged.PackingMode.DisableAutotune });
+            return;
+        }
+
+        // Tall-skinny large-m / small-K·N — SimdGemm (managed) beats native here.
+        // Use the 10-arg lda/ldb kernel (the 3-arg no-trans shim is [Obsolete] AND a
+        // far slower path — ~5 GF/s vs this one's 600 at [2048,128]x[128,128]).
+        if (mm > 1024 && nn <= 256 && kk <= 256)
+        {
+            SimdGemm.Sgemm(a.AsSpan(0, mm * kk), lda, false, b.AsSpan(0, kk * nn), ldb, false,
+                           c.AsSpan(0, mm * nn), mm, kk, nn);
+            return;
+        }
+
+        // Long-tail fallback: native if present, else SimdGemm.
+        if (!BlasProvider.TryGemm(mm, nn, kk, a, 0, lda, b, 0, ldb, c, 0, ldc))
+            SimdGemm.Sgemm(a.AsSpan(0, mm * kk), lda, false, b.AsSpan(0, kk * nn), ldb, false,
+                           c.AsSpan(0, mm * nn), mm, kk, nn);
     }
 }
