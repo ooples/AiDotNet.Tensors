@@ -802,13 +802,21 @@ public partial class CpuEngine
         // FP64 throughput penalty or accept the mismatch).
         if (typeof(T) == typeof(float))
         {
-            var fa = System.Runtime.InteropServices.MemoryMarshal.Cast<T, float>(a);
-            var fb = System.Runtime.InteropServices.MemoryMarshal.Cast<T, float>(b);
+            // T isn't constrained to be unmanaged, so MemoryMarshal.Cast<T,float>
+            // won't compile here. Reinterpret element-by-element via Unsafe.As
+            // on the span's reference — same codegen as a Cast<T,float>[k] read
+            // once T is known to be float at this branch.
+            ref T rA = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(a);
+            ref T rB = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(b);
             float pf = (float)p;
             float sumF = 0f;
             for (int k = 0; k < d; k++)
             {
-                float diff = System.Math.Abs(fa[offA + k] - fb[offB + k]);
+                float fa = System.Runtime.CompilerServices.Unsafe.As<T, float>(
+                    ref System.Runtime.CompilerServices.Unsafe.Add(ref rA, offA + k));
+                float fb = System.Runtime.CompilerServices.Unsafe.As<T, float>(
+                    ref System.Runtime.CompilerServices.Unsafe.Add(ref rB, offB + k));
+                float diff = System.Math.Abs(fa - fb);
                 if (pf == 1f) sumF += diff;
                 else if (pf == 2f) sumF += diff * diff;
                 else sumF += (float)System.Math.Pow(diff, p);
