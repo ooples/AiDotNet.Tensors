@@ -29,6 +29,17 @@ internal static class CudaNativeBindings
     private const string CudaLibrary = "libcuda";
 #endif
 
+#if NET5_0_OR_GREATER
+    // The const above is baked at BUILD time, but the package ships one assembly for all
+    // platforms — the cross-platform resolver maps whichever name was baked to the current
+    // OS's real driver library at runtime (a Linux-built package must still find nvcuda.dll
+    // on Windows, and vice versa).
+    static CudaNativeBindings()
+    {
+        GpuDriverCrossPlatformResolver.EnsureRegistered();
+    }
+#endif
+
     private static bool _isAvailable;
     private static bool _availabilityChecked;
 

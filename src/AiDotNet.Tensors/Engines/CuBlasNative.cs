@@ -98,16 +98,21 @@ public static class CuBlasNative
 #if WINDOWS
     private const string CublasLibrary = "cublas64_12";
     private const string CudaLibrary = "nvcuda";
+#else
+    private const string CublasLibrary = "libcublas.so.12";
+    private const string CudaLibrary = "libcuda.so.1";
+#endif
 
+    // BOTH candidate sets are always compiled and selected at RUNTIME: the package ships ONE
+    // assembly for every platform, so the consts above reflect the BUILD machine's OS, not the
+    // user's. A package built on a Linux CI runner bakes in libcublas/libcuda — without runtime
+    // mapping, CUDA silently dies on every Windows machine (and vice versa).
     private static readonly string[] CublasWindowsCandidates =
     [
         "cublas64_13",
         "cublas64_12",
         "cublas64_11"
     ];
-#else
-    private const string CublasLibrary = "libcublas.so.12";
-    private const string CudaLibrary = "libcuda.so.1";
 
     private static readonly string[] CublasLinuxCandidates =
     [
@@ -116,7 +121,6 @@ public static class CuBlasNative
         "libcublas.so.11",
         "libcublas.so"
     ];
-#endif
 
 #if !NET471
     static CuBlasNative()
@@ -125,19 +129,22 @@ public static class CuBlasNative
         // OpenCL, Vulkan, etc. all chain through one assembly-level
         // resolver. Direct SetDllImportResolver throws on second call.
         NativeLibraryResolverRegistry.Register(ResolveCuBlasLibrary);
+        // Cross-OS mapping for the driver/nvrtc/cudart names this class P/Invokes
+        // (nvcuda vs libcuda etc.) — see GpuDriverCrossPlatformResolver.
+        GpuDriverCrossPlatformResolver.EnsureRegistered();
     }
 
     private static IntPtr ResolveCuBlasLibrary(string libraryName, Assembly assembly, DllImportSearchPath? searchPath)
     {
-        // Only intercept cuBLAS resolution — let nvcuda/libcuda resolve normally
-        if (libraryName != CublasLibrary)
+        // Intercept ANY cuBLAS alias (whichever OS's name was baked in at build time);
+        // let nvcuda/libcuda resolve via the cross-platform driver resolver.
+        if (!libraryName.StartsWith("cublas64_", StringComparison.Ordinal) &&
+            !libraryName.StartsWith("libcublas", StringComparison.Ordinal))
             return IntPtr.Zero;
 
-#if WINDOWS
-        var candidates = CublasWindowsCandidates;
-#else
-        var candidates = CublasLinuxCandidates;
-#endif
+        var candidates = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+            ? CublasWindowsCandidates
+            : CublasLinuxCandidates;
         // First try standard DLL search (PATH, system dirs, etc.)
         foreach (var candidate in candidates)
         {
