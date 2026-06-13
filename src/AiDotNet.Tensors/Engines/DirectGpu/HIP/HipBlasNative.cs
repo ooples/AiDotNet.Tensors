@@ -33,6 +33,29 @@ internal static class HipBlasNative
         ConjugateTranspose = 113
     }
 
+    /// <summary>
+    /// hipBLAS element data types (legacy <c>hipblasDatatype_t</c>). Values match
+    /// the hipBLAS / rocBLAS ABI (hipblas.h): real FP16 = 150, real FP32 = 151,
+    /// real FP64 = 152. Used by <see cref="hipblasGemmEx"/> to describe the FP16
+    /// inputs and FP32 accumulator/output of the mixed-precision GEMM.
+    /// </summary>
+    internal enum HipBlasDatatype
+    {
+        R_16F = 150,  // 16-bit real (half)
+        R_32F = 151,  // 32-bit real (float)
+        R_64F = 152,  // 64-bit real (double)
+    }
+
+    /// <summary>
+    /// hipBLAS GEMM algorithm selector (<c>hipblasGemmAlgo_t</c>).
+    /// <c>HIPBLAS_GEMM_DEFAULT = 160</c> lets the library pick — the cuBLAS
+    /// <c>CUBLAS_GEMM_DEFAULT</c> equivalent.
+    /// </summary>
+    internal enum HipBlasGemmAlgo
+    {
+        Default = 160,
+    }
+
     internal static bool IsAvailable
     {
         get
@@ -81,6 +104,57 @@ internal static class HipBlasNative
         ref float beta,
         IntPtr C,
         int ldc); // lgtm[cs/unmanaged-code] HIP BLAS requires native bindings.
+
+    /// <summary>
+    /// FP16 GEMM: C = alpha·A·B + beta·C, all matrices half-precision
+    /// (<c>hipblasHalf</c> = uint16). alpha/beta are passed as their FP16 bit
+    /// patterns (1.0 = 0x3C00, 0.0 = 0x0000). Equivalent to <c>cublasHgemm</c>.
+    /// </summary>
+    [DllImport(HipBlasLibrary, EntryPoint = "hipblasHgemm", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern HipBlasStatus hipblasHgemm(
+        IntPtr handle,
+        HipBlasOperation transA,
+        HipBlasOperation transB,
+        int m,
+        int n,
+        int k,
+        ref ushort alpha,
+        IntPtr A,
+        int lda,
+        IntPtr B,
+        int ldb,
+        ref ushort beta,
+        IntPtr C,
+        int ldc); // lgtm[cs/unmanaged-code] HIP BLAS requires native bindings.
+
+    /// <summary>
+    /// Mixed-precision GEMM: FP16 inputs, FP32 accumulator + output. This is the
+    /// cuBLAS-compatible <c>hipblasGemmEx</c> signature (no separate D matrix,
+    /// unlike raw <c>rocblas_gemm_ex</c>): alpha/beta are FP32 scalars passed by
+    /// pointer (compute type = FP32). Maps to <c>cublasGemmEx(CUDA_R_16F in,
+    /// CUBLAS_COMPUTE_32F)</c> — the standard AMP forward-pass matmul.
+    /// </summary>
+    [DllImport(HipBlasLibrary, EntryPoint = "hipblasGemmEx", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern HipBlasStatus hipblasGemmEx(
+        IntPtr handle,
+        HipBlasOperation transA,
+        HipBlasOperation transB,
+        int m,
+        int n,
+        int k,
+        ref float alpha,            // const void* (FP32 scalar, compute type)
+        IntPtr A,
+        HipBlasDatatype aType,
+        int lda,
+        IntPtr B,
+        HipBlasDatatype bType,
+        int ldb,
+        ref float beta,             // const void* (FP32 scalar)
+        IntPtr C,
+        HipBlasDatatype cType,
+        int ldc,
+        HipBlasDatatype computeType,
+        HipBlasGemmAlgo algo); // lgtm[cs/unmanaged-code] HIP BLAS requires native bindings.
 
     private static bool TryLoadLibrary()
     {
