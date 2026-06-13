@@ -70,6 +70,26 @@ public class WeightStreamingTransparentAccessTests : IDisposable
     }
 
     [Fact]
+    public void Memory_OnDroppedStreamingWeight_AutoRehydrates()
+    {
+        // .Memory / .Data are the buffer accessors engine + layer code use (e.g.
+        // SelfAttentionLayer.Forward reaches the weight via .Memory). They must
+        // auto-rehydrate a dropped streaming weight exactly like AsSpan — without
+        // the gate, .Memory Slices empty storage and throws ArgumentOutOfRange.
+        float[] expected = { 2.5f, 4.5f, 6.5f, 8.5f };
+        var t = new Tensor<float>(expected, new[] { expected.Length });
+        t.Lifetime = WeightLifetime.Streaming;
+        WeightRegistry.RegisterWeight(t);
+        Assert.Equal(0, t.DataVector.Length);
+
+        var span = t.Memory.Span; // must page the bytes back in transparently
+        Assert.Equal(expected.Length, span.Length);
+        for (int i = 0; i < expected.Length; i++)
+            Assert.Equal(expected[i], span[i]);
+        Assert.Equal(expected.Length, t.DataVector.Length);
+    }
+
+    [Fact]
     public void Indexer_OnDroppedStreamingWeight_AutoRehydrates()
     {
         float[] expected = { 10f, 20f, 30f, 40f, 50f };
