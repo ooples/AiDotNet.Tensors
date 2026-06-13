@@ -87,6 +87,28 @@ public sealed class GpuOffloadOptions
     /// pay full disk-read latency on each layer's hot path. Default 2.
     /// </summary>
     public int PrefetchWindow { get; set; } = 2;
+
+    /// <summary>
+    /// Transparent auto-eviction (issue #430 follow-up). When <c>true</c>, the
+    /// streaming pool records every weight it pages out so the
+    /// <c>WeightRegistry</c> can also drop the owning tensor's resident
+    /// in-memory copy after transparent auto-rehydrate (see
+    /// <c>TensorBase&lt;T&gt;.EnsureMaterialized</c>). This is what lets a model
+    /// fit a bounded resident set with NO per-layer orchestration code — a
+    /// forward pass that reads weight after weight keeps only ~budget worth of
+    /// weights live instead of accumulating every weight it touched.
+    /// <para>
+    /// Default <c>false</c>: with explicit orchestration
+    /// (<c>MaterializeMany</c> / <c>ReleaseToPool</c>, as in
+    /// <c>NeuralNetworkBase</c>) the MODEL owns weight residency, and making
+    /// <c>Materialize</c> drop other weights as a side effect would both change
+    /// that contract and race a concurrent reader (one thread's materialize
+    /// could drop a weight another thread just materialized and is reading).
+    /// Enable this ONLY for single-threaded foundation-scale inference, where
+    /// the cold weight being dropped is by definition not the one in use.
+    /// </para>
+    /// </summary>
+    public bool TransparentAutoEviction { get; set; } = false;
 }
 
 /// <summary>Memory-placement scheme for <see cref="WeightLifetime.GpuOffload"/> weights.</summary>

@@ -46,6 +46,7 @@ public sealed class StreamingTensorPool : IDisposable
     private readonly long _maxResidentBytes;
     private readonly string _backingDir;
     private readonly bool _enableCompression;
+    private readonly bool _transparentAutoEviction;
     private bool _disposed;
 
     // Telemetry counters (#1222 PR-A task #181). All written under _lock.
@@ -73,11 +74,38 @@ public sealed class StreamingTensorPool : IDisposable
     private long _prefetchIssueCount;   // Total Rehydrate calls flagged as isPrefetch=true
     private readonly HashSet<long> _prefetchPending = new();
 
+    // Transparent-streaming owner-drop notification (issue #430 follow-up).
+    // When the pool pages an entry out to disk under budget pressure it frees
+    // its OWN byte[] snapshot — but the owning Tensor's GC-heap `_data` (if it
+    // was made resident by a prior Materialize) is invisible to the pool: this
+    // class is type-erased (handles + byte[], no Tensor<T>). Transparent
+    // auto-rehydrate (TensorBase.EnsureMaterialized) re-materialises a weight's
+    // `_data` on access; without dropping that copy when the pool evicts the
+    // entry, every accessed weight would stay GC-resident and the resident set
+    // would grow unbounded — defeating the bound the pool enforces on its own
+    // snapshots. So each paged-out handle is recorded here and WeightRegistry
+    // drains it (dropping the owning tensor via a weak back-reference). A queue
+    // rather than an immediate callback keeps the pool free of registry
+    // knowledge AND avoids running arbitrary drop logic under _lock: the
+    // registry drains lazily on its next Materialize, so evictions from any
+    // source (Register, prefetch, Materialize) are reconciled there. Written
+    // under _lock.
+    //
+    // A SET, not a queue: a handle is "pending owner-drop" while its bytes are
+    // paged out and not yet reconciled. If the same handle is re-paged-in
+    // (transparent auto-rehydrate on access) BEFORE the registry drains, its
+    // resident _data is valid again and MUST NOT be dropped — Rehydrate removes
+    // it from this set on page-in. Without that cancellation, a stale
+    // register-time eviction would make the very next drain drop the weight the
+    // caller just materialized, emptying its storage mid-read.
+    private readonly HashSet<long> _pendingOwnerDrops = new();
+
     public StreamingTensorPool(GpuOffloadOptions? options = null)
     {
         var opts = options ?? new GpuOffloadOptions();
         _maxResidentBytes = opts.StreamingPoolMaxResidentBytes;
         _enableCompression = opts.EnableCompression;
+        _transparentAutoEviction = opts.TransparentAutoEviction;
         // Always append a Guid sub-directory — even when the caller
         // supplies StreamingBackingStorePath. Two pools sharing the same
         // base path would otherwise collide on streaming-{id}.bin
@@ -293,6 +321,12 @@ public sealed class StreamingTensorPool : IDisposable
                     var freshNode = _lruOrder.AddFirst(handleId);
                     _lruIndex[handleId] = freshNode;
                 }
+                // This entry is resident again — cancel any pending owner-drop
+                // queued when it was previously evicted. Otherwise the next
+                // registry drain would drop the owning tensor's _data right
+                // after the caller materialised it (e.g. a register-time
+                // eviction that was never reconciled), emptying storage mid-read.
+                _pendingOwnerDrops.Remove(handleId);
                 // Skip the just-rehydrated entry during eviction. If this
                 // tensor alone exceeds the budget, evicting it here would
                 // page it back out before Rehydrate returns and the caller
@@ -521,6 +555,30 @@ public sealed class StreamingTensorPool : IDisposable
     }
 
     /// <summary>
+    /// Returns and clears the handles the pool has paged out to disk since the
+    /// last drain, so <see cref="WeightRegistry"/> can drop the owning tensors'
+    /// resident <c>_data</c> (see <c>_pendingOwnerDrops</c>). The pool frees
+    /// only its own byte[] snapshot on eviction; the tensor's GC-heap copy —
+    /// re-materialised by transparent auto-rehydrate — is freed by the registry
+    /// after this drain, keeping the resident set bounded. Returns
+    /// <see cref="Array.Empty{T}"/> when nothing was evicted. Snapshot is taken
+    /// under <see cref="_lock"/> so it's internally consistent; the registry
+    /// performs the actual drops (tensor-storage CAS only, no pool/registry
+    /// lock) after this returns.
+    /// </summary>
+    internal long[] DrainEvictedHandles()
+    {
+        lock (_lock)
+        {
+            if (_pendingOwnerDrops.Count == 0) return Array.Empty<long>();
+            long[] result = new long[_pendingOwnerDrops.Count];
+            _pendingOwnerDrops.CopyTo(result);
+            _pendingOwnerDrops.Clear();
+            return result;
+        }
+    }
+
+    /// <summary>
     /// Pages a single LRU entry to disk. Extracted from
     /// <see cref="EvictIfOverBudget"/> so
     /// <see cref="EvictUntilFreeBytes"/> can drive the same eviction
@@ -633,6 +691,15 @@ public sealed class StreamingTensorPool : IDisposable
         entry.ResidentBytes = 0;
         _lruOrder.Remove(oldest);
         _lruIndex.Remove(id);
+        // Record the page-out so WeightRegistry can drop the owning tensor's
+        // resident _data on its next drain — but ONLY in transparent mode.
+        // With explicit orchestration the model owns residency (and a
+        // concurrent reader could be mid-read on the very weight we'd drop),
+        // so leave the owner copy alone and keep DrainEvictedHandles empty.
+        // Only the real page-out path records — the stale-node branch above
+        // (entry.Data already null) was paged out earlier and recorded then.
+        if (_transparentAutoEviction)
+            _pendingOwnerDrops.Add(id);
         return true;
     }
 
@@ -658,6 +725,7 @@ public sealed class StreamingTensorPool : IDisposable
             _entries.Clear();
             _lruOrder.Clear();
             _lruIndex.Clear();
+            _pendingOwnerDrops.Clear();
             // Atomic write so the lock-free ResidentBytes property doesn't
             // see torn values on 32-bit hosts (net471 x86 still ships).
             Interlocked.Exchange(ref _residentBytes, 0);

@@ -8,10 +8,33 @@ using AiDotNet.Tensors.Interfaces;
 namespace AiDotNet.Tensors.LinearAlgebra;
 
 /// <summary>
+/// Non-generic view of a streaming-registered weight tensor that lets
+/// <see cref="WeightRegistry"/> drop a tensor's resident in-memory data
+/// without knowing its element type <c>T</c>. The registry tracks the owning
+/// tensor by streaming-pool handle (a weak reference to this interface) so it
+/// can drop the GC-heap copy when the pool pages the handle's bytes out —
+/// the symmetric half of transparent auto-rehydrate (see
+/// <see cref="TensorBase{T}"/>'s EnsureMaterialized). Implemented by
+/// <see cref="TensorBase{T}"/>.
+/// </summary>
+internal interface IStreamingDroppable
+{
+    /// <summary>The streaming-pool handle this tensor's bytes live under, or
+    /// -1 when not registered.</summary>
+    long StreamingPoolHandle { get; }
+
+    /// <summary>Drops this tensor's resident in-memory data (the streaming
+    /// pool keeps the canonical copy). Returns <c>false</c> without dropping
+    /// when the storage is still shared (refcount &gt; 1) — e.g. an autodiff
+    /// tape capture during training — leaving the data resident for the peer.</summary>
+    bool TryDropStorageForStreaming(bool throwOnSharedRefcount);
+}
+
+/// <summary>
 /// Represents a base class for multi-dimensional arrays of numeric values used in machine learning and AI computations.
 /// </summary>
 /// <typeparam name="T">The numeric type of the tensor elements (e.g., float, double, int).</typeparam>
-public abstract class TensorBase<T> : IDisposable
+public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
 {
     private bool _disposed;
     // ================================================================
@@ -247,6 +270,16 @@ public abstract class TensorBase<T> : IDisposable
         _storage = new TensorStorage<T>(_data);
         return true;
     }
+
+    // Explicit IStreamingDroppable implementation — the underlying members are
+    // internal (not public), so they can't implicitly satisfy the interface.
+    // These forward to the internal members, letting WeightRegistry drop a
+    // streaming tensor's resident data without a reference to the closed
+    // generic Tensor<T>.
+    bool IStreamingDroppable.TryDropStorageForStreaming(bool throwOnSharedRefcount)
+        => TryDropStorageForStreaming(throwOnSharedRefcount);
+
+    long IStreamingDroppable.StreamingPoolHandle => StreamingPoolHandle;
 
     /// <summary>
     /// Restores this tensor's data from a serialized byte buffer (produced
@@ -1248,11 +1281,72 @@ public abstract class TensorBase<T> : IDisposable
     /// Ensures lazy tensor data has been materialized before access.
     /// Centralizes the auto-materialization guard so all data access paths use it.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Two independent deferral mechanisms converge here so that every data-access
+    /// path (<see cref="AsSpan"/>, <see cref="AsWritableSpan"/>, the indexers,
+    /// <see cref="ToArray"/>, and — via the <see cref="GetLiveBackingArrayOrNull"/>
+    /// miss → <see cref="ToArray"/> fallback — <see cref="GetDataArray"/>) observes
+    /// live data without the caller knowing which mechanism, if any, is in play:
+    /// </para>
+    /// <list type="number">
+    ///   <item><b>Lazy graph realization</b> — a deferred (<see cref="LazySource"/>)
+    ///     node whose op hasn't run yet is realized on first touch.</item>
+    ///   <item><b>Weight streaming (issue #430, transparent path).</b> A weight tagged
+    ///     <see cref="WeightLifetime.Streaming"/> and registered with the
+    ///     <see cref="WeightRegistry"/> has its in-memory bytes paged out to the
+    ///     streaming pool's backing store under memory pressure (its backing
+    ///     <c>_data</c> dropped to <see cref="Vector{T}.Empty"/>). Auto-rehydrating
+    ///     here — rather than requiring every model to call
+    ///     <c>WeightRegistry.Materialize</c> before each Forward — is what makes
+    ///     streaming <i>transparent</i>: any model whose weights are tagged Streaming
+    ///     fits a bounded resident set without per-layer orchestration code, because
+    ///     the read path itself pages the bytes back in on demand.</item>
+    /// </list>
+    /// <para>
+    /// <b>Cost.</b> The streaming check is a single field compare
+    /// (<c>Lifetime == Streaming</c>) that short-circuits for every
+    /// <see cref="WeightLifetime.Default"/> tensor — i.e. all activations and all
+    /// non-streamed models — so the common path pays one predictable branch.
+    /// <c>Materialize</c> is only invoked when the weight is actually dropped
+    /// (<c>_data.Length != Length</c>); a resident streaming weight skips it
+    /// entirely. In a single-pass forward each weight is touched once, so the
+    /// pool's LRU (which evicts the least-recently paged-in weight) naturally
+    /// keeps the just-materialized weight — the most-recently-used — resident.
+    /// </para>
+    /// <para>
+    /// <b>Recursion safety.</b> <c>Materialize</c> → <c>RehydrateInto</c> →
+    /// <see cref="RestoreStorageFromBytes"/> swaps <c>_data</c>/<c>_storage</c>
+    /// directly; it never re-enters <see cref="AsSpan"/>/<c>EnsureMaterialized</c>,
+    /// and after it runs <c>_data.Length == Length</c> so a re-entrant call would
+    /// short-circuit regardless.
+    /// </para>
+    /// <para>
+    /// <b>Scope.</b> This is the read/inference page-in. Training write-back —
+    /// where <see cref="AsWritableSpan"/> mutates the resident copy and the pool's
+    /// snapshot goes stale — stays on the explicit <c>ReleaseToPool</c> /
+    /// dirty-tracking flow; streaming is engaged for foundation-scale <i>inference</i>,
+    /// which is read-only over weights.
+    /// </para>
+    /// </remarks>
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     private void EnsureMaterialized()
     {
         if (LazySource is ILazyNode node && !node.IsRealized)
             node.Realize(node.RecordingEngine);
+
+        // Transparent weight-streaming page-in. Gated on the cheap Lifetime
+        // field so non-streamed tensors (the overwhelming majority) pay only
+        // one branch. Only a dropped weight (_data emptied by the pool) needs
+        // the rehydrate; a resident one is left untouched to avoid the pool
+        // lock on the hot path.
+        if (Lifetime == WeightLifetime.Streaming
+            && StreamingPoolHandle >= 0
+            && _data.Length != Length
+            && this is Tensor<T> streamedWeight)
+        {
+            WeightRegistry.Materialize(streamedWeight);
+        }
     }
 
     /// <summary>
