@@ -14,8 +14,12 @@ internal static class ShadercNativeBindings
     private const string ShadercWindows = "shaderc_shared";
     private const string ShadercLinux = "libshaderc_shared";
 
-    // Shader kind for compute shaders
-    public const int shaderc_compute_shader = 5;
+    // Shader kind for compute shaders. shaderc_shader_kind enum order is
+    // vertex=0, fragment=1, compute=2, geometry=3, tess_control=4,
+    // tess_evaluation=5 — so compute is 2 (5 was tessellation-evaluation, which
+    // made every GLSL compute dispatch fail "local_size_x: no such layout
+    // identifier for this stage" and silently fall back to the CPU path).
+    public const int shaderc_compute_shader = 2;
 
     // Compilation status
     public const int shaderc_compilation_status_success = 0;

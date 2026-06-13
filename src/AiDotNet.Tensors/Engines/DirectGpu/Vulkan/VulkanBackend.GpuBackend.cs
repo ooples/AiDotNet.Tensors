@@ -332,6 +332,14 @@ public sealed unsafe partial class VulkanBackend
     public void Gemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
     {
         EnsureInitialized();
+
+        // GPU fast path: plain C = A·B (alpha=1, beta=0) runs on-device via the
+        // GLSL GEMM compute shader. This is the common case (MatMul calls Gemm
+        // with the defaults). Scaled/accumulating GEMM (alpha≠1 or beta≠0) and
+        // hosts without libshaderc fall through to the managed loop below.
+        if (alpha == 1.0f && beta == 0.0f && TryGlslGemmFp32(A, B, C, M, N, K))
+            return;
+
         var a = DownloadBuffer(A);
         var b = DownloadBuffer(B);
         // Skip downloading C when beta is 0 since existing values are not needed
@@ -347,6 +355,35 @@ public sealed unsafe partial class VulkanBackend
             }
         }
         UploadToBuffer(c, C);
+    }
+
+    /// <summary>
+    /// Runs C = A·B (row-major, M×K · K×N) on the GPU via the GLSL GEMM kernel.
+    /// Returns false (so the caller can fall back to the managed loop) when the
+    /// dimensions are non-positive or libshaderc isn't available to compile the
+    /// shader. One invocation per output element; push constants carry {M, N, K}.
+    /// </summary>
+    private bool TryGlslGemmFp32(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K)
+    {
+        if (M <= 0 || N <= 0 || K <= 0)
+            return false;
+
+        var pipeline = GetOrCreateGlslPipeline(VulkanGemmKernels.GemmFp32, 3, 3 * sizeof(uint));
+        if (pipeline is null)
+            return false;
+
+        var vbA = AsVulkan(A);
+        var vbB = AsVulkan(B);
+        var vbC = AsVulkan(C);
+        var pushConstants = new uint[] { (uint)M, (uint)N, (uint)K };
+        var threadRes = _device.AcquireThreadResources();
+        lock (_computeLock)
+        {
+            pipeline.UpdateDescriptorSet(vbA.Storage, vbB.Storage, vbC.Storage);
+            RecordAndExecuteWithPushData(pipeline, M * N, pushConstants, 3 * sizeof(uint), threadRes);
+        }
+
+        return true;
     }
 
     public IGpuBuffer MatMul(IGpuBuffer A, IGpuBuffer B, int M, int N, int K)
