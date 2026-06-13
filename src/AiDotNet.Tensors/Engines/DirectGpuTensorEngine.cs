@@ -205,11 +205,20 @@ public sealed class GpuScope : IDisposable
         {
             depth--;
             _depthPerEngine[_engineId] = depth;
-            // When the outermost scope for this engine exits, materialize its deferred downloads
-            if (depth == 0)
-            {
-                _engine?.MaterializeAllDeferred();
-            }
+            // Issue #561: previously this called _engine.MaterializeAllDeferred()
+            // which forced a host download of EVERY intermediate produced inside
+            // the scope. For an 8-step chained GEMM that's 8 downloads at scope
+            // exit when the user only reads the final value — a 1.63× slowdown
+            // vs running the same chain outside the scope. That directly
+            // contradicted GpuScope's documented contract ("Downloads of
+            // intermediate results are deferred until CPU data is actually
+            // needed"). Buffer-lifetime safety is already covered by
+            // EvictOldestActivationsUnsafe / EvictActivationsCreatedAfter,
+            // which materialize-before-free any deferred entry they evict.
+            // So scope exit can drop straight back to the deferred-lazy
+            // model: a host read of an intermediate materializes it at the
+            // read point; an intermediate the user never reads never pays for
+            // a download.
         }
     }
 }
@@ -3356,15 +3365,116 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (a.Columns != b.Rows)
             return base.MatrixMultiply(a, b);
 
+        // Issue #415: FP64 (and anything else that can't roundtrip through FP32
+        // without precision loss) bails to CPU rather than silently downcasting.
+        if (Engines.DirectGpu.DirectGpuEngine.ShouldFallbackForPrecision<T>())
+            return base.MatrixMultiply(a, b);
+
+        if (!TryGetBackend(out var backend))
+            return base.MatrixMultiply(a, b);
+
         try
         {
-            var resultData = _directGpu.MatMul(a.AsSpan().ToArray(), b.AsSpan().ToArray(), a.Rows, a.Columns, b.Columns);
-            if (resultData == null)
-                return base.MatrixMultiply(a, b);
+            int M = a.Rows, K = a.Columns, N = b.Columns;
+            int outLen = M * N;
 
-            var result = new Matrix<T>(a.Rows, b.Columns);
-            resultData.AsSpan().CopyTo(result.AsWritableSpan());
-            return result;
+            // Issues #561 / #562: resolve A and B through the activation /
+            // persistent cache instead of re-uploading from host every call.
+            // The previous implementation called
+            //   _directGpu.MatMul(a.AsSpan().ToArray(), b.AsSpan().ToArray(), …)
+            // which allocated fresh GPU buffers AND downloaded the result on
+            // every call, so a chained C=A·B, E=C·D paid a full
+            // device→host→device round-trip for the intermediate C (74 GF/s
+            // measured on N=2048 chained vs 601 GF/s on a single GEMM, RTX 3080).
+            // Routing through GetOrAllocateBuffer + FinishGpuOp lets the second
+            // MatMul find C's buffer in the activation cache and lets GpuScope
+            // defer the host download until the chain's final value is read.
+            //
+            // Use GetBackingArrayUnsafe (not GetDataArray) so a deferred input
+            // does NOT trigger its own download here — its GPU buffer is still
+            // resident under the same array key, and GetOrAllocateBuffer will
+            // find it via the activation-cache hit. If neither cache has the
+            // buffer, GetOrAllocateBuffer falls through to MaterializeIfDeferred
+            // + a fresh upload, which is the correct behavior for the
+            // GPU-input + host-resident-A pattern.
+            var aBacking = a.GetBackingArrayUnsafe() ?? a.GetDataArray();
+            var bBacking = b.GetBackingArrayUnsafe() ?? b.GetDataArray();
+            using var bufA = GetOrAllocateBuffer(backend, aBacking);
+            using var bufB = GetOrAllocateBuffer(backend, bBacking);
+
+            var bufOut = AllocateOutputBuffer(backend, outLen);
+            // The buffer is owned (ownsBuffer:true) and will be transferred to
+            // the activation cache by FinishGpuOp at the end of the try block.
+            // Any exception thrown by ConvertToFp16 / GemmFp16In32fOut /
+            // backend.Gemm BEFORE the FinishGpuOp call leaks the underlying
+            // device allocation — the outer catch only swallows the throw and
+            // falls back to CPU. Track ownership transfer explicitly so the
+            // finally can dispose the buffer if the GPU path bailed before
+            // FinishGpuOp consumed it.
+            bool finishedOwnershipTransfer = false;
+            try {
+            bool fp16PathRan = false;
+            if (typeof(T) == typeof(Half)
+                && backend is Engines.Gpu.IGpuHalfPrecisionBackend halfBackend
+                && halfBackend.SupportsHgemm)
+            {
+                // Issue #560: FP16 tensor-core fast path. cublasGemmEx with
+                // FP16 inputs and an FP32 accumulator is the standard
+                // mixed-precision matmul (matches the AMP forward pass): the
+                // multiply runs on tensor cores, the FP32 accumulator preserves
+                // long-chain precision, and the FP32 output flows back into
+                // the activation cache so downstream FP32 ops can consume it
+                // directly. The two FP32→FP16 conversions are O(MK+KN) —
+                // negligible against the O(MKN) GEMM.
+                //
+                // GemmFp16In32fOut requires tensor cores. Some CC>=5 GPUs
+                // (notably Turing TU116/TU117 — the GTX 16-series) advertise
+                // FP16 support but lack tensor cores, and cublasGemmEx returns
+                // CUBLAS_STATUS_NOT_SUPPORTED on those parts. Try the FP16 path
+                // first; on a clean failure fall through to SGEMM on the same
+                // (already-uploaded) FP32 inputs. This is the right behavior
+                // for "Half user on hardware that can't accelerate Half" —
+                // they get the FP32 speed of the GPU instead of dropping to
+                // a multi-second CPU scalar loop.
+                try
+                {
+                    using var aFp16 = AllocateOutputBuffer(backend, M * K);
+                    using var bFp16 = AllocateOutputBuffer(backend, K * N);
+                    backend.ConvertToFp16(bufA.Buffer, aFp16.Buffer, M * K);
+                    backend.ConvertToFp16(bufB.Buffer, bFp16.Buffer, K * N);
+                    halfBackend.GemmFp16In32fOut(aFp16.Buffer, bFp16.Buffer, bufOut.Buffer, M, N, K);
+                    fp16PathRan = true;
+                }
+                catch (InvalidOperationException)
+                {
+                    // Tensor cores not available — SGEMM fallback below.
+                }
+                catch (NotSupportedException)
+                {
+                    // Same as above; some backends surface a different exception type.
+                }
+            }
+
+            if (!fp16PathRan)
+            {
+                backend.Gemm(bufA.Buffer, bufB.Buffer, bufOut.Buffer, M, N, K);
+            }
+
+            // Defer the download: the result T[] is registered with
+            // DeferredArrayMaterializer so a chained next-MatMul that consumes
+            // this Matrix finds the buffer in the activation cache (no
+            // download, no re-upload), and host reads materialize lazily on
+            // first access. Matrix<T>.FromMemory wraps the deferred array
+            // zero-copy.
+            var resultData = FinishGpuOp<T>(backend, bufOut, outLen);
+            finishedOwnershipTransfer = true;
+            return Matrix<T>.FromMemory(resultData, M, N);
+            }
+            finally
+            {
+                if (!finishedOwnershipTransfer)
+                    bufOut.Dispose();
+            }
         }
         catch
         {

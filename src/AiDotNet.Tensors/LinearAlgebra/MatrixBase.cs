@@ -95,16 +95,50 @@ public abstract class MatrixBase<T>
     /// </summary>
     internal T[] GetDataArray()
     {
+        // If a deferred GPU download is pending, materialize now: callers
+        // of GetDataArray either read the data directly or pass it to code
+        // that does (host-side serialization, base CPU ops, etc.). The
+        // GPU-cache-lookup path uses GetBackingArrayUnsafe() instead, which
+        // returns the same array WITHOUT triggering the download.
         if (_cachedArray is not null)
+        {
+            Helpers.DeferredArrayMaterializer.TryMaterialize(_cachedArray);
             return _cachedArray;
+        }
 
         if (MemoryMarshal.TryGetArray((ReadOnlyMemory<T>)_memory, out var segment) && segment.Array is not null)
         {
             if (segment.Offset == 0)
+            {
+                Helpers.DeferredArrayMaterializer.TryMaterialize(segment.Array);
                 return segment.Array;
+            }
         }
 
         return _memory.ToArray();
+    }
+
+    /// <summary>
+    /// Gets the backing array reference WITHOUT triggering deferred GPU
+    /// materialization. Used by DirectGpuTensorEngine to look up an existing
+    /// GPU buffer in the activation cache (key = array identity); the matrix
+    /// data may still be unmaterialized in CPU memory but the GPU buffer is
+    /// the source of truth. Never read from the returned array directly —
+    /// values may be stale or uninitialized until the deferred materializer
+    /// has fired.
+    /// </summary>
+    internal T[]? GetBackingArrayUnsafe()
+    {
+        if (_cachedArray is not null)
+            return _cachedArray;
+
+        if (MemoryMarshal.TryGetArray((ReadOnlyMemory<T>)_memory, out var segment)
+            && segment.Array is not null && segment.Offset == 0)
+        {
+            return segment.Array;
+        }
+
+        return null;
     }
 
     /// <summary>
@@ -340,11 +374,24 @@ public abstract class MatrixBase<T>
         get
         {
             ValidateIndices(row, col);
+            // A Matrix returned by a deferred GPU op holds an uninitialized
+            // backing array whose values only get populated when its
+            // DeferredArrayMaterializer callback fires. The span accessors
+            // already trigger materialization; the indexer was bypassing it,
+            // so matrix[i,j] silently read zeros until something else hit
+            // the deferred path. Mirror AsSpan's TryMaterialize call here.
+            if (_cachedArray is not null)
+                Helpers.DeferredArrayMaterializer.TryMaterialize(_cachedArray);
             return _memory.Span[row * _cols + col];
         }
         set
         {
             ValidateIndices(row, col);
+            // Writers must observe materialized data too — a read-modify-write
+            // pattern (`m[i,j] += x`) reads the slot first and would otherwise
+            // overwrite the not-yet-downloaded GPU result with `0 + x`.
+            if (_cachedArray is not null)
+                Helpers.DeferredArrayMaterializer.TryMaterialize(_cachedArray);
             MarkDirty();
             _memory.Span[row * _cols + col] = value;
         }
@@ -1487,6 +1534,13 @@ public abstract class MatrixBase<T>
     /// </remarks>
     public ReadOnlySpan<T> AsSpan()
     {
+        // Issues #561 / #562: a Matrix returned by IEngine.MatrixMultiply on
+        // the GPU may be backed by a DeferredArrayMaterializer-registered
+        // array — its GPU buffer is still resident and the host array is
+        // empty until first read. Materialize before exposing the span so
+        // callers don't see zeros. Mirrors VectorBase.AsSpan's trigger.
+        if (_cachedArray is not null)
+            Helpers.DeferredArrayMaterializer.TryMaterialize(_cachedArray);
         return _memory.Span;
     }
 
@@ -1503,6 +1557,11 @@ public abstract class MatrixBase<T>
     /// </remarks>
     internal Span<T> AsWritableSpan()
     {
+        // See AsSpan() — a writable view must observe materialized data too,
+        // otherwise an "x[i] += y" pattern would read 0 and overwrite the
+        // not-yet-downloaded GPU result.
+        if (_cachedArray is not null)
+            Helpers.DeferredArrayMaterializer.TryMaterialize(_cachedArray);
         MarkDirty();
         return _memory.Span;
     }
@@ -1522,6 +1581,10 @@ public abstract class MatrixBase<T>
     /// </remarks>
     public ReadOnlyMemory<T> AsMemory()
     {
+        // Memory is held + read later, so we have to materialize NOW; we
+        // can't observe the read point of a stored Memory<T>.
+        if (_cachedArray is not null)
+            Helpers.DeferredArrayMaterializer.TryMaterialize(_cachedArray);
         return _memory;
     }
 
@@ -1538,6 +1601,8 @@ public abstract class MatrixBase<T>
     /// </remarks>
     internal Memory<T> AsWritableMemory()
     {
+        if (_cachedArray is not null)
+            Helpers.DeferredArrayMaterializer.TryMaterialize(_cachedArray);
         MarkDirty();
         return _memory;
     }
