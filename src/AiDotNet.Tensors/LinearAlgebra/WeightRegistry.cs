@@ -25,6 +25,17 @@ public static class WeightRegistry
     private static IGpuOffloadAllocator? _offloadAllocator;
     private static GpuOffloadOptions _options = new();
 
+    // Transparent-streaming owner map: streaming-pool handle → weak reference
+    // to the owning tensor (typed as the non-generic IStreamingDroppable so
+    // the registry stays element-type-agnostic, mirroring the pool). When the
+    // pool pages a handle's bytes out, DrainOwnerDropsAfterEviction looks the
+    // owner up here and drops its resident GC-heap _data — the symmetric half
+    // of transparent auto-rehydrate (TensorBase.EnsureMaterialized) that keeps
+    // the resident set bounded. WeakReference so a tensor GC'd without
+    // UnregisterWeight doesn't leak the entry; dead targets are pruned on
+    // drain. Written/read under _lock.
+    private static readonly Dictionary<long, WeakReference<IStreamingDroppable>> _ownerByHandle = new();
+
     /// <summary>Replaces the active options; must be called before any
     /// <see cref="WeightLifetime.Streaming"/> / GpuOffload registration.
     /// Throws <see cref="InvalidOperationException"/> when the existing pool
@@ -191,6 +202,11 @@ public static class WeightRegistry
                             bool dropped = weight.TryDropStorageForStreaming(throwOnSharedRefcount: false);
                             weight.StreamingPoolHandle = handle;
                             weight.StreamingDropDeferred = !dropped;
+                            // Record the owner so a later pool eviction can drop
+                            // this tensor's resident _data once transparent
+                            // auto-rehydrate has paged it back in. Weak ref: a
+                            // tensor GC'd without UnregisterWeight won't leak.
+                            _ownerByHandle[handle] = new WeakReference<IStreamingDroppable>(weight);
                         }
                         catch
                         {
@@ -492,6 +508,7 @@ public static class WeightRegistry
             if (weight.StreamingPoolHandle >= 0)
             {
                 _streamingPool?.Unregister(weight.StreamingPoolHandle);
+                _ownerByHandle.Remove(weight.StreamingPoolHandle);
                 weight.StreamingPoolHandle = -1;
             }
             if (weight.OffloadDevicePointer != IntPtr.Zero || weight.OffloadHostPointer != IntPtr.Zero)
@@ -707,6 +724,10 @@ public static class WeightRegistry
             StreamingTensorPool? poolRef;
             lock (_lock) { poolRef = _streamingPool; }
             poolRef?.MarkAccessed(weight.StreamingPoolHandle);
+            // Reconcile any evictions that happened on a non-Materialize path
+            // (a late RegisterWeight, or a background prefetch) since the last
+            // drain, so their owners' resident _data doesn't linger.
+            DrainOwnerDropsAfterEviction();
             return;
         }
 
@@ -737,6 +758,12 @@ public static class WeightRegistry
         }
         byte[] snapshot = pool.RehydrateInto(weight.StreamingPoolHandle);
         weight.RestoreStorageFromBytes(snapshot);
+
+        // RehydrateInto may have paged other weights out to stay under budget.
+        // Drop those owners' resident _data now so the transparent-streaming
+        // resident set stays bounded (the just-materialized weight is protected
+        // from eviction by RehydrateInto, so it's never in the drained set).
+        DrainOwnerDropsAfterEviction();
     }
 
     /// <summary>
@@ -1293,7 +1320,64 @@ public static class WeightRegistry
             _streamingPool = null;
             _offloadAllocator?.Dispose();
             _offloadAllocator = null;
+            _ownerByHandle.Clear();
             _options = new GpuOffloadOptions();
+        }
+    }
+
+    /// <summary>
+    /// Drops the resident in-memory <c>_data</c> of every tensor the streaming
+    /// pool has paged out since the last drain (see
+    /// <see cref="StreamingTensorPool.DrainEvictedHandles"/>). This is the
+    /// symmetric half of transparent auto-rehydrate
+    /// (<c>TensorBase&lt;T&gt;.EnsureMaterialized</c>): the pool frees its own
+    /// byte[] snapshot on eviction, and this frees the owning tensor's GC-heap
+    /// copy, so a forward pass that touches weight after weight keeps only a
+    /// bounded resident set (≈ budget) instead of accumulating every weight it
+    /// has read. Called at the end of each <see cref="Materialize{T}"/> page-in;
+    /// evictions from any source (Register, prefetch) are reconciled at the next
+    /// Materialize.
+    /// <para>
+    /// The drops run OUTSIDE <see cref="_lock"/> — <c>TryDropStorageForStreaming</c>
+    /// only touches the tensor's own storage refcount (a CAS), acquiring neither
+    /// the registry nor the pool lock, so there's no lock-order hazard. A soft
+    /// drop (<c>throwOnSharedRefcount: false</c>) leaves a weight resident when
+    /// its storage is still shared — the training-tape case — which is correct:
+    /// transparent streaming targets inference, where a paged-out weight's
+    /// refcount is 1 and the drop succeeds.
+    /// </para>
+    /// </summary>
+    private static void DrainOwnerDropsAfterEviction()
+    {
+        StreamingTensorPool? pool;
+        lock (_lock) { pool = _streamingPool; }
+        if (pool is null) return;
+
+        long[] evicted = pool.DrainEvictedHandles();
+        if (evicted.Length == 0) return;
+
+        foreach (long handle in evicted)
+        {
+            IStreamingDroppable? owner = null;
+            lock (_lock)
+            {
+                if (_ownerByHandle.TryGetValue(handle, out var weak) && !weak.TryGetTarget(out owner))
+                {
+                    // Tensor was GC'd without UnregisterWeight — prune the dead
+                    // entry; there's no resident copy left to drop.
+                    _ownerByHandle.Remove(handle);
+                }
+            }
+
+            // Only drop if the owner still maps to THIS handle (a re-registered
+            // tensor could have a new handle). Soft drop tolerates shared
+            // refcount (returns false) and only throws on view/non-contiguous
+            // storage, which a registered weight never is — guarded anyway.
+            if (owner is not null && owner.StreamingPoolHandle == handle)
+            {
+                try { owner.TryDropStorageForStreaming(throwOnSharedRefcount: false); }
+                catch (InvalidOperationException) { /* not droppable (view/non-contiguous) — leave resident */ }
+            }
         }
     }
 }
