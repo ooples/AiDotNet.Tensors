@@ -905,6 +905,14 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
     {
         get
         {
+            // Same auto-materialization guard as AsSpan / AsWritableSpan: a lazy
+            // node is realized and a paged-out streaming weight is rehydrated
+            // before its backing storage is handed out. .Memory / .Data are the
+            // accessors engine + layer code (e.g. SelfAttentionLayer.Forward) use
+            // to reach the buffer, so without this gate a dropped streaming weight
+            // would Slice empty storage and throw. See EnsureMaterialized.
+            EnsureMaterialized();
+
             if (!IsContiguous)
                 throw new InvalidOperationException(
                     "Cannot get contiguous Memory from a non-contiguous tensor view. Call Contiguous() first.");
