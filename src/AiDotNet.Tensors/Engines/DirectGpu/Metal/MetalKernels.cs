@@ -1677,6 +1677,32 @@ kernel void matmul_naive(
     }
 }
 
+// Mixed-precision GEMM: FP16 inputs, FP32 accumulator + FP32 output — the
+// AMP standard (matches cuBLAS cublasGemmEx(CUDA_R_16F, COMPUTE_32F)). The
+// half operands are packed two-per-32-bit-word by ConvertToFp16; reinterpreting
+// the buffer as 'device const half*' indexes each half directly. Accumulating in
+// float avoids the worst half-precision drift. One thread per output element.
+kernel void matmul_fp16_fp32out(
+    device const half* A [[buffer(0)]],
+    device const half* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    constant uint& K [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint row = gid.y;
+    uint col = gid.x;
+
+    if (row < M && col < N) {
+        float sum = 0.0f;
+        for (uint k = 0; k < K; k++) {
+            sum += float(A[row * K + k]) * float(B[k * N + col]);
+        }
+        C[row * N + col] = sum;
+    }
+}
+
 // Tiled matrix multiplication for better cache utilization
 kernel void matmul_tiled(
     device const float* A [[buffer(0)]],
