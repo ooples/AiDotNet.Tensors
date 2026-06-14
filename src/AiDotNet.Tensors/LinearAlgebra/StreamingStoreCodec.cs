@@ -2,6 +2,10 @@
 
 using System;
 using K4os.Compression.LZ4;
+#if NET5_0_OR_GREATER
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
+#endif
 
 namespace AiDotNet.Tensors.LinearAlgebra;
 
@@ -185,25 +189,145 @@ internal static class StreamingStoreCodec
     // didn't shrink). LZ4 decode is ~6.7 GB/s so it never bottlenecks rehydrate. This is
     // the EXACT (lossless) store option; bf16/int8 give more (2x/4x) at a precision cost.
 
+    // Shuffle = transpose the [count × elem] byte matrix to [elem × count] (group byte-k of
+    // every element). The naive whole-array strided pass thrashes cache/TLB (~256 MiB/s) and
+    // was the reason lossless couldn't be a default. Fast paths:
+    //   • fp32 (elem 4): AVX2 byte-plane transpose (unpack/permute), 32 elements/iter.
+    //   • everything else / net471 / SIMD remainder: a CACHE-TILED scalar pass — same result
+    //     as the naive loop but the strided source stays within an L1/L2-sized tile, which
+    //     alone is several× faster than the whole-array version.
+    private const int ShuffleTileElems = 2048; // tile * elem stays in L1/L2
+
     private static void BytePlaneShuffle(ReadOnlySpan<byte> src, Span<byte> dst, int elem)
     {
         int count = src.Length / elem;
-        for (int k = 0; k < elem; k++)
+#if NET5_0_OR_GREATER
+        if (elem == 4 && Ssse3.IsSupported && count >= 4)
         {
-            int planeBase = k * count;
-            for (int i = 0; i < count; i++) dst[planeBase + i] = src[i * elem + k];
+            int vec = count & ~3; // largest multiple of 4
+            Shuffle4Ssse3(src, dst, count, vec);
+            ShuffleTailScalar(src, dst, elem, count, vec);
+            return;
         }
+#endif
+        BytePlaneShuffleScalar(src, dst, elem, count, 0);
     }
 
     private static void BytePlaneUnshuffle(ReadOnlySpan<byte> src, Span<byte> dst, int elem)
     {
         int count = dst.Length / elem;
+#if NET5_0_OR_GREATER
+        if (elem == 4 && Ssse3.IsSupported && count >= 4)
+        {
+            int vec = count & ~3;
+            Unshuffle4Ssse3(src, dst, count, vec);
+            UnshuffleTailScalar(src, dst, elem, count, vec);
+            return;
+        }
+#endif
+        BytePlaneUnshuffleScalar(src, dst, elem, count, 0);
+    }
+
+    // Cache-tiled scalar transpose, from element `from` to `count`. Correctness reference
+    // for the SIMD paths (the SIMD tests assert bit-identical output).
+    private static void BytePlaneShuffleScalar(ReadOnlySpan<byte> src, Span<byte> dst, int elem, int count, int from)
+    {
+        for (int b0 = from; b0 < count; b0 += ShuffleTileElems)
+        {
+            int b1 = Math.Min(b0 + ShuffleTileElems, count);
+            for (int k = 0; k < elem; k++)
+            {
+                int planeBase = k * count;
+                for (int i = b0; i < b1; i++) dst[planeBase + i] = src[i * elem + k];
+            }
+        }
+    }
+
+    private static void BytePlaneUnshuffleScalar(ReadOnlySpan<byte> src, Span<byte> dst, int elem, int count, int from)
+    {
+        for (int b0 = from; b0 < count; b0 += ShuffleTileElems)
+        {
+            int b1 = Math.Min(b0 + ShuffleTileElems, count);
+            for (int k = 0; k < elem; k++)
+            {
+                int planeBase = k * count;
+                for (int i = b0; i < b1; i++) dst[i * elem + k] = src[planeBase + i];
+            }
+        }
+    }
+
+#if NET5_0_OR_GREATER
+    // Scalar remainder for the SIMD prefix [vec, count). Element i's plane writes are at
+    // dst[k*count + i] (shuffle) / read from there (unshuffle) — same layout as the SIMD body.
+    private static void ShuffleTailScalar(ReadOnlySpan<byte> src, Span<byte> dst, int elem, int count, int vec)
+    {
         for (int k = 0; k < elem; k++)
         {
             int planeBase = k * count;
-            for (int i = 0; i < count; i++) dst[i * elem + k] = src[planeBase + i];
+            for (int i = vec; i < count; i++) dst[planeBase + i] = src[i * elem + k];
         }
     }
+
+    private static void UnshuffleTailScalar(ReadOnlySpan<byte> src, Span<byte> dst, int elem, int count, int vec)
+    {
+        for (int k = 0; k < elem; k++)
+        {
+            int planeBase = k * count;
+            for (int i = vec; i < count; i++) dst[i * elem + k] = src[planeBase + i];
+        }
+    }
+
+    // AVX2 byte-plane transpose for 4-byte elements. 128 bytes (32 floats) per iteration:
+    // pshufb groups bytes by plane within each 128-bit lane, two unpack stages transpose the
+    // 32-/64-bit groups, and a permute fixes the lane crossing — yielding 4 contiguous
+    // 32-byte plane outputs. Bit-identical to BytePlaneShuffleScalar (asserted by tests).
+    // Self-inverse per-128-bit byte gather [0,4,8,12, 1,5,9,13, 2,6,10,14, 3,7,11,15]:
+    // applied to 4 elements' interleaved bytes it groups them by plane; applied to 4 planes'
+    // grouped bytes it scatters them back to element order. Same mask both directions.
+    private static readonly Vector128<byte> ByteGroupMask128 = Vector128.Create(
+        (byte)0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15);
+
+    // SSSE3 byte-plane shuffle for 4-byte elements, 4 elements (16 bytes) per iteration. One
+    // 128-bit pshufb groups the 4 elements' bytes by plane → [p0:4 p1:4 p2:4 p3:4]; the four
+    // 32-bit lanes are then written to the four plane offsets. No cross-lane ops, so the output
+    // is bit-identical to BytePlaneShuffleScalar (the SIMD prefix + scalar tail compose into
+    // the exact scalar layout). Asserted by the round-trip + scalar-equality tests.
+    private static unsafe void Shuffle4Ssse3(ReadOnlySpan<byte> src, Span<byte> dst, int count, int vec)
+    {
+        Vector128<byte> mask = ByteGroupMask128;
+        fixed (byte* ps = src)
+        fixed (byte* pd = dst)
+        {
+            for (int i = 0; i < vec; i += 4)
+            {
+                Vector128<int> g = Ssse3.Shuffle(Sse2.LoadVector128(ps + i * 4), mask).AsInt32();
+                *(int*)(pd + 0 * count + i) = g.GetElement(0);
+                *(int*)(pd + 1 * count + i) = g.GetElement(1);
+                *(int*)(pd + 2 * count + i) = g.GetElement(2);
+                *(int*)(pd + 3 * count + i) = g.GetElement(3);
+            }
+        }
+    }
+
+    // Inverse: gather one 32-bit lane from each of the 4 planes, pshufb back to element order.
+    private static unsafe void Unshuffle4Ssse3(ReadOnlySpan<byte> src, Span<byte> dst, int count, int vec)
+    {
+        Vector128<byte> mask = ByteGroupMask128;
+        fixed (byte* ps = src)
+        fixed (byte* pd = dst)
+        {
+            for (int i = 0; i < vec; i += 4)
+            {
+                Vector128<int> g = Vector128.Create(
+                    *(int*)(ps + 0 * count + i),
+                    *(int*)(ps + 1 * count + i),
+                    *(int*)(ps + 2 * count + i),
+                    *(int*)(ps + 3 * count + i));
+                Sse2.Store(pd + i * 4, Ssse3.Shuffle(g.AsByte(), mask));
+            }
+        }
+    }
+#endif
 
     private static byte[] EncodeLosslessBytes(ReadOnlySpan<byte> raw, int elem)
     {
@@ -247,6 +371,29 @@ internal static class StreamingStoreCodec
                 throw new InvalidOperationException($"Lossless decode: raw payload {shuffled.Length} bytes, expected {shuffledLen}.");
         }
         BytePlaneUnshuffle(shuffled, dstRaw, elem);
+    }
+
+    // ── Test hooks (InternalsVisibleTo) — exercise the shuffle transform directly so tests
+    //    can assert the SIMD path is bit-identical to the scalar reference + invertible. ──
+    internal static byte[] ShuffleForTest(ReadOnlySpan<byte> raw, int elem)
+    {
+        var d = new byte[raw.Length];
+        BytePlaneShuffle(raw, d, elem);
+        return d;
+    }
+
+    internal static byte[] ShuffleScalarForTest(ReadOnlySpan<byte> raw, int elem)
+    {
+        var d = new byte[raw.Length];
+        BytePlaneShuffleScalar(raw, d, elem, raw.Length / elem, 0);
+        return d;
+    }
+
+    internal static byte[] UnshuffleForTest(ReadOnlySpan<byte> shuffled, int elem)
+    {
+        var d = new byte[shuffled.Length];
+        BytePlaneUnshuffle(shuffled, d, elem);
+        return d;
     }
 
     /// <summary>fp32 → lossless (byte-shuffle + LZ4). Returns a variable-size buffer.</summary>
