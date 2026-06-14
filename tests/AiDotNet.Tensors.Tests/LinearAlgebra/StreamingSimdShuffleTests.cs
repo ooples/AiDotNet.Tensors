@@ -98,10 +98,14 @@ public class StreamingSimdShuffleTests
 
 #if NET5_0_OR_GREATER
     // Throughput target applies to the SSSE3 path; net471 uses the tiled-scalar fallback
-    // (correctness still verified above) and isn't held to the SIMD bar.
+    // (correctness still verified above) and isn't held to the SIMD bar. The same
+    // tiled-scalar path also runs on a NET5_0_OR_GREATER host whose CPU lacks SSSE3
+    // (rare but possible — pre-Core2 x86, some embedded ARM via x86-on-ARM emu, CI
+    // sandboxes that mask intrinsics). Detect at runtime and gate to the right bar.
     [Fact]
     public void Shuffle4_Throughput_BeatsNaiveBottleneck()
     {
+        bool ssse3 = System.Runtime.Intrinsics.X86.Ssse3.IsSupported;
         // 16 MiB of fp32 — large enough to be memory-bound, the realistic regime.
         const int count = 4 * 1024 * 1024;
         var raw = RandomBytes(count * 4, 7);
@@ -121,12 +125,24 @@ public class StreamingSimdShuffleTests
             dst = s;
         }
         double mibPerSec = raw.Length / (1024.0 * 1024.0) / (best / 1000.0);
-        _out.WriteLine($"SIMD byte-shuffle: {raw.Length / (1024 * 1024)} MiB in {best:F3} ms = {mibPerSec:F0} MiB/s " +
+        _out.WriteLine($"byte-shuffle ({(ssse3 ? "SSSE3" : "tiled-scalar")}): {raw.Length / (1024 * 1024)} MiB in {best:F3} ms = {mibPerSec:F0} MiB/s " +
                        $"({mibPerSec / 1024:F2} GiB/s)  [naive whole-array pass was ~256 MiB/s]");
         Assert.True(dst.Length == raw.Length);
         // The whole point: clear the naive bottleneck by a wide margin (NVMe is ~3 GB/s, so
         // anything well above that means the shuffle no longer gates lossless throughput).
-        Assert.True(mibPerSec > 1024, $"SIMD shuffle {mibPerSec:F0} MiB/s should clear ~1 GiB/s (naive was ~256 MiB/s)");
+        // On SSSE3 we hold the ~1 GiB/s bar (the SIMD claim); on the tiled-scalar fallback
+        // (no SSSE3 — rare but real) we still demand the tiled pass clears the naive
+        // whole-array thrash by a comfortable margin.
+        if (ssse3)
+        {
+            Assert.True(mibPerSec > 1024,
+                $"SSSE3 shuffle {mibPerSec:F0} MiB/s should clear ~1 GiB/s (naive was ~256 MiB/s).");
+        }
+        else
+        {
+            Assert.True(mibPerSec > 400,
+                $"Tiled-scalar fallback {mibPerSec:F0} MiB/s should still clear the ~256 MiB/s naive baseline by ≥1.5×.");
+        }
     }
 #endif
 }
