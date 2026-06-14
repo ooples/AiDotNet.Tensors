@@ -112,7 +112,21 @@ public class QuantizedComputeW8A8Tests
         // Speed varies by shape (fp32's machine-code kernel is shape-gated — see the
         // apples-to-apples Theory for GFLOP/s); correctness is the hard gate. int8-weight
         // is steady-fast (~400+ GFLOP/s) and faster than fp32 at realistic shapes.
-        Assert.True(int8Ms > 0);
+
+        // CodeRabbit #604: the prior `Assert.True(int8Ms > 0)` was an
+        // always-passing sentinel — a real regression in
+        // SgemmWithInt8RowScaledCachedB during the timed loop (silent
+        // overflow, transposed output, NaN) wouldn't surface here. Verify
+        // the LAST timed result matches the fp32-on-quantized reference
+        // bit-for-quant-tolerance, the same bound the correctness section
+        // above uses. This costs O(m·n) on top of the timing.
+        double sum2Timed = 0, ref2Timed = 0;
+        for (int i = 0; i < m * n; i++) { double e = cInt8[i] - cRef[i]; sum2Timed += e * e; ref2Timed += (double)cRef[i] * cRef[i]; }
+        double relTimed = Math.Sqrt(sum2Timed / Math.Max(1e-30, ref2Timed));
+        Assert.True(relTimed < 0.01,
+            $"int8 GEMM output drifted during the perf loop — rel RMS {relTimed:E3} (correctness gate is 0.01).");
+        Assert.True(int8Ms > 0 && fp32Ms > 0,
+            $"Timings must be positive (got fp32={fp32Ms:F3}ms int8={int8Ms:F3}ms).");
     }
 
     [Theory]
@@ -153,7 +167,35 @@ public class QuantizedComputeW8A8Tests
         _out.WriteLine($"  fp32        : {fp32,7:F3} ms  {gflop / (fp32 / 1000),6:F0} GFLOP/s");
         _out.WriteLine($"  int8-weight : {int8w,7:F3} ms  {gflop / (int8w / 1000),6:F0} GFLOP/s  ({fp32 / int8w:F2}x fp32)");
         _out.WriteLine($"  W8A8        : {w8a8,7:F3} ms  {gflop / (w8a8 / 1000),6:F0} GFLOP/s  ({fp32 / w8a8:F2}x fp32)");
-        Assert.True(fp32 > 0 && int8w > 0 && w8a8 > 0);
+
+        // CodeRabbit #604: the prior `Assert.True(fp32>0 && int8w>0 && w8a8>0)`
+        // was an always-passing benchmark sentinel — silent overflow,
+        // shape mismatch, or NaN in either int8 kernel would leave CI
+        // green. Cross-check the outputs against the fp32 reference within
+        // quantization-error tolerance.
+        //
+        // The fp32 reference here multiplies a × bT (full-precision B),
+        // while int8w and w8a8 use bInt8 + per-row scales. The error vs
+        // fp32 is dominated by per-row int8 quantization noise
+        // (~1/127 ≈ 0.8% per element), which accumulates across K
+        // independent rounded terms (RMS ≈ 0.8% / sqrt(K) for Gaussian
+        // a; for k=512 that's ~0.04%). We allow 5% to absorb additional
+        // sources (input scale, edge rows, kernel ordering differences).
+        double Rms(float[] x, float[] y)
+        {
+            double s = 0, r = 0;
+            for (int i = 0; i < x.Length; i++) { double e = x[i] - y[i]; s += e * e; r += (double)y[i] * y[i]; }
+            return Math.Sqrt(s / Math.Max(1e-30, r));
+        }
+        double relInt8 = Rms(cInt8W, cFp32);
+        double relW8A8 = Rms(cW8A8, cFp32);
+        _out.WriteLine($"  rel RMS vs fp32: int8-weight {relInt8:E2}, W8A8 {relW8A8:E2}");
+        Assert.True(relInt8 < 0.05,
+            $"int8-weight output diverged from fp32 reference: rel RMS {relInt8:E3}.");
+        Assert.True(relW8A8 < 0.10,
+            $"W8A8 output diverged from fp32 reference: rel RMS {relW8A8:E3} (W8A8 quantizes both A and B, hence the wider 10% bound).");
+        Assert.True(fp32 > 0 && int8w > 0 && w8a8 > 0,
+            $"Timings must be positive (got fp32={fp32:F3}ms int8w={int8w:F3}ms w8a8={w8a8:F3}ms).");
     }
 
     [Fact]
