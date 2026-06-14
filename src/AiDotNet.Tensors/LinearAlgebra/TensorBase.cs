@@ -299,27 +299,60 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
             throw new InvalidOperationException(
                 "Streaming restore requires contiguous, non-view, zero-offset tensors.");
 
-        // Use the typed-fast-path size table rather than Marshal.SizeOf<T>:
-        // the latter throws ArgumentException for non-blittable types
-        // (Complex, Multivector) with a confusing native-interop message.
-        // ElementSizeForStreaming throws NotSupportedException with a
-        // clear "use a supported element type" message instead, matching
-        // WeightRegistry.SerializeToBytes' error contract.
-        int elementSize = ElementSizeForStreaming();
-        long expectedBytes = (long)Length * elementSize;
-        if (bytes.Length != expectedBytes)
-            throw new ArgumentException(
-                $"Streaming restore: buffer length {bytes.Length} does not match " +
-                $"expected {expectedBytes} bytes (Length={Length} × element size={elementSize}).");
+        Vector<T> fresh;
+        // bf16-encoded store (StreamingStoreEncoding == 1): the backing bytes are
+        // 2-per-element bf16; widen them back to T (float/double) here. The pool is
+        // byte-agnostic, so the 2x-smaller bytes flowed through register/evict/
+        // rehydrate transparently — only this restore boundary knows to widen.
+        if (StreamingStoreEncoding == 1)
+        {
+            long expectedBf16 = (long)Length * StreamingStoreCodec.Bf16ElementSize;
+            if (bytes.Length != expectedBf16)
+                throw new ArgumentException(
+                    $"Streaming restore (bf16): buffer length {bytes.Length} does not match " +
+                    $"expected {expectedBf16} bytes (Length={Length} × 2).");
+            if (typeof(T) == typeof(float))
+            {
+                var arr = new float[Length];
+                StreamingStoreCodec.DecodeFloat(bytes, arr);
+                fresh = Vector<T>.WrapMemory((T[])(object)arr);
+            }
+            else if (typeof(T) == typeof(double))
+            {
+                var arr = new double[Length];
+                StreamingStoreCodec.DecodeDouble(bytes, arr);
+                fresh = Vector<T>.WrapMemory((T[])(object)arr);
+            }
+            else
+            {
+                throw new NotSupportedException(
+                    $"bf16 streaming store is only supported for float/double, not {typeof(T).Name}.");
+            }
+        }
+        else
+        {
+            // Use the typed-fast-path size table rather than Marshal.SizeOf<T>:
+            // the latter throws ArgumentException for non-blittable types
+            // (Complex, Multivector) with a confusing native-interop message.
+            // ElementSizeForStreaming throws NotSupportedException with a
+            // clear "use a supported element type" message instead, matching
+            // WeightRegistry.SerializeToBytes' error contract.
+            int elementSize = ElementSizeForStreaming();
+            long expectedBytes = (long)Length * elementSize;
+            if (bytes.Length != expectedBytes)
+                throw new ArgumentException(
+                    $"Streaming restore: buffer length {bytes.Length} does not match " +
+                    $"expected {expectedBytes} bytes (Length={Length} × element size={elementSize}).");
 
-        // Construct a typed backing array, deserialize bytes into it via
-        // typed fast paths — same set WeightRegistry.SerializeToBytes
-        // covers — then wrap it back into a Vector<T>. We can't use
-        // MemoryMarshal.Cast on Span<T> directly because T isn't
-        // constrained to struct on TensorBase, so we go through typed
-        // arrays via the (T[])(object)typed[] cast that's safe at runtime
-        // when typeof(T) matches.
-        var fresh = DeserializeToVector(bytes, Length);
+            // Construct a typed backing array, deserialize bytes into it via
+            // typed fast paths — same set WeightRegistry.SerializeToBytes
+            // covers — then wrap it back into a Vector<T>. We can't use
+            // MemoryMarshal.Cast on Span<T> directly because T isn't
+            // constrained to struct on TensorBase, so we go through typed
+            // arrays via the (T[])(object)typed[] cast that's safe at runtime
+            // when typeof(T) matches.
+            fresh = DeserializeToVector(bytes, Length);
+        }
 
         var oldStorage = _storage;
         _data = fresh;
@@ -796,6 +829,15 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
     /// </para>
     /// </summary>
     internal bool StreamingDropDeferred { get; set; }
+
+    /// <summary>
+    /// How this tensor's bytes are encoded in the streaming pool's backing store:
+    /// 0 = native (fp32/fp64/etc. raw), 1 = bf16 (2x smaller, decoded back to T on
+    /// restore). Set by <see cref="WeightRegistry.RegisterWeight{T}"/> from the
+    /// resolved <see cref="StreamingStoreDtype"/> policy; read by
+    /// <see cref="RestoreStorageFromBytes"/> so it knows whether to widen bf16 → T.
+    /// </summary>
+    internal byte StreamingStoreEncoding { get; set; }
 
     /// <summary>
     /// GPU offload allocation handle when <see cref="Lifetime"/> is

@@ -152,9 +152,18 @@ public static class WeightRegistry
                         // regardless of host RAM. Helper is internal so
                         // the overflow guard can be unit-tested directly
                         // without faking a multi-GB tensor.
-                        int byteCount = CheckedStreamingByteCount<T>(weight.Length);
+                        // Resolve the store encoding (bf16 vs native) from the
+                        // StreamingStoreDtype policy + execution mode. bf16 halves the
+                        // registered byte[] and everything downstream (resident set,
+                        // eviction, disk) for free — the pool is byte-agnostic; only the
+                        // restore boundary widens bf16 → T (RestoreStorageFromBytes).
+                        var (encoding, stochastic) = ResolveStoreEncoding<T>();
+                        int byteCount = encoding == 1
+                            ? CheckedBf16ByteCount(weight.Length)
+                            : CheckedStreamingByteCount<T>(weight.Length);
                         var bytes = new byte[byteCount];
-                        SerializeToBytes(weight, bytes);
+                        SerializeToBytes(weight, bytes, encoding, stochastic);
+                        weight.StreamingStoreEncoding = encoding;
                         var pool = StreamingPoolUnlocked();
                         // If this tensor was produced by AllocateStreaming,
                         // it carries the reservation byteCount the pool
@@ -561,6 +570,58 @@ public static class WeightRegistry
     /// can be unit-tested directly against synthetic Length values
     /// without allocating a 2GB+ tensor in a test process.
     /// </summary>
+    // Execution-mode hint for StreamingStoreDtype.Auto. The model's training-mode
+    // toggle sets this so Auto stores bf16 in inference (read-only weights → a safe
+    // one-time quantization) and full precision in training (preserve fp32/fp64
+    // masters — small updates would be lost to bf16). null = unknown → safe (full).
+    private static bool? _streamingTrainingMode;
+
+    /// <summary>
+    /// Hints whether streaming weights are currently used in TRAINING (<c>true</c>)
+    /// or INFERENCE (<c>false</c>) so <see cref="StreamingStoreDtype.Auto"/> picks
+    /// bf16 only where it's safe. <c>null</c> = unknown (treated as training → full
+    /// precision). The model's <c>SetTrainingMode</c> forwards here.
+    /// </summary>
+    public static void SetStreamingExecutionTraining(bool? isTraining)
+    {
+        lock (_lock) { _streamingTrainingMode = isTraining; }
+    }
+
+    /// <summary>
+    /// Resolves the streaming-store encoding (1 = bf16, 0 = native) and rounding
+    /// (stochastic) for type T from <see cref="GpuOffloadOptions.StreamingStoreDtype"/>
+    /// and the execution-mode hint. Only float/double can be bf16-encoded; all other
+    /// types always store native. Caller holds <see cref="_lock"/>.
+    /// </summary>
+    private static (byte encoding, bool stochastic) ResolveStoreEncoding<T>()
+    {
+        if (typeof(T) != typeof(float) && typeof(T) != typeof(double)) return (0, false);
+        switch (_options.StreamingStoreDtype)
+        {
+            case StreamingStoreDtype.FullPrecision: return (0, false);
+            case StreamingStoreDtype.Bf16: return (1, false);
+            case StreamingStoreDtype.Bf16Stochastic: return (1, true);
+            case StreamingStoreDtype.Auto:
+            default:
+                // bf16 ONLY when we KNOW it's inference; training or unknown →
+                // full precision so we never silently make the masters bf16.
+                return _streamingTrainingMode == false ? ((byte)1, false) : ((byte)0, false);
+        }
+    }
+
+    /// <summary>bf16 byte count (2 per element) with the same int.MaxValue overflow
+    /// guard as <see cref="CheckedStreamingByteCount{T}"/>.</summary>
+    internal static int CheckedBf16ByteCount(int length)
+    {
+        if (length < 0) throw new ArgumentOutOfRangeException(nameof(length));
+        long byteCountLong = (long)length * StreamingStoreCodec.Bf16ElementSize;
+        if (byteCountLong > int.MaxValue)
+            throw new NotSupportedException(
+                $"Streaming bf16 registration requires per-tensor size <= {int.MaxValue} bytes. " +
+                $"Tensor has {length} elements × 2 bytes = {byteCountLong} bytes. Chunk it.");
+        return (int)byteCountLong;
+    }
+
     internal static int CheckedStreamingByteCount<T>(int length)
     {
         if (length < 0) throw new ArgumentOutOfRangeException(nameof(length));
@@ -630,8 +691,27 @@ public static class WeightRegistry
     /// at the bottom — there is intentionally no generic fallback because a
     /// byte-by-byte memcpy would silently lose data for non-blittable types.
     /// </summary>
-    private static void SerializeToBytes<T>(Tensor<T> tensor, byte[] dst)
+    private static void SerializeToBytes<T>(Tensor<T> tensor, byte[] dst, byte encoding = 0, bool stochastic = false)
     {
+        // bf16 store (encoding == 1): narrow float/double → 2-byte bf16. dst is
+        // sized to Length*2 by the caller (CheckedBf16ByteCount).
+        if (encoding == 1)
+        {
+            if (typeof(T) == typeof(float))
+            {
+                var srcF = (float[])(object)tensor.AsSpan().ToArray();
+                StreamingStoreCodec.EncodeFloat(srcF, dst, stochastic);
+                return;
+            }
+            if (typeof(T) == typeof(double))
+            {
+                var srcD = (double[])(object)tensor.AsSpan().ToArray();
+                StreamingStoreCodec.EncodeDouble(srcD, dst, stochastic);
+                return;
+            }
+            throw new NotSupportedException(
+                $"bf16 streaming store is only supported for float/double, not {typeof(T).Name}.");
+        }
         if (typeof(T) == typeof(float))
         {
             var src = (float[])(object)tensor.AsSpan().ToArray();
