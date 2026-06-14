@@ -170,7 +170,7 @@ public static class WeightRegistry
                             int byteCount = encoding switch
                             {
                                 StreamingEncoding.Bf16 => CheckedBf16ByteCount(weight.Length),
-                                StreamingEncoding.Int8 => CheckedInt8ByteCount(weight.Length),
+                                StreamingEncoding.Int8 => CheckedInt8ByteCount(weight.Length, weight.Int8QuantRows),
                                 _ => CheckedStreamingByteCount<T>(weight.Length),
                             };
                             bytes = new byte[byteCount];
@@ -706,15 +706,17 @@ public static class WeightRegistry
             $"Lossless streaming store is only supported for float/double, not {typeof(T).Name}.");
     }
 
-    /// <summary>int8 byte count (1 per element + 4-byte scale) with overflow guard.</summary>
-    internal static int CheckedInt8ByteCount(int length)
+    /// <summary>int8 byte count (1 per element + 4-byte row-count header + 4 bytes per row
+    /// scale) with overflow guard.</summary>
+    internal static int CheckedInt8ByteCount(int length, int rows)
     {
         if (length < 0) throw new ArgumentOutOfRangeException(nameof(length));
-        long byteCountLong = (long)length + StreamingStoreCodec.Int8ScaleBytes;
+        if (rows <= 0) throw new ArgumentOutOfRangeException(nameof(rows));
+        long byteCountLong = 4L + 4L * rows + length; // [int32 rows][rows × fp32 scale][int8 data]
         if (byteCountLong > int.MaxValue)
             throw new NotSupportedException(
                 $"Streaming int8 registration requires per-tensor size <= {int.MaxValue} bytes. " +
-                $"Tensor has {length} elements + 4 scale bytes = {byteCountLong} bytes. Chunk it.");
+                $"Tensor has {length} elements + {4 + 4 * rows} header bytes = {byteCountLong} bytes. Chunk it.");
         return (int)byteCountLong;
     }
 
@@ -808,20 +810,22 @@ public static class WeightRegistry
             throw new NotSupportedException(
                 $"bf16 streaming store is only supported for float/double, not {typeof(T).Name}.");
         }
-        // int8 store (StreamingEncoding.Int8): per-tensor symmetric quantization. dst
-        // is sized to Int8BufferBytes(Length) by the caller (CheckedInt8ByteCount).
+        // int8 store (StreamingEncoding.Int8): PER-ROW symmetric quantization. dst is sized
+        // to Int8BufferBytes(Length, rows) by the caller (CheckedInt8ByteCount). rows = the
+        // tensor's leading dim, so each output channel gets its own scale.
         if (encoding == StreamingEncoding.Int8)
         {
+            int rows = tensor.Int8QuantRows;
             if (typeof(T) == typeof(float))
             {
                 var srcF = (float[])(object)tensor.AsSpan().ToArray();
-                StreamingStoreCodec.EncodeInt8Float(srcF, dst);
+                StreamingStoreCodec.EncodeInt8Float(srcF, dst, rows);
                 return;
             }
             if (typeof(T) == typeof(double))
             {
                 var srcD = (double[])(object)tensor.AsSpan().ToArray();
-                StreamingStoreCodec.EncodeInt8Double(srcD, dst);
+                StreamingStoreCodec.EncodeInt8Double(srcD, dst, rows);
                 return;
             }
             throw new NotSupportedException(
@@ -901,7 +905,9 @@ public static class WeightRegistry
         if (weight is null) throw new ArgumentNullException(nameof(weight));
         if (weight.Lifetime != WeightLifetime.Streaming) return;
         if (weight.StreamingPoolHandle < 0) return;
-        if (weight.DataVector.Length == weight.Length)
+        // A no-upcast int8 weight is already materialized (as int8 + scales), even though its
+        // fp32 _data is empty — treat it as resident so we don't re-fetch + re-attach each call.
+        if (weight.DataVector.Length == weight.Length || weight.StreamingInt8 is not null)
         {
             // Already resident — but still bump the pool's LRU heat so
             // this hot weight doesn't get evicted in favor of cold ones.
@@ -973,7 +979,19 @@ public static class WeightRegistry
         }
 
         byte[] snapshot = pool.RehydrateInto(weight.StreamingPoolHandle);
-        weight.RestoreStorageFromBytes(snapshot);
+        // No-upcast int8 fast path: keep an int8-stored weight as int8 + per-row scales in
+        // inference so the matmul fast path feeds the int8 GEMM directly (no dequant to fp32).
+        // The fp32 view is produced lazily by EnsureMaterialized only if a non-matmul path
+        // reads it. Training/unknown still decode to fp32 (the optimizer writes the weight).
+        if (inferenceMode && weight.StreamingStoreEncoding == StreamingEncoding.Int8
+            && (typeof(T) == typeof(float) || typeof(T) == typeof(double)))
+        {
+            weight.AttachStreamingInt8(snapshot);
+        }
+        else
+        {
+            weight.RestoreStorageFromBytes(snapshot);
+        }
 
         // RehydrateInto may have paged other weights out to stay under budget.
         // Drop those owners' resident _data now so the transparent-streaming

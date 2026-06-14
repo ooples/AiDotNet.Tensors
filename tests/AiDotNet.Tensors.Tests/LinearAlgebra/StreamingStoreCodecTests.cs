@@ -130,36 +130,69 @@ public class StreamingStoreCodecTests
     }
 
     [Fact]
-    public void Int8_RoundTrip_4xSmaller_WithinPerTensorPrecision()
+    public void Int8_RoundTrip_4xSmaller_WithinPerRowPrecision()
     {
         var rng = new Rng(7);
-        int n = 4096;
+        const int rows = 64, k = 64, n = rows * k;
         var src = new float[n];
         for (int i = 0; i < n; i++) src[i] = rng.NextGaussian(0.05);
 
-        int bytes = StreamingStoreCodec.Int8BufferBytes(n);
-        Assert.Equal(n + 4, bytes); // 1 byte/elem + 4-byte scale → ~4x vs fp32
+        int bytes = StreamingStoreCodec.Int8BufferBytes(n, rows);
+        Assert.Equal(4 + 4 * rows + n, bytes); // [int32 rows][rows scales][int8 data] → still ~4x vs fp32
         var enc = new byte[bytes];
-        StreamingStoreCodec.EncodeInt8Float(src, enc);
+        StreamingStoreCodec.EncodeInt8Float(src, enc, rows);
         var dec = new float[n];
         StreamingStoreCodec.DecodeInt8Float(enc, dec);
 
         double sum2 = 0, ref2 = 0;
         for (int i = 0; i < n; i++) { double e = dec[i] - src[i]; sum2 += e * e; ref2 += (double)src[i] * src[i]; }
         double rmse = Math.Sqrt(sum2 / ref2);
-        // Per-tensor symmetric int8 → ~1.1% RMS on Gaussian weights; allow headroom.
         Assert.True(rmse < 0.02, $"int8 RMS relative error {rmse} should be ~1%");
+    }
+
+    [Fact]
+    public void Int8_PerRow_BeatsPerTensor_OnVariedRowMagnitudes()
+    {
+        // The reason for per-row: rows with wildly different magnitudes. A single per-tensor
+        // scale is dominated by the largest row, clipping the small rows to near-zero int8.
+        var rng = new Rng(11);
+        const int rows = 32, k = 64, n = rows * k;
+        var src = new float[n];
+        for (int r = 0; r < rows; r++)
+        {
+            // Row magnitude spans 4 orders: row 0 ~1e-3, last row ~1e1.
+            double rowStd = Math.Pow(10, -3 + 4.0 * r / (rows - 1));
+            for (int j = 0; j < k; j++) src[r * k + j] = rng.NextGaussian(rowStd);
+        }
+
+        // per-row (the new store): rows = 32
+        var encRow = new byte[StreamingStoreCodec.Int8BufferBytes(n, rows)];
+        StreamingStoreCodec.EncodeInt8Float(src, encRow, rows);
+        var decRow = new float[n];
+        StreamingStoreCodec.DecodeInt8Float(encRow, decRow);
+
+        // per-tensor (rows = 1): one scale for everything
+        var encTen = new byte[StreamingStoreCodec.Int8BufferBytes(n, 1)];
+        StreamingStoreCodec.EncodeInt8Float(src, encTen, 1);
+        var decTen = new float[n];
+        StreamingStoreCodec.DecodeInt8Float(encTen, decTen);
+
+        double Rmse(float[] dec) { double s = 0, rf = 0; for (int i = 0; i < n; i++) { double e = dec[i] - src[i]; s += e * e; rf += (double)src[i] * src[i]; } return Math.Sqrt(s / rf); }
+        double rowRmse = Rmse(decRow), tenRmse = Rmse(decTen);
+        // Per-row should be dramatically better when row magnitudes vary.
+        Assert.True(rowRmse < tenRmse * 0.5,
+            $"per-row RMSE {rowRmse:E3} should be < half per-tensor RMSE {tenRmse:E3} on varied-magnitude rows");
     }
 
     [Fact]
     public void Int8_Double_RoundTrips()
     {
         var rng = new Rng(8);
-        int n = 1024;
+        const int rows = 16, k = 64, n = rows * k;
         var src = new double[n];
         for (int i = 0; i < n; i++) src[i] = rng.NextGaussian(0.1);
-        var enc = new byte[StreamingStoreCodec.Int8BufferBytes(n)];
-        StreamingStoreCodec.EncodeInt8Double(src, enc);
+        var enc = new byte[StreamingStoreCodec.Int8BufferBytes(n, rows)];
+        StreamingStoreCodec.EncodeInt8Double(src, enc, rows);
         var dec = new double[n];
         StreamingStoreCodec.DecodeInt8Double(enc, dec);
         double sum2 = 0, ref2 = 0;

@@ -27,13 +27,15 @@ internal static class StreamingEncoding
     /// automatically when the model is in training mode.</summary>
     internal const byte Bf16 = 1;
 
-    /// <summary>int8: per-tensor symmetric quantisation (1 byte/element +
-    /// 4-byte scale prefix). Lossier than bf16; explicit opt-in only —
-    /// <c>StreamingStoreDtype.Auto</c> never picks int8.</summary>
+    /// <summary>int8: PER-ROW symmetric quantisation — [int32 rows][rows × fp32
+    /// scale][1 byte/element]. One scale per output channel preserves far more SNR
+    /// than a single per-tensor scale on varied-magnitude rows, and the layout feeds
+    /// the int8 weight-only GEMM directly (no upcast). Lossier than bf16; explicit
+    /// opt-in only — <c>StreamingStoreDtype.Auto</c> never picks int8.</summary>
     internal const byte Int8 = 2;
 
-    /// <summary>Lossless: byte-shuffle + LZ4 (variable size). Exact restore,
-    /// modest compression ratio (~0.65× for typical weights). Explicit
-    /// opt-in.</summary>
+    /// <summary>Lossless: SIMD byte-plane shuffle + Deflate (variable size). Exact
+    /// restore, ~1.18× on typical fp weights. The <c>Auto</c> default in training
+    /// (bit-exact masters); otherwise explicit opt-in.</summary>
     internal const byte Lossless = 3;
 }

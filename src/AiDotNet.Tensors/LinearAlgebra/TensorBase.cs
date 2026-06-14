@@ -72,6 +72,97 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
     internal Vector<T> DataVector => _data;
 
     /// <summary>
+    /// The no-upcast resident form of a streaming int8 weight (int8 + per-row scales). Non-null
+    /// only between materializing an int8-stored weight for inference and dropping it. The engine
+    /// matmul fast path reads this directly (feeds the int8 GEMM, no dequant); any fp32 access
+    /// lazily dequantizes it into <see cref="_data"/> via <see cref="EnsureMaterialized"/>. Null
+    /// for every normal tensor → the matmul/ensure hooks are a single null-check for them.
+    /// </summary>
+    internal StreamingInt8Weight? StreamingInt8 { get; private set; }
+
+    /// <summary>
+    /// Installs <paramref name="encoded"/> (a per-row int8 streaming buffer) as this tensor's
+    /// no-upcast quantized form: parses the int8 weight + per-row scales and leaves
+    /// <see cref="_data"/> empty (the fp32 view is produced lazily on first non-matmul access).
+    /// Used by <c>WeightRegistry.Materialize</c> for int8-stored weights in inference.
+    /// </summary>
+    internal void AttachStreamingInt8(ReadOnlySpan<byte> encoded)
+    {
+        int rows = StreamingStoreCodec.Int8RowsOf(encoded);
+        var scales = StreamingStoreCodec.Int8ScalesOf(encoded);
+        var data = StreamingStoreCodec.Int8DataOf(encoded, Length);
+        int k = rows > 0 ? Length / rows : Length;
+        StreamingInt8 = new StreamingInt8Weight(data, scales, rows, k);
+    }
+
+    /// <summary>
+    /// Returns this weight's no-upcast int8 form for the matmul fast path, materializing it as
+    /// int8 (NOT fp32) if it's an eligible streaming int8 weight that's currently paged out.
+    /// Returns null for every other tensor (non-streaming, non-int8, training, or already fp32) —
+    /// so the engine's int8 routing hook is a single null check for the common case. Unlike
+    /// <see cref="EnsureMaterialized"/>, this never dequantizes to fp32.
+    /// </summary>
+    internal StreamingInt8Weight? GetMaterializedStreamingInt8()
+    {
+        if (StreamingInt8 is not null) return StreamingInt8;
+        if (Lifetime == WeightLifetime.Streaming
+            && StreamingPoolHandle >= 0
+            && _data.Length != Length
+            && StreamingStoreEncoding == StreamingEncoding.Int8
+            && this is Tensor<T> w)
+        {
+            // Materialize attaches the int8 form in inference (leaves _data empty); in training
+            // it decodes to fp32 instead and StreamingInt8 stays null → we return null below.
+            WeightRegistry.Materialize(w);
+            return StreamingInt8;
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Lazily dequantizes the attached int8 weight into <see cref="_data"/> (fp32/fp64) — the
+    /// fallback when a non-matmul path needs a materialized span/indexer on a no-upcast int8
+    /// weight. Clears <see cref="StreamingInt8"/> afterwards (the fp32 copy is now canonical).
+    /// </summary>
+    private void DequantizeStreamingInt8()
+    {
+        var q = StreamingInt8;
+        if (q is null) return;
+        Vector<T> fresh;
+        if (typeof(T) == typeof(float))
+        {
+            var arr = new float[Length];
+            for (int r = 0; r < q.Rows; r++)
+            {
+                float s = q.Scales[r];
+                int baseI = r * q.K;
+                for (int j = 0; j < q.K; j++) arr[baseI + j] = q.Data[baseI + j] * s;
+            }
+            fresh = Vector<T>.WrapMemory((T[])(object)arr);
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            var arr = new double[Length];
+            for (int r = 0; r < q.Rows; r++)
+            {
+                double s = q.Scales[r];
+                int baseI = r * q.K;
+                for (int j = 0; j < q.K; j++) arr[baseI + j] = q.Data[baseI + j] * s;
+            }
+            fresh = Vector<T>.WrapMemory((T[])(object)arr);
+        }
+        else
+        {
+            throw new NotSupportedException($"int8 streaming weight dequant supports float/double, not {typeof(T).Name}.");
+        }
+        StreamingInt8 = null;
+        var old = _storage;
+        _data = fresh;
+        _storage = new TensorStorage<T>(_data);
+        old.Release();
+    }
+
+    /// <summary>
     /// When this tensor's <see cref="_data"/> aliases a read-only memory-mapped slice of
     /// the streaming backing file (zero-copy materialization), this owns the mapping and
     /// must be disposed the instant the storage is replaced or dropped — otherwise the
@@ -328,6 +419,8 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
         // If this tensor was aliasing a zero-copy mmap slice, the mapping is no
         // longer referenced once storage is dropped — release it now.
         DisposeStreamingMmapOwner();
+        // Drop any no-upcast int8 weight too — the pool holds the canonical bytes.
+        StreamingInt8 = null;
         _data = Vector<T>.Empty();
         _storage = new TensorStorage<T>(_data);
         return true;
@@ -393,12 +486,12 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
         }
         else if (StreamingStoreEncoding == StreamingEncoding.Int8)
         {
-            // int8-encoded store: 4-byte scale + 1 byte/element; dequant back to T.
-            long expectedInt8 = StreamingStoreCodec.Int8BufferBytes(Length);
+            // int8-encoded store: per-row [int32 rows][rows × fp32 scale][int8 data]; dequant back to T.
+            long expectedInt8 = StreamingStoreCodec.Int8BufferBytes(Length, Int8QuantRows);
             if (bytes.Length != expectedInt8)
                 throw new ArgumentException(
                     $"Streaming restore (int8): buffer length {bytes.Length} does not match " +
-                    $"expected {expectedInt8} bytes (4 scale + Length={Length}).");
+                    $"expected {expectedInt8} bytes (header {StreamingStoreCodec.Int8HeaderBytes(Int8QuantRows)} + Length={Length}).");
             if (typeof(T) == typeof(float))
             {
                 var arr = new float[Length];
@@ -1043,6 +1136,14 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
     public int Rank => _shape.Length;
 
     /// <summary>
+    /// Row count for per-row int8 streaming quantization: the leading dim (output channels
+    /// for an [out,in] weight); vectors (rank &lt; 2) quantize per-tensor (1 row). Both the
+    /// encode side (WeightRegistry) and the decode side (RestoreStorageFromBytes) read this
+    /// from the same shape, so the scale layout is consistent.
+    /// </summary>
+    internal int Int8QuantRows => _shape.Length >= 2 ? _shape[0] : 1;
+
+    /// <summary>
     /// Gets the pre-computed strides for each dimension as a read-only span.
     /// </summary>
     public ReadOnlySpan<int> Strides => _strides;
@@ -1505,10 +1606,16 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
         if (Lifetime == WeightLifetime.Streaming
             && StreamingPoolHandle >= 0
             && _data.Length != Length
+            && StreamingInt8 is null            // an already-attached int8 weight is handled below
             && this is Tensor<T> streamedWeight)
         {
             WeightRegistry.Materialize(streamedWeight);
         }
+        // A no-upcast int8 weight (just attached by Materialize, or earlier) has empty _data;
+        // a span/indexer — NOT the int8 GEMM fast path, which reads StreamingInt8 directly —
+        // is asking for an fp32 view, so dequantize it now.
+        if (StreamingInt8 is not null && _data.Length != Length)
+            DequantizeStreamingInt8();
     }
 
     /// <summary>
@@ -2181,6 +2288,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
 
         // Release any zero-copy mmap mapping before tearing down storage.
         DisposeStreamingMmapOwner();
+        StreamingInt8 = null;
         _storage.Release();
         if (_ownsGpuBuffer && _gpuBuffer is IDisposable disposableBuffer)
         {

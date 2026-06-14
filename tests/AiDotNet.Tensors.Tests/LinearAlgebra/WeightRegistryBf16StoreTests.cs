@@ -149,9 +149,10 @@ public class WeightRegistryBf16StoreTests
             t.Lifetime = WeightLifetime.Streaming;
             WeightRegistry.RegisterWeight(t);
 
-            // int8 + 4-byte scale ≈ n bytes vs fp32's 4n → ~4x reduction.
-            Assert.Equal(n + 4, WeightRegistry.StreamingPool.ResidentBytes);
-            Assert.Equal((byte)2, t.StreamingStoreEncoding);
+            // Per-row int8: a 1D (rank<2) tensor quantizes per-tensor → 1 row. Bytes =
+            // [int32 rows][1 fp32 scale][n int8] = n + 8 vs fp32's 4n → ~4x reduction.
+            Assert.Equal(n + 8, WeightRegistry.StreamingPool.ResidentBytes);
+            Assert.Equal(StreamingEncoding.Int8, t.StreamingStoreEncoding);
 
             WeightRegistry.Materialize(t);
             double sum2 = 0, ref2 = 0;

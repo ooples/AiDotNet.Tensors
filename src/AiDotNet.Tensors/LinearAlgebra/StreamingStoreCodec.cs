@@ -118,23 +118,35 @@ internal static class StreamingStoreCodec
         }
     }
 
-    // ── int8 per-tensor symmetric quantization (4x vs fp32) ───────────────────
-    // Layout: a 4-byte little-endian fp32 scale prefix, then one signed int8 per
-    // element. Dequant = q * scale. ~1.1% RMS error on Gaussian weights — much more
-    // lossy than bf16, so it's explicit opt-in (never the Auto default).
+    // ── int8 PER-ROW symmetric quantization (4x vs fp32) ──────────────────────
+    // Layout: [int32 rows][rows × fp32 scale][count × signed int8]. One scale per ROW
+    // (output channel) — each row uses its own max, so a small-magnitude row isn't
+    // clipped by a global max one large row dominates. That preserves much more SNR than
+    // a single per-tensor scale on trained weights whose row magnitudes vary widely (the
+    // common transformer case), and it's the layout SgemmWithInt8RowScaledCachedB consumes
+    // directly (sbyte[n,k] + per-row scales) so the quantized weight can feed the int8 GEMM
+    // with NO upcast. `rows` = the weight's leading dim (output channels); k = count/rows.
+    // ~1.1% per-tensor RMSE drops to noticeably less per-row; still opt-in (never Auto).
 
-    /// <summary>int8 buffer size for <paramref name="count"/> elements: 4-byte scale
-    /// prefix + 1 byte each.</summary>
-    internal const int Int8ScaleBytes = 4;
-    internal static int Int8BufferBytes(int count) => Int8ScaleBytes + count;
+    /// <summary>int8 header bytes (4-byte row count + one 4-byte fp32 scale per row).</summary>
+    internal static int Int8HeaderBytes(int rows) => 4 + 4 * rows;
+    /// <summary>int8 buffer size for <paramref name="count"/> elements in
+    /// <paramref name="rows"/> rows: header + 1 byte/element.</summary>
+    internal static int Int8BufferBytes(int count, int rows) => Int8HeaderBytes(rows) + count;
 
-    private static void WriteScale(Span<byte> dst, float scale)
+    private static void WriteInt32(Span<byte> dst, int off, int v)
+    {
+        dst[off] = (byte)v; dst[off + 1] = (byte)(v >> 8); dst[off + 2] = (byte)(v >> 16); dst[off + 3] = (byte)(v >> 24);
+    }
+    private static int ReadInt32(ReadOnlySpan<byte> src, int off)
+        => src[off] | (src[off + 1] << 8) | (src[off + 2] << 16) | (src[off + 3] << 24);
+    private static void WriteScaleAt(Span<byte> dst, int off, float scale)
     {
         uint sb = F32Bits(scale);
-        dst[0] = (byte)sb; dst[1] = (byte)(sb >> 8); dst[2] = (byte)(sb >> 16); dst[3] = (byte)(sb >> 24);
+        dst[off] = (byte)sb; dst[off + 1] = (byte)(sb >> 8); dst[off + 2] = (byte)(sb >> 16); dst[off + 3] = (byte)(sb >> 24);
     }
-    private static float ReadScale(ReadOnlySpan<byte> src)
-        => BitsF32((uint)(src[0] | (src[1] << 8) | (src[2] << 16) | (src[3] << 24)));
+    private static float ReadScaleAt(ReadOnlySpan<byte> src, int off)
+        => BitsF32((uint)(src[off] | (src[off + 1] << 8) | (src[off + 2] << 16) | (src[off + 3] << 24)));
 
     private static byte QuantOne(double v, double inv)
     {
@@ -143,68 +155,117 @@ internal static class StreamingStoreCodec
         return (byte)(sbyte)q;
     }
 
-    /// <summary>fp32 → int8 (+scale). <paramref name="dst"/> must be
-    /// <c>Int8BufferBytes(src.Length)</c>.</summary>
-    internal static void EncodeInt8Float(ReadOnlySpan<float> src, Span<byte> dst)
+    /// <summary>fp32 → per-row int8. <paramref name="dst"/> must be
+    /// <c>Int8BufferBytes(src.Length, rows)</c>; <paramref name="rows"/> must divide the length.</summary>
+    internal static void EncodeInt8Float(ReadOnlySpan<float> src, Span<byte> dst, int rows)
     {
-        // Reject NaN/Infinity at the boundary instead of producing a poisoned
-        // amax (NaN propagates through `Math.Abs(NaN) > amax` → false on
-        // first occurrence, then `1.0 / scale` yields ±Infinity, then
-        // `(int)Math.Round(±Inf)` produces an indeterminate sentinel value
-        // (int.MinValue on .NET, signaling NaN-cast OF an architecture-
-        // dependent value on net471). Failing fast with a clear contract
-        // error keeps the streaming store deterministic.
-        float amax = 0f;
-        for (int i = 0; i < src.Length; i++)
+        int count = src.Length;
+        if (rows <= 0 || count % rows != 0)
+            throw new ArgumentException($"int8 encode: rows ({rows}) must be > 0 and divide length ({count}).", nameof(rows));
+        int k = count / rows;
+        int dataOff = Int8HeaderBytes(rows);
+        WriteInt32(dst, 0, rows);
+        for (int r = 0; r < rows; r++)
         {
-            float v = src[i];
-            if (float.IsNaN(v) || float.IsInfinity(v))
-                throw new ArgumentException(
-                    $"int8 streaming-store encoder cannot encode non-finite value at index {i} (got {v}).",
-                    nameof(src));
-            float a = Math.Abs(v);
-            if (a > amax) amax = a;
+            int baseI = r * k;
+            float amax = 0f;
+            for (int j = 0; j < k; j++)
+            {
+                float v = src[baseI + j];
+                // Reject NaN/Infinity at the boundary: a poisoned amax → 1/scale = ±Inf →
+                // (int)Math.Round(±Inf) = an architecture-dependent sentinel. Fail fast.
+                if (float.IsNaN(v) || float.IsInfinity(v))
+                    throw new ArgumentException(
+                        $"int8 streaming-store encoder cannot encode non-finite value at index {baseI + j} (got {v}).",
+                        nameof(src));
+                float a = Math.Abs(v); if (a > amax) amax = a;
+            }
+            float scale = amax > 0f ? amax / 127f : 1f;
+            WriteScaleAt(dst, 4 + r * 4, scale);
+            double inv = 1.0 / scale;
+            for (int j = 0; j < k; j++) dst[dataOff + baseI + j] = QuantOne(src[baseI + j], inv);
         }
-        float scale = amax > 0f ? amax / 127f : 1f;
-        WriteScale(dst, scale);
-        double inv = 1.0 / scale;
-        for (int i = 0; i < src.Length; i++) dst[Int8ScaleBytes + i] = QuantOne(src[i], inv);
     }
 
-    /// <summary>fp64 → int8 (+scale).</summary>
-    internal static void EncodeInt8Double(ReadOnlySpan<double> src, Span<byte> dst)
+    /// <summary>fp64 → per-row int8.</summary>
+    internal static void EncodeInt8Double(ReadOnlySpan<double> src, Span<byte> dst, int rows)
     {
-        // See EncodeInt8Float for the rationale on the non-finite guard.
-        double amax = 0.0;
-        for (int i = 0; i < src.Length; i++)
+        int count = src.Length;
+        if (rows <= 0 || count % rows != 0)
+            throw new ArgumentException($"int8 encode: rows ({rows}) must be > 0 and divide length ({count}).", nameof(rows));
+        int k = count / rows;
+        int dataOff = Int8HeaderBytes(rows);
+        WriteInt32(dst, 0, rows);
+        for (int r = 0; r < rows; r++)
         {
-            double v = src[i];
-            if (double.IsNaN(v) || double.IsInfinity(v))
-                throw new ArgumentException(
-                    $"int8 streaming-store encoder cannot encode non-finite value at index {i} (got {v}).",
-                    nameof(src));
-            double a = Math.Abs(v);
-            if (a > amax) amax = a;
+            int baseI = r * k;
+            double amax = 0.0;
+            for (int j = 0; j < k; j++)
+            {
+                double v = src[baseI + j];
+                if (double.IsNaN(v) || double.IsInfinity(v))
+                    throw new ArgumentException(
+                        $"int8 streaming-store encoder cannot encode non-finite value at index {baseI + j} (got {v}).",
+                        nameof(src));
+                double a = Math.Abs(v); if (a > amax) amax = a;
+            }
+            float scale = amax > 0.0 ? (float)(amax / 127.0) : 1f;
+            WriteScaleAt(dst, 4 + r * 4, scale);
+            double inv = 1.0 / scale;
+            for (int j = 0; j < k; j++) dst[dataOff + baseI + j] = QuantOne(src[baseI + j], inv);
         }
-        float scale = amax > 0.0 ? (float)(amax / 127.0) : 1f;
-        WriteScale(dst, scale);
-        double inv = 1.0 / scale;
-        for (int i = 0; i < src.Length; i++) dst[Int8ScaleBytes + i] = QuantOne(src[i], inv);
     }
 
-    /// <summary>int8 (+scale) → fp32. <paramref name="src"/> is
-    /// <c>Int8BufferBytes(dst.Length)</c>.</summary>
+    /// <summary>per-row int8 → fp32 (dequant fallback). <paramref name="src"/> is the encoded buffer.</summary>
     internal static void DecodeInt8Float(ReadOnlySpan<byte> src, Span<float> dst)
     {
-        float scale = ReadScale(src);
-        for (int i = 0; i < dst.Length; i++) dst[i] = (sbyte)src[Int8ScaleBytes + i] * scale;
+        int rows = ReadInt32(src, 0);
+        int count = dst.Length;
+        int k = count / rows;
+        int dataOff = Int8HeaderBytes(rows);
+        for (int r = 0; r < rows; r++)
+        {
+            float scale = ReadScaleAt(src, 4 + r * 4);
+            int baseI = r * k;
+            for (int j = 0; j < k; j++) dst[baseI + j] = (sbyte)src[dataOff + baseI + j] * scale;
+        }
     }
 
-    /// <summary>int8 (+scale) → fp64.</summary>
+    /// <summary>per-row int8 → fp64.</summary>
     internal static void DecodeInt8Double(ReadOnlySpan<byte> src, Span<double> dst)
     {
-        float scale = ReadScale(src);
-        for (int i = 0; i < dst.Length; i++) dst[i] = (sbyte)src[Int8ScaleBytes + i] * (double)scale;
+        int rows = ReadInt32(src, 0);
+        int count = dst.Length;
+        int k = count / rows;
+        int dataOff = Int8HeaderBytes(rows);
+        for (int r = 0; r < rows; r++)
+        {
+            float scale = ReadScaleAt(src, 4 + r * 4);
+            int baseI = r * k;
+            for (int j = 0; j < k; j++) dst[baseI + j] = (sbyte)src[dataOff + baseI + j] * (double)scale;
+        }
+    }
+
+    // ── Compute-path extraction: pull the int8 weight + per-row scales out of the encoded
+    //    buffer WITHOUT dequantizing, so a streaming int8 weight can feed the int8 GEMM directly.
+    /// <summary>Row count stored in an int8 buffer header.</summary>
+    internal static int Int8RowsOf(ReadOnlySpan<byte> src) => ReadInt32(src, 0);
+    /// <summary>Per-row scales from an int8 buffer.</summary>
+    internal static float[] Int8ScalesOf(ReadOnlySpan<byte> src)
+    {
+        int rows = ReadInt32(src, 0);
+        var s = new float[rows];
+        for (int r = 0; r < rows; r++) s[r] = ReadScaleAt(src, 4 + r * 4);
+        return s;
+    }
+    /// <summary>The <paramref name="count"/> signed int8 weights from an int8 buffer (row-major [rows,k]).</summary>
+    internal static sbyte[] Int8DataOf(ReadOnlySpan<byte> src, int count)
+    {
+        int rows = ReadInt32(src, 0);
+        int dataOff = Int8HeaderBytes(rows);
+        var d = new sbyte[count];
+        for (int i = 0; i < count; i++) d[i] = (sbyte)src[dataOff + i];
+        return d;
     }
 
     // ── Lossless: byte-plane shuffle + DEFLATE (EXACT, ~1.18x on fp weights) ──────────

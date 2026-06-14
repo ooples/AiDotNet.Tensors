@@ -11326,6 +11326,32 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+#if NET5_0_OR_GREATER
+        // No-upcast int8 weight fast path. b is a [N,K] weight; if it's an int8-streamed weight
+        // materialized for inference, it carries its int8 + per-row scales (GetMaterializedStreamingInt8
+        // attaches them WITHOUT dequantizing to fp32). Feed those straight to the int8 weight-only
+        // GEMM — c = a·Wᵀ with per-row dequant folded into the epilogue — so the streamed int8
+        // bytes never upcast. Null for every non-int8/training/non-streaming weight → this is a
+        // single null check on the hot path. Rows/K match N/K by construction (2D weight, the
+        // quant row count is the leading dim). a stays fp32.
+        if (typeof(T) == typeof(float) && a.Rank == 2 && b.Rank == 2 && a.IsContiguous)
+        {
+            var q = b.GetMaterializedStreamingInt8();
+            if (q is not null && q.Rows == N && q.K == K)
+            {
+                var int8Result = AutoTensorCache.RentOrAllocate<T>(outShape);
+                var aRawQ = (float[])(object)a._storage.GetDataArray();
+                var rRawQ = (float[])(object)int8Result._storage.GetDataArray();
+                AiDotNet.Tensors.Engines.Simd.SimdGemm.SgemmWithInt8RowScaledCachedB(
+                    new ReadOnlySpan<float>(aRawQ, a._storageOffset, M * K),
+                    q.Data, q.Scales,
+                    new Span<float>(rRawQ, int8Result._storageOffset, M * N),
+                    M, K, N);
+                return int8Result;
+            }
+        }
+#endif
+
         // Float fast path via SimdGemm.Sgemm with transB=true. Skips the
         // ~70%-of-the-time-spent-on-the-transpose materialization that the
         // user-pattern Transpose(B) + MatMul(A, B^T) was hitting.
