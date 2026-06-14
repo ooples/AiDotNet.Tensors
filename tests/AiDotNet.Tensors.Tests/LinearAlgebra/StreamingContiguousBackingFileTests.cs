@@ -53,7 +53,12 @@ public class StreamingContiguousBackingFileTests
                 }
 
                 // Exactly one backing file (not n per-handle files).
-                poolDir = Directory.GetDirectories(dir)[0];
+                // Assert pool-created exactly one directory before indexing so
+                // a pool-init failure surfaces as a clear assertion error
+                // instead of IndexOutOfRangeException.
+                var subdirs = Directory.GetDirectories(dir);
+                Assert.Single(subdirs);
+                poolDir = subdirs[0];
                 var files = Directory.GetFiles(poolDir);
                 Assert.Single(files);
                 Assert.Equal("backing.bin", Path.GetFileName(files[0]));
