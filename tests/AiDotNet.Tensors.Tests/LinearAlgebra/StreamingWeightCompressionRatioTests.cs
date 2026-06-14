@@ -171,55 +171,40 @@ public class StreamingWeightCompressionRatioTests
         sw.Stop();
         return (originalLen / (1024.0 * 1024)) * iters / sw.Elapsed.TotalSeconds;
     }
-    private static double Lz4DecodeMBps(byte[] compressed, int originalLen, int iters)
-    {
-        var outBuf = new byte[originalLen];
-        var sw = Stopwatch.StartNew();
-        for (int it = 0; it < iters; it++) LZ4Codec.Decode(compressed, 0, compressed.Length, outBuf, 0, outBuf.Length);
-        sw.Stop();
-        return (originalLen / (1024.0 * 1024)) * iters / sw.Elapsed.TotalSeconds;
-    }
-
     [Fact]
     public void MeasureLosslessThroughputTradeoff_RatioVsDecodeSpeed()
     {
-        // The gate for "default compression on": a 1.2x byte saving is a NET LOSS if
-        // decode is slower than the disk read it replaces. Compare ratio AND decode
-        // throughput against rough storage bandwidths (NVMe ~3-7 GB/s, SATA SSD ~0.5,
-        // network/HDD ~0.1-0.2 GB/s).
+        // The production lossless codec landed as byte-shuffle + Deflate
+        // (see commit 68ecd261 — Deflate's Huffman stage shrinks the
+        // shuffle-exposed sign/exponent byte-plane that match-only LZ4
+        // can't touch). LZ4 was evaluated and rejected, so this test now
+        // gates the PROD path (Deflate) against storage-bandwidth
+        // thresholds and the shuffle-pre-transform contract.
         const int count = 1 << 18; // 256K elems — ratios are stable, keeps CI fast
         var raw = ToBytes(Gaussian(count, 0.02, 1)); // realistic small-std weights
-        var bitS = BitPlaneShuffle(raw, 4);
+        var byteS = BytePlaneShuffle(raw, 4);
 
-        var lz4 = new byte[LZ4Codec.MaximumOutputSize(bitS.Length)];
-        int lz4n = LZ4Codec.Encode(bitS, 0, bitS.Length, lz4, 0, lz4.Length);
-        var lz4c = new byte[lz4n]; Array.Copy(lz4, lz4c, lz4n);
-        var defl = Deflate(bitS);
+        var defl = Deflate(byteS);
+        double deflPct = (double)defl.Length / byteS.Length * 100;
+        double deflDecMb = InflateMBps(defl, byteS.Length, 50);
+        _out.WriteLine($"byte-shuffled fp32 std=0.02 ({raw.Length / (1024 * 1024)} MiB):");
+        _out.WriteLine($"  Deflate (prod codec): {deflPct:F1}% size, decode {deflDecMb:F0} MiB/s");
+        _out.WriteLine("  → SATA-SSD ≈ 500 MiB/s; NVMe ≈ 3-7 GiB/s. Compression is a net win when decode ≥ storage bandwidth.");
 
-        double lz4DecMb = Lz4DecodeMBps(lz4c, bitS.Length, 50);
-        double deflDecMb = InflateMBps(defl, bitS.Length, 50);
-        _out.WriteLine($"bit-shuffled fp32 std=0.02 ({raw.Length / (1024 * 1024)} MiB):");
-        _out.WriteLine($"  LZ4    : {(double)lz4n / bitS.Length * 100:F1}% size, decode {lz4DecMb:F0} MiB/s");
-        _out.WriteLine($"  Deflate: {(double)defl.Length / bitS.Length * 100:F1}% size, decode {deflDecMb:F0} MiB/s");
-        _out.WriteLine("  → if decode MiB/s < storage bandwidth, compression bottlenecks reads on that storage.");
-        _out.WriteLine("  → zstd (new dep) is the sweet spot: ~1.5-2 GB/s decode + Deflate-class ratio.");
-
-        // Real behavioral assertions (CodeRabbit #604). The PR's argument
-        // for picking LZ4 over Deflate is decode throughput at comparable
-        // ratio. We assert the two halves:
-        //   - LZ4 decode must be ≥ 3× faster than Deflate. The realistic
-        //     gap is ~5-10× on modern x64; 3× catches a regression that
-        //     swapped the LZ4 decoder for a slower variant while leaving
-        //     headroom for slow CI hardware.
-        //   - LZ4-compressed size on bit-shuffled small-std weights must
-        //     fit in 90% of the input — the bit-shuffle exposes enough
-        //     redundancy that any LZ4 worse than that means the shuffle
-        //     pipeline regressed.
-        double lz4Pct = (double)lz4n / bitS.Length * 100;
-        Assert.True(lz4DecMb >= 3.0 * deflDecMb,
-            $"LZ4 decode ({lz4DecMb:F0} MiB/s) should be ≥ 3× Deflate decode ({deflDecMb:F0} MiB/s).");
-        Assert.True(lz4Pct < 90.0,
-            $"LZ4 on bit-shuffled small-std fp32 should compress below 90% ({lz4Pct:F1}% measured).");
+        // Real behavioral assertions (CodeRabbit #604).
+        //   - Deflate on byte-shuffled small-std fp32 should reach the
+        //     ~1.18× ratio claimed in 68ecd261 — i.e. size ≤ ~88% of
+        //     input. We allow a touch of headroom (≤ 92%) to absorb
+        //     std/seed variance.
+        //   - Decode throughput must beat a typical SATA-SSD's 500 MiB/s
+        //     by a margin (≥ 600 MiB/s). At that point compression
+        //     amortises over the disk read it replaces; below that, the
+        //     codec bottlenecks the streaming pool and the resident-
+        //     budget win turns into a wall-clock loss.
+        Assert.True(deflPct <= 92.0,
+            $"Deflate on byte-shuffled small-std fp32 should be ≤ 92% size ({deflPct:F1}% measured); see commit 68ecd261.");
+        Assert.True(deflDecMb >= 600.0,
+            $"Deflate decode ({deflDecMb:F0} MiB/s) should comfortably outpace SATA-SSD (≥ 600 MiB/s) — otherwise compression bottlenecks reads.");
 
         // The shuffle pre-transform is on the critical path too — measure it alone.
         int iters = 8; double mib = raw.Length / (1024.0 * 1024);
@@ -228,7 +213,7 @@ public class StreamingWeightCompressionRatioTests
         double byteShufMb = mib * iters / swB.Elapsed.TotalSeconds;
         double bitShufMb = mib * iters / swBit.Elapsed.TotalSeconds;
         _out.WriteLine($"  transform cost: byte-shuffle {byteShufMb:F0} MiB/s, bit-shuffle (naive) {bitShufMb:F0} MiB/s");
-        _out.WriteLine("  → byte-shuffle is memory-bandwidth-cheap; naive bit-shuffle needs a SIMD impl to be viable.");
+        _out.WriteLine("  → byte-shuffle is memory-bandwidth-cheap; bit-shuffle is the rejected dead end (see commit 90792f19).");
 
         // Byte-shuffle must comfortably outpace bit-shuffle on any modern CPU
         // (it's a memory-copy pattern vs an 8x per-byte loop). Detects a
