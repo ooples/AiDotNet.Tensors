@@ -176,7 +176,39 @@ public sealed class StreamingTensorPool : IDisposable
         lock (_lock)
         {
             ThrowIfDisposed();
-            return _entries.TryGetValue(handleId, out var entry) && entry.Data is not null;
+            return IsResidentUnlocked(handleId);
+        }
+    }
+
+    private bool IsResidentUnlocked(long handleId)
+        => _entries.TryGetValue(handleId, out var entry) && entry.Data is not null;
+
+    /// <summary>
+    /// Schedule-driven prefetch targeting: returns up to <paramref name="lookahead"/>
+    /// DISTINCT handles the access schedule says will be read soonest and that are
+    /// NOT currently resident — exactly what to background-prefetch, with no guessing
+    /// and no wasted prefetch of already-resident entries. Empty if no schedule is
+    /// set (<see cref="SetAccessSchedule"/>). The consumer (or registry) feeds these
+    /// to its background reader so the next layers' weights stream in while the
+    /// current layer computes.
+    /// </summary>
+    public long[] GetScheduledPrefetchTargets(int lookahead)
+    {
+        lock (_lock)
+        {
+            ThrowIfDisposed();
+            if (_schedule is null || lookahead <= 0) return Array.Empty<long>();
+            int len = _schedule.Length;
+            var targets = new System.Collections.Generic.List<long>(lookahead);
+            var seen = new System.Collections.Generic.HashSet<long>();
+            for (int step = 0; step < len && targets.Count < lookahead; step++)
+            {
+                long h = _schedule[(_schedulePos + step) % len];
+                if (!seen.Add(h)) continue;          // distinct only
+                if (IsResidentUnlocked(h)) continue; // already in memory — don't prefetch
+                targets.Add(h);
+            }
+            return targets.ToArray();
         }
     }
 

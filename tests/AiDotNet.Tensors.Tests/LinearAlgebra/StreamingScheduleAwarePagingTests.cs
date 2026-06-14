@@ -69,6 +69,37 @@ public class StreamingScheduleAwarePagingTests
     }
 
     [Fact]
+    public void GetScheduledPrefetchTargets_ReturnsUpcomingNonResidentHandles()
+    {
+        const int entryBytes = 4096, n = 6, budget = 3;
+        var dir = Path.Combine(Path.GetTempPath(), "aidotnet-prefetch-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            using var pool = new StreamingTensorPool(new GpuOffloadOptions
+            {
+                StreamingPoolMaxResidentBytes = (long)budget * entryBytes,
+                StreamingBackingStorePath = dir,
+            });
+            var h = new long[n];
+            for (int i = 0; i < n; i++) h[i] = pool.Register(new byte[entryBytes]);
+            // Registering 6 into a 3-budget pool leaves the last 3 resident (h3,h4,h5);
+            // h0,h1,h2 are paged out.
+            Assert.False(pool.IsResident(h[0])); Assert.True(pool.IsResident(h[5]));
+
+            // No schedule → no targeting.
+            Assert.Empty(pool.GetScheduledPrefetchTargets(4));
+
+            pool.SetAccessSchedule(h); // cursor at 0
+            // From the cycle start, the soonest non-resident handles are h0,h1,h2 (the
+            // resident h3/h4/h5 are skipped — no point prefetching them).
+            Assert.Equal(new[] { h[0], h[1], h[2] }, pool.GetScheduledPrefetchTargets(4));
+            // Bounded by lookahead.
+            Assert.Equal(new[] { h[0], h[1] }, pool.GetScheduledPrefetchTargets(2));
+        }
+        finally { if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true); }
+    }
+
+    [Fact]
     public void NoSchedule_IsPlainLru_Unchanged()
     {
         // Sanity: without a schedule the pool behaves exactly as LRU (regression guard
