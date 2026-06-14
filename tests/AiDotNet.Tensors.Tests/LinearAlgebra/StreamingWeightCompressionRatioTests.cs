@@ -1,6 +1,9 @@
 // Copyright (c) AiDotNet. All rights reserved.
 
 using System;
+using System.Diagnostics;
+using System.IO;
+using System.IO.Compression;
 using AiDotNet.Tensors.LinearAlgebra;
 using K4os.Compression.LZ4;
 using Xunit;
@@ -123,6 +126,66 @@ public class StreamingWeightCompressionRatioTests
         Row("fp32 std=1.0", 1.0, 3);
         _out.WriteLine("(entropyFloor = order-0 Shannon limit on the bit-shuffled stream — what a");
         _out.WriteLine(" zstd/Brotli entropy stage could approach; LZ4 has no entropy coder so it can't.)");
+        Assert.True(count > 0);
+    }
+
+    private static byte[] Deflate(byte[] data)
+    {
+        using var ms = new MemoryStream();
+        using (var ds = new DeflateStream(ms, CompressionLevel.Optimal, leaveOpen: true)) ds.Write(data, 0, data.Length);
+        return ms.ToArray();
+    }
+    private static double InflateMBps(byte[] compressed, int originalLen, int iters)
+    {
+        var outBuf = new byte[originalLen];
+        var sw = Stopwatch.StartNew();
+        for (int it = 0; it < iters; it++)
+        {
+            using var ms = new MemoryStream(compressed);
+            using var ds = new DeflateStream(ms, CompressionMode.Decompress);
+            int off = 0, r; while ((r = ds.Read(outBuf, off, outBuf.Length - off)) > 0) off += r;
+        }
+        sw.Stop();
+        return (originalLen / (1024.0 * 1024)) * iters / sw.Elapsed.TotalSeconds;
+    }
+    private static double Lz4DecodeMBps(byte[] compressed, int originalLen, int iters)
+    {
+        var outBuf = new byte[originalLen];
+        var sw = Stopwatch.StartNew();
+        for (int it = 0; it < iters; it++) LZ4Codec.Decode(compressed, 0, compressed.Length, outBuf, 0, outBuf.Length);
+        sw.Stop();
+        return (originalLen / (1024.0 * 1024)) * iters / sw.Elapsed.TotalSeconds;
+    }
+
+    [Fact]
+    public void MeasureLosslessThroughputTradeoff_RatioVsDecodeSpeed()
+    {
+        // The gate for "default compression on": a 1.2x byte saving is a NET LOSS if
+        // decode is slower than the disk read it replaces. Compare ratio AND decode
+        // throughput against rough storage bandwidths (NVMe ~3-7 GB/s, SATA SSD ~0.5,
+        // network/HDD ~0.1-0.2 GB/s).
+        const int count = 1 << 18; // 256K elems — ratios are stable, keeps CI fast
+        var raw = ToBytes(Gaussian(count, 0.02, 1)); // realistic small-std weights
+        var bitS = BitPlaneShuffle(raw, 4);
+
+        var lz4 = new byte[LZ4Codec.MaximumOutputSize(bitS.Length)];
+        int lz4n = LZ4Codec.Encode(bitS, 0, bitS.Length, lz4, 0, lz4.Length);
+        var lz4c = new byte[lz4n]; Array.Copy(lz4, lz4c, lz4n);
+        var defl = Deflate(bitS);
+
+        _out.WriteLine($"bit-shuffled fp32 std=0.02 ({raw.Length / (1024 * 1024)} MiB):");
+        _out.WriteLine($"  LZ4    : {(double)lz4n / bitS.Length * 100:F1}% size, decode {Lz4DecodeMBps(lz4c, bitS.Length, 50):F0} MiB/s");
+        _out.WriteLine($"  Deflate: {(double)defl.Length / bitS.Length * 100:F1}% size, decode {InflateMBps(defl, bitS.Length, 50):F0} MiB/s");
+        _out.WriteLine("  → if decode MiB/s < storage bandwidth, compression bottlenecks reads on that storage.");
+        _out.WriteLine("  → zstd (new dep) is the sweet spot: ~1.5-2 GB/s decode + Deflate-class ratio.");
+
+        // The shuffle pre-transform is on the critical path too — measure it alone.
+        int iters = 8; double mib = raw.Length / (1024.0 * 1024);
+        var swB = Stopwatch.StartNew(); for (int i = 0; i < iters; i++) BytePlaneShuffle(raw, 4); swB.Stop();
+        var swBit = Stopwatch.StartNew(); for (int i = 0; i < iters; i++) BitPlaneShuffle(raw, 4); swBit.Stop();
+        _out.WriteLine($"  transform cost: byte-shuffle {mib * iters / swB.Elapsed.TotalSeconds:F0} MiB/s, " +
+                       $"bit-shuffle (naive) {mib * iters / swBit.Elapsed.TotalSeconds:F0} MiB/s");
+        _out.WriteLine("  → byte-shuffle is memory-bandwidth-cheap; naive bit-shuffle needs a SIMD impl to be viable.");
         Assert.True(count > 0);
     }
 
