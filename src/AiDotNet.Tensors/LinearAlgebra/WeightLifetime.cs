@@ -78,6 +78,12 @@ public enum StreamingStoreDtype
     /// rounding is unbiased so training stays correct in regimes that tolerate
     /// bf16 masters (large-batch pretraining). Opt-in for training.</summary>
     Bf16Stochastic = 3,
+
+    /// <summary>Always store int8 with a per-tensor symmetric scale. 4x I/O at
+    /// ~1.1% RMS error — much more lossy than bf16, so it's never the Auto default
+    /// and is intended for inference / aggressive memory-bound cases where the
+    /// accuracy tradeoff is accepted.</summary>
+    Int8 = 4,
 }
 
 /// <summary>

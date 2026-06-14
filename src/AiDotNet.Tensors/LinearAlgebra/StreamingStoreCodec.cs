@@ -111,4 +111,67 @@ internal static class StreamingStoreCodec
             dst[i] = BitsF32(raw << 16);
         }
     }
+
+    // ── int8 per-tensor symmetric quantization (4x vs fp32) ───────────────────
+    // Layout: a 4-byte little-endian fp32 scale prefix, then one signed int8 per
+    // element. Dequant = q * scale. ~1.1% RMS error on Gaussian weights — much more
+    // lossy than bf16, so it's explicit opt-in (never the Auto default).
+
+    /// <summary>int8 buffer size for <paramref name="count"/> elements: 4-byte scale
+    /// prefix + 1 byte each.</summary>
+    internal const int Int8ScaleBytes = 4;
+    internal static int Int8BufferBytes(int count) => Int8ScaleBytes + count;
+
+    private static void WriteScale(Span<byte> dst, float scale)
+    {
+        uint sb = F32Bits(scale);
+        dst[0] = (byte)sb; dst[1] = (byte)(sb >> 8); dst[2] = (byte)(sb >> 16); dst[3] = (byte)(sb >> 24);
+    }
+    private static float ReadScale(ReadOnlySpan<byte> src)
+        => BitsF32((uint)(src[0] | (src[1] << 8) | (src[2] << 16) | (src[3] << 24)));
+
+    private static byte QuantOne(double v, double inv)
+    {
+        int q = (int)Math.Round(v * inv);
+        if (q > 127) q = 127; else if (q < -127) q = -127; // symmetric, avoid -128
+        return (byte)(sbyte)q;
+    }
+
+    /// <summary>fp32 → int8 (+scale). <paramref name="dst"/> must be
+    /// <c>Int8BufferBytes(src.Length)</c>.</summary>
+    internal static void EncodeInt8Float(ReadOnlySpan<float> src, Span<byte> dst)
+    {
+        float amax = 0f;
+        for (int i = 0; i < src.Length; i++) { float a = Math.Abs(src[i]); if (a > amax) amax = a; }
+        float scale = amax > 0f ? amax / 127f : 1f;
+        WriteScale(dst, scale);
+        double inv = 1.0 / scale;
+        for (int i = 0; i < src.Length; i++) dst[Int8ScaleBytes + i] = QuantOne(src[i], inv);
+    }
+
+    /// <summary>fp64 → int8 (+scale).</summary>
+    internal static void EncodeInt8Double(ReadOnlySpan<double> src, Span<byte> dst)
+    {
+        double amax = 0.0;
+        for (int i = 0; i < src.Length; i++) { double a = Math.Abs(src[i]); if (a > amax) amax = a; }
+        float scale = amax > 0.0 ? (float)(amax / 127.0) : 1f;
+        WriteScale(dst, scale);
+        double inv = 1.0 / scale;
+        for (int i = 0; i < src.Length; i++) dst[Int8ScaleBytes + i] = QuantOne(src[i], inv);
+    }
+
+    /// <summary>int8 (+scale) → fp32. <paramref name="src"/> is
+    /// <c>Int8BufferBytes(dst.Length)</c>.</summary>
+    internal static void DecodeInt8Float(ReadOnlySpan<byte> src, Span<float> dst)
+    {
+        float scale = ReadScale(src);
+        for (int i = 0; i < dst.Length; i++) dst[i] = (sbyte)src[Int8ScaleBytes + i] * scale;
+    }
+
+    /// <summary>int8 (+scale) → fp64.</summary>
+    internal static void DecodeInt8Double(ReadOnlySpan<byte> src, Span<double> dst)
+    {
+        float scale = ReadScale(src);
+        for (int i = 0; i < dst.Length; i++) dst[i] = (sbyte)src[Int8ScaleBytes + i] * (double)scale;
+    }
 }

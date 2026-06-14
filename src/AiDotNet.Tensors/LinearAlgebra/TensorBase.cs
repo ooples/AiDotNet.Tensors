@@ -329,6 +329,32 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
                     $"bf16 streaming store is only supported for float/double, not {typeof(T).Name}.");
             }
         }
+        else if (StreamingStoreEncoding == 2)
+        {
+            // int8-encoded store: 4-byte scale + 1 byte/element; dequant back to T.
+            long expectedInt8 = StreamingStoreCodec.Int8BufferBytes(Length);
+            if (bytes.Length != expectedInt8)
+                throw new ArgumentException(
+                    $"Streaming restore (int8): buffer length {bytes.Length} does not match " +
+                    $"expected {expectedInt8} bytes (4 scale + Length={Length}).");
+            if (typeof(T) == typeof(float))
+            {
+                var arr = new float[Length];
+                StreamingStoreCodec.DecodeInt8Float(bytes, arr);
+                fresh = Vector<T>.WrapMemory((T[])(object)arr);
+            }
+            else if (typeof(T) == typeof(double))
+            {
+                var arr = new double[Length];
+                StreamingStoreCodec.DecodeInt8Double(bytes, arr);
+                fresh = Vector<T>.WrapMemory((T[])(object)arr);
+            }
+            else
+            {
+                throw new NotSupportedException(
+                    $"int8 streaming store is only supported for float/double, not {typeof(T).Name}.");
+            }
+        }
         else
         {
             // Use the typed-fast-path size table rather than Marshal.SizeOf<T>:

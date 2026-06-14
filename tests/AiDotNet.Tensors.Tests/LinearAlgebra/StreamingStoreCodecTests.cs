@@ -121,6 +121,44 @@ public class StreamingStoreCodecTests
     }
 
     [Fact]
+    public void Int8_RoundTrip_4xSmaller_WithinPerTensorPrecision()
+    {
+        var rng = new Rng(7);
+        int n = 4096;
+        var src = new float[n];
+        for (int i = 0; i < n; i++) src[i] = rng.NextGaussian(0.05);
+
+        int bytes = StreamingStoreCodec.Int8BufferBytes(n);
+        Assert.Equal(n + 4, bytes); // 1 byte/elem + 4-byte scale → ~4x vs fp32
+        var enc = new byte[bytes];
+        StreamingStoreCodec.EncodeInt8Float(src, enc);
+        var dec = new float[n];
+        StreamingStoreCodec.DecodeInt8Float(enc, dec);
+
+        double sum2 = 0, ref2 = 0;
+        for (int i = 0; i < n; i++) { double e = dec[i] - src[i]; sum2 += e * e; ref2 += (double)src[i] * src[i]; }
+        double rmse = Math.Sqrt(sum2 / ref2);
+        // Per-tensor symmetric int8 → ~1.1% RMS on Gaussian weights; allow headroom.
+        Assert.True(rmse < 0.02, $"int8 RMS relative error {rmse} should be ~1%");
+    }
+
+    [Fact]
+    public void Int8_Double_RoundTrips()
+    {
+        var rng = new Rng(8);
+        int n = 1024;
+        var src = new double[n];
+        for (int i = 0; i < n; i++) src[i] = rng.NextGaussian(0.1);
+        var enc = new byte[StreamingStoreCodec.Int8BufferBytes(n)];
+        StreamingStoreCodec.EncodeInt8Double(src, enc);
+        var dec = new double[n];
+        StreamingStoreCodec.DecodeInt8Double(enc, dec);
+        double sum2 = 0, ref2 = 0;
+        for (int i = 0; i < n; i++) { double e = dec[i] - src[i]; sum2 += e * e; ref2 += src[i] * src[i]; }
+        Assert.True(Math.Sqrt(sum2 / ref2) < 0.02, "fp64→int8 RMS error ~1%");
+    }
+
+    [Fact]
     public void EncodeDecodeDouble_RoundTrip_WithinBf16Precision()
     {
         var rng = new Rng(3);

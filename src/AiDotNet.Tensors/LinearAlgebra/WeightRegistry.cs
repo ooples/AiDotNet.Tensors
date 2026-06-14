@@ -158,9 +158,12 @@ public static class WeightRegistry
                         // eviction, disk) for free — the pool is byte-agnostic; only the
                         // restore boundary widens bf16 → T (RestoreStorageFromBytes).
                         var (encoding, stochastic) = ResolveStoreEncoding<T>();
-                        int byteCount = encoding == 1
-                            ? CheckedBf16ByteCount(weight.Length)
-                            : CheckedStreamingByteCount<T>(weight.Length);
+                        int byteCount = encoding switch
+                        {
+                            1 => CheckedBf16ByteCount(weight.Length),
+                            2 => CheckedInt8ByteCount(weight.Length),
+                            _ => CheckedStreamingByteCount<T>(weight.Length),
+                        };
                         var bytes = new byte[byteCount];
                         SerializeToBytes(weight, bytes, encoding, stochastic);
                         weight.StreamingStoreEncoding = encoding;
@@ -601,10 +604,12 @@ public static class WeightRegistry
             case StreamingStoreDtype.FullPrecision: return (0, false);
             case StreamingStoreDtype.Bf16: return (1, false);
             case StreamingStoreDtype.Bf16Stochastic: return (1, true);
+            case StreamingStoreDtype.Int8: return (2, false); // explicit opt-in (Auto never picks int8)
             case StreamingStoreDtype.Auto:
             default:
                 // bf16 ONLY when we KNOW it's inference; training or unknown →
-                // full precision so we never silently make the masters bf16.
+                // full precision so we never silently make the masters bf16. (int8
+                // is too lossy to ever be an automatic choice.)
                 return _streamingTrainingMode == false ? ((byte)1, false) : ((byte)0, false);
         }
     }
@@ -619,6 +624,18 @@ public static class WeightRegistry
             throw new NotSupportedException(
                 $"Streaming bf16 registration requires per-tensor size <= {int.MaxValue} bytes. " +
                 $"Tensor has {length} elements × 2 bytes = {byteCountLong} bytes. Chunk it.");
+        return (int)byteCountLong;
+    }
+
+    /// <summary>int8 byte count (1 per element + 4-byte scale) with overflow guard.</summary>
+    internal static int CheckedInt8ByteCount(int length)
+    {
+        if (length < 0) throw new ArgumentOutOfRangeException(nameof(length));
+        long byteCountLong = (long)length + StreamingStoreCodec.Int8ScaleBytes;
+        if (byteCountLong > int.MaxValue)
+            throw new NotSupportedException(
+                $"Streaming int8 registration requires per-tensor size <= {int.MaxValue} bytes. " +
+                $"Tensor has {length} elements + 4 scale bytes = {byteCountLong} bytes. Chunk it.");
         return (int)byteCountLong;
     }
 
@@ -711,6 +728,25 @@ public static class WeightRegistry
             }
             throw new NotSupportedException(
                 $"bf16 streaming store is only supported for float/double, not {typeof(T).Name}.");
+        }
+        // int8 store (encoding == 2): per-tensor symmetric quantization. dst is sized
+        // to Int8BufferBytes(Length) by the caller (CheckedInt8ByteCount).
+        if (encoding == 2)
+        {
+            if (typeof(T) == typeof(float))
+            {
+                var srcF = (float[])(object)tensor.AsSpan().ToArray();
+                StreamingStoreCodec.EncodeInt8Float(srcF, dst);
+                return;
+            }
+            if (typeof(T) == typeof(double))
+            {
+                var srcD = (double[])(object)tensor.AsSpan().ToArray();
+                StreamingStoreCodec.EncodeInt8Double(srcD, dst);
+                return;
+            }
+            throw new NotSupportedException(
+                $"int8 streaming store is only supported for float/double, not {typeof(T).Name}.");
         }
         if (typeof(T) == typeof(float))
         {

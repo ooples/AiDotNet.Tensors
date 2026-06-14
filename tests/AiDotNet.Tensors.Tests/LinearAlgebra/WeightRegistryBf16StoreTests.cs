@@ -116,6 +116,37 @@ public class WeightRegistryBf16StoreTests
         finally { Cleanup(dir); }
     }
 
+    [Fact]
+    public void Int8Store_QuartersBytes_AndRoundTrips()
+    {
+        const int n = 1024;
+        var dir = Path.Combine(Path.GetTempPath(), $"aidotnet-int8-{Guid.NewGuid():N}");
+        WeightRegistry.Configure(new GpuOffloadOptions
+        {
+            StreamingBackingStorePath = dir,
+            StreamingPoolMaxResidentBytes = 1024L * 1024,
+            StreamingStoreDtype = StreamingStoreDtype.Int8,
+        });
+        WeightRegistry.SetStreamingExecutionTraining(null);
+        try
+        {
+            var t = new Tensor<float>(new[] { n });
+            for (int i = 0; i < n; i++) t[i] = (float)Math.Sin(i * 0.02) * 0.05f;
+            t.Lifetime = WeightLifetime.Streaming;
+            WeightRegistry.RegisterWeight(t);
+
+            // int8 + 4-byte scale ≈ n bytes vs fp32's 4n → ~4x reduction.
+            Assert.Equal(n + 4, WeightRegistry.StreamingPool.ResidentBytes);
+            Assert.Equal((byte)2, t.StreamingStoreEncoding);
+
+            WeightRegistry.Materialize(t);
+            double sum2 = 0, ref2 = 0;
+            for (int i = 0; i < n; i++) { double exp = Math.Sin(i * 0.02) * 0.05; double e = t[i] - exp; sum2 += e * e; ref2 += exp * exp; }
+            Assert.True(Math.Sqrt(sum2 / ref2) < 0.03, "int8 store round-trip RMS error should be ~1-2%");
+        }
+        finally { Cleanup(dir); }
+    }
+
     private static void Cleanup(string dir)
     {
         WeightRegistry.SetStreamingExecutionTraining(null);
