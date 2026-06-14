@@ -139,7 +139,13 @@ public sealed class GpuOffloadOptions
             if (available <= 0) return ResidentBudgetCeiling;
             long ramAware = (long)(available * 0.7);
             long budget = Math.Min(ResidentBudgetCeiling, ramAware);
-            return Math.Max(512L * 1024 * 1024, budget);
+            budget = Math.Max(512L * 1024 * 1024, budget);
+            // Cap by what's actually available — the 512 MiB floor used to
+            // be unconditional, so on a container with e.g. 256 MiB free
+            // we'd return 512 MiB and immediately push the pool over the
+            // OS limit, triggering exactly the swap-thrash the budget is
+            // meant to prevent.
+            return Math.Min(budget, available);
         }
         catch
         {
