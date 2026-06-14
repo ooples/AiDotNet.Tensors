@@ -13,6 +13,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 /// <see cref="MixedPrecisionCompiledPlan.StepAdam"/> with FP32 master moments + a GradScaler, and asserts
 /// the loss descends with zero overflow.
 /// </summary>
+[Collection(MixedPrecisionTestCollection.Name)]
 public class MixedPrecisionAdamTests
 {
     private readonly IEngine _engine = AiDotNetEngine.Current;

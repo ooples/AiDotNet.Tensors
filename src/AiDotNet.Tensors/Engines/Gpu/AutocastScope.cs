@@ -322,7 +322,12 @@ public sealed class AutocastScope : IDisposable
         if (!IsEnabled || ActivePrecision == PrecisionMode.Float32)
             return null;
 
-        var fp16Buffer = backend.AllocateBuffer(size);
+        // FP16 storage is 2 bytes/element. AllocateBuffer(size) reserves size FLOATS (size*4 bytes), so the
+        // fp16-compute inputs were stored float-sized and saved no memory (#558 layer-5 secondary finding).
+        // AllocateByteBuffer(size*2) reserves exactly the half-precision footprint — a contained ½-size win
+        // on the transient autocast GEMM inputs. IGpuBuffer.SizeInBytes then reflects the true 2-byte size,
+        // so the activation-cache byte accounting stays correct.
+        var fp16Buffer = backend.AllocateByteBuffer(size * 2);
         backend.ConvertToFp16(fp32Buffer, fp16Buffer, size);
         return fp16Buffer;
     }

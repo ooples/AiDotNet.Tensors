@@ -69,6 +69,61 @@ public sealed partial class MetalBackend : IGpuHalfPrecisionBackend
         ConvertToFp16(scratch, cFp16, m * n);
     }
 
+    /// <summary>
+    /// True when the FP16-native op kernels are available — they live in the same matrix MSL library as
+    /// the FP16 GEMM, so they compile whenever the backend does.
+    /// </summary>
+    public bool SupportsFp16NativeOps => IsAvailable;
+
+    /// <summary>GELU over a half buffer: out[i] = gelu(in[i]); half in/out, FP32 math.</summary>
+    public void Fp16Gelu(IGpuBuffer input, IGpuBuffer output, int n)
+        => DispatchFp16Unary("fp16_gelu_native", input, output, n);
+
+    /// <summary>ReLU over a half buffer: out[i] = max(in[i], 0); half in/out, FP32 math.</summary>
+    public void Fp16Relu(IGpuBuffer input, IGpuBuffer output, int n)
+        => DispatchFp16Unary("fp16_relu_native", input, output, n);
+
+    /// <summary>Residual add over half buffers: out[i] = a[i] + b[i]; half in/out, FP32 accumulate.</summary>
+    public void Fp16Add(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int n)
+    {
+        ThrowIfDisposed();
+        if (a is null) throw new ArgumentNullException(nameof(a));
+        if (b is null) throw new ArgumentNullException(nameof(b));
+        if (output is null) throw new ArgumentNullException(nameof(output));
+        if (n <= 0) throw new ArgumentOutOfRangeException(nameof(n), "Element count must be positive.");
+        if (a is not MetalGpuBuffer aBuf || b is not MetalGpuBuffer bBuf || output is not MetalGpuBuffer oBuf)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer");
+
+        var pipeline = GetPipeline("Matrix", _matrixLibrary, "fp16_add_native");
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(n);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer(aBuf, 0);
+        encoder.SetBuffer(bBuf, 1);
+        encoder.SetBuffer(oBuf, 2);
+        encoder.SetBytes((uint)n, 3);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+    }
+
+    private void DispatchFp16Unary(string kernelName, IGpuBuffer input, IGpuBuffer output, int n)
+    {
+        ThrowIfDisposed();
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (output is null) throw new ArgumentNullException(nameof(output));
+        if (n <= 0) throw new ArgumentOutOfRangeException(nameof(n), "Element count must be positive.");
+        if (input is not MetalGpuBuffer inBuf || output is not MetalGpuBuffer outBuf)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer");
+
+        var pipeline = GetPipeline("Matrix", _matrixLibrary, kernelName);
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(n);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer(inBuf, 0);
+        encoder.SetBuffer(outBuf, 1);
+        encoder.SetBytes((uint)n, 2);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+    }
+
     private static void ValidateHalfGemmArgs(IGpuBuffer a, IGpuBuffer b, IGpuBuffer c,
         int m, int n, int k)
     {

@@ -2789,6 +2789,16 @@ public partial class CpuEngine : ITensorLevelEngine
             if (scope != null)
             {
                 scope.BindEngineIfUnset(this);
+                // FP16 activation storage (#558): FP16-native residual add so both operand activations and
+                // the sum stay Half. Add is linear ⇒ gradient is the upstream grad for BOTH inputs.
+                if (Compilation.MixedPrecisionEmit.ActivationStorageActive<T>())
+                {
+                    var yF = Compilation.MixedPrecisionEmit.Binary(
+                        scope, (Tensor<float>)(object)a, (Tensor<float>)(object)b, a._shape, "TensorAdd", LazyNodeType.Add,
+                        (eng, af, bf) => eng.TensorAdd(af, bf),
+                        (eng, gOut, af, bf) => (gOut, gOut));
+                    return (Tensor<T>)(object)yF;
+                }
                 var capturedA = a;
                 var capturedB = b;
                 return scope.RecordBinary(LazyNodeType.Add, "TensorAdd", a, b, a._shape,
@@ -10017,6 +10027,15 @@ public partial class CpuEngine : ITensorLevelEngine
             var scope = GraphMode.Current;
             if (scope != null)
             {
+                // FP16 activation storage (#558): FP16-native ReLU so the activation stays Half end-to-end.
+                if (Compilation.MixedPrecisionEmit.ActivationStorageActive<T>())
+                {
+                    var yF = Compilation.MixedPrecisionEmit.Unary(
+                        scope, (Tensor<float>)(object)tensor, tensor._shape, "ReLU", LazyNodeType.ReLU,
+                        (eng, xf) => eng.ReLU(xf),
+                        (eng, gOut, xin, _out, _st) => eng.ReluBackward(gOut, xin));
+                    return (Tensor<T>)(object)yF;
+                }
                 var captured = tensor;
                 return scope.RecordUnary(LazyNodeType.ReLU, "ReLU", tensor, tensor._shape,
                     (eng, output) => eng.ReLUInto(output, captured),
@@ -10326,6 +10345,17 @@ public partial class CpuEngine : ITensorLevelEngine
             var scope = GraphMode.Current;
             if (scope != null)
             {
+                // FP16 activation storage (#558): under an FP16 autocast scope + the opt-in flag, emit GELU
+                // as an FP16-NATIVE op so its activation stays Half (read Half in, FP32 math, save Half) and
+                // the between-matmul activation chain never widens back to FP32. Gated off by default.
+                if (Compilation.MixedPrecisionEmit.ActivationStorageActive<T>())
+                {
+                    var yF = Compilation.MixedPrecisionEmit.Unary(
+                        scope, (Tensor<float>)(object)tensor, tensor._shape, "GELU", LazyNodeType.GELU,
+                        (eng, xf) => eng.GELU(xf),
+                        (eng, gOut, xin, _out, _st) => eng.GeluBackward(gOut, xin));
+                    return (Tensor<T>)(object)yF;
+                }
                 var captured = tensor;
                 return scope.RecordUnary(LazyNodeType.GELU, "GELU", tensor, tensor._shape,
                     (eng, output) => eng.GELUInto(output, captured),
@@ -19022,6 +19052,17 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var captured = input;
                 int capturedAxis = axis;
+                // FP16 activation storage (#558): FP16-native softmax — input/output stay Half; the backward
+                // (which needs the softmax OUTPUT, not the input) up-casts the Half output in-register.
+                if (Compilation.MixedPrecisionEmit.ActivationStorageActive<T>())
+                {
+                    var yF = Compilation.MixedPrecisionEmit.Unary(
+                        scope, (Tensor<float>)(object)input, input._shape, "Softmax", LazyNodeType.Softmax,
+                        (eng, xf) => eng.Softmax(xf, capturedAxis),
+                        (eng, gOut, _in, outF, st) => eng.SoftmaxBackward(gOut, outF, (int)st[0]),
+                        new object[] { axis });
+                    return (Tensor<T>)(object)yF;
+                }
                 return scope.RecordUnary(LazyNodeType.Softmax, "Softmax", input, input._shape,
                     // Path C: write-through via SoftmaxInto when possible.
                     // Skips the alloc-copy round-trip through Softmax's
@@ -21652,6 +21693,21 @@ public partial class CpuEngine : ITensorLevelEngine
             var scope = GraphMode.Current;
             if (scope != null)
             {
+                // FP16 activation storage (#558): FP16-native LayerNorm — input + gamma/beta taken as Half
+                // (param grads bridge to FP32 via the down-cast nodes), FP32 normalize math, Half output, so
+                // the dominant [B,S,D] activation is saved Half. Still assign the out mean/variance from an
+                // eager pass to honor the method contract (they are trace-time placeholders in graph mode).
+                if (Compilation.MixedPrecisionEmit.ActivationStorageActive<T>())
+                {
+                    var savedScopeMp = GraphMode.Current;
+                    GraphMode.SetCurrent(null);
+                    var eagerMp = LayerNorm(input, gamma, beta, epsilon, out mean, out variance);
+                    GraphMode.SetCurrent(savedScopeMp);
+                    var yF = Compilation.MixedPrecisionEmit.LayerNorm(
+                        scope, (Tensor<float>)(object)input, (Tensor<float>)(object)gamma,
+                        (Tensor<float>)(object)beta, epsilon, eagerMp._shape, "LayerNorm");
+                    return (Tensor<T>)(object)yF;
+                }
                 var ci = input; var cg = gamma; var cb = beta; double ce = epsilon;
                 var savedScope = GraphMode.Current;
                 GraphMode.SetCurrent(null);

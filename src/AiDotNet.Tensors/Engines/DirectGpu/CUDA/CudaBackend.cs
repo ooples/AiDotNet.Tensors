@@ -11516,6 +11516,33 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public unsafe void Fp16Gelu(IGpuBuffer input, IGpuBuffer output, int size)
         => LaunchUnaryFp16("fp16_gelu_native", input, output, size);
 
+    /// <summary>
+    /// True when the self-contained FP16-native op kernels (GELU/ReLU/add — no cuda_fp16.h) are compiled.
+    /// They are built in the ctor as part of <c>fp16_native_kernels</c>, so this is available driver-only.
+    /// </summary>
+    public bool SupportsFp16NativeOps => IsAvailable && _kernelCache.ContainsKey("fp16_gelu_native");
+
+    /// <summary>FP16-native ReLU: reads FP16 directly, max(x,0) in FP32, writes FP16 (no FP32 buffer).</summary>
+    public unsafe void Fp16Relu(IGpuBuffer input, IGpuBuffer output, int size)
+        => LaunchUnaryFp16("fp16_relu_native", input, output, size);
+
+    /// <summary>FP16-native residual add: out = a + b; reads FP16 directly, FP32 accumulate, writes FP16.</summary>
+    public unsafe void Fp16Add(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int size)
+    {
+        if (a is null) throw new ArgumentNullException(nameof(a));
+        if (b is null) throw new ArgumentNullException(nameof(b));
+        if (output is null) throw new ArgumentNullException(nameof(output));
+        if (size <= 0) throw new ArgumentOutOfRangeException(nameof(size), "Element count must be positive.");
+        if (!_kernelCache.TryGetValue("fp16_add_native", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: fp16_add_native");
+        using var _ = PushContext();
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr aPtr = a.Handle, bPtr = b.Handle, outPtr = output.Handle;
+        void** args = stackalloc void*[4];
+        args[0] = &aPtr; args[1] = &bPtr; args[2] = &outPtr; args[3] = &size;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
     /// <summary>FP32→FP16 via the self-contained native kernel (no cuda_fp16.h). Output is a half buffer.</summary>
     public unsafe void ConvertToFp16Native(IGpuBuffer input, IGpuBuffer output, int size)
         => LaunchConvertFp16("convert_fp32_to_fp16_native", input, output, size);

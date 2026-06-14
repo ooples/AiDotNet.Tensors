@@ -14,6 +14,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 /// and asserts (1) paging engages (PageOutCount &gt; 0), and (2) it is TRANSPARENT — gradients match the
 /// non-paged run within FP16 rounding (paging stores activations as Half, the accepted AMP trade).
 /// </summary>
+[Collection(MixedPrecisionTestCollection.Name)]
 public class MixedPrecisionPagingTests
 {
     private readonly IEngine _engine = AiDotNetEngine.Current;

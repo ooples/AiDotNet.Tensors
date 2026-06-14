@@ -20,6 +20,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 /// segment, which is only reachable after the FP16 grad of the SECOND segment bridges back into the
 /// FP32 tape and re-seeds it — i.e. it exercises the Gauss-Seidel sweep, not a single pass.
 /// </summary>
+[Collection(AiDotNet.Tensors.Tests.Engines.Compilation.MixedPrecisionTestCollection.Name)]
 public class MixedPrecisionTapeGradientCheckTests
 {
     private readonly IEngine _engine = AiDotNetEngine.Current;
