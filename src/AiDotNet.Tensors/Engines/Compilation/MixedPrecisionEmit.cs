@@ -49,7 +49,20 @@ internal static class MixedPrecisionEmit
         && Gpu.AutocastScope.IsEnabled
         && Gpu.AutocastScope.ActivePrecision == Gpu.PrecisionMode.Float16;
 
-    /// <summary>Both the autocast scope and the activation-storage opt-in are active.</summary>
+    /// <summary>
+    /// Both the autocast scope and the activation-storage opt-in are active. The CpuEngine GraphMode
+    /// branches (MatMul/GELU/ReLU/Softmax/TensorAdd/LayerNorm) call this to decide whether to record the
+    /// FP16-native emit instead of the FP32 node.
+    /// <para><b>GPU-engine behavior (documents the deliberate fallback for issue #558).</b> The recorded
+    /// realize delegates are engine-agnostic: at realize they call <c>e.GELU</c>/<c>e.TensorMatMul</c>/etc.,
+    /// which dispatch to whatever engine runs the plan — so on <c>DirectGpuTensorEngine</c> the op math runs
+    /// on the GPU, NOT silently on the CPU. The only host-side work is the FP16↔FP32 dtype cast
+    /// (<see cref="MixedPrecisionCast"/>); the GPU does the matmul/activation. This is the same engine-agnostic
+    /// pattern the already-shipped FP16 <see cref="MatMul"/> emit uses. The zero-copy GPU path — having the
+    /// realize call the per-backend FP16-native kernels (<c>Fp16Gelu</c>/<c>Fp16Relu</c>/<c>Fp16Add</c>,
+    /// added for all six backends in this PR) so no host round-trip happens — is the remaining wiring tracked
+    /// under issue #558; until then the GPU path is correct (ops on GPU) but not yet host-round-trip-free.</para>
+    /// </summary>
     public static bool ActivationStorageActive<T>() => Fp16ActivationStorageEnabled && ShouldEmitFp16<T>();
 
     /// <summary>
@@ -135,20 +148,25 @@ internal static class MixedPrecisionEmit
             (e, o) =>
             {
                 // FP16-native realize: up-cast the Half activation only for the FP32 math, then store the
-                // result back as Half so the saved activation chain never widens to FP32.
-                var xf = MixedPrecisionCast.CastToFp32(xH);
-                var yf = fp32Forward(e, xf);
-                MixedPrecisionCast.CastToFp16(yf).AsSpan().CopyTo(o.AsWritableSpan());
+                // result back as Half so the saved activation chain never widens to FP32. The up-cast/op
+                // results are fresh, non-pooled Tensors local to this realize — dispose them so the
+                // per-replay-step transient FP32 buffers don't accumulate GC pressure in the training loop.
+                using var xf = MixedPrecisionCast.CastToFp32(xH);
+                using var yf = fp32Forward(e, xf);
+                using var yh = MixedPrecisionCast.CastToFp16(yf);
+                yh.AsSpan().CopyTo(o.AsWritableSpan());
             },
             (gradOutH, inputs, output, state, e, grads) =>
             {
                 // Backward in FP32: up-cast the saved Half input + incoming Half grad (+ Half output), run
-                // the op's FP32 gradient, down-cast the input-grad back to Half and accumulate.
+                // the op's FP32 gradient, down-cast the input-grad back to Half and accumulate. All upcasts
+                // and the op-gradient output are fresh transients → dispose them; the down-cast grad handed
+                // to AccumulateGrad is retained by the grad map and must NOT be disposed here.
                 var inH = inputs[0];
-                var gradOutF = MixedPrecisionCast.CastToFp32(gradOutH);
-                var inF = MixedPrecisionCast.CastToFp32(inH);
-                var outF = MixedPrecisionCast.CastToFp32(output);
-                var gradInF = fp32Backward(e, gradOutF, inF, outF, state);
+                using var gradOutF = MixedPrecisionCast.CastToFp32(gradOutH);
+                using var inF = MixedPrecisionCast.CastToFp32(inH);
+                using var outF = MixedPrecisionCast.CastToFp32(output);
+                using var gradInF = fp32Backward(e, gradOutF, inF, outF, state);
                 Autodiff.DifferentiableOps.AccumulateGrad(grads, inH, MixedPrecisionCast.CastToFp16(gradInF), e);
             },
             savedState: savedState ?? Array.Empty<object>());
@@ -189,18 +207,26 @@ internal static class MixedPrecisionEmit
             nodeType, opName + ".fp16", aH, bH, outShape,
             (e, o) =>
             {
-                var af = MixedPrecisionCast.CastToFp32(aH);
-                var bf = MixedPrecisionCast.CastToFp32(bH);
-                var cf = fp32Forward(e, af, bf);
-                MixedPrecisionCast.CastToFp16(cf).AsSpan().CopyTo(o.AsWritableSpan());
+                // Fresh, non-pooled transients local to this realize — dispose to bound per-step GC churn.
+                using var af = MixedPrecisionCast.CastToFp32(aH);
+                using var bf = MixedPrecisionCast.CastToFp32(bH);
+                using var cf = fp32Forward(e, af, bf);
+                using var ch = MixedPrecisionCast.CastToFp16(cf);
+                ch.AsSpan().CopyTo(o.AsWritableSpan());
             },
             (gradOutH, inputs, output, state, e, grads) =>
             {
                 var inA = inputs[0];
                 var inB = inputs[1];
+                // Only dispose the operand up-casts: they are fresh and never returned by fp32Backward.
+                // gradOutF and the returned (gradAF, gradBF) are NOT disposed — a linear op (e.g. residual
+                // Add: (gOut, gOut)) returns gradOutF itself for both inputs, so disposing any of them would
+                // free a buffer the CastToFp16 reads (use-after-free) or double-free the alias. Leaving them
+                // to GC is the safe choice; the dominant transients (the two operand up-casts) are freed.
                 var gradOutF = MixedPrecisionCast.CastToFp32(gradOutH);
-                var (gradAF, gradBF) = fp32Backward(
-                    e, gradOutF, MixedPrecisionCast.CastToFp32(inA), MixedPrecisionCast.CastToFp32(inB));
+                using var aF = MixedPrecisionCast.CastToFp32(inA);
+                using var bF = MixedPrecisionCast.CastToFp32(inB);
+                var (gradAF, gradBF) = fp32Backward(e, gradOutF, aF, bF);
                 Autodiff.DifferentiableOps.AccumulateGrad(grads, inA, MixedPrecisionCast.CastToFp16(gradAF), e);
                 Autodiff.DifferentiableOps.AccumulateGrad(grads, inB, MixedPrecisionCast.CastToFp16(gradBF), e);
             });
@@ -248,26 +274,33 @@ internal static class MixedPrecisionEmit
             LazyNodeType.Custom, opName + ".fp16", new[] { xH, gH, bH }, outShape,
             (e, o) =>
             {
-                var xf = MixedPrecisionCast.CastToFp32(xH);
-                var gf = MixedPrecisionCast.CastToFp32(gH);
-                var bf = MixedPrecisionCast.CastToFp32(bH);
-                var yf = e.LayerNorm(xf, gf, bf, epsilon, out var mean, out var variance);
+                // x/gamma/beta up-casts and the normalized output are fresh transients — dispose them. The
+                // mean/variance out-params are NOT disposed: they're handed to the backward via the holder.
+                using var xf = MixedPrecisionCast.CastToFp32(xH);
+                using var gf = MixedPrecisionCast.CastToFp32(gH);
+                using var bf = MixedPrecisionCast.CastToFp32(bH);
+                using var yf = e.LayerNorm(xf, gf, bf, epsilon, out var mean, out var variance);
                 mv.Mean = mean;
                 mv.Variance = variance;
-                MixedPrecisionCast.CastToFp16(yf).AsSpan().CopyTo(o.AsWritableSpan());
+                using var yh = MixedPrecisionCast.CastToFp16(yf);
+                yh.AsSpan().CopyTo(o.AsWritableSpan());
             },
             (gradOutH, inputs, output, state, e, grads) =>
             {
-                var xf = MixedPrecisionCast.CastToFp32(inputs[0]);
-                var gf = MixedPrecisionCast.CastToFp32(inputs[1]);
-                var gradOutF = MixedPrecisionCast.CastToFp32(gradOutH);
                 if (mv.Mean is null || mv.Variance is null)
                     throw new InvalidOperationException("LayerNorm backward ran before its forward realize populated mean/variance.");
-                var gradIn = e.LayerNormBackward(
+                // All up-casts and the three FP32 grad outputs are fresh transients → dispose. The down-cast
+                // grads handed to AccumulateGrad are retained by the grad map and must NOT be disposed here.
+                using var xf = MixedPrecisionCast.CastToFp32(inputs[0]);
+                using var gf = MixedPrecisionCast.CastToFp32(inputs[1]);
+                using var gradOutF = MixedPrecisionCast.CastToFp32(gradOutH);
+                using var gradIn = e.LayerNormBackward(
                     gradOutF, xf, gf, mv.Mean, mv.Variance, epsilon, out var gradGamma, out var gradBeta);
+                using var gradGammaD = gradGamma;
+                using var gradBetaD = gradBeta;
                 Autodiff.DifferentiableOps.AccumulateGrad(grads, inputs[0], MixedPrecisionCast.CastToFp16(gradIn), e);
-                Autodiff.DifferentiableOps.AccumulateGrad(grads, inputs[1], MixedPrecisionCast.CastToFp16(gradGamma), e);
-                Autodiff.DifferentiableOps.AccumulateGrad(grads, inputs[2], MixedPrecisionCast.CastToFp16(gradBeta), e);
+                Autodiff.DifferentiableOps.AccumulateGrad(grads, inputs[1], MixedPrecisionCast.CastToFp16(gradGammaD), e);
+                Autodiff.DifferentiableOps.AccumulateGrad(grads, inputs[2], MixedPrecisionCast.CastToFp16(gradBetaD), e);
             });
 
         return UpCast(scope, yH, outShape, opName + ".castOut32");

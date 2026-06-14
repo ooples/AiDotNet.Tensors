@@ -272,7 +272,12 @@ public class Fp16NativeOpTests
         Assert.Equal(expected.Length, actual.Length);
         for (int i = 0; i < expected.Length; i++)
         {
+#if NET6_0_OR_GREATER
             Assert.True(float.IsFinite(actual[i]), $"{label}[{i}] not finite: {actual[i]}");
+#else
+            // float.IsFinite was added in .NET Core 2.1 / net5+; net471 lacks it.
+            Assert.True(!float.IsNaN(actual[i]) && !float.IsInfinity(actual[i]), $"{label}[{i}] not finite: {actual[i]}");
+#endif
             double tol = 2e-2 + 5e-2 * Math.Abs(expected[i]); // FP16 activation rounding
             Assert.True(Math.Abs(expected[i] - actual[i]) <= tol,
                 $"{label}[{i}] reference {expected[i]} vs FP16-native {actual[i]} (tol {tol})");
