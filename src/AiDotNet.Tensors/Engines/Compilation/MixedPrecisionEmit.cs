@@ -107,7 +107,11 @@ internal static class MixedPrecisionEmit
     /// dead (unreachable from the loss) → dropped by the plan's topo-from-output, so it is never resident.</para>
     /// </summary>
     /// <param name="fp32Forward">Runs the op's FP32 math: <c>(engine, inputFp32) =&gt; outputFp32</c>.</param>
-    /// <param name="fp32Backward">The op's FP32 backward: <c>(engine, gradOutFp32, inputFp32) =&gt; gradInFp32</c>.</param>
+    /// <param name="fp32Backward">
+    /// The op's FP32 backward: <c>(engine, gradOutFp32, inputFp32, outputFp32, savedState) =&gt; gradInFp32</c>.
+    /// <paramref name="outputFp32"/> is the up-cast realized output (softmax/sigmoid backward need it);
+    /// <c>savedState</c> carries op params (e.g. the softmax axis). Either may be ignored.
+    /// </param>
     public static Tensor<float> Unary(
         LazyTensorScope scope,
         Tensor<float> x,
@@ -115,7 +119,8 @@ internal static class MixedPrecisionEmit
         string opName,
         LazyNodeType nodeType,
         Func<IEngine, Tensor<float>, Tensor<float>> fp32Forward,
-        Func<IEngine, Tensor<float>, Tensor<float>, Tensor<float>> fp32Backward)
+        Func<IEngine, Tensor<float>, Tensor<float>, Tensor<float>, object[], Tensor<float>> fp32Backward,
+        object[]? savedState = null)
     {
         if (scope is null) throw new ArgumentNullException(nameof(scope));
         if (x is null) throw new ArgumentNullException(nameof(x));
@@ -137,14 +142,16 @@ internal static class MixedPrecisionEmit
             },
             (gradOutH, inputs, output, state, e, grads) =>
             {
-                // Backward in FP32: up-cast the saved Half input + incoming Half grad, run the op's FP32
-                // gradient, down-cast the input-grad back to Half and accumulate into the Half grad map.
+                // Backward in FP32: up-cast the saved Half input + incoming Half grad (+ Half output), run
+                // the op's FP32 gradient, down-cast the input-grad back to Half and accumulate.
                 var inH = inputs[0];
                 var gradOutF = MixedPrecisionCast.CastToFp32(gradOutH);
                 var inF = MixedPrecisionCast.CastToFp32(inH);
-                var gradInF = fp32Backward(e, gradOutF, inF);
+                var outF = MixedPrecisionCast.CastToFp32(output);
+                var gradInF = fp32Backward(e, gradOutF, inF, outF, state);
                 Autodiff.DifferentiableOps.AccumulateGrad(grads, inH, MixedPrecisionCast.CastToFp16(gradInF), e);
-            });
+            },
+            savedState: savedState ?? Array.Empty<object>());
 
         return UpCast(scope, yH, outShape, opName + ".castOut32");
     }
@@ -199,6 +206,71 @@ internal static class MixedPrecisionEmit
             });
 
         return UpCast(scope, cH, outShape, opName + ".castOut32");
+    }
+
+    /// <summary>Mutable carrier for the realize-time FP32 mean/variance a norm backward needs.</summary>
+    private sealed class MeanVarHolder
+    {
+        public Tensor<float>? Mean;
+        public Tensor<float>? Variance;
+    }
+
+    /// <summary>
+    /// Emits an FP16-NATIVE affine LayerNorm so the dominant activation (the [B,S,D] input) is saved as
+    /// <see cref="Half"/>. Input and the gamma/beta params are taken as Half (params down-cast once per step
+    /// via <see cref="ToFp16Input"/> — the cast node bridges their Half grad back to the FP32 master grad,
+    /// exactly as matmul handles its weight); the normalize math runs in FP32 on an up-cast-in-realize copy,
+    /// the output is Half, and the realize-time mean/variance flow to the backward through a holder (the
+    /// #1331 freshness contract — trace-time mean/var are stale under replay). gradInput/gradGamma/gradBeta
+    /// are computed in FP32 then down-cast into the Half grad map.
+    /// </summary>
+    public static Tensor<float> LayerNorm(
+        LazyTensorScope scope,
+        Tensor<float> x,
+        Tensor<float> gamma,
+        Tensor<float> beta,
+        double epsilon,
+        int[] outShape,
+        string opName = "LayerNorm")
+    {
+        if (scope is null) throw new ArgumentNullException(nameof(scope));
+        if (x is null) throw new ArgumentNullException(nameof(x));
+        if (gamma is null) throw new ArgumentNullException(nameof(gamma));
+        if (beta is null) throw new ArgumentNullException(nameof(beta));
+        if (outShape is null) throw new ArgumentNullException(nameof(outShape));
+
+        var xH = ToFp16Input(scope, x, opName + ".castIn16");
+        var gH = ToFp16Input(scope, gamma, opName + ".castGamma16");
+        var bH = ToFp16Input(scope, beta, opName + ".castBeta16");
+        var mv = new MeanVarHolder();
+
+        var yH = scope.RecordVariadic<Half>(
+            LazyNodeType.Custom, opName + ".fp16", new[] { xH, gH, bH }, outShape,
+            (e, o) =>
+            {
+                var xf = MixedPrecisionCast.CastToFp32(xH);
+                var gf = MixedPrecisionCast.CastToFp32(gH);
+                var bf = MixedPrecisionCast.CastToFp32(bH);
+                var yf = e.LayerNorm(xf, gf, bf, epsilon, out var mean, out var variance);
+                mv.Mean = mean;
+                mv.Variance = variance;
+                MixedPrecisionCast.CastToFp16(yf).AsSpan().CopyTo(o.AsWritableSpan());
+            },
+            (gradOutH, inputs, output, state, e, grads) =>
+            {
+                var xf = MixedPrecisionCast.CastToFp32(inputs[0]);
+                var gf = MixedPrecisionCast.CastToFp32(inputs[1]);
+                var gradOutF = MixedPrecisionCast.CastToFp32(gradOutH);
+                if (mv.Mean is null || mv.Variance is null)
+                    throw new InvalidOperationException("LayerNorm backward ran before its forward realize populated mean/variance.");
+                var gradIn = e.LayerNormBackward(
+                    gradOutF, xf, gf, mv.Mean, mv.Variance, epsilon, out var gradGamma, out var gradBeta);
+                Autodiff.DifferentiableOps.AccumulateGrad(grads, inputs[0], MixedPrecisionCast.CastToFp16(gradIn), e);
+                Autodiff.DifferentiableOps.AccumulateGrad(grads, inputs[1], MixedPrecisionCast.CastToFp16(gradGamma), e);
+                Autodiff.DifferentiableOps.AccumulateGrad(grads, inputs[2], MixedPrecisionCast.CastToFp16(gradBeta), e);
+            });
+
+        return UpCast(scope, yH, outShape, opName + ".castOut32");
     }
 
     /// <summary>

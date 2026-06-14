@@ -61,7 +61,7 @@ public class Fp16NativeOpTests
                 y = MixedPrecisionEmit.MatMul(scope, x, W, new[] { 2, 2 });
                 g = MixedPrecisionEmit.Unary(scope, y, new[] { 2, 2 }, "GELU", LazyNodeType.GELU,
                     (e, xf) => e.GELU(xf),
-                    (e, gOut, xin) => e.GeluBackward(gOut, xin));
+                    (e, gOut, xin, _o, _s) => e.GeluBackward(gOut, xin));
             }
             finally { MixedPrecisionEmit.TestOverrideEnabled = prev; }
             loss = SumLoss(scope, g);
@@ -123,7 +123,7 @@ public class Fp16NativeOpTests
                 var y = MixedPrecisionEmit.MatMul(scope, x, W, new[] { 2, 2 });
                 relu = MixedPrecisionEmit.Unary(scope, y, new[] { 2, 2 }, "ReLU", LazyNodeType.ReLU,
                     (e, xf) => e.ReLU(xf),
-                    (e, gOut, xin) => e.ReluBackward(gOut, xin));
+                    (e, gOut, xin, _o, _s) => e.ReluBackward(gOut, xin));
                 z = MixedPrecisionEmit.Binary(scope, relu, r, new[] { 2, 2 }, "Add", LazyNodeType.Add,
                     (e, af, bf) => e.TensorAdd(af, bf),
                     (e, gOut, af, bf) => (gOut, gOut));
@@ -156,6 +156,110 @@ public class Fp16NativeOpTests
         var refGrads = MixedPrecisionGraphBackward.Backward(lossRef, _engine);
 
         foreach (var (t, name) in new[] { (x, "dL/dx"), (W, "dL/dW"), (r, "dL/dr") })
+        {
+            Assert.True(got.Fp32.TryGetValue(t, out var g16), $"no FP16-native grad for {name}");
+            Assert.True(refGrads.Fp32.TryGetValue(t, out var gRef), $"no reference grad for {name}");
+            AssertClose(gRef.ToArray(), g16.ToArray(), name);
+        }
+    }
+
+    [Fact]
+    public void Unary_Softmax_StaysHalf_BackpropMatchesFp32Reference()
+    {
+        // loss = sum( Softmax(x @ W, axis=-1) ) over [2,2]; softmax backward needs the OUTPUT.
+        var x = F(new[] { 2, 3 }, 1f, 2f, -1f, 0.5f, -0.5f, 1.5f);
+        var W = F(new[] { 3, 2 }, 0.5f, 1f, -1f, 0.5f, 2f, -0.5f);
+
+        var scope = new LazyTensorScope(null);
+        Tensor<float> sm, loss;
+        using (new AutocastScope(PrecisionMode.Float16))
+        {
+            var prev = MixedPrecisionEmit.TestOverrideEnabled;
+            MixedPrecisionEmit.TestOverrideEnabled = true;
+            try
+            {
+                var y = MixedPrecisionEmit.MatMul(scope, x, W, new[] { 2, 2 });
+                sm = MixedPrecisionEmit.Unary(scope, y, new[] { 2, 2 }, "Softmax", LazyNodeType.Softmax,
+                    (e, xf) => e.Softmax(xf, -1),
+                    (e, gOut, _in, outF, st) => e.SoftmaxBackward(gOut, outF, (int)st[0]),
+                    new object[] { 1 });
+            }
+            finally { MixedPrecisionEmit.TestOverrideEnabled = prev; }
+            loss = SumLoss(scope, sm);
+        }
+        Assert.True(sm.LazySource is CrossTypeLazyNode<Half, float>, "softmax output should be Half up-cast");
+
+        _ = loss.ToArray();
+        var got = MixedPrecisionGraphBackward.Backward(loss, _engine);
+
+        var refScope = new LazyTensorScope(null);
+        var yRef = refScope.RecordBinary<float>(LazyNodeType.MatMul, "mm", x, W, new[] { 2, 2 },
+            (e, o) => e.TensorMatMul(x, W).AsSpan().CopyTo(o.AsWritableSpan()),
+            BackwardFunctions<float>.MatMulBackward);
+        var smRef = refScope.RecordUnary<float>(LazyNodeType.Softmax, "sm", yRef, new[] { 2, 2 },
+            (e, o) => e.Softmax(yRef, -1).AsSpan().CopyTo(o.AsWritableSpan()),
+            BackwardFunctions<float>.SoftmaxBackward, new object[] { 1 });
+        var lossRef = SumLoss(refScope, smRef);
+        _ = lossRef.ToArray();
+        var refGrads = MixedPrecisionGraphBackward.Backward(lossRef, _engine);
+
+        foreach (var (t, name) in new[] { (x, "dL/dx"), (W, "dL/dW") })
+        {
+            Assert.True(got.Fp32.TryGetValue(t, out var g16), $"no FP16-native grad for {name}");
+            Assert.True(refGrads.Fp32.TryGetValue(t, out var gRef), $"no reference grad for {name}");
+            AssertClose(gRef.ToArray(), g16.ToArray(), name);
+        }
+    }
+
+    [Fact]
+    public void LayerNorm_StaysHalf_ParamGradsBridgeToFp32_BackpropMatchesReference()
+    {
+        // loss = sum( LayerNorm(x @ W, gamma, beta) ) — exercises FP16-native affine LayerNorm with
+        // gamma/beta param grads bridged back to FP32 via the down-cast nodes.
+        var x = F(new[] { 2, 3 }, 1f, 2f, -1f, 0.5f, -0.5f, 1.5f);
+        var W = F(new[] { 3, 4 }, 0.5f, 1f, -1f, 0.5f, 2f, -0.5f, 1f, -1f, 0.25f, 0.5f, -0.25f, 1.5f);
+        var gamma = F(new[] { 4 }, 1f, 1.5f, 0.5f, 1f);
+        var beta = F(new[] { 4 }, 0f, 0.25f, -0.25f, 0.5f);
+        const double eps = 1e-5;
+
+        var scope = new LazyTensorScope(null);
+        Tensor<float> ln, loss;
+        using (new AutocastScope(PrecisionMode.Float16))
+        {
+            var prev = MixedPrecisionEmit.TestOverrideEnabled;
+            MixedPrecisionEmit.TestOverrideEnabled = true;
+            try
+            {
+                var y = MixedPrecisionEmit.MatMul(scope, x, W, new[] { 2, 4 });
+                ln = MixedPrecisionEmit.LayerNorm(scope, y, gamma, beta, eps, new[] { 2, 4 });
+            }
+            finally { MixedPrecisionEmit.TestOverrideEnabled = prev; }
+            loss = SumLoss(scope, ln);
+        }
+        Assert.True(ln.LazySource is CrossTypeLazyNode<Half, float>, "LayerNorm output should be Half up-cast");
+
+        _ = loss.ToArray();
+        var got = MixedPrecisionGraphBackward.Backward(loss, _engine);
+
+        var refScope = new LazyTensorScope(null);
+        var yRef = refScope.RecordBinary<float>(LazyNodeType.MatMul, "mm", x, W, new[] { 2, 4 },
+            (e, o) => e.TensorMatMul(x, W).AsSpan().CopyTo(o.AsWritableSpan()),
+            BackwardFunctions<float>.MatMulBackward);
+        var lnRef = refScope.RecordVariadic<float>(LazyNodeType.Custom, "ln", new[] { yRef, gamma, beta }, new[] { 2, 4 },
+            (e, o) => e.LayerNorm(yRef, gamma, beta, eps, out _, out _).AsSpan().CopyTo(o.AsWritableSpan()),
+            (gradOut, inputs, output, state, e, grads) =>
+            {
+                _ = e.LayerNorm(inputs[0], inputs[1], inputs[2], eps, out var m, out var v);
+                var gi = e.LayerNormBackward(gradOut, inputs[0], inputs[1], m, v, eps, out var gg, out var gb);
+                Acc(grads, inputs[0], gi, e);
+                Acc(grads, inputs[1], gg, e);
+                Acc(grads, inputs[2], gb, e);
+            });
+        var lossRef = SumLoss(refScope, lnRef);
+        _ = lossRef.ToArray();
+        var refGrads = MixedPrecisionGraphBackward.Backward(lossRef, _engine);
+
+        foreach (var (t, name) in new[] { (x, "dL/dx"), (W, "dL/dW"), (gamma, "dL/dgamma"), (beta, "dL/dbeta") })
         {
             Assert.True(got.Fp32.TryGetValue(t, out var g16), $"no FP16-native grad for {name}");
             Assert.True(refGrads.Fp32.TryGetValue(t, out var gRef), $"no reference grad for {name}");
