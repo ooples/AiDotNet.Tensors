@@ -30,6 +30,18 @@ public sealed class StreamingTensorPool : IDisposable
     private readonly Dictionary<long, Entry> _entries = new();
     private readonly LinkedList<long> _lruOrder = new(); // most recent at head
     private readonly Dictionary<long, LinkedListNode<long>> _lruIndex = new();
+
+    // Schedule-aware (Belady-optimal) paging. When the consumer supplies the
+    // repeating per-step handle access order (a transformer's forward 0..N then
+    // backward N..0 is fully deterministic), eviction picks the resident entry
+    // whose NEXT scheduled use is furthest in the future — the provably minimal
+    // page-fault policy — instead of LRU. Crucially, for a cyclic/scan pattern LRU
+    // is near-PESSIMAL: it evicts the entry about to be reused next. _schedule is
+    // the access order; _scheduleOccurrences maps handle → its sorted positions in
+    // it; _schedulePos is the cursor into the current step. Null _schedule ⇒ LRU.
+    private long[]? _schedule;
+    private Dictionary<long, int[]>? _scheduleOccurrences;
+    private int _schedulePos;
     private long _residentBytes;
     private long _residentBytesPeak;
     private long _nextHandleId = 1;
@@ -205,6 +217,7 @@ public sealed class StreamingTensorPool : IDisposable
         lock (_lock)
         {
             ThrowIfDisposed();
+            AdvanceSchedule(handleId);
             if (!_lruIndex.TryGetValue(handleId, out var node)) return;
             _lruOrder.Remove(node);
             _lruOrder.AddFirst(node);
@@ -228,6 +241,40 @@ public sealed class StreamingTensorPool : IDisposable
             ThrowIfDisposed();
             if (_entries.TryGetValue(handleId, out var entry))
                 entry.BackingFileCurrent = false;
+        }
+    }
+
+    /// <summary>
+    /// Supplies the repeating per-step handle access order so eviction can use
+    /// Belady-optimal selection (evict the entry whose next use is furthest) instead
+    /// of LRU. For a transformer this is forward layers 0..N then backward N..0 — a
+    /// known static schedule. Crucially LRU is near-PESSIMAL on such cyclic patterns
+    /// (it evicts the entry about to be reused); Belady is provably minimal-fault.
+    /// Pass an empty span (or never call this) to keep LRU. The order may contain a
+    /// handle multiple times (forward + backward uses); it's treated as one cycle.
+    /// </summary>
+    public void SetAccessSchedule(ReadOnlySpan<long> order)
+    {
+        lock (_lock)
+        {
+            ThrowIfDisposed();
+            if (order.Length == 0)
+            {
+                _schedule = null; _scheduleOccurrences = null; _schedulePos = 0;
+                return;
+            }
+            var sched = order.ToArray();
+            var occ = new Dictionary<long, System.Collections.Generic.List<int>>();
+            for (int i = 0; i < sched.Length; i++)
+            {
+                if (!occ.TryGetValue(sched[i], out var list)) { list = new System.Collections.Generic.List<int>(); occ[sched[i]] = list; }
+                list.Add(i);
+            }
+            var occArr = new Dictionary<long, int[]>(occ.Count);
+            foreach (var kv in occ) occArr[kv.Key] = kv.Value.ToArray(); // already sorted (ascending i)
+            _schedule = sched;
+            _scheduleOccurrences = occArr;
+            _schedulePos = 0;
         }
     }
 
@@ -261,6 +308,11 @@ public sealed class StreamingTensorPool : IDisposable
             ThrowIfDisposed();
             if (!_entries.TryGetValue(handleId, out var entry))
                 throw new InvalidOperationException($"Streaming pool: handle {handleId} is unknown.");
+
+            // A real (foreground) read advances the schedule cursor so Belady
+            // eviction predicts the next use from the true access stream. Prefetch
+            // is speculative — it must NOT move the cursor.
+            if (!isPrefetch) AdvanceSchedule(handleId);
 
             if (isPrefetch)
             {
@@ -568,11 +620,66 @@ public sealed class StreamingTensorPool : IDisposable
     {
         // Caller already holds _lock.
         if (_lruOrder.Count == 0) return false;
+        var victim = _schedule is null
+            ? SelectLruVictim(protectedHandleId)
+            : SelectBeladyVictim(protectedHandleId);
+        if (victim is null) return false;
+        return EvictNodeInternal(victim);
+    }
+
+    // LRU: the tail (least-recently-used), skipping the protected handle.
+    private LinkedListNode<long>? SelectLruVictim(long? protectedHandleId)
+    {
         var oldest = _lruOrder.Last;
         while (oldest is not null && protectedHandleId.HasValue && oldest.Value == protectedHandleId.Value)
             oldest = oldest.Previous;
-        if (oldest is null) return false;
-        return EvictNodeInternal(oldest);
+        return oldest;
+    }
+
+    // Belady: among resident entries, the one whose NEXT scheduled access is
+    // furthest in the future (or never) — provably the minimal-fault choice. O(R)
+    // over the resident set (bounded by budget); ties resolved toward LRU tail.
+    private LinkedListNode<long>? SelectBeladyVictim(long? protectedHandleId)
+    {
+        LinkedListNode<long>? best = null;
+        long bestDist = long.MinValue;
+        // Walk LRU tail→head so equal-distance ties pick the less-recently-used one.
+        for (var node = _lruOrder.Last; node is not null; node = node.Previous)
+        {
+            long h = node.Value;
+            if (protectedHandleId.HasValue && h == protectedHandleId.Value) continue;
+            long dist = NextAccessDistance(h);
+            if (dist > bestDist) { bestDist = dist; best = node; }
+            if (dist == long.MaxValue) break; // never used again → evict immediately
+        }
+        // Fall back to LRU if the schedule somehow knows none of them (shouldn't happen).
+        return best ?? SelectLruVictim(protectedHandleId);
+    }
+
+    // Distance (in accesses) from the current schedule cursor to handle h's next
+    // occurrence, wrapping to the next cycle. long.MaxValue if h is not scheduled.
+    private long NextAccessDistance(long handle)
+    {
+        if (_scheduleOccurrences is null || _schedule is null) return long.MaxValue;
+        if (!_scheduleOccurrences.TryGetValue(handle, out var positions)) return long.MaxValue;
+        // Smallest position >= _schedulePos via binary search.
+        int lo = 0, hi = positions.Length;
+        while (lo < hi) { int mid = (lo + hi) >> 1; if (positions[mid] >= _schedulePos) hi = mid; else lo = mid + 1; }
+        if (lo < positions.Length) return positions[lo] - _schedulePos;
+        // Wrap: first occurrence in the next cycle.
+        return (long)_schedule.Length - _schedulePos + positions[0];
+    }
+
+    // Advance the schedule cursor to just past handle h's next occurrence, so the
+    // cursor tracks the real access stream even if it skips/reorders slightly.
+    private void AdvanceSchedule(long handle)
+    {
+        if (_scheduleOccurrences is null || _schedule is null) return;
+        if (!_scheduleOccurrences.TryGetValue(handle, out var positions)) return;
+        int lo = 0, hi = positions.Length;
+        while (lo < hi) { int mid = (lo + hi) >> 1; if (positions[mid] >= _schedulePos) hi = mid; else lo = mid + 1; }
+        int next = lo < positions.Length ? positions[lo] : positions[0];
+        _schedulePos = (next + 1) % _schedule.Length;
     }
 
     private void EvictIfOverBudget(long? protectedHandleId = null)
