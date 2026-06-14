@@ -706,6 +706,25 @@ public static class WeightRegistry
             $"Lossless streaming store is only supported for float/double, not {typeof(T).Name}.");
     }
 
+    // Transpose a [r, c] row-major buffer to [c, r] row-major (used to store a Linear weight
+    // [in, out] as [out, in] so the int8 store is per-output-channel + kernel-ready).
+    private static float[] TransposeRowMajor(float[] src, int r, int c)
+    {
+        var dst = new float[src.Length];
+        for (int i = 0; i < r; i++)
+            for (int j = 0; j < c; j++)
+                dst[j * r + i] = src[i * c + j];
+        return dst;
+    }
+    private static double[] TransposeRowMajor(double[] src, int r, int c)
+    {
+        var dst = new double[src.Length];
+        for (int i = 0; i < r; i++)
+            for (int j = 0; j < c; j++)
+                dst[j * r + i] = src[i * c + j];
+        return dst;
+    }
+
     /// <summary>int8 byte count (1 per element + 4-byte row-count header + 4 bytes per row
     /// scale) with overflow guard.</summary>
     internal static int CheckedInt8ByteCount(int length, int rows)
@@ -810,21 +829,25 @@ public static class WeightRegistry
             throw new NotSupportedException(
                 $"bf16 streaming store is only supported for float/double, not {typeof(T).Name}.");
         }
-        // int8 store (StreamingEncoding.Int8): PER-ROW symmetric quantization. dst is sized
-        // to Int8BufferBytes(Length, rows) by the caller (CheckedInt8ByteCount). rows = the
-        // tensor's leading dim, so each output channel gets its own scale.
+        // int8 store (StreamingEncoding.Int8): PER-OUTPUT-CHANNEL symmetric quantization. A 2-D
+        // Linear weight [in,out] is TRANSPOSED to [out,in] first, so the per-row scales are
+        // per-output and the stored int8 is exactly the [N,K] layout the int8 GEMM consumes
+        // (no upcast). Higher-rank weights store per-leading-dim, untransposed. dst is sized to
+        // Int8BufferBytes(Length, rows) by the caller (CheckedInt8ByteCount).
         if (encoding == StreamingEncoding.Int8)
         {
             int rows = tensor.Int8QuantRows;
             if (typeof(T) == typeof(float))
             {
                 var srcF = (float[])(object)tensor.AsSpan().ToArray();
+                if (tensor.Int8StoreTransposed) srcF = TransposeRowMajor(srcF, tensor._shape[0], tensor._shape[1]);
                 StreamingStoreCodec.EncodeInt8Float(srcF, dst, rows);
                 return;
             }
             if (typeof(T) == typeof(double))
             {
                 var srcD = (double[])(object)tensor.AsSpan().ToArray();
+                if (tensor.Int8StoreTransposed) srcD = TransposeRowMajor(srcD, tensor._shape[0], tensor._shape[1]);
                 StreamingStoreCodec.EncodeInt8Double(srcD, dst, rows);
                 return;
             }

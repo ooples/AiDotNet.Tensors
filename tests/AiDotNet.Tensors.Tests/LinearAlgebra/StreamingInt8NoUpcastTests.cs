@@ -21,7 +21,9 @@ public class StreamingInt8NoUpcastTests
     [Fact]
     public void Int8Inference_Materialize_KeepsInt8_NoFp32Decode_LazyFallbackIsCorrect()
     {
-        const int rows = 16, k = 32, n = rows * k;
+        // Logical Linear weight [in, out]; the int8 store keeps it TRANSPOSED [out, in] + per-
+        // output scales (the kernel layout), so Rows = out, K = in.
+        const int inDim = 16, outDim = 32, n = inDim * outDim;
         var dir = Path.Combine(Path.GetTempPath(), $"aidotnet-int8nu-{Guid.NewGuid():N}");
         WeightRegistry.Configure(new GpuOffloadOptions
         {
@@ -32,21 +34,22 @@ public class StreamingInt8NoUpcastTests
         WeightRegistry.SetStreamingExecutionTraining(false); // inference
         try
         {
-            var t = new Tensor<float>(new[] { rows, k });
+            var t = new Tensor<float>(new[] { inDim, outDim });
             for (int i = 0; i < n; i++) t[i] = Val(i);
             t.Lifetime = WeightLifetime.Streaming;
-            WeightRegistry.RegisterWeight(t); // stores per-row int8, drops fp32 _data
+            WeightRegistry.RegisterWeight(t); // stores per-output int8 (transposed), drops fp32 _data
             Assert.Equal(StreamingEncoding.Int8, t.StreamingStoreEncoding);
 
             WeightRegistry.Materialize(t);
 
-            // No upcast: the int8 weight is attached, fp32 _data is NOT decoded.
+            // No upcast: the int8 weight is attached (kernel-ready [out,in]), fp32 _data NOT decoded.
             Assert.NotNull(t.StreamingInt8);
             Assert.Equal(0, t.DataVector.Length);
-            Assert.Equal(rows, t.StreamingInt8!.Rows);
-            Assert.Equal(k, t.StreamingInt8.K);
-            Assert.Equal(rows, t.StreamingInt8.Scales.Length);
+            Assert.Equal(outDim, t.StreamingInt8!.Rows);   // per-output scales
+            Assert.Equal(inDim, t.StreamingInt8.K);
+            Assert.Equal(outDim, t.StreamingInt8.Scales.Length);
             Assert.Equal(n, t.StreamingInt8.Data.Length);
+            Assert.True(t.StreamingInt8.TransposedFromLogical);
 
             // A second Materialize is a no-op (already materialized as int8) — no re-fetch.
             WeightRegistry.Materialize(t);

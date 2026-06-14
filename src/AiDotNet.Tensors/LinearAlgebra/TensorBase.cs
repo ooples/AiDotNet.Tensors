@@ -92,7 +92,9 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
         var scales = StreamingStoreCodec.Int8ScalesOf(encoded);
         var data = StreamingStoreCodec.Int8DataOf(encoded, Length);
         int k = rows > 0 ? Length / rows : Length;
-        StreamingInt8 = new StreamingInt8Weight(data, scales, rows, k);
+        // For a 2-D Linear weight the stored int8 IS [out,in] = [rows,k] = Wᵀ (kernel-ready);
+        // it's the transpose of the logical [in,out], which the fp32 fallback must undo.
+        StreamingInt8 = new StreamingInt8Weight(data, scales, rows, k, transposedFromLogical: Int8StoreTransposed);
     }
 
     /// <summary>
@@ -138,6 +140,8 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
                 int baseI = r * q.K;
                 for (int j = 0; j < q.K; j++) arr[baseI + j] = q.Data[baseI + j] * s;
             }
+            // arr is [out,in]; transpose to the logical [in,out] if the store transposed it.
+            if (q.TransposedFromLogical) arr = TransposeRowMajorBack(arr, _shape[0], _shape[1]);
             fresh = Vector<T>.WrapMemory((T[])(object)arr);
         }
         else if (typeof(T) == typeof(double))
@@ -149,6 +153,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
                 int baseI = r * q.K;
                 for (int j = 0; j < q.K; j++) arr[baseI + j] = q.Data[baseI + j] * s;
             }
+            if (q.TransposedFromLogical) arr = TransposeRowMajorBack(arr, _shape[0], _shape[1]);
             fresh = Vector<T>.WrapMemory((T[])(object)arr);
         }
         else
@@ -160,6 +165,25 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
         _data = fresh;
         _storage = new TensorStorage<T>(_data);
         old.Release();
+    }
+
+    // Inverse of the store transpose: takes the stored [cols, rows] (= [out, in]) buffer and
+    // produces the logical [rows, cols] (= [in, out]). dst[i*cols+j] = src[j*rows+i].
+    private static float[] TransposeRowMajorBack(float[] storedTransposed, int rows, int cols)
+    {
+        var dst = new float[storedTransposed.Length];
+        for (int i = 0; i < rows; i++)
+            for (int j = 0; j < cols; j++)
+                dst[i * cols + j] = storedTransposed[j * rows + i];
+        return dst;
+    }
+    private static double[] TransposeRowMajorBack(double[] storedTransposed, int rows, int cols)
+    {
+        var dst = new double[storedTransposed.Length];
+        for (int i = 0; i < rows; i++)
+            for (int j = 0; j < cols; j++)
+                dst[i * cols + j] = storedTransposed[j * rows + i];
+        return dst;
     }
 
     /// <summary>
@@ -492,16 +516,21 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
                 throw new ArgumentException(
                     $"Streaming restore (int8): buffer length {bytes.Length} does not match " +
                     $"expected {expectedInt8} bytes (header {StreamingStoreCodec.Int8HeaderBytes(Int8QuantRows)} + Length={Length}).");
+            // For a 2-D weight the store is the TRANSPOSE [out,in]; dequant in stored order then
+            // transpose back to the logical [in,out] so the fp32 view matches the tensor shape.
+            bool transposed = Int8StoreTransposed;
             if (typeof(T) == typeof(float))
             {
                 var arr = new float[Length];
                 StreamingStoreCodec.DecodeInt8Float(bytes, arr);
+                if (transposed) arr = TransposeRowMajorBack(arr, _shape[0], _shape[1]);
                 fresh = Vector<T>.WrapMemory((T[])(object)arr);
             }
             else if (typeof(T) == typeof(double))
             {
                 var arr = new double[Length];
                 StreamingStoreCodec.DecodeInt8Double(bytes, arr);
+                if (transposed) arr = TransposeRowMajorBack(arr, _shape[0], _shape[1]);
                 fresh = Vector<T>.WrapMemory((T[])(object)arr);
             }
             else
@@ -1136,12 +1165,18 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
     public int Rank => _shape.Length;
 
     /// <summary>
-    /// Row count for per-row int8 streaming quantization: the leading dim (output channels
-    /// for an [out,in] weight); vectors (rank &lt; 2) quantize per-tensor (1 row). Both the
-    /// encode side (WeightRegistry) and the decode side (RestoreStorageFromBytes) read this
-    /// from the same shape, so the scale layout is consistent.
+    /// Number of per-row scales in the int8 streaming store = output channels. A 2-D Linear
+    /// weight is logically [in, out]; it's stored TRANSPOSED as [out, in] so it feeds the int8
+    /// GEMM directly, so the row/scale count is the OUTPUT dim (<c>_shape[1]</c>). Higher-rank
+    /// weights store per-leading-dim (no transpose); vectors quantize per-tensor (1 row). Both
+    /// the encode (WeightRegistry) and decode (RestoreStorageFromBytes) sides read this from the
+    /// same shape, so the scale layout is consistent.
     /// </summary>
-    internal int Int8QuantRows => _shape.Length >= 2 ? _shape[0] : 1;
+    internal int Int8QuantRows => _shape.Length == 2 ? _shape[1] : (_shape.Length > 2 ? _shape[0] : 1);
+
+    /// <summary>True when the int8 store transposes this weight (a 2-D Linear weight [in,out]
+    /// stored as [out,in]); the decode/dequant paths must transpose back to the logical shape.</summary>
+    internal bool Int8StoreTransposed => _shape.Length == 2;
 
     /// <summary>
     /// Gets the pre-computed strides for each dimension as a read-only span.

@@ -9,15 +9,14 @@ using Xunit;
 namespace AiDotNet.Tensors.Tests.LinearAlgebra;
 
 /// <summary>
-/// End-to-end no-upcast int8 compute: an int8-streamed weight (Linear pattern, [out,in])
-/// flowing through the engine's transposed matmul (c = a·Wᵀ) routes to the int8 weight-only
-/// GEMM — consuming the stored int8 + per-row scales directly, never upcasting to fp32. The
-/// result matches the fp32 path on the same dequantized weight, and the weight stays in its
-/// int8 form afterward (proving the fp32 decode was skipped). Serialized (global registry).
+/// End-to-end no-upcast int8 compute through the CONSUMER's path: a Linear weight [in,out]
+/// int8-streamed for inference, run through <c>Engine.FusedLinear(x, W, bias)</c> = x·W, routes
+/// to the int8 weight-only GEMM — consuming the stored int8 + per-OUTPUT scales directly (W is
+/// stored transposed [out,in], the kernel layout), never upcasting to fp32. The result matches
+/// the fp32 FusedLinear on the same per-output-dequantized weight, and the weight stays int8
+/// afterward (proving the fp32 decode was skipped). Serialized (global registry).
 /// </summary>
-// The int8 weight-only GEMM (SgemmWithInt8RowScaledCachedB) and the engine's routing hook
-// live in NET5_0_OR_GREATER (AVX2 intrinsics) — net471 falls back to fp32 decode + Sgemm, so
-// the no-upcast routing only applies (and is tested) there.
+// The int8 weight-only GEMM + the FusedLinear int8 hook live in NET5_0_OR_GREATER (AVX2).
 #if NET5_0_OR_GREATER
 [Collection("WeightRegistry")]
 public class StreamingInt8MatMulRoutingTests
@@ -29,48 +28,51 @@ public class StreamingInt8MatMulRoutingTests
         public float Next(double std) { ulong x = _s; x ^= x << 13; x ^= x >> 7; x ^= x << 17; _s = x; double u = (x >> 11) * (1.0 / (1UL << 53)); return (float)((u - 0.5) * 2 * std); }
     }
 
-    // Per-row symmetric int8 quant matching StreamingStoreCodec.EncodeInt8Float, returning the
-    // dequantized fp32 weight (what both the int8 kernel and the fp32 reference should compute).
-    private static float[] DequantizePerRow(float[] w, int n, int k)
+    // Per-OUTPUT-channel symmetric int8 quant of a Linear weight W[in,out] (per column), matching
+    // the registry's transpose-then-per-row encode. Returns the dequantized fp32 weight.
+    private static float[] DequantizePerOutput(float[] w, int inDim, int outDim)
     {
-        var deq = new float[n * k];
-        for (int r = 0; r < n; r++)
+        var deq = new float[inDim * outDim];
+        for (int o = 0; o < outDim; o++)
         {
             float amax = 0f;
-            for (int j = 0; j < k; j++) { float a = Math.Abs(w[r * k + j]); if (a > amax) amax = a; }
+            for (int i = 0; i < inDim; i++) { float a = Math.Abs(w[i * outDim + o]); if (a > amax) amax = a; }
             float scale = amax > 0f ? amax / 127f : 1f;
             float inv = 1f / scale;
-            for (int j = 0; j < k; j++)
+            for (int i = 0; i < inDim; i++)
             {
-                int q = (int)Math.Round(w[r * k + j] * inv);
+                int q = (int)Math.Round(w[i * outDim + o] * inv);
                 if (q > 127) q = 127; else if (q < -127) q = -127;
-                deq[r * k + j] = q * scale;
+                deq[i * outDim + o] = q * scale;
             }
         }
         return deq;
     }
 
     [Fact]
-    public void Int8Weight_ThroughTransposedMatMul_RoutesToInt8Kernel_NoUpcast()
+    public void Int8Weight_ThroughFusedLinear_RoutesToInt8Kernel_NoUpcast()
     {
-        const int n = 64, k = 128, m = 8; // weight [out=64, in=128]; activation [batch=8, in=128]
+        const int inDim = 128, outDim = 64, batch = 8;
         var engine = new CpuEngine();
         var rng = new Rng(2024);
 
-        var wData = new float[n * k];
+        var wData = new float[inDim * outDim];          // logical [in, out]
         for (int i = 0; i < wData.Length; i++) wData[i] = rng.Next(0.1);
-        var aData = new float[m * k];
-        for (int i = 0; i < aData.Length; i++) aData[i] = rng.Next(1.0);
+        var xData = new float[batch * inDim];
+        for (int i = 0; i < xData.Length; i++) xData[i] = rng.Next(1.0);
+        var biasData = new float[outDim];
+        for (int i = 0; i < biasData.Length; i++) biasData[i] = rng.Next(0.3);
 
-        var a = new Tensor<float>(aData, new[] { m, k });
+        var x = new Tensor<float>(xData, new[] { batch, inDim });
+        var bias = new Tensor<float>(biasData, new[] { outDim });
 
-        // Reference: the engine's normal fp32 transposed-matmul on the DEQUANTIZED weight —
-        // exactly what the int8 kernel computes, so the only difference is accumulation order.
-        var deq = DequantizePerRow(wData, n, k);
-        var wRef = new Tensor<float>(deq, new[] { n, k });
-        var cRef = engine.TensorMatMulTransposed(a, wRef);
+        // Reference: fp32 FusedLinear on the per-output-dequantized weight — exactly what the
+        // int8 kernel computes (only accumulation order differs).
+        var deq = DequantizePerOutput(wData, inDim, outDim);
+        var wRef = new Tensor<float>(deq, new[] { inDim, outDim });
+        var cRef = engine.FusedLinear(x, wRef, bias, FusedActivationType.None);
 
-        var dir = Path.Combine(Path.GetTempPath(), $"aidotnet-int8mm-{Guid.NewGuid():N}");
+        var dir = Path.Combine(Path.GetTempPath(), $"aidotnet-int8fl-{Guid.NewGuid():N}");
         WeightRegistry.Configure(new GpuOffloadOptions
         {
             StreamingBackingStorePath = dir,
@@ -80,26 +82,25 @@ public class StreamingInt8MatMulRoutingTests
         WeightRegistry.SetStreamingExecutionTraining(false); // inference
         try
         {
-            var wStream = new Tensor<float>(new[] { n, k });
+            var wStream = new Tensor<float>(new[] { inDim, outDim });
             for (int i = 0; i < wData.Length; i++) wStream[i] = wData[i];
             wStream.Lifetime = WeightLifetime.Streaming;
-            WeightRegistry.RegisterWeight(wStream); // per-row int8 store, fp32 dropped
+            WeightRegistry.RegisterWeight(wStream); // per-output int8 store (transposed), fp32 dropped
 
-            // The weight reaches the engine still paged-out → the int8 routing materializes it
-            // AS int8 (no fp32 decode) and runs the int8 GEMM.
-            var cInt8 = engine.TensorMatMulTransposed(a, wStream);
+            // The weight reaches FusedLinear still paged-out → routed AS int8 (no fp32 decode).
+            var cInt8 = engine.FusedLinear(x, wStream, bias, FusedActivationType.None);
 
-            // (1) Routed to int8 + no upcast: the weight is in its int8 form, fp32 _data empty.
+            // (1) Routed to int8 + no upcast: weight is in int8 form, fp32 _data empty.
             Assert.NotNull(wStream.StreamingInt8);
             Assert.Equal(0, wStream.DataVector.Length);
 
-            // (2) Correct: matches the fp32 path on the dequantized weight.
+            // (2) Correct: matches fp32 FusedLinear on the per-output-dequantized weight.
             var rEng = cInt8.AsSpan();
             var rRef = cRef.AsSpan();
             double sum2 = 0, ref2 = 0;
-            for (int i = 0; i < m * n; i++) { double e = rEng[i] - rRef[i]; sum2 += e * e; ref2 += (double)rRef[i] * rRef[i]; }
+            for (int i = 0; i < batch * outDim; i++) { double e = rEng[i] - rRef[i]; sum2 += e * e; ref2 += (double)rRef[i] * rRef[i]; }
             double rel = Math.Sqrt(sum2 / Math.Max(1e-30, ref2));
-            Assert.True(rel < 0.01, $"int8-routed matmul should match fp32-on-dequantized (rel {rel:E3}).");
+            Assert.True(rel < 0.01, $"int8-routed FusedLinear should match fp32-on-dequantized (rel {rel:E3}).");
         }
         finally
         {

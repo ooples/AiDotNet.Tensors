@@ -16,23 +16,33 @@ namespace AiDotNet.Tensors.LinearAlgebra;
 /// </remarks>
 internal sealed class StreamingInt8Weight
 {
-    public StreamingInt8Weight(sbyte[] data, float[] scales, int rows, int k)
+    public StreamingInt8Weight(sbyte[] data, float[] scales, int rows, int k, bool transposedFromLogical)
     {
         Data = data;
         Scales = scales;
         Rows = rows;
         K = k;
+        TransposedFromLogical = transposedFromLogical;
     }
 
-    /// <summary>Signed int8 weights, row-major [Rows, K].</summary>
+    /// <summary>Signed int8 weights in the kernel's [Rows, K] (= [out, in]) row-major layout —
+    /// i.e. Wᵀ of a Linear weight whose logical shape is [in, out].</summary>
     public sbyte[] Data { get; }
 
     /// <summary>Per-row (per-output-channel) fp32 scales, length <see cref="Rows"/>.</summary>
     public float[] Scales { get; }
 
-    /// <summary>Number of rows (output channels) = the weight's leading dim.</summary>
+    /// <summary>Rows of <see cref="Data"/> = output channels (the matmul's N).</summary>
     public int Rows { get; }
 
-    /// <summary>Columns per row (input features) = total elements / <see cref="Rows"/>.</summary>
+    /// <summary>Columns of <see cref="Data"/> = input features (the matmul's K).</summary>
     public int K { get; }
+
+    /// <summary>
+    /// True when <see cref="Data"/> is the TRANSPOSE of the tensor's logical layout: a Linear
+    /// weight is logically [in, out] = [K, Rows] but stored here as [out, in] = [Rows, K] so it
+    /// feeds the int8 GEMM (c = x·Wᵀᵀ = x·W) directly. The fp32 lazy fallback must transpose
+    /// back to the logical [K, Rows]. False for a 1-D / per-leading store (no transpose).
+    /// </summary>
+    public bool TransposedFromLogical { get; }
 }
