@@ -76,6 +76,15 @@ public class StreamingStoreCodecTests
         Assert.True(float.IsPositiveInfinity(dec[6]));
         Assert.True(float.IsNegativeInfinity(dec[7]));
 
+        // Negative zero must round-trip with sign preserved. `Assert.Equal(0f, -0f)`
+        // would pass on +0f too — `1/-0f == -Inf` is the unambiguous sign check
+        // (bf16 keeps the IEEE-754 sign bit so this contract holds).
+        Assert.True(float.IsNegativeInfinity(1f / dec[1]),
+            $"-0f did not round-trip with sign preserved: dec[1]={dec[1]} (1/dec[1]={1f / dec[1]})");
+        // +0f symmetry — both signs of zero must survive.
+        Assert.True(float.IsPositiveInfinity(1f / dec[0]),
+            $"+0f did not round-trip with sign preserved: dec[0]={dec[0]} (1/dec[0]={1f / dec[0]})");
+
         // NaN stays NaN.
         var nanEnc = new byte[2];
         StreamingStoreCodec.EncodeFloat(new[] { float.NaN }, nanEnc, stochastic: false);
