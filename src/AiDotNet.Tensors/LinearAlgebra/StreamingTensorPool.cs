@@ -54,6 +54,11 @@ public sealed class StreamingTensorPool : IDisposable
     private long _diskReadBytes;
     private long _diskWriteBytes;
     private long _evictionCount;
+    // Clean/dirty-eviction telemetry: evictions that skipped the disk
+    // write+compress because the backing file already held the entry's
+    // current bytes, and the on-disk bytes that re-write would have cost.
+    private long _cleanEvictionCount;
+    private long _cleanEvictionBytesSkipped;
     private long _compressedBytesTotal;
     private long _uncompressedBytesTotal;
     // Prefetch effectiveness — distinguishes background prefetch reads
@@ -207,6 +212,26 @@ public sealed class StreamingTensorPool : IDisposable
     }
 
     /// <summary>
+    /// Marks an entry's backing file STALE so the next eviction re-writes it.
+    /// The pool's normal lifecycle never needs this — callers can't mutate the
+    /// bytes returned by <see cref="Rehydrate(long)"/> (ReadOnlySpan) or
+    /// <see cref="RehydrateInto"/> (copy), so a written backing file always
+    /// matches <c>entry.Data</c>. It exists for any future path that replaces an
+    /// entry's content in place under the SAME handle (rather than the normal
+    /// Unregister + Register), so clean/dirty eviction stays correct. No-op for
+    /// an unknown handle.
+    /// </summary>
+    public void MarkDirty(long handleId)
+    {
+        lock (_lock)
+        {
+            ThrowIfDisposed();
+            if (_entries.TryGetValue(handleId, out var entry))
+                entry.BackingFileCurrent = false;
+        }
+    }
+
+    /// <summary>
     /// Reads back a weight, bringing it back from the backing store if it
     /// has been evicted. Returned span aliases the pool's internal byte[];
     /// the array is rooted by the returned reference, so the bytes remain
@@ -308,6 +333,11 @@ public sealed class StreamingTensorPool : IDisposable
                 }
 
                 entry.Data = buffer;
+                // entry.Data now holds exactly what's in the backing file, which
+                // is still on disk — so a subsequent eviction can drop this resident
+                // copy without re-writing it. (Cleared only if the content is later
+                // replaced out-of-band via MarkDirty.)
+                entry.BackingFileCurrent = true;
                 entry.ResidentBytes = buffer.Length;
                 Interlocked.Add(ref _residentBytes, buffer.Length);
                 long peak = Interlocked.Read(ref _residentBytesPeak);
@@ -618,75 +648,98 @@ public sealed class StreamingTensorPool : IDisposable
         // and entry.Data is freed BEFORE the write returns.
         string path = BackingPathFor(id);
         int uncompressed = entry.Data.Length;
-        int paged;
-        bool compressed = false;
-        if (_enableCompression)
+
+        // Clean/dirty eviction. Once an entry's backing file has been written it
+        // holds that entry's exact bytes for the rest of its life: callers can
+        // never mutate entry.Data (Rehydrate hands out a ReadOnlySpan and
+        // RehydrateInto returns a copy), so entry.Data is only ever (a) the bytes
+        // passed to Register — dirty until first written — or (b) bytes just read
+        // back from this same file by Rehydrate — clean. Re-writing and
+        // re-LZ4-compressing a CLEAN entry on every subsequent eviction is pure
+        // waste, and it is the dominant cost of a read-only forward/backward pass
+        // (every layer's rehydrate evicts a clean peer). A clean entry is simply
+        // dropped; its file, PagedOutBytes, UncompressedBytes and IsCompressed all
+        // stay valid for the next Rehydrate. Only genuinely-new content (a freshly
+        // Registered entry, or one explicitly marked dirty by MarkDirty) is written.
+        if (entry.BackingFileCurrent)
         {
-            // LZ4 worst-case bound is uncompressed + (uncompressed/255) + 16.
-            // Rent from ArrayPool to keep the encode buffer pooled
-            // across evictions instead of allocating a fresh worst-
-            // case buffer each time.
-            int maxOut = LZ4Codec.MaximumOutputSize(uncompressed);
-            byte[] encodeBuf = ArrayPool<byte>.Shared.Rent(maxOut);
-            try
-            {
-                int encoded = LZ4Codec.Encode(entry.Data, 0, uncompressed, encodeBuf, 0, maxOut);
-                if (encoded > 0 && encoded < uncompressed)
-                {
-                    // Stream-write only the encoded slice. FileStream
-                    // .Write copies (uncompressed + overhead) bytes
-                    // straight to disk — no intermediate byte[encoded]
-                    // copy. This is the dominant peak-memory win:
-                    // before this, we'd have allocated a third
-                    // copy-out buffer here.
-                    using (var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None))
-                    {
-                        fs.Write(encodeBuf, 0, encoded);
-                    }
-                    paged = encoded;
-                    compressed = true;
-                }
-                else
-                {
-                    // Compression didn't shrink the payload (entropy too
-                    // high or below LZ4's break-even) — write entry.Data
-                    // raw and flag IsCompressed=false so Rehydrate
-                    // doesn't try to decode. Same File.WriteAllBytes
-                    // path as the no-compression branch below.
-                    File.WriteAllBytes(path, entry.Data);
-                    paged = uncompressed;
-                    compressed = false;
-                }
-            }
-            finally
-            {
-                // clearArray:true so the next renter doesn't observe the
-                // previous tenant's serialized weight bytes — these are
-                // model parameters, often proprietary, and a downstream
-                // consumer renting the same buffer would see them
-                // unzeroed. The clear cost is amortized against the
-                // disk write latency anyway.
-                ArrayPool<byte>.Shared.Return(encodeBuf, clearArray: true);
-            }
+            entry.Data = null;
+            _cleanEvictionCount++;
+            _cleanEvictionBytesSkipped += entry.PagedOutBytes;
         }
         else
         {
-            File.WriteAllBytes(path, entry.Data);
-            paged = uncompressed;
+            int paged;
+            bool compressed = false;
+            if (_enableCompression)
+            {
+                // LZ4 worst-case bound is uncompressed + (uncompressed/255) + 16.
+                // Rent from ArrayPool to keep the encode buffer pooled
+                // across evictions instead of allocating a fresh worst-
+                // case buffer each time.
+                int maxOut = LZ4Codec.MaximumOutputSize(uncompressed);
+                byte[] encodeBuf = ArrayPool<byte>.Shared.Rent(maxOut);
+                try
+                {
+                    int encoded = LZ4Codec.Encode(entry.Data, 0, uncompressed, encodeBuf, 0, maxOut);
+                    if (encoded > 0 && encoded < uncompressed)
+                    {
+                        // Stream-write only the encoded slice. FileStream
+                        // .Write copies (uncompressed + overhead) bytes
+                        // straight to disk — no intermediate byte[encoded]
+                        // copy. This is the dominant peak-memory win:
+                        // before this, we'd have allocated a third
+                        // copy-out buffer here.
+                        using (var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None))
+                        {
+                            fs.Write(encodeBuf, 0, encoded);
+                        }
+                        paged = encoded;
+                        compressed = true;
+                    }
+                    else
+                    {
+                        // Compression didn't shrink the payload (entropy too
+                        // high or below LZ4's break-even) — write entry.Data
+                        // raw and flag IsCompressed=false so Rehydrate
+                        // doesn't try to decode. Same File.WriteAllBytes
+                        // path as the no-compression branch below.
+                        File.WriteAllBytes(path, entry.Data);
+                        paged = uncompressed;
+                        compressed = false;
+                    }
+                }
+                finally
+                {
+                    // clearArray:true so the next renter doesn't observe the
+                    // previous tenant's serialized weight bytes — these are
+                    // model parameters, often proprietary, and a downstream
+                    // consumer renting the same buffer would see them
+                    // unzeroed. The clear cost is amortized against the
+                    // disk write latency anyway.
+                    ArrayPool<byte>.Shared.Return(encodeBuf, clearArray: true);
+                }
+            }
+            else
+            {
+                File.WriteAllBytes(path, entry.Data);
+                paged = uncompressed;
+            }
+            // Free entry.Data IMMEDIATELY now that the bytes are durably
+            // on disk. Any further work (counter updates, LRU bookkeeping)
+            // doesn't need the resident copy. Holding it alive across
+            // the rest of this method (or worse, until the next eviction)
+            // would defeat the whole eviction.
+            entry.Data = null;
+            entry.PagedOutBytes = paged;
+            entry.UncompressedBytes = uncompressed;
+            entry.IsCompressed = compressed;
+            entry.BackingFileCurrent = true;
+            _diskWriteBytes += paged;
+            _compressedBytesTotal += paged;
+            _uncompressedBytesTotal += uncompressed;
         }
-        // Free entry.Data IMMEDIATELY now that the bytes are durably
-        // on disk. Any further work (counter updates, LRU bookkeeping)
-        // doesn't need the resident copy. Holding it alive across
-        // the rest of this method (or worse, until the next eviction)
-        // would defeat the whole eviction.
-        entry.Data = null;
-        entry.PagedOutBytes = paged;
-        entry.UncompressedBytes = uncompressed;
-        entry.IsCompressed = compressed;
-        _diskWriteBytes += paged;
         _evictionCount++;
-        _compressedBytesTotal += paged;
-        _uncompressedBytesTotal += uncompressed;
         Interlocked.Add(ref _residentBytes, -entry.ResidentBytes);
         entry.ResidentBytes = 0;
         _lruOrder.Remove(oldest);
@@ -751,6 +804,12 @@ public sealed class StreamingTensorPool : IDisposable
         // size + whether to invoke LZ4Codec.Decode at all.
         public long UncompressedBytes;
         public bool IsCompressed;
+        // True iff a backing file exists on disk holding this entry's CURRENT
+        // bytes — so a subsequent eviction can drop the resident copy without
+        // re-writing. Set after a page-out write and after a rehydrate-from-disk
+        // (entry.Data then equals the file); cleared by Register (no file yet)
+        // and MarkDirty (content replaced out-of-band). See EvictNodeInternal.
+        public bool BackingFileCurrent;
     }
 
     /// <summary>
@@ -775,6 +834,8 @@ public sealed class StreamingTensorPool : IDisposable
                 DiskReadBytes = _diskReadBytes,
                 DiskWriteBytes = _diskWriteBytes,
                 EvictionCount = _evictionCount,
+                CleanEvictionCount = _cleanEvictionCount,
+                CleanEvictionBytesSkipped = _cleanEvictionBytesSkipped,
                 CompressionRatio = ratio,
                 CompressionEnabled = _enableCompression,
                 PrefetchHitCount = _prefetchHitCount,
@@ -830,6 +891,17 @@ public readonly record struct StreamingPoolReport
     /// <summary>Number of eviction events. Each event may page out
     /// one entry.</summary>
     public long EvictionCount { get; init; }
+
+    /// <summary>Of <see cref="EvictionCount"/>, the evictions that skipped the
+    /// disk write+compress because the backing file already held the entry's
+    /// current bytes (clean/dirty eviction). High relative to EvictionCount on a
+    /// read-heavy workload (forward/backward) is the expected, healthy case.</summary>
+    public long CleanEvictionCount { get; init; }
+
+    /// <summary>Total on-disk bytes NOT re-written thanks to clean-eviction
+    /// skips — the write I/O (and LZ4 compression) saved versus re-persisting
+    /// every eviction.</summary>
+    public long CleanEvictionBytesSkipped { get; init; }
 
     // Backing field for CompressionRatio. The default value of zero
     // (from default(StreamingPoolReport)) is interpreted as "no
