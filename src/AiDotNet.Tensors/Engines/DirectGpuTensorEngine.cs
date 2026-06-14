@@ -14688,19 +14688,39 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!TryGetBackend(out var backend))
             return base.TensorMatMul(a, b);
 
-        // Only the 2D × 2D case has a single-call GPU GEMM here. The rank-3+
-        // shapes (broadcast 2D weights over batch dims, full ND × ND, etc.)
-        // need flatten + reshape orchestration that this override didn't do —
-        // the previous code took `a.Shape._dims[a.Rank - 2]` as M, which
-        // silently dropped every leading batch dimension and only multiplied
-        // the last [M, K] slice against B. That produced a rank-2 output for
-        // a rank-3 input, breaking shape contracts downstream (caught by
-        // FusedLinearBiasGradIntegrationTests.TwoLayerFFL_Rank3Double — the
-        // rank-3 TensorMatMul output was [S, N] instead of [B, S, N], and
-        // the next TensorSubtract failed on shape mismatch). Route non-2D
-        // through the base CpuEngine path, which correctly handles ND × 2D
-        // (collapse leading dims into M, single GEMM, reshape back) and
-        // ND × ND (per-batch GEMM). Both base paths record on the tape too.
+        // ND × 2D — the dominant transformer case ([B, S, K] activations × [K, N] weight for every
+        // Dense/FFN/QKV/output projection). This used to fall to base.TensorMatMul (CpuEngine host BLAS),
+        // running the transformer's heavy GEMMs on the CPU and starving the device (cortex GPU util ~5-7%).
+        // A is row-major [.., K], so collapsing all leading dims into a single M is a pure reshape (same
+        // memory): do ONE GPU GEMM [M*, K]×[K, N] then reshape the result back to a.dims[:-1] + [N].
+        // MatMulBackward already handles the ND×2D shapes (the base CpuEngine path recorded it identically).
+        if (typeof(T) == typeof(float) && a.Rank > 2 && b.Rank == 2
+            && a.Shape._dims[a.Rank - 1] == b.Shape._dims[0])
+        {
+            try
+            {
+                int Kc = a.Shape._dims[a.Rank - 1];
+                int Nc = b.Shape._dims[1];
+                int Mc = 1;
+                for (int d = 0; d < a.Rank - 1; d++) Mc *= a.Shape._dims[d];
+                using var bufAc = GetOrAllocateBuffer(backend, a);
+                using var bufBc = GetOrAllocateBuffer(backend, b);
+                var bufOutc = AllocateOutputBuffer(backend, Mc * Nc);
+                backend.Gemm(bufAc.Buffer, bufBc.Buffer, bufOutc.Buffer, Mc, Nc, Kc);
+                var resultc = FinishGpuOp<T>(backend, bufOutc, Mc * Nc);
+                int[] outShapec = (int[])a.Shape._dims.Clone();
+                outShapec[a.Rank - 1] = Nc;
+                var outputc = new Tensor<T>(resultc, outShapec);
+                Autodiff.DifferentiableOps.RecordBinary("TensorMatMul", outputc, a, b, Autodiff.BackwardFunctions<T>.MatMulBackward);
+                return outputc;
+            }
+            catch (Exception)
+            {
+                return base.TensorMatMul(a, b);
+            }
+        }
+        // Remaining non-2D shapes (ND × ND, K-mismatch, non-float) go through the base CpuEngine path,
+        // which correctly handles ND × ND (per-batch GEMM) and records on the tape.
         if (a.Rank != 2 || b.Rank != 2)
             return base.TensorMatMul(a, b);
 
