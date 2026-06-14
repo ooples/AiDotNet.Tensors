@@ -663,12 +663,22 @@ public static class WeightRegistry
             case StreamingStoreDtype.Lossless: return (StreamingEncoding.Lossless, false); // exact, variable-size; explicit opt-in
             case StreamingStoreDtype.Auto:
             default:
-                // bf16 ONLY when we KNOW it's inference; training or unknown →
-                // full precision so we never silently make the masters bf16. (int8
-                // is too lossy to ever be an automatic choice.)
-                return _streamingTrainingMode == false
-                    ? (StreamingEncoding.Bf16, false)
-                    : (StreamingEncoding.Native, false);
+                // Compress by DEFAULT whenever the execution mode is known — every model that
+                // goes through SetTrainingMode is — always picking the max-safe option:
+                //   • inference → bf16: 2x (4x for fp64) at ~0.17% RMS, a safe one-time
+                //     quantization of read-only weights.
+                //   • training → LOSSLESS (byte-shuffle + Deflate): bit-exact, so the fp32/fp64
+                //     masters are preserved EXACTLY (no convergence risk) while still reclaiming
+                //     ~1.18x of disk + resident bytes. Never silently lossy.
+                //   • unknown (no declared mode — raw registry use) → full precision: don't
+                //     guess; keep the bytes exact and the layout fixed-size.
+                // (int8 is too lossy to ever be an automatic choice — explicit opt-in only.)
+                return _streamingTrainingMode switch
+                {
+                    false => (StreamingEncoding.Bf16, false),     // inference → bf16
+                    true => (StreamingEncoding.Lossless, false),  // training → lossless
+                    _ => (StreamingEncoding.Native, false),       // unknown → full precision
+                };
         }
     }
 

@@ -1,7 +1,8 @@
 // Copyright (c) AiDotNet. All rights reserved.
 
 using System;
-using K4os.Compression.LZ4;
+using System.IO;
+using System.IO.Compression;
 #if NET5_0_OR_GREATER
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
@@ -206,14 +207,16 @@ internal static class StreamingStoreCodec
         for (int i = 0; i < dst.Length; i++) dst[i] = (sbyte)src[Int8ScaleBytes + i] * (double)scale;
     }
 
-    // ── Lossless: byte-plane shuffle + LZ4 (EXACT, ~1.08x on fp weights) ──────────
-    // Raw LZ4 can't compress dense fp weights (~100%) because the high-entropy mantissa
-    // bytes are interleaved with the structured sign/exponent bytes. Byte-plane shuffle
-    // groups byte-k of every element together, so the high (sign+exponent) plane — highly
-    // repetitive for near-Gaussian weights — becomes compressible and LZ4 then shrinks it.
-    // Output = [1-byte flag][payload]: flag 1 = LZ4(shuffled), 0 = raw shuffled (when LZ4
-    // didn't shrink). LZ4 decode is ~6.7 GB/s so it never bottlenecks rehydrate. This is
-    // the EXACT (lossless) store option; bf16/int8 give more (2x/4x) at a precision cost.
+    // ── Lossless: byte-plane shuffle + DEFLATE (EXACT, ~1.18x on fp weights) ──────────
+    // Dense fp weights don't compress raw (~100%): the high-entropy mantissa bytes are
+    // interleaved with the structured sign/exponent bytes. Byte-plane shuffle (SIMD, see
+    // above) groups byte-k of every element together, so the sign+exponent plane — highly
+    // repetitive for near-Gaussian weights — becomes a long low-entropy run. An ENTROPY coder
+    // (Deflate's Huffman stage) then actually shrinks it (~1.18x); LZ4, being match-only with
+    // no entropy stage, can't (~1.08x). Output = [1-byte flag][payload]: flag 1 = Deflate
+    // (shuffled), 0 = raw shuffled (when it didn't shrink). This is the EXACT (lossless) store
+    // — bit-for-bit — used by default in TRAINING where weights must stay exact; bf16/int8
+    // give more (2x/4x) in inference at a precision cost.
 
     // Shuffle = transpose the [count × elem] byte matrix to [elem × count] (group byte-k of
     // every element). The naive whole-array strided pass thrashes cache/TLB (~256 MiB/s) and
@@ -355,21 +358,41 @@ internal static class StreamingStoreCodec
     }
 #endif
 
+    // DEFLATE (zlib's raw deflate) is the entropy coder: unlike LZ4 (match-only, no entropy
+    // stage → ~1.08x on shuffled fp weights), Deflate's Huffman stage compresses the highly
+    // repetitive sign/exponent byte-plane that the shuffle exposes → ~1.18x, bit-exact, at
+    // ~1.1 GiB/s decode. It's in the BCL on both net471 and net5+ (no extra dependency).
+    private static byte[] DeflateCompress(byte[] src)
+    {
+        using var ms = new MemoryStream(src.Length);
+        using (var ds = new DeflateStream(ms, CompressionLevel.Optimal, leaveOpen: true))
+            ds.Write(src, 0, src.Length);
+        return ms.ToArray();
+    }
+
+    private static int DeflateDecompress(byte[] comp, byte[] dst, int dstLen)
+    {
+        using var ms = new MemoryStream(comp);
+        using var ds = new DeflateStream(ms, CompressionMode.Decompress);
+        int read = 0, r;
+        while (read < dstLen && (r = ds.Read(dst, read, dstLen - read)) > 0) read += r;
+        return read;
+    }
+
     private static byte[] EncodeLosslessBytes(ReadOnlySpan<byte> raw, int elem)
     {
         var shuffled = new byte[raw.Length];
         BytePlaneShuffle(raw, shuffled, elem);
-        int maxOut = LZ4Codec.MaximumOutputSize(shuffled.Length);
-        var lz = new byte[maxOut];
-        int enc = LZ4Codec.Encode(shuffled, 0, shuffled.Length, lz, 0, maxOut);
-        if (enc > 0 && enc < shuffled.Length)
+        var comp = DeflateCompress(shuffled);
+        if (comp.Length < shuffled.Length)
         {
-            var outp = new byte[1 + enc];
-            outp[0] = 1; // LZ4-compressed
-            Buffer.BlockCopy(lz, 0, outp, 1, enc);
+            var outp = new byte[1 + comp.Length];
+            outp[0] = 1; // Deflate-compressed
+            Buffer.BlockCopy(comp, 0, outp, 1, comp.Length);
             return outp;
         }
-        // Didn't shrink — store the raw shuffled bytes so decode is still exact.
+        // Didn't shrink (rare — tiny or high-entropy) — store the raw shuffled bytes so the
+        // round-trip is still exact and never larger than shuffled + 1.
         var rawOut = new byte[1 + shuffled.Length];
         rawOut[0] = 0;
         Buffer.BlockCopy(shuffled, 0, rawOut, 1, shuffled.Length);
@@ -386,9 +409,9 @@ internal static class StreamingStoreCodec
         if (flag == 1)
         {
             shuffled = new byte[shuffledLen];
-            int dec = LZ4Codec.Decode(payload.ToArray(), 0, payload.Length, shuffled, 0, shuffledLen);
+            int dec = DeflateDecompress(payload.ToArray(), shuffled, shuffledLen);
             if (dec != shuffledLen)
-                throw new InvalidOperationException($"Lossless decode: LZ4 produced {dec} bytes, expected {shuffledLen}.");
+                throw new InvalidOperationException($"Lossless decode: Deflate produced {dec} bytes, expected {shuffledLen}.");
         }
         else
         {
@@ -422,7 +445,7 @@ internal static class StreamingStoreCodec
         return d;
     }
 
-    /// <summary>fp32 → lossless (byte-shuffle + LZ4). Returns a variable-size buffer.</summary>
+    /// <summary>fp32 → lossless (byte-shuffle + Deflate). Returns a variable-size buffer.</summary>
     internal static byte[] EncodeLosslessFloat(ReadOnlySpan<float> src)
         => EncodeLosslessBytes(System.Runtime.InteropServices.MemoryMarshal.AsBytes(src), 4);
 

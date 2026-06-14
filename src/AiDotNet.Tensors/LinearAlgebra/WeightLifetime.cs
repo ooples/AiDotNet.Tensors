@@ -178,12 +178,14 @@ public sealed class GpuOffloadOptions
 
     /// <summary>
     /// Precision the streaming pool stores weight bytes at. Default
-    /// <see cref="StreamingStoreDtype.Auto"/> — bf16 (2x I/O at ~0.17% RMS error)
-    /// in inference/eval where it's a one-time, always-safe quantization, and
-    /// full precision during training to preserve fp32/fp64 master weights.
-    /// Set to <see cref="StreamingStoreDtype.Bf16Stochastic"/> to also get the
-    /// 2x during training in regimes that tolerate bf16 masters, or
-    /// <see cref="StreamingStoreDtype.FullPrecision"/> to disable entirely.
+    /// <see cref="StreamingStoreDtype.Auto"/> — <b>compresses by default</b>, always picking
+    /// the max-safe option for the context: bf16 (2x I/O, 4x for fp64, at ~0.17% RMS error)
+    /// in inference/eval where it's a one-time, always-safe quantization; and <b>lossless</b>
+    /// (byte-shuffle + Deflate, ~1.18x, BIT-EXACT) during training — so fp32/fp64 masters are
+    /// preserved exactly (no convergence risk) while still reclaiming disk + resident bytes.
+    /// Set <see cref="StreamingStoreDtype.Bf16Stochastic"/> for 2x during training in regimes
+    /// that tolerate bf16 masters, <see cref="StreamingStoreDtype.Int8"/> for 4x lossy
+    /// inference, or <see cref="StreamingStoreDtype.FullPrecision"/> to disable compression.
     /// </summary>
     public StreamingStoreDtype StreamingStoreDtype { get; set; } = StreamingStoreDtype.Auto;
 

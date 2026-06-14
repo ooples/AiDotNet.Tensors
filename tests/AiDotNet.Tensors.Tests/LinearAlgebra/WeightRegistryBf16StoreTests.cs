@@ -69,18 +69,32 @@ public class WeightRegistryBf16StoreTests
     }
 
     [Fact]
-    public void Auto_PicksBf16InInference_FullInTraining()
+    public void Auto_CompressesByDefault_Bf16InInference_LosslessInTrainingAndUnknown()
     {
         const int n = 256;
+        // Inference: bf16 (2x, ~0.17% RMS — safe one-time quantization of read-only weights).
         var (d1, tInf) = SetupFloat(StreamingStoreDtype.Auto, n, training: false);
         try { Assert.Equal((byte)1, tInf.StreamingStoreEncoding); Assert.Equal(n * 2, WeightRegistry.StreamingPool.ResidentBytes); }
         finally { Cleanup(d1); }
 
+        // Training: LOSSLESS (encoding 3) — bit-exact masters (no convergence risk) AND still
+        // compressed (resident < raw fp32). Never silently lossy in training.
         var (d2, tTrain) = SetupFloat(StreamingStoreDtype.Auto, n, training: true);
-        try { Assert.Equal((byte)0, tTrain.StreamingStoreEncoding); Assert.Equal(n * sizeof(float), WeightRegistry.StreamingPool.ResidentBytes); }
+        try
+        {
+            Assert.Equal((byte)3, tTrain.StreamingStoreEncoding);
+            Assert.True(WeightRegistry.StreamingPool.ResidentBytes < n * sizeof(float),
+                $"Auto-training lossless resident {WeightRegistry.StreamingPool.ResidentBytes} should be < raw {n * 4}");
+            // Exact round-trip — the masters are preserved bit-for-bit.
+            var expected = new float[n];
+            for (int i = 0; i < n; i++) expected[i] = (float)Math.Sin(i * 0.013) * 0.05f;
+            WeightRegistry.Materialize(tTrain);
+            for (int i = 0; i < n; i++)
+                Assert.Equal(BitConverter.GetBytes(expected[i]), BitConverter.GetBytes(tTrain[i]));
+        }
         finally { Cleanup(d2); }
 
-        // Unknown mode (null) must be SAFE = full precision (never silent bf16 masters).
+        // Unknown mode (null — no declared execution mode): don't guess, keep full precision.
         var (d3, tUnknown) = SetupFloat(StreamingStoreDtype.Auto, n, training: null);
         try { Assert.Equal((byte)0, tUnknown.StreamingStoreEncoding); }
         finally { Cleanup(d3); }
