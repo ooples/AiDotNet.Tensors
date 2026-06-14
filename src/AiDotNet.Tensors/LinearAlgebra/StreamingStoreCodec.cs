@@ -306,10 +306,11 @@ internal static class StreamingStoreCodec
         }
     }
 
-    // AVX2 byte-plane transpose for 4-byte elements. 128 bytes (32 floats) per iteration:
-    // pshufb groups bytes by plane within each 128-bit lane, two unpack stages transpose the
-    // 32-/64-bit groups, and a permute fixes the lane crossing — yielding 4 contiguous
-    // 32-byte plane outputs. Bit-identical to BytePlaneShuffleScalar (asserted by tests).
+    // SSSE3 byte-plane transpose for 4-byte elements. 16 bytes (4 floats) per iteration:
+    // one pshufb groups the 4 elements' bytes by plane within a single 128-bit register
+    // — no cross-lane ops, no second unpack pass — and the resulting four 32-bit lanes
+    // scatter to four contiguous plane offsets. Bit-identical to BytePlaneShuffleScalar
+    // (asserted by tests).
     // Self-inverse per-128-bit byte gather [0,4,8,12, 1,5,9,13, 2,6,10,14, 3,7,11,15]:
     // applied to 4 elements' interleaved bytes it groups them by plane; applied to 4 planes'
     // grouped bytes it scatters them back to element order. Same mask both directions.
