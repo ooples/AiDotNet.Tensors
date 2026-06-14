@@ -1,5 +1,7 @@
 // Copyright (c) AiDotNet. All rights reserved.
 
+using System;
+
 namespace AiDotNet.Tensors.LinearAlgebra;
 
 /// <summary>
@@ -62,8 +64,45 @@ public sealed class GpuOffloadOptions
     public OffloadScheme PreferredScheme { get; set; } = OffloadScheme.Auto;
 
     /// <summary>Maximum resident bytes for streaming-pool weights. When
-    /// the pool exceeds this, oldest unused entries evict. Default 16 GiB.</summary>
-    public long StreamingPoolMaxResidentBytes { get; set; } = 16L * 1024 * 1024 * 1024;
+    /// the pool exceeds this, oldest unused entries evict. Defaults to
+    /// <see cref="DefaultResidentBudgetBytes"/> — min(16 GiB, ~70% of the
+    /// memory available to the process) — so the pool's own resident byte[]s
+    /// never push the box into OS-level swap (which would page on top of the
+    /// pool's own paging — double I/O). Set explicitly to override.</summary>
+    public long StreamingPoolMaxResidentBytes { get; set; } = DefaultResidentBudgetBytes();
+
+    // Historical ceiling, kept as the cap for large-memory boxes so their
+    // behaviour is unchanged.
+    private const long ResidentBudgetCeiling = 16L * 1024 * 1024 * 1024;
+
+    /// <summary>
+    /// The default resident budget: min(16 GiB, ~70% of memory available to the
+    /// process). The 70% headroom leaves room for activations, the GC heap, and
+    /// the OS; on boxes / containers with ≥ ~23 GiB available this returns the
+    /// historical 16 GiB (no behaviour change), and on smaller boxes it clamps
+    /// down so the resident set stays within RAM instead of triggering OS swap.
+    /// Never below 512 MiB (a tiny budget thrashes eviction). Falls back to the
+    /// 16 GiB ceiling when available memory can't be determined (e.g. net471).
+    /// </summary>
+    public static long DefaultResidentBudgetBytes()
+    {
+        try
+        {
+#if NET5_0_OR_GREATER
+            long available = GC.GetGCMemoryInfo().TotalAvailableMemoryBytes;
+#else
+            long available = 0; // net471: no portable query — keep the ceiling.
+#endif
+            if (available <= 0) return ResidentBudgetCeiling;
+            long ramAware = (long)(available * 0.7);
+            long budget = Math.Min(ResidentBudgetCeiling, ramAware);
+            return Math.Max(512L * 1024 * 1024, budget);
+        }
+        catch
+        {
+            return ResidentBudgetCeiling;
+        }
+    }
 
     /// <summary>Backing store path for the streaming pool. Null ⇒ use the
     /// system temp dir. Memory-mapped file is the default backing format.</summary>
@@ -71,10 +110,20 @@ public sealed class GpuOffloadOptions
 
     /// <summary>
     /// LZ4-compress weight bytes before writing them to the backing store.
-    /// On near-Gaussian fp32 weights this typically saves 30–40% of disk
-    /// footprint at ~3 GB/s decompress (negligible vs. NVMe bandwidth).
-    /// Default false to keep the basic streaming path identical to the
-    /// pre-compression behaviour; enable for memory-bound (562B) models.
+    /// Default false — and that is the right default: raw LZ4 does NOT shrink
+    /// dense floating-point weights. Measured on near-Gaussian fp32/fp64 it
+    /// lands at ~100% (the high-entropy mantissa is incompressible to a
+    /// match-only codec; the eviction path's raw-fallback fires), so enabling it
+    /// adds encode CPU for ~0 benefit on typical weights. It only helps weights
+    /// with real byte-level structure (heavy sparsity / repeats).
+    /// <para>
+    /// What actually shrinks weight bytes (see StreamingWeightCompressionRatioTests):
+    /// lossless bit-plane shuffle + an ENTROPY coder (zstd/Brotli) reaches only
+    /// ~1.15–1.25x because the mantissa is near-random; the real lever is lossy
+    /// quantization of the backing store — bf16 = 2x at ~0.17% RMS error,
+    /// int8 per-tensor = 4x at ~1.1% — which is future work gated on
+    /// lossy-during-training safety.
+    /// </para>
     /// </summary>
     public bool EnableCompression { get; set; } = false;
 

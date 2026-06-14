@@ -117,6 +117,27 @@ public class StreamingTensorPoolEvictionWriteProfileTests
     }
 
     [Fact]
+    public void DefaultResidentBudget_StaysWithinRamAndCeiling()
+    {
+        long budget = GpuOffloadOptions.DefaultResidentBudgetBytes();
+        const long ceiling = 16L * 1024 * 1024 * 1024;
+        const long floor = 512L * 1024 * 1024;
+        Assert.InRange(budget, floor, ceiling);
+
+        // A fresh options instance must pick up the RAM-aware default.
+        Assert.Equal(budget, new GpuOffloadOptions().StreamingPoolMaxResidentBytes);
+
+#if NET5_0_OR_GREATER
+        // When available memory is known, the budget must not exceed it (the whole
+        // point — never let the resident set push the box into OS swap).
+        long available = GC.GetGCMemoryInfo().TotalAvailableMemoryBytes;
+        if (available > 0)
+            Assert.True(budget <= available,
+                $"Budget {budget} must not exceed available memory {available}.");
+#endif
+    }
+
+    [Fact]
     public void MarkDirty_ForcesReWriteOnNextEviction()
     {
         // The dirty contract that keeps clean-eviction correct: once an entry is
