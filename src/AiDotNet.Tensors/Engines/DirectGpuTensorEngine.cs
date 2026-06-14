@@ -1389,7 +1389,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
             else
             {
-                // Non-CUDA backends keep the synchronous free (no deferred-free path yet).
+                // Non-CUDA backends have no event-based deferred-free, so a synchronous free of an
+                // evicted buffer races the step's in-flight async kernels that may still reference it
+                // (the OpenCL/Vulkan analogue of the #226/#555 CUDA-700 illegal-access race). Stream-
+                // synchronize FIRST (#555 approach 1) so every enqueued kernel that could touch an
+                // evicted buffer has completed before we return it to the pool / free it. Eviction only
+                // fires under genuine VRAM pressure (the count cap is huge), so this sync is rare and
+                // does not stall the steady-state pipeline.
+                try { backend.Synchronize(); }
+                catch { /* best-effort: a failed sync must not leak the eviction set */ }
                 foreach (var entry in evicted)
                     entry.Dispose();
             }
