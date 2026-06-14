@@ -16,6 +16,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 /// <see cref="MixedPrecisionGraphBackward"/>. FP16-exact values ⇒ the analytic gradient is the exact
 /// target, so a defect in the bridge or the walk ordering shows as a real mismatch.
 /// </summary>
+[Collection(MixedPrecisionTestCollection.Name)]
 public class MixedPrecisionGraphBackwardTests
 {
     private readonly IEngine _engine = AiDotNetEngine.Current;

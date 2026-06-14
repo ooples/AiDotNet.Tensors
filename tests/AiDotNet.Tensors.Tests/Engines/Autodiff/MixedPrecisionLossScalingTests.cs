@@ -14,6 +14,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 /// resident grad stays representable, then the result is unscaled in FP32. This test shows BOTH the
 /// failure (unscaled → 0) and the recovery (scaled → correct), which is the whole point of loss scaling.
 /// </summary>
+[Collection(AiDotNet.Tensors.Tests.Engines.Compilation.MixedPrecisionTestCollection.Name)]
 public class MixedPrecisionLossScalingTests
 {
     private readonly IEngine _engine = AiDotNetEngine.Current;

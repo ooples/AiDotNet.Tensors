@@ -15,6 +15,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 /// internals are touched (Trace manages them). The loss must descend — proving the API is sufficient to
 /// drive FP16 activation-storage training from outside the assembly.
 /// </summary>
+[Collection(MixedPrecisionTestCollection.Name)]
 public class MixedPrecisionPublicApiTests
 {
     private readonly IEngine _engine = AiDotNetEngine.Current;

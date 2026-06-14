@@ -14,6 +14,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 /// difference test is deliberately NOT used here — a down-cast is a rounding staircase (non-smooth),
 /// so the correct gate is round-trip consistency, not numeric differentiation through the rounding.
 /// </summary>
+[Collection(AiDotNet.Tensors.Tests.Engines.Compilation.MixedPrecisionTestCollection.Name)]
 public class MixedPrecisionCastTests
 {
     private static Tensor<float> Rand(int n, int seed, double scale)

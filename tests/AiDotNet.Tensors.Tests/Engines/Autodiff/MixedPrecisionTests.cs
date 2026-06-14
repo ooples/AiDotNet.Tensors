@@ -9,6 +9,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 
 /// <summary>Issue #276 sub-feature 1 follow-up: mixed-precision training
 /// — loss scaling + master weights round-trip.</summary>
+[Collection(AiDotNet.Tensors.Tests.Engines.Compilation.MixedPrecisionTestCollection.Name)]
 public class MixedPrecisionTests
 {
     [Fact]

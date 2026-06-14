@@ -18,6 +18,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 /// undone (returned grads are independent of the scaler's scale), and (4) the grads match an
 /// analytic FP32 reference within FP16 tolerance.
 /// </summary>
+[Collection(MixedPrecisionTestCollection.Name)]
 public class MixedPrecisionComputeGradientsTests
 {
     private readonly IEngine _engine = AiDotNetEngine.Current;

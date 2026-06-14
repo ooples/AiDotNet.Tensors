@@ -20,6 +20,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 /// REUSES that Half output (the chain never widens); (3) the auto-emitted mixed-dtype graph backprops to
 /// gradients matching the all-FP32 reference graph within FP16 tolerance.</para>
 /// </summary>
+[Collection(MixedPrecisionTestCollection.Name)]
 public class Fp16NativeOpTests
 {
     private readonly IEngine _engine = AiDotNetEngine.Current;

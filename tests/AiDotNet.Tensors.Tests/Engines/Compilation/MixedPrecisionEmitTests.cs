@@ -18,6 +18,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 /// and (2) <see cref="MixedPrecisionGraphBackward"/> backprops the auto-emitted mixed-dtype graph to the
 /// correct FP32 parameter gradients (analytic, FP16-exact values).
 /// </summary>
+[Collection(MixedPrecisionTestCollection.Name)]
 public class MixedPrecisionEmitTests
 {
     private readonly IEngine _engine = AiDotNetEngine.Current;
