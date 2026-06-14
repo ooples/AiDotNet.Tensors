@@ -300,6 +300,20 @@ public sealed class StreamingTensorPool : IDisposable
                 _schedule = null; _scheduleOccurrences = null; _schedulePos = 0;
                 return;
             }
+            // Validate every handle at the boundary. An unknown id would flow
+            // through GetScheduledPrefetchTargets and surface as a
+            // far-from-the-call-site InvalidOperationException inside
+            // Rehydrate. Better to reject the bad schedule up front with the
+            // offending position so the caller can identify which entry in
+            // its layer ordering is stale.
+            for (int i = 0; i < order.Length; i++)
+            {
+                if (!_entries.ContainsKey(order[i]))
+                    throw new ArgumentException(
+                        $"Access schedule contains unknown handle {order[i]} at index {i}. " +
+                        "All handles must correspond to currently-registered tensors in this pool.",
+                        nameof(order));
+            }
             var sched = order.ToArray();
             var occ = new Dictionary<long, System.Collections.Generic.List<int>>();
             for (int i = 0; i < sched.Length; i++)
