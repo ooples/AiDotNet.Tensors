@@ -47,9 +47,20 @@ public class StreamingZeroCopyMmapValueTests
             view.SafeMemoryMappedViewHandle.AcquirePointer(ref basePtr);
             try
             {
-                // Warm the page cache (first touch pulls pages in).
-                long warm = 0; for (int i = 0; i < bytes; i += 4096) warm += basePtr[i];
-                Assert.True(warm >= 0);
+                // Warm the page cache (first touch pulls pages in). The sum
+                // MUST equal what we wrote — the inputs are nonzero at every
+                // 64-byte slot (i&0xFF for i % 4096 == 0), so a zero-sum or
+                // an "all bytes equal 0xFF" pattern would mean the mapping
+                // exposes the wrong pages. CodeRabbit #604 flagged the prior
+                // `warm >= 0` (always-true on byte sums) as non-gating.
+                long warm = 0;
+                long expectedWarm = 0;
+                for (int i = 0; i < bytes; i += 4096)
+                {
+                    warm += basePtr[i];
+                    expectedWarm += (byte)(i & 0xFF);
+                }
+                Assert.Equal(expectedWarm, warm);
 
                 const int iters = 40;
                 long sinkA = 0, sinkB = 0;
@@ -91,12 +102,29 @@ public class StreamingZeroCopyMmapValueTests
                 Copy(); ZeroCopy(); // warm
                 double copyMs = Copy();
                 double zcMs = ZeroCopy();
-                Assert.Equal(sinkA > 0, sinkB > 0);
+
+                // Both readers iterate the same offsets, on the same mapped
+                // pages, so the running sinks must be exactly equal — the
+                // claim of this test (zero-copy reads the SAME bytes the
+                // copy path reads) is what we have to prove. The prior
+                // `Equal(sinkA > 0, sinkB > 0)` only compared the
+                // null-vs-nonzero buckets; sinkA = 1 and sinkB = 999_999
+                // would have passed. CodeRabbit #604.
+                Assert.Equal(sinkA, sinkB);
 
                 double savedMs = copyMs - zcMs;
                 double savedPct = copyMs > 0 ? savedMs / copyMs * 100 : 0;
                 _out.WriteLine($"weight {bytes / (1024.0 * 1024):F0} MiB  per-access: copy {copyMs:F3} ms, zero-copy {zcMs:F3} ms " +
                                $"→ saves {savedMs:F3} ms ({savedPct:F0}%)  [the alloc+memcpy zero-copy removes]");
+                Assert.True(copyMs > 0 && zcMs > 0,
+                    $"Timings must be positive (copy={copyMs:F3}ms zero-copy={zcMs:F3}ms).");
+                // Zero-copy must not be SLOWER than the alloc+memcpy path on
+                // the same data — the whole point. Allow a small +10% jitter
+                // floor because both paths' inner loops are memory-bound and
+                // can hit cache vagaries; pre-fix the test would have
+                // accepted a 10× regression.
+                Assert.True(zcMs <= copyMs * 1.10,
+                    $"Zero-copy path regressed below the alloc+memcpy path: copy={copyMs:F3}ms zero-copy={zcMs:F3}ms.");
             }
             finally { view.SafeMemoryMappedViewHandle.ReleasePointer(); }
         }
