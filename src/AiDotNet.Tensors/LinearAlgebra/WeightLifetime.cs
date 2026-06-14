@@ -1,5 +1,7 @@
 // Copyright (c) AiDotNet. All rights reserved.
 
+using System;
+
 namespace AiDotNet.Tensors.LinearAlgebra;
 
 /// <summary>
@@ -50,6 +52,50 @@ public enum WeightLifetime
 }
 
 /// <summary>
+/// Precision the streaming pool stores weight bytes at on its backing store.
+/// bf16 halves disk + resident I/O at ~0.17% RMS error; because the pool's
+/// stored copy IS the canonical weight, bf16 during TRAINING effectively makes
+/// the master weights bf16 (which mixed-precision training avoids — it keeps
+/// fp32 masters), so the safe default is context-aware.
+/// </summary>
+public enum StreamingStoreDtype
+{
+    /// <summary>Context-aware default — compresses whenever the execution mode is known:
+    /// bf16 in inference/eval (read-only weights → a one-time quantization, always safe, 2x),
+    /// and LOSSLESS (byte-shuffle + Deflate, ~1.18x, BIT-EXACT) during training so the
+    /// fp32/fp64 masters are preserved exactly. Unknown mode (no declared context) → full
+    /// precision (don't guess).</summary>
+    Auto = 0,
+
+    /// <summary>Always store at the weight's native precision (fp32/fp64). No
+    /// quantization, no I/O reduction — the pre-bf16 behaviour.</summary>
+    FullPrecision = 1,
+
+    /// <summary>Always store bf16 with round-to-nearest-even. 2x I/O. Safe for
+    /// inference; for training it's bf16 masters (deterministic-rounding bias on
+    /// small updates) — prefer <see cref="Bf16Stochastic"/> when training.</summary>
+    Bf16 = 2,
+
+    /// <summary>Always store bf16 with STOCHASTIC rounding. 2x I/O, and the
+    /// rounding is unbiased so training stays correct in regimes that tolerate
+    /// bf16 masters (large-batch pretraining). Opt-in for training.</summary>
+    Bf16Stochastic = 3,
+
+    /// <summary>Always store int8 with a per-tensor symmetric scale. 4x I/O at
+    /// ~1.1% RMS error — much more lossy than bf16, so it's never the Auto default
+    /// and is intended for inference / aggressive memory-bound cases where the
+    /// accuracy tradeoff is accepted.</summary>
+    Int8 = 4,
+
+    /// <summary>EXACT (lossless) storage: SIMD byte-plane shuffle + Deflate. ~1.18x I/O on
+    /// dense fp weights (raw codecs yield ~0% — the shuffle exposes the structured
+    /// sign/exponent byte-plane and Deflate's entropy stage shrinks it) at ZERO precision
+    /// loss. This is the Auto default during TRAINING (bit-exact masters); bf16/int8 give far
+    /// more (2x/4x) at a precision cost. ~1.1 GiB/s decode, overlapped by prefetch.</summary>
+    Lossless = 5,
+}
+
+/// <summary>
 /// Per-engine options for the GPU offload / streaming subsystem. Plumbs
 /// through every direct-GPU backend (CUDA / HIP / Metal / OpenCL / Vulkan /
 /// WebGPU) so a single config struct controls the placement contract.
@@ -62,8 +108,51 @@ public sealed class GpuOffloadOptions
     public OffloadScheme PreferredScheme { get; set; } = OffloadScheme.Auto;
 
     /// <summary>Maximum resident bytes for streaming-pool weights. When
-    /// the pool exceeds this, oldest unused entries evict. Default 16 GiB.</summary>
-    public long StreamingPoolMaxResidentBytes { get; set; } = 16L * 1024 * 1024 * 1024;
+    /// the pool exceeds this, oldest unused entries evict. Defaults to
+    /// <see cref="DefaultResidentBudgetBytes"/> — min(16 GiB, ~70% of the
+    /// memory available to the process) — so the pool's own resident byte[]s
+    /// never push the box into OS-level swap (which would page on top of the
+    /// pool's own paging — double I/O). Set explicitly to override.</summary>
+    public long StreamingPoolMaxResidentBytes { get; set; } = DefaultResidentBudgetBytes();
+
+    // Historical ceiling, kept as the cap for large-memory boxes so their
+    // behaviour is unchanged.
+    private const long ResidentBudgetCeiling = 16L * 1024 * 1024 * 1024;
+
+    /// <summary>
+    /// The default resident budget: min(16 GiB, ~70% of memory available to the
+    /// process). The 70% headroom leaves room for activations, the GC heap, and
+    /// the OS; on boxes / containers with ≥ ~23 GiB available this returns the
+    /// historical 16 GiB (no behaviour change), and on smaller boxes it clamps
+    /// down so the resident set stays within RAM instead of triggering OS swap.
+    /// Never below 512 MiB (a tiny budget thrashes eviction). Falls back to the
+    /// 16 GiB ceiling when available memory can't be determined (e.g. net471).
+    /// </summary>
+    public static long DefaultResidentBudgetBytes()
+    {
+        try
+        {
+#if NET5_0_OR_GREATER
+            long available = GC.GetGCMemoryInfo().TotalAvailableMemoryBytes;
+#else
+            long available = 0; // net471: no portable query — keep the ceiling.
+#endif
+            if (available <= 0) return ResidentBudgetCeiling;
+            long ramAware = (long)(available * 0.7);
+            long budget = Math.Min(ResidentBudgetCeiling, ramAware);
+            budget = Math.Max(512L * 1024 * 1024, budget);
+            // Cap by what's actually available — the 512 MiB floor used to
+            // be unconditional, so on a container with e.g. 256 MiB free
+            // we'd return 512 MiB and immediately push the pool over the
+            // OS limit, triggering exactly the swap-thrash the budget is
+            // meant to prevent.
+            return Math.Min(budget, available);
+        }
+        catch
+        {
+            return ResidentBudgetCeiling;
+        }
+    }
 
     /// <summary>Backing store path for the streaming pool. Null ⇒ use the
     /// system temp dir. Memory-mapped file is the default backing format.</summary>
@@ -71,12 +160,52 @@ public sealed class GpuOffloadOptions
 
     /// <summary>
     /// LZ4-compress weight bytes before writing them to the backing store.
-    /// On near-Gaussian fp32 weights this typically saves 30–40% of disk
-    /// footprint at ~3 GB/s decompress (negligible vs. NVMe bandwidth).
-    /// Default false to keep the basic streaming path identical to the
-    /// pre-compression behaviour; enable for memory-bound (562B) models.
+    /// Default false — and that is the right default: raw LZ4 does NOT shrink
+    /// dense floating-point weights. Measured on near-Gaussian fp32/fp64 it
+    /// lands at ~100% (the high-entropy mantissa is incompressible to a
+    /// match-only codec; the eviction path's raw-fallback fires), so enabling it
+    /// adds encode CPU for ~0 benefit on typical weights. It only helps weights
+    /// with real byte-level structure (heavy sparsity / repeats).
+    /// <para>
+    /// What actually shrinks weight bytes (see StreamingWeightCompressionRatioTests):
+    /// lossless bit-plane shuffle + an ENTROPY coder (zstd/Brotli) reaches only
+    /// ~1.15–1.25x because the mantissa is near-random; the real lever is lossy
+    /// quantization of the backing store — bf16 = 2x at ~0.17% RMS error,
+    /// int8 per-tensor = 4x at ~1.1% — which is future work gated on
+    /// lossy-during-training safety.
+    /// </para>
     /// </summary>
     public bool EnableCompression { get; set; } = false;
+
+    /// <summary>
+    /// Precision the streaming pool stores weight bytes at. Default
+    /// <see cref="StreamingStoreDtype.Auto"/> — <b>compresses by default</b>, always picking
+    /// the max-safe option for the context: bf16 (2x I/O, 4x for fp64, at ~0.17% RMS error)
+    /// in inference/eval where it's a one-time, always-safe quantization; and <b>lossless</b>
+    /// (byte-shuffle + Deflate, ~1.18x, BIT-EXACT) during training — so fp32/fp64 masters are
+    /// preserved exactly (no convergence risk) while still reclaiming disk + resident bytes.
+    /// Set <see cref="StreamingStoreDtype.Bf16Stochastic"/> for 2x during training in regimes
+    /// that tolerate bf16 masters, <see cref="StreamingStoreDtype.Int8"/> for 4x lossy
+    /// inference, or <see cref="StreamingStoreDtype.FullPrecision"/> to disable compression.
+    /// </summary>
+    public StreamingStoreDtype StreamingStoreDtype { get; set; } = StreamingStoreDtype.Auto;
+
+    /// <summary>
+    /// Opt-in (default <see langword="false"/>): when materializing a paged-out weight
+    /// whose backing-file slice holds its NATIVE element bytes (full precision, no LZ4),
+    /// alias those bytes directly from a read-only memory-mapping instead of paging them
+    /// into a fresh array — eliminating the per-access allocation + memory copy (measured
+    /// 86–95% of the non-compute access cost for hot, page-cache-resident weights). The OS
+    /// page cache manages residency.
+    ///
+    /// <para><b>INFERENCE-ONLY.</b> The mapping is READ-ONLY: it must back only weights
+    /// that are never written while aliased (forward-read). The pool honors this by aliasing
+    /// only when the streaming execution mode is inference (not training) and the store
+    /// encoding is native (not bf16/int8/lossless — those require a decode, which copies).
+    /// Do not enable for training deployments: a weight update would fault on the read-only
+    /// pages. Leave off unless you are serving a larger-than-RAM model for inference.</para>
+    /// </summary>
+    public bool EnableZeroCopyMmapResidency { get; set; } = false;
 
     /// <summary>
     /// Number of layers to prefetch ahead of the current Forward / Backward

@@ -152,9 +152,31 @@ public static class WeightRegistry
                         // regardless of host RAM. Helper is internal so
                         // the overflow guard can be unit-tested directly
                         // without faking a multi-GB tensor.
-                        int byteCount = CheckedStreamingByteCount<T>(weight.Length);
-                        var bytes = new byte[byteCount];
-                        SerializeToBytes(weight, bytes);
+                        // Resolve the store encoding (bf16 vs native) from the
+                        // StreamingStoreDtype policy + execution mode. bf16 halves the
+                        // registered byte[] and everything downstream (resident set,
+                        // eviction, disk) for free — the pool is byte-agnostic; only the
+                        // restore boundary widens bf16 → T (RestoreStorageFromBytes).
+                        var (encoding, stochastic) = ResolveStoreEncoding<T>();
+                        byte[] bytes;
+                        if (encoding == StreamingEncoding.Lossless)
+                        {
+                            // Lossless (byte-shuffle + LZ4) is variable-size — compress
+                            // first, then register exactly the produced bytes.
+                            bytes = SerializeLossless(weight);
+                        }
+                        else
+                        {
+                            int byteCount = encoding switch
+                            {
+                                StreamingEncoding.Bf16 => CheckedBf16ByteCount(weight.Length),
+                                StreamingEncoding.Int8 => CheckedInt8ByteCount(weight.Length, weight.Int8QuantRows),
+                                _ => CheckedStreamingByteCount<T>(weight.Length),
+                            };
+                            bytes = new byte[byteCount];
+                            SerializeToBytes(weight, bytes, encoding, stochastic);
+                        }
+                        weight.StreamingStoreEncoding = encoding;
                         var pool = StreamingPoolUnlocked();
                         // If this tensor was produced by AllocateStreaming,
                         // it carries the reservation byteCount the pool
@@ -561,6 +583,162 @@ public static class WeightRegistry
     /// can be unit-tested directly against synthetic Length values
     /// without allocating a 2GB+ tensor in a test process.
     /// </summary>
+    // Execution-mode hint for StreamingStoreDtype.Auto. The model's training-mode
+    // toggle sets this so Auto stores bf16 in inference (read-only weights → a safe
+    // one-time quantization) and full precision in training (preserve fp32/fp64
+    // masters — small updates would be lost to bf16). null = unknown → safe (full).
+    private static bool? _streamingTrainingMode;
+
+    /// <summary>
+    /// Hints whether streaming weights are currently used in TRAINING (<c>true</c>)
+    /// or INFERENCE (<c>false</c>) so <see cref="StreamingStoreDtype.Auto"/> picks
+    /// bf16 only where it's safe. <c>null</c> = unknown (treated as training → full
+    /// precision). The model's <c>SetTrainingMode</c> forwards here.
+    /// </summary>
+    public static void SetStreamingExecutionTraining(bool? isTraining)
+    {
+        lock (_lock) { _streamingTrainingMode = isTraining; }
+    }
+
+    /// <summary>
+    /// Attempts to alias <paramref name="weight"/>'s storage onto a read-only memory-mapped
+    /// slice of the backing file (zero-copy materialization). Returns false (caller falls
+    /// back to the copy path) if the slice doesn't match the tensor's native element layout
+    /// or the mapping can't be opened. Only valid for natively-stored, read-only weights —
+    /// the caller gates on encoding + inference mode.
+    /// </summary>
+    private static bool TryAliasZeroCopy<T>(Tensor<T> weight, string path, long fileOffset, int byteLength)
+    {
+        int elemSize = NativeStreamingElementSize<T>();
+        if (elemSize <= 0) return false;
+        // The slice must hold exactly Length native elements — no scale prefix, no
+        // compression. A mismatch means the entry isn't natively stored; don't alias.
+        if ((long)weight.Length * elemSize != byteLength) return false;
+
+        MmapTensorMemoryManager<T>? manager = null;
+        try
+        {
+            manager = new MmapTensorMemoryManager<T>(path, fileOffset, byteLength, weight.Length);
+            var aliased = Vector<T>.WrapMemory(manager.Memory);
+            weight.AliasStorageFromMmap(aliased, manager); // tensor owns the mapping now
+            return true;
+        }
+        catch
+        {
+            // Any failure (file locked, OOM mapping address space, etc.) → fall back to
+            // the proven copy path. Dispose the half-built mapping so no handle leaks.
+            // MemoryManager<T>.Dispose() is an explicit interface impl — cast to reach it.
+            ((IDisposable?)manager)?.Dispose();
+            return false;
+        }
+    }
+
+    /// <summary>Byte size of one native element of <typeparamref name="T"/> for the
+    /// zero-copy path, or 0 for unsupported types. Matches the native (encoding 0)
+    /// branch of <c>SerializeToBytes</c>/<c>RestoreStorageFromBytes</c>.</summary>
+    private static int NativeStreamingElementSize<T>()
+    {
+        if (typeof(T) == typeof(float)) return sizeof(float);
+        if (typeof(T) == typeof(double)) return sizeof(double);
+        if (typeof(T) == typeof(int)) return sizeof(int);
+        if (typeof(T) == typeof(long)) return sizeof(long);
+        return 0;
+    }
+
+    /// <summary>
+    /// Resolves the streaming-store encoding (1 = bf16, 0 = native) and rounding
+    /// (stochastic) for type T from <see cref="GpuOffloadOptions.StreamingStoreDtype"/>
+    /// and the execution-mode hint. Only float/double can be bf16-encoded; all other
+    /// types always store native. Caller holds <see cref="_lock"/>.
+    /// </summary>
+    private static (byte encoding, bool stochastic) ResolveStoreEncoding<T>()
+    {
+        if (typeof(T) != typeof(float) && typeof(T) != typeof(double)) return (StreamingEncoding.Native, false);
+        switch (_options.StreamingStoreDtype)
+        {
+            case StreamingStoreDtype.FullPrecision: return (StreamingEncoding.Native, false);
+            case StreamingStoreDtype.Bf16: return (StreamingEncoding.Bf16, false);
+            case StreamingStoreDtype.Bf16Stochastic: return (StreamingEncoding.Bf16, true);
+            case StreamingStoreDtype.Int8: return (StreamingEncoding.Int8, false); // explicit opt-in (Auto never picks int8)
+            case StreamingStoreDtype.Lossless: return (StreamingEncoding.Lossless, false); // exact, variable-size; explicit opt-in
+            case StreamingStoreDtype.Auto:
+            default:
+                // Compress by DEFAULT whenever the execution mode is known — every model that
+                // goes through SetTrainingMode is — always picking the max-safe option:
+                //   • inference → bf16: 2x (4x for fp64) at ~0.17% RMS, a safe one-time
+                //     quantization of read-only weights.
+                //   • training → LOSSLESS (byte-shuffle + Deflate): bit-exact, so the fp32/fp64
+                //     masters are preserved EXACTLY (no convergence risk) while still reclaiming
+                //     ~1.18x of disk + resident bytes. Never silently lossy.
+                //   • unknown (no declared mode — raw registry use) → full precision: don't
+                //     guess; keep the bytes exact and the layout fixed-size.
+                // (int8 is too lossy to ever be an automatic choice — explicit opt-in only.)
+                return _streamingTrainingMode switch
+                {
+                    false => (StreamingEncoding.Bf16, false),     // inference → bf16
+                    true => (StreamingEncoding.Lossless, false),  // training → lossless
+                    _ => (StreamingEncoding.Native, false),       // unknown → full precision
+                };
+        }
+    }
+
+    /// <summary>bf16 byte count (2 per element) with the same int.MaxValue overflow
+    /// guard as <see cref="CheckedStreamingByteCount{T}"/>.</summary>
+    internal static int CheckedBf16ByteCount(int length)
+    {
+        if (length < 0) throw new ArgumentOutOfRangeException(nameof(length));
+        long byteCountLong = (long)length * StreamingStoreCodec.Bf16ElementSize;
+        if (byteCountLong > int.MaxValue)
+            throw new NotSupportedException(
+                $"Streaming bf16 registration requires per-tensor size <= {int.MaxValue} bytes. " +
+                $"Tensor has {length} elements × 2 bytes = {byteCountLong} bytes. Chunk it.");
+        return (int)byteCountLong;
+    }
+
+    /// <summary>Lossless (byte-shuffle + LZ4) serialization — variable size.</summary>
+    private static byte[] SerializeLossless<T>(Tensor<T> tensor)
+    {
+        if (typeof(T) == typeof(float))
+            return StreamingStoreCodec.EncodeLosslessFloat((float[])(object)tensor.AsSpan().ToArray());
+        if (typeof(T) == typeof(double))
+            return StreamingStoreCodec.EncodeLosslessDouble((double[])(object)tensor.AsSpan().ToArray());
+        throw new NotSupportedException(
+            $"Lossless streaming store is only supported for float/double, not {typeof(T).Name}.");
+    }
+
+    // Transpose a [r, c] row-major buffer to [c, r] row-major (used to store a Linear weight
+    // [in, out] as [out, in] so the int8 store is per-output-channel + kernel-ready).
+    private static float[] TransposeRowMajor(float[] src, int r, int c)
+    {
+        var dst = new float[src.Length];
+        for (int i = 0; i < r; i++)
+            for (int j = 0; j < c; j++)
+                dst[j * r + i] = src[i * c + j];
+        return dst;
+    }
+    private static double[] TransposeRowMajor(double[] src, int r, int c)
+    {
+        var dst = new double[src.Length];
+        for (int i = 0; i < r; i++)
+            for (int j = 0; j < c; j++)
+                dst[j * r + i] = src[i * c + j];
+        return dst;
+    }
+
+    /// <summary>int8 byte count (1 per element + 4-byte row-count header + 4 bytes per row
+    /// scale) with overflow guard.</summary>
+    internal static int CheckedInt8ByteCount(int length, int rows)
+    {
+        if (length < 0) throw new ArgumentOutOfRangeException(nameof(length));
+        if (rows <= 0) throw new ArgumentOutOfRangeException(nameof(rows));
+        long byteCountLong = 4L + 4L * rows + length; // [int32 rows][rows × fp32 scale][int8 data]
+        if (byteCountLong > int.MaxValue)
+            throw new NotSupportedException(
+                $"Streaming int8 registration requires per-tensor size <= {int.MaxValue} bytes. " +
+                $"Tensor has {length} elements + {4 + 4 * rows} header bytes = {byteCountLong} bytes. Chunk it.");
+        return (int)byteCountLong;
+    }
+
     internal static int CheckedStreamingByteCount<T>(int length)
     {
         if (length < 0) throw new ArgumentOutOfRangeException(nameof(length));
@@ -630,8 +808,52 @@ public static class WeightRegistry
     /// at the bottom — there is intentionally no generic fallback because a
     /// byte-by-byte memcpy would silently lose data for non-blittable types.
     /// </summary>
-    private static void SerializeToBytes<T>(Tensor<T> tensor, byte[] dst)
+    private static void SerializeToBytes<T>(Tensor<T> tensor, byte[] dst, byte encoding = StreamingEncoding.Native, bool stochastic = false)
     {
+        // bf16 store (StreamingEncoding.Bf16): narrow float/double → 2-byte bf16. dst is
+        // sized to Length*2 by the caller (CheckedBf16ByteCount).
+        if (encoding == StreamingEncoding.Bf16)
+        {
+            if (typeof(T) == typeof(float))
+            {
+                var srcF = (float[])(object)tensor.AsSpan().ToArray();
+                StreamingStoreCodec.EncodeFloat(srcF, dst, stochastic);
+                return;
+            }
+            if (typeof(T) == typeof(double))
+            {
+                var srcD = (double[])(object)tensor.AsSpan().ToArray();
+                StreamingStoreCodec.EncodeDouble(srcD, dst, stochastic);
+                return;
+            }
+            throw new NotSupportedException(
+                $"bf16 streaming store is only supported for float/double, not {typeof(T).Name}.");
+        }
+        // int8 store (StreamingEncoding.Int8): PER-OUTPUT-CHANNEL symmetric quantization. A 2-D
+        // Linear weight [in,out] is TRANSPOSED to [out,in] first, so the per-row scales are
+        // per-output and the stored int8 is exactly the [N,K] layout the int8 GEMM consumes
+        // (no upcast). Higher-rank weights store per-leading-dim, untransposed. dst is sized to
+        // Int8BufferBytes(Length, rows) by the caller (CheckedInt8ByteCount).
+        if (encoding == StreamingEncoding.Int8)
+        {
+            int rows = tensor.Int8QuantRows;
+            if (typeof(T) == typeof(float))
+            {
+                var srcF = (float[])(object)tensor.AsSpan().ToArray();
+                if (tensor.Int8StoreTransposed) srcF = TransposeRowMajor(srcF, tensor._shape[0], tensor._shape[1]);
+                StreamingStoreCodec.EncodeInt8Float(srcF, dst, rows);
+                return;
+            }
+            if (typeof(T) == typeof(double))
+            {
+                var srcD = (double[])(object)tensor.AsSpan().ToArray();
+                if (tensor.Int8StoreTransposed) srcD = TransposeRowMajor(srcD, tensor._shape[0], tensor._shape[1]);
+                StreamingStoreCodec.EncodeInt8Double(srcD, dst, rows);
+                return;
+            }
+            throw new NotSupportedException(
+                $"int8 streaming store is only supported for float/double, not {typeof(T).Name}.");
+        }
         if (typeof(T) == typeof(float))
         {
             var src = (float[])(object)tensor.AsSpan().ToArray();
@@ -706,7 +928,9 @@ public static class WeightRegistry
         if (weight is null) throw new ArgumentNullException(nameof(weight));
         if (weight.Lifetime != WeightLifetime.Streaming) return;
         if (weight.StreamingPoolHandle < 0) return;
-        if (weight.DataVector.Length == weight.Length)
+        // A no-upcast int8 weight is already materialized (as int8 + scales), even though its
+        // fp32 _data is empty — treat it as resident so we don't re-fetch + re-attach each call.
+        if (weight.DataVector.Length == weight.Length || weight.StreamingInt8 is not null)
         {
             // Already resident — but still bump the pool's LRU heat so
             // this hot weight doesn't get evicted in favor of cold ones.
@@ -752,12 +976,45 @@ public static class WeightRegistry
         //      DropStorageForStreaming's TryClaimExclusive guards
         //      against).
         StreamingTensorPool pool;
+        bool zeroCopyEnabled;
+        bool inferenceMode;
         lock (_lock)
         {
             pool = StreamingPoolUnlocked();
+            zeroCopyEnabled = _options.EnableZeroCopyMmapResidency;
+            inferenceMode = _streamingTrainingMode == false;
         }
+
+        // Zero-copy mmap fast path: alias the backing-file slice directly (no alloc, no
+        // copy) for a read-only, natively-stored, uncompressed weight. Gated to inference
+        // (the mapping is read-only — a weight update would fault) and native encoding (bf16/
+        // int8/lossless need a decode, which copies by definition). The append-only backing
+        // file never rewrites an entry's slice, so the offset stays valid for the alias's
+        // lifetime even under concurrent pool activity. Falls through to the copy path if
+        // the slice isn't aliasable or the mapping can't be opened.
+        if (zeroCopyEnabled && inferenceMode && weight.StreamingStoreEncoding == StreamingEncoding.Native
+            && pool.TryGetZeroCopyByteRange(weight.StreamingPoolHandle, out string zcPath, out long zcOffset, out int zcBytes)
+            && TryAliasZeroCopy(weight, zcPath, zcOffset, zcBytes))
+        {
+            // The pool entry stays "paged out" (the OS page cache holds the bytes now), so
+            // there are no new owner-drops to drain from this path.
+            return;
+        }
+
         byte[] snapshot = pool.RehydrateInto(weight.StreamingPoolHandle);
-        weight.RestoreStorageFromBytes(snapshot);
+        // No-upcast int8 fast path: keep an int8-stored weight as int8 + per-row scales in
+        // inference so the matmul fast path feeds the int8 GEMM directly (no dequant to fp32).
+        // The fp32 view is produced lazily by EnsureMaterialized only if a non-matmul path
+        // reads it. Training/unknown still decode to fp32 (the optimizer writes the weight).
+        if (inferenceMode && weight.StreamingStoreEncoding == StreamingEncoding.Int8
+            && (typeof(T) == typeof(float) || typeof(T) == typeof(double)))
+        {
+            weight.AttachStreamingInt8(snapshot);
+        }
+        else
+        {
+            weight.RestoreStorageFromBytes(snapshot);
+        }
 
         // RehydrateInto may have paged other weights out to stay under budget.
         // Drop those owners' resident _data now so the transparent-streaming
@@ -1322,6 +1579,13 @@ public static class WeightRegistry
             _offloadAllocator = null;
             _ownerByHandle.Clear();
             _options = new GpuOffloadOptions();
+            // CodeRabbit #604: clear the training-mode hint too. Otherwise a
+            // prior `false` (set by the last model's SetTrainingMode) persists
+            // process-wide and silently biases StreamingStoreDtype.Auto toward
+            // bf16 on the next model that hasn't yet called SetTrainingMode —
+            // the policy is documented as "training or unknown → full
+            // precision", so the safe-unknown state has to mean null here.
+            _streamingTrainingMode = null;
         }
     }
 

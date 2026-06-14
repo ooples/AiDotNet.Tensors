@@ -72,6 +72,180 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
     internal Vector<T> DataVector => _data;
 
     /// <summary>
+    /// The no-upcast resident form of a streaming int8 weight (int8 + per-row scales). Non-null
+    /// only between materializing an int8-stored weight for inference and dropping it. The engine
+    /// matmul fast path reads this directly (feeds the int8 GEMM, no dequant); any fp32 access
+    /// lazily dequantizes it into <see cref="_data"/> via <see cref="EnsureMaterialized"/>. Null
+    /// for every normal tensor → the matmul/ensure hooks are a single null-check for them.
+    /// </summary>
+    internal StreamingInt8Weight? StreamingInt8 { get; private set; }
+
+    /// <summary>
+    /// Installs <paramref name="encoded"/> (a per-row int8 streaming buffer) as this tensor's
+    /// no-upcast quantized form: parses the int8 weight + per-row scales and leaves
+    /// <see cref="_data"/> empty (the fp32 view is produced lazily on first non-matmul access).
+    /// Used by <c>WeightRegistry.Materialize</c> for int8-stored weights in inference.
+    /// </summary>
+    internal void AttachStreamingInt8(ReadOnlySpan<byte> encoded)
+    {
+        int rows = StreamingStoreCodec.Int8RowsOf(encoded);
+        var scales = StreamingStoreCodec.Int8ScalesOf(encoded);
+        var data = StreamingStoreCodec.Int8DataOf(encoded, Length);
+        int k = rows > 0 ? Length / rows : Length;
+        // For a 2-D Linear weight the stored int8 IS [out,in] = [rows,k] = Wᵀ (kernel-ready);
+        // it's the transpose of the logical [in,out], which the fp32 fallback must undo.
+        StreamingInt8 = new StreamingInt8Weight(data, scales, rows, k, transposedFromLogical: Int8StoreTransposed);
+    }
+
+    /// <summary>
+    /// Returns this weight's no-upcast int8 form for the matmul fast path, materializing it as
+    /// int8 (NOT fp32) if it's an eligible streaming int8 weight that's currently paged out.
+    /// Returns null for every other tensor (non-streaming, non-int8, training, or already fp32) —
+    /// so the engine's int8 routing hook is a single null check for the common case. Unlike
+    /// <see cref="EnsureMaterialized"/>, this never dequantizes to fp32.
+    /// </summary>
+    internal StreamingInt8Weight? GetMaterializedStreamingInt8()
+    {
+        if (StreamingInt8 is not null) return StreamingInt8;
+        if (Lifetime == WeightLifetime.Streaming
+            && StreamingPoolHandle >= 0
+            && _data.Length != Length
+            && StreamingStoreEncoding == StreamingEncoding.Int8
+            && this is Tensor<T> w)
+        {
+            // Materialize attaches the int8 form in inference (leaves _data empty); in training
+            // it decodes to fp32 instead and StreamingInt8 stays null → we return null below.
+            WeightRegistry.Materialize(w);
+            return StreamingInt8;
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Lazily dequantizes the attached int8 weight into <see cref="_data"/> (fp32/fp64) — the
+    /// fallback when a non-matmul path needs a materialized span/indexer on a no-upcast int8
+    /// weight. Clears <see cref="StreamingInt8"/> afterwards (the fp32 copy is now canonical).
+    /// </summary>
+    private void DequantizeStreamingInt8()
+    {
+        var q = StreamingInt8;
+        if (q is null) return;
+        Vector<T> fresh;
+        if (typeof(T) == typeof(float))
+        {
+            var arr = new float[Length];
+            for (int r = 0; r < q.Rows; r++)
+            {
+                float s = q.Scales[r];
+                int baseI = r * q.K;
+                for (int j = 0; j < q.K; j++) arr[baseI + j] = q.Data[baseI + j] * s;
+            }
+            // arr is [out,in]; transpose to the logical [in,out] if the store transposed it.
+            if (q.TransposedFromLogical) arr = TransposeRowMajorBack(arr, _shape[0], _shape[1]);
+            fresh = Vector<T>.WrapMemory((T[])(object)arr);
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            var arr = new double[Length];
+            for (int r = 0; r < q.Rows; r++)
+            {
+                double s = q.Scales[r];
+                int baseI = r * q.K;
+                for (int j = 0; j < q.K; j++) arr[baseI + j] = q.Data[baseI + j] * s;
+            }
+            if (q.TransposedFromLogical) arr = TransposeRowMajorBack(arr, _shape[0], _shape[1]);
+            fresh = Vector<T>.WrapMemory((T[])(object)arr);
+        }
+        else
+        {
+            throw new NotSupportedException($"int8 streaming weight dequant supports float/double, not {typeof(T).Name}.");
+        }
+        StreamingInt8 = null;
+        var old = _storage;
+        _data = fresh;
+        _storage = new TensorStorage<T>(_data);
+        old.Release();
+    }
+
+    // Inverse of the store transpose: takes the stored [cols, rows] (= [out, in]) buffer and
+    // produces the logical [rows, cols] (= [in, out]). dst[i*cols+j] = src[j*rows+i].
+    private static float[] TransposeRowMajorBack(float[] storedTransposed, int rows, int cols)
+    {
+        var dst = new float[storedTransposed.Length];
+        for (int i = 0; i < rows; i++)
+            for (int j = 0; j < cols; j++)
+                dst[i * cols + j] = storedTransposed[j * rows + i];
+        return dst;
+    }
+    private static double[] TransposeRowMajorBack(double[] storedTransposed, int rows, int cols)
+    {
+        var dst = new double[storedTransposed.Length];
+        for (int i = 0; i < rows; i++)
+            for (int j = 0; j < cols; j++)
+                dst[i * cols + j] = storedTransposed[j * rows + i];
+        return dst;
+    }
+
+    /// <summary>
+    /// When this tensor's <see cref="_data"/> aliases a read-only memory-mapped slice of
+    /// the streaming backing file (zero-copy materialization), this owns the mapping and
+    /// must be disposed the instant the storage is replaced or dropped — otherwise the
+    /// mapping (and its file handle) outlives the alias. Null for normal heap-backed
+    /// storage. Disposed (and nulled) by <see cref="DisposeStreamingMmapOwner"/>, which
+    /// every storage-swap path calls before installing the new <see cref="_data"/>.
+    /// </summary>
+    private IDisposable? _streamingMmapOwner;
+
+    /// <summary>
+    /// Releases the zero-copy mmap mapping (if any) backing the current <see cref="_data"/>.
+    /// Idempotent. MUST be called by any path that replaces or drops <see cref="_data"/>
+    /// so a stale mapping never outlives the alias that read from it.
+    /// </summary>
+    private void DisposeStreamingMmapOwner()
+    {
+        var owner = _streamingMmapOwner;
+        if (owner is null) return;
+        _streamingMmapOwner = null;
+        owner.Dispose();
+    }
+
+    /// <summary>
+    /// Installs <paramref name="aliased"/> (which must wrap a read-only memory-mapped
+    /// region owned by <paramref name="owner"/>) as this tensor's storage WITHOUT copying.
+    /// Used by the streaming pool's zero-copy materialization path: instead of paging the
+    /// weight's bytes into a fresh array, the tensor aliases the backing-file pages directly
+    /// and the OS page cache manages residency. <paramref name="owner"/> is disposed when
+    /// the storage is next dropped/replaced (see <see cref="DisposeStreamingMmapOwner"/>).
+    ///
+    /// <para>READ-ONLY: the mapping is read-only; the caller guarantees nothing writes to
+    /// this tensor while aliased (inference / forward-read only). A write would fault.</para>
+    /// </summary>
+    internal void AliasStorageFromMmap(Vector<T> aliased, IDisposable owner)
+    {
+        if (aliased is null) throw new ArgumentNullException(nameof(aliased));
+        if (owner is null) throw new ArgumentNullException(nameof(owner));
+        if (!IsContiguous || _storageOffset != 0 || IsView)
+            throw new InvalidOperationException(
+                "Zero-copy streaming alias requires contiguous, non-view, zero-offset tensors.");
+
+        // CodeRabbit PR #604: the mmap owner now lives at TensorStorage scope,
+        // not on this individual tensor. That ties the mapping's lifetime to
+        // the shared storage's refcount, so a view (Reshape / Transpose) or
+        // a RebindStorageFrom target that outlives this tensor still keeps
+        // the mapping alive until ITS release. The storage also gates write
+        // paths (AsWritableSpan / AsMemory / GetDataArray) with a clear
+        // InvalidOperationException instead of the write silently faulting
+        // in the read-only mapped pages.
+        DisposeStreamingMmapOwner(); // back-compat no-op once _streamingMmapOwner is null
+        var oldStorage = _storage;
+        _data = aliased;
+        var newStorage = new TensorStorage<T>(_data);
+        newStorage.AttachMmapOwner(owner); // attach BEFORE making the storage visible to anyone else
+        _storage = newStorage;
+        oldStorage.Release();
+    }
+
+    /// <summary>
     /// Physical memory layout of this tensor's data. Default
     /// <see cref="TensorLayout.Nchw"/> (standard row-major). The
     /// channel-packed variants (<see cref="TensorLayout.Nchwc8"/>,
@@ -266,6 +440,11 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
         // throw). Abandon it for GC and swap in fresh empty storage.
         // Note: do NOT call Release on the claimed storage — refcount
         // is already 0, Release would underflow.
+        // If this tensor was aliasing a zero-copy mmap slice, the mapping is no
+        // longer referenced once storage is dropped — release it now.
+        DisposeStreamingMmapOwner();
+        // Drop any no-upcast int8 weight too — the pool holds the canonical bytes.
+        StreamingInt8 = null;
         _data = Vector<T>.Empty();
         _storage = new TensorStorage<T>(_data);
         return true;
@@ -299,28 +478,116 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
             throw new InvalidOperationException(
                 "Streaming restore requires contiguous, non-view, zero-offset tensors.");
 
-        // Use the typed-fast-path size table rather than Marshal.SizeOf<T>:
-        // the latter throws ArgumentException for non-blittable types
-        // (Complex, Multivector) with a confusing native-interop message.
-        // ElementSizeForStreaming throws NotSupportedException with a
-        // clear "use a supported element type" message instead, matching
-        // WeightRegistry.SerializeToBytes' error contract.
-        int elementSize = ElementSizeForStreaming();
-        long expectedBytes = (long)Length * elementSize;
-        if (bytes.Length != expectedBytes)
-            throw new ArgumentException(
-                $"Streaming restore: buffer length {bytes.Length} does not match " +
-                $"expected {expectedBytes} bytes (Length={Length} × element size={elementSize}).");
+        Vector<T> fresh;
+        // bf16-encoded store (StreamingEncoding.Bf16): the backing bytes are
+        // 2-per-element bf16; widen them back to T (float/double) here. The pool is
+        // byte-agnostic, so the 2x-smaller bytes flowed through register/evict/
+        // rehydrate transparently — only this restore boundary knows to widen.
+        if (StreamingStoreEncoding == StreamingEncoding.Bf16)
+        {
+            long expectedBf16 = (long)Length * StreamingStoreCodec.Bf16ElementSize;
+            if (bytes.Length != expectedBf16)
+                throw new ArgumentException(
+                    $"Streaming restore (bf16): buffer length {bytes.Length} does not match " +
+                    $"expected {expectedBf16} bytes (Length={Length} × 2).");
+            if (typeof(T) == typeof(float))
+            {
+                var arr = new float[Length];
+                StreamingStoreCodec.DecodeFloat(bytes, arr);
+                fresh = Vector<T>.WrapMemory((T[])(object)arr);
+            }
+            else if (typeof(T) == typeof(double))
+            {
+                var arr = new double[Length];
+                StreamingStoreCodec.DecodeDouble(bytes, arr);
+                fresh = Vector<T>.WrapMemory((T[])(object)arr);
+            }
+            else
+            {
+                throw new NotSupportedException(
+                    $"bf16 streaming store is only supported for float/double, not {typeof(T).Name}.");
+            }
+        }
+        else if (StreamingStoreEncoding == StreamingEncoding.Int8)
+        {
+            // int8-encoded store: per-row [int32 rows][rows × fp32 scale][int8 data]; dequant back to T.
+            long expectedInt8 = StreamingStoreCodec.Int8BufferBytes(Length, Int8QuantRows);
+            if (bytes.Length != expectedInt8)
+                throw new ArgumentException(
+                    $"Streaming restore (int8): buffer length {bytes.Length} does not match " +
+                    $"expected {expectedInt8} bytes (header {StreamingStoreCodec.Int8HeaderBytes(Int8QuantRows)} + Length={Length}).");
+            // For a 2-D weight the store is the TRANSPOSE [out,in]; dequant in stored order then
+            // transpose back to the logical [in,out] so the fp32 view matches the tensor shape.
+            bool transposed = Int8StoreTransposed;
+            if (typeof(T) == typeof(float))
+            {
+                var arr = new float[Length];
+                StreamingStoreCodec.DecodeInt8Float(bytes, arr);
+                if (transposed) arr = TransposeRowMajorBack(arr, _shape[0], _shape[1]);
+                fresh = Vector<T>.WrapMemory((T[])(object)arr);
+            }
+            else if (typeof(T) == typeof(double))
+            {
+                var arr = new double[Length];
+                StreamingStoreCodec.DecodeInt8Double(bytes, arr);
+                if (transposed) arr = TransposeRowMajorBack(arr, _shape[0], _shape[1]);
+                fresh = Vector<T>.WrapMemory((T[])(object)arr);
+            }
+            else
+            {
+                throw new NotSupportedException(
+                    $"int8 streaming store is only supported for float/double, not {typeof(T).Name}.");
+            }
+        }
+        else if (StreamingStoreEncoding == StreamingEncoding.Lossless)
+        {
+            // Lossless (byte-shuffle + LZ4): variable-size payload → exact bytes for T.
+            if (typeof(T) == typeof(float))
+            {
+                var arr = new float[Length];
+                StreamingStoreCodec.DecodeLosslessFloat(bytes, arr);
+                fresh = Vector<T>.WrapMemory((T[])(object)arr);
+            }
+            else if (typeof(T) == typeof(double))
+            {
+                var arr = new double[Length];
+                StreamingStoreCodec.DecodeLosslessDouble(bytes, arr);
+                fresh = Vector<T>.WrapMemory((T[])(object)arr);
+            }
+            else
+            {
+                throw new NotSupportedException(
+                    $"Lossless streaming store is only supported for float/double, not {typeof(T).Name}.");
+            }
+        }
+        else
+        {
+            // Use the typed-fast-path size table rather than Marshal.SizeOf<T>:
+            // the latter throws ArgumentException for non-blittable types
+            // (Complex, Multivector) with a confusing native-interop message.
+            // ElementSizeForStreaming throws NotSupportedException with a
+            // clear "use a supported element type" message instead, matching
+            // WeightRegistry.SerializeToBytes' error contract.
+            int elementSize = ElementSizeForStreaming();
+            long expectedBytes = (long)Length * elementSize;
+            if (bytes.Length != expectedBytes)
+                throw new ArgumentException(
+                    $"Streaming restore: buffer length {bytes.Length} does not match " +
+                    $"expected {expectedBytes} bytes (Length={Length} × element size={elementSize}).");
 
-        // Construct a typed backing array, deserialize bytes into it via
-        // typed fast paths — same set WeightRegistry.SerializeToBytes
-        // covers — then wrap it back into a Vector<T>. We can't use
-        // MemoryMarshal.Cast on Span<T> directly because T isn't
-        // constrained to struct on TensorBase, so we go through typed
-        // arrays via the (T[])(object)typed[] cast that's safe at runtime
-        // when typeof(T) matches.
-        var fresh = DeserializeToVector(bytes, Length);
+            // Construct a typed backing array, deserialize bytes into it via
+            // typed fast paths — same set WeightRegistry.SerializeToBytes
+            // covers — then wrap it back into a Vector<T>. We can't use
+            // MemoryMarshal.Cast on Span<T> directly because T isn't
+            // constrained to struct on TensorBase, so we go through typed
+            // arrays via the (T[])(object)typed[] cast that's safe at runtime
+            // when typeof(T) matches.
+            fresh = DeserializeToVector(bytes, Length);
+        }
 
+        // Re-materializing as a heap copy supersedes any zero-copy mmap alias;
+        // release the mapping before swapping in the owned bytes.
+        DisposeStreamingMmapOwner();
         var oldStorage = _storage;
         _data = fresh;
         _storage = new TensorStorage<T>(_data);
@@ -798,6 +1065,15 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
     internal bool StreamingDropDeferred { get; set; }
 
     /// <summary>
+    /// How this tensor's bytes are encoded in the streaming pool's backing store:
+    /// 0 = native (fp32/fp64/etc. raw), 1 = bf16 (2x smaller, decoded back to T on
+    /// restore). Set by <see cref="WeightRegistry.RegisterWeight{T}"/> from the
+    /// resolved <see cref="StreamingStoreDtype"/> policy; read by
+    /// <see cref="RestoreStorageFromBytes"/> so it knows whether to widen bf16 → T.
+    /// </summary>
+    internal byte StreamingStoreEncoding { get; set; }
+
+    /// <summary>
     /// GPU offload allocation handle when <see cref="Lifetime"/> is
     /// <see cref="WeightLifetime.GpuOffload"/> or
     /// <see cref="WeightLifetime.GpuManaged"/>. Owned by
@@ -887,6 +1163,20 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
     /// Gets the rank (number of dimensions) of the tensor.
     /// </summary>
     public int Rank => _shape.Length;
+
+    /// <summary>
+    /// Number of per-row scales in the int8 streaming store = output channels. A 2-D Linear
+    /// weight is logically [in, out]; it's stored TRANSPOSED as [out, in] so it feeds the int8
+    /// GEMM directly, so the row/scale count is the OUTPUT dim (<c>_shape[1]</c>). Higher-rank
+    /// weights store per-leading-dim (no transpose); vectors quantize per-tensor (1 row). Both
+    /// the encode (WeightRegistry) and decode (RestoreStorageFromBytes) sides read this from the
+    /// same shape, so the scale layout is consistent.
+    /// </summary>
+    internal int Int8QuantRows => _shape.Length == 2 ? _shape[1] : (_shape.Length > 2 ? _shape[0] : 1);
+
+    /// <summary>True when the int8 store transposes this weight (a 2-D Linear weight [in,out]
+    /// stored as [out,in]); the decode/dequant paths must transpose back to the logical shape.</summary>
+    internal bool Int8StoreTransposed => _shape.Length == 2;
 
     /// <summary>
     /// Gets the pre-computed strides for each dimension as a read-only span.
@@ -1351,10 +1641,16 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
         if (Lifetime == WeightLifetime.Streaming
             && StreamingPoolHandle >= 0
             && _data.Length != Length
+            && StreamingInt8 is null            // an already-attached int8 weight is handled below
             && this is Tensor<T> streamedWeight)
         {
             WeightRegistry.Materialize(streamedWeight);
         }
+        // A no-upcast int8 weight (just attached by Materialize, or earlier) has empty _data;
+        // a span/indexer — NOT the int8 GEMM fast path, which reads StreamingInt8 directly —
+        // is asking for an fp32 view, so dequantize it now.
+        if (StreamingInt8 is not null && _data.Length != Length)
+            DequantizeStreamingInt8();
     }
 
     /// <summary>
@@ -2025,6 +2321,9 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
             _gpuMaterializerCallback = null;
         }
 
+        // Release any zero-copy mmap mapping before tearing down storage.
+        DisposeStreamingMmapOwner();
+        StreamingInt8 = null;
         _storage.Release();
         if (_ownsGpuBuffer && _gpuBuffer is IDisposable disposableBuffer)
         {

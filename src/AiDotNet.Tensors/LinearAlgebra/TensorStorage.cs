@@ -1,4 +1,6 @@
+using System;
 using System.Runtime.CompilerServices;
+using System.Threading;
 
 namespace AiDotNet.Tensors.LinearAlgebra;
 
@@ -18,6 +20,34 @@ internal sealed class TensorStorage<T>
 {
     private readonly Vector<T> _data;
     private int _refCount;
+
+    // Streaming-pool zero-copy mmap alias (PR #604, CodeRabbit-Major): when
+    // WeightRegistry.TryAliasZeroCopy installs an MmapTensorMemoryManager as
+    // this storage's backing Vector, the mapping HAS to outlive every view /
+    // RebindStorageFrom that shares the storage — those views can outlive the
+    // tensor that installed the alias. So the owner lives at storage scope,
+    // disposed exactly when the last ref releases (or an explicit
+    // TryClaimExclusive succeeds). Also exposes IsReadOnlyMapped so the
+    // write paths (AsWritableSpan / AsWritableMemory / GetDataArray) can
+    // throw a clear error instead of faulting in the mapped pages.
+    private IDisposable? _mmapOwner;
+    internal bool IsReadOnlyMapped => Volatile.Read(ref _mmapOwner) != null;
+
+    /// <summary>
+    /// Attaches an IDisposable that will be disposed when this storage's
+    /// refcount finally reaches 0. Used by the streaming-pool zero-copy
+    /// alias to tie the lifetime of the underlying memory-mapped file to
+    /// the lifetime of the shared storage (not the lifetime of any single
+    /// tensor that holds a ref). Must be called BEFORE the alias is exposed
+    /// to other tensors.
+    /// </summary>
+    internal void AttachMmapOwner(IDisposable owner)
+    {
+        if (owner is null) throw new ArgumentNullException(nameof(owner));
+        if (Interlocked.CompareExchange(ref _mmapOwner, owner, null) != null)
+            throw new InvalidOperationException(
+                "TensorStorage already has an attached mmap owner; replacing it would leak the prior mapping.");
+    }
 
     /// <summary>
     /// Creates a new storage wrapping an existing Vector (zero-copy).
@@ -85,8 +115,15 @@ internal sealed class TensorStorage<T>
             Interlocked.Increment(ref _refCount);
             throw new InvalidOperationException("TensorStorage released more times than it was acquired.");
         }
-        // When refCount reaches 0, storage can be reclaimed.
-        // Future: integrate with TensorAllocator pool return.
+        if (newCount == 0)
+        {
+            // Last ref out — dispose the streaming-pool mmap owner (if any) so
+            // the underlying mapping doesn't outlive its last viewer.
+            // Interlocked.Exchange so a concurrent (broken) double-release
+            // can't double-dispose.
+            var owner = Interlocked.Exchange(ref _mmapOwner, null);
+            owner?.Dispose();
+        }
     }
 
     /// <summary>
@@ -114,7 +151,12 @@ internal sealed class TensorStorage<T>
     internal bool TryClaimExclusive()
     {
         // CAS 1 → 0. Succeeds only when no other ref exists.
-        return Interlocked.CompareExchange(ref _refCount, 0, 1) == 1;
+        if (Interlocked.CompareExchange(ref _refCount, 0, 1) != 1) return false;
+        // Sole-claim succeeded → no other ref exists → dispose the mmap
+        // owner too. Caller is about to abandon this storage.
+        var owner = Interlocked.Exchange(ref _mmapOwner, null);
+        owner?.Dispose();
+        return true;
     }
 
     /// <summary>
@@ -127,19 +169,42 @@ internal sealed class TensorStorage<T>
     /// Gets the underlying data as a writable span.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    internal Span<T> AsWritableSpan() => _data.AsWritableSpan();
+    internal Span<T> AsWritableSpan()
+    {
+        ThrowIfReadOnlyMapped();
+        return _data.AsWritableSpan();
+    }
 
     /// <summary>
     /// Gets the underlying data as Memory&lt;T&gt; for pinning/GPU transfer.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    internal Memory<T> AsMemory() => _data.AsWritableMemory();
+    internal Memory<T> AsMemory()
+    {
+        ThrowIfReadOnlyMapped();
+        return _data.AsWritableMemory();
+    }
 
     /// <summary>
     /// Gets the raw backing array. Use with care — bypasses safety checks.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    internal T[] GetDataArray() => _data.GetDataArray();
+    internal T[] GetDataArray()
+    {
+        ThrowIfReadOnlyMapped();
+        return _data.GetDataArray();
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void ThrowIfReadOnlyMapped()
+    {
+        if (IsReadOnlyMapped)
+            throw new InvalidOperationException(
+                "Cannot obtain a writable view of TensorStorage: this storage aliases a read-only " +
+                "memory-mapped weight (streaming-pool zero-copy materialization). Writing into the " +
+                "mapped pages would fault. Call DropStorageForStreaming / Rebind into fresh storage " +
+                "before mutating, or stage the write in a separate tensor.");
+    }
 
     /// <summary>
     /// Gets the underlying Vector for compatibility with existing code.
