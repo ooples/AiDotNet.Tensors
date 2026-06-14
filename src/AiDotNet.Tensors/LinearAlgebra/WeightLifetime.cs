@@ -52,6 +52,35 @@ public enum WeightLifetime
 }
 
 /// <summary>
+/// Precision the streaming pool stores weight bytes at on its backing store.
+/// bf16 halves disk + resident I/O at ~0.17% RMS error; because the pool's
+/// stored copy IS the canonical weight, bf16 during TRAINING effectively makes
+/// the master weights bf16 (which mixed-precision training avoids — it keeps
+/// fp32 masters), so the safe default is context-aware.
+/// </summary>
+public enum StreamingStoreDtype
+{
+    /// <summary>Context-aware default: bf16 in inference/eval (read-only weights →
+    /// a one-time quantization, always safe, 2x), full precision during training
+    /// (preserve fp32/fp64 masters so small updates aren't lost).</summary>
+    Auto = 0,
+
+    /// <summary>Always store at the weight's native precision (fp32/fp64). No
+    /// quantization, no I/O reduction — the pre-bf16 behaviour.</summary>
+    FullPrecision = 1,
+
+    /// <summary>Always store bf16 with round-to-nearest-even. 2x I/O. Safe for
+    /// inference; for training it's bf16 masters (deterministic-rounding bias on
+    /// small updates) — prefer <see cref="Bf16Stochastic"/> when training.</summary>
+    Bf16 = 2,
+
+    /// <summary>Always store bf16 with STOCHASTIC rounding. 2x I/O, and the
+    /// rounding is unbiased so training stays correct in regimes that tolerate
+    /// bf16 masters (large-batch pretraining). Opt-in for training.</summary>
+    Bf16Stochastic = 3,
+}
+
+/// <summary>
 /// Per-engine options for the GPU offload / streaming subsystem. Plumbs
 /// through every direct-GPU backend (CUDA / HIP / Metal / OpenCL / Vulkan /
 /// WebGPU) so a single config struct controls the placement contract.
@@ -126,6 +155,17 @@ public sealed class GpuOffloadOptions
     /// </para>
     /// </summary>
     public bool EnableCompression { get; set; } = false;
+
+    /// <summary>
+    /// Precision the streaming pool stores weight bytes at. Default
+    /// <see cref="StreamingStoreDtype.Auto"/> — bf16 (2x I/O at ~0.17% RMS error)
+    /// in inference/eval where it's a one-time, always-safe quantization, and
+    /// full precision during training to preserve fp32/fp64 master weights.
+    /// Set to <see cref="StreamingStoreDtype.Bf16Stochastic"/> to also get the
+    /// 2x during training in regimes that tolerate bf16 masters, or
+    /// <see cref="StreamingStoreDtype.FullPrecision"/> to disable entirely.
+    /// </summary>
+    public StreamingStoreDtype StreamingStoreDtype { get; set; } = StreamingStoreDtype.Auto;
 
     /// <summary>
     /// Number of layers to prefetch ahead of the current Forward / Backward
