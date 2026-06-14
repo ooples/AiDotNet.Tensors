@@ -354,11 +354,11 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
                 "Streaming restore requires contiguous, non-view, zero-offset tensors.");
 
         Vector<T> fresh;
-        // bf16-encoded store (StreamingStoreEncoding == 1): the backing bytes are
+        // bf16-encoded store (StreamingEncoding.Bf16): the backing bytes are
         // 2-per-element bf16; widen them back to T (float/double) here. The pool is
         // byte-agnostic, so the 2x-smaller bytes flowed through register/evict/
         // rehydrate transparently — only this restore boundary knows to widen.
-        if (StreamingStoreEncoding == 1)
+        if (StreamingStoreEncoding == StreamingEncoding.Bf16)
         {
             long expectedBf16 = (long)Length * StreamingStoreCodec.Bf16ElementSize;
             if (bytes.Length != expectedBf16)
@@ -383,7 +383,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
                     $"bf16 streaming store is only supported for float/double, not {typeof(T).Name}.");
             }
         }
-        else if (StreamingStoreEncoding == 2)
+        else if (StreamingStoreEncoding == StreamingEncoding.Int8)
         {
             // int8-encoded store: 4-byte scale + 1 byte/element; dequant back to T.
             long expectedInt8 = StreamingStoreCodec.Int8BufferBytes(Length);
@@ -409,7 +409,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
                     $"int8 streaming store is only supported for float/double, not {typeof(T).Name}.");
             }
         }
-        else if (StreamingStoreEncoding == 3)
+        else if (StreamingStoreEncoding == StreamingEncoding.Lossless)
         {
             // Lossless (byte-shuffle + LZ4): variable-size payload → exact bytes for T.
             if (typeof(T) == typeof(float))

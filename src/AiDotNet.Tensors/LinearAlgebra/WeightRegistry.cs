@@ -159,7 +159,7 @@ public static class WeightRegistry
                         // restore boundary widens bf16 → T (RestoreStorageFromBytes).
                         var (encoding, stochastic) = ResolveStoreEncoding<T>();
                         byte[] bytes;
-                        if (encoding == 3)
+                        if (encoding == StreamingEncoding.Lossless)
                         {
                             // Lossless (byte-shuffle + LZ4) is variable-size — compress
                             // first, then register exactly the produced bytes.
@@ -169,8 +169,8 @@ public static class WeightRegistry
                         {
                             int byteCount = encoding switch
                             {
-                                1 => CheckedBf16ByteCount(weight.Length),
-                                2 => CheckedInt8ByteCount(weight.Length),
+                                StreamingEncoding.Bf16 => CheckedBf16ByteCount(weight.Length),
+                                StreamingEncoding.Int8 => CheckedInt8ByteCount(weight.Length),
                                 _ => CheckedStreamingByteCount<T>(weight.Length),
                             };
                             bytes = new byte[byteCount];
@@ -653,20 +653,22 @@ public static class WeightRegistry
     /// </summary>
     private static (byte encoding, bool stochastic) ResolveStoreEncoding<T>()
     {
-        if (typeof(T) != typeof(float) && typeof(T) != typeof(double)) return (0, false);
+        if (typeof(T) != typeof(float) && typeof(T) != typeof(double)) return (StreamingEncoding.Native, false);
         switch (_options.StreamingStoreDtype)
         {
-            case StreamingStoreDtype.FullPrecision: return (0, false);
-            case StreamingStoreDtype.Bf16: return (1, false);
-            case StreamingStoreDtype.Bf16Stochastic: return (1, true);
-            case StreamingStoreDtype.Int8: return (2, false); // explicit opt-in (Auto never picks int8)
-            case StreamingStoreDtype.Lossless: return (3, false); // exact, variable-size; explicit opt-in
+            case StreamingStoreDtype.FullPrecision: return (StreamingEncoding.Native, false);
+            case StreamingStoreDtype.Bf16: return (StreamingEncoding.Bf16, false);
+            case StreamingStoreDtype.Bf16Stochastic: return (StreamingEncoding.Bf16, true);
+            case StreamingStoreDtype.Int8: return (StreamingEncoding.Int8, false); // explicit opt-in (Auto never picks int8)
+            case StreamingStoreDtype.Lossless: return (StreamingEncoding.Lossless, false); // exact, variable-size; explicit opt-in
             case StreamingStoreDtype.Auto:
             default:
                 // bf16 ONLY when we KNOW it's inference; training or unknown →
                 // full precision so we never silently make the masters bf16. (int8
                 // is too lossy to ever be an automatic choice.)
-                return _streamingTrainingMode == false ? ((byte)1, false) : ((byte)0, false);
+                return _streamingTrainingMode == false
+                    ? (StreamingEncoding.Bf16, false)
+                    : (StreamingEncoding.Native, false);
         }
     }
 
@@ -775,11 +777,11 @@ public static class WeightRegistry
     /// at the bottom — there is intentionally no generic fallback because a
     /// byte-by-byte memcpy would silently lose data for non-blittable types.
     /// </summary>
-    private static void SerializeToBytes<T>(Tensor<T> tensor, byte[] dst, byte encoding = 0, bool stochastic = false)
+    private static void SerializeToBytes<T>(Tensor<T> tensor, byte[] dst, byte encoding = StreamingEncoding.Native, bool stochastic = false)
     {
-        // bf16 store (encoding == 1): narrow float/double → 2-byte bf16. dst is
+        // bf16 store (StreamingEncoding.Bf16): narrow float/double → 2-byte bf16. dst is
         // sized to Length*2 by the caller (CheckedBf16ByteCount).
-        if (encoding == 1)
+        if (encoding == StreamingEncoding.Bf16)
         {
             if (typeof(T) == typeof(float))
             {
@@ -796,9 +798,9 @@ public static class WeightRegistry
             throw new NotSupportedException(
                 $"bf16 streaming store is only supported for float/double, not {typeof(T).Name}.");
         }
-        // int8 store (encoding == 2): per-tensor symmetric quantization. dst is sized
-        // to Int8BufferBytes(Length) by the caller (CheckedInt8ByteCount).
-        if (encoding == 2)
+        // int8 store (StreamingEncoding.Int8): per-tensor symmetric quantization. dst
+        // is sized to Int8BufferBytes(Length) by the caller (CheckedInt8ByteCount).
+        if (encoding == StreamingEncoding.Int8)
         {
             if (typeof(T) == typeof(float))
             {
@@ -951,7 +953,7 @@ public static class WeightRegistry
         // file never rewrites an entry's slice, so the offset stays valid for the alias's
         // lifetime even under concurrent pool activity. Falls through to the copy path if
         // the slice isn't aliasable or the mapping can't be opened.
-        if (zeroCopyEnabled && inferenceMode && weight.StreamingStoreEncoding == 0
+        if (zeroCopyEnabled && inferenceMode && weight.StreamingStoreEncoding == StreamingEncoding.Native
             && pool.TryGetZeroCopyByteRange(weight.StreamingPoolHandle, out string zcPath, out long zcOffset, out int zcBytes)
             && TryAliasZeroCopy(weight, zcPath, zcOffset, zcBytes))
         {
