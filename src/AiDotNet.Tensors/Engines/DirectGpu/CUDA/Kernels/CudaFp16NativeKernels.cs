@@ -88,6 +88,26 @@ extern ""C"" __global__ __launch_bounds__(256) void fp16_gelu_native(
     float r = 0.5f * x * (1.0f + tanhf(inner));
     output[idx] = f2h(r);
 }
+
+// FP16-NATIVE ReLU: reads FP16 directly, max(x,0) in FP32, writes FP16.
+extern ""C"" __global__ __launch_bounds__(256) void fp16_relu_native(
+    const unsigned short* __restrict__ input, unsigned short* __restrict__ output, int size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    float x = h2f(input[idx]);
+    output[idx] = f2h(x > 0.0f ? x : 0.0f);
+}
+
+// FP16-NATIVE residual add: out = a + b (same shape), reads FP16 directly, FP32 accumulate, writes FP16.
+extern ""C"" __global__ __launch_bounds__(256) void fp16_add_native(
+    const unsigned short* __restrict__ a, const unsigned short* __restrict__ b,
+    unsigned short* __restrict__ output, int size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    output[idx] = f2h(h2f(a[idx]) + h2f(b[idx]));
+}
 ";
     }
 
@@ -95,6 +115,8 @@ extern ""C"" __global__ __launch_bounds__(256) void fp16_gelu_native(
     {
         "convert_fp32_to_fp16_native",
         "convert_fp16_to_fp32_native",
-        "fp16_gelu_native"
+        "fp16_gelu_native",
+        "fp16_relu_native",
+        "fp16_add_native"
     };
 }
