@@ -146,8 +146,24 @@ internal static class StreamingStoreCodec
     /// <c>Int8BufferBytes(src.Length)</c>.</summary>
     internal static void EncodeInt8Float(ReadOnlySpan<float> src, Span<byte> dst)
     {
+        // Reject NaN/Infinity at the boundary instead of producing a poisoned
+        // amax (NaN propagates through `Math.Abs(NaN) > amax` → false on
+        // first occurrence, then `1.0 / scale` yields ±Infinity, then
+        // `(int)Math.Round(±Inf)` produces an indeterminate sentinel value
+        // (int.MinValue on .NET, signaling NaN-cast OF an architecture-
+        // dependent value on net471). Failing fast with a clear contract
+        // error keeps the streaming store deterministic.
         float amax = 0f;
-        for (int i = 0; i < src.Length; i++) { float a = Math.Abs(src[i]); if (a > amax) amax = a; }
+        for (int i = 0; i < src.Length; i++)
+        {
+            float v = src[i];
+            if (float.IsNaN(v) || float.IsInfinity(v))
+                throw new ArgumentException(
+                    $"int8 streaming-store encoder cannot encode non-finite value at index {i} (got {v}).",
+                    nameof(src));
+            float a = Math.Abs(v);
+            if (a > amax) amax = a;
+        }
         float scale = amax > 0f ? amax / 127f : 1f;
         WriteScale(dst, scale);
         double inv = 1.0 / scale;
@@ -157,8 +173,18 @@ internal static class StreamingStoreCodec
     /// <summary>fp64 → int8 (+scale).</summary>
     internal static void EncodeInt8Double(ReadOnlySpan<double> src, Span<byte> dst)
     {
+        // See EncodeInt8Float for the rationale on the non-finite guard.
         double amax = 0.0;
-        for (int i = 0; i < src.Length; i++) { double a = Math.Abs(src[i]); if (a > amax) amax = a; }
+        for (int i = 0; i < src.Length; i++)
+        {
+            double v = src[i];
+            if (double.IsNaN(v) || double.IsInfinity(v))
+                throw new ArgumentException(
+                    $"int8 streaming-store encoder cannot encode non-finite value at index {i} (got {v}).",
+                    nameof(src));
+            double a = Math.Abs(v);
+            if (a > amax) amax = a;
+        }
         float scale = amax > 0.0 ? (float)(amax / 127.0) : 1f;
         WriteScale(dst, scale);
         double inv = 1.0 / scale;
