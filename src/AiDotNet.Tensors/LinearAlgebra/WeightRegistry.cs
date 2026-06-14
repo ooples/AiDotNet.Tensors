@@ -1528,6 +1528,13 @@ public static class WeightRegistry
             _offloadAllocator = null;
             _ownerByHandle.Clear();
             _options = new GpuOffloadOptions();
+            // CodeRabbit #604: clear the training-mode hint too. Otherwise a
+            // prior `false` (set by the last model's SetTrainingMode) persists
+            // process-wide and silently biases StreamingStoreDtype.Auto toward
+            // bf16 on the next model that hasn't yet called SetTrainingMode —
+            // the policy is documented as "training or unknown → full
+            // precision", so the safe-unknown state has to mean null here.
+            _streamingTrainingMode = null;
         }
     }
 
