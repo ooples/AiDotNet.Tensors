@@ -113,12 +113,20 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
             throw new InvalidOperationException(
                 "Zero-copy streaming alias requires contiguous, non-view, zero-offset tensors.");
 
-        // Drop any previous mapping before installing the new one.
-        DisposeStreamingMmapOwner();
+        // CodeRabbit PR #604: the mmap owner now lives at TensorStorage scope,
+        // not on this individual tensor. That ties the mapping's lifetime to
+        // the shared storage's refcount, so a view (Reshape / Transpose) or
+        // a RebindStorageFrom target that outlives this tensor still keeps
+        // the mapping alive until ITS release. The storage also gates write
+        // paths (AsWritableSpan / AsMemory / GetDataArray) with a clear
+        // InvalidOperationException instead of the write silently faulting
+        // in the read-only mapped pages.
+        DisposeStreamingMmapOwner(); // back-compat no-op once _streamingMmapOwner is null
         var oldStorage = _storage;
         _data = aliased;
-        _storage = new TensorStorage<T>(_data);
-        _streamingMmapOwner = owner;
+        var newStorage = new TensorStorage<T>(_data);
+        newStorage.AttachMmapOwner(owner); // attach BEFORE making the storage visible to anyone else
+        _storage = newStorage;
         oldStorage.Release();
     }
 
