@@ -176,7 +176,7 @@ public class StreamingStoreCodecTests
 
         // LOSSLESS → must be BIT-exact (not just close).
         for (int i = 0; i < n; i++)
-            Assert.Equal(BitConverter.SingleToInt32Bits(src[i]), BitConverter.SingleToInt32Bits(dec[i]));
+            Assert.Equal(BitExactHelpers.SingleBits(src[i]), BitExactHelpers.SingleBits(dec[i]));
 
         // And for a non-trivial tensor it should actually shrink (byte-shuffle exposes
         // the structured exponent bytes to LZ4). Tiny tensors may not — only assert on big.

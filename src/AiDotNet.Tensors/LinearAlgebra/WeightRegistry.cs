@@ -601,6 +601,51 @@ public static class WeightRegistry
     }
 
     /// <summary>
+    /// Attempts to alias <paramref name="weight"/>'s storage onto a read-only memory-mapped
+    /// slice of the backing file (zero-copy materialization). Returns false (caller falls
+    /// back to the copy path) if the slice doesn't match the tensor's native element layout
+    /// or the mapping can't be opened. Only valid for natively-stored, read-only weights —
+    /// the caller gates on encoding + inference mode.
+    /// </summary>
+    private static bool TryAliasZeroCopy<T>(Tensor<T> weight, string path, long fileOffset, int byteLength)
+    {
+        int elemSize = NativeStreamingElementSize<T>();
+        if (elemSize <= 0) return false;
+        // The slice must hold exactly Length native elements — no scale prefix, no
+        // compression. A mismatch means the entry isn't natively stored; don't alias.
+        if ((long)weight.Length * elemSize != byteLength) return false;
+
+        MmapTensorMemoryManager<T>? manager = null;
+        try
+        {
+            manager = new MmapTensorMemoryManager<T>(path, fileOffset, byteLength, weight.Length);
+            var aliased = Vector<T>.WrapMemory(manager.Memory);
+            weight.AliasStorageFromMmap(aliased, manager); // tensor owns the mapping now
+            return true;
+        }
+        catch
+        {
+            // Any failure (file locked, OOM mapping address space, etc.) → fall back to
+            // the proven copy path. Dispose the half-built mapping so no handle leaks.
+            // MemoryManager<T>.Dispose() is an explicit interface impl — cast to reach it.
+            ((IDisposable?)manager)?.Dispose();
+            return false;
+        }
+    }
+
+    /// <summary>Byte size of one native element of <typeparamref name="T"/> for the
+    /// zero-copy path, or 0 for unsupported types. Matches the native (encoding 0)
+    /// branch of <c>SerializeToBytes</c>/<c>RestoreStorageFromBytes</c>.</summary>
+    private static int NativeStreamingElementSize<T>()
+    {
+        if (typeof(T) == typeof(float)) return sizeof(float);
+        if (typeof(T) == typeof(double)) return sizeof(double);
+        if (typeof(T) == typeof(int)) return sizeof(int);
+        if (typeof(T) == typeof(long)) return sizeof(long);
+        return 0;
+    }
+
+    /// <summary>
     /// Resolves the streaming-store encoding (1 = bf16, 0 = native) and rounding
     /// (stochastic) for type T from <see cref="GpuOffloadOptions.StreamingStoreDtype"/>
     /// and the execution-mode hint. Only float/double can be bf16-encoded; all other
@@ -890,10 +935,31 @@ public static class WeightRegistry
         //      DropStorageForStreaming's TryClaimExclusive guards
         //      against).
         StreamingTensorPool pool;
+        bool zeroCopyEnabled;
+        bool inferenceMode;
         lock (_lock)
         {
             pool = StreamingPoolUnlocked();
+            zeroCopyEnabled = _options.EnableZeroCopyMmapResidency;
+            inferenceMode = _streamingTrainingMode == false;
         }
+
+        // Zero-copy mmap fast path: alias the backing-file slice directly (no alloc, no
+        // copy) for a read-only, natively-stored, uncompressed weight. Gated to inference
+        // (the mapping is read-only — a weight update would fault) and native encoding (bf16/
+        // int8/lossless need a decode, which copies by definition). The append-only backing
+        // file never rewrites an entry's slice, so the offset stays valid for the alias's
+        // lifetime even under concurrent pool activity. Falls through to the copy path if
+        // the slice isn't aliasable or the mapping can't be opened.
+        if (zeroCopyEnabled && inferenceMode && weight.StreamingStoreEncoding == 0
+            && pool.TryGetZeroCopyByteRange(weight.StreamingPoolHandle, out string zcPath, out long zcOffset, out int zcBytes)
+            && TryAliasZeroCopy(weight, zcPath, zcOffset, zcBytes))
+        {
+            // The pool entry stays "paged out" (the OS page cache holds the bytes now), so
+            // there are no new owner-drops to drain from this path.
+            return;
+        }
+
         byte[] snapshot = pool.RehydrateInto(weight.StreamingPoolHandle);
         weight.RestoreStorageFromBytes(snapshot);
 

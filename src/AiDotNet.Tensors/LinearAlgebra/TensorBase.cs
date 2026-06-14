@@ -72,6 +72,57 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
     internal Vector<T> DataVector => _data;
 
     /// <summary>
+    /// When this tensor's <see cref="_data"/> aliases a read-only memory-mapped slice of
+    /// the streaming backing file (zero-copy materialization), this owns the mapping and
+    /// must be disposed the instant the storage is replaced or dropped — otherwise the
+    /// mapping (and its file handle) outlives the alias. Null for normal heap-backed
+    /// storage. Disposed (and nulled) by <see cref="DisposeStreamingMmapOwner"/>, which
+    /// every storage-swap path calls before installing the new <see cref="_data"/>.
+    /// </summary>
+    private IDisposable? _streamingMmapOwner;
+
+    /// <summary>
+    /// Releases the zero-copy mmap mapping (if any) backing the current <see cref="_data"/>.
+    /// Idempotent. MUST be called by any path that replaces or drops <see cref="_data"/>
+    /// so a stale mapping never outlives the alias that read from it.
+    /// </summary>
+    private void DisposeStreamingMmapOwner()
+    {
+        var owner = _streamingMmapOwner;
+        if (owner is null) return;
+        _streamingMmapOwner = null;
+        owner.Dispose();
+    }
+
+    /// <summary>
+    /// Installs <paramref name="aliased"/> (which must wrap a read-only memory-mapped
+    /// region owned by <paramref name="owner"/>) as this tensor's storage WITHOUT copying.
+    /// Used by the streaming pool's zero-copy materialization path: instead of paging the
+    /// weight's bytes into a fresh array, the tensor aliases the backing-file pages directly
+    /// and the OS page cache manages residency. <paramref name="owner"/> is disposed when
+    /// the storage is next dropped/replaced (see <see cref="DisposeStreamingMmapOwner"/>).
+    ///
+    /// <para>READ-ONLY: the mapping is read-only; the caller guarantees nothing writes to
+    /// this tensor while aliased (inference / forward-read only). A write would fault.</para>
+    /// </summary>
+    internal void AliasStorageFromMmap(Vector<T> aliased, IDisposable owner)
+    {
+        if (aliased is null) throw new ArgumentNullException(nameof(aliased));
+        if (owner is null) throw new ArgumentNullException(nameof(owner));
+        if (!IsContiguous || _storageOffset != 0 || IsView)
+            throw new InvalidOperationException(
+                "Zero-copy streaming alias requires contiguous, non-view, zero-offset tensors.");
+
+        // Drop any previous mapping before installing the new one.
+        DisposeStreamingMmapOwner();
+        var oldStorage = _storage;
+        _data = aliased;
+        _storage = new TensorStorage<T>(_data);
+        _streamingMmapOwner = owner;
+        oldStorage.Release();
+    }
+
+    /// <summary>
     /// Physical memory layout of this tensor's data. Default
     /// <see cref="TensorLayout.Nchw"/> (standard row-major). The
     /// channel-packed variants (<see cref="TensorLayout.Nchwc8"/>,
@@ -266,6 +317,9 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
         // throw). Abandon it for GC and swap in fresh empty storage.
         // Note: do NOT call Release on the claimed storage — refcount
         // is already 0, Release would underflow.
+        // If this tensor was aliasing a zero-copy mmap slice, the mapping is no
+        // longer referenced once storage is dropped — release it now.
+        DisposeStreamingMmapOwner();
         _data = Vector<T>.Empty();
         _storage = new TensorStorage<T>(_data);
         return true;
@@ -401,6 +455,9 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
             fresh = DeserializeToVector(bytes, Length);
         }
 
+        // Re-materializing as a heap copy supersedes any zero-copy mmap alias;
+        // release the mapping before swapping in the owned bytes.
+        DisposeStreamingMmapOwner();
         var oldStorage = _storage;
         _data = fresh;
         _storage = new TensorStorage<T>(_data);
@@ -2114,6 +2171,8 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
             _gpuMaterializerCallback = null;
         }
 
+        // Release any zero-copy mmap mapping before tearing down storage.
+        DisposeStreamingMmapOwner();
         _storage.Release();
         if (_ownsGpuBuffer && _gpuBuffer is IDisposable disposableBuffer)
         {

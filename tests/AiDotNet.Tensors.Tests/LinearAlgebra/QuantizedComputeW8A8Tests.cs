@@ -12,10 +12,8 @@ namespace AiDotNet.Tensors.Tests.LinearAlgebra;
 /// Quantized compute (lever 4 part 2) — a MEASUREMENT that decides the int8 compute
 /// path. Computing a GEMM directly on int8-stored weights (int8 weight × fp32 activation
 /// with per-row scales) is bit-for-bit equivalent to upcasting then doing fp32 GEMM
-/// (exact to float precision), BUT it is NOT faster — measured ~7x SLOWER at an FFN
-/// shape, because the inline int8→fp32 dequant costs more than the highly-optimized
-/// fp32 machine-code microkernel saves, and fp32 activations preclude a true int8×int8
-/// VNNI/AMX path.
+/// (exact to float precision), AND it is consistently FAST — so it pairs with the int8
+/// store to give 4x less I/O plus a fast GEMM at only the weight-quant error.
 ///
 /// Findings, from an APPLES-TO-APPLES benchmark (same shape, GFLOP/s, warmed). An
 /// earlier version compared at DIFFERENT shapes and drew the WRONG conclusions; fp32's
@@ -32,6 +30,9 @@ namespace AiDotNet.Tensors.Tests.LinearAlgebra;
 ///      future option; int8-weight is the win on commodity AVX2. Driver primitives:
 ///      SgemmWithInt8RowScaledCachedB (int8 weight) and SgemmA8W8RowScaledCachedB (W8A8).
 /// </summary>
+// The int8 GEMM driver primitives live in SimdGemm's NET5_0_OR_GREATER region (AVX2
+// intrinsics) — net471 has no such path, so this measurement only compiles/runs there.
+#if NET5_0_OR_GREATER
 public class QuantizedComputeW8A8Tests
 {
     private readonly ITestOutputHelper _out;
@@ -197,3 +198,4 @@ public class QuantizedComputeW8A8Tests
         Assert.True(w8a8Ms > 0);
     }
 }
+#endif

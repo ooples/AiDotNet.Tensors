@@ -898,8 +898,48 @@ public sealed class StreamingTensorPool : IDisposable
     // Caller holds _lock.
     private FileStream BackingFile()
         => _backingFile ??= new FileStream(
-            Path.Combine(_backingDir, "backing.bin"),
-            FileMode.Create, FileAccess.ReadWrite, FileShare.None);
+            BackingFilePath,
+            // FileShare.Read (not None) so a zero-copy reader can open a
+            // read-only memory-mapping of the same file concurrently with the
+            // pool's append handle. The pool stays the only WRITER (no other
+            // handle is granted write), so the append-only contract is intact.
+            FileMode.Create, FileAccess.ReadWrite, FileShare.Read);
+
+    // Absolute path of the single contiguous backing file. Stable for the
+    // pool's lifetime; used by the zero-copy mmap path.
+    private string BackingFilePath => Path.Combine(_backingDir, "backing.bin");
+
+    /// <summary>
+    /// For the zero-copy mmap path: if <paramref name="handleId"/> is currently
+    /// paged out to a stable, uncompressed slice of the backing file whose bytes
+    /// are the tensor's NATIVE element bytes, returns that slice (file + offset +
+    /// length) so the caller can alias it read-only. Pure lookup — does NOT touch
+    /// LRU heat, resident accounting, or eviction. Returns false when the entry is
+    /// resident, compressed, or never paged out (no zero-copy is possible).
+    /// </summary>
+    public bool TryGetZeroCopyByteRange(long handleId, out string path, out long fileOffset, out int byteLength)
+    {
+        path = string.Empty;
+        fileOffset = -1;
+        byteLength = 0;
+        lock (_lock)
+        {
+            ThrowIfDisposed();
+            if (!_entries.TryGetValue(handleId, out var entry)) return false;
+            // Must be paged out to a current, uncompressed file slice. Compressed
+            // (LZ4) or bf16/int8/lossless-encoded bytes can't be aliased — they
+            // require a decode pass, which is a copy by definition.
+            if (entry.Data is not null) return false;            // resident — caller's fast path already avoids a copy
+            if (entry.IsCompressed) return false;                // LZ4 needs decode
+            if (!entry.BackingFileCurrent) return false;         // slice not guaranteed to hold current bytes
+            if (entry.FileOffset < 0) return false;              // never paged out
+            if (entry.PagedOutBytes <= 0 || entry.PagedOutBytes > int.MaxValue) return false;
+            path = BackingFilePath;
+            fileOffset = entry.FileOffset;
+            byteLength = (int)entry.PagedOutBytes;
+            return true;
+        }
+    }
 
     // Appends `count` bytes from `buf` to the backing file and returns the offset
     // the slice was written at. Append-only — entries land contiguously in

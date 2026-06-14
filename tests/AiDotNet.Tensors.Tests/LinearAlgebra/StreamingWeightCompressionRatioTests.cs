@@ -203,10 +203,10 @@ public class StreamingWeightCompressionRatioTests
             double bf16MaxRel = 0, bf16Sum2 = 0, ref2 = 0;
             for (int i = 0; i < count; i++)
             {
-                uint u = (uint)BitConverter.SingleToInt32Bits(w[i]);
+                uint u = (uint)BitExactHelpers.SingleBits(w[i]);
                 uint rounding = 0x7FFFu + ((u >> 16) & 1u);
                 uint bf = (u + rounding) & 0xFFFF0000u;
-                float r = BitConverter.Int32BitsToSingle((int)bf);
+                float r = BitExactHelpers.BitsSingle((int)bf);
                 double e = Math.Abs(r - w[i]);
                 if (Math.Abs(w[i]) > 1e-12) bf16MaxRel = Math.Max(bf16MaxRel, e / Math.Abs(w[i]));
                 bf16Sum2 += e * e; ref2 += (double)w[i] * w[i];

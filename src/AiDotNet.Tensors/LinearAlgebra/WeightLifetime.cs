@@ -182,6 +182,23 @@ public sealed class GpuOffloadOptions
     public StreamingStoreDtype StreamingStoreDtype { get; set; } = StreamingStoreDtype.Auto;
 
     /// <summary>
+    /// Opt-in (default <see langword="false"/>): when materializing a paged-out weight
+    /// whose backing-file slice holds its NATIVE element bytes (full precision, no LZ4),
+    /// alias those bytes directly from a read-only memory-mapping instead of paging them
+    /// into a fresh array — eliminating the per-access allocation + memory copy (measured
+    /// 86–95% of the non-compute access cost for hot, page-cache-resident weights). The OS
+    /// page cache manages residency.
+    ///
+    /// <para><b>INFERENCE-ONLY.</b> The mapping is READ-ONLY: it must back only weights
+    /// that are never written while aliased (forward-read). The pool honors this by aliasing
+    /// only when the streaming execution mode is inference (not training) and the store
+    /// encoding is native (not bf16/int8/lossless — those require a decode, which copies).
+    /// Do not enable for training deployments: a weight update would fault on the read-only
+    /// pages. Leave off unless you are serving a larger-than-RAM model for inference.</para>
+    /// </summary>
+    public bool EnableZeroCopyMmapResidency { get; set; } = false;
+
+    /// <summary>
     /// Number of layers to prefetch ahead of the current Forward / Backward
     /// step. The schedule-aware prefetcher in <c>NeuralNetworkBase.Predict</c>
     /// reads layer N+W's weights from disk in the background while layer N

@@ -176,7 +176,7 @@ public class WeightRegistryBf16StoreTests
             WeightRegistry.Materialize(t);
             // BIT-exact round-trip (lossless).
             for (int i = 0; i < n; i++)
-                Assert.Equal(BitConverter.SingleToInt32Bits(expected[i]), BitConverter.SingleToInt32Bits(t[i]));
+                Assert.Equal(BitExactHelpers.SingleBits(expected[i]), BitExactHelpers.SingleBits(t[i]));
         }
         finally { Cleanup(dir); }
     }
