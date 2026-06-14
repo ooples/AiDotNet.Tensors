@@ -89,12 +89,130 @@ internal static class MixedPrecisionEmit
             BackwardFunctions<Half>.MatMulBackward);
 
         // 3. Up-cast FP16 -> FP32 for the next FP32 op. Backward: bridge the FP32 grad down to FP16.
-        var cF = scope.RecordCrossTypeWithBackward<Half, float>(
-            LazyNodeType.Custom, opName + ".castOut32", cH, outShape,
-            (e, o) => MixedPrecisionCast.CastToFp32(cH).AsSpan().CopyTo(o.AsWritableSpan()),
-            (gradOut, input, output, state, e) => MixedPrecisionCast.CastToFp32Backward(gradOut));
+        return UpCast(scope, cH, outShape, opName + ".castOut32");
+    }
 
-        return cF;
+    /// <summary>
+    /// Emits a unary FP16-NATIVE op (GELU / ReLU / activation / norm-as-unary) so its activation stays
+    /// <see cref="Half"/> end-to-end. This is the keystone of the resident-memory win
+    /// (docs/fp16-activation-storage-design.md §"SEVENTH FINDING"): a transformer separates matmuls with
+    /// FP32 ops, and the EARLIER matmul-only emission still up-cast each output to an FP32 tensor that the
+    /// consuming op then SAVED for its own backward — so the dominant activation stayed FP32 and footprint
+    /// went UP. By taking the input as Half (reusing the upstream FP16 op's output, never re-widening),
+    /// running the op's FP32 math on a transient up-cast-in-realize copy, and storing BOTH the saved input
+    /// and the output as Half, the activation chain never widens. The transient FP32 inside realize is freed
+    /// immediately, so the saved-activation set is genuinely Half.
+    /// <para>Returns the FP32 up-cast of the Half output for the next consumer. When that consumer is also
+    /// FP16-native, its <see cref="ToFp16Input"/> reuses the Half output directly and this up-cast is left
+    /// dead (unreachable from the loss) → dropped by the plan's topo-from-output, so it is never resident.</para>
+    /// </summary>
+    /// <param name="fp32Forward">Runs the op's FP32 math: <c>(engine, inputFp32) =&gt; outputFp32</c>.</param>
+    /// <param name="fp32Backward">The op's FP32 backward: <c>(engine, gradOutFp32, inputFp32) =&gt; gradInFp32</c>.</param>
+    public static Tensor<float> Unary(
+        LazyTensorScope scope,
+        Tensor<float> x,
+        int[] outShape,
+        string opName,
+        LazyNodeType nodeType,
+        Func<IEngine, Tensor<float>, Tensor<float>> fp32Forward,
+        Func<IEngine, Tensor<float>, Tensor<float>, Tensor<float>> fp32Backward)
+    {
+        if (scope is null) throw new ArgumentNullException(nameof(scope));
+        if (x is null) throw new ArgumentNullException(nameof(x));
+        if (outShape is null) throw new ArgumentNullException(nameof(outShape));
+        if (fp32Forward is null) throw new ArgumentNullException(nameof(fp32Forward));
+        if (fp32Backward is null) throw new ArgumentNullException(nameof(fp32Backward));
+
+        var xH = ToFp16Input(scope, x, opName + ".castIn16");
+
+        var yH = scope.RecordUnary<Half>(
+            nodeType, opName + ".fp16", xH, outShape,
+            (e, o) =>
+            {
+                // FP16-native realize: up-cast the Half activation only for the FP32 math, then store the
+                // result back as Half so the saved activation chain never widens to FP32.
+                var xf = MixedPrecisionCast.CastToFp32(xH);
+                var yf = fp32Forward(e, xf);
+                MixedPrecisionCast.CastToFp16(yf).AsSpan().CopyTo(o.AsWritableSpan());
+            },
+            (gradOutH, inputs, output, state, e, grads) =>
+            {
+                // Backward in FP32: up-cast the saved Half input + incoming Half grad, run the op's FP32
+                // gradient, down-cast the input-grad back to Half and accumulate into the Half grad map.
+                var inH = inputs[0];
+                var gradOutF = MixedPrecisionCast.CastToFp32(gradOutH);
+                var inF = MixedPrecisionCast.CastToFp32(inH);
+                var gradInF = fp32Backward(e, gradOutF, inF);
+                Autodiff.DifferentiableOps.AccumulateGrad(grads, inH, MixedPrecisionCast.CastToFp16(gradInF), e);
+            });
+
+        return UpCast(scope, yH, outShape, opName + ".castOut32");
+    }
+
+    /// <summary>
+    /// Emits a binary FP16-NATIVE elementwise op (residual <c>Add</c>, elementwise <c>Multiply</c>, ...) so
+    /// both operand activations and the output stay <see cref="Half"/>. Same rationale and mechanics as
+    /// <see cref="Unary"/>; the backward returns the gradient for EACH input, each down-cast to Half and
+    /// accumulated into the matching node.
+    /// </summary>
+    /// <param name="fp32Backward">
+    /// The op's FP32 backward: <c>(engine, gradOutFp32, aFp32, bFp32) =&gt; (gradAFp32, gradBFp32)</c>.
+    /// </param>
+    public static Tensor<float> Binary(
+        LazyTensorScope scope,
+        Tensor<float> a,
+        Tensor<float> b,
+        int[] outShape,
+        string opName,
+        LazyNodeType nodeType,
+        Func<IEngine, Tensor<float>, Tensor<float>, Tensor<float>> fp32Forward,
+        Func<IEngine, Tensor<float>, Tensor<float>, Tensor<float>, (Tensor<float> gradA, Tensor<float> gradB)> fp32Backward)
+    {
+        if (scope is null) throw new ArgumentNullException(nameof(scope));
+        if (a is null) throw new ArgumentNullException(nameof(a));
+        if (b is null) throw new ArgumentNullException(nameof(b));
+        if (outShape is null) throw new ArgumentNullException(nameof(outShape));
+        if (fp32Forward is null) throw new ArgumentNullException(nameof(fp32Forward));
+        if (fp32Backward is null) throw new ArgumentNullException(nameof(fp32Backward));
+
+        var aH = ToFp16Input(scope, a, opName + ".castA16");
+        var bH = ToFp16Input(scope, b, opName + ".castB16");
+
+        var cH = scope.RecordBinary<Half>(
+            nodeType, opName + ".fp16", aH, bH, outShape,
+            (e, o) =>
+            {
+                var af = MixedPrecisionCast.CastToFp32(aH);
+                var bf = MixedPrecisionCast.CastToFp32(bH);
+                var cf = fp32Forward(e, af, bf);
+                MixedPrecisionCast.CastToFp16(cf).AsSpan().CopyTo(o.AsWritableSpan());
+            },
+            (gradOutH, inputs, output, state, e, grads) =>
+            {
+                var inA = inputs[0];
+                var inB = inputs[1];
+                var gradOutF = MixedPrecisionCast.CastToFp32(gradOutH);
+                var (gradAF, gradBF) = fp32Backward(
+                    e, gradOutF, MixedPrecisionCast.CastToFp32(inA), MixedPrecisionCast.CastToFp32(inB));
+                Autodiff.DifferentiableOps.AccumulateGrad(grads, inA, MixedPrecisionCast.CastToFp16(gradAF), e);
+                Autodiff.DifferentiableOps.AccumulateGrad(grads, inB, MixedPrecisionCast.CastToFp16(gradBF), e);
+            });
+
+        return UpCast(scope, cH, outShape, opName + ".castOut32");
+    }
+
+    /// <summary>
+    /// Records the FP16→FP32 up-cast that bridges a Half activation node back to the FP32 consumer surface,
+    /// carrying the verified <see cref="MixedPrecisionCast"/> backward so <see cref="MixedPrecisionGraphBackward"/>
+    /// bridges the gradient down to the Half grad space. Shared by <see cref="MatMul"/>, <see cref="Unary"/>,
+    /// and <see cref="Binary"/>.
+    /// </summary>
+    private static Tensor<float> UpCast(LazyTensorScope scope, Tensor<Half> yH, int[] outShape, string name)
+    {
+        return scope.RecordCrossTypeWithBackward<Half, float>(
+            LazyNodeType.Custom, name, yH, outShape,
+            (e, o) => MixedPrecisionCast.CastToFp32(yH).AsSpan().CopyTo(o.AsWritableSpan()),
+            (gradOut, input, output, state, e) => MixedPrecisionCast.CastToFp32Backward(gradOut));
     }
 
     /// <summary>

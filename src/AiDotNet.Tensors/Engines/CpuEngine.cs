@@ -10326,6 +10326,17 @@ public partial class CpuEngine : ITensorLevelEngine
             var scope = GraphMode.Current;
             if (scope != null)
             {
+                // FP16 activation storage (#558): under an FP16 autocast scope + the opt-in flag, emit GELU
+                // as an FP16-NATIVE op so its activation stays Half (read Half in, FP32 math, save Half) and
+                // the between-matmul activation chain never widens back to FP32. Gated off by default.
+                if (Compilation.MixedPrecisionEmit.ActivationStorageActive<T>())
+                {
+                    var yF = Compilation.MixedPrecisionEmit.Unary(
+                        scope, (Tensor<float>)(object)tensor, tensor._shape, "GELU", LazyNodeType.GELU,
+                        (eng, xf) => eng.GELU(xf),
+                        (eng, gOut, xin) => eng.GeluBackward(gOut, xin));
+                    return (Tensor<T>)(object)yF;
+                }
                 var captured = tensor;
                 return scope.RecordUnary(LazyNodeType.GELU, "GELU", tensor, tensor._shape,
                     (eng, output) => eng.GELUInto(output, captured),
