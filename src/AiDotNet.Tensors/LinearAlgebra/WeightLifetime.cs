@@ -60,9 +60,11 @@ public enum WeightLifetime
 /// </summary>
 public enum StreamingStoreDtype
 {
-    /// <summary>Context-aware default: bf16 in inference/eval (read-only weights →
-    /// a one-time quantization, always safe, 2x), full precision during training
-    /// (preserve fp32/fp64 masters so small updates aren't lost).</summary>
+    /// <summary>Context-aware default — compresses whenever the execution mode is known:
+    /// bf16 in inference/eval (read-only weights → a one-time quantization, always safe, 2x),
+    /// and LOSSLESS (byte-shuffle + Deflate, ~1.18x, BIT-EXACT) during training so the
+    /// fp32/fp64 masters are preserved exactly. Unknown mode (no declared context) → full
+    /// precision (don't guess).</summary>
     Auto = 0,
 
     /// <summary>Always store at the weight's native precision (fp32/fp64). No
@@ -85,12 +87,11 @@ public enum StreamingStoreDtype
     /// accuracy tradeoff is accepted.</summary>
     Int8 = 4,
 
-    /// <summary>EXACT (lossless) storage: byte-plane shuffle + LZ4. ~1.08x I/O on
-    /// dense fp weights (raw LZ4 alone yields ~0% — the shuffle exposes the
-    /// structured sign/exponent bytes to the codec) at ZERO precision loss. For
-    /// callers that need bit-exact weights but want some I/O reduction; bf16/int8
-    /// give far more (2x/4x) at a precision cost. LZ4 decode (~6.7 GB/s) never
-    /// bottlenecks rehydrate.</summary>
+    /// <summary>EXACT (lossless) storage: SIMD byte-plane shuffle + Deflate. ~1.18x I/O on
+    /// dense fp weights (raw codecs yield ~0% — the shuffle exposes the structured
+    /// sign/exponent byte-plane and Deflate's entropy stage shrinks it) at ZERO precision
+    /// loss. This is the Auto default during TRAINING (bit-exact masters); bf16/int8 give far
+    /// more (2x/4x) at a precision cost. ~1.1 GiB/s decode, overlapped by prefetch.</summary>
     Lossless = 5,
 }
 
