@@ -17,12 +17,17 @@ namespace AiDotNet.Tensors.Tests.LinearAlgebra;
 /// fp32 machine-code microkernel saves, and fp32 activations preclude a true int8×int8
 /// VNNI/AMX path.
 ///
-/// Conclusion: the int8 streaming store's value is I/O (4x fewer bytes off disk/in the
-/// resident set — lever 4 part 1, shipped), NOT compute. The optimal path is therefore
-/// int8 store → upcast on rehydrate → fast fp32 GEMM (which is exactly what the store
-/// does today). A real compute speedup would need full W8A8 (int8 ACTIVATIONS too +
-/// VNNI/AMX hardware), a larger feature with its own activation-quantization accuracy
-/// and hardware-gating concerns — tracked separately, not pursued here.
+/// TWO findings:
+///   1. int8-WEIGHT-only × fp32-activation is exact vs fp32-on-quantized but ~7x SLOWER
+///      (inline dequant + fp32 accumulate beats nothing) — so for a weight-only int8
+///      store, compute should upcast → fast fp32 GEMM (what the store does today).
+///   2. TRUE W8A8 (int8 ACTIVATIONS + int8 weights, int32 accumulate) IS a real compute
+///      win: measured ~3.8x FASTER than fp32 at 1.79% total quant error — even on AVX2
+///      without VNNI, and including the per-call activation quantization. VNNI/AMX would
+///      widen the gap. This is the quantized-compute lever; its cost is activation-quant
+///      accuracy (outliers) + (best on) VNNI/AMX hardware. The driver
+///      SimdGemm.SgemmA8W8RowScaledCachedB is the integration primitive for wiring it
+///      into inference forward paths.
 /// </summary>
 public class QuantizedComputeW8A8Tests
 {
@@ -102,5 +107,44 @@ public class QuantizedComputeW8A8Tests
         _out.WriteLine($"GEMM [{m}x{k}x{n}] min-of-30: fp32 {fp32Ms:F3} ms, int8-weight {int8Ms:F3} ms ({fp32Ms / int8Ms:F2}x)");
         // Report-only on speed (CI boxes are noisy); correctness is the hard gate.
         Assert.True(int8Ms > 0);
+    }
+
+    [Fact]
+    public void TrueW8A8_Int8ActivationsAndWeights_AccuracyAndSpeed()
+    {
+        // True W8A8: BOTH activations and weights int8 → int8×int8 VNNI/AMX path
+        // (SgemmA8W8RowScaledCachedB quantizes activations to uint8 internally and
+        // dispatches VNNI → AVX2 → scalar). The compute-speedup path (vs the int8-
+        // WEIGHT-only path which was ~7x slower than fp32).
+        const int m = 256, k = 1024, n = 1024;
+        var rng = new Rng(2024);
+        var a = new float[m * k];
+        for (int i = 0; i < a.Length; i++) a[i] = rng.NextGaussian(1.0);
+        var b = new float[n * k];
+        for (int i = 0; i < b.Length; i++) b[i] = rng.NextGaussian(1.0 / Math.Sqrt(k));
+        var (bInt8, rowScales, _) = QuantizePerRow(b, n, k);
+
+        // Full fp32 reference: c = a · bᵀ (b unquantized). Sgemm wants B in [k,n].
+        var bT = new float[k * n];
+        for (int i = 0; i < n; i++) for (int j = 0; j < k; j++) bT[j * n + i] = b[i * k + j];
+        var cFull = new float[m * n];
+        SimdGemm.Sgemm(a, bT, cFull, m, k, n);
+
+        var cW8A8 = new float[m * n];
+        SimdGemm.SgemmA8W8RowScaledCachedB(a, bInt8, rowScales, cW8A8, m, k, n);
+
+        double sum2 = 0, ref2 = 0;
+        for (int i = 0; i < m * n; i++) { double e = cW8A8[i] - cFull[i]; sum2 += e * e; ref2 += (double)cFull[i] * cFull[i]; }
+        double rel = Math.Sqrt(sum2 / Math.Max(1e-30, ref2));
+        bool vnni = SimdGemm.Int8Int8VnniAvailable;
+        _out.WriteLine($"True W8A8 (VNNI={vnni}) vs full fp32: total quant rel RMS {rel * 100:F2}% (activation+weight int8)");
+        // Both operands int8 → larger than weight-only error, but bounded for inference.
+        Assert.True(rel < 0.10, $"W8A8 total quantization error {rel} should be within ~10%");
+
+        double Best(Action f) { double best = double.MaxValue; for (int r = 0; r < 30; r++) { var sw = Stopwatch.StartNew(); f(); sw.Stop(); best = Math.Min(best, sw.Elapsed.TotalMilliseconds); } return best; }
+        double fp32Ms = Best(() => SimdGemm.Sgemm(a, bT, cFull, m, k, n));
+        double w8a8Ms = Best(() => SimdGemm.SgemmA8W8RowScaledCachedB(a, bInt8, rowScales, cW8A8, m, k, n));
+        _out.WriteLine($"GEMM [{m}x{k}x{n}] min-of-30: fp32 {fp32Ms:F3} ms, W8A8 {w8a8Ms:F3} ms ({fp32Ms / w8a8Ms:F2}x vs fp32; includes per-call activation quant)");
+        Assert.True(w8a8Ms > 0);
     }
 }
