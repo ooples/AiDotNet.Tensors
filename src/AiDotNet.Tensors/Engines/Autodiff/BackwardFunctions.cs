@@ -545,7 +545,12 @@ internal static class BackwardFunctions<T>
         // collapsing the leading batch dims into Mflat and dispatching
         // SimdGemm.Sgemm directly with transA/transB flags eliminates the
         // 2 transposes per call and the engine-dispatch overhead.
+        // On a GPU engine, SKIP this CPU-BLAS fast path (it runs the backward GEMMs on host .Data arrays,
+        // starving the device — cortex GPU util ~5-7%). Fall through to the engine-dispatched ND×2D collapsed
+        // path below (lines ~683), whose engine.TensorMatMul calls are GPU-resident (2D GPU GEMM path), keeping
+        // the dominant backward GEMMs on the device.
         bool rank3FastPathEligible = (typeof(T) == typeof(float) || typeof(T) == typeof(double))
+            && !engine.SupportsGpu
             && inputs[1].Rank == 2
             && inputs[0].Rank >= 2
             && inputs[0].IsContiguous
