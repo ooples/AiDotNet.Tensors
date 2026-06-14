@@ -39,18 +39,38 @@ internal sealed unsafe class MmapTensorMemoryManager<T> : MemoryManager<T>
     public MmapTensorMemoryManager(string path, long byteOffset, int byteLength, int elementCount)
     {
         _count = elementCount;
-        // Open a read-only mapping. The owning FileStream must share read access.
-        _mmf = MemoryMappedFile.CreateFromFile(
-            new System.IO.FileStream(path, System.IO.FileMode.Open, System.IO.FileAccess.Read, System.IO.FileShare.ReadWrite),
-            mapName: null, capacity: 0,
-            MemoryMappedFileAccess.Read, HandleInheritability.None, leaveOpen: false);
-        _view = _mmf.CreateViewAccessor(byteOffset, byteLength, MemoryMappedFileAccess.Read);
-        byte* p = null;
-        _view.SafeMemoryMappedViewHandle.AcquirePointer(ref p);
-        _basePtr = p;
-        // CreateViewAccessor rounds the start down to a page boundary; PointerOffset is the
-        // distance from that boundary to the requested byteOffset.
-        _sliceByteOffset = _view.PointerOffset;
+        // Each step opens an additional handle on top of any prior one; if a
+        // later step throws (e.g. CreateViewAccessor on a corrupt file,
+        // AcquirePointer on an out-of-memory address space), the earlier
+        // handles leak until finalization. TryAliasZeroCopy on the caller
+        // side already falls back to the copy path on failure, so the
+        // mapping failure is recoverable — but under repeated zero-copy
+        // fallback a transient mapping failure would silently leak file
+        // descriptors / view handles. Dispose what we've already opened
+        // before rethrowing.
+        try
+        {
+            // Open a read-only mapping. The owning FileStream must share read access.
+            _mmf = MemoryMappedFile.CreateFromFile(
+                new System.IO.FileStream(path, System.IO.FileMode.Open, System.IO.FileAccess.Read, System.IO.FileShare.ReadWrite),
+                mapName: null, capacity: 0,
+                MemoryMappedFileAccess.Read, HandleInheritability.None, leaveOpen: false);
+            _view = _mmf.CreateViewAccessor(byteOffset, byteLength, MemoryMappedFileAccess.Read);
+            byte* p = null;
+            _view.SafeMemoryMappedViewHandle.AcquirePointer(ref p);
+            _basePtr = p;
+            // CreateViewAccessor rounds the start down to a page boundary; PointerOffset is the
+            // distance from that boundary to the requested byteOffset.
+            _sliceByteOffset = _view.PointerOffset;
+        }
+        catch
+        {
+            _view?.Dispose();
+            _view = null;
+            _mmf?.Dispose();
+            _mmf = null;
+            throw;
+        }
     }
 
     public override Span<T> GetSpan()
