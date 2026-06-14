@@ -74,6 +74,53 @@ public class StreamingEntropyCoderRatioTests
     }
 #endif
 
+    // Scalar bit-plane shuffle (32 bit-planes for fp32): groups bit-k of every element. Slow
+    // (measurement only) — it exists to see whether separating the exponent BITS (concentrated
+    // → very compressible) from the mantissa noise beats byte-plane through the entropy coder.
+    private static byte[] BitPlaneShuffle32(float[] w)
+    {
+        int n = w.Length;
+        int planeBytes = (n + 7) / 8;
+        var outp = new byte[32 * planeBytes];
+        for (int i = 0; i < n; i++)
+        {
+            uint bits = unchecked((uint)BitExactHelpers.SingleBits(w[i]));
+            int bytePos = i >> 3, bitPos = i & 7;
+            for (int b = 0; b < 32; b++)
+                if (((bits >> b) & 1u) != 0) outp[b * planeBytes + bytePos] |= (byte)(1 << bitPos);
+        }
+        return outp;
+    }
+
+    // FINDING (measured below): bit-plane shuffle does NOT beat byte-plane through an entropy
+    // coder — it's marginally WORSE (−0.3% to −1.9%) and ~18x slower to compute. Bit-plane
+    // helps LZ4 (no entropy stage → cleaner bit separation aids the match-finder), but Deflate's
+    // Huffman stage already extracts the exponent redundancy from byte-plane 3, so the extra
+    // separation buys nothing. ~1.18x byte-plane+Deflate is the practical LOSSLESS ceiling for
+    // dense fp weights; the mantissa is incompressible. Going past it requires LOSSY methods
+    // (bf16 2x, int8 4x) — kept here as a guard so the dead end isn't re-attempted.
+    [Theory]
+    [InlineData(0.02)]
+    [InlineData(0.05)]
+    [InlineData(0.2)]
+    public void BitPlaneShuffle_DoesNotBeatBytePlane_ThroughDeflate(double std)
+    {
+        const int n = 1 << 20; // 1M floats
+        var w = TrainedLikeWeights(n, std, (int)(std * 1000) + 7);
+        var raw = new byte[n * 4];
+        Buffer.BlockCopy(w, 0, raw, 0, raw.Length);
+
+        var bytePlane = StreamingStoreCodec.ShuffleForTest(raw, 4);
+        var bitPlane = BitPlaneShuffle32(w);
+        double byteRatio = (double)raw.Length / Deflate(bytePlane).Length;
+        double bitRatio = (double)raw.Length / Deflate(bitPlane).Length;
+
+        _out.WriteLine($"std={std}: byte-plane+Deflate {byteRatio:F3}x | bit-plane+Deflate {bitRatio:F3}x " +
+                       $"({(bitRatio - byteRatio) / byteRatio * 100:+0.0;-0.0}% from bit-plane)");
+
+        Assert.True(byteRatio > 1.0 && bitRatio > 1.0, "both transforms must compress dense fp weights");
+    }
+
     private static double Lz4Ratio(byte[] src)
     {
         var lz = new byte[LZ4Codec.MaximumOutputSize(src.Length)];
