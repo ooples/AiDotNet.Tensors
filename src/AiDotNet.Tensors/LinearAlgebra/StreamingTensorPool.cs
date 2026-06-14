@@ -57,6 +57,11 @@ public sealed class StreamingTensorPool : IDisposable
     private long _reservedBytes;
     private readonly long _maxResidentBytes;
     private readonly string _backingDir;
+    // Single contiguous backing file (append-only). Opened lazily on the first
+    // page-out. All access is under _lock, so one shared FileStream + Seek is safe
+    // and avoids a per-rehydrate file open/mmap/close.
+    private FileStream? _backingFile;
+    private long _backingLength;
     private readonly bool _enableCompression;
     private readonly bool _transparentAutoEviction;
     private bool _disposed;
@@ -384,18 +389,12 @@ public sealed class StreamingTensorPool : IDisposable
 
             if (entry.Data is null)
             {
-                // Paged out — read from backing file.
-                string path = BackingPathFor(handleId);
-                if (!File.Exists(path))
-                    throw new InvalidOperationException($"Streaming pool: handle {handleId} backing file missing at {path}.");
+                // Paged out — read from the entry's slice of the contiguous backing file.
+                if (entry.FileOffset < 0)
+                    throw new InvalidOperationException($"Streaming pool: handle {handleId} has no backing offset (never paged out).");
 
                 int onDiskBytes = (int)entry.PagedOutBytes;
-                var diskBuffer = new byte[onDiskBytes];
-                using (var mmf = MemoryMappedFile.CreateFromFile(path, FileMode.Open, null, 0, MemoryMappedFileAccess.Read))
-                using (var view = mmf.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read))
-                {
-                    view.ReadArray(0, diskBuffer, 0, onDiskBytes);
-                }
+                var diskBuffer = ReadFromBacking(entry.FileOffset, onDiskBytes);
                 _diskReadCount++;
                 _diskReadBytes += onDiskBytes;
 
@@ -500,8 +499,10 @@ public sealed class StreamingTensorPool : IDisposable
             // by live entries even when callers register/unregister at
             // high churn.
             _prefetchPending.Remove(handleId);
-            string path = BackingPathFor(handleId);
-            try { if (File.Exists(path)) File.Delete(path); } catch { /* best-effort */ }
+            // The entry's slice of the contiguous backing file is left in place
+            // (reclaimed when the whole file is deleted at Dispose). Weight handles
+            // are register-once for a model, so per-unregister compaction would be
+            // churn for no benefit; the file is bounded by total bytes paged out.
         }
     }
 
@@ -785,7 +786,6 @@ public sealed class StreamingTensorPool : IDisposable
         // memory-bound models this feature is meant to help. After
         // this change peak is entry.Data + encodeBuf ≈ ~536 MB,
         // and entry.Data is freed BEFORE the write returns.
-        string path = BackingPathFor(id);
         int uncompressed = entry.Data.Length;
 
         // Clean/dirty eviction. Once an entry's backing file has been written it
@@ -823,27 +823,19 @@ public sealed class StreamingTensorPool : IDisposable
                     int encoded = LZ4Codec.Encode(entry.Data, 0, uncompressed, encodeBuf, 0, maxOut);
                     if (encoded > 0 && encoded < uncompressed)
                     {
-                        // Stream-write only the encoded slice. FileStream
-                        // .Write copies (uncompressed + overhead) bytes
-                        // straight to disk — no intermediate byte[encoded]
-                        // copy. This is the dominant peak-memory win:
-                        // before this, we'd have allocated a third
-                        // copy-out buffer here.
-                        using (var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None))
-                        {
-                            fs.Write(encodeBuf, 0, encoded);
-                        }
+                        // Append the encoded slice to the single contiguous backing
+                        // file (no intermediate byte[encoded] copy — the dominant
+                        // peak-memory win is preserved).
+                        entry.FileOffset = AppendToBacking(encodeBuf, encoded);
                         paged = encoded;
                         compressed = true;
                     }
                     else
                     {
                         // Compression didn't shrink the payload (entropy too
-                        // high or below LZ4's break-even) — write entry.Data
-                        // raw and flag IsCompressed=false so Rehydrate
-                        // doesn't try to decode. Same File.WriteAllBytes
-                        // path as the no-compression branch below.
-                        File.WriteAllBytes(path, entry.Data);
+                        // high or below LZ4's break-even) — append entry.Data raw
+                        // and flag IsCompressed=false so Rehydrate doesn't decode.
+                        entry.FileOffset = AppendToBacking(entry.Data, uncompressed);
                         paged = uncompressed;
                         compressed = false;
                     }
@@ -861,7 +853,7 @@ public sealed class StreamingTensorPool : IDisposable
             }
             else
             {
-                File.WriteAllBytes(path, entry.Data);
+                entry.FileOffset = AppendToBacking(entry.Data, uncompressed);
                 paged = uncompressed;
             }
             // Free entry.Data IMMEDIATELY now that the bytes are durably
@@ -902,7 +894,45 @@ public sealed class StreamingTensorPool : IDisposable
     // pool is ever extended to support persistent state across process
     // restarts, add `[u32 magic][u32 version]` here and adjust Rehydrate
     // to validate before LZ4Codec.Decode.
-    private string BackingPathFor(long id) => Path.Combine(_backingDir, $"streaming-{id}.bin");
+    // Lazily opens the single contiguous backing file (read-write, exclusive).
+    // Caller holds _lock.
+    private FileStream BackingFile()
+        => _backingFile ??= new FileStream(
+            Path.Combine(_backingDir, "backing.bin"),
+            FileMode.Create, FileAccess.ReadWrite, FileShare.None);
+
+    // Appends `count` bytes from `buf` to the backing file and returns the offset
+    // the slice was written at. Append-only — entries land contiguously in
+    // first-eviction order. Caller holds _lock.
+    private long AppendToBacking(byte[] buf, int count)
+    {
+        var fs = BackingFile();
+        long offset = _backingLength;
+        fs.Seek(offset, SeekOrigin.Begin);
+        fs.Write(buf, 0, count);
+        fs.Flush();
+        _backingLength += count;
+        return offset;
+    }
+
+    // Reads exactly `count` bytes at `offset` from the backing file. Caller holds _lock.
+    private byte[] ReadFromBacking(long offset, int count)
+    {
+        var fs = BackingFile();
+        fs.Seek(offset, SeekOrigin.Begin);
+        var buf = new byte[count];
+        int read = 0;
+        while (read < count)
+        {
+            int r = fs.Read(buf, read, count - read);
+            if (r <= 0) break;
+            read += r;
+        }
+        if (read != count)
+            throw new InvalidOperationException(
+                $"Streaming backing file: short read at offset {offset} ({read}/{count} bytes).");
+        return buf;
+    }
 
     public void Dispose()
     {
@@ -921,6 +951,9 @@ public sealed class StreamingTensorPool : IDisposable
             // Atomic write so the lock-free ResidentBytes property doesn't
             // see torn values on 32-bit hosts (net471 x86 still ships).
             Interlocked.Exchange(ref _residentBytes, 0);
+            // Close the single backing-file handle before the directory delete.
+            try { _backingFile?.Dispose(); } catch { /* best-effort */ }
+            _backingFile = null;
         }
         // Backing-store deletion outside the lock — Directory.Delete on a
         // large pool can be slow, and there's no in-memory state to
@@ -949,6 +982,12 @@ public sealed class StreamingTensorPool : IDisposable
         // (entry.Data then equals the file); cleared by Register (no file yet)
         // and MarkDirty (content replaced out-of-band). See EvictNodeInternal.
         public bool BackingFileCurrent;
+        // Byte offset of this entry's PagedOutBytes in the single contiguous
+        // backing file (-1 until first paged out). With clean/dirty eviction each
+        // entry is written once, so the file is append-only and entries land
+        // contiguously in first-eviction order → large sequential reads + one
+        // persistent file handle instead of a file open/close per rehydrate.
+        public long FileOffset = -1;
     }
 
     /// <summary>
