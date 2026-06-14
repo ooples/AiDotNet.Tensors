@@ -1703,6 +1703,45 @@ kernel void matmul_fp16_fp32out(
     }
 }
 
+// FP16-NATIVE elementwise / activation kernels (#558): read the activation DIRECTLY from a half buffer
+// (MSL has a native half type), compute in FP32 in-register, write half — no FP32 buffer materialized,
+// no convert transient. GPU counterpart of the CPU FP16-native emit.
+kernel void fp16_gelu_native(
+    device const half* input [[buffer(0)]],
+    device half* output [[buffer(1)]],
+    constant uint& n [[buffer(2)]],
+    uint i [[thread_position_in_grid]])
+{
+    if (i >= n) return;
+    float x = float(input[i]);
+    float z = 0.7978845608028654f * (x + 0.044715f * x * x * x);
+    z = clamp(z, -20.0f, 20.0f);
+    output[i] = half(0.5f * x * (1.0f + tanh(z)));
+}
+
+kernel void fp16_relu_native(
+    device const half* input [[buffer(0)]],
+    device half* output [[buffer(1)]],
+    constant uint& n [[buffer(2)]],
+    uint i [[thread_position_in_grid]])
+{
+    if (i >= n) return;
+    float x = float(input[i]);
+    output[i] = half(x > 0.0f ? x : 0.0f);
+}
+
+// Residual add: out = a + b (same shape), half in/out, FP32 accumulate.
+kernel void fp16_add_native(
+    device const half* a [[buffer(0)]],
+    device const half* b [[buffer(1)]],
+    device half* output [[buffer(2)]],
+    constant uint& n [[buffer(3)]],
+    uint i [[thread_position_in_grid]])
+{
+    if (i >= n) return;
+    output[i] = half(float(a[i]) + float(b[i]));
+}
+
 // Tiled matrix multiplication for better cache utilization
 kernel void matmul_tiled(
     device const float* A [[buffer(0)]],
