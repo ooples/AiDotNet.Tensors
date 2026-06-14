@@ -2789,6 +2789,16 @@ public partial class CpuEngine : ITensorLevelEngine
             if (scope != null)
             {
                 scope.BindEngineIfUnset(this);
+                // FP16 activation storage (#558): FP16-native residual add so both operand activations and
+                // the sum stay Half. Add is linear ⇒ gradient is the upstream grad for BOTH inputs.
+                if (Compilation.MixedPrecisionEmit.ActivationStorageActive<T>())
+                {
+                    var yF = Compilation.MixedPrecisionEmit.Binary(
+                        scope, (Tensor<float>)(object)a, (Tensor<float>)(object)b, a._shape, "TensorAdd", LazyNodeType.Add,
+                        (eng, af, bf) => eng.TensorAdd(af, bf),
+                        (eng, gOut, af, bf) => (gOut, gOut));
+                    return (Tensor<T>)(object)yF;
+                }
                 var capturedA = a;
                 var capturedB = b;
                 return scope.RecordBinary(LazyNodeType.Add, "TensorAdd", a, b, a._shape,
@@ -10017,6 +10027,15 @@ public partial class CpuEngine : ITensorLevelEngine
             var scope = GraphMode.Current;
             if (scope != null)
             {
+                // FP16 activation storage (#558): FP16-native ReLU so the activation stays Half end-to-end.
+                if (Compilation.MixedPrecisionEmit.ActivationStorageActive<T>())
+                {
+                    var yF = Compilation.MixedPrecisionEmit.Unary(
+                        scope, (Tensor<float>)(object)tensor, tensor._shape, "ReLU", LazyNodeType.ReLU,
+                        (eng, xf) => eng.ReLU(xf),
+                        (eng, gOut, xin) => eng.ReluBackward(gOut, xin));
+                    return (Tensor<T>)(object)yF;
+                }
                 var captured = tensor;
                 return scope.RecordUnary(LazyNodeType.ReLU, "ReLU", tensor, tensor._shape,
                     (eng, output) => eng.ReLUInto(output, captured),

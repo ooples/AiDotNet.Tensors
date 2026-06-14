@@ -104,6 +104,65 @@ public class Fp16NativeOpTests
         AssertClose(gWRef.ToArray(), gWFp16.ToArray(), "dL/dW");
     }
 
+    [Fact]
+    public void Binary_ResidualAdd_And_Relu_StayHalf_BackpropMatchesFp32Reference()
+    {
+        // loss = sum( ReLU(x @ W) + r ) — exercises FP16-native ReLU (Unary) + residual Add (Binary).
+        var x = F(new[] { 2, 3 }, 1f, -2f, 3f, 0.5f, 1f, -1.5f);
+        var W = F(new[] { 3, 2 }, 0.5f, 1f, -1f, 2f, 1.5f, -0.5f);
+        var r = F(new[] { 2, 2 }, 0.25f, -0.5f, 1f, 0.75f);
+
+        var scope = new LazyTensorScope(null);
+        Tensor<float> relu, z, loss;
+        using (new AutocastScope(PrecisionMode.Float16))
+        {
+            var prev = MixedPrecisionEmit.TestOverrideEnabled;
+            MixedPrecisionEmit.TestOverrideEnabled = true;
+            try
+            {
+                var y = MixedPrecisionEmit.MatMul(scope, x, W, new[] { 2, 2 });
+                relu = MixedPrecisionEmit.Unary(scope, y, new[] { 2, 2 }, "ReLU", LazyNodeType.ReLU,
+                    (e, xf) => e.ReLU(xf),
+                    (e, gOut, xin) => e.ReluBackward(gOut, xin));
+                z = MixedPrecisionEmit.Binary(scope, relu, r, new[] { 2, 2 }, "Add", LazyNodeType.Add,
+                    (e, af, bf) => e.TensorAdd(af, bf),
+                    (e, gOut, af, bf) => (gOut, gOut));
+            }
+            finally { MixedPrecisionEmit.TestOverrideEnabled = prev; }
+            loss = SumLoss(scope, z);
+        }
+
+        // Both ReLU and the residual sum are genuinely Half activations.
+        Assert.True(relu.LazySource is CrossTypeLazyNode<Half, float>, "ReLU output should be FP16->FP32 up-cast");
+        Assert.True(z.LazySource is CrossTypeLazyNode<Half, float>, "residual sum should be FP16->FP32 up-cast");
+        var addAct = ((CrossTypeLazyNode<Half, float>)z.LazySource!).Input;
+        Assert.IsType<LazyNode<Half>>(addAct.LazySource);
+
+        _ = loss.ToArray();
+        var got = MixedPrecisionGraphBackward.Backward(loss, _engine);
+
+        var refScope = new LazyTensorScope(null);
+        var yRef = refScope.RecordBinary<float>(LazyNodeType.MatMul, "mm", x, W, new[] { 2, 2 },
+            (e, o) => e.TensorMatMul(x, W).AsSpan().CopyTo(o.AsWritableSpan()),
+            BackwardFunctions<float>.MatMulBackward);
+        var reluRef = refScope.RecordUnary<float>(LazyNodeType.ReLU, "relu", yRef, new[] { 2, 2 },
+            (e, o) => e.ReLU(yRef).AsSpan().CopyTo(o.AsWritableSpan()),
+            BackwardFunctions<float>.ReLUBackward);
+        var zRef = refScope.RecordBinary<float>(LazyNodeType.Add, "add", reluRef, r, new[] { 2, 2 },
+            (e, o) => e.TensorAdd(reluRef, r).AsSpan().CopyTo(o.AsWritableSpan()),
+            BackwardFunctions<float>.AddBackward);
+        var lossRef = SumLoss(refScope, zRef);
+        _ = lossRef.ToArray();
+        var refGrads = MixedPrecisionGraphBackward.Backward(lossRef, _engine);
+
+        foreach (var (t, name) in new[] { (x, "dL/dx"), (W, "dL/dW"), (r, "dL/dr") })
+        {
+            Assert.True(got.Fp32.TryGetValue(t, out var g16), $"no FP16-native grad for {name}");
+            Assert.True(refGrads.Fp32.TryGetValue(t, out var gRef), $"no reference grad for {name}");
+            AssertClose(gRef.ToArray(), g16.ToArray(), name);
+        }
+    }
+
     private static void AssertClose(float[] expected, float[] actual, string label)
     {
         Assert.Equal(expected.Length, actual.Length);
