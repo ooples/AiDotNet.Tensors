@@ -147,6 +147,40 @@ public class WeightRegistryBf16StoreTests
         finally { Cleanup(dir); }
     }
 
+    [Fact]
+    public void LosslessStore_IsBitExact_AndSmallerThanFp32()
+    {
+        const int n = 4096;
+        var dir = Path.Combine(Path.GetTempPath(), $"aidotnet-lossless-{Guid.NewGuid():N}");
+        WeightRegistry.Configure(new GpuOffloadOptions
+        {
+            StreamingBackingStorePath = dir,
+            StreamingPoolMaxResidentBytes = 1024L * 1024,
+            StreamingStoreDtype = StreamingStoreDtype.Lossless,
+        });
+        WeightRegistry.SetStreamingExecutionTraining(null);
+        try
+        {
+            var expected = new float[n];
+            for (int i = 0; i < n; i++) expected[i] = (float)Math.Sin(i * 0.01) * 0.03f;
+            var t = new Tensor<float>(new[] { n });
+            for (int i = 0; i < n; i++) t[i] = expected[i];
+            t.Lifetime = WeightLifetime.Streaming;
+            WeightRegistry.RegisterWeight(t);
+
+            Assert.Equal((byte)3, t.StreamingStoreEncoding);
+            // Lossless compresses: resident bytes < raw fp32.
+            Assert.True(WeightRegistry.StreamingPool.ResidentBytes < n * sizeof(float),
+                $"lossless resident {WeightRegistry.StreamingPool.ResidentBytes} should be < {n * 4}");
+
+            WeightRegistry.Materialize(t);
+            // BIT-exact round-trip (lossless).
+            for (int i = 0; i < n; i++)
+                Assert.Equal(BitConverter.SingleToInt32Bits(expected[i]), BitConverter.SingleToInt32Bits(t[i]));
+        }
+        finally { Cleanup(dir); }
+    }
+
     private static void Cleanup(string dir)
     {
         WeightRegistry.SetStreamingExecutionTraining(null);

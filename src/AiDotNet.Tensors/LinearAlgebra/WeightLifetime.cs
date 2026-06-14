@@ -84,6 +84,14 @@ public enum StreamingStoreDtype
     /// and is intended for inference / aggressive memory-bound cases where the
     /// accuracy tradeoff is accepted.</summary>
     Int8 = 4,
+
+    /// <summary>EXACT (lossless) storage: byte-plane shuffle + LZ4. ~1.08x I/O on
+    /// dense fp weights (raw LZ4 alone yields ~0% — the shuffle exposes the
+    /// structured sign/exponent bytes to the codec) at ZERO precision loss. For
+    /// callers that need bit-exact weights but want some I/O reduction; bf16/int8
+    /// give far more (2x/4x) at a precision cost. LZ4 decode (~6.7 GB/s) never
+    /// bottlenecks rehydrate.</summary>
+    Lossless = 5,
 }
 
 /// <summary>

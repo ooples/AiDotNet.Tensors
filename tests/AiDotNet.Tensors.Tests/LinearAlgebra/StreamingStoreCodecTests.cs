@@ -158,6 +158,47 @@ public class StreamingStoreCodecTests
         Assert.True(Math.Sqrt(sum2 / ref2) < 0.02, "fp64→int8 RMS error ~1%");
     }
 
+    [Theory]
+    [InlineData(1)]
+    [InlineData(7)]
+    [InlineData(8)]
+    [InlineData(1000)]
+    [InlineData(4096)]
+    public void Lossless_RoundTrip_IsBitExact_AndCompresses(int n)
+    {
+        var rng = new Rng((ulong)(n + 100));
+        var src = new float[n];
+        for (int i = 0; i < n; i++) src[i] = rng.NextGaussian(0.05);
+
+        var enc = StreamingStoreCodec.EncodeLosslessFloat(src);
+        var dec = new float[n];
+        StreamingStoreCodec.DecodeLosslessFloat(enc, dec);
+
+        // LOSSLESS → must be BIT-exact (not just close).
+        for (int i = 0; i < n; i++)
+            Assert.Equal(BitConverter.SingleToInt32Bits(src[i]), BitConverter.SingleToInt32Bits(dec[i]));
+
+        // And for a non-trivial tensor it should actually shrink (byte-shuffle exposes
+        // the structured exponent bytes to LZ4). Tiny tensors may not — only assert on big.
+        if (n >= 1000)
+            Assert.True(enc.Length < n * sizeof(float),
+                $"lossless ({enc.Length} B) should be smaller than raw fp32 ({n * 4} B)");
+    }
+
+    [Fact]
+    public void Lossless_Double_RoundTrip_IsBitExact()
+    {
+        var rng = new Rng(222);
+        int n = 2048;
+        var src = new double[n];
+        for (int i = 0; i < n; i++) src[i] = rng.NextGaussian(0.05);
+        var enc = StreamingStoreCodec.EncodeLosslessDouble(src);
+        var dec = new double[n];
+        StreamingStoreCodec.DecodeLosslessDouble(enc, dec);
+        for (int i = 0; i < n; i++)
+            Assert.Equal(BitConverter.DoubleToInt64Bits(src[i]), BitConverter.DoubleToInt64Bits(dec[i]));
+    }
+
     [Fact]
     public void EncodeDecodeDouble_RoundTrip_WithinBf16Precision()
     {

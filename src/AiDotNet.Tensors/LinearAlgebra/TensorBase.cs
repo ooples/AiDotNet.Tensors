@@ -355,6 +355,27 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
                     $"int8 streaming store is only supported for float/double, not {typeof(T).Name}.");
             }
         }
+        else if (StreamingStoreEncoding == 3)
+        {
+            // Lossless (byte-shuffle + LZ4): variable-size payload → exact bytes for T.
+            if (typeof(T) == typeof(float))
+            {
+                var arr = new float[Length];
+                StreamingStoreCodec.DecodeLosslessFloat(bytes, arr);
+                fresh = Vector<T>.WrapMemory((T[])(object)arr);
+            }
+            else if (typeof(T) == typeof(double))
+            {
+                var arr = new double[Length];
+                StreamingStoreCodec.DecodeLosslessDouble(bytes, arr);
+                fresh = Vector<T>.WrapMemory((T[])(object)arr);
+            }
+            else
+            {
+                throw new NotSupportedException(
+                    $"Lossless streaming store is only supported for float/double, not {typeof(T).Name}.");
+            }
+        }
         else
         {
             // Use the typed-fast-path size table rather than Marshal.SizeOf<T>:

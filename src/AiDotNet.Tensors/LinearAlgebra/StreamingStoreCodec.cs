@@ -1,6 +1,7 @@
 // Copyright (c) AiDotNet. All rights reserved.
 
 using System;
+using K4os.Compression.LZ4;
 
 namespace AiDotNet.Tensors.LinearAlgebra;
 
@@ -174,4 +175,93 @@ internal static class StreamingStoreCodec
         float scale = ReadScale(src);
         for (int i = 0; i < dst.Length; i++) dst[i] = (sbyte)src[Int8ScaleBytes + i] * (double)scale;
     }
+
+    // ── Lossless: byte-plane shuffle + LZ4 (EXACT, ~1.08x on fp weights) ──────────
+    // Raw LZ4 can't compress dense fp weights (~100%) because the high-entropy mantissa
+    // bytes are interleaved with the structured sign/exponent bytes. Byte-plane shuffle
+    // groups byte-k of every element together, so the high (sign+exponent) plane — highly
+    // repetitive for near-Gaussian weights — becomes compressible and LZ4 then shrinks it.
+    // Output = [1-byte flag][payload]: flag 1 = LZ4(shuffled), 0 = raw shuffled (when LZ4
+    // didn't shrink). LZ4 decode is ~6.7 GB/s so it never bottlenecks rehydrate. This is
+    // the EXACT (lossless) store option; bf16/int8 give more (2x/4x) at a precision cost.
+
+    private static void BytePlaneShuffle(ReadOnlySpan<byte> src, Span<byte> dst, int elem)
+    {
+        int count = src.Length / elem;
+        for (int k = 0; k < elem; k++)
+        {
+            int planeBase = k * count;
+            for (int i = 0; i < count; i++) dst[planeBase + i] = src[i * elem + k];
+        }
+    }
+
+    private static void BytePlaneUnshuffle(ReadOnlySpan<byte> src, Span<byte> dst, int elem)
+    {
+        int count = dst.Length / elem;
+        for (int k = 0; k < elem; k++)
+        {
+            int planeBase = k * count;
+            for (int i = 0; i < count; i++) dst[i * elem + k] = src[planeBase + i];
+        }
+    }
+
+    private static byte[] EncodeLosslessBytes(ReadOnlySpan<byte> raw, int elem)
+    {
+        var shuffled = new byte[raw.Length];
+        BytePlaneShuffle(raw, shuffled, elem);
+        int maxOut = LZ4Codec.MaximumOutputSize(shuffled.Length);
+        var lz = new byte[maxOut];
+        int enc = LZ4Codec.Encode(shuffled, 0, shuffled.Length, lz, 0, maxOut);
+        if (enc > 0 && enc < shuffled.Length)
+        {
+            var outp = new byte[1 + enc];
+            outp[0] = 1; // LZ4-compressed
+            Buffer.BlockCopy(lz, 0, outp, 1, enc);
+            return outp;
+        }
+        // Didn't shrink — store the raw shuffled bytes so decode is still exact.
+        var rawOut = new byte[1 + shuffled.Length];
+        rawOut[0] = 0;
+        Buffer.BlockCopy(shuffled, 0, rawOut, 1, shuffled.Length);
+        return rawOut;
+    }
+
+    private static void DecodeLosslessBytes(ReadOnlySpan<byte> src, Span<byte> dstRaw, int elem)
+    {
+        if (src.Length < 1) throw new ArgumentException("Lossless payload too short.", nameof(src));
+        int shuffledLen = dstRaw.Length;
+        byte flag = src[0];
+        var payload = src.Slice(1);
+        byte[] shuffled;
+        if (flag == 1)
+        {
+            shuffled = new byte[shuffledLen];
+            int dec = LZ4Codec.Decode(payload.ToArray(), 0, payload.Length, shuffled, 0, shuffledLen);
+            if (dec != shuffledLen)
+                throw new InvalidOperationException($"Lossless decode: LZ4 produced {dec} bytes, expected {shuffledLen}.");
+        }
+        else
+        {
+            shuffled = payload.ToArray();
+            if (shuffled.Length != shuffledLen)
+                throw new InvalidOperationException($"Lossless decode: raw payload {shuffled.Length} bytes, expected {shuffledLen}.");
+        }
+        BytePlaneUnshuffle(shuffled, dstRaw, elem);
+    }
+
+    /// <summary>fp32 → lossless (byte-shuffle + LZ4). Returns a variable-size buffer.</summary>
+    internal static byte[] EncodeLosslessFloat(ReadOnlySpan<float> src)
+        => EncodeLosslessBytes(System.Runtime.InteropServices.MemoryMarshal.AsBytes(src), 4);
+
+    /// <summary>fp64 → lossless.</summary>
+    internal static byte[] EncodeLosslessDouble(ReadOnlySpan<double> src)
+        => EncodeLosslessBytes(System.Runtime.InteropServices.MemoryMarshal.AsBytes(src), 8);
+
+    /// <summary>lossless → fp32 (exact round-trip).</summary>
+    internal static void DecodeLosslessFloat(ReadOnlySpan<byte> src, Span<float> dst)
+        => DecodeLosslessBytes(src, System.Runtime.InteropServices.MemoryMarshal.AsBytes(dst), 4);
+
+    /// <summary>lossless → fp64 (exact round-trip).</summary>
+    internal static void DecodeLosslessDouble(ReadOnlySpan<byte> src, Span<double> dst)
+        => DecodeLosslessBytes(src, System.Runtime.InteropServices.MemoryMarshal.AsBytes(dst), 8);
 }

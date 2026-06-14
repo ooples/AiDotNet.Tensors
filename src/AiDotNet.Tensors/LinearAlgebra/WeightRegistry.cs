@@ -158,14 +158,24 @@ public static class WeightRegistry
                         // eviction, disk) for free — the pool is byte-agnostic; only the
                         // restore boundary widens bf16 → T (RestoreStorageFromBytes).
                         var (encoding, stochastic) = ResolveStoreEncoding<T>();
-                        int byteCount = encoding switch
+                        byte[] bytes;
+                        if (encoding == 3)
                         {
-                            1 => CheckedBf16ByteCount(weight.Length),
-                            2 => CheckedInt8ByteCount(weight.Length),
-                            _ => CheckedStreamingByteCount<T>(weight.Length),
-                        };
-                        var bytes = new byte[byteCount];
-                        SerializeToBytes(weight, bytes, encoding, stochastic);
+                            // Lossless (byte-shuffle + LZ4) is variable-size — compress
+                            // first, then register exactly the produced bytes.
+                            bytes = SerializeLossless(weight);
+                        }
+                        else
+                        {
+                            int byteCount = encoding switch
+                            {
+                                1 => CheckedBf16ByteCount(weight.Length),
+                                2 => CheckedInt8ByteCount(weight.Length),
+                                _ => CheckedStreamingByteCount<T>(weight.Length),
+                            };
+                            bytes = new byte[byteCount];
+                            SerializeToBytes(weight, bytes, encoding, stochastic);
+                        }
                         weight.StreamingStoreEncoding = encoding;
                         var pool = StreamingPoolUnlocked();
                         // If this tensor was produced by AllocateStreaming,
@@ -605,6 +615,7 @@ public static class WeightRegistry
             case StreamingStoreDtype.Bf16: return (1, false);
             case StreamingStoreDtype.Bf16Stochastic: return (1, true);
             case StreamingStoreDtype.Int8: return (2, false); // explicit opt-in (Auto never picks int8)
+            case StreamingStoreDtype.Lossless: return (3, false); // exact, variable-size; explicit opt-in
             case StreamingStoreDtype.Auto:
             default:
                 // bf16 ONLY when we KNOW it's inference; training or unknown →
@@ -625,6 +636,17 @@ public static class WeightRegistry
                 $"Streaming bf16 registration requires per-tensor size <= {int.MaxValue} bytes. " +
                 $"Tensor has {length} elements × 2 bytes = {byteCountLong} bytes. Chunk it.");
         return (int)byteCountLong;
+    }
+
+    /// <summary>Lossless (byte-shuffle + LZ4) serialization — variable size.</summary>
+    private static byte[] SerializeLossless<T>(Tensor<T> tensor)
+    {
+        if (typeof(T) == typeof(float))
+            return StreamingStoreCodec.EncodeLosslessFloat((float[])(object)tensor.AsSpan().ToArray());
+        if (typeof(T) == typeof(double))
+            return StreamingStoreCodec.EncodeLosslessDouble((double[])(object)tensor.AsSpan().ToArray());
+        throw new NotSupportedException(
+            $"Lossless streaming store is only supported for float/double, not {typeof(T).Name}.");
     }
 
     /// <summary>int8 byte count (1 per element + 4-byte scale) with overflow guard.</summary>
