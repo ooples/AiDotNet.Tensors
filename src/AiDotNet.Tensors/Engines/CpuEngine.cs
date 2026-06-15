@@ -15008,7 +15008,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> MaxPool2DWithIndices<T>(Tensor<T> input, int[] poolSize, int[] stride, out int[,,,,] maxIndices)
+    public virtual Tensor<T> MaxPool2DWithIndices<T>(Tensor<T> input, int[] poolSize, int[] stride, out int[,,,,] maxIndices)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
 
@@ -15137,7 +15137,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> MaxPool2DBackward<T>(Tensor<T> gradOutput, int[,,,,] maxIndices, int[] inputShape, int[] poolSize, int[] stride)
+    public virtual Tensor<T> MaxPool2DBackward<T>(Tensor<T> gradOutput, int[,,,,] maxIndices, int[] inputShape, int[] poolSize, int[] stride)
     {
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
 
@@ -15466,7 +15466,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> DepthwiseConv2D<T>(Tensor<T> input, Tensor<T> kernel, int[] stride, int[] padding)
+    public virtual Tensor<T> DepthwiseConv2D<T>(Tensor<T> input, Tensor<T> kernel, int[] stride, int[] padding)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (kernel == null) throw new ArgumentNullException(nameof(kernel));
@@ -16175,7 +16175,7 @@ public partial class CpuEngine : ITensorLevelEngine
     #region Deformable Convolution Operations
 
     /// <inheritdoc/>
-    public Tensor<T> DeformableConv2D<T>(
+    public virtual Tensor<T> DeformableConv2D<T>(
         Tensor<T> input,
         Tensor<T> kernel,
         Tensor<T> offset,
@@ -16444,7 +16444,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> DeformableConv2DBackwardInput<T>(
+    public virtual Tensor<T> DeformableConv2DBackwardInput<T>(
         Tensor<T> gradOutput,
         Tensor<T> input,
         Tensor<T> kernel,
@@ -16614,7 +16614,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> DeformableConv2DBackwardKernel<T>(
+    public virtual Tensor<T> DeformableConv2DBackwardKernel<T>(
         Tensor<T> gradOutput,
         Tensor<T> input,
         Tensor<T> offset,
@@ -16718,7 +16718,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> DeformableConv2DBackwardOffset<T>(
+    public virtual Tensor<T> DeformableConv2DBackwardOffset<T>(
         Tensor<T> gradOutput,
         Tensor<T> input,
         Tensor<T> kernel,
@@ -17031,7 +17031,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> DeformableConv2DBackwardMask<T>(
+    public virtual Tensor<T> DeformableConv2DBackwardMask<T>(
         Tensor<T> gradOutput,
         Tensor<T> input,
         Tensor<T> kernel,
@@ -18743,7 +18743,7 @@ public partial class CpuEngine : ITensorLevelEngine
     #endregion
 
     /// <inheritdoc/>
-    public Tensor<T> LocallyConnectedConv2D<T>(Tensor<T> input, Tensor<T> weights, Tensor<T>? bias, int[] stride)
+    public virtual Tensor<T> LocallyConnectedConv2D<T>(Tensor<T> input, Tensor<T> weights, Tensor<T>? bias, int[] stride)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (weights == null) throw new ArgumentNullException(nameof(weights));
@@ -18855,7 +18855,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> LocallyConnectedConv2DBackwardInput<T>(Tensor<T> gradOutput, Tensor<T> weights, int[] inputShape, int[] stride)
+    public virtual Tensor<T> LocallyConnectedConv2DBackwardInput<T>(Tensor<T> gradOutput, Tensor<T> weights, int[] inputShape, int[] stride)
     {
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
         if (weights == null) throw new ArgumentNullException(nameof(weights));
@@ -18920,7 +18920,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> LocallyConnectedConv2DBackwardWeights<T>(Tensor<T> gradOutput, Tensor<T> input, int[] weightsShape, int[] stride)
+    public virtual Tensor<T> LocallyConnectedConv2DBackwardWeights<T>(Tensor<T> gradOutput, Tensor<T> input, int[] weightsShape, int[] stride)
     {
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
         if (input == null) throw new ArgumentNullException(nameof(input));
@@ -18992,7 +18992,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> LocallyConnectedConv2DBackwardBias<T>(Tensor<T> gradOutput)
+    public virtual Tensor<T> LocallyConnectedConv2DBackwardBias<T>(Tensor<T> gradOutput)
     {
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
         if (gradOutput.Rank != 4) throw new ArgumentException($"LocallyConnectedConv2DBackwardBias gradOutput requires 4D tensor. Got rank {gradOutput.Rank}.");
@@ -25774,7 +25774,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <summary>
     /// Computes the backward pass for FlashAttention.
     /// </summary>
-    public Tensor<T> FlashAttentionBackward<T>(
+    public virtual Tensor<T> FlashAttentionBackward<T>(
         Tensor<T> gradOutput,
         Tensor<T> query,
         Tensor<T> key,
@@ -26355,7 +26355,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <summary>
     /// Computes the backward pass for Grouped Query Attention.
     /// </summary>
-    public Tensor<T> GroupedQueryAttentionBackward<T>(
+    public virtual Tensor<T> GroupedQueryAttentionBackward<T>(
         Tensor<T> gradOutput,
         Tensor<T> query,
         Tensor<T> key,
@@ -27709,7 +27709,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> ReduceMax<T>(Tensor<T> input, int[] axes, bool keepDims, out int[] maxIndices)
+    public virtual Tensor<T> ReduceMax<T>(Tensor<T> input, int[] axes, bool keepDims, out int[] maxIndices)
     {
         // GraphMode: record lazy node for compiled plan
         if (GraphMode.IsActive)
@@ -35660,7 +35660,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> FusedConv3D<T>(
+    public virtual Tensor<T> FusedConv3D<T>(
         Tensor<T> input,
         Tensor<T> kernel,
         Tensor<T>? bias,
@@ -35695,7 +35695,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> FusedConvTranspose2D<T>(
+    public virtual Tensor<T> FusedConvTranspose2D<T>(
         Tensor<T> input,
         Tensor<T> kernel,
         Tensor<T>? bias,
@@ -35728,7 +35728,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> FusedBatchNorm<T>(
+    public virtual Tensor<T> FusedBatchNorm<T>(
         Tensor<T> input,
         Tensor<T> gamma,
         Tensor<T> beta,
@@ -35886,7 +35886,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// On CPU, this is a no-op. Persistent tensor management only provides benefits
     /// on GPU where data transfer between host and device is expensive.
     /// </remarks>
-    public void RegisterPersistentTensor<T>(Tensor<T> tensor, PersistentTensorRole role)
+    public virtual void RegisterPersistentTensor<T>(Tensor<T> tensor, PersistentTensorRole role)
     {
         // No-op on CPU: persistence only benefits GPU by avoiding repeated transfers
         // The tensor is already in CPU memory, so there's nothing to cache
@@ -35896,7 +35896,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <remarks>
     /// On CPU, this is a no-op. See <see cref="RegisterPersistentTensor{T}"/>.
     /// </remarks>
-    public void UnregisterPersistentTensor<T>(Tensor<T> tensor)
+    public virtual void UnregisterPersistentTensor<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         // No-op on CPU
@@ -35906,7 +35906,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <remarks>
     /// On CPU, this is a no-op. See <see cref="RegisterPersistentTensor{T}"/>.
     /// </remarks>
-    public void InvalidatePersistentTensor<T>(Tensor<T> tensor)
+    public virtual void InvalidatePersistentTensor<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         // No-op on CPU

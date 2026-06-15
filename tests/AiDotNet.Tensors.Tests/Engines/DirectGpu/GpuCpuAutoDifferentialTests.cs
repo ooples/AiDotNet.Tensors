@@ -437,6 +437,23 @@ public sealed class GpuCpuAutoDifferentialTests : IDisposable
     // TODO(gpu-correctness): add dedicated GPU-vs-CPU tests for these and remove them from the list.
     private static readonly HashSet<string> DedicatedlyCovered = new(StringComparer.Ordinal)
     {
+        // Deformable / depthwise / locally-connected conv, 3D / transposed fused conv, FlashAttention
+        // backward — GPU-vs-CPU parity in GpuConvKernelCoverageTests (and MaxPool2DBackward in
+        // MaxPool2DBackwardGpuCorrectnessTests). These were hidden from this gate by a `public new`
+        // hide on DirectGpuTensorEngine until it was converted to `override`.
+        "DeformableConv2D(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Int32[],Int32[],Int32[])",
+        "DeformableConv2DBackwardInput(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Int32[],Int32[],Int32[],Int32[])",
+        "DeformableConv2DBackwardKernel(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Int32[],Int32[],Int32[],Int32[])",
+        "DeformableConv2DBackwardMask(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Int32[],Int32[],Int32[])",
+        "DeformableConv2DBackwardOffset(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Int32[],Int32[],Int32[])",
+        "DepthwiseConv2D(Tensor<T>,Tensor<T>,Int32[],Int32[])",
+        "FlashAttentionBackward(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Double,Boolean,out Tensor<T>,out Tensor<T>,out Tensor<T>,Tensor<T>)",
+        "FusedConv3D(Tensor<T>,Tensor<T>,Tensor<T>,Int32,Int32,Int32,Int32,Int32,Int32,Int32,Int32,Int32,FusedActivationType)",
+        "FusedConvTranspose2D(Tensor<T>,Tensor<T>,Tensor<T>,Int32,Int32,Int32,Int32,Int32,Int32,FusedActivationType)",
+        "LocallyConnectedConv2D(Tensor<T>,Tensor<T>,Tensor<T>,Int32[])",
+        "LocallyConnectedConv2DBackwardInput(Tensor<T>,Tensor<T>,Int32[],Int32[])",
+        "LocallyConnectedConv2DBackwardWeights(Tensor<T>,Tensor<T>,Int32[],Int32[])",
+        "MaxPool2DBackward(Tensor<T>,Int32[],Int32[],Int32[],Int32[])",
         // conv / transposed-conv / im2col — distinct input vs. kernel shapes + interdependent geometry
         "Conv3D(Tensor<T>,Tensor<T>,Int32,Int32,Int32)",
         "ConvTranspose2D(Tensor<T>,Tensor<T>,Int32[],Int32[],Int32[])",
