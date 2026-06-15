@@ -65,6 +65,17 @@ internal static class CooperativeGemmScheduler
         public readonly Action<int> Action;
         public int Remaining;            // Interlocked-decremented as chunks finish.
         public Exception? FirstException; // First chunk exception (CompareExchange).
+
+        // Spin-then-park join (issue #589). Once the participating caller exhausts its
+        // spin budget waiting for the LAST chunks (held by other threads), it parks on
+        // Done instead of busy-spinning a core — that spin otherwise stole ~47% of a
+        // core from a conv kernel running on the parallel path, halving conv throughput.
+        // Single waiter (the dispatch caller), so Done is created only by the caller and
+        // only when it actually needs to park (the common case completes while draining).
+        // ParkPending=1 tells the thread that decrements Remaining to 0 to wake the caller.
+        public int ParkPending;
+        public ManualResetEventSlim? Done;
+
         public Job(Action<int> action, int remaining) { Action = action; Remaining = remaining; }
     }
 
@@ -155,7 +166,8 @@ internal static class CooperativeGemmScheduler
         finally
         {
             _inScheduler = prev;
-            Interlocked.Decrement(ref item.Job.Remaining);
+            if (Interlocked.Decrement(ref item.Job.Remaining) == 0)
+                SignalIfParked(item.Job);
         }
     }
 
@@ -222,9 +234,30 @@ internal static class CooperativeGemmScheduler
                 else
                 {
                     // Queue empty but our job isn't done → other threads hold our
-                    // remaining chunks. Spin briefly, then yield.
-                    if (spin++ < 1000) Thread.SpinWait(8);
-                    else { Thread.Yield(); spin = 0; }
+                    // remaining chunks; we cannot help. Spin briefly to cover the
+                    // sub-microsecond completion gap, then PARK on the job's done
+                    // event instead of an unbounded SpinWait/Yield loop. The old loop
+                    // burned a whole core busy-waiting — under conv-dominated workloads
+                    // that core contends with the FusedConvHelper conv running on the
+                    // parallel path, roughly halving conv throughput (issue #589).
+                    if (spin++ < CoopJoinSpinBeforePark)
+                    {
+                        Thread.SpinWait(8);
+                    }
+                    else
+                    {
+                        var done = job.Done ?? EnsureDoneEvent(job);
+                        Volatile.Write(ref job.ParkPending, 1);
+                        // Publish ParkPending=1 before re-reading Remaining. Without this
+                        // fence the thread completing the last chunk could read
+                        // ParkPending==0 and skip the wake while we then read a stale
+                        // Remaining>0 and park forever (lost wakeup).
+                        Interlocked.MemoryBarrier();
+                        if (Volatile.Read(ref job.Remaining) > 0)
+                            done.Wait();
+                        Volatile.Write(ref job.ParkPending, 0);
+                        spin = 0;
+                    }
                 }
             }
         }
@@ -252,8 +285,43 @@ internal static class CooperativeGemmScheduler
         }
         finally
         {
-            Interlocked.Decrement(ref item.Job.Remaining);
+            if (Interlocked.Decrement(ref item.Job.Remaining) == 0)
+                SignalIfParked(item.Job);
         }
+    }
+
+    /// <summary>
+    /// SpinWait(8) iterations the participating caller burns waiting for the last
+    /// in-flight chunks before it parks on the job's done event (issue #589). 1000
+    /// preserves the original sub-microsecond busy-wait latency for fast completions;
+    /// only the previously-unbounded yield tail is replaced by a park.
+    /// </summary>
+    private const int CoopJoinSpinBeforePark = 1000;
+
+    /// <summary>
+    /// Lazily creates the dispatch caller's park event. Only the caller creates it
+    /// (single creator), and it is published before any <c>ParkPending = 1</c> store,
+    /// so a thread that observes <c>ParkPending == 1</c> always sees a non-null Done.
+    /// </summary>
+    private static ManualResetEventSlim EnsureDoneEvent(Job job)
+    {
+        var ev = new ManualResetEventSlim(false);
+        Volatile.Write(ref job.Done, ev);
+        return ev;
+    }
+
+    /// <summary>
+    /// Wakes the participating caller if it has parked on this job. Called by the thread
+    /// that decrements <see cref="Job.Remaining"/> to 0 — that Interlocked decrement is a
+    /// full fence, so this read of ParkPending sees the caller's store; if the caller has
+    /// committed to parking we set its event, otherwise its post-store re-read of
+    /// Remaining (now 0) makes it skip the park.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void SignalIfParked(Job job)
+    {
+        if (Volatile.Read(ref job.ParkPending) == 1)
+            job.Done?.Set();
     }
 
     private static void RunSerial(int numChunks, Action<int> action)
