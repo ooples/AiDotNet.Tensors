@@ -4382,6 +4382,61 @@ internal static class BackwardFunctions<T>
             return;
         }
 
+        // Double 2D fast path: transposed GEMMs via BlasProvider (transA/transB
+        // handled by the strided kernels — no transpose buffer is materialised),
+        // mirroring the float path above. Without this, fp64 linear layers fall to
+        // the engine fallback below, which builds FULL weight/input transposes via
+        // TensorTranspose → Contiguous(); for a large in-features dim (e.g. a CNN
+        // classifier over un-pooled features) the K×N transpose copy alone is
+        // hundreds of MB and OOMs (ResNet50/fp64 LossStrictlyDecreases crashed here
+        // in ComputeGradientsStreaming, not on convergence).
+        if (typeof(T) == typeof(double) && inputs[0].Rank == 2 && inputs[1].Rank == 2
+            && gradOutput.IsContiguous && GradientTape<T>.Current is null)
+        {
+            int M = inputs[0]._shape[0]; // batch
+            int K = inputs[0]._shape[1]; // in_features
+            int N = inputs[1]._shape[1]; // out_features
+
+            var gArr = (double[])(object)gradOutput.GetDataArray();
+            var inArr = (double[])(object)inputs[0].GetDataArray();
+            var wArr = (double[])(object)inputs[1].GetDataArray();
+
+            var inputGrad = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[0]._shape);
+            var weightGrad = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[1]._shape);
+            var gradInputArr = (double[])(object)inputGrad.GetDataArray();
+            var gradWeightArr = (double[])(object)weightGrad.GetDataArray();
+
+            // dInput[M,K] = dY[M,N] · Wᵀ[N,K]; W stored [K,N] (ldb=N), transB=true.
+            bool okInput = BlasProvider.TryGemmEx(M, K, N, gArr, 0, N, false, wArr, 0, N, true, gradInputArr, 0, K);
+            // dWeight[K,N] = inputᵀ[K,M] · dY[M,N]; input stored [M,K] (lda=K), transA=true.
+            bool okWeight = BlasProvider.TryGemmEx(K, N, M, inArr, 0, K, true, gArr, 0, N, false, gradWeightArr, 0, N);
+
+            if (!(okInput && okWeight))
+            {
+                AutoTensorCache.Return(inputGrad);
+                AutoTensorCache.Return(weightGrad);
+                goto fusedFallback;
+            }
+
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], inputGrad, engine);
+            DifferentiableOps.AccumulateGrad(grads, inputs[1], weightGrad, engine);
+
+            // dL/dbias = sum(gradOutput, axis=0).
+            if (inputs.Length > 2)
+            {
+                var biasGrad = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[2]._shape);
+                var biasArr = (double[])(object)biasGrad.GetDataArray();
+                Array.Clear(biasArr, 0, N);
+                for (int row = 0; row < M; row++)
+                {
+                    int baseIdx = row * N;
+                    for (int j = 0; j < N; j++) biasArr[j] += gArr[baseIdx + j];
+                }
+                DifferentiableOps.AccumulateGrad(grads, inputs[2], biasGrad, engine);
+            }
+            return;
+        }
+
         // Fallback: engine calls (non-float or non-2D, or BLAS refused).
         //
         // Fallback: engine calls (non-float or non-2D, or BLAS refused).
