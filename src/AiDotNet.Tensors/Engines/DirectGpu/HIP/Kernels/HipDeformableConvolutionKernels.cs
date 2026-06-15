@@ -136,12 +136,12 @@ extern ""C"" __global__ __launch_bounds__(256) void deformable_conv2d(
                 float base_x = ow * strideW - padW + kw * dilationW;
 
                 // Get offset index
-                int offsetIdx = ((deformGroup * kernelH * kernelW + kh * kernelW + kw) * 2);
+                int offsetIdx = (deformGroup * 2 * kernelH * kernelW + kh * kernelW + kw);
                 int offsetBaseIdx = ((b * deformGroups * 2 * kernelH * kernelW + offsetIdx) * outHeight + oh) * outWidth + ow;
 
                 // Apply learned offset
                 float offset_y = offsets[offsetBaseIdx];
-                float offset_x = offsets[offsetBaseIdx + outHeight * outWidth];
+                float offset_x = offsets[offsetBaseIdx + kernelH * kernelW * outHeight * outWidth];
 
                 float sample_y = base_y + offset_y;
                 float sample_x = base_x + offset_x;
@@ -222,11 +222,11 @@ extern ""C"" __global__ __launch_bounds__(256) void deformable_conv2d_backward_i
                     float base_y = oh * strideH - padH + kh * dilationH;
                     float base_x = ow * strideW - padW + kw * dilationW;
 
-                    int offsetIdx = ((deformGroup * kernelH * kernelW + kh * kernelW + kw) * 2);
+                    int offsetIdx = (deformGroup * 2 * kernelH * kernelW + kh * kernelW + kw);
                     int offsetBaseIdx = ((b * deformGroups * 2 * kernelH * kernelW + offsetIdx) * outHeight + oh) * outWidth + ow;
 
                     float offset_y = offsets[offsetBaseIdx];
-                    float offset_x = offsets[offsetBaseIdx + outHeight * outWidth];
+                    float offset_x = offsets[offsetBaseIdx + kernelH * kernelW * outHeight * outWidth];
 
                     float sample_y = base_y + offset_y;
                     float sample_x = base_x + offset_x;
@@ -324,11 +324,11 @@ extern ""C"" __global__ __launch_bounds__(256) void deformable_conv2d_backward_w
                 float base_y = oh * strideH - padH + kh * dilationH;
                 float base_x = ow * strideW - padW + kw * dilationW;
 
-                int offsetIdx = ((deformGroup * kernelH * kernelW + kh * kernelW + kw) * 2);
+                int offsetIdx = (deformGroup * 2 * kernelH * kernelW + kh * kernelW + kw);
                 int offsetBaseIdx = ((b * deformGroups * 2 * kernelH * kernelW + offsetIdx) * outHeight + oh) * outWidth + ow;
 
                 float offset_y = offsets[offsetBaseIdx];
-                float offset_x = offsets[offsetBaseIdx + outHeight * outWidth];
+                float offset_x = offsets[offsetBaseIdx + kernelH * kernelW * outHeight * outWidth];
 
                 float sample_y = base_y + offset_y;
                 float sample_x = base_x + offset_x;
@@ -386,23 +386,27 @@ extern ""C"" __global__ __launch_bounds__(256) void deformable_conv2d_backward_o
     int tmp = idx / outWidth;
     int oh = tmp % outHeight;
     tmp /= outHeight;
-    int offsetComponent = tmp % 2; // 0 = y offset, 1 = x offset
-    tmp /= 2;
+    // BLOCKED offset layout [B, 2*kH*kW, oH, oW]: the component (y vs x) is the OUTER index
+    // over the kH*kW positions, so decode kw/kh FIRST and the component LAST. This makes
+    // gradOffset[idx] land in the same blocked channel order the CPU reference produces:
+    // channel = deformGroup*2*kH*kW + component*kH*kW + (kh*kW+kw).
     int kw = tmp % kernelW;
     tmp /= kernelW;
     int kh = tmp % kernelH;
     tmp /= kernelH;
+    int offsetComponent = tmp % 2; // 0 = y offset, 1 = x offset
+    tmp /= 2;
     int deformGroup = tmp % deformGroups;
     int b = tmp / deformGroups;
 
     float base_y = oh * strideH - padH + kh * dilationH;
     float base_x = ow * strideW - padW + kw * dilationW;
 
-    int offsetIdx = ((deformGroup * kernelH * kernelW + kh * kernelW + kw) * 2);
+    int offsetIdx = (deformGroup * 2 * kernelH * kernelW + kh * kernelW + kw);
     int offsetBaseIdx = ((b * deformGroups * 2 * kernelH * kernelW + offsetIdx) * outHeight + oh) * outWidth + ow;
 
     float offset_y = offsets[offsetBaseIdx];
-    float offset_x = offsets[offsetBaseIdx + outHeight * outWidth];
+    float offset_x = offsets[offsetBaseIdx + kernelH * kernelW * outHeight * outWidth];
 
     float sample_y = base_y + offset_y;
     float sample_x = base_x + offset_x;
@@ -511,11 +515,11 @@ extern ""C"" __global__ __launch_bounds__(256) void deformable_conv2d_backward_m
     float base_y = oh * strideH - padH + kh * dilationH;
     float base_x = ow * strideW - padW + kw * dilationW;
 
-    int offsetIdx = ((deformGroup * kernelH * kernelW + kh * kernelW + kw) * 2);
+    int offsetIdx = (deformGroup * 2 * kernelH * kernelW + kh * kernelW + kw);
     int offsetBaseIdx = ((b * deformGroups * 2 * kernelH * kernelW + offsetIdx) * outHeight + oh) * outWidth + ow;
 
     float offset_y = offsets[offsetBaseIdx];
-    float offset_x = offsets[offsetBaseIdx + outHeight * outWidth];
+    float offset_x = offsets[offsetBaseIdx + kernelH * kernelW * outHeight * outWidth];
 
     float sample_y = base_y + offset_y;
     float sample_x = base_x + offset_x;
