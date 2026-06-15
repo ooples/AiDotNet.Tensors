@@ -5789,6 +5789,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (stride == 0) stride = poolSize;
 
+        // Under a gradient tape, route to the CPU base path, which records the op
+        // for autodiff. The GPU path below returns an untracked tensor, so without
+        // this the pool is invisible to the tape — and since pooling routes the
+        // gradient to its input, the WHOLE subgraph feeding the pool would receive
+        // no gradient (frozen training). Mirrors BatchNorm/LayerNorm.
+        if (IsTapeActive<T>()) return base.MaxPool2D(input, poolSize, stride, padding);
+
         if (!TryGetBackend(out var backend))
             return base.MaxPool2D(input, poolSize, stride, padding);
 
@@ -5985,6 +5992,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<T> AvgPool2D<T>(Tensor<T> input, int poolSize, int stride = 0, int padding = 0)
     {
         if (stride == 0) stride = poolSize;
+
+        // Tape-active: use the recording CPU base path (see MaxPool2D).
+        if (IsTapeActive<T>()) return base.AvgPool2D(input, poolSize, stride, padding);
 
         if (!TryGetBackend(out var backend))
             return base.AvgPool2D(input, poolSize, stride, padding);
@@ -15253,6 +15263,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> Conv3D<T>(Tensor<T> input, Tensor<T> kernel, int stride, int padding, int dilation)
     {
+        // Tape-active: use the recording CPU base path so the conv (and its
+        // kernel gradient) participate in autodiff (see MaxPool2D). The GPU path
+        // returns an untracked tensor — frozen training for 3D convs (UNet3D,
+        // VoxelCNN, video models) otherwise.
+        if (IsTapeActive<T>()) return base.Conv3D(input, kernel, stride, padding, dilation);
+
         if (!TryGetBackend(out var backend) || input.Rank < 5)
             return base.Conv3D(input, kernel, stride, padding, dilation);
 

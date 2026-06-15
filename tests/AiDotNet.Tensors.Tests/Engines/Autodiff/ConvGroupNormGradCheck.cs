@@ -131,6 +131,49 @@ public class ConvGroupNormGradCheck
         Assert.True(Report("ConvTranspose2D dK", gka, numK) < GradCheckTol, "ConvTranspose2D kernel gradient mismatch");
     }
 
+    [Fact]
+    public void MaxPool2D_GradReachesInput()
+    {
+        var x = Rand(new[] { 1, 2, 4, 4 }, 20);
+        using var tape = new GradientTape<double>();
+        var loss = _engine.ReduceSum(_engine.MaxPool2D(x, 2, 2, 0), null);
+        var grads = tape.ComputeGradients(loss, new[] { x });
+        Assert.True(grads.ContainsKey(x), "MaxPool2D produced NO gradient for its input (op not recorded on the tape)");
+        var num = NumGrad(t => _engine.MaxPool2D(t, 2, 2, 0), x);
+        var ga = new double[grads[x].Length]; for (int i = 0; i < ga.Length; i++) ga[i] = grads[x][i];
+        Assert.True(Report("MaxPool2D dX", ga, num) < GradCheckTol, "MaxPool2D input gradient mismatch");
+    }
+
+    [Fact]
+    public void AvgPool2D_GradReachesInput()
+    {
+        var x = Rand(new[] { 1, 2, 4, 4 }, 21);
+        using var tape = new GradientTape<double>();
+        var loss = _engine.ReduceSum(_engine.AvgPool2D(x, 2, 2, 0), null);
+        var grads = tape.ComputeGradients(loss, new[] { x });
+        Assert.True(grads.ContainsKey(x), "AvgPool2D produced NO gradient for its input (op not recorded on the tape)");
+        var num = NumGrad(t => _engine.AvgPool2D(t, 2, 2, 0), x);
+        var ga = new double[grads[x].Length]; for (int i = 0; i < ga.Length; i++) ga[i] = grads[x][i];
+        Assert.True(Report("AvgPool2D dX", ga, num) < GradCheckTol, "AvgPool2D input gradient mismatch");
+    }
+
+    [Fact]
+    public void Conv3D_GradMatchesNumeric()
+    {
+        var x = Rand(new[] { 1, 2, 4, 4, 4 }, 22);
+        var k = Rand(new[] { 3, 2, 3, 3, 3 }, 23);
+        using var tape = new GradientTape<double>();
+        var loss = _engine.ReduceSum(_engine.Conv3D(x, k, 1, 1, 1), null);
+        var grads = tape.ComputeGradients(loss, new[] { x, k });
+        Assert.True(grads.ContainsKey(x) && grads.ContainsKey(k), "Conv3D produced NO gradient (op not recorded on the tape)");
+        var numX = NumGrad(t => _engine.Conv3D(t, k, 1, 1, 1), x);
+        var numK = NumGrad(t => _engine.Conv3D(x, t, 1, 1, 1), k);
+        var gxa = new double[grads[x].Length]; for (int i = 0; i < gxa.Length; i++) gxa[i] = grads[x][i];
+        var gka = new double[grads[k].Length]; for (int i = 0; i < gka.Length; i++) gka[i] = grads[k][i];
+        Assert.True(Report("Conv3D dX", gxa, numX) < GradCheckTol, "Conv3D input gradient mismatch");
+        Assert.True(Report("Conv3D dK", gka, numK) < GradCheckTol, "Conv3D kernel gradient mismatch");
+    }
+
     // Deep stack: Conv -> GroupNorm -> Swish, repeated. Measures the gradient
     // magnitude reaching the INPUT vs the per-stage analytic-vs-numeric ratio,
     // to localize a per-layer attenuation.
