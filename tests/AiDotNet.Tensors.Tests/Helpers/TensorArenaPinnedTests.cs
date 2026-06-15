@@ -180,11 +180,27 @@ public class TensorArenaPinnedTests
 
         Assert.NotNull(tensor);
         Assert.Equal(8, tensor.Length);
-        Assert.Equal(WeightLifetime.Default, tensor.Lifetime);
-        // Fallback path is RentPinned, so the pinned tier should have grown
-        // by one — verifying we actually pinned the allocation rather than
-        // routing through plain `new Tensor<T>`.
-        Assert.Equal(countBefore + 1, arena.PinnedArrayCount);
+
+        // This test asserts the CPU-host FALLBACK contract, which only applies when no GPU offload
+        // allocator is registered. On a GPU-equipped host the engine auto-registers the CUDA offload
+        // allocator (WeightRegistry.OffloadAllocator becomes non-null), so RentPinnedOnGpu legitimately
+        // takes the real GpuPinned path instead. Branch on the actual allocator state so the test verifies
+        // the correct contract on both CPU-only CI and GPU hosts rather than assuming the fallback.
+        var offload = WeightRegistry.OffloadAllocator;
+        if (offload is null || !offload.IsAvailable)
+        {
+            Assert.Equal(WeightLifetime.Default, tensor.Lifetime);
+            // Fallback path is RentPinned, so the pinned tier should have grown by one — verifying we
+            // actually pinned the allocation rather than routing through plain `new Tensor<T>`.
+            Assert.Equal(countBefore + 1, arena.PinnedArrayCount);
+        }
+        else
+        {
+            // A real GPU offload allocator is present → the GpuPinned path (pinned-host + DMA mapping) is
+            // taken, which is the correct behavior here. The CPU-fallback branch is covered on CI hosts
+            // without a GPU.
+            Assert.Equal(WeightLifetime.GpuPinned, tensor.Lifetime);
+        }
     }
 
     /// <summary>

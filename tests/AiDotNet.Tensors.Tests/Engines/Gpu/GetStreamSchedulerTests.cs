@@ -308,12 +308,19 @@ public class GetStreamSchedulerTests
         backend.DownloadBuffer(cStrided, stridedHost);
         backend.DownloadBuffer(cFanout, fanoutHost);
 
-        // Strided and fanout compute the same GEMM, just dispatched
-        // differently. Results should match to within fp32 ULPs — any
-        // significant drift means the fanout's offset arithmetic or
-        // alpha/beta handling is wrong.
+        // Strided and fanout compute the same GEMM, just dispatched differently. They do NOT match to
+        // fp32 ULPs: cublasSgemmStridedBatched and per-slice cublasSgemm are different routines, and on
+        // Ampere+ the shared cuBLAS handle runs TF32 tensor-op math (CUBLAS_TF32_TENSOR_OP_MATH). TF32
+        // rounds inputs to 19 bits and the two routines accumulate in different tile orders, so a ~1e-3
+        // relative divergence is expected and correct. A real bug (wrong slice offset / alpha/beta) drives
+        // gross divergence, which this relative tolerance still catches.
         for (int i = 0; i < cElems; i++)
-            Assert.Equal(stridedHost[i], fanoutHost[i], 4);
+        {
+            float diff = System.Math.Abs(stridedHost[i] - fanoutHost[i]);
+            float tol = 1e-2f * System.Math.Max(1f, System.Math.Abs(stridedHost[i]));
+            Assert.True(diff <= tol,
+                $"element {i}: strided={stridedHost[i]} fanout={fanoutHost[i]} diff={diff} exceeds TF32 tolerance {tol}");
+        }
     }
 
     [Fact]

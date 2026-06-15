@@ -110,6 +110,58 @@ public sealed class CompiledModelCache<T> : IDisposable
     }
 
     /// <summary>
+    /// Multi-input variant: traces the forward once and marks EVERY tensor in
+    /// <paramref name="inputs"/> as a mutable input slot the plan re-binds on each replay.
+    /// On cache hit, every input's data is copied into the plan's captured buffers, so a forward
+    /// whose result depends on more than one per-call-varying tensor — e.g. a diffusion denoiser
+    /// reading both the noisy sample AND a per-step timestep embedding — replays correctly instead
+    /// of baking all-but-the-first input as constants. Each input must be a traced leaf the forward
+    /// reads directly; otherwise compilation throws and the caller should fall back to eager.
+    /// </summary>
+    /// <param name="inputs">
+    /// The mutable input tensors, in a stable order. Their data is copied into the plan on cache
+    /// hit; the combined shape sequence keys the plan so distinct secondary shapes don't collide.
+    /// </param>
+    /// <param name="forward">The forward pass to trace (called once on cache miss).</param>
+    public ICompiledPlan<T> GetOrCompileInference(Tensor<T>[] inputs, Func<Tensor<T>> forward)
+    {
+        if (inputs is null) throw new ArgumentNullException(nameof(inputs));
+        if (inputs.Length == 0)
+            throw new ArgumentException("At least one input is required.", nameof(inputs));
+
+        long key = ComputeShapeKey(inputs);
+        var primaryShape = inputs[0]._shape;
+        if (_inferencePlans.TryGetValue(key, out var cached) && cached.IsValid(primaryShape))
+        {
+            cached.SetInputs(inputs);
+            return cached;
+        }
+
+        lock (_compileLock)
+        {
+            if (_inferencePlans.TryGetValue(key, out cached) && cached.IsValid(primaryShape))
+            {
+                cached.SetInputs(inputs);
+                return cached;
+            }
+
+            // The trace runs the forward against the CURRENT input data, so the freshly
+            // compiled plan already reflects this call — no SetInputs needed on the miss path
+            // (mirrors the single-input Tensor<T> overload above).
+            using var scope = GraphMode.Enable();
+            var explicitOutput = forward();
+            ThrowIfForwardRecordedNothing(scope, explicitOutput);
+            var plan = scope.CompileInference<T>(explicitOutput, inputs);
+
+            if (_inferencePlans.TryGetValue(key, out var old))
+                old.Dispose();
+
+            _inferencePlans[key] = plan;
+            return plan;
+        }
+    }
+
+    /// <summary>
     /// Gets a cached training plan for the given input shape, or compiles a new one.
     /// The forward + loss computation is traced once and compiled with backward pass.
     /// </summary>
@@ -273,6 +325,32 @@ public sealed class CompiledModelCache<T> : IDisposable
         // regardless. When a future backend reintroduces a divergent path, the
         // correct fix is per-plan instruction selection, not cache-key segregation.
 
+        return hash;
+    }
+
+    /// <summary>
+    /// Combined key over an ordered set of input shapes for multi-input plans. Folds each
+    /// input's shape into one FNV-1a hash with a per-tensor separator so that, e.g.,
+    /// ([2,3],[4]) and ([2],[3,4]) map to different keys and a plan compiled for one set of
+    /// secondary shapes is never replayed for another.
+    /// </summary>
+    private static long ComputeShapeKey(Tensor<T>[] inputs)
+    {
+        long hash = unchecked((long)0xcbf29ce484222325L);
+        hash ^= typeof(T).GetHashCode();
+        hash *= unchecked((long)0x100000001b3L);
+        for (int t = 0; t < inputs.Length; t++)
+        {
+            // Per-tensor separator so shape boundaries are significant.
+            hash ^= unchecked((long)0x9E3779B97F4A7C15L);
+            hash *= unchecked((long)0x100000001b3L);
+            var shape = inputs[t]._shape;
+            for (int i = 0; i < shape.Length; i++)
+            {
+                hash ^= shape[i];
+                hash *= unchecked((long)0x100000001b3L);
+            }
+        }
         return hash;
     }
 }
