@@ -6474,17 +6474,57 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     }
 
     /// <summary>
-    /// Locally connected 2D backward pass for weight gradients. Currently runs on the CPU: the GPU
-    /// kernel disagrees with the CPU reference (separate from the deformable offset-layout bug — its
-    /// per-position weight-gradient accumulation still needs to be debugged against the CPU oracle and
-    /// validated on a GPU runner) and is tracked in #622. This is NOT a "GPU unavailable" fallback —
-    /// it unconditionally uses the correct CPU path until the kernel is verified.
+    /// GPU-accelerated locally connected 2D backward pass for weight gradients.
+    /// Falls back to CPU only when the GPU backend is unavailable or the launch throws.
     /// </summary>
     public override Tensor<T> LocallyConnectedConv2DBackwardWeights<T>(Tensor<T> gradOutput, Tensor<T> input, int[] weightsShape, int[] stride)
     {
-        // Unconditional CPU: the GPU kernel is unverified (#622). The `override` (vs the prior `new`
-        // hide, which never dispatched) keeps virtual dispatch correct.
-        return base.LocallyConnectedConv2DBackwardWeights(gradOutput, input, weightsShape, stride);
+        if (!TryGetBackend(out var backend))
+            return base.LocallyConnectedConv2DBackwardWeights(gradOutput, input, weightsShape, stride);
+
+        if (gradOutput.Rank != 4 || input.Rank != 4)
+            return base.LocallyConnectedConv2DBackwardWeights(gradOutput, input, weightsShape, stride);
+
+        if (weightsShape == null || weightsShape.Length != 6)
+            throw new ArgumentException("Weights shape must be an array of 6 elements", nameof(weightsShape));
+        if (stride == null || stride.Length != 2)
+            throw new ArgumentException("Stride must be an array of 2 elements", nameof(stride));
+
+        int batch = input.Shape._dims[0];
+        int inChannels = input.Shape._dims[1];
+        int inHeight = input.Shape._dims[2];
+        int inWidth = input.Shape._dims[3];
+
+        int outHeight = weightsShape[0];
+        int outWidth = weightsShape[1];
+        int outChannels = weightsShape[2];
+        int kernelH = weightsShape[4];
+        int kernelW = weightsShape[5];
+
+        int weightsSize = outHeight * outWidth * outChannels * inChannels * kernelH * kernelW;
+
+        using var gradOutputBuffer = GetOrAllocateBuffer(backend, gradOutput);
+        using var inputBuffer = GetOrAllocateBuffer(backend, input);
+        using var gradWeightsBuffer = AllocateOutputBuffer(backend, weightsSize);
+
+        try
+        {
+            backend.LocallyConnectedConv2DBackwardWeights(
+                inputBuffer.Buffer, gradOutputBuffer.Buffer, gradWeightsBuffer.Buffer,
+                batch, inChannels, inHeight, inWidth,
+                outChannels, outHeight, outWidth,
+                kernelH, kernelW, stride[0], stride[1]);
+
+            float[] resultFloat = new float[weightsSize];
+            backend.DownloadBuffer(gradWeightsBuffer.Buffer, resultFloat);
+
+            T[] resultData = DirectGpuEngine.FromFloatArray<T>(resultFloat);
+            return new Tensor<T>(resultData, weightsShape);
+        }
+        catch
+        {
+            return base.LocallyConnectedConv2DBackwardWeights(gradOutput, input, weightsShape, stride);
+        }
     }
 
     /// <summary>
