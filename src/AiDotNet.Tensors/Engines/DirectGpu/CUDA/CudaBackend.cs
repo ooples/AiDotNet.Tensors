@@ -327,7 +327,16 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                 {
                     _asyncMemPool = memPool;
                     ulong threshold = ulong.MaxValue; // CU_MEMPOOL_ATTR_RELEASE_THRESHOLD = 4
-                    CuBlasNative.cuMemPoolSetAttribute(memPool, 4, ref threshold);
+                    var poolAttrStatus = CuBlasNative.cuMemPoolSetAttribute(memPool, 4, ref threshold);
+                    if (poolAttrStatus != CudaResult.Success)
+                    {
+                        // Non-fatal: the pool still works, it just won't RETAIN freed blocks for reuse
+                        // (it releases to the OS at each sync point) — a churn-performance loss, not a
+                        // correctness one. Surface it instead of discarding the status.
+                        System.Diagnostics.Trace.TraceWarning(
+                            $"[CudaBackend] cuMemPoolSetAttribute(RELEASE_THRESHOLD) failed: {poolAttrStatus}. " +
+                            "Stream-ordered pool caching is disabled; expect more allocator churn under load.");
+                    }
                 }
                 else if (asyncExplicitlyRequested)
                 {
@@ -1291,8 +1300,14 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             // land in the pool, then trim the pool back to the OS so this sync allocation can succeed.
             if (_asyncMemPool != IntPtr.Zero)
             {
-                CuBlasNative.cuCtxSynchronize();
-                CuBlasNative.cuMemPoolTrimTo(_asyncMemPool, 0);
+                // A failed sync here is almost always a STICKY context error (the very CUDA-700 this
+                // allocator guards against), NOT out-of-memory — throw with its real name so the OOM
+                // diagnostic below isn't misleading. Trim is best-effort: warn but still attempt the retry.
+                CuBlasNative.CheckCudaResult(CuBlasNative.cuCtxSynchronize(), "cuCtxSynchronize (async-pool OOM reclamation)");
+                var trimStatus = CuBlasNative.cuMemPoolTrimTo(_asyncMemPool, 0);
+                if (trimStatus != CudaResult.Success)
+                    System.Diagnostics.Trace.TraceWarning(
+                        $"[CudaBackend] cuMemPoolTrimTo failed during sync-path OOM reclamation: {trimStatus}; the cuMemAlloc retry may still OOM.");
             }
             result = CuBlasNative.cuMemAlloc(out devicePtr, byteSize);
             if (result != CudaResult.Success)
@@ -1381,8 +1396,17 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             // has reserved up to the training peak (release threshold maxed for caching); a later phase with
             // a different allocation shape (e.g. forward-only eval re-uploading weights) can then OOM here
             // while almost all of VRAM is pool-reserved-but-free. Trimming returns it so the retry succeeds.
-            CuBlasNative.cuCtxSynchronize();
-            if (_asyncMemPool != IntPtr.Zero) CuBlasNative.cuMemPoolTrimTo(_asyncMemPool, 0);
+            // As in the sync-path reclamation: a failed sync is a real (often sticky) error, so throw
+            // with its real name rather than let it masquerade as the cuMemAllocAsync OOM below.
+            // Trim is best-effort.
+            CuBlasNative.CheckCudaResult(CuBlasNative.cuCtxSynchronize(), "cuCtxSynchronize (async-pool OOM reclamation)");
+            if (_asyncMemPool != IntPtr.Zero)
+            {
+                var trimStatus = CuBlasNative.cuMemPoolTrimTo(_asyncMemPool, 0);
+                if (trimStatus != CudaResult.Success)
+                    System.Diagnostics.Trace.TraceWarning(
+                        $"[CudaBackend] cuMemPoolTrimTo failed during async-path OOM reclamation: {trimStatus}; the cuMemAllocAsync retry may still OOM.");
+            }
             r = CuBlasNative.cuMemAllocAsync(out p, byteSize, _stream);
         }
         if (r != CudaResult.Success) GpuMemoryTracker.Dump($"cuMemAllocAsync OOM requesting {byteSize} bytes");
