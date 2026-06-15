@@ -18,6 +18,8 @@ public static class Fp16NativeOpKernels
     public const string GeluKernelName = "fp16_gelu";
     public const string ReluKernelName = "fp16_relu";
     public const string AddKernelName = "fp16_add";
+    public const string ConvertF32ToF16KernelName = "fp16_convert_f32_to_f16";
+    public const string ConvertF16ToF32KernelName = "fp16_convert_f16_to_f32";
 
     public static string GetSource()
     {
@@ -64,8 +66,33 @@ __kernel void fp16_add(
     float s = vload_half(i, a) + vload_half(i, b);
     vstore_half(s, i, output);
 }
+
+// FP32 -> FP16 (half storage) conversion. vstore_half rounds the float to IEEE-754 half and writes it,
+// using ONLY the core vstore_half built-in (no cl_khr_fp16 arithmetic extension). This is the native
+// counterpart of OpenClBackend.ConvertToFp16 so half-buffer round-trips work on devices (e.g. NVIDIA
+// OpenCL) that expose vload_half/vstore_half but NOT the cl_khr_fp16 extension.
+__kernel void fp16_convert_f32_to_f16(
+    __global const float* input,
+    __global half* output,
+    const int n)
+{
+    int i = get_global_id(0);
+    if (i >= n) return;
+    vstore_half(input[i], i, output);
+}
+
+// FP16 (half storage) -> FP32 conversion via the core vload_half built-in.
+__kernel void fp16_convert_f16_to_f32(
+    __global const half* input,
+    __global float* output,
+    const int n)
+{
+    int i = get_global_id(0);
+    if (i >= n) return;
+    output[i] = vload_half(i, input);
+}
 ";
     }
 
-    public static string[] GetKernelNames() => new[] { GeluKernelName, ReluKernelName, AddKernelName };
+    public static string[] GetKernelNames() => new[] { GeluKernelName, ReluKernelName, AddKernelName, ConvertF32ToF16KernelName, ConvertF16ToF32KernelName };
 }
