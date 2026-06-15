@@ -2235,6 +2235,23 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         bool preferGenericForGpu = engine.SupportsGpu
             && Environment.GetEnvironmentVariable("AIDOTNET_GPU_PREFER_GENERIC") != "0";
 
+        // Diagnostic companion to GRAPHSTEP-DIAG (gated on AIDOTNET_CUDA_GRAPH_STEP=1): record the engine
+        // type + SupportsGpu + the resulting preferGenericForGpu at compile time. When a GPU plan is
+        // unexpectedly graph-ineligible this immediately distinguishes "engine isn't GPU / SupportsGpu
+        // false" from "ops aren't GPU-pure", which is otherwise invisible.
+        if (s_graphStepEnabled && typeof(T) == typeof(float))
+        {
+            try
+            {
+                System.IO.File.AppendAllText(
+                    System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_graphstep_diag.txt"),
+                    $"[GRAPHSTEP-ENGINE] type={engine.GetType().Name} SupportsGpu={engine.SupportsGpu} "
+                    + $"DirectGpu?={(engine.DirectGpu != null)} preferGenericForGpu={preferGenericForGpu}"
+                    + System.Environment.NewLine);
+            }
+            catch { /* diagnostic must never break the build */ }
+        }
+
         if (typeof(T) == typeof(float) && Optimization.TensorCodecOptions.Current.EnableDataflowFusion
             && !preferGenericForGpu)
         {

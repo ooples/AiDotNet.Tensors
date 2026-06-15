@@ -50,10 +50,10 @@ public partial class CpuEngine : ITensorLevelEngine
     private const int TensorMatMulGemvParallelThreshold = 128 * 1024;
 
     /// <inheritdoc/>
-    public string Name => "CPU Engine";
+    public virtual string Name => "CPU Engine";
 
     /// <inheritdoc/>
-    public bool SupportsGpu => false;
+    public virtual bool SupportsGpu => false;
 
     /// <inheritdoc/>
     public DirectGpu.DirectGpuEngine? DirectGpu => null;
