@@ -8,14 +8,34 @@ using Xunit.Abstractions;
 
 namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 
-// Finite-difference gradient checks for the ops a Conv+GroupNorm+SiLU U-Net
-// backbone stacks. Hunting a ~500x/layer backward attenuation that freezes deep
-// nets (ODISE/ResNet LossStrictlyDecreases) despite a healthy unity-gain forward.
+// GPU autodiff-recording regression guard for the conv/pool ops a Conv+GroupNorm+
+// SiLU U-Net backbone stacks. Several DirectGpuTensorEngine overrides
+// (ConvTranspose2D, MaxPool2D, AvgPool2D, Conv3D) used to run the GPU kernel and
+// return an UNTRACKED tensor — invisible to the gradient tape — freezing training
+// for any GPU-resident model that used them. These finite-difference checks pin to
+// the GPU engine so they exercise exactly that path; they SKIP when no GPU backend
+// is present (the regression is GPU-path-specific and cannot manifest on CPU). CPU
+// autodiff correctness for these ops is covered separately by GradientCorrectnessTests.
 public class ConvGroupNormGradCheck
 {
     private readonly ITestOutputHelper _out;
-    private readonly IEngine _engine = AiDotNetEngine.Current;
-    public ConvGroupNormGradCheck(ITestOutputHelper output) => _out = output;
+    private readonly IEngine _engine;
+    private readonly bool _gpuAvailable;
+
+    public ConvGroupNormGradCheck(ITestOutputHelper output)
+    {
+        _out = output;
+        _engine = AiDotNetEngine.Current;
+        _gpuAvailable = _engine is DirectGpuTensorEngine gpu && gpu.IsGpuAvailable;
+    }
+
+    // Guards the GPU regression these tests exist for: without an active GPU backend
+    // AiDotNetEngine.Current is the CPU engine, which always recorded correctly, so a
+    // pass would give false confidence about the GPU path. Skip instead of silently
+    // validating CPU.
+    private void RequireGpuEngine() => Skip.IfNot(_gpuAvailable,
+        "ConvGroupNormGradCheck requires an active DirectGpuTensorEngine backend — it guards the " +
+        "GPU autodiff-recording path. CPU autodiff for these ops is covered by GradientCorrectnessTests.");
 
     private static Tensor<double> Rand(int[] shape, int seed, double scale = 1.0)
     {
@@ -67,9 +87,10 @@ public class ConvGroupNormGradCheck
     // from broken without flagging finite-difference noise.
     private const double GradCheckTol = 2e-2;
 
-    [Fact]
+    [SkippableFact]
     public void Swish_GradMatchesNumeric()
     {
+        RequireGpuEngine();
         var x = Rand(new[] { 1, 4, 4, 4 }, 1);
         using var tape = new GradientTape<double>();
         var loss = _engine.ReduceSum(_engine.Swish(x), null);
@@ -79,9 +100,10 @@ public class ConvGroupNormGradCheck
         Assert.True(Report("Swish dX", ga, num) < GradCheckTol, "Swish input gradient mismatch");
     }
 
-    [Fact]
+    [SkippableFact]
     public void Conv2D_GradInputMatchesNumeric()
     {
+        RequireGpuEngine();
         var x = Rand(new[] { 1, 3, 6, 6 }, 2);
         var k = Rand(new[] { 4, 3, 3, 3 }, 3);
         using var tape = new GradientTape<double>();
@@ -96,9 +118,10 @@ public class ConvGroupNormGradCheck
         Assert.True(Report("Conv2D dK", gka, numK) < GradCheckTol, "Conv2D kernel gradient mismatch");
     }
 
-    [Fact]
+    [SkippableFact]
     public void GroupNorm_GradInputMatchesNumeric()
     {
+        RequireGpuEngine();
         var x = Rand(new[] { 1, 4, 4, 4 }, 4, 2.0);
         var gamma = Rand(new[] { 4 }, 5); var beta = Rand(new[] { 4 }, 6);
         using var tape = new GradientTape<double>();
@@ -110,9 +133,10 @@ public class ConvGroupNormGradCheck
         Assert.True(Report("GroupNorm dX", gxa, num) < GradCheckTol, "GroupNorm input gradient mismatch");
     }
 
-    [Fact]
+    [SkippableFact]
     public void ConvTranspose2D_GradMatchesNumeric()
     {
+        RequireGpuEngine();
         // input [B, Cin, H, W], kernel [Cin, Cout, kH, kW] (ConvTranspose layout)
         var x = Rand(new[] { 1, 3, 4, 4 }, 12);
         var k = Rand(new[] { 3, 4, 3, 3 }, 13);
@@ -131,9 +155,10 @@ public class ConvGroupNormGradCheck
         Assert.True(Report("ConvTranspose2D dK", gka, numK) < GradCheckTol, "ConvTranspose2D kernel gradient mismatch");
     }
 
-    [Fact]
+    [SkippableFact]
     public void MaxPool2D_GradReachesInput()
     {
+        RequireGpuEngine();
         var x = Rand(new[] { 1, 2, 4, 4 }, 20);
         using var tape = new GradientTape<double>();
         var loss = _engine.ReduceSum(_engine.MaxPool2D(x, 2, 2, 0), null);
@@ -144,9 +169,10 @@ public class ConvGroupNormGradCheck
         Assert.True(Report("MaxPool2D dX", ga, num) < GradCheckTol, "MaxPool2D input gradient mismatch");
     }
 
-    [Fact]
+    [SkippableFact]
     public void AvgPool2D_GradReachesInput()
     {
+        RequireGpuEngine();
         var x = Rand(new[] { 1, 2, 4, 4 }, 21);
         using var tape = new GradientTape<double>();
         var loss = _engine.ReduceSum(_engine.AvgPool2D(x, 2, 2, 0), null);
@@ -157,9 +183,10 @@ public class ConvGroupNormGradCheck
         Assert.True(Report("AvgPool2D dX", ga, num) < GradCheckTol, "AvgPool2D input gradient mismatch");
     }
 
-    [Fact]
+    [SkippableFact]
     public void Conv3D_GradMatchesNumeric()
     {
+        RequireGpuEngine();
         var x = Rand(new[] { 1, 2, 4, 4, 4 }, 22);
         var k = Rand(new[] { 3, 2, 3, 3, 3 }, 23);
         using var tape = new GradientTape<double>();
@@ -177,9 +204,10 @@ public class ConvGroupNormGradCheck
     // Deep stack: Conv -> GroupNorm -> Swish, repeated. Measures the gradient
     // magnitude reaching the INPUT vs the per-stage analytic-vs-numeric ratio,
     // to localize a per-layer attenuation.
-    [Fact]
+    [SkippableFact]
     public void DeepStack_GradInputDoesNotVanish()
     {
+        RequireGpuEngine();
         int depth = 8;
         var x = Rand(new[] { 1, 8, 8, 8 }, 7);
         var kernels = new Tensor<double>[depth];
