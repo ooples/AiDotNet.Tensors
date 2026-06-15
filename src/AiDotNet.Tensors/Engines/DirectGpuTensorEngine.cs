@@ -6475,14 +6475,56 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     /// <summary>
     /// GPU-accelerated locally connected 2D backward pass for weight gradients.
-    /// Falls back to CPU implementation if GPU is unavailable.
+    /// Falls back to CPU only when the GPU backend is unavailable or the launch throws.
     /// </summary>
     public override Tensor<T> LocallyConnectedConv2DBackwardWeights<T>(Tensor<T> gradOutput, Tensor<T> input, int[] weightsShape, int[] stride)
     {
-        // The GPU LocallyConnectedConv2DBackwardWeights kernel disagreed with the CPU reference (GpuConvKernelCoverageTests);
-        // route to the correct CPU implementation until the GPU kernel is fixed (tracked in #622). The `override`
-        // (vs the prior `new` hide) keeps virtual dispatch correct.
-        return base.LocallyConnectedConv2DBackwardWeights(gradOutput, input, weightsShape, stride);
+        if (!TryGetBackend(out var backend))
+            return base.LocallyConnectedConv2DBackwardWeights(gradOutput, input, weightsShape, stride);
+
+        if (gradOutput.Rank != 4 || input.Rank != 4)
+            return base.LocallyConnectedConv2DBackwardWeights(gradOutput, input, weightsShape, stride);
+
+        if (weightsShape == null || weightsShape.Length != 6)
+            throw new ArgumentException("Weights shape must be an array of 6 elements", nameof(weightsShape));
+        if (stride == null || stride.Length != 2)
+            throw new ArgumentException("Stride must be an array of 2 elements", nameof(stride));
+
+        int batch = input.Shape._dims[0];
+        int inChannels = input.Shape._dims[1];
+        int inHeight = input.Shape._dims[2];
+        int inWidth = input.Shape._dims[3];
+
+        int outHeight = weightsShape[0];
+        int outWidth = weightsShape[1];
+        int outChannels = weightsShape[2];
+        int kernelH = weightsShape[4];
+        int kernelW = weightsShape[5];
+
+        int weightsSize = outHeight * outWidth * outChannels * inChannels * kernelH * kernelW;
+
+        using var gradOutputBuffer = GetOrAllocateBuffer(backend, gradOutput);
+        using var inputBuffer = GetOrAllocateBuffer(backend, input);
+        using var gradWeightsBuffer = AllocateOutputBuffer(backend, weightsSize);
+
+        try
+        {
+            backend.LocallyConnectedConv2DBackwardWeights(
+                inputBuffer.Buffer, gradOutputBuffer.Buffer, gradWeightsBuffer.Buffer,
+                batch, inChannels, inHeight, inWidth,
+                outChannels, outHeight, outWidth,
+                kernelH, kernelW, stride[0], stride[1]);
+
+            float[] resultFloat = new float[weightsSize];
+            backend.DownloadBuffer(gradWeightsBuffer.Buffer, resultFloat);
+
+            T[] resultData = DirectGpuEngine.FromFloatArray<T>(resultFloat);
+            return new Tensor<T>(resultData, weightsShape);
+        }
+        catch
+        {
+            return base.LocallyConnectedConv2DBackwardWeights(gradOutput, input, weightsShape, stride);
+        }
     }
 
     /// <summary>
@@ -6609,10 +6651,75 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int[] padding,
         int[] dilation)
     {
-        // The GPU DeformableConv2D kernel disagreed with the CPU reference (GpuConvKernelCoverageTests);
-        // route to the correct CPU implementation until the GPU kernel is fixed (tracked in #622). The `override`
-        // (vs the prior `new` hide) keeps virtual dispatch correct.
-        return base.DeformableConv2D(input, kernel, offsets, mask, stride, padding, dilation);
+        // The CUDA/HIP deformable kernels' offset-layout bug is fixed (blocked layout matching the
+        // CPU reference), so the GPU path is used again. CPU fallback remains only for genuine
+        // GPU-unavailability or a launch exception. Validated by GpuConvKernelCoverageTests (GPU runner).
+        if (!TryGetBackend(out var backend))
+            return base.DeformableConv2D(input, kernel, offsets, mask, stride, padding, dilation);
+
+        if (input.Rank != 4 || kernel.Rank != 4 || offsets.Rank != 4)
+            return base.DeformableConv2D(input, kernel, offsets, mask, stride, padding, dilation);
+
+        if (stride == null || stride.Length != 2)
+            throw new ArgumentException("Stride must be an array of 2 elements", nameof(stride));
+        if (padding == null || padding.Length != 2)
+            throw new ArgumentException("Padding must be an array of 2 elements", nameof(padding));
+        if (dilation == null || dilation.Length != 2)
+            throw new ArgumentException("Dilation must be an array of 2 elements", nameof(dilation));
+
+        int batch = input.Shape._dims[0];
+        int inChannels = input.Shape._dims[1];
+        int inHeight = input.Shape._dims[2];
+        int inWidth = input.Shape._dims[3];
+
+        int outChannels = kernel.Shape._dims[0];
+        int kernelH = kernel.Shape._dims[2];
+        int kernelW = kernel.Shape._dims[3];
+
+        int outHeight = (inHeight + 2 * padding[0] - dilation[0] * (kernelH - 1) - 1) / stride[0] + 1;
+        int outWidth = (inWidth + 2 * padding[1] - dilation[1] * (kernelW - 1) - 1) / stride[1] + 1;
+
+        if (outHeight <= 0 || outWidth <= 0)
+            return base.DeformableConv2D(input, kernel, offsets, mask, stride, padding, dilation);
+
+        int offsetChannels = offsets.Shape._dims[1];
+        int deformGroups = offsetChannels / (2 * kernelH * kernelW);
+        int groups = 1; // Standard deformable conv uses groups=1
+
+        int outputSize = batch * outChannels * outHeight * outWidth;
+
+        using var inputBuffer = GetOrAllocateBuffer(backend, input);
+        using var weightsBuffer = GetOrCacheWeightBuffer(backend, kernel.GetDataArray(), PersistentTensorRole.Weights);
+        using var offsetsBuffer = GetOrAllocateBuffer(backend, offsets);
+        using var outputBuffer = AllocateOutputBuffer(backend, outputSize);
+
+        try
+        {
+            OwnedBuffer? maskBuffer = mask != null ? GetOrAllocateBuffer(backend, mask) : null;
+            try
+            {
+                backend.DeformableConv2D(
+                    inputBuffer.Buffer, weightsBuffer.Buffer, offsetsBuffer.Buffer, maskBuffer?.Buffer, outputBuffer.Buffer,
+                    batch, inChannels, inHeight, inWidth,
+                    outChannels, outHeight, outWidth,
+                    kernelH, kernelW, stride[0], stride[1], padding[0], padding[1],
+                    dilation[0], dilation[1], groups, deformGroups);
+
+                float[] resultFloat = new float[outputSize];
+                backend.DownloadBuffer(outputBuffer.Buffer, resultFloat);
+
+                T[] resultData = DirectGpuEngine.FromFloatArray<T>(resultFloat);
+                return new Tensor<T>(resultData, new[] { batch, outChannels, outHeight, outWidth });
+            }
+            finally
+            {
+                maskBuffer?.Dispose();
+            }
+        }
+        catch
+        {
+            return base.DeformableConv2D(input, kernel, offsets, mask, stride, padding, dilation);
+        }
     }
 
     /// <summary>
@@ -6630,10 +6737,63 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int[] padding,
         int[] dilation)
     {
-        // The GPU DeformableConv2DBackwardInput kernel disagreed with the CPU reference (GpuConvKernelCoverageTests);
-        // route to the correct CPU implementation until the GPU kernel is fixed (tracked in #622). The `override`
-        // (vs the prior `new` hide) keeps virtual dispatch correct.
-        return base.DeformableConv2DBackwardInput(gradOutput, input, kernel, offsets, mask, inputShape, stride, padding, dilation);
+        // GPU path restored after the deformable offset-layout kernel fix (see DeformableConv2D).
+        if (!TryGetBackend(out var backend))
+            return base.DeformableConv2DBackwardInput(gradOutput, input, kernel, offsets, mask, inputShape, stride, padding, dilation);
+
+        if (gradOutput.Rank != 4 || input.Rank != 4 || kernel.Rank != 4)
+            return base.DeformableConv2DBackwardInput(gradOutput, input, kernel, offsets, mask, inputShape, stride, padding, dilation);
+
+        int batch = inputShape[0];
+        int inChannels = inputShape[1];
+        int inHeight = inputShape[2];
+        int inWidth = inputShape[3];
+
+        int outChannels = kernel.Shape._dims[0];
+        int kernelH = kernel.Shape._dims[2];
+        int kernelW = kernel.Shape._dims[3];
+
+        int outHeight = gradOutput.Shape._dims[2];
+        int outWidth = gradOutput.Shape._dims[3];
+
+        int offsetChannels = offsets.Shape._dims[1];
+        int deformGroups = offsetChannels / (2 * kernelH * kernelW);
+        int groups = 1;
+
+        int inputSize = batch * inChannels * inHeight * inWidth;
+
+        using var gradOutputBuffer = GetOrAllocateBuffer(backend, gradOutput);
+        using var weightsBuffer = GetOrCacheWeightBuffer(backend, kernel.GetDataArray(), PersistentTensorRole.Weights);
+        using var offsetsBuffer = GetOrAllocateBuffer(backend, offsets);
+        using var gradInputBuffer = AllocateOutputBuffer(backend, inputSize);
+
+        try
+        {
+            OwnedBuffer? maskBuffer = mask != null ? GetOrAllocateBuffer(backend, mask) : null;
+            try
+            {
+                backend.DeformableConv2DBackwardInput(
+                    gradOutputBuffer.Buffer, weightsBuffer.Buffer, offsetsBuffer.Buffer, maskBuffer?.Buffer, gradInputBuffer.Buffer,
+                    batch, inChannels, inHeight, inWidth,
+                    outChannels, outHeight, outWidth,
+                    kernelH, kernelW, stride[0], stride[1], padding[0], padding[1],
+                    dilation[0], dilation[1], groups, deformGroups);
+
+                float[] resultFloat = new float[inputSize];
+                backend.DownloadBuffer(gradInputBuffer.Buffer, resultFloat);
+
+                T[] resultData = DirectGpuEngine.FromFloatArray<T>(resultFloat);
+                return new Tensor<T>(resultData, inputShape);
+            }
+            finally
+            {
+                maskBuffer?.Dispose();
+            }
+        }
+        catch
+        {
+            return base.DeformableConv2DBackwardInput(gradOutput, input, kernel, offsets, mask, inputShape, stride, padding, dilation);
+        }
     }
 
     /// <summary>
@@ -6650,10 +6810,63 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int[] padding,
         int[] dilation)
     {
-        // The GPU DeformableConv2DBackwardKernel kernel disagreed with the CPU reference (GpuConvKernelCoverageTests);
-        // route to the correct CPU implementation until the GPU kernel is fixed (tracked in #622). The `override`
-        // (vs the prior `new` hide) keeps virtual dispatch correct.
-        return base.DeformableConv2DBackwardKernel(gradOutput, input, offsets, mask, kernelShape, stride, padding, dilation);
+        // GPU path restored after the deformable offset-layout kernel fix (see DeformableConv2D).
+        if (!TryGetBackend(out var backend))
+            return base.DeformableConv2DBackwardKernel(gradOutput, input, offsets, mask, kernelShape, stride, padding, dilation);
+
+        if (gradOutput.Rank != 4 || input.Rank != 4)
+            return base.DeformableConv2DBackwardKernel(gradOutput, input, offsets, mask, kernelShape, stride, padding, dilation);
+
+        int batch = input.Shape._dims[0];
+        int inChannels = input.Shape._dims[1];
+        int inHeight = input.Shape._dims[2];
+        int inWidth = input.Shape._dims[3];
+
+        int outChannels = kernelShape[0];
+        int kernelH = kernelShape[2];
+        int kernelW = kernelShape[3];
+
+        int outHeight = gradOutput.Shape._dims[2];
+        int outWidth = gradOutput.Shape._dims[3];
+
+        int offsetChannels = offsets.Shape._dims[1];
+        int deformGroups = offsetChannels / (2 * kernelH * kernelW);
+        int groups = 1;
+
+        int kernelSize = kernelShape[0] * kernelShape[1] * kernelShape[2] * kernelShape[3];
+
+        using var gradOutputBuffer = GetOrAllocateBuffer(backend, gradOutput);
+        using var inputBuffer = GetOrAllocateBuffer(backend, input);
+        using var offsetsBuffer = GetOrAllocateBuffer(backend, offsets);
+        using var gradWeightsBuffer = AllocateOutputBuffer(backend, kernelSize);
+
+        try
+        {
+            OwnedBuffer? maskBuffer = mask != null ? GetOrAllocateBuffer(backend, mask) : null;
+            try
+            {
+                backend.DeformableConv2DBackwardWeights(
+                    inputBuffer.Buffer, gradOutputBuffer.Buffer, offsetsBuffer.Buffer, maskBuffer?.Buffer, gradWeightsBuffer.Buffer,
+                    batch, inChannels, inHeight, inWidth,
+                    outChannels, outHeight, outWidth,
+                    kernelH, kernelW, stride[0], stride[1], padding[0], padding[1],
+                    dilation[0], dilation[1], groups, deformGroups);
+
+                float[] resultFloat = new float[kernelSize];
+                backend.DownloadBuffer(gradWeightsBuffer.Buffer, resultFloat);
+
+                T[] resultData = DirectGpuEngine.FromFloatArray<T>(resultFloat);
+                return new Tensor<T>(resultData, kernelShape);
+            }
+            finally
+            {
+                maskBuffer?.Dispose();
+            }
+        }
+        catch
+        {
+            return base.DeformableConv2DBackwardKernel(gradOutput, input, offsets, mask, kernelShape, stride, padding, dilation);
+        }
     }
 
     /// <summary>
@@ -6670,10 +6883,65 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int[] padding,
         int[] dilation)
     {
-        // The GPU DeformableConv2DBackwardOffset kernel disagreed with the CPU reference (GpuConvKernelCoverageTests);
-        // route to the correct CPU implementation until the GPU kernel is fixed (tracked in #622). The `override`
-        // (vs the prior `new` hide) keeps virtual dispatch correct.
-        return base.DeformableConv2DBackwardOffset(gradOutput, input, kernel, offsets, mask, stride, padding, dilation);
+        // GPU path restored after the deformable offset-layout kernel fix (see DeformableConv2D); this
+        // kernel also got the backward_offset blocked-write decode fix so gradOffset matches CPU.
+        if (!TryGetBackend(out var backend))
+            return base.DeformableConv2DBackwardOffset(gradOutput, input, kernel, offsets, mask, stride, padding, dilation);
+
+        if (gradOutput.Rank != 4 || input.Rank != 4 || kernel.Rank != 4)
+            return base.DeformableConv2DBackwardOffset(gradOutput, input, kernel, offsets, mask, stride, padding, dilation);
+
+        int batch = input.Shape._dims[0];
+        int inChannels = input.Shape._dims[1];
+        int inHeight = input.Shape._dims[2];
+        int inWidth = input.Shape._dims[3];
+
+        int outChannels = kernel.Shape._dims[0];
+        int kernelH = kernel.Shape._dims[2];
+        int kernelW = kernel.Shape._dims[3];
+
+        int outHeight = gradOutput.Shape._dims[2];
+        int outWidth = gradOutput.Shape._dims[3];
+
+        int offsetChannels = offsets.Shape._dims[1];
+        int deformGroups = offsetChannels / (2 * kernelH * kernelW);
+        int groups = 1;
+
+        int offsetSize = batch * offsetChannels * outHeight * outWidth;
+
+        using var gradOutputBuffer = GetOrAllocateBuffer(backend, gradOutput);
+        using var inputBuffer = GetOrAllocateBuffer(backend, input);
+        using var weightsBuffer = GetOrCacheWeightBuffer(backend, kernel.GetDataArray(), PersistentTensorRole.Weights);
+        using var offsetsBuffer = GetOrAllocateBuffer(backend, offsets);
+        using var gradOffsetBuffer = AllocateOutputBuffer(backend, offsetSize);
+
+        try
+        {
+            OwnedBuffer? maskBuffer = mask != null ? GetOrAllocateBuffer(backend, mask) : null;
+            try
+            {
+                backend.DeformableConv2DBackwardOffset(
+                    inputBuffer.Buffer, weightsBuffer.Buffer, gradOutputBuffer.Buffer, offsetsBuffer.Buffer, maskBuffer?.Buffer, gradOffsetBuffer.Buffer,
+                    batch, inChannels, inHeight, inWidth,
+                    outChannels, outHeight, outWidth,
+                    kernelH, kernelW, stride[0], stride[1], padding[0], padding[1],
+                    dilation[0], dilation[1], groups, deformGroups);
+
+                float[] resultFloat = new float[offsetSize];
+                backend.DownloadBuffer(gradOffsetBuffer.Buffer, resultFloat);
+
+                T[] resultData = DirectGpuEngine.FromFloatArray<T>(resultFloat);
+                return new Tensor<T>(resultData, offsets.Shape._dims);
+            }
+            finally
+            {
+                maskBuffer?.Dispose();
+            }
+        }
+        catch
+        {
+            return base.DeformableConv2DBackwardOffset(gradOutput, input, kernel, offsets, mask, stride, padding, dilation);
+        }
     }
 
     /// <summary>
@@ -6690,10 +6958,60 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int[] padding,
         int[] dilation)
     {
-        // The GPU DeformableConv2DBackwardMask kernel disagreed with the CPU reference (GpuConvKernelCoverageTests);
-        // route to the correct CPU implementation until the GPU kernel is fixed (tracked in #622). The `override`
-        // (vs the prior `new` hide) keeps virtual dispatch correct.
-        return base.DeformableConv2DBackwardMask(gradOutput, input, kernel, offsets, mask, stride, padding, dilation);
+        // GPU path restored after the deformable offset-layout kernel fix (see DeformableConv2D).
+        if (mask == null)
+            throw new ArgumentNullException(nameof(mask), "Mask cannot be null when computing mask gradients");
+
+        if (!TryGetBackend(out var backend))
+            return base.DeformableConv2DBackwardMask(gradOutput, input, kernel, offsets, mask, stride, padding, dilation);
+
+        if (gradOutput.Rank != 4 || input.Rank != 4 || kernel.Rank != 4 || mask.Rank != 4)
+            return base.DeformableConv2DBackwardMask(gradOutput, input, kernel, offsets, mask, stride, padding, dilation);
+
+        int batch = input.Shape._dims[0];
+        int inChannels = input.Shape._dims[1];
+        int inHeight = input.Shape._dims[2];
+        int inWidth = input.Shape._dims[3];
+
+        int outChannels = kernel.Shape._dims[0];
+        int kernelH = kernel.Shape._dims[2];
+        int kernelW = kernel.Shape._dims[3];
+
+        int outHeight = gradOutput.Shape._dims[2];
+        int outWidth = gradOutput.Shape._dims[3];
+
+        int offsetChannels = offsets.Shape._dims[1];
+        int deformGroups = offsetChannels / (2 * kernelH * kernelW);
+        int maskChannels = deformGroups * kernelH * kernelW;
+        int groups = 1;
+
+        int maskSize = batch * maskChannels * outHeight * outWidth;
+
+        using var gradOutputBuffer = GetOrAllocateBuffer(backend, gradOutput);
+        using var inputBuffer = GetOrAllocateBuffer(backend, input);
+        using var weightsBuffer = GetOrCacheWeightBuffer(backend, kernel.GetDataArray(), PersistentTensorRole.Weights);
+        using var offsetsBuffer = GetOrAllocateBuffer(backend, offsets);
+        using var gradMaskBuffer = AllocateOutputBuffer(backend, maskSize);
+
+        try
+        {
+            backend.DeformableConv2DBackwardMask(
+                inputBuffer.Buffer, weightsBuffer.Buffer, gradOutputBuffer.Buffer, offsetsBuffer.Buffer, gradMaskBuffer.Buffer,
+                batch, inChannels, inHeight, inWidth,
+                outChannels, outHeight, outWidth,
+                kernelH, kernelW, stride[0], stride[1], padding[0], padding[1],
+                dilation[0], dilation[1], groups, deformGroups);
+
+            float[] resultFloat = new float[maskSize];
+            backend.DownloadBuffer(gradMaskBuffer.Buffer, resultFloat);
+
+            T[] resultData = DirectGpuEngine.FromFloatArray<T>(resultFloat);
+            return new Tensor<T>(resultData, mask.Shape._dims);
+        }
+        catch
+        {
+            return base.DeformableConv2DBackwardMask(gradOutput, input, kernel, offsets, mask, stride, padding, dilation);
+        }
     }
 
     /// <summary>

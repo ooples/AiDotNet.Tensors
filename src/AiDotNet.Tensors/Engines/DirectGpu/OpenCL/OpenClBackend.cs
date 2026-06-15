@@ -6407,8 +6407,11 @@ KERNEL VARIANTS (A/B testing):
         {
             var k = _kernelCache["deformable_conv2d_backward_weights"];
             uint arg = 0;
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+            // Kernel signature is (gradOutput, input, offsets, mask, gradWeights). The C# parameter
+            // order follows the engine call (input, gradOutput, ...), so binding by parameter position
+            // swapped gradOutput/input — the kernel read input as gradOutput. Bind in kernel order.
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)offsets).Buffer.Handle);
             k.SetArg(arg++, mask != null ? ((DirectOpenClGpuBuffer)mask).Buffer.Handle : IntPtr.Zero);
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradWeights).Buffer.Handle);
@@ -6445,9 +6448,11 @@ KERNEL VARIANTS (A/B testing):
         {
             var k = _kernelCache["deformable_conv2d_backward_offset"];
             uint arg = 0;
+            // Kernel signature is (gradOutput, input, weights, offsets, mask, gradOffsets) — bind in
+            // that order, not the C# parameter order (input, weights, gradOutput, ...).
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)weights).Buffer.Handle);
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)offsets).Buffer.Handle);
             k.SetArg(arg++, mask != null ? ((DirectOpenClGpuBuffer)mask).Buffer.Handle : IntPtr.Zero);
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOffset).Buffer.Handle);
@@ -6484,9 +6489,11 @@ KERNEL VARIANTS (A/B testing):
         {
             var k = _kernelCache["deformable_conv2d_backward_mask"];
             uint arg = 0;
+            // Kernel signature is (gradOutput, input, weights, offsets, gradMask) — bind in that order,
+            // not the C# parameter order (input, weights, gradOutput, ...).
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)weights).Buffer.Handle);
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)offsets).Buffer.Handle);
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradMask).Buffer.Handle);
             k.SetArg(arg++, batch);
