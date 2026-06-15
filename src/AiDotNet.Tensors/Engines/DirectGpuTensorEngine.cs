@@ -419,11 +419,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public bool IsGpuAvailable => _directGpu?.IsAvailable == true;
 
-    public new string Name => IsGpuAvailable
-        ? $"Direct GPU Engine ({_directGpu!.BackendName} {_directGpu.DeviceName})"
+    public override string Name => IsGpuAvailable
+        ? $"Direct GPU Engine ({_directGpu?.BackendName} {_directGpu?.DeviceName})"
         : "CPU Engine (DirectGpu unavailable)";
 
-    public new bool SupportsGpu => IsGpuAvailable;
+    public override bool SupportsGpu => IsGpuAvailable;
 
     /// <summary>
     /// Gets or sets the maximum number of activation cache entries.
@@ -437,10 +437,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     }
 
     DirectGpuEngine? IEngine.DirectGpu => _directGpu;
-
-    string IEngine.Name => Name;
-
-    bool IEngine.SupportsGpu => SupportsGpu;
 
     /// <summary>
     /// Begins a GPU scope that enables activation caching for intermediate results.
