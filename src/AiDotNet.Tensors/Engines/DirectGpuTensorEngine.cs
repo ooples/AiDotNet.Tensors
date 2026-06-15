@@ -1675,6 +1675,49 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     }
 
     /// <summary>
+    /// Like <see cref="ClearActivationCache"/> but DROPS each cached activation WITHOUT materializing its
+    /// pending GPU→CPU download. Use ONLY when the cached activations are provably dead — e.g. a forward-only
+    /// inference/eval pass, where no backward and no host read of an intermediate activation will follow.
+    /// ClearActivationCache downloads every entry to keep a later CPU read correct; over a long eval loop
+    /// that is ~one download per cached op × thousands of positions, which dominates wall-clock. Dropping
+    /// frees the GPU buffers and removes the (now-moot) materializers directly.
+    /// </summary>
+    public void DropActivationCache()
+    {
+        List<KeyValuePair<object, ActivationCacheEntry>> toDispose;
+        lock (_activationCacheLock)
+        {
+            toDispose = new List<KeyValuePair<object, ActivationCacheEntry>>(_activationCache);
+            _activationCache.Clear();
+            System.Threading.Interlocked.Exchange(ref _currentActivationCacheBytes, 0);
+            System.Threading.Interlocked.Exchange(ref _currentActivationManagedBytes, 0);
+        }
+        foreach (var kv in toDispose)
+            Helpers.DeferredArrayMaterializer.Remove(kv.Key); // drop the pending download — the data is dead
+        foreach (var kv in toDispose)
+            kv.Value.Dispose();                               // free the GPU buffer
+    }
+
+    /// <summary>
+    /// Returns the GPU buffer for a weight/bias tensor, preferring the tensor's OWN resident GPU buffer when
+    /// it has one. Under GPU-resident parameters the weights already live on the device (and the optimizer
+    /// updates that buffer in place), so using it directly is both correct and free. The host-array fallback
+    /// (<see cref="GetOrCacheWeightBuffer"/>) is keyed by <c>GetDataArray()</c>, which for a resident tensor
+    /// returns a FRESH host array on every call → a persistent-cache MISS every forward → a re-upload AND a
+    /// brand-new cached GPU buffer each time. That leaks thousands of weight-buffer copies (GPU OOM, found
+    /// via <see cref="DirectGpu.GpuMemoryTracker"/>: ~24 GB across ~10k FusedLinear weight allocs) and wastes
+    /// the bandwidth of re-uploading the weights every step. Falls back to the persistent cache for
+    /// CPU-resident weights, where <c>GetDataArray()</c> is the stable backing array and the cache hits.
+    /// </summary>
+    private OwnedBuffer GetWeightBufferPreferResident<T>(IDirectGpuBackend backend, Tensor<T> weights, PersistentTensorRole role)
+    {
+        var resident = weights.TryGetGpuBuffer();
+        if (resident != null)
+            return new OwnedBuffer(resident, ownsBuffer: false);
+        return GetOrCacheWeightBuffer(backend, weights.GetDataArray(), role);
+    }
+
+    /// <summary>
     /// Gets a GPU buffer for weight/bias tensor, auto-caching if not already persistent.
     /// Unlike GetOrAllocateBuffer, this caches the buffer in the persistent cache
     /// so subsequent calls reuse the same GPU buffer without re-uploading.
@@ -4270,8 +4313,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // whole-step graph and pinning the cortex to the launch-bound eager path (~14% util). GetOrCacheWeightBuffer
         // adds to _persistentBufferCache — the same cache the optimizer updates in place — so the weights stay
         // resident AND fresh. Matches the sibling fused-op path below (#GPU-graph-capture).
-        using var weightsBuffer = GetOrCacheWeightBuffer(backend, weights.GetDataArray(), PersistentTensorRole.Weights);
-        using var biasBuffer = bias != null ? GetOrCacheWeightBuffer(backend, bias.GetDataArray(), PersistentTensorRole.Biases) : default;
+        using var weightsBuffer = GetWeightBufferPreferResident(backend, weights, PersistentTensorRole.Weights);
+        using var biasBuffer = bias != null ? GetWeightBufferPreferResident(backend, bias, PersistentTensorRole.Biases) : default;
 
         try
         {
@@ -4371,7 +4414,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Upload input to GPU (activations are not cached persistently)
         using var inputBuffer = GetOrAllocateBuffer(backend, input);
         // Auto-cache weights and biases so they stay on GPU for subsequent calls
-        using var weightsBuffer = GetOrCacheWeightBuffer(backend, weights.GetDataArray(), PersistentTensorRole.Weights);
+        using var weightsBuffer = GetWeightBufferPreferResident(backend, weights, PersistentTensorRole.Weights);
         using var biasBuffer = bias != null ? GetOrCacheWeightBuffer(backend, bias.GetDataArray(), PersistentTensorRole.Biases) : default;
 
         // Execute the fused kernel and get result buffer
@@ -6322,7 +6365,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         // Use cache-aware buffer allocation for weights/bias (persistent tensors)
         using var inputBuffer = GetOrAllocateBuffer(backend, input);
-        using var weightsBuffer = GetOrCacheWeightBuffer(backend, weights.GetDataArray(), PersistentTensorRole.Weights);
+        using var weightsBuffer = GetWeightBufferPreferResident(backend, weights, PersistentTensorRole.Weights);
         using var outputBuffer = AllocateOutputBuffer(backend, outputSize);
 
         try
@@ -6396,7 +6439,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int inputSize = batch * inChannels * inHeight * inWidth;
 
         using var gradOutputBuffer = GetOrAllocateBuffer(backend, gradOutput);
-        using var weightsBuffer = GetOrCacheWeightBuffer(backend, weights.GetDataArray(), PersistentTensorRole.Weights);
+        using var weightsBuffer = GetWeightBufferPreferResident(backend, weights, PersistentTensorRole.Weights);
         using var gradInputBuffer = AllocateOutputBuffer(backend, inputSize);
 
         try
@@ -6557,7 +6600,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         int outputSize = batch * outChannels * outHeight * outWidth;
 
-        using var weightsBuffer = GetOrCacheWeightBuffer(backend, weights.GetDataArray(), PersistentTensorRole.Weights);
+        using var weightsBuffer = GetWeightBufferPreferResident(backend, weights, PersistentTensorRole.Weights);
         using var biasBuffer = bias != null ? GetOrCacheWeightBuffer(backend, bias.GetDataArray(), PersistentTensorRole.Biases) : default(OwnedBuffer?);
         var outputBuffer = backend.AllocateBuffer(outputSize);
 
@@ -7015,7 +7058,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         int outputSize = batch * outChannels * outHeight * outWidth;
 
-        using var weightsBuffer = GetOrCacheWeightBuffer(backend, weights.GetDataArray(), PersistentTensorRole.Weights);
+        using var weightsBuffer = GetWeightBufferPreferResident(backend, weights, PersistentTensorRole.Weights);
         using var offsetsBuffer = GetOrAllocateBuffer(backend, offsets);
         using var maskBuffer = mask != null ? GetOrAllocateBuffer(backend, mask) : default(OwnedBuffer?);
         using var biasBuffer = bias != null ? GetOrCacheWeightBuffer(backend, bias.GetDataArray(), PersistentTensorRole.Biases) : default(OwnedBuffer?);
@@ -8086,7 +8129,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             throw new ArgumentException($"Input last dimension {lastDim} doesn't match weight input dimension {inputDim}");
 
         // Upload weights
-        using var weightsBuffer = GetOrCacheWeightBuffer(backend, weights.GetDataArray(), PersistentTensorRole.Weights);
+        using var weightsBuffer = GetWeightBufferPreferResident(backend, weights, PersistentTensorRole.Weights);
 
         // Execute MatMul
         var resultBuffer = backend.MatMul(input.Buffer, weightsBuffer.Buffer, flatBatch, outputDim, inputDim);
@@ -12939,7 +12982,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // If cached, we modify it in place.
         // We must ensure CPU side knows it's dirty if we download later.
 
-        using var weightsBuffer = GetOrCacheWeightBuffer(backend, weights.GetDataArray(), PersistentTensorRole.Weights);
+        using var weightsBuffer = GetWeightBufferPreferResident(backend, weights, PersistentTensorRole.Weights);
         backend.StdpUpdate(
             weightsBuffer.Buffer,
             preTrace.Buffer,
