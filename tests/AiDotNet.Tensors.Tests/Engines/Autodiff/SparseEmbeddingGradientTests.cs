@@ -182,4 +182,56 @@ public class SparseEmbeddingGradientTests
             for (int d = 0; d < embeddingDim; d++)
                 Assert.Equal(reference[i, d], fromSparse[i, d], precision: 5);
     }
+
+    /// <summary>
+    /// Locks the rank-3 <c>[batch, seq, dim]</c> leading-axis flatten path of
+    /// <see cref="SparseEmbeddingGradient{T}.Build"/> — the path the embedding backward takes for a
+    /// batched <c>[batch, seq]</c> token input. Build must flatten the leading axes to the canonical
+    /// <c>[totalIndices, dim]</c> values and produce a <c>ToDense</c> identical to the reference
+    /// dense scatter.
+    /// <para>
+    /// This guards the fix where Build reconstructed the flattened values via
+    /// <c>new Tensor(gradOutput.GetDataArray(), [totalIndices, dim])</c>. On the GPU compiled path
+    /// <c>GetDataArray()</c> returns a POOLED download buffer whose length exceeds the logical
+    /// element count, so the raw <c>Tensor(data, dims)</c> ctor threw "The number of values does not
+    /// match the specified shape" — which latched <c>_fusedTrainingDisabled</c> and silently dropped
+    /// the entire cortex onto the eager path after one step. The fix routes through the
+    /// logical-length-aware <c>Tensor.Reshape</c> (validated end-to-end by the d768/L6 cortex run:
+    /// the ArgumentException disappears and the fused/compiled path engages). The oversized-backing
+    /// condition is GPU-pool-specific and cannot be reproduced with a CPU tensor (CPU
+    /// <c>GetDataArray()</c> always materializes exactly-sized logical data), so this test asserts
+    /// the flatten CORRECTNESS that the Reshape route must preserve.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void Build_Rank3BatchedGradient_FlattensLeadingAxes_AndMatchesDenseReference()
+    {
+        const int batch = 2, seq = 3, dim = 4, vocabSize = 16;
+        int totalIndices = batch * seq; // 6
+
+        // Rank-3 [batch, seq, dim] per-position gradient (the batched embedding-lookup backward shape).
+        var gradOutput = new Tensor<float>(new[] { batch, seq, dim });
+        for (int b = 0; b < batch; b++)
+            for (int s = 0; s < seq; s++)
+                for (int d = 0; d < dim; d++)
+                    gradOutput[b, s, d] = (b * seq + s) * 0.5f + d * 0.1f;
+
+        // Float indices — the cortex path is TensorEmbeddingLookupFromFloatIndicesBackward; index 5
+        // is duplicated so the dense scatter-ADD accumulation is exercised too.
+        var indices = new Tensor<float>(new float[] { 2, 5, 0, 5, 1, 3 }, new[] { batch, seq });
+
+        var sparse = SparseEmbeddingGradient<float>.Build(gradOutput, indices, vocabSize, dim);
+        Assert.Equal(totalIndices, sparse.NumIndices);
+        Assert.Equal(new[] { totalIndices, dim }, sparse.Values.Shape.ToArray());
+
+        // ToDense must equal the reference dense backward built from the flattened gradient.
+        var refValues = gradOutput.Reshape(totalIndices, dim);
+        var refIndices = new Tensor<long>(new long[] { 2, 5, 0, 5, 1, 3 }, new[] { totalIndices });
+        var refDense = Engine.TensorEmbeddingLookupBackward<float, long>(refValues, refIndices, vocabSize, dim);
+        var got = sparse.ToDense(Engine);
+        Assert.Equal(new[] { vocabSize, dim }, got.Shape.ToArray());
+        for (int i = 0; i < vocabSize; i++)
+            for (int d = 0; d < dim; d++)
+                Assert.Equal(refDense[i, d], got[i, d], precision: 5);
+    }
 }

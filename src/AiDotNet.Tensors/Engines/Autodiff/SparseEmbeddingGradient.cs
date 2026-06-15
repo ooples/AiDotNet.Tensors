@@ -169,7 +169,15 @@ public readonly struct SparseEmbeddingGradient<T>
         }
         if (gradOutput.Rank != 2 || gradOutput.Shape[0] != totalIndices)
         {
-            flatValues = new Tensor<T>(gradOutput.GetDataArray(), new[] { totalIndices, embeddingDim });
+            // Reshape (not raw-ctor): gradOutput may be backed by a pooled / storage-offset
+            // buffer whose GetDataArray() length exceeds the logical element count (e.g. the
+            // compiled-plan StepEager path hands back pooled activation buffers). The raw
+            // Tensor(data, dims) ctor validates data.Length against the shape and throws
+            // "number of values does not match the specified shape" on such a buffer, which
+            // latched _fusedTrainingDisabled and forced the whole model onto the eager path.
+            // Reshape validates against logical Length and materializes via Contiguous() when
+            // needed, so it round-trips pooled/strided gradients correctly.
+            flatValues = gradOutput.Reshape(totalIndices, embeddingDim);
         }
 
         // Widen indices to long AND normalize to rank-1 [totalIndices]. Callers commonly
@@ -184,7 +192,9 @@ public readonly struct SparseEmbeddingGradient<T>
         }
         else if (typeof(TIndex) == typeof(long) && indices is Tensor<long> alreadyLongMulti)
         {
-            longIndices = new Tensor<long>(alreadyLongMulti.GetDataArray(), new[] { totalIndices });
+            // Same pooled/storage-offset concern as the values reshape above — use Reshape so
+            // a higher-rank long indices tensor backed by an oversized buffer flattens correctly.
+            longIndices = alreadyLongMulti.Reshape(totalIndices);
         }
         else
         {
