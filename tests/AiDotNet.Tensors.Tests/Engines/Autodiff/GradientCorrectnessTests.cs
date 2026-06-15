@@ -12,6 +12,12 @@ namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 /// finite-difference numerical gradients. Every backward function must
 /// produce gradients that match within tolerance.
 /// </summary>
+// This fixture mutates the process-wide AiDotNetEngine.Current (constructor sets CpuEngine; Dispose
+// restores). Under xUnit's default per-class parallelism a concurrent GPU-engine test can flip the
+// global mid-gradient-computation, so ComputeGradients would dispatch to the GPU backward (e.g. the
+// 4D-NCHW PReLU parity flake). Joining the serial "EngineCurrentGlobalState" collection orders these
+// global-engine mutators so no two run at once.
+[Collection("EngineCurrentGlobalState")]
 public class GradientCorrectnessTests : IDisposable
 {
     // PR #333 added a [ModuleInitializer] that flips AiDotNetEngine.Current
