@@ -956,12 +956,26 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         LazyTensorScope scope, IEngine engine, Tensor<T>? explicitOutput, int[] requestedInputShape)
         => Compile(scope, engine, explicitOutput, explicitInput: null, requestedInputShape);
 
+    /// <summary>
+    /// Multi-input compile: every tensor in <paramref name="explicitInputs"/> is marked as
+    /// a mutable input slot that <c>SetInputs</c> re-binds on each <c>Execute</c>; all other
+    /// traced leaves (weights, true constants) stay frozen. This is what lets a forward with
+    /// more than one per-call-varying input — e.g. a diffusion denoiser reading both the noisy
+    /// sample AND a per-step timestep embedding — replay correctly instead of baking all but the
+    /// first input as constants. Each supplied tensor must be a traced leaf the graph reads
+    /// directly (see <see cref="ValidateExplicitInputsAreLeaves"/>).
+    /// </summary>
+    internal static CompiledInferencePlan<T> Compile(
+        LazyTensorScope scope, IEngine engine, Tensor<T>? explicitOutput, Tensor<T>[] explicitInputs)
+        => Compile(scope, engine, explicitOutput, explicitInput: null, requestedInputShape: null, explicitInputs);
+
     private static CompiledInferencePlan<T> Compile(
         LazyTensorScope scope,
         IEngine engine,
         Tensor<T>? explicitOutput,
         Tensor<T>? explicitInput,
-        int[]? requestedInputShape)
+        int[]? requestedInputShape,
+        Tensor<T>[]? explicitInputs = null)
     {
         var compiler = new LazyGraphCompiler();
         var optimized = compiler.Compile(scope.Nodes);
@@ -1000,12 +1014,33 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         // shape and treat all other leaves as frozen constants. This fixes
         // #304's weights.MatrixMultiply(query) case where the first op input
         // is a frozen weight matrix, not the variable query.
-        var inputTensor = SelectCompiledInputTensor(steps, explicitInput, requestedInputShape);
-        var inputShape = requestedInputShape is not null
-            ? (int[])requestedInputShape.Clone()
-            : inputTensor is not null
-                ? (int[])inputTensor._shape.Clone()
+        Tensor<T>? inputTensor;
+        Tensor<T>[]? compiledInputTensors;
+        int[] inputShape;
+        if (explicitInputs is not null)
+        {
+            // Multi-input plan: every supplied tensor is a mutable input slot. Validate each
+            // is a traced leaf so a caller can never pass a tensor the graph doesn't read and
+            // silently get it baked (the exact failure this path exists to prevent). The first
+            // input is the primary shape used for IsValid()/cache identity, matching the
+            // single-input contract where the noisy-sample shape keys the plan.
+            ValidateExplicitInputsAreLeaves(steps, explicitInputs);
+            inputTensor = null;
+            compiledInputTensors = explicitInputs;
+            inputShape = explicitInputs.Length > 0
+                ? (int[])explicitInputs[0]._shape.Clone()
                 : Array.Empty<int>();
+        }
+        else
+        {
+            inputTensor = SelectCompiledInputTensor(steps, explicitInput, requestedInputShape);
+            compiledInputTensors = null;
+            inputShape = requestedInputShape is not null
+                ? (int[])requestedInputShape.Clone()
+                : inputTensor is not null
+                    ? (int[])inputTensor._shape.Clone()
+                    : Array.Empty<int>();
+        }
 
         // Run step-mutating optimization passes BEFORE specialization.
         // Specialization pins raw pointers into each input/output buffer
@@ -1136,7 +1171,35 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                 ? optimizedSteps[optimizedSteps.Length - 1].OutputBuffer
                 : new Tensor<T>(new int[] { 0 });
         }
-        return new CompiledInferencePlan<T>(optimizedSteps, finalOutput, engine, inputShape, inputTensor, pinnedHandles);
+        return new CompiledInferencePlan<T>(
+            optimizedSteps, finalOutput, engine, inputShape, inputTensor, pinnedHandles,
+            compiledInputTensors: compiledInputTensors);
+    }
+
+    /// <summary>
+    /// Verifies every tensor the caller declared as a mutable input is actually a traced leaf
+    /// (a tensor the graph consumes but no step produces). A tensor that fails this check is one
+    /// the forward never reads directly — re-binding it via <c>SetInputs</c> would have no effect
+    /// and the value the graph actually uses would stay frozen at its trace-time content. Fail
+    /// closed with a clear message so the caller falls back to eager rather than replaying stale data.
+    /// </summary>
+    private static void ValidateExplicitInputsAreLeaves(List<CompiledStep<T>> steps, Tensor<T>[] explicitInputs)
+    {
+        var leaves = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+        foreach (var leaf in EnumerateLeafInputs(steps))
+            leaves.Add(leaf);
+
+        for (int i = 0; i < explicitInputs.Length; i++)
+        {
+            var inp = explicitInputs[i]
+                ?? throw new ArgumentException($"explicitInputs[{i}] is null.", nameof(explicitInputs));
+            if (!leaves.Contains(inp))
+                throw new InvalidOperationException(
+                    $"explicitInputs[{i}] (shape [{string.Join(",", inp._shape)}]) is not a traced leaf of " +
+                    "the captured graph — the forward never reads it directly, so it cannot be a mutable " +
+                    "input slot. Pass the exact tensor object the graph consumes, with no reshape/clone " +
+                    "between capture and first use.");
+        }
     }
 
     private static Tensor<T>? SelectCompiledInputTensor(
