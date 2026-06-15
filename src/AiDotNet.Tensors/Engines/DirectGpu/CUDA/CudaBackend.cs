@@ -52,6 +52,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     // cuMemAllocAsync/cuMemFreeAsync on _stream, so freed memory is reused in stream order without a host
     // sync (race-free + bounds mid-step peak). Opt-in via AIDOTNET_CUDA_ASYNC_ALLOC; default off.
     private bool _asyncAlloc;
+    private IntPtr _asyncMemPool; // the stream-ordered default mem pool (when _asyncAlloc); trimmed on sync-path OOM
     /// <summary>Diagnostic (#558): the nvrtc error if the FP16 kernel module failed to compile (which
     /// silently disables the whole FP16 GPU path). Null when FP16 compiled successfully.</summary>
     internal static string? Fp16ModuleCompileError;
@@ -296,15 +297,29 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             // Stream-ordered allocator setup (#558 layer 6). Retain freed memory in the pool for reuse
             // (caching-allocator behaviour) by maxing the release threshold; disable if the pool query
             // fails (older driver / no pool support) so AllocateBuffer falls back to the sync path.
-            _asyncAlloc = Environment.GetEnvironmentVariable("AIDOTNET_CUDA_ASYNC_ALLOC") == "1";
+            //
+            // DEFAULT ON (opt out with AIDOTNET_CUDA_ASYNC_ALLOC=0). Stream-ordered alloc/free
+            // (cuMemAllocAsync / cuMemFreeAsync on _stream) is REQUIRED for correctness under the async
+            // training pipeline: the legacy synchronous custom-pool path frees device memory with cuMemFree
+            // (on pool-bucket overflow and via the CudaGpuBuffer finalizer) the instant the host requests
+            // it — but a kernel launched earlier may not have EXECUTED yet (work is queued async on
+            // _stream). That kernel then accesses freed memory → a use-after-free that faults the context
+            // with a STICKY CUDA 700 (illegal address). It reproduces only on large models under
+            // VRAM-pressure buffer churn (the d768/L6 cortex) and vanishes entirely under
+            // CUDA_LAUNCH_BLOCKING=1 — the signature of an async free-before-execute race. cuMemFreeAsync
+            // is stream-ordered (the free is enqueued AFTER in-flight kernels on _stream), eliminating the
+            // race by construction. Blocking stream FLAGS do NOT fix it (the free is host-side, not
+            // stream-ordered); only stream-ordered freeing does.
+            _asyncAlloc = Environment.GetEnvironmentVariable("AIDOTNET_CUDA_ASYNC_ALLOC") != "0";
             if (_asyncAlloc)
             {
                 if (CuBlasNative.cuDeviceGetDefaultMemPool(out var memPool, device) == CudaResult.Success)
                 {
+                    _asyncMemPool = memPool;
                     ulong threshold = ulong.MaxValue; // CU_MEMPOOL_ATTR_RELEASE_THRESHOLD = 4
                     CuBlasNative.cuMemPoolSetAttribute(memPool, 4, ref threshold);
                 }
-                else { _asyncAlloc = false; }
+                else { _asyncAlloc = false; } // older driver / no stream-ordered pool support → sync path
             }
 
             CuBlasNative.CheckCublasStatus(CuBlasNative.cublasCreate(out _cublasHandle), "cublasCreate");
@@ -1216,6 +1231,15 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             // their events so their device memory returns to the pool — then drain the pool.
             DrainDeferredFrees(blockOldest: true);
             int drained = _bufferPool.DrainAll();
+            // When _asyncAlloc is on, freed stream-ordered allocations are RETAINED in the default mem
+            // pool (release threshold maxed for caching), so they show as device free=0 and the legacy
+            // cuMemAlloc here can't reach them. Sync the context so pending cuMemFreeAsync reclamations
+            // land in the pool, then trim the pool back to the OS so this sync allocation can succeed.
+            if (_asyncMemPool != IntPtr.Zero)
+            {
+                CuBlasNative.cuCtxSynchronize();
+                CuBlasNative.cuMemPoolTrimTo(_asyncMemPool, 0);
+            }
             result = CuBlasNative.cuMemAlloc(out devicePtr, byteSize);
             if (result != CudaResult.Success)
             {
