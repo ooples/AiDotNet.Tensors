@@ -51,6 +51,18 @@ public static class GpuMemoryTracker
     private static long s_totalAllocs;
     private static long s_totalFrees;
 
+    // Capture-trace: log every device allocation that fires INSIDE a CUDA-graph capture window. Such an
+    // allocation is a graph-purity violation — it either aborts capture (CUDA 906 STREAM_CAPTURE_UNSUPPORTED)
+    // or pins device pointers the replay can't honour — so listing the offending ops (by call site) is exactly
+    // what's needed to make a training step graph-capturable. Opt-in via AIDOTNET_GPU_CAPTURE_TRACE=1 and
+    // independent of the full tracker (Enabled): the capture window is one step, so the per-alloc stack capture
+    // here is bounded even with the heavyweight tracker off.
+    public static readonly bool CaptureTrace =
+        Environment.GetEnvironmentVariable("AIDOTNET_GPU_CAPTURE_TRACE") == "1";
+    private static int s_capturing;
+    private static readonly System.Collections.Generic.List<string> s_captureAllocs = new();
+    private static readonly object s_captureLock = new();
+
     /// <summary>Bytes currently allocated on the device and not yet freed (sum over the live set).</summary>
     public static long LiveBytes => Interlocked.Read(ref s_liveBytes);
 
@@ -60,10 +72,52 @@ public static class GpuMemoryTracker
     /// <summary>Number of live (un-freed) device allocations.</summary>
     public static int LiveCount => s_live.Count;
 
+    /// <summary>
+    /// Begins a CUDA-graph capture window: every <see cref="OnAlloc"/> until the returned scope is disposed is
+    /// recorded as a capture-time allocation (a graph-purity violation). On dispose the collected list is
+    /// appended to the capture-trace file. No-op unless <see cref="CaptureTrace"/>. Re-entrant-safe.
+    /// </summary>
+    public static IDisposable BeginCapture(string label)
+    {
+        if (!CaptureTrace) return NoopScope.Instance;
+        Interlocked.Increment(ref s_capturing);
+        return new CaptureScope(label);
+    }
+
+    private sealed class NoopScope : IDisposable { public static readonly NoopScope Instance = new(); public void Dispose() { } }
+
+    private sealed class CaptureScope : IDisposable
+    {
+        private readonly string _label;
+        public CaptureScope(string label) => _label = label;
+        public void Dispose()
+        {
+            Interlocked.Decrement(ref s_capturing);
+            string[] snapshot;
+            lock (s_captureLock) { snapshot = s_captureAllocs.ToArray(); s_captureAllocs.Clear(); }
+            try
+            {
+                string path = Environment.GetEnvironmentVariable("AIDOTNET_GPU_MEMTRACK_FILE")
+                              ?? System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_capture_allocs.txt");
+                var sb = new StringBuilder();
+                sb.AppendLine($"==== capture window [{_label}] — {snapshot.Length} device alloc(s) DURING capture (graph-purity violations) ====");
+                foreach (var s in snapshot) sb.AppendLine("  " + s);
+                System.IO.File.AppendAllText(path, sb.ToString());
+            }
+            catch { /* diagnostics must never destabilize the caller */ }
+        }
+    }
+
     /// <summary>Records a device allocation. Call right after a successful <c>cuMemAlloc</c>/<c>cuMemAllocAsync</c>.</summary>
     public static void OnAlloc(IntPtr ptr, long bytes)
     {
-        if (!Enabled || ptr == IntPtr.Zero || bytes <= 0) return;
+        if (ptr == IntPtr.Zero || bytes <= 0) return;
+        if (CaptureTrace && Volatile.Read(ref s_capturing) > 0)
+        {
+            string site = CaptureSite();
+            lock (s_captureLock) s_captureAllocs.Add($"{bytes / 1024.0,10:F1} KB  {site}");
+        }
+        if (!Enabled) return;
         var rec = new Rec { Bytes = bytes, Site = CaptureSite(), Seq = Interlocked.Increment(ref s_seq) };
         s_live[(long)ptr] = rec;
         Interlocked.Increment(ref s_totalAllocs);

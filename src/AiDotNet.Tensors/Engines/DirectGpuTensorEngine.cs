@@ -2863,8 +2863,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             int normSize = gamma.Length > 0 ? gamma.Length : input.Shape._dims[input.Rank - 1];
             int outerSize = input.Length / normSize;
             using var bufIn = GetOrAllocateContiguousInputBuffer(backend, input);
-            using var bufGamma = GetOrCacheWeightBuffer(backend, gamma.GetDataArray(), PersistentTensorRole.Weights);
-            using var bufBeta = GetOrCacheWeightBuffer(backend, beta.GetDataArray(), PersistentTensorRole.Biases);
+            // Prefer the resident GPU buffer for gamma/beta. GetOrCacheWeightBuffer keys its cache on the host
+            // array identity, but a resident weight's GetDataArray() returns a FRESH host copy each forward → a
+            // guaranteed cache miss → a device alloc on every call. Inside CUDA-graph capture that alloc is a
+            // graph-purity violation (the GpuMemoryTracker capture-trace pinpointed this exact site), and outside
+            // capture it's a per-step leak. GetWeightBufferPreferResident reuses the already-resident buffer.
+            using var bufGamma = GetWeightBufferPreferResident(backend, gamma, PersistentTensorRole.Weights);
+            using var bufBeta = GetWeightBufferPreferResident(backend, beta, PersistentTensorRole.Biases);
             var outBuf = GetOrCreateResidentBuffer(backend, output, input.Length);
             if (!_lnStatsScratch.TryGetValue(arr, out var stats))
             {

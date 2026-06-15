@@ -552,7 +552,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         RefreshGraphInputInPlace(cb);
                         RunGpuStepBodyForCapture(cb);
                         if (_graphHasEmbedding) gte.EmbeddingIndexExternallyManaged = true;
-                        exec = cb.CaptureGraph(() => RunGpuStepBodyForCapture(cb));
+                        // Trace every device allocation that fires INSIDE the capture (AIDOTNET_GPU_CAPTURE_TRACE=1):
+                        // those are the graph-purity violations that abort/spoil whole-step capture and keep the
+                        // cortex on the launch-bound eager path. The scope dumps the offending call sites on exit.
+                        using (AiDotNet.Tensors.Engines.DirectGpu.GpuMemoryTracker.BeginCapture("StepGraphCapture"))
+                            exec = cb.CaptureGraph(() => RunGpuStepBodyForCapture(cb));
                     }
                     catch
                     {
