@@ -465,6 +465,21 @@ public static class WeightRegistry
         // calculation, so neither overshoots budget.
         pool?.ReserveBytes(byteCount);
 
+        // ReserveBytes may have paged cold weights out under
+        // TransparentAutoEviction to make room. Those evictions only freed the
+        // POOL's byte[] snapshot; the OWNING tensors still hold their GC-heap
+        // _data until DrainOwnerDropsAfterEviction drops it. On the
+        // Materialize page-in path that drain runs automatically, but a fresh
+        // first forward allocates each lazy weight straight through this method
+        // and uses it in place — Materialize is never called, so without an
+        // explicit drain here the owners' resident _data accumulates weight by
+        // weight and a foundation-scale model OOMs mid-forward even though the
+        // pool reported itself under budget. Draining now (before the new GC
+        // allocation below) keeps the transparent-streaming resident set
+        // bounded across a single lazy forward. No-op when nothing was evicted
+        // or when transparent eviction is off (_pendingOwnerDrops stays empty).
+        if (pool is not null) DrainOwnerDropsAfterEviction();
+
         // Phase 3: allocate OUTSIDE both locks. The tensor's storage
         // hits the GC heap here — there's no way to skip that without
         // a full storage-from-pool refactor — but the registry lock
