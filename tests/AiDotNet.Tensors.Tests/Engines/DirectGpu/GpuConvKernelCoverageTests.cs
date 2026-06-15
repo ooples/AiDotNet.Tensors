@@ -14,6 +14,7 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// (TF32-tolerant). They no-op on CPU-only hosts. Shapes for backward ops are derived from a forward pass
 /// so the geometry is always self-consistent.
 /// </summary>
+[Collection("DirectGpuSerial")]
 public sealed class GpuConvKernelCoverageTests : IDisposable
 {
     private readonly DirectGpuTensorEngine _gpu;
@@ -27,6 +28,13 @@ public sealed class GpuConvKernelCoverageTests : IDisposable
     }
 
     public void Dispose() => _gpu?.Dispose();
+
+    // Skip (visibly, via Xunit.SkipException) rather than silently `return` when
+    // no GPU is present, so a failed/absent GPU setup shows as a skipped test
+    // instead of a false green. Mirrors the DirectGpu suite's SkipIfUnavailable
+    // convention (e.g. DetectionGpuParityTests).
+    private void SkipIfUnavailable()
+        => Skip.If(!_ready, "DirectGpu/GPU unavailable; skipping GPU-vs-CPU conv coverage.");
 
     private static Tensor<float> R(int seed, params int[] shape)
     {
@@ -59,10 +67,10 @@ public sealed class GpuConvKernelCoverageTests : IDisposable
     }
 
     // ---- DepthwiseConv2D ----
-    [Fact]
+    [SkippableFact]
     public void DepthwiseConv2D_Gpu_MatchesCpu()
     {
-        if (!_ready) return;
+        SkipIfUnavailable();
         var input = R(1, 1, 2, 5, 5);
         var kernel = R(2, 2, 1, 3, 3); // [inCh, mult, kH, kW]
         int[] stride = { 1, 1 }, pad = { 1, 1 };
@@ -83,19 +91,19 @@ public sealed class GpuConvKernelCoverageTests : IDisposable
         return (input, kernel, offset, mask, stride, pad, dil, fwd, Like(14, fwd));
     }
 
-    [Fact]
+    [SkippableFact]
     public void DeformableConv2D_Gpu_MatchesCpu()
     {
-        if (!_ready) return;
+        SkipIfUnavailable();
         var s = DeformSetup();
         AssertClose(s.fwd, _gpu.DeformableConv2D(s.input, s.kernel, s.offset, s.mask, s.stride, s.pad, s.dil),
                     "DeformableConv2D");
     }
 
-    [Fact]
+    [SkippableFact]
     public void DeformableConv2DBackwardInput_Gpu_MatchesCpu()
     {
-        if (!_ready) return;
+        SkipIfUnavailable();
         var s = DeformSetup();
         int[] inShape = s.input.Shape.ToArray();
         AssertClose(
@@ -104,10 +112,10 @@ public sealed class GpuConvKernelCoverageTests : IDisposable
             "DeformableConv2DBackwardInput");
     }
 
-    [Fact]
+    [SkippableFact]
     public void DeformableConv2DBackwardKernel_Gpu_MatchesCpu()
     {
-        if (!_ready) return;
+        SkipIfUnavailable();
         var s = DeformSetup();
         int[] kShape = s.kernel.Shape.ToArray();
         AssertClose(
@@ -116,10 +124,10 @@ public sealed class GpuConvKernelCoverageTests : IDisposable
             "DeformableConv2DBackwardKernel");
     }
 
-    [Fact]
+    [SkippableFact]
     public void DeformableConv2DBackwardOffset_Gpu_MatchesCpu()
     {
-        if (!_ready) return;
+        SkipIfUnavailable();
         var s = DeformSetup();
         AssertClose(
             _cpu.DeformableConv2DBackwardOffset(s.grad, s.input, s.kernel, s.offset, s.mask, s.stride, s.pad, s.dil),
@@ -127,10 +135,10 @@ public sealed class GpuConvKernelCoverageTests : IDisposable
             "DeformableConv2DBackwardOffset");
     }
 
-    [Fact]
+    [SkippableFact]
     public void DeformableConv2DBackwardMask_Gpu_MatchesCpu()
     {
-        if (!_ready) return;
+        SkipIfUnavailable();
         var s = DeformSetup();
         AssertClose(
             _cpu.DeformableConv2DBackwardMask(s.grad, s.input, s.kernel, s.offset, s.mask, s.stride, s.pad, s.dil),
@@ -139,10 +147,10 @@ public sealed class GpuConvKernelCoverageTests : IDisposable
     }
 
     // ---- FusedConv3D ----
-    [Fact]
+    [SkippableFact]
     public void FusedConv3D_Gpu_MatchesCpu()
     {
-        if (!_ready) return;
+        SkipIfUnavailable();
         var input = R(20, 1, 1, 4, 4, 4);   // [B, Cin, D, H, W]
         var kernel = R(21, 2, 1, 2, 2, 2);  // [Cout, Cin, kD, kH, kW]
         AssertClose(
@@ -152,10 +160,10 @@ public sealed class GpuConvKernelCoverageTests : IDisposable
     }
 
     // ---- FusedConvTranspose2D ----
-    [Fact]
+    [SkippableFact]
     public void FusedConvTranspose2D_Gpu_MatchesCpu()
     {
-        if (!_ready) return;
+        SkipIfUnavailable();
         var input = R(30, 1, 1, 3, 3);   // [B, Cin, H, W]
         var kernel = R(31, 1, 2, 2, 2);  // [Cin, Cout, kH, kW]
         AssertClose(
@@ -174,18 +182,18 @@ public sealed class GpuConvKernelCoverageTests : IDisposable
         return (input, weights, stride, fwd, Like(42, fwd));
     }
 
-    [Fact]
+    [SkippableFact]
     public void LocallyConnectedConv2D_Gpu_MatchesCpu()
     {
-        if (!_ready) return;
+        SkipIfUnavailable();
         var s = LocalSetup();
         AssertClose(s.fwd, _gpu.LocallyConnectedConv2D(s.input, s.weights, null, s.stride), "LocallyConnectedConv2D");
     }
 
-    [Fact]
+    [SkippableFact]
     public void LocallyConnectedConv2DBackwardInput_Gpu_MatchesCpu()
     {
-        if (!_ready) return;
+        SkipIfUnavailable();
         var s = LocalSetup();
         int[] inShape = s.input.Shape.ToArray();
         AssertClose(
@@ -194,10 +202,10 @@ public sealed class GpuConvKernelCoverageTests : IDisposable
             "LocallyConnectedConv2DBackwardInput");
     }
 
-    [Fact]
+    [SkippableFact]
     public void LocallyConnectedConv2DBackwardWeights_Gpu_MatchesCpu()
     {
-        if (!_ready) return;
+        SkipIfUnavailable();
         var s = LocalSetup();
         int[] wShape = s.weights.Shape.ToArray();
         AssertClose(
@@ -207,10 +215,10 @@ public sealed class GpuConvKernelCoverageTests : IDisposable
     }
 
     // ---- FlashAttentionBackward ----
-    [Fact]
+    [SkippableFact]
     public void FlashAttentionBackward_Gpu_MatchesCpu()
     {
-        if (!_ready) return;
+        SkipIfUnavailable();
         // [B, H, S, D]
         var q = R(50, 1, 2, 4, 8);
         var k = R(51, 1, 2, 4, 8);

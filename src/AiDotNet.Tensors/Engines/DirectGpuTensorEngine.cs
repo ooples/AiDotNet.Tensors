@@ -6480,7 +6480,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<T> LocallyConnectedConv2DBackwardWeights<T>(Tensor<T> gradOutput, Tensor<T> input, int[] weightsShape, int[] stride)
     {
         // The GPU LocallyConnectedConv2DBackwardWeights kernel disagreed with the CPU reference (GpuConvKernelCoverageTests);
-        // route to the correct CPU implementation until the GPU kernel is fixed. The `override`
+        // route to the correct CPU implementation until the GPU kernel is fixed (tracked in #622). The `override`
         // (vs the prior `new` hide) keeps virtual dispatch correct.
         return base.LocallyConnectedConv2DBackwardWeights(gradOutput, input, weightsShape, stride);
     }
@@ -6610,7 +6610,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int[] dilation)
     {
         // The GPU DeformableConv2D kernel disagreed with the CPU reference (GpuConvKernelCoverageTests);
-        // route to the correct CPU implementation until the GPU kernel is fixed. The `override`
+        // route to the correct CPU implementation until the GPU kernel is fixed (tracked in #622). The `override`
         // (vs the prior `new` hide) keeps virtual dispatch correct.
         return base.DeformableConv2D(input, kernel, offsets, mask, stride, padding, dilation);
     }
@@ -6631,7 +6631,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int[] dilation)
     {
         // The GPU DeformableConv2DBackwardInput kernel disagreed with the CPU reference (GpuConvKernelCoverageTests);
-        // route to the correct CPU implementation until the GPU kernel is fixed. The `override`
+        // route to the correct CPU implementation until the GPU kernel is fixed (tracked in #622). The `override`
         // (vs the prior `new` hide) keeps virtual dispatch correct.
         return base.DeformableConv2DBackwardInput(gradOutput, input, kernel, offsets, mask, inputShape, stride, padding, dilation);
     }
@@ -6651,7 +6651,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int[] dilation)
     {
         // The GPU DeformableConv2DBackwardKernel kernel disagreed with the CPU reference (GpuConvKernelCoverageTests);
-        // route to the correct CPU implementation until the GPU kernel is fixed. The `override`
+        // route to the correct CPU implementation until the GPU kernel is fixed (tracked in #622). The `override`
         // (vs the prior `new` hide) keeps virtual dispatch correct.
         return base.DeformableConv2DBackwardKernel(gradOutput, input, offsets, mask, kernelShape, stride, padding, dilation);
     }
@@ -6671,7 +6671,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int[] dilation)
     {
         // The GPU DeformableConv2DBackwardOffset kernel disagreed with the CPU reference (GpuConvKernelCoverageTests);
-        // route to the correct CPU implementation until the GPU kernel is fixed. The `override`
+        // route to the correct CPU implementation until the GPU kernel is fixed (tracked in #622). The `override`
         // (vs the prior `new` hide) keeps virtual dispatch correct.
         return base.DeformableConv2DBackwardOffset(gradOutput, input, kernel, offsets, mask, stride, padding, dilation);
     }
@@ -6691,7 +6691,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int[] dilation)
     {
         // The GPU DeformableConv2DBackwardMask kernel disagreed with the CPU reference (GpuConvKernelCoverageTests);
-        // route to the correct CPU implementation until the GPU kernel is fixed. The `override`
+        // route to the correct CPU implementation until the GPU kernel is fixed (tracked in #622). The `override`
         // (vs the prior `new` hide) keeps virtual dispatch correct.
         return base.DeformableConv2DBackwardMask(gradOutput, input, kernel, offsets, mask, stride, padding, dilation);
     }
