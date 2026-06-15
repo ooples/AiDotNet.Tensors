@@ -355,6 +355,18 @@ internal sealed class LazyTensorScope : IDisposable
     }
 
     /// <summary>
+    /// Compiles the lazy graph while binding every tensor in <paramref name="inputs"/> as a
+    /// mutable input slot the plan re-binds on each replay. Use this when more than one captured
+    /// leaf varies per call (e.g. a diffusion denoiser's noisy sample plus its per-step timestep
+    /// embedding); all other captured leaves stay frozen as constants.
+    /// </summary>
+    internal CompiledInferencePlan<T> CompileInference<T>(Tensor<T> explicitOutput, Tensor<T>[] inputs)
+    {
+        MarkCompiled();
+        return CompiledInferencePlan<T>.Compile(this, _engine, explicitOutput, inputs);
+    }
+
+    /// <summary>
     /// Compiles the lazy graph into a training plan with forward + backward steps.
     /// The plan can be replayed for zero-overhead training iterations.
     /// </summary>
