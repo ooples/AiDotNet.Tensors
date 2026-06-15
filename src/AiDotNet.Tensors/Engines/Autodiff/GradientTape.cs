@@ -447,6 +447,23 @@ public sealed class GradientTape<T> : IDisposable
 
                     step.Backward(gradOutput, step.Inputs, step.Output,
                         step.SavedState ?? Array.Empty<object>(), engine, grads);
+
+                    // Release this node-output's gradient now that its backward has
+                    // consumed it. In the reverse topo walk every consumer of this
+                    // output ran earlier, so its gradient is fully accumulated and is
+                    // never read again. Leaving it in `grads` ROOTS it for the rest of
+                    // the walk — and with every intermediate kept, the dict pins the
+                    // FULL backward's worth of gradient tensors at once, so GC can't
+                    // reclaim any of them and a deep net (ResNet50) OOMs. Dropping the
+                    // reference here unroots it so GC bounds the streaming peak to the
+                    // live frontier. Sources are leaves (never a step Output) and are
+                    // emitted + released separately below; the lastUse guard keeps this
+                    // from touching them.
+                    if (step.Output is not null && !lastUse.ContainsKey(step.Output))
+                    {
+                        grads.Remove(step.Output);
+                        step.Output.Grad = null;
+                    }
                 }
 
                 // Emit + release every source whose gradient just completed.
