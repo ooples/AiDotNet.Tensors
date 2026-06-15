@@ -6474,14 +6474,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     }
 
     /// <summary>
-    /// GPU-accelerated locally connected 2D backward pass for weight gradients.
-    /// Falls back to CPU implementation if GPU is unavailable.
+    /// Locally connected 2D backward pass for weight gradients. Currently runs on the CPU: the GPU
+    /// kernel disagrees with the CPU reference (separate from the deformable offset-layout bug — its
+    /// per-position weight-gradient accumulation still needs to be debugged against the CPU oracle and
+    /// validated on a GPU runner) and is tracked in #622. This is NOT a "GPU unavailable" fallback —
+    /// it unconditionally uses the correct CPU path until the kernel is verified.
     /// </summary>
     public override Tensor<T> LocallyConnectedConv2DBackwardWeights<T>(Tensor<T> gradOutput, Tensor<T> input, int[] weightsShape, int[] stride)
     {
-        // The GPU LocallyConnectedConv2DBackwardWeights kernel disagreed with the CPU reference (GpuConvKernelCoverageTests);
-        // route to the correct CPU implementation until the GPU kernel is fixed (tracked in #622). The `override`
-        // (vs the prior `new` hide) keeps virtual dispatch correct.
+        // Unconditional CPU: the GPU kernel is unverified (#622). The `override` (vs the prior `new`
+        // hide, which never dispatched) keeps virtual dispatch correct.
         return base.LocallyConnectedConv2DBackwardWeights(gradOutput, input, weightsShape, stride);
     }
 
