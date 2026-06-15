@@ -50,7 +50,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     private IntPtr _cublasHandle;
     // Stream-ordered allocator (#558 layer 6): when enabled, device buffers are allocated/freed via
     // cuMemAllocAsync/cuMemFreeAsync on _stream, so freed memory is reused in stream order without a host
-    // sync (race-free + bounds mid-step peak). Opt-in via AIDOTNET_CUDA_ASYNC_ALLOC; default off.
+    // sync (race-free + bounds mid-step peak). DEFAULT ON; opt out with AIDOTNET_CUDA_ASYNC_ALLOC=0
+    // (the legacy synchronous allocator, which can hit a sticky CUDA-700 under heavy buffer churn).
     private bool _asyncAlloc;
     private IntPtr _asyncMemPool; // the stream-ordered default mem pool (when _asyncAlloc); trimmed on sync-path OOM
     /// <summary>Diagnostic (#558): the nvrtc error if the FP16 kernel module failed to compile (which
@@ -310,7 +311,16 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             // is stream-ordered (the free is enqueued AFTER in-flight kernels on _stream), eliminating the
             // race by construction. Blocking stream FLAGS do NOT fix it (the free is host-side, not
             // stream-ordered); only stream-ordered freeing does.
-            _asyncAlloc = Environment.GetEnvironmentVariable("AIDOTNET_CUDA_ASYNC_ALLOC") != "0";
+            // Tri-state the env var so we never SILENTLY drop onto the unsafe sync path: null = default (on),
+            // "0" = explicit opt-out (sync), anything else = explicit opt-in. The sync path is not merely
+            // "slower" — it is the use-after-free described above, so a no-mempool box that lands on it is
+            // still exposed to the sticky CUDA-700. We therefore surface the loss of the stream-ordered pool
+            // rather than hide it: an explicit opt-in throws (the caller asked for a guarantee we can't honour),
+            // and the default-on case emits a one-time warning before falling back (so older drivers still run,
+            // but the operator is told why churn-heavy training may fault).
+            string? asyncAllocSetting = Environment.GetEnvironmentVariable("AIDOTNET_CUDA_ASYNC_ALLOC");
+            bool asyncExplicitlyRequested = asyncAllocSetting is not null && asyncAllocSetting != "0";
+            _asyncAlloc = asyncAllocSetting != "0";
             if (_asyncAlloc)
             {
                 if (CuBlasNative.cuDeviceGetDefaultMemPool(out var memPool, device) == CudaResult.Success)
@@ -319,7 +329,28 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                     ulong threshold = ulong.MaxValue; // CU_MEMPOOL_ATTR_RELEASE_THRESHOLD = 4
                     CuBlasNative.cuMemPoolSetAttribute(memPool, 4, ref threshold);
                 }
-                else { _asyncAlloc = false; } // older driver / no stream-ordered pool support → sync path
+                else if (asyncExplicitlyRequested)
+                {
+                    // The caller explicitly demanded the race-free allocator but the driver has no
+                    // stream-ordered mem-pool support — do NOT silently substitute the unsafe sync path.
+                    throw new NotSupportedException(
+                        "AIDOTNET_CUDA_ASYNC_ALLOC was set but this CUDA driver exposes no stream-ordered " +
+                        "default memory pool (cuDeviceGetDefaultMemPool failed). The legacy synchronous " +
+                        "allocator can free device memory before queued kernels execute (sticky CUDA-700 under " +
+                        "buffer churn). Upgrade the driver, or set AIDOTNET_CUDA_ASYNC_ALLOC=0 to deliberately " +
+                        "accept the synchronous allocator.");
+                }
+                else
+                {
+                    // Default-on, but no pool support. Fall back so older drivers still run, but make the
+                    // residual use-after-free risk visible instead of pretending the default is safe here.
+                    _asyncAlloc = false;
+                    System.Diagnostics.Trace.TraceWarning(
+                        "[CudaBackend] Stream-ordered CUDA memory pools are unavailable on this driver; " +
+                        "falling back to the legacy synchronous allocator. Under heavy GPU buffer churn this " +
+                        "can hit a sticky CUDA-700 use-after-free. Upgrade the driver to enable cuMemAllocAsync, " +
+                        "or set AIDOTNET_CUDA_ASYNC_ALLOC=0 to silence this warning.");
+                }
             }
 
             CuBlasNative.CheckCublasStatus(CuBlasNative.cublasCreate(out _cublasHandle), "cublasCreate");
