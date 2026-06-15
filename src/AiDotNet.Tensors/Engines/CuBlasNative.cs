@@ -319,6 +319,12 @@ public static class CuBlasNative
     [DllImport(CudaLibrary, EntryPoint = "cuMemPoolSetAttribute")]
     public static extern CudaResult cuMemPoolSetAttribute(IntPtr pool, int attr, ref ulong value);
 
+    // Releases memory the stream-ordered pool is RETAINING (above the high release threshold) back to the
+    // OS, keeping at least minBytesToKeep. Called on a SYNC-path cuMemAlloc OOM so the async pool's cached
+    // bytes (which show up as device free=0) become available to the legacy cuMemAlloc allocator.
+    [DllImport(CudaLibrary, EntryPoint = "cuMemPoolTrimTo")]
+    public static extern CudaResult cuMemPoolTrimTo(IntPtr pool, ulong minBytesToKeep);
+
     /// <summary>
     /// Allocates page-locked (pinned) host memory.
     /// Pinned memory enables true async DMA transfers without requiring

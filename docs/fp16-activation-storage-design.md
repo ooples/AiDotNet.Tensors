@@ -113,7 +113,7 @@ Root cause (bottom of the stack): compression allocates the FP16 buffer but free
 
 ## ⚠️ SEVENTH / CONCLUSIVE FINDING — convert-based compression can't reduce peak at any scale; the win needs FP16-NATIVE kernels
 
-Layer 6 (stream-ordered allocator, `cuMemAllocAsync`/`cuMemFreeAsync`, race-safe + pool-reuse, pool release-threshold maxed) IMPLEMENTED + committed (`AIDOTNET_CUDA_ASYNC_ALLOC`, default off). Measured the full stack (ACTIVATIONS+PAGING+GPU_CACHE+ASYNC_ALLOC) at BOTH scales on the cortex:
+Layer 6 (stream-ordered allocator, `cuMemAllocAsync`/`cuMemFreeAsync`, race-safe + pool-reuse, pool release-threshold maxed) IMPLEMENTED + committed (`AIDOTNET_CUDA_ASYNC_ALLOC`). **Note (updated):** this allocator is now **default ON** (opt out with `AIDOTNET_CUDA_ASYNC_ALLOC=0`) — it is required for correctness, not just memory, because the legacy synchronous allocator frees device memory before queued kernels execute (sticky CUDA-700 under buffer churn). On drivers without stream-ordered mem-pool support it falls back to the sync path with a logged warning (or throws if async was explicitly requested). The memory measurements below predate that default flip and were taken with the flag toggled explicitly. Measured the full stack (ACTIVATIONS+PAGING+GPU_CACHE+ASYNC_ALLOC) at BOTH scales on the cortex:
 - d512/L6/**B64**: FP32 4671 → FP16-all **7087** MiB (higher)
 - d512/L6/**B256**: FP32 8071 → FP16-all **11937** MiB (higher)
 
