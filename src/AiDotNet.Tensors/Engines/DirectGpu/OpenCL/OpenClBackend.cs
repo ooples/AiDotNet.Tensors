@@ -10630,12 +10630,21 @@ KERNEL VARIANTS (A/B testing):
         {
             if (_context == null)
                 throw new InvalidOperationException("OpenCL context not available");
-            if (!_supportsFp16)
-                throw new NotSupportedException("FP16 conversion is not supported on this device (device does not support FP16).");
-            if (!_mixedPrecisionKernelsAvailable)
-                throw new NotSupportedException("FP16 conversion is not available (mixed precision kernel compilation failed).");
-            if (!_kernelCache.TryGetValue("convert_fp32_to_fp16", out var k))
-                throw new InvalidOperationException("OpenCL kernel not found: convert_fp32_to_fp16. FP16 conversion requires a proper GPU kernel.");
+
+            // Prefer the cl_khr_fp16 (hardware-extension) convert kernel when present; otherwise fall back to
+            // the NATIVE convert kernel, which uses only the CORE vstore_half built-in (no cl_khr_fp16). The
+            // native path runs on every OpenCL 1.0+ device — including NVIDIA OpenCL, which exposes
+            // vload_half/vstore_half but NOT the cl_khr_fp16 arithmetic extension — so half round-trips no
+            // longer throw "FP16 conversion is not supported" on such devices.
+            DirectOpenClKernel? k = null;
+            if (_supportsFp16 && _mixedPrecisionKernelsAvailable)
+                _kernelCache.TryGetValue("convert_fp32_to_fp16", out k);
+            if (k is null && EnsureFp16NativeOpKernels())
+                _kernelCache.TryGetValue(Fp16NativeOpKernels.ConvertF32ToF16KernelName, out k);
+            if (k is null)
+                throw new NotSupportedException(
+                    "FP16 conversion is not available on this OpenCL device (neither the cl_khr_fp16 convert kernel " +
+                    "nor the native vstore_half convert kernel could be used).");
 
             uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
@@ -10648,12 +10657,16 @@ KERNEL VARIANTS (A/B testing):
         {
             if (_context == null)
                 throw new InvalidOperationException("OpenCL context not available");
-            if (!_supportsFp16)
-                throw new NotSupportedException("FP32 conversion from FP16 is not supported on this device (device does not support FP16).");
-            if (!_mixedPrecisionKernelsAvailable)
-                throw new NotSupportedException("FP32 conversion from FP16 is not available (mixed precision kernel compilation failed).");
-            if (!_kernelCache.TryGetValue("convert_fp16_to_fp32", out var k))
-                throw new InvalidOperationException("OpenCL kernel not found: convert_fp16_to_fp32. FP32 conversion requires a proper GPU kernel.");
+
+            DirectOpenClKernel? k = null;
+            if (_supportsFp16 && _mixedPrecisionKernelsAvailable)
+                _kernelCache.TryGetValue("convert_fp16_to_fp32", out k);
+            if (k is null && EnsureFp16NativeOpKernels())
+                _kernelCache.TryGetValue(Fp16NativeOpKernels.ConvertF16ToF32KernelName, out k);
+            if (k is null)
+                throw new NotSupportedException(
+                    "FP32 conversion from FP16 is not available on this OpenCL device (neither the cl_khr_fp16 convert " +
+                    "kernel nor the native vload_half convert kernel could be used).");
 
             uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
