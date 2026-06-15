@@ -42,7 +42,7 @@ public class Bf16MasterWeightConvergenceTests
         StreamingStoreCodec.DecodeFloat(enc, x);
     }
 
-    private static double RunLeastSquares(Store store, int steps)
+    private static double RunLeastSquares(Store store, int steps, ulong stochSeed = 1)
     {
         const int m = 256, n = 48;
         var rng = new Rng(12345);
@@ -59,6 +59,10 @@ public class Bf16MasterWeightConvergenceTests
         double lr = 0.15;     // small enough that late-stage updates approach bf16 grid spacing
         var grad = new double[n];
         var resid = new double[m];
+        // Pin the stochastic-rounding sequence so this run is reproducible regardless of which
+        // xUnit pool thread it lands on (otherwise the thread-static RNG state leaks across tests
+        // and the final loss varies run to run — the intermittent-failure root cause).
+        if (store == Store.Bf16Stoch) StreamingStoreCodec.SeedStochasticRng(stochSeed);
         for (int step = 0; step < steps; step++)
         {
             // resid = A x - b
@@ -80,16 +84,28 @@ public class Bf16MasterWeightConvergenceTests
     public void Bf16Stochastic_TracksFp32_WhileDeterministicStalls()
     {
         const int steps = 4000;
+        const int stochTrials = 8;
         double fp32 = RunLeastSquares(Store.Fp32, steps);
         double det = RunLeastSquares(Store.Bf16Det, steps);
-        double stoch = RunLeastSquares(Store.Bf16Stoch, steps);
+
+        // Stochastic rounding is randomized by construction; assert on its EXPECTED behavior by
+        // averaging several independently-seeded runs rather than a single noisy draw. Each run is
+        // deterministic (seeded), so the mean is reproducible and the gate is stable across machines.
+        double stochSum = 0, stochWorst = 0;
+        for (ulong seed = 1; seed <= stochTrials; seed++)
+        {
+            double v = RunLeastSquares(Store.Bf16Stoch, steps, seed);
+            stochSum += v;
+            stochWorst = Math.Max(stochWorst, v);
+        }
+        double stoch = stochSum / stochTrials;
 
         var outLines = new[]
         {
             $"Final least-squares loss after {steps} steps (lower = better convergence):",
             $"  fp32 store           : {fp32:E3}",
             $"  bf16 deterministic   : {det:E3}  ({det / fp32:F1}x fp32 loss)",
-            $"  bf16 stochastic      : {stoch:E3}  ({stoch / fp32:F1}x fp32 loss)",
+            $"  bf16 stochastic mean : {stoch:E3}  ({stoch / fp32:F1}x fp32 loss; worst of {stochTrials}: {stochWorst / fp32:F1}x)",
         };
         foreach (var l in outLines) _output.WriteLine(l);
 

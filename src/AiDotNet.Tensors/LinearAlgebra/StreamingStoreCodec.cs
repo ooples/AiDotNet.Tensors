@@ -42,6 +42,15 @@ internal static class StreamingStoreCodec
         return (uint)(x >> 48) & 0xFFFFu; // top 16 bits → uniform [0, 0xFFFF]
     }
 
+    /// <summary>
+    /// Pins the per-thread stochastic-rounding PRNG to a fixed seed for the CURRENT thread.
+    /// Production never calls this — the stream auto-seeds from the managed thread id and stochastic
+    /// rounding is unbiased either way. It exists so convergence tests can make the rounding sequence
+    /// reproducible instead of depending on which pool thread xUnit scheduled them on (and on RNG
+    /// state left by earlier tests on that thread) — the source of intermittent failures.
+    /// </summary>
+    internal static void SeedStochasticRng(ulong seed) => _rngState = seed | 1UL;
+
     private static unsafe uint F32Bits(float v) => *(uint*)&v;
     private static unsafe float BitsF32(uint b) => *(float*)&b;
 
