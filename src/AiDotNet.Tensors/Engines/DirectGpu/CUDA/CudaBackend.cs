@@ -1049,6 +1049,29 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
         // CUDA driver API calls are required for device memory operations.
         using var _ = PushContext();
+        // Stream-ordered allocation (same default mem pool as the activation buffers) when async-alloc is
+        // on. Without this, weight/persistent uploads take the legacy SYNC cuMemAlloc path below, which sees
+        // device free=0 once the async pool has reserved VRAM (release threshold maxed for caching) — the
+        // forward-only eval path then OOMs on its first weight upload while the GPU is "full" of pool-reserved
+        // (but reusable) bytes. Drawing weights from the same pool removes that sync/async split.
+        if (_asyncAlloc)
+        {
+            var pAsync = AllocDeviceMemoryAsync(byteSize);
+            try
+            {
+                unsafe
+                {
+                    fixed (float* src = data)
+                    {
+                        CuBlasNative.CheckCudaResult(
+                            CuBlasNative.cuMemcpyHtoD(pAsync, (IntPtr)src, byteSize),
+                            "cuMemcpyHtoD");
+                    }
+                }
+            }
+            catch { CuBlasNative.cuMemFreeAsync(pAsync, _stream); throw; }
+            return new CudaGpuBuffer(_cudaContext, pAsync, size, returnToPool: null, asyncFreeStream: _stream);
+        }
         if (_bufferPool.TryRent(size, out var pooled) && pooled != null)
         {
             unsafe
@@ -1246,6 +1269,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                 ulong free = 0, total = 0;
                 try { CudaNativeBindings.cuMemGetInfo(out free, out total); }
                 catch { /* diagnostic only — never mask the real failure */ }
+                GpuMemoryTracker.Dump($"cuMemAlloc OOM requesting {byteSize} bytes (free={free})");
                 throw new InvalidOperationException(
                     $"cuMemAlloc failed: {CuBlasNative.GetCudaErrorString(result)} " +
                     $"(requested {byteSize} bytes; drained {drained} pooled buffers; " +
@@ -1256,6 +1280,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         {
             CuBlasNative.CheckCudaResult(result, "cuMemAlloc");
         }
+        GpuMemoryTracker.OnAlloc(devicePtr, (long)byteSize);
         return devicePtr;
     }
 
@@ -1320,10 +1345,18 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         var r = CuBlasNative.cuMemAllocAsync(out IntPtr p, byteSize, _stream);
         if (r != CudaResult.Success)
         {
+            // Sync so pending cuMemFreeAsync reclamations land back in the pool, then TRIM the pool's
+            // retained-but-unused reservation back to the OS. After a fused/resident training run the pool
+            // has reserved up to the training peak (release threshold maxed for caching); a later phase with
+            // a different allocation shape (e.g. forward-only eval re-uploading weights) can then OOM here
+            // while almost all of VRAM is pool-reserved-but-free. Trimming returns it so the retry succeeds.
             CuBlasNative.cuCtxSynchronize();
+            if (_asyncMemPool != IntPtr.Zero) CuBlasNative.cuMemPoolTrimTo(_asyncMemPool, 0);
             r = CuBlasNative.cuMemAllocAsync(out p, byteSize, _stream);
         }
+        if (r != CudaResult.Success) GpuMemoryTracker.Dump($"cuMemAllocAsync OOM requesting {byteSize} bytes");
         CuBlasNative.CheckCudaResult(r, "cuMemAllocAsync");
+        GpuMemoryTracker.OnAlloc(p, (long)byteSize);
         return p;
     }
 
@@ -15103,6 +15136,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                         try
                         {
                             CuBlasNative.cuCtxPushCurrent(_context);
+                            GpuMemoryTracker.OnFree(_devicePtr);
                             // Stream-ordered free (#558 layer 6): race-safe + pool-reused in stream order.
                             if (_asyncFreeStream != IntPtr.Zero)
                                 CuBlasNative.cuMemFreeAsync(_devicePtr, _asyncFreeStream);
@@ -15198,6 +15232,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                         try
                         {
                             CuBlasNative.cuCtxPushCurrent(_context);
+                            GpuMemoryTracker.OnFree(_devicePtr);
                             // Stream-ordered free (#558 layer 6): race-safe + pool-reused in stream order.
                             if (_asyncFreeStream != IntPtr.Zero)
                                 CuBlasNative.cuMemFreeAsync(_devicePtr, _asyncFreeStream);
