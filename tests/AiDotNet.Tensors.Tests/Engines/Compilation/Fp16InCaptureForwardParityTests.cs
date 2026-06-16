@@ -156,6 +156,66 @@ public class Fp16InCaptureForwardParityTests
     }
 
     [Fact]
+    public void Fp16HeteroForwardBackward_OnGpu_MatchesFp32()
+    {
+        // Device-resident verification: the heterogeneous forward (FP16-native device kernels → Half
+        // activation buffers) + backward (MixedPrecisionGraphBackward on the GPU engine) must produce a loss
+        // and gradients matching FP32 on the actual CUDA backend. Skips on a non-GPU host.
+        var gpu = AiDotNetEngine.Current as DirectGpuTensorEngine;
+        if (gpu is null) return;
+
+        var input = Rand(new[] { 4, 5 }, 1);
+        float[] w1d = RandData(new[] { 5, 6 }, 2), w2d = RandData(new[] { 6, 4 }, 3);
+
+        // FP32 reference (GPU eager): loss + grads via a bare plan Step.
+        var w1a = new Tensor<float>((float[])w1d.Clone(), new[] { 5, 6 });
+        var w2a = new Tensor<float>((float[])w2d.Clone(), new[] { 6, 4 });
+        float fp32Loss; float[] g1_32, g2_32;
+        CompiledTrainingPlan<float> fp32Plan;
+        using (var scope = GraphMode.Enable())
+        {
+            var h = gpu.TensorMatMul(input, w1a);
+            var y = gpu.TensorMatMul(h, w2a);
+            gpu.ReduceSum(y, null);
+            fp32Plan = scope.CompileTraining(new[] { w1a, w2a });
+        }
+        try { fp32Loss = fp32Plan.Step().GetFlat(0); g1_32 = fp32Plan.Gradients[0].ToArray(); g2_32 = fp32Plan.Gradients[1].ToArray(); }
+        finally { fp32Plan.Dispose(); }
+
+        // FP16 hetero on GPU.
+        var w1b = new Tensor<float>((float[])w1d.Clone(), new[] { 5, 6 });
+        var w2b = new Tensor<float>((float[])w2d.Clone(), new[] { 6, 4 });
+        var prev = MixedPrecisionEmit.TestOverrideEnabled;
+        MixedPrecisionEmit.TestOverrideEnabled = true;
+        CompiledTrainingPlan<float> fp16Plan;
+        try
+        {
+            using (var scope = GraphMode.Enable())
+            using (new AutocastScope(PrecisionMode.Float16))
+            {
+                var h = gpu.TensorMatMul(input, w1b);
+                var y = gpu.TensorMatMul(h, w2b);
+                gpu.ReduceSum(y, null);
+                fp16Plan = scope.CompileTraining(new[] { w1b, w2b });
+            }
+        }
+        finally { MixedPrecisionEmit.TestOverrideEnabled = prev; GraphMode.SetCurrent(null); }
+
+        try
+        {
+            Assert.True(fp16Plan.HasFp16HeteroForward);
+            float fp16Loss = fp16Plan.RunFp16HeteroForward(gpu).GetFlat(0);
+            fp16Plan.RunFp16HeteroBackward(gpu);
+            Assert.True(float.IsFinite(fp16Loss), $"GPU FP16 loss must be finite, got {fp16Loss}.");
+            float tolL = 0.1f * Math.Abs(fp32Loss) + 0.5f;
+            Assert.True(Math.Abs(fp16Loss - fp32Loss) < tolL, $"GPU FP16 loss {fp16Loss} vs FP32 {fp32Loss} tol {tolL}.");
+            AssertGradsClose(g1_32, fp16Plan.Gradients[0].ToArray(), "gpu-w1");
+            AssertGradsClose(g2_32, fp16Plan.Gradients[1].ToArray(), "gpu-w2");
+        }
+        finally { fp16Plan.Dispose(); }
+    }
+
+    [Fact]
     public void Fp16HeteroStep_Wired_LossMatchesFp32()
     {
         // End-to-end: plan.Step() must route through the heterogeneous forward+backward (wired into StepEager)
