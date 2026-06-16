@@ -1742,6 +1742,27 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
     }
 
     /// <summary>
+    /// COW Stage 2 (issue #624): a READ-ONLY view of the live backing array that does
+    /// <b>not</b> privatize a copy-on-write clone. Identical data semantics to
+    /// <see cref="GetDataArray"/> (same live backing array for the simple CPU layout, a
+    /// realized <see cref="ToArray"/> snapshot for lazy/GPU/view layouts) minus the
+    /// <see cref="EnsureOwnedForWrite"/> privatization. The caller contract is
+    /// <b>read-only</b>: engine ops use this for INPUT operands they only read (matmul
+    /// operands, conv filters, norm gamma/beta, broadcast bias). Routing a genuine
+    /// in-place write through this would corrupt a COW peer — those must keep using
+    /// <see cref="GetDataArray"/>/<see cref="AsWritableSpan"/>. For every non-COW tensor
+    /// (the overwhelming default) this is byte-for-byte identical to
+    /// <see cref="GetDataArray"/> at the same cost, so converting a read site is risk-free;
+    /// the benefit is that inference on a cloned model never privatizes its shared weights.
+    /// </summary>
+    internal T[] GetReadOnlyDataArray()
+    {
+        var live = GetLiveBackingArrayOrNull();
+        if (live is not null) return live;
+        return ToArray();
+    }
+
+    /// <summary>
     /// Gets the BACKING storage array without triggering lazy realization
     /// and without ever returning a copy. Returns <c>null</c> when the
     /// tensor's layout is not a simple contiguous-at-offset-0-whose-storage-
