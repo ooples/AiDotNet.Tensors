@@ -774,6 +774,13 @@ extern ""C"" __global__ __launch_bounds__(256) void grouped_query_attention_back
 
     for (int qhOff = 0; qhOff < queriesPerKV; qhOff++) {
         int qh = kvh * queriesPerKV + qhOff;
+        // BUGFIX: bound qh to the real query heads. For an inconsistent GQA config where
+        // numKVHeads*queriesPerKV > numQHeads (e.g. numQHeads=3, numKVHeads=3, queriesPerKV=2 → kvh=1
+        // would gather qh∈{2,3}, but qh=3 does not exist), gathering the phantom head reads out-of-bounds
+        // query/gradOutput/weights and corrupts gradKey/gradValue for that kvh. The CPU reference maps
+        // kvh = qh/queriesPerKV over the REAL heads only, so a kvh with no (or fewer) mapped heads must
+        // accumulate only the heads that exist. qhOff increases, so break once past the last real head.
+        if (qh >= numQHeads) break;
         int bqh = b * numQHeads + qh;
         int qheadBase = bqh * seqQ * headDim;
         int wheadBase = bqh * seqQ * seqK;
