@@ -171,6 +171,7 @@ public static class WeightRegistry
                             {
                                 StreamingEncoding.Bf16 => CheckedBf16ByteCount(weight.Length),
                                 StreamingEncoding.Int8 => CheckedInt8ByteCount(weight.Length, weight.Int8QuantRows),
+                                StreamingEncoding.Int4 => CheckedInt4ByteCount(weight.Length),
                                 _ => CheckedStreamingByteCount<T>(weight.Length),
                             };
                             bytes = new byte[byteCount];
@@ -675,6 +676,7 @@ public static class WeightRegistry
             case StreamingStoreDtype.Bf16: return (StreamingEncoding.Bf16, false);
             case StreamingStoreDtype.Bf16Stochastic: return (StreamingEncoding.Bf16, true);
             case StreamingStoreDtype.Int8: return (StreamingEncoding.Int8, false); // explicit opt-in (Auto never picks int8)
+            case StreamingStoreDtype.Int4: return (StreamingEncoding.Int4, false); // explicit opt-in (Auto never picks int4)
             case StreamingStoreDtype.Lossless: return (StreamingEncoding.Lossless, false); // exact, variable-size; explicit opt-in
             case StreamingStoreDtype.Auto:
             default:
@@ -751,6 +753,21 @@ public static class WeightRegistry
             throw new NotSupportedException(
                 $"Streaming int8 registration requires per-tensor size <= {int.MaxValue} bytes. " +
                 $"Tensor has {length} elements + {4 + 4 * rows} header bytes = {byteCountLong} bytes. Chunk it.");
+        return (int)byteCountLong;
+    }
+
+    /// <summary>int4 group-quant byte count (4 bits per element + 8-byte header + 4 bytes per
+    /// group scale, at the default group size) with overflow guard.</summary>
+    internal static int CheckedInt4ByteCount(int length)
+    {
+        if (length < 0) throw new ArgumentOutOfRangeException(nameof(length));
+        int groupSize = StreamingStoreCodec.DefaultInt4GroupSize;
+        long numGroups = (length + groupSize - 1L) / groupSize;
+        long byteCountLong = 8L + 4L * numGroups + (length + 1L) / 2; // [count][groupSize][scales][nibbles]
+        if (byteCountLong > int.MaxValue)
+            throw new NotSupportedException(
+                $"Streaming int4 registration requires per-tensor size <= {int.MaxValue} bytes. " +
+                $"Tensor has {length} elements + {8 + 4 * numGroups} header bytes = {byteCountLong} bytes. Chunk it.");
         return (int)byteCountLong;
     }
 
@@ -868,6 +885,28 @@ public static class WeightRegistry
             }
             throw new NotSupportedException(
                 $"int8 streaming store is only supported for float/double, not {typeof(T).Name}.");
+        }
+        // int4 store (StreamingEncoding.Int4): AWQ/GPTQ-style GROUP symmetric quantization over the
+        // native element order (8x). dst is sized to Int4BufferBytes(Length, DefaultInt4GroupSize)
+        // by the caller (CheckedInt4ByteCount); decode reconstructs the same native order so the
+        // dequant-on-materialize round-trip preserves the weight (within int4 error).
+        if (encoding == StreamingEncoding.Int4)
+        {
+            int gs = StreamingStoreCodec.DefaultInt4GroupSize;
+            if (typeof(T) == typeof(float))
+            {
+                var srcF = (float[])(object)tensor.AsSpan().ToArray();
+                StreamingStoreCodec.EncodeInt4Float(srcF, dst, gs);
+                return;
+            }
+            if (typeof(T) == typeof(double))
+            {
+                var srcD = (double[])(object)tensor.AsSpan().ToArray();
+                StreamingStoreCodec.EncodeInt4Double(srcD, dst, gs);
+                return;
+            }
+            throw new NotSupportedException(
+                $"int4 streaming store is only supported for float/double, not {typeof(T).Name}.");
         }
         if (typeof(T) == typeof(float))
         {

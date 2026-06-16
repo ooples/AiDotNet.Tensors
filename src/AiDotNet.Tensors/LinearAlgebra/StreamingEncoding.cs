@@ -38,4 +38,11 @@ internal static class StreamingEncoding
     /// restore, ~1.18× on typical fp weights. The <c>Auto</c> default in training
     /// (bit-exact masters); otherwise explicit opt-in.</summary>
     internal const byte Lossless = 3;
+
+    /// <summary>int4: AWQ/GPTQ-style GROUP-symmetric quantization — [int32 count][int32
+    /// groupSize][numGroups × fp32 scale][ceil(count/2) packed nibbles]. 8x compression at
+    /// 4 bits/weight; one scale per contiguous group bounds the int4 RMSE. Feeds the no-upcast
+    /// int4 weight-only GEMM directly. Lossier than int8; explicit opt-in only —
+    /// <c>StreamingStoreDtype.Auto</c> never picks int4.</summary>
+    internal const byte Int4 = 4;
 }

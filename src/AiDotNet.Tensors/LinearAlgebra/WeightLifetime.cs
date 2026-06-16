@@ -93,6 +93,13 @@ public enum StreamingStoreDtype
     /// loss. This is the Auto default during TRAINING (bit-exact masters); bf16/int8 give far
     /// more (2x/4x) at a precision cost. ~1.1 GiB/s decode, overlapped by prefetch.</summary>
     Lossless = 5,
+
+    /// <summary>Always store int4 with AWQ/GPTQ-style GROUP-symmetric quantization (one fp32
+    /// scale per 128-weight group). 8x I/O — the most aggressive rung, intended to make the
+    /// very largest (&gt;~20B) models RESIDENT inside a 16 GiB budget so they skip streaming.
+    /// More lossy than int8, so it is never the Auto default and is explicit opt-in for
+    /// aggressive memory-bound inference where the accuracy tradeoff is accepted.</summary>
+    Int4 = 6,
 }
 
 /// <summary>

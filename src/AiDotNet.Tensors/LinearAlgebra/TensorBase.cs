@@ -539,6 +539,33 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
                     $"int8 streaming store is only supported for float/double, not {typeof(T).Name}.");
             }
         }
+        else if (StreamingStoreEncoding == StreamingEncoding.Int4)
+        {
+            // int4-encoded store: group-quant [int32 count][int32 groupSize][scales][packed nibbles];
+            // dequant back to T in the native element order (encoder stored native order, no transpose).
+            long expectedInt4 = StreamingStoreCodec.Int4BufferBytes(Length, StreamingStoreCodec.Int4GroupSizeOf(bytes));
+            if (bytes.Length != expectedInt4)
+                throw new ArgumentException(
+                    $"Streaming restore (int4): buffer length {bytes.Length} does not match " +
+                    $"expected {expectedInt4} bytes (Length={Length}, groupSize={StreamingStoreCodec.Int4GroupSizeOf(bytes)}).");
+            if (typeof(T) == typeof(float))
+            {
+                var arr = new float[Length];
+                StreamingStoreCodec.DecodeInt4Float(bytes, arr);
+                fresh = Vector<T>.WrapMemory((T[])(object)arr);
+            }
+            else if (typeof(T) == typeof(double))
+            {
+                var arr = new double[Length];
+                StreamingStoreCodec.DecodeInt4Double(bytes, arr);
+                fresh = Vector<T>.WrapMemory((T[])(object)arr);
+            }
+            else
+            {
+                throw new NotSupportedException(
+                    $"int4 streaming store is only supported for float/double, not {typeof(T).Name}.");
+            }
+        }
         else if (StreamingStoreEncoding == StreamingEncoding.Lossless)
         {
             // Lossless (byte-shuffle + LZ4): variable-size payload → exact bytes for T.
