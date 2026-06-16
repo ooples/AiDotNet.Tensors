@@ -7138,6 +7138,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int batchSize = input.Shape._dims[0];
         int features = input.Shape._dims[1];
 
+        // Contract parity with the CPU reference: CpuEngine.FusedBatchNorm always normalizes with
+        // BATCH statistics and ignores the training flag / running mean+var (those are updated
+        // externally — see its comment). The GPU must do the same, otherwise an inference-mode call
+        // (training=false) normalizes with running stats on GPU while the CPU uses batch stats,
+        // diverging grossly. Force batch-stats here so the two engines agree. (A dedicated
+        // inference-mode path using running stats would be a separate, explicitly-routed op.)
+        training = true;
+
         // Use cache-aware buffer allocation (OwnedBuffer auto-disposes only if we allocated)
         using var inputBuffer = GetOrAllocateBuffer(backend, input);
         using var outputBuffer = AllocateOutputBuffer(backend, batchSize * features);
@@ -7177,6 +7185,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             backend.DownloadBuffer(outputBuffer.Buffer, resultFloat);
             backend.DownloadBuffer(saveMeanBuffer.Buffer, saveMeanFloat);
             backend.DownloadBuffer(saveVarBuffer.Buffer, saveVarFloat);
+
+            // The batchnorm_forward kernel writes INVERSE std (1/sqrt(var+eps)) into the saveVar buffer
+            // (its launcher param is named saveInvVar), but the CPU FusedBatchNorm reference returns the
+            // batch VARIANCE in saveVar. Convert back so the returned saveVar matches the CPU contract:
+            // var = 1/invStd^2 - epsilon.
+            for (int i = 0; i < saveVarFloat.Length; i++)
+            {
+                float invStd = saveVarFloat[i];
+                saveVarFloat[i] = invStd != 0f ? 1.0f / (invStd * invStd) - (float)epsilon : 0f;
+            }
 
             // Convert back to T
             T[] resultData = DirectGpuEngine.FromFloatArray<T>(resultFloat);
