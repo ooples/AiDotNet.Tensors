@@ -2187,6 +2187,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     // heterogeneous Realize-forward must be used instead of the float-only forward steps.
     internal bool HasFp16HeteroForward => _fp16HeteroOrder is not null;
 
+    /// <summary>FP16-IN-CAPTURE: the captured heterogeneous node order (test/measurement use — lets a test
+    /// sum the activation buffer bytes that are stored as Half vs the FP32 equivalent).</summary>
+    internal ILazyNode[]? Fp16HeteroOrderForTest => _fp16HeteroOrder;
+
     /// <summary>
     /// FP16-IN-CAPTURE heterogeneous forward: replay EVERY node (float + Half + cast bridges) in topological
     /// order via <see cref="ILazyNode.Realize"/>, producing the device-resident Half activation buffers (the

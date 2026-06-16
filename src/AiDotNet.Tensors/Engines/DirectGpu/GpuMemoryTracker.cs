@@ -69,6 +69,17 @@ public static class GpuMemoryTracker
     /// <summary>The high-water mark of <see cref="LiveBytes"/> observed since process start.</summary>
     public static long PeakBytes => Interlocked.Read(ref s_peakBytes);
 
+    /// <summary>
+    /// Reset the peak watermark down to the CURRENT live bytes, so a subsequent <see cref="PeakBytes"/> read
+    /// reflects the peak of just the next measurement window (e.g. one forward). Used to A/B the device-memory
+    /// footprint of two configurations (FP32 vs FP16 activation storage) within one process. No-op when off.
+    /// </summary>
+    public static void ResetPeak()
+    {
+        if (!Enabled) return;
+        Interlocked.Exchange(ref s_peakBytes, Interlocked.Read(ref s_liveBytes));
+    }
+
     /// <summary>Number of live (un-freed) device allocations.</summary>
     public static int LiveCount => s_live.Count;
 
