@@ -7865,6 +7865,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         out Tensor<T> gradKey,
         out Tensor<T> gradValue)
     {
+        // The GPU GroupedQueryAttentionBackward kernel is numerically WRONG — GpuCpuAutoDifferentialTests
+        // measures GPU-vs-CPU max_abs_err ~3.7e2 (vs 1e-2 tol) on shape [2,3,8,8], i.e. the gradients it
+        // produces are garbage, not a tolerance miss. Same call as the #617 conv-coverage cluster surfaced
+        // for the DeformableConv2D family: route to the verified CPU base for correct gradients until the
+        // GPU kernel is fixed (tracked separately). GQA backward is not on any HRE cortex hot path, so this
+        // is correctness with no measurable cost. Keep the (correct) GPU forward GroupedQueryAttention.
+        return base.GroupedQueryAttentionBackward(gradOutput, query, key, value, attentionWeights, numQueriesPerKV, scale,
+            out gradQuery, out gradKey, out gradValue);
+#pragma warning disable CS0162 // Unreachable code — GPU path retained for the future kernel fix
         if (!TryGetBackend(out var backend))
             return base.GroupedQueryAttentionBackward(gradOutput, query, key, value, attentionWeights, numQueriesPerKV, scale,
                 out gradQuery, out gradKey, out gradValue);
@@ -7917,6 +7926,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return base.GroupedQueryAttentionBackward(gradOutput, query, key, value, attentionWeights, numQueriesPerKV, scale,
                 out gradQuery, out gradKey, out gradValue);
         }
+#pragma warning restore CS0162
     }
 
     /// <summary>
