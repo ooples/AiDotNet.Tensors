@@ -2609,7 +2609,7 @@ public partial class CpuEngine : ITensorLevelEngine
             // Try OneDNN/MKL BLAS for contiguous non-transposed
             if (a.IsContiguous && b.IsContiguous)
             {
-                if (MatrixMultiplyHelper.TryGemm(a.Data, 0, b.Data, 0, result.Data, 0, m, k, n))
+                if (MatrixMultiplyHelper.TryGemm(a.ReadOnlyData, 0, b.ReadOnlyData, 0, result.Data, 0, m, k, n))
                 {
                     DifferentiableOps.RecordBinary("BatchMatMul", result, aOrig, bOrig, BackwardFunctions<T>.BatchMatMulBackward);
                     { var ca = a; var cb = b; AutoTracer.RecordOp("BatchMatMul", result, eng => eng.BatchMatMul(ca, cb)); }
@@ -2668,8 +2668,9 @@ public partial class CpuEngine : ITensorLevelEngine
             return result;
         }
 
-        var aData = a.GetDataArray();
-        var bData = b.GetDataArray();
+        // COW Stage 2 (#624): a/b are read-only operands — non-privatizing read keeps a clone O(1).
+        var aData = a.GetReadOnlyDataArray();
+        var bData = b.GetReadOnlyDataArray();
         var rData = result.GetDataArray();
 
         // Handle ND case with batch dimensions (N >= 3)
@@ -2738,7 +2739,7 @@ public partial class CpuEngine : ITensorLevelEngine
             int bOffset = batch * matrixSizeB;
             int resultOffset = batch * matrixSizeResult;
 
-            if (MatrixMultiplyHelper.TryGemm(a.Data, aOffset, b.Data, bOffset, result.Data, resultOffset, m, k, n))
+            if (MatrixMultiplyHelper.TryGemm(a.ReadOnlyData, aOffset, b.ReadOnlyData, bOffset, result.Data, resultOffset, m, k, n))
             {
                 return;
             }
@@ -3932,9 +3933,10 @@ public partial class CpuEngine : ITensorLevelEngine
         T eps = numOps.FromDouble(epsilon);
         int groupSize = channelsPerGroup * spatialSize;
 
-        var inputData = input.GetDataArray();
-        var gammaData = gamma.GetDataArray();
-        var betaData = beta.GetDataArray();
+        // COW Stage 2 (#624): input/gamma/beta are read-only norm operands — non-privatizing read.
+        var inputData = input.GetReadOnlyDataArray();
+        var gammaData = gamma.GetReadOnlyDataArray();
+        var betaData = beta.GetReadOnlyDataArray();
         var outputData = output.GetDataArray();
         var meanData = new T[batch * numGroups];
         var varData = new T[batch * numGroups];
@@ -9101,8 +9103,8 @@ public partial class CpuEngine : ITensorLevelEngine
         if (FusedConvHelper.ShouldUseFusedConv(kernelHeight, kernelWidth, stride, stride,
             outputHeight, outputWidth, inChannels, outChannels))
         {
-            var inputSpan = input.Data.Span;
-            var kernelSpan = kernel.Data.Span;
+            var inputSpan = input.AsSpan();
+            var kernelSpan = kernel.AsSpan();
             var outputSpan = result.Data.Span;
 
             FusedConvHelper.Conv2DFused(
@@ -9118,8 +9120,8 @@ public partial class CpuEngine : ITensorLevelEngine
         // Strategy 3: Try Winograd for large 3x3 convolutions with stride=1, dilation=1
         if (WinogradHelper.ShouldUseWinograd(kernelHeight, kernelWidth, stride, stride, dilation, dilation, outputHeight, outputWidth))
         {
-            var inputSpan = input.Data.Span;
-            var kernelSpan = kernel.Data.Span;
+            var inputSpan = input.AsSpan();
+            var kernelSpan = kernel.AsSpan();
             var outputSpan = result.Data.Span;
 
             WinogradHelper.Conv2DWinograd(
@@ -9158,8 +9160,8 @@ public partial class CpuEngine : ITensorLevelEngine
             return false;
         }
 
-        var inputSpan = input.Data.Span;
-        var kernelSpan = kernel.Data.Span;
+        var inputSpan = input.AsSpan();
+        var kernelSpan = kernel.AsSpan();
         var outputSpan = result.Data.Span;
 
         fixed (float* inputPtr = inputSpan)
@@ -9188,8 +9190,8 @@ public partial class CpuEngine : ITensorLevelEngine
             return false;
         }
 
-        var inputSpan = input.Data.Span;
-        var kernelSpan = kernel.Data.Span;
+        var inputSpan = input.AsSpan();
+        var kernelSpan = kernel.AsSpan();
         var outputSpan = result.Data.Span;
 
         fixed (float* inputPtr = inputSpan)
@@ -9231,8 +9233,8 @@ public partial class CpuEngine : ITensorLevelEngine
         // Allocate only one batch-slice worth of im2col buffer, not batch * colH * colW
         int sliceSize = colH * colW;
 
-        var inputSpan = input.Data.Span;
-        var kernelSpan = kernel.Data.Span;
+        var inputSpan = input.AsSpan();
+        var kernelSpan = kernel.AsSpan();
         var outputSpan = result.Data.Span;
         int inputSliceSize = inChannels * height * width;
 
@@ -9304,8 +9306,8 @@ public partial class CpuEngine : ITensorLevelEngine
         // Allocate only one batch-slice worth of im2col buffer, not batch * colH * colW
         int sliceSize = colH * colW;
 
-        var inputSpan = input.Data.Span;
-        var kernelSpan = kernel.Data.Span;
+        var inputSpan = input.AsSpan();
+        var kernelSpan = kernel.AsSpan();
         var outputSpan = result.Data.Span;
         int inputSliceSize = inChannels * height * width;
 
@@ -11870,8 +11872,8 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 if (typeof(T) == typeof(float))
                 {
-                    var aArr = (float[])(object)a.GetDataArray();
-                    var bArr = (float[])(object)b.GetDataArray();
+                    var aArr = (float[])(object)a.GetReadOnlyDataArray();
+                    var bArr = (float[])(object)b.GetReadOnlyDataArray();
                     var rArr = (float[])(object)result.GetDataArray();
                     var opts = new Engines.BlasManaged.BlasOptions<float> { PackedB = handle };
                     Engines.BlasManaged.BlasManaged.Gemm<float>(
@@ -11880,8 +11882,8 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
                 else
                 {
-                    var aArr = (double[])(object)a.GetDataArray();
-                    var bArr = (double[])(object)b.GetDataArray();
+                    var aArr = (double[])(object)a.GetReadOnlyDataArray();
+                    var bArr = (double[])(object)b.GetReadOnlyDataArray();
                     var rArr = (double[])(object)result.GetDataArray();
                     var opts = new Engines.BlasManaged.BlasOptions<double> { PackedB = handle };
                     Engines.BlasManaged.BlasManaged.Gemm<double>(
@@ -11905,8 +11907,8 @@ public partial class CpuEngine : ITensorLevelEngine
         // Our JIT'd AVX2 GEMM (opt-in). C[m,p] = A[m,n]·B[n,p] ⇒ TryMultiply(M=m,N=p,K=n).
         if (_jitGemm && typeof(T) == typeof(float) && a.IsContiguous && b.IsContiguous)
         {
-            var aJ = (float[])(object)a.GetDataArray();
-            var bJ = (float[])(object)b.GetDataArray();
+            var aJ = (float[])(object)a.GetReadOnlyDataArray();
+            var bJ = (float[])(object)b.GetReadOnlyDataArray();
             var rJ = (float[])(object)result.GetDataArray();
             if (Simd.JitGemmAvx2.TryMultiply(aJ.AsSpan(0, m * n), bJ.AsSpan(0, n * p), rJ.AsSpan(0, m * p), m, p, n))
                 return result;
@@ -11917,8 +11919,8 @@ public partial class CpuEngine : ITensorLevelEngine
         // is unavailable (TrySgemm returns false without mutating C).
         if (_oneDnnGemm && typeof(T) == typeof(float) && a.IsContiguous && b.IsContiguous)
         {
-            var aArrO = (float[])(object)a.GetDataArray();
-            var bArrO = (float[])(object)b.GetDataArray();
+            var aArrO = (float[])(object)a.GetReadOnlyDataArray();
+            var bArrO = (float[])(object)b.GetReadOnlyDataArray();
             var rArrO = (float[])(object)result.GetDataArray();
             unsafe
             {
@@ -11934,8 +11936,8 @@ public partial class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(float) && a.IsContiguous && b.IsContiguous
             && m <= _cachedBMaxM)
         {
-            var aArrF = (float[])(object)a.GetDataArray();
-            var bArrF = (float[])(object)b.GetDataArray();
+            var aArrF = (float[])(object)a.GetReadOnlyDataArray();
+            var bArrF = (float[])(object)b.GetReadOnlyDataArray();
             var rArrF = (float[])(object)result.GetDataArray();
             // #573 follow-up: above a row-count floor, route through BlasManaged.Gemm (the same
             // dispatcher the pre-packed path above uses) instead of the legacy full-trans
@@ -12030,8 +12032,8 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (typeof(T) == typeof(float))
         {
-            var aArr = (float[])(object)a.GetDataArray();
-            var bArr = (float[])(object)b.GetDataArray();
+            var aArr = (float[])(object)a.GetReadOnlyDataArray();
+            var bArr = (float[])(object)b.GetReadOnlyDataArray();
             var rArr = (float[])(object)result.GetDataArray();
             var opts = new Engines.BlasManaged.BlasOptions<float> { PackedB = prePackedB };
             Engines.BlasManaged.BlasManaged.Gemm<float>(
@@ -12040,8 +12042,8 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         if (typeof(T) == typeof(double))
         {
-            var aArr = (double[])(object)a.GetDataArray();
-            var bArr = (double[])(object)b.GetDataArray();
+            var aArr = (double[])(object)a.GetReadOnlyDataArray();
+            var bArr = (double[])(object)b.GetReadOnlyDataArray();
             var rArr = (double[])(object)result.GetDataArray();
             var opts = new Engines.BlasManaged.BlasOptions<double> { PackedB = prePackedB };
             Engines.BlasManaged.BlasManaged.Gemm<double>(
@@ -12211,8 +12213,8 @@ public partial class CpuEngine : ITensorLevelEngine
         int matrixSizeA = m * n;
         int matrixSizeResult = m * p;
 
-        var aData = a.GetDataArray();
-        var bData = b.GetDataArray();
+        var aData = a.GetReadOnlyDataArray();
+        var bData = b.GetReadOnlyDataArray();
         var rData = result.GetDataArray();
 
         // Iter 24 (batched-GEMM consolidation): for the ND×2D broadcast pattern, B is
@@ -12352,8 +12354,8 @@ public partial class CpuEngine : ITensorLevelEngine
         int matrixSizeB = n * p;
         int matrixSizeResult = m * p;
 
-        var aData = a.GetDataArray();
-        var bData = b.GetDataArray();
+        var aData = a.GetReadOnlyDataArray();
+        var bData = b.GetReadOnlyDataArray();
         var rData = result.GetDataArray();
 
         // Phase 2D BERT-attention fix: for float, bypass
@@ -20400,9 +20402,10 @@ public partial class CpuEngine : ITensorLevelEngine
         int width = input._shape[2];
         int spatialSize = height * width;
 
-        var inputData = input.GetDataArray();
-        var gammaData = gamma.GetDataArray();
-        var betaData = beta.GetDataArray();
+        // COW Stage 2 (#624): input/gamma/beta are read-only norm operands — non-privatizing read.
+        var inputData = input.GetReadOnlyDataArray();
+        var gammaData = gamma.GetReadOnlyDataArray();
+        var betaData = beta.GetReadOnlyDataArray();
 
         var meanData = new T[channels];
         var varData = new T[channels];
@@ -20469,9 +20472,10 @@ public partial class CpuEngine : ITensorLevelEngine
         int spatialSize = height * width;
         int elementsPerChannel = batch * spatialSize;
 
-        var inputData = input.GetDataArray();
-        var gammaData = gamma.GetDataArray();
-        var betaData = beta.GetDataArray();
+        // COW Stage 2 (#624): input/gamma/beta are read-only norm operands — non-privatizing read.
+        var inputData = input.GetReadOnlyDataArray();
+        var gammaData = gamma.GetReadOnlyDataArray();
+        var betaData = beta.GetReadOnlyDataArray();
 
         // Float fast path with SIMD
         if (inputData is float[] inF && gammaData is float[] gamF && betaData is float[] betF)
@@ -21808,9 +21812,11 @@ public partial class CpuEngine : ITensorLevelEngine
 
         int featureSize = gamma.Length; // product of normalized dimensions
 
-        var inputData = input.GetDataArray();
-        var gammaData = gamma.GetDataArray();
-        var betaData = beta.GetDataArray();
+        // COW Stage 2 (#624): input/gamma/beta are read-only operands — read them through
+        // the non-privatizing accessor so a cloned model's shared norm weights stay O(1).
+        var inputData = input.GetReadOnlyDataArray();
+        var gammaData = gamma.GetReadOnlyDataArray();
+        var betaData = beta.GetReadOnlyDataArray();
 
         // Float fast path: SIMD mean, variance, and normalize via Vector256
         // with FMA — fused into a SINGLE pass over the input using
@@ -21986,9 +21992,10 @@ public partial class CpuEngine : ITensorLevelEngine
         if (batchSize == 0) batchSize = 1;
         int featureSize = gamma.Length;
 
-        var fInput  = input .GetDataArray();
-        var fGamma  = gamma .GetDataArray();
-        var fBeta   = beta  .GetDataArray();
+        // COW Stage 2 (#624): read-only operands via the non-privatizing accessor; only fOutput writes.
+        var fInput  = input .GetReadOnlyDataArray();
+        var fGamma  = gamma .GetReadOnlyDataArray();
+        var fBeta   = beta  .GetReadOnlyDataArray();
         var fOutput = output.GetDataArray();
         float fEps = (float)epsilon;
 
@@ -23131,11 +23138,13 @@ public partial class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(float))
         {
             var result = AutoTensorCache.RentOrAllocate<T>(input._shape);
-            // Pin all memory to get float* pointers (works with both managed and NativeMemory)
-            using var pinIn = input.Data.Pin();
+            // Pin all memory to get float* pointers (works with both managed and NativeMemory).
+            // COW Stage 2 (#624): input/gamma/beta are read-only — pin via the non-privatizing
+            // ReadOnlyData so a cloned model's shared norm weights stay O(1); only pinOut writes.
+            using var pinIn = input.ReadOnlyData.Pin();
             using var pinOut = result.Data.Pin();
-            using var pinGamma = gamma.Data.Pin();
-            using var pinBeta = beta.Data.Pin();
+            using var pinGamma = gamma.ReadOnlyData.Pin();
+            using var pinBeta = beta.ReadOnlyData.Pin();
             unsafe
             {
                 GroupNormFloatPtr(
@@ -23155,9 +23164,10 @@ public partial class CpuEngine : ITensorLevelEngine
             return result;
         }
 
-        var inputData = input.GetDataArray();
-        var gammaData = gamma.GetDataArray();
-        var betaData = beta.GetDataArray();
+        // COW Stage 2 (#624): input/gamma/beta are read-only norm operands — non-privatizing read.
+        var inputData = input.GetReadOnlyDataArray();
+        var gammaData = gamma.GetReadOnlyDataArray();
+        var betaData = beta.GetReadOnlyDataArray();
 
         // Mean and variance are computed per batch per group
         var meanData = new T[batch * numGroups];
@@ -33467,8 +33477,9 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         var result = TensorAllocator.Rent<T>([batch, M, N]);
-        var aData = a.GetDataArray();
-        var bData = b.GetDataArray();
+        // COW Stage 2 (#624): a/b are read-only operands — non-privatizing read keeps a clone O(1).
+        var aData = a.GetReadOnlyDataArray();
+        var bData = b.GetReadOnlyDataArray();
         var resultData = result.GetDataArray();
 
         CpuParallelSettings.ParallelForOrSerial(0, batch, resultData.Length, batchIdx =>
@@ -35138,13 +35149,13 @@ public partial class CpuEngine : ITensorLevelEngine
                 if (q8 is not null && q8.Rows == N && q8.K == K)
                 {
                     var int8Result = AutoTensorCache.RentOrAllocate<T>(new[] { M, N });
-                    var inA = (float[])(object)input.GetDataArray();
+                    var inA = (float[])(object)input.GetReadOnlyDataArray();
                     var outA = (float[])(object)int8Result.GetDataArray();
                     Simd.SimdGemm.SgemmWithInt8RowScaledCachedB(
                         inA.AsSpan(0, M * K), q8.Data, q8.Scales, outA.AsSpan(0, M * N), M, K, N);
                     if (bias != null || activation != FusedActivationType.None)
                     {
-                        var bA = bias != null ? (float[])(object)bias.GetDataArray() : null;
+                        var bA = bias != null ? (float[])(object)bias.GetReadOnlyDataArray() : null;
                         CpuFusedOperations.ApplyBiasActivationInPlace(outA, bA, M, N, activation, activationParams);
                     }
                     return int8Result;
@@ -35156,8 +35167,8 @@ public partial class CpuEngine : ITensorLevelEngine
             if (typeof(T) == typeof(float))
             {
                 var result = AutoTensorCache.RentOrAllocate<T>(new[] { M, N });
-                var inArr = (float[])(object)input.GetDataArray();
-                var wArr = (float[])(object)weights.GetDataArray();
+                var inArr = (float[])(object)input.GetReadOnlyDataArray();
+                var wArr = (float[])(object)weights.GetReadOnlyDataArray();
                 var outArr = (float[])(object)result.GetDataArray();
 
                 bool blasDone = false;
@@ -35273,7 +35284,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 if (bias != null || activation != FusedActivationType.None)
                 {
                     using var _ffnEpi = AiDotNet.Tensors.Engines.Profiling.Profiler.OpScope("FFN.Epilogue");
-                    var bArr = bias != null ? (float[])(object)bias.GetDataArray() : null;
+                    var bArr = bias != null ? (float[])(object)bias.GetReadOnlyDataArray() : null;
                     CpuFusedOperations.ApplyBiasActivationInPlace(outArr, bArr, M, N, activation, activationParams);
                 }
 
@@ -35284,8 +35295,8 @@ public partial class CpuEngine : ITensorLevelEngine
             if (typeof(T) == typeof(double))
             {
                 var result = AutoTensorCache.RentOrAllocate<T>(new[] { M, N });
-                var inArr = (double[])(object)input.GetDataArray();
-                var wArr = (double[])(object)weights.GetDataArray();
+                var inArr = (double[])(object)input.GetReadOnlyDataArray();
+                var wArr = (double[])(object)weights.GetReadOnlyDataArray();
                 var outArr = (double[])(object)result.GetDataArray();
 
                 bool dBlasDone = false;
@@ -35317,7 +35328,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 if (!dBlasDone && !BlasProvider.TryGemm(M, N, K, inArr, 0, K, wArr, 0, N, outArr, 0, N))
                 {
                     CpuFusedOperations.FusedGemmBiasActivation(inArr, wArr,
-                        bias != null ? (double[])(object)bias.GetDataArray() : null,
+                        bias != null ? (double[])(object)bias.GetReadOnlyDataArray() : null,
                         outArr, M, N, K, activation);
                     return result;
                 }
@@ -38039,8 +38050,10 @@ public partial class CpuEngine : ITensorLevelEngine
         outputShape[^1] = embeddingDim;
 
         var embResult = AutoTensorCache.RentOrAllocate<T>(outputShape);
-        var tableData = embeddingTable.GetDataArray();
-        var indicesData = indices.GetDataArray();
+        // COW Stage 2 (#624): the embedding table + indices are read-only inputs — read them
+        // through the non-privatizing accessor so a cloned model's shared table stays O(1).
+        var tableData = embeddingTable.GetReadOnlyDataArray();
+        var indicesData = indices.GetReadOnlyDataArray();
         var resultData = embResult.GetDataArray();
 
         for (int i = 0; i < numIndices; i++)

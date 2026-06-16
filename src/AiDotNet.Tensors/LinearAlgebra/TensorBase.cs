@@ -1202,6 +1202,9 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
             // to reach the buffer, so without this gate a dropped streaming weight
             // would Slice empty storage and throw. See EnsureMaterialized.
             EnsureMaterialized();
+            // .Memory / .Data hand out a WRITABLE Memory<T> over the storage (engine + layer code
+            // mutate through it), so privatize first if this is a shared COW clone. No-op otherwise.
+            EnsureOwnedForWrite();
 
             if (!IsContiguous)
                 throw new InvalidOperationException(
@@ -1216,6 +1219,28 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
     /// Shorthand alias for Memory — used by engine code.
     /// </summary>
     internal Memory<T> Data => Memory;
+
+    /// <summary>
+    /// COW Stage 2 (#624): a READ-ONLY <see cref="ReadOnlyMemory{T}"/> view of the backing store
+    /// that does <b>not</b> privatize a copy-on-write clone — the <see cref="Memory"/>/<see cref="Data"/>
+    /// counterpart for engine INPUT operands passed to read-only-typed parameters (e.g.
+    /// <c>MatrixMultiplyHelper.TryGemm</c>'s <see cref="ReadOnlyMemory{T}"/> a/b). Same materialization
+    /// guard as <see cref="Memory"/>; identical to it for every non-COW tensor. The caller contract is
+    /// read-only — routing a write through this would corrupt a COW peer.
+    /// </summary>
+    internal ReadOnlyMemory<T> ReadOnlyData
+    {
+        get
+        {
+            EnsureMaterialized();
+            if (!IsContiguous)
+                throw new InvalidOperationException(
+                    "Cannot get contiguous Memory from a non-contiguous tensor view. Call Contiguous() first.");
+            if (_storageOffset == 0 && _storage.Length == Length)
+                return _storage.AsMemory();
+            return _storage.AsMemory().Slice(_storageOffset, Length);
+        }
+    }
 
     // ================================================================
     // Constructors
@@ -1451,6 +1476,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
         {
             ThrowIfSparse();
             ValidateIndices(indices);
+            EnsureOwnedForWrite();
             _data[GetFlatIndex(indices)] = value;
             // Element-level CPU mutation: bump the version counter so cached
             // GPU buffers (DirectGpuTensorEngine activation cache,
@@ -1516,6 +1542,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
         if (source.Length != Length)
             throw new ArgumentException($"Source array length ({source.Length}) must match tensor length ({Length}).");
         if (Length == 0) return;
+        EnsureOwnedForWrite();
         if (IsContiguous && _storageOffset == 0 && _storage.Length == Length)
         {
             source.AsSpan().CopyTo(_data.AsWritableSpan());
@@ -1561,6 +1588,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
         ThrowIfSparse();
         if (flatIndex < 0 || flatIndex >= Length)
             throw new ArgumentOutOfRangeException(nameof(flatIndex), "Flat index is out of range.");
+        EnsureOwnedForWrite();
         if (IsContiguous)
             _data[flatIndex + _storageOffset] = value;
         else
@@ -1628,7 +1656,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
     /// </para>
     /// </remarks>
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
-    private void EnsureMaterialized()
+    private protected void EnsureMaterialized()
     {
         if (LazySource is ILazyNode node && !node.IsRealized)
             node.Realize(node.RecordingEngine);
@@ -1686,6 +1714,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
     internal Span<T> AsWritableSpan()
     {
         EnsureMaterialized();
+        EnsureOwnedForWrite();
 
         if (Length == 0) return Span<T>.Empty;
         if (!IsContiguous)
@@ -1710,6 +1739,11 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
     /// </summary>
     internal T[] GetDataArray()
     {
+        // COW: GetDataArray hands back a live, writable backing array (specializations pin it and
+        // expect later writes to land), so privatize first if this is a shared COW clone. No-op for
+        // every normal tensor. Stage 1 conservatively treats this as a write-intent accessor; the
+        // read/write split that avoids privatizing on engine reads is Stage 2.
+        EnsureOwnedForWrite();
         // Eager simple-layout CPU tensors: hand back the backing array
         // directly. Specializations (TryBuildSpecializedForward) capture
         // this reference at compile time and need later writes — notably
@@ -1724,6 +1758,27 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
         // preserves the BERT-SQuAD × 100 fix: a lazy tensor whose
         // upstream hasn't run yet would have had its placeholder-filled
         // backing pinned, leaking stale/zero bytes into every replay.
+        var live = GetLiveBackingArrayOrNull();
+        if (live is not null) return live;
+        return ToArray();
+    }
+
+    /// <summary>
+    /// COW Stage 2 (issue #624): a READ-ONLY view of the live backing array that does
+    /// <b>not</b> privatize a copy-on-write clone. Identical data semantics to
+    /// <see cref="GetDataArray"/> (same live backing array for the simple CPU layout, a
+    /// realized <see cref="ToArray"/> snapshot for lazy/GPU/view layouts) minus the
+    /// <see cref="EnsureOwnedForWrite"/> privatization. The caller contract is
+    /// <b>read-only</b>: engine ops use this for INPUT operands they only read (matmul
+    /// operands, conv filters, norm gamma/beta, broadcast bias). Routing a genuine
+    /// in-place write through this would corrupt a COW peer — those must keep using
+    /// <see cref="GetDataArray"/>/<see cref="AsWritableSpan"/>. For every non-COW tensor
+    /// (the overwhelming default) this is byte-for-byte identical to
+    /// <see cref="GetDataArray"/> at the same cost, so converting a read site is risk-free;
+    /// the benefit is that inference on a cloned model never privatizes its shared weights.
+    /// </summary>
+    internal T[] GetReadOnlyDataArray()
+    {
         var live = GetLiveBackingArrayOrNull();
         if (live is not null) return live;
         return ToArray();
@@ -1855,9 +1910,48 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
     }
 
     /// <summary>
-    /// Creates a deep copy of this tensor (always contiguous, never a view).
+    /// COW Stage 3 (issue #624): when <c>true</c> (the default), <see cref="Clone"/> routes through
+    /// the copy-on-write <see cref="CloneShared"/> — O(1)-until-write storage sharing that privatizes
+    /// on the first in-place write to either side, preserving exact deep-copy semantics. This makes
+    /// every <c>Clone()</c> caller (notably AiDotNet model <c>DeepCopy</c>, which clones per-parameter)
+    /// O(1) in memory for the inference-only clone case (ensembles, EMA snapshots, eval). Set to
+    /// <c>false</c> to force the eager full-buffer deep copy everywhere — an escape hatch only needed
+    /// if a caller writes to a clone through a path outside the Stage 1 write-gates (which would
+    /// corrupt the peer); no such path is known. Per-call eager copies are always available via
+    /// <see cref="CloneDeepCopy"/>.
+    /// </summary>
+    public static bool UseCopyOnWriteClone { get; set; } = ReadCowCloneDefault();
+
+    private static bool ReadCowCloneDefault()
+    {
+        // Escape hatch: AIDOTNET_COW_CLONE=0 (or false/off) forces eager deep-copy clones globally.
+        var env = Environment.GetEnvironmentVariable("AIDOTNET_COW_CLONE");
+        if (env is not null && (env == "0" ||
+            string.Equals(env, "false", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(env, "off", StringComparison.OrdinalIgnoreCase)))
+            return false;
+        return true;
+    }
+
+    /// <summary>
+    /// Creates a copy of this tensor (always contiguous, never a view). Routes through the
+    /// copy-on-write share when <see cref="UseCopyOnWriteClone"/> is set (the default); the result is
+    /// indistinguishable from an eager deep copy — the first write to either side privatizes.
     /// </summary>
     public virtual TensorBase<T> Clone()
+    {
+        // COW Stage 3: O(1)-until-write share by default; CloneShared falls back to CloneDeepCopy for
+        // any layout it cannot share (views/sparse/mmap/GPU), so this never recurses.
+        if (UseCopyOnWriteClone)
+            return CloneShared();
+        return CloneDeepCopy();
+    }
+
+    /// <summary>
+    /// Eager full-buffer deep copy (always contiguous, never a view). The unconditional copy that
+    /// <see cref="Clone"/> used before COW Stage 3 and that <see cref="CloneShared"/> falls back to.
+    /// </summary>
+    public virtual TensorBase<T> CloneDeepCopy()
     {
         ThrowIfSparse();
         var result = CreateInstance(_shape);
@@ -1879,6 +1973,55 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
         }
         return result;
     }
+
+    // ================================================================
+    // Copy-on-write clone (issue #624 — Stage 1: primitive + write-gate)
+    // ================================================================
+
+    /// <summary>
+    /// True when this tensor shares its backing storage with a copy-on-write peer (see
+    /// <see cref="CloneShared"/>). While set, the next in-place write privatizes this tensor's
+    /// storage (<see cref="EnsureOwnedForWrite"/>) so neither side observes the other's mutation.
+    /// Normal tensors never set it — so the write-path guards are a single predictable branch.
+    /// </summary>
+    private bool _cowShared;
+
+    /// <summary>Diagnostic: whether this tensor is currently a live COW storage sharer.</summary>
+    internal bool IsCowShared => _cowShared;
+
+    /// <summary>Marks this tensor as a COW sharer. Called only by <see cref="CloneShared"/>.</summary>
+    internal void MarkCowShared() => _cowShared = true;
+
+    /// <summary>
+    /// Privatizes copy-on-write storage before an in-place write. No-op unless this tensor was
+    /// produced by (or is the source of) a <see cref="CloneShared"/> and still shares storage.
+    /// When storage is still shared (<c>RefCount &gt; 1</c>) the backing buffer is deep-copied into
+    /// fresh sole-owned storage; when we are already the only ref we just clear the flag. Must be
+    /// called at the top of every in-place write path — the isolation test is the completeness guard.
+    /// </summary>
+    protected void EnsureOwnedForWrite()
+    {
+        if (!_cowShared) return;
+        if (_storage.RefCount > 1)
+        {
+            EnsureMaterialized();
+            var fresh = _data.Clone();                  // independent copy of the shared buffer
+            var oldStorage = _storage;
+            _data = fresh;
+            _storage = new TensorStorage<T>(fresh);     // sole owner (RefCount 1)
+            oldStorage.Release();                       // drop our shared ref; peer keeps theirs
+            IncrementVersion();
+        }
+        _cowShared = false;
+    }
+
+    /// <summary>
+    /// Copy-on-write clone: shares the backing storage at O(1) for the plain dense case and
+    /// privatizes on the first write to either side, preserving full deep-copy semantics. Falls
+    /// back to an eager <see cref="Clone"/> for any layout that cannot be shared safely. The base
+    /// implementation is the safe deep copy; <c>Tensor&lt;T&gt;</c> overrides it with the real share.
+    /// </summary>
+    public virtual TensorBase<T> CloneShared() => CloneDeepCopy();
 
     protected abstract TensorBase<T> CreateInstance(int[] shape);
     protected abstract TensorBase<T> CreateInstance(T[] data, int[] shape);
@@ -2217,7 +2360,14 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
     /// at the point of mutation if tape-replay safety or GPU-cache
     /// staleness checks matter for the calling op.
     /// </remarks>
-    internal Span<T> RawWritableStorageSpan => _data.AsWritableSpan();
+    internal Span<T> RawWritableStorageSpan
+    {
+        get
+        {
+            EnsureOwnedForWrite();
+            return _data.AsWritableSpan();
+        }
+    }
 
     /// <summary>
     /// Fills a pre-allocated array with storage indices for every logical element.

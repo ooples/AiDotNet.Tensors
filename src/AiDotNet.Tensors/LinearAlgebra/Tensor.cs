@@ -140,6 +140,48 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     }
 
     /// <summary>
+    /// Storage-sharing constructor with explicit <paramref name="isView"/> control. Used by the
+    /// copy-on-write <see cref="CloneShared"/> (issue #624) with <c>isView: false</c> — a logical
+    /// full clone that shares the source's <see cref="TensorStorage{T}"/> until the first write.
+    /// </summary>
+    internal Tensor(Vector<T> data, int[] shape, int[] strides, int storageOffset, TensorStorage<T> parentStorage, bool isView)
+        : base(data, shape, strides, storageOffset, isView, parentStorage)
+    {
+    }
+
+    /// <inheritdoc/>
+    public override TensorBase<T> CloneShared()
+    {
+        // O(1) storage share only for the plain dense weight case: CPU-resident, contiguous, zero
+        // offset, backing length == logical length, not mmap-backed, not sparse, not already a view.
+        // Anything else falls back to a correct eager deep copy.
+        if (IsSparse || IsView || !IsContiguous || _storageOffset != 0
+            || _storage.Length != Length || _storage.IsReadOnlyMapped || _device != TensorDevice.CPU)
+        {
+            return CloneDeepCopy();
+        }
+
+        EnsureMaterialized();
+        // EnsureMaterialized can realize a lazy node or rehydrate a paged-out weight and swap storage
+        // or device — re-validate the layout before sharing.
+        if (!IsContiguous || _storageOffset != 0 || _storage.Length != Length
+            || _storage.IsReadOnlyMapped || _device != TensorDevice.CPU)
+        {
+            return CloneDeepCopy();
+        }
+
+        // Share the same TensorStorage (the ctor AddRefs it); flag both sides as COW sharers so the
+        // first in-place write on either privatizes via EnsureOwnedForWrite, preserving deep-copy
+        // semantics at O(1)-until-write.
+        var clone = new Tensor<T>(_data, (int[])_shape.Clone(), (int[])_strides.Clone(),
+                                  _storageOffset, _storage, isView: false);
+        clone.Layout = Layout;
+        MarkCowShared();
+        clone.MarkCowShared();
+        return clone;
+    }
+
+    /// <summary>
     /// Constructor for sparse tensors. The values vector contains only non-zero elements,
     /// while the logical shape represents the full tensor dimensions.
     /// Used by <see cref="SparseTensor{T}"/> which inherits from Tensor.
@@ -472,6 +514,9 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
             throw new InvalidOperationException(
                 "AsVector requires a contiguous tensor with zero storage offset. " +
                 "Call .Contiguous() first to materialize a copy if needed.");
+        // The fast path returns the LIVE backing vector (aliases storage); privatize first so a
+        // caller mutating the returned vector can't corrupt a COW peer. No-op for normal tensors.
+        EnsureOwnedForWrite();
         if (_data.Length == _shape[0])
             return _data;
         return new Vector<T>(_data.AsSpan().Slice(0, _shape[0]).ToArray());
@@ -1117,6 +1162,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     public void Fill(T value)
     {
         ThrowIfSparse();
+        EnsureOwnedForWrite();
         _numOps.Fill(_data.AsWritableSpan(), value);
         UniformFillValue = _numOps.ToDouble(value);
     }
