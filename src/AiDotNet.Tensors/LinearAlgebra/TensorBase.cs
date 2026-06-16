@@ -80,6 +80,10 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
     /// </summary>
     internal StreamingInt8Weight? StreamingInt8 { get; private set; }
 
+    /// <summary>No-upcast int4 group-quant form, attached for int4-stored streaming weights in
+    /// inference (see <see cref="AttachStreamingInt4"/>); null otherwise.</summary>
+    internal StreamingInt4Weight? StreamingInt4 { get; private set; }
+
     /// <summary>
     /// Installs <paramref name="encoded"/> (a per-row int8 streaming buffer) as this tensor's
     /// no-upcast quantized form: parses the int8 weight + per-row scales and leaves
@@ -161,6 +165,78 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
             throw new NotSupportedException($"int8 streaming weight dequant supports float/double, not {typeof(T).Name}.");
         }
         StreamingInt8 = null;
+        var old = _storage;
+        _data = fresh;
+        _storage = new TensorStorage<T>(_data);
+        old.Release();
+    }
+
+    /// <summary>
+    /// Attaches the int4 group-quant form (parses the encoded buffer into a
+    /// <see cref="StreamingInt4Weight"/>, leaving <see cref="_data"/> empty). For a 2-D Linear
+    /// weight the stored int4 IS [out,in] = [Rows,K] (kernel-ready, the transpose of the logical
+    /// [in,out]). Used by <c>WeightRegistry.Materialize</c> for int4-stored weights in inference.
+    /// </summary>
+    internal void AttachStreamingInt4(ReadOnlySpan<byte> encoded)
+    {
+        int groupSize = StreamingStoreCodec.Int4GroupSizeOf(encoded);
+        var scales = StreamingStoreCodec.Int4ScalesOf(encoded);
+        var data = StreamingStoreCodec.Int4DataOf(encoded, Length);
+        int rows = Int8QuantRows; // shape-derived (2-D → out channels); same convention as int8
+        int k = rows > 0 ? Length / rows : Length;
+        StreamingInt4 = new StreamingInt4Weight(data, scales, groupSize, rows, k, transposedFromLogical: Int8StoreTransposed);
+    }
+
+    /// <summary>
+    /// Returns this weight's no-upcast int4 form for the matmul fast path, materializing it as
+    /// int4 (NOT fp32) if it's an eligible streaming int4 weight that's currently paged out.
+    /// Returns null for every other tensor — so the engine's int4 routing hook is a single null
+    /// check. Unlike <see cref="EnsureMaterialized"/>, this never dequantizes to fp32.
+    /// </summary>
+    internal StreamingInt4Weight? GetMaterializedStreamingInt4()
+    {
+        if (StreamingInt4 is not null) return StreamingInt4;
+        if (Lifetime == WeightLifetime.Streaming
+            && StreamingPoolHandle >= 0
+            && _data.Length != Length
+            && StreamingStoreEncoding == StreamingEncoding.Int4
+            && this is Tensor<T> w)
+        {
+            WeightRegistry.Materialize(w);
+            return StreamingInt4;
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Lazily dequantizes the attached int4 weight into <see cref="_data"/> — the fallback when a
+    /// non-matmul path needs a materialized span/indexer on a no-upcast int4 weight. Clears
+    /// <see cref="StreamingInt4"/> afterwards (the fp copy is now canonical).
+    /// </summary>
+    private void DequantizeStreamingInt4()
+    {
+        var q = StreamingInt4;
+        if (q is null) return;
+        Vector<T> fresh;
+        if (typeof(T) == typeof(float))
+        {
+            var arr = new float[Length];
+            for (int i = 0; i < Length; i++) arr[i] = q.Data[i] * q.GroupScales[i / q.GroupSize];
+            if (q.TransposedFromLogical) arr = TransposeRowMajorBack(arr, _shape[0], _shape[1]);
+            fresh = Vector<T>.WrapMemory((T[])(object)arr);
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            var arr = new double[Length];
+            for (int i = 0; i < Length; i++) arr[i] = q.Data[i] * (double)q.GroupScales[i / q.GroupSize];
+            if (q.TransposedFromLogical) arr = TransposeRowMajorBack(arr, _shape[0], _shape[1]);
+            fresh = Vector<T>.WrapMemory((T[])(object)arr);
+        }
+        else
+        {
+            throw new NotSupportedException($"int4 streaming weight dequant supports float/double, not {typeof(T).Name}.");
+        }
+        StreamingInt4 = null;
         var old = _storage;
         _data = fresh;
         _storage = new TensorStorage<T>(_data);
@@ -548,16 +624,21 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
                 throw new ArgumentException(
                     $"Streaming restore (int4): buffer length {bytes.Length} does not match " +
                     $"expected {expectedInt4} bytes (Length={Length}, groupSize={StreamingStoreCodec.Int4GroupSizeOf(bytes)}).");
+            // For a 2-D weight the store is the TRANSPOSE [out,in]; dequant in stored order then
+            // transpose back to the logical [in,out] so the fp view matches the tensor shape.
+            bool int4Transposed = Int8StoreTransposed;
             if (typeof(T) == typeof(float))
             {
                 var arr = new float[Length];
                 StreamingStoreCodec.DecodeInt4Float(bytes, arr);
+                if (int4Transposed) arr = TransposeRowMajorBack(arr, _shape[0], _shape[1]);
                 fresh = Vector<T>.WrapMemory((T[])(object)arr);
             }
             else if (typeof(T) == typeof(double))
             {
                 var arr = new double[Length];
                 StreamingStoreCodec.DecodeInt4Double(bytes, arr);
+                if (int4Transposed) arr = TransposeRowMajorBack(arr, _shape[0], _shape[1]);
                 fresh = Vector<T>.WrapMemory((T[])(object)arr);
             }
             else
@@ -1697,15 +1778,18 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
             && StreamingPoolHandle >= 0
             && _data.Length != Length
             && StreamingInt8 is null            // an already-attached int8 weight is handled below
+            && StreamingInt4 is null            // ditto int4
             && this is Tensor<T> streamedWeight)
         {
             WeightRegistry.Materialize(streamedWeight);
         }
-        // A no-upcast int8 weight (just attached by Materialize, or earlier) has empty _data;
-        // a span/indexer — NOT the int8 GEMM fast path, which reads StreamingInt8 directly —
-        // is asking for an fp32 view, so dequantize it now.
+        // A no-upcast int8/int4 weight (just attached by Materialize, or earlier) has empty _data;
+        // a span/indexer — NOT the GEMM fast path, which reads StreamingInt8/StreamingInt4
+        // directly — is asking for an fp view, so dequantize it now.
         if (StreamingInt8 is not null && _data.Length != Length)
             DequantizeStreamingInt8();
+        if (StreamingInt4 is not null && _data.Length != Length)
+            DequantizeStreamingInt4();
     }
 
     /// <summary>
