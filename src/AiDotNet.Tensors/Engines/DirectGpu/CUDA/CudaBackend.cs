@@ -1103,9 +1103,21 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                 {
                     fixed (float* src = data)
                     {
+                        // STREAM-ORDERED-ALLOCATION HAZARD FIX: pAsync was allocated via cuMemAllocAsync on
+                        // _stream, so it is only valid to ACCESS in _stream order. The legacy null-stream
+                        // cuMemcpyHtoD does NOT order after the async alloc (_stream is a non-blocking compute
+                        // stream → the null stream has no implicit dependency on it), so it can touch a device
+                        // pointer the allocator has not yet committed = ILLEGAL access that faults the context
+                        // (sticky CUDA 700, surfacing at the NEXT driver call). This is the same class of bug
+                        // already fixed on the device→host side (see DownloadBuffer's _stream sync). Issue the
+                        // copy on _stream, then synchronize _stream BEFORE the `fixed` pin is released so the
+                        // pageable host source stays put for the (now stream-ordered) copy.
                         CuBlasNative.CheckCudaResult(
-                            CuBlasNative.cuMemcpyHtoD(pAsync, (IntPtr)src, byteSize),
-                            "cuMemcpyHtoD");
+                            CudaNativeBindings.cuMemcpyHtoDAsync(pAsync, (IntPtr)src, byteSize, _stream),
+                            "cuMemcpyHtoDAsync(weight upload)");
+                        CuBlasNative.CheckCudaResult(
+                            CudaNativeBindings.cuStreamSynchronize(_stream),
+                            "cuStreamSynchronize(weight upload)");
                     }
                 }
             }
@@ -1345,7 +1357,16 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (_asyncAlloc)
         {
             var p = AllocDeviceMemoryAsync((ulong)size * sizeof(float));
-            CuBlasNative.CheckCudaResult(CuBlasNative.cuMemsetD32(p, 0, (ulong)size), "cuMemsetD32");
+            // STREAM-ORDERED-ALLOCATION HAZARD FIX (see AllocateBuffer(float[]) above): p was allocated on
+            // _stream via cuMemAllocAsync, so the zero-init MUST also be issued on _stream. The legacy
+            // null-stream cuMemsetD32 touches an async pointer not yet valid on the null stream (non-blocking
+            // _stream → no implicit ordering) = illegal access / sticky CUDA 700 — the exact fault seen when
+            // ConfigureOptimizer allocates the GPU-resident Adam moment buffers (gpuM/gpuV). cuMemsetD8Async
+            // zeroing every byte is equivalent to zeroing the float words. No host sync needed: the consumers
+            // (Adam/SGD fused kernels) also run on _stream, so the memset is correctly ordered before them.
+            CuBlasNative.CheckCudaResult(
+                CudaNativeBindings.cuMemsetD8Async(p, 0, (ulong)size * sizeof(float), _stream),
+                "cuMemsetD8Async");
             return new CudaGpuBuffer(_cudaContext, p, size, returnToPool: null, asyncFreeStream: _stream);
         }
         if (_bufferPool.TryRent(size, out var pooled) && pooled != null)
@@ -2366,6 +2387,29 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public void Scale(IGpuBuffer A, IGpuBuffer B, float scalar, int size)
     {
         LaunchScaleKernel(A, B, scalar, size);
+    }
+
+    /// <summary>
+    /// In-place multiply of every element of <paramref name="buffer"/> by a DEVICE-resident scalar
+    /// (<paramref name="scalar"/>[0]). Used by the GPU-resident global-L2 gradient clip so the per-step
+    /// clip scale never round-trips to the host — keeping the whole clip device-resident, which lets
+    /// grad-norm clipping stay ON without disabling CUDA-graph whole-step capture.
+    /// </summary>
+    public unsafe void ScaleByDeviceScalar(IGpuBuffer buffer, IGpuBuffer scalar, int size)
+    {
+        if (size <= 0) return;
+        if (!_kernelCache.TryGetValue("scale_by_device_scalar", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: scale_by_device_scalar");
+        using var _ = PushContext();
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr bufPtr = buffer.Handle;
+        IntPtr scalarPtr = scalar.Handle;
+        int n = size;
+        void** args = stackalloc void*[3];
+        args[0] = &bufPtr;
+        args[1] = &scalarPtr;
+        args[2] = &n;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
     public unsafe void StridedGather(IGpuBuffer src, IGpuBuffer dst, int offset, int stride, int count)
@@ -7124,10 +7168,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public unsafe void GroupedQueryAttentionBackward(IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer attentionWeights,
         IGpuBuffer gradQuery, IGpuBuffer gradKey, IGpuBuffer gradValue,
-        int batch, int numQHeads, int numKVHeads, int seqQ, int seqK, int headDim, float scale)
+        int batch, int numQHeads, int numKVHeads, int seqQ, int seqK, int headDim, float scale,
+        int numQueriesPerKV)
     {
         using var _ = PushContext();
-        int queriesPerKV = numQHeads / numKVHeads;
+        // #628: honor the explicit numQueriesPerKV (matches the CPU's kvh = qh / numQueriesPerKV)
+        // rather than recomputing numQHeads/numKVHeads, which diverges for inconsistent GQA configs.
+        int queriesPerKV = numQueriesPerKV;
 
         IntPtr goPtr = gradOutput.Handle;
         IntPtr qPtr = query.Handle;

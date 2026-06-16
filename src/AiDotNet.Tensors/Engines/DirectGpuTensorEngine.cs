@@ -7898,15 +7898,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int numKVHeads = key.Shape._dims[1];
         int seqK = key.Shape._dims[2];
 
-        // The GPU kernel derives the query→KV head mapping from the GQA invariant
-        // queriesPerKV = numQHeads / numKVHeads, whereas the CPU reference honors the numQueriesPerKV
-        // PARAMETER directly (kvh = qh / numQueriesPerKV). For a well-formed GQA input these are
-        // identical; for an ill-formed one where numQHeads != numKVHeads * numQueriesPerKV (the
-        // parameter doesn't tile the heads) the mappings differ and the kernel's invariant doesn't
-        // hold. Route those to the CPU reference. NOTE: this is input validation, not a kernel dodge —
-        // the kernel is mathematically identical to the CPU for valid inputs (verified op-by-op), so
-        // it only covers degenerate head/query-count combinations.
-        if (numKVHeads <= 0 || numQHeads != numKVHeads * numQueriesPerKV)
+        // The GPU kernel now honors numQueriesPerKV directly (kvh = qh / numQueriesPerKV), matching the
+        // CPU reference for every in-range config — including the ill-formed-but-in-range combos the
+        // parity harness drives (e.g. Q=K=3 heads, numQueriesPerKV=2 → kvh in {0,1}), which run on the
+        // GPU and are validated (#628). The ONLY remaining dodge is a genuinely out-of-range config where
+        // the gradQuery kernel's kv-head index kvh = (numQHeads-1)/numQueriesPerKV would exceed numKVHeads
+        // (numQueriesPerKV too small to tile the query heads onto the KV heads): that read is out of
+        // bounds on the GPU — a hard fault, unlike the CPU's managed-array throw — so route only those to
+        // the CPU reference (which the harness skips anyway, as the CPU throws on the same input).
+        if (numKVHeads <= 0 || numQueriesPerKV <= 0 || (numQHeads - 1) / numQueriesPerKV >= numKVHeads)
             return base.GroupedQueryAttentionBackward(gradOutput, query, key, value, attentionWeights,
                 numQueriesPerKV, scale, out gradQuery, out gradKey, out gradValue);
 
@@ -7916,16 +7916,21 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         using var keyBuffer = GetOrAllocateBuffer(backend, key);
         using var valueBuffer = GetOrAllocateBuffer(backend, value);
         using var attnWeightsBuffer = GetOrAllocateBuffer(backend, attentionWeights);
-        using var gradQBuffer = AllocateOutputBuffer(backend, batch * numQHeads * seqQ * headDim);
-        using var gradKBuffer = AllocateOutputBuffer(backend, batch * numKVHeads * seqK * headDim);
-        using var gradVBuffer = AllocateOutputBuffer(backend, batch * numKVHeads * seqK * headDim);
+        int gradQSize = batch * numQHeads * seqQ * headDim;
+        int gradKVSize = batch * numKVHeads * seqK * headDim;
+        using var gradQBuffer = AllocateOutputBuffer(backend, gradQSize);
+        using var gradKBuffer = AllocateOutputBuffer(backend, gradKVSize);
+        using var gradVBuffer = AllocateOutputBuffer(backend, gradKVSize);
+        // The backend zeroes gradQ/K/V before the accumulating kernels (the pooled buffers are
+        // uninitialized) — see OpenClBackend.GroupedQueryAttentionBackward.
 
         try
         {
-            // Execute GPU backward
+            // Execute GPU backward. Pass numQueriesPerKV so the kernels use the SAME head mapping as the
+            // CPU reference (kvh = qh / numQueriesPerKV) instead of recomputing numQHeads/numKVHeads (#628).
             backend.GroupedQueryAttentionBackward(gradOutBuffer.Buffer, queryBuffer.Buffer, keyBuffer.Buffer, valueBuffer.Buffer,
                 attnWeightsBuffer.Buffer, gradQBuffer.Buffer, gradKBuffer.Buffer, gradVBuffer.Buffer,
-                batch, numQHeads, numKVHeads, seqQ, seqK, headDim, (float)scale);
+                batch, numQHeads, numKVHeads, seqQ, seqK, headDim, (float)scale, numQueriesPerKV);
 
             // DownloadBuffer uses blocking read, Synchronize() removed for performance
             float[] gradQFloat = new float[batch * numQHeads * seqQ * headDim];

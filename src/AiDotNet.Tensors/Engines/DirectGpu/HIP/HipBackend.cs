@@ -6221,9 +6221,11 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void GroupedQueryAttentionBackward(IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer attentionWeights,
         IGpuBuffer gradQuery, IGpuBuffer gradKey, IGpuBuffer gradValue,
-        int batch, int numQHeads, int numKVHeads, int seqQ, int seqK, int headDim, float scale)
+        int batch, int numQHeads, int numKVHeads, int seqQ, int seqK, int headDim, float scale,
+        int numQueriesPerKV)
     {
-        int queriesPerKV = numQHeads / numKVHeads;
+        // #628: honor the explicit numQueriesPerKV (matches the CPU's kvh = qh / numQueriesPerKV).
+        int queriesPerKV = numQueriesPerKV;
 
         IntPtr _p0 = gradOutput.Handle;
         IntPtr _p1 = query.Handle;

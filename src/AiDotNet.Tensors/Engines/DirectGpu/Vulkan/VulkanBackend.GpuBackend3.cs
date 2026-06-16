@@ -204,9 +204,11 @@ public sealed unsafe partial class VulkanBackend
     public void GroupedQueryAttentionBackward(IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer attentionWeights,
         IGpuBuffer gradQuery, IGpuBuffer gradKey, IGpuBuffer gradValue,
-        int batch, int numQHeads, int numKVHeads, int seqQ, int seqK, int headDim, float scale)
+        int batch, int numQHeads, int numKVHeads, int seqQ, int seqK, int headDim, float scale,
+        int numQueriesPerKV)
     {
-        // GQA backward: using numQHeads for fallback path.
+        // GQA backward: using numQHeads for fallback path (numQueriesPerKV honored by the GQA-aware
+        // CPU/OpenCL paths; this simplified Vulkan fallback treats every head independently).
         AttentionBackwardCore(gradOutput, query, key, value, attentionWeights, gradQuery, gradKey, gradValue,
             batch, numQHeads, seqQ, headDim, scale, false);
     }

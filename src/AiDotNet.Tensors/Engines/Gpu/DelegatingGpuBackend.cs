@@ -890,9 +890,11 @@ public class DelegatingGpuBackend : IDirectGpuBackend
     public virtual void GroupedQueryAttentionBackward(IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer attentionWeights,
         IGpuBuffer gradQuery, IGpuBuffer gradKey, IGpuBuffer gradValue,
-        int batch, int numQHeads, int numKVHeads, int seqQ, int seqK, int headDim, float scale)
+        int batch, int numQHeads, int numKVHeads, int seqQ, int seqK, int headDim, float scale,
+        int numQueriesPerKV)
         => Inner.GroupedQueryAttentionBackward(gradOutput, query, key, value, attentionWeights,
-            gradQuery, gradKey, gradValue, batch, numQHeads, numKVHeads, seqQ, seqK, headDim, scale);
+            gradQuery, gradKey, gradValue, batch, numQHeads, numKVHeads, seqQ, seqK, headDim, scale,
+            numQueriesPerKV);
 
     #endregion
 

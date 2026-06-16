@@ -169,7 +169,8 @@ public sealed partial class WebGpuBackend
     public void GroupedQueryAttentionBackward(IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer attentionWeights,
         IGpuBuffer gradQuery, IGpuBuffer gradKey, IGpuBuffer gradValue,
-        int batch, int numQHeads, int numKVHeads, int seqQ, int seqK, int headDim, float scale)
+        int batch, int numQHeads, int numKVHeads, int seqQ, int seqK, int headDim, float scale,
+        int numQueriesPerKV)
     {
         // Compute gradients using the attention backward kernel.
         // For GQA, multiple Q-heads share the same KV-head, so KV gradients must be accumulated.
@@ -184,7 +185,7 @@ public sealed partial class WebGpuBackend
             // Grouped query attention: multiple Q-heads share a single KV-head.
             // We compute per-(batch, Q-head) gradients and accumulate K/V gradients
             // into the corresponding shared KV-head.
-            int headRatio = numQHeads / numKVHeads;
+            int headRatio = numQueriesPerKV; // #628: honor the explicit param (kvh = qh / numQueriesPerKV)
 
             // Zero KV gradients; we'll accumulate into them.
             Fill(gradKey, 0f, batch * numKVHeads * seqLen * headDim);
