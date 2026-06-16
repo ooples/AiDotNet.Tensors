@@ -19,11 +19,31 @@ public class Fp16InCaptureForwardParityTests
 {
     private static Tensor<float> Rand(int[] shape, int seed)
     {
+        return new Tensor<float>(RandData(shape, seed), shape);
+    }
+
+    private static float[] RandData(int[] shape, int seed)
+    {
         var rng = new Random(seed);
         int n = 1; foreach (var d in shape) n *= d;
         var data = new float[n];
         for (int i = 0; i < n; i++) data[i] = (float)(rng.NextDouble() * 2 - 1);
-        return new Tensor<float>(data, shape);
+        return data;
+    }
+
+    private static void AssertGradsClose(float[] fp32, float[] fp16, string what)
+    {
+        Assert.Equal(fp32.Length, fp16.Length);
+        float maxAbs = 0, maxDiff = 0;
+        for (int i = 0; i < fp32.Length; i++)
+        {
+            maxAbs = Math.Max(maxAbs, Math.Abs(fp32[i]));
+            maxDiff = Math.Max(maxDiff, Math.Abs(fp32[i] - fp16[i]));
+        }
+        // FP16 activation storage perturbs gradients more than the forward; allow a generous band. The gate
+        // is "correct gradient (matches FP32 direction/magnitude)", not bit-equality.
+        float tol = 0.15f * maxAbs + 0.05f;
+        Assert.True(maxDiff < tol, $"{what} grad: maxDiff {maxDiff} exceeds tol {tol} (maxAbs {maxAbs}).");
     }
 
     [Fact]
@@ -75,5 +95,63 @@ public class Fp16InCaptureForwardParityTests
                 $"FP16-activation hetero forward loss {fp16Loss} should match FP32 {fp32Loss} within {tol}.");
         }
         finally { plan.Dispose(); }
+    }
+
+    [Fact]
+    public void Fp16HeteroBackward_MatchesFp32_ParamGrads()
+    {
+        var engine = new CpuEngine();
+        var input = Rand(new[] { 4, 5 }, 1);
+        float[] w1d = RandData(new[] { 5, 6 }, 2), w2d = RandData(new[] { 6, 4 }, 3);
+
+        // FP32 reference grads: bare CompileTraining + one Step (forward+backward, no optimizer configured ⇒
+        // grads filled, no weight update, no clip since _maxGradNorm==0). Read the grad buffers.
+        var w1a = new Tensor<float>((float[])w1d.Clone(), new[] { 5, 6 });
+        var w2a = new Tensor<float>((float[])w2d.Clone(), new[] { 6, 4 });
+        float[] g1_32, g2_32;
+        CompiledTrainingPlan<float> fp32Plan;
+        using (var scope = GraphMode.Enable())
+        {
+            var h = engine.TensorMatMul(input, w1a);
+            var y = engine.TensorMatMul(h, w2a);
+            engine.ReduceSum(y, null);
+            fp32Plan = scope.CompileTraining(new[] { w1a, w2a });
+        }
+        try
+        {
+            fp32Plan.Step();
+            g1_32 = fp32Plan.Gradients[0].ToArray();
+            g2_32 = fp32Plan.Gradients[1].ToArray();
+        }
+        finally { fp32Plan.Dispose(); }
+
+        // FP16 grads from the heterogeneous forward+backward (same init params).
+        var w1b = new Tensor<float>((float[])w1d.Clone(), new[] { 5, 6 });
+        var w2b = new Tensor<float>((float[])w2d.Clone(), new[] { 6, 4 });
+        var prev = MixedPrecisionEmit.TestOverrideEnabled;
+        MixedPrecisionEmit.TestOverrideEnabled = true;
+        CompiledTrainingPlan<float> fp16Plan;
+        try
+        {
+            using (var scope = GraphMode.Enable())
+            using (new AutocastScope(PrecisionMode.Float16))
+            {
+                var h = engine.TensorMatMul(input, w1b);
+                var y = engine.TensorMatMul(h, w2b);
+                engine.ReduceSum(y, null);
+                fp16Plan = scope.CompileTraining(new[] { w1b, w2b });
+            }
+        }
+        finally { MixedPrecisionEmit.TestOverrideEnabled = prev; GraphMode.SetCurrent(null); }
+
+        try
+        {
+            Assert.True(fp16Plan.HasFp16HeteroForward);
+            fp16Plan.RunFp16HeteroForward(engine);
+            fp16Plan.RunFp16HeteroBackward(engine);
+            AssertGradsClose(g1_32, fp16Plan.Gradients[0].ToArray(), "w1");
+            AssertGradsClose(g2_32, fp16Plan.Gradients[1].ToArray(), "w2");
+        }
+        finally { fp16Plan.Dispose(); }
     }
 }

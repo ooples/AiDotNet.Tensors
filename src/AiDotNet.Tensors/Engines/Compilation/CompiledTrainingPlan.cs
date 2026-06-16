@@ -2200,6 +2200,35 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         return _lossOutput;
     }
 
+    /// <summary>
+    /// FP16-IN-CAPTURE heterogeneous backward: reverse-mode gradients over the mixed-dtype order via the
+    /// VERIFIED <see cref="MixedPrecisionGraphBackward.BackwardOverOrder"/> (each LazyNode backprops in its
+    /// own dtype; the float&lt;-&gt;Half CrossTypeLazyNode bridges move the gradient across the dtype
+    /// boundary on-device). The resulting parameter gradients (FP32 map) are routed into the plan's grad
+    /// buffers (<c>_gradients</c> = what the fused optimizer reads). Forward must have replayed first.
+    /// </summary>
+    internal void RunFp16HeteroBackward(IEngine engine)
+    {
+        var order = _fp16HeteroOrder ?? throw new InvalidOperationException(
+            "RunFp16HeteroBackward called but no FP16 heterogeneous order was captured.");
+        if (typeof(T) != typeof(float))
+            throw new NotSupportedException("FP16-in-capture is float-only.");
+        var lossF = (Tensor<float>)(object)_lossOutput;
+        var result = MixedPrecisionGraphBackward.BackwardOverOrder(order, lossF, engine);
+        for (int p = 0; p < _parameters.Length; p++)
+        {
+            if (_gradients[p] is null) continue;
+            var paramF = (Tensor<float>)(object)_parameters[p];
+            if (result.Fp32.TryGetValue(paramF, out var g) && g is not null)
+            {
+                var srcSpan = g.AsSpan();
+                var dstSpan = ((Tensor<float>)(object)_gradients[p]).AsWritableSpan();
+                int n = Math.Min(srcSpan.Length, dstSpan.Length);
+                srcSpan.Slice(0, n).CopyTo(dstSpan.Slice(0, n));
+            }
+        }
+    }
+
     // ── Internal accessors for serialization ────────────────────────────
     internal Action<IEngine>[] ForwardActions => _forwardActions;
     internal Action<IEngine>[] BackwardActions => _backwardActions;
