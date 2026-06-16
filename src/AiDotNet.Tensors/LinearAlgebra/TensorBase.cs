@@ -1910,9 +1910,48 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
     }
 
     /// <summary>
-    /// Creates a deep copy of this tensor (always contiguous, never a view).
+    /// COW Stage 3 (issue #624): when <c>true</c> (the default), <see cref="Clone"/> routes through
+    /// the copy-on-write <see cref="CloneShared"/> — O(1)-until-write storage sharing that privatizes
+    /// on the first in-place write to either side, preserving exact deep-copy semantics. This makes
+    /// every <c>Clone()</c> caller (notably AiDotNet model <c>DeepCopy</c>, which clones per-parameter)
+    /// O(1) in memory for the inference-only clone case (ensembles, EMA snapshots, eval). Set to
+    /// <c>false</c> to force the eager full-buffer deep copy everywhere — an escape hatch only needed
+    /// if a caller writes to a clone through a path outside the Stage 1 write-gates (which would
+    /// corrupt the peer); no such path is known. Per-call eager copies are always available via
+    /// <see cref="CloneDeepCopy"/>.
+    /// </summary>
+    public static bool UseCopyOnWriteClone { get; set; } = ReadCowCloneDefault();
+
+    private static bool ReadCowCloneDefault()
+    {
+        // Escape hatch: AIDOTNET_COW_CLONE=0 (or false/off) forces eager deep-copy clones globally.
+        var env = Environment.GetEnvironmentVariable("AIDOTNET_COW_CLONE");
+        if (env is not null && (env == "0" ||
+            string.Equals(env, "false", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(env, "off", StringComparison.OrdinalIgnoreCase)))
+            return false;
+        return true;
+    }
+
+    /// <summary>
+    /// Creates a copy of this tensor (always contiguous, never a view). Routes through the
+    /// copy-on-write share when <see cref="UseCopyOnWriteClone"/> is set (the default); the result is
+    /// indistinguishable from an eager deep copy — the first write to either side privatizes.
     /// </summary>
     public virtual TensorBase<T> Clone()
+    {
+        // COW Stage 3: O(1)-until-write share by default; CloneShared falls back to CloneDeepCopy for
+        // any layout it cannot share (views/sparse/mmap/GPU), so this never recurses.
+        if (UseCopyOnWriteClone)
+            return CloneShared();
+        return CloneDeepCopy();
+    }
+
+    /// <summary>
+    /// Eager full-buffer deep copy (always contiguous, never a view). The unconditional copy that
+    /// <see cref="Clone"/> used before COW Stage 3 and that <see cref="CloneShared"/> falls back to.
+    /// </summary>
+    public virtual TensorBase<T> CloneDeepCopy()
     {
         ThrowIfSparse();
         var result = CreateInstance(_shape);
@@ -1982,7 +2021,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
     /// back to an eager <see cref="Clone"/> for any layout that cannot be shared safely. The base
     /// implementation is the safe deep copy; <c>Tensor&lt;T&gt;</c> overrides it with the real share.
     /// </summary>
-    public virtual TensorBase<T> CloneShared() => Clone();
+    public virtual TensorBase<T> CloneShared() => CloneDeepCopy();
 
     protected abstract TensorBase<T> CreateInstance(int[] shape);
     protected abstract TensorBase<T> CreateInstance(T[] data, int[] shape);

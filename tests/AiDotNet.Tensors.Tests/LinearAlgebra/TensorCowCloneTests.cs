@@ -131,4 +131,58 @@ public class TensorCowCloneTests
         clone[0] = 123f;
         Assert.Equal(expected, src.Transpose(new[] { 1, 0 }).ToArray());
     }
+
+    // ---------- Stage 3 (#624): the public Clone() itself routes through COW by default ----------
+
+    [Fact]
+    public void Clone_RoutesThroughCow_SharesUntilWrite()
+    {
+        Assert.True(TensorBase<float>.UseCopyOnWriteClone, "COW clone is the default");
+        var src = MakeTensor();
+        var clone = (Tensor<float>)src.Clone();
+
+        // O(1) proof: CloneShared only flags _cowShared when it actually shared storage (the eager
+        // CloneDeepCopy fallback never does), so IsCowShared==true means no full-buffer copy happened.
+        Assert.True(clone.IsCowShared, "Clone() must share storage (O(1)) by default");
+        Assert.True(src.IsCowShared, "the source is flagged COW too");
+        Assert.Equal(Original, clone.ToArray());
+    }
+
+    [Fact]
+    public void Clone_ThenWrite_IsolatesLikeDeepCopy()
+    {
+        var src = MakeTensor();
+        var clone = (Tensor<float>)src.Clone();
+
+        clone[2] = 77f;                                  // first write privatizes
+
+        Assert.Equal(Original, src.ToArray());           // source untouched — deep-copy semantics preserved
+        Assert.False(clone.IsCowShared);
+        Assert.Equal(77f, clone.ToArray()[2]);
+    }
+
+    [Fact]
+    public void Clone_LargeTensor_IsCheapShare()
+    {
+        // A 4M-element tensor: an eager Clone would copy 16 MB; COW shares at O(1). We assert the
+        // share happened (IsCowShared) rather than timing, then prove isolation still holds.
+        var big = new Tensor<float>(new float[4_000_000], new[] { 4_000_000 });
+        var clone = (Tensor<float>)big.Clone();
+
+        Assert.True(clone.IsCowShared, "large Clone() must be an O(1) share, not a 16 MB copy");
+        clone[0] = 5f;
+        Assert.Equal(0f, big.ToArray()[0]);              // privatized write didn't touch the source
+    }
+
+    [Fact]
+    public void CloneDeepCopy_AlwaysEager_NeverShares()
+    {
+        var src = MakeTensor();
+        var eager = (Tensor<float>)src.CloneDeepCopy();
+
+        Assert.False(eager.IsCowShared, "CloneDeepCopy is always an independent eager copy");
+        Assert.False(src.IsCowShared, "an eager copy must not flag the source COW");
+        eager[0] = 55f;
+        Assert.Equal(Original, src.ToArray());
+    }
 }

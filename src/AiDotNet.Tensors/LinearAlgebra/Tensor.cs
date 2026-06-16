@@ -158,7 +158,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         if (IsSparse || IsView || !IsContiguous || _storageOffset != 0
             || _storage.Length != Length || _storage.IsReadOnlyMapped || _device != TensorDevice.CPU)
         {
-            return Clone();
+            return CloneDeepCopy();
         }
 
         EnsureMaterialized();
@@ -167,7 +167,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         if (!IsContiguous || _storageOffset != 0 || _storage.Length != Length
             || _storage.IsReadOnlyMapped || _device != TensorDevice.CPU)
         {
-            return Clone();
+            return CloneDeepCopy();
         }
 
         // Share the same TensorStorage (the ctor AddRefs it); flag both sides as COW sharers so the
