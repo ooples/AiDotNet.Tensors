@@ -1103,9 +1103,21 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                 {
                     fixed (float* src = data)
                     {
+                        // STREAM-ORDERED-ALLOCATION HAZARD FIX: pAsync was allocated via cuMemAllocAsync on
+                        // _stream, so it is only valid to ACCESS in _stream order. The legacy null-stream
+                        // cuMemcpyHtoD does NOT order after the async alloc (_stream is a non-blocking compute
+                        // stream → the null stream has no implicit dependency on it), so it can touch a device
+                        // pointer the allocator has not yet committed = ILLEGAL access that faults the context
+                        // (sticky CUDA 700, surfacing at the NEXT driver call). This is the same class of bug
+                        // already fixed on the device→host side (see DownloadBuffer's _stream sync). Issue the
+                        // copy on _stream, then synchronize _stream BEFORE the `fixed` pin is released so the
+                        // pageable host source stays put for the (now stream-ordered) copy.
                         CuBlasNative.CheckCudaResult(
-                            CuBlasNative.cuMemcpyHtoD(pAsync, (IntPtr)src, byteSize),
-                            "cuMemcpyHtoD");
+                            CudaNativeBindings.cuMemcpyHtoDAsync(pAsync, (IntPtr)src, byteSize, _stream),
+                            "cuMemcpyHtoDAsync(weight upload)");
+                        CuBlasNative.CheckCudaResult(
+                            CudaNativeBindings.cuStreamSynchronize(_stream),
+                            "cuStreamSynchronize(weight upload)");
                     }
                 }
             }
@@ -1345,7 +1357,16 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (_asyncAlloc)
         {
             var p = AllocDeviceMemoryAsync((ulong)size * sizeof(float));
-            CuBlasNative.CheckCudaResult(CuBlasNative.cuMemsetD32(p, 0, (ulong)size), "cuMemsetD32");
+            // STREAM-ORDERED-ALLOCATION HAZARD FIX (see AllocateBuffer(float[]) above): p was allocated on
+            // _stream via cuMemAllocAsync, so the zero-init MUST also be issued on _stream. The legacy
+            // null-stream cuMemsetD32 touches an async pointer not yet valid on the null stream (non-blocking
+            // _stream → no implicit ordering) = illegal access / sticky CUDA 700 — the exact fault seen when
+            // ConfigureOptimizer allocates the GPU-resident Adam moment buffers (gpuM/gpuV). cuMemsetD8Async
+            // zeroing every byte is equivalent to zeroing the float words. No host sync needed: the consumers
+            // (Adam/SGD fused kernels) also run on _stream, so the memset is correctly ordered before them.
+            CuBlasNative.CheckCudaResult(
+                CudaNativeBindings.cuMemsetD8Async(p, 0, (ulong)size * sizeof(float), _stream),
+                "cuMemsetD8Async");
             return new CudaGpuBuffer(_cudaContext, p, size, returnToPool: null, asyncFreeStream: _stream);
         }
         if (_bufferPool.TryRent(size, out var pooled) && pooled != null)
