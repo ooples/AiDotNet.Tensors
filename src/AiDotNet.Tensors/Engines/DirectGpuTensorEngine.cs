@@ -7887,17 +7887,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return base.GroupedQueryAttentionBackward(gradOutput, query, key, value, attentionWeights, numQueriesPerKV, scale,
                 out gradQuery, out gradKey, out gradValue);
 
-        // The CUDA grouped_query_attention_backward kernel is numerically BROKEN: GpuCpuAutoDifferentialTests
-        // measures GPU-vs-CPU max_abs_err ~4.5e2–4.5e7 (vs 1e-2 tol) on shape [2,3,8,8] — a deterministic
-        // compute/indexing error (not a missing zero-init: the output buffers are already zeroed and the bug
-        // reproduces at the same magnitude). #628's numQueriesPerKV head-mapping fix was validated on
-        // AMD/OpenCL only; the CUDA kernel still produces garbage gradients. Route CUDA to the verified CPU
-        // base for correct gradients (GQA backward is not on any HRE cortex hot path) until the CUDA kernel is
-        // fixed; the (working) OpenCL/HIP/Metal kernels keep their GPU path.
-        if (string.Equals(backend.BackendName, "CUDA", StringComparison.OrdinalIgnoreCase))
-            return base.GroupedQueryAttentionBackward(gradOutput, query, key, value, attentionWeights, numQueriesPerKV, scale,
-                out gradQuery, out gradKey, out gradValue);
-
         if (query.Rank != 4)
             return base.GroupedQueryAttentionBackward(gradOutput, query, key, value, attentionWeights, numQueriesPerKV, scale,
                 out gradQuery, out gradKey, out gradValue);
