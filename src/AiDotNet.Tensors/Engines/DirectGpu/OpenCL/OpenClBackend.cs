@@ -7704,8 +7704,13 @@ KERNEL VARIANTS (A/B testing):
         public void GroupedQueryAttentionBackward(IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
             IGpuBuffer attentionWeights,
             IGpuBuffer gradQuery, IGpuBuffer gradKey, IGpuBuffer gradValue,
-            int batch, int numQHeads, int numKVHeads, int seqQ, int seqK, int headDim, float scale)
+            int batch, int numQHeads, int numKVHeads, int seqQ, int seqK, int headDim, float scale,
+            int numQueriesPerKV)
         {
+            // The kernels must honor the SAME head mapping as the CPU reference: kvh = qh / numQueriesPerKV
+            // (the explicit parameter), NOT a recomputed numQHeads/numKVHeads. For a consistent GQA config
+            // these are equal, but the parity harness drives inconsistent combos (e.g. Q=K=3 heads with
+            // numQueriesPerKV=2) where they differ — recomputing produced garbage gradients (#628).
             if (GpuDeterminism.IsActive)
             {
                 // Issue #382: gradkey/gradValue scatter atomics are FP-non-deterministic;
@@ -7721,7 +7726,7 @@ KERNEL VARIANTS (A/B testing):
                 kqg.SetArg(aqg++, batch);
                 kqg.SetArg(aqg++, numQHeads);
                 kqg.SetArg(aqg++, numKVHeads);
-                kqg.SetArg(aqg++, numQHeads / numKVHeads);
+                kqg.SetArg(aqg++, numQueriesPerKV);
                 kqg.SetArg(aqg++, seqQ);
                 kqg.SetArg(aqg++, seqK);
                 kqg.SetArg(aqg++, headDim);
@@ -7742,7 +7747,7 @@ KERNEL VARIANTS (A/B testing):
                 kkvg.SetArg(akvg++, batch);
                 kkvg.SetArg(akvg++, numQHeads);
                 kkvg.SetArg(akvg++, numKVHeads);
-                kkvg.SetArg(akvg++, numQHeads / numKVHeads);
+                kkvg.SetArg(akvg++, numQueriesPerKV);
                 kkvg.SetArg(akvg++, seqQ);
                 kkvg.SetArg(akvg++, seqK);
                 kkvg.SetArg(akvg++, headDim);
@@ -7767,7 +7772,7 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, batch);
             k.SetArg(arg++, numQHeads);
             k.SetArg(arg++, numKVHeads);
-            k.SetArg(arg++, numQHeads / numKVHeads);
+            k.SetArg(arg++, numQueriesPerKV);
             k.SetArg(arg++, seqQ);
             k.SetArg(arg++, seqK);
             k.SetArg(arg++, headDim);

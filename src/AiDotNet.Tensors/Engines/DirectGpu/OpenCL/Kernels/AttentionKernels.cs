@@ -678,6 +678,12 @@ __kernel void grouped_query_attention_backward_gradkv_deterministic(
 
     for (int qhOff = 0; qhOff < queriesPerKV; qhOff++) {
         int qh = kvh * queriesPerKV + qhOff;
+        // The inverse mapping qh = kvh*queriesPerKV + qhOff overshoots numQHeads when the config is
+        // not perfectly divisible (the parity harness drives Q=K=3 heads with queriesPerKV=2). The CPU
+        // maps each EXISTING qh forward via kvh = qh/queriesPerKV, so a qh past numQHeads simply does
+        // not exist — skip it (qh increases monotonically, so break). Without this the kernel read
+        // out-of-bounds query/gradOutput and produced garbage gradients (#628).
+        if (qh >= numQHeads) break;
         int bqh = b * numQHeads + qh;
         int qheadBase = bqh * seqQ * headDim;
         int wheadBase = bqh * seqQ * seqK;
@@ -710,8 +716,10 @@ __kernel void grouped_query_attention_backward_gradkv_deterministic(
         }
     }
 
-    gradValue[kvOffsetBase + ki * headDim + d] += accV;
-    gradKey[kvOffsetBase + ki * headDim + d] += accK;
+    // Each (b, kvh, ki, d) cell has exactly one owning work-item that computed the FULL accumulation
+    // locally, so write with `=` (not `+=`) — `+=` read the un-zeroed output buffer and added garbage.
+    gradValue[kvOffsetBase + ki * headDim + d] = accV;
+    gradKey[kvOffsetBase + ki * headDim + d] = accK;
 }
 
 __kernel void grouped_query_attention_backward(

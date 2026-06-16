@@ -543,7 +543,8 @@ public sealed partial class MetalBackend
     public void GroupedQueryAttentionBackward(IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer attentionWeights,
         IGpuBuffer gradQuery, IGpuBuffer gradKey, IGpuBuffer gradValue,
-        int batch, int numQHeads, int numKVHeads, int seqQ, int seqK, int headDim, float scale)
+        int batch, int numQHeads, int numKVHeads, int seqQ, int seqK, int headDim, float scale,
+        int numQueriesPerKV)
     {
         ThrowIfDisposed();
 
@@ -553,7 +554,8 @@ public sealed partial class MetalBackend
         var valueData = DownloadBuffer(value);
         var weightsData = DownloadBuffer(attentionWeights);
 
-        int headsPerGroup = numQHeads / numKVHeads;
+        // #628: honor the explicit numQueriesPerKV (matches the CPU's kvh = qh / numQueriesPerKV).
+        int headsPerGroup = numQueriesPerKV;
         var gradQueryData = new float[batch * numQHeads * seqQ * headDim];
         var gradKeyData = new float[batch * numKVHeads * seqK * headDim];
         var gradValueData = new float[batch * numKVHeads * seqK * headDim];

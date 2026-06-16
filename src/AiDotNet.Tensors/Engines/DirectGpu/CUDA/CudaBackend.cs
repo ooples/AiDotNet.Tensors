@@ -7145,10 +7145,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public unsafe void GroupedQueryAttentionBackward(IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer attentionWeights,
         IGpuBuffer gradQuery, IGpuBuffer gradKey, IGpuBuffer gradValue,
-        int batch, int numQHeads, int numKVHeads, int seqQ, int seqK, int headDim, float scale)
+        int batch, int numQHeads, int numKVHeads, int seqQ, int seqK, int headDim, float scale,
+        int numQueriesPerKV)
     {
         using var _ = PushContext();
-        int queriesPerKV = numQHeads / numKVHeads;
+        // #628: honor the explicit numQueriesPerKV (matches the CPU's kvh = qh / numQueriesPerKV)
+        // rather than recomputing numQHeads/numKVHeads, which diverges for inconsistent GQA configs.
+        int queriesPerKV = numQueriesPerKV;
 
         IntPtr goPtr = gradOutput.Handle;
         IntPtr qPtr = query.Handle;

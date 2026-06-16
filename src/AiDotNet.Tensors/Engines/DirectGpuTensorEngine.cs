@@ -7865,15 +7865,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         out Tensor<T> gradKey,
         out Tensor<T> gradValue)
     {
-        // The GPU GroupedQueryAttentionBackward kernel is numerically WRONG — GpuCpuAutoDifferentialTests
-        // measures GPU-vs-CPU max_abs_err ~3.7e2 (vs 1e-2 tol) on shape [2,3,8,8], i.e. the gradients it
-        // produces are garbage, not a tolerance miss. Same call as the #617 conv-coverage cluster surfaced
-        // for the DeformableConv2D family: route to the verified CPU base for correct gradients until the
-        // GPU kernel is fixed (tracked separately). GQA backward is not on any HRE cortex hot path, so this
-        // is correctness with no measurable cost. Keep the (correct) GPU forward GroupedQueryAttention.
-        return base.GroupedQueryAttentionBackward(gradOutput, query, key, value, attentionWeights, numQueriesPerKV, scale,
-            out gradQuery, out gradKey, out gradValue);
-#pragma warning disable CS0162 // Unreachable code — GPU path retained for the future kernel fix
         if (!TryGetBackend(out var backend))
             return base.GroupedQueryAttentionBackward(gradOutput, query, key, value, attentionWeights, numQueriesPerKV, scale,
                 out gradQuery, out gradKey, out gradValue);
@@ -7895,16 +7886,26 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         using var keyBuffer = GetOrAllocateBuffer(backend, key);
         using var valueBuffer = GetOrAllocateBuffer(backend, value);
         using var attnWeightsBuffer = GetOrAllocateBuffer(backend, attentionWeights);
-        using var gradQBuffer = AllocateOutputBuffer(backend, batch * numQHeads * seqQ * headDim);
-        using var gradKBuffer = AllocateOutputBuffer(backend, batch * numKVHeads * seqK * headDim);
-        using var gradVBuffer = AllocateOutputBuffer(backend, batch * numKVHeads * seqK * headDim);
+        int gradQSize = batch * numQHeads * seqQ * headDim;
+        int gradKVSize = batch * numKVHeads * seqK * headDim;
+        using var gradQBuffer = AllocateOutputBuffer(backend, gradQSize);
+        using var gradKBuffer = AllocateOutputBuffer(backend, gradKVSize);
+        using var gradVBuffer = AllocateOutputBuffer(backend, gradKVSize);
+
+        // AllocateOutputBuffer hands back pooled/uninitialized memory; the non-deterministic GQA-backward
+        // kernel accumulates gradQ/K/V via += / atomic_add, so zero them first (#628). The deterministic
+        // split kernels write with =, so this is belt-and-suspenders for that path.
+        backend.Fill(gradQBuffer.Buffer, 0f, gradQSize);
+        backend.Fill(gradKBuffer.Buffer, 0f, gradKVSize);
+        backend.Fill(gradVBuffer.Buffer, 0f, gradKVSize);
 
         try
         {
-            // Execute GPU backward
+            // Execute GPU backward. Pass numQueriesPerKV so the kernels use the SAME head mapping as the
+            // CPU reference (kvh = qh / numQueriesPerKV) instead of recomputing numQHeads/numKVHeads (#628).
             backend.GroupedQueryAttentionBackward(gradOutBuffer.Buffer, queryBuffer.Buffer, keyBuffer.Buffer, valueBuffer.Buffer,
                 attnWeightsBuffer.Buffer, gradQBuffer.Buffer, gradKBuffer.Buffer, gradVBuffer.Buffer,
-                batch, numQHeads, numKVHeads, seqQ, seqK, headDim, (float)scale);
+                batch, numQHeads, numKVHeads, seqQ, seqK, headDim, (float)scale, numQueriesPerKV);
 
             // DownloadBuffer uses blocking read, Synchronize() removed for performance
             float[] gradQFloat = new float[batch * numQHeads * seqQ * headDim];
@@ -7926,7 +7927,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return base.GroupedQueryAttentionBackward(gradOutput, query, key, value, attentionWeights, numQueriesPerKV, scale,
                 out gradQuery, out gradKey, out gradValue);
         }
-#pragma warning restore CS0162
     }
 
     /// <summary>
