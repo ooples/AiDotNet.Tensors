@@ -7706,6 +7706,14 @@ KERNEL VARIANTS (A/B testing):
             IGpuBuffer gradQuery, IGpuBuffer gradKey, IGpuBuffer gradValue,
             int batch, int numQHeads, int numKVHeads, int seqQ, int seqK, int headDim, float scale)
         {
+            // The backward kernels ACCUMULATE into the gradient buffers (gradQuery via +=, gradKey/
+            // gradValue via atomic_add across the shared query heads). AllocateBuffer returns pooled
+            // (stale) or uninitialized GPU memory — never zeroed — so without this the gradients
+            // accumulate onto garbage (observed GPU-vs-CPU max_abs_err ~372). Zero them first.
+            Fill(gradQuery, 0f, batch * numQHeads * seqQ * headDim);
+            Fill(gradKey, 0f, batch * numKVHeads * seqK * headDim);
+            Fill(gradValue, 0f, batch * numKVHeads * seqK * headDim);
+
             if (GpuDeterminism.IsActive)
             {
                 // Issue #382: gradkey/gradValue scatter atomics are FP-non-deterministic;

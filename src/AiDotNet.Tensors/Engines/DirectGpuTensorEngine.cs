@@ -7889,6 +7889,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int numKVHeads = key.Shape._dims[1];
         int seqK = key.Shape._dims[2];
 
+        // The GPU kernel derives the query→KV head mapping from the GQA invariant
+        // queriesPerKV = numQHeads / numKVHeads, whereas the CPU reference honors the numQueriesPerKV
+        // PARAMETER directly (kvh = qh / numQueriesPerKV). For a well-formed GQA input these are
+        // identical; for an ill-formed one where numQHeads != numKVHeads * numQueriesPerKV (the
+        // parameter doesn't tile the heads) the mappings differ and the kernel's invariant doesn't
+        // hold. Route those to the CPU reference. NOTE: this is input validation, not a kernel dodge —
+        // the kernel is mathematically identical to the CPU for valid inputs (verified op-by-op), so
+        // it only covers degenerate head/query-count combinations.
+        if (numKVHeads <= 0 || numQHeads != numKVHeads * numQueriesPerKV)
+            return base.GroupedQueryAttentionBackward(gradOutput, query, key, value, attentionWeights,
+                numQueriesPerKV, scale, out gradQuery, out gradKey, out gradValue);
+
         // Use cache-aware buffer allocation
         using var gradOutBuffer = GetOrAllocateBuffer(backend, gradOutput);
         using var queryBuffer = GetOrAllocateBuffer(backend, query);
