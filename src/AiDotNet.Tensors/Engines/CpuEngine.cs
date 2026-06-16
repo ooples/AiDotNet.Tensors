@@ -35173,7 +35173,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     var int4Result = AutoTensorCache.RentOrAllocate<T>(new[] { M, N });
                     var inA = (float[])(object)input.GetDataArray();
                     var outA = (float[])(object)int4Result.GetDataArray();
-                    Simd.SimdGemm.SgemmWithInt4GroupScaled(
+                    Simd.SimdGemm.SgemmWithInt4GroupScaledDispatch(
                         inA, q4.Data, q4.GroupScales, q4.GroupSize, outA, M, K, N);
                     if (bias != null || activation != FusedActivationType.None)
                     {
