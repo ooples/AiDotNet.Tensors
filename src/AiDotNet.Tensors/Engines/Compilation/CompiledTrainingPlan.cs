@@ -751,7 +751,13 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
         // Forward: use checkpointing if enabled, otherwise straight-line delegates
         long fwdStart = stepTiming ? Stopwatch.GetTimestamp() : 0;
-        if (_checkpointing is not null)
+        if (_fp16HeteroOrder is not null)
+        {
+            // FP16-IN-CAPTURE: replay the mixed-dtype graph (Half activation nodes + cast bridges) — the
+            // float-only forward steps dropped the Half nodes. Produces device-resident Half activations.
+            RunFp16HeteroForward(engine);
+        }
+        else if (_checkpointing is not null)
         {
             _checkpointing.ForwardWithCheckpoints();
         }
@@ -837,7 +843,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var bwd = _backwardActions;
         var bwdProbe = StepProbe;
         if (bwdProbe != null) bwdProbe("BEGIN-BWD");
-        if (_profileStepEnabled)
+        if (_fp16HeteroOrder is not null)
+        {
+            // FP16-IN-CAPTURE: mixed-dtype reverse pass (float/Half LazyNode backwards + cast-bridge
+            // gradient moves) → parameter grads routed into _gradients, which the clip + fused optimizer
+            // below read exactly as for the float path.
+            RunFp16HeteroBackward(engine);
+        }
+        else if (_profileStepEnabled)
         {
             // Per-delegate timing — accumulates into _profPerStepUs[i] across calls.
             var perStep = _profPerStepUs;

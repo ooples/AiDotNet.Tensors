@@ -154,4 +154,56 @@ public class Fp16InCaptureForwardParityTests
         }
         finally { fp16Plan.Dispose(); }
     }
+
+    [Fact]
+    public void Fp16HeteroStep_Wired_LossMatchesFp32()
+    {
+        // End-to-end: plan.Step() must route through the heterogeneous forward+backward (wired into StepEager)
+        // and return a loss matching the FP32 plan's Step loss.
+        var engine = new CpuEngine();
+        var input = Rand(new[] { 4, 5 }, 1);
+        float[] w1d = RandData(new[] { 5, 6 }, 2), w2d = RandData(new[] { 6, 4 }, 3);
+
+        var w1a = new Tensor<float>((float[])w1d.Clone(), new[] { 5, 6 });
+        var w2a = new Tensor<float>((float[])w2d.Clone(), new[] { 6, 4 });
+        float fp32Loss;
+        CompiledTrainingPlan<float> fp32Plan;
+        using (var scope = GraphMode.Enable())
+        {
+            var h = engine.TensorMatMul(input, w1a);
+            var y = engine.TensorMatMul(h, w2a);
+            engine.ReduceSum(y, null);
+            fp32Plan = scope.CompileTraining(new[] { w1a, w2a });
+        }
+        try { fp32Loss = fp32Plan.Step().GetFlat(0); } finally { fp32Plan.Dispose(); }
+
+        var w1b = new Tensor<float>((float[])w1d.Clone(), new[] { 5, 6 });
+        var w2b = new Tensor<float>((float[])w2d.Clone(), new[] { 6, 4 });
+        var prev = MixedPrecisionEmit.TestOverrideEnabled;
+        MixedPrecisionEmit.TestOverrideEnabled = true;
+        CompiledTrainingPlan<float> fp16Plan;
+        try
+        {
+            using (var scope = GraphMode.Enable())
+            using (new AutocastScope(PrecisionMode.Float16))
+            {
+                var h = engine.TensorMatMul(input, w1b);
+                var y = engine.TensorMatMul(h, w2b);
+                engine.ReduceSum(y, null);
+                fp16Plan = scope.CompileTraining(new[] { w1b, w2b });
+            }
+        }
+        finally { MixedPrecisionEmit.TestOverrideEnabled = prev; GraphMode.SetCurrent(null); }
+
+        try
+        {
+            Assert.True(fp16Plan.HasFp16HeteroForward);
+            float fp16Loss = fp16Plan.Step().GetFlat(0);
+            Assert.True(float.IsFinite(fp16Loss), $"Step loss must be finite, got {fp16Loss}.");
+            float tol = 0.1f * Math.Abs(fp32Loss) + 0.5f;
+            Assert.True(Math.Abs(fp16Loss - fp32Loss) < tol,
+                $"FP16 hetero Step() loss {fp16Loss} should match FP32 Step() loss {fp32Loss} within {tol}.");
+        }
+        finally { fp16Plan.Dispose(); }
+    }
 }
