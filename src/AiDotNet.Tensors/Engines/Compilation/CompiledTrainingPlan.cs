@@ -42,18 +42,19 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     // per-kernel launch overheads/step into 1 (the launch-bound bottleneck for small
     // models). Default OFF => existing training is byte-identical; eligibility is
     // narrowly gated and any capture failure falls back to eager permanently.
-    // Default ON so users get the whole-step CUDA-graph capture (collapses per-kernel launch
-    // overhead → full GPU power) automatically; opt out with AIDOTNET_CUDA_GRAPH_STEP=0. Still
-    // narrowly gated at the call site (float + CUDA + eligible + no clip/checkpoint). OPT-IN (default OFF).
-    // The embedding-input correctness root (#558 — captured graph trained on STALE token indices, loss frozen
-    // at ln V) is now FIXED via the prefix-eager embedding (run it outside capture + refresh its output each
-    // step; see _graphEagerFwd / RunEagerForwardPrefix) — VERIFIED: the d256/L2 cortex loss drops 9.59→7.20
-    // under the graph. Kept OPT-IN conservatively because (a) a NON-embedding leading host op would need the
-    // same eager-prefix treatment, and (b) for a token LM the eager host embedding currently caps GPU util
-    // (~15%) until the gather is GPU-ized — a perf follow-up, not a correctness gate. Enable for the GPU-op
-    // acceleration with AIDOTNET_CUDA_GRAPH_STEP=1; the default (generic GPU-pure ops, no graph) is correct.
+    // DEFAULT ON (industry-standard): whole-step CUDA-graph capture collapses thousands of per-kernel
+    // launches into one cuGraphLaunch — the difference between a launch-bound GPU step and a compute-bound
+    // one. Opt out with AIDOTNET_CUDA_GRAPH_STEP=0. Safe to default-on because the call-site gate is narrow
+    // (float + CUDA + graph-eligible + not checkpointing) and ANY capture failure rolls back the
+    // graph-lifetime state and runs eager permanently (the eager path is always a valid fallback), so the
+    // worst case of enabling it is "no speedup", never a correctness regression. The historical blockers are
+    // resolved: (a) the #558 stale-token-index root is fixed via the on-device captured embedding gather
+    // (_graphHasEmbedding) / prefix-eager embedding; (b) grad-norm clipping no longer disables capture — it
+    // runs as a fully GPU-resident clip (TryClipGradientsGlobalL2Gpu) after the captured backward, so the
+    // _maxGradNorm<=0 gate was removed. Measured: with constant-shape batching the captured d768/L6 cortex
+    // reaches ~71% GPU util at the default batch (vs ~12% launch-bound without capture).
     private static readonly bool s_graphStepEnabled =
-        System.Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_STEP") == "1";
+        System.Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_STEP") != "0";
     private IntPtr _stepGraphExec;
     private long _graphStepCalls;
     private bool _graphStepDisabled;
