@@ -171,6 +171,7 @@ public static class WeightRegistry
                             {
                                 StreamingEncoding.Bf16 => CheckedBf16ByteCount(weight.Length),
                                 StreamingEncoding.Int8 => CheckedInt8ByteCount(weight.Length, weight.Int8QuantRows),
+                                StreamingEncoding.Int4 => CheckedInt4ByteCount(weight.Length),
                                 _ => CheckedStreamingByteCount<T>(weight.Length),
                             };
                             bytes = new byte[byteCount];
@@ -675,6 +676,7 @@ public static class WeightRegistry
             case StreamingStoreDtype.Bf16: return (StreamingEncoding.Bf16, false);
             case StreamingStoreDtype.Bf16Stochastic: return (StreamingEncoding.Bf16, true);
             case StreamingStoreDtype.Int8: return (StreamingEncoding.Int8, false); // explicit opt-in (Auto never picks int8)
+            case StreamingStoreDtype.Int4: return (StreamingEncoding.Int4, false); // explicit opt-in (Auto never picks int4)
             case StreamingStoreDtype.Lossless: return (StreamingEncoding.Lossless, false); // exact, variable-size; explicit opt-in
             case StreamingStoreDtype.Auto:
             default:
@@ -751,6 +753,21 @@ public static class WeightRegistry
             throw new NotSupportedException(
                 $"Streaming int8 registration requires per-tensor size <= {int.MaxValue} bytes. " +
                 $"Tensor has {length} elements + {4 + 4 * rows} header bytes = {byteCountLong} bytes. Chunk it.");
+        return (int)byteCountLong;
+    }
+
+    /// <summary>int4 group-quant byte count (4 bits per element + 8-byte header + 4 bytes per
+    /// group scale, at the default group size) with overflow guard.</summary>
+    internal static int CheckedInt4ByteCount(int length)
+    {
+        if (length < 0) throw new ArgumentOutOfRangeException(nameof(length));
+        int groupSize = StreamingStoreCodec.DefaultInt4GroupSize;
+        long numGroups = (length + groupSize - 1L) / groupSize;
+        long byteCountLong = 8L + 4L * numGroups + (length + 1L) / 2; // [count][groupSize][scales][nibbles]
+        if (byteCountLong > int.MaxValue)
+            throw new NotSupportedException(
+                $"Streaming int4 registration requires per-tensor size <= {int.MaxValue} bytes. " +
+                $"Tensor has {length} elements + {8 + 4 * numGroups} header bytes = {byteCountLong} bytes. Chunk it.");
         return (int)byteCountLong;
     }
 
@@ -869,6 +886,34 @@ public static class WeightRegistry
             throw new NotSupportedException(
                 $"int8 streaming store is only supported for float/double, not {typeof(T).Name}.");
         }
+        // int4 store (StreamingEncoding.Int4): AWQ/GPTQ-style GROUP symmetric quantization (8x).
+        // A 2-D Linear weight [in,out] is TRANSPOSED to [out,in] first (Int8StoreTransposed is
+        // shape-derived: true iff rank 2), so the stored int4 is exactly the [N,K] layout the
+        // int4 weight-only GEMM consumes (no upcast); the group scales then run over that flat
+        // [out,in] order, so they must be quantized AFTER the transpose (transposing quantized
+        // data would scramble group membership). Higher-rank / 1-D weights store untransposed.
+        // dst is sized to Int4BufferBytes(Length, DefaultInt4GroupSize) by the caller. The fp
+        // fallback (DequantizeStreamingInt4 / restore) transposes back to the logical [in,out].
+        if (encoding == StreamingEncoding.Int4)
+        {
+            int gs = StreamingStoreCodec.DefaultInt4GroupSize;
+            if (typeof(T) == typeof(float))
+            {
+                var srcF = (float[])(object)tensor.AsSpan().ToArray();
+                if (tensor.Int8StoreTransposed) srcF = TransposeRowMajor(srcF, tensor._shape[0], tensor._shape[1]);
+                StreamingStoreCodec.EncodeInt4Float(srcF, dst, gs);
+                return;
+            }
+            if (typeof(T) == typeof(double))
+            {
+                var srcD = (double[])(object)tensor.AsSpan().ToArray();
+                if (tensor.Int8StoreTransposed) srcD = TransposeRowMajor(srcD, tensor._shape[0], tensor._shape[1]);
+                StreamingStoreCodec.EncodeInt4Double(srcD, dst, gs);
+                return;
+            }
+            throw new NotSupportedException(
+                $"int4 streaming store is only supported for float/double, not {typeof(T).Name}.");
+        }
         if (typeof(T) == typeof(float))
         {
             var src = (float[])(object)tensor.AsSpan().ToArray();
@@ -943,9 +988,9 @@ public static class WeightRegistry
         if (weight is null) throw new ArgumentNullException(nameof(weight));
         if (weight.Lifetime != WeightLifetime.Streaming) return;
         if (weight.StreamingPoolHandle < 0) return;
-        // A no-upcast int8 weight is already materialized (as int8 + scales), even though its
-        // fp32 _data is empty — treat it as resident so we don't re-fetch + re-attach each call.
-        if (weight.DataVector.Length == weight.Length || weight.StreamingInt8 is not null)
+        // A no-upcast int8/int4 weight is already materialized (as quantized + scales), even though
+        // its fp _data is empty — treat it as resident so we don't re-fetch + re-attach each call.
+        if (weight.DataVector.Length == weight.Length || weight.StreamingInt8 is not null || weight.StreamingInt4 is not null)
         {
             // Already resident — but still bump the pool's LRU heat so
             // this hot weight doesn't get evicted in favor of cold ones.
@@ -1025,6 +1070,14 @@ public static class WeightRegistry
             && (typeof(T) == typeof(float) || typeof(T) == typeof(double)))
         {
             weight.AttachStreamingInt8(snapshot);
+        }
+        // No-upcast int4 fast path: same as int8 but for the 8x int4 group-quant store — keep it
+        // 4-bit + group scales so an int4-resident model holds its small footprint through the
+        // matmul (the int4 weight-only GEMM consumes it directly).
+        else if (inferenceMode && weight.StreamingStoreEncoding == StreamingEncoding.Int4
+            && (typeof(T) == typeof(float) || typeof(T) == typeof(double)))
+        {
+            weight.AttachStreamingInt4(snapshot);
         }
         else
         {
