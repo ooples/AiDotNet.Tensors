@@ -501,8 +501,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // checkpointing + an all-GPU-pure action set (_graphStepEligible — host-only
         // specialized closures would freeze under replay). Anything else, or any
         // capture failure, runs eager.
+        // Note: grad-norm clipping no longer gates capture off. The clip is now applied as a fully
+        // GPU-resident op (TryClipGradientsGlobalL2Gpu) eagerly after the captured backward and before the
+        // eager optimizer update — no host read — so clipping can stay ON (industry-standard default) while
+        // whole-step capture still engages. (Capture is CUDA-only, which is exactly where the resident clip runs.)
         if (s_graphStepEnabled && !_graphStepDisabled && _graphStepEligible && typeof(T) == typeof(float)
-            && _checkpointing is null && _maxGradNorm <= 0.0
+            && _checkpointing is null
             && _engine is Engines.DirectGpuTensorEngine gte
             && gte.GetBackend() is Engines.DirectGpu.CUDA.CudaBackend cb)
         {
@@ -596,6 +600,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     // Adam/AdamW bias-correction each step, and bakes those scalars into
                     // the kernel args — a captured replay would freeze them at the
                     // capture step. Its kernels enqueue (in order) after the graph launch.
+                    // GPU-resident grad clip (if enabled): scales the device grad buffers in place on the
+                    // compute stream — ordered after the captured backward, before the optimizer reads them.
+                    if (_maxGradNorm > 0.0 && !TryClipGradientsGlobalL2Gpu(_gradients, _maxGradNorm))
+                        ClipGradientsGlobalL2(_gradients, _maxGradNorm);
                     _optimizerUpdate?.Invoke();
                     return _lossOutput;
                 }
@@ -608,6 +616,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 if (_graphHasEmbedding) gte.RefreshGraphEmbeddingIndicesNow();   // upload step-N indices (registered action)
                 RefreshGraphInputInPlace(cb);
                 cb.LaunchCapturedGraph(_stepGraphExec);
+                if (_maxGradNorm > 0.0 && !TryClipGradientsGlobalL2Gpu(_gradients, _maxGradNorm))
+                    ClipGradientsGlobalL2(_gradients, _maxGradNorm);
                 _optimizerUpdate?.Invoke();
                 return _lossOutput;
             }
@@ -863,7 +873,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // leaves uninitialised).
         if (_maxGradNorm > 0.0)
         {
-            ClipGradientsGlobalL2(_gradients, _maxGradNorm);
+            // Prefer the fully GPU-resident clip when grads are CUDA-resident — it scales the device grad
+            // buffers in place with no host read, so clipping stays correct on the resident/captured path
+            // (the CPU ClipGradientsGlobalL2 throws on GPU-resident grads). Falls back to the CPU clip for
+            // CPU-resident / non-CUDA grads.
+            if (!TryClipGradientsGlobalL2Gpu(_gradients, _maxGradNorm))
+                ClipGradientsGlobalL2(_gradients, _maxGradNorm);
         }
 
         if (bwdProbe != null) bwdProbe("BEGIN-OPT");
@@ -4237,6 +4252,78 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             for (int i = 0; i < len; i++)
                 arr[i] = numOps.Multiply(arr[i], scale);
         }
+    }
+
+    /// <summary>
+    /// Fully GPU-resident global L2-norm gradient clip (PyTorch clip_grad_norm_ semantics). Computes the
+    /// total norm across all GPU-resident parameter gradients and scales every gradient buffer in place by
+    /// <c>min(1, maxNorm/(totalNorm+1e-6))</c> — entirely on-device, with NO host read of the gradients or
+    /// the scale. This is what lets grad-norm clipping stay enabled WITHOUT disabling CUDA-graph capture
+    /// (the old <see cref="ClipGradientsGlobalL2"/> throws on GPU-resident grads because a host norm/scale
+    /// would read a stale CPU copy). Runs eagerly on the compute stream between the (captured-or-eager)
+    /// backward and the eager optimizer update, so all clip ops are stream-ordered before the optimizer
+    /// reads the now-clipped grads. Returns false if any gradient is not CUDA-resident (caller uses the CPU
+    /// clip instead); the global norm requires ALL grads present, so a mixed CPU/GPU set is not handled here.
+    /// </summary>
+    private static bool TryClipGradientsGlobalL2Gpu(Tensor<T>[] gradients, double maxNorm)
+    {
+        if (gradients.Length == 0) return true;
+        Engines.DirectGpu.CUDA.CudaBackend? cb = null;
+        // All gradients must be CUDA-resident for a correct global norm.
+        for (int p = 0; p < gradients.Length; p++)
+        {
+            var g = gradients[p];
+            if (g == null) continue;
+            if (g.TryGetGpuBuffer() is null || g._gpuBackend is not Engines.DirectGpu.CUDA.CudaBackend gcb)
+                return false;
+            cb ??= gcb;
+            if (!ReferenceEquals(g._gpuBackend, cb)) return false; // grads split across backends — bail
+        }
+        if (cb is null) return true; // all-null grads: nothing to clip
+
+        // sumSq accumulator + a 1-element scratch, both device-resident. Tiny pool allocations (reused).
+        var sumSq = cb.AllocateBuffer(1);   // AllocateBuffer(int) zero-inits
+        var tmp = cb.AllocateBuffer(1);
+        try
+        {
+            // total sumSq = Σ_p Σ_i grad_p[i]^2. NOTE: ReduceSumOfSquares ACCUMULATES into its output
+            // (the non-deterministic kernel does atomicAdd; the deterministic one Fill-zeros then writes),
+            // so tmp MUST be zeroed before each call or it would double-count across tensors. sumSq is then
+            // accumulated explicitly via Add so the result is correct in BOTH determinism modes.
+            cb.Fill(sumSq, 0f, 1);
+            for (int p = 0; p < gradients.Length; p++)
+            {
+                var g = gradients[p];
+                if (g == null) continue;
+                var buf = g.TryGetGpuBuffer();
+                if (buf is null) continue;
+                cb.Fill(tmp, 0f, 1);
+                cb.ReduceSumOfSquares(buf, tmp, g.Length);
+                cb.Add(sumSq, tmp, sumSq, 1);
+            }
+            // scale = min(1, maxNorm / (sqrt(sumSq) + 1e-6)) — all in place in sumSq, '1' staged in tmp.
+            cb.Sqrt(sumSq, sumSq, 1);                       // norm
+            cb.AddScalar(sumSq, sumSq, 1e-6f, 1);           // norm + eps
+            cb.Reciprocal(sumSq, sumSq, 1);                 // 1/(norm+eps)
+            cb.Scale(sumSq, sumSq, (float)maxNorm, 1);      // maxNorm/(norm+eps)
+            cb.Fill(tmp, 1f, 1);
+            cb.Min(sumSq, tmp, sumSq, 1);                   // min(1, ...) → final scale (no-op clip when norm<=maxNorm)
+            // apply: grad_p *= scale[0]  (device-scalar broadcast multiply, in place)
+            for (int p = 0; p < gradients.Length; p++)
+            {
+                var g = gradients[p];
+                if (g == null) continue;
+                var buf = g.TryGetGpuBuffer();
+                if (buf is null) continue;
+                cb.ScaleByDeviceScalar(buf, sumSq, g.Length);
+            }
+        }
+        finally
+        {
+            (sumSq as IDisposable)?.Dispose();
+            (tmp as IDisposable)?.Dispose();
+        }
+        return true;
     }
 
     private static void TensorMatMulGemvFloat(float[] matrix, float[] vector, float[] output, int rows, int cols)

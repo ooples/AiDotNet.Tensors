@@ -2389,6 +2389,29 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         LaunchScaleKernel(A, B, scalar, size);
     }
 
+    /// <summary>
+    /// In-place multiply of every element of <paramref name="buffer"/> by a DEVICE-resident scalar
+    /// (<paramref name="scalar"/>[0]). Used by the GPU-resident global-L2 gradient clip so the per-step
+    /// clip scale never round-trips to the host — keeping the whole clip device-resident, which lets
+    /// grad-norm clipping stay ON without disabling CUDA-graph whole-step capture.
+    /// </summary>
+    public unsafe void ScaleByDeviceScalar(IGpuBuffer buffer, IGpuBuffer scalar, int size)
+    {
+        if (size <= 0) return;
+        if (!_kernelCache.TryGetValue("scale_by_device_scalar", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: scale_by_device_scalar");
+        using var _ = PushContext();
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr bufPtr = buffer.Handle;
+        IntPtr scalarPtr = scalar.Handle;
+        int n = size;
+        void** args = stackalloc void*[3];
+        args[0] = &bufPtr;
+        args[1] = &scalarPtr;
+        args[2] = &n;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
     public unsafe void StridedGather(IGpuBuffer src, IGpuBuffer dst, int offset, int stride, int count)
     {
         if (count <= 0) return;

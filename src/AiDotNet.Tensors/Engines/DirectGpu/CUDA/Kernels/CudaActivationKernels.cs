@@ -779,6 +779,16 @@ extern ""C"" __global__ __launch_bounds__(256) void scale_vector(const float* __
     B[idx] = A[idx] * scalar;
 }
 
+// In-place multiply of every element by a DEVICE-resident scalar (scalar[0]). Used by the GPU-resident
+// global-L2 gradient clip so the per-step clip scale never round-trips to the host (keeps the whole clip
+// device-resident, so grad clipping can stay ON without disabling CUDA-graph capture).
+extern ""C"" __global__ __launch_bounds__(256) void scale_by_device_scalar(float* __restrict__ buf, const float* __restrict__ scalar, int size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    buf[idx] *= scalar[0];
+}
+
 extern ""C"" __global__ __launch_bounds__(256) void abs_vector(const float* __restrict__ A, float* __restrict__ B, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1432,6 +1442,7 @@ extern ""C"" __global__ __launch_bounds__(256) void max_vectors_vec4(const float
                 "max_vectors",
                 // Scalar ops
                 "scale_vector",
+                "scale_by_device_scalar",
                 "power_scalar",
                 // Unary math
                 "abs_vector",
