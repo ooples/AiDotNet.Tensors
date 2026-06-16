@@ -7147,6 +7147,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int batchSize = input.Shape._dims[0];
         int features = input.Shape._dims[1];
 
+        // Contract parity with the CPU reference: CpuEngine.FusedBatchNorm always normalizes with
+        // BATCH statistics and ignores the training flag / running mean+var (those are updated
+        // externally — see its comment). The GPU must do the same, otherwise an inference-mode call
+        // (training=false) normalizes with running stats on GPU while the CPU uses batch stats,
+        // diverging grossly. Force batch-stats here so the two engines agree. (A dedicated
+        // inference-mode path using running stats would be a separate, explicitly-routed op.)
+        training = true;
+
         // Use cache-aware buffer allocation (OwnedBuffer auto-disposes only if we allocated)
         using var inputBuffer = GetOrAllocateBuffer(backend, input);
         using var outputBuffer = AllocateOutputBuffer(backend, batchSize * features);
@@ -7186,6 +7194,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             backend.DownloadBuffer(outputBuffer.Buffer, resultFloat);
             backend.DownloadBuffer(saveMeanBuffer.Buffer, saveMeanFloat);
             backend.DownloadBuffer(saveVarBuffer.Buffer, saveVarFloat);
+
+            // The batchnorm_forward kernel writes INVERSE std (1/sqrt(var+eps)) into the saveVar buffer
+            // (its launcher param is named saveInvVar), but the CPU FusedBatchNorm reference returns the
+            // batch VARIANCE in saveVar. Convert back so the returned saveVar matches the CPU contract:
+            // var = 1/invStd^2 - epsilon.
+            for (int i = 0; i < saveVarFloat.Length; i++)
+            {
+                float invStd = saveVarFloat[i];
+                saveVarFloat[i] = invStd != 0f ? 1.0f / (invStd * invStd) - (float)epsilon : 0f;
+            }
 
             // Convert back to T
             T[] resultData = DirectGpuEngine.FromFloatArray<T>(resultFloat);
@@ -7879,6 +7897,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int headDim = query.Shape._dims[3];
         int numKVHeads = key.Shape._dims[1];
         int seqK = key.Shape._dims[2];
+
+        // The GPU kernel derives the query→KV head mapping from the GQA invariant
+        // queriesPerKV = numQHeads / numKVHeads, whereas the CPU reference honors the numQueriesPerKV
+        // PARAMETER directly (kvh = qh / numQueriesPerKV). For a well-formed GQA input these are
+        // identical; for an ill-formed one where numQHeads != numKVHeads * numQueriesPerKV (the
+        // parameter doesn't tile the heads) the mappings differ and the kernel's invariant doesn't
+        // hold. Route those to the CPU reference. NOTE: this is input validation, not a kernel dodge —
+        // the kernel is mathematically identical to the CPU for valid inputs (verified op-by-op), so
+        // it only covers degenerate head/query-count combinations.
+        if (numKVHeads <= 0 || numQHeads != numKVHeads * numQueriesPerKV)
+            return base.GroupedQueryAttentionBackward(gradOutput, query, key, value, attentionWeights,
+                numQueriesPerKV, scale, out gradQuery, out gradKey, out gradValue);
 
         // Use cache-aware buffer allocation
         using var gradOutBuffer = GetOrAllocateBuffer(backend, gradOutput);

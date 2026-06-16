@@ -21,6 +21,7 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// input gradient catches them. NON-SQUARE spatial dims are used deliberately: a square
 /// output (outHeight == outWidth) coincidentally masked bug #2.
 /// </summary>
+[Collection("DirectGpuSerial")]
 public class MaxPool2DBackwardGpuCorrectnessTests
 {
     [Fact]

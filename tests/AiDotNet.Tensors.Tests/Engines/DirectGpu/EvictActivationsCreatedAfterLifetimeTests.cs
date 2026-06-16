@@ -23,6 +23,7 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 ///      is materialized BEFORE the buffer is freed, so a later CPU read never touches
 ///      a freed buffer.
 /// </summary>
+[Collection("DirectGpuSerial")]
 public class EvictActivationsCreatedAfterLifetimeTests
 {
     /// <summary>Fake GPU buffer — tracks Dispose so the test can assert on lifetime.</summary>

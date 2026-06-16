@@ -30,6 +30,7 @@ using Xunit.Abstractions;
 
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
+[Collection("DirectGpuSerial")]
 public class MatrixMultiplyResidencyTests
 {
     private readonly ITestOutputHelper _output;

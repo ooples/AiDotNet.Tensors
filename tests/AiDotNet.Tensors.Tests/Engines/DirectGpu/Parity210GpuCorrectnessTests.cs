@@ -14,6 +14,7 @@ using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
+[Collection("DirectGpuSerial")]
 public class Parity210GpuCorrectnessTests
 {
     private readonly DirectGpuTensorEngine? _gpu;

@@ -25,6 +25,7 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// correctness is covered by the parity tests, not here.</para>
 /// </summary>
 [Trait("Category", "Perf")]
+[Collection("DirectGpuSerial")]
 public class GpuSpMMBenchHarness
 {
     private readonly ITestOutputHelper _out;

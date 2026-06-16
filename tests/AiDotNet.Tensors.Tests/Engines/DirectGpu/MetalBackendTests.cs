@@ -22,6 +22,7 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// - Memory management
 /// - Edge cases and precision
 /// </remarks>
+[Collection("DirectGpuSerial")]
 public class MetalBackendTests : IDisposable
 {
 #if NET7_0_OR_GREATER

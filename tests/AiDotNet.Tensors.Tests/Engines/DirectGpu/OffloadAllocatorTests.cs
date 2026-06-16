@@ -23,6 +23,7 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// We can't test happy-path allocation without the matching hardware/runtime,
 /// but the IsAvailable + clean-throw contract is testable everywhere.
 /// </summary>
+[Collection("DirectGpuSerial")]
 public class OffloadAllocatorTests
 {
     private static IGpuOffloadAllocator[] AllAllocators() => new IGpuOffloadAllocator[]
