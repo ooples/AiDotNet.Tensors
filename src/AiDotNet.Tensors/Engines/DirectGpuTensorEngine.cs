@@ -3022,6 +3022,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (t._gpuBuffer is not null && ReferenceEquals(t._gpuBackend, backend))
             return new OwnedBuffer(t._gpuBuffer, ownsBuffer: false);
+        // Comprehensive resident check (the _gpuBuffer field alone is NOT enough): a GPU-RESIDENT PARAMETER
+        // (GpuPinned/GpuOffload, AIDOTNET_GPU_RESIDENT_PARAMS=1) carries its residency as an OffloadDevicePointer
+        // in WeightRegistry, not the _gpuBuffer field, so TryGetGpuBuffer() finds it where the field check misses.
+        // Without this, a matmul WEIGHT operand fell through to GetOrCacheWeightBuffer below and allocated a fresh
+        // device buffer DURING CUDA-graph capture (GetDataArray() returns a new host array each call → a guaranteed
+        // cache miss) — a graph-purity violation (CUDA 906) that aborts whole-step capture and PERMANENTLY drops the
+        // cortex onto the launch-bound eager path (~60 s/step). Same root cause as the #611 LayerNorm fix.
+        var resident = t.TryGetGpuBuffer();
+        if (resident is not null) return new OwnedBuffer(resident, ownsBuffer: false);
         var arr = t.DataVector.GetBackingArrayUnsafe();
         if (arr is not null)
         {
@@ -3031,7 +3040,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 if (_activationCache.TryGetValue(arr, out var e) && ReferenceEquals(e.Backend, backend) && !e.IsFp16)
                     return new OwnedBuffer(e.Buffer, ownsBuffer: false);
             if (t.IsContiguous)
-                return GetOrCacheWeightBuffer(backend, t.GetDataArray(), PersistentTensorRole.Weights);
+                return GetWeightBufferPreferResident(backend, t, PersistentTensorRole.Weights);
         }
         return GetOrAllocateContiguousInputBuffer(backend, t);
     }
