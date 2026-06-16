@@ -112,4 +112,64 @@ public class TensorCowInferenceReadPathTests
         Assert.True(tableClone.IsCowShared, "embedding privatized the COW table");
         AssertClose(expected, actual);
     }
+
+    [Fact]
+    public void BatchMatMul_DoesNotPrivatizeCowOperand()
+    {
+        // attention-style batched matmul [B, M, K] x [B, K, N]
+        var a = Filled(new[] { 2, 3, 4 }, 1);
+        var (b, bClone) = Weight(new[] { 2, 4, 5 }, 600);
+
+        var expected = Engine.TensorBatchMatMul(a, b);
+        var actual = Engine.TensorBatchMatMul(a, bClone);
+
+        Assert.True(bClone.IsCowShared, "batch matmul privatized the COW operand");
+        AssertClose(expected, actual);
+    }
+
+    [Fact]
+    public void ElementwiseAdd_DoesNotPrivatizeCowOperand()
+    {
+        // same-shape elementwise add (TensorAdd does not broadcast [M,N]+[N];
+        // model bias-add is covered by FusedLinear). The COW operand is read-only.
+        var x = Filled(new[] { 4, 8 }, 1);
+        var (other, otherClone) = Weight(new[] { 4, 8 }, 700);
+
+        var expected = Engine.TensorAdd(x, other);
+        var actual = Engine.TensorAdd(x, otherClone);
+
+        Assert.True(otherClone.IsCowShared, "elementwise add privatized the COW operand");
+        AssertClose(expected, actual);
+    }
+
+    [Fact]
+    public void GroupNorm_DoesNotPrivatizeCowGammaBeta()
+    {
+        // [N=1, C=4, H=2, W=2], 2 groups
+        var x = Filled(new[] { 1, 4, 2, 2 }, 1);
+        var (gamma, gammaClone) = Weight(new[] { 4 }, 800);
+        var (beta, betaClone) = Weight(new[] { 4 }, 900);
+
+        var expected = Engine.GroupNorm(x, 2, gamma, beta, 1e-5, out _, out _);
+        var actual = Engine.GroupNorm(x, 2, gammaClone, betaClone, 1e-5, out _, out _);
+
+        Assert.True(gammaClone.IsCowShared, "groupnorm privatized the COW gamma");
+        Assert.True(betaClone.IsCowShared, "groupnorm privatized the COW beta");
+        AssertClose(expected, actual);
+    }
+
+    [Fact]
+    public void FusedLinear_DoesNotPrivatizeCowWeightsBias()
+    {
+        var x = Filled(new[] { 2, 4 }, 1);
+        var (w, wClone) = Weight(new[] { 4, 3 }, 1000);
+        var (bias, biasClone) = Weight(new[] { 3 }, 1100);
+
+        var expected = Engine.FusedLinear(x, w, bias, AiDotNet.Tensors.Engines.FusedActivationType.None);
+        var actual = Engine.FusedLinear(x, wClone, biasClone, AiDotNet.Tensors.Engines.FusedActivationType.None);
+
+        Assert.True(wClone.IsCowShared, "fused linear privatized the COW weights");
+        Assert.True(biasClone.IsCowShared, "fused linear privatized the COW bias");
+        AssertClose(expected, actual);
+    }
 }

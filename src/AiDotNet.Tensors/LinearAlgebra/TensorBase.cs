@@ -1220,6 +1220,28 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
     /// </summary>
     internal Memory<T> Data => Memory;
 
+    /// <summary>
+    /// COW Stage 2 (#624): a READ-ONLY <see cref="ReadOnlyMemory{T}"/> view of the backing store
+    /// that does <b>not</b> privatize a copy-on-write clone — the <see cref="Memory"/>/<see cref="Data"/>
+    /// counterpart for engine INPUT operands passed to read-only-typed parameters (e.g.
+    /// <c>MatrixMultiplyHelper.TryGemm</c>'s <see cref="ReadOnlyMemory{T}"/> a/b). Same materialization
+    /// guard as <see cref="Memory"/>; identical to it for every non-COW tensor. The caller contract is
+    /// read-only — routing a write through this would corrupt a COW peer.
+    /// </summary>
+    internal ReadOnlyMemory<T> ReadOnlyData
+    {
+        get
+        {
+            EnsureMaterialized();
+            if (!IsContiguous)
+                throw new InvalidOperationException(
+                    "Cannot get contiguous Memory from a non-contiguous tensor view. Call Contiguous() first.");
+            if (_storageOffset == 0 && _storage.Length == Length)
+                return _storage.AsMemory();
+            return _storage.AsMemory().Slice(_storageOffset, Length);
+        }
+    }
+
     // ================================================================
     // Constructors
     // ================================================================
