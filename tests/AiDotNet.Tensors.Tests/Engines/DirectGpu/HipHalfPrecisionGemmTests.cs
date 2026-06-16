@@ -22,6 +22,7 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// (throws instead of skipping when a GPU is required) per the no-silent-pass
 /// guideline. Requires AMD ROCm + hipBLAS; skips on non-ROCm hosts.
 /// </summary>
+[Collection("DirectGpuSerial")]
 public sealed class HipHalfPrecisionGemmTests : IDisposable
 {
     private readonly HipBackend _backend;

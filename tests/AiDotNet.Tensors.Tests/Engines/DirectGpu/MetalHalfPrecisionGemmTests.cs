@@ -22,6 +22,7 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// (throws instead of skipping when a GPU is required) per the no-silent-pass
 /// guideline. Requires an Apple Metal device; skips on non-Metal hosts.
 /// </summary>
+[Collection("DirectGpuSerial")]
 public sealed class MetalHalfPrecisionGemmTests : IDisposable
 {
     private readonly MetalBackend _backend;

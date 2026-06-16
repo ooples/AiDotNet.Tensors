@@ -9,6 +9,7 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// by comparing against CPU reference implementations.
 /// Tests are skipped when no GPU backend is available.
 /// </summary>
+[Collection("DirectGpuSerial")]
 public class GpuFusedKernelCorrectnessTests
 {
     private readonly CpuEngine _cpu = new();

@@ -527,7 +527,10 @@ public sealed class GpuCpuAutoDifferentialTests : IDisposable
 }
 
 /// <summary>Serializes all DirectGpu test classes so they don't share an OpenCL context concurrently
-/// (AMD RDNA1 drivers crash on multi-threaded shared-context use).</summary>
-[CollectionDefinition("DirectGpuSerial")]
+/// (AMD RDNA1 drivers crash / the device wedges on multi-threaded shared-context use — observed as a
+/// multi-hour hang when the GPU parity suites run in parallel). <c>DisableParallelization = true</c> is
+/// REQUIRED: without it this collection still runs concurrently with the other GPU collections and the
+/// ungrouped GPU classes, defeating the serialization this type exists to provide.</summary>
+[CollectionDefinition("DirectGpuSerial", DisableParallelization = true)]
 public sealed class DirectGpuSerialCollection { }
 #endif

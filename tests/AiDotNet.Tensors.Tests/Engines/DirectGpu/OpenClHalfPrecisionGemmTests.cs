@@ -28,6 +28,7 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// rather than passing as a no-op.
 /// </para>
 /// </summary>
+[Collection("DirectGpuSerial")]
 public sealed class OpenClHalfPrecisionGemmTests : IDisposable
 {
     private readonly OpenClBackend _backend;

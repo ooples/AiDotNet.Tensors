@@ -19,6 +19,7 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// shows up as O(1) error, not rounding. (The HIP mirror is implemented but not yet
 /// wired/validated — it needs a healthy ROCm runner; see HipCustomSparseBackend.)</para>
 /// </summary>
+[Collection("DirectGpuSerial")]
 public class CudaSparseBackendSpMMTests
 {
     private static float[] CpuReference(int[] rowPtr, int[] colIdx, float[] vals, float[] b, int rows, int n)

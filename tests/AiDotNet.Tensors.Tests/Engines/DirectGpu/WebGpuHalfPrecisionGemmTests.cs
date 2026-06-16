@@ -25,6 +25,7 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// skipping when a GPU is required) per the no-silent-pass guideline.
 /// </para>
 /// </summary>
+[Collection("DirectGpuSerial")]
 public sealed class WebGpuHalfPrecisionGemmTests : IDisposable
 {
     private readonly WebGpuBackend _backend;

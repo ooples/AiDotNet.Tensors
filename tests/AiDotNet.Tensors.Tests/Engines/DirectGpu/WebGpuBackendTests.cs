@@ -23,6 +23,7 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// - Matrix operations (GEMM, Transpose)
 /// - Normalization (Softmax, LayerNorm)
 /// </remarks>
+[Collection("DirectGpuSerial")]
 public class WebGpuBackendTests : IDisposable
 {
 #if NET7_0_OR_GREATER

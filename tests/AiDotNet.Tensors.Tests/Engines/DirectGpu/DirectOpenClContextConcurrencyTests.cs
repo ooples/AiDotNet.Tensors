@@ -36,6 +36,7 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// Regression coverage for issue #414 (per-thread <c>cl_command_queue</c>)
 /// and the driver-safety lock around <c>clCreateCommandQueue</c>.
 /// </summary>
+[Collection("DirectGpuSerial")]
 public class DirectOpenClContextConcurrencyTests
 {
     /// <summary>
