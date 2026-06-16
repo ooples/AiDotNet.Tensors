@@ -8,6 +8,7 @@ using Xunit;
 /// path at least loads without throwing when the native lib is
 /// absent (availability probe).
 /// </summary>
+[Collection("DirectGpuSerial")]
 public class NcclAvailabilityTests
 {
     [Fact]

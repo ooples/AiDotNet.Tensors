@@ -20,6 +20,7 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// only residual error is FP32 round-off. Honors <c>AIDOTNET_REQUIRE_GPU_TESTS=1</c> (throws instead of
 /// skipping when a GPU is required) per the no-silent-pass guideline.
 /// </summary>
+[Collection("DirectGpuSerial")]
 public sealed class OpenClFp16NativeOpTests : IDisposable
 {
     private readonly OpenClBackend _backend;

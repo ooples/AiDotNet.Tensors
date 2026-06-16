@@ -10,6 +10,7 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// Ensures GPU operations complete within expected time bounds.
 /// Tests are skipped when no GPU backend is available.
 /// </summary>
+[Collection("DirectGpuSerial")]
 public class GpuPerformanceRegressionTests : IDisposable
 {
     private readonly DirectGpuTensorEngine? _gpu;

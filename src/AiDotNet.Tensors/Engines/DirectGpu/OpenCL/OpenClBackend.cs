@@ -7711,6 +7711,16 @@ KERNEL VARIANTS (A/B testing):
             // (the explicit parameter), NOT a recomputed numQHeads/numKVHeads. For a consistent GQA config
             // these are equal, but the parity harness drives inconsistent combos (e.g. Q=K=3 heads with
             // numQueriesPerKV=2) where they differ — recomputing produced garbage gradients (#628).
+            //
+            // The non-deterministic backward kernel ACCUMULATES into the gradient buffers (gradQuery via +=,
+            // gradKey/gradValue via atomic_add across the shared query heads). AllocateBuffer returns pooled
+            // (stale) or uninitialized GPU memory — never zeroed — so without this the gradients accumulate
+            // onto garbage (observed GPU-vs-CPU max_abs_err ~372). Zero them first. (The deterministic split
+            // kernels write with =, so this is belt-and-suspenders for that path.)
+            Fill(gradQuery, 0f, batch * numQHeads * seqQ * headDim);
+            Fill(gradKey, 0f, batch * numKVHeads * seqK * headDim);
+            Fill(gradValue, 0f, batch * numKVHeads * seqK * headDim);
+
             if (GpuDeterminism.IsActive)
             {
                 // Issue #382: gradkey/gradValue scatter atomics are FP-non-deterministic;

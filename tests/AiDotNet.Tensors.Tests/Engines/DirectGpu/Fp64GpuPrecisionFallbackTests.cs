@@ -16,6 +16,7 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// the caller to fall back to the now-improved CPU SIMD path (Stages
 /// 1-7) which keeps FP64 precision end-to-end.
 /// </summary>
+[Collection("DirectGpuSerial")]
 public class Fp64GpuPrecisionFallbackTests
 {
     [Fact]

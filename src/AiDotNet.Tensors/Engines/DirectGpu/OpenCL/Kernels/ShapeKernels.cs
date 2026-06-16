@@ -185,8 +185,13 @@ __kernel void hsoftmax_paths(__global const float* acts, __global float* out, in
     int c = idx % numClasses; int r = idx / numClasses;
     int gbase = r * treeDepth;
     float prob = 1.0f; int node = 1;
+    // Match the CPU reference EXACTLY: walk the tree and break when the node index reaches a leaf
+    // (node >= numClasses), AND clamp the shift to < 32 — `1 << sh` is undefined in OpenCL for
+    // sh >= 32, and the CPU treats any bit past int width as 0. Only the missing clamp was the bug
+    // (it diverged at treeDepth>32); the node walk / early break is part of the CPU contract.
     for (int level = 0; level < treeDepth; level++) {
-        int goRight = (c & (1 << (treeDepth - level - 1))) != 0;
+        int sh = treeDepth - level - 1;
+        int goRight = (sh < 32) && ((c & (1 << sh)) != 0);
         float g = 1.0f / (1.0f + exp(-acts[gbase + level]));
         prob *= goRight ? g : (1.0f - g);
         node = node * 2 + (goRight ? 1 : 0);

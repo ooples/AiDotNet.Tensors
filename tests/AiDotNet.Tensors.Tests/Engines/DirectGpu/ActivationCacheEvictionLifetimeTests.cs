@@ -29,6 +29,7 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// tests reach through reflection into the engine's private eviction method to assert the
 /// invariant on any CI host — without requiring a real OpenCL runtime.
 /// </summary>
+[Collection("DirectGpuSerial")]
 public class ActivationCacheEvictionLifetimeTests
 {
     /// <summary>Fake GPU buffer — tracks Dispose so the test can assert on lifetime.</summary>

@@ -782,6 +782,27 @@ public partial class CpuEngine
         int offA, int offB, int d, double p)
     {
         // ‖a − b‖_p with inputs pulled from the same span (pdist case).
+        // Float-typed input → accumulate in FLOAT to match the GPU pdist kernel, mirroring
+        // PNormCross (CDist). The library is float-throughout; keeping a double CPU accumulation
+        // here diverged from the fp32 GPU kernel by ~1% at d≈129 — the recorded GPU/CPU parity
+        // failure (TensorPDist on [129,129]: max_abs_err 1.37e-2 > tol 1e-2). Float-vs-float is
+        // bit-consistent (same sequential op order as the kernel).
+        if (typeof(T) == typeof(float))
+        {
+            float pf = (float)p;
+            float sumF = 0f;
+            for (int k = 0; k < d; k++)
+            {
+                float diff = System.Math.Abs(ops.ToFloat(s[offA + k]) - ops.ToFloat(s[offB + k]));
+                if (pf == 1f) sumF += diff;
+                else if (pf == 2f) sumF += diff * diff;
+                else sumF += (float)System.Math.Pow(diff, p);
+            }
+            float resF = pf == 1f ? sumF : pf == 2f ? (float)System.Math.Sqrt(sumF) : (float)System.Math.Pow(sumF, 1.0 / p);
+            return ops.FromFloat(resF);
+        }
+
+        // Non-float T keeps the double path (higher precision; no GPU bit-equivalence committed).
         double acc = 0;
         for (int k = 0; k < d; k++)
         {

@@ -27,6 +27,7 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// CI host without requiring a real GPU runtime — mirroring
 /// <see cref="ActivationCacheEvictionLifetimeTests"/>.
 /// </summary>
+[Collection("DirectGpuSerial")]
 public class InvalidateActivationCacheEntryLifetimeTests
 {
     /// <summary>Fake GPU buffer — tracks Dispose so the test can assert on lifetime.</summary>

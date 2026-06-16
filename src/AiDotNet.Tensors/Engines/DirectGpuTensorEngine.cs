@@ -7147,6 +7147,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int batchSize = input.Shape._dims[0];
         int features = input.Shape._dims[1];
 
+        // Contract parity with the CPU reference: CpuEngine.FusedBatchNorm always normalizes with
+        // BATCH statistics and ignores the training flag / running mean+var (those are updated
+        // externally — see its comment). The GPU must do the same, otherwise an inference-mode call
+        // (training=false) normalizes with running stats on GPU while the CPU uses batch stats,
+        // diverging grossly. Force batch-stats here so the two engines agree. (A dedicated
+        // inference-mode path using running stats would be a separate, explicitly-routed op.)
+        training = true;
+
         // Use cache-aware buffer allocation (OwnedBuffer auto-disposes only if we allocated)
         using var inputBuffer = GetOrAllocateBuffer(backend, input);
         using var outputBuffer = AllocateOutputBuffer(backend, batchSize * features);
@@ -7186,6 +7194,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             backend.DownloadBuffer(outputBuffer.Buffer, resultFloat);
             backend.DownloadBuffer(saveMeanBuffer.Buffer, saveMeanFloat);
             backend.DownloadBuffer(saveVarBuffer.Buffer, saveVarFloat);
+
+            // The batchnorm_forward kernel writes INVERSE std (1/sqrt(var+eps)) into the saveVar buffer
+            // (its launcher param is named saveInvVar), but the CPU FusedBatchNorm reference returns the
+            // batch VARIANCE in saveVar. Convert back so the returned saveVar matches the CPU contract:
+            // var = 1/invStd^2 - epsilon.
+            for (int i = 0; i < saveVarFloat.Length; i++)
+            {
+                float invStd = saveVarFloat[i];
+                saveVarFloat[i] = invStd != 0f ? 1.0f / (invStd * invStd) - (float)epsilon : 0f;
+            }
 
             // Convert back to T
             T[] resultData = DirectGpuEngine.FromFloatArray<T>(resultFloat);
@@ -7880,6 +7898,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int numKVHeads = key.Shape._dims[1];
         int seqK = key.Shape._dims[2];
 
+        // The GPU kernel now honors numQueriesPerKV directly (kvh = qh / numQueriesPerKV), matching the
+        // CPU reference for every in-range config — including the ill-formed-but-in-range combos the
+        // parity harness drives (e.g. Q=K=3 heads, numQueriesPerKV=2 → kvh in {0,1}), which run on the
+        // GPU and are validated (#628). The ONLY remaining dodge is a genuinely out-of-range config where
+        // the gradQuery kernel's kv-head index kvh = (numQHeads-1)/numQueriesPerKV would exceed numKVHeads
+        // (numQueriesPerKV too small to tile the query heads onto the KV heads): that read is out of
+        // bounds on the GPU — a hard fault, unlike the CPU's managed-array throw — so route only those to
+        // the CPU reference (which the harness skips anyway, as the CPU throws on the same input).
+        if (numKVHeads <= 0 || numQueriesPerKV <= 0 || (numQHeads - 1) / numQueriesPerKV >= numKVHeads)
+            return base.GroupedQueryAttentionBackward(gradOutput, query, key, value, attentionWeights,
+                numQueriesPerKV, scale, out gradQuery, out gradKey, out gradValue);
+
         // Use cache-aware buffer allocation
         using var gradOutBuffer = GetOrAllocateBuffer(backend, gradOutput);
         using var queryBuffer = GetOrAllocateBuffer(backend, query);
@@ -7891,13 +7921,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         using var gradQBuffer = AllocateOutputBuffer(backend, gradQSize);
         using var gradKBuffer = AllocateOutputBuffer(backend, gradKVSize);
         using var gradVBuffer = AllocateOutputBuffer(backend, gradKVSize);
-
-        // AllocateOutputBuffer hands back pooled/uninitialized memory; the non-deterministic GQA-backward
-        // kernel accumulates gradQ/K/V via += / atomic_add, so zero them first (#628). The deterministic
-        // split kernels write with =, so this is belt-and-suspenders for that path.
-        backend.Fill(gradQBuffer.Buffer, 0f, gradQSize);
-        backend.Fill(gradKBuffer.Buffer, 0f, gradKVSize);
-        backend.Fill(gradVBuffer.Buffer, 0f, gradKVSize);
+        // The backend zeroes gradQ/K/V before the accumulating kernels (the pooled buffers are
+        // uninitialized) — see OpenClBackend.GroupedQueryAttentionBackward.
 
         try
         {
