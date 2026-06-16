@@ -38,8 +38,13 @@ internal static class MixedPrecisionEmit
     /// <summary>Test-only override; null ⇒ read the env var. Not part of the public API.</summary>
     internal static bool? TestOverrideEnabled;
 
+    // AIDOTNET_FP16_ACTIVATIONS routes to the separate (capture-incompatible) MixedPrecisionCompiledPlan in
+    // AiDotNet; AIDOTNET_FP16_CAPTURE instead keeps the normal CompiledTrainingPlan but emits the same Half
+    // activation nodes, which that plan now consumes via its heterogeneous forward/backward (FP16-in-capture,
+    // task #30). Either enables the FP16-activation EMISSION here; the routing differs at the AiDotNet caller.
     public static bool Fp16ActivationStorageEnabled =>
-        TestOverrideEnabled ?? (Environment.GetEnvironmentVariable("AIDOTNET_FP16_ACTIVATIONS") == "1");
+        TestOverrideEnabled ?? (Environment.GetEnvironmentVariable("AIDOTNET_FP16_ACTIVATIONS") == "1"
+                                || Environment.GetEnvironmentVariable("AIDOTNET_FP16_CAPTURE") == "1");
 
     /// <summary>
     /// True when graph tracing should emit FP16 activation buffers: an FP16 autocast scope is active.

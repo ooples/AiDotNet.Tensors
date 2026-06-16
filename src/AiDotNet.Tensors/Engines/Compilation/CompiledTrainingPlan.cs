@@ -516,8 +516,13 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // GPU-resident op (TryClipGradientsGlobalL2Gpu) eagerly after the captured backward and before the
         // eager optimizer update — no host read — so clipping can stay ON (industry-standard default) while
         // whole-step capture still engages. (Capture is CUDA-only, which is exactly where the resident clip runs.)
+        // FP16-IN-CAPTURE (task #30): when the plan carries an FP16 heterogeneous order, the captured body
+        // (RunGpuStepBodyForCapture) does NOT yet replay the Half nodes, so capture would run the float-only
+        // forward and drop the FP16 activations (wrong result). Until the captured body is wired with a
+        // capture-PURE hetero backward, FP16 forces the EAGER path (StepEager — already wired + verified to
+        // produce the FP16 VRAM win with correct loss/grads). FP16+capture compose in a follow-up increment.
         if (s_graphStepEnabled && !_graphStepDisabled && _graphStepEligible && typeof(T) == typeof(float)
-            && _checkpointing is null
+            && _checkpointing is null && _fp16HeteroOrder is null
             && _engine is Engines.DirectGpuTensorEngine gte
             && gte.GetBackend() is Engines.DirectGpu.CUDA.CudaBackend cb)
         {
