@@ -2179,7 +2179,24 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     {
         var order = _fp16HeteroOrder ?? throw new InvalidOperationException(
             "RunFp16HeteroForward called but no FP16 heterogeneous order was captured.");
-        for (int i = 0; i < order.Length; i++) order[i].Realize(engine);
+        // Call each node's typed Execute DIRECTLY (not Realize) — Realize is gated by IsRealized, which the
+        // float forward-step walk sets true; Execute re-runs unconditionally into the node's stable output
+        // buffer. Mixed-dtype graphs are float/Half LazyNode + float<->Half CrossTypeLazyNode bridges only
+        // (mirrors MixedPrecisionCompiledPlan.RunForward). Topological order ⇒ a node runs after its inputs.
+        for (int i = 0; i < order.Length; i++)
+        {
+            switch (order[i])
+            {
+                case LazyNode<float> lf: lf.Execute(engine, lf.Output); break;
+                case LazyNode<Half> lh: lh.Execute(engine, lh.Output); break;
+                case CrossTypeLazyNode<float, Half> down: down.Execute(engine, down.Output); break;
+                case CrossTypeLazyNode<Half, float> up: up.Execute(engine, up.Output); break;
+                default:
+                    throw new NotSupportedException(
+                        $"FP16-hetero forward: unsupported node type {order[i].GetType().Name}. " +
+                        "Mixed-precision graphs use float/Half LazyNode and float<->Half CrossTypeLazyNode only.");
+            }
+        }
         return _lossOutput;
     }
 
