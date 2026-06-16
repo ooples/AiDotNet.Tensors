@@ -33,6 +33,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private Action<IEngine>[] _forwardActions;
     private readonly Action<IEngine>[] _backwardActions;
     private readonly Tensor<T> _lossOutput;
+
+    // FP16-IN-CAPTURE (task #30): the full heterogeneous (mixed-dtype) topological node order, captured when
+    // the traced graph contains FP16 activation-storage nodes (LazyNode<Half> + MixedPrecisionCast bridges
+    // emitted by MixedPrecisionEmit under an FP16-storage autocast). The single-type float forward steps
+    // (_forwardActions) DROP these Half nodes, so a heterogeneous forward must replay EVERY node's Realize in
+    // topological order to produce the Half activation buffers (the device-resident, capture-pure VRAM win).
+    // Null ⇒ no FP16 activation nodes ⇒ the normal float-only path is used (zero behavior change).
+    private readonly ILazyNode[]? _fp16HeteroOrder;
     private readonly IEngine _engine;
 
     // ---- CUDA-graph capture of the whole compiled training step (opt-in, default OFF) ----
@@ -132,11 +140,13 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         Tensor<T>? graphRefreshTensor = null,
         int[]? fusedStepIndices = null,
         Action<IEngine>[]? fusedForwardActions = null,
-        bool graphStepEligible = false)
+        bool graphStepEligible = false,
+        ILazyNode[]? fp16HeteroOrder = null)
     {
         _forwardActions = forwardActions;
         _backwardActions = backwardActions;
         _graphStepEligible = graphStepEligible;
+        _fp16HeteroOrder = fp16HeteroOrder;
         _lossOutput = lossOutput;
         _engine = engine;
         _parameters = parameters;
@@ -2155,6 +2165,24 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         return info.GetIncompatibilityReason<T>() is null;
     }
 
+    // FP16-IN-CAPTURE (task #30): true when the traced graph carried FP16 activation-storage nodes, so the
+    // heterogeneous Realize-forward must be used instead of the float-only forward steps.
+    internal bool HasFp16HeteroForward => _fp16HeteroOrder is not null;
+
+    /// <summary>
+    /// FP16-IN-CAPTURE heterogeneous forward: replay EVERY node (float + Half + cast bridges) in topological
+    /// order via <see cref="ILazyNode.Realize"/>, producing the device-resident Half activation buffers (the
+    /// capture-pure VRAM win) and writing the scalar loss into <c>_lossOutput</c>. All ops dispatch to the
+    /// supplied engine (FP16-native device kernels on the GPU), so no host transfer — capture stays pure.
+    /// </summary>
+    internal Tensor<T> RunFp16HeteroForward(IEngine engine)
+    {
+        var order = _fp16HeteroOrder ?? throw new InvalidOperationException(
+            "RunFp16HeteroForward called but no FP16 heterogeneous order was captured.");
+        for (int i = 0; i < order.Length; i++) order[i].Realize(engine);
+        return _lossOutput;
+    }
+
     // ── Internal accessors for serialization ────────────────────────────
     internal Action<IEngine>[] ForwardActions => _forwardActions;
     internal Action<IEngine>[] BackwardActions => _backwardActions;
@@ -2206,6 +2234,18 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 typed.IsRealized = true;
                 typed.Output.LazySource = null;
             }
+        }
+
+        // FP16-IN-CAPTURE (task #30): if the traced graph contains mixed-dtype activation-storage nodes
+        // (anything that isn't a LazyNode<T> — i.e. LazyNode<Half> + the MixedPrecisionCast bridges emitted by
+        // MixedPrecisionEmit under an FP16-storage autocast), the float-only forwardSteps above DROPPED them, so
+        // capture the FULL heterogeneous topological order. The plan replays every node's Realize to produce the
+        // Half activation buffers. Null when no such nodes exist → the normal float path is byte-identical.
+        ILazyNode[]? fp16HeteroOrder = null;
+        {
+            bool hasFp16Nodes = false;
+            foreach (var n in optimized) { if (n is not LazyNode<T>) { hasFp16Nodes = true; break; } }
+            if (hasFp16Nodes) fp16HeteroOrder = System.Linq.Enumerable.ToArray(optimized);
         }
 
         // Map each tensor to its consumer count (how many backward steps write to it)
@@ -2678,7 +2718,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             graphRefreshTensor,
             fusedStepIndices.Count > 0 ? fusedStepIndices.ToArray() : null,
             fusedForwardActions.Count > 0 ? fusedForwardActions.ToArray() : null,
-            graphStepEligible);
+            graphStepEligible,
+            fp16HeteroOrder);
     }
 
     /// <summary>
