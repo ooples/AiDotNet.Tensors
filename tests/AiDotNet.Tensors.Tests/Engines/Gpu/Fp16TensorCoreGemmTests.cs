@@ -94,4 +94,56 @@ public class Fp16TensorCoreGemmTests
         Assert.True(rel32 < 1e-3, $"TF32 GEMM drifted from FP32 reference: relFro={rel32:E3}");
         Assert.True(rel16 < 1e-2, $"FP16 Tensor-Core GEMM exceeded FP16 tolerance: relFro={rel16:E3}");
     }
+
+    [SkippableFact]
+    public void GemmFp16HalfOut_matches_fp32_reference_within_fp16_tolerance()
+    {
+        // The Half-OUTPUT forward GEMM (CudaBackend.GemmFp16HalfOut) — the building block that lets the forward
+        // keep the matmul activation resident as Half instead of up-casting to FP32. FP16 in, FP32 accumulate,
+        // Half stored output; up-cast back to FP32 (ConvertToFp32Native) to compare against the CPU reference.
+        Skip.IfNot(CudaNativeBindings.IsAvailable, "CUDA driver not available");
+        var eng = AiDotNetEngine.Current;
+        Skip.IfNot(eng is DirectGpuTensorEngine, "active engine is not the CUDA backend");
+        var warm = new Tensor<float>(new float[] { 1, 2, 3, 4 }, new[] { 2, 2 });
+        _ = eng.TensorMatMul(warm, warm);
+        var b = ((DirectGpuTensorEngine)eng).TestBackend as CudaBackend;
+        Skip.IfNot(b is not null && b.IsAvailable, "CudaBackend not available");
+
+        const int M = 64, K = 96, N = 48; // non-square, distinct dims
+        var rng = new Random(13);
+        var A = new float[M * K];
+        var B = new float[K * N];
+        for (int i = 0; i < A.Length; i++) A[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < B.Length; i++) B[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        var cpu = new float[M * N];
+        for (int m = 0; m < M; m++)
+            for (int n = 0; n < N; n++)
+            {
+                double acc = 0;
+                for (int k = 0; k < K; k++) acc += (double)A[m * K + k] * B[k * N + n];
+                cpu[m * N + n] = (float)acc;
+            }
+
+        using var dA = b!.AllocateBuffer(A);
+        using var dB = b.AllocateBuffer(B);
+        using var hA = b.AllocateByteBuffer(M * K * 2);
+        using var hB = b.AllocateByteBuffer(K * N * 2);
+        b.ConvertToFp16Native(dA, hA, M * K);
+        b.ConvertToFp16Native(dB, hB, K * N);
+
+        using var hC = b.AllocateByteBuffer(M * N * 2); // HALF output
+        try { b.GemmFp16HalfOut(hA, hB, hC, M, N, K); }
+        catch (NotSupportedException ex) { Skip.If(true, $"not supported: {ex.Message}"); return; }
+
+        using var fC = b.AllocateBuffer(M * N);
+        b.ConvertToFp32Native(hC, fC, M * N);
+        var got = b.DownloadBuffer(fC);
+
+        double num = 0, den = 0;
+        for (int i = 0; i < cpu.Length; i++) { double e = got[i] - cpu[i]; num += e * e; den += (double)cpu[i] * cpu[i]; }
+        double rel = Math.Sqrt(num / den);
+        // Half-stored output rounds the result to FP16 (~2^-11 relative) on top of FP16-input GEMM error.
+        Assert.True(rel < 2e-2, $"GemmFp16HalfOut exceeded FP16 tolerance: relFro={rel:E3}");
+    }
 }

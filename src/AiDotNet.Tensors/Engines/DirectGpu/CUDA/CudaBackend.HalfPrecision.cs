@@ -107,6 +107,44 @@ public sealed partial class CudaBackend
     }
 
     /// <summary>
+    /// FP16 Tensor-Core forward GEMM with a HALF output: row-major <c>C[M,N] = A[M,K] · B[K,N]</c>, FP16
+    /// inputs, FP32 accumulate (<c>CUBLAS_COMPUTE_32F</c> — full-chain precision), FP16 STORED output. The
+    /// half-output variant of <see cref="GemmFp16"/> (which stores FP32): it lets the forward keep the matmul
+    /// activation resident as Half (half the VRAM) instead of up-casting it to FP32 on the device. cuBLAS is
+    /// column-major, so Cᵀ = Bᵀ·Aᵀ via (N,M,K) with B then A — identical layout to <see cref="GemmFp16"/>.
+    /// </summary>
+    public unsafe void GemmFp16HalfOut(IGpuBuffer Ahalf, IGpuBuffer Bhalf, IGpuBuffer Chalf, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
+    {
+        if (!SupportsHgemm) throw new NotSupportedException("GemmFp16HalfOut requires CUDA compute capability >= 5.0 (Maxwell+).");
+        if (Ahalf is null) throw new ArgumentNullException(nameof(Ahalf));
+        if (Bhalf is null) throw new ArgumentNullException(nameof(Bhalf));
+        if (Chalf is null) throw new ArgumentNullException(nameof(Chalf));
+        if (M <= 0 || N <= 0 || K <= 0) throw new ArgumentException($"GEMM dims must be positive (M={M}, N={N}, K={K}).");
+        if (Ahalf.SizeInBytes < (long)M * K * 2) throw new ArgumentException($"A half buffer too small: {Ahalf.SizeInBytes} < {(long)M * K * 2}.");
+        if (Bhalf.SizeInBytes < (long)K * N * 2) throw new ArgumentException($"B half buffer too small: {Bhalf.SizeInBytes} < {(long)K * N * 2}.");
+        if (Chalf.SizeInBytes < (long)M * N * 2) throw new ArgumentException($"C half buffer too small: {Chalf.SizeInBytes} < {(long)M * N * 2}.");
+
+        using var _ = PushContext();
+        float aVal = alpha, bVal = beta;
+        IntPtr alphaPtr = (IntPtr)(&aVal);
+        IntPtr betaPtr = (IntPtr)(&bVal);
+        var status = CuBlasNative.cublasGemmEx(
+            _cublasHandle,
+            CublasOperation.None, CublasOperation.None,
+            N, M, K,
+            alphaPtr,
+            Bhalf.Handle, CuBlasNative.CUDA_R_16F, N,
+            Ahalf.Handle, CuBlasNative.CUDA_R_16F, K,
+            betaPtr,
+            Chalf.Handle, CuBlasNative.CUDA_R_16F, N,
+            CuBlasNative.CUBLAS_COMPUTE_32F,
+            0 /* CUBLAS_GEMM_DEFAULT */);
+        if (status == AiDotNet.Tensors.Engines.CublasStatus.NotSupported)
+            throw new NotSupportedException($"FP16 Tensor-Core GEMM (Half out) not supported on this device (cc {_ccMajor}.{_ccMinor}).");
+        CuBlasNative.CheckCublasStatus(status, "cublasGemmEx(GemmFp16HalfOut)");
+    }
+
+    /// <summary>
     /// Fused FP16 matmul BACKWARD for the forward <c>C[M,N] = A[M,K] · B[K,N]</c>. Computes both gradients in
     /// two Tensor-Core <c>cublasGemmEx</c> launches (FP16 inputs, FP32 accumulate + FP32 output) directly from
     /// the FP16-resident activations — with NO materialized transpose and NO FP32 up-cast scratch:
