@@ -30,8 +30,9 @@ internal sealed class GradNode<T>
     /// release once its backward has run).</summary>
     public BackwardFunction<T>? Backward;
 
-    /// <summary>Input tensors to the operation (1-3 inline, overflow for 4+).</summary>
-    public Tensor<T> Input0 = null!;
+    /// <summary>Input tensors to the operation (1-3 inline, overflow for 4+). Input0 is null after the node
+    /// has been released (pool return, or streaming-backward activation release once its backward has run).</summary>
+    public Tensor<T>? Input0;
     public Tensor<T>? Input1;
     public Tensor<T>? Input2;
     public Tensor<T>[]? InputsOverflow;
@@ -111,12 +112,15 @@ internal sealed class GradNode<T>
     public Tensor<T>[] GetInputsArray()
     {
         if (InputsOverflow is not null) return InputsOverflow;
+        // Input0 is set for the node's whole live span; this is only called while building the backward
+        // step list (before any release), so a null here is a real invariant violation, not a normal state.
+        var i0 = Input0 ?? throw new InvalidOperationException("GradNode.Input0 accessed after release.");
         return InputCount switch
         {
-            1 => new[] { Input0 },
-            2 => new[] { Input0, Input1! },
-            3 => new[] { Input0, Input1!, Input2! },
-            _ => new[] { Input0 }
+            1 => new[] { i0 },
+            2 => new[] { i0, Input1! },
+            3 => new[] { i0, Input1!, Input2! },
+            _ => new[] { i0 }
         };
     }
 }
