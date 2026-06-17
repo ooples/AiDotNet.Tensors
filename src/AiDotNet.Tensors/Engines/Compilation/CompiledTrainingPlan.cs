@@ -189,6 +189,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     {
         if (_disposed) return;
         _disposed = true;
+        if (StepTiming.Enabled)
+            try { StepTiming.DumpAndReset(s => System.IO.File.AppendAllText(
+                System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_steptiming.txt"), s + System.Environment.NewLine)); }
+            catch { }
         foreach (var handle in _pinnedHandles)
         {
             if (handle.IsAllocated)
