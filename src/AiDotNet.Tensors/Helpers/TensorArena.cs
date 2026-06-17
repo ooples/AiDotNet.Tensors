@@ -90,11 +90,18 @@ public sealed class TensorArena : IDisposable
     // Thread-static: each thread keeps its own pool (no locks, matches the
     // [ThreadStatic] _current contract). Bounded: only arrays at/above
     // PersistThresholdElems are retained (small buffers GC cheaply and would
-    // bloat the dictionary), and at most MaxPersistPerSize per (type,size) so
-    // a model with many distinct shapes can't grow the pool without bound.
+    // bloat the dictionary), and the TOTAL retained bytes are capped by
+    // MaxPersistTotalBytes so the pool can't grow without bound.
     // ---------------------------------------------------------------------
     [ThreadStatic]
     private static Dictionary<(Type, int), Stack<Array>>? _persistent;
+
+    // Running total of bytes currently retained in this thread's persistent
+    // pool. Kept in lock-step with _persistent (incremented on push, decremented
+    // on pop) so ReturnPersistent can enforce the byte budget in O(1) without
+    // walking the dictionary.
+    [ThreadStatic]
+    private static long _persistentBytes;
 
     // Test/diagnostic: counts how many times a large buffer was served from the
     // cross-arena persistent pool (a reuse hit) rather than freshly allocated.
@@ -112,11 +119,71 @@ public sealed class TensorArena : IDisposable
     /// allocation/GC is cheap and pooling churns the dictionary for no gain.</summary>
     private const int PersistThresholdElems = 64 * 1024;
 
-    /// <summary>Max retained buffers per (type, size). A single-threaded training
-    /// step rents each distinct size O(1) times, so a small cap fully covers
-    /// steady-state reuse while bounding worst-case retained memory to a few ×
-    /// the model's transient working set.</summary>
-    private const int MaxPersistPerSize = 4;
+    /// <summary>Soft ceiling on the TOTAL bytes retained by this thread's
+    /// cross-arena persistent pool. The pool makes the create+dispose-arena-
+    /// per-step pattern allocation-free after warmup (#478): each step reuses the
+    /// previous step's transient buffers instead of re-allocating + gen2-
+    /// collecting them. The pool is bounded by BYTES rather than by a per-(type,
+    /// size) COUNT because a single step of a deep model rents the SAME large
+    /// size MANY times — every op produces a like-shaped intermediate that a
+    /// persistent gradient tape keeps live for the whole backward pass — so a
+    /// small per-size count cap (the old value 4) recycled only a sliver and left
+    /// thousands of large buffers to be re-allocated and GC'd every step. Under a
+    /// constrained heap (DOTNET_GCHeapHardLimit) that per-step churn outpaces
+    /// gen2 collection and OOMs even though the LIVE set is flat (issue #1624).
+    /// Pooling by total bytes lets a high-fan-out size pool fully — the buffers
+    /// then just cycle between "in pool" (between steps) and "rented by the
+    /// current step", so the steady-state footprint is the single-step working
+    /// set, not working-set × churn. Override with the
+    /// AIDOTNET_ARENA_PERSIST_BYTES environment variable (a byte count; 0 = pool
+    /// disabled). Default: half of the memory the GC is allowed to use (which
+    /// reflects the heap hard limit when one is set, else physical RAM).</summary>
+    private static readonly long MaxPersistTotalBytes = ResolveMaxPersistTotalBytes();
+
+    private static long ResolveMaxPersistTotalBytes()
+    {
+        var env = Environment.GetEnvironmentVariable("AIDOTNET_ARENA_PERSIST_BYTES");
+        if (env is not null && long.TryParse(env, out var overrideBytes) && overrideBytes >= 0)
+            return overrideBytes;
+
+        long available = GetGcAvailableMemoryBytes();
+        if (available <= 0)
+            available = 8L * 1024 * 1024 * 1024; // 8 GiB fallback when unknown
+        return available / 2;
+    }
+
+    private static long GetGcAvailableMemoryBytes()
+    {
+#if NET5_0_OR_GREATER
+        try
+        {
+            long total = GC.GetGCMemoryInfo().TotalAvailableMemoryBytes;
+            if (total > 0) return total;
+        }
+        catch
+        {
+            // GetGCMemoryInfo can throw on some constrained hosts — fall through.
+        }
+#endif
+        return 0;
+    }
+
+    // Exact byte size of an array whose elements are a primitive numeric type
+    // (the only element types tensor backing arrays use). Buffer.ByteLength is an
+    // O(1) intrinsic for primitive arrays; a non-primitive element type (which
+    // tensor storage never produces) conservatively counts 8 bytes/element so the
+    // byte budget is never UNDER-counted.
+    private static long ArrayByteLength(Array arr, int elementCount)
+    {
+        try
+        {
+            return Buffer.ByteLength(arr);
+        }
+        catch (ArgumentException)
+        {
+            return (long)elementCount * 8;
+        }
+    }
 
     private static Array? RentPersistent(Type type, int elementCount)
     {
@@ -126,6 +193,8 @@ public sealed class TensorArena : IDisposable
         if (pool.TryGetValue((type, elementCount), out var stack) && stack.Count > 0)
         {
             var arr = stack.Pop();
+            _persistentBytes -= ArrayByteLength(arr, elementCount);
+            if (_persistentBytes < 0) _persistentBytes = 0; // guard against drift
             _persistentReuseHits++;
             // Zero the recycled buffer. The arena's previous behaviour allocated
             // every first-use-per-arena buffer via `new T[]`, which the CLR
@@ -146,26 +215,33 @@ public sealed class TensorArena : IDisposable
     private static void ReturnPersistent(Type type, int elementCount, Array arr)
     {
         if (elementCount < PersistThresholdElems) return; // let small buffers GC
+        long bytes = ArrayByteLength(arr, elementCount);
+        // Enforce the thread's total-byte budget: once the pool is full, drop the
+        // surplus buffer for GC instead of hoarding. This is what bounds the pool
+        // for a model with a huge or unbounded set of transient shapes, while
+        // still letting the common case (a handful of high-fan-out sizes) pool
+        // fully — see MaxPersistTotalBytes.
+        if (_persistentBytes + bytes > MaxPersistTotalBytes) return;
         var pool = _persistent ??= new Dictionary<(Type, int), Stack<Array>>();
         var key = (type, elementCount);
         if (!pool.TryGetValue(key, out var stack))
         {
-            stack = new Stack<Array>(MaxPersistPerSize);
+            stack = new Stack<Array>();
             pool[key] = stack;
         }
-        if (stack.Count < MaxPersistPerSize)
-            stack.Push(arr);
-        // else: at cap — drop the reference, let GC reclaim (don't hoard).
+        stack.Push(arr);
+        _persistentBytes += bytes;
     }
 
     /// <summary>
     /// Drops every buffer held in the calling thread's cross-arena persistent
     /// pool. For tests / explicit memory-pressure handling; production code
-    /// never needs this (the pool is bounded by <see cref="MaxPersistPerSize"/>).
+    /// never needs this (the pool is bounded by <see cref="MaxPersistTotalBytes"/>).
     /// </summary>
     public static void ClearPersistentPool()
     {
         _persistent?.Clear();
+        _persistentBytes = 0;
         _persistentReuseHits = 0;
     }
 

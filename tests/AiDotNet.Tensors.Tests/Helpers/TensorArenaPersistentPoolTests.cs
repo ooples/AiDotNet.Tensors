@@ -123,6 +123,49 @@ public class TensorArenaPersistentPoolTests
     }
 
     /// <summary>
+    /// Regression for the #1624 training-scale OOM: a single deep-model step rents
+    /// the SAME large size MANY times (every op produces a like-shaped intermediate
+    /// that the persistent gradient tape keeps live for the whole backward pass, so
+    /// the arena cannot reuse them within the step). The cross-arena pool must
+    /// retain ALL of them so the next step reuses every buffer — the old fixed
+    /// per-(type,size) cap of 4 retained only a sliver and re-allocated the rest
+    /// each step, which under a constrained heap (DOTNET_GCHeapHardLimit) churns
+    /// faster than gen2 collects and OOMs even though the LIVE set is flat.
+    /// </summary>
+    [Fact]
+    public void HighFanOutLargeSize_PoolsEveryBufferAcrossLifetimes()
+    {
+        TensorArena.ClearPersistentPool();
+        int[] shape = { LargeElems };
+        const int fanOut = 16; // far more than the old per-size cap of 4
+
+        // Lifetime 1: rent the same large size fanOut times. No Reset between
+        // rents, so each rent allocates a distinct backing array (matching a
+        // step whose tape keeps every intermediate live). Fresh — no reuse yet.
+        using (var arena = TensorArena.Create())
+        {
+            for (int i = 0; i < fanOut; i++)
+            {
+                var t = TensorAllocator.RentUninitialized<float>(shape);
+                t.AsWritableSpan()[0] = i;
+            }
+        }
+        Assert.Equal(0, TensorArena.PersistentReuseHits);
+
+        // Lifetime 2: the same fan-out must reuse EVERY buffer from the pool, not
+        // just the first 4. One reuse hit per rent == fully allocation-free step.
+        using (var arena = TensorArena.Create())
+        {
+            for (int i = 0; i < fanOut; i++)
+            {
+                var t = TensorAllocator.RentUninitialized<float>(shape);
+                t.AsWritableSpan()[0] = i;
+            }
+        }
+        Assert.Equal(fanOut, TensorArena.PersistentReuseHits);
+    }
+
+    /// <summary>
     /// Small buffers (below the persist threshold) are intentionally NOT pooled
     /// across lifetimes — they GC cheaply and pooling them would bloat the
     /// dictionary. This guards the threshold so the pool stays focused on the
