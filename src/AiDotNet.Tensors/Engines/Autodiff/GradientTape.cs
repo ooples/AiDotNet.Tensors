@@ -372,11 +372,15 @@ public sealed class GradientTape<T> : IDisposable
             {
                 var node = topoOrder[stepCount - 1 - i]; // reverse for backward
                 nodes[i] = node;
+                var nodeOutput = node.Output ?? throw new InvalidOperationException(
+                    "Streaming backward: GradNode.Output was null during plan setup (node already released).");
+                var nodeBackward = node.Backward ?? throw new InvalidOperationException(
+                    "Streaming backward: GradNode.Backward was null during plan setup (node already released).");
                 steps[i] = new BackwardStep<T>
                 {
-                    Output = node.Output,
+                    Output = nodeOutput,
                     Inputs = node.GetInputsArray(),
-                    Backward = node.Backward,
+                    Backward = nodeBackward,
                     SavedState = node.SavedState,
                 };
             }
@@ -509,16 +513,18 @@ public sealed class GradientTape<T> : IDisposable
                 if (ReleaseStreamingActivations)
                 {
                     var n = nodes[i];
-                    if (n is not null && !lastUse.ContainsKey(n.Output))
+                    var nodeOutput = n?.Output;
+                    if (n is not null && nodeOutput is not null && !lastUse.ContainsKey(nodeOutput))
                     {
-                        n.Output = null!;
+                        n.Output = null;
                         n.SavedState = null;
-                        n.Backward = null!;
+                        n.Backward = null;
                     }
-                    step.Output = null!;
-                    step.Inputs = null!;
-                    step.SavedState = null;
-                    step.Backward = null!;
+                    // Reset the whole struct slot (Output/Inputs/Backward/SavedState)
+                    // in one assignment — releases every reference without a
+                    // null-forgiving cast. Safe: this is the end of the iteration and
+                    // steps[i] is never read again.
+                    step = default;
                 }
             }
 
@@ -1291,11 +1297,15 @@ public sealed class GradientTape<T> : IDisposable
             for (int i = 0; i < stepCount; i++)
             {
                 var node = topoOrder[stepCount - 1 - i]; // reverse for backward order
+                var nodeOutput = node.Output ?? throw new InvalidOperationException(
+                    "Backward: GradNode.Output was null during delegate-chain build (node already released).");
+                var nodeBackward = node.Backward ?? throw new InvalidOperationException(
+                    "Backward: GradNode.Backward was null during delegate-chain build (node already released).");
                 steps[i] = new BackwardStep<T>
                 {
-                    Output = node.Output,
+                    Output = nodeOutput,
                     Inputs = node.GetInputsArray(),
-                    Backward = node.Backward,
+                    Backward = nodeBackward,
                     SavedState = node.SavedState
                 };
             }
@@ -1482,15 +1492,20 @@ public sealed class GradientTape<T> : IDisposable
                     bool nodeOwnedByThisTape = ReferenceEquals(node.OwningTape, this);
                     if (!nodeOwnedByThisTape) continue;
 
-                    // node.Output is always owned by this tape (we just verified
-                    // nodeOwnedByThisTape above). Safe to clear both fields.
-                    node.Output.GradFn = null;
-                    // Issue #338: clear the tape-pinning flag on every
-                    // tape-owned tensor we touch — the backward walk has
-                    // consumed it and pooling is safe again.
-                    node.Output._pinnedByTape = false;
-                    if (!ShouldKeepGrad(node.Output))
-                        node.Output.Grad = null;
+                    // node.Output is owned by this tape (verified above). It may
+                    // already be null when the streaming backward released it after
+                    // consuming it — nothing left to clean in that case.
+                    var nodeOutput = node.Output;
+                    if (nodeOutput is not null)
+                    {
+                        nodeOutput.GradFn = null;
+                        // Issue #338: clear the tape-pinning flag on every
+                        // tape-owned tensor we touch — the backward walk has
+                        // consumed it and pooling is safe again.
+                        nodeOutput._pinnedByTape = false;
+                        if (!ShouldKeepGrad(nodeOutput))
+                            nodeOutput.Grad = null;
+                    }
                     node.Input0._pinnedByTape = false;
                     if (node.Input1 is not null) node.Input1._pinnedByTape = false;
                     if (node.Input2 is not null) node.Input2._pinnedByTape = false;
@@ -1614,7 +1629,10 @@ public sealed class GradientTape<T> : IDisposable
                 foreach (var node in topoOrder)
                 {
                     if (!ReferenceEquals(node.OwningTape, this)) continue;
-                    node.Output._pinnedByTape = false;
+                    // node.Output may already be null when the streaming backward
+                    // released it after consuming it — skip its cleanup in that case.
+                    var nodeOutput = node.Output;
+                    if (nodeOutput is not null) nodeOutput._pinnedByTape = false;
                     node.Input0._pinnedByTape = false;
                     if (node.Input1 is not null) node.Input1._pinnedByTape = false;
                     if (node.Input2 is not null) node.Input2._pinnedByTape = false;
@@ -1628,9 +1646,12 @@ public sealed class GradientTape<T> : IDisposable
                     // may be leaves (params / raw inputs) — preserve their
                     // .Grad and don't touch their .GradFn (leaves have
                     // GradFn=null anyway, or it belongs to an outer tape).
-                    node.Output.GradFn = null;
-                    if (!PersistentShouldKeepGrad(node.Output))
-                        node.Output.Grad = null;
+                    if (nodeOutput is not null)
+                    {
+                        nodeOutput.GradFn = null;
+                        if (!PersistentShouldKeepGrad(nodeOutput))
+                            nodeOutput.Grad = null;
+                    }
 
                     static void ClearIfIntermediate(Tensor<T>? t, GradientTape<T> self,
                         Func<Tensor<T>, bool> shouldKeep, bool canPool)

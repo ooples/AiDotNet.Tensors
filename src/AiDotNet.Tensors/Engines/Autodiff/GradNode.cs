@@ -25,8 +25,10 @@ namespace AiDotNet.Tensors.Engines.Autodiff;
 /// </remarks>
 internal sealed class GradNode<T>
 {
-    /// <summary>The backward function that computes input gradients.</summary>
-    public BackwardFunction<T> Backward = null!;
+    /// <summary>The backward function that computes input gradients. Null after
+    /// the node has been released (pool return, or streaming-backward activation
+    /// release once its backward has run).</summary>
+    public BackwardFunction<T>? Backward;
 
     /// <summary>Input tensors to the operation (1-3 inline, overflow for 4+).</summary>
     public Tensor<T> Input0 = null!;
@@ -35,8 +37,10 @@ internal sealed class GradNode<T>
     public Tensor<T>[]? InputsOverflow;
     public byte InputCount;
 
-    /// <summary>The output tensor (for gradient seeding during backward).</summary>
-    public Tensor<T> Output = null!;
+    /// <summary>The output tensor (for gradient seeding during backward). Null
+    /// after the node has been released (pool return, or streaming-backward
+    /// activation release once its backward has run).</summary>
+    public Tensor<T>? Output;
 
     /// <summary>Optional saved state for backward (dropout mask, max indices, etc.).</summary>
     public object[]? SavedState;
@@ -90,13 +94,13 @@ internal sealed class GradNode<T>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal void ClearForPoolReturn()
     {
-        Backward = null!;
+        Backward = null;
         Input0 = null!;
         Input1 = null;
         Input2 = null;
         InputsOverflow = null;
         InputCount = 0;
-        Output = null!;
+        Output = null;
         SavedState = null;
         Gradient = null;
         OwningTape = null;
