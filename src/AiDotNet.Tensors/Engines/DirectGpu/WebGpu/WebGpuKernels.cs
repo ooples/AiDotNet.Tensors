@@ -124,6 +124,17 @@ fn minimum(@builtin(global_invocation_id) gid: vec3<u32>) {
         C[idx] = min(A[idx], B[idx]);
     }
 }
+
+// Multiply every element of A by a DEVICE-resident scalar (B[0]) into C. WebGPU/WGSL counterpart of the
+// CUDA scale_by_device_scalar. Written out-of-place (C != A) so the in-place caller copies C back to A —
+// WebGPU forbids binding one buffer as both read and read_write storage.
+@compute @workgroup_size(256)
+fn scale_by_device_scalar(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx < params.size) {
+        C[idx] = A[idx] * B[0];
+    }
+}
 ";
 
     /// <summary>

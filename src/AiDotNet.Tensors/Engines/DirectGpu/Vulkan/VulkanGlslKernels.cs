@@ -23,6 +23,21 @@ layout(set = 0, binding = 2) writeonly buffer C { float c[]; };
 ";
 
     // =====================================================================
+    // Scalar ops
+    // =====================================================================
+
+    // In-place multiply of every element by a DEVICE-resident scalar (bdata[0]). Vulkan/GLSL counterpart of
+    // the CUDA scale_by_device_scalar. The in-place buffer is bound to BOTH binding 0 (read) and binding 2
+    // (write); each invocation reads and writes the same index, so the read/write alias is hazard-free.
+    public static string ScaleByDeviceScalar => Header + ThreeBufferLayout + @"
+layout(push_constant) uniform Params { uint size; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= size) return;
+    c[idx] = a[idx] * bdata[0];
+}";
+
+    // =====================================================================
     // Reductions
     // =====================================================================
 

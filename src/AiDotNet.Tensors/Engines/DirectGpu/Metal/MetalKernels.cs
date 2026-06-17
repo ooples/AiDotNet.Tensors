@@ -108,6 +108,21 @@ kernel void multiply(
     }
 }
 
+// In-place multiply by a DEVICE-resident scalar (B[0]). Metal counterpart of the CUDA
+// scale_by_device_scalar; the caller binds the same buffer to A and C (Metal allows aliasing, and each
+// thread reads then writes its own index).
+kernel void scale_by_device_scalar(
+    device const float* A [[buffer(0)]],
+    device const float* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& size [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < size) {
+        C[gid] = A[gid] * B[0];
+    }
+}
+
 // Element-wise division: C = A / B
 kernel void divide(
     device const float* A [[buffer(0)]],

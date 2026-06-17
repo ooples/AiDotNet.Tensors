@@ -240,6 +240,16 @@ public sealed partial class WebGpuBackend
     #region Element-wise Operations
 
     public void Add(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) => AddAsync(A, B, C, size).GetAwaiter().GetResult();
+    /// <summary>In-place multiply of every element of <paramref name="buffer"/> by the device-resident
+    /// scalar at <paramref name="scalar"/>[0]. WebGPU counterpart of the CUDA scale_by_device_scalar.
+    /// Computed out-of-place into a scratch (WebGPU forbids read+read_write aliasing) then copied back.</summary>
+    public void ScaleByDeviceScalar(IGpuBuffer buffer, IGpuBuffer scalar, int size)
+    {
+        if (size <= 0) return;
+        using var scratch = AllocateBuffer(size);
+        DispatchBinaryOpAsync("scale_by_device_scalar", buffer, scalar, scratch, size).GetAwaiter().GetResult();
+        Copy(scratch, buffer, size);
+    }
     public void AddRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) { Add(A, B, C, size); Relu(C, C, size); }
     public void AddSigmoid(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) { Add(A, B, C, size); Sigmoid(C, C, size); }
     public void AddGelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) { Add(A, B, C, size); Gelu(C, C, size); }

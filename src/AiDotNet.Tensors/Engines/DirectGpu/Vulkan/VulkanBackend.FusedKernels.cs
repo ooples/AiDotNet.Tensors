@@ -30,6 +30,14 @@ public sealed partial class VulkanBackend
     public void CumSumAxis(IGpuBuffer i, IGpuBuffer o, int os, int isz) => GlslUnaryOp(VulkanGlslKernels.CumSumAxis, i, o, os, new uint[] { (uint)os, (uint)isz }, 2 * sizeof(uint));
     // Scalar ops: push {scalar_as_uint_bits, size}
     public void ScalarMinusTensor(IGpuBuffer i, IGpuBuffer o, float sc, int sz) => GlslUnaryOp(VulkanGlslKernels.ScalarMinusTensor, i, o, sz, new uint[] { FloatBits(sc), (uint)sz }, sizeof(float) + sizeof(uint));
+    /// <summary>In-place multiply of every element of <paramref name="buffer"/> by the device-resident
+    /// scalar at <paramref name="scalar"/>[0]. Vulkan counterpart of the CUDA scale_by_device_scalar
+    /// (the in-place buffer is bound as both the read input A and the write output C).</summary>
+    public void ScaleByDeviceScalar(IGpuBuffer buffer, IGpuBuffer scalar, int size)
+    {
+        if (size <= 0) return;
+        GlslBinaryOp(VulkanGlslKernels.ScaleByDeviceScalar, buffer, scalar, buffer, size, new uint[] { (uint)size }, sizeof(uint));
+    }
     public void NormalizeL2(IGpuBuffer i, IGpuBuffer o, int os, int isz) => GlslUnaryOp(VulkanGlslKernels.NormalizeL2, i, o, os, new uint[] { (uint)os, (uint)isz }, 2 * sizeof(uint));
     // Backward: dispatch os*rs workgroups, push {outerSize, reduceSize}
     public void ReduceSumBackward(IGpuBuffer go, IGpuBuffer gi, int os, int rs) => GlslUnaryOp(VulkanGlslKernels.ReduceSumBackwardGlsl, go, gi, os * rs, new uint[] { (uint)os, (uint)rs }, 2 * sizeof(uint));
