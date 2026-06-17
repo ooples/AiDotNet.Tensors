@@ -16,8 +16,10 @@ namespace AiDotNet.Tensors.Tests.Engines.Gpu;
 /// </summary>
 public class Fp16FusedBackwardGemmTests
 {
-    [SkippableFact]
-    public void MatMulBackwardFp16Fused_matches_fp32_reference()
+    [SkippableTheory]
+    [InlineData(false)] // FP32 gradient outputs
+    [InlineData(true)]  // FP16 gradient outputs (FP32 accumulate) — the dtype the hetero backward needs
+    public void MatMulBackwardFp16Fused_matches_fp32_reference(bool gradOutHalf)
     {
         Skip.IfNot(CudaNativeBindings.IsAvailable, "CUDA driver not available");
         var eng = AiDotNetEngine.Current;
@@ -66,19 +68,33 @@ public class Fp16FusedBackwardGemmTests
         b.ConvertToFp16Native(dB, hB, K * N);
         b.ConvertToFp16Native(dGradC, hGradC, M * N);
 
-        using var dGradA = b.AllocateBuffer(M * K); // FP32 outputs
-        using var dGradB = b.AllocateBuffer(K * N);
+        // Outputs: FP32 buffers, or FP16 byte buffers up-cast back to FP32 for comparison.
+        using var dGradA = gradOutHalf ? b.AllocateByteBuffer(M * K * 2) : b.AllocateBuffer(M * K);
+        using var dGradB = gradOutHalf ? b.AllocateByteBuffer(K * N * 2) : b.AllocateBuffer(K * N);
         try
         {
-            b.MatMulBackwardFp16Fused(hGradC, hA, hB, dGradA, dGradB, M, N, K);
+            b.MatMulBackwardFp16Fused(hGradC, hA, hB, dGradA, dGradB, M, N, K, gradOutHalf);
         }
         catch (NotSupportedException ex)
         {
             Skip.If(true, $"FP16 Tensor-Core GEMM not supported on this device: {ex.Message}");
             return;
         }
-        var gotGradA = b.DownloadBuffer(dGradA);
-        var gotGradB = b.DownloadBuffer(dGradB);
+        float[] gotGradA, gotGradB;
+        if (gradOutHalf)
+        {
+            using var fA = b.AllocateBuffer(M * K);
+            using var fB = b.AllocateBuffer(K * N);
+            b.ConvertToFp32Native(dGradA, fA, M * K);
+            b.ConvertToFp32Native(dGradB, fB, K * N);
+            gotGradA = b.DownloadBuffer(fA);
+            gotGradB = b.DownloadBuffer(fB);
+        }
+        else
+        {
+            gotGradA = b.DownloadBuffer(dGradA);
+            gotGradB = b.DownloadBuffer(dGradB);
+        }
 
         // Relative Frobenius error (entries straddle zero, so per-entry relative error is meaningless).
         double RelFro(float[] got, float[] re)

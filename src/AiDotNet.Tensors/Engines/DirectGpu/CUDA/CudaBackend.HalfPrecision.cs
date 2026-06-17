@@ -126,29 +126,34 @@ public sealed partial class CudaBackend
     /// <param name="gradCHalf">FP16 upstream gradient, shape [M,N].</param>
     /// <param name="aHalf">FP16 forward input A, shape [M,K].</param>
     /// <param name="bHalf">FP16 forward input B, shape [K,N].</param>
-    /// <param name="gradAFp32">FP32 output buffer for gradA, shape [M,K] (caller-owned, reused).</param>
-    /// <param name="gradBFp32">FP32 output buffer for gradB, shape [K,N] (caller-owned, reused).</param>
+    /// <param name="gradAOut">Output buffer for gradA, shape [M,K] (caller-owned, reused). FP32 or FP16 per <paramref name="gradOutHalf"/>.</param>
+    /// <param name="gradBOut">Output buffer for gradB, shape [K,N] (caller-owned, reused). FP32 or FP16 per <paramref name="gradOutHalf"/>.</param>
+    /// <param name="gradOutHalf">When true the gradient outputs are FP16 (CUDA_R_16F) — the dtype the FP16
+    /// hetero backward needs so the grads flow on as Half with no FP32 down-cast scratch; the accumulate stays
+    /// FP32 (COMPUTE_32F) either way, so only the stored output is Half. When false the outputs are FP32.</param>
     public unsafe void MatMulBackwardFp16Fused(
         IGpuBuffer gradCHalf, IGpuBuffer aHalf, IGpuBuffer bHalf,
-        IGpuBuffer gradAFp32, IGpuBuffer gradBFp32,
-        int M, int N, int K)
+        IGpuBuffer gradAOut, IGpuBuffer gradBOut,
+        int M, int N, int K, bool gradOutHalf = false)
     {
         if (!SupportsHgemm)
             throw new NotSupportedException("MatMulBackwardFp16Fused requires CUDA compute capability >= 5.0 (Maxwell+).");
         if (gradCHalf is null) throw new ArgumentNullException(nameof(gradCHalf));
         if (aHalf is null) throw new ArgumentNullException(nameof(aHalf));
         if (bHalf is null) throw new ArgumentNullException(nameof(bHalf));
-        if (gradAFp32 is null) throw new ArgumentNullException(nameof(gradAFp32));
-        if (gradBFp32 is null) throw new ArgumentNullException(nameof(gradBFp32));
+        if (gradAOut is null) throw new ArgumentNullException(nameof(gradAOut));
+        if (gradBOut is null) throw new ArgumentNullException(nameof(gradBOut));
         if (M <= 0) throw new ArgumentOutOfRangeException(nameof(M), "Dimensions must be positive.");
         if (N <= 0) throw new ArgumentOutOfRangeException(nameof(N), "Dimensions must be positive.");
         if (K <= 0) throw new ArgumentOutOfRangeException(nameof(K), "Dimensions must be positive.");
+        int outType = gradOutHalf ? CuBlasNative.CUDA_R_16F : CuBlasNative.CUDA_R_32F;
+        long outElemBytes = gradOutHalf ? 2 : sizeof(float);
         // Byte-aware buffer-size guards (half = 2 bytes, fp32 = 4) — the element-count view would misread.
         if (gradCHalf.SizeInBytes < (long)M * N * 2) throw new ArgumentException($"gradC half buffer too small: {gradCHalf.SizeInBytes} < {(long)M * N * 2}.");
         if (aHalf.SizeInBytes < (long)M * K * 2) throw new ArgumentException($"A half buffer too small: {aHalf.SizeInBytes} < {(long)M * K * 2}.");
         if (bHalf.SizeInBytes < (long)K * N * 2) throw new ArgumentException($"B half buffer too small: {bHalf.SizeInBytes} < {(long)K * N * 2}.");
-        if (gradAFp32.SizeInBytes < (long)M * K * sizeof(float)) throw new ArgumentException($"gradA buffer too small: {gradAFp32.SizeInBytes} < {(long)M * K * sizeof(float)}.");
-        if (gradBFp32.SizeInBytes < (long)K * N * sizeof(float)) throw new ArgumentException($"gradB buffer too small: {gradBFp32.SizeInBytes} < {(long)K * N * sizeof(float)}.");
+        if (gradAOut.SizeInBytes < (long)M * K * outElemBytes) throw new ArgumentException($"gradA buffer too small: {gradAOut.SizeInBytes} < {(long)M * K * outElemBytes}.");
+        if (gradBOut.SizeInBytes < (long)K * N * outElemBytes) throw new ArgumentException($"gradB buffer too small: {gradBOut.SizeInBytes} < {(long)K * N * outElemBytes}.");
 
         using var _ = PushContext();
         float alphaF = 1.0f, betaF = 0.0f;
@@ -164,7 +169,7 @@ public sealed partial class CudaBackend
             bHalf.Handle, CuBlasNative.CUDA_R_16F, N,
             gradCHalf.Handle, CuBlasNative.CUDA_R_16F, N,
             betaPtr,
-            gradAFp32.Handle, CuBlasNative.CUDA_R_32F, K,
+            gradAOut.Handle, outType, K,
             CuBlasNative.CUBLAS_COMPUTE_32F, 0);
         if (sA == AiDotNet.Tensors.Engines.CublasStatus.NotSupported)
             throw new NotSupportedException($"FP16 Tensor-Core GEMM not supported on this device (cc {_ccMajor}.{_ccMinor}).");
@@ -179,7 +184,7 @@ public sealed partial class CudaBackend
             gradCHalf.Handle, CuBlasNative.CUDA_R_16F, N,
             aHalf.Handle, CuBlasNative.CUDA_R_16F, K,
             betaPtr,
-            gradBFp32.Handle, CuBlasNative.CUDA_R_32F, N,
+            gradBOut.Handle, outType, N,
             CuBlasNative.CUBLAS_COMPUTE_32F, 0);
         if (sB == AiDotNet.Tensors.Engines.CublasStatus.NotSupported)
             throw new NotSupportedException($"FP16 Tensor-Core GEMM not supported on this device (cc {_ccMajor}.{_ccMinor}).");
