@@ -1961,6 +1961,23 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     }
 
     /// <summary>
+    /// Resolve a tensor to an FP16 device buffer for a Tensor-Core kernel: if it is resident as a Half IsFp16
+    /// activation entry, return that buffer DIRECTLY (no up-cast — keeps the activation Half end-to-end, the
+    /// key to avoiding the float↔Half re-inflate/re-convert churn each layer); otherwise convert its FP32
+    /// buffer into a fresh Half buffer that the caller owns (<paramref name="owned"/>) and disposes.
+    /// </summary>
+    private IGpuBuffer ResolveToFp16<T>(Tensor<T> t, int elems, DirectGpu.CUDA.CudaBackend cb, IDirectGpuBackend backend, out IGpuBuffer? owned)
+    {
+        owned = null;
+        if (TryGetResidentFp16Buffer(t, backend, out var resident) && resident is not null)
+            return resident;
+        using var f = GetOrAllocateBuffer(backend, t);
+        owned = cb.AllocateByteBuffer(elems * 2);
+        cb.ConvertToFp16Native(f.Buffer, owned, elems);
+        return owned;
+    }
+
+    /// <summary>
     /// Central output-write for the compiled-plan GraphMode Execute delegates (replaces the inline
     /// <c>src.AsSpan().CopyTo(dest.AsWritableSpan())</c> at ~183 sites). On a GPU engine DURING a compiled step
     /// (eviction suspended → activation buffers are pinned/stable for the whole step), aliases <paramref name="dest"/>
@@ -14911,23 +14928,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 throw new ArgumentException(
                     $"TensorMatMul shape mismatch: a.Shape[1]={K} but b.Shape[0]={bLeadingDim}.");
 
-            using var bufA = GetOrAllocateBuffer(backend, a);
-            using var bufB = GetOrAllocateBuffer(backend, b);
-
-            // FORWARD Half-resident store: keep the activation as a HALF GPU buffer (half the VRAM) instead of
-            // up-casting to FP32. Opt-in + CUDA Tensor-Core only; convert the (cached FP32) inputs to FP16, run
-            // the Half-output GEMM (FP32 accumulate), and cache the Half output as an IsFp16 entry.
+            // FORWARD Half-resident store — RUN BEFORE GetOrAllocateBuffer (which would up-cast an IsFp16 input
+            // to FP32, re-inflating it for the rest of the step). Keep the activation as a HALF GPU buffer (half
+            // the VRAM); read IsFp16-resident inputs DIRECTLY (no re-inflate/re-convert churn), run the
+            // Half-output GEMM (FP32 accumulate), and cache the Half output as an IsFp16 entry. CUDA Tensor-Core only.
             if (typeof(T) == typeof(Half) && s_fp16FwdStore
                 && backend is DirectGpu.CUDA.CudaBackend cbFwd && cbFwd.SupportsHgemm)
             {
-                IGpuBuffer? hAi = null, hBi = null, hOut = null;
+                IGpuBuffer? hAiOwned = null, hBiOwned = null, hOut = null;
                 bool storeOk = false;
                 try
                 {
-                    hAi = cbFwd.AllocateByteBuffer(M * K * 2);
-                    hBi = cbFwd.AllocateByteBuffer(K * N * 2);
-                    cbFwd.ConvertToFp16Native(bufA.Buffer, hAi, M * K);
-                    cbFwd.ConvertToFp16Native(bufB.Buffer, hBi, K * N);
+                    var hAi = ResolveToFp16(a, M * K, cbFwd, backend, out hAiOwned);
+                    var hBi = ResolveToFp16(b, K * N, cbFwd, backend, out hBiOwned);
                     hOut = cbFwd.AllocateByteBuffer(M * N * 2);
                     cbFwd.GemmFp16HalfOut(hAi, hBi, hOut, M, N, K);
                     var resultH = FinishGpuOpHalfStore(cbFwd, hOut, M * N, new[] { M, N }); // takes ownership of hOut
@@ -14938,8 +14951,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     return outputH;
                 }
                 catch (Exception) { /* fall through to the FP32-store path below */ }
-                finally { hAi?.Dispose(); hBi?.Dispose(); if (!storeOk) hOut?.Dispose(); }
+                finally { hAiOwned?.Dispose(); hBiOwned?.Dispose(); if (!storeOk) hOut?.Dispose(); }
             }
+
+            using var bufA = GetOrAllocateBuffer(backend, a);
+            using var bufB = GetOrAllocateBuffer(backend, b);
 
             var bufOut = AllocateOutputBuffer(backend, M * N);
             backend.Gemm(bufA.Buffer, bufB.Buffer, bufOut.Buffer, M, N, K);
