@@ -6224,6 +6224,18 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int batch, int numQHeads, int numKVHeads, int seqQ, int seqK, int headDim, float scale,
         int numQueriesPerKV)
     {
+        // Validate the external head-mapping parameter before any kernel launch: the kernels compute
+        // kvh = qh / numQueriesPerKV, so a non-positive value divides by zero on-device, and a value that
+        // maps a query head past numKVHeads reads/writes KV gradients out of bounds.
+        if (numQueriesPerKV <= 0)
+            throw new ArgumentOutOfRangeException(nameof(numQueriesPerKV), numQueriesPerKV,
+                "numQueriesPerKV must be positive.");
+        long mappedKvHeads = ((long)numQHeads + numQueriesPerKV - 1) / numQueriesPerKV;
+        if (mappedKvHeads > numKVHeads)
+            throw new ArgumentException(
+                $"numQueriesPerKV={numQueriesPerKV} maps {numQHeads} query heads across {mappedKvHeads} KV heads, " +
+                $"but only {numKVHeads} KV heads were provided.", nameof(numQueriesPerKV));
+
         // #628: honor the explicit numQueriesPerKV (matches the CPU's kvh = qh / numQueriesPerKV).
         int queriesPerKV = numQueriesPerKV;
 

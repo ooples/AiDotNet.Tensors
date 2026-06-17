@@ -15015,7 +15015,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     storeOk = true;
                     return outputH;
                 }
-                catch (Exception) { /* fall through to the FP32-store path below */ }
+                catch (Exception ex)
+                {
+                    // Fall through to the FP32-store path below, but leave a diagnostic trail — a silent
+                    // swallow here would hide OOM / cuBLAS / device-sync failures behind a quiet downgrade.
+                    System.Diagnostics.Debug.WriteLine(
+                        $"[FP16 fwd-store] unexpected failure, falling back to FP32: {ex.GetType().Name}: {ex.Message}");
+                }
                 finally { hAiOwned?.Dispose(); hBiOwned?.Dispose(); if (!storeOk) hOut?.Dispose(); }
             }
 
@@ -15139,8 +15145,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             gradB = new Tensor<Half>(gBresult, new[] { K, N });
             return true;
         }
-        catch (Exception)
+        catch (Exception ex)
         {
+            // Fall back to the generic backward, but leave a diagnostic trail: a silent swallow of a
+            // gradient-computation failure (cuBLAS/device error) can surface later as a subtle training bug.
+            System.Diagnostics.Debug.WriteLine(
+                $"[FP16 fused backward] unexpected failure, falling back to generic backward: {ex.GetType().Name}: {ex.Message}");
             gradA = null;
             gradB = null;
             return false;

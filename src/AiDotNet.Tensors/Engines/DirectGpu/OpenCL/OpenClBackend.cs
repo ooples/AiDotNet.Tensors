@@ -7707,6 +7707,19 @@ KERNEL VARIANTS (A/B testing):
             int batch, int numQHeads, int numKVHeads, int seqQ, int seqK, int headDim, float scale,
             int numQueriesPerKV)
         {
+            // Validate the external head-mapping parameter before launching any kernel: the kernels divide
+            // qh by numQueriesPerKV and use the result as a KV-head index, so 0/negative divides by zero and
+            // a too-small value indexes KV gradients out of bounds.
+            if (numQueriesPerKV <= 0)
+                throw new ArgumentOutOfRangeException(nameof(numQueriesPerKV), numQueriesPerKV,
+                    "numQueriesPerKV must be positive.");
+            if (numQHeads <= 0 || numKVHeads <= 0)
+                throw new ArgumentOutOfRangeException(nameof(numQHeads), "GQA head counts must be positive.");
+            if ((numQHeads - 1) / numQueriesPerKV >= numKVHeads)
+                throw new ArgumentException(
+                    "numQueriesPerKV maps at least one query head outside the available KV head range.",
+                    nameof(numQueriesPerKV));
+
             // The kernels must honor the SAME head mapping as the CPU reference: kvh = qh / numQueriesPerKV
             // (the explicit parameter), NOT a recomputed numQHeads/numKVHeads. For a consistent GQA config
             // these are equal, but the parity harness drives inconsistent combos (e.g. Q=K=3 heads with
@@ -7717,9 +7730,9 @@ KERNEL VARIANTS (A/B testing):
             // (stale) or uninitialized GPU memory — never zeroed — so without this the gradients accumulate
             // onto garbage (observed GPU-vs-CPU max_abs_err ~372). Zero them first. (The deterministic split
             // kernels write with =, so this is belt-and-suspenders for that path.)
-            Fill(gradQuery, 0f, batch * numQHeads * seqQ * headDim);
-            Fill(gradKey, 0f, batch * numKVHeads * seqK * headDim);
-            Fill(gradValue, 0f, batch * numKVHeads * seqK * headDim);
+            ZeroBufferOnDevice(gradQuery, batch * numQHeads * seqQ * headDim);
+            ZeroBufferOnDevice(gradKey, batch * numKVHeads * seqK * headDim);
+            ZeroBufferOnDevice(gradValue, batch * numKVHeads * seqK * headDim);
 
             if (GpuDeterminism.IsActive)
             {
@@ -10724,6 +10737,17 @@ KERNEL VARIANTS (A/B testing):
             var data = new float[size];
             var buf = ((DirectOpenClGpuBuffer)buffer).Buffer;
             buf.CopyFromHost(data);
+        }
+
+        // Device-side buffer zeroing via the zero_buffer kernel — no host array
+        // allocation or CPU->GPU upload (unlike Fill / the host-copy ZeroBuffer above).
+        private void ZeroBufferOnDevice(IGpuBuffer buffer, int size)
+        {
+            if (size <= 0) return;
+            var zeroKernel = _kernelCache["zero_buffer"];
+            zeroKernel.SetArg(0, ((DirectOpenClGpuBuffer)buffer).Buffer.Handle);
+            zeroKernel.SetArg(1, size);
+            zeroKernel.Execute1D(size, CalculateOptimalWorkGroupSize1D(size));
         }
 
         private void ScaleBuffer(IGpuBuffer buffer, float scale, int size)

@@ -162,7 +162,10 @@ extern ""C"" __global__ void fp16_layernorm_native(
     for (int st = bs >> 1; st > 0; st >>= 1) { if (tid < st) sdata[tid] += sdata[tid + st]; __syncthreads(); }
     float var = sdata[0] / (float)cols; __syncthreads();
     float invstd = rsqrtf(var + eps);
-    if (tid == 0 && meanOut) { meanOut[row] = mean; varOut[row] = var; }
+    if (tid == 0) {                                     // meanOut / varOut are optional + independent
+        if (meanOut) meanOut[row] = mean;
+        if (varOut) varOut[row] = var;
+    }
     for (int i = tid; i < cols; i += bs) {
         float norm = (h2f(in[i]) - mean) * invstd;
         out[i] = f2h(norm * h2f(gamma[i]) + h2f(beta[i]));

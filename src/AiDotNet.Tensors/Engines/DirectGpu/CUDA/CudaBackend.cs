@@ -11739,9 +11739,17 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (beta is null) throw new ArgumentNullException(nameof(beta));
         if (output is null) throw new ArgumentNullException(nameof(output));
         if (rows <= 0 || cols <= 0) throw new ArgumentException($"rows/cols must be positive (rows={rows}, cols={cols}).");
-        if (input.SizeInBytes < (long)rows * cols * 2) throw new ArgumentException($"input half buffer too small: {input.SizeInBytes} < {(long)rows * cols * 2}.");
-        if (gamma.SizeInBytes < (long)cols * 2) throw new ArgumentException($"gamma half buffer too small: {gamma.SizeInBytes} < {(long)cols * 2}.");
-        if (beta.SizeInBytes < (long)cols * 2) throw new ArgumentException($"beta half buffer too small: {beta.SizeInBytes} < {(long)cols * 2}.");
+        long matrixHalfBytes = (long)rows * cols * 2;   // half = 2 bytes
+        long vectorHalfBytes = (long)cols * 2;
+        long statsBytes = (long)rows * sizeof(float);    // mean/var are FP32, one per row
+        if (input.SizeInBytes < matrixHalfBytes) throw new ArgumentException($"input half buffer too small: {input.SizeInBytes} < {matrixHalfBytes}.");
+        if (gamma.SizeInBytes < vectorHalfBytes) throw new ArgumentException($"gamma half buffer too small: {gamma.SizeInBytes} < {vectorHalfBytes}.");
+        if (beta.SizeInBytes < vectorHalfBytes) throw new ArgumentException($"beta half buffer too small: {beta.SizeInBytes} < {vectorHalfBytes}.");
+        // Write targets must also be validated — the kernel writes into them.
+        if (output.SizeInBytes < matrixHalfBytes) throw new ArgumentException($"output half buffer too small: {output.SizeInBytes} < {matrixHalfBytes}.");
+        if (meanFp32 is not null && meanFp32.SizeInBytes < statsBytes) throw new ArgumentException($"mean FP32 buffer too small: {meanFp32.SizeInBytes} < {statsBytes}.");
+        if (varFp32 is not null && varFp32.SizeInBytes < statsBytes) throw new ArgumentException($"variance FP32 buffer too small: {varFp32.SizeInBytes} < {statsBytes}.");
+        if (eps <= 0f || float.IsNaN(eps) || float.IsInfinity(eps)) throw new ArgumentOutOfRangeException(nameof(eps), eps, "eps must be finite and positive.");
         if (!_kernelCache.TryGetValue("fp16_layernorm_native", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: fp16_layernorm_native");
         using var _ = PushContext();
