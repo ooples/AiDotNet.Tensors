@@ -92,7 +92,7 @@ public class Fp16InCaptureForwardParityTests
             var lossT = plan.RunFp16HeteroForward(engine);
             float fp16Loss = lossT.GetFlat(0);
 
-            Assert.True(float.IsFinite(fp16Loss), $"FP16 hetero forward loss must be finite, got {fp16Loss}.");
+            Assert.True((!float.IsInfinity(fp16Loss) && !float.IsNaN(fp16Loss)), $"FP16 hetero forward loss must be finite, got {fp16Loss}.");
             // FP16 activation storage rounds activations to ~3 sig digits; the loss is a sum, so allow a
             // generous relative+absolute band. The point is correctness (matches FP32), not bit-equality.
             float tol = 0.1f * Math.Abs(fp32Loss) + 0.5f;
@@ -248,7 +248,7 @@ public class Fp16InCaptureForwardParityTests
         finally { plan.Dispose(); }
     }
 
-    [Fact]
+    [SkippableFact]
     public void Fp16ForwardStore_LowersGpuPeakBytes()
     {
         // Forward Half-resident store (AIDOTNET_FP16_FWD_STORE): the Half matmul forward keeps its activation
@@ -256,7 +256,7 @@ public class Fp16InCaptureForwardParityTests
         // peak of the SAME FP16 plan with the store OFF vs ON — store-on must be strictly lower (the
         // activations occupy half the device bytes). Parity is covered by Fp16HeteroForwardBackward_OnGpu.
         var gpu = AiDotNetEngine.Current as DirectGpuTensorEngine;
-        if (gpu is null || !GpuMemoryTracker.Enabled) { _out.WriteLine("skipped: needs GPU + AIDOTNET_GPU_MEMTRACK=1"); return; }
+        Skip.If(gpu is null || !GpuMemoryTracker.Enabled, "needs GPU + AIDOTNET_GPU_MEMTRACK=1");
 
         float[] inD = RandData(new[] { 2048, 256 }, 1);
         float[][] wD = new[] { RandData(new[] { 256, 256 }, 2), RandData(new[] { 256, 256 }, 3),
@@ -331,15 +331,18 @@ public class Fp16InCaptureForwardParityTests
         Assert.True(fwdOn < fwdOff, $"forward Half-store resident bytes {fwdOn} must be below no-store {fwdOff}.");
     }
 
-    [Fact]
-    public void Fp16ActivationDominated_ReducesGpuPeakBytes()
+    [SkippableFact]
+    public void Fp16ActivationDominated_FullStepGpuPeak_Measurement()
     {
-        // The real win: on an ACTIVATION-dominated config (big batch, modest weights — like a transformer),
-        // FP16 holds the chained matmul activations as Half (chained up-casts are eliminated, verified by the
-        // node-type dump), so the FP16 forward's GPU peak is BELOW the FP32 forward's despite the Half
-        // weight-down-cast overhead. Requires GPU + AIDOTNET_GPU_MEMTRACK=1.
+        // MEASUREMENT (not a reduction assertion): on an ACTIVATION-dominated config (big batch, modest
+        // weights), measure the full-Step GPU peak of an FP32 plan vs an FP16 plan WITHOUT the forward
+        // Half-resident store. As the HONEST FINDING below documents, FP16 is currently HIGHER here because
+        // the forward up-casts Half activations to FP32 device buffers and the Execute-replay forward reuses
+        // no buffers. The actual peak REDUCTION is asserted in Fp16ForwardStore_LowersGpuPeakBytes (store on).
+        // So this test only sanity-checks that both peaks were recorded; it must NOT assert fp16 < fp32, which
+        // the measurement contradicts. Requires GPU + AIDOTNET_GPU_MEMTRACK=1.
         var gpu = AiDotNetEngine.Current as DirectGpuTensorEngine;
-        if (gpu is null || !GpuMemoryTracker.Enabled) { _out.WriteLine("skipped: needs GPU + AIDOTNET_GPU_MEMTRACK=1"); return; }
+        Skip.If(gpu is null || !GpuMemoryTracker.Enabled, "needs GPU + AIDOTNET_GPU_MEMTRACK=1");
 
         // Activation-dominated: big batch (2048) through modest 256x256 weights, so the held [2048,256]
         // activations dwarf the weights. Measure GPU peak of a full Step() of an FP32 plan vs an FP16 plan
@@ -403,10 +406,13 @@ public class Fp16InCaptureForwardParityTests
         _out.WriteLine($"activation-dominated full-Step GPU peak: FP32={fp32Peak} FP16={fp16Peak} " +
             $"-> FP16 is {100.0 * (fp16Peak - fp32Peak) / Math.Max(1, fp32Peak):F1}% HIGHER " +
             $"(backward now fused; remaining gap = forward FLOAT storage + Execute-replay no-reuse)");
+        // Sanity only: both measurements must have recorded a peak. A strict fp16 < fp32 assertion is
+        // intentionally NOT made — without the forward Half-store this config's FP16 peak is higher (see the
+        // finding above); the reduction is asserted by Fp16ForwardStore_LowersGpuPeakBytes.
         Assert.True(fp16Peak > 0 && fp32Peak > 0, "both measurements must record a GPU peak");
     }
 
-    [Fact]
+    [SkippableFact]
     public void Fp16Paging_GpuPeakBytes_Measurement()
     {
         // Runtime measurement of the GPU peak bytes of the SAME FP16 heterogeneous forward with the existing
@@ -416,7 +422,7 @@ public class Fp16InCaptureForwardParityTests
         // The real device VRAM win needs a node-output-transient free (purpose-built), not this cache pager.
         // Requires GPU + AIDOTNET_GPU_MEMTRACK=1 (+ AIDOTNET_FP16_GPU_CACHE=1 for the on-device compress path).
         var gpu = AiDotNetEngine.Current as DirectGpuTensorEngine;
-        if (gpu is null || !GpuMemoryTracker.Enabled) { _out.WriteLine("skipped: needs GPU + AIDOTNET_GPU_MEMTRACK=1"); return; }
+        Skip.If(gpu is null || !GpuMemoryTracker.Enabled, "needs GPU + AIDOTNET_GPU_MEMTRACK=1");
 
         var input = Rand(new[] { 256, 256 }, 1);
         var ws = new[] { Rand(new[] { 256, 256 }, 2), Rand(new[] { 256, 256 }, 3),
@@ -461,14 +467,14 @@ public class Fp16InCaptureForwardParityTests
         finally { plan.Dispose(); }
     }
 
-    [Fact]
+    [SkippableFact]
     public void Fp16HeteroForwardBackward_OnGpu_MatchesFp32()
     {
         // Device-resident verification: the heterogeneous forward (FP16-native device kernels → Half
         // activation buffers) + backward (MixedPrecisionGraphBackward on the GPU engine) must produce a loss
         // and gradients matching FP32 on the actual CUDA backend. Skips on a non-GPU host.
         var gpu = AiDotNetEngine.Current as DirectGpuTensorEngine;
-        if (gpu is null) return;
+        Skip.If(gpu is null, "needs a CUDA GPU host");
 
         var input = Rand(new[] { 4, 5 }, 1);
         float[] w1d = RandData(new[] { 5, 6 }, 2), w2d = RandData(new[] { 6, 4 }, 3);
@@ -512,7 +518,7 @@ public class Fp16InCaptureForwardParityTests
             Assert.True(fp16Plan.HasFp16HeteroForward);
             float fp16Loss = fp16Plan.RunFp16HeteroForward(gpu).GetFlat(0);
             fp16Plan.RunFp16HeteroBackward(gpu);
-            Assert.True(float.IsFinite(fp16Loss), $"GPU FP16 loss must be finite, got {fp16Loss}.");
+            Assert.True((!float.IsInfinity(fp16Loss) && !float.IsNaN(fp16Loss)), $"GPU FP16 loss must be finite, got {fp16Loss}.");
             float tolL = 0.1f * Math.Abs(fp32Loss) + 0.5f;
             Assert.True(Math.Abs(fp16Loss - fp32Loss) < tolL, $"GPU FP16 loss {fp16Loss} vs FP32 {fp32Loss} tol {tolL}.");
             AssertGradsClose(g1_32, fp16Plan.Gradients[0].ToArray(), "gpu-w1");
@@ -565,7 +571,7 @@ public class Fp16InCaptureForwardParityTests
         {
             Assert.True(fp16Plan.HasFp16HeteroForward);
             float fp16Loss = fp16Plan.Step().GetFlat(0);
-            Assert.True(float.IsFinite(fp16Loss), $"Step loss must be finite, got {fp16Loss}.");
+            Assert.True((!float.IsInfinity(fp16Loss) && !float.IsNaN(fp16Loss)), $"Step loss must be finite, got {fp16Loss}.");
             float tol = 0.1f * Math.Abs(fp32Loss) + 0.5f;
             Assert.True(Math.Abs(fp16Loss - fp32Loss) < tol,
                 $"FP16 hetero Step() loss {fp16Loss} should match FP32 Step() loss {fp32Loss} within {tol}.");

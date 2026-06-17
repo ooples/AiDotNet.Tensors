@@ -53,7 +53,9 @@ public class Fp16NativeOpsTests
         using var hout = b.AllocateByteBuffer(rows * cols * 2);
         b.ConvertToFp16Native(dx, hx, rows * cols);
         try { b.Fp16Softmax(hx, hout, rows, cols); }
-        catch (Exception ex) { Skip.If(true, $"not supported: {ex.Message}"); return; }
+        catch (NotSupportedException ex) { Skip.If(true, $"not supported: {ex.Message}"); return; }
+        catch (InvalidOperationException ex) when (ex.Message.IndexOf("kernel not found", StringComparison.OrdinalIgnoreCase) >= 0)
+        { Skip.If(true, $"not supported: {ex.Message}"); return; }
         using var fout = b.AllocateBuffer(rows * cols);
         b.ConvertToFp32Native(hout, fout, rows * cols);
         var got = b.DownloadBuffer(fout);
@@ -107,7 +109,9 @@ public class Fp16NativeOpsTests
         b.ConvertToFp16Native(dg, hg, cols);
         b.ConvertToFp16Native(db, hb, cols);
         try { b.Fp16LayerNorm(hx, hg, hb, hout, dmean, dvar, rows, cols, eps); }
-        catch (Exception ex) { Skip.If(true, $"not supported: {ex.Message}"); return; }
+        catch (NotSupportedException ex) { Skip.If(true, $"not supported: {ex.Message}"); return; }
+        catch (InvalidOperationException ex) when (ex.Message.IndexOf("kernel not found", StringComparison.OrdinalIgnoreCase) >= 0)
+        { Skip.If(true, $"not supported: {ex.Message}"); return; }
         using var fout = b.AllocateBuffer(rows * cols);
         b.ConvertToFp32Native(hout, fout, rows * cols);
         var got = b.DownloadBuffer(fout);
