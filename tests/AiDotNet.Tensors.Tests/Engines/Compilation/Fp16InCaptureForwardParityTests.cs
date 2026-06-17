@@ -8,6 +8,7 @@
 using System;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Compilation;
+using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.Gpu;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
@@ -204,6 +205,61 @@ public class Fp16InCaptureForwardParityTests
                 "That paging is the next increment (MixedPrecisionCompiledPlan's PageOut/PageIn, on-device).");
             Assert.True(halfElems > 0, "some activations must be stored as Half (FP16 storage engaged)");
             Assert.Equal(storedFp32, storedFp16 * 2);   // exactly halved
+        }
+        finally { plan.Dispose(); }
+    }
+
+    [Fact]
+    public void Fp16Paging_GpuPeakBytes_Measurement()
+    {
+        // Runtime measurement of the GPU peak bytes of the SAME FP16 heterogeneous forward with the existing
+        // cache-based paging OFF vs ON. FINDING (recorded, not a reduction claim): paging ON does NOT lower
+        // the peak here — its CompressActivationFp16 targets activation-CACHE entries, but this graph's
+        // transient float up-casts are NODE OUTPUTS, so they aren't freed and the compress copies raise peak.
+        // The real device VRAM win needs a node-output-transient free (purpose-built), not this cache pager.
+        // Requires GPU + AIDOTNET_GPU_MEMTRACK=1 (+ AIDOTNET_FP16_GPU_CACHE=1 for the on-device compress path).
+        var gpu = AiDotNetEngine.Current as DirectGpuTensorEngine;
+        if (gpu is null || !GpuMemoryTracker.Enabled) { _out.WriteLine("skipped: needs GPU + AIDOTNET_GPU_MEMTRACK=1"); return; }
+
+        var input = Rand(new[] { 256, 256 }, 1);
+        var ws = new[] { Rand(new[] { 256, 256 }, 2), Rand(new[] { 256, 256 }, 3),
+                         Rand(new[] { 256, 256 }, 4), Rand(new[] { 256, 256 }, 5) };
+
+        CompiledTrainingPlan<float> plan;
+        var prev = MixedPrecisionEmit.TestOverrideEnabled;
+        MixedPrecisionEmit.TestOverrideEnabled = true;
+        try
+        {
+            using (var scope = GraphMode.Enable())
+            using (new AutocastScope(PrecisionMode.Float16))
+            {
+                var y = input;
+                foreach (var w in ws) y = gpu.TensorMatMul(y, w);
+                gpu.ReduceSum(y, null);
+                plan = scope.CompileTraining(ws);
+            }
+        }
+        finally { MixedPrecisionEmit.TestOverrideEnabled = prev; GraphMode.SetCurrent(null); }
+
+        try
+        {
+            var order = plan.Fp16HeteroOrderForTest!;
+            var loss = plan.LossOutput;
+
+            var unpaged = MixedPrecisionCompiledPlan.FromCapturedOrder(gpu, order, loss, paging: false);
+            GpuMemoryTracker.ResetPeak();
+            unpaged.Forward();
+            long unpagedPeak = GpuMemoryTracker.PeakBytes;
+
+            var paged = MixedPrecisionCompiledPlan.FromCapturedOrder(gpu, order, loss, paging: true);
+            GpuMemoryTracker.ResetPeak();
+            paged.Forward();
+            long pagedPeak = GpuMemoryTracker.PeakBytes;
+
+            _out.WriteLine($"forward GPU peak bytes: paging-off={unpagedPeak} paging-on={pagedPeak} " +
+                $"(delta {pagedPeak - unpagedPeak}). FINDING: the cache-based pager does NOT reduce this " +
+                "graph's node-output transient peak; a node-output-transient free is needed (TODO).");
+            Assert.True(unpagedPeak > 0 && pagedPeak > 0, "both forwards must allocate + run on the GPU.");
         }
         finally { plan.Dispose(); }
     }

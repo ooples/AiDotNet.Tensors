@@ -2209,12 +2209,16 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             "RunFp16HeteroForward called but no FP16 heterogeneous order was captured.");
         if (typeof(T) != typeof(float))
             throw new NotSupportedException("FP16-in-capture is float-only.");
-        // Delegate to the paged MixedPrecisionCompiledPlan: it replays each node's Execute over the order AND
-        // runs the tested activation-paging lifecycle (frees the transient float up-cast copies after their
-        // consumer; on-device compress/upcast when AIDOTNET_FP16_GPU_CACHE=1), so peak resident = Half
-        // activations + the live float working set, not all activations. paging:true ⇒ realizes the VRAM win.
+        // Delegate to MixedPrecisionCompiledPlan: it replays each node's Execute over the order (forward) and
+        // runs the TESTED mixed-dtype backward — reusing verified code instead of a hand-rolled replay.
+        // paging:false here — MEASURED (Fp16Paging_ReducesGpuPeakBytes): the existing GPU paging is CACHE-based
+        // (CompressActivationFp16 compresses activation-CACHE entries), but this graph's transient float
+        // up-casts are NODE OUTPUTS, not cache entries, so paging:true does NOT free them and its compress
+        // copies raise peak ~40%. Realizing the device VRAM win needs a node-output-transient free (free each
+        // float up-cast buffer after its forward consumer; re-derive from the held Half in backward) — a
+        // purpose-built mechanism, not the cache pager. Correctness is unaffected (parity verified).
         _fp16PagedPlan ??= MixedPrecisionCompiledPlan.FromCapturedOrder(
-            engine, order, (Tensor<float>)(object)_lossOutput, paging: true);
+            engine, order, (Tensor<float>)(object)_lossOutput, paging: false);
         var loss = _fp16PagedPlan.Forward();
         return (Tensor<T>)(object)loss;
     }
