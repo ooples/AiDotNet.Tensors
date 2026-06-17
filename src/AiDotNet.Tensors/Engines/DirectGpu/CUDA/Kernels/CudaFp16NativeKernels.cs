@@ -108,6 +108,66 @@ extern ""C"" __global__ __launch_bounds__(256) void fp16_add_native(
     if (idx >= size) return;
     output[idx] = f2h(h2f(a[idx]) + h2f(b[idx]));
 }
+
+// FP16-NATIVE row softmax over the last axis: ONE BLOCK PER ROW. Reads FP16 directly, the max/sum reductions
+// + exp run in FP32 (numerically stable: subtract row max), writes FP16. Shared mem = blockDim.x floats.
+extern ""C"" __global__ void fp16_softmax_native(
+    const unsigned short* __restrict__ input, unsigned short* __restrict__ output, int rows, int cols)
+{
+    int row = blockIdx.x;
+    if (row >= rows) return;
+    const unsigned short* in = input + (long long)row * cols;
+    unsigned short* out = output + (long long)row * cols;
+    extern __shared__ float sdata[];
+    int tid = threadIdx.x; int bs = blockDim.x;
+    // row max
+    float m = -3.4e38f;
+    for (int i = tid; i < cols; i += bs) { float v = h2f(in[i]); if (v > m) m = v; }
+    sdata[tid] = m; __syncthreads();
+    for (int s = bs >> 1; s > 0; s >>= 1) { if (tid < s) sdata[tid] = fmaxf(sdata[tid], sdata[tid + s]); __syncthreads(); }
+    float rowmax = sdata[0]; __syncthreads();
+    // sum exp
+    float sum = 0.0f;
+    for (int i = tid; i < cols; i += bs) sum += expf(h2f(in[i]) - rowmax);
+    sdata[tid] = sum; __syncthreads();
+    for (int s = bs >> 1; s > 0; s >>= 1) { if (tid < s) sdata[tid] += sdata[tid + s]; __syncthreads(); }
+    float inv = 1.0f / sdata[0]; __syncthreads();
+    for (int i = tid; i < cols; i += bs) out[i] = f2h(expf(h2f(in[i]) - rowmax) * inv);
+}
+
+// FP16-NATIVE row layernorm over the last axis with FP16 gamma/beta: ONE BLOCK PER ROW. Reads FP16 directly,
+// mean/var reductions in FP32, writes FP16 output; also writes the per-row FP32 mean + variance (for the
+// backward). Population variance (÷cols), eps inside the rsqrt — matches the engine's LayerNorm convention.
+extern ""C"" __global__ void fp16_layernorm_native(
+    const unsigned short* __restrict__ input, const unsigned short* __restrict__ gamma,
+    const unsigned short* __restrict__ beta, unsigned short* __restrict__ output,
+    float* __restrict__ meanOut, float* __restrict__ varOut, int rows, int cols, float eps)
+{
+    int row = blockIdx.x;
+    if (row >= rows) return;
+    const unsigned short* in = input + (long long)row * cols;
+    unsigned short* out = output + (long long)row * cols;
+    extern __shared__ float sdata[];
+    int tid = threadIdx.x; int bs = blockDim.x;
+    // mean
+    float s = 0.0f;
+    for (int i = tid; i < cols; i += bs) s += h2f(in[i]);
+    sdata[tid] = s; __syncthreads();
+    for (int st = bs >> 1; st > 0; st >>= 1) { if (tid < st) sdata[tid] += sdata[tid + st]; __syncthreads(); }
+    float mean = sdata[0] / (float)cols; __syncthreads();
+    // variance
+    float v = 0.0f;
+    for (int i = tid; i < cols; i += bs) { float d = h2f(in[i]) - mean; v += d * d; }
+    sdata[tid] = v; __syncthreads();
+    for (int st = bs >> 1; st > 0; st >>= 1) { if (tid < st) sdata[tid] += sdata[tid + st]; __syncthreads(); }
+    float var = sdata[0] / (float)cols; __syncthreads();
+    float invstd = rsqrtf(var + eps);
+    if (tid == 0 && meanOut) { meanOut[row] = mean; varOut[row] = var; }
+    for (int i = tid; i < cols; i += bs) {
+        float norm = (h2f(in[i]) - mean) * invstd;
+        out[i] = f2h(norm * h2f(gamma[i]) + h2f(beta[i]));
+    }
+}
 ";
     }
 
@@ -117,6 +177,8 @@ extern ""C"" __global__ __launch_bounds__(256) void fp16_add_native(
         "convert_fp16_to_fp32_native",
         "fp16_gelu_native",
         "fp16_relu_native",
-        "fp16_add_native"
+        "fp16_add_native",
+        "fp16_softmax_native",
+        "fp16_layernorm_native"
     };
 }

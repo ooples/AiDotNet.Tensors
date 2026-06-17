@@ -11705,6 +11705,55 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
+    /// <summary>
+    /// FP16-native row softmax over the last axis: input/output are FP16 [rows, cols] buffers; the max/sum
+    /// reductions + exp run in FP32 (stable). One block per row. Keeps the activation half-resident.
+    /// </summary>
+    public unsafe void Fp16Softmax(IGpuBuffer input, IGpuBuffer output, int rows, int cols)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (output is null) throw new ArgumentNullException(nameof(output));
+        if (rows <= 0 || cols <= 0) throw new ArgumentException($"rows/cols must be positive (rows={rows}, cols={cols}).");
+        if (input.SizeInBytes < (long)rows * cols * 2) throw new ArgumentException($"input half buffer too small: {input.SizeInBytes} < {(long)rows * cols * 2}.");
+        if (output.SizeInBytes < (long)rows * cols * 2) throw new ArgumentException($"output half buffer too small: {output.SizeInBytes} < {(long)rows * cols * 2}.");
+        if (!_kernelCache.TryGetValue("fp16_softmax_native", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: fp16_softmax_native");
+        using var _ = PushContext();
+        const uint block = 256u;
+        IntPtr inPtr = input.Handle, outPtr = output.Handle;
+        void** args = stackalloc void*[4];
+        args[0] = &inPtr; args[1] = &outPtr; args[2] = &rows; args[3] = &cols;
+        LaunchKernelWithSharedMem(kernel, (uint)rows, block, block * sizeof(float), args);
+    }
+
+    /// <summary>
+    /// FP16-native row layernorm over the last axis with FP16 gamma/beta: input/output/gamma/beta are FP16;
+    /// also writes the per-row FP32 mean + variance (for the backward). One block per row; mean/var in FP32.
+    /// Population variance, eps inside the rsqrt — matches the engine's LayerNorm convention.
+    /// </summary>
+    public unsafe void Fp16LayerNorm(IGpuBuffer input, IGpuBuffer gamma, IGpuBuffer beta, IGpuBuffer output,
+        IGpuBuffer meanFp32, IGpuBuffer varFp32, int rows, int cols, float eps)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (gamma is null) throw new ArgumentNullException(nameof(gamma));
+        if (beta is null) throw new ArgumentNullException(nameof(beta));
+        if (output is null) throw new ArgumentNullException(nameof(output));
+        if (rows <= 0 || cols <= 0) throw new ArgumentException($"rows/cols must be positive (rows={rows}, cols={cols}).");
+        if (input.SizeInBytes < (long)rows * cols * 2) throw new ArgumentException($"input half buffer too small: {input.SizeInBytes} < {(long)rows * cols * 2}.");
+        if (gamma.SizeInBytes < (long)cols * 2) throw new ArgumentException($"gamma half buffer too small: {gamma.SizeInBytes} < {(long)cols * 2}.");
+        if (beta.SizeInBytes < (long)cols * 2) throw new ArgumentException($"beta half buffer too small: {beta.SizeInBytes} < {(long)cols * 2}.");
+        if (!_kernelCache.TryGetValue("fp16_layernorm_native", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: fp16_layernorm_native");
+        using var _ = PushContext();
+        const uint block = 256u;
+        IntPtr inPtr = input.Handle, gPtr = gamma.Handle, bPtr = beta.Handle, outPtr = output.Handle;
+        IntPtr meanPtr = meanFp32?.Handle ?? IntPtr.Zero, varPtr = varFp32?.Handle ?? IntPtr.Zero;
+        void** args = stackalloc void*[9];
+        args[0] = &inPtr; args[1] = &gPtr; args[2] = &bPtr; args[3] = &outPtr;
+        args[4] = &meanPtr; args[5] = &varPtr; args[6] = &rows; args[7] = &cols; args[8] = &eps;
+        LaunchKernelWithSharedMem(kernel, (uint)rows, block, block * sizeof(float), args);
+    }
+
     /// <summary>FP32→FP16 via the self-contained native kernel (no cuda_fp16.h). Output is a half buffer.</summary>
     public unsafe void ConvertToFp16Native(IGpuBuffer input, IGpuBuffer output, int size)
         => LaunchConvertFp16("convert_fp32_to_fp16_native", input, output, size);
