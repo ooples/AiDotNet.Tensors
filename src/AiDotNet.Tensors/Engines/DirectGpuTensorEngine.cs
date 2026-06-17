@@ -9995,6 +9995,51 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             if (batchSize * normalizedSize != input.Length)
                 return base.LayerNormBackward(gradOutput, input, gamma, mean, variance, epsilon, out gradGamma, out gradBeta);
 
+            // FP16 Half-native backward: read IsFp16 grad/input/gamma directly, run the FP16-native LayerNorm
+            // backward (gradInput) + grad-params (gradGamma/gradBeta), store Half. mean/invVar stay FP32 (tiny,
+            // one per row) exactly like the float path. Parity-equivalent to layernorm_backward + grad_params.
+            if (typeof(T) == typeof(Half) && s_fp16FwdStore
+                && backend is DirectGpu.CUDA.CudaBackend cbL && cbL.SupportsFp16NativeOps)
+            {
+                IGpuBuffer? hgOwned = null, hiOwned = null, hgamOwned = null;
+                IGpuBuffer? meanBuf = null, invVarBuf = null, giOut = null, ggOut = null, gbOut = null;
+                bool ok = false;
+                try
+                {
+                    var lnMeanF = DirectGpuEngine.ToFloatArray(mean.GetDataArray());
+                    var lnVarF = DirectGpuEngine.ToFloatArray(variance.GetDataArray());
+                    var lnInvVarF = new float[lnVarF.Length];
+                    for (int i = 0; i < lnVarF.Length; i++) lnInvVarF[i] = 1f / MathF.Sqrt(lnVarF[i] + (float)epsilon);
+                    var hg = ResolveToFp16(gradOutput, gradOutput.Length, cbL, backend, out hgOwned);
+                    var hi = ResolveToFp16(input, input.Length, cbL, backend, out hiOwned);
+                    var hgam = ResolveToFp16(gamma, normalizedSize, cbL, backend, out hgamOwned);
+                    meanBuf = cbL.AllocateBuffer(lnMeanF);
+                    invVarBuf = cbL.AllocateBuffer(lnInvVarF);
+                    giOut = cbL.AllocateByteBuffer(input.Length * 2);
+                    ggOut = cbL.AllocateByteBuffer(normalizedSize * 2);
+                    gbOut = cbL.AllocateByteBuffer(normalizedSize * 2);
+                    cbL.Fp16LayerNormBackward(hg, hi, hgam, meanBuf, invVarBuf, giOut, batchSize, normalizedSize);
+                    cbL.Fp16LayerNormGradParams(hg, hi, meanBuf, invVarBuf, ggOut, gbOut, batchSize, normalizedSize);
+                    var giH = FinishGpuOpHalfStore(cbL, giOut, input.Length, input.Shape.ToArray()); giOut = null;
+                    var ggH = FinishGpuOpHalfStore(cbL, ggOut, normalizedSize, gamma.Shape.ToArray()); ggOut = null;
+                    var gbH = FinishGpuOpHalfStore(cbL, gbOut, normalizedSize, gamma.Shape.ToArray()); gbOut = null;
+                    gradGamma = (Tensor<T>)(object)new Tensor<Half>(ggH, gamma.Shape.ToArray());
+                    gradBeta = (Tensor<T>)(object)new Tensor<Half>(gbH, gamma.Shape.ToArray());
+                    ok = true;
+                    return (Tensor<T>)(object)new Tensor<Half>(giH, input.Shape.ToArray());
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"[FP16 bwd LayerNorm] fallback: {ex.GetType().Name}: {ex.Message}");
+                }
+                finally
+                {
+                    hgOwned?.Dispose(); hiOwned?.Dispose(); hgamOwned?.Dispose();
+                    meanBuf?.Dispose(); invVarBuf?.Dispose();
+                    if (!ok) { giOut?.Dispose(); ggOut?.Dispose(); gbOut?.Dispose(); }
+                }
+            }
+
             using var gradOutBuffer = GetOrAllocateBuffer(backend, gradOutput);
             using var inputBuffer = GetOrAllocateBuffer(backend, input);
             using var gammaBuffer = GetOrCacheWeightBuffer(backend, gamma.GetDataArray(), PersistentTensorRole.Weights);

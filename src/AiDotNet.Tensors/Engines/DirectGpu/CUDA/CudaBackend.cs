@@ -11819,6 +11819,68 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
+    /// <summary>FP16-native LayerNorm backward — gradInput. ONE BLOCK PER ROW (mirrors layernorm_backward); takes
+    /// the FP32 saveMean + saveInvVar (1/sqrt(var+eps)). grad/input/gamma/gradInput are FP16 buffers.</summary>
+    public unsafe void Fp16LayerNormBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma,
+        IGpuBuffer saveMeanFp32, IGpuBuffer saveInvVarFp32, IGpuBuffer gradInput, int rows, int cols)
+    {
+        if (gradOutput is null) throw new ArgumentNullException(nameof(gradOutput));
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (gamma is null) throw new ArgumentNullException(nameof(gamma));
+        if (saveMeanFp32 is null) throw new ArgumentNullException(nameof(saveMeanFp32));
+        if (saveInvVarFp32 is null) throw new ArgumentNullException(nameof(saveInvVarFp32));
+        if (gradInput is null) throw new ArgumentNullException(nameof(gradInput));
+        if (rows <= 0 || cols <= 0) throw new ArgumentException($"rows/cols must be positive (rows={rows}, cols={cols}).");
+        long matBytes = (long)rows * cols * 2;
+        if (gradOutput.SizeInBytes < matBytes) throw new ArgumentException($"gradOutput half buffer too small: {gradOutput.SizeInBytes} < {matBytes}.");
+        if (input.SizeInBytes < matBytes) throw new ArgumentException($"input half buffer too small: {input.SizeInBytes} < {matBytes}.");
+        if (gradInput.SizeInBytes < matBytes) throw new ArgumentException($"gradInput half buffer too small: {gradInput.SizeInBytes} < {matBytes}.");
+        if (gamma.SizeInBytes < (long)cols * 2) throw new ArgumentException($"gamma half buffer too small: {gamma.SizeInBytes} < {(long)cols * 2}.");
+        if (saveMeanFp32.SizeInBytes < (long)rows * sizeof(float)) throw new ArgumentException($"saveMean FP32 buffer too small: {saveMeanFp32.SizeInBytes} < {(long)rows * sizeof(float)}.");
+        if (saveInvVarFp32.SizeInBytes < (long)rows * sizeof(float)) throw new ArgumentException($"saveInvVar FP32 buffer too small: {saveInvVarFp32.SizeInBytes} < {(long)rows * sizeof(float)}.");
+        if (!_kernelCache.TryGetValue("fp16_layernorm_backward_native", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: fp16_layernorm_backward_native");
+        using var _ = PushContext();
+        const uint block = 256u;
+        IntPtr gPtr = gradOutput.Handle, iPtr = input.Handle, gamPtr = gamma.Handle;
+        IntPtr mPtr = saveMeanFp32.Handle, vPtr = saveInvVarFp32.Handle, giPtr = gradInput.Handle;
+        void** args = stackalloc void*[8];
+        args[0] = &gPtr; args[1] = &iPtr; args[2] = &gamPtr; args[3] = &mPtr;
+        args[4] = &vPtr; args[5] = &giPtr; args[6] = &rows; args[7] = &cols;
+        LaunchKernelWithSharedMem(kernel, (uint)rows, block, 2u * block * sizeof(float), args);
+    }
+
+    /// <summary>FP16-native LayerNorm backward — gamma/beta param grads. ONE THREAD PER FEATURE, FP32 accumulate,
+    /// Half out (mirrors layernorm_grad_params). Takes FP32 saveMean + saveInvVar.</summary>
+    public unsafe void Fp16LayerNormGradParams(IGpuBuffer gradOutput, IGpuBuffer input,
+        IGpuBuffer saveMeanFp32, IGpuBuffer saveInvVarFp32, IGpuBuffer gradGamma, IGpuBuffer gradBeta, int rows, int cols)
+    {
+        if (gradOutput is null) throw new ArgumentNullException(nameof(gradOutput));
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (saveMeanFp32 is null) throw new ArgumentNullException(nameof(saveMeanFp32));
+        if (saveInvVarFp32 is null) throw new ArgumentNullException(nameof(saveInvVarFp32));
+        if (gradGamma is null) throw new ArgumentNullException(nameof(gradGamma));
+        if (gradBeta is null) throw new ArgumentNullException(nameof(gradBeta));
+        if (rows <= 0 || cols <= 0) throw new ArgumentException($"rows/cols must be positive (rows={rows}, cols={cols}).");
+        long matBytes = (long)rows * cols * 2;
+        if (gradOutput.SizeInBytes < matBytes) throw new ArgumentException($"gradOutput half buffer too small: {gradOutput.SizeInBytes} < {matBytes}.");
+        if (input.SizeInBytes < matBytes) throw new ArgumentException($"input half buffer too small: {input.SizeInBytes} < {matBytes}.");
+        if (gradGamma.SizeInBytes < (long)cols * 2) throw new ArgumentException($"gradGamma half buffer too small: {gradGamma.SizeInBytes} < {(long)cols * 2}.");
+        if (gradBeta.SizeInBytes < (long)cols * 2) throw new ArgumentException($"gradBeta half buffer too small: {gradBeta.SizeInBytes} < {(long)cols * 2}.");
+        if (saveMeanFp32.SizeInBytes < (long)rows * sizeof(float)) throw new ArgumentException($"saveMean FP32 buffer too small: {saveMeanFp32.SizeInBytes} < {(long)rows * sizeof(float)}.");
+        if (saveInvVarFp32.SizeInBytes < (long)rows * sizeof(float)) throw new ArgumentException($"saveInvVar FP32 buffer too small: {saveInvVarFp32.SizeInBytes} < {(long)rows * sizeof(float)}.");
+        if (!_kernelCache.TryGetValue("fp16_layernorm_grad_params_native", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: fp16_layernorm_grad_params_native");
+        using var _ = PushContext();
+        uint grid = (uint)((cols + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr gPtr = gradOutput.Handle, iPtr = input.Handle, mPtr = saveMeanFp32.Handle;
+        IntPtr vPtr = saveInvVarFp32.Handle, ggPtr = gradGamma.Handle, gbPtr = gradBeta.Handle;
+        void** args = stackalloc void*[8];
+        args[0] = &gPtr; args[1] = &iPtr; args[2] = &mPtr; args[3] = &vPtr;
+        args[4] = &ggPtr; args[5] = &gbPtr; args[6] = &rows; args[7] = &cols;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
     /// <summary>FP32→FP16 via the self-contained native kernel (no cuda_fp16.h). Output is a half buffer.</summary>
     public unsafe void ConvertToFp16Native(IGpuBuffer input, IGpuBuffer output, int size)
         => LaunchConvertFp16("convert_fp32_to_fp16_native", input, output, size);

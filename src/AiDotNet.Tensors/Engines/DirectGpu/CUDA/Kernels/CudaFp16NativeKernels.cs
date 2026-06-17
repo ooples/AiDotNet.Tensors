@@ -222,6 +222,60 @@ extern ""C"" __global__ __launch_bounds__(256) void fp16_softmax_backward_native
         gradInput[idx] = f2h(h2f(output[idx]) * (h2f(gradOutput[idx]) - dot));
     }
 }
+
+// LayerNorm backward — gradInput. ONE BLOCK PER ROW, reductions in FP32 (mirrors layernorm_backward). Takes
+// the FP32 saveMean + saveInvVar (1/sqrt(var+eps)) exactly like the FP32 engine path; grad/input/gamma/gradInput
+// are FP16. Shared mem = 2*blockDim.x floats (sumDy, sumDyXmu).
+extern ""C"" __global__ void fp16_layernorm_backward_native(
+    const unsigned short* __restrict__ gradOutput, const unsigned short* __restrict__ input,
+    const unsigned short* __restrict__ gamma, const float* __restrict__ saveMean, const float* __restrict__ saveInvVar,
+    unsigned short* __restrict__ gradInput, int rows, int cols)
+{
+    int b = blockIdx.x;
+    if (b >= rows) return;
+    extern __shared__ float smem[];
+    float* smem2 = smem + blockDim.x;
+    int tid = threadIdx.x; int bs = blockDim.x;
+    long long base = (long long)b * cols;
+    float mean = saveMean[b];
+    float invVar = saveInvVar[b];
+    float locSumDy = 0.0f, locSumDyXmu = 0.0f;
+    for (int i = tid; i < cols; i += bs) {
+        float dy = h2f(gradOutput[base + i]) * h2f(gamma[i]);
+        locSumDy += dy;
+        locSumDyXmu += dy * (h2f(input[base + i]) - mean);
+    }
+    smem[tid] = locSumDy; smem2[tid] = locSumDyXmu; __syncthreads();
+    for (int s = bs >> 1; s > 0; s >>= 1) { if (tid < s) { smem[tid] += smem[tid + s]; smem2[tid] += smem2[tid + s]; } __syncthreads(); }
+    float sumDy = smem[0], sumDyXmu = smem2[0]; __syncthreads();
+    for (int i = tid; i < cols; i += bs) {
+        float xmu = h2f(input[base + i]) - mean;
+        float dxhat = h2f(gradOutput[base + i]) * h2f(gamma[i]);
+        float gi = invVar * (dxhat - (sumDy + xmu * invVar * invVar * sumDyXmu) / (float)cols);
+        gradInput[base + i] = f2h(gi);
+    }
+}
+
+// LayerNorm backward — gamma/beta param grads. ONE THREAD PER FEATURE, serial over rows, FP32 accumulate, Half
+// out (mirrors layernorm_grad_params). gradGamma += gradOut*normalized; gradBeta += gradOut.
+extern ""C"" __global__ __launch_bounds__(256) void fp16_layernorm_grad_params_native(
+    const unsigned short* __restrict__ gradOutput, const unsigned short* __restrict__ input,
+    const float* __restrict__ saveMean, const float* __restrict__ saveInvVar,
+    unsigned short* __restrict__ gradGamma, unsigned short* __restrict__ gradBeta, int rows, int cols)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= cols) return;
+    float dGamma = 0.0f, dBeta = 0.0f;
+    for (int b = 0; b < rows; b++) {
+        long long idx = (long long)b * cols + i;
+        float normalized = (h2f(input[idx]) - saveMean[b]) * saveInvVar[b];
+        float go = h2f(gradOutput[idx]);
+        dGamma += go * normalized;
+        dBeta += go;
+    }
+    gradGamma[i] = f2h(dGamma);
+    gradBeta[i] = f2h(dBeta);
+}
 ";
     }
 
@@ -236,6 +290,8 @@ extern ""C"" __global__ __launch_bounds__(256) void fp16_softmax_backward_native
         "fp16_layernorm_native",
         "fp16_gelu_backward_native",
         "fp16_relu_backward_native",
-        "fp16_softmax_backward_native"
+        "fp16_softmax_backward_native",
+        "fp16_layernorm_backward_native",
+        "fp16_layernorm_grad_params_native"
     };
 }
