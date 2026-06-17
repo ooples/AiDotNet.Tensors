@@ -249,6 +249,57 @@ public class Fp16InCaptureForwardParityTests
     }
 
     [Fact]
+    public void Fp16ForwardStore_LowersGpuPeakBytes()
+    {
+        // Forward Half-resident store (AIDOTNET_FP16_FWD_STORE): the Half matmul forward keeps its activation
+        // as a HALF GPU buffer instead of up-casting to FP32. Measure the activation-dominated full-Step GPU
+        // peak of the SAME FP16 plan with the store OFF vs ON — store-on must be strictly lower (the
+        // activations occupy half the device bytes). Parity is covered by Fp16HeteroForwardBackward_OnGpu.
+        var gpu = AiDotNetEngine.Current as DirectGpuTensorEngine;
+        if (gpu is null || !GpuMemoryTracker.Enabled) { _out.WriteLine("skipped: needs GPU + AIDOTNET_GPU_MEMTRACK=1"); return; }
+
+        float[] inD = RandData(new[] { 2048, 256 }, 1);
+        float[][] wD = new[] { RandData(new[] { 256, 256 }, 2), RandData(new[] { 256, 256 }, 3),
+                               RandData(new[] { 256, 256 }, 4), RandData(new[] { 256, 256 }, 5) };
+        Tensor<float>[] MkWs() => new[] { new Tensor<float>((float[])wD[0].Clone(), new[] { 256, 256 }),
+            new Tensor<float>((float[])wD[1].Clone(), new[] { 256, 256 }),
+            new Tensor<float>((float[])wD[2].Clone(), new[] { 256, 256 }),
+            new Tensor<float>((float[])wD[3].Clone(), new[] { 256, 256 }) };
+
+        // Measure LIVE device bytes resident right AFTER the forward (the actual activation allocations), not
+        // the peak watermark — the async buffer pool's high-water reservation is sticky across sequential
+        // in-process measurements, so a peak A/B is confounded, but the live set is the true resident footprint.
+        long MeasureFwdLive(bool fwdStore)
+        {
+            var prevStore = DirectGpuTensorEngine.Fp16FwdStoreOverride;
+            DirectGpuTensorEngine.Fp16FwdStoreOverride = fwdStore;
+            var prev = MixedPrecisionEmit.TestOverrideEnabled; MixedPrecisionEmit.TestOverrideEnabled = true;
+            CompiledTrainingPlan<float> plan;
+            try
+            {
+                var inp = new Tensor<float>((float[])inD.Clone(), new[] { 2048, 256 });
+                var ws = MkWs();
+                using (var scope = GraphMode.Enable())
+                using (new AutocastScope(PrecisionMode.Float16))
+                {
+                    var y = inp; foreach (var w in ws) y = gpu.TensorMatMul(y, w);
+                    gpu.ReduceSum(y, null);
+                    plan = scope.CompileTraining(ws);
+                }
+            }
+            finally { MixedPrecisionEmit.TestOverrideEnabled = prev; GraphMode.SetCurrent(null); }
+            try { long before = GpuMemoryTracker.LiveBytes; plan.RunFp16HeteroForward(gpu); return GpuMemoryTracker.LiveBytes - before; }
+            finally { plan.Dispose(); DirectGpuTensorEngine.Fp16FwdStoreOverride = prevStore; }
+        }
+
+        long off = MeasureFwdLive(false);
+        long on = MeasureFwdLive(true);
+        _out.WriteLine($"FP16 forward resident device bytes: fwd-store OFF={off} ON={on} " +
+            $"-> {100.0 * (off - on) / Math.Max(1, off):F1}% lower with forward Half-store");
+        Assert.True(on < off, $"forward Half-store resident bytes {on} must be below no-store {off}.");
+    }
+
+    [Fact]
     public void Fp16ActivationDominated_ReducesGpuPeakBytes()
     {
         // The real win: on an ACTIVATION-dominated config (big batch, modest weights — like a transformer),

@@ -1295,7 +1295,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private void CacheActivation<T>(T[] resultData, IGpuBuffer buffer, int[] shape, IDirectGpuBackend backend)
         => CacheActivation((object)resultData, buffer, shape, backend);
 
-    private void CacheActivation(object cacheKey, IGpuBuffer buffer, int[] shape, IDirectGpuBackend backend)
+    private void CacheActivation(object cacheKey, IGpuBuffer buffer, int[] shape, IDirectGpuBackend backend,
+        bool isFp16 = false, int elementCount = 0)
     {
         // Approximate managed-heap footprint of the key array this entry pins
         // (product(shape) * 4 bytes; activation backing arrays are float[]). Bounds
@@ -1348,7 +1349,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
 
             var timestamp = System.Threading.Interlocked.Increment(ref _activationCacheTimestamp);
-            var entry = new ActivationCacheEntry(buffer, shape, timestamp, backend, managedBytes);
+            var entry = isFp16
+                ? new ActivationCacheEntry(buffer, shape, timestamp, backend, managedBytes: managedBytes, isFp16: true, elementCount: elementCount)
+                : new ActivationCacheEntry(buffer, shape, timestamp, backend, managedBytes);
             bool added = false;
             try
             {
@@ -1895,6 +1898,44 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         CacheActivation(result, outputBuffer.Buffer, new[] { elementCount }, backend);
 
+        return result;
+    }
+
+    // FORWARD Half-resident activation store (#558 layer 7, opt-in AIDOTNET_FP16_FWD_STORE): keep a matmul's
+    // output activation as a HALF GPU buffer (half the VRAM) instead of up-casting it to FP32.
+    private static readonly bool s_fp16FwdStoreEnv =
+        Environment.GetEnvironmentVariable("AIDOTNET_FP16_FWD_STORE") == "1";
+    /// <summary>Test override for the forward Half-store flag (null = use the env var).</summary>
+    internal static bool? Fp16FwdStoreOverride;
+    internal static bool s_fp16FwdStore => Fp16FwdStoreOverride ?? s_fp16FwdStoreEnv;
+
+    /// <summary>
+    /// Cache <paramref name="halfBuffer"/> (FP16, half the bytes) as an IsFp16 activation entry keyed on the
+    /// returned Half[], with a Half-AWARE deferred materializer (the resident Half buffer is up-cast to a
+    /// transient FP32 buffer, downloaded, then narrowed to Half[]) — because <c>DownloadBuffer</c> is FP32-only.
+    /// GPU consumers re-resolve through <c>GetOrAllocateBuffer</c>, which up-casts the IsFp16 entry on demand
+    /// (TryUpcastActivationFp32ByKey). Mirrors <see cref="FinishGpuOp{T}"/>'s deferral/cache contract for Half.
+    /// </summary>
+    private Half[] FinishGpuOpHalfStore(DirectGpu.CUDA.CudaBackend backend, IGpuBuffer halfBuffer, int elementCount, int[] shape)
+    {
+#if !NETFRAMEWORK
+        var result = GC.AllocateUninitializedArray<Half>(elementCount);
+#else
+        var result = new Half[elementCount];
+#endif
+        var capturedBuffer = halfBuffer;
+        var capturedBackend = backend;
+        int n = elementCount;
+        Helpers.DeferredArrayMaterializer.Register(result, arr =>
+        {
+            using var tmp = AllocateOutputBuffer(capturedBackend, n); // FP32 transient
+            capturedBackend.ConvertToFp32Native(capturedBuffer, tmp.Buffer, n);
+            float[] floatData = capturedBackend.DownloadBuffer(tmp.Buffer);
+            var dst = (Half[])arr;
+            int m = Math.Min(floatData.Length, dst.Length);
+            for (int i = 0; i < m; i++) dst[i] = (Half)floatData[i];
+        });
+        CacheActivation(result, halfBuffer, shape, backend, isFp16: true, elementCount: elementCount);
         return result;
     }
 
@@ -14851,6 +14892,34 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
             using var bufA = GetOrAllocateBuffer(backend, a);
             using var bufB = GetOrAllocateBuffer(backend, b);
+
+            // FORWARD Half-resident store: keep the activation as a HALF GPU buffer (half the VRAM) instead of
+            // up-casting to FP32. Opt-in + CUDA Tensor-Core only; convert the (cached FP32) inputs to FP16, run
+            // the Half-output GEMM (FP32 accumulate), and cache the Half output as an IsFp16 entry.
+            if (typeof(T) == typeof(Half) && s_fp16FwdStore
+                && backend is DirectGpu.CUDA.CudaBackend cbFwd && cbFwd.SupportsHgemm)
+            {
+                IGpuBuffer? hAi = null, hBi = null, hOut = null;
+                bool storeOk = false;
+                try
+                {
+                    hAi = cbFwd.AllocateByteBuffer(M * K * 2);
+                    hBi = cbFwd.AllocateByteBuffer(K * N * 2);
+                    cbFwd.ConvertToFp16Native(bufA.Buffer, hAi, M * K);
+                    cbFwd.ConvertToFp16Native(bufB.Buffer, hBi, K * N);
+                    hOut = cbFwd.AllocateByteBuffer(M * N * 2);
+                    cbFwd.GemmFp16HalfOut(hAi, hBi, hOut, M, N, K);
+                    var resultH = FinishGpuOpHalfStore(cbFwd, hOut, M * N, new[] { M, N }); // takes ownership of hOut
+                    hOut = null;
+                    var outputH = (Tensor<T>)(object)new Tensor<Half>(resultH, new[] { M, N });
+                    Autodiff.DifferentiableOps.RecordBinary("TensorMatMul", outputH, a, b, Autodiff.BackwardFunctions<T>.MatMulBackward);
+                    storeOk = true;
+                    return outputH;
+                }
+                catch (Exception) { /* fall through to the FP32-store path below */ }
+                finally { hAi?.Dispose(); hBi?.Dispose(); if (!storeOk) hOut?.Dispose(); }
+            }
+
             var bufOut = AllocateOutputBuffer(backend, M * N);
             backend.Gemm(bufA.Buffer, bufB.Buffer, bufOut.Buffer, M, N, K);
             var result = FinishGpuOp<T>(backend, bufOut, M * N);
