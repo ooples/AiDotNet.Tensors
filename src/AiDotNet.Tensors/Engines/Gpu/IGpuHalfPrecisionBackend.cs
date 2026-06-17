@@ -46,4 +46,19 @@ public interface IGpuHalfPrecisionBackend
     /// </summary>
     void GemmFp16In32fOut(IGpuBuffer aFp16, IGpuBuffer bFp16, IGpuBuffer cFp32,
         int m, int n, int k);
+
+    /// <summary>True when this backend ships the FP16-NATIVE element / activation / normalization kernels
+    /// (GELU/ReLU/residual-add and row Softmax/LayerNorm over half-stored activations, FP32 math). Consumers
+    /// check before routing to the half-resident fast path so they can fall back to the FP32 path otherwise.</summary>
+    bool SupportsFp16NativeOps { get; }
+
+    /// <summary>Row softmax over the last axis of a half buffer: one block/work-group per row, FP32 max/sum
+    /// reductions (numerically stable), half in/out.</summary>
+    void Fp16Softmax(IGpuBuffer input, IGpuBuffer output, int rows, int cols);
+
+    /// <summary>Row layernorm over the last axis of a half buffer with half gamma/beta: one block/work-group
+    /// per row, FP32 mean/var, half in/out. Writes the per-row FP32 mean + variance for the backward (pass a
+    /// real buffer; backends supply a temporary internally if a backend-specific null is allowed).</summary>
+    void Fp16LayerNorm(IGpuBuffer input, IGpuBuffer gamma, IGpuBuffer beta, IGpuBuffer output,
+        IGpuBuffer meanFp32, IGpuBuffer varFp32, int rows, int cols, float eps);
 }

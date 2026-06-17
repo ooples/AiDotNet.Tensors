@@ -15439,6 +15439,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
             // FP16 Half-resident store (keystone-enabled): read IsFp16 input/gamma/beta directly, FP16-native
             // layernorm (Half output + FP32 mean/var), store Half output — keeps the per-layer norm Half.
+            // The fp16_layernorm_native KERNEL now ships on all six backends (IGpuHalfPrecisionBackend); this
+            // half-RESIDENT-STORE fast path is still gated to CUDA because the surrounding store plumbing
+            // (ResolveToFp16 / FinishGpuOpHalfStore / ConvertToFp32Native) is CUDA-typed. Generalizing that
+            // plumbing to the other backends is tracked as a follow-up (Tensors #633 GPU half-store); other
+            // backends correctly use the FP32 LayerNorm path below (no half-resident memory win, but correct).
             if (typeof(T) == typeof(Half) && s_fp16FwdStore
                 && backend is DirectGpu.CUDA.CudaBackend cbL && cbL.SupportsFp16NativeOps)
             {
@@ -15461,8 +15466,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     meanVarTransferred = true;
                     return (Tensor<T>)(object)new Tensor<Half>(resultH, input.Shape._dims);
                 }
-                catch (Exception)
+                catch (Exception ex)
                 {
+                    // Fall through to the FP32 LayerNorm path below, but leave a diagnostic trail rather than
+                    // silently swallowing (OOM / cuBLAS / device-sync failures would otherwise be invisible).
+                    System.Diagnostics.Debug.WriteLine(
+                        $"[FP16 layernorm store] unexpected failure, falling back to FP32: {ex.GetType().Name}: {ex.Message}");
                     hOut?.Dispose();
                     if (!meanVarTransferred) { mBuf.Dispose(); vBuf.Dispose(); }
                 }
@@ -15756,6 +15765,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
             // FP16 Half-resident store: read IsFp16 input directly, FP16-native softmax, store Half output — so
             // the attention softmax activations stay Half (works now that the IsFp16 re-inflate is transient).
+            // As with LayerNorm above, the fp16_softmax_native KERNEL now ships on all six backends; this
+            // half-resident-store fast path stays CUDA-gated only because ResolveToFp16/FinishGpuOpHalfStore
+            // are CUDA-typed (tracked follow-up). Non-CUDA backends use the correct FP32 softmax path below.
             if (typeof(T) == typeof(Half) && s_fp16FwdStore
                 && backend is DirectGpu.CUDA.CudaBackend cbS && cbS.SupportsFp16NativeOps)
             {
@@ -15774,7 +15786,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     okS = true;
                     return outputH;
                 }
-                catch (Exception) { /* fall through */ }
+                catch (Exception ex)
+                {
+                    // Fall through to the FP32 softmax path below, with a diagnostic trail instead of a silent swallow.
+                    System.Diagnostics.Debug.WriteLine(
+                        $"[FP16 softmax store] unexpected failure, falling back to FP32: {ex.GetType().Name}: {ex.Message}");
+                }
                 finally { hInOwned?.Dispose(); if (!okS) hOut?.Dispose(); }
             }
 
