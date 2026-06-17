@@ -15022,50 +15022,40 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int M = a._shape[0], K = a._shape[1], N = b._shape[1];
         if (b._shape[0] != K || gradC._shape[0] != M || gradC._shape[1] != N) return false;
 
-        DirectGpu.IGpuBuffer? hAOwned = null, hBOwned = null, hGc = null, gAf = null, gBf = null;
+        DirectGpu.IGpuBuffer? hAOwned = null, hBOwned = null, hGcOwned = null, gAf = null, gBf = null;
+        bool gradsCached = false;
         try
         {
-            // Inputs as FP16. If an activation is already resident as a Half IsFp16 entry, read it DIRECTLY —
-            // no up-cast (which would re-inflate it to FP32 for the rest of the step, erasing the forward store
-            // win) and no convert. Otherwise fall back to the cached FP32 buffer + a FP16 convert.
-            DirectGpu.IGpuBuffer hA, hB;
-            if (TryGetResidentFp16Buffer(a, backend, out var aResident) && aResident is not null)
-                hA = aResident;
-            else
+            // A/B/gradC as FP16. If a tensor is already resident as a Half IsFp16 entry (the forward store, or a
+            // grad produced GPU-resident by a downstream fused-backward), read it DIRECTLY — no up-cast (which
+            // would re-inflate it to FP32 and erase the store win) and no convert. Otherwise convert its FP32 buffer.
+            DirectGpu.IGpuBuffer ResolveHalf(Tensor<Half> t, int elems, ref DirectGpu.IGpuBuffer? owned)
             {
-                using var oa = GetOrAllocateBuffer(backend, a);
-                hAOwned = cb.AllocateByteBuffer(M * K * 2);
-                cb.ConvertToFp16Native(oa.Buffer, hAOwned, M * K);
-                hA = hAOwned;
+                if (TryGetResidentFp16Buffer(t, backend, out var resident) && resident is not null)
+                    return resident;
+                using var f = GetOrAllocateBuffer(backend, t);
+                owned = cb.AllocateByteBuffer(elems * 2);
+                cb.ConvertToFp16Native(f.Buffer, owned, elems);
+                return owned;
             }
-            if (TryGetResidentFp16Buffer(b, backend, out var bResident) && bResident is not null)
-                hB = bResident;
-            else
-            {
-                using var ob = GetOrAllocateBuffer(backend, b);
-                hBOwned = cb.AllocateByteBuffer(K * N * 2);
-                cb.ConvertToFp16Native(ob.Buffer, hBOwned, K * N);
-                hB = hBOwned;
-            }
-            // gradC is a gradient tensor (not an IsFp16 activation) — convert from its FP32 buffer.
-            using var ogc = GetOrAllocateBuffer(backend, gradC);
-            hGc = cb.AllocateByteBuffer(M * N * 2);
-            cb.ConvertToFp16Native(ogc.Buffer, hGc, M * N);
+            var hA = ResolveHalf(a, M * K, ref hAOwned);     // a is [M,K]
+            var hB = ResolveHalf(b, K * N, ref hBOwned);     // b is [K,N]
+            var hGc = ResolveHalf(gradC, M * N, ref hGcOwned); // gradC is [M,N]
 
-            // Fused transpose-free Tensor-Core backward → FP32 grad buffers (no transpose / no up-cast scratch).
+            // Fused transpose-free Tensor-Core backward → FP32 grad buffers, wrapped via the DEFERRED-download
+            // FinishGpuOp: the grad's FP32 GPU buffer is cached (consumers read it on-device, no re-upload) and
+            // the host Half[] materializes LAZILY only if read on the CPU (intermediate grads never are). This
+            // keeps the grads GPU-resident with NO eager host round-trip — the per-matmul DownloadBuffer was the
+            // cortex's ~5x slowdown. (Caching the grads as IsFp16 instead churns the activation cache with fresh
+            // per-step grad arrays — measured to hang the cortex — so use the normal FP32 deferred path here.)
             gAf = cb.AllocateBuffer(M * K);
             gBf = cb.AllocateBuffer(K * N);
             cb.MatMulBackwardFp16Fused(hGc, hA, hB, gAf, gBf, M, N, K, gradOutHalf: false);
-
-            // Materialize as Half grad tensors for the FP16 grad dict.
-            var gAf32 = cb.DownloadBuffer(gAf);
-            var gBf32 = cb.DownloadBuffer(gBf);
-            var gAhalf = new Half[M * K];
-            for (int i = 0; i < gAhalf.Length; i++) gAhalf[i] = (Half)gAf32[i];
-            var gBhalf = new Half[K * N];
-            for (int i = 0; i < gBhalf.Length; i++) gBhalf[i] = (Half)gBf32[i];
-            gradA = new Tensor<Half>(gAhalf, new[] { M, K });
-            gradB = new Tensor<Half>(gBhalf, new[] { K, N });
+            var gAresult = FinishGpuOp<Half>(backend, new OwnedBuffer(gAf, ownsBuffer: true), M * K);
+            var gBresult = FinishGpuOp<Half>(backend, new OwnedBuffer(gBf, ownsBuffer: true), K * N);
+            gradsCached = true; // FinishGpuOp took ownership of gAf/gBf (cached) — do NOT dispose
+            gradA = new Tensor<Half>(gAresult, new[] { M, K });
+            gradB = new Tensor<Half>(gBresult, new[] { K, N });
             return true;
         }
         catch (Exception)
@@ -15076,10 +15066,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         finally
         {
-            // Dispose only the buffers WE allocated (the FP16 converts) — never the resident IsFp16 activation
-            // buffers read directly from the cache (those are owned by the activation cache).
-            hAOwned?.Dispose(); hBOwned?.Dispose(); hGc?.Dispose();
-            gAf?.Dispose(); gBf?.Dispose();
+            // Dispose only the convert buffers WE allocated — never the resident IsFp16 buffers (cache-owned) nor
+            // the grad output buffers once FinishGpuOpHalfStore has taken ownership of them.
+            hAOwned?.Dispose(); hBOwned?.Dispose(); hGcOwned?.Dispose();
+            if (!gradsCached) { gAf?.Dispose(); gBf?.Dispose(); }
         }
     }
 
