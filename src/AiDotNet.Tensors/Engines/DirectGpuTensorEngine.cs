@@ -15007,9 +15007,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // FORWARD Half-resident store — RUN BEFORE GetOrAllocateBuffer (which would up-cast an IsFp16 input
             // to FP32, re-inflating it for the rest of the step). Keep the activation as a HALF GPU buffer (half
             // the VRAM); read IsFp16-resident inputs DIRECTLY (no re-inflate/re-convert churn), run the
-            // Half-output GEMM (FP32 accumulate), and cache the Half output as an IsFp16 entry. CUDA Tensor-Core only.
+            // Half-output GEMM (FP32 accumulate), and cache the Half output as an IsFp16 entry. Runs on ANY
+            // backend that ships a half-output GEMM (IGpuHalfPrecisionBackend.Hgemm / SupportsHgemm) — the
+            // half-resident matmul forward is no longer CUDA-only.
             if (typeof(T) == typeof(Half) && s_fp16FwdStore
-                && backend is DirectGpu.CUDA.CudaBackend cbFwd && cbFwd.SupportsHgemm)
+                && backend is IGpuHalfPrecisionBackend hpFwd && hpFwd.SupportsHgemm)
             {
                 IGpuBuffer? hAiOwned = null, hBiOwned = null, hOut = null;
                 bool storeOk = false;
@@ -15017,8 +15019,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 {
                     var hAi = ResolveToFp16(a, M * K, backend, out hAiOwned);
                     var hBi = ResolveToFp16(b, K * N, backend, out hBiOwned);
-                    hOut = cbFwd.AllocateByteBuffer(M * N * 2);
-                    cbFwd.GemmFp16HalfOut(hAi, hBi, hOut, M, N, K);
+                    hOut = backend.AllocateByteBuffer(M * N * 2);
+                    hpFwd.Hgemm(hAi, hBi, hOut, M, N, K);
                     var resultH = FinishGpuOpHalfStore(backend, hOut, M * N, new[] { M, N }); // takes ownership of hOut
                     hOut = null;
                     var outputH = (Tensor<T>)(object)new Tensor<Half>(resultH, new[] { M, N });
