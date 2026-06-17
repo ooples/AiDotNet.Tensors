@@ -5,6 +5,7 @@
 
 using System;
 using AiDotNet.Tensors.Engines.Gpu;
+using static AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 
@@ -103,6 +104,73 @@ public sealed partial class MetalBackend : IGpuHalfPrecisionBackend
         encoder.SetBuffer(oBuf, 2);
         encoder.SetBytes((uint)n, 3);
         encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+    }
+
+    /// <summary>Row softmax over the last axis of a half buffer: one threadgroup per row, FP32 max/sum,
+    /// half in/out. Metal counterpart of the CUDA fp16_softmax_native.</summary>
+    public void Fp16Softmax(IGpuBuffer input, IGpuBuffer output, int rows, int cols)
+    {
+        ThrowIfDisposed();
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (output is null) throw new ArgumentNullException(nameof(output));
+        if (rows <= 0 || cols <= 0) throw new ArgumentException($"rows/cols must be positive (rows={rows}, cols={cols}).");
+        if (input is not MetalGpuBuffer inBuf || output is not MetalGpuBuffer outBuf)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer");
+
+        var pipeline = GetPipeline("Matrix", _matrixLibrary, "fp16_softmax_native");
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer(inBuf, 0);
+        encoder.SetBuffer(outBuf, 1);
+        encoder.SetBytes((uint)rows, 2);
+        encoder.SetBytes((uint)cols, 3);
+        encoder.DispatchThreadgroups(new MTLSize((ulong)rows, 1, 1), new MTLSize(256, 1, 1)); // one threadgroup per row
+    }
+
+    /// <summary>Row layernorm over the last axis of a half buffer with half gamma/beta: one threadgroup per
+    /// row, FP32 mean/var, half in/out; optionally writes per-row FP32 mean/variance. Metal counterpart of
+    /// the CUDA fp16_layernorm_native.</summary>
+    public void Fp16LayerNorm(IGpuBuffer input, IGpuBuffer gamma, IGpuBuffer beta, IGpuBuffer output,
+        IGpuBuffer meanFp32, IGpuBuffer varFp32, int rows, int cols, float eps)
+    {
+        ThrowIfDisposed();
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (gamma is null) throw new ArgumentNullException(nameof(gamma));
+        if (beta is null) throw new ArgumentNullException(nameof(beta));
+        if (output is null) throw new ArgumentNullException(nameof(output));
+        if (rows <= 0 || cols <= 0) throw new ArgumentException($"rows/cols must be positive (rows={rows}, cols={cols}).");
+        if (eps <= 0f || float.IsNaN(eps) || float.IsInfinity(eps))
+            throw new ArgumentOutOfRangeException(nameof(eps), eps, "eps must be finite and positive.");
+        if (input is not MetalGpuBuffer inBuf || gamma is not MetalGpuBuffer gBuf || beta is not MetalGpuBuffer bBuf || output is not MetalGpuBuffer oBuf)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer");
+
+        // The kernel always writes mean/var; supply temporaries when the caller passes none.
+        IGpuBuffer? tmpMean = null, tmpVar = null;
+        var meanBuf = meanFp32 ?? (tmpMean = AllocateBuffer(rows));
+        var varBuf = varFp32 ?? (tmpVar = AllocateBuffer(rows));
+        try
+        {
+            if (meanBuf is not MetalGpuBuffer mBuf || varBuf is not MetalGpuBuffer vBuf)
+                throw new ArgumentException("Buffers must be MetalGpuBuffer");
+            var pipeline = GetPipeline("Matrix", _matrixLibrary, "fp16_layernorm_native");
+            using var encoder = _commandQueue.CreateScopedComputeEncoder();
+            encoder.SetPipelineState(pipeline.Handle);
+            encoder.SetBuffer(inBuf, 0);
+            encoder.SetBuffer(gBuf, 1);
+            encoder.SetBuffer(bBuf, 2);
+            encoder.SetBuffer(oBuf, 3);
+            encoder.SetBuffer(mBuf, 4);
+            encoder.SetBuffer(vBuf, 5);
+            encoder.SetBytes((uint)rows, 6);
+            encoder.SetBytes((uint)cols, 7);
+            encoder.SetBytes(eps, 8);
+            encoder.DispatchThreadgroups(new MTLSize((ulong)rows, 1, 1), new MTLSize(256, 1, 1)); // one threadgroup per row
+        }
+        finally
+        {
+            tmpMean?.Dispose();
+            tmpVar?.Dispose();
+        }
     }
 
     private void DispatchFp16Unary(string kernelName, IGpuBuffer input, IGpuBuffer output, int n)

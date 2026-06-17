@@ -1757,6 +1757,73 @@ kernel void fp16_add_native(
     output[i] = half(float(a[i]) + float(b[i]));
 }
 
+// FP16-native row softmax over the last axis: ONE THREADGROUP PER ROW, FP32 max/sum reductions in
+// threadgroup memory (stable: subtract row max), half in/out. Counterpart of the CUDA fp16_softmax_native.
+kernel void fp16_softmax_native(
+    device const half* input [[buffer(0)]],
+    device half* output [[buffer(1)]],
+    constant uint& rows [[buffer(2)]],
+    constant uint& cols [[buffer(3)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint row [[threadgroup_position_in_grid]],
+    uint bs [[threads_per_threadgroup]])
+{
+    if (row >= rows) return;
+    threadgroup float sdata[256];
+    device const half* in = input + (uint)row * cols;
+    device half* out = output + (uint)row * cols;
+    float m = -3.4e38f;
+    for (uint i = tid; i < cols; i += bs) m = max(m, float(in[i]));
+    sdata[tid] = m; threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = bs >> 1; s > 0; s >>= 1) { if (tid < s) sdata[tid] = max(sdata[tid], sdata[tid + s]); threadgroup_barrier(mem_flags::mem_threadgroup); }
+    float rowmax = sdata[0]; threadgroup_barrier(mem_flags::mem_threadgroup);
+    float sum = 0.0f;
+    for (uint i = tid; i < cols; i += bs) sum += exp(float(in[i]) - rowmax);
+    sdata[tid] = sum; threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = bs >> 1; s > 0; s >>= 1) { if (tid < s) sdata[tid] += sdata[tid + s]; threadgroup_barrier(mem_flags::mem_threadgroup); }
+    float inv = 1.0f / sdata[0]; threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < cols; i += bs) out[i] = half(exp(float(in[i]) - rowmax) * inv);
+}
+
+// FP16-native row layernorm over the last axis with half gamma/beta: ONE THREADGROUP PER ROW, FP32
+// mean/var reductions in threadgroup memory, half in/out; writes per-row FP32 mean + variance. Population
+// variance (/cols), eps inside rsqrt. Counterpart of the CUDA fp16_layernorm_native.
+kernel void fp16_layernorm_native(
+    device const half* input [[buffer(0)]],
+    device const half* gamma [[buffer(1)]],
+    device const half* beta [[buffer(2)]],
+    device half* output [[buffer(3)]],
+    device float* meanOut [[buffer(4)]],
+    device float* varOut [[buffer(5)]],
+    constant uint& rows [[buffer(6)]],
+    constant uint& cols [[buffer(7)]],
+    constant float& eps [[buffer(8)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint row [[threadgroup_position_in_grid]],
+    uint bs [[threads_per_threadgroup]])
+{
+    if (row >= rows) return;
+    threadgroup float sdata[256];
+    device const half* in = input + (uint)row * cols;
+    device half* out = output + (uint)row * cols;
+    float s = 0.0f;
+    for (uint i = tid; i < cols; i += bs) s += float(in[i]);
+    sdata[tid] = s; threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint st = bs >> 1; st > 0; st >>= 1) { if (tid < st) sdata[tid] += sdata[tid + st]; threadgroup_barrier(mem_flags::mem_threadgroup); }
+    float mean = sdata[0] / float(cols); threadgroup_barrier(mem_flags::mem_threadgroup);
+    float vv = 0.0f;
+    for (uint i = tid; i < cols; i += bs) { float d = float(in[i]) - mean; vv += d * d; }
+    sdata[tid] = vv; threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint st = bs >> 1; st > 0; st >>= 1) { if (tid < st) sdata[tid] += sdata[tid + st]; threadgroup_barrier(mem_flags::mem_threadgroup); }
+    float var = sdata[0] / float(cols); threadgroup_barrier(mem_flags::mem_threadgroup);
+    float invstd = rsqrt(var + eps);
+    if (tid == 0) { meanOut[row] = mean; varOut[row] = var; }
+    for (uint i = tid; i < cols; i += bs) {
+        float norm = (float(in[i]) - mean) * invstd;
+        out[i] = half(norm * float(gamma[i]) + float(beta[i]));
+    }
+}
+
 // Tiled matrix multiplication for better cache utilization
 kernel void matmul_tiled(
     device const float* A [[buffer(0)]],
