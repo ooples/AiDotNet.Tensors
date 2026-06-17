@@ -2217,6 +2217,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // copies raise peak ~40%. Realizing the device VRAM win needs a node-output-transient free (free each
         // float up-cast buffer after its forward consumer; re-derive from the held Half in backward) — a
         // purpose-built mechanism, not the cache pager. Correctness is unaffected (parity verified).
+        // paging:false — MEASURED (forward-paging experiment, 2026-06-16): enabling paging + GPU compress +
+        // draining the deferred frees gave NO peak reduction. Root cause: CompressActivationFp16 is keyed on
+        // Tensor<float> cache entries, but the hetero activations are Tensor<Half> whose GPU buffers the engine
+        // already up-casts to FP32 (GetOrAllocateBuffer:1105 ToFloatArray) — so the compress never matches them.
+        // The real forward-storage win needs the Half matmul FORWARD to emit a Half OUTPUT buffer (not up-cast)
+        // — a residency-machinery change (FinishGpuOp/DownloadBuffer are float-only), not the cache pager.
         _fp16PagedPlan ??= MixedPrecisionCompiledPlan.FromCapturedOrder(
             engine, order, (Tensor<float>)(object)_lossOutput, paging: false);
         var loss = _fp16PagedPlan.Forward();
