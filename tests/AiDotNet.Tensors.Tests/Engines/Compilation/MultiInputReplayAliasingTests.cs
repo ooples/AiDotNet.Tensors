@@ -162,6 +162,48 @@ public class MultiInputReplayAliasingTests : IDisposable
     }
 
     [Fact]
+    public void Replay_LeafThroughMatmulThenSliceAxis_Deterministic()
+    {
+        // The precise combination only the multi-input full DiT exercises: the secondary leaf (timeEmbed)
+        // goes through a matmul (AdaLNModulation) -> reshape -> TensorSliceAxis views -> AdaLN. Single-input
+        // DiT bakes this whole chain to constants (timestep is constant), so it never hits it; the prior
+        // repros tested matmul-on-leaf and slice-on-leaf SEPARATELY but not chained.
+        var engine = new CpuEngine();
+        int seq = 4, hidden = 8, k = 6;
+        var x = Tensor<float>.CreateRandom(new[] { 1, seq, hidden });
+        var te = Tensor<float>.CreateRandom(new[] { 1, k });             // timeEmbed leaf
+        var wMod = Tensor<float>.CreateRandom(new[] { k, 6 * hidden });
+
+        Func<Tensor<float>> forward = () =>
+        {
+            var mod = engine.TensorMatMul(te, wMod);                     // [1, 6*hidden]  (AdaLNModulation)
+            var modR = engine.Reshape(mod, new[] { 1, 6, 1, hidden });
+            var shift = engine.TensorSliceAxis(modR, 1, 0);
+            var scale = engine.TensorSliceAxis(modR, 1, 1);
+            var scaled = engine.TensorBroadcastMultiply(x, engine.TensorAddScalar(scale, 1f));
+            return engine.TensorBroadcastAdd(scaled, shift);
+        };
+
+        var xBefore = Snapshot(x);
+        var teBefore = Snapshot(te);
+        var cache = new CompiledModelCache<float>();
+        try
+        {
+            var plan = cache.GetOrCompileInference(new[] { x, te }, forward);
+            plan.SetInputs(new[] { x, te });
+            var got1 = Snapshot(plan.Execute());
+            Assert.Equal(xBefore, x.AsSpan().ToArray());
+            Assert.Equal(teBefore, te.AsSpan().ToArray());
+            plan.SetInputs(new[] { x, te });
+            var got2 = Snapshot(plan.Execute());
+            for (int i = 0; i < got1.Length; i++)
+                Assert.True(Math.Abs(got1[i] - got2[i]) < 1e-5f,
+                    $"matmul-then-slice replay {i}: {got1[i]} vs {got2[i]} — non-deterministic compiled replay.");
+        }
+        finally { cache.Dispose(); }
+    }
+
+    [Fact]
     public void Replay_PatchifyReshapeOfPermute_Deterministic()
     {
         // DiT.Patchify: [B,C,H,W] -> 6D reshape -> permute {0,2,4,1,3,5} -> reshape to [B,numPatches,
@@ -304,6 +346,206 @@ public class MultiInputReplayAliasingTests : IDisposable
     }
 
     [Fact]
+    public void Parity_PermuteThenReshape()
+    {
+        // The remaining piece of the failing chain: RESHAPE of a PERMUTE output. Eager permute returns a
+        // strided view; reshaping it must materialize to logical order. The compiled plan materializes the
+        // permute (TensorPermuteInto -> contiguous) then reshapes. If eager reshape reinterprets strides
+        // (physical order) instead of materializing, eager and compiled diverge here.
+        var engine = new CpuEngine();
+        int B = 1, heads = 2, seq = 4, hd = 4;
+        var x = Tensor<float>.CreateRandom(new[] { B, heads, seq, hd });
+        var t = Tensor<float>.CreateRandom(new[] { B, seq, heads * hd });
+        Func<Tensor<float>> forward = () =>
+        {
+            var p = engine.TensorPermute(x, new[] { 0, 2, 1, 3 });   // [B, seq, heads, hd] (strided in eager)
+            var flat = engine.Reshape(p, new[] { B, seq, heads * hd });
+            return engine.TensorBroadcastAdd(flat, t);                // materialize
+        };
+        var eager = Snapshot(forward());
+        var cache = new CompiledModelCache<float>();
+        try
+        {
+            var plan = cache.GetOrCompileInference(new[] { x, t }, forward);
+            plan.SetInputs(new[] { x, t });
+            var got = Snapshot(plan.Execute());
+            for (int i = 0; i < got.Length; i++)
+                Assert.True(Math.Abs(got[i] - eager[i]) < 1e-4f,
+                    $"permute-then-reshape parity {i}: compiled {got[i]} vs eager {eager[i]}.");
+        }
+        finally { cache.Dispose(); }
+    }
+
+    [Fact]
+    public void Parity_Matmul_ReshapeView_Permute_SingleBranch()
+    {
+        // Minimal: matmul -> reshape (recorded as a no-op VIEW sharing the matmul's buffer) -> permute
+        // -> materialize. If the plan reuses the matmul's buffer without seeing that the reshape-view +
+        // permute still need it, the permute reads stale data.
+        var engine = new CpuEngine();
+        int seq = 4, embed = 8, heads = 2, headDim = embed / heads;
+        var input2D = Tensor<float>.CreateRandom(new[] { seq, embed });
+        var w = Tensor<float>.CreateRandom(new[] { embed, embed });
+        var t = Tensor<float>.CreateRandom(new[] { 1, heads, seq, headDim });
+        Func<Tensor<float>> forward = () =>
+        {
+            var mm = engine.TensorMatMul(input2D, w);                                  // [seq, embed]
+            var r = engine.Reshape(mm, new[] { 1, seq, heads, headDim });              // view
+            var p = engine.TensorPermute(r, new[] { 0, 2, 1, 3 });                     // [1, heads, seq, headDim]
+            return engine.TensorBroadcastAdd(p, t);
+        };
+        var eager = Snapshot(forward());
+        var cache = new CompiledModelCache<float>();
+        try
+        {
+            var plan = cache.GetOrCompileInference(new[] { input2D, t }, forward);
+            plan.SetInputs(new[] { input2D, t });
+            var got = Snapshot(plan.Execute());
+            for (int i = 0; i < got.Length; i++)
+                Assert.True(Math.Abs(got[i] - eager[i]) < 1e-4f,
+                    $"matmul-reshape-permute parity {i}: compiled {got[i]} vs eager {eager[i]}.");
+        }
+        finally { cache.Dispose(); }
+    }
+
+    [Fact(Skip = "KNOWN BUG (tracked): the compiled-inference step-mutating passes (OperatorReorderingPass " +
+        "+ MemoryPlanningPass, run for plans with >=4 steps) miscompute the fan-out attention topology — " +
+        "ONE shared input feeding q/k/v via matmul->reshape->permute, joined at SDPA — producing a " +
+        "DETERMINISTIC but WRONG result vs eager. Bypassing BOTH passes makes this + the whole compile " +
+        "suite pass (541/541), but MemoryPlanningPass is the SD-UNet peak-memory reducer (2GB->300MB), so " +
+        "the real fix is to make both passes' liveness view-aliasing-aware, not to disable them. Minimal " +
+        "repro: shared-input QKV->SDPA fails; single branch and separate-input QKV->SDPA both pass.")]
+    public void Parity_SharedInput_QKV_Reshape_Permute_SDPA()
+    {
+        // Front half of the attention chain: ONE shared input -> 3x (matmul -> reshape -> permute) -> SDPA.
+        // The passing Parity_PermuteThenSDPA used 3 SEPARATE inputs; here q/k/v all derive from one input
+        // through matmul+reshape, which is what the real SelfAttentionLayer does.
+        var engine = new CpuEngine();
+        int seq = 4, embed = 8, heads = 2, headDim = embed / heads;
+        var input2D = Tensor<float>.CreateRandom(new[] { seq, embed });
+        var wq = Tensor<float>.CreateRandom(new[] { embed, embed });
+        var wk = Tensor<float>.CreateRandom(new[] { embed, embed });
+        var wv = Tensor<float>.CreateRandom(new[] { embed, embed });
+        Func<Tensor<float>> forward = () =>
+        {
+            var q = engine.TensorPermute(engine.Reshape(engine.TensorMatMul(input2D, wq), new[] { 1, seq, heads, headDim }), new[] { 0, 2, 1, 3 });
+            var k = engine.TensorPermute(engine.Reshape(engine.TensorMatMul(input2D, wk), new[] { 1, seq, heads, headDim }), new[] { 0, 2, 1, 3 });
+            var v = engine.TensorPermute(engine.Reshape(engine.TensorMatMul(input2D, wv), new[] { 1, seq, heads, headDim }), new[] { 0, 2, 1, 3 });
+            return engine.ScaledDotProductAttention(q, k, v, null, 1.0 / Math.Sqrt(headDim), out _);
+        };
+        var eager = Snapshot(forward());
+        var cache = new CompiledModelCache<float>();
+        try
+        {
+            var plan = cache.GetOrCompileInference(input2D, forward);
+            if (plan is ICompiledPlan<float> rb) rb.SetInputs(new[] { input2D });
+            var got = Snapshot(plan.Execute());
+            for (int i = 0; i < got.Length; i++)
+                Assert.True(Math.Abs(got[i] - eager[i]) < 1e-4f,
+                    $"shared-qkv parity {i}: compiled {got[i]} vs eager {eager[i]}.");
+        }
+        finally { cache.Dispose(); }
+    }
+
+    [Fact]
+    public void Parity_PermuteThenSDPA()
+    {
+        // The exact failing sub-chain: permute q/k/v (materialized contiguous in the plan; strided views
+        // in eager) THEN feed SDPA. SDPA-alone and permute-alone both pass parity; this composition is
+        // where the SelfAttentionLayerOps repro diverged.
+        var engine = new CpuEngine();
+        var q = Tensor<float>.CreateRandom(new[] { 1, 4, 2, 4 });   // [B, seq, heads, headDim]
+        var k = Tensor<float>.CreateRandom(new[] { 1, 4, 2, 4 });
+        var v = Tensor<float>.CreateRandom(new[] { 1, 4, 2, 4 });
+        Func<Tensor<float>> forward = () =>
+        {
+            var qh = engine.TensorPermute(q, new[] { 0, 2, 1, 3 });  // [B, heads, seq, headDim]
+            var kh = engine.TensorPermute(k, new[] { 0, 2, 1, 3 });
+            var vh = engine.TensorPermute(v, new[] { 0, 2, 1, 3 });
+            return engine.ScaledDotProductAttention(qh, kh, vh, null, 0.5, out _);
+        };
+        var eager = Snapshot(forward());
+        var cache = new CompiledModelCache<float>();
+        try
+        {
+            var plan = cache.GetOrCompileInference(new[] { q, k, v }, forward);
+            plan.SetInputs(new[] { q, k, v });
+            var got = Snapshot(plan.Execute());
+            for (int i = 0; i < got.Length; i++)
+                Assert.True(Math.Abs(got[i] - eager[i]) < 1e-4f,
+                    $"permute-then-SDPA parity {i}: compiled {got[i]} vs eager {eager[i]}.");
+        }
+        finally { cache.Dispose(); }
+    }
+
+    [Fact]
+    public void Parity_TwoPermuteOutputsLiveAtOnce()
+    {
+        // Minimal: two permute outputs that must BOTH be live for the add. If the compiled plan reuses
+        // a buffer (mis-computed liveness for materialized-permute outputs), the add reads corrupted data.
+        var engine = new CpuEngine();
+        var a = Tensor<float>.CreateRandom(new[] { 1, 4, 2, 4 });
+        var b = Tensor<float>.CreateRandom(new[] { 1, 4, 2, 4 });
+        Func<Tensor<float>> forward = () =>
+        {
+            var pa = engine.TensorPermute(a, new[] { 0, 2, 1, 3 });
+            var pb = engine.TensorPermute(b, new[] { 0, 2, 1, 3 });
+            return engine.TensorAdd(pa, pb);
+        };
+        var eager = Snapshot(forward());
+        var cache = new CompiledModelCache<float>();
+        try
+        {
+            var plan = cache.GetOrCompileInference(new[] { a, b }, forward);
+            plan.SetInputs(new[] { a, b });
+            var got = Snapshot(plan.Execute());
+            for (int i = 0; i < got.Length; i++)
+                Assert.True(Math.Abs(got[i] - eager[i]) < 1e-4f,
+                    $"two-permute parity {i}: compiled {got[i]} vs eager {eager[i]}.");
+        }
+        finally { cache.Dispose(); }
+    }
+
+    [Fact]
+    public void Parity_ScaledDotProductAttention_4D()
+    {
+        var engine = new CpuEngine();
+        var q = Tensor<float>.CreateRandom(new[] { 1, 2, 4, 4 });
+        Func<Tensor<float>> forward = () => engine.ScaledDotProductAttention(q, q, q, null, 0.5, out _);
+        var eager = Snapshot(forward());
+        var cache = new CompiledModelCache<float>();
+        try
+        {
+            var plan = cache.GetOrCompileInference(q, forward);
+            if (plan is ICompiledPlan<float> rb) rb.SetInputs(new[] { q });
+            var got = Snapshot(plan.Execute());
+            for (int i = 0; i < got.Length; i++)
+                Assert.True(Math.Abs(got[i] - eager[i]) < 1e-4f,
+                    $"SDPA parity {i}: compiled {got[i]} vs eager {eager[i]}.");
+        }
+        finally { cache.Dispose(); }
+    }
+
+    [Fact]
+    public void Parity_TensorPermuteInto_vs_TransposeContiguous_4D()
+    {
+        // Direct eager check (no compile): the compiled plan materializes permute via TensorPermuteInto;
+        // eager downstream consumes the strided Transpose view. Both must agree on the logical permuted
+        // data. Compares TensorPermuteInto's output against Transpose().Contiguous() (logical order).
+        var engine = new CpuEngine();
+        var x = Tensor<float>.CreateRandom(new[] { 1, 4, 2, 4 });
+        var axes = new[] { 0, 2, 1, 3 };
+
+        var viaInto = new Tensor<float>(new[] { 1, 2, 4, 4 });
+        engine.TensorPermuteInto(viaInto, x, axes);
+        var viaTranspose = engine.TensorPermute(x, axes).Contiguous();
+
+        for (int i = 0; i < viaInto.Length; i++)
+            Assert.True(Math.Abs(viaInto[i] - viaTranspose[i]) < 1e-5f,
+                $"PermuteInto vs Transpose.Contiguous {i}: {viaInto[i]} vs {viaTranspose[i]}.");
+    }
+
+    [Fact]
     public void Replay_SelfAttentionLayerOps_Deterministic()
     {
         // Faithful mirror of SelfAttentionLayer.Forward's op sequence: QKV matmul -> reshape to heads
@@ -345,6 +587,9 @@ public class MultiInputReplayAliasingTests : IDisposable
             for (int i = 0; i < got1.Length; i++)
                 Assert.True(Math.Abs(got1[i] - got2[i]) < 1e-5f,
                     $"selfattn replay {i}: {got1[i]} vs {got2[i]} — non-deterministic compiled replay.");
+            // NOTE: an eager-PARITY assertion here FAILS on the original compiler — the step-mutating
+            // passes miscompute this fan-out attention chain (see the skipped
+            // Parity_SharedInput_QKV_Reshape_Permute_SDPA for the minimal repro + root cause).
         }
         finally { cache.Dispose(); }
     }
