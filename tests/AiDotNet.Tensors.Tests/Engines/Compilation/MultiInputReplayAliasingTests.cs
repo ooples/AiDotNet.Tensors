@@ -162,6 +162,194 @@ public class MultiInputReplayAliasingTests : IDisposable
     }
 
     [Fact]
+    public void Replay_PatchifyReshapeOfPermute_Deterministic()
+    {
+        // DiT.Patchify: [B,C,H,W] -> 6D reshape -> permute {0,2,4,1,3,5} -> reshape to [B,numPatches,
+        // patchDim]. The final reshape collapses a NON-contiguous permuted view — a pattern none of the
+        // other repros hit (they permute 4D then feed an op that handles strides; this RESHAPES the
+        // strided permute directly). Reuse the same image input across replays.
+        var engine = new CpuEngine();
+        int B = 1, C = 4, H = 8, W = 8, p = 2;
+        int nH = H / p, nW = W / p, numPatches = nH * nW, patchDim = C * p * p;
+        var x = Tensor<float>.CreateRandom(new[] { B, C, H, W });
+        var t = Tensor<float>.CreateRandom(new[] { B, numPatches, patchDim });
+
+        Func<Tensor<float>> forward = () =>
+        {
+            var split = engine.Reshape(x, new[] { B, C, nH, p, nW, p });
+            var permuted = engine.TensorPermute(split, new[] { 0, 2, 4, 1, 3, 5 });
+            var patches = engine.Reshape(permuted, new[] { B, numPatches, patchDim });
+            return engine.TensorAdd(patches, t);
+        };
+
+        var xBefore = Snapshot(x);
+        var cache = new CompiledModelCache<float>();
+        try
+        {
+            var plan = cache.GetOrCompileInference(new[] { x, t }, forward);
+            plan.SetInputs(new[] { x, t });
+            var got1 = Snapshot(plan.Execute());
+            Assert.Equal(xBefore, x.AsSpan().ToArray());
+            plan.SetInputs(new[] { x, t });
+            var got2 = Snapshot(plan.Execute());
+            for (int i = 0; i < got1.Length; i++)
+                Assert.True(Math.Abs(got1[i] - got2[i]) < 1e-5f,
+                    $"patchify replay {i}: {got1[i]} vs {got2[i]} — non-deterministic compiled replay.");
+        }
+        finally { cache.Dispose(); }
+    }
+
+    [Fact]
+    public void Replay_AdaLNSliceAxisViews_Deterministic()
+    {
+        // The exact DiT-block AdaLN pattern: a modulation tensor reshaped to [B,6,1,hidden] and split
+        // into six [B,1,hidden] VIEWS via Engine.TensorSliceAxis (shared backing buffer), then used as
+        // scale/shift in y = x*(1+scale)+shift plus a gated residual. None of the other repros use
+        // TensorSliceAxis. The second input (the modulation source) is reused across replays.
+        var engine = new CpuEngine();
+        int seq = 4, hidden = 8;
+        var x = Tensor<float>.CreateRandom(new[] { 1, seq, hidden });
+        var mod = Tensor<float>.CreateRandom(new[] { 1, 6 * hidden });    // AdaLN modulation source
+
+        Func<Tensor<float>> forward = () =>
+        {
+            var modReshaped = engine.Reshape(mod, new[] { 1, 6, 1, hidden });
+            var shift1 = engine.TensorSliceAxis(modReshaped, 1, 0);
+            var scale1 = engine.TensorSliceAxis(modReshaped, 1, 1);
+            var gate1  = engine.TensorSliceAxis(modReshaped, 1, 2);
+            // y = x*(1+scale)+shift  (ApplyAdaLN)
+            var scaled = engine.TensorBroadcastMultiply(x, engine.TensorAddScalar(scale1, 1f));
+            var normed = engine.TensorBroadcastAdd(scaled, shift1);
+            // gated residual: x + gate*normed
+            var gated = engine.TensorBroadcastMultiply(normed, gate1);
+            return engine.TensorAdd(x, gated);
+        };
+
+        var xBefore = Snapshot(x);
+        var modBefore = Snapshot(mod);
+        var cache = new CompiledModelCache<float>();
+        try
+        {
+            var plan = cache.GetOrCompileInference(new[] { x, mod }, forward);
+            plan.SetInputs(new[] { x, mod });
+            var got1 = Snapshot(plan.Execute());
+            Assert.Equal(xBefore, x.AsSpan().ToArray());
+            Assert.Equal(modBefore, mod.AsSpan().ToArray());
+            plan.SetInputs(new[] { x, mod });
+            var got2 = Snapshot(plan.Execute());
+            for (int i = 0; i < got1.Length; i++)
+                Assert.True(Math.Abs(got1[i] - got2[i]) < 1e-5f,
+                    $"adaln-slice replay {i}: {got1[i]} vs {got2[i]} — non-deterministic compiled replay.");
+        }
+        finally { cache.Dispose(); }
+    }
+
+    [Fact]
+    public void Replay_MultiBlockMiniDiT_Deterministic()
+    {
+        // A deep mini-DiT: 4 stacked blocks of (AdaLN-by-input-2 -> self-attention -> residual ->
+        // AdaLN -> GELU MLP -> residual). Stresses the compiled plan's buffer pool the way the real
+        // multi-block DiT does, which the single-block repros do not. Reuse the SAME input instance.
+        var engine = new CpuEngine();
+        int seq = 4, embed = 8, heads = 2, headDim = embed / heads;
+        const int blocks = 4;
+        var x0 = Tensor<float>.CreateRandom(new[] { seq, embed });
+        var t = Tensor<float>.CreateRandom(new[] { 1, embed });            // modulation, consumed every block
+        var g = Tensor<float>.CreateRandom(new[] { embed });
+        var b = Tensor<float>.CreateRandom(new[] { embed });
+        var wq = new Tensor<float>[blocks]; var wk = new Tensor<float>[blocks];
+        var wv = new Tensor<float>[blocks]; var wm = new Tensor<float>[blocks];
+        for (int i = 0; i < blocks; i++)
+        {
+            wq[i] = Tensor<float>.CreateRandom(new[] { embed, embed });
+            wk[i] = Tensor<float>.CreateRandom(new[] { embed, embed });
+            wv[i] = Tensor<float>.CreateRandom(new[] { embed, embed });
+            wm[i] = Tensor<float>.CreateRandom(new[] { embed, embed });
+        }
+
+        Func<Tensor<float>> forward = () =>
+        {
+            var x = (Tensor<float>)x0;
+            for (int i = 0; i < blocks; i++)
+            {
+                var n1 = engine.TensorBroadcastMultiply(engine.TensorLayerNorm(x, g, b), t);
+                var q = engine.TensorPermute(engine.Reshape(engine.TensorMatMul(n1, wq[i]), new[] { 1, seq, heads, headDim }), new[] { 0, 2, 1, 3 });
+                var k = engine.TensorPermute(engine.Reshape(engine.TensorMatMul(n1, wk[i]), new[] { 1, seq, heads, headDim }), new[] { 0, 2, 1, 3 });
+                var v = engine.TensorPermute(engine.Reshape(engine.TensorMatMul(n1, wv[i]), new[] { 1, seq, heads, headDim }), new[] { 0, 2, 1, 3 });
+                var attn = engine.ScaledDotProductAttention(q, k, v, null, 1.0 / Math.Sqrt(headDim), out _);
+                var attnFlat = engine.Reshape(engine.TensorPermute(attn, new[] { 0, 2, 1, 3 }), new[] { seq, embed });
+                x = engine.TensorAdd(x, attnFlat);
+                var n2 = engine.TensorBroadcastMultiply(engine.TensorLayerNorm(x, g, b), t);
+                var mlp = engine.GELU(engine.TensorMatMul(n2, wm[i]));
+                x = engine.TensorAdd(x, mlp);
+            }
+            return x;
+        };
+
+        var xBefore = Snapshot(x0);
+        var cache = new CompiledModelCache<float>();
+        try
+        {
+            var plan = cache.GetOrCompileInference(new[] { x0, t }, forward);
+            plan.SetInputs(new[] { x0, t });
+            var got1 = Snapshot(plan.Execute());
+            Assert.Equal(xBefore, x0.AsSpan().ToArray());
+            plan.SetInputs(new[] { x0, t });
+            var got2 = Snapshot(plan.Execute());
+            for (int i = 0; i < got1.Length; i++)
+                Assert.True(Math.Abs(got1[i] - got2[i]) < 1e-5f,
+                    $"minidit replay {i}: {got1[i]} vs {got2[i]} — non-deterministic compiled replay.");
+        }
+        finally { cache.Dispose(); }
+    }
+
+    [Fact]
+    public void Replay_SelfAttentionLayerOps_Deterministic()
+    {
+        // Faithful mirror of SelfAttentionLayer.Forward's op sequence: QKV matmul -> reshape to heads
+        // -> permute -> 4D ScaledDotProductAttention (with the secondary `out attentionWeights`) ->
+        // permute back -> reshape -> add the second input. This is the exact path a DiT block walks,
+        // and the one the simpler repros lack. Reuse the SAME input instance across replays.
+        var engine = new CpuEngine();
+        int seq = 4, embed = 8, heads = 2, headDim = embed / heads;
+        var input2D = Tensor<float>.CreateRandom(new[] { seq, embed });
+        var t = Tensor<float>.CreateRandom(new[] { 1, seq, embed });
+        var wq = Tensor<float>.CreateRandom(new[] { embed, embed });
+        var wk = Tensor<float>.CreateRandom(new[] { embed, embed });
+        var wv = Tensor<float>.CreateRandom(new[] { embed, embed });
+
+        Func<Tensor<float>> forward = () =>
+        {
+            var q = engine.Reshape(engine.TensorMatMul(input2D, wq), new[] { 1, seq, heads, headDim });
+            var k = engine.Reshape(engine.TensorMatMul(input2D, wk), new[] { 1, seq, heads, headDim });
+            var v = engine.Reshape(engine.TensorMatMul(input2D, wv), new[] { 1, seq, heads, headDim });
+            var qh = engine.TensorPermute(q, new[] { 0, 2, 1, 3 });
+            var kh = engine.TensorPermute(k, new[] { 0, 2, 1, 3 });
+            var vh = engine.TensorPermute(v, new[] { 0, 2, 1, 3 });
+            var attn = engine.ScaledDotProductAttention(qh, kh, vh, null, 1.0 / Math.Sqrt(headDim), out _);
+            var back = engine.TensorPermute(attn, new[] { 0, 2, 1, 3 });
+            var flat = engine.Reshape(back, new[] { 1, seq, embed });
+            return engine.TensorBroadcastAdd(flat, t);
+        };
+
+        var inputBefore = Snapshot(input2D);
+        var cache = new CompiledModelCache<float>();
+        try
+        {
+            var plan = cache.GetOrCompileInference(new[] { input2D, t }, forward);
+            plan.SetInputs(new[] { input2D, t });
+            var got1 = Snapshot(plan.Execute());
+            Assert.Equal(inputBefore, input2D.AsSpan().ToArray());
+            plan.SetInputs(new[] { input2D, t });
+            var got2 = Snapshot(plan.Execute());
+            for (int i = 0; i < got1.Length; i++)
+                Assert.True(Math.Abs(got1[i] - got2[i]) < 1e-5f,
+                    $"selfattn replay {i}: {got1[i]} vs {got2[i]} — non-deterministic compiled replay.");
+        }
+        finally { cache.Dispose(); }
+    }
+
+    [Fact]
     public void Replay_AdaLNBlock_Deterministic()
     {
         // Faithful mini-DiT block: LayerNorm modulated by a broadcast scale/shift derived from the
