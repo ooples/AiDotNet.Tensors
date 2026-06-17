@@ -105,4 +105,84 @@ public sealed partial class CudaBackend
                 0 /* CUBLAS_GEMM_DEFAULT — let cuBLAS pick algorithm */),
             "cublasGemmEx(FP16 in / FP32 out)");
     }
+
+    /// <summary>
+    /// Fused FP16 matmul BACKWARD for the forward <c>C[M,N] = A[M,K] · B[K,N]</c>. Computes both gradients in
+    /// two Tensor-Core <c>cublasGemmEx</c> launches (FP16 inputs, FP32 accumulate + FP32 output) directly from
+    /// the FP16-resident activations — with NO materialized transpose and NO FP32 up-cast scratch:
+    /// <list type="bullet">
+    /// <item><c>gradA[M,K] = gradC[M,N] · Bᵀ</c></item>
+    /// <item><c>gradB[K,N] = Aᵀ · gradC[M,N]</c></item>
+    /// </list>
+    /// This replaces the eager backward's two <c>TensorTranspose</c> + two <c>TensorMatMul</c> dispatches (four
+    /// FP32 device allocations per matmul backward — the measured dominant cost of the FP16 hetero path, see
+    /// Fp16ActivationDominated_ReducesGpuPeakBytes) with two transpose-free Half GEMMs into caller-owned
+    /// (reused) output buffers. cuBLAS is column-major, so each gradient is derived via the same
+    /// memory-equivalence transposition as <see cref="MatMulTransposed"/>:
+    /// <para>gradA_col[K,M] = Bᵀ_col · gradC_col → (op=T on B, op=N on gradC; m=K,n=M,k=N; ldB=N,ldgradC=N,ldgradA=K).</para>
+    /// <para>gradB_col[N,K] = gradC_col · Aᵀ_col → (op=N on gradC, op=T on A; m=N,n=K,k=M; ldgradC=N,ldA=K,ldgradB=N).</para>
+    /// All buffers are device-resident; the caller owns allocation + stream (capture-safe: no alloc/free here).
+    /// </summary>
+    /// <param name="gradCHalf">FP16 upstream gradient, shape [M,N].</param>
+    /// <param name="aHalf">FP16 forward input A, shape [M,K].</param>
+    /// <param name="bHalf">FP16 forward input B, shape [K,N].</param>
+    /// <param name="gradAFp32">FP32 output buffer for gradA, shape [M,K] (caller-owned, reused).</param>
+    /// <param name="gradBFp32">FP32 output buffer for gradB, shape [K,N] (caller-owned, reused).</param>
+    public unsafe void MatMulBackwardFp16Fused(
+        IGpuBuffer gradCHalf, IGpuBuffer aHalf, IGpuBuffer bHalf,
+        IGpuBuffer gradAFp32, IGpuBuffer gradBFp32,
+        int M, int N, int K)
+    {
+        if (!SupportsHgemm)
+            throw new NotSupportedException("MatMulBackwardFp16Fused requires CUDA compute capability >= 5.0 (Maxwell+).");
+        if (gradCHalf is null) throw new ArgumentNullException(nameof(gradCHalf));
+        if (aHalf is null) throw new ArgumentNullException(nameof(aHalf));
+        if (bHalf is null) throw new ArgumentNullException(nameof(bHalf));
+        if (gradAFp32 is null) throw new ArgumentNullException(nameof(gradAFp32));
+        if (gradBFp32 is null) throw new ArgumentNullException(nameof(gradBFp32));
+        if (M <= 0) throw new ArgumentOutOfRangeException(nameof(M), "Dimensions must be positive.");
+        if (N <= 0) throw new ArgumentOutOfRangeException(nameof(N), "Dimensions must be positive.");
+        if (K <= 0) throw new ArgumentOutOfRangeException(nameof(K), "Dimensions must be positive.");
+        // Byte-aware buffer-size guards (half = 2 bytes, fp32 = 4) — the element-count view would misread.
+        if (gradCHalf.SizeInBytes < (long)M * N * 2) throw new ArgumentException($"gradC half buffer too small: {gradCHalf.SizeInBytes} < {(long)M * N * 2}.");
+        if (aHalf.SizeInBytes < (long)M * K * 2) throw new ArgumentException($"A half buffer too small: {aHalf.SizeInBytes} < {(long)M * K * 2}.");
+        if (bHalf.SizeInBytes < (long)K * N * 2) throw new ArgumentException($"B half buffer too small: {bHalf.SizeInBytes} < {(long)K * N * 2}.");
+        if (gradAFp32.SizeInBytes < (long)M * K * sizeof(float)) throw new ArgumentException($"gradA buffer too small: {gradAFp32.SizeInBytes} < {(long)M * K * sizeof(float)}.");
+        if (gradBFp32.SizeInBytes < (long)K * N * sizeof(float)) throw new ArgumentException($"gradB buffer too small: {gradBFp32.SizeInBytes} < {(long)K * N * sizeof(float)}.");
+
+        using var _ = PushContext();
+        float alphaF = 1.0f, betaF = 0.0f;
+        IntPtr alphaPtr = (IntPtr)(&alphaF);
+        IntPtr betaPtr = (IntPtr)(&betaF);
+
+        // gradA[M,K] = gradC · Bᵀ  →  col-major gradA[K,M] = Bᵀ_col · gradC_col.
+        var sA = CuBlasNative.cublasGemmEx(
+            _cublasHandle,
+            CublasOperation.Transpose, CublasOperation.None,
+            K, M, N,
+            alphaPtr,
+            bHalf.Handle, CuBlasNative.CUDA_R_16F, N,
+            gradCHalf.Handle, CuBlasNative.CUDA_R_16F, N,
+            betaPtr,
+            gradAFp32.Handle, CuBlasNative.CUDA_R_32F, K,
+            CuBlasNative.CUBLAS_COMPUTE_32F, 0);
+        if (sA == AiDotNet.Tensors.Engines.CublasStatus.NotSupported)
+            throw new NotSupportedException($"FP16 Tensor-Core GEMM not supported on this device (cc {_ccMajor}.{_ccMinor}).");
+        CuBlasNative.CheckCublasStatus(sA, "cublasGemmEx(MatMulBackwardFp16Fused gradA)");
+
+        // gradB[K,N] = Aᵀ · gradC  →  col-major gradB[N,K] = gradC_col · Aᵀ_col.
+        var sB = CuBlasNative.cublasGemmEx(
+            _cublasHandle,
+            CublasOperation.None, CublasOperation.Transpose,
+            N, K, M,
+            alphaPtr,
+            gradCHalf.Handle, CuBlasNative.CUDA_R_16F, N,
+            aHalf.Handle, CuBlasNative.CUDA_R_16F, K,
+            betaPtr,
+            gradBFp32.Handle, CuBlasNative.CUDA_R_32F, N,
+            CuBlasNative.CUBLAS_COMPUTE_32F, 0);
+        if (sB == AiDotNet.Tensors.Engines.CublasStatus.NotSupported)
+            throw new NotSupportedException($"FP16 Tensor-Core GEMM not supported on this device (cc {_ccMajor}.{_ccMinor}).");
+        CuBlasNative.CheckCublasStatus(sB, "cublasGemmEx(MatMulBackwardFp16Fused gradB)");
+    }
 }
