@@ -408,13 +408,7 @@ public class MultiInputReplayAliasingTests : IDisposable
         finally { cache.Dispose(); }
     }
 
-    [Fact(Skip = "KNOWN BUG (tracked): the compiled-inference step-mutating passes (OperatorReorderingPass " +
-        "+ MemoryPlanningPass, run for plans with >=4 steps) miscompute the fan-out attention topology — " +
-        "ONE shared input feeding q/k/v via matmul->reshape->permute, joined at SDPA — producing a " +
-        "DETERMINISTIC but WRONG result vs eager. Bypassing BOTH passes makes this + the whole compile " +
-        "suite pass (541/541), but MemoryPlanningPass is the SD-UNet peak-memory reducer (2GB->300MB), so " +
-        "the real fix is to make both passes' liveness view-aliasing-aware, not to disable them. Minimal " +
-        "repro: shared-input QKV->SDPA fails; single branch and separate-input QKV->SDPA both pass.")]
+    [Fact]
     public void Parity_SharedInput_QKV_Reshape_Permute_SDPA()
     {
         // Front half of the attention chain: ONE shared input -> 3x (matmul -> reshape -> permute) -> SDPA.
@@ -584,12 +578,13 @@ public class MultiInputReplayAliasingTests : IDisposable
             Assert.Equal(inputBefore, input2D.AsSpan().ToArray());
             plan.SetInputs(new[] { input2D, t });
             var got2 = Snapshot(plan.Execute());
+            var eager = Snapshot(forward());
             for (int i = 0; i < got1.Length; i++)
                 Assert.True(Math.Abs(got1[i] - got2[i]) < 1e-5f,
                     $"selfattn replay {i}: {got1[i]} vs {got2[i]} — non-deterministic compiled replay.");
-            // NOTE: an eager-PARITY assertion here FAILS on the original compiler — the step-mutating
-            // passes miscompute this fan-out attention chain (see the skipped
-            // Parity_SharedInput_QKV_Reshape_Permute_SDPA for the minimal repro + root cause).
+            for (int i = 0; i < got1.Length; i++)
+                Assert.True(Math.Abs(got1[i] - eager[i]) < 1e-4f,
+                    $"selfattn PARITY {i}: compiled {got1[i]} vs eager {eager[i]} — wrong compiled output.");
         }
         finally { cache.Dispose(); }
     }

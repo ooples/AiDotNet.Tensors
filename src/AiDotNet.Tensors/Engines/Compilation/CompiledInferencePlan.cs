@@ -1301,6 +1301,26 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     private static List<CompiledStep<T>> RunStepMutatingPasses(List<CompiledStep<T>> steps, IEngine engine)
     {
         if (steps.Count < 4) return steps;
+
+        // CORRECTNESS GATE (#1624): the step-mutating passes (OperatorReorderingPass + MemoryPlanningPass)
+        // produce a DETERMINISTIC-but-WRONG result for the attention fan-out topology — one shared input
+        // feeding q/k/v through matmul->reshape->permute, joined at scaled-dot-product attention (which
+        // GraphMode decomposes to permute/matmul/Softmax/matmul). The compiled output silently diverges
+        // from eager (masked for years because attention compile tests check shape/finiteness/determinism,
+        // never eager parity — see MultiInputReplayAliasingTests). Bisected: each pass corrupts it
+        // independently; bypassing BOTH makes the whole compile suite pass and matches eager. The root
+        // cause is subtle (a topologically-valid reorder still corrupts, so it is not a broken dependency)
+        // and the proper fix is deeper; until then, skip these passes whenever the plan contains a Softmax
+        // (the reliable signature of an attention block) so transformer/diffusion inference is CORRECT.
+        // Non-attention plans (CNN/MLP) keep the passes unchanged. Trade-off: attention inference plans lose
+        // peak-memory reduction — acceptable vs. silently-wrong attention, and revisited when the passes are
+        // made fan-out-correct.
+        for (int s = 0; s < steps.Count; s++)
+        {
+            if (steps[s].OpType == OpType.Softmax || steps[s].OpType == OpType.LogSoftmax)
+                return steps;
+        }
+
         var arr = steps.ToArray();
         AiDotNet.Tensors.Engines.Optimization.ICpuOptimizationPass[] passes =
         {
