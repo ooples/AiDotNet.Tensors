@@ -69,6 +69,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     // reaches ~71% GPU util at the default batch (vs ~12% launch-bound without capture).
     private static readonly bool s_graphStepEnabled =
         System.Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_STEP") != "0";
+    // Graph capture is default-on (s_graphStepEnabled), but the hardcoded-path
+    // %TEMP%/aidotnet_graphstep_diag.txt writes must NOT run for ordinary
+    // production compiles. Gate those behind a separate explicit opt-in so a
+    // default compile never touches the filesystem for diagnostics.
+    private static readonly bool s_graphStepDiagnosticsEnabled =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPHSTEP_DIAG") == "1";
     private IntPtr _stepGraphExec;
     private long _graphStepCalls;
     private bool _graphStepDisabled;
@@ -764,6 +770,13 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         long fwdStart = stepTiming ? Stopwatch.GetTimestamp() : 0;
         if (_fp16HeteroOrder is not null)
         {
+            // Gradient checkpointing replays the float-only forward; the FP16 hetero
+            // path replays a different (mixed-dtype) graph, so the two cannot compose
+            // until heterogeneous checkpoint replay exists. Fail loudly rather than
+            // silently dropping checkpointing for FP16 hetero plans.
+            if (_checkpointing is not null)
+                throw new NotSupportedException(
+                    "Gradient checkpointing is not currently supported for FP16 heterogeneous compiled training plans.");
             // FP16-IN-CAPTURE: replay the mixed-dtype graph (Half activation nodes + cast bridges) — the
             // float-only forward steps dropped the Half nodes. Produces device-resident Half activations.
             RunFp16HeteroForward(engine);
@@ -2255,8 +2268,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             {
                 var srcSpan = g.AsSpan();
                 var dstSpan = ((Tensor<float>)(object)_gradients[p]).AsWritableSpan();
-                int n = Math.Min(srcSpan.Length, dstSpan.Length);
-                srcSpan.Slice(0, n).CopyTo(dstSpan.Slice(0, n));
+                // A length mismatch means the FP16 backward produced a gradient that
+                // does not match the parameter's gradient buffer — silently truncating
+                // (Math.Min) would feed the optimizer a partial update. Fail fast.
+                if (srcSpan.Length != dstSpan.Length)
+                    throw new InvalidOperationException(
+                        $"FP16 backward produced gradient length {srcSpan.Length} for parameter {p}, " +
+                        $"but the compiled parameter gradient buffer length is {dstSpan.Length}.");
+                srcSpan.CopyTo(dstSpan);
             }
         }
     }
@@ -2321,8 +2340,25 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // Half activation buffers. Null when no such nodes exist → the normal float path is byte-identical.
         ILazyNode[]? fp16HeteroOrder = null;
         {
+            // Detect the ACTUAL FP16 storage nodes (LazyNode<Half> + the Half cast
+            // bridges), not merely "anything that isn't LazyNode<T>". The FP16-hetero
+            // replay path is float-plan-specific, so only a float plan carrying one of
+            // the known Half node types should route through it — a future non-FP16
+            // heterogeneous graph must not be misrouted here.
             bool hasFp16Nodes = false;
-            foreach (var n in optimized) { if (n is not LazyNode<T>) { hasFp16Nodes = true; break; } }
+            if (typeof(T) == typeof(float))
+            {
+                foreach (var n in optimized)
+                {
+                    if (n is LazyNode<Half>
+                        || n is CrossTypeLazyNode<float, Half>
+                        || n is CrossTypeLazyNode<Half, float>)
+                    {
+                        hasFp16Nodes = true;
+                        break;
+                    }
+                }
+            }
             if (hasFp16Nodes) fp16HeteroOrder = System.Linq.Enumerable.ToArray(optimized);
         }
 
@@ -2373,7 +2409,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // type + SupportsGpu + the resulting preferGenericForGpu at compile time. When a GPU plan is
         // unexpectedly graph-ineligible this immediately distinguishes "engine isn't GPU / SupportsGpu
         // false" from "ops aren't GPU-pure", which is otherwise invisible.
-        if (s_graphStepEnabled && typeof(T) == typeof(float))
+        if (s_graphStepDiagnosticsEnabled && typeof(T) == typeof(float))
         {
             try
             {
@@ -2698,8 +2734,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // DIAGNOSTIC (AIDOTNET_CUDA_GRAPH_STEP=1 + ineligible): record WHY the plan can't be CUDA-graph
         // captured — the specialized/fused (host-only) actions listed here are exactly the port-to-GPU-pure
         // targets. Written to %TEMP%/aidotnet_graphstep_diag.txt (survives xunit's console redirection) and
-        // Trace. Gated on the flag so it costs nothing in normal runs.
-        if (s_graphStepEnabled && !graphStepEligible && typeof(T) == typeof(float))
+        // Trace. Gated on the diagnostics opt-in so it costs nothing in normal runs.
+        if (s_graphStepDiagnosticsEnabled && !graphStepEligible && typeof(T) == typeof(float))
         {
             try
             {
@@ -4387,6 +4423,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// </summary>
     private static bool TryClipGradientsGlobalL2Gpu(Tensor<T>[] gradients, double maxNorm)
     {
+        // The CUDA reduction/scale path is float-typed. For a Tensor<double> (or any
+        // non-float T) it would reinterpret the buffer as float and corrupt the
+        // gradient bytes, so refuse and let the caller fall back to the generic clip.
+        if (typeof(T) != typeof(float)) return false;
         if (gradients.Length == 0) return true;
         Engines.DirectGpu.CUDA.CudaBackend? cb = null;
         // All gradients must be CUDA-resident for a correct global norm.
