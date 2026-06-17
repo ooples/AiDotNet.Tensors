@@ -61,13 +61,25 @@ internal static class BackwardGradientBufferPlanner
         public long NaiveBytes { get; }
         /// <summary>Pooled bytes: distinct physical buffers only.</summary>
         public long PooledBytes { get; }
+        /// <summary>
+        /// Re-zero schedule, indexed by backward POSITION (0 = the backward step of
+        /// the LAST forward step). <c>ReZeroAtPosition[k]</c> lists the physical
+        /// buffer indices that must be cleared to zero BEFORE the backward action at
+        /// position k runs, because a buffer is being handed from a previous tenant
+        /// to a NEW (non-first) tenant whose gradient accumulation begins at k. The
+        /// first tenant of every buffer is covered by the step-start clear, so it is
+        /// NOT listed here. Null entries mean "nothing to re-zero at this position".
+        /// </summary>
+        public int[][] ReZeroAtPosition { get; }
 
-        public PlanResult(int[] bufferOfTensor, int[] bufferElemCount, long naiveBytes, long pooledBytes)
+        public PlanResult(int[] bufferOfTensor, int[] bufferElemCount, long naiveBytes,
+            long pooledBytes, int[][] reZeroAtPosition)
         {
             BufferOfTensor = bufferOfTensor;
             BufferElemCount = bufferElemCount;
             NaiveBytes = naiveBytes;
             PooledBytes = pooledBytes;
+            ReZeroAtPosition = reZeroAtPosition;
         }
     }
 
@@ -158,6 +170,8 @@ internal static class BackwardGradientBufferPlanner
         var freeByShape = new System.Collections.Generic.Dictionary<long, System.Collections.Generic.Stack<int>>();
         // Active intervals, ordered by end position, so we can expire cheaply.
         var active = new System.Collections.Generic.List<(int end, int tensorId, int bufferId)>();
+        // Re-zero schedule, indexed by backward position.
+        var reZero = new System.Collections.Generic.List<int>[n];
 
         foreach (int t in poolable)
         {
@@ -181,7 +195,12 @@ internal static class BackwardGradientBufferPlanner
             int buf;
             if (freeByShape.TryGetValue(shapeKey, out var avail) && avail.Count > 0)
             {
+                // Reusing a buffer => t is a NON-first tenant. Its accumulation
+                // starts at `start`, and the buffer still holds the previous
+                // tenant's gradient, so it MUST be cleared before position `start`.
                 buf = avail.Pop();
+                if (start >= 0 && start < n)
+                    (reZero[start] ??= new System.Collections.Generic.List<int>()).Add(buf);
             }
             else
             {
@@ -208,6 +227,10 @@ internal static class BackwardGradientBufferPlanner
         for (int i = 0; i < bufferElem.Count; i++)
             pooledBytes += (long)bufferElem[i] * elementBytes;
 
-        return new PlanResult(bufferOfTensor, bufferElem.ToArray(), naiveBytes, pooledBytes);
+        var reZeroArr = new int[n][];
+        for (int k = 0; k < n; k++)
+            reZeroArr[k] = reZero[k] != null ? reZero[k].ToArray() : System.Array.Empty<int>();
+
+        return new PlanResult(bufferOfTensor, bufferElem.ToArray(), naiveBytes, pooledBytes, reZeroArr);
     }
 }
