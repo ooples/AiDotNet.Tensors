@@ -11762,6 +11762,63 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         LaunchKernelWithSharedMem(kernel, (uint)rows, block, block * sizeof(float), args);
     }
 
+    /// <summary>FP16-native GELU backward: gradIn = gradOut * gelu'(x). All FP16 buffers; FP32 math in-register.
+    /// Mirrors the FP32 gelu_backward formula so the Half backward is parity-equivalent.</summary>
+    public unsafe void Fp16GeluBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int size)
+    {
+        if (gradOutput is null) throw new ArgumentNullException(nameof(gradOutput));
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (gradInput is null) throw new ArgumentNullException(nameof(gradInput));
+        if (size <= 0) throw new ArgumentOutOfRangeException(nameof(size), "Element count must be positive.");
+        if (!_kernelCache.TryGetValue("fp16_gelu_backward_native", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: fp16_gelu_backward_native");
+        using var _ = PushContext();
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr gPtr = gradOutput.Handle, iPtr = input.Handle, oPtr = gradInput.Handle;
+        void** args = stackalloc void*[4];
+        args[0] = &gPtr; args[1] = &iPtr; args[2] = &oPtr; args[3] = &size;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    /// <summary>FP16-native ReLU backward: gradIn = (x>0)?gradOut:0. All FP16 buffers. Mirrors relu_backward.</summary>
+    public unsafe void Fp16ReluBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int size)
+    {
+        if (gradOutput is null) throw new ArgumentNullException(nameof(gradOutput));
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (gradInput is null) throw new ArgumentNullException(nameof(gradInput));
+        if (size <= 0) throw new ArgumentOutOfRangeException(nameof(size), "Element count must be positive.");
+        if (!_kernelCache.TryGetValue("fp16_relu_backward_native", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: fp16_relu_backward_native");
+        using var _ = PushContext();
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr gPtr = gradOutput.Handle, iPtr = input.Handle, oPtr = gradInput.Handle;
+        void** args = stackalloc void*[4];
+        args[0] = &gPtr; args[1] = &iPtr; args[2] = &oPtr; args[3] = &size;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    /// <summary>FP16-native softmax backward: gradIn = y*(gradOut - sum_f gradOut*y), ONE THREAD PER ROW (mirrors
+    /// softmax_backward). gradOutput/output/gradInput are FP16 [batchSize, features] buffers; reductions in FP32.</summary>
+    public unsafe void Fp16SoftmaxBackward(IGpuBuffer gradOutput, IGpuBuffer output, IGpuBuffer gradInput, int batchSize, int features)
+    {
+        if (gradOutput is null) throw new ArgumentNullException(nameof(gradOutput));
+        if (output is null) throw new ArgumentNullException(nameof(output));
+        if (gradInput is null) throw new ArgumentNullException(nameof(gradInput));
+        if (batchSize <= 0 || features <= 0) throw new ArgumentException($"batchSize/features must be positive (batchSize={batchSize}, features={features}).");
+        long halfBytes = (long)batchSize * features * 2;
+        if (gradOutput.SizeInBytes < halfBytes) throw new ArgumentException($"gradOutput half buffer too small: {gradOutput.SizeInBytes} < {halfBytes}.");
+        if (output.SizeInBytes < halfBytes) throw new ArgumentException($"output half buffer too small: {output.SizeInBytes} < {halfBytes}.");
+        if (gradInput.SizeInBytes < halfBytes) throw new ArgumentException($"gradInput half buffer too small: {gradInput.SizeInBytes} < {halfBytes}.");
+        if (!_kernelCache.TryGetValue("fp16_softmax_backward_native", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: fp16_softmax_backward_native");
+        using var _ = PushContext();
+        uint grid = (uint)((batchSize + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr gPtr = gradOutput.Handle, oPtr = output.Handle, giPtr = gradInput.Handle;
+        void** args = stackalloc void*[5];
+        args[0] = &gPtr; args[1] = &oPtr; args[2] = &giPtr; args[3] = &batchSize; args[4] = &features;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
     /// <summary>FP32→FP16 via the self-contained native kernel (no cuda_fp16.h). Output is a half buffer.</summary>
     public unsafe void ConvertToFp16Native(IGpuBuffer input, IGpuBuffer output, int size)
         => LaunchConvertFp16("convert_fp32_to_fp16_native", input, output, size);

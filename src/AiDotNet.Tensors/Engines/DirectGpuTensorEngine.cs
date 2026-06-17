@@ -9307,6 +9307,31 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 int features = output.Shape._dims[rank - 1];
                 int outerSize = output.Length / features;
 
+                // FP16 Half-native backward: read IsFp16 grad + softmax output directly, FP16-native softmax
+                // backward (Half grad out), store Half. Parity-equivalent to softmax_backward (same math).
+                if (typeof(T) == typeof(Half) && s_fp16FwdStore
+                    && backend is DirectGpu.CUDA.CudaBackend cbS && cbS.SupportsFp16NativeOps)
+                {
+                    IGpuBuffer? hgOwned = null, hoOwned = null, hOut = null;
+                    bool ok = false;
+                    try
+                    {
+                        var hg = ResolveToFp16(gradOutput, output.Length, cbS, backend, out hgOwned);
+                        var ho = ResolveToFp16(output, output.Length, cbS, backend, out hoOwned);
+                        hOut = cbS.AllocateByteBuffer(output.Length * 2);
+                        cbS.Fp16SoftmaxBackward(hg, ho, hOut, outerSize, features);
+                        var resultH = FinishGpuOpHalfStore(cbS, hOut, output.Length, output.Shape.ToArray());
+                        hOut = null;
+                        ok = true;
+                        return (Tensor<T>)(object)new Tensor<Half>(resultH, output.Shape.ToArray());
+                    }
+                    catch (Exception ex)
+                    {
+                        System.Diagnostics.Debug.WriteLine($"[FP16 bwd Softmax] fallback: {ex.GetType().Name}: {ex.Message}");
+                    }
+                    finally { hgOwned?.Dispose(); hoOwned?.Dispose(); if (!ok) hOut?.Dispose(); }
+                }
+
                 using var gradOutBuffer = GetOrAllocateBuffer(backend, gradOutput);
                 using var outputBuffer = GetOrAllocateBuffer(backend, output);
                 using var gradInputBuffer = AllocateOutputBuffer(backend, output.Length);
@@ -14343,6 +14368,30 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             if (TryGetBackend(out var backend))
             {
+                // FP16 Half-native backward: read IsFp16 grad + input directly, FP16-native ReLU backward
+                // (Half grad out), store Half. Parity-equivalent to relu_backward.
+                if (typeof(T) == typeof(Half) && s_fp16FwdStore
+                    && backend is DirectGpu.CUDA.CudaBackend cbR && cbR.SupportsFp16NativeOps)
+                {
+                    IGpuBuffer? hgOwned = null, hiOwned = null, hOut = null;
+                    bool ok = false;
+                    try
+                    {
+                        var hg = ResolveToFp16(gradOutput, gradOutput.Length, cbR, backend, out hgOwned);
+                        var hi = ResolveToFp16(input, input.Length, cbR, backend, out hiOwned);
+                        hOut = cbR.AllocateByteBuffer(gradOutput.Length * 2);
+                        cbR.Fp16ReluBackward(hg, hi, hOut, gradOutput.Length);
+                        var resultH = FinishGpuOpHalfStore(cbR, hOut, gradOutput.Length, gradOutput.Shape._dims);
+                        hOut = null;
+                        ok = true;
+                        return (Tensor<T>)(object)new Tensor<Half>(resultH, gradOutput.Shape._dims);
+                    }
+                    catch (Exception ex)
+                    {
+                        System.Diagnostics.Debug.WriteLine($"[FP16 bwd ReLU] fallback: {ex.GetType().Name}: {ex.Message}");
+                    }
+                    finally { hgOwned?.Dispose(); hiOwned?.Dispose(); if (!ok) hOut?.Dispose(); }
+                }
                 var gArr = DirectGpuEngine.ToFloatArray(gradOutput.GetFlattenedData());
                 var iArr = DirectGpuEngine.ToFloatArray(input.GetFlattenedData());
                 int size = gArr.Length;
@@ -14422,6 +14471,31 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             if (TryGetBackend(out var backend))
             {
+                // FP16 Half-native backward: read the IsFp16 grad + input directly, FP16-native GELU backward
+                // (Half grad out), store Half — keeps the backward signal Half (no up-cast). Parity-equivalent
+                // to the FP32 gelu_backward kernel (same formula).
+                if (typeof(T) == typeof(Half) && s_fp16FwdStore
+                    && backend is DirectGpu.CUDA.CudaBackend cbG && cbG.SupportsFp16NativeOps)
+                {
+                    IGpuBuffer? hgOwned = null, hiOwned = null, hOut = null;
+                    bool ok = false;
+                    try
+                    {
+                        var hg = ResolveToFp16(gradOutput, gradOutput.Length, cbG, backend, out hgOwned);
+                        var hi = ResolveToFp16(input, input.Length, cbG, backend, out hiOwned);
+                        hOut = cbG.AllocateByteBuffer(gradOutput.Length * 2);
+                        cbG.Fp16GeluBackward(hg, hi, hOut, gradOutput.Length);
+                        var resultH = FinishGpuOpHalfStore(cbG, hOut, gradOutput.Length, gradOutput.Shape._dims);
+                        hOut = null;
+                        ok = true;
+                        return (Tensor<T>)(object)new Tensor<Half>(resultH, gradOutput.Shape._dims);
+                    }
+                    catch (Exception ex)
+                    {
+                        System.Diagnostics.Debug.WriteLine($"[FP16 bwd GELU] fallback: {ex.GetType().Name}: {ex.Message}");
+                    }
+                    finally { hgOwned?.Dispose(); hiOwned?.Dispose(); if (!ok) hOut?.Dispose(); }
+                }
                 using var gBuf = GetOrAllocateBuffer(backend, gradOutput);
                 using var iBuf = GetOrAllocateBuffer(backend, input);
                 var oBuf = AllocateOutputBuffer(backend, gradOutput.Length);
