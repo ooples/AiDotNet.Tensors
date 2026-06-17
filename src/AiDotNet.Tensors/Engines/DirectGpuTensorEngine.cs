@@ -1983,7 +1983,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// GPU consumers re-resolve through <c>GetOrAllocateBuffer</c>, which up-casts the IsFp16 entry on demand
     /// (TryUpcastActivationFp32ByKey). Mirrors <see cref="FinishGpuOp{T}"/>'s deferral/cache contract for Half.
     /// </summary>
-    private Half[] FinishGpuOpHalfStore(DirectGpu.CUDA.CudaBackend backend, IGpuBuffer halfBuffer, int elementCount, int[] shape)
+    // Backend-agnostic: ConvertToFp32 + DownloadBuffer + AllocateOutputBuffer are all on IDirectGpuBackend
+    // (CUDA's ConvertToFp32 falls through to the driver-only-safe native kernel), so the half-resident-store
+    // finish works on ANY GPU backend, not just CUDA.
+    private Half[] FinishGpuOpHalfStore(IDirectGpuBackend backend, IGpuBuffer halfBuffer, int elementCount, int[] shape)
     {
 #if !NETFRAMEWORK
         var result = GC.AllocateUninitializedArray<Half>(elementCount);
@@ -1996,7 +1999,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         Helpers.DeferredArrayMaterializer.Register(result, arr =>
         {
             using var tmp = AllocateOutputBuffer(capturedBackend, n); // FP32 transient
-            capturedBackend.ConvertToFp32Native(capturedBuffer, tmp.Buffer, n);
+            capturedBackend.ConvertToFp32(capturedBuffer, tmp.Buffer, n);
             float[] floatData = capturedBackend.DownloadBuffer(tmp.Buffer);
             var dst = (Half[])arr;
             // Both lengths are derived from n (elementCount); a mismatch is an upstream
@@ -2036,14 +2039,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// key to avoiding the float↔Half re-inflate/re-convert churn each layer); otherwise convert its FP32
     /// buffer into a fresh Half buffer that the caller owns (<paramref name="owned"/>) and disposes.
     /// </summary>
-    private IGpuBuffer ResolveToFp16<T>(Tensor<T> t, int elems, DirectGpu.CUDA.CudaBackend cb, IDirectGpuBackend backend, out IGpuBuffer? owned)
+    // Backend-agnostic: AllocateByteBuffer + ConvertToFp16 are both on IDirectGpuBackend, and every
+    // backend's ConvertToFp16 falls through to its self-contained (driver-only-safe) conversion, so this
+    // resolves a tensor to a half buffer on ANY GPU backend — not just CUDA.
+    private IGpuBuffer ResolveToFp16<T>(Tensor<T> t, int elems, IDirectGpuBackend backend, out IGpuBuffer? owned)
     {
         owned = null;
         if (TryGetResidentFp16Buffer(t, backend, out var resident) && resident is not null)
             return resident;
         using var f = GetOrAllocateBuffer(backend, t);
-        owned = cb.AllocateByteBuffer(elems * 2);
-        cb.ConvertToFp16Native(f.Buffer, owned, elems);
+        owned = backend.AllocateByteBuffer(elems * 2);
+        backend.ConvertToFp16(f.Buffer, owned, elems);
         return owned;
     }
 
@@ -15009,11 +15015,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 bool storeOk = false;
                 try
                 {
-                    var hAi = ResolveToFp16(a, M * K, cbFwd, backend, out hAiOwned);
-                    var hBi = ResolveToFp16(b, K * N, cbFwd, backend, out hBiOwned);
+                    var hAi = ResolveToFp16(a, M * K, backend, out hAiOwned);
+                    var hBi = ResolveToFp16(b, K * N, backend, out hBiOwned);
                     hOut = cbFwd.AllocateByteBuffer(M * N * 2);
                     cbFwd.GemmFp16HalfOut(hAi, hBi, hOut, M, N, K);
-                    var resultH = FinishGpuOpHalfStore(cbFwd, hOut, M * N, new[] { M, N }); // takes ownership of hOut
+                    var resultH = FinishGpuOpHalfStore(backend, hOut, M * N, new[] { M, N }); // takes ownership of hOut
                     hOut = null;
                     var outputH = (Tensor<T>)(object)new Tensor<Half>(resultH, new[] { M, N });
                     Autodiff.DifferentiableOps.RecordBinary("TensorMatMul", outputH, a, b, Autodiff.BackwardFunctions<T>.MatMulBackward);
@@ -15451,27 +15457,25 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
             // FP16 Half-resident store (keystone-enabled): read IsFp16 input/gamma/beta directly, FP16-native
             // layernorm (Half output + FP32 mean/var), store Half output — keeps the per-layer norm Half.
-            // The fp16_layernorm_native KERNEL now ships on all six backends (IGpuHalfPrecisionBackend); this
-            // half-RESIDENT-STORE fast path is still gated to CUDA because the surrounding store plumbing
-            // (ResolveToFp16 / FinishGpuOpHalfStore / ConvertToFp32Native) is CUDA-typed. Generalizing that
-            // plumbing to the other backends is tracked as a follow-up (Tensors #633 GPU half-store); other
-            // backends correctly use the FP32 LayerNorm path below (no half-resident memory win, but correct).
+            // Runs on ANY backend that ships the FP16-native kernels (IGpuHalfPrecisionBackend.SupportsFp16NativeOps):
+            // the store plumbing (ResolveToFp16 / FinishGpuOpHalfStore) is now backend-agnostic, so the
+            // half-resident memory win is no longer CUDA-only. Backends without the kernels use the FP32 path below.
             if (typeof(T) == typeof(Half) && s_fp16FwdStore
-                && backend is DirectGpu.CUDA.CudaBackend cbL && cbL.SupportsFp16NativeOps)
+                && backend is IGpuHalfPrecisionBackend hpL && hpL.SupportsFp16NativeOps)
             {
                 IGpuBuffer? hInOwned = null, hGOwned = null, hBOwned = null, hOut = null;
                 var mBuf = default(OwnedBuffer); var vBuf = default(OwnedBuffer);
                 bool meanVarTransferred = false;
                 try
                 {
-                    var hIn = ResolveToFp16(input, input.Length, cbL, backend, out hInOwned);
-                    var hG = ResolveToFp16(gamma, normSize, cbL, backend, out hGOwned);
-                    var hB = ResolveToFp16(beta, normSize, cbL, backend, out hBOwned);
-                    hOut = cbL.AllocateByteBuffer(input.Length * 2);
+                    var hIn = ResolveToFp16(input, input.Length, backend, out hInOwned);
+                    var hG = ResolveToFp16(gamma, normSize, backend, out hGOwned);
+                    var hB = ResolveToFp16(beta, normSize, backend, out hBOwned);
+                    hOut = backend.AllocateByteBuffer(input.Length * 2);
                     mBuf = AllocateOutputBuffer(backend, outerSize);
                     vBuf = AllocateOutputBuffer(backend, outerSize);
-                    cbL.Fp16LayerNorm(hIn, hG, hB, hOut, mBuf.Buffer, vBuf.Buffer, outerSize, normSize, (float)epsilon);
-                    var resultH = FinishGpuOpHalfStore(cbL, hOut, input.Length, input.Shape._dims);
+                    hpL.Fp16LayerNorm(hIn, hG, hB, hOut, mBuf.Buffer, vBuf.Buffer, outerSize, normSize, (float)epsilon);
+                    var resultH = FinishGpuOpHalfStore(backend, hOut, input.Length, input.Shape._dims);
                     hOut = null;
                     mean = (Tensor<T>)(object)new Tensor<Half>(FinishGpuOp<Half>(backend, mBuf, outerSize), new[] { outerSize });
                     variance = (Tensor<T>)(object)new Tensor<Half>(FinishGpuOp<Half>(backend, vBuf, outerSize), new[] { outerSize });
@@ -15777,20 +15781,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
             // FP16 Half-resident store: read IsFp16 input directly, FP16-native softmax, store Half output — so
             // the attention softmax activations stay Half (works now that the IsFp16 re-inflate is transient).
-            // As with LayerNorm above, the fp16_softmax_native KERNEL now ships on all six backends; this
-            // half-resident-store fast path stays CUDA-gated only because ResolveToFp16/FinishGpuOpHalfStore
-            // are CUDA-typed (tracked follow-up). Non-CUDA backends use the correct FP32 softmax path below.
+            // Runs on ANY backend with the FP16-native kernels (IGpuHalfPrecisionBackend.SupportsFp16NativeOps);
+            // the store plumbing (ResolveToFp16/FinishGpuOpHalfStore) is backend-agnostic, so this is no longer
+            // CUDA-only. Backends without the kernels use the correct FP32 softmax path below.
             if (typeof(T) == typeof(Half) && s_fp16FwdStore
-                && backend is DirectGpu.CUDA.CudaBackend cbS && cbS.SupportsFp16NativeOps)
+                && backend is IGpuHalfPrecisionBackend hpS && hpS.SupportsFp16NativeOps)
             {
                 IGpuBuffer? hInOwned = null, hOut = null;
                 bool okS = false;
                 try
                 {
-                    var hIn = ResolveToFp16(input, input.Length, cbS, backend, out hInOwned);
-                    hOut = cbS.AllocateByteBuffer(input.Length * 2);
-                    cbS.Fp16Softmax(hIn, hOut, outerSize, features);
-                    var resultH = FinishGpuOpHalfStore(cbS, hOut, input.Length, input.Shape._dims);
+                    var hIn = ResolveToFp16(input, input.Length, backend, out hInOwned);
+                    hOut = backend.AllocateByteBuffer(input.Length * 2);
+                    hpS.Fp16Softmax(hIn, hOut, outerSize, features);
+                    var resultH = FinishGpuOpHalfStore(backend, hOut, input.Length, input.Shape._dims);
                     hOut = null;
                     var outputH = (Tensor<T>)(object)new Tensor<Half>(resultH, input.Shape._dims);
                     Autodiff.DifferentiableOps.RecordUnary("Softmax", outputH, input,
