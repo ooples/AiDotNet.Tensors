@@ -41,6 +41,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     // topological order to produce the Half activation buffers (the device-resident, capture-pure VRAM win).
     // Null ⇒ no FP16 activation nodes ⇒ the normal float-only path is used (zero behavior change).
     private readonly ILazyNode[]? _fp16HeteroOrder;
+
+    // FP16-IN-CAPTURE: the paged mixed-precision plan built once from _fp16HeteroOrder. Its forward/backward
+    // carry the TESTED activation-paging lifecycle (PageOut/PageIn) that frees the transient float up-cast
+    // copies and holds only the Half activations — realizing the peak-VRAM reduction (on-device when
+    // AIDOTNET_FP16_GPU_CACHE=1). Lazily constructed on first hetero forward.
+    private MixedPrecisionCompiledPlan? _fp16PagedPlan;
     private readonly IEngine _engine;
 
     // ---- CUDA-graph capture of the whole compiled training step (opt-in, default OFF) ----
@@ -2201,25 +2207,16 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     {
         var order = _fp16HeteroOrder ?? throw new InvalidOperationException(
             "RunFp16HeteroForward called but no FP16 heterogeneous order was captured.");
-        // Call each node's typed Execute DIRECTLY (not Realize) — Realize is gated by IsRealized, which the
-        // float forward-step walk sets true; Execute re-runs unconditionally into the node's stable output
-        // buffer. Mixed-dtype graphs are float/Half LazyNode + float<->Half CrossTypeLazyNode bridges only
-        // (mirrors MixedPrecisionCompiledPlan.RunForward). Topological order ⇒ a node runs after its inputs.
-        for (int i = 0; i < order.Length; i++)
-        {
-            switch (order[i])
-            {
-                case LazyNode<float> lf: lf.Execute(engine, lf.Output); break;
-                case LazyNode<Half> lh: lh.Execute(engine, lh.Output); break;
-                case CrossTypeLazyNode<float, Half> down: down.Execute(engine, down.Output); break;
-                case CrossTypeLazyNode<Half, float> up: up.Execute(engine, up.Output); break;
-                default:
-                    throw new NotSupportedException(
-                        $"FP16-hetero forward: unsupported node type {order[i].GetType().Name}. " +
-                        "Mixed-precision graphs use float/Half LazyNode and float<->Half CrossTypeLazyNode only.");
-            }
-        }
-        return _lossOutput;
+        if (typeof(T) != typeof(float))
+            throw new NotSupportedException("FP16-in-capture is float-only.");
+        // Delegate to the paged MixedPrecisionCompiledPlan: it replays each node's Execute over the order AND
+        // runs the tested activation-paging lifecycle (frees the transient float up-cast copies after their
+        // consumer; on-device compress/upcast when AIDOTNET_FP16_GPU_CACHE=1), so peak resident = Half
+        // activations + the live float working set, not all activations. paging:true ⇒ realizes the VRAM win.
+        _fp16PagedPlan ??= MixedPrecisionCompiledPlan.FromCapturedOrder(
+            engine, order, (Tensor<float>)(object)_lossOutput, paging: true);
+        var loss = _fp16PagedPlan.Forward();
+        return (Tensor<T>)(object)loss;
     }
 
     /// <summary>
@@ -2231,12 +2228,15 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// </summary>
     internal void RunFp16HeteroBackward(IEngine engine)
     {
-        var order = _fp16HeteroOrder ?? throw new InvalidOperationException(
+        _ = _fp16HeteroOrder ?? throw new InvalidOperationException(
             "RunFp16HeteroBackward called but no FP16 heterogeneous order was captured.");
         if (typeof(T) != typeof(float))
             throw new NotSupportedException("FP16-in-capture is float-only.");
-        var lossF = (Tensor<float>)(object)_lossOutput;
-        var result = MixedPrecisionGraphBackward.BackwardOverOrder(order, lossF, engine);
+        if (_fp16PagedPlan is null)
+            throw new InvalidOperationException("RunFp16HeteroForward must run before RunFp16HeteroBackward.");
+        // The paged plan's backward pages activations in (up-cast) before each node's backward reads them and
+        // frees them after the last read — the tested mixed-dtype reverse pass (MixedPrecisionGraphBackward).
+        var result = _fp16PagedPlan.Backward();
         for (int p = 0; p < _parameters.Length; p++)
         {
             if (_gradients[p] is null) continue;

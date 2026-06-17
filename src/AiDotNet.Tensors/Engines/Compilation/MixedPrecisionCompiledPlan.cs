@@ -59,6 +59,16 @@ public sealed class MixedPrecisionCompiledPlan
     }
 
     /// <summary>
+    /// FP16-IN-CAPTURE (task #30): construct a paged mixed-precision plan from an ALREADY-captured heterogeneous
+    /// node order (e.g. CompiledTrainingPlan's _fp16HeteroOrder) + its loss output, rather than re-tracing.
+    /// Lets CompiledTrainingPlan delegate its hetero forward/backward to this plan's tested activation-paging
+    /// lifecycle (PageOut/PageIn — frees the transient float up-cast copies, holds only the Half activations,
+    /// on-device when AIDOTNET_FP16_GPU_CACHE=1) so the full peak-VRAM reduction is realized.
+    /// </summary>
+    internal static MixedPrecisionCompiledPlan FromCapturedOrder(IEngine engine, ILazyNode[] order, Tensor<float> output, bool paging)
+        => new MixedPrecisionCompiledPlan(engine, order, output, paging);
+
+    /// <summary>
     /// Public entry point (Phase E): trace <paramref name="forward"/> under an FP16 autocast scope with
     /// activation storage forced on, then compile the resulting mixed-dtype graph. The delegate builds the
     /// loss by calling ordinary engine ops on the parameter/input tensors (matmuls auto-emit FP16
