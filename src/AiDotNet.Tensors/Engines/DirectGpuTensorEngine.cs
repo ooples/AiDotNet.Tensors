@@ -14042,6 +14042,32 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (!ShapesMatch(a.Shape._dims, b.Shape._dims))
             return base.TensorAdd(a, b);
+        // FP16 Half-resident store (keystone-enabled): the transformer residual add. Read both IsFp16 inputs
+        // directly, FP16-native add (FP32 accumulate, Half out), store Half — keeps the residual stream Half.
+        if (typeof(T) == typeof(Half) && s_fp16FwdStore && TryGetBackend(out var bkA)
+            && bkA is DirectGpu.CUDA.CudaBackend cbA && cbA.SupportsFp16NativeOps)
+        {
+            IGpuBuffer? hAOwned = null, hBOwned = null, hOut = null;
+            bool ok = false;
+            try
+            {
+                var hA = ResolveToFp16(a, a.Length, cbA, bkA, out hAOwned);
+                var hB = ResolveToFp16(b, b.Length, cbA, bkA, out hBOwned);
+                hOut = cbA.AllocateByteBuffer(a.Length * 2);
+                cbA.Fp16Add(hA, hB, hOut, a.Length);
+                var resultH = FinishGpuOpHalfStore(cbA, hOut, a.Length, a.Shape._dims);
+                hOut = null;
+                var outputH = (Tensor<T>)(object)new Tensor<Half>(resultH, a.Shape._dims);
+                Autodiff.DifferentiableOps.RecordBinary("TensorAdd", outputH, a, b, Autodiff.BackwardFunctions<T>.AddBackward);
+                ok = true;
+                return outputH;
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"[FP16 fwd-store Add] fallback: {ex.GetType().Name}: {ex.Message}");
+            }
+            finally { hAOwned?.Dispose(); hBOwned?.Dispose(); if (!ok) hOut?.Dispose(); }
+        }
         try
         {
             var result = TryRunBinary(a, b, static (backend, ia, ib, o, size) => backend.Add(ia, ib, o, size));
@@ -16487,6 +16513,33 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (DirectGpuEngine.ShouldFallbackForPrecision<T>())
             return base.ReLU(tensor);
 
+        // FP16 Half-resident store (keystone-enabled): read IsFp16 input directly, FP16-native ReLU (Half out),
+        // store Half — keeps the activation Half end-to-end. Gated like the other forward stores.
+        if (typeof(T) == typeof(Half) && s_fp16FwdStore && TryGetBackend(out var bkR)
+            && bkR is DirectGpu.CUDA.CudaBackend cbR && cbR.SupportsFp16NativeOps)
+        {
+            IGpuBuffer? hInOwned = null, hOut = null;
+            bool ok = false;
+            try
+            {
+                var hIn = ResolveToFp16(tensor, tensor.Length, cbR, bkR, out hInOwned);
+                hOut = cbR.AllocateByteBuffer(tensor.Length * 2);
+                cbR.Fp16Relu(hIn, hOut, tensor.Length);
+                var resultH = FinishGpuOpHalfStore(cbR, hOut, tensor.Length, tensor.Shape._dims);
+                hOut = null;
+                var outputH = (Tensor<T>)(object)new Tensor<Half>(resultH, tensor.Shape._dims);
+                Autodiff.DifferentiableOps.RecordUnary("ReLU", outputH, tensor,
+                    Autodiff.BackwardFunctions<T>.ReLUBackward);
+                ok = true;
+                return outputH;
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"[FP16 fwd-store ReLU] fallback: {ex.GetType().Name}: {ex.Message}");
+            }
+            finally { hInOwned?.Dispose(); if (!ok) hOut?.Dispose(); }
+        }
+
         try
         {
             var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Relu(input, output, size));
@@ -16506,6 +16559,33 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (DirectGpuEngine.ShouldFallbackForPrecision<T>())
             return base.GELU(tensor);
+        // FP16 Half-resident store (keystone-enabled): read the IsFp16 input DIRECTLY, run the FP16-native GELU
+        // (Half output, FP32-in-register math), store the Half output as an IsFp16 entry — keeps the activation
+        // Half end-to-end so the next op reads Half (no up-cast/re-inflate). Gated like the other forward stores.
+        if (typeof(T) == typeof(Half) && s_fp16FwdStore && TryGetBackend(out var bkG)
+            && bkG is DirectGpu.CUDA.CudaBackend cbG && cbG.SupportsFp16NativeOps)
+        {
+            IGpuBuffer? hInOwned = null, hOut = null;
+            bool ok = false;
+            try
+            {
+                var hIn = ResolveToFp16(tensor, tensor.Length, cbG, bkG, out hInOwned);
+                hOut = cbG.AllocateByteBuffer(tensor.Length * 2);
+                cbG.Fp16Gelu(hIn, hOut, tensor.Length);
+                var resultH = FinishGpuOpHalfStore(cbG, hOut, tensor.Length, tensor.Shape._dims);
+                hOut = null;
+                var outputH = (Tensor<T>)(object)new Tensor<Half>(resultH, tensor.Shape._dims);
+                Autodiff.DifferentiableOps.RecordUnary("GELU", outputH, tensor,
+                    Autodiff.BackwardFunctions<T>.GELUBackward);
+                ok = true;
+                return outputH;
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"[FP16 fwd-store GELU] fallback: {ex.GetType().Name}: {ex.Message}");
+            }
+            finally { hInOwned?.Dispose(); if (!ok) hOut?.Dispose(); }
+        }
         try
         {
             var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Gelu(input, output, size));
