@@ -475,8 +475,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private const int TrainingParallelMinM = 64;
 
     // read at static init, then a single bool check per Step.
+    private static readonly bool s_stepProf =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_STEP_PROF") == "1";
     private static readonly bool _profileStepEnabled =
-        System.Environment.GetEnvironmentVariable("AIDOTNET_PROFILE_STEP") == "1";
+        System.Environment.GetEnvironmentVariable("AIDOTNET_PROFILE_STEP") == "1" || s_stepProf;
     private static long _profForwardUs, _profGradZeroUs, _profBackwardUs, _profOptimUs;
     private static int _profStepCount;
     private static long[]? _profPerStepUs;
@@ -958,7 +960,20 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             System.Threading.Interlocked.Add(ref _profGradZeroUs, (long)((t2 - t1) * tickToUs));
             System.Threading.Interlocked.Add(ref _profBackwardUs, (long)((t3 - t2) * tickToUs));
             System.Threading.Interlocked.Add(ref _profOptimUs,    (long)((t4 - t3) * tickToUs));
-            System.Threading.Interlocked.Increment(ref _profStepCount);
+            int sc = System.Threading.Interlocked.Increment(ref _profStepCount);
+            // Periodic per-phase dump (AIDOTNET_STEP_PROF=1) to a known absolute path so the cortex's per-step
+            // time is attributable (forward / grad-zero / backward / optimizer). Where the PyTorch gap lives.
+            if (s_stepProf && sc % 5 == 0)
+            {
+                try
+                {
+                    long f = _profForwardUs, gz = _profGradZeroUs, b = _profBackwardUs, o = _profOptimUs;
+                    System.IO.File.AppendAllText(@"C:\Users\cheat\HarmonicEngine\logs\stepprof.txt",
+                        $"[STEPPROF] steps={sc} avgUs/step fwd={f / sc} gradZero={gz / sc} bwd={b / sc} opt={o / sc} total={(f + gz + b + o) / sc}"
+                        + System.Environment.NewLine);
+                }
+                catch { }
+            }
         }
         if (stepTiming)
         {
