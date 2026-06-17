@@ -2005,6 +2005,50 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     }
 
     /// <summary>
+    /// FP16-IN-CAPTURE speed (#34): land an op RESULT <paramref name="r"/> into the stable node-output tensor
+    /// <paramref name="o"/> GPU-RESIDENT — an on-device DtoD copy of r's resident Half buffer into o's Half
+    /// buffer + register o as an IsFp16 activation — instead of the host round-trip
+    /// <c>r.AsSpan().CopyTo(o.AsWritableSpan())</c>, which DOWNLOADS r and lands o on the CPU, forcing the next
+    /// op to RE-UPLOAD it (the profiler-measured ~80ms/op cost that made the hetero replay ~8s/step). The next
+    /// consumer reads o from GPU via GetOrAllocateBuffer/ResolveToFp16 — no re-upload, no download. Returns
+    /// false (caller host-copies) when not on a CUDA backend or r is not resident as Half.
+    /// </summary>
+    internal bool TryLandResidentHalf(Tensor<Half> r, Tensor<Half> o)
+    {
+        if (r is null || o is null || o.Length == 0 || r.Length != o.Length) return false;
+        if (!TryGetBackend(out var backend) || backend is not DirectGpu.CUDA.CudaBackend cb) return false;
+        if (!TryGetResidentFp16Buffer(r, backend, out var rBuf) || rBuf is null) return false;
+        var oKey = o.DataVector.GetBackingArrayUnsafe();
+        if (oKey is null) return false;
+        int n = o.Length;
+        long bytes = (long)n * 2;
+        // Reuse o's resident Half buffer when it's still cached (stable across steps → also the capture-#38
+        // prereq): just DtoD-overwrite it with this step's result.
+        if (TryGetResidentFp16Buffer(o, backend, out var existing) && existing is not null && existing.SizeInBytes >= bytes)
+        {
+            cb.CopyBufferDtoD(rBuf, existing, bytes);
+            return true;
+        }
+        var oBuf = cb.AllocateByteBuffer(n * 2);
+        cb.CopyBufferDtoD(rBuf, oBuf, bytes);
+        // Half-aware deferred materializer (DownloadBuffer is FP32-only) so any HOST read of o stays correct:
+        // up-cast oBuf -> FP32 -> narrow to Half. Remove+Register keeps it pointing at the CURRENT buffer if o
+        // was evicted then re-landed on a later step.
+        var capBuf = oBuf; var capBackend = cb; int cn = n;
+        Helpers.DeferredArrayMaterializer.Remove(oKey);
+        Helpers.DeferredArrayMaterializer.Register(oKey, arr =>
+        {
+            using var tmp = AllocateOutputBuffer(capBackend, cn);
+            capBackend.ConvertToFp32Native(capBuf, tmp.Buffer, cn);
+            float[] fdata = capBackend.DownloadBuffer(tmp.Buffer);
+            var dst = (Half[])arr;
+            for (int i = 0; i < cn; i++) dst[i] = (Half)fdata[i];
+        });
+        CacheActivation(oKey, oBuf, o.Shape._dims, backend, isFp16: true, elementCount: n);
+        return true;
+    }
+
+    /// <summary>
     /// Get a tensor's resident FP16 activation buffer DIRECTLY (no up-cast) when it is stored as an IsFp16
     /// activation-cache entry on this backend — lets the FP16 store / fused-backward paths consume the Half
     /// activation without re-inflating it to FP32 (which would erase the forward storage win for the rest of

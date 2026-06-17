@@ -102,7 +102,7 @@ internal static class MixedPrecisionEmit
             (e, o) =>
             {
                 var r = e.TensorMatMul(aH, bH);
-                r.AsSpan().CopyTo(o.AsWritableSpan());
+                LandHalf(e, r, o);
             },
             BackwardFunctions<Half>.MatMulBackward);
 
@@ -159,7 +159,7 @@ internal static class MixedPrecisionEmit
                 using var xf = MixedPrecisionCast.CastToFp32(xH);
                 using var yf = fp32Forward(e, xf);
                 using var yh = MixedPrecisionCast.CastToFp16(yf);
-                yh.AsSpan().CopyTo(o.AsWritableSpan());
+                LandHalf(e, yh, o);
             },
             (gradOutH, inputs, output, state, e, grads) =>
             {
@@ -217,7 +217,7 @@ internal static class MixedPrecisionEmit
                 using var bf = MixedPrecisionCast.CastToFp32(bH);
                 using var cf = fp32Forward(e, af, bf);
                 using var ch = MixedPrecisionCast.CastToFp16(cf);
-                ch.AsSpan().CopyTo(o.AsWritableSpan());
+                LandHalf(e, ch, o);
             },
             (gradOutH, inputs, output, state, e, grads) =>
             {
@@ -288,7 +288,7 @@ internal static class MixedPrecisionEmit
                 mv.Mean = mean;
                 mv.Variance = variance;
                 using var yh = MixedPrecisionCast.CastToFp16(yf);
-                yh.AsSpan().CopyTo(o.AsWritableSpan());
+                LandHalf(e, yh, o);
             },
             (gradOutH, inputs, output, state, e, grads) =>
             {
@@ -337,7 +337,19 @@ internal static class MixedPrecisionEmit
             return up.Input; // already FP16 upstream — reuse it, skip the float round-trip
         return scope.RecordCrossTypeWithBackward<float, Half>(
             LazyNodeType.Custom, name, x, x._shape,
-            (e, o) => MixedPrecisionCast.CastToFp16(x).AsSpan().CopyTo(o.AsWritableSpan()),
+            (e, o) => LandHalf(e, MixedPrecisionCast.CastToFp16(x), o),
             (gradOut, input, output, state, e) => MixedPrecisionCast.CastToFp16Backward(gradOut));
+    }
+
+    /// <summary>
+    /// GPU-resident landing of a Half op result into the stable node-output <paramref name="o"/> (#34): on a
+    /// DirectGpu engine, an on-device DtoD copy keeps o resident so the next op reads it from GPU with no
+    /// re-upload (eliminates the per-op host round-trip that dominated the hetero replay). Falls back to the
+    /// host <c>CopyTo</c> on CPU / non-resident results — identical semantics, just without the GPU fast path.
+    /// </summary>
+    private static void LandHalf(IEngine e, Tensor<Half> r, Tensor<Half> o)
+    {
+        if (e is DirectGpuTensorEngine gpu && gpu.TryLandResidentHalf(r, o)) return;
+        r.AsSpan().CopyTo(o.AsWritableSpan());
     }
 }
