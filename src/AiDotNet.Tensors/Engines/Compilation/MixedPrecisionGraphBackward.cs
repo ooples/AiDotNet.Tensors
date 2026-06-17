@@ -26,6 +26,9 @@ namespace AiDotNet.Tensors.Engines.Compilation;
 /// </summary>
 internal static class MixedPrecisionGraphBackward
 {
+    private static readonly bool s_fusedDiag =
+        Environment.GetEnvironmentVariable("AIDOTNET_FP16_FUSED_DIAG") == "1";
+
     public sealed class Result
     {
         public Dictionary<Tensor<float>, Tensor<float>> Fp32 { get; }
@@ -86,6 +89,26 @@ internal static class MixedPrecisionGraphBackward
                     RunSingleType(lf.Output, lf.BackwardFn, lf.GetInputsArray, lf.SavedState, fp32, engine);
                     break;
                 case LazyNode<Half> lh:
+                    if (s_fusedDiag)
+                        Console.WriteLine($"[FP16-FUSED-DIAG] LazyNode<Half> OpName='{lh.OpName}' inputs={lh.GetInputsArray().Length} hasGrad={fp16.ContainsKey(lh.Output)} engineGpu={engine is DirectGpuTensorEngine}");
+                    // FP16 fused-backward fast path: for a 2D matmul on a CUDA Tensor-Core engine, compute both
+                    // grads via the transpose-free fused kernel (no FP32 transpose/up-cast scratch — the
+                    // measured dominant cost) instead of the generic MatMulBackward<Half>. Falls through to the
+                    // generic path on any non-matmul node, non-GPU engine, or unsupported shape.
+                    if ((lh.OpName == "TensorMatMul" || lh.OpName == "TensorMatMul.fp16")
+                        && engine is DirectGpuTensorEngine gpuEng
+                        && fp16.TryGetValue(lh.Output, out var gradCTensor))
+                    {
+                        var mmInputs = lh.GetInputsArray();
+                        if (mmInputs.Length == 2
+                            && gpuEng.TryMatMulBackwardFp16Fused(gradCTensor, mmInputs[0], mmInputs[1], out var gA, out var gB)
+                            && gA is not null && gB is not null)
+                        {
+                            Accumulate(fp16, mmInputs[0], gA, engine);
+                            Accumulate(fp16, mmInputs[1], gB, engine);
+                            break;
+                        }
+                    }
                     RunSingleType(lh.Output, lh.BackwardFn, lh.GetInputsArray, lh.SavedState, fp16, engine);
                     break;
                 case CrossTypeLazyNode<float, Half> down: // FP32 input -> FP16 output (down-cast)

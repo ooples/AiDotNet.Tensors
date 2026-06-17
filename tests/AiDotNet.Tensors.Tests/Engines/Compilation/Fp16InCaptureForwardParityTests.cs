@@ -308,16 +308,18 @@ public class Fp16InCaptureForwardParityTests
             finally { fp16Plan.Dispose(); }
         }
 
-        // HONEST FINDING (not an assertion): the FP16 hetero path's full-Step GPU peak is HIGHER than the FP32
-        // production path, because the FP16 path (Execute-replay over the heterogeneous order) holds, on top of
-        // the Half activations it saves on: (a) Half DOWN-CAST copies of every weight/input (the FP32 leaves
-        // still live), (b) the float UP-CASTS needed by the FP32 loss/backward, and (c) every node output (no
-        // buffer reuse), whereas the FP32 specialized path reuses preallocated BLAS buffers. The Half-activation
-        // saving (proven 50% at byte level by Fp16Activations_ReduceStoredActivationBytes) is real but is
-        // OVERWHELMED by these. So FP16-in-capture does NOT yet deliver a device-VRAM lever; that needs the
-        // cast-copies eliminated (in-place down-cast / FP16-native loss) + buffer reuse in the hetero path.
+        // HONEST FINDING (not an assertion): the fused FP16 backward (MatMulBackwardFp16Fused, wired via
+        // MixedPrecisionGraphBackward) eliminated the backward's FP32 transpose/up-cast scratch — measured: the
+        // RunSingleType MatMulBackward sites vanish from the GpuMemoryTracker live-set and the FP16 full-Step
+        // peak fell from ~+168% to ~+113% vs FP32. The REMAINING gap is the FORWARD: the engine up-casts
+        // Tensor<Half> to FP32 device buffers (GetOrAllocateBuffer → ToFloatArray), so the hetero activations
+        // are stored FLOAT on GPU (MixedPrecisionCompiledPlan.RunForward / LazyNode.Realize dominate the live
+        // set), and the Execute-replay forward holds every node output with no buffer reuse (vs the FP32
+        // specialized path's preallocated BLAS buffers). So the next lever is FORWARD Half-resident storage
+        // (GPU-native Half matmul output, not up-cast) — not the backward, which is now fused.
         _out.WriteLine($"activation-dominated full-Step GPU peak: FP32={fp32Peak} FP16={fp16Peak} " +
-            $"-> FP16 is {100.0 * (fp16Peak - fp32Peak) / Math.Max(1, fp32Peak):F1}% HIGHER (no VRAM win as built)");
+            $"-> FP16 is {100.0 * (fp16Peak - fp32Peak) / Math.Max(1, fp32Peak):F1}% HIGHER " +
+            $"(backward now fused; remaining gap = forward FLOAT storage + Execute-replay no-reuse)");
         Assert.True(fp16Peak > 0 && fp32Peak > 0, "both measurements must record a GPU peak");
     }
 

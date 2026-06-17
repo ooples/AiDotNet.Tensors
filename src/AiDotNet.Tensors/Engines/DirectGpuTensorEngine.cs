@@ -14905,6 +14905,78 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
     }
 
+    /// <summary>
+    /// GPU-resident fused FP16 matmul BACKWARD for the heterogeneous (FP16-activation) plan. Computes both
+    /// gradients of the forward <c>C[M,N] = A[M,K] · B[K,N]</c> — for the FP16 (<see cref="Tensor{Half}"/>)
+    /// activations of <see cref="Engines.Compilation.MixedPrecisionGraphBackward"/> — through the Tensor-Core
+    /// <see cref="DirectGpu.CUDA.CudaBackend.MatMulBackwardFp16Fused"/> (two transpose-free
+    /// <c>cublasGemmEx</c> launches) INSTEAD of the eager backward's two <c>TensorTranspose</c> + two
+    /// <c>TensorMatMul</c> FP32 dispatches — the four-FP32-allocation-per-matmul scratch that
+    /// Fp16ActivationDominated_ReducesGpuPeakBytes measured as the dominant cost. The Half activations are
+    /// stored up-cast to FP32 on the device (see <c>GetOrAllocateBuffer</c>), so the inputs are converted to
+    /// FP16 for the kernel (O(MK+KN+MN) — negligible vs the O(MKN) GEMMs); the kernel accumulates in FP32 and
+    /// the grads are materialized as Half for the FP16 grad dict.
+    /// Returns false (caller falls back to the generic backward) when the backend is not CUDA Tensor-Core
+    /// capable or the shapes are not the supported 2D matmul case.
+    /// </summary>
+    internal bool TryMatMulBackwardFp16Fused(
+        Tensor<Half> gradC, Tensor<Half> a, Tensor<Half> b,
+        out Tensor<Half>? gradA, out Tensor<Half>? gradB)
+    {
+        gradA = null;
+        gradB = null;
+        if (a.Rank != 2 || b.Rank != 2 || gradC.Rank != 2) return false;
+        if (!TryGetBackend(out var backend)) return false;
+        if (backend is not DirectGpu.CUDA.CudaBackend cb || !cb.SupportsHgemm) return false;
+
+        int M = a._shape[0], K = a._shape[1], N = b._shape[1];
+        if (b._shape[0] != K || gradC._shape[0] != M || gradC._shape[1] != N) return false;
+
+        DirectGpu.IGpuBuffer? hA = null, hB = null, hGc = null, gAf = null, gBf = null;
+        try
+        {
+            // FP32 device buffers for the Half activations (the engine stores Half tensors up-cast to FP32).
+            using var oa = GetOrAllocateBuffer(backend, a);
+            using var ob = GetOrAllocateBuffer(backend, b);
+            using var ogc = GetOrAllocateBuffer(backend, gradC);
+
+            // Convert to FP16 for the Tensor-Core kernel.
+            hA = cb.AllocateByteBuffer(M * K * 2);
+            hB = cb.AllocateByteBuffer(K * N * 2);
+            hGc = cb.AllocateByteBuffer(M * N * 2);
+            cb.ConvertToFp16Native(oa.Buffer, hA, M * K);
+            cb.ConvertToFp16Native(ob.Buffer, hB, K * N);
+            cb.ConvertToFp16Native(ogc.Buffer, hGc, M * N);
+
+            // Fused transpose-free Tensor-Core backward → FP32 grad buffers (no transpose / no up-cast scratch).
+            gAf = cb.AllocateBuffer(M * K);
+            gBf = cb.AllocateBuffer(K * N);
+            cb.MatMulBackwardFp16Fused(hGc, hA, hB, gAf, gBf, M, N, K, gradOutHalf: false);
+
+            // Materialize as Half grad tensors for the FP16 grad dict.
+            var gAf32 = cb.DownloadBuffer(gAf);
+            var gBf32 = cb.DownloadBuffer(gBf);
+            var gAhalf = new Half[M * K];
+            for (int i = 0; i < gAhalf.Length; i++) gAhalf[i] = (Half)gAf32[i];
+            var gBhalf = new Half[K * N];
+            for (int i = 0; i < gBhalf.Length; i++) gBhalf[i] = (Half)gBf32[i];
+            gradA = new Tensor<Half>(gAhalf, new[] { M, K });
+            gradB = new Tensor<Half>(gBhalf, new[] { K, N });
+            return true;
+        }
+        catch (Exception)
+        {
+            gradA = null;
+            gradB = null;
+            return false;
+        }
+        finally
+        {
+            hA?.Dispose(); hB?.Dispose(); hGc?.Dispose();
+            gAf?.Dispose(); gBf?.Dispose();
+        }
+    }
+
     public override Tensor<T> BatchMatMul<T>(Tensor<T> a, Tensor<T> b)
     {
         if (!TryGetBackend(out var backend) || a.Rank < 3 || b.Rank < 3)
