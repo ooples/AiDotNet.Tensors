@@ -61,6 +61,15 @@ public sealed class GradientTape<T> : IDisposable
     private bool _engineExplicitlyBound;
     private readonly bool _savedReplayMode; // Saved ReplayMode from outer scope for nested tapes
     private bool _disposed;
+    // Set true once a streaming backward (ComputeGradientsStreaming) has
+    // destructively released a PERSISTENT tape's activation arena + GradFn graph.
+    // A persistent tape is normally reusable, but after the streaming release its
+    // _entries slots and node Output/Backward/Inputs are defaulted, so a later
+    // Record / ComputeGradients would walk a corrupt graph. We fail fast with a
+    // clear error instead of silently corrupting. Non-persistent tapes Reset()
+    // their arena in the finally and are safe to re-record, so this is only armed
+    // for persistent tapes.
+    private bool _streamingActivationsReleased;
     // Deterministic per-step activation lifetime (GPU): the DirectGpu activation
     // cache that an outermost tape's forward populates is released wholesale on
     // Dispose via EvictActivationsCreatedAfter(_activationSnapshot), giving ~one-step
@@ -218,12 +227,32 @@ public sealed class GradientTape<T> : IDisposable
     /// </summary>
     /// <param name="entry">The tape entry describing the operation and its backward function.</param>
     /// <exception cref="ObjectDisposedException">Thrown if the tape has been disposed.</exception>
+    /// <summary>
+    /// Throws if this tape's activations were already released by a streaming
+    /// backward — the persistent graph it left behind is no longer valid to
+    /// record onto or differentiate again. Keeps the perf benefit of the
+    /// destructive release while turning silent corruption into a clear error.
+    /// </summary>
+    private void ThrowIfStreamingReleased()
+    {
+        if (_streamingActivationsReleased)
+        {
+            throw new InvalidOperationException(
+                "This persistent GradientTape's activations were released by a prior " +
+                "ComputeGradientsStreaming call, so its recorded graph can no longer be " +
+                "reused. Record a fresh tape for the next step, or set " +
+                "GradientTape<T>.ReleaseStreamingActivations = false to keep activations " +
+                "resident when you need to record onto or differentiate the same tape again.");
+        }
+    }
+
     public void Record(TapeEntry<T> entry)
     {
         if (_disposed)
         {
             throw new ObjectDisposedException(nameof(GradientTape<T>));
         }
+        ThrowIfStreamingReleased();
 
         // MaxEntries: drops new entries when at capacity (not evict-oldest).
         // Arena-based storage doesn't support efficient front-eviction (would require O(n) shift).
@@ -344,6 +373,7 @@ public sealed class GradientTape<T> : IDisposable
         Action<Tensor<T>, Tensor<T>> onSourceGradient)
     {
         if (_disposed) throw new ObjectDisposedException(nameof(GradientTape<T>));
+        ThrowIfStreamingReleased();
         if (sources is null) throw new ArgumentNullException(nameof(sources));
         if (onSourceGradient is null) throw new ArgumentNullException(nameof(onSourceGradient));
         if (_entries.Count == 0)
@@ -590,7 +620,19 @@ public sealed class GradientTape<T> : IDisposable
         finally
         {
             SetCurrentTape(savedCurrent);
-            if (!_options.Persistent) _entries.Reset();
+            if (!_options.Persistent)
+            {
+                // Non-persistent tapes drop the whole arena here, so they're safe to
+                // re-record from scratch — no consumed-guard needed.
+                _entries.Reset();
+            }
+            else if (ReleaseStreamingActivations)
+            {
+                // Persistent tape whose arena/graph we just destructively released:
+                // arm the consumed-guard so any later Record/ComputeGradients fails
+                // fast instead of walking the now-defaulted graph.
+                _streamingActivationsReleased = true;
+            }
         }
     }
 
@@ -620,6 +662,7 @@ public sealed class GradientTape<T> : IDisposable
         {
             throw new ObjectDisposedException(nameof(GradientTape<T>));
         }
+        ThrowIfStreamingReleased();
 
         if (_entries.Count == 0)
         {
