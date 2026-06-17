@@ -1559,6 +1559,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!_activationCache.TryRemove(key, out var e)) return false;
         System.Threading.Interlocked.Add(ref _currentActivationCacheBytes, -e.Buffer.SizeInBytes);
         System.Threading.Interlocked.Add(ref _currentActivationManagedBytes, -e.ManagedBytes);
+        // CUDA uses STREAM-ORDERED deferred free (cuMemFreeAsync) to release the buffer at the stream's
+        // current point without a host sync — a CUDA-stream-specific optimization with no portable
+        // equivalent. Every other backend takes the immediate, equally-correct e.Dispose() (no leak, no
+        // cross-backend semantic difference — just a synchronous free). This asymmetry is intentional, not a
+        // missing feature; a deferred-free abstraction across all backends is tracked as a follow-up.
         if (e.Backend is DirectGpu.CUDA.CudaBackend c) c.FreeBufferDeferred(e.Buffer);
         else e.Dispose();
         return true;
@@ -15104,6 +15109,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         gradB = null;
         if (a.Rank != 2 || b.Rank != 2 || gradC.Rank != 2) return false;
         if (!TryGetBackend(out var backend)) return false;
+        // CUDA-only fast path: this fuses BOTH gradients through cuBLAS Tensor-Core HGEMM with no FP32
+        // transpose/up-cast scratch (the measured dominant backward cost). It is intrinsically CUDA-specific
+        // — there is no cross-backend Tensor-Core HGEMM equivalent — so the other five backends do NOT fuse
+        // here and instead take the GENERIC FP16 backward (MatMulBackward<Half>), which is correct, just
+        // without the −36% working-set win. Generalizing a fused backward to rocBLAS (HIP) and the
+        // shader backends is tracked as a follow-up (Tensors #633 GPU fused-backward parity); this is an
+        // optimization gap, not a correctness gap.
         if (backend is not DirectGpu.CUDA.CudaBackend cb || !cb.SupportsHgemm) return false;
 
         int M = a._shape[0], K = a._shape[1], N = b._shape[1];
