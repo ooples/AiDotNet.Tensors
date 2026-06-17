@@ -135,6 +135,14 @@ public sealed class GradientTape<T> : IDisposable
     [ThreadStatic]
     private static Tensor<T>? _cachedScalarSeed;
 
+    // #1624: release each node's activation references during the streaming
+    // backward as the reverse walk consumes them, bounding the live activation set
+    // to the frontier instead of the whole forward (the deep-model OOM). On by
+    // default; AIDOTNET_STREAMING_RELEASE_ACTIVATIONS=0 disables it as a safety
+    // hatch. Only affects ComputeGradientsStreaming (the memory-bounded path).
+    internal static bool ReleaseStreamingActivations { get; set; } =
+        Environment.GetEnvironmentVariable("AIDOTNET_STREAMING_RELEASE_ACTIVATIONS") != "0";
+
     public GradientTape(GradientTapeOptions? options = null)
     {
         _options = options ?? GradientTapeOptions.Default;
@@ -357,9 +365,13 @@ public sealed class GradientTape<T> : IDisposable
             int stepCount = topoOrder.Count;
 
             var steps = new BackwardStep<T>[stepCount];
+            // #1624: parallel node handles so each step's backward can release its
+            // activation references the moment they are consumed (see below).
+            var nodes = new GradNode<T>[stepCount];
             for (int i = 0; i < stepCount; i++)
             {
                 var node = topoOrder[stepCount - 1 - i]; // reverse for backward
+                nodes[i] = node;
                 steps[i] = new BackwardStep<T>
                 {
                     Output = node.Output,
@@ -479,6 +491,34 @@ public sealed class GradientTape<T> : IDisposable
                             src.Grad = null;     // … and the per-tensor mirror → reclaimable
                         }
                     }
+                }
+
+                // #1624: free this step's ACTIVATION references now that its
+                // backward has consumed them. The forward builds the FULL
+                // activation set; under a persistent tape the node graph otherwise
+                // keeps every activation resident through the whole backward, so
+                // the backward's own buffer allocations (AutoTensorCache) pile on
+                // top and OOM a deep model (the SimCSE #1624 failure throws here).
+                // Releasing each node's Output / SavedState / backward-closure as
+                // the reverse walk consumes it — combined with layers no longer
+                // pinning activations (consumer-side layer-cache skip) — bounds the
+                // live set to the backward frontier instead of the whole forward.
+                // The node Output is never a source (sources are leaves, emitted +
+                // released above), so this never drops a gradient the optimizer
+                // still needs.
+                if (ReleaseStreamingActivations)
+                {
+                    var n = nodes[i];
+                    if (n is not null && !lastUse.ContainsKey(n.Output))
+                    {
+                        n.Output = null!;
+                        n.SavedState = null;
+                        n.Backward = null!;
+                    }
+                    step.Output = null!;
+                    step.Inputs = null!;
+                    step.SavedState = null;
+                    step.Backward = null!;
                 }
             }
 

@@ -82,6 +82,55 @@ public class GradientTapeStreamingTests
     }
 
     /// <summary>
+    /// #1624: releasing each node's activation references as the streaming
+    /// backward consumes them (ReleaseStreamingActivations, on by default) must
+    /// NOT change the gradients — it only frees memory. A/B the flag on a deeper
+    /// chain (several intermediates released mid-walk) and assert the gradients
+    /// are bit-identical on vs off.
+    /// </summary>
+    [Fact]
+    public void StreamingActivationRelease_OnVsOff_BitIdentical()
+    {
+        var saved = GradientTape<double>.ReleaseStreamingActivations;
+        try
+        {
+            var aData = new double[] { 2, 3, 4, 5 };
+            var bData = new double[] { 5, 6, 7, 8 };
+
+            System.Collections.Generic.Dictionary<string, double[]> Run(bool release)
+            {
+                GradientTape<double>.ReleaseStreamingActivations = release;
+                var a = new Tensor<double>(new[] { 4 }, new Vector<double>((double[])aData.Clone()));
+                var b = new Tensor<double>(new[] { 4 }, new Vector<double>((double[])bData.Clone()));
+                using var tape = new GradientTape<double>();
+                // Deeper chain so multiple intermediates are released mid-walk.
+                var c = _engine.TensorMultiply(a, b);
+                var d = _engine.TensorAdd(c, a);
+                var e = _engine.TensorMultiply(d, b);
+                var f = _engine.TensorAdd(e, c);
+                var loss = _engine.ReduceSum(f, null);
+                var outp = new System.Collections.Generic.Dictionary<string, double[]>();
+                tape.ComputeGradientsStreaming(loss, new[] { a, b }, (src, grad) =>
+                {
+                    outp[ReferenceEquals(src, a) ? "a" : "b"] = grad.ToArray();
+                });
+                return outp;
+            }
+
+            var on = Run(release: true);
+            var off = Run(release: false);
+
+            Assert.Equal(off["a"], on["a"]);
+            Assert.Equal(off["b"], on["b"]);
+            Assert.Contains(on["a"], g => g != 0.0);
+        }
+        finally
+        {
+            GradientTape<double>.ReleaseStreamingActivations = saved;
+        }
+    }
+
+    /// <summary>
     /// Sanity-checks the streaming gradient against the textbook value on a
     /// clean graph where each source is used exactly once:
     /// loss = sum(a*b) → da = b, db = a.
