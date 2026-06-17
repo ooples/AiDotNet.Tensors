@@ -743,6 +743,16 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             ? null
             : engine as AiDotNet.Tensors.Engines.DirectGpuTensorEngine;
         evictGuard?.SuspendActivationEviction();
+        // FP16 hetero path per-step LEAK fix (MEASURED): the Execute-replay caches fresh per-step transients
+        // (Half activations, grad contributions, scratch) keyed on NEW arrays every step, and — unlike the FP32
+        // compiled path's stable preallocated buffers — they accumulate across steps (the cortex GPU peak grew
+        // ~0.8MB/step faster than FP32). Snapshot the activation-cache timestamp before this step and
+        // deterministically release everything created during it in the finally (exactly what GradientTape does
+        // on dispose). Persistent state (params, optimizer m/v, gradMap) was allocated earlier → kept.
+        long fp16ActSnapshot = -1;
+        var fp16SnapEng = _fp16HeteroOrder is not null
+            ? engine as AiDotNet.Tensors.Engines.DirectGpuTensorEngine : null;
+        if (fp16SnapEng is not null) fp16ActSnapshot = fp16SnapEng.ActivationCacheTimestampSnapshot();
         // FP16 mixed precision on the FUSED path (AiDotNet #1354 / #555). The fused plan
         // ignores AiDotNet's _mixedPrecisionContext, but the Tensors-level AutocastScope is
         // honored by the engine's matmul/conv/elementwise GPU ops (norms, softmax, loss and
@@ -957,6 +967,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         finally
         {
             evictGuard?.ResumeActivationEviction();
+            // FP16 hetero per-step leak fix: deterministically release THIS step's transient activations/grads/
+            // scratch (created after the snapshot). The optimizer has already read _gradients (separate stable
+            // buffers); the stable node-output tensors re-cache on the next step's Execute. This is what keeps
+            // the FP16 path's cross-step VRAM flat instead of climbing ~0.8MB/step.
+            if (fp16SnapEng is not null && fp16ActSnapshot >= 0)
+                fp16SnapEng.EvictActivationsCreatedAfter(fp16ActSnapshot);
             // Bound cross-step VRAM growth: per-step transient activation buffers are dereferenced
             // here but their device memory is only released by the GC finalizer, which cannot keep
             // pace under fast stepping (steady climb to OOM, "drained 0 pooled buffers"). Force a
