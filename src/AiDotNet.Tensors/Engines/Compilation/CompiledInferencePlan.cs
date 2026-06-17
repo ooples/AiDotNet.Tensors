@@ -1314,10 +1314,13 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         // (the reliable signature of an attention block) so transformer/diffusion inference is CORRECT.
         // Non-attention plans (CNN/MLP) keep the passes unchanged. Trade-off: attention inference plans lose
         // peak-memory reduction — acceptable vs. silently-wrong attention, and revisited when the passes are
-        // made fan-out-correct.
+        // made fan-out-correct. Also gate on a FUSED ScaledDotProductAttention step: a plan that keeps SDPA
+        // as one op (rather than the GraphMode-decomposed permute/matmul/Softmax/matmul) has no Softmax step,
+        // so the Softmax check alone would let the same fan-out topology slip through and miscompile.
         for (int s = 0; s < steps.Count; s++)
         {
-            if (steps[s].OpType == OpType.Softmax || steps[s].OpType == OpType.LogSoftmax)
+            var op = steps[s].OpType;
+            if (op == OpType.Softmax || op == OpType.LogSoftmax || op == OpType.ScaledDotProductAttention)
                 return steps;
         }
 
