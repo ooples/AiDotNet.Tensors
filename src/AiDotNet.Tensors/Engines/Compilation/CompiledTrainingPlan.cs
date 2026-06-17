@@ -215,6 +215,101 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     public int ForwardStepCount => _forwardActions.Length;
     public int BackwardStepCount => _backwardActions.Length;
 
+    /// <summary>
+    /// #1624 prototype measurement: reports how far liveness-based pooling could
+    /// shrink the per-traced-tensor gradient buffer set (the resident multi-GB
+    /// working set that OOMs deep models on the compiled path). Pure analysis via
+    /// <see cref="BackwardGradientBufferPlanner"/> — no allocation change, no hot-
+    /// path effect. Gated on AIDOTNET_COMPILED_GRAD_POOL_MEASURE=1 so it is free
+    /// (skipped) by default; when enabled it appends a one-line summary to
+    /// %TEMP%/aidotnet_gradpool_measure.txt.
+    /// </summary>
+    private static void MaybeMeasureGradPoolBound(
+        System.Collections.Generic.HashSet<Tensor<T>> allTensors,
+        System.Collections.Generic.List<CompiledStep<T>> forwardSteps,
+        Tensor<T>[] parameters)
+    {
+        if (Environment.GetEnvironmentVariable("AIDOTNET_COMPILED_GRAD_POOL_MEASURE") != "1")
+            return;
+
+        try
+        {
+            // Stable id per tensor.
+            // Default reference equality — same comparer the builder's gradMap uses.
+            var idOf = new System.Collections.Generic.Dictionary<Tensor<T>, int>(allTensors.Count);
+            foreach (var t in allTensors)
+                if (!idOf.ContainsKey(t)) idOf[t] = idOf.Count;
+
+            int tensorCount = idOf.Count;
+            var elemCount = new int[tensorCount];
+            var shapeKey = new long[tensorCount];
+            foreach (var kv in idOf)
+            {
+                elemCount[kv.Value] = kv.Key.Length;
+                shapeKey[kv.Value] = ShapeKey(kv.Key._shape);
+            }
+
+            var steps = new System.Collections.Generic.List<BackwardGradientBufferPlanner.GradStep>(forwardSteps.Count);
+            foreach (var step in forwardSteps)
+            {
+                int outId = idOf.TryGetValue(step.OutputBuffer, out var oid) ? oid : -1;
+                var ins = step.Inputs;
+                var inIds = new int[ins?.Length ?? 0];
+                for (int j = 0; j < inIds.Length; j++)
+                    inIds[j] = idOf.TryGetValue(ins![j], out var iid) ? iid : -1;
+                steps.Add(new BackwardGradientBufferPlanner.GradStep(outId, inIds));
+            }
+
+            // Persistent = parameters (read by the optimizer after backward) plus
+            // the loss output (its grad is the externally-seeded start).
+            var persistent = new bool[tensorCount];
+            foreach (var p in parameters)
+                if (idOf.TryGetValue(p, out var pid)) persistent[pid] = true;
+            if (forwardSteps.Count > 0 &&
+                idOf.TryGetValue(forwardSteps[forwardSteps.Count - 1].OutputBuffer, out var lossId))
+                persistent[lossId] = true;
+
+            int elementBytes = typeof(T) == typeof(double) ? 8 : typeof(T) == typeof(float) ? 4
+                : System.Runtime.InteropServices.Marshal.SizeOf<T>();
+
+            var result = BackwardGradientBufferPlanner.Plan(
+                tensorCount, elemCount, shapeKey, steps, persistent, elementBytes);
+
+            double naiveMb = result.NaiveBytes / (1024.0 * 1024.0);
+            double pooledMb = result.PooledBytes / (1024.0 * 1024.0);
+            double ratio = result.PooledBytes > 0 ? (double)result.NaiveBytes / result.PooledBytes : 0;
+            string line =
+                $"[gradpool] tensors={tensorCount} steps={forwardSteps.Count} " +
+                $"naiveBuffers={tensorCount} pooledBuffers={result.PhysicalBufferCount} " +
+                $"naive={naiveMb:F1}MB pooled={pooledMb:F1}MB reduction={ratio:F2}x" +
+                System.Environment.NewLine;
+            System.IO.File.AppendAllText(
+                System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_gradpool_measure.txt"),
+                line);
+            System.Diagnostics.Debug.Write(line);
+        }
+        catch
+        {
+            // Measurement must never break compilation — swallow and move on.
+        }
+    }
+
+    private static long ShapeKey(int[] shape)
+    {
+        // FNV-1a over the shape ints — same shape => same key (poolable peers).
+        unchecked
+        {
+            long h = 1469598103934665603L;
+            if (shape != null)
+                for (int i = 0; i < shape.Length; i++)
+                {
+                    h ^= shape[i];
+                    h *= 1099511628211L;
+                }
+            return h;
+        }
+    }
+
     /// <inheritdoc/>
     public void EnableFrozenWeightOptimizations()
     {
@@ -2238,6 +2333,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             gradMap[tensor] = grad;
             allGrads.Add(grad);
         }
+
+        // #1624 prototype: quantify how much the per-traced-tensor gradient buffer
+        // set (the multi-GB resident working set that OOMs deep models) could
+        // shrink under liveness-based pooling. Pure measurement, gated off by
+        // default so it never touches the production allocation or hot path.
+        MaybeMeasureGradPoolBound(allTensors, forwardSteps, parameters);
 
         // Phase B integration: detect MatMul→ReLU→MatMul patterns and replace with fused kernel
         var fusedForwardActions = new List<Action<IEngine>>();
