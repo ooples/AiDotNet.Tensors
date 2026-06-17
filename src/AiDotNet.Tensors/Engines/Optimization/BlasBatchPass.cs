@@ -45,7 +45,8 @@ internal sealed class BlasBatchPass : ICpuOptimizationPass
                 continue;
 
             if (steps[i].OpType == OpType.TensorMatMul && steps[i].Inputs.Length == 2
-                && steps[i].Inputs[0].Rank == 2 && steps[i].Inputs[1].Rank == 2)
+                && steps[i].Inputs[0].Rank == 2 && steps[i].Inputs[1].Rank == 2
+                && !HasAliasedOutput(steps[i]))
             {
                 int k = steps[i].Inputs[0]._shape[1];
                 int n = steps[i].Inputs[1]._shape[1];
@@ -59,6 +60,10 @@ internal sealed class BlasBatchPass : ICpuOptimizationPass
                     if (consumed.Contains(j)) continue;
                     if (steps[j].OpType != OpType.TensorMatMul || steps[j].Inputs.Length != 2) continue;
                     if (steps[j].Inputs[0].Rank != 2 || steps[j].Inputs[1].Rank != 2) continue;
+
+                    // Skip matmuls whose output buffer was aliased to share storage with
+                    // another tensor (see HasAliasedOutput) — they cannot be hoisted.
+                    if (HasAliasedOutput(steps[j])) continue;
 
                     int jk = steps[j].Inputs[0]._shape[1];
                     int jn = steps[j].Inputs[1]._shape[1];
@@ -137,4 +142,28 @@ internal sealed class BlasBatchPass : ICpuOptimizationPass
 
         return anyBatched ? result.ToArray() : null;
     }
+
+    /// <summary>
+    /// True when this step's output buffer shares its backing storage with another
+    /// tensor (storage refcount &gt; 1) — i.e. <see cref="MemoryPlanningPass"/> rebound
+    /// it onto a donor's storage, or it is a view.
+    /// <para>
+    /// Batching <b>hoists</b> every grouped matmul to the position of the group's
+    /// first member and runs them back-to-back there (see the batched delegate
+    /// below). MemoryPlanningPass runs earlier and computes buffer lifetimes from
+    /// the <i>original</i> step order; it may legally donate a buffer D (dead at
+    /// its original last-use) to a later matmul M's output. If BlasBatch then
+    /// hoists M earlier than D's last consumer, M's write lands in D's storage
+    /// before that consumer reads it — corrupting the consumer's input. (Concrete
+    /// case: shared-input Q/K/V projection matmuls feeding reshape→permute→SDPA;
+    /// the V-projection buffer dies at its reshape, MemoryPlanning donates it to
+    /// the K-projection matmul, and batching hoists that K matmul ahead of the V
+    /// reshape — clobbering V.) An output with refcount 1 is privately owned, so
+    /// hoisting it only computes its own value earlier into its own buffer, which
+    /// is always safe. Refusing to batch aliased outputs is the necessary and
+    /// sufficient guard; the only cost is forgoing the batch for those matmuls.
+    /// </para>
+    /// </summary>
+    private static bool HasAliasedOutput<T>(CompiledStep<T> step)
+        => step.OutputBuffer._storage.RefCount > 1 || step.OutputBuffer.IsView;
 }

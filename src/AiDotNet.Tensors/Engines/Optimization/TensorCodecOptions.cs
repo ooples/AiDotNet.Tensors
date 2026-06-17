@@ -91,8 +91,17 @@ public sealed class TensorCodecOptions
     /// <summary>Phase 4.1: Fold BatchNorm into Conv2D weights at compile time.</summary>
     public bool EnableConvBnFusion { get; set; } = true;
 
-    /// <summary>Phase 4.2: Fuse attention Q@K^T->Softmax->V patterns.</summary>
-    public bool EnableAttentionFusion { get; set; } = true;
+    /// <summary>Phase 4.2: Fuse attention Q@K^T->Softmax->V patterns into a FlashAttention kernel.
+    /// DISABLED BY DEFAULT — the fusion is INCORRECT for this codebase's attention graphs. FlashAttention
+    /// needs K in [.., seqK, headDim] layout, but the QK step is matmul(Q, Kᵀ): a valid plain matmul's
+    /// second input is ALWAYS Kᵀ ([.., headDim, seqK]), never K. The pass takes qk.Inputs[1] as "K" and lets
+    /// FlashAttention transpose it again, computing the wrong thing. The shape sanity check only catches this
+    /// when seqK != headDim (it rejects the mismatched dims); when seqK == headDim the wrong orientation
+    /// passes the check and produces a SILENTLY WRONG result (caught by MultiInputReplayAliasingTests'
+    /// eager-parity asserts). So the fusion never fuses correctly — it either skips (seqK != headDim) or
+    /// corrupts (seqK == headDim). Keep off until rewritten to recover K structurally (trace the transpose
+    /// feeding the QK matmul) and validated against a real attention model.</summary>
+    public bool EnableAttentionFusion { get; set; } = false;
 
     /// <summary>Phase 4.3: Merge consecutive pointwise ops into fewer dispatch steps.</summary>
     public bool EnablePointwiseFusion { get; set; } = true;
