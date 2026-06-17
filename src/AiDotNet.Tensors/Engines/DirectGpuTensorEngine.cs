@@ -1539,6 +1539,31 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (arr is not null) TryUpcastActivationFp32ByKey(arr);
     }
 
+    /// <summary>
+    /// Free a tensor's cached GPU activation ENTIRELY (drop the cache entry + FreeBufferDeferred). Called by
+    /// the mixed-precision plan to release an intermediate float activation after its LAST use (forward, if the
+    /// backward never reads it; otherwise after its last backward read). The hetero Execute-replay path
+    /// otherwise caches+holds EVERY intermediate until end-of-step (eviction is suspended mid-step for #226),
+    /// which — measured — is the bulk of its GPU peak vs the FP32 compiled path's preallocated buffer reuse.
+    /// </summary>
+    internal void FreeFloatActivation(Tensor<float> t)
+    {
+        bool any = TryFreeActivationByKey(t.DataVector);
+        var arr = t.DataVector.GetBackingArrayUnsafe();
+        if (arr is not null) any |= TryFreeActivationByKey(arr);
+        if (any) { t._gpuBuffer = null; t._gpuBufferVersion = -1; }
+    }
+
+    private bool TryFreeActivationByKey(object key)
+    {
+        if (!_activationCache.TryRemove(key, out var e)) return false;
+        System.Threading.Interlocked.Add(ref _currentActivationCacheBytes, -e.Buffer.SizeInBytes);
+        System.Threading.Interlocked.Add(ref _currentActivationManagedBytes, -e.ManagedBytes);
+        if (e.Backend is DirectGpu.CUDA.CudaBackend c) c.FreeBufferDeferred(e.Buffer);
+        else e.Dispose();
+        return true;
+    }
+
     private bool TryReplacePersistentBuffer<T>(T[] data, IGpuBuffer buffer)
     {
         lock (_persistentBufferLock)

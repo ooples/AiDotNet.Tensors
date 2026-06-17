@@ -47,6 +47,15 @@ public sealed class MixedPrecisionCompiledPlan
     private Dictionary<Tensor<float>, int>? _bwdConsumerCount;            // total backward reads per activation
     private HashSet<Tensor<float>>? _droppedThisStep;                     // storage freed this step; restore next Forward
 
+    // ── Buffer FREE for the hetero Execute-replay path (not paging/compress — full free) ──────────────
+    // The hetero path otherwise CACHES + HOLDS every intermediate float activation until end-of-step (eviction
+    // is suspended mid-step for #226), so its GPU peak is the SUM of all intermediates — measured as the bulk
+    // of FP16's overhead vs the FP32 compiled path, which reuses preallocated buffers. This frees each
+    // intermediate after its LAST use (forward, if the backward never reads it; else after its last backward
+    // read), matching the compiled path's progressive release. Default on for the GPU hetero path; opt-out.
+    private readonly DirectGpuTensorEngine? _freeEng;
+    private List<Tensor<float>>[]? _freeAfterFwd;                          // per fwd step: free dead (no-bwd-read) intermediates
+
     private MixedPrecisionCompiledPlan(IEngine engine, ILazyNode[] order, Tensor<float> output, bool paging)
     {
         _engine = engine;
@@ -56,6 +65,50 @@ public sealed class MixedPrecisionCompiledPlan
         _gpuFp16 = (paging && engine is DirectGpuTensorEngine dg
                     && Environment.GetEnvironmentVariable("AIDOTNET_FP16_GPU_CACHE") == "1") ? dg : null;
         if (_paging) BuildPagingSchedule();
+        else if (engine is DirectGpuTensorEngine fdg
+                 && Environment.GetEnvironmentVariable("AIDOTNET_FP16_NO_FREE") != "1")
+        {
+            _freeEng = fdg;
+            BuildFreeSchedule();
+        }
+    }
+
+    // Build the free schedule: which intermediate float activations the backward reads (_bwdReadByNode +
+    // _bwdConsumerCount, for free-after-last-bwd-read) and which are DEAD after forward (_freeAfterFwd).
+    private void BuildFreeSchedule()
+    {
+        _bwdConsumerCount = new Dictionary<Tensor<float>, int>(ReferenceEqualityComparer<Tensor<float>>.Instance);
+        _bwdReadByNode = new Dictionary<ILazyNode, List<Tensor<float>>>(ReferenceEqualityComparer<ILazyNode>.Instance);
+        int n = _order.Length;
+        _freeAfterFwd = new List<Tensor<float>>[n];
+        for (int i = 0; i < n; i++) _freeAfterFwd[i] = new List<Tensor<float>>();
+
+        var floatOutputs = new HashSet<Tensor<float>>(ReferenceEqualityComparer<Tensor<float>>.Instance);
+        foreach (var node in _order)
+        {
+            var o = FloatOutputOf(node);
+            if (o is not null && !ReferenceEquals(o, _output)) floatOutputs.Add(o);
+        }
+
+        var lastFwdUse = new Dictionary<Tensor<float>, int>(ReferenceEqualityComparer<Tensor<float>>.Instance);
+        for (int i = 0; i < n; i++)
+        {
+            var node = _order[i];
+            foreach (var t in FloatInputsOf(node))
+                if (floatOutputs.Contains(t)) lastFwdUse[t] = i;
+            List<Tensor<float>>? reads = null;
+            foreach (var t in BwdReadsFloat(node))
+            {
+                if (!floatOutputs.Contains(t)) continue;
+                (reads ??= new List<Tensor<float>>()).Add(t);
+                _bwdConsumerCount[t] = (_bwdConsumerCount.TryGetValue(t, out var c) ? c : 0) + 1;
+            }
+            if (reads is not null) _bwdReadByNode[node] = reads;
+        }
+        // DEAD intermediates (no backward read) → free right after their last forward use.
+        foreach (var kv in lastFwdUse)
+            if (!_bwdConsumerCount.ContainsKey(kv.Key))
+                _freeAfterFwd[kv.Value].Add(kv.Key);
     }
 
     /// <summary>
@@ -128,6 +181,8 @@ public sealed class MixedPrecisionCompiledPlan
             RunForward(_order[i], eng);
             if (_paging)
                 foreach (var t in _pageOutAt![i]) PageOut(t);
+            else if (_freeEng is not null)
+                foreach (var t in _freeAfterFwd![i]) _freeEng.FreeFloatActivation(t); // dead after forward
         }
         return _output;
     }
@@ -150,7 +205,20 @@ public sealed class MixedPrecisionCompiledPlan
     private MixedPrecisionGraphBackward.Result RunBackward(float seedScale)
     {
         if (!_paging)
-            return MixedPrecisionGraphBackward.BackwardOverOrder(_order, _output, _engine, seedScale);
+        {
+            if (_freeEng is null)
+                return MixedPrecisionGraphBackward.BackwardOverOrder(_order, _output, _engine, seedScale);
+            // FREE mode: free each backward-read intermediate after its LAST backward read (progressive release,
+            // matching the FP32 compiled path) instead of holding all to end-of-step.
+            var rem = new Dictionary<Tensor<float>, int>(_bwdConsumerCount!, ReferenceEqualityComparer<Tensor<float>>.Instance);
+            return MixedPrecisionGraphBackward.BackwardOverOrder(_order, _output, _engine, seedScale,
+                onAfterNodeBackward: node =>
+                {
+                    if (_bwdReadByNode!.TryGetValue(node, out var reads))
+                        foreach (var t in reads)
+                            if (--rem[t] == 0) _freeEng.FreeFloatActivation(t);
+                });
+        }
 
         // Refcount backward reads; page-in before a node's backward reads an activation, free after the last.
         var remaining = new Dictionary<Tensor<float>, int>(_bwdConsumerCount!, ReferenceEqualityComparer<Tensor<float>>.Instance);
