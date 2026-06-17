@@ -200,6 +200,94 @@ public class StreamingStoreCodecTests
         Assert.True(Math.Sqrt(sum2 / ref2) < 0.02, "fp64→int8 RMS error ~1%");
     }
 
+    [Fact]
+    public void Int4_RoundTrip_8xSmaller_WithinGroupPrecision()
+    {
+        var rng = new Rng(13);
+        const int n = 4096, gs = StreamingStoreCodec.DefaultInt4GroupSize;
+        var src = new float[n];
+        for (int i = 0; i < n; i++) src[i] = rng.NextGaussian(0.05);
+
+        int bytes = StreamingStoreCodec.Int4BufferBytes(n, gs);
+        // ~8x vs fp32: 4 bits/weight + a tiny per-group-scale header.
+        Assert.True(bytes < n * sizeof(float) / 7,
+            $"int4 store ({bytes} B) should be ~8x smaller than fp32 ({n * 4} B)");
+        var enc = new byte[bytes];
+        StreamingStoreCodec.EncodeInt4Float(src, enc, gs);
+        var dec = new float[n];
+        StreamingStoreCodec.DecodeInt4Float(enc, dec);
+
+        double sum2 = 0, ref2 = 0;
+        for (int i = 0; i < n; i++) { double e = dec[i] - src[i]; sum2 += e * e; ref2 += (double)src[i] * src[i]; }
+        double rmse = Math.Sqrt(sum2 / ref2);
+        // 4-bit symmetric group-quant: theoretical ~12-15% relative RMSE on Gaussian weights.
+        Assert.True(rmse < 0.18, $"int4 group-quant RMS relative error {rmse} should be ~12-15%");
+    }
+
+    [Fact]
+    public void Int4_GroupQuant_BeatsPerTensor_OnVariedMagnitudes()
+    {
+        var rng = new Rng(17);
+        const int n = 4096, gs = 128;
+        var src = new float[n];
+        // Magnitude ramps across the array by 4 orders, so a single per-tensor scale clips
+        // the small-magnitude region to near-zero int4 while group scaling tracks it.
+        for (int i = 0; i < n; i++)
+        {
+            double std = Math.Pow(10, -3 + 4.0 * i / (n - 1));
+            src[i] = rng.NextGaussian(std);
+        }
+        double Rmse(float[] dec) { double s = 0, rf = 0; for (int i = 0; i < n; i++) { double e = dec[i] - src[i]; s += e * e; rf += (double)src[i] * src[i]; } return Math.Sqrt(s / rf); }
+
+        var encGrp = new byte[StreamingStoreCodec.Int4BufferBytes(n, gs)];
+        StreamingStoreCodec.EncodeInt4Float(src, encGrp, gs);
+        var decGrp = new float[n]; StreamingStoreCodec.DecodeInt4Float(encGrp, decGrp);
+
+        var encTen = new byte[StreamingStoreCodec.Int4BufferBytes(n, n)]; // one group = per-tensor
+        StreamingStoreCodec.EncodeInt4Float(src, encTen, n);
+        var decTen = new float[n]; StreamingStoreCodec.DecodeInt4Float(encTen, decTen);
+
+        Assert.True(Rmse(decGrp) < Rmse(decTen) * 0.5,
+            $"group int4 RMSE {Rmse(decGrp):E3} should be < half per-tensor RMSE {Rmse(decTen):E3}");
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(7)]    // odd length → final nibble unused
+    [InlineData(129)]  // spills into a 2nd partial group
+    [InlineData(257)]
+    public void Int4_OddAndPartialGroup_RoundTrips(int n)
+    {
+        var rng = new Rng((ulong)(n + 500));
+        var src = new float[n];
+        for (int i = 0; i < n; i++) src[i] = rng.NextGaussian(0.1);
+        var enc = new byte[StreamingStoreCodec.Int4BufferBytes(n, StreamingStoreCodec.DefaultInt4GroupSize)];
+        StreamingStoreCodec.EncodeInt4Float(src, enc, StreamingStoreCodec.DefaultInt4GroupSize);
+        var dec = new float[n];
+        StreamingStoreCodec.DecodeInt4Float(enc, dec);
+        // Each decoded value must be within one int4 step of the original (no packing corruption).
+        for (int i = 0; i < n; i++)
+            Assert.True(Math.Abs(dec[i] - src[i]) <= Math.Abs(src[i]) + 1e-3,
+                $"int4 element {i} round-trip corrupt: {src[i]} -> {dec[i]}");
+    }
+
+    [Fact]
+    public void Int4_Double_RoundTrips()
+    {
+        var rng = new Rng(19);
+        const int n = 2048, gs = 128;
+        var src = new double[n];
+        for (int i = 0; i < n; i++) src[i] = rng.NextGaussian(0.1);
+        var enc = new byte[StreamingStoreCodec.Int4BufferBytes(n, gs)];
+        StreamingStoreCodec.EncodeInt4Double(src, enc, gs);
+        var dec = new double[n];
+        StreamingStoreCodec.DecodeInt4Double(enc, dec);
+        double sum2 = 0, ref2 = 0;
+        for (int i = 0; i < n; i++) { double e = dec[i] - src[i]; sum2 += e * e; ref2 += src[i] * src[i]; }
+        Assert.True(Math.Sqrt(sum2 / ref2) < 0.18, "fp64→int4 group-quant RMS error ~12-15%");
+    }
+
     [Theory]
     [InlineData(1)]
     [InlineData(7)]

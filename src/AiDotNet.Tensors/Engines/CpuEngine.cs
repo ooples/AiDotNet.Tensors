@@ -35161,6 +35161,28 @@ public partial class CpuEngine : ITensorLevelEngine
                     return int8Result;
                 }
             }
+            // No-upcast int4 weight-only fast path (8x int4 group-quant store). Same contract as
+            // int8: GetMaterializedStreamingInt4 returns the weight as int4 + group scales in the
+            // kernel's [N,K] layout (never dequantizing to fp32), fed straight to the N-parallel
+            // int4 GEMM, then the SAME bias+activation epilogue. Null for every non-int4 weight.
+            if (typeof(T) == typeof(float))
+            {
+                var q4 = weights.GetMaterializedStreamingInt4();
+                if (q4 is not null && q4.Rows == N && q4.K == K)
+                {
+                    var int4Result = AutoTensorCache.RentOrAllocate<T>(new[] { M, N });
+                    var inA = (float[])(object)input.GetDataArray();
+                    var outA = (float[])(object)int4Result.GetDataArray();
+                    Simd.SimdGemm.SgemmWithInt4GroupScaledDispatch(
+                        inA, q4.Data, q4.GroupScales, q4.GroupSize, outA, M, K, N);
+                    if (bias != null || activation != FusedActivationType.None)
+                    {
+                        var bA = bias != null ? (float[])(object)bias.GetDataArray() : null;
+                        CpuFusedOperations.ApplyBiasActivationInPlace(outA, bA, M, N, activation, activationParams);
+                    }
+                    return int4Result;
+                }
+            }
 #endif
 
             // Ultra-fast path for float: zero-alloc arena + direct BLAS pointers
