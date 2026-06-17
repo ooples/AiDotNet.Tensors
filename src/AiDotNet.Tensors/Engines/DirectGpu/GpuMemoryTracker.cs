@@ -137,7 +137,19 @@ public static class GpuMemoryTracker
         long peak;
         while (lb > (peak = Interlocked.Read(ref s_peakBytes)))
             if (Interlocked.CompareExchange(ref s_peakBytes, lb, peak) == peak) break;
+        // Peak-composition dump (AIDOTNET_GPU_MEMTRACK_PEAKDUMP=1): each time the live high-water grows by a
+        // big margin, append the current live-set Report so the PEAK's allocation breakdown is captured (the
+        // post-run Report only shows the small residual). Throttled to big jumps so it doesn't spam.
+        if (s_peakDump && lb > Interlocked.Read(ref s_lastPeakDump) + (64L << 20))
+        {
+            Interlocked.Exchange(ref s_lastPeakDump, lb);
+            Dump($"peak-grow {lb / 1048576.0:F1} MB");
+        }
     }
+
+    private static readonly bool s_peakDump =
+        Environment.GetEnvironmentVariable("AIDOTNET_GPU_MEMTRACK_PEAKDUMP") == "1";
+    private static long s_lastPeakDump;
 
     /// <summary>Clears a device allocation. Call right before the matching <c>cuMemFree</c>/<c>cuMemFreeAsync</c>.</summary>
     public static void OnFree(IntPtr ptr)

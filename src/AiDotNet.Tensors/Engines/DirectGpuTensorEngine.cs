@@ -1085,6 +1085,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         if (upcastNeeded)
         {
+            // FP16-storage path: hand out a TRANSIENT float copy and KEEP the activation Half (the keystone —
+            // a permanent swap re-inflates the whole forward+backward chain). Falls back to the legacy permanent
+            // up-cast when the store path is off (the #558 paging contract).
+            if (s_fp16FwdStore && TryTransientUpcastFp16(data, backend, out var transient))
+                return transient;
             TryUpcastActivationFp32ByKey(data);
             lock (_activationCacheLock)
             {
@@ -1177,6 +1182,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
             if (upcastNeeded2)
             {
+                if (s_fp16FwdStore && TryTransientUpcastFp16(backingArray, backend, out var transient))
+                    return transient;
                 TryUpcastActivationFp32ByKey(backingArray);
                 lock (_activationCacheLock)
                 {
@@ -1455,6 +1462,36 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (old is not null && old.Backend is DirectGpu.CUDA.CudaBackend c) c.FreeBufferDeferred(old.Buffer);
         else old?.Dispose();
         return true;
+    }
+
+    /// <summary>
+    /// TRANSIENT up-cast of an IsFp16 activation: convert the Half cache buffer to a FRESH FP32 buffer that the
+    /// caller OWNS and disposes after the op, while LEAVING THE CACHE ENTRY HALF. This is the keystone of the
+    /// FP16-storage path: it lets the FP32-centric ops (LayerNorm/Softmax/loss/etc., forward AND backward) read
+    /// a Half activation without permanently re-inflating it (TryUpcastActivationFp32ByKey swaps the entry to
+    /// FP32 forever — which is what made every layer + the whole backward re-inflate the activations and negate
+    /// the storage win). The activation stays half-resident; only a throwaway float copy lives during the op.
+    /// </summary>
+    private bool TryTransientUpcastFp16(object key, IDirectGpuBackend backend, out OwnedBuffer transient)
+    {
+        transient = default;
+        if (backend is not DirectGpu.CUDA.CudaBackend cuda) return false;
+        IGpuBuffer halfBuf; int elems;
+        lock (_activationCacheLock)
+        {
+            if (!_activationCache.TryGetValue(key, out var e) || !ReferenceEquals(e.Backend, backend) || !e.IsFp16)
+                return false;
+            halfBuf = e.Buffer; elems = e.ElementCount;
+        }
+        // GPU convert OUTSIDE the lock; eviction is suspended during a step so halfBuf stays alive.
+        try
+        {
+            var fp32 = cuda.AllocateBuffer(elems);
+            cuda.ConvertToFp32(halfBuf, fp32, elems);
+            transient = new OwnedBuffer(fp32, ownsBuffer: true); // caller disposes; cache entry stays Half
+            return true;
+        }
+        catch { return false; }
     }
 
     private bool TryUpcastActivationFp32ByKey(object key)
@@ -15361,6 +15398,39 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             int outerSize = input.Shape._dims[0];
             int normSize = input.Length / outerSize;
+
+            // FP16 Half-resident store (keystone-enabled): read IsFp16 input/gamma/beta directly, FP16-native
+            // layernorm (Half output + FP32 mean/var), store Half output — keeps the per-layer norm Half.
+            if (typeof(T) == typeof(Half) && s_fp16FwdStore
+                && backend is DirectGpu.CUDA.CudaBackend cbL && cbL.SupportsFp16NativeOps)
+            {
+                IGpuBuffer? hInOwned = null, hGOwned = null, hBOwned = null, hOut = null;
+                var mBuf = default(OwnedBuffer); var vBuf = default(OwnedBuffer);
+                bool meanVarTransferred = false;
+                try
+                {
+                    var hIn = ResolveToFp16(input, input.Length, cbL, backend, out hInOwned);
+                    var hG = ResolveToFp16(gamma, normSize, cbL, backend, out hGOwned);
+                    var hB = ResolveToFp16(beta, normSize, cbL, backend, out hBOwned);
+                    hOut = cbL.AllocateByteBuffer(input.Length * 2);
+                    mBuf = AllocateOutputBuffer(backend, outerSize);
+                    vBuf = AllocateOutputBuffer(backend, outerSize);
+                    cbL.Fp16LayerNorm(hIn, hG, hB, hOut, mBuf.Buffer, vBuf.Buffer, outerSize, normSize, (float)epsilon);
+                    var resultH = FinishGpuOpHalfStore(cbL, hOut, input.Length, input.Shape._dims);
+                    hOut = null;
+                    mean = (Tensor<T>)(object)new Tensor<Half>(FinishGpuOp<Half>(backend, mBuf, outerSize), new[] { outerSize });
+                    variance = (Tensor<T>)(object)new Tensor<Half>(FinishGpuOp<Half>(backend, vBuf, outerSize), new[] { outerSize });
+                    meanVarTransferred = true;
+                    return (Tensor<T>)(object)new Tensor<Half>(resultH, input.Shape._dims);
+                }
+                catch (Exception)
+                {
+                    hOut?.Dispose();
+                    if (!meanVarTransferred) { mBuf.Dispose(); vBuf.Dispose(); }
+                }
+                finally { hInOwned?.Dispose(); hGOwned?.Dispose(); hBOwned?.Dispose(); }
+            }
+
             using var bufIn = GetOrAllocateBuffer(backend, input);
             using var bufGamma = GetOrAllocateBuffer(backend, gamma);
             using var bufBeta = GetOrAllocateBuffer(backend, beta);
@@ -15645,6 +15715,31 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             int features = input.Shape._dims[ea];
             int outerSize = input.Length / features;
+
+            // FP16 Half-resident store: read IsFp16 input directly, FP16-native softmax, store Half output — so
+            // the attention softmax activations stay Half (works now that the IsFp16 re-inflate is transient).
+            if (typeof(T) == typeof(Half) && s_fp16FwdStore
+                && backend is DirectGpu.CUDA.CudaBackend cbS && cbS.SupportsFp16NativeOps)
+            {
+                IGpuBuffer? hInOwned = null, hOut = null;
+                bool okS = false;
+                try
+                {
+                    var hIn = ResolveToFp16(input, input.Length, cbS, backend, out hInOwned);
+                    hOut = cbS.AllocateByteBuffer(input.Length * 2);
+                    cbS.Fp16Softmax(hIn, hOut, outerSize, features);
+                    var resultH = FinishGpuOpHalfStore(cbS, hOut, input.Length, input.Shape._dims);
+                    hOut = null;
+                    var outputH = (Tensor<T>)(object)new Tensor<Half>(resultH, input.Shape._dims);
+                    Autodiff.DifferentiableOps.RecordUnary("Softmax", outputH, input,
+                        Autodiff.BackwardFunctions<T>.SoftmaxBackward, new object[] { axis });
+                    okS = true;
+                    return outputH;
+                }
+                catch (Exception) { /* fall through */ }
+                finally { hInOwned?.Dispose(); if (!okS) hOut?.Dispose(); }
+            }
+
             using var bufIn = GetOrAllocateBuffer(backend, input);
             var bufOut = AllocateOutputBuffer(backend, input.Length);
             backend.Softmax(bufIn.Buffer, bufOut.Buffer, outerSize, features);
