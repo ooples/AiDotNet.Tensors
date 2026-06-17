@@ -1940,6 +1940,27 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     }
 
     /// <summary>
+    /// Get a tensor's resident FP16 activation buffer DIRECTLY (no up-cast) when it is stored as an IsFp16
+    /// activation-cache entry on this backend — lets the FP16 store / fused-backward paths consume the Half
+    /// activation without re-inflating it to FP32 (which would erase the forward storage win for the rest of
+    /// the step). Returns false when the tensor isn't resident as a Half entry (caller converts instead).
+    /// </summary>
+    internal bool TryGetResidentFp16Buffer<T>(Tensor<T> t, IDirectGpuBackend backend, out IGpuBuffer? halfBuf)
+    {
+        halfBuf = null;
+        object? k1 = t.DataVector;
+        object? k2 = t.DataVector?.GetBackingArrayUnsafe();
+        lock (_activationCacheLock)
+        {
+            if (k1 is not null && _activationCache.TryGetValue(k1, out var e1) && ReferenceEquals(e1.Backend, backend) && e1.IsFp16)
+            { halfBuf = e1.Buffer; return true; }
+            if (k2 is not null && _activationCache.TryGetValue(k2, out var e2) && ReferenceEquals(e2.Backend, backend) && e2.IsFp16)
+            { halfBuf = e2.Buffer; return true; }
+        }
+        return false;
+    }
+
+    /// <summary>
     /// Central output-write for the compiled-plan GraphMode Execute delegates (replaces the inline
     /// <c>src.AsSpan().CopyTo(dest.AsWritableSpan())</c> at ~183 sites). On a GPU engine DURING a compiled step
     /// (eviction suspended → activation buffers are pinned/stable for the whole step), aliases <paramref name="dest"/>
@@ -15001,20 +15022,34 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int M = a._shape[0], K = a._shape[1], N = b._shape[1];
         if (b._shape[0] != K || gradC._shape[0] != M || gradC._shape[1] != N) return false;
 
-        DirectGpu.IGpuBuffer? hA = null, hB = null, hGc = null, gAf = null, gBf = null;
+        DirectGpu.IGpuBuffer? hAOwned = null, hBOwned = null, hGc = null, gAf = null, gBf = null;
         try
         {
-            // FP32 device buffers for the Half activations (the engine stores Half tensors up-cast to FP32).
-            using var oa = GetOrAllocateBuffer(backend, a);
-            using var ob = GetOrAllocateBuffer(backend, b);
+            // Inputs as FP16. If an activation is already resident as a Half IsFp16 entry, read it DIRECTLY —
+            // no up-cast (which would re-inflate it to FP32 for the rest of the step, erasing the forward store
+            // win) and no convert. Otherwise fall back to the cached FP32 buffer + a FP16 convert.
+            DirectGpu.IGpuBuffer hA, hB;
+            if (TryGetResidentFp16Buffer(a, backend, out var aResident) && aResident is not null)
+                hA = aResident;
+            else
+            {
+                using var oa = GetOrAllocateBuffer(backend, a);
+                hAOwned = cb.AllocateByteBuffer(M * K * 2);
+                cb.ConvertToFp16Native(oa.Buffer, hAOwned, M * K);
+                hA = hAOwned;
+            }
+            if (TryGetResidentFp16Buffer(b, backend, out var bResident) && bResident is not null)
+                hB = bResident;
+            else
+            {
+                using var ob = GetOrAllocateBuffer(backend, b);
+                hBOwned = cb.AllocateByteBuffer(K * N * 2);
+                cb.ConvertToFp16Native(ob.Buffer, hBOwned, K * N);
+                hB = hBOwned;
+            }
+            // gradC is a gradient tensor (not an IsFp16 activation) — convert from its FP32 buffer.
             using var ogc = GetOrAllocateBuffer(backend, gradC);
-
-            // Convert to FP16 for the Tensor-Core kernel.
-            hA = cb.AllocateByteBuffer(M * K * 2);
-            hB = cb.AllocateByteBuffer(K * N * 2);
             hGc = cb.AllocateByteBuffer(M * N * 2);
-            cb.ConvertToFp16Native(oa.Buffer, hA, M * K);
-            cb.ConvertToFp16Native(ob.Buffer, hB, K * N);
             cb.ConvertToFp16Native(ogc.Buffer, hGc, M * N);
 
             // Fused transpose-free Tensor-Core backward → FP32 grad buffers (no transpose / no up-cast scratch).
@@ -15041,7 +15076,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         finally
         {
-            hA?.Dispose(); hB?.Dispose(); hGc?.Dispose();
+            // Dispose only the buffers WE allocated (the FP16 converts) — never the resident IsFp16 activation
+            // buffers read directly from the cache (those are owned by the activation cache).
+            hAOwned?.Dispose(); hBOwned?.Dispose(); hGc?.Dispose();
             gAf?.Dispose(); gBf?.Dispose();
         }
     }

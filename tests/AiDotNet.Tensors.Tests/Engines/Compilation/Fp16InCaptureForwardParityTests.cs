@@ -292,11 +292,43 @@ public class Fp16InCaptureForwardParityTests
             finally { plan.Dispose(); DirectGpuTensorEngine.Fp16FwdStoreOverride = prevStore; }
         }
 
-        long off = MeasureFwdLive(false);
-        long on = MeasureFwdLive(true);
-        _out.WriteLine($"FP16 forward resident device bytes: fwd-store OFF={off} ON={on} " +
-            $"-> {100.0 * (off - on) / Math.Max(1, off):F1}% lower with forward Half-store");
-        Assert.True(on < off, $"forward Half-store resident bytes {on} must be below no-store {off}.");
+        // Full-Step peak-live GROWTH (PeakBytes - live-at-start) per config — the step's working-set, measured
+        // relative to each config's own start so the cross-config pool-retention confound is reduced. With the
+        // store on, the fused backward reads the Half activations DIRECTLY (no re-inflate), so the activations
+        // stay Half through backward and the working set is smaller. Measure store-ON first (clean) so the
+        // confound (the second run reuses the first's retained pool) is conservative against the win.
+        long StepGrowth(bool fwdStore)
+        {
+            var prevStore = DirectGpuTensorEngine.Fp16FwdStoreOverride;
+            DirectGpuTensorEngine.Fp16FwdStoreOverride = fwdStore;
+            var prev = MixedPrecisionEmit.TestOverrideEnabled; MixedPrecisionEmit.TestOverrideEnabled = true;
+            CompiledTrainingPlan<float> plan;
+            try
+            {
+                var inp = new Tensor<float>((float[])inD.Clone(), new[] { 2048, 256 });
+                var ws = MkWs();
+                using (var scope = GraphMode.Enable())
+                using (new AutocastScope(PrecisionMode.Float16))
+                {
+                    var y = inp; foreach (var w in ws) y = gpu.TensorMatMul(y, w);
+                    gpu.ReduceSum(y, null);
+                    plan = scope.CompileTraining(ws);
+                }
+            }
+            finally { MixedPrecisionEmit.TestOverrideEnabled = prev; GraphMode.SetCurrent(null); }
+            try { long live0 = GpuMemoryTracker.LiveBytes; GpuMemoryTracker.ResetPeak(); plan.Step(); return GpuMemoryTracker.PeakBytes - live0; }
+            finally { plan.Dispose(); DirectGpuTensorEngine.Fp16FwdStoreOverride = prevStore; }
+        }
+
+        long fwdOff = MeasureFwdLive(false);
+        long fwdOn = MeasureFwdLive(true);
+        long stepOn = StepGrowth(true);
+        long stepOff = StepGrowth(false);
+        _out.WriteLine($"FP16 forward resident device bytes: fwd-store OFF={fwdOff} ON={fwdOn} " +
+            $"-> {100.0 * (fwdOff - fwdOn) / Math.Max(1, fwdOff):F1}% lower with forward Half-store");
+        _out.WriteLine($"FP16 full-Step peak-live GROWTH: store ON={stepOn} OFF={stepOff} " +
+            $"-> {100.0 * (stepOff - stepOn) / Math.Max(1, stepOff):F1}% lower with store (Half-direct backward)");
+        Assert.True(fwdOn < fwdOff, $"forward Half-store resident bytes {fwdOn} must be below no-store {fwdOff}.");
     }
 
     [Fact]
