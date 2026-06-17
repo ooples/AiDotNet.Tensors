@@ -1676,6 +1676,24 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             }
     }
 
+    /// <summary>In-place multiply of every element of <paramref name="buffer"/> by the device-resident
+    /// scalar at <paramref name="scalar"/>[0]. HIP counterpart of the CUDA scale_by_device_scalar.</summary>
+    public unsafe void ScaleByDeviceScalar(IGpuBuffer buffer, IGpuBuffer scalar, int size)
+    {
+        if (size <= 0) return;
+        if (!_kernelCache.TryGetValue("scale_by_device_scalar", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: scale_by_device_scalar");
+        IntPtr bufPtr = buffer.Handle;
+        IntPtr scalarPtr = scalar.Handle;
+        int n = size;
+        void** args = stackalloc void*[3];
+        args[0] = &bufPtr;
+        args[1] = &scalarPtr;
+        args[2] = &n;
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
     public unsafe void StridedGather(IGpuBuffer src, IGpuBuffer dst, int offset, int stride, int count)
     {
         if (count <= 0) return;

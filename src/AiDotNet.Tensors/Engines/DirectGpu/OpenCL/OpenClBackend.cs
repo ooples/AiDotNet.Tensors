@@ -10750,6 +10750,19 @@ KERNEL VARIANTS (A/B testing):
             zeroKernel.Execute1D(size, CalculateOptimalWorkGroupSize1D(size));
         }
 
+        /// <summary>In-place multiply of every element of <paramref name="buffer"/> by the device-resident
+        /// scalar at <paramref name="scalar"/>[0]. OpenCL counterpart of the CUDA scale_by_device_scalar.</summary>
+        public void ScaleByDeviceScalar(IGpuBuffer buffer, IGpuBuffer scalar, int size)
+        {
+            if (size <= 0) return;
+            if (!_kernelCache.TryGetValue("scale_by_device_scalar", out var kernel))
+                throw new InvalidOperationException("OpenCL kernel not found: scale_by_device_scalar");
+            kernel.SetArg(0, ((DirectOpenClGpuBuffer)buffer).Buffer.Handle);
+            kernel.SetArg(1, ((DirectOpenClGpuBuffer)scalar).Buffer.Handle);
+            kernel.SetArg(2, size);
+            kernel.Execute1D(size, CalculateOptimalWorkGroupSize1D(size));
+        }
+
         private void ScaleBuffer(IGpuBuffer buffer, float scale, int size)
         {
             if (_context == null) return;
