@@ -137,8 +137,34 @@ public sealed class TensorArena : IDisposable
     /// set, not working-set × churn. Override with the
     /// AIDOTNET_ARENA_PERSIST_BYTES environment variable (a byte count; 0 = pool
     /// disabled). Default: half of the memory the GC is allowed to use (which
-    /// reflects the heap hard limit when one is set, else physical RAM).</summary>
+    /// reflects the heap hard limit when one is set, else physical RAM).
+    /// <para><b>Per-thread:</b> the budget bounds EACH thread's pool independently
+    /// (the pool is [ThreadStatic]). In the create+dispose-arena-per-step pattern
+    /// the pool only accrues on the thread that creates arenas — the training
+    /// thread — so a single pool exists in practice. If a host were to drive arenas
+    /// from many threads concurrently, lower this via the env var so N × budget
+    /// stays within the heap.</para></summary>
     private static readonly long MaxPersistTotalBytes = ResolveMaxPersistTotalBytes();
+
+    // Test hook (InternalsVisibleTo): a per-thread override of the byte budget so
+    // the eviction path can be exercised at a size small enough to hit in a unit
+    // test (the production MaxPersistTotalBytes is gigabytes). [ThreadStatic] so a
+    // test only affects its own worker thread and never leaks the budget to a
+    // concurrent test. 0 = unset → use MaxPersistTotalBytes. Set back to 0 in a
+    // finally to restore production behaviour.
+    [ThreadStatic]
+    private static long _maxPersistTotalBytesOverride;
+
+    internal static long MaxPersistTotalBytesOverrideForTests
+    {
+        get => _maxPersistTotalBytesOverride;
+        set => _maxPersistTotalBytesOverride = value;
+    }
+
+    /// <summary>The byte budget in force on this thread — the test override when
+    /// set (&gt; 0), else the resolved <see cref="MaxPersistTotalBytes"/>.</summary>
+    private static long EffectiveMaxPersistTotalBytes
+        => _maxPersistTotalBytesOverride > 0 ? _maxPersistTotalBytesOverride : MaxPersistTotalBytes;
 
     private static long ResolveMaxPersistTotalBytes()
     {
@@ -221,7 +247,7 @@ public sealed class TensorArena : IDisposable
         // for a model with a huge or unbounded set of transient shapes, while
         // still letting the common case (a handful of high-fan-out sizes) pool
         // fully — see MaxPersistTotalBytes.
-        if (_persistentBytes + bytes > MaxPersistTotalBytes) return;
+        if (_persistentBytes + bytes > EffectiveMaxPersistTotalBytes) return;
         var pool = _persistent ??= new Dictionary<(Type, int), Stack<Array>>();
         var key = (type, elementCount);
         if (!pool.TryGetValue(key, out var stack))

@@ -166,6 +166,61 @@ public class TensorArenaPersistentPoolTests
     }
 
     /// <summary>
+    /// The byte budget MUST bound the pool: a model with an effectively unbounded
+    /// set of distinct large shapes can't grow the persistent pool past
+    /// MaxPersistTotalBytes — surplus buffers are dropped for GC on return. This
+    /// is the mechanism that prevents the fix itself from becoming an unbounded
+    /// leak. Exercised via the per-thread test override of the budget (production
+    /// budget is gigabytes); we set it to exactly <c>budgetBuffers</c> large
+    /// buffers and assert only that many are retained — the next lifetime reuses
+    /// exactly <c>budgetBuffers</c> and re-allocates the rest.
+    /// </summary>
+    [Fact]
+    public void ByteBudget_BoundsPool_DropsSurplusBuffers()
+    {
+        TensorArena.ClearPersistentPool();
+        int[] shape = { LargeElems };
+        const int budgetBuffers = 4;
+        const int fanOut = 16; // 4x the budget — the surplus 12 must be dropped
+        long bufferBytes = (long)LargeElems * sizeof(float); // 8 MB
+
+        long savedOverride = TensorArena.MaxPersistTotalBytesOverrideForTests;
+        TensorArena.MaxPersistTotalBytesOverrideForTests = budgetBuffers * bufferBytes;
+        try
+        {
+            // Lifetime 1: return fanOut buffers; only budgetBuffers fit the budget,
+            // the rest are dropped for GC (no reuse recorded yet).
+            using (var arena = TensorArena.Create())
+            {
+                for (int i = 0; i < fanOut; i++)
+                {
+                    var t = TensorAllocator.RentUninitialized<float>(shape);
+                    t.AsWritableSpan()[0] = i;
+                }
+            }
+            Assert.Equal(0, TensorArena.PersistentReuseHits);
+
+            // Lifetime 2: only the budgetBuffers that were retained can be reused;
+            // the remaining (fanOut - budgetBuffers) rents allocate fresh. So the
+            // reuse-hit count is capped at the budget, proving the pool is bounded.
+            using (var arena = TensorArena.Create())
+            {
+                for (int i = 0; i < fanOut; i++)
+                {
+                    var t = TensorAllocator.RentUninitialized<float>(shape);
+                    t.AsWritableSpan()[0] = i;
+                }
+            }
+            Assert.Equal(budgetBuffers, TensorArena.PersistentReuseHits);
+        }
+        finally
+        {
+            TensorArena.MaxPersistTotalBytesOverrideForTests = savedOverride;
+            TensorArena.ClearPersistentPool();
+        }
+    }
+
+    /// <summary>
     /// Small buffers (below the persist threshold) are intentionally NOT pooled
     /// across lifetimes — they GC cheaply and pooling them would bloat the
     /// dictionary. This guards the threshold so the pool stays focused on the
