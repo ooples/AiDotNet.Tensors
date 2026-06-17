@@ -1994,8 +1994,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             capturedBackend.ConvertToFp32Native(capturedBuffer, tmp.Buffer, n);
             float[] floatData = capturedBackend.DownloadBuffer(tmp.Buffer);
             var dst = (Half[])arr;
-            int m = Math.Min(floatData.Length, dst.Length);
-            for (int i = 0; i < m; i++) dst[i] = (Half)floatData[i];
+            // Both lengths are derived from n (elementCount); a mismatch is an upstream
+            // bug. Use n directly and assert rather than silently truncating via Math.Min.
+            System.Diagnostics.Debug.Assert(floatData.Length == n && dst.Length == n,
+                "Element count mismatch in FP16 materializer");
+            for (int i = 0; i < n; i++) dst[i] = (Half)floatData[i];
         });
         CacheActivation(result, halfBuffer, shape, backend, isFp16: true, elementCount: elementCount);
         return result;

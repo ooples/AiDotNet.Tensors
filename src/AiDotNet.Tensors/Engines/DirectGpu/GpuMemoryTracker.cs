@@ -140,12 +140,17 @@ public static class GpuMemoryTracker
         // Peak-composition dump (AIDOTNET_GPU_MEMTRACK_PEAKDUMP=1): each time the live high-water grows by a
         // big margin, append the current live-set Report so the PEAK's allocation breakdown is captured (the
         // post-run Report only shows the small residual). Throttled to big jumps so it doesn't spam.
-        if (s_peakDump && lb > Interlocked.Read(ref s_lastPeakDump) + (64L << 20))
+        if (s_peakDump && lb > Interlocked.Read(ref s_lastPeakDump) + PeakDumpStepBytes)
         {
             Interlocked.Exchange(ref s_lastPeakDump, lb);
-            Dump($"peak-grow {lb / 1048576.0:F1} MB");
+            Dump($"peak-grow {lb / (double)BytesPerMiB:F1} MB");
         }
     }
+
+    private const long BytesPerMiB = 1024L * 1024L;
+    // Only re-dump the peak composition once the live high-water grows by this
+    // much, so the throttled dump doesn't spam on every small allocation.
+    private const long PeakDumpStepBytes = 64L * BytesPerMiB;
 
     private static readonly bool s_peakDump =
         Environment.GetEnvironmentVariable("AIDOTNET_GPU_MEMTRACK_PEAKDUMP") == "1";
