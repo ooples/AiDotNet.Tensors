@@ -7313,6 +7313,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         LaunchKernel3D(kernel, gridX, gridY, gridZ, blockX, blockY, 1, args);
     }
 
+    // CUDA-graph capture (#38): the general permute's stride/permutation int arrays are CONSTANT per permute op
+    // (shape + axes don't change across steps), but AllocateIntBuffer uploads them (cuMemcpyHtoD) every call —
+    // a non-capturable op inside cuStreamCapture (CUDA 906) that aborted whole-step capture on the attention
+    // transpose. Cache the device buffers keyed on the (shape, permutation) values: uploaded ONCE (pre-residency
+    // / warmup), reused on the captured replay with no HtoD. Bounded by the few distinct permute shapes.
+    private readonly System.Collections.Generic.Dictionary<string, (IGpuBuffer inStr, IGpuBuffer outStr, IGpuBuffer perm)> _permuteMetaCache = new();
+
     public unsafe void Permute(IGpuBuffer input, IGpuBuffer output, int[] shape, int[] permutation)
     {
         // Handle common fast paths first
@@ -7363,17 +7370,22 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         for (int i = ndims - 2; i >= 0; i--)
             outputStrides[i] = outputStrides[i + 1] * outputShape[i + 1];
 
-        // Allocate device memory for strides and permutation
-        using var inputStridesBuffer = AllocateIntBuffer(inputStrides);
-        using var outputStridesBuffer = AllocateIntBuffer(outputStrides);
-        using var permutationBuffer = AllocateIntBuffer(permutation);
+        // Device stride/permutation buffers — CACHED per (shape, permutation) so the captured replay does not
+        // re-upload them (cuMemcpyHtoD inside cuStreamCapture = CUDA 906). First call (pre-residency) uploads +
+        // caches; later calls (incl. the capture pass) reuse. Buffers are owned by the cache (not disposed here).
+        var metaKey = ndims.ToString() + ":" + string.Join(",", shape) + "|" + string.Join(",", permutation);
+        if (!_permuteMetaCache.TryGetValue(metaKey, out var meta))
+        {
+            meta = (AllocateIntBuffer(inputStrides), AllocateIntBuffer(outputStrides), AllocateIntBuffer(permutation));
+            _permuteMetaCache[metaKey] = meta;
+        }
 
         uint grid = (uint)((totalSize + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr inputPtr = input.Handle;
         IntPtr outputPtr = output.Handle;
-        IntPtr inputStridesPtr = inputStridesBuffer.Handle;
-        IntPtr outputStridesPtr = outputStridesBuffer.Handle;
-        IntPtr permutationPtr = permutationBuffer.Handle;
+        IntPtr inputStridesPtr = meta.inStr.Handle;
+        IntPtr outputStridesPtr = meta.outStr.Handle;
+        IntPtr permutationPtr = meta.perm.Handle;
 
         void** args = stackalloc void*[7];
         args[0] = &inputPtr;

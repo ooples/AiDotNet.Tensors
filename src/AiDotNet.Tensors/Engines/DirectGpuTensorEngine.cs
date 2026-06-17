@@ -15503,7 +15503,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 using var bufIn = GetOrAllocateBuffer(backend, tensor);   // Tensor overload: resident fast-path, no forced download
                 var arr = output.DataVector.GetBackingArrayUnsafe();
                 IGpuBuffer? outBuf = null;
-                if (output._gpuBuffer is not null && ReferenceEquals(output._gpuBackend, backend) && IsCachedGpuBufferLive(output, backend))
+                // ResidentStepActive ⇒ eviction is suspended for the whole step, so output._gpuBuffer (set by the
+                // pre-residency pass below at output._gpuBuffer = outBuf) is GUARANTEED live — accept it on
+                // backend match ALONE, WITHOUT the IsCachedGpuBufferLive gate. That gate wrongly declined here when
+                // the output's backing array is null/unmaterialized (so CacheActivation was skipped and the buffer
+                // isn't in the activation cache), forcing a fresh AllocateBuffer on the CAPTURE pass = a cuMemAlloc
+                // inside cuStreamCapture = CUDA 906 → the catch → CpuEngine.TensorPermuteInto → get_Memory()
+                // download → cuStreamSynchronize CUDA 900 → capture aborts (the #38 attention-transpose blocker).
+                // Matches TryAliasResidentOutput's resident-step buffer-resolution rationale.
+                if (output._gpuBuffer is not null && ReferenceEquals(output._gpuBackend, backend))
                     outBuf = output._gpuBuffer;
                 else if (arr is not null)
                     lock (_activationCacheLock)
@@ -15541,8 +15549,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         catch (Exception)
         {
-            // Any backend hiccup (allocation failure, kernel launch error)
-            // — fall back to the CPU strided-copy.
+            // During a resident/captured step the CPU strided-copy fallback is FATAL: CpuEngine.TensorPermuteInto
+            // calls get_Memory() which fires a deferred DtoH download = cuStreamSynchronize inside the capture =
+            // CUDA 900 (and a real cuMemAlloc earlier = 906). Re-throw so CaptureGraph aborts ONCE and the plan
+            // cleanly disables capture (StepEager), instead of cascading a host download mid-capture.
+            if (ResidentStepActive) throw;
+            // Eager path: any backend hiccup (allocation failure, kernel launch error) → CPU strided-copy.
             base.TensorPermuteInto(output, tensor, axes);
         }
     }
