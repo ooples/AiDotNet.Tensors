@@ -94,6 +94,63 @@ public class Fp16HeteroScratchFreeTests
         finally { Environment.SetEnvironmentVariable("AIDOTNET_FP16_NO_SCRATCH_FREE", prevEnv); }
     }
 
+    // Run one ISOLATED forward (+ backward for the grad fingerprint) with the forward Half-resident store on/off,
+    // returning the param-grad L2 norm and the resident activation-cache bytes right AFTER the forward (before
+    // the backward adds grads/scratch) — so the measurement isolates the activation STORAGE dtype.
+    private static (double gradNorm, long cacheBytesAfterForward) RunForwardStoreOnce(DirectGpuTensorEngine gpu, bool store)
+    {
+        var prevEnv = Environment.GetEnvironmentVariable("AIDOTNET_FP16_NO_FWD_STORE");
+        // store on = default (env unset); store off = opt out via env (engages the FP32 up-cast store).
+        Environment.SetEnvironmentVariable("AIDOTNET_FP16_NO_FWD_STORE", store ? null : "1");
+        try
+        {
+            var (order, loss) = CaptureHetero(gpu);
+            gpu.ClearActivationCache();
+            var plan = MixedPrecisionCompiledPlan.FromCapturedOrder(gpu, order, loss, paging: false);
+            gpu.SuspendActivationEviction();
+            try
+            {
+                plan.Forward();
+                long bytes = gpu.CurrentActivationCacheBytes;  // resident activation storage right after forward
+                var grads = plan.Backward();
+                double sum = 0;
+                foreach (var kv in grads.Fp32)
+                {
+                    var a = kv.Value.ToArray();
+                    for (int i = 0; i < a.Length; i++) sum += (double)a[i] * a[i];
+                }
+                return (Math.Sqrt(sum), bytes);
+            }
+            finally { gpu.ResumeActivationEviction(); }
+        }
+        finally { Environment.SetEnvironmentVariable("AIDOTNET_FP16_NO_FWD_STORE", prevEnv); }
+    }
+
+    [SkippableFact]
+    public void ForwardHalfStore_PreservesGradients_AndLowersResidentActivationBytes()
+    {
+        using var gpu = new DirectGpuTensorEngine();
+        Skip.If(!gpu.IsGpuAvailable, "needs a DirectGpu backend (CUDA/OpenCL/…).");
+
+        var off = RunForwardStoreOnce(gpu, store: false);
+        var on = RunForwardStoreOnce(gpu, store: true);
+
+        // The Half-resident store only engages on a backend with a half-output GEMM; if it didn't (bytes equal),
+        // this backend lacks SupportsHgemm — skip rather than fail (the store no-ops to the FP32 path there).
+        Skip.If(on.cacheBytesAfterForward == off.cacheBytesAfterForward,
+            "forward Half-store did not engage (backend has no half-output GEMM) — nothing to measure.");
+
+        // (1) Correctness: keeping activations Half-resident must not change the gradients (the captured graph
+        // already intends Half activations; the fused Half backward reads them directly).
+        Assert.True(Math.Abs(on.gradNorm - off.gradNorm) <= 1e-3 * (1 + Math.Abs(off.gradNorm)),
+            $"forward Half-store changed the gradient norm: on={on.gradNorm} off={off.gradNorm}.");
+
+        // (2) The win: the Half-resident matmul activations occupy 2 bytes/elem vs 4 (FP32 up-cast), so the
+        // resident activation-cache bytes after the forward are strictly lower with the store on.
+        Assert.True(on.cacheBytesAfterForward < off.cacheBytesAfterForward,
+            $"forward Half-store should lower resident activation bytes: on={on.cacheBytesAfterForward} off={off.cacheBytesAfterForward}.");
+    }
+
     [SkippableFact]
     public void ScratchFree_PreservesGradients_AndLowersResidentCacheBytes()
     {
