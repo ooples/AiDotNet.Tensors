@@ -397,7 +397,10 @@ public class Fp16InCaptureForwardParityTests
         // HONEST FINDING (not an assertion): the fused FP16 backward (MatMulBackwardFp16Fused, wired via
         // MixedPrecisionGraphBackward) eliminated the backward's FP32 transpose/up-cast scratch — measured: the
         // RunSingleType MatMulBackward sites vanish from the GpuMemoryTracker live-set and the FP16 full-Step
-        // peak fell from ~+168% to ~+113% vs FP32. The REMAINING gap is the FORWARD: the engine up-casts
+        // peak fell from ~+168% to ~+113% vs FP32. The backward sub-op SCRATCH (the next-largest contributor —
+        // cross-entropy Clamp/Log/Sign/Abs/Divide, TensorMultiply-backward temps) is now also released per node
+        // (MixedPrecisionCompiledPlan scratch-free, validated in Fp16HeteroScratchFreeTests). The REMAINING gap
+        // is the FORWARD: the engine up-casts
         // Tensor<Half> to FP32 device buffers (GetOrAllocateBuffer → ToFloatArray), so the hetero activations
         // are stored FLOAT on GPU (MixedPrecisionCompiledPlan.RunForward / LazyNode.Realize dominate the live
         // set), and the Execute-replay forward holds every node output with no buffer reuse (vs the FP32

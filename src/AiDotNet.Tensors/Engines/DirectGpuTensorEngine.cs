@@ -1670,7 +1670,26 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// flushed to its CPU array before the GPU buffer is freed. Safe no-op when the
     /// engine isn't GPU-backed or nothing was cached this pass.
     /// </summary>
-    internal void EvictActivationsCreatedAfter(long snapshot)
+    internal void EvictActivationsCreatedAfter(long snapshot) => EvictActivationsCreatedAfter(snapshot, null);
+
+    /// <summary>
+    /// Internal read of the current activation-cache device-byte total (the sum of resident activation GPU
+    /// buffers). Lets a test measure the FP16 hetero backward's per-node scratch release without GPU memory
+    /// tracking. Lock-free read of the Interlocked-maintained counter.
+    /// </summary>
+    internal long CurrentActivationCacheBytes => System.Threading.Interlocked.Read(ref _currentActivationCacheBytes);
+
+    /// <summary>
+    /// Deterministically evicts every activation-cache entry created AFTER <paramref name="snapshot"/> whose
+    /// backing-array key is NOT in <paramref name="protect"/>. The protect set is the FP16 hetero backward's live
+    /// gradient accumulators (their cache key = backing array); everything else created during the backward is
+    /// per-op SCRATCH (e.g. the cross-entropy Clamp/Log/Sign/Abs/Divide chain over the full vocab, TensorMultiply
+    /// backward temporaries) that the FP32 specialized path reuses preallocated buffers for but the hetero
+    /// Execute-replay routes through the cache. Evicting it after each node's backward gives the hetero path the
+    /// FP32 path's progressive release. Materialize-then-free per the #226 contract, so even an over-eviction
+    /// degrades to a cache-miss re-upload (correct, slower), never a use-after-free.
+    /// </summary>
+    internal void EvictActivationsCreatedAfter(long snapshot, HashSet<object>? protect)
     {
         // The activation timestamp counter is process-wide, so "created after my snapshot"
         // also matches a CONCURRENT tape's activations on another thread. Free only THIS
@@ -1687,6 +1706,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 if (entries[i].Value.Timestamp <= snapshot) continue;   // pre-existing — keep
                 if (entries[i].Value.ThreadId != callerThreadId) continue; // another thread's live buffer
+                if (protect is not null && protect.Contains(entries[i].Key)) continue; // live gradient — keep
                 if (Helpers.DeferredArrayMaterializer.IsPending(entries[i].Key))
                 {
                     try { Helpers.DeferredArrayMaterializer.TryMaterialize(entries[i].Key); }
