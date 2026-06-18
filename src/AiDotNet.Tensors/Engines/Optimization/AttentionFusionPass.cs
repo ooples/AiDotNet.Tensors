@@ -231,18 +231,18 @@ internal sealed class AttentionFusionPass : ICpuOptimizationPass
     /// Recovers the natural key tensor K from the second operand of a Q @ K^T matmul.
     /// Because <see cref="OpType.TensorMatMul"/>/<see cref="OpType.BatchMatMul"/> carry no
     /// transpose flag, an attention graph materialises K^T with a <see cref="OpType.TensorTranspose"/>
-    /// step and feeds its output as the matmul's second operand. The FlashAttention kernels
-    /// transpose K internally, so they require natural K — we trace that transpose to its input.
-    /// Returns false (caller must NOT fuse) when the operand has no producing transpose, was
-    /// produced by some other op, or the transpose is not a clean swap of the last two dims —
-    /// in those cases the operand's layout cannot be proven and fusing would risk silent
-    /// gradient/output corruption.
+    /// step and feeds its output as the matmul's second operand. The FlashAttention kernels transpose
+    /// K internally, so they require natural K — we trace that transpose to its input.
+    /// <see cref="CpuEngine.TensorTranspose{T}"/> is 2D-only and always swaps the two dims, so a
+    /// TensorTranspose producer's input is exactly the natural [seqK, headDim] key. Returns false
+    /// (caller must NOT fuse) when the operand has no producing transpose or was produced by some other
+    /// op — there the orientation cannot be proven and fusing would risk a silently-transposed key. The
+    /// downstream rank checks validate the recovered key's shape, so no extra shape guard is needed here.
     /// </summary>
     private static bool TryRecoverNaturalKey<T>(
         CompiledStep<T>[] steps, int qkIndex, Tensor<T> keyOperand, out Tensor<T> naturalKey)
     {
         naturalKey = keyOperand;
-        if (keyOperand is null) return false;
 
         for (int s = qkIndex - 1; s >= 0; s--)
         {
@@ -250,31 +250,17 @@ internal sealed class AttentionFusionPass : ICpuOptimizationPass
             if (producer.OutputBuffer is null || !ReferenceEquals(producer.OutputBuffer, keyOperand))
                 continue;
 
-            // Found the step that writes the K operand. It must be a transpose for the
-            // operand to be K^T; anything else means we cannot reason about the layout.
-            if (producer.OpType != OpType.TensorTranspose
-                || producer.Inputs is null || producer.Inputs.Length < 1)
-                return false;
-
-            var src = producer.Inputs[0];
-            int rank = keyOperand.Rank;
-            if (src is null || src.Rank != rank || rank < 2)
-                return false;
-
-            // Require a pure last-two-dim swap: src[.., a, b] -> keyOperand[.., b, a],
-            // with all leading (batch/head) dims identical. Any other permutation is rejected.
-            if (src._shape[rank - 1] != keyOperand._shape[rank - 2]
-                || src._shape[rank - 2] != keyOperand._shape[rank - 1])
-                return false;
-            for (int d = 0; d < rank - 2; d++)
-                if (src._shape[d] != keyOperand._shape[d]) return false;
-
-            naturalKey = src;
-            return true;
+            // The K operand is K^T only if a TensorTranspose produced it; recover that transpose's input
+            // (the natural key). Any other producer leaves the orientation unprovable -> refuse to fuse.
+            if (producer.OpType == OpType.TensorTranspose && producer.Inputs is { Length: >= 1 })
+            {
+                naturalKey = producer.Inputs[0];
+                return true;
+            }
+            return false;
         }
 
-        // No producing step found (e.g. the operand is a plan input that is already stored
-        // transposed): the layout is unknown, so refuse to fuse.
+        // No producing step found (the key is a direct plan input): orientation unknown -> refuse.
         return false;
     }
 }
