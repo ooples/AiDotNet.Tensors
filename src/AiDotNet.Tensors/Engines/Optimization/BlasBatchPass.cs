@@ -45,8 +45,7 @@ internal sealed class BlasBatchPass : ICpuOptimizationPass
                 continue;
 
             if (steps[i].OpType == OpType.TensorMatMul && steps[i].Inputs.Length == 2
-                && steps[i].Inputs[0].Rank == 2 && steps[i].Inputs[1].Rank == 2
-                && !HasAliasedOutput(steps[i]))
+                && steps[i].Inputs[0].Rank == 2 && steps[i].Inputs[1].Rank == 2)
             {
                 int k = steps[i].Inputs[0]._shape[1];
                 int n = steps[i].Inputs[1]._shape[1];
@@ -57,21 +56,30 @@ internal sealed class BlasBatchPass : ICpuOptimizationPass
 
                 for (int j = i + 1; j < steps.Length; j++)
                 {
-                    if (consumed.Contains(j)) continue;
-                    if (steps[j].OpType != OpType.TensorMatMul || steps[j].Inputs.Length != 2) continue;
-                    if (steps[j].Inputs[0].Rank != 2 || steps[j].Inputs[1].Rank != 2) continue;
-
-                    // Skip matmuls whose output buffer was aliased to share storage with
-                    // another tensor (see HasAliasedOutput) — they cannot be hoisted.
-                    if (HasAliasedOutput(steps[j])) continue;
+                    // CONSECUTIVE-RUN ONLY: a batched group must be a CONTIGUOUS run of
+                    // matmuls. The batched step executes every member at the FIRST member's
+                    // position (and no-ops the originals). If a NON-group step sat between two
+                    // members, moving the later matmul before it would write that matmul's
+                    // output buffer early — and MemoryPlanningPass may have aliased that buffer
+                    // onto a tensor still live across the skipped region (buffers are reused by
+                    // original-order lifetime). Writing early then clobbers a live value →
+                    // silently wrong replay (the multi-input diffusion fan-out, #1620/#1624).
+                    // Stopping the run at the first step that can't join means no member is ever
+                    // hoisted across an intervening step's buffer lifetime — a structural fix
+                    // that holds regardless of how MemoryPlanning aliases buffers. (Within a
+                    // contiguous run the members are independent matmuls with no consumer
+                    // between them, so running them all at the first position reorders nothing
+                    // observable.)
+                    if (consumed.Contains(j)) break;
+                    if (steps[j].OpType != OpType.TensorMatMul || steps[j].Inputs.Length != 2) break;
+                    if (steps[j].Inputs[0].Rank != 2 || steps[j].Inputs[1].Rank != 2) break;
 
                     int jk = steps[j].Inputs[0]._shape[1];
                     int jn = steps[j].Inputs[1]._shape[1];
-                    if (jk != k || jn != n) continue;
+                    if (jk != k || jn != n) break;
 
-                    // Check independence: j's inputs must not depend on group outputs
-                    // AND must be available at position i (produced by steps before i,
-                    // or not produced by any step at all — i.e., graph-level inputs).
+                    // Independence: j's inputs must not depend on a group output, and must be
+                    // available at position i (produced before i, or a graph-level leaf).
                     bool canBatch = true;
                     foreach (var inp in steps[j].Inputs)
                     {
@@ -80,20 +88,16 @@ internal sealed class BlasBatchPass : ICpuOptimizationPass
                             canBatch = false;
                             break;
                         }
-                        // If this input is produced by a step that comes after position i,
-                        // it won't be available when the batched step executes at position i.
                         if (producedByStep.TryGetValue(inp, out int producerIdx) && producerIdx >= i)
                         {
                             canBatch = false;
                             break;
                         }
                     }
+                    if (!canBatch) break;
 
-                    if (canBatch)
-                    {
-                        group.Add(j);
-                        groupOutputs.Add(steps[j].OutputBuffer);
-                    }
+                    group.Add(j);
+                    groupOutputs.Add(steps[j].OutputBuffer);
                 }
 
                 if (group.Count >= 2)
@@ -142,28 +146,4 @@ internal sealed class BlasBatchPass : ICpuOptimizationPass
 
         return anyBatched ? result.ToArray() : null;
     }
-
-    /// <summary>
-    /// True when this step's output buffer shares its backing storage with another
-    /// tensor (storage refcount &gt; 1) — i.e. <see cref="MemoryPlanningPass"/> rebound
-    /// it onto a donor's storage, or it is a view.
-    /// <para>
-    /// Batching <b>hoists</b> every grouped matmul to the position of the group's
-    /// first member and runs them back-to-back there (see the batched delegate
-    /// below). MemoryPlanningPass runs earlier and computes buffer lifetimes from
-    /// the <i>original</i> step order; it may legally donate a buffer D (dead at
-    /// its original last-use) to a later matmul M's output. If BlasBatch then
-    /// hoists M earlier than D's last consumer, M's write lands in D's storage
-    /// before that consumer reads it — corrupting the consumer's input. (Concrete
-    /// case: shared-input Q/K/V projection matmuls feeding reshape→permute→SDPA;
-    /// the V-projection buffer dies at its reshape, MemoryPlanning donates it to
-    /// the K-projection matmul, and batching hoists that K matmul ahead of the V
-    /// reshape — clobbering V.) An output with refcount 1 is privately owned, so
-    /// hoisting it only computes its own value earlier into its own buffer, which
-    /// is always safe. Refusing to batch aliased outputs is the necessary and
-    /// sufficient guard; the only cost is forgoing the batch for those matmuls.
-    /// </para>
-    /// </summary>
-    private static bool HasAliasedOutput<T>(CompiledStep<T> step)
-        => step.OutputBuffer._storage.RefCount > 1 || step.OutputBuffer.IsView;
 }
