@@ -1,6 +1,7 @@
 using System;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
+using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
@@ -97,5 +98,70 @@ public class BatchNormAffineGradientTests
         for (int i = 0; i < refDx.Length; i++) Assert.Equal(refDx[i], gx[i], 4);
         for (int c = 0; c < C; c++) Assert.Equal(refDg[c], gg[c], 3);
         for (int c = 0; c < C; c++) Assert.Equal(refDb[c], gb[c], 3);
+    }
+
+    // #639: the WHOLE point of the affine-BN op is to survive the compiled-plan replay as a
+    // single node. This validates that GraphMode capture → CompiledTrainingPlan.Step() produces
+    // the SAME forward loss and the SAME gamma/beta gradients as the eager tape — i.e. the
+    // realize closure (running-stats reread) and the recorded BatchNormAffineBackward replay
+    // identically under compilation. mean/variance are constant running stats (batch=1 never
+    // refreshes them), so a single Step() is the representative replay.
+    [Fact]
+    public void BatchNormAffine_CompiledPlanReplay_MatchesEager()
+    {
+        // LazyTensorScope drives the forward closures with AiDotNetEngine.Current. On a GPU box
+        // that captured engine is DirectGpuTensorEngine; pin to CPU so the replay exercises the
+        // known-correct CpuEngine path this op was validated against (mirrors GroupNormOpTests).
+        var priorEngine = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = new CpuEngine();
+        try
+        {
+            var engine = new CpuEngine();
+            int N = 2, C = 3, H = 2, W = 2;
+            var x = Rnd(new[] { N, C, H, W }, 1);
+            var gamma = Rnd(new[] { C }, 2);
+            var beta = Rnd(new[] { C }, 3);
+            var mean = Rnd(new[] { C }, 4);
+            var variance = PosRnd(new[] { C }, 5);
+            double eps = 1e-3;
+
+            // Eager reference for loss = Σ y.
+            float eagerLoss;
+            float[] eagerDg, eagerDb;
+            using (var tape = new GradientTape<float>())
+            {
+                var y = engine.BatchNormAffine(x, gamma, beta, mean, variance, eps);
+                var loss = engine.ReduceSum(y, null);
+                eagerLoss = loss.GetFlattenedData()[0];
+                var grads = tape.ComputeGradients(loss, new[] { gamma, beta });
+                eagerDg = (float[])grads[gamma].GetFlattenedData().Clone();
+                eagerDb = (float[])grads[beta].GetFlattenedData().Clone();
+            }
+
+            // Compiled-plan replay of the same graph.
+            ICompiledTrainingPlan<float> plan;
+            using (var scope = GraphMode.Enable())
+            {
+                var y = engine.BatchNormAffine(x, gamma, beta, mean, variance, eps);
+                engine.ReduceSum(y, null);
+                plan = scope.CompileTraining(new[] { gamma, beta });
+            }
+
+            var loss2 = plan.Step();
+            Assert.False(float.IsNaN(loss2[0]), "Compiled BatchNormAffine loss is NaN");
+            Assert.Equal(eagerLoss, loss2[0], 3);
+
+            Assert.Equal(2, plan.Gradients.Length);
+            var planDg = plan.Gradients[0].AsSpan();
+            var planDb = plan.Gradients[1].AsSpan();
+            for (int c = 0; c < C; c++) Assert.Equal(eagerDg[c], planDg[c], 3);
+            for (int c = 0; c < C; c++) Assert.Equal(eagerDb[c], planDb[c], 3);
+
+            plan.Dispose();
+        }
+        finally
+        {
+            AiDotNetEngine.Current = priorEngine;
+        }
     }
 }
