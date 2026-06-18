@@ -689,4 +689,76 @@ public class MultiInputReplayAliasingTests : IDisposable
         }
         finally { cache.Dispose(); }
     }
+
+    [Fact]
+    public void AttentionFusion_RefusesFusion_WhenKeyHasNoProducingTranspose_StillMatchesEager()
+    {
+        // scores = Q @ K with K supplied DIRECTLY (not produced by a TensorTranspose) -> softmax -> @ V.
+        // The pass matches the MatMul->Softmax->MatMul shape, but the key operand has no producing
+        // transpose, so TryRecoverNaturalKey can't prove its orientation and returns false -> fusion is
+        // REFUSED. The plan must fall back to the unfused steps and still equal eager. Exercises the
+        // refuse-to-fuse path (no-producer branch) that keeps a non-attention/unprovable pattern correct.
+        var engine = new CpuEngine();
+        int seqQ = 5, d = 4, seqK = 6, dV = 4;
+        var q = Tensor<float>.CreateRandom(new[] { seqQ, d });
+        var kDirect = Tensor<float>.CreateRandom(new[] { d, seqK }); // used directly as the matmul's B
+        var v = Tensor<float>.CreateRandom(new[] { seqK, dV });
+
+        Func<Tensor<float>> forward = () =>
+        {
+            var scores = engine.TensorMatMul(q, kDirect);  // [seqQ, seqK] — no transpose feeds K
+            var probs = engine.TensorSoftmax(scores, -1);
+            return engine.TensorMatMul(probs, v);          // [seqQ, dV]
+        };
+
+        var eager = Snapshot(forward());
+        var cache = new CompiledModelCache<float>();
+        try
+        {
+            var plan = cache.GetOrCompileInference(new[] { q, kDirect, v }, forward);
+            plan.SetInputs(new[] { q, kDirect, v });
+            var got = Snapshot(plan.Execute());
+            Assert.Equal(eager.Length, got.Length);
+            for (int i = 0; i < got.Length; i++)
+                Assert.True(Math.Abs(got[i] - eager[i]) < 1e-4f,
+                    $"refuse-fusion (no-transpose) parity idx {i}: compiled {got[i]} vs eager {eager[i]}.");
+        }
+        finally { cache.Dispose(); }
+    }
+
+    [Fact]
+    public void AttentionFusion_RefusesFusion_WhenKeyProducerIsNotATranspose_StillMatchesEager()
+    {
+        // K is produced by a MatMul (not a TensorTranspose), so even though the operand has a producer,
+        // TryRecoverNaturalKey returns false at the OpType check -> fusion REFUSED -> unfused == eager.
+        // Exercises the "producer is not a transpose" refuse branch.
+        var engine = new CpuEngine();
+        int seqQ = 5, d = 4, m = 3, seqK = 6, dV = 4;
+        var q = Tensor<float>.CreateRandom(new[] { seqQ, d });
+        var kx = Tensor<float>.CreateRandom(new[] { d, m });
+        var kw = Tensor<float>.CreateRandom(new[] { m, seqK });
+        var v = Tensor<float>.CreateRandom(new[] { seqK, dV });
+
+        Func<Tensor<float>> forward = () =>
+        {
+            var kProj = engine.TensorMatMul(kx, kw);       // [d, seqK] — produced by a MatMul, not a transpose
+            var scores = engine.TensorMatMul(q, kProj);    // [seqQ, seqK]
+            var probs = engine.TensorSoftmax(scores, -1);
+            return engine.TensorMatMul(probs, v);          // [seqQ, dV]
+        };
+
+        var eager = Snapshot(forward());
+        var cache = new CompiledModelCache<float>();
+        try
+        {
+            var plan = cache.GetOrCompileInference(new[] { q, kx, kw, v }, forward);
+            plan.SetInputs(new[] { q, kx, kw, v });
+            var got = Snapshot(plan.Execute());
+            Assert.Equal(eager.Length, got.Length);
+            for (int i = 0; i < got.Length; i++)
+                Assert.True(Math.Abs(got[i] - eager[i]) < 1e-4f,
+                    $"refuse-fusion (non-transpose producer) parity idx {i}: compiled {got[i]} vs eager {eager[i]}.");
+        }
+        finally { cache.Dispose(); }
+    }
 }
