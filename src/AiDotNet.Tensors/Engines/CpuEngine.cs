@@ -5000,7 +5000,14 @@ public partial class CpuEngine : ITensorLevelEngine
                 var capturedA = a;
                 var capturedB = b;
                 return scope.RecordBinary(LazyNodeType.Multiply, "TensorMultiply", a, b, a._shape,
-                    (eng, output) => eng.TensorMultiplyInto(output, capturedA, capturedB),
+                    (eng, output) =>
+                    {
+                        // GPU-resident elementwise multiply into output's stable buffer (no host materialize that
+                        // breaks CUDA-graph capture); else the host write-through.
+                        if (eng is DirectGpuTensorEngine mGpu && mGpu.TryMultiplyResidentInto(output, capturedA, capturedB))
+                            return;
+                        eng.TensorMultiplyInto(output, capturedA, capturedB);
+                    },
                     BackwardFunctions<T>.MultiplyBackward);
             }
         }

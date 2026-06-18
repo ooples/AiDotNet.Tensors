@@ -3184,6 +3184,27 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         catch (Exception sex) { AliasDiag($"MulScalar-resident FELLBACK a=[{string.Join(",", a._shape)}]: {sex.GetType().Name}: {sex.Message}"); return false; }
     }
 
+    /// <summary>GPU-RESIDENT elementwise multiply (same-shape a*b) for the compiled step via backend.Multiply
+    /// into the destination's stable buffer — no host CpuEngine.TensorMultiplyInto (DtoH download = CUDA-900
+    /// that aborts capture). Same-shape only (broadcasting falls back). Returns false to fall back.</summary>
+    internal bool TryMultiplyResidentInto<T>(Tensor<T> output, Tensor<T> a, Tensor<T> b)
+    {
+        if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
+        if (!TryGetBackend(out var backend)) return false;
+        if (!a.IsContiguous || !b.IsContiguous || a.Length != output.Length || b.Length != a.Length) return false;
+        try
+        {
+            using var bufA = GetResidentOrPersistentInputBuffer(backend, a);
+            using var bufB = GetResidentOrPersistentInputBuffer(backend, b);
+            var outBuf = GetOrCreateResidentBuffer(backend, output, output.Length);
+            backend.Multiply(bufA.Buffer, bufB.Buffer, outBuf, output.Length);
+            ResidentSyncCheck("Multiply");
+            BindResidentBuffer(output, outBuf, backend);
+            return true;
+        }
+        catch (Exception mex) { AliasDiag($"Mul-resident FELLBACK a=[{string.Join(",", a._shape)}] b=[{string.Join(",", b._shape)}]: {mex.GetType().Name}: {mex.Message}"); return false; }
+    }
+
     /// <summary>GPU-RESIDENT embedding lookup from FLOAT indices for the compiled step (the cortex's actual
     /// embedding op): backend.Embedding (the kernel casts float→int) into the destination's stable buffer, with
     /// the table from the PERSISTENT weight cache and the indices from the resident input buffer — no host gather
