@@ -1,6 +1,7 @@
 using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Engines.Simd;
 using AiDotNet.Tensors.Helpers;
+using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Engines.Optimization;
 
@@ -100,7 +101,19 @@ internal sealed class AttentionFusionPass : ICpuOptimizationPass
         if (typeof(T) != typeof(float)) return false;
 
         var queryTensor = qk.Inputs[0];
-        var keyTensor = qk.Inputs[1]; // This is K (or K^T depending on how the graph was built)
+
+        // The matched QK op is a plain TensorMatMul/BatchMatMul (no transpose flag),
+        // so to compute scores = Q @ K^T its second operand is K^T — the output of a
+        // TensorTranspose(K) step. FlashAttention computes Q @ K^T INTERNALLY and so
+        // needs the NATURAL key K ([.., seqK, headDim]); feeding it the already-
+        // transposed K^T makes it transpose twice (→ Q @ K), which is silently wrong
+        // whenever seqK == headDim (equal shapes pass every downstream dim check) and
+        // also breaks the seqK/headDim extraction below (both were written for natural K).
+        // Recover natural K by tracing the transpose that produced the operand; if the
+        // operand is not a clean last-two-dim transpose output we cannot prove its
+        // layout, so refuse to fuse rather than risk corruption.
+        if (!TryRecoverNaturalKey(steps, index, qk.Inputs[1], out var keyTensor))
+            return false;
         var valueTensor = attnV.Inputs[1];
         var finalOutput = attnV.OutputBuffer;
 
@@ -212,5 +225,42 @@ internal sealed class AttentionFusionPass : ICpuOptimizationPass
             null);
 
         return true;
+    }
+
+    /// <summary>
+    /// Recovers the natural key tensor K from the second operand of a Q @ K^T matmul.
+    /// Because <see cref="OpType.TensorMatMul"/>/<see cref="OpType.BatchMatMul"/> carry no
+    /// transpose flag, an attention graph materialises K^T with a <see cref="OpType.TensorTranspose"/>
+    /// step and feeds its output as the matmul's second operand. The FlashAttention kernels transpose
+    /// K internally, so they require natural K — we trace that transpose to its input.
+    /// <see cref="CpuEngine.TensorTranspose{T}"/> is 2D-only and always swaps the two dims, so a
+    /// TensorTranspose producer's input is exactly the natural [seqK, headDim] key. Returns false
+    /// (caller must NOT fuse) when the operand has no producing transpose or was produced by some other
+    /// op — there the orientation cannot be proven and fusing would risk a silently-transposed key. The
+    /// downstream rank checks validate the recovered key's shape, so no extra shape guard is needed here.
+    /// </summary>
+    private static bool TryRecoverNaturalKey<T>(
+        CompiledStep<T>[] steps, int qkIndex, Tensor<T> keyOperand, out Tensor<T> naturalKey)
+    {
+        naturalKey = keyOperand;
+
+        for (int s = qkIndex - 1; s >= 0; s--)
+        {
+            var producer = steps[s];
+            if (producer.OutputBuffer is null || !ReferenceEquals(producer.OutputBuffer, keyOperand))
+                continue;
+
+            // The K operand is K^T only if a TensorTranspose produced it; recover that transpose's input
+            // (the natural key). Any other producer leaves the orientation unprovable -> refuse to fuse.
+            if (producer.OpType == OpType.TensorTranspose && producer.Inputs is { Length: >= 1 })
+            {
+                naturalKey = producer.Inputs[0];
+                return true;
+            }
+            return false;
+        }
+
+        // No producing step found (the key is a direct plan input): orientation unknown -> refuse.
+        return false;
     }
 }

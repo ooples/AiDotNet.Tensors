@@ -91,7 +91,15 @@ public sealed class TensorCodecOptions
     /// <summary>Phase 4.1: Fold BatchNorm into Conv2D weights at compile time.</summary>
     public bool EnableConvBnFusion { get; set; } = true;
 
-    /// <summary>Phase 4.2: Fuse attention Q@K^T->Softmax->V patterns.</summary>
+    /// <summary>Phase 4.2: Fuse attention Q@K^T->Softmax->V patterns into a FlashAttention kernel.
+    /// Re-enabled: the fusion now structurally recovers natural K. FlashAttention needs K in
+    /// [.., seqK, headDim] layout, but the QK step is a plain matmul(Q, Kᵀ) whose second operand is Kᵀ
+    /// ([.., headDim, seqK]) — the output of a TensorTranspose(K) step (plain matmul carries no transpose
+    /// flag). <see cref="AttentionFusionPass"/> traces that transpose back to its input to feed natural K,
+    /// and REFUSES to fuse when the operand's layout cannot be proven (no producing transpose / not a clean
+    /// last-two-dim swap), so the previous silent-corruption-at-seqK==headDim case can no longer occur.
+    /// Inference-only (CompiledInferencePlan.RunCpuOptimizationPasses), so the forward-only fused step
+    /// needs no backward kernel.</summary>
     public bool EnableAttentionFusion { get; set; } = true;
 
     /// <summary>Phase 4.3: Merge consecutive pointwise ops into fewer dispatch steps.</summary>
