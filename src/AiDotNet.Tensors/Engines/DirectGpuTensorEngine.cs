@@ -3080,7 +3080,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
         if (!TryGetBackend(out var backend)) return false;
-        if (a.Rank < 2 || b.Rank != 2 || !a.IsContiguous || !b.IsContiguous) return false;
+        if (a.Rank < 2 || b.Rank != 2 || !a.IsContiguous || !b.IsContiguous)
+        {
+            AliasDiag($"MM-resident SKIP a=[{string.Join(",", a._shape)}](contig={a.IsContiguous}) b=[{string.Join(",", b._shape)}](contig={b.IsContiguous}) bRank={b.Rank}");
+            return false;
+        }
         int K = b.Shape._dims[0];
         int N = b.Shape._dims[1];
         if (a.Shape._dims[a.Rank - 1] != K) return false;
@@ -3096,6 +3100,42 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return true;
         }
         catch (Exception mex) { AliasDiag($"MM-resident FELLBACK a=[{string.Join(",", a._shape)}] b=[{string.Join(",", b._shape)}]: {mex.GetType().Name}: {mex.Message}"); return false; }
+    }
+
+    /// <summary>GPU-RESIDENT ND×ND BATCHED matmul for the compiled step (the attention QK^T / AV: [B,H,M,K] @
+    /// [B,H,K,N] = [B,H,M,N]) via cublasSgemmStridedBatched into the destination's stable buffer — no host
+    /// CpuEngine.TensorMatMulFloatInto (which materializes inputs → a DtoH download = non-capturable CUDA-900
+    /// that aborts whole-step capture, the #38 attention-matmul blocker). Contiguous batches only (stride
+    /// M*K / K*N / M*N — exactly what BatchedGemm assumes). Returns false to fall back.</summary>
+    internal bool TryBatchedMatMulResidentInto<T>(Tensor<T> output, Tensor<T> a, Tensor<T> b)
+    {
+        if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
+        if (!TryGetBackend(out var backend) || backend is not DirectGpu.CUDA.CudaBackend cb) return false;
+        int rank = a.Rank;
+        // ND batched: equal rank ≥ 3, contiguous, matching leading (batch) dims, inner dims compatible (K).
+        if (rank < 3 || b.Rank != rank || !a.IsContiguous || !b.IsContiguous) return false;
+        int M = a.Shape._dims[rank - 2];
+        int K = a.Shape._dims[rank - 1];
+        int Kb = b.Shape._dims[rank - 2];
+        int N = b.Shape._dims[rank - 1];
+        if (K != Kb) return false;
+        int batch = 1;
+        for (int i = 0; i < rank - 2; i++)
+        {
+            if (a.Shape._dims[i] != b.Shape._dims[i]) return false;   // batch dims must match
+            batch *= a.Shape._dims[i];
+        }
+        if ((long)batch * M * N != output.Length) return false;
+        try
+        {
+            using var bufA = GetResidentOrPersistentInputBuffer(backend, a);
+            using var bufB = GetResidentOrPersistentInputBuffer(backend, b);
+            var outBuf = GetOrCreateResidentBuffer(backend, output, batch * M * N);
+            cb.BatchedGemm(bufA.Buffer, bufB.Buffer, outBuf, M, N, K, batch, 1.0f, 0.0f);
+            BindResidentBuffer(output, outBuf, backend);
+            return true;
+        }
+        catch (Exception mex) { AliasDiag($"BMM-resident FELLBACK a=[{string.Join(",", a._shape)}] b=[{string.Join(",", b._shape)}]: {mex.GetType().Name}: {mex.Message}"); return false; }
     }
 
     /// <summary>GPU-RESIDENT embedding lookup from FLOAT indices for the compiled step (the cortex's actual

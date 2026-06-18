@@ -11473,6 +11473,11 @@ public partial class CpuEngine : ITensorLevelEngine
                         // breaks CUDA-graph capture); else the host write-through path.
                         if (eng is DirectGpuTensorEngine mmGpu && mmGpu.TryMatMulResidentInto(output, capturedA, capturedB))
                             return;
+                        // GPU-resident ND×ND BATCHED matmul (attention QK^T / AV) — same residency contract via
+                        // cublasSgemmStridedBatched; without it the 4D attention matmuls host-fall-back = CUDA-900
+                        // that aborts capture (#38).
+                        if (eng is DirectGpuTensorEngine bmmGpu && bmmGpu.TryBatchedMatMulResidentInto(output, capturedA, capturedB))
+                            return;
                         if (typeof(T) == typeof(float) && eng is CpuEngine cpuEngF)
                         {
                             cpuEngF.TensorMatMulFloatInto(
