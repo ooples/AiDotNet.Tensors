@@ -87,9 +87,15 @@ internal static class AutoTrainingCompiler
         // the caller actually wants gradients for.
         long currentHash = ComputeStructureHash(tape.Entries, tape.EntryCount);
         currentHash = IncludeTargetIdentity(currentHash, loss, sources);
-        if (!State.MatchesCompiledHash(currentHash))
+        // Match on BOTH the full hash AND exact source reference-equality. The
+        // hash alone is collision-prone (XOR of 32-bit GetHashCode values), and
+        // the state is thread-static — a different model on the same thread could
+        // collide and replay the wrong backward against the wrong parameters
+        // (the flaky, batch-only LossStrictly failures). The reference check makes
+        // a cross-model hit impossible.
+        if (!State.MatchesCompiledHash(currentHash) || !State.SourcesMatch(sources))
         {
-            // Pattern changed — disable replay mode so recording resumes
+            // Pattern / sources changed — disable replay mode so recording resumes
             ReplayMode = false;
             return null;
         }
@@ -145,7 +151,7 @@ internal static class AutoTrainingCompiler
             // computation in TryGetCompiledBackward — both must agree.
             long hash = ComputeStructureHash(tape.Entries, tape.EntryCount);
             hash = IncludeTargetIdentity(hash, loss, sources);
-            State.StoreCompiledBackwardWithHash(compiled, hash);
+            State.StoreCompiledBackwardWithHash(compiled, hash, sources);
             // Drop the plan's strong reference to the compilation-time loss
             // tensor. The compile cache is thread-static and persists for
             // the lifetime of the worker thread; without this release, the
@@ -303,6 +309,15 @@ internal sealed class AutoTrainingState
     private int _repeatCount;
     private object? _compiledBackward; // CompiledBackwardGraph<T> — type-erased
     private bool _compiledStored;
+    // Weak references to the EXACT source tensors the compiled plan was built
+    // against. The full hash (_compiledHash) folds in RuntimeHelpers.GetHashCode
+    // of these sources, but hash codes are 32-bit and XOR-combined, so a
+    // DIFFERENT model on the same (thread-static) state could collide and replay
+    // the wrong backward — silently producing wrong gradients (root cause of the
+    // flaky, batch-only LossStrictly failures). Verifying reference-equality of
+    // the sources on lookup makes a cross-model hit impossible. Weak so the plan
+    // never pins another model's parameter tensors alive.
+    private System.WeakReference<object>[]? _compiledSourceRefs;
 
     private const int CompileThreshold = 2;
 
@@ -321,17 +336,24 @@ internal sealed class AutoTrainingState
         {
             _repeatCount++;
         }
-        else if (!_compiledStored || hash != _lastStepHash)
+        else
         {
-            // New pattern — reset state. But don't drop compiled state if
-            // the pattern hash matches (only the full hash differs due to sources).
+            // New STRUCTURE pattern (different model / input shape). The
+            // thread-static state persists across models and tests on the same
+            // thread, so a previously-compiled plan here belongs to the OLD
+            // structure and its source tensors. Drop it completely: keeping it
+            // (the previous behaviour, which only cleared when !_compiledStored)
+            // let a structurally-different model leave a stale plan in the single
+            // slot, which then blocked its own compilation and — on a hash
+            // collision — could be replayed against the wrong parameters. A model
+            // whose structure genuinely repeats will recompile on its next steps.
             _lastStepHash = hash;
             _repeatCount = 1;
-            if (!_compiledStored)
-            {
-                _compilationFailed = false;
-                _compiledBackward = null;
-            }
+            _compilationFailed = false;
+            _compiledBackward = null;
+            _compiledStored = false;
+            _compiledHash = 0;
+            _compiledSourceRefs = null;
         }
     }
 
@@ -341,11 +363,45 @@ internal sealed class AutoTrainingState
         _compiledStored = true;
     }
 
-    internal void StoreCompiledBackwardWithHash<T>(CompiledBackwardGraph<T> compiled, long hash)
+    internal void StoreCompiledBackwardWithHash<T>(CompiledBackwardGraph<T> compiled, long hash, Tensor<T>[]? sources)
     {
         _compiledBackward = compiled;
         _compiledStored = true;
         _compiledHash = hash; // Store full hash (pattern + sources) for lookup matching
+        // Record the EXACT source tensors (weakly) so lookup can confirm the
+        // plan belongs to THIS model and not a hash-colliding different one.
+        if (sources is null || sources.Length == 0)
+        {
+            _compiledSourceRefs = null;
+        }
+        else
+        {
+            _compiledSourceRefs = new System.WeakReference<object>[sources.Length];
+            for (int i = 0; i < sources.Length; i++)
+                _compiledSourceRefs[i] = new System.WeakReference<object>(sources[i]);
+        }
+    }
+
+    /// <summary>
+    /// True only if the stored plan was compiled against EXACTLY these source
+    /// tensor instances (same count, each reference-equal). Guards against a
+    /// hash collision serving one model's plan to another. A null/empty stored
+    /// source set only matches a null/empty query (structure-only plans are
+    /// refused at compile time, so this is the defensive case).
+    /// </summary>
+    internal bool SourcesMatch<T>(Tensor<T>[]? sources)
+    {
+        var stored = _compiledSourceRefs;
+        int queryLen = sources?.Length ?? 0;
+        int storedLen = stored?.Length ?? 0;
+        if (queryLen != storedLen) return false;
+        if (storedLen == 0) return true;
+        for (int i = 0; i < storedLen; i++)
+        {
+            if (!stored![i].TryGetTarget(out var obj) || !ReferenceEquals(obj, sources![i]))
+                return false;
+        }
+        return true;
     }
 
     internal CompiledBackwardGraph<T>? TryGetCompiledBackward<T>()
