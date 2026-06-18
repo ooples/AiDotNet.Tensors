@@ -89,6 +89,13 @@ public static class TensorPool<T>
         // pin; the tape's cleanup walk clears it after backward.
         if (tensor._pinnedByTape) return;
 
+        // GPU residency: a tensor produced by a GPU op carries a PENDING deferred GPU→CPU download (its CPU
+        // backing isn't populated until something reads it). Pooling it calls GetLiveBackingArrayOrNull →
+        // GetDataArray, which would FORCE that download (a host round-trip) purely to recycle the array. Skip
+        // pooling such tensors — the few recycled bytes aren't worth breaking GPU residency; the temp is GC'd.
+        var unsafeBacking = tensor.DataVector.GetBackingArrayUnsafe();
+        if (unsafeBacking is not null && Helpers.DeferredArrayMaterializer.IsPending(unsafeBacking)) return;
+
         // Issue #338 view-safety: refuse view-tensors whose backing
         // storage is shared with another tensor (strided permute views,
         // reshape views, and offset/sliced views). Recycling such a

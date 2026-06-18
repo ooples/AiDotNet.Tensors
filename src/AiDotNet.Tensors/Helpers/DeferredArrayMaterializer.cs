@@ -34,6 +34,18 @@ internal static class DeferredArrayMaterializer
     /// </summary>
     private static int _pendingCount;
 
+    // Diagnostics: total deferred GPU→CPU downloads actually performed (each fired callback = one DtoH copy of a
+    // resident tensor to host). A test resets this around a training step and asserts it stays ~0 to prove the
+    // forward/backward kept every activation/gradient GPU-resident (no per-op host round-trip). Always-on counter
+    // on the (already-expensive) transfer path — negligible overhead.
+    private static long _materializeCount;
+
+    /// <summary>Total deferred GPU→CPU materializations (DtoH downloads) performed since the last reset.</summary>
+    public static long MaterializeCount => Volatile.Read(ref _materializeCount);
+
+    /// <summary>Resets <see cref="MaterializeCount"/> to zero (test instrumentation).</summary>
+    public static void ResetMaterializeCount() => Interlocked.Exchange(ref _materializeCount, 0);
+
     /// <summary>
     /// Registers a deferred materialization callback for the given array.
     /// When TryMaterialize is called with this array, the callback runs to populate it.
@@ -80,6 +92,7 @@ internal static class DeferredArrayMaterializer
         if (_pendingMaterializations.TryRemove(array, out var pending))
         {
             Interlocked.Decrement(ref _pendingCount);
+            Interlocked.Increment(ref _materializeCount); // a real DtoH download is about to run
             pending.Callback(array);
             return true;
         }

@@ -1690,6 +1690,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// degrades to a cache-miss re-upload (correct, slower), never a use-after-free.
     /// </summary>
     internal void EvictActivationsCreatedAfter(long snapshot, HashSet<object>? protect)
+        => EvictActivationsCreatedAfter(snapshot, protect, materializePending: true);
+
+    /// <summary>
+    /// As above, with control over the pending-download policy. <paramref name="materializePending"/>=true keeps
+    /// the #226 materialize-then-free contract (safe for general use: an over-eviction degrades to a re-upload).
+    /// =false DISCARDS each pending download (Remove, no DtoH copy) before freeing — for the FP16 hetero backward
+    /// SCRATCH, which is provably dead (not a node output kept past its forward, not a protected live gradient,
+    /// never read again), so materializing it would be a wasted GPU→CPU transfer that breaks full residency. The
+    /// FP16 parity tests gate correctness: a wrongful discard of a still-needed tensor would corrupt the grads.
+    /// </summary>
+    internal void EvictActivationsCreatedAfter(long snapshot, HashSet<object>? protect, bool materializePending)
     {
         // The activation timestamp counter is process-wide, so "created after my snapshot"
         // also matches a CONCURRENT tape's activations on another thread. Free only THIS
@@ -1709,8 +1720,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 if (protect is not null && protect.Contains(entries[i].Key)) continue; // live gradient — keep
                 if (Helpers.DeferredArrayMaterializer.IsPending(entries[i].Key))
                 {
-                    try { Helpers.DeferredArrayMaterializer.TryMaterialize(entries[i].Key); }
-                    catch { Helpers.DeferredArrayMaterializer.Remove(entries[i].Key); }
+                    if (materializePending)
+                    {
+                        // #226 safe path: flush the pending DtoH so a later CPU read still sees correct data.
+                        try { Helpers.DeferredArrayMaterializer.TryMaterialize(entries[i].Key); }
+                        catch { Helpers.DeferredArrayMaterializer.Remove(entries[i].Key); }
+                    }
+                    else
+                    {
+                        // Dead scratch: drop the pending download (no DtoH) — keeps the step fully GPU-resident.
+                        Helpers.DeferredArrayMaterializer.Remove(entries[i].Key);
+                    }
                 }
                 if (_activationCache.TryRemove(entries[i].Key, out var entry))
                 {
@@ -2031,6 +2051,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         CacheActivation(result, halfBuffer, shape, backend, isFp16: true, elementCount: elementCount);
         return result;
     }
+
 
     /// <summary>
     /// Get a tensor's resident FP16 activation buffer DIRECTLY (no up-cast) when it is stored as an IsFp16

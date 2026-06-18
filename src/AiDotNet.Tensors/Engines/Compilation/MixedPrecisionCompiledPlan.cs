@@ -278,7 +278,9 @@ public sealed class MixedPrecisionCompiledPlan
                             var a = g.DataVector.GetBackingArrayUnsafe();
                             if (a is not null) protect.Add(a);
                         }
-                        _freeEng.EvictActivationsCreatedAfter(bwdSnap, protect);
+                        // materializePending:false — the scratch is dead (not protected, not a forward activation
+                        // kept past the snapshot), so dropping its pending download keeps the step fully resident.
+                        _freeEng.EvictActivationsCreatedAfter(bwdSnap, protect, materializePending: false);
                     }
                     : null);
         }

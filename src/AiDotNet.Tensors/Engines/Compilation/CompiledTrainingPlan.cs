@@ -1292,7 +1292,16 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // buffers); the stable node-output tensors re-cache on the next step's Execute. This is what keeps
             // the FP16 path's cross-step VRAM flat instead of climbing ~0.8MB/step.
             if (fp16SnapEng is not null && fp16ActSnapshot >= 0)
-                fp16SnapEng.EvictActivationsCreatedAfter(fp16ActSnapshot);
+            {
+                // FULL-RESIDENCY: the ONLY value the caller reads from a step is the scalar loss (the returned
+                // tensor). Materialize just that (one tiny GPU→CPU copy) and DISCARD every other dead step
+                // intermediate without a download — so a training step's only host transfer is the loss readout
+                // (the activations / gradients / optimizer state never round-trip). The next step's Execute
+                // recomputes the node outputs; reading any non-loss output after Step() is not part of its contract.
+                var lossKey = _lossOutput.DataVector.GetBackingArrayUnsafe();
+                if (lossKey is not null) Helpers.DeferredArrayMaterializer.TryMaterialize(lossKey);
+                fp16SnapEng.EvictActivationsCreatedAfter(fp16ActSnapshot, protect: null, materializePending: false);
+            }
             // Bound cross-step VRAM growth: per-step transient activation buffers are dereferenced
             // here but their device memory is only released by the GC finalizer, which cannot keep
             // pace under fast stepping (steady climb to OOM, "drained 0 pooled buffers"). Force a
