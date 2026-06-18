@@ -3191,7 +3191,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
         if (!TryGetBackend(out var backend)) return false;
-        if (!a.IsContiguous || !b.IsContiguous || a.Length != output.Length || b.Length != a.Length) return false;
+        if (!a.IsContiguous || !b.IsContiguous || a.Length != output.Length || b.Length != a.Length)
+        {
+            if (s_residentSyncDebug) AliasDiag($"Mul-resident SKIP a=[{string.Join(",", a._shape)}] b=[{string.Join(",", b._shape)}] out=[{string.Join(",", output._shape)}]");
+            return false;
+        }
         try
         {
             using var bufA = GetResidentOrPersistentInputBuffer(backend, a);
@@ -3257,6 +3261,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var bufIn = GetResidentOrPersistentInputBuffer(backend, input);
             var outBuf = GetOrCreateResidentBuffer(backend, output, outerSize * stride);
             cudaB.SliceAxis(bufIn.Buffer, outBuf, outerSize, axisSize, stride, index);
+            ResidentSyncCheck("SliceAxis");
             BindResidentBuffer(output, outBuf, backend);
             return true;
         }
