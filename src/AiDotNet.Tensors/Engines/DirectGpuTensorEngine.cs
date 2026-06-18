@@ -4128,8 +4128,37 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         base.GroupNormInto(output, input, numGroups, gamma, beta, epsilon, out mean, out variance);
     }
 
+    /// <summary>GPU-RESIDENT last-axis softmax for the compiled step (the attention-score softmax [B,H,S,S] over
+    /// the last axis): resolves the input's resident buffer and writes into the destination's stable buffer via
+    /// backend.Softmax — NO GetDataArray download, NO fresh AllocateBuffer, NO result download (the three things the
+    /// naive IEngine.SoftmaxInto below does, every one of which is illegal during CUDA-graph stream capture and was
+    /// the forwardAction#25 capture invalidator).</summary>
+    internal bool TrySoftmaxResidentInto<T>(Tensor<T> output, Tensor<T> input, int axis)
+    {
+        if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
+        if (!TryGetBackend(out var backend) || !input.IsContiguous) return false;
+        int normAxis = axis < 0 ? input.Rank + axis : axis;
+        if (normAxis != input.Rank - 1) return false;   // backend.Softmax reduces the contiguous LAST axis only
+        int axisSize = input.Shape._dims[normAxis];
+        if (axisSize <= 0 || input.Length % axisSize != 0) return false;
+        if ((long)input.Length != output.Length) return false;
+        try
+        {
+            using var bufIn = GetResidentOrPersistentInputBuffer(backend, input);
+            var outBuf = GetOrCreateResidentBuffer(backend, output, input.Length);
+            backend.Softmax(bufIn.Buffer, outBuf, input.Length / axisSize, axisSize);
+            ResidentSyncCheck("Softmax");
+            BindResidentBuffer(output, outBuf, backend);
+            return true;
+        }
+        catch (Exception sex) { AliasDiag($"Softmax-resident FELLBACK ax={axis} len={input.Length}: {sex.GetType().Name}: {sex.Message}"); return false; }
+    }
+
     void IEngine.SoftmaxInto<T>(Tensor<T> destination, Tensor<T> input, int axis)
     {
+        // GPU-resident write into the destination's stable buffer (compiled/capture path); else the naive
+        // upload→compute→download below (eager only — it would invalidate stream capture).
+        if (TrySoftmaxResidentInto(destination, input, axis)) return;
         // Try GPU softmax: upload input, compute on GPU, download to destination
         if (TryGetBackend(out var gpuBackend))
         {
