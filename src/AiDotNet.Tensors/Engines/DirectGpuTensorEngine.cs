@@ -4049,10 +4049,72 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         base.ReLUInPlace(tensor);
     }
 
+    /// <summary>GPU-RESIDENT elementwise ReLU into the destination's stable buffer (compiled/capture path): resolve
+    /// the input's resident buffer → backend.Relu → bind output, no host download (the ReLU().Data.CopyTo below
+    /// materializes = breaks CUDA-graph capture).</summary>
+    internal bool TryReLUResidentInto<T>(Tensor<T> output, Tensor<T> input)
+    {
+        if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
+        if (!TryGetBackend(out var backend) || !input.IsContiguous) return false;
+        if ((long)input.Length != output.Length) return false;
+        try
+        {
+            using var bufIn = GetResidentOrPersistentInputBuffer(backend, input);
+            var outBuf = GetOrCreateResidentBuffer(backend, output, input.Length);
+            backend.Relu(bufIn.Buffer, outBuf, input.Length);
+            ResidentSyncCheck("ReLU");
+            BindResidentBuffer(output, outBuf, backend);
+            return true;
+        }
+        catch (Exception rex) { AliasDiag($"ReLU-resident FELLBACK len={input.Length}: {rex.GetType().Name}: {rex.Message}"); return false; }
+    }
+
     void IEngine.ReLUInto<T>(Tensor<T> dest, Tensor<T> input)
     {
+        if (TryReLUResidentInto(dest, input)) return;
         var result = ((IEngine)this).ReLU(input);
         result.Data.Span.CopyTo(dest.Data.Span);
+    }
+
+    /// <summary>GPU-RESIDENT elementwise natural-log into the destination's stable buffer (compiled/capture path,
+    /// e.g. the cross-entropy log of softmax probs): resolve resident input → backend.Log → bind output, no host
+    /// download. NOTE the recording delegate must check DirectGpuTensorEngine BEFORE `eng is CpuEngine` (DirectGpu
+    /// INHERITS CpuEngine, so a CpuEngine-first branch runs the host TensorLogInto on the GPU engine = download).</summary>
+    internal bool TryLogResidentInto<T>(Tensor<T> output, Tensor<T> input)
+    {
+        if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
+        if (!TryGetBackend(out var backend) || !input.IsContiguous) return false;
+        if ((long)input.Length != output.Length) return false;
+        try
+        {
+            using var bufIn = GetResidentOrPersistentInputBuffer(backend, input);
+            var outBuf = GetOrCreateResidentBuffer(backend, output, input.Length);
+            backend.Log(bufIn.Buffer, outBuf, input.Length);
+            ResidentSyncCheck("Log");
+            BindResidentBuffer(output, outBuf, backend);
+            return true;
+        }
+        catch (Exception lex) { AliasDiag($"Log-resident FELLBACK len={input.Length}: {lex.GetType().Name}: {lex.Message}"); return false; }
+    }
+
+    /// <summary>GPU-RESIDENT elementwise negate into the destination's stable buffer (compiled/capture path, e.g.
+    /// the -log(p) of cross-entropy): resolve resident input → backend.Negate → bind output, no host download (the
+    /// recorded delegate's NumOps.Negate(span,span) materializes both = breaks capture).</summary>
+    internal bool TryNegateResidentInto<T>(Tensor<T> output, Tensor<T> input)
+    {
+        if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
+        if (!TryGetBackend(out var backend) || !input.IsContiguous) return false;
+        if ((long)input.Length != output.Length) return false;
+        try
+        {
+            using var bufIn = GetResidentOrPersistentInputBuffer(backend, input);
+            var outBuf = GetOrCreateResidentBuffer(backend, output, input.Length);
+            backend.Negate(bufIn.Buffer, outBuf, input.Length);
+            ResidentSyncCheck("Negate");
+            BindResidentBuffer(output, outBuf, backend);
+            return true;
+        }
+        catch (Exception nex) { AliasDiag($"Negate-resident FELLBACK len={input.Length}: {nex.GetType().Name}: {nex.Message}"); return false; }
     }
 
     void IEngine.Conv2DInto<T>(Tensor<T> output, Tensor<T> input, Tensor<T> kernel, int stride, int padding, int dilation)
@@ -4652,6 +4714,44 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// Uses cached GPU buffers for registered persistent tensors (weights/bias) to avoid
     /// redundant CPU→GPU transfers on every forward pass.
     /// </summary>
+    /// <summary>GPU-RESIDENT FusedLinear (the FFN matmul+bias+activation) for the compiled/capture step: GEMM into
+    /// the destination's stable buffer, in-place BiasAdd, in-place activation — NO host GetReadOnlyDataArray download
+    /// (the CpuEngine.FusedLinear fallback's download was the capture invalidator). Rank-3 [B,S,D] input flattens via
+    /// M = input.Length / K. Only None/ReLU/GELU (the cortex FFN is GELU) — others decline to the eager path.</summary>
+    internal bool TryFusedLinearResidentInto<T>(Tensor<T> output, Tensor<T> input, Tensor<T> weights, Tensor<T>? bias,
+        FusedActivationType activation, FusedActivationParams? activationParams)
+    {
+        if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
+        if (activationParams is not null) return false;   // parametric activations not plumbed into the GPU kernels
+        if (activation != FusedActivationType.None && activation != FusedActivationType.ReLU && activation != FusedActivationType.GELU) return false;
+        if (!TryGetBackend(out var backend)) return false;
+        if (input.Rank < 1 || weights.Rank != 2 || !input.IsContiguous || !weights.IsContiguous) return false;
+        int K = weights.Shape._dims[0];
+        int N = weights.Shape._dims[1];
+        if (K <= 0 || input.Length % K != 0) return false;
+        int M = input.Length / K;
+        if ((long)M * N != output.Length) return false;
+        if (bias is not null && (bias.Length != N || !bias.IsContiguous)) return false;
+        try
+        {
+            using var bufIn = GetResidentOrPersistentInputBuffer(backend, input);
+            using var bufW = GetResidentOrPersistentInputBuffer(backend, weights);
+            var outBuf = GetOrCreateResidentBuffer(backend, output, M * N);
+            backend.Gemm(bufIn.Buffer, bufW.Buffer, outBuf, M, N, K, 1.0f, 0.0f);
+            if (bias is not null)
+            {
+                using var bufB = GetResidentOrPersistentInputBuffer(backend, bias);
+                backend.BiasAdd(outBuf, bufB.Buffer, outBuf, M, N);   // in-place: C and A both = outBuf
+            }
+            if (activation == FusedActivationType.ReLU) backend.Relu(outBuf, outBuf, M * N);
+            else if (activation == FusedActivationType.GELU) backend.Gelu(outBuf, outBuf, M * N);
+            ResidentSyncCheck("FusedLinear");
+            BindResidentBuffer(output, outBuf, backend);
+            return true;
+        }
+        catch (Exception fex) { AliasDiag($"FusedLinear-resident FELLBACK M={M} N={N} K={K} act={activation}: {fex.GetType().Name}: {fex.Message}"); return false; }
+    }
+
     public override Tensor<T> FusedLinear<T>(Tensor<T> input, Tensor<T> weights, Tensor<T>? bias, FusedActivationType activation, FusedActivationParams? activationParams = null)
     {
         // Parametric activation parameters (LeakyReLU slope, ELU/CELU alpha,

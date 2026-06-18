@@ -6017,6 +6017,9 @@ public partial class CpuEngine : ITensorLevelEngine
                 return scope.RecordUnary(LazyNodeType.Custom, "TensorLog", tensor, tensor._shape,
                     (eng, output) =>
                     {
+                        // DirectGpu FIRST (it inherits CpuEngine, so an `is CpuEngine` branch would run the host log
+                        // on the GPU engine → download → breaks capture). Resident GPU log into output's stable buffer.
+                        if (eng is DirectGpuTensorEngine dgeLog && dgeLog.TryLogResidentInto(output, captured)) return;
                         if (eng is CpuEngine cpuEng) cpuEng.TensorLogInto(output, captured);
                         else { var r = eng.TensorLog(captured); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
@@ -6266,7 +6269,13 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var captured = tensor;
                 return scope.RecordUnary(LazyNodeType.Negate, "TensorNegate", tensor, tensor._shape,
-                    (eng, output) => { MathHelper.GetNumericOperations<T>().Negate(captured.AsSpan(), output.AsWritableSpan()); },
+                    (eng, output) =>
+                    {
+                        // GPU-resident negate into output's stable buffer (compiled/capture path); else the host span
+                        // negate (which materializes input + output = breaks capture). DirectGpu inherits CpuEngine.
+                        if (eng is DirectGpuTensorEngine dgeNeg && dgeNeg.TryNegateResidentInto(output, captured)) return;
+                        MathHelper.GetNumericOperations<T>().Negate(captured.AsSpan(), output.AsWritableSpan());
+                    },
                     BackwardFunctions<T>.NegateBackward);
             }
         }
@@ -35094,6 +35103,11 @@ public partial class CpuEngine : ITensorLevelEngine
                 return scope.RecordVariadic(nodeType, "FusedLinear", inputs, outShape,
                     (eng, output) =>
                     {
+                        // GPU-resident FusedLinear into output's stable buffer (compiled/capture path); else the
+                        // eager FusedLinear + CopyResultInto (the eager CpuEngine path downloads = breaks capture).
+                        if (eng is DirectGpuTensorEngine dgeFl && dgeFl.TryFusedLinearResidentInto(output, inputs[0], inputs[1],
+                                inputs.Length > 2 ? inputs[2] : null, capturedActivation, capturedParams))
+                            return;
                         var eager = eng.FusedLinear(inputs[0], inputs[1],
                             inputs.Length > 2 ? inputs[2] : null, capturedActivation, capturedParams);
                         DirectGpuTensorEngine.CopyResultInto(eng, eager, output);
