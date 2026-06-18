@@ -1594,6 +1594,40 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             "cublasSgemmStridedBatched");
     }
 
+    /// <summary>CUDA-graph-CAPTURE-SAFE batched GEMM: issues <paramref name="batchCount"/> independent SGEMMs
+    /// sequentially on the SAME (capturing) stream — no extra streams (BatchedGemmFanout's multi-stream pool breaks
+    /// THREAD_LOCAL capture) and no strided-batched (cublasSgemmStridedBatched returns CUBLAS_STATUS_INTERNAL_ERROR
+    /// during stream capture — it selects a capture-unsafe internal path). Plain cublasSgemm captures cleanly (the
+    /// 2D resident matmul proves it), so the whole attention BMM becomes one graph node-chain replayed cheaply.
+    /// Same row-major C = A·B per batch as <see cref="BatchedGemm"/>.</summary>
+    public void BatchedGemmSequential(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, int batchCount, float alpha = 1.0f, float beta = 0.0f)
+    {
+        if (!IsAvailable) throw new InvalidOperationException("CUDA backend is not available.");
+        ValidateBatchedGemmArgs(A, B, C, M, N, K, batchCount);
+        using var _ = PushContext();
+        long strideA = (long)M * K, strideB = (long)K * N, strideC = (long)M * N;
+        const long eb = sizeof(float);
+        for (int s = 0; s < batchCount; s++)
+        {
+            float aVal = alpha, bVal = beta;
+            IntPtr aPtr = (IntPtr)((long)A.Handle + s * strideA * eb);
+            IntPtr bPtr = (IntPtr)((long)B.Handle + s * strideB * eb);
+            IntPtr cPtr = (IntPtr)((long)C.Handle + s * strideC * eb);
+            CuBlasNative.CheckCublasStatus(
+                CuBlasNative.cublasSgemm(
+                    _cublasHandle,
+                    CublasOperation.None,
+                    CublasOperation.None,
+                    N, M, K,
+                    ref aVal,
+                    bPtr, N,
+                    aPtr, K,
+                    ref bVal,
+                    cPtr, N),
+                $"cublasSgemm (sequential batched) slice {s}");
+        }
+    }
+
     /// <summary>
     /// Issue #335 items 3+4 production wiring: fans <paramref name="batchCount"/>
     /// independent SGEMMs of identical shape across the supplied

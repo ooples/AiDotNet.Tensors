@@ -3155,7 +3155,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var bufA = GetResidentOrPersistentInputBuffer(backend, a);
             using var bufB = GetResidentOrPersistentInputBuffer(backend, b);
             var outBuf = GetOrCreateResidentBuffer(backend, output, batch * M * N);
-            cb.BatchedGemm(bufA.Buffer, bufB.Buffer, outBuf, M, N, K, batch, 1.0f, 0.0f);
+            // Sequential (per-slice cublasSgemm on the capture stream), NOT strided-batched: the resident path's
+            // whole purpose is CUDA-graph capture, and cublasSgemmStridedBatched returns INTERNAL_ERROR during
+            // capture while plain cublasSgemm captures cleanly. Same numeric result.
+            cb.BatchedGemmSequential(bufA.Buffer, bufB.Buffer, outBuf, M, N, K, batch, 1.0f, 0.0f);
             ResidentSyncCheck("BatchedMatMul");
             BindResidentBuffer(output, outBuf, backend);
             return true;
