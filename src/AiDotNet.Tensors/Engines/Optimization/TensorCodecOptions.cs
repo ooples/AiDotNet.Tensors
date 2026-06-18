@@ -106,6 +106,27 @@ public sealed class TensorCodecOptions
     /// <summary>Phase 7.1: Group independent MatMuls into batched calls.</summary>
     public bool EnableBlasBatch { get; set; } = true;
 
+    /// <summary>
+    /// #1624: liveness-pool the compiled training plan's backward gradient buffers.
+    /// Opt-in (default false). The compiled training path pre-allocates ONE gradient
+    /// buffer per traced tensor and holds the entire backward intermediate-gradient
+    /// working set resident at once — multi-GB on deep models. With pooling on,
+    /// same-shape intermediates with disjoint backward lifetimes share one physical
+    /// buffer (linear-scan register allocation over the FINAL backward action
+    /// stream), shrinking the resident set to the peak live frontier. It is
+    /// FUSION-COMPATIBLE — dataflow fusion + analytic-loss backward stay enabled —
+    /// and parameter gradients are bit-identical to the non-pooled path.
+    /// <para><b>Trade-off &amp; scope:</b> a memory optimization, not a speed one —
+    /// it adds a small per-step re-zero of reused buffers. Default OFF because it is
+    /// a memory/throughput trade callers should choose per workload, and because a
+    /// model whose backward stream contains a transform the planner hasn't validated
+    /// fails loud (so it stays opt-in rather than surprising every model). CPU
+    /// engines only; on a GPU engine it is ignored (the GPU-graph backward has a
+    /// different execution model). Also overridable via the
+    /// AIDOTNET_COMPILED_GRAD_POOL environment variable (1 = on).</para>
+    /// </summary>
+    public bool EnableBackwardGradientPooling { get; set; }
+
     /// <summary>Phase 7.3: Enable mixed precision (fp16 forward, fp32 backward). Opt-in.</summary>
     /// <remarks>Legacy boolean — kept for backward compat. New code should use
     /// <see cref="MixedPrecisionPolicy"/> for finer-grained control over which dtype
