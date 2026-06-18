@@ -48,18 +48,8 @@ public class MultiInputSecondaryConsumerReproTests : IDisposable
                 return engine.TensorAdd(a, b);
             });
 
-            for (int trial = 0; trial < 4; trial++)
-            {
-                var x = Tensor<float>.CreateRandom(new[] { 2, 4 });
-                var t = Tensor<float>.CreateRandom(new[] { 2, 3 });
-                plan.SetInputs(new[] { x, t });
-                var got = plan.Execute();
-                var exp = Eager(x, t);
-                float maxDiff = 0f;
-                for (int i = 0; i < got.Length; i++)
-                    maxDiff = Math.Max(maxDiff, Math.Abs(exp[i] - got[i]));
-                Assert.True(maxDiff < 1e-3f, $"trial {trial}: compiled diverged from eager, maxDiff={maxDiff:E3}");
-            }
+            AssertReplayMatches(plan, () => Tensor<float>.CreateRandom(new[] { 2, 4 }),
+                () => Tensor<float>.CreateRandom(new[] { 2, 3 }), Eager, "secondary-through-matmul");
         }
         finally { cache.Dispose(); }
     }
@@ -88,7 +78,7 @@ public class MultiInputSecondaryConsumerReproTests : IDisposable
             var plan = cache.GetOrCompileInference(new[] { x0, t0 }, () =>
                 engine.TensorAdd(engine.TensorMatMul(x0, wx),
                     engine.TensorAdd(engine.TensorMatMul(t0, wt1), engine.TensorMatMul(t0, wt2))));
-            AssertReplayMatches(engine, plan, () => Tensor<float>.CreateRandom(new[] { 2, 4 }),
+            AssertReplayMatches(plan, () => Tensor<float>.CreateRandom(new[] { 2, 4 }),
                 () => Tensor<float>.CreateRandom(new[] { 2, 3 }), Eager, "multi-consumer");
         }
         finally { cache.Dispose(); }
@@ -117,7 +107,7 @@ public class MultiInputSecondaryConsumerReproTests : IDisposable
         {
             var plan = cache.GetOrCompileInference(new[] { x0, t0 }, () =>
                 engine.TensorBroadcastMultiply(engine.TensorMatMul(x0, wx), engine.TensorMatMul(t0, wt)));
-            AssertReplayMatches(engine, plan, () => Tensor<float>.CreateRandom(new[] { 2, 4 }),
+            AssertReplayMatches(plan, () => Tensor<float>.CreateRandom(new[] { 2, 4 }),
                 () => Tensor<float>.CreateRandom(new[] { 1, 3 }), Eager, "broadcast-modulation");
         }
         finally { cache.Dispose(); }
@@ -162,7 +152,7 @@ public class MultiInputSecondaryConsumerReproTests : IDisposable
         try
         {
             var plan = cache.GetOrCompileInference(new[] { x0, t0 }, () => Build(x0, t0));
-            AssertReplayMatches(engine, plan, () => Tensor<float>.CreateRandom(new[] { 2, 5 }),
+            AssertReplayMatches(plan, () => Tensor<float>.CreateRandom(new[] { 2, 5 }),
                 () => Tensor<float>.CreateRandom(new[] { 2, 3 }), Eager, "deep-graph");
         }
         finally { cache.Dispose(); }
@@ -210,14 +200,14 @@ public class MultiInputSecondaryConsumerReproTests : IDisposable
         try
         {
             var plan = cache.GetOrCompileInference(new[] { x0, t0 }, () => Build(x0, t0));
-            AssertReplayMatches(engine, plan, () => Tensor<float>.CreateRandom(new[] { 2, 5 }),
+            AssertReplayMatches(plan, () => Tensor<float>.CreateRandom(new[] { 2, 5 }),
                 () => Tensor<float>.CreateRandom(new[] { 2, 3 }), Eager, "consecutive-secondary");
         }
         finally { cache.Dispose(); }
     }
 
     private static void AssertReplayMatches(
-        CpuEngine engine, ICompiledPlan<float> plan,
+        ICompiledPlan<float> plan,
         Func<Tensor<float>> makeX, Func<Tensor<float>> makeT,
         Func<Tensor<float>, Tensor<float>, float[]> eager, string label)
     {
