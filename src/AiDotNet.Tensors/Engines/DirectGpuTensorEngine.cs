@@ -3948,8 +3948,34 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // Uses the same GPU buffer for input and output where safe (element-wise ops).
     // Falls back to CpuEngine base when GPU is not available.
 
+    /// <summary>GPU-RESIDENT in-place add a += b for the compiled/capture step (e.g. the transformer RESIDUAL adds):
+    /// backend.Add into a's OWN resident buffer — no GetDataArray (TryRunBinaryInPlace below downloads both inputs)
+    /// and no DownloadBuffer result round-trip (both capture-illegal). Requires a already resident so the in-place
+    /// mutation lands on its live buffer.</summary>
+    internal bool TryAddInPlaceResident<T>(Tensor<T> a, Tensor<T> b)
+    {
+        if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
+        if (!TryGetBackend(out var backend) || !a.IsContiguous || !b.IsContiguous || a.Length != b.Length) return false;
+        var aBuf = a.TryGetGpuBuffer();
+        if (aBuf is null)
+        {
+            if (s_residentSyncDebug) AliasDiag($"AddInPlace-resident SKIP a-not-resident a=[{string.Join(",", a._shape)}] b=[{string.Join(",", b._shape)}] bResident={(b.TryGetGpuBuffer() is not null)}");
+            return false;   // 'a' must already be resident → the in-place add lands on ITS buffer
+        }
+        try
+        {
+            using var bufB = GetResidentOrPersistentInputBuffer(backend, b);
+            backend.Add(aBuf, bufB.Buffer, aBuf, a.Length);
+            a.IncrementVersion();
+            a._gpuBufferVersion = a.Version;   // the buffer we just mutated IS the current snapshot — no re-upload
+            return true;
+        }
+        catch (Exception aex) { AliasDiag($"AddInPlace-resident FELLBACK len={a.Length}: {aex.GetType().Name}: {aex.Message}"); return false; }
+    }
+
     void IEngine.TensorAddInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
+        if (TryAddInPlaceResident(a, b)) return;
         // Version-counter contract is enforced inside TryRunBinaryInPlace
         // (and CpuEngine's base implementation on the fallback path).
         if (ShapesMatch(a.Shape._dims, b.Shape._dims) && TryRunBinaryInPlace(a, b,
