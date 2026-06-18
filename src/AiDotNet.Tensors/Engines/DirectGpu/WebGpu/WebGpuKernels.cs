@@ -743,6 +743,27 @@ fn gemm_transposed_simple(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     C[idx] = params.alpha * acc + params.beta * C[idx];
 }
+
+// C[M,N] = Aᵀ · B, where A is stored row-major as [K, M] and B as [K, N],
+// contraction over the LEADING dim K of both. The left-operand-transposed
+// companion to gemm_transposed_simple, needed for the FP16 matmul backward's
+// gradB = Aᵀ·gradC term (no materialized transpose: A's index pattern changes
+// from A[row*K + k] to A[k*M + row]).
+@compute @workgroup_size(256)
+fn gemm_lhs_transposed_simple(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let total = params.M * params.N;
+    if (idx >= total) {
+        return;
+    }
+    let row = idx / params.N;
+    let col = idx % params.N;
+    var acc: f32 = 0.0;
+    for (var k: u32 = 0u; k < params.K; k = k + 1u) {
+        acc = acc + A[k * params.M + row] * B[k * params.N + col];
+    }
+    C[idx] = params.alpha * acc + params.beta * C[idx];
+}
 ";
 
     /// <summary>

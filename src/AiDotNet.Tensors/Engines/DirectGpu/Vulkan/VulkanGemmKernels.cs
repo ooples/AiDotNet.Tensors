@@ -76,4 +76,38 @@ void main() {
     }
     C[gid] = acc;
 }";
+
+    /// <summary>
+    /// Generalized transposed FP16 GEMM for the fused matmul BACKWARD: <c>C[Mo,No] = op(A)·op(B)</c>, FP16
+    /// packed inputs, FP32 accumulator + output. <c>transA</c>/<c>transB</c> (0/1, via push constants) select how
+    /// each logical operand is read from storage with no materialized transpose — op(A) logical [Mo,Kc]:
+    /// transA==0 → A[i*Kc+p], transA==1 → A[p*Mo+i]; op(B) logical [Kc,No]: transB==0 → B[p*No+j],
+    /// transB==1 → B[j*Kc+p]. With transA=0,transB=0 this is exactly <see cref="GemmFp16In32fOut"/>. The two
+    /// backward GEMMs are gradA[M,K]=gradC·Bᵀ (transA=0,transB=1) and gradB[K,N]=Aᵀ·gradC (transA=1,transB=0).
+    /// FP16-output grads are produced by running this into an FP32 scratch then <c>ConvertToFp16</c> (mirrors
+    /// <see cref="VulkanBackend.Hgemm"/>), so the shader only ever writes FP32.
+    /// </summary>
+    public static string GemmFp16BackwardTransposed => Header + @"
+layout(set=0,binding=0) readonly buffer Ab { uint Apacked[]; };
+layout(set=0,binding=1) readonly buffer Bb { uint Bpacked[]; };
+layout(set=0,binding=2) writeonly buffer Cb { float C[]; };
+layout(push_constant) uniform PC { uint Mo; uint No; uint Kc; uint transA; uint transB; };
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= Mo * No) return;
+    uint row = gid / No;   // Mo index (i)
+    uint col = gid % No;   // No index (j)
+    float acc = 0.0;
+    for (uint p = 0u; p < Kc; ++p) {
+        uint ae = (transA == 0u) ? (row * Kc + p) : (p * Mo + row);
+        uint be = (transB == 0u) ? (p * No + col) : (col * Kc + p);
+        vec2 ap = unpackHalf2x16(Apacked[ae >> 1]);
+        vec2 bp = unpackHalf2x16(Bpacked[be >> 1]);
+        float av = ((ae & 1u) == 0u) ? ap.x : ap.y;
+        float bv = ((be & 1u) == 0u) ? bp.x : bp.y;
+        acc += av * bv;
+    }
+    C[gid] = acc;
+}";
 }

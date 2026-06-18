@@ -1718,6 +1718,37 @@ kernel void matmul_fp16_fp32out(
     }
 }
 
+// Generalized transposed FP16 GEMM for the fused matmul BACKWARD: C[Mo,No] = op(A) . op(B), half inputs,
+// FP32 accumulate + FP32 output. transA/transB (0/1) select how each logical operand is read from storage
+// with no materialized transpose: op(A) logical [Mo,Kc] -> transA==0 A[i*Kc+p], transA==1 A[p*Mo+i];
+// op(B) logical [Kc,No] -> transB==0 B[p*No+j], transB==1 B[j*Kc+p]. With transA=0,transB=0 this is exactly
+// matmul_fp16_fp32out. The two backward GEMMs are gradA[M,K]=gradC.B^T (transA=0,transB=1) and
+// gradB[K,N]=A^T.gradC (transA=1,transB=0). FP16-output grads are produced by running into an FP32 scratch
+// then ConvertToFp16 (mirrors Hgemm), so the kernel only ever writes FP32.
+kernel void matmul_fp16_backward(
+    device const half* A [[buffer(0)]],
+    device const half* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& Mo [[buffer(3)]],
+    constant uint& No [[buffer(4)]],
+    constant uint& Kc [[buffer(5)]],
+    constant uint& transA [[buffer(6)]],
+    constant uint& transB [[buffer(7)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint row = gid.y;   // Mo index (i)
+    uint col = gid.x;   // No index (j)
+    if (row < Mo && col < No) {
+        float sum = 0.0f;
+        for (uint p = 0; p < Kc; p++) {
+            uint ia = (transA == 0u) ? (row * Kc + p) : (p * Mo + row);
+            uint ib = (transB == 0u) ? (p * No + col) : (col * Kc + p);
+            sum += float(A[ia]) * float(B[ib]);
+        }
+        C[row * No + col] = sum;
+    }
+}
+
 // FP16-NATIVE elementwise / activation kernels (#558): read the activation DIRECTLY from a half buffer
 // (MSL has a native half type), compute in FP32 in-register, write half — no FP32 buffer materialized,
 // no convert transient. GPU counterpart of the CPU FP16-native emit.

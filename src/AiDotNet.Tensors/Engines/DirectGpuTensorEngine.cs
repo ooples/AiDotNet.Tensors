@@ -15098,16 +15098,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <summary>
     /// GPU-resident fused FP16 matmul BACKWARD for the heterogeneous (FP16-activation) plan. Computes both
     /// gradients of the forward <c>C[M,N] = A[M,K] · B[K,N]</c> — for the FP16 (<see cref="Tensor{Half}"/>)
-    /// activations of <see cref="Engines.Compilation.MixedPrecisionGraphBackward"/> — through the Tensor-Core
-    /// <see cref="DirectGpu.CUDA.CudaBackend.MatMulBackwardFp16Fused"/> (two transpose-free
-    /// <c>cublasGemmEx</c> launches) INSTEAD of the eager backward's two <c>TensorTranspose</c> + two
-    /// <c>TensorMatMul</c> FP32 dispatches — the four-FP32-allocation-per-matmul scratch that
-    /// Fp16ActivationDominated_ReducesGpuPeakBytes measured as the dominant cost. The Half activations are
-    /// stored up-cast to FP32 on the device (see <c>GetOrAllocateBuffer</c>), so the inputs are converted to
-    /// FP16 for the kernel (O(MK+KN+MN) — negligible vs the O(MKN) GEMMs); the kernel accumulates in FP32 and
-    /// the grads are materialized as Half for the FP16 grad dict.
-    /// Returns false (caller falls back to the generic backward) when the backend is not CUDA Tensor-Core
-    /// capable or the shapes are not the supported 2D matmul case.
+    /// activations of <see cref="Engines.Compilation.MixedPrecisionGraphBackward"/> — through the BACKEND-AGNOSTIC
+    /// <see cref="Gpu.IGpuHalfPrecisionBackend.MatMulBackwardFp16Fused"/> (two transpose-free FP16-in/FP32-accumulate
+    /// GEMMs) INSTEAD of the eager backward's two <c>TensorTranspose</c> + two <c>TensorMatMul</c> FP32 dispatches —
+    /// the four-FP32-allocation-per-matmul scratch that Fp16ActivationDominated_ReducesGpuPeakBytes measured as the
+    /// dominant cost. Any backend implementing the capability fuses here (CUDA cuBLAS / HIP rocBLAS via transpose
+    /// flags; OpenCL/Vulkan/Metal/WebGpu via dedicated transposed FP16 GEMM kernels). The Half activations are
+    /// resolved to FP16 device buffers (resident reads are direct; otherwise a one-time convert, O(MK+KN+MN) —
+    /// negligible vs the O(MKN) GEMMs); the GEMMs accumulate in FP32 and the grads materialize lazily as Half.
+    /// Returns false (caller falls back to the generic backward) when the backend lacks the fused-backward
+    /// capability or the shapes are not the supported 2D matmul case.
     /// </summary>
     internal bool TryMatMulBackwardFp16Fused(
         Tensor<Half> gradC, Tensor<Half> a, Tensor<Half> b,
@@ -15117,14 +15117,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         gradB = null;
         if (a.Rank != 2 || b.Rank != 2 || gradC.Rank != 2) return false;
         if (!TryGetBackend(out var backend)) return false;
-        // CUDA-only fast path: this fuses BOTH gradients through cuBLAS Tensor-Core HGEMM with no FP32
-        // transpose/up-cast scratch (the measured dominant backward cost). It is intrinsically CUDA-specific
-        // — there is no cross-backend Tensor-Core HGEMM equivalent — so the other five backends do NOT fuse
-        // here and instead take the GENERIC FP16 backward (MatMulBackward<Half>), which is correct, just
-        // without the −36% working-set win. Generalizing a fused backward to rocBLAS (HIP) and the
-        // shader backends is tracked as a follow-up (Tensors #633 GPU fused-backward parity); this is an
-        // optimization gap, not a correctness gap.
-        if (backend is not DirectGpu.CUDA.CudaBackend cb || !cb.SupportsHgemm) return false;
+        // BACKEND-AGNOSTIC fused backward: route through the IGpuHalfPrecisionBackend capability so EVERY backend
+        // that ships the fused FP16 backward (CUDA cuBLAS, HIP rocBLAS, and the OpenCL/Vulkan/Metal/WebGpu kernel
+        // backends) fuses BOTH gradients with FP16 inputs + FP32 accumulate and NO FP32 transpose/up-cast scratch
+        // (the measured dominant cost of the FP16 hetero path). Backends without the capability return false here
+        // and fall back to the GENERIC FP16 backward (MatMulBackward<Half>) — correct, just without the working-set
+        // win. (#633: the win is no longer CUDA-only.)
+        if (backend is not IGpuHalfPrecisionBackend hp || !hp.SupportsFp16FusedBackward) return false;
 
         int M = a._shape[0], K = a._shape[1], N = b._shape[1];
         if (b._shape[0] != K || gradC._shape[0] != M || gradC._shape[1] != N) return false;
@@ -15133,31 +15132,23 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         bool gradsCached = false;
         try
         {
-            // A/B/gradC as FP16. If a tensor is already resident as a Half IsFp16 entry (the forward store, or a
-            // grad produced GPU-resident by a downstream fused-backward), read it DIRECTLY — no up-cast (which
-            // would re-inflate it to FP32 and erase the store win) and no convert. Otherwise convert its FP32 buffer.
-            DirectGpu.IGpuBuffer ResolveHalf(Tensor<Half> t, int elems, ref DirectGpu.IGpuBuffer? owned)
-            {
-                if (TryGetResidentFp16Buffer(t, backend, out var resident) && resident is not null)
-                    return resident;
-                using var f = GetOrAllocateBuffer(backend, t);
-                owned = cb.AllocateByteBuffer(elems * 2);
-                cb.ConvertToFp16Native(f.Buffer, owned, elems);
-                return owned;
-            }
-            var hA = ResolveHalf(a, M * K, ref hAOwned);     // a is [M,K]
-            var hB = ResolveHalf(b, K * N, ref hBOwned);     // b is [K,N]
-            var hGc = ResolveHalf(gradC, M * N, ref hGcOwned); // gradC is [M,N]
+            // A/B/gradC as FP16, via the backend-agnostic ResolveToFp16: if a tensor is already resident as a Half
+            // IsFp16 entry (the forward store, or a grad produced GPU-resident by a downstream fused-backward) it is
+            // read DIRECTLY — no up-cast (which would re-inflate it to FP32 and erase the store win); otherwise its
+            // FP32 buffer is converted once (O(MK+KN+MN), negligible vs the O(MKN) GEMMs).
+            var hA = ResolveToFp16(a, M * K, backend, out hAOwned);     // a is [M,K]
+            var hB = ResolveToFp16(b, K * N, backend, out hBOwned);     // b is [K,N]
+            var hGc = ResolveToFp16(gradC, M * N, backend, out hGcOwned); // gradC is [M,N]
 
-            // Fused transpose-free Tensor-Core backward → FP32 grad buffers, wrapped via the DEFERRED-download
-            // FinishGpuOp: the grad's FP32 GPU buffer is cached (consumers read it on-device, no re-upload) and
-            // the host Half[] materializes LAZILY only if read on the CPU (intermediate grads never are). This
-            // keeps the grads GPU-resident with NO eager host round-trip — the per-matmul DownloadBuffer was the
-            // cortex's ~5x slowdown. (Caching the grads as IsFp16 instead churns the activation cache with fresh
-            // per-step grad arrays — measured to hang the cortex — so use the normal FP32 deferred path here.)
-            gAf = cb.AllocateBuffer(M * K);
-            gBf = cb.AllocateBuffer(K * N);
-            cb.MatMulBackwardFp16Fused(hGc, hA, hB, gAf, gBf, M, N, K, gradOutHalf: false);
+            // Fused transpose-free backward → FP32 grad buffers, wrapped via the DEFERRED-download FinishGpuOp: the
+            // grad's FP32 GPU buffer is cached (consumers read it on-device, no re-upload) and the host Half[]
+            // materializes LAZILY only if read on the CPU (intermediate grads never are). This keeps the grads
+            // GPU-resident with NO eager host round-trip — the per-matmul DownloadBuffer was the cortex's ~5x
+            // slowdown. (Caching the grads as IsFp16 instead churns the activation cache with fresh per-step grad
+            // arrays — measured to hang the cortex — so use the normal FP32 deferred path here.)
+            gAf = backend.AllocateBuffer(M * K);
+            gBf = backend.AllocateBuffer(K * N);
+            hp.MatMulBackwardFp16Fused(hGc, hA, hB, gAf, gBf, M, N, K, gradOutHalf: false);
             var gAresult = FinishGpuOp<Half>(backend, new OwnedBuffer(gAf, ownsBuffer: true), M * K);
             var gBresult = FinishGpuOp<Half>(backend, new OwnedBuffer(gBf, ownsBuffer: true), K * N);
             gradsCached = true; // FinishGpuOp took ownership of gAf/gBf (cached) — do NOT dispose

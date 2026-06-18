@@ -26,6 +26,80 @@ public sealed partial class MetalBackend : IGpuHalfPrecisionBackend
     public bool SupportsHgemm => IsAvailable;
 
     /// <inheritdoc/>
+    /// <remarks>The fused backward is two dispatches of the <c>matmul_fp16_backward</c> MSL kernel in the same
+    /// matrix library as the forward GEMM, so it tracks device availability like <see cref="SupportsHgemm"/>.</remarks>
+    public bool SupportsFp16FusedBackward => IsAvailable;
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Two dispatches of the transposed <c>matmul_fp16_backward</c> MSL kernel (half in, FP32 accumulate, no
+    /// materialized transpose): gradA[M,K] = gradC·Bᵀ (transA=0, transB=1) and gradB[K,N] = Aᵀ·gradC
+    /// (transA=1, transB=0). The kernel writes FP32; FP16-output grads run into an FP32 scratch then
+    /// <c>ConvertToFp16</c> (mirrors <see cref="Hgemm"/>).
+    /// </remarks>
+    public void MatMulBackwardFp16Fused(
+        IGpuBuffer gradCFp16, IGpuBuffer aFp16, IGpuBuffer bFp16,
+        IGpuBuffer gradAOut, IGpuBuffer gradBOut,
+        int m, int n, int k, bool gradOutHalf)
+    {
+        ThrowIfDisposed();
+        if (gradCFp16 is null) throw new ArgumentNullException(nameof(gradCFp16));
+        if (aFp16 is null) throw new ArgumentNullException(nameof(aFp16));
+        if (bFp16 is null) throw new ArgumentNullException(nameof(bFp16));
+        if (gradAOut is null) throw new ArgumentNullException(nameof(gradAOut));
+        if (gradBOut is null) throw new ArgumentNullException(nameof(gradBOut));
+        if (m <= 0) throw new ArgumentOutOfRangeException(nameof(m), "Dimensions must be positive.");
+        if (n <= 0) throw new ArgumentOutOfRangeException(nameof(n), "Dimensions must be positive.");
+        if (k <= 0) throw new ArgumentOutOfRangeException(nameof(k), "Dimensions must be positive.");
+
+        // gradA[M,K] = gradC[M,N] · Bᵀ : Mo=M, No=K, Kc=N; A=gradC (transA=0), B=Bfwd (transB=1).
+        DispatchBackwardGemm(gradCFp16, bFp16, gradAOut, m, k, n, transA: 0, transB: 1, gradOutHalf);
+        // gradB[K,N] = Aᵀ · gradC[M,N] : Mo=K, No=N, Kc=M; A=Afwd (transA=1), B=gradC (transB=0).
+        DispatchBackwardGemm(aFp16, gradCFp16, gradBOut, k, n, m, transA: 1, transB: 0, gradOutHalf);
+    }
+
+    /// <summary>
+    /// One dispatch of the transposed <c>matmul_fp16_backward</c> kernel into <paramref name="gradOut"/>. The
+    /// kernel writes FP32; when <paramref name="gradOutHalf"/> it writes an FP32 scratch then packs to FP16.
+    /// </summary>
+    private void DispatchBackwardGemm(IGpuBuffer a, IGpuBuffer b, IGpuBuffer gradOut,
+        int mo, int no, int kc, int transA, int transB, bool gradOutHalf)
+    {
+        if (a is not MetalGpuBuffer aBuffer || b is not MetalGpuBuffer bBuffer)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer");
+
+        IGpuBuffer? scratch = gradOutHalf ? AllocateBuffer(mo * no) : null;
+        try
+        {
+            var dest = scratch ?? gradOut;
+            if (dest is not MetalGpuBuffer cBuffer)
+                throw new ArgumentException("Buffers must be MetalGpuBuffer");
+
+            var pipeline = GetPipeline("Matrix", _matrixLibrary, "matmul_fp16_backward");
+            var (threadgroups, threadsPerGroup) = pipeline.Calculate2DDispatch(no, mo);
+            using (var encoder = _commandQueue.CreateScopedComputeEncoder())
+            {
+                encoder.SetPipelineState(pipeline.Handle);
+                encoder.SetBuffer(aBuffer, 0);
+                encoder.SetBuffer(bBuffer, 1);
+                encoder.SetBuffer(cBuffer, 2);
+                encoder.SetBytes((uint)mo, 3);
+                encoder.SetBytes((uint)no, 4);
+                encoder.SetBytes((uint)kc, 5);
+                encoder.SetBytes((uint)transA, 6);
+                encoder.SetBytes((uint)transB, 7);
+                encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+            }
+            if (scratch is not null)
+                ConvertToFp16(scratch, gradOut, mo * no);
+        }
+        finally
+        {
+            scratch?.Dispose();
+        }
+    }
+
+    /// <inheritdoc/>
     public void GemmFp16In32fOut(IGpuBuffer aFp16, IGpuBuffer bFp16, IGpuBuffer cFp32,
         int m, int n, int k)
     {

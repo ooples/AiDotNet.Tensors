@@ -33,6 +33,11 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public bool SupportsHgemm => EnsureHalfGemmKernels();
 
         /// <inheritdoc/>
+        /// <remarks>The fused backward is two dispatches of the same FP16 GEMM kernel program (the
+        /// <c>gemm_fp16_backward</c> transposed variant), so it tracks <see cref="SupportsHgemm"/>.</remarks>
+        public bool SupportsFp16FusedBackward => EnsureHalfGemmKernels();
+
+        /// <inheritdoc/>
         public void Hgemm(IGpuBuffer aFp16, IGpuBuffer bFp16, IGpuBuffer cFp16,
             int m, int n, int k)
             => DispatchHalfGemm(HalfPrecisionGemmKernels.Fp16In16fOutKernelName,
@@ -43,6 +48,32 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             int m, int n, int k)
             => DispatchHalfGemm(HalfPrecisionGemmKernels.Fp16In32fOutKernelName,
                 aFp16, bFp16, cFp32, m, n, k);
+
+        /// <inheritdoc/>
+        /// <remarks>
+        /// Two dispatches of the transposed <c>gemm_fp16_backward</c> kernel (FP16 in, FP32 accumulate, no
+        /// materialized transpose): gradA[M,K] = gradC·Bᵀ (transA=0, transB=1) and gradB[K,N] = Aᵀ·gradC
+        /// (transA=1, transB=0).
+        /// </remarks>
+        public void MatMulBackwardFp16Fused(
+            IGpuBuffer gradCFp16, IGpuBuffer aFp16, IGpuBuffer bFp16,
+            IGpuBuffer gradAOut, IGpuBuffer gradBOut,
+            int m, int n, int k, bool gradOutHalf)
+        {
+            if (gradCFp16 is null) throw new ArgumentNullException(nameof(gradCFp16));
+            if (aFp16 is null) throw new ArgumentNullException(nameof(aFp16));
+            if (bFp16 is null) throw new ArgumentNullException(nameof(bFp16));
+            if (gradAOut is null) throw new ArgumentNullException(nameof(gradAOut));
+            if (gradBOut is null) throw new ArgumentNullException(nameof(gradBOut));
+            if (m <= 0) throw new ArgumentOutOfRangeException(nameof(m), "Dimensions must be positive.");
+            if (n <= 0) throw new ArgumentOutOfRangeException(nameof(n), "Dimensions must be positive.");
+            if (k <= 0) throw new ArgumentOutOfRangeException(nameof(k), "Dimensions must be positive.");
+
+            // gradA[M,K] = gradC[M,N] · Bᵀ : Mo=M, No=K, Kc=N; A=gradC (transA=0), B=Bfwd (transB=1).
+            DispatchHalfGemmBackward(gradCFp16, bFp16, gradAOut, m, k, n, transA: 0, transB: 1, gradOutHalf);
+            // gradB[K,N] = Aᵀ · gradC[M,N] : Mo=K, No=N, Kc=M; A=Afwd (transA=1), B=gradC (transB=0).
+            DispatchHalfGemmBackward(aFp16, gradCFp16, gradBOut, k, n, m, transA: 1, transB: 0, gradOutHalf);
+        }
 
         /// <summary>
         /// Lazily compiles and caches the FP16 GEMM kernels on first use.
@@ -121,6 +152,37 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             // loads + barriers but skip the final store).
             int globalX = ((n + ts - 1) / ts) * ts;   // N axis (dim 0)
             int globalY = ((m + ts - 1) / ts) * ts;   // M axis (dim 1)
+            kernel.Execute2D(globalX, globalY, ts, ts);
+        }
+
+        /// <summary>
+        /// One dispatch of the transposed <c>gemm_fp16_backward</c> kernel: <c>C[Mo,No] = op(A)·op(B)</c> with
+        /// per-operand transpose flags and a selectable FP32/FP16 output dtype. Output buffer is the caller's
+        /// raw byte buffer cast inside the kernel per <paramref name="gradOutHalf"/>.
+        /// </summary>
+        private void DispatchHalfGemmBackward(IGpuBuffer a, IGpuBuffer b, IGpuBuffer c,
+            int mo, int no, int kc, int transA, int transB, bool gradOutHalf)
+        {
+            if (!EnsureHalfGemmKernels() ||
+                !_kernelCache.TryGetValue(HalfPrecisionGemmKernels.Fp16BackwardKernelName, out var kernel))
+                throw new NotSupportedException(
+                    "Half-precision GEMM kernels are not available on this OpenCL device.");
+
+            const int ts = HalfPrecisionGemmKernels.TileSize;
+
+            uint arg = 0;
+            kernel.SetArg(arg++, ((DirectOpenClGpuBuffer)a).Buffer.Handle);
+            kernel.SetArg(arg++, ((DirectOpenClGpuBuffer)b).Buffer.Handle);
+            kernel.SetArg(arg++, ((DirectOpenClGpuBuffer)c).Buffer.Handle);
+            kernel.SetArg(arg++, mo);
+            kernel.SetArg(arg++, no);
+            kernel.SetArg(arg++, kc);
+            kernel.SetArg(arg++, transA);
+            kernel.SetArg(arg++, transB);
+            kernel.SetArg(arg++, gradOutHalf ? 1 : 0);
+
+            int globalX = ((no + ts - 1) / ts) * ts;   // No axis (dim 0)
+            int globalY = ((mo + ts - 1) / ts) * ts;   // Mo axis (dim 1)
             kernel.Execute2D(globalX, globalY, ts, ts);
         }
     }
