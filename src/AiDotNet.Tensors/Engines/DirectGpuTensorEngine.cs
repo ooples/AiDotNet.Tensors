@@ -3315,6 +3315,36 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         catch (Exception bex) { AliasDiag($"BA-resident FELLBACK full=[{string.Join(",", full._shape)}] bias=[{string.Join(",", bias._shape)}]: {bex.GetType().Name}: {bex.Message}"); return false; }
     }
 
+    /// <summary>GPU-RESIDENT broadcast-MULTIPLY for the compiled step (trailing-broadcast case, e.g. an AdaLN/scale
+    /// vector [D] or [1,S,D] times the activation [B,S,D]): maps to backend.BroadcastMultiplyLastAxis into the
+    /// destination's stable buffer — no fresh alloc / no host fallback that breaks CUDA-graph capture. This is the
+    /// deterministic capture-THREW: TensorMultiply branches to TensorBroadcastMultiply BEFORE the same-shape resident
+    /// delegate, and the eager broadcast delegate (eng.TensorBroadcastMultiply + CopyResultInto) allocs+host-copies.</summary>
+    internal bool TryBroadcastMultiplyResidentInto<T>(Tensor<T> output, Tensor<T> a, Tensor<T> b)
+    {
+        if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
+        if (!TryGetBackend(out var backend)) return false;
+        Tensor<T> full, bias;
+        if (a.Length == output.Length && b.Length > 0 && b.Length < a.Length) { full = a; bias = b; }
+        else if (b.Length == output.Length && a.Length > 0 && a.Length < b.Length) { full = b; bias = a; }
+        else { AliasDiag($"BM-skip operands a=[{string.Join(",", a._shape)}] b=[{string.Join(",", b._shape)}] out=[{string.Join(",", output._shape)}]"); return false; }
+        if (full.Length % bias.Length != 0 || !IsTrailingBroadcast(full._shape, bias._shape))
+        { AliasDiag($"BM-skip not-trailing full=[{string.Join(",", full._shape)}] bias=[{string.Join(",", bias._shape)}]"); return false; }
+        if (!full.IsContiguous || !bias.IsContiguous) { AliasDiag($"BM-skip noncontig full={full.IsContiguous} bias={bias.IsContiguous}"); return false; }
+        int innerSize = bias.Length;
+        int outerSize = full.Length / innerSize;
+        try
+        {
+            using var bufFull = GetResidentOrPersistentInputBuffer(backend, full);
+            using var bufBias = GetResidentOrPersistentInputBuffer(backend, bias);
+            var outBuf = GetOrCreateResidentBuffer(backend, output, full.Length);
+            backend.BroadcastMultiplyLastAxis(bufFull.Buffer, bufBias.Buffer, outBuf, outerSize, innerSize);
+            BindResidentBuffer(output, outBuf, backend);
+            return true;
+        }
+        catch (Exception bex) { AliasDiag($"BM-resident FELLBACK full=[{string.Join(",", full._shape)}] bias=[{string.Join(",", bias._shape)}]: {bex.GetType().Name}: {bex.Message}"); return false; }
+    }
+
     // Resolve a compiled-step binary/scalar INPUT to a resident GPU buffer. A resident activation (produced by a
     // prior forward op) is found via _gpuBuffer / the persistent / activation caches — no upload. A non-resident
     // input during a compiled step is a STABLE parameter/constant (operand never on the forward chain, e.g. a

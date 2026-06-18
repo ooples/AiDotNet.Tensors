@@ -3431,7 +3431,13 @@ public partial class CpuEngine : ITensorLevelEngine
                 // inside the closure overran it with "Destination is too short".
                 var broadcastShape = ComputeBroadcastShape(a._shape, b._shape);
                 return scope.RecordBinary(LazyNodeType.BroadcastMultiply, "TensorBroadcastMultiply", a, b, broadcastShape,
-                    (eng, output) => { var r = eng.TensorBroadcastMultiply(capturedA, capturedB); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
+                    (eng, output) =>
+                    {
+                        // GPU-resident broadcast-multiply into output's stable buffer (no fresh alloc / host copy that
+                        // breaks CUDA-graph capture — this delegate was the deterministic capture-THREW); else eager.
+                        if (eng is DirectGpuTensorEngine dgeBm && dgeBm.TryBroadcastMultiplyResidentInto(output, capturedA, capturedB)) return;
+                        var r = eng.TensorBroadcastMultiply(capturedA, capturedB); DirectGpuTensorEngine.CopyResultInto(eng, r, output);
+                    },
                     BackwardFunctions<T>.BroadcastMultiplyBackward);
             }
         }
