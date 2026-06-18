@@ -61,6 +61,15 @@ public sealed class GradientTape<T> : IDisposable
     private bool _engineExplicitlyBound;
     private readonly bool _savedReplayMode; // Saved ReplayMode from outer scope for nested tapes
     private bool _disposed;
+    // Set true once a streaming backward (ComputeGradientsStreaming) has
+    // destructively released a PERSISTENT tape's activation arena + GradFn graph.
+    // A persistent tape is normally reusable, but after the streaming release its
+    // _entries slots and node Output/Backward/Inputs are defaulted, so a later
+    // Record / ComputeGradients would walk a corrupt graph. We fail fast with a
+    // clear error instead of silently corrupting. Non-persistent tapes Reset()
+    // their arena in the finally and are safe to re-record, so this is only armed
+    // for persistent tapes.
+    private bool _streamingActivationsReleased;
     // Deterministic per-step activation lifetime (GPU): the DirectGpu activation
     // cache that an outermost tape's forward populates is released wholesale on
     // Dispose via EvictActivationsCreatedAfter(_activationSnapshot), giving ~one-step
@@ -135,6 +144,18 @@ public sealed class GradientTape<T> : IDisposable
     [ThreadStatic]
     private static Tensor<T>? _cachedScalarSeed;
 
+    // Release each node's activation references during the streaming backward as the
+    // reverse walk consumes them — the standard autograd memory model (matches
+    // PyTorch's default retain_graph=False, which frees saved tensors as each node's
+    // backward completes). In reverse-topological order an output's consumers have
+    // all already run by the time its own backward runs, so releasing it there can
+    // never drop a tensor a later step needs; parameters/sources are guarded by
+    // lastUse. This is UNCONDITIONAL in production (no opt-out) — ComputeGradientsStreaming
+    // is already a one-shot, gradient-freeing backward, so retaining activations would
+    // only ever leak. The settable property is a TEST SEAM so the on-vs-off bit-identity
+    // regression test can still assert releasing never changes a gradient.
+    internal static bool ReleaseStreamingActivations { get; set; } = true;
+
     public GradientTape(GradientTapeOptions? options = null)
     {
         _options = options ?? GradientTapeOptions.Default;
@@ -206,12 +227,32 @@ public sealed class GradientTape<T> : IDisposable
     /// </summary>
     /// <param name="entry">The tape entry describing the operation and its backward function.</param>
     /// <exception cref="ObjectDisposedException">Thrown if the tape has been disposed.</exception>
+    /// <summary>
+    /// Throws if this tape's activations were already released by a streaming
+    /// backward — the persistent graph it left behind is no longer valid to
+    /// record onto or differentiate again. Keeps the perf benefit of the
+    /// destructive release while turning silent corruption into a clear error.
+    /// </summary>
+    private void ThrowIfStreamingReleased()
+    {
+        if (_streamingActivationsReleased)
+        {
+            throw new InvalidOperationException(
+                "This persistent GradientTape's activations were released by a prior " +
+                "ComputeGradientsStreaming call, so its recorded graph can no longer be " +
+                "reused. Record a fresh tape for the next step, or set " +
+                "GradientTape<T>.ReleaseStreamingActivations = false to keep activations " +
+                "resident when you need to record onto or differentiate the same tape again.");
+        }
+    }
+
     public void Record(TapeEntry<T> entry)
     {
         if (_disposed)
         {
             throw new ObjectDisposedException(nameof(GradientTape<T>));
         }
+        ThrowIfStreamingReleased();
 
         // MaxEntries: drops new entries when at capacity (not evict-oldest).
         // Arena-based storage doesn't support efficient front-eviction (would require O(n) shift).
@@ -236,6 +277,11 @@ public sealed class GradientTape<T> : IDisposable
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     internal ref TapeEntry<T> RecordSlot()
     {
+        // Same consumed-guard as Record(): RecordSlot is the alternate (direct arena-slot) recording
+        // entry point, so a streaming-released persistent tape must reject it too — otherwise a caller
+        // could record onto the destructively-released graph and hit the silent corruption the guard prevents.
+        ThrowIfStreamingReleased();
+
         // Drop new entries when at capacity (bounded tape)
         if (_options.MaxEntries > 0 && _entries.Count >= _options.MaxEntries)
         {
@@ -332,6 +378,7 @@ public sealed class GradientTape<T> : IDisposable
         Action<Tensor<T>, Tensor<T>> onSourceGradient)
     {
         if (_disposed) throw new ObjectDisposedException(nameof(GradientTape<T>));
+        ThrowIfStreamingReleased();
         if (sources is null) throw new ArgumentNullException(nameof(sources));
         if (onSourceGradient is null) throw new ArgumentNullException(nameof(onSourceGradient));
         if (_entries.Count == 0)
@@ -357,16 +404,43 @@ public sealed class GradientTape<T> : IDisposable
             int stepCount = topoOrder.Count;
 
             var steps = new BackwardStep<T>[stepCount];
+            // #1624: parallel node handles so each step's backward can release its
+            // activation references the moment they are consumed (see below).
+            var nodes = new GradNode<T>[stepCount];
             for (int i = 0; i < stepCount; i++)
             {
                 var node = topoOrder[stepCount - 1 - i]; // reverse for backward
+                nodes[i] = node;
+                var nodeOutput = node.Output ?? throw new InvalidOperationException(
+                    "Streaming backward: GradNode.Output was null during plan setup (node already released).");
+                var nodeBackward = node.Backward ?? throw new InvalidOperationException(
+                    "Streaming backward: GradNode.Backward was null during plan setup (node already released).");
                 steps[i] = new BackwardStep<T>
                 {
-                    Output = node.Output,
+                    Output = nodeOutput,
                     Inputs = node.GetInputsArray(),
-                    Backward = node.Backward,
+                    Backward = nodeBackward,
                     SavedState = node.SavedState,
                 };
+            }
+
+            // Map each op-output tensor to its slot in the tape's entry arena. The arena (_entries)
+            // strongly references every recorded op's Output + Inputs for the tape's lifetime — so on a
+            // PERSISTENT tape (the default) it pins the entire activation set independently of the GradFn
+            // node graph. Releasing only the node graph therefore frees nothing; we must also clear the
+            // arena slot for each activation as the reverse walk consumes it. The streaming backward walks
+            // the GradFn graph (not _entries), so clearing arena slots never affects the backward itself.
+            Dictionary<Tensor<T>, int>? entrySlotOfOutput = null;
+            if (ReleaseStreamingActivations)
+            {
+                int entryCount = _entries.Count;
+                entrySlotOfOutput = new Dictionary<Tensor<T>, int>(
+                    entryCount, ReferenceEqualityComparer<Tensor<T>>.Instance);
+                for (int e = 0; e < entryCount; e++)
+                {
+                    var outT = _entries[e].Output;
+                    if (outT is not null) entrySlotOfOutput[outT] = e; // last writer wins (fused-op replacement)
+                }
             }
 
             // Last backward step that contributes to each source's gradient.
@@ -480,6 +554,62 @@ public sealed class GradientTape<T> : IDisposable
                         }
                     }
                 }
+
+                // Free this step's ACTIVATION references now that its backward has
+                // consumed them — the standard autograd discipline (PyTorch frees
+                // each node's saved tensors as its backward completes). The forward
+                // builds the FULL activation set; without this the node graph keeps
+                // every activation resident for the whole backward, so the backward's
+                // own buffer allocations (AutoTensorCache) pile on top and OOM a deep
+                // model (the SimCSE #1624 failure throws here). This bounds the
+                // live set to the backward frontier on its own — every activation the
+                // TAPE holds is released here, independent of any consumer-side cache.
+                // (A consumer that ALSO pins the same activation via its own layer
+                // cache must additionally drop its reference for the end-to-end peak
+                // to fall; that is the consumer's concern, not a limitation of this
+                // release.) In reverse-topological order an output's consumers have
+                // all already run by the time its producer's backward runs, and the
+                // node Output is never a source (sources are leaves, emitted + released
+                // above), so this never drops a tensor a later step or the optimizer needs.
+                if (ReleaseStreamingActivations)
+                {
+                    var n = nodes[i];
+                    if (n is not null)
+                    {
+                        var nodeOutput = n.Output;
+                        if (nodeOutput is not null && !lastUse.ContainsKey(nodeOutput))
+                        {
+                            n.Output = null;
+                            n.SavedState = null;
+                            n.Backward = null;
+                            // Also drop the tape entry-arena's strong refs to this activation (Output +
+                            // that entry's inputs). On a persistent tape the arena — not the node graph —
+                            // is what otherwise pins the whole activation set for the backward's duration.
+                            if (entrySlotOfOutput is not null
+                                && entrySlotOfOutput.TryGetValue(nodeOutput, out int slot))
+                                _entries[slot] = default;
+                        }
+                        // This node's backward has already run, so it no longer needs its INPUTS.
+                        // Drop the node's references to them: an activation is the output of one node and
+                        // the input of its consumers; nulling Output alone leaves it pinned by every
+                        // consumer node's Input field for the WHOLE backward (the persistent node graph is
+                        // kept), so the activation chain — the bulk of the memory — never frees mid-backward.
+                        // Dropping this node's input refs lets an activation be collected once its producer
+                        // (Output nulled above) and all consumers (input refs nulled here) have released it.
+                        // Safe: only THIS node's references are dropped — a tensor still held elsewhere
+                        // (a source/param in `sources`, or another consumer not yet processed) stays alive;
+                        // later backward steps read grad(tensor), never these node-held input values.
+                        n.Input0 = null;
+                        n.Input1 = null;
+                        n.Input2 = null;
+                        n.InputsOverflow = null;
+                    }
+                    // Reset the whole struct slot (Output/Inputs/Backward/SavedState)
+                    // in one assignment — releases every reference without a
+                    // null-forgiving cast. Safe: this is the end of the iteration and
+                    // steps[i] is never read again.
+                    step = default;
+                }
             }
 
             // Clear .Grad on forward intermediates (parity with the non-persistent
@@ -495,7 +625,19 @@ public sealed class GradientTape<T> : IDisposable
         finally
         {
             SetCurrentTape(savedCurrent);
-            if (!_options.Persistent) _entries.Reset();
+            if (!_options.Persistent)
+            {
+                // Non-persistent tapes drop the whole arena here, so they're safe to
+                // re-record from scratch — no consumed-guard needed.
+                _entries.Reset();
+            }
+            else if (ReleaseStreamingActivations)
+            {
+                // Persistent tape whose arena/graph we just destructively released:
+                // arm the consumed-guard so any later Record/ComputeGradients fails
+                // fast instead of walking the now-defaulted graph.
+                _streamingActivationsReleased = true;
+            }
         }
     }
 
@@ -525,6 +667,7 @@ public sealed class GradientTape<T> : IDisposable
         {
             throw new ObjectDisposedException(nameof(GradientTape<T>));
         }
+        ThrowIfStreamingReleased();
 
         if (_entries.Count == 0)
         {
@@ -1251,11 +1394,15 @@ public sealed class GradientTape<T> : IDisposable
             for (int i = 0; i < stepCount; i++)
             {
                 var node = topoOrder[stepCount - 1 - i]; // reverse for backward order
+                var nodeOutput = node.Output ?? throw new InvalidOperationException(
+                    "Backward: GradNode.Output was null during delegate-chain build (node already released).");
+                var nodeBackward = node.Backward ?? throw new InvalidOperationException(
+                    "Backward: GradNode.Backward was null during delegate-chain build (node already released).");
                 steps[i] = new BackwardStep<T>
                 {
-                    Output = node.Output,
+                    Output = nodeOutput,
                     Inputs = node.GetInputsArray(),
-                    Backward = node.Backward,
+                    Backward = nodeBackward,
                     SavedState = node.SavedState
                 };
             }
@@ -1442,45 +1589,52 @@ public sealed class GradientTape<T> : IDisposable
                     bool nodeOwnedByThisTape = ReferenceEquals(node.OwningTape, this);
                     if (!nodeOwnedByThisTape) continue;
 
-                    // node.Output is always owned by this tape (we just verified
-                    // nodeOwnedByThisTape above). Safe to clear both fields.
-                    node.Output.GradFn = null;
-                    // Issue #338: clear the tape-pinning flag on every
-                    // tape-owned tensor we touch — the backward walk has
-                    // consumed it and pooling is safe again.
-                    node.Output._pinnedByTape = false;
-                    if (!ShouldKeepGrad(node.Output))
-                        node.Output.Grad = null;
-                    node.Input0._pinnedByTape = false;
+                    // node.Output is owned by this tape (verified above). It may
+                    // already be null when the streaming backward released it after
+                    // consuming it — nothing left to clean in that case.
+                    var nodeOutput = node.Output;
+                    if (nodeOutput is not null)
+                    {
+                        nodeOutput.GradFn = null;
+                        // Issue #338: clear the tape-pinning flag on every
+                        // tape-owned tensor we touch — the backward walk has
+                        // consumed it and pooling is safe again.
+                        nodeOutput._pinnedByTape = false;
+                        if (!ShouldKeepGrad(nodeOutput))
+                            nodeOutput.Grad = null;
+                    }
+                    if (node.Input0 is not null) node.Input0._pinnedByTape = false;
                     if (node.Input1 is not null) node.Input1._pinnedByTape = false;
                     if (node.Input2 is not null) node.Input2._pinnedByTape = false;
                     if (node.InputsOverflow is not null)
                         foreach (var inp in node.InputsOverflow)
                             inp._pinnedByTape = false;
 
-                    // Input0 is non-nullable on GradNode<T>; the recorder
-                    // always populates it. But it CAN be a leaf (no GradFn)
-                    // or a foreign-tape intermediate (GradFn.OwningTape != this).
+                    // Input0 CAN be a leaf (no GradFn) or a foreign-tape intermediate
+                    // (GradFn.OwningTape != this), or null when the streaming backward
+                    // already released this node's inputs.
+                    //   null: already released — nothing to clean.
                     //   leaf: preserve .Grad — that's the BC contract for
                     //     param.Grad-reading consumers.
                     //   foreign: preserve both .GradFn and .Grad — those
                     //     belong to the outer tape.
                     //   this-tape intermediate: clear both, gated by
                     //     ShouldKeepGrad for the source / RetainGrad cases.
-                    if (InputOwnedByThisTape(node.Input0))
+                    var in0 = node.Input0;
+                    if (in0 is not null && InputOwnedByThisTape(in0))
                     {
-                        node.Input0.GradFn = null;
-                        if (!ShouldKeepGrad(node.Input0))
-                            node.Input0.Grad = null;
+                        in0.GradFn = null;
+                        if (!ShouldKeepGrad(in0))
+                            in0.Grad = null;
                     }
-                    else if (sourceSet is not null && !ShouldKeepGrad(node.Input0))
+                    else if (in0 is not null && sourceSet is not null && !ShouldKeepGrad(in0))
                     {
                         // Caller's explicit "keep what I listed" contract:
                         // foreign-leaf .Grad wasn't populated by this
                         // backward anyway, so clearing here is a no-op for
                         // nested-tape inputs — but matches the behavior of
                         // the non-Persistent leak-fix path.
-                        node.Input0.Grad = null;
+                        in0.Grad = null;
                     }
 
                     if (node.Input1 is not null)
@@ -1574,8 +1728,11 @@ public sealed class GradientTape<T> : IDisposable
                 foreach (var node in topoOrder)
                 {
                     if (!ReferenceEquals(node.OwningTape, this)) continue;
-                    node.Output._pinnedByTape = false;
-                    node.Input0._pinnedByTape = false;
+                    // node.Output may already be null when the streaming backward
+                    // released it after consuming it — skip its cleanup in that case.
+                    var nodeOutput = node.Output;
+                    if (nodeOutput is not null) nodeOutput._pinnedByTape = false;
+                    if (node.Input0 is not null) node.Input0._pinnedByTape = false;
                     if (node.Input1 is not null) node.Input1._pinnedByTape = false;
                     if (node.Input2 is not null) node.Input2._pinnedByTape = false;
                     if (node.InputsOverflow is not null)
@@ -1588,9 +1745,12 @@ public sealed class GradientTape<T> : IDisposable
                     // may be leaves (params / raw inputs) — preserve their
                     // .Grad and don't touch their .GradFn (leaves have
                     // GradFn=null anyway, or it belongs to an outer tape).
-                    node.Output.GradFn = null;
-                    if (!PersistentShouldKeepGrad(node.Output))
-                        node.Output.Grad = null;
+                    if (nodeOutput is not null)
+                    {
+                        nodeOutput.GradFn = null;
+                        if (!PersistentShouldKeepGrad(nodeOutput))
+                            nodeOutput.Grad = null;
+                    }
 
                     static void ClearIfIntermediate(Tensor<T>? t, GradientTape<T> self,
                         Func<Tensor<T>, bool> shouldKeep, bool canPool)
