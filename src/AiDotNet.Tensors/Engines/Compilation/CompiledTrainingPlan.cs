@@ -34,6 +34,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private readonly Action<IEngine>[] _backwardActions;
     private readonly Tensor<T> _lossOutput;
 
+    // PR #638 generalized per-step transient release: count Step() calls so the release skips a warmup window
+    // (the plan's stable resident buffers are created lazily on the first few steps; evicting then would free
+    // them). After warmup they are pre-snapshot and kept; only each step's fresh tapeless-op transients are freed.
+    private long _stepCounter;
+    private const long StepTransientReleaseWarmup = 8;
+
     // FP16-IN-CAPTURE (task #30): the full heterogeneous (mixed-dtype) topological node order, captured when
     // the traced graph contains FP16 activation-storage nodes (LazyNode<Half> + MixedPrecisionCast bridges
     // emitted by MixedPrecisionEmit under an FP16-storage autocast). The single-type float forward steps
@@ -771,10 +777,31 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // ~0.8MB/step faster than FP32). Snapshot the activation-cache timestamp before this step and
         // deterministically release everything created during it in the finally (exactly what GradientTape does
         // on dispose). Persistent state (params, optimizer m/v, gradMap) was allocated earlier → kept.
-        long fp16ActSnapshot = -1;
-        var fp16SnapEng = _fp16HeteroOrder is not null
-            ? engine as AiDotNet.Tensors.Engines.DirectGpuTensorEngine : null;
-        if (fp16SnapEng is not null) fp16ActSnapshot = fp16SnapEng.ActivationCacheTimestampSnapshot();
+        // PR #638: GENERALIZED per-step transient release (was FP16-hetero only). The compiled plan REPLAYS
+        // without a per-step GradientTape, so GradientTape.Dispose's EvictActivationsCreatedAfter — the normal
+        // per-pass release — never runs. The plan's OWN forward/grad buffers are stable (reused arrays → cached
+        // once → pre-snapshot → KEPT), but the cortex also runs TAPELESS eager layer-forward ops each step
+        // (MultiHeadAttentionForward and the other fused layer ops) that allocate FRESH-keyed activations every
+        // step; with eviction suspended nothing releases them → the diffuse per-step leak that OOMs the async
+        // pool → CUDA-700 → capture aborts. Snapshot here and release this step's post-snapshot transients in the
+        // finally. SKIP a warmup window: the plan's stable resident buffers are created lazily on the first few
+        // steps (timestamp > those steps' snapshots), so evicting then would free them and re-allocate every step
+        // (defeating capture's stable-pointer requirement). After warmup they're pre-snapshot and safely kept.
+        // NOTE (measured): a StepEager-level release does NOT fix the cortex's residual leak — the leaking
+        // tapeless eager ops (MultiHeadAttentionForward et al.) run in the model's ForwardForTraining BEFORE this
+        // snapshot, so their activations are pre-snapshot and not caught here. The effective Tensors-side fix is
+        // per-op (DropTransientActivationsCreatedAfter inside the fused op, e.g. MHA). For the FP16 hetero path the
+        // per-step release IS in-scope (the Half transients are created inside StepEager), so keep it on there;
+        // generalize to all paths only as opt-in (AIDOTNET_STEP_TRANSIENT_RELEASE=1) pending a real use.
+        var snapEng = engine as AiDotNet.Tensors.Engines.DirectGpuTensorEngine;
+        long actSnapshot = snapEng is not null ? snapEng.ActivationCacheTimestampSnapshot() : -1;
+        // FP16 hetero: release every step (original behavior — its Half transients ARE created inside StepEager).
+        // General path: opt-in only (it does NOT help the cortex's residual leak; that leak is in the model's
+        // pre-StepEager ForwardForTraining), and warmup-skipped to protect FP32 lazily-created stable buffers.
+        bool releaseTransients = snapEng is not null && actSnapshot >= 0
+            && (_fp16HeteroOrder is not null
+                || (System.Environment.GetEnvironmentVariable("AIDOTNET_STEP_TRANSIENT_RELEASE") == "1"
+                    && System.Threading.Interlocked.Increment(ref _stepCounter) > StepTransientReleaseWarmup));
         // FP16 mixed precision on the FUSED path (AiDotNet #1354 / #555). The fused plan
         // ignores AiDotNet's _mixedPrecisionContext, but the Tensors-level AutocastScope is
         // honored by the engine's matmul/conv/elementwise GPU ops (norms, softmax, loss and
@@ -1008,12 +1035,15 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         finally
         {
             evictGuard?.ResumeActivationEviction();
-            // FP16 hetero per-step leak fix: deterministically release THIS step's transient activations/grads/
-            // scratch (created after the snapshot). The optimizer has already read _gradients (separate stable
-            // buffers); the stable node-output tensors re-cache on the next step's Execute. This is what keeps
-            // the FP16 path's cross-step VRAM flat instead of climbing ~0.8MB/step.
-            if (fp16SnapEng is not null && fp16ActSnapshot >= 0)
-                fp16SnapEng.EvictActivationsCreatedAfter(fp16ActSnapshot);
+            // PR #638 (generalized; was FP16-hetero only): deterministically release THIS step's transient
+            // activations/grads/scratch created after the snapshot — exactly what GradientTape.Dispose does, which
+            // the compiled REPLAY never invokes. EvictActivationsCreatedAfter keeps everything pre-snapshot, so the
+            // plan's stable resident buffers (reused arrays, cached in the warmup window → pre-snapshot) survive
+            // while the per-step TAPELESS eager-layer transients (fresh arrays each step → post-snapshot) are freed.
+            // The optimizer has already read _gradients. The FP16 path re-caches its stable node-outputs next step;
+            // the FP32 path reuses them. The warmup skip (releaseTransients) protects lazily-created stable buffers.
+            if (releaseTransients && actSnapshot >= 0)
+                snapEng!.EvictActivationsCreatedAfter(actSnapshot);
             // Bound cross-step VRAM growth: per-step transient activation buffers are dereferenced
             // here but their device memory is only released by the GC finalizer, which cannot keep
             // pace under fast stepping (steady climb to OOM, "drained 0 pooled buffers"). Force a
