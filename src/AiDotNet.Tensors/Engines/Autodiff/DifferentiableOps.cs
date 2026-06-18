@@ -430,6 +430,11 @@ internal static class DifferentiableOps
         Tensor<T> grad,
         IEngine engine)
     {
+        // PR #638 A2: mark this scope as grad accumulation so the DirectGpu engine's resident in-place add
+        // fast path engages ONLY here (the dedicated, non-aliased gradient leaf) and never hijacks forward
+        // in-place ops on aliased activations (that hijack threw CUDA-700). No-op for non-DirectGpu engines.
+        using var _gradAccumScope = (engine as AiDotNet.Tensors.Engines.DirectGpuTensorEngine)?.EnterGradAccumulation();
+
         // Higher-order AD: in-place add records a "TensorAddInPlace"
         // entry whose saved input is a *clone* of the existing gradient,
         // which severs the graph the second backward pass needs to

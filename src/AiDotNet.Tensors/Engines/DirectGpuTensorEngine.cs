@@ -352,6 +352,35 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             if (e is not null) System.Threading.Interlocked.Decrement(ref e._capturePathDepth);
         }
     }
+
+    /// <summary>Nonzero only while autodiff's <c>AccumulateGrad</c> runs its in-place grad add (set via
+    /// <see cref="EnterGradAccumulation"/>). The PR #638 A2 resident in-place fast path gates on THIS so it
+    /// engages ONLY for the dedicated, non-aliased gradient leaf — NOT for forward in-place ops
+    /// (<c>TensorBroadcastAddInPlace</c> etc.) whose `a` may be an ALIASED resident activation that an in-place
+    /// mutation would corrupt (the A2 forward-hijack that threw CUDA-700). Instance field + Interlocked to match
+    /// <see cref="_capturePathDepth"/> (op execution can fan out to BLAS-pool threads).</summary>
+    private int _gradAccumDepth;
+
+    /// <summary>True while inside autodiff grad accumulation (see <see cref="_gradAccumDepth"/>).</summary>
+    internal bool InGradAccumulation => System.Threading.Volatile.Read(ref _gradAccumDepth) > 0;
+
+    /// <summary>RAII scope marking the autodiff grad-accumulation in-place add (instance depth; nesting-safe).</summary>
+    internal IDisposable EnterGradAccumulation()
+    {
+        System.Threading.Interlocked.Increment(ref _gradAccumDepth);
+        return new GradAccumScope(this);
+    }
+
+    private sealed class GradAccumScope : IDisposable
+    {
+        private DirectGpuTensorEngine? _e;
+        public GradAccumScope(DirectGpuTensorEngine e) { _e = e; }
+        public void Dispose()
+        {
+            var e = System.Threading.Interlocked.Exchange(ref _e, null);
+            if (e is not null) System.Threading.Interlocked.Decrement(ref e._gradAccumDepth);
+        }
+    }
     internal void SuspendActivationEviction() => System.Threading.Interlocked.Increment(ref _evictionSuspendDepth);
     internal void ResumeActivationEviction()
     {
@@ -2101,6 +2130,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // action in CompiledTrainingPlan), so a "src not resident" log names the PRODUCER op.
     [System.ThreadStatic] internal static string? s_currentForwardOp;
 
+    // Diagnostic (PR #638 A0): the OpName of the compiled GENERIC backward action currently executing (set by
+    // the generic backward action in CompiledTrainingPlan), so the capture-path "[CAPTURE-INVALIDATED-BY]
+    // backwardAction#i" log can name the producing op — the backward analogue of s_currentForwardOp. On a GPU
+    // engine every backward step takes the generic branch (preferGenericForGpu), so tagging it covers the path.
+    [System.ThreadStatic] internal static string? s_currentBackwardOp;
+
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, int> s_aliasDiag = new();
     // Diagnostic: maps a (compiled-plan output) backing array → the op that produced it, so a "src not resident"
     // log names the actual PRODUCER (not the consuming op). Tagged in CopyResultInto.
@@ -2128,6 +2163,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     private static readonly bool s_residentSyncDebug =
         System.Environment.GetEnvironmentVariable("AIDOTNET_RESIDENT_SYNC_DEBUG") == "1";
+    // PR #638 A2 kill-switch (default OFF — opt in with AIDOTNET_RESIDENT_INPLACE=1): the GPU-resident IN-PLACE
+    // binary fast path (resident grad accumulation). DISABLED by default: in-place mutation of a resident buffer
+    // on the capture/pre-residency path triggers an async CUDA-700 even when both operands are resident and the
+    // path is gated to grad accumulation (verified: any engagement → 700; A2-off → clean; per-op sync hides it =
+    // async hazard). The safe replacement is OUT-OF-PLACE accumulation (TensorAddInto into a stable per-leaf
+    // buffer, never mutating an input) — TODO. Code kept behind this flag for that investigation.
+    private static readonly bool s_residentInPlace =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_RESIDENT_INPLACE") == "1";
     private static int s_residentFaultLogged;
     /// <summary>Debug-only (#38 CUDA-700 localization, no compute-sanitizer on this box): synchronize _stream
     /// right after a resident-step op so an async illegal access surfaces ON THAT OP instead of being deferred
@@ -4456,6 +4499,44 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (!TryGetBackend(out var backend))
             return false;
+
+        // GPU-RESIDENT compiled-step path (PR #638 A2): the dominant backward host-traffic is grad accumulation
+        // (AccumulateGrad → TensorAddInPlace → here): the param-grad leaf `a` is GPU-resident, but the host path
+        // below does `a.GetDataArray()` (DtoH), re-uploads, runs the op, and DOWNLOADS the result every call — a
+        // CUDA-900 that aborts whole-step capture and the dominant entry on the A0 download-trace work-list
+        // (~70 of 107 copies). When BOTH operands are ALREADY resident on their own stable buffers, run the op in
+        // place on `a`'s device buffer and rebind — no GetDataArray, no result download.
+        //
+        // BOTH must be resident (not just `a`): an earlier version resolved `b` via GetResidentOrPersistentInputBuffer,
+        // which for a NON-resident `b` UPLOADS into an owned buffer that the `using` then async-frees right after the
+        // in-place Add kernel launches on `_stream` — the kernel reads the freed buffer → an ASYNC CUDA-700
+        // (use-after-free). Verified: A2-off clean, A2-on threw 700, A2-on+per-op-sync (serializes the free after the
+        // kernel) made the 700 vanish — the textbook async-race signature. Requiring `b` resident removes every owned
+        // upload/disposal from this path; it stays inert (host fall-back) until A1 makes the intermediate grads
+        // resident, then engages safely — exactly the A2-falls-out-of-A1 dependency.
+        if (s_residentInPlace && InGradAccumulation && ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float)
+            && a.IsContiguous && b.IsContiguous && a.Length == b.Length
+            && a.TryGetGpuBuffer() is { } aResident
+            && b.TryGetGpuBuffer() is { } bResident
+            && !ReferenceEquals(aResident, bResident)
+            && aResident.Size >= a.Length && bResident.Size >= b.Length)
+        {
+            try
+            {
+                op(backend, aResident, bResident, a.Length);   // a := op(a, b) in place on a's resident buffer
+                ResidentSyncCheck("BinaryInPlace");
+                // In-place mutation: bump Version, then rebind resident (BindResidentBuffer syncs
+                // _gpuBufferVersion to the new Version and registers the host-read materializer).
+                a.IncrementVersion();
+                BindResidentBuffer(a, aResident, backend);
+                return true;
+            }
+            catch (Exception rex)
+            {
+                AliasDiag($"binary-inplace-resident FELLBACK a=[{string.Join(",", a._shape)}] b=[{string.Join(",", b._shape)}]: {rex.GetType().Name}: {rex.Message}");
+                /* fall through to the host-download path below */
+            }
+        }
 
         var aData = a.GetDataArray();
         var bData = b.GetDataArray();

@@ -1483,6 +1483,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                     "cuMemcpyDtoH");
             }
         }
+        // PR #638 A0: attribute this DtoH to the op that issued it (no-op outside a download-trace window).
+        AiDotNet.Tensors.Engines.DirectGpu.GpuMemoryTracker.OnDownload((long)byteSize);
     }
 
     public void Gemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)

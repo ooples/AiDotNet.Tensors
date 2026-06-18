@@ -725,7 +725,23 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             cb.CopyBufferDtoD(seedBuf, destBuf, (long)_lossGradSeed.Length * esz);
 
         var bwd = _backwardActions;
-        for (int i = 0; i < bwd.Length; i++) bwd[i](engine);
+        // PR #638 A0: extend the forward's capture-invalidation probe into the backward. The forward is fully
+        // capture-resident, so capture is still live entering here; the FIRST backward action that issues a
+        // host transfer (a non-resident gradient intermediate) flips StreamCaptureStatusRaw to 2 (invalidated).
+        // Logging its index + name + producing op turns "the THREW op moved" into a concrete backward work-item.
+        bool bwdDiag = System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") == "1" && cb.IsStreamCapturing();
+        var bwdNames = ProfBackwardStepNames;
+        for (int i = 0; i < bwd.Length; i++)
+        {
+            bwd[i](engine);
+            if (bwdDiag && cb.StreamCaptureStatusRaw() == 2)
+            {
+                string nm = i < bwdNames.Length ? bwdNames[i] : "?";
+                try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_graphcapture_diag.txt"),
+                    $"[CAPTURE-INVALIDATED-BY] backwardAction#{i} name={nm} op={Engines.DirectGpuTensorEngine.s_currentBackwardOp}" + System.Environment.NewLine); } catch { }
+                bwdDiag = false;   // log only the FIRST invalidation
+            }
+        }
         // NOTE: _optimizerUpdate is intentionally NOT invoked here — it runs eagerly
         // in Step() after LaunchCapturedGraph so the LR schedule / Adam bias-correction
         // scalars are fresh per step rather than frozen at capture time.
@@ -880,6 +896,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
         // Backward: specialized delegates (direct BLAS into pre-allocated buffers)
         long bwdStart = stepTiming ? Stopwatch.GetTimestamp() : 0;
+        // PR #638 A0: under AIDOTNET_GPU_DOWNLOAD_TRACE=1 (eager run), attribute every DtoH copy issued during
+        // THIS backward to its op, so the post-run trace ranks the backward ops still downloading gradient
+        // intermediates — the work-list for making the backward capture-resident. No-op when the trace is off.
+        var _dlTrace = AiDotNet.Tensors.Engines.DirectGpu.GpuMemoryTracker.BeginDownloadTrace();
         var bwd = _backwardActions;
         var bwdProbe = StepProbe;
         if (bwdProbe != null) bwdProbe("BEGIN-BWD");
@@ -921,6 +941,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 if (bwdProbe != null) bwdProbe($"AFTER-BWD-{i}");
             }
         }
+        _dlTrace.Dispose();
+        AiDotNet.Tensors.Engines.DirectGpu.GpuMemoryTracker.DumpDownloadTrace("backward");
         long t3 = _profileStepEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         if (stepTiming) StepTiming.RecordBackward(Stopwatch.GetTimestamp() - bwdStart);
 
@@ -2700,6 +2722,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 var gradAcc = gradMap;
                 backwardActions.Add(eng =>
                 {
+                    // PR #638 A0: tag the producing op so the capture-path invalidation log can name it.
+                    Engines.DirectGpuTensorEngine.s_currentBackwardOp = stepCopy.OpName;
                     var gradOut = gradAcc.ContainsKey(stepCopy.OutputBuffer)
                         ? gradAcc[stepCopy.OutputBuffer]
                         : gradAcc.Values.First();

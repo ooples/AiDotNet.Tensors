@@ -63,6 +63,19 @@ public static class GpuMemoryTracker
     private static readonly System.Collections.Generic.List<string> s_captureAllocs = new();
     private static readonly object s_captureLock = new();
 
+    // Download-trace (PR #638 Phase A0): attribute every device→host copy (cuMemcpyDtoH) to the op that
+    // triggered it, ranked by frequency. A DtoH inside a CUDA-graph capture window aborts the capture, so the
+    // backward ops that still download are exactly the work-list for making the backward capture-resident. Run
+    // EAGER (AIDOTNET_CUDA_GRAPH_STEP=0) so the copies are legal and ALL of them are observed in one pass (a
+    // captured run would abort on the first). Opt-in via AIDOTNET_GPU_DOWNLOAD_TRACE=1; armed only inside a
+    // BeginDownloadTrace window so the forward's legitimate scalar-loss download isn't attributed to backward.
+    public static readonly bool DownloadTrace =
+        Environment.GetEnvironmentVariable("AIDOTNET_GPU_DOWNLOAD_TRACE") == "1";
+    private static int s_dlTracing;
+    private static readonly Dictionary<string, (long count, long bytes)> s_dlSites = new();
+    private static readonly object s_dlLock = new();
+    private static int s_dlDumped;
+
     /// <summary>Bytes currently allocated on the device and not yet freed (sum over the live set).</summary>
     public static long LiveBytes => Interlocked.Read(ref s_liveBytes);
 
@@ -117,6 +130,69 @@ public static class GpuMemoryTracker
             }
             catch { /* diagnostics must never destabilize the caller */ }
         }
+    }
+
+    /// <summary>
+    /// Begins a download-trace window (PR #638 A0): every <see cref="OnDownload"/> until the returned scope is
+    /// disposed is attributed (by managed call site) to the op that issued the DtoH copy. Use it to wrap the
+    /// backward pass of one eager step so the ranked list names exactly the backward ops still downloading
+    /// gradient intermediates. No-op unless <see cref="DownloadTrace"/>. Re-entrant-safe.
+    /// </summary>
+    public static IDisposable BeginDownloadTrace()
+    {
+        if (!DownloadTrace) return NoopScope.Instance;
+        Interlocked.Increment(ref s_dlTracing);
+        return new DownloadScope();
+    }
+
+    private sealed class DownloadScope : IDisposable
+    {
+        public void Dispose() => Interlocked.Decrement(ref s_dlTracing);
+    }
+
+    /// <summary>Records a device→host copy. Call from the backend's DtoH primitive. Cheap no-op when the trace is
+    /// off or no <see cref="BeginDownloadTrace"/> window is active.</summary>
+    public static void OnDownload(long bytes)
+    {
+        if (!DownloadTrace || Volatile.Read(ref s_dlTracing) <= 0) return;
+        string site = CaptureSite();
+        lock (s_dlLock)
+        {
+            s_dlSites.TryGetValue(site, out var cur);
+            s_dlSites[site] = (cur.count + 1, cur.bytes + bytes);
+        }
+    }
+
+    /// <summary>Writes the download-trace sites ranked by call count (then bytes) to a file, then clears the
+    /// accumulator. One-shot per process by default (the op set repeats every step), so call it after the FIRST
+    /// eager backward. No-op when the trace is off or already dumped.</summary>
+    public static void DumpDownloadTrace(string label)
+    {
+        if (!DownloadTrace) return;
+        if (Interlocked.Exchange(ref s_dlDumped, 1) != 0) return;
+        List<KeyValuePair<string, (long count, long bytes)>> sorted;
+        lock (s_dlLock)
+        {
+            sorted = new List<KeyValuePair<string, (long count, long bytes)>>(s_dlSites);
+            s_dlSites.Clear();
+        }
+        sorted.Sort((a, b) => a.Value.count != b.Value.count
+            ? b.Value.count.CompareTo(a.Value.count)
+            : b.Value.bytes.CompareTo(a.Value.bytes));
+        try
+        {
+            string path = Environment.GetEnvironmentVariable("AIDOTNET_GPU_DOWNLOAD_TRACE_FILE")
+                          ?? System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_download_trace.txt");
+            var sb = new StringBuilder();
+            long totalCount = 0, totalBytes = 0;
+            foreach (var kv in sorted) { totalCount += kv.Value.count; totalBytes += kv.Value.bytes; }
+            sb.AppendLine($"==== download trace [{label}] — {sorted.Count} site(s), {totalCount} DtoH copies, " +
+                          $"{totalBytes / 1048576.0:F1} MB total. Ranked by copy count (the backward-residency work-list): ====");
+            foreach (var kv in sorted)
+                sb.AppendLine($"  x{kv.Value.count,-5} {kv.Value.bytes / 1024.0,10:F1} KB  {kv.Key}");
+            System.IO.File.AppendAllText(path, sb.ToString());
+        }
+        catch { /* diagnostics must never destabilize the caller */ }
     }
 
     /// <summary>Records a device allocation. Call right after a successful <c>cuMemAlloc</c>/<c>cuMemAllocAsync</c>.</summary>
