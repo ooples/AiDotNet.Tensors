@@ -277,6 +277,11 @@ public sealed class GradientTape<T> : IDisposable
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     internal ref TapeEntry<T> RecordSlot()
     {
+        // Same consumed-guard as Record(): RecordSlot is the alternate (direct arena-slot) recording
+        // entry point, so a streaming-released persistent tape must reject it too — otherwise a caller
+        // could record onto the destructively-released graph and hit the silent corruption the guard prevents.
+        ThrowIfStreamingReleased();
+
         // Drop new entries when at capacity (bounded tape)
         if (_options.MaxEntries > 0 && _entries.Count >= _options.MaxEntries)
         {
