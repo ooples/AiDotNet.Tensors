@@ -2052,6 +2052,139 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return result;
     }
 
+    /// <summary>Resident FP16 training (#633): register a PARAMETER's GPU buffer in the persistent weight cache
+    /// (keyed on its backing array — the SAME key the forward param-cast looks up) and point _gpuBuffer at it, so
+    /// the optimizer's in-place update and the next forward read the SAME buffer (survives the step-end discard).</summary>
+    internal void RegisterResidentParamBuffer<T>(Tensor<T> param)
+    {
+        if (param is null || typeof(T) != typeof(float) || !TryGetBackend(out var backend)) return;
+        var arr = param.DataVector.GetBackingArrayUnsafe();
+        if (arr is not float[] farr) return;
+        lock (_persistentBufferLock)
+        {
+            if (_persistentBufferCache.TryGetValue(arr, out var existing))
+            {
+                param._gpuBuffer = existing.Buffer; param._gpuBackend = backend; param._gpuBufferVersion = param.Version;
+                return;
+            }
+            var buf = backend.AllocateBuffer(farr);
+            _persistentBufferCache[arr] = new GpuBufferCacheEntry(buf, PersistentTensorRole.Weights);
+            _tensorVersions.TryAdd(arr, 0);
+            param._gpuBuffer = buf; param._gpuBackend = backend; param._gpuBufferVersion = param.Version;
+        }
+    }
+
+    /// <summary>Resident FP16 training (#633): forward down-cast of FP32 input <paramref name="x"/> (an optimizer-
+    /// updated param, or a resident activation) into Half output <paramref name="o"/>, ON-DEVICE. Reads x preferring
+    /// the persistent param buffer (optimizer-updated, not stale host), ConvertToFp16 into a fresh Half buffer
+    /// published as o's IsFp16 entry. Returns false off-GPU/on failure (caller host-casts).</summary>
+    internal bool TryCastResidentForwardHalf(Tensor<float> x, Tensor<Half> o)
+    {
+        if (x is null || o is null || !TryGetBackend(out var backend)) return false;
+        int n = x.Length;
+        if (n == 0 || o.Length != n) return false;
+        try
+        {
+            IGpuBuffer? xbuf = null;
+            var xarr = x.DataVector.GetBackingArrayUnsafe();
+            // Take the on-device resident cast ONLY when x's device buffer is VERSION-FRESH relative to the host
+            // array. A device-only write (the fused optimizer updating the param buffer in place) does NOT bump the
+            // host Version, so a version-match means the buffer holds the latest weights — read it with no transfer.
+            // A HOST mutation (a host-side optimizer step, or a test re-seeding/perturbing the param) bumps Version
+            // PAST the buffer's snapshot: the buffer is now stale, so we return false and let the caller perform the
+            // host cast (MixedPrecisionCast.CastToFp16) over the fresh host array — identical to the pre-resident
+            // behavior. Without this gate the stale resident buffer masks host param mutations (the forward output
+            // stops tracking weight changes), which broke the standalone/host-optimizer mixed-precision paths.
+            if (x._gpuBuffer is not null && ReferenceEquals(x._gpuBackend, backend) && x._gpuBufferVersion == x.Version)
+            {
+                var persistent = xarr is not null ? TryGetCachedBuffer(xarr) : null;
+                if ((persistent is not null && ReferenceEquals(persistent, x._gpuBuffer))
+                    || IsCachedGpuBufferLive(x, backend))
+                    xbuf = x._gpuBuffer;
+            }
+            if (xbuf is null) return false;
+            // Allocate the Half buffer via AllocateBuffer (a standard float-typed device buffer, over-allocated:
+            // n floats hold n packed halves) rather than AllocateByteBuffer. ConvertToFp16/Hgemm cast the buffer
+            // to the standard device-buffer type, so a byte-typed buffer throws InvalidCastException on those
+            // backends (e.g. OpenCL) — the float-typed buffer is the type those kernels accept.
+            var oArr = o.DataVector.GetBackingArrayUnsafe();
+            if (oArr is null) return false;
+            // REUSE an already-cached Half buffer for this output IN PLACE instead of dispose+realloc. The Half
+            // buffers come from a POOLED allocator: disposing one (InvalidateActivationCacheEntry frees the GPU
+            // buffer) returns it to the pool, and a later cast for a DIFFERENT param can re-rent that exact buffer
+            // while a backward still references the old contents — clobbering a live W_half and corrupting the
+            // upstream gradient (e.g. gradW1, which flows back through W2). The cast node re-executes within one
+            // step (forward, then the backward's activation recompute); the 2nd execution takes this reuse path,
+            // overwriting the SAME buffer so it never re-enters the pool mid-step and every param's Half activation
+            // stays distinct. Gate on ElementCount==n so a pooled host array reused for a differently-sized node
+            // does not alias.
+            IGpuBuffer? halfBuf = null; bool reused = false;
+            lock (_activationCacheLock)
+            {
+                if (_activationCache.TryGetValue(oArr, out var exist) && ReferenceEquals(exist.Backend, backend)
+                    && exist.IsFp16 && exist.ElementCount == n)
+                { halfBuf = exist.Buffer; reused = true; }
+            }
+            if (halfBuf is null) halfBuf = backend.AllocateBuffer(n);
+            backend.ConvertToFp16(xbuf, halfBuf, n);
+            // Refresh the deferred materializer to point at the current contents (one-shot; first-write-wins, so
+            // Remove first). The buffer pointer is unchanged on the reuse path, so this is a cheap closure swap.
+            var capBuf = halfBuf; var capBackend = backend; int cn = n;
+            Helpers.DeferredArrayMaterializer.Remove(oArr);
+            Helpers.DeferredArrayMaterializer.Register(oArr, a =>
+            {
+                using var tmp = AllocateOutputBuffer(capBackend, cn);
+                capBackend.ConvertToFp32(capBuf, tmp.Buffer, cn);
+                float[] fd = capBackend.DownloadBuffer(tmp.Buffer);
+                var dst = (Half[])a;
+                for (int i = 0; i < cn; i++) dst[i] = (Half)fd[i];
+            });
+            if (!reused)
+            {
+                InvalidateActivationCacheEntry(o.DataVector);
+                CacheActivation(oArr, halfBuf, o._shape, backend, isFp16: true, elementCount: n);
+            }
+            o._gpuBuffer = null; o._gpuBackend = null; o._gpuBufferVersion = -1;
+            return true;
+        }
+        catch (Exception) { return false; }
+    }
+
+    /// <summary>Resident FP16 training (#633): device-copy gradient <paramref name="g"/> into a stable per-param
+    /// buffer bound to <paramref name="dest"/> so the fused on-device optimizer reads it with no transfer.</summary>
+    internal bool TryRouteGradResident(Tensor<float> g, Tensor<float> dest, ref IGpuBuffer? stableBuf)
+    {
+        if (g is null || dest is null || !TryGetBackend(out var backend)) return false;
+        int n = g.Length;
+        if (n == 0 || dest.Length != n) return false;
+        // The AUTHORITATIVE resident grad buffer is the activation-cache entry FinishGpuOp published (the very
+        // buffer its deferred materializer downloads when the host reads g) — NOT g._gpuBuffer, which FinishGpuOp
+        // never sets and which can be a stale/earlier pointer from another path (using it copies the wrong tensor,
+        // producing gradients that diverge from the FP32 reference). Resolve the cache entry FIRST (by backing
+        // array, then DataVector); only fall back to g._gpuBuffer when it is the live cached buffer for g.
+        IGpuBuffer? srcBuf = null;
+        object? k2 = g.DataVector?.GetBackingArrayUnsafe();
+        object? k1 = g.DataVector;
+        lock (_activationCacheLock)
+        {
+            if (k2 is not null && _activationCache.TryGetValue(k2, out var e2) && ReferenceEquals(e2.Backend, backend) && !e2.IsFp16) srcBuf = e2.Buffer;
+            else if (k1 is not null && _activationCache.TryGetValue(k1, out var e1) && ReferenceEquals(e1.Backend, backend) && !e1.IsFp16) srcBuf = e1.Buffer;
+        }
+        if (srcBuf is null && g._gpuBuffer is not null && ReferenceEquals(g._gpuBackend, backend)
+            && IsCachedGpuBufferLive(g, backend))
+            srcBuf = g._gpuBuffer;
+        if (srcBuf is null) return false;
+        try
+        {
+            bool firstBind = stableBuf is null;
+            stableBuf ??= backend.AllocateBuffer(n);
+            backend.Copy(srcBuf, stableBuf, n);
+            if (firstBind || !ReferenceEquals(dest._gpuBuffer, stableBuf)) BindResidentBuffer(dest, stableBuf, backend);
+            return true;
+        }
+        catch (Exception) { return false; }
+    }
+
     /// <summary>
     /// On-device dtype cast that keeps the result GPU-RESIDENT — the residency-preserving form of the float↔Half
     /// gradient cast bridge (<see cref="Autodiff.MixedPrecisionCast"/>), whose <c>Tensor.Cast</c> path is a host

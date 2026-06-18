@@ -341,7 +341,12 @@ internal static class MixedPrecisionEmit
             return up.Input; // already FP16 upstream — reuse it, skip the float round-trip
         return scope.RecordCrossTypeWithBackward<float, Half>(
             LazyNodeType.Custom, name, x, x._shape,
-            (e, o) => MixedPrecisionCast.CastToFp16(x).AsSpan().CopyTo(o.AsWritableSpan()),
+            (e, o) =>
+            {
+                if (e is AiDotNet.Tensors.Engines.DirectGpuTensorEngine fg && fg.TryCastResidentForwardHalf(x, o))
+                    return;
+                MixedPrecisionCast.CastToFp16(x).AsSpan().CopyTo(o.AsWritableSpan());
+            },
             // Up-cast the Half gradient into the FP32 grad space ON-DEVICE on the GPU (the host Tensor.Cast
             // would pull the gradient to CPU — CastResidentDtype keeps it resident); host cast otherwise.
             (gradOut, input, output, state, e) => e is AiDotNet.Tensors.Engines.DirectGpuTensorEngine g

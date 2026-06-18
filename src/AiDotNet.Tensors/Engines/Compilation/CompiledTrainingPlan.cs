@@ -104,6 +104,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     // them — otherwise device memory leaks for every gpuM/gpuV across the
     // plan's lifetime, which is unbounded for long-running training.
     private readonly List<Engines.DirectGpu.IGpuBuffer> _gpuOptimizerBuffers = new();
+    private Engines.DirectGpu.IGpuBuffer?[]? _residentGradBuffers;
+    internal static readonly bool ResidentFp16TrainingEnabled =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_FP16_NO_RESIDENT_TRAIN") != "1";
     private bool _disposed;
 
     // Phase G.4: rebuild state captured at compile time so
@@ -214,6 +217,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         foreach (var buf in _gpuOptimizerBuffers)
             buf.Dispose();
         _gpuOptimizerBuffers.Clear();
+
+        if (_residentGradBuffers is not null)
+        {
+            foreach (var buf in _residentGradBuffers) buf?.Dispose();
+            _residentGradBuffers = null;
+        }
 
         // Free the captured training-step graph, if any.
         InvalidateCapturedStepGraph();
@@ -1573,6 +1582,13 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // SgdUpdate / AdamUpdate / AdamWUpdate for every supported
             // device (CUDA / HIP / OpenCL / Metal) so the fused kernel runs
             // on-device with no CPU round-trip.
+            // Pin the param to its PERSISTENT resident buffer BEFORE reading the buffer the optimizer will update,
+            // so the fused on-device optimizer mutates the SAME buffer the resident forward down-cast reads. If we
+            // read TryGetGpuBuffer() first and pinned after, the optimizer would update a transient buffer the
+            // forward never sees → the weights never change → flat loss. Only meaningful on the FP16 hetero path.
+            if (ResidentFp16TrainingEnabled && _fp16HeteroOrder is not null
+                && _engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine rde)
+                rde.RegisterResidentParamBuffer(_parameters[p]);
             var paramGpuBuf = _parameters[p].TryGetGpuBuffer();
             var paramBackend = _parameters[p]._gpuBackend;
             if (paramGpuBuf is not null && paramBackend is not null
@@ -2040,6 +2056,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
             // GPU fast path — same logic as ConfigureOptimizerFloat. See
             // there for the full rationale on per-param GPU/CPU dispatch.
+            // Pin BEFORE reading the buffer so the optimizer and the resident forward share the SAME param buffer.
+            if (ResidentFp16TrainingEnabled && _fp16HeteroOrder is not null
+                && _engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine rde)
+                rde.RegisterResidentParamBuffer(_parameters[p]);
             var paramGpuBuf = _parameters[p].TryGetGpuBuffer();
             var paramBackend = _parameters[p]._gpuBackend;
             if (paramGpuBuf is not null && paramBackend is not null
@@ -2581,6 +2601,18 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // already up-casts to FP32 (GetOrAllocateBuffer:1105 ToFloatArray) — so the compress never matches them.
         // The real forward-storage win needs the Half matmul FORWARD to emit a Half OUTPUT buffer (not up-cast)
         // — a residency-machinery change (FinishGpuOp/DownloadBuffer are float-only), not the cache pager.
+        // Resident FP16 training (#633): make every parameter PERSISTENT-resident before the forward reads it —
+        // but ONLY when an on-device fused optimizer is configured (_optimizerUpdate != null). That is the sole
+        // case where the param is updated IN PLACE on the device and the host array goes stale, so the forward
+        // MUST read the device buffer. With no on-device optimizer (e.g. a bare forward+backward, or a host-side
+        // optimizer), the host array stays authoritative: pinning the param would make the device down-cast read a
+        // device buffer instead of the fresh host weights, needlessly diverging the gradients from the FP32
+        // reference. Leaving the param unpinned lets TryCastResidentForwardHalf fall back to the tested host cast.
+        if (ResidentFp16TrainingEnabled && _optimizerUpdate is not null
+            && engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine prde)
+            for (int p = 0; p < _parameters.Length; p++)
+                prde.RegisterResidentParamBuffer(_parameters[p]);
+
         _fp16PagedPlan ??= MixedPrecisionCompiledPlan.FromCapturedOrder(
             engine, order, (Tensor<float>)(object)_lossOutput, paging: false);
         var loss = _fp16PagedPlan.Forward();
@@ -2605,22 +2637,22 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // The paged plan's backward pages activations in (up-cast) before each node's backward reads them and
         // frees them after the last read — the tested mixed-dtype reverse pass (MixedPrecisionGraphBackward).
         var result = _fp16PagedPlan.Backward();
+        var residentEng = ResidentFp16TrainingEnabled ? engine as AiDotNet.Tensors.Engines.DirectGpuTensorEngine : null;
+        if (residentEng is not null && (_residentGradBuffers is null || _residentGradBuffers.Length != _parameters.Length))
+            _residentGradBuffers = new Engines.DirectGpu.IGpuBuffer?[_parameters.Length];
         for (int p = 0; p < _parameters.Length; p++)
         {
             if (_gradients[p] is null) continue;
             var paramF = (Tensor<float>)(object)_parameters[p];
             if (result.Fp32.TryGetValue(paramF, out var g) && g is not null)
             {
-                var srcSpan = g.AsSpan();
-                var dstSpan = ((Tensor<float>)(object)_gradients[p]).AsWritableSpan();
-                // A length mismatch means the FP16 backward produced a gradient that
-                // does not match the parameter's gradient buffer — silently truncating
-                // (Math.Min) would feed the optimizer a partial update. Fail fast.
-                if (srcSpan.Length != dstSpan.Length)
+                var destF = (Tensor<float>)(object)_gradients[p];
+                if (g.Length != destF.Length)
                     throw new InvalidOperationException(
-                        $"FP16 backward produced gradient length {srcSpan.Length} for parameter {p}, " +
-                        $"but the compiled parameter gradient buffer length is {dstSpan.Length}.");
-                srcSpan.CopyTo(dstSpan);
+                        $"FP16 backward produced gradient length {g.Length} for parameter {p}, " +
+                        $"but the compiled parameter gradient buffer length is {destF.Length}.");
+                if (!(residentEng is not null && residentEng.TryRouteGradResident(g, destF, ref _residentGradBuffers![p])))
+                    g.AsSpan().CopyTo(destF.AsWritableSpan());
             }
         }
     }
