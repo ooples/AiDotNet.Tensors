@@ -2126,6 +2126,28 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             "aidotnet_graphcapture_diag.txt"), "[ALIAS] " + reason + System.Environment.NewLine); } catch { }
     }
 
+    private static readonly bool s_residentSyncDebug =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_RESIDENT_SYNC_DEBUG") == "1";
+    private static int s_residentFaultLogged;
+    /// <summary>Debug-only (#38 CUDA-700 localization, no compute-sanitizer on this box): synchronize _stream
+    /// right after a resident-step op so an async illegal access surfaces ON THAT OP instead of being deferred
+    /// to a later sync (ConfigureOptimizer). The FIRST "[RESIDENT-SYNC] FAULT after 'X'" names the culprit op X.
+    /// Gated by AIDOTNET_RESIDENT_SYNC_DEBUG=1; a no-op in normal runs.</summary>
+    private void ResidentSyncCheck(string op)
+    {
+        if (!s_residentSyncDebug || !ResidentStepActive) return;
+        if (!TryGetBackend(out var b)) return;
+        try { b.Synchronize(); }
+        catch (System.Exception ex)
+        {
+            if (System.Threading.Interlocked.Increment(ref s_residentFaultLogged) <= 3)
+                try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(),
+                    "aidotnet_graphcapture_diag.txt"),
+                    $"[RESIDENT-SYNC] FAULT after '{op}': {ex.GetType().Name}: {ex.Message}" + System.Environment.NewLine); } catch { }
+            throw;
+        }
+    }
+
     internal static void CopyResultInto<T>(IEngine eng, Tensor<T> src, Tensor<T> dest)
     {
         if (s_currentForwardOp is not null)
@@ -3061,6 +3083,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 _lnStatsScratch[arr] = stats;
             }
             backend.LayerNorm(bufIn.Buffer, outBuf, bufGamma.Buffer, bufBeta.Buffer, stats.mean, stats.var, outerSize, normSize, (float)epsilon);
+            ResidentSyncCheck("LayerNorm");
             BindResidentBuffer(output, outBuf, backend);
             var meanT = new Tensor<T>(new T[outerSize], new[] { outerSize });
             var varT = new Tensor<T>(new T[outerSize], new[] { outerSize });
@@ -3096,6 +3119,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var bufB = GetResidentOrPersistentInputBuffer(backend, b);
             var outBuf = GetOrCreateResidentBuffer(backend, output, M * N);
             backend.Gemm(bufA.Buffer, bufB.Buffer, outBuf, M, N, K, 1.0f, 0.0f);
+            ResidentSyncCheck("MatMul");
             BindResidentBuffer(output, outBuf, backend);
             return true;
         }
@@ -3132,6 +3156,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var bufB = GetResidentOrPersistentInputBuffer(backend, b);
             var outBuf = GetOrCreateResidentBuffer(backend, output, batch * M * N);
             cb.BatchedGemm(bufA.Buffer, bufB.Buffer, outBuf, M, N, K, batch, 1.0f, 0.0f);
+            ResidentSyncCheck("BatchedMatMul");
             BindResidentBuffer(output, outBuf, backend);
             return true;
         }
@@ -3152,6 +3177,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var bufIn = GetResidentOrPersistentInputBuffer(backend, a);
             var outBuf = GetOrCreateResidentBuffer(backend, output, output.Length);
             backend.Scale(bufIn.Buffer, outBuf, scalarF, output.Length);
+            ResidentSyncCheck("MultiplyScalar");
             BindResidentBuffer(output, outBuf, backend);
             return true;
         }
@@ -3180,7 +3206,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             RegisterEmbIndexRefresh(() => UploadEmbeddingIndices(capIdx, capN));
             if (!EmbeddingIndexExternallyManaged) UploadEmbeddingIndices(floatIndices, numIndices);
             if (_cachedEmbIndexBuffer is null) return false;
+            if (s_residentSyncDebug) AliasDiag($"EMB-BUFS n={numIndices} dim={embeddingDim} needOut={(long)numIndices*embeddingDim} "
+                + $"outBufElems={outBuf.Size} tableElems={tableBuf.Size} idxBufElems={_cachedEmbIndexBuffer.Size} impliedV={tableBuf.Size/embeddingDim}");
             backend.Embedding(_cachedEmbIndexBuffer, tableBuf, outBuf, numIndices, embeddingDim);
+            ResidentSyncCheck("Embedding");
             output._gpuBuffer = outBuf; output._gpuBackend = backend; output._gpuBufferVersion = output.Version;
             var oArr = output.DataVector.GetBackingArrayUnsafe();
             if (oArr is not null && s_currentForwardOp is not null) if (s_producerDiagEnabled && s_producerOf.Count < ProducerDiagCap) s_producerOf[oArr] = s_currentForwardOp;
@@ -15583,6 +15612,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     if (arr is not null) CacheActivation(arr, outBuf, output._shape, backend);
                 }
                 backend.Permute(bufIn.Buffer, outBuf, tensor.Shape._dims, axes);
+                ResidentSyncCheck("Permute");
                 output._gpuBuffer = outBuf;
                 output._gpuBackend = backend;
                 output._gpuBufferVersion = output.Version;
