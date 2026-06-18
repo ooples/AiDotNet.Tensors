@@ -3221,9 +3221,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if ((long)numIndices * embeddingDim != output.Length) return false;
         try
         {
+            if (s_residentSyncDebug && backend is Engines.DirectGpu.CUDA.CudaBackend cbP0)
+                AliasDiag($"EMB-PROBE preResolveTable captureStatus={cbP0.StreamCaptureStatusRaw()} tableHasGpuBuf={embeddings._gpuBuffer is not null}");
             var tableBuf = ResolveResidentEmbeddingTable(backend, embeddings);
+            if (s_residentSyncDebug && backend is Engines.DirectGpu.CUDA.CudaBackend cbP1)
+                AliasDiag($"EMB-PROBE postResolveTable captureStatus={cbP1.StreamCaptureStatusRaw()}");
             if (tableBuf is null) return false;
             var outBuf = output.TryGetGpuBuffer() ?? GetOrCreateResidentBuffer(backend, output, numIndices * embeddingDim);
+            if (s_residentSyncDebug && backend is Engines.DirectGpu.CUDA.CudaBackend cbP2)
+                AliasDiag($"EMB-PROBE postResolveOut captureStatus={cbP2.StreamCaptureStatusRaw()} outWasResident={output.TryGetGpuBuffer() is not null}");
             // Indices via the EXTERNALLY-MANAGED stable buffer (mirrors TryEmbeddingGatherGpu): register the refresh
             // so the plan re-uploads fresh indices before each captured replay; upload inline only on the eager
             // (non-managed) pass. The index upload (the only HtoD) thus never happens INSIDE the capture (= the 906).
@@ -3233,6 +3239,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             if (_cachedEmbIndexBuffer is null) return false;
             if (s_residentSyncDebug) AliasDiag($"EMB-BUFS n={numIndices} dim={embeddingDim} needOut={(long)numIndices*embeddingDim} "
                 + $"outBufElems={outBuf.Size} tableElems={tableBuf.Size} idxBufElems={_cachedEmbIndexBuffer.Size} impliedV={tableBuf.Size/embeddingDim}");
+            if (s_residentSyncDebug && backend is Engines.DirectGpu.CUDA.CudaBackend cbProbe)
+                AliasDiag($"EMB-PROBE preLaunch captureStatus={cbProbe.StreamCaptureStatusRaw()} idxBuf={_cachedEmbIndexBuffer.Size} tableBuf={tableBuf.Size} outBuf={outBuf.Size}");
             backend.Embedding(_cachedEmbIndexBuffer, tableBuf, outBuf, numIndices, embeddingDim);
             ResidentSyncCheck("Embedding");
             output._gpuBuffer = outBuf; output._gpuBackend = backend; output._gpuBufferVersion = output.Version;
@@ -11753,6 +11761,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// capture/replay never re-read host data or re-upload (no DtoH/HtoD inside the captured region).</summary>
     private IGpuBuffer? ResolveResidentEmbeddingTable<T>(IDirectGpuBackend backend, Tensor<T> embeddingTable)
     {
+        // CAPTURE PATH (#38 embedding-first capture abort): inside a resident step NEVER re-resolve the table via the
+        // GetDataArray() path below — for a GPU-resident table that DtoH-DOWNLOADS it, an illegal copy during stream
+        // capture that invalidated the whole graph (verified: preResolveTable status=1 → postResolveTable status=2).
+        // The pre-residency pass already resolved + uploaded the table for THIS backend into _cachedEmbTableBuffer,
+        // which (per this method's contract) is "uploaded once + updated in place by the optimizer — exactly the
+        // buffer the captured MatMul reads", and eviction is suspended for the graph lifetime so it stays stable.
+        // The param's own _gpuBuffer field can't be used here: its _gpuBackend doesn't ReferenceEqual the live
+        // backend (set by a different upload path), so both early-returns below fall through to the download.
+        if (ResidentStepActive && _cachedEmbTableBuffer is not null) return _cachedEmbTableBuffer;
+
         // Prefer the param's CURRENT live resident buffer. The embedding table is a PARAMETER; if its GPU buffer
         // is re-allocated (the optimizer's resident-param setup) a once-cached pointer DANGLES → the gather reads
         // FREED device memory = the sticky CUDA-700/900 that aborted capture (#38). Re-validate each call.

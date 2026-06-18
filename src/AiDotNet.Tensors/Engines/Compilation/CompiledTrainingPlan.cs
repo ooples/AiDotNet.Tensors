@@ -689,11 +689,20 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private void RunGpuStepBodyForCapture(Engines.DirectGpu.CUDA.CudaBackend cb)
     {
         var engine = _engine;
+        bool capDiag = System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") == "1" && cb.IsStreamCapturing();
+        // PINPOINT (issue: forwardAction#0 reports 901=already-invalidated, so the invalidator is BEFORE it): log
+        // capture status at body entry and right after the (host-only) param transform. If status is already 2 here,
+        // the invalidation happened in capture SETUP / the param transform, not in any forward op.
+        if (capDiag)
+        { try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_graphcapture_diag.txt"),
+            $"[CAP-PROBE] bodyEntry status={cb.StreamCaptureStatusRaw()}" + System.Environment.NewLine); } catch { } }
         _preForwardParamTransform?.Invoke();
+        if (capDiag)
+        { try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_graphcapture_diag.txt"),
+            $"[CAP-PROBE] afterParamTransform status={cb.StreamCaptureStatusRaw()}" + System.Environment.NewLine); } catch { } }
         var fwd = _forwardActions;
         // The whole forward (INCLUDING the embedding, which gathers on-device from the externally-refreshed stable
         // index buffer) is captured. _graphEagerFwd is 0 in capture mode (no eager prefix).
-        bool capDiag = System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") == "1" && cb.IsStreamCapturing();
         for (int i = _graphEagerFwd; i < fwd.Length; i++)
         {
             fwd[i](engine);
