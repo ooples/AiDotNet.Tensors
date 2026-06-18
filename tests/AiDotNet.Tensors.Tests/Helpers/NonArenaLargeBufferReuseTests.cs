@@ -32,6 +32,14 @@ using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Helpers;
 
+// Serialized: the churn assertion uses GC.GetTotalAllocatedBytes(precise: true), which counts
+// allocations across ALL threads of the process. Run in parallel with other allocating tests it
+// observes their bytes too and the per-cycle delta exceeds the threshold — a false failure (it
+// passes in isolation). A non-parallel collection makes the measurement deterministic.
+[CollectionDefinition("NonArenaLargeBufferReuseSerial", DisableParallelization = true)]
+public class NonArenaLargeBufferReuseCollection { }
+
+[Collection("NonArenaLargeBufferReuseSerial")]
 public class NonArenaLargeBufferReuseTests
 {
     // 2^21 float elements = 8 MB — strictly larger than ArrayPool<T>.Shared's

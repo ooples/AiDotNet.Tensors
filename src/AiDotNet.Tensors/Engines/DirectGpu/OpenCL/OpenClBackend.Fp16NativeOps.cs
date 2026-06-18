@@ -50,6 +50,68 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             k.Execute1D(n, Math.Min(256, n));
         }
 
+        /// <summary>Row softmax over the last axis of a half buffer: one work-group per row, FP32 max/sum,
+        /// half in/out. OpenCL counterpart of the CUDA fp16_softmax_native.</summary>
+        public void Fp16Softmax(IGpuBuffer input, IGpuBuffer output, int rows, int cols)
+        {
+            if (input is null) throw new ArgumentNullException(nameof(input));
+            if (output is null) throw new ArgumentNullException(nameof(output));
+            if (rows <= 0 || cols <= 0) throw new ArgumentException($"rows/cols must be positive (rows={rows}, cols={cols}).");
+            if (!EnsureFp16NativeOpKernels() || !_kernelCache.TryGetValue(Fp16NativeOpKernels.SoftmaxKernelName, out var k))
+                throw new NotSupportedException("FP16-native op kernels are not available on this OpenCL device.");
+
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            k.SetArg(arg++, rows);
+            k.SetArg(arg++, cols);
+            int local = Fp16NativeOpKernels.RowReduceLocalSize;
+            k.Execute1D(rows * local, local); // one work-group per row
+        }
+
+        /// <summary>Row layernorm over the last axis of a half buffer with half gamma/beta: one work-group
+        /// per row, FP32 mean/var, half in/out; optionally writes per-row FP32 mean/variance. OpenCL
+        /// counterpart of the CUDA fp16_layernorm_native (the kernel always writes mean/var, so temporary
+        /// buffers are supplied when the caller passes none).</summary>
+        public void Fp16LayerNorm(IGpuBuffer input, IGpuBuffer gamma, IGpuBuffer beta, IGpuBuffer output,
+            IGpuBuffer meanFp32, IGpuBuffer varFp32, int rows, int cols, float eps)
+        {
+            if (input is null) throw new ArgumentNullException(nameof(input));
+            if (gamma is null) throw new ArgumentNullException(nameof(gamma));
+            if (beta is null) throw new ArgumentNullException(nameof(beta));
+            if (output is null) throw new ArgumentNullException(nameof(output));
+            if (rows <= 0 || cols <= 0) throw new ArgumentException($"rows/cols must be positive (rows={rows}, cols={cols}).");
+            if (eps <= 0f || float.IsNaN(eps) || float.IsInfinity(eps))
+                throw new ArgumentOutOfRangeException(nameof(eps), eps, "eps must be finite and positive.");
+            if (!EnsureFp16NativeOpKernels() || !_kernelCache.TryGetValue(Fp16NativeOpKernels.LayerNormKernelName, out var k))
+                throw new NotSupportedException("FP16-native op kernels are not available on this OpenCL device.");
+
+            IGpuBuffer? tmpMean = null, tmpVar = null;
+            var meanBuf = meanFp32 ?? (tmpMean = AllocateBuffer(rows));
+            var varBuf = varFp32 ?? (tmpVar = AllocateBuffer(rows));
+            try
+            {
+                uint arg = 0;
+                k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+                k.SetArg(arg++, ((DirectOpenClGpuBuffer)gamma).Buffer.Handle);
+                k.SetArg(arg++, ((DirectOpenClGpuBuffer)beta).Buffer.Handle);
+                k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+                k.SetArg(arg++, ((DirectOpenClGpuBuffer)meanBuf).Buffer.Handle);
+                k.SetArg(arg++, ((DirectOpenClGpuBuffer)varBuf).Buffer.Handle);
+                k.SetArg(arg++, rows);
+                k.SetArg(arg++, cols);
+                k.SetArg(arg++, eps);
+                int local = Fp16NativeOpKernels.RowReduceLocalSize;
+                k.Execute1D(rows * local, local); // one work-group per row
+                if (tmpMean is not null || tmpVar is not null) _context?.Finish(); // ensure writes land before disposing temps
+            }
+            finally
+            {
+                tmpMean?.Dispose();
+                tmpVar?.Dispose();
+            }
+        }
+
         private void DispatchFp16Unary(string kernelName, IGpuBuffer input, IGpuBuffer output, int n)
         {
             if (input is null) throw new ArgumentNullException(nameof(input));

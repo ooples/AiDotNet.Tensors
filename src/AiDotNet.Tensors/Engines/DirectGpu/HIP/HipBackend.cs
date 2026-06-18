@@ -1676,6 +1676,36 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             }
     }
 
+    /// <summary>In-place multiply of every element of <paramref name="buffer"/> by the device-resident
+    /// scalar at <paramref name="scalar"/>[0]. HIP counterpart of the CUDA scale_by_device_scalar.</summary>
+    public unsafe void ScaleByDeviceScalar(IGpuBuffer buffer, IGpuBuffer scalar, int size)
+    {
+        if (buffer is null) throw new ArgumentNullException(nameof(buffer));
+        if (scalar is null) throw new ArgumentNullException(nameof(scalar));
+        if (size <= 0) return;
+        long requiredBytes = (long)size * sizeof(float);
+        if (buffer.SizeInBytes < requiredBytes)
+            throw new ArgumentException(
+                $"ScaleByDeviceScalar requires {requiredBytes} bytes but buffer has {buffer.SizeInBytes}.", nameof(buffer));
+        if (scalar.SizeInBytes < sizeof(float))
+            throw new ArgumentException(
+                $"ScaleByDeviceScalar requires a scalar buffer with at least {sizeof(float)} bytes.", nameof(scalar));
+        if (!_kernelCache.TryGetValue("scale_by_device_scalar", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: scale_by_device_scalar");
+        IntPtr bufPtr = buffer.Handle;
+        IntPtr scalarPtr = scalar.Handle;
+        int n = size;
+        void** args = stackalloc void*[3];
+        args[0] = &bufPtr;
+        args[1] = &scalarPtr;
+        args[2] = &n;
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+        // Preserve the synchronous lifetime contract: the caller may free/reuse the device scalar
+        // immediately after this returns, so the launch must complete before we return (matches ScaleVector).
+        Synchronize();
+    }
+
     public unsafe void StridedGather(IGpuBuffer src, IGpuBuffer dst, int offset, int stride, int count)
     {
         if (count <= 0) return;
@@ -6224,6 +6254,18 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int batch, int numQHeads, int numKVHeads, int seqQ, int seqK, int headDim, float scale,
         int numQueriesPerKV)
     {
+        // Validate the external head-mapping parameter before any kernel launch: the kernels compute
+        // kvh = qh / numQueriesPerKV, so a non-positive value divides by zero on-device, and a value that
+        // maps a query head past numKVHeads reads/writes KV gradients out of bounds.
+        if (numQueriesPerKV <= 0)
+            throw new ArgumentOutOfRangeException(nameof(numQueriesPerKV), numQueriesPerKV,
+                "numQueriesPerKV must be positive.");
+        long mappedKvHeads = ((long)numQHeads + numQueriesPerKV - 1) / numQueriesPerKV;
+        if (mappedKvHeads > numKVHeads)
+            throw new ArgumentException(
+                $"numQueriesPerKV={numQueriesPerKV} maps {numQHeads} query heads across {mappedKvHeads} KV heads, " +
+                $"but only {numKVHeads} KV heads were provided.", nameof(numQueriesPerKV));
+
         // #628: honor the explicit numQueriesPerKV (matches the CPU's kvh = qh / numQueriesPerKV).
         int queriesPerKV = numQueriesPerKV;
 

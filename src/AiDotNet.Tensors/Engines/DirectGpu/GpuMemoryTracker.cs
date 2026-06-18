@@ -69,6 +69,17 @@ public static class GpuMemoryTracker
     /// <summary>The high-water mark of <see cref="LiveBytes"/> observed since process start.</summary>
     public static long PeakBytes => Interlocked.Read(ref s_peakBytes);
 
+    /// <summary>
+    /// Reset the peak watermark down to the CURRENT live bytes, so a subsequent <see cref="PeakBytes"/> read
+    /// reflects the peak of just the next measurement window (e.g. one forward). Used to A/B the device-memory
+    /// footprint of two configurations (FP32 vs FP16 activation storage) within one process. No-op when off.
+    /// </summary>
+    public static void ResetPeak()
+    {
+        if (!Enabled) return;
+        Interlocked.Exchange(ref s_peakBytes, Interlocked.Read(ref s_liveBytes));
+    }
+
     /// <summary>Number of live (un-freed) device allocations.</summary>
     public static int LiveCount => s_live.Count;
 
@@ -126,7 +137,24 @@ public static class GpuMemoryTracker
         long peak;
         while (lb > (peak = Interlocked.Read(ref s_peakBytes)))
             if (Interlocked.CompareExchange(ref s_peakBytes, lb, peak) == peak) break;
+        // Peak-composition dump (AIDOTNET_GPU_MEMTRACK_PEAKDUMP=1): each time the live high-water grows by a
+        // big margin, append the current live-set Report so the PEAK's allocation breakdown is captured (the
+        // post-run Report only shows the small residual). Throttled to big jumps so it doesn't spam.
+        if (s_peakDump && lb > Interlocked.Read(ref s_lastPeakDump) + PeakDumpStepBytes)
+        {
+            Interlocked.Exchange(ref s_lastPeakDump, lb);
+            Dump($"peak-grow {lb / (double)BytesPerMiB:F1} MB");
+        }
     }
+
+    private const long BytesPerMiB = 1024L * 1024L;
+    // Only re-dump the peak composition once the live high-water grows by this
+    // much, so the throttled dump doesn't spam on every small allocation.
+    private const long PeakDumpStepBytes = 64L * BytesPerMiB;
+
+    private static readonly bool s_peakDump =
+        Environment.GetEnvironmentVariable("AIDOTNET_GPU_MEMTRACK_PEAKDUMP") == "1";
+    private static long s_lastPeakDump;
 
     /// <summary>Clears a device allocation. Call right before the matching <c>cuMemFree</c>/<c>cuMemFreeAsync</c>.</summary>
     public static void OnFree(IntPtr ptr)

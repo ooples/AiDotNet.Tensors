@@ -32,6 +32,73 @@ public sealed partial class VulkanBackend : IGpuHalfPrecisionBackend
     public bool SupportsHgemm => IsGlslCompilerAvailable;
 
     /// <inheritdoc/>
+    /// <remarks>The fused backward is two dispatches of the runtime-compiled <c>GemmFp16BackwardTransposed</c>
+    /// GLSL shader, so it shares the libshaderc gate with <see cref="SupportsHgemm"/>.</remarks>
+    public bool SupportsFp16FusedBackward => IsGlslCompilerAvailable;
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Two dispatches of the transposed FP16 GLSL GEMM (FP16 in, FP32 accumulate, no materialized transpose):
+    /// gradA[M,K] = gradC·Bᵀ (transA=0, transB=1) and gradB[K,N] = Aᵀ·gradC (transA=1, transB=0). The shader
+    /// writes FP32; FP16-output grads run into an FP32 scratch then <c>ConvertToFp16</c> (mirrors <see cref="Hgemm"/>).
+    /// </remarks>
+    public void MatMulBackwardFp16Fused(
+        IGpuBuffer gradCFp16, IGpuBuffer aFp16, IGpuBuffer bFp16,
+        IGpuBuffer gradAOut, IGpuBuffer gradBOut,
+        int m, int n, int k, bool gradOutHalf)
+    {
+        if (gradCFp16 is null) throw new ArgumentNullException(nameof(gradCFp16));
+        if (aFp16 is null) throw new ArgumentNullException(nameof(aFp16));
+        if (bFp16 is null) throw new ArgumentNullException(nameof(bFp16));
+        if (gradAOut is null) throw new ArgumentNullException(nameof(gradAOut));
+        if (gradBOut is null) throw new ArgumentNullException(nameof(gradBOut));
+        if (m <= 0) throw new ArgumentOutOfRangeException(nameof(m), "Dimensions must be positive.");
+        if (n <= 0) throw new ArgumentOutOfRangeException(nameof(n), "Dimensions must be positive.");
+        if (k <= 0) throw new ArgumentOutOfRangeException(nameof(k), "Dimensions must be positive.");
+
+        // gradA[M,K] = gradC[M,N] · Bᵀ : Mo=M, No=K, Kc=N; A=gradC (transA=0), B=Bfwd (transB=1).
+        DispatchGlslGemmBackward(gradCFp16, bFp16, gradAOut, m, k, n, transA: 0, transB: 1, gradOutHalf);
+        // gradB[K,N] = Aᵀ · gradC[M,N] : Mo=K, No=N, Kc=M; A=Afwd (transA=1), B=gradC (transB=0).
+        DispatchGlslGemmBackward(aFp16, gradCFp16, gradBOut, k, n, m, transA: 1, transB: 0, gradOutHalf);
+    }
+
+    /// <summary>
+    /// One dispatch of the transposed FP16 backward GLSL GEMM into <paramref name="cOut"/>. When
+    /// <paramref name="gradOutHalf"/> the shader writes an FP32 scratch which is then packed to FP16 by
+    /// <c>ConvertToFp16</c>; otherwise it writes <paramref name="cOut"/> (FP32) directly.
+    /// </summary>
+    private void DispatchGlslGemmBackward(IGpuBuffer a, IGpuBuffer b, IGpuBuffer cOut,
+        int mo, int no, int kc, int transA, int transB, bool gradOutHalf)
+    {
+        var pipeline = GetOrCreateGlslPipeline(VulkanGemmKernels.GemmFp16BackwardTransposed, 3, 5 * sizeof(uint));
+        if (pipeline is null)
+            throw new NotSupportedException(
+                "Vulkan FP16 GEMM requires libshaderc for runtime GLSL compilation, which is unavailable.");
+
+        IGpuBuffer? scratch = gradOutHalf ? AllocateBuffer(mo * no) : null;
+        try
+        {
+            var dest = scratch ?? cOut;
+            var vbA = AsVulkan(a);
+            var vbB = AsVulkan(b);
+            var vbC = AsVulkan(dest);
+            var pushConstants = new uint[] { (uint)mo, (uint)no, (uint)kc, (uint)transA, (uint)transB };
+            var threadRes = _device.AcquireThreadResources();
+            lock (_computeLock)
+            {
+                pipeline.UpdateDescriptorSet(vbA.Storage, vbB.Storage, vbC.Storage);
+                RecordAndExecuteWithPushData(pipeline, mo * no, pushConstants, 5 * sizeof(uint), threadRes);
+            }
+            if (scratch is not null)
+                ConvertToFp16(scratch, cOut, mo * no);
+        }
+        finally
+        {
+            scratch?.Dispose();
+        }
+    }
+
+    /// <inheritdoc/>
     public void GemmFp16In32fOut(IGpuBuffer aFp16, IGpuBuffer bFp16, IGpuBuffer cFp32,
         int m, int n, int k)
     {

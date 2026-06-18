@@ -28,6 +28,11 @@ public sealed partial class CudaBackend
     public bool SupportsHgemm => IsAvailable && _ccMajor >= 5;
 
     /// <inheritdoc/>
+    /// <remarks>The fused backward is two <c>cublasGemmEx</c> launches with transpose flags — available on exactly
+    /// the same Tensor-Core-capable hardware as the forward HGEMM, so it tracks <see cref="SupportsHgemm"/>.</remarks>
+    public bool SupportsFp16FusedBackward => SupportsHgemm;
+
+    /// <inheritdoc/>
     public unsafe void Hgemm(IGpuBuffer aFp16, IGpuBuffer bFp16, IGpuBuffer cFp16,
         int m, int n, int k)
     {
@@ -104,5 +109,128 @@ public sealed partial class CudaBackend
                 CuBlasNative.CUBLAS_COMPUTE_32F,
                 0 /* CUBLAS_GEMM_DEFAULT — let cuBLAS pick algorithm */),
             "cublasGemmEx(FP16 in / FP32 out)");
+    }
+
+    /// <summary>
+    /// FP16 Tensor-Core forward GEMM with a HALF output: row-major <c>C[M,N] = A[M,K] · B[K,N]</c>, FP16
+    /// inputs, FP32 accumulate (<c>CUBLAS_COMPUTE_32F</c> — full-chain precision), FP16 STORED output. The
+    /// half-output variant of <see cref="GemmFp16"/> (which stores FP32): it lets the forward keep the matmul
+    /// activation resident as Half (half the VRAM) instead of up-casting it to FP32 on the device. cuBLAS is
+    /// column-major, so Cᵀ = Bᵀ·Aᵀ via (N,M,K) with B then A — identical layout to <see cref="GemmFp16"/>.
+    /// </summary>
+    public unsafe void GemmFp16HalfOut(IGpuBuffer Ahalf, IGpuBuffer Bhalf, IGpuBuffer Chalf, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
+    {
+        if (!SupportsHgemm) throw new NotSupportedException("GemmFp16HalfOut requires CUDA compute capability >= 5.0 (Maxwell+).");
+        if (Ahalf is null) throw new ArgumentNullException(nameof(Ahalf));
+        if (Bhalf is null) throw new ArgumentNullException(nameof(Bhalf));
+        if (Chalf is null) throw new ArgumentNullException(nameof(Chalf));
+        if (M <= 0 || N <= 0 || K <= 0) throw new ArgumentException($"GEMM dims must be positive (M={M}, N={N}, K={K}).");
+        if (Ahalf.SizeInBytes < (long)M * K * 2) throw new ArgumentException($"A half buffer too small: {Ahalf.SizeInBytes} < {(long)M * K * 2}.");
+        if (Bhalf.SizeInBytes < (long)K * N * 2) throw new ArgumentException($"B half buffer too small: {Bhalf.SizeInBytes} < {(long)K * N * 2}.");
+        if (Chalf.SizeInBytes < (long)M * N * 2) throw new ArgumentException($"C half buffer too small: {Chalf.SizeInBytes} < {(long)M * N * 2}.");
+
+        using var _ = PushContext();
+        float aVal = alpha, bVal = beta;
+        IntPtr alphaPtr = (IntPtr)(&aVal);
+        IntPtr betaPtr = (IntPtr)(&bVal);
+        var status = CuBlasNative.cublasGemmEx(
+            _cublasHandle,
+            CublasOperation.None, CublasOperation.None,
+            N, M, K,
+            alphaPtr,
+            Bhalf.Handle, CuBlasNative.CUDA_R_16F, N,
+            Ahalf.Handle, CuBlasNative.CUDA_R_16F, K,
+            betaPtr,
+            Chalf.Handle, CuBlasNative.CUDA_R_16F, N,
+            CuBlasNative.CUBLAS_COMPUTE_32F,
+            0 /* CUBLAS_GEMM_DEFAULT */);
+        if (status == AiDotNet.Tensors.Engines.CublasStatus.NotSupported)
+            throw new NotSupportedException($"FP16 Tensor-Core GEMM (Half out) not supported on this device (cc {_ccMajor}.{_ccMinor}).");
+        CuBlasNative.CheckCublasStatus(status, "cublasGemmEx(GemmFp16HalfOut)");
+    }
+
+    /// <summary>
+    /// Fused FP16 matmul BACKWARD for the forward <c>C[M,N] = A[M,K] · B[K,N]</c>. Computes both gradients in
+    /// two Tensor-Core <c>cublasGemmEx</c> launches (FP16 inputs, FP32 accumulate + FP32 output) directly from
+    /// the FP16-resident activations — with NO materialized transpose and NO FP32 up-cast scratch:
+    /// <list type="bullet">
+    /// <item><c>gradA[M,K] = gradC[M,N] · Bᵀ</c></item>
+    /// <item><c>gradB[K,N] = Aᵀ · gradC[M,N]</c></item>
+    /// </list>
+    /// This replaces the eager backward's two <c>TensorTranspose</c> + two <c>TensorMatMul</c> dispatches (four
+    /// FP32 device allocations per matmul backward — the measured dominant cost of the FP16 hetero path, see
+    /// Fp16ActivationDominated_ReducesGpuPeakBytes) with two transpose-free Half GEMMs into caller-owned
+    /// (reused) output buffers. cuBLAS is column-major, so each gradient is derived via the same
+    /// memory-equivalence transposition as <see cref="MatMulTransposed"/>:
+    /// <para>gradA_col[K,M] = Bᵀ_col · gradC_col → (op=T on B, op=N on gradC; m=K,n=M,k=N; ldB=N,ldgradC=N,ldgradA=K).</para>
+    /// <para>gradB_col[N,K] = gradC_col · Aᵀ_col → (op=N on gradC, op=T on A; m=N,n=K,k=M; ldgradC=N,ldA=K,ldgradB=N).</para>
+    /// All buffers are device-resident; the caller owns allocation + stream (capture-safe: no alloc/free here).
+    /// </summary>
+    /// <param name="gradCHalf">FP16 upstream gradient, shape [M,N].</param>
+    /// <param name="aHalf">FP16 forward input A, shape [M,K].</param>
+    /// <param name="bHalf">FP16 forward input B, shape [K,N].</param>
+    /// <param name="gradAOut">Output buffer for gradA, shape [M,K] (caller-owned, reused). FP32 or FP16 per <paramref name="gradOutHalf"/>.</param>
+    /// <param name="gradBOut">Output buffer for gradB, shape [K,N] (caller-owned, reused). FP32 or FP16 per <paramref name="gradOutHalf"/>.</param>
+    /// <param name="gradOutHalf">When true the gradient outputs are FP16 (CUDA_R_16F) — the dtype the FP16
+    /// hetero backward needs so the grads flow on as Half with no FP32 down-cast scratch; the accumulate stays
+    /// FP32 (COMPUTE_32F) either way, so only the stored output is Half. When false the outputs are FP32.</param>
+    public unsafe void MatMulBackwardFp16Fused(
+        IGpuBuffer gradCHalf, IGpuBuffer aHalf, IGpuBuffer bHalf,
+        IGpuBuffer gradAOut, IGpuBuffer gradBOut,
+        int M, int N, int K, bool gradOutHalf = false)
+    {
+        if (!SupportsHgemm)
+            throw new NotSupportedException("MatMulBackwardFp16Fused requires CUDA compute capability >= 5.0 (Maxwell+).");
+        if (gradCHalf is null) throw new ArgumentNullException(nameof(gradCHalf));
+        if (aHalf is null) throw new ArgumentNullException(nameof(aHalf));
+        if (bHalf is null) throw new ArgumentNullException(nameof(bHalf));
+        if (gradAOut is null) throw new ArgumentNullException(nameof(gradAOut));
+        if (gradBOut is null) throw new ArgumentNullException(nameof(gradBOut));
+        if (M <= 0) throw new ArgumentOutOfRangeException(nameof(M), "Dimensions must be positive.");
+        if (N <= 0) throw new ArgumentOutOfRangeException(nameof(N), "Dimensions must be positive.");
+        if (K <= 0) throw new ArgumentOutOfRangeException(nameof(K), "Dimensions must be positive.");
+        int outType = gradOutHalf ? CuBlasNative.CUDA_R_16F : CuBlasNative.CUDA_R_32F;
+        long outElemBytes = gradOutHalf ? 2 : sizeof(float);
+        // Byte-aware buffer-size guards (half = 2 bytes, fp32 = 4) — the element-count view would misread.
+        if (gradCHalf.SizeInBytes < (long)M * N * 2) throw new ArgumentException($"gradC half buffer too small: {gradCHalf.SizeInBytes} < {(long)M * N * 2}.");
+        if (aHalf.SizeInBytes < (long)M * K * 2) throw new ArgumentException($"A half buffer too small: {aHalf.SizeInBytes} < {(long)M * K * 2}.");
+        if (bHalf.SizeInBytes < (long)K * N * 2) throw new ArgumentException($"B half buffer too small: {bHalf.SizeInBytes} < {(long)K * N * 2}.");
+        if (gradAOut.SizeInBytes < (long)M * K * outElemBytes) throw new ArgumentException($"gradA buffer too small: {gradAOut.SizeInBytes} < {(long)M * K * outElemBytes}.");
+        if (gradBOut.SizeInBytes < (long)K * N * outElemBytes) throw new ArgumentException($"gradB buffer too small: {gradBOut.SizeInBytes} < {(long)K * N * outElemBytes}.");
+
+        using var _ = PushContext();
+        float alphaF = 1.0f, betaF = 0.0f;
+        IntPtr alphaPtr = (IntPtr)(&alphaF);
+        IntPtr betaPtr = (IntPtr)(&betaF);
+
+        // gradA[M,K] = gradC · Bᵀ  →  col-major gradA[K,M] = Bᵀ_col · gradC_col.
+        var sA = CuBlasNative.cublasGemmEx(
+            _cublasHandle,
+            CublasOperation.Transpose, CublasOperation.None,
+            K, M, N,
+            alphaPtr,
+            bHalf.Handle, CuBlasNative.CUDA_R_16F, N,
+            gradCHalf.Handle, CuBlasNative.CUDA_R_16F, N,
+            betaPtr,
+            gradAOut.Handle, outType, K,
+            CuBlasNative.CUBLAS_COMPUTE_32F, 0);
+        if (sA == AiDotNet.Tensors.Engines.CublasStatus.NotSupported)
+            throw new NotSupportedException($"FP16 Tensor-Core GEMM not supported on this device (cc {_ccMajor}.{_ccMinor}).");
+        CuBlasNative.CheckCublasStatus(sA, "cublasGemmEx(MatMulBackwardFp16Fused gradA)");
+
+        // gradB[K,N] = Aᵀ · gradC  →  col-major gradB[N,K] = gradC_col · Aᵀ_col.
+        var sB = CuBlasNative.cublasGemmEx(
+            _cublasHandle,
+            CublasOperation.None, CublasOperation.Transpose,
+            N, K, M,
+            alphaPtr,
+            gradCHalf.Handle, CuBlasNative.CUDA_R_16F, N,
+            aHalf.Handle, CuBlasNative.CUDA_R_16F, K,
+            betaPtr,
+            gradBOut.Handle, outType, N,
+            CuBlasNative.CUBLAS_COMPUTE_32F, 0);
+        if (sB == AiDotNet.Tensors.Engines.CublasStatus.NotSupported)
+            throw new NotSupportedException($"FP16 Tensor-Core GEMM not supported on this device (cc {_ccMajor}.{_ccMinor}).");
+        CuBlasNative.CheckCublasStatus(sB, "cublasGemmEx(MatMulBackwardFp16Fused gradB)");
     }
 }

@@ -48,6 +48,10 @@ internal static class HalfPrecisionGemmKernels
     /// <summary>Kernel name: FP16 inputs, FP32 accumulator, FP16 output.</summary>
     public const string Fp16In16fOutKernelName = "gemm_fp16in_fp16out";
 
+    /// <summary>Kernel name: generalized transposed FP16 GEMM for the fused matmul backward
+    /// (<c>C = op(A)·op(B)</c> with per-operand transpose + selectable FP32/FP16 output).</summary>
+    public const string Fp16BackwardKernelName = "gemm_fp16_backward";
+
     /// <summary>Work-group tile size; global sizes are rounded up to a multiple of this.</summary>
     public const int TileSize = 16;
 
@@ -56,6 +60,7 @@ internal static class HalfPrecisionGemmKernels
     {
         Fp16In32fOutKernelName,
         Fp16In16fOutKernelName,
+        Fp16BackwardKernelName,
     };
 
     /// <summary>OpenCL C source for the FP16 GEMM kernels.</summary>
@@ -138,6 +143,72 @@ __kernel void gemm_fp16in_fp16out(
 
     if (row < M && col < N)
         vstore_half(acc, row * N + col, (__global half*)C);
+}
+
+// Generalized transposed FP16 GEMM for the fused matmul BACKWARD:
+//   C[Mo,No] = op(A) . op(B),  FP16 inputs, FP32 accumulate.
+//   transA/transB (0/1) select how the logical operand is read from storage WITHOUT a materialized transpose:
+//     op(A) logical [Mo,Kc]:  transA==0 -> A stored [Mo,Kc], A[i,p]=A[i*Kc+p]
+//                             transA==1 -> A stored [Kc,Mo], A[i,p]=A[p*Mo+i]
+//     op(B) logical [Kc,No]:  transB==0 -> B stored [Kc,No], B[p,j]=B[p*No+j]
+//                             transB==1 -> B stored [No,Kc], B[p,j]=B[j*Kc+p]
+//   gradOutHalf (0/1) selects the stored output dtype (FP32 float / FP16 half); accumulate is FP32 either way.
+//   C is a raw byte buffer (uchar*) cast inside per gradOutHalf. With transA=0,transB=0,gradOutHalf=0 this is
+//   exactly gemm_fp16in_fp32out, so the tiled staging matches the verified forward kernel.
+//   The two backward GEMMs map as:
+//     gradA[M,K] = gradC[M,N].B^T : Mo=M,No=K,Kc=N,  A=gradC transA=0,  B=Bfwd transB=1
+//     gradB[K,N] = A^T.gradC[M,N] : Mo=K,No=N,Kc=M,  A=Afwd transA=1,   B=gradC transB=0
+__kernel void gemm_fp16_backward(
+    __global const ushort* A,
+    __global const ushort* B,
+    __global uchar* C,
+    const int Mo, const int No, const int Kc,
+    const int transA, const int transB, const int gradOutHalf)
+{
+    const int lx = get_local_id(0);                  // column within tile (No axis)
+    const int ly = get_local_id(1);                  // row within tile (Mo axis)
+    const int col = get_group_id(0) * HGEMM_TS + lx; // global No index (j)
+    const int row = get_group_id(1) * HGEMM_TS + ly; // global Mo index (i)
+
+    __local float Asub[HGEMM_TS][HGEMM_TS];
+    __local float Bsub[HGEMM_TS][HGEMM_TS];
+
+    float acc = 0.0f;
+    const int numTiles = (Kc + HGEMM_TS - 1) / HGEMM_TS;
+    for (int t = 0; t < numTiles; ++t)
+    {
+        const int aK = t * HGEMM_TS + lx;            // Kc index paired with row for A
+        const int bK = t * HGEMM_TS + ly;            // Kc index paired with col for B
+        float av = 0.0f;
+        if (row < Mo && aK < Kc)
+        {
+            const int idxA = (transA == 0) ? (row * Kc + aK) : (aK * Mo + row);
+            av = vload_half(idxA, (__global const half*)A);
+        }
+        Asub[ly][lx] = av;
+        float bv = 0.0f;
+        if (bK < Kc && col < No)
+        {
+            const int idxB = (transB == 0) ? (bK * No + col) : (col * Kc + bK);
+            bv = vload_half(idxB, (__global const half*)B);
+        }
+        Bsub[ly][lx] = bv;
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        for (int kk = 0; kk < HGEMM_TS; ++kk)
+            acc += Asub[ly][kk] * Bsub[kk][lx];
+
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    if (row < Mo && col < No)
+    {
+        const int o = row * No + col;
+        if (gradOutHalf == 0)
+            ((__global float*)C)[o] = acc;
+        else
+            vstore_half(acc, o, (__global half*)C);
+    }
 }
 ";
 }

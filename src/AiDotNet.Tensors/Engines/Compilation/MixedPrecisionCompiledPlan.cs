@@ -47,7 +47,38 @@ public sealed class MixedPrecisionCompiledPlan
     private Dictionary<Tensor<float>, int>? _bwdConsumerCount;            // total backward reads per activation
     private HashSet<Tensor<float>>? _droppedThisStep;                     // storage freed this step; restore next Forward
 
-    private MixedPrecisionCompiledPlan(IEngine engine, ILazyNode[] order, Tensor<float> output, bool paging)
+    // ── Buffer FREE for the hetero Execute-replay path (not paging/compress — full free) ──────────────
+    // The hetero path otherwise CACHES + HOLDS every intermediate float activation until end-of-step (eviction
+    // is suspended mid-step for #226), so its GPU peak is the SUM of all intermediates — measured as the bulk
+    // of FP16's overhead vs the FP32 compiled path, which reuses preallocated buffers. This frees each
+    // intermediate after its LAST use (forward, if the backward never reads it; else after its last backward
+    // read), matching the compiled path's progressive release. Default on for the GPU hetero path; opt-out.
+    private readonly DirectGpuTensorEngine? _freeEng;
+    private List<Tensor<float>>[]? _freeAfterFwd;                          // per fwd step: free dead (no-bwd-read) intermediates
+
+    // ── Backward SUB-OP SCRATCH release (the structural piece, #633) ───────────────────────────────────
+    // The activation FREE above releases node-output activations; but the MEASURED dominant FP16-hetero
+    // overhead vs the FP32 compiled path is the per-op SCRATCH the BACKWARD functions create through engine ops
+    // (the cross-entropy Clamp/Log/Sign/Abs/Divide chain over the full vocab, TensorMultiply-backward temps),
+    // held in the activation cache because eviction is suspended mid-step. The FP32 specialized path reuses
+    // preallocated buffers; the hetero Execute-replay routes every op through the cache. This releases each
+    // node's backward scratch right after that node's backward (protecting the live gradient accumulators),
+    // giving the hetero path the FP32 path's progressive release. Default-on for the GPU hetero path; opt-out.
+    private readonly bool _scratchFree;
+
+    // ── Forward Half-resident activation STORAGE (the last structural piece, #633) ─────────────────────
+    // The hetero forward otherwise emits each Half matmul output as an FP32 device buffer (the engine up-casts
+    // Tensor<Half> → FP32 in GetOrAllocateBuffer/FinishGpuOp), so the activations are stored FLOAT on the GPU and
+    // the dtype win is lost. The engine ships a Half-resident store (FinishGpuOpHalfStore, gated by
+    // DirectGpuTensorEngine.Fp16FwdStoreOverride/AIDOTNET_FP16_FWD_STORE) that keeps the matmul output as a HALF
+    // GPU buffer (half the VRAM); the now-all-backend fused Half backward then reads it directly (no re-inflate).
+    // Default-on for the GPU hetero forward (the activations are already Tensor<Half> — Half-resident matches the
+    // captured intent, no new precision loss); opt-out AIDOTNET_FP16_NO_FWD_STORE. An EXPLICIT caller override
+    // (e.g. the A/B peak tests) is always respected.
+    private readonly bool _fwdStoreDefault;
+
+    private MixedPrecisionCompiledPlan(IEngine engine, ILazyNode[] order, Tensor<float> output, bool paging,
+        bool fwdStoreEligible = false)
     {
         _engine = engine;
         _order = order;
@@ -56,7 +87,72 @@ public sealed class MixedPrecisionCompiledPlan
         _gpuFp16 = (paging && engine is DirectGpuTensorEngine dg
                     && Environment.GetEnvironmentVariable("AIDOTNET_FP16_GPU_CACHE") == "1") ? dg : null;
         if (_paging) BuildPagingSchedule();
+        else if (engine is DirectGpuTensorEngine fdg
+                 && Environment.GetEnvironmentVariable("AIDOTNET_FP16_NO_FREE") != "1")
+        {
+            _freeEng = fdg;
+            BuildFreeSchedule();
+            // Backward sub-op scratch release: default-on alongside the activation free, separately opt-out-able
+            // (AIDOTNET_FP16_NO_SCRATCH_FREE) so it can be disabled without losing the activation free schedule.
+            _scratchFree = Environment.GetEnvironmentVariable("AIDOTNET_FP16_NO_SCRATCH_FREE") != "1";
+        }
+        // Forward Half-resident store: default-on ONLY for the FP16 hetero TRAINING forward (FromCapturedOrder,
+        // fwdStoreEligible=true), where the VRAM win matters and the training parity tolerance already covers the
+        // Half-storage rounding. NOT for the standalone Compile()/Trace() inference path, whose contract is to
+        // replay a fresh trace bit-for-bit (the Half storage would perturb the matmul-intermediate values vs the
+        // eager FP32-stored trace). Opt-out AIDOTNET_FP16_NO_FWD_STORE; an explicit Fp16FwdStoreOverride wins.
+        _fwdStoreDefault = fwdStoreEligible
+            && engine is DirectGpuTensorEngine
+            && Environment.GetEnvironmentVariable("AIDOTNET_FP16_NO_FWD_STORE") != "1";
     }
+
+    // Build the free schedule: which intermediate float activations the backward reads (_bwdReadByNode +
+    // _bwdConsumerCount, for free-after-last-bwd-read) and which are DEAD after forward (_freeAfterFwd).
+    private void BuildFreeSchedule()
+    {
+        _bwdConsumerCount = new Dictionary<Tensor<float>, int>(ReferenceEqualityComparer<Tensor<float>>.Instance);
+        _bwdReadByNode = new Dictionary<ILazyNode, List<Tensor<float>>>(ReferenceEqualityComparer<ILazyNode>.Instance);
+        int n = _order.Length;
+        _freeAfterFwd = new List<Tensor<float>>[n];
+        for (int i = 0; i < n; i++) _freeAfterFwd[i] = new List<Tensor<float>>();
+
+        var floatOutputs = new HashSet<Tensor<float>>(ReferenceEqualityComparer<Tensor<float>>.Instance);
+        foreach (var node in _order)
+        {
+            var o = FloatOutputOf(node);
+            if (o is not null && !ReferenceEquals(o, _output)) floatOutputs.Add(o);
+        }
+
+        var lastFwdUse = new Dictionary<Tensor<float>, int>(ReferenceEqualityComparer<Tensor<float>>.Instance);
+        for (int i = 0; i < n; i++)
+        {
+            var node = _order[i];
+            foreach (var t in FloatInputsOf(node))
+                if (floatOutputs.Contains(t)) lastFwdUse[t] = i;
+            List<Tensor<float>>? reads = null;
+            foreach (var t in BwdReadsFloat(node))
+            {
+                if (!floatOutputs.Contains(t)) continue;
+                (reads ??= new List<Tensor<float>>()).Add(t);
+                _bwdConsumerCount[t] = (_bwdConsumerCount.TryGetValue(t, out var c) ? c : 0) + 1;
+            }
+            if (reads is not null) _bwdReadByNode[node] = reads;
+        }
+        // DEAD intermediates (no backward read) → free right after their last forward use.
+        foreach (var kv in lastFwdUse)
+            if (!_bwdConsumerCount.ContainsKey(kv.Key))
+                _freeAfterFwd[kv.Value].Add(kv.Key);
+    }
+
+    /// <summary>
+    /// FP16-IN-CAPTURE (task #30): construct a paged mixed-precision plan from an ALREADY-captured heterogeneous
+    /// node order (e.g. CompiledTrainingPlan's _fp16HeteroOrder) + its loss output, rather than re-tracing.
+    /// Lets CompiledTrainingPlan delegate its hetero forward/backward to this plan's tested activation-paging
+    /// lifecycle (PageOut/PageIn — frees the transient float up-cast copies, holds only the Half activations,
+    /// on-device when AIDOTNET_FP16_GPU_CACHE=1) so the full peak-VRAM reduction is realized.
+    /// </summary>
+    internal static MixedPrecisionCompiledPlan FromCapturedOrder(IEngine engine, ILazyNode[] order, Tensor<float> output, bool paging)
+        => new MixedPrecisionCompiledPlan(engine, order, output, paging, fwdStoreEligible: true);
 
     /// <summary>
     /// Public entry point (Phase E): trace <paramref name="forward"/> under an FP16 autocast scope with
@@ -109,17 +205,29 @@ public sealed class MixedPrecisionCompiledPlan
     public Tensor<float> Forward()
     {
         var eng = _engine;
-        for (int i = 0; i < _order.Length; i++)
+        // Engage the Half-resident forward store for the GPU hetero forward so each Half matmul output stays a
+        // HALF GPU buffer (half the VRAM) instead of being up-cast to FP32 — but ONLY when the caller hasn't set
+        // an explicit override (the A/B peak tests do), so their measurement intent is preserved.
+        bool setStore = _fwdStoreDefault && DirectGpuTensorEngine.Fp16FwdStoreOverride is null;
+        var prevStore = DirectGpuTensorEngine.Fp16FwdStoreOverride;
+        if (setStore) DirectGpuTensorEngine.Fp16FwdStoreOverride = true;
+        try
         {
-            // Just-in-time: re-give storage to THIS node's output if it was paged/freed last step, right
-            // before its Execute writes into it. Restoring all upfront would re-inflate to full float and
-            // erase the win; per-node keeps resident float = the live working set.
-            if (_paging) RestoreOutputForReplay(_order[i]);
-            RunForward(_order[i], eng);
-            if (_paging)
-                foreach (var t in _pageOutAt![i]) PageOut(t);
+            for (int i = 0; i < _order.Length; i++)
+            {
+                // Just-in-time: re-give storage to THIS node's output if it was paged/freed last step, right
+                // before its Execute writes into it. Restoring all upfront would re-inflate to full float and
+                // erase the win; per-node keeps resident float = the live working set.
+                if (_paging) RestoreOutputForReplay(_order[i]);
+                RunForward(_order[i], eng);
+                if (_paging)
+                    foreach (var t in _pageOutAt![i]) PageOut(t);
+                else if (_freeEng is not null)
+                    foreach (var t in _freeAfterFwd![i]) _freeEng.FreeFloatActivation(t); // dead after forward
+            }
+            return _output;
         }
-        return _output;
+        finally { if (setStore) DirectGpuTensorEngine.Fp16FwdStoreOverride = prevStore; }
     }
 
     // A node's float output may have had its backing freed on the prior step (paged out / backward-freed);
@@ -140,7 +248,46 @@ public sealed class MixedPrecisionCompiledPlan
     private MixedPrecisionGraphBackward.Result RunBackward(float seedScale)
     {
         if (!_paging)
-            return MixedPrecisionGraphBackward.BackwardOverOrder(_order, _output, _engine, seedScale);
+        {
+            if (_freeEng is null)
+                return MixedPrecisionGraphBackward.BackwardOverOrder(_order, _output, _engine, seedScale);
+            // FREE mode: free each backward-read intermediate after its LAST backward read (progressive release,
+            // matching the FP32 compiled path) instead of holding all to end-of-step.
+            var rem = new Dictionary<Tensor<float>, int>(_bwdConsumerCount!, ReferenceEqualityComparer<Tensor<float>>.Instance);
+            // Snapshot the activation-cache timestamp at the START of the backward: everything cached after this
+            // is backward-pass-created (gradient accumulators + per-op scratch). The grads are protected via the
+            // live grad maps; the rest is scratch released after each node (#633 structural progressive release).
+            long bwdSnap = _scratchFree ? _freeEng.ActivationCacheTimestampSnapshot() : -1L;
+            var protect = _scratchFree ? new HashSet<object>(ReferenceEqualityComparer<object>.Instance) : null;
+            return MixedPrecisionGraphBackward.BackwardOverOrder(_order, _output, _engine, seedScale,
+                onAfterNodeBackward: node =>
+                {
+                    if (_bwdReadByNode!.TryGetValue(node, out var reads))
+                        foreach (var t in reads)
+                            if (--rem[t] == 0) _freeEng.FreeFloatActivation(t);
+                },
+                onAfterNodeBackwardWithGrads: _scratchFree
+                    ? (node, fp32, fp16) =>
+                    {
+                        // Protect the live gradient accumulators (cache key = backing array); evict the rest of
+                        // this node's backward sub-op scratch. Over-eviction degrades to a re-upload, not a fault.
+                        protect!.Clear();
+                        foreach (var g in fp32.Values)
+                        {
+                            var a = g.DataVector.GetBackingArrayUnsafe();
+                            if (a is not null) protect.Add(a);
+                        }
+                        foreach (var g in fp16.Values)
+                        {
+                            var a = g.DataVector.GetBackingArrayUnsafe();
+                            if (a is not null) protect.Add(a);
+                        }
+                        // materializePending:false — the scratch is dead (not protected, not a forward activation
+                        // kept past the snapshot), so dropping its pending download keeps the step fully resident.
+                        _freeEng.EvictActivationsCreatedAfter(bwdSnap, protect, materializePending: false);
+                    }
+                    : null);
+        }
 
         // Refcount backward reads; page-in before a node's backward reads an activation, free after the last.
         var remaining = new Dictionary<Tensor<float>, int>(_bwdConsumerCount!, ReferenceEqualityComparer<Tensor<float>>.Instance);

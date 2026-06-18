@@ -114,22 +114,22 @@ public sealed class GpuGradientClipParityTests : IDisposable
         Assert.True(maxErr < 1e-4, $"GPU vs CPU clip max_abs_err {maxErr:E3} exceeded 1e-4");
     }
 
-    [Fact]
+    [SkippableFact]
     public void GpuClip_Matches_Cpu_WhenClippingActive()
     {
         var cb = GetCuda();
-        if (cb is null) return;
+        Skip.If(cb is null, "CUDA backend not available");
         var sizes = new[] { 589824, 768, 3072, 50 };   // mixed sizes incl. a non-pow2-block tail
         var grads = MakeGrads(11, sizes, mag: 2.0);     // big values → norm >> maxNorm → real clipping
         const double maxNorm = 1.0;
         AssertMatch(GpuClip(cb, grads, maxNorm), CpuClip(grads, maxNorm));
     }
 
-    [Fact]
+    [SkippableFact]
     public void GpuClip_IsNoOp_WhenNormBelowMax()
     {
         var cb = GetCuda();
-        if (cb is null) return;
+        Skip.If(cb is null, "CUDA backend not available");
         var sizes = new[] { 1024, 256, 17 };
         var grads = MakeGrads(7, sizes, mag: 1e-3);     // tiny values → norm << maxNorm → scale==1 (no-op)
         const double maxNorm = 100.0;

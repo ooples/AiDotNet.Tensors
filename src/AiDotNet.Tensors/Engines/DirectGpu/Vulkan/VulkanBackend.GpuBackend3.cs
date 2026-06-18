@@ -207,8 +207,20 @@ public sealed unsafe partial class VulkanBackend
         int batch, int numQHeads, int numKVHeads, int seqQ, int seqK, int headDim, float scale,
         int numQueriesPerKV)
     {
-        // GQA backward: using numQHeads for fallback path (numQueriesPerKV honored by the GQA-aware
-        // CPU/OpenCL paths; this simplified Vulkan fallback treats every head independently).
+        if (numQueriesPerKV <= 0)
+            throw new ArgumentOutOfRangeException(nameof(numQueriesPerKV), numQueriesPerKV, "numQueriesPerKV must be positive.");
+        if (numQHeads <= 0 || numKVHeads <= 0)
+            throw new ArgumentOutOfRangeException(nameof(numQHeads), "GQA head counts must be positive.");
+        // True GQA (numQHeads != numKVHeads) needs a KV-head-aware backward (kvh = qh / numQueriesPerKV)
+        // that accumulates gradKey/gradValue across the query heads sharing each KV head. The Vulkan backend
+        // has no such kernel yet (its attention backward is the host reference AttentionBackwardCore). The
+        // previous fallback ran that with numQHeads, which mis-indexed K/V and wrote gradKey/gradValue
+        // (sized for numKVHeads) OUT OF BOUNDS — silently wrong gradients. Reject it loudly instead; standard
+        // multi-head attention (equal head counts) is correct via the shared backward.
+        if (numQHeads != numKVHeads)
+            throw new NotSupportedException(
+                $"Vulkan backend does not support grouped-query attention backward (numQHeads={numQHeads} != " +
+                $"numKVHeads={numKVHeads}); only standard multi-head attention (equal head counts) is implemented.");
         AttentionBackwardCore(gradOutput, query, key, value, attentionWeights, gradQuery, gradKey, gradValue,
             batch, numQHeads, seqQ, headDim, scale, false);
     }

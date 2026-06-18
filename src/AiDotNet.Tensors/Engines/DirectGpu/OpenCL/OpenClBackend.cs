@@ -7707,6 +7707,22 @@ KERNEL VARIANTS (A/B testing):
             int batch, int numQHeads, int numKVHeads, int seqQ, int seqK, int headDim, float scale,
             int numQueriesPerKV)
         {
+            // Validate the external head-mapping parameter before launching any kernel: the kernels divide
+            // qh by numQueriesPerKV and use the result as a KV-head index, so 0/negative divides by zero and
+            // a too-small value indexes KV gradients out of bounds.
+            if (numQueriesPerKV <= 0)
+                throw new ArgumentOutOfRangeException(nameof(numQueriesPerKV), numQueriesPerKV,
+                    "numQueriesPerKV must be positive.");
+            if (numQHeads <= 0 || numKVHeads <= 0)
+                throw new ArgumentOutOfRangeException(nameof(numQHeads), "GQA head counts must be positive.");
+            if (batch <= 0 || seqQ <= 0 || seqK <= 0 || headDim <= 0)
+                throw new ArgumentOutOfRangeException(nameof(batch),
+                    $"GQA dimensions must be positive (batch={batch}, seqQ={seqQ}, seqK={seqK}, headDim={headDim}).");
+            if ((numQHeads - 1) / numQueriesPerKV >= numKVHeads)
+                throw new ArgumentException(
+                    "numQueriesPerKV maps at least one query head outside the available KV head range.",
+                    nameof(numQueriesPerKV));
+
             // The kernels must honor the SAME head mapping as the CPU reference: kvh = qh / numQueriesPerKV
             // (the explicit parameter), NOT a recomputed numQHeads/numKVHeads. For a consistent GQA config
             // these are equal, but the parity harness drives inconsistent combos (e.g. Q=K=3 heads with
@@ -10724,6 +10740,42 @@ KERNEL VARIANTS (A/B testing):
             var data = new float[size];
             var buf = ((DirectOpenClGpuBuffer)buffer).Buffer;
             buf.CopyFromHost(data);
+        }
+
+        // Device-side buffer zeroing via the zero_buffer kernel — no host array
+        // allocation or CPU->GPU upload (unlike Fill / the host-copy ZeroBuffer above).
+        private void ZeroBufferOnDevice(IGpuBuffer buffer, int size)
+        {
+            if (size <= 0) return;
+            if ((long)size * sizeof(float) > buffer.SizeInBytes)
+                throw new ArgumentException(
+                    $"ZeroBufferOnDevice would write {(long)size * sizeof(float)} bytes but buffer has {buffer.SizeInBytes}.", nameof(size));
+            var zeroKernel = _kernelCache["zero_buffer"];
+            zeroKernel.SetArg(0, ((DirectOpenClGpuBuffer)buffer).Buffer.Handle);
+            zeroKernel.SetArg(1, size);
+            zeroKernel.Execute1D(size, CalculateOptimalWorkGroupSize1D(size));
+        }
+
+        /// <summary>In-place multiply of every element of <paramref name="buffer"/> by the device-resident
+        /// scalar at <paramref name="scalar"/>[0]. OpenCL counterpart of the CUDA scale_by_device_scalar.</summary>
+        public void ScaleByDeviceScalar(IGpuBuffer buffer, IGpuBuffer scalar, int size)
+        {
+            if (buffer is null) throw new ArgumentNullException(nameof(buffer));
+            if (scalar is null) throw new ArgumentNullException(nameof(scalar));
+            if (size <= 0) return;
+            long requiredBytes = (long)size * sizeof(float);
+            if (buffer.SizeInBytes < requiredBytes)
+                throw new ArgumentException(
+                    $"ScaleByDeviceScalar requires {requiredBytes} bytes but buffer has {buffer.SizeInBytes}.", nameof(buffer));
+            if (scalar.SizeInBytes < sizeof(float))
+                throw new ArgumentException(
+                    $"ScaleByDeviceScalar requires a scalar buffer with at least {sizeof(float)} bytes.", nameof(scalar));
+            if (!_kernelCache.TryGetValue("scale_by_device_scalar", out var kernel))
+                throw new InvalidOperationException("OpenCL kernel not found: scale_by_device_scalar");
+            kernel.SetArg(0, ((DirectOpenClGpuBuffer)buffer).Buffer.Handle);
+            kernel.SetArg(1, ((DirectOpenClGpuBuffer)scalar).Buffer.Handle);
+            kernel.SetArg(2, size);
+            kernel.Execute1D(size, CalculateOptimalWorkGroupSize1D(size));
         }
 
         private void ScaleBuffer(IGpuBuffer buffer, float scale, int size)

@@ -396,6 +396,13 @@ __kernel void scale_vector(
     }
 }
 
+// In-place multiply of every element by a DEVICE-resident scalar (scalar[0]). OpenCL counterpart of the
+// CUDA scale_by_device_scalar; one element per work-item (global size == size).
+__kernel void scale_by_device_scalar(__global float* buf, __global const float* scalar, const int size) {
+    const int idx = get_global_id(0);
+    if (idx < size) buf[idx] *= scalar[0];
+}
+
 // Absolute value
 __kernel void abs_vector(__global const float* A, __global float* B, const int size) {
     const int idx = get_global_id(0); const int idx4 = idx * 4;
@@ -1506,7 +1513,7 @@ __kernel void scale_add(__global const float* A, __global const float* B, __glob
                 // Fused element-wise
                 "add_relu", "add_sigmoid", "add_gelu", "fused_mul_add", "scale_add",
                 // Scalar ops
-                "scale_vector", "power_scalar",
+                "scale_vector", "scale_by_device_scalar", "power_scalar",
                 // Unary math
                 "abs_vector", "exp_vector", "log_vector",
                 "log2_vector", "exp2_vector", "exp10_vector",
