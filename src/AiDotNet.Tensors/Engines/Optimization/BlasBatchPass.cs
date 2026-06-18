@@ -56,17 +56,30 @@ internal sealed class BlasBatchPass : ICpuOptimizationPass
 
                 for (int j = i + 1; j < steps.Length; j++)
                 {
-                    if (consumed.Contains(j)) continue;
-                    if (steps[j].OpType != OpType.TensorMatMul || steps[j].Inputs.Length != 2) continue;
-                    if (steps[j].Inputs[0].Rank != 2 || steps[j].Inputs[1].Rank != 2) continue;
+                    // CONSECUTIVE-RUN ONLY: a batched group must be a CONTIGUOUS run of
+                    // matmuls. The batched step executes every member at the FIRST member's
+                    // position (and no-ops the originals). If a NON-group step sat between two
+                    // members, moving the later matmul before it would write that matmul's
+                    // output buffer early — and MemoryPlanningPass may have aliased that buffer
+                    // onto a tensor still live across the skipped region (buffers are reused by
+                    // original-order lifetime). Writing early then clobbers a live value →
+                    // silently wrong replay (the multi-input diffusion fan-out, #1620/#1624).
+                    // Stopping the run at the first step that can't join means no member is ever
+                    // hoisted across an intervening step's buffer lifetime — a structural fix
+                    // that holds regardless of how MemoryPlanning aliases buffers. (Within a
+                    // contiguous run the members are independent matmuls with no consumer
+                    // between them, so running them all at the first position reorders nothing
+                    // observable.)
+                    if (consumed.Contains(j)) break;
+                    if (steps[j].OpType != OpType.TensorMatMul || steps[j].Inputs.Length != 2) break;
+                    if (steps[j].Inputs[0].Rank != 2 || steps[j].Inputs[1].Rank != 2) break;
 
                     int jk = steps[j].Inputs[0]._shape[1];
                     int jn = steps[j].Inputs[1]._shape[1];
-                    if (jk != k || jn != n) continue;
+                    if (jk != k || jn != n) break;
 
-                    // Check independence: j's inputs must not depend on group outputs
-                    // AND must be available at position i (produced by steps before i,
-                    // or not produced by any step at all — i.e., graph-level inputs).
+                    // Independence: j's inputs must not depend on a group output, and must be
+                    // available at position i (produced before i, or a graph-level leaf).
                     bool canBatch = true;
                     foreach (var inp in steps[j].Inputs)
                     {
@@ -75,20 +88,16 @@ internal sealed class BlasBatchPass : ICpuOptimizationPass
                             canBatch = false;
                             break;
                         }
-                        // If this input is produced by a step that comes after position i,
-                        // it won't be available when the batched step executes at position i.
                         if (producedByStep.TryGetValue(inp, out int producerIdx) && producerIdx >= i)
                         {
                             canBatch = false;
                             break;
                         }
                     }
+                    if (!canBatch) break;
 
-                    if (canBatch)
-                    {
-                        group.Add(j);
-                        groupOutputs.Add(steps[j].OutputBuffer);
-                    }
+                    group.Add(j);
+                    groupOutputs.Add(steps[j].OutputBuffer);
                 }
 
                 if (group.Count >= 2)

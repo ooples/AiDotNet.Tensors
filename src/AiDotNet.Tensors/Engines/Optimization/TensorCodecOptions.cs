@@ -91,7 +91,15 @@ public sealed class TensorCodecOptions
     /// <summary>Phase 4.1: Fold BatchNorm into Conv2D weights at compile time.</summary>
     public bool EnableConvBnFusion { get; set; } = true;
 
-    /// <summary>Phase 4.2: Fuse attention Q@K^T->Softmax->V patterns.</summary>
+    /// <summary>Phase 4.2: Fuse attention Q@K^T->Softmax->V patterns into a FlashAttention kernel.
+    /// Re-enabled: the fusion now structurally recovers natural K. FlashAttention needs K in
+    /// [.., seqK, headDim] layout, but the QK step is a plain matmul(Q, Kᵀ) whose second operand is Kᵀ
+    /// ([.., headDim, seqK]) — the output of a TensorTranspose(K) step (plain matmul carries no transpose
+    /// flag). <see cref="AttentionFusionPass"/> traces that transpose back to its input to feed natural K,
+    /// and REFUSES to fuse when the operand's layout cannot be proven (no producing transpose / not a clean
+    /// last-two-dim swap), so the previous silent-corruption-at-seqK==headDim case can no longer occur.
+    /// Inference-only (CompiledInferencePlan.RunCpuOptimizationPasses), so the forward-only fused step
+    /// needs no backward kernel.</summary>
     public bool EnableAttentionFusion { get; set; } = true;
 
     /// <summary>Phase 4.3: Merge consecutive pointwise ops into fewer dispatch steps.</summary>
@@ -105,6 +113,27 @@ public sealed class TensorCodecOptions
 
     /// <summary>Phase 7.1: Group independent MatMuls into batched calls.</summary>
     public bool EnableBlasBatch { get; set; } = true;
+
+    /// <summary>
+    /// #1624: liveness-pool the compiled training plan's backward gradient buffers.
+    /// Opt-in (default false). The compiled training path pre-allocates ONE gradient
+    /// buffer per traced tensor and holds the entire backward intermediate-gradient
+    /// working set resident at once — multi-GB on deep models. With pooling on,
+    /// same-shape intermediates with disjoint backward lifetimes share one physical
+    /// buffer (linear-scan register allocation over the FINAL backward action
+    /// stream), shrinking the resident set to the peak live frontier. It is
+    /// FUSION-COMPATIBLE — dataflow fusion + analytic-loss backward stay enabled —
+    /// and parameter gradients are bit-identical to the non-pooled path.
+    /// <para><b>Trade-off &amp; scope:</b> a memory optimization, not a speed one —
+    /// it adds a small per-step re-zero of reused buffers. Default OFF because it is
+    /// a memory/throughput trade callers should choose per workload, and because a
+    /// model whose backward stream contains a transform the planner hasn't validated
+    /// fails loud (so it stays opt-in rather than surprising every model). CPU
+    /// engines only; on a GPU engine it is ignored (the GPU-graph backward has a
+    /// different execution model). Also overridable via the
+    /// AIDOTNET_COMPILED_GRAD_POOL environment variable (1 = on).</para>
+    /// </summary>
+    public bool EnableBackwardGradientPooling { get; set; }
 
     /// <summary>Phase 7.3: Enable mixed precision (fp16 forward, fp32 backward). Opt-in.</summary>
     /// <remarks>Legacy boolean — kept for backward compat. New code should use
