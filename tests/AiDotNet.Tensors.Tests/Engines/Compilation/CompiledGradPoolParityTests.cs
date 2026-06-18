@@ -89,4 +89,89 @@ public class CompiledGradPoolParityTests
         Assert.True(poolBuffers < ctrlBuffers,
             $"pooling did not reduce the physical buffer count: pooled={poolBuffers}, control={ctrlBuffers}");
     }
+
+    // Both paths now compile WITH dataflow fusion + analytic-loss backward enabled
+    // (pooling is fusion-compatible). These deeper/rectangular variants stress the
+    // action-space liveness + re-zero against the FUSED action stream — if the
+    // pooler mis-mapped a re-zero onto the wrong fused action, a shared buffer
+    // would carry a stale tenant's gradient and the parity below would break.
+    private static (float[][] grads, int gradBuffers) RunDeep(bool pool, int layers, int rows, int dim, int seedBase)
+    {
+        string? prev = Environment.GetEnvironmentVariable("AIDOTNET_COMPILED_GRAD_POOL");
+        Environment.SetEnvironmentVariable("AIDOTNET_COMPILED_GRAD_POOL", pool ? "1" : null);
+        try
+        {
+            var engine = new CpuEngine();
+            var x = Make(new[] { rows, dim }, seed: seedBase);
+            var ws = new Tensor<float>[layers];
+            for (int i = 0; i < layers; i++) ws[i] = Make(new[] { dim, dim }, seed: seedBase + 1 + i);
+
+            ICompiledTrainingPlan<float> plan;
+            using (var scope = GraphMode.Enable())
+            {
+                var h = engine.TensorMatMul(x, ws[0]);
+                for (int i = 1; i < layers; i++)
+                    h = engine.TensorMatMul(engine.ReLU(h), ws[i]);
+                engine.ReduceSum(h, null);
+                plan = scope.CompileTraining(ws);
+            }
+            plan.Step();
+            var grads = plan.Gradients.Select(g => g.AsSpan().ToArray()).ToArray();
+            int buffers = ((CompiledTrainingPlan<float>)plan).PreAllocatedGradBufferCount;
+            plan.Dispose();
+            return (grads, buffers);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("AIDOTNET_COMPILED_GRAD_POOL", prev);
+        }
+    }
+
+    [Theory]
+    [InlineData(6, 4, 8, 100)]   // deeper, square
+    [InlineData(5, 16, 12, 200)] // rectangular rows, wider dim
+    [InlineData(8, 2, 16, 300)]  // very deep, small batch
+    public void PooledGradients_MatchUnpooled_WithFusion_AcrossShapes(int layers, int rows, int dim, int seedBase)
+    {
+        var (control, ctrlBuffers) = RunDeep(pool: false, layers, rows, dim, seedBase);
+        var (pooled, poolBuffers) = RunDeep(pool: true, layers, rows, dim, seedBase);
+
+        Assert.Equal(control.Length, pooled.Length);
+        for (int p = 0; p < control.Length; p++)
+        {
+            Assert.Equal(control[p].Length, pooled[p].Length);
+            for (int i = 0; i < control[p].Length; i++)
+                Assert.Equal(control[p][i], pooled[p][i], 4);
+        }
+        Assert.True(poolBuffers < ctrlBuffers,
+            $"pooling did not reduce the physical buffer count: pooled={poolBuffers}, control={ctrlBuffers}");
+    }
+
+    [Fact]
+    public void PoolingEnabledViaConfigOption_MatchesUnpooled_AndPoolsFewerBuffers()
+    {
+        // The production API is the TensorCodecOptions flag (not just the env var).
+        var (control, ctrlBuffers) = RunDeep(pool: false, layers: 5, rows: 4, dim: 8, seedBase: 400);
+
+        var prev = AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions.Current;
+        var opts = AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions.Default;
+        opts.EnableBackwardGradientPooling = true;
+        AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions.SetCurrent(opts);
+        try
+        {
+            var (pooled, poolBuffers) = RunDeep(pool: false, layers: 5, rows: 4, dim: 8, seedBase: 400);
+            // RunDeep(pool:false) leaves the env var unset, so the config flag is the
+            // only thing turning pooling on here.
+            Assert.Equal(control.Length, pooled.Length);
+            for (int p = 0; p < control.Length; p++)
+                for (int i = 0; i < control[p].Length; i++)
+                    Assert.Equal(control[p][i], pooled[p][i], 4);
+            Assert.True(poolBuffers < ctrlBuffers,
+                $"config-enabled pooling did not reduce buffers: pooled={poolBuffers}, control={ctrlBuffers}");
+        }
+        finally
+        {
+            AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions.SetCurrent(prev);
+        }
+    }
 }

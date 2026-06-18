@@ -84,6 +84,90 @@ internal static class BackwardGradientBufferPlanner
     }
 
     /// <summary>
+    /// One backward ACTION's gradient data-dependency, expressed over tensor ids,
+    /// in the order the actions actually execute. Unlike <see cref="GradStep"/>
+    /// (one entry per forward step, reverse-walked positionally), this models the
+    /// FINAL backward action stream after fusion/analytic/skip transforms — where a
+    /// single fused action covers a contiguous range of forward steps and runs as
+    /// one atomic unit. Liveness is computed in ACTION-index units so a buffer is
+    /// only shared across an action BOUNDARY (never within a fused action, whose
+    /// internal grad hand-offs cannot be re-zeroed) and the re-zero schedule maps
+    /// directly onto backward action indices.
+    /// </summary>
+    internal readonly struct GradAction
+    {
+        /// <summary>Tensor ids whose gradient this action READS (the output grads of the steps it covers).</summary>
+        public readonly int[] ReadIds;
+        /// <summary>Tensor ids whose gradient this action WRITES/accumulates (the input grads of the steps it covers).</summary>
+        public readonly int[] WriteIds;
+
+        public GradAction(int[] readIds, int[] writeIds)
+        {
+            ReadIds = readIds;
+            WriteIds = writeIds;
+        }
+    }
+
+    /// <summary>
+    /// Liveness-based physical-buffer assignment computed over the FINAL backward
+    /// ACTION stream (fusion-compatible). Each action is treated atomically: a
+    /// tensor's gradient buffer is live from the first action that writes it to the
+    /// last action that touches (reads or writes) it, in action-index units. Two
+    /// same-shape tensors with disjoint action intervals share one physical buffer;
+    /// the returned re-zero schedule is indexed by backward ACTION index.
+    /// <para>Because intervals are in action units, two tensors that share a buffer
+    /// are guaranteed to live in DIFFERENT actions, so the hand-off (re-zero) always
+    /// falls on an action boundary that <c>Step()</c> can inject a clear before —
+    /// this is what makes pooling correct under fusion (where a single action runs
+    /// several forward steps' backward internally).</para>
+    /// </summary>
+    /// <param name="tensorCount">Number of distinct traced tensors (ids 0..tensorCount-1).</param>
+    /// <param name="tensorElemCount">Per-tensor gradient element count.</param>
+    /// <param name="tensorShapeKey">Per-tensor shape key; only equal keys may share a buffer.</param>
+    /// <param name="actions">The backward actions in execution order, with per-action read/write tensor ids.</param>
+    /// <param name="isPersistent">Per-tensor: true =&gt; never pooled (parameters / read after backward).</param>
+    /// <param name="elementBytes">Bytes per gradient element (4 for float, 8 for double).</param>
+    internal static PlanResult PlanOverActions(
+        int tensorCount,
+        int[] tensorElemCount,
+        long[] tensorShapeKey,
+        System.Collections.Generic.IReadOnlyList<GradAction> actions,
+        bool[] isPersistent,
+        int elementBytes)
+    {
+        int m = actions.Count;
+        const int NONE = int.MaxValue;
+        var firstWrite = new int[tensorCount];
+        var lastUse = new int[tensorCount];
+        for (int i = 0; i < tensorCount; i++) { firstWrite[i] = NONE; lastUse[i] = -1; }
+
+        for (int a = 0; a < m; a++)
+        {
+            var act = actions[a];
+            var reads = act.ReadIds;
+            if (reads != null)
+                for (int j = 0; j < reads.Length; j++)
+                {
+                    int t = reads[j];
+                    if (t < 0) continue;
+                    if (a > lastUse[t]) lastUse[t] = a;
+                }
+            var writes = act.WriteIds;
+            if (writes != null)
+                for (int j = 0; j < writes.Length; j++)
+                {
+                    int t = writes[j];
+                    if (t < 0) continue;
+                    if (a < firstWrite[t]) firstWrite[t] = a;
+                    if (a > lastUse[t]) lastUse[t] = a;
+                }
+        }
+
+        return AssignBuffers(tensorCount, tensorElemCount, tensorShapeKey, isPersistent,
+            elementBytes, firstWrite, lastUse, NONE, m);
+    }
+
+    /// <summary>
     /// Computes a liveness-based physical-buffer assignment for the backward
     /// gradient buffers.
     /// </summary>
@@ -144,6 +228,30 @@ internal static class BackwardGradientBufferPlanner
             }
         }
 
+        return AssignBuffers(tensorCount, tensorElemCount, tensorShapeKey, isPersistent,
+            elementBytes, firstWrite, lastRead, NONE, n);
+    }
+
+    /// <summary>
+    /// Shared linear-scan register allocation over precomputed liveness intervals
+    /// (<paramref name="firstWrite"/> / <paramref name="lastUse"/>, in whatever
+    /// unit the caller computed them — backward POSITION for <see cref="Plan"/>,
+    /// backward ACTION index for <see cref="PlanOverActions"/>). Same-shape tensors
+    /// with disjoint intervals share a physical buffer; a reused buffer's non-first
+    /// tenant is scheduled for re-zero before its interval start.
+    /// </summary>
+    /// <param name="scheduleLen">Length of the re-zero schedule (position/action count).</param>
+    private static PlanResult AssignBuffers(
+        int tensorCount,
+        int[] tensorElemCount,
+        long[] tensorShapeKey,
+        bool[] isPersistent,
+        int elementBytes,
+        int[] firstWrite,
+        int[] lastUse,
+        int none,
+        int scheduleLen)
+    {
         var bufferOfTensor = new int[tensorCount];
         for (int i = 0; i < tensorCount; i++) bufferOfTensor[i] = -1;
 
@@ -152,26 +260,25 @@ internal static class BackwardGradientBufferPlanner
             naiveBytes += (long)tensorElemCount[i] * elementBytes;
 
         // Poolable tensors: not persistent AND have a real backward interval.
-        // Build (tensorId, start, end) and linear-scan by start position.
         var poolable = new System.Collections.Generic.List<int>(tensorCount);
         for (int i = 0; i < tensorCount; i++)
         {
-            bool hasInterval = firstWrite[i] != NONE && lastRead[i] >= firstWrite[i];
+            bool hasInterval = firstWrite[i] != none && lastUse[i] >= firstWrite[i];
             if (!isPersistent[i] && hasInterval) poolable.Add(i);
         }
         poolable.Sort((a, b) =>
         {
             int c = firstWrite[a].CompareTo(firstWrite[b]);
-            return c != 0 ? c : lastRead[a].CompareTo(lastRead[b]);
+            return c != 0 ? c : lastUse[a].CompareTo(lastUse[b]);
         });
 
         var bufferElem = new System.Collections.Generic.List<int>();
         // Free physical buffers keyed by shape: shapeKey -> stack of buffer ids.
         var freeByShape = new System.Collections.Generic.Dictionary<long, System.Collections.Generic.Stack<int>>();
-        // Active intervals, ordered by end position, so we can expire cheaply.
+        // Active intervals.
         var active = new System.Collections.Generic.List<(int end, int tensorId, int bufferId)>();
-        // Re-zero schedule, indexed by backward position.
-        var reZero = new System.Collections.Generic.List<int>[n];
+        // Re-zero schedule, indexed by position/action.
+        var reZero = new System.Collections.Generic.List<int>[scheduleLen];
 
         foreach (int t in poolable)
         {
@@ -199,7 +306,7 @@ internal static class BackwardGradientBufferPlanner
                 // starts at `start`, and the buffer still holds the previous
                 // tenant's gradient, so it MUST be cleared before position `start`.
                 buf = avail.Pop();
-                if (start >= 0 && start < n)
+                if (start >= 0 && start < scheduleLen)
                     (reZero[start] ??= new System.Collections.Generic.List<int>()).Add(buf);
             }
             else
@@ -208,7 +315,7 @@ internal static class BackwardGradientBufferPlanner
                 bufferElem.Add(tensorElemCount[t]);
             }
             bufferOfTensor[t] = buf;
-            active.Add((lastRead[t], t, buf));
+            active.Add((lastUse[t], t, buf));
         }
 
         // Persistent tensors (and any non-poolable, e.g. unreferenced) each get
@@ -227,8 +334,8 @@ internal static class BackwardGradientBufferPlanner
         for (int i = 0; i < bufferElem.Count; i++)
             pooledBytes += (long)bufferElem[i] * elementBytes;
 
-        var reZeroArr = new int[n][];
-        for (int k = 0; k < n; k++)
+        var reZeroArr = new int[scheduleLen][];
+        for (int k = 0; k < scheduleLen; k++)
             reZeroArr[k] = reZero[k] != null ? reZero[k].ToArray() : System.Array.Empty<int>();
 
         return new PlanResult(bufferOfTensor, bufferElem.ToArray(), naiveBytes, pooledBytes, reZeroArr);

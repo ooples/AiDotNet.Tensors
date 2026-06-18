@@ -340,24 +340,41 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     }
 
     /// <summary>
-    /// #1624: build a LIVENESS-POOLED gradient map. Intermediate gradients with
-    /// disjoint backward lifetimes and the same shape share one physical buffer,
-    /// shrinking the resident set from "one buffer per traced tensor" to the peak
-    /// live frontier. Fills <paramref name="gradMap"/> (tensor -&gt; shared buffer)
-    /// and <paramref name="allGrads"/> (the distinct physical buffers, in buffer-id
-    /// order so id == index), and returns the re-zero schedule indexed by backward
-    /// position (= backward action index on the 1:1 path this is gated to).
-    ///
-    /// Only valid when the backward is 1:1 with the forward steps — the caller
-    /// disables dataflow/analytic/slice/dW fusion and pruning when pooling, and
-    /// asserts the resulting action count matches before using the schedule.
+    /// #1624: build a LIVENESS-POOLED gradient map that is FUSION-COMPATIBLE.
+    /// Intermediate gradients with disjoint backward lifetimes and the same shape
+    /// share one physical buffer, shrinking the resident set from "one buffer per
+    /// traced tensor" to the peak live frontier. Unlike the original 1:1-only
+    /// version, this computes liveness over the FINAL backward ACTION stream (after
+    /// dataflow fusion + analytic-loss backward), so pooling no longer has to
+    /// disable those optimizations.
+    /// <para><b>How fusion compatibility works.</b> The backward delegates capture
+    /// <c>gradMap[tensor]</c> (build-time tensor ref; specialized backward resolves
+    /// its array lazily on first <c>Step()</c>), and the fusion passes run AFTER
+    /// gradMap is built — so the shared buffers must already be in gradMap before
+    /// fusion. But the buffer ASSIGNMENT needs action-space liveness, which depends
+    /// on the fusion DECISIONS (which contiguous step-runs fuse, which ReduceSums
+    /// are skipped). We therefore run the fusion + analytic DETECTION here against a
+    /// throwaway shape-keyed gradMap (decisions are graph-based, independent of the
+    /// gradMap's values), derive the action coverage with the same enumerator the
+    /// real backward loop uses, plan the buffers, and install the aliased gradMap.
+    /// The caller then re-runs detection against this aliased gradMap to build the
+    /// real delegates (identical decisions ⇒ identical action stream), and asserts
+    /// the decision sets + action count match before trusting the re-zero schedule.</para>
+    /// <para>Fills <paramref name="gradMap"/> (tensor → shared buffer) and
+    /// <paramref name="allGrads"/> (distinct physical buffers, id == index); returns
+    /// the re-zero schedule indexed by backward ACTION index, plus the fused-step
+    /// and skippable-ReduceSum decision sets for the caller's drift guard.</para>
     /// </summary>
     private static int[][] BuildPooledGradMap(
         System.Collections.Generic.HashSet<Tensor<T>> allTensors,
         System.Collections.Generic.List<CompiledStep<T>> forwardSteps,
         Tensor<T>[] parameters,
+        System.Collections.Generic.Dictionary<Tensor<T>, int> consumerCount,
+        IEngine engine,
         System.Collections.Generic.Dictionary<Tensor<T>, Tensor<T>> gradMap,
-        System.Collections.Generic.List<Tensor<T>> allGrads)
+        System.Collections.Generic.List<Tensor<T>> allGrads,
+        out System.Collections.Generic.HashSet<int> decidedFusedSteps,
+        out System.Collections.Generic.HashSet<int> decidedSkippableReduceSum)
     {
         var idOf = new System.Collections.Generic.Dictionary<Tensor<T>, int>(allTensors.Count);
         var tensorById = new System.Collections.Generic.List<Tensor<T>>(allTensors.Count);
@@ -379,15 +396,56 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             shapeKey[i] = sid;
         }
 
-        var steps = new System.Collections.Generic.List<BackwardGradientBufferPlanner.GradStep>(forwardSteps.Count);
-        foreach (var step in forwardSteps)
+        // ---- Decision pass: learn fusion / analytic decisions on a throwaway
+        // gradMap so action-space liveness can account for the fused action stream.
+        // The throwaway map points every tensor at a per-SHAPE dummy buffer (a
+        // handful, not one-per-tensor) so it never materializes the resident set we
+        // are trying to shrink, while still satisfying any shape/ContainsKey probe
+        // in the detectors. The delegates the detectors build here capture these
+        // dummies and are discarded.
+        decidedFusedSteps = new System.Collections.Generic.HashSet<int>();
+        decidedSkippableReduceSum = new System.Collections.Generic.HashSet<int>();
+        if (typeof(T) == typeof(float) || typeof(T) == typeof(double))
         {
-            int outId = idOf.TryGetValue(step.OutputBuffer, out var oid) ? oid : -1;
-            var ins = step.Inputs;
-            var inIds = new int[ins?.Length ?? 0];
-            for (int j = 0; j < inIds.Length; j++)
-                inIds[j] = idOf.TryGetValue(ins![j], out var iid) ? iid : -1;
-            steps.Add(new BackwardGradientBufferPlanner.GradStep(outId, inIds));
+            var dummyByShape = new System.Collections.Generic.Dictionary<string, Tensor<T>>();
+            var tempGrad = new System.Collections.Generic.Dictionary<Tensor<T>, Tensor<T>>(tc);
+            foreach (var t in tensorById)
+            {
+                string canon = CanonShape(t._shape);
+                if (!dummyByShape.TryGetValue(canon, out var dummy))
+                    dummyByShape[canon] = dummy = TensorAllocator.RentUninitialized<T>(t._shape);
+                tempGrad[t] = dummy;
+            }
+            var tFusedFwd = new System.Collections.Generic.List<Action<IEngine>>();
+            var tFusedBwd = new System.Collections.Generic.List<Action<IEngine>>();
+            TryFuseForwardBackward(forwardSteps, tempGrad, consumerCount, engine,
+                tFusedFwd, tFusedBwd, decidedFusedSteps);
+            var tAnalytic = new System.Collections.Generic.Dictionary<int, Action<IEngine>>();
+            var tAnalyticFwd = new System.Collections.Generic.Dictionary<int, Action<IEngine>>();
+            var tSkipFwd = new System.Collections.Generic.HashSet<int>();
+            var tRowSum = new System.Collections.Generic.Dictionary<int, float[]>();
+            if (!engine.SupportsGpu)
+                DetectAnalyticLossMatMulBackward(forwardSteps, consumerCount, tempGrad,
+                    tAnalytic, decidedSkippableReduceSum, tAnalyticFwd, tSkipFwd, tRowSum);
+        }
+
+        // ---- Action-space liveness over the decided action stream.
+        var coverage = EnumerateBackwardActionCoverage(forwardSteps, decidedFusedSteps, decidedSkippableReduceSum);
+        var actions = new System.Collections.Generic.List<BackwardGradientBufferPlanner.GradAction>(coverage.Count);
+        foreach (var covered in coverage)
+        {
+            var reads = new System.Collections.Generic.List<int>(covered.Length);
+            var writes = new System.Collections.Generic.List<int>();
+            foreach (int s in covered)
+            {
+                var step = forwardSteps[s];
+                if (idOf.TryGetValue(step.OutputBuffer, out var oid)) reads.Add(oid);
+                var ins = step.Inputs;
+                if (ins != null)
+                    foreach (var inp in ins)
+                        if (idOf.TryGetValue(inp, out var iid)) writes.Add(iid);
+            }
+            actions.Add(new BackwardGradientBufferPlanner.GradAction(reads.ToArray(), writes.ToArray()));
         }
 
         // Persistent (never pooled): parameters (read by the optimizer AFTER
@@ -401,7 +459,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
         int elementBytes = typeof(T) == typeof(double) ? 8 : typeof(T) == typeof(float) ? 4
             : System.Runtime.InteropServices.Marshal.SizeOf<T>();
-        var plan = BackwardGradientBufferPlanner.Plan(tc, elem, shapeKey, steps, persistent, elementBytes);
+        var plan = BackwardGradientBufferPlanner.PlanOverActions(tc, elem, shapeKey, actions, persistent, elementBytes);
 
         int pb = plan.PhysicalBufferCount;
         var bufShape = new int[pb][];
@@ -417,6 +475,50 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             gradMap[tensorById[i]] = phys[plan.BufferOfTensor[i]];
         allGrads.AddRange(phys);
         return plan.ReZeroAtPosition;
+    }
+
+    /// <summary>
+    /// Enumerates, in backward EXECUTION order, the forward-step set each backward
+    /// action covers — mirroring the real backward construction loop EXACTLY so the
+    /// pooler's action-space liveness can't drift from what actually runs. Per-step
+    /// actions (specialized / generic / analytic — all cover a single step) come
+    /// first in descending forward index, then the fused groups (maximal contiguous
+    /// runs of <paramref name="fusedSteps"/>) appended in descending start order —
+    /// matching how the loop appends <c>fusedBackwardActions</c> in reverse. Steps
+    /// with no backward (null BackwardFn) and skipped ReduceSums emit no action.
+    /// </summary>
+    private static System.Collections.Generic.List<int[]> EnumerateBackwardActionCoverage(
+        System.Collections.Generic.List<CompiledStep<T>> forwardSteps,
+        System.Collections.Generic.HashSet<int> fusedSteps,
+        System.Collections.Generic.HashSet<int> skippableReduceSum)
+    {
+        var cov = new System.Collections.Generic.List<int[]>(forwardSteps.Count);
+        for (int i = forwardSteps.Count - 1; i >= 0; i--)
+        {
+            if (fusedSteps.Contains(i)) continue;
+            if (forwardSteps[i].BackwardFn == null) continue;
+            if (skippableReduceSum.Contains(i)) continue;
+            cov.Add(new[] { i });
+        }
+        // Maximal contiguous runs of fused step indices, ascending by start.
+        var sorted = new System.Collections.Generic.List<int>(fusedSteps);
+        sorted.Sort();
+        var runs = new System.Collections.Generic.List<int[]>();
+        int r = 0;
+        while (r < sorted.Count)
+        {
+            int start = r;
+            while (r + 1 < sorted.Count && sorted[r + 1] == sorted[r] + 1) r++;
+            int len = r - start + 1;
+            var run = new int[len];
+            for (int k = 0; k < len; k++) run[k] = sorted[start + k];
+            runs.Add(run);
+            r++;
+        }
+        // Appended in reverse (matches the loop's reverse append of fusedBackwardActions).
+        for (int g = runs.Count - 1; g >= 0; g--)
+            cov.Add(runs[g]);
+        return cov;
     }
 
     private static string CanonShape(int[] shape)
@@ -2448,15 +2550,27 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
         // #1624: opt-in liveness pooling of the backward gradient buffers. When on
         // (CPU only), share buffers across disjoint-lifetime same-shape
-        // intermediates instead of one-per-traced-tensor. This forces the simple
-        // 1:1 backward (fusion/analytic/slice/dW + pruning disabled below) so the
-        // re-zero schedule maps directly onto the backward action indices.
-        bool useGradPool = Environment.GetEnvironmentVariable("AIDOTNET_COMPILED_GRAD_POOL") == "1"
+        // intermediates instead of one-per-traced-tensor. Liveness is computed over
+        // the FINAL backward ACTION stream, so pooling stays compatible with
+        // dataflow fusion + analytic-loss backward (the default-on optimizations);
+        // only slice-prefix/dW-batching (env-opt-in) and backward pruning remain
+        // disabled below — see BuildPooledGradMap. The re-zero schedule is indexed
+        // by backward action index, validated against the real stream by the drift
+        // guard before use.
+        bool useGradPool = (Optimization.TensorCodecOptions.Current.EnableBackwardGradientPooling
+                || Environment.GetEnvironmentVariable("AIDOTNET_COMPILED_GRAD_POOL") == "1")
             && !engine.SupportsGpu;
         int[][]? gradPoolReZeroByPosition = null;
+        // Decision sets the pooler used to plan the re-zero schedule; populated by
+        // BuildPooledGradMap when pooling, left empty otherwise. Non-null so the
+        // drift guard never needs a null-forgiving access.
+        var decidedFusedSteps = new System.Collections.Generic.HashSet<int>();
+        var decidedSkippableReduceSum = new System.Collections.Generic.HashSet<int>();
         if (useGradPool)
         {
-            gradPoolReZeroByPosition = BuildPooledGradMap(allTensors, forwardSteps, parameters, gradMap, allGrads);
+            gradPoolReZeroByPosition = BuildPooledGradMap(allTensors, forwardSteps, parameters,
+                consumerCount, engine, gradMap, allGrads,
+                out decidedFusedSteps, out decidedSkippableReduceSum);
         }
         else
         {
@@ -2503,8 +2617,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             catch { /* diagnostic must never break the build */ }
         }
 
+        // Dataflow fusion is pooling-COMPATIBLE: BuildPooledGradMap already accounted
+        // for the fused action stream when assigning shared buffers, so we run the
+        // real fusion pass against the aliased gradMap here exactly as on the
+        // non-pooled path (the drift guard later asserts the decisions matched).
         if (typeof(T) == typeof(float) && Optimization.TensorCodecOptions.Current.EnableDataflowFusion
-            && !preferGenericForGpu && !useGradPool)
+            && !preferGenericForGpu)
         {
             TryFuseForwardBackward(forwardSteps, gradMap, consumerCount, engine,
                 fusedForwardActions, fusedBackwardActions, fusedStepIndices);
@@ -2546,7 +2664,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // (2) are host-only, so the fixed kernel sequence can't be CUDA-graph captured (AIDOTNET_CUDA_GRAPH_STEP).
         // Routing to generic moves the work onto the GPU AND makes the whole step graph-eligible. Default ON
         // for GPU engines; opt out with AIDOTNET_GPU_PREFER_GENERIC=0 (preferGenericForGpu computed above).
-        if (typeof(T) == typeof(float) && !preferGenericForGpu && !useGradPool)
+        // Analytic backward is pooling-COMPATIBLE (each analytic step is still one
+        // backward action covering one forward step; BuildPooledGradMap accounted
+        // for it, incl. its skippable-ReduceSum, in the action coverage).
+        if (typeof(T) == typeof(float) && !preferGenericForGpu)
         {
             DetectAnalyticLossMatMulBackward(forwardSteps, consumerCount, gradMap, analyticBackwardSpecs, skippableReduceSumIndices, analyticForwardSpecs, skippableReduceSumForwardIndices, sharedRowSumCache);
         }
@@ -2867,20 +2988,29 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // re-zero schedule clears it again before each subsequent tenant.
         int[]? genericGradIndices = (!useGradPool && genericBackwardCount == 0) ? new int[0] : null;
 
-        // #1624: map the pooler's re-zero schedule (indexed by backward POSITION)
-        // onto backward ACTION indices. With fusion/analytic/slice/dW + pruning all
-        // disabled above, the main backward loop emits exactly one action per
-        // forward step in reverse order, so action index i == backward position i.
-        // Assert that invariant before trusting the schedule — a mismatch means an
-        // unexpected reorder slipped through and pooling must NOT proceed.
+        // #1624 drift guard: the re-zero schedule (indexed by backward ACTION index)
+        // was planned in BuildPooledGradMap from the fusion/analytic DECISIONS made
+        // on a throwaway gradMap. The real passes above re-made those decisions
+        // against the aliased gradMap; they MUST be identical (decisions are
+        // graph-based) for the schedule to line up with the real action stream.
+        // Re-derive the coverage from the REAL decision sets with the SAME
+        // enumerator the planner used, and assert the decisions + the resulting
+        // action count match what actually got built. A mismatch means an
+        // unexpected transform slipped through — fail loud rather than apply a
+        // misaligned schedule (this is an opt-in path; a clear error beats silent
+        // gradient corruption).
         int[][]? gradPoolReZeroByStep = null;
         if (useGradPool)
         {
-            if (backwardActions.Count != forwardSteps.Count)
+            var realCoverage = EnumerateBackwardActionCoverage(
+                forwardSteps, fusedStepIndices, skippableReduceSumIndices);
+            bool decisionsMatch = fusedStepIndices.SetEquals(decidedFusedSteps)
+                && skippableReduceSumIndices.SetEquals(decidedSkippableReduceSum);
+            if (!decisionsMatch || realCoverage.Count != backwardActions.Count)
                 throw new InvalidOperationException(
-                    $"Gradient pooling expected a 1:1 backward but got {backwardActions.Count} " +
-                    $"actions for {forwardSteps.Count} forward steps; refusing to apply a misaligned " +
-                    "re-zero schedule.");
+                    "Gradient pooling: the backward action stream diverged from the planned " +
+                    $"coverage (decisionsMatch={decisionsMatch}, plannedActions={realCoverage.Count}, " +
+                    $"builtActions={backwardActions.Count}); refusing to apply a misaligned re-zero schedule.");
             gradPoolReZeroByStep = gradPoolReZeroByPosition;
         }
 
