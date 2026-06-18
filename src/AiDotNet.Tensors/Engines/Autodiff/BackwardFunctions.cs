@@ -1067,6 +1067,48 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[2], gradBeta, engine);
     }
 
+    /// <summary>
+    /// #639: backward for the AFFINE batch-norm (running-stats inference form), the single
+    /// differentiable op that replaces the ~6-primitive batch=1 BN fallback. mean/variance are
+    /// CONSTANTS (running stats), so only inputs[0]=x, inputs[1]=gamma, inputs[2]=beta get
+    /// gradients. CpuEngine uses a fused typed kernel; other engines use a primitive fallback.
+    /// </summary>
+    internal static void BatchNormAffineBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var mean = (Tensor<T>)savedState[0];
+        var variance = (Tensor<T>)savedState[1];
+        var epsilon = (double)savedState[2];
+
+        Tensor<T> gradInput, gradGamma, gradBeta;
+        if (engine is CpuEngine cpu)
+        {
+            gradInput = cpu.BatchNormAffineBackward(
+                gradOutput, inputs[0], inputs[1], mean, variance, epsilon, out gradGamma, out gradBeta);
+        }
+        else
+        {
+            // Engine-generic primitive fallback (NCHW; gamma/mean/var are [C]).
+            int C = inputs[1].Length;
+            var bshape = new[] { 1, C, 1, 1 };
+            var eps = MathHelper.GetNumericOperations<T>().FromDouble(epsilon);
+            var std = engine.TensorSqrt(engine.TensorAddScalar(variance, eps)); // [C]
+            var inv = engine.TensorReciprocal(std);                             // 1/std [C]
+            var scale = engine.TensorMultiply(inputs[1], inv);                  // gamma/std [C]
+            gradInput = engine.TensorBroadcastMultiply(gradOutput, engine.Reshape(scale, bshape));
+            var xhat = engine.TensorBroadcastMultiply(
+                engine.TensorBroadcastSubtract(inputs[0], engine.Reshape(mean, bshape)),
+                engine.Reshape(inv, bshape));
+            gradGamma = engine.ReduceSum(engine.TensorMultiply(gradOutput, xhat), new[] { 0, 2, 3 }, false);
+            gradBeta = engine.ReduceSum(gradOutput, new[] { 0, 2, 3 }, false);
+        }
+
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradInput, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradGamma, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[2], gradBeta, engine);
+    }
+
     /// <summary>LayerNorm backward: uses engine.LayerNormBackward</summary>
     internal static void LayerNormBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,

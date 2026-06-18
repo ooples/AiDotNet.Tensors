@@ -2295,6 +2295,179 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
 
+    /// <summary>
+    /// #639: backward for the AFFINE batch-norm (running-stats inference form used as the
+    /// differentiable batch=1 training fallback). mean/variance are CONSTANTS (running stats),
+    /// so only x, gamma, beta receive gradients. Rank-4 NCHW.
+    ///   y = gamma·(x-mean)·inv + beta,  inv = 1/sqrt(var+eps)
+    ///   dx      = gradY · gamma · inv                         (per-channel broadcast)
+    ///   dgamma  = Σ_{n,h,w} gradY · (x-mean)·inv
+    ///   dbeta   = Σ_{n,h,w} gradY
+    /// </summary>
+    internal Tensor<T> BatchNormAffineBackward<T>(
+        Tensor<T> gradOutput, Tensor<T> input, Tensor<T> gamma, Tensor<T> mean, Tensor<T> variance,
+        double epsilon, out Tensor<T> gradGamma, out Tensor<T> gradBeta)
+    {
+        if (gradOutput.Rank != 4 || input.Rank != 4)
+            throw new ArgumentException("BatchNormAffineBackward requires rank-4 NCHW tensors.");
+        int N = input._shape[0], C = input._shape[1], H = input._shape[2], W = input._shape[3];
+        int hw = H * W, chw = C * hw;
+
+        if (typeof(T) == typeof(float))
+        {
+            var go = (float[])(object)gradOutput.Contiguous().GetFlattenedData();
+            var xf = (float[])(object)input.Contiguous().GetFlattenedData();
+            var gf = (float[])(object)gamma.GetFlattenedData();
+            var mf = (float[])(object)mean.GetFlattenedData();
+            var vf = (float[])(object)variance.GetFlattenedData();
+            var dx = new float[N * chw];
+            var dg = new float[C];
+            var db = new float[C];
+            for (int c = 0; c < C; c++)
+            {
+                float inv = 1f / MathF.Sqrt(vf[c] + (float)epsilon);
+                float gc = gf[c], mc = mf[c];
+                float sg = 0f, sb = 0f;
+                float scale = gc * inv;
+                for (int n = 0; n < N; n++)
+                {
+                    int baseIdx = n * chw + c * hw;
+                    for (int i = 0; i < hw; i++)
+                    {
+                        float gy = go[baseIdx + i];
+                        sb += gy;
+                        sg += gy * (xf[baseIdx + i] - mc) * inv;
+                        dx[baseIdx + i] = gy * scale;
+                    }
+                }
+                dg[c] = sg; db[c] = sb;
+            }
+            gradGamma = TensorAllocator.Rent<T>(gamma._shape, (T[])(object)dg);
+            gradBeta = TensorAllocator.Rent<T>(gamma._shape, (T[])(object)db);
+            return TensorAllocator.Rent<T>(input._shape, (T[])(object)dx);
+        }
+        if (typeof(T) == typeof(double))
+        {
+            var go = (double[])(object)gradOutput.Contiguous().GetFlattenedData();
+            var xf = (double[])(object)input.Contiguous().GetFlattenedData();
+            var gf = (double[])(object)gamma.GetFlattenedData();
+            var mf = (double[])(object)mean.GetFlattenedData();
+            var vf = (double[])(object)variance.GetFlattenedData();
+            var dx = new double[N * chw];
+            var dg = new double[C];
+            var db = new double[C];
+            for (int c = 0; c < C; c++)
+            {
+                double inv = 1d / Math.Sqrt(vf[c] + epsilon);
+                double gc = gf[c], mc = mf[c];
+                double sg = 0d, sb = 0d;
+                double scale = gc * inv;
+                for (int n = 0; n < N; n++)
+                {
+                    int baseIdx = n * chw + c * hw;
+                    for (int i = 0; i < hw; i++)
+                    {
+                        double gy = go[baseIdx + i];
+                        sb += gy;
+                        sg += gy * (xf[baseIdx + i] - mc) * inv;
+                        dx[baseIdx + i] = gy * scale;
+                    }
+                }
+                dg[c] = sg; db[c] = sb;
+            }
+            gradGamma = TensorAllocator.Rent<T>(gamma._shape, (T[])(object)dg);
+            gradBeta = TensorAllocator.Rent<T>(gamma._shape, (T[])(object)db);
+            return TensorAllocator.Rent<T>(input._shape, (T[])(object)dx);
+        }
+
+        // Generic fallback
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var goG = gradOutput.Contiguous().GetFlattenedData();
+        var xG = input.Contiguous().GetFlattenedData();
+        var gG = gamma.GetFlattenedData();
+        var mG = mean.GetFlattenedData();
+        var vG = variance.GetFlattenedData();
+        var dxG = new T[N * chw];
+        var dgG = new T[C];
+        var dbG = new T[C];
+        T epsT = numOps.FromDouble(epsilon);
+        for (int c = 0; c < C; c++)
+        {
+            T inv = numOps.Divide(numOps.One, numOps.Sqrt(numOps.Add(vG[c], epsT)));
+            T scale = numOps.Multiply(gG[c], inv);
+            T sg = numOps.Zero, sb = numOps.Zero;
+            for (int n = 0; n < N; n++)
+            {
+                int baseIdx = n * chw + c * hw;
+                for (int i = 0; i < hw; i++)
+                {
+                    T gy = goG[baseIdx + i];
+                    sb = numOps.Add(sb, gy);
+                    sg = numOps.Add(sg, numOps.Multiply(numOps.Multiply(gy, numOps.Subtract(xG[baseIdx + i], mG[c])), inv));
+                    dxG[baseIdx + i] = numOps.Multiply(gy, scale);
+                }
+            }
+            dgG[c] = sg; dbG[c] = sb;
+        }
+        gradGamma = TensorAllocator.Rent<T>(gamma._shape, dgG);
+        gradBeta = TensorAllocator.Rent<T>(gamma._shape, dbG);
+        return TensorAllocator.Rent<T>(input._shape, dxG);
+    }
+
+    /// <summary>
+    /// #639: DIFFERENTIABLE affine batch-norm (running-stats form): y = gamma·(x-mean)·inv + beta,
+    /// inv = 1/sqrt(var+eps). Records ONE tape/graph node (vs the ~6 primitive ops the consumer's
+    /// batch=1 BN fallback decomposes into), with gradients to x, gamma, beta (mean/variance are
+    /// constant running stats). Forward math is identical to <see cref="BatchNormInference{T}"/>;
+    /// the difference is it carries a backward so it can be used in TRAINING at batch=1 (where the
+    /// batch-stats BatchNorm collapses). Rank-4 NCHW.
+    /// </summary>
+    public virtual Tensor<T> BatchNormAffine<T>(Tensor<T> x, Tensor<T> gamma, Tensor<T> beta, Tensor<T> mean, Tensor<T> variance, double epsilon)
+    {
+        if (x == null) throw new ArgumentNullException(nameof(x));
+        if (gamma == null) throw new ArgumentNullException(nameof(gamma));
+        if (beta == null) throw new ArgumentNullException(nameof(beta));
+        if (mean == null) throw new ArgumentNullException(nameof(mean));
+        if (variance == null) throw new ArgumentNullException(nameof(variance));
+        if (x.Rank != 4) throw new ArgumentException($"BatchNormAffine requires rank-4 NCHW input, got rank {x.Rank}.");
+
+        var xOrig = x;
+        if (!x.IsContiguous) x = x.Contiguous();
+
+        // GraphMode: record a single lazy node; the realize closure recomputes the affine
+        // result so the compiled plan reads the CURRENT running mean/variance each step.
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var capX = x; var capG = gamma; var capB = beta; var capM = mean; var capV = variance; double capE = epsilon;
+                var lazy = scope.RecordVariadic(LazyNodeType.Custom, "BatchNormAffine",
+                    new[] { xOrig, gamma, beta }, x._shape,
+                    (eng, output) =>
+                    {
+                        if (eng is CpuEngine cpuEng)
+                            cpuEng.BatchNormInferenceInto(output, capX, capG, capB, capM, capV, capE);
+                        else
+                        {
+                            var r = eng.BatchNormInference(capX, capG, capB, capM, capV, capE);
+                            DirectGpuTensorEngine.CopyResultInto(eng, r, output);
+                        }
+                    },
+                    BackwardFunctions<T>.BatchNormAffineBackward,
+                    new object[] { mean, variance, epsilon });
+                return lazy;
+            }
+        }
+
+        // Eager path: compute the affine result, then record one differentiable node.
+        var result = new Tensor<T>(x._shape);
+        BatchNormInferenceInto(result, x, gamma, beta, mean, variance, epsilon);
+        DifferentiableOps.RecordIfActive("BatchNormAffine", result, new[] { xOrig, gamma, beta },
+            BackwardFunctions<T>.BatchNormAffineBackward, new object[] { mean, variance, epsilon });
+        return result;
+    }
+
     /// <inheritdoc/>
     public virtual Tensor<T> BatchNormInference<T>(Tensor<T> x, Tensor<T> gamma, Tensor<T> beta, Tensor<T> mean, Tensor<T> variance, double epsilon)
     {
