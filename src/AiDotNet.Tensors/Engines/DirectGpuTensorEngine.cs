@@ -2052,6 +2052,53 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return result;
     }
 
+    /// <summary>
+    /// On-device dtype cast that keeps the result GPU-RESIDENT — the residency-preserving form of the float↔Half
+    /// gradient cast bridge (<see cref="Autodiff.MixedPrecisionCast"/>), whose <c>Tensor.Cast</c> path is a host
+    /// loop that pulls the gradient to CPU. Both grad spaces are FP32-backed on the device (a gradient
+    /// <c>Tensor&lt;Half&gt;</c> from the fused backward is a <see cref="FinishGpuOp{T}"/> over an FP32 buffer, the
+    /// Half rounding happening only at host materialization — which never fires while resident), so the cast is a
+    /// device-to-device copy (or <c>ConvertToFp32</c> when the source is a true Half buffer) + a dtype relabel via
+    /// <see cref="FinishGpuOp{T}"/> — no host transfer. Falls back to the host <see cref="Tensor{T}.Cast"/> when
+    /// there is no GPU backend or the source isn't resident (rare), preserving correctness.
+    /// </summary>
+    internal Tensor<TOut> CastResidentDtype<TIn, TOut>(Tensor<TIn> src)
+    {
+        if (src is null) throw new ArgumentNullException(nameof(src));
+        if (!TryGetBackend(out var backend)) return src.Cast<TOut>();
+        int n = src.Length;
+        if (n == 0) return src.Cast<TOut>();
+
+        // Find the source's resident GPU buffer (and whether it is a true Half byte buffer or FP32).
+        IGpuBuffer? srcBuf = null; bool srcIsFp16 = false;
+        object? k1 = src.DataVector;
+        object? k2 = src.DataVector?.GetBackingArrayUnsafe();
+        lock (_activationCacheLock)
+        {
+            if (k2 is not null && _activationCache.TryGetValue(k2, out var e2) && ReferenceEquals(e2.Backend, backend))
+            { srcBuf = e2.Buffer; srcIsFp16 = e2.IsFp16; }
+            else if (k1 is not null && _activationCache.TryGetValue(k1, out var e1) && ReferenceEquals(e1.Backend, backend))
+            { srcBuf = e1.Buffer; srcIsFp16 = e1.IsFp16; }
+        }
+        if (srcBuf is null) return src.Cast<TOut>(); // not GPU-resident — host cast (correct, just not resident)
+
+        try
+        {
+            // Dest is always an FP32 device buffer: FinishGpuOp<float> reads it as float, and FinishGpuOp<Half>
+            // reads it as float then casts to Half[] on host — matching the FP32-backed-Half grad representation.
+            var dstFp32 = backend.AllocateBuffer(n);
+            if (srcIsFp16)
+                backend.ConvertToFp32(srcBuf, dstFp32, n);   // true Half (2-byte) source → FP32
+            else
+                backend.Copy(srcBuf, dstFp32, n);            // FP32 source → FP32 (device-to-device, no host)
+            var result = FinishGpuOp<TOut>(backend, new OwnedBuffer(dstFp32, ownsBuffer: true), n);
+            return new Tensor<TOut>(result, src._shape);
+        }
+        catch (Exception)
+        {
+            return src.Cast<TOut>();
+        }
+    }
 
     /// <summary>
     /// Get a tensor's resident FP16 activation buffer DIRECTLY (no up-cast) when it is stored as an IsFp16

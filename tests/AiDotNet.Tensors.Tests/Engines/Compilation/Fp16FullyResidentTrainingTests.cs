@@ -1,13 +1,14 @@
-// End-to-end proof (#633): a small model trains on the GPU with FP16 activations while the HEAVY tensors stay
-// GPU-resident — the forward (Half-resident store), the fused Half backward, the per-node scratch release, and
-// the fused on-device optimizer keep activations / gradients / weights / optimizer-state on the device across a
-// full training step. Measured via DeferredArrayMaterializer.MaterializeCount (each fired callback = one real
-// GPU→CPU download of a resident tensor): a full Step with no loss read pulls only a small bounded number of
-// tensors to host — exclusively the float↔Half gradient CAST-BOUNDARY copies at the FP32/FP16 edges (count
-// scales with dtype boundaries, not activation bytes / in-region depth), NOT the activations/weights/grads/
-// optimizer state (which never round-trip). Eliminating those last cast-boundary copies needs an on-device
-// gradient cast bridge (tracked follow-up). The loss also decreases over steps, proving the resident gradients
-// are correct. Runs on any DirectGpuTensorEngine (CUDA/OpenCL/…); skips on a CPU-only host.
+// End-to-end proof (#633): a small model trains on the GPU with FP16 activations while the AUTODIFF working set
+// stays GPU-resident — the forward (Half-resident store), the fused Half backward, the on-device float↔Half
+// gradient cast bridges, and the per-node scratch release keep activations / op results / cast-boundary
+// gradients / scratch on the device across a full training step. Measured via
+// DeferredArrayMaterializer.MaterializeCount (each fired callback = one real GPU→CPU download of a resident
+// tensor): a full Step with no loss read pulls only a small bounded number of tensors to host — the per-PARAMETER
+// gradient reads handed to the optimizer's master-weight update (count = trainable-parameter count, independent
+// of activation size / model depth), NOT the activations/op-results/scratch (which never round-trip). Driving
+// those last per-parameter grad reads to zero needs the optimizer master-update + forward param-cast on-device
+// too (a coupled param-residency change, tracked separately). The loss also decreases over steps, proving the
+// resident gradients are correct. Runs on any DirectGpuTensorEngine (CUDA/OpenCL/…); skips on a CPU-only host.
 
 #nullable disable
 using System;
@@ -86,25 +87,25 @@ public class Fp16FullyResidentTrainingTests
             _out.WriteLine($"loss: first={firstLoss:G6} last={last:G6}");
             Assert.True(last < firstLoss * 0.99f, $"FP16 training should reduce the loss: first={firstLoss}, last={last}.");
 
-            // RESIDENCY PROOF: a full Step — forward (Half-resident store) + fused Half backward + per-node
-            // scratch release + fused on-device SGD — with NO host read of the result keeps the HEAVY tensors
-            // (activations, gradients, weights, optimizer state) GPU-resident: nothing that scales with the
-            // activation working set round-trips. The only host transfers are the small float↔Half GRADIENT
-            // CAST-BOUNDARY copies at the FP32/FP16 edges (proportional to the number of dtype boundaries, NOT to
-            // activation bytes or in-region depth). A non-resident path would instead download every op's result —
-            // dozens for this graph's forward+backward+optimizer. The bound below is well under that and well under
-            // the activation count, proving the activations/weights/grads/optimizer never ping-pong to host.
-            // (Eliminating the residual cast-boundary copies needs an on-device gradient cast bridge — tracked.)
+            // RESIDENCY PROOF: a full Step — forward (Half-resident store) + fused Half backward + on-device
+            // float↔Half gradient cast bridges + per-node scratch release — keeps the AUTODIFF working set
+            // (activations, the matmul/elementwise op results, the cast-boundary gradients, the per-op scratch)
+            // GPU-resident: nothing that scales with the activation working set or model depth round-trips. The
+            // only host transfers are the small per-PARAMETER gradient reads handed to the optimizer's master-
+            // weight update (one per trained parameter — here W1, W2 — independent of activation size / depth). A
+            // non-resident path would instead download every op's result: dozens for this graph's forward+backward.
+            // (Driving these last per-parameter grad reads to zero needs the optimizer's master-weight update +
+            // the forward param-cast to run on-device too — a coupled param-residency change, tracked separately.)
             DeferredArrayMaterializer.ResetMaterializeCount();
             plan.Step(); // intentionally do NOT read the returned loss
             long downloads = DeferredArrayMaterializer.MaterializeCount;
             _out.WriteLine($"deferred GPU→CPU downloads during a full no-read FP16 step: {downloads} " +
-                "(float↔Half gradient cast boundaries only; activations/weights/grads/optimizer stay resident)");
-            // 8 = generous bound for this graph's handful of dtype boundaries; a per-op host ping-pong of the
-            // forward+backward+optimizer over this ~7-tensor graph would be far more (every op result downloaded).
+                "(per-parameter gradient reads for the optimizer only; the autodiff activations/results/scratch stay resident)");
+            // Bound = a small multiple of the trainable-parameter count (2 here), NOT the activation/op count. A
+            // per-op host ping-pong of the forward+backward over this ~7-tensor graph would be far more.
             Assert.True(downloads <= 8,
-                $"a full FP16 step pulled {downloads} tensors to host — more than the dtype-boundary cast copies, " +
-                "so an activation/weight/gradient is round-tripping (residency regression).");
+                $"a full FP16 step pulled {downloads} tensors to host — more than the per-parameter gradient reads, " +
+                "so an activation/op-result/scratch is round-tripping (residency regression).");
         }
         finally { plan.Dispose(); }
     }

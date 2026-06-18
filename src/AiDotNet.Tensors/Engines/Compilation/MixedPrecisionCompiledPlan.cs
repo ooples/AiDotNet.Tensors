@@ -77,7 +77,8 @@ public sealed class MixedPrecisionCompiledPlan
     // (e.g. the A/B peak tests) is always respected.
     private readonly bool _fwdStoreDefault;
 
-    private MixedPrecisionCompiledPlan(IEngine engine, ILazyNode[] order, Tensor<float> output, bool paging)
+    private MixedPrecisionCompiledPlan(IEngine engine, ILazyNode[] order, Tensor<float> output, bool paging,
+        bool fwdStoreEligible = false)
     {
         _engine = engine;
         _order = order;
@@ -95,10 +96,13 @@ public sealed class MixedPrecisionCompiledPlan
             // (AIDOTNET_FP16_NO_SCRATCH_FREE) so it can be disabled without losing the activation free schedule.
             _scratchFree = Environment.GetEnvironmentVariable("AIDOTNET_FP16_NO_SCRATCH_FREE") != "1";
         }
-        // Forward Half-resident store: default-on for the GPU hetero forward (any GPU engine, independent of the
-        // free/paging branch above), opt-out AIDOTNET_FP16_NO_FWD_STORE. Engaged in Forward() only when the caller
-        // has not set an explicit DirectGpuTensorEngine.Fp16FwdStoreOverride.
-        _fwdStoreDefault = engine is DirectGpuTensorEngine
+        // Forward Half-resident store: default-on ONLY for the FP16 hetero TRAINING forward (FromCapturedOrder,
+        // fwdStoreEligible=true), where the VRAM win matters and the training parity tolerance already covers the
+        // Half-storage rounding. NOT for the standalone Compile()/Trace() inference path, whose contract is to
+        // replay a fresh trace bit-for-bit (the Half storage would perturb the matmul-intermediate values vs the
+        // eager FP32-stored trace). Opt-out AIDOTNET_FP16_NO_FWD_STORE; an explicit Fp16FwdStoreOverride wins.
+        _fwdStoreDefault = fwdStoreEligible
+            && engine is DirectGpuTensorEngine
             && Environment.GetEnvironmentVariable("AIDOTNET_FP16_NO_FWD_STORE") != "1";
     }
 
@@ -148,7 +152,7 @@ public sealed class MixedPrecisionCompiledPlan
     /// on-device when AIDOTNET_FP16_GPU_CACHE=1) so the full peak-VRAM reduction is realized.
     /// </summary>
     internal static MixedPrecisionCompiledPlan FromCapturedOrder(IEngine engine, ILazyNode[] order, Tensor<float> output, bool paging)
-        => new MixedPrecisionCompiledPlan(engine, order, output, paging);
+        => new MixedPrecisionCompiledPlan(engine, order, output, paging, fwdStoreEligible: true);
 
     /// <summary>
     /// Public entry point (Phase E): trace <paramref name="forward"/> under an FP16 autocast scope with
