@@ -5649,6 +5649,10 @@ public partial class CpuEngine : ITensorLevelEngine
                 return scope.RecordUnary(LazyNodeType.MultiplyScalar, "TensorMultiplyScalar", tensor, tensor._shape,
                     (eng, output) =>
                     {
+                        // GPU-resident scalar multiply into output's stable buffer (no host materialize that breaks
+                        // CUDA-graph capture — the attention QK^T·1/√d scaling); else the host path.
+                        if (eng is DirectGpuTensorEngine sclGpu && sclGpu.TryMultiplyScalarResidentInto(output, captured, capturedScalar))
+                            return;
                         if (eng is CpuEngine cpuEng) cpuEng.TensorMultiplyScalarInto(output, captured, capturedScalar);
                         else { var r = eng.TensorMultiplyScalar(captured, capturedScalar); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },

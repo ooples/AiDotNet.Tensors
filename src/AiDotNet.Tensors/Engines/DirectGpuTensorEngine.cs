@@ -3138,6 +3138,26 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         catch (Exception mex) { AliasDiag($"BMM-resident FELLBACK a=[{string.Join(",", a._shape)}] b=[{string.Join(",", b._shape)}]: {mex.GetType().Name}: {mex.Message}"); return false; }
     }
 
+    /// <summary>GPU-RESIDENT scalar multiply for the compiled step (the attention score scaling QK^T·1/√d) via
+    /// backend.Scale into the destination's stable buffer — no host CpuEngine.TensorMultiplyScalarInto (which
+    /// materializes the input → a DtoH download = non-capturable CUDA-900). Returns false to fall back.</summary>
+    internal bool TryMultiplyScalarResidentInto<T>(Tensor<T> output, Tensor<T> a, T scalar)
+    {
+        if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
+        if (!TryGetBackend(out var backend)) return false;
+        if (!a.IsContiguous || a.Length != output.Length) return false;
+        try
+        {
+            float scalarF = (float)(object)scalar!;
+            using var bufIn = GetResidentOrPersistentInputBuffer(backend, a);
+            var outBuf = GetOrCreateResidentBuffer(backend, output, output.Length);
+            backend.Scale(bufIn.Buffer, outBuf, scalarF, output.Length);
+            BindResidentBuffer(output, outBuf, backend);
+            return true;
+        }
+        catch (Exception sex) { AliasDiag($"MulScalar-resident FELLBACK a=[{string.Join(",", a._shape)}]: {sex.GetType().Name}: {sex.Message}"); return false; }
+    }
+
     /// <summary>GPU-RESIDENT embedding lookup from FLOAT indices for the compiled step (the cortex's actual
     /// embedding op): backend.Embedding (the kernel casts float→int) into the destination's stable buffer, with
     /// the table from the PERSISTENT weight cache and the indices from the resident input buffer — no host gather
