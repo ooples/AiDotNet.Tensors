@@ -71,6 +71,7 @@ public class MultiInputReplayAliasingTests : IDisposable
             // Second replay with the SAME instances must reproduce the first (deterministic).
             plan.SetInputs(new[] { x, t });
             var got2 = Snapshot(plan.Execute());
+            Assert.Equal(got1.Length, got2.Length);        // guard against a short-output false pass
             for (int i = 0; i < got1.Length; i++)
                 Assert.True(Math.Abs(got1[i] - got2[i]) < 1e-5f,
                     $"replay {i}: {got1[i]} vs {got2[i]} — non-deterministic compiled replay.");
@@ -104,6 +105,7 @@ public class MultiInputReplayAliasingTests : IDisposable
         };
 
         var xBefore = Snapshot(x);
+        var tBefore = Snapshot(t);
         var cache = new CompiledModelCache<float>();
         try
         {
@@ -111,8 +113,10 @@ public class MultiInputReplayAliasingTests : IDisposable
             plan.SetInputs(new[] { x, t });
             var got1 = Snapshot(plan.Execute());
             Assert.Equal(xBefore, x.AsSpan().ToArray());
+            Assert.Equal(tBefore, t.AsSpan().ToArray());   // every SetInputs operand must be immutable
             plan.SetInputs(new[] { x, t });
             var got2 = Snapshot(plan.Execute());
+            Assert.Equal(got1.Length, got2.Length);        // guard against a short-output false pass
             for (int i = 0; i < got1.Length; i++)
                 Assert.True(Math.Abs(got1[i] - got2[i]) < 1e-5f,
                     $"diff-rank replay {i}: {got1[i]} vs {got2[i]} — non-deterministic.");
@@ -145,6 +149,7 @@ public class MultiInputReplayAliasingTests : IDisposable
         };
 
         var xBefore = Snapshot(x);
+        var tBefore = Snapshot(t);
         var cache = new CompiledModelCache<float>();
         try
         {
@@ -152,8 +157,10 @@ public class MultiInputReplayAliasingTests : IDisposable
             plan.SetInputs(new[] { x, t });
             var got1 = Snapshot(plan.Execute());
             Assert.Equal(xBefore, x.AsSpan().ToArray());
+            Assert.Equal(tBefore, t.AsSpan().ToArray());   // every SetInputs operand must be immutable
             plan.SetInputs(new[] { x, t });
             var got2 = Snapshot(plan.Execute());
+            Assert.Equal(got1.Length, got2.Length);        // guard against a short-output false pass
             for (int i = 0; i < got1.Length; i++)
                 Assert.True(Math.Abs(got1[i] - got2[i]) < 1e-5f,
                     $"attn replay {i}: {got1[i]} vs {got2[i]} — non-deterministic compiled replay.");
@@ -646,45 +653,40 @@ public class MultiInputReplayAliasingTests : IDisposable
     [InlineData(8, 8)]
     public void AttentionFusion_FusedForwardMatchesEager_AfterKeyRecovery(int seqK, int headDim)
     {
-        var saved = AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions.Current.EnableAttentionFusion;
-        AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions.Current.EnableAttentionFusion = true;
+        // AttentionFusion is on by default (TensorCodecOptions.EnableAttentionFusion = true), so this
+        // exercises the fused path WITHOUT writing the process-global TensorCodecOptions.Current — which
+        // would race other parallel tests. No test mutates that global flag (the disable-fusion tests use
+        // local TensorCodecOptions instances), so the default-on value holds for the whole run.
+        var engine = new CpuEngine();
+        const int seqQ = 7;
+        float scale = 1f / MathF.Sqrt(headDim); // matches the FlashAttention kernel's internal scale
+        var q = Tensor<float>.CreateRandom(new[] { seqQ, headDim });
+        var k = Tensor<float>.CreateRandom(new[] { seqK, headDim });
+        var v = Tensor<float>.CreateRandom(new[] { seqK, headDim });
+
+        // Decomposed attention: scores = (Q @ K^T) * scale -> softmax -> @ V. The K^T comes from an
+        // explicit TensorTranspose, which AttentionFusionPass must trace back to recover natural K.
+        Func<Tensor<float>> forward = () =>
+        {
+            var scores = engine.TensorMultiplyScalar(
+                engine.TensorMatMul(q, engine.TensorTranspose(k)), scale); // [seqQ, seqK]
+            var probs = engine.TensorSoftmax(scores, -1);
+            return engine.TensorMatMul(probs, v);                          // [seqQ, headDim]
+        };
+
+        var eager = Snapshot(forward());
+        var cache = new CompiledModelCache<float>();
         try
         {
-            var engine = new CpuEngine();
-            const int seqQ = 7;
-            float scale = 1f / MathF.Sqrt(headDim); // matches the FlashAttention kernel's internal scale
-            var q = Tensor<float>.CreateRandom(new[] { seqQ, headDim });
-            var k = Tensor<float>.CreateRandom(new[] { seqK, headDim });
-            var v = Tensor<float>.CreateRandom(new[] { seqK, headDim });
-
-            // Decomposed attention: scores = (Q @ K^T) * scale -> softmax -> @ V. The K^T comes from an
-            // explicit TensorTranspose, which AttentionFusionPass must trace back to recover natural K.
-            Func<Tensor<float>> forward = () =>
-            {
-                var scores = engine.TensorMultiplyScalar(
-                    engine.TensorMatMul(q, engine.TensorTranspose(k)), scale); // [seqQ, seqK]
-                var probs = engine.TensorSoftmax(scores, -1);
-                return engine.TensorMatMul(probs, v);                          // [seqQ, headDim]
-            };
-
-            var eager = Snapshot(forward());
-            var cache = new CompiledModelCache<float>();
-            try
-            {
-                var plan = cache.GetOrCompileInference(new[] { q, k, v }, forward);
-                plan.SetInputs(new[] { q, k, v });
-                var got = Snapshot(plan.Execute());
-                Assert.Equal(eager.Length, got.Length);
-                for (int i = 0; i < got.Length; i++)
-                    Assert.True(Math.Abs(got[i] - eager[i]) < 1e-4f,
-                        $"attention-fusion parity [seqK={seqK}, headDim={headDim}] idx {i}: " +
-                        $"fused {got[i]} vs eager {eager[i]} — K-recovery produced the wrong key orientation.");
-            }
-            finally { cache.Dispose(); }
+            var plan = cache.GetOrCompileInference(new[] { q, k, v }, forward);
+            plan.SetInputs(new[] { q, k, v });
+            var got = Snapshot(plan.Execute());
+            Assert.Equal(eager.Length, got.Length);
+            for (int i = 0; i < got.Length; i++)
+                Assert.True(Math.Abs(got[i] - eager[i]) < 1e-4f,
+                    $"attention-fusion parity [seqK={seqK}, headDim={headDim}] idx {i}: " +
+                    $"fused {got[i]} vs eager {eager[i]} — K-recovery produced the wrong key orientation.");
         }
-        finally
-        {
-            AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions.Current.EnableAttentionFusion = saved;
-        }
+        finally { cache.Dispose(); }
     }
 }
