@@ -207,6 +207,58 @@ public class AutoTrainingCompilerTests : IDisposable
     }
 
     // ──────────────────────────────────────────────────────────────
+    // Cross-model isolation (thread-static state persists across models/tests)
+    // ──────────────────────────────────────────────────────────────
+
+    [Fact]
+    public void DifferentStructureAfterCompile_RecompilesForNewModel_NoStalePlanBlock()
+    {
+        // Two DIFFERENT models trained sequentially on the same thread WITHOUT a
+        // ResetState between them (the real batched-test / sequential-training
+        // scenario — the compiler state is [ThreadStatic] and survives across
+        // models). Model A's compiled plan must not stay stuck in the single slot
+        // and block model B (different structure) from compiling its own. Before
+        // the fix, B's ShouldCompile stayed false forever because _compiledStored
+        // (A's plan) was never cleared on a structure change — and on a hash
+        // collision B could even replay A's backward against B's parameters.
+        var inputA = new Tensor<float>(new float[] { 1f, 0f, 0f, 1f }, new[] { 2, 2 });
+        var weightA = new Tensor<float>(new float[] { 2f, 0f, 0f, 2f }, new[] { 2, 2 });
+
+        using (var tapeA = new GradientTape<float>(new GradientTapeOptions { Persistent = true }))
+        {
+            for (int s = 0; s < 3; s++)
+            {
+                tapeA.Reset();
+                var h = _engine.TensorMatMul(inputA, weightA);
+                var loss = _engine.ReduceSum(h, null);
+                tapeA.ComputeGradients(loss, new[] { weightA });
+            }
+            Assert.True(AutoTrainingCompiler.ReplayMode, "Model A should have compiled (sanity check)");
+        }
+
+        // Model B: different structure (3x3 vs 2x2) + different parameter tensor.
+        // No ResetState — A's plan is still in the thread-static slot.
+        var inputB = new Tensor<float>(new float[] { 1f, 0f, 0f, 0f, 1f, 0f, 0f, 0f, 1f }, new[] { 3, 3 });
+        var weightB = new Tensor<float>(new float[] { 2f, 0f, 0f, 0f, 2f, 0f, 0f, 0f, 2f }, new[] { 3, 3 });
+        bool bCompiled;
+        using (var tapeB = new GradientTape<float>(new GradientTapeOptions { Persistent = true }))
+        {
+            for (int s = 0; s < 3; s++)
+            {
+                tapeB.Reset();
+                var h = _engine.TensorMatMul(inputB, weightB);
+                var loss = _engine.ReduceSum(h, null);
+                tapeB.ComputeGradients(loss, new[] { weightB });
+            }
+            bCompiled = AutoTrainingCompiler.ReplayMode;
+        }
+
+        Assert.True(bCompiled,
+            "Model B (different structure) must compile its OWN plan; a stale plan from model A " +
+            "must not occupy the single thread-static slot and block B's compilation.");
+    }
+
+    // ──────────────────────────────────────────────────────────────
     // TryCompileBackward guards
     // ──────────────────────────────────────────────────────────────
 
