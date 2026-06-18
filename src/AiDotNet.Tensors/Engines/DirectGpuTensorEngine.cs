@@ -11697,13 +11697,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// capture/replay never re-read host data or re-upload (no DtoH/HtoD inside the captured region).</summary>
     private IGpuBuffer? ResolveResidentEmbeddingTable<T>(IDirectGpuBackend backend, Tensor<T> embeddingTable)
     {
-        if (_cachedEmbTableBuffer is not null) return _cachedEmbTableBuffer;
+        // Prefer the param's CURRENT live resident buffer. The embedding table is a PARAMETER; if its GPU buffer
+        // is re-allocated (the optimizer's resident-param setup) a once-cached pointer DANGLES → the gather reads
+        // FREED device memory = the sticky CUDA-700/900 that aborted capture (#38). Re-validate each call.
+        if (embeddingTable._gpuBuffer is not null && ReferenceEquals(embeddingTable._gpuBackend, backend)
+            && IsCachedGpuBufferLive(embeddingTable, backend))
+            return embeddingTable._gpuBuffer;
         try
         {
             var owned = GetOrCacheWeightBuffer(backend, embeddingTable.GetDataArray(), PersistentTensorRole.Embeddings);
             _cachedEmbTableBuffer = owned.Buffer;
         }
-        catch { return null; }
+        catch { return _cachedEmbTableBuffer; }
         return _cachedEmbTableBuffer;
     }
 
