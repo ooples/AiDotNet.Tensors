@@ -634,4 +634,57 @@ public class MultiInputReplayAliasingTests : IDisposable
         }
         finally { cache.Dispose(); }
     }
+
+    // ---- AttentionFusion correctness (#632/#633): the fused FlashAttention path must equal eager ----
+
+    [Theory]
+    // seqK == headDim is the case that SILENTLY CORRUPTED before the K-recovery fix: with the K operand
+    // left as K^T, the fused kernel transposed it again (→ Q@K) yet the equal shapes passed every dim
+    // check. seqK != headDim previously *skipped* fusion (mismatched dims rejected). Both must now match.
+    [InlineData(5, 5)]
+    [InlineData(6, 4)]
+    [InlineData(8, 8)]
+    public void AttentionFusion_FusedForwardMatchesEager_AfterKeyRecovery(int seqK, int headDim)
+    {
+        var saved = AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions.Current.EnableAttentionFusion;
+        AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions.Current.EnableAttentionFusion = true;
+        try
+        {
+            var engine = new CpuEngine();
+            const int seqQ = 7;
+            float scale = 1f / MathF.Sqrt(headDim); // matches the FlashAttention kernel's internal scale
+            var q = Tensor<float>.CreateRandom(new[] { seqQ, headDim });
+            var k = Tensor<float>.CreateRandom(new[] { seqK, headDim });
+            var v = Tensor<float>.CreateRandom(new[] { seqK, headDim });
+
+            // Decomposed attention: scores = (Q @ K^T) * scale -> softmax -> @ V. The K^T comes from an
+            // explicit TensorTranspose, which AttentionFusionPass must trace back to recover natural K.
+            Func<Tensor<float>> forward = () =>
+            {
+                var scores = engine.TensorMultiplyScalar(
+                    engine.TensorMatMul(q, engine.TensorTranspose(k)), scale); // [seqQ, seqK]
+                var probs = engine.TensorSoftmax(scores, -1);
+                return engine.TensorMatMul(probs, v);                          // [seqQ, headDim]
+            };
+
+            var eager = Snapshot(forward());
+            var cache = new CompiledModelCache<float>();
+            try
+            {
+                var plan = cache.GetOrCompileInference(new[] { q, k, v }, forward);
+                plan.SetInputs(new[] { q, k, v });
+                var got = Snapshot(plan.Execute());
+                Assert.Equal(eager.Length, got.Length);
+                for (int i = 0; i < got.Length; i++)
+                    Assert.True(Math.Abs(got[i] - eager[i]) < 1e-4f,
+                        $"attention-fusion parity [seqK={seqK}, headDim={headDim}] idx {i}: " +
+                        $"fused {got[i]} vs eager {eager[i]} — K-recovery produced the wrong key orientation.");
+            }
+            finally { cache.Dispose(); }
+        }
+        finally
+        {
+            AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions.Current.EnableAttentionFusion = saved;
+        }
+    }
 }

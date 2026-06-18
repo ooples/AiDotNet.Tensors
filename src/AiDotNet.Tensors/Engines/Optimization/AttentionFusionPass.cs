@@ -1,6 +1,7 @@
 using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Engines.Simd;
 using AiDotNet.Tensors.Helpers;
+using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Engines.Optimization;
 
@@ -100,7 +101,19 @@ internal sealed class AttentionFusionPass : ICpuOptimizationPass
         if (typeof(T) != typeof(float)) return false;
 
         var queryTensor = qk.Inputs[0];
-        var keyTensor = qk.Inputs[1]; // This is K (or K^T depending on how the graph was built)
+
+        // The matched QK op is a plain TensorMatMul/BatchMatMul (no transpose flag),
+        // so to compute scores = Q @ K^T its second operand is K^T — the output of a
+        // TensorTranspose(K) step. FlashAttention computes Q @ K^T INTERNALLY and so
+        // needs the NATURAL key K ([.., seqK, headDim]); feeding it the already-
+        // transposed K^T makes it transpose twice (→ Q @ K), which is silently wrong
+        // whenever seqK == headDim (equal shapes pass every downstream dim check) and
+        // also breaks the seqK/headDim extraction below (both were written for natural K).
+        // Recover natural K by tracing the transpose that produced the operand; if the
+        // operand is not a clean last-two-dim transpose output we cannot prove its
+        // layout, so refuse to fuse rather than risk corruption.
+        if (!TryRecoverNaturalKey(steps, index, qk.Inputs[1], out var keyTensor))
+            return false;
         var valueTensor = attnV.Inputs[1];
         var finalOutput = attnV.OutputBuffer;
 
@@ -212,5 +225,56 @@ internal sealed class AttentionFusionPass : ICpuOptimizationPass
             null);
 
         return true;
+    }
+
+    /// <summary>
+    /// Recovers the natural key tensor K from the second operand of a Q @ K^T matmul.
+    /// Because <see cref="OpType.TensorMatMul"/>/<see cref="OpType.BatchMatMul"/> carry no
+    /// transpose flag, an attention graph materialises K^T with a <see cref="OpType.TensorTranspose"/>
+    /// step and feeds its output as the matmul's second operand. The FlashAttention kernels
+    /// transpose K internally, so they require natural K — we trace that transpose to its input.
+    /// Returns false (caller must NOT fuse) when the operand has no producing transpose, was
+    /// produced by some other op, or the transpose is not a clean swap of the last two dims —
+    /// in those cases the operand's layout cannot be proven and fusing would risk silent
+    /// gradient/output corruption.
+    /// </summary>
+    private static bool TryRecoverNaturalKey<T>(
+        CompiledStep<T>[] steps, int qkIndex, Tensor<T> keyOperand, out Tensor<T> naturalKey)
+    {
+        naturalKey = keyOperand;
+        if (keyOperand is null) return false;
+
+        for (int s = qkIndex - 1; s >= 0; s--)
+        {
+            var producer = steps[s];
+            if (producer.OutputBuffer is null || !ReferenceEquals(producer.OutputBuffer, keyOperand))
+                continue;
+
+            // Found the step that writes the K operand. It must be a transpose for the
+            // operand to be K^T; anything else means we cannot reason about the layout.
+            if (producer.OpType != OpType.TensorTranspose
+                || producer.Inputs is null || producer.Inputs.Length < 1)
+                return false;
+
+            var src = producer.Inputs[0];
+            int rank = keyOperand.Rank;
+            if (src is null || src.Rank != rank || rank < 2)
+                return false;
+
+            // Require a pure last-two-dim swap: src[.., a, b] -> keyOperand[.., b, a],
+            // with all leading (batch/head) dims identical. Any other permutation is rejected.
+            if (src._shape[rank - 1] != keyOperand._shape[rank - 2]
+                || src._shape[rank - 2] != keyOperand._shape[rank - 1])
+                return false;
+            for (int d = 0; d < rank - 2; d++)
+                if (src._shape[d] != keyOperand._shape[d]) return false;
+
+            naturalKey = src;
+            return true;
+        }
+
+        // No producing step found (e.g. the operand is a plan input that is already stored
+        // transposed): the layout is unknown, so refuse to fuse.
+        return false;
     }
 }

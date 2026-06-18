@@ -92,16 +92,15 @@ public sealed class TensorCodecOptions
     public bool EnableConvBnFusion { get; set; } = true;
 
     /// <summary>Phase 4.2: Fuse attention Q@K^T->Softmax->V patterns into a FlashAttention kernel.
-    /// DISABLED BY DEFAULT — the fusion is INCORRECT for this codebase's attention graphs. FlashAttention
-    /// needs K in [.., seqK, headDim] layout, but the QK step is matmul(Q, Kᵀ): a valid plain matmul's
-    /// second input is ALWAYS Kᵀ ([.., headDim, seqK]), never K. The pass takes qk.Inputs[1] as "K" and lets
-    /// FlashAttention transpose it again, computing the wrong thing. The shape sanity check only catches this
-    /// when seqK != headDim (it rejects the mismatched dims); when seqK == headDim the wrong orientation
-    /// passes the check and produces a SILENTLY WRONG result (caught by MultiInputReplayAliasingTests'
-    /// eager-parity asserts). So the fusion never fuses correctly — it either skips (seqK != headDim) or
-    /// corrupts (seqK == headDim). Keep off until rewritten to recover K structurally (trace the transpose
-    /// feeding the QK matmul) and validated against a real attention model.</summary>
-    public bool EnableAttentionFusion { get; set; } = false;
+    /// Re-enabled: the fusion now structurally recovers natural K. FlashAttention needs K in
+    /// [.., seqK, headDim] layout, but the QK step is a plain matmul(Q, Kᵀ) whose second operand is Kᵀ
+    /// ([.., headDim, seqK]) — the output of a TensorTranspose(K) step (plain matmul carries no transpose
+    /// flag). <see cref="AttentionFusionPass"/> traces that transpose back to its input to feed natural K,
+    /// and REFUSES to fuse when the operand's layout cannot be proven (no producing transpose / not a clean
+    /// last-two-dim swap), so the previous silent-corruption-at-seqK==headDim case can no longer occur.
+    /// Inference-only (CompiledInferencePlan.RunCpuOptimizationPasses), so the forward-only fused step
+    /// needs no backward kernel.</summary>
+    public bool EnableAttentionFusion { get; set; } = true;
 
     /// <summary>Phase 4.3: Merge consecutive pointwise ops into fewer dispatch steps.</summary>
     public bool EnablePointwiseFusion { get; set; } = true;
