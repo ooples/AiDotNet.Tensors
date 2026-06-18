@@ -64,8 +64,13 @@ public class EvictActivationsCreatedAfterLifetimeTests
             "_activationCacheTimestamp", BindingFlags.NonPublic | BindingFlags.Instance)!;
         var snapshotMethod = engineType.GetMethod(
             "ActivationCacheTimestampSnapshot", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        // Resolve the single-argument EvictActivationsCreatedAfter(long) overload by its exact parameter types:
+        // #633 added (long, HashSet) and (long, HashSet, bool) overloads, so a name-only GetMethod now throws
+        // AmbiguousMatchException. This test exercises the 1-arg snapshot overload (see the single-arg Invoke
+        // calls below), so bind that signature explicitly — same pattern as GetActivationCacheEntryCtor above.
         var evictMethod = engineType.GetMethod(
-            "EvictActivationsCreatedAfter", BindingFlags.NonPublic | BindingFlags.Instance)!;
+            "EvictActivationsCreatedAfter", BindingFlags.NonPublic | BindingFlags.Instance,
+            null, new[] { typeof(long) }, null)!;
         var activationCacheEntryType = engineType.Assembly.GetType(
             "AiDotNet.Tensors.Engines.ActivationCacheEntry")!;
         var entryCtor = GetActivationCacheEntryCtor(activationCacheEntryType);
@@ -122,8 +127,13 @@ public class EvictActivationsCreatedAfterLifetimeTests
             "_activationCache", BindingFlags.NonPublic | BindingFlags.Instance)!;
         var timestampField = engineType.GetField(
             "_activationCacheTimestamp", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        // Resolve the single-argument EvictActivationsCreatedAfter(long) overload by its exact parameter types:
+        // #633 added (long, HashSet) and (long, HashSet, bool) overloads, so a name-only GetMethod now throws
+        // AmbiguousMatchException. This test exercises the 1-arg snapshot overload (see the single-arg Invoke
+        // calls below), so bind that signature explicitly — same pattern as GetActivationCacheEntryCtor above.
         var evictMethod = engineType.GetMethod(
-            "EvictActivationsCreatedAfter", BindingFlags.NonPublic | BindingFlags.Instance)!;
+            "EvictActivationsCreatedAfter", BindingFlags.NonPublic | BindingFlags.Instance,
+            null, new[] { typeof(long) }, null)!;
         var activationCacheEntryType = engineType.Assembly.GetType(
             "AiDotNet.Tensors.Engines.ActivationCacheEntry")!;
         var entryCtor = GetActivationCacheEntryCtor(activationCacheEntryType);
@@ -173,8 +183,13 @@ public class EvictActivationsCreatedAfterLifetimeTests
         // without throwing. This is the "nested tape under a no-op forward" shape.
         using var engine = new DirectGpuTensorEngine();
         var engineType = typeof(DirectGpuTensorEngine);
+        // Resolve the single-argument EvictActivationsCreatedAfter(long) overload by its exact parameter types:
+        // #633 added (long, HashSet) and (long, HashSet, bool) overloads, so a name-only GetMethod now throws
+        // AmbiguousMatchException. This test exercises the 1-arg snapshot overload (see the single-arg Invoke
+        // calls below), so bind that signature explicitly — same pattern as GetActivationCacheEntryCtor above.
         var evictMethod = engineType.GetMethod(
-            "EvictActivationsCreatedAfter", BindingFlags.NonPublic | BindingFlags.Instance)!;
+            "EvictActivationsCreatedAfter", BindingFlags.NonPublic | BindingFlags.Instance,
+            null, new[] { typeof(long) }, null)!;
         evictMethod.Invoke(engine, new object[] { 0L });
         evictMethod.Invoke(engine, new object[] { long.MaxValue });
     }
