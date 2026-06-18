@@ -1728,6 +1728,43 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     }
 
     /// <summary>
+    /// Capture-SAFE drop of DEAD transient activations created after <paramref name="snapshot"/> on the calling
+    /// thread, EXCLUDING <paramref name="keepKey"/> (the op's live result). Unlike
+    /// <see cref="EvictActivationsCreatedAfter"/> this does NOT materialize (no DtoH download — illegal inside a
+    /// CUDA-graph capture); the dropped entries are intermediates of a tapeless fused op (e.g.
+    /// <c>MultiHeadAttentionForward</c>'s inference path) whose host arrays are never read, so their pending
+    /// materializers are discarded and the buffers freed (stream-ordered under the async allocator). Without this,
+    /// a tapeless fused op's intermediates are cached but owned by NO tape, so nothing releases them and — with
+    /// eviction suspended for the compiled step — they accumulate every step (the d128/L1 async-pool-OOM CUDA-700
+    /// that aborts capture). Keeping <paramref name="keepKey"/> preserves the result's forward residency.
+    /// </summary>
+    internal void DropTransientActivationsCreatedAfter(long snapshot, object? keepKey)
+    {
+        int callerThreadId = System.Environment.CurrentManagedThreadId;
+        List<ActivationCacheEntry> toDispose = new();
+        lock (_activationCacheLock)
+        {
+            if (_activationCache.IsEmpty) return;
+            var entries = _activationCache.ToArray();
+            for (int i = 0; i < entries.Length; i++)
+            {
+                if (entries[i].Value.Timestamp <= snapshot) continue;            // pre-existing — keep
+                if (entries[i].Value.ThreadId != callerThreadId) continue;       // another thread's live buffer
+                if (keepKey is not null && ReferenceEquals(entries[i].Key, keepKey)) continue; // the live result
+                // Dead intermediate: discard its pending download (never read) and free the buffer.
+                Helpers.DeferredArrayMaterializer.Remove(entries[i].Key);
+                if (_activationCache.TryRemove(entries[i].Key, out var entry))
+                {
+                    System.Threading.Interlocked.Add(ref _currentActivationCacheBytes, -entry.Buffer.SizeInBytes);
+                    System.Threading.Interlocked.Add(ref _currentActivationManagedBytes, -entry.ManagedBytes);
+                    toDispose.Add(entry);
+                }
+            }
+        }
+        foreach (var entry in toDispose) entry.Dispose();
+    }
+
+    /// <summary>
     /// Clears the activation cache to free GPU memory.
     /// Call this between inference batches if memory is tight.
     /// Thread-safe: uses lock to prevent clearing while buffers are in use.
