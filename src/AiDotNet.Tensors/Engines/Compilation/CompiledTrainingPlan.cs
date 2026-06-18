@@ -814,7 +814,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     // #639: one-time op-type histogram of the compiled forward graph. Sizes the
     // operator-fusion prize (how many ops the plan replays per step, and which
     // adjacencies — conv→bias→activation, residual-add, BN — are worth fusing).
-    // Gated on AIDOTNET_PLAN_HISTOGRAM=1; writes to stderr once per process.
+    // Gated on AIDOTNET_PLAN_HISTOGRAM=1; writes once per process. Output goes to stderr AND
+    // (so it survives xUnit/dotnet-test console capture) to the path in AIDOTNET_PLAN_HISTOGRAM_FILE,
+    // defaulting to %TEMP%/aidotnet_plan_histogram.txt.
     private void MaybeDumpOpHistogram()
     {
         if (s_histogramDumped || _forwardSteps is null) return;
@@ -828,9 +830,22 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         }
         var ordered = new System.Collections.Generic.List<System.Collections.Generic.KeyValuePair<string, int>>(hist);
         ordered.Sort((a, b) => b.Value.CompareTo(a.Value));
-        System.Console.Error.WriteLine($"[#639] compiled-plan forward op histogram — {_forwardSteps.Length} ops:");
+
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine($"[#639] compiled-plan forward op histogram — {_forwardSteps.Length} ops:");
         foreach (var kv in ordered)
-            System.Console.Error.WriteLine($"  {kv.Value,4}  {kv.Key}");
+            sb.AppendLine($"  {kv.Value,4}  {kv.Key}");
+        var text = sb.ToString();
+
+        System.Console.Error.Write(text);
+        try
+        {
+            var path = System.Environment.GetEnvironmentVariable("AIDOTNET_PLAN_HISTOGRAM_FILE");
+            if (string.IsNullOrEmpty(path))
+                path = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_plan_histogram.txt");
+            System.IO.File.WriteAllText(path, text);
+        }
+        catch { /* diagnostic only — never let a histogram dump break a training run */ }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
