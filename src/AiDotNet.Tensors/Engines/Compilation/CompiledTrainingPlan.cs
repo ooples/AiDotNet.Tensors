@@ -153,6 +153,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         _lossGradSeed = lossGradSeed;
         _genericGradIndices = genericGradIndices;
         _forwardSteps = forwardSteps;
+        MaybeDumpOpHistogram(); // #639 diagnostic: AIDOTNET_PLAN_HISTOGRAM=1 dumps the replayed op profile
         // A leading "Embedding" step is an int→float gather. Capture it INSIDE the graph as a pure on-device gather
         // over a STABLE index buffer, and refresh just the small index vector before each launch (via the engine's
         // registered action, which knows the live indices tensor's TIndex) — so the whole step is one cuGraphLaunch
@@ -807,6 +808,30 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// here when AIDOTNET_DEBUG_SUB=1. Used by Pinpoint tests to inspect
     /// what the kernel sees vs writes.</summary>
     public static string SubFwdDiag = "";
+
+    private static bool s_histogramDumped;
+
+    // #639: one-time op-type histogram of the compiled forward graph. Sizes the
+    // operator-fusion prize (how many ops the plan replays per step, and which
+    // adjacencies — conv→bias→activation, residual-add, BN — are worth fusing).
+    // Gated on AIDOTNET_PLAN_HISTOGRAM=1; writes to stderr once per process.
+    private void MaybeDumpOpHistogram()
+    {
+        if (s_histogramDumped || _forwardSteps is null) return;
+        if (System.Environment.GetEnvironmentVariable("AIDOTNET_PLAN_HISTOGRAM") != "1") return;
+        s_histogramDumped = true;
+        var hist = new System.Collections.Generic.Dictionary<string, int>();
+        foreach (var s in _forwardSteps)
+        {
+            var key = s.OpName ?? s.OpType.ToString();
+            hist[key] = hist.TryGetValue(key, out var c) ? c + 1 : 1;
+        }
+        var ordered = new System.Collections.Generic.List<System.Collections.Generic.KeyValuePair<string, int>>(hist);
+        ordered.Sort((a, b) => b.Value.CompareTo(a.Value));
+        System.Console.Error.WriteLine($"[#639] compiled-plan forward op histogram — {_forwardSteps.Length} ops:");
+        foreach (var kv in ordered)
+            System.Console.Error.WriteLine($"  {kv.Value,4}  {kv.Key}");
+    }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public Tensor<T> Step()
