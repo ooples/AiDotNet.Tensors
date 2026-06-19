@@ -89,6 +89,14 @@ public static class TensorPool<T>
         // pin; the tape's cleanup walk clears it after backward.
         if (tensor._pinnedByTape) return;
 
+        // PR #638: a GPU-RESIDENT tensor (BindResidentBuffer set _gpuBuffer + a deferred host-read materializer)
+        // must NOT be pooled — but the GetLiveBackingArrayOrNull() discriminator below calls GetDataArray(), which
+        // FIRES that materializer (a DtoH download). During CUDA-graph capture that download is a non-capturable
+        // CUDA-900 that aborts the whole-step capture (the LAST blocker after every backward grad went resident:
+        // NegateBackward pool-returns its resident negGrad). Reject resident tensors here via the _gpuBuffer FIELD
+        // (no materialization) before the downloading check.
+        if (tensor._gpuBuffer is not null) return;
+
         // Issue #338 view-safety: refuse view-tensors whose backing
         // storage is shared with another tensor (strided permute views,
         // reshape views, and offset/sliced views). Recycling such a
