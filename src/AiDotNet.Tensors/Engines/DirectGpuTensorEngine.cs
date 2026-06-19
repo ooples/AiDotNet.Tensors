@@ -5899,6 +5899,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         catch
         {
+            if (ThrowOnGpuKernelFallback) throw;
             return base.FusedConv3D(input, kernel, bias, strideD, strideH, strideW, padD, padH, padW, dilationD, dilationH, dilationW, activation);
         }
     }
@@ -6116,6 +6117,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         catch
         {
+            if (ThrowOnGpuKernelFallback) throw;
             return base.FusedConvTranspose2D(input, kernel, bias, strideH, strideW, padH, padW, outputPadH, outputPadW, activation);
         }
     }
@@ -6633,6 +6635,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         catch
         {
+            if (ThrowOnGpuKernelFallback) throw;
             return base.DepthwiseConv2D(input, kernel, stride, padding);
         }
     }
@@ -6798,6 +6801,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         catch
         {
+            if (ThrowOnGpuKernelFallback) throw;
             // Fall back to CPU on any GPU error
             return base.LocallyConnectedConv2D(input, weights, bias, stride);
         }
@@ -6854,9 +6858,21 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         catch
         {
+            if (ThrowOnGpuKernelFallback) throw;
             return base.LocallyConnectedConv2DBackwardInput(gradOutput, weights, inputShape, stride);
         }
     }
+
+    /// <summary>
+    /// Test/diagnostic hook (default <c>false</c>): when <c>true</c>, the conv / pool / attention GPU-kernel
+    /// <c>catch</c> blocks RETHROW the kernel exception instead of silently falling back to the CPU reference.
+    /// <see cref="GpuConvKernelCoverageTests"/> (in the test project) enables it so the GPU-vs-CPU accuracy gate
+    /// PROVES the GPU kernel actually ran — a kernel that threw would otherwise fall back to CPU and the
+    /// comparison would trivially pass (false green), exactly the gap that let issue #622 look "fixed" without
+    /// proof. Production leaves it <c>false</c>: the CPU fallback stays a correctness safety net for genuinely
+    /// unsupported shapes or transient launch failures.
+    /// </summary>
+    internal bool ThrowOnGpuKernelFallback { get; set; }
 
     /// <summary>
     /// GPU-accelerated locally connected 2D backward pass for weight gradients.
@@ -6908,6 +6924,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         catch
         {
+            if (ThrowOnGpuKernelFallback) throw;
             return base.LocallyConnectedConv2DBackwardWeights(gradOutput, input, weightsShape, stride);
         }
     }
@@ -7103,6 +7120,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         catch
         {
+            if (ThrowOnGpuKernelFallback) throw;
             return base.DeformableConv2D(input, kernel, offsets, mask, stride, padding, dilation);
         }
     }
@@ -7177,6 +7195,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         catch
         {
+            if (ThrowOnGpuKernelFallback) throw;
             return base.DeformableConv2DBackwardInput(gradOutput, input, kernel, offsets, mask, inputShape, stride, padding, dilation);
         }
     }
@@ -7250,6 +7269,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         catch
         {
+            if (ThrowOnGpuKernelFallback) throw;
             return base.DeformableConv2DBackwardKernel(gradOutput, input, offsets, mask, kernelShape, stride, padding, dilation);
         }
     }
@@ -7325,6 +7345,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         catch
         {
+            if (ThrowOnGpuKernelFallback) throw;
             return base.DeformableConv2DBackwardOffset(gradOutput, input, kernel, offsets, mask, stride, padding, dilation);
         }
     }
@@ -7395,6 +7416,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         catch
         {
+            if (ThrowOnGpuKernelFallback) throw;
             return base.DeformableConv2DBackwardMask(gradOutput, input, kernel, offsets, mask, stride, padding, dilation);
         }
     }
@@ -8167,6 +8189,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         catch
         {
+            if (ThrowOnGpuKernelFallback) throw;
             return base.FlashAttentionBackward(gradOutput, query, key, value, output, softmaxStats, scale, isCausal,
                 out gradQuery, out gradKey, out gradValue, attentionBias);
         }

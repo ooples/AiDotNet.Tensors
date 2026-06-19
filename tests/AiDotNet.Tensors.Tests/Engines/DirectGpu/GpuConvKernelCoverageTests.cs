@@ -23,7 +23,16 @@ public sealed class GpuConvKernelCoverageTests : IDisposable
 
     public GpuConvKernelCoverageTests()
     {
-        try { _gpu = new DirectGpuTensorEngine(); _ready = _gpu.SupportsGpu; }
+        try
+        {
+            _gpu = new DirectGpuTensorEngine();
+            _ready = _gpu.SupportsGpu;
+            // Prove the GPU kernel ACTUALLY runs: make the conv/pool/attention catch blocks rethrow instead of
+            // silently falling back to the CPU reference. Without this, a GPU kernel that threw would fall back to
+            // CPU and every GPU-vs-CPU assertion below would compare CPU-vs-CPU and trivially pass (false green) —
+            // the exact gap that left issue #622 looking "fixed" without proof.
+            if (_gpu is not null) _gpu.ThrowOnGpuKernelFallback = true;
+        }
         catch { _ready = false; }
     }
 
