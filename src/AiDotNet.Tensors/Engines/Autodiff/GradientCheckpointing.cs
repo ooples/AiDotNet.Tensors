@@ -88,7 +88,17 @@ public static class GradientCheckpointing<T>
                     using var recomputeTape = new GradientTape<T>(
                         new GradientTapeOptions { Persistent = false });
                     var reInput = inputs[0];
-                    var reOutput = reInput;
+                    // Detach the segment input so the recompute graph is SELF-CONTAINED: its backward
+                    // stops at the segment boundary instead of following reInput's producer into an
+                    // EARLIER checkpoint segment. Without this, ComputeGradients(sources: null) below
+                    // re-enters the previous segment's recompute (nested) and scatters its gradients,
+                    // which the outer reverse walk then ALSO computes — double-counting every earlier
+                    // segment's gradients (2x with two segments; (N-i)x for segment i of N). This
+                    // mirrors torch.utils.checkpoint's detach_variable(inputs). StopGradient returns a
+                    // fresh leaf (data copy, no GradFn); the input gradient it produces is remapped
+                    // back onto the original reInput tensor when scattering below.
+                    var reInputDetached = eng.StopGradient(reInput);
+                    var reOutput = reInputDetached;
                     for (int i = capturedStart; i < capturedEnd; i++)
                         reOutput = capturedFunctions[i](reOutput);
 
@@ -130,29 +140,21 @@ public static class GradientCheckpointing<T>
                     var pseudoLoss = eng.ReduceSum(weighted);
 
                     // Differentiate the recomputed segment w.r.t. EVERY leaf it touched — the
-                    // segment input AND every weight/parameter the segment's functions read —
-                    // not just the input. PyTorch's torch.utils.checkpoint backpropagates the
+                    // (detached) segment input AND every weight/parameter the segment's functions
+                    // read — not just the input. PyTorch's torch.utils.checkpoint backpropagates the
                     // recomputed forward through all inputs that require grad, including module
-                    // parameters; an earlier version requested only `reInput`, so the WEIGHT
-                    // gradients of every checkpointed layer were silently dropped — the outer
-                    // ComputeGradients then found no gradient for those params and they never
-                    // updated (checkpointed layers did not learn; ~half of a Transformer's
-                    // parameters diverged from the eager update). `sources: null` differentiates
-                    // the whole recomputed graph.
+                    // parameters; an earlier version requested only `reInput`, so the WEIGHT gradients
+                    // of every checkpointed layer were silently dropped and checkpointed layers never
+                    // learned. `sources: null` differentiates the whole recomputed graph.
                     //
-                    // Scattering correctness: the outer forward ran this segment under NoGrad
-                    // (its ops were never recorded on the outer tape), so this recompute is the
-                    // ONLY place the segment's gradient contributions exist — there is no double
-                    // counting. Accumulating each leaf's grad into the outer `grads` accumulator
-                    // is therefore exactly right: the segment input and parameters are the same
-                    // tensor instances the caller looks up, and any captured upstream tensor gets
-                    // its segment-side contribution propagated further when the outer reverse walk
-                    // reaches that tensor's producer (the segment entry is processed before its
-                    // producers in reverse order). The recompute's throwaway intermediates are
-                    // fresh instances the caller never queries — harmless. The sole exclusion is
-                    // gradOutput: an outer-tape constant folded into the pseudo-loss only to seed
-                    // the VJP, whose inner "gradient" (== reOutput) is not a real gradient and
-                    // must not leak back onto the outer tape.
+                    // Scattering correctness: the input was detached above, so this recompute graph is
+                    // self-contained — its only leaves are the detached input and the segment's own
+                    // parameters; it does NOT reach into earlier segments, so each leaf is computed
+                    // exactly once and the outer reverse walk computes earlier segments exactly once
+                    // too (no double counting). The recompute's throwaway intermediates are fresh
+                    // instances the caller never queries — harmless. The sole exclusion is gradOutput:
+                    // an outer-tape constant folded into the pseudo-loss only to seed the VJP, whose
+                    // inner "gradient" (== reOutput) is not a real gradient and must not leak back.
                     var segGrads = recomputeTape.ComputeGradients(pseudoLoss, sources: null);
 
                     bool accumulatedAny = false;
@@ -160,7 +162,11 @@ public static class GradientCheckpointing<T>
                     {
                         if (ReferenceEquals(kvp.Key, gradOutput)) continue;
                         if (kvp.Value is null) continue;
-                        DifferentiableOps.AccumulateGrad(grads, kvp.Key, kvp.Value, eng);
+                        // The detached input's gradient belongs to the ORIGINAL segment-input tensor
+                        // the caller tracks (and that the outer walk hands to the previous segment);
+                        // remap it. Every other key is a live parameter the segment read directly.
+                        var key = ReferenceEquals(kvp.Key, reInputDetached) ? reInput : kvp.Key;
+                        DifferentiableOps.AccumulateGrad(grads, key, kvp.Value, eng);
                         accumulatedAny = true;
                     }
 
@@ -169,9 +175,11 @@ public static class GradientCheckpointing<T>
                     // equality is the only safe alias predicate — it covers the empty-segment case
                     // without false positives on shape coincidence. For a genuinely input-
                     // independent segment, leaving grads[input] untouched (zero) is the correct VJP.
-                    if (!accumulatedAny && ReferenceEquals(reOutput, reInput))
+                    if (!accumulatedAny && ReferenceEquals(reOutput, reInputDetached))
                     {
-                        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradOutput, eng);
+                        // Empty / no-op segment (no functions ran): pass the upstream gradient straight
+                        // through to the original input.
+                        DifferentiableOps.AccumulateGrad(grads, reInput, gradOutput, eng);
                     }
                 });
 
