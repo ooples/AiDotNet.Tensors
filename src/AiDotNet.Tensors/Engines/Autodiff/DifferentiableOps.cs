@@ -462,6 +462,13 @@ internal static class DifferentiableOps
         // preserves graph connectivity through the original grad
         // reference. Keep the original `grad` for the out-of-place
         // path; only materialize for in-place add storage.
+        if (Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") == "1"
+            && engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine gde && gde.ResidentStepActive)
+        {
+            Tensor<T>? exi = grads.TryGetValue(tensor, out var ed) ? ed : null;
+            try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_graphcapture_diag.txt"),
+                $"[ALIAS] accumgrad op={AiDotNet.Tensors.Engines.DirectGpuTensorEngine.s_currentBackwardOp} len={grad.Length}: gradRes={grad.TryGetGpuBuffer() is not null} gradContig={grad.IsContiguous} existRes={(exi?.TryGetGpuBuffer() is not null)}" + System.Environment.NewLine); } catch { }
+        }
         var gradForInPlace = grad.IsContiguous ? grad : grad.Contiguous();
 
         // Fast path: use indexed array when grad indices are assigned (avoids hash lookup)

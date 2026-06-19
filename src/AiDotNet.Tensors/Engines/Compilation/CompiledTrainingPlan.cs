@@ -712,6 +712,17 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         }
 
         int esz = System.Runtime.CompilerServices.Unsafe.SizeOf<T>();
+        // PR #638 A1: bind a STABLE resident GPU buffer to every pre-allocated gradient accumulator (the generic
+        // backward accumulates into gradMap[input] in place; without a resident buffer that accumulator lived on
+        // the host and every TensorAddInPlace downloaded it → CUDA-900 abort). Allocate ONLY in the not-capturing
+        // pre-pass; during capture/replay the buffers already exist and we just memset + accumulate in place.
+        var residentEngine = engine as Engines.DirectGpuTensorEngine;
+        bool capturingNow = cb.IsStreamCapturing();
+        if (residentEngine is not null && !capturingNow)
+        {
+            for (int i = 0; i < _preAllocatedGrads.Length; i++)
+                residentEngine.EnsureResidentBuffer(_preAllocatedGrads[i]);
+        }
         if (_genericGradIndices != null)
         {
             for (int i = 0; i < _genericGradIndices.Length; i++)

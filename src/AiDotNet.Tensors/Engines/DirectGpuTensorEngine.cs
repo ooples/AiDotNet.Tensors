@@ -3159,6 +3159,31 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         });
     }
 
+    /// <summary>PR #638 A1: ensure tensor `t` has a STABLE resident GPU buffer (allocate + bind once if it has none),
+    /// so the compiled backward's pre-allocated gradient accumulators are device-resident before capture. Idempotent:
+    /// returns the existing resident buffer when already bound. MUST be called OUTSIDE stream capture (it may allocate);
+    /// the compiled plan calls it from the not-capturing pre-pass so capture/replay only memset + accumulate in place.
+    /// Returns null if no backend or non-float (the resident paths are float-only).</summary>
+    internal IGpuBuffer? EnsureResidentBuffer<T>(Tensor<T> t)
+    {
+        if (typeof(T) != typeof(float) || !TryGetBackend(out var backend)) return null;
+        int need = t.Length;
+        if (t._gpuBuffer is not null && ReferenceEquals(t._gpuBackend, backend)
+            && t._gpuBuffer.Handle != System.IntPtr.Zero && t._gpuBuffer.Size >= need)
+            return t._gpuBuffer;
+        var resident = t.TryGetGpuBuffer();
+        if (resident is not null && resident.Handle != System.IntPtr.Zero && resident.Size >= need)
+            return resident;
+        try
+        {
+            var buf = backend.AllocateBuffer(need);
+            if (buf is null || buf.Handle == System.IntPtr.Zero) return null;
+            BindResidentBuffer(t, buf, backend);
+            return buf;
+        }
+        catch (Exception ex) { AliasDiag($"EnsureResidentBuffer FELLBACK len={need}: {ex.GetType().Name}: {ex.Message}"); return null; }
+    }
+
     // Stable per-LayerNorm mean/variance scratch buffers (keyed by the LN output's backing array), allocated
     // once so capture/replay don't cuMemAlloc them. The backward reads these (resident) via the state ref.
     private readonly System.Collections.Concurrent.ConcurrentDictionary<object, (IGpuBuffer mean, IGpuBuffer var)> _lnStatsScratch = new();
