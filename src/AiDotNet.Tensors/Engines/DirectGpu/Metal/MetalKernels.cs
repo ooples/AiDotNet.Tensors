@@ -2575,6 +2575,59 @@ kernel void global_avgpool(
     }
     output[b * channels + c] = sum / float(spatial_size);
 }
+
+// Transposed 2D convolution (gather form): one thread per output element, accumulating over the input
+// positions that scatter into it. Mirrors the verified OpenCL/CUDA conv_transpose2d math. Output-pad
+// rows/cols naturally compute 0 (no valid input maps to them), so outputPad needs no special handling.
+// weights layout: [inChannels, outChannels, kH, kW].
+kernel void conv_transpose2d(
+    device const float* inp [[buffer(0)]],
+    device const float* wgt [[buffer(1)]],
+    device float* outp [[buffer(2)]],
+    constant uint& batch [[buffer(3)]],
+    constant uint& inChannels [[buffer(4)]],
+    constant uint& inHeight [[buffer(5)]],
+    constant uint& inWidth [[buffer(6)]],
+    constant uint& outChannels [[buffer(7)]],
+    constant uint& outHeight [[buffer(8)]],
+    constant uint& outWidth [[buffer(9)]],
+    constant uint& kernelH [[buffer(10)]],
+    constant uint& kernelW [[buffer(11)]],
+    constant uint& strideH [[buffer(12)]],
+    constant uint& strideW [[buffer(13)]],
+    constant uint& padH [[buffer(14)]],
+    constant uint& padW [[buffer(15)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint total = batch * outChannels * outHeight * outWidth;
+    if (gid >= total) return;
+    uint idx = gid;
+    uint ow = idx % outWidth;
+    uint t = idx / outWidth;
+    uint oh = t % outHeight;
+    t = t / outHeight;
+    uint oc = t % outChannels;
+    uint b = t / outChannels;
+    float sum = 0.0f;
+    for (uint ic = 0; ic < inChannels; ic++) {
+        for (uint kh = 0; kh < kernelH; kh++) {
+            for (uint kw = 0; kw < kernelW; kw++) {
+                int ihBase = int(oh + padH) - int(kh);
+                int iwBase = int(ow + padW) - int(kw);
+                if ((ihBase % int(strideH)) == 0 && (iwBase % int(strideW)) == 0) {
+                    int ih = ihBase / int(strideH);
+                    int iw = iwBase / int(strideW);
+                    if (ih >= 0 && ih < int(inHeight) && iw >= 0 && iw < int(inWidth)) {
+                        float inVal = inp[((b * inChannels + ic) * inHeight + uint(ih)) * inWidth + uint(iw)];
+                        float wVal = wgt[((ic * outChannels + oc) * kernelH + kh) * kernelW + kw];
+                        sum += inVal * wVal;
+                    }
+                }
+            }
+        }
+    }
+    outp[((b * outChannels + oc) * outHeight + oh) * outWidth + ow] = sum;
+}
 ";
 
     #endregion

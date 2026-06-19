@@ -260,6 +260,62 @@ public sealed unsafe partial class VulkanBackend
         UploadToBuffer(outp, output);
     }
 
+    // GLSL conv-transpose mirrors the verified OpenCL `conv_transpose2d` gather kernel: each thread owns one
+    // output element and accumulates over the input positions that scatter into it. Output-pad rows/cols naturally
+    // resolve to 0 (no valid input maps to them), so outputPadH/W need no special handling — matching OpenCL/CUDA.
+    private const string ConvTranspose2DGlsl = @"#version 450
+layout(local_size_x = 256) in;
+layout(set=0, binding=0) buffer B0 { float inp[]; };
+layout(set=0, binding=1) buffer B1 { float wgt[]; };
+layout(set=0, binding=2) buffer B2 { float outp[]; };
+layout(push_constant) uniform PC {
+    int batch;
+    int inChannels;
+    int inHeight;
+    int inWidth;
+    int outChannels;
+    int outHeight;
+    int outWidth;
+    int kernelH;
+    int kernelW;
+    int strideH;
+    int strideW;
+    int padH;
+    int padW;
+};
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    int total = batch * outChannels * outHeight * outWidth;
+    if (gid >= uint(total)) return;
+    int idx = int(gid);
+    int ow = idx % outWidth;
+    int t = idx / outWidth;
+    int oh = t % outHeight;
+    t = t / outHeight;
+    int oc = t % outChannels;
+    int b = t / outChannels;
+    float sum = 0.0;
+    for (int ic = 0; ic < inChannels; ic++) {
+        for (int kh = 0; kh < kernelH; kh++) {
+            for (int kw = 0; kw < kernelW; kw++) {
+                int ihBase = oh + padH - kh;
+                int iwBase = ow + padW - kw;
+                if ((ihBase % strideH) == 0 && (iwBase % strideW) == 0) {
+                    int ih = ihBase / strideH;
+                    int iw = iwBase / strideW;
+                    if (ih >= 0 && ih < inHeight && iw >= 0 && iw < inWidth) {
+                        float inVal = inp[((b * inChannels + ic) * inHeight + ih) * inWidth + iw];
+                        // weights layout [inChannels, outChannels, kH, kW]
+                        float wVal = wgt[((ic * outChannels + oc) * kernelH + kh) * kernelW + kw];
+                        sum += inVal * wVal;
+                    }
+                }
+            }
+        }
+    }
+    outp[((b * outChannels + oc) * outHeight + oh) * outWidth + ow] = sum;
+}";
+
     public void ConvTranspose2D(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer output,
         int batch, int inChannels, int inHeight, int inWidth,
         int outChannels, int outHeight, int outWidth,
@@ -268,12 +324,43 @@ public sealed unsafe partial class VulkanBackend
         int outputPadH, int outputPadW)
     {
         EnsureInitialized();
+
+        // GPU path: real GLSL compute kernel. Requires libshaderc for runtime GLSL→SPIR-V; GetOrCreateGlslPipeline
+        // returns null when it is unavailable, in which case we fall through to the CPU reference below. Any launch
+        // failure also degrades to CPU so results stay correct (issue #646).
+        try
+        {
+            var pipeline = GetOrCreateGlslPipeline(ConvTranspose2DGlsl, 3, 13u * sizeof(uint));
+            if (pipeline is not null)
+            {
+                int total = batch * outChannels * outHeight * outWidth;
+                var pc = new uint[]
+                {
+                    (uint)batch, (uint)inChannels, (uint)inHeight, (uint)inWidth,
+                    (uint)outChannels, (uint)outHeight, (uint)outWidth,
+                    (uint)kernelH, (uint)kernelW, (uint)strideH, (uint)strideW, (uint)padH, (uint)padW
+                };
+                var threadRes = _device.AcquireThreadResources();
+                lock (_computeLock)
+                {
+                    pipeline.UpdateDescriptorSet(AsVulkan(input).Storage, AsVulkan(kernel).Storage, AsVulkan(output).Storage);
+                    RecordAndExecuteWithPushData(pipeline, total, pc, 13u * sizeof(uint), threadRes);
+                }
+                return;
+            }
+        }
+        catch
+        {
+            // fall through to the CPU reference
+        }
+
+        // CPU fallback (correctness safety net when the GPU kernel is unavailable / fails to launch).
         var inp = DownloadBuffer(input);
         var ker = DownloadBuffer(kernel);
         // Output padding restricts valid output range (adds extra rows/columns to one side)
         int effectiveOutH = outHeight - outputPadH;
         int effectiveOutW = outWidth - outputPadW;
-        var outp = new float[batch * outChannels * outHeight * outWidth];
+        var outpArr = new float[batch * outChannels * outHeight * outWidth];
         for (int b = 0; b < batch; b++)
             for (int ic = 0; ic < inChannels; ic++)
                 for (int ih = 0; ih < inHeight; ih++)
@@ -287,11 +374,11 @@ public sealed unsafe partial class VulkanBackend
                                     int oh = ih * strideH - padH + kh;
                                     int ow = iw * strideW - padW + kw;
                                     if (oh >= 0 && oh < effectiveOutH && ow >= 0 && ow < effectiveOutW)
-                                        outp[((b * outChannels + oc) * outHeight + oh) * outWidth + ow]
+                                        outpArr[((b * outChannels + oc) * outHeight + oh) * outWidth + ow]
                                             += val * ker[((ic * outChannels + oc) * kernelH + kh) * kernelW + kw];
                                 }
                     }
-        UploadToBuffer(outp, output);
+        UploadToBuffer(outpArr, output);
     }
 
     public void ConvTranspose2DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer kernel, IGpuBuffer gradInput,

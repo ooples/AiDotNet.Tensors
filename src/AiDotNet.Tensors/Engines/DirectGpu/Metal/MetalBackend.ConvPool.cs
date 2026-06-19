@@ -372,6 +372,45 @@ public sealed partial class MetalBackend
         int outputPadH, int outputPadW)
     {
         ThrowIfDisposed();
+
+        // GPU path: real MSL conv_transpose2d kernel (gather form, one thread per output element). Falls back to
+        // the CPU reference on any failure so results stay correct (issue #646).
+        try
+        {
+            if (input is MetalGpuBuffer inBuf && kernel is MetalGpuBuffer wBuf && output is MetalGpuBuffer outBuf
+                && _convolutionLibrary != IntPtr.Zero)
+            {
+                var pipeline = GetPipeline("Convolution", _convolutionLibrary, "conv_transpose2d");
+                int total = batch * outChannels * outHeight * outWidth;
+                var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(total);
+                using var encoder = _commandQueue.CreateScopedComputeEncoder();
+                encoder.SetPipelineState(pipeline.Handle);
+                encoder.SetBuffer(inBuf, 0);
+                encoder.SetBuffer(wBuf, 1);
+                encoder.SetBuffer(outBuf, 2);
+                encoder.SetBytes((uint)batch, 3);
+                encoder.SetBytes((uint)inChannels, 4);
+                encoder.SetBytes((uint)inHeight, 5);
+                encoder.SetBytes((uint)inWidth, 6);
+                encoder.SetBytes((uint)outChannels, 7);
+                encoder.SetBytes((uint)outHeight, 8);
+                encoder.SetBytes((uint)outWidth, 9);
+                encoder.SetBytes((uint)kernelH, 10);
+                encoder.SetBytes((uint)kernelW, 11);
+                encoder.SetBytes((uint)strideH, 12);
+                encoder.SetBytes((uint)strideW, 13);
+                encoder.SetBytes((uint)padH, 14);
+                encoder.SetBytes((uint)padW, 15);
+                encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+                return;
+            }
+        }
+        catch
+        {
+            // fall through to the CPU reference
+        }
+
+        // CPU fallback (correctness safety net when the GPU kernel is unavailable / fails to launch).
         var inp = DownloadBuffer(input);
         var kern = DownloadBuffer(kernel);
         var result = new float[batch * outChannels * outHeight * outWidth];
