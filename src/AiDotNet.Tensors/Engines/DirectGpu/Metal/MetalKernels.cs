@@ -2628,6 +2628,259 @@ kernel void conv_transpose2d(
     }
     outp[((b * outChannels + oc) * outHeight + oh) * outWidth + ow] = sum;
 }
+
+// ---- Pooling (issue #646): all gather-form (one thread per output element; backwards scan covering outputs so
+// no atomics / zero-init are needed). Ported from the verified OpenCL pooling kernels. ----
+kernel void avgpool2d(
+    device const float* inp [[buffer(0)]], device float* outp [[buffer(1)]],
+    constant uint& batch [[buffer(2)]], constant uint& channels [[buffer(3)]],
+    constant uint& inHeight [[buffer(4)]], constant uint& inWidth [[buffer(5)]],
+    constant uint& outHeight [[buffer(6)]], constant uint& outWidth [[buffer(7)]],
+    constant uint& kernelH [[buffer(8)]], constant uint& kernelW [[buffer(9)]],
+    constant uint& strideH [[buffer(10)]], constant uint& strideW [[buffer(11)]],
+    constant uint& padH [[buffer(12)]], constant uint& padW [[buffer(13)]],
+    constant uint& countIncludePad [[buffer(14)]], uint gid [[thread_position_in_grid]])
+{
+    uint total = batch * channels * outHeight * outWidth;
+    if (gid >= total) return;
+    int idx = int(gid);
+    int ow = idx % int(outWidth); int t = idx / int(outWidth);
+    int oh = t % int(outHeight); t = t / int(outHeight);
+    int c = t % int(channels); int b = t / int(channels);
+    float sum = 0.0f; int count = 0;
+    for (int kh = 0; kh < int(kernelH); kh++) for (int kw = 0; kw < int(kernelW); kw++) {
+        int ih = oh * int(strideH) - int(padH) + kh;
+        int iw = ow * int(strideW) - int(padW) + kw;
+        if (ih >= 0 && ih < int(inHeight) && iw >= 0 && iw < int(inWidth)) {
+            sum += inp[((b * int(channels) + c) * int(inHeight) + ih) * int(inWidth) + iw]; count++;
+        } else if (countIncludePad != 0u) { count++; }
+    }
+    int divisor = (countIncludePad != 0u) ? int(kernelH * kernelW) : max(count, 1);
+    outp[((b * int(channels) + c) * int(outHeight) + oh) * int(outWidth) + ow] = sum / float(divisor);
+}
+
+kernel void avgpool2d_backward(
+    device const float* gradOutput [[buffer(0)]], device float* gradInput [[buffer(1)]],
+    constant uint& batch [[buffer(2)]], constant uint& channels [[buffer(3)]],
+    constant uint& inHeight [[buffer(4)]], constant uint& inWidth [[buffer(5)]],
+    constant uint& outHeight [[buffer(6)]], constant uint& outWidth [[buffer(7)]],
+    constant uint& kernelH [[buffer(8)]], constant uint& kernelW [[buffer(9)]],
+    constant uint& strideH [[buffer(10)]], constant uint& strideW [[buffer(11)]],
+    constant uint& padH [[buffer(12)]], constant uint& padW [[buffer(13)]],
+    constant uint& countIncludePad [[buffer(14)]], uint gid [[thread_position_in_grid]])
+{
+    uint total = batch * channels * inHeight * inWidth;
+    if (gid >= total) return;
+    int idx = int(gid);
+    int iw = idx % int(inWidth); int t = idx / int(inWidth);
+    int ih = t % int(inHeight); t = t / int(inHeight);
+    int c = t % int(channels); int b = t / int(channels);
+    float sum = 0.0f;
+    for (int oh = 0; oh < int(outHeight); oh++) for (int ow = 0; ow < int(outWidth); ow++) {
+        int hStart = oh * int(strideH) - int(padH); int wStart = ow * int(strideW) - int(padW);
+        int hEnd = hStart + int(kernelH); int wEnd = wStart + int(kernelW);
+        if (ih >= hStart && ih < hEnd && iw >= wStart && iw < wEnd) {
+            int poolSize;
+            if (countIncludePad != 0u) poolSize = int(kernelH * kernelW);
+            else { int hs = max(hStart,0); int he = min(hEnd,int(inHeight)); int ws = max(wStart,0); int we = min(wEnd,int(inWidth)); poolSize = (he-hs)*(we-ws); }
+            sum += gradOutput[((b * int(channels) + c) * int(outHeight) + oh) * int(outWidth) + ow] / float(max(poolSize,1));
+        }
+    }
+    gradInput[((b * int(channels) + c) * int(inHeight) + ih) * int(inWidth) + iw] = sum;
+}
+
+kernel void maxpool2d(
+    device const float* inp [[buffer(0)]], device float* outp [[buffer(1)]], device int* indices [[buffer(2)]],
+    constant uint& batch [[buffer(3)]], constant uint& channels [[buffer(4)]],
+    constant uint& inHeight [[buffer(5)]], constant uint& inWidth [[buffer(6)]],
+    constant uint& outHeight [[buffer(7)]], constant uint& outWidth [[buffer(8)]],
+    constant uint& kernelH [[buffer(9)]], constant uint& kernelW [[buffer(10)]],
+    constant uint& strideH [[buffer(11)]], constant uint& strideW [[buffer(12)]],
+    constant uint& padH [[buffer(13)]], constant uint& padW [[buffer(14)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint total = batch * channels * outHeight * outWidth;
+    if (gid >= total) return;
+    int idx = int(gid);
+    int ow = idx % int(outWidth); int t = idx / int(outWidth);
+    int oh = t % int(outHeight); t = t / int(outHeight);
+    int c = t % int(channels); int b = t / int(channels);
+    float maxVal = -3.402823466e+38f; int maxIdx = 0;
+    for (int kh = 0; kh < int(kernelH); kh++) for (int kw = 0; kw < int(kernelW); kw++) {
+        int ih = oh * int(strideH) - int(padH) + kh; int iw = ow * int(strideW) - int(padW) + kw;
+        if (ih >= 0 && ih < int(inHeight) && iw >= 0 && iw < int(inWidth)) {
+            float v = inp[((b * int(channels) + c) * int(inHeight) + ih) * int(inWidth) + iw];
+            if (v > maxVal) { maxVal = v; maxIdx = ih * int(inWidth) + iw; }
+        }
+    }
+    int oIdx = ((b * int(channels) + c) * int(outHeight) + oh) * int(outWidth) + ow;
+    outp[oIdx] = maxVal; indices[oIdx] = maxIdx;
+}
+
+kernel void maxpool2d_backward(
+    device const float* gradOutput [[buffer(0)]], device const int* indices [[buffer(1)]], device float* gradInput [[buffer(2)]],
+    constant uint& batch [[buffer(3)]], constant uint& channels [[buffer(4)]],
+    constant uint& inHeight [[buffer(5)]], constant uint& inWidth [[buffer(6)]],
+    constant uint& outHeight [[buffer(7)]], constant uint& outWidth [[buffer(8)]],
+    constant uint& kernelH [[buffer(9)]], constant uint& kernelW [[buffer(10)]],
+    constant uint& strideH [[buffer(11)]], constant uint& strideW [[buffer(12)]],
+    constant uint& padH [[buffer(13)]], constant uint& padW [[buffer(14)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint total = batch * channels * inHeight * inWidth;
+    if (gid >= total) return;
+    int idx = int(gid);
+    int iw = idx % int(inWidth); int t = idx / int(inWidth);
+    int ih = t % int(inHeight); t = t / int(inHeight);
+    int c = t % int(channels); int b = t / int(channels);
+    int myFlat = ih * int(inWidth) + iw;
+    float sum = 0.0f;
+    for (int oh = 0; oh < int(outHeight); oh++) for (int ow = 0; ow < int(outWidth); ow++) {
+        int hStart = oh * int(strideH) - int(padH); int wStart = ow * int(strideW) - int(padW);
+        if (ih >= hStart && ih < hStart + int(kernelH) && iw >= wStart && iw < wStart + int(kernelW)) {
+            int oIdx = ((b * int(channels) + c) * int(outHeight) + oh) * int(outWidth) + ow;
+            if (indices[oIdx] == myFlat) sum += gradOutput[oIdx];
+        }
+    }
+    gradInput[idx] = sum;
+}
+
+kernel void global_avgpool2d(
+    device const float* inp [[buffer(0)]], device float* outp [[buffer(1)]],
+    constant uint& batch [[buffer(2)]], constant uint& channels [[buffer(3)]],
+    constant uint& height [[buffer(4)]], constant uint& width [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint total = batch * channels;
+    if (gid >= total) return;
+    int idx = int(gid); int c = idx % int(channels); int b = idx / int(channels);
+    float sum = 0.0f; int sp = int(height * width);
+    for (int i = 0; i < sp; i++) sum += inp[(b * int(channels) + c) * sp + i];
+    outp[b * int(channels) + c] = sum / float(sp);
+}
+
+kernel void global_avgpool2d_backward(
+    device const float* gradOutput [[buffer(0)]], device float* gradInput [[buffer(1)]],
+    constant uint& batch [[buffer(2)]], constant uint& channels [[buffer(3)]],
+    constant uint& height [[buffer(4)]], constant uint& width [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+    int sp = int(height * width); uint total = batch * channels * uint(sp);
+    if (gid >= total) return;
+    int idx = int(gid); int c = (idx / sp) % int(channels); int b = idx / (int(channels) * sp);
+    gradInput[idx] = gradOutput[b * int(channels) + c] / float(sp);
+}
+
+kernel void global_maxpool2d_noidx(
+    device const float* inp [[buffer(0)]], device float* outp [[buffer(1)]],
+    constant uint& batch [[buffer(2)]], constant uint& channels [[buffer(3)]],
+    constant uint& height [[buffer(4)]], constant uint& width [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint total = batch * channels;
+    if (gid >= total) return;
+    int idx = int(gid); int c = idx % int(channels); int b = idx / int(channels);
+    float m = -3.402823466e+38f; int sp = int(height * width);
+    for (int i = 0; i < sp; i++) m = max(m, inp[(b * int(channels) + c) * sp + i]);
+    outp[b * int(channels) + c] = m;
+}
+
+kernel void global_maxpool2d(
+    device const float* inp [[buffer(0)]], device float* outp [[buffer(1)]], device int* indices [[buffer(2)]],
+    constant uint& batch [[buffer(3)]], constant uint& channels [[buffer(4)]],
+    constant uint& height [[buffer(5)]], constant uint& width [[buffer(6)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint total = batch * channels;
+    if (gid >= total) return;
+    int idx = int(gid); int c = idx % int(channels); int b = idx / int(channels);
+    float m = -3.402823466e+38f; int mi = 0; int sp = int(height * width);
+    for (int i = 0; i < sp; i++) { float v = inp[(b * int(channels) + c) * sp + i]; if (v > m) { m = v; mi = i; } }
+    outp[b * int(channels) + c] = m; indices[b * int(channels) + c] = mi;
+}
+
+kernel void global_maxpool2d_backward(
+    device const float* gradOutput [[buffer(0)]], device const int* indices [[buffer(1)]], device float* gradInput [[buffer(2)]],
+    constant uint& batch [[buffer(3)]], constant uint& channels [[buffer(4)]],
+    constant uint& height [[buffer(5)]], constant uint& width [[buffer(6)]],
+    uint gid [[thread_position_in_grid]])
+{
+    int sp = int(height * width); uint total = batch * channels * uint(sp);
+    if (gid >= total) return;
+    int idx = int(gid); int pos = idx % sp; int bc = idx / sp;
+    gradInput[idx] = (indices[bc] == pos) ? gradOutput[bc] : 0.0f;
+}
+
+kernel void adaptive_avgpool2d(
+    device const float* inp [[buffer(0)]], device float* outp [[buffer(1)]],
+    constant uint& batch [[buffer(2)]], constant uint& channels [[buffer(3)]],
+    constant uint& inHeight [[buffer(4)]], constant uint& inWidth [[buffer(5)]],
+    constant uint& outHeight [[buffer(6)]], constant uint& outWidth [[buffer(7)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint total = batch * channels * outHeight * outWidth;
+    if (gid >= total) return;
+    int idx = int(gid);
+    int ow = idx % int(outWidth); int t = idx / int(outWidth);
+    int oh = t % int(outHeight); t = t / int(outHeight);
+    int c = t % int(channels); int b = t / int(channels);
+    int hS = (oh * int(inHeight)) / int(outHeight); int hE = ((oh + 1) * int(inHeight)) / int(outHeight);
+    int wS = (ow * int(inWidth)) / int(outWidth); int wE = ((ow + 1) * int(inWidth)) / int(outWidth);
+    float sum = 0.0f; int count = 0;
+    for (int ih = hS; ih < hE; ih++) for (int iw = wS; iw < wE; iw++) { sum += inp[((b * int(channels) + c) * int(inHeight) + ih) * int(inWidth) + iw]; count++; }
+    outp[((b * int(channels) + c) * int(outHeight) + oh) * int(outWidth) + ow] = sum / float(max(count, 1));
+}
+
+kernel void maxpool3d(
+    device const float* inp [[buffer(0)]], device float* outp [[buffer(1)]], device int* indices [[buffer(2)]],
+    constant uint& batch [[buffer(3)]], constant uint& channels [[buffer(4)]],
+    constant uint& inDepth [[buffer(5)]], constant uint& inHeight [[buffer(6)]], constant uint& inWidth [[buffer(7)]],
+    constant uint& outDepth [[buffer(8)]], constant uint& outHeight [[buffer(9)]], constant uint& outWidth [[buffer(10)]],
+    constant uint& kernelD [[buffer(11)]], constant uint& kernelH [[buffer(12)]], constant uint& kernelW [[buffer(13)]],
+    constant uint& strideD [[buffer(14)]], constant uint& strideH [[buffer(15)]], constant uint& strideW [[buffer(16)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint total = batch * channels * outDepth * outHeight * outWidth;
+    if (gid >= total) return;
+    int idx = int(gid);
+    int ow = idx % int(outWidth); int t = idx / int(outWidth);
+    int oh = t % int(outHeight); t = t / int(outHeight);
+    int od = t % int(outDepth); t = t / int(outDepth);
+    int c = t % int(channels); int b = t / int(channels);
+    float m = -3.402823466e+38f; int mi = 0;
+    for (int kd = 0; kd < int(kernelD); kd++) { int id = od * int(strideD) + kd; if (id >= int(inDepth)) continue;
+      for (int kh = 0; kh < int(kernelH); kh++) { int ih = oh * int(strideH) + kh; if (ih >= int(inHeight)) continue;
+        for (int kw = 0; kw < int(kernelW); kw++) { int iw = ow * int(strideW) + kw; if (iw >= int(inWidth)) continue;
+            float v = inp[((b * int(channels) + c) * int(inDepth) + id) * int(inHeight) * int(inWidth) + ih * int(inWidth) + iw];
+            if (v > m) { m = v; mi = id * int(inHeight) * int(inWidth) + ih * int(inWidth) + iw; }
+        } } }
+    int oIdx = ((b * int(channels) + c) * int(outDepth) + od) * int(outHeight) * int(outWidth) + oh * int(outWidth) + ow;
+    outp[oIdx] = m; indices[oIdx] = mi;
+}
+
+kernel void maxpool3d_backward(
+    device const float* gradOutput [[buffer(0)]], device const int* indices [[buffer(1)]], device float* gradInput [[buffer(2)]],
+    constant uint& batch [[buffer(3)]], constant uint& channels [[buffer(4)]],
+    constant uint& inDepth [[buffer(5)]], constant uint& inHeight [[buffer(6)]], constant uint& inWidth [[buffer(7)]],
+    constant uint& outDepth [[buffer(8)]], constant uint& outHeight [[buffer(9)]], constant uint& outWidth [[buffer(10)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint total = batch * channels * inDepth * inHeight * inWidth;
+    if (gid >= total) return;
+    int idx = int(gid);
+    int iw = idx % int(inWidth); int t = idx / int(inWidth);
+    int ih = t % int(inHeight); t = t / int(inHeight);
+    int id = t % int(inDepth); t = t / int(inDepth);
+    int c = t % int(channels); int b = t / int(channels);
+    int myFlat = id * int(inHeight) * int(inWidth) + ih * int(inWidth) + iw;
+    int outSp = int(outDepth) * int(outHeight) * int(outWidth);
+    float sum = 0.0f;
+    for (int o = 0; o < outSp; o++) {
+        int oIdx = (b * int(channels) + c) * outSp + o;
+        if (indices[oIdx] == myFlat) sum += gradOutput[oIdx];
+    }
+    gradInput[idx] = sum;
+}
 ";
 
     #endregion

@@ -5,6 +5,25 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 
 public sealed partial class MetalBackend
 {
+    // Shared dispatch for the conv/pool MSL kernels (issue #646): bind the buffers (indices 0..n-1) and the int
+    // params (as setBytes at indices n..), launch a 1D grid over `threads` output elements. Returns false when the
+    // library/kernel is unavailable so the caller falls back to the CPU reference. Mirrors the Gemm dispatch shape.
+    // NOTE: validated only on a Metal runner — the dev box has no Apple GPU.
+    private bool TryDispatchConvPoolMetal(System.IntPtr library, string libName, string kernelName,
+        int threads, IGpuBuffer[] buffers, int[] intParams)
+    {
+        if (threads <= 0 || library == System.IntPtr.Zero) return false;
+        foreach (var b in buffers) if (b is not MetalGpuBuffer) return false;
+        var pipeline = GetPipeline(libName, library, kernelName);
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(threads);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        for (int i = 0; i < buffers.Length; i++) encoder.SetBuffer((MetalGpuBuffer)buffers[i], i);
+        for (int i = 0; i < intParams.Length; i++) encoder.SetBytes((uint)intParams[i], (uint)(buffers.Length + i));
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+        return true;
+    }
+
     #region Convolution Operations
 
     /// <summary>
@@ -1002,6 +1021,15 @@ public sealed partial class MetalBackend
         int strideH, int strideW, int padH, int padW)
     {
         ThrowIfDisposed();
+        try
+        {
+            if (indices is not null && TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "maxpool2d",
+                batch * channels * outHeight * outWidth, new[] { input, output, indices },
+                new[] { batch, channels, inHeight, inWidth, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW }))
+                return;
+        }
+        catch { /* fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         var result = new float[batch * channels * outHeight * outWidth];
         var idxResult = indices is not null ? new float[batch * channels * outHeight * outWidth] : null;
@@ -1069,6 +1097,15 @@ public sealed partial class MetalBackend
         int strideH, int strideW, int padH, int padW)
     {
         ThrowIfDisposed();
+        try
+        {
+            if (TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "maxpool2d_backward",
+                batch * channels * inHeight * inWidth, new[] { gradOutput, indices, gradInput },
+                new[] { batch, channels, inHeight, inWidth, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW }))
+                return;
+        }
+        catch { /* fall through to CPU reference */ }
+
         var go = DownloadBuffer(gradOutput);
         var idx = DownloadBuffer(indices);
         var result = new float[batch * channels * inHeight * inWidth];
@@ -1111,6 +1148,15 @@ public sealed partial class MetalBackend
         bool countIncludePad)
     {
         ThrowIfDisposed();
+        try
+        {
+            if (TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "avgpool2d",
+                batch * channels * outHeight * outWidth, new[] { input, output },
+                new[] { batch, channels, inHeight, inWidth, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, countIncludePad ? 1 : 0 }))
+                return;
+        }
+        catch { /* fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         var result = new float[batch * channels * outHeight * outWidth];
 
@@ -1167,6 +1213,15 @@ public sealed partial class MetalBackend
         bool countIncludePad)
     {
         ThrowIfDisposed();
+        try
+        {
+            if (TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "avgpool2d_backward",
+                batch * channels * inHeight * inWidth, new[] { gradOutput, gradInput },
+                new[] { batch, channels, inHeight, inWidth, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, countIncludePad ? 1 : 0 }))
+                return;
+        }
+        catch { /* fall through to CPU reference */ }
+
         var go = DownloadBuffer(gradOutput);
         var result = new float[batch * channels * inHeight * inWidth];
 
@@ -1229,6 +1284,14 @@ public sealed partial class MetalBackend
     public void GlobalAvgPool2D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int height, int width)
     {
         ThrowIfDisposed();
+        try
+        {
+            if (TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "global_avgpool2d",
+                batch * channels, new[] { input, output }, new[] { batch, channels, height, width }))
+                return;
+        }
+        catch { /* fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         var result = new float[batch * channels];
 
@@ -1258,6 +1321,14 @@ public sealed partial class MetalBackend
     public void GlobalMaxPool2D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int height, int width)
     {
         ThrowIfDisposed();
+        try
+        {
+            if (TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "global_maxpool2d_noidx",
+                batch * channels, new[] { input, output }, new[] { batch, channels, height, width }))
+                return;
+        }
+        catch { /* fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         var result = new float[batch * channels];
 
@@ -1287,6 +1358,14 @@ public sealed partial class MetalBackend
     public void GlobalMaxPool2D(IGpuBuffer input, IGpuBuffer output, IGpuBuffer indices, int batch, int channels, int height, int width)
     {
         ThrowIfDisposed();
+        try
+        {
+            if (TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "global_maxpool2d",
+                batch * channels, new[] { input, output, indices }, new[] { batch, channels, height, width }))
+                return;
+        }
+        catch { /* fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         var result = new float[batch * channels];
         var idxResult = new float[batch * channels];
@@ -1329,6 +1408,14 @@ public sealed partial class MetalBackend
     public void GlobalAvgPool2DBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput, int batch, int channels, int height, int width)
     {
         ThrowIfDisposed();
+        try
+        {
+            if (TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "global_avgpool2d_backward",
+                batch * channels * height * width, new[] { gradOutput, gradInput }, new[] { batch, channels, height, width }))
+                return;
+        }
+        catch { /* fall through to CPU reference */ }
+
         var go = DownloadBuffer(gradOutput);
         int spatialSize = height * width;
         var result = new float[batch * channels * spatialSize];
@@ -1357,6 +1444,14 @@ public sealed partial class MetalBackend
     public void GlobalMaxPool2DBackward(IGpuBuffer gradOutput, IGpuBuffer indices, IGpuBuffer gradInput, int batch, int channels, int height, int width)
     {
         ThrowIfDisposed();
+        try
+        {
+            if (TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "global_maxpool2d_backward",
+                batch * channels * height * width, new[] { gradOutput, indices, gradInput }, new[] { batch, channels, height, width }))
+                return;
+        }
+        catch { /* fall through to CPU reference */ }
+
         var go = DownloadBuffer(gradOutput);
         var idx = DownloadBuffer(indices);
         int spatialSize = height * width;
@@ -1385,6 +1480,15 @@ public sealed partial class MetalBackend
     public void AdaptiveAvgPool2D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth)
     {
         ThrowIfDisposed();
+        try
+        {
+            if (TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "adaptive_avgpool2d",
+                batch * channels * outHeight * outWidth, new[] { input, output },
+                new[] { batch, channels, inHeight, inWidth, outHeight, outWidth }))
+                return;
+        }
+        catch { /* fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         var result = new float[batch * channels * outHeight * outWidth];
 
@@ -1434,6 +1538,15 @@ public sealed partial class MetalBackend
         int strideD, int strideH, int strideW)
     {
         ThrowIfDisposed();
+        try
+        {
+            if (indices is not null && TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "maxpool3d",
+                batch * channels * outDepth * outHeight * outWidth, new[] { input, output, indices },
+                new[] { batch, channels, inDepth, inHeight, inWidth, outDepth, outHeight, outWidth, kernelD, kernelH, kernelW, strideD, strideH, strideW }))
+                return;
+        }
+        catch { /* fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         var result = new float[batch * channels * outDepth * outHeight * outWidth];
         var idxResult = indices is not null ? new float[batch * channels * outDepth * outHeight * outWidth] : null;
@@ -1494,6 +1607,15 @@ public sealed partial class MetalBackend
         int outDepth, int outHeight, int outWidth)
     {
         ThrowIfDisposed();
+        try
+        {
+            if (TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "maxpool3d_backward",
+                batch * channels * inDepth * inHeight * inWidth, new[] { gradOutput, indices, gradInput },
+                new[] { batch, channels, inDepth, inHeight, inWidth, outDepth, outHeight, outWidth }))
+                return;
+        }
+        catch { /* fall through to CPU reference */ }
+
         var go = DownloadBuffer(gradOutput);
         var idx = DownloadBuffer(indices);
         var result = new float[batch * channels * inDepth * inHeight * inWidth];
