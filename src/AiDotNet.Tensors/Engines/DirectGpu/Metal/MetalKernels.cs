@@ -2881,6 +2881,281 @@ kernel void maxpool3d_backward(
     }
     gradInput[idx] = sum;
 }
+
+// ---- Conv family (issue #646): gather-form ports of the verified OpenCL kernels. ----
+kernel void conv2d_direct(
+    device const float* inp [[buffer(0)]], device const float* wgt [[buffer(1)]], device float* outp [[buffer(2)]],
+    constant uint& batch [[buffer(3)]], constant uint& inChannels [[buffer(4)]],
+    constant uint& inHeight [[buffer(5)]], constant uint& inWidth [[buffer(6)]],
+    constant uint& outChannels [[buffer(7)]], constant uint& outHeight [[buffer(8)]], constant uint& outWidth [[buffer(9)]],
+    constant uint& kernelH [[buffer(10)]], constant uint& kernelW [[buffer(11)]],
+    constant uint& strideH [[buffer(12)]], constant uint& strideW [[buffer(13)]],
+    constant uint& padH [[buffer(14)]], constant uint& padW [[buffer(15)]],
+    constant uint& dilationH [[buffer(16)]], constant uint& dilationW [[buffer(17)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint total = batch * outChannels * outHeight * outWidth;
+    if (gid >= total) return;
+    int idx = int(gid);
+    int ow = idx % int(outWidth); int t = idx / int(outWidth);
+    int oh = t % int(outHeight); t = t / int(outHeight);
+    int oc = t % int(outChannels); int b = t / int(outChannels);
+    float sum = 0.0f;
+    for (int ic = 0; ic < int(inChannels); ic++)
+      for (int kh = 0; kh < int(kernelH); kh++)
+        for (int kw = 0; kw < int(kernelW); kw++) {
+            int ih = oh * int(strideH) - int(padH) + kh * int(dilationH);
+            int iw = ow * int(strideW) - int(padW) + kw * int(dilationW);
+            if (ih >= 0 && ih < int(inHeight) && iw >= 0 && iw < int(inWidth))
+                sum += inp[((b * int(inChannels) + ic) * int(inHeight) + ih) * int(inWidth) + iw]
+                     * wgt[((oc * int(inChannels) + ic) * int(kernelH) + kh) * int(kernelW) + kw];
+        }
+    outp[((b * int(outChannels) + oc) * int(outHeight) + oh) * int(outWidth) + ow] = sum;
+}
+
+kernel void conv2d_backward_input(
+    device const float* gradOutput [[buffer(0)]], device const float* wgt [[buffer(1)]], device float* gradInput [[buffer(2)]],
+    constant uint& batch [[buffer(3)]], constant uint& inChannels [[buffer(4)]],
+    constant uint& inHeight [[buffer(5)]], constant uint& inWidth [[buffer(6)]],
+    constant uint& outChannels [[buffer(7)]], constant uint& outHeight [[buffer(8)]], constant uint& outWidth [[buffer(9)]],
+    constant uint& kernelH [[buffer(10)]], constant uint& kernelW [[buffer(11)]],
+    constant uint& strideH [[buffer(12)]], constant uint& strideW [[buffer(13)]],
+    constant uint& padH [[buffer(14)]], constant uint& padW [[buffer(15)]],
+    constant uint& dilationH [[buffer(16)]], constant uint& dilationW [[buffer(17)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint total = batch * inChannels * inHeight * inWidth;
+    if (gid >= total) return;
+    int idx = int(gid);
+    int iw = idx % int(inWidth); int t = idx / int(inWidth);
+    int ih = t % int(inHeight); t = t / int(inHeight);
+    int ic = t % int(inChannels); int b = t / int(inChannels);
+    float sum = 0.0f;
+    for (int oc = 0; oc < int(outChannels); oc++)
+      for (int kh = 0; kh < int(kernelH); kh++)
+        for (int kw = 0; kw < int(kernelW); kw++) {
+            int ohb = ih + int(padH) - kh * int(dilationH);
+            int owb = iw + int(padW) - kw * int(dilationW);
+            if ((ohb % int(strideH)) == 0 && (owb % int(strideW)) == 0) {
+                int oh = ohb / int(strideH); int ow = owb / int(strideW);
+                if (oh >= 0 && oh < int(outHeight) && ow >= 0 && ow < int(outWidth))
+                    sum += gradOutput[((b * int(outChannels) + oc) * int(outHeight) + oh) * int(outWidth) + ow]
+                         * wgt[((oc * int(inChannels) + ic) * int(kernelH) + kh) * int(kernelW) + kw];
+            }
+        }
+    gradInput[((b * int(inChannels) + ic) * int(inHeight) + ih) * int(inWidth) + iw] = sum;
+}
+
+kernel void conv2d_backward_weights(
+    device const float* inp [[buffer(0)]], device const float* gradOutput [[buffer(1)]], device float* gradKernel [[buffer(2)]],
+    constant uint& batch [[buffer(3)]], constant uint& inChannels [[buffer(4)]],
+    constant uint& inHeight [[buffer(5)]], constant uint& inWidth [[buffer(6)]],
+    constant uint& outChannels [[buffer(7)]], constant uint& outHeight [[buffer(8)]], constant uint& outWidth [[buffer(9)]],
+    constant uint& kernelH [[buffer(10)]], constant uint& kernelW [[buffer(11)]],
+    constant uint& strideH [[buffer(12)]], constant uint& strideW [[buffer(13)]],
+    constant uint& padH [[buffer(14)]], constant uint& padW [[buffer(15)]],
+    constant uint& dilationH [[buffer(16)]], constant uint& dilationW [[buffer(17)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint total = outChannels * inChannels * kernelH * kernelW;
+    if (gid >= total) return;
+    int idx = int(gid);
+    int kw = idx % int(kernelW); int t = idx / int(kernelW);
+    int kh = t % int(kernelH); t = t / int(kernelH);
+    int ic = t % int(inChannels); int oc = t / int(inChannels);
+    float sum = 0.0f;
+    for (int b = 0; b < int(batch); b++)
+      for (int oh = 0; oh < int(outHeight); oh++)
+        for (int ow = 0; ow < int(outWidth); ow++) {
+            int ih = oh * int(strideH) - int(padH) + kh * int(dilationH);
+            int iw = ow * int(strideW) - int(padW) + kw * int(dilationW);
+            if (ih >= 0 && ih < int(inHeight) && iw >= 0 && iw < int(inWidth))
+                sum += inp[((b * int(inChannels) + ic) * int(inHeight) + ih) * int(inWidth) + iw]
+                     * gradOutput[((b * int(outChannels) + oc) * int(outHeight) + oh) * int(outWidth) + ow];
+        }
+    gradKernel[((oc * int(inChannels) + ic) * int(kernelH) + kh) * int(kernelW) + kw] = sum;
+}
+
+kernel void depthwise_conv2d(
+    device const float* inp [[buffer(0)]], device const float* wgt [[buffer(1)]], device float* outp [[buffer(2)]],
+    constant uint& batch [[buffer(3)]], constant uint& channels [[buffer(4)]],
+    constant uint& inHeight [[buffer(5)]], constant uint& inWidth [[buffer(6)]],
+    constant uint& outHeight [[buffer(7)]], constant uint& outWidth [[buffer(8)]],
+    constant uint& kernelH [[buffer(9)]], constant uint& kernelW [[buffer(10)]],
+    constant uint& strideH [[buffer(11)]], constant uint& strideW [[buffer(12)]],
+    constant uint& padH [[buffer(13)]], constant uint& padW [[buffer(14)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint total = batch * channels * outHeight * outWidth;
+    if (gid >= total) return;
+    int idx = int(gid);
+    int ow = idx % int(outWidth); int t = idx / int(outWidth);
+    int oh = t % int(outHeight); t = t / int(outHeight);
+    int c = t % int(channels); int b = t / int(channels);
+    float sum = 0.0f;
+    for (int kh = 0; kh < int(kernelH); kh++)
+      for (int kw = 0; kw < int(kernelW); kw++) {
+          int ih = oh * int(strideH) - int(padH) + kh; int iw = ow * int(strideW) - int(padW) + kw;
+          if (ih >= 0 && ih < int(inHeight) && iw >= 0 && iw < int(inWidth))
+              sum += inp[((b * int(channels) + c) * int(inHeight) + ih) * int(inWidth) + iw]
+                   * wgt[(c * int(kernelH) + kh) * int(kernelW) + kw];
+      }
+    outp[((b * int(channels) + c) * int(outHeight) + oh) * int(outWidth) + ow] = sum;
+}
+
+// Transposed conv backward input — matches the Metal CPU reference (gather per input, full out dims,
+// kernel layout [inChannels, outChannels, kH, kW]).
+kernel void conv_transpose2d_backward_input(
+    device const float* gradOutput [[buffer(0)]], device const float* wgt [[buffer(1)]], device float* gradInput [[buffer(2)]],
+    constant uint& batch [[buffer(3)]], constant uint& inChannels [[buffer(4)]],
+    constant uint& inHeight [[buffer(5)]], constant uint& inWidth [[buffer(6)]],
+    constant uint& outChannels [[buffer(7)]], constant uint& outHeight [[buffer(8)]], constant uint& outWidth [[buffer(9)]],
+    constant uint& kernelH [[buffer(10)]], constant uint& kernelW [[buffer(11)]],
+    constant uint& strideH [[buffer(12)]], constant uint& strideW [[buffer(13)]],
+    constant uint& padH [[buffer(14)]], constant uint& padW [[buffer(15)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint total = batch * inChannels * inHeight * inWidth;
+    if (gid >= total) return;
+    int idx = int(gid);
+    int iw = idx % int(inWidth); int t = idx / int(inWidth);
+    int ih = t % int(inHeight); t = t / int(inHeight);
+    int ic = t % int(inChannels); int b = t / int(inChannels);
+    float sum = 0.0f;
+    for (int oc = 0; oc < int(outChannels); oc++)
+      for (int kh = 0; kh < int(kernelH); kh++)
+        for (int kw = 0; kw < int(kernelW); kw++) {
+            int oh = ih * int(strideH) - int(padH) + kh; int ow = iw * int(strideW) - int(padW) + kw;
+            if (oh >= 0 && oh < int(outHeight) && ow >= 0 && ow < int(outWidth))
+                sum += gradOutput[((b * int(outChannels) + oc) * int(outHeight) + oh) * int(outWidth) + ow]
+                     * wgt[((ic * int(outChannels) + oc) * int(kernelH) + kh) * int(kernelW) + kw];
+        }
+    gradInput[((b * int(inChannels) + ic) * int(inHeight) + ih) * int(inWidth) + iw] = sum;
+}
+
+// Transposed conv backward weights — matches the Metal CPU reference (full out dims; layout [inC,outC,kH,kW]).
+kernel void conv_transpose2d_backward_weights(
+    device const float* inp [[buffer(0)]], device const float* gradOutput [[buffer(1)]], device float* gradWeights [[buffer(2)]],
+    constant uint& batch [[buffer(3)]], constant uint& inChannels [[buffer(4)]],
+    constant uint& inHeight [[buffer(5)]], constant uint& inWidth [[buffer(6)]],
+    constant uint& outChannels [[buffer(7)]], constant uint& outHeight [[buffer(8)]], constant uint& outWidth [[buffer(9)]],
+    constant uint& kernelH [[buffer(10)]], constant uint& kernelW [[buffer(11)]],
+    constant uint& strideH [[buffer(12)]], constant uint& strideW [[buffer(13)]],
+    constant uint& padH [[buffer(14)]], constant uint& padW [[buffer(15)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint total = inChannels * outChannels * kernelH * kernelW;
+    if (gid >= total) return;
+    int idx = int(gid);
+    int kw = idx % int(kernelW); int t = idx / int(kernelW);
+    int kh = t % int(kernelH); t = t / int(kernelH);
+    int oc = t % int(outChannels); int ic = t / int(outChannels);
+    float sum = 0.0f;
+    for (int b = 0; b < int(batch); b++)
+      for (int ih = 0; ih < int(inHeight); ih++)
+        for (int iw = 0; iw < int(inWidth); iw++) {
+            int oh = ih * int(strideH) - int(padH) + kh; int ow = iw * int(strideW) - int(padW) + kw;
+            if (oh >= 0 && oh < int(outHeight) && ow >= 0 && ow < int(outWidth))
+                sum += inp[((b * int(inChannels) + ic) * int(inHeight) + ih) * int(inWidth) + iw]
+                     * gradOutput[((b * int(outChannels) + oc) * int(outHeight) + oh) * int(outWidth) + ow];
+        }
+    gradWeights[idx] = sum;
+}
+
+kernel void conv3d_direct(
+    device const float* inp [[buffer(0)]], device const float* wgt [[buffer(1)]], device float* outp [[buffer(2)]],
+    constant uint& batch [[buffer(3)]], constant uint& inChannels [[buffer(4)]],
+    constant uint& inDepth [[buffer(5)]], constant uint& inHeight [[buffer(6)]], constant uint& inWidth [[buffer(7)]],
+    constant uint& outChannels [[buffer(8)]], constant uint& outDepth [[buffer(9)]], constant uint& outHeight [[buffer(10)]], constant uint& outWidth [[buffer(11)]],
+    constant uint& kernelD [[buffer(12)]], constant uint& kernelH [[buffer(13)]], constant uint& kernelW [[buffer(14)]],
+    constant uint& strideD [[buffer(15)]], constant uint& strideH [[buffer(16)]], constant uint& strideW [[buffer(17)]],
+    constant uint& padD [[buffer(18)]], constant uint& padH [[buffer(19)]], constant uint& padW [[buffer(20)]],
+    constant uint& dilationD [[buffer(21)]], constant uint& dilationH [[buffer(22)]], constant uint& dilationW [[buffer(23)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint total = batch * outChannels * outDepth * outHeight * outWidth;
+    if (gid >= total) return;
+    int idx = int(gid);
+    int ow = idx % int(outWidth); int t = idx / int(outWidth);
+    int oh = t % int(outHeight); t = t / int(outHeight);
+    int od = t % int(outDepth); t = t / int(outDepth);
+    int oc = t % int(outChannels); int b = t / int(outChannels);
+    float sum = 0.0f;
+    for (int ic = 0; ic < int(inChannels); ic++)
+      for (int kd = 0; kd < int(kernelD); kd++)
+        for (int kh = 0; kh < int(kernelH); kh++)
+          for (int kw = 0; kw < int(kernelW); kw++) {
+              int id = od * int(strideD) - int(padD) + kd * int(dilationD);
+              int ih = oh * int(strideH) - int(padH) + kh * int(dilationH);
+              int iw = ow * int(strideW) - int(padW) + kw * int(dilationW);
+              if (id >= 0 && id < int(inDepth) && ih >= 0 && ih < int(inHeight) && iw >= 0 && iw < int(inWidth))
+                  sum += inp[(((b * int(inChannels) + ic) * int(inDepth) + id) * int(inHeight) + ih) * int(inWidth) + iw]
+                       * wgt[(((oc * int(inChannels) + ic) * int(kernelD) + kd) * int(kernelH) + kh) * int(kernelW) + kw];
+          }
+    outp[(((b * int(outChannels) + oc) * int(outDepth) + od) * int(outHeight) + oh) * int(outWidth) + ow] = sum;
+}
+
+// Unfold (Metal column layout [b, (c*kH+ki)*kW+kj, outH*outW], no dilation) — one thread per column element.
+kernel void unfold(
+    device const float* inp [[buffer(0)]], device float* outp [[buffer(1)]],
+    constant uint& batch [[buffer(2)]], constant uint& channels [[buffer(3)]],
+    constant uint& height [[buffer(4)]], constant uint& width [[buffer(5)]],
+    constant uint& kernelH [[buffer(6)]], constant uint& kernelW [[buffer(7)]],
+    constant uint& strideH [[buffer(8)]], constant uint& strideW [[buffer(9)]],
+    constant uint& padH [[buffer(10)]], constant uint& padW [[buffer(11)]],
+    uint gid [[thread_position_in_grid]])
+{
+    int outH = (int(height) + 2 * int(padH) - int(kernelH)) / int(strideH) + 1;
+    int outW = (int(width) + 2 * int(padW) - int(kernelW)) / int(strideW) + 1;
+    int colLen = outH * outW; int colCh = int(channels) * int(kernelH) * int(kernelW);
+    uint total = batch * uint(colCh) * uint(colLen);
+    if (gid >= total) return;
+    int idx = int(gid);
+    int b = idx / (colCh * colLen); int r = idx % (colCh * colLen);
+    int colRow = r / colLen; int pos = r % colLen;
+    int oh = pos / outW; int ow = pos % outW;
+    int c = colRow / (int(kernelH) * int(kernelW)); int k = colRow % (int(kernelH) * int(kernelW));
+    int ki = k / int(kernelW); int kj = k % int(kernelW);
+    int ih = oh * int(strideH) + ki - int(padH); int iw = ow * int(strideW) + kj - int(padW);
+    float val = 0.0f;
+    if (ih >= 0 && ih < int(height) && iw >= 0 && iw < int(width))
+        val = inp[(b * int(channels) + c) * int(height) * int(width) + ih * int(width) + iw];
+    outp[idx] = val;
+}
+
+// Fold (Metal column layout, gather per output pixel — race-free inverse of unfold's scatter).
+kernel void fold(
+    device const float* inp [[buffer(0)]], device float* outp [[buffer(1)]],
+    constant uint& batch [[buffer(2)]], constant uint& channels [[buffer(3)]],
+    constant uint& outputH [[buffer(4)]], constant uint& outputW [[buffer(5)]],
+    constant uint& kernelH [[buffer(6)]], constant uint& kernelW [[buffer(7)]],
+    constant uint& strideH [[buffer(8)]], constant uint& strideW [[buffer(9)]],
+    constant uint& padH [[buffer(10)]], constant uint& padW [[buffer(11)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint total = batch * channels * outputH * outputW;
+    if (gid >= total) return;
+    int idx = int(gid);
+    int iw = idx % int(outputW); int t = idx / int(outputW);
+    int ih = t % int(outputH); t = t / int(outputH);
+    int c = t % int(channels); int b = t / int(channels);
+    int unfoldH = (int(outputH) + 2 * int(padH) - int(kernelH)) / int(strideH) + 1;
+    int unfoldW = (int(outputW) + 2 * int(padW) - int(kernelW)) / int(strideW) + 1;
+    int colLen = unfoldH * unfoldW; int colCh = int(channels) * int(kernelH) * int(kernelW);
+    float sum = 0.0f;
+    for (int ki = 0; ki < int(kernelH); ki++)
+      for (int kj = 0; kj < int(kernelW); kj++) {
+          int ohn = ih - ki + int(padH); int own = iw - kj + int(padW);
+          if ((ohn % int(strideH)) == 0 && (own % int(strideW)) == 0) {
+              int oh = ohn / int(strideH); int ow = own / int(strideW);
+              if (oh >= 0 && oh < unfoldH && ow >= 0 && ow < unfoldW) {
+                  int colRow = (c * int(kernelH) + ki) * int(kernelW) + kj;
+                  sum += inp[b * colCh * colLen + colRow * colLen + oh * unfoldW + ow];
+              }
+          }
+      }
+    outp[idx] = sum;
+}
 ";
 
     #endregion

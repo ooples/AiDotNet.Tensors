@@ -37,6 +37,14 @@ public sealed partial class MetalBackend
         int dilationH, int dilationW)
     {
         ThrowIfDisposed();
+        try
+        {
+            if (TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "conv2d_direct",
+                batch * outChannels * outHeight * outWidth, new[] { input, kernel, output },
+                new[] { batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW }))
+                return;
+        }
+        catch { /* fall through to CPU reference */ }
         // CPU fallback - proper Metal implementation would use MPSNDArrayMatrixMultiplication or custom kernel
         var inp = DownloadBuffer(input);
         var kern = DownloadBuffer(kernel);
@@ -96,6 +104,14 @@ public sealed partial class MetalBackend
         int dilationH, int dilationW)
     {
         ThrowIfDisposed();
+        try
+        {
+            if (TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "conv2d_backward_input",
+                batch * inChannels * inHeight * inWidth, new[] { gradOutput, kernel, gradInput },
+                new[] { batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW }))
+                return;
+        }
+        catch { /* fall through to CPU reference */ }
         // CPU fallback
         var go = DownloadBuffer(gradOutput);
         var kern = DownloadBuffer(kernel);
@@ -159,6 +175,15 @@ public sealed partial class MetalBackend
         int dilationH, int dilationW)
     {
         ThrowIfDisposed();
+        try
+        {
+            if (TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "conv2d_backward_weights",
+                outChannels * inChannels * kernelH * kernelW, new[] { input, gradOutput, gradKernel },
+                new[] { batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW }))
+                return;
+        }
+        catch { /* fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         var go = DownloadBuffer(gradOutput);
         var result = new float[outChannels * inChannels * kernelH * kernelW];
@@ -232,6 +257,17 @@ public sealed partial class MetalBackend
     {
         ThrowIfDisposed();
         if (strideH <= 0 || strideW <= 0) throw new ArgumentException("Stride must be positive.");
+        try
+        {
+            int oH = (height + 2 * padH - kernelH) / strideH + 1;
+            int oW = (width + 2 * padW - kernelW) / strideW + 1;
+            if (TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "unfold",
+                batch * channels * kernelH * kernelW * oH * oW, new[] { input, output },
+                new[] { batch, channels, height, width, kernelH, kernelW, strideH, strideW, padH, padW }))
+                return;
+        }
+        catch { /* fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         int outH = (height + 2 * padH - kernelH) / strideH + 1;
         int outW = (width + 2 * padW - kernelW) / strideW + 1;
@@ -260,6 +296,15 @@ public sealed partial class MetalBackend
     {
         ThrowIfDisposed();
         if (strideH <= 0 || strideW <= 0) throw new ArgumentException("Stride must be positive.");
+        try
+        {
+            if (TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "fold",
+                batch * channels * outputH * outputW, new[] { input, output },
+                new[] { batch, channels, outputH, outputW, kernelH, kernelW, strideH, strideW, padH, padW }))
+                return;
+        }
+        catch { /* fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         int unfoldH = (outputH + 2 * padH - kernelH) / strideH + 1;
         int unfoldW = (outputW + 2 * padW - kernelW) / strideW + 1;
@@ -296,6 +341,15 @@ public sealed partial class MetalBackend
         int dilationD, int dilationH, int dilationW)
     {
         ThrowIfDisposed();
+        try
+        {
+            if (TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "conv3d_direct",
+                batch * outChannels * outDepth * outHeight * outWidth, new[] { input, kernel, output },
+                new[] { batch, inChannels, inDepth, inHeight, inWidth, outChannels, outDepth, outHeight, outWidth, kernelD, kernelH, kernelW, strideD, strideH, strideW, padD, padH, padW, dilationD, dilationH, dilationW }))
+                return;
+        }
+        catch { /* fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         var kern = DownloadBuffer(kernel);
         var result = new float[batch * outChannels * outDepth * outHeight * outWidth];
@@ -338,6 +392,15 @@ public sealed partial class MetalBackend
         int strideH, int strideW, int padH, int padW)
     {
         ThrowIfDisposed();
+        try
+        {
+            if (TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "depthwise_conv2d",
+                batch * channels * outHeight * outWidth, new[] { input, kernel, output },
+                new[] { batch, channels, inHeight, inWidth, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW }))
+                return;
+        }
+        catch { /* fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         var kern = DownloadBuffer(kernel);
         var result = new float[batch * channels * outHeight * outWidth];
@@ -469,6 +532,15 @@ public sealed partial class MetalBackend
         int outputPadH, int outputPadW)
     {
         ThrowIfDisposed();
+        try
+        {
+            if (TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "conv_transpose2d_backward_input",
+                batch * inChannels * inHeight * inWidth, new[] { gradOutput, kernel, gradInput },
+                new[] { batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW }))
+                return;
+        }
+        catch { /* fall through to CPU reference */ }
+
         var go = DownloadBuffer(gradOutput);
         var kern = DownloadBuffer(kernel);
         var result = new float[batch * inChannels * inHeight * inWidth];
@@ -509,6 +581,15 @@ public sealed partial class MetalBackend
         int outputPadH, int outputPadW)
     {
         ThrowIfDisposed();
+        try
+        {
+            if (TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "conv_transpose2d_backward_weights",
+                inChannels * outChannels * kernelH * kernelW, new[] { input, gradOutput, gradKernel },
+                new[] { batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW }))
+                return;
+        }
+        catch { /* fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         var go = DownloadBuffer(gradOutput);
         var result = new float[inChannels * outChannels * kernelH * kernelW];
