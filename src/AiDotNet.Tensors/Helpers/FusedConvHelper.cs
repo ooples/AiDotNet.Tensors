@@ -129,7 +129,7 @@ internal static class FusedConvHelper
                 int mcEnd = Math.Min(mc + Mc, M);
                 int nc = nTile * Nc;
                 int ncEnd = Math.Min(nc + Nc, N);
-                ProcessMcNcTile(A, input, C, mc, mcEnd, nc, ncEnd, M, N, K,
+                ProcessMcNcTile(A, input, C, mc, mcEnd, nc, ncEnd, N, K,
                     height, width, outHeight, outWidth,
                     kernelH, kernelW, kernelSize, strideH, strideW,
                     padH, padW, dilationH, dilationW, inChannels);
@@ -146,7 +146,7 @@ internal static class FusedConvHelper
     [MethodImpl(HotInline)]
     private static unsafe void ProcessMcNcTile(
         float* A, float* input, float* C,
-        int mc, int mcEnd, int ncStart, int ncEnd, int M, int N, int K,
+        int mc, int mcEnd, int ncStart, int ncEnd, int N, int K,
         int height, int width, int outHeight, int outWidth,
         int kernelH, int kernelW, int kernelSize,
         int strideH, int strideW, int padH, int padW,

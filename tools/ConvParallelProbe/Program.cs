@@ -22,6 +22,12 @@ internal static class Program
         int sp = ArgI(args, "--sp", 16);
         int reps = ArgI(args, "--reps", 12);
 
+        if (maxdop < 1 || inC < 1 || outC < 1 || sp < 1 || reps < 1)
+        {
+            Console.WriteLine("Error: All numeric arguments must be at least 1");
+            return 1;
+        }
+
         CpuParallelSettings.MaxDegreeOfParallelism = maxdop;
 
         var rng = new Random(0);
@@ -44,7 +50,7 @@ internal static class Program
         Array.Sort(times);
         Console.WriteLine(
             $"CONV inC={inC} outC={outC} sp={sp}x{sp} out.len={o.Length} maxdop={maxdop} " +
-            $"procs={Environment.ProcessorCount} warmup_ms={warm:F1} median_ms={times[reps / 2]:F2} min_ms={times[0]:F2}");
+            $"procs={Environment.ProcessorCount} warmup_ms={warm:F1} median_ms={times[reps / 2]:F2} min_ms={times[0]:F2} max_ms={times[times.Length - 1]:F2}");
         return 0;
     }
 
@@ -99,7 +105,7 @@ internal static class Program
         Array.Sort(times);
         Console.WriteLine(
             $"RESBLOCK C={C} sp={sp}x{sp} blocks={blocks} maxdop={maxdop} procs={Environment.ProcessorCount} " +
-            $"warmup_ms={warm:F1} median_ms={times[reps / 2]:F2} min_ms={times[0]:F2}");
+            $"warmup_ms={warm:F1} median_ms={times[reps / 2]:F2} min_ms={times[0]:F2} max_ms={times[times.Length - 1]:F2}");
         return 0;
     }
 
