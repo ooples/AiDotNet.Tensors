@@ -15,6 +15,7 @@ internal static class Program
         var eng = (CpuEngine)AiDotNetEngine.Current;
 
         if (args.Length > 0 && args[0] == "--resblock") return RunResblock(eng, args);
+        if (args.Length > 0 && args[0] == "--gpu") return RunGpu(args);
 
         int maxdop = ArgI(args, "--maxdop", Environment.ProcessorCount);
         int inC = ArgI(args, "--inc", 256);
@@ -106,6 +107,67 @@ internal static class Program
         Console.WriteLine(
             $"RESBLOCK C={C} sp={sp}x{sp} blocks={blocks} maxdop={maxdop} procs={Environment.ProcessorCount} " +
             $"warmup_ms={warm:F1} median_ms={times[reps / 2]:F2} min_ms={times[0]:F2} max_ms={times[times.Length - 1]:F2}");
+        return 0;
+    }
+
+    // P3 (#642): GPU utilization baseline. Drives the GPU engine through a sustained
+    // Conv2D loop (the diffusion-relevant op) so nvidia-smi can sample GPU util, and
+    // compares ms/op to the CPU path to detect a silent CPU fallback (DirectGpuTensorEngine
+    // does NOT override Conv2D). Reads the output each iter to force GPU->host sync so we
+    // measure real completed work, not just queued launches.
+    private static int RunGpu(string[] args)
+    {
+        int secs = ArgI(args, "--secs", 12);
+        int C = ArgI(args, "--c", 256);
+        int sp = ArgI(args, "--sp", 16);
+        bool fused = ArgI(args, "--fused", 0) != 0;
+
+        var gpu = new AiDotNet.Tensors.Engines.DirectGpuTensorEngine();
+        AiDotNetEngine.Current = gpu;
+        Console.WriteLine($"engine={gpu.GetType().Name} SupportsGpu={gpu.SupportsGpu}");
+
+        bool rb = ArgI(args, "--rb", 0) != 0;
+        var rng = new Random(0);
+        var input = Rand(new[] { 1, C, sp, sp }, rng);
+        var kernel = Rand(new[] { C, C, 3, 3 }, rng);
+        var k2 = Rand(new[] { C, C, 3, 3 }, rng);
+        var gamma = Rand(new[] { C }, rng);
+        var beta = Rand(new[] { C }, rng);
+
+        Func<Tensor<float>> oneIter = rb
+            ? () =>
+            {
+                // ResBlock: GN -> Swish -> Conv -> GN -> Swish -> Conv -> residual add
+                var h = gpu.GroupNorm(input, 32, gamma, beta, 1e-5, out _, out _);
+                gpu.SwishInPlace(h);
+                h = gpu.Conv2D(h, kernel, 1, 1, 1);
+                h = gpu.GroupNorm(h, 32, gamma, beta, 1e-5, out _, out _);
+                gpu.SwishInPlace(h);
+                h = gpu.Conv2D(h, k2, 1, 1, 1);
+                return gpu.TensorAdd(input, h);
+            }
+        : () => gpu.Conv2D(input, kernel, 1, 1, 1);
+
+        var w = Stopwatch.StartNew();
+        var o = oneIter();
+        float sink = o[0];   // force materialize / GPU->host sync (kernel compile + first run)
+        w.Stop();
+        Console.WriteLine($"warmup {(rb ? "resblock" : "conv")} {w.Elapsed.TotalMilliseconds:F0}ms (sink={sink:E2})");
+
+        int syncEvery = ArgI(args, "--syncevery", 1);
+        long n = 0;
+        var sw = Stopwatch.StartNew();
+        while (sw.Elapsed.TotalMilliseconds < secs * 1000.0)
+        {
+            o = oneIter();
+            if (n % syncEvery == 0) sink += o[0];   // host->GPU sync every N iters
+            n++;
+        }
+        sink += o[0]; // final sync
+        sw.Stop();
+        Console.WriteLine(
+            $"GPU {(rb ? "ResBlock" : "Conv2D")} [1,{C},{sp}x{sp}] {n} iters / {sw.Elapsed.TotalSeconds:F1}s = " +
+            $"{sw.Elapsed.TotalMilliseconds / n:F3} ms/iter  ({n / sw.Elapsed.TotalSeconds:F0} iters/s)  sink={sink:E2}");
         return 0;
     }
 
