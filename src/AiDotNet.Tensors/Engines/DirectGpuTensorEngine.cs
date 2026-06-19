@@ -15856,6 +15856,51 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return base.TensorMatMul(a, b);
             }
         }
+        // PR #638 A1: resident-step CONTIGUOUS BATCHED matmul for ND×ND (the 4D attention score/output backward
+        // GEMMs: [B,H,M,K]×[B,H,K,N] → [B,H,M,N]). Collapse the leading dims into batchCount and run one resident
+        // BatchedGemm into a resident-bound output (capture-safe sequential cublasSgemm-per-batch loop) — no
+        // base CpuEngine download. Same contiguous batched semantics base.TensorMatMul records (MatMulBackward).
+        if (typeof(T) == typeof(float) && ResidentStepActive && !Gpu.AutocastScope.IsEnabled
+            && a.Rank >= 3 && b.Rank == a.Rank)
+        {
+            int rk = a.Rank;
+            int Mb = a.Shape._dims[rk - 2], Kb = a.Shape._dims[rk - 1];
+            int Nb = b.Shape._dims[rk - 1];
+            bool leadingMatch = b.Shape._dims[rk - 2] == Kb;
+            int batch = 1;
+            for (int d = 0; d < rk - 2 && leadingMatch; d++)
+            {
+                if (a.Shape._dims[d] != b.Shape._dims[d]) { leadingMatch = false; break; }
+                batch *= a.Shape._dims[d];
+            }
+            if (leadingMatch && a.IsContiguous && b.IsContiguous)
+            {
+                var aR = ResolveResidentBufferNoUpload(backend, a, batch * Mb * Kb);
+                var bR = ResolveResidentBufferNoUpload(backend, b, batch * Kb * Nb);
+                if (aR is not null && bR is not null)
+                {
+                    try
+                    {
+                        var outDims = (int[])a.Shape._dims.Clone();
+                        outDims[rk - 1] = Nb;
+                        var output = new Tensor<T>(new T[(long)batch * Mb * Nb], outDims);
+                        var outBuf = GetOrCreateResidentBuffer(backend, output, batch * Mb * Nb);
+                        if (outBuf.Handle != System.IntPtr.Zero && outBuf.Size >= (long)batch * Mb * Nb)
+                        {
+                            backend.BatchedGemm(aR, bR, outBuf, Mb, Nb, Kb, batch, 1f, 0f);
+                            ResidentSyncCheck("BatchedMatMulResident");
+                            BindResidentBuffer(output, outBuf, backend);
+                            Autodiff.DifferentiableOps.RecordBinary("TensorMatMul", output, a, b, Autodiff.BackwardFunctions<T>.MatMulBackward);
+                            return output;
+                        }
+                    }
+                    catch (Exception ex) { AliasDiag($"BatchedMatMulResident FELLBACK b={batch} M={Mb} N={Nb} K={Kb}: {ex.GetType().Name}: {ex.Message}"); }
+                }
+                else if (System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") == "1")
+                    AliasDiag($"BatchedMatMul bail aResident={aR is not null} bResident={bR is not null} aShape=[{string.Join(",", a._shape)}]");
+            }
+        }
+
         // Remaining non-2D shapes (ND × ND, K-mismatch, non-float) go through the base CpuEngine path,
         // which correctly handles ND × ND (per-batch GEMM) and records on the tape.
         if (a.Rank != 2 || b.Rank != 2)
