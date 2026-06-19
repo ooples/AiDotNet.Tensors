@@ -14757,7 +14757,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             var bufA = ResolveResidentBufferNoUpload(backend, a, M * K);
             var bufB = ResolveResidentBufferNoUpload(backend, b, K * N);
-            if (bufA is null || bufB is null) return null;
+            if (bufA is null || bufB is null)
+            {
+                if (System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") == "1")
+                    AliasDiag($"MatMulResident bail M={M} N={N} K={K} aResident={bufA is not null} bResident={bufB is not null} aRank={a.Rank} bRank={b.Rank}");
+                return null;
+            }
             var output = new Tensor<T>(new T[(long)M * N], outShape);
             var outBuf = GetOrCreateResidentBuffer(backend, output, M * N);
             if (outBuf.Handle == System.IntPtr.Zero || outBuf.Size < (long)M * N) return null;
@@ -15854,7 +15859,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Remaining non-2D shapes (ND × ND, K-mismatch, non-float) go through the base CpuEngine path,
         // which correctly handles ND × ND (per-batch GEMM) and records on the tape.
         if (a.Rank != 2 || b.Rank != 2)
+        {
+            if (ResidentStepActive && System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") == "1")
+                AliasDiag($"MatMul ND-base-fallthrough aShape=[{string.Join(",", a._shape)}] bShape=[{string.Join(",", b._shape)}]");
             return base.TensorMatMul(a, b);
+        }
 
         try
         {
