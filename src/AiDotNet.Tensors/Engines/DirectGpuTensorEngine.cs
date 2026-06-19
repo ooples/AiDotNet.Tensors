@@ -14644,6 +14644,29 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return TryRunBinaryInto(output, a, b, kernel) ? output : null;
     }
 
+    /// <summary>PR #638 A1: resident-step GEMM — [M,K]x[K,N] into a fresh resident-bound output, no temp output
+    /// buffer / download. Inputs MUST already be resident (resolved no-upload — capture-safe); returns the bound
+    /// output, or null to fall back (off resident step / inputs not resident / undersized). Records nothing.</summary>
+    private Tensor<T>? TryMatMulResident<T>(Tensor<T> a, Tensor<T> b, int M, int N, int K, int[] outShape)
+    {
+        if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return null;
+        if (!TryGetBackend(out var backend)) return null;
+        try
+        {
+            var bufA = ResolveResidentBufferNoUpload(backend, a, M * K);
+            var bufB = ResolveResidentBufferNoUpload(backend, b, K * N);
+            if (bufA is null || bufB is null) return null;
+            var output = new Tensor<T>(new T[(long)M * N], outShape);
+            var outBuf = GetOrCreateResidentBuffer(backend, output, M * N);
+            if (outBuf.Handle == System.IntPtr.Zero || outBuf.Size < (long)M * N) return null;
+            backend.Gemm(bufA, bufB, outBuf, M, N, K);
+            ResidentSyncCheck("MatMulResident");
+            BindResidentBuffer(output, outBuf, backend);
+            return output;
+        }
+        catch (Exception ex) { AliasDiag($"MatMulResident FELLBACK M={M} N={N} K={K}: {ex.GetType().Name}: {ex.Message}"); return null; }
+    }
+
     public override Tensor<T> TensorAdd<T>(Tensor<T> a, Tensor<T> b)
     {
         if (!ShapesMatch(a.Shape._dims, b.Shape._dims))
@@ -15442,6 +15465,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorMultiplyScalar<T>(Tensor<T> tensor, T scalar)
     {
+        if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float))
+        {
+            float sf = scalar is float f0 ? f0 : Convert.ToSingle(scalar);
+            var rout = new Tensor<T>(new T[tensor.Length], tensor.Shape._dims);
+            if (TryUnaryResidentInto(rout, tensor, (b, i, o, n) => b.Scale(i, o, sf, n), "ScaleResident"))
+            {
+                Autodiff.DifferentiableOps.RecordUnary("TensorMultiplyScalar", rout, tensor,
+                    Autodiff.BackwardFunctions<T>.MultiplyScalarBackward, new object[] { scalar as object ?? new object() });
+                return rout;
+            }
+        }
         try
         {
             if (TryGetBackend(out var backend))
@@ -15667,6 +15701,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 int Nc = b.Shape._dims[1];
                 int Mc = 1;
                 for (int d = 0; d < a.Rank - 1; d++) Mc *= a.Shape._dims[d];
+                int[] outShapeRes = (int[])a.Shape._dims.Clone();
+                outShapeRes[a.Rank - 1] = Nc;
+                if (TryMatMulResident(a, b, Mc, Nc, Kc, outShapeRes) is { } rmm)
+                {
+                    Autodiff.DifferentiableOps.RecordBinary("TensorMatMul", rmm, a, b, Autodiff.BackwardFunctions<T>.MatMulBackward);
+                    return rmm;
+                }
                 using var bufAc = GetOrAllocateBuffer(backend, a);
                 using var bufBc = GetOrAllocateBuffer(backend, b);
                 var bufOutc = AllocateOutputBuffer(backend, Mc * Nc);
@@ -15702,6 +15743,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             if (K != bLeadingDim)
                 throw new ArgumentException(
                     $"TensorMatMul shape mismatch: a.Shape[1]={K} but b.Shape[0]={bLeadingDim}.");
+
+            // PR #638 A1: resident-step GEMM into a resident-bound output (no temp/download) so the backward
+            // matmul grads stay resident for capture.
+            if (TryMatMulResident(a, b, M, N, K, new[] { M, N }) is { } rmm2d)
+            {
+                Autodiff.DifferentiableOps.RecordBinary("TensorMatMul", rmm2d, a, b, Autodiff.BackwardFunctions<T>.MatMulBackward);
+                return rmm2d;
+            }
 
             // FORWARD Half-resident store — RUN BEFORE GetOrAllocateBuffer (which would up-cast an IsFp16 input
             // to FP32, re-inflating it for the rest of the step). Keep the activation as a HALF GPU buffer (half
