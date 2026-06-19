@@ -14,6 +14,8 @@ internal static class Program
         AiDotNetEngine.Current = new CpuEngine();
         var eng = (CpuEngine)AiDotNetEngine.Current;
 
+        if (args.Length > 0 && args[0] == "--resblock") return RunResblock(eng, args);
+
         int maxdop = ArgI(args, "--maxdop", Environment.ProcessorCount);
         int inC = ArgI(args, "--inc", 256);
         int outC = ArgI(args, "--outc", 256);
@@ -43,6 +45,61 @@ internal static class Program
         Console.WriteLine(
             $"CONV inC={inC} outC={outC} sp={sp}x{sp} out.len={o.Length} maxdop={maxdop} " +
             $"procs={Environment.ProcessorCount} warmup_ms={warm:F1} median_ms={times[reps / 2]:F2} min_ms={times[0]:F2}");
+        return 0;
+    }
+
+    // P2 (#642): an SD-style ResBlock stack (GroupNorm -> Swish -> Conv -> GroupNorm ->
+    // Swish -> Conv -> residual add) — the real per-op mix of a diffusion forward. Sweep
+    // maxdop to see whether the WHOLE stack (not just conv) saturates cores after the conv
+    // fixes, and profile to find the next bottleneck (norms/activations/elementwise/barriers).
+    private static int RunResblock(CpuEngine eng, string[] a)
+    {
+        int maxdop = ArgI(a, "--maxdop", Environment.ProcessorCount);
+        int C = ArgI(a, "--c", 256);
+        int sp = ArgI(a, "--sp", 16);
+        int blocks = ArgI(a, "--blocks", 8);
+        int reps = ArgI(a, "--reps", 10);
+        const int groups = 32;
+
+        CpuParallelSettings.MaxDegreeOfParallelism = maxdop;
+
+        var rng = new Random(0);
+        var x0 = Rand(new[] { 1, C, sp, sp }, rng);
+        var gamma = Rand(new[] { C }, rng);
+        var beta = Rand(new[] { C }, rng);
+        var k1 = Rand(new[] { C, C, 3, 3 }, rng);
+        var k2 = Rand(new[] { C, C, 3, 3 }, rng);
+
+        Func<Tensor<float>, Tensor<float>> block = x =>
+        {
+            var h = eng.GroupNorm(x, groups, gamma, beta, 1e-5, out _, out _);
+            eng.SwishInPlace(h);
+            h = eng.Conv2D(h, k1, 1, 1, 1);
+            h = eng.GroupNorm(h, groups, gamma, beta, 1e-5, out _, out _);
+            eng.SwishInPlace(h);
+            h = eng.Conv2D(h, k2, 1, 1, 1);
+            return eng.TensorAdd(x, h);
+        };
+
+        var sw = Stopwatch.StartNew();
+        var y = x0;
+        for (int b = 0; b < blocks; b++) y = block(y);
+        sw.Stop();
+        double warm = sw.Elapsed.TotalMilliseconds;
+
+        var times = new double[reps];
+        for (int i = 0; i < reps; i++)
+        {
+            var s = Stopwatch.StartNew();
+            y = x0;
+            for (int b = 0; b < blocks; b++) y = block(y);
+            s.Stop();
+            times[i] = s.Elapsed.TotalMilliseconds;
+        }
+        Array.Sort(times);
+        Console.WriteLine(
+            $"RESBLOCK C={C} sp={sp}x{sp} blocks={blocks} maxdop={maxdop} procs={Environment.ProcessorCount} " +
+            $"warmup_ms={warm:F1} median_ms={times[reps / 2]:F2} min_ms={times[0]:F2}");
         return 0;
     }
 
