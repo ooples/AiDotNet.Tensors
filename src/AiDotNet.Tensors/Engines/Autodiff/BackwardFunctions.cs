@@ -1526,6 +1526,9 @@ internal static class BackwardFunctions<T>
         }
 
         // Now expandedGrad has the same rank as input with size-1 at reduced dims — tile to match
+        if (Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") == "1")
+            try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_graphcapture_diag.txt"),
+                $"[ALIAS] ReduceSumBwd gradOut=[{string.Join(",", gradOutput._shape)}] expanded=[{string.Join(",", expandedGrad._shape)}] inShape=[{string.Join(",", inputShape)}] axes=[{string.Join(",", axes)}] keepDims={keepDims}" + System.Environment.NewLine); } catch { }
         var grad = BroadcastGradToShape(expandedGrad, inputShape, engine);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
@@ -1536,6 +1539,9 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var axes = (int[])savedState[0];
+        if (Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") == "1")
+            try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_graphcapture_diag.txt"),
+                $"[ALIAS] ReduceMeanBwd gradOut=[{string.Join(",", gradOutput._shape)}] inShape=[{string.Join(",", inputs[0]._shape)}] axes=[{string.Join(",", axes)}]" + System.Environment.NewLine); } catch { }
         var grad = engine.ReduceMeanBackward(gradOutput, inputs[0]._shape, axes);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
@@ -4189,6 +4195,9 @@ internal static class BackwardFunctions<T>
         var axis = (int)savedState[0];
         var index = (int)savedState[1];
         var inputShape = inputs[0]._shape;
+        if (Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") == "1")
+            try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_graphcapture_diag.txt"),
+                $"[ALIAS] SliceAxisBwd gradOut=[{string.Join(",", gradOutput._shape)}] inShape=[{string.Join(",", inputShape)}] axis={axis} index={index}" + System.Environment.NewLine); } catch { }
         var grad = new Tensor<T>(inputShape); // zero-initialized
         // Place gradOutput into grad at the correct slice
         engine.TensorSetSliceAxis(grad, gradOutput, axis, index);

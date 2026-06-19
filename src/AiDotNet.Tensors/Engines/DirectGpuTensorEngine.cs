@@ -3210,6 +3210,45 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return null;
     }
 
+    /// <summary>PR #638 A1: resident BROADCAST of a [rows,1] / [1,cols] / scalar source across the other axis via an
+    /// outer-product GEMM with a resident ones-vector — no Tile/Broadcast kernel, no download. Reduces ReduceSum /
+    /// ReduceMean backward (broadcast the reduced-axis grad) to the already-resident GEMM. onesOnRight=true does
+    /// src[rows,1]·ones[1,cols]=[rows,cols] (tile trailing axis); false does ones[rows,1]·src[1,cols]=[rows,cols]
+    /// (scalar/leading broadcast). alpha folds in any 1/N scale. Returns the bound output, else null (caller's base).</summary>
+    private Tensor<T>? TryResidentOuterBroadcast<T>(Tensor<T> src, int rows, int cols, int[] outShape, float alpha, bool onesOnRight)
+    {
+        if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return null;
+        if (!TryGetBackend(out var backend)) return null;
+        var sR = ResolveResidentBufferNoUpload(backend, src, src.Length);
+        if (sR is null) return null;
+        IGpuBuffer? ones = null;
+        try
+        {
+            var output = new Tensor<T>(new T[(long)rows * cols], outShape);
+            var outBuf = GetOrCreateResidentBuffer(backend, output, rows * cols);
+            if (outBuf.Handle == System.IntPtr.Zero || outBuf.Size < (long)rows * cols) return null;
+            if (onesOnRight)
+            {
+                ones = backend.AllocateBuffer(cols);
+                if (ones is null || ones.Handle == System.IntPtr.Zero) return null;
+                backend.Fill(ones, 1f, cols);
+                backend.Gemm(sR, ones, outBuf, rows, cols, 1, alpha, 0f);   // [rows,1]·[1,cols]
+            }
+            else
+            {
+                ones = backend.AllocateBuffer(rows);
+                if (ones is null || ones.Handle == System.IntPtr.Zero) return null;
+                backend.Fill(ones, 1f, rows);
+                backend.Gemm(ones, sR, outBuf, rows, cols, 1, alpha, 0f);   // [rows,1]·[1,cols]
+            }
+            ResidentSyncCheck("OuterBroadcast");
+            BindResidentBuffer(output, outBuf, backend);
+            return output;
+        }
+        catch (Exception ex) { AliasDiag($"OuterBroadcast FELLBACK rows={rows} cols={cols}: {ex.GetType().Name}: {ex.Message}"); return null; }
+        finally { ones?.Dispose(); }
+    }
+
     // Stable per-LayerNorm mean/variance scratch buffers (keyed by the LN output's backing array), allocated
     // once so capture/replay don't cuMemAlloc them. The backward reads these (resident) via the state ref.
     private readonly System.Collections.Concurrent.ConcurrentDictionary<object, (IGpuBuffer mean, IGpuBuffer var)> _lnStatsScratch = new();
@@ -12797,6 +12836,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     }
 
     /// <summary>
+    /// <summary>PR #638 A1: resident ReduceMean backward — broadcast the reduced grad back to inputShape (scaled
+    /// 1/N) via the resident outer-product GEMM, no download. Handles the scalar case (full reduce → gradOut[1]
+    /// broadcast to [N]); other shapes fall to base.</summary>
+    Tensor<T> IEngine.ReduceMeanBackward<T>(Tensor<T> gradOutput, int[] inputShape, int[] axes)
+    {
+        if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float) && gradOutput.Length == 1)
+        {
+            int N = 1; for (int i = 0; i < inputShape.Length; i++) N *= inputShape[i];
+            if (N > 0 && TryResidentOuterBroadcast(gradOutput, N, 1, inputShape, 1f / N, onesOnRight: false) is { } r)
+                return r;
+        }
+        return base.ReduceMeanBackward(gradOutput, inputShape, axes);
+    }
+
     /// GPU-accelerated ReduceSum operation.
     /// </summary>
     public override Tensor<T> ReduceSum<T>(Tensor<T> tensor, int[]? axes = null, bool keepDims = false)
@@ -18001,6 +18054,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorTile<T>(Tensor<T> tensor, int[] multiples)
     {
+        // PR #638 A1: resident-step tile of a trailing size-1 axis ([rows,1]→[rows,cols], the ReduceSum-backward
+        // broadcast) via the resident outer-product GEMM (src[rows,1]·ones[1,cols]) — no Tile kernel, no download.
+        // Only the exact 2D [rows,1]×[1,cols] shape; everything else falls to the base tile.
+        if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float)
+            && tensor.Rank == 2 && multiples.Length == 2
+            && tensor.Shape._dims[1] == 1 && multiples[0] == 1 && multiples[1] >= 1)
+        {
+            int rows = tensor.Shape._dims[0], cols = multiples[1];
+            if (TryResidentOuterBroadcast(tensor, rows, cols, new[] { rows, cols }, 1f, onesOnRight: true) is { } r)
+                return r;
+        }
         return ((IEngine)this).TensorTile(tensor, multiples);
     }
 
