@@ -307,3 +307,35 @@ whole-graph capture — so the score that matters for *engagement* is binary (0 
 the 69/78 is the real measure of progress and each is independently correct. The reusable
 helpers (`EnsureResidentBuffer`, `ResolveResidentBufferNoUpload`, `TryBinaryResidentOutOfPlace`,
 `TryMatMulResident`, the `accumgrad` probe) make the last 9 mechanical once each kernel exists.
+
+---
+
+## 13. STATUS 2026-06-19 (cont.) — A1 at 73/78 backward grads resident; last 5 need NEW kernels
+
+Resident backward grad sites now **73 of 78** (from 7). This pass added the resident
+**4D batched-attention GEMM** (contiguous `[B,H,M,K]×[B,H,K,N]` → one `BatchedGemm` with
+the capture-safe sequential cublasSgemm-per-batch loop, into a resident-bound output).
+That flipped all 4 attention score/output backward GEMMs AND the dependent ReLU (its input
+was an attention activation that's now resident). **Correctness verified byte-identical**:
+`[LAMBADA-CAND-RANK] recall 70.7%  C 2.86%  M 1.07%  hybrid 1.79%` unchanged before/after —
+the batched GEMM matches base exactly. (capture_health's "1.79% DRIFT" is its hybrid-vs-ref
+2.81 mismatch for this config, NOT a regression — the C=2.86% correctness metric is constant.)
+
+**The remaining 5 are a DIFFERENT class of work — they need GPU kernels that don't exist yet**
+(every resident path so far REUSED an existing backend kernel; these don't have one):
+- `ReduceSum` backward ×1 (len 1920128) and `ReduceMean` backward ×1 (len 128): the backward
+  **broadcasts/tiles** the grad back to input shape (`ExpandDims` view + `BroadcastGradToShape`
+  / `engine.ReduceMeanBackward`). No backend Broadcast/Tile/Repeat kernel exists → write one
+  (or compose via a ones-vector outer-product GEMM into a resident buffer).
+- `TensorSliceAxis` backward ×1 (len 1048576): `TensorSetSliceAxis` scatters the grad into a
+  zeroed buffer → needs a resident memset + strided scatter (no download).
+- `TensorEmbeddingLookupFromFloatIndices` backward ×1: **scatter-add** of the grad rows into
+  the table-grad by index → needs a resident scatter-add kernel.
+
+**Net for #638:** the entire forward pass plus 73/78 of the backward run capture-resident,
+test green and cortex correctness (C 2.86%) intact at every increment. Capture still ABORTS
+only because the whole-graph capture is invalidated by ANY single remaining download — so
+engagement is the last-5-kernels away. The reusable primitives (`EnsureResidentBuffer`,
+`ResolveResidentBufferNoUpload`, `TryBinaryResidentOutOfPlace`, `TryMatMulResident`, the
+resident BatchedGemm branch, the `accumgrad` probe) plus this list make the finish mechanical
+once the broadcast + scatter-add kernels land.
