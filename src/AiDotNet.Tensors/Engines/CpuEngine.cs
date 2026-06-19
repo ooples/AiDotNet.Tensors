@@ -13148,18 +13148,30 @@ public partial class CpuEngine : ITensorLevelEngine
                 return entry.Data;
             }
 
-            // Stale (weights mutated in place since the transpose was built)
-            // or missing — rebuild from the live kernel contents. Remove+
-            // GetValue rather than AddOrUpdate: net471's ConditionalWeakTable
-            // has no AddOrUpdate, and a concurrent racer at worst redoes the
-            // transpose once.
+            // Stale (weights mutated in place since the transpose was built) or
+            // missing. #639: in TRAINING the weights change every optimizer step, so
+            // this rebuilds every step. REUSE the stale entry's buffer (same size)
+            // instead of allocating a fresh float[] each rebuild — that was ~116 MB/step
+            // of pure GC churn on MobileNetV3 batch=1. Conv ops in the compiled-plan
+            // replay run sequentially, so no other thread is mid-read of this kernel's
+            // transpose while we overwrite it.
+            int needed = cols * rows;
+            float[] kernelT = (entry != null && entry.Data.Length == needed)
+                ? entry.Data
+                : new float[needed];
+            TransposeFloatParallel(kernel, 0, kernelT, 0, rows, cols);
             _kernelTransposeCache.Remove(kernel);
-            return _kernelTransposeCache.GetValue(kernel, k =>
+            try
             {
-                var kernelT = new float[cols * rows];
-                TransposeFloatParallel(k, 0, kernelT, 0, rows, cols);
-                return new KernelTransposeEntry(kernelT, epoch, sourceVersion);
-            }).Data;
+                _kernelTransposeCache.Add(kernel, new KernelTransposeEntry(kernelT, epoch, sourceVersion));
+            }
+            catch (ArgumentException)
+            {
+                // A concurrent caller re-added an entry between Remove and Add. Our
+                // kernelT is a correct transpose of the CURRENT kernel, so return it;
+                // the cache holding the racer's (equally-correct) buffer is fine.
+            }
+            return kernelT;
         }
 
         /// <summary>
@@ -13939,11 +13951,15 @@ public partial class CpuEngine : ITensorLevelEngine
                 Array.Clear(destF, destOff, batch * inChannels * height * width);
             var gradOutputF = (float[])(object)gradOutput.GetFlattenedData();
             var kernelF = (float[])(object)kernel.GetFlattenedData();
-            var kernelT = new float[colH * outChannels];
+            var pool = System.Buffers.ArrayPool<float>.Shared;
+            // #639: rent the transposed-kernel scratch instead of `new float[]` per call.
+            // Its size is fixed per layer (only the contents change each step), and the
+            // weights change every step so this can't be content-cached — it was ~130 MB/step
+            // of pure GC churn on MobileNetV3 batch=1 (a gen2 collection every ~2 steps).
+            var kernelT = pool.Rent(colH * outChannels);
             for (int r = 0; r < outChannels; r++)
                 for (int c = 0; c < colH; c++)
                     kernelT[c * outChannels + r] = kernelF[r * colH + c];
-            var pool = System.Buffers.ArrayPool<float>.Shared;
             long col2imWorkF = (long)inChannels * kernelHeight * kernelWidth * colW;
             void ProcessImageInputF(int b, bool channelParallel)
             {
@@ -13996,6 +14012,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     b => ProcessImageInputF(b, channelParallel: false));
             else
                 for (int b = 0; b < batch; b++) ProcessImageInputF(b, channelParallel: true);
+            pool.Return(kernelT);
             return;
         }
 
@@ -14892,12 +14909,15 @@ public partial class CpuEngine : ITensorLevelEngine
             int totalLen = outChannels * colH;
             var destF = (float[])(object)dest._storage.GetDataArray();
             int destOff = dest._storageOffset;
-            // Local accumulator: per-batch BLAS writes into localGrad; merge into dest at end.
-            var gradKernelF = new float[totalLen];
+            var kPool = System.Buffers.ArrayPool<float>.Shared;
+            // #639: rent the kernel-gradient accumulator instead of `new float[]` per call.
+            // Weights change every step so it can't be content-cached — it was per-step GC
+            // churn. Rented buffers aren't zeroed and this is a += accumulator, so clear it.
+            var gradKernelF = kPool.Rent(totalLen);
+            Array.Clear(gradKernelF, 0, totalLen);
             var gradOutputF = (float[])(object)gradOutput.GetFlattenedData();
             var inputF = (float[])(object)input.GetFlattenedData();
             int inputSliceSize = inChannels * height * width;
-            var kPool = System.Buffers.ArrayPool<float>.Shared;
             long im2colWorkKF = (long)inChannels * kernelHeight * kernelWidth * colW;
 
             // Per-image: build im2col(input_b) then GEMM gradOut_b @ im2col^T into
@@ -14999,6 +15019,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 for (int i = 0; i < totalLen; i++) destF[destOff + i] += gradKernelF[i];
             else
                 Array.Copy(gradKernelF, 0, destF, destOff, totalLen);
+            kPool.Return(gradKernelF);
             return;
         }
 
