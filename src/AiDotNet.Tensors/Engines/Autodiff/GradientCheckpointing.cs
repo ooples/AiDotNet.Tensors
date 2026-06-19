@@ -129,41 +129,49 @@ public static class GradientCheckpointing<T>
                     var weighted = eng.TensorMultiply(reOutput, gradOutput);
                     var pseudoLoss = eng.ReduceSum(weighted);
 
-                    var segGrads = recomputeTape.ComputeGradients(pseudoLoss, sources: new[] { reInput });
+                    // Differentiate the recomputed segment w.r.t. EVERY leaf it touched — the
+                    // segment input AND every weight/parameter the segment's functions read —
+                    // not just the input. PyTorch's torch.utils.checkpoint backpropagates the
+                    // recomputed forward through all inputs that require grad, including module
+                    // parameters; an earlier version requested only `reInput`, so the WEIGHT
+                    // gradients of every checkpointed layer were silently dropped — the outer
+                    // ComputeGradients then found no gradient for those params and they never
+                    // updated (checkpointed layers did not learn; ~half of a Transformer's
+                    // parameters diverged from the eager update). `sources: null` differentiates
+                    // the whole recomputed graph.
+                    //
+                    // Scattering correctness: the outer forward ran this segment under NoGrad
+                    // (its ops were never recorded on the outer tape), so this recompute is the
+                    // ONLY place the segment's gradient contributions exist — there is no double
+                    // counting. Accumulating each leaf's grad into the outer `grads` accumulator
+                    // is therefore exactly right: the segment input and parameters are the same
+                    // tensor instances the caller looks up, and any captured upstream tensor gets
+                    // its segment-side contribution propagated further when the outer reverse walk
+                    // reaches that tensor's producer (the segment entry is processed before its
+                    // producers in reverse order). The recompute's throwaway intermediates are
+                    // fresh instances the caller never queries — harmless. The sole exclusion is
+                    // gradOutput: an outer-tape constant folded into the pseudo-loss only to seed
+                    // the VJP, whose inner "gradient" (== reOutput) is not a real gradient and
+                    // must not leak back onto the outer tape.
+                    var segGrads = recomputeTape.ComputeGradients(pseudoLoss, sources: null);
 
-                    if (segGrads.TryGetValue(reInput, out var inputGrad))
+                    bool accumulatedAny = false;
+                    foreach (var kvp in segGrads)
                     {
-                        DifferentiableOps.AccumulateGrad(grads, inputs[0], inputGrad, eng);
+                        if (ReferenceEquals(kvp.Key, gradOutput)) continue;
+                        if (kvp.Value is null) continue;
+                        DifferentiableOps.AccumulateGrad(grads, kvp.Key, kvp.Value, eng);
+                        accumulatedAny = true;
                     }
-                    else
+
+                    // Identity / no-op segment (output IS input by reference, nothing recorded on
+                    // the recompute tape): pass the upstream gradient straight through. Reference-
+                    // equality is the only safe alias predicate — it covers the empty-segment case
+                    // without false positives on shape coincidence. For a genuinely input-
+                    // independent segment, leaving grads[input] untouched (zero) is the correct VJP.
+                    if (!accumulatedAny && ReferenceEquals(reOutput, reInput))
                     {
-                        // The segment was disconnected from its input — the
-                        // recomputed forward never touched reInput, so the
-                        // mathematical VJP is ZERO regardless of whether the
-                        // output happens to share a shape with the input.
-                        //
-                        // The earlier shape-equality fallback (CodeRabbit
-                        // feedback on PR #361) incorrectly turned input-
-                        // independent same-shape segments into an identity
-                        // backward by passing gradOutput through whenever the
-                        // shapes lined up. That's only correct when the
-                        // segment is literally a no-op (reOutput IS reInput
-                        // by reference), which is the only case where the
-                        // segment trivially passes gradients through. For
-                        // every other shape-equal but input-independent
-                        // segment, the correct gradient is zero, and we
-                        // achieve that by simply NOT calling
-                        // DifferentiableOps.AccumulateGrad — grads already
-                        // contains zero for inputs[0] by initialization.
-                        //
-                        // Reference-equality is the only safe alias predicate:
-                        // it covers the identity case (reInput == reOutput,
-                        // such as when the segment was empty / no-op) without
-                        // false positives on shape-coincidence.
-                        if (ReferenceEquals(reOutput, reInput))
-                        {
-                            DifferentiableOps.AccumulateGrad(grads, inputs[0], gradOutput, eng);
-                        }
+                        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradOutput, eng);
                     }
                 });
 

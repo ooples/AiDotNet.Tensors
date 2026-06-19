@@ -430,6 +430,56 @@ public class GradientCorrectnessTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// A checkpointed segment that uses a WEIGHT (matmul) must produce a weight gradient identical to
+    /// the eager (non-checkpointed) run — not just the input gradient. Activation checkpointing is a
+    /// memory optimization; it must be exactly gradient-equivalent for BOTH the segment input and every
+    /// parameter the segment reads. Regression guard: the recompute backward previously differentiated
+    /// only w.r.t. the segment input (sources: [reInput]), so checkpointed-layer weight gradients were
+    /// silently dropped and checkpointed layers never learned. A non-uniform output weighting makes the
+    /// upstream gradient non-constant so a wrong (e.g. ones-seed) VJP would not coincidentally match.
+    /// </summary>
+    [Fact]
+    public void Checkpoint_ProducesParameterGradients_MatchingEager()
+    {
+        Tensor<float> MakeFilled(int[] shape, float start, float step)
+        {
+            var t = new Tensor<float>(shape);
+            for (int i = 0; i < t.Length; i++) t[i] = start + step * i;
+            return t;
+        }
+
+        var x = MakeFilled([2, 3], -0.4f, 0.05f);
+        var w = MakeFilled([3, 4], -0.3f, 0.03f);
+        var outW = MakeFilled([2, 4], 0.1f, 0.02f); // non-uniform gradOutput driver
+
+        // Segment reads the weight w: inp => relu(inp @ w). w is a closure-captured parameter.
+        Func<Tensor<float>, Tensor<float>> seg = inp => _engine.ReLU(_engine.TensorMatMul(inp, w));
+
+        System.Collections.Generic.Dictionary<Tensor<float>, Tensor<float>> Run(bool checkpoint)
+        {
+            using var tape = new GradientTape<float>();
+            var o = checkpoint
+                ? GradientCheckpointing<float>.Checkpoint(new[] { seg }, x, segmentSize: 1)
+                : seg(x);
+            var loss = _engine.ReduceSum(_engine.TensorMultiply(o, outW));
+            return tape.ComputeGradients(loss, sources: new[] { x, w });
+        }
+
+        var eager = Run(checkpoint: false);
+        var ckpt = Run(checkpoint: true);
+
+        Assert.True(eager.ContainsKey(w) && eager.ContainsKey(x), "eager run must produce x and w grads");
+        Assert.True(ckpt.ContainsKey(w),
+            "checkpointed run must produce a WEIGHT gradient (regression: recompute differentiated only w.r.t. input)");
+        Assert.True(ckpt.ContainsKey(x), "checkpointed run must produce an input gradient");
+
+        for (int i = 0; i < eager[w].Length; i++)
+            Assert.Equal(eager[w][i], ckpt[w][i], 3);
+        for (int i = 0; i < eager[x].Length; i++)
+            Assert.Equal(eager[x][i], ckpt[x][i], 3);
+    }
+
     // ─── Additional arithmetic gradient checks ───────────────────
 
     [Fact]
