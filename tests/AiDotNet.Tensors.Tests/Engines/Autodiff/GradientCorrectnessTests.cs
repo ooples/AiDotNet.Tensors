@@ -101,6 +101,16 @@ public class GradientCorrectnessTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// Helper method to create a tensor filled with sequential values.
+    /// </summary>
+    private static Tensor<float> MakeFilled(int[] shape, float start, float step)
+    {
+        var t = new Tensor<float>(shape);
+        for (int i = 0; i < t.Length; i++) t[i] = start + step * i;
+        return t;
+    }
+
     // ─── Arithmetic ─────────────────────────────────────────────
 
     [Fact]
@@ -442,13 +452,6 @@ public class GradientCorrectnessTests : IDisposable
     [Fact]
     public void Checkpoint_ProducesParameterGradients_MatchingEager()
     {
-        Tensor<float> MakeFilled(int[] shape, float start, float step)
-        {
-            var t = new Tensor<float>(shape);
-            for (int i = 0; i < t.Length; i++) t[i] = start + step * i;
-            return t;
-        }
-
         var x = MakeFilled([2, 3], -0.4f, 0.05f);
         var w = MakeFilled([3, 4], -0.3f, 0.03f);
         var outW = MakeFilled([2, 4], 0.1f, 0.02f); // non-uniform gradOutput driver
@@ -489,13 +492,6 @@ public class GradientCorrectnessTests : IDisposable
     [Fact]
     public void Checkpoint_TwoSegments_ParameterGradients_MatchEager()
     {
-        Tensor<float> MakeFilled(int[] shape, float start, float step)
-        {
-            var t = new Tensor<float>(shape);
-            for (int i = 0; i < t.Length; i++) t[i] = start + step * i;
-            return t;
-        }
-
         var x = MakeFilled([2, 3], -0.4f, 0.05f);
         var w0 = MakeFilled([3, 4], -0.3f, 0.03f);
         var w1 = MakeFilled([4, 4], -0.2f, 0.02f);
@@ -534,13 +530,6 @@ public class GradientCorrectnessTests : IDisposable
     [Fact]
     public void Checkpoint_PersistentWeight_ParameterGradients_MatchEager()
     {
-        Tensor<float> MakeFilled(int[] shape, float start, float step)
-        {
-            var t = new Tensor<float>(shape);
-            for (int i = 0; i < t.Length; i++) t[i] = start + step * i;
-            return t;
-        }
-
         var x = MakeFilled([2, 3], -0.4f, 0.05f);
         var w = MakeFilled([3, 4], -0.3f, 0.03f);
         _engine.RegisterPersistentTensor(w, PersistentTensorRole.Weights);
@@ -579,13 +568,6 @@ public class GradientCorrectnessTests : IDisposable
     [Fact]
     public void Checkpoint_NullSources_ParameterGradients_MatchEager()
     {
-        Tensor<float> MakeFilled(int[] shape, float start, float step)
-        {
-            var t = new Tensor<float>(shape);
-            for (int i = 0; i < t.Length; i++) t[i] = start + step * i;
-            return t;
-        }
-
         var x = MakeFilled([2, 3], -0.4f, 0.05f);
         var w = MakeFilled([3, 4], -0.3f, 0.03f);
         var outW = MakeFilled([2, 4], 0.1f, 0.02f);
@@ -617,13 +599,6 @@ public class GradientCorrectnessTests : IDisposable
     [Fact]
     public void Checkpoint_FusedLinear_ParameterGradients_MatchEager()
     {
-        Tensor<float> MakeFilled(int[] shape, float start, float step)
-        {
-            var t = new Tensor<float>(shape);
-            for (int i = 0; i < t.Length; i++) t[i] = start + step * i;
-            return t;
-        }
-
         var x = MakeFilled([2, 3], -0.4f, 0.05f);
         var w = MakeFilled([3, 4], -0.3f, 0.03f);
         var b = MakeFilled([4], 0.05f, 0.01f);
@@ -661,13 +636,6 @@ public class GradientCorrectnessTests : IDisposable
     [Fact]
     public void Checkpoint_FourSegment_ResidualFusedLinear_MatchEager()
     {
-        Tensor<float> MakeFilled(int[] shape, float start, float step)
-        {
-            var t = new Tensor<float>(shape);
-            for (int i = 0; i < t.Length; i++) t[i] = start + step * i;
-            return t;
-        }
-
         var x = MakeFilled([2, 4], -0.4f, 0.05f);
         var ws = new Tensor<float>[4];
         var bs = new Tensor<float>[4];
@@ -716,13 +684,6 @@ public class GradientCorrectnessTests : IDisposable
     [Fact]
     public void Checkpoint_TwoSegment_FusedLinear_ParameterGradients_MatchEager()
     {
-        Tensor<float> MakeFilled(int[] shape, float start, float step)
-        {
-            var t = new Tensor<float>(shape);
-            for (int i = 0; i < t.Length; i++) t[i] = start + step * i;
-            return t;
-        }
-
         var x = MakeFilled([2, 3], -0.4f, 0.05f);
         var w0 = MakeFilled([3, 4], -0.3f, 0.03f);
         var b0 = MakeFilled([4], 0.05f, 0.01f);
