@@ -4136,8 +4136,32 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         base.ReLUInPlace(tensor);
     }
 
+    /// <summary>GPU-RESIDENT elementwise unary-into for the compiled step: run <paramref name="kernel"/> from the
+    /// resident input buffer into the destination's stable buffer and bind it — no materialize/download (the host
+    /// *Into activations go through .Data → DeferredArrayMaterializer → DownloadBuffer, which aborts capture, and
+    /// can hit the #226 "buffer released before materialization" race). Same-length contiguous float only.</summary>
+    private bool TryUnaryResidentInto<T>(Tensor<T> output, Tensor<T> input,
+        System.Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, int> kernel, string opName)
+    {
+        if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
+        if (!TryGetBackend(out var backend) || !input.IsContiguous || input.Length != output.Length) return false;
+        try
+        {
+            using var inBuf = GetResidentOrPersistentInputBuffer(backend, input);
+            var outBuf = GetOrCreateResidentBuffer(backend, output, input.Length);
+            if (inBuf.Buffer.Handle == System.IntPtr.Zero || inBuf.Buffer.Size < input.Length
+                || outBuf.Handle == System.IntPtr.Zero || outBuf.Size < input.Length) return false;
+            kernel(backend, inBuf.Buffer, outBuf, input.Length);
+            ResidentSyncCheck(opName);
+            BindResidentBuffer(output, outBuf, backend);
+            return true;
+        }
+        catch (Exception uex) { AliasDiag($"{opName}-resident FELLBACK in=[{string.Join(",", input._shape)}]: {uex.GetType().Name}: {uex.Message}"); return false; }
+    }
+
     void IEngine.ReLUInto<T>(Tensor<T> dest, Tensor<T> input)
     {
+        if (TryUnaryResidentInto(dest, input, static (be, i, o, n) => be.Relu(i, o, n), "ReLU")) return;
         var result = ((IEngine)this).ReLU(input);
         result.Data.Span.CopyTo(dest.Data.Span);
     }
@@ -4359,6 +4383,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.GELUInto<T>(Tensor<T> dest, Tensor<T> input)
     {
+        if (TryUnaryResidentInto(dest, input, static (be, i, o, n) => be.Gelu(i, o, n), "GELU")) return;
         if (TryGetBackend(out var gpuBackend))
         {
             try
@@ -4778,8 +4803,56 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// Uses cached GPU buffers for registered persistent tensors (weights/bias) to avoid
     /// redundant CPU→GPU transfers on every forward pass.
     /// </summary>
+    /// <summary>GPU-RESIDENT FusedLinear for the compiled step: GEMM into the destination's STABLE buffer +
+    /// in-place bias + in-place activation — no per-call output alloc (the GemmBias* helpers AllocateBuffer →
+    /// CUDA-906 during capture) and no result download (the host FusedLinear's DownloadBuffer → CUDA-900; the FFN
+    /// FusedLinear was the post-attention capture frontier). Bias + None/ReLU/GELU last-dim linear only; else
+    /// returns false and the caller takes the existing (eager) path.</summary>
+    internal bool TryFusedLinearResidentInto<T>(Tensor<T> input, Tensor<T> weights, Tensor<T>? bias,
+        FusedActivationType activation, FusedActivationParams? activationParams, out Tensor<T>? result)
+    {
+        result = null;
+        if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
+        if (activationParams is not null || bias is null || weights.Rank != 2 || !input.IsContiguous) return false;
+        if (activation != FusedActivationType.None && activation != FusedActivationType.ReLU && activation != FusedActivationType.GELU)
+            return false;
+        if (!TryGetBackend(out var backend) || backend is not DirectGpu.CUDA.CudaBackend cb) return false;
+        int K = weights.Shape._dims[0];   // input features
+        int N = weights.Shape._dims[1];   // output features
+        if (K <= 0 || N <= 0 || input.Length % K != 0) return false;
+        int M = input.Length / K;
+        try
+        {
+            using var inBuf = GetResidentOrPersistentInputBuffer(backend, input);
+            using var wBuf = GetWeightBufferPreferResident(backend, weights, PersistentTensorRole.Weights);
+            using var bBuf = GetWeightBufferPreferResident(backend, bias, PersistentTensorRole.Biases);
+            int[] outShape = (int[])input.Shape._dims.Clone(); outShape[^1] = N;
+            var outTensor = new Tensor<T>(new T[(long)M * N], outShape);
+            var outBuf = GetOrCreateResidentBuffer(backend, outTensor, M * N);
+            if (inBuf.Buffer.Handle == System.IntPtr.Zero || inBuf.Buffer.Size < (long)M * K
+                || wBuf.Buffer.Handle == System.IntPtr.Zero || wBuf.Buffer.Size < (long)K * N
+                || bBuf.Buffer.Handle == System.IntPtr.Zero || bBuf.Buffer.Size < N
+                || outBuf.Handle == System.IntPtr.Zero || outBuf.Size < (long)M * N)
+                return false;
+            cb.Gemm(inBuf.Buffer, wBuf.Buffer, outBuf, M, N, K, 1.0f, 0.0f);   // outBuf = input @ weights
+            cb.BiasAdd(outBuf, bBuf.Buffer, outBuf, M, N);                     // += bias[N] (in place)
+            if (activation == FusedActivationType.ReLU) cb.Relu(outBuf, outBuf, M * N);
+            else if (activation == FusedActivationType.GELU) cb.Gelu(outBuf, outBuf, M * N);
+            ResidentSyncCheck("FusedLinear");
+            BindResidentBuffer(outTensor, outBuf, backend);
+            result = outTensor;
+            return true;
+        }
+        catch (Exception fex) { AliasDiag($"FusedLinear-resident FELLBACK in=[{string.Join(",", input._shape)}] act={activation}: {fex.GetType().Name}: {fex.Message}"); return false; }
+    }
+
     public override Tensor<T> FusedLinear<T>(Tensor<T> input, Tensor<T> weights, Tensor<T>? bias, FusedActivationType activation, FusedActivationParams? activationParams = null)
     {
+        // GPU-RESIDENT compiled-step path first (no per-call alloc, no download → capture-safe). Falls through to
+        // the eager path below when not on the resident step / unsupported activation / no bias.
+        if (TryFusedLinearResidentInto(input, weights, bias, activation, activationParams, out var resident) && resident is not null)
+            return resident;
+
         // Parametric activation parameters (LeakyReLU slope, ELU/CELU alpha,
         // ThresholdedReLU theta, ScaledTanh alpha/beta) are not yet plumbed into
         // the GPU fused kernels — defer to the base CPU params-aware path so a
