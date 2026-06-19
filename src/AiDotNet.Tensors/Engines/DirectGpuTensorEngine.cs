@@ -16843,7 +16843,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (DirectGpuEngine.ShouldFallbackForPrecision<T>())
             return base.TensorBroadcastAdd(a, b);
-        if (TryGetBackend(out var backend) && a.Length > b.Length && a.Length % b.Length == 0)
+        // BroadcastAddLast(outer, inner=b.Length) computes out[o*inner+i] = a[o*inner+i] + b[i] — i.e. b
+        // MUST map to a's contiguous LAST axis (or be a scalar). For a channel-broadcast like
+        // [N,C,H,W] + [1,C,1,1] the b vector spans the OUTER (channel) axis with stride H*W, so
+        // BroadcastAddLast adds b[flat % C] instead of b[flat / (H*W)] — silently wrong (it made
+        // MobileNetV3's per-channel BN bias diverge on GPU and the whole forward collapse). Only take
+        // the GPU fast path when b is a scalar or genuinely aligns with a's last axis; otherwise fall
+        // through to the shape-aware CPU broadcast.
+        if (TryGetBackend(out var backend) && a.Length > b.Length && a.Length % b.Length == 0
+            && (b.Length == 1 || a.Shape._dims[a.Rank - 1] == b.Length))
         {
             try
             {
@@ -16867,7 +16875,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (DirectGpuEngine.ShouldFallbackForPrecision<T>())
             return base.TensorBroadcastSubtract(a, b);
-        if (TryGetBackend(out var backend) && a.Length > b.Length && a.Length % b.Length == 0)
+        // See TensorBroadcastAdd: BroadcastSubLast only maps b to a's contiguous last axis (or scalar);
+        // a non-last-axis (e.g. per-channel [1,C,1,1]) broadcast must fall back to the CPU path.
+        if (TryGetBackend(out var backend) && a.Length > b.Length && a.Length % b.Length == 0
+            && (b.Length == 1 || a.Shape._dims[a.Rank - 1] == b.Length))
         {
             try
             {
@@ -16891,7 +16902,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (DirectGpuEngine.ShouldFallbackForPrecision<T>())
             return base.TensorBroadcastDivide(a, b);
-        if (TryGetBackend(out var backend) && a.Length > b.Length && a.Length % b.Length == 0)
+        // See TensorBroadcastAdd: BroadcastDivLast only maps b to a's contiguous last axis (or scalar);
+        // a non-last-axis (e.g. per-channel [1,C,1,1]) broadcast must fall back to the CPU path.
+        if (TryGetBackend(out var backend) && a.Length > b.Length && a.Length % b.Length == 0
+            && (b.Length == 1 || a.Shape._dims[a.Rank - 1] == b.Length))
         {
             try
             {
