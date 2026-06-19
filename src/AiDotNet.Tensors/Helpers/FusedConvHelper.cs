@@ -101,73 +101,78 @@ internal static class FusedConvHelper
     {
         int kernelSize = kernelH * kernelW;
 
-        // Parallel over output channel tiles for large convolutions
-        bool useParallel = M >= 64 && N >= 1024 && Environment.ProcessorCount > 1;
+        // Parallelize over a 2D grid of (output-channel tile × spatial tile). #642:
+        // the old gate (M>=64 && N>=1024, N = output H*W) ran the WHOLE conv serially for
+        // every small-spatial conv — i.e. all the deep SD-UNet stages (16x16, 8x8), which
+        // carry the most channels and the most FLOPs — and even when it did parallelize it
+        // split only the channel dim, so a shallow conv (outChannels==Mc) got a single tile.
+        // Net: ~90% of the diffusion forward ran on one core (measured: maxdop 1->16 = 1.13x).
+        // Tiling BOTH dims fans every shape out: channel-heavy/small-spatial deep convs split
+        // over M-tiles, large-spatial shallow convs split over N-tiles. Each (mTile,nTile)
+        // writes a DISJOINT C[m-range, n-range] block (C is [outChannels, outputSize]), so
+        // chunks never alias — the same disjoint-output invariant the engine's other parallel
+        // kernels rely on, and bit-reproducible regardless of thread count (each output element
+        // is reduced over K by a single thread in fixed order) => deterministicSafe. The K-loop
+        // order inside each tile is identical to the old ProcessMcTile, so output is unchanged.
+        // ParallelForOrSerial self-gates: serial below the grain size, when pinned to one
+        // thread, or when already inside a parallel region (a batched/outer-parallel caller).
+        int numMTiles = (M + Mc - 1) / Mc;
+        int numNTiles = (N + Nc - 1) / Nc;
+        int totalTiles = numMTiles * numNTiles;
 
-        if (useParallel)
-        {
-            int numMTiles = (M + Mc - 1) / Mc;
-            AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, numMTiles, (long)M * N * K, mcTile =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(
+            0, totalTiles, (long)M * N * K, tileId =>
             {
-                int mc = mcTile * Mc;
+                int mTile = tileId / numNTiles;
+                int nTile = tileId % numNTiles;
+                int mc = mTile * Mc;
                 int mcEnd = Math.Min(mc + Mc, M);
-
-                ProcessMcTile(A, input, C, mc, mcEnd, M, N, K,
+                int nc = nTile * Nc;
+                int ncEnd = Math.Min(nc + Nc, N);
+                ProcessMcNcTile(A, input, C, mc, mcEnd, nc, ncEnd, M, N, K,
                     height, width, outHeight, outWidth,
                     kernelH, kernelW, kernelSize, strideH, strideW,
                     padH, padW, dilationH, dilationW, inChannels);
-            });
-        }
-        else
-        {
-            // Sequential processing
-            for (int mc = 0; mc < M; mc += Mc)
-            {
-                int mcEnd = Math.Min(mc + Mc, M);
-                ProcessMcTile(A, input, C, mc, mcEnd, M, N, K,
-                    height, width, outHeight, outWidth,
-                    kernelH, kernelW, kernelSize, strideH, strideW,
-                    padH, padW, dilationH, dilationW, inChannels);
-            }
-        }
+            }, deterministicSafe: true);
     }
 
+    /// <summary>
+    /// Compute one output block: output-channel range [mc,mcEnd) × spatial range
+    /// [ncStart,ncEnd). Tiles over K then runs the Mr×Nr fused-im2col micro-kernel. The
+    /// (kc outer, then m, then n) order matches the previous full-N ProcessMcTile so each
+    /// output element's K-reduction is bit-identical; the block is disjoint from every
+    /// other tile, so calls are safe to run concurrently (#642 2D conv parallelism).
+    /// </summary>
     [MethodImpl(HotInline)]
-    private static unsafe void ProcessMcTile(
+    private static unsafe void ProcessMcNcTile(
         float* A, float* input, float* C,
-        int mc, int mcEnd, int M, int N, int K,
+        int mc, int mcEnd, int ncStart, int ncEnd, int M, int N, int K,
         int height, int width, int outHeight, int outWidth,
         int kernelH, int kernelW, int kernelSize,
         int strideH, int strideW, int padH, int padW,
         int dilationH, int dilationW, int inChannels)
     {
-        // Tile over spatial positions (N)
-        for (int nc = 0; nc < N; nc += Nc)
+        // Tile over K (input channels * kernel elements)
+        for (int kc = 0; kc < K; kc += Kc)
         {
-            int ncEnd = Math.Min(nc + Nc, N);
+            int kcEnd = Math.Min(kc + Kc, K);
 
-            // Tile over K (input channels * kernel elements)
-            for (int kc = 0; kc < K; kc += Kc)
+            // Micro-kernel: process Mr x Nr blocks within this (channel, spatial) tile
+            for (int m = mc; m < mcEnd; m += Mr)
             {
-                int kcEnd = Math.Min(kc + Kc, K);
+                int mEnd = Math.Min(m + Mr, mcEnd);
 
-                // Micro-kernel: process Mr x Nr blocks
-                for (int m = mc; m < mcEnd; m += Mr)
+                for (int n = ncStart; n < ncEnd; n += Nr)
                 {
-                    int mEnd = Math.Min(m + Mr, mcEnd);
+                    int nEnd = Math.Min(n + Nr, ncEnd);
 
-                    for (int n = nc; n < ncEnd; n += Nr)
-                    {
-                        int nEnd = Math.Min(n + Nr, ncEnd);
-
-                        // Compute micro-tile with fused im2col
-                        ComputeMicroTileFused(
-                            A, input, C,
-                            m, mEnd, n, nEnd, kc, kcEnd, K, N,
-                            height, width, outHeight, outWidth,
-                            kernelH, kernelW, kernelSize, strideH, strideW,
-                            padH, padW, dilationH, dilationW, inChannels);
-                    }
+                    // Compute micro-tile with fused im2col
+                    ComputeMicroTileFused(
+                        A, input, C,
+                        m, mEnd, n, nEnd, kc, kcEnd, K, N,
+                        height, width, outHeight, outWidth,
+                        kernelH, kernelW, kernelSize, strideH, strideW,
+                        padH, padW, dilationH, dilationW, inChannels);
                 }
             }
         }
