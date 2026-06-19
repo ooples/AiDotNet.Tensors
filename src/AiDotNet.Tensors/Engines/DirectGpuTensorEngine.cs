@@ -3441,6 +3441,32 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         catch (Exception eex) { AliasDiag($"EmbFloat-resident FELLBACK n={numIndices} dim={embeddingDim}: {eex.GetType().Name}: {eex.Message}"); return false; }
     }
 
+    /// <summary>PR #638 A1: resident embedding BACKWARD — scatter-add the grad rows into a resident [vocab,dim]
+    /// table-grad via the backend EmbeddingBackward kernel, reusing the forward's STABLE on-device index buffer
+    /// (_cachedEmbIndexBuffer) so the float-index GetDataArray() download that aborts capture is skipped entirely.
+    /// Returns the bound table-grad, else null (off the resident step / no cached indices → caller's CPU path).</summary>
+    internal Tensor<T>? TryEmbeddingBackwardResident<T>(Tensor<T> gradOutput, int numIndices, int vocabSize, int embeddingDim, int[] tableShape)
+    {
+        if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return null;
+        if (!TryGetBackend(out var backend) || _cachedEmbIndexBuffer is null) return null;
+        if ((long)numIndices * embeddingDim != gradOutput.Length) return null;
+        var grad = gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous();
+        var gR = ResolveResidentBufferNoUpload(backend, grad, numIndices * embeddingDim);
+        if (gR is null) return null;
+        try
+        {
+            var gradTable = new Tensor<T>(new T[(long)vocabSize * embeddingDim], tableShape);
+            var gradBuf = GetOrCreateResidentBuffer(backend, gradTable, vocabSize * embeddingDim);
+            if (gradBuf.Handle == System.IntPtr.Zero || gradBuf.Size < (long)vocabSize * embeddingDim) return null;
+            backend.Fill(gradBuf, 0f, vocabSize * embeddingDim);   // EmbeddingBackward scatter-ADDs → zero-init
+            backend.EmbeddingBackward(gR, _cachedEmbIndexBuffer, gradBuf, numIndices, embeddingDim, vocabSize);
+            ResidentSyncCheck("EmbeddingBackward");
+            BindResidentBuffer(gradTable, gradBuf, backend);
+            return gradTable;
+        }
+        catch (Exception ex) { AliasDiag($"EmbeddingBackward-resident FELLBACK n={numIndices} dim={embeddingDim}: {ex.GetType().Name}: {ex.Message}"); return null; }
+    }
+
     /// <summary>GPU-RESIDENT slice-along-axis for the compiled step (e.g. the LM-head last-token select
     /// [B,S,D]→[B,D]): backend.SliceAxis into the destination's stable buffer — no host TensorSliceAxis that
     /// materializes the input (DtoH download = non-capturable CUDA-900). Returns false to fall back.</summary>
@@ -17368,7 +17394,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         return result;
     }
-    public override Tensor<T> TensorExpandDims<T>(Tensor<T> tensor, int axis) => base.TensorExpandDims(tensor, axis);
+    public override Tensor<T> TensorExpandDims<T>(Tensor<T> tensor, int axis)
+    {
+        var result = base.TensorExpandDims(tensor, axis);
+        // PR #638 A1: ExpandDims is a metadata-only view (same flat buffer + a size-1 axis). Propagate the input's
+        // resident GPU buffer so the ReduceSum-backward broadcast chain (ExpandDims→Reshape→Tile) stays resident.
+        if (ResidentStepActive && typeof(T) == typeof(float) && result.Length == tensor.Length
+            && !ReferenceEquals(result, tensor) && TryGetBackend(out var backend))
+        {
+            var resident = ResolveResidentBufferNoUpload(backend, tensor, tensor.Length);
+            if (resident is not null) BindResidentBuffer(result, resident, backend);
+        }
+        return result;
+    }
     public override Tensor<T> TensorFlatten<T>(Tensor<T> tensor) => base.TensorFlatten(tensor);
     public override Tensor<T> TensorSqueeze<T>(Tensor<T> tensor, int axis) => base.TensorSqueeze(tensor, axis);
 
@@ -18054,18 +18092,65 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorTile<T>(Tensor<T> tensor, int[] multiples)
     {
-        // PR #638 A1: resident-step tile of a trailing size-1 axis ([rows,1]→[rows,cols], the ReduceSum-backward
-        // broadcast) via the resident outer-product GEMM (src[rows,1]·ones[1,cols]) — no Tile kernel, no download.
-        // Only the exact 2D [rows,1]×[1,cols] shape; everything else falls to the base tile.
+        // PR #638 A1: resident-step tile of the TRAILING size-1 axis (..,1) → (..,cols) — the ReduceSum-backward
+        // broadcast for any rank — via the resident outer-product GEMM (src[outer,1]·ones[1,cols]). No Tile kernel,
+        // no download. Engages only when every non-last multiple is 1 and the source's last dim is 1.
         if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float)
-            && tensor.Rank == 2 && multiples.Length == 2
-            && tensor.Shape._dims[1] == 1 && multiples[0] == 1 && multiples[1] >= 1)
+            && tensor.Rank >= 1 && multiples.Length == tensor.Rank
+            && tensor.Shape._dims[tensor.Rank - 1] == 1 && multiples[tensor.Rank - 1] >= 1)
         {
-            int rows = tensor.Shape._dims[0], cols = multiples[1];
-            if (TryResidentOuterBroadcast(tensor, rows, cols, new[] { rows, cols }, 1f, onesOnRight: true) is { } r)
-                return r;
+            bool onlyLast = true;
+            for (int i = 0; i < tensor.Rank - 1; i++) if (multiples[i] != 1) { onlyLast = false; break; }
+            if (onlyLast)
+            {
+                int outer = 1; for (int i = 0; i < tensor.Rank - 1; i++) outer *= tensor.Shape._dims[i];
+                int cols = multiples[tensor.Rank - 1];
+                var outShape = (int[])tensor.Shape._dims.Clone();
+                outShape[tensor.Rank - 1] = cols;
+                if (TryResidentOuterBroadcast(tensor, outer, cols, outShape, 1f, onesOnRight: true) is { } r)
+                    return r;
+                if (System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") == "1")
+                    AliasDiag($"TensorTile-resident bail outer={outer} cols={cols} src=[{string.Join(",", tensor._shape)}]");
+            }
         }
         return ((IEngine)this).TensorTile(tensor, multiples);
+    }
+
+    /// <summary>PR #638 A1: resident set-slice-along-axis (the SliceAxis backward scatters the grad into a fresh
+    /// zeroed buffer at [...,index,...]). Zero the resident destination (Fill) then write the source slice via the
+    /// backend SetSliceAxis kernel — no download. Falls to the CPU path off the resident step / non-contiguous.</summary>
+    void IEngine.TensorSetSliceAxis<T>(Tensor<T> destination, Tensor<T> source, int axis, int index)
+    {
+        if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float)
+            && destination.IsContiguous && axis >= 0 && axis < destination.Rank
+            && index >= 0 && index < destination.Shape._dims[axis] && TryGetBackend(out var backend))
+        {
+            var src = source.IsContiguous ? source : source.Contiguous();
+            var srcR = ResolveResidentBufferNoUpload(backend, src, src.Length);
+            if (srcR is not null)
+            {
+                try
+                {
+                    int stride = 1;
+                    for (int d = axis + 1; d < destination.Rank; d++) stride *= destination.Shape._dims[d];
+                    int outerCount = 1;
+                    for (int d = 0; d < axis; d++) outerCount *= destination.Shape._dims[d];
+                    int axisSize = destination.Shape._dims[axis];
+                    var dstBuf = GetOrCreateResidentBuffer(backend, destination, destination.Length);
+                    if (backend is DirectGpu.IGpuBatchExecution batchEng
+                        && dstBuf.Handle != System.IntPtr.Zero && dstBuf.Size >= destination.Length)
+                    {
+                        backend.Fill(dstBuf, 0f, destination.Length);
+                        batchEng.SetSliceAxis(dstBuf, srcR, outerCount, axisSize, stride, index);
+                        ResidentSyncCheck("SetSliceAxisResident");
+                        BindResidentBuffer(destination, dstBuf, backend);
+                        return;
+                    }
+                }
+                catch (Exception ex) { AliasDiag($"SetSliceAxis-resident FELLBACK: {ex.GetType().Name}: {ex.Message}"); }
+            }
+        }
+        base.TensorSetSliceAxis(destination, source, axis, index);
     }
 
     public override Tensor<T> TensorSlice<T>(Tensor<T> tensor, int[] start, int[] length)
@@ -18572,6 +18657,27 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     Tensor<T> IEngine.TensorTile<T>(Tensor<T> tensor, int[] multiples)
     {
         if (IsTapeActive<T>()) return base.TensorTile(tensor, multiples);
+        // PR #638 A1: resident-step trailing-axis tile (the ReduceSum-backward broadcast [..,1]→[..,cols]) via the
+        // resident outer-product GEMM — no UploadTensorRaw/DeferTensorResult download. Must live HERE (the explicit
+        // interface impl), not the public override: BroadcastGradToShape calls engine.TensorTile via IEngine.
+        if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float)
+            && tensor.Rank >= 1 && multiples.Length == tensor.Rank
+            && tensor.Shape._dims[tensor.Rank - 1] == 1 && multiples[tensor.Rank - 1] >= 1)
+        {
+            bool onlyLast = true;
+            for (int i = 0; i < tensor.Rank - 1; i++) if (multiples[i] != 1) { onlyLast = false; break; }
+            if (onlyLast)
+            {
+                int outer = 1; for (int i = 0; i < tensor.Rank - 1; i++) outer *= tensor.Shape._dims[i];
+                int cols = multiples[tensor.Rank - 1];
+                var outShape = (int[])tensor.Shape._dims.Clone();
+                outShape[tensor.Rank - 1] = cols;
+                if (TryResidentOuterBroadcast(tensor, outer, cols, outShape, 1f, onesOnRight: true) is { } r)
+                    return r;
+                if (System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") == "1")
+                    AliasDiag($"IEngine.TensorTile-resident bail outer={outer} cols={cols} src=[{string.Join(",", tensor._shape)}]");
+            }
+        }
         if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb) && multiples.Length==tensor.Rank && multiples[multiples.Length-1]>1)
         { try { int lastAxis=tensor.Rank-1; bool onlyLastTiled=true; for(int i=0;i<lastAxis;i++) if(multiples[i]!=1) onlyLastTiled=false; if(onlyLastTiled){ int outerSize=1; for(int i=0;i<lastAxis;i++)outerSize*=tensor.Shape._dims[i]; int innerSize=tensor.Shape._dims[lastAxis]; int repeats=multiples[lastAxis]; int total=outerSize*innerSize*repeats; var gi=UploadTensorRaw(bb, tensor); var go=bb.AllocateBuffer(total); bb.TileLastAxis(gi,go,outerSize,innerSize,repeats); int[] outShape=(int[])tensor.Shape._dims.Clone(); outShape[lastAxis]*=repeats; return DeferTensorResult<T>(bb,go,total,outShape); } } catch{} }
         return base.TensorTile(tensor,multiples);

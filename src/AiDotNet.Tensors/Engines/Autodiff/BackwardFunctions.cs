@@ -1268,6 +1268,19 @@ internal static class BackwardFunctions<T>
         int vocabSize = (int)savedState[1];
         int embeddingDim = (int)savedState[2];
 
+        // PR #638 A1: resident embedding backward — scatter-add into a resident [vocab,dim] table-grad via the
+        // forward's stable on-device index buffer, skipping the capturedFloatIdx.GetDataArray() download (CUDA-900).
+        if (engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine deEmb && deEmb.ResidentStepActive)
+        {
+            var residentTableGrad = deEmb.TryEmbeddingBackwardResident<T>(
+                gradOutput, capturedFloatIdx.Length, vocabSize, embeddingDim, inputs[0]._shape);
+            if (residentTableGrad is not null)
+            {
+                DifferentiableOps.AccumulateGrad(grads, inputs[0], residentTableGrad, engine);
+                return;
+            }
+        }
+
         // Materialise fresh int indices for this Step. The float input may
         // have been overwritten between forward and backward — that's the
         // whole reason this op exists — so the int[] we build here MUST
