@@ -627,6 +627,15 @@ public sealed partial class MetalBackend
         int strideH, int strideW)
     {
         ThrowIfDisposed();
+        try
+        {
+            if (bias is not null && TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "locally_connected_conv2d",
+                batch * outChannels * outHeight * outWidth, new[] { input, weights, bias, output },
+                new[] { batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW }))
+                return;
+        }
+        catch { /* fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         var w = DownloadBuffer(weights);
         float[]? b = bias is not null ? DownloadBuffer(bias) : null;
@@ -670,6 +679,15 @@ public sealed partial class MetalBackend
         int strideH, int strideW)
     {
         ThrowIfDisposed();
+        try
+        {
+            if (TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "locally_connected_conv2d_backward_input",
+                batch * inChannels * inHeight * inWidth, new[] { gradOutput, weights, gradInput },
+                new[] { batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW }))
+                return;
+        }
+        catch { /* fall through to CPU reference */ }
+
         var go = DownloadBuffer(gradOutput);
         var w = DownloadBuffer(weights);
         var result = new float[batch * inChannels * inHeight * inWidth];
@@ -709,6 +727,15 @@ public sealed partial class MetalBackend
         int strideH, int strideW)
     {
         ThrowIfDisposed();
+        try
+        {
+            if (TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "locally_connected_conv2d_backward_weights",
+                outHeight * outWidth * outChannels * inChannels * kernelH * kernelW, new[] { gradOutput, input, gradWeights },
+                new[] { batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW }))
+                return;
+        }
+        catch { /* fall through to CPU reference */ }
+
         var go = DownloadBuffer(gradOutput);
         var inp = DownloadBuffer(input);
         var result = new float[outHeight * outWidth * outChannels * inChannels * kernelH * kernelW];
@@ -746,6 +773,14 @@ public sealed partial class MetalBackend
         int batch, int outChannels, int outHeight, int outWidth)
     {
         ThrowIfDisposed();
+        try
+        {
+            if (TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "locally_connected_conv2d_backward_bias",
+                outChannels, new[] { gradOutput, gradBias }, new[] { batch, outChannels, outHeight, outWidth }))
+                return;
+        }
+        catch { /* fall through to CPU reference */ }
+
         var go = DownloadBuffer(gradOutput);
         var result = new float[outChannels];
 
@@ -781,6 +816,17 @@ public sealed partial class MetalBackend
         int groups, int deformGroups)
     {
         ThrowIfDisposed();
+        try
+        {
+            if (mask is not null && groups > 0 && deformGroups > 0
+                && inChannels % groups == 0 && inChannels % deformGroups == 0
+                && TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "deformable_conv2d",
+                    batch * outChannels * outHeight * outWidth, new[] { input, weights, offsets, mask, output },
+                    new[] { batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, groups, deformGroups }))
+                return;
+        }
+        catch { /* fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         var w = DownloadBuffer(weights);
         var off = DownloadBuffer(offsets);
@@ -839,6 +885,17 @@ public sealed partial class MetalBackend
         int groups, int deformGroups)
     {
         ThrowIfDisposed();
+        try
+        {
+            if (mask is not null && groups > 0 && deformGroups > 0
+                && inChannels % groups == 0 && inChannels % deformGroups == 0
+                && TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "deformable_conv2d_backward_input",
+                    batch * inChannels * inHeight * inWidth, new[] { gradOutput, weights, offsets, mask, gradInput },
+                    new[] { batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, groups, deformGroups }))
+                return;
+        }
+        catch { /* fall through to CPU reference */ }
+
         var go = DownloadBuffer(gradOutput);
         var w = DownloadBuffer(weights);
         var off = DownloadBuffer(offsets);
@@ -911,6 +968,17 @@ public sealed partial class MetalBackend
         int groups, int deformGroups)
     {
         ThrowIfDisposed();
+        try
+        {
+            if (mask is not null && groups > 0 && deformGroups > 0
+                && inChannels % groups == 0 && inChannels % deformGroups == 0
+                && TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "deformable_conv2d_backward_weights",
+                    outChannels * (inChannels / groups) * kernelH * kernelW, new[] { gradOutput, input, offsets, mask, gradWeights },
+                    new[] { batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, groups, deformGroups }))
+                return;
+        }
+        catch { /* fall through to CPU reference */ }
+
         var go = DownloadBuffer(gradOutput);
         var inp = DownloadBuffer(input);
         var off = DownloadBuffer(offsets);
@@ -970,6 +1038,18 @@ public sealed partial class MetalBackend
         int groups, int deformGroups)
     {
         ThrowIfDisposed();
+        try
+        {
+            int ksG = kernelH * kernelW;
+            if (mask is not null && groups > 0 && deformGroups > 0
+                && inChannels % groups == 0 && inChannels % deformGroups == 0
+                && TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "deformable_conv2d_backward_offset",
+                    batch * deformGroups * 2 * ksG * outHeight * outWidth, new[] { gradOutput, input, weights, offsets, mask, gradOffsets },
+                    new[] { batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, groups, deformGroups }))
+                return;
+        }
+        catch { /* fall through to CPU reference */ }
+
         var go = DownloadBuffer(gradOutput);
         var inp = DownloadBuffer(input);
         var w = DownloadBuffer(weights);
@@ -1045,6 +1125,18 @@ public sealed partial class MetalBackend
         int groups, int deformGroups)
     {
         ThrowIfDisposed();
+        try
+        {
+            int ksG = kernelH * kernelW;
+            if (groups > 0 && deformGroups > 0
+                && inChannels % groups == 0 && inChannels % deformGroups == 0
+                && TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "deformable_conv2d_backward_mask",
+                    batch * deformGroups * ksG * outHeight * outWidth, new[] { gradOutput, input, weights, offsets, gradMask },
+                    new[] { batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, groups, deformGroups }))
+                return;
+        }
+        catch { /* fall through to CPU reference */ }
+
         var go = DownloadBuffer(gradOutput);
         var inp = DownloadBuffer(input);
         var w = DownloadBuffer(weights);
