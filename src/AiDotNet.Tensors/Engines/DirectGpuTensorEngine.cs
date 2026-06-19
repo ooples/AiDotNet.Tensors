@@ -15996,6 +15996,31 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // permute→device→host round-trip every time even though the result
         // was indistinguishable from a metadata-only stride permute.
         //
+        // PR #638 A1: during the resident step (CUDA-graph capture of the compiled backward), the strided VIEW
+        // returned here is non-contiguous, so the downstream grad-accum's gradForInPlace = grad.Contiguous()
+        // materializes it on the HOST → DtoH download → CUDA-900 abort. Materialize the permutation on-GPU into a
+        // fresh contiguous resident buffer (via the resident TensorPermuteInto path) so the backward permute grad
+        // stays resident + contiguous. Records PermuteBackward exactly as the base view path. Only in the resident
+        // step — outside it the view contract (IsContiguous == false) is preserved.
+        if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float)
+            && axes.Length == tensor.Shape._dims.Length)
+        {
+            try
+            {
+                var outDims = new int[axes.Length];
+                for (int i = 0; i < axes.Length; i++) outDims[i] = tensor.Shape._dims[axes[i]];
+                var output = new Tensor<T>(new T[tensor.Length], outDims);
+                TensorPermuteInto(output, tensor, axes);
+                if (output.TryGetGpuBuffer() is not null)
+                {
+                    Autodiff.DifferentiableOps.RecordUnary("TensorPermute", output, tensor,
+                        Autodiff.BackwardFunctions<T>.PermuteBackward, new object[] { axes });
+                    return output;
+                }
+            }
+            catch (Exception ex) { AliasDiag($"Permute-resident FELLBACK axes=[{string.Join(",", axes)}]: {ex.GetType().Name}: {ex.Message}"); }
+        }
+
         // Delegate to the CPU/base path which returns the strided view.
         // Downstream GPU ops that genuinely need contiguous layout call
         // `.Contiguous()` themselves at the point they need it.
