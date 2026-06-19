@@ -2481,12 +2481,14 @@ public partial class DirectGpuTensorEngine
     // tapeless ones get DropTransientActivationsCreatedAfter; tape-active are skipped). AIDOTNET_MHA_DIAG=1.
     private static readonly bool s_mhaDiag = System.Environment.GetEnvironmentVariable("AIDOTNET_MHA_DIAG") == "1";
     private static long s_mhaTotal, s_mhaTapeActive;
+    private const int MhaDiagDumpInterval = 500;                    // dump every N MHA calls
+    private const string MhaDiagFileName = "aidotnet_mha_diag.txt"; // under Path.GetTempPath()
     private static void MhaDiag(bool tapeActive)
     {
         long tot = System.Threading.Interlocked.Increment(ref s_mhaTotal);
         if (tapeActive) System.Threading.Interlocked.Increment(ref s_mhaTapeActive);
-        if (tot % 500 == 0)
-            try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_mha_diag.txt"),
+        if (tot % MhaDiagDumpInterval == 0)
+            try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), MhaDiagFileName),
                 $"MHA calls={tot} tapeActive={System.Threading.Interlocked.Read(ref s_mhaTapeActive)} dropFreedTotal={System.Threading.Interlocked.Read(ref s_dropFreedTotal)}" + System.Environment.NewLine); } catch { }
     }
 

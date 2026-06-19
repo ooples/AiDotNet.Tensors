@@ -800,6 +800,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     // read at static init, then a single bool check per Step.
     private static readonly bool s_stepProf =
         System.Environment.GetEnvironmentVariable("AIDOTNET_STEP_PROF") == "1";
+    // Step-profiler dump cadence (every N steps) and destination — configurable, with a temp-file fallback so no
+    // developer-local path is baked in.
+    private const int StepProfDumpInterval = 5;
+    private static readonly string StepProfDumpPath =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_STEP_PROF_PATH")
+        ?? System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_stepprof.txt");
     private static readonly bool _profileStepEnabled =
         System.Environment.GetEnvironmentVariable("AIDOTNET_PROFILE_STEP") == "1" || s_stepProf;
     private static long _profForwardUs, _profGradZeroUs, _profBackwardUs, _profOptimUs;
@@ -1039,6 +1045,13 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             for (int i = 0; i < _preAllocatedGrads.Length; i++)
                 residentEngine.EnsureResidentBuffer(_preAllocatedGrads[i]);
+            // PR #638 (review): the loss-grad SEED is NOT part of _preAllocatedGrads, so the captured reseed below
+            // (CopyBufferDtoD seed→dest) would find no seed GPU buffer and be skipped — leaving the captured
+            // backward to start from a zero/stale loss gradient. Bind the seed resident here AND initialize its
+            // constant 1.0 (the seed is filled with numOps.One at construction; cuMemsetD32/Fill is fine — the
+            // pre-pass is NOT capturing). The dest (_lossGradDest == gradMap[lossOutput]) is already bound above.
+            if (typeof(T) == typeof(float) && residentEngine.EnsureResidentBuffer(_lossGradSeed) is { } seedResident)
+                cb.Fill(seedResident, 1f, _lossGradSeed.Length);
         }
         if (_genericGradIndices != null)
         {
@@ -1319,14 +1332,15 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             System.Threading.Interlocked.Add(ref _profBackwardUs, (long)((t3 - t2) * tickToUs));
             System.Threading.Interlocked.Add(ref _profOptimUs,    (long)((t4 - t3) * tickToUs));
             int sc = System.Threading.Interlocked.Increment(ref _profStepCount);
-            // Periodic per-phase dump (AIDOTNET_STEP_PROF=1) to a known absolute path so the cortex's per-step
-            // time is attributable (forward / grad-zero / backward / optimizer). Where the PyTorch gap lives.
-            if (s_stepProf && sc % 5 == 0)
+            // Periodic per-phase dump (AIDOTNET_STEP_PROF=1) so the per-step time is attributable
+            // (forward / grad-zero / backward / optimizer). Path is configurable via AIDOTNET_STEP_PROF_PATH,
+            // else falls back to a temp file (no hardcoded developer path); interval is a named constant.
+            if (s_stepProf && sc % StepProfDumpInterval == 0)
             {
                 try
                 {
                     long f = _profForwardUs, gz = _profGradZeroUs, b = _profBackwardUs, o = _profOptimUs;
-                    System.IO.File.AppendAllText(@"C:\Users\cheat\HarmonicEngine\logs\stepprof.txt",
+                    System.IO.File.AppendAllText(StepProfDumpPath,
                         $"[STEPPROF] steps={sc} avgUs/step fwd={f / sc} gradZero={gz / sc} bwd={b / sc} opt={o / sc} total={(f + gz + b + o) / sc}"
                         + System.Environment.NewLine);
                 }

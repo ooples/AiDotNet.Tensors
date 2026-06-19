@@ -11487,15 +11487,15 @@ public partial class CpuEngine : ITensorLevelEngine
                     // 2D/ND×2D/ND×ND cases to write-through kernels.
                     (eng, output) =>
                     {
-                        // GPU-resident 2D / ND×2D matmul into output's stable buffer (no host materialize that
-                        // breaks CUDA-graph capture); else the host write-through path.
-                        if (eng is DirectGpuTensorEngine mmGpu && mmGpu.TryMatMulResidentInto(output, capturedA, capturedB))
-                            return;
-                        // GPU-resident ND×ND BATCHED matmul (attention QK^T / AV) — same residency contract via
-                        // cublasSgemmStridedBatched; without it the 4D attention matmuls host-fall-back = CUDA-900
-                        // that aborts capture (#38).
-                        if (eng is DirectGpuTensorEngine bmmGpu && bmmGpu.TryBatchedMatMulResidentInto(output, capturedA, capturedB))
-                            return;
+                        // GPU-resident matmul into output's stable buffer (no host materialize that breaks
+                        // CUDA-graph capture): 2D / ND×2D first, then ND×ND BATCHED (attention QK^T / AV via
+                        // cublasSgemmStridedBatched — without it the 4D attention matmuls host-fall-back = CUDA-900
+                        // that aborts capture, #38). Single type check; else the host write-through path below.
+                        if (eng is DirectGpuTensorEngine mmGpu)
+                        {
+                            if (mmGpu.TryMatMulResidentInto(output, capturedA, capturedB)) return;
+                            if (mmGpu.TryBatchedMatMulResidentInto(output, capturedA, capturedB)) return;
+                        }
                         if (typeof(T) == typeof(float) && eng is CpuEngine cpuEngF)
                         {
                             cpuEngF.TensorMatMulFloatInto(

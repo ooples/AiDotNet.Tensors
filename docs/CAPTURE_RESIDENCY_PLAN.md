@@ -15,7 +15,7 @@ For several sessions the work was reported as "almost done — one last op" beca
 
 ## 1. Acceptance Test (the definition of "done" for #638)
 
-#638 is COMPLETE when **all** of these hold in one clean run:
+PR #638 is COMPLETE when **all** of these hold in one clean run:
 
 1. **Capture engages:** `scripts/capture_health.sh` on the cortex (d128/L1, N≥8000) prints **`VERDICT: CAPTURE FULLY ENGAGED`** — i.e. `eagerFallback=False`, `CUDA-700 none`, **0 THREW**, and `_stepGraphExec != Zero` (the graph instantiates and replays).
 2. **Correctness gate:** held-out **CAND-RANK from the captured run == the eager run at the same seed+config** (within ±0.15pp). This compares *captured-vs-eager at identical config* — NOT against the historical 2.81% (which was a different N). A dedicated `HE_CAPTURE_PARITY` harness produces both numbers.
@@ -195,7 +195,7 @@ during capture):
 **The capture frontier has crossed into the BACKWARD pass.** First backward blocker
 (precisely characterized, defb333):
 
-```
+```text
 NegateBackward → AccumulateGradPoolable → TensorAddInPlace
   → TryRunBinaryInPlace → a.GetDataArray()
     → stale pooled-array DeferredArrayMaterializer → DownloadBuffer → CUDA-900

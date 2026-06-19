@@ -11851,6 +11851,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (input is null) throw new ArgumentNullException(nameof(input));
         if (gradInput is null) throw new ArgumentNullException(nameof(gradInput));
         if (size <= 0) throw new ArgumentOutOfRangeException(nameof(size), "Element count must be positive.");
+        // Validate half-buffer sizes (matches Fp16Softmax/LayerNormBackward) — an undersized pooled buffer would
+        // otherwise read/write out of bounds (the CUDA-700 class this PR root-causes elsewhere).
+        long geluHalfBytes = (long)size * 2;
+        if (gradOutput.SizeInBytes < geluHalfBytes) throw new ArgumentException($"gradOutput half buffer too small: {gradOutput.SizeInBytes} < {geluHalfBytes}.");
+        if (input.SizeInBytes < geluHalfBytes) throw new ArgumentException($"input half buffer too small: {input.SizeInBytes} < {geluHalfBytes}.");
+        if (gradInput.SizeInBytes < geluHalfBytes) throw new ArgumentException($"gradInput half buffer too small: {gradInput.SizeInBytes} < {geluHalfBytes}.");
         if (!_kernelCache.TryGetValue("fp16_gelu_backward_native", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: fp16_gelu_backward_native");
         using var _ = PushContext();
@@ -11868,6 +11874,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (input is null) throw new ArgumentNullException(nameof(input));
         if (gradInput is null) throw new ArgumentNullException(nameof(gradInput));
         if (size <= 0) throw new ArgumentOutOfRangeException(nameof(size), "Element count must be positive.");
+        // Validate half-buffer sizes (matches Fp16Softmax/LayerNormBackward) — an undersized pooled buffer would
+        // otherwise read/write out of bounds (the CUDA-700 class this PR root-causes elsewhere).
+        long reluHalfBytes = (long)size * 2;
+        if (gradOutput.SizeInBytes < reluHalfBytes) throw new ArgumentException($"gradOutput half buffer too small: {gradOutput.SizeInBytes} < {reluHalfBytes}.");
+        if (input.SizeInBytes < reluHalfBytes) throw new ArgumentException($"input half buffer too small: {input.SizeInBytes} < {reluHalfBytes}.");
+        if (gradInput.SizeInBytes < reluHalfBytes) throw new ArgumentException($"gradInput half buffer too small: {gradInput.SizeInBytes} < {reluHalfBytes}.");
         if (!_kernelCache.TryGetValue("fp16_relu_backward_native", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: fp16_relu_backward_native");
         using var _ = PushContext();

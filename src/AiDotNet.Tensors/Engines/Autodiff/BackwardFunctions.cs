@@ -1539,9 +1539,6 @@ internal static class BackwardFunctions<T>
         }
 
         // Now expandedGrad has the same rank as input with size-1 at reduced dims — tile to match
-        if (Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") == "1")
-            try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_graphcapture_diag.txt"),
-                $"[ALIAS] ReduceSumBwd gradOut=[{string.Join(",", gradOutput._shape)}] expanded=[{string.Join(",", expandedGrad._shape)}] inShape=[{string.Join(",", inputShape)}] axes=[{string.Join(",", axes)}] keepDims={keepDims}" + System.Environment.NewLine); } catch { }
         var grad = BroadcastGradToShape(expandedGrad, inputShape, engine);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
@@ -1552,9 +1549,6 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var axes = (int[])savedState[0];
-        if (Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") == "1")
-            try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_graphcapture_diag.txt"),
-                $"[ALIAS] ReduceMeanBwd gradOut=[{string.Join(",", gradOutput._shape)}] inShape=[{string.Join(",", inputs[0]._shape)}] axes=[{string.Join(",", axes)}]" + System.Environment.NewLine); } catch { }
         var grad = engine.ReduceMeanBackward(gradOutput, inputs[0]._shape, axes);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
@@ -2972,6 +2966,9 @@ internal static class BackwardFunctions<T>
     {
         var maskedGrad = engine.SigmoidBackward(gradOutput, output);
         if (typeof(T) == typeof(float) && inputs[0].Rank == 2 && GradientTape<T>.Current is null
+            // PR #638: skip the GetDataArray()-downloading fast path during CUDA-graph capture (route to the
+            // resident engine fallback) — capture-safety for Sigmoid/Tanh/GELU/Swish FFN backward, not just ReLU.
+            && !(engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine { ResidentStepActive: true })
             && (long)inputs[0]._shape[0] * inputs[0]._shape[1] * inputs[1]._shape[1] >= FusedLinearActivationFastPathMinWork)
         {
             FusedLinearActivationBackwardCore(
@@ -2989,6 +2986,9 @@ internal static class BackwardFunctions<T>
     {
         var maskedGrad = engine.TanhBackward(gradOutput, output);
         if (typeof(T) == typeof(float) && inputs[0].Rank == 2 && GradientTape<T>.Current is null
+            // PR #638: skip the GetDataArray()-downloading fast path during CUDA-graph capture (route to the
+            // resident engine fallback) — capture-safety for Sigmoid/Tanh/GELU/Swish FFN backward, not just ReLU.
+            && !(engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine { ResidentStepActive: true })
             && (long)inputs[0]._shape[0] * inputs[0]._shape[1] * inputs[1]._shape[1] >= FusedLinearActivationFastPathMinWork)
         {
             FusedLinearActivationBackwardCore(
@@ -3007,6 +3007,9 @@ internal static class BackwardFunctions<T>
         var preActivation = (Tensor<T>)savedState[0];
         var maskedGrad = engine.GeluBackward(gradOutput, preActivation);
         if (typeof(T) == typeof(float) && inputs[0].Rank == 2 && GradientTape<T>.Current is null
+            // PR #638: skip the GetDataArray()-downloading fast path during CUDA-graph capture (route to the
+            // resident engine fallback) — capture-safety for Sigmoid/Tanh/GELU/Swish FFN backward, not just ReLU.
+            && !(engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine { ResidentStepActive: true })
             && (long)inputs[0]._shape[0] * inputs[0]._shape[1] * inputs[1]._shape[1] >= FusedLinearActivationFastPathMinWork)
         {
             FusedLinearActivationBackwardCore(
@@ -3025,6 +3028,9 @@ internal static class BackwardFunctions<T>
         var preActivation = (Tensor<T>)savedState[0];
         var maskedGrad = engine.SwishBackward(gradOutput, preActivation);
         if (typeof(T) == typeof(float) && inputs[0].Rank == 2 && GradientTape<T>.Current is null
+            // PR #638: skip the GetDataArray()-downloading fast path during CUDA-graph capture (route to the
+            // resident engine fallback) — capture-safety for Sigmoid/Tanh/GELU/Swish FFN backward, not just ReLU.
+            && !(engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine { ResidentStepActive: true })
             && (long)inputs[0]._shape[0] * inputs[0]._shape[1] * inputs[1]._shape[1] >= FusedLinearActivationFastPathMinWork)
         {
             FusedLinearActivationBackwardCore(
@@ -4208,9 +4214,6 @@ internal static class BackwardFunctions<T>
         var axis = (int)savedState[0];
         var index = (int)savedState[1];
         var inputShape = inputs[0]._shape;
-        if (Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") == "1")
-            try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_graphcapture_diag.txt"),
-                $"[ALIAS] SliceAxisBwd gradOut=[{string.Join(",", gradOutput._shape)}] inShape=[{string.Join(",", inputShape)}] axis={axis} index={index}" + System.Environment.NewLine); } catch { }
         var grad = new Tensor<T>(inputShape); // zero-initialized
         // Place gradOutput into grad at the correct slice
         engine.TensorSetSliceAxis(grad, gradOutput, axis, index);
@@ -4422,7 +4425,10 @@ internal static class BackwardFunctions<T>
         // hundreds of MB and OOMs (ResNet50/fp64 LossStrictlyDecreases crashed here
         // in ComputeGradientsStreaming, not on convergence).
         if (typeof(T) == typeof(double) && inputs[0].Rank == 2 && inputs[1].Rank == 2
-            && gradOutput.IsContiguous && GradientTape<T>.Current is null)
+            && gradOutput.IsContiguous && GradientTape<T>.Current is null
+            // PR #638: skip the GetDataArray()-downloading double fast path during CUDA-graph capture (a resident
+            // T=double step would otherwise invalidate capture) → resident engine fallback below.
+            && !(engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine { ResidentStepActive: true }))
         {
             int M = inputs[0]._shape[0]; // batch
             int K = inputs[0]._shape[1]; // in_features
