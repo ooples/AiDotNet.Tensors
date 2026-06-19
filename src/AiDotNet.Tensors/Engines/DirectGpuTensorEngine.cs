@@ -3184,6 +3184,32 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         catch (Exception ex) { AliasDiag($"EnsureResidentBuffer FELLBACK len={need}: {ex.GetType().Name}: {ex.Message}"); return null; }
     }
 
+    /// <summary>PR #638 A1: resolve tensor `t`'s EXISTING resident GPU buffer (field → resident-param → activation
+    /// cache by backing array), big enough for `need`, WITHOUT uploading or allocating. Returns null when not
+    /// resident. Capture-safe (unlike GetResidentOrPersistentInputBuffer, which may upload/allocate). Used to
+    /// propagate residency through metadata-only views (Reshape) during the resident step.</summary>
+    private IGpuBuffer? ResolveResidentBufferNoUpload<T>(IDirectGpuBackend backend, Tensor<T> t, int need)
+    {
+        if (t._gpuBuffer is not null && ReferenceEquals(t._gpuBackend, backend)
+            && t._gpuBuffer.Handle != System.IntPtr.Zero && t._gpuBuffer.Size >= need)
+            return t._gpuBuffer;
+        var resident = t.TryGetGpuBuffer();
+        if (resident is not null && resident.Handle != System.IntPtr.Zero && resident.Size >= need)
+            return resident;
+        var arr = t.DataVector.GetBackingArrayUnsafe();
+        if (arr is not null)
+        {
+            var cached = TryGetCachedBuffer(arr);
+            if (cached is not null && cached.Handle != System.IntPtr.Zero && cached.Size >= need)
+                return cached;
+            lock (_activationCacheLock)
+                if (_activationCache.TryGetValue(arr, out var e) && ReferenceEquals(e.Backend, backend) && !e.IsFp16
+                    && e.Buffer.Handle != System.IntPtr.Zero && e.Buffer.Size >= need)
+                    return e.Buffer;
+        }
+        return null;
+    }
+
     // Stable per-LayerNorm mean/variance scratch buffers (keyed by the LN output's backing array), allocated
     // once so capture/replay don't cuMemAlloc them. The backward reads these (resident) via the state ref.
     private readonly System.Collections.Concurrent.ConcurrentDictionary<object, (IGpuBuffer mean, IGpuBuffer var)> _lnStatsScratch = new();
@@ -17002,7 +17028,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // ──────────────────────────────────────────────────────────────
 
     // Shape metadata ops — no GPU compute, override for full coverage
-    public override Tensor<T> Reshape<T>(Tensor<T> tensor, int[] newShape) => base.Reshape(tensor, newShape);
+    public override Tensor<T> Reshape<T>(Tensor<T> tensor, int[] newShape)
+    {
+        var result = base.Reshape(tensor, newShape);
+        // PR #638 A1: a reshape is a metadata-only view (same flat buffer, new shape). When the input is resident
+        // (e.g. the backward reshape's gradOutput), propagate that GPU buffer to the reshaped output so the grad
+        // stays resident for capture — otherwise the new view tensor has _gpuBuffer=null and grad-accum downloads it.
+        if (ResidentStepActive && typeof(T) == typeof(float) && result.Length == tensor.Length
+            && !ReferenceEquals(result, tensor) && TryGetBackend(out var backend))
+        {
+            var resident = ResolveResidentBufferNoUpload(backend, tensor, tensor.Length);
+            if (resident is not null) BindResidentBuffer(result, resident, backend);
+        }
+        return result;
+    }
     public override Tensor<T> TensorExpandDims<T>(Tensor<T> tensor, int axis) => base.TensorExpandDims(tensor, axis);
     public override Tensor<T> TensorFlatten<T>(Tensor<T> tensor) => base.TensorFlatten(tensor);
     public override Tensor<T> TensorSqueeze<T>(Tensor<T> tensor, int axis) => base.TensorSqueeze(tensor, axis);
