@@ -176,7 +176,6 @@ internal static class Program
             catch (Exception ex)
             {
                 Console.WriteLine($"DEFERRED-PATH-FAILED: {ex.GetType().Name}: {ex.Message}");
-                Console.WriteLine("(#642 P3 finding: the deferred GPU execution graph is not functional for a multi-op forward on real hardware — must be fixed before CUDA-graph capture can build on it.)");
                 return 3;
             }
         }

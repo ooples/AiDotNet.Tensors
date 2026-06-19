@@ -15274,6 +15274,15 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
         public void Release()
         {
+            // #642: while a deferred-execution scope is recording/replaying, queue the free
+            // until after the graph runs — the recorded op graph still references this buffer.
+            // The queued closure holds a strong ref, so GC can't reclaim it in the meantime.
+            if (AiDotNet.Tensors.Engines.Gpu.GpuBufferReleaseDeferral.TryDefer(ReleaseCore)) return;
+            ReleaseCore();
+        }
+
+        private void ReleaseCore()
+        {
             if (Interlocked.Exchange(ref _poolState, 2) == 2)
                 return;
 
@@ -15321,9 +15330,18 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
         public void Dispose()
         {
+            // #642: defer the whole dispose (free OR pool-return) until the deferred-execution
+            // scope finishes — returning to the pool mid-record could re-rent + overwrite a
+            // buffer the recorded graph still reads. Runs normally once the gate is cleared.
+            if (AiDotNet.Tensors.Engines.Gpu.GpuBufferReleaseDeferral.TryDefer(DisposeCore)) return;
+            DisposeCore();
+        }
+
+        private void DisposeCore()
+        {
             if (_returnToPool == null)
             {
-                Release();
+                ReleaseCore();
                 return;
             }
 
@@ -15337,7 +15355,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             catch (Exception)
             {
                 // If returning to pool fails for any reason, release directly
-                Release();
+                ReleaseCore();
             }
         }
 

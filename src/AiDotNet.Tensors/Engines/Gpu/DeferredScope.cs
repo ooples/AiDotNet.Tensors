@@ -77,6 +77,12 @@ public sealed class DeferredScope : IDeferredScope
         _recordingBackend = new RecordingGpuBackend(backend);
         _recordingBackend.BeginRecording(GraphBuilder);
 
+        // #642: defer buffer releases for the lifetime of this scope. Ops allocate buffers
+        // eagerly during recording but their compute is replayed at Execute(); without this the
+        // engine's normal tensor lifetime frees those buffers mid-record, leaving the recorded
+        // graph pointing at freed device memory. Flushed in Execute()/Dispose().
+        GpuBufferReleaseDeferral.Begin();
+
         // Set this scope as current (save parent for restore on dispose)
         _parentScope = _current;
         SetCurrentScope(this);
@@ -152,6 +158,10 @@ public sealed class DeferredScope : IDeferredScope
 
         RecordStatistics(graph, compilationTimer.Elapsed, executionTimer.Elapsed);
         IsExecuted = true;
+
+        // #642: graph has executed — now safe to run the buffer releases that were deferred
+        // during recording/replay.
+        GpuBufferReleaseDeferral.EndAndRelease();
     }
 
     /// <inheritdoc/>
@@ -197,6 +207,10 @@ public sealed class DeferredScope : IDeferredScope
 
         RecordStatistics(graph, compilationTimer.Elapsed, executionTimer.Elapsed);
         IsExecuted = true;
+
+        // #642: graph has executed — now safe to run the buffer releases that were deferred
+        // during recording/replay.
+        GpuBufferReleaseDeferral.EndAndRelease();
     }
 
     /// <inheritdoc/>
@@ -289,6 +303,11 @@ public sealed class DeferredScope : IDeferredScope
                 // Suppress exceptions during dispose
             }
         }
+
+        // Safety: if the scope was disposed without ever executing (e.g. empty graph), the
+        // deferral gate set in the ctor would otherwise leak into subsequent ops on this thread.
+        // Idempotent — Execute() already cleared it on the normal path.
+        GpuBufferReleaseDeferral.EndAndRelease();
 
         GraphBuilder.Dispose();
     }

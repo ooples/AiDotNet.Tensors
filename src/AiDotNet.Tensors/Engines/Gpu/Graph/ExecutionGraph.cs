@@ -13,6 +13,10 @@ public sealed class ExecutionGraph : IDisposable
     private readonly Dictionary<int, List<ExecutionNode>> _levelNodes;
     private readonly List<IGpuStream> _acquiredStreams = new();
     private readonly object _streamLock = new();
+    // #642: a stream pool whose streams the compiler embedded into this graph's nodes
+    // (AssignedStream / BarrierNode sync). Owned here so those streams stay valid for the
+    // graph's whole lifetime and are freed exactly once, when the graph is disposed.
+    private readonly GpuStreamPool? _ownedStreamPool;
     private bool _disposed;
 
     /// <summary>
@@ -58,6 +62,18 @@ public sealed class ExecutionGraph : IDisposable
         TotalEstimatedCost = _nodes.Sum(n => n.EstimatedCost);
         CriticalPathLength = _levelNodes.Count;
         MaxParallelism = _levelNodes.Values.Max(level => level.Count);
+    }
+
+    /// <summary>
+    /// Creates an execution graph that takes ownership of <paramref name="ownedStreamPool"/> — the
+    /// compiler's stream pool whose streams are embedded in the graph's nodes (#642). The pool is
+    /// disposed together with this graph, so the embedded streams outlive compilation and stay valid
+    /// throughout execution.
+    /// </summary>
+    internal ExecutionGraph(List<ExecutionNode> nodes, GpuStreamPool? ownedStreamPool)
+        : this(nodes)
+    {
+        _ownedStreamPool = ownedStreamPool;
     }
 
     /// <summary>
@@ -401,6 +417,9 @@ public sealed class ExecutionGraph : IDisposable
         {
             node.CompletionSync?.Dispose();
         }
+
+        // #642: free the compiler's embedded stream pool now that no node will touch its streams.
+        _ownedStreamPool?.Dispose();
     }
 
     /// <inheritdoc/>
