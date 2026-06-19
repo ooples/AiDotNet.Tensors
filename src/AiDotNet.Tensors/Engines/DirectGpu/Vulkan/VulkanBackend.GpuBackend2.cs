@@ -531,6 +531,19 @@ void main() {
         int kernelH, int kernelW, int strideH, int strideW)
     {
         EnsureInitialized();
+        try
+        {
+            // GPU path needs the bias SSBO (binding 3); the no-bias case uses the CPU reference.
+            if (bias is not null)
+            {
+                int total = batch * outChannels * outHeight * outWidth;
+                var pc = new uint[] { (uint)batch, (uint)inChannels, (uint)inHeight, (uint)inWidth,
+                    (uint)outChannels, (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW, (uint)strideH, (uint)strideW };
+                if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.LocallyConnectedConv2D, pc, total, input, weights, bias, output)) return;
+            }
+        }
+        catch { /* fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         var w = DownloadBuffer(weights);
         float[]? bi = bias is not null ? DownloadBuffer(bias) : null;
@@ -563,6 +576,15 @@ void main() {
         int kernelH, int kernelW, int strideH, int strideW)
     {
         EnsureInitialized();
+        try
+        {
+            int total = batch * inChannels * inHeight * inWidth;
+            var pc = new uint[] { (uint)batch, (uint)inChannels, (uint)inHeight, (uint)inWidth,
+                (uint)outChannels, (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW, (uint)strideH, (uint)strideW };
+            if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.LocallyConnectedConv2DBackwardInput, pc, total, gradOutput, weights, gradInput)) return;
+        }
+        catch { /* fall through to CPU reference */ }
+
         var go = DownloadBuffer(gradOutput);
         var w = DownloadBuffer(weights);
         var gi = new float[batch * inChannels * inHeight * inWidth];
@@ -593,6 +615,15 @@ void main() {
         int kernelH, int kernelW, int strideH, int strideW)
     {
         EnsureInitialized();
+        try
+        {
+            int total = outHeight * outWidth * outChannels * inChannels * kernelH * kernelW;
+            var pc = new uint[] { (uint)batch, (uint)inChannels, (uint)inHeight, (uint)inWidth,
+                (uint)outChannels, (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW, (uint)strideH, (uint)strideW };
+            if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.LocallyConnectedConv2DBackwardWeights, pc, total, gradOutput, input, gradWeights)) return;
+        }
+        catch { /* fall through to CPU reference */ }
+
         var go = DownloadBuffer(gradOutput);
         var inp = DownloadBuffer(input);
         var gw = new float[outHeight * outWidth * outChannels * inChannels * kernelH * kernelW];
@@ -621,6 +652,13 @@ void main() {
         int batch, int outChannels, int outHeight, int outWidth)
     {
         EnsureInitialized();
+        try
+        {
+            var pc = new uint[] { (uint)batch, (uint)outChannels, (uint)outHeight, (uint)outWidth };
+            if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.LocallyConnectedConv2DBackwardBias, pc, outChannels, gradOutput, gradBias)) return;
+        }
+        catch { /* fall through to CPU reference */ }
+
         var go = DownloadBuffer(gradOutput);
         var gb = new float[outChannels];
         for (int b = 0; b < batch; b++)

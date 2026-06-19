@@ -591,4 +591,116 @@ void main() {
         }
     outp[idx] = sum;
 }";
+
+    // ---- Locally connected Conv2D (forward, gather; weights [outH,outW,outC,inC,kH,kW]; bias [outC]; no padding) ----
+    public const string LocallyConnectedConv2D = Header + @"
+layout(set=0, binding=0) buffer B0 { float inp[]; };
+layout(set=0, binding=1) buffer B1 { float wgt[]; };
+layout(set=0, binding=2) buffer B2 { float bias[]; };
+layout(set=0, binding=3) buffer B3 { float outp[]; };
+layout(push_constant) uniform PC {
+    int batch; int inChannels; int inHeight; int inWidth;
+    int outChannels; int outHeight; int outWidth; int kernelH; int kernelW; int strideH; int strideW;
+};
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    int total = batch * outChannels * outHeight * outWidth;
+    if (gid >= uint(total)) return;
+    int idx = int(gid);
+    int ow = idx % outWidth; int t = idx / outWidth;
+    int oh = t % outHeight; t = t / outHeight;
+    int oc = t % outChannels; int b = t / outChannels;
+    int wBase = ((oh * outWidth + ow) * outChannels + oc) * inChannels * kernelH * kernelW;
+    float sum = bias[oc];
+    for (int ic = 0; ic < inChannels; ic++)
+        for (int kh = 0; kh < kernelH; kh++)
+            for (int kw = 0; kw < kernelW; kw++) {
+                int ih = oh * strideH + kh; int iw = ow * strideW + kw;
+                if (ih >= 0 && ih < inHeight && iw >= 0 && iw < inWidth)
+                    sum += inp[((b * inChannels + ic) * inHeight + ih) * inWidth + iw]
+                         * wgt[wBase + (ic * kernelH + kh) * kernelW + kw];
+            }
+    outp[((b * outChannels + oc) * outHeight + oh) * outWidth + ow] = sum;
+}";
+
+    // ---- Locally connected backward input (gather per input element) ----
+    public const string LocallyConnectedConv2DBackwardInput = Header + @"
+layout(set=0, binding=0) buffer B0 { float gradOutput[]; };
+layout(set=0, binding=1) buffer B1 { float wgt[]; };
+layout(set=0, binding=2) buffer B2 { float gradInput[]; };
+layout(push_constant) uniform PC {
+    int batch; int inChannels; int inHeight; int inWidth;
+    int outChannels; int outHeight; int outWidth; int kernelH; int kernelW; int strideH; int strideW;
+};
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    int total = batch * inChannels * inHeight * inWidth;
+    if (gid >= uint(total)) return;
+    int idx = int(gid);
+    int b = idx / (inChannels * inHeight * inWidth);
+    int r = idx % (inChannels * inHeight * inWidth);
+    int ic = r / (inHeight * inWidth);
+    int r2 = r % (inHeight * inWidth);
+    int ih = r2 / inWidth; int iw = r2 % inWidth;
+    float sum = 0.0;
+    for (int oh = 0; oh < outHeight; oh++)
+        for (int ow = 0; ow < outWidth; ow++) {
+            int khr = ih - oh * strideH; int kwr = iw - ow * strideW;
+            if (khr >= 0 && khr < kernelH && kwr >= 0 && kwr < kernelW) {
+                for (int oc = 0; oc < outChannels; oc++) {
+                    float g = gradOutput[((b * outChannels + oc) * outHeight + oh) * outWidth + ow];
+                    int wIdx = (((oh * outWidth + ow) * outChannels + oc) * inChannels + ic) * kernelH * kernelW + khr * kernelW + kwr;
+                    sum += g * wgt[wIdx];
+                }
+            }
+        }
+    gradInput[idx] = sum;
+}";
+
+    // ---- Locally connected backward weights (one thread per weight; layout [outH,outW,outC,inC,kH,kW]) ----
+    public const string LocallyConnectedConv2DBackwardWeights = Header + @"
+layout(set=0, binding=0) buffer B0 { float gradOutput[]; };
+layout(set=0, binding=1) buffer B1 { float inp[]; };
+layout(set=0, binding=2) buffer B2 { float gradWeights[]; };
+layout(push_constant) uniform PC {
+    int batch; int inChannels; int inHeight; int inWidth;
+    int outChannels; int outHeight; int outWidth; int kernelH; int kernelW; int strideH; int strideW;
+};
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    int total = outHeight * outWidth * outChannels * inChannels * kernelH * kernelW;
+    if (gid >= uint(total)) return;
+    int idx = int(gid);
+    int tmp = idx;
+    int kw = tmp % kernelW; tmp /= kernelW;
+    int kh = tmp % kernelH; tmp /= kernelH;
+    int ic = tmp % inChannels; tmp /= inChannels;
+    int oc = tmp % outChannels; tmp /= outChannels;
+    int ow = tmp % outWidth; tmp /= outWidth;
+    int oh = tmp;
+    int ih = oh * strideH + kh; int iw = ow * strideW + kw;
+    float sum = 0.0;
+    if (ih >= 0 && ih < inHeight && iw >= 0 && iw < inWidth)
+        for (int b = 0; b < batch; b++)
+            sum += gradOutput[((b * outChannels + oc) * outHeight + oh) * outWidth + ow]
+                 * inp[((b * inChannels + ic) * inHeight + ih) * inWidth + iw];
+    gradWeights[idx] = sum;
+}";
+
+    // ---- Locally connected backward bias (one thread per output channel) ----
+    public const string LocallyConnectedConv2DBackwardBias = Header + @"
+layout(set=0, binding=0) buffer B0 { float gradOutput[]; };
+layout(set=0, binding=1) buffer B1 { float gradBias[]; };
+layout(push_constant) uniform PC { int batch; int outChannels; int outHeight; int outWidth; };
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= uint(outChannels)) return;
+    int oc = int(gid);
+    float sum = 0.0;
+    for (int b = 0; b < batch; b++)
+        for (int oh = 0; oh < outHeight; oh++)
+            for (int ow = 0; ow < outWidth; ow++)
+                sum += gradOutput[((b * outChannels + oc) * outHeight + oh) * outWidth + ow];
+    gradBias[oc] = sum;
+}";
 }
