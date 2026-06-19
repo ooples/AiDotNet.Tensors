@@ -14605,10 +14605,28 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // GPU-accelerated element-wise arithmetic
     // ──────────────────────────────────────────────────────────────
 
+    /// <summary>PR #638 A1: resident-step out-of-place elementwise binary — compute into a FRESH resident-bound
+    /// output (no AllocateOutputBuffer temp, no download), so the backward grad stays GPU-resident for capture.
+    /// Returns the bound output on success, else null (off the resident step / autocast / non-float → caller's
+    /// normal download path). Records nothing; the caller records the backward exactly as its eager path.</summary>
+    private Tensor<T>? TryBinaryResidentOutOfPlace<T>(Tensor<T> a, Tensor<T> b,
+        System.Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, IGpuBuffer, int> kernel)
+    {
+        if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return null;
+        if (!ShapesMatch(a.Shape._dims, b.Shape._dims) || a.Length != b.Length) return null;
+        var output = new Tensor<T>(new T[a.Length], a.Shape._dims);
+        return TryRunBinaryInto(output, a, b, kernel) ? output : null;
+    }
+
     public override Tensor<T> TensorAdd<T>(Tensor<T> a, Tensor<T> b)
     {
         if (!ShapesMatch(a.Shape._dims, b.Shape._dims))
             return base.TensorAdd(a, b);
+        if (TryBinaryResidentOutOfPlace(a, b, static (be, ia, ib, o, n) => be.Add(ia, ib, o, n)) is { } radd)
+        {
+            Autodiff.DifferentiableOps.RecordBinary("TensorAdd", radd, a, b, Autodiff.BackwardFunctions<T>.AddBackward);
+            return radd;
+        }
         // FP16 Half-resident store (keystone-enabled): the transformer residual add. Read both IsFp16 inputs
         // directly, FP16-native add (FP32 accumulate, Half out), store Half — keeps the residual stream Half.
         if (typeof(T) == typeof(Half) && s_fp16FwdStore && TryGetBackend(out var bkA)
@@ -14653,6 +14671,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (!ShapesMatch(a.Shape._dims, b.Shape._dims))
             return base.TensorSubtract(a, b);
+        if (TryBinaryResidentOutOfPlace(a, b, static (be, ia, ib, o, n) => be.Subtract(ia, ib, o, n)) is { } rsub)
+        {
+            Autodiff.DifferentiableOps.RecordBinary("TensorSubtract", rsub, a, b, Autodiff.BackwardFunctions<T>.SubtractBackward);
+            return rsub;
+        }
         try
         {
             var result = TryRunBinary(a, b, static (backend, ia, ib, o, size) => backend.Subtract(ia, ib, o, size));
@@ -14671,6 +14694,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (!ShapesMatch(a.Shape._dims, b.Shape._dims))
             return base.TensorMultiply(a, b);
+        if (TryBinaryResidentOutOfPlace(a, b, static (be, ia, ib, o, n) => be.Multiply(ia, ib, o, n)) is { } rmul)
+        {
+            Autodiff.DifferentiableOps.RecordBinary("TensorMultiply", rmul, a, b, Autodiff.BackwardFunctions<T>.MultiplyBackward);
+            return rmul;
+        }
         try
         {
             var result = TryRunBinary(a, b, static (backend, ia, ib, o, size) => backend.Multiply(ia, ib, o, size));
