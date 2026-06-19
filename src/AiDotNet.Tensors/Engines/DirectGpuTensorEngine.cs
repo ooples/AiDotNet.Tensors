@@ -1738,8 +1738,26 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// eviction suspended for the compiled step — they accumulate every step (the d128/L1 async-pool-OOM CUDA-700
     /// that aborts capture). Keeping <paramref name="keepKey"/> preserves the result's forward residency.
     /// </summary>
-    internal void DropTransientActivationsCreatedAfter(long snapshot, object? keepKey)
+    /// <param name="allThreads">When true, drop entries cached on ANY thread (not just the caller's) — the
+    /// per-head MatMul/Softmax intermediates of a fused op are cached on BLAS-pool threads, so the per-thread
+    /// filter would leak them (measured: MHA-forward still retained x480 intermediates/step at N=8000). The caller
+    /// MUST guarantee these buffers belong to THIS self-contained op with no concurrent tape; we DEVICE-SYNC
+    /// first so no in-flight kernel on a pool stream still references a buffer we free (that free-before-execute
+    /// is the async CUDA-700). On sync failure we drop nothing (leaking is safer than an unsafe free).</param>
+    // PR #638 diag: cumulative count of activation entries this drop has freed (AIDOTNET_MHA_DIAG reads it).
+    internal static long s_dropFreedTotal;
+
+    internal void DropTransientActivationsCreatedAfter(long snapshot, object? keepKey, bool allThreads = false)
     {
+        if (allThreads)
+        {
+            // Barrier: ensure every kernel that may write/read these buffers (incl. pool-thread GEMM/softmax
+            // streams) has COMPLETED before we free them. MHA-forward runs in the model forward, never inside a
+            // CUDA-graph capture, so a synchronize here is legal. If it throws, the context is already unsafe —
+            // bail without freeing.
+            if (!TryGetBackend(out var syncBackend)) return;
+            try { syncBackend.Synchronize(); } catch { return; }
+        }
         int callerThreadId = System.Environment.CurrentManagedThreadId;
         List<ActivationCacheEntry> toDispose = new();
         lock (_activationCacheLock)
@@ -1749,7 +1767,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             for (int i = 0; i < entries.Length; i++)
             {
                 if (entries[i].Value.Timestamp <= snapshot) continue;            // pre-existing — keep
-                if (entries[i].Value.ThreadId != callerThreadId) continue;       // another thread's live buffer
+                if (!allThreads && entries[i].Value.ThreadId != callerThreadId) continue; // another thread's live buffer
                 if (keepKey is not null && ReferenceEquals(entries[i].Key, keepKey)) continue; // the live result
                 // Dead intermediate: discard its pending download (never read) and free the buffer.
                 Helpers.DeferredArrayMaterializer.Remove(entries[i].Key);
@@ -1762,6 +1780,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
         }
         foreach (var entry in toDispose) entry.Dispose();
+        if (s_mhaDiag && toDispose.Count > 0) System.Threading.Interlocked.Add(ref s_dropFreedTotal, toDispose.Count);
     }
 
     /// <summary>

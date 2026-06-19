@@ -2477,6 +2477,19 @@ public partial class DirectGpuTensorEngine
         return bhsd.Reshape(new[] { B * H, S, d });
     }
 
+    // PR #638 diag: pin the residual MHA leak source — count tape-active vs tapeless MHA-forward calls (the
+    // tapeless ones get DropTransientActivationsCreatedAfter; tape-active are skipped). AIDOTNET_MHA_DIAG=1.
+    private static readonly bool s_mhaDiag = System.Environment.GetEnvironmentVariable("AIDOTNET_MHA_DIAG") == "1";
+    private static long s_mhaTotal, s_mhaTapeActive;
+    private static void MhaDiag(bool tapeActive)
+    {
+        long tot = System.Threading.Interlocked.Increment(ref s_mhaTotal);
+        if (tapeActive) System.Threading.Interlocked.Increment(ref s_mhaTapeActive);
+        if (tot % 500 == 0)
+            try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_mha_diag.txt"),
+                $"MHA calls={tot} tapeActive={System.Threading.Interlocked.Read(ref s_mhaTapeActive)} dropFreedTotal={System.Threading.Interlocked.Read(ref s_dropFreedTotal)}" + System.Environment.NewLine); } catch { }
+    }
+
     /// <inheritdoc/>
     public override Tensor<T> MultiHeadAttentionForward<T>(
         Tensor<T> input, Tensor<T> qWeight, Tensor<T> kWeight, Tensor<T> vWeight, Tensor<T> outWeight,
@@ -2537,8 +2550,13 @@ public partial class DirectGpuTensorEngine
             var result = outProj.Reshape(new[] { B, S, D });
             // Release the dead intermediates (keep the result's resident buffer). Only when no tape depends on
             // them; if a tape is recording (the sub-ops registered backwards), their lifetime is the tape's.
-            if (!IsTapeActive<T>())
+            bool tapeActive = IsTapeActive<T>();
+            if (!tapeActive)
+                // Tapeless MHA calls: drop the dead intermediates (caller-thread; measured: they are NOT cached on
+                // pool threads, so the allThreads variant gives no gain here). The tape-ACTIVE MHA calls are
+                // released via the tape-dispose path instead — see GradientTape.
                 DropTransientActivationsCreatedAfter(actSnapshot, outProj.DataVector.GetBackingArrayUnsafe());
+            if (s_mhaDiag) MhaDiag(tapeActive);   // PR #638 diag: count tape-active vs tapeless MHA calls
             return result;
         }
         catch (Exception)
