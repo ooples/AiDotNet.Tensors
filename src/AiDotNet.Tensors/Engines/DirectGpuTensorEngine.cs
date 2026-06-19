@@ -12839,14 +12839,52 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 }
             }
 
-            // Permute the input tensor
-            input = PermuteImpl(input, permutation.ToArray());
+            // Permute the input tensor. PR #638 A1: in the resident step, materialize on-GPU into a contiguous
+            // resident buffer (TensorPermuteInto — no recording, no download) so the resident reduce below can read
+            // it; otherwise the strided VIEW from PermuteImpl forces a host download in the reduction path.
+            if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float))
+            {
+                var permArr = permutation.ToArray();
+                var permDims = new int[permArr.Length];
+                for (int i = 0; i < permArr.Length; i++) permDims[i] = inputShape[permArr[i]];
+                var permuted = new Tensor<T>(new T[input.Length], permDims);
+                try { TensorPermuteInto(permuted, input, permArr); input = permuted; }
+                catch { input = PermuteImpl(input, permArr); }
+            }
+            else
+                input = PermuteImpl(input, permutation.ToArray());
         }
 
         if (outputShapeList.Count == 0)
             outputShapeList.Add(1);
 
         var outputShape = outputShapeList.ToArray();
+
+        // PR #638 A1: resident-step reduction — read the (contiguous) input resident, reduce into a resident-bound
+        // output buffer; no GetDataArray download, no temp AllocateOutputBuffer, no result download (each aborts
+        // capture). Only Sum/Mean/Max over a contiguous [outerSize, reduceSize] layout (the last-axis form the
+        // permute above produces). Falls through to the host path when the input isn't resident.
+        if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float) && input.IsContiguous)
+        {
+            var inResid = ResolveResidentBufferNoUpload(backend, input, outerSize * reduceSize);
+            if (inResid is not null)
+            {
+                var rOut = new Tensor<T>(new T[outerSize], outputShape);
+                var rOutBuf = GetOrCreateResidentBuffer(backend, rOut, outerSize);
+                if (rOutBuf.Handle != System.IntPtr.Zero && rOutBuf.Size >= outerSize)
+                {
+                    switch (op)
+                    {
+                        case ReduceOperation.Sum: backend.SumAxis(inResid, rOutBuf, outerSize, reduceSize); break;
+                        case ReduceOperation.Mean: backend.MeanAxis(inResid, rOutBuf, outerSize, reduceSize); break;
+                        case ReduceOperation.Max: backend.MaxAxis(inResid, rOutBuf, outerSize, reduceSize); break;
+                    }
+                    ResidentSyncCheck("ReduceAxisResident");
+                    BindResidentBuffer(rOut, rOutBuf, backend);
+                    return rOut;
+                }
+            }
+        }
 
         // Upload input
         float[] inputFloat = DirectGpuEngine.ToFloatArray(input.GetDataArray());
@@ -15025,6 +15063,26 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     }
                     finally { hgOwned?.Dispose(); hiOwned?.Dispose(); if (!ok) hOut?.Dispose(); }
                 }
+                // PR #638 A1: resident-step ReLU backward into a resident-bound output (no download), keeping the
+                // FFN fused-linear-relu backward's grad resident for capture.
+                if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float)
+                    && gradOutput.Length == input.Length)
+                {
+                    var gR = ResolveResidentBufferNoUpload(backend, gradOutput, gradOutput.Length);
+                    var iR = ResolveResidentBufferNoUpload(backend, input, input.Length);
+                    if (gR is not null && iR is not null)
+                    {
+                        var rOut = new Tensor<T>(new T[gradOutput.Length], gradOutput.Shape._dims);
+                        var oResBuf = GetOrCreateResidentBuffer(backend, rOut, gradOutput.Length);
+                        if (oResBuf.Handle != System.IntPtr.Zero && oResBuf.Size >= gradOutput.Length)
+                        {
+                            backend.ReluBackward(gR, iR, oResBuf, gradOutput.Length);
+                            ResidentSyncCheck("ReluBackwardResident");
+                            BindResidentBuffer(rOut, oResBuf, backend);
+                            return rOut;
+                        }
+                    }
+                }
                 var gArr = DirectGpuEngine.ToFloatArray(gradOutput.GetFlattenedData());
                 var iArr = DirectGpuEngine.ToFloatArray(input.GetFlattenedData());
                 int size = gArr.Length;
@@ -15971,6 +16029,24 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             int rows = tensor.Shape._dims[0];
             int cols = tensor.Shape._dims[1];
+            // PR #638 A1: resident-step 2D transpose into a resident-bound output (no temp/download), keeping the
+            // backward transpose's grad resident for capture (used by FusedLinear/LayerNorm fallback weight^T).
+            if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float))
+            {
+                var inResid = ResolveResidentBufferNoUpload(backend, tensor, tensor.Length);
+                if (inResid is not null)
+                {
+                    var rOut = new Tensor<T>(new T[tensor.Length], new[] { cols, rows });
+                    var rOutBuf = GetOrCreateResidentBuffer(backend, rOut, tensor.Length);
+                    if (rOutBuf.Handle != System.IntPtr.Zero && rOutBuf.Size >= tensor.Length)
+                    {
+                        backend.Transpose(inResid, rOutBuf, rows, cols);
+                        ResidentSyncCheck("TransposeResident");
+                        BindResidentBuffer(rOut, rOutBuf, backend);
+                        return rOut;
+                    }
+                }
+            }
             using var bufIn = GetOrAllocateBuffer(backend, tensor);
             var bufOut = AllocateOutputBuffer(backend, tensor.Length);
             backend.Transpose(bufIn.Buffer, bufOut.Buffer, rows, cols);

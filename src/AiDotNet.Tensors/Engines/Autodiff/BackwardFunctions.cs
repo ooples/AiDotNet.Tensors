@@ -767,7 +767,10 @@ internal static class BackwardFunctions<T>
         // higher-order AD. Rentals also live inside the gate.
         if (typeof(T) == typeof(float)
             && inputs[0].Rank == 2 && inputs[1].Rank == 2
-            && GradientTape<T>.Current is null)
+            && GradientTape<T>.Current is null
+            // PR #638 A1: during CUDA-graph capture the CPU fast path's GetDataArray() downloads resident grads
+            // (CUDA-900). Skip it so the engine fallback (resident Reshape/Transpose/MatMul) keeps grads resident.
+            && !(engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine { ResidentStepActive: true }))
         {
             var dCArr = (gradOutput as Tensor<float>)?.GetDataArray();
             var aArr = (inputs[0] as Tensor<float>)?.GetDataArray();
@@ -2742,6 +2745,9 @@ internal static class BackwardFunctions<T>
         if (typeof(T) == typeof(float) && inputs[0].Rank == 2 && inputs[1].Rank == 2
             && gradOutput.IsContiguous && preActivation.IsContiguous
             && GradientTape<T>.Current is null
+            // PR #638 A1: skip the GetDataArray()-downloading CPU fast path during CUDA-graph capture → use the
+            // resident engine fallback (ReluBackward/Transpose/MatMul/ReduceSum are all resident in the step).
+            && !(engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine { ResidentStepActive: true })
             && (long)inputs[0]._shape[0] * inputs[0]._shape[1] * inputs[1]._shape[1] >= FusedReluFastPathMinWork)
         {
             int M = inputs[0]._shape[0]; // batch
