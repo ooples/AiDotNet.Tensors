@@ -38,6 +38,16 @@ public sealed unsafe partial class VulkanBackend
         int dilationH, int dilationW)
     {
         EnsureInitialized();
+        try
+        {
+            int total = batch * outChannels * outHeight * outWidth;
+            var pc = new uint[] { (uint)batch, (uint)inChannels, (uint)inHeight, (uint)inWidth,
+                (uint)outChannels, (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW,
+                (uint)strideH, (uint)strideW, (uint)padH, (uint)padW, (uint)dilationH, (uint)dilationW };
+            if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.Conv2D, pc, total, input, kernel, output)) return;
+        }
+        catch { /* fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         var ker = DownloadBuffer(kernel);
         var outp = new float[batch * outChannels * outHeight * outWidth];
@@ -70,6 +80,16 @@ public sealed unsafe partial class VulkanBackend
         int dilationH, int dilationW)
     {
         EnsureInitialized();
+        try
+        {
+            int total = batch * inChannels * inHeight * inWidth;
+            var pc = new uint[] { (uint)batch, (uint)inChannels, (uint)inHeight, (uint)inWidth,
+                (uint)outChannels, (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW,
+                (uint)strideH, (uint)strideW, (uint)padH, (uint)padW, (uint)dilationH, (uint)dilationW };
+            if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.Conv2DBackwardInput, pc, total, gradOutput, kernel, gradInput)) return;
+        }
+        catch { /* fall through to CPU reference */ }
+
         var go = DownloadBuffer(gradOutput);
         var ker = DownloadBuffer(kernel);
         var gi = new float[batch * inChannels * inHeight * inWidth];
@@ -101,6 +121,16 @@ public sealed unsafe partial class VulkanBackend
         int dilationH, int dilationW)
     {
         EnsureInitialized();
+        try
+        {
+            int total = outChannels * inChannels * kernelH * kernelW;
+            var pc = new uint[] { (uint)batch, (uint)inChannels, (uint)inHeight, (uint)inWidth,
+                (uint)outChannels, (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW,
+                (uint)strideH, (uint)strideW, (uint)padH, (uint)padW, (uint)dilationH, (uint)dilationW };
+            if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.Conv2DBackwardKernel, pc, total, input, gradOutput, gradKernel)) return;
+        }
+        catch { /* fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         var go = DownloadBuffer(gradOutput);
         var gk = new float[outChannels * inChannels * kernelH * kernelW];
@@ -157,6 +187,17 @@ public sealed unsafe partial class VulkanBackend
         int kernelH, int kernelW, int strideH, int strideW, int padH, int padW)
     {
         EnsureInitialized();
+        try
+        {
+            int oH = (height + 2 * padH - kernelH) / strideH + 1;
+            int oW = (width + 2 * padW - kernelW) / strideW + 1;
+            int total = batch * channels * kernelH * kernelW * oH * oW;
+            var pc = new uint[] { (uint)batch, (uint)channels, (uint)height, (uint)width,
+                (uint)kernelH, (uint)kernelW, (uint)strideH, (uint)strideW, (uint)padH, (uint)padW };
+            if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.Unfold, pc, total, input, output)) return;
+        }
+        catch { /* fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         int outH = (height + 2 * padH - kernelH) / strideH + 1;
         int outW = (width + 2 * padW - kernelW) / strideW + 1;
@@ -188,6 +229,15 @@ public sealed unsafe partial class VulkanBackend
         int kernelH, int kernelW, int strideH, int strideW, int padH, int padW)
     {
         EnsureInitialized();
+        try
+        {
+            int total = batch * channels * outputH * outputW;
+            var pc = new uint[] { (uint)batch, (uint)channels, (uint)outputH, (uint)outputW,
+                (uint)kernelH, (uint)kernelW, (uint)strideH, (uint)strideW, (uint)padH, (uint)padW };
+            if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.Fold, pc, total, input, output)) return;
+        }
+        catch { /* fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         int unfoldH = (outputH + 2 * padH - kernelH) / strideH + 1;
         int unfoldW = (outputW + 2 * padW - kernelW) / strideW + 1;
@@ -223,6 +273,17 @@ public sealed unsafe partial class VulkanBackend
         int dilationD, int dilationH, int dilationW)
     {
         EnsureInitialized();
+        try
+        {
+            int total = batch * outChannels * outDepth * outHeight * outWidth;
+            var pc = new uint[] { (uint)batch, (uint)inChannels, (uint)inDepth, (uint)inHeight, (uint)inWidth,
+                (uint)outChannels, (uint)outDepth, (uint)outHeight, (uint)outWidth,
+                (uint)kernelD, (uint)kernelH, (uint)kernelW, (uint)strideD, (uint)strideH, (uint)strideW,
+                (uint)padD, (uint)padH, (uint)padW, (uint)dilationD, (uint)dilationH, (uint)dilationW };
+            if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.Conv3D, pc, total, input, kernel, output)) return;
+        }
+        catch { /* fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         var ker = DownloadBuffer(kernel);
         var outp = new float[batch * outChannels * outDepth * outHeight * outWidth];
@@ -257,6 +318,16 @@ public sealed unsafe partial class VulkanBackend
         int strideH, int strideW, int padH, int padW)
     {
         EnsureInitialized();
+        try
+        {
+            int total = batch * channels * outHeight * outWidth;
+            var pc = new uint[] { (uint)batch, (uint)channels, (uint)inHeight, (uint)inWidth,
+                (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW,
+                (uint)strideH, (uint)strideW, (uint)padH, (uint)padW };
+            if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.DepthwiseConv2D, pc, total, input, kernel, output)) return;
+        }
+        catch { /* fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         var ker = DownloadBuffer(kernel);
         var outp = new float[batch * channels * outHeight * outWidth];
@@ -420,6 +491,16 @@ void main() {
         int outputPadH, int outputPadW)
     {
         EnsureInitialized();
+        try
+        {
+            int total = inChannels * outChannels * kernelH * kernelW;
+            var pc = new uint[] { (uint)batch, (uint)inChannels, (uint)inHeight, (uint)inWidth,
+                (uint)outChannels, (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW,
+                (uint)strideH, (uint)strideW, (uint)padH, (uint)padW, (uint)outputPadH, (uint)outputPadW };
+            if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.ConvTranspose2DBackwardWeights, pc, total, input, gradOutput, gradKernel)) return;
+        }
+        catch { /* fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         var go = DownloadBuffer(gradOutput);
         var gk = new float[inChannels * outChannels * kernelH * kernelW];
