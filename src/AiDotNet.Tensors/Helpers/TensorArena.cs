@@ -413,17 +413,31 @@ public sealed class TensorArena : IDisposable
         // ReturnPersistent and simply dropped for GC. The pinned tier is NOT
         // returned — those are long-lived (weights / optimizer state) and the
         // owner still holds references to them.
-        foreach (var kvp in _pool)
+        //
+        // ONLY a TOP-LEVEL arena (no outer arena active) may pool its scratch/ring
+        // buffers. A NESTED arena (_previous != null) disposes back into a still-live
+        // outer scope, and its op-output tensors routinely ESCAPE there — a layer caches
+        // the forward activation for backward, the caller retains the model output, etc.
+        // Pooling an escaped buffer lets a later RentPersistent zero+reuse it and silently
+        // corrupt the live tensor (issue #1221: MobileNetV3 trained under an outer arena,
+        // then a per-step training arena's escaped activation buffer was recycled into the
+        // following eval forward, making Predict non-idempotent — first forward ≠ rest).
+        // Top-level per-step training arenas (the #478 pattern: TrainWithTape's own
+        // `using var arena`, no outer wrapper) keep pooling, so the GC win is preserved.
+        if (_previous is null)
         {
-            var (type, size) = kvp.Key;
-            var bucket = kvp.Value;
-            for (int i = 0; i < bucket.Count; i++)
-                ReturnPersistent(type, size, bucket[i]);
-        }
-        for (int i = 0; i < _ringBackingArrays.Count; i++)
-        {
-            var (type, size, arr) = _ringBackingArrays[i];
-            ReturnPersistent(type, size, arr);
+            foreach (var kvp in _pool)
+            {
+                var (type, size) = kvp.Key;
+                var bucket = kvp.Value;
+                for (int i = 0; i < bucket.Count; i++)
+                    ReturnPersistent(type, size, bucket[i]);
+            }
+            for (int i = 0; i < _ringBackingArrays.Count; i++)
+            {
+                var (type, size, arr) = _ringBackingArrays[i];
+                ReturnPersistent(type, size, arr);
+            }
         }
 
         _pool.Clear();
