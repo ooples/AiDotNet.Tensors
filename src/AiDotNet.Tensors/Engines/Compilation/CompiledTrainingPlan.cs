@@ -1250,6 +1250,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var bwd = _backwardActions;
         var bwdProbe = StepProbe;
         if (bwdProbe != null) bwdProbe("BEGIN-BWD");
+        try
+        {
         if (_fp16HeteroOrder is not null)
         {
             // FP16-IN-CAPTURE: mixed-dtype reverse pass (float/Half LazyNode backwards + cast-bridge
@@ -1290,8 +1292,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 if (bwdProbe != null) bwdProbe($"AFTER-BWD-{i}");
             }
         }
-        _dlTrace.Dispose();
-        AiDotNet.Tensors.Engines.DirectGpu.GpuMemoryTracker.DumpDownloadTrace("backward");
+        }
+        finally
+        {
+            // PR #638 (review): always dispose + dump the download trace, even if a backward delegate throws —
+            // otherwise the trace lifecycle is unbalanced and the failing-backward diagnostic is lost.
+            _dlTrace.Dispose();
+            AiDotNet.Tensors.Engines.DirectGpu.GpuMemoryTracker.DumpDownloadTrace("backward");
+        }
         long t3 = _profileStepEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         if (stepTiming) StepTiming.RecordBackward(Stopwatch.GetTimestamp() - bwdStart);
 
