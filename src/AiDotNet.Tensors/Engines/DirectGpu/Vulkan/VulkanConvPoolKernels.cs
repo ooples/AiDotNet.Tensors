@@ -703,4 +703,282 @@ void main() {
                 sum += gradOutput[((b * outChannels + oc) * outHeight + oh) * outWidth + ow];
     gradBias[oc] = sum;
 }";
+
+    // ---- Deformable Conv2D (forward, gather; DCNv2 — mask required on the GPU path) ----
+    public const string DeformableConv2D = @"#version 450
+layout(local_size_x = 256) in;
+layout(set=0, binding=0) buffer B0 { float inp[]; };
+layout(set=0, binding=1) buffer B1 { float wgt[]; };
+layout(set=0, binding=2) buffer B2 { float offsets[]; };
+layout(set=0, binding=3) buffer B3 { float mask[]; };
+layout(set=0, binding=4) buffer B4 { float outp[]; };
+layout(push_constant) uniform PC {
+    int batch; int inChannels; int inHeight; int inWidth;
+    int outChannels; int outHeight; int outWidth; int kernelH; int kernelW;
+    int strideH; int strideW; int padH; int padW; int dilationH; int dilationW; int groups; int deformGroups;
+};
+float bilinearSample(int b, int c, float h, float w) {
+    int hl = int(floor(h)); int wl = int(floor(w)); int hh = hl + 1; int wh = wl + 1;
+    float lh = h - float(hl); float lw = w - float(wl); float hhf = 1.0 - lh; float hwf = 1.0 - lw;
+    float v1 = 0.0, v2 = 0.0, v3 = 0.0, v4 = 0.0;
+    if (hl >= 0 && hl < inHeight && wl >= 0 && wl < inWidth) v1 = inp[((b*inChannels+c)*inHeight+hl)*inWidth+wl];
+    if (hl >= 0 && hl < inHeight && wh >= 0 && wh < inWidth) v2 = inp[((b*inChannels+c)*inHeight+hl)*inWidth+wh];
+    if (hh >= 0 && hh < inHeight && wl >= 0 && wl < inWidth) v3 = inp[((b*inChannels+c)*inHeight+hh)*inWidth+wl];
+    if (hh >= 0 && hh < inHeight && wh >= 0 && wh < inWidth) v4 = inp[((b*inChannels+c)*inHeight+hh)*inWidth+wh];
+    return hhf*hwf*v1 + hhf*lw*v2 + lh*hwf*v3 + lh*lw*v4;
+}
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    int total = batch * outChannels * outHeight * outWidth;
+    if (gid >= uint(total)) return;
+    int idx = int(gid);
+    int ow = idx % outWidth; int t = idx / outWidth;
+    int oh = t % outHeight; t = t / outHeight;
+    int oc = t % outChannels; int b = t / outChannels;
+    int g = oc / (outChannels / groups);
+    int dg = oc / (outChannels / deformGroups);
+    int icpg = inChannels / groups;
+    int ks = kernelH * kernelW;
+    int baseH = oh * strideH - padH; int baseW = ow * strideW - padW;
+    float sum = 0.0;
+    for (int ic = 0; ic < icpg; ic++) {
+        int aic = g * icpg + ic;
+        for (int kh = 0; kh < kernelH; kh++)
+            for (int kw = 0; kw < kernelW; kw++) {
+                int ki = kh * kernelW + kw;
+                int oIx = ((b*deformGroups+dg)*2*ks + ki)*outHeight*outWidth + oh*outWidth + ow;
+                int oIy = ((b*deformGroups+dg)*2*ks + ks + ki)*outHeight*outWidth + oh*outWidth + ow;
+                float h = float(baseH) + float(kh*dilationH) + offsets[oIx];
+                float w = float(baseW) + float(kw*dilationW) + offsets[oIy];
+                float val = bilinearSample(b, aic, h, w);
+                int mIx = ((b*deformGroups+dg)*ks + ki)*outHeight*outWidth + oh*outWidth + ow;
+                val *= mask[mIx];
+                sum += val * wgt[((oc*icpg+ic)*kernelH+kh)*kernelW+kw];
+            }
+    }
+    outp[((b*outChannels+oc)*outHeight+oh)*outWidth+ow] = sum;
+}";
+
+    // ---- Deformable backward input (gather per input element) ----
+    public const string DeformableConv2DBackwardInput = @"#version 450
+layout(local_size_x = 256) in;
+layout(set=0, binding=0) buffer B0 { float gradOutput[]; };
+layout(set=0, binding=1) buffer B1 { float wgt[]; };
+layout(set=0, binding=2) buffer B2 { float offsets[]; };
+layout(set=0, binding=3) buffer B3 { float mask[]; };
+layout(set=0, binding=4) buffer B4 { float gradInput[]; };
+layout(push_constant) uniform PC {
+    int batch; int inChannels; int inHeight; int inWidth;
+    int outChannels; int outHeight; int outWidth; int kernelH; int kernelW;
+    int strideH; int strideW; int padH; int padW; int dilationH; int dilationW; int groups; int deformGroups;
+};
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    int total = batch * inChannels * inHeight * inWidth;
+    if (gid >= uint(total)) return;
+    int idx = int(gid);
+    int b = idx / (inChannels*inHeight*inWidth);
+    int r1 = idx % (inChannels*inHeight*inWidth);
+    int ic = r1 / (inHeight*inWidth);
+    int r2 = r1 % (inHeight*inWidth);
+    int ih = r2 / inWidth; int iw = r2 % inWidth;
+    int g = ic / (inChannels / groups);
+    int icpg = inChannels / groups; int ocpg = outChannels / groups; int ks = kernelH * kernelW;
+    float sum = 0.0;
+    for (int oc = g*ocpg; oc < (g+1)*ocpg; oc++) {
+        int dg = oc / (outChannels / deformGroups);
+        int icLocal = ic - g*icpg;
+        for (int oh = 0; oh < outHeight; oh++)
+            for (int ow = 0; ow < outWidth; ow++) {
+                int baseH = oh*strideH - padH; int baseW = ow*strideW - padW;
+                for (int kh = 0; kh < kernelH; kh++)
+                    for (int kw = 0; kw < kernelW; kw++) {
+                        int ki = kh*kernelW + kw;
+                        int oIx = ((b*deformGroups+dg)*2*ks + ki)*outHeight*outWidth + oh*outWidth + ow;
+                        int oIy = ((b*deformGroups+dg)*2*ks + ks + ki)*outHeight*outWidth + oh*outWidth + ow;
+                        float h = float(baseH) + float(kh*dilationH) + offsets[oIx];
+                        float w = float(baseW) + float(kw*dilationW) + offsets[oIy];
+                        int hl = int(floor(h)); int wl = int(floor(w)); int hh = hl+1; int wh = wl+1;
+                        float lh = h - float(hl); float lw = w - float(wl); float hhf = 1.0-lh; float hwf = 1.0-lw;
+                        float wc = 0.0;
+                        if (ih == hl && iw == wl) wc = hhf*hwf;
+                        else if (ih == hl && iw == wh) wc = hhf*lw;
+                        else if (ih == hh && iw == wl) wc = lh*hwf;
+                        else if (ih == hh && iw == wh) wc = lh*lw;
+                        else continue;
+                        float go = gradOutput[((b*outChannels+oc)*outHeight+oh)*outWidth+ow];
+                        float contrib = go * wgt[((oc*icpg+icLocal)*kernelH+kh)*kernelW+kw] * wc;
+                        int mIx = ((b*deformGroups+dg)*ks + ki)*outHeight*outWidth + oh*outWidth + ow;
+                        contrib *= mask[mIx];
+                        sum += contrib;
+                    }
+            }
+    }
+    gradInput[idx] = sum;
+}";
+
+    // ---- Deformable backward weights (one thread per weight) ----
+    public const string DeformableConv2DBackwardWeights = @"#version 450
+layout(local_size_x = 256) in;
+layout(set=0, binding=0) buffer B0 { float gradOutput[]; };
+layout(set=0, binding=1) buffer B1 { float inp[]; };
+layout(set=0, binding=2) buffer B2 { float offsets[]; };
+layout(set=0, binding=3) buffer B3 { float mask[]; };
+layout(set=0, binding=4) buffer B4 { float gradWeights[]; };
+layout(push_constant) uniform PC {
+    int batch; int inChannels; int inHeight; int inWidth;
+    int outChannels; int outHeight; int outWidth; int kernelH; int kernelW;
+    int strideH; int strideW; int padH; int padW; int dilationH; int dilationW; int groups; int deformGroups;
+};
+float bilinearSample(int b, int c, float h, float w) {
+    int hl = int(floor(h)); int wl = int(floor(w)); int hh = hl + 1; int wh = wl + 1;
+    float lh = h - float(hl); float lw = w - float(wl); float hhf = 1.0 - lh; float hwf = 1.0 - lw;
+    float v1 = 0.0, v2 = 0.0, v3 = 0.0, v4 = 0.0;
+    if (hl >= 0 && hl < inHeight && wl >= 0 && wl < inWidth) v1 = inp[((b*inChannels+c)*inHeight+hl)*inWidth+wl];
+    if (hl >= 0 && hl < inHeight && wh >= 0 && wh < inWidth) v2 = inp[((b*inChannels+c)*inHeight+hl)*inWidth+wh];
+    if (hh >= 0 && hh < inHeight && wl >= 0 && wl < inWidth) v3 = inp[((b*inChannels+c)*inHeight+hh)*inWidth+wl];
+    if (hh >= 0 && hh < inHeight && wh >= 0 && wh < inWidth) v4 = inp[((b*inChannels+c)*inHeight+hh)*inWidth+wh];
+    return hhf*hwf*v1 + hhf*lw*v2 + lh*hwf*v3 + lh*lw*v4;
+}
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    int icpg = inChannels / groups;
+    int total = outChannels * icpg * kernelH * kernelW;
+    if (gid >= uint(total)) return;
+    int idx = int(gid); int tmp = idx;
+    int kw = tmp % kernelW; tmp /= kernelW;
+    int kh = tmp % kernelH; tmp /= kernelH;
+    int icLocal = tmp % icpg; tmp /= icpg;
+    int oc = tmp;
+    int g = oc / (outChannels / groups);
+    int dg = oc / (outChannels / deformGroups);
+    int ic = g*icpg + icLocal; int ks = kernelH*kernelW; int ki = kh*kernelW + kw;
+    float sum = 0.0;
+    for (int b = 0; b < batch; b++)
+        for (int oh = 0; oh < outHeight; oh++)
+            for (int ow = 0; ow < outWidth; ow++) {
+                int baseH = oh*strideH - padH; int baseW = ow*strideW - padW;
+                int oIx = ((b*deformGroups+dg)*2*ks + ki)*outHeight*outWidth + oh*outWidth + ow;
+                int oIy = ((b*deformGroups+dg)*2*ks + ks + ki)*outHeight*outWidth + oh*outWidth + ow;
+                float h = float(baseH) + float(kh*dilationH) + offsets[oIx];
+                float w = float(baseW) + float(kw*dilationW) + offsets[oIy];
+                float iv = bilinearSample(b, ic, h, w);
+                int mIx = ((b*deformGroups+dg)*ks + ki)*outHeight*outWidth + oh*outWidth + ow;
+                iv *= mask[mIx];
+                sum += gradOutput[((b*outChannels+oc)*outHeight+oh)*outWidth+ow] * iv;
+            }
+    gradWeights[idx] = sum;
+}";
+
+    // ---- Deformable backward offset (one thread per offset element) ----
+    public const string DeformableConv2DBackwardOffset = @"#version 450
+layout(local_size_x = 256) in;
+layout(set=0, binding=0) buffer B0 { float gradOutput[]; };
+layout(set=0, binding=1) buffer B1 { float inp[]; };
+layout(set=0, binding=2) buffer B2 { float wgt[]; };
+layout(set=0, binding=3) buffer B3 { float offsets[]; };
+layout(set=0, binding=4) buffer B4 { float mask[]; };
+layout(set=0, binding=5) buffer B5 { float gradOffsets[]; };
+layout(push_constant) uniform PC {
+    int batch; int inChannels; int inHeight; int inWidth;
+    int outChannels; int outHeight; int outWidth; int kernelH; int kernelW;
+    int strideH; int strideW; int padH; int padW; int dilationH; int dilationW; int groups; int deformGroups;
+};
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    int ks = kernelH * kernelW;
+    int total = batch * deformGroups * 2 * ks * outHeight * outWidth;
+    if (gid >= uint(total)) return;
+    int idx = int(gid); int tmp = idx;
+    int ow = tmp % outWidth; tmp /= outWidth;
+    int oh = tmp % outHeight; tmp /= outHeight;
+    int comp = tmp % (2*ks); tmp /= (2*ks);
+    int dg = tmp % deformGroups; tmp /= deformGroups;
+    int b = tmp;
+    int isY = comp >= ks ? 1 : 0;
+    int ki = comp % ks; int kh = ki / kernelW; int kw = ki % kernelW;
+    int oIx = ((b*deformGroups+dg)*2*ks + ki)*outHeight*outWidth + oh*outWidth + ow;
+    int oIy = ((b*deformGroups+dg)*2*ks + ks + ki)*outHeight*outWidth + oh*outWidth + ow;
+    float oh_off = offsets[oIx]; float ow_off = offsets[oIy];
+    int baseH = oh*strideH - padH; int baseW = ow*strideW - padW;
+    float h = float(baseH) + float(kh*dilationH) + oh_off;
+    float w = float(baseW) + float(kw*dilationW) + ow_off;
+    int hl = int(floor(h)); int wl = int(floor(w)); int hh = hl+1; int wh = wl+1;
+    float lh = h - float(hl); float lw = w - float(wl);
+    float sum = 0.0;
+    int icpg = inChannels / groups; int ocpg = outChannels / groups;
+    for (int oco = 0; oco < outChannels / deformGroups; oco++) {
+        int oc = dg * (outChannels / deformGroups) + oco;
+        int g = oc / ocpg;
+        float go = gradOutput[((b*outChannels+oc)*outHeight+oh)*outWidth+ow];
+        int mIx = ((b*deformGroups+dg)*ks + ki)*outHeight*outWidth + oh*outWidth + ow;
+        go *= mask[mIx];
+        for (int ic = g*icpg; ic < (g+1)*icpg; ic++) {
+            int icLocal = ic - g*icpg;
+            float wv = wgt[((oc*icpg+icLocal)*kernelH+kh)*kernelW+kw];
+            float v1 = 0.0, v2 = 0.0, v3 = 0.0, v4 = 0.0;
+            if (hl >= 0 && hl < inHeight && wl >= 0 && wl < inWidth) v1 = inp[((b*inChannels+ic)*inHeight+hl)*inWidth+wl];
+            if (hl >= 0 && hl < inHeight && wh >= 0 && wh < inWidth) v2 = inp[((b*inChannels+ic)*inHeight+hl)*inWidth+wh];
+            if (hh >= 0 && hh < inHeight && wl >= 0 && wl < inWidth) v3 = inp[((b*inChannels+ic)*inHeight+hh)*inWidth+wl];
+            if (hh >= 0 && hh < inHeight && wh >= 0 && wh < inWidth) v4 = inp[((b*inChannels+ic)*inHeight+hh)*inWidth+wh];
+            if (isY == 0) sum += go * wv * ((1.0-lw)*(v3-v1) + lw*(v4-v2));
+            else sum += go * wv * ((1.0-lh)*(v2-v1) + lh*(v4-v3));
+        }
+    }
+    gradOffsets[idx] = sum;
+}";
+
+    // ---- Deformable backward mask (one thread per mask element) ----
+    public const string DeformableConv2DBackwardMask = @"#version 450
+layout(local_size_x = 256) in;
+layout(set=0, binding=0) buffer B0 { float gradOutput[]; };
+layout(set=0, binding=1) buffer B1 { float inp[]; };
+layout(set=0, binding=2) buffer B2 { float wgt[]; };
+layout(set=0, binding=3) buffer B3 { float offsets[]; };
+layout(set=0, binding=4) buffer B4 { float gradMask[]; };
+layout(push_constant) uniform PC {
+    int batch; int inChannels; int inHeight; int inWidth;
+    int outChannels; int outHeight; int outWidth; int kernelH; int kernelW;
+    int strideH; int strideW; int padH; int padW; int dilationH; int dilationW; int groups; int deformGroups;
+};
+float bilinearSample(int b, int c, float h, float w) {
+    int hl = int(floor(h)); int wl = int(floor(w)); int hh = hl + 1; int wh = wl + 1;
+    float lh = h - float(hl); float lw = w - float(wl); float hhf = 1.0 - lh; float hwf = 1.0 - lw;
+    float v1 = 0.0, v2 = 0.0, v3 = 0.0, v4 = 0.0;
+    if (hl >= 0 && hl < inHeight && wl >= 0 && wl < inWidth) v1 = inp[((b*inChannels+c)*inHeight+hl)*inWidth+wl];
+    if (hl >= 0 && hl < inHeight && wh >= 0 && wh < inWidth) v2 = inp[((b*inChannels+c)*inHeight+hl)*inWidth+wh];
+    if (hh >= 0 && hh < inHeight && wl >= 0 && wl < inWidth) v3 = inp[((b*inChannels+c)*inHeight+hh)*inWidth+wl];
+    if (hh >= 0 && hh < inHeight && wh >= 0 && wh < inWidth) v4 = inp[((b*inChannels+c)*inHeight+hh)*inWidth+wh];
+    return hhf*hwf*v1 + hhf*lw*v2 + lh*hwf*v3 + lh*lw*v4;
+}
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    int ks = kernelH * kernelW;
+    int total = batch * deformGroups * ks * outHeight * outWidth;
+    if (gid >= uint(total)) return;
+    int idx = int(gid); int tmp = idx;
+    int ow = tmp % outWidth; tmp /= outWidth;
+    int oh = tmp % outHeight; tmp /= outHeight;
+    int ki = tmp % ks; tmp /= ks;
+    int dg = tmp % deformGroups; tmp /= deformGroups;
+    int b = tmp;
+    int kh = ki / kernelW; int kw = ki % kernelW;
+    int oIx = ((b*deformGroups+dg)*2*ks + ki)*outHeight*outWidth + oh*outWidth + ow;
+    int oIy = ((b*deformGroups+dg)*2*ks + ks + ki)*outHeight*outWidth + oh*outWidth + ow;
+    float h = float(oh*strideH - padH) + float(kh*dilationH) + offsets[oIx];
+    float w = float(ow*strideW - padW) + float(kw*dilationW) + offsets[oIy];
+    float sum = 0.0;
+    int icpg = inChannels / groups; int ocpg = outChannels / groups;
+    for (int oco = 0; oco < outChannels / deformGroups; oco++) {
+        int oc = dg * (outChannels / deformGroups) + oco;
+        int g = oc / ocpg;
+        float go = gradOutput[((b*outChannels+oc)*outHeight+oh)*outWidth+ow];
+        for (int ic = g*icpg; ic < (g+1)*icpg; ic++) {
+            int icLocal = ic - g*icpg;
+            float wv = wgt[((oc*icpg+icLocal)*kernelH+kh)*kernelW+kw];
+            sum += go * wv * bilinearSample(b, ic, h, w);
+        }
+    }
+    gradMask[idx] = sum;
+}";
 }

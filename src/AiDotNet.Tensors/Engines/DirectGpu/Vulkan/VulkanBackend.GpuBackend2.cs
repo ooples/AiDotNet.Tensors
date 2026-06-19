@@ -702,6 +702,23 @@ void main() {
         int dilationH, int dilationW, int groups, int deformGroups)
     {
         EnsureInitialized();
+        try
+        {
+            // GPU (DCNv2) path requires the mask SSBO and valid grouping; otherwise the CPU reference runs (it
+            // also validates the args and handles DCNv1 / no-mask).
+            if (mask is not null && groups > 0 && deformGroups > 0
+                && inChannels % groups == 0 && inChannels % deformGroups == 0)
+            {
+                int total = batch * outChannels * outHeight * outWidth;
+                var pc = new uint[] { (uint)batch, (uint)inChannels, (uint)inHeight, (uint)inWidth,
+                    (uint)outChannels, (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW,
+                    (uint)strideH, (uint)strideW, (uint)padH, (uint)padW, (uint)dilationH, (uint)dilationW,
+                    (uint)groups, (uint)deformGroups };
+                if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.DeformableConv2D, pc, total, input, weights, offsets, mask, output)) return;
+            }
+        }
+        catch { /* fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         var ker = DownloadBuffer(weights);
         var off = DownloadBuffer(offsets);
@@ -772,6 +789,21 @@ void main() {
         int dilationH, int dilationW, int groups, int deformGroups)
     {
         EnsureInitialized();
+        try
+        {
+            if (mask is not null && groups > 0 && deformGroups > 0
+                && inChannels % groups == 0 && inChannels % deformGroups == 0)
+            {
+                int total = batch * inChannels * inHeight * inWidth;
+                var pc = new uint[] { (uint)batch, (uint)inChannels, (uint)inHeight, (uint)inWidth,
+                    (uint)outChannels, (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW,
+                    (uint)strideH, (uint)strideW, (uint)padH, (uint)padW, (uint)dilationH, (uint)dilationW,
+                    (uint)groups, (uint)deformGroups };
+                if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.DeformableConv2DBackwardInput, pc, total, gradOutput, weights, offsets, mask, gradInput)) return;
+            }
+        }
+        catch { /* fall through to CPU reference */ }
+
         var go = DownloadBuffer(gradOutput);
         var ker = DownloadBuffer(weights);
         var off = DownloadBuffer(offsets);
@@ -845,6 +877,21 @@ void main() {
         int dilationH, int dilationW, int groups, int deformGroups)
     {
         EnsureInitialized();
+        try
+        {
+            if (mask is not null && groups > 0 && deformGroups > 0
+                && inChannels % groups == 0 && inChannels % deformGroups == 0)
+            {
+                int total = outChannels * (inChannels / groups) * kernelH * kernelW;
+                var pc = new uint[] { (uint)batch, (uint)inChannels, (uint)inHeight, (uint)inWidth,
+                    (uint)outChannels, (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW,
+                    (uint)strideH, (uint)strideW, (uint)padH, (uint)padW, (uint)dilationH, (uint)dilationW,
+                    (uint)groups, (uint)deformGroups };
+                if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.DeformableConv2DBackwardWeights, pc, total, gradOutput, input, offsets, mask, gradWeights)) return;
+            }
+        }
+        catch { /* fall through to CPU reference */ }
+
         var go = DownloadBuffer(gradOutput);
         var inp = DownloadBuffer(input);
         var off = DownloadBuffer(offsets);
@@ -902,6 +949,22 @@ void main() {
         int dilationH, int dilationW, int groups, int deformGroups)
     {
         EnsureInitialized();
+        try
+        {
+            if (mask is not null && groups > 0 && deformGroups > 0
+                && inChannels % groups == 0 && inChannels % deformGroups == 0)
+            {
+                int ks = kernelH * kernelW;
+                int total = batch * deformGroups * 2 * ks * outHeight * outWidth;
+                var pc = new uint[] { (uint)batch, (uint)inChannels, (uint)inHeight, (uint)inWidth,
+                    (uint)outChannels, (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW,
+                    (uint)strideH, (uint)strideW, (uint)padH, (uint)padW, (uint)dilationH, (uint)dilationW,
+                    (uint)groups, (uint)deformGroups };
+                if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.DeformableConv2DBackwardOffset, pc, total, gradOutput, input, weights, offsets, mask, gradOffsets)) return;
+            }
+        }
+        catch { /* fall through to CPU reference */ }
+
         var go = DownloadBuffer(gradOutput);
         var inp = DownloadBuffer(input);
         var ker = DownloadBuffer(weights);
@@ -987,6 +1050,21 @@ void main() {
         int dilationH, int dilationW, int groups, int deformGroups)
     {
         EnsureInitialized();
+        try
+        {
+            if (groups > 0 && deformGroups > 0
+                && inChannels % groups == 0 && inChannels % deformGroups == 0)
+            {
+                int total = batch * deformGroups * kernelH * kernelW * outHeight * outWidth;
+                var pc = new uint[] { (uint)batch, (uint)inChannels, (uint)inHeight, (uint)inWidth,
+                    (uint)outChannels, (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW,
+                    (uint)strideH, (uint)strideW, (uint)padH, (uint)padW, (uint)dilationH, (uint)dilationW,
+                    (uint)groups, (uint)deformGroups };
+                if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.DeformableConv2DBackwardMask, pc, total, gradOutput, input, weights, offsets, gradMask)) return;
+            }
+        }
+        catch { /* fall through to CPU reference */ }
+
         var go = DownloadBuffer(gradOutput);
         var inp = DownloadBuffer(input);
         var ker = DownloadBuffer(weights);
