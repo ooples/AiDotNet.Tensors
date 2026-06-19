@@ -4678,11 +4678,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // kernel) made the 700 vanish — the textbook async-race signature. Requiring `b` resident removes every owned
         // upload/disposal from this path; it stays inert (host fall-back) until A1 makes the intermediate grads
         // resident, then engages safely — exactly the A2-falls-out-of-A1 dependency.
+        if (s_residentInPlace && InGradAccumulation && ResidentStepActive && System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") == "1" && typeof(T) == typeof(float))
+        {
+            var aB = a.TryGetGpuBuffer(); var bB2 = b.TryGetGpuBuffer();
+            var aArr = a.DataVector.GetBackingArrayUnsafe();
+            var aCached = aArr is not null ? TryGetCachedBuffer(aArr) : null;
+            AliasDiag($"gradacc-inplace probe: aField={(aB is null ? "null" : "H=" + ((long)aB.Handle).ToString("X") + "/sz" + aB.Size)} aCache={(aCached is null ? "null" : "H=" + ((long)aCached.Handle).ToString("X") + "/sz" + aCached.Size)} bField={(bB2 is null ? "null" : "H=" + ((long)bB2.Handle).ToString("X") + "/sz" + bB2.Size)} need={a.Length} aContig={a.IsContiguous}");
+        }
         if (s_residentInPlace && InGradAccumulation && ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float)
             && a.IsContiguous && b.IsContiguous && a.Length == b.Length
             && a.TryGetGpuBuffer() is { } aResident
             && b.TryGetGpuBuffer() is { } bResident
             && !ReferenceEquals(aResident, bResident)
+            && aResident.Handle != System.IntPtr.Zero && bResident.Handle != System.IntPtr.Zero
             && aResident.Size >= a.Length && bResident.Size >= b.Length)
         {
             try
