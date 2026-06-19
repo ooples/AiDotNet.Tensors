@@ -4033,10 +4033,23 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     #endregion
 
+    // float4 (vec4) kernels load/store 16-byte vectors; a base pointer that is not 16-byte aligned (a sliced or
+    // pooled SUB-buffer at a non-16B offset) makes that access MISALIGNED → an illegal access that faults the
+    // context with a sticky CUDA-700 (root-caused to add_vectors_vec4 / op=TensorAdd via the post-launch kernel
+    // check; the GPU never exceeds ~2.6/12GB so it was never a real OOM). Only take the vec4 fast path when every
+    // operand is 16-byte aligned; otherwise fall through to the scalar kernel (always correct, any alignment).
+    // Diagnostic kill-switch: AIDOTNET_NO_VEC4=1 forces the scalar kernels (disables every vec4 fast path) to
+    // test whether the vec4 float4 kernels are the CUDA-700 source vs the buffer lifecycle.
+    private static readonly bool s_noVec4 = System.Environment.GetEnvironmentVariable("AIDOTNET_NO_VEC4") == "1";
+    private static bool Vec4Aligned(IGpuBuffer a, IGpuBuffer b)
+        => !s_noVec4 && ((long)a.Handle & 15) == 0 && ((long)b.Handle & 15) == 0;
+    private static bool Vec4Aligned(IGpuBuffer a, IGpuBuffer b, IGpuBuffer c)
+        => !s_noVec4 && ((long)a.Handle & 15) == 0 && ((long)b.Handle & 15) == 0 && ((long)c.Handle & 15) == 0;
+
     private unsafe void LaunchUnaryKernel(string kernelName, IGpuBuffer input, IGpuBuffer output, int size)
     {
         // Try vec4 variant for 4x throughput on bandwidth-limited ops
-        if (size % 4 == 0 && _kernelCache.TryGetValue(kernelName + "_vec4", out var vec4Kernel))
+        if (size % 4 == 0 && Vec4Aligned(input, output) && _kernelCache.TryGetValue(kernelName + "_vec4", out var vec4Kernel))
         {
             using var _v = PushContext();
             int size4 = size / 4;
@@ -4068,8 +4081,20 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     private unsafe void LaunchElementwiseKernel(string kernelName, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
     {
+        // PR #638 (CUDA-700 root fix): never launch an elementwise kernel over a buffer SMALLER than `size`. A
+        // pooled/cached buffer reused at a larger shape (or a stale resident buffer) that slips past the engine's
+        // size guards would make the kernel read/write PAST the allocation — an out-of-bounds access that faults
+        // the context with a sticky CUDA-700 (localized to add_vectors / op=TensorAdd via the post-launch check;
+        // the GPU never exceeds ~2.6/12GB, so it was never a real OOM). Throw BEFORE the launch so the caller's
+        // try/catch falls back to the correct (reallocating) host path instead of corrupting the context.
+        if (A.Handle == IntPtr.Zero || B.Handle == IntPtr.Zero || C.Handle == IntPtr.Zero)
+            throw new InvalidOperationException(
+                $"Elementwise '{kernelName}' operand was DISPOSED (Handle=0): A={(long)A.Handle:X} B={(long)B.Handle:X} C={(long)C.Handle:X} — use-after-free guard.");
+        if (A.Size < size || B.Size < size || C.Size < size)
+            throw new InvalidOperationException(
+                $"Elementwise '{kernelName}' operand buffer too small for size {size}: A={A.Size} B={B.Size} C={C.Size}.");
         // Try vec4 variant for 4x throughput on bandwidth-limited ops
-        if (size % 4 == 0 && _kernelCache.TryGetValue(kernelName + "_vec4", out var vec4Kernel))
+        if (size % 4 == 0 && Vec4Aligned(A, B, C) && _kernelCache.TryGetValue(kernelName + "_vec4", out var vec4Kernel))
         {
             using var _v = PushContext();
             int size4 = size / 4;
@@ -4106,7 +4131,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     private unsafe void LaunchScaleKernel(IGpuBuffer A, IGpuBuffer B, float scalar, int size)
     {
         // Try vec4 variant
-        if (size % 4 == 0 && _kernelCache.TryGetValue("scale_vector_vec4", out var vec4Kernel))
+        if (size % 4 == 0 && Vec4Aligned(A, B) && _kernelCache.TryGetValue("scale_vector_vec4", out var vec4Kernel))
         {
             using var _v = PushContext();
             int size4 = size / 4;
@@ -4277,6 +4302,14 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         LaunchKernelWithSharedMem(kernel, gridX, blockX, 0, args);
     }
 
+    // PR #638: localize the intermittent async CUDA-700 (an illegal access misdiagnosed as async-pool OOM — the
+    // GPU never exceeds ~2.6GB/12GB). compute-sanitizer isn't installed (driver-only box), so under
+    // AIDOTNET_KERNEL_LAUNCH_CHECK=1 synchronize + check the device error RIGHT AFTER each kernel launch: the
+    // FIRST kernel whose sync returns non-Success is the faulting one, tagged with the current op name. This
+    // catches a deterministic out-of-bounds (a race would serialize away — still informative either way).
+    internal static readonly bool s_launchCheck =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_KERNEL_LAUNCH_CHECK") == "1";
+
     private unsafe void LaunchKernelWithSharedMem(IntPtr kernel, uint gridX, uint blockX, uint sharedMemBytes, void** args)
     {
         CuBlasNative.CheckCudaResult(
@@ -4289,6 +4322,20 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                 (IntPtr)args,
                 IntPtr.Zero),
             "cuLaunchKernel");
+        if (s_launchCheck)
+        {
+            var sync = CudaNativeBindings.cuStreamSynchronize(_stream);
+            if (sync != CudaResult.Success)
+            {
+                string op = AiDotNet.Tensors.Engines.DirectGpuTensorEngine.s_currentForwardOp
+                            ?? AiDotNet.Tensors.Engines.DirectGpuTensorEngine.s_currentBackwardOp ?? "(none)";
+                string kname = "(unknown)";
+                foreach (var kv in _kernelCache) if (kv.Value == kernel) { kname = kv.Key; break; }
+                try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_launch_fault.txt"),
+                    $"[LAUNCH-FAULT] kernel={kname} op={op} grid={gridX} block={blockX} syncResult={sync}" + System.Environment.NewLine); } catch { }
+                throw new InvalidOperationException($"[LAUNCH-FAULT] kernel '{kname}' fault: {sync} (op={op})");
+            }
+        }
     }
 
     /// <summary>

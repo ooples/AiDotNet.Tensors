@@ -3117,13 +3117,26 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // — a sync alloc inside a stream capture aborts it. Keyed by the destination's backing array.
     private IGpuBuffer GetOrCreateResidentBuffer<T>(IDirectGpuBackend backend, Tensor<T> t, int length)
     {
-        if (t._gpuBuffer is not null && ReferenceEquals(t._gpuBackend, backend) && IsCachedGpuBufferLive(t, backend))
+        // PR #638 (CUDA-700 fix): the reused buffer MUST hold at least `length` elements. A pooled backing array
+        // reused at a LARGER shape — or a tensor whose prior resident/cached buffer was allocated smaller — would
+        // otherwise hand back an UNDERSIZED buffer; the resident op then runs its kernel at `length` and writes
+        // PAST the device allocation = an out-of-bounds access that faults the context with a sticky CUDA-700
+        // (localized to a resident TensorAdd via AIDOTNET_KERNEL_LAUNCH_CHECK; the GPU never exceeds ~2.6/12GB, so
+        // it was never a real OOM). Reuse only when big enough; otherwise drop the stale entry and allocate fresh.
+        if (t._gpuBuffer is not null && ReferenceEquals(t._gpuBackend, backend) && IsCachedGpuBufferLive(t, backend)
+            && t._gpuBuffer.Handle != System.IntPtr.Zero && t._gpuBuffer.Size >= length)
             return t._gpuBuffer;
         var arr = t.DataVector.GetBackingArrayUnsafe();
         if (arr is not null)
+        {
             lock (_activationCacheLock)
-                if (_activationCache.TryGetValue(arr, out var e) && ReferenceEquals(e.Backend, backend) && !e.IsFp16)
+                if (_activationCache.TryGetValue(arr, out var e) && ReferenceEquals(e.Backend, backend) && !e.IsFp16
+                    && e.Buffer.Handle != System.IntPtr.Zero && e.Buffer.Size >= length)
                     return e.Buffer;
+            // A cached entry exists but is undersized (or fp16) — remove it so the new, correctly-sized buffer can
+            // re-cache (CacheActivation's TryAdd fails on an existing key and would keep the wrong-sized one).
+            RemoveActivationCacheEntry(arr);
+        }
         var buf = backend.AllocateBuffer(length);
         if (arr is not null) CacheActivation(arr, buf, t._shape, backend);
         return buf;
@@ -3417,7 +3430,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // whole graph). Falls back to the transient path if it has no backing array.
     private OwnedBuffer GetResidentOrPersistentInputBuffer<T>(IDirectGpuBackend backend, Tensor<T> t)
     {
-        if (t._gpuBuffer is not null && ReferenceEquals(t._gpuBackend, backend))
+        // PR #638 (CUDA-700 fix): a REUSED input buffer must hold at least the tensor's logical length, else the
+        // consuming kernel reads PAST the allocation (out-of-bounds → sticky CUDA-700). A pooled backing array
+        // reused at a larger shape leaves an UNDERSIZED cached/resident buffer; skip it and re-resolve a correctly
+        // sized one below. (Same class as the GetOrCreateResidentBuffer + TryRunBinaryInPlace size guards.)
+        int need = t.Length;
+        // Handle != 0: a DISPOSED buffer (returned to pool / freed) zeros its device pointer but its Size field
+        // stays — so a Size-only check returns a dangling buffer and the kernel dereferences NULL = the CUDA-700
+        // (root-caused: the residual add's operand B had Handle=0 via the post-launch buf-trace). Reject it here so
+        // we re-resolve a live buffer (re-upload below).
+        if (t._gpuBuffer is not null && ReferenceEquals(t._gpuBackend, backend)
+            && t._gpuBuffer.Handle != System.IntPtr.Zero && t._gpuBuffer.Size >= need)
             return new OwnedBuffer(t._gpuBuffer, ownsBuffer: false);
         // Comprehensive resident check (the _gpuBuffer field alone is NOT enough): a GPU-RESIDENT PARAMETER
         // (GpuPinned/GpuOffload, AIDOTNET_GPU_RESIDENT_PARAMS=1) carries its residency as an OffloadDevicePointer
@@ -3427,14 +3450,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // cache miss) — a graph-purity violation (CUDA 906) that aborts whole-step capture and PERMANENTLY drops the
         // cortex onto the launch-bound eager path (~60 s/step). Same root cause as the #611 LayerNorm fix.
         var resident = t.TryGetGpuBuffer();
-        if (resident is not null) return new OwnedBuffer(resident, ownsBuffer: false);
+        if (resident is not null && resident.Handle != System.IntPtr.Zero && resident.Size >= need)
+            return new OwnedBuffer(resident, ownsBuffer: false);
         var arr = t.DataVector.GetBackingArrayUnsafe();
         if (arr is not null)
         {
             var cached = TryGetCachedBuffer(arr);
-            if (cached != null) return new OwnedBuffer(cached, ownsBuffer: false);
+            if (cached != null && cached.Handle != System.IntPtr.Zero && cached.Size >= need)
+                return new OwnedBuffer(cached, ownsBuffer: false);
             lock (_activationCacheLock)
-                if (_activationCache.TryGetValue(arr, out var e) && ReferenceEquals(e.Backend, backend) && !e.IsFp16)
+                if (_activationCache.TryGetValue(arr, out var e) && ReferenceEquals(e.Backend, backend) && !e.IsFp16
+                    && e.Buffer.Handle != System.IntPtr.Zero && e.Buffer.Size >= need)
                     return new OwnedBuffer(e.Buffer, ownsBuffer: false);
             if (t.IsContiguous)
                 return GetWeightBufferPreferResident(backend, t, PersistentTensorRole.Weights);
@@ -3464,9 +3490,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 using var bA = GetResidentOrPersistentInputBuffer(backend, left);
                 using var bB = GetResidentOrPersistentInputBuffer(backend, right);
                 var destBuf = GetOrCreateResidentBuffer(backend, destination, left.Length);
-                op(backend, bA.Buffer, bB.Buffer, destBuf, left.Length);
-                BindResidentBuffer(destination, destBuf, backend);
-                return true;
+                // PR #638 (CUDA-700 guard): never launch the kernel over a buffer smaller than the op length —
+                // that is the out-of-bounds access that faults the context. If any operand is undersized (a stale
+                // pooled buffer slipped through), fall back to the host path, which reallocates correctly.
+                if (bA.Buffer.Size < left.Length || bB.Buffer.Size < left.Length || destBuf.Size < left.Length)
+                    AliasDiag($"binary-into UNDERSIZED op={callerName} a={bA.Buffer.Size} b={bB.Buffer.Size} dest={destBuf.Size} need={left.Length}");
+                else
+                {
+                    op(backend, bA.Buffer, bB.Buffer, destBuf, left.Length);
+                    BindResidentBuffer(destination, destBuf, backend);
+                    return true;
+                }
             }
             catch (Exception rex)
             {
