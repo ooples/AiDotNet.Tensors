@@ -977,6 +977,16 @@ void main() {
         int strideH, int strideW, int padH, int padW)
     {
         EnsureInitialized();
+        try
+        {
+            int inTotal = batch * channels * inHeight * inWidth;
+            int outTotal = batch * channels * outHeight * outWidth;
+            Fill(gradInput, 0f, inTotal); // scatter-add target must start at zero
+            var pc = new uint[] { (uint)batch, (uint)channels, (uint)inHeight, (uint)inWidth, (uint)outHeight, (uint)outWidth };
+            if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.MaxPool2DBackward, pc, outTotal, gradOutput, indices, gradInput)) return;
+        }
+        catch { /* fall through to CPU reference */ }
+
         var go = DownloadBuffer(gradOutput);
         var idx = DownloadBuffer(indices);
         int inSpatial = inHeight * inWidth;
@@ -1086,6 +1096,13 @@ void main() {
     public void GlobalAvgPool2D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int height, int width)
     {
         EnsureInitialized();
+        try
+        {
+            var pc = new uint[] { (uint)batch, (uint)channels, (uint)height, (uint)width };
+            if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.GlobalAvgPool2D, pc, batch * channels, input, output)) return;
+        }
+        catch { /* fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         var outp = new float[batch * channels];
         int spatial = height * width;
@@ -1103,6 +1120,13 @@ void main() {
     public void GlobalMaxPool2D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int height, int width)
     {
         EnsureInitialized();
+        try
+        {
+            var pc = new uint[] { (uint)batch, (uint)channels, (uint)height, (uint)width };
+            if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.GlobalMaxPool2DNoIndices, pc, batch * channels, input, output)) return;
+        }
+        catch { /* fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         var outp = new float[batch * channels];
         int spatial = height * width;
@@ -1120,6 +1144,13 @@ void main() {
     public void GlobalMaxPool2D(IGpuBuffer input, IGpuBuffer output, IGpuBuffer indices, int batch, int channels, int height, int width)
     {
         EnsureInitialized();
+        try
+        {
+            var pc = new uint[] { (uint)batch, (uint)channels, (uint)height, (uint)width };
+            if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.GlobalMaxPool2D, pc, batch * channels, input, output, indices)) return;
+        }
+        catch { /* fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         var outp = new float[batch * channels];
         var idx = new float[batch * channels];
@@ -1140,6 +1171,13 @@ void main() {
     public void GlobalAvgPool2DBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput, int batch, int channels, int height, int width)
     {
         EnsureInitialized();
+        try
+        {
+            var pc = new uint[] { (uint)batch, (uint)channels, (uint)height, (uint)width };
+            if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.GlobalAvgPool2DBackward, pc, batch * channels * height * width, gradOutput, gradInput)) return;
+        }
+        catch { /* fall through to CPU reference */ }
+
         var go = DownloadBuffer(gradOutput);
         int spatial = height * width;
         var gi = new float[batch * channels * spatial];
@@ -1156,6 +1194,14 @@ void main() {
     public void GlobalMaxPool2DBackward(IGpuBuffer gradOutput, IGpuBuffer indices, IGpuBuffer gradInput, int batch, int channels, int height, int width)
     {
         EnsureInitialized();
+        try
+        {
+            Fill(gradInput, 0f, batch * channels * height * width); // only argmax positions are written
+            var pc = new uint[] { (uint)batch, (uint)channels, (uint)height, (uint)width };
+            if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.GlobalMaxPool2DBackward, pc, batch * channels, gradOutput, indices, gradInput)) return;
+        }
+        catch { /* fall through to CPU reference */ }
+
         var go = DownloadBuffer(gradOutput);
         var idx = DownloadBuffer(indices);
         int spatial = height * width;
@@ -1174,6 +1220,13 @@ void main() {
     public void AdaptiveAvgPool2D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth)
     {
         EnsureInitialized();
+        try
+        {
+            var pc = new uint[] { (uint)batch, (uint)channels, (uint)inHeight, (uint)inWidth, (uint)outHeight, (uint)outWidth };
+            if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.AdaptiveAvgPool2D, pc, batch * channels * outHeight * outWidth, input, output)) return;
+        }
+        catch { /* fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         var outp = new float[batch * channels * outHeight * outWidth];
         for (int b = 0; b < batch; b++)
@@ -1201,6 +1254,19 @@ void main() {
         int strideD, int strideH, int strideW)
     {
         EnsureInitialized();
+        try
+        {
+            if (indices is not null)
+            {
+                int total = batch * channels * outDepth * outHeight * outWidth;
+                var pc = new uint[] { (uint)batch, (uint)channels, (uint)inDepth, (uint)inHeight, (uint)inWidth,
+                    (uint)outDepth, (uint)outHeight, (uint)outWidth,
+                    (uint)kernelD, (uint)kernelH, (uint)kernelW, (uint)strideD, (uint)strideH, (uint)strideW };
+                if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.MaxPool3D, pc, total, input, output, indices)) return;
+            }
+        }
+        catch { /* fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         int outSize = batch * channels * outDepth * outHeight * outWidth;
         var outp = new float[outSize];
@@ -1239,6 +1305,17 @@ void main() {
         int outDepth, int outHeight, int outWidth)
     {
         EnsureInitialized();
+        try
+        {
+            int inTotal = batch * channels * inDepth * inHeight * inWidth;
+            int outTotal = batch * channels * outDepth * outHeight * outWidth;
+            Fill(gradInput, 0f, inTotal); // scatter-add target must start at zero
+            var pc = new uint[] { (uint)batch, (uint)channels, (uint)inDepth, (uint)inHeight, (uint)inWidth,
+                (uint)outDepth, (uint)outHeight, (uint)outWidth };
+            if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.MaxPool3DBackward, pc, outTotal, gradOutput, indices, gradInput)) return;
+        }
+        catch { /* fall through to CPU reference */ }
+
         var go = DownloadBuffer(gradOutput);
         var idx = DownloadBuffer(indices);
         int inSpatial = inDepth * inHeight * inWidth;
