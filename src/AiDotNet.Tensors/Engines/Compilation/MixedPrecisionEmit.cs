@@ -322,7 +322,11 @@ internal static class MixedPrecisionEmit
         return scope.RecordCrossTypeWithBackward<Half, float>(
             LazyNodeType.Custom, name, yH, outShape,
             (e, o) => MixedPrecisionCast.CastToFp32(yH).AsSpan().CopyTo(o.AsWritableSpan()),
-            (gradOut, input, output, state, e) => MixedPrecisionCast.CastToFp32Backward(gradOut));
+            // Down-cast the FP32 gradient into the Half grad space ON-DEVICE on the GPU (the host Tensor.Cast
+            // would pull the gradient to CPU — CastResidentDtype keeps it resident); host cast otherwise.
+            (gradOut, input, output, state, e) => e is AiDotNet.Tensors.Engines.DirectGpuTensorEngine g
+                ? g.CastResidentDtype<float, Half>(gradOut)
+                : MixedPrecisionCast.CastToFp32Backward(gradOut));
     }
 
     /// <summary>
@@ -337,8 +341,17 @@ internal static class MixedPrecisionEmit
             return up.Input; // already FP16 upstream — reuse it, skip the float round-trip
         return scope.RecordCrossTypeWithBackward<float, Half>(
             LazyNodeType.Custom, name, x, x._shape,
-            (e, o) => LandHalf(e, MixedPrecisionCast.CastToFp16(x), o),
-            (gradOut, input, output, state, e) => MixedPrecisionCast.CastToFp16Backward(gradOut));
+            (e, o) =>
+            {
+                if (e is AiDotNet.Tensors.Engines.DirectGpuTensorEngine fg && fg.TryCastResidentForwardHalf(x, o))
+                    return;
+                MixedPrecisionCast.CastToFp16(x).AsSpan().CopyTo(o.AsWritableSpan());
+            },
+            // Up-cast the Half gradient into the FP32 grad space ON-DEVICE on the GPU (the host Tensor.Cast
+            // would pull the gradient to CPU — CastResidentDtype keeps it resident); host cast otherwise.
+            (gradOut, input, output, state, e) => e is AiDotNet.Tensors.Engines.DirectGpuTensorEngine g
+                ? g.CastResidentDtype<Half, float>(gradOut)
+                : MixedPrecisionCast.CastToFp16Backward(gradOut));
     }
 
     /// <summary>

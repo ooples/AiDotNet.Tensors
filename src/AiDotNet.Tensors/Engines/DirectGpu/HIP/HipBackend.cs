@@ -1680,7 +1680,16 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     /// scalar at <paramref name="scalar"/>[0]. HIP counterpart of the CUDA scale_by_device_scalar.</summary>
     public unsafe void ScaleByDeviceScalar(IGpuBuffer buffer, IGpuBuffer scalar, int size)
     {
+        if (buffer is null) throw new ArgumentNullException(nameof(buffer));
+        if (scalar is null) throw new ArgumentNullException(nameof(scalar));
         if (size <= 0) return;
+        long requiredBytes = (long)size * sizeof(float);
+        if (buffer.SizeInBytes < requiredBytes)
+            throw new ArgumentException(
+                $"ScaleByDeviceScalar requires {requiredBytes} bytes but buffer has {buffer.SizeInBytes}.", nameof(buffer));
+        if (scalar.SizeInBytes < sizeof(float))
+            throw new ArgumentException(
+                $"ScaleByDeviceScalar requires a scalar buffer with at least {sizeof(float)} bytes.", nameof(scalar));
         if (!_kernelCache.TryGetValue("scale_by_device_scalar", out var kernel))
             throw new InvalidOperationException("HIP kernel not found: scale_by_device_scalar");
         IntPtr bufPtr = buffer.Handle;
@@ -1692,6 +1701,9 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         args[2] = &n;
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
+        // Preserve the synchronous lifetime contract: the caller may free/reuse the device scalar
+        // immediately after this returns, so the launch must complete before we return (matches ScaleVector).
+        Synchronize();
     }
 
     public unsafe void StridedGather(IGpuBuffer src, IGpuBuffer dst, int offset, int stride, int count)

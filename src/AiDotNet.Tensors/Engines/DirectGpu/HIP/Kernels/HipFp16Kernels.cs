@@ -406,6 +406,43 @@ extern ""C"" __global__ __launch_bounds__(256) void fp16_softmax(
         *reinterpret_cast<__half*>(&rowOut[c]) = __float2half(expf(v - maxVal) * invSum);
     }
 }
+
+// ============================================================================
+// FP16 LAYERNORM (FP16 I/O + gamma/beta, FP32 accumulation). ONE BLOCK PER ROW.
+// Full-block shared-memory reduction (no warp-size assumption, correct on wave32/wave64).
+// Population variance (/cols), eps inside rsqrt — matches the engine's LayerNorm convention.
+// Writes per-row FP32 mean + variance for the backward; meanOut/varOut are optional + independent.
+// ============================================================================
+extern ""C"" __global__ void fp16_layernorm(
+    const unsigned short* __restrict__ input, const unsigned short* __restrict__ gamma,
+    const unsigned short* __restrict__ beta, unsigned short* __restrict__ output,
+    float* __restrict__ meanOut, float* __restrict__ varOut, int rows, int cols, float eps)
+{
+    int row = blockIdx.x;
+    if (row >= rows) return;
+    const unsigned short* in = input + (long long)row * cols;
+    unsigned short* out = output + (long long)row * cols;
+    extern __shared__ float sdata[];
+    int tid = threadIdx.x; int bs = blockDim.x;
+    float s = 0.0f;
+    for (int i = tid; i < cols; i += bs) s += __half2float(*reinterpret_cast<const __half*>(&in[i]));
+    sdata[tid] = s; __syncthreads();
+    for (int st = bs >> 1; st > 0; st >>= 1) { if (tid < st) sdata[tid] += sdata[tid + st]; __syncthreads(); }
+    float mean = sdata[0] / (float)cols; __syncthreads();
+    float vv = 0.0f;
+    for (int i = tid; i < cols; i += bs) { float d = __half2float(*reinterpret_cast<const __half*>(&in[i])) - mean; vv += d * d; }
+    sdata[tid] = vv; __syncthreads();
+    for (int st = bs >> 1; st > 0; st >>= 1) { if (tid < st) sdata[tid] += sdata[tid + st]; __syncthreads(); }
+    float var = sdata[0] / (float)cols; __syncthreads();
+    float invstd = rsqrtf(var + eps);
+    if (tid == 0) { if (meanOut) meanOut[row] = mean; if (varOut) varOut[row] = var; }
+    for (int i = tid; i < cols; i += bs) {
+        float norm = (__half2float(*reinterpret_cast<const __half*>(&in[i])) - mean) * invstd;
+        float g = __half2float(*reinterpret_cast<const __half*>(&gamma[i]));
+        float b = __half2float(*reinterpret_cast<const __half*>(&beta[i]));
+        *reinterpret_cast<__half*>(&out[i]) = __float2half(norm * g + b);
+    }
+}
 ";
     }
 
@@ -433,7 +470,8 @@ extern ""C"" __global__ __launch_bounds__(256) void fp16_softmax(
             "fp16_swish",
             "fp16_reduce_sum",
             "fp16_reduce_sum_deterministic",
-            "fp16_softmax"
+            "fp16_softmax",
+            "fp16_layernorm"
         };
     }
 }

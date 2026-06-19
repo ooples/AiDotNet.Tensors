@@ -665,6 +665,42 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
         await WebGpuNativeBindings.SubmitAndWaitAsync();
     }
 
+    /// <summary>
+    /// C[M,N] = Aᵀ·B where A is stored row-major as [K, M] and B as [K, N] (contraction over the leading dim).
+    /// The left-operand-transposed companion to <see cref="MatMulTransposedAsync"/>, used for the FP16 matmul
+    /// backward's gradB = Aᵀ·gradC term — no materialized transpose (A's index pattern is A[k*M + row]).
+    /// </summary>
+    public async Task MatMulLhsTransposedAsync(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
+    {
+        ThrowIfNotInitialized();
+        var aBuffer = (WebGpuBuffer)A;
+        var bBuffer = (WebGpuBuffer)B;
+        var cBuffer = (WebGpuBuffer)C;
+        var pipelineId = await GetOrCreatePipelineAsync("MatMulLhsTransposed", WebGpuKernels.MatMulSource, "gemm_lhs_transposed_simple");
+        var paramsData = new float[]
+        {
+            BitConverter.Int32BitsToSingle(M),
+            BitConverter.Int32BitsToSingle(N),
+            BitConverter.Int32BitsToSingle(K),
+            alpha,
+            beta, 0, 0, 0
+        };
+        using var uniformBuffer = new WebGpuBuffer(paramsData, WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst);
+        using var bindGroup = new WebGpuBindGroup(pipelineId, aBuffer, bBuffer, cBuffer);
+        long total = (long)M * N;
+        const long workgroupSize = 256;
+        const long maxWorkgroupsPerDim = 65535;
+        long maxItems = maxWorkgroupsPerDim * workgroupSize;
+        if (total <= 0 || total > maxItems)
+            throw new ArgumentOutOfRangeException(
+                nameof(M),
+                $"MatMulLhsTransposedAsync: M*N = {total} exceeds the 1D dispatch capacity of {maxItems}. " +
+                "A tiled fallback is required for matrices this large.");
+        var (wg, _) = _device.CalculateWorkgroups1D((int)total);
+        await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(pipelineId, bindGroup.BindGroupId, uniformBuffer.BufferId, wg, 1, 1);
+        await WebGpuNativeBindings.SubmitAndWaitAsync();
+    }
+
     public async Task GemmAsync(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
     {
         ThrowIfNotInitialized();

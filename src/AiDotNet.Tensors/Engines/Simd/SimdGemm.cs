@@ -1432,6 +1432,19 @@ internal static partial class SimdGemm
         bool allowParallel,
         bool clearedOutput = false)
     {
+        // batch=1 / small-M, large-N, no-transpose: parallelize over N (output features). The
+        // small-matmul fast path below requires m >= Mr and SgemmDirectParallelM requires m >= 64,
+        // so a tiny-M GEMM (foundation-model batch=1 / decode forward, fused QKV/FFN projections)
+        // otherwise runs single-threaded over a huge N. N-partitioning saturates the cores even at
+        // m=1. Gated above ParallelWorkThreshold so small GEMMs stay serial (dispatch would
+        // dominate). Race-free: each worker owns a disjoint column range (overwrite or accumulate).
+        if (allowParallel && UseParallelGemm && !transA && !transB
+            && m > 0 && m <= NParallelSmallMMaxM && n >= Nr
+            && (long)m * k * n >= ParallelWorkThreshold)
+        {
+            SgemmNParallelSmallM(a, lda, b, ldb, c, m, k, n, clearedOutput);
+            return;
+        }
 #if NET5_0_OR_GREATER
         if (Avx2.IsSupported && Fma.IsSupported && m >= Mr && n > 0)
         {

@@ -124,6 +124,17 @@ fn minimum(@builtin(global_invocation_id) gid: vec3<u32>) {
         C[idx] = min(A[idx], B[idx]);
     }
 }
+
+// Multiply every element of A by a DEVICE-resident scalar (B[0]) into C. WebGPU/WGSL counterpart of the
+// CUDA scale_by_device_scalar. Written out-of-place (C != A) so the in-place caller copies C back to A —
+// WebGPU forbids binding one buffer as both read and read_write storage.
+@compute @workgroup_size(256)
+fn scale_by_device_scalar(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx < params.size) {
+        C[idx] = A[idx] * B[0];
+    }
+}
 ";
 
     /// <summary>
@@ -732,6 +743,27 @@ fn gemm_transposed_simple(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     C[idx] = params.alpha * acc + params.beta * C[idx];
 }
+
+// C[M,N] = Aᵀ · B, where A is stored row-major as [K, M] and B as [K, N],
+// contraction over the LEADING dim K of both. The left-operand-transposed
+// companion to gemm_transposed_simple, needed for the FP16 matmul backward's
+// gradB = Aᵀ·gradC term (no materialized transpose: A's index pattern changes
+// from A[row*K + k] to A[k*M + row]).
+@compute @workgroup_size(256)
+fn gemm_lhs_transposed_simple(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let total = params.M * params.N;
+    if (idx >= total) {
+        return;
+    }
+    let row = idx / params.N;
+    let col = idx % params.N;
+    var acc: f32 = 0.0;
+    for (var k: u32 = 0u; k < params.K; k = k + 1u) {
+        acc = acc + A[k * params.M + row] * B[k * params.N + col];
+    }
+    C[idx] = params.alpha * acc + params.beta * C[idx];
+}
 ";
 
     /// <summary>
@@ -877,6 +909,77 @@ fn layer_norm(@builtin(global_invocation_id) gid: vec3<u32>,
     workgroupBarrier();
 
     // Normalize
+    let inv_std = 1.0 / sqrt(shared_var + params.epsilon);
+    for (var i: u32 = local_idx; i < params.feature_size; i = i + 256u) {
+        let normalized = (input[base + i] - shared_mean) * inv_std;
+        output[base + i] = gamma[i] * normalized + beta[i];
+    }
+}
+";
+
+    /// <summary>
+    /// FP16-native LayerNorm (one work-group per row). Identical math to <see cref="LayerNormSource"/> but
+    /// ALSO writes the per-row FP32 mean + variance (for the backward), matching the CUDA
+    /// fp16_layernorm_native contract. WebGPU models FP16 as truncated-f32, so this runs the real f32 kernel
+    /// on the (already-truncated) inputs and the caller re-truncates the output to FP16 precision.
+    /// </summary>
+    public const string Fp16LayerNormSource = @"
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read> gamma: array<f32>;
+@group(0) @binding(2) var<storage, read> beta: array<f32>;
+@group(0) @binding(3) var<storage, read_write> output: array<f32>;
+@group(0) @binding(4) var<storage, read_write> mean_out: array<f32>;
+@group(0) @binding(5) var<storage, read_write> var_out: array<f32>;
+
+struct Params {
+    batch_size: u32,
+    feature_size: u32,
+    epsilon: f32,
+}
+@group(0) @binding(6) var<uniform> params: Params;
+
+var<workgroup> shared_mean: f32;
+var<workgroup> shared_var: f32;
+var<workgroup> local_data: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn fp16_layernorm(@builtin(local_invocation_id) lid: vec3<u32>,
+                  @builtin(workgroup_id) wid: vec3<u32>) {
+    let batch_idx = wid.x;
+    let local_idx = lid.x;
+    let base = batch_idx * params.feature_size;
+
+    var local_sum: f32 = 0.0;
+    for (var i: u32 = local_idx; i < params.feature_size; i = i + 256u) {
+        local_sum = local_sum + input[base + i];
+    }
+    local_data[local_idx] = local_sum;
+    workgroupBarrier();
+    for (var stride: u32 = 128u; stride > 0u; stride = stride >> 1u) {
+        if (local_idx < stride) { local_data[local_idx] = local_data[local_idx] + local_data[local_idx + stride]; }
+        workgroupBarrier();
+    }
+    if (local_idx == 0u) { shared_mean = local_data[0] / f32(params.feature_size); }
+    workgroupBarrier();
+
+    var local_var: f32 = 0.0;
+    for (var i: u32 = local_idx; i < params.feature_size; i = i + 256u) {
+        let diff = input[base + i] - shared_mean;
+        local_var = local_var + diff * diff;
+    }
+    local_data[local_idx] = local_var;
+    workgroupBarrier();
+    for (var stride: u32 = 128u; stride > 0u; stride = stride >> 1u) {
+        if (local_idx < stride) { local_data[local_idx] = local_data[local_idx] + local_data[local_idx + stride]; }
+        workgroupBarrier();
+    }
+    if (local_idx == 0u) {
+        shared_var = local_data[0] / f32(params.feature_size);
+        mean_out[batch_idx] = shared_mean;
+        var_out[batch_idx] = shared_var;
+    }
+    workgroupBarrier();
+
     let inv_std = 1.0 / sqrt(shared_var + params.epsilon);
     for (var i: u32 = local_idx; i < params.feature_size; i = i + 256u) {
         let normalized = (input[base + i] - shared_mean) * inv_std;

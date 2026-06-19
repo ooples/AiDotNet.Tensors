@@ -28,6 +28,11 @@ public sealed partial class CudaBackend
     public bool SupportsHgemm => IsAvailable && _ccMajor >= 5;
 
     /// <inheritdoc/>
+    /// <remarks>The fused backward is two <c>cublasGemmEx</c> launches with transpose flags — available on exactly
+    /// the same Tensor-Core-capable hardware as the forward HGEMM, so it tracks <see cref="SupportsHgemm"/>.</remarks>
+    public bool SupportsFp16FusedBackward => SupportsHgemm;
+
+    /// <inheritdoc/>
     public unsafe void Hgemm(IGpuBuffer aFp16, IGpuBuffer bFp16, IGpuBuffer cFp16,
         int m, int n, int k)
     {

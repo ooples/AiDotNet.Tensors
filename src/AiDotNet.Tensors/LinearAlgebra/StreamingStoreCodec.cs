@@ -277,6 +277,177 @@ internal static class StreamingStoreCodec
         return d;
     }
 
+    // ── int4 GROUP symmetric quantization (8x vs fp32) ───────────────────────
+    // Layout: [int32 count][int32 groupSize][numGroups × fp32 scale][ceil(count/2) packed nibbles].
+    // AWQ/GPTQ-style group quantization: contiguous runs of `groupSize` elements share one
+    // symmetric scale (amax/7). 4 bits/weight = 8x compression vs fp32 — the most aggressive
+    // rung of the quant ladder, required to make the very largest (>~20B) models RESIDENT in a
+    // 16 GiB budget. Group (not per-tensor) scaling keeps the int4 RMSE bounded despite the tiny
+    // 4-bit range; smaller groups = better SNR at a small header cost (one fp32 per group).
+    // Signed 4-bit range is [-7, 7] (8 is excluded to stay symmetric, mirroring int8's -127).
+    // Each byte packs two elements: low nibble = even index, high nibble = odd index.
+    // Explicit opt-in only — Auto never picks int4 (far lossier than bf16/int8).
+
+    /// <summary>Default int4 group size (AWQ/GPTQ convention). One fp32 scale per 128 weights.</summary>
+    internal const int DefaultInt4GroupSize = 128;
+
+    /// <summary>Number of int4 groups covering <paramref name="count"/> elements at
+    /// <paramref name="groupSize"/> (the last group may be partial).</summary>
+    internal static int Int4NumGroups(int count, int groupSize) => (count + groupSize - 1) / groupSize;
+
+    /// <summary>int4 header bytes: 4 (count) + 4 (groupSize) + one 4-byte fp32 scale per group.</summary>
+    internal static int Int4HeaderBytes(int numGroups) => 8 + 4 * numGroups;
+
+    /// <summary>int4 buffer size for <paramref name="count"/> elements at <paramref name="groupSize"/>:
+    /// header + ceil(count/2) packed-nibble bytes.</summary>
+    internal static int Int4BufferBytes(int count, int groupSize)
+        => Int4HeaderBytes(Int4NumGroups(count, groupSize)) + (count + 1) / 2;
+
+    private static sbyte QuantOneInt4(double v, double inv)
+    {
+        int q = (int)Math.Round(v * inv);
+        if (q > 7) q = 7; else if (q < -7) q = -7; // symmetric, avoid -8
+        return (sbyte)q;
+    }
+
+    // Write a signed 4-bit value into the low (even i) or high (odd i) nibble of dst[dataOff + i/2].
+    private static void PackNibble(Span<byte> dst, int dataOff, int i, sbyte q)
+    {
+        int b = dataOff + (i >> 1);
+        byte nib = (byte)(q & 0x0F);
+        if ((i & 1) == 0) dst[b] = (byte)((dst[b] & 0xF0) | nib);
+        else dst[b] = (byte)((dst[b] & 0x0F) | (nib << 4));
+    }
+
+    // Read + sign-extend the 4-bit value at element index i.
+    private static int UnpackNibble(ReadOnlySpan<byte> src, int dataOff, int i)
+    {
+        byte by = src[dataOff + (i >> 1)];
+        int n = (i & 1) == 0 ? (by & 0x0F) : (by >> 4) & 0x0F;
+        return (n & 0x8) != 0 ? n - 16 : n; // sign-extend -8..7
+    }
+
+    /// <summary>fp32 → int4 group-quant. <paramref name="dst"/> must be
+    /// <c>Int4BufferBytes(src.Length, groupSize)</c>.</summary>
+    internal static void EncodeInt4Float(ReadOnlySpan<float> src, Span<byte> dst, int groupSize)
+    {
+        int count = src.Length;
+        if (groupSize <= 0)
+            throw new ArgumentException($"int4 encode: groupSize ({groupSize}) must be > 0.", nameof(groupSize));
+        int numGroups = Int4NumGroups(count, groupSize);
+        int dataOff = Int4HeaderBytes(numGroups);
+        WriteInt32(dst, 0, count);
+        WriteInt32(dst, 4, groupSize);
+        for (int g = 0; g < numGroups; g++)
+        {
+            int baseI = g * groupSize;
+            int len = Math.Min(groupSize, count - baseI);
+            float amax = 0f;
+            for (int j = 0; j < len; j++)
+            {
+                float v = src[baseI + j];
+                if (float.IsNaN(v) || float.IsInfinity(v))
+                    throw new ArgumentException(
+                        $"int4 streaming-store encoder cannot encode non-finite value at index {baseI + j} (got {v}).",
+                        nameof(src));
+                float a = Math.Abs(v); if (a > amax) amax = a;
+            }
+            float scale = amax > 0f ? amax / 7f : 1f;
+            WriteScaleAt(dst, 8 + g * 4, scale);
+            double inv = 1.0 / scale;
+            for (int j = 0; j < len; j++) PackNibble(dst, dataOff, baseI + j, QuantOneInt4(src[baseI + j], inv));
+        }
+    }
+
+    /// <summary>fp64 → int4 group-quant.</summary>
+    internal static void EncodeInt4Double(ReadOnlySpan<double> src, Span<byte> dst, int groupSize)
+    {
+        int count = src.Length;
+        if (groupSize <= 0)
+            throw new ArgumentException($"int4 encode: groupSize ({groupSize}) must be > 0.", nameof(groupSize));
+        int numGroups = Int4NumGroups(count, groupSize);
+        int dataOff = Int4HeaderBytes(numGroups);
+        WriteInt32(dst, 0, count);
+        WriteInt32(dst, 4, groupSize);
+        for (int g = 0; g < numGroups; g++)
+        {
+            int baseI = g * groupSize;
+            int len = Math.Min(groupSize, count - baseI);
+            double amax = 0.0;
+            for (int j = 0; j < len; j++)
+            {
+                double v = src[baseI + j];
+                if (double.IsNaN(v) || double.IsInfinity(v))
+                    throw new ArgumentException(
+                        $"int4 streaming-store encoder cannot encode non-finite value at index {baseI + j} (got {v}).",
+                        nameof(src));
+                double a = Math.Abs(v); if (a > amax) amax = a;
+            }
+            float scale = amax > 0.0 ? (float)(amax / 7.0) : 1f;
+            WriteScaleAt(dst, 8 + g * 4, scale);
+            double inv = 1.0 / scale;
+            for (int j = 0; j < len; j++) PackNibble(dst, dataOff, baseI + j, QuantOneInt4(src[baseI + j], inv));
+        }
+    }
+
+    /// <summary>int4 group-quant → fp32 (dequant). <paramref name="src"/> is the encoded buffer.</summary>
+    internal static void DecodeInt4Float(ReadOnlySpan<byte> src, Span<float> dst)
+    {
+        int count = ReadInt32(src, 0);
+        int groupSize = ReadInt32(src, 4);
+        int numGroups = Int4NumGroups(count, groupSize);
+        int dataOff = Int4HeaderBytes(numGroups);
+        for (int g = 0; g < numGroups; g++)
+        {
+            float scale = ReadScaleAt(src, 8 + g * 4);
+            int baseI = g * groupSize;
+            int len = Math.Min(groupSize, count - baseI);
+            for (int j = 0; j < len; j++) dst[baseI + j] = UnpackNibble(src, dataOff, baseI + j) * scale;
+        }
+    }
+
+    /// <summary>int4 group-quant → fp64.</summary>
+    internal static void DecodeInt4Double(ReadOnlySpan<byte> src, Span<double> dst)
+    {
+        int count = ReadInt32(src, 0);
+        int groupSize = ReadInt32(src, 4);
+        int numGroups = Int4NumGroups(count, groupSize);
+        int dataOff = Int4HeaderBytes(numGroups);
+        for (int g = 0; g < numGroups; g++)
+        {
+            float scale = ReadScaleAt(src, 8 + g * 4);
+            int baseI = g * groupSize;
+            int len = Math.Min(groupSize, count - baseI);
+            for (int j = 0; j < len; j++) dst[baseI + j] = UnpackNibble(src, dataOff, baseI + j) * (double)scale;
+        }
+    }
+
+    // ── int4 compute-path extraction (for the no-upcast int4 GEMM) ──
+    /// <summary>Element count stored in an int4 buffer header.</summary>
+    internal static int Int4CountOf(ReadOnlySpan<byte> src) => ReadInt32(src, 0);
+    /// <summary>Group size stored in an int4 buffer header.</summary>
+    internal static int Int4GroupSizeOf(ReadOnlySpan<byte> src) => ReadInt32(src, 4);
+    /// <summary>Per-group scales from an int4 buffer.</summary>
+    internal static float[] Int4ScalesOf(ReadOnlySpan<byte> src)
+    {
+        int count = ReadInt32(src, 0);
+        int groupSize = ReadInt32(src, 4);
+        int numGroups = Int4NumGroups(count, groupSize);
+        var s = new float[numGroups];
+        for (int g = 0; g < numGroups; g++) s[g] = ReadScaleAt(src, 8 + g * 4);
+        return s;
+    }
+    /// <summary>The <paramref name="count"/> sign-extended int4 weights (one per sbyte) from an int4 buffer.</summary>
+    internal static sbyte[] Int4DataOf(ReadOnlySpan<byte> src, int count)
+    {
+        int groupSize = ReadInt32(src, 4);
+        int numGroups = Int4NumGroups(count, groupSize);
+        int dataOff = Int4HeaderBytes(numGroups);
+        var d = new sbyte[count];
+        for (int i = 0; i < count; i++) d[i] = (sbyte)UnpackNibble(src, dataOff, i);
+        return d;
+    }
+
     // ── Lossless: byte-plane shuffle + DEFLATE (EXACT, ~1.18x on fp weights) ──────────
     // Dense fp weights don't compress raw (~100%): the high-entropy mantissa bytes are
     // interleaved with the structured sign/exponent bytes. Byte-plane shuffle (SIMD, see

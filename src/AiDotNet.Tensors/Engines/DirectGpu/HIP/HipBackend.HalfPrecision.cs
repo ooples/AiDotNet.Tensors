@@ -33,6 +33,67 @@ public sealed partial class HipBackend : IGpuHalfPrecisionBackend
     public bool SupportsHgemm => _hipblasAvailable && _hipblasHandle != IntPtr.Zero;
 
     /// <inheritdoc/>
+    /// <remarks>The fused backward is two <c>hipblasGemmEx</c> launches with transpose flags — same library +
+    /// device gate as the forward GEMM, so it tracks <see cref="SupportsHgemm"/>.</remarks>
+    public bool SupportsFp16FusedBackward => SupportsHgemm;
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// rocBLAS counterpart of <see cref="CUDA.CudaBackend.MatMulBackwardFp16Fused"/>: two transpose-free
+    /// <c>hipblasGemmEx</c> launches (FP16 in, FP32 accumulate) with the same column-major derivation hipBLAS
+    /// shares with cuBLAS. gradA[M,K] = gradC·Bᵀ → col-major (op=T on B, op=N on gradC; m=K,n=M,k=N);
+    /// gradB[K,N] = Aᵀ·gradC → col-major (op=N on gradC, op=T on A; m=N,n=K,k=M).
+    /// </remarks>
+    public void MatMulBackwardFp16Fused(
+        IGpuBuffer gradCFp16, IGpuBuffer aFp16, IGpuBuffer bFp16,
+        IGpuBuffer gradAOut, IGpuBuffer gradBOut,
+        int m, int n, int k, bool gradOutHalf)
+    {
+        if (gradCFp16 is null) throw new ArgumentNullException(nameof(gradCFp16));
+        if (aFp16 is null) throw new ArgumentNullException(nameof(aFp16));
+        if (bFp16 is null) throw new ArgumentNullException(nameof(bFp16));
+        if (gradAOut is null) throw new ArgumentNullException(nameof(gradAOut));
+        if (gradBOut is null) throw new ArgumentNullException(nameof(gradBOut));
+        if (m <= 0) throw new ArgumentOutOfRangeException(nameof(m), "Dimensions must be positive.");
+        if (n <= 0) throw new ArgumentOutOfRangeException(nameof(n), "Dimensions must be positive.");
+        if (k <= 0) throw new ArgumentOutOfRangeException(nameof(k), "Dimensions must be positive.");
+        EnsureHalfGemmSupported();
+
+        var outType = gradOutHalf ? HipBlasNative.HipBlasDatatype.R_16F : HipBlasNative.HipBlasDatatype.R_32F;
+        float alpha = 1.0f, beta = 0.0f;
+
+        // gradA[M,K] = gradC · Bᵀ  →  col-major gradA[K,M] = Bᵀ_col · gradC_col.
+        var sA = HipBlasNative.hipblasGemmEx(
+            _hipblasHandle,
+            HipBlasNative.HipBlasOperation.Transpose, HipBlasNative.HipBlasOperation.None,
+            k, m, n,
+            ref alpha,
+            ((HipGpuBuffer)bFp16).Handle, HipBlasNative.HipBlasDatatype.R_16F, n,
+            ((HipGpuBuffer)gradCFp16).Handle, HipBlasNative.HipBlasDatatype.R_16F, n,
+            ref beta,
+            ((HipGpuBuffer)gradAOut).Handle, outType, k,
+            HipBlasNative.HipBlasDatatype.R_32F, HipBlasNative.HipBlasGemmAlgo.Default);
+        if (sA != HipBlasNative.HipBlasStatus.Success)
+            throw new InvalidOperationException($"hipblasGemmEx(MatMulBackwardFp16Fused gradA) failed: {sA}");
+
+        // gradB[K,N] = Aᵀ · gradC  →  col-major gradB[N,K] = gradC_col · Aᵀ_col.
+        var sB = HipBlasNative.hipblasGemmEx(
+            _hipblasHandle,
+            HipBlasNative.HipBlasOperation.None, HipBlasNative.HipBlasOperation.Transpose,
+            n, k, m,
+            ref alpha,
+            ((HipGpuBuffer)gradCFp16).Handle, HipBlasNative.HipBlasDatatype.R_16F, n,
+            ((HipGpuBuffer)aFp16).Handle, HipBlasNative.HipBlasDatatype.R_16F, k,
+            ref beta,
+            ((HipGpuBuffer)gradBOut).Handle, outType, n,
+            HipBlasNative.HipBlasDatatype.R_32F, HipBlasNative.HipBlasGemmAlgo.Default);
+        if (sB != HipBlasNative.HipBlasStatus.Success)
+            throw new InvalidOperationException($"hipblasGemmEx(MatMulBackwardFp16Fused gradB) failed: {sB}");
+
+        SyncHalfGemm();
+    }
+
+    /// <inheritdoc/>
     public void Hgemm(IGpuBuffer aFp16, IGpuBuffer bFp16, IGpuBuffer cFp16,
         int m, int n, int k)
     {

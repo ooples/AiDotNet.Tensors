@@ -67,7 +67,8 @@ internal static class MixedPrecisionGraphBackward
     /// (so it can't re-topo from <c>loss.LazySource</c>). Single source of the per-node backward dispatch.
     /// </summary>
     internal static Result BackwardOverOrder(IReadOnlyList<ILazyNode> producersFirstOrder, Tensor<float> lossOutput, IEngine engine, float seedScale = 1f,
-        Action<ILazyNode>? onBeforeNodeBackward = null, Action<ILazyNode>? onAfterNodeBackward = null)
+        Action<ILazyNode>? onBeforeNodeBackward = null, Action<ILazyNode>? onAfterNodeBackward = null,
+        Action<ILazyNode, Dictionary<Tensor<float>, Tensor<float>>, Dictionary<Tensor<Half>, Tensor<Half>>>? onAfterNodeBackwardWithGrads = null)
     {
         var fp32 = new Dictionary<Tensor<float>, Tensor<float>>(ReferenceEqualityComparer<Tensor<float>>.Instance);
         var fp16 = new Dictionary<Tensor<Half>, Tensor<Half>>(ReferenceEqualityComparer<Tensor<Half>>.Instance);
@@ -130,6 +131,9 @@ internal static class MixedPrecisionGraphBackward
                 // Other cross-type nodes (e.g. Complex FFT) are forward-only here — no grad edge.
             }
             onAfterNodeBackward?.Invoke(producersFirstOrder[i]);
+            // Post-node hook WITH the live gradient maps: lets the caller release this node's backward sub-op
+            // scratch from the activation cache while protecting the still-live gradient accumulators.
+            onAfterNodeBackwardWithGrads?.Invoke(producersFirstOrder[i], fp32, fp16);
         }
 
         return new Result(fp32, fp16);

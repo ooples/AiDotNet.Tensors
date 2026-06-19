@@ -45,6 +45,49 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.HIP
             LaunchKernel(kernel, grid, DefaultBlockSize, args);
         }
 
+        /// <summary>Row softmax over the last axis of a half buffer: one block per row, FP32 max/sum
+        /// reductions, half in/out. HIP counterpart of the CUDA fp16_softmax_native.</summary>
+        public unsafe void Fp16Softmax(IGpuBuffer input, IGpuBuffer output, int rows, int cols)
+        {
+            if (input is null) throw new ArgumentNullException(nameof(input));
+            if (output is null) throw new ArgumentNullException(nameof(output));
+            if (rows <= 0 || cols <= 0) throw new ArgumentException($"rows/cols must be positive (rows={rows}, cols={cols}).");
+            if (!_kernelCache.TryGetValue("fp16_softmax", out var kernel))
+                throw new InvalidOperationException("HIP kernel not found: fp16_softmax");
+            IntPtr inP = input.Handle, oP = output.Handle;
+            int r = rows, c = cols;
+            void** args = stackalloc void*[4];
+            args[0] = &inP; args[1] = &oP; args[2] = &r; args[3] = &c;
+            uint sharedBytes = (uint)((int)DefaultBlockSize * sizeof(float));
+            LaunchKernel(kernel, (uint)rows, DefaultBlockSize, args, sharedBytes);
+        }
+
+        /// <summary>Row layernorm over the last axis of a half buffer with half gamma/beta: one block per row,
+        /// FP32 mean/var, half in/out; optionally writes per-row FP32 mean/variance. HIP counterpart of the
+        /// CUDA fp16_layernorm_native.</summary>
+        public unsafe void Fp16LayerNorm(IGpuBuffer input, IGpuBuffer gamma, IGpuBuffer beta, IGpuBuffer output,
+            IGpuBuffer meanFp32, IGpuBuffer varFp32, int rows, int cols, float eps)
+        {
+            if (input is null) throw new ArgumentNullException(nameof(input));
+            if (gamma is null) throw new ArgumentNullException(nameof(gamma));
+            if (beta is null) throw new ArgumentNullException(nameof(beta));
+            if (output is null) throw new ArgumentNullException(nameof(output));
+            if (rows <= 0 || cols <= 0) throw new ArgumentException($"rows/cols must be positive (rows={rows}, cols={cols}).");
+            if (eps <= 0f || float.IsNaN(eps) || float.IsInfinity(eps))
+                throw new ArgumentOutOfRangeException(nameof(eps), eps, "eps must be finite and positive.");
+            if (!_kernelCache.TryGetValue("fp16_layernorm", out var kernel))
+                throw new InvalidOperationException("HIP kernel not found: fp16_layernorm");
+            IntPtr inP = input.Handle, gP = gamma.Handle, bP = beta.Handle, oP = output.Handle;
+            IntPtr mP = meanFp32 is null ? IntPtr.Zero : meanFp32.Handle;
+            IntPtr vP = varFp32 is null ? IntPtr.Zero : varFp32.Handle;
+            int r = rows, c = cols; float e = eps;
+            void** args = stackalloc void*[9];
+            args[0] = &inP; args[1] = &gP; args[2] = &bP; args[3] = &oP;
+            args[4] = &mP; args[5] = &vP; args[6] = &r; args[7] = &c; args[8] = &e;
+            uint sharedBytes = (uint)((int)DefaultBlockSize * sizeof(float));
+            LaunchKernel(kernel, (uint)rows, DefaultBlockSize, args, sharedBytes);
+        }
+
         private unsafe void LaunchUnaryFp16Native(string kernelName, IGpuBuffer input, IGpuBuffer output, int n)
         {
             if (input is null) throw new ArgumentNullException(nameof(input));

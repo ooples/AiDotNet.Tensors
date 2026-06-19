@@ -90,12 +90,19 @@ public static class TensorPool<T>
         if (tensor._pinnedByTape) return;
 
         // PR #638: a GPU-RESIDENT tensor (BindResidentBuffer set _gpuBuffer + a deferred host-read materializer)
-        // must NOT be pooled — but the GetLiveBackingArrayOrNull() discriminator below calls GetDataArray(), which
+        // must NOT be pooled — the GetLiveBackingArrayOrNull() discriminator below calls GetDataArray(), which
         // FIRES that materializer (a DtoH download). During CUDA-graph capture that download is a non-capturable
         // CUDA-900 that aborts the whole-step capture (the LAST blocker after every backward grad went resident:
-        // NegateBackward pool-returns its resident negGrad). Reject resident tensors here via the _gpuBuffer FIELD
+        // NegateBackward pool-returns its resident negGrad). Reject resident tensors via the _gpuBuffer FIELD
         // (no materialization) before the downloading check.
         if (tensor._gpuBuffer is not null) return;
+
+        // GPU residency (main #633): a tensor produced by a GPU op may carry a PENDING deferred GPU→CPU download
+        // even without _gpuBuffer set (Half-resident store). Pooling it would FORCE that download to recycle the
+        // array. Skip — the few recycled bytes aren't worth breaking residency; the temp is GC'd. Complements the
+        // _gpuBuffer check above.
+        var unsafeBacking = tensor.DataVector.GetBackingArrayUnsafe();
+        if (unsafeBacking is not null && Helpers.DeferredArrayMaterializer.IsPending(unsafeBacking)) return;
 
         // Issue #338 view-safety: refuse view-tensors whose backing
         // storage is shared with another tensor (strided permute views,

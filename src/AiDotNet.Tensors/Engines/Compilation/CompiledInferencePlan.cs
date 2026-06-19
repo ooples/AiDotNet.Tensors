@@ -1301,8 +1301,20 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     private static List<CompiledStep<T>> RunStepMutatingPasses(List<CompiledStep<T>> steps, IEngine engine)
     {
         if (steps.Count < 4) return steps;
+
+        // OperatorReorderingPass and MemoryPlanningPass run here, pre-specialization, so the
+        // specializer pins the correct post-reorder/post-rebind tensors. These passes are now
+        // correct for the attention fan-out topology (one shared input feeding q/k/v through
+        // matmul->reshape->permute, joined at scaled-dot-product attention). The historical
+        // miscompile (#1624) was NOT in these passes: MemoryPlanningPass legally donates a
+        // buffer that dies at its original last-use, but the later BlasBatchPass HOISTS grouped
+        // matmuls to a single position and could move an aliased matmul write ahead of the
+        // donor buffer's last consumer. The fix lives in BlasBatchPass (it now refuses to batch
+        // matmuls whose output buffer was aliased by MemoryPlanning) — see BlasBatchPass.HasAliasedOutput.
+        // Verified eager-parity across the full attention/SDPA fan-out suite (MultiInputReplayAliasingTests).
         var arr = steps.ToArray();
         AiDotNet.Tensors.Engines.Optimization.ICpuOptimizationPass[] passes =
+            new AiDotNet.Tensors.Engines.Optimization.ICpuOptimizationPass[]
         {
             new AiDotNet.Tensors.Engines.Optimization.OperatorReorderingPass(),
             new AiDotNet.Tensors.Engines.Optimization.MemoryPlanningPass(),

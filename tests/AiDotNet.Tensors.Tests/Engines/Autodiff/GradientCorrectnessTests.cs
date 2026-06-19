@@ -101,6 +101,16 @@ public class GradientCorrectnessTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// Helper method to create a tensor filled with sequential values.
+    /// </summary>
+    private static Tensor<float> MakeFilled(int[] shape, float start, float step)
+    {
+        var t = new Tensor<float>(shape);
+        for (int i = 0; i < t.Length; i++) t[i] = start + step * i;
+        return t;
+    }
+
     // ─── Arithmetic ─────────────────────────────────────────────
 
     [Fact]
@@ -427,6 +437,281 @@ public class GradientCorrectnessTests : IDisposable
         for (int i = 0; i < grads[x].Length; i++)
         {
             Assert.False(float.IsNaN(grads[x][i]) || float.IsInfinity(grads[x][i]));
+        }
+    }
+
+    /// <summary>
+    /// A checkpointed segment that uses a WEIGHT (matmul) must produce a weight gradient identical to
+    /// the eager (non-checkpointed) run — not just the input gradient. Activation checkpointing is a
+    /// memory optimization; it must be exactly gradient-equivalent for BOTH the segment input and every
+    /// parameter the segment reads. Regression guard: the recompute backward previously differentiated
+    /// only w.r.t. the segment input (sources: [reInput]), so checkpointed-layer weight gradients were
+    /// silently dropped and checkpointed layers never learned. A non-uniform output weighting makes the
+    /// upstream gradient non-constant so a wrong (e.g. ones-seed) VJP would not coincidentally match.
+    /// </summary>
+    [Fact]
+    public void Checkpoint_ProducesParameterGradients_MatchingEager()
+    {
+        var x = MakeFilled([2, 3], -0.4f, 0.05f);
+        var w = MakeFilled([3, 4], -0.3f, 0.03f);
+        var outW = MakeFilled([2, 4], 0.1f, 0.02f); // non-uniform gradOutput driver
+
+        // Segment reads the weight w: inp => relu(inp @ w). w is a closure-captured parameter.
+        Func<Tensor<float>, Tensor<float>> seg = inp => _engine.ReLU(_engine.TensorMatMul(inp, w));
+
+        System.Collections.Generic.Dictionary<Tensor<float>, Tensor<float>> Run(bool checkpoint)
+        {
+            using var tape = new GradientTape<float>();
+            var o = checkpoint
+                ? GradientCheckpointing<float>.Checkpoint(new[] { seg }, x, segmentSize: 1)
+                : seg(x);
+            var loss = _engine.ReduceSum(_engine.TensorMultiply(o, outW));
+            return tape.ComputeGradients(loss, sources: new[] { x, w });
+        }
+
+        var eager = Run(checkpoint: false);
+        var ckpt = Run(checkpoint: true);
+
+        Assert.True(eager.ContainsKey(w) && eager.ContainsKey(x), "eager run must produce x and w grads");
+        Assert.True(ckpt.ContainsKey(w),
+            "checkpointed run must produce a WEIGHT gradient (regression: recompute differentiated only w.r.t. input)");
+        Assert.True(ckpt.ContainsKey(x), "checkpointed run must produce an input gradient");
+
+        for (int i = 0; i < eager[w].Length; i++)
+            Assert.Equal(eager[w][i], ckpt[w][i], 3);
+        for (int i = 0; i < eager[x].Length; i++)
+            Assert.Equal(eager[x][i], ckpt[x][i], 3);
+    }
+
+    /// <summary>
+    /// MULTI-SEGMENT variant: two matmul segments checkpointed with segmentSize=1 (one segment each).
+    /// Each segment's input and weight gradients must match the eager run. Guards against cross-segment
+    /// double-counting in the recompute backward (the earlier sources:null scatter could attribute a
+    /// segment input's gradient to more than one segment).
+    /// </summary>
+    [Fact]
+    public void Checkpoint_TwoSegments_ParameterGradients_MatchEager()
+    {
+        var x = MakeFilled([2, 3], -0.4f, 0.05f);
+        var w0 = MakeFilled([3, 4], -0.3f, 0.03f);
+        var w1 = MakeFilled([4, 4], -0.2f, 0.02f);
+        var outW = MakeFilled([2, 4], 0.1f, 0.02f);
+
+        Func<Tensor<float>, Tensor<float>> seg0 = inp => _engine.ReLU(_engine.TensorMatMul(inp, w0));
+        Func<Tensor<float>, Tensor<float>> seg1 = inp => _engine.ReLU(_engine.TensorMatMul(inp, w1));
+
+        System.Collections.Generic.Dictionary<Tensor<float>, Tensor<float>> Run(bool checkpoint)
+        {
+            using var tape = new GradientTape<float>();
+            Tensor<float> o;
+            if (checkpoint)
+                o = GradientCheckpointing<float>.Checkpoint(new[] { seg0, seg1 }, x, segmentSize: 1);
+            else { o = seg0(x); o = seg1(o); }
+            var loss = _engine.ReduceSum(_engine.TensorMultiply(o, outW));
+            return tape.ComputeGradients(loss, sources: new[] { x, w0, w1 });
+        }
+
+        var eager = Run(checkpoint: false);
+        var ckpt = Run(checkpoint: true);
+
+        foreach (var (name, t) in new[] { ("x", x), ("w0", w0), ("w1", w1) })
+        {
+            Assert.True(ckpt.ContainsKey(t), $"checkpointed run missing {name} gradient");
+            for (int i = 0; i < eager[t].Length; i++)
+                Assert.Equal(eager[t][i], ckpt[t][i], 3);
+        }
+    }
+
+    /// <summary>
+    /// PERSISTENT-WEIGHT variant: the checkpointed segment's weight is registered as a persistent
+    /// tensor (as every real layer's weights are via RegisterPersistentTensor). Reproduces the case
+    /// where the recompute's gradient gets double-counted for registered parameters.
+    /// </summary>
+    [Fact]
+    public void Checkpoint_PersistentWeight_ParameterGradients_MatchEager()
+    {
+        var x = MakeFilled([2, 3], -0.4f, 0.05f);
+        var w = MakeFilled([3, 4], -0.3f, 0.03f);
+        _engine.RegisterPersistentTensor(w, PersistentTensorRole.Weights);
+        try
+        {
+            var outW = MakeFilled([2, 4], 0.1f, 0.02f);
+            Func<Tensor<float>, Tensor<float>> seg = inp => _engine.ReLU(_engine.TensorMatMul(inp, w));
+
+            System.Collections.Generic.Dictionary<Tensor<float>, Tensor<float>> Run(bool checkpoint)
+            {
+                using var tape = new GradientTape<float>();
+                var o = checkpoint
+                    ? GradientCheckpointing<float>.Checkpoint(new[] { seg }, x, segmentSize: 1)
+                    : seg(x);
+                var loss = _engine.ReduceSum(_engine.TensorMultiply(o, outW));
+                return tape.ComputeGradients(loss, sources: new[] { x, w });
+            }
+
+            var eager = Run(checkpoint: false);
+            var ckpt = Run(checkpoint: true);
+
+            for (int i = 0; i < eager[w].Length; i++)
+                Assert.Equal(eager[w][i], ckpt[w][i], 3);
+            for (int i = 0; i < eager[x].Length; i++)
+                Assert.Equal(eager[x][i], ckpt[x][i], 3);
+        }
+        finally { _engine.UnregisterPersistentTensor(w); }
+    }
+
+    /// <summary>
+    /// sources:null variant — the mode NeuralNetworkBase tape-training uses
+    /// (ComputeGradients(loss, sources: null)). The checkpointed weight gradient (looked up by key in
+    /// the full-graph result) must equal the eager run's. Guards the recompute scatter against
+    /// double-counting when the OUTER ComputeGradients differentiates the whole graph.
+    /// </summary>
+    [Fact]
+    public void Checkpoint_NullSources_ParameterGradients_MatchEager()
+    {
+        var x = MakeFilled([2, 3], -0.4f, 0.05f);
+        var w = MakeFilled([3, 4], -0.3f, 0.03f);
+        var outW = MakeFilled([2, 4], 0.1f, 0.02f);
+        Func<Tensor<float>, Tensor<float>> seg = inp => _engine.ReLU(_engine.TensorMatMul(inp, w));
+
+        System.Collections.Generic.Dictionary<Tensor<float>, Tensor<float>> Run(bool checkpoint)
+        {
+            using var tape = new GradientTape<float>();
+            var o = checkpoint
+                ? GradientCheckpointing<float>.Checkpoint(new[] { seg }, x, segmentSize: 1)
+                : seg(x);
+            var loss = _engine.ReduceSum(_engine.TensorMultiply(o, outW));
+            return tape.ComputeGradients(loss, sources: null);
+        }
+
+        var eager = Run(checkpoint: false);
+        var ckpt = Run(checkpoint: true);
+
+        Assert.True(ckpt.ContainsKey(w), "checkpointed run missing w gradient (null sources)");
+        for (int i = 0; i < eager[w].Length; i++)
+            Assert.Equal(eager[w][i], ckpt[w][i], 3);
+    }
+
+    /// <summary>
+    /// FusedLinear variant — the exact op DenseLayer.Forward uses in training (matmul+bias fused into
+    /// one tape entry). Reproduces the case where a checkpointed DenseLayer block's gradients were 2x
+    /// the eager gradients.
+    /// </summary>
+    [Fact]
+    public void Checkpoint_FusedLinear_ParameterGradients_MatchEager()
+    {
+        var x = MakeFilled([2, 3], -0.4f, 0.05f);
+        var w = MakeFilled([3, 4], -0.3f, 0.03f);
+        var b = MakeFilled([4], 0.05f, 0.01f);
+        var outW = MakeFilled([2, 4], 0.1f, 0.02f);
+        Func<Tensor<float>, Tensor<float>> seg = inp =>
+            _engine.FusedLinear(inp, w, b, FusedActivationType.None);
+
+        System.Collections.Generic.Dictionary<Tensor<float>, Tensor<float>> Run(bool checkpoint)
+        {
+            using var tape = new GradientTape<float>();
+            var o = checkpoint
+                ? GradientCheckpointing<float>.Checkpoint(new[] { seg }, x, segmentSize: 1)
+                : seg(x);
+            var loss = _engine.ReduceSum(_engine.TensorMultiply(o, outW));
+            return tape.ComputeGradients(loss, sources: new[] { x, w, b });
+        }
+
+        var eager = Run(checkpoint: false);
+        var ckpt = Run(checkpoint: true);
+
+        foreach (var (name, t) in new[] { ("x", x), ("w", w), ("b", b) })
+        {
+            Assert.True(ckpt.ContainsKey(t), $"checkpointed run missing {name} gradient");
+            for (int i = 0; i < eager[t].Length; i++)
+                Assert.Equal(eager[t][i], ckpt[t][i], 3);
+        }
+    }
+
+    /// <summary>
+    /// SCALING + RESIDUAL: four segments (segmentSize=1) where each segment is a residual block
+    /// inp => inp + FusedLinear(inp, w, b) — the shape of a transformer sub-layer. Verifies the
+    /// detach-per-segment fix scales beyond two segments and handles a segment whose input feeds BOTH
+    /// the residual add and the linear (the segment input appears twice in the local graph).
+    /// </summary>
+    [Fact]
+    public void Checkpoint_FourSegment_ResidualFusedLinear_MatchEager()
+    {
+        var x = MakeFilled([2, 4], -0.4f, 0.05f);
+        var ws = new Tensor<float>[4];
+        var bs = new Tensor<float>[4];
+        var segs = new Func<Tensor<float>, Tensor<float>>[4];
+        for (int s = 0; s < 4; s++)
+        {
+            var w = MakeFilled([4, 4], -0.3f + 0.02f * s, 0.01f);
+            var b = MakeFilled([4], 0.05f, 0.01f);
+            ws[s] = w; bs[s] = b;
+            segs[s] = inp => _engine.TensorAdd(inp, _engine.FusedLinear(inp, w, b, FusedActivationType.None));
+        }
+        var outW = MakeFilled([2, 4], 0.1f, 0.02f);
+
+        System.Collections.Generic.Dictionary<Tensor<float>, Tensor<float>> Run(bool checkpoint)
+        {
+            using var tape = new GradientTape<float>();
+            Tensor<float> o;
+            if (checkpoint) o = GradientCheckpointing<float>.Checkpoint(segs, x, segmentSize: 1);
+            else { o = x; foreach (var s in segs) o = s(o); }
+            var loss = _engine.ReduceSum(_engine.TensorMultiply(o, outW));
+            var srcs = new System.Collections.Generic.List<Tensor<float>> { x };
+            srcs.AddRange(ws); srcs.AddRange(bs);
+            return tape.ComputeGradients(loss, sources: srcs.ToArray());
+        }
+
+        var eager = Run(checkpoint: false);
+        var ckpt = Run(checkpoint: true);
+
+        Assert.True(ckpt.ContainsKey(x), "missing input grad");
+        for (int i = 0; i < eager[x].Length; i++) Assert.Equal(eager[x][i], ckpt[x][i], 3);
+        for (int s = 0; s < 4; s++)
+        {
+            for (int i = 0; i < eager[ws[s]].Length; i++) Assert.Equal(eager[ws[s]][i], ckpt[ws[s]][i], 3);
+            for (int i = 0; i < eager[bs[s]].Length; i++) Assert.Equal(eager[bs[s]][i], ckpt[bs[s]][i], 3);
+        }
+    }
+
+    /// <summary>
+    /// MULTI-SEGMENT FusedLinear regression: two FusedLinear segments checkpointed with segmentSize=1
+    /// (two separate segments) — the shape of a checkpointed two-DenseLayer stack. Every parameter's
+    /// gradient (and the input's) must equal the eager run's. Guards the cross-segment defect where the
+    /// recompute of a later segment followed its (non-detached) input back into the earlier segment's
+    /// checkpoint node, re-running it and double-counting every earlier-segment gradient (2x). Detaching
+    /// each segment's input at recompute makes each segment self-contained and the gradients exact.
+    /// </summary>
+    [Fact]
+    public void Checkpoint_TwoSegment_FusedLinear_ParameterGradients_MatchEager()
+    {
+        var x = MakeFilled([2, 3], -0.4f, 0.05f);
+        var w0 = MakeFilled([3, 4], -0.3f, 0.03f);
+        var b0 = MakeFilled([4], 0.05f, 0.01f);
+        var w1 = MakeFilled([4, 4], -0.2f, 0.02f);
+        var b1 = MakeFilled([4], 0.03f, 0.01f);
+        var outW = MakeFilled([2, 4], 0.1f, 0.02f);
+
+        Func<Tensor<float>, Tensor<float>> seg0 = inp => _engine.FusedLinear(inp, w0, b0, FusedActivationType.None);
+        Func<Tensor<float>, Tensor<float>> seg1 = inp => _engine.FusedLinear(inp, w1, b1, FusedActivationType.None);
+
+        System.Collections.Generic.Dictionary<Tensor<float>, Tensor<float>> Run(bool checkpoint)
+        {
+            using var tape = new GradientTape<float>();
+            Tensor<float> o;
+            if (checkpoint) o = GradientCheckpointing<float>.Checkpoint(new[] { seg0, seg1 }, x, segmentSize: 1);
+            else { o = seg0(x); o = seg1(o); }
+            var loss = _engine.ReduceSum(_engine.TensorMultiply(o, outW));
+            return tape.ComputeGradients(loss, sources: new[] { x, w0, b0, w1, b1 });
+        }
+
+        var eager = Run(checkpoint: false);
+        var ckpt = Run(checkpoint: true);
+
+        foreach (var (name, t) in new[] { ("x", x), ("w0", w0), ("b0", b0), ("w1", w1), ("b1", b1) })
+        {
+            Assert.True(ckpt.ContainsKey(t), $"checkpointed run missing {name} gradient");
+            for (int i = 0; i < eager[t].Length; i++)
+                Assert.Equal(eager[t][i], ckpt[t][i], 3);
         }
     }
 

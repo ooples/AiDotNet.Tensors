@@ -40,6 +40,55 @@ public sealed partial class WebGpuBackend : IGpuHalfPrecisionBackend
     public bool SupportsHgemm => IsAvailable;
 
     /// <inheritdoc/>
+    /// <remarks>The fused backward routes through the real WGSL transposed GEMMs (always present on WebGPU,
+    /// which has no CPU-fallback GEMM), so it tracks device availability like <see cref="SupportsHgemm"/>.</remarks>
+    public bool SupportsFp16FusedBackward => IsAvailable;
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// WebGPU models FP16 as f32 (truncated mantissa — see class remarks), so the inputs already carry FP16
+    /// precision and the backward is two real f32 transposed GEMMs with no materialized transpose:
+    /// gradA[M,K] = gradC·Bᵀ via the rhs-transposed kernel (<see cref="MatMulTransposed"/>) and gradB[K,N] = Aᵀ·gradC
+    /// via the lhs-transposed kernel (<see cref="MatMulLhsTransposedAsync"/>). FP16-output grads run into an f32
+    /// scratch then <c>ConvertToFp16</c> (mirrors <see cref="Hgemm"/>); the accumulate is f32 throughout.
+    /// </remarks>
+    public void MatMulBackwardFp16Fused(
+        IGpuBuffer gradCFp16, IGpuBuffer aFp16, IGpuBuffer bFp16,
+        IGpuBuffer gradAOut, IGpuBuffer gradBOut,
+        int m, int n, int k, bool gradOutHalf)
+    {
+        if (gradCFp16 is null) throw new ArgumentNullException(nameof(gradCFp16));
+        if (aFp16 is null) throw new ArgumentNullException(nameof(aFp16));
+        if (bFp16 is null) throw new ArgumentNullException(nameof(bFp16));
+        if (gradAOut is null) throw new ArgumentNullException(nameof(gradAOut));
+        if (gradBOut is null) throw new ArgumentNullException(nameof(gradBOut));
+        if (m <= 0) throw new ArgumentOutOfRangeException(nameof(m), "Dimensions must be positive.");
+        if (n <= 0) throw new ArgumentOutOfRangeException(nameof(n), "Dimensions must be positive.");
+        if (k <= 0) throw new ArgumentOutOfRangeException(nameof(k), "Dimensions must be positive.");
+
+        // gradA[M,K] = gradC[M,N] · Bᵀ  (b stored [K,N] → read transposed as [N,K]).
+        DispatchBackward(scratchElems: m * k, gradOutHalf, gradAOut, dest =>
+            MatMulTransposed(gradCFp16, bFp16, dest, m, k, n));
+        // gradB[K,N] = Aᵀ · gradC  (a stored [M,K] → contraction over leading dim M).
+        DispatchBackward(scratchElems: k * n, gradOutHalf, gradBOut, dest =>
+            MatMulLhsTransposedAsync(aFp16, gradCFp16, dest, k, n, m).GetAwaiter().GetResult());
+    }
+
+    /// <summary>Runs one backward GEMM into <paramref name="gradOut"/> (FP32) or, when
+    /// <paramref name="gradOutHalf"/>, into an f32 scratch then packs to FP16 via <c>ConvertToFp16</c>.</summary>
+    private void DispatchBackward(int scratchElems, bool gradOutHalf, IGpuBuffer gradOut, Action<IGpuBuffer> gemm)
+    {
+        if (!gradOutHalf)
+        {
+            gemm(gradOut);
+            return;
+        }
+        using var scratch = AllocateBuffer(scratchElems);
+        gemm(scratch);
+        ConvertToFp16(scratch, gradOut, scratchElems);
+    }
+
+    /// <inheritdoc/>
     public void GemmFp16In32fOut(IGpuBuffer aFp16, IGpuBuffer bFp16, IGpuBuffer cFp32,
         int m, int n, int k)
     {

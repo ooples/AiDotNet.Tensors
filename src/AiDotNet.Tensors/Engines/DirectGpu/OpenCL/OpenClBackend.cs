@@ -7715,6 +7715,9 @@ KERNEL VARIANTS (A/B testing):
                     "numQueriesPerKV must be positive.");
             if (numQHeads <= 0 || numKVHeads <= 0)
                 throw new ArgumentOutOfRangeException(nameof(numQHeads), "GQA head counts must be positive.");
+            if (batch <= 0 || seqQ <= 0 || seqK <= 0 || headDim <= 0)
+                throw new ArgumentOutOfRangeException(nameof(batch),
+                    $"GQA dimensions must be positive (batch={batch}, seqQ={seqQ}, seqK={seqK}, headDim={headDim}).");
             if ((numQHeads - 1) / numQueriesPerKV >= numKVHeads)
                 throw new ArgumentException(
                     "numQueriesPerKV maps at least one query head outside the available KV head range.",
@@ -7730,9 +7733,9 @@ KERNEL VARIANTS (A/B testing):
             // (stale) or uninitialized GPU memory — never zeroed — so without this the gradients accumulate
             // onto garbage (observed GPU-vs-CPU max_abs_err ~372). Zero them first. (The deterministic split
             // kernels write with =, so this is belt-and-suspenders for that path.)
-            ZeroBufferOnDevice(gradQuery, batch * numQHeads * seqQ * headDim);
-            ZeroBufferOnDevice(gradKey, batch * numKVHeads * seqK * headDim);
-            ZeroBufferOnDevice(gradValue, batch * numKVHeads * seqK * headDim);
+            Fill(gradQuery, 0f, batch * numQHeads * seqQ * headDim);
+            Fill(gradKey, 0f, batch * numKVHeads * seqK * headDim);
+            Fill(gradValue, 0f, batch * numKVHeads * seqK * headDim);
 
             if (GpuDeterminism.IsActive)
             {
@@ -10744,6 +10747,9 @@ KERNEL VARIANTS (A/B testing):
         private void ZeroBufferOnDevice(IGpuBuffer buffer, int size)
         {
             if (size <= 0) return;
+            if ((long)size * sizeof(float) > buffer.SizeInBytes)
+                throw new ArgumentException(
+                    $"ZeroBufferOnDevice would write {(long)size * sizeof(float)} bytes but buffer has {buffer.SizeInBytes}.", nameof(size));
             var zeroKernel = _kernelCache["zero_buffer"];
             zeroKernel.SetArg(0, ((DirectOpenClGpuBuffer)buffer).Buffer.Handle);
             zeroKernel.SetArg(1, size);
@@ -10754,7 +10760,16 @@ KERNEL VARIANTS (A/B testing):
         /// scalar at <paramref name="scalar"/>[0]. OpenCL counterpart of the CUDA scale_by_device_scalar.</summary>
         public void ScaleByDeviceScalar(IGpuBuffer buffer, IGpuBuffer scalar, int size)
         {
+            if (buffer is null) throw new ArgumentNullException(nameof(buffer));
+            if (scalar is null) throw new ArgumentNullException(nameof(scalar));
             if (size <= 0) return;
+            long requiredBytes = (long)size * sizeof(float);
+            if (buffer.SizeInBytes < requiredBytes)
+                throw new ArgumentException(
+                    $"ScaleByDeviceScalar requires {requiredBytes} bytes but buffer has {buffer.SizeInBytes}.", nameof(buffer));
+            if (scalar.SizeInBytes < sizeof(float))
+                throw new ArgumentException(
+                    $"ScaleByDeviceScalar requires a scalar buffer with at least {sizeof(float)} bytes.", nameof(scalar));
             if (!_kernelCache.TryGetValue("scale_by_device_scalar", out var kernel))
                 throw new InvalidOperationException("OpenCL kernel not found: scale_by_device_scalar");
             kernel.SetArg(0, ((DirectOpenClGpuBuffer)buffer).Buffer.Handle);

@@ -1588,6 +1588,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!_activationCache.TryRemove(key, out var e)) return false;
         System.Threading.Interlocked.Add(ref _currentActivationCacheBytes, -e.Buffer.SizeInBytes);
         System.Threading.Interlocked.Add(ref _currentActivationManagedBytes, -e.ManagedBytes);
+        // CUDA uses STREAM-ORDERED deferred free (cuMemFreeAsync) to release the buffer at the stream's
+        // current point without a host sync — a CUDA-stream-specific optimization with no portable
+        // equivalent. Every other backend takes the immediate, equally-correct e.Dispose() (no leak, no
+        // cross-backend semantic difference — just a synchronous free). This asymmetry is intentional, not a
+        // missing feature; a deferred-free abstraction across all backends is tracked as a follow-up.
         if (e.Backend is DirectGpu.CUDA.CudaBackend c) c.FreeBufferDeferred(e.Buffer);
         else e.Dispose();
         return true;
@@ -1694,7 +1699,37 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// flushed to its CPU array before the GPU buffer is freed. Safe no-op when the
     /// engine isn't GPU-backed or nothing was cached this pass.
     /// </summary>
-    internal void EvictActivationsCreatedAfter(long snapshot)
+    internal void EvictActivationsCreatedAfter(long snapshot) => EvictActivationsCreatedAfter(snapshot, null);
+
+    /// <summary>
+    /// Internal read of the current activation-cache device-byte total (the sum of resident activation GPU
+    /// buffers). Lets a test measure the FP16 hetero backward's per-node scratch release without GPU memory
+    /// tracking. Lock-free read of the Interlocked-maintained counter.
+    /// </summary>
+    internal long CurrentActivationCacheBytes => System.Threading.Interlocked.Read(ref _currentActivationCacheBytes);
+
+    /// <summary>
+    /// Deterministically evicts every activation-cache entry created AFTER <paramref name="snapshot"/> whose
+    /// backing-array key is NOT in <paramref name="protect"/>. The protect set is the FP16 hetero backward's live
+    /// gradient accumulators (their cache key = backing array); everything else created during the backward is
+    /// per-op SCRATCH (e.g. the cross-entropy Clamp/Log/Sign/Abs/Divide chain over the full vocab, TensorMultiply
+    /// backward temporaries) that the FP32 specialized path reuses preallocated buffers for but the hetero
+    /// Execute-replay routes through the cache. Evicting it after each node's backward gives the hetero path the
+    /// FP32 path's progressive release. Materialize-then-free per the #226 contract, so even an over-eviction
+    /// degrades to a cache-miss re-upload (correct, slower), never a use-after-free.
+    /// </summary>
+    internal void EvictActivationsCreatedAfter(long snapshot, HashSet<object>? protect)
+        => EvictActivationsCreatedAfter(snapshot, protect, materializePending: true);
+
+    /// <summary>
+    /// As above, with control over the pending-download policy. <paramref name="materializePending"/>=true keeps
+    /// the #226 materialize-then-free contract (safe for general use: an over-eviction degrades to a re-upload).
+    /// =false DISCARDS each pending download (Remove, no DtoH copy) before freeing — for the FP16 hetero backward
+    /// SCRATCH, which is provably dead (not a node output kept past its forward, not a protected live gradient,
+    /// never read again), so materializing it would be a wasted GPU→CPU transfer that breaks full residency. The
+    /// FP16 parity tests gate correctness: a wrongful discard of a still-needed tensor would corrupt the grads.
+    /// </summary>
+    internal void EvictActivationsCreatedAfter(long snapshot, HashSet<object>? protect, bool materializePending)
     {
         // The activation timestamp counter is process-wide, so "created after my snapshot"
         // also matches a CONCURRENT tape's activations on another thread. Free only THIS
@@ -1711,10 +1746,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 if (entries[i].Value.Timestamp <= snapshot) continue;   // pre-existing — keep
                 if (entries[i].Value.ThreadId != callerThreadId) continue; // another thread's live buffer
+                if (protect is not null && protect.Contains(entries[i].Key)) continue; // live gradient — keep
                 if (Helpers.DeferredArrayMaterializer.IsPending(entries[i].Key))
                 {
-                    try { Helpers.DeferredArrayMaterializer.TryMaterialize(entries[i].Key); }
-                    catch { Helpers.DeferredArrayMaterializer.Remove(entries[i].Key); }
+                    if (materializePending)
+                    {
+                        // #226 safe path: flush the pending DtoH so a later CPU read still sees correct data.
+                        try { Helpers.DeferredArrayMaterializer.TryMaterialize(entries[i].Key); }
+                        catch { Helpers.DeferredArrayMaterializer.Remove(entries[i].Key); }
+                    }
+                    else
+                    {
+                        // Dead scratch: drop the pending download (no DtoH) — keeps the step fully GPU-resident.
+                        Helpers.DeferredArrayMaterializer.Remove(entries[i].Key);
+                    }
                 }
                 if (_activationCache.TryRemove(entries[i].Key, out var entry))
                 {
@@ -2063,7 +2108,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// GPU consumers re-resolve through <c>GetOrAllocateBuffer</c>, which up-casts the IsFp16 entry on demand
     /// (TryUpcastActivationFp32ByKey). Mirrors <see cref="FinishGpuOp{T}"/>'s deferral/cache contract for Half.
     /// </summary>
-    private Half[] FinishGpuOpHalfStore(DirectGpu.CUDA.CudaBackend backend, IGpuBuffer halfBuffer, int elementCount, int[] shape)
+    // Backend-agnostic: ConvertToFp32 + DownloadBuffer + AllocateOutputBuffer are all on IDirectGpuBackend
+    // (CUDA's ConvertToFp32 falls through to the driver-only-safe native kernel), so the half-resident-store
+    // finish works on ANY GPU backend, not just CUDA.
+    private Half[] FinishGpuOpHalfStore(IDirectGpuBackend backend, IGpuBuffer halfBuffer, int elementCount, int[] shape)
     {
 #if !NETFRAMEWORK
         var result = GC.AllocateUninitializedArray<Half>(elementCount);
@@ -2076,7 +2124,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         Helpers.DeferredArrayMaterializer.Register(result, arr =>
         {
             using var tmp = AllocateOutputBuffer(capturedBackend, n); // FP32 transient
-            capturedBackend.ConvertToFp32Native(capturedBuffer, tmp.Buffer, n);
+            capturedBackend.ConvertToFp32(capturedBuffer, tmp.Buffer, n);
             float[] floatData = capturedBackend.DownloadBuffer(tmp.Buffer);
             var dst = (Half[])arr;
             // Both lengths are derived from n (elementCount); a mismatch is an upstream
@@ -2133,6 +2181,187 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return true;
     }
 
+    /// <summary>Resident FP16 training (#633): register a PARAMETER's GPU buffer in the persistent weight cache
+    /// (keyed on its backing array — the SAME key the forward param-cast looks up) and point _gpuBuffer at it, so
+    /// the optimizer's in-place update and the next forward read the SAME buffer (survives the step-end discard).</summary>
+    internal void RegisterResidentParamBuffer<T>(Tensor<T> param)
+    {
+        if (param is null || typeof(T) != typeof(float) || !TryGetBackend(out var backend)) return;
+        var arr = param.DataVector.GetBackingArrayUnsafe();
+        if (arr is not float[] farr) return;
+        lock (_persistentBufferLock)
+        {
+            if (_persistentBufferCache.TryGetValue(arr, out var existing))
+            {
+                param._gpuBuffer = existing.Buffer; param._gpuBackend = backend; param._gpuBufferVersion = param.Version;
+                return;
+            }
+            var buf = backend.AllocateBuffer(farr);
+            _persistentBufferCache[arr] = new GpuBufferCacheEntry(buf, PersistentTensorRole.Weights);
+            _tensorVersions.TryAdd(arr, 0);
+            param._gpuBuffer = buf; param._gpuBackend = backend; param._gpuBufferVersion = param.Version;
+        }
+    }
+
+    /// <summary>Resident FP16 training (#633): forward down-cast of FP32 input <paramref name="x"/> (an optimizer-
+    /// updated param, or a resident activation) into Half output <paramref name="o"/>, ON-DEVICE. Reads x preferring
+    /// the persistent param buffer (optimizer-updated, not stale host), ConvertToFp16 into a fresh Half buffer
+    /// published as o's IsFp16 entry. Returns false off-GPU/on failure (caller host-casts).</summary>
+    internal bool TryCastResidentForwardHalf(Tensor<float> x, Tensor<Half> o)
+    {
+        if (x is null || o is null || !TryGetBackend(out var backend)) return false;
+        int n = x.Length;
+        if (n == 0 || o.Length != n) return false;
+        try
+        {
+            IGpuBuffer? xbuf = null;
+            var xarr = x.DataVector.GetBackingArrayUnsafe();
+            // Take the on-device resident cast ONLY when x's device buffer is VERSION-FRESH relative to the host
+            // array. A device-only write (the fused optimizer updating the param buffer in place) does NOT bump the
+            // host Version, so a version-match means the buffer holds the latest weights — read it with no transfer.
+            // A HOST mutation (a host-side optimizer step, or a test re-seeding/perturbing the param) bumps Version
+            // PAST the buffer's snapshot: the buffer is now stale, so we return false and let the caller perform the
+            // host cast (MixedPrecisionCast.CastToFp16) over the fresh host array — identical to the pre-resident
+            // behavior. Without this gate the stale resident buffer masks host param mutations (the forward output
+            // stops tracking weight changes), which broke the standalone/host-optimizer mixed-precision paths.
+            if (x._gpuBuffer is not null && ReferenceEquals(x._gpuBackend, backend) && x._gpuBufferVersion == x.Version)
+            {
+                var persistent = xarr is not null ? TryGetCachedBuffer(xarr) : null;
+                if ((persistent is not null && ReferenceEquals(persistent, x._gpuBuffer))
+                    || IsCachedGpuBufferLive(x, backend))
+                    xbuf = x._gpuBuffer;
+            }
+            if (xbuf is null) return false;
+            // Allocate the Half buffer via AllocateBuffer (a standard float-typed device buffer, over-allocated:
+            // n floats hold n packed halves) rather than AllocateByteBuffer. ConvertToFp16/Hgemm cast the buffer
+            // to the standard device-buffer type, so a byte-typed buffer throws InvalidCastException on those
+            // backends (e.g. OpenCL) — the float-typed buffer is the type those kernels accept.
+            var oArr = o.DataVector.GetBackingArrayUnsafe();
+            if (oArr is null) return false;
+            // REUSE an already-cached Half buffer for this output IN PLACE instead of dispose+realloc. The Half
+            // buffers come from a POOLED allocator: disposing one (InvalidateActivationCacheEntry frees the GPU
+            // buffer) returns it to the pool, and a later cast for a DIFFERENT param can re-rent that exact buffer
+            // while a backward still references the old contents — clobbering a live W_half and corrupting the
+            // upstream gradient (e.g. gradW1, which flows back through W2). The cast node re-executes within one
+            // step (forward, then the backward's activation recompute); the 2nd execution takes this reuse path,
+            // overwriting the SAME buffer so it never re-enters the pool mid-step and every param's Half activation
+            // stays distinct. Gate on ElementCount==n so a pooled host array reused for a differently-sized node
+            // does not alias.
+            IGpuBuffer? halfBuf = null; bool reused = false;
+            lock (_activationCacheLock)
+            {
+                if (_activationCache.TryGetValue(oArr, out var exist) && ReferenceEquals(exist.Backend, backend)
+                    && exist.IsFp16 && exist.ElementCount == n)
+                { halfBuf = exist.Buffer; reused = true; }
+            }
+            if (halfBuf is null) halfBuf = backend.AllocateBuffer(n);
+            backend.ConvertToFp16(xbuf, halfBuf, n);
+            // Refresh the deferred materializer to point at the current contents (one-shot; first-write-wins, so
+            // Remove first). The buffer pointer is unchanged on the reuse path, so this is a cheap closure swap.
+            var capBuf = halfBuf; var capBackend = backend; int cn = n;
+            Helpers.DeferredArrayMaterializer.Remove(oArr);
+            Helpers.DeferredArrayMaterializer.Register(oArr, a =>
+            {
+                using var tmp = AllocateOutputBuffer(capBackend, cn);
+                capBackend.ConvertToFp32(capBuf, tmp.Buffer, cn);
+                float[] fd = capBackend.DownloadBuffer(tmp.Buffer);
+                var dst = (Half[])a;
+                for (int i = 0; i < cn; i++) dst[i] = (Half)fd[i];
+            });
+            if (!reused)
+            {
+                InvalidateActivationCacheEntry(o.DataVector);
+                CacheActivation(oArr, halfBuf, o._shape, backend, isFp16: true, elementCount: n);
+            }
+            o._gpuBuffer = null; o._gpuBackend = null; o._gpuBufferVersion = -1;
+            return true;
+        }
+        catch (Exception) { return false; }
+    }
+
+    /// <summary>Resident FP16 training (#633): device-copy gradient <paramref name="g"/> into a stable per-param
+    /// buffer bound to <paramref name="dest"/> so the fused on-device optimizer reads it with no transfer.</summary>
+    internal bool TryRouteGradResident(Tensor<float> g, Tensor<float> dest, ref IGpuBuffer? stableBuf)
+    {
+        if (g is null || dest is null || !TryGetBackend(out var backend)) return false;
+        int n = g.Length;
+        if (n == 0 || dest.Length != n) return false;
+        // The AUTHORITATIVE resident grad buffer is the activation-cache entry FinishGpuOp published (the very
+        // buffer its deferred materializer downloads when the host reads g) — NOT g._gpuBuffer, which FinishGpuOp
+        // never sets and which can be a stale/earlier pointer from another path (using it copies the wrong tensor,
+        // producing gradients that diverge from the FP32 reference). Resolve the cache entry FIRST (by backing
+        // array, then DataVector); only fall back to g._gpuBuffer when it is the live cached buffer for g.
+        IGpuBuffer? srcBuf = null;
+        object? k2 = g.DataVector?.GetBackingArrayUnsafe();
+        object? k1 = g.DataVector;
+        lock (_activationCacheLock)
+        {
+            if (k2 is not null && _activationCache.TryGetValue(k2, out var e2) && ReferenceEquals(e2.Backend, backend) && !e2.IsFp16) srcBuf = e2.Buffer;
+            else if (k1 is not null && _activationCache.TryGetValue(k1, out var e1) && ReferenceEquals(e1.Backend, backend) && !e1.IsFp16) srcBuf = e1.Buffer;
+        }
+        if (srcBuf is null && g._gpuBuffer is not null && ReferenceEquals(g._gpuBackend, backend)
+            && IsCachedGpuBufferLive(g, backend))
+            srcBuf = g._gpuBuffer;
+        if (srcBuf is null) return false;
+        try
+        {
+            bool firstBind = stableBuf is null;
+            stableBuf ??= backend.AllocateBuffer(n);
+            backend.Copy(srcBuf, stableBuf, n);
+            if (firstBind || !ReferenceEquals(dest._gpuBuffer, stableBuf)) BindResidentBuffer(dest, stableBuf, backend);
+            return true;
+        }
+        catch (Exception) { return false; }
+    }
+
+    /// <summary>
+    /// On-device dtype cast that keeps the result GPU-RESIDENT — the residency-preserving form of the float↔Half
+    /// gradient cast bridge (<see cref="Autodiff.MixedPrecisionCast"/>), whose <c>Tensor.Cast</c> path is a host
+    /// loop that pulls the gradient to CPU. Both grad spaces are FP32-backed on the device (a gradient
+    /// <c>Tensor&lt;Half&gt;</c> from the fused backward is a <see cref="FinishGpuOp{T}"/> over an FP32 buffer, the
+    /// Half rounding happening only at host materialization — which never fires while resident), so the cast is a
+    /// device-to-device copy (or <c>ConvertToFp32</c> when the source is a true Half buffer) + a dtype relabel via
+    /// <see cref="FinishGpuOp{T}"/> — no host transfer. Falls back to the host <see cref="Tensor{T}.Cast"/> when
+    /// there is no GPU backend or the source isn't resident (rare), preserving correctness.
+    /// </summary>
+    internal Tensor<TOut> CastResidentDtype<TIn, TOut>(Tensor<TIn> src)
+    {
+        if (src is null) throw new ArgumentNullException(nameof(src));
+        if (!TryGetBackend(out var backend)) return src.Cast<TOut>();
+        int n = src.Length;
+        if (n == 0) return src.Cast<TOut>();
+
+        // Find the source's resident GPU buffer (and whether it is a true Half byte buffer or FP32).
+        IGpuBuffer? srcBuf = null; bool srcIsFp16 = false;
+        object? k1 = src.DataVector;
+        object? k2 = src.DataVector?.GetBackingArrayUnsafe();
+        lock (_activationCacheLock)
+        {
+            if (k2 is not null && _activationCache.TryGetValue(k2, out var e2) && ReferenceEquals(e2.Backend, backend))
+            { srcBuf = e2.Buffer; srcIsFp16 = e2.IsFp16; }
+            else if (k1 is not null && _activationCache.TryGetValue(k1, out var e1) && ReferenceEquals(e1.Backend, backend))
+            { srcBuf = e1.Buffer; srcIsFp16 = e1.IsFp16; }
+        }
+        if (srcBuf is null) return src.Cast<TOut>(); // not GPU-resident — host cast (correct, just not resident)
+
+        try
+        {
+            // Dest is always an FP32 device buffer: FinishGpuOp<float> reads it as float, and FinishGpuOp<Half>
+            // reads it as float then casts to Half[] on host — matching the FP32-backed-Half grad representation.
+            var dstFp32 = backend.AllocateBuffer(n);
+            if (srcIsFp16)
+                backend.ConvertToFp32(srcBuf, dstFp32, n);   // true Half (2-byte) source → FP32
+            else
+                backend.Copy(srcBuf, dstFp32, n);            // FP32 source → FP32 (device-to-device, no host)
+            var result = FinishGpuOp<TOut>(backend, new OwnedBuffer(dstFp32, ownsBuffer: true), n);
+            return new Tensor<TOut>(result, src._shape);
+        }
+        catch (Exception)
+        {
+            return src.Cast<TOut>();
+        }
+    }
+
     /// <summary>
     /// Get a tensor's resident FP16 activation buffer DIRECTLY (no up-cast) when it is stored as an IsFp16
     /// activation-cache entry on this backend — lets the FP16 store / fused-backward paths consume the Half
@@ -2160,6 +2389,22 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// key to avoiding the float↔Half re-inflate/re-convert churn each layer); otherwise convert its FP32
     /// buffer into a fresh Half buffer that the caller owns (<paramref name="owned"/>) and disposes.
     /// </summary>
+    // Backend-agnostic (main #633): AllocateByteBuffer + ConvertToFp16 are both on IDirectGpuBackend, and every
+    // backend's ConvertToFp16 falls through to its self-contained (driver-only-safe) conversion, so this resolves
+    // a tensor to a half buffer on ANY GPU backend — not just CUDA.
+    private IGpuBuffer ResolveToFp16<T>(Tensor<T> t, int elems, IDirectGpuBackend backend, out IGpuBuffer? owned)
+    {
+        owned = null;
+        if (TryGetResidentFp16Buffer(t, backend, out var resident) && resident is not null)
+            return resident;
+        using var f = GetOrAllocateBuffer(backend, t);
+        owned = backend.AllocateByteBuffer(elems * 2);
+        backend.ConvertToFp16(f.Buffer, owned, elems);
+        return owned;
+    }
+
+    // CUDA-specific overload (#34): the FP16-native backward methods that already hold a CudaBackend cb call this
+    // form; ConvertToFp16Native is the same self-contained conversion as the agnostic ConvertToFp16 above.
     private IGpuBuffer ResolveToFp16<T>(Tensor<T> t, int elems, DirectGpu.CUDA.CudaBackend cb, IDirectGpuBackend backend, out IGpuBuffer? owned)
     {
         owned = null;
@@ -16057,19 +16302,21 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // FORWARD Half-resident store — RUN BEFORE GetOrAllocateBuffer (which would up-cast an IsFp16 input
             // to FP32, re-inflating it for the rest of the step). Keep the activation as a HALF GPU buffer (half
             // the VRAM); read IsFp16-resident inputs DIRECTLY (no re-inflate/re-convert churn), run the
-            // Half-output GEMM (FP32 accumulate), and cache the Half output as an IsFp16 entry. CUDA Tensor-Core only.
+            // Half-output GEMM (FP32 accumulate), and cache the Half output as an IsFp16 entry. Runs on ANY
+            // backend that ships a half-output GEMM (IGpuHalfPrecisionBackend.Hgemm / SupportsHgemm) — the
+            // half-resident matmul forward is no longer CUDA-only.
             if (typeof(T) == typeof(Half) && s_fp16FwdStore
-                && backend is DirectGpu.CUDA.CudaBackend cbFwd && cbFwd.SupportsHgemm)
+                && backend is IGpuHalfPrecisionBackend hpFwd && hpFwd.SupportsHgemm)
             {
                 IGpuBuffer? hAiOwned = null, hBiOwned = null, hOut = null;
                 bool storeOk = false;
                 try
                 {
-                    var hAi = ResolveToFp16(a, M * K, cbFwd, backend, out hAiOwned);
-                    var hBi = ResolveToFp16(b, K * N, cbFwd, backend, out hBiOwned);
-                    hOut = cbFwd.AllocateByteBuffer(M * N * 2);
-                    cbFwd.GemmFp16HalfOut(hAi, hBi, hOut, M, N, K);
-                    var resultH = FinishGpuOpHalfStore(cbFwd, hOut, M * N, new[] { M, N }); // takes ownership of hOut
+                    var hAi = ResolveToFp16(a, M * K, backend, out hAiOwned);
+                    var hBi = ResolveToFp16(b, K * N, backend, out hBiOwned);
+                    hOut = backend.AllocateByteBuffer(M * N * 2);
+                    hpFwd.Hgemm(hAi, hBi, hOut, M, N, K);
+                    var resultH = FinishGpuOpHalfStore(backend, hOut, M * N, new[] { M, N }); // takes ownership of hOut
                     hOut = null;
                     var outputH = (Tensor<T>)(object)new Tensor<Half>(resultH, new[] { M, N });
                     Autodiff.DifferentiableOps.RecordBinary("TensorMatMul", outputH, a, b, Autodiff.BackwardFunctions<T>.MatMulBackward);
@@ -16146,16 +16393,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <summary>
     /// GPU-resident fused FP16 matmul BACKWARD for the heterogeneous (FP16-activation) plan. Computes both
     /// gradients of the forward <c>C[M,N] = A[M,K] · B[K,N]</c> — for the FP16 (<see cref="Tensor{Half}"/>)
-    /// activations of <see cref="Engines.Compilation.MixedPrecisionGraphBackward"/> — through the Tensor-Core
-    /// <see cref="DirectGpu.CUDA.CudaBackend.MatMulBackwardFp16Fused"/> (two transpose-free
-    /// <c>cublasGemmEx</c> launches) INSTEAD of the eager backward's two <c>TensorTranspose</c> + two
-    /// <c>TensorMatMul</c> FP32 dispatches — the four-FP32-allocation-per-matmul scratch that
-    /// Fp16ActivationDominated_ReducesGpuPeakBytes measured as the dominant cost. The Half activations are
-    /// stored up-cast to FP32 on the device (see <c>GetOrAllocateBuffer</c>), so the inputs are converted to
-    /// FP16 for the kernel (O(MK+KN+MN) — negligible vs the O(MKN) GEMMs); the kernel accumulates in FP32 and
-    /// the grads are materialized as Half for the FP16 grad dict.
-    /// Returns false (caller falls back to the generic backward) when the backend is not CUDA Tensor-Core
-    /// capable or the shapes are not the supported 2D matmul case.
+    /// activations of <see cref="Engines.Compilation.MixedPrecisionGraphBackward"/> — through the BACKEND-AGNOSTIC
+    /// <see cref="Gpu.IGpuHalfPrecisionBackend.MatMulBackwardFp16Fused"/> (two transpose-free FP16-in/FP32-accumulate
+    /// GEMMs) INSTEAD of the eager backward's two <c>TensorTranspose</c> + two <c>TensorMatMul</c> FP32 dispatches —
+    /// the four-FP32-allocation-per-matmul scratch that Fp16ActivationDominated_ReducesGpuPeakBytes measured as the
+    /// dominant cost. Any backend implementing the capability fuses here (CUDA cuBLAS / HIP rocBLAS via transpose
+    /// flags; OpenCL/Vulkan/Metal/WebGpu via dedicated transposed FP16 GEMM kernels). The Half activations are
+    /// resolved to FP16 device buffers (resident reads are direct; otherwise a one-time convert, O(MK+KN+MN) —
+    /// negligible vs the O(MKN) GEMMs); the GEMMs accumulate in FP32 and the grads materialize lazily as Half.
+    /// Returns false (caller falls back to the generic backward) when the backend lacks the fused-backward
+    /// capability or the shapes are not the supported 2D matmul case.
     /// </summary>
     internal bool TryMatMulBackwardFp16Fused(
         Tensor<Half> gradC, Tensor<Half> a, Tensor<Half> b,
@@ -16165,7 +16412,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         gradB = null;
         if (a.Rank != 2 || b.Rank != 2 || gradC.Rank != 2) return false;
         if (!TryGetBackend(out var backend)) return false;
-        if (backend is not DirectGpu.CUDA.CudaBackend cb || !cb.SupportsHgemm) return false;
+        // BACKEND-AGNOSTIC fused backward: route through the IGpuHalfPrecisionBackend capability so EVERY backend
+        // that ships the fused FP16 backward (CUDA cuBLAS, HIP rocBLAS, and the OpenCL/Vulkan/Metal/WebGpu kernel
+        // backends) fuses BOTH gradients with FP16 inputs + FP32 accumulate and NO FP32 transpose/up-cast scratch
+        // (the measured dominant cost of the FP16 hetero path). Backends without the capability return false here
+        // and fall back to the GENERIC FP16 backward (MatMulBackward<Half>) — correct, just without the working-set
+        // win. (#633: the win is no longer CUDA-only.)
+        if (backend is not IGpuHalfPrecisionBackend hp || !hp.SupportsFp16FusedBackward) return false;
 
         int M = a._shape[0], K = a._shape[1], N = b._shape[1];
         if (b._shape[0] != K || gradC._shape[0] != M || gradC._shape[1] != N) return false;
@@ -16174,31 +16427,23 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         bool gradsCached = false;
         try
         {
-            // A/B/gradC as FP16. If a tensor is already resident as a Half IsFp16 entry (the forward store, or a
-            // grad produced GPU-resident by a downstream fused-backward), read it DIRECTLY — no up-cast (which
-            // would re-inflate it to FP32 and erase the store win) and no convert. Otherwise convert its FP32 buffer.
-            DirectGpu.IGpuBuffer ResolveHalf(Tensor<Half> t, int elems, ref DirectGpu.IGpuBuffer? owned)
-            {
-                if (TryGetResidentFp16Buffer(t, backend, out var resident) && resident is not null)
-                    return resident;
-                using var f = GetOrAllocateBuffer(backend, t);
-                owned = cb.AllocateByteBuffer(elems * 2);
-                cb.ConvertToFp16Native(f.Buffer, owned, elems);
-                return owned;
-            }
-            var hA = ResolveHalf(a, M * K, ref hAOwned);     // a is [M,K]
-            var hB = ResolveHalf(b, K * N, ref hBOwned);     // b is [K,N]
-            var hGc = ResolveHalf(gradC, M * N, ref hGcOwned); // gradC is [M,N]
+            // A/B/gradC as FP16, via the backend-agnostic ResolveToFp16: if a tensor is already resident as a Half
+            // IsFp16 entry (the forward store, or a grad produced GPU-resident by a downstream fused-backward) it is
+            // read DIRECTLY — no up-cast (which would re-inflate it to FP32 and erase the store win); otherwise its
+            // FP32 buffer is converted once (O(MK+KN+MN), negligible vs the O(MKN) GEMMs).
+            var hA = ResolveToFp16(a, M * K, backend, out hAOwned);     // a is [M,K]
+            var hB = ResolveToFp16(b, K * N, backend, out hBOwned);     // b is [K,N]
+            var hGc = ResolveToFp16(gradC, M * N, backend, out hGcOwned); // gradC is [M,N]
 
-            // Fused transpose-free Tensor-Core backward → FP32 grad buffers, wrapped via the DEFERRED-download
-            // FinishGpuOp: the grad's FP32 GPU buffer is cached (consumers read it on-device, no re-upload) and
-            // the host Half[] materializes LAZILY only if read on the CPU (intermediate grads never are). This
-            // keeps the grads GPU-resident with NO eager host round-trip — the per-matmul DownloadBuffer was the
-            // cortex's ~5x slowdown. (Caching the grads as IsFp16 instead churns the activation cache with fresh
-            // per-step grad arrays — measured to hang the cortex — so use the normal FP32 deferred path here.)
-            gAf = cb.AllocateBuffer(M * K);
-            gBf = cb.AllocateBuffer(K * N);
-            cb.MatMulBackwardFp16Fused(hGc, hA, hB, gAf, gBf, M, N, K, gradOutHalf: false);
+            // Fused transpose-free backward → FP32 grad buffers, wrapped via the DEFERRED-download FinishGpuOp: the
+            // grad's FP32 GPU buffer is cached (consumers read it on-device, no re-upload) and the host Half[]
+            // materializes LAZILY only if read on the CPU (intermediate grads never are). This keeps the grads
+            // GPU-resident with NO eager host round-trip — the per-matmul DownloadBuffer was the cortex's ~5x
+            // slowdown. (Caching the grads as IsFp16 instead churns the activation cache with fresh per-step grad
+            // arrays — measured to hang the cortex — so use the normal FP32 deferred path here.)
+            gAf = backend.AllocateBuffer(M * K);
+            gBf = backend.AllocateBuffer(K * N);
+            hp.MatMulBackwardFp16Fused(hGc, hA, hB, gAf, gBf, M, N, K, gradOutHalf: false);
             var gAresult = FinishGpuOp<Half>(backend, new OwnedBuffer(gAf, ownsBuffer: true), M * K);
             var gBresult = FinishGpuOp<Half>(backend, new OwnedBuffer(gBf, ownsBuffer: true), K * N);
             gradsCached = true; // FinishGpuOp took ownership of gAf/gBf (cached) — do NOT dispose
@@ -16556,30 +16801,37 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
             // FP16 Half-resident store (keystone-enabled): read IsFp16 input/gamma/beta directly, FP16-native
             // layernorm (Half output + FP32 mean/var), store Half output — keeps the per-layer norm Half.
+            // Runs on ANY backend that ships the FP16-native kernels (IGpuHalfPrecisionBackend.SupportsFp16NativeOps):
+            // the store plumbing (ResolveToFp16 / FinishGpuOpHalfStore) is now backend-agnostic, so the
+            // half-resident memory win is no longer CUDA-only. Backends without the kernels use the FP32 path below.
             if (typeof(T) == typeof(Half) && s_fp16FwdStore
-                && backend is DirectGpu.CUDA.CudaBackend cbL && cbL.SupportsFp16NativeOps)
+                && backend is IGpuHalfPrecisionBackend hpL && hpL.SupportsFp16NativeOps)
             {
                 IGpuBuffer? hInOwned = null, hGOwned = null, hBOwned = null, hOut = null;
                 var mBuf = default(OwnedBuffer); var vBuf = default(OwnedBuffer);
                 bool meanVarTransferred = false;
                 try
                 {
-                    var hIn = ResolveToFp16(input, input.Length, cbL, backend, out hInOwned);
-                    var hG = ResolveToFp16(gamma, normSize, cbL, backend, out hGOwned);
-                    var hB = ResolveToFp16(beta, normSize, cbL, backend, out hBOwned);
-                    hOut = cbL.AllocateByteBuffer(input.Length * 2);
+                    var hIn = ResolveToFp16(input, input.Length, backend, out hInOwned);
+                    var hG = ResolveToFp16(gamma, normSize, backend, out hGOwned);
+                    var hB = ResolveToFp16(beta, normSize, backend, out hBOwned);
+                    hOut = backend.AllocateByteBuffer(input.Length * 2);
                     mBuf = AllocateOutputBuffer(backend, outerSize);
                     vBuf = AllocateOutputBuffer(backend, outerSize);
-                    cbL.Fp16LayerNorm(hIn, hG, hB, hOut, mBuf.Buffer, vBuf.Buffer, outerSize, normSize, (float)epsilon);
-                    var resultH = FinishGpuOpHalfStore(cbL, hOut, input.Length, input.Shape._dims);
+                    hpL.Fp16LayerNorm(hIn, hG, hB, hOut, mBuf.Buffer, vBuf.Buffer, outerSize, normSize, (float)epsilon);
+                    var resultH = FinishGpuOpHalfStore(backend, hOut, input.Length, input.Shape._dims);
                     hOut = null;
                     mean = (Tensor<T>)(object)new Tensor<Half>(FinishGpuOp<Half>(backend, mBuf, outerSize), new[] { outerSize });
                     variance = (Tensor<T>)(object)new Tensor<Half>(FinishGpuOp<Half>(backend, vBuf, outerSize), new[] { outerSize });
                     meanVarTransferred = true;
                     return (Tensor<T>)(object)new Tensor<Half>(resultH, input.Shape._dims);
                 }
-                catch (Exception)
+                catch (Exception ex)
                 {
+                    // Fall through to the FP32 LayerNorm path below, but leave a diagnostic trail rather than
+                    // silently swallowing (OOM / cuBLAS / device-sync failures would otherwise be invisible).
+                    System.Diagnostics.Debug.WriteLine(
+                        $"[FP16 layernorm store] unexpected failure, falling back to FP32: {ex.GetType().Name}: {ex.Message}");
                     hOut?.Dispose();
                     if (!meanVarTransferred) { mBuf.Dispose(); vBuf.Dispose(); }
                 }
@@ -16873,17 +17125,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
             // FP16 Half-resident store: read IsFp16 input directly, FP16-native softmax, store Half output — so
             // the attention softmax activations stay Half (works now that the IsFp16 re-inflate is transient).
+            // Runs on ANY backend with the FP16-native kernels (IGpuHalfPrecisionBackend.SupportsFp16NativeOps);
+            // the store plumbing (ResolveToFp16/FinishGpuOpHalfStore) is backend-agnostic, so this is no longer
+            // CUDA-only. Backends without the kernels use the correct FP32 softmax path below.
             if (typeof(T) == typeof(Half) && s_fp16FwdStore
-                && backend is DirectGpu.CUDA.CudaBackend cbS && cbS.SupportsFp16NativeOps)
+                && backend is IGpuHalfPrecisionBackend hpS && hpS.SupportsFp16NativeOps)
             {
                 IGpuBuffer? hInOwned = null, hOut = null;
                 bool okS = false;
                 try
                 {
-                    var hIn = ResolveToFp16(input, input.Length, cbS, backend, out hInOwned);
-                    hOut = cbS.AllocateByteBuffer(input.Length * 2);
-                    cbS.Fp16Softmax(hIn, hOut, outerSize, features);
-                    var resultH = FinishGpuOpHalfStore(cbS, hOut, input.Length, input.Shape._dims);
+                    var hIn = ResolveToFp16(input, input.Length, backend, out hInOwned);
+                    hOut = backend.AllocateByteBuffer(input.Length * 2);
+                    hpS.Fp16Softmax(hIn, hOut, outerSize, features);
+                    var resultH = FinishGpuOpHalfStore(backend, hOut, input.Length, input.Shape._dims);
                     hOut = null;
                     var outputH = (Tensor<T>)(object)new Tensor<Half>(resultH, input.Shape._dims);
                     Autodiff.DifferentiableOps.RecordUnary("Softmax", outputH, input,
@@ -16891,7 +17146,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     okS = true;
                     return outputH;
                 }
-                catch (Exception) { /* fall through */ }
+                catch (Exception ex)
+                {
+                    // Fall through to the FP32 softmax path below, with a diagnostic trail instead of a silent swallow.
+                    System.Diagnostics.Debug.WriteLine(
+                        $"[FP16 softmax store] unexpected failure, falling back to FP32: {ex.GetType().Name}: {ex.Message}");
+                }
                 finally { hInOwned?.Dispose(); if (!okS) hOut?.Dispose(); }
             }
 
