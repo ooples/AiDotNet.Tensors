@@ -1819,7 +1819,21 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         var resident = weights.TryGetGpuBuffer();
         if (resident != null)
-            return new OwnedBuffer(resident, ownsBuffer: false);
+        {
+            // Only trust the resident device buffer when it is CURRENT with the host tensor. A weight's
+            // resident _gpuBuffer is tagged with the tensor Version at upload (UploadTensorRaw /
+            // BindResidentBuffer). A later CPU-side write — the optimizer's CPU update path, deserialize,
+            // or SetParameters — bumps Version but does NOT refresh the device buffer, leaving it stale.
+            // Serving a stale buffer makes inference run on pre-update (or uninitialized → NaN) weights:
+            // MobileNetV3 trained on GPU then read its classifier from a never-refreshed resident buffer,
+            // producing garbage/NaN. Falling through to the host-array persistent cache re-uploads the
+            // current weights and caches them. The offload-pointer path (GpuPinned / GpuOffload) has
+            // _gpuBuffer == null and owns its own device-pointer lifetime, so it is NOT version-tracked —
+            // keep trusting it unconditionally.
+            bool versionTracked = weights._gpuBuffer != null;
+            if (!versionTracked || weights._gpuBufferVersion == weights.Version)
+                return new OwnedBuffer(resident, ownsBuffer: false);
+        }
         return GetOrCacheWeightBuffer(backend, weights.GetDataArray(), role);
     }
 
