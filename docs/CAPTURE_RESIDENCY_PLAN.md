@@ -172,3 +172,60 @@ The **entire forward + loss is capture-resident** (commits `88ba2db`…`ef7e3b5`
 3. Phase A0 (instrument) → A1/A2 (work the backward-op list to the bottom) → A3/A4.
 4. Phase B → C → D → E.
 5. Update the checkboxes in this file as each item lands; re-run `capture_health.sh` to verify, not to "see the frontier move."
+
+---
+
+## 10. STATUS 2026-06-19 — FORWARD COMPLETE; frontier now in the BACKWARD (A1)
+
+**What changed this session (the 700 was masking everything):** with the CUDA-700
+use-after-free fixed (dd78e1b: disposed `Handle=0` buffer in the resident resolvers),
+capture stopped aborting at op #0 and the frontier marched through the **entire forward
+pass**. Every forward op is now capture-resident (no per-op DtoH download, no cuMemAlloc
+during capture):
+
+- embedding (on-device gather, `TryGetGpuBuffer` for the resident table) — 1412d61
+- attention BMM (sequential cublasSgemm under capture; strided is capture-unsafe) — 0e38a16
+- Softmax resident-into — 352d420
+- FusedLinear / FFN + ReLU/GELU resident-into — f77339b
+- Log resident-into (virtual + DirectGpu override; loss `log(p)`) — 66179f8
+- **Negate resident** — both the autodiff op AND the loss-tail GraphMode lazy-node
+  executor (it hardcoded CPU `AsSpan()` → download → CUDA-900; now routes through
+  `TensorNegateIntoResident` when `eng` is the GPU engine) — 6fc6fb0
+
+**The capture frontier has crossed into the BACKWARD pass.** First backward blocker
+(precisely characterized, defb333):
+
+```
+NegateBackward → AccumulateGradPoolable → TensorAddInPlace
+  → TryRunBinaryInPlace → a.GetDataArray()
+    → stale pooled-array DeferredArrayMaterializer → DownloadBuffer → CUDA-900
+```
+
+**Probe verdict (`AIDOTNET_GRAPH_CAPTURE_DEBUG=1`, over every resident-step grad-accum):**
+`aField=null aCache=null` in **23/23** sites — the gradient **accumulator is never
+resident**, and the incoming grad `b` is resident only for the scalar loss-seed. The
+**backward pass produces plain CPU grad tensors.** The capture-abort download is the
+accumulator's `GetDataArray()` firing a STALE materializer left on its pooled backing
+array by a prior step's `BindResidentBuffer`.
+
+**Therefore A1 is the real remaining work and there is NO capture shortcut:** an HtoD
+upload or `AllocateBuffer` *during* capture is itself a graph-purity violation, so the
+grads MUST be computed resident *inside* the captured backward. A1 =
+
+1. Route the hot backward ops (`BackwardFunctions.*`: matmul/softmax/layernorm/embedding/
+   bias backwards) through the resident-into paths so each grad output lands on a stable
+   GPU buffer (the forward already has the machinery: `GetOrCreateResidentBuffer` +
+   `BindResidentBuffer` + the `*ResidentInto` helpers).
+2. Give each gradient **leaf a STABLE per-leaf resident buffer** that survives the whole
+   step (the accumulator must stay resident across accumulations; today it's a pooled CPU
+   tensor). Then the Handle-guarded resident in-place grad-accum (`s_residentInPlace`,
+   `AIDOTNET_RESIDENT_INPLACE=1`) engages safely — both operands resident, no download.
+3. Watch for a STALE-materializer correctness hazard independent of capture: a pooled grad
+   backing array reused across steps keeps a previous step's resident materializer; a host
+   read then downloads an old buffer. Clearing/retiring the materializer on pool-return is
+   its own fix.
+
+**Reusable diagnostic added:** the grad-accum buffer probe (gated, defb333) prints
+`aField/aCache/bField` Handle+size for every resident-step in-place grad-accum — re-run
+with `AIDOTNET_RESIDENT_INPLACE=1 AIDOTNET_GRAPH_CAPTURE_DEBUG=1` to watch A1 turn the
+nulls into resident handles.
