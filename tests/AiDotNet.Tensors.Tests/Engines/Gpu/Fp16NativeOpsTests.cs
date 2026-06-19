@@ -121,4 +121,232 @@ public class Fp16NativeOpsTests
         double rel = Math.Sqrt(num / den);
         Assert.True(rel < 3e-2, $"Fp16LayerNorm exceeded FP16 tolerance: relFro={rel:E3}");
     }
+
+    [SkippableFact]
+    public void Fp16GeluBackward_matches_fp32_reference()
+    {
+        Skip.IfNot(CudaNativeBindings.IsAvailable, "CUDA driver not available");
+        var (b, ok) = Setup();
+        Skip.IfNot(ok, "CudaBackend not available");
+        Skip.IfNot(b.SupportsFp16NativeOps, "fp16 native kernels not compiled");
+
+        const int n = 4096;
+        var rng = new Random(11);
+        var g = new float[n]; var x = new float[n];
+        for (int i = 0; i < n; i++) { g[i] = (float)(rng.NextDouble() * 2 - 1); x[i] = (float)(rng.NextDouble() * 6 - 3); }
+
+        // CPU ref on the SAME FP16-quantized inputs — gelu'(x) tanh-approx, mirrors gelu_backward.
+        var gq = g.Select(v => (float)(Half)v).ToArray();
+        var xq = x.Select(v => (float)(Half)v).ToArray();
+        var cpu = new float[n];
+        for (int i = 0; i < n; i++)
+        {
+            float xi = xq[i], x2 = xi * xi, x3 = x2 * xi;
+            float inner = 0.7978845608f * (xi + 0.044715f * x3);
+            float t = MathF.Tanh(inner);
+            float sech2 = 1.0f - t * t;
+            float dInner = 0.7978845608f * (1.0f + 3.0f * 0.044715f * x2);
+            float dgelu = 0.5f * (1.0f + t) + 0.5f * xi * sech2 * dInner;
+            cpu[i] = gq[i] * dgelu;
+        }
+
+        using var dg = b.AllocateBuffer(g);
+        using var dx = b.AllocateBuffer(x);
+        using var hg = b.AllocateByteBuffer(n * 2);
+        using var hx = b.AllocateByteBuffer(n * 2);
+        using var hout = b.AllocateByteBuffer(n * 2);
+        b.ConvertToFp16Native(dg, hg, n);
+        b.ConvertToFp16Native(dx, hx, n);
+        try { b.Fp16GeluBackward(hg, hx, hout, n); }
+        catch (Exception ex) when (ex is NotSupportedException || (ex is InvalidOperationException && ex.Message.IndexOf("kernel not found", StringComparison.OrdinalIgnoreCase) >= 0))
+        { Skip.If(true, $"not supported: {ex.Message}"); return; }
+        using var fout = b.AllocateBuffer(n);
+        b.ConvertToFp32Native(hout, fout, n);
+        var got = b.DownloadBuffer(fout);
+
+        double num = 0, den = 0;
+        for (int i = 0; i < n; i++) { double e = got[i] - cpu[i]; num += e * e; den += (double)cpu[i] * cpu[i]; }
+        double rel = Math.Sqrt(num / den);
+        Assert.True(rel < 2e-2, $"Fp16GeluBackward exceeded FP16 tolerance: relFro={rel:E3}");
+    }
+
+    [SkippableFact]
+    public void Fp16ReluBackward_matches_fp32_reference()
+    {
+        Skip.IfNot(CudaNativeBindings.IsAvailable, "CUDA driver not available");
+        var (b, ok) = Setup();
+        Skip.IfNot(ok, "CudaBackend not available");
+        Skip.IfNot(b.SupportsFp16NativeOps, "fp16 native kernels not compiled");
+
+        const int n = 4096;
+        var rng = new Random(13);
+        var g = new float[n]; var x = new float[n];
+        for (int i = 0; i < n; i++) { g[i] = (float)(rng.NextDouble() * 2 - 1); x[i] = (float)(rng.NextDouble() * 6 - 3); }
+
+        var gq = g.Select(v => (float)(Half)v).ToArray();
+        var xq = x.Select(v => (float)(Half)v).ToArray();
+        var cpu = new float[n];
+        for (int i = 0; i < n; i++) cpu[i] = xq[i] > 0.0f ? gq[i] : 0.0f;
+
+        using var dg = b.AllocateBuffer(g);
+        using var dx = b.AllocateBuffer(x);
+        using var hg = b.AllocateByteBuffer(n * 2);
+        using var hx = b.AllocateByteBuffer(n * 2);
+        using var hout = b.AllocateByteBuffer(n * 2);
+        b.ConvertToFp16Native(dg, hg, n);
+        b.ConvertToFp16Native(dx, hx, n);
+        try { b.Fp16ReluBackward(hg, hx, hout, n); }
+        catch (Exception ex) when (ex is NotSupportedException || (ex is InvalidOperationException && ex.Message.IndexOf("kernel not found", StringComparison.OrdinalIgnoreCase) >= 0))
+        { Skip.If(true, $"not supported: {ex.Message}"); return; }
+        using var fout = b.AllocateBuffer(n);
+        b.ConvertToFp32Native(hout, fout, n);
+        var got = b.DownloadBuffer(fout);
+
+        for (int i = 0; i < n; i++)
+            Assert.True(Math.Abs(got[i] - cpu[i]) < 1e-3, $"Fp16ReluBackward mismatch at {i}: got={got[i]} cpu={cpu[i]}");
+    }
+
+    [SkippableFact]
+    public void Fp16SoftmaxBackward_matches_fp32_reference()
+    {
+        Skip.IfNot(CudaNativeBindings.IsAvailable, "CUDA driver not available");
+        var (b, ok) = Setup();
+        Skip.IfNot(ok, "CudaBackend not available");
+        Skip.IfNot(b.SupportsFp16NativeOps, "fp16 native kernels not compiled");
+
+        const int rows = 48, cols = 65; // non-power-of-2 features
+        var rng = new Random(17);
+        // y is a valid softmax row (so the test exercises the real backward inputs); g is arbitrary upstream grad.
+        var y = new float[rows * cols];
+        var g = new float[rows * cols];
+        for (int r = 0; r < rows; r++)
+        {
+            double s = 0; var row = new double[cols];
+            for (int c = 0; c < cols; c++) { row[c] = Math.Exp(rng.NextDouble() * 4 - 2); s += row[c]; }
+            for (int c = 0; c < cols; c++) { y[r * cols + c] = (float)(row[c] / s); g[r * cols + c] = (float)(rng.NextDouble() * 2 - 1); }
+        }
+
+        // CPU ref on FP16-quantized inputs: gradIn = y*(g - dot(g,y)), mirrors softmax_backward.
+        var yq = y.Select(v => (float)(Half)v).ToArray();
+        var gq = g.Select(v => (float)(Half)v).ToArray();
+        var cpu = new float[rows * cols];
+        for (int r = 0; r < rows; r++)
+        {
+            float dot = 0; for (int c = 0; c < cols; c++) dot += gq[r * cols + c] * yq[r * cols + c];
+            for (int c = 0; c < cols; c++) cpu[r * cols + c] = yq[r * cols + c] * (gq[r * cols + c] - dot);
+        }
+
+        using var dg = b.AllocateBuffer(g);
+        using var dy = b.AllocateBuffer(y);
+        using var hg = b.AllocateByteBuffer(rows * cols * 2);
+        using var hy = b.AllocateByteBuffer(rows * cols * 2);
+        using var hout = b.AllocateByteBuffer(rows * cols * 2);
+        b.ConvertToFp16Native(dg, hg, rows * cols);
+        b.ConvertToFp16Native(dy, hy, rows * cols);
+        try { b.Fp16SoftmaxBackward(hg, hy, hout, rows, cols); }
+        catch (Exception ex) when (ex is NotSupportedException || (ex is InvalidOperationException && ex.Message.IndexOf("kernel not found", StringComparison.OrdinalIgnoreCase) >= 0))
+        { Skip.If(true, $"not supported: {ex.Message}"); return; }
+        using var fout = b.AllocateBuffer(rows * cols);
+        b.ConvertToFp32Native(hout, fout, rows * cols);
+        var got = b.DownloadBuffer(fout);
+
+        double num = 0, den = 0;
+        for (int i = 0; i < cpu.Length; i++) { double e = got[i] - cpu[i]; num += e * e; den += (double)cpu[i] * cpu[i]; }
+        double rel = Math.Sqrt(num / den);
+        Assert.True(rel < 3e-2, $"Fp16SoftmaxBackward exceeded FP16 tolerance: relFro={rel:E3}");
+    }
+
+    [SkippableFact]
+    public void Fp16LayerNormBackward_matches_fp32_reference()
+    {
+        Skip.IfNot(CudaNativeBindings.IsAvailable, "CUDA driver not available");
+        var (b, ok) = Setup();
+        Skip.IfNot(ok, "CudaBackend not available");
+        Skip.IfNot(b.SupportsFp16NativeOps, "fp16 native kernels not compiled");
+
+        const int rows = 32, cols = 80;
+        const float eps = 1e-5f;
+        var rng = new Random(23);
+        var x = new float[rows * cols];
+        var g = new float[rows * cols];
+        var gamma = new float[cols];
+        for (int i = 0; i < x.Length; i++) { x[i] = (float)(rng.NextDouble() * 4 - 2); g[i] = (float)(rng.NextDouble() * 2 - 1); }
+        for (int c = 0; c < cols; c++) gamma[c] = (float)(rng.NextDouble() + 0.5);
+
+        // FP16-quantized inputs; mean/invVar (population) per row in FP32 — these are passed to the kernel as the
+        // engine passes them (FP32 saveMean + saveInvVar). CPU ref mirrors layernorm_backward + grad_params.
+        var xq = x.Select(v => (float)(Half)v).ToArray();
+        var gq = g.Select(v => (float)(Half)v).ToArray();
+        var gamq = gamma.Select(v => (float)(Half)v).ToArray();
+        var mean = new float[rows];
+        var invVar = new float[rows];
+        for (int r = 0; r < rows; r++)
+        {
+            double m = 0; for (int c = 0; c < cols; c++) m += xq[r * cols + c]; m /= cols;
+            double v = 0; for (int c = 0; c < cols; c++) { double d = xq[r * cols + c] - m; v += d * d; } v /= cols;
+            mean[r] = (float)m; invVar[r] = (float)(1.0 / Math.Sqrt(v + eps));
+        }
+        var cpuGi = new float[rows * cols];
+        for (int r = 0; r < rows; r++)
+        {
+            float mu = mean[r], iv = invVar[r];
+            float sumDy = 0, sumDyXmu = 0;
+            for (int c = 0; c < cols; c++) { float dy = gq[r * cols + c] * gamq[c]; sumDy += dy; sumDyXmu += dy * (xq[r * cols + c] - mu); }
+            for (int c = 0; c < cols; c++)
+            {
+                float xmu = xq[r * cols + c] - mu;
+                float dxhat = gq[r * cols + c] * gamq[c];
+                cpuGi[r * cols + c] = iv * (dxhat - (sumDy + xmu * iv * iv * sumDyXmu) / cols);
+            }
+        }
+        var cpuGg = new float[cols];
+        var cpuGb = new float[cols];
+        for (int c = 0; c < cols; c++)
+        {
+            float dG = 0, dB = 0;
+            for (int r = 0; r < rows; r++) { float nrm = (xq[r * cols + c] - mean[r]) * invVar[r]; dG += gq[r * cols + c] * nrm; dB += gq[r * cols + c]; }
+            cpuGg[c] = dG; cpuGb[c] = dB;
+        }
+
+        using var dx = b.AllocateBuffer(x);
+        using var dg = b.AllocateBuffer(g);
+        using var dgam = b.AllocateBuffer(gamma);
+        using var hx = b.AllocateByteBuffer(rows * cols * 2);
+        using var hg = b.AllocateByteBuffer(rows * cols * 2);
+        using var hgam = b.AllocateByteBuffer(cols * 2);
+        using var meanBuf = b.AllocateBuffer(mean);
+        using var invVarBuf = b.AllocateBuffer(invVar);
+        using var giOut = b.AllocateByteBuffer(rows * cols * 2);
+        using var ggOut = b.AllocateByteBuffer(cols * 2);
+        using var gbOut = b.AllocateByteBuffer(cols * 2);
+        b.ConvertToFp16Native(dx, hx, rows * cols);
+        b.ConvertToFp16Native(dg, hg, rows * cols);
+        b.ConvertToFp16Native(dgam, hgam, cols);
+        try
+        {
+            b.Fp16LayerNormBackward(hg, hx, hgam, meanBuf, invVarBuf, giOut, rows, cols);
+            b.Fp16LayerNormGradParams(hg, hx, meanBuf, invVarBuf, ggOut, gbOut, rows, cols);
+        }
+        catch (Exception ex) when (ex is NotSupportedException || (ex is InvalidOperationException && ex.Message.IndexOf("kernel not found", StringComparison.OrdinalIgnoreCase) >= 0))
+        { Skip.If(true, $"not supported: {ex.Message}"); return; }
+        using var fgi = b.AllocateBuffer(rows * cols);
+        using var fgg = b.AllocateBuffer(cols);
+        using var fgb = b.AllocateBuffer(cols);
+        b.ConvertToFp32Native(giOut, fgi, rows * cols);
+        b.ConvertToFp32Native(ggOut, fgg, cols);
+        b.ConvertToFp32Native(gbOut, fgb, cols);
+        var gotGi = b.DownloadBuffer(fgi);
+        var gotGg = b.DownloadBuffer(fgg);
+        var gotGb = b.DownloadBuffer(fgb);
+
+        double Rel(float[] got, float[] cpu)
+        {
+            double num = 0, den = 0;
+            for (int i = 0; i < cpu.Length; i++) { double e = got[i] - cpu[i]; num += e * e; den += (double)cpu[i] * cpu[i]; }
+            return Math.Sqrt(num / Math.Max(den, 1e-12));
+        }
+        Assert.True(Rel(gotGi, cpuGi) < 4e-2, $"Fp16LayerNormBackward gradInput relFro={Rel(gotGi, cpuGi):E3}");
+        Assert.True(Rel(gotGg, cpuGg) < 4e-2, $"Fp16LayerNorm gradGamma relFro={Rel(gotGg, cpuGg):E3}");
+        Assert.True(Rel(gotGb, cpuGb) < 4e-2, $"Fp16LayerNorm gradBeta relFro={Rel(gotGb, cpuGb):E3}");
+    }
 }

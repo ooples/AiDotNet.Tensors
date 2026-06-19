@@ -2477,6 +2477,21 @@ public partial class DirectGpuTensorEngine
         return bhsd.Reshape(new[] { B * H, S, d });
     }
 
+    // PR #638 diag: pin the residual MHA leak source — count tape-active vs tapeless MHA-forward calls (the
+    // tapeless ones get DropTransientActivationsCreatedAfter; tape-active are skipped). AIDOTNET_MHA_DIAG=1.
+    private static readonly bool s_mhaDiag = System.Environment.GetEnvironmentVariable("AIDOTNET_MHA_DIAG") == "1";
+    private static long s_mhaTotal, s_mhaTapeActive;
+    private const int MhaDiagDumpInterval = 500;                    // dump every N MHA calls
+    private const string MhaDiagFileName = "aidotnet_mha_diag.txt"; // under Path.GetTempPath()
+    private static void MhaDiag(bool tapeActive)
+    {
+        long tot = System.Threading.Interlocked.Increment(ref s_mhaTotal);
+        if (tapeActive) System.Threading.Interlocked.Increment(ref s_mhaTapeActive);
+        if (tot % MhaDiagDumpInterval == 0)
+            try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), MhaDiagFileName),
+                $"MHA calls={tot} tapeActive={System.Threading.Interlocked.Read(ref s_mhaTapeActive)} dropFreedTotal={System.Threading.Interlocked.Read(ref s_dropFreedTotal)}" + System.Environment.NewLine); } catch { }
+    }
+
     /// <inheritdoc/>
     public override Tensor<T> MultiHeadAttentionForward<T>(
         Tensor<T> input, Tensor<T> qWeight, Tensor<T> kWeight, Tensor<T> vWeight, Tensor<T> outWeight,
@@ -2504,6 +2519,14 @@ public partial class DirectGpuTensorEngine
 
         try
         {
+            // Snapshot the activation cache so the dead intermediates this fused op caches (qh/kh/vh, the per-head
+            // scores/attn/headOuts, oBHSD/oBSHD) can be released on the way out. This is a TAPELESS inference op
+            // (reached via MultiHeadAttentionLayer.TryFusedAttentionInference) — no GradientTape brackets it, so
+            // NOTHING else releases those entries, and with the compiled step's eviction suspended they accumulate
+            // every step → the d128/L1 async-pool-OOM CUDA-700 that aborts whole-step capture. (Leak localized via
+            // GpuMemoryTracker: x536-540 MHA-forward intermediates/step.) We free them WITHOUT a download (they are
+            // never read) so it is capture-safe; the resident result is preserved via its keep-key.
+            long actSnapshot = ActivationCacheTimestampSnapshot();
             float scale = (float)(1.0 / System.Math.Sqrt(d));
             T scaleT = (T)(object)scale;
             var input2d = (input.IsContiguous ? input : (Tensor<T>)input.Contiguous()).Reshape(new[] { B * S, D });
@@ -2525,7 +2548,18 @@ public partial class DirectGpuTensorEngine
 
             var oBHSD = TensorConcatenate(headOuts, 0).Reshape(new[] { B, H, S, d });
             var oBSHD = PermuteResidentGpu(backend, oBHSD, new[] { 0, 2, 1, 3 }).Reshape(new[] { B * S, D });
-            return TensorMatMul(oBSHD, outWeight).Reshape(new[] { B, S, D });
+            var outProj = TensorMatMul(oBSHD, outWeight);                    // [B*S, D] — the live result buffer
+            var result = outProj.Reshape(new[] { B, S, D });
+            // Release the dead intermediates (keep the result's resident buffer). Only when no tape depends on
+            // them; if a tape is recording (the sub-ops registered backwards), their lifetime is the tape's.
+            bool tapeActive = IsTapeActive<T>();
+            if (!tapeActive)
+                // Tapeless MHA calls: drop the dead intermediates (caller-thread; measured: they are NOT cached on
+                // pool threads, so the allThreads variant gives no gain here). The tape-ACTIVE MHA calls are
+                // released via the tape-dispose path instead — see GradientTape.
+                DropTransientActivationsCreatedAfter(actSnapshot, outProj.DataVector.GetBackingArrayUnsafe());
+            if (s_mhaDiag) MhaDiag(tapeActive);   // PR #638 diag: count tape-active vs tapeless MHA calls
+            return result;
         }
         catch (Exception)
         {
