@@ -18121,12 +18121,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// backend SetSliceAxis kernel — no download. Falls to the CPU path off the resident step / non-contiguous.</summary>
     void IEngine.TensorSetSliceAxis<T>(Tensor<T> destination, Tensor<T> source, int axis, int index)
     {
+        if (System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") == "1")
+            AliasDiag($"SetSliceAxis ENTRY residentStep={ResidentStepActive} float={typeof(T) == typeof(float)} dstContig={destination.IsContiguous} axis={axis} idx={index} dst=[{string.Join(",", destination._shape)}]");
         if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float)
             && destination.IsContiguous && axis >= 0 && axis < destination.Rank
             && index >= 0 && index < destination.Shape._dims[axis] && TryGetBackend(out var backend))
         {
             var src = source.IsContiguous ? source : source.Contiguous();
             var srcR = ResolveResidentBufferNoUpload(backend, src, src.Length);
+            if (srcR is null && System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") == "1")
+                AliasDiag($"SetSliceAxis bail: srcResident=False srcContig={source.IsContiguous} srcShape=[{string.Join(",", source._shape)}] dstShape=[{string.Join(",", destination._shape)}] axis={axis} index={index}");
             if (srcR is not null)
             {
                 try
@@ -18137,11 +18141,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     for (int d = 0; d < axis; d++) outerCount *= destination.Shape._dims[d];
                     int axisSize = destination.Shape._dims[axis];
                     var dstBuf = GetOrCreateResidentBuffer(backend, destination, destination.Length);
-                    if (backend is DirectGpu.IGpuBatchExecution batchEng
+                    if (backend is DirectGpu.CUDA.CudaBackend cudaBe
                         && dstBuf.Handle != System.IntPtr.Zero && dstBuf.Size >= destination.Length)
                     {
                         backend.Fill(dstBuf, 0f, destination.Length);
-                        batchEng.SetSliceAxis(dstBuf, srcR, outerCount, axisSize, stride, index);
+                        cudaBe.SetSliceAxis(dstBuf, srcR, outerCount, axisSize, stride, index);
                         ResidentSyncCheck("SetSliceAxisResident");
                         BindResidentBuffer(destination, dstBuf, backend);
                         return;
