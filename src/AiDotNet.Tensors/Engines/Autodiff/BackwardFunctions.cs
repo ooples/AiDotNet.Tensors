@@ -4312,7 +4312,10 @@ internal static class BackwardFunctions<T>
         // Parallel.For. Both fast paths bypass engine recording, so the no-
         // active-tape gate preserves higher-order AD via the engine fallback.
         if (typeof(T) == typeof(float) && inputs[0].Rank == 2 && inputs[1].Rank == 2
-            && gradOutput.IsContiguous && GradientTape<T>.Current is null)
+            && gradOutput.IsContiguous && GradientTape<T>.Current is null
+            // PR #638 A1: skip the GetDataArray()-downloading CPU fast path during CUDA-graph capture → resident
+            // engine fallback (Reshape/TensorTranspose/TensorMatMul/ReduceSum are all resident in the step).
+            && !(engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine { ResidentStepActive: true }))
         {
             int M = inputs[0]._shape[0]; // batch
             int K = inputs[0]._shape[1]; // in_features
