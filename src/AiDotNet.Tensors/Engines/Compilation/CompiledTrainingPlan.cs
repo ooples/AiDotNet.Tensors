@@ -1050,8 +1050,16 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // backward to start from a zero/stale loss gradient. Bind the seed resident here AND initialize its
             // constant 1.0 (the seed is filled with numOps.One at construction; cuMemsetD32/Fill is fine — the
             // pre-pass is NOT capturing). The dest (_lossGradDest == gradMap[lossOutput]) is already bound above.
-            if (typeof(T) == typeof(float) && residentEngine.EnsureResidentBuffer(_lossGradSeed) is { } seedResident)
+            // FAIL FAST if the seed cannot be made resident: silently skipping would leave the captured reseed off
+            // and the backward training from a zero loss gradient (a silent-wrong-numbers failure mode).
+            if (typeof(T) == typeof(float))
+            {
+                var seedResident = residentEngine.EnsureResidentBuffer(_lossGradSeed)
+                    ?? throw new InvalidOperationException(
+                        "Could not make the loss-gradient seed GPU-resident for the captured backward; the captured "
+                        + "reseed (CopyBufferDtoD) would be skipped and the backward would start from a zero loss gradient.");
                 cb.Fill(seedResident, 1f, _lossGradSeed.Length);
+            }
         }
         if (_genericGradIndices != null)
         {

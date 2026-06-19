@@ -44,6 +44,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     private const int DefaultBlockSize = 256;
     private const int MaxRnnBlockSize = 1024;
+    // FP16 (Half) element width in bytes — used to validate half-buffer sizes before launching FP16-native kernels.
+    private const int Fp16ByteWidth = 2;
     private readonly ConcurrentDictionary<string, IntPtr> _kernelCache;
     private IntPtr _cudaContext;
     private IntPtr _stream;
@@ -11853,7 +11855,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (size <= 0) throw new ArgumentOutOfRangeException(nameof(size), "Element count must be positive.");
         // Validate half-buffer sizes (matches Fp16Softmax/LayerNormBackward) — an undersized pooled buffer would
         // otherwise read/write out of bounds (the CUDA-700 class this PR root-causes elsewhere).
-        long geluHalfBytes = (long)size * 2;
+        long geluHalfBytes = (long)size * Fp16ByteWidth;
         if (gradOutput.SizeInBytes < geluHalfBytes) throw new ArgumentException($"gradOutput half buffer too small: {gradOutput.SizeInBytes} < {geluHalfBytes}.");
         if (input.SizeInBytes < geluHalfBytes) throw new ArgumentException($"input half buffer too small: {input.SizeInBytes} < {geluHalfBytes}.");
         if (gradInput.SizeInBytes < geluHalfBytes) throw new ArgumentException($"gradInput half buffer too small: {gradInput.SizeInBytes} < {geluHalfBytes}.");
@@ -11876,7 +11878,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         if (size <= 0) throw new ArgumentOutOfRangeException(nameof(size), "Element count must be positive.");
         // Validate half-buffer sizes (matches Fp16Softmax/LayerNormBackward) — an undersized pooled buffer would
         // otherwise read/write out of bounds (the CUDA-700 class this PR root-causes elsewhere).
-        long reluHalfBytes = (long)size * 2;
+        long reluHalfBytes = (long)size * Fp16ByteWidth;
         if (gradOutput.SizeInBytes < reluHalfBytes) throw new ArgumentException($"gradOutput half buffer too small: {gradOutput.SizeInBytes} < {reluHalfBytes}.");
         if (input.SizeInBytes < reluHalfBytes) throw new ArgumentException($"input half buffer too small: {input.SizeInBytes} < {reluHalfBytes}.");
         if (gradInput.SizeInBytes < reluHalfBytes) throw new ArgumentException($"gradInput half buffer too small: {gradInput.SizeInBytes} < {reluHalfBytes}.");
