@@ -6262,7 +6262,12 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var captured = tensor;
                 return scope.RecordUnary(LazyNodeType.Negate, "TensorNegate", tensor, tensor._shape,
-                    (eng, output) => { MathHelper.GetNumericOperations<T>().Negate(captured.AsSpan(), output.AsWritableSpan()); },
+                    (eng, output) =>
+                    {
+                        // During CUDA-graph capture the GPU engine keeps this resident (no AsSpan download → CUDA-900).
+                        if (eng is DirectGpuTensorEngine gpu && gpu.TensorNegateIntoResident(output, captured)) return;
+                        MathHelper.GetNumericOperations<T>().Negate(captured.AsSpan(), output.AsWritableSpan());
+                    },
                     BackwardFunctions<T>.NegateBackward);
             }
         }

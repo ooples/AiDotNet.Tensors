@@ -4162,6 +4162,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         catch (Exception uex) { AliasDiag($"{opName}-resident FELLBACK in=[{string.Join(",", input._shape)}]: {uex.GetType().Name}: {uex.Message}"); return false; }
     }
 
+    /// <summary>Resident negate INTO a caller-provided output buffer, for the GraphMode lazy-node executor that the
+    /// compiled loss tail replays (the cross-entropy -log(p) negate). The lazy closure (CpuEngine.TensorNegate's
+    /// RecordUnary) hardcodes CPU AsSpan() → DeferredArrayMaterializer download → CUDA-900 during capture. Routing it
+    /// here keeps the negate GPU-resident (no download). Returns false off the resident step → caller does CPU.</summary>
+    internal bool TensorNegateIntoResident<T>(Tensor<T> output, Tensor<T> input)
+        => TryUnaryResidentInto(output, input, static (be, i, o, n) => be.Negate(i, o, n), "NegateLazy");
+
     void IEngine.ReLUInto<T>(Tensor<T> dest, Tensor<T> input)
     {
         if (TryUnaryResidentInto(dest, input, static (be, i, o, n) => be.Relu(i, o, n), "ReLU")) return;
@@ -14742,6 +14749,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // download aborted capture at the cross-entropy -log(p)). Records the backward exactly as the eager path.
         if (typeof(T) == typeof(float))
         {
+            if (System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") == "1"
+                && TryGetBackend(out var dbgB) && dbgB is DirectGpu.CUDA.CudaBackend dbgCb && dbgCb.IsStreamCapturing())
+                AliasDiag($"Negate DURING-CAPTURE residentStep={ResidentStepActive} evictSusp={EvictionSuspended} capDepth>0");
             var resOut = new Tensor<T>(new T[tensor.Length], tensor.Shape._dims);
             if (TryUnaryResidentInto(resOut, tensor, static (be, i, o, n) => be.Negate(i, o, n), "Negate"))
             {
