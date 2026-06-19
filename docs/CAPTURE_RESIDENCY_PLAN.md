@@ -268,3 +268,42 @@ read the `accumgrad` producer histogram (`op=… gradRes=False`), fix the top pr
 Every increment keeps `test Passed` + CAND C correct. The `TryMatMulResident` /
 `TryBinaryResidentOutOfPlace` / `ResolveResidentBufferNoUpload` / `EnsureResidentBuffer`
 helpers are the reusable primitives; the remaining ops follow the same shape.
+
+---
+
+## 12. STATUS 2026-06-19 (cont.) — A1 at 69/78 backward grads resident (forward 100%)
+
+Continued working the backward-residency list end-to-end. Resident backward grad
+sites now **69 of 78** (was 7 at the start of A1). Added this pass:
+- elementwise out-of-place (Add/Sub/Multiply/**Divide**→Log), Reshape, MatMul (ND×2D +
+  2D×2D), MultiplyScalar, Permute (on-GPU contiguous materialize)
+- shared sub-ops resident: **ReduceSum** (incl. non-last-axis via on-GPU permute),
+  2D **Transpose**, **ReluBackward**, **SoftmaxBackward**
+- **FusedLinear** backward: gate the GetDataArray CPU fast path off in the resident step
+  → resident engine fallback (the gate was on the wrong function first; the real one is
+  FusedLinearBackwardCore @ the 4314 gate) — flipped all 8
+- **LayerNorm** backward: full resident path, all 3 grads (gradInput/gradGamma/gradBeta),
+  invVar = 1/sqrt(var+eps) computed on-GPU (AddScalar→Sqrt→Reciprocal) — flipped all 6
+
+**Remaining 9 (the specialized / dependency-coupled tail) — capture engages once these land:**
+- `TensorMatMul` ×4 (len 1048576/4194304): the **4D batched-attention GEMMs** (Q·Kᵀ, attn·V
+  backward). `TryMatMulResident` only covers ND×2D and 2D×2D; these go ND×ND → base → download.
+  Needs a resident batched-GEMM path (the capture-safe sequential `cublasSgemm`-per-batch loop
+  added earlier in BatchedGemm is the template).
+- `ReLU` ×1 (len 4194304): `ReluBackward` IS resident, but its input activation isn't resident
+  here → resolves no-upload to null → bails. Dependency: trace which producer leaves that
+  activation non-resident (likely the same attention path).
+- `TensorEmbeddingLookupFromFloatIndices` ×1: embedding backward = **scatter-add** of the grad
+  into the table-grad; needs a resident scatter-add (no download).
+- `ReduceSum` ×1, `ReduceMean` ×1: their backward **broadcasts** the grad back to input shape
+  (ExpandDims + BroadcastGradToShape / engine.ReduceMeanBackward) — needs a resident broadcast.
+- `TensorSliceAxis` ×1: backward = `TensorSetSliceAxis` (scatter the grad into a zeroed buffer)
+  — needs a resident set-slice.
+
+**Important framing:** the whole forward + 69/78 of the backward run capture-resident; the test
+passes and CAND C stays correct at every step (capture_health's "1.79%" hybrid line is a
+misparse — ignore). Capture still ABORTS because ANY single remaining download invalidates the
+whole-graph capture — so the score that matters for *engagement* is binary (0 downloads), but
+the 69/78 is the real measure of progress and each is independently correct. The reusable
+helpers (`EnsureResidentBuffer`, `ResolveResidentBufferNoUpload`, `TryBinaryResidentOutOfPlace`,
+`TryMatMulResident`, the `accumgrad` probe) make the last 9 mechanical once each kernel exists.
