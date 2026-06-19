@@ -339,3 +339,42 @@ engagement is the last-5-kernels away. The reusable primitives (`EnsureResidentB
 `ResolveResidentBufferNoUpload`, `TryBinaryResidentOutOfPlace`, `TryMatMulResident`, the
 resident BatchedGemm branch, the `accumgrad` probe) plus this list make the finish mechanical
 once the broadcast + scatter-add kernels land.
+
+---
+
+## 14. ★ 2026-06-19 — PHASE A COMPLETE: WHOLE-STEP CUDA-GRAPH CAPTURE ENGAGES ★
+
+`CAPTURE ✓ ENGAGED (0 in-capture violations)`, CUDA-700 none, test Passed, cortex
+correctness `C 2.86%` byte-identical. **All 78 backward grad sites are resident; the
+entire forward + backward of the cortex training step is now CUDA-graph-capture-pure.**
+This is the §1 frontier (capture engages) — done. The work went 7→78 resident grads by
+reusing existing backend kernels + clearing every residual download / non-capturable op.
+
+**The last cluster of blockers (all this session):**
+- `TensorPool.Return` materialized (downloaded) resident tensors via its
+  `GetLiveBackingArrayOrNull` discriminator → guard on the `_gpuBuffer` field instead.
+- `ReduceMean`/`ReduceSum` backward broadcast = outer-product GEMM with a ones-vector; the
+  ones MUST be a STABLE pre-warmed buffer because **`cuMemsetD32` (backend.Fill) is not
+  capturable → CUDA-906**. Fill once in the not-capturing pre-pass, read-only in capture.
+- For all zero-init (SliceAxis / Embedding scatter), use **`cuMemsetD8Async`
+  (CudaBackend.MemsetBuffer)** — capturable — NOT `backend.Fill` (cuMemsetD32 → 906).
+- `SliceAxis` set-slice needs `CudaBackend.SetSliceAxis` directly (the backend does NOT
+  implement `IGpuBatchExecution`; `TryGetBatchBackend` misses too).
+- `Embedding` backward = resident scatter-add (`EmbeddingBackward`) reusing the forward's
+  on-device `_cachedEmbIndexBuffer` (no float-index `GetDataArray` download).
+- Several resident paths had to live in the **EXPLICIT `IEngine.*` impl**, not the public
+  override (`engine.TensorTile`/`engine.ReluBackward` via IEngine bypass the override), and
+  metadata-view ops (`Reshape`, `ExpandDims`) must PROPAGATE the input's resident buffer.
+
+**METHOD LESSON:** two recurring traps gated the last 12% — (1) the explicit-interface-impl
+vs public-override dispatch (a resident branch in the override is dead when the op is called
+through `IEngine`), and (2) `cuMemsetD32` (Fill) is not stream-capturable while
+`cuMemsetD8Async` (MemsetBuffer) is. Both are silent: the op appears resident in the pre-pass
+probe and only fails when the capture frontier actually reaches it.
+
+**REMAINING = PHASE B (replayability), a distinct frontier:** capture BUILDS the graph purely
+but `cuGraphLaunch` on a later step throws `Invalid value` (CudaBackend.Graph.cs:95) → the
+cortex recovers to eager (test passes, no acceleration yet). Likely the per-call async-pool
+allocations the resident-into ops make DURING capture leave the graph's captured device
+pointers invalid on replay → resident-into outputs may need STABLE (pre-allocated, reused)
+buffers. Then Phase C (perf gate: captured vs eager wall-clock), D, E. See plan task Phase B.
