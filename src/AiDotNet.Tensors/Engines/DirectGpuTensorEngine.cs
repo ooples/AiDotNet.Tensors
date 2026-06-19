@@ -14873,6 +14873,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return base.TensorDivide(a, b);
         if (!ShapesMatch(a.Shape._dims, b.Shape._dims))
             return base.TensorDivide(a, b);
+        if (TryBinaryResidentOutOfPlace(a, b, static (be, ia, ib, o, n) => be.Divide(ia, ib, o, n)) is { } rdiv)
+        {
+            Autodiff.DifferentiableOps.RecordBinary("TensorDivide", rdiv, a, b, Autodiff.BackwardFunctions<T>.DivideBackward);
+            return rdiv;
+        }
         try
         {
             var result = TryRunBinary(a, b, static (backend, ia, ib, o, size) => backend.Divide(ia, ib, o, size));
