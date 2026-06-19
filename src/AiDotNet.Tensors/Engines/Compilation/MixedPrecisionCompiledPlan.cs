@@ -613,6 +613,139 @@ public sealed class MixedPrecisionCompiledPlan
         return new GradientResult(loss, infNan, pgrads);
     }
 
+    /// <summary>Outcome of a mixed forward/backward that surfaces gradients for BOTH FP32 master params
+    /// and FP16 STORAGE-weight params. <see cref="Fp32Gradients"/> is index-aligned with the FP32
+    /// parameters; <see cref="Fp16ParamGradients"/> is index-aligned with the FP16 parameters and is
+    /// already UP-CAST to FP32 and unscaled, ready to apply to an FP32 master. An entry is null when that
+    /// parameter wasn't on the path this step. <see cref="FoundInfNan"/> is the combined overflow flag.</summary>
+    public readonly struct MixedGradientResult
+    {
+        public readonly float Loss;
+        public readonly bool FoundInfNan;
+        public readonly IReadOnlyList<Tensor<float>?> Fp32Gradients;
+        public readonly IReadOnlyList<Tensor<float>?> Fp16ParamGradients;
+        public MixedGradientResult(float loss, bool infNan, IReadOnlyList<Tensor<float>?> fp32, IReadOnlyList<Tensor<float>?> fp16Params)
+        { Loss = loss; FoundInfNan = infNan; Fp32Gradients = fp32; Fp16ParamGradients = fp16Params; }
+    }
+
+    /// <summary>
+    /// Optimizer-agnostic mixed forward + scaled backward that returns BOTH the FP32-master-param
+    /// gradients AND the FP16 STORAGE-weight gradients (the latter up-cast to FP32 and unscaled). This is
+    /// the surface for fp16 WEIGHT storage with fp32 masters — the weight-memory win on top of fp16
+    /// activations: the caller keeps each fp16 weight's fp32 master (e.g. in <see cref="MasterWeights"/>),
+    /// applies any optimizer to the master using the returned grad, and casts the master back into the
+    /// fp16 storage. Loss-scaling + skip-on-overflow match <see cref="ComputeGradients(IReadOnlyList{Tensor{float}},GradScaler)"/>:
+    /// the backward seed is loss-scaled and grads are unscaled in FP32; on overflow
+    /// <see cref="MixedGradientResult.FoundInfNan"/> is true and the caller MUST skip its update. One
+    /// forward + one backward. The plan output must be the scalar loss.
+    /// </summary>
+    public MixedGradientResult ComputeGradients(
+        IReadOnlyList<Tensor<float>> fp32Parameters,
+        IReadOnlyList<Tensor<Half>> fp16Parameters,
+        GradScaler? scaler = null)
+    {
+        if (fp32Parameters is null) throw new ArgumentNullException(nameof(fp32Parameters));
+        if (fp16Parameters is null) throw new ArgumentNullException(nameof(fp16Parameters));
+
+        Forward();
+        float loss = _output.Length > 0 ? _output.ToArray()[0] : 0f;
+
+        float scale = scaler?.Scale ?? 1f;
+        var grads = RunBackward(scale);
+        float invScale = 1f / scale;
+
+        bool infNan = false;
+
+        var fp32Grads = new Tensor<float>?[fp32Parameters.Count];
+        for (int i = 0; i < fp32Parameters.Count; i++)
+        {
+            if (!grads.Fp32.TryGetValue(fp32Parameters[i], out var g)) continue;
+            var span = g.AsWritableSpan();
+            for (int k = 0; k < span.Length; k++)
+            {
+                span[k] *= invScale;
+                if (float.IsNaN(span[k]) || float.IsInfinity(span[k])) infNan = true;
+            }
+            fp32Grads[i] = g;
+        }
+
+        // FP16 storage params: up-cast the (loss-scaled) Half grad to FP32 and unscale, so the master
+        // update never sees a Half-range value. A Half grad that overflowed during backward surfaces as
+        // Inf here and trips the overflow flag — same skip-on-overflow contract as the FP32 path.
+        var fp16Grads = new Tensor<float>?[fp16Parameters.Count];
+        for (int i = 0; i < fp16Parameters.Count; i++)
+        {
+            if (!grads.Fp16.TryGetValue(fp16Parameters[i], out var gh)) continue;
+            var hs = gh.AsSpan();
+            var f = new Tensor<float>(gh._shape);
+            var fsp = f.AsWritableSpan();
+            for (int k = 0; k < fsp.Length; k++)
+            {
+                float v = (float)hs[k] * invScale;
+                if (float.IsNaN(v) || float.IsInfinity(v)) infNan = true;
+                fsp[k] = v;
+            }
+            fp16Grads[i] = f;
+        }
+
+        scaler?.Update(infNan);
+        return new MixedGradientResult(loss, infNan, fp32Grads, fp16Grads);
+    }
+
+    /// <summary>
+    /// One compiled mixed-precision SGD step that updates BOTH FP32 master params (in place) AND FP16
+    /// STORAGE-weight params via their FP32 masters in <paramref name="masters"/>: each fp16 weight's
+    /// loss-unscaled grad is up-cast to FP32, the SGD update lands on the fp32 master, and the master is
+    /// cast back into the fp16 storage. This realizes the fp16 WEIGHT-memory win (half the weight bytes)
+    /// without the precision loss of accumulating tiny SGD updates directly in fp16. Every fp16 param must
+    /// be <see cref="MasterWeights.Register"/>ed first. Loss scaling + skip-on-overflow as in
+    /// <see cref="Step(IReadOnlyList{Tensor{float}},float,GradScaler)"/>.
+    /// </summary>
+    public StepResult Step(
+        IReadOnlyList<Tensor<float>> fp32Parameters,
+        IReadOnlyList<Tensor<Half>> fp16Parameters,
+        MasterWeights masters,
+        float learningRate,
+        GradScaler? scaler = null)
+    {
+        if (fp32Parameters is null) throw new ArgumentNullException(nameof(fp32Parameters));
+        if (fp16Parameters is null) throw new ArgumentNullException(nameof(fp16Parameters));
+        if (masters is null) throw new ArgumentNullException(nameof(masters));
+
+        var res = ComputeGradients(fp32Parameters, fp16Parameters, scaler);
+        if (res.FoundInfNan) return new StepResult(res.Loss, true);
+
+        for (int i = 0; i < fp32Parameters.Count; i++)
+        {
+            var g = res.Fp32Gradients[i];
+            if (g is null) continue;
+            var w = fp32Parameters[i].AsWritableSpan();
+            var gs = g.AsSpan();
+            for (int k = 0; k < w.Length; k++) w[k] -= learningRate * gs[k];
+            fp32Parameters[i].IncrementVersion();
+        }
+
+        for (int i = 0; i < fp16Parameters.Count; i++)
+        {
+            var g = res.Fp16ParamGradients[i];
+            if (g is null) continue;
+            var param = fp16Parameters[i];
+            var garr = g.ToArray(); // float[] — Span can't be captured in the master-update lambdas
+            float lr = learningRate;
+            masters.UpdateMaster(param,
+                master => { int n = Math.Min(master.Length, garr.Length); for (int k = 0; k < n; k++) master[k] -= lr * garr[k]; },
+                master =>
+                {
+                    var w = param.AsWritableSpan();
+                    int n = Math.Min(w.Length, master.Length);
+                    for (int k = 0; k < n; k++) w[k] = (Half)master[k];
+                    param.IncrementVersion();
+                });
+        }
+
+        return new StepResult(res.Loss, false);
+    }
+
     private static void RunForward(ILazyNode node, IEngine eng)
     {
         switch (node)
