@@ -1581,6 +1581,26 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         long strideB = (long)K * N;
         long strideC = (long)M * N;
 
+        // PR #638: cublasSgemmStridedBatched is NOT stream-capture-safe — inside a CUDA-graph capture it returns a
+        // CUBLAS "Internal error" (the #38 attention-BMM blocker that invalidated whole-step capture at the
+        // Softmax/attention frontier). Under capture, issue `batchCount` SEQUENTIAL cublasSgemm calls on _stream
+        // (each is capturable); the strided-batched fast path stays for the non-captured (eager) steps where it
+        // saturates the SMs. Same arg order as the strided call and BatchedGemmFanout's per-slice cublasSgemm.
+        if (IsStreamCapturing())
+        {
+            for (int b = 0; b < batchCount; b++)
+            {
+                IntPtr aP = (IntPtr)((long)A.Handle + b * strideA * sizeof(float));
+                IntPtr bP = (IntPtr)((long)B.Handle + b * strideB * sizeof(float));
+                IntPtr cP = (IntPtr)((long)C.Handle + b * strideC * sizeof(float));
+                CuBlasNative.CheckCublasStatus(
+                    CuBlasNative.cublasSgemm(_cublasHandle, CublasOperation.None, CublasOperation.None,
+                        N, M, K, ref alphaVal, bP, N, aP, K, ref betaVal, cP, N),
+                    $"cublasSgemm(capture-sequential batch {b})");
+            }
+            return;
+        }
+
         CuBlasNative.CheckCublasStatus(
             CuBlasNative.cublasSgemmStridedBatched(
                 _cublasHandle,
