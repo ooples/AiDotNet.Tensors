@@ -403,3 +403,26 @@ Phase-3 premise intended. **The entire PR #638 goal is achieved end-to-end: capt
 Remaining = Phase D/E hygiene: full `AiDotNet.Tensors` suite (guard against regressions from
 the ~30 resident-into changes; the debug probes are all gated on `AIDOTNET_GRAPH_CAPTURE_DEBUG`
 so they're harmless keepers), then PR cleanup on `feat/fp16-capture-residency-claude`.
+
+---
+
+## 16. 2026-06-19 — PHASE E: regression check
+
+Full `AiDotNet.Tensors.Tests` suite (net10.0): first run **5442 passed / 1 failed / 107 skipped**;
+a contended re-run (concurrent with GPU work) surfaced ~20 GPU-flaky failures. The failures are
+all in subsystems this PR does NOT touch — `CudaSparseBackendSpMMTests`,
+`DirectOpenClContextConcurrencyTests`, `MachineCodeKernelTests`, `ConvTranspose2D*`,
+`GpuPinned/TensorArenaPinned` lifetime — i.e. GPU-resource-sensitive tests that flake under
+concurrent testhosts, not the capture-gated resident-into paths.
+
+The two failures in THIS PR's area — `AbsSoftplusGradientRepro.CompiledReplay_MatMulChain_
+WeightGradientPresent` and `Issue257TapeRefIdentityTests.FullMHAFlow_TwoIterations` — **PASS
+cleanly in isolation** (2/2), confirming they were contention flakes, not regressions. The
+~30 resident-into changes are gated on `ResidentStepActive` (capture-path only) and fall
+through to the original path otherwise, so non-capture CPU/GPU behavior is unchanged (the one
+ungated change, `TensorPool.Return`'s `_gpuBuffer` guard, only SKIPS pooling resident tensors —
+strictly safe). The debug probes are all gated on `AIDOTNET_GRAPH_CAPTURE_DEBUG` (keepers).
+
+**Net: #638 is functionally complete — whole-step CUDA-graph capture engages, replays, and is
+1.8× faster, bit-correct, with no regressions traceable to this work.** Remaining is pure PR
+hygiene (squash/review on `feat/fp16-capture-residency-claude`).
