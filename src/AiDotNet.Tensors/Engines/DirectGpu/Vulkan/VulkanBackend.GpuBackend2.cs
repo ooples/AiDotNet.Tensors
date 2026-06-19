@@ -8,6 +8,26 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 
 public sealed unsafe partial class VulkanBackend
 {
+    // Shared dispatch for the conv/pool GLSL kernels (issue #646): compile-or-cache the pipeline, bind the SSBOs,
+    // push the int params, and launch a 1D grid over `threads` output elements. Returns false when the pipeline
+    // could not be built (no libshaderc at runtime) so the caller falls back to the CPU reference. Mirrors the
+    // DispatchUnary pattern. NOTE: validated only on a Vulkan runner — the dev box has no libshaderc.
+    private bool TryDispatchConvPoolGlsl(string glsl, uint[] pushInts, int threads, params IGpuBuffer[] buffers)
+    {
+        if (threads <= 0) return false;
+        var pipeline = GetOrCreateGlslPipeline(glsl, buffers.Length, (uint)(pushInts.Length * sizeof(uint)));
+        if (pipeline is null) return false;
+        var storages = new VulkanBuffer[buffers.Length];
+        for (int i = 0; i < buffers.Length; i++) storages[i] = AsVulkan(buffers[i]).Storage;
+        var threadRes = _device.AcquireThreadResources();
+        lock (_computeLock)
+        {
+            pipeline.UpdateDescriptorSet(storages);
+            RecordAndExecuteWithPushData(pipeline, threads, pushInts, (uint)(pushInts.Length * sizeof(uint)), threadRes);
+        }
+        return true;
+    }
+
     #region Convolution Operations
 
     public void Conv2D(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer output,
@@ -907,6 +927,20 @@ void main() {
         int strideH, int strideW, int padH, int padW)
     {
         EnsureInitialized();
+        try
+        {
+            // GPU path requires the indices SSBO (binding 2). When the caller wants no indices, use the CPU path.
+            if (indices is not null)
+            {
+                int total = batch * channels * outHeight * outWidth;
+                var pc = new uint[] { (uint)batch, (uint)channels, (uint)inHeight, (uint)inWidth,
+                    (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW,
+                    (uint)strideH, (uint)strideW, (uint)padH, (uint)padW };
+                if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.MaxPool2D, pc, total, input, output, indices)) return;
+            }
+        }
+        catch { /* fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         var outp = new float[batch * channels * outHeight * outWidth];
         float[]? idx = indices is not null ? new float[batch * channels * outHeight * outWidth] : null;
@@ -968,6 +1002,16 @@ void main() {
         int strideH, int strideW, int padH, int padW, bool countIncludePad)
     {
         EnsureInitialized();
+        try
+        {
+            int total = batch * channels * outHeight * outWidth;
+            var pc = new uint[] { (uint)batch, (uint)channels, (uint)inHeight, (uint)inWidth,
+                (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW,
+                (uint)strideH, (uint)strideW, (uint)padH, (uint)padW, (uint)(countIncludePad ? 1 : 0) };
+            if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.AvgPool2D, pc, total, input, output)) return;
+        }
+        catch { /* fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         var outp = new float[batch * channels * outHeight * outWidth];
         for (int b = 0; b < batch; b++)
@@ -999,6 +1043,16 @@ void main() {
         int strideH, int strideW, int padH, int padW, bool countIncludePad)
     {
         EnsureInitialized();
+        try
+        {
+            int total = batch * channels * inHeight * inWidth;
+            var pc = new uint[] { (uint)batch, (uint)channels, (uint)inHeight, (uint)inWidth,
+                (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW,
+                (uint)strideH, (uint)strideW, (uint)padH, (uint)padW, (uint)(countIncludePad ? 1 : 0) };
+            if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.AvgPool2DBackward, pc, total, gradOutput, gradInput)) return;
+        }
+        catch { /* fall through to CPU reference */ }
+
         var go = DownloadBuffer(gradOutput);
         var gi = new float[batch * channels * inHeight * inWidth];
         for (int b = 0; b < batch; b++)
