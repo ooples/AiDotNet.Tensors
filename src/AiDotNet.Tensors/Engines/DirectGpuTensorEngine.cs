@@ -4215,8 +4215,38 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         base.GroupNormInto(output, input, numGroups, gamma, beta, epsilon, out mean, out variance);
     }
 
+    /// <summary>GPU-RESIDENT last-axis softmax for the compiled step: read the resident input buffer and write
+    /// into the destination's stable buffer — no input upload, no output download (both abort CUDA-graph capture;
+    /// the host SoftmaxInto's DownloadIntoTensor was the forwardAction#25 capture-invalidator). Last-axis only.</summary>
+    internal bool TrySoftmaxResidentInto<T>(Tensor<T> output, Tensor<T> input, int axis)
+    {
+        if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
+        if (!TryGetBackend(out var backend) || !input.IsContiguous || input.Length != output.Length) return false;
+        int rank = input.Rank;
+        int eff = axis < 0 ? rank + axis : axis;
+        if (eff != rank - 1) return false;                       // last-axis only
+        int features = input.Shape._dims[rank - 1];
+        if (features <= 0 || input.Length % features != 0) return false;
+        int outerSize = input.Length / features;
+        try
+        {
+            using var bufIn = GetResidentOrPersistentInputBuffer(backend, input);
+            var outBuf = GetOrCreateResidentBuffer(backend, output, input.Length);
+            if (bufIn.Buffer.Handle == System.IntPtr.Zero || bufIn.Buffer.Size < input.Length
+                || outBuf.Handle == System.IntPtr.Zero || outBuf.Size < input.Length) return false;
+            backend.Softmax(bufIn.Buffer, outBuf, outerSize, features);
+            ResidentSyncCheck("Softmax");
+            BindResidentBuffer(output, outBuf, backend);
+            return true;
+        }
+        catch (Exception sex) { AliasDiag($"Softmax-resident FELLBACK in=[{string.Join(",", input._shape)}] axis={axis}: {sex.GetType().Name}: {sex.Message}"); return false; }
+    }
+
     void IEngine.SoftmaxInto<T>(Tensor<T> destination, Tensor<T> input, int axis)
     {
+        // GPU-RESIDENT compiled-step path first (no upload/download → capture-safe). Falls through to the
+        // upload+compute+download path below when not on the resident step or not last-axis.
+        if (TrySoftmaxResidentInto(destination, input, axis)) return;
         // Try GPU softmax: upload input, compute on GPU, download to destination
         if (TryGetBackend(out var gpuBackend))
         {
