@@ -229,3 +229,42 @@ grads MUST be computed resident *inside* the captured backward. A1 =
 `aField/aCache/bField` Handle+size for every resident-step in-place grad-accum — re-run
 with `AIDOTNET_RESIDENT_INPLACE=1 AIDOTNET_GRAPH_CAPTURE_DEBUG=1` to watch A1 turn the
 nulls into resident handles.
+
+---
+
+## 11. STATUS 2026-06-19 (cont.) — A1 BACKWARD RESIDENCY: 47/78 grads resident
+
+The A1 backward-residency frontier is being worked exactly like the forward: each
+op that produces a non-resident gradient is given a resident path, verified by the
+`accumgrad` probe (`AIDOTNET_GRAPH_CAPTURE_DEBUG=1` → `gradRes`/`existRes` per site).
+
+**Done (resident backward grad sites 7 → 47 of 78):**
+- **Accumulators (foundation, dce5638):** `EnsureResidentBuffer` binds a stable resident
+  GPU buffer to every pre-allocated `gradMap` accumulator in the not-capturing pre-pass →
+  `existRes=True` in all 78 sites (the generic backward accumulates into `gradMap[input]`
+  in place; memset-on-device each step).
+- **Incoming grads (the producing op binds its output resident):**
+  - elementwise `TensorAdd/Subtract/Multiply` — `TryBinaryResidentOutOfPlace` (4f0dbc2)
+  - `Reshape` view → propagate input's resident buffer (`ResolveResidentBufferNoUpload`, b55c261)
+  - `TensorMatMul` GEMM → `TryMatMulResident` (ND×2D + 2D×2D) + `TensorMultiplyScalar` (10a0c7d)
+  - `TensorPermute` → on-GPU materialize to contiguous resident (5259b4e)
+
+**Remaining (31 non-resident grad sites) — the FUSED-BACKWARD + reduction/transpose family:**
+- `FusedLinearReluBackward` / `FusedLinearBackward` (8): CPU fast-paths gated on
+  `GradientTape.Current is null` read `GetDataArray()` (download during replay). Engine
+  fallback (`fusedReluFallback:`) uses `ReluBackward` / `TransposeLastTwoDims` / `TensorMatMul`
+  (resident ✓) / `ReduceSum`. To flip: gate the fast-path off when the resident step is
+  active AND make the fallback sub-ops resident.
+- `LayerNormBackward` (6): same shape — custom backward, needs a GPU-resident path.
+- `ReduceSum`, `TensorTranspose`, `ReluBackward` (NO DirectGpu override today): the shared
+  sub-ops the fused fallbacks need; making these resident-into unblocks both FusedLinear
+  and LayerNorm at once — do these FIRST.
+- `TensorMatMul` (4): inputs not yet resident (a saved forward activation isn't resident) —
+  resolves once its producer is resident (dependency, not a new op).
+- `TensorSliceAxis` (1, view), `TensorLog` (1), `TensorEmbeddingLookupFromFloatIndices` (1).
+
+**Method that's working:** add the resident path, swap the DLL, re-run `capture_health.sh`,
+read the `accumgrad` producer histogram (`op=… gradRes=False`), fix the top producer, repeat.
+Every increment keeps `test Passed` + CAND C correct. The `TryMatMulResident` /
+`TryBinaryResidentOutOfPlace` / `ResolveResidentBufferNoUpload` / `EnsureResidentBuffer`
+helpers are the reusable primitives; the remaining ops follow the same shape.
