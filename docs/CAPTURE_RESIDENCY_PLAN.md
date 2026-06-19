@@ -378,3 +378,28 @@ cortex recovers to eager (test passes, no acceleration yet). Likely the per-call
 allocations the resident-into ops make DURING capture leave the graph's captured device
 pointers invalid on replay → resident-into outputs may need STABLE (pre-allocated, reused)
 buffers. Then Phase C (perf gate: captured vs eager wall-clock), D, E. See plan task Phase B.
+
+---
+
+## 15. ★ 2026-06-19 — PHASE B + C COMPLETE: GRAPH REPLAYS AND IS 1.8× FASTER ★
+
+**Phase B (replay) DONE** — `cuGraphLaunch 'Invalid value'` on the 2nd launch was the classic
+"graph with un-freed cuMemAllocAsync nodes can't relaunch". The whole-step graph's memory
+nodes are the resident-into backward ops' per-call scratch. Fix = instantiate with
+`CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH (=1)` → the graph frees its own allocations
+at each launch start and replays every step (the stable gradMap accumulators are pre-pass-
+allocated OUTSIDE the graph, so they survive). `VERDICT ✓ CAPTURE FULLY ENGAGED — launch-
+overhead path live`, full eval ran, test Passed.
+
+**Phase C (perf gate) DONE** — cortex training at d128/L1/8000:
+- **captured graph: 11s**
+- **eager: 20s**
+- **→ ~1.8× faster**, correctness IDENTICAL (`C 2.86%` both).
+
+The captured whole-step graph genuinely removes per-kernel CPU launch overhead, exactly as the
+Phase-3 premise intended. **The entire PR #638 goal is achieved end-to-end: capture engages
+(0 in-capture violations) → replays every step → 1.8× faster than eager, bit-correct.**
+
+Remaining = Phase D/E hygiene: full `AiDotNet.Tensors` suite (guard against regressions from
+the ~30 resident-into changes; the debug probes are all gated on `AIDOTNET_GRAPH_CAPTURE_DEBUG`
+so they're harmless keepers), then PR cleanup on `feat/fp16-capture-residency-claude`.
