@@ -9838,6 +9838,25 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     finally { hgOwned?.Dispose(); hoOwned?.Dispose(); if (!ok) hOut?.Dispose(); }
                 }
 
+                // PR #638 A1: resident-step softmax backward into a resident-bound output (no temp/download).
+                if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float)
+                    && gradOutput.Length == output.Length)
+                {
+                    var gR = ResolveResidentBufferNoUpload(backend, gradOutput, output.Length);
+                    var oR = ResolveResidentBufferNoUpload(backend, output, output.Length);
+                    if (gR is not null && oR is not null)
+                    {
+                        var rOut = new Tensor<T>(new T[output.Length], output.Shape.ToArray());
+                        var giBuf = GetOrCreateResidentBuffer(backend, rOut, output.Length);
+                        if (giBuf.Handle != System.IntPtr.Zero && giBuf.Size >= output.Length)
+                        {
+                            backend.SoftmaxBackward(gR, oR, giBuf, outerSize, features);
+                            ResidentSyncCheck("SoftmaxBackwardResident");
+                            BindResidentBuffer(rOut, giBuf, backend);
+                            return rOut;
+                        }
+                    }
+                }
                 using var gradOutBuffer = GetOrAllocateBuffer(backend, gradOutput);
                 using var outputBuffer = GetOrAllocateBuffer(backend, output);
                 using var gradInputBuffer = AllocateOutputBuffer(backend, output.Length);
@@ -10543,6 +10562,50 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     hgOwned?.Dispose(); hiOwned?.Dispose(); hgamOwned?.Dispose();
                     meanBuf?.Dispose(); invVarBuf?.Dispose();
                     if (!ok) { giOut?.Dispose(); ggOut?.Dispose(); gbOut?.Dispose(); }
+                }
+            }
+
+            // PR #638 A1: resident-step LayerNorm backward — all 3 grads (gradInput/gradGamma/gradBeta) into
+            // resident-bound outputs, invVar computed on-GPU (AddScalar + RsqrtKernel), no host download/upload.
+            // Inputs resolved no-upload (capture-safe); mean/variance come from the forward's resident scratch.
+            if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float))
+            {
+                var gR = ResolveResidentBufferNoUpload(backend, gradOutput, input.Length);
+                var iR = ResolveResidentBufferNoUpload(backend, input, input.Length);
+                var gamR = ResolveResidentBufferNoUpload(backend, gamma, normalizedSize);
+                var meanR = ResolveResidentBufferNoUpload(backend, mean, batchSize);
+                var varR = ResolveResidentBufferNoUpload(backend, variance, batchSize);
+                if (gR is not null && iR is not null && gamR is not null && meanR is not null && varR is not null)
+                {
+                    IGpuBuffer? invVarBuf = null;
+                    try
+                    {
+                        invVarBuf = backend.AllocateBuffer(batchSize);
+                        if (invVarBuf is not null && invVarBuf.Handle != System.IntPtr.Zero)
+                        {
+                            backend.AddScalar(varR, invVarBuf, (float)epsilon, batchSize);
+                            backend.RsqrtKernel(invVarBuf, invVarBuf, batchSize);
+                            var giT = new Tensor<T>(new T[input.Length], input.Shape.ToArray());
+                            var ggT = new Tensor<T>(new T[normalizedSize], gamma.Shape.ToArray());
+                            var gbT = new Tensor<T>(new T[normalizedSize], gamma.Shape.ToArray());
+                            var giBuf = GetOrCreateResidentBuffer(backend, giT, input.Length);
+                            var ggBuf = GetOrCreateResidentBuffer(backend, ggT, normalizedSize);
+                            var gbBuf = GetOrCreateResidentBuffer(backend, gbT, normalizedSize);
+                            if (giBuf.Handle != System.IntPtr.Zero && ggBuf.Handle != System.IntPtr.Zero && gbBuf.Handle != System.IntPtr.Zero)
+                            {
+                                backend.LayerNormBackward(gR, iR, gamR, meanR, invVarBuf, giBuf, ggBuf, gbBuf,
+                                    batchSize, normalizedSize, (float)epsilon);
+                                ResidentSyncCheck("LayerNormBackwardResident");
+                                BindResidentBuffer(giT, giBuf, backend);
+                                BindResidentBuffer(ggT, ggBuf, backend);
+                                BindResidentBuffer(gbT, gbBuf, backend);
+                                gradGamma = ggT; gradBeta = gbT;
+                                return giT;
+                            }
+                        }
+                    }
+                    catch (Exception ex) { AliasDiag($"LayerNormBackward-resident FELLBACK: {ex.GetType().Name}: {ex.Message}"); }
+                    finally { invVarBuf?.Dispose(); }
                 }
             }
 
