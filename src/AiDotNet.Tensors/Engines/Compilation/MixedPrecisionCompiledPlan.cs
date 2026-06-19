@@ -729,16 +729,31 @@ public sealed class MixedPrecisionCompiledPlan
         {
             var g = res.Fp16ParamGradients[i];
             if (g is null) continue;
+            int idx = i;
             var param = fp16Parameters[i];
             var garr = g.ToArray(); // float[] — Span can't be captured in the master-update lambdas
             float lr = learningRate;
+            // The gradient, the fp32 master, and the fp16 storage for a parameter must all have the
+            // SAME element count — a mismatch means the wrong master was registered (or a stale param),
+            // which would silently corrupt training, so fail loudly instead of truncating to the min.
+            if (garr.Length != param.Length)
+                throw new InvalidOperationException(
+                    $"Mixed-precision Step: gradient length {garr.Length} != fp16 parameter length {param.Length} (param index {idx}).");
             masters.UpdateMaster(param,
-                master => { int n = Math.Min(master.Length, garr.Length); for (int k = 0; k < n; k++) master[k] -= lr * garr[k]; },
+                master =>
+                {
+                    if (master.Length != garr.Length)
+                        throw new InvalidOperationException(
+                            $"Mixed-precision Step: fp32 master length {master.Length} != gradient length {garr.Length} (param index {idx}) — register each fp16 param's master with its own length.");
+                    for (int k = 0; k < master.Length; k++) master[k] -= lr * garr[k];
+                },
                 master =>
                 {
                     var w = param.AsWritableSpan();
-                    int n = Math.Min(w.Length, master.Length);
-                    for (int k = 0; k < n; k++) w[k] = (Half)master[k];
+                    if (w.Length != master.Length)
+                        throw new InvalidOperationException(
+                            $"Mixed-precision Step: fp16 storage length {w.Length} != fp32 master length {master.Length} (param index {idx}).");
+                    for (int k = 0; k < w.Length; k++) w[k] = (Half)master[k];
                     param.IncrementVersion();
                 });
         }
