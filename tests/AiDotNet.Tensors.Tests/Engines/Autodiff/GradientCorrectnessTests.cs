@@ -653,6 +653,59 @@ public class GradientCorrectnessTests : IDisposable
     }
 
     /// <summary>
+    /// SCALING + RESIDUAL: four segments (segmentSize=1) where each segment is a residual block
+    /// inp => inp + FusedLinear(inp, w, b) — the shape of a transformer sub-layer. Verifies the
+    /// detach-per-segment fix scales beyond two segments and handles a segment whose input feeds BOTH
+    /// the residual add and the linear (the segment input appears twice in the local graph).
+    /// </summary>
+    [Fact]
+    public void Checkpoint_FourSegment_ResidualFusedLinear_MatchEager()
+    {
+        Tensor<float> MakeFilled(int[] shape, float start, float step)
+        {
+            var t = new Tensor<float>(shape);
+            for (int i = 0; i < t.Length; i++) t[i] = start + step * i;
+            return t;
+        }
+
+        var x = MakeFilled([2, 4], -0.4f, 0.05f);
+        var ws = new Tensor<float>[4];
+        var bs = new Tensor<float>[4];
+        var segs = new Func<Tensor<float>, Tensor<float>>[4];
+        for (int s = 0; s < 4; s++)
+        {
+            var w = MakeFilled([4, 4], -0.3f + 0.02f * s, 0.01f);
+            var b = MakeFilled([4], 0.05f, 0.01f);
+            ws[s] = w; bs[s] = b;
+            segs[s] = inp => _engine.TensorAdd(inp, _engine.FusedLinear(inp, w, b, FusedActivationType.None));
+        }
+        var outW = MakeFilled([2, 4], 0.1f, 0.02f);
+
+        System.Collections.Generic.Dictionary<Tensor<float>, Tensor<float>> Run(bool checkpoint)
+        {
+            using var tape = new GradientTape<float>();
+            Tensor<float> o;
+            if (checkpoint) o = GradientCheckpointing<float>.Checkpoint(segs, x, segmentSize: 1);
+            else { o = x; foreach (var s in segs) o = s(o); }
+            var loss = _engine.ReduceSum(_engine.TensorMultiply(o, outW));
+            var srcs = new System.Collections.Generic.List<Tensor<float>> { x };
+            srcs.AddRange(ws); srcs.AddRange(bs);
+            return tape.ComputeGradients(loss, sources: srcs.ToArray());
+        }
+
+        var eager = Run(checkpoint: false);
+        var ckpt = Run(checkpoint: true);
+
+        Assert.True(ckpt.ContainsKey(x), "missing input grad");
+        for (int i = 0; i < eager[x].Length; i++) Assert.Equal(eager[x][i], ckpt[x][i], 3);
+        for (int s = 0; s < 4; s++)
+        {
+            for (int i = 0; i < eager[ws[s]].Length; i++) Assert.Equal(eager[ws[s]][i], ckpt[ws[s]][i], 3);
+            for (int i = 0; i < eager[bs[s]].Length; i++) Assert.Equal(eager[bs[s]][i], ckpt[bs[s]][i], 3);
+        }
+    }
+
+    /// <summary>
     /// MULTI-SEGMENT FusedLinear regression: two FusedLinear segments checkpointed with segmentSize=1
     /// (two separate segments) — the shape of a checkpointed two-DenseLayer stack. Every parameter's
     /// gradient (and the input's) must equal the eager run's. Guards the cross-segment defect where the
