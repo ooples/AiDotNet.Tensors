@@ -4143,14 +4143,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private bool TryUnaryResidentInto<T>(Tensor<T> output, Tensor<T> input,
         System.Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, int> kernel, string opName)
     {
-        if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
-        if (!TryGetBackend(out var backend) || !input.IsContiguous || input.Length != output.Length) return false;
+        if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float))
+        { AliasDiag($"{opName}-resident SKIP gate1 residentStep={ResidentStepActive} autocast={Gpu.AutocastScope.IsEnabled} T={typeof(T).Name}"); return false; }
+        if (!TryGetBackend(out var backend) || !input.IsContiguous || input.Length != output.Length)
+        { AliasDiag($"{opName}-resident SKIP gate2 contig={input.IsContiguous} inLen={input.Length} outLen={output.Length}"); return false; }
         try
         {
             using var inBuf = GetResidentOrPersistentInputBuffer(backend, input);
             var outBuf = GetOrCreateResidentBuffer(backend, output, input.Length);
             if (inBuf.Buffer.Handle == System.IntPtr.Zero || inBuf.Buffer.Size < input.Length
-                || outBuf.Handle == System.IntPtr.Zero || outBuf.Size < input.Length) return false;
+                || outBuf.Handle == System.IntPtr.Zero || outBuf.Size < input.Length)
+            { AliasDiag($"{opName}-resident SKIP gate3 inH={(long)inBuf.Buffer.Handle:X} inSz={inBuf.Buffer.Size} outH={(long)outBuf.Handle:X} outSz={outBuf.Size} need={input.Length}"); return false; }
             kernel(backend, inBuf.Buffer, outBuf, input.Length);
             ResidentSyncCheck(opName);
             BindResidentBuffer(output, outBuf, backend);
@@ -14735,6 +14738,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorNegate<T>(Tensor<T> tensor)
     {
+        // GPU-RESIDENT compiled-step path: negate into a stable resident buffer, no download (the host TryRunUnary
+        // download aborted capture at the cross-entropy -log(p)). Records the backward exactly as the eager path.
+        if (typeof(T) == typeof(float))
+        {
+            var resOut = new Tensor<T>(new T[tensor.Length], tensor.Shape._dims);
+            if (TryUnaryResidentInto(resOut, tensor, static (be, i, o, n) => be.Negate(i, o, n), "Negate"))
+            {
+                Autodiff.DifferentiableOps.RecordUnary("TensorNegate", resOut, tensor, Autodiff.BackwardFunctions<T>.NegateBackward);
+                return resOut;
+            }
+        }
         try
         {
             var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Negate(input, output, size));
