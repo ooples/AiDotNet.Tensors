@@ -4166,6 +4166,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         result.Data.Span.CopyTo(dest.Data.Span);
     }
 
+    /// <summary>GPU-resident elementwise log into the destination's stable buffer (the cross-entropy loss's log
+    /// was the post-forward capture frontier — the host TensorLogInto downloads). Falls to base off the resident
+    /// step. Override (not explicit-interface) because the compiled loss builder calls TensorLogInto concretely.</summary>
+    public override void TensorLogInto<T>(Tensor<T> destination, Tensor<T> input)
+    {
+        if (TryUnaryResidentInto(destination, input, static (be, i, o, n) => be.Log(i, o, n), "Log")) return;
+        base.TensorLogInto(destination, input);
+    }
+
     void IEngine.Conv2DInto<T>(Tensor<T> output, Tensor<T> input, Tensor<T> kernel, int stride, int padding, int dilation)
     {
         if (TryGetBackend(out var gpuBackend))

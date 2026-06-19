@@ -4641,7 +4641,9 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>Log into pre-allocated destination. Uses VML/SVML with parallel chunking.</summary>
-    public unsafe void TensorLogInto<T>(Tensor<T> destination, Tensor<T> input)
+    // virtual so the DirectGpu engine can override with a GPU-resident path (PR #638: the compiled loss builder
+    // calls this concretely via `cpuEng.TensorLogInto`, so an explicit-interface override would not be reached).
+    public virtual unsafe void TensorLogInto<T>(Tensor<T> destination, Tensor<T> input)
     {
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
         var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
