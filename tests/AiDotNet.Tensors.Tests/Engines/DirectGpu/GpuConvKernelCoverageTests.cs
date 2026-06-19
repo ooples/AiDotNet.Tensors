@@ -245,4 +245,55 @@ public sealed class GpuConvKernelCoverageTests : IDisposable
         AssertClose(dKc, dKg, "FlashAttentionBackward.dK");
         AssertClose(dVc, dVg, "FlashAttentionBackward.dV");
     }
+
+    // ---- Conv/pool family forward coverage (#646): these high-level engine ops dispatch to the backend
+    // conv/pool kernels, so on a Metal/Vulkan runner they gate the new MSL/GLSL kernels (and on OpenCL they
+    // confirm the shared math vs the CPU reference). ----
+    [SkippableFact]
+    public void Conv2D_Gpu_MatchesCpu()
+    {
+        SkipIfUnavailable();
+        var input = R(60, 1, 2, 6, 6);
+        var kernel = R(61, 3, 2, 3, 3); // [outC, inC, kH, kW]
+        int[] stride = { 1, 1 }, pad = { 1, 1 }, dil = { 1, 1 };
+        AssertClose(_cpu.Conv2D(input, kernel, stride, pad, dil),
+                    _gpu.Conv2D(input, kernel, stride, pad, dil), "Conv2D");
+    }
+
+    [SkippableFact]
+    public void Conv3D_Gpu_MatchesCpu()
+    {
+        SkipIfUnavailable();
+        var input = R(62, 1, 2, 4, 4, 4);
+        var kernel = R(63, 3, 2, 2, 2, 2); // [outC, inC, kD, kH, kW]
+        int[] stride = { 1, 1, 1 }, pad = { 0, 0, 0 }, dil = { 1, 1, 1 };
+        AssertClose(_cpu.Conv3D(input, kernel, stride, pad, dil),
+                    _gpu.Conv3D(input, kernel, stride, pad, dil), "Conv3D");
+    }
+
+    [SkippableFact]
+    public void GlobalAvgPool2D_Gpu_MatchesCpu()
+    {
+        SkipIfUnavailable();
+        var input = R(64, 2, 3, 5, 5);
+        AssertClose(_cpu.GlobalAvgPool2D(input), _gpu.GlobalAvgPool2D(input), "GlobalAvgPool2D");
+    }
+
+    [SkippableFact]
+    public void GlobalMaxPool2D_Gpu_MatchesCpu()
+    {
+        SkipIfUnavailable();
+        var input = R(65, 2, 3, 5, 5);
+        AssertClose(_cpu.GlobalMaxPool2D(input), _gpu.GlobalMaxPool2D(input), "GlobalMaxPool2D");
+    }
+
+    [SkippableFact]
+    public void MaxPool3D_Gpu_MatchesCpu()
+    {
+        SkipIfUnavailable();
+        var input = R(66, 1, 2, 4, 4, 4);
+        int[] pool = { 2, 2, 2 }, stride = { 2, 2, 2 }, pad = { 0, 0, 0 };
+        AssertClose(_cpu.MaxPool3D(input, pool, stride, pad),
+                    _gpu.MaxPool3D(input, pool, stride, pad), "MaxPool3D");
+    }
 }
