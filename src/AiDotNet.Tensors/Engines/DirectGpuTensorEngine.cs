@@ -10583,8 +10583,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                         invVarBuf = backend.AllocateBuffer(batchSize);
                         if (invVarBuf is not null && invVarBuf.Handle != System.IntPtr.Zero)
                         {
-                            backend.AddScalar(varR, invVarBuf, (float)epsilon, batchSize);
-                            backend.RsqrtKernel(invVarBuf, invVarBuf, batchSize);
+                            backend.AddScalar(varR, invVarBuf, (float)epsilon, batchSize); // var + eps
+                            backend.Sqrt(invVarBuf, invVarBuf, batchSize);                 // sqrt(var + eps)
+                            backend.Reciprocal(invVarBuf, invVarBuf, batchSize);           // 1/sqrt(var + eps) = invVar
                             var giT = new Tensor<T>(new T[input.Length], input.Shape.ToArray());
                             var ggT = new Tensor<T>(new T[normalizedSize], gamma.Shape.ToArray());
                             var gbT = new Tensor<T>(new T[normalizedSize], gamma.Shape.ToArray());
