@@ -11895,6 +11895,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (embeddingTable._gpuBuffer is not null && ReferenceEquals(embeddingTable._gpuBackend, backend)
             && IsCachedGpuBufferLive(embeddingTable, backend))
             return embeddingTable._gpuBuffer;
+        // The table is a PARAMETER; under resident params (AIDOTNET_GPU_RESIDENT_PARAMS) its device buffer lives
+        // as a WeightRegistry OffloadDevicePointer, NOT the _gpuBuffer field — TryGetGpuBuffer() finds it where the
+        // field check above misses. WITHOUT this we fall to GetOrCacheWeightBuffer, whose GetDataArray() key MISSES
+        // for a resident weight (fresh host array each call) → a cuMemAllocAsync EVERY call → a graph-purity
+        // violation (CUDA-906) that invalidates whole-step capture at forwardAction#0 (the capture-alloc trace
+        // pinned exactly this 7.5MB embedding-table alloc). The live resident buffer needs no alloc and no upload.
+        var resident = embeddingTable.TryGetGpuBuffer();
+        if (resident is not null && resident.Handle != System.IntPtr.Zero)
+        {
+            _cachedEmbTableBuffer = resident;
+            return resident;
+        }
         try
         {
             var owned = GetOrCacheWeightBuffer(backend, embeddingTable.GetDataArray(), PersistentTensorRole.Embeddings);
