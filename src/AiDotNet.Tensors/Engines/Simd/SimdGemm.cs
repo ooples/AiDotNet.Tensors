@@ -1147,10 +1147,24 @@ internal static partial class SimdGemm
 
     private static long ComputeParallelWorkThreshold()
     {
+        // Total FMA work (m*k*n) above which a single SGEMM fans its m-tiles out across the
+        // pool. The gate exists to amortize parallel-dispatch overhead — which is governed by
+        // the (now cheap, cooperative-pool) per-dispatch cost, so the bar is ~256K FMAs per
+        // core that would be woken.
+        //
+        // #653 Phase 1: the old clamp (max 20M) scaled UP with core count and, on a 16-32 core
+        // box, refused to parallelize ANY GEMM below ~20M FMAs. Diffusion/transformer forwards
+        // are dominated by GEMMs squarely in the 4-20M "dead zone" (e.g. a [256,256]x[256,256]
+        // projection = 16.7M), so those ran fully serial and left the box ~50% idle. Profiled
+        // on the #653 attention probe: dropping the cap to ~4M sped the dead-zone block +22%
+        // (cpuUtil 67%->77%) with no regression on larger blocks (their GEMMs were already
+        // above the bar). The 4M cap means even a 32-core box parallelizes the dead-zone, while
+        // the 1M floor keeps genuinely tiny GEMMs (per-head attention, 1x1 convs) serial so
+        // they don't pay dispatch for nothing. Override with AIDOTNET_GEMM_PARALLEL_MINWORK.
         int cores = Math.Max(1, Environment.ProcessorCount);
-        long scaled = (20L * 1024 * 1024 / 16) * cores;
-        if (scaled < 2L * 1024 * 1024) scaled = 2L * 1024 * 1024;
-        if (scaled > 20L * 1024 * 1024) scaled = 20L * 1024 * 1024;
+        long scaled = (256L * 1024) * cores;
+        if (scaled < 1L * 1024 * 1024) scaled = 1L * 1024 * 1024;
+        if (scaled > 4L * 1024 * 1024) scaled = 4L * 1024 * 1024;
         return scaled;
     }
 
