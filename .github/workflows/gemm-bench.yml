@@ -1,0 +1,75 @@
+name: GEMM small-M tiling bench (#653)
+
+# Validates the AIDOTNET_GEMM_SMALLM_TILING lever (small-M GEMM row-block
+# targeting, #653 / PR #654) before it is flipped default-on:
+#   * fails if it regresses any hand-tuned SgemmTiled shape past the tolerance,
+#   * reports the speedup on the transformer FFN/QKV shapes it targets.
+#
+# Manual-only: perf A/B is noisy on shared runners and the small-M win only
+# manifests on a many-core box (on <= ~8 cores the shapes aren't under-tiled,
+# so the lever no-ops). Point GEMM_BENCH_RUNNER at a large/self-hosted runner
+# (repo/org Actions variable) to validate the WIN; on ubuntu-latest the job
+# still validates the NO-REGRESSION gate.
+
+on:
+  workflow_dispatch:
+    inputs:
+      maxdop:
+        description: 'Max degree of parallelism (0 = all runner cores)'
+        required: false
+        default: '0'
+      reps:
+        description: 'Probe reps per measurement'
+        required: false
+        default: '60'
+      repeat:
+        description: 'Probe invocations per (shape, flag); min is kept'
+        required: false
+        default: '5'
+      tol:
+        description: 'Max allowed tuned-shape regression (fraction, e.g. 0.10)'
+        required: false
+        default: '0.10'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  DOTNET_NOLOGO: true
+
+jobs:
+  gemm-bench:
+    runs-on: ${{ vars.GEMM_BENCH_RUNNER || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+          dotnet-quality: 'preview'
+
+      - name: Build probe (Release)
+        run: dotnet build tools/ConvParallelProbe/ConvParallelProbe.csproj --configuration Release --framework net10.0
+
+      - name: Resolve maxdop
+        id: dop
+        run: |
+          DOP="${{ github.event.inputs.maxdop }}"
+          if [ "$DOP" = "0" ] || [ -z "$DOP" ]; then DOP="$(nproc)"; fi
+          echo "value=$DOP" >> "$GITHUB_OUTPUT"
+          echo "Using maxdop=$DOP on $(nproc)-core runner"
+
+      - name: GEMM A/B bench (gate)
+        run: |
+          PROBE="$(find tools/ConvParallelProbe/bin/Release -name ConvParallelProbe.dll | head -1)"
+          echo "probe=$PROBE"
+          python3 tools/ConvParallelProbe/gemm_bench.py \
+            --probe "$PROBE" \
+            --maxdop "${{ steps.dop.outputs.value }}" \
+            --reps "${{ github.event.inputs.reps }}" \
+            --repeat "${{ github.event.inputs.repeat }}" \
+            --tol "${{ github.event.inputs.tol }}"
