@@ -23,11 +23,32 @@ public sealed class GpuConvKernelCoverageTests : IDisposable
 
     public GpuConvKernelCoverageTests()
     {
-        try { _gpu = new DirectGpuTensorEngine(); _ready = _gpu.SupportsGpu; }
-        catch { _ready = false; }
+        // Only swallow the two exceptions that mean "no native GPU runtime on this host"
+        // (PlatformNotSupportedException / DllNotFoundException). A real GPU setup or kernel/module
+        // compilation regression MUST surface as a test failure, not get converted into an "unavailable"
+        // skip that hides the regression this suite exists to catch. Mirrors DetectionGpuParityTests.
+        try
+        {
+            _gpu = new DirectGpuTensorEngine();
+            _ready = _gpu.SupportsGpu;
+        }
+        catch (PlatformNotSupportedException) { _ready = false; }
+        catch (DllNotFoundException) { _ready = false; }
+
+        // Prove the GPU kernel ACTUALLY runs: make the conv/pool/attention catch blocks (here in the engine
+        // AND inside the Metal/Vulkan backends) rethrow instead of silently falling back to the CPU reference.
+        // Without this, a GPU kernel that threw would fall back to CPU and every GPU-vs-CPU assertion below
+        // would compare CPU-vs-CPU and trivially pass (false green) — the exact gap that left issue #622
+        // looking "fixed" without proof. The flag is [ThreadStatic], so set it only when a GPU is present and
+        // always clear it in Dispose so it never leaks into other test collections on this thread.
+        if (_ready) DirectGpuTensorEngine.ThrowOnGpuKernelFallback = true;
     }
 
-    public void Dispose() => _gpu?.Dispose();
+    public void Dispose()
+    {
+        DirectGpuTensorEngine.ThrowOnGpuKernelFallback = false;
+        _gpu?.Dispose();
+    }
 
     // Skip (visibly, via Xunit.SkipException) rather than silently `return` when
     // no GPU is present, so a failed/absent GPU setup shows as a skipped test
@@ -235,5 +256,56 @@ public sealed class GpuConvKernelCoverageTests : IDisposable
         AssertClose(dQc, dQg, "FlashAttentionBackward.dQ");
         AssertClose(dKc, dKg, "FlashAttentionBackward.dK");
         AssertClose(dVc, dVg, "FlashAttentionBackward.dV");
+    }
+
+    // ---- Conv/pool family forward coverage (#646): these high-level engine ops dispatch to the backend
+    // conv/pool kernels, so on a Metal/Vulkan runner they gate the new MSL/GLSL kernels (and on OpenCL they
+    // confirm the shared math vs the CPU reference). ----
+    [SkippableFact]
+    public void Conv2D_Gpu_MatchesCpu()
+    {
+        SkipIfUnavailable();
+        var input = R(60, 1, 2, 6, 6);
+        var kernel = R(61, 3, 2, 3, 3); // [outC, inC, kH, kW]
+        int[] stride = { 1, 1 }, pad = { 1, 1 }, dil = { 1, 1 };
+        AssertClose(_cpu.Conv2D(input, kernel, stride, pad, dil),
+                    _gpu.Conv2D(input, kernel, stride, pad, dil), "Conv2D");
+    }
+
+    [SkippableFact]
+    public void Conv3D_Gpu_MatchesCpu()
+    {
+        SkipIfUnavailable();
+        var input = R(62, 1, 2, 4, 4, 4);
+        var kernel = R(63, 3, 2, 2, 2, 2); // [outC, inC, kD, kH, kW]
+        int[] stride = { 1, 1, 1 }, pad = { 0, 0, 0 }, dil = { 1, 1, 1 };
+        AssertClose(_cpu.Conv3D(input, kernel, stride, pad, dil),
+                    _gpu.Conv3D(input, kernel, stride, pad, dil), "Conv3D");
+    }
+
+    [SkippableFact]
+    public void GlobalAvgPool2D_Gpu_MatchesCpu()
+    {
+        SkipIfUnavailable();
+        var input = R(64, 2, 3, 5, 5);
+        AssertClose(_cpu.GlobalAvgPool2D(input), _gpu.GlobalAvgPool2D(input), "GlobalAvgPool2D");
+    }
+
+    [SkippableFact]
+    public void GlobalMaxPool2D_Gpu_MatchesCpu()
+    {
+        SkipIfUnavailable();
+        var input = R(65, 2, 3, 5, 5);
+        AssertClose(_cpu.GlobalMaxPool2D(input), _gpu.GlobalMaxPool2D(input), "GlobalMaxPool2D");
+    }
+
+    [SkippableFact]
+    public void MaxPool3D_Gpu_MatchesCpu()
+    {
+        SkipIfUnavailable();
+        var input = R(66, 1, 2, 4, 4, 4);
+        int[] pool = { 2, 2, 2 }, stride = { 2, 2, 2 }, pad = { 0, 0, 0 };
+        AssertClose(_cpu.MaxPool3D(input, pool, stride, pad),
+                    _gpu.MaxPool3D(input, pool, stride, pad), "MaxPool3D");
     }
 }

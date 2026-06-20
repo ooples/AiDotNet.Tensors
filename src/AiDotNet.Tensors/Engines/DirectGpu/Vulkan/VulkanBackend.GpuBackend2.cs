@@ -8,6 +8,26 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 
 public sealed unsafe partial class VulkanBackend
 {
+    // Shared dispatch for the conv/pool GLSL kernels (issue #646): compile-or-cache the pipeline, bind the SSBOs,
+    // push the int params, and launch a 1D grid over `threads` output elements. Returns false when the pipeline
+    // could not be built (no libshaderc at runtime) so the caller falls back to the CPU reference. Mirrors the
+    // DispatchUnary pattern. NOTE: validated only on a Vulkan runner — the dev box has no libshaderc.
+    private bool TryDispatchConvPoolGlsl(string glsl, uint[] pushInts, int threads, params IGpuBuffer[] buffers)
+    {
+        if (threads <= 0) return false;
+        var pipeline = GetOrCreateGlslPipeline(glsl, buffers.Length, (uint)(pushInts.Length * sizeof(uint)));
+        if (pipeline is null) return false;
+        var storages = new VulkanBuffer[buffers.Length];
+        for (int i = 0; i < buffers.Length; i++) storages[i] = AsVulkan(buffers[i]).Storage;
+        var threadRes = _device.AcquireThreadResources();
+        lock (_computeLock)
+        {
+            pipeline.UpdateDescriptorSet(storages);
+            RecordAndExecuteWithPushData(pipeline, threads, pushInts, (uint)(pushInts.Length * sizeof(uint)), threadRes);
+        }
+        return true;
+    }
+
     #region Convolution Operations
 
     public void Conv2D(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer output,
@@ -18,6 +38,16 @@ public sealed unsafe partial class VulkanBackend
         int dilationH, int dilationW)
     {
         EnsureInitialized();
+        try
+        {
+            int total = batch * outChannels * outHeight * outWidth;
+            var pc = new uint[] { (uint)batch, (uint)inChannels, (uint)inHeight, (uint)inWidth,
+                (uint)outChannels, (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW,
+                (uint)strideH, (uint)strideW, (uint)padH, (uint)padW, (uint)dilationH, (uint)dilationW };
+            if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.Conv2D, pc, total, input, kernel, output)) return;
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         var ker = DownloadBuffer(kernel);
         var outp = new float[batch * outChannels * outHeight * outWidth];
@@ -50,6 +80,16 @@ public sealed unsafe partial class VulkanBackend
         int dilationH, int dilationW)
     {
         EnsureInitialized();
+        try
+        {
+            int total = batch * inChannels * inHeight * inWidth;
+            var pc = new uint[] { (uint)batch, (uint)inChannels, (uint)inHeight, (uint)inWidth,
+                (uint)outChannels, (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW,
+                (uint)strideH, (uint)strideW, (uint)padH, (uint)padW, (uint)dilationH, (uint)dilationW };
+            if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.Conv2DBackwardInput, pc, total, gradOutput, kernel, gradInput)) return;
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
+
         var go = DownloadBuffer(gradOutput);
         var ker = DownloadBuffer(kernel);
         var gi = new float[batch * inChannels * inHeight * inWidth];
@@ -81,6 +121,16 @@ public sealed unsafe partial class VulkanBackend
         int dilationH, int dilationW)
     {
         EnsureInitialized();
+        try
+        {
+            int total = outChannels * inChannels * kernelH * kernelW;
+            var pc = new uint[] { (uint)batch, (uint)inChannels, (uint)inHeight, (uint)inWidth,
+                (uint)outChannels, (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW,
+                (uint)strideH, (uint)strideW, (uint)padH, (uint)padW, (uint)dilationH, (uint)dilationW };
+            if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.Conv2DBackwardKernel, pc, total, input, gradOutput, gradKernel)) return;
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         var go = DownloadBuffer(gradOutput);
         var gk = new float[outChannels * inChannels * kernelH * kernelW];
@@ -137,6 +187,17 @@ public sealed unsafe partial class VulkanBackend
         int kernelH, int kernelW, int strideH, int strideW, int padH, int padW)
     {
         EnsureInitialized();
+        try
+        {
+            int oH = (height + 2 * padH - kernelH) / strideH + 1;
+            int oW = (width + 2 * padW - kernelW) / strideW + 1;
+            int total = batch * channels * kernelH * kernelW * oH * oW;
+            var pc = new uint[] { (uint)batch, (uint)channels, (uint)height, (uint)width,
+                (uint)kernelH, (uint)kernelW, (uint)strideH, (uint)strideW, (uint)padH, (uint)padW };
+            if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.Unfold, pc, total, input, output)) return;
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         int outH = (height + 2 * padH - kernelH) / strideH + 1;
         int outW = (width + 2 * padW - kernelW) / strideW + 1;
@@ -168,6 +229,15 @@ public sealed unsafe partial class VulkanBackend
         int kernelH, int kernelW, int strideH, int strideW, int padH, int padW)
     {
         EnsureInitialized();
+        try
+        {
+            int total = batch * channels * outputH * outputW;
+            var pc = new uint[] { (uint)batch, (uint)channels, (uint)outputH, (uint)outputW,
+                (uint)kernelH, (uint)kernelW, (uint)strideH, (uint)strideW, (uint)padH, (uint)padW };
+            if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.Fold, pc, total, input, output)) return;
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         int unfoldH = (outputH + 2 * padH - kernelH) / strideH + 1;
         int unfoldW = (outputW + 2 * padW - kernelW) / strideW + 1;
@@ -203,6 +273,17 @@ public sealed unsafe partial class VulkanBackend
         int dilationD, int dilationH, int dilationW)
     {
         EnsureInitialized();
+        try
+        {
+            int total = batch * outChannels * outDepth * outHeight * outWidth;
+            var pc = new uint[] { (uint)batch, (uint)inChannels, (uint)inDepth, (uint)inHeight, (uint)inWidth,
+                (uint)outChannels, (uint)outDepth, (uint)outHeight, (uint)outWidth,
+                (uint)kernelD, (uint)kernelH, (uint)kernelW, (uint)strideD, (uint)strideH, (uint)strideW,
+                (uint)padD, (uint)padH, (uint)padW, (uint)dilationD, (uint)dilationH, (uint)dilationW };
+            if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.Conv3D, pc, total, input, kernel, output)) return;
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         var ker = DownloadBuffer(kernel);
         var outp = new float[batch * outChannels * outDepth * outHeight * outWidth];
@@ -237,6 +318,16 @@ public sealed unsafe partial class VulkanBackend
         int strideH, int strideW, int padH, int padW)
     {
         EnsureInitialized();
+        try
+        {
+            int total = batch * channels * outHeight * outWidth;
+            var pc = new uint[] { (uint)batch, (uint)channels, (uint)inHeight, (uint)inWidth,
+                (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW,
+                (uint)strideH, (uint)strideW, (uint)padH, (uint)padW };
+            if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.DepthwiseConv2D, pc, total, input, kernel, output)) return;
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         var ker = DownloadBuffer(kernel);
         var outp = new float[batch * channels * outHeight * outWidth];
@@ -260,6 +351,62 @@ public sealed unsafe partial class VulkanBackend
         UploadToBuffer(outp, output);
     }
 
+    // GLSL conv-transpose mirrors the verified OpenCL `conv_transpose2d` gather kernel: each thread owns one
+    // output element and accumulates over the input positions that scatter into it. Output-pad rows/cols naturally
+    // resolve to 0 (no valid input maps to them), so outputPadH/W need no special handling — matching OpenCL/CUDA.
+    private const string ConvTranspose2DGlsl = @"#version 450
+layout(local_size_x = 256) in;
+layout(set=0, binding=0) buffer B0 { float inp[]; };
+layout(set=0, binding=1) buffer B1 { float wgt[]; };
+layout(set=0, binding=2) buffer B2 { float outp[]; };
+layout(push_constant) uniform PC {
+    int batch;
+    int inChannels;
+    int inHeight;
+    int inWidth;
+    int outChannels;
+    int outHeight;
+    int outWidth;
+    int kernelH;
+    int kernelW;
+    int strideH;
+    int strideW;
+    int padH;
+    int padW;
+};
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    int total = batch * outChannels * outHeight * outWidth;
+    if (gid >= uint(total)) return;
+    int idx = int(gid);
+    int ow = idx % outWidth;
+    int t = idx / outWidth;
+    int oh = t % outHeight;
+    t = t / outHeight;
+    int oc = t % outChannels;
+    int b = t / outChannels;
+    float sum = 0.0;
+    for (int ic = 0; ic < inChannels; ic++) {
+        for (int kh = 0; kh < kernelH; kh++) {
+            for (int kw = 0; kw < kernelW; kw++) {
+                int ihBase = oh + padH - kh;
+                int iwBase = ow + padW - kw;
+                if ((ihBase % strideH) == 0 && (iwBase % strideW) == 0) {
+                    int ih = ihBase / strideH;
+                    int iw = iwBase / strideW;
+                    if (ih >= 0 && ih < inHeight && iw >= 0 && iw < inWidth) {
+                        float inVal = inp[((b * inChannels + ic) * inHeight + ih) * inWidth + iw];
+                        // weights layout [inChannels, outChannels, kH, kW]
+                        float wVal = wgt[((ic * outChannels + oc) * kernelH + kh) * kernelW + kw];
+                        sum += inVal * wVal;
+                    }
+                }
+            }
+        }
+    }
+    outp[((b * outChannels + oc) * outHeight + oh) * outWidth + ow] = sum;
+}";
+
     public void ConvTranspose2D(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer output,
         int batch, int inChannels, int inHeight, int inWidth,
         int outChannels, int outHeight, int outWidth,
@@ -268,12 +415,44 @@ public sealed unsafe partial class VulkanBackend
         int outputPadH, int outputPadW)
     {
         EnsureInitialized();
+
+        // GPU path: real GLSL compute kernel. Requires libshaderc for runtime GLSL→SPIR-V; GetOrCreateGlslPipeline
+        // returns null when it is unavailable, in which case we fall through to the CPU reference below. Any launch
+        // failure also degrades to CPU so results stay correct (issue #646).
+        try
+        {
+            var pipeline = GetOrCreateGlslPipeline(ConvTranspose2DGlsl, 3, 13u * sizeof(uint));
+            if (pipeline is not null)
+            {
+                int total = batch * outChannels * outHeight * outWidth;
+                var pc = new uint[]
+                {
+                    (uint)batch, (uint)inChannels, (uint)inHeight, (uint)inWidth,
+                    (uint)outChannels, (uint)outHeight, (uint)outWidth,
+                    (uint)kernelH, (uint)kernelW, (uint)strideH, (uint)strideW, (uint)padH, (uint)padW
+                };
+                var threadRes = _device.AcquireThreadResources();
+                lock (_computeLock)
+                {
+                    pipeline.UpdateDescriptorSet(AsVulkan(input).Storage, AsVulkan(kernel).Storage, AsVulkan(output).Storage);
+                    RecordAndExecuteWithPushData(pipeline, total, pc, 13u * sizeof(uint), threadRes);
+                }
+                return;
+            }
+        }
+        catch
+        {
+            if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw;
+            // else fall through to the CPU reference
+        }
+
+        // CPU fallback (correctness safety net when the GPU kernel is unavailable / fails to launch).
         var inp = DownloadBuffer(input);
         var ker = DownloadBuffer(kernel);
         // Output padding restricts valid output range (adds extra rows/columns to one side)
         int effectiveOutH = outHeight - outputPadH;
         int effectiveOutW = outWidth - outputPadW;
-        var outp = new float[batch * outChannels * outHeight * outWidth];
+        var outpArr = new float[batch * outChannels * outHeight * outWidth];
         for (int b = 0; b < batch; b++)
             for (int ic = 0; ic < inChannels; ic++)
                 for (int ih = 0; ih < inHeight; ih++)
@@ -287,11 +466,11 @@ public sealed unsafe partial class VulkanBackend
                                     int oh = ih * strideH - padH + kh;
                                     int ow = iw * strideW - padW + kw;
                                     if (oh >= 0 && oh < effectiveOutH && ow >= 0 && ow < effectiveOutW)
-                                        outp[((b * outChannels + oc) * outHeight + oh) * outWidth + ow]
+                                        outpArr[((b * outChannels + oc) * outHeight + oh) * outWidth + ow]
                                             += val * ker[((ic * outChannels + oc) * kernelH + kh) * kernelW + kw];
                                 }
                     }
-        UploadToBuffer(outp, output);
+        UploadToBuffer(outpArr, output);
     }
 
     public void ConvTranspose2DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer kernel, IGpuBuffer gradInput,
@@ -313,6 +492,16 @@ public sealed unsafe partial class VulkanBackend
         int outputPadH, int outputPadW)
     {
         EnsureInitialized();
+        try
+        {
+            int total = inChannels * outChannels * kernelH * kernelW;
+            var pc = new uint[] { (uint)batch, (uint)inChannels, (uint)inHeight, (uint)inWidth,
+                (uint)outChannels, (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW,
+                (uint)strideH, (uint)strideW, (uint)padH, (uint)padW, (uint)outputPadH, (uint)outputPadW };
+            if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.ConvTranspose2DBackwardWeights, pc, total, input, gradOutput, gradKernel)) return;
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         var go = DownloadBuffer(gradOutput);
         var gk = new float[inChannels * outChannels * kernelH * kernelW];
@@ -343,6 +532,19 @@ public sealed unsafe partial class VulkanBackend
         int kernelH, int kernelW, int strideH, int strideW)
     {
         EnsureInitialized();
+        try
+        {
+            // GPU path needs the bias SSBO (binding 3); the no-bias case uses the CPU reference.
+            if (bias is not null)
+            {
+                int total = batch * outChannels * outHeight * outWidth;
+                var pc = new uint[] { (uint)batch, (uint)inChannels, (uint)inHeight, (uint)inWidth,
+                    (uint)outChannels, (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW, (uint)strideH, (uint)strideW };
+                if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.LocallyConnectedConv2D, pc, total, input, weights, bias, output)) return;
+            }
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         var w = DownloadBuffer(weights);
         float[]? bi = bias is not null ? DownloadBuffer(bias) : null;
@@ -375,6 +577,15 @@ public sealed unsafe partial class VulkanBackend
         int kernelH, int kernelW, int strideH, int strideW)
     {
         EnsureInitialized();
+        try
+        {
+            int total = batch * inChannels * inHeight * inWidth;
+            var pc = new uint[] { (uint)batch, (uint)inChannels, (uint)inHeight, (uint)inWidth,
+                (uint)outChannels, (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW, (uint)strideH, (uint)strideW };
+            if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.LocallyConnectedConv2DBackwardInput, pc, total, gradOutput, weights, gradInput)) return;
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
+
         var go = DownloadBuffer(gradOutput);
         var w = DownloadBuffer(weights);
         var gi = new float[batch * inChannels * inHeight * inWidth];
@@ -405,6 +616,15 @@ public sealed unsafe partial class VulkanBackend
         int kernelH, int kernelW, int strideH, int strideW)
     {
         EnsureInitialized();
+        try
+        {
+            int total = outHeight * outWidth * outChannels * inChannels * kernelH * kernelW;
+            var pc = new uint[] { (uint)batch, (uint)inChannels, (uint)inHeight, (uint)inWidth,
+                (uint)outChannels, (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW, (uint)strideH, (uint)strideW };
+            if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.LocallyConnectedConv2DBackwardWeights, pc, total, gradOutput, input, gradWeights)) return;
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
+
         var go = DownloadBuffer(gradOutput);
         var inp = DownloadBuffer(input);
         var gw = new float[outHeight * outWidth * outChannels * inChannels * kernelH * kernelW];
@@ -433,6 +653,13 @@ public sealed unsafe partial class VulkanBackend
         int batch, int outChannels, int outHeight, int outWidth)
     {
         EnsureInitialized();
+        try
+        {
+            var pc = new uint[] { (uint)batch, (uint)outChannels, (uint)outHeight, (uint)outWidth };
+            if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.LocallyConnectedConv2DBackwardBias, pc, outChannels, gradOutput, gradBias)) return;
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
+
         var go = DownloadBuffer(gradOutput);
         var gb = new float[outChannels];
         for (int b = 0; b < batch; b++)
@@ -476,6 +703,23 @@ public sealed unsafe partial class VulkanBackend
         int dilationH, int dilationW, int groups, int deformGroups)
     {
         EnsureInitialized();
+        try
+        {
+            // GPU (DCNv2) path requires the mask SSBO and valid grouping; otherwise the CPU reference runs (it
+            // also validates the args and handles DCNv1 / no-mask).
+            if (mask is not null && groups > 0 && deformGroups > 0
+                && inChannels % groups == 0 && inChannels % deformGroups == 0)
+            {
+                int total = batch * outChannels * outHeight * outWidth;
+                var pc = new uint[] { (uint)batch, (uint)inChannels, (uint)inHeight, (uint)inWidth,
+                    (uint)outChannels, (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW,
+                    (uint)strideH, (uint)strideW, (uint)padH, (uint)padW, (uint)dilationH, (uint)dilationW,
+                    (uint)groups, (uint)deformGroups };
+                if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.DeformableConv2D, pc, total, input, weights, offsets, mask, output)) return;
+            }
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         var ker = DownloadBuffer(weights);
         var off = DownloadBuffer(offsets);
@@ -546,6 +790,21 @@ public sealed unsafe partial class VulkanBackend
         int dilationH, int dilationW, int groups, int deformGroups)
     {
         EnsureInitialized();
+        try
+        {
+            if (mask is not null && groups > 0 && deformGroups > 0
+                && inChannels % groups == 0 && inChannels % deformGroups == 0)
+            {
+                int total = batch * inChannels * inHeight * inWidth;
+                var pc = new uint[] { (uint)batch, (uint)inChannels, (uint)inHeight, (uint)inWidth,
+                    (uint)outChannels, (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW,
+                    (uint)strideH, (uint)strideW, (uint)padH, (uint)padW, (uint)dilationH, (uint)dilationW,
+                    (uint)groups, (uint)deformGroups };
+                if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.DeformableConv2DBackwardInput, pc, total, gradOutput, weights, offsets, mask, gradInput)) return;
+            }
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
+
         var go = DownloadBuffer(gradOutput);
         var ker = DownloadBuffer(weights);
         var off = DownloadBuffer(offsets);
@@ -619,6 +878,21 @@ public sealed unsafe partial class VulkanBackend
         int dilationH, int dilationW, int groups, int deformGroups)
     {
         EnsureInitialized();
+        try
+        {
+            if (mask is not null && groups > 0 && deformGroups > 0
+                && inChannels % groups == 0 && inChannels % deformGroups == 0)
+            {
+                int total = outChannels * (inChannels / groups) * kernelH * kernelW;
+                var pc = new uint[] { (uint)batch, (uint)inChannels, (uint)inHeight, (uint)inWidth,
+                    (uint)outChannels, (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW,
+                    (uint)strideH, (uint)strideW, (uint)padH, (uint)padW, (uint)dilationH, (uint)dilationW,
+                    (uint)groups, (uint)deformGroups };
+                if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.DeformableConv2DBackwardWeights, pc, total, gradOutput, input, offsets, mask, gradWeights)) return;
+            }
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
+
         var go = DownloadBuffer(gradOutput);
         var inp = DownloadBuffer(input);
         var off = DownloadBuffer(offsets);
@@ -676,6 +950,22 @@ public sealed unsafe partial class VulkanBackend
         int dilationH, int dilationW, int groups, int deformGroups)
     {
         EnsureInitialized();
+        try
+        {
+            if (mask is not null && groups > 0 && deformGroups > 0
+                && inChannels % groups == 0 && inChannels % deformGroups == 0)
+            {
+                int ks = kernelH * kernelW;
+                int total = batch * deformGroups * 2 * ks * outHeight * outWidth;
+                var pc = new uint[] { (uint)batch, (uint)inChannels, (uint)inHeight, (uint)inWidth,
+                    (uint)outChannels, (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW,
+                    (uint)strideH, (uint)strideW, (uint)padH, (uint)padW, (uint)dilationH, (uint)dilationW,
+                    (uint)groups, (uint)deformGroups };
+                if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.DeformableConv2DBackwardOffset, pc, total, gradOutput, input, weights, offsets, mask, gradOffsets)) return;
+            }
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
+
         var go = DownloadBuffer(gradOutput);
         var inp = DownloadBuffer(input);
         var ker = DownloadBuffer(weights);
@@ -761,6 +1051,21 @@ public sealed unsafe partial class VulkanBackend
         int dilationH, int dilationW, int groups, int deformGroups)
     {
         EnsureInitialized();
+        try
+        {
+            if (groups > 0 && deformGroups > 0
+                && inChannels % groups == 0 && inChannels % deformGroups == 0)
+            {
+                int total = batch * deformGroups * kernelH * kernelW * outHeight * outWidth;
+                var pc = new uint[] { (uint)batch, (uint)inChannels, (uint)inHeight, (uint)inWidth,
+                    (uint)outChannels, (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW,
+                    (uint)strideH, (uint)strideW, (uint)padH, (uint)padW, (uint)dilationH, (uint)dilationW,
+                    (uint)groups, (uint)deformGroups };
+                if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.DeformableConv2DBackwardMask, pc, total, gradOutput, input, weights, offsets, gradMask)) return;
+            }
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
+
         var go = DownloadBuffer(gradOutput);
         var inp = DownloadBuffer(input);
         var ker = DownloadBuffer(weights);
@@ -820,6 +1125,20 @@ public sealed unsafe partial class VulkanBackend
         int strideH, int strideW, int padH, int padW)
     {
         EnsureInitialized();
+        try
+        {
+            // GPU path requires the indices SSBO (binding 2). When the caller wants no indices, use the CPU path.
+            if (indices is not null)
+            {
+                int total = batch * channels * outHeight * outWidth;
+                var pc = new uint[] { (uint)batch, (uint)channels, (uint)inHeight, (uint)inWidth,
+                    (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW,
+                    (uint)strideH, (uint)strideW, (uint)padH, (uint)padW };
+                if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.MaxPool2D, pc, total, input, output, indices)) return;
+            }
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         var outp = new float[batch * channels * outHeight * outWidth];
         float[]? idx = indices is not null ? new float[batch * channels * outHeight * outWidth] : null;
@@ -856,6 +1175,16 @@ public sealed unsafe partial class VulkanBackend
         int strideH, int strideW, int padH, int padW)
     {
         EnsureInitialized();
+        try
+        {
+            int inTotal = batch * channels * inHeight * inWidth;
+            int outTotal = batch * channels * outHeight * outWidth;
+            Fill(gradInput, 0f, inTotal); // scatter-add target must start at zero
+            var pc = new uint[] { (uint)batch, (uint)channels, (uint)inHeight, (uint)inWidth, (uint)outHeight, (uint)outWidth };
+            if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.MaxPool2DBackward, pc, outTotal, gradOutput, indices, gradInput)) return;
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
+
         var go = DownloadBuffer(gradOutput);
         var idx = DownloadBuffer(indices);
         int inSpatial = inHeight * inWidth;
@@ -881,6 +1210,16 @@ public sealed unsafe partial class VulkanBackend
         int strideH, int strideW, int padH, int padW, bool countIncludePad)
     {
         EnsureInitialized();
+        try
+        {
+            int total = batch * channels * outHeight * outWidth;
+            var pc = new uint[] { (uint)batch, (uint)channels, (uint)inHeight, (uint)inWidth,
+                (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW,
+                (uint)strideH, (uint)strideW, (uint)padH, (uint)padW, (uint)(countIncludePad ? 1 : 0) };
+            if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.AvgPool2D, pc, total, input, output)) return;
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         var outp = new float[batch * channels * outHeight * outWidth];
         for (int b = 0; b < batch; b++)
@@ -912,6 +1251,16 @@ public sealed unsafe partial class VulkanBackend
         int strideH, int strideW, int padH, int padW, bool countIncludePad)
     {
         EnsureInitialized();
+        try
+        {
+            int total = batch * channels * inHeight * inWidth;
+            var pc = new uint[] { (uint)batch, (uint)channels, (uint)inHeight, (uint)inWidth,
+                (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW,
+                (uint)strideH, (uint)strideW, (uint)padH, (uint)padW, (uint)(countIncludePad ? 1 : 0) };
+            if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.AvgPool2DBackward, pc, total, gradOutput, gradInput)) return;
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
+
         var go = DownloadBuffer(gradOutput);
         var gi = new float[batch * channels * inHeight * inWidth];
         for (int b = 0; b < batch; b++)
@@ -945,6 +1294,13 @@ public sealed unsafe partial class VulkanBackend
     public void GlobalAvgPool2D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int height, int width)
     {
         EnsureInitialized();
+        try
+        {
+            var pc = new uint[] { (uint)batch, (uint)channels, (uint)height, (uint)width };
+            if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.GlobalAvgPool2D, pc, batch * channels, input, output)) return;
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         var outp = new float[batch * channels];
         int spatial = height * width;
@@ -962,6 +1318,13 @@ public sealed unsafe partial class VulkanBackend
     public void GlobalMaxPool2D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int height, int width)
     {
         EnsureInitialized();
+        try
+        {
+            var pc = new uint[] { (uint)batch, (uint)channels, (uint)height, (uint)width };
+            if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.GlobalMaxPool2DNoIndices, pc, batch * channels, input, output)) return;
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         var outp = new float[batch * channels];
         int spatial = height * width;
@@ -979,6 +1342,13 @@ public sealed unsafe partial class VulkanBackend
     public void GlobalMaxPool2D(IGpuBuffer input, IGpuBuffer output, IGpuBuffer indices, int batch, int channels, int height, int width)
     {
         EnsureInitialized();
+        try
+        {
+            var pc = new uint[] { (uint)batch, (uint)channels, (uint)height, (uint)width };
+            if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.GlobalMaxPool2D, pc, batch * channels, input, output, indices)) return;
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         var outp = new float[batch * channels];
         var idx = new float[batch * channels];
@@ -999,6 +1369,13 @@ public sealed unsafe partial class VulkanBackend
     public void GlobalAvgPool2DBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput, int batch, int channels, int height, int width)
     {
         EnsureInitialized();
+        try
+        {
+            var pc = new uint[] { (uint)batch, (uint)channels, (uint)height, (uint)width };
+            if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.GlobalAvgPool2DBackward, pc, batch * channels * height * width, gradOutput, gradInput)) return;
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
+
         var go = DownloadBuffer(gradOutput);
         int spatial = height * width;
         var gi = new float[batch * channels * spatial];
@@ -1015,6 +1392,14 @@ public sealed unsafe partial class VulkanBackend
     public void GlobalMaxPool2DBackward(IGpuBuffer gradOutput, IGpuBuffer indices, IGpuBuffer gradInput, int batch, int channels, int height, int width)
     {
         EnsureInitialized();
+        try
+        {
+            Fill(gradInput, 0f, batch * channels * height * width); // only argmax positions are written
+            var pc = new uint[] { (uint)batch, (uint)channels, (uint)height, (uint)width };
+            if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.GlobalMaxPool2DBackward, pc, batch * channels, gradOutput, indices, gradInput)) return;
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
+
         var go = DownloadBuffer(gradOutput);
         var idx = DownloadBuffer(indices);
         int spatial = height * width;
@@ -1033,6 +1418,13 @@ public sealed unsafe partial class VulkanBackend
     public void AdaptiveAvgPool2D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth)
     {
         EnsureInitialized();
+        try
+        {
+            var pc = new uint[] { (uint)batch, (uint)channels, (uint)inHeight, (uint)inWidth, (uint)outHeight, (uint)outWidth };
+            if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.AdaptiveAvgPool2D, pc, batch * channels * outHeight * outWidth, input, output)) return;
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         var outp = new float[batch * channels * outHeight * outWidth];
         for (int b = 0; b < batch; b++)
@@ -1060,6 +1452,19 @@ public sealed unsafe partial class VulkanBackend
         int strideD, int strideH, int strideW)
     {
         EnsureInitialized();
+        try
+        {
+            if (indices is not null)
+            {
+                int total = batch * channels * outDepth * outHeight * outWidth;
+                var pc = new uint[] { (uint)batch, (uint)channels, (uint)inDepth, (uint)inHeight, (uint)inWidth,
+                    (uint)outDepth, (uint)outHeight, (uint)outWidth,
+                    (uint)kernelD, (uint)kernelH, (uint)kernelW, (uint)strideD, (uint)strideH, (uint)strideW };
+                if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.MaxPool3D, pc, total, input, output, indices)) return;
+            }
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         int outSize = batch * channels * outDepth * outHeight * outWidth;
         var outp = new float[outSize];
@@ -1098,6 +1503,17 @@ public sealed unsafe partial class VulkanBackend
         int outDepth, int outHeight, int outWidth)
     {
         EnsureInitialized();
+        try
+        {
+            int inTotal = batch * channels * inDepth * inHeight * inWidth;
+            int outTotal = batch * channels * outDepth * outHeight * outWidth;
+            Fill(gradInput, 0f, inTotal); // scatter-add target must start at zero
+            var pc = new uint[] { (uint)batch, (uint)channels, (uint)inDepth, (uint)inHeight, (uint)inWidth,
+                (uint)outDepth, (uint)outHeight, (uint)outWidth };
+            if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.MaxPool3DBackward, pc, outTotal, gradOutput, indices, gradInput)) return;
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
+
         var go = DownloadBuffer(gradOutput);
         var idx = DownloadBuffer(indices);
         int inSpatial = inDepth * inHeight * inWidth;

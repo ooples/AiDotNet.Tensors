@@ -6144,6 +6144,11 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, strideW);
             k.SetArg(arg++, padH);
             k.SetArg(arg++, padW);
+            // The conv_transpose2d kernel declares outputPadH/outputPadW as the last two parameters. OpenCL
+            // requires EVERY declared kernel argument to be bound before enqueue, so omitting these two raised
+            // CL_INVALID_KERNEL_ARGS (-52) at launch and the engine silently fell back to the CPU reference.
+            k.SetArg(arg++, outputPadH);
+            k.SetArg(arg++, outputPadW);
 
             int localX = 8, localY = 8, localZ = 1;
             k.Execute3D(outWidth, outHeight, batch * outChannels, localX, localY, localZ);
