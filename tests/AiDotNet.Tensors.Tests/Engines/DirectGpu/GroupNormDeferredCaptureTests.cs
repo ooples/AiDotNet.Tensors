@@ -183,9 +183,16 @@ public sealed class GroupNormDeferredCaptureTests : IDisposable
         AssertDeferredMatchesEager("MaxPool2D", () => _gpu!.MaxPool2D(input, 2, 2, 0));
     }
 
-    // NOTE: AvgPool2D is intentionally NOT covered here — it is not yet deferred-safe (its kernel
-    // intermittently crashes the process under deferred replay; root cause TBD, #642). It stays on
-    // the eager path and is not recorded. Standard SD UNets use strided conv, not avgpool.
+    [SkippableFact]
+    public void DeferredAvgPool2D_MatchesEager()
+    {
+        // Regression for the CudaBackend.AvgPool2D launch bug (#642): the kernel takes 15 params
+        // (… countIncludePad) but the launcher allocated 14 arg slots, so cuLaunchKernel read a
+        // garbage 15th pointer → 0xC0000005 on small inputs (surfaced under deferred replay).
+        Skip.IfNot(_gpuAvailable, "No CUDA device.");
+        var input = Rand(new[] { 1, C, Sp, Sp }, 13);
+        AssertDeferredMatchesEager("AvgPool2D", () => _gpu!.AvgPool2D(input, 2, 2, 0));
+    }
 
     [SkippableFact]
     public void DeferredConvTranspose2D_MatchesEager()

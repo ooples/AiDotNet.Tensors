@@ -792,9 +792,18 @@ public class RecordingGpuBackend : DelegatingGpuBackend
                 outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW));
     }
 
-    // NOTE (#642): AvgPool2D is intentionally NOT recorded — its kernel intermittently crashes the
-    // process under deferred replay (root cause TBD). Leaving it unrecorded keeps it on the eager
-    // path; models using AvgPool2D must not enable the deferred/captured path until that is fixed.
+    /// <inheritdoc/>
+    public override void AvgPool2D(IGpuBuffer input, IGpuBuffer output,
+        int batch, int channels, int inHeight, int inWidth,
+        int outHeight, int outWidth, int kernelH, int kernelW,
+        int strideH, int strideW, int padH, int padW, bool countIncludePad)
+    {
+        // #642: record downsample pool for deferred replay. The earlier intermittent crash was a
+        // CudaBackend.AvgPool2D launch bug (dropped the countIncludePad kernel arg) — now fixed.
+        RecordOrExecute(KernelType.Pooling, new[] { input }, new[] { output },
+            () => Inner.AvgPool2D(input, output, batch, channels, inHeight, inWidth,
+                outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, countIncludePad));
+    }
 
     /// <inheritdoc/>
     public override void Transpose(IGpuBuffer A, IGpuBuffer B, int rows, int cols)

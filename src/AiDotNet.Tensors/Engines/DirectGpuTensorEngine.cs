@@ -6532,8 +6532,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return base.AvgPool2D(input, poolSize, stride, padding);
 
         using var inputBuffer = GetOrAllocateBuffer(backend, input);
-        using var outputBuffer = AllocateOutputBuffer(backend, batch * channels * outHeight * outWidth);
-
+        // #642: lazy FinishGpuOp (deferred-correct). The earlier deferred crash was the
+        // CudaBackend.AvgPool2D launch dropping the countIncludePad kernel arg, now fixed.
+        var outputBuffer = AllocateOutputBuffer(backend, batch * channels * outHeight * outWidth);
+        bool handedOff = false;
         try
         {
             // Execute GPU average pooling
@@ -6544,21 +6546,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 stride, stride, padding, padding,
                 countIncludePad: true);
 
-            // NOTE (#642): NOT yet deferred-safe — AvgPool2D's recorded kernel intermittently
-            // crashes the process under a DeferredScope (see GroupNormDeferredCaptureTests note),
-            // so this op keeps its eager DownloadBuffer and is NOT recorded by RecordingGpuBackend.
-            // Models that use AvgPool2D must not enable the deferred/captured path until that crash
-            // is root-caused. Standard SD UNets use strided conv (not avgpool) for downsampling.
             int outputSize = batch * channels * outHeight * outWidth;
-            float[] resultFloat = new float[outputSize];
-            backend.DownloadBuffer(outputBuffer.Buffer, resultFloat);
-
-            T[] resultData = DirectGpuEngine.FromFloatArray<T>(resultFloat);
+            var resultData = FinishGpuOp<T>(backend, outputBuffer, outputSize);
+            handedOff = true;
             return new Tensor<T>(resultData, new[] { batch, channels, outHeight, outWidth });
         }
         catch
         {
             return base.AvgPool2D(input, poolSize, stride, padding);
+        }
+        finally
+        {
+            if (!handedOff) outputBuffer.Dispose();
         }
     }
 

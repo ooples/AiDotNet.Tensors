@@ -5692,7 +5692,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         IntPtr inputPtr = input.Handle;
         IntPtr outputPtr = output.Handle;
         int countPad = countIncludePad ? 1 : 0;
-        void** args = stackalloc void*[14];
+        // Kernel signature has 15 parameters: input, output, the 12 shape/stride/pad ints, AND
+        // countIncludePad. The original 14-slot stackalloc dropped the countIncludePad slot, so
+        // cuLaunchKernel read garbage stack memory for parameter 15 — a 0xC0000005 access violation
+        // on small inputs (stack-layout dependent, which is why it surfaced under deferred replay).
+        // Same fix as AvgPool2DBackward below.
+        void** args = stackalloc void*[15];
         args[0] = &inputPtr;
         args[1] = &outputPtr;
         args[2] = &batch;
@@ -5707,6 +5712,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         args[11] = &strideW;
         args[12] = &padH;
         args[13] = &padW;
+        args[14] = &countPad;
         LaunchKernel2D(kernel, gridX, gridY, gridZ, (uint)blockSize, (uint)blockSize, args);
     }
 
