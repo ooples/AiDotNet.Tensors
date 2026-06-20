@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph;
 using AiDotNet.Tensors.Engines.DirectGpu;
@@ -65,6 +66,39 @@ public sealed class GroupNormDeferredCaptureTests : IDisposable
         gpu.SwishInPlace(h);
         h = gpu.Conv2D(h, k2, 1, 1, 1);
         return gpu.TensorAdd(input, h);
+    }
+
+    // Pure-CPU unit test (no GPU) for the GpuBufferReleaseDeferral depth-counting fix (#642 review,
+    // Critical). Runs in CI and locks in the nesting contract: an inner scope's EndAndRelease must
+    // NOT flush the outer scope's still-pending releases (the use-after-free the depth counter fixes).
+    [Fact]
+    public void DeferralGate_NestedScopes_FlushOnlyAtOutermostEnd()
+    {
+        // (Serialized with the GPU tests via the collection, so no concurrent DeferredScope pollutes
+        // the thread-local depth on this thread.)
+        Assert.False(GpuBufferReleaseDeferral.IsActive);
+        var flushed = new List<string>();
+
+        GpuBufferReleaseDeferral.Begin();                                   // outer
+        Assert.True(GpuBufferReleaseDeferral.IsActive);
+        Assert.True(GpuBufferReleaseDeferral.TryDefer(() => flushed.Add("outer")));
+
+        GpuBufferReleaseDeferral.Begin();                                   // inner
+        Assert.True(GpuBufferReleaseDeferral.TryDefer(() => flushed.Add("inner")));
+
+        GpuBufferReleaseDeferral.EndAndRelease();                           // inner ends — must NOT flush
+        Assert.True(GpuBufferReleaseDeferral.IsActive);
+        Assert.Empty(flushed);
+
+        GpuBufferReleaseDeferral.EndAndRelease();                           // outer ends — flush both
+        Assert.False(GpuBufferReleaseDeferral.IsActive);
+        Assert.Equal(new[] { "outer", "inner" }, flushed);
+
+        // Balanced + idempotent: an extra EndAndRelease is a no-op, and TryDefer returns false.
+        GpuBufferReleaseDeferral.EndAndRelease();
+        Assert.False(GpuBufferReleaseDeferral.IsActive);
+        Assert.False(GpuBufferReleaseDeferral.TryDefer(() => flushed.Add("after")));
+        Assert.Equal(2, flushed.Count);
     }
 
     [SkippableFact]
