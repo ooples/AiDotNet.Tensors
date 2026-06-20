@@ -4472,9 +4472,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 using var gpuVar = gpuBackend.AllocateBuffer(batch * numGroups);
                 using var gpuOut = gpuBackend.AllocateBuffer(input.Length);
 
-                // GroupNorm then Swish (sigmoid * x)
+                // GroupNorm then Swish (sigmoid * x). Interface order is
+                // (batch, numGroups, channels, spatialSize) — see the value-returning GroupNorm fix.
                 gpuBackend.GroupNorm(gpuIn, gpuNorm, gpuGamma, gpuBeta, gpuMean, gpuVar,
-                    batch, channels, spatial, numGroups, (float)epsilon);
+                    batch, numGroups, channels, spatial, (float)epsilon);
                 gpuBackend.Swish(gpuNorm, gpuOut, input.Length);
                 DownloadIntoTensor(gpuBackend, gpuOut, floatOutput);
                 return;
@@ -15836,8 +15837,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             bufOut = AllocateOutputBuffer(backend, input.Length);
             bufMean = AllocateOutputBuffer(backend, batch * numGroups);
             bufVar = AllocateOutputBuffer(backend, batch * numGroups);
+            // Interface order is (batch, numGroups, channels, spatialSize). Passing
+            // (batch, channels, spatial, numGroups) scrambled the kernel's dims: it wrote `channels`
+            // mean/var entries into the batch*numGroups-sized save buffers (overflow + wrong
+            // normalization) whenever channels != numGroups — i.e. essentially every diffusion
+            // GroupNorm. #642 P3 root cause of the deferred-ResBlock divergence (eager was wrong too).
             backend.GroupNorm(bufIn.Buffer, bufOut.Buffer, bufGamma.Buffer, bufBeta.Buffer,
-                bufMean.Buffer, bufVar.Buffer, batch, channels, spatial, numGroups, (float)epsilon);
+                bufMean.Buffer, bufVar.Buffer, batch, numGroups, channels, spatial, (float)epsilon);
             var result = FinishGpuOp<T>(backend, bufOut, input.Length);
             mean = new Tensor<T>(FinishGpuOp<T>(backend, bufMean, batch * numGroups), new[] { batch, numGroups });
             variance = new Tensor<T>(FinishGpuOp<T>(backend, bufVar, batch * numGroups), new[] { batch, numGroups });

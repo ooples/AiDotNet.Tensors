@@ -167,12 +167,39 @@ internal static class Program
         Func<Tensor<float>> baseIter = oneIter;
         if (deferred)
         {
+            bool bufdump = ArgI(args, "--bufdump", 0) != 0;
             oneIter = () =>
             {
                 using var scope = gpu.BeginDeferredScope();
                 var r = baseIter();
                 var ds = scope as AiDotNet.Tensors.Engines.Gpu.DeferredScope;
-                if (ds != null)
+                if (ds != null && bufdump)
+                {
+                    // #642 P3: dump COMPILED-graph node buffer handles to find the residual-add
+                    // aliasing collision. H(handle) collisions across nodes with overlapping
+                    // lifetimes = two logical buffers sharing one device pointer.
+                    var g = ds.Compile();
+                    int idx = 0;
+                    string Hx(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer? b)
+                        => b == null ? "null" : $"0x{b.Handle.ToInt64():X}/{b.Size}";
+                    foreach (var node in g.TopologicalOrder)
+                    {
+                        var line = new System.Text.StringBuilder($"  [{idx++}] {node.NodeType}");
+                        if (node is AiDotNet.Tensors.Engines.Gpu.Graph.KernelNode kn)
+                        {
+                            line.Append(':').Append(kn.KernelType).Append(" in=[");
+                            foreach (var t in kn.InputTensors) line.Append(Hx(t.TryGetGpuBuffer())).Append(' ');
+                            line.Append("] out=[");
+                            foreach (var t in kn.OutputTensors) line.Append(Hx(t.TryGetGpuBuffer())).Append(' ');
+                            line.Append(']');
+                        }
+                        else if (node is AiDotNet.Tensors.Engines.Gpu.Graph.TransferNode tn)
+                            line.Append(' ').Append(tn.TransferType).Append(" src=").Append(Hx(tn.SourceBuffer)).Append(" dst=").Append(Hx(tn.DestinationBuffer));
+                        line.Append($" deps={node.Dependencies.Count}");
+                        Console.WriteLine(line.ToString());
+                    }
+                }
+                else if (ds != null)
                 {
                     var sb = new System.Text.StringBuilder("  NODES: ");
                     foreach (var node in ds.GraphBuilder.Nodes)
