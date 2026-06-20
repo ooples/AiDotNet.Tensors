@@ -590,6 +590,43 @@ public class RecordingGpuBackend : DelegatingGpuBackend
             });
     }
 
+    /// <inheritdoc/>
+    public override void GroupNorm(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
+        IGpuBuffer saveMean, IGpuBuffer saveInvVar, int batch, int numGroups, int channels, int spatialSize, float epsilon)
+    {
+        RecordOrExecute(
+            KernelType.GroupNorm,
+            new[] { input, gamma, beta },
+            new[] { output, saveMean, saveInvVar },
+            () => Inner.GroupNorm(input, output, gamma, beta, saveMean, saveInvVar, batch, numGroups, channels, spatialSize, epsilon),
+            new Dictionary<string, object>
+            {
+                ["batch"] = batch,
+                ["numGroups"] = numGroups,
+                ["channels"] = channels,
+                ["spatialSize"] = spatialSize,
+                ["epsilon"] = epsilon
+            });
+    }
+
+    /// <inheritdoc/>
+    public override void InstanceNorm(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
+        IGpuBuffer saveMean, IGpuBuffer saveInvVar, int batch, int channels, int spatialSize, float epsilon)
+    {
+        RecordOrExecute(
+            KernelType.InstanceNorm,
+            new[] { input, gamma, beta },
+            new[] { output, saveMean, saveInvVar },
+            () => Inner.InstanceNorm(input, output, gamma, beta, saveMean, saveInvVar, batch, channels, spatialSize, epsilon),
+            new Dictionary<string, object>
+            {
+                ["batch"] = batch,
+                ["channels"] = channels,
+                ["spatialSize"] = spatialSize,
+                ["epsilon"] = epsilon
+            });
+    }
+
     #endregion
 
     #region Attention Operations (Override to Record)

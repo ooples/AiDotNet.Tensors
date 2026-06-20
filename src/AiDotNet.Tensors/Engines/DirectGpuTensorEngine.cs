@@ -4606,6 +4606,63 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return true;
     }
 
+    /// <summary>
+    /// #642 P3 — GPU-RESIDENT in-place unary, used only while recording into a deferred
+    /// execution graph. The plain <see cref="TryRunUnaryInPlace{T}"/> eagerly downloads the
+    /// result back into the tensor's CPU array, which (a) reads the not-yet-computed device
+    /// buffer during recording → wrong, and (b) severs the on-device chain so the next op
+    /// re-uploads. This variant instead runs the kernel buf→buf (RECORDED into the graph) and
+    /// keeps the modified buffer resident under the tensor's array key, deferring the CPU
+    /// readback to first access (after <c>scope.Execute()</c>) via a <see cref="BindResidentBuffer"/>
+    /// materializer — so GroupNorm→Swish→Conv stays device-resident and dependency edges form.
+    /// Returns false (caller falls back to the eager in-place path) outside a recording scope,
+    /// under autocast, for non-float, or when no array key / buffer is available.
+    /// </summary>
+    private bool TryRunUnaryInPlaceResident<T>(Tensor<T> tensor, Action<IDirectGpuBackend, IGpuBuffer, int> op)
+    {
+        if (Gpu.DeferredScope.Current?.IsRecording != true) return false;
+        if (Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
+        if (!TryGetBackend(out var backend)) return false;
+        // Need a managed backing array to key the activation cache / materializer on. Read it
+        // WITHOUT materializing (GetDataArray would download a resident upstream's buffer).
+        var backing = tensor.DataVector.GetBackingArrayUnsafe();
+        if (backing is null) return false;
+
+        OwnedBuffer owned;
+        try { owned = GetOrAllocateBuffer(backend, tensor); }
+        catch { return false; }
+
+        var buf = owned.Buffer;
+        int n = tensor.Length;
+        if (buf.Size < n)
+        {
+            if (owned.OwnsBuffer) owned.Dispose();
+            return false;
+        }
+
+        try
+        {
+            op(backend, buf, n); // in-place buf→buf; recorded by RecordingGpuBackend
+        }
+        catch
+        {
+            if (owned.OwnsBuffer) owned.Dispose();
+            return false;
+        }
+
+        // On a fresh upload (OwnsBuffer) the buffer is not yet cached — cache it under the
+        // tensor's array key so the next op's GetOrAllocateBuffer reuses it (resident chain).
+        // On a cache HIT the entry already maps this same (now in-place-modified) buffer, and
+        // re-caching would TryAdd-fail and Dispose the live buffer (ActivationCacheEntry.Dispose
+        // frees Buffer), so DO NOT re-cache a hit.
+        if (owned.OwnsBuffer)
+            CacheActivation(backing, buf, tensor.Shape._dims, backend);
+        // Pin the buffer to the tensor + (re)register the deferred materializer so the final CPU
+        // read downloads the kernel's output after Execute() instead of the stale pre-op data.
+        BindResidentBuffer(tensor, buf, backend);
+        return true;
+    }
+
     // Explicit IEngine.* impls for TensorDivideScalar / TensorAbs / TensorExp /
     // TensorLog / TensorSqrt / TensorNegate / TensorPower / TensorMax /
     // TensorMin / Tanh / Sigmoid / ReLU / GELU were DELETED — same rationale
@@ -16431,6 +16488,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override void SigmoidInPlace<T>(Tensor<T> tensor)
     {
+        if (TryRunUnaryInPlaceResident(tensor, static (backend, buf, size) => backend.Sigmoid(buf, buf, size)))
+            return;
         if (TryRunUnaryInPlace(tensor, static (backend, buf, size) => backend.Sigmoid(buf, buf, size)))
             return;
         base.SigmoidInPlace(tensor);
@@ -17262,9 +17321,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override void ReLUInPlace<T>(Tensor<T> tensor)
     {
+        if (TryRunUnaryInPlaceResident(tensor, static (backend, buf, size) => backend.Relu(buf, buf, size)))
+            return;
         if (TryRunUnaryInPlace(tensor, static (backend, buf, size) => backend.Relu(buf, buf, size)))
             return;
         base.ReLUInPlace(tensor);
+    }
+
+    public override void SwishInPlace<T>(Tensor<T> tensor)
+    {
+        if (TryRunUnaryInPlaceResident(tensor, static (backend, buf, size) => backend.Swish(buf, buf, size)))
+            return;
+        if (TryRunUnaryInPlace(tensor, static (backend, buf, size) => backend.Swish(buf, buf, size)))
+            return;
+        base.SwishInPlace(tensor);
     }
 
     // --- Scalar reductions ---
