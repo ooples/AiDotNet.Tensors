@@ -108,8 +108,10 @@ public sealed class GroupNormDeferredCaptureTests : IDisposable
             scope!.Execute();
         }
 
+        // Shape is part of the contract — Math.Min would mask a wrong-shape regression.
+        Assert.Equal(eagerCopy.Length, deferred.Length);
         float maxDiff = 0;
-        for (int i = 0; i < Math.Min(eagerCopy.Length, deferred.Length); i++)
+        for (int i = 0; i < eagerCopy.Length; i++)
             maxDiff = Math.Max(maxDiff, Math.Abs(eagerCopy[i] - deferred[i]));
         Assert.True(maxDiff < Tolerance, $"Deferred ResBlock diverged from eager: maxDiff={maxDiff}");
     }
@@ -161,8 +163,10 @@ public sealed class GroupNormDeferredCaptureTests : IDisposable
             deferred = op();
             scope!.Execute();
         }
+        // Shape is part of the contract — Math.Min would mask a wrong-shape regression.
+        Assert.Equal(eagerCopy.Length, deferred.Length);
         float maxDiff = 0;
-        for (int i = 0; i < Math.Min(eagerCopy.Length, deferred.Length); i++)
+        for (int i = 0; i < eagerCopy.Length; i++)
             maxDiff = Math.Max(maxDiff, Math.Abs(eagerCopy[i] - deferred[i]));
         Assert.True(maxDiff < Tolerance, $"Deferred {name} diverged from eager: maxDiff={maxDiff}");
     }
@@ -224,11 +228,13 @@ public sealed class GroupNormDeferredCaptureTests : IDisposable
         for (int i = 0; i < eager.Length; i++) eagerCopy[i] = eager[i];
 
         // Record the resident graph (buffers allocated at record time → Execute is alloc-free).
-        var scope = (DeferredScope)gpu.BeginDeferredScope()!;
+        var scope = gpu.BeginDeferredScope() as DeferredScope;
+        Skip.If(scope is null, "Deferred execution unsupported.");
+        ExecutionGraph? graph = null;
         try
         {
             Tensor<float> result = ResBlock(input, gamma, beta, k1, k2);
-            ExecutionGraph graph = scope.Compile();
+            graph = scope!.Compile();   // owns the stream pool (GraphCompiler transferred ownership)
 
             // Warmup: full graph once (H2D populates resident buffers + JIT).
             foreach (var node in graph.TopologicalOrder) node.Execute(backend);
@@ -244,14 +250,18 @@ public sealed class GroupNormDeferredCaptureTests : IDisposable
 
             step.Replay();   // recomputes into the captured output buffer; `result` downloads it
 
+            Assert.Equal(eagerCopy.Length, result.Length);
             float maxDiff = 0;
-            for (int i = 0; i < Math.Min(eagerCopy.Length, result.Length); i++)
+            for (int i = 0; i < eagerCopy.Length; i++)
                 maxDiff = Math.Max(maxDiff, Math.Abs(eagerCopy[i] - result[i]));
             Assert.True(maxDiff < Tolerance, $"CUDA-graph replay diverged from eager: maxDiff={maxDiff}");
         }
         finally
         {
-            scope.Dispose();
+            // Dispose the scope first (its Dispose may touch the compiled graph), then the graph —
+            // which disposes the stream pool the GraphCompiler transferred to it (no leak).
+            scope?.Dispose();
+            graph?.Dispose();
         }
     }
 }

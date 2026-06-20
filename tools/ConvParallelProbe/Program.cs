@@ -285,7 +285,11 @@ internal static class Program
 
         // Record the op graph into a deferred scope (NOT `using` — keep the recorded buffers alive
         // through capture/replay; the scope's release-deferral gate frees them on Dispose at the end).
-        var scope = (AiDotNet.Tensors.Engines.Gpu.DeferredScope)gpu.BeginDeferredScope()!;
+        if (gpu.BeginDeferredScope() is not AiDotNet.Tensors.Engines.Gpu.DeferredScope scope)
+        {
+            Console.WriteLine("CAPTURE: BeginDeferredScope did not return a DeferredScope (GPU unavailable?)");
+            return 2;
+        }
         Tensor<float> r;
         AiDotNet.Tensors.Engines.Gpu.Graph.ExecutionGraph graph;
         try
