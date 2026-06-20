@@ -5194,8 +5194,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (backing is null) return false;
 
         OwnedBuffer owned;
+        // Expected GPU failures (alloc/upload) fall back to the eager in-place path; OOM must
+        // propagate rather than be silently swallowed. (#652 review)
         try { owned = GetOrAllocateBuffer(backend, tensor); }
-        catch { return false; }
+        catch (OutOfMemoryException) { throw; }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Trace.TraceWarning($"TryRunUnaryInPlaceResident upload fallback: {ex.GetType().Name}: {ex.Message}");
+            return false;
+        }
 
         var buf = owned.Buffer;
         int n = tensor.Length;
@@ -5209,8 +5216,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             op(backend, buf, n); // in-place buf→buf; recorded by RecordingGpuBackend
         }
-        catch
+        catch (OutOfMemoryException) { throw; }
+        catch (Exception ex)
         {
+            System.Diagnostics.Trace.TraceWarning($"TryRunUnaryInPlaceResident op fallback: {ex.GetType().Name}: {ex.Message}");
             if (owned.OwnsBuffer) owned.Dispose();
             return false;
         }
@@ -6346,24 +6355,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     ApplyGpuActivation(backend, outputBuffer.Buffer, outputSize, activation);
                 }
 
-                // #642 P3: when recording into a deferred execution graph, the Conv2D kernel
-                // above was RECORDED, not executed — an eager DownloadBuffer here would read the
-                // not-yet-computed (all-zero) output buffer. Hand the buffer to FinishGpuOp so
-                // the download is deferred to first CPU access (which happens after
-                // scope.Execute() replays the graph). The activation cache owns the buffer's
-                // lifetime from here, so we must NOT dispose it in the finally.
-                if (Gpu.DeferredScope.Current?.IsRecording == true)
-                {
-                    var lazyData = FinishGpuOp<T>(backend, outputBuffer, outputSize);
-                    outputHandedOff = true;
-                    return new Tensor<T>(lazyData, new[] { batch, outChannels, outHeight, outWidth });
-                }
-
-                // DownloadBuffer uses blocking read, Synchronize() removed for performance
-                float[] resultFloat = new float[outputSize];
-                backend.DownloadBuffer(outputBuffer.Buffer, resultFloat);
-
-                T[] resultData = DirectGpuEngine.FromFloatArray<T>(resultFloat);
+                // #642: hand the output to FinishGpuOp (lazy deferred download) UNCONDITIONALLY —
+                // same pattern as MaxPool2D/AvgPool2D and the scalar/reduction ops. Under a
+                // DeferredScope the Conv2D above was RECORDED not executed, so an eager
+                // DownloadBuffer here would read the not-yet-computed (zero) buffer; in eager mode
+                // the lazy result keeps the conv output GPU-resident so a chained op reuses it
+                // without a host round-trip (the #642 win). The activation cache owns the buffer's
+                // lifetime from here, so it must NOT be disposed in the finally.
+                var resultData = FinishGpuOp<T>(backend, outputBuffer, outputSize);
+                outputHandedOff = true;
                 return new Tensor<T>(resultData, new[] { batch, outChannels, outHeight, outWidth });
             }
         }
@@ -19186,7 +19186,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     }
                 }
             }
-            catch { }
+            catch (Exception ex) when (ex is not OutOfMemoryException)
+            {
+                // GPU concat failed — fall back to the CPU base. Surface the reason at Trace level
+                // (don't swallow silently); never mask OOM, which must propagate. (#652 review)
+                System.Diagnostics.Trace.TraceWarning($"GPU TensorConcatenate fallback to CPU: {ex.GetType().Name}: {ex.Message}");
+            }
         }
         return base.TensorConcatenate(tensors, axis);
     }
