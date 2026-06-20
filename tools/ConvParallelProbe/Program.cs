@@ -18,6 +18,7 @@ internal static class Program
         if (args.Length > 0 && args[0] == "--attnblock") return RunAttnBlock(eng, args);
         if (args.Length > 0 && args[0] == "--act") return RunAct(eng, args);
         if (args.Length > 0 && args[0] == "--gemm") return RunGemm(eng, args);
+        if (args.Length > 0 && args[0] == "--gemmprofile") return RunGemmProfile(eng, args);
         if (args.Length > 0 && args[0] == "--gpu") return RunGpu(args);
 
         int maxdop = ArgI(args, "--maxdop", Environment.ProcessorCount);
@@ -251,6 +252,51 @@ internal static class Program
         Console.WriteLine(
             $"GEMM M={M} K={K} N={N} fma={(double)M * K * N:E1} maxdop={maxdop} procs={Environment.ProcessorCount} " +
             $"median_ms={times[reps / 2]:F3} min_ms={times[0]:F3} max_ms={times[times.Length - 1]:F3} (warm={warm:E1}){u}");
+        return 0;
+    }
+
+    // P4 (#653): single-thread pack-vs-kernel attribution via PackBothProfiler (reflection,
+    // since it's internal). Answers whether the per-core gap is the RyuJIT microkernel or the
+    // pack/blocking overhead — which decides whether a machine-code microkernel is worth it.
+    private static int RunGemmProfile(CpuEngine eng, string[] a)
+    {
+        int M = ArgI(a, "--m", 512);
+        int K = ArgI(a, "--k", 1024);
+        int N = ArgI(a, "--n", 4096);
+        int reps = ArgI(a, "--reps", 20);
+        CpuParallelSettings.MaxDegreeOfParallelism = 1; // single-thread attribution
+
+        var asm = typeof(CpuEngine).Assembly;
+        var prof = asm.GetType("AiDotNet.Tensors.Engines.BlasManaged.PackBothProfiler");
+        if (prof == null) { Console.Error.WriteLine("PackBothProfiler not found"); return 2; }
+        const System.Reflection.BindingFlags SF = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static;
+        var enabledF = prof.GetField("Enabled", SF);
+        var resetM = prof.GetMethod("Reset", SF);
+        var packB = prof.GetProperty("PackBMs", SF);
+        var packA = prof.GetProperty("PackAMs", SF);
+        var kernel = prof.GetProperty("KernelMs", SF);
+
+        var rng = new Random(0);
+        var lhs = Rand(new[] { M, K }, rng);
+        var rhs = Rand(new[] { K, N }, rng);
+        var o = eng.BatchMatMul(lhs, rhs); // warm
+        float warm = o[0];
+
+        enabledF.SetValue(null, true);
+        resetM.Invoke(null, null);
+        var sw = Stopwatch.StartNew();
+        for (int i = 0; i < reps; i++) o = eng.BatchMatMul(lhs, rhs);
+        sw.Stop();
+        enabledF.SetValue(null, false);
+
+        double total = sw.Elapsed.TotalMilliseconds;
+        double pb = (double)packB.GetValue(null), pa = (double)packA.GetValue(null), kr = (double)kernel.GetValue(null);
+        double accounted = pb + pa + kr;
+        double gflops = reps * 2.0 * M * K * N / (total / 1000.0) / 1e9;
+        Console.WriteLine(
+            $"GEMMPROFILE M={M} K={K} N={N} reps={reps} total_ms={total:F1} GFLOPs={gflops:F1} | " +
+            $"kernel_ms={kr:F1} ({100*kr/accounted:F0}%) packA_ms={pa:F1} ({100*pa/accounted:F0}%) " +
+            $"packB_ms={pb:F1} ({100*pb/accounted:F0}%) accounted_ms={accounted:F1} (warm={warm:E1})");
         return 0;
     }
 
