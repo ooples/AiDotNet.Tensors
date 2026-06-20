@@ -68,6 +68,17 @@ internal static class Program
         int reps = ArgI(a, "--reps", 10);
         const int groups = 32;
 
+        if (maxdop < 1 || C < 1 || sp < 1 || blocks < 1 || reps < 1)
+        {
+            Console.Error.WriteLine("resblock: --maxdop, --c, --sp, --blocks, --reps must all be >= 1.");
+            return 2;
+        }
+        if (C % groups != 0)
+        {
+            Console.Error.WriteLine($"resblock: --c ({C}) must be a multiple of groups ({groups}).");
+            return 2;
+        }
+
         CpuParallelSettings.MaxDegreeOfParallelism = maxdop;
 
         var rng = new Random(0);
@@ -121,6 +132,13 @@ internal static class Program
         int C = ArgI(args, "--c", 256);
         int sp = ArgI(args, "--sp", 16);
         bool fused = ArgI(args, "--fused", 0) != 0;
+        int syncEvery = ArgI(args, "--syncevery", 1);
+
+        if (secs < 1 || C < 1 || sp < 1 || syncEvery < 1)
+        {
+            Console.Error.WriteLine("gpu: --secs, --c, --sp, --syncevery must all be >= 1.");
+            return 2;
+        }
 
         var gpu = new AiDotNet.Tensors.Engines.DirectGpuTensorEngine();
         AiDotNetEngine.Current = gpu;
@@ -154,7 +172,6 @@ internal static class Program
         w.Stop();
         Console.WriteLine($"warmup {(rb ? "resblock" : "conv")} {w.Elapsed.TotalMilliseconds:F0}ms (sink={sink:E2})");
 
-        int syncEvery = ArgI(args, "--syncevery", 1);
         long n = 0;
         var sw = Stopwatch.StartNew();
         while (sw.Elapsed.TotalMilliseconds < secs * 1000.0)
