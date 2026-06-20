@@ -9301,6 +9301,28 @@ public partial class CpuEngine : ITensorLevelEngine
             return;
         }
 
+        // Strategy 1.5: high-channel convs -> explicit im2col + BLAS GEMM.
+        // MEASURED (diffusion decoder + ResNet shapes, 32-thread CPU, 2026-06): a single
+        // im2col + BlasManaged.Gemm runs at ~350-440 GFLOP/s (the GEMM K dimension =
+        // inChannels*kH*kW is large enough that one packed machine-code GEMM reaches
+        // near hardware peak), whereas at high channel counts BOTH the on-the-fly fused
+        // kernel (~1 GFLOP/s) AND the SIMD-direct 3x3 kernel (~35-87 GFLOP/s) collapse.
+        // Routing these straight to im2col+BLAS is what makes a 1.2B-param diffusion
+        // UNet forward ~10x faster (per-block profile: 99% of the forward was ResBlock
+        // convs at >=384 input channels, mis-routed to the slow direct/fused paths and
+        // timing out the foundation-scale CI shards). The >=256 gate is conservative:
+        // every measured high-channel conv wins decisively (>300 GFLOP/s) while lower-
+        // channel / stem / depthwise convs stay on the direct cascade below where the
+        // transient im2col buffer is not worth it. Winograd keeps its large-spatial niche
+        // (output >= 224) since it cuts FLOPs 2.25x there.
+        if (inChannels >= 256 &&
+            !WinogradHelper.ShouldUseWinograd(kernelHeight, kernelWidth, stride, stride, dilation, dilation, outputHeight, outputWidth))
+        {
+            Conv2DWithIm2ColGemm(input, kernel, result, batch, inChannels, height, width,
+                outChannels, kernelHeight, kernelWidth, stride, padding, dilation, outputHeight, outputWidth);
+            return;
+        }
+
         // Strategy 2: Try fused im2col-GEMM with cache tiling (BLAS-based, faster for most sizes)
         if (FusedConvHelper.ShouldUseFusedConv(kernelHeight, kernelWidth, stride, stride,
             outputHeight, outputWidth, inChannels, outChannels))
@@ -14480,9 +14502,21 @@ public partial class CpuEngine : ITensorLevelEngine
             // batch-parallel loop collapses the wide-N transposed GEMM to
             // serial; stacking gradOutput + im2col along the K axis lets one
             // full-width GEMM fold the cross-batch sum into its K reduction.
+            //
+            // batch==1 is ALSO routed here (2026-06): the per-batch fallback below
+            // computes gradKernel = gradOutput · im2colᵀ as a transB=true GEMM whose
+            // M = outChannels is thin and whose transposed-B access is cache-hostile —
+            // MEASURED 30-63 GFLOP/s at the diffusion-decoder backward shapes (vs the
+            // forward conv's ~300-400). Building gradOutput TRANSPOSED turns it into a
+            // non-transposed GEMM with M = colH (large), which hits the fast machine-code
+            // kernel at ~300-400 GFLOP/s — a 5-9x backward-kernel speedup that the foundation
+            // -scale diffusion TRAINING tests need (one Kandinsky train iter was ~162s at the
+            // CI thread cap, dominated by this op). At batch==1 there is no cross-batch
+            // stacking, so the buffers are the same size the fallback already rents — the
+            // 64 MB element bound only needs to gate genuine multi-batch stacking.
             long kConcatElemsF = (long)colH * batch * colW;
             const long MaxKConcatElemsF = 16L * 1024 * 1024; // 64 MB of floats
-            if (batch >= 2 && kConcatElemsF <= MaxKConcatElemsF)
+            if (batch == 1 || (batch >= 2 && kConcatElemsF <= MaxKConcatElemsF))
             {
                 int batchColW = batch * colW;
                 var kcPool = System.Buffers.ArrayPool<float>.Shared;
