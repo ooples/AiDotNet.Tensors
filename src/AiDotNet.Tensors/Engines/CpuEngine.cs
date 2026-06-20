@@ -2295,6 +2295,190 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
 
+    /// <summary>
+    /// #639: backward for the AFFINE batch-norm (running-stats inference form used as the
+    /// differentiable batch=1 training fallback). mean/variance are CONSTANTS (running stats),
+    /// so only x, gamma, beta receive gradients. Rank-4 NCHW.
+    ///   y = gamma·(x-mean)·inv + beta,  inv = 1/sqrt(var+eps)
+    ///   dx      = gradY · gamma · inv                         (per-channel broadcast)
+    ///   dgamma  = Σ_{n,h,w} gradY · (x-mean)·inv
+    ///   dbeta   = Σ_{n,h,w} gradY
+    /// </summary>
+    internal Tensor<T> BatchNormAffineBackward<T>(
+        Tensor<T> gradOutput, Tensor<T> input, Tensor<T> gamma, Tensor<T> mean, Tensor<T> variance,
+        double epsilon, out Tensor<T> gradGamma, out Tensor<T> gradBeta)
+    {
+        if (gradOutput.Rank != 4 || input.Rank != 4)
+            throw new ArgumentException("BatchNormAffineBackward requires rank-4 NCHW tensors.");
+        int N = input._shape[0], C = input._shape[1], H = input._shape[2], W = input._shape[3];
+        int hw = H * W, chw = C * hw;
+
+        if (typeof(T) == typeof(float))
+        {
+            var go = (float[])(object)gradOutput.Contiguous().GetFlattenedData();
+            var xf = (float[])(object)input.Contiguous().GetFlattenedData();
+            var gf = (float[])(object)gamma.GetFlattenedData();
+            var mf = (float[])(object)mean.GetFlattenedData();
+            var vf = (float[])(object)variance.GetFlattenedData();
+            var dx = new float[N * chw];
+            var dg = new float[C];
+            var db = new float[C];
+            for (int c = 0; c < C; c++)
+            {
+                float inv = 1f / MathF.Sqrt(vf[c] + (float)epsilon);
+                float gc = gf[c], mc = mf[c];
+                float sg = 0f, sb = 0f;
+                float scale = gc * inv;
+                for (int n = 0; n < N; n++)
+                {
+                    int baseIdx = n * chw + c * hw;
+                    for (int i = 0; i < hw; i++)
+                    {
+                        float gy = go[baseIdx + i];
+                        sb += gy;
+                        sg += gy * (xf[baseIdx + i] - mc) * inv;
+                        dx[baseIdx + i] = gy * scale;
+                    }
+                }
+                dg[c] = sg; db[c] = sb;
+            }
+            gradGamma = TensorAllocator.Rent<T>(gamma._shape, (T[])(object)dg);
+            gradBeta = TensorAllocator.Rent<T>(gamma._shape, (T[])(object)db);
+            return TensorAllocator.Rent<T>(input._shape, (T[])(object)dx);
+        }
+        if (typeof(T) == typeof(double))
+        {
+            var go = (double[])(object)gradOutput.Contiguous().GetFlattenedData();
+            var xf = (double[])(object)input.Contiguous().GetFlattenedData();
+            var gf = (double[])(object)gamma.GetFlattenedData();
+            var mf = (double[])(object)mean.GetFlattenedData();
+            var vf = (double[])(object)variance.GetFlattenedData();
+            var dx = new double[N * chw];
+            var dg = new double[C];
+            var db = new double[C];
+            for (int c = 0; c < C; c++)
+            {
+                double inv = 1d / Math.Sqrt(vf[c] + epsilon);
+                double gc = gf[c], mc = mf[c];
+                double sg = 0d, sb = 0d;
+                double scale = gc * inv;
+                for (int n = 0; n < N; n++)
+                {
+                    int baseIdx = n * chw + c * hw;
+                    for (int i = 0; i < hw; i++)
+                    {
+                        double gy = go[baseIdx + i];
+                        sb += gy;
+                        sg += gy * (xf[baseIdx + i] - mc) * inv;
+                        dx[baseIdx + i] = gy * scale;
+                    }
+                }
+                dg[c] = sg; db[c] = sb;
+            }
+            gradGamma = TensorAllocator.Rent<T>(gamma._shape, (T[])(object)dg);
+            gradBeta = TensorAllocator.Rent<T>(gamma._shape, (T[])(object)db);
+            return TensorAllocator.Rent<T>(input._shape, (T[])(object)dx);
+        }
+
+        // Generic fallback
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var goG = gradOutput.Contiguous().GetFlattenedData();
+        var xG = input.Contiguous().GetFlattenedData();
+        var gG = gamma.GetFlattenedData();
+        var mG = mean.GetFlattenedData();
+        var vG = variance.GetFlattenedData();
+        var dxG = new T[N * chw];
+        var dgG = new T[C];
+        var dbG = new T[C];
+        T epsT = numOps.FromDouble(epsilon);
+        for (int c = 0; c < C; c++)
+        {
+            T inv = numOps.Divide(numOps.One, numOps.Sqrt(numOps.Add(vG[c], epsT)));
+            T scale = numOps.Multiply(gG[c], inv);
+            T sg = numOps.Zero, sb = numOps.Zero;
+            for (int n = 0; n < N; n++)
+            {
+                int baseIdx = n * chw + c * hw;
+                for (int i = 0; i < hw; i++)
+                {
+                    T gy = goG[baseIdx + i];
+                    sb = numOps.Add(sb, gy);
+                    sg = numOps.Add(sg, numOps.Multiply(numOps.Multiply(gy, numOps.Subtract(xG[baseIdx + i], mG[c])), inv));
+                    dxG[baseIdx + i] = numOps.Multiply(gy, scale);
+                }
+            }
+            dgG[c] = sg; dbG[c] = sb;
+        }
+        gradGamma = TensorAllocator.Rent<T>(gamma._shape, dgG);
+        gradBeta = TensorAllocator.Rent<T>(gamma._shape, dbG);
+        return TensorAllocator.Rent<T>(input._shape, dxG);
+    }
+
+    /// <summary>
+    /// #639: DIFFERENTIABLE affine batch-norm (running-stats form): y = gamma·(x-mean)·inv + beta,
+    /// inv = 1/sqrt(var+eps). Records ONE tape/graph node (vs the ~6 primitive ops the consumer's
+    /// batch=1 BN fallback decomposes into), with gradients to x, gamma, beta (mean/variance are
+    /// constant running stats). Forward math is identical to <see cref="BatchNormInference{T}"/>;
+    /// the difference is it carries a backward so it can be used in TRAINING at batch=1 (where the
+    /// batch-stats BatchNorm collapses). Rank-4 NCHW; gamma/beta/mean/variance are <c>[C]</c>.
+    /// <para>
+    /// <b>GPU coverage (intentional CPU forward).</b> There is no native GPU override of this
+    /// FORWARD: on a <see cref="DirectGpuTensorEngine"/> it runs the CPU in-place
+    /// <see cref="BatchNormInferenceInto{T}"/> (downloading/uploading the rank-4 operand). This is
+    /// deliberate — #639 targets the per-step OP-COUNT explosion in batch=1 training (one fused node
+    /// instead of ~6 broadcast ops), a win on either device, and batch=1 is a rare/small op where a
+    /// dedicated GPU kernel + dispatch would not pay for itself. The differentiable BACKWARD
+    /// (<see cref="BackwardFunctions{T}.BatchNormAffineBackward"/>) DOES route GPU engines through
+    /// device-resident primitives (it only takes the CPU fused kernel when <c>!SupportsGpu</c>). A
+    /// native GPU forward kernel is a follow-up under #639.
+    /// </para>
+    /// </summary>
+    public virtual Tensor<T> BatchNormAffine<T>(Tensor<T> x, Tensor<T> gamma, Tensor<T> beta, Tensor<T> mean, Tensor<T> variance, double epsilon)
+    {
+        if (x == null) throw new ArgumentNullException(nameof(x));
+        if (gamma == null) throw new ArgumentNullException(nameof(gamma));
+        if (beta == null) throw new ArgumentNullException(nameof(beta));
+        if (mean == null) throw new ArgumentNullException(nameof(mean));
+        if (variance == null) throw new ArgumentNullException(nameof(variance));
+        if (x.Rank != 4) throw new ArgumentException($"BatchNormAffine requires rank-4 NCHW input, got rank {x.Rank}.");
+
+        var xOrig = x;
+        if (!x.IsContiguous) x = x.Contiguous();
+
+        // GraphMode: record a single lazy node; the realize closure recomputes the affine
+        // result so the compiled plan reads the CURRENT running mean/variance each step.
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var capX = x; var capG = gamma; var capB = beta; var capM = mean; var capV = variance; double capE = epsilon;
+                var lazy = scope.RecordVariadic(LazyNodeType.Custom, "BatchNormAffine",
+                    new[] { xOrig, gamma, beta }, x._shape,
+                    (eng, output) =>
+                    {
+                        if (eng is CpuEngine cpuEng)
+                            cpuEng.BatchNormInferenceInto(output, capX, capG, capB, capM, capV, capE);
+                        else
+                        {
+                            var r = eng.BatchNormInference(capX, capG, capB, capM, capV, capE);
+                            DirectGpuTensorEngine.CopyResultInto(eng, r, output);
+                        }
+                    },
+                    BackwardFunctions<T>.BatchNormAffineBackward,
+                    new object[] { mean, variance, epsilon });
+                return lazy;
+            }
+        }
+
+        // Eager path: compute the affine result, then record one differentiable node.
+        var result = new Tensor<T>(x._shape);
+        BatchNormInferenceInto(result, x, gamma, beta, mean, variance, epsilon);
+        DifferentiableOps.RecordIfActive("BatchNormAffine", result, new[] { xOrig, gamma, beta },
+            BackwardFunctions<T>.BatchNormAffineBackward, new object[] { mean, variance, epsilon });
+        return result;
+    }
+
     /// <inheritdoc/>
     public virtual Tensor<T> BatchNormInference<T>(Tensor<T> x, Tensor<T> gamma, Tensor<T> beta, Tensor<T> mean, Tensor<T> variance, double epsilon)
     {
@@ -12998,18 +13182,30 @@ public partial class CpuEngine : ITensorLevelEngine
                 return entry.Data;
             }
 
-            // Stale (weights mutated in place since the transpose was built)
-            // or missing — rebuild from the live kernel contents. Remove+
-            // GetValue rather than AddOrUpdate: net471's ConditionalWeakTable
-            // has no AddOrUpdate, and a concurrent racer at worst redoes the
-            // transpose once.
+            // Stale (weights mutated in place since the transpose was built) or
+            // missing. #639: in TRAINING the weights change every optimizer step, so
+            // this rebuilds every step. REUSE the stale entry's buffer (same size)
+            // instead of allocating a fresh float[] each rebuild — that was ~116 MB/step
+            // of pure GC churn on MobileNetV3 batch=1. Conv ops in the compiled-plan
+            // replay run sequentially, so no other thread is mid-read of this kernel's
+            // transpose while we overwrite it.
+            int needed = cols * rows;
+            float[] kernelT = (entry != null && entry.Data.Length == needed)
+                ? entry.Data
+                : new float[needed];
+            TransposeFloatParallel(kernel, 0, kernelT, 0, rows, cols);
             _kernelTransposeCache.Remove(kernel);
-            return _kernelTransposeCache.GetValue(kernel, k =>
+            try
             {
-                var kernelT = new float[cols * rows];
-                TransposeFloatParallel(k, 0, kernelT, 0, rows, cols);
-                return new KernelTransposeEntry(kernelT, epoch, sourceVersion);
-            }).Data;
+                _kernelTransposeCache.Add(kernel, new KernelTransposeEntry(kernelT, epoch, sourceVersion));
+            }
+            catch (ArgumentException)
+            {
+                // A concurrent caller re-added an entry between Remove and Add. Our
+                // kernelT is a correct transpose of the CURRENT kernel, so return it;
+                // the cache holding the racer's (equally-correct) buffer is fine.
+            }
+            return kernelT;
         }
 
         /// <summary>
@@ -13789,11 +13985,17 @@ public partial class CpuEngine : ITensorLevelEngine
                 Array.Clear(destF, destOff, batch * inChannels * height * width);
             var gradOutputF = (float[])(object)gradOutput.GetFlattenedData();
             var kernelF = (float[])(object)kernel.GetFlattenedData();
-            var kernelT = new float[colH * outChannels];
+            var pool = System.Buffers.ArrayPool<float>.Shared;
+            // #639: rent the transposed-kernel scratch instead of `new float[]` per call.
+            // Its size is fixed per layer (only the contents change each step), and the
+            // weights change every step so this can't be content-cached — it was ~130 MB/step
+            // of pure GC churn on MobileNetV3 batch=1 (a gen2 collection every ~2 steps).
+            var kernelT = pool.Rent(colH * outChannels);
+            try
+            {
             for (int r = 0; r < outChannels; r++)
                 for (int c = 0; c < colH; c++)
                     kernelT[c * outChannels + r] = kernelF[r * colH + c];
-            var pool = System.Buffers.ArrayPool<float>.Shared;
             long col2imWorkF = (long)inChannels * kernelHeight * kernelWidth * colW;
             void ProcessImageInputF(int b, bool channelParallel)
             {
@@ -13846,6 +14048,8 @@ public partial class CpuEngine : ITensorLevelEngine
                     b => ProcessImageInputF(b, channelParallel: false));
             else
                 for (int b = 0; b < batch; b++) ProcessImageInputF(b, channelParallel: true);
+            }
+            finally { pool.Return(kernelT); }
             return;
         }
 
@@ -14742,12 +14946,17 @@ public partial class CpuEngine : ITensorLevelEngine
             int totalLen = outChannels * colH;
             var destF = (float[])(object)dest._storage.GetDataArray();
             int destOff = dest._storageOffset;
-            // Local accumulator: per-batch BLAS writes into localGrad; merge into dest at end.
-            var gradKernelF = new float[totalLen];
+            var kPool = System.Buffers.ArrayPool<float>.Shared;
+            // #639: rent the kernel-gradient accumulator instead of `new float[]` per call.
+            // Weights change every step so it can't be content-cached — it was per-step GC
+            // churn. Rented buffers aren't zeroed and this is a += accumulator, so clear it.
+            var gradKernelF = kPool.Rent(totalLen);
+            try
+            {
+            Array.Clear(gradKernelF, 0, totalLen);
             var gradOutputF = (float[])(object)gradOutput.GetFlattenedData();
             var inputF = (float[])(object)input.GetFlattenedData();
             int inputSliceSize = inChannels * height * width;
-            var kPool = System.Buffers.ArrayPool<float>.Shared;
             long im2colWorkKF = (long)inChannels * kernelHeight * kernelWidth * colW;
 
             // Per-image: build im2col(input_b) then GEMM gradOut_b @ im2col^T into
@@ -14849,6 +15058,8 @@ public partial class CpuEngine : ITensorLevelEngine
                 for (int i = 0; i < totalLen; i++) destF[destOff + i] += gradKernelF[i];
             else
                 Array.Copy(gradKernelF, 0, destF, destOff, totalLen);
+            }
+            finally { kPool.Return(gradKernelF); }
             return;
         }
 
@@ -15633,6 +15844,102 @@ public partial class CpuEngine : ITensorLevelEngine
         int outputWidth = gradOutput._shape[3];
         int outChannels = inChannels * multiplier;
 
+        // #639: typed float/double fast paths. The generic loop below runs every
+        // multiply-add through INumericOperations<T> virtual dispatch — pathological
+        // for depthwise-heavy nets (MobileNet, EfficientNet). These typed paths use
+        // raw arrays in a plain inline loop. NOTE: deliberately NOT wrapped in
+        // ParallelForOrSerial — depthwise backward at batch-1/inference shapes is a
+        // few hundred microseconds, where the per-call delegate + closure + pool
+        // dispatch overhead measurably EXCEEDS the work (it regressed this path 3.9 ->
+        // 7.0 ms before being removed). The per-element accumulation order matches the
+        // generic path, so the result is bit-for-bit identical.
+        if (typeof(T) == typeof(float))
+        {
+            var goF = (float[])(object)gradOutput.GetFlattenedData();
+            var kF = (float[])(object)kernel.GetFlattenedData();
+            var giF = new float[batch * inChannels * height * width];
+            for (int ic = 0; ic < inChannels; ic++)
+            {
+                for (int b = 0; b < batch; b++)
+                {
+                    int giChan = (b * inChannels + ic) * height * width;
+                    for (int m = 0; m < multiplier; m++)
+                    {
+                        int oc = ic * multiplier + m;
+                        int goChan = (b * outChannels + oc) * outputHeight * outputWidth;
+                        int kBase = oc * kernelHeight * kernelWidth;
+                        for (int oh = 0; oh < outputHeight; oh++)
+                        {
+                            for (int ow = 0; ow < outputWidth; ow++)
+                            {
+                                float g = goF[goChan + oh * outputWidth + ow];
+                                if (g == 0f) continue;
+                                int ihB = oh * strideH - padH;
+                                int iwB = ow * strideW - padW;
+                                for (int kh = 0; kh < kernelHeight; kh++)
+                                {
+                                    int ih = ihB + kh;
+                                    if (ih < 0 || ih >= height) continue;
+                                    int giRow = giChan + ih * width;
+                                    int kRow = kBase + kh * kernelWidth;
+                                    for (int kw = 0; kw < kernelWidth; kw++)
+                                    {
+                                        int iw = iwB + kw;
+                                        if (iw < 0 || iw >= width) continue;
+                                        giF[giRow + iw] += g * kF[kRow + kw];
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return TensorAllocator.Rent<T>(inputShape, (T[])(object)giF);
+        }
+        if (typeof(T) == typeof(double))
+        {
+            var goD = (double[])(object)gradOutput.GetFlattenedData();
+            var kD = (double[])(object)kernel.GetFlattenedData();
+            var giD = new double[batch * inChannels * height * width];
+            for (int ic = 0; ic < inChannels; ic++)
+            {
+                for (int b = 0; b < batch; b++)
+                {
+                    int giChan = (b * inChannels + ic) * height * width;
+                    for (int m = 0; m < multiplier; m++)
+                    {
+                        int oc = ic * multiplier + m;
+                        int goChan = (b * outChannels + oc) * outputHeight * outputWidth;
+                        int kBase = oc * kernelHeight * kernelWidth;
+                        for (int oh = 0; oh < outputHeight; oh++)
+                        {
+                            for (int ow = 0; ow < outputWidth; ow++)
+                            {
+                                double g = goD[goChan + oh * outputWidth + ow];
+                                if (g == 0d) continue;
+                                int ihB = oh * strideH - padH;
+                                int iwB = ow * strideW - padW;
+                                for (int kh = 0; kh < kernelHeight; kh++)
+                                {
+                                    int ih = ihB + kh;
+                                    if (ih < 0 || ih >= height) continue;
+                                    int giRow = giChan + ih * width;
+                                    int kRow = kBase + kh * kernelWidth;
+                                    for (int kw = 0; kw < kernelWidth; kw++)
+                                    {
+                                        int iw = iwB + kw;
+                                        if (iw < 0 || iw >= width) continue;
+                                        giD[giRow + iw] += g * kD[kRow + kw];
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return TensorAllocator.Rent<T>(inputShape, (T[])(object)giD);
+        }
+
         var gradInput = new T[batch * inChannels * height * width];
         var gradOutputData = gradOutput.GetFlattenedData();
         var kernelData = kernel.GetFlattenedData();
@@ -15701,6 +16008,94 @@ public partial class CpuEngine : ITensorLevelEngine
 
         int outputHeight = gradOutput._shape[2];
         int outputWidth = gradOutput._shape[3];
+        int outChannels = inChannels * multiplier;
+
+        // #639: typed float/double fast paths (see DepthwiseConv2DBackwardInput). Each
+        // output channel's gradient slab is independent, so we parallelize over input
+        // channels and accumulate each kernel element with the SAME b,oh,ow order as the
+        // generic loop — bit-for-bit identical and deterministic-safe.
+        if (typeof(T) == typeof(float))
+        {
+            var goF = (float[])(object)gradOutput.GetFlattenedData();
+            var inF = (float[])(object)input.GetFlattenedData();
+            var gkF = new float[inChannels * multiplier * kernelHeight * kernelWidth];
+            for (int ic = 0; ic < inChannels; ic++)
+            {
+                for (int m = 0; m < multiplier; m++)
+                {
+                    int oc = ic * multiplier + m;
+                    int kBase = oc * kernelHeight * kernelWidth;
+                    for (int kh = 0; kh < kernelHeight; kh++)
+                    {
+                        for (int kw = 0; kw < kernelWidth; kw++)
+                        {
+                            float sum = 0f;
+                            for (int b = 0; b < batch; b++)
+                            {
+                                int goChan = (b * outChannels + oc) * outputHeight * outputWidth;
+                                int inChan = (b * inChannels + ic) * height * width;
+                                for (int oh = 0; oh < outputHeight; oh++)
+                                {
+                                    int ih = oh * strideH + kh - padH;
+                                    if (ih < 0 || ih >= height) continue;
+                                    int inRow = inChan + ih * width;
+                                    int goRow = goChan + oh * outputWidth;
+                                    for (int ow = 0; ow < outputWidth; ow++)
+                                    {
+                                        int iw = ow * strideW + kw - padW;
+                                        if (iw < 0 || iw >= width) continue;
+                                        sum += goF[goRow + ow] * inF[inRow + iw];
+                                    }
+                                }
+                            }
+                            gkF[kBase + kh * kernelWidth + kw] = sum;
+                        }
+                    }
+                }
+            }
+            return TensorAllocator.Rent<T>(kernelShape, (T[])(object)gkF);
+        }
+        if (typeof(T) == typeof(double))
+        {
+            var goD = (double[])(object)gradOutput.GetFlattenedData();
+            var inD = (double[])(object)input.GetFlattenedData();
+            var gkD = new double[inChannels * multiplier * kernelHeight * kernelWidth];
+            for (int ic = 0; ic < inChannels; ic++)
+            {
+                for (int m = 0; m < multiplier; m++)
+                {
+                    int oc = ic * multiplier + m;
+                    int kBase = oc * kernelHeight * kernelWidth;
+                    for (int kh = 0; kh < kernelHeight; kh++)
+                    {
+                        for (int kw = 0; kw < kernelWidth; kw++)
+                        {
+                            double sum = 0d;
+                            for (int b = 0; b < batch; b++)
+                            {
+                                int goChan = (b * outChannels + oc) * outputHeight * outputWidth;
+                                int inChan = (b * inChannels + ic) * height * width;
+                                for (int oh = 0; oh < outputHeight; oh++)
+                                {
+                                    int ih = oh * strideH + kh - padH;
+                                    if (ih < 0 || ih >= height) continue;
+                                    int inRow = inChan + ih * width;
+                                    int goRow = goChan + oh * outputWidth;
+                                    for (int ow = 0; ow < outputWidth; ow++)
+                                    {
+                                        int iw = ow * strideW + kw - padW;
+                                        if (iw < 0 || iw >= width) continue;
+                                        sum += goD[goRow + ow] * inD[inRow + iw];
+                                    }
+                                }
+                            }
+                            gkD[kBase + kh * kernelWidth + kw] = sum;
+                        }
+                    }
+                }
+            }
+            return TensorAllocator.Rent<T>(kernelShape, (T[])(object)gkD);
+        }
 
         var gradKernel = new T[inChannels * multiplier * kernelHeight * kernelWidth];
         var gradOutputData = gradOutput.GetFlattenedData();
