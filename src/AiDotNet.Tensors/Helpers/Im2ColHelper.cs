@@ -69,6 +69,84 @@ internal static class Im2ColHelper
     }
 
     /// <summary>
+    /// Channel-parallel single-image im2col for the stride=1/dilation=1 fast path
+    /// (the dominant CNN/diffusion conv case). Each input channel writes only its own
+    /// <c>kH·kW</c> contiguous rows of the column matrix and reads only its own H·W input
+    /// slab, so the per-channel work is fully disjoint — bit-identical to the serial form
+    /// regardless of thread count, hence <c>deterministicSafe: true</c>. The serial
+    /// <see cref="Im2ColSingleImage"/> build was a chunk of the FORWARD conv's serial
+    /// fraction at batch=1 (the GEMM scales but the im2col didn't). Falls back to the
+    /// serial path for general stride/dilation. Pointers are captured as IntPtr (a
+    /// lambda can't close over <c>float*</c>); the <c>fixed</c> block outlives the
+    /// synchronous parallel call.
+    /// </summary>
+    public static unsafe void Im2ColChannelParallel(
+        ReadOnlySpan<float> input,
+        Span<float> output,
+        int channels, int height, int width,
+        int kernelH, int kernelW,
+        int strideH, int strideW,
+        int padH, int padW,
+        int dilationH, int dilationW,
+        int outputH, int outputW)
+    {
+        if (strideH != 1 || strideW != 1 || dilationH != 1 || dilationW != 1)
+        {
+            // General stride/dilation: keep the existing serial single-image path.
+            Im2ColSingleImage(input, output, channels, height, width,
+                kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW,
+                outputH, outputW);
+            return;
+        }
+
+        int kHW = kernelH * kernelW;
+        int colW = outputH * outputW;
+        output.Slice(0, channels * kHW * colW).Clear(); // padding handled once up front
+        long work = (long)channels * kHW * colW;
+        fixed (float* inP = input)
+        fixed (float* outP = output)
+        {
+            IntPtr inPtr = (IntPtr)inP;
+            IntPtr outPtr = (IntPtr)outP;
+            AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(
+                0, channels, work, c =>
+                {
+                    float* inputPtr = (float*)inPtr;
+                    float* outputPtr = (float*)outPtr;
+                    int channelOffset = c * height * width;
+                    int rowIdx = c * kHW;
+                    for (int kh = 0; kh < kernelH; kh++)
+                    {
+                        int ohStart = Math.Max(0, padH - kh);
+                        int ohEnd = Math.Min(outputH, height + padH - kh);
+                        for (int kw = 0; kw < kernelW; kw++)
+                        {
+                            int owStart = Math.Max(0, padW - kw);
+                            int owEnd = Math.Min(outputW, width + padW - kw);
+                            int validWidth = owEnd - owStart;
+                            if (validWidth > 0 && ohEnd > ohStart)
+                            {
+                                float* outRow = outputPtr + rowIdx * colW;
+                                for (int oh = ohStart; oh < ohEnd; oh++)
+                                {
+                                    int ih = oh + kh - padH;
+                                    int inputStart = channelOffset + ih * width + (owStart + kw - padW);
+                                    int outputStart = oh * outputW + owStart;
+                                    Buffer.MemoryCopy(
+                                        inputPtr + inputStart,
+                                        outRow + outputStart,
+                                        validWidth * sizeof(float),
+                                        validWidth * sizeof(float));
+                                }
+                            }
+                            rowIdx++;
+                        }
+                    }
+                }, deterministicSafe: true);
+        }
+    }
+
+    /// <summary>
     /// Performs im2col on a single image (no batch dimension).
     /// Optimized row-by-row processing for better cache utilization and SIMD.
     /// </summary>

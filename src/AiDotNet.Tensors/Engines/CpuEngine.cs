@@ -9477,11 +9477,14 @@ public partial class CpuEngine : ITensorLevelEngine
 
         for (int b = 0; b < batch; b++)
         {
-            // Step 1: im2col for this batch slice only
-            Helpers.Im2ColHelper.Im2Col(
+            // Step 1: im2col for this batch slice only — channel-parallel (each input
+            // channel writes disjoint column rows). The serial build was part of the
+            // forward conv's serial fraction once the GEMM was parallelized.
+            Helpers.Im2ColHelper.Im2ColChannelParallel(
                 inputSpan.Slice(b * inputSliceSize, inputSliceSize), im2colSpan,
-                1, inChannels, height, width,
-                kernelHeight, kernelWidth, stride, stride, padding, padding, dilation, dilation);
+                inChannels, height, width,
+                kernelHeight, kernelWidth, stride, stride, padding, padding, dilation, dilation,
+                outputHeight, outputWidth);
 
             // Step 2: GEMM for this batch
             int outputOffset = b * outChannels * colW;
