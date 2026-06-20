@@ -504,6 +504,65 @@ internal static class Im2ColHelper
     }
 
     /// <summary>
+    /// Channel-parallel col2im scatter (float, array-based). Identical math to
+    /// <see cref="Col2ImAccumulate(ReadOnlySpan{float}, Span{float}, int, int, int, int, int, int, int, int, int, int, int, int)"/>
+    /// but fans the outer channel loop across cores. Each input channel <c>c</c> reads
+    /// only its own contiguous column row-block (<c>colData[colOffset + c*kHW*colW ..]</c>)
+    /// and writes only its own <c>imageData[imgOffset + c*H*W ..]</c> slab, so the work is
+    /// fully disjoint per channel — bit-identical to the serial form regardless of thread
+    /// count (each input pixel's <c>+=</c> order within a channel is unchanged), hence
+    /// <c>deterministicSafe: true</c> so it stays parallel under DeterministicReductions.
+    /// Array-based (not Span) because the parallel body must capture the buffers.
+    /// <para>
+    /// Motivation: the serial Span overload was the dominant cost of
+    /// <c>Conv2DBackwardInput</c> at batch=1 — measured ~52 GFLOP/s on a 32-thread box
+    /// (i.e. running on a single core), the bottleneck of foundation-scale diffusion
+    /// TRAINING (Kandinsky-class). The GEMM half was already BLAS-parallel; this scatter
+    /// was not.
+    /// </para>
+    /// </summary>
+    public static void Col2ImAccumulateChannelParallel(
+        float[] colData, int colOffset,
+        float[] imageData, int imgOffset,
+        int channels, int height, int width,
+        int kernelH, int kernelW,
+        int strideH, int strideW,
+        int padH, int padW,
+        int dilationH, int dilationW,
+        int outputH, int outputW)
+    {
+        int kHW = kernelH * kernelW;
+        int colW = outputH * outputW;
+        long totalWork = (long)channels * kHW * colW;
+        int hw = height * width;
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(
+            0, channels, totalWork, c =>
+            {
+                int colIdx = colOffset + c * kHW * colW;
+                int imgChannelBase = imgOffset + c * hw;
+                for (int kh = 0; kh < kernelH; kh++)
+                {
+                    for (int kw = 0; kw < kernelW; kw++)
+                    {
+                        for (int oh = 0; oh < outputH; oh++)
+                        {
+                            int ih = oh * strideH + kh * dilationH - padH;
+                            for (int ow = 0; ow < outputW; ow++)
+                            {
+                                int iw = ow * strideW + kw * dilationW - padW;
+                                if (ih >= 0 && ih < height && iw >= 0 && iw < width)
+                                {
+                                    imageData[imgChannelBase + ih * width + iw] += colData[colIdx];
+                                }
+                                colIdx++;
+                            }
+                        }
+                    }
+                }
+            }, deterministicSafe: true);
+    }
+
+    /// <summary>
     /// col2im: inverse of im2col. Accumulates column matrix values back into a spatial
     /// image buffer. Multiple column entries can map to the same spatial position (due to
     /// overlapping receptive fields), so values are ADDED (not overwritten). The output

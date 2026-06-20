@@ -13549,9 +13549,17 @@ public partial class CpuEngine : ITensorLevelEngine
                     }
 
                     int imgOff = b * inChannels * height * width;
-                    Im2ColHelper.Col2ImAccumulate(
-                        new ReadOnlySpan<float>(colBuf, 0, colW * colH),
-                        new Span<float>(gradInputF, imgOff, inChannels * height * width),
+                    // Channel-parallel scatter: the serial Span col2im was the dominant
+                    // cost of this op at batch=1 (~52 GFLOP/s on 32 cores = single-core),
+                    // the foundation-scale diffusion TRAINING bottleneck. Per-channel work
+                    // is disjoint (each c reads its own column row-block and writes its own
+                    // image slab) so this stays parallel even under DeterministicReductions
+                    // and is bit-identical. When the outer batch loop itself ran parallel
+                    // (batch>1, non-deterministic), ParallelForOrSerial self-gates to serial
+                    // here to avoid nesting.
+                    Im2ColHelper.Col2ImAccumulateChannelParallel(
+                        colBuf, 0,
+                        gradInputF, imgOff,
                         inChannels, height, width,
                         kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW,
                         outputHeight, outputWidth);
