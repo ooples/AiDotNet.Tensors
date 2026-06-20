@@ -165,19 +165,28 @@ public sealed class GroupNormDeferredCaptureTests : IDisposable
         int beginThread = System.Environment.CurrentManagedThreadId;
 
         GpuBufferReleaseDeferral.Begin();
-        Assert.True(GpuBufferReleaseDeferral.TryDefer(() => flushed.Add("a")));
+        try
+        {
+            Assert.True(GpuBufferReleaseDeferral.TryDefer(() => flushed.Add("a")));
 
-        // Force a real thread hop: the continuation almost certainly resumes on another pool thread.
-        await System.Threading.Tasks.Task.Run(() => System.Threading.Thread.Sleep(1)).ConfigureAwait(false);
-
-        // On the (likely different) continuation thread the AsyncLocal state must still be visible.
-        Assert.True(GpuBufferReleaseDeferral.IsActive);
-        Assert.True(GpuBufferReleaseDeferral.TryDefer(() => flushed.Add("b")));
-
-        GpuBufferReleaseDeferral.EndAndRelease();   // outermost end → flush both, regardless of thread
+            // LongRunning + the default scheduler forces a DEDICATED new thread (deterministic hop),
+            // and the ExecutionContext capture flows the AsyncLocal gate to it.
+            await System.Threading.Tasks.Task.Factory.StartNew(() =>
+            {
+                Assert.NotEqual(beginThread, System.Environment.CurrentManagedThreadId);
+                Assert.True(GpuBufferReleaseDeferral.IsActive);
+                Assert.True(GpuBufferReleaseDeferral.TryDefer(() => flushed.Add("b")));
+            },
+            System.Threading.CancellationToken.None,
+            System.Threading.Tasks.TaskCreationOptions.LongRunning,
+            System.Threading.Tasks.TaskScheduler.Default).ConfigureAwait(false);
+        }
+        finally
+        {
+            GpuBufferReleaseDeferral.EndAndRelease();   // outermost end → flush both, regardless of thread
+        }
         Assert.False(GpuBufferReleaseDeferral.IsActive);
         Assert.Equal(new[] { "a", "b" }, flushed);
-        _ = beginThread; // (continuation thread may differ — that's the point)
     }
 
     [SkippableFact]
