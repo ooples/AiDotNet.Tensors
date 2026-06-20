@@ -145,6 +145,58 @@ public sealed class GroupNormDeferredCaptureTests : IDisposable
         Assert.True(defDiff < Tolerance, $"Deferred GPU channel-concat diverged from CPU: maxDiff={defDiff}");
     }
 
+    // Runs `op` eagerly, then inside a deferred scope; asserts the deferred result matches eager.
+    // Proves the op's backend kernel is RECORDED (replays in order) rather than running eagerly
+    // mid-record on not-yet-computed buffers (#642 structural-op coverage).
+    private void AssertDeferredMatchesEager(string name, Func<Tensor<float>> op)
+    {
+        var eager = op();
+        var eagerCopy = new float[eager.Length];
+        for (int i = 0; i < eager.Length; i++) eagerCopy[i] = eager[i];
+
+        Tensor<float> deferred;
+        using (var scope = _gpu!.BeginDeferredScope())
+        {
+            Skip.If(scope is null, "Deferred execution unsupported.");
+            deferred = op();
+            scope!.Execute();
+        }
+        float maxDiff = 0;
+        for (int i = 0; i < Math.Min(eagerCopy.Length, deferred.Length); i++)
+            maxDiff = Math.Max(maxDiff, Math.Abs(eagerCopy[i] - deferred[i]));
+        Assert.True(maxDiff < Tolerance, $"Deferred {name} diverged from eager: maxDiff={maxDiff}");
+    }
+
+    [SkippableFact]
+    public void DeferredUpsample_MatchesEager()
+    {
+        Skip.IfNot(_gpuAvailable, "No CUDA device.");
+        var input = Rand(new[] { 1, C, Sp, Sp }, 11);
+        AssertDeferredMatchesEager("Upsample", () => _gpu!.Upsample(input, 2, 2));
+    }
+
+    [SkippableFact]
+    public void DeferredMaxPool2D_MatchesEager()
+    {
+        Skip.IfNot(_gpuAvailable, "No CUDA device.");
+        var input = Rand(new[] { 1, C, Sp, Sp }, 12);
+        AssertDeferredMatchesEager("MaxPool2D", () => _gpu!.MaxPool2D(input, 2, 2, 0));
+    }
+
+    // NOTE: AvgPool2D is intentionally NOT covered here — it is not yet deferred-safe (its kernel
+    // intermittently crashes the process under deferred replay; root cause TBD, #642). It stays on
+    // the eager path and is not recorded. Standard SD UNets use strided conv, not avgpool.
+
+    [SkippableFact]
+    public void DeferredConvTranspose2D_MatchesEager()
+    {
+        Skip.IfNot(_gpuAvailable, "No CUDA device.");
+        var input = Rand(new[] { 1, C, Sp, Sp }, 14);
+        var kernel = Rand(new[] { C, C, 2, 2 }, 15);   // [inC, outC, kH, kW]
+        AssertDeferredMatchesEager("ConvTranspose2D",
+            () => _gpu!.ConvTranspose2D(input, kernel, new[] { 2, 2 }, new[] { 0, 0 }, new[] { 0, 0 }));
+    }
+
     [SkippableFact]
     public void CudaGraphCapture_ReplaysResBlockCorrectly()
     {

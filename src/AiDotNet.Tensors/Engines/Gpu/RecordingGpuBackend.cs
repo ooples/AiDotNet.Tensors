@@ -757,6 +757,63 @@ public class RecordingGpuBackend : DelegatingGpuBackend
     }
 
     /// <inheritdoc/>
+    public override void NearestNeighborUpsample(IGpuBuffer input, IGpuBuffer output, int batchChannels, int height, int width, int scaleFactor)
+    {
+        // #642: record UNet upsample so it replays in order in a deferred graph (was eager mid-record).
+        RecordOrExecute(KernelType.ElementWise, new[] { input }, new[] { output },
+            () => Inner.NearestNeighborUpsample(input, output, batchChannels, height, width, scaleFactor));
+    }
+
+    /// <inheritdoc/>
+    public override void ConvTranspose2D(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer output,
+        int batch, int inChannels, int inHeight, int inWidth,
+        int outChannels, int outHeight, int outWidth,
+        int kernelH, int kernelW,
+        int strideH, int strideW, int padH, int padW,
+        int outputPadH, int outputPadW)
+    {
+        // #642: record transposed-conv (UNet decoder upsample) for deferred replay.
+        RecordOrExecute(KernelType.Conv2D, new[] { input, kernel }, new[] { output },
+            () => Inner.ConvTranspose2D(input, kernel, output, batch, inChannels, inHeight, inWidth,
+                outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, outputPadH, outputPadW));
+    }
+
+    /// <inheritdoc/>
+    public override void MaxPool2D(IGpuBuffer input, IGpuBuffer output, IGpuBuffer? indices,
+        int batch, int channels, int inHeight, int inWidth,
+        int outHeight, int outWidth, int kernelH, int kernelW,
+        int strideH, int strideW, int padH, int padW)
+    {
+        // #642: record downsample pool for deferred replay. `indices` (optional, used by backward) is
+        // also an output so a later read of it is ordered after this node.
+        var outputs = indices is null ? new[] { output } : new[] { output, indices };
+        RecordOrExecute(KernelType.Pooling, new[] { input }, outputs,
+            () => Inner.MaxPool2D(input, output, indices, batch, channels, inHeight, inWidth,
+                outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW));
+    }
+
+    // NOTE (#642): AvgPool2D is intentionally NOT recorded — its kernel intermittently crashes the
+    // process under deferred replay (root cause TBD). Leaving it unrecorded keeps it on the eager
+    // path; models using AvgPool2D must not enable the deferred/captured path until that is fixed.
+
+    /// <inheritdoc/>
+    public override void Transpose(IGpuBuffer A, IGpuBuffer B, int rows, int cols)
+    {
+        // #642: record 2-D transpose (attention reshapes) for deferred replay.
+        RecordOrExecute(KernelType.Transpose, new[] { A }, new[] { B },
+            () => Inner.Transpose(A, B, rows, cols));
+    }
+
+    /// <inheritdoc/>
+    public override void Conv2DBiasAdd(IGpuBuffer output, IGpuBuffer bias, int batch, int channels, int spatialSize)
+    {
+        // #642: in-place per-channel bias add after conv — `output` is both read and written, so it is
+        // the node's input AND output (dependency tracker chains it after the conv that produced it).
+        RecordOrExecute(KernelType.ElementWise, new[] { output, bias }, new[] { output },
+            () => Inner.Conv2DBiasAdd(output, bias, batch, channels, spatialSize));
+    }
+
+    /// <inheritdoc/>
     public override void Copy(IGpuBuffer source, int sourceOffset, IGpuBuffer destination, int destinationOffset, int length)
     {
         // #642: record the offset device-to-device copy as a kernel node (input=source,

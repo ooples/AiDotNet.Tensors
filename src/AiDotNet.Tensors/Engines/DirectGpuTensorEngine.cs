@@ -6328,8 +6328,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return base.MaxPool2D(input, poolSize, stride, padding);
 
         using var inputBuffer = GetOrAllocateBuffer(backend, input);
-        using var outputBuffer = AllocateOutputBuffer(backend, batch * channels * outHeight * outWidth);
-
+        // #642: not `using` — handed to FinishGpuOp (lazy result, activation cache owns it). The old
+        // eager DownloadBuffer here read the not-yet-computed output under a DeferredScope (the conv
+        // bug class). `finally` disposes on the fallback path.
+        var outputBuffer = AllocateOutputBuffer(backend, batch * channels * outHeight * outWidth);
+        bool handedOff = false;
         try
         {
             // Execute GPU max pooling (indices buffer is null for forward-only)
@@ -6339,17 +6342,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 poolSize, poolSize,
                 stride, stride, padding, padding);
 
-            // DownloadBuffer uses blocking read, Synchronize() removed for performance
             int outputSize = batch * channels * outHeight * outWidth;
-            float[] resultFloat = new float[outputSize];
-            backend.DownloadBuffer(outputBuffer.Buffer, resultFloat);
-
-            T[] resultData = DirectGpuEngine.FromFloatArray<T>(resultFloat);
+            var resultData = FinishGpuOp<T>(backend, outputBuffer, outputSize);
+            handedOff = true;
             return new Tensor<T>(resultData, new[] { batch, channels, outHeight, outWidth });
         }
         catch
         {
             return base.MaxPool2D(input, poolSize, stride, padding);
+        }
+        finally
+        {
+            if (!handedOff) outputBuffer.Dispose();
         }
     }
 
@@ -6540,7 +6544,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 stride, stride, padding, padding,
                 countIncludePad: true);
 
-            // DownloadBuffer uses blocking read, Synchronize() removed for performance
+            // NOTE (#642): NOT yet deferred-safe — AvgPool2D's recorded kernel intermittently
+            // crashes the process under a DeferredScope (see GroupNormDeferredCaptureTests note),
+            // so this op keeps its eager DownloadBuffer and is NOT recorded by RecordingGpuBackend.
+            // Models that use AvgPool2D must not enable the deferred/captured path until that crash
+            // is root-caused. Standard SD UNets use strided conv (not avgpool) for downsampling.
             int outputSize = batch * channels * outHeight * outWidth;
             float[] resultFloat = new float[outputSize];
             backend.DownloadBuffer(outputBuffer.Buffer, resultFloat);
