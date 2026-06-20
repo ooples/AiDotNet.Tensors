@@ -191,10 +191,14 @@ internal static class Program
             };
 
             // Correctness gate: deferred output must match eager output for the same input.
+            // --deffirst: run the deferred path BEFORE the eager reference, to test whether a
+            // prior eager run pollutes `input`'s cached GPU buffer (eager→deferred staleness).
+            bool defFirst = ArgI(args, "--deffirst", 0) != 0;
             try
             {
-                var eagerO = baseIter();
-                var defO = oneIter();
+                Tensor<float> eagerO, defO;
+                if (defFirst) { defO = oneIter(); eagerO = baseIter(); }
+                else { eagerO = baseIter(); defO = oneIter(); }
                 double maxAbsDiff = 0, defAbsMax = 0, defNonZero = 0;
                 int len = Math.Min(eagerO.Length, defO.Length);
                 for (int i = 0; i < len; i++)
