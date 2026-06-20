@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-#653 GEMM saturation A/B bench (CI gate for AIDOTNET_GEMM_SMALLM_TILING).
+#653 GEMM saturation A/B bench (CI gate for AIDOTNET_GEMM_FORWARD_PACKBOTH (#653)).
 
 Runs the ConvParallelProbe `--gemm` single-matmul probe twice per shape - with
-the small-M row-block-targeting lever OFF (=0) then ON (=1) - and compares the
+the forward-path PackBoth blocking optimization (#653) OFF (=0) then ON (=1) - and compares the
 best-case (min_ms) timings.
 
 Two shape classes:
@@ -52,7 +52,7 @@ def run_probe(probe, m, k, n, maxdop, reps, flag, repeat):
     """Return the min min_ms over `repeat` probe invocations for one flag value."""
     env = dict(os.environ)
     env["AIDOTNET_DISABLE_GPU"] = "1"          # no OpenCL init stealing cores
-    env["AIDOTNET_GEMM_SMALLM_TILING"] = str(flag)
+    env["AIDOTNET_GEMM_FORWARD_PACKBOTH"] = str(flag)
     cmd = ["dotnet", probe, "--gemm", "--m", str(m), "--k", str(k), "--n", str(n),
            "--reps", str(reps), "--maxdop", str(maxdop)]
     best = None

@@ -34,6 +34,10 @@ namespace AiDotNet.Tensors.Engines.BlasManaged;
 /// </summary>
 internal static class PackBothStrategy
 {
+    // #653 diagnostic gate (env AIDOTNET_GEMM_TRACE=1): trace the chosen parallel path.
+    private static readonly bool s_trace =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_GEMM_TRACE") == "1";
+
     /// <summary>
     /// Compute C += op(A) · op(B) using the Pack-Both 3-level loop nest.
     /// C is zeroed by the caller (BlasManaged.Gemm); the kernel accumulates.
@@ -124,6 +128,14 @@ internal static class PackBothStrategy
             // would use ≤ a quarter of the cores (numMBlocks*4 < procs), regardless of absolute M.
             bool use2D = MN2DDriver.ShouldUse2DGrid(numMBlocks, numNBlocks, procs)
                          && (m < 256 || numMBlocks * 4 <= procs);
+
+            // #653 diagnostic: AIDOTNET_GEMM_TRACE=1 prints the chosen parallel path +
+            // blocking so we can see what a real forward GEMM actually runs. stderr only,
+            // so the probe's stdout GEMM line stays parseable.
+            if (s_trace)
+                Console.Error.WriteLine(
+                    $"[PackBoth] m={m} n={n} k={k} mc={mc} nc={nc} kc={kc} mr={mr} nr={nr} " +
+                    $"numMB={numMBlocks} numNB={numNBlocks} procs={procs} path={(use2D ? "2D" : "Maxis")}");
 
             // Pin a, b, c for the duration of the parallel region. Both paths use
             // unsafe pointer access from worker threads.
