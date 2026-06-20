@@ -6511,6 +6511,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         catch
         {
+            if (ThrowOnGpuKernelFallback) throw;
             return base.FusedConv3D(input, kernel, bias, strideD, strideH, strideW, padD, padH, padW, dilationD, dilationH, dilationW, activation);
         }
     }
@@ -6728,6 +6729,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         catch
         {
+            if (ThrowOnGpuKernelFallback) throw;
             return base.FusedConvTranspose2D(input, kernel, bias, strideH, strideW, padH, padW, outputPadH, outputPadW, activation);
         }
     }
@@ -7245,6 +7247,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         catch
         {
+            if (ThrowOnGpuKernelFallback) throw;
             return base.DepthwiseConv2D(input, kernel, stride, padding);
         }
     }
@@ -7410,6 +7413,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         catch
         {
+            if (ThrowOnGpuKernelFallback) throw;
             // Fall back to CPU on any GPU error
             return base.LocallyConnectedConv2D(input, weights, bias, stride);
         }
@@ -7466,8 +7470,42 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         catch
         {
+            if (ThrowOnGpuKernelFallback) throw;
             return base.LocallyConnectedConv2DBackwardInput(gradOutput, weights, inputShape, stride);
         }
+    }
+
+    [ThreadStatic]
+    private static bool s_throwOnGpuKernelFallback;
+
+    /// <summary>
+    /// Test/diagnostic hook (default <c>false</c>; <c>[ThreadStatic]</c> so it only affects the thread that
+    /// sets it and never leaks into other parallel test collections). When <c>true</c>, the GPU-kernel
+    /// <c>catch</c> blocks that route conv / transpose / unfold-fold / pooling / locally-connected /
+    /// deformable / attention operations to their CPU reference RETHROW the kernel exception instead of
+    /// silently falling back. Because the per-kernel fallback now lives partly inside the individual backends
+    /// (Metal / Vulkan implement the conv/pool family in their own classes), the flag is a process-wide
+    /// <c>static</c> so those backend <c>catch</c> blocks can honor it too
+    /// (<see cref="ThrowOnGpuKernelFallback"/> is read from <c>DirectGpuTensorEngine</c> by the backends).
+    /// <para>
+    /// <see cref="GpuConvKernelCoverageTests"/> (in the test project) enables it so the GPU-vs-CPU accuracy
+    /// gate PROVES the GPU kernel actually ran on-device — a kernel that threw (or a backend that silently
+    /// emulated on CPU and then threw on a real launch) would otherwise fall back to CPU and the comparison
+    /// would trivially pass (false green), exactly the gap that let issue #622 look "fixed" without proof.
+    /// </para>
+    /// <para>
+    /// Scope: this hook covers the conv/pool-family kernels exercised by the coverage suite (the methods whose
+    /// <c>catch</c> blocks contain the rethrow, both here and in the Metal/Vulkan backends). It is a coverage
+    /// aid, NOT a guarantee that every <c>catch</c> in the GPU stack rethrows; unrelated catch blocks (argument
+    /// validation, capability probing, non-kernel host paths) deliberately keep their normal behavior.
+    /// Production leaves it <c>false</c>: the CPU fallback stays a correctness safety net for genuinely
+    /// unsupported shapes or transient launch failures.
+    /// </para>
+    /// </summary>
+    internal static bool ThrowOnGpuKernelFallback
+    {
+        get => s_throwOnGpuKernelFallback;
+        set => s_throwOnGpuKernelFallback = value;
     }
 
     /// <summary>
@@ -7520,6 +7558,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         catch
         {
+            if (ThrowOnGpuKernelFallback) throw;
             return base.LocallyConnectedConv2DBackwardWeights(gradOutput, input, weightsShape, stride);
         }
     }
@@ -7715,6 +7754,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         catch
         {
+            if (ThrowOnGpuKernelFallback) throw;
             return base.DeformableConv2D(input, kernel, offsets, mask, stride, padding, dilation);
         }
     }
@@ -7789,6 +7829,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         catch
         {
+            if (ThrowOnGpuKernelFallback) throw;
             return base.DeformableConv2DBackwardInput(gradOutput, input, kernel, offsets, mask, inputShape, stride, padding, dilation);
         }
     }
@@ -7862,6 +7903,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         catch
         {
+            if (ThrowOnGpuKernelFallback) throw;
             return base.DeformableConv2DBackwardKernel(gradOutput, input, offsets, mask, kernelShape, stride, padding, dilation);
         }
     }
@@ -7937,6 +7979,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         catch
         {
+            if (ThrowOnGpuKernelFallback) throw;
             return base.DeformableConv2DBackwardOffset(gradOutput, input, kernel, offsets, mask, stride, padding, dilation);
         }
     }
@@ -8007,6 +8050,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         catch
         {
+            if (ThrowOnGpuKernelFallback) throw;
             return base.DeformableConv2DBackwardMask(gradOutput, input, kernel, offsets, mask, stride, padding, dilation);
         }
     }
@@ -8779,6 +8823,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         catch
         {
+            if (ThrowOnGpuKernelFallback) throw;
             return base.FlashAttentionBackward(gradOutput, query, key, value, output, softmaxStats, scale, isCausal,
                 out gradQuery, out gradKey, out gradValue, attentionBias);
         }

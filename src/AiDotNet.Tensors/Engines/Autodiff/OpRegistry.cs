@@ -63,7 +63,7 @@ internal static class OpRegistry
         "DepthwiseConv2D", "ConvTranspose2D", "ConvTranspose3D", "LocallyConnectedConv2D",
 
         // Normalization
-        "BatchNorm", "LayerNorm", "GroupNorm", "RMSNorm", "InstanceNorm",
+        "BatchNorm", "BatchNormAffine", "LayerNorm", "GroupNorm", "RMSNorm", "InstanceNorm",
 
         // Attention/Embedding
         "Embedding", "Dropout",

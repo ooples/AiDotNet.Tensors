@@ -35,11 +35,16 @@ internal static class Avx2Streaming
         if (!IsSupported)
             throw new PlatformNotSupportedException("Avx2Streaming requires Avx2 + Fma.");
 
-        // transB=true: B is strided across N rows. Fall back to scalar — gather
-        // would require vgatherqpd which is slow on most µarchs.
         if (transB)
         {
-            ScalarStreaming.RunFp64(a, lda, transA, b, ldb, transB, c, ldc, m, n, k);
+            // TT: A strided along K — keep scalar (rare).
+            if (transA)
+            {
+                ScalarStreaming.RunFp64(a, lda, transA, b, ldb, transB, c, ldc, m, n, k);
+                return;
+            }
+            // NT (#639): contiguous-K dot product, vectorized. See the FP32 path.
+            RunFp64Nt(a, lda, b, ldb, c, ldc, m, n, k);
             return;
         }
 
@@ -132,7 +137,20 @@ internal static class Avx2Streaming
 
         if (transB)
         {
-            ScalarStreaming.RunFp32(a, lda, transA, b, ldb, transB, c, ldc, m, n, k);
+            // TT (A also transposed): A is strided along K, so the contiguous-K
+            // dot product below doesn't apply — keep the scalar reference (rare).
+            if (transA)
+            {
+                ScalarStreaming.RunFp32(a, lda, transA, b, ldb, transB, c, ldc, m, n, k);
+                return;
+            }
+            // NT (#639): C[i,j] += dot(A[i,:K], B[j,:K]). With transB=true, B is [N,K]
+            // row-major so B's row j is contiguous along K — same as A's row i. This is
+            // the conv-backward dX = dY·Wᵀ shape, which previously fell to the SCALAR
+            // kernel for the WHOLE GEMM (no SIMD at all — the top compiled-plan compute
+            // frame on an AVX2 box). Vectorize it as an 8-wide FMA dot product, 4 output
+            // columns per inner pass so one A-row load feeds four B-row FMAs.
+            RunFp32Nt(a, lda, b, ldb, c, ldc, m, n, k);
             return;
         }
 
@@ -237,6 +255,143 @@ internal static class Avx2Streaming
             }
         }
     }
+    /// <summary>
+    /// #639 NT microkernel (transB=true, transA=false): C[i,j] += Σ_k A[i,k]·B[j,k].
+    /// Both A row i and B row j are contiguous along K, so each output is a vectorized
+    /// 8-wide FMA dot product. Processes 4 output columns per pass so a single A-row
+    /// load feeds four independent accumulators (hides FMA latency, amortizes the load).
+    /// C is read-modify-write (caller zeroed it on the first streaming call).
+    /// </summary>
+    private static unsafe void RunFp32Nt(
+        ReadOnlySpan<float> a, int lda,
+        ReadOnlySpan<float> b, int ldb,
+        Span<float> c, int ldc,
+        int m, int n, int k)
+    {
+        int kVec = (k / 8) * 8;
+        fixed (float* aPtr = a)
+        fixed (float* bPtr = b)
+        fixed (float* cPtr = c)
+        {
+            for (int i = 0; i < m; i++)
+            {
+                float* aRow = aPtr + i * lda;
+                float* cRow = cPtr + i * ldc;
+                int j = 0;
+                for (; j + 4 <= n; j += 4)
+                {
+                    float* b0 = bPtr + (j + 0) * ldb;
+                    float* b1 = bPtr + (j + 1) * ldb;
+                    float* b2 = bPtr + (j + 2) * ldb;
+                    float* b3 = bPtr + (j + 3) * ldb;
+                    Vector256<float> acc0 = Vector256<float>.Zero;
+                    Vector256<float> acc1 = Vector256<float>.Zero;
+                    Vector256<float> acc2 = Vector256<float>.Zero;
+                    Vector256<float> acc3 = Vector256<float>.Zero;
+                    for (int kk = 0; kk < kVec; kk += 8)
+                    {
+                        Vector256<float> av = Avx.LoadVector256(aRow + kk);
+                        acc0 = Fma.MultiplyAdd(av, Avx.LoadVector256(b0 + kk), acc0);
+                        acc1 = Fma.MultiplyAdd(av, Avx.LoadVector256(b1 + kk), acc1);
+                        acc2 = Fma.MultiplyAdd(av, Avx.LoadVector256(b2 + kk), acc2);
+                        acc3 = Fma.MultiplyAdd(av, Avx.LoadVector256(b3 + kk), acc3);
+                    }
+                    float s0 = HSum256(acc0), s1 = HSum256(acc1), s2 = HSum256(acc2), s3 = HSum256(acc3);
+                    for (int kk = kVec; kk < k; kk++)
+                    {
+                        float av = aRow[kk];
+                        s0 += av * b0[kk]; s1 += av * b1[kk]; s2 += av * b2[kk]; s3 += av * b3[kk];
+                    }
+                    cRow[j + 0] += s0; cRow[j + 1] += s1; cRow[j + 2] += s2; cRow[j + 3] += s3;
+                }
+                for (; j < n; j++)
+                {
+                    float* bj = bPtr + j * ldb;
+                    Vector256<float> acc = Vector256<float>.Zero;
+                    for (int kk = 0; kk < kVec; kk += 8)
+                        acc = Fma.MultiplyAdd(Avx.LoadVector256(aRow + kk), Avx.LoadVector256(bj + kk), acc);
+                    float s = HSum256(acc);
+                    for (int kk = kVec; kk < k; kk++) s += aRow[kk] * bj[kk];
+                    cRow[j] += s;
+                }
+            }
+        }
+    }
+
+    /// <summary>FP64 mirror of <see cref="RunFp32Nt"/> (Vector256&lt;double&gt;, 4 lanes).</summary>
+    private static unsafe void RunFp64Nt(
+        ReadOnlySpan<double> a, int lda,
+        ReadOnlySpan<double> b, int ldb,
+        Span<double> c, int ldc,
+        int m, int n, int k)
+    {
+        int kVec = (k / 4) * 4;
+        fixed (double* aPtr = a)
+        fixed (double* bPtr = b)
+        fixed (double* cPtr = c)
+        {
+            for (int i = 0; i < m; i++)
+            {
+                double* aRow = aPtr + i * lda;
+                double* cRow = cPtr + i * ldc;
+                int j = 0;
+                for (; j + 4 <= n; j += 4)
+                {
+                    double* b0 = bPtr + (j + 0) * ldb;
+                    double* b1 = bPtr + (j + 1) * ldb;
+                    double* b2 = bPtr + (j + 2) * ldb;
+                    double* b3 = bPtr + (j + 3) * ldb;
+                    Vector256<double> acc0 = Vector256<double>.Zero;
+                    Vector256<double> acc1 = Vector256<double>.Zero;
+                    Vector256<double> acc2 = Vector256<double>.Zero;
+                    Vector256<double> acc3 = Vector256<double>.Zero;
+                    for (int kk = 0; kk < kVec; kk += 4)
+                    {
+                        Vector256<double> av = Avx.LoadVector256(aRow + kk);
+                        acc0 = Fma.MultiplyAdd(av, Avx.LoadVector256(b0 + kk), acc0);
+                        acc1 = Fma.MultiplyAdd(av, Avx.LoadVector256(b1 + kk), acc1);
+                        acc2 = Fma.MultiplyAdd(av, Avx.LoadVector256(b2 + kk), acc2);
+                        acc3 = Fma.MultiplyAdd(av, Avx.LoadVector256(b3 + kk), acc3);
+                    }
+                    double s0 = HSum256(acc0), s1 = HSum256(acc1), s2 = HSum256(acc2), s3 = HSum256(acc3);
+                    for (int kk = kVec; kk < k; kk++)
+                    {
+                        double av = aRow[kk];
+                        s0 += av * b0[kk]; s1 += av * b1[kk]; s2 += av * b2[kk]; s3 += av * b3[kk];
+                    }
+                    cRow[j + 0] += s0; cRow[j + 1] += s1; cRow[j + 2] += s2; cRow[j + 3] += s3;
+                }
+                for (; j < n; j++)
+                {
+                    double* bj = bPtr + j * ldb;
+                    Vector256<double> acc = Vector256<double>.Zero;
+                    for (int kk = 0; kk < kVec; kk += 4)
+                        acc = Fma.MultiplyAdd(Avx.LoadVector256(aRow + kk), Avx.LoadVector256(bj + kk), acc);
+                    double s = HSum256(acc);
+                    for (int kk = kVec; kk < k; kk++) s += aRow[kk] * bj[kk];
+                    cRow[j] += s;
+                }
+            }
+        }
+    }
+
+    /// <summary>Horizontal sum of an 8-lane FP32 vector.</summary>
+    private static float HSum256(Vector256<float> v)
+    {
+        Vector128<float> s = Sse.Add(v.GetLower(), v.GetUpper());   // 4 partials
+        s = Sse.Add(s, Sse.MoveHighToLow(s, s));                    // 2 partials
+        s = Sse.AddScalar(s, Sse.Shuffle(s, s, 0x55));              // + lane 1
+        return s.ToScalar();
+    }
+
+    /// <summary>Horizontal sum of a 4-lane FP64 vector.</summary>
+    private static double HSum256(Vector256<double> v)
+    {
+        Vector128<double> s = Sse2.Add(v.GetLower(), v.GetUpper());  // 2 partials
+        s = Sse2.AddScalar(s, Sse2.UnpackHigh(s, s));               // + lane 1
+        return s.ToScalar();
+    }
+
 #else
     /// <summary>Runtime support gate (always false on net471 — no Vector256&lt;T&gt; intrinsics).</summary>
     public static bool IsSupported => false;
