@@ -12,6 +12,16 @@ name: GEMM small-M tiling bench (#653)
 # still validates the NO-REGRESSION gate.
 
 on:
+  # Auto no-regression gate: runs on PRs that touch the GEMM kernel or the bench
+  # itself. On the default ubuntu-latest runner the small-M lever no-ops (the
+  # shapes aren't under-tiled at <=~8 cores), so ON and OFF exercise the same
+  # code path and the gate is a stable identical-code A/B. Point GEMM_BENCH_RUNNER
+  # at a many-core runner (and use workflow_dispatch) to also validate the WIN.
+  pull_request:
+    paths:
+      - 'src/AiDotNet.Tensors/Engines/Simd/SimdGemm.cs'
+      - 'tools/ConvParallelProbe/**'
+      - '.github/workflows/gemm-bench.yml'
   workflow_dispatch:
     inputs:
       maxdop:
@@ -58,7 +68,7 @@ jobs:
       - name: Resolve maxdop
         id: dop
         run: |
-          DOP="${{ github.event.inputs.maxdop }}"
+          DOP="${{ github.event.inputs.maxdop || '0' }}"
           if [ "$DOP" = "0" ] || [ -z "$DOP" ]; then DOP="$(nproc)"; fi
           echo "value=$DOP" >> "$GITHUB_OUTPUT"
           echo "Using maxdop=$DOP on $(nproc)-core runner"
@@ -70,6 +80,6 @@ jobs:
           python3 tools/ConvParallelProbe/gemm_bench.py \
             --probe "$PROBE" \
             --maxdop "${{ steps.dop.outputs.value }}" \
-            --reps "${{ github.event.inputs.reps }}" \
-            --repeat "${{ github.event.inputs.repeat }}" \
-            --tol "${{ github.event.inputs.tol }}"
+            --reps "${{ github.event.inputs.reps || '40' }}" \
+            --repeat "${{ github.event.inputs.repeat || '4' }}" \
+            --tol "${{ github.event.inputs.tol || '0.12' }}"
