@@ -125,43 +125,49 @@ public sealed class DeferredScope : IDeferredScope
         ThrowIfDisposed();
         ThrowIfExecuted();
 
-        // Stop recording before compiling and executing
-        _recordingBackend.EndRecording();
-
-        var compilationTimer = Stopwatch.StartNew();
-        var graph = CompileInternal();
-        compilationTimer.Stop();
-
-        var executionTimer = Stopwatch.StartNew();
-
-        if (_streamPool != null)
+        try
         {
-            graph.Execute(_backend, _streamPool);
-        }
-        else
-        {
-            // Execute without stream pool - use default stream
-            foreach (var node in graph.TopologicalOrder)
+            // Stop recording before compiling and executing
+            _recordingBackend.EndRecording();
+
+            var compilationTimer = Stopwatch.StartNew();
+            var graph = CompileInternal();
+            compilationTimer.Stop();
+
+            var executionTimer = Stopwatch.StartNew();
+
+            if (_streamPool != null)
             {
-                node.Execute(_backend);
+                graph.Execute(_backend, _streamPool);
             }
+            else
+            {
+                // Execute without stream pool - use default stream
+                foreach (var node in graph.TopologicalOrder)
+                {
+                    node.Execute(_backend);
+                }
+            }
+
+            executionTimer.Stop();
+            _totalTimer.Stop();
+
+            // Mark all deferred downloads as executed
+            foreach (var download in _deferredDownloads)
+            {
+                download.MarkExecuted();
+            }
+
+            RecordStatistics(graph, compilationTimer.Elapsed, executionTimer.Elapsed);
+            IsExecuted = true;
         }
-
-        executionTimer.Stop();
-        _totalTimer.Stop();
-
-        // Mark all deferred downloads as executed
-        foreach (var download in _deferredDownloads)
+        finally
         {
-            download.MarkExecuted();
+            // #642: run the deferred buffer releases even if compile/execute THROWS or cancels —
+            // otherwise the thread-local deferral gate stays active and leaks into later ops on this
+            // thread. EndDeferralOnce balances the single Begin() from the ctor exactly once.
+            EndDeferralOnce();
         }
-
-        RecordStatistics(graph, compilationTimer.Elapsed, executionTimer.Elapsed);
-        IsExecuted = true;
-
-        // #642: graph has executed — now safe to run the buffer releases that were deferred
-        // during recording/replay.
-        GpuBufferReleaseDeferral.EndAndRelease();
     }
 
     /// <inheritdoc/>
@@ -170,46 +176,61 @@ public sealed class DeferredScope : IDeferredScope
         ThrowIfDisposed();
         ThrowIfExecuted();
 
-        // Stop recording before compiling and executing
-        _recordingBackend.EndRecording();
-
-        var compilationTimer = Stopwatch.StartNew();
-        var graph = CompileInternal();
-        compilationTimer.Stop();
-
-        var executionTimer = Stopwatch.StartNew();
-
-        if (_streamPool != null)
+        try
         {
-            await graph.ExecuteAsync(_backend, _streamPool, cancellationToken);
-        }
-        else
-        {
-            // Execute synchronously without stream pool
-            await Task.Run(() =>
+            // Stop recording before compiling and executing
+            _recordingBackend.EndRecording();
+
+            var compilationTimer = Stopwatch.StartNew();
+            var graph = CompileInternal();
+            compilationTimer.Stop();
+
+            var executionTimer = Stopwatch.StartNew();
+
+            if (_streamPool != null)
             {
-                foreach (var node in graph.TopologicalOrder)
+                await graph.ExecuteAsync(_backend, _streamPool, cancellationToken);
+            }
+            else
+            {
+                // Execute synchronously without stream pool
+                await Task.Run(() =>
                 {
-                    cancellationToken.ThrowIfCancellationRequested();
-                    node.Execute(_backend);
-                }
-            }, cancellationToken);
+                    foreach (var node in graph.TopologicalOrder)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        node.Execute(_backend);
+                    }
+                }, cancellationToken);
+            }
+
+            executionTimer.Stop();
+            _totalTimer.Stop();
+
+            // Mark all deferred downloads as executed
+            foreach (var download in _deferredDownloads)
+            {
+                download.MarkExecuted();
+            }
+
+            RecordStatistics(graph, compilationTimer.Elapsed, executionTimer.Elapsed);
+            IsExecuted = true;
         }
-
-        executionTimer.Stop();
-        _totalTimer.Stop();
-
-        // Mark all deferred downloads as executed
-        foreach (var download in _deferredDownloads)
+        finally
         {
-            download.MarkExecuted();
+            // #642: see Execute() — release deferred buffers even on throw/cancel.
+            EndDeferralOnce();
         }
+    }
 
-        RecordStatistics(graph, compilationTimer.Elapsed, executionTimer.Elapsed);
-        IsExecuted = true;
-
-        // #642: graph has executed — now safe to run the buffer releases that were deferred
-        // during recording/replay.
+    // #642: balances the single GpuBufferReleaseDeferral.Begin() from the ctor with exactly one
+    // EndAndRelease(), so the nesting-depth counter stays correct when Execute() AND Dispose() both
+    // try to end the scope (Dispose's call becomes a no-op once Execute already ended it).
+    private bool _deferralEnded;
+    private void EndDeferralOnce()
+    {
+        if (_deferralEnded) return;
+        _deferralEnded = true;
         GpuBufferReleaseDeferral.EndAndRelease();
     }
 
@@ -306,8 +327,8 @@ public sealed class DeferredScope : IDeferredScope
 
         // Safety: if the scope was disposed without ever executing (e.g. empty graph), the
         // deferral gate set in the ctor would otherwise leak into subsequent ops on this thread.
-        // Idempotent — Execute() already cleared it on the normal path.
-        GpuBufferReleaseDeferral.EndAndRelease();
+        // EndDeferralOnce is a no-op when Execute() already ended it (keeps the depth count balanced).
+        EndDeferralOnce();
 
         GraphBuilder.Dispose();
     }
