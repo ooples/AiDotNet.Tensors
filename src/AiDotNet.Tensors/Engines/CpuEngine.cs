@@ -2420,7 +2420,18 @@ public partial class CpuEngine : ITensorLevelEngine
     /// batch=1 BN fallback decomposes into), with gradients to x, gamma, beta (mean/variance are
     /// constant running stats). Forward math is identical to <see cref="BatchNormInference{T}"/>;
     /// the difference is it carries a backward so it can be used in TRAINING at batch=1 (where the
-    /// batch-stats BatchNorm collapses). Rank-4 NCHW.
+    /// batch-stats BatchNorm collapses). Rank-4 NCHW; gamma/beta/mean/variance are <c>[C]</c>.
+    /// <para>
+    /// <b>GPU coverage (intentional CPU forward).</b> There is no native GPU override of this
+    /// FORWARD: on a <see cref="DirectGpuTensorEngine"/> it runs the CPU in-place
+    /// <see cref="BatchNormInferenceInto{T}"/> (downloading/uploading the rank-4 operand). This is
+    /// deliberate — #639 targets the per-step OP-COUNT explosion in batch=1 training (one fused node
+    /// instead of ~6 broadcast ops), a win on either device, and batch=1 is a rare/small op where a
+    /// dedicated GPU kernel + dispatch would not pay for itself. The differentiable BACKWARD
+    /// (<see cref="BackwardFunctions{T}.BatchNormAffineBackward"/>) DOES route GPU engines through
+    /// device-resident primitives (it only takes the CPU fused kernel when <c>!SupportsGpu</c>). A
+    /// native GPU forward kernel is a follow-up under #639.
+    /// </para>
     /// </summary>
     public virtual Tensor<T> BatchNormAffine<T>(Tensor<T> x, Tensor<T> gamma, Tensor<T> beta, Tensor<T> mean, Tensor<T> variance, double epsilon)
     {
@@ -13957,6 +13968,8 @@ public partial class CpuEngine : ITensorLevelEngine
             // weights change every step so this can't be content-cached — it was ~130 MB/step
             // of pure GC churn on MobileNetV3 batch=1 (a gen2 collection every ~2 steps).
             var kernelT = pool.Rent(colH * outChannels);
+            try
+            {
             for (int r = 0; r < outChannels; r++)
                 for (int c = 0; c < colH; c++)
                     kernelT[c * outChannels + r] = kernelF[r * colH + c];
@@ -14012,7 +14025,8 @@ public partial class CpuEngine : ITensorLevelEngine
                     b => ProcessImageInputF(b, channelParallel: false));
             else
                 for (int b = 0; b < batch; b++) ProcessImageInputF(b, channelParallel: true);
-            pool.Return(kernelT);
+            }
+            finally { pool.Return(kernelT); }
             return;
         }
 
@@ -14914,6 +14928,8 @@ public partial class CpuEngine : ITensorLevelEngine
             // Weights change every step so it can't be content-cached — it was per-step GC
             // churn. Rented buffers aren't zeroed and this is a += accumulator, so clear it.
             var gradKernelF = kPool.Rent(totalLen);
+            try
+            {
             Array.Clear(gradKernelF, 0, totalLen);
             var gradOutputF = (float[])(object)gradOutput.GetFlattenedData();
             var inputF = (float[])(object)input.GetFlattenedData();
@@ -15019,7 +15035,8 @@ public partial class CpuEngine : ITensorLevelEngine
                 for (int i = 0; i < totalLen; i++) destF[destOff + i] += gradKernelF[i];
             else
                 Array.Copy(gradKernelF, 0, destF, destOff, totalLen);
-            kPool.Return(gradKernelF);
+            }
+            finally { kPool.Return(gradKernelF); }
             return;
         }
 

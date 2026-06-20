@@ -809,19 +809,21 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// what the kernel sees vs writes.</summary>
     public static string SubFwdDiag = "";
 
-    private static bool s_histogramDumped;
-
     // #639: one-time op-type histogram of the compiled forward graph. Sizes the
     // operator-fusion prize (how many ops the plan replays per step, and which
     // adjacencies — conv→bias→activation, residual-add, BN — are worth fusing).
     // Gated on AIDOTNET_PLAN_HISTOGRAM=1; writes once per process. Output goes to stderr AND
     // (so it survives xUnit/dotnet-test console capture) to the path in AIDOTNET_PLAN_HISTOGRAM_FILE,
     // defaulting to %TEMP%/aidotnet_plan_histogram.txt.
+    //
+    // The once-flag lives in the NON-generic CompiledPlanDiagnostics so it is genuinely process-wide
+    // (a static in CompiledTrainingPlan<T> would be per-closed-T: float, double, … each dump once) and
+    // the Interlocked latch makes the first-writer-wins check thread-safe under concurrent plan builds.
     private void MaybeDumpOpHistogram()
     {
-        if (s_histogramDumped || _forwardSteps is null) return;
+        if (_forwardSteps is null) return;
         if (System.Environment.GetEnvironmentVariable("AIDOTNET_PLAN_HISTOGRAM") != "1") return;
-        s_histogramDumped = true;
+        if (System.Threading.Interlocked.Exchange(ref CompiledPlanDiagnostics.HistogramDumped, 1) != 0) return;
         var hist = new System.Collections.Generic.Dictionary<string, int>();
         foreach (var s in _forwardSteps)
         {
@@ -7163,6 +7165,17 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             i++; // Skip past i+1 — already consumed
         }
     }
+}
+
+/// <summary>
+/// Process-wide (NON-generic) diagnostics latch for <see cref="CompiledTrainingPlan{T}"/>. A static
+/// in the generic class would be per-closed-T, so the #639 op histogram would dump once per element
+/// type instead of once per process; this non-generic holder guarantees a single dump.
+/// </summary>
+internal static class CompiledPlanDiagnostics
+{
+    /// <summary>0 until the op histogram has been dumped; latched to 1 via Interlocked (first wins).</summary>
+    internal static int HistogramDumped;
 }
 
 /// <summary>

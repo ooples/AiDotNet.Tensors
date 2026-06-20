@@ -1082,7 +1082,11 @@ internal static class BackwardFunctions<T>
         var epsilon = (double)savedState[2];
 
         Tensor<T> gradInput, gradGamma, gradBeta;
-        if (engine is CpuEngine cpu)
+        // DirectGpuTensorEngine inherits CpuEngine, so a bare `is CpuEngine` would silently route
+        // a GPU engine into the CPU fused backward (host<->device ping-pong, the worst outcome).
+        // Only take the CPU fused kernel for a genuine CPU engine; GPU engines use the
+        // engine-generic primitive fallback below, which dispatches each op to the GPU backend.
+        if (engine is CpuEngine cpu && !engine.SupportsGpu)
         {
             gradInput = cpu.BatchNormAffineBackward(
                 gradOutput, inputs[0], inputs[1], mean, variance, epsilon, out gradGamma, out gradBeta);
