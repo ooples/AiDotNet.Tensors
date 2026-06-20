@@ -756,6 +756,22 @@ public class RecordingGpuBackend : DelegatingGpuBackend
         }
     }
 
+    /// <inheritdoc/>
+    public override void Copy(IGpuBuffer source, int sourceOffset, IGpuBuffer destination, int destinationOffset, int length)
+    {
+        // #642: record the offset device-to-device copy as a kernel node (input=source,
+        // output=destination) so the dependency tracker orders it after the producer of `source`
+        // and before any reader of `destination`. This is the primitive a deferred-correct Concat
+        // composes from — ConcatAxis lives on IGpuBatchExecution, which the recording backend does
+        // NOT wrap, so concat must route through IDirectGpuBackend.Copy (which it does). AddCopy's
+        // TransferNode carries no offsets, hence RecordOrExecute with the offsets in the closure.
+        RecordOrExecute(
+            KernelType.ElementWise,
+            new[] { source },
+            new[] { destination },
+            () => Inner.Copy(source, sourceOffset, destination, destinationOffset, length));
+    }
+
     #endregion
 }
 

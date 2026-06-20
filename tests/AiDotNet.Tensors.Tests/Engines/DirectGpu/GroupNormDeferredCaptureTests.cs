@@ -115,6 +115,37 @@ public sealed class GroupNormDeferredCaptureTests : IDisposable
     }
 
     [SkippableFact]
+    public void ChannelConcat_MatchesCpu_EagerAndDeferred()
+    {
+        // The UNet decoder skip-connection: TensorConcatenate(new[]{a,b}, axis:1) on NCHW.
+        // Channel-axis concat was the #642 gap — the old GPU path only handled the last axis, so
+        // this fell to CPU (breaking the device-resident chain). Validate GPU eager + deferred == CPU.
+        Skip.IfNot(_gpuAvailable, "No CUDA device.");
+        var gpu = _gpu!;
+        var a = Rand(new[] { 1, C, Sp, Sp }, 7);
+        var b = Rand(new[] { 1, C / 2, Sp, Sp }, 8);
+
+        var cpu = new CpuEngine().TensorConcatenate(new[] { a, b }, axis: 1);
+        Assert.Equal(C + C / 2, cpu.Shape[1]);
+
+        var eager = gpu.TensorConcatenate(new[] { a, b }, axis: 1);
+        float eagerDiff = 0;
+        for (int i = 0; i < cpu.Length; i++) eagerDiff = Math.Max(eagerDiff, Math.Abs(cpu[i] - eager[i]));
+        Assert.True(eagerDiff < Tolerance, $"Eager GPU channel-concat diverged from CPU: maxDiff={eagerDiff}");
+
+        Tensor<float> deferred;
+        using (var scope = gpu.BeginDeferredScope())
+        {
+            Skip.If(scope is null, "Deferred execution unsupported.");
+            deferred = gpu.TensorConcatenate(new[] { a, b }, axis: 1);
+            scope!.Execute();
+        }
+        float defDiff = 0;
+        for (int i = 0; i < cpu.Length; i++) defDiff = Math.Max(defDiff, Math.Abs(cpu[i] - deferred[i]));
+        Assert.True(defDiff < Tolerance, $"Deferred GPU channel-concat diverged from CPU: maxDiff={defDiff}");
+    }
+
+    [SkippableFact]
     public void CudaGraphCapture_ReplaysResBlockCorrectly()
     {
         Skip.IfNot(_gpuAvailable, "No CUDA device.");

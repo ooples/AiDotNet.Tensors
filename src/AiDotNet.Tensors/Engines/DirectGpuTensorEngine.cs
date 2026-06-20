@@ -17777,9 +17777,66 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     Tensor<T> IEngine.TensorConcatenate<T>(Tensor<T>[] tensors, int axis)
     {
         if (IsTapeActive<T>()) return base.TensorConcatenate(tensors, axis);
-        if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb) && tensors.Length==2 && (axis==-1||axis==tensors[0].Rank-1))
-        { try { var a=tensors[0]; var b2=tensors[1]; int lastAxis=a.Rank-1; int outerSize=1; for(int i=0;i<lastAxis;i++)outerSize*=a.Shape._dims[i]; int aInner=a.Shape._dims[lastAxis],bInner=b2.Shape._dims[lastAxis]; int total=outerSize*(aInner+bInner); var ga=UploadTensorRaw(bb, a); var gb=UploadTensorRaw(bb, b2); var go=bb.AllocateBuffer(total); bb.ConcatAxis(ga,gb,go,outerSize,aInner,bInner); int[] outShape=(int[])a.Shape._dims.Clone(); outShape[lastAxis]=aInner+bInner; return DeferTensorResult<T>(bb,go,total,outShape); } catch{} }
-        return base.TensorConcatenate(tensors,axis);
+        // GPU concat for 2 tensors along ANY axis (#642), composed from offset device-to-device
+        // copies via IDirectGpuBackend.Copy. The previous path used IGpuBatchExecution.ConcatAxis,
+        // which (a) only handled the LAST axis — so the UNet decoder's channel concat (NCHW axis=1)
+        // silently fell to the CPU base, materialising both inputs and breaking the device-resident
+        // chain — and (b) lives on IGpuBatchExecution, which the recording backend does NOT wrap, so
+        // it could never be captured into a deferred graph. Copy IS on IDirectGpuBackend and is now
+        // recorded, so this is correct + capturable in BOTH eager and deferred modes. For axis k:
+        // outer = prod(dims[0..k)), inner = prod(dims[k+1..)); each input contributes `outer`
+        // contiguous slices of axisLen*inner into the output at its axis offset.
+        if (typeof(T) == typeof(float) && TryGetBackend(out var backend) && tensors is { Length: 2 })
+        {
+            try
+            {
+                var a = tensors[0];
+                var b2 = tensors[1];
+                int rank = a.Rank;
+                int normAxis = axis < 0 ? rank + axis : axis;
+                if (normAxis >= 0 && normAxis < rank && b2.Rank == rank && a.IsContiguous && b2.IsContiguous)
+                {
+                    bool shapesOk = true;
+                    for (int k = 0; k < rank; k++)
+                        if (k != normAxis && a.Shape._dims[k] != b2.Shape._dims[k]) { shapesOk = false; break; }
+                    if (shapesOk)
+                    {
+                        int outer = 1;
+                        for (int k = 0; k < normAxis; k++) outer *= a.Shape._dims[k];
+                        int inner = 1;
+                        for (int k = normAxis + 1; k < rank; k++) inner *= a.Shape._dims[k];
+                        int aAxis = a.Shape._dims[normAxis], bAxis = b2.Shape._dims[normAxis];
+                        int axisTotal = aAxis + bAxis;
+                        int total = outer * axisTotal * inner;
+
+                        using var aBuf = GetOrAllocateBuffer(backend, (Tensor<float>)(object)a);
+                        using var bBuf = GetOrAllocateBuffer(backend, (Tensor<float>)(object)b2);
+                        var outBuf = AllocateOutputBuffer(backend, total);
+                        bool handedOff = false;
+                        try
+                        {
+                            int aSlice = aAxis * inner, bSlice = bAxis * inner;
+                            for (int o = 0; o < outer; o++)
+                            {
+                                backend.Copy(aBuf.Buffer, o * aSlice, outBuf.Buffer, o * axisTotal * inner, aSlice);
+                                backend.Copy(bBuf.Buffer, o * bSlice, outBuf.Buffer, (o * axisTotal + aAxis) * inner, bSlice);
+                            }
+                            int[] outShape = (int[])a.Shape._dims.Clone();
+                            outShape[normAxis] = axisTotal;
+                            var result = FinishGpuOp<T>(backend, outBuf, total);
+                            handedOff = true;
+                            return new Tensor<T>(result, outShape);
+                        }
+                        finally
+                        {
+                            if (!handedOff) outBuf.Dispose();
+                        }
+                    }
+                }
+            }
+            catch { }
+        }
+        return base.TensorConcatenate(tensors, axis);
     }
 
     Tensor<T> IEngine.TensorSlice<T>(Tensor<T> tensor, int[] start, int[] length)
