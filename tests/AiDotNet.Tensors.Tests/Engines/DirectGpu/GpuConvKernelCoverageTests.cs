@@ -23,20 +23,32 @@ public sealed class GpuConvKernelCoverageTests : IDisposable
 
     public GpuConvKernelCoverageTests()
     {
+        // Only swallow the two exceptions that mean "no native GPU runtime on this host"
+        // (PlatformNotSupportedException / DllNotFoundException). A real GPU setup or kernel/module
+        // compilation regression MUST surface as a test failure, not get converted into an "unavailable"
+        // skip that hides the regression this suite exists to catch. Mirrors DetectionGpuParityTests.
         try
         {
             _gpu = new DirectGpuTensorEngine();
             _ready = _gpu.SupportsGpu;
-            // Prove the GPU kernel ACTUALLY runs: make the conv/pool/attention catch blocks rethrow instead of
-            // silently falling back to the CPU reference. Without this, a GPU kernel that threw would fall back to
-            // CPU and every GPU-vs-CPU assertion below would compare CPU-vs-CPU and trivially pass (false green) —
-            // the exact gap that left issue #622 looking "fixed" without proof.
-            if (_gpu is not null) _gpu.ThrowOnGpuKernelFallback = true;
         }
-        catch { _ready = false; }
+        catch (PlatformNotSupportedException) { _ready = false; }
+        catch (DllNotFoundException) { _ready = false; }
+
+        // Prove the GPU kernel ACTUALLY runs: make the conv/pool/attention catch blocks (here in the engine
+        // AND inside the Metal/Vulkan backends) rethrow instead of silently falling back to the CPU reference.
+        // Without this, a GPU kernel that threw would fall back to CPU and every GPU-vs-CPU assertion below
+        // would compare CPU-vs-CPU and trivially pass (false green) — the exact gap that left issue #622
+        // looking "fixed" without proof. The flag is [ThreadStatic], so set it only when a GPU is present and
+        // always clear it in Dispose so it never leaks into other test collections on this thread.
+        if (_ready) DirectGpuTensorEngine.ThrowOnGpuKernelFallback = true;
     }
 
-    public void Dispose() => _gpu?.Dispose();
+    public void Dispose()
+    {
+        DirectGpuTensorEngine.ThrowOnGpuKernelFallback = false;
+        _gpu?.Dispose();
+    }
 
     // Skip (visibly, via Xunit.SkipException) rather than silently `return` when
     // no GPU is present, so a failed/absent GPU setup shows as a skipped test

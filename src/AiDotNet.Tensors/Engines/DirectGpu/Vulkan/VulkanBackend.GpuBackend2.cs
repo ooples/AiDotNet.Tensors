@@ -46,7 +46,7 @@ public sealed unsafe partial class VulkanBackend
                 (uint)strideH, (uint)strideW, (uint)padH, (uint)padW, (uint)dilationH, (uint)dilationW };
             if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.Conv2D, pc, total, input, kernel, output)) return;
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
 
         var inp = DownloadBuffer(input);
         var ker = DownloadBuffer(kernel);
@@ -88,7 +88,7 @@ public sealed unsafe partial class VulkanBackend
                 (uint)strideH, (uint)strideW, (uint)padH, (uint)padW, (uint)dilationH, (uint)dilationW };
             if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.Conv2DBackwardInput, pc, total, gradOutput, kernel, gradInput)) return;
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
 
         var go = DownloadBuffer(gradOutput);
         var ker = DownloadBuffer(kernel);
@@ -129,7 +129,7 @@ public sealed unsafe partial class VulkanBackend
                 (uint)strideH, (uint)strideW, (uint)padH, (uint)padW, (uint)dilationH, (uint)dilationW };
             if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.Conv2DBackwardKernel, pc, total, input, gradOutput, gradKernel)) return;
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
 
         var inp = DownloadBuffer(input);
         var go = DownloadBuffer(gradOutput);
@@ -196,7 +196,7 @@ public sealed unsafe partial class VulkanBackend
                 (uint)kernelH, (uint)kernelW, (uint)strideH, (uint)strideW, (uint)padH, (uint)padW };
             if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.Unfold, pc, total, input, output)) return;
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
 
         var inp = DownloadBuffer(input);
         int outH = (height + 2 * padH - kernelH) / strideH + 1;
@@ -236,7 +236,7 @@ public sealed unsafe partial class VulkanBackend
                 (uint)kernelH, (uint)kernelW, (uint)strideH, (uint)strideW, (uint)padH, (uint)padW };
             if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.Fold, pc, total, input, output)) return;
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
 
         var inp = DownloadBuffer(input);
         int unfoldH = (outputH + 2 * padH - kernelH) / strideH + 1;
@@ -282,7 +282,7 @@ public sealed unsafe partial class VulkanBackend
                 (uint)padD, (uint)padH, (uint)padW, (uint)dilationD, (uint)dilationH, (uint)dilationW };
             if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.Conv3D, pc, total, input, kernel, output)) return;
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
 
         var inp = DownloadBuffer(input);
         var ker = DownloadBuffer(kernel);
@@ -326,7 +326,7 @@ public sealed unsafe partial class VulkanBackend
                 (uint)strideH, (uint)strideW, (uint)padH, (uint)padW };
             if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.DepthwiseConv2D, pc, total, input, kernel, output)) return;
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
 
         var inp = DownloadBuffer(input);
         var ker = DownloadBuffer(kernel);
@@ -442,7 +442,8 @@ void main() {
         }
         catch
         {
-            // fall through to the CPU reference
+            if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw;
+            // else fall through to the CPU reference
         }
 
         // CPU fallback (correctness safety net when the GPU kernel is unavailable / fails to launch).
@@ -499,7 +500,7 @@ void main() {
                 (uint)strideH, (uint)strideW, (uint)padH, (uint)padW, (uint)outputPadH, (uint)outputPadW };
             if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.ConvTranspose2DBackwardWeights, pc, total, input, gradOutput, gradKernel)) return;
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
 
         var inp = DownloadBuffer(input);
         var go = DownloadBuffer(gradOutput);
@@ -542,7 +543,7 @@ void main() {
                 if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.LocallyConnectedConv2D, pc, total, input, weights, bias, output)) return;
             }
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
 
         var inp = DownloadBuffer(input);
         var w = DownloadBuffer(weights);
@@ -583,7 +584,7 @@ void main() {
                 (uint)outChannels, (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW, (uint)strideH, (uint)strideW };
             if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.LocallyConnectedConv2DBackwardInput, pc, total, gradOutput, weights, gradInput)) return;
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
 
         var go = DownloadBuffer(gradOutput);
         var w = DownloadBuffer(weights);
@@ -622,7 +623,7 @@ void main() {
                 (uint)outChannels, (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW, (uint)strideH, (uint)strideW };
             if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.LocallyConnectedConv2DBackwardWeights, pc, total, gradOutput, input, gradWeights)) return;
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
 
         var go = DownloadBuffer(gradOutput);
         var inp = DownloadBuffer(input);
@@ -657,7 +658,7 @@ void main() {
             var pc = new uint[] { (uint)batch, (uint)outChannels, (uint)outHeight, (uint)outWidth };
             if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.LocallyConnectedConv2DBackwardBias, pc, outChannels, gradOutput, gradBias)) return;
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
 
         var go = DownloadBuffer(gradOutput);
         var gb = new float[outChannels];
@@ -717,7 +718,7 @@ void main() {
                 if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.DeformableConv2D, pc, total, input, weights, offsets, mask, output)) return;
             }
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
 
         var inp = DownloadBuffer(input);
         var ker = DownloadBuffer(weights);
@@ -802,7 +803,7 @@ void main() {
                 if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.DeformableConv2DBackwardInput, pc, total, gradOutput, weights, offsets, mask, gradInput)) return;
             }
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
 
         var go = DownloadBuffer(gradOutput);
         var ker = DownloadBuffer(weights);
@@ -890,7 +891,7 @@ void main() {
                 if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.DeformableConv2DBackwardWeights, pc, total, gradOutput, input, offsets, mask, gradWeights)) return;
             }
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
 
         var go = DownloadBuffer(gradOutput);
         var inp = DownloadBuffer(input);
@@ -963,7 +964,7 @@ void main() {
                 if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.DeformableConv2DBackwardOffset, pc, total, gradOutput, input, weights, offsets, mask, gradOffsets)) return;
             }
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
 
         var go = DownloadBuffer(gradOutput);
         var inp = DownloadBuffer(input);
@@ -1063,7 +1064,7 @@ void main() {
                 if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.DeformableConv2DBackwardMask, pc, total, gradOutput, input, weights, offsets, gradMask)) return;
             }
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
 
         var go = DownloadBuffer(gradOutput);
         var inp = DownloadBuffer(input);
@@ -1136,7 +1137,7 @@ void main() {
                 if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.MaxPool2D, pc, total, input, output, indices)) return;
             }
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
 
         var inp = DownloadBuffer(input);
         var outp = new float[batch * channels * outHeight * outWidth];
@@ -1182,7 +1183,7 @@ void main() {
             var pc = new uint[] { (uint)batch, (uint)channels, (uint)inHeight, (uint)inWidth, (uint)outHeight, (uint)outWidth };
             if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.MaxPool2DBackward, pc, outTotal, gradOutput, indices, gradInput)) return;
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
 
         var go = DownloadBuffer(gradOutput);
         var idx = DownloadBuffer(indices);
@@ -1217,7 +1218,7 @@ void main() {
                 (uint)strideH, (uint)strideW, (uint)padH, (uint)padW, (uint)(countIncludePad ? 1 : 0) };
             if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.AvgPool2D, pc, total, input, output)) return;
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
 
         var inp = DownloadBuffer(input);
         var outp = new float[batch * channels * outHeight * outWidth];
@@ -1258,7 +1259,7 @@ void main() {
                 (uint)strideH, (uint)strideW, (uint)padH, (uint)padW, (uint)(countIncludePad ? 1 : 0) };
             if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.AvgPool2DBackward, pc, total, gradOutput, gradInput)) return;
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
 
         var go = DownloadBuffer(gradOutput);
         var gi = new float[batch * channels * inHeight * inWidth];
@@ -1298,7 +1299,7 @@ void main() {
             var pc = new uint[] { (uint)batch, (uint)channels, (uint)height, (uint)width };
             if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.GlobalAvgPool2D, pc, batch * channels, input, output)) return;
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
 
         var inp = DownloadBuffer(input);
         var outp = new float[batch * channels];
@@ -1322,7 +1323,7 @@ void main() {
             var pc = new uint[] { (uint)batch, (uint)channels, (uint)height, (uint)width };
             if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.GlobalMaxPool2DNoIndices, pc, batch * channels, input, output)) return;
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
 
         var inp = DownloadBuffer(input);
         var outp = new float[batch * channels];
@@ -1346,7 +1347,7 @@ void main() {
             var pc = new uint[] { (uint)batch, (uint)channels, (uint)height, (uint)width };
             if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.GlobalMaxPool2D, pc, batch * channels, input, output, indices)) return;
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
 
         var inp = DownloadBuffer(input);
         var outp = new float[batch * channels];
@@ -1373,7 +1374,7 @@ void main() {
             var pc = new uint[] { (uint)batch, (uint)channels, (uint)height, (uint)width };
             if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.GlobalAvgPool2DBackward, pc, batch * channels * height * width, gradOutput, gradInput)) return;
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
 
         var go = DownloadBuffer(gradOutput);
         int spatial = height * width;
@@ -1397,7 +1398,7 @@ void main() {
             var pc = new uint[] { (uint)batch, (uint)channels, (uint)height, (uint)width };
             if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.GlobalMaxPool2DBackward, pc, batch * channels, gradOutput, indices, gradInput)) return;
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
 
         var go = DownloadBuffer(gradOutput);
         var idx = DownloadBuffer(indices);
@@ -1422,7 +1423,7 @@ void main() {
             var pc = new uint[] { (uint)batch, (uint)channels, (uint)inHeight, (uint)inWidth, (uint)outHeight, (uint)outWidth };
             if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.AdaptiveAvgPool2D, pc, batch * channels * outHeight * outWidth, input, output)) return;
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
 
         var inp = DownloadBuffer(input);
         var outp = new float[batch * channels * outHeight * outWidth];
@@ -1462,7 +1463,7 @@ void main() {
                 if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.MaxPool3D, pc, total, input, output, indices)) return;
             }
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
 
         var inp = DownloadBuffer(input);
         int outSize = batch * channels * outDepth * outHeight * outWidth;
@@ -1511,7 +1512,7 @@ void main() {
                 (uint)outDepth, (uint)outHeight, (uint)outWidth };
             if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.MaxPool3DBackward, pc, outTotal, gradOutput, indices, gradInput)) return;
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
 
         var go = DownloadBuffer(gradOutput);
         var idx = DownloadBuffer(indices);

@@ -2578,7 +2578,9 @@ kernel void global_avgpool(
 
 // Transposed 2D convolution (gather form): one thread per output element, accumulating over the input
 // positions that scatter into it. Mirrors the verified OpenCL/CUDA conv_transpose2d math. Output-pad
-// rows/cols naturally compute 0 (no valid input maps to them), so outputPad needs no special handling.
+// rows/cols naturally compute 0 (no valid input maps to them) because outHeight/outWidth already encode the
+// output padding, so outputPadH/outputPadW are accepted for cross-backend signature parity (OpenCL/CUDA/HIP
+// declare them as the final two parameters) but need no special handling in the gather body.
 // weights layout: [inChannels, outChannels, kH, kW].
 kernel void conv_transpose2d(
     device const float* inp [[buffer(0)]],
@@ -2597,8 +2599,11 @@ kernel void conv_transpose2d(
     constant uint& strideW [[buffer(13)]],
     constant uint& padH [[buffer(14)]],
     constant uint& padW [[buffer(15)]],
+    constant uint& outputPadH [[buffer(16)]],
+    constant uint& outputPadW [[buffer(17)]],
     uint gid [[thread_position_in_grid]])
 {
+    (void)outputPadH; (void)outputPadW;
     uint total = batch * outChannels * outHeight * outWidth;
     if (gid >= total) return;
     uint idx = gid;

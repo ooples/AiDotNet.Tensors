@@ -44,7 +44,7 @@ public sealed partial class MetalBackend
                 new[] { batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW }))
                 return;
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
         // CPU fallback - proper Metal implementation would use MPSNDArrayMatrixMultiplication or custom kernel
         var inp = DownloadBuffer(input);
         var kern = DownloadBuffer(kernel);
@@ -111,7 +111,7 @@ public sealed partial class MetalBackend
                 new[] { batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW }))
                 return;
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
         // CPU fallback
         var go = DownloadBuffer(gradOutput);
         var kern = DownloadBuffer(kernel);
@@ -182,7 +182,7 @@ public sealed partial class MetalBackend
                 new[] { batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW }))
                 return;
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
 
         var inp = DownloadBuffer(input);
         var go = DownloadBuffer(gradOutput);
@@ -266,7 +266,7 @@ public sealed partial class MetalBackend
                 new[] { batch, channels, height, width, kernelH, kernelW, strideH, strideW, padH, padW }))
                 return;
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
 
         var inp = DownloadBuffer(input);
         int outH = (height + 2 * padH - kernelH) / strideH + 1;
@@ -303,7 +303,7 @@ public sealed partial class MetalBackend
                 new[] { batch, channels, outputH, outputW, kernelH, kernelW, strideH, strideW, padH, padW }))
                 return;
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
 
         var inp = DownloadBuffer(input);
         int unfoldH = (outputH + 2 * padH - kernelH) / strideH + 1;
@@ -348,7 +348,7 @@ public sealed partial class MetalBackend
                 new[] { batch, inChannels, inDepth, inHeight, inWidth, outChannels, outDepth, outHeight, outWidth, kernelD, kernelH, kernelW, strideD, strideH, strideW, padD, padH, padW, dilationD, dilationH, dilationW }))
                 return;
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
 
         var inp = DownloadBuffer(input);
         var kern = DownloadBuffer(kernel);
@@ -399,7 +399,7 @@ public sealed partial class MetalBackend
                 new[] { batch, channels, inHeight, inWidth, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW }))
                 return;
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
 
         var inp = DownloadBuffer(input);
         var kern = DownloadBuffer(kernel);
@@ -483,13 +483,16 @@ public sealed partial class MetalBackend
                 encoder.SetBytes((uint)strideW, 13);
                 encoder.SetBytes((uint)padH, 14);
                 encoder.SetBytes((uint)padW, 15);
+                encoder.SetBytes((uint)outputPadH, 16);
+                encoder.SetBytes((uint)outputPadW, 17);
                 encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
                 return;
             }
         }
         catch
         {
-            // fall through to the CPU reference
+            if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw;
+            // else fall through to the CPU reference
         }
 
         // CPU fallback (correctness safety net when the GPU kernel is unavailable / fails to launch).
@@ -539,7 +542,7 @@ public sealed partial class MetalBackend
                 new[] { batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW }))
                 return;
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
 
         var go = DownloadBuffer(gradOutput);
         var kern = DownloadBuffer(kernel);
@@ -588,7 +591,7 @@ public sealed partial class MetalBackend
                 new[] { batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW }))
                 return;
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
 
         var inp = DownloadBuffer(input);
         var go = DownloadBuffer(gradOutput);
@@ -634,7 +637,7 @@ public sealed partial class MetalBackend
                 new[] { batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW }))
                 return;
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
 
         var inp = DownloadBuffer(input);
         var w = DownloadBuffer(weights);
@@ -686,7 +689,7 @@ public sealed partial class MetalBackend
                 new[] { batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW }))
                 return;
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
 
         var go = DownloadBuffer(gradOutput);
         var w = DownloadBuffer(weights);
@@ -734,7 +737,7 @@ public sealed partial class MetalBackend
                 new[] { batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW }))
                 return;
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
 
         var go = DownloadBuffer(gradOutput);
         var inp = DownloadBuffer(input);
@@ -779,7 +782,7 @@ public sealed partial class MetalBackend
                 outChannels, new[] { gradOutput, gradBias }, new[] { batch, outChannels, outHeight, outWidth }))
                 return;
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
 
         var go = DownloadBuffer(gradOutput);
         var result = new float[outChannels];
@@ -825,7 +828,7 @@ public sealed partial class MetalBackend
                     new[] { batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, groups, deformGroups }))
                 return;
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
 
         var inp = DownloadBuffer(input);
         var w = DownloadBuffer(weights);
@@ -894,7 +897,7 @@ public sealed partial class MetalBackend
                     new[] { batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, groups, deformGroups }))
                 return;
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
 
         var go = DownloadBuffer(gradOutput);
         var w = DownloadBuffer(weights);
@@ -977,7 +980,7 @@ public sealed partial class MetalBackend
                     new[] { batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, groups, deformGroups }))
                 return;
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
 
         var go = DownloadBuffer(gradOutput);
         var inp = DownloadBuffer(input);
@@ -1048,7 +1051,7 @@ public sealed partial class MetalBackend
                     new[] { batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, groups, deformGroups }))
                 return;
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
 
         var go = DownloadBuffer(gradOutput);
         var inp = DownloadBuffer(input);
@@ -1135,7 +1138,7 @@ public sealed partial class MetalBackend
                     new[] { batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, groups, deformGroups }))
                 return;
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
 
         var go = DownloadBuffer(gradOutput);
         var inp = DownloadBuffer(input);
@@ -1201,7 +1204,7 @@ public sealed partial class MetalBackend
                 new[] { batch, channels, inHeight, inWidth, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW }))
                 return;
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
 
         var inp = DownloadBuffer(input);
         var result = new float[batch * channels * outHeight * outWidth];
@@ -1277,7 +1280,7 @@ public sealed partial class MetalBackend
                 new[] { batch, channels, inHeight, inWidth, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW }))
                 return;
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
 
         var go = DownloadBuffer(gradOutput);
         var idx = DownloadBuffer(indices);
@@ -1328,7 +1331,7 @@ public sealed partial class MetalBackend
                 new[] { batch, channels, inHeight, inWidth, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, countIncludePad ? 1 : 0 }))
                 return;
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
 
         var inp = DownloadBuffer(input);
         var result = new float[batch * channels * outHeight * outWidth];
@@ -1393,7 +1396,7 @@ public sealed partial class MetalBackend
                 new[] { batch, channels, inHeight, inWidth, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, countIncludePad ? 1 : 0 }))
                 return;
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
 
         var go = DownloadBuffer(gradOutput);
         var result = new float[batch * channels * inHeight * inWidth];
@@ -1463,7 +1466,7 @@ public sealed partial class MetalBackend
                 batch * channels, new[] { input, output }, new[] { batch, channels, height, width }))
                 return;
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
 
         var inp = DownloadBuffer(input);
         var result = new float[batch * channels];
@@ -1500,7 +1503,7 @@ public sealed partial class MetalBackend
                 batch * channels, new[] { input, output }, new[] { batch, channels, height, width }))
                 return;
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
 
         var inp = DownloadBuffer(input);
         var result = new float[batch * channels];
@@ -1537,7 +1540,7 @@ public sealed partial class MetalBackend
                 batch * channels, new[] { input, output, indices }, new[] { batch, channels, height, width }))
                 return;
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
 
         var inp = DownloadBuffer(input);
         var result = new float[batch * channels];
@@ -1587,7 +1590,7 @@ public sealed partial class MetalBackend
                 batch * channels * height * width, new[] { gradOutput, gradInput }, new[] { batch, channels, height, width }))
                 return;
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
 
         var go = DownloadBuffer(gradOutput);
         int spatialSize = height * width;
@@ -1623,7 +1626,7 @@ public sealed partial class MetalBackend
                 batch * channels * height * width, new[] { gradOutput, indices, gradInput }, new[] { batch, channels, height, width }))
                 return;
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
 
         var go = DownloadBuffer(gradOutput);
         var idx = DownloadBuffer(indices);
@@ -1660,7 +1663,7 @@ public sealed partial class MetalBackend
                 new[] { batch, channels, inHeight, inWidth, outHeight, outWidth }))
                 return;
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
 
         var inp = DownloadBuffer(input);
         var result = new float[batch * channels * outHeight * outWidth];
@@ -1718,7 +1721,7 @@ public sealed partial class MetalBackend
                 new[] { batch, channels, inDepth, inHeight, inWidth, outDepth, outHeight, outWidth, kernelD, kernelH, kernelW, strideD, strideH, strideW }))
                 return;
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
 
         var inp = DownloadBuffer(input);
         var result = new float[batch * channels * outDepth * outHeight * outWidth];
@@ -1787,7 +1790,7 @@ public sealed partial class MetalBackend
                 new[] { batch, channels, inDepth, inHeight, inWidth, outDepth, outHeight, outWidth }))
                 return;
         }
-        catch { /* fall through to CPU reference */ }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
 
         var go = DownloadBuffer(gradOutput);
         var idx = DownloadBuffer(indices);
