@@ -4641,7 +4641,9 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>Log into pre-allocated destination. Uses VML/SVML with parallel chunking.</summary>
-    public unsafe void TensorLogInto<T>(Tensor<T> destination, Tensor<T> input)
+    // virtual so the DirectGpu engine can override with a GPU-resident path (PR #638: the compiled loss builder
+    // calls this concretely via `cpuEng.TensorLogInto`, so an explicit-interface override would not be reached).
+    public virtual unsafe void TensorLogInto<T>(Tensor<T> destination, Tensor<T> input)
     {
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
         var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
@@ -5000,7 +5002,14 @@ public partial class CpuEngine : ITensorLevelEngine
                 var capturedA = a;
                 var capturedB = b;
                 return scope.RecordBinary(LazyNodeType.Multiply, "TensorMultiply", a, b, a._shape,
-                    (eng, output) => eng.TensorMultiplyInto(output, capturedA, capturedB),
+                    (eng, output) =>
+                    {
+                        // GPU-resident elementwise multiply into output's stable buffer (no host materialize that
+                        // breaks CUDA-graph capture); else the host write-through.
+                        if (eng is DirectGpuTensorEngine mGpu && mGpu.TryMultiplyResidentInto(output, capturedA, capturedB))
+                            return;
+                        eng.TensorMultiplyInto(output, capturedA, capturedB);
+                    },
                     BackwardFunctions<T>.MultiplyBackward);
             }
         }
@@ -5649,6 +5658,10 @@ public partial class CpuEngine : ITensorLevelEngine
                 return scope.RecordUnary(LazyNodeType.MultiplyScalar, "TensorMultiplyScalar", tensor, tensor._shape,
                     (eng, output) =>
                     {
+                        // GPU-resident scalar multiply into output's stable buffer (no host materialize that breaks
+                        // CUDA-graph capture — the attention QK^T·1/√d scaling); else the host path.
+                        if (eng is DirectGpuTensorEngine sclGpu && sclGpu.TryMultiplyScalarResidentInto(output, captured, capturedScalar))
+                            return;
                         if (eng is CpuEngine cpuEng) cpuEng.TensorMultiplyScalarInto(output, captured, capturedScalar);
                         else { var r = eng.TensorMultiplyScalar(captured, capturedScalar); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
@@ -6249,7 +6262,12 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var captured = tensor;
                 return scope.RecordUnary(LazyNodeType.Negate, "TensorNegate", tensor, tensor._shape,
-                    (eng, output) => { MathHelper.GetNumericOperations<T>().Negate(captured.AsSpan(), output.AsWritableSpan()); },
+                    (eng, output) =>
+                    {
+                        // During CUDA-graph capture the GPU engine keeps this resident (no AsSpan download → CUDA-900).
+                        if (eng is DirectGpuTensorEngine gpu && gpu.TensorNegateIntoResident(output, captured)) return;
+                        MathHelper.GetNumericOperations<T>().Negate(captured.AsSpan(), output.AsWritableSpan());
+                    },
                     BackwardFunctions<T>.NegateBackward);
             }
         }
@@ -11469,10 +11487,15 @@ public partial class CpuEngine : ITensorLevelEngine
                     // 2D/ND×2D/ND×ND cases to write-through kernels.
                     (eng, output) =>
                     {
-                        // GPU-resident 2D / ND×2D matmul into output's stable buffer (no host materialize that
-                        // breaks CUDA-graph capture); else the host write-through path.
-                        if (eng is DirectGpuTensorEngine mmGpu && mmGpu.TryMatMulResidentInto(output, capturedA, capturedB))
-                            return;
+                        // GPU-resident matmul into output's stable buffer (no host materialize that breaks
+                        // CUDA-graph capture): 2D / ND×2D first, then ND×ND BATCHED (attention QK^T / AV via
+                        // cublasSgemmStridedBatched — without it the 4D attention matmuls host-fall-back = CUDA-900
+                        // that aborts capture, #38). Single type check; else the host write-through path below.
+                        if (eng is DirectGpuTensorEngine mmGpu)
+                        {
+                            if (mmGpu.TryMatMulResidentInto(output, capturedA, capturedB)) return;
+                            if (mmGpu.TryBatchedMatMulResidentInto(output, capturedA, capturedB)) return;
+                        }
                         if (typeof(T) == typeof(float) && eng is CpuEngine cpuEngF)
                         {
                             cpuEngF.TensorMatMulFloatInto(

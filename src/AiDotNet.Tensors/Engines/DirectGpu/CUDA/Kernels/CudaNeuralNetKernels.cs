@@ -1529,13 +1529,17 @@ extern ""C"" __global__ __launch_bounds__(256) void dropout_backward(
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void embedding_forward(
-    const float* indices, const float* embeddingTable, float* output,
+    const int* indices, const float* embeddingTable, float* output,
     int numIndices, int embeddingDim)
 {
+    // indices is TRUE int32 (every caller uploads via CudaBackend.AllocateIntBuffer). The prior signature
+    // `const float* indices` with `(int)indices[i]` float-interpreted the int32 bit pattern — small token IDs
+    // became denormals→0 (wrong gather) and some patterns became negative/huge → OOB table read = a sticky
+    // CUDA-700/900 that aborted CUDA-graph capture (#38). Same fix already applied to embedding_backward below.
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= numIndices) return;
 
-    int idx = (int)indices[i];
+    int idx = indices[i];
     for (int d = 0; d < embeddingDim; d++) {
         output[i * embeddingDim + d] = embeddingTable[idx * embeddingDim + d];
     }
