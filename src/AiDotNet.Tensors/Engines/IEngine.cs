@@ -5015,6 +5015,26 @@ public interface IEngine
     Tensor<T> BatchNorm<T>(Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance);
 
     /// <summary>
+    /// #639: DIFFERENTIABLE affine batch-norm using fixed (running) statistics —
+    /// <c>y = gamma·(x-mean)/sqrt(var+eps) + beta</c>. Records a single fused node with gradients
+    /// to x, gamma, beta (mean/variance are constants). This is the differentiable single-op form of
+    /// <see cref="BatchNormInference{T}"/>, intended as the batch=1 training BN fallback (where the
+    /// batch-statistics <see cref="BatchNorm{T}"/> collapses) so it stays one op instead of
+    /// decomposing into ~6 primitives.
+    /// </summary>
+    /// <param name="x">Rank-4 NCHW input <c>[N, C, H, W]</c> (the only supported rank).</param>
+    /// <param name="gamma">Per-channel scale, shape <c>[C]</c>.</param>
+    /// <param name="beta">Per-channel shift, shape <c>[C]</c>.</param>
+    /// <param name="mean">Per-channel running mean, shape <c>[C]</c> (constant w.r.t. autodiff).</param>
+    /// <param name="variance">Per-channel running variance, shape <c>[C]</c> (constant w.r.t. autodiff).</param>
+    /// <param name="epsilon">Numerical-stability term added to variance before the square root.</param>
+    /// <returns>Normalized output with the same shape as <paramref name="x"/> (<c>[N, C, H, W]</c>).</returns>
+    /// <exception cref="System.ArgumentException">Thrown when <paramref name="x"/> is not rank-4.</exception>
+    /// <remarks>GPU engines run the CPU forward (batch=1 is rare; see the CpuEngine implementation
+    /// note); the backward routes device-resident primitives on GPU engines.</remarks>
+    Tensor<T> BatchNormAffine<T>(Tensor<T> x, Tensor<T> gamma, Tensor<T> beta, Tensor<T> mean, Tensor<T> variance, double epsilon);
+
+    /// <summary>
     /// Computes the backward pass for batch normalization.
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>

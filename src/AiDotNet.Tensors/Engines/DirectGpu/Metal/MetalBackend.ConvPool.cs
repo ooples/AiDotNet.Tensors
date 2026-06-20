@@ -5,6 +5,25 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 
 public sealed partial class MetalBackend
 {
+    // Shared dispatch for the conv/pool MSL kernels (issue #646): bind the buffers (indices 0..n-1) and the int
+    // params (as setBytes at indices n..), launch a 1D grid over `threads` output elements. Returns false when the
+    // library/kernel is unavailable so the caller falls back to the CPU reference. Mirrors the Gemm dispatch shape.
+    // NOTE: validated only on a Metal runner — the dev box has no Apple GPU.
+    private bool TryDispatchConvPoolMetal(System.IntPtr library, string libName, string kernelName,
+        int threads, IGpuBuffer[] buffers, int[] intParams)
+    {
+        if (threads <= 0 || library == System.IntPtr.Zero) return false;
+        foreach (var b in buffers) if (b is not MetalGpuBuffer) return false;
+        var pipeline = GetPipeline(libName, library, kernelName);
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(threads);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        for (int i = 0; i < buffers.Length; i++) encoder.SetBuffer((MetalGpuBuffer)buffers[i], i);
+        for (int i = 0; i < intParams.Length; i++) encoder.SetBytes((uint)intParams[i], (uint)(buffers.Length + i));
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+        return true;
+    }
+
     #region Convolution Operations
 
     /// <summary>
@@ -18,6 +37,14 @@ public sealed partial class MetalBackend
         int dilationH, int dilationW)
     {
         ThrowIfDisposed();
+        try
+        {
+            if (TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "conv2d_direct",
+                batch * outChannels * outHeight * outWidth, new[] { input, kernel, output },
+                new[] { batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW }))
+                return;
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
         // CPU fallback - proper Metal implementation would use MPSNDArrayMatrixMultiplication or custom kernel
         var inp = DownloadBuffer(input);
         var kern = DownloadBuffer(kernel);
@@ -77,6 +104,14 @@ public sealed partial class MetalBackend
         int dilationH, int dilationW)
     {
         ThrowIfDisposed();
+        try
+        {
+            if (TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "conv2d_backward_input",
+                batch * inChannels * inHeight * inWidth, new[] { gradOutput, kernel, gradInput },
+                new[] { batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW }))
+                return;
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
         // CPU fallback
         var go = DownloadBuffer(gradOutput);
         var kern = DownloadBuffer(kernel);
@@ -140,6 +175,15 @@ public sealed partial class MetalBackend
         int dilationH, int dilationW)
     {
         ThrowIfDisposed();
+        try
+        {
+            if (TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "conv2d_backward_weights",
+                outChannels * inChannels * kernelH * kernelW, new[] { input, gradOutput, gradKernel },
+                new[] { batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW }))
+                return;
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         var go = DownloadBuffer(gradOutput);
         var result = new float[outChannels * inChannels * kernelH * kernelW];
@@ -213,6 +257,17 @@ public sealed partial class MetalBackend
     {
         ThrowIfDisposed();
         if (strideH <= 0 || strideW <= 0) throw new ArgumentException("Stride must be positive.");
+        try
+        {
+            int oH = (height + 2 * padH - kernelH) / strideH + 1;
+            int oW = (width + 2 * padW - kernelW) / strideW + 1;
+            if (TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "unfold",
+                batch * channels * kernelH * kernelW * oH * oW, new[] { input, output },
+                new[] { batch, channels, height, width, kernelH, kernelW, strideH, strideW, padH, padW }))
+                return;
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         int outH = (height + 2 * padH - kernelH) / strideH + 1;
         int outW = (width + 2 * padW - kernelW) / strideW + 1;
@@ -241,6 +296,15 @@ public sealed partial class MetalBackend
     {
         ThrowIfDisposed();
         if (strideH <= 0 || strideW <= 0) throw new ArgumentException("Stride must be positive.");
+        try
+        {
+            if (TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "fold",
+                batch * channels * outputH * outputW, new[] { input, output },
+                new[] { batch, channels, outputH, outputW, kernelH, kernelW, strideH, strideW, padH, padW }))
+                return;
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         int unfoldH = (outputH + 2 * padH - kernelH) / strideH + 1;
         int unfoldW = (outputW + 2 * padW - kernelW) / strideW + 1;
@@ -277,6 +341,15 @@ public sealed partial class MetalBackend
         int dilationD, int dilationH, int dilationW)
     {
         ThrowIfDisposed();
+        try
+        {
+            if (TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "conv3d_direct",
+                batch * outChannels * outDepth * outHeight * outWidth, new[] { input, kernel, output },
+                new[] { batch, inChannels, inDepth, inHeight, inWidth, outChannels, outDepth, outHeight, outWidth, kernelD, kernelH, kernelW, strideD, strideH, strideW, padD, padH, padW, dilationD, dilationH, dilationW }))
+                return;
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         var kern = DownloadBuffer(kernel);
         var result = new float[batch * outChannels * outDepth * outHeight * outWidth];
@@ -319,6 +392,15 @@ public sealed partial class MetalBackend
         int strideH, int strideW, int padH, int padW)
     {
         ThrowIfDisposed();
+        try
+        {
+            if (TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "depthwise_conv2d",
+                batch * channels * outHeight * outWidth, new[] { input, kernel, output },
+                new[] { batch, channels, inHeight, inWidth, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW }))
+                return;
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         var kern = DownloadBuffer(kernel);
         var result = new float[batch * channels * outHeight * outWidth];
@@ -372,6 +454,48 @@ public sealed partial class MetalBackend
         int outputPadH, int outputPadW)
     {
         ThrowIfDisposed();
+
+        // GPU path: real MSL conv_transpose2d kernel (gather form, one thread per output element). Falls back to
+        // the CPU reference on any failure so results stay correct (issue #646).
+        try
+        {
+            if (input is MetalGpuBuffer inBuf && kernel is MetalGpuBuffer wBuf && output is MetalGpuBuffer outBuf
+                && _convolutionLibrary != IntPtr.Zero)
+            {
+                var pipeline = GetPipeline("Convolution", _convolutionLibrary, "conv_transpose2d");
+                int total = batch * outChannels * outHeight * outWidth;
+                var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(total);
+                using var encoder = _commandQueue.CreateScopedComputeEncoder();
+                encoder.SetPipelineState(pipeline.Handle);
+                encoder.SetBuffer(inBuf, 0);
+                encoder.SetBuffer(wBuf, 1);
+                encoder.SetBuffer(outBuf, 2);
+                encoder.SetBytes((uint)batch, 3);
+                encoder.SetBytes((uint)inChannels, 4);
+                encoder.SetBytes((uint)inHeight, 5);
+                encoder.SetBytes((uint)inWidth, 6);
+                encoder.SetBytes((uint)outChannels, 7);
+                encoder.SetBytes((uint)outHeight, 8);
+                encoder.SetBytes((uint)outWidth, 9);
+                encoder.SetBytes((uint)kernelH, 10);
+                encoder.SetBytes((uint)kernelW, 11);
+                encoder.SetBytes((uint)strideH, 12);
+                encoder.SetBytes((uint)strideW, 13);
+                encoder.SetBytes((uint)padH, 14);
+                encoder.SetBytes((uint)padW, 15);
+                encoder.SetBytes((uint)outputPadH, 16);
+                encoder.SetBytes((uint)outputPadW, 17);
+                encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+                return;
+            }
+        }
+        catch
+        {
+            if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw;
+            // else fall through to the CPU reference
+        }
+
+        // CPU fallback (correctness safety net when the GPU kernel is unavailable / fails to launch).
         var inp = DownloadBuffer(input);
         var kern = DownloadBuffer(kernel);
         var result = new float[batch * outChannels * outHeight * outWidth];
@@ -411,6 +535,15 @@ public sealed partial class MetalBackend
         int outputPadH, int outputPadW)
     {
         ThrowIfDisposed();
+        try
+        {
+            if (TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "conv_transpose2d_backward_input",
+                batch * inChannels * inHeight * inWidth, new[] { gradOutput, kernel, gradInput },
+                new[] { batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW }))
+                return;
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
+
         var go = DownloadBuffer(gradOutput);
         var kern = DownloadBuffer(kernel);
         var result = new float[batch * inChannels * inHeight * inWidth];
@@ -451,6 +584,15 @@ public sealed partial class MetalBackend
         int outputPadH, int outputPadW)
     {
         ThrowIfDisposed();
+        try
+        {
+            if (TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "conv_transpose2d_backward_weights",
+                inChannels * outChannels * kernelH * kernelW, new[] { input, gradOutput, gradKernel },
+                new[] { batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW }))
+                return;
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         var go = DownloadBuffer(gradOutput);
         var result = new float[inChannels * outChannels * kernelH * kernelW];
@@ -488,6 +630,15 @@ public sealed partial class MetalBackend
         int strideH, int strideW)
     {
         ThrowIfDisposed();
+        try
+        {
+            if (bias is not null && TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "locally_connected_conv2d",
+                batch * outChannels * outHeight * outWidth, new[] { input, weights, bias, output },
+                new[] { batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW }))
+                return;
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         var w = DownloadBuffer(weights);
         float[]? b = bias is not null ? DownloadBuffer(bias) : null;
@@ -531,6 +682,15 @@ public sealed partial class MetalBackend
         int strideH, int strideW)
     {
         ThrowIfDisposed();
+        try
+        {
+            if (TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "locally_connected_conv2d_backward_input",
+                batch * inChannels * inHeight * inWidth, new[] { gradOutput, weights, gradInput },
+                new[] { batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW }))
+                return;
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
+
         var go = DownloadBuffer(gradOutput);
         var w = DownloadBuffer(weights);
         var result = new float[batch * inChannels * inHeight * inWidth];
@@ -570,6 +730,15 @@ public sealed partial class MetalBackend
         int strideH, int strideW)
     {
         ThrowIfDisposed();
+        try
+        {
+            if (TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "locally_connected_conv2d_backward_weights",
+                outHeight * outWidth * outChannels * inChannels * kernelH * kernelW, new[] { gradOutput, input, gradWeights },
+                new[] { batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW }))
+                return;
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
+
         var go = DownloadBuffer(gradOutput);
         var inp = DownloadBuffer(input);
         var result = new float[outHeight * outWidth * outChannels * inChannels * kernelH * kernelW];
@@ -607,6 +776,14 @@ public sealed partial class MetalBackend
         int batch, int outChannels, int outHeight, int outWidth)
     {
         ThrowIfDisposed();
+        try
+        {
+            if (TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "locally_connected_conv2d_backward_bias",
+                outChannels, new[] { gradOutput, gradBias }, new[] { batch, outChannels, outHeight, outWidth }))
+                return;
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
+
         var go = DownloadBuffer(gradOutput);
         var result = new float[outChannels];
 
@@ -642,6 +819,17 @@ public sealed partial class MetalBackend
         int groups, int deformGroups)
     {
         ThrowIfDisposed();
+        try
+        {
+            if (mask is not null && groups > 0 && deformGroups > 0
+                && inChannels % groups == 0 && inChannels % deformGroups == 0
+                && TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "deformable_conv2d",
+                    batch * outChannels * outHeight * outWidth, new[] { input, weights, offsets, mask, output },
+                    new[] { batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, groups, deformGroups }))
+                return;
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         var w = DownloadBuffer(weights);
         var off = DownloadBuffer(offsets);
@@ -700,6 +888,17 @@ public sealed partial class MetalBackend
         int groups, int deformGroups)
     {
         ThrowIfDisposed();
+        try
+        {
+            if (mask is not null && groups > 0 && deformGroups > 0
+                && inChannels % groups == 0 && inChannels % deformGroups == 0
+                && TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "deformable_conv2d_backward_input",
+                    batch * inChannels * inHeight * inWidth, new[] { gradOutput, weights, offsets, mask, gradInput },
+                    new[] { batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, groups, deformGroups }))
+                return;
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
+
         var go = DownloadBuffer(gradOutput);
         var w = DownloadBuffer(weights);
         var off = DownloadBuffer(offsets);
@@ -772,6 +971,17 @@ public sealed partial class MetalBackend
         int groups, int deformGroups)
     {
         ThrowIfDisposed();
+        try
+        {
+            if (mask is not null && groups > 0 && deformGroups > 0
+                && inChannels % groups == 0 && inChannels % deformGroups == 0
+                && TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "deformable_conv2d_backward_weights",
+                    outChannels * (inChannels / groups) * kernelH * kernelW, new[] { gradOutput, input, offsets, mask, gradWeights },
+                    new[] { batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, groups, deformGroups }))
+                return;
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
+
         var go = DownloadBuffer(gradOutput);
         var inp = DownloadBuffer(input);
         var off = DownloadBuffer(offsets);
@@ -831,6 +1041,18 @@ public sealed partial class MetalBackend
         int groups, int deformGroups)
     {
         ThrowIfDisposed();
+        try
+        {
+            int ksG = kernelH * kernelW;
+            if (mask is not null && groups > 0 && deformGroups > 0
+                && inChannels % groups == 0 && inChannels % deformGroups == 0
+                && TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "deformable_conv2d_backward_offset",
+                    batch * deformGroups * 2 * ksG * outHeight * outWidth, new[] { gradOutput, input, weights, offsets, mask, gradOffsets },
+                    new[] { batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, groups, deformGroups }))
+                return;
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
+
         var go = DownloadBuffer(gradOutput);
         var inp = DownloadBuffer(input);
         var w = DownloadBuffer(weights);
@@ -906,6 +1128,18 @@ public sealed partial class MetalBackend
         int groups, int deformGroups)
     {
         ThrowIfDisposed();
+        try
+        {
+            int ksG = kernelH * kernelW;
+            if (groups > 0 && deformGroups > 0
+                && inChannels % groups == 0 && inChannels % deformGroups == 0
+                && TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "deformable_conv2d_backward_mask",
+                    batch * deformGroups * ksG * outHeight * outWidth, new[] { gradOutput, input, weights, offsets, gradMask },
+                    new[] { batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, groups, deformGroups }))
+                return;
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
+
         var go = DownloadBuffer(gradOutput);
         var inp = DownloadBuffer(input);
         var w = DownloadBuffer(weights);
@@ -963,6 +1197,15 @@ public sealed partial class MetalBackend
         int strideH, int strideW, int padH, int padW)
     {
         ThrowIfDisposed();
+        try
+        {
+            if (indices is not null && TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "maxpool2d",
+                batch * channels * outHeight * outWidth, new[] { input, output, indices },
+                new[] { batch, channels, inHeight, inWidth, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW }))
+                return;
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         var result = new float[batch * channels * outHeight * outWidth];
         var idxResult = indices is not null ? new float[batch * channels * outHeight * outWidth] : null;
@@ -1030,6 +1273,15 @@ public sealed partial class MetalBackend
         int strideH, int strideW, int padH, int padW)
     {
         ThrowIfDisposed();
+        try
+        {
+            if (TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "maxpool2d_backward",
+                batch * channels * inHeight * inWidth, new[] { gradOutput, indices, gradInput },
+                new[] { batch, channels, inHeight, inWidth, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW }))
+                return;
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
+
         var go = DownloadBuffer(gradOutput);
         var idx = DownloadBuffer(indices);
         var result = new float[batch * channels * inHeight * inWidth];
@@ -1072,6 +1324,15 @@ public sealed partial class MetalBackend
         bool countIncludePad)
     {
         ThrowIfDisposed();
+        try
+        {
+            if (TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "avgpool2d",
+                batch * channels * outHeight * outWidth, new[] { input, output },
+                new[] { batch, channels, inHeight, inWidth, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, countIncludePad ? 1 : 0 }))
+                return;
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         var result = new float[batch * channels * outHeight * outWidth];
 
@@ -1128,6 +1389,15 @@ public sealed partial class MetalBackend
         bool countIncludePad)
     {
         ThrowIfDisposed();
+        try
+        {
+            if (TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "avgpool2d_backward",
+                batch * channels * inHeight * inWidth, new[] { gradOutput, gradInput },
+                new[] { batch, channels, inHeight, inWidth, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, countIncludePad ? 1 : 0 }))
+                return;
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
+
         var go = DownloadBuffer(gradOutput);
         var result = new float[batch * channels * inHeight * inWidth];
 
@@ -1190,6 +1460,14 @@ public sealed partial class MetalBackend
     public void GlobalAvgPool2D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int height, int width)
     {
         ThrowIfDisposed();
+        try
+        {
+            if (TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "global_avgpool2d",
+                batch * channels, new[] { input, output }, new[] { batch, channels, height, width }))
+                return;
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         var result = new float[batch * channels];
 
@@ -1219,6 +1497,14 @@ public sealed partial class MetalBackend
     public void GlobalMaxPool2D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int height, int width)
     {
         ThrowIfDisposed();
+        try
+        {
+            if (TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "global_maxpool2d_noidx",
+                batch * channels, new[] { input, output }, new[] { batch, channels, height, width }))
+                return;
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         var result = new float[batch * channels];
 
@@ -1248,6 +1534,14 @@ public sealed partial class MetalBackend
     public void GlobalMaxPool2D(IGpuBuffer input, IGpuBuffer output, IGpuBuffer indices, int batch, int channels, int height, int width)
     {
         ThrowIfDisposed();
+        try
+        {
+            if (TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "global_maxpool2d",
+                batch * channels, new[] { input, output, indices }, new[] { batch, channels, height, width }))
+                return;
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         var result = new float[batch * channels];
         var idxResult = new float[batch * channels];
@@ -1290,6 +1584,14 @@ public sealed partial class MetalBackend
     public void GlobalAvgPool2DBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput, int batch, int channels, int height, int width)
     {
         ThrowIfDisposed();
+        try
+        {
+            if (TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "global_avgpool2d_backward",
+                batch * channels * height * width, new[] { gradOutput, gradInput }, new[] { batch, channels, height, width }))
+                return;
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
+
         var go = DownloadBuffer(gradOutput);
         int spatialSize = height * width;
         var result = new float[batch * channels * spatialSize];
@@ -1318,6 +1620,14 @@ public sealed partial class MetalBackend
     public void GlobalMaxPool2DBackward(IGpuBuffer gradOutput, IGpuBuffer indices, IGpuBuffer gradInput, int batch, int channels, int height, int width)
     {
         ThrowIfDisposed();
+        try
+        {
+            if (TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "global_maxpool2d_backward",
+                batch * channels * height * width, new[] { gradOutput, indices, gradInput }, new[] { batch, channels, height, width }))
+                return;
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
+
         var go = DownloadBuffer(gradOutput);
         var idx = DownloadBuffer(indices);
         int spatialSize = height * width;
@@ -1346,6 +1656,15 @@ public sealed partial class MetalBackend
     public void AdaptiveAvgPool2D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth)
     {
         ThrowIfDisposed();
+        try
+        {
+            if (TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "adaptive_avgpool2d",
+                batch * channels * outHeight * outWidth, new[] { input, output },
+                new[] { batch, channels, inHeight, inWidth, outHeight, outWidth }))
+                return;
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         var result = new float[batch * channels * outHeight * outWidth];
 
@@ -1395,6 +1714,15 @@ public sealed partial class MetalBackend
         int strideD, int strideH, int strideW)
     {
         ThrowIfDisposed();
+        try
+        {
+            if (indices is not null && TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "maxpool3d",
+                batch * channels * outDepth * outHeight * outWidth, new[] { input, output, indices },
+                new[] { batch, channels, inDepth, inHeight, inWidth, outDepth, outHeight, outWidth, kernelD, kernelH, kernelW, strideD, strideH, strideW }))
+                return;
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
+
         var inp = DownloadBuffer(input);
         var result = new float[batch * channels * outDepth * outHeight * outWidth];
         var idxResult = indices is not null ? new float[batch * channels * outDepth * outHeight * outWidth] : null;
@@ -1455,6 +1783,15 @@ public sealed partial class MetalBackend
         int outDepth, int outHeight, int outWidth)
     {
         ThrowIfDisposed();
+        try
+        {
+            if (TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "maxpool3d_backward",
+                batch * channels * inDepth * inHeight * inWidth, new[] { gradOutput, indices, gradInput },
+                new[] { batch, channels, inDepth, inHeight, inWidth, outDepth, outHeight, outWidth }))
+                return;
+        }
+        catch { if (AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ThrowOnGpuKernelFallback) throw; /* else fall through to CPU reference */ }
+
         var go = DownloadBuffer(gradOutput);
         var idx = DownloadBuffer(indices);
         var result = new float[batch * channels * inDepth * inHeight * inWidth];

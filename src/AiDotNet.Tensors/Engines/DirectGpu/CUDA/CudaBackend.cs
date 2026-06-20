@@ -44,6 +44,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     private const int DefaultBlockSize = 256;
     private const int MaxRnnBlockSize = 1024;
+    // FP16 (Half) element width in bytes — used to validate half-buffer sizes before launching FP16-native kernels.
+    private const int Fp16ByteWidth = 2;
     private readonly ConcurrentDictionary<string, IntPtr> _kernelCache;
     private IntPtr _cudaContext;
     private IntPtr _stream;
@@ -1483,6 +1485,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                     "cuMemcpyDtoH");
             }
         }
+        // PR #638 A0: attribute this DtoH to the op that issued it (no-op outside a download-trace window).
+        AiDotNet.Tensors.Engines.DirectGpu.GpuMemoryTracker.OnDownload((long)byteSize);
     }
 
     public void Gemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
@@ -1578,6 +1582,26 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         long strideA = (long)M * K;
         long strideB = (long)K * N;
         long strideC = (long)M * N;
+
+        // PR #638: cublasSgemmStridedBatched is NOT stream-capture-safe — inside a CUDA-graph capture it returns a
+        // CUBLAS "Internal error" (the #38 attention-BMM blocker that invalidated whole-step capture at the
+        // Softmax/attention frontier). Under capture, issue `batchCount` SEQUENTIAL cublasSgemm calls on _stream
+        // (each is capturable); the strided-batched fast path stays for the non-captured (eager) steps where it
+        // saturates the SMs. Same arg order as the strided call and BatchedGemmFanout's per-slice cublasSgemm.
+        if (IsStreamCapturing())
+        {
+            for (int b = 0; b < batchCount; b++)
+            {
+                IntPtr aP = (IntPtr)((long)A.Handle + b * strideA * sizeof(float));
+                IntPtr bP = (IntPtr)((long)B.Handle + b * strideB * sizeof(float));
+                IntPtr cP = (IntPtr)((long)C.Handle + b * strideC * sizeof(float));
+                CuBlasNative.CheckCublasStatus(
+                    CuBlasNative.cublasSgemm(_cublasHandle, CublasOperation.None, CublasOperation.None,
+                        N, M, K, ref alphaVal, bP, N, aP, K, ref betaVal, cP, N),
+                    $"cublasSgemm(capture-sequential batch {b})");
+            }
+            return;
+        }
 
         CuBlasNative.CheckCublasStatus(
             CuBlasNative.cublasSgemmStridedBatched(
@@ -4031,10 +4055,23 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     #endregion
 
+    // float4 (vec4) kernels load/store 16-byte vectors; a base pointer that is not 16-byte aligned (a sliced or
+    // pooled SUB-buffer at a non-16B offset) makes that access MISALIGNED → an illegal access that faults the
+    // context with a sticky CUDA-700 (root-caused to add_vectors_vec4 / op=TensorAdd via the post-launch kernel
+    // check; the GPU never exceeds ~2.6/12GB so it was never a real OOM). Only take the vec4 fast path when every
+    // operand is 16-byte aligned; otherwise fall through to the scalar kernel (always correct, any alignment).
+    // Diagnostic kill-switch: AIDOTNET_NO_VEC4=1 forces the scalar kernels (disables every vec4 fast path) to
+    // test whether the vec4 float4 kernels are the CUDA-700 source vs the buffer lifecycle.
+    private static readonly bool s_noVec4 = System.Environment.GetEnvironmentVariable("AIDOTNET_NO_VEC4") == "1";
+    private static bool Vec4Aligned(IGpuBuffer a, IGpuBuffer b)
+        => !s_noVec4 && ((long)a.Handle & 15) == 0 && ((long)b.Handle & 15) == 0;
+    private static bool Vec4Aligned(IGpuBuffer a, IGpuBuffer b, IGpuBuffer c)
+        => !s_noVec4 && ((long)a.Handle & 15) == 0 && ((long)b.Handle & 15) == 0 && ((long)c.Handle & 15) == 0;
+
     private unsafe void LaunchUnaryKernel(string kernelName, IGpuBuffer input, IGpuBuffer output, int size)
     {
         // Try vec4 variant for 4x throughput on bandwidth-limited ops
-        if (size % 4 == 0 && _kernelCache.TryGetValue(kernelName + "_vec4", out var vec4Kernel))
+        if (size % 4 == 0 && Vec4Aligned(input, output) && _kernelCache.TryGetValue(kernelName + "_vec4", out var vec4Kernel))
         {
             using var _v = PushContext();
             int size4 = size / 4;
@@ -4066,8 +4103,20 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
 
     private unsafe void LaunchElementwiseKernel(string kernelName, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
     {
+        // PR #638 (CUDA-700 root fix): never launch an elementwise kernel over a buffer SMALLER than `size`. A
+        // pooled/cached buffer reused at a larger shape (or a stale resident buffer) that slips past the engine's
+        // size guards would make the kernel read/write PAST the allocation — an out-of-bounds access that faults
+        // the context with a sticky CUDA-700 (localized to add_vectors / op=TensorAdd via the post-launch check;
+        // the GPU never exceeds ~2.6/12GB, so it was never a real OOM). Throw BEFORE the launch so the caller's
+        // try/catch falls back to the correct (reallocating) host path instead of corrupting the context.
+        if (A.Handle == IntPtr.Zero || B.Handle == IntPtr.Zero || C.Handle == IntPtr.Zero)
+            throw new InvalidOperationException(
+                $"Elementwise '{kernelName}' operand was DISPOSED (Handle=0): A={(long)A.Handle:X} B={(long)B.Handle:X} C={(long)C.Handle:X} — use-after-free guard.");
+        if (A.Size < size || B.Size < size || C.Size < size)
+            throw new InvalidOperationException(
+                $"Elementwise '{kernelName}' operand buffer too small for size {size}: A={A.Size} B={B.Size} C={C.Size}.");
         // Try vec4 variant for 4x throughput on bandwidth-limited ops
-        if (size % 4 == 0 && _kernelCache.TryGetValue(kernelName + "_vec4", out var vec4Kernel))
+        if (size % 4 == 0 && Vec4Aligned(A, B, C) && _kernelCache.TryGetValue(kernelName + "_vec4", out var vec4Kernel))
         {
             using var _v = PushContext();
             int size4 = size / 4;
@@ -4104,7 +4153,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     private unsafe void LaunchScaleKernel(IGpuBuffer A, IGpuBuffer B, float scalar, int size)
     {
         // Try vec4 variant
-        if (size % 4 == 0 && _kernelCache.TryGetValue("scale_vector_vec4", out var vec4Kernel))
+        if (size % 4 == 0 && Vec4Aligned(A, B) && _kernelCache.TryGetValue("scale_vector_vec4", out var vec4Kernel))
         {
             using var _v = PushContext();
             int size4 = size / 4;
@@ -4275,6 +4324,14 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         LaunchKernelWithSharedMem(kernel, gridX, blockX, 0, args);
     }
 
+    // PR #638: localize the intermittent async CUDA-700 (an illegal access misdiagnosed as async-pool OOM — the
+    // GPU never exceeds ~2.6GB/12GB). compute-sanitizer isn't installed (driver-only box), so under
+    // AIDOTNET_KERNEL_LAUNCH_CHECK=1 synchronize + check the device error RIGHT AFTER each kernel launch: the
+    // FIRST kernel whose sync returns non-Success is the faulting one, tagged with the current op name. This
+    // catches a deterministic out-of-bounds (a race would serialize away — still informative either way).
+    internal static readonly bool s_launchCheck =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_KERNEL_LAUNCH_CHECK") == "1";
+
     private unsafe void LaunchKernelWithSharedMem(IntPtr kernel, uint gridX, uint blockX, uint sharedMemBytes, void** args)
     {
         CuBlasNative.CheckCudaResult(
@@ -4287,6 +4344,20 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                 (IntPtr)args,
                 IntPtr.Zero),
             "cuLaunchKernel");
+        if (s_launchCheck)
+        {
+            var sync = CudaNativeBindings.cuStreamSynchronize(_stream);
+            if (sync != CudaResult.Success)
+            {
+                string op = AiDotNet.Tensors.Engines.DirectGpuTensorEngine.s_currentForwardOp
+                            ?? AiDotNet.Tensors.Engines.DirectGpuTensorEngine.s_currentBackwardOp ?? "(none)";
+                string kname = "(unknown)";
+                foreach (var kv in _kernelCache) if (kv.Value == kernel) { kname = kv.Key; break; }
+                try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_launch_fault.txt"),
+                    $"[LAUNCH-FAULT] kernel={kname} op={op} grid={gridX} block={blockX} syncResult={sync}" + System.Environment.NewLine); } catch { }
+                throw new InvalidOperationException($"[LAUNCH-FAULT] kernel '{kname}' fault: {sync} (op={op})");
+            }
+        }
     }
 
     /// <summary>
@@ -7319,6 +7390,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         LaunchKernel3D(kernel, gridX, gridY, gridZ, blockX, blockY, 1, args);
     }
 
+    // CUDA-graph capture (#38): the general permute's stride/permutation int arrays are CONSTANT per permute op
+    // (shape + axes don't change across steps), but AllocateIntBuffer uploads them (cuMemcpyHtoD) every call —
+    // a non-capturable op inside cuStreamCapture (CUDA 906) that aborted whole-step capture on the attention
+    // transpose. Cache the device buffers keyed on the (shape, permutation) values: uploaded ONCE (pre-residency
+    // / warmup), reused on the captured replay with no HtoD. Bounded by the few distinct permute shapes.
+    private readonly System.Collections.Generic.Dictionary<string, (IGpuBuffer inStr, IGpuBuffer outStr, IGpuBuffer perm)> _permuteMetaCache = new();
+
     public unsafe void Permute(IGpuBuffer input, IGpuBuffer output, int[] shape, int[] permutation)
     {
         // Handle common fast paths first
@@ -7369,17 +7447,22 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         for (int i = ndims - 2; i >= 0; i--)
             outputStrides[i] = outputStrides[i + 1] * outputShape[i + 1];
 
-        // Allocate device memory for strides and permutation
-        using var inputStridesBuffer = AllocateIntBuffer(inputStrides);
-        using var outputStridesBuffer = AllocateIntBuffer(outputStrides);
-        using var permutationBuffer = AllocateIntBuffer(permutation);
+        // Device stride/permutation buffers — CACHED per (shape, permutation) so the captured replay does not
+        // re-upload them (cuMemcpyHtoD inside cuStreamCapture = CUDA 906). First call (pre-residency) uploads +
+        // caches; later calls (incl. the capture pass) reuse. Buffers are owned by the cache (not disposed here).
+        var metaKey = ndims.ToString() + ":" + string.Join(",", shape) + "|" + string.Join(",", permutation);
+        if (!_permuteMetaCache.TryGetValue(metaKey, out var meta))
+        {
+            meta = (AllocateIntBuffer(inputStrides), AllocateIntBuffer(outputStrides), AllocateIntBuffer(permutation));
+            _permuteMetaCache[metaKey] = meta;
+        }
 
         uint grid = (uint)((totalSize + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr inputPtr = input.Handle;
         IntPtr outputPtr = output.Handle;
-        IntPtr inputStridesPtr = inputStridesBuffer.Handle;
-        IntPtr outputStridesPtr = outputStridesBuffer.Handle;
-        IntPtr permutationPtr = permutationBuffer.Handle;
+        IntPtr inputStridesPtr = meta.inStr.Handle;
+        IntPtr outputStridesPtr = meta.outStr.Handle;
+        IntPtr permutationPtr = meta.perm.Handle;
 
         void** args = stackalloc void*[7];
         args[0] = &inputPtr;
@@ -11766,6 +11849,137 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         args[0] = &inPtr; args[1] = &gPtr; args[2] = &bPtr; args[3] = &outPtr;
         args[4] = &meanPtr; args[5] = &varPtr; args[6] = &rows; args[7] = &cols; args[8] = &eps;
         LaunchKernelWithSharedMem(kernel, (uint)rows, block, block * sizeof(float), args);
+    }
+
+    /// <summary>FP16-native GELU backward: gradIn = gradOut * gelu'(x). All FP16 buffers; FP32 math in-register.
+    /// Mirrors the FP32 gelu_backward formula so the Half backward is parity-equivalent.</summary>
+    public unsafe void Fp16GeluBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int size)
+    {
+        if (gradOutput is null) throw new ArgumentNullException(nameof(gradOutput));
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (gradInput is null) throw new ArgumentNullException(nameof(gradInput));
+        if (size <= 0) throw new ArgumentOutOfRangeException(nameof(size), "Element count must be positive.");
+        // Validate half-buffer sizes (matches Fp16Softmax/LayerNormBackward) — an undersized pooled buffer would
+        // otherwise read/write out of bounds (the CUDA-700 class this PR root-causes elsewhere).
+        long geluHalfBytes = (long)size * Fp16ByteWidth;
+        if (gradOutput.SizeInBytes < geluHalfBytes) throw new ArgumentException($"gradOutput half buffer too small: {gradOutput.SizeInBytes} < {geluHalfBytes}.");
+        if (input.SizeInBytes < geluHalfBytes) throw new ArgumentException($"input half buffer too small: {input.SizeInBytes} < {geluHalfBytes}.");
+        if (gradInput.SizeInBytes < geluHalfBytes) throw new ArgumentException($"gradInput half buffer too small: {gradInput.SizeInBytes} < {geluHalfBytes}.");
+        if (!_kernelCache.TryGetValue("fp16_gelu_backward_native", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: fp16_gelu_backward_native");
+        using var _ = PushContext();
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr gPtr = gradOutput.Handle, iPtr = input.Handle, oPtr = gradInput.Handle;
+        void** args = stackalloc void*[4];
+        args[0] = &gPtr; args[1] = &iPtr; args[2] = &oPtr; args[3] = &size;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    /// <summary>FP16-native ReLU backward: gradIn = (x>0)?gradOut:0. All FP16 buffers. Mirrors relu_backward.</summary>
+    public unsafe void Fp16ReluBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int size)
+    {
+        if (gradOutput is null) throw new ArgumentNullException(nameof(gradOutput));
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (gradInput is null) throw new ArgumentNullException(nameof(gradInput));
+        if (size <= 0) throw new ArgumentOutOfRangeException(nameof(size), "Element count must be positive.");
+        // Validate half-buffer sizes (matches Fp16Softmax/LayerNormBackward) — an undersized pooled buffer would
+        // otherwise read/write out of bounds (the CUDA-700 class this PR root-causes elsewhere).
+        long reluHalfBytes = (long)size * Fp16ByteWidth;
+        if (gradOutput.SizeInBytes < reluHalfBytes) throw new ArgumentException($"gradOutput half buffer too small: {gradOutput.SizeInBytes} < {reluHalfBytes}.");
+        if (input.SizeInBytes < reluHalfBytes) throw new ArgumentException($"input half buffer too small: {input.SizeInBytes} < {reluHalfBytes}.");
+        if (gradInput.SizeInBytes < reluHalfBytes) throw new ArgumentException($"gradInput half buffer too small: {gradInput.SizeInBytes} < {reluHalfBytes}.");
+        if (!_kernelCache.TryGetValue("fp16_relu_backward_native", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: fp16_relu_backward_native");
+        using var _ = PushContext();
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr gPtr = gradOutput.Handle, iPtr = input.Handle, oPtr = gradInput.Handle;
+        void** args = stackalloc void*[4];
+        args[0] = &gPtr; args[1] = &iPtr; args[2] = &oPtr; args[3] = &size;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    /// <summary>FP16-native softmax backward: gradIn = y*(gradOut - sum_f gradOut*y), ONE THREAD PER ROW (mirrors
+    /// softmax_backward). gradOutput/output/gradInput are FP16 [batchSize, features] buffers; reductions in FP32.</summary>
+    public unsafe void Fp16SoftmaxBackward(IGpuBuffer gradOutput, IGpuBuffer output, IGpuBuffer gradInput, int batchSize, int features)
+    {
+        if (gradOutput is null) throw new ArgumentNullException(nameof(gradOutput));
+        if (output is null) throw new ArgumentNullException(nameof(output));
+        if (gradInput is null) throw new ArgumentNullException(nameof(gradInput));
+        if (batchSize <= 0 || features <= 0) throw new ArgumentException($"batchSize/features must be positive (batchSize={batchSize}, features={features}).");
+        long halfBytes = (long)batchSize * features * 2;
+        if (gradOutput.SizeInBytes < halfBytes) throw new ArgumentException($"gradOutput half buffer too small: {gradOutput.SizeInBytes} < {halfBytes}.");
+        if (output.SizeInBytes < halfBytes) throw new ArgumentException($"output half buffer too small: {output.SizeInBytes} < {halfBytes}.");
+        if (gradInput.SizeInBytes < halfBytes) throw new ArgumentException($"gradInput half buffer too small: {gradInput.SizeInBytes} < {halfBytes}.");
+        if (!_kernelCache.TryGetValue("fp16_softmax_backward_native", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: fp16_softmax_backward_native");
+        using var _ = PushContext();
+        uint grid = (uint)((batchSize + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr gPtr = gradOutput.Handle, oPtr = output.Handle, giPtr = gradInput.Handle;
+        void** args = stackalloc void*[5];
+        args[0] = &gPtr; args[1] = &oPtr; args[2] = &giPtr; args[3] = &batchSize; args[4] = &features;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    /// <summary>FP16-native LayerNorm backward — gradInput. ONE BLOCK PER ROW (mirrors layernorm_backward); takes
+    /// the FP32 saveMean + saveInvVar (1/sqrt(var+eps)). grad/input/gamma/gradInput are FP16 buffers.</summary>
+    public unsafe void Fp16LayerNormBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma,
+        IGpuBuffer saveMeanFp32, IGpuBuffer saveInvVarFp32, IGpuBuffer gradInput, int rows, int cols)
+    {
+        if (gradOutput is null) throw new ArgumentNullException(nameof(gradOutput));
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (gamma is null) throw new ArgumentNullException(nameof(gamma));
+        if (saveMeanFp32 is null) throw new ArgumentNullException(nameof(saveMeanFp32));
+        if (saveInvVarFp32 is null) throw new ArgumentNullException(nameof(saveInvVarFp32));
+        if (gradInput is null) throw new ArgumentNullException(nameof(gradInput));
+        if (rows <= 0 || cols <= 0) throw new ArgumentException($"rows/cols must be positive (rows={rows}, cols={cols}).");
+        long matBytes = (long)rows * cols * 2;
+        if (gradOutput.SizeInBytes < matBytes) throw new ArgumentException($"gradOutput half buffer too small: {gradOutput.SizeInBytes} < {matBytes}.");
+        if (input.SizeInBytes < matBytes) throw new ArgumentException($"input half buffer too small: {input.SizeInBytes} < {matBytes}.");
+        if (gradInput.SizeInBytes < matBytes) throw new ArgumentException($"gradInput half buffer too small: {gradInput.SizeInBytes} < {matBytes}.");
+        if (gamma.SizeInBytes < (long)cols * 2) throw new ArgumentException($"gamma half buffer too small: {gamma.SizeInBytes} < {(long)cols * 2}.");
+        if (saveMeanFp32.SizeInBytes < (long)rows * sizeof(float)) throw new ArgumentException($"saveMean FP32 buffer too small: {saveMeanFp32.SizeInBytes} < {(long)rows * sizeof(float)}.");
+        if (saveInvVarFp32.SizeInBytes < (long)rows * sizeof(float)) throw new ArgumentException($"saveInvVar FP32 buffer too small: {saveInvVarFp32.SizeInBytes} < {(long)rows * sizeof(float)}.");
+        if (!_kernelCache.TryGetValue("fp16_layernorm_backward_native", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: fp16_layernorm_backward_native");
+        using var _ = PushContext();
+        const uint block = 256u;
+        IntPtr gPtr = gradOutput.Handle, iPtr = input.Handle, gamPtr = gamma.Handle;
+        IntPtr mPtr = saveMeanFp32.Handle, vPtr = saveInvVarFp32.Handle, giPtr = gradInput.Handle;
+        void** args = stackalloc void*[8];
+        args[0] = &gPtr; args[1] = &iPtr; args[2] = &gamPtr; args[3] = &mPtr;
+        args[4] = &vPtr; args[5] = &giPtr; args[6] = &rows; args[7] = &cols;
+        LaunchKernelWithSharedMem(kernel, (uint)rows, block, 2u * block * sizeof(float), args);
+    }
+
+    /// <summary>FP16-native LayerNorm backward — gamma/beta param grads. ONE THREAD PER FEATURE, FP32 accumulate,
+    /// Half out (mirrors layernorm_grad_params). Takes FP32 saveMean + saveInvVar.</summary>
+    public unsafe void Fp16LayerNormGradParams(IGpuBuffer gradOutput, IGpuBuffer input,
+        IGpuBuffer saveMeanFp32, IGpuBuffer saveInvVarFp32, IGpuBuffer gradGamma, IGpuBuffer gradBeta, int rows, int cols)
+    {
+        if (gradOutput is null) throw new ArgumentNullException(nameof(gradOutput));
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (saveMeanFp32 is null) throw new ArgumentNullException(nameof(saveMeanFp32));
+        if (saveInvVarFp32 is null) throw new ArgumentNullException(nameof(saveInvVarFp32));
+        if (gradGamma is null) throw new ArgumentNullException(nameof(gradGamma));
+        if (gradBeta is null) throw new ArgumentNullException(nameof(gradBeta));
+        if (rows <= 0 || cols <= 0) throw new ArgumentException($"rows/cols must be positive (rows={rows}, cols={cols}).");
+        long matBytes = (long)rows * cols * 2;
+        if (gradOutput.SizeInBytes < matBytes) throw new ArgumentException($"gradOutput half buffer too small: {gradOutput.SizeInBytes} < {matBytes}.");
+        if (input.SizeInBytes < matBytes) throw new ArgumentException($"input half buffer too small: {input.SizeInBytes} < {matBytes}.");
+        if (gradGamma.SizeInBytes < (long)cols * 2) throw new ArgumentException($"gradGamma half buffer too small: {gradGamma.SizeInBytes} < {(long)cols * 2}.");
+        if (gradBeta.SizeInBytes < (long)cols * 2) throw new ArgumentException($"gradBeta half buffer too small: {gradBeta.SizeInBytes} < {(long)cols * 2}.");
+        if (saveMeanFp32.SizeInBytes < (long)rows * sizeof(float)) throw new ArgumentException($"saveMean FP32 buffer too small: {saveMeanFp32.SizeInBytes} < {(long)rows * sizeof(float)}.");
+        if (saveInvVarFp32.SizeInBytes < (long)rows * sizeof(float)) throw new ArgumentException($"saveInvVar FP32 buffer too small: {saveInvVarFp32.SizeInBytes} < {(long)rows * sizeof(float)}.");
+        if (!_kernelCache.TryGetValue("fp16_layernorm_grad_params_native", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: fp16_layernorm_grad_params_native");
+        using var _ = PushContext();
+        uint grid = (uint)((cols + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr gPtr = gradOutput.Handle, iPtr = input.Handle, mPtr = saveMeanFp32.Handle;
+        IntPtr vPtr = saveInvVarFp32.Handle, ggPtr = gradGamma.Handle, gbPtr = gradBeta.Handle;
+        void** args = stackalloc void*[8];
+        args[0] = &gPtr; args[1] = &iPtr; args[2] = &mPtr; args[3] = &vPtr;
+        args[4] = &ggPtr; args[5] = &gbPtr; args[6] = &rows; args[7] = &cols;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
     /// <summary>FP32→FP16 via the self-contained native kernel (no cuda_fp16.h). Output is a half buffer.</summary>

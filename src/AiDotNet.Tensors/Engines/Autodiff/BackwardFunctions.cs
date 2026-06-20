@@ -767,7 +767,10 @@ internal static class BackwardFunctions<T>
         // higher-order AD. Rentals also live inside the gate.
         if (typeof(T) == typeof(float)
             && inputs[0].Rank == 2 && inputs[1].Rank == 2
-            && GradientTape<T>.Current is null)
+            && GradientTape<T>.Current is null
+            // PR #638 A1: during CUDA-graph capture the CPU fast path's GetDataArray() downloads resident grads
+            // (CUDA-900). Skip it so the engine fallback (resident Reshape/Transpose/MatMul) keeps grads resident.
+            && !(engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine { ResidentStepActive: true }))
         {
             var dCArr = (gradOutput as Tensor<float>)?.GetDataArray();
             var aArr = (inputs[0] as Tensor<float>)?.GetDataArray();
@@ -1067,6 +1070,52 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[2], gradBeta, engine);
     }
 
+    /// <summary>
+    /// #639: backward for the AFFINE batch-norm (running-stats inference form), the single
+    /// differentiable op that replaces the ~6-primitive batch=1 BN fallback. mean/variance are
+    /// CONSTANTS (running stats), so only inputs[0]=x, inputs[1]=gamma, inputs[2]=beta get
+    /// gradients. CpuEngine uses a fused typed kernel; other engines use a primitive fallback.
+    /// </summary>
+    internal static void BatchNormAffineBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var mean = (Tensor<T>)savedState[0];
+        var variance = (Tensor<T>)savedState[1];
+        var epsilon = (double)savedState[2];
+
+        Tensor<T> gradInput, gradGamma, gradBeta;
+        // DirectGpuTensorEngine inherits CpuEngine, so a bare `is CpuEngine` would silently route
+        // a GPU engine into the CPU fused backward (host<->device ping-pong, the worst outcome).
+        // Only take the CPU fused kernel for a genuine CPU engine; GPU engines use the
+        // engine-generic primitive fallback below, which dispatches each op to the GPU backend.
+        if (engine is CpuEngine cpu && !engine.SupportsGpu)
+        {
+            gradInput = cpu.BatchNormAffineBackward(
+                gradOutput, inputs[0], inputs[1], mean, variance, epsilon, out gradGamma, out gradBeta);
+        }
+        else
+        {
+            // Engine-generic primitive fallback (NCHW; gamma/mean/var are [C]).
+            int C = inputs[1].Length;
+            var bshape = new[] { 1, C, 1, 1 };
+            var eps = MathHelper.GetNumericOperations<T>().FromDouble(epsilon);
+            var std = engine.TensorSqrt(engine.TensorAddScalar(variance, eps)); // [C]
+            var inv = engine.TensorReciprocal(std);                             // 1/std [C]
+            var scale = engine.TensorMultiply(inputs[1], inv);                  // gamma/std [C]
+            gradInput = engine.TensorBroadcastMultiply(gradOutput, engine.Reshape(scale, bshape));
+            var xhat = engine.TensorBroadcastMultiply(
+                engine.TensorBroadcastSubtract(inputs[0], engine.Reshape(mean, bshape)),
+                engine.Reshape(inv, bshape));
+            gradGamma = engine.ReduceSum(engine.TensorMultiply(gradOutput, xhat), new[] { 0, 2, 3 }, false);
+            gradBeta = engine.ReduceSum(gradOutput, new[] { 0, 2, 3 }, false);
+        }
+
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradInput, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradGamma, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[2], gradBeta, engine);
+    }
+
     /// <summary>LayerNorm backward: uses engine.LayerNormBackward</summary>
     internal static void LayerNormBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
@@ -1264,6 +1313,19 @@ internal static class BackwardFunctions<T>
         var capturedFloatIdx = (Tensor<T>)savedState[0];
         int vocabSize = (int)savedState[1];
         int embeddingDim = (int)savedState[2];
+
+        // PR #638 A1: resident embedding backward — scatter-add into a resident [vocab,dim] table-grad via the
+        // forward's stable on-device index buffer, skipping the capturedFloatIdx.GetDataArray() download (CUDA-900).
+        if (engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine deEmb && deEmb.ResidentStepActive)
+        {
+            var residentTableGrad = deEmb.TryEmbeddingBackwardResident<T>(
+                gradOutput, capturedFloatIdx.Length, vocabSize, embeddingDim, inputs[0]._shape);
+            if (residentTableGrad is not null)
+            {
+                DifferentiableOps.AccumulateGrad(grads, inputs[0], residentTableGrad, engine);
+                return;
+            }
+        }
 
         // Materialise fresh int indices for this Step. The float input may
         // have been overwritten between forward and backward — that's the
@@ -2742,6 +2804,9 @@ internal static class BackwardFunctions<T>
         if (typeof(T) == typeof(float) && inputs[0].Rank == 2 && inputs[1].Rank == 2
             && gradOutput.IsContiguous && preActivation.IsContiguous
             && GradientTape<T>.Current is null
+            // PR #638 A1: skip the GetDataArray()-downloading CPU fast path during CUDA-graph capture → use the
+            // resident engine fallback (ReluBackward/Transpose/MatMul/ReduceSum are all resident in the step).
+            && !(engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine { ResidentStepActive: true })
             && (long)inputs[0]._shape[0] * inputs[0]._shape[1] * inputs[1]._shape[1] >= FusedReluFastPathMinWork)
         {
             int M = inputs[0]._shape[0]; // batch
@@ -2947,6 +3012,9 @@ internal static class BackwardFunctions<T>
     {
         var maskedGrad = engine.SigmoidBackward(gradOutput, output);
         if (typeof(T) == typeof(float) && inputs[0].Rank == 2 && GradientTape<T>.Current is null
+            // PR #638: skip the GetDataArray()-downloading fast path during CUDA-graph capture (route to the
+            // resident engine fallback) — capture-safety for Sigmoid/Tanh/GELU/Swish FFN backward, not just ReLU.
+            && !(engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine { ResidentStepActive: true })
             && (long)inputs[0]._shape[0] * inputs[0]._shape[1] * inputs[1]._shape[1] >= FusedLinearActivationFastPathMinWork)
         {
             FusedLinearActivationBackwardCore(
@@ -2964,6 +3032,9 @@ internal static class BackwardFunctions<T>
     {
         var maskedGrad = engine.TanhBackward(gradOutput, output);
         if (typeof(T) == typeof(float) && inputs[0].Rank == 2 && GradientTape<T>.Current is null
+            // PR #638: skip the GetDataArray()-downloading fast path during CUDA-graph capture (route to the
+            // resident engine fallback) — capture-safety for Sigmoid/Tanh/GELU/Swish FFN backward, not just ReLU.
+            && !(engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine { ResidentStepActive: true })
             && (long)inputs[0]._shape[0] * inputs[0]._shape[1] * inputs[1]._shape[1] >= FusedLinearActivationFastPathMinWork)
         {
             FusedLinearActivationBackwardCore(
@@ -2982,6 +3053,9 @@ internal static class BackwardFunctions<T>
         var preActivation = (Tensor<T>)savedState[0];
         var maskedGrad = engine.GeluBackward(gradOutput, preActivation);
         if (typeof(T) == typeof(float) && inputs[0].Rank == 2 && GradientTape<T>.Current is null
+            // PR #638: skip the GetDataArray()-downloading fast path during CUDA-graph capture (route to the
+            // resident engine fallback) — capture-safety for Sigmoid/Tanh/GELU/Swish FFN backward, not just ReLU.
+            && !(engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine { ResidentStepActive: true })
             && (long)inputs[0]._shape[0] * inputs[0]._shape[1] * inputs[1]._shape[1] >= FusedLinearActivationFastPathMinWork)
         {
             FusedLinearActivationBackwardCore(
@@ -3000,6 +3074,9 @@ internal static class BackwardFunctions<T>
         var preActivation = (Tensor<T>)savedState[0];
         var maskedGrad = engine.SwishBackward(gradOutput, preActivation);
         if (typeof(T) == typeof(float) && inputs[0].Rank == 2 && GradientTape<T>.Current is null
+            // PR #638: skip the GetDataArray()-downloading fast path during CUDA-graph capture (route to the
+            // resident engine fallback) — capture-safety for Sigmoid/Tanh/GELU/Swish FFN backward, not just ReLU.
+            && !(engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine { ResidentStepActive: true })
             && (long)inputs[0]._shape[0] * inputs[0]._shape[1] * inputs[1]._shape[1] >= FusedLinearActivationFastPathMinWork)
         {
             FusedLinearActivationBackwardCore(
@@ -4306,7 +4383,10 @@ internal static class BackwardFunctions<T>
         // Parallel.For. Both fast paths bypass engine recording, so the no-
         // active-tape gate preserves higher-order AD via the engine fallback.
         if (typeof(T) == typeof(float) && inputs[0].Rank == 2 && inputs[1].Rank == 2
-            && gradOutput.IsContiguous && GradientTape<T>.Current is null)
+            && gradOutput.IsContiguous && GradientTape<T>.Current is null
+            // PR #638 A1: skip the GetDataArray()-downloading CPU fast path during CUDA-graph capture → resident
+            // engine fallback (Reshape/TensorTranspose/TensorMatMul/ReduceSum are all resident in the step).
+            && !(engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine { ResidentStepActive: true }))
         {
             int M = inputs[0]._shape[0]; // batch
             int K = inputs[0]._shape[1]; // in_features
@@ -4391,7 +4471,10 @@ internal static class BackwardFunctions<T>
         // hundreds of MB and OOMs (ResNet50/fp64 LossStrictlyDecreases crashed here
         // in ComputeGradientsStreaming, not on convergence).
         if (typeof(T) == typeof(double) && inputs[0].Rank == 2 && inputs[1].Rank == 2
-            && gradOutput.IsContiguous && GradientTape<T>.Current is null)
+            && gradOutput.IsContiguous && GradientTape<T>.Current is null
+            // PR #638: skip the GetDataArray()-downloading double fast path during CUDA-graph capture (a resident
+            // T=double step would otherwise invalidate capture) → resident engine fallback below.
+            && !(engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine { ResidentStepActive: true }))
         {
             int M = inputs[0]._shape[0]; // batch
             int K = inputs[0]._shape[1]; // in_features

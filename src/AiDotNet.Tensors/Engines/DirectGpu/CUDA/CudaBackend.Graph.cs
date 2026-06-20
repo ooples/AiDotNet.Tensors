@@ -75,7 +75,14 @@ public sealed partial class CudaBackend
         rc = CudaNativeBindings.cuStreamEndCapture(_stream, out var graph);
         if (rc != CudaResult.Success || graph == IntPtr.Zero) { GcDiag($"endCapture FAILED rc={rc} graph={(graph != IntPtr.Zero)} (a non-capturable op — sync HtoD/DtoH or cuMemAlloc — was issued during launch)"); return IntPtr.Zero; }
 
-        rc = CudaNativeBindings.cuGraphInstantiate(out var graphExec, graph, 0UL);
+        // PR #638 Phase B: the captured whole-step graph contains cuMemAllocAsync MEMORY NODES (the resident-into
+        // backward ops allocate per-call scratch from the async pool during capture). A graph with allocation nodes
+        // can only be relaunched if its allocations are freed between launches — otherwise the SECOND cuGraphLaunch
+        // returns CUDA_ERROR_INVALID_VALUE (the eager-fallback trigger we saw). CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_
+        // ON_LAUNCH (=1) makes the graph auto-free its own allocations at the start of each launch, so it replays
+        // every step. (The freed memory returns to the async pool for the next launch's alloc nodes.)
+        const ulong CU_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH = 1UL;
+        rc = CudaNativeBindings.cuGraphInstantiate(out var graphExec, graph, CU_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH);
         CudaNativeBindings.cuGraphDestroy(graph); // exec holds its own copy; the template graph is no longer needed
         if (rc != CudaResult.Success) { GcDiag($"instantiate FAILED rc={rc}"); return IntPtr.Zero; }
 

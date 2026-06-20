@@ -430,6 +430,11 @@ internal static class DifferentiableOps
         Tensor<T> grad,
         IEngine engine)
     {
+        // PR #638 A2: mark this scope as grad accumulation so the DirectGpu engine's resident in-place add
+        // fast path engages ONLY here (the dedicated, non-aliased gradient leaf) and never hijacks forward
+        // in-place ops on aliased activations (that hijack threw CUDA-700). No-op for non-DirectGpu engines.
+        using var _gradAccumScope = (engine as AiDotNet.Tensors.Engines.DirectGpuTensorEngine)?.EnterGradAccumulation();
+
         // Higher-order AD: in-place add records a "TensorAddInPlace"
         // entry whose saved input is a *clone* of the existing gradient,
         // which severs the graph the second backward pass needs to
@@ -457,6 +462,13 @@ internal static class DifferentiableOps
         // preserves graph connectivity through the original grad
         // reference. Keep the original `grad` for the out-of-place
         // path; only materialize for in-place add storage.
+        if (Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") == "1"
+            && engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine gde && gde.ResidentStepActive)
+        {
+            Tensor<T>? exi = grads.TryGetValue(tensor, out var ed) ? ed : null;
+            try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_graphcapture_diag.txt"),
+                $"[ALIAS] accumgrad op={AiDotNet.Tensors.Engines.DirectGpuTensorEngine.s_currentBackwardOp} len={grad.Length}: gradRes={grad.TryGetGpuBuffer() is not null} gradContig={grad.IsContiguous} existRes={(exi?.TryGetGpuBuffer() is not null)}" + System.Environment.NewLine); } catch { }
+        }
         var gradForInPlace = grad.IsContiguous ? grad : grad.Contiguous();
 
         // Fast path: use indexed array when grad indices are assigned (avoids hash lookup)

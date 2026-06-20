@@ -89,10 +89,18 @@ public static class TensorPool<T>
         // pin; the tape's cleanup walk clears it after backward.
         if (tensor._pinnedByTape) return;
 
-        // GPU residency: a tensor produced by a GPU op carries a PENDING deferred GPU→CPU download (its CPU
-        // backing isn't populated until something reads it). Pooling it calls GetLiveBackingArrayOrNull →
-        // GetDataArray, which would FORCE that download (a host round-trip) purely to recycle the array. Skip
-        // pooling such tensors — the few recycled bytes aren't worth breaking GPU residency; the temp is GC'd.
+        // PR #638: a GPU-RESIDENT tensor (BindResidentBuffer set _gpuBuffer + a deferred host-read materializer)
+        // must NOT be pooled — the GetLiveBackingArrayOrNull() discriminator below calls GetDataArray(), which
+        // FIRES that materializer (a DtoH download). During CUDA-graph capture that download is a non-capturable
+        // CUDA-900 that aborts the whole-step capture (the LAST blocker after every backward grad went resident:
+        // NegateBackward pool-returns its resident negGrad). Reject resident tensors via the _gpuBuffer FIELD
+        // (no materialization) before the downloading check.
+        if (tensor._gpuBuffer is not null) return;
+
+        // GPU residency (main #633): a tensor produced by a GPU op may carry a PENDING deferred GPU→CPU download
+        // even without _gpuBuffer set (Half-resident store). Pooling it would FORCE that download to recycle the
+        // array. Skip — the few recycled bytes aren't worth breaking residency; the temp is GC'd. Complements the
+        // _gpuBuffer check above.
         var unsafeBacking = tensor.DataVector.GetBackingArrayUnsafe();
         if (unsafeBacking is not null && Helpers.DeferredArrayMaterializer.IsPending(unsafeBacking)) return;
 

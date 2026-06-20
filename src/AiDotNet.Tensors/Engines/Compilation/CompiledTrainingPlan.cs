@@ -178,6 +178,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         _lossGradSeed = lossGradSeed;
         _genericGradIndices = genericGradIndices;
         _forwardSteps = forwardSteps;
+        MaybeDumpOpHistogram(); // #639 diagnostic: AIDOTNET_PLAN_HISTOGRAM=1 dumps the replayed op profile
         // A leading "Embedding" step is an int→float gather. Capture it INSIDE the graph as a pure on-device gather
         // over a STABLE index buffer, and refresh just the small index vector before each launch (via the engine's
         // registered action, which knows the live indices tensor's TIndex) — so the whole step is one cuGraphLaunch
@@ -798,8 +799,16 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private const int TrainingParallelMinM = 64;
 
     // read at static init, then a single bool check per Step.
+    private static readonly bool s_stepProf =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_STEP_PROF") == "1";
+    // Step-profiler dump cadence (every N steps) and destination — configurable, with a temp-file fallback so no
+    // developer-local path is baked in.
+    private const int StepProfDumpInterval = 5;
+    private static readonly string StepProfDumpPath =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_STEP_PROF_PATH")
+        ?? System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_stepprof.txt");
     private static readonly bool _profileStepEnabled =
-        System.Environment.GetEnvironmentVariable("AIDOTNET_PROFILE_STEP") == "1";
+        System.Environment.GetEnvironmentVariable("AIDOTNET_PROFILE_STEP") == "1" || s_stepProf;
     private static long _profForwardUs, _profGradZeroUs, _profBackwardUs, _profOptimUs;
     private static int _profStepCount;
     private static long[]? _profPerStepUs;
@@ -842,6 +851,47 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// here when AIDOTNET_DEBUG_SUB=1. Used by Pinpoint tests to inspect
     /// what the kernel sees vs writes.</summary>
     public static string SubFwdDiag = "";
+
+    // #639: one-time op-type histogram of the compiled forward graph. Sizes the
+    // operator-fusion prize (how many ops the plan replays per step, and which
+    // adjacencies — conv→bias→activation, residual-add, BN — are worth fusing).
+    // Gated on AIDOTNET_PLAN_HISTOGRAM=1; writes once per process. Output goes to stderr AND
+    // (so it survives xUnit/dotnet-test console capture) to the path in AIDOTNET_PLAN_HISTOGRAM_FILE,
+    // defaulting to %TEMP%/aidotnet_plan_histogram.txt.
+    //
+    // The once-flag lives in the NON-generic CompiledPlanDiagnostics so it is genuinely process-wide
+    // (a static in CompiledTrainingPlan<T> would be per-closed-T: float, double, … each dump once) and
+    // the Interlocked latch makes the first-writer-wins check thread-safe under concurrent plan builds.
+    private void MaybeDumpOpHistogram()
+    {
+        if (_forwardSteps is null) return;
+        if (System.Environment.GetEnvironmentVariable("AIDOTNET_PLAN_HISTOGRAM") != "1") return;
+        if (System.Threading.Interlocked.Exchange(ref CompiledPlanDiagnostics.HistogramDumped, 1) != 0) return;
+        var hist = new System.Collections.Generic.Dictionary<string, int>();
+        foreach (var s in _forwardSteps)
+        {
+            var key = s.OpName ?? s.OpType.ToString();
+            hist[key] = hist.TryGetValue(key, out var c) ? c + 1 : 1;
+        }
+        var ordered = new System.Collections.Generic.List<System.Collections.Generic.KeyValuePair<string, int>>(hist);
+        ordered.Sort((a, b) => b.Value.CompareTo(a.Value));
+
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine($"[#639] compiled-plan forward op histogram — {_forwardSteps.Length} ops:");
+        foreach (var kv in ordered)
+            sb.AppendLine($"  {kv.Value,4}  {kv.Key}");
+        var text = sb.ToString();
+
+        System.Console.Error.Write(text);
+        try
+        {
+            var path = System.Environment.GetEnvironmentVariable("AIDOTNET_PLAN_HISTOGRAM_FILE");
+            if (string.IsNullOrEmpty(path))
+                path = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_plan_histogram.txt");
+            System.IO.File.WriteAllText(path, text);
+        }
+        catch { /* diagnostic only — never let a histogram dump break a training run */ }
+    }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public Tensor<T> Step()
@@ -1027,6 +1077,32 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         }
 
         int esz = System.Runtime.CompilerServices.Unsafe.SizeOf<T>();
+        // PR #638 A1: bind a STABLE resident GPU buffer to every pre-allocated gradient accumulator (the generic
+        // backward accumulates into gradMap[input] in place; without a resident buffer that accumulator lived on
+        // the host and every TensorAddInPlace downloaded it → CUDA-900 abort). Allocate ONLY in the not-capturing
+        // pre-pass; during capture/replay the buffers already exist and we just memset + accumulate in place.
+        var residentEngine = engine as Engines.DirectGpuTensorEngine;
+        bool capturingNow = cb.IsStreamCapturing();
+        if (residentEngine is not null && !capturingNow)
+        {
+            for (int i = 0; i < _preAllocatedGrads.Length; i++)
+                residentEngine.EnsureResidentBuffer(_preAllocatedGrads[i]);
+            // PR #638 (review): the loss-grad SEED is NOT part of _preAllocatedGrads, so the captured reseed below
+            // (CopyBufferDtoD seed→dest) would find no seed GPU buffer and be skipped — leaving the captured
+            // backward to start from a zero/stale loss gradient. Bind the seed resident here AND initialize its
+            // constant 1.0 (the seed is filled with numOps.One at construction; cuMemsetD32/Fill is fine — the
+            // pre-pass is NOT capturing). The dest (_lossGradDest == gradMap[lossOutput]) is already bound above.
+            // FAIL FAST if the seed cannot be made resident: silently skipping would leave the captured reseed off
+            // and the backward training from a zero loss gradient (a silent-wrong-numbers failure mode).
+            if (typeof(T) == typeof(float))
+            {
+                var seedResident = residentEngine.EnsureResidentBuffer(_lossGradSeed)
+                    ?? throw new InvalidOperationException(
+                        "Could not make the loss-gradient seed GPU-resident for the captured backward; the captured "
+                        + "reseed (CopyBufferDtoD) would be skipped and the backward would start from a zero loss gradient.");
+                cb.Fill(seedResident, 1f, _lossGradSeed.Length);
+            }
+        }
         if (_genericGradIndices != null)
         {
             for (int i = 0; i < _genericGradIndices.Length; i++)
@@ -1046,7 +1122,23 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             cb.CopyBufferDtoD(seedBuf, destBuf, (long)_lossGradSeed.Length * esz);
 
         var bwd = _backwardActions;
-        for (int i = 0; i < bwd.Length; i++) bwd[i](engine);
+        // PR #638 A0: extend the forward's capture-invalidation probe into the backward. The forward is fully
+        // capture-resident, so capture is still live entering here; the FIRST backward action that issues a
+        // host transfer (a non-resident gradient intermediate) flips StreamCaptureStatusRaw to 2 (invalidated).
+        // Logging its index + name + producing op turns "the THREW op moved" into a concrete backward work-item.
+        bool bwdDiag = System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") == "1" && cb.IsStreamCapturing();
+        var bwdNames = ProfBackwardStepNames;
+        for (int i = 0; i < bwd.Length; i++)
+        {
+            bwd[i](engine);
+            if (bwdDiag && cb.StreamCaptureStatusRaw() == 2)
+            {
+                string nm = i < bwdNames.Length ? bwdNames[i] : "?";
+                try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_graphcapture_diag.txt"),
+                    $"[CAPTURE-INVALIDATED-BY] backwardAction#{i} name={nm} op={Engines.DirectGpuTensorEngine.s_currentBackwardOp}" + System.Environment.NewLine); } catch { }
+                bwdDiag = false;   // log only the FIRST invalidation
+            }
+        }
         // NOTE: _optimizerUpdate is intentionally NOT invoked here — it runs eagerly
         // in Step() after LaunchCapturedGraph so the LR schedule / Adam bias-correction
         // scalars are fresh per step rather than frozen at capture time.
@@ -1201,9 +1293,15 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
         // Backward: specialized delegates (direct BLAS into pre-allocated buffers)
         long bwdStart = stepTiming ? Stopwatch.GetTimestamp() : 0;
+        // PR #638 A0: under AIDOTNET_GPU_DOWNLOAD_TRACE=1 (eager run), attribute every DtoH copy issued during
+        // THIS backward to its op, so the post-run trace ranks the backward ops still downloading gradient
+        // intermediates — the work-list for making the backward capture-resident. No-op when the trace is off.
+        var _dlTrace = AiDotNet.Tensors.Engines.DirectGpu.GpuMemoryTracker.BeginDownloadTrace();
         var bwd = _backwardActions;
         var bwdProbe = StepProbe;
         if (bwdProbe != null) bwdProbe("BEGIN-BWD");
+        try
+        {
         if (_fp16HeteroOrder is not null)
         {
             // FP16-IN-CAPTURE: mixed-dtype reverse pass (float/Half LazyNode backwards + cast-bridge
@@ -1244,6 +1342,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 if (bwdProbe != null) bwdProbe($"AFTER-BWD-{i}");
             }
         }
+        }
+        finally
+        {
+            // PR #638 (review): always dispose + dump the download trace, even if a backward delegate throws —
+            // otherwise the trace lifecycle is unbalanced and the failing-backward diagnostic is lost.
+            _dlTrace.Dispose();
+            AiDotNet.Tensors.Engines.DirectGpu.GpuMemoryTracker.DumpDownloadTrace("backward");
+        }
         long t3 = _profileStepEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         if (stepTiming) StepTiming.RecordBackward(Stopwatch.GetTimestamp() - bwdStart);
 
@@ -1283,7 +1389,21 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             System.Threading.Interlocked.Add(ref _profGradZeroUs, (long)((t2 - t1) * tickToUs));
             System.Threading.Interlocked.Add(ref _profBackwardUs, (long)((t3 - t2) * tickToUs));
             System.Threading.Interlocked.Add(ref _profOptimUs,    (long)((t4 - t3) * tickToUs));
-            System.Threading.Interlocked.Increment(ref _profStepCount);
+            int sc = System.Threading.Interlocked.Increment(ref _profStepCount);
+            // Periodic per-phase dump (AIDOTNET_STEP_PROF=1) so the per-step time is attributable
+            // (forward / grad-zero / backward / optimizer). Path is configurable via AIDOTNET_STEP_PROF_PATH,
+            // else falls back to a temp file (no hardcoded developer path); interval is a named constant.
+            if (s_stepProf && sc % StepProfDumpInterval == 0)
+            {
+                try
+                {
+                    long f = _profForwardUs, gz = _profGradZeroUs, b = _profBackwardUs, o = _profOptimUs;
+                    System.IO.File.AppendAllText(StepProfDumpPath,
+                        $"[STEPPROF] steps={sc} avgUs/step fwd={f / sc} gradZero={gz / sc} bwd={b / sc} opt={o / sc} total={(f + gz + b + o) / sc}"
+                        + System.Environment.NewLine);
+                }
+                catch { }
+            }
         }
         if (stepTiming)
         {
@@ -3083,6 +3203,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 var gradAcc = gradMap;
                 backwardActions.Add(eng =>
                 {
+                    // PR #638 A0: tag the producing op so the capture-path invalidation log can name it.
+                    Engines.DirectGpuTensorEngine.s_currentBackwardOp = stepCopy.OpName;
                     var gradOut = gradAcc.ContainsKey(stepCopy.OutputBuffer)
                         ? gradAcc[stepCopy.OutputBuffer]
                         : gradAcc.Values.First();
@@ -7343,6 +7465,17 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             i++; // Skip past i+1 — already consumed
         }
     }
+}
+
+/// <summary>
+/// Process-wide (NON-generic) diagnostics latch for <see cref="CompiledTrainingPlan{T}"/>. A static
+/// in the generic class would be per-closed-T, so the #639 op histogram would dump once per element
+/// type instead of once per process; this non-generic holder guarantees a single dump.
+/// </summary>
+internal static class CompiledPlanDiagnostics
+{
+    /// <summary>0 until the op histogram has been dumped; latched to 1 via Interlocked (first wins).</summary>
+    internal static int HistogramDumped;
 }
 
 /// <summary>
