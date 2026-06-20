@@ -134,19 +134,31 @@ internal static class Program
         var gamma = Rand(new[] { C }, rng);
         var beta = Rand(new[] { C }, rng);
 
+        int groups = ArgI(args, "--groups", 32);
+        bool noAdd = ArgI(args, "--noadd", 0) != 0;        // skip the residual add (localize corruption)
+        bool gnOnly = ArgI(args, "--gnonly", 0) != 0;      // just GroupNorm (isolate the norm op)
         Func<Tensor<float>> oneIter = rb
             ? () =>
             {
+                if (gnOnly) return gpu.GroupNorm(input, groups, gamma, beta, 1e-5, out _, out _);
                 // ResBlock: GN -> Swish -> Conv -> GN -> Swish -> Conv -> residual add
-                var h = gpu.GroupNorm(input, 32, gamma, beta, 1e-5, out _, out _);
+                var h = gpu.GroupNorm(input, groups, gamma, beta, 1e-5, out _, out _);
                 gpu.SwishInPlace(h);
                 h = gpu.Conv2D(h, kernel, 1, 1, 1);
-                h = gpu.GroupNorm(h, 32, gamma, beta, 1e-5, out _, out _);
+                h = gpu.GroupNorm(h, groups, gamma, beta, 1e-5, out _, out _);
                 gpu.SwishInPlace(h);
                 h = gpu.Conv2D(h, k2, 1, 1, 1);
-                return gpu.TensorAdd(input, h);
+                return noAdd ? h : gpu.TensorAdd(input, h);
             }
         : () => gpu.Conv2D(input, kernel, 1, 1, 1);
+
+        // --capture: #642 P3 option B endgame. Record the resident op graph, then CUDA-graph
+        // CAPTURE its compute-kernel sequence (H2D uploads stay outside capture — they cuMemAlloc,
+        // which is illegal mid-capture) and REPLAY it with zero per-launch overhead. Validates
+        // (a) the captured graph replays correctly (output matches eager) and (b) the launch-cost
+        // reduction vs issuing the same kernels directly.
+        if (ArgI(args, "--capture", 0) != 0)
+            return RunCapture(gpu, oneIter, rb ? "ResBlock" : "Conv2D");
 
         // --deferred: run each iter inside a DeferredScope so ops record into the fused
         // execution graph (device-resident, multi-stream) instead of executing eagerly per op
@@ -222,6 +234,87 @@ internal static class Program
         Console.WriteLine(
             $"GPU {(rb ? "ResBlock" : "Conv2D")} [1,{C},{sp}x{sp}] {n} iters / {sw.Elapsed.TotalSeconds:F1}s = " +
             $"{sw.Elapsed.TotalMilliseconds / n:F3} ms/iter  ({n / sw.Elapsed.TotalSeconds:F0} iters/s)  sink={sink:E2}");
+        return 0;
+    }
+
+    // #642 P3 option B: CUDA-graph CAPTURE + REPLAY of the resident deferred graph's compute
+    // kernels. The recorded graph allocates all buffers at RECORD time, so the kernel sequence
+    // replayed by Execute is alloc-free — the capturable subset. H2D upload nodes (TransferNode)
+    // cuMemAlloc a temp buffer per run, which is illegal during capture, so they're run only in
+    // warmup (to populate the resident buffers) and SKIPPED inside the captured region.
+    private static int RunCapture(AiDotNet.Tensors.Engines.DirectGpuTensorEngine gpu, Func<Tensor<float>> work, string label)
+    {
+        var backend = gpu.GetBackend();
+        if (backend == null) { Console.WriteLine("CAPTURE: no GPU backend"); return 2; }
+
+        // Eager reference (no scope) for the correctness check.
+        var eager = work();
+        var eagerCopy = new float[eager.Length];
+        for (int i = 0; i < eager.Length; i++) eagerCopy[i] = eager[i];
+
+        // Record the op graph into a deferred scope (NOT `using` — keep the recorded buffers alive
+        // through capture/replay; the scope's release-deferral gate frees them on Dispose at the end).
+        var scope = (AiDotNet.Tensors.Engines.Gpu.DeferredScope)gpu.BeginDeferredScope()!;
+        Tensor<float> r;
+        AiDotNet.Tensors.Engines.Gpu.Graph.ExecutionGraph graph;
+        try
+        {
+            r = work();                 // records H2D + resident compute kernels (buffers allocated now)
+            graph = scope.Compile();    // ends recording, runs optimizer passes
+        }
+        catch (Exception ex) { Console.WriteLine($"CAPTURE record/compile FAILED: {ex.GetType().Name}: {ex.Message}"); scope.Dispose(); return 3; }
+
+        int kernelCount = 0, transferCount = 0;
+        foreach (var node in graph.TopologicalOrder)
+        {
+            if (node is AiDotNet.Tensors.Engines.Gpu.Graph.KernelNode) kernelCount++;
+            else if (node is AiDotNet.Tensors.Engines.Gpu.Graph.TransferNode) transferCount++;
+        }
+        Console.WriteLine($"CAPTURE {label}: {graph.TopologicalOrder.Count} nodes ({kernelCount} kernels, {transferCount} transfers)");
+
+        // Warmup: run the full graph once (H2D populates resident buffers + JIT compiles kernels).
+        foreach (var node in graph.TopologicalOrder) node.Execute(backend);
+        backend.Synchronize();
+
+        if (backend is not AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend cudaBackend)
+        { Console.WriteLine($"CAPTURE: backend {backend.GetType().Name} is not CUDA — capture path is CUDA-only"); scope.Dispose(); return 0; }
+        var cap = new AiDotNet.Tensors.Engines.Gpu.CudaGraphScope(backend, cudaBackend.DefaultStream.Handle);
+        if (!cap.IsSupported) { Console.WriteLine("CAPTURE: CudaGraphScope not supported on this device"); cap.Dispose(); scope.Dispose(); return 0; }
+
+        try
+        {
+            // Capture ONLY the compute kernels (skip H2D/alloc/barrier — they alloc or sync).
+            cap.BeginCapture();
+            foreach (var node in graph.TopologicalOrder)
+                if (node is AiDotNet.Tensors.Engines.Gpu.Graph.KernelNode) node.Execute(backend);
+            cap.EndCapture();
+            Console.WriteLine($"CAPTURE: cuStreamBeginCapture/EndCapture/Instantiate OK (HasGraph={cap.HasGraph})");
+
+            // Replay once, then validate: r downloads the output buffer that replay last wrote.
+            cap.Replay();
+            double maxAbsDiff = 0;
+            int len = Math.Min(eagerCopy.Length, r.Length);
+            for (int i = 0; i < len; i++) maxAbsDiff = Math.Max(maxAbsDiff, Math.Abs((double)eagerCopy[i] - r[i]));
+            Console.WriteLine($"CAPTURE replay-vs-eager maxAbsDiff={maxAbsDiff:E3} (len={len})  {(maxAbsDiff < 1e-3 ? "CORRECT" : "WRONG")}");
+
+            // Timing: graph replay vs issuing the same kernels directly.
+            const int REP = 1000;
+            var swG = Stopwatch.StartNew();
+            for (int i = 0; i < REP; i++) cap.Replay();
+            swG.Stop();
+            var swD = Stopwatch.StartNew();
+            for (int i = 0; i < REP; i++)
+            {
+                foreach (var node in graph.TopologicalOrder)
+                    if (node is AiDotNet.Tensors.Engines.Gpu.Graph.KernelNode) node.Execute(backend);
+            }
+            backend.Synchronize();
+            swD.Stop();
+            double g = swG.Elapsed.TotalMilliseconds, d = swD.Elapsed.TotalMilliseconds;
+            Console.WriteLine($"CAPTURE {REP} replays={g:F1}ms ({g / REP:F3} ms/replay)  |  {REP} direct={d:F1}ms ({d / REP:F3} ms)  speedup={d / Math.Max(0.01, g):F2}x");
+        }
+        catch (Exception ex) { Console.WriteLine($"CAPTURE FAILED: {ex.GetType().Name}: {ex.Message}"); }
+        finally { cap.Dispose(); scope.Dispose(); }
         return 0;
     }
 
