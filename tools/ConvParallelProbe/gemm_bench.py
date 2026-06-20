@@ -52,7 +52,11 @@ def run_probe(probe, m, k, n, maxdop, reps, flag, repeat):
     """Return the min min_ms over `repeat` probe invocations for one flag value."""
     env = dict(os.environ)
     env["AIDOTNET_DISABLE_GPU"] = "1"          # no OpenCL init stealing cores
+    # The #653 forward-GEMM optimizations flip together: wide-nc/mc PackBoth blocking +
+    # single-persistent-region K-loop. flag=1 enables both (the eventual default); flag=0 is
+    # the pre-#653 baseline.
     env["AIDOTNET_GEMM_FORWARD_PACKBOTH"] = str(flag)
+    env["AIDOTNET_GEMM_SINGLE_REGION"] = str(flag)
     cmd = ["dotnet", probe, "--gemm", "--m", str(m), "--k", str(k), "--n", str(n),
            "--reps", str(reps), "--maxdop", str(maxdop)]
     best = None
