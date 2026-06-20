@@ -16,6 +16,7 @@ internal static class Program
 
         if (args.Length > 0 && args[0] == "--resblock") return RunResblock(eng, args);
         if (args.Length > 0 && args[0] == "--attnblock") return RunAttnBlock(eng, args);
+        if (args.Length > 0 && args[0] == "--act") return RunAct(eng, args);
         if (args.Length > 0 && args[0] == "--gpu") return RunGpu(args);
 
         int maxdop = ArgI(args, "--maxdop", Environment.ProcessorCount);
@@ -151,6 +152,60 @@ internal static class Program
         Console.WriteLine(
             $"ATTNBLOCK S={S} D={D} H={H} Dh={Dh} blocks={blocks} maxdop={maxdop} procs={Environment.ProcessorCount} " +
             $"warmup_ms={warm:F1} median_ms={times[reps / 2]:F2} min_ms={times[0]:F2} max_ms={times[times.Length - 1]:F2}{u}");
+        return 0;
+    }
+
+    // P4 (#653): the elementwise-activation stragglers (GELU/Swish/Tanh/Sigmoid) on a single
+    // large contiguous tensor — an FFN intermediate ([S,4D]) or UNet feature map. These ran
+    // SIMD-but-single-threaded between the parallelized GEMMs; this probe times them out-of-place
+    // (the *Into path the forward DAG uses) at a chosen maxdop so we can see them fan across cores.
+    private static int RunAct(CpuEngine eng, string[] a)
+    {
+        int maxdop = ArgI(a, "--maxdop", Environment.ProcessorCount);
+        int n = ArgI(a, "--n", 8 * 1024 * 1024);  // 8M floats ~= S=2048 x 4D=4096 FFN intermediate
+        int reps = ArgI(a, "--reps", 40);
+        bool util = HasFlag(a, "--util");
+        string op = a.Length > 1 && !a[1].StartsWith("--") ? a[1] : "gelu";
+
+        if (maxdop < 1 || n < 1 || reps < 1)
+        {
+            Console.Error.WriteLine("act: --maxdop, --n, --reps must all be >= 1.");
+            return 2;
+        }
+
+        CpuParallelSettings.MaxDegreeOfParallelism = maxdop;
+
+        var rng = new Random(0);
+        var src = Rand(new[] { n }, rng);
+        var dst = new Tensor<float>(new[] { n });
+
+        Action run = op switch
+        {
+            "swish"   => () => eng.SwishInto(dst, src),
+            "tanh"    => () => eng.TanhInto(dst, src),
+            "sigmoid" => () => eng.SigmoidInto(dst, src),
+            "relu"    => () => eng.ReLUInto(dst, src),
+            "mish"    => () => eng.MishInto(dst, src),
+            _         => () => eng.GELUInto(dst, src),
+        };
+
+        run(); // warm
+        double warm = dst[0];
+
+        var times = new double[reps];
+        var meter = util ? ParallelUtilizationMeter.Start() : null;
+        for (int i = 0; i < reps; i++)
+        {
+            var s = Stopwatch.StartNew();
+            run();
+            s.Stop();
+            times[i] = s.Elapsed.TotalMilliseconds;
+        }
+        string u = StopMeter(meter, maxdop);
+        Array.Sort(times);
+        Console.WriteLine(
+            $"ACT op={op} n={n} maxdop={maxdop} procs={Environment.ProcessorCount} " +
+            $"median_ms={times[reps / 2]:F3} min_ms={times[0]:F3} max_ms={times[times.Length - 1]:F3} (warm={warm:E1}){u}");
         return 0;
     }
 
