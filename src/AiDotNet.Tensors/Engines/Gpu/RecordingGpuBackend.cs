@@ -814,6 +814,39 @@ public class RecordingGpuBackend : DelegatingGpuBackend
     }
 
     /// <inheritdoc/>
+    public override void GlobalAvgPool2D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int height, int width)
+    {
+        // #642: record global/adaptive avg-pool (SE blocks, attention pooling) for deferred replay.
+        RecordOrExecute(KernelType.Pooling, new[] { input }, new[] { output },
+            () => Inner.GlobalAvgPool2D(input, output, batch, channels, height, width));
+    }
+
+    /// <inheritdoc/>
+    public override void GlobalMaxPool2D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int height, int width)
+    {
+        // #642: record global max-pool for deferred replay.
+        RecordOrExecute(KernelType.Pooling, new[] { input }, new[] { output },
+            () => Inner.GlobalMaxPool2D(input, output, batch, channels, height, width));
+    }
+
+    /// <inheritdoc/>
+    public override void AdaptiveAvgPool2D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth)
+    {
+        // #642: record adaptive avg-pool for deferred replay.
+        RecordOrExecute(KernelType.Pooling, new[] { input }, new[] { output },
+            () => Inner.AdaptiveAvgPool2D(input, output, batch, channels, inHeight, inWidth, outHeight, outWidth));
+    }
+
+    /// <inheritdoc/>
+    public override void Embedding(IGpuBuffer indices, IGpuBuffer embeddingTable, IGpuBuffer output, int numIndices, int embeddingDim)
+    {
+        // #642: record embedding gather (conditioning / token lookup) for deferred replay. The table
+        // is an input; indices is a separate (int) input the kernel reads.
+        RecordOrExecute(KernelType.ElementWise, new[] { indices, embeddingTable }, new[] { output },
+            () => Inner.Embedding(indices, embeddingTable, output, numIndices, embeddingDim));
+    }
+
+    /// <inheritdoc/>
     public override void Conv2DBiasAdd(IGpuBuffer output, IGpuBuffer bias, int batch, int channels, int spatialSize)
     {
         // #642: in-place per-channel bias add after conv — `output` is both read and written, so it is

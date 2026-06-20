@@ -6307,43 +6307,24 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 int outputSize = batch * outChannels * outHeight * outWidth;
                 int spatialSize = outHeight * outWidth;
 
-                // Download, add bias, re-upload (GPU bias broadcast kernel would be more efficient)
-                float[] outputFloat = new float[outputSize];
-                backend.DownloadBuffer(outputBuffer.Buffer, outputFloat);
-
-                // Get bias data (check cache first)
                 using var biasBuffer = GetOrCacheWeightBuffer(backend, bias.GetDataArray(), PersistentTensorRole.Biases);
-                float[] biasFloat = new float[bias.Length];
-                backend.DownloadBuffer(biasBuffer.Buffer, biasFloat);
 
-                for (int b = 0; b < batch; b++)
-                {
-                    for (int c = 0; c < outChannels; c++)
-                    {
-                        float biasVal = biasFloat[c];
-                        int baseIdx = (b * outChannels + c) * spatialSize;
-                        for (int s = 0; s < spatialSize; s++)
-                        {
-                            outputFloat[baseIdx + s] += biasVal;
-                        }
-                    }
-                }
+                // #642: GPU-resident, deferred-correct per-channel bias add via the recorded
+                // Conv2DBiasAdd kernel (in-place on outputBuffer), then activation on-device, then a
+                // lazy FinishGpuOp result. The old path downloaded the conv output, added bias in a
+                // CPU loop, and re-uploaded — which under a DeferredScope read the not-yet-computed
+                // output AND broke the device-resident chain. The activation cache owns outputBuffer
+                // from FinishGpuOp on, so it must NOT be disposed in the finally.
+                backend.Conv2DBiasAdd(outputBuffer.Buffer, biasBuffer.Buffer, batch, outChannels, spatialSize);
 
-                // Re-upload for activation
-                using var biasedBuffer = backend.AllocateBuffer(outputFloat);
-
-                // Apply activation on GPU
                 if (activation != FusedActivationType.None)
                 {
-                    ApplyGpuActivation(backend, biasedBuffer, outputSize, activation);
+                    ApplyGpuActivation(backend, outputBuffer.Buffer, outputSize, activation);
                 }
 
-                // DownloadBuffer uses blocking read, Synchronize() removed for performance
-                float[] resultFloat = new float[outputSize];
-                backend.DownloadBuffer(biasedBuffer, resultFloat);
-
-                T[] resultData = DirectGpuEngine.FromFloatArray<T>(resultFloat);
-                return new Tensor<T>(resultData, new[] { batch, outChannels, outHeight, outWidth });
+                var biasedData = FinishGpuOp<T>(backend, outputBuffer, outputSize);
+                outputHandedOff = true;
+                return new Tensor<T>(biasedData, new[] { batch, outChannels, outHeight, outWidth });
             }
             else
             {

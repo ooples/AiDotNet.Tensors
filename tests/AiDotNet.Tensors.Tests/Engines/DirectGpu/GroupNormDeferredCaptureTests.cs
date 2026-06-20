@@ -214,6 +214,46 @@ public sealed class GroupNormDeferredCaptureTests : IDisposable
     }
 
     [SkippableFact]
+    public void DeferredConvWithBias_MatchesEager()
+    {
+        // The conv+bias path previously downloaded the conv output, added bias in a CPU loop, and
+        // re-uploaded — broken under a DeferredScope. Now uses the recorded Conv2DBiasAdd kernel.
+        Skip.IfNot(_gpuAvailable, "No CUDA device.");
+        var input = Rand(new[] { 1, C, Sp, Sp }, 21);
+        var kernel = Rand(new[] { C, C, 3, 3 }, 22);
+        var bias = Rand(new[] { C }, 23);
+        AssertDeferredMatchesEager("FusedConv2D+bias",
+            () => _gpu!.FusedConv2D(input, kernel, bias, 1, 1, 1, 1, 1, 1, FusedActivationType.None));
+    }
+
+    [SkippableFact]
+    public void DeferredTensorTranspose_MatchesEager()
+    {
+        Skip.IfNot(_gpuAvailable, "No CUDA device.");
+        var m = Rand(new[] { 64, 96 }, 24);   // 2-D → backend.Transpose
+        AssertDeferredMatchesEager("TensorTranspose", () => _gpu!.TensorTranspose(m));
+    }
+
+    [SkippableFact]
+    public void DeferredAdaptiveAvgPool2D_MatchesEager()
+    {
+        // 1x1 adaptive avg-pool → GlobalAvgPool2D (SE blocks / attention pooling).
+        Skip.IfNot(_gpuAvailable, "No CUDA device.");
+        var input = Rand(new[] { 1, C, Sp, Sp }, 25);
+        AssertDeferredMatchesEager("AdaptiveAvgPool2D", () => _gpu!.AdaptiveAvgPool2D(input, 1, 1));
+    }
+
+    [SkippableFact]
+    public void DeferredEmbedding_MatchesEager()
+    {
+        Skip.IfNot(_gpuAvailable, "No CUDA device.");
+        var indices = new Tensor<int>(new[] { 4 });
+        for (int i = 0; i < 4; i++) indices[i] = i % 3;
+        var table = Rand(new[] { 3, 16 }, 26);
+        AssertDeferredMatchesEager("Embedding", () => _gpu!.Embedding(indices, table));
+    }
+
+    [SkippableFact]
     public void DeferredMaxPool2D_MatchesEager()
     {
         Skip.IfNot(_gpuAvailable, "No CUDA device.");
