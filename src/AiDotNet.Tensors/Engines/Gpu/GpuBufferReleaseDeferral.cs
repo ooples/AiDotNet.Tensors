@@ -16,23 +16,38 @@ namespace AiDotNet.Tensors.Engines.Gpu;
 /// </summary>
 internal static class GpuBufferReleaseDeferral
 {
-    [ThreadStatic] private static List<Action>? _deferred;
-    // Nesting depth: DeferredScopes can nest (a scope's ctor saves the parent). A single shared
-    // list would let an INNER scope's EndAndRelease() flush the OUTER scope's still-in-flight
-    // releases (use-after-free). We only flush when the OUTERMOST scope ends (depth returns to 0);
-    // inner-scope releases are held (safe — delayed free) until then. Each Begin() must be paired
-    // with exactly one EndAndRelease() (DeferredScope guards against its Execute()+Dispose() double
-    // call so the count stays balanced).
-    [ThreadStatic] private static int _depth;
+    // Per-flow deferral state. Holds the nesting depth (DeferredScopes can nest — a scope's ctor
+    // saves the parent — and only the OUTERMOST end flushes, so an inner EndAndRelease can't free the
+    // outer scope's still-in-flight buffers) and the queued releases.
+    private sealed class State
+    {
+        public int Depth;
+        public readonly List<Action> Releases = new();
+    }
 
-    /// <summary>True while releases on the current thread are being deferred (any nesting depth).</summary>
-    public static bool IsActive => _depth > 0;
+    // AsyncLocal, NOT [ThreadStatic]: DeferredScope.ExecuteAsync awaits, and its continuation (and
+    // `finally` cleanup) can resume on a DIFFERENT thread-pool thread than the one that called Begin()
+    // in the ctor. With [ThreadStatic] the cleanup ran against the wrong thread's (empty) state → the
+    // originating thread's gate stayed active forever and its queued buffer releases never ran (a
+    // permanent resource leak). AsyncLocal flows the SAME State object across await boundaries and
+    // threads, so Begin/TryDefer/EndAndRelease all see one shared, correctly-balanced state. The
+    // State is locked because a parallel recording region could touch it from several flow-inheriting
+    // threads.
+    private static readonly System.Threading.AsyncLocal<State?> _state = new();
 
-    /// <summary>Begin deferring releases on the calling thread; increments the nesting depth.</summary>
+    /// <summary>True while releases on the current async flow are being deferred (any nesting depth).</summary>
+    public static bool IsActive => _state.Value is { Depth: > 0 };
+
+    /// <summary>Begin deferring releases for the current async flow; increments the nesting depth.</summary>
     public static void Begin()
     {
-        _depth++;
-        _deferred ??= new List<Action>();
+        var s = _state.Value;
+        if (s is null)
+        {
+            s = new State();
+            _state.Value = s;
+        }
+        lock (s) { s.Depth++; }
     }
 
     /// <summary>
@@ -41,24 +56,34 @@ internal static class GpuBufferReleaseDeferral
     /// </summary>
     public static bool TryDefer(Action release)
     {
-        if (_depth == 0) return false;
-        (_deferred ??= new List<Action>()).Add(release);
+        var s = _state.Value;
+        if (s is null) return false;
+        lock (s)
+        {
+            if (s.Depth == 0) return false;
+            s.Releases.Add(release);
+        }
         return true;
     }
 
     /// <summary>
     /// Ends one deferral nesting level. Only when the outermost level ends (depth → 0) are the queued
-    /// releases drained and run. Idempotent when already balanced (depth 0). Call AFTER the deferred
-    /// graph has executed.
+    /// releases drained and run. Idempotent when already balanced. Call AFTER the deferred graph has
+    /// executed.
     /// </summary>
     public static void EndAndRelease()
     {
-        if (_depth == 0) return;        // already balanced — no active deferral to end
-        if (--_depth > 0) return;       // an inner scope ended; keep deferring for the outer scope
-        var d = _deferred;
-        _deferred = null;
-        if (d is null) return;
-        foreach (var r in d)
+        var s = _state.Value;
+        if (s is null) return;
+        List<Action> toRun;
+        lock (s)
+        {
+            if (s.Depth == 0) return;       // already balanced — no active deferral to end
+            if (--s.Depth > 0) return;      // an inner scope ended; keep deferring for the outer scope
+            toRun = new List<Action>(s.Releases);
+            s.Releases.Clear();
+        }
+        foreach (var r in toRun)
         {
             try { r(); } catch { /* a single buffer's free must not abort the rest */ }
         }

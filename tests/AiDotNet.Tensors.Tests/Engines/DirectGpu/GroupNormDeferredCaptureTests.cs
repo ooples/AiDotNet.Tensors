@@ -150,6 +150,36 @@ public sealed class GroupNormDeferredCaptureTests : IDisposable
         Assert.True(maxDiff < Tolerance, $"Deferred ResBlock diverged from eager: maxDiff={maxDiff}");
     }
 
+    // Pure-CPU async test (no GPU → runs in CI) for the AsyncLocal deferral gate (#642 review,
+    // Major): Begin on this thread, hop threads via an await, then TryDefer/EndAndRelease on the
+    // continuation thread must see the SAME flowed state. With the old [ThreadStatic] storage the
+    // continuation thread saw an empty gate → the originating thread's gate leaked and its queued
+    // releases never ran. (NOTE: full async GPU *execution* via DeferredScope.ExecuteAsync is a
+    // separate, pre-existing limitation — GPU ops need the CUDA context current on the continuation
+    // thread; the production deferred path uses synchronous Execute. This test isolates the gate.)
+    [Fact]
+    public async System.Threading.Tasks.Task DeferralGate_FlowsAcrossAwaitAndThreadHop()
+    {
+        Assert.False(GpuBufferReleaseDeferral.IsActive);
+        var flushed = new List<string>();
+        int beginThread = System.Environment.CurrentManagedThreadId;
+
+        GpuBufferReleaseDeferral.Begin();
+        Assert.True(GpuBufferReleaseDeferral.TryDefer(() => flushed.Add("a")));
+
+        // Force a real thread hop: the continuation almost certainly resumes on another pool thread.
+        await System.Threading.Tasks.Task.Run(() => System.Threading.Thread.Sleep(1)).ConfigureAwait(false);
+
+        // On the (likely different) continuation thread the AsyncLocal state must still be visible.
+        Assert.True(GpuBufferReleaseDeferral.IsActive);
+        Assert.True(GpuBufferReleaseDeferral.TryDefer(() => flushed.Add("b")));
+
+        GpuBufferReleaseDeferral.EndAndRelease();   // outermost end → flush both, regardless of thread
+        Assert.False(GpuBufferReleaseDeferral.IsActive);
+        Assert.Equal(new[] { "a", "b" }, flushed);
+        _ = beginThread; // (continuation thread may differ — that's the point)
+    }
+
     [SkippableFact]
     public void ChannelConcat_MatchesCpu_EagerAndDeferred()
     {
