@@ -5605,7 +5605,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Use cache-aware buffer allocation (OwnedBuffer auto-disposes only if we allocated)
         using var inputBuffer = GetOrAllocateBuffer(backend, input);
         using var kernelBuffer = GetOrCacheWeightBuffer(backend, kernel.GetDataArray(), PersistentTensorRole.Weights);
-        using var outputBuffer = AllocateOutputBuffer(backend, batch * outChannels * outHeight * outWidth);
+        // NOTE: not `using` — under a DeferredScope the no-bias path hands this buffer to
+        // FinishGpuOp (the activation cache then owns its lifetime so the lazy download can
+        // run after scope.Execute()). The `finally` disposes it on every other path. #642 P3.
+        var outputBuffer = AllocateOutputBuffer(backend, batch * outChannels * outHeight * outWidth);
+        bool outputHandedOff = false;
 
         try
         {
@@ -5672,6 +5676,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     ApplyGpuActivation(backend, outputBuffer.Buffer, outputSize, activation);
                 }
 
+                // #642 P3: when recording into a deferred execution graph, the Conv2D kernel
+                // above was RECORDED, not executed — an eager DownloadBuffer here would read the
+                // not-yet-computed (all-zero) output buffer. Hand the buffer to FinishGpuOp so
+                // the download is deferred to first CPU access (which happens after
+                // scope.Execute() replays the graph). The activation cache owns the buffer's
+                // lifetime from here, so we must NOT dispose it in the finally.
+                if (Gpu.DeferredScope.Current?.IsRecording == true)
+                {
+                    var lazyData = FinishGpuOp<T>(backend, outputBuffer, outputSize);
+                    outputHandedOff = true;
+                    return new Tensor<T>(lazyData, new[] { batch, outChannels, outHeight, outWidth });
+                }
+
                 // DownloadBuffer uses blocking read, Synchronize() removed for performance
                 float[] resultFloat = new float[outputSize];
                 backend.DownloadBuffer(outputBuffer.Buffer, resultFloat);
@@ -5684,6 +5701,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             // Fall back to CPU on any GPU error
             return base.FusedConv2D(input, kernel, bias, strideH, strideW, padH, padW, dilationH, dilationW, activation);
+        }
+        finally
+        {
+            // Free the output buffer on every path except the deferred hand-off (where the
+            // activation cache now owns it and frees it on eviction). Replaces the old
+            // `using var outputBuffer`.
+            if (!outputHandedOff)
+                outputBuffer.Dispose();
         }
     }
 

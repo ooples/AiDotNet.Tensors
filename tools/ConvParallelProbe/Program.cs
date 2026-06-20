@@ -159,7 +159,22 @@ internal static class Program
             {
                 using var scope = gpu.BeginDeferredScope();
                 var r = baseIter();
+                var ds = scope as AiDotNet.Tensors.Engines.Gpu.DeferredScope;
+                if (ds != null)
+                {
+                    var sb = new System.Text.StringBuilder("  NODES: ");
+                    foreach (var node in ds.GraphBuilder.Nodes)
+                    {
+                        sb.Append(node.NodeType);
+                        if (node is AiDotNet.Tensors.Engines.Gpu.Graph.KernelNode kn) sb.Append(':').Append(kn.KernelType);
+                        sb.Append('[').Append(node.Dependencies.Count).Append("dep] ");
+                    }
+                    Console.WriteLine(sb.ToString());
+                }
                 scope?.Execute();
+                var st = (scope as AiDotNet.Tensors.Engines.Gpu.DeferredScope)?.GetStatistics();
+                if (st != null)
+                    Console.WriteLine($"  GRAPH recorded={st.OperationsRecorded} afterCompile={st.NodesAfterCompilation} eliminated={st.EliminatedOperations} fused={st.FusedOperations}");
                 return r;
             };
 
@@ -168,10 +183,17 @@ internal static class Program
             {
                 var eagerO = baseIter();
                 var defO = oneIter();
-                double maxAbsDiff = 0;
+                double maxAbsDiff = 0, defAbsMax = 0, defNonZero = 0;
                 int len = Math.Min(eagerO.Length, defO.Length);
-                for (int i = 0; i < len; i++) maxAbsDiff = Math.Max(maxAbsDiff, Math.Abs((double)eagerO[i] - defO[i]));
-                Console.WriteLine($"CORRECTNESS deferred-vs-eager maxAbsDiff={maxAbsDiff:E3} (len={len})");
+                for (int i = 0; i < len; i++)
+                {
+                    maxAbsDiff = Math.Max(maxAbsDiff, Math.Abs((double)eagerO[i] - defO[i]));
+                    defAbsMax = Math.Max(defAbsMax, Math.Abs((double)defO[i]));
+                    if (defO[i] != 0) defNonZero++;
+                }
+                Console.WriteLine($"CORRECTNESS deferred-vs-eager maxAbsDiff={maxAbsDiff:E3} (len={len}) defAbsMax={defAbsMax:E3} defNonZero={defNonZero / len:P0}");
+                Console.WriteLine($"  eager[0..4]={eagerO[0]:F4} {eagerO[1]:F4} {eagerO[2]:F4} {eagerO[3]:F4}");
+                Console.WriteLine($"  defrd[0..4]={defO[0]:F4} {defO[1]:F4} {defO[2]:F4} {defO[3]:F4}");
             }
             catch (Exception ex)
             {
