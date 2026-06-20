@@ -17,6 +17,7 @@ internal static class Program
         if (args.Length > 0 && args[0] == "--resblock") return RunResblock(eng, args);
         if (args.Length > 0 && args[0] == "--attnblock") return RunAttnBlock(eng, args);
         if (args.Length > 0 && args[0] == "--act") return RunAct(eng, args);
+        if (args.Length > 0 && args[0] == "--gemm") return RunGemm(eng, args);
         if (args.Length > 0 && args[0] == "--gpu") return RunGpu(args);
 
         int maxdop = ArgI(args, "--maxdop", Environment.ProcessorCount);
@@ -205,6 +206,50 @@ internal static class Program
         Array.Sort(times);
         Console.WriteLine(
             $"ACT op={op} n={n} maxdop={maxdop} procs={Environment.ProcessorCount} " +
+            $"median_ms={times[reps / 2]:F3} min_ms={times[0]:F3} max_ms={times[times.Length - 1]:F3} (warm={warm:E1}){u}");
+        return 0;
+    }
+
+    // P4 (#653): a single dense GEMM [M,K]x[K,N] — the transformer QKV/O projection and FFN
+    // matmul shapes — at a chosen maxdop. Isolates whether intra-op GEMM parallelism saturates
+    // cores (the cooperative-pool fan-out), separate from the block-level barriers/small ops.
+    private static int RunGemm(CpuEngine eng, string[] a)
+    {
+        int maxdop = ArgI(a, "--maxdop", Environment.ProcessorCount);
+        int M = ArgI(a, "--m", 512);
+        int K = ArgI(a, "--k", 1024);
+        int N = ArgI(a, "--n", 4096);
+        int reps = ArgI(a, "--reps", 30);
+        bool util = HasFlag(a, "--util");
+
+        if (maxdop < 1 || M < 1 || K < 1 || N < 1 || reps < 1)
+        {
+            Console.Error.WriteLine("gemm: --maxdop, --m, --k, --n, --reps must all be >= 1.");
+            return 2;
+        }
+
+        CpuParallelSettings.MaxDegreeOfParallelism = maxdop;
+
+        var rng = new Random(0);
+        var lhs = Rand(new[] { M, K }, rng);
+        var rhs = Rand(new[] { K, N }, rng);
+
+        var o = eng.BatchMatMul(lhs, rhs); // warm
+        float warm = o[0];
+
+        var times = new double[reps];
+        var meter = util ? ParallelUtilizationMeter.Start() : null;
+        for (int i = 0; i < reps; i++)
+        {
+            var s = Stopwatch.StartNew();
+            o = eng.BatchMatMul(lhs, rhs);
+            s.Stop();
+            times[i] = s.Elapsed.TotalMilliseconds;
+        }
+        string u = StopMeter(meter, maxdop);
+        Array.Sort(times);
+        Console.WriteLine(
+            $"GEMM M={M} K={K} N={N} fma={(double)M * K * N:E1} maxdop={maxdop} procs={Environment.ProcessorCount} " +
             $"median_ms={times[reps / 2]:F3} min_ms={times[0]:F3} max_ms={times[times.Length - 1]:F3} (warm={warm:E1}){u}");
         return 0;
     }
