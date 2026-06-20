@@ -2901,17 +2901,52 @@ public partial class CpuEngine : ITensorLevelEngine
                 // For a small batch (batch=2 of [16, 64, 16] tiles)
                 // the work could be small enough to skip dispatch.
                 long batchTotalWork = (long)batchSize * m * n * k;
-                Helpers.CpuParallelSettings.ParallelForOrSerial(0, batchSize, batchTotalWork, batch =>
+                int maxDeg = Helpers.CpuParallelSettings.MaxDegreeOfParallelism;
+
+                // #653 Phase 2: when there are fewer batch slices than cores AND each slice's
+                // GEMM is large, parallelizing over the batch alone caps utilization at
+                // batchSize. High-res attention is exactly this (e.g. 8 heads, each a
+                // [1024,64]x[64,1024] score GEMM) — heads-only fan-out left a 16-32 core box
+                // ~half idle (#642). Flatten the work into a (batch × M-row-block) grid so it
+                // fans out to ~maxDeg. Each output row is still computed by a single thread via
+                // SgemmSequential, so the result is bit-identical to the batch-only path
+                // (disjoint output rows → deterministicSafe).
+                if (batchSize < maxDeg && m >= 2 && batchTotalWork >= Helpers.PersistentParallelExecutor.DefaultSerialGrainSize)
                 {
-                    int aOffset = batch * matrixSizeA;
-                    int bOffset = batch * matrixSizeB;
-                    int resultOffset = batch * matrixSizeResult;
-                    Simd.SimdGemm.SgemmSequential(
-                        aF.AsSpan(aOffset, matrixSizeA),
-                        bF.AsSpan(bOffset, matrixSizeB),
-                        rF.AsSpan(resultOffset, matrixSizeResult),
-                        m, k, n);
-                });
+                    int blocksPerSlice = Math.Min(m, Math.Max(1, (maxDeg + batchSize - 1) / batchSize));
+                    int totalItems = batchSize * blocksPerSlice;
+                    Helpers.CpuParallelSettings.ParallelForOrSerial(0, totalItems, batchTotalWork, item =>
+                    {
+                        int batch = item / blocksPerSlice;
+                        int blk = item % blocksPerSlice;
+                        int r0 = (int)((long)blk * m / blocksPerSlice);
+                        int r1 = (int)((long)(blk + 1) * m / blocksPerSlice);
+                        if (r1 <= r0) return;
+                        int rows = r1 - r0;
+                        int aOffset = batch * matrixSizeA + r0 * k;
+                        int bOffset = batch * matrixSizeB;
+                        int resultOffset = batch * matrixSizeResult + r0 * n;
+                        Simd.SimdGemm.SgemmSequential(
+                            aF.AsSpan(aOffset, rows * k),
+                            bF.AsSpan(bOffset, matrixSizeB),
+                            rF.AsSpan(resultOffset, rows * n),
+                            rows, k, n);
+                    }, deterministicSafe: true);
+                }
+                else
+                {
+                    Helpers.CpuParallelSettings.ParallelForOrSerial(0, batchSize, batchTotalWork, batch =>
+                    {
+                        int aOffset = batch * matrixSizeA;
+                        int bOffset = batch * matrixSizeB;
+                        int resultOffset = batch * matrixSizeResult;
+                        Simd.SimdGemm.SgemmSequential(
+                            aF.AsSpan(aOffset, matrixSizeA),
+                            bF.AsSpan(bOffset, matrixSizeB),
+                            rF.AsSpan(resultOffset, matrixSizeResult),
+                            m, k, n);
+                    });
+                }
             }
             goto batchDone;
         }
