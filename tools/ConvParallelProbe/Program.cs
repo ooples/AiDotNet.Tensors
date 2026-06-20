@@ -309,20 +309,23 @@ internal static class Program
 
         if (backend is not AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend cudaBackend)
         { Console.WriteLine($"CAPTURE: backend {backend.GetType().Name} is not CUDA — capture path is CUDA-only"); scope.Dispose(); return 0; }
-        var cap = new AiDotNet.Tensors.Engines.Gpu.CudaGraphScope(backend, cudaBackend.DefaultStream.Handle);
-        if (!cap.IsSupported) { Console.WriteLine("CAPTURE: CudaGraphScope not supported on this device"); cap.Dispose(); scope.Dispose(); return 0; }
 
         try
         {
-            // Capture ONLY the compute kernels (skip H2D/alloc/barrier — they alloc or sync).
-            cap.BeginCapture();
-            foreach (var node in graph.TopologicalOrder)
-                if (node is AiDotNet.Tensors.Engines.Gpu.Graph.KernelNode) node.Execute(backend);
-            cap.EndCapture();
-            Console.WriteLine($"CAPTURE: cuStreamBeginCapture/EndCapture/Instantiate OK (HasGraph={cap.HasGraph})");
+            // Drive capture/replay through the PRODUCTION API: GraphedInferenceStep wraps
+            // Prepare(warmup) -> Capture(BeginCapture; forward; EndCapture) -> Replay. The forward
+            // closure is the capture-safe compute-kernel subset (no H2D alloc, no final sync).
+            using var step = new AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.GraphedInferenceStep(
+                backend, cudaBackend.DefaultStream.Handle,
+                () => graph.ExecuteComputeKernelsNoSync(backend),
+                new AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.GraphedInferenceStepOptions { ThrowOnUnsupported = false });
+            step.Prepare();
+            step.Capture();
+            Console.WriteLine($"CAPTURE: GraphedInferenceStep HasGraph={step.HasGraph}");
+            if (!step.HasGraph) { Console.WriteLine("CAPTURE: graph capture unsupported"); scope.Dispose(); return 0; }
 
             // Replay once, then validate: r downloads the output buffer that replay last wrote.
-            cap.Replay();
+            step.Replay();
             double maxAbsDiff = 0;
             int len = Math.Min(eagerCopy.Length, r.Length);
             for (int i = 0; i < len; i++) maxAbsDiff = Math.Max(maxAbsDiff, Math.Abs((double)eagerCopy[i] - r[i]));
@@ -331,21 +334,17 @@ internal static class Program
             // Timing: graph replay vs issuing the same kernels directly.
             const int REP = 1000;
             var swG = Stopwatch.StartNew();
-            for (int i = 0; i < REP; i++) cap.Replay();
+            for (int i = 0; i < REP; i++) step.Replay();
             swG.Stop();
             var swD = Stopwatch.StartNew();
-            for (int i = 0; i < REP; i++)
-            {
-                foreach (var node in graph.TopologicalOrder)
-                    if (node is AiDotNet.Tensors.Engines.Gpu.Graph.KernelNode) node.Execute(backend);
-            }
+            for (int i = 0; i < REP; i++) graph.ExecuteComputeKernelsNoSync(backend);
             backend.Synchronize();
             swD.Stop();
             double g = swG.Elapsed.TotalMilliseconds, d = swD.Elapsed.TotalMilliseconds;
             Console.WriteLine($"CAPTURE {REP} replays={g:F1}ms ({g / REP:F3} ms/replay)  |  {REP} direct={d:F1}ms ({d / REP:F3} ms)  speedup={d / Math.Max(0.01, g):F2}x");
         }
         catch (Exception ex) { Console.WriteLine($"CAPTURE FAILED: {ex.GetType().Name}: {ex.Message}"); }
-        finally { cap.Dispose(); scope.Dispose(); }
+        finally { scope.Dispose(); }
         return 0;
     }
 

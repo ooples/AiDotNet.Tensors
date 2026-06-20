@@ -100,6 +100,34 @@ public sealed class ExecutionGraph : IDisposable
     }
 
     /// <summary>
+    /// Runs ONLY the compute kernels of the graph in topological order, on the backend's default
+    /// stream, with NO final synchronize and NO host transfers/allocations — the capture-safe subset.
+    /// Use this as the <c>forward</c> closure for a <see cref="Codegen.CudaGraph.GraphedInferenceStep"/>:
+    /// CUDA-graph capture rejects <c>cuMemAlloc</c> (H2D <see cref="TransferNode"/>s allocate a temp
+    /// buffer) and <c>cuStreamSynchronize</c> (the final <c>backend.Synchronize()</c>). The graph's
+    /// buffers are allocated at RECORD time, so the kernel sequence here is alloc-free and replayable.
+    /// Inputs must already be resident (run a full <see cref="Execute(IDirectGpuBackend)"/> once to warm
+    /// + populate them, or copy fresh input into the captured input buffer before each replay). #642 P3.
+    /// </summary>
+    /// <param name="backend">The GPU backend to use.</param>
+    public void ExecuteComputeKernelsNoSync(IDirectGpuBackend backend)
+    {
+        ThrowIfDisposed();
+        if (backend == null)
+        {
+            throw new ArgumentNullException(nameof(backend));
+        }
+
+        foreach (var node in _topologicalOrder)
+        {
+            if (node is KernelNode || node is FusedKernelNode)
+            {
+                node.Execute(backend);
+            }
+        }
+    }
+
+    /// <summary>
     /// Executes the graph with multi-stream parallelism.
     /// </summary>
     /// <param name="backend">The GPU backend to use.</param>
