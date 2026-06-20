@@ -1122,17 +1122,6 @@ internal static class SimdConvHelper
         int outWidth = width + 2 * padW - (dilationW * 2 + 1) + 1;
         int outputSize = outHeight * outWidth;
 
-        // #415 Phase F: per-task FMA threshold — see Conv3x3Stride1Double for
-        // the rationale. FP32 lane count is 2× FP64 so the empirical
-        // crossover is lower; 500K per-task FMAs (~half the FP64 threshold)
-        // keeps small-spatial × high-channel FP32 shapes parallel while
-        // staying above ThreadPool dispatch overhead (~100K FMAs at 8 GFLOPS
-        // FP32 SIMD peak).
-        long perTaskFmas = (long)inChannels * outputSize * 9L;
-        bool useParallel = perTaskFmas >= 500_000L
-                          && outChannels >= 2
-                          && Environment.ProcessorCount > 1;
-
         // #209 close-parity A/B: select Conv3x3 variant.
         // Pad=1 dilation=1 are required by the OcBlock kernels.
         bool padOneNoDilation = padH == 1 && padW == 1 && dilationH == 1 && dilationW == 1;
@@ -1162,6 +1151,22 @@ internal static class SimdConvHelper
         // Fallback if requested variant not applicable (wrong shape).
         if (variant == Conv3x3Variant.Block4 && !canUseBlock4) variant = Conv3x3Variant.PerChannel;
         if (variant == Conv3x3Variant.Block2 && !canUseBlock2) variant = Conv3x3Variant.PerChannel;
+
+        // #642: parallelize over the variant's output-channel tasks when the work justifies
+        // it. The old gate compared PER-CHANNEL FMAs (inChannels*outputSize*9) to 500K — but a
+        // task is a BLOCK of channelsPerTask channels, and for small-spatial × high-channel
+        // convs (SD-UNet deep stages, e.g. 256ch @ 8x8) per-channel work is ~150K, so the WHOLE
+        // conv ran serial despite ~64 block4 tasks and ~38M aggregate FMAs. Gate on PER-TASK
+        // work (above dispatch overhead) and task count instead, so deep convs fan to all cores.
+        int channelsPerTask = variant == Conv3x3Variant.Block4 ? 4
+                            : variant == Conv3x3Variant.Block2 ? 2 : 1;
+        int numConvTasks = outChannels / channelsPerTask;
+        long perTaskFmas = (long)channelsPerTask * inChannels * outputSize * 9L;
+        // Honor the MaxDegreeOfParallelism contract (pin-to-1 => serial); the old gate
+        // checked Environment.ProcessorCount and so ignored it.
+        bool useParallel = numConvTasks >= 2
+                          && perTaskFmas >= 100_000L
+                          && CpuParallelSettings.MaxDegreeOfParallelism > 1;
 
         for (int b = 0; b < batch; b++)
         {
