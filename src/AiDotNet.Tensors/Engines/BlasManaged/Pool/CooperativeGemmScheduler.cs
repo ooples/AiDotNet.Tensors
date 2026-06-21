@@ -90,6 +90,22 @@ internal static class CooperativeGemmScheduler
     // A nested Dispatch from inside a chunk runs serially to avoid pool re-entry.
     [ThreadStatic] private static bool _inScheduler;
 
+    // ---- #653 Phase 0: opt-in core-utilization gauge ----
+    // Counts how many fanned-out chunks are executing concurrently on the pool
+    // (worker threads + the participating caller). It directly measures the #642
+    // symptom — "worker pool parked, receiving no work" reads ~0 here; a saturated
+    // op reads ~maxdop. OFF by default: the per-chunk Interlocked pair is skipped
+    // entirely unless a ParallelUtilizationMeter has set MeasureUtilization, so there
+    // is zero added cost on the production dispatch path. RunSerial (below-grain inline
+    // work) is intentionally NOT counted — this gauge reports pool fan-out only, and
+    // the serial orchestrator time is captured by the probe's speedup/N efficiency.
+    internal static volatile bool MeasureUtilization;
+    private static int s_activeWorkers;
+    /// <summary>Current count of chunks executing concurrently on the cooperative pool.</summary>
+    internal static int ActiveWorkers => Volatile.Read(ref s_activeWorkers);
+    /// <summary>Zero the gauge before a measurement window.</summary>
+    internal static void ResetUtilization() => Volatile.Write(ref s_activeWorkers, 0);
+
     private static int _initialized; // 0 = not started, 1 = workers spawned
     private static readonly object _initLock = new();
     private static int _numWorkers;
@@ -155,6 +171,8 @@ internal static class CooperativeGemmScheduler
     {
         bool prev = _inScheduler;
         _inScheduler = true;
+        bool counted = MeasureUtilization;
+        if (counted) Interlocked.Increment(ref s_activeWorkers);
         try
         {
             item.Job.Action(item.Chunk);
@@ -166,6 +184,7 @@ internal static class CooperativeGemmScheduler
         finally
         {
             _inScheduler = prev;
+            if (counted) Interlocked.Decrement(ref s_activeWorkers);
             if (Interlocked.Decrement(ref item.Job.Remaining) == 0)
                 SignalIfParked(item.Job);
         }
@@ -275,6 +294,8 @@ internal static class CooperativeGemmScheduler
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void ExecuteAlreadyInScheduler(in WorkItem item)
     {
+        bool counted = MeasureUtilization;
+        if (counted) Interlocked.Increment(ref s_activeWorkers);
         try
         {
             item.Job.Action(item.Chunk);
@@ -285,6 +306,7 @@ internal static class CooperativeGemmScheduler
         }
         finally
         {
+            if (counted) Interlocked.Decrement(ref s_activeWorkers);
             if (Interlocked.Decrement(ref item.Job.Remaining) == 0)
                 SignalIfParked(item.Job);
         }

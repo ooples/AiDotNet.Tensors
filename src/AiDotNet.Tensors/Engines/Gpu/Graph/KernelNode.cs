@@ -244,6 +244,10 @@ public enum KernelType
     LayerNorm,
     /// <summary>Batch normalization.</summary>
     BatchNorm,
+    /// <summary>Group normalization.</summary>
+    GroupNorm,
+    /// <summary>Instance normalization.</summary>
+    InstanceNorm,
     /// <summary>Activation function.</summary>
     Activation,
     /// <summary>Element-wise operation.</summary>
