@@ -14,6 +14,16 @@ internal static class Program
         AiDotNetEngine.Current = new CpuEngine();
         var eng = (CpuEngine)AiDotNetEngine.Current;
 
+        // #653: optionally disable the hand-emitted machine-code GEMM kernel (reflection) so the
+        // SAME shape can be measured machine-code vs RyuJIT to isolate the per-core codegen gap.
+        if (Environment.GetEnvironmentVariable("AIDOTNET_MK_OFF") == "1")
+        {
+            var mk = typeof(CpuEngine).Assembly.GetType("AiDotNet.Tensors.Engines.BlasManaged.MachineKernelGemm");
+            mk?.GetProperty("Enabled", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)
+              ?.SetValue(null, false);
+            Console.Error.WriteLine("[probe] MachineKernelGemm.Enabled=false");
+        }
+
         if (args.Length > 0 && args[0] == "--resblock") return RunResblock(eng, args);
         if (args.Length > 0 && args[0] == "--attnblock") return RunAttnBlock(eng, args);
         if (args.Length > 0 && args[0] == "--act") return RunAct(eng, args);
