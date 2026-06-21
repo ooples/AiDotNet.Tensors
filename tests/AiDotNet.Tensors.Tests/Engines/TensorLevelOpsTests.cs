@@ -528,6 +528,32 @@ public class TensorLevelOpsTests
             Assert.Equal(9.0, result.AsSpan()[i], 1e-10);
     }
 
+    [Theory]
+    // Small array exercises the scalar tail; the large one (> the 131072 parallel
+    // threshold) exercises the #653 double ParallelSwish fan-out branch added so the
+    // double activation path parallelizes like the float one.
+    [InlineData(257)]
+    [InlineData(200_000)]
+    public void SwishInto_Double_MatchesXTimesSigmoid(int length)
+    {
+        var engine = new CpuEngine();
+        var input = new Tensor<double>(new[] { length });
+        var inSpan = input.AsWritableSpan();
+        for (int i = 0; i < length; i++)
+            inSpan[i] = -8.0 + 16.0 * i / (length - 1);  // spread across [-8, 8]
+
+        var dst = new Tensor<double>(new[] { length });
+        engine.SwishInto(dst, input);
+
+        var outSpan = dst.AsSpan();
+        for (int i = 0; i < length; i++)
+        {
+            double x = inSpan[i];
+            double expected = x / (1.0 + Math.Exp(-x));  // x * sigmoid(x)
+            Assert.Equal(expected, outSpan[i], 1e-10);
+        }
+    }
+
     [Fact]
     public void TensorConv2D_Double_DistinctBatches_CorrectOutputValues()
     {
