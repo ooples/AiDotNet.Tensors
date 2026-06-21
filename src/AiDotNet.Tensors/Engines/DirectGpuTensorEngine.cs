@@ -4990,9 +4990,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 using var gpuVar = gpuBackend.AllocateBuffer(batch * numGroups);
                 using var gpuOut = gpuBackend.AllocateBuffer(input.Length);
 
-                // GroupNorm then Swish (sigmoid * x)
+                // GroupNorm then Swish (sigmoid * x). Interface order is
+                // (batch, numGroups, channels, spatialSize) — see the value-returning GroupNorm fix.
                 gpuBackend.GroupNorm(gpuIn, gpuNorm, gpuGamma, gpuBeta, gpuMean, gpuVar,
-                    batch, channels, spatial, numGroups, (float)epsilon);
+                    batch, numGroups, channels, spatial, (float)epsilon);
                 gpuBackend.Swish(gpuNorm, gpuOut, input.Length);
                 DownloadIntoTensor(gpuBackend, gpuOut, floatOutput);
                 return;
@@ -5167,6 +5168,72 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // the freshly-written buffer instead of re-uploading.
         tensor.IncrementVersion();
         tensor._gpuBufferVersion = tensor.Version;
+        return true;
+    }
+
+    /// <summary>
+    /// #642 P3 — GPU-RESIDENT in-place unary, used only while recording into a deferred
+    /// execution graph. The plain <see cref="TryRunUnaryInPlace{T}"/> eagerly downloads the
+    /// result back into the tensor's CPU array, which (a) reads the not-yet-computed device
+    /// buffer during recording → wrong, and (b) severs the on-device chain so the next op
+    /// re-uploads. This variant instead runs the kernel buf→buf (RECORDED into the graph) and
+    /// keeps the modified buffer resident under the tensor's array key, deferring the CPU
+    /// readback to first access (after <c>scope.Execute()</c>) via a <see cref="BindResidentBuffer"/>
+    /// materializer — so GroupNorm→Swish→Conv stays device-resident and dependency edges form.
+    /// Returns false (caller falls back to the eager in-place path) outside a recording scope,
+    /// under autocast, for non-float, or when no array key / buffer is available.
+    /// </summary>
+    private bool TryRunUnaryInPlaceResident<T>(Tensor<T> tensor, Action<IDirectGpuBackend, IGpuBuffer, int> op)
+    {
+        if (Gpu.DeferredScope.Current?.IsRecording != true) return false;
+        if (Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
+        if (!TryGetBackend(out var backend)) return false;
+        // Need a managed backing array to key the activation cache / materializer on. Read it
+        // WITHOUT materializing (GetDataArray would download a resident upstream's buffer).
+        var backing = tensor.DataVector.GetBackingArrayUnsafe();
+        if (backing is null) return false;
+
+        OwnedBuffer owned;
+        // Expected GPU failures (alloc/upload) fall back to the eager in-place path; OOM must
+        // propagate rather than be silently swallowed. (#652 review)
+        try { owned = GetOrAllocateBuffer(backend, tensor); }
+        catch (OutOfMemoryException) { throw; }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Trace.TraceWarning($"TryRunUnaryInPlaceResident upload fallback: {ex.GetType().Name}: {ex.Message}");
+            return false;
+        }
+
+        var buf = owned.Buffer;
+        int n = tensor.Length;
+        if (buf.Size < n)
+        {
+            if (owned.OwnsBuffer) owned.Dispose();
+            return false;
+        }
+
+        try
+        {
+            op(backend, buf, n); // in-place buf→buf; recorded by RecordingGpuBackend
+        }
+        catch (OutOfMemoryException) { throw; }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Trace.TraceWarning($"TryRunUnaryInPlaceResident op fallback: {ex.GetType().Name}: {ex.Message}");
+            if (owned.OwnsBuffer) owned.Dispose();
+            return false;
+        }
+
+        // On a fresh upload (OwnsBuffer) the buffer is not yet cached — cache it under the
+        // tensor's array key so the next op's GetOrAllocateBuffer reuses it (resident chain).
+        // On a cache HIT the entry already maps this same (now in-place-modified) buffer, and
+        // re-caching would TryAdd-fail and Dispose the live buffer (ActivationCacheEntry.Dispose
+        // frees Buffer), so DO NOT re-cache a hit.
+        if (owned.OwnsBuffer)
+            CacheActivation(backing, buf, tensor.Shape._dims, backend);
+        // Pin the buffer to the tensor + (re)register the deferred materializer so the final CPU
+        // read downloads the kernel's output after Execute() instead of the stale pre-op data.
+        BindResidentBuffer(tensor, buf, backend);
         return true;
     }
 
@@ -6217,7 +6284,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Use cache-aware buffer allocation (OwnedBuffer auto-disposes only if we allocated)
         using var inputBuffer = GetOrAllocateBuffer(backend, input);
         using var kernelBuffer = GetOrCacheWeightBuffer(backend, kernel.GetDataArray(), PersistentTensorRole.Weights);
-        using var outputBuffer = AllocateOutputBuffer(backend, batch * outChannels * outHeight * outWidth);
+        // NOTE: not `using` — under a DeferredScope the no-bias path hands this buffer to
+        // FinishGpuOp (the activation cache then owns its lifetime so the lazy download can
+        // run after scope.Execute()). The `finally` disposes it on every other path. #642 P3.
+        var outputBuffer = AllocateOutputBuffer(backend, batch * outChannels * outHeight * outWidth);
+        bool outputHandedOff = false;
 
         try
         {
@@ -6236,43 +6307,24 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 int outputSize = batch * outChannels * outHeight * outWidth;
                 int spatialSize = outHeight * outWidth;
 
-                // Download, add bias, re-upload (GPU bias broadcast kernel would be more efficient)
-                float[] outputFloat = new float[outputSize];
-                backend.DownloadBuffer(outputBuffer.Buffer, outputFloat);
-
-                // Get bias data (check cache first)
                 using var biasBuffer = GetOrCacheWeightBuffer(backend, bias.GetDataArray(), PersistentTensorRole.Biases);
-                float[] biasFloat = new float[bias.Length];
-                backend.DownloadBuffer(biasBuffer.Buffer, biasFloat);
 
-                for (int b = 0; b < batch; b++)
-                {
-                    for (int c = 0; c < outChannels; c++)
-                    {
-                        float biasVal = biasFloat[c];
-                        int baseIdx = (b * outChannels + c) * spatialSize;
-                        for (int s = 0; s < spatialSize; s++)
-                        {
-                            outputFloat[baseIdx + s] += biasVal;
-                        }
-                    }
-                }
+                // #642: GPU-resident, deferred-correct per-channel bias add via the recorded
+                // Conv2DBiasAdd kernel (in-place on outputBuffer), then activation on-device, then a
+                // lazy FinishGpuOp result. The old path downloaded the conv output, added bias in a
+                // CPU loop, and re-uploaded — which under a DeferredScope read the not-yet-computed
+                // output AND broke the device-resident chain. The activation cache owns outputBuffer
+                // from FinishGpuOp on, so it must NOT be disposed in the finally.
+                backend.Conv2DBiasAdd(outputBuffer.Buffer, biasBuffer.Buffer, batch, outChannels, spatialSize);
 
-                // Re-upload for activation
-                using var biasedBuffer = backend.AllocateBuffer(outputFloat);
-
-                // Apply activation on GPU
                 if (activation != FusedActivationType.None)
                 {
-                    ApplyGpuActivation(backend, biasedBuffer, outputSize, activation);
+                    ApplyGpuActivation(backend, outputBuffer.Buffer, outputSize, activation);
                 }
 
-                // DownloadBuffer uses blocking read, Synchronize() removed for performance
-                float[] resultFloat = new float[outputSize];
-                backend.DownloadBuffer(biasedBuffer, resultFloat);
-
-                T[] resultData = DirectGpuEngine.FromFloatArray<T>(resultFloat);
-                return new Tensor<T>(resultData, new[] { batch, outChannels, outHeight, outWidth });
+                var biasedData = FinishGpuOp<T>(backend, outputBuffer, outputSize);
+                outputHandedOff = true;
+                return new Tensor<T>(biasedData, new[] { batch, outChannels, outHeight, outWidth });
             }
             else
             {
@@ -6284,11 +6336,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     ApplyGpuActivation(backend, outputBuffer.Buffer, outputSize, activation);
                 }
 
-                // DownloadBuffer uses blocking read, Synchronize() removed for performance
-                float[] resultFloat = new float[outputSize];
-                backend.DownloadBuffer(outputBuffer.Buffer, resultFloat);
-
-                T[] resultData = DirectGpuEngine.FromFloatArray<T>(resultFloat);
+                // #642: hand the output to FinishGpuOp (lazy deferred download) UNCONDITIONALLY —
+                // same pattern as MaxPool2D/AvgPool2D and the scalar/reduction ops. Under a
+                // DeferredScope the Conv2D above was RECORDED not executed, so an eager
+                // DownloadBuffer here would read the not-yet-computed (zero) buffer; in eager mode
+                // the lazy result keeps the conv output GPU-resident so a chained op reuses it
+                // without a host round-trip (the #642 win). The activation cache owns the buffer's
+                // lifetime from here, so it must NOT be disposed in the finally.
+                var resultData = FinishGpuOp<T>(backend, outputBuffer, outputSize);
+                outputHandedOff = true;
                 return new Tensor<T>(resultData, new[] { batch, outChannels, outHeight, outWidth });
             }
         }
@@ -6296,6 +6352,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             // Fall back to CPU on any GPU error
             return base.FusedConv2D(input, kernel, bias, strideH, strideW, padH, padW, dilationH, dilationW, activation);
+        }
+        finally
+        {
+            // Free the output buffer on every path except the deferred hand-off (where the
+            // activation cache now owns it and frees it on eviction). Replaces the old
+            // `using var outputBuffer`.
+            if (!outputHandedOff)
+                outputBuffer.Dispose();
         }
     }
 
@@ -6859,8 +6923,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return base.MaxPool2D(input, poolSize, stride, padding);
 
         using var inputBuffer = GetOrAllocateBuffer(backend, input);
-        using var outputBuffer = AllocateOutputBuffer(backend, batch * channels * outHeight * outWidth);
-
+        // #642: not `using` — handed to FinishGpuOp (lazy result, activation cache owns it). The old
+        // eager DownloadBuffer here read the not-yet-computed output under a DeferredScope (the conv
+        // bug class). `finally` disposes on the fallback path.
+        var outputBuffer = AllocateOutputBuffer(backend, batch * channels * outHeight * outWidth);
+        bool handedOff = false;
         try
         {
             // Execute GPU max pooling (indices buffer is null for forward-only)
@@ -6870,17 +6937,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 poolSize, poolSize,
                 stride, stride, padding, padding);
 
-            // DownloadBuffer uses blocking read, Synchronize() removed for performance
             int outputSize = batch * channels * outHeight * outWidth;
-            float[] resultFloat = new float[outputSize];
-            backend.DownloadBuffer(outputBuffer.Buffer, resultFloat);
-
-            T[] resultData = DirectGpuEngine.FromFloatArray<T>(resultFloat);
+            var resultData = FinishGpuOp<T>(backend, outputBuffer, outputSize);
+            handedOff = true;
             return new Tensor<T>(resultData, new[] { batch, channels, outHeight, outWidth });
         }
         catch
         {
             return base.MaxPool2D(input, poolSize, stride, padding);
+        }
+        finally
+        {
+            if (!handedOff) outputBuffer.Dispose();
         }
     }
 
@@ -7059,8 +7127,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return base.AvgPool2D(input, poolSize, stride, padding);
 
         using var inputBuffer = GetOrAllocateBuffer(backend, input);
-        using var outputBuffer = AllocateOutputBuffer(backend, batch * channels * outHeight * outWidth);
-
+        // #642: lazy FinishGpuOp (deferred-correct). The earlier deferred crash was the
+        // CudaBackend.AvgPool2D launch dropping the countIncludePad kernel arg, now fixed.
+        var outputBuffer = AllocateOutputBuffer(backend, batch * channels * outHeight * outWidth);
+        bool handedOff = false;
         try
         {
             // Execute GPU average pooling
@@ -7071,17 +7141,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 stride, stride, padding, padding,
                 countIncludePad: true);
 
-            // DownloadBuffer uses blocking read, Synchronize() removed for performance
             int outputSize = batch * channels * outHeight * outWidth;
-            float[] resultFloat = new float[outputSize];
-            backend.DownloadBuffer(outputBuffer.Buffer, resultFloat);
-
-            T[] resultData = DirectGpuEngine.FromFloatArray<T>(resultFloat);
+            var resultData = FinishGpuOp<T>(backend, outputBuffer, outputSize);
+            handedOff = true;
             return new Tensor<T>(resultData, new[] { batch, channels, outHeight, outWidth });
         }
         catch
         {
             return base.AvgPool2D(input, poolSize, stride, padding);
+        }
+        finally
+        {
+            if (!handedOff) outputBuffer.Dispose();
         }
     }
 
@@ -16943,8 +17014,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             bufOut = AllocateOutputBuffer(backend, input.Length);
             bufMean = AllocateOutputBuffer(backend, batch * numGroups);
             bufVar = AllocateOutputBuffer(backend, batch * numGroups);
+            // Interface order is (batch, numGroups, channels, spatialSize). Passing
+            // (batch, channels, spatial, numGroups) scrambled the kernel's dims: it wrote `channels`
+            // mean/var entries into the batch*numGroups-sized save buffers (overflow + wrong
+            // normalization) whenever channels != numGroups — i.e. essentially every diffusion
+            // GroupNorm. #642 P3 root cause of the deferred-ResBlock divergence (eager was wrong too).
             backend.GroupNorm(bufIn.Buffer, bufOut.Buffer, bufGamma.Buffer, bufBeta.Buffer,
-                bufMean.Buffer, bufVar.Buffer, batch, channels, spatial, numGroups, (float)epsilon);
+                bufMean.Buffer, bufVar.Buffer, batch, numGroups, channels, spatial, (float)epsilon);
             var result = FinishGpuOp<T>(backend, bufOut, input.Length);
             mean = new Tensor<T>(FinishGpuOp<T>(backend, bufMean, batch * numGroups), new[] { batch, numGroups });
             variance = new Tensor<T>(FinishGpuOp<T>(backend, bufVar, batch * numGroups), new[] { batch, numGroups });
@@ -17595,6 +17671,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override void SigmoidInPlace<T>(Tensor<T> tensor)
     {
+        if (TryRunUnaryInPlaceResident(tensor, static (backend, buf, size) => backend.Sigmoid(buf, buf, size)))
+            return;
         if (TryRunUnaryInPlace(tensor, static (backend, buf, size) => backend.Sigmoid(buf, buf, size)))
             return;
         base.SigmoidInPlace(tensor);
@@ -18582,9 +18660,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override void ReLUInPlace<T>(Tensor<T> tensor)
     {
+        if (TryRunUnaryInPlaceResident(tensor, static (backend, buf, size) => backend.Relu(buf, buf, size)))
+            return;
         if (TryRunUnaryInPlace(tensor, static (backend, buf, size) => backend.Relu(buf, buf, size)))
             return;
         base.ReLUInPlace(tensor);
+    }
+
+    public override void SwishInPlace<T>(Tensor<T> tensor)
+    {
+        if (TryRunUnaryInPlaceResident(tensor, static (backend, buf, size) => backend.Swish(buf, buf, size)))
+            return;
+        if (TryRunUnaryInPlace(tensor, static (backend, buf, size) => backend.Swish(buf, buf, size)))
+            return;
+        base.SwishInPlace(tensor);
     }
 
     // --- Scalar reductions ---
@@ -19021,9 +19110,71 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     Tensor<T> IEngine.TensorConcatenate<T>(Tensor<T>[] tensors, int axis)
     {
         if (IsTapeActive<T>()) return base.TensorConcatenate(tensors, axis);
-        if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb) && tensors.Length==2 && (axis==-1||axis==tensors[0].Rank-1))
-        { try { var a=tensors[0]; var b2=tensors[1]; int lastAxis=a.Rank-1; int outerSize=1; for(int i=0;i<lastAxis;i++)outerSize*=a.Shape._dims[i]; int aInner=a.Shape._dims[lastAxis],bInner=b2.Shape._dims[lastAxis]; int total=outerSize*(aInner+bInner); var ga=UploadTensorRaw(bb, a); var gb=UploadTensorRaw(bb, b2); var go=bb.AllocateBuffer(total); bb.ConcatAxis(ga,gb,go,outerSize,aInner,bInner); int[] outShape=(int[])a.Shape._dims.Clone(); outShape[lastAxis]=aInner+bInner; return DeferTensorResult<T>(bb,go,total,outShape); } catch{} }
-        return base.TensorConcatenate(tensors,axis);
+        // GPU concat for 2 tensors along ANY axis (#642), composed from offset device-to-device
+        // copies via IDirectGpuBackend.Copy. The previous path used IGpuBatchExecution.ConcatAxis,
+        // which (a) only handled the LAST axis — so the UNet decoder's channel concat (NCHW axis=1)
+        // silently fell to the CPU base, materialising both inputs and breaking the device-resident
+        // chain — and (b) lives on IGpuBatchExecution, which the recording backend does NOT wrap, so
+        // it could never be captured into a deferred graph. Copy IS on IDirectGpuBackend and is now
+        // recorded, so this is correct + capturable in BOTH eager and deferred modes. For axis k:
+        // outer = prod(dims[0..k)), inner = prod(dims[k+1..)); each input contributes `outer`
+        // contiguous slices of axisLen*inner into the output at its axis offset.
+        if (typeof(T) == typeof(float) && TryGetBackend(out var backend) && tensors is { Length: 2 })
+        {
+            try
+            {
+                var a = tensors[0];
+                var b2 = tensors[1];
+                int rank = a.Rank;
+                int normAxis = axis < 0 ? rank + axis : axis;
+                if (normAxis >= 0 && normAxis < rank && b2.Rank == rank && a.IsContiguous && b2.IsContiguous)
+                {
+                    bool shapesOk = true;
+                    for (int k = 0; k < rank; k++)
+                        if (k != normAxis && a.Shape._dims[k] != b2.Shape._dims[k]) { shapesOk = false; break; }
+                    if (shapesOk)
+                    {
+                        int outer = 1;
+                        for (int k = 0; k < normAxis; k++) outer *= a.Shape._dims[k];
+                        int inner = 1;
+                        for (int k = normAxis + 1; k < rank; k++) inner *= a.Shape._dims[k];
+                        int aAxis = a.Shape._dims[normAxis], bAxis = b2.Shape._dims[normAxis];
+                        int axisTotal = aAxis + bAxis;
+                        int total = outer * axisTotal * inner;
+
+                        using var aBuf = GetOrAllocateBuffer(backend, (Tensor<float>)(object)a);
+                        using var bBuf = GetOrAllocateBuffer(backend, (Tensor<float>)(object)b2);
+                        var outBuf = AllocateOutputBuffer(backend, total);
+                        bool handedOff = false;
+                        try
+                        {
+                            int aSlice = aAxis * inner, bSlice = bAxis * inner;
+                            for (int o = 0; o < outer; o++)
+                            {
+                                backend.Copy(aBuf.Buffer, o * aSlice, outBuf.Buffer, o * axisTotal * inner, aSlice);
+                                backend.Copy(bBuf.Buffer, o * bSlice, outBuf.Buffer, (o * axisTotal + aAxis) * inner, bSlice);
+                            }
+                            int[] outShape = (int[])a.Shape._dims.Clone();
+                            outShape[normAxis] = axisTotal;
+                            var result = FinishGpuOp<T>(backend, outBuf, total);
+                            handedOff = true;
+                            return new Tensor<T>(result, outShape);
+                        }
+                        finally
+                        {
+                            if (!handedOff) outBuf.Dispose();
+                        }
+                    }
+                }
+            }
+            catch (Exception ex) when (ex is not OutOfMemoryException)
+            {
+                // GPU concat failed — fall back to the CPU base. Surface the reason at Trace level
+                // (don't swallow silently); never mask OOM, which must propagate. (#652 review)
+                System.Diagnostics.Trace.TraceWarning($"GPU TensorConcatenate fallback to CPU: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+        return base.TensorConcatenate(tensors, axis);
     }
 
     Tensor<T> IEngine.TensorSlice<T>(Tensor<T> tensor, int[] start, int[] length)

@@ -590,6 +590,43 @@ public class RecordingGpuBackend : DelegatingGpuBackend
             });
     }
 
+    /// <inheritdoc/>
+    public override void GroupNorm(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
+        IGpuBuffer saveMean, IGpuBuffer saveInvVar, int batch, int numGroups, int channels, int spatialSize, float epsilon)
+    {
+        RecordOrExecute(
+            KernelType.GroupNorm,
+            new[] { input, gamma, beta },
+            new[] { output, saveMean, saveInvVar },
+            () => Inner.GroupNorm(input, output, gamma, beta, saveMean, saveInvVar, batch, numGroups, channels, spatialSize, epsilon),
+            new Dictionary<string, object>
+            {
+                ["batch"] = batch,
+                ["numGroups"] = numGroups,
+                ["channels"] = channels,
+                ["spatialSize"] = spatialSize,
+                ["epsilon"] = epsilon
+            });
+    }
+
+    /// <inheritdoc/>
+    public override void InstanceNorm(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
+        IGpuBuffer saveMean, IGpuBuffer saveInvVar, int batch, int channels, int spatialSize, float epsilon)
+    {
+        RecordOrExecute(
+            KernelType.InstanceNorm,
+            new[] { input, gamma, beta },
+            new[] { output, saveMean, saveInvVar },
+            () => Inner.InstanceNorm(input, output, gamma, beta, saveMean, saveInvVar, batch, channels, spatialSize, epsilon),
+            new Dictionary<string, object>
+            {
+                ["batch"] = batch,
+                ["channels"] = channels,
+                ["spatialSize"] = spatialSize,
+                ["epsilon"] = epsilon
+            });
+    }
+
     #endregion
 
     #region Attention Operations (Override to Record)
@@ -717,6 +754,121 @@ public class RecordingGpuBackend : DelegatingGpuBackend
         {
             Inner.Copy(source, destination, size);
         }
+    }
+
+    /// <inheritdoc/>
+    public override void NearestNeighborUpsample(IGpuBuffer input, IGpuBuffer output, int batchChannels, int height, int width, int scaleFactor)
+    {
+        // #642: record UNet upsample so it replays in order in a deferred graph (was eager mid-record).
+        RecordOrExecute(KernelType.ElementWise, new[] { input }, new[] { output },
+            () => Inner.NearestNeighborUpsample(input, output, batchChannels, height, width, scaleFactor));
+    }
+
+    /// <inheritdoc/>
+    public override void ConvTranspose2D(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer output,
+        int batch, int inChannels, int inHeight, int inWidth,
+        int outChannels, int outHeight, int outWidth,
+        int kernelH, int kernelW,
+        int strideH, int strideW, int padH, int padW,
+        int outputPadH, int outputPadW)
+    {
+        // #642: record transposed-conv (UNet decoder upsample) for deferred replay.
+        RecordOrExecute(KernelType.Conv2D, new[] { input, kernel }, new[] { output },
+            () => Inner.ConvTranspose2D(input, kernel, output, batch, inChannels, inHeight, inWidth,
+                outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, outputPadH, outputPadW));
+    }
+
+    /// <inheritdoc/>
+    public override void MaxPool2D(IGpuBuffer input, IGpuBuffer output, IGpuBuffer? indices,
+        int batch, int channels, int inHeight, int inWidth,
+        int outHeight, int outWidth, int kernelH, int kernelW,
+        int strideH, int strideW, int padH, int padW)
+    {
+        // #642: record downsample pool for deferred replay. `indices` (optional, used by backward) is
+        // also an output so a later read of it is ordered after this node.
+        var outputs = indices is null ? new[] { output } : new[] { output, indices };
+        RecordOrExecute(KernelType.Pooling, new[] { input }, outputs,
+            () => Inner.MaxPool2D(input, output, indices, batch, channels, inHeight, inWidth,
+                outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW));
+    }
+
+    /// <inheritdoc/>
+    public override void AvgPool2D(IGpuBuffer input, IGpuBuffer output,
+        int batch, int channels, int inHeight, int inWidth,
+        int outHeight, int outWidth, int kernelH, int kernelW,
+        int strideH, int strideW, int padH, int padW, bool countIncludePad)
+    {
+        // #642: record downsample pool for deferred replay. The earlier intermittent crash was a
+        // CudaBackend.AvgPool2D launch bug (dropped the countIncludePad kernel arg) — now fixed.
+        RecordOrExecute(KernelType.Pooling, new[] { input }, new[] { output },
+            () => Inner.AvgPool2D(input, output, batch, channels, inHeight, inWidth,
+                outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, countIncludePad));
+    }
+
+    /// <inheritdoc/>
+    public override void Transpose(IGpuBuffer A, IGpuBuffer B, int rows, int cols)
+    {
+        // #642: record 2-D transpose (attention reshapes) for deferred replay.
+        RecordOrExecute(KernelType.Transpose, new[] { A }, new[] { B },
+            () => Inner.Transpose(A, B, rows, cols));
+    }
+
+    /// <inheritdoc/>
+    public override void GlobalAvgPool2D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int height, int width)
+    {
+        // #642: record global/adaptive avg-pool (SE blocks, attention pooling) for deferred replay.
+        RecordOrExecute(KernelType.Pooling, new[] { input }, new[] { output },
+            () => Inner.GlobalAvgPool2D(input, output, batch, channels, height, width));
+    }
+
+    /// <inheritdoc/>
+    public override void GlobalMaxPool2D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int height, int width)
+    {
+        // #642: record global max-pool for deferred replay.
+        RecordOrExecute(KernelType.Pooling, new[] { input }, new[] { output },
+            () => Inner.GlobalMaxPool2D(input, output, batch, channels, height, width));
+    }
+
+    /// <inheritdoc/>
+    public override void AdaptiveAvgPool2D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth)
+    {
+        // #642: record adaptive avg-pool for deferred replay.
+        RecordOrExecute(KernelType.Pooling, new[] { input }, new[] { output },
+            () => Inner.AdaptiveAvgPool2D(input, output, batch, channels, inHeight, inWidth, outHeight, outWidth));
+    }
+
+    /// <inheritdoc/>
+    public override void Embedding(IGpuBuffer indices, IGpuBuffer embeddingTable, IGpuBuffer output, int numIndices, int embeddingDim)
+    {
+        // #642: record embedding gather (conditioning / token lookup) for deferred replay. The table
+        // is an input; indices is a separate (int) input the kernel reads.
+        RecordOrExecute(KernelType.ElementWise, new[] { indices, embeddingTable }, new[] { output },
+            () => Inner.Embedding(indices, embeddingTable, output, numIndices, embeddingDim));
+    }
+
+    /// <inheritdoc/>
+    public override void Conv2DBiasAdd(IGpuBuffer output, IGpuBuffer bias, int batch, int channels, int spatialSize)
+    {
+        // #642: in-place per-channel bias add after conv — `output` is both read and written, so it is
+        // the node's input AND output (dependency tracker chains it after the conv that produced it).
+        RecordOrExecute(KernelType.ElementWise, new[] { output, bias }, new[] { output },
+            () => Inner.Conv2DBiasAdd(output, bias, batch, channels, spatialSize));
+    }
+
+    /// <inheritdoc/>
+    public override void Copy(IGpuBuffer source, int sourceOffset, IGpuBuffer destination, int destinationOffset, int length)
+    {
+        // #642: record the offset device-to-device copy as a kernel node (input=source,
+        // output=destination) so the dependency tracker orders it after the producer of `source`
+        // and before any reader of `destination`. This is the primitive a deferred-correct Concat
+        // composes from — ConcatAxis lives on IGpuBatchExecution, which the recording backend does
+        // NOT wrap, so concat must route through IDirectGpuBackend.Copy (which it does). AddCopy's
+        // TransferNode carries no offsets, hence RecordOrExecute with the offsets in the closure.
+        RecordOrExecute(
+            KernelType.ElementWise,
+            new[] { source },
+            new[] { destination },
+            () => Inner.Copy(source, sourceOffset, destination, destinationOffset, length));
     }
 
     #endregion
