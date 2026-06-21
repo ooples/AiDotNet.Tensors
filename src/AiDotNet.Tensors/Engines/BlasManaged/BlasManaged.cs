@@ -58,6 +58,15 @@ public static partial class BlasManaged
     private static readonly bool s_forwardPackBothBlocking =
         System.Environment.GetEnvironmentVariable("AIDOTNET_GEMM_FORWARD_PACKBOTH") == "1";
 
+    // #653 cache-blocking sweep hook: env overrides for the PackBoth Mc/Nc/Kc so the
+    // cache-residency-optimal blocking can be found empirically (the MKL/BLIS tuning art).
+    // 0 = unset (use the computed value). Only applied on the effective-PackBoth path.
+    private static readonly int s_envMc = EnvBlock("AIDOTNET_GEMM_MC");
+    private static readonly int s_envNc = EnvBlock("AIDOTNET_GEMM_NC");
+    private static readonly int s_envKc = EnvBlock("AIDOTNET_GEMM_KC");
+    private static int EnvBlock(string name) =>
+        int.TryParse(System.Environment.GetEnvironmentVariable(name), out var v) && v > 0 ? v : 0;
+
     /// <summary>
     /// #368 thin-M fast path bounds. The no-pack direct 6×16 parallel kernel
     /// (<see cref="Simd.SimdGemm.SgemmDirectParallelMInto"/>) beats both the
@@ -758,6 +767,16 @@ public static partial class BlasManaged
                     if (targetMc < mcFromAutotune) mcFromAutotune = targetMc;
                 }
             }
+        }
+
+        // #653 cache-blocking sweep hook: env overrides applied last, so a sweep can probe the
+        // cache-residency-optimal (Mc, Nc, Kc) directly. Rounded to the micro-tile so the packed
+        // panels stay tile-aligned. Effective-PackBoth only (the path the forward GEMM runs).
+        if (effectivePackBoth && (s_envMc > 0 || s_envNc > 0 || s_envKc > 0))
+        {
+            if (s_envMc > 0) mcFromAutotune = ((s_envMc + mr - 1) / mr) * mr;
+            if (s_envNc > 0) ncFromAutotune = Math.Min(((s_envNc + nr - 1) / nr) * nr, ((n + nr - 1) / nr) * nr);
+            if (s_envKc > 0) kcFromAutotune = Math.Min(s_envKc, k);
         }
 
         switch (strategy)
