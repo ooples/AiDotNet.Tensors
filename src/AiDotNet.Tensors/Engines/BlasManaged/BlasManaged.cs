@@ -276,6 +276,10 @@ public static partial class BlasManaged
         // Checked before the work>=250M cutoff that would otherwise force the packed path.
         if (isFloat && TinyKPreferMachineKernel && k <= 128 && (long)m * n >= 1_000_000L)
             return false;
+        // #475 DEAD END (measured neutral, do not re-add): routing mid-large FP32 (≥250M)
+        // to the machine kernel instead of PackBoth left the diffusion FFN GEMMs (e.g.
+        // 384×4096×3456) at the SAME ~122-150 GF/s at MaxDOP=4 — both kernels hit the same
+        // ~4-thread ceiling, so the FFN gap is raw kernel efficiency vs MKL, not routing.
         if (n < 128 && k >= 128) return true;                 // thin-N (both dtypes)
         if (!isFloat)
             // FP64 microkernel is competitive on FFN and mid squares (1024³ double 211 > packed
