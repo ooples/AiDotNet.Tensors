@@ -34,6 +34,25 @@ namespace AiDotNet.Tensors.Engines.BlasManaged;
 /// </summary>
 internal static class PackBothStrategy
 {
+    // #653 diagnostic gate (env AIDOTNET_GEMM_TRACE=1): trace the chosen parallel path.
+    private static readonly bool s_trace =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_GEMM_TRACE") == "1";
+
+    // #653 single-persistent-region path (env AIDOTNET_GEMM_SINGLE_REGION=1, default off).
+    // The M-axis RunParallelUnsafe re-dispatches the parallel region (and barriers) once per
+    // (jc, pc) macro-tile. For the wide-nc forward case (numNB==1) that's one barriered
+    // pack-B + ic-compute pair per K-panel — e.g. the FFN's 4 K-panels = 8 parallel regions,
+    // capping utilization (~8/16 cores -> 8x). This path packs ALL K-panels of B once (one
+    // dispatch) then runs ONE parallel ic region where each thread walks the full K-loop for
+    // its rows — the BLIS persistent-team shape, no per-K-panel barrier. Bit-identical: each
+    // C element still reduces over k in the same panel order. Gated for A/B + flip via CI.
+    private static readonly bool s_singleRegion =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_GEMM_SINGLE_REGION") == "1";
+
+    // Cap on the all-panels packed-B residency for the single-region path (bytes). Above this
+    // the buffer blows the cache budget; fall back to the per-panel M-axis path.
+    private const long SingleRegionPackBBudgetBytes = 64L * 1024 * 1024;
+
     /// <summary>
     /// Compute C += op(A) · op(B) using the Pack-Both 3-level loop nest.
     /// C is zeroed by the caller (BlasManaged.Gemm); the kernel accumulates.
@@ -125,6 +144,14 @@ internal static class PackBothStrategy
             bool use2D = MN2DDriver.ShouldUse2DGrid(numMBlocks, numNBlocks, procs)
                          && (m < 256 || numMBlocks * 4 <= procs);
 
+            // #653 diagnostic: AIDOTNET_GEMM_TRACE=1 prints the chosen parallel path +
+            // blocking so we can see what a real forward GEMM actually runs. stderr only,
+            // so the probe's stdout GEMM line stays parseable.
+            if (s_trace)
+                Console.Error.WriteLine(
+                    $"[PackBoth] m={m} n={n} k={k} mc={mc} nc={nc} kc={kc} mr={mr} nr={nr} " +
+                    $"numMB={numMBlocks} numNB={numNBlocks} procs={procs} path={(use2D ? "2D" : "Maxis")}");
+
             // Pin a, b, c for the duration of the parallel region. Both paths use
             // unsafe pointer access from worker threads.
             fixed (T* aPtr = a)
@@ -145,26 +172,50 @@ internal static class PackBothStrategy
                 }
                 else
                 {
-                    // M-axis (existing): shared packed-B, parallel over ic.
-                    byte[]? packBArray = null;
-                    try
+                    // #653 single-region: wide-nc (numNB==1), no pre-pack/workspace/transpose,
+                    // packed-B-all within budget → pack all K-panels once + one ic region (no
+                    // per-K-panel barrier). Otherwise the existing per-panel M-axis path.
+                    int numKPanelsSr = (k + kc - 1) / kc;
+                    int packedNcSr = ((n + nr - 1) / nr) * nr;
+                    long packBAllBytes = (long)numKPanelsSr * kc * packedNcSr * elemSize;
+                    bool useSingleRegion = s_singleRegion
+                        && nc >= n                       // numNB == 1
+                        && !transA && !transB
+                        && options.PackedA is null && options.PackedB is null
+                        && packBAllBytes <= SingleRegionPackBBudgetBytes;
+
+                    if (useSingleRegion)
                     {
-                        Span<byte> packBBytesSpan = ArenaIntegration.TryRentBytes(packBBytes);
-                        if (packBBytesSpan.IsEmpty)
-                        {
-                            packBArray = ArrayPool<byte>.Shared.Rent(packBBytes);
-                            packBBytesSpan = packBArray.AsSpan(0, packBBytes);
-                        }
-                        RunParallelUnsafe<T>(
-                            aPtr, a.Length, lda, transA,
-                            bPtr, b.Length, ldb, transB,
+                        RunParallelSingleRegionUnsafe<T>(
+                            aPtr, a.Length, lda,
+                            bPtr, b.Length, ldb,
                             cPtr, c.Length, ldc,
-                            m, n, k, mc, nc, kc, mr, nr,
-                            packBBytesSpan, in options, elemSize);
+                            m, n, k, mc, kc, mr, nr,
+                            in options, elemSize);
                     }
-                    finally
+                    else
                     {
-                        if (packBArray != null) ArrayPool<byte>.Shared.Return(packBArray);
+                        // M-axis (existing): shared packed-B, parallel over ic.
+                        byte[]? packBArray = null;
+                        try
+                        {
+                            Span<byte> packBBytesSpan = ArenaIntegration.TryRentBytes(packBBytes);
+                            if (packBBytesSpan.IsEmpty)
+                            {
+                                packBArray = ArrayPool<byte>.Shared.Rent(packBBytes);
+                                packBBytesSpan = packBArray.AsSpan(0, packBBytes);
+                            }
+                            RunParallelUnsafe<T>(
+                                aPtr, a.Length, lda, transA,
+                                bPtr, b.Length, ldb, transB,
+                                cPtr, c.Length, ldc,
+                                m, n, k, mc, nc, kc, mr, nr,
+                                packBBytesSpan, in options, elemSize);
+                        }
+                        finally
+                        {
+                            if (packBArray != null) ArrayPool<byte>.Shared.Return(packBArray);
+                        }
                     }
                 }
             }
@@ -677,6 +728,122 @@ internal static class PackBothStrategy
             }
         }
 
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<byte>.Shared.Return(packBArr);
+        }
+    }
+
+    /// <summary>
+    /// #653 single-persistent-region M-axis path for the wide-nc case (numNB==1, no pre-pack,
+    /// no workspace, no transpose). Packs all K-panels of B once into a shared buffer, then runs
+    /// ONE parallel region over ic blocks where each thread walks the full K-loop for its rows —
+    /// eliminating the per-K-panel pack/compute barriers of <see cref="RunParallelUnsafe"/>.
+    /// Bit-identical: each C[ic,jr] tile still reduces over k in ascending panel order, and
+    /// ic blocks own disjoint C rows so there is no cross-thread write contention.
+    /// </summary>
+    private static unsafe void RunParallelSingleRegionUnsafe<T>(
+        T* aPtr, int aLen, int lda,
+        T* bPtr, int bLen, int ldb,
+        T* cPtr, int cLen, int ldc,
+        int m, int n, int k,
+        int mc, int kc, int mr, int nr,
+        in BlasOptions<T> options, int elemSize) where T : unmanaged
+    {
+        int numKPanels = (k + kc - 1) / kc;
+        int numStripes = (n + nr - 1) / nr;
+        int packedNc = numStripes * nr;
+        long packBAllElems = (long)numKPanels * kc * packedNc;
+
+        const int PackBAlignment = 32;
+        byte[] packBArr = System.Buffers.ArrayPool<byte>.Shared.Rent((int)(packBAllElems * elemSize) + PackBAlignment - 1);
+        int packBAlignedOffset;
+        fixed (byte* pbPtr = packBArr)
+        {
+            nuint addr = (nuint)pbPtr;
+            nuint mask = PackBAlignment - 1;
+            packBAlignedOffset = (int)((PackBAlignment - (uint)(addr & mask)) & mask);
+        }
+
+        nint aPtrInt = (nint)aPtr;
+        nint bPtrInt = (nint)bPtr;
+        nint cPtrInt = (nint)cPtr;
+        byte[] packBArrCap = packBArr;
+        int packBAlignedOffsetCap = packBAlignedOffset;
+        int kcCap = kc, ncCol = n, packedNcCap = packedNc, numStripesCap = numStripes, nrCap = nr;
+        int ldbCap = ldb, bLenCap = bLen, kCap = k, numKPanelsCap = numKPanels;
+
+        try
+        {
+            // ── Pack ALL K-panels of B once: single dispatch over (panel × stripe) ──
+            // Each work-item packs one Nr-stripe of one K-panel into a disjoint region of the
+            // shared buffer — order-independent, so deterministicSafe.
+            int totalPackItems = numKPanels * numStripes;
+            long packWork = packBAllElems;
+            CpuParallelSettings.ParallelForOrSerial(0, totalPackItems, packWork, item =>
+            {
+                int panel = item / numStripesCap;
+                int stripe = item % numStripesCap;
+                int pc = panel * kcCap;
+                int effKc = Math.Min(kcCap, kCap - pc);
+                int panelOffElems = panel * kcCap * packedNcCap;
+                int stripeOffElems = stripe * effKc * nrCap;
+                ReadOnlySpan<T> bSlice = new ReadOnlySpan<T>((T*)bPtrInt + pc * ldbCap, bLenCap - pc * ldbCap);
+                Span<T> packBStripe = MemoryMarshal.Cast<byte, T>(
+                    packBArrCap.AsSpan(packBAlignedOffsetCap + (panelOffElems + stripeOffElems) * elemSize,
+                                       effKc * nrCap * elemSize));
+                Avx2Pack.PackBStripeRange<T>(
+                    bSlice, ldbCap, false,
+                    packBStripe,
+                    stripe, 1,
+                    ncCol, effKc, nrCap);
+            }, deterministicSafe: true);
+
+            // ── ONE parallel region over ic blocks; each thread walks the full K-loop ──
+            int numIcBlocks = (m + mc - 1) / mc;
+            long totalWork = (long)m * n * k;
+            int mcCap = mc, mCap = m, ldaCap = lda, aLenCap = aLen, ldcCap = ldc, cLenCap = cLen, mrCap = mr;
+            CpuParallelSettings.ParallelForOrSerial(0, numIcBlocks, totalWork, icIdx =>
+            {
+                int ic = icIdx * mcCap;
+                int effMc = Math.Min(mcCap, mCap - ic);
+                for (int panel = 0; panel < numKPanelsCap; panel++)
+                {
+                    int pc = panel * kcCap;
+                    int effKc = Math.Min(kcCap, kCap - pc);
+                    int panelOffElems = panel * kcCap * packedNcCap;
+
+                    // Pack A[ic, pc] into this thread's [ThreadStatic] pool (consumed below).
+                    Span<byte> packAByteSpan = PerThreadPool.Current.RentPackA(effMc * effKc * elemSize);
+                    Span<T> packA = MemoryMarshal.Cast<byte, T>(packAByteSpan).Slice(0, effMc * effKc);
+                    int aSliceOffset = ic * ldaCap + pc;
+                    ReadOnlySpan<T> aSlice = new ReadOnlySpan<T>((T*)aPtrInt + aSliceOffset, aLenCap - aSliceOffset);
+                    Avx2Pack.PackA<T>(aSlice, ldaCap, false, packA, effMc, effKc, mrCap);
+
+                    Span<T> packBPanel = MemoryMarshal.Cast<byte, T>(
+                        packBArrCap.AsSpan(packBAlignedOffsetCap + panelOffElems * elemSize, effKc * packedNcCap * elemSize));
+
+                    // Inner (jr, ir) microkernel — accumulates into C (cleared by caller); the
+                    // K-panels accumulate in ascending order, matching RunParallelUnsafe bit-for-bit.
+                    for (int jr = 0; jr < ncCol; jr += nrCap)
+                    {
+                        int effNr = Math.Min(nrCap, ncCol - jr);
+                        for (int ir = 0; ir < effMc; ir += mrCap)
+                        {
+                            if (ir + mrCap > effMc) break;
+                            int packedAStripeOff = (ir / mrCap) * effKc * mrCap;
+                            int packedBStripeOff = (jr / nrCap) * effKc * nrCap;
+                            int cTileOff = (ic + ir) * ldcCap + jr;
+                            Span<T> cTile = new Span<T>((T*)cPtrInt + cTileOff, cLenCap - cTileOff);
+                            DispatchMicrokernelWithTail<T>(
+                                packA.Slice(packedAStripeOff, effKc * mrCap),
+                                packBPanel.Slice(packedBStripeOff, effKc * nrCap),
+                                cTile, ldcCap, effKc, mrCap, nrCap, effNr);
+                        }
+                    }
+                }
+            }, deterministicSafe: true);
         }
         finally
         {

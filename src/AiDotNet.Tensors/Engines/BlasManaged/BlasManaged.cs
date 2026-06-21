@@ -44,6 +44,29 @@ public static partial class BlasManaged
     /// </summary>
     internal const long MachineKernelMinWork = 4_000_000;
 
+    // #653: extend the PackBoth parallelism-floor + wide-N blocking optimizations to the
+    // DisableAutotune shim path the forward GEMM uses (CpuEngine.BatchMatMul -> 6-arg
+    // SimdGemm.Sgemm -> Gemm{DisableAutotune}). Those optimizations were gated on
+    // strategy == ForcePackBoth, so the forward FFN/QKV matmuls skipped them and capped
+    // M-axis parallelism (512x1024x4096 -> mc=60/nc=512 -> numMB=9, ~9 of 16 cores).
+    // With this on, the same shape gets nc widened to N + mc shrunk -> numMB=15, 4.9x -> 8.0x
+    // at 16 cores (measured). Default OFF: it's a hot path the code's own notes flag as
+    // regression-prone for multi-N shapes, and the dev box is too noisy to validate a flip —
+    // gated for the gemm-bench CI A/B (set =1 to enable; flip the default once CI on a
+    // many-core runner confirms no tuned-shape regression). Only affects the DisableAutotune
+    // path; direct ForcePackBoth callers are unchanged (they already get these optimizations).
+    private static readonly bool s_forwardPackBothBlocking =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_GEMM_FORWARD_PACKBOTH") == "1";
+
+    // #653 cache-blocking sweep hook: env overrides for the PackBoth Mc/Nc/Kc so the
+    // cache-residency-optimal blocking can be found empirically (the MKL/BLIS tuning art).
+    // 0 = unset (use the computed value). Only applied on the effective-PackBoth path.
+    private static readonly int s_envMc = EnvBlock("AIDOTNET_GEMM_MC");
+    private static readonly int s_envNc = EnvBlock("AIDOTNET_GEMM_NC");
+    private static readonly int s_envKc = EnvBlock("AIDOTNET_GEMM_KC");
+    private static int EnvBlock(string name) =>
+        int.TryParse(System.Environment.GetEnvironmentVariable(name), out var v) && v > 0 ? v : 0;
+
     /// <summary>
     /// #368 thin-M fast path bounds. The no-pack direct 6×16 parallel kernel
     /// (<see cref="Simd.SimdGemm.SgemmDirectParallelMInto"/>) beats both the
@@ -666,6 +689,23 @@ public static partial class BlasManaged
             kcFromAutotune = options.PackedB.TileKc;
         }
 
+        // #653: the parallelism-floor + A-repack-reduction blocking optimizations below were gated
+        // on strategy == ForcePackBoth, so they were SKIPPED for the DisableAutotune shim path the
+        // forward GEMM uses (CpuEngine.BatchMatMul -> 6-arg SimdGemm.Sgemm -> Gemm{DisableAutotune}).
+        // That left the FFN/QKV forward matmuls at the autotuner's cache-sized mc (e.g. the FFN
+        // 512×1024×4096 -> mc=60/nc=512 -> numMB=9, ~9 of 16 cores busy). Resolve the EFFECTIVE
+        // PackBoth decision (the same fallback the DisableAutotune switch case computes at dispatch
+        // time) so these blocking optimizations fire on that path too — the DisableAutotune case
+        // reads the mcFromAutotune/ncFromAutotune we adjust here.
+        bool effectivePackBoth = strategy == PackingMode.ForcePackBoth;
+        if (s_forwardPackBothBlocking && strategy == PackingMode.DisableAutotune)
+        {
+            var packBothProbe = new BlasOptions<T> { PackingMode = PackingMode.Auto };
+            PackingMode effStrategy = Dispatcher.SelectStrategy(m, n, k, packBothProbe);
+            if (effStrategy == PackingMode.ForcePackAOnly && transB) effStrategy = PackingMode.ForcePackBoth;
+            effectivePackBoth = effStrategy == PackingMode.ForcePackBoth;
+        }
+
         // Parallelism floor (PackBoth, no pre-pack): the autotuner sizes mc/nc for cache, but
         // on high core counts a shape can yield fewer (m/mc)×(n/nc) blocks than cores, leaving
         // cores idle. When N fits a single nc-block the 2D MN-grid can't add N-parallelism
@@ -683,7 +723,7 @@ public static partial class BlasManaged
         // Extending it to multi-N-block shapes (e.g. 1024³, mc=64 → 16 M-blocks) REGRESSED them:
         // the box is 16 PHYSICAL cores (32 SMT threads) and compute-bound GEMM gets nothing from
         // SMT, so 16 M-blocks already saturates the cores — shrinking mc only shrinks the panels.
-        if (strategy == PackingMode.ForcePackBoth && k >= 1024
+        if (effectivePackBoth && k >= 1024
             && options.PackedA is null && options.PackedB is null && procs > 1)
         {
             int numNB = (n + ncFromAutotune - 1) / ncFromAutotune;
@@ -703,7 +743,7 @@ public static partial class BlasManaged
         // full Kc×Nc B-panel merely has to fit L3. So widen nc to span all of N when the Kc×N panel
         // fits an L3 budget: numNB collapses to 1 and A is packed ONCE (this is why OpenBLAS uses a
         // large Nc). Pure win — fewer pack passes, identical reduction order (bit-exact).
-        if (strategy == PackingMode.ForcePackBoth
+        if (effectivePackBoth
             && options.PackedA is null && options.PackedB is null && m >= 256)
         {
             int elemSz = System.Runtime.CompilerServices.Unsafe.SizeOf<T>();
@@ -727,6 +767,16 @@ public static partial class BlasManaged
                     if (targetMc < mcFromAutotune) mcFromAutotune = targetMc;
                 }
             }
+        }
+
+        // #653 cache-blocking sweep hook: env overrides applied last, so a sweep can probe the
+        // cache-residency-optimal (Mc, Nc, Kc) directly. Rounded to the micro-tile so the packed
+        // panels stay tile-aligned. Effective-PackBoth only (the path the forward GEMM runs).
+        if (effectivePackBoth && (s_envMc > 0 || s_envNc > 0 || s_envKc > 0))
+        {
+            if (s_envMc > 0) mcFromAutotune = ((s_envMc + mr - 1) / mr) * mr;
+            if (s_envNc > 0) ncFromAutotune = Math.Min(((s_envNc + nr - 1) / nr) * nr, ((n + nr - 1) / nr) * nr);
+            if (s_envKc > 0) kcFromAutotune = Math.Min(s_envKc, k);
         }
 
         switch (strategy)

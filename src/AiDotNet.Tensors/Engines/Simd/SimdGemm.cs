@@ -83,10 +83,43 @@ internal static partial class SimdGemm
         // reduces outer-loop packing iterations.
         if (m == n && n == k && work >= SquareMediumWorkLow && work <= SquareMediumWorkHigh)
             return LargeMc;
+
+        // #653: small-M shapes (transformer FFN/QKV: m = batch×seq) get too few
+        // row blocks at SmallMc to fill a many-core box. Shrink Mc toward
+        // numRowBlocks ≈ maxThreads (floored at MinParallelMc, rounded to Mr) so
+        // SgemmTiled's M-fan and per-row-block packing both saturate the cores.
+        // Only fires for compute-bound, parallel-eligible shapes; everything else
+        // keeps the tuned SmallMc.
+        if (SmallMRowBlockTargeting)
+        {
+            int maxThreads = Helpers.CpuParallelSettings.MaxDegreeOfParallelism;
+            if (maxThreads > 1
+                && m >= MinParallelMc * 2                       // enough rows to split finer
+                && work >= ParallelWorkThreshold                // parallel-eligible at all
+                && (m + SmallMc - 1) / SmallMc < maxThreads)    // currently under-tiled
+            {
+                int targetMc = ((m / maxThreads) / Mr) * Mr;    // ~maxThreads row blocks, Mr-aligned
+                if (targetMc < MinParallelMc) targetMc = MinParallelMc;
+                if (targetMc < SmallMc) return targetMc;
+            }
+        }
         return SmallMc;
     }
     private const int Kc = 512;  // Panel depth (fits in L1)
     private const int Nc = 4096; // Panel width for B (fits in L3)
+
+    // #653: small-M row-block targeting. A transformer FFN/QKV matmul has small M
+    // (m = batch×seq, e.g. 512) but the adaptive Mc=128 yields only m/Mc = 4 row
+    // blocks. SgemmTiled fans M-rows across cores, so 4 blocks on a 16-core box
+    // leaves >half the cores idle (measured: [512,1024]x[1024,4096] scaled only
+    // 4.9× / ~8 cores at maxdop=16, vs 11× for a 2048³ GEMM with 11 row blocks).
+    // When enabled, ChooseAdaptiveMc shrinks Mc for these under-tiled shapes so
+    // numRowBlocks ≈ maxThreads, floored at MinParallelMc to keep each Mr=6
+    // micro-kernel panel efficient. Default off (env-gated) until A/B-validated
+    // against the full GEMM bench so it can't silently regress the tuned shapes.
+    private static readonly bool SmallMRowBlockTargeting =
+        Environment.GetEnvironmentVariable("AIDOTNET_GEMM_SMALLM_TILING") == "1";
+    private const int MinParallelMc = 48; // 8 × Mr — floor for the shrunk small-M Mc
 
     // Micro-kernel register block: 6 rows x 16 columns
     // 6 rows * 16 cols = 96 floats = 12 Vector256<float> accumulators
@@ -1145,12 +1178,31 @@ internal static partial class SimdGemm
         long.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_GEMM_PARALLEL_MINWORK"), out var gpw) && gpw > 0
             ? gpw : ComputeParallelWorkThreshold();
 
+    // #653 Phase 1 parallel-work-threshold scaling constants (see ComputeParallelWorkThreshold).
+    private const long ParallelFmasPerCore = 256L * 1024;          // ~256K FMAs per woken core
+    private const long ParallelWorkFloor = 1L * 1024 * 1024;       // 1M FMAs — tiny GEMMs stay serial
+    private const long ParallelWorkCeiling = 4L * 1024 * 1024;     // 4M FMAs — dead-zone cap
+
     private static long ComputeParallelWorkThreshold()
     {
+        // Total FMA work (m*k*n) above which a single SGEMM fans its m-tiles out across the
+        // pool. The gate exists to amortize parallel-dispatch overhead — which is governed by
+        // the (now cheap, cooperative-pool) per-dispatch cost, so the bar is ~256K FMAs per
+        // core that would be woken.
+        //
+        // #653 Phase 1: the old clamp (max 20M) scaled UP with core count and, on a 16-32 core
+        // box, refused to parallelize ANY GEMM below ~20M FMAs. Diffusion/transformer forwards
+        // are dominated by GEMMs squarely in the 4-20M "dead zone" (e.g. a [256,256]x[256,256]
+        // projection = 16.7M), so those ran fully serial and left the box ~50% idle. Profiled
+        // on the #653 attention probe: dropping the cap to ~4M sped the dead-zone block +22%
+        // (cpuUtil 67%->77%) with no regression on larger blocks (their GEMMs were already
+        // above the bar). The 4M cap means even a 32-core box parallelizes the dead-zone, while
+        // the 1M floor keeps genuinely tiny GEMMs (per-head attention, 1x1 convs) serial so
+        // they don't pay dispatch for nothing. Override with AIDOTNET_GEMM_PARALLEL_MINWORK.
         int cores = Math.Max(1, Environment.ProcessorCount);
-        long scaled = (20L * 1024 * 1024 / 16) * cores;
-        if (scaled < 2L * 1024 * 1024) scaled = 2L * 1024 * 1024;
-        if (scaled > 20L * 1024 * 1024) scaled = 20L * 1024 * 1024;
+        long scaled = ParallelFmasPerCore * cores;
+        if (scaled < ParallelWorkFloor) scaled = ParallelWorkFloor;
+        if (scaled > ParallelWorkCeiling) scaled = ParallelWorkCeiling;
         return scaled;
     }
 

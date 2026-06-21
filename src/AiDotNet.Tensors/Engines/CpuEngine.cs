@@ -2901,17 +2901,52 @@ public partial class CpuEngine : ITensorLevelEngine
                 // For a small batch (batch=2 of [16, 64, 16] tiles)
                 // the work could be small enough to skip dispatch.
                 long batchTotalWork = (long)batchSize * m * n * k;
-                Helpers.CpuParallelSettings.ParallelForOrSerial(0, batchSize, batchTotalWork, batch =>
+                int maxDeg = Helpers.CpuParallelSettings.MaxDegreeOfParallelism;
+
+                // #653 Phase 2: when there are fewer batch slices than cores AND each slice's
+                // GEMM is large, parallelizing over the batch alone caps utilization at
+                // batchSize. High-res attention is exactly this (e.g. 8 heads, each a
+                // [1024,64]x[64,1024] score GEMM) — heads-only fan-out left a 16-32 core box
+                // ~half idle (#642). Flatten the work into a (batch × M-row-block) grid so it
+                // fans out to ~maxDeg. Each output row is still computed by a single thread via
+                // SgemmSequential, so the result is bit-identical to the batch-only path
+                // (disjoint output rows → deterministicSafe).
+                if (batchSize < maxDeg && m >= 2 && batchTotalWork >= Helpers.PersistentParallelExecutor.DefaultSerialGrainSize)
                 {
-                    int aOffset = batch * matrixSizeA;
-                    int bOffset = batch * matrixSizeB;
-                    int resultOffset = batch * matrixSizeResult;
-                    Simd.SimdGemm.SgemmSequential(
-                        aF.AsSpan(aOffset, matrixSizeA),
-                        bF.AsSpan(bOffset, matrixSizeB),
-                        rF.AsSpan(resultOffset, matrixSizeResult),
-                        m, k, n);
-                });
+                    int blocksPerSlice = Math.Min(m, Math.Max(1, (maxDeg + batchSize - 1) / batchSize));
+                    int totalItems = batchSize * blocksPerSlice;
+                    Helpers.CpuParallelSettings.ParallelForOrSerial(0, totalItems, batchTotalWork, item =>
+                    {
+                        int batch = item / blocksPerSlice;
+                        int blk = item % blocksPerSlice;
+                        int r0 = (int)((long)blk * m / blocksPerSlice);
+                        int r1 = (int)((long)(blk + 1) * m / blocksPerSlice);
+                        if (r1 <= r0) return;
+                        int rows = r1 - r0;
+                        int aOffset = batch * matrixSizeA + r0 * k;
+                        int bOffset = batch * matrixSizeB;
+                        int resultOffset = batch * matrixSizeResult + r0 * n;
+                        Simd.SimdGemm.SgemmSequential(
+                            aF.AsSpan(aOffset, rows * k),
+                            bF.AsSpan(bOffset, matrixSizeB),
+                            rF.AsSpan(resultOffset, rows * n),
+                            rows, k, n);
+                    }, deterministicSafe: true);
+                }
+                else
+                {
+                    Helpers.CpuParallelSettings.ParallelForOrSerial(0, batchSize, batchTotalWork, batch =>
+                    {
+                        int aOffset = batch * matrixSizeA;
+                        int bOffset = batch * matrixSizeB;
+                        int resultOffset = batch * matrixSizeResult;
+                        Simd.SimdGemm.SgemmSequential(
+                            aF.AsSpan(aOffset, matrixSizeA),
+                            bF.AsSpan(bOffset, matrixSizeB),
+                            rF.AsSpan(resultOffset, matrixSizeResult),
+                            m, k, n);
+                    }, deterministicSafe: true);   // disjoint per-batch output regions (same guarantee as the Phase 2 path)
+                }
             }
             goto batchDone;
         }
@@ -4250,18 +4285,19 @@ public partial class CpuEngine : ITensorLevelEngine
             using var pinDst = dstMem.Pin();
             float* pSrc = (float*)pinSrc.Pointer;
             float* pDst = (float*)pinDst.Pointer;
-            // Sigmoid into destination
-            Simd.SimdKernels.SigmoidUnsafe(pSrc, pDst, input.Length);
-            // Multiply: dst = src * dst (fused swish = x * sigmoid(x))
-            Simd.SimdKernels.VectorMultiplyUnsafe(pSrc, pDst, pDst, input.Length);
+            // Fused swish = x * sigmoid(x), fanned across cores for large activations.
+            ParallelSwish(pSrc, pDst, input.Length);
             return;
         }
         if (typeof(T) == typeof(double))
         {
-            // SIMD double Swish via Span overload.
-            var srcSpan = ((ReadOnlyMemory<double>)AsDoubleMemory(input.Data)).Span;
-            var dstSpan = AsDoubleMemory(destination.Data).Span;
-            Simd.SimdKernels.Swish(srcSpan, dstSpan);
+            // Fused swish = x * sigmoid(x), fanned across cores for large activations (#653 — parity
+            // with the float path; the double path was a serial straggler).
+            var srcMemD = AsDoubleMemory(input.Data);
+            var dstMemD = AsDoubleMemory(destination.Data);
+            using var pinSrcD = srcMemD.Pin();
+            using var pinDstD = dstMemD.Pin();
+            ParallelSwish((double*)pinSrcD.Pointer, (double*)pinDstD.Pointer, input.Length);
             return;
         }
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -4308,7 +4344,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var dstMem = AsFloatMemory(destination.Data);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
-            Simd.SimdKernels.GELUUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, input.Length);
+            ParallelComputeBound((float*)pinSrc.Pointer, (float*)pinDst.Pointer, input.Length, Simd.SimdKernels.GELUUnsafe);
         }
         else if (typeof(T) == typeof(double))
         {
@@ -4316,7 +4352,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var dstMem = AsDoubleMemory(destination.Data);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
-            Simd.SimdKernels.GELUUnsafe((double*)pinSrc.Pointer, (double*)pinDst.Pointer, input.Length);
+            ParallelComputeBound((double*)pinSrc.Pointer, (double*)pinDst.Pointer, input.Length, Simd.SimdKernels.GELUUnsafe);
         }
         else
         {
@@ -4364,7 +4400,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var dstMem = AsFloatMemory(destination.Data);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
-            Simd.SimdKernels.TanhUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, length);
+            ParallelComputeBound((float*)pinSrc.Pointer, (float*)pinDst.Pointer, length, Simd.SimdKernels.TanhUnsafe);
         }
         else if (typeof(T) == typeof(double))
         {
@@ -4372,7 +4408,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var dstMem = AsDoubleMemory(destination.Data);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
-            Simd.SimdKernels.TanhUnsafe((double*)pinSrc.Pointer, (double*)pinDst.Pointer, length);
+            ParallelComputeBound((double*)pinSrc.Pointer, (double*)pinDst.Pointer, length, Simd.SimdKernels.TanhUnsafe);
         }
         else
         {
@@ -4416,7 +4452,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var dstMem = AsFloatMemory(destination.Data);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
-            Simd.SimdKernels.MishUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, input.Length);
+            ParallelComputeBound((float*)pinSrc.Pointer, (float*)pinDst.Pointer, input.Length, Simd.SimdKernels.MishUnsafe);
             return;
         }
         if (typeof(T) == typeof(double))
@@ -10203,7 +10239,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var dstMem = AsFloatMemory(destination.Data);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
-            Simd.SimdKernels.SigmoidUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, length);
+            ParallelComputeBound((float*)pinSrc.Pointer, (float*)pinDst.Pointer, length, Simd.SimdKernels.SigmoidUnsafe);
         }
         else if (typeof(T) == typeof(double))
         {
@@ -10211,7 +10247,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var dstMem = AsDoubleMemory(destination.Data);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
-            Simd.SimdKernels.SigmoidUnsafe((double*)pinSrc.Pointer, (double*)pinDst.Pointer, length);
+            ParallelComputeBound((double*)pinSrc.Pointer, (double*)pinDst.Pointer, length, Simd.SimdKernels.SigmoidUnsafe);
         }
         else
         {
@@ -10488,7 +10524,7 @@ public partial class CpuEngine : ITensorLevelEngine
             if (CpuJitSelfTest.IsVerified && length >= 64)
                 JitUnaryDispatch(pSrc, pDst, length);
             else
-                Simd.SimdKernels.ReLUUnsafe(pSrc, pDst, length);
+                ParallelComputeBound(pSrc, pDst, length, Simd.SimdKernels.ReLUUnsafe);
         }
         else if (typeof(T) == typeof(double))
         {
@@ -10498,7 +10534,7 @@ public partial class CpuEngine : ITensorLevelEngine
             using var pinDst = dstMem.Pin();
             double* pSrc = (double*)pinSrc.Pointer;
             double* pDst = (double*)pinDst.Pointer;
-            Simd.SimdKernels.ReLUUnsafe(pSrc, pDst, length);
+            ParallelComputeBound(pSrc, pDst, length, Simd.SimdKernels.ReLUUnsafe);
         }
         else
         {
@@ -39481,6 +39517,82 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             kernel(input, output, length);
+        }
+    }
+
+    /// <summary>
+    /// Parallel fused Swish (x * sigmoid(x)) over a contiguous float buffer.
+    /// Mirrors <see cref="ParallelComputeBound(float*, float*, int, UnsafeUnaryKernel)"/>'s
+    /// chunking so large FFN/feature-map activations saturate cores instead of
+    /// running the two SIMD passes (sigmoid, then fused multiply) single-threaded.
+    /// Each chunk is independent — sigmoid then x*sigmoid over the same slice — so
+    /// the result is bit-identical to the serial two-pass path.
+    /// </summary>
+    private static unsafe void ParallelSwish(float* src, float* dst, int length)
+    {
+        const int parallelThreshold = 262144; // 1MB of floats — matches ParallelComputeBound(float).
+        if (length >= parallelThreshold)
+        {
+            int nChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, 16);
+            int chunkSize = (length + nChunks - 1) / nChunks;
+            chunkSize = (chunkSize + 31) & ~31;
+
+            IntPtr pIn = (IntPtr)src;
+            IntPtr pOut = (IntPtr)dst;
+            int totalLength = length;
+
+            Helpers.PersistentParallelExecutor.Instance.Execute(nChunks, chunk =>
+            {
+                int start = chunk * chunkSize;
+                int count = Math.Min(chunkSize, totalLength - start);
+                if (count > 0)
+                {
+                    float* s = (float*)pIn + start;
+                    float* d = (float*)pOut + start;
+                    Simd.SimdKernels.SigmoidUnsafe(s, d, count);
+                    Simd.SimdKernels.VectorMultiplyUnsafe(s, d, d, count);
+                }
+            });
+        }
+        else
+        {
+            Simd.SimdKernels.SigmoidUnsafe(src, dst, length);
+            Simd.SimdKernels.VectorMultiplyUnsafe(src, dst, dst, length);
+        }
+    }
+
+    // #653: double overload — mirrors ParallelSwish(float*) so the double activation path also fans
+    // across cores instead of being a serial straggler (parity with GELU/Tanh/Sigmoid double paths).
+    private static unsafe void ParallelSwish(double* src, double* dst, int length)
+    {
+        const int parallelThreshold = 131072; // 1MB of doubles — matches ParallelComputeBound(double).
+        if (length >= parallelThreshold)
+        {
+            int nChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, 16);
+            int chunkSize = (length + nChunks - 1) / nChunks;
+            chunkSize = (chunkSize + 31) & ~31;
+
+            IntPtr pIn = (IntPtr)src;
+            IntPtr pOut = (IntPtr)dst;
+            int totalLength = length;
+
+            Helpers.PersistentParallelExecutor.Instance.Execute(nChunks, chunk =>
+            {
+                int start = chunk * chunkSize;
+                int count = Math.Min(chunkSize, totalLength - start);
+                if (count > 0)
+                {
+                    double* s = (double*)pIn + start;
+                    double* d = (double*)pOut + start;
+                    Simd.SimdKernels.SigmoidUnsafe(s, d, count);
+                    Simd.SimdKernels.VectorMultiplyUnsafe(s, d, d, count);
+                }
+            });
+        }
+        else
+        {
+            Simd.SimdKernels.SigmoidUnsafe(src, dst, length);
+            Simd.SimdKernels.VectorMultiplyUnsafe(src, dst, dst, length);
         }
     }
 
