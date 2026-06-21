@@ -15485,46 +15485,50 @@ public partial class CpuEngine : ITensorLevelEngine
         var gradInputData = result.GetDataArray();
         var gradOutputData = gradOutput.GetFlattenedData();
 
-        // Cannot parallelize across (batch, channel) pairs because for MaxPool with
-        // overlapping windows, multiple output positions may scatter to the same
-        // input index within a channel. Parallel over batches is safe.
+        // Parallelize over (batch, channel) pairs. Each (b,c) scatters only into the
+        // disjoint input region [(b*channels+c)*height*width, ...) (the gradInIdx always
+        // carries the (b*channels+c) prefix), so distinct (b,c) tasks never collide — the
+        // only within-channel overlap (multiple output windows hitting one input index)
+        // is resolved serially inside a single task. This keeps batch=1 work (diffusion
+        // decoder, CNN inference) saturating all cores instead of running single-threaded.
+        int bc = batch * channels;
         if (typeof(T) == typeof(float))
         {
             var fGradIn = (float[])(object)gradInputData;
             var fGradOut = (float[])(object)gradOutputData;
             Array.Clear(fGradIn, 0, fGradIn.Length);
-            CpuParallelSettings.ParallelForOrSerial(0, batch, fGradIn.Length, b =>
+            CpuParallelSettings.ParallelForOrSerial(0, bc, fGradIn.Length, p =>
             {
-                for (int c = 0; c < channels; c++)
-                    for (int oh = 0; oh < outputHeight; oh++)
-                        for (int ow = 0; ow < outputWidth; ow++)
-                        {
-                            int maxH = maxIndices[b, c, oh, ow, 0];
-                            int maxW = maxIndices[b, c, oh, ow, 1];
-                            int gradOutIdx = ((b * channels + c) * outputHeight + oh) * outputWidth + ow;
-                            int gradInIdx = ((b * channels + c) * height + maxH) * width + maxW;
-                            fGradIn[gradInIdx] += fGradOut[gradOutIdx];
-                        }
-            });
+                int b = p / channels, c = p % channels;
+                for (int oh = 0; oh < outputHeight; oh++)
+                    for (int ow = 0; ow < outputWidth; ow++)
+                    {
+                        int maxH = maxIndices[b, c, oh, ow, 0];
+                        int maxW = maxIndices[b, c, oh, ow, 1];
+                        int gradOutIdx = (p * outputHeight + oh) * outputWidth + ow;
+                        int gradInIdx = (p * height + maxH) * width + maxW;
+                        fGradIn[gradInIdx] += fGradOut[gradOutIdx];
+                    }
+            }, deterministicSafe: true);
         }
         else if (typeof(T) == typeof(double))
         {
             var dGradIn = (double[])(object)gradInputData;
             var dGradOut = (double[])(object)gradOutputData;
             Array.Clear(dGradIn, 0, dGradIn.Length);
-            CpuParallelSettings.ParallelForOrSerial(0, batch, dGradIn.Length, b =>
+            CpuParallelSettings.ParallelForOrSerial(0, bc, dGradIn.Length, p =>
             {
-                for (int c = 0; c < channels; c++)
-                    for (int oh = 0; oh < outputHeight; oh++)
-                        for (int ow = 0; ow < outputWidth; ow++)
-                        {
-                            int maxH = maxIndices[b, c, oh, ow, 0];
-                            int maxW = maxIndices[b, c, oh, ow, 1];
-                            int gradOutIdx = ((b * channels + c) * outputHeight + oh) * outputWidth + ow;
-                            int gradInIdx = ((b * channels + c) * height + maxH) * width + maxW;
-                            dGradIn[gradInIdx] += dGradOut[gradOutIdx];
-                        }
-            });
+                int b = p / channels, c = p % channels;
+                for (int oh = 0; oh < outputHeight; oh++)
+                    for (int ow = 0; ow < outputWidth; ow++)
+                    {
+                        int maxH = maxIndices[b, c, oh, ow, 0];
+                        int maxW = maxIndices[b, c, oh, ow, 1];
+                        int gradOutIdx = (p * outputHeight + oh) * outputWidth + ow;
+                        int gradInIdx = (p * height + maxH) * width + maxW;
+                        dGradIn[gradInIdx] += dGradOut[gradOutIdx];
+                    }
+            }, deterministicSafe: true);
         }
         else
         {
@@ -15532,25 +15536,23 @@ public partial class CpuEngine : ITensorLevelEngine
             for (int i = 0; i < gradInputData.Length; i++)
                 gradInputData[i] = numOps.Zero;
 
-            CpuParallelSettings.ParallelForOrSerial(0, batch, gradInputData.Length, b =>
+            CpuParallelSettings.ParallelForOrSerial(0, bc, gradInputData.Length, p =>
             {
-                for (int c = 0; c < channels; c++)
+                int b = p / channels, c = p % channels;
+                for (int oh = 0; oh < outputHeight; oh++)
                 {
-                    for (int oh = 0; oh < outputHeight; oh++)
+                    for (int ow = 0; ow < outputWidth; ow++)
                     {
-                        for (int ow = 0; ow < outputWidth; ow++)
-                        {
-                            int maxH = maxIndices[b, c, oh, ow, 0];
-                            int maxW = maxIndices[b, c, oh, ow, 1];
+                        int maxH = maxIndices[b, c, oh, ow, 0];
+                        int maxW = maxIndices[b, c, oh, ow, 1];
 
-                            int gradOutIdx = ((b * channels + c) * outputHeight + oh) * outputWidth + ow;
-                            int gradInIdx = ((b * channels + c) * height + maxH) * width + maxW;
+                        int gradOutIdx = (p * outputHeight + oh) * outputWidth + ow;
+                        int gradInIdx = (p * height + maxH) * width + maxW;
 
-                            gradInputData[gradInIdx] = numOps.Add(gradInputData[gradInIdx], gradOutputData[gradOutIdx]);
-                        }
+                        gradInputData[gradInIdx] = numOps.Add(gradInputData[gradInIdx], gradOutputData[gradOutIdx]);
                     }
                 }
-            });
+            }, deterministicSafe: true);
         }
 
         return result;
@@ -15684,12 +15686,13 @@ public partial class CpuEngine : ITensorLevelEngine
             var fGradOut = (float[])(object)gradOutputData;
             float invPoolArea = 1f / (poolH * poolW);
             Array.Clear(fGradIn, 0, fGradIn.Length);
-            CpuParallelSettings.ParallelForOrSerial(0, batch, fGradIn.Length, b =>
+            // Parallelize over (batch, channel): each pair scatters only into its disjoint
+            // [(b*channels+c)*height*width, ...) input slab, so batch=1 still saturates cores.
+            CpuParallelSettings.ParallelForOrSerial(0, batch * channels, fGradIn.Length, p =>
             {
-                for (int c = 0; c < channels; c++)
                 {
-                    int inputBaseOffset = (b * channels + c) * height * width;
-                    int outputBaseOffset = (b * channels + c) * outputHeight * outputWidth;
+                    int inputBaseOffset = p * height * width;
+                    int outputBaseOffset = p * outputHeight * outputWidth;
                     for (int oh = 0; oh < outputHeight; oh++)
                     {
                         for (int ow = 0; ow < outputWidth; ow++)
@@ -15707,7 +15710,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         }
                     }
                 }
-            });
+            }, deterministicSafe: true);
         }
         else if (typeof(T) == typeof(double))
         {
@@ -15715,12 +15718,11 @@ public partial class CpuEngine : ITensorLevelEngine
             var dGradOut = (double[])(object)gradOutputData;
             double invPoolArea = 1.0 / (poolH * poolW);
             Array.Clear(dGradIn, 0, dGradIn.Length);
-            CpuParallelSettings.ParallelForOrSerial(0, batch, dGradIn.Length, b =>
+            CpuParallelSettings.ParallelForOrSerial(0, batch * channels, dGradIn.Length, p =>
             {
-                for (int c = 0; c < channels; c++)
                 {
-                    int inputBaseOffset = (b * channels + c) * height * width;
-                    int outputBaseOffset = (b * channels + c) * outputHeight * outputWidth;
+                    int inputBaseOffset = p * height * width;
+                    int outputBaseOffset = p * outputHeight * outputWidth;
                     for (int oh = 0; oh < outputHeight; oh++)
                     {
                         for (int ow = 0; ow < outputWidth; ow++)
@@ -15738,7 +15740,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         }
                     }
                 }
-            });
+            }, deterministicSafe: true);
         }
         else
         {
@@ -15748,13 +15750,13 @@ public partial class CpuEngine : ITensorLevelEngine
             for (int i = 0; i < gradInputData.Length; i++)
                 gradInputData[i] = numOps.Zero;
 
-            // Parallelize across batches (within a batch*channel, output positions scatter to overlapping input regions)
-            CpuParallelSettings.ParallelForOrSerial(0, batch, gradInputData.Length, b =>
+            // Parallelize over (batch, channel): each pair writes only into its disjoint
+            // input slab, so distinct tasks never collide (within-pair overlap stays serial).
+            CpuParallelSettings.ParallelForOrSerial(0, batch * channels, gradInputData.Length, p =>
             {
-                for (int c = 0; c < channels; c++)
                 {
-                    int inputBaseOffset = (b * channels + c) * height * width;
-                    int outputBaseOffset = (b * channels + c) * outputHeight * outputWidth;
+                    int inputBaseOffset = p * height * width;
+                    int outputBaseOffset = p * outputHeight * outputWidth;
 
                     for (int oh = 0; oh < outputHeight; oh++)
                     {
@@ -15775,7 +15777,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         }
                     }
                 }
-            });
+            }, deterministicSafe: true);
         }
 
         return result;
