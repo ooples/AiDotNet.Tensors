@@ -23820,7 +23820,24 @@ public partial class CpuEngine : ITensorLevelEngine
                         int chanOffset = b * (channels * spatialSize) + channel * spatialSize;
                         float gammaAcc = 0f;
                         float betaAcc = 0f;
-                        for (int s = 0; s < spatialSize; s++)
+                        int s = 0;
+                        if (Vector256.IsHardwareAccelerated && spatialSize >= 8)
+                        {
+                            var vMean = Vector256.Create(groupMean);
+                            var vInvStd = Vector256.Create(invStd);
+                            var accG = Vector256<float>.Zero;
+                            var accB = Vector256<float>.Zero;
+                            for (; s + 8 <= spatialSize; s += 8)
+                            {
+                                var go = Vector256.LoadUnsafe(ref fGradOut[chanOffset + s]);
+                                var norm = (Vector256.LoadUnsafe(ref fInput[chanOffset + s]) - vMean) * vInvStd;
+                                accG += go * norm;
+                                accB += go;
+                            }
+                            gammaAcc = Vector256.Sum(accG);
+                            betaAcc = Vector256.Sum(accB);
+                        }
+                        for (; s < spatialSize; s++)
                         {
                             float go = fGradOut[chanOffset + s];
                             float normalized = (fInput[chanOffset + s] - groupMean) * invStd;
@@ -23851,7 +23868,25 @@ public partial class CpuEngine : ITensorLevelEngine
                         int channel = startChannel + c;
                         int chanOffset = b * (channels * spatialSize) + channel * spatialSize;
                         float gammaC = fGamma[channel];
-                        for (int s = 0; s < spatialSize; s++)
+                        int s = 0;
+                        if (Vector256.IsHardwareAccelerated && spatialSize >= 8)
+                        {
+                            var vMean = Vector256.Create(groupMean);
+                            var vInvStd = Vector256.Create(invStd);
+                            var vGamma = Vector256.Create(gammaC);
+                            var accGrad = Vector256<float>.Zero;
+                            var accGradNorm = Vector256<float>.Zero;
+                            for (; s + 8 <= spatialSize; s += 8)
+                            {
+                                var scaledGrad = vGamma * Vector256.LoadUnsafe(ref fGradOut[chanOffset + s]);
+                                var norm = (Vector256.LoadUnsafe(ref fInput[chanOffset + s]) - vMean) * vInvStd;
+                                accGrad += scaledGrad;
+                                accGradNorm += scaledGrad * norm;
+                            }
+                            sumGrad += Vector256.Sum(accGrad);
+                            sumGradNorm += Vector256.Sum(accGradNorm);
+                        }
+                        for (; s < spatialSize; s++)
                         {
                             float scaledGrad = gammaC * fGradOut[chanOffset + s];
                             float normalized = (fInput[chanOffset + s] - groupMean) * invStd;
@@ -23867,7 +23902,25 @@ public partial class CpuEngine : ITensorLevelEngine
                         int channel = startChannel + c;
                         int chanOffset = b * (channels * spatialSize) + channel * spatialSize;
                         float gammaC = fGamma[channel];
-                        for (int s = 0; s < spatialSize; s++)
+                        int s = 0;
+                        if (Vector256.IsHardwareAccelerated && spatialSize >= 8)
+                        {
+                            var vMean = Vector256.Create(groupMean);
+                            var vInvStd = Vector256.Create(invStd);
+                            var vGamma = Vector256.Create(gammaC);
+                            var vGroupSize = Vector256.Create(groupSizeF);
+                            var vSumGrad = Vector256.Create(sumGrad);
+                            var vSumGradNorm = Vector256.Create(sumGradNorm);
+                            var vScale = Vector256.Create(scale);
+                            for (; s + 8 <= spatialSize; s += 8)
+                            {
+                                var norm = (Vector256.LoadUnsafe(ref fInput[chanOffset + s]) - vMean) * vInvStd;
+                                var gradNorm = vGamma * Vector256.LoadUnsafe(ref fGradOut[chanOffset + s]);
+                                var res = vScale * (vGroupSize * gradNorm - vSumGrad - norm * vSumGradNorm);
+                                res.StoreUnsafe(ref fGradInput[chanOffset + s]);
+                            }
+                        }
+                        for (; s < spatialSize; s++)
                         {
                             float normalized = (fInput[chanOffset + s] - groupMean) * invStd;
                             float gradNorm = gammaC * fGradOut[chanOffset + s];
