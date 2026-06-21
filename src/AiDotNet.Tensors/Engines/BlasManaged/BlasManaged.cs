@@ -257,9 +257,25 @@ public static partial class BlasManaged
     //     microkernel for these shapes.
     // The microkernel still wins (and is kept) for small/medium near-square shapes
     // (512³, 256×784×128, 128×64×256), where its low per-call overhead dominates.
+    /// <summary>
+    /// #475 tiny-K routing. When true (default), FP32 GEMMs with a small contraction
+    /// dimension (K ≤ 128) but large M·N — the 1×1-conv / im2col shapes that dominate
+    /// diffusion (e.g. 13824×1536×64) — are routed to the machine-code kernel instead of
+    /// the cache-blocking packed strategy, whose A/B packing cost does not amortize over a
+    /// tiny K. Measured on Kandinsky train (A/B in one process, MaxDOP=4): the 13824×1536×64
+    /// shape went from 1.23s @ ~31 GF/s on the packed path to fast enough to drop off the
+    /// top-8 (machine kernel ~5×), cutting total GEMM time 18.4s → 16.4s/iter. Settable for
+    /// A/B regression testing.
+    /// </summary>
+    public static bool TinyKPreferMachineKernel = true;
+
     private static bool PrefersStrategyOverMachineKernel(int m, int n, int k, bool isFloat)
     {
         long work = (long)m * n * k;
+        // #475: tiny-K, large-M·N FP32 (1×1-conv / im2col) — let the machine kernel take it.
+        // Checked before the work>=250M cutoff that would otherwise force the packed path.
+        if (isFloat && TinyKPreferMachineKernel && k <= 128 && (long)m * n >= 1_000_000L)
+            return false;
         if (n < 128 && k >= 128) return true;                 // thin-N (both dtypes)
         if (!isFloat)
             // FP64 microkernel is competitive on FFN and mid squares (1024³ double 211 > packed
@@ -279,7 +295,40 @@ public static partial class BlasManaged
         return false;
     }
 
+    // Diagnostic timing wrapper (#475 shape audit). When GemmShapeHistogram.Enabled it times
+    // only the TOP-LEVEL Gemm call (a ThreadStatic guard skips internal re-dispatches so a
+    // shape is attributed once, to the outer call). Disabled → a single bool read + straight
+    // tail-call into GemmCore, no Stopwatch, no measurable overhead.
+    [ThreadStatic] private static bool s_gemmTiming;
+
     public static void Gemm<T>(
+        ReadOnlySpan<T> a, int lda, bool transA,
+        ReadOnlySpan<T> b, int ldb, bool transB,
+        Span<T> c, int ldc,
+        int m, int n, int k,
+        in BlasOptions<T> options = default) where T : unmanaged
+    {
+        if (!GemmShapeHistogram.Enabled || s_gemmTiming)
+        {
+            GemmCore(a, lda, transA, b, ldb, transB, c, ldc, m, n, k, in options);
+            return;
+        }
+        s_gemmTiming = true;
+        long start = System.Diagnostics.Stopwatch.GetTimestamp();
+        try
+        {
+            GemmCore(a, lda, transA, b, ldb, transB, c, ldc, m, n, k, in options);
+        }
+        finally
+        {
+            long elapsed = System.Diagnostics.Stopwatch.GetTimestamp() - start;
+            s_gemmTiming = false;
+            if (m > 0 && n > 0 && k > 0)
+                GemmShapeHistogram.Record(m, n, k, transA, transB, typeof(T) == typeof(float), elapsed);
+        }
+    }
+
+    private static void GemmCore<T>(
         ReadOnlySpan<T> a, int lda, bool transA,
         ReadOnlySpan<T> b, int ldb, bool transB,
         Span<T> c, int ldc,
