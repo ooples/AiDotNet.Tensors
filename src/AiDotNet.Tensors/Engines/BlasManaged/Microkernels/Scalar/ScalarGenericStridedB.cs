@@ -18,8 +18,8 @@ namespace AiDotNet.Tensors.Engines.BlasManaged;
 /// <para>
 /// Packed-A layout matches the SIMD kernels: <c>[Kc × mr]</c> row-major (mr-contiguous within
 /// each k-slice), so A row <c>r</c> at K-step <c>k</c> is <c>packedA[k * mr + r]</c>. B is read
-/// directly with stride <paramref name="ldb"/> (transB=false, row-major [K, N]); C is
-/// read-modify-write at stride <paramref name="ldc"/>. Accumulation is in FP64 to match the
+/// directly with stride <c>ldb</c> (transB=false, row-major [K, N]); C is
+/// read-modify-write at stride <c>ldc</c>. Accumulation is in FP64 to match the
 /// fixed-size scalar kernels' precision strategy (cast back to FP32 only at write-back).
 /// </para>
 /// </summary>

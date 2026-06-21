@@ -310,7 +310,10 @@ internal static class PackAOnlyStrategy
     /// Routes to the appropriate strided-B microkernel matching T and the
     /// Mr×Nr tile width chosen by the caller. AVX2 8×8 FP32 fires when
     /// <paramref name="mr"/>==8 AND <paramref name="nr"/>==8 AND AVX2+FMA
-    /// are runtime-available; else falls through to scalar 4×4.
+    /// are runtime-available; when no matching SIMD kernel is available (e.g.
+    /// net471 or no-AVX2 platforms), falls back to scalar: the optimized
+    /// 4×4 kernel for 4×4 tiles specifically, or the generic scalar fallback
+    /// for all other tile size combinations (mr != 4 or nr != 4).
     /// </summary>
     private static void DispatchStridedMicrokernel<T>(
         ReadOnlySpan<T> packedA, ReadOnlySpan<T> b, int ldb,
