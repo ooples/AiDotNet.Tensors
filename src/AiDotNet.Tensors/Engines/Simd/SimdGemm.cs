@@ -88,15 +88,36 @@ internal static partial class SimdGemm
         // row blocks at SmallMc to fill a many-core box. Shrink Mc toward
         // numRowBlocks ≈ maxThreads (floored at MinParallelMc, rounded to Mr) so
         // SgemmTiled's M-fan and per-row-block packing both saturate the cores.
-        // Only fires for compute-bound, parallel-eligible shapes; everything else
-        // keeps the tuned SmallMc.
-        if (SmallMRowBlockTargeting)
+        //
+        // OPT-IN (AIDOTNET_GEMM_SMALLM_TILING=1) — NOT default-on. A directional
+        // bench of the canonical FFN-up shape [512,1024]x[1024,4096] (32-core box)
+        // showed NO measurable change with the lever on vs off (min ~16.2ms both
+        // ways, busyCores ~8/32 both ways): that shape draws its parallelism from
+        // N=4096 (256 Nr-column blocks), so the M row-block count is irrelevant
+        // and the kernel is bandwidth-bound at ~8 effective cores regardless of Mc.
+        // The lever only matters in the narrow regime where BOTH m and n are small
+        // relative to the core count (so columns under-supply parallelism too),
+        // which this box can't validate cleanly (>10× run-to-run variance). Kept
+        // opt-in until a quiet-box bench proves a win on that regime.
+        //
+        // The guard below is still safe-by-construction for when it IS enabled —
+        // the only Mc it changes is non-square AND severely under-tiled:
+        //   * SQUARE shapes (m == n) are excluded — square-1152/768 etc. have a
+        //     hand-tuned Mc (the Salykova large-panel regime above); reshaping
+        //     them for parallelism would trade their cache-blocking win.
+        //   * Shapes already filling > half the cores (curRowBlocks*2 > maxThreads)
+        //     keep their tuned SmallMc — the shrink fires only on SEVERE
+        //     under-tiling (≥ half the cores would sit idle).
+        //   * The shrunk Mc is floored at MinParallelMc (8×Mr) so each Mr=6
+        //     micro-kernel panel stays packing-efficient.
+        if (SmallMRowBlockTargeting && m != n)              // never reshape square (cache-tuned)
         {
             int maxThreads = Helpers.CpuParallelSettings.MaxDegreeOfParallelism;
+            int curRowBlocks = (m + SmallMc - 1) / SmallMc;
             if (maxThreads > 1
-                && m >= MinParallelMc * 2                       // enough rows to split finer
-                && work >= ParallelWorkThreshold                // parallel-eligible at all
-                && (m + SmallMc - 1) / SmallMc < maxThreads)    // currently under-tiled
+                && m >= MinParallelMc * 2                   // enough rows to split finer
+                && work >= ParallelWorkThreshold            // parallel-eligible at all
+                && curRowBlocks * 2 <= maxThreads)          // SEVERELY under-tiled (≤ half cores busy)
             {
                 int targetMc = ((m / maxThreads) / Mr) * Mr;    // ~maxThreads row blocks, Mr-aligned
                 if (targetMc < MinParallelMc) targetMc = MinParallelMc;
@@ -113,10 +134,14 @@ internal static partial class SimdGemm
     // blocks. SgemmTiled fans M-rows across cores, so 4 blocks on a 16-core box
     // leaves >half the cores idle (measured: [512,1024]x[1024,4096] scaled only
     // 4.9× / ~8 cores at maxdop=16, vs 11× for a 2048³ GEMM with 11 row blocks).
-    // When enabled, ChooseAdaptiveMc shrinks Mc for these under-tiled shapes so
-    // numRowBlocks ≈ maxThreads, floored at MinParallelMc to keep each Mr=6
-    // micro-kernel panel efficient. Default off (env-gated) until A/B-validated
-    // against the full GEMM bench so it can't silently regress the tuned shapes.
+    // ChooseAdaptiveMc shrinks Mc for these under-tiled shapes so numRowBlocks ≈
+    // maxThreads, floored at MinParallelMc to keep each Mr=6 micro-kernel panel
+    // efficient. OPT-IN (AIDOTNET_GEMM_SMALLM_TILING=1): a directional bench of the
+    // canonical FFN-up shape showed no measurable win (that shape's parallelism
+    // comes from N, not M — see ChooseAdaptiveMc), so the default stays off pending
+    // a quiet-box bench of the small-m-AND-small-n regime where it would matter.
+    // The guard is safe-by-construction when enabled (square excluded; fires only
+    // on severe under-tiling).
     private static readonly bool SmallMRowBlockTargeting =
         Environment.GetEnvironmentVariable("AIDOTNET_GEMM_SMALLM_TILING") == "1";
     private const int MinParallelMc = 48; // 8 × Mr — floor for the shrunk small-M Mc
