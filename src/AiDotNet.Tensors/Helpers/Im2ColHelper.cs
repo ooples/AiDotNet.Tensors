@@ -1727,16 +1727,20 @@ internal static class Im2ColHelper
                 //   where ih_out = oh_in*strideH + kh*dilationH - padH
                 // For ConvTranspose2D: "c" = outChannels, output(c, ih_out, iw_out) accumulates
                 // contributions from input position (oh_in, ow_in) shifted by (kh, kw). Dilation = 1.
-                Col2ImAccumulate(
-                    tempBuffer.AsSpan(0, kmkn * hw),
-                    output.AsSpan(outputOffset, outSliceSize),
-                    channels: outChannels,
-                    height: outputHeight, width: outputWidth,
-                    kernelH: kernelH, kernelW: kernelW,
-                    strideH: strideH, strideW: strideW,
-                    padH: padH, padW: padW,
-                    dilationH: 1, dilationW: 1,
-                    outputH: inputHeight, outputW: inputWidth);
+                // Channel-parallel scatter (each output channel disjoint) — the serial Span col2im
+                // was the ConvTranspose forward's scatter bottleneck (same pattern as the conv
+                // backward-input fix). tempBuffer + output are float[], so the no-pin array variant
+                // applies directly. (The double overload below still uses the serial path.)
+                Col2ImAccumulateChannelParallel(
+                    tempBuffer, 0,
+                    output, outputOffset,
+                    outChannels,
+                    outputHeight, outputWidth,
+                    kernelH, kernelW,
+                    strideH, strideW,
+                    padH, padW,
+                    1, 1,
+                    inputHeight, inputWidth);
             }
 
             return true;
