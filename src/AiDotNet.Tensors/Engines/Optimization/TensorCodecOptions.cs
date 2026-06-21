@@ -106,23 +106,20 @@ public sealed class TensorCodecOptions
     public bool EnablePointwiseFusion { get; set; } = true;
 
     /// <summary>
-    /// Phase 4.5: Precompute static subgraphs at compile time. OFF by default.
+    /// Phase 4.5: Fold constant subgraphs to a run-once-at-runtime step (computed on the first replay,
+    /// skipped on the rest). Default on.
     /// </summary>
     /// <remarks>
-    /// <see cref="ConstantFoldingPass"/> evaluates a constant subgraph by calling the step's Execute AT
-    /// COMPILE TIME, writing into the step's output buffer (a graph tensor) and dropping the step. That
-    /// makes building the compiled plan MUTATE the source graph's tensors — which breaks the verify-then-
-    /// trust inference gate: the gate runs the eager forward and the compiled candidate over the SAME graph
-    /// to compare them, so a compile-time write into a shared/persistent tensor corrupts the eager reference
-    /// and the eager fallback. Reproduced as non-deterministic cross-attention diffusion inference
-    /// (AiDotNet AudioLDM/AuraFlow Predict_ShouldBeDeterministic with compiled inference enabled): the
-    /// folded constant subgraph the cross-attention path introduces poisoned the eager output (the 3.19-vs-
-    /// 3.55 divergence). Disabling it restores determinism with zero measurable perf loss (it fires rarely
-    /// in real graphs — almost every op transitively depends on the model input or a weight). Re-enable only
-    /// after the pass folds into a PRIVATE buffer and rewires consumers, so compilation has no graph side
-    /// effects (tracked as the constant-folding-isolation follow-up).
+    /// <see cref="ConstantFoldingPass"/> previously evaluated a constant subgraph by calling the step's
+    /// Execute AT COMPILE TIME and dropping the step. That read not-yet-materialized input buffers (garbage)
+    /// and made building the plan MUTATE the source graph's tensors — corrupting the verify-then-trust
+    /// inference gate, which runs the eager forward over the SAME graph to compare against the compiled
+    /// candidate (observed as non-deterministic cross-attention diffusion inference, the 3.19-vs-3.55
+    /// divergence). It now folds to a run-once step that executes lazily at runtime when inputs are valid,
+    /// so compilation has no graph side effects while the constant is still computed only once across a
+    /// denoising loop's replays.
     /// </remarks>
-    public bool EnableConstantFolding { get; set; }
+    public bool EnableConstantFolding { get; set; } = true;
 
     /// <summary>Phase 6.2: Deduplicate identical computations across layers.</summary>
     public bool EnableForwardCSE { get; set; } = true;
