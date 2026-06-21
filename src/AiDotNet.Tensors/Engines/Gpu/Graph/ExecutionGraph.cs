@@ -13,6 +13,10 @@ public sealed class ExecutionGraph : IDisposable
     private readonly Dictionary<int, List<ExecutionNode>> _levelNodes;
     private readonly List<IGpuStream> _acquiredStreams = new();
     private readonly object _streamLock = new();
+    // #642: a stream pool whose streams the compiler embedded into this graph's nodes
+    // (AssignedStream / BarrierNode sync). Owned here so those streams stay valid for the
+    // graph's whole lifetime and are freed exactly once, when the graph is disposed.
+    private readonly GpuStreamPool? _ownedStreamPool;
     private bool _disposed;
 
     /// <summary>
@@ -61,6 +65,18 @@ public sealed class ExecutionGraph : IDisposable
     }
 
     /// <summary>
+    /// Creates an execution graph that takes ownership of <paramref name="ownedStreamPool"/> — the
+    /// compiler's stream pool whose streams are embedded in the graph's nodes (#642). The pool is
+    /// disposed together with this graph, so the embedded streams outlive compilation and stay valid
+    /// throughout execution.
+    /// </summary>
+    internal ExecutionGraph(List<ExecutionNode> nodes, GpuStreamPool? ownedStreamPool)
+        : this(nodes)
+    {
+        _ownedStreamPool = ownedStreamPool;
+    }
+
+    /// <summary>
     /// Executes the graph synchronously on the default stream.
     /// </summary>
     /// <param name="backend">The GPU backend to use.</param>
@@ -81,6 +97,34 @@ public sealed class ExecutionGraph : IDisposable
 
         // Final synchronization
         backend.Synchronize();
+    }
+
+    /// <summary>
+    /// Runs ONLY the compute kernels of the graph in topological order, on the backend's default
+    /// stream, with NO final synchronize and NO host transfers/allocations — the capture-safe subset.
+    /// Use this as the <c>forward</c> closure for a <see cref="Codegen.CudaGraph.GraphedInferenceStep"/>:
+    /// CUDA-graph capture rejects <c>cuMemAlloc</c> (H2D <see cref="TransferNode"/>s allocate a temp
+    /// buffer) and <c>cuStreamSynchronize</c> (the final <c>backend.Synchronize()</c>). The graph's
+    /// buffers are allocated at RECORD time, so the kernel sequence here is alloc-free and replayable.
+    /// Inputs must already be resident (run a full <see cref="Execute(IDirectGpuBackend)"/> once to warm
+    /// + populate them, or copy fresh input into the captured input buffer before each replay). #642 P3.
+    /// </summary>
+    /// <param name="backend">The GPU backend to use.</param>
+    public void ExecuteComputeKernelsNoSync(IDirectGpuBackend backend)
+    {
+        ThrowIfDisposed();
+        if (backend == null)
+        {
+            throw new ArgumentNullException(nameof(backend));
+        }
+
+        foreach (var node in _topologicalOrder)
+        {
+            if (node is KernelNode || node is FusedKernelNode)
+            {
+                node.Execute(backend);
+            }
+        }
     }
 
     /// <summary>
@@ -401,6 +445,9 @@ public sealed class ExecutionGraph : IDisposable
         {
             node.CompletionSync?.Dispose();
         }
+
+        // #642: free the compiler's embedded stream pool now that no node will touch its streams.
+        _ownedStreamPool?.Dispose();
     }
 
     /// <inheritdoc/>

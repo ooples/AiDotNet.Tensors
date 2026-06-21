@@ -127,8 +127,14 @@ public sealed class GraphCompiler
                 ? (double)(originalCost - optimizedCost) / originalCost
                 : 0;
 
-            // Create the optimized graph
-            return (new ExecutionGraph(optimizedNodes), context.Statistics);
+            // #642: the optimization passes may embed streams from `streamPool` into the graph
+            // (node.AssignedStream, BarrierNode cross-stream sync). Those references must stay valid
+            // through execution, so HAND OWNERSHIP of the pool to the graph (it disposes the pool when
+            // it is disposed) instead of disposing it in the finally below — which previously left the
+            // executed graph pointing at disposed CudaStreams (ObjectDisposedException at RecordEvent).
+            var resultGraph = new ExecutionGraph(optimizedNodes, streamPool);
+            streamPool = null; // ownership transferred — don't dispose in finally
+            return (resultGraph, context.Statistics);
         }
         finally
         {

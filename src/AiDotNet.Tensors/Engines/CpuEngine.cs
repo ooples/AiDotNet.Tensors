@@ -4212,7 +4212,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public void SwishInPlace<T>(Tensor<T> tensor)
+    public virtual void SwishInPlace<T>(Tensor<T> tensor)
     {
         // Issue #350 v3 (GraphMode-aware in-place op).
         if (GraphMode.IsActive)
