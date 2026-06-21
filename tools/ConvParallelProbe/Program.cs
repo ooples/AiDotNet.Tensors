@@ -24,6 +24,7 @@ internal static class Program
             Console.Error.WriteLine("[probe] MachineKernelGemm.Enabled=false");
         }
 
+        if (args.Length > 0 && args[0] == "--allocbench") return RunAllocBench(eng, args);
         if (args.Length > 0 && args[0] == "--resblock") return RunResblock(eng, args);
         if (args.Length > 0 && args[0] == "--attnblock") return RunAttnBlock(eng, args);
         if (args.Length > 0 && args[0] == "--act") return RunAct(eng, args);
@@ -606,6 +607,42 @@ internal static class Program
         }
         catch (Exception ex) { Console.WriteLine($"CAPTURE FAILED: {ex.GetType().Name}: {ex.Message}"); }
         finally { scope.Dispose(); }
+        return 0;
+    }
+
+    // #653: measure per-op allocated bytes + time when AutoTracer.ShouldRecord is FALSE (the
+    // training / no-compilation hot path) — isolates the autotrace closure allocate-then-discard
+    // overhead. ShouldRecord is forced false by disabling compilation (reflection). Tiny shapes
+    // so the per-op closure alloc is visible against the (unavoidable) result-tensor alloc.
+    private static int RunAllocBench(CpuEngine eng, string[] a)
+    {
+        int M = ArgI(a, "--m", 8), K = ArgI(a, "--k", 8), N = ArgI(a, "--n", 8);
+        int reps = ArgI(a, "--reps", 200000);
+        // ShouldRecord = Enabled && !GraphMode && EnableCompilation && !ThreadTapeActive.
+        // Force AutoTracer.Enabled=false so ShouldRecord is false (mirrors the training hot path
+        // where a live tape makes ShouldRecord false). Verify before measuring.
+        var asm = typeof(CpuEngine).Assembly;
+        const System.Reflection.BindingFlags SF = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public;
+        var at = asm.GetType("AiDotNet.Tensors.Engines.Compilation.AutoTracer");
+        at?.GetProperty("Enabled", SF)?.SetValue(null, false);
+        var shouldRec = at?.GetProperty("ShouldRecord", SF)?.GetValue(null);
+        Console.Error.WriteLine($"[probe] AutoTracer.ShouldRecord={shouldRec}");
+
+        var rng = new Random(0);
+        var lhs = Rand(new[] { M, K }, rng);
+        var rhs = Rand(new[] { K, N }, rng);
+        var warm = eng.BatchMatMul(lhs, rhs); float sink = warm[0];
+
+        GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
+        long startBytes = GC.GetAllocatedBytesForCurrentThread();
+        var sw = Stopwatch.StartNew();
+        for (int i = 0; i < reps; i++) { var o = eng.BatchMatMul(lhs, rhs); sink += o[0]; }
+        sw.Stop();
+        long bytes = GC.GetAllocatedBytesForCurrentThread() - startBytes;
+        Console.WriteLine(
+            $"ALLOCBENCH op=BatchMatMul {M}x{K}x{N} reps={reps} " +
+            $"bytes_per_op={(double)bytes / reps:F1} ns_per_op={sw.Elapsed.TotalMilliseconds * 1e6 / reps:F1} " +
+            $"total_MB={bytes / 1048576.0:F1} (sink={sink:E1})");
         return 0;
     }
 
