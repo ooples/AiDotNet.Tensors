@@ -26577,6 +26577,8 @@ public partial class CpuEngine : ITensorLevelEngine
     private static float VDot(float[] a, int ao, float[] b, int bo, int n)
     {
         int i = 0;
+#if NET5_0_OR_GREATER
+        // Vector256 (System.Runtime.Intrinsics) is net5+ only; net471 uses the scalar tail.
         if (Vector256.IsHardwareAccelerated && n >= 8)
         {
             var acc = Vector256<float>.Zero;
@@ -26586,6 +26588,7 @@ public partial class CpuEngine : ITensorLevelEngine
             for (; i < n; i++) s += a[ao + i] * b[bo + i];
             return s;
         }
+#endif
         float sc = 0f;
         for (; i < n; i++) sc += a[ao + i] * b[bo + i];
         return sc;
@@ -26594,6 +26597,8 @@ public partial class CpuEngine : ITensorLevelEngine
     private static void VAxpy(float[] y, int yo, float scalar, float[] x, int xo, int n)
     {
         int i = 0;
+#if NET5_0_OR_GREATER
+        // Vector256 (System.Runtime.Intrinsics) is net5+ only; net471 uses the scalar tail.
         if (Vector256.IsHardwareAccelerated && n >= 8)
         {
             var vs = Vector256.Create(scalar);
@@ -26603,6 +26608,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 yv.StoreUnsafe(ref y[yo + i]);
             }
         }
+#endif
         for (; i < n; i++) y[yo + i] += scalar * x[xo + i];
     }
 
