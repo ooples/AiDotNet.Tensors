@@ -26567,6 +26567,45 @@ public partial class CpuEngine : ITensorLevelEngine
         return gradOutput;
     }
 
+    // Vectorized head-dim primitives for the attention backward inner kernel. The
+    // per-(qi,ki) dot products and gradient axpys were scalar loops over headDim — the
+    // single-thread bottleneck of the diffusion attention backward (~19% of a train
+    // step). Vector256.LoadUnsafe takes a managed ref (no pinning), so these work inside
+    // the parallel-region lambda. Lane-then-horizontal summation differs from naive
+    // sequential order in the last FP bit — standard for any SIMD/BLAS kernel (PyTorch/
+    // oneDNN do the same); attention parity tests use tolerances, not bit-exactness.
+    private static float VDot(float[] a, int ao, float[] b, int bo, int n)
+    {
+        int i = 0;
+        if (Vector256.IsHardwareAccelerated && n >= 8)
+        {
+            var acc = Vector256<float>.Zero;
+            for (; i + 8 <= n; i += 8)
+                acc += Vector256.LoadUnsafe(ref a[ao + i]) * Vector256.LoadUnsafe(ref b[bo + i]);
+            float s = Vector256.Sum(acc);
+            for (; i < n; i++) s += a[ao + i] * b[bo + i];
+            return s;
+        }
+        float sc = 0f;
+        for (; i < n; i++) sc += a[ao + i] * b[bo + i];
+        return sc;
+    }
+
+    private static void VAxpy(float[] y, int yo, float scalar, float[] x, int xo, int n)
+    {
+        int i = 0;
+        if (Vector256.IsHardwareAccelerated && n >= 8)
+        {
+            var vs = Vector256.Create(scalar);
+            for (; i + 8 <= n; i += 8)
+            {
+                var yv = Vector256.LoadUnsafe(ref y[yo + i]) + vs * Vector256.LoadUnsafe(ref x[xo + i]);
+                yv.StoreUnsafe(ref y[yo + i]);
+            }
+        }
+        for (; i < n; i++) y[yo + i] += scalar * x[xo + i];
+    }
+
     /// <summary>
     /// Float fast path for <see cref="FlashAttentionBackward{T}"/>. Direct
     /// float arithmetic; no virtual dispatch; writes to disjoint per-(b, h)
@@ -26605,11 +26644,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         int oRowOff = oOffset + qi * headDim;
 
                         // doO is independent of ki — hoist it out of the ki loop.
-                        // (The generic path recomputes it per ki; correctness-neutral
-                        // hoist that was already safe there too.)
-                        float doO = 0f;
-                        for (int d = 0; d < headDim; d++)
-                            doO += gradOutData[oRowOff + d] * outputData[oRowOff + d];
+                        float doO = VDot(gradOutData, oRowOff, outputData, oRowOff, headDim);
 
                         for (int ki = kvBlockStart; ki < kvBlockEnd; ki++)
                         {
@@ -26618,10 +26653,7 @@ public partial class CpuEngine : ITensorLevelEngine
                             int kRowOff = kOffset + ki * headDim;
                             int vRowOff = vOffset + ki * headDim;
 
-                            float score = 0f;
-                            for (int d = 0; d < headDim; d++)
-                                score += queryData[qRowOff + d] * keyData[kRowOff + d];
-                            score *= scaleFactor;
+                            float score = VDot(queryData, qRowOff, keyData, kRowOff, headDim) * scaleFactor;
 
                             if (biasData is not null)
                             {
@@ -26633,23 +26665,16 @@ public partial class CpuEngine : ITensorLevelEngine
 
                             float attnWeight = MathF.Exp(score - logsumexp);
 
-                            float doV = 0f;
-                            for (int d = 0; d < headDim; d++)
-                                doV += gradOutData[oRowOff + d] * valueData[vRowOff + d];
+                            float doV = VDot(gradOutData, oRowOff, valueData, vRowOff, headDim);
 
                             float dS = attnWeight * (doV - doO) * scaleFactor;
 
                             // gradV += attnWeight * gradOutput — disjoint per (b, h), no lock.
-                            for (int d = 0; d < headDim; d++)
-                                gradVData[vRowOff + d] += attnWeight * gradOutData[oRowOff + d];
-
+                            VAxpy(gradVData, vRowOff, attnWeight, gradOutData, oRowOff, headDim);
                             // gradQ += dS * K (this worker owns the full gradQ slice for its qi row).
-                            for (int d = 0; d < headDim; d++)
-                                gradQData[qRowOff + d] += dS * keyData[kRowOff + d];
-
+                            VAxpy(gradQData, qRowOff, dS, keyData, kRowOff, headDim);
                             // gradK += dS * Q — also disjoint per (b, h).
-                            for (int d = 0; d < headDim; d++)
-                                gradKData[kRowOff + d] += dS * queryData[qRowOff + d];
+                            VAxpy(gradKData, kRowOff, dS, queryData, qRowOff, headDim);
                         }
                     }
                 }
