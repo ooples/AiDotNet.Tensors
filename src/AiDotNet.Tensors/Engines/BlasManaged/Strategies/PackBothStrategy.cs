@@ -38,16 +38,19 @@ internal static class PackBothStrategy
     private static readonly bool s_trace =
         System.Environment.GetEnvironmentVariable("AIDOTNET_GEMM_TRACE") == "1";
 
-    // #653 single-persistent-region path (env AIDOTNET_GEMM_SINGLE_REGION=1, default off).
+    // #653 single-persistent-region path (DEFAULT ON, opt-out AIDOTNET_GEMM_SINGLE_REGION=0).
     // The M-axis RunParallelUnsafe re-dispatches the parallel region (and barriers) once per
     // (jc, pc) macro-tile. For the wide-nc forward case (numNB==1) that's one barriered
     // pack-B + ic-compute pair per K-panel — e.g. the FFN's 4 K-panels = 8 parallel regions,
     // capping utilization (~8/16 cores -> 8x). This path packs ALL K-panels of B once (one
     // dispatch) then runs ONE parallel ic region where each thread walks the full K-loop for
     // its rows — the BLIS persistent-team shape, no per-K-panel barrier. Bit-identical: each
-    // C element still reduces over k in the same panel order. Gated for A/B + flip via CI.
+    // C element still reduces over k in the same panel order. Self-limiting (only fires on the
+    // numNB==1 wide-nc case under the packed-B residency cap below); measured on top of
+    // forward-packboth it lifts FFN-up busyCores ~12->15.7 (9.7->9.05ms) with no regression
+    // across the 10-shape A/B, so flipped default-on alongside s_forwardPackBothBlocking.
     private static readonly bool s_singleRegion =
-        System.Environment.GetEnvironmentVariable("AIDOTNET_GEMM_SINGLE_REGION") == "1";
+        System.Environment.GetEnvironmentVariable("AIDOTNET_GEMM_SINGLE_REGION") != "0";
 
     // Cap on the all-panels packed-B residency for the single-region path (bytes). Above this
     // the buffer blows the cache budget; fall back to the per-panel M-axis path.

@@ -50,13 +50,17 @@ public static partial class BlasManaged
     // strategy == ForcePackBoth, so the forward FFN/QKV matmuls skipped them and capped
     // M-axis parallelism (512x1024x4096 -> mc=60/nc=512 -> numMB=9, ~9 of 16 cores).
     // With this on, the same shape gets nc widened to N + mc shrunk -> numMB=15, 4.9x -> 8.0x
-    // at 16 cores (measured). Default OFF: it's a hot path the code's own notes flag as
-    // regression-prone for multi-N shapes, and the dev box is too noisy to validate a flip —
-    // gated for the gemm-bench CI A/B (set =1 to enable; flip the default once CI on a
-    // many-core runner confirms no tuned-shape regression). Only affects the DisableAutotune
-    // path; direct ForcePackBoth callers are unchanged (they already get these optimizations).
+    // at 16 cores (measured). DEFAULT ON (opt-out AIDOTNET_GEMM_FORWARD_PACKBOTH=0): a
+    // min-of-many A/B across 10 shapes on a 32-core Zen2 box (squares 768/1152/2048, FFN-up
+    // [512,1024,4096] 16.0->9.05ms, FFN-down [512,4096,1024] 16.1->8.2ms, QKV, batched
+    // [2048,1024,4096], and the LM-head [512,768,50304]) shows it FASTER or NEUTRAL on every
+    // shape and never a regression — the huge-N LM head is correctly neutral because nc can't
+    // widen to N (numNB>1), so the wide-N path self-limits and falls back. The prior "too
+    // noisy to validate" concern was measuring the off-path SgemmTiled SmallM lever (which the
+    // forward never reaches); the PackBoth path here measures cleanly on min-of-many. Only
+    // affects the DisableAutotune path; direct ForcePackBoth callers already had these.
     private static readonly bool s_forwardPackBothBlocking =
-        System.Environment.GetEnvironmentVariable("AIDOTNET_GEMM_FORWARD_PACKBOTH") == "1";
+        System.Environment.GetEnvironmentVariable("AIDOTNET_GEMM_FORWARD_PACKBOTH") != "0";
 
     // #653 cache-blocking sweep hook: env overrides for the PackBoth Mc/Nc/Kc so the
     // cache-residency-optimal blocking can be found empirically (the MKL/BLIS tuning art).
