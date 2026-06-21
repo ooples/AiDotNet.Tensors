@@ -40,7 +40,7 @@ public static class GemmShapeHistogram
         }
     }
 
-    public sealed class Stat { public long Count; public long TicksTotal; }
+    public sealed class Stat { public long Count; public long TicksTotal; public long TicksMin = long.MaxValue; }
 
     /// <summary>Toggle recording. Initialized from AIDOTNET_GEMM_HISTOGRAM=1.</summary>
     public static bool Enabled = Environment.GetEnvironmentVariable("AIDOTNET_GEMM_HISTOGRAM") == "1";
@@ -53,6 +53,14 @@ public static class GemmShapeHistogram
         var stat = Stats.GetOrAdd(new Key(m, n, k, transA, transB, isFloat), static _ => new Stat());
         System.Threading.Interlocked.Increment(ref stat.Count);
         System.Threading.Interlocked.Add(ref stat.TicksTotal, elapsedTicks);
+        // Lock-free min update.
+        long prev = System.Threading.Volatile.Read(ref stat.TicksMin);
+        while (elapsedTicks < prev)
+        {
+            long was = System.Threading.Interlocked.CompareExchange(ref stat.TicksMin, elapsedTicks, prev);
+            if (was == prev) break;
+            prev = was;
+        }
     }
 
     public static void Clear() => Stats.Clear();
@@ -63,21 +71,23 @@ public static class GemmShapeHistogram
     /// </summary>
     public static string Report(int topN = 40)
     {
-        var rows = new List<(Key key, long count, double secs, double gflops)>();
+        var rows = new List<(Key key, long count, double secs, double gfMean, double gfBest)>();
         double tickToSec = 1.0 / Stopwatch.Frequency;
         foreach (var kv in Stats)
         {
             double secs = kv.Value.TicksTotal * tickToSec;
-            double flops = 2.0 * kv.Key.M * kv.Key.N * kv.Key.K * kv.Value.Count;
-            double gflops = secs > 0 ? flops / secs / 1e9 : 0;
-            rows.Add((kv.Key, kv.Value.Count, secs, gflops));
+            double flops1 = 2.0 * kv.Key.M * kv.Key.N * kv.Key.K;
+            double gfMean = secs > 0 ? flops1 * kv.Value.Count / secs / 1e9 : 0;
+            double minSecs = kv.Value.TicksMin * tickToSec;
+            double gfBest = minSecs > 0 ? flops1 / minSecs / 1e9 : 0;
+            rows.Add((kv.Key, kv.Value.Count, secs, gfMean, gfBest));
         }
         rows.Sort((x, y) => y.secs.CompareTo(x.secs));
         var sb = new StringBuilder();
         double totalSecs = 0; long totalCalls = 0;
         foreach (var r in rows) { totalSecs += r.secs; totalCalls += r.count; }
         sb.AppendLine($"=== GEMM shape histogram: {rows.Count} distinct shapes, {totalCalls} calls, {totalSecs:F2}s total ===");
-        sb.AppendLine($"{"m",6} {"n",6} {"k",6} tA tB dt {"calls",7} {"sec",8} {"%",5} {"GFLOP/s",9}");
+        sb.AppendLine($"{"m",6} {"n",6} {"k",6} tA tB dt {"calls",7} {"sec",8} {"%",5} {"GFmean",7} {"GFbest",7}");
         int shown = 0;
         foreach (var r in rows)
         {
@@ -86,7 +96,7 @@ public static class GemmShapeHistogram
             double pct = totalSecs > 0 ? 100 * r.secs / totalSecs : 0;
             sb.AppendLine($"{r.key.M,6} {r.key.N,6} {r.key.K,6} " +
                 $"{(r.key.TransA ? 'T' : '.'),2} {(r.key.TransB ? 'T' : '.'),2} {dt,2} " +
-                $"{r.count,7} {r.secs,8:F3} {pct,5:F1} {r.gflops,9:F1}");
+                $"{r.count,7} {r.secs,8:F3} {pct,5:F1} {r.gfMean,7:F0} {r.gfBest,7:F0}");
         }
         return sb.ToString();
     }
