@@ -23054,6 +23054,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 float invStd = 1f / MathF.Sqrt(fVar[b] + fEps);
                 float m = fMean[b];
                 int f = 0;
+#if NET5_0_OR_GREATER
                 if (Vector256.IsHardwareAccelerated && fs >= 8)
                 {
                     var vM = Vector256.Create(m);
@@ -23066,6 +23067,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         (Vector256.LoadUnsafe(ref fGradBeta[f]) + go).StoreUnsafe(ref fGradBeta[f]);
                     }
                 }
+#endif
                 for (; f < fs; f++)
                 {
                     float go = fGradOut[off + f];
@@ -23087,6 +23089,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 float sumGrad = 0f;
                 float sumGradX = 0f;
                 int f = 0;
+#if NET5_0_OR_GREATER
                 if (Vector256.IsHardwareAccelerated && fs >= 8)
                 {
                     var vM = Vector256.Create(m);
@@ -23101,6 +23104,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     sumGrad = Vector256.Sum(accGrad);
                     sumGradX = Vector256.Sum(accGradX);
                 }
+#endif
                 for (; f < fs; f++)
                 {
                     float scaledGrad = fGamma[f] * fGradOut[off + f];
@@ -23110,6 +23114,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
                 float scale = invStd * invFeatureSizeF;
                 int fw = 0;
+#if NET5_0_OR_GREATER
                 if (Vector256.IsHardwareAccelerated && fs >= 8)
                 {
                     var vM = Vector256.Create(m);
@@ -23127,6 +23132,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         res.StoreUnsafe(ref fGradInput[off + fw]);
                     }
                 }
+#endif
                 for (; fw < fs; fw++)
                 {
                     float normalized = (fInput[off + fw] - m) * invStd;
@@ -23869,6 +23875,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         float gammaAcc = 0f;
                         float betaAcc = 0f;
                         int s = 0;
+#if NET5_0_OR_GREATER
                         if (Vector256.IsHardwareAccelerated && spatialSize >= 8)
                         {
                             var vMean = Vector256.Create(groupMean);
@@ -23885,6 +23892,7 @@ public partial class CpuEngine : ITensorLevelEngine
                             gammaAcc = Vector256.Sum(accG);
                             betaAcc = Vector256.Sum(accB);
                         }
+#endif
                         for (; s < spatialSize; s++)
                         {
                             float go = fGradOut[chanOffset + s];
@@ -23917,6 +23925,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         int chanOffset = b * (channels * spatialSize) + channel * spatialSize;
                         float gammaC = fGamma[channel];
                         int s = 0;
+#if NET5_0_OR_GREATER
                         if (Vector256.IsHardwareAccelerated && spatialSize >= 8)
                         {
                             var vMean = Vector256.Create(groupMean);
@@ -23934,6 +23943,7 @@ public partial class CpuEngine : ITensorLevelEngine
                             sumGrad += Vector256.Sum(accGrad);
                             sumGradNorm += Vector256.Sum(accGradNorm);
                         }
+#endif
                         for (; s < spatialSize; s++)
                         {
                             float scaledGrad = gammaC * fGradOut[chanOffset + s];
@@ -23951,6 +23961,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         int chanOffset = b * (channels * spatialSize) + channel * spatialSize;
                         float gammaC = fGamma[channel];
                         int s = 0;
+#if NET5_0_OR_GREATER
                         if (Vector256.IsHardwareAccelerated && spatialSize >= 8)
                         {
                             var vMean = Vector256.Create(groupMean);
@@ -23968,6 +23979,7 @@ public partial class CpuEngine : ITensorLevelEngine
                                 res.StoreUnsafe(ref fGradInput[chanOffset + s]);
                             }
                         }
+#endif
                         for (; s < spatialSize; s++)
                         {
                             float normalized = (fInput[chanOffset + s] - groupMean) * invStd;
@@ -38061,6 +38073,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (gData is float[] gF && iData is float[] iF && result is float[] rF)
         {
             int i = 0;
+#if NET5_0_OR_GREATER
             if (Vector256.IsHardwareAccelerated)
             {
                 // sig = 1/(1+exp(-x)); deriv = sig + x*sig*(1-sig); out = g*deriv.
@@ -38077,6 +38090,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     (Vector256.LoadUnsafe(ref gF[i]) * deriv).StoreUnsafe(ref rF[i]);
                 }
             }
+#endif
             for (; i < rF.Length; i++)
             {
                 float x = iF[i];
@@ -38169,6 +38183,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (gData is float[] gF && iData is float[] iF && result is float[] rF)
         {
             int i = 0;
+#if NET5_0_OR_GREATER
             if (Vector256.IsHardwareAccelerated)
             {
                 var one = Vector256.Create(1f);
@@ -38179,6 +38194,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     (Vector256.LoadUnsafe(ref gF[i]) * sig).StoreUnsafe(ref rF[i]);
                 }
             }
+#endif
             for (; i < rF.Length; i++) { float x = iF[i]; rF[i] = gF[i] * (1f / (1f + MathF.Exp(-x))); }
         }
         else if (gData is double[] gD && iData is double[] iD && result is double[] rD)
