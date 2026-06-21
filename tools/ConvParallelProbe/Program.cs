@@ -161,17 +161,25 @@ internal static class Program
         double warm = sw.Elapsed.TotalMilliseconds;
 
         var times = new double[reps];
+        // #653: optionally run the forward inside a TensorArena scope (PyTorch-caching-allocator
+        // equivalent) — Reset() per rep recycles the prior iteration's intermediate arrays.
+        bool useArena = Environment.GetEnvironmentVariable("AIDOTNET_ARENA") == "1";
+        TensorArena arena = useArena ? TensorArena.Create() : null;
         using var meter = util ? ParallelUtilizationMeter.Start() : null;   // `using` disposes on exception paths too (#654 review)
+        // Warm the arena (first rep allocates; subsequent reps reuse) before the alloc window.
+        if (useArena) { arena.Reset(); yy = x0; for (int b = 0; b < blocks; b++) yy = blk(yy); }
         GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
         long allocStart = GC.GetAllocatedBytesForCurrentThread();
         for (int i = 0; i < reps; i++)
         {
+            if (useArena) arena.Reset();
             var s = Stopwatch.StartNew();
             yy = x0;
             for (int b = 0; b < blocks; b++) yy = blk(yy);
             s.Stop();
             times[i] = s.Elapsed.TotalMilliseconds;
         }
+        arena?.Dispose();
         long allocBytes = GC.GetAllocatedBytesForCurrentThread() - allocStart;
         string u = StopMeter(meter, maxdop);
         Array.Sort(times);
