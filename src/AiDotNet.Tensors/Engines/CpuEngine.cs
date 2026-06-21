@@ -14357,8 +14357,17 @@ public partial class CpuEngine : ITensorLevelEngine
     private static void TransposeFloatRowMajor(float[] src, float[] dst, int rows, int cols)
     {
         const int Blk = 32;
-        for (int r0 = 0; r0 < rows; r0 += Blk)
+        // Parallel over row-blocks: each block writes dst[c*rows + r] only for its own
+        // r-range, so the blocks' writes are disjoint -> bit-identical regardless of thread
+        // count (deterministicSafe). The serial blocked transpose was ~6% of a foundation-
+        // scale diffusion train step (it materialises gradKernelᵀ -> gradKernel after the
+        // #573 non-transposed backward-kernel GEMM). Self-gates to serial when already
+        // inside a parallel region.
+        int numRowBlocks = (rows + Blk - 1) / Blk;
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(
+            0, numRowBlocks, (long)rows * cols, rb =>
         {
+            int r0 = rb * Blk;
             int rMax = Math.Min(r0 + Blk, rows);
             for (int c0 = 0; c0 < cols; c0 += Blk)
             {
@@ -14370,7 +14379,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         dst[c * rows + r] = src[srcRow + c];
                 }
             }
-        }
+        }, deterministicSafe: true);
     }
 
     private static void BuildKConcatStackFloat(
