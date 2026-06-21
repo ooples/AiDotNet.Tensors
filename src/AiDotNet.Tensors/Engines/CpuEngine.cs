@@ -13451,6 +13451,22 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    // Hand a freshly-computed float[] kernel result back as a Tensor<T> WITHOUT the redundant
+    // float->T copy when T is float (the overwhelmingly common case). The float-path conv
+    // backward kernels own their result buffer (freshly allocated, not aliased), so there is
+    // no sharing hazard. The previous `new T[] + FromFloatSpan` was a full-tensor copy of the
+    // gradient on every backward call — pure per-op overhead at T=float. Centralised so the
+    // four conv-backward float paths (and any future float kernel) share one no-copy fast path.
+    private static Tensor<T> RentFloatResult<T>(int[] shape, float[] floatResult)
+    {
+        if (typeof(T) == typeof(float))
+            return TensorAllocator.Rent<T>(shape, (T[])(object)floatResult);
+        var ops = MathHelper.GetNumericOperations<T>();
+        var arr = new T[floatResult.Length];
+        ops.FromFloatSpan(new ReadOnlySpan<float>(floatResult), new Span<T>(arr));
+        return TensorAllocator.Rent<T>(shape, arr);
+    }
+
     public Tensor<T> Conv2DBackwardInput<T>(Tensor<T> gradOutput, Tensor<T> kernel, int[] inputShape, int[] stride, int[] padding, int[] dilation)
     {
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
@@ -13553,10 +13569,7 @@ public partial class CpuEngine : ITensorLevelEngine
                             outputHeight, outputWidth);
                     });
 
-                    var opsNi = MathHelper.GetNumericOperations<T>();
-                    var resultNi = new T[gradInputF.Length];
-                    opsNi.FromFloatSpan(new ReadOnlySpan<float>(gradInputF), new Span<T>(resultNi));
-                    return TensorAllocator.Rent<T>(inputShape, resultNi);
+                    return RentFloatResult<T>(inputShape, gradInputF);
                 }
                 finally
                 {
@@ -13606,10 +13619,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 finally { pool.Return(colBuf); }
             });
 
-            var ops2 = MathHelper.GetNumericOperations<T>();
-            var resultArr = new T[gradInputF.Length];
-            ops2.FromFloatSpan(new ReadOnlySpan<float>(gradInputF), new Span<T>(resultArr));
-            return TensorAllocator.Rent<T>(inputShape, resultArr);
+            return RentFloatResult<T>(inputShape, gradInputF);
         }
 
         // im2col + GEMM fast path for double — mirrors the float branch above
@@ -14622,10 +14632,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     }
                     TransposeFloatRowMajor(gradKernelT, gradKernelF, colH, outChannels);
 
-                    var opsKc = MathHelper.GetNumericOperations<T>();
-                    var resultKc = new T[gradKernelF.Length];
-                    opsKc.FromFloatSpan(new ReadOnlySpan<float>(gradKernelF), new Span<T>(resultKc));
-                    return TensorAllocator.Rent<T>(kernelShape, resultKc);
+                    return RentFloatResult<T>(kernelShape, gradKernelF);
                 }
                 finally
                 {
@@ -14689,10 +14696,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     gradKernelF[i] += lg[i];
             }
 
-            var ops2 = MathHelper.GetNumericOperations<T>();
-            var resultArr = new T[gradKernelF.Length];
-            ops2.FromFloatSpan(new ReadOnlySpan<float>(gradKernelF), new Span<T>(resultArr));
-            return TensorAllocator.Rent<T>(kernelShape, resultArr);
+            return RentFloatResult<T>(kernelShape, gradKernelF);
         }
 
         // im2col + GEMM-with-transpose fast path for double — paired with the
