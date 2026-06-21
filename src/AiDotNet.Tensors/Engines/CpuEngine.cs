@@ -38058,7 +38058,24 @@ public partial class CpuEngine : ITensorLevelEngine
         // as BCE backward (4× win measured there).
         if (gData is float[] gF && iData is float[] iF && result is float[] rF)
         {
-            for (int i = 0; i < rF.Length; i++)
+            int i = 0;
+            if (Vector256.IsHardwareAccelerated)
+            {
+                // sig = 1/(1+exp(-x)); deriv = sig + x*sig*(1-sig); out = g*deriv.
+                // FastExp256 (~1e-6 rel err, within float32 precision) — SiLU/Swish is in
+                // every diffusion ResBlock + many transformers, so the per-element scalar
+                // MathF.Exp here was a real per-train-step cost.
+                var one = Vector256.Create(1f);
+                int n = rF.Length;
+                for (; i + 8 <= n; i += 8)
+                {
+                    var x = Vector256.LoadUnsafe(ref iF[i]);
+                    var sig = one / (one + SimdKernels.FastExp256(-x));
+                    var deriv = sig + x * sig * (one - sig);
+                    (Vector256.LoadUnsafe(ref gF[i]) * deriv).StoreUnsafe(ref rF[i]);
+                }
+            }
+            for (; i < rF.Length; i++)
             {
                 float x = iF[i];
                 float sig = 1f / (1f + MathF.Exp(-x));
