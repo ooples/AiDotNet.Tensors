@@ -24,6 +24,16 @@ internal static class Program
             Console.Error.WriteLine("[probe] MachineKernelGemm.Enabled=false");
         }
 
+        // #653: force AutoTracer.ShouldRecord=false (the training / inference-without-compile hot
+        // path) so the end-to-end probes measure the recording-off fast path.
+        if (Environment.GetEnvironmentVariable("AIDOTNET_NO_AUTOTRACE") == "1")
+        {
+            typeof(CpuEngine).Assembly.GetType("AiDotNet.Tensors.Engines.Compilation.AutoTracer")
+                ?.GetProperty("Enabled", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public)
+                ?.SetValue(null, false);
+            Console.Error.WriteLine("[probe] AutoTracer.Enabled=false");
+        }
+
         if (args.Length > 0 && args[0] == "--allocbench") return RunAllocBench(eng, args);
         if (args.Length > 0 && args[0] == "--resblock") return RunResblock(eng, args);
         if (args.Length > 0 && args[0] == "--attnblock") return RunAttnBlock(eng, args);
@@ -152,6 +162,8 @@ internal static class Program
 
         var times = new double[reps];
         using var meter = util ? ParallelUtilizationMeter.Start() : null;   // `using` disposes on exception paths too (#654 review)
+        GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
+        long allocStart = GC.GetAllocatedBytesForCurrentThread();
         for (int i = 0; i < reps; i++)
         {
             var s = Stopwatch.StartNew();
@@ -160,11 +172,13 @@ internal static class Program
             s.Stop();
             times[i] = s.Elapsed.TotalMilliseconds;
         }
+        long allocBytes = GC.GetAllocatedBytesForCurrentThread() - allocStart;
         string u = StopMeter(meter, maxdop);
         Array.Sort(times);
         Console.WriteLine(
             $"ATTNBLOCK S={S} D={D} H={H} Dh={Dh} blocks={blocks} maxdop={maxdop} procs={Environment.ProcessorCount} " +
-            $"warmup_ms={warm:F1} median_ms={times[reps / 2]:F2} min_ms={times[0]:F2} max_ms={times[times.Length - 1]:F2}{u}");
+            $"warmup_ms={warm:F1} median_ms={times[reps / 2]:F2} min_ms={times[0]:F2} max_ms={times[times.Length - 1]:F2} " +
+            $"alloc_MB_per_fwd={allocBytes / 1048576.0 / reps:F3}{u}");
         return 0;
     }
 
