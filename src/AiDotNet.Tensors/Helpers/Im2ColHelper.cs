@@ -147,6 +147,102 @@ internal static class Im2ColHelper
     }
 
     /// <summary>
+    /// Column-blocked im2col for a single image (float): fills only the output rows
+    /// <paramref name="ohStartBlock"/>..<paramref name="ohEndBlock"/> into a compact
+    /// <c>[colH, ncBlock]</c> buffer where <c>ncBlock = (ohEndBlock-ohStartBlock)*outputW</c>
+    /// and the destination row stride equals <c>ncBlock</c> (column index for output
+    /// position (oh, ow) is <c>(oh-ohStartBlock)*outputW + ow</c>).
+    ///
+    /// This is the building block of the FUSED (implicit-GEMM) conv forward path: instead
+    /// of materialising the full <c>[colH, outputH*outputW]</c> im2col matrix (tens of MB
+    /// streamed to DRAM and re-read by the GEMM), the caller walks output-row blocks sized
+    /// so the small <c>[colH, ncBlock]</c> panel stays resident in cache — it is written
+    /// then immediately consumed by a per-block GEMM, eliminating the ~2x im2col DRAM
+    /// round-trip (the dominant non-compute cost of high-channel 3x3 convs) and the large
+    /// transient native-buffer allocation. Blocking on whole output ROWS (not flat columns)
+    /// keeps the stride=1 contiguous-memcpy fast path intact. Channel-parallel: each input
+    /// channel owns a disjoint <c>kernelH*kernelW</c>-row block, so no synchronisation.
+    /// Bit-identical to the full-matrix im2col over the same output columns.
+    /// </summary>
+    public static unsafe void Im2ColRowBlockFloat(
+        ReadOnlySpan<float> input,
+        Span<float> output,
+        int channels, int height, int width,
+        int kernelH, int kernelW,
+        int strideH, int strideW,
+        int padH, int padW,
+        int dilationH, int dilationW,
+        int outputH, int outputW,
+        int ohStartBlock, int ohEndBlock)
+    {
+        int kHW = kernelH * kernelW;
+        int ncBlock = (ohEndBlock - ohStartBlock) * outputW;
+        output.Slice(0, channels * kHW * ncBlock).Clear(); // padding handled once up front
+        bool fast = strideH == 1 && strideW == 1 && dilationH == 1 && dilationW == 1;
+        long work = (long)channels * kHW * ncBlock;
+        fixed (float* inP = input)
+        fixed (float* outP = output)
+        {
+            IntPtr inPtr = (IntPtr)inP;
+            IntPtr outPtr = (IntPtr)outP;
+            AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(
+                0, channels, work, c =>
+                {
+                    float* inputPtr = (float*)inPtr;
+                    float* outputPtr = (float*)outPtr;
+                    int channelOffset = c * height * width;
+                    int rowIdx = c * kHW;
+                    for (int kh = 0; kh < kernelH; kh++)
+                    {
+                        for (int kw = 0; kw < kernelW; kw++)
+                        {
+                            float* outRow = outputPtr + (long)rowIdx * ncBlock;
+                            if (fast)
+                            {
+                                int ohLo = Math.Max(ohStartBlock, padH - kh);
+                                int ohHi = Math.Min(ohEndBlock, height + padH - kh);
+                                int owStart = Math.Max(0, padW - kw);
+                                int owEnd = Math.Min(outputW, width + padW - kw);
+                                int validWidth = owEnd - owStart;
+                                if (validWidth > 0)
+                                {
+                                    for (int oh = ohLo; oh < ohHi; oh++)
+                                    {
+                                        int ih = oh + kh - padH;
+                                        int inputStart = channelOffset + ih * width + (owStart + kw - padW);
+                                        int outputStart = (oh - ohStartBlock) * outputW + owStart;
+                                        Buffer.MemoryCopy(
+                                            inputPtr + inputStart,
+                                            outRow + outputStart,
+                                            validWidth * sizeof(float),
+                                            validWidth * sizeof(float));
+                                    }
+                                }
+                            }
+                            else
+                            {
+                                for (int oh = ohStartBlock; oh < ohEndBlock; oh++)
+                                {
+                                    int ih = oh * strideH + kh * dilationH - padH;
+                                    int outBase = (oh - ohStartBlock) * outputW;
+                                    if (ih < 0 || ih >= height) continue; // row stays zero (cleared)
+                                    int inRow = channelOffset + ih * width;
+                                    for (int ow = 0; ow < outputW; ow++)
+                                    {
+                                        int iw = ow * strideW + kw * dilationW - padW;
+                                        if (iw >= 0 && iw < width)
+                                            outRow[outBase + ow] = inputPtr[inRow + iw];
+                                    }
+                                }
+                            }
+                            rowIdx++;
+                        }
+                    }
+                }, deterministicSafe: true);
+        }
+    }
+
+    /// <summary>
     /// Performs im2col on a single image (no batch dimension).
     /// Optimized row-by-row processing for better cache utilization and SIMD.
     /// </summary>
