@@ -38161,11 +38161,36 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = new T[gradOutput.Length];
         var gData = gradOutput.GetDataArray();
         var iData = input.GetDataArray();
-        for (int i = 0; i < result.Length; i++)
+        // softplus' = sigmoid(x) = 1/(1+exp(-x)). Float path had no primitive fast path at all
+        // (full per-element NumOps box/dispatch) — add float (vectorized, FastExp256 ~1e-6 rel
+        // err) + double primitive paths.
+        if (gData is float[] gF && iData is float[] iF && result is float[] rF)
         {
-            double x = numOps.ToDouble(iData[i]);
-            double sig = 1.0 / (1.0 + Math.Exp(-x));
-            result[i] = numOps.FromDouble(numOps.ToDouble(gData[i]) * sig);
+            int i = 0;
+            if (Vector256.IsHardwareAccelerated)
+            {
+                var one = Vector256.Create(1f);
+                int n = rF.Length;
+                for (; i + 8 <= n; i += 8)
+                {
+                    var sig = one / (one + SimdKernels.FastExp256(-Vector256.LoadUnsafe(ref iF[i])));
+                    (Vector256.LoadUnsafe(ref gF[i]) * sig).StoreUnsafe(ref rF[i]);
+                }
+            }
+            for (; i < rF.Length; i++) { float x = iF[i]; rF[i] = gF[i] * (1f / (1f + MathF.Exp(-x))); }
+        }
+        else if (gData is double[] gD && iData is double[] iD && result is double[] rD)
+        {
+            for (int i = 0; i < rD.Length; i++) { double x = iD[i]; rD[i] = gD[i] * (1.0 / (1.0 + Math.Exp(-x))); }
+        }
+        else
+        {
+            for (int i = 0; i < result.Length; i++)
+            {
+                double x = numOps.ToDouble(iData[i]);
+                double sig = 1.0 / (1.0 + Math.Exp(-x));
+                result[i] = numOps.FromDouble(numOps.ToDouble(gData[i]) * sig);
+            }
         }
         return new Tensor<T>(result, gradOutput.Shape.ToArray());
     }
