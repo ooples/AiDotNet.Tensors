@@ -24,8 +24,13 @@ namespace AiDotNet.Tensors.Helpers;
 /// </summary>
 public sealed class ParallelUtilizationMeter : IDisposable
 {
+    // Ref-counts active meters so overlapping windows don't disable each other's measurement and a
+    // constructor failure can't leave the global gauge stuck on. Only the 0→1 transition enables the
+    // scheduler gauge; only the →0 transition disables it.
+    private static int s_meterRefCount;
+
     private readonly Thread _sampler;
-    private readonly long _intervalTicks;
+    private readonly int _sleepMs;        // sampler sleep between samples, derived from sampleMicros
     private volatile bool _running;
     private long _sum;       // sum of per-sample active-worker counts (sampler-thread only)
     private long _count;     // number of samples taken
@@ -43,22 +48,37 @@ public sealed class ParallelUtilizationMeter : IDisposable
     private ParallelUtilizationMeter(int sampleMicros)
     {
         if (sampleMicros < 1) sampleMicros = 1;
-        _intervalTicks = Math.Max(1, Stopwatch.Frequency / 1_000_000L * sampleMicros);
+        // Thread.Sleep granularity is milliseconds, so the sub-ms request is rounded up to >= 1 ms.
+        _sleepMs = Math.Max(1, sampleMicros / 1000);
 
-        Engines.BlasManaged.Pool.CooperativeGemmScheduler.ResetUtilization();
-        Engines.BlasManaged.Pool.CooperativeGemmScheduler.MeasureUtilization = true;
-
-        _cpuAtStart = Process.GetCurrentProcess().TotalProcessorTime;
-        _wall = Stopwatch.StartNew();
-
-        _running = true;
-        _sampler = new Thread(SampleLoop)
+        // Enable the scheduler gauge only on the first concurrent meter (ref-counted).
+        if (Interlocked.Increment(ref s_meterRefCount) == 1)
         {
-            IsBackground = true,
-            Name = "AiDotNet-UtilSampler",
-            Priority = ThreadPriority.AboveNormal,
-        };
-        _sampler.Start();
+            Engines.BlasManaged.Pool.CooperativeGemmScheduler.ResetUtilization();
+            Engines.BlasManaged.Pool.CooperativeGemmScheduler.MeasureUtilization = true;
+        }
+
+        // If anything below throws, the ref-count must be undone so the gauge isn't stuck on.
+        try
+        {
+            _cpuAtStart = Process.GetCurrentProcess().TotalProcessorTime;
+            _wall = Stopwatch.StartNew();
+
+            _running = true;
+            _sampler = new Thread(SampleLoop)
+            {
+                IsBackground = true,
+                Name = "AiDotNet-UtilSampler",
+                Priority = ThreadPriority.AboveNormal,
+            };
+            _sampler.Start();
+        }
+        catch
+        {
+            if (Interlocked.Decrement(ref s_meterRefCount) == 0)
+                Engines.BlasManaged.Pool.CooperativeGemmScheduler.MeasureUtilization = false;
+            throw;
+        }
     }
 
     /// <summary>Start a new utilization measurement window.</summary>
@@ -68,18 +88,17 @@ public sealed class ParallelUtilizationMeter : IDisposable
     private void SampleLoop()
     {
         // Sleep (not busy-spin) between samples: a spin loop would itself burn ~1 core and
-        // inflate the process-CPU-time headline by ~1. Sleep(1) wakes often enough (hundreds
-        // of samples over a typical multi-hundred-ms window) to give a representative mean of
-        // the cooperative-pool gauge while consuming ~0 CPU. _intervalTicks is unused now but
-        // kept for callers that want finer control later.
-        _ = _intervalTicks;
+        // inflate the process-CPU-time headline by ~1. The interval honors the configured
+        // sampleMicros (rounded up to Thread.Sleep's ms granularity) and wakes often enough
+        // (hundreds of samples over a typical multi-hundred-ms window) to give a representative
+        // mean of the cooperative-pool gauge while consuming ~0 CPU.
         while (_running)
         {
             int a = Engines.BlasManaged.Pool.CooperativeGemmScheduler.ActiveWorkers;
             _sum += a;
             _count++;
             if (a > _peak) _peak = a;
-            Thread.Sleep(1);
+            Thread.Sleep(_sleepMs);
         }
     }
 
@@ -119,6 +138,8 @@ public sealed class ParallelUtilizationMeter : IDisposable
         _sampler.Join();
         _wall.Stop();
         _cpuAtStop = Process.GetCurrentProcess().TotalProcessorTime;
-        Engines.BlasManaged.Pool.CooperativeGemmScheduler.MeasureUtilization = false;
+        // Disable the gauge only when the last concurrent meter disposes (ref-counted).
+        if (Interlocked.Decrement(ref s_meterRefCount) == 0)
+            Engines.BlasManaged.Pool.CooperativeGemmScheduler.MeasureUtilization = false;
     }
 }

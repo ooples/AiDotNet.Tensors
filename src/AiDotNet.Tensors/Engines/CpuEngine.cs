@@ -2945,7 +2945,7 @@ public partial class CpuEngine : ITensorLevelEngine
                             bF.AsSpan(bOffset, matrixSizeB),
                             rF.AsSpan(resultOffset, matrixSizeResult),
                             m, k, n);
-                    });
+                    }, deterministicSafe: true);   // disjoint per-batch output regions (same guarantee as the Phase 2 path)
                 }
             }
             goto batchDone;
@@ -4291,10 +4291,13 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         if (typeof(T) == typeof(double))
         {
-            // SIMD double Swish via Span overload.
-            var srcSpan = ((ReadOnlyMemory<double>)AsDoubleMemory(input.Data)).Span;
-            var dstSpan = AsDoubleMemory(destination.Data).Span;
-            Simd.SimdKernels.Swish(srcSpan, dstSpan);
+            // Fused swish = x * sigmoid(x), fanned across cores for large activations (#653 — parity
+            // with the float path; the double path was a serial straggler).
+            var srcMemD = AsDoubleMemory(input.Data);
+            var dstMemD = AsDoubleMemory(destination.Data);
+            using var pinSrcD = srcMemD.Pin();
+            using var pinDstD = dstMemD.Pin();
+            ParallelSwish((double*)pinSrcD.Pointer, (double*)pinDstD.Pointer, input.Length);
             return;
         }
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -39546,6 +39549,41 @@ public partial class CpuEngine : ITensorLevelEngine
                 {
                     float* s = (float*)pIn + start;
                     float* d = (float*)pOut + start;
+                    Simd.SimdKernels.SigmoidUnsafe(s, d, count);
+                    Simd.SimdKernels.VectorMultiplyUnsafe(s, d, d, count);
+                }
+            });
+        }
+        else
+        {
+            Simd.SimdKernels.SigmoidUnsafe(src, dst, length);
+            Simd.SimdKernels.VectorMultiplyUnsafe(src, dst, dst, length);
+        }
+    }
+
+    // #653: double overload — mirrors ParallelSwish(float*) so the double activation path also fans
+    // across cores instead of being a serial straggler (parity with GELU/Tanh/Sigmoid double paths).
+    private static unsafe void ParallelSwish(double* src, double* dst, int length)
+    {
+        const int parallelThreshold = 131072; // 1MB of doubles — matches ParallelComputeBound(double).
+        if (length >= parallelThreshold)
+        {
+            int nChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, 16);
+            int chunkSize = (length + nChunks - 1) / nChunks;
+            chunkSize = (chunkSize + 31) & ~31;
+
+            IntPtr pIn = (IntPtr)src;
+            IntPtr pOut = (IntPtr)dst;
+            int totalLength = length;
+
+            Helpers.PersistentParallelExecutor.Instance.Execute(nChunks, chunk =>
+            {
+                int start = chunk * chunkSize;
+                int count = Math.Min(chunkSize, totalLength - start);
+                if (count > 0)
+                {
+                    double* s = (double*)pIn + start;
+                    double* d = (double*)pOut + start;
                     Simd.SimdKernels.SigmoidUnsafe(s, d, count);
                     Simd.SimdKernels.VectorMultiplyUnsafe(s, d, d, count);
                 }

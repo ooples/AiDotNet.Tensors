@@ -56,7 +56,7 @@ internal static class Program
         double warm = sw.Elapsed.TotalMilliseconds;
 
         var times = new double[reps];
-        var meter = util ? ParallelUtilizationMeter.Start() : null;
+        using var meter = util ? ParallelUtilizationMeter.Start() : null;   // `using` disposes on exception paths too (#654 review)
         for (int i = 0; i < reps; i++)
         {
             var s = Stopwatch.StartNew();
@@ -150,7 +150,7 @@ internal static class Program
         double warm = sw.Elapsed.TotalMilliseconds;
 
         var times = new double[reps];
-        var meter = util ? ParallelUtilizationMeter.Start() : null;
+        using var meter = util ? ParallelUtilizationMeter.Start() : null;   // `using` disposes on exception paths too (#654 review)
         for (int i = 0; i < reps; i++)
         {
             var s = Stopwatch.StartNew();
@@ -201,11 +201,11 @@ internal static class Program
             _         => () => eng.GELUInto(dst, src),
         };
 
-        run(); // warm
-        double warm = dst[0];
+        run(); // warmup (untimed)
+        double sink = dst[0];
 
         var times = new double[reps];
-        var meter = util ? ParallelUtilizationMeter.Start() : null;
+        using var meter = util ? ParallelUtilizationMeter.Start() : null;   // `using` disposes on exception paths too (#654 review)
         for (int i = 0; i < reps; i++)
         {
             var s = Stopwatch.StartNew();
@@ -217,7 +217,7 @@ internal static class Program
         Array.Sort(times);
         Console.WriteLine(
             $"ACT op={op} n={n} maxdop={maxdop} procs={Environment.ProcessorCount} " +
-            $"median_ms={times[reps / 2]:F3} min_ms={times[0]:F3} max_ms={times[times.Length - 1]:F3} (warm={warm:E1}){u}");
+            $"median_ms={times[reps / 2]:F3} min_ms={times[0]:F3} max_ms={times[times.Length - 1]:F3} (sink={sink:E1}){u}");
         return 0;
     }
 
@@ -246,10 +246,10 @@ internal static class Program
         var rhs = Rand(new[] { K, N }, rng);
 
         var o = eng.BatchMatMul(lhs, rhs); // warm
-        float warm = o[0];
+        float sink = o[0];
 
         var times = new double[reps];
-        var meter = util ? ParallelUtilizationMeter.Start() : null;
+        using var meter = util ? ParallelUtilizationMeter.Start() : null;   // `using` disposes on exception paths too (#654 review)
         for (int i = 0; i < reps; i++)
         {
             var s = Stopwatch.StartNew();
@@ -261,7 +261,7 @@ internal static class Program
         Array.Sort(times);
         Console.WriteLine(
             $"GEMM M={M} K={K} N={N} fma={(double)M * K * N:E1} maxdop={maxdop} procs={Environment.ProcessorCount} " +
-            $"median_ms={times[reps / 2]:F3} min_ms={times[0]:F3} max_ms={times[times.Length - 1]:F3} (warm={warm:E1}){u}");
+            $"median_ms={times[reps / 2]:F3} min_ms={times[0]:F3} max_ms={times[times.Length - 1]:F3} (sink={sink:E1}){u}");
         return 0;
     }
 
@@ -290,7 +290,7 @@ internal static class Program
         var lhs = Rand(new[] { M, K }, rng);
         var rhs = Rand(new[] { K, N }, rng);
         var o = eng.BatchMatMul(lhs, rhs); // warm
-        float warm = o[0];
+        float sink = o[0];
 
         enabledF.SetValue(null, true);
         resetM.Invoke(null, null);
@@ -306,7 +306,7 @@ internal static class Program
         Console.WriteLine(
             $"GEMMPROFILE M={M} K={K} N={N} reps={reps} total_ms={total:F1} GFLOPs={gflops:F1} | " +
             $"kernel_ms={kr:F1} ({100*kr/accounted:F0}%) packA_ms={pa:F1} ({100*pa/accounted:F0}%) " +
-            $"packB_ms={pb:F1} ({100*pb/accounted:F0}%) accounted_ms={accounted:F1} (warm={warm:E1})");
+            $"packB_ms={pb:F1} ({100*pb/accounted:F0}%) accounted_ms={accounted:F1} (sink={sink:E1})");
         return 0;
     }
 

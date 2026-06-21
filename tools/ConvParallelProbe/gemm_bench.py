@@ -48,8 +48,18 @@ SMALLM = [
 MIN_RE = re.compile(r"min_ms=([0-9.]+)")
 
 
-def run_probe(probe, m, k, n, maxdop, reps, flag, repeat):
-    """Return the min min_ms over `repeat` probe invocations for one flag value."""
+def fmt_ms(v):
+    """Format a min_ms value, or 'n/a' when the probe failed (None)."""
+    return f"{v:.3f}" if v is not None else "n/a"
+
+
+def fmt_ratio(v):
+    """Format a ratio/speedup, or 'n/a' for NaN (one side failed). NaN != NaN."""
+    return f"{v:.3f}" if v == v else "n/a"
+
+
+def run_probe_once(probe, m, k, n, maxdop, reps, flag):
+    """One probe invocation for one flag value; returns min_ms or None on failure."""
     env = dict(os.environ)
     env["AIDOTNET_DISABLE_GPU"] = "1"          # no OpenCL init stealing cores
     # The #653 forward-GEMM optimizations flip together: wide-nc/mc PackBoth blocking +
@@ -59,27 +69,38 @@ def run_probe(probe, m, k, n, maxdop, reps, flag, repeat):
     env["AIDOTNET_GEMM_SINGLE_REGION"] = str(flag)
     cmd = ["dotnet", probe, "--gemm", "--m", str(m), "--k", str(k), "--n", str(n),
            "--reps", str(reps), "--maxdop", str(maxdop)]
-    best = None
-    for _ in range(repeat):
-        out = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=900)
-        line = next((ln for ln in out.stdout.splitlines() if ln.startswith("GEMM ")), None)
-        if line is None:
-            sys.stderr.write(f"no GEMM line for {m}x{k}x{n} flag={flag}\n{out.stdout[-500:]}\n{out.stderr[-500:]}\n")
-            return None
-        match = MIN_RE.search(line)
-        if not match:
-            sys.stderr.write(f"no min_ms in: {line}\n")
-            return None
-        val = float(match.group(1))
-        best = val if best is None else min(best, val)
-    return best
+    out = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=900, check=False)
+    # Surface a non-zero exit (build/runtime failure) explicitly — otherwise it degrades into an
+    # ambiguous "no GEMM line" error and hides the real cause.
+    if out.returncode != 0:
+        sys.stderr.write(f"probe failed rc={out.returncode} for {m}x{k}x{n} flag={flag}\n"
+                         f"{out.stdout[-500:]}\n{out.stderr[-500:]}\n")
+        return None
+    line = next((ln for ln in out.stdout.splitlines() if ln.startswith("GEMM ")), None)
+    if line is None:
+        sys.stderr.write(f"no GEMM line for {m}x{k}x{n} flag={flag}\n{out.stdout[-500:]}\n{out.stderr[-500:]}\n")
+        return None
+    match = MIN_RE.search(line)
+    if not match:
+        sys.stderr.write(f"no min_ms in: {line}\n")
+        return None
+    return float(match.group(1))
 
 
 def bench(probe, shapes, maxdop, reps, repeat):
     rows = []
     for label, m, k, n in shapes:
-        off = run_probe(probe, m, k, n, maxdop, reps, 0, repeat)
-        on = run_probe(probe, m, k, n, maxdop, reps, 1, repeat)
+        off = None
+        on = None
+        # Interleave OFF/ON per repeat (not all-OFF-then-all-ON): slow machine-load drift on a
+        # shared CI runner then biases both flags equally instead of skewing the ON/OFF ratio.
+        for _ in range(repeat):
+            o0 = run_probe_once(probe, m, k, n, maxdop, reps, 0)
+            o1 = run_probe_once(probe, m, k, n, maxdop, reps, 1)
+            if o0 is not None:
+                off = o0 if off is None else min(off, o0)
+            if o1 is not None:
+                on = o1 if on is None else min(on, o1)
         ratio = (on / off) if (off and on) else float("nan")
         rows.append((label, m, k, n, off, on, ratio))
     return rows
@@ -113,7 +134,7 @@ def main():
         if not ok:
             failed.append(label)
         verdict = "ok" if ok else "**REGRESSION**"
-        lines.append(f"| {label} | {m}x{k}x{n} | {off:.3f} | {on:.3f} | {ratio:.3f} | {verdict} |")
+        lines.append(f"| {label} | {m}x{k}x{n} | {fmt_ms(off)} | {fmt_ms(on)} | {fmt_ratio(ratio)} | {verdict} |")
 
     lines += [
         "",
@@ -123,7 +144,8 @@ def main():
     ]
     for label, m, k, n, off, on, ratio in smallm:
         speedup = (off / on) if (off and on) else float("nan")
-        lines.append(f"| {label} | {m}x{k}x{n} | {off:.3f} | {on:.3f} | {ratio:.3f} | {speedup:.2f}x |")
+        speedup_str = f"{speedup:.2f}x" if speedup == speedup else "n/a"
+        lines.append(f"| {label} | {m}x{k}x{n} | {fmt_ms(off)} | {fmt_ms(on)} | {fmt_ratio(ratio)} | {speedup_str} |")
 
     lines += ["", ("### Result: PASS - no tuned-shape regression" if not failed
                    else f"### Result: FAIL - regressions: {', '.join(failed)}")]

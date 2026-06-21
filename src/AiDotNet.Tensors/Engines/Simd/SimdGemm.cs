@@ -1178,6 +1178,11 @@ internal static partial class SimdGemm
         long.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_GEMM_PARALLEL_MINWORK"), out var gpw) && gpw > 0
             ? gpw : ComputeParallelWorkThreshold();
 
+    // #653 Phase 1 parallel-work-threshold scaling constants (see ComputeParallelWorkThreshold).
+    private const long ParallelFmasPerCore = 256L * 1024;          // ~256K FMAs per woken core
+    private const long ParallelWorkFloor = 1L * 1024 * 1024;       // 1M FMAs — tiny GEMMs stay serial
+    private const long ParallelWorkCeiling = 4L * 1024 * 1024;     // 4M FMAs — dead-zone cap
+
     private static long ComputeParallelWorkThreshold()
     {
         // Total FMA work (m*k*n) above which a single SGEMM fans its m-tiles out across the
@@ -1195,9 +1200,9 @@ internal static partial class SimdGemm
         // the 1M floor keeps genuinely tiny GEMMs (per-head attention, 1x1 convs) serial so
         // they don't pay dispatch for nothing. Override with AIDOTNET_GEMM_PARALLEL_MINWORK.
         int cores = Math.Max(1, Environment.ProcessorCount);
-        long scaled = (256L * 1024) * cores;
-        if (scaled < 1L * 1024 * 1024) scaled = 1L * 1024 * 1024;
-        if (scaled > 4L * 1024 * 1024) scaled = 4L * 1024 * 1024;
+        long scaled = ParallelFmasPerCore * cores;
+        if (scaled < ParallelWorkFloor) scaled = ParallelWorkFloor;
+        if (scaled > ParallelWorkCeiling) scaled = ParallelWorkCeiling;
         return scaled;
     }
 
