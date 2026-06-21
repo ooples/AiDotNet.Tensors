@@ -23051,7 +23051,20 @@ public partial class CpuEngine : ITensorLevelEngine
                 int off = b * fs;
                 float invStd = 1f / MathF.Sqrt(fVar[b] + fEps);
                 float m = fMean[b];
-                for (int f = 0; f < fs; f++)
+                int f = 0;
+                if (Vector256.IsHardwareAccelerated && fs >= 8)
+                {
+                    var vM = Vector256.Create(m);
+                    var vInvStd = Vector256.Create(invStd);
+                    for (; f + 8 <= fs; f += 8)
+                    {
+                        var go = Vector256.LoadUnsafe(ref fGradOut[off + f]);
+                        var norm = (Vector256.LoadUnsafe(ref fInput[off + f]) - vM) * vInvStd;
+                        (Vector256.LoadUnsafe(ref fGradGamma[f]) + go * norm).StoreUnsafe(ref fGradGamma[f]);
+                        (Vector256.LoadUnsafe(ref fGradBeta[f]) + go).StoreUnsafe(ref fGradBeta[f]);
+                    }
+                }
+                for (; f < fs; f++)
                 {
                     float go = fGradOut[off + f];
                     float normalized = (fInput[off + f] - m) * invStd;
@@ -23071,7 +23084,22 @@ public partial class CpuEngine : ITensorLevelEngine
 
                 float sumGrad = 0f;
                 float sumGradX = 0f;
-                for (int f = 0; f < fs; f++)
+                int f = 0;
+                if (Vector256.IsHardwareAccelerated && fs >= 8)
+                {
+                    var vM = Vector256.Create(m);
+                    var accGrad = Vector256<float>.Zero;
+                    var accGradX = Vector256<float>.Zero;
+                    for (; f + 8 <= fs; f += 8)
+                    {
+                        var scaledGrad = Vector256.LoadUnsafe(ref fGamma[f]) * Vector256.LoadUnsafe(ref fGradOut[off + f]);
+                        accGrad += scaledGrad;
+                        accGradX += scaledGrad * (Vector256.LoadUnsafe(ref fInput[off + f]) - vM);
+                    }
+                    sumGrad = Vector256.Sum(accGrad);
+                    sumGradX = Vector256.Sum(accGradX);
+                }
+                for (; f < fs; f++)
                 {
                     float scaledGrad = fGamma[f] * fGradOut[off + f];
                     sumGrad += scaledGrad;
@@ -23079,13 +23107,31 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
 
                 float scale = invStd * invFeatureSizeF;
-                for (int f = 0; f < fs; f++)
+                int fw = 0;
+                if (Vector256.IsHardwareAccelerated && fs >= 8)
                 {
-                    float normalized = (fInput[off + f] - m) * invStd;
-                    float gradNorm = fGamma[f] * fGradOut[off + f];
+                    var vM = Vector256.Create(m);
+                    var vInvStd = Vector256.Create(invStd);
+                    var vFeat = Vector256.Create(featureSizeF);
+                    var vSumGrad = Vector256.Create(sumGrad);
+                    var vSumGradX = Vector256.Create(sumGradX);
+                    var vScale = Vector256.Create(scale);
+                    for (; fw + 8 <= fs; fw += 8)
+                    {
+                        var norm = (Vector256.LoadUnsafe(ref fInput[off + fw]) - vM) * vInvStd;
+                        var gradNorm = Vector256.LoadUnsafe(ref fGamma[fw]) * Vector256.LoadUnsafe(ref fGradOut[off + fw]);
+                        var term3 = norm * vInvStd * vSumGradX;
+                        var res = vScale * (vFeat * gradNorm - vSumGrad - term3);
+                        res.StoreUnsafe(ref fGradInput[off + fw]);
+                    }
+                }
+                for (; fw < fs; fw++)
+                {
+                    float normalized = (fInput[off + fw] - m) * invStd;
+                    float gradNorm = fGamma[fw] * fGradOut[off + fw];
                     float term1 = featureSizeF * gradNorm;
                     float term3 = normalized * invStd * sumGradX;
-                    fGradInput[off + f] = scale * (term1 - sumGrad - term3);
+                    fGradInput[off + fw] = scale * (term1 - sumGrad - term3);
                 }
             }
 
