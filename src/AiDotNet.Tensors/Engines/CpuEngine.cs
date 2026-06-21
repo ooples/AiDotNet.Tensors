@@ -2786,7 +2786,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     Simd.SimdGemm.Sgemm(aFloat, lda, transA, bFloat, ldb, transB, cFloat, m, k, n);
                 }
                 DifferentiableOps.RecordBinary("BatchMatMul", result, aOrig, bOrig, BackwardFunctions<T>.BatchMatMulBackward);
-                { var ca = a; var cb = b; AutoTracer.RecordOp("BatchMatMul", result, eng => eng.BatchMatMul(ca, cb)); }
+                if (AutoTracer.ShouldRecord) { var ca = a; var cb = b; AutoTracer.RecordOp("BatchMatMul", result, eng => eng.BatchMatMul(ca, cb)); }
                 return result;
             }
 
@@ -2796,7 +2796,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 if (MatrixMultiplyHelper.TryGemm(a.ReadOnlyData, 0, b.ReadOnlyData, 0, result.Data, 0, m, k, n))
                 {
                     DifferentiableOps.RecordBinary("BatchMatMul", result, aOrig, bOrig, BackwardFunctions<T>.BatchMatMulBackward);
-                    { var ca = a; var cb = b; AutoTracer.RecordOp("BatchMatMul", result, eng => eng.BatchMatMul(ca, cb)); }
+                    if (AutoTracer.ShouldRecord) { var ca = a; var cb = b; AutoTracer.RecordOp("BatchMatMul", result, eng => eng.BatchMatMul(ca, cb)); }
                     return result;
                 }
             }
@@ -2816,7 +2816,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var cSpanD = new Span<double>((double[])(object)rArrD, 0, m * n);
                 SimdGemm.Dgemm(aSpanD, bSpanD, cSpanD, m, k, n);
                 DifferentiableOps.RecordBinary("BatchMatMul", result, aOrig, bOrig, BackwardFunctions<T>.BatchMatMulBackward);
-                { var ca = a; var cb = b; AutoTracer.RecordOp("BatchMatMul", result, eng => eng.BatchMatMul(ca, cb)); }
+                if (AutoTracer.ShouldRecord) { var ca = a; var cb = b; AutoTracer.RecordOp("BatchMatMul", result, eng => eng.BatchMatMul(ca, cb)); }
                 return result;
             }
 
@@ -2848,7 +2848,7 @@ public partial class CpuEngine : ITensorLevelEngine
             });
             DifferentiableOps.RecordBinary("BatchMatMul", result, aOrig, bOrig,
                 BackwardFunctions<T>.BatchMatMulBackward);
-            { var ca = a; var cb = b; AutoTracer.RecordOp("BatchMatMul", result, eng => eng.BatchMatMul(ca, cb)); }
+            if (AutoTracer.ShouldRecord) { var ca = a; var cb = b; AutoTracer.RecordOp("BatchMatMul", result, eng => eng.BatchMatMul(ca, cb)); }
             return result;
         }
 
@@ -2982,7 +2982,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         DifferentiableOps.RecordBinary("BatchMatMul", result, aOrig, bOrig,
             BackwardFunctions<T>.BatchMatMulBackward);
-        { var ca = a; var cb = b; AutoTracer.RecordOp("BatchMatMul", result, eng => eng.BatchMatMul(ca, cb)); }
+        if (AutoTracer.ShouldRecord) { var ca = a; var cb = b; AutoTracer.RecordOp("BatchMatMul", result, eng => eng.BatchMatMul(ca, cb)); }
         return result;
     }
 
@@ -3148,7 +3148,7 @@ public partial class CpuEngine : ITensorLevelEngine
         DifferentiableOps.RecordBinary("TensorAdd", result, a, b, BackwardFunctions<T>.AddBackward);
 
         // Auto-tracer: record this op for future compilation
-        { var ca = a; var cb = b; AutoTracer.RecordOp("TensorAdd", result, eng => eng.TensorAdd(ca, cb)); }
+        if (AutoTracer.ShouldRecord) { var ca = a; var cb = b; AutoTracer.RecordOp("TensorAdd", result, eng => eng.TensorAdd(ca, cb)); }
 
         return result;
     }
@@ -33956,7 +33956,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         DifferentiableOps.RecordBinary("BatchMatMul", result, aOrig, bOrig,
             BackwardFunctions<T>.BatchMatMulBackward);
-        { var ca = a; var cb = b; AutoTracer.RecordOp("BatchMatMul", result, eng => eng.BatchMatMul(ca, cb)); }
+        if (AutoTracer.ShouldRecord) { var ca = a; var cb = b; AutoTracer.RecordOp("BatchMatMul", result, eng => eng.BatchMatMul(ca, cb)); }
         return result;
     }
 
