@@ -105,8 +105,24 @@ public sealed class TensorCodecOptions
     /// <summary>Phase 4.3: Merge consecutive pointwise ops into fewer dispatch steps.</summary>
     public bool EnablePointwiseFusion { get; set; } = true;
 
-    /// <summary>Phase 4.5: Precompute static subgraphs at compile time.</summary>
-    public bool EnableConstantFolding { get; set; } = true;
+    /// <summary>
+    /// Phase 4.5: Precompute static subgraphs at compile time. OFF by default.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="ConstantFoldingPass"/> evaluates a constant subgraph by calling the step's Execute AT
+    /// COMPILE TIME, writing into the step's output buffer (a graph tensor) and dropping the step. That
+    /// makes building the compiled plan MUTATE the source graph's tensors — which breaks the verify-then-
+    /// trust inference gate: the gate runs the eager forward and the compiled candidate over the SAME graph
+    /// to compare them, so a compile-time write into a shared/persistent tensor corrupts the eager reference
+    /// and the eager fallback. Reproduced as non-deterministic cross-attention diffusion inference
+    /// (AiDotNet AudioLDM/AuraFlow Predict_ShouldBeDeterministic with compiled inference enabled): the
+    /// folded constant subgraph the cross-attention path introduces poisoned the eager output (the 3.19-vs-
+    /// 3.55 divergence). Disabling it restores determinism with zero measurable perf loss (it fires rarely
+    /// in real graphs — almost every op transitively depends on the model input or a weight). Re-enable only
+    /// after the pass folds into a PRIVATE buffer and rewires consumers, so compilation has no graph side
+    /// effects (tracked as the constant-folding-isolation follow-up).
+    /// </remarks>
+    public bool EnableConstantFolding { get; set; }
 
     /// <summary>Phase 6.2: Deduplicate identical computations across layers.</summary>
     public bool EnableForwardCSE { get; set; } = true;
