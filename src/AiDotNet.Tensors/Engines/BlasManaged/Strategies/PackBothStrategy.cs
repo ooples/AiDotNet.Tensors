@@ -166,6 +166,48 @@ internal static class PackBothStrategy
 
             // Pin a, b, c for the duration of the parallel region. Both paths use
             // unsafe pointer access from worker threads.
+            // N-axis private-B path: wide-N moderate-M FP32, m%mr==0, enough N-blocks to fan
+            // out, no pre-pack/workspace/transpose. Each thread owns an N-block with a private
+            // L2-resident B — beats the M-axis shared-B path's L3 contention on these shapes.
+            // N-axis uses its OWN L2-sized Nc (the autotune may have widened nc to span N for
+            // A-pack-once, which leaves 1 N-block — no fan-out). Target the Kc×Nc B-block at
+            // ~half L2 (256 KB) so each thread's private B stays L2-resident.
+            int ncN = nc;
+            {
+                int l2Target = 256 * 1024 / (Math.Max(1, kc) * sizeof(float));
+                ncN = Math.Max(nr, (l2Target / nr) * nr);
+                ncN = Math.Min(ncN, ((n + nr - 1) / nr) * nr);
+            }
+            int numNBlocksN = (n + ncN - 1) / ncN;
+            int effProcs = Math.Min(procs, Environment.ProcessorCount);
+            bool useNAxis = !s_disableNAxis
+                && MachineKernelGemm.IsFp32PanelAvailable
+                && typeof(T) == typeof(float)
+                && !transA && !transB
+                && options.PackedA is null && options.PackedB is null
+                && (m % mr) == 0 && m >= mr
+                // Large K makes the shared-A (m×k) re-read per N-block dominate (measured: N-axis
+                // regresses ffn-big k=3456 −17% at low thread count but wins ffn-up k=1536 +27%,
+                // reaching 91% of OpenBLAS). Cap K so the shared-A re-read stays cheap.
+                && k <= 2048
+                && numNBlocksN >= 2 && numNBlocksN >= Math.Min(4, effProcs)
+                && options.Epilogue.Activation == AiDotNet.Tensors.Engines.FusedActivationType.None
+                && options.Epilogue.BiasN.IsEmpty && options.Epilogue.SkipMxN.IsEmpty;
+            if (useNAxis)
+            {
+                fixed (T* aPtrN = a)
+                fixed (T* bPtrN = b)
+                fixed (T* cPtrN = c)
+                {
+                    RunNAxisParallelUnsafe(
+                        (float*)aPtrN, a.Length, lda,
+                        (float*)bPtrN, b.Length, ldb,
+                        (float*)cPtrN, c.Length, ldc,
+                        m, n, k, mc, ncN, kc, mr, nr);
+                }
+                return;
+            }
+
             fixed (T* aPtr = a)
             fixed (T* bPtr = b)
             fixed (T* cPtr = c)
@@ -791,6 +833,128 @@ internal static class PackBothStrategy
         {
             System.Buffers.ArrayPool<byte>.Shared.Return(packBArr);
         }
+    }
+
+    // Route wide-N moderate-M float GEMMs to the N-axis private-B path. Test-only toggle.
+    internal static bool s_disableNAxis;
+
+    /// <summary>
+    /// N-axis-parallel path (FP32 panel kernel): packs ALL of A once into a shared read-only
+    /// buffer, then parallelises over N-blocks — each thread packs its OWN B-block into a
+    /// PRIVATE per-thread buffer (its L2) and computes all M for that N-block with the panel
+    /// kernel. This is the OpenBLAS macro-loop: no shared-L3 B contention (each thread's B is
+    /// private) AND no redundant B-packing (each N-block's B packed exactly once) — the two
+    /// failure modes of the M-axis shared-B path and the 2D grid respectively. Gated to
+    /// m%mr==0 float (the M-tail-free case, e.g. FFN m=384); other shapes use the M-axis path.
+    /// Bit-identical: each C[ir,jc] tile reduces over k in ascending K-panel order; jc blocks
+    /// own disjoint C columns so no cross-thread write sync.
+    /// </summary>
+    private static unsafe void RunNAxisParallelUnsafe(
+        float* aPtr, int aLen, int lda,
+        float* bPtr, int bLen, int ldb,
+        float* cPtr, int cLen, int ldc,
+        int m, int n, int k, int mc, int nc, int kc, int mr, int nr)
+    {
+        int numKPanels = (k + kc - 1) / kc;
+        int numNBlocks = (n + nc - 1) / nc;
+        int numMr = m / mr; // m % mr == 0 guaranteed by caller
+
+        // ── Pack ALL of A once (shared, read-only). Layout: [K-panel][Mr-stripe][Kc × Mr]. ──
+        // Panel pc occupies numMr * effKc * mr floats; pc panels are laid end to end with a
+        // fixed per-panel stride of numMr * kc * mr so a worker can index (pc, ir) directly.
+        int aPanelStride = numMr * kc * mr;
+        long packAElems = (long)numKPanels * aPanelStride;
+        var packAArr = System.Buffers.ArrayPool<float>.Shared.Rent((int)packAElems);
+        try
+        {
+            for (int pIdx = 0; pIdx < numKPanels; pIdx++)
+            {
+                int pc = pIdx * kc;
+                int effKc = Math.Min(kc, k - pc);
+                // PackA writes [Mr-stripe][effKc × mr] (mc=m → all stripes).
+                Avx2Pack.PackA<float>(
+                    new ReadOnlySpan<float>(aPtr + pc, aLen - pc), lda, false,
+                    packAArr.AsSpan(pIdx * aPanelStride, numMr * effKc * mr),
+                    mc: m, kc: effKc, mr);
+            }
+
+            nint aPackAddr = 0, bAddr = (nint)bPtr, cAddr = (nint)cPtr;
+            fixed (float* paBase = packAArr) { aPackAddr = (nint)paBase;
+
+            int kcL = kc, ncL = nc, nrL = nr, mrL = mr, ldbL = ldb, ldcL = ldc;
+            int numKPanelsL = numKPanels, numMrL = numMr, aPanelStrideL = aPanelStride;
+            int kL = k, nL = n, bLenL = bLen, cLenL = cLen;
+            long totalWork = (long)m * n * k * 2;
+
+            CpuParallelSettings.ParallelForOrSerial(0, numNBlocks, totalWork, jcIdx =>
+            {
+                int jc = jcIdx * ncL;
+                int effNc = Math.Min(ncL, nL - jc);
+                int njrFull = effNc / nrL;
+                int nrTail = effNc - njrFull * nrL;
+                int packedNc = ((effNc + nrL - 1) / nrL) * nrL;
+
+                // Private per-thread packed-B for this N-block: [K-panel][Kc × packedNc].
+                int bPanelStride = kcL * packedNc;
+                byte[] packBArr = System.Buffers.ArrayPool<byte>.Shared.Rent(numKPanelsL * bPanelStride * sizeof(float));
+                try
+                {
+                    float* pa = (float*)aPackAddr;
+                    float* bb = (float*)bAddr;
+                    float* cc = (float*)cAddr;
+                    var packBSpan = MemoryMarshal.Cast<byte, float>(packBArr.AsSpan());
+                    int numStripes = (effNc + nrL - 1) / nrL;
+
+                    for (int pIdx = 0; pIdx < numKPanelsL; pIdx++)
+                    {
+                        int pc = pIdx * kcL;
+                        int effKc = Math.Min(kcL, kL - pc);
+                        Avx2Pack.PackBStripeRange<float>(
+                            new ReadOnlySpan<float>(bb + pc * ldbL + jc, bLenL - (pc * ldbL + jc)), ldbL, false,
+                            packBSpan.Slice(pIdx * bPanelStride, effKc * packedNc),
+                            0, numStripes, effNc, effKc, nrL);
+                    }
+
+                    // Compute: for each K-panel (ascending → correct C accumulation), each
+                    // Mr-block does one chunked panel call over the N-block's full tiles + tail.
+                    for (int pIdx = 0; pIdx < numKPanelsL; pIdx++)
+                    {
+                        int pc = pIdx * kcL;
+                        int effKc = Math.Min(kcL, kL - pc);
+                        var bPanel = packBSpan.Slice(pIdx * bPanelStride, effKc * packedNc);
+                        for (int ir = 0; ir < numMrL; ir++)
+                        {
+                            var aPanel = new ReadOnlySpan<float>(pa + pIdx * aPanelStrideL + ir * effKc * mrL, effKc * mrL);
+                            int cOff = (ir * mrL) * ldcL + jc;
+                            if (njrFull > 0)
+                            {
+                                for (int jb = 0; jb < njrFull; jb += MaxPanelTiles)
+                                {
+                                    int chunk = Math.Min(MaxPanelTiles, njrFull - jb);
+                                    MachineKernelGemm.RunPanelFp32(
+                                        aPanel,
+                                        bPanel.Slice(jb * effKc * nrL, chunk * effKc * nrL),
+                                        new Span<float>(cc + cOff + jb * nrL, cLenL - (cOff + jb * nrL)),
+                                        ldcL, effKc, chunk);
+                                }
+                            }
+                            if (nrTail > 0)
+                            {
+                                int jrTail = njrFull * nrL;
+                                DispatchMicrokernelWithTail<float>(
+                                    aPanel,
+                                    bPanel.Slice(njrFull * effKc * nrL, effKc * nrL),
+                                    new Span<float>(cc + cOff + jrTail, cLenL - (cOff + jrTail)),
+                                    ldcL, effKc, mrL, nrL, nrTail);
+                            }
+                        }
+                    }
+                }
+                finally { System.Buffers.ArrayPool<byte>.Shared.Return(packBArr); }
+            }, deterministicSafe: true); // N-axis split: disjoint C columns, fixed-order K reduction
+            }
+        }
+        finally { System.Buffers.ArrayPool<float>.Shared.Return(packAArr); }
     }
 
     /// <summary>
