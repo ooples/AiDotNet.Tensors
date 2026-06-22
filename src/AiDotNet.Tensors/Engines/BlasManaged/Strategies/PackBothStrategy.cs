@@ -38,6 +38,15 @@ internal static class PackBothStrategy
     private static readonly bool s_trace =
         System.Environment.GetEnvironmentVariable("AIDOTNET_GEMM_TRACE") == "1";
 
+    // A/B toggle for the FP32 6×16 machine-code panel fast path (one asm call per M-block
+    // vs per-tile managed dispatch). Test-only; default off = panel ON.
+    internal static bool s_disablePanel;
+
+    // Max Nr=16-wide tiles per machine-code panel call. Bounds each asm call's B/C working
+    // set — a single call over a very wide panel (e.g. 384 tiles at n=6144) regresses vs
+    // chunks of ~256, while chunking still amortizes per-tile dispatch. Settable for sweeps.
+    internal static int MaxPanelTiles = 256;
+
     // #653 single-persistent-region path (DEFAULT ON, opt-out AIDOTNET_GEMM_SINGLE_REGION=0).
     // The M-axis RunParallelUnsafe re-dispatches the parallel region (and barriers) once per
     // (jc, pc) macro-tile. For the wide-nc forward case (numNB==1) that's one barriered
@@ -696,8 +705,54 @@ internal static class PackBothStrategy
                     Span<T> activePackB = MemoryMarshal.Cast<byte, T>(
                         packBArr_cap.AsSpan(packBAlignedOffset_cap, packedBByteCount_cap));
 
-                    // ── Inner microkernel loop (jr, ir) ────────────────────────────────
+                    // ── Inner microkernel loop ─────────────────────────────────────────
                     long _krStart = PackBothProfiler.Enabled ? Stopwatch.GetTimestamp() : 0L;
+                    int njrFull = effectiveNc_cap / nr;          // full Nr-wide tiles
+                    int nrTail = effectiveNc_cap - njrFull * nr; // partial-N remainder
+                    // FP32 6×16 MACHINE-CODE PANEL fast path: one hand-emitted asm call per 6-row
+                    // block processes ALL its full-Nr tiles (A reused, B streamed, N-loop in asm),
+                    // eliminating the per-tile dispatch + re-prologue that caps in-context
+                    // throughput — the OpenBLAS macro-kernel granularity. Bit-identical to the
+                    // per-tile loop (MachineKernelPanelTests). Partial-N tail keeps the generic
+                    // tail dispatch. Gated to the live (non-pre-packed) Auto path.
+                    bool mcPanel = !s_disablePanel && typeof(T) == typeof(float)
+                        && mr == 6 && nr == 16 && njrFull > 0
+                        && MachineKernelGemm.IsFp32PanelAvailable;
+                    if (mcPanel)
+                    {
+                        int njrBytesA = effectiveKc_cap * mr;
+                        for (int ir = 0; ir < effectiveMc; ir += mr)
+                        {
+                            if (ir + mr > effectiveMc) break;
+                            int packedAStripeOff = (ir / mr) * effectiveKc_cap * mr;
+                            var aPanel = MemoryMarshal.Cast<T, float>(activePackA.Slice(packedAStripeOff, njrBytesA));
+                            // Chunk the N-tiles per asm call: one giant panel call (e.g. 384 tiles
+                            // for n=6144) regresses vs ~256 (the single call's B/C working set
+                            // spills cache); chunking keeps each call's footprint bounded while
+                            // still amortizing dispatch over MaxPanelTiles tiles.
+                            for (int jb = 0; jb < njrFull; jb += MaxPanelTiles)
+                            {
+                                int chunk = Math.Min(MaxPanelTiles, njrFull - jb);
+                                int cPanelOff = (ic + ir) * ldc + (jc_cap + jb * nr);
+                                MachineKernelGemm.RunPanelFp32(
+                                    aPanel,
+                                    MemoryMarshal.Cast<T, float>(activePackB.Slice(jb * effectiveKc_cap * nr, chunk * effectiveKc_cap * nr)),
+                                    MemoryMarshal.Cast<T, float>(new Span<T>((T*)cPtrInt + cPanelOff, cLen - cPanelOff)),
+                                    ldc, effectiveKc_cap, chunk);
+                            }
+                            if (nrTail > 0)
+                            {
+                                int jrTail = njrFull * nr;
+                                int cTileOff = (ic + ir) * ldc + (jc_cap + jrTail);
+                                DispatchMicrokernelWithTail<T>(
+                                    activePackA.Slice(packedAStripeOff, effectiveKc_cap * mr),
+                                    activePackB.Slice(njrFull * effectiveKc_cap * nr, effectiveKc_cap * nr),
+                                    new Span<T>((T*)cPtrInt + cTileOff, cLen - cTileOff),
+                                    ldc, effectiveKc_cap, mr, nr, nrTail);
+                            }
+                        }
+                    }
+                    else
                     for (int jr = 0; jr < effectiveNc_cap; jr += nr)
                     {
                         // Partial-N tile on the last jr iteration when effectiveNc % nr != 0.

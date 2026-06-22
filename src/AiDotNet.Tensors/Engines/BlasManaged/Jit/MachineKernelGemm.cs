@@ -69,9 +69,49 @@ internal static class MachineKernelGemm
     private static bool UseAvx512Fp32 => EnableAvx512 && Avx512F.IsSupported && TryInitAvx512Fp32();
 
     private static readonly object _lock = new();
-    private static bool _tried64, _tried32, _triedZ64, _triedZ32;
-    private static ExecutableMemory? _mem64, _mem32, _memZ64, _memZ32; // kept alive for the process
-    private static nint _kern64, _kern32, _kernZ64, _kernZ32;
+    private static bool _tried64, _tried32, _triedZ64, _triedZ32, _triedPanel32;
+    private static ExecutableMemory? _mem64, _mem32, _memZ64, _memZ32, _memPanel32; // kept alive for the process
+    private static nint _kern64, _kern32, _kernZ64, _kernZ32, _kernPanel32;
+
+    /// <summary>True when the FP32 6×16 PANEL kernel is usable on this process.</summary>
+    internal static bool IsFp32PanelAvailable => Enabled && TryInitPanel32();
+
+    private static bool TryInitPanel32()
+    {
+        if (_triedPanel32) return _kernPanel32 != 0;
+        lock (_lock)
+        {
+            if (_triedPanel32) return _kernPanel32 != 0;
+            _triedPanel32 = true;
+            if (!PlatformOk()) return false;
+            try
+            {
+                byte[] code = IsWindows
+                    ? MachineCodeFmaKernel.EmitFp32_6x16_PanelWindows()
+                    : MachineCodeFmaKernel.EmitFp32_6x16_PanelSysV();
+                _memPanel32 = ExecutableMemory.TryAllocate(code);
+                if (_memPanel32 is not null) _kernPanel32 = _memPanel32.Pointer;
+            }
+            catch { _memPanel32 = null; _kernPanel32 = 0; }
+            return _kernPanel32 != 0;
+        }
+    }
+
+    /// <summary>
+    /// Run the FP32 6×16 panel kernel: C[0..6, 0..njr·16] += packedA[Kc×6] · packedB[njr×Kc×16]
+    /// over kc K-steps, looping the Nr=16 tiles internally. C is read-modify-write (pre-zero for
+    /// a fresh result). Caller guarantees the panel kernel is available (IsFp32PanelAvailable).
+    /// </summary>
+    internal static unsafe void RunPanelFp32(
+        ReadOnlySpan<float> packedA, ReadOnlySpan<float> packedB,
+        Span<float> c, int ldc, int kc, int njr)
+    {
+        var kern = (delegate* unmanaged<float*, float*, float*, long, long, long, void>)_kernPanel32;
+        fixed (float* pa = packedA)
+        fixed (float* pb = packedB)
+        fixed (float* pc = c)
+            kern(pa, pb, pc, ldc, kc, njr);
+    }
 
     private static bool IsWindows => RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
 
@@ -309,6 +349,10 @@ internal static class MachineKernelGemm
     /// <summary>net471 has no x86 intrinsics / function pointers — always defer to managed.</summary>
     internal static bool IsFp64Available => false;
     internal static bool IsFp32Available => false;
+    internal static bool IsFp32PanelAvailable => false;
+    internal static void RunPanelFp32(
+        ReadOnlySpan<float> packedA, ReadOnlySpan<float> packedB,
+        Span<float> c, int ldc, int kc, int njr) { }
     internal static int ActiveFp64Nr => Fp64Nr;
     internal static int ActiveFp32Nr => Fp32Nr;
 

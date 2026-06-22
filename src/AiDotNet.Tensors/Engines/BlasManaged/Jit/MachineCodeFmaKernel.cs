@@ -162,6 +162,135 @@ internal static class MachineCodeFmaKernel
         return asm.ToArray();
     }
 
+    // ── FP32 6×16 PANEL kernel ──────────────────────────────────────────────────
+    // Processes a whole 6-row × (njr·16)-col C block in ONE call: the 6×Kc packed-A
+    // block is read once and reused across all Nr=16 tiles; each Kc×16 packed-B stripe
+    // is streamed once. This is the OpenBLAS-style macro-kernel granularity — looping
+    // the N-tiles INSIDE the asm kernel eliminates the per-tile managed dispatch +
+    // re-prologue that caps the in-context throughput. Bit-identical to invoking the
+    // single-tile kernel njr times (same K-reduction order, disjoint C columns).
+    //
+    // Signature: void(float* packedA, float* packedB, float* c, long ldc, long kc, long njr)
+    //   Windows: rcx=A, rdx=B, r8=c, r9=ldc, [rsp+0x28]=kc, [rsp+0x30]=njr.
+    //   SysV:    rdi=A, rsi=B, rdx=c, rcx=ldc, r8=kc, r9=njr.
+    // The inner K-loop advances rdx by exactly kc·16·4 = one packed-B stripe, so after
+    // each tile rdx already points at the next stripe — no stride arithmetic needed. A
+    // is reset to its base each tile; C advances by one 16-float tile (64 bytes).
+
+    internal static byte[] EmitFp32_6x16_PanelWindows()
+    {
+        const int RCX = 1, R10 = 10, RAX = 0, RSI = 6, R12 = 12, R13 = 13, R9 = 9, RSP = 4;
+        var asm = new X64Assembler();
+        // Load stack args BEFORE moving rsp (Windows: 5th arg @ +0x28, 6th @ +0x30).
+        asm.MovRegFromRsp(R10, 0x28);  // r10 = kc
+        asm.MovRegFromRsp(RAX, 0x30);  // rax = njr
+        // Preserve nonvolatile rsi, r12, r13 (used as A-base / kc / njr-counter).
+        asm.PushReg(RSI); asm.PushReg(R12); asm.PushReg(R13);
+        // Frame + save nonvolatile xmm6–15 (the body uses ymm6–15).
+        asm.SubRsp(0xA0);
+        for (int i = 0; i < 10; i++) asm.VmovupsXmmStoreD32(RSP, i * 0x10, 6 + i);
+        // Outer state.
+        asm.MovRegReg(RSI, RCX);   // rsi = A base
+        asm.MovRegReg(R12, R10);   // r12 = kc
+        asm.MovRegReg(R13, RAX);   // r13 = njr counter
+        asm.LeaRaxIndexScale4(R9); // rax = ldc*4 (row stride bytes) — constant across tiles
+
+        EmitPanelLoop_Fp32_6x16(asm);
+
+        for (int i = 0; i < 10; i++) asm.VmovupsXmmLoadD32(6 + i, RSP, i * 0x10);
+        asm.AddRsp(0xA0);
+        asm.PopReg(R13); asm.PopReg(R12); asm.PopReg(RSI);
+        asm.Vzeroupper(); asm.Ret();
+        return asm.ToArray();
+    }
+
+    internal static byte[] EmitFp32_6x16_PanelSysV()
+    {
+        const int RCX = 1, RDX = 2, R8 = 8, R9 = 9, R10 = 10, RAX = 0, RSI = 6, RDI = 7, R12 = 12, R13 = 13;
+        var asm = new X64Assembler();
+        // Shuffle SysV args (rdi=A,rsi=B,rdx=C,rcx=ldc,r8=kc,r9=njr) into the body layout
+        // (rcx=A,rdx=B,r8=C,r9=ldc,r10=kc,rax=njr). Order avoids clobbering a live source.
+        asm.MovRegReg(RAX, R9);    // rax = njr
+        asm.MovRegReg(R10, R8);    // r10 = kc
+        asm.MovRegReg(R9, RCX);    // r9 = ldc (rcx was ldc)
+        asm.MovRegReg(R8, RDX);    // r8 = C   (rdx was C)
+        asm.MovRegReg(RDX, RSI);   // rdx = B
+        asm.MovRegReg(RCX, RDI);   // rcx = A
+        // Preserve nonvolatile r12, r13 (rsi is volatile on SysV — used freely as A-base).
+        asm.PushReg(R12); asm.PushReg(R13);
+        asm.MovRegReg(RSI, RCX);   // rsi = A base
+        asm.MovRegReg(R12, R10);   // r12 = kc
+        asm.MovRegReg(R13, RAX);   // r13 = njr
+        asm.LeaRaxIndexScale4(R9); // rax = ldc*4
+
+        EmitPanelLoop_Fp32_6x16(asm);
+
+        asm.PopReg(R13); asm.PopReg(R12);
+        asm.Vzeroupper(); asm.Ret();
+        return asm.ToArray();
+    }
+
+    /// <summary>Register-level FP32 6×16 panel loop. Assumes rsi=A-base, r12=kc, r13=njr,
+    /// rax=ldc*4 (row stride bytes), r8=C, r9=ldc; clobbers ymm0–15, rcx, rdx, r10, r11,
+    /// advances r8/r13/rdx; rsi/r12/rax preserved across iterations. ABI-agnostic.</summary>
+    private static void EmitPanelLoop_Fp32_6x16(X64Assembler asm)
+    {
+        const int RCX = 1, RDX = 2, R8 = 8, R10 = 10, R11 = 11, RAX = 0, RSI = 6, R12 = 12, R13 = 13;
+        const int BLO = 12, BHI = 13, A0 = 14, A1 = 15; // YMM regs (distinct file from GP r12/r13)
+        const int Mr = 6, Nr = 16;
+
+        int done = asm.NewLabel();
+        asm.TestRegSelf(R13);
+        asm.JzLabel32(done);
+
+        int outer = asm.NewLabel();
+        asm.MarkLabel(outer);
+        asm.MovRegReg(RCX, RSI);   // reset A to base
+        asm.MovRegReg(R10, R12);   // reset kc
+
+        // Load 6 C rows (r11 walks from r8 by rax=ldc*4).
+        asm.MovRegReg(R11, R8);
+        for (int r = 0; r < Mr; r++)
+        {
+            asm.VmovupsLoad(2 * r, R11, 0);
+            asm.VmovupsLoad(2 * r + 1, R11, 32);
+            if (r < Mr - 1) asm.AddRegReg(R11, RAX);
+        }
+
+        int store = asm.NewLabel();
+        asm.TestRegSelf(R10);
+        asm.JzLabel(store);
+        int kloop = asm.NewLabel();
+        asm.MarkLabel(kloop);
+        asm.VmovupsLoad(BLO, RDX, 0);
+        asm.VmovupsLoad(BHI, RDX, 32);
+        for (int r = 0; r < Mr; r++)
+        {
+            int areg = (r % 2 == 0) ? A0 : A1;
+            asm.VbroadcastSs(areg, RCX, (sbyte)(r * 4));
+            asm.Vfmadd231ps(2 * r, areg, BLO);
+            asm.Vfmadd231ps(2 * r + 1, areg, BHI);
+        }
+        asm.AddRegImm8(RCX, Mr * 4);  // A += 6 floats
+        asm.AddRegImm8(RDX, Nr * 4);  // B += 16 floats (→ next stripe after kc steps)
+        asm.DecReg(R10);
+        asm.JnzLabel(kloop);
+
+        asm.MarkLabel(store);
+        asm.MovRegReg(R11, R8);
+        for (int r = 0; r < Mr; r++)
+        {
+            asm.VmovupsStore(R11, 0, 2 * r);
+            asm.VmovupsStore(R11, 32, 2 * r + 1);
+            if (r < Mr - 1) asm.AddRegReg(R11, RAX);
+        }
+
+        asm.AddRegImm8(R8, Nr * 4); // C += one 16-float tile (rdx already at next B stripe)
+        asm.DecReg(R13);
+        asm.JnzLabel32(outer);
+        asm.MarkLabel(done);
+    }
+
     /// <summary>
     /// Register-level FP32 6×16 body. Assumes rcx=packedA, rdx=packedB, r8=c,
     /// r9=ldc(elements), r10=kc; clobbers ymm0–15, rax, r11 and advances rcx/rdx/r10.
