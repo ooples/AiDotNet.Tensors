@@ -29,6 +29,17 @@ public sealed class GroupNormDeferredCaptureTests : IDisposable
     private readonly DirectGpuTensorEngine? _gpu;
     private readonly bool _gpuAvailable;
     private const float Tolerance = 1e-3f;
+
+    // Flip to true when the deferred-graph buffer-management bug is fixed. Root-caused on a
+    // GTX 1660 Ti: in a DEEP deferred graph, a tensor produced early and held across several
+    // intervening ops, then consumed by TensorConcatenate, reads STALE data — its pooled GPU
+    // buffer is recycled for an intervening op before the concat consumer runs (the UNet
+    // encoder→decoder skip-connection pattern; the cause of the #1650 end-to-end DDPM divergence).
+    // Every individual op + short chain + an 8-deep chain WITHOUT a long-lived skip are correct;
+    // only the long-lived-skip-into-concat case fails. NOTE: MemoryPlanningPass.BufferReuseMap is
+    // dead code (computed, never consumed), so the bad reuse is in the recording/release-deferral
+    // path, not that pass.
+    private const bool DeferredLongLivedSkipFixed = false;
     private const int C = 64;       // channels != numGroups (the GroupNorm arg-order overflow case)
     private const int Groups = 32;
     private const int Sp = 16;
@@ -319,6 +330,134 @@ public sealed class GroupNormDeferredCaptureTests : IDisposable
         var kernel = Rand(new[] { C, C, 2, 2 }, 15);   // [inC, outC, kH, kW]
         AssertDeferredMatchesEager("ConvTranspose2D",
             () => _gpu!.ConvTranspose2D(input, kernel, new[] { 2, 2 }, new[] { 0, 0 }, new[] { 0, 0 }));
+    }
+
+    [SkippableFact]
+    public void DeferredDeepResBlockChain_MatchesEager()
+    {
+        // The isolated op + single-ResBlock tests are SHORT graphs (1-6 ops); the real DDPM UNet
+        // forward is a DEEP graph (~100+ ops). A deferred-graph buffer-reuse / aliasing bug can
+        // manifest only at depth (a recycled scratch buffer overwritten by a later node before its
+        // consumer runs). This chains 8 ResBlocks + a channel-concat skip + a merge conv (~55 ops)
+        // to stress that path — the end-to-end DDPM deferred denoise diverged ~100% (#1650), so a
+        // deep-graph regression is the leading remaining suspect once every isolated op passes.
+        Skip.IfNot(_gpuAvailable, "No CUDA device.");
+        Skip.IfNot(DeferredLongLivedSkipFixed,
+            "Known deferred-graph buffer bug: long-lived skip + concat in a deep graph reads stale data (#1650 root cause).");
+        var input = Rand(new[] { 1, C, Sp, Sp }, 61);
+        var gamma = Rand(new[] { C }, 62);
+        var beta = Rand(new[] { C }, 63);
+        var k1 = Rand(new[] { C, C, 3, 3 }, 64);
+        var k2 = Rand(new[] { C, C, 3, 3 }, 65);
+        var kMerge = Rand(new[] { C, 2 * C, 3, 3 }, 66);  // merges the concatenated skip back to C
+
+        Func<Tensor<float>> deep = () =>
+        {
+            var gpu = _gpu!;
+            var h = input;
+            var skip = h;
+            for (int i = 0; i < 8; i++) h = ResBlock(h, gamma, beta, k1, k2);
+            var cat = gpu.TensorConcatenate(new[] { h, skip }, axis: 1);   // [1, 2C, Sp, Sp]
+            var merged = gpu.Conv2D(cat, kMerge, 1, 1, 1);                 // [1, C, Sp, Sp]
+            return ResBlock(merged, gamma, beta, k1, k2);
+        };
+        AssertDeferredMatchesEager("DeepResBlockChain(8x + concat-skip)", deep);
+    }
+
+    [SkippableFact]
+    public void DeferredDeepResBlockChain_NoSkip_MatchesEager()
+    {
+        // Disambiguates the DeepResBlockChain failure: same 8-deep ResBlock chain but WITHOUT the
+        // long-lived concat-skip. Each ResBlock's own residual is short-lived (6 ops). If THIS
+        // passes while the concat-skip variant fails, the bug is specifically a long-lived tensor
+        // (held across the deep span) whose buffer the deferred graph recycles before its consumer
+        // runs — not depth/accumulation per se.
+        Skip.IfNot(_gpuAvailable, "No CUDA device.");
+        var input = Rand(new[] { 1, C, Sp, Sp }, 71);
+        var gamma = Rand(new[] { C }, 72);
+        var beta = Rand(new[] { C }, 73);
+        var k1 = Rand(new[] { C, C, 3, 3 }, 74);
+        var k2 = Rand(new[] { C, C, 3, 3 }, 75);
+        AssertDeferredMatchesEager("DeepResBlockChain(8x, no skip)", () =>
+        {
+            var h = input;
+            for (int i = 0; i < 8; i++) h = ResBlock(h, gamma, beta, k1, k2);
+            return h;
+        });
+    }
+
+    [SkippableFact]
+    public void DeferredLongLivedSkipConcat_MatchesEager()
+    {
+        // Minimal repro of the suspected root cause: a tensor produced early, held across several
+        // intervening ops, then consumed by a concat. If the deferred graph recycles `skip`'s buffer
+        // for one of the intervening ResBlocks' scratch, the concat reads stale data. Smaller/faster
+        // than the 8-deep chain — a clean bug report repro if it fails.
+        Skip.IfNot(_gpuAvailable, "No CUDA device.");
+        Skip.IfNot(DeferredLongLivedSkipFixed,
+            "Known deferred-graph buffer bug: long-lived skip + concat reads stale data (#1650 root cause; minimal repro).");
+        var input = Rand(new[] { 1, C, Sp, Sp }, 81);
+        var gamma = Rand(new[] { C }, 82);
+        var beta = Rand(new[] { C }, 83);
+        var k1 = Rand(new[] { C, C, 3, 3 }, 84);
+        var k2 = Rand(new[] { C, C, 3, 3 }, 85);
+        var kMerge = Rand(new[] { C, 2 * C, 3, 3 }, 86);
+        AssertDeferredMatchesEager("LongLivedSkipConcat(3x intervening)", () =>
+        {
+            var gpu = _gpu!;
+            var skip = gpu.GroupNorm(input, Groups, gamma, beta, 1e-5, out _, out _); // produced early
+            var h = skip;
+            for (int i = 0; i < 3; i++) h = ResBlock(h, gamma, beta, k1, k2);          // intervening ops
+            var cat = gpu.TensorConcatenate(new[] { h, skip }, axis: 1);               // consumes the old skip
+            return gpu.Conv2D(cat, kMerge, 1, 1, 1);
+        });
+    }
+
+    [SkippableFact]
+    public void DeferredSoftmax_MatchesEager()
+    {
+        // The UNet self-attention softmax over scores [heads, S, S]. Not covered by the
+        // structural/ResBlock tests above.
+        Skip.IfNot(_gpuAvailable, "No CUDA device.");
+        var scores = Rand(new[] { 4, 64, 64 }, 31);
+        AssertDeferredMatchesEager("Softmax(-1)", () => _gpu!.Softmax(scores, -1));
+    }
+
+    [SkippableFact]
+    public void DeferredSelfAttention_MatchesEager()
+    {
+        // The DDPM UNet self-attention at 16x16: scores = Q·Kᵀ, softmax(-1), ctx = scores·V.
+        // This batched-matmul → softmax → batched-matmul chain is NOT exercised by the existing
+        // deferred coverage (conv/groupnorm/pool/concat/upsample/transpose/embedding), and is the
+        // prime suspect for the end-to-end deferred-graph denoise divergence observed for #1650.
+        Skip.IfNot(_gpuAvailable, "No CUDA device.");
+        int heads = 4, s = 64, dh = 16;
+        var q = Rand(new[] { heads, s, dh }, 41);
+        var kT = Rand(new[] { heads, dh, s }, 42);
+        var v = Rand(new[] { heads, s, dh }, 43);
+        AssertDeferredMatchesEager("SelfAttention(QKᵀ·softmax·V)", () =>
+        {
+            var scores = _gpu!.BatchMatMul(q, kT);   // [heads, s, s]
+            scores = _gpu!.Softmax(scores, -1);
+            return _gpu!.BatchMatMul(scores, v);     // [heads, s, dh]
+        });
+    }
+
+    [SkippableFact]
+    public void DeferredBatchMatMulChain_MatchesEager()
+    {
+        // Isolates whether a *chained* BatchMatMul (output of one feeds the next) is deferred-correct
+        // — separating a matmul-recording bug from a softmax-recording bug in the attention chain.
+        Skip.IfNot(_gpuAvailable, "No CUDA device.");
+        int heads = 4, s = 64, dh = 16;
+        var q = Rand(new[] { heads, s, dh }, 51);
+        var kT = Rand(new[] { heads, dh, s }, 52);
+        var v = Rand(new[] { heads, s, dh }, 53);
+        AssertDeferredMatchesEager("BatchMatMulChain", () =>
+        {
+            var scores = _gpu!.BatchMatMul(q, kT);   // [heads, s, s]
+            return _gpu!.BatchMatMul(scores, v);     // [heads, s, dh] (no softmax in between)
+        });
     }
 
     [SkippableFact]
