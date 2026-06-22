@@ -1,6 +1,7 @@
 using System;
 using System.Diagnostics;
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.BlasManaged;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 
@@ -24,6 +25,16 @@ internal static class Program
             Console.Error.WriteLine("[probe] MachineKernelGemm.Enabled=false");
         }
 
+        // #653: disable the background GEMM autotuner so micro-benchmarks aren't perturbed by its
+        // strategy sweeps running mid-measurement (confounds even min-of-N for fresh shapes).
+        if (Environment.GetEnvironmentVariable("AIDOTNET_AUTOTUNE_OFF") == "1")
+        {
+            var bat = typeof(CpuEngine).Assembly.GetType("AiDotNet.Tensors.Engines.BlasManaged.BackgroundAutotuner");
+            bat?.GetProperty("Enabled", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)
+               ?.SetValue(null, false);
+            Console.Error.WriteLine("[probe] BackgroundAutotuner.Enabled=false");
+        }
+
         // #653: force AutoTracer.ShouldRecord=false (the training / inference-without-compile hot
         // path) so the end-to-end probes measure the recording-off fast path.
         if (Environment.GetEnvironmentVariable("AIDOTNET_NO_AUTOTRACE") == "1")
@@ -43,6 +54,7 @@ internal static class Program
         if (args.Length > 0 && args[0] == "--attnblock") return RunAttnBlock(eng, args);
         if (args.Length > 0 && args[0] == "--act") return RunAct(eng, args);
         if (args.Length > 0 && args[0] == "--gemm") return RunGemm(eng, args);
+        if (args.Length > 0 && args[0] == "--gemmaudit") return RunGemmAudit(eng, args);
         if (args.Length > 0 && args[0] == "--gemmprofile") return RunGemmProfile(eng, args);
         if (args.Length > 0 && args[0] == "--gpu") return RunGpu(args);
 
@@ -261,6 +273,61 @@ internal static class Program
     // P4 (#653): a single dense GEMM [M,K]x[K,N] — the transformer QKV/O projection and FFN
     // matmul shapes — at a chosen maxdop. Isolates whether intra-op GEMM parallelism saturates
     // cores (the cooperative-pool fan-out), separate from the block-level barriers/small ops.
+    // #653 strategy audit: for a grid of (m,k,n), measure single-thread MIN-of-N for the
+    // production heuristic (Auto) vs each forced strategy, and flag where Auto is materially
+    // slower than the best forced strategy (a mis-route). Run with AIDOTNET_AUTOTUNE_OFF=1 so
+    // the background sweeps don't perturb the measurement. Catches latent cliffs systematically.
+    private static int RunGemmAudit(CpuEngine eng, string[] a)
+    {
+        int reps = ArgI(a, "--reps", 25);
+        CpuParallelSettings.MaxDegreeOfParallelism = 1;
+        var rng = new Random(0);
+
+        int[] Ms = { 128, 132, 160, 192, 256, 320 };
+        int[] Ks = { 256, 512, 1024, 1536, 2048 };
+        int[] Ns = { 256, 384, 768, 1536, 3072 };
+
+        Console.WriteLine("M K N | auto packBoth packAOnly streaming (min_ms) | flag");
+        foreach (int m in Ms)
+            foreach (int k in Ks)
+                foreach (int n in Ns)
+                {
+                    var A = RandFlat(m * k, rng);
+                    var B = RandFlat(k * n, rng);
+                    var C = new float[m * n];
+                    double tAuto = BenchStrat(A, B, C, m, n, k, PackingMode.Auto, reps);
+                    double tPB = BenchStrat(A, B, C, m, n, k, PackingMode.ForcePackBoth, reps);
+                    double tPA = BenchStrat(A, B, C, m, n, k, PackingMode.ForcePackAOnly, reps);
+                    double tS = BenchStrat(A, B, C, m, n, k, PackingMode.ForceStreaming, reps);
+                    double best = Math.Min(tPB, Math.Min(tPA, tS));
+                    string flag = tAuto > 1.25 * best ? $"MISROUTE x{tAuto / best:F1}" : "";
+                    Console.WriteLine($"{m} {k} {n} | {tAuto:F3} {tPB:F3} {tPA:F3} {tS:F3} | {flag}");
+                }
+        return 0;
+    }
+
+    private static double BenchStrat(float[] A, float[] B, float[] C, int m, int n, int k, PackingMode mode, int reps)
+    {
+        var opt = new BlasOptions<float> { PackingMode = mode };
+        for (int w = 0; w < 3; w++) BlasManaged.Gemm<float>(A, k, false, B, n, false, C, n, m, n, k, opt);
+        double best = double.MaxValue;
+        for (int i = 0; i < reps; i++)
+        {
+            var sw = Stopwatch.StartNew();
+            BlasManaged.Gemm<float>(A, k, false, B, n, false, C, n, m, n, k, opt);
+            sw.Stop();
+            best = Math.Min(best, sw.Elapsed.TotalMilliseconds);
+        }
+        return best;
+    }
+
+    private static float[] RandFlat(int n, Random r)
+    {
+        var arr = new float[n];
+        for (int i = 0; i < n; i++) arr[i] = (float)(r.NextDouble() - 0.5);
+        return arr;
+    }
+
     private static int RunGemm(CpuEngine eng, string[] a)
     {
         int maxdop = ArgI(a, "--maxdop", Environment.ProcessorCount);
