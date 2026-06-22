@@ -2786,7 +2786,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     Simd.SimdGemm.Sgemm(aFloat, lda, transA, bFloat, ldb, transB, cFloat, m, k, n);
                 }
                 DifferentiableOps.RecordBinary("BatchMatMul", result, aOrig, bOrig, BackwardFunctions<T>.BatchMatMulBackward);
-                { var ca = a; var cb = b; AutoTracer.RecordOp("BatchMatMul", result, eng => eng.BatchMatMul(ca, cb)); }
+                if (AutoTracer.ShouldRecord) { var ca = a; var cb = b; AutoTracer.RecordOp("BatchMatMul", result, eng => eng.BatchMatMul(ca, cb)); }
                 return result;
             }
 
@@ -2796,7 +2796,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 if (MatrixMultiplyHelper.TryGemm(a.ReadOnlyData, 0, b.ReadOnlyData, 0, result.Data, 0, m, k, n))
                 {
                     DifferentiableOps.RecordBinary("BatchMatMul", result, aOrig, bOrig, BackwardFunctions<T>.BatchMatMulBackward);
-                    { var ca = a; var cb = b; AutoTracer.RecordOp("BatchMatMul", result, eng => eng.BatchMatMul(ca, cb)); }
+                    if (AutoTracer.ShouldRecord) { var ca = a; var cb = b; AutoTracer.RecordOp("BatchMatMul", result, eng => eng.BatchMatMul(ca, cb)); }
                     return result;
                 }
             }
@@ -2816,7 +2816,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var cSpanD = new Span<double>((double[])(object)rArrD, 0, m * n);
                 SimdGemm.Dgemm(aSpanD, bSpanD, cSpanD, m, k, n);
                 DifferentiableOps.RecordBinary("BatchMatMul", result, aOrig, bOrig, BackwardFunctions<T>.BatchMatMulBackward);
-                { var ca = a; var cb = b; AutoTracer.RecordOp("BatchMatMul", result, eng => eng.BatchMatMul(ca, cb)); }
+                if (AutoTracer.ShouldRecord) { var ca = a; var cb = b; AutoTracer.RecordOp("BatchMatMul", result, eng => eng.BatchMatMul(ca, cb)); }
                 return result;
             }
 
@@ -2848,7 +2848,7 @@ public partial class CpuEngine : ITensorLevelEngine
             });
             DifferentiableOps.RecordBinary("BatchMatMul", result, aOrig, bOrig,
                 BackwardFunctions<T>.BatchMatMulBackward);
-            { var ca = a; var cb = b; AutoTracer.RecordOp("BatchMatMul", result, eng => eng.BatchMatMul(ca, cb)); }
+            if (AutoTracer.ShouldRecord) { var ca = a; var cb = b; AutoTracer.RecordOp("BatchMatMul", result, eng => eng.BatchMatMul(ca, cb)); }
             return result;
         }
 
@@ -2982,7 +2982,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         DifferentiableOps.RecordBinary("BatchMatMul", result, aOrig, bOrig,
             BackwardFunctions<T>.BatchMatMulBackward);
-        { var ca = a; var cb = b; AutoTracer.RecordOp("BatchMatMul", result, eng => eng.BatchMatMul(ca, cb)); }
+        if (AutoTracer.ShouldRecord) { var ca = a; var cb = b; AutoTracer.RecordOp("BatchMatMul", result, eng => eng.BatchMatMul(ca, cb)); }
         return result;
     }
 
@@ -3148,7 +3148,7 @@ public partial class CpuEngine : ITensorLevelEngine
         DifferentiableOps.RecordBinary("TensorAdd", result, a, b, BackwardFunctions<T>.AddBackward);
 
         // Auto-tracer: record this op for future compilation
-        { var ca = a; var cb = b; AutoTracer.RecordOp("TensorAdd", result, eng => eng.TensorAdd(ca, cb)); }
+        if (AutoTracer.ShouldRecord) { var ca = a; var cb = b; AutoTracer.RecordOp("TensorAdd", result, eng => eng.TensorAdd(ca, cb)); }
 
         return result;
     }
@@ -8990,7 +8990,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 outputHeight, outputWidth);
             DifferentiableOps.RecordBinary("Conv2D", result, inputOrig, kernel,
                 BackwardFunctions<T>.Conv2DBackward, new object[] { new[] { stride, stride }, new[] { padding, padding }, new[] { dilation, dilation } });
-            AutoTracer.RecordOp("Conv2D", result, eng => result);
+            if (AutoTracer.ShouldRecord) AutoTracer.RecordOp("Conv2D", result, eng => result);
             return result;
         }
 
@@ -9089,7 +9089,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
                 DifferentiableOps.RecordBinary("Conv2D", result, inputOrig, kernel,
                     BackwardFunctions<T>.Conv2DBackward, new object[] { new[] { stride, stride }, new[] { padding, padding }, new[] { dilation, dilation } });
-                AutoTracer.RecordOp("Conv2D", result, eng => result);
+                if (AutoTracer.ShouldRecord) AutoTracer.RecordOp("Conv2D", result, eng => result);
                 return result;
             }
 #endif
@@ -9104,7 +9104,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 outputHeight, outputWidth);
             DifferentiableOps.RecordBinary("Conv2D", result, inputOrig, kernel,
                 BackwardFunctions<T>.Conv2DBackward, new object[] { new[] { stride, stride }, new[] { padding, padding }, new[] { dilation, dilation } });
-            AutoTracer.RecordOp("Conv2D", result, eng => result);
+            if (AutoTracer.ShouldRecord) AutoTracer.RecordOp("Conv2D", result, eng => result);
             return result;
         }
 
@@ -9117,7 +9117,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         DifferentiableOps.RecordBinary("Conv2D", result, inputOrig, kernel,
             BackwardFunctions<T>.Conv2DBackward, new object[] { new[] { stride, stride }, new[] { padding, padding }, new[] { dilation, dilation } });
-        AutoTracer.RecordOp("Conv2D", result, eng => result);
+        if (AutoTracer.ShouldRecord) AutoTracer.RecordOp("Conv2D", result, eng => result);
         return result;
     }
 
@@ -13005,7 +13005,7 @@ public partial class CpuEngine : ITensorLevelEngine
             result.Layout = LinearAlgebra.TensorLayout.Nchwc16;
             DifferentiableOps.RecordBinary("Conv2D", result, inputOrig, kernel, BackwardFunctions<T>.Conv2DBackward,
                 new object[] { stride, padding, dilation });
-            AutoTracer.RecordOp("Conv2D", result, eng => result);
+            if (AutoTracer.ShouldRecord) AutoTracer.RecordOp("Conv2D", result, eng => result);
             return result;
         }
 
@@ -13036,7 +13036,7 @@ public partial class CpuEngine : ITensorLevelEngine
             result.Layout = LinearAlgebra.TensorLayout.Nchwc8;
             DifferentiableOps.RecordBinary("Conv2D", result, inputOrig, kernel, BackwardFunctions<T>.Conv2DBackward,
                 new object[] { stride, padding, dilation });
-            AutoTracer.RecordOp("Conv2D", result, eng => result);
+            if (AutoTracer.ShouldRecord) AutoTracer.RecordOp("Conv2D", result, eng => result);
             return result;
         }
 
@@ -13139,7 +13139,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         DifferentiableOps.RecordBinary("Conv2D", result, inputOrig, kernel, BackwardFunctions<T>.Conv2DBackward,
             new object[] { stride, padding, dilation });
-        AutoTracer.RecordOp("Conv2D", result, eng => result);
+        if (AutoTracer.ShouldRecord) AutoTracer.RecordOp("Conv2D", result, eng => result);
         return result;
     }
 
@@ -19760,7 +19760,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 SoftmaxFloatFastPtr((float*)pinIn.Pointer, (float*)pinOut.Pointer, outerSize, axisSize);
             }
             DifferentiableOps.RecordUnary("Softmax", result, input, BackwardFunctions<T>.SoftmaxBackward, new object[] { axis });
-            { var c = input; int ax = axis; AutoTracer.RecordOp("Softmax", result, eng => eng.Softmax(c, ax), paramHash: ax); }
+            if (AutoTracer.ShouldRecord) { var c = input; int ax = axis; AutoTracer.RecordOp("Softmax", result, eng => eng.Softmax(c, ax), paramHash: ax); }
             return result;
         }
 
@@ -19807,7 +19807,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
             }
             DifferentiableOps.RecordUnary("Softmax", result, input, BackwardFunctions<T>.SoftmaxBackward, new object[] { axis });
-            { var c = input; int ax = axis; AutoTracer.RecordOp("Softmax", result, eng => eng.Softmax(c, ax), paramHash: ax); }
+            if (AutoTracer.ShouldRecord) { var c = input; int ax = axis; AutoTracer.RecordOp("Softmax", result, eng => eng.Softmax(c, ax), paramHash: ax); }
             return result;
         }
 
@@ -19847,7 +19847,7 @@ public partial class CpuEngine : ITensorLevelEngine
         });
 
         DifferentiableOps.RecordUnary("Softmax", result2, input, BackwardFunctions<T>.SoftmaxBackward, new object[] { axis });
-        { var c = input; int ax = axis; AutoTracer.RecordOp("Softmax", result2, eng => eng.Softmax(c, ax), paramHash: ax); }
+        if (AutoTracer.ShouldRecord) { var c = input; int ax = axis; AutoTracer.RecordOp("Softmax", result2, eng => eng.Softmax(c, ax), paramHash: ax); }
         return result2;
     }
 
@@ -22519,7 +22519,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var lnResult = (Tensor<T>)(object)lnResultF;
             DifferentiableOps.RecordIfActive("LayerNorm", lnResult, new[] { input, gamma, beta },
                 BackwardFunctions<T>.LayerNormBackward, new object[] { mean, variance, epsilon });
-            AutoTracer.RecordOp("LayerNorm", lnResult, eng => lnResult);
+            if (AutoTracer.ShouldRecord) AutoTracer.RecordOp("LayerNorm", lnResult, eng => lnResult);
             return lnResult;
         }
 
@@ -22609,7 +22609,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var lnResultG = TensorAllocator.Rent<T>(input._shape, outputData);
         DifferentiableOps.RecordIfActive("LayerNorm", lnResultG, new[] { input, gamma, beta },
             BackwardFunctions<T>.LayerNormBackward, new object[] { mean, variance, epsilon });
-        AutoTracer.RecordOp("LayerNorm", lnResultG, eng => lnResultG);
+        if (AutoTracer.ShouldRecord) AutoTracer.RecordOp("LayerNorm", lnResultG, eng => lnResultG);
         return lnResultG;
     }
 
@@ -23877,7 +23877,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
             DifferentiableOps.RecordIfActive("GroupNorm", result, new[] { inputOrig, gamma, beta },
                 BackwardFunctions<T>.GroupNormBackward, new object[] { numGroups, mean, variance, epsilon });
-            AutoTracer.RecordOp("GroupNorm", result, eng => result);
+            if (AutoTracer.ShouldRecord) AutoTracer.RecordOp("GroupNorm", result, eng => result);
             return result;
         }
 
@@ -34309,7 +34309,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         DifferentiableOps.RecordBinary("BatchMatMul", result, aOrig, bOrig,
             BackwardFunctions<T>.BatchMatMulBackward);
-        { var ca = a; var cb = b; AutoTracer.RecordOp("BatchMatMul", result, eng => eng.BatchMatMul(ca, cb)); }
+        if (AutoTracer.ShouldRecord) { var ca = a; var cb = b; AutoTracer.RecordOp("BatchMatMul", result, eng => eng.BatchMatMul(ca, cb)); }
         return result;
     }
 
