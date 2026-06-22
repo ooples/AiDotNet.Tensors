@@ -149,21 +149,35 @@ internal static class Program
         sw.Stop();
         double warm = sw.Elapsed.TotalMilliseconds;
 
+        // #653/#657 follow-up: forward caching-allocator. With --arena, ONE TensorArena lives
+        // across the whole rep loop and Reset()s before each full forward — so every per-op
+        // TensorAllocator.Rent inside blk() hits the arena (Tier 0) instead of allocating a
+        // fresh GC array, and the prior forward's intermediates are recycled. Reset is PER
+        // FORWARD (not per block): a block's output is the next block's input, so resetting
+        // mid-forward would recycle a live tensor. x0 is allocated before the arena, so it
+        // survives Reset and is a safe re-entry point each iteration.
+        bool useArena = HasFlag(a, "--arena");
+        TensorArena? arena = useArena ? TensorArena.Create() : null;
         var times = new double[reps];
         using var meter = util ? ParallelUtilizationMeter.Start() : null;   // `using` disposes on exception paths too (#654 review)
+        long allocBefore = GC.GetTotalAllocatedBytes(precise: true);
         for (int i = 0; i < reps; i++)
         {
+            arena?.Reset();
             var s = Stopwatch.StartNew();
             yy = x0;
             for (int b = 0; b < blocks; b++) yy = blk(yy);
             s.Stop();
             times[i] = s.Elapsed.TotalMilliseconds;
         }
+        long allocAfter = GC.GetTotalAllocatedBytes(precise: true);
+        arena?.Dispose();
+        double mbPerFwd = (allocAfter - allocBefore) / (1024.0 * 1024.0) / reps;
         string u = StopMeter(meter, maxdop);
         Array.Sort(times);
         Console.WriteLine(
             $"ATTNBLOCK S={S} D={D} H={H} Dh={Dh} blocks={blocks} maxdop={maxdop} procs={Environment.ProcessorCount} " +
-            $"warmup_ms={warm:F1} median_ms={times[reps / 2]:F2} min_ms={times[0]:F2} max_ms={times[times.Length - 1]:F2}{u}");
+            $"arena={useArena} alloc_MB/fwd={mbPerFwd:F2} warmup_ms={warm:F1} median_ms={times[reps / 2]:F2} min_ms={times[0]:F2} max_ms={times[times.Length - 1]:F2}{u}");
         return 0;
     }
 
