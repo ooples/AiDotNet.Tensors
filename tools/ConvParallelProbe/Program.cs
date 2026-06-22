@@ -196,17 +196,27 @@ internal static class Program
             return 2;
         }
         CpuParallelSettings.MaxDegreeOfParallelism = maxdop;
+        // Real training (NeuralNetworkBase) wraps each step in a per-step TensorArena that
+        // recycles fwd+bwd scratch. Mirror that by default so the metric reflects the REAL
+        // per-step churn (what bypasses the arena) — the lever #4 audit target. --no-arena
+        // measures the un-pooled worst case.
+        bool arenaOn = !HasFlag(a, "--no-arena");
 
         var rng = new Random(0);
         var step = new TrainbenchStep(eng, S, D, layers, rng);
 
-        for (int i = 0; i < warmup; i++) step.RunStep();
+        // Weights are constructed above (before the arena) so they stay persistent across
+        // Reset(); only per-step scratch recycles.
+        using var arena = arenaOn ? TensorArena.Create() : null;
+
+        for (int i = 0; i < warmup; i++) { arena?.Reset(); step.RunStep(); }
 
         var times = new double[reps];
         long peakWs = 0;
         long allocStart = GC.GetAllocatedBytesForCurrentThread();
         for (int i = 0; i < reps; i++)
         {
+            arena?.Reset();
             var sw = Stopwatch.StartNew();
             step.RunStep();
             sw.Stop();
@@ -217,7 +227,7 @@ internal static class Program
         Array.Sort(times);
         double perStepAllocMB = allocTotal / (double)reps / (1024.0 * 1024.0);
         Console.WriteLine(
-            $"TRAINBENCH engine=aidotnet S={S} D={D} layers={layers} maxdop={maxdop} " +
+            $"TRAINBENCH engine=aidotnet arena={(arenaOn ? "on" : "off")} S={S} D={D} layers={layers} maxdop={maxdop} " +
             $"procs={Environment.ProcessorCount} median_ms={times[reps / 2]:F3} min_ms={times[0]:F3} " +
             $"alloc_mb_per_step={perStepAllocMB:F3} peak_ws_mb={peakWs / (1024.0 * 1024.0):F1} " +
             $"last_loss={step.LastLoss:E3}");
