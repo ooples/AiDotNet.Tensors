@@ -18314,6 +18314,31 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (DirectGpuEngine.ShouldFallbackForPrecision<T>())
             return base.TensorBroadcastAdd(a, b);
+
+        // #1650 inference capture: per-channel [N,C,H,W] + [1,C,1,1] (conv bias) is NOT a last-axis
+        // broadcast, so the path below correctly declines it and the CPU base path would download a
+        // resident operand mid-capture. On the capture path, do it resident on-device via Conv2DBiasAdd
+        // (copy a → out, then add bias per channel). Gated on ResidentStepActive so non-capture inference
+        // is unchanged.
+        if (ResidentStepActive && typeof(T) == typeof(float) && !Gpu.AutocastScope.IsEnabled
+            && a.Rank == 4 && b.Rank == 4 && a.IsContiguous && b.IsContiguous
+            && b.Shape._dims[0] == 1 && b.Shape._dims[2] == 1 && b.Shape._dims[3] == 1
+            && a.Shape._dims[1] == b.Shape._dims[1]
+            && TryGetBackend(out var beCh) && beCh is Engines.DirectGpu.CUDA.CudaBackend cbCh)
+        {
+            try
+            {
+                int n = a.Shape._dims[0], c = a.Shape._dims[1], hw = a.Shape._dims[2] * a.Shape._dims[3];
+                using var abuf = GetResidentOrPersistentInputBuffer(beCh, a);
+                using var bbuf = GetResidentOrPersistentInputBuffer(beCh, b);
+                var outBuf = AllocateOutputBuffer(beCh, a.Length);
+                cbCh.Copy(abuf.Buffer, outBuf.Buffer, a.Length);          // out = a
+                cbCh.Conv2DBiasAdd(outBuf.Buffer, bbuf.Buffer, n, c, hw); // out += bias (per channel)
+                var resData = FinishGpuOp<T>(beCh, outBuf, a.Length);
+                return new Tensor<T>(resData, a.Shape._dims);
+            }
+            catch { /* fall through to the paths below */ }
+        }
         // BroadcastAddLast(outer, inner=b.Length) computes out[o*inner+i] = a[o*inner+i] + b[i] — i.e. b
         // MUST map to a's contiguous LAST axis (or be a scalar). For a channel-broadcast like
         // [N,C,H,W] + [1,C,1,1] the b vector spans the OUTER (channel) axis with stride H*W, so
