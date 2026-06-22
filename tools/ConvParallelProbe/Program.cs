@@ -29,10 +29,12 @@ internal static class Program
         if (Environment.GetEnvironmentVariable("AIDOTNET_NO_AUTOTRACE") == "1")
         {
             // AutoTracer.ShouldRecord = Enabled && !GraphMode && EnableCompilation && !ThreadTapeActive.
-            // EnableCompilation is the PUBLIC, documented disable knob (AutoTracer.cs), so flip it
-            // directly — no reflection (the property is compile-time-resolved, so it can't silently
-            // no-op the way the old reflected `?.SetValue` could).
-            AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions.Current.EnableCompilation = false;
+            // EnableCompilation is the PUBLIC, documented disable knob (AutoTracer.cs). Current returns
+            // a FRESH Default copy when the thread has no installed options, so mutating it in place is
+            // lost — take the copy, disable compilation, and install it via SetCurrent so it persists.
+            var codecOpts = AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions.Current;
+            codecOpts.EnableCompilation = false;
+            AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions.SetCurrent(codecOpts);
             Console.Error.WriteLine("[probe] TensorCodecOptions.EnableCompilation=false (AutoTracer recording off)");
         }
 
@@ -660,10 +662,13 @@ internal static class Program
         // ShouldRecord = Enabled && !GraphMode && EnableCompilation && !ThreadTapeActive.
         // Disabling compilation via the PUBLIC, documented knob (AutoTracer.cs) forces
         // ShouldRecord=false (the training / no-compilation hot path this benchmarks) — no
-        // reflection. It's a one-time set before the timed loop, so it never touches the
-        // per-op measurement; the public property is compile-time-resolved so it can't
-        // silently no-op the way the old reflected `?.SetValue` could.
-        AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions.Current.EnableCompilation = false;
+        // reflection. Current returns a FRESH Default copy when the thread has no installed
+        // options, so mutate the copy and install it via SetCurrent (a bare property set on
+        // Current would be discarded). One-time set before the timed loop, so it never touches
+        // the per-op measurement.
+        var codecOpts = AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions.Current;
+        codecOpts.EnableCompilation = false;
+        AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions.SetCurrent(codecOpts);
         Console.Error.WriteLine("[probe] TensorCodecOptions.EnableCompilation=false (AutoTracer.ShouldRecord=false)");
 
         var rng = new Random(0);
