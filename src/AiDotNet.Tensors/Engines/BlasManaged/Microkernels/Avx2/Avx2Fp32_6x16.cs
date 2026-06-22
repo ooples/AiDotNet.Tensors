@@ -137,9 +137,13 @@ internal static class Avx2Fp32_6x16
             {
                 for (int k = 0; k < kc; k++)
                 {
-                    // Prefetch the B stripe (64B/k, one line) + A panel pfd steps ahead into L1.
+                    // Prefetch only the STREAMING B stripe (Nr=16 floats = exactly one 64B line
+                    // per K-step) pfd steps ahead. The packed-A panel is NOT prefetched: it's just
+                    // Mr=6 floats (24B) per K-step — multiple K-steps share a line and the
+                    // Vector256.Create broadcast loads already pull it into L1, so an extra
+                    // prefetch is redundant load-port traffic (the dominant cause of the original
+                    // regression on strong-HW-prefetch cores).
                     Sse.Prefetch0(bPtr + (k + pfd) * Nr);
-                    Sse.Prefetch0(aPtr + (k + pfd) * Mr);
 
                     Vector256<float> bL = Avx.LoadVector256(bPtr + k * Nr);
                     Vector256<float> bH = Avx.LoadVector256(bPtr + k * Nr + 8);
