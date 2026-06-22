@@ -28,9 +28,17 @@ internal static class Program
         // path) so the end-to-end probes measure the recording-off fast path.
         if (Environment.GetEnvironmentVariable("AIDOTNET_NO_AUTOTRACE") == "1")
         {
-            typeof(CpuEngine).Assembly.GetType("AiDotNet.Tensors.Engines.Compilation.AutoTracer")
-                ?.GetProperty("Enabled", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public)
-                ?.SetValue(null, false);
+            // FAIL FAST: a silent `?.` no-op (type/property renamed) would leave recording ON
+            // and silently invalidate every downstream probe measurement, so require the set.
+            const System.Reflection.BindingFlags SF = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public;
+            var enabledProp = typeof(CpuEngine).Assembly
+                .GetType("AiDotNet.Tensors.Engines.Compilation.AutoTracer")?.GetProperty("Enabled", SF);
+            if (enabledProp is null)
+            {
+                Console.Error.WriteLine("[probe] ERROR: AIDOTNET_NO_AUTOTRACE=1 but AutoTracer.Enabled not found (renamed?) — refusing to run with recording silently left on.");
+                return 3;
+            }
+            enabledProp.SetValue(null, false);
             Console.Error.WriteLine("[probe] AutoTracer.Enabled=false");
         }
 
@@ -640,15 +648,32 @@ internal static class Program
     {
         int M = ArgI(a, "--m", 8), K = ArgI(a, "--k", 8), N = ArgI(a, "--n", 8);
         int reps = ArgI(a, "--reps", 200000);
+        if (M < 1 || K < 1 || N < 1 || reps < 1)
+        {
+            Console.Error.WriteLine("allocbench: --m, --k, --n, --reps must all be >= 1.");
+            return 2;
+        }
         // ShouldRecord = Enabled && !GraphMode && EnableCompilation && !ThreadTapeActive.
         // Force AutoTracer.Enabled=false so ShouldRecord is false (mirrors the training hot path
-        // where a live tape makes ShouldRecord false). Verify before measuring.
-        var asm = typeof(CpuEngine).Assembly;
+        // where a live tape makes ShouldRecord false). FAIL FAST: if the reflected type/property
+        // is missing or renamed, the silent `?.` no-op would leave recording ON and produce
+        // invalid benchmark data — so require the set to succeed AND verify ShouldRecord==false.
         const System.Reflection.BindingFlags SF = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public;
-        var at = asm.GetType("AiDotNet.Tensors.Engines.Compilation.AutoTracer");
-        at?.GetProperty("Enabled", SF)?.SetValue(null, false);
-        var shouldRec = at?.GetProperty("ShouldRecord", SF)?.GetValue(null);
-        Console.Error.WriteLine($"[probe] AutoTracer.ShouldRecord={shouldRec}");
+        var at = typeof(CpuEngine).Assembly.GetType("AiDotNet.Tensors.Engines.Compilation.AutoTracer");
+        var enabledProp = at?.GetProperty("Enabled", SF);
+        var shouldRecProp = at?.GetProperty("ShouldRecord", SF);
+        if (at is null || enabledProp is null || shouldRecProp is null)
+        {
+            Console.Error.WriteLine("allocbench: could not reflect AutoTracer.Enabled/ShouldRecord (renamed?) — refusing to report invalid numbers.");
+            return 3;
+        }
+        enabledProp.SetValue(null, false);
+        if (shouldRecProp.GetValue(null) is not bool rec || rec)
+        {
+            Console.Error.WriteLine("allocbench: AutoTracer.ShouldRecord is still true after disabling — recording would skew the measurement.");
+            return 3;
+        }
+        Console.Error.WriteLine("[probe] AutoTracer.ShouldRecord=False");
 
         var rng = new Random(0);
         var lhs = Rand(new[] { M, K }, rng);
