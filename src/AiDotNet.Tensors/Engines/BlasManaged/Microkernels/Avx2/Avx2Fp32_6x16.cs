@@ -35,9 +35,13 @@ internal static class Avx2Fp32_6x16
     internal const int Nr = 16;
 
     // #653: software-prefetch distance (K-steps ahead) for RunPrefetch. Env-tunable for the
-    // prefetch sweep; default 8 (~L2 latency at ~6 cyc/k). Read once at init.
+    // prefetch sweep; default 8 (~L2 latency at ~6 cyc/k). Read once at init. Clamped to
+    // [1, 1024]: pfd feeds (k + pfd) * Nr pointer math, so an unbounded env value could
+    // overflow int and form a wild prefetch address — 1024 K-steps is already far past any
+    // useful prefetch horizon.
     private static readonly int s_pfDist =
-        int.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_GEMM_PF_DIST"), out var d) && d > 0 ? d : 8;
+        int.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_GEMM_PF_DIST"), out var d) && d > 0
+            ? System.Math.Min(d, 1024) : 8;
 
 #if NET5_0_OR_GREATER
     /// <summary>Runtime support gate. True when AVX2 and FMA intrinsics are usable.</summary>
@@ -107,7 +111,7 @@ internal static class Avx2Fp32_6x16
 
     /// <summary>
     /// #653: software-prefetching variant of <see cref="Run"/>. Identical math + FMA order
-    /// (bit-identical) — it only adds PREFETCHT0 of the packed-A/B cache lines <c>s_pfDist</c>
+    /// (bit-identical) — it only adds PREFETCHT0 of the packed-B cache lines <c>s_pfDist</c>
     /// K-steps ahead to hide L2/L3 latency, which is the suspected residual per-core gap to
     /// native BLAS at large-N shapes (where packedB streams from L2/L3). Prefetch of an address
     /// past the panel end is fault-safe on x86 (a no-op), so no bounds guard is needed.

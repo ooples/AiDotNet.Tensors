@@ -39,7 +39,7 @@ internal static class PackBothStrategy
         System.Environment.GetEnvironmentVariable("AIDOTNET_GEMM_TRACE") == "1";
 
     // #653 software-prefetch microkernel (env AIDOTNET_GEMM_PREFETCH=1, default off). Routes the
-    // FP32 6×16 tile through Avx2Fp32_6x16.RunPrefetch (PREFETCHT0 of A/B ahead) — same inlined
+    // FP32 6×16 tile through Avx2Fp32_6x16.RunPrefetch (PREFETCHT0 of packed-B ahead) — same inlined
     // intrinsic kernel, so NO per-tile call/fixed overhead (unlike the machine-code-per-tile path
     // that regressed). Tests whether L2/L3 latency is the residual per-core gap at large N.
     private static readonly bool s_prefetch =
