@@ -57,6 +57,7 @@ public class BackwardArenaTests
 
         const int warmup = 12, reps = 10;
 
+#if NET5_0_OR_GREATER
         // Measure WITHOUT an arena: conv backward output grads are fresh allocations each step.
         // (Relative on-vs-off comparison is robust to the process-global AutoTensorCache state
         // left by other tests in the suite, which an absolute byte threshold is not.)
@@ -82,6 +83,17 @@ public class BackwardArenaTests
         Assert.True(perStepOn * 3 < perStepOff,
             $"arena did not recycle conv backward allocation: on={perStepOn} B/step, off={perStepOff} B/step " +
             $"(expected on < off/3; conv backward output-grad arena routing may have regressed)");
+#else
+        // net471 (.NET Framework) has no per-thread allocation counter
+        // (GC.GetAllocatedBytesForCurrentThread is .NET Core / .NET 5+ only), so the
+        // byte-delta guard above can only run on the modern TFM (which CI uses for this
+        // assertion). Still exercise the conv-backward arena path here so net471 guards
+        // against a crash / shape regression in the *Into routing, even though it can't
+        // measure the allocation win.
+        for (int i = 0; i < warmup; i++) OneStep();
+        using (var arena = TensorArena.Create())
+            for (int i = 0; i < reps; i++) { arena.Reset(); OneStep(); }
+#endif
     }
 
     private static Tensor<float> Rand(int[] s, Random r)
