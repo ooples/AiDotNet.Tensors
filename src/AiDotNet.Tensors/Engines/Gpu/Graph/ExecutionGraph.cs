@@ -61,7 +61,7 @@ public sealed class ExecutionGraph : IDisposable
 
         TotalEstimatedCost = _nodes.Sum(n => n.EstimatedCost);
         CriticalPathLength = _levelNodes.Count;
-        MaxParallelism = _levelNodes.Values.Max(level => level.Count);
+        MaxParallelism = _levelNodes.Count == 0 ? 0 : _levelNodes.Values.Max(level => level.Count);
     }
 
     /// <summary>
