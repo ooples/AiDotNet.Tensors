@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics.X86;
 using AiDotNet.Tensors.Engines.BlasManaged;
+using AiDotNet.Tensors.Helpers;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -247,6 +248,58 @@ public class MachineCodeKernelTests
         for (int i = 0; i < cLen; i++)
             Assert.True(BitConverter.SingleToInt32Bits(cKernel[i]) == BitConverter.SingleToInt32Bits(cRef[i]),
                 $"6x16 FP32 machine kernel mismatch at {i}: kernel={cKernel[i]:G9}, ref={cRef[i]:G9} (kc={kc}, ldc={ldc})");
+    }
+
+    [Theory]
+    [InlineData(256, 4, 64)]    // 4 tiles, ldc == nTiles*Nr
+    [InlineData(64, 3, 48)]
+    [InlineData(7, 8, 128)]
+    [InlineData(1, 2, 32)]      // kc=1, smallest panel
+    [InlineData(128, 5, 83)]    // ldc > nTiles*Nr (padded C)
+    public unsafe void Fp32_6x16_Panel_MatchesPerTileReference(int kc, int nTiles, int ldc)
+    {
+        if (!IsX64Windows || !Avx2.IsSupported || !Fma.IsSupported) return;
+
+        const int Mr = 6, Nr = 16;
+        Assert.True(ldc >= nTiles * Nr, "test setup: ldc must hold nTiles N-tile blocks");
+
+        byte[] code = MachineCodeFmaKernel.EmitFp32_6x16_PanelWindows();
+        using var mem = ExecutableMemory.TryAllocate(code);
+        if (mem is null) return;
+        // void kern(float* packedA, float* packedB, float* c, long ldc, long kc, long nTiles)
+        var fn = (delegate* unmanaged<float*, float*, float*, long, long, long, void>)mem.Pointer;
+
+        var rng = new Random(409 + kc * 31 + nTiles * 7 + ldc);
+        var packedA = new float[kc * Mr];                       // ONE stripe, reused for every tile
+        var packedB = new float[(long)nTiles * kc * Nr];        // contiguous [tile][k][Nr] panel
+        for (int i = 0; i < packedA.Length; i++) packedA[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < packedB.Length; i++) packedB[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        int cLen = (Mr - 1) * ldc + nTiles * Nr;
+        var c0 = new float[cLen];
+        for (int i = 0; i < cLen; i++) c0[i] = (float)(rng.NextDouble() * 2 - 1);
+        var cKernel = (float[])c0.Clone();
+        var cRef = (float[])c0.Clone();
+
+        fixed (float* pa = packedA, pb = packedB, pc = cKernel)
+            fn(pa, pb, pc, ldc, kc, nTiles);
+
+        // Reference: nTiles independent 6×16 tiles, lane-wise FMA in k order (matches the panel,
+        // which must equal calling the single-tile kernel nTiles times). Tile js reads B at
+        // js*kc*Nr and writes C columns [js*Nr, js*Nr+Nr).
+        for (int js = 0; js < nTiles; js++)
+            for (int r = 0; r < Mr; r++)
+                for (int col = 0; col < Nr; col++)
+                {
+                    float acc = cRef[r * ldc + js * Nr + col];
+                    for (int k = 0; k < kc; k++)
+                        acc = MathF.FusedMultiplyAdd(packedA[k * Mr + r], packedB[(long)js * kc * Nr + k * Nr + col], acc);
+                    cRef[r * ldc + js * Nr + col] = acc;
+                }
+
+        for (int i = 0; i < cLen; i++)
+            Assert.True(BitConverter.SingleToInt32Bits(cKernel[i]) == BitConverter.SingleToInt32Bits(cRef[i]),
+                $"6x16 FP32 panel kernel mismatch at {i}: kernel={cKernel[i]:G9}, ref={cRef[i]:G9} (kc={kc}, nTiles={nTiles}, ldc={ldc})");
     }
 
     [Theory]
@@ -497,6 +550,72 @@ public class MachineCodeKernelTests
             double gflops = 2.0 * Mr * Nr * kc * iters / best / 1e9;
             _output.WriteLine($"machine-code 6x16 FP32: {gflops:F1} GFLOPS (best-of-7) " +
                 "(FP64 6x8 ~57; FP32 should be ~2× since 8 lanes/FMA; HW FP32 peak ~128)");
+        }
+    }
+
+    [Fact]
+    public unsafe void Fp32_GebpPanel_vs_PerTile_GemmPath_Perf()
+    {
+        if (Environment.GetEnvironmentVariable("AIDOTNET_RUN_JIT_PERF") != "1") return;
+        if (!IsX64Windows || !Avx2.IsSupported || !Fma.IsSupported) return;
+        if (!MachineKernelGemm.IsFp32Available) { _output.WriteLine("FP32 machine kernel unavailable"); return; }
+
+        // Real GEMM path (parallel, BLIS-blocked). The per-N-tile call paid the Windows xmm6–15
+        // save/restore (20 movups) on EVERY tile; the GEBP panel pays it once per M-stripe. The
+        // benefit is only visible when kernel work dominates B-packing — i.e. large m (kernel/pack
+        // ratio ≈ m) — so we sweep square-ish sizes through the actual TryGemmFp32 path.
+        // m must be ÷ Mr(6), n must be ÷ Nr(16) (TryGemmFp32 requires a tile-aligned whole shape).
+        foreach (var (m, n, k, iters) in new[] { (504, 512, 512, 300), (1020, 1024, 1024, 60), (1536, 1536, 1536, 25) })
+        {
+            var rng = new Random(42);
+            var a = new float[m * k];
+            var b = new float[k * n];
+            var c = new float[m * n];
+            for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() * 2 - 1);
+            for (int i = 0; i < b.Length; i++) b[i] = (float)(rng.NextDouble() * 2 - 1);
+
+            double MeasureGemm(bool panel)
+            {
+                bool prev = MachineKernelGemm.EnablePanelKernel;
+                MachineKernelGemm.EnablePanelKernel = panel;
+                try
+                {
+                    for (int i = 0; i < 5; i++)
+                    {
+                        Array.Clear(c);
+                        MachineKernelGemm.TryGemmFp32(a, k, false, b, n, false, c, n, m, n, k, false, false); // warm
+                    }
+                    double best = double.MaxValue;
+                    for (int w = 0; w < 7; w++)
+                    {
+                        var sw = Stopwatch.StartNew();
+                        for (int i = 0; i < iters; i++)
+                        {
+                            Array.Clear(c);
+                            MachineKernelGemm.TryGemmFp32(a, k, false, b, n, false, c, n, m, n, k, false, false);
+                        }
+                        sw.Stop();
+                        best = Math.Min(best, sw.Elapsed.TotalSeconds);
+                    }
+                    return 2.0 * m * n * k * iters / best / 1e9;
+                }
+                finally { MachineKernelGemm.EnablePanelKernel = prev; }
+            }
+
+            double perTile = MeasureGemm(panel: false);
+            double panelG = MeasureGemm(panel: true);
+
+            // Single-thread per-core efficiency vs the ~115 GF/s raw kernel ceiling: isolates how much
+            // of the per-core compute survives packing + memory traffic (vs parallel-scaling loss).
+            int prevMax = CpuParallelSettings.MaxDegreeOfParallelism;
+            CpuParallelSettings.MaxDegreeOfParallelism = 1;
+            double st1;
+            try { st1 = MeasureGemm(panel: true); }
+            finally { CpuParallelSettings.MaxDegreeOfParallelism = prevMax; }
+
+            _output.WriteLine($"GEMM {m}x{n}x{k}: per-tile {perTile:F1} GF/s, " +
+                $"GEBP panel {panelG:F1} GF/s ({(panelG / perTile - 1) * 100:+0.0;-0.0}%) | " +
+                $"single-thread {st1:F1} GF/s (raw kernel ceiling ~115/core)");
         }
     }
 
