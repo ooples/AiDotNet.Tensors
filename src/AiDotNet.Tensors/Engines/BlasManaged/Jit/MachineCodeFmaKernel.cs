@@ -162,74 +162,189 @@ internal static class MachineCodeFmaKernel
         return asm.ToArray();
     }
 
-    /// <summary>
-    /// #653 GEBP panel driver (Windows ABI): computes <c>nTiles</c> consecutive 6×16 tiles in ONE
-    /// call, looping the N-tile dimension INSIDE the machine code. The managed driver then issues
-    /// one indirect call per packed panel instead of one per Nr-tile (the per-tile call throttled
-    /// the kernel ~20% below its raw ~115 GF/s). Signature:
-    ///   <c>void kern(float* packedA, float* packedB, float* c, long ldc, long kc, long nTiles)</c>.
-    /// packedA is the SAME Mr×kc stripe for every tile (rcx reset each iteration); packedB is the
-    /// contiguous [nTiles][kc][Nr] panel — the inner K-loop already advances rdx by kc·Nr, landing
-    /// it on the next tile's B, so it carries forward untouched; c advances Nr·4 bytes per tile.
-    /// Bit-identical to invoking the single-tile kernel nTiles times (same per-tile FMA order).
-    /// Caller must guarantee nTiles ≥ 1.
-    /// </summary>
+    // ── FP32 6×16 PANEL kernel ──────────────────────────────────────────────────
+    // Processes a whole 6-row × (njr·16)-col C block in ONE call: the 6×Kc packed-A
+    // block is read once and reused across all Nr=16 tiles; each Kc×16 packed-B stripe
+    // is streamed once. This is the OpenBLAS-style macro-kernel granularity — looping
+    // the N-tiles INSIDE the asm kernel eliminates the per-tile managed dispatch +
+    // re-prologue that caps the in-context throughput. Bit-identical to invoking the
+    // single-tile kernel njr times (same K-reduction order, disjoint C columns).
+    //
+    // Signature: void(float* packedA, float* packedB, float* c, long ldc, long kc, long njr)
+    //   Windows: rcx=A, rdx=B, r8=c, r9=ldc, [rsp+0x28]=kc, [rsp+0x30]=njr.
+    //   SysV:    rdi=A, rsi=B, rdx=c, rcx=ldc, r8=kc, r9=njr.
+    // The inner K-loop advances rdx by exactly kc·16·4 = one packed-B stripe, so after
+    // each tile rdx already points at the next stripe — no stride arithmetic needed. A
+    // is reset to its base each tile; C advances by one 16-float tile (64 bytes).
+
     internal static byte[] EmitFp32_6x16_PanelWindows()
     {
+        const int RCX = 1, R10 = 10, RAX = 0, RSI = 6, R12 = 12, R13 = 13, R9 = 9, RSP = 4;
         var asm = new X64Assembler();
-        // Save nonvolatile rbx/r12/r13 — they hold packedA-base / kc / nTiles across the body,
-        // which clobbers rcx/rdx/r10/r11/rax. The 3 pushes shift the stack args by +24 bytes.
-        asm.PushReg(3); asm.PushReg(12); asm.PushReg(13);   // rbx, r12, r13
-        asm.MovRegFromRsp(12, 0x28 + 24);   // r12 = kc      (5th stack arg, +24 for the pushes)
-        asm.MovRegFromRsp(13, 0x30 + 24);   // r13 = nTiles  (6th stack arg)
-        asm.MovRegReg(3, 1);                // rbx = rcx     (packedA stripe base)
+        // Load stack args BEFORE moving rsp (Windows: 5th arg @ +0x28, 6th @ +0x30).
+        asm.MovRegFromRsp(R10, 0x28);  // r10 = kc
+        asm.MovRegFromRsp(RAX, 0x30);  // rax = njr
+        // Preserve nonvolatile rsi, r12, r13 (used as A-base / kc / njr-counter).
+        asm.PushReg(RSI); asm.PushReg(R12); asm.PushReg(R13);
+        // Frame + save nonvolatile xmm6–15 (the body uses ymm6–15).
         asm.SubRsp(0xA0);
-        for (int i = 0; i < 10; i++) asm.VmovupsXmmStoreD32(4, i * 0x10, 6 + i); // save xmm6–15
+        for (int i = 0; i < 10; i++) asm.VmovupsXmmStoreD32(RSP, i * 0x10, 6 + i);
+        // Outer state.
+        asm.MovRegReg(RSI, RCX);   // rsi = A base
+        asm.MovRegReg(R12, R10);   // r12 = kc
+        asm.MovRegReg(R13, RAX);   // r13 = njr counter
+        asm.LeaRaxIndexScale4(R9); // rax = ldc*4 (row stride bytes) — constant across tiles
+
         EmitPanelLoop_Fp32_6x16(asm);
-        for (int i = 0; i < 10; i++) asm.VmovupsXmmLoadD32(6 + i, 4, i * 0x10);
+
+        for (int i = 0; i < 10; i++) asm.VmovupsXmmLoadD32(6 + i, RSP, i * 0x10);
         asm.AddRsp(0xA0);
-        asm.PopReg(13); asm.PopReg(12); asm.PopReg(3);
-        asm.Vzeroupper();
-        asm.Ret();
+        asm.PopReg(R13); asm.PopReg(R12); asm.PopReg(RSI);
+        asm.Vzeroupper(); asm.Ret();
         return asm.ToArray();
     }
 
-    /// <summary>System V AMD64 variant of <see cref="EmitFp32_6x16_PanelWindows"/> (args
-    /// rdi/rsi/rdx/rcx/r8/r9; volatile xmm so no save frame, just the 3 GP pushes).</summary>
     internal static byte[] EmitFp32_6x16_PanelSysV()
     {
+        const int RCX = 1, RDX = 2, R8 = 8, R9 = 9, R10 = 10, RAX = 0, RSI = 6, RDI = 7, R12 = 12, R13 = 13;
         var asm = new X64Assembler();
-        asm.PushReg(3); asm.PushReg(12); asm.PushReg(13);   // rbx, r12, r13
-        asm.MovRegReg(13, 9);   // r13 = nTiles  (r9)
-        asm.MovRegReg(12, 8);   // r12 = kc      (r8)
-        asm.MovRegReg(3, 7);    // rbx = packedA (rdi)
-        asm.MovRegReg(9, 1);    // r9  = ldc     (rcx)  — read before rcx is reused per tile
-        asm.MovRegReg(8, 2);    // r8  = c       (rdx)
-        asm.MovRegReg(2, 6);    // rdx = packedB (rsi)
+        // Shuffle SysV args (rdi=A,rsi=B,rdx=C,rcx=ldc,r8=kc,r9=njr) into the body layout
+        // (rcx=A,rdx=B,r8=C,r9=ldc,r10=kc,rax=njr). Order avoids clobbering a live source.
+        asm.MovRegReg(RAX, R9);    // rax = njr
+        asm.MovRegReg(R10, R8);    // r10 = kc
+        asm.MovRegReg(R9, RCX);    // r9 = ldc (rcx was ldc)
+        asm.MovRegReg(R8, RDX);    // r8 = C   (rdx was C)
+        asm.MovRegReg(RDX, RSI);   // rdx = B
+        asm.MovRegReg(RCX, RDI);   // rcx = A
+        // Preserve nonvolatile r12, r13 (rsi is volatile on SysV — used freely as A-base).
+        asm.PushReg(R12); asm.PushReg(R13);
+        asm.MovRegReg(RSI, RCX);   // rsi = A base
+        asm.MovRegReg(R12, R10);   // r12 = kc
+        asm.MovRegReg(R13, RAX);   // r13 = njr
+        asm.LeaRaxIndexScale4(R9); // rax = ldc*4
+
         EmitPanelLoop_Fp32_6x16(asm);
-        asm.PopReg(13); asm.PopReg(12); asm.PopReg(3);
-        asm.Vzeroupper();
-        asm.Ret();
+
+        asm.PopReg(R13); asm.PopReg(R12);
+        asm.Vzeroupper(); asm.Ret();
         return asm.ToArray();
     }
 
-    /// <summary>
-    /// N-tile loop shared by the panel emitters. Pre: rbx=packedA stripe base, r12=kc, r13=nTiles,
-    /// rdx=packedB (first tile), r8=c (first tile), r9=ldc. Each iteration resets rcx=rbx and
-    /// r10=r12, runs one 6×16 tile (advances rcx & rdx, leaves r8/r9/rbx/r12/r13), then advances
-    /// c by Nr·4 and decrements nTiles. r9/rbx/r12/r13 are untouched by the body.
-    /// </summary>
+    /// <summary>Register-level FP32 6×16 panel loop. Assumes rsi=A-base, r12=kc, r13=njr,
+    /// rax=ldc*4 (row stride bytes), r8=C, r9=ldc; clobbers ymm0–15, rcx, rdx, r10, r11,
+    /// advances r8/r13/rdx; rsi/r12/rax preserved across iterations. ABI-agnostic.</summary>
     private static void EmitPanelLoop_Fp32_6x16(X64Assembler asm)
     {
-        const int RCX = 1, R8 = 8, R10 = 10, R12 = 12, R13 = 13, RBX = 3, Nr = 16;
-        int ntile = asm.NewLabel();
-        asm.MarkLabel(ntile);
-        asm.MovRegReg(RCX, RBX);            // packedA reset to stripe base (same A for every tile)
-        asm.MovRegReg(R10, R12);            // kc reset
-        EmitBody_Fp32_6x16(asm);            // one 6×16 tile; advances rcx & rdx, r8 untouched
-        asm.AddRegImm8(R8, Nr * 4);         // c += 16 floats → next N-tile column block
-        asm.DecReg(R13);                    // nTiles--
-        asm.JnzLabel32(ntile);              // rel32 near jump: the 6×16 body far exceeds rel8 range
+        const int RCX = 1, RDX = 2, R8 = 8, R10 = 10, R11 = 11, RAX = 0, RSI = 6, R12 = 12, R13 = 13;
+        const int BLO = 12, BHI = 13, A0 = 14, A1 = 15; // YMM regs (distinct file from GP r12/r13)
+        const int Mr = 6, Nr = 16;
+
+        int done = asm.NewLabel();
+        asm.TestRegSelf(R13);
+        asm.JzLabel32(done);
+
+        int outer = asm.NewLabel();
+        asm.MarkLabel(outer);
+        asm.MovRegReg(RCX, RSI);   // reset A to base
+        asm.MovRegReg(R10, R12);   // reset kc
+
+        // Load 6 C rows (r11 walks from r8 by rax=ldc*4).
+        // DEAD END (measured neutral at DOP 1/4/32, do not re-add): prefetcht0 of the next
+        // N-tile's C here is a no-op — the 6×16 C read-modify-write is already amortized over
+        // kc≈256 K-steps, so cold-C latency isn't on the critical path. The single-thread
+        // ceiling (~66 GF/s in-context, ~76 hot-L1 vs OpenBLAS ~103) is the 6×16 broadcast/FMA
+        // microkernel itself, not C traffic or loop overhead (K-unroll was also only ~+5%).
+        asm.MovRegReg(R11, R8);
+        for (int r = 0; r < Mr; r++)
+        {
+            asm.VmovupsLoad(2 * r, R11, 0);
+            asm.VmovupsLoad(2 * r + 1, R11, 32);
+            if (r < Mr - 1) asm.AddRegReg(R11, RAX);
+        }
+
+        int store = asm.NewLabel();
+        int ktail = asm.NewLabel();
+        const int U = 4; // K-unroll factor
+
+        // Tuned prefetch distance for the next packed-B stripe (bytes ahead of rdx). 512 B = 8
+        // cache lines ≈ one Nr=16 tile's worth of K-steps ahead — far enough to hide the L2→L1
+        // latency, near enough not to evict the current stripe. A named kernel parameter, not
+        // incidental addressing: change this when retuning the panel for a different µarch.
+        const int BPrefetchBytes = 512;
+
+        // K-loop, unrolled by U=4. A single K-step is FMA-bound (12 FMAs ≈ 6 cycles), but the
+        // per-step pointer-advance (2 adds) + dec + taken branch added ~2.8 cycles of overhead
+        // on top — ~30% of the body — capping the hot-L1 kernel near 68% of peak. Unrolling
+        // amortizes that bookkeeping over 4 K-steps (1 branch / 4 steps instead of 1/step) and
+        // gives the scheduler a wider independent-FMA window. Bit-exact: K-steps still accumulate
+        // into C in ascending order 0,1,2,… (guarded by MachineKernelPanelTests).
+        //
+        // Software-prefetch the upcoming B 512 B ahead — hides the L2→L1 latency of the next
+        // packed panel, the dominant in-context stall. B-ONLY: the packed-A panel is only Mr=6
+        // floats (24 B) per K-step, already pulled into L1 by the vbroadcastss loads, so
+        // prefetching A is pure redundant load-port traffic (PR #656: A+B −14%, B-only −2% in
+        // the single-tile kernel). Here B is cold for the NEXT tile in the panel macro-loop, so
+        // it's a real win. Pure hint, bit-exact.
+        asm.CmpRegImm8(R10, U);
+        asm.JlLabel32(ktail);          // kc < U → straight to the 1-step tail
+        int kmain = asm.NewLabel();
+        asm.MarkLabel(kmain);
+        asm.Prefetcht0D32(RDX, BPrefetchBytes);
+        for (int ku = 0; ku < U; ku++)
+        {
+            int bOff = ku * Nr * 4;    // 0, 64, 128, 192 — within an unrolled block, read B/A by
+            if (bOff <= 127)           // displacement (no per-step pointer math). ≥128 needs disp32.
+            { asm.VmovupsLoad(BLO, RDX, (sbyte)bOff); asm.VmovupsLoad(BHI, RDX, (sbyte)(bOff + 32)); }
+            else
+            { asm.VmovupsLoadD32(BLO, RDX, bOff); asm.VmovupsLoadD32(BHI, RDX, bOff + 32); }
+            for (int r = 0; r < Mr; r++)
+            {
+                int areg = (r % 2 == 0) ? A0 : A1;
+                asm.VbroadcastSs(areg, RCX, (sbyte)(ku * Mr * 4 + r * 4)); // max 3*24+20=92 → disp8
+                asm.Vfmadd231ps(2 * r, areg, BLO);
+                asm.Vfmadd231ps(2 * r + 1, areg, BHI);
+            }
+        }
+        asm.AddRegImm32(RCX, U * Mr * 4);  // A += 24 floats
+        asm.AddRegImm32(RDX, U * Nr * 4);  // B += 64 floats
+        asm.SubRegImm8(R10, (sbyte)U);
+        asm.CmpRegImm8(R10, U);
+        asm.JlLabel32(ktail);          // remaining < U → tail
+        asm.JmpLabel32(kmain);         // else another unrolled round
+
+        // Tail: remaining 0..U-1 K-steps, one at a time (pointer-advance form).
+        asm.MarkLabel(ktail);
+        asm.TestRegSelf(R10);
+        asm.JzLabel32(store);
+        int kloop = asm.NewLabel();
+        asm.MarkLabel(kloop);
+        asm.VmovupsLoad(BLO, RDX, 0);
+        asm.VmovupsLoad(BHI, RDX, 32);
+        for (int r = 0; r < Mr; r++)
+        {
+            int areg = (r % 2 == 0) ? A0 : A1;
+            asm.VbroadcastSs(areg, RCX, (sbyte)(r * 4));
+            asm.Vfmadd231ps(2 * r, areg, BLO);
+            asm.Vfmadd231ps(2 * r + 1, areg, BHI);
+        }
+        asm.AddRegImm8(RCX, Mr * 4);  // A += 6 floats
+        asm.AddRegImm8(RDX, Nr * 4);  // B += 16 floats (→ next stripe after kc steps)
+        asm.DecReg(R10);
+        asm.JnzLabel32(kloop);
+
+        asm.MarkLabel(store);
+        asm.MovRegReg(R11, R8);
+        for (int r = 0; r < Mr; r++)
+        {
+            asm.VmovupsStore(R11, 0, 2 * r);
+            asm.VmovupsStore(R11, 32, 2 * r + 1);
+            if (r < Mr - 1) asm.AddRegReg(R11, RAX);
+        }
+
+        asm.AddRegImm8(R8, Nr * 4); // C += one 16-float tile (rdx already at next B stripe)
+        asm.DecReg(R13);
+        asm.JnzLabel32(outer);
+        asm.MarkLabel(done);
     }
 
     /// <summary>

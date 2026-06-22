@@ -5020,12 +5020,21 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             throw new InvalidOperationException("CUDA kernel not found: conv3d_direct");
 
         using var _ = PushContext();
-        int totalOutput = batch * outChannels * outDepth * outHeight * outWidth;
-        uint gridX = (uint)((totalOutput + DefaultBlockSize - 1) / DefaultBlockSize);
+        // The conv3d_direct kernel uses a 3D grid + 2D block: blockIdx.x→outWidth,
+        // blockIdx.y→outHeight, blockIdx.z→(batch*outChannels*outDepth), with threadIdx.x/y over
+        // a 16x16 tile. The previous launcher did a 1-D launch (only blockIdx.x populated) and
+        // passed `totalOutput` in place of the kernel's dilationD/H/W params (the array was also
+        // one slot short), so the kernel read uninitialised/garbage dilation and never indexed
+        // outHeight/outDepth/channels/batch — wrong results, and the malformed launch surfaced as
+        // cuLaunchKernel "Invalid value". Match the kernel's actual signature + grid here.
+        const int blockSize = 16;
+        uint gridX = (uint)((outWidth + blockSize - 1) / blockSize);
+        uint gridY = (uint)((outHeight + blockSize - 1) / blockSize);
+        uint gridZ = (uint)(batch * outChannels * outDepth);
         IntPtr inputPtr = input.Handle;
         IntPtr kernelPtr = kernel.Handle;
         IntPtr outputPtr = output.Handle;
-        void** args = stackalloc void*[23];
+        void** args = stackalloc void*[24];
         args[0] = &inputPtr;
         args[1] = &kernelPtr;
         args[2] = &outputPtr;
@@ -5047,8 +5056,10 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         args[18] = &padD;
         args[19] = &padH;
         args[20] = &padW;
-        args[21] = &totalOutput;
-        LaunchKernel(cudaKernel, gridX, DefaultBlockSize, args);
+        args[21] = &dilationD;
+        args[22] = &dilationH;
+        args[23] = &dilationW;
+        LaunchKernel2D(cudaKernel, gridX, gridY, gridZ, (uint)blockSize, (uint)blockSize, args);
     }
 
     public unsafe void DepthwiseConv2D(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer output,
@@ -5494,9 +5505,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         IntPtr gradWeightsPtr = gradWeights.Handle;
         int hasMask = mask is not null ? 1 : 0;
 
+        // Kernel parameter order is (input, gradOutput, offsets, mask, gradWeights, ...) — bind the
+        // pointers in THAT order (the previous code bound gradOutput first, so the kernel read
+        // gradOutput as `input` and vice versa).
         void** args = stackalloc void*[23];
-        args[0] = &gradOutputPtr;
-        args[1] = &inputPtr;
+        args[0] = &inputPtr;
+        args[1] = &gradOutputPtr;
         args[2] = &offsetsPtr;
         args[3] = &maskPtr;
         args[4] = &gradWeightsPtr;
@@ -5534,24 +5548,26 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             throw new InvalidOperationException("CUDA kernel not found: deformable_conv2d_backward_offset");
 
         using var _ = PushContext();
-        const int blockSize = 16;
-        int offsetChannels = 2 * kernelH * kernelW * deformGroups;
-        uint gridX = (uint)((outWidth + blockSize - 1) / blockSize);
-        uint gridY = (uint)((outHeight + blockSize - 1) / blockSize);
-        uint gridZ = (uint)(batch * offsetChannels);
+        // The deformable_conv2d_backward_offset kernel is 1-D indexed
+        // (idx over totalOffsets) and its parameter order is
+        // (input, weights, gradOutput, offsets, mask, gradOffset, ...). The previous launcher used a
+        // 2-D grid (the 1-D kernel could never reach beyond blockIdx.x) and bound the pointers
+        // gradOutput-first — both wrong; match the kernel here.
+        int totalOffsets = batch * deformGroups * 2 * kernelH * kernelW * outHeight * outWidth;
+        uint gridX = (uint)((totalOffsets + DefaultBlockSize - 1) / DefaultBlockSize);
 
-        IntPtr gradOutputPtr = gradOutput.Handle;
         IntPtr inputPtr = input.Handle;
         IntPtr weightsPtr = weights.Handle;
+        IntPtr gradOutputPtr = gradOutput.Handle;
         IntPtr offsetsPtr = offsets.Handle;
         IntPtr maskPtr = mask?.Handle ?? IntPtr.Zero;
         IntPtr gradOffsetsPtr = gradOffsets.Handle;
         int hasMask = mask is not null ? 1 : 0;
 
         void** args = stackalloc void*[24];
-        args[0] = &gradOutputPtr;
-        args[1] = &inputPtr;
-        args[2] = &weightsPtr;
+        args[0] = &inputPtr;
+        args[1] = &weightsPtr;
+        args[2] = &gradOutputPtr;
         args[3] = &offsetsPtr;
         args[4] = &maskPtr;
         args[5] = &gradOffsetsPtr;
@@ -5573,7 +5589,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         args[21] = &groups;
         args[22] = &deformGroups;
         args[23] = &hasMask;
-        LaunchKernel2D(cudaKernel, gridX, gridY, gridZ, (uint)blockSize, (uint)blockSize, args);
+        LaunchKernel(cudaKernel, gridX, DefaultBlockSize, args);
     }
 
     // Param order matches the engine call (input, weights, gradOutput, ...) so the kernel-order bindings below bind the right buffers.
@@ -5589,22 +5605,24 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             throw new InvalidOperationException("CUDA kernel not found: deformable_conv2d_backward_mask");
 
         using var _ = PushContext();
-        const int blockSize = 16;
-        int maskChannels = kernelH * kernelW * deformGroups;
-        uint gridX = (uint)((outWidth + blockSize - 1) / blockSize);
-        uint gridY = (uint)((outHeight + blockSize - 1) / blockSize);
-        uint gridZ = (uint)(batch * maskChannels);
+        // The deformable_conv2d_backward_mask kernel is 1-D indexed
+        // (idx = blockIdx.x*blockDim.x + threadIdx.x over totalMask) and its parameter order is
+        // (input, weights, gradOutput, offsets, gradMask, ...). The previous launcher used a 2-D grid
+        // (so the 1-D kernel could only ever cover blockIdx.x and never the full index space) and
+        // bound the pointer args gradOutput-first — both wrong; match the kernel here.
+        int totalMask = batch * deformGroups * kernelH * kernelW * outHeight * outWidth;
+        uint gridX = (uint)((totalMask + DefaultBlockSize - 1) / DefaultBlockSize);
 
-        IntPtr gradOutputPtr = gradOutput.Handle;
         IntPtr inputPtr = input.Handle;
         IntPtr weightsPtr = weights.Handle;
+        IntPtr gradOutputPtr = gradOutput.Handle;
         IntPtr offsetsPtr = offsets.Handle;
         IntPtr gradMaskPtr = gradMask.Handle;
 
         void** args = stackalloc void*[22];
-        args[0] = &gradOutputPtr;
-        args[1] = &inputPtr;
-        args[2] = &weightsPtr;
+        args[0] = &inputPtr;
+        args[1] = &weightsPtr;
+        args[2] = &gradOutputPtr;
         args[3] = &offsetsPtr;
         args[4] = &gradMaskPtr;
         args[5] = &batch;
@@ -5624,7 +5642,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         args[19] = &dilationW;
         args[20] = &groups;
         args[21] = &deformGroups;
-        LaunchKernel2D(cudaKernel, gridX, gridY, gridZ, (uint)blockSize, (uint)blockSize, args);
+        LaunchKernel(cudaKernel, gridX, DefaultBlockSize, args);
     }
 
     #endregion

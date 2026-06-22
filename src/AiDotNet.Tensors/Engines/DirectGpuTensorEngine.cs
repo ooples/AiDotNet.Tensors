@@ -7005,7 +7005,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                         for (int ow = 0; ow < outWidth; ow++)
                         {
                             int flatIdx = ((b * channels + c) * outHeight + oh) * outWidth + ow;
-                            int idx = (int)indicesFloat[flatIdx];
+                            // The maxpool2d kernel declares indices as `__global int*` and writes
+                            // raw int32 (`indices[outIdx] = maxIdx`), but this buffer is downloaded
+                            // as float[]. A numeric `(int)` cast of those bytes is WRONG: int 5 is
+                            // bit-pattern 0x00000005, which reads as float ≈ 7e-45 and truncates to
+                            // 0 — collapsing every window's argmax to cell (0,0) (the under-count that
+                            // failed the autodiff MaxPool2D grad-check). Reinterpret the bits back to
+                            // int32 instead (the buffer IS int32 data). Mirrors the backward path,
+                            // which already round-trips indices through AllocateIntBuffer.
+#if NET5_0_OR_GREATER
+                            int idx = BitConverter.SingleToInt32Bits(indicesFloat[flatIdx]);
+#else
+                            float idxBits = indicesFloat[flatIdx];
+                            int idx = System.Runtime.CompilerServices.Unsafe.As<float, int>(ref idxBits);
+#endif
                             maxIndices[b, c, oh, ow, 0] = idx / inWidth;
                             maxIndices[b, c, oh, ow, 1] = idx % inWidth;
                         }
@@ -7072,10 +7085,22 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         using var gradOutputBuffer = GetOrAllocateBuffer(backend, gradOutput);
         using var indicesBuffer = backend.AllocateIntBuffer(indicesFlat);
-        using var gradInputBuffer = AllocateOutputBuffer(backend, batch * channels * inHeight * inWidth);
+        int gradInputSize = batch * channels * inHeight * inWidth;
+        using var gradInputBuffer = AllocateOutputBuffer(backend, gradInputSize);
 
+        // The maxpool2d_backward kernel SCATTER-ADDS (gradInput[idx] += grad), so gradInput
+        // must start zeroed. AllocateOutputBuffer rents from the GPU buffer pool, which holds
+        // STALE data from a prior op — without this zero the scatter accumulates onto garbage,
+        // routing phantom gradient to non-max cells (the over-count that failed the autodiff
+        // MaxPool2D grad-check on a warm engine while the fresh-engine direct test passed).
+        // Matches the Scatter-ADD 0-init every other backward path here already does.
         try
         {
+            // Inside the guarded block: Fill is a GPU backend boundary call, so a failure here must
+            // fall through to the CPU MaxPool2DBackward fallback / ThrowOnGpuKernelFallback policy
+            // like the scatter-add below, not escape uncaught.
+            backend.Fill(gradInputBuffer.Buffer, 0f, gradInputSize);
+
             backend.MaxPool2DBackward(gradOutputBuffer.Buffer, indicesBuffer, gradInputBuffer.Buffer,
                 batch, channels, inHeight, inWidth,
                 outHeight, outWidth,
@@ -7615,8 +7640,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         try
         {
+            // Backend signature is (gradOutput, input, gradWeights, ...) — pass them in that order.
+            // (Previously input/gradOutput were swapped, so the kernel indexed input's buffer with the
+            // gradOutput layout and vice versa, producing wrong weight gradients.)
             backend.LocallyConnectedConv2DBackwardWeights(
-                inputBuffer.Buffer, gradOutputBuffer.Buffer, gradWeightsBuffer.Buffer,
+                gradOutputBuffer.Buffer, inputBuffer.Buffer, gradWeightsBuffer.Buffer,
                 batch, inChannels, inHeight, inWidth,
                 outChannels, outHeight, outWidth,
                 kernelH, kernelW, stride[0], stride[1]);

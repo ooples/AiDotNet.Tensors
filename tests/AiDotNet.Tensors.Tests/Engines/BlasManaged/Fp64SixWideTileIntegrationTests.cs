@@ -91,24 +91,9 @@ public class Fp64SixWideTileIntegrationTests
         var b = RandD(K * N, rng);
         var c = new double[M * N];
 
-        double MeasureMin(bool deterministic)
-        {
-            BlasProvider.SetDeterministicMode(deterministic);
-            for (int i = 0; i < warmup; i++)
-                BlasManagedLib.Gemm<double>(a, K, false, b, N, false, c, N, M, N, K,
-                    new BlasOptions<double> { PackingMode = PackingMode.ForcePackBoth });
-            double min = double.MaxValue;
-            for (int i = 0; i < measured; i++)
-            {
-                var sw = Stopwatch.StartNew();
-                BlasManagedLib.Gemm<double>(a, K, false, b, N, false, c, N, M, N, K,
-                    new BlasOptions<double> { PackingMode = PackingMode.ForcePackBoth });
-                sw.Stop();
-                double us = sw.Elapsed.TotalMilliseconds * 1000.0;
-                if (us < min) min = us;
-            }
-            return min;
-        }
+        void Run() =>
+            BlasManagedLib.Gemm<double>(a, K, false, b, N, false, c, N, M, N, K,
+                new BlasOptions<double> { PackingMode = PackingMode.ForcePackBoth });
 
         bool before = BlasProvider.IsDeterministicMode;
         bool? beforeTl = BlasProvider.GetThreadLocalDeterministicMode();
@@ -116,8 +101,30 @@ public class Fp64SixWideTileIntegrationTests
         double det4, fast6;
         try
         {
-            det4 = MeasureMin(true);    // 4×8
-            fast6 = MeasureMin(false);  // 6×8
+            // Warmup both modes (each picks its microkernel: deterministic=4×8, fast=6×8).
+            BlasProvider.SetDeterministicMode(true);  for (int i = 0; i < warmup; i++) Run();
+            BlasProvider.SetDeterministicMode(false); for (int i = 0; i < warmup; i++) Run();
+
+            // Interleaved min-of-N: measure the 4×8 (deterministic) and 6×8 (fast) tiles in
+            // the SAME loop so they share one contention timeline, taking the MINIMUM of each.
+            // The prior all-det-then-all-fast layout let a transient contention burst land
+            // entirely on one phase and skew the ratio (flaking the <=1.05x bar under full-
+            // suite load though both pass cleanly in isolation); interleaving removes that.
+            double minDet = double.MaxValue, minFast = double.MaxValue;
+            for (int i = 0; i < measured; i++)
+            {
+                BlasProvider.SetDeterministicMode(true);
+                var sw = Stopwatch.StartNew(); Run(); sw.Stop();
+                double usDet = sw.Elapsed.TotalMilliseconds * 1000.0;
+                if (usDet < minDet) minDet = usDet;
+
+                BlasProvider.SetDeterministicMode(false);
+                sw.Restart(); Run(); sw.Stop();
+                double usFast = sw.Elapsed.TotalMilliseconds * 1000.0;
+                if (usFast < minFast) minFast = usFast;
+            }
+            det4 = minDet;   // 4×8
+            fast6 = minFast;  // 6×8
         }
         finally
         {
@@ -130,6 +137,13 @@ public class Fp64SixWideTileIntegrationTests
         _out.WriteLine($"  Fast          6×8: {fast6,7:F2} us   {flops / (fast6 * 1e-6) / 1e9,6:F1} GF/s   ({det4 / fast6:F2}x vs 4×8)");
 
         Assert.True(det4 > 0 && fast6 > 0);
+
+        // The 6×8 must not be slower than the 4×8 (≤5%) — contract, asserted unconditionally and
+        // never weakened to a skip-on-failure. This test is [Trait("Category","Performance")], so the
+        // contended full-suite correctness run excludes it (where a transient stall could break the
+        // tight margin); it runs in the isolated perf lane where the min-of-N interleaved measurement
+        // (both kernels share one contention timeline) makes the ratio robust. End-to-end numeric
+        // correctness of the 6×8 tile is also asserted by the [Theory] cases above.
         Assert.True(fast6 <= det4 * 1.05, $"6×8 is slower: {fast6} > {det4}");
     }
 

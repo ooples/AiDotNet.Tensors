@@ -941,10 +941,30 @@ internal static class BackwardFunctions<T>
         var padding = (int[])savedState[1];
         var dilation = (int[])savedState[2];
 
-        var gradInput = engine.Conv2DBackwardInput(
-            gradOutput, inputs[1], inputs[0]._shape, stride, padding, dilation);
-        var gradKernel = engine.Conv2DBackwardKernel(
-            gradOutput, inputs[0], inputs[1]._shape, stride, padding, dilation);
+        // #1662 lever #4: route the conv backward OUTPUT gradients through the per-step arena
+        // (AutoTensorCache -> TensorAllocator -> TensorArena) instead of the raw `new float[]`
+        // the allocating Conv2DBackwardInput/Kernel entries use, which bypassed the arena
+        // (~1 MB/step leak measured by `--trainbench --block conv`: only 76.6% recycled vs
+        // 98-99.9% for matmul/attention backward). The *Into variants fill a rented buffer and
+        // zero it first (accumulate:false -> Array.Clear), so renting uninitialized memory is
+        // safe. CPU-only; the GPU engine keeps the allocating path.
+        Tensor<T> gradInput, gradKernel;
+        if (engine is CpuEngine cpu)
+        {
+            gradInput = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[0]._shape);
+            gradKernel = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[1]._shape);
+            cpu.Conv2DBackwardInputInto(
+                gradInput, gradOutput, inputs[1], inputs[0]._shape, stride, padding, dilation, accumulate: false);
+            cpu.Conv2DBackwardKernelInto(
+                gradKernel, gradOutput, inputs[0], inputs[1]._shape, stride, padding, dilation, accumulate: false);
+        }
+        else
+        {
+            gradInput = engine.Conv2DBackwardInput(
+                gradOutput, inputs[1], inputs[0]._shape, stride, padding, dilation);
+            gradKernel = engine.Conv2DBackwardKernel(
+                gradOutput, inputs[0], inputs[1]._shape, stride, padding, dilation);
+        }
 
         DifferentiableOps.AccumulateGrad(grads, inputs[0], gradInput, engine);
         DifferentiableOps.AccumulateGrad(grads, inputs[1], gradKernel, engine);
