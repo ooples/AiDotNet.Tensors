@@ -283,45 +283,83 @@ public sealed class ExecutionGraphBuilder : IDisposable
 
     private void TrackBufferDependencies(ExecutionNode node)
     {
-        // Get input buffers and add dependencies on their last writers
+        // Read-after-write (RAW): a read depends on the last write to that buffer. We also record
+        // this node as a READER of the buffer so a later write to the same buffer can order itself
+        // after it (write-after-read, below).
         foreach (var input in node.InputTensors)
         {
-            if (_lastWriteNode.TryGetValue(input.Buffer, out var lastWriter))
-            {
-                node.AddDependency(lastWriter);
-            }
-
-            // Track this node as a dependent of the buffer
-            if (!_bufferDependents.TryGetValue(input.Buffer, out var dependents))
-            {
-                dependents = new List<ExecutionNode>();
-                _bufferDependents[input.Buffer] = dependents;
-            }
-            dependents.Add(node);
+            AddRawAndRecordReader(node, input.Buffer);
         }
 
-        // Track this node as the last writer to its output buffers
+        // For every output buffer, add the write-after-write (WAW) and write-after-read (WAR)
+        // hazard edges that RAW tracking alone misses:
+        //   * WAW — order this write after the PREVIOUS writer of the same buffer. Critical for a
+        //     buffer with MULTIPLE writers: e.g. TensorConcatenate composes from one offset Copy per
+        //     input slice, all writing the SAME destination. A later reader depends only on the LAST
+        //     writer, so without serializing the writers the earlier slice-copies race the reader
+        //     under multi-stream execution and it sees a partially-written buffer (the deferred-graph
+        //     long-lived-skip-into-concat corruption, AiDotNet #1650).
+        //   * WAR — order this write after every READER recorded since the last write, so reusing /
+        //     overwriting a buffer can't clobber data a still-pending reader needs.
         foreach (var output in node.OutputTensors)
         {
-            _lastWriteNode[output.Buffer] = node;
+            AddWawWarAndRecordWrite(node, output.Buffer);
         }
 
-        // Handle transfer nodes specially
+        // Transfer nodes carry their source/destination outside InputTensors/OutputTensors.
         if (node is TransferNode transfer)
         {
             if (transfer.SourceBuffer != null)
             {
-                if (_lastWriteNode.TryGetValue(transfer.SourceBuffer, out var srcWriter))
-                {
-                    node.AddDependency(srcWriter);
-                }
+                AddRawAndRecordReader(node, transfer.SourceBuffer);
             }
 
             if (transfer.DestinationBuffer != null)
             {
-                _lastWriteNode[transfer.DestinationBuffer] = node;
+                AddWawWarAndRecordWrite(node, transfer.DestinationBuffer);
             }
         }
+    }
+
+    // RAW: depend on the buffer's last writer; record this node as a reader (for later WAR edges).
+    private void AddRawAndRecordReader(ExecutionNode node, IGpuBuffer buffer)
+    {
+        if (_lastWriteNode.TryGetValue(buffer, out var lastWriter) && lastWriter != node)
+        {
+            node.AddDependency(lastWriter);
+        }
+
+        if (!_bufferDependents.TryGetValue(buffer, out var readers))
+        {
+            readers = new List<ExecutionNode>();
+            _bufferDependents[buffer] = readers;
+        }
+        readers.Add(node);
+    }
+
+    // WAW + WAR: depend on the previous writer and on every reader since that write, then become the
+    // buffer's last writer and reset its pending-reader set.
+    private void AddWawWarAndRecordWrite(ExecutionNode node, IGpuBuffer buffer)
+    {
+        if (_lastWriteNode.TryGetValue(buffer, out var prevWriter) && prevWriter != node)
+        {
+            node.AddDependency(prevWriter); // WAW
+        }
+
+        if (_bufferDependents.TryGetValue(buffer, out var readers))
+        {
+            foreach (var reader in readers)
+            {
+                if (reader != node)
+                {
+                    node.AddDependency(reader); // WAR
+                }
+            }
+            // Reads before this write are now ordered; subsequent reads accumulate fresh.
+            readers.Clear();
+        }
+
+        _lastWriteNode[buffer] = node;
     }
 
     private void ValidateGraph()
