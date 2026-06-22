@@ -65,7 +65,13 @@ internal static class StrategyDefaultTable
                 ShapeBucket.TallThin => PackingMode.ForceStreaming,
                 ShapeBucket.MediumSquare => PackingMode.ForceStreaming,  // 128³ transB: Streaming
                 ShapeBucket.ThinK => PackingMode.ForcePackBoth,          // 512×512×64 transB: PackBoth ≫ Streaming
-                ShapeBucket.MediumMWide => PackingMode.ForcePackAOnly,   // 197×768×768 transB → PackBoth via PackAOnly
+                // #653: was ForcePackAOnly, calibrated for TRANSPOSED shapes (which redirect
+                // PackAOnly→PackBoth under transB and win). But PrefersStrategyOverMachineKernel
+                // declines the machine kernel for deep-K small-M (k>2m), so NON-transposed
+                // FFN-shaped GEMMs (m∈[132,256], wide-N, deep-K) also reach here — and for them
+                // PackAOnly is pathologically 4-6× slower than PackBoth (132×384×1536: 26ms vs
+                // ~6ms). PackBoth is also where the transB redirect lands, so route there directly.
+                ShapeBucket.MediumMWide => PackingMode.ForcePackBoth,
                 _ => PackingMode.ForcePackBoth,
             };
         }
@@ -80,7 +86,7 @@ internal static class StrategyDefaultTable
                 ShapeBucket.TallThin => PackingMode.ForceStreaming,
                 ShapeBucket.MediumSquare => PackingMode.ForcePackBoth,
                 ShapeBucket.ThinK => PackingMode.ForcePackAOnly,
-                ShapeBucket.MediumMWide => PackingMode.ForcePackAOnly,
+                ShapeBucket.MediumMWide => PackingMode.ForcePackBoth, // #653: see cpu≤1 note — PackAOnly is pathological for non-transposed MediumMWide
                 _ => PackingMode.ForcePackBoth,
             };
         }
@@ -95,7 +101,7 @@ internal static class StrategyDefaultTable
             ShapeBucket.TallThin => PackingMode.ForceStreaming,
             ShapeBucket.ThinK => PackingMode.ForcePackAOnly,
             ShapeBucket.MediumSquare => PackingMode.ForcePackAOnly,
-            ShapeBucket.MediumMWide => PackingMode.ForcePackAOnly,
+            ShapeBucket.MediumMWide => PackingMode.ForcePackBoth, // #653: see cpu≤1 note — PackAOnly is pathological for non-transposed MediumMWide
             _ => PackingMode.ForcePackBoth,
         };
     }
