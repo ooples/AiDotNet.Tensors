@@ -138,19 +138,12 @@ public class Fp64SixWideTileIntegrationTests
 
         Assert.True(det4 > 0 && fast6 > 0);
 
-        // The 6×8 must not be slower than the 4×8 (≤5%) — contract, never weakened. The two
-        // kernels are measured interleaved + min-of-N so they share one contention timeline,
-        // which makes the ratio robust in isolation. But the test assembly runs massively
-        // parallel in one process; under a saturated full-suite run a transient stall on the
-        // faster kernel's min can still break the tight 5% margin even though both kernels are
-        // single-threaded. So enforce the bound when measuring in an isolated perf lane
-        // (AIDOTNET_ENFORCE_PERF=1) and otherwise SKIP-as-inconclusive rather than false-fail.
-        // End-to-end numeric correctness of the 6×8 tile is asserted unconditionally by the
-        // [Theory] cases above, so a skip here costs no correctness coverage.
-        bool enforce = Environment.GetEnvironmentVariable("AIDOTNET_ENFORCE_PERF") == "1";
-        Skip.If(!enforce && fast6 > det4 * 1.05,
-            $"6×8 measured {det4 / fast6:F2}x vs 4×8 (>5% slower) — unreliable under the parallel suite's " +
-            $"shared-CPU contention (passes in isolation). Set AIDOTNET_ENFORCE_PERF=1 in an isolated perf lane to enforce.");
+        // The 6×8 must not be slower than the 4×8 (≤5%) — contract, asserted unconditionally and
+        // never weakened to a skip-on-failure. This test is [Trait("Category","Performance")], so the
+        // contended full-suite correctness run excludes it (where a transient stall could break the
+        // tight margin); it runs in the isolated perf lane where the min-of-N interleaved measurement
+        // (both kernels share one contention timeline) makes the ratio robust. End-to-end numeric
+        // correctness of the 6×8 tile is also asserted by the [Theory] cases above.
         Assert.True(fast6 <= det4 * 1.05, $"6×8 is slower: {fast6} > {det4}");
     }
 

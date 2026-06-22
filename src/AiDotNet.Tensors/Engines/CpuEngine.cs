@@ -9363,7 +9363,7 @@ public partial class CpuEngine : ITensorLevelEngine
             // im2col, so blocking would only add per-block overhead). Bit-identical output.
             bool isPointwiseIdentity = kernelHeight == 1 && kernelWidth == 1
                 && stride == 1 && padding == 0 && dilation == 1;
-            if (isPointwiseIdentity || DisableImplicitGemmConv)
+            if (isPointwiseIdentity || t_forceFullIm2Col)
             {
                 Conv2DWithIm2ColGemm(input, kernel, result, batch, inChannels, height, width,
                     outChannels, kernelHeight, kernelWidth, stride, padding, dilation, outputHeight, outputWidth);
@@ -9570,11 +9570,26 @@ public partial class CpuEngine : ITensorLevelEngine
 #endif
     }
 
-    // Test-only switch: when true, the high-channel float forward conv falls back to the
-    // full-matrix im2col path instead of the fused (implicit-GEMM) path. Lets a parity
-    // test assert the fused path is BIT-IDENTICAL to the full path (same GEMM, blocked).
-    // Never set in production.
-    internal static bool DisableImplicitGemmConv;
+    // Test-only override: forces the high-channel float forward conv onto the full-matrix im2col
+    // path instead of the fused (implicit-GEMM) path, so a parity test can assert the two are
+    // BIT-IDENTICAL (same GEMM, blocked). [ThreadStatic] so it NEVER affects a concurrent
+    // production Conv2D on another thread, and only ever set through ForceFullIm2ColScope() — a
+    // disposable that restores the prior value, so it cannot leak across tests/calls. Not a
+    // process-wide switch.
+    [ThreadStatic]
+    private static bool t_forceFullIm2Col;
+
+    /// <summary>Test-only: scope that forces the full im2col conv path on the CURRENT thread until
+    /// disposed (restoring the prior value). Used by the implicit-GEMM parity test; thread-local so
+    /// it cannot affect concurrent production Conv2D calls.</summary>
+    internal static IDisposable ForceFullIm2ColScope() => new ForceFullIm2ColOverride();
+
+    private sealed class ForceFullIm2ColOverride : IDisposable
+    {
+        private readonly bool _prev;
+        internal ForceFullIm2ColOverride() { _prev = t_forceFullIm2Col; t_forceFullIm2Col = true; }
+        public void Dispose() => t_forceFullIm2Col = _prev;
+    }
 
     // Target byte budget for the fused conv's reused im2col panel. Sized so the
     // [colH x ncBlock] panel stays resident in L2/L3 across its per-block GEMM
@@ -9602,22 +9617,24 @@ public partial class CpuEngine : ITensorLevelEngine
         int outChannels, int kernelHeight, int kernelWidth,
         int stride, int padding, int dilation, int outputHeight, int outputWidth)
     {
-        int colH = inChannels * kernelHeight * kernelWidth;
-        int colW = outputHeight * outputWidth;
+        // Fail loud on int overflow of the shape products rather than silently wrapping to a
+        // negative/wrong size (which would corrupt the panel Rent and the GEMM bounds below).
+        int colH = checked(inChannels * kernelHeight * kernelWidth);
+        int colW = checked(outputHeight * outputWidth);
 
         // Block on whole output rows so the stride=1 contiguous-memcpy im2col fast path
         // stays intact and the panel covers an exact column range [oh0*outW, oh1*outW).
         long perRowFloats = (long)colH * outputWidth;
         int ohRows = (int)Math.Max(1, Math.Min(outputHeight, FusedConvPanelFloatBudget / Math.Max(1, perRowFloats)));
-        int maxNcBlock = ohRows * outputWidth;
+        int maxNcBlock = checked(ohRows * outputWidth);
 
         var inputSpan = input.AsSpan();
         var kernelSpan = kernel.AsSpan();
         var outputSpan = result.Data.Span;
-        int inputSliceSize = inChannels * height * width;
+        int inputSliceSize = checked(inChannels * height * width);
 
         var pool = System.Buffers.ArrayPool<float>.Shared;
-        float[] panel = pool.Rent(colH * maxNcBlock);
+        float[] panel = pool.Rent(checked(colH * maxNcBlock));
         try
         {
             var panelSpan = panel.AsSpan();

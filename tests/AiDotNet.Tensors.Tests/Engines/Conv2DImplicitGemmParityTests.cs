@@ -47,19 +47,15 @@ public class Conv2DImplicitGemmParityTests
         var padArr = new[] { pad, pad };
         var dilArr = new[] { dilation, dilation };
 
-        float[] fused;
-        float[] full;
-        try
-        {
-            CpuEngine.DisableImplicitGemmConv = false;
-            fused = e.Conv2D(x, kernel, strideArr, padArr, dilArr).ToArray();
+        // Fused (implicit-GEMM) path is the production default.
+        float[] fused = e.Conv2D(x, kernel, strideArr, padArr, dilArr).ToArray();
 
-            CpuEngine.DisableImplicitGemmConv = true;
-            full = e.Conv2D(x, kernel, strideArr, padArr, dilArr).ToArray();
-        }
-        finally
+        // Full im2col baseline via a thread-local, auto-restoring scope — no process-wide flag, so
+        // this can't perturb a concurrent Conv2D or leak into sibling tests.
+        float[] full;
+        using (CpuEngine.ForceFullIm2ColScope())
         {
-            CpuEngine.DisableImplicitGemmConv = false;
+            full = e.Conv2D(x, kernel, strideArr, padArr, dilArr).ToArray();
         }
 
         Assert.Equal(full.Length, fused.Length);

@@ -350,9 +350,13 @@ internal static class MachineKernelGemm
     internal static bool IsFp64Available => false;
     internal static bool IsFp32Available => false;
     internal static bool IsFp32PanelAvailable => false;
+    /// <summary>net471 has no JIT panel kernel; callers must gate on <see cref="IsFp32PanelAvailable"/>.
+    /// Reached only by a caller that skipped that gate — fail loud rather than silently leave C unchanged.</summary>
     internal static void RunPanelFp32(
         ReadOnlySpan<float> packedA, ReadOnlySpan<float> packedB,
-        Span<float> c, int ldc, int kc, int njr) { }
+        Span<float> c, int ldc, int kc, int njr) =>
+        throw new PlatformNotSupportedException(
+            "RunPanelFp32 requires the net5.0+ machine-code JIT path; gate on IsFp32PanelAvailable before calling.");
     internal static int ActiveFp64Nr => Fp64Nr;
     internal static int ActiveFp32Nr => Fp32Nr;
 

@@ -185,7 +185,10 @@ internal static class PackBothStrategy
             {
                 int l2Target = 256 * 1024 / (Math.Max(1, kc) * sizeof(float));
                 ncN = Math.Max(nr, (l2Target / nr) * nr);
-                ncN = Math.Min(ncN, ((n + nr - 1) / nr) * nr);
+                int nRounded = ((n + nr - 1) / nr) * nr;
+                // Only shrink toward n when n>0; a zero-column GEMM would clamp ncN to 0 and make
+                // the numNBlocksN divide below throw. (Callers guard n>0, but keep route selection safe.)
+                if (nRounded > 0) ncN = Math.Min(ncN, nRounded);
             }
             int numNBlocksN = (n + ncN - 1) / ncN;
             int effProcs = Math.Min(procs, Environment.ProcessorCount);
@@ -206,6 +209,7 @@ internal static class PackBothStrategy
                 && options.Epilogue.BiasN.IsEmpty && options.Epilogue.SkipMxN.IsEmpty;
             if (useNAxis)
             {
+                System.Threading.Interlocked.Increment(ref s_nAxisRunCount); // test observable (see s_nAxisRunCount)
                 fixed (T* aPtrN = a)
                 fixed (T* bPtrN = b)
                 fixed (T* cPtrN = c)
@@ -783,9 +787,10 @@ internal static class PackBothStrategy
                             // for n=6144) regresses vs ~256 (the single call's B/C working set
                             // spills cache); chunking keeps each call's footprint bounded while
                             // still amortizing dispatch over MaxPanelTiles tiles.
-                            for (int jb = 0; jb < njrFull; jb += MaxPanelTiles)
+                            int maxPanelTiles = Math.Max(1, MaxPanelTiles); // guard sweep-set 0/negative
+                            for (int jb = 0; jb < njrFull; jb += maxPanelTiles)
                             {
-                                int chunk = Math.Min(MaxPanelTiles, njrFull - jb);
+                                int chunk = Math.Min(maxPanelTiles, njrFull - jb);
                                 int cPanelOff = (ic + ir) * ldc + (jc_cap + jb * nr);
                                 MachineKernelGemm.RunPanelFp32(
                                     aPanel,
@@ -848,6 +853,11 @@ internal static class PackBothStrategy
 
     // Route wide-N moderate-M float GEMMs to the N-axis private-B path. Test-only toggle.
     internal static bool s_disableNAxis;
+
+    // Test-only observable: incremented each time the N-axis private-B path actually runs, so the
+    // parity test can assert the N-axis path was exercised (not silently falling back to M-axis,
+    // which would make the bit-identity comparison vacuous M-vs-M).
+    internal static long s_nAxisRunCount;
 
     /// <summary>
     /// N-axis-parallel path (FP32 panel kernel): packs ALL of A once into a shared read-only
@@ -939,9 +949,10 @@ internal static class PackBothStrategy
                             int cOff = (ir * mrL) * ldcL + jc;
                             if (njrFull > 0)
                             {
-                                for (int jb = 0; jb < njrFull; jb += MaxPanelTiles)
+                                int maxPanelTiles = Math.Max(1, MaxPanelTiles); // guard sweep-set 0/negative
+                                for (int jb = 0; jb < njrFull; jb += maxPanelTiles)
                                 {
-                                    int chunk = Math.Min(MaxPanelTiles, njrFull - jb);
+                                    int chunk = Math.Min(maxPanelTiles, njrFull - jb);
                                     MachineKernelGemm.RunPanelFp32(
                                         aPanel,
                                         bPanel.Slice(jb * effKc * nrL, chunk * effKc * nrL),

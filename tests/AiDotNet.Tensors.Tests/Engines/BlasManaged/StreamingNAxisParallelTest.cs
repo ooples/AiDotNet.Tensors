@@ -112,6 +112,7 @@ public class StreamingNAxisParallelTest
     }
 
     [SkippableFact]
+    [Trait("Category", "Performance")]
     public void Streaming_NAxisParallel_Delivers_Speedup_On_Wide_N()
     {
         // CI run 26304260634 measured 0.39x on a 4-vCPU runner: with
@@ -163,23 +164,12 @@ public class StreamingNAxisParallelTest
         double speedup = serialMin / parallelMin;
         _output.WriteLine($"Streaming N-axis (min-of-30): serial={serialMin:F2}ms parallel={parallelMin:F2}ms speedup={speedup:F2}x");
 
-        // The ≥2x bar is the contract and is NEVER weakened. The wall-clock speedup ratio is
-        // only validly measurable when this test owns the cores AND memory bandwidth — but the
-        // test assembly runs massively parallel in one process, so during a full-suite run the
-        // sibling collections saturate the shared cores/L3/DRAM the N-axis split needs, and no
-        // single iteration sees 8 free cores (xUnit's DisableParallelization does not isolate
-        // cross-collection — see BlasManagedPerfSerialCollection). So:
-        //   • host genuinely delivers ≥2x (isolation, or an idle perf lane) → PASS;
-        //   • AIDOTNET_ENFORCE_PERF=1 (dedicated isolated perf lane) → always assert, so a real
-        //     regression FAILS loudly;
-        //   • otherwise the ratio fell short only because the shared box is saturated → SKIP as
-        //     inconclusive rather than emit a false failure.
-        // Bit-exact correctness of the parallel split is asserted unconditionally by the
-        // sibling [Fact]s, so a skip here costs no correctness coverage.
-        bool enforce = Environment.GetEnvironmentVariable("AIDOTNET_ENFORCE_PERF") == "1";
-        Skip.If(!enforce && speedup < 2.0,
-            $"Streaming N-axis speedup {speedup:F2}x < 2x — unreliable under the parallel suite's shared-core/" +
-            $"bandwidth contention (passes in isolation). Set AIDOTNET_ENFORCE_PERF=1 in an isolated perf lane to enforce.");
+        // The ≥2x bar is the contract, asserted unconditionally and NEVER weakened to a
+        // skip-on-failure. This test is [Trait("Category","Performance")], so the contended
+        // full-suite correctness run excludes it (where the shared cores/L3/DRAM would starve the
+        // N-axis split and produce a false failure); it runs in the isolated perf lane where the
+        // min-of-30 wall-clock measurement is valid. Bit-exact correctness of the parallel split is
+        // asserted unconditionally by the sibling [Fact]s.
         Assert.True(speedup >= 2.0, $"Expected >=2x speedup, got {speedup:F2}x (serial={serialMin:F2}ms, parallel={parallelMin:F2}ms)");
     }
 }

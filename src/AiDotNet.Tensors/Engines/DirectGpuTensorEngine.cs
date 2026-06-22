@@ -7094,10 +7094,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // routing phantom gradient to non-max cells (the over-count that failed the autodiff
         // MaxPool2D grad-check on a warm engine while the fresh-engine direct test passed).
         // Matches the Scatter-ADD 0-init every other backward path here already does.
-        backend.Fill(gradInputBuffer.Buffer, 0f, gradInputSize);
-
         try
         {
+            // Inside the guarded block: Fill is a GPU backend boundary call, so a failure here must
+            // fall through to the CPU MaxPool2DBackward fallback / ThrowOnGpuKernelFallback policy
+            // like the scatter-add below, not escape uncaught.
+            backend.Fill(gradInputBuffer.Buffer, 0f, gradInputSize);
+
             backend.MaxPool2DBackward(gradOutputBuffer.Buffer, indicesBuffer, gradInputBuffer.Buffer,
                 batch, channels, inHeight, inWidth,
                 outHeight, outWidth,
