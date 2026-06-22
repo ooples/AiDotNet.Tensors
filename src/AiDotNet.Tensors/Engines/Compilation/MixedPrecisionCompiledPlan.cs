@@ -96,11 +96,16 @@ public sealed class MixedPrecisionCompiledPlan
             // (AIDOTNET_FP16_NO_SCRATCH_FREE) so it can be disabled without losing the activation free schedule.
             _scratchFree = Environment.GetEnvironmentVariable("AIDOTNET_FP16_NO_SCRATCH_FREE") != "1";
         }
-        // Forward Half-resident store: default-on ONLY for the FP16 hetero TRAINING forward (FromCapturedOrder,
-        // fwdStoreEligible=true), where the VRAM win matters and the training parity tolerance already covers the
-        // Half-storage rounding. NOT for the standalone Compile()/Trace() inference path, whose contract is to
-        // replay a fresh trace bit-for-bit (the Half storage would perturb the matmul-intermediate values vs the
-        // eager FP32-stored trace). Opt-out AIDOTNET_FP16_NO_FWD_STORE; an explicit Fp16FwdStoreOverride wins.
+        // Forward Half-resident store: keeps each Half matmul output a HALF GPU buffer (half the VRAM)
+        // instead of up-casting to FP32. Engaged by default for the FP16 hetero TRAINING forward
+        // (FromCapturedOrder, fwdStoreEligible=true). The training backward reads these Half activations as
+        // weight-gradient operands (h in dW = hᵀ·dY); that read is correct end-to-end now that
+        // DirectGpuTensorEngine.TensorTranspose routes non-float (Half) through the element-size-correct
+        // path instead of the float-typed transpose_2d kernel, and CudaBackend.ConvertToFp32 falls back to
+        // the self-contained native kernel on driver-only GPUs (the two #1624 fixes — previously the Half
+        // weight-gradient transpose read Half-as-float and zeroed dW). NOT for the standalone
+        // Compile()/Trace() inference path (its contract is bit-for-bit eager replay). Opt-out
+        // AIDOTNET_FP16_NO_FWD_STORE; an explicit Fp16FwdStoreOverride wins.
         _fwdStoreDefault = fwdStoreEligible
             && engine is DirectGpuTensorEngine
             && Environment.GetEnvironmentVariable("AIDOTNET_FP16_NO_FWD_STORE") != "1";
@@ -208,7 +213,9 @@ public sealed class MixedPrecisionCompiledPlan
         // Engage the Half-resident forward store for the GPU hetero forward so each Half matmul output stays a
         // HALF GPU buffer (half the VRAM) instead of being up-cast to FP32 — but ONLY when the caller hasn't set
         // an explicit override (the A/B peak tests do), so their measurement intent is preserved.
-        bool setStore = _fwdStoreDefault && DirectGpuTensorEngine.Fp16FwdStoreOverride is null;
+        // AIDOTNET_FP16_NO_FWD_STORE is a hard opt-out that takes precedence over all other enable mechanisms.
+        bool hardOptOut = Environment.GetEnvironmentVariable("AIDOTNET_FP16_NO_FWD_STORE") == "1";
+        bool setStore = !hardOptOut && _fwdStoreDefault && DirectGpuTensorEngine.Fp16FwdStoreOverride is null;
         var prevStore = DirectGpuTensorEngine.Fp16FwdStoreOverride;
         if (setStore) DirectGpuTensorEngine.Fp16FwdStoreOverride = true;
         try

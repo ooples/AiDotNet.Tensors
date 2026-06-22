@@ -310,7 +310,10 @@ internal static class PackAOnlyStrategy
     /// Routes to the appropriate strided-B microkernel matching T and the
     /// Mr×Nr tile width chosen by the caller. AVX2 8×8 FP32 fires when
     /// <paramref name="mr"/>==8 AND <paramref name="nr"/>==8 AND AVX2+FMA
-    /// are runtime-available; else falls through to scalar 4×4.
+    /// are runtime-available; when no matching SIMD kernel is available (e.g.
+    /// net471 or no-AVX2 platforms), falls back to scalar: the optimized
+    /// 4×4 kernel for 4×4 tiles specifically, or the generic scalar fallback
+    /// for all other tile size combinations (mr != 4 or nr != 4).
     /// </summary>
     private static void DispatchStridedMicrokernel<T>(
         ReadOnlySpan<T> packedA, ReadOnlySpan<T> b, int ldb,
@@ -336,10 +339,20 @@ internal static class PackAOnlyStrategy
                     MemoryMarshal.Cast<T, float>(c), ldc, kc);
                 return;
             }
-            ScalarFp32_4x4.RunStridedB(
-                MemoryMarshal.Cast<T, float>(packedA),
-                MemoryMarshal.Cast<T, float>(b), ldb,
-                MemoryMarshal.Cast<T, float>(c), ldc, kc);
+            // Scalar fallback (no matching SIMD kernel — e.g. net471 / no-AVX2). The fixed 4×4
+            // kernel is only correct for a 4×4 tile; the general kernel honors the actual mr×nr
+            // (RunSerial packs A at the active mr and dispatches mr×nr tiles, so a 6×16/8×8 tile
+            // would read packed-A at the wrong stride + compute only a 4×4 corner here).
+            if (mr == 4 && nr == 4)
+                ScalarFp32_4x4.RunStridedB(
+                    MemoryMarshal.Cast<T, float>(packedA),
+                    MemoryMarshal.Cast<T, float>(b), ldb,
+                    MemoryMarshal.Cast<T, float>(c), ldc, kc);
+            else
+                ScalarGenericStridedB.RunFloat(
+                    MemoryMarshal.Cast<T, float>(packedA), mr,
+                    MemoryMarshal.Cast<T, float>(b), ldb,
+                    MemoryMarshal.Cast<T, float>(c), ldc, nr, kc);
             return;
         }
         if (typeof(T) == typeof(double))
@@ -362,10 +375,19 @@ internal static class PackAOnlyStrategy
                     MemoryMarshal.Cast<T, double>(c), ldc, kc);
                 return;
             }
-            ScalarFp64_4x4.RunStridedB(
-                MemoryMarshal.Cast<T, double>(packedA),
-                MemoryMarshal.Cast<T, double>(b), ldb,
-                MemoryMarshal.Cast<T, double>(c), ldc, kc);
+            // Scalar fallback (no matching SIMD kernel — e.g. net471 / no-AVX2). See the FP32
+            // branch above: the fixed 4×4 kernel is only correct for a 4×4 tile, so any other
+            // mr×nr routes to the general kernel that honors the actual tile dimensions.
+            if (mr == 4 && nr == 4)
+                ScalarFp64_4x4.RunStridedB(
+                    MemoryMarshal.Cast<T, double>(packedA),
+                    MemoryMarshal.Cast<T, double>(b), ldb,
+                    MemoryMarshal.Cast<T, double>(c), ldc, kc);
+            else
+                ScalarGenericStridedB.RunDouble(
+                    MemoryMarshal.Cast<T, double>(packedA), mr,
+                    MemoryMarshal.Cast<T, double>(b), ldb,
+                    MemoryMarshal.Cast<T, double>(c), ldc, nr, kc);
             return;
         }
         throw new NotSupportedException($"PackAOnlyStrategy does not support T={typeof(T).Name}.");

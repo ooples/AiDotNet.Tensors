@@ -105,7 +105,20 @@ public sealed class TensorCodecOptions
     /// <summary>Phase 4.3: Merge consecutive pointwise ops into fewer dispatch steps.</summary>
     public bool EnablePointwiseFusion { get; set; } = true;
 
-    /// <summary>Phase 4.5: Precompute static subgraphs at compile time.</summary>
+    /// <summary>
+    /// Phase 4.5: Fold constant subgraphs to a run-once-at-runtime step (computed on the first replay,
+    /// skipped on the rest). Default on.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="ConstantFoldingPass"/> previously evaluated a constant subgraph by calling the step's
+    /// Execute AT COMPILE TIME and dropping the step. That read not-yet-materialized input buffers (garbage)
+    /// and made building the plan MUTATE the source graph's tensors — corrupting the verify-then-trust
+    /// inference gate, which runs the eager forward over the SAME graph to compare against the compiled
+    /// candidate (observed as non-deterministic cross-attention diffusion inference, the 3.19-vs-3.55
+    /// divergence). It now folds to a run-once step that executes lazily at runtime when inputs are valid,
+    /// so compilation has no graph side effects while the constant is still computed only once across a
+    /// denoising loop's replays.
+    /// </remarks>
     public bool EnableConstantFolding { get; set; } = true;
 
     /// <summary>Phase 6.2: Deduplicate identical computations across layers.</summary>
