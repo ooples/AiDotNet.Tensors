@@ -26407,6 +26407,23 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>
+    /// #1662 lever #3: when true, the tape-path <see cref="FlashAttentionBackward{T}"/> routes the
+    /// float/double backward through the tiled <see cref="Autodiff.FusedAttention{T}.Backward"/>
+    /// (FlashAttention-2 recompute) instead of the in-place blocked <c>FlashAttentionBackwardFloat/
+    /// Double</c> kernel. Both are O(block) memory, so there is NO memory win to be had here — and
+    /// the benchmark ([B=2,H=8,S=512,Dh=64], Debug) measured the tiled path at ~2.9× the time of the
+    /// blocked kernel (1249 vs 428 ms/call): the blocked kernel is tight parallel scalar loops over
+    /// the stored softmax stats, whereas the tiled path recomputes the softmax and runs per-tile
+    /// batched GEMMs with transient tile tensors. So the blocked kernel stays the DEFAULT; this flag
+    /// is OPT-IN (<c>AIDOTNET_TILED_ATTN_BWD=1</c>) — it makes the tiled FusedAttention.Backward the
+    /// single source of truth on the tape for parity/debugging, not for speed. The standalone
+    /// <see cref="Autodiff.FusedAttention{T}.Backward"/> public API (no stored stats required) is the
+    /// path where its tiling actually earns its keep.
+    /// </summary>
+    internal static bool UseTiledFusedAttentionBackward { get; set; } =
+        Environment.GetEnvironmentVariable("AIDOTNET_TILED_ATTN_BWD") == "1";
+
+    /// <summary>
     /// Computes the backward pass for FlashAttention.
     /// </summary>
     public virtual Tensor<T> FlashAttentionBackward<T>(
@@ -26471,6 +26488,27 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentException(
                 $"softmaxStats shape [{string.Join(",", softmaxStats._shape)}] must be [batch={batch}, heads={heads}, seqQ={seqQ}].",
                 nameof(softmaxStats));
+
+        // #1662 lever #3 wiring (benchmark-gated): route the tape-path attention backward through
+        // the tiled FusedAttention<T>.Backward (FlashAttention-2 recompute, tiles over key blocks
+        // for Sk>128 so the full Sq×Sk score/prob matrices are never materialised). It recomputes
+        // the softmax from Q/K/V, so the stored output/softmaxStats are unused on this branch.
+        // The in-place blocked FlashAttentionBackwardFloat/Double below is ALSO O(block)-memory, so
+        // this is a single-source-of-truth consolidation, not a memory rescue — kept behind a flag
+        // and chosen as the default only because the benchmark showed it is not a regression
+        // (FusedAttention's engine batched-GEMM dQ/dK/dV are competitive). Set
+        // AIDOTNET_TILED_ATTN_BWD=0 to force the legacy blocked kernel.
+        if (UseTiledFusedAttentionBackward
+            && (typeof(T) == typeof(float) || typeof(T) == typeof(double)))
+        {
+            var tiledCfg = new Autodiff.FlashAttentionConfig { Scale = scale, IsCausal = isCausal };
+            var (tgQ, tgK, tgV) = Autodiff.FusedAttention<T>.Backward(
+                gradOutput, query, key, value, tiledCfg, attentionBias, this);
+            gradQuery = tgQ;
+            gradKey = tgK;
+            gradValue = tgV;
+            return gradOutput;
+        }
 
         T scaleFactor = numOps.FromDouble(scale);
 
