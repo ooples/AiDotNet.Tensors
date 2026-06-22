@@ -69,6 +69,84 @@ internal static class Im2ColHelper
     }
 
     /// <summary>
+    /// Channel-parallel single-image im2col for the stride=1/dilation=1 fast path
+    /// (the dominant CNN/diffusion conv case). Each input channel writes only its own
+    /// <c>kH·kW</c> contiguous rows of the column matrix and reads only its own H·W input
+    /// slab, so the per-channel work is fully disjoint — bit-identical to the serial form
+    /// regardless of thread count, hence <c>deterministicSafe: true</c>. The serial
+    /// <see cref="Im2ColSingleImage"/> build was a chunk of the FORWARD conv's serial
+    /// fraction at batch=1 (the GEMM scales but the im2col didn't). Falls back to the
+    /// serial path for general stride/dilation. Pointers are captured as IntPtr (a
+    /// lambda can't close over <c>float*</c>); the <c>fixed</c> block outlives the
+    /// synchronous parallel call.
+    /// </summary>
+    public static unsafe void Im2ColChannelParallel(
+        ReadOnlySpan<float> input,
+        Span<float> output,
+        int channels, int height, int width,
+        int kernelH, int kernelW,
+        int strideH, int strideW,
+        int padH, int padW,
+        int dilationH, int dilationW,
+        int outputH, int outputW)
+    {
+        if (strideH != 1 || strideW != 1 || dilationH != 1 || dilationW != 1)
+        {
+            // General stride/dilation: keep the existing serial single-image path.
+            Im2ColSingleImage(input, output, channels, height, width,
+                kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW,
+                outputH, outputW);
+            return;
+        }
+
+        int kHW = kernelH * kernelW;
+        int colW = outputH * outputW;
+        output.Slice(0, channels * kHW * colW).Clear(); // padding handled once up front
+        long work = (long)channels * kHW * colW;
+        fixed (float* inP = input)
+        fixed (float* outP = output)
+        {
+            IntPtr inPtr = (IntPtr)inP;
+            IntPtr outPtr = (IntPtr)outP;
+            AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(
+                0, channels, work, c =>
+                {
+                    float* inputPtr = (float*)inPtr;
+                    float* outputPtr = (float*)outPtr;
+                    int channelOffset = c * height * width;
+                    int rowIdx = c * kHW;
+                    for (int kh = 0; kh < kernelH; kh++)
+                    {
+                        int ohStart = Math.Max(0, padH - kh);
+                        int ohEnd = Math.Min(outputH, height + padH - kh);
+                        for (int kw = 0; kw < kernelW; kw++)
+                        {
+                            int owStart = Math.Max(0, padW - kw);
+                            int owEnd = Math.Min(outputW, width + padW - kw);
+                            int validWidth = owEnd - owStart;
+                            if (validWidth > 0 && ohEnd > ohStart)
+                            {
+                                float* outRow = outputPtr + rowIdx * colW;
+                                for (int oh = ohStart; oh < ohEnd; oh++)
+                                {
+                                    int ih = oh + kh - padH;
+                                    int inputStart = channelOffset + ih * width + (owStart + kw - padW);
+                                    int outputStart = oh * outputW + owStart;
+                                    Buffer.MemoryCopy(
+                                        inputPtr + inputStart,
+                                        outRow + outputStart,
+                                        validWidth * sizeof(float),
+                                        validWidth * sizeof(float));
+                                }
+                            }
+                            rowIdx++;
+                        }
+                    }
+                }, deterministicSafe: true);
+        }
+    }
+
+    /// <summary>
     /// Performs im2col on a single image (no batch dimension).
     /// Optimized row-by-row processing for better cache utilization and SIMD.
     /// </summary>
@@ -501,6 +579,65 @@ internal static class Im2ColHelper
                 }
             }
         }
+    }
+
+    /// <summary>
+    /// Channel-parallel col2im scatter (float, array-based). Identical math to
+    /// <see cref="Col2ImAccumulate(ReadOnlySpan{float}, Span{float}, int, int, int, int, int, int, int, int, int, int, int, int)"/>
+    /// but fans the outer channel loop across cores. Each input channel <c>c</c> reads
+    /// only its own contiguous column row-block (<c>colData[colOffset + c*kHW*colW ..]</c>)
+    /// and writes only its own <c>imageData[imgOffset + c*H*W ..]</c> slab, so the work is
+    /// fully disjoint per channel — bit-identical to the serial form regardless of thread
+    /// count (each input pixel's <c>+=</c> order within a channel is unchanged), hence
+    /// <c>deterministicSafe: true</c> so it stays parallel under DeterministicReductions.
+    /// Array-based (not Span) because the parallel body must capture the buffers.
+    /// <para>
+    /// Motivation: the serial Span overload was the dominant cost of
+    /// <c>Conv2DBackwardInput</c> at batch=1 — measured ~52 GFLOP/s on a 32-thread box
+    /// (i.e. running on a single core), the bottleneck of foundation-scale diffusion
+    /// TRAINING (Kandinsky-class). The GEMM half was already BLAS-parallel; this scatter
+    /// was not.
+    /// </para>
+    /// </summary>
+    public static void Col2ImAccumulateChannelParallel(
+        float[] colData, int colOffset,
+        float[] imageData, int imgOffset,
+        int channels, int height, int width,
+        int kernelH, int kernelW,
+        int strideH, int strideW,
+        int padH, int padW,
+        int dilationH, int dilationW,
+        int outputH, int outputW)
+    {
+        int kHW = kernelH * kernelW;
+        int colW = outputH * outputW;
+        long totalWork = (long)channels * kHW * colW;
+        int hw = height * width;
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(
+            0, channels, totalWork, c =>
+            {
+                int colIdx = colOffset + c * kHW * colW;
+                int imgChannelBase = imgOffset + c * hw;
+                for (int kh = 0; kh < kernelH; kh++)
+                {
+                    for (int kw = 0; kw < kernelW; kw++)
+                    {
+                        for (int oh = 0; oh < outputH; oh++)
+                        {
+                            int ih = oh * strideH + kh * dilationH - padH;
+                            for (int ow = 0; ow < outputW; ow++)
+                            {
+                                int iw = ow * strideW + kw * dilationW - padW;
+                                if (ih >= 0 && ih < height && iw >= 0 && iw < width)
+                                {
+                                    imageData[imgChannelBase + ih * width + iw] += colData[colIdx];
+                                }
+                                colIdx++;
+                            }
+                        }
+                    }
+                }
+            }, deterministicSafe: true);
     }
 
     /// <summary>
@@ -1590,16 +1727,20 @@ internal static class Im2ColHelper
                 //   where ih_out = oh_in*strideH + kh*dilationH - padH
                 // For ConvTranspose2D: "c" = outChannels, output(c, ih_out, iw_out) accumulates
                 // contributions from input position (oh_in, ow_in) shifted by (kh, kw). Dilation = 1.
-                Col2ImAccumulate(
-                    tempBuffer.AsSpan(0, kmkn * hw),
-                    output.AsSpan(outputOffset, outSliceSize),
-                    channels: outChannels,
-                    height: outputHeight, width: outputWidth,
-                    kernelH: kernelH, kernelW: kernelW,
-                    strideH: strideH, strideW: strideW,
-                    padH: padH, padW: padW,
-                    dilationH: 1, dilationW: 1,
-                    outputH: inputHeight, outputW: inputWidth);
+                // Channel-parallel scatter (each output channel disjoint) — the serial Span col2im
+                // was the ConvTranspose forward's scatter bottleneck (same pattern as the conv
+                // backward-input fix). tempBuffer + output are float[], so the no-pin array variant
+                // applies directly. (The double overload below still uses the serial path.)
+                Col2ImAccumulateChannelParallel(
+                    tempBuffer, 0,
+                    output, outputOffset,
+                    outChannels,
+                    outputHeight, outputWidth,
+                    kernelH, kernelW,
+                    strideH, strideW,
+                    padH, padW,
+                    1, 1,
+                    inputHeight, inputWidth);
             }
 
             return true;

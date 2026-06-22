@@ -16644,6 +16644,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return base.TensorTranspose(tensor);
         if (tensor.Rank != 2)
             return base.TensorTranspose(tensor);
+        // The GPU transpose_2d kernel is FLOAT-typed (4-byte elements, no element-size parameter). For a
+        // non-float tensor — notably a Half-resident activation (2-byte elements), which is exactly the
+        // weight-gradient transpose operand h in the FP16 hetero backward (dW = (transpose h)·dY) — it would
+        // read Half-as-float and return garbage (sum 12.69 → 0.306), silently zeroing the FP16 weight
+        // gradient (#1624). Route non-float transposes through the element-size-correct CPU reference.
+        if (typeof(T) != typeof(float))
+            return base.TensorTranspose(tensor);
         try
         {
             int rows = tensor.Shape._dims[0];

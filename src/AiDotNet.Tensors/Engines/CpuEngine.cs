@@ -9337,6 +9337,28 @@ public partial class CpuEngine : ITensorLevelEngine
             return;
         }
 
+        // Strategy 1.5: high-channel convs -> explicit im2col + BLAS GEMM.
+        // MEASURED (diffusion decoder + ResNet shapes, 32-thread CPU, 2026-06): a single
+        // im2col + BlasManaged.Gemm runs at ~350-440 GFLOP/s (the GEMM K dimension =
+        // inChannels*kH*kW is large enough that one packed machine-code GEMM reaches
+        // near hardware peak), whereas at high channel counts BOTH the on-the-fly fused
+        // kernel (~1 GFLOP/s) AND the SIMD-direct 3x3 kernel (~35-87 GFLOP/s) collapse.
+        // Routing these straight to im2col+BLAS is what makes a 1.2B-param diffusion
+        // UNet forward ~10x faster (per-block profile: 99% of the forward was ResBlock
+        // convs at >=384 input channels, mis-routed to the slow direct/fused paths and
+        // timing out the foundation-scale CI shards). The >=256 gate is conservative:
+        // every measured high-channel conv wins decisively (>300 GFLOP/s) while lower-
+        // channel / stem / depthwise convs stay on the direct cascade below where the
+        // transient im2col buffer is not worth it. Winograd keeps its large-spatial niche
+        // (output >= 224) since it cuts FLOPs 2.25x there.
+        if (inChannels >= 256 &&
+            !WinogradHelper.ShouldUseWinograd(kernelHeight, kernelWidth, stride, stride, dilation, dilation, outputHeight, outputWidth))
+        {
+            Conv2DWithIm2ColGemm(input, kernel, result, batch, inChannels, height, width,
+                outChannels, kernelHeight, kernelWidth, stride, padding, dilation, outputHeight, outputWidth);
+            return;
+        }
+
         // Strategy 2: Try fused im2col-GEMM with cache tiling (BLAS-based, faster for most sizes)
         if (FusedConvHelper.ShouldUseFusedConv(kernelHeight, kernelWidth, stride, stride,
             outputHeight, outputWidth, inChannels, outChannels))
@@ -9491,11 +9513,14 @@ public partial class CpuEngine : ITensorLevelEngine
 
         for (int b = 0; b < batch; b++)
         {
-            // Step 1: im2col for this batch slice only
-            Helpers.Im2ColHelper.Im2Col(
+            // Step 1: im2col for this batch slice only — channel-parallel (each input
+            // channel writes disjoint column rows). The serial build was part of the
+            // forward conv's serial fraction once the GEMM was parallelized.
+            Helpers.Im2ColHelper.Im2ColChannelParallel(
                 inputSpan.Slice(b * inputSliceSize, inputSliceSize), im2colSpan,
-                1, inChannels, height, width,
-                kernelHeight, kernelWidth, stride, stride, padding, padding, dilation, dilation);
+                inChannels, height, width,
+                kernelHeight, kernelWidth, stride, stride, padding, padding, dilation, dilation,
+                outputHeight, outputWidth);
 
             // Step 2: GEMM for this batch
             int outputOffset = b * outChannels * colW;
@@ -13426,6 +13451,22 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    // Hand a freshly-computed float[] kernel result back as a Tensor<T> WITHOUT the redundant
+    // float->T copy when T is float (the overwhelmingly common case). The float-path conv
+    // backward kernels own their result buffer (freshly allocated, not aliased), so there is
+    // no sharing hazard. The previous `new T[] + FromFloatSpan` was a full-tensor copy of the
+    // gradient on every backward call — pure per-op overhead at T=float. Centralised so the
+    // four conv-backward float paths (and any future float kernel) share one no-copy fast path.
+    private static Tensor<T> RentFloatResult<T>(int[] shape, float[] floatResult)
+    {
+        if (typeof(T) == typeof(float))
+            return TensorAllocator.Rent<T>(shape, (T[])(object)floatResult);
+        var ops = MathHelper.GetNumericOperations<T>();
+        var arr = new T[floatResult.Length];
+        ops.FromFloatSpan(new ReadOnlySpan<float>(floatResult), new Span<T>(arr));
+        return TensorAllocator.Rent<T>(shape, arr);
+    }
+
     public Tensor<T> Conv2DBackwardInput<T>(Tensor<T> gradOutput, Tensor<T> kernel, int[] inputShape, int[] stride, int[] padding, int[] dilation)
     {
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
@@ -13528,10 +13569,7 @@ public partial class CpuEngine : ITensorLevelEngine
                             outputHeight, outputWidth);
                     });
 
-                    var opsNi = MathHelper.GetNumericOperations<T>();
-                    var resultNi = new T[gradInputF.Length];
-                    opsNi.FromFloatSpan(new ReadOnlySpan<float>(gradInputF), new Span<T>(resultNi));
-                    return TensorAllocator.Rent<T>(inputShape, resultNi);
+                    return RentFloatResult<T>(inputShape, gradInputF);
                 }
                 finally
                 {
@@ -13563,9 +13601,17 @@ public partial class CpuEngine : ITensorLevelEngine
                     }
 
                     int imgOff = b * inChannels * height * width;
-                    Im2ColHelper.Col2ImAccumulate(
-                        new ReadOnlySpan<float>(colBuf, 0, colW * colH),
-                        new Span<float>(gradInputF, imgOff, inChannels * height * width),
+                    // Channel-parallel scatter: the serial Span col2im was the dominant
+                    // cost of this op at batch=1 (~52 GFLOP/s on 32 cores = single-core),
+                    // the foundation-scale diffusion TRAINING bottleneck. Per-channel work
+                    // is disjoint (each c reads its own column row-block and writes its own
+                    // image slab) so this stays parallel even under DeterministicReductions
+                    // and is bit-identical. When the outer batch loop itself ran parallel
+                    // (batch>1, non-deterministic), ParallelForOrSerial self-gates to serial
+                    // here to avoid nesting.
+                    Im2ColHelper.Col2ImAccumulateChannelParallel(
+                        colBuf, 0,
+                        gradInputF, imgOff,
                         inChannels, height, width,
                         kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW,
                         outputHeight, outputWidth);
@@ -13573,10 +13619,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 finally { pool.Return(colBuf); }
             });
 
-            var ops2 = MathHelper.GetNumericOperations<T>();
-            var resultArr = new T[gradInputF.Length];
-            ops2.FromFloatSpan(new ReadOnlySpan<float>(gradInputF), new Span<T>(resultArr));
-            return TensorAllocator.Rent<T>(inputShape, resultArr);
+            return RentFloatResult<T>(inputShape, gradInputF);
         }
 
         // im2col + GEMM fast path for double — mirrors the float branch above
@@ -14360,8 +14403,17 @@ public partial class CpuEngine : ITensorLevelEngine
     private static void TransposeFloatRowMajor(float[] src, float[] dst, int rows, int cols)
     {
         const int Blk = 32;
-        for (int r0 = 0; r0 < rows; r0 += Blk)
+        // Parallel over row-blocks: each block writes dst[c*rows + r] only for its own
+        // r-range, so the blocks' writes are disjoint -> bit-identical regardless of thread
+        // count (deterministicSafe). The serial blocked transpose was ~6% of a foundation-
+        // scale diffusion train step (it materialises gradKernelᵀ -> gradKernel after the
+        // #573 non-transposed backward-kernel GEMM). Self-gates to serial when already
+        // inside a parallel region.
+        int numRowBlocks = (rows + Blk - 1) / Blk;
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(
+            0, numRowBlocks, (long)rows * cols, rb =>
         {
+            int r0 = rb * Blk;
             int rMax = Math.Min(r0 + Blk, rows);
             for (int c0 = 0; c0 < cols; c0 += Blk)
             {
@@ -14373,7 +14425,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         dst[c * rows + r] = src[srcRow + c];
                 }
             }
-        }
+        }, deterministicSafe: true);
     }
 
     private static void BuildKConcatStackFloat(
@@ -14516,9 +14568,21 @@ public partial class CpuEngine : ITensorLevelEngine
             // batch-parallel loop collapses the wide-N transposed GEMM to
             // serial; stacking gradOutput + im2col along the K axis lets one
             // full-width GEMM fold the cross-batch sum into its K reduction.
+            //
+            // batch==1 is ALSO routed here (2026-06): the per-batch fallback below
+            // computes gradKernel = gradOutput · im2colᵀ as a transB=true GEMM whose
+            // M = outChannels is thin and whose transposed-B access is cache-hostile —
+            // MEASURED 30-63 GFLOP/s at the diffusion-decoder backward shapes (vs the
+            // forward conv's ~300-400). Building gradOutput TRANSPOSED turns it into a
+            // non-transposed GEMM with M = colH (large), which hits the fast machine-code
+            // kernel at ~300-400 GFLOP/s — a 5-9x backward-kernel speedup that the foundation
+            // -scale diffusion TRAINING tests need (one Kandinsky train iter was ~162s at the
+            // CI thread cap, dominated by this op). At batch==1 there is no cross-batch
+            // stacking, so the buffers are the same size the fallback already rents — the
+            // 64 MB element bound only needs to gate genuine multi-batch stacking.
             long kConcatElemsF = (long)colH * batch * colW;
             const long MaxKConcatElemsF = 16L * 1024 * 1024; // 64 MB of floats
-            if (batch >= 2 && kConcatElemsF <= MaxKConcatElemsF)
+            if (batch == 1 || (batch >= 2 && kConcatElemsF <= MaxKConcatElemsF))
             {
                 int batchColW = batch * colW;
                 var kcPool = System.Buffers.ArrayPool<float>.Shared;
@@ -14568,10 +14632,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     }
                     TransposeFloatRowMajor(gradKernelT, gradKernelF, colH, outChannels);
 
-                    var opsKc = MathHelper.GetNumericOperations<T>();
-                    var resultKc = new T[gradKernelF.Length];
-                    opsKc.FromFloatSpan(new ReadOnlySpan<float>(gradKernelF), new Span<T>(resultKc));
-                    return TensorAllocator.Rent<T>(kernelShape, resultKc);
+                    return RentFloatResult<T>(kernelShape, gradKernelF);
                 }
                 finally
                 {
@@ -14635,10 +14696,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     gradKernelF[i] += lg[i];
             }
 
-            var ops2 = MathHelper.GetNumericOperations<T>();
-            var resultArr = new T[gradKernelF.Length];
-            ops2.FromFloatSpan(new ReadOnlySpan<float>(gradKernelF), new Span<T>(resultArr));
-            return TensorAllocator.Rent<T>(kernelShape, resultArr);
+            return RentFloatResult<T>(kernelShape, gradKernelF);
         }
 
         // im2col + GEMM-with-transpose fast path for double — paired with the
@@ -15427,46 +15485,50 @@ public partial class CpuEngine : ITensorLevelEngine
         var gradInputData = result.GetDataArray();
         var gradOutputData = gradOutput.GetFlattenedData();
 
-        // Cannot parallelize across (batch, channel) pairs because for MaxPool with
-        // overlapping windows, multiple output positions may scatter to the same
-        // input index within a channel. Parallel over batches is safe.
+        // Parallelize over (batch, channel) pairs. Each (b,c) scatters only into the
+        // disjoint input region [(b*channels+c)*height*width, ...) (the gradInIdx always
+        // carries the (b*channels+c) prefix), so distinct (b,c) tasks never collide — the
+        // only within-channel overlap (multiple output windows hitting one input index)
+        // is resolved serially inside a single task. This keeps batch=1 work (diffusion
+        // decoder, CNN inference) saturating all cores instead of running single-threaded.
+        int bc = batch * channels;
         if (typeof(T) == typeof(float))
         {
             var fGradIn = (float[])(object)gradInputData;
             var fGradOut = (float[])(object)gradOutputData;
             Array.Clear(fGradIn, 0, fGradIn.Length);
-            CpuParallelSettings.ParallelForOrSerial(0, batch, fGradIn.Length, b =>
+            CpuParallelSettings.ParallelForOrSerial(0, bc, fGradIn.Length, p =>
             {
-                for (int c = 0; c < channels; c++)
-                    for (int oh = 0; oh < outputHeight; oh++)
-                        for (int ow = 0; ow < outputWidth; ow++)
-                        {
-                            int maxH = maxIndices[b, c, oh, ow, 0];
-                            int maxW = maxIndices[b, c, oh, ow, 1];
-                            int gradOutIdx = ((b * channels + c) * outputHeight + oh) * outputWidth + ow;
-                            int gradInIdx = ((b * channels + c) * height + maxH) * width + maxW;
-                            fGradIn[gradInIdx] += fGradOut[gradOutIdx];
-                        }
-            });
+                int b = p / channels, c = p % channels;
+                for (int oh = 0; oh < outputHeight; oh++)
+                    for (int ow = 0; ow < outputWidth; ow++)
+                    {
+                        int maxH = maxIndices[b, c, oh, ow, 0];
+                        int maxW = maxIndices[b, c, oh, ow, 1];
+                        int gradOutIdx = (p * outputHeight + oh) * outputWidth + ow;
+                        int gradInIdx = (p * height + maxH) * width + maxW;
+                        fGradIn[gradInIdx] += fGradOut[gradOutIdx];
+                    }
+            }, deterministicSafe: true);
         }
         else if (typeof(T) == typeof(double))
         {
             var dGradIn = (double[])(object)gradInputData;
             var dGradOut = (double[])(object)gradOutputData;
             Array.Clear(dGradIn, 0, dGradIn.Length);
-            CpuParallelSettings.ParallelForOrSerial(0, batch, dGradIn.Length, b =>
+            CpuParallelSettings.ParallelForOrSerial(0, bc, dGradIn.Length, p =>
             {
-                for (int c = 0; c < channels; c++)
-                    for (int oh = 0; oh < outputHeight; oh++)
-                        for (int ow = 0; ow < outputWidth; ow++)
-                        {
-                            int maxH = maxIndices[b, c, oh, ow, 0];
-                            int maxW = maxIndices[b, c, oh, ow, 1];
-                            int gradOutIdx = ((b * channels + c) * outputHeight + oh) * outputWidth + ow;
-                            int gradInIdx = ((b * channels + c) * height + maxH) * width + maxW;
-                            dGradIn[gradInIdx] += dGradOut[gradOutIdx];
-                        }
-            });
+                int b = p / channels, c = p % channels;
+                for (int oh = 0; oh < outputHeight; oh++)
+                    for (int ow = 0; ow < outputWidth; ow++)
+                    {
+                        int maxH = maxIndices[b, c, oh, ow, 0];
+                        int maxW = maxIndices[b, c, oh, ow, 1];
+                        int gradOutIdx = (p * outputHeight + oh) * outputWidth + ow;
+                        int gradInIdx = (p * height + maxH) * width + maxW;
+                        dGradIn[gradInIdx] += dGradOut[gradOutIdx];
+                    }
+            }, deterministicSafe: true);
         }
         else
         {
@@ -15474,25 +15536,23 @@ public partial class CpuEngine : ITensorLevelEngine
             for (int i = 0; i < gradInputData.Length; i++)
                 gradInputData[i] = numOps.Zero;
 
-            CpuParallelSettings.ParallelForOrSerial(0, batch, gradInputData.Length, b =>
+            CpuParallelSettings.ParallelForOrSerial(0, bc, gradInputData.Length, p =>
             {
-                for (int c = 0; c < channels; c++)
+                int b = p / channels, c = p % channels;
+                for (int oh = 0; oh < outputHeight; oh++)
                 {
-                    for (int oh = 0; oh < outputHeight; oh++)
+                    for (int ow = 0; ow < outputWidth; ow++)
                     {
-                        for (int ow = 0; ow < outputWidth; ow++)
-                        {
-                            int maxH = maxIndices[b, c, oh, ow, 0];
-                            int maxW = maxIndices[b, c, oh, ow, 1];
+                        int maxH = maxIndices[b, c, oh, ow, 0];
+                        int maxW = maxIndices[b, c, oh, ow, 1];
 
-                            int gradOutIdx = ((b * channels + c) * outputHeight + oh) * outputWidth + ow;
-                            int gradInIdx = ((b * channels + c) * height + maxH) * width + maxW;
+                        int gradOutIdx = (p * outputHeight + oh) * outputWidth + ow;
+                        int gradInIdx = (p * height + maxH) * width + maxW;
 
-                            gradInputData[gradInIdx] = numOps.Add(gradInputData[gradInIdx], gradOutputData[gradOutIdx]);
-                        }
+                        gradInputData[gradInIdx] = numOps.Add(gradInputData[gradInIdx], gradOutputData[gradOutIdx]);
                     }
                 }
-            });
+            }, deterministicSafe: true);
         }
 
         return result;
@@ -15626,12 +15686,13 @@ public partial class CpuEngine : ITensorLevelEngine
             var fGradOut = (float[])(object)gradOutputData;
             float invPoolArea = 1f / (poolH * poolW);
             Array.Clear(fGradIn, 0, fGradIn.Length);
-            CpuParallelSettings.ParallelForOrSerial(0, batch, fGradIn.Length, b =>
+            // Parallelize over (batch, channel): each pair scatters only into its disjoint
+            // [(b*channels+c)*height*width, ...) input slab, so batch=1 still saturates cores.
+            CpuParallelSettings.ParallelForOrSerial(0, batch * channels, fGradIn.Length, p =>
             {
-                for (int c = 0; c < channels; c++)
                 {
-                    int inputBaseOffset = (b * channels + c) * height * width;
-                    int outputBaseOffset = (b * channels + c) * outputHeight * outputWidth;
+                    int inputBaseOffset = p * height * width;
+                    int outputBaseOffset = p * outputHeight * outputWidth;
                     for (int oh = 0; oh < outputHeight; oh++)
                     {
                         for (int ow = 0; ow < outputWidth; ow++)
@@ -15649,7 +15710,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         }
                     }
                 }
-            });
+            }, deterministicSafe: true);
         }
         else if (typeof(T) == typeof(double))
         {
@@ -15657,12 +15718,11 @@ public partial class CpuEngine : ITensorLevelEngine
             var dGradOut = (double[])(object)gradOutputData;
             double invPoolArea = 1.0 / (poolH * poolW);
             Array.Clear(dGradIn, 0, dGradIn.Length);
-            CpuParallelSettings.ParallelForOrSerial(0, batch, dGradIn.Length, b =>
+            CpuParallelSettings.ParallelForOrSerial(0, batch * channels, dGradIn.Length, p =>
             {
-                for (int c = 0; c < channels; c++)
                 {
-                    int inputBaseOffset = (b * channels + c) * height * width;
-                    int outputBaseOffset = (b * channels + c) * outputHeight * outputWidth;
+                    int inputBaseOffset = p * height * width;
+                    int outputBaseOffset = p * outputHeight * outputWidth;
                     for (int oh = 0; oh < outputHeight; oh++)
                     {
                         for (int ow = 0; ow < outputWidth; ow++)
@@ -15680,7 +15740,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         }
                     }
                 }
-            });
+            }, deterministicSafe: true);
         }
         else
         {
@@ -15690,13 +15750,13 @@ public partial class CpuEngine : ITensorLevelEngine
             for (int i = 0; i < gradInputData.Length; i++)
                 gradInputData[i] = numOps.Zero;
 
-            // Parallelize across batches (within a batch*channel, output positions scatter to overlapping input regions)
-            CpuParallelSettings.ParallelForOrSerial(0, batch, gradInputData.Length, b =>
+            // Parallelize over (batch, channel): each pair writes only into its disjoint
+            // input slab, so distinct tasks never collide (within-pair overlap stays serial).
+            CpuParallelSettings.ParallelForOrSerial(0, batch * channels, gradInputData.Length, p =>
             {
-                for (int c = 0; c < channels; c++)
                 {
-                    int inputBaseOffset = (b * channels + c) * height * width;
-                    int outputBaseOffset = (b * channels + c) * outputHeight * outputWidth;
+                    int inputBaseOffset = p * height * width;
+                    int outputBaseOffset = p * outputHeight * outputWidth;
 
                     for (int oh = 0; oh < outputHeight; oh++)
                     {
@@ -15717,7 +15777,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         }
                     }
                 }
-            });
+            }, deterministicSafe: true);
         }
 
         return result;
@@ -22993,7 +23053,22 @@ public partial class CpuEngine : ITensorLevelEngine
                 int off = b * fs;
                 float invStd = 1f / MathF.Sqrt(fVar[b] + fEps);
                 float m = fMean[b];
-                for (int f = 0; f < fs; f++)
+                int f = 0;
+#if NET5_0_OR_GREATER
+                if (Vector256.IsHardwareAccelerated && fs >= 8)
+                {
+                    var vM = Vector256.Create(m);
+                    var vInvStd = Vector256.Create(invStd);
+                    for (; f + 8 <= fs; f += 8)
+                    {
+                        var go = Vector256.LoadUnsafe(ref fGradOut[off + f]);
+                        var norm = (Vector256.LoadUnsafe(ref fInput[off + f]) - vM) * vInvStd;
+                        (Vector256.LoadUnsafe(ref fGradGamma[f]) + go * norm).StoreUnsafe(ref fGradGamma[f]);
+                        (Vector256.LoadUnsafe(ref fGradBeta[f]) + go).StoreUnsafe(ref fGradBeta[f]);
+                    }
+                }
+#endif
+                for (; f < fs; f++)
                 {
                     float go = fGradOut[off + f];
                     float normalized = (fInput[off + f] - m) * invStd;
@@ -23013,7 +23088,24 @@ public partial class CpuEngine : ITensorLevelEngine
 
                 float sumGrad = 0f;
                 float sumGradX = 0f;
-                for (int f = 0; f < fs; f++)
+                int f = 0;
+#if NET5_0_OR_GREATER
+                if (Vector256.IsHardwareAccelerated && fs >= 8)
+                {
+                    var vM = Vector256.Create(m);
+                    var accGrad = Vector256<float>.Zero;
+                    var accGradX = Vector256<float>.Zero;
+                    for (; f + 8 <= fs; f += 8)
+                    {
+                        var scaledGrad = Vector256.LoadUnsafe(ref fGamma[f]) * Vector256.LoadUnsafe(ref fGradOut[off + f]);
+                        accGrad += scaledGrad;
+                        accGradX += scaledGrad * (Vector256.LoadUnsafe(ref fInput[off + f]) - vM);
+                    }
+                    sumGrad = Vector256.Sum(accGrad);
+                    sumGradX = Vector256.Sum(accGradX);
+                }
+#endif
+                for (; f < fs; f++)
                 {
                     float scaledGrad = fGamma[f] * fGradOut[off + f];
                     sumGrad += scaledGrad;
@@ -23021,13 +23113,33 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
 
                 float scale = invStd * invFeatureSizeF;
-                for (int f = 0; f < fs; f++)
+                int fw = 0;
+#if NET5_0_OR_GREATER
+                if (Vector256.IsHardwareAccelerated && fs >= 8)
                 {
-                    float normalized = (fInput[off + f] - m) * invStd;
-                    float gradNorm = fGamma[f] * fGradOut[off + f];
+                    var vM = Vector256.Create(m);
+                    var vInvStd = Vector256.Create(invStd);
+                    var vFeat = Vector256.Create(featureSizeF);
+                    var vSumGrad = Vector256.Create(sumGrad);
+                    var vSumGradX = Vector256.Create(sumGradX);
+                    var vScale = Vector256.Create(scale);
+                    for (; fw + 8 <= fs; fw += 8)
+                    {
+                        var norm = (Vector256.LoadUnsafe(ref fInput[off + fw]) - vM) * vInvStd;
+                        var gradNorm = Vector256.LoadUnsafe(ref fGamma[fw]) * Vector256.LoadUnsafe(ref fGradOut[off + fw]);
+                        var term3 = norm * vInvStd * vSumGradX;
+                        var res = vScale * (vFeat * gradNorm - vSumGrad - term3);
+                        res.StoreUnsafe(ref fGradInput[off + fw]);
+                    }
+                }
+#endif
+                for (; fw < fs; fw++)
+                {
+                    float normalized = (fInput[off + fw] - m) * invStd;
+                    float gradNorm = fGamma[fw] * fGradOut[off + fw];
                     float term1 = featureSizeF * gradNorm;
                     float term3 = normalized * invStd * sumGradX;
-                    fGradInput[off + f] = scale * (term1 - sumGrad - term3);
+                    fGradInput[off + fw] = scale * (term1 - sumGrad - term3);
                 }
             }
 
@@ -23762,7 +23874,26 @@ public partial class CpuEngine : ITensorLevelEngine
                         int chanOffset = b * (channels * spatialSize) + channel * spatialSize;
                         float gammaAcc = 0f;
                         float betaAcc = 0f;
-                        for (int s = 0; s < spatialSize; s++)
+                        int s = 0;
+#if NET5_0_OR_GREATER
+                        if (Vector256.IsHardwareAccelerated && spatialSize >= 8)
+                        {
+                            var vMean = Vector256.Create(groupMean);
+                            var vInvStd = Vector256.Create(invStd);
+                            var accG = Vector256<float>.Zero;
+                            var accB = Vector256<float>.Zero;
+                            for (; s + 8 <= spatialSize; s += 8)
+                            {
+                                var go = Vector256.LoadUnsafe(ref fGradOut[chanOffset + s]);
+                                var norm = (Vector256.LoadUnsafe(ref fInput[chanOffset + s]) - vMean) * vInvStd;
+                                accG += go * norm;
+                                accB += go;
+                            }
+                            gammaAcc = Vector256.Sum(accG);
+                            betaAcc = Vector256.Sum(accB);
+                        }
+#endif
+                        for (; s < spatialSize; s++)
                         {
                             float go = fGradOut[chanOffset + s];
                             float normalized = (fInput[chanOffset + s] - groupMean) * invStd;
@@ -23793,7 +23924,27 @@ public partial class CpuEngine : ITensorLevelEngine
                         int channel = startChannel + c;
                         int chanOffset = b * (channels * spatialSize) + channel * spatialSize;
                         float gammaC = fGamma[channel];
-                        for (int s = 0; s < spatialSize; s++)
+                        int s = 0;
+#if NET5_0_OR_GREATER
+                        if (Vector256.IsHardwareAccelerated && spatialSize >= 8)
+                        {
+                            var vMean = Vector256.Create(groupMean);
+                            var vInvStd = Vector256.Create(invStd);
+                            var vGamma = Vector256.Create(gammaC);
+                            var accGrad = Vector256<float>.Zero;
+                            var accGradNorm = Vector256<float>.Zero;
+                            for (; s + 8 <= spatialSize; s += 8)
+                            {
+                                var scaledGrad = vGamma * Vector256.LoadUnsafe(ref fGradOut[chanOffset + s]);
+                                var norm = (Vector256.LoadUnsafe(ref fInput[chanOffset + s]) - vMean) * vInvStd;
+                                accGrad += scaledGrad;
+                                accGradNorm += scaledGrad * norm;
+                            }
+                            sumGrad += Vector256.Sum(accGrad);
+                            sumGradNorm += Vector256.Sum(accGradNorm);
+                        }
+#endif
+                        for (; s < spatialSize; s++)
                         {
                             float scaledGrad = gammaC * fGradOut[chanOffset + s];
                             float normalized = (fInput[chanOffset + s] - groupMean) * invStd;
@@ -23809,7 +23960,27 @@ public partial class CpuEngine : ITensorLevelEngine
                         int channel = startChannel + c;
                         int chanOffset = b * (channels * spatialSize) + channel * spatialSize;
                         float gammaC = fGamma[channel];
-                        for (int s = 0; s < spatialSize; s++)
+                        int s = 0;
+#if NET5_0_OR_GREATER
+                        if (Vector256.IsHardwareAccelerated && spatialSize >= 8)
+                        {
+                            var vMean = Vector256.Create(groupMean);
+                            var vInvStd = Vector256.Create(invStd);
+                            var vGamma = Vector256.Create(gammaC);
+                            var vGroupSize = Vector256.Create(groupSizeF);
+                            var vSumGrad = Vector256.Create(sumGrad);
+                            var vSumGradNorm = Vector256.Create(sumGradNorm);
+                            var vScale = Vector256.Create(scale);
+                            for (; s + 8 <= spatialSize; s += 8)
+                            {
+                                var norm = (Vector256.LoadUnsafe(ref fInput[chanOffset + s]) - vMean) * vInvStd;
+                                var gradNorm = vGamma * Vector256.LoadUnsafe(ref fGradOut[chanOffset + s]);
+                                var res = vScale * (vGroupSize * gradNorm - vSumGrad - norm * vSumGradNorm);
+                                res.StoreUnsafe(ref fGradInput[chanOffset + s]);
+                            }
+                        }
+#endif
+                        for (; s < spatialSize; s++)
                         {
                             float normalized = (fInput[chanOffset + s] - groupMean) * invStd;
                             float gradNorm = gammaC * fGradOut[chanOffset + s];
@@ -26513,6 +26684,51 @@ public partial class CpuEngine : ITensorLevelEngine
         return gradOutput;
     }
 
+    // Vectorized head-dim primitives for the attention backward inner kernel. The
+    // per-(qi,ki) dot products and gradient axpys were scalar loops over headDim — the
+    // single-thread bottleneck of the diffusion attention backward (~19% of a train
+    // step). Vector256.LoadUnsafe takes a managed ref (no pinning), so these work inside
+    // the parallel-region lambda. Lane-then-horizontal summation differs from naive
+    // sequential order in the last FP bit — standard for any SIMD/BLAS kernel (PyTorch/
+    // oneDNN do the same); attention parity tests use tolerances, not bit-exactness.
+    private static float VDot(float[] a, int ao, float[] b, int bo, int n)
+    {
+        int i = 0;
+#if NET5_0_OR_GREATER
+        // Vector256 (System.Runtime.Intrinsics) is net5+ only; net471 uses the scalar tail.
+        if (Vector256.IsHardwareAccelerated && n >= 8)
+        {
+            var acc = Vector256<float>.Zero;
+            for (; i + 8 <= n; i += 8)
+                acc += Vector256.LoadUnsafe(ref a[ao + i]) * Vector256.LoadUnsafe(ref b[bo + i]);
+            float s = Vector256.Sum(acc);
+            for (; i < n; i++) s += a[ao + i] * b[bo + i];
+            return s;
+        }
+#endif
+        float sc = 0f;
+        for (; i < n; i++) sc += a[ao + i] * b[bo + i];
+        return sc;
+    }
+
+    private static void VAxpy(float[] y, int yo, float scalar, float[] x, int xo, int n)
+    {
+        int i = 0;
+#if NET5_0_OR_GREATER
+        // Vector256 (System.Runtime.Intrinsics) is net5+ only; net471 uses the scalar tail.
+        if (Vector256.IsHardwareAccelerated && n >= 8)
+        {
+            var vs = Vector256.Create(scalar);
+            for (; i + 8 <= n; i += 8)
+            {
+                var yv = Vector256.LoadUnsafe(ref y[yo + i]) + vs * Vector256.LoadUnsafe(ref x[xo + i]);
+                yv.StoreUnsafe(ref y[yo + i]);
+            }
+        }
+#endif
+        for (; i < n; i++) y[yo + i] += scalar * x[xo + i];
+    }
+
     /// <summary>
     /// Float fast path for <see cref="FlashAttentionBackward{T}"/>. Direct
     /// float arithmetic; no virtual dispatch; writes to disjoint per-(b, h)
@@ -26551,11 +26767,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         int oRowOff = oOffset + qi * headDim;
 
                         // doO is independent of ki — hoist it out of the ki loop.
-                        // (The generic path recomputes it per ki; correctness-neutral
-                        // hoist that was already safe there too.)
-                        float doO = 0f;
-                        for (int d = 0; d < headDim; d++)
-                            doO += gradOutData[oRowOff + d] * outputData[oRowOff + d];
+                        float doO = VDot(gradOutData, oRowOff, outputData, oRowOff, headDim);
 
                         for (int ki = kvBlockStart; ki < kvBlockEnd; ki++)
                         {
@@ -26564,10 +26776,7 @@ public partial class CpuEngine : ITensorLevelEngine
                             int kRowOff = kOffset + ki * headDim;
                             int vRowOff = vOffset + ki * headDim;
 
-                            float score = 0f;
-                            for (int d = 0; d < headDim; d++)
-                                score += queryData[qRowOff + d] * keyData[kRowOff + d];
-                            score *= scaleFactor;
+                            float score = VDot(queryData, qRowOff, keyData, kRowOff, headDim) * scaleFactor;
 
                             if (biasData is not null)
                             {
@@ -26579,23 +26788,16 @@ public partial class CpuEngine : ITensorLevelEngine
 
                             float attnWeight = MathF.Exp(score - logsumexp);
 
-                            float doV = 0f;
-                            for (int d = 0; d < headDim; d++)
-                                doV += gradOutData[oRowOff + d] * valueData[vRowOff + d];
+                            float doV = VDot(gradOutData, oRowOff, valueData, vRowOff, headDim);
 
                             float dS = attnWeight * (doV - doO) * scaleFactor;
 
                             // gradV += attnWeight * gradOutput — disjoint per (b, h), no lock.
-                            for (int d = 0; d < headDim; d++)
-                                gradVData[vRowOff + d] += attnWeight * gradOutData[oRowOff + d];
-
+                            VAxpy(gradVData, vRowOff, attnWeight, gradOutData, oRowOff, headDim);
                             // gradQ += dS * K (this worker owns the full gradQ slice for its qi row).
-                            for (int d = 0; d < headDim; d++)
-                                gradQData[qRowOff + d] += dS * keyData[kRowOff + d];
-
+                            VAxpy(gradQData, qRowOff, dS, keyData, kRowOff, headDim);
                             // gradK += dS * Q — also disjoint per (b, h).
-                            for (int d = 0; d < headDim; d++)
-                                gradKData[kRowOff + d] += dS * queryData[qRowOff + d];
+                            VAxpy(gradKData, kRowOff, dS, queryData, qRowOff, headDim);
                         }
                     }
                 }
@@ -37870,7 +38072,26 @@ public partial class CpuEngine : ITensorLevelEngine
         // as BCE backward (4× win measured there).
         if (gData is float[] gF && iData is float[] iF && result is float[] rF)
         {
-            for (int i = 0; i < rF.Length; i++)
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Vector256.IsHardwareAccelerated)
+            {
+                // sig = 1/(1+exp(-x)); deriv = sig + x*sig*(1-sig); out = g*deriv.
+                // FastExp256 (~1e-6 rel err, within float32 precision) — SiLU/Swish is in
+                // every diffusion ResBlock + many transformers, so the per-element scalar
+                // MathF.Exp here was a real per-train-step cost.
+                var one = Vector256.Create(1f);
+                int n = rF.Length;
+                for (; i + 8 <= n; i += 8)
+                {
+                    var x = Vector256.LoadUnsafe(ref iF[i]);
+                    var sig = one / (one + SimdKernels.FastExp256(-x));
+                    var deriv = sig + x * sig * (one - sig);
+                    (Vector256.LoadUnsafe(ref gF[i]) * deriv).StoreUnsafe(ref rF[i]);
+                }
+            }
+#endif
+            for (; i < rF.Length; i++)
             {
                 float x = iF[i];
                 float sig = 1f / (1f + MathF.Exp(-x));
@@ -37956,11 +38177,38 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = new T[gradOutput.Length];
         var gData = gradOutput.GetDataArray();
         var iData = input.GetDataArray();
-        for (int i = 0; i < result.Length; i++)
+        // softplus' = sigmoid(x) = 1/(1+exp(-x)). Float path had no primitive fast path at all
+        // (full per-element NumOps box/dispatch) — add float (vectorized, FastExp256 ~1e-6 rel
+        // err) + double primitive paths.
+        if (gData is float[] gF && iData is float[] iF && result is float[] rF)
         {
-            double x = numOps.ToDouble(iData[i]);
-            double sig = 1.0 / (1.0 + Math.Exp(-x));
-            result[i] = numOps.FromDouble(numOps.ToDouble(gData[i]) * sig);
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Vector256.IsHardwareAccelerated)
+            {
+                var one = Vector256.Create(1f);
+                int n = rF.Length;
+                for (; i + 8 <= n; i += 8)
+                {
+                    var sig = one / (one + SimdKernels.FastExp256(-Vector256.LoadUnsafe(ref iF[i])));
+                    (Vector256.LoadUnsafe(ref gF[i]) * sig).StoreUnsafe(ref rF[i]);
+                }
+            }
+#endif
+            for (; i < rF.Length; i++) { float x = iF[i]; rF[i] = gF[i] * (1f / (1f + MathF.Exp(-x))); }
+        }
+        else if (gData is double[] gD && iData is double[] iD && result is double[] rD)
+        {
+            for (int i = 0; i < rD.Length; i++) { double x = iD[i]; rD[i] = gD[i] * (1.0 / (1.0 + Math.Exp(-x))); }
+        }
+        else
+        {
+            for (int i = 0; i < result.Length; i++)
+            {
+                double x = numOps.ToDouble(iData[i]);
+                double sig = 1.0 / (1.0 + Math.Exp(-x));
+                result[i] = numOps.FromDouble(numOps.ToDouble(gData[i]) * sig);
+            }
         }
         return new Tensor<T>(result, gradOutput.Shape.ToArray());
     }

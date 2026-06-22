@@ -306,7 +306,18 @@ public static class CpuParallelSettings
         bool deterministic = DeterministicReductions && !deterministicSafe;
         // _inParallelRegion: a nested call (this thread is already a parallel
         // worker) runs serial to avoid ThreadPool starvation. See its docs.
+        // (toExclusive - fromInclusive) <= 1: a single-iteration loop must run
+        // INLINE on the calling thread, NOT via the parallel pool — the parallel
+        // path wraps the body in EnterParallelRegion(), which sets _inParallelRegion
+        // and makes any parallel op the body itself invokes serialize (nested-
+        // parallelism avoidance). There is no parallelism to gain from one iteration,
+        // and entering a region throttles the body's inner parallel work. This was the
+        // root cause of Conv2DBackwardInput having ~0 thread scaling at batch=1 (its
+        // 1-iteration batch loop forced the inner GEMM + col2im serial) — the dominant
+        // serial fraction of foundation-scale diffusion training. ParallelForRegion
+        // already special-cases count==1; this brings ParallelForOrSerial in line.
         if (maxDegree <= 1 || deterministic || _inParallelRegion
+            || (toExclusive - fromInclusive) <= 1
             || totalWork < PersistentParallelExecutor.DefaultSerialGrainSize)
         {
             // Match Parallel.For's exception semantics: capture

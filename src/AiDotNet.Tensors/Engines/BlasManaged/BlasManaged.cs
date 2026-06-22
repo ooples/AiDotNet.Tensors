@@ -50,13 +50,17 @@ public static partial class BlasManaged
     // strategy == ForcePackBoth, so the forward FFN/QKV matmuls skipped them and capped
     // M-axis parallelism (512x1024x4096 -> mc=60/nc=512 -> numMB=9, ~9 of 16 cores).
     // With this on, the same shape gets nc widened to N + mc shrunk -> numMB=15, 4.9x -> 8.0x
-    // at 16 cores (measured). Default OFF: it's a hot path the code's own notes flag as
-    // regression-prone for multi-N shapes, and the dev box is too noisy to validate a flip —
-    // gated for the gemm-bench CI A/B (set =1 to enable; flip the default once CI on a
-    // many-core runner confirms no tuned-shape regression). Only affects the DisableAutotune
-    // path; direct ForcePackBoth callers are unchanged (they already get these optimizations).
+    // at 16 cores (measured). DEFAULT ON (opt-out AIDOTNET_GEMM_FORWARD_PACKBOTH=0): a
+    // min-of-many A/B across 10 shapes on a 32-core Zen2 box (squares 768/1152/2048, FFN-up
+    // [512,1024,4096] 16.0->9.05ms, FFN-down [512,4096,1024] 16.1->8.2ms, QKV, batched
+    // [2048,1024,4096], and the LM-head [512,768,50304]) shows it FASTER or NEUTRAL on every
+    // shape and never a regression — the huge-N LM head is correctly neutral because nc can't
+    // widen to N (numNB>1), so the wide-N path self-limits and falls back. The prior "too
+    // noisy to validate" concern was measuring the off-path SgemmTiled SmallM lever (which the
+    // forward never reaches); the PackBoth path here measures cleanly on min-of-many. Only
+    // affects the DisableAutotune path; direct ForcePackBoth callers already had these.
     private static readonly bool s_forwardPackBothBlocking =
-        System.Environment.GetEnvironmentVariable("AIDOTNET_GEMM_FORWARD_PACKBOTH") == "1";
+        System.Environment.GetEnvironmentVariable("AIDOTNET_GEMM_FORWARD_PACKBOTH") != "0";
 
     // #653 cache-blocking sweep hook: env overrides for the PackBoth Mc/Nc/Kc so the
     // cache-residency-optimal blocking can be found empirically (the MKL/BLIS tuning art).
@@ -257,9 +261,31 @@ public static partial class BlasManaged
     //     microkernel for these shapes.
     // The microkernel still wins (and is kept) for small/medium near-square shapes
     // (512³, 256×784×128, 128×64×256), where its low per-call overhead dominates.
+    /// <summary>
+    /// #475 tiny-K routing. When true (default), FP32 GEMMs with a small contraction
+    /// dimension (K ≤ 128) but large M·N — the 1×1-conv / im2col shapes that dominate
+    /// diffusion (e.g. 13824×1536×64) — are routed to the machine-code kernel instead of
+    /// the cache-blocking packed strategy, whose A/B packing cost does not amortize over a
+    /// tiny K. Measured on Kandinsky train (A/B in one process, MaxDOP=4): the 13824×1536×64
+    /// shape went from 1.23s @ ~31 GF/s on the packed path to fast enough to drop off the
+    /// top-8 (machine kernel ~5×), cutting total GEMM time 18.4s → 16.4s/iter. Settable for
+    /// A/B regression testing.
+    /// </summary>
+    public static bool TinyKPreferMachineKernel = true;
+
     private static bool PrefersStrategyOverMachineKernel(int m, int n, int k, bool isFloat)
     {
         long work = (long)m * n * k;
+        // #475: tiny-K, large-M·N FP32 (1×1-conv / im2col) — let the machine kernel take it.
+        // Checked before the work>=250M cutoff that would otherwise force the packed path.
+        if (isFloat && TinyKPreferMachineKernel && k <= 128 && (long)m * n >= 1_000_000L)
+            return false;
+        // #475 DEAD END (min-of-N isolated, do NOT re-add): routing mid-large FP32 (≥250M) to
+        // the machine kernel is 19-77% SLOWER than PackBoth on the diffusion FFN shapes
+        // (384×4096×3456: PackBoth 221 vs MK 125 GF/s). PackBoth's cache-blocking beats the
+        // un-blocked machine microkernel at large K; the machine kernel only wins at tiny-K
+        // (above) and small squares (1024³ +13%). PackBoth already runs ~230-280 GF/s here
+        // (near MKL) — so "avoid RyuJIT to beat MKL" does not hold for these shapes.
         if (n < 128 && k >= 128) return true;                 // thin-N (both dtypes)
         if (!isFloat)
             // FP64 microkernel is competitive on FFN and mid squares (1024³ double 211 > packed
@@ -279,7 +305,40 @@ public static partial class BlasManaged
         return false;
     }
 
+    // Diagnostic timing wrapper (#475 shape audit). When GemmShapeHistogram.Enabled it times
+    // only the TOP-LEVEL Gemm call (a ThreadStatic guard skips internal re-dispatches so a
+    // shape is attributed once, to the outer call). Disabled → a single bool read + straight
+    // tail-call into GemmCore, no Stopwatch, no measurable overhead.
+    [ThreadStatic] private static bool s_gemmTiming;
+
     public static void Gemm<T>(
+        ReadOnlySpan<T> a, int lda, bool transA,
+        ReadOnlySpan<T> b, int ldb, bool transB,
+        Span<T> c, int ldc,
+        int m, int n, int k,
+        in BlasOptions<T> options = default) where T : unmanaged
+    {
+        if (!GemmShapeHistogram.Enabled || s_gemmTiming)
+        {
+            GemmCore(a, lda, transA, b, ldb, transB, c, ldc, m, n, k, in options);
+            return;
+        }
+        s_gemmTiming = true;
+        long start = System.Diagnostics.Stopwatch.GetTimestamp();
+        try
+        {
+            GemmCore(a, lda, transA, b, ldb, transB, c, ldc, m, n, k, in options);
+        }
+        finally
+        {
+            long elapsed = System.Diagnostics.Stopwatch.GetTimestamp() - start;
+            s_gemmTiming = false;
+            if (m > 0 && n > 0 && k > 0)
+                GemmShapeHistogram.Record(m, n, k, transA, transB, typeof(T) == typeof(float), elapsed);
+        }
+    }
+
+    private static void GemmCore<T>(
         ReadOnlySpan<T> a, int lda, bool transA,
         ReadOnlySpan<T> b, int ldb, bool transB,
         Span<T> c, int ldc,

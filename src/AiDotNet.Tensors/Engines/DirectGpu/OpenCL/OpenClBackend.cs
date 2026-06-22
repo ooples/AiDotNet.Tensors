@@ -7380,7 +7380,12 @@ KERNEL VARIANTS (A/B testing):
 
         public void Embedding(IGpuBuffer indices, IGpuBuffer embeddingTable, IGpuBuffer output, int numIndices, int embeddingDim)
         {
-            var k = _kernelCache["embedding_forward"];
+            // The OpenCL forward-embedding kernel is registered as "embedding_lookup"
+            // (NeuralNetKernels embedding_lookup + its registration list), NOT
+            // "embedding_forward" like the CUDA/HIP/WebGpu backends. The wrong key threw
+            // KeyNotFoundException on the deferred-replay path (eager fell back to CPU,
+            // masking it). Use the OpenCL kernel's actual name.
+            var k = _kernelCache["embedding_lookup"];
             uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)indices).Buffer.Handle);
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)embeddingTable).Buffer.Handle);

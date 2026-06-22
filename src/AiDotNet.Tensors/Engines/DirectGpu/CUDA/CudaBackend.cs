@@ -12066,18 +12066,28 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     /// <inheritdoc/>
     public unsafe void ConvertToFp32(IGpuBuffer input, IGpuBuffer output, int size)
     {
-        if (!_kernelCache.TryGetValue("convert_fp16_to_fp32", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: convert_fp16_to_fp32");
+        // Mirror ConvertToFp16: the toolkit (cuda_fp16.h) "convert_fp16_to_fp32" kernel only registers on
+        // CUDA-Toolkit hosts; on driver-only hosts (e.g. GTX 1660 Ti, no toolkit) it never compiles, so a
+        // hard throw here broke every FP16→FP32 up-cast on those machines — including the FP16 resident
+        // training optimizer's master-weight up-cast (#1624: surfaced once the transpose fix let the
+        // gradients reach the optimizer). Fall through to the self-contained native kernel, which is
+        // compiled in the ctor (fp16_native_kernels) and exists by construction on every CUDA system.
+        if (_kernelCache.TryGetValue("convert_fp16_to_fp32", out var kernel))
+        {
+            using var _ = PushContext();
+            uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+            IntPtr inPtr = input.Handle;
+            IntPtr outPtr = output.Handle;
+            void** args = stackalloc void*[3];
+            args[0] = &inPtr;
+            args[1] = &outPtr;
+            args[2] = &size;
+            LaunchKernel(kernel, grid, DefaultBlockSize, args);
+            return;
+        }
 
-        using var _ = PushContext();
-        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
-        IntPtr inPtr = input.Handle;
-        IntPtr outPtr = output.Handle;
-        void** args = stackalloc void*[3];
-        args[0] = &inPtr;
-        args[1] = &outPtr;
-        args[2] = &size;
-        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+        // Driver-only fallback — same FP16→FP32 semantics, registered by construction.
+        ConvertToFp32Native(input, output, size);
     }
 
     #endregion
