@@ -259,9 +259,16 @@ internal static class MachineCodeFmaKernel
 
         int store = asm.NewLabel();
         asm.TestRegSelf(R10);
-        asm.JzLabel(store);
+        asm.JzLabel32(store);        // rel32: prefetch'd K-loop body exceeds rel8 forward range
         int kloop = asm.NewLabel();
         asm.MarkLabel(kloop);
+        // Software prefetch the upcoming B and A 512 B ahead (8 lines for B at 64 B/step) —
+        // hides the L2→L1 latency of the next packed panel, the dominant in-context kernel
+        // stall. Matches OpenBLAS sgemm's A_PR1/B_PR1=512 prefetch distance. Pure hint;
+        // bit-exact. (Single-tile prefetch was neutral because B was already L1-hot; in the
+        // panel macro-loop the NEXT tile's panel is cold, so this is the real win.)
+        asm.Prefetcht0D32(RDX, 512);
+        asm.Prefetcht0D32(RCX, 512);
         asm.VmovupsLoad(BLO, RDX, 0);
         asm.VmovupsLoad(BHI, RDX, 32);
         for (int r = 0; r < Mr; r++)
@@ -274,7 +281,7 @@ internal static class MachineCodeFmaKernel
         asm.AddRegImm8(RCX, Mr * 4);  // A += 6 floats
         asm.AddRegImm8(RDX, Nr * 4);  // B += 16 floats (→ next stripe after kc steps)
         asm.DecReg(R10);
-        asm.JnzLabel(kloop);
+        asm.JnzLabel32(kloop);        // rel32: the prefetch'd K-loop body exceeds rel8 range
 
         asm.MarkLabel(store);
         asm.MovRegReg(R11, R8);
