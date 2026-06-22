@@ -479,6 +479,13 @@ public static class FusedAttention<T>
     /// <typeparamref name="T"/> is not a floating-point type
     /// (<c>float</c>, <c>double</c>, or <c>System.Half</c>).
     /// </exception>
+    /// <summary>
+    /// #1662 bench-only switch: force the full-matrix backward even when the tiled path would
+    /// engage, so <c>ConvParallelProbe --flashbwd</c> can measure tiled-vs-full peak memory at
+    /// the same shape. Never set in production. Not thread-safe; for single-threaded benchmarking.
+    /// </summary>
+    internal static bool ForceFullBackwardForBench;
+
     public static (Tensor<T> GradQuery, Tensor<T> GradKey, Tensor<T> GradValue) Backward(
         Tensor<T> gradOutput,
         Tensor<T> query,
@@ -524,7 +531,7 @@ public static class FusedAttention<T>
         // which is faster when the S^2 matrices fit comfortably. This is a permanent size-tiered
         // fast path, mirroring the FP32/FP64 split already here.
         const int TileBk = 128;
-        if (attentionBias is null && Sk > TileBk)
+        if (attentionBias is null && Sk > TileBk && !ForceFullBackwardForBench)
         {
             (gradQ, gradK, gradV) = BackwardTiled(
                 engine, numOps, query, key, value, gradOutput,

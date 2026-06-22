@@ -33,6 +33,7 @@ internal static class Program
         if (args.Length > 0 && args[0] == "--gemmprofile") return RunGemmProfile(eng, args);
         if (args.Length > 0 && args[0] == "--gpu") return RunGpu(args);
         if (args.Length > 0 && args[0] == "--trainbench") return RunTrainbench(eng, args);
+        if (args.Length > 0 && args[0] == "--flashbwd") return RunFlashBwd(eng, args);
 
         int maxdop = ArgI(args, "--maxdop", Environment.ProcessorCount);
         int inC = ArgI(args, "--inc", 256);
@@ -239,6 +240,69 @@ internal static class Program
             $"procs={Environment.ProcessorCount} median_ms={times[reps / 2]:F3} min_ms={times[0]:F3} " +
             $"alloc_mb_per_step={perStepAllocMB:F3} peak_ws_mb={peakWs / (1024.0 * 1024.0):F1} " +
             $"last_loss={step.LastLoss:E3}");
+        return 0;
+    }
+
+    // #1662 lever #3 memory proof: peak LIVE managed set during one FusedAttention.Backward at a
+    // long sequence, tiled (default) vs --full (forces the full-matrix path at the same shape).
+    // The full path keeps the [B,H,S,S] score/prob matrices simultaneously reachable (O(S^2));
+    // the tiled path holds only one O(S*tile) tile + the outputs at a time. The sampler FORCES a
+    // collection per sample (GC.GetTotalMemory(true)) so only REACHABLE bytes count — otherwise
+    // the tiled path's transient per-tile garbage (it recomputes scores 3x) would dominate and
+    // hide the peak-live win. Timing is perturbed by the forced GCs, so this mode reports memory,
+    // not speed (use --trainbench / plain backward_ms elsewhere for timing).
+    private static int RunFlashBwd(CpuEngine eng, string[] a)
+    {
+        int B = ArgI(a, "--b", 1);
+        int H = ArgI(a, "--h", 8);
+        int S = ArgI(a, "--s", 2048);
+        int Dh = ArgI(a, "--dh", 64);
+        bool full = HasFlag(a, "--full");
+        if (B < 1 || H < 1 || S < 1 || Dh < 1) { Console.Error.WriteLine("flashbwd: --b,--h,--s,--dh must be >= 1."); return 2; }
+
+        var rng = new Random(0);
+        var q = Rand(new[] { B, H, S, Dh }, rng);
+        var k = Rand(new[] { B, H, S, Dh }, rng);
+        var v = Rand(new[] { B, H, S, Dh }, rng);
+        var dO = Rand(new[] { B, H, S, Dh }, rng);
+
+        var toggle = typeof(FusedAttention<float>).GetField(
+            "ForceFullBackwardForBench",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+        toggle?.SetValue(null, full);
+
+        // Warmup (JIT + first-touch); result discarded.
+        var (wq, _, _) = FusedAttention<float>.Backward(dO, q, k, v, engine: eng);
+        if (wq[0] == float.PositiveInfinity) Console.Write("");
+
+        GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
+        long baseline = GC.GetTotalMemory(true);
+        long peak = baseline;
+        bool stop = false;
+        var sampler = new System.Threading.Thread(() =>
+        {
+            while (!System.Threading.Volatile.Read(ref stop))
+            {
+                long m = GC.GetTotalMemory(true); // forced collection -> reachable bytes only
+                if (m > peak) peak = m;
+                System.Threading.Thread.Sleep(10);
+            }
+        }) { IsBackground = true };
+        sampler.Start();
+
+        var sw = Stopwatch.StartNew();
+        var (gq, gk, gv) = FusedAttention<float>.Backward(dO, q, k, v, engine: eng);
+        sw.Stop();
+
+        System.Threading.Volatile.Write(ref stop, true);
+        sampler.Join();
+        toggle?.SetValue(null, false); // restore
+
+        float sink = gq[0] + gk[0] + gv[0];
+        Console.WriteLine(
+            $"FLASHBWD path={(full ? "full" : "tiled")} B={B} H={H} S={S} Dh={Dh} " +
+            $"backward_ms={sw.Elapsed.TotalMilliseconds:F1} peak_managed_mb={(peak - baseline) / (1024.0 * 1024.0):F1} " +
+            $"(sink={sink:E1})");
         return 0;
     }
 
