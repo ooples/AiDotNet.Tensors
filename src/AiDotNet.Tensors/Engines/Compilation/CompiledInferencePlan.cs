@@ -64,8 +64,12 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     // fallback) if any op issues a non-capturable sync alloc/copy during capture.
     private IntPtr _graphExec = IntPtr.Zero;
     private Engines.DirectGpu.CUDA.CudaBackend? _graphBackend;
+    private DirectGpuTensorEngine? _graphEngine;
     private int _graphWarmupCalls;
     private bool _graphCaptureDisabled;
+    // Eviction is suspended for the captured graph's LIFETIME (resumed in Dispose): the captured kernels
+    // reference resident intermediate buffers in the activation cache that must not be freed before replay.
+    private bool _graphEvictionSuspended;
     private static readonly bool s_inferenceCudaGraph =
         System.Environment.GetEnvironmentVariable("AIDOTNET_INFERENCE_CUDA_GRAPH") == "1";
     // Eager calls before capture, so lazy uploads / kernel autotune settle into the steady-state
@@ -776,32 +780,58 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
             }
 
             _graphWarmupCalls++;
-            if (_graphWarmupCalls >= InferenceGraphWarmup)
+            if (_graphWarmupCalls >= InferenceGraphWarmup && _engine is DirectGpuTensorEngine gte)
             {
-                // Refresh the input in place OUTSIDE the captured region (an HtoD upload inside
-                // capture is a non-capturable op that would abort EndCapture), then record the
-                // step launches. Capture RECORDS but does not execute, so launch once afterwards
-                // to produce this call's output.
+                // Enter the resident capture path. ResidentStepActive (capture-path depth + eviction
+                // suspended) flips the engine's GPU ops to stable resident buffers — no host round-trips —
+                // and BeginInferenceCapture lets the resident in-place ops engage for inference. Eviction
+                // stays suspended for the plan's LIFETIME (resumed in Dispose) so the resident intermediate
+                // buffers the captured graph references aren't evicted/freed before replay.
                 try
                 {
-                    RefreshInferenceInputsInPlace(cb);
-                    var exec = cb.CaptureGraph(() =>
+                    if (!_graphEvictionSuspended) { gte.SuspendActivationEviction(); _graphEvictionSuspended = true; }
+                    gte.BeginInferenceCapture();
+                    try
                     {
-                        for (int i = 0; i < steps.Length; i++)
-                            steps[i].Execute(engine, steps[i].OutputBuffer);
-                    });
-                    if (exec != IntPtr.Zero)
-                    {
-                        _graphExec = exec;
-                        _graphBackend = cb;
-                        cb.LaunchCapturedGraph(exec);
-                        return _finalOutput;
+                        using (gte.EnterCompiledCapturePath())
+                        {
+                            // Pre-residency pass: run the body once under ResidentStepActive so every op
+                            // binds its STABLE resident buffer; the capture below then records reads/writes
+                            // against those exact addresses. (Sync uploads here are fine — not capturing yet.)
+                            for (int i = 0; i < steps.Length; i++)
+                                steps[i].Execute(engine, steps[i].OutputBuffer);
+
+                            // Refresh inputs in place OUTSIDE the captured region (an HtoD upload inside
+                            // capture is non-capturable), then record the step launches. Capture RECORDS
+                            // but does not execute, so launch once afterwards to produce this call's output.
+                            RefreshInferenceInputsInPlace(cb);
+                            var exec = cb.CaptureGraph(() =>
+                            {
+                                for (int i = 0; i < steps.Length; i++)
+                                    steps[i].Execute(engine, steps[i].OutputBuffer);
+                            });
+                            if (exec != IntPtr.Zero)
+                            {
+                                _graphExec = exec;
+                                _graphBackend = cb;
+                                _graphEngine = gte;
+                                cb.LaunchCapturedGraph(exec);
+                                return _finalOutput;
+                            }
+                        }
+                        // Capture failed (a non-capturable op remains) — disable + resume eviction.
+                        _graphCaptureDisabled = true;
+                        if (_graphEvictionSuspended) { gte.ResumeActivationEviction(); _graphEvictionSuspended = false; }
                     }
-                    _graphCaptureDisabled = true; // a non-capturable op fired during launch — stay eager
+                    finally
+                    {
+                        gte.EndInferenceCapture();
+                    }
                 }
                 catch
                 {
                     _graphCaptureDisabled = true;
+                    if (_graphEvictionSuspended) { gte.ResumeActivationEviction(); _graphEvictionSuspended = false; }
                 }
             }
 
@@ -937,11 +967,17 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         if (_disposed) return;
         _disposed = true;
 
-        // Free the captured CUDA graph (if any) before the buffers it references are torn down.
+        // Free the captured CUDA graph (if any) before the buffers it references are torn down,
+        // then resume the eviction we suspended for the graph's lifetime.
         if (_graphExec != IntPtr.Zero && _graphBackend is not null)
         {
             try { _graphBackend.DestroyCapturedGraph(_graphExec); } catch { }
             _graphExec = IntPtr.Zero;
+        }
+        if (_graphEvictionSuspended && _graphEngine is not null)
+        {
+            try { _graphEngine.ResumeActivationEviction(); } catch { }
+            _graphEvictionSuspended = false;
         }
 
         // Tear down the cached execution stream BEFORE freeing pinned

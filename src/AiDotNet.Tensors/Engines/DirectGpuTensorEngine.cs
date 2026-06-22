@@ -381,6 +381,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             if (e is not null) System.Threading.Interlocked.Decrement(ref e._gradAccumDepth);
         }
     }
+    // #1650 inference CUDA-graph capture: while set, GPU-resident in-place ops (TryRunBinaryInPlace) engage
+    // on ResidentStepActive WITHOUT the training-only InGradAccumulation gate, so the inference forward runs
+    // host-round-trip-free and is capturable. Depth counter (not bool) so it's visible on the BLAS pool
+    // threads the op execution fans out to, mirroring _capturePathDepth / _evictionSuspendDepth.
+    private int _inferenceCaptureDepth;
+    internal bool InferenceCaptureActive => System.Threading.Volatile.Read(ref _inferenceCaptureDepth) > 0;
+    internal void BeginInferenceCapture() => System.Threading.Interlocked.Increment(ref _inferenceCaptureDepth);
+    internal void EndInferenceCapture() => System.Threading.Interlocked.Decrement(ref _inferenceCaptureDepth);
+
     internal void SuspendActivationEviction() => System.Threading.Interlocked.Increment(ref _evictionSuspendDepth);
     internal void ResumeActivationEviction()
     {
@@ -5075,7 +5084,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var aCached = aArr is not null ? TryGetCachedBuffer(aArr) : null;
             AliasDiag($"gradacc-inplace probe: aField={(aB is null ? "null" : "H=" + ((long)aB.Handle).ToString("X") + "/sz" + aB.Size)} aCache={(aCached is null ? "null" : "H=" + ((long)aCached.Handle).ToString("X") + "/sz" + aCached.Size)} bField={(bB2 is null ? "null" : "H=" + ((long)bB2.Handle).ToString("X") + "/sz" + bB2.Size)} need={a.Length} aContig={a.IsContiguous}");
         }
-        if (s_residentInPlace && InGradAccumulation && ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float)
+        // Training grad-accum (opt-in s_residentInPlace) OR inference CUDA-graph capture engage the resident
+        // in-place path. Both still require BOTH operands already resident (checked below) — that is what makes
+        // it safe (no owned upload to async-free under the kernel, the CUDA-700 the s_residentInPlace gate guarded).
+        if (((s_residentInPlace && InGradAccumulation) || InferenceCaptureActive) && ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float)
             && a.IsContiguous && b.IsContiguous && a.Length == b.Length
             && a.TryGetGpuBuffer() is { } aResident
             && b.TryGetGpuBuffer() is { } bResident
