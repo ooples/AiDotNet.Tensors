@@ -266,6 +266,12 @@ internal static class MachineCodeFmaKernel
         int ktail = asm.NewLabel();
         const int U = 4; // K-unroll factor
 
+        // Tuned prefetch distance for the next packed-B stripe (bytes ahead of rdx). 512 B = 8
+        // cache lines ≈ one Nr=16 tile's worth of K-steps ahead — far enough to hide the L2→L1
+        // latency, near enough not to evict the current stripe. A named kernel parameter, not
+        // incidental addressing: change this when retuning the panel for a different µarch.
+        const int BPrefetchBytes = 512;
+
         // K-loop, unrolled by U=4. A single K-step is FMA-bound (12 FMAs ≈ 6 cycles), but the
         // per-step pointer-advance (2 adds) + dec + taken branch added ~2.8 cycles of overhead
         // on top — ~30% of the body — capping the hot-L1 kernel near 68% of peak. Unrolling
@@ -283,7 +289,7 @@ internal static class MachineCodeFmaKernel
         asm.JlLabel32(ktail);          // kc < U → straight to the 1-step tail
         int kmain = asm.NewLabel();
         asm.MarkLabel(kmain);
-        asm.Prefetcht0D32(RDX, 512);
+        asm.Prefetcht0D32(RDX, BPrefetchBytes);
         for (int ku = 0; ku < U; ku++)
         {
             int bOff = ku * Nr * 4;    // 0, 64, 128, 192 — within an unrolled block, read B/A by

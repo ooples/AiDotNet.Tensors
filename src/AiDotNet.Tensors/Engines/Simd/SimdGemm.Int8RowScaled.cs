@@ -75,6 +75,15 @@ internal static partial class SimdGemm
     private static readonly object _int8RowScaledPrePackedBCacheLock = new();
 
     /// <summary>
+    /// Upper bound on the col-sub-block parallelism grid baked into the cached prepacked-B
+    /// (see <see cref="BuildInt8RowScaledPrePackedB"/>). The grid is sized to the machine width
+    /// so the int8 GEMM scales regardless of the MaxDegreeOfParallelism at first build; this cap
+    /// keeps it bounded on very-many-core hosts (matches the worker-pool ceiling in
+    /// CooperativeGemmScheduler / PersistentParallelExecutor).
+    /// </summary>
+    private const int Int8RowScaledMaxGridThreads = 64;
+
+    /// <summary>
     /// Compute <c>C = A · dequant(B_int8, rowScales)</c> using a cached
     /// pre-packed form of B. Weights are already int8 with per-row scales,
     /// avoiding the FP32 round-trip the consumer's prior dequant+Sgemm path
@@ -211,8 +220,8 @@ internal static partial class SimdGemm
         // the cache is built at full width). The per-call path only fans out to the current
         // MaxDoP anyway (LightweightParallel honors it), so a machine-width grid scales when
         // threads are available and costs only a few extra sequential col-block iterations
-        // when they aren't. Ceiling 64 keeps the grid bounded on very-many-core hosts.
-        int maxThreads = Math.Max(1, Math.Min(Environment.ProcessorCount, 64));
+        // when they aren't. The ceiling keeps the grid bounded on very-many-core hosts.
+        int maxThreads = Math.Max(1, Math.Min(Environment.ProcessorCount, Int8RowScaledMaxGridThreads));
         int numPcIters = (k + Kc - 1) / Kc;
 
         int nc0 = Math.Min(Nc, n);
