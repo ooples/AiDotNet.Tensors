@@ -32,7 +32,17 @@ namespace AiDotNet.Tensors.Tests.LinearAlgebra;
 /// </summary>
 // The int8 GEMM driver primitives live in SimdGemm's NET5_0_OR_GREATER region (AVX2
 // intrinsics) — net471 has no such path, so this measurement only compiles/runs there.
+//
+// Serial collection: this test cross-checks two GEMM paths (fp32 reference vs int8-weight)
+// within a 5% numerical tolerance. Both consult the process-wide GEMM global state
+// (CpuParallelSettings / BlasProvider.IsDeterministicMode / the SimdGemm caches). When run
+// concurrently in the full suite, a sibling test flipping that state mid-compute corrupts
+// one path's output, intermittently breaking the tolerance with a structural divergence
+// (rel RMS ~1.9 at 1024³) — it passes 50/50 in isolation. Membership in the canonical
+// GEMM-global-state serial collection serializes it against those mutators and closes the
+// window (same fix as the PrePack/determinism drift flakes — see BlasManagedStatsSerialCollection).
 #if NET5_0_OR_GREATER
+[Collection("BlasManaged-Stats-Serial")]
 public class QuantizedComputeW8A8Tests
 {
     private readonly ITestOutputHelper _out;
