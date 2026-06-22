@@ -474,6 +474,29 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         t._gpuBufferVersion = t.Version;
     }
 
+    /// <summary>Binds <paramref name="t"/> to a STABLE resident GPU buffer (uploading its current host data),
+    /// so the captured graph reads a fixed device address and GetOrAllocateBuffer finds it (no re-upload mid-
+    /// capture). Call during the non-capturing pre-residency pass for each EXTERNAL stable input (the graph's
+    /// own intermediates become resident via FinishGpuOp under ResidentStepActive). Idempotent: re-binds the
+    /// current data into the existing buffer if already bound + big enough. float only / no-op off CUDA.</summary>
+    public void EnsureResidentInput<T>(Tensor<T> t)
+    {
+        if (typeof(T) != typeof(float) || t is null) return;
+        if (GetBackend() is not Engines.DirectGpu.CUDA.CudaBackend cb) return;
+        var data = t.GetDataArray();
+        if (t._gpuBuffer is { } existing && ReferenceEquals(t._gpuBackend, cb)
+            && existing.Handle != System.IntPtr.Zero && existing.Size >= data.Length)
+        {
+            cb.UploadBufferInPlace((float[])(object)data, existing);
+            t._gpuBufferVersion = t.Version;
+            return;
+        }
+        var buf = cb.AllocateBuffer((float[])(object)data); // sync upload — OK in the non-capturing pre-pass
+        t._gpuBuffer = buf;
+        t._gpuBackend = cb;
+        t._gpuBufferVersion = t.Version;
+    }
+
     /// <summary>Downloads <paramref name="t"/>'s resident GPU buffer (which a replayed graph just wrote) into a
     /// fresh host array. Needed for a graph OUTPUT: its deferred materializer caches after the first read, so a
     /// plain re-read returns the capture-step's stale values; this forces a fresh DtoH each replay. Returns null

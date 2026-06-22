@@ -54,32 +54,51 @@ public sealed class ResidentInferenceGraph : System.IDisposable
         if (inputs is null) throw new System.ArgumentNullException(nameof(inputs));
         if (forward is null) throw new System.ArgumentNullException(nameof(forward));
 
+        if (System.Environment.GetEnvironmentVariable("AIDOTNET_INFGRAPH_DIAG") == "1")
+        {
+            var sh = new System.Text.StringBuilder();
+            for (int i = 0; i < inputs.Length; i++) sh.Append($"[{string.Join("x", inputs[i].Shape._dims)}]");
+            var stb = _stableInputs as Tensor<T>[];
+            var ss = new System.Text.StringBuilder();
+            if (stb != null) for (int i = 0; i < stb.Length; i++) ss.Append($"[{string.Join("x", stb[i].Shape._dims)}]");
+            try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_infgraph_diag.txt"),
+                $"RIG.Forward<{typeof(T).Name}>: disabled={_disabled} warmup={_warmup} hasGraph={_exec != System.IntPtr.Zero} inShapes={sh} stableShapes={ss}\n"); } catch { }
+        }
+
         if (_disabled || typeof(T) != typeof(float) || !_engine.SupportsInferenceGraphCapture)
             return forward(inputs); // eager passthrough (no capture possible / already abandoned)
 
         // Stable input copies — fixed device addresses the captured graph reads from.
         var stable = (Tensor<T>[]?)_stableInputs;
-        if (stable is null)
+        // (Re)build the stable input copies on the first call OR when the shape changes — e.g. the first
+        // PredictNoise is an internal lazy-shape-resolution probe at a smaller size ([1,3,16,16]) before the
+        // real denoising steps ([1,3,32,32]); lock onto the steady-state shape rather than the probe. A shape
+        // change discards any graph captured for the old shape and restarts the warmup.
+        bool needRebuild = stable is null || stable.Length != inputs.Length;
+        if (!needRebuild)
         {
+            for (int i = 0; i < inputs.Length; i++)
+                if (!ShapeMatches(inputs[i], stable![i])) { needRebuild = true; break; }
+        }
+        if (needRebuild)
+        {
+            if (_exec != System.IntPtr.Zero) { _engine.DestroyGpuGraph(_exec); _exec = System.IntPtr.Zero; }
+            _scope?.Dispose();
+            _scope = null;
             stable = new Tensor<T>[inputs.Length];
             for (int i = 0; i < inputs.Length; i++)
                 stable[i] = new Tensor<T>(inputs[i].Shape._dims);
             _stableInputs = stable;
+            _warmup = 0;
         }
-        else if (stable.Length != inputs.Length)
-        {
-            return forward(inputs); // input arity changed unexpectedly — stay eager
-        }
+        var s = stable!; // non-null from here: either pre-existing or rebuilt above
         for (int i = 0; i < inputs.Length; i++)
-        {
-            if (!ShapeMatches(inputs[i], stable[i])) return forward(inputs); // shape changed — eager
-            inputs[i].AsSpan().CopyTo(stable[i].AsWritableSpan());
-        }
+            inputs[i].AsSpan().CopyTo(s[i].AsWritableSpan());
 
         // REPLAY: refresh stable input buffers in place, one cuGraphLaunch, fresh download of the output.
         if (_exec != System.IntPtr.Zero)
         {
-            for (int i = 0; i < stable.Length; i++) _engine.RefreshResidentInputInPlace(stable[i]);
+            for (int i = 0; i < s.Length; i++) _engine.RefreshResidentInputInPlace(s[i]);
             _engine.LaunchGpuGraph(_exec);
             return DownloadOutput<T>();
         }
@@ -87,20 +106,24 @@ public sealed class ResidentInferenceGraph : System.IDisposable
         // WARMUP: a few eager forwards on the stable inputs so lazy allocs / autotune settle.
         _warmup++;
         if (_warmup < _warmupRuns)
-            return forward(stable);
+            return forward(s);
 
         // CAPTURE: enter the resident capture path (kept alive for the graph's lifetime), do a
         // pre-residency pass so every op binds its stable resident buffer, then record the forward.
         try
         {
             _scope = _engine.EnterResidentCaptureScope();
-            if (_scope is null) { _disabled = true; return forward(stable); }
+            if (_scope is null) { _disabled = true; return forward(s); }
 
-            _ = forward(stable); // pre-residency: bind resident buffers (sync uploads here are fine — not capturing)
-            for (int i = 0; i < stable.Length; i++) _engine.RefreshResidentInputInPlace(stable[i]);
+            // Bind each external stable input to a fixed resident buffer so the captured forward reads a
+            // stable device address (no re-upload mid-capture). The forward's own intermediates become
+            // resident under the capture path.
+            for (int i = 0; i < s.Length; i++) _engine.EnsureResidentInput(s[i]);
+            _ = forward(s); // pre-residency: bind resident buffers (sync uploads here are fine — not capturing)
+            for (int i = 0; i < s.Length; i++) _engine.RefreshResidentInputInPlace(s[i]);
 
             Tensor<T>? captured = null;
-            var exec = _engine.CaptureGpuGraph(() => { captured = forward(stable); });
+            var exec = _engine.CaptureGpuGraph(() => { captured = forward(s); });
             if (exec != System.IntPtr.Zero && captured is not null)
             {
                 _exec = exec;
@@ -114,7 +137,7 @@ public sealed class ResidentInferenceGraph : System.IDisposable
             _scope.Dispose();
             _scope = null;
             _disabled = true;
-            return forward(stable);
+            return forward(s);
         }
         catch (System.Exception ex)
         {
