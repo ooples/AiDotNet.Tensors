@@ -248,22 +248,36 @@ public sealed class CudaOffloadAllocator : IGpuOffloadAllocator, IGpuDevicePoint
             ctxToDestroy = _context;
             _context = IntPtr.Zero;
 
-            if (ctxToDestroy != IntPtr.Zero)
+            if (ctxToDestroy != IntPtr.Zero && _ownsContext)
             {
-                // Push our context to free its allocations cleanly,
-                // then pop and destroy. Push/pop discipline matters
-                // even at dispose time: a CudaBackend running on the
-                // same thread might have its own context current, and
-                // a free issued against the wrong context would be
-                // INVALID_CONTEXT or worse.
+                // WE created and own this context, so it is guaranteed valid
+                // here. Push it to free its allocations cleanly, then pop and
+                // destroy. Push/pop discipline matters even at dispose time: a
+                // CudaBackend running on the same thread might have its own
+                // context current, and a free issued against the wrong context
+                // would be INVALID_CONTEXT or worse.
                 using (var scope = new CudaContextPushScope(ctxToDestroy))
                 {
                     foreach (var h in snapshot) FreeNative(h);
                 }
-                // Only destroy the context if WE created it. A shared backend
-                // context must outlive this allocator (the backend still uses it).
-                if (_ownsContext)
-                    CuBlasNative.cuCtxDestroy(ctxToDestroy);
+                CuBlasNative.cuCtxDestroy(ctxToDestroy);
+            }
+            else if (ctxToDestroy != IntPtr.Zero)
+            {
+                // SHARED (non-owning) context: its lifetime is the CudaBackend's,
+                // NOT ours. The backend may ALREADY have destroyed it before this
+                // allocator is disposed — e.g. AiDotNetEngine.ResetToCpu tears the
+                // backend (and its context) down first, then WeightRegistry.Reset
+                // disposes this allocator. Issuing cuCtxPushCurrent / cuMemFree /
+                // cuCtxPopCurrent against a destroyed context is a use-after-free
+                // that faults the process with an UNCATCHABLE native access
+                // violation (observed as "Test host process crashed" in
+                // WeightRegistry.Reset -> CudaOffloadAllocator.Dispose ->
+                // cuCtxPopCurrent). So do NOT touch the shared context here:
+                // cuCtxDestroy by its owner reclaims EVERY allocation made in the
+                // context (device + pinned host), so dropping the per-handle frees
+                // forgoes only a redundant free, never leaks past the context's own
+                // lifetime. (The owned-context branch above still frees+destroys.)
             }
             else
             {

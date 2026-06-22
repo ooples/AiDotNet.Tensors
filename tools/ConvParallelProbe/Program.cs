@@ -162,19 +162,29 @@ internal static class Program
         sw.Stop();
         double warm = sw.Elapsed.TotalMilliseconds;
 
+        // #653/#657 follow-up: forward caching-allocator. With --arena, ONE TensorArena lives
+        // across the whole rep loop and Reset()s before each full forward — so every per-op
+        // TensorAllocator.Rent inside blk() hits the arena (Tier 0) instead of allocating a
+        // fresh GC array, and the prior forward's intermediates are recycled. Reset is PER
+        // FORWARD (not per block): a block's output is the next block's input, so resetting
+        // mid-forward would recycle a live tensor. x0 is allocated before the arena, so it
+        // survives Reset and is a safe re-entry point each iteration.
+        // #653/#657: --arena runs the forward inside a TensorArena (PyTorch-caching-allocator
+        // equivalent); Reset() per rep recycles the prior iteration's intermediate arrays.
+        // (Resolved against main's AIDOTNET_ARENA env-var variant — kept the more careful flag
+        // version: it warms the arena before measuring and uses the per-thread alloc counter,
+        // which the single-threaded alloc window needs; folded in main's arena={...} reporting.)
+        bool useArena = HasFlag(a, "--arena");
+        TensorArena? arena = useArena ? TensorArena.Create() : null;
         var times = new double[reps];
-        // #653: optionally run the forward inside a TensorArena scope (PyTorch-caching-allocator
-        // equivalent) — Reset() per rep recycles the prior iteration's intermediate arrays.
-        bool useArena = Environment.GetEnvironmentVariable("AIDOTNET_ARENA") == "1";
-        TensorArena arena = useArena ? TensorArena.Create() : null;
         using var meter = util ? ParallelUtilizationMeter.Start() : null;   // `using` disposes on exception paths too (#654 review)
         // Warm the arena (first rep allocates; subsequent reps reuse) before the alloc window.
-        if (useArena) { arena.Reset(); yy = x0; for (int b = 0; b < blocks; b++) yy = blk(yy); }
+        if (arena is not null) { arena.Reset(); yy = x0; for (int b = 0; b < blocks; b++) yy = blk(yy); }
         GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
         long allocStart = GC.GetAllocatedBytesForCurrentThread();
         for (int i = 0; i < reps; i++)
         {
-            if (useArena) arena.Reset();
+            if (arena is not null) arena.Reset();
             var s = Stopwatch.StartNew();
             yy = x0;
             for (int b = 0; b < blocks; b++) yy = blk(yy);
@@ -187,7 +197,7 @@ internal static class Program
         Array.Sort(times);
         Console.WriteLine(
             $"ATTNBLOCK S={S} D={D} H={H} Dh={Dh} blocks={blocks} maxdop={maxdop} procs={Environment.ProcessorCount} " +
-            $"warmup_ms={warm:F1} median_ms={times[reps / 2]:F2} min_ms={times[0]:F2} max_ms={times[times.Length - 1]:F2} " +
+            $"arena={useArena} warmup_ms={warm:F1} median_ms={times[reps / 2]:F2} min_ms={times[0]:F2} max_ms={times[times.Length - 1]:F2} " +
             $"alloc_MB_per_fwd={allocBytes / 1048576.0 / reps:F3}{u}");
         return 0;
     }

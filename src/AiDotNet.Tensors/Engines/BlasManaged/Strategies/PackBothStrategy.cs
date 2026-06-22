@@ -38,6 +38,13 @@ internal static class PackBothStrategy
     private static readonly bool s_trace =
         System.Environment.GetEnvironmentVariable("AIDOTNET_GEMM_TRACE") == "1";
 
+    // #653 software-prefetch microkernel (env AIDOTNET_GEMM_PREFETCH=1, default off). Routes the
+    // FP32 6×16 tile through Avx2Fp32_6x16.RunPrefetch (PREFETCHT0 of packed-B ahead) — same inlined
+    // intrinsic kernel, so NO per-tile call/fixed overhead (unlike the machine-code-per-tile path
+    // that regressed). Tests whether L2/L3 latency is the residual per-core gap at large N.
+    private static readonly bool s_prefetch =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_GEMM_PREFETCH") == "1";
+
     // #653 single-persistent-region path (DEFAULT ON, opt-out AIDOTNET_GEMM_SINGLE_REGION=0).
     // The M-axis RunParallelUnsafe re-dispatches the parallel region (and barriers) once per
     // (jc, pc) macro-tile. For the wide-nc forward case (numNB==1) that's one barriered
@@ -1113,11 +1120,18 @@ internal static class PackBothStrategy
             // PackBoth — the gap to native is the macro-harness (packing / blocking / bandwidth).
             if (mr == 6 && nr == 16 && Avx2Fp32_6x16.IsSupported)
             {
-                Avx2Fp32_6x16.Run(
-                    MemoryMarshal.Cast<T, float>(packedA),
-                    MemoryMarshal.Cast<T, float>(packedB),
-                    MemoryMarshal.Cast<T, float>(c),
-                    ldc, kc);
+                if (s_prefetch)
+                    Avx2Fp32_6x16.RunPrefetch(
+                        MemoryMarshal.Cast<T, float>(packedA),
+                        MemoryMarshal.Cast<T, float>(packedB),
+                        MemoryMarshal.Cast<T, float>(c),
+                        ldc, kc);
+                else
+                    Avx2Fp32_6x16.Run(
+                        MemoryMarshal.Cast<T, float>(packedA),
+                        MemoryMarshal.Cast<T, float>(packedB),
+                        MemoryMarshal.Cast<T, float>(c),
+                        ldc, kc);
                 return;
             }
             if (mr == 8 && nr == 8 && Avx2Fp32_8x8.IsSupported)
