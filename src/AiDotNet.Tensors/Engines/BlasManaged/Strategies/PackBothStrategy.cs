@@ -186,10 +186,12 @@ internal static class PackBothStrategy
                 && !transA && !transB
                 && options.PackedA is null && options.PackedB is null
                 && (m % mr) == 0 && m >= mr
-                // Large K makes the shared-A (m×k) re-read per N-block dominate (measured: N-axis
-                // regresses ffn-big k=3456 −17% at low thread count but wins ffn-up k=1536 +27%,
-                // reaching 91% of OpenBLAS). Cap K so the shared-A re-read stays cheap.
-                && k <= 2048
+                // Wide-N gate (n >= k): the N-axis re-reads the shared A (m×k) once per N-block,
+                // so it pays off only when N is wide enough to amortize that — measured across 6
+                // interleaved reps: ffn-big n=4096≥k=3456 wins +27% (DOP32, 6/6) and is neutral
+                // at DOP4, while narrow-N attn-out n=1536<k=4608 loses −19/−26% (0/6). The
+                // earlier k<=2048 gate was the wrong proxy.
+                && (long)n >= (long)k
                 && numNBlocksN >= 2 && numNBlocksN >= Math.Min(4, effProcs)
                 && options.Epilogue.Activation == AiDotNet.Tensors.Engines.FusedActivationType.None
                 && options.Epilogue.BiasN.IsEmpty && options.Epilogue.SkipMxN.IsEmpty;
