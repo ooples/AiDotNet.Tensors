@@ -553,6 +553,57 @@ public class MachineCodeKernelTests
         }
     }
 
+    // #653 PackBoth blocking sweep: measure the production PackBoth strategy at one large size while
+    // AIDOTNET_GEMM_MC/NC/KC override the autotuner's tile choice (read once at static init, so sweep
+    // across separate runs). Reports GF/s + the OpenBLAS reference so a blocking change can be A/B'd.
+    [Fact]
+    public unsafe void Fp32_PackBoth_BlockingSweep_Perf()
+    {
+        if (Environment.GetEnvironmentVariable("AIDOTNET_RUN_JIT_PERF") != "1") return;
+        if (!IsX64Windows || !Avx2.IsSupported || !Fma.IsSupported) return;
+
+        int sz = int.TryParse(Environment.GetEnvironmentVariable("AIDOTNET_SWEEP_SIZE"), out var s) ? s : 1536;
+        int m = sz, n = sz, k = sz, iters = sz >= 1536 ? 25 : sz >= 1024 ? 60 : 300;
+        var rng = new Random(42);
+        var a = new float[m * k]; var b = new float[k * n]; var c = new float[m * n];
+        for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < b.Length; i++) b[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        double Bench(Action body)
+        {
+            for (int i = 0; i < 5; i++) { Array.Clear(c); body(); }
+            double best = double.MaxValue;
+            for (int w = 0; w < 7; w++)
+            {
+                var sw = Stopwatch.StartNew();
+                for (int i = 0; i < iters; i++) { Array.Clear(c); body(); }
+                sw.Stop();
+                best = Math.Min(best, sw.Elapsed.TotalSeconds);
+            }
+            return 2.0 * m * n * k * iters / best / 1e9;
+        }
+
+        double packBoth = Bench(() => AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.Gemm<float>(a, k, false, b, n, false, c, n, m, n, k));
+
+        // PackBoth single-thread → scaling efficiency = aggregate / (st × physicalCores).
+        int prevMax = CpuParallelSettings.MaxDegreeOfParallelism;
+        CpuParallelSettings.MaxDegreeOfParallelism = 1;
+        double packBothSt;
+        try { packBothSt = Bench(() => AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.Gemm<float>(a, k, false, b, n, false, c, n, m, n, k)); }
+        finally { CpuParallelSettings.MaxDegreeOfParallelism = prevMax; }
+
+        double openblas = 0;
+        if (BlasProvider.HasRawSgemm)
+            fixed (float* pa = a, pb = b, pc = c)
+            { float* xa = pa, xb = pb, xc = pc; openblas = Bench(() => BlasProvider.SgemmRaw(m, n, k, xa, k, xb, n, xc, n)); }
+
+        int physical = Math.Max(1, Environment.ProcessorCount / 2);
+        _output.WriteLine($"PackBoth-sweep {m}³ MC={Environment.GetEnvironmentVariable("AIDOTNET_GEMM_MC")} " +
+            $"NC={Environment.GetEnvironmentVariable("AIDOTNET_GEMM_NC")} KC={Environment.GetEnvironmentVariable("AIDOTNET_GEMM_KC")}: " +
+            $"PackBoth {packBoth:F0} GF/s (st {packBothSt:F0}/core, scaling {packBoth / packBothSt:F1}× / {physical} phys), " +
+            $"OpenBLAS {openblas:F0} ({(packBoth / openblas - 1) * 100:+0.0;-0.0}%)");
+    }
+
     [Fact]
     public unsafe void Fp32_GebpPanel_vs_PerTile_GemmPath_Perf()
     {

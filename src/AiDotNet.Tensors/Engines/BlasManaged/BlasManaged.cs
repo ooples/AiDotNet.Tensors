@@ -69,6 +69,14 @@ public static partial class BlasManaged
     private static readonly bool s_forwardPackBothBlocking =
         System.Environment.GetEnvironmentVariable("AIDOTNET_GEMM_FORWARD_PACKBOTH") != "0";
 
+    // #653 wave-quantization mc guard: when the M-axis path's block count lands JUST above the
+    // physical-core count (e.g. numMB=18 on 16 cores → 1 full wave + a 2-block straggler wave that
+    // idles 14 cores), shrink mc so the work splits into ~2 even waves. Catches the catastrophic
+    // numMB ∈ (cores, cores+cores/4] case WITHOUT touching well-quantized shapes (e.g. numMB=26).
+    // Measured: 1024³ FP32 493→~600 GF/s (scaling 7.0×→~8.6×). Opt-in for A/B; default-off.
+    private static readonly bool s_waveMc =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_GEMM_WAVE_MC") == "1";
+
     // #653 cache-blocking sweep hook: env overrides for the PackBoth Mc/Nc/Kc so the
     // cache-residency-optimal blocking can be found empirically (the MKL/BLIS tuning art).
     // 0 = unset (use the computed value). Only applied on the effective-PackBoth path.
@@ -831,6 +839,20 @@ public static partial class BlasManaged
                     int targetMc = Math.Max(2 * mr, (m + physicalCores - 1) / physicalCores);
                     targetMc = ((targetMc + mr - 1) / mr) * mr; // round up to a whole mr tile
                     if (targetMc < mcFromAutotune) mcFromAutotune = targetMc;
+                }
+                // Wave-quantization guard: numMB just OVER physicalCores (a small straggler wave that
+                // idles most cores). Re-split into ~2 even waves (≈2·physicalCores blocks). Only the
+                // narrow (cores, cores+cores/4] band — wider tails (e.g. numMB=26 on 16) quantize fine
+                // and shrinking mc there over-subscribes the shared B panel (L3 pressure → regression).
+                else if (s_waveMc && mcFromAutotune > 2 * mr)
+                {
+                    int tailBand = Math.Max(1, physicalCores / 4);
+                    if (numMBwide > physicalCores && numMBwide <= physicalCores + tailBand)
+                    {
+                        int targetMc = Math.Max(2 * mr, (m + 2 * physicalCores - 1) / (2 * physicalCores));
+                        targetMc = ((targetMc + mr - 1) / mr) * mr; // round up to a whole mr tile
+                        if (targetMc < mcFromAutotune) mcFromAutotune = targetMc;
+                    }
                 }
             }
         }
