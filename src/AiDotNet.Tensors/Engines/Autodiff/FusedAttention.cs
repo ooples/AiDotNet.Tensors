@@ -469,16 +469,24 @@ public static class FusedAttention<T>
     /// </code>
     /// </para>
     ///
-    /// <para>Memory: this reference implementation materialises the full
-    /// <c>[B, H, Sq, Sk]</c> attention-weight matrix. A tiled online-
-    /// softmax backward that matches FlashAttention-2's O(seqLen) memory
-    /// cost is future work; this version is sufficient for correctness
-    /// testing and for small/medium sequences.</para>
+    /// <para>Memory: for small/medium key lengths (<c>Sk &lt;= 128</c>) the straightforward path
+    /// materialises the full <c>[B, H, Sq, Sk]</c> attention-weight matrix. For longer sequences
+    /// (<c>Sk &gt; 128</c>) the backward is tiled over key blocks (<see cref="BackwardTiled"/>) in
+    /// the FlashAttention-2 style — including the causal and additive-bias cases — so the full
+    /// <c>Sq×Sk</c> intermediates are never resident: peak extra memory is O(Sq·tile), not
+    /// O(Sq·Sk).</para>
     /// </summary>
     /// <exception cref="NotSupportedException">
     /// <typeparamref name="T"/> is not a floating-point type
     /// (<c>float</c>, <c>double</c>, or <c>System.Half</c>).
     /// </exception>
+    /// <summary>
+    /// #1662 bench-only switch: force the full-matrix backward even when the tiled path would
+    /// engage, so <c>ConvParallelProbe --flashbwd</c> can measure tiled-vs-full peak memory at
+    /// the same shape. Never set in production. Not thread-safe; for single-threaded benchmarking.
+    /// </summary>
+    internal static bool ForceFullBackwardForBench;
+
     public static (Tensor<T> GradQuery, Tensor<T> GradKey, Tensor<T> GradValue) Backward(
         Tensor<T> gradOutput,
         Tensor<T> query,
@@ -514,51 +522,71 @@ public static class FusedAttention<T>
         double scaleVal = config.Scale ?? 1.0 / Math.Sqrt(headDim);
         T scaleT = numOps.FromDouble(scaleVal);
 
-        var qFlat  = engine.Reshape(query, new[] { B * H, Sq, headDim });
-        var kFlat  = engine.Reshape(key,   new[] { B * H, Sk, headDim });
-        var vFlat  = engine.Reshape(value, new[] { B * H, Sk, Dv });
-        var kFlatT = kFlat.TransposeLast2D();
+        Tensor<T> gradQ, gradK, gradV;
 
-        var scoresFlat = engine.TensorBatchMatMul(qFlat, kFlatT);
-        scoresFlat = engine.TensorMultiplyScalar(scoresFlat, scaleT);
-        var scores = engine.Reshape(scoresFlat, new[] { B, H, Sq, Sk });
-        if (attentionBias is not null)
-            scores = AddBroadcastBias(engine, scores, attentionBias);
-        else if (config.IsCausal)
-            scores = ApplyCausalMask(engine, scores, numOps, config.QueryOffset);
-        else if (config.IsCausal && attentionBias is not null)
-            scores = ApplyCausalMask(engine, scores, numOps, config.QueryOffset);
-        var P = engine.TensorSoftmax(scores, axis: 3);                           // [B, H, Sq, Sk]
+        // #1662 lever #3: for long key sequences, tile the backward over key blocks so the full
+        // [Sq, Sk] score/prob matrices are NEVER materialized — peak extra memory is O(Sq*tile)
+        // instead of O(Sq*Sk). Handles plain, CAUSAL (fully-masked key tiles skipped — the LLM
+        // long-context win), AND additive-bias attention (the bias is sliced per key tile and
+        // broadcast-added to each tile's scores). Matching the full path, bias takes precedence
+        // over the causal flag. Small/medium Sk keeps the full path (faster when S^2 fits).
+        const int TileBk = 128;
+        if (Sk > TileBk && !ForceFullBackwardForBench)
+        {
+            (gradQ, gradK, gradV) = BackwardTiled(
+                engine, numOps, query, key, value, gradOutput,
+                B, H, Sq, Sk, headDim, Dv, scaleVal, TileBk,
+                isCausal: attentionBias is null && config.IsCausal, // bias precedence: no causal mask when bias present
+                config.QueryOffset, attentionBias);
+        }
+        else
+        {
+            // ===== Full-matrix path (small/medium Sk only; Sk>128 — incl. causal/bias — tiles) =====
+            // Recompute the forward softmax to get P — needed for every gradient below.
+            var qFlat  = engine.Reshape(query, new[] { B * H, Sq, headDim });
+            var kFlat  = engine.Reshape(key,   new[] { B * H, Sk, headDim });
+            var vFlat  = engine.Reshape(value, new[] { B * H, Sk, Dv });
+            var kFlatT = kFlat.TransposeLast2D();
 
-        var pFlat = engine.Reshape(P, new[] { B * H, Sq, Sk });
-        var pFlatT = pFlat.TransposeLast2D();                                    // [B*H, Sk, Sq]
-        var goFlat = engine.Reshape(gradOutput, new[] { B * H, Sq, Dv });
+            var scoresFlat = engine.TensorBatchMatMul(qFlat, kFlatT);
+            scoresFlat = engine.TensorMultiplyScalar(scoresFlat, scaleT);
+            var scores = engine.Reshape(scoresFlat, new[] { B, H, Sq, Sk });
+            if (attentionBias is not null)
+                scores = AddBroadcastBias(engine, scores, attentionBias);
+            else if (config.IsCausal)
+                scores = ApplyCausalMask(engine, scores, numOps, config.QueryOffset);
+            var P = engine.TensorSoftmax(scores, axis: 3);                       // [B, H, Sq, Sk]
 
-        // dV = P^T @ dO                                                        [B*H, Sk, Dv]
-        var dvFlat = engine.TensorBatchMatMul(pFlatT, goFlat);
+            var pFlat = engine.Reshape(P, new[] { B * H, Sq, Sk });
+            var pFlatT = pFlat.TransposeLast2D();                                // [B*H, Sk, Sq]
+            var goFlat = engine.Reshape(gradOutput, new[] { B * H, Sq, Dv });
 
-        // dP = dO @ V^T                                                        [B*H, Sq, Sk]
-        var vFlatT = vFlat.TransposeLast2D();
-        var dpFlat = engine.TensorBatchMatMul(goFlat, vFlatT);
+            // dV = P^T @ dO                                                    [B*H, Sk, Dv]
+            var dvFlat = engine.TensorBatchMatMul(pFlatT, goFlat);
 
-        // dS = P * (dP - rowsum(dP * P)) — softmax backward
-        var dP = engine.Reshape(dpFlat, new[] { B, H, Sq, Sk });
-        var dS = SoftmaxBackward(engine, numOps, dP, P);
+            // dP = dO @ V^T                                                    [B*H, Sq, Sk]
+            var vFlatT = vFlat.TransposeLast2D();
+            var dpFlat = engine.TensorBatchMatMul(goFlat, vFlatT);
 
-        var dsFlat = engine.Reshape(dS, new[] { B * H, Sq, Sk });
+            // dS = P * (dP - rowsum(dP * P)) — softmax backward
+            var dP = engine.Reshape(dpFlat, new[] { B, H, Sq, Sk });
+            var dS = SoftmaxBackward(engine, numOps, dP, P);
 
-        // dQ = dS @ K * scale                                                  [B*H, Sq, headDim]
-        var dqFlat = engine.TensorBatchMatMul(dsFlat, kFlat);
-        dqFlat = engine.TensorMultiplyScalar(dqFlat, scaleT);
+            var dsFlat = engine.Reshape(dS, new[] { B * H, Sq, Sk });
 
-        // dK = dS^T @ Q * scale                                                [B*H, Sk, headDim]
-        var dsFlatT = dsFlat.TransposeLast2D();
-        var dkFlat = engine.TensorBatchMatMul(dsFlatT, qFlat);
-        dkFlat = engine.TensorMultiplyScalar(dkFlat, scaleT);
+            // dQ = dS @ K * scale                                              [B*H, Sq, headDim]
+            var dqFlat = engine.TensorBatchMatMul(dsFlat, kFlat);
+            dqFlat = engine.TensorMultiplyScalar(dqFlat, scaleT);
 
-        var gradQ = engine.Reshape(dqFlat, new[] { B, H, Sq, headDim });
-        var gradK = engine.Reshape(dkFlat, new[] { B, H, Sk, headDim });
-        var gradV = engine.Reshape(dvFlat, new[] { B, H, Sk, Dv });
+            // dK = dS^T @ Q * scale                                            [B*H, Sk, headDim]
+            var dsFlatT = dsFlat.TransposeLast2D();
+            var dkFlat = engine.TensorBatchMatMul(dsFlatT, qFlat);
+            dkFlat = engine.TensorMultiplyScalar(dkFlat, scaleT);
+
+            gradQ = engine.Reshape(dqFlat, new[] { B, H, Sq, headDim });
+            gradK = engine.Reshape(dkFlat, new[] { B, H, Sk, headDim });
+            gradV = engine.Reshape(dvFlat, new[] { B, H, Sk, Dv });
+        }
 
         if (was3D)
         {
@@ -567,6 +595,190 @@ public static class FusedAttention<T>
             gradV = DemoteToThreeD(engine, gradV);
         }
         return (gradQ, gradK, gradV);
+    }
+
+    /// <summary>
+    /// #1662 lever #3 — FlashAttention-2 style tiled backward. Tiles over key blocks so the
+    /// full [Sq, Sk] score / probability matrices are never materialized; peak extra memory is
+    /// O(Sq * tile) instead of O(Sq * Sk). Three streaming passes over key tiles:
+    ///   1. online softmax normalizers m_i (row max) and l_i (row sum-exp);
+    ///   2. the softmax-backward correction D_i = Σ_j P_ij·(dO_i·v_j);
+    ///   3. dQ / dK / dV from P_ij = exp(s_ij − m_i)/l_i and dS_ij = P_ij·(dP_ij − D_i).
+    /// The heavy GEMMs (scores, dP, dQ, dK, dV) run through the engine's batched matmul; only the
+    /// O(Sq*tile) per-row softmax elementwise is done inline. Supports plain, causal (fully-masked
+    /// key tiles skipped), and additive-bias attention (bias sliced + broadcast-added per key tile
+    /// via <see cref="ScoresTileWithBias"/>); bias takes precedence over the causal flag.
+    /// </summary>
+    private static (Tensor<T> GradQuery, Tensor<T> GradKey, Tensor<T> GradValue) BackwardTiled(
+        IEngine engine, INumericOperations<T> numOps,
+        Tensor<T> query, Tensor<T> key, Tensor<T> value, Tensor<T> gradOutput,
+        int B, int H, int Sq, int Sk, int headDim, int Dv, double scaleVal, int tileBk,
+        bool isCausal, int queryOffset, Tensor<T>? attentionBias)
+    {
+        int BH = B * H;
+        T scaleT = numOps.FromDouble(scaleVal);
+        // Causal: key kg is visible to query i iff kg <= queryOffset + i (matches ApplyCausalMask).
+        // A whole key tile [j0, j0+bk) is fully masked for EVERY query when j0 > queryOffset+(Sq-1);
+        // such tiles are skipped (their dK/dV stay zero, dQ contribution zero).
+        bool TileFullyMasked(int j0) => isCausal && j0 > queryOffset + (Sq - 1);
+
+        var qf  = engine.Reshape(query,      new[] { BH, Sq, headDim }); // [BH, Sq, Dh]
+        var kf  = engine.Reshape(key,        new[] { BH, Sk, headDim }); // [BH, Sk, Dh]
+        var vf  = engine.Reshape(value,      new[] { BH, Sk, Dv });      // [BH, Sk, Dv]
+        var dof = engine.Reshape(gradOutput, new[] { BH, Sq, Dv });      // [BH, Sq, Dv]
+
+        var m = new T[BH * Sq];
+        var l = new T[BH * Sq];
+        for (int i = 0; i < m.Length; i++) { m[i] = numOps.MinValue; l[i] = numOps.Zero; }
+
+        // ---- Pass 1: online softmax normalizers (m, l) ----
+        for (int j0 = 0; j0 < Sk; j0 += tileBk)
+        {
+            if (TileFullyMasked(j0)) continue;
+            int bk = Math.Min(tileBk, Sk - j0);
+            var kt = SliceAxis1(numOps, kf, BH, Sk, headDim, j0, bk);                       // [BH, bk, Dh]
+            var sTile = ScoresTileWithBias(engine, qf, kt, scaleT, attentionBias, B, H, Sq, bk, j0); // [BH, Sq, bk]
+            var s = sTile.GetDataArray();
+            for (int row = 0; row < BH * Sq; row++)
+            {
+                int b0 = row * bk;
+                int i = row % Sq;                       // query position within [0, Sq)
+                int jMax = isCausal ? Math.Min(bk, queryOffset + i - j0 + 1) : bk; // visible cols in this tile
+                if (jMax <= 0) continue;                // this row sees nothing in this tile
+                T tmax = numOps.MinValue;
+                for (int j = 0; j < jMax; j++)
+                    if (numOps.GreaterThan(s[b0 + j], tmax)) tmax = s[b0 + j];
+                T mOld = m[row];
+                T mNew = numOps.GreaterThan(mOld, tmax) ? mOld : tmax;
+                T alpha = numOps.Exp(numOps.Subtract(mOld, mNew)); // 0 on the first (mOld = MinValue) tile
+                T sumExp = numOps.Zero;
+                for (int j = 0; j < jMax; j++)
+                    sumExp = numOps.Add(sumExp, numOps.Exp(numOps.Subtract(s[b0 + j], mNew)));
+                l[row] = numOps.Add(numOps.Multiply(l[row], alpha), sumExp);
+                m[row] = mNew;
+            }
+        }
+
+        // ---- Pass 2: softmax-backward correction D_i = Σ_j P_ij · dP_ij ----
+        var D = new T[BH * Sq]; // zero-init
+        for (int j0 = 0; j0 < Sk; j0 += tileBk)
+        {
+            if (TileFullyMasked(j0)) continue;
+            int bk = Math.Min(tileBk, Sk - j0);
+            var kt = SliceAxis1(numOps, kf, BH, Sk, headDim, j0, bk);                       // [BH, bk, Dh]
+            var vt = SliceAxis1(numOps, vf, BH, Sk, Dv, j0, bk);                            // [BH, bk, Dv]
+            var sTile = ScoresTileWithBias(engine, qf, kt, scaleT, attentionBias, B, H, Sq, bk, j0); // [BH, Sq, bk]
+            var dpTile = engine.TensorBatchMatMul(dof, vt.TransposeLast2D());               // [BH, Sq, bk]
+            var s = sTile.GetDataArray();
+            var dp = dpTile.GetDataArray();
+            for (int row = 0; row < BH * Sq; row++)
+            {
+                int b0 = row * bk;
+                int i = row % Sq;
+                int jMax = isCausal ? Math.Min(bk, queryOffset + i - j0 + 1) : bk;
+                for (int j = 0; j < jMax; j++)
+                {
+                    T p = numOps.Divide(numOps.Exp(numOps.Subtract(s[b0 + j], m[row])), l[row]);
+                    D[row] = numOps.Add(D[row], numOps.Multiply(p, dp[b0 + j]));
+                }
+            }
+        }
+
+        // ---- Pass 3: dQ (accumulated), dK / dV (per-tile, disjoint keys) ----
+        var dQacc = new T[BH * Sq * headDim]; // zero-init, accumulated across tiles
+        var dKfull = new T[BH * Sk * headDim];
+        var dVfull = new T[BH * Sk * Dv];
+        for (int j0 = 0; j0 < Sk; j0 += tileBk)
+        {
+            if (TileFullyMasked(j0)) continue;
+            int bk = Math.Min(tileBk, Sk - j0);
+            var kt = SliceAxis1(numOps, kf, BH, Sk, headDim, j0, bk);                       // [BH, bk, Dh]
+            var vt = SliceAxis1(numOps, vf, BH, Sk, Dv, j0, bk);                            // [BH, bk, Dv]
+            var sTile = ScoresTileWithBias(engine, qf, kt, scaleT, attentionBias, B, H, Sq, bk, j0); // [BH, Sq, bk]
+            var dpTile = engine.TensorBatchMatMul(dof, vt.TransposeLast2D());               // [BH, Sq, bk]
+            var s = sTile.GetDataArray();
+            var dp = dpTile.GetDataArray();
+
+            // Masked (j >= jMax) entries stay zero-init, so they contribute nothing to the
+            // dV / dK / dQ GEMMs below — exactly the causal mask.
+            var pData = new T[BH * Sq * bk];
+            var dsData = new T[BH * Sq * bk];
+            for (int row = 0; row < BH * Sq; row++)
+            {
+                int b0 = row * bk;
+                int i = row % Sq;
+                int jMax = isCausal ? Math.Min(bk, queryOffset + i - j0 + 1) : bk;
+                for (int j = 0; j < jMax; j++)
+                {
+                    T p = numOps.Divide(numOps.Exp(numOps.Subtract(s[b0 + j], m[row])), l[row]);
+                    pData[b0 + j] = p;
+                    dsData[b0 + j] = numOps.Multiply(p, numOps.Subtract(dp[b0 + j], D[row]));
+                }
+            }
+            var pTile = new Tensor<T>(pData, new[] { BH, Sq, bk });
+            var dsTile = new Tensor<T>(dsData, new[] { BH, Sq, bk });
+
+            // dV_j = Σ_i P_ij · dO_i  -> [BH, bk, Dv]; keys are disjoint per tile, so write.
+            var dVtile = engine.TensorBatchMatMul(pTile.TransposeLast2D(), dof);            // [BH, bk, Dv]
+            CopyTileIntoAxis1(dVfull, dVtile.GetDataArray(), BH, Sk, Dv, j0, bk);
+            // dK_j = scale · Σ_i dS_ij · q_i -> [BH, bk, Dh]
+            var dKtile = engine.TensorMultiplyScalar(
+                engine.TensorBatchMatMul(dsTile.TransposeLast2D(), qf), scaleT);            // [BH, bk, Dh]
+            CopyTileIntoAxis1(dKfull, dKtile.GetDataArray(), BH, Sk, headDim, j0, bk);
+            // dQ_i += scale · Σ_j dS_ij · k_j -> [BH, Sq, Dh] (accumulate across tiles)
+            var dQtile = engine.TensorMultiplyScalar(
+                engine.TensorBatchMatMul(dsTile, kt), scaleT);                              // [BH, Sq, Dh]
+            var dq = dQtile.GetDataArray();
+            for (int idx = 0; idx < dQacc.Length; idx++)
+                dQacc[idx] = numOps.Add(dQacc[idx], dq[idx]);
+        }
+
+        var gradQ = engine.Reshape(new Tensor<T>(dQacc, new[] { BH, Sq, headDim }), new[] { B, H, Sq, headDim });
+        var gradK = engine.Reshape(new Tensor<T>(dKfull, new[] { BH, Sk, headDim }), new[] { B, H, Sk, headDim });
+        var gradV = engine.Reshape(new Tensor<T>(dVfull, new[] { BH, Sk, Dv }), new[] { B, H, Sk, Dv });
+        return (gradQ, gradK, gradV);
+    }
+
+    /// <summary>Scaled scores for one key tile: <c>scale · (Q @ Kt^T)</c> as [BH, Sq, bk], plus
+    /// the additive attention bias sliced to the tile's key columns when present. The bias slice
+    /// preserves the bias's broadcast shape (last axis Sk → [j0, j0+bk)); TensorBroadcastAdd then
+    /// applies the same broadcast rules as the full-matrix path's AddBroadcastBias.</summary>
+    private static Tensor<T> ScoresTileWithBias(
+        IEngine engine, Tensor<T> qf, Tensor<T> kt, T scaleT, Tensor<T>? bias,
+        int B, int H, int Sq, int bk, int j0)
+    {
+        var s = engine.TensorMultiplyScalar(engine.TensorBatchMatMul(qf, kt.TransposeLast2D()), scaleT); // [BH, Sq, bk]
+        if (bias is null) return s;
+
+        int br = bias.Rank;
+        var start = new int[br];
+        var len = new int[br];
+        for (int d = 0; d < br; d++) { start[d] = 0; len[d] = bias._shape[d]; }
+        start[br - 1] = j0;   // slice the key axis to this tile
+        len[br - 1] = bk;
+        var biasTile = engine.TensorSlice(bias, start, len);                 // [.., Sq, bk] (broadcastable)
+        var s4 = engine.Reshape(s, new[] { B, H, Sq, bk });
+        s4 = engine.TensorBroadcastAdd(s4, biasTile);
+        return engine.Reshape(s4, new[] { B * H, Sq, bk });
+    }
+
+    /// <summary>Copies the key/value slice [:, j0:j0+bk, :] out of a contiguous [BH, S, D]
+    /// tensor into a fresh contiguous [BH, bk, D] tile.</summary>
+    private static Tensor<T> SliceAxis1(INumericOperations<T> numOps, Tensor<T> src, int BH, int S, int D, int j0, int bk)
+    {
+        var srcData = src.IsContiguous ? src.GetDataArray() : src.Contiguous().GetDataArray();
+        var dst = new T[BH * bk * D];
+        for (int b = 0; b < BH; b++)
+            Array.Copy(srcData, (b * S + j0) * D, dst, b * bk * D, bk * D);
+        return new Tensor<T>(dst, new[] { BH, bk, D });
+    }
+
+    /// <summary>Writes a [BH, bk, D] tile into the [:, j0:j0+bk, :] slice of a flat [BH, S, D]
+    /// destination buffer (keys are disjoint across tiles, so a copy is correct).</summary>
+    private static void CopyTileIntoAxis1(T[] dst, T[] tile, int BH, int S, int D, int j0, int bk)
+    {
+        for (int b = 0; b < BH; b++)
+            Array.Copy(tile, b * bk * D, dst, (b * S + j0) * D, bk * D);
     }
 
     /// <summary>
