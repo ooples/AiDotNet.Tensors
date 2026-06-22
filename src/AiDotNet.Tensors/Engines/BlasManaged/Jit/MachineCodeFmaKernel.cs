@@ -262,13 +262,15 @@ internal static class MachineCodeFmaKernel
         asm.JzLabel32(store);        // rel32: prefetch'd K-loop body exceeds rel8 forward range
         int kloop = asm.NewLabel();
         asm.MarkLabel(kloop);
-        // Software prefetch the upcoming B and A 512 B ahead (8 lines for B at 64 B/step) —
-        // hides the L2→L1 latency of the next packed panel, the dominant in-context kernel
-        // stall. Matches OpenBLAS sgemm's A_PR1/B_PR1=512 prefetch distance. Pure hint;
-        // bit-exact. (Single-tile prefetch was neutral because B was already L1-hot; in the
-        // panel macro-loop the NEXT tile's panel is cold, so this is the real win.)
+        // Software prefetch the upcoming B stripe 512 B ahead (8 lines at 64 B/step) — hides
+        // the L2→L1 latency of the next packed panel, the dominant in-context kernel stall.
+        // B-ONLY: the packed-A panel is only Mr=6 floats (24 B) per K-step, already pulled
+        // into L1 by the vbroadcastss loads, so prefetching A is pure redundant load-port
+        // traffic (confirmed by PR #656's review: A+B prefetch −14%, B-only −2%, in the
+        // single-tile kernel). Pure hint, bit-exact. Distinct from PR #656: that prefetches
+        // the SINGLE-TILE kernel where B is already streaming-resident (net loss → opt-in);
+        // here B is cold for the NEXT tile in the panel macro-loop, so it's a real win.
         asm.Prefetcht0D32(RDX, 512);
-        asm.Prefetcht0D32(RCX, 512);
         asm.VmovupsLoad(BLO, RDX, 0);
         asm.VmovupsLoad(BHI, RDX, 32);
         for (int r = 0; r < Mr; r++)
