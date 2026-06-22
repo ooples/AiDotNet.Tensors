@@ -7640,8 +7640,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         try
         {
+            // Backend signature is (gradOutput, input, gradWeights, ...) — pass them in that order.
+            // (Previously input/gradOutput were swapped, so the kernel indexed input's buffer with the
+            // gradOutput layout and vice versa, producing wrong weight gradients.)
             backend.LocallyConnectedConv2DBackwardWeights(
-                inputBuffer.Buffer, gradOutputBuffer.Buffer, gradWeightsBuffer.Buffer,
+                gradOutputBuffer.Buffer, inputBuffer.Buffer, gradWeightsBuffer.Buffer,
                 batch, inChannels, inHeight, inWidth,
                 outChannels, outHeight, outWidth,
                 kernelH, kernelW, stride[0], stride[1]);
