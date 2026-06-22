@@ -26,6 +26,13 @@ internal sealed class PersistentParallelExecutor
     private volatile Action<int>? _action;
     private volatile int _numChunks;
 
+    // Per-dispatch participant stride (= active workers + 1). Workers walk chunks
+    // slot+1, slot+1+stride, … so the stride MUST equal the number of participants
+    // (main + woken workers) or chunks assigned to non-woken slots are dropped.
+    // Set per Execute so a low MaxDegreeOfParallelism wakes fewer workers without
+    // losing chunks. Volatile: published before _workReady[i].Set() wakes a worker.
+    private volatile int _stride = 1;
+
     // Completion tracking — workers decrement, dispatcher waits for zero
     private int _remaining;
 
@@ -37,7 +44,17 @@ internal sealed class PersistentParallelExecutor
 
     private PersistentParallelExecutor()
     {
-        _numWorkers = CpuParallelSettings.WorkerPoolThreads;   // capped (was ProcessorCount-1 = ~63 on a 64-core box)
+        // Size the parked pool to the MACHINE width (cores-1, ceiling 32), NOT
+        // CpuParallelSettings.WorkerPoolThreads. WorkerPoolThreads folds in the CURRENT
+        // MaxDegreeOfParallelism, and this pool initializes exactly once — so a transient
+        // low MaxDoP at the first dispatch (a DOP-pinned warmup/probe, or a consumer that
+        // lowers MaxDoP before its first parallel op) would PERMANENTLY cap the pool and
+        // kill many-core scaling for the process's life (the same singleton-init bug fixed
+        // in CooperativeGemmScheduler). Per-dispatch concurrency is bounded per call below
+        // (effWorkers honors the current MaxDegreeOfParallelism), so a machine-width parked
+        // pool honors MaxDoP per op without the permanent cap; parked workers cost no CPU.
+        const int ceiling = 32;
+        _numWorkers = Math.Max(1, Math.Min(Environment.ProcessorCount - 1, ceiling));
         _workers = new Thread[_numWorkers];
         _workReady = new ManualResetEventSlim[_numWorkers];
 
@@ -98,7 +115,7 @@ internal sealed class PersistentParallelExecutor
             // Set reentrancy guard on worker thread so nested Execute() from
             // callbacks falls back to sequential instead of deadlocking on _executeLock.
             _isExecuting = true;
-            int stride = _numWorkers + 1;
+            int stride = _stride;   // per-dispatch participant count (main + active workers)
             int chunkId = slot + 1;
             while (chunkId < _numChunks)
             {
@@ -215,11 +232,20 @@ internal sealed class PersistentParallelExecutor
             _isExecuting = true;
             try
             {
-                int workersNeeded = Math.Min(numChunks - 1, _numWorkers);
+                // Honor the CURRENT MaxDegreeOfParallelism per dispatch: wake at most
+                // MaxDoP-1 workers (the caller participates as the MaxDoP-th). The parked pool
+                // is machine-width, but a low MaxDoP must not oversubscribe — and the stride
+                // below is set to the participant count so the un-woken slots' chunks aren't
+                // dropped.
+                int maxDeg = CpuParallelSettings.MaxDegreeOfParallelism;
+                int effWorkers = Math.Min(_numWorkers, Math.Max(0, maxDeg - 1));
+                int workersNeeded = Math.Min(numChunks - 1, effWorkers);
+                int stride = workersNeeded + 1;   // participants = main + woken workers
 
                 // Setup shared state
                 _action = action;
                 _numChunks = numChunks;
+                _stride = stride;                 // publish BEFORE waking any worker
                 _remaining = workersNeeded;
                 _workerException = null;
                 _allDone.Reset();
@@ -230,8 +256,8 @@ internal sealed class PersistentParallelExecutor
                     _workReady[i].Set();
                 }
 
-                // Main thread does chunk 0 and any overflow chunks beyond worker count
-                // (chunks assigned round-robin: main thread gets 0, _numWorkers+1, 2*_numWorkers+1, ...)
+                // Main thread does chunk 0 and any overflow chunks (round-robin by stride:
+                // main gets 0, stride, 2*stride, …; worker slot i gets i+1, i+1+stride, …).
                 Exception? mainException = null;
                 int mainChunk = 0;
                 while (mainChunk < numChunks)
@@ -244,11 +270,15 @@ internal sealed class PersistentParallelExecutor
                     {
                         mainException ??= ex;
                     }
-                    mainChunk += _numWorkers + 1;
+                    mainChunk += stride;
                 }
 
-                // Always wait for workers once dispatched to avoid stale Set() on next round
-                _allDone.Wait();
+                // Wait for the woken workers to finish (each decrements _remaining; the last
+                // sets _allDone). Skip when no workers were woken (workersNeeded == 0, e.g.
+                // MaxDoP==1): the main thread already ran every chunk (stride == 1), and
+                // _allDone would never be set — waiting would hang.
+                if (workersNeeded > 0)
+                    _allDone.Wait();
 
                 _action = null;
 
