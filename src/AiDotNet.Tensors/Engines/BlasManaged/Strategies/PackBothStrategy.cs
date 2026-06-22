@@ -181,6 +181,7 @@ internal static class PackBothStrategy
             // N-axis uses its OWN L2-sized Nc (the autotune may have widened nc to span N for
             // A-pack-once, which leaves 1 N-block — no fan-out). Target the Kc×Nc B-block at
             // ~half L2 (256 KB) so each thread's private B stays L2-resident.
+            int effProcs = Math.Min(procs, Environment.ProcessorCount);
             int ncN = nc;
             {
                 int l2Target = 256 * 1024 / (Math.Max(1, kc) * sizeof(float));
@@ -189,9 +190,19 @@ internal static class PackBothStrategy
                 // Only shrink toward n when n>0; a zero-column GEMM would clamp ncN to 0 and make
                 // the numNBlocksN divide below throw. (Callers guard n>0, but keep route selection safe.)
                 if (nRounded > 0) ncN = Math.Min(ncN, nRounded);
+                // DOP-aware fan-out: the L2-sized ncN above can leave FEWER N-blocks than threads
+                // (e.g. n=1024, ncN=256 → 4 blocks → only 4 of 32 threads do work). When parallel,
+                // shrink ncN so there are at least effProcs N-blocks — each thread's private B is
+                // just smaller, still L2-resident. Measured at DOP=32: +36% on ffn-big (n=4096),
+                // +44% on a 1024³ shape, neutral on ffn-up. Single-thread (effProcs==1) skips this,
+                // keeping the wide B-panel the serial per-block A re-read amortizes best.
+                if (effProcs > 1)
+                {
+                    int ncFanout = Math.Max(nr, (n / effProcs / nr) * nr);
+                    ncN = Math.Min(ncN, ncFanout);
+                }
             }
             int numNBlocksN = (n + ncN - 1) / ncN;
-            int effProcs = Math.Min(procs, Environment.ProcessorCount);
             bool useNAxis = !s_disableNAxis
                 && MachineKernelGemm.IsFp32PanelAvailable
                 && typeof(T) == typeof(float)
