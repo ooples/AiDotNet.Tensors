@@ -21,9 +21,11 @@ namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 public class FusedAttentionTiledBackwardTests
 {
     [Theory]
-    [InlineData(1, 2, 16, 8)]    // tiny
-    [InlineData(2, 4, 64, 16)]   // medium, multi-batch/head
-    [InlineData(1, 8, 256, 32)]  // long-ish sequence (where O(S) memory matters)
+    [InlineData(1, 2, 16, 8)]    // tiny (full-matrix path)
+    [InlineData(2, 4, 64, 16)]   // medium, multi-batch/head (full-matrix path)
+    [InlineData(1, 8, 256, 32)]  // long sequence -> tiled path, 2 even key tiles (128+128)
+    [InlineData(1, 4, 200, 16)]  // tiled path, UNEVEN last tile (128+72)
+    [InlineData(2, 4, 320, 16)]  // tiled path, multi-batch/head, 3 tiles (128+128+64)
     public void Backward_MatchesNaiveReference_dQdKdV(int B, int H, int S, int Dh)
     {
         var engine = new CpuEngine();
