@@ -185,11 +185,12 @@ internal static class Program
     private static int RunTrainbench(CpuEngine eng, string[] a)
     {
         int maxdop = ArgI(a, "--maxdop", Environment.ProcessorCount);
-        int S = ArgI(a, "--s", 128);        // sequence length (rows)
-        int D = ArgI(a, "--d", 384);        // model dim
+        int S = ArgI(a, "--s", 128);        // sequence length (rows) / conv spatial
+        int D = ArgI(a, "--d", 384);        // model dim / conv channels
         int layers = ArgI(a, "--layers", 10);
         int reps = ArgI(a, "--reps", 20);
         int warmup = ArgI(a, "--warmup", 5);
+        string block = ArgS(a, "--block", "mlp"); // mlp | attn | conv
         if (maxdop < 1 || S < 1 || D < 1 || layers < 1 || reps < 1 || warmup < 0)
         {
             Console.Error.WriteLine("trainbench: --maxdop,--s,--d,--layers,--reps must be >= 1 (--warmup >= 0).");
@@ -203,7 +204,14 @@ internal static class Program
         bool arenaOn = !HasFlag(a, "--no-arena");
 
         var rng = new Random(0);
-        var step = new TrainbenchStep(eng, S, D, layers, rng);
+        ITrainStep step = block switch
+        {
+            "attn" => new TrainbenchAttnStep(eng, S, D, layers, rng),
+            "conv" => new TrainbenchConvStep(eng, S, D, layers, rng),
+            "mlp"  => new TrainbenchStep(eng, S, D, layers, rng),
+            _      => null!,
+        };
+        if (step is null) { Console.Error.WriteLine($"trainbench: --block must be mlp|attn|conv (got '{block}')."); return 2; }
 
         // Weights are constructed above (before the arena) so they stay persistent across
         // Reset(); only per-step scratch recycles.
@@ -227,23 +235,40 @@ internal static class Program
         Array.Sort(times);
         double perStepAllocMB = allocTotal / (double)reps / (1024.0 * 1024.0);
         Console.WriteLine(
-            $"TRAINBENCH engine=aidotnet arena={(arenaOn ? "on" : "off")} S={S} D={D} layers={layers} maxdop={maxdop} " +
+            $"TRAINBENCH engine=aidotnet block={block} arena={(arenaOn ? "on" : "off")} S={S} D={D} layers={layers} maxdop={maxdop} " +
             $"procs={Environment.ProcessorCount} median_ms={times[reps / 2]:F3} min_ms={times[0]:F3} " +
             $"alloc_mb_per_step={perStepAllocMB:F3} peak_ws_mb={peakWs / (1024.0 * 1024.0):F1} " +
             $"last_loss={step.LastLoss:E3}");
         return 0;
     }
 
+    // A single training block whose per-step fwd+bwd allocation the trainbench measures.
+    private interface ITrainStep { void RunStep(); float LastLoss { get; } }
+
+    private const float TbLr = 1e-3f;
+
+    // In-place SGD update applied inside the streaming-backward callback.
+    private static void SgdApply(Tensor<float> src, Tensor<float> g)
+    {
+        if (g is null || g.Length == 0) return;
+        for (int i = 0; i < src.Length; i++) src[i] -= TbLr * g[i];
+    }
+
+    private static Tensor<float> Scaled(Tensor<float> t, float s)
+    {
+        for (int i = 0; i < t.Length; i++) t[i] *= s;
+        return t;
+    }
+
     // Owns the residual-FFN weights and runs one fwd+bwd+SGD step on the tape. SGD (not Adam)
     // so the optimizer step itself contributes ~no allocation — the metric isolates fwd+bwd.
-    private sealed class TrainbenchStep
+    private sealed class TrainbenchStep : ITrainStep
     {
         private readonly CpuEngine _eng;
         private readonly int _layers;
         private readonly Tensor<float>[] _w1; // [D, 4D]
         private readonly Tensor<float>[] _w2; // [4D, D]
         private readonly Tensor<float> _x;    // [S, D] fixed input
-        private const float Lr = 1e-3f;
 
         public float LastLoss { get; private set; }
 
@@ -256,8 +281,8 @@ internal static class Program
             // Scale weights small so the residual stack stays numerically tame over many steps.
             for (int l = 0; l < layers; l++)
             {
-                _w1[l] = Scale(Rand(new[] { d, 4 * d }, rng), 0.02f);
-                _w2[l] = Scale(Rand(new[] { 4 * d, d }, rng), 0.02f);
+                _w1[l] = Scaled(Rand(new[] { d, 4 * d }, rng), 0.02f);
+                _w2[l] = Scaled(Rand(new[] { 4 * d, d }, rng), 0.02f);
             }
         }
 
@@ -278,17 +303,106 @@ internal static class Program
 
             var sources = new List<Tensor<float>>(_layers * 2);
             for (int l = 0; l < _layers; l++) { sources.Add(_w1[l]); sources.Add(_w2[l]); }
-            tape.ComputeGradientsStreaming(loss, sources, (src, g) =>
+            tape.ComputeGradientsStreaming(loss, sources, SgdApply);
+        }
+    }
+
+    // Single-head attention block (q@k^T -> softmax -> @v -> proj -> residual -> LayerNorm),
+    // built from tape primitives so Softmax/LayerNorm/MatMulTransposed BACKWARD are exercised
+    // — the attention backward path #1662 lever #4 names. Verifies it stays arena-bounded.
+    private sealed class TrainbenchAttnStep : ITrainStep
+    {
+        private readonly CpuEngine _eng;
+        private readonly int _layers, _d;
+        private readonly float _scale;
+        private readonly Tensor<float>[] _wq, _wk, _wv, _wo, _gamma, _beta;
+        private readonly Tensor<float> _x; // [S, D]
+
+        public float LastLoss { get; private set; }
+
+        public TrainbenchAttnStep(CpuEngine eng, int s, int d, int layers, Random rng)
+        {
+            _eng = eng; _layers = layers; _d = d;
+            _scale = (float)(1.0 / Math.Sqrt(d));
+            _x = Rand(new[] { s, d }, rng);
+            _wq = new Tensor<float>[layers]; _wk = new Tensor<float>[layers];
+            _wv = new Tensor<float>[layers]; _wo = new Tensor<float>[layers];
+            _gamma = new Tensor<float>[layers]; _beta = new Tensor<float>[layers];
+            for (int l = 0; l < layers; l++)
             {
-                if (g is null || g.Length == 0) return;
-                for (int i = 0; i < src.Length; i++) src[i] -= Lr * g[i]; // SGD, in place
-            });
+                _wq[l] = Scaled(Rand(new[] { d, d }, rng), 0.02f);
+                _wk[l] = Scaled(Rand(new[] { d, d }, rng), 0.02f);
+                _wv[l] = Scaled(Rand(new[] { d, d }, rng), 0.02f);
+                _wo[l] = Scaled(Rand(new[] { d, d }, rng), 0.02f);
+                _gamma[l] = Scaled(Rand(new[] { d }, rng), 0f); // gamma=0+1 below
+                for (int i = 0; i < d; i++) _gamma[l][i] = 1f;
+                _beta[l] = Scaled(Rand(new[] { d }, rng), 0f);
+            }
         }
 
-        private static Tensor<float> Scale(Tensor<float> t, float s)
+        public void RunStep()
         {
-            for (int i = 0; i < t.Length; i++) t[i] *= s;
-            return t;
+            using var tape = new GradientTape<float>();
+            var h = _x;
+            for (int l = 0; l < _layers; l++)
+            {
+                var q = _eng.TensorMatMul(h, _wq[l]);                 // [S, D]
+                var k = _eng.TensorMatMul(h, _wk[l]);
+                var v = _eng.TensorMatMul(h, _wv[l]);
+                var scores = _eng.TensorMatMulTransposed(q, k);       // q @ k^T -> [S, S]
+                scores = _eng.TensorMultiplyScalar(scores, _scale);
+                var p = _eng.Softmax(scores, -1);                     // [S, S]
+                var ctx = _eng.TensorMatMul(p, v);                    // [S, D]
+                var o = _eng.TensorMatMul(ctx, _wo[l]);               // [S, D]
+                var res = _eng.TensorAdd(h, o);                       // residual
+                h = _eng.TensorLayerNorm(res, _gamma[l], _beta[l]);   // LayerNorm
+            }
+            var loss = _eng.ReduceSum(_eng.TensorMultiply(h, h));
+            LastLoss = loss.Length > 0 ? loss[0] : 0f;
+
+            var sources = new List<Tensor<float>>(_layers * 6);
+            for (int l = 0; l < _layers; l++)
+            { sources.Add(_wq[l]); sources.Add(_wk[l]); sources.Add(_wv[l]); sources.Add(_wo[l]); sources.Add(_gamma[l]); sources.Add(_beta[l]); }
+            tape.ComputeGradientsStreaming(loss, sources, SgdApply);
+        }
+    }
+
+    // Residual conv stack (Conv2D 3x3 pad-1 -> GELU -> residual) so Conv2D BACKWARD (im2col /
+    // col2im scratch) is exercised — the conv backward path #1662 lever #4 names.
+    private sealed class TrainbenchConvStep : ITrainStep
+    {
+        private readonly CpuEngine _eng;
+        private readonly int _layers;
+        private readonly Tensor<float>[] _kernels; // [C, C, 3, 3]
+        private readonly Tensor<float> _x;         // [1, C, sp, sp]
+
+        public float LastLoss { get; private set; }
+
+        public TrainbenchConvStep(CpuEngine eng, int sp, int channels, int layers, Random rng)
+        {
+            _eng = eng; _layers = layers;
+            _x = Rand(new[] { 1, channels, sp, sp }, rng);
+            _kernels = new Tensor<float>[layers];
+            for (int l = 0; l < layers; l++)
+                _kernels[l] = Scaled(Rand(new[] { channels, channels, 3, 3 }, rng), 0.02f);
+        }
+
+        public void RunStep()
+        {
+            using var tape = new GradientTape<float>();
+            var h = _x;
+            for (int l = 0; l < _layers; l++)
+            {
+                var y = _eng.Conv2D(h, _kernels[l], 1, 1, 1); // 3x3 stride1 pad1 -> same spatial
+                y = _eng.GELU(y);
+                h = _eng.TensorAdd(h, y);                     // residual
+            }
+            var loss = _eng.ReduceSum(_eng.TensorMultiply(h, h));
+            LastLoss = loss.Length > 0 ? loss[0] : 0f;
+
+            var sources = new List<Tensor<float>>(_layers);
+            for (int l = 0; l < _layers; l++) sources.Add(_kernels[l]);
+            tape.ComputeGradientsStreaming(loss, sources, SgdApply);
         }
     }
 
@@ -741,6 +855,12 @@ internal static class Program
     }
 
     private static bool HasFlag(string[] a, string f) => Array.IndexOf(a, f) >= 0;
+
+    private static string ArgS(string[] a, string f, string d)
+    {
+        int i = Array.IndexOf(a, f);
+        return i >= 0 && i + 1 < a.Length ? a[i + 1] : d;
+    }
 
     // Stop a utilization meter (if any) and format its reading.
     //  busyCores = mean busy CPU cores over the window (process CPU-time / wall) — pool-agnostic.
