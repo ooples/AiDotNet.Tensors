@@ -295,10 +295,21 @@ internal static class Program
                     var A = RandFlat(m * k, rng);
                     var B = RandFlat(k * n, rng);
                     var C = new float[m * n];
-                    double tAuto = BenchStrat(A, B, C, m, n, k, PackingMode.Auto, reps);
-                    double tPB = BenchStrat(A, B, C, m, n, k, PackingMode.ForcePackBoth, reps);
-                    double tPA = BenchStrat(A, B, C, m, n, k, PackingMode.ForcePackAOnly, reps);
-                    double tS = BenchStrat(A, B, C, m, n, k, PackingMode.ForceStreaming, reps);
+                    // INTERLEAVED min-of-N (matches #663's methodology): cycle through the strategies
+                    // per rep and keep each one's MIN, so all strategies see the same thermal/
+                    // contention drift — eliminates the block-order bias that fakes flip-flops.
+                    var modes = new[] { PackingMode.Auto, PackingMode.ForcePackBoth, PackingMode.ForcePackAOnly, PackingMode.ForceStreaming };
+                    var min = new double[modes.Length];
+                    for (int s = 0; s < modes.Length; s++) min[s] = double.MaxValue;
+                    for (int w = 0; w < 3; w++) // warmup all
+                        for (int s = 0; s < modes.Length; s++) RunOnce(A, B, C, m, n, k, modes[s]);
+                    for (int i = 0; i < reps; i++)
+                        for (int s = 0; s < modes.Length; s++)
+                        {
+                            double ms = RunOnce(A, B, C, m, n, k, modes[s]);
+                            if (ms < min[s]) min[s] = ms;
+                        }
+                    double tAuto = min[0], tPB = min[1], tPA = min[2], tS = min[3];
                     double best = Math.Min(tPB, Math.Min(tPA, tS));
                     string flag = tAuto > 1.25 * best ? $"MISROUTE x{tAuto / best:F1}" : "";
                     Console.WriteLine($"{m} {k} {n} | {tAuto:F3} {tPB:F3} {tPA:F3} {tS:F3} | {flag}");
@@ -306,19 +317,13 @@ internal static class Program
         return 0;
     }
 
-    private static double BenchStrat(float[] A, float[] B, float[] C, int m, int n, int k, PackingMode mode, int reps)
+    private static double RunOnce(float[] A, float[] B, float[] C, int m, int n, int k, PackingMode mode)
     {
         var opt = new BlasOptions<float> { PackingMode = mode };
-        for (int w = 0; w < 3; w++) BlasManaged.Gemm<float>(A, k, false, B, n, false, C, n, m, n, k, opt);
-        double best = double.MaxValue;
-        for (int i = 0; i < reps; i++)
-        {
-            var sw = Stopwatch.StartNew();
-            BlasManaged.Gemm<float>(A, k, false, B, n, false, C, n, m, n, k, opt);
-            sw.Stop();
-            best = Math.Min(best, sw.Elapsed.TotalMilliseconds);
-        }
-        return best;
+        var sw = Stopwatch.StartNew();
+        BlasManaged.Gemm<float>(A, k, false, B, n, false, C, n, m, n, k, opt);
+        sw.Stop();
+        return sw.Elapsed.TotalMilliseconds;
     }
 
     private static float[] RandFlat(int n, Random r)
