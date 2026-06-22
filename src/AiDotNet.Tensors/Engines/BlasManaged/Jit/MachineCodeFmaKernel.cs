@@ -258,19 +258,55 @@ internal static class MachineCodeFmaKernel
         }
 
         int store = asm.NewLabel();
+        int ktail = asm.NewLabel();
+        const int U = 4; // K-unroll factor
+
+        // K-loop, unrolled by U=4. A single K-step is FMA-bound (12 FMAs ≈ 6 cycles), but the
+        // per-step pointer-advance (2 adds) + dec + taken branch added ~2.8 cycles of overhead
+        // on top — ~30% of the body — capping the hot-L1 kernel near 68% of peak. Unrolling
+        // amortizes that bookkeeping over 4 K-steps (1 branch / 4 steps instead of 1/step) and
+        // gives the scheduler a wider independent-FMA window. Bit-exact: K-steps still accumulate
+        // into C in ascending order 0,1,2,… (guarded by MachineKernelPanelTests).
+        //
+        // Software-prefetch the upcoming B 512 B ahead — hides the L2→L1 latency of the next
+        // packed panel, the dominant in-context stall. B-ONLY: the packed-A panel is only Mr=6
+        // floats (24 B) per K-step, already pulled into L1 by the vbroadcastss loads, so
+        // prefetching A is pure redundant load-port traffic (PR #656: A+B −14%, B-only −2% in
+        // the single-tile kernel). Here B is cold for the NEXT tile in the panel macro-loop, so
+        // it's a real win. Pure hint, bit-exact.
+        asm.CmpRegImm8(R10, U);
+        asm.JlLabel32(ktail);          // kc < U → straight to the 1-step tail
+        int kmain = asm.NewLabel();
+        asm.MarkLabel(kmain);
+        asm.Prefetcht0D32(RDX, 512);
+        for (int ku = 0; ku < U; ku++)
+        {
+            int bOff = ku * Nr * 4;    // 0, 64, 128, 192 — within an unrolled block, read B/A by
+            if (bOff <= 127)           // displacement (no per-step pointer math). ≥128 needs disp32.
+            { asm.VmovupsLoad(BLO, RDX, (sbyte)bOff); asm.VmovupsLoad(BHI, RDX, (sbyte)(bOff + 32)); }
+            else
+            { asm.VmovupsLoadD32(BLO, RDX, bOff); asm.VmovupsLoadD32(BHI, RDX, bOff + 32); }
+            for (int r = 0; r < Mr; r++)
+            {
+                int areg = (r % 2 == 0) ? A0 : A1;
+                asm.VbroadcastSs(areg, RCX, (sbyte)(ku * Mr * 4 + r * 4)); // max 3*24+20=92 → disp8
+                asm.Vfmadd231ps(2 * r, areg, BLO);
+                asm.Vfmadd231ps(2 * r + 1, areg, BHI);
+            }
+        }
+        asm.AddRegImm32(RCX, U * Mr * 4);  // A += 24 floats
+        asm.AddRegImm32(RDX, U * Nr * 4);  // B += 64 floats
+        asm.SubRegImm8(R10, (sbyte)U);
+        asm.CmpRegImm8(R10, U);
+        asm.JlLabel32(ktail);          // remaining < U → tail
+        asm.JmpLabel32(kmain);         // else another unrolled round
+
+        // Tail: remaining 0..U-1 K-steps, one at a time (pointer-advance form).
+        asm.MarkLabel(ktail);
         asm.TestRegSelf(R10);
-        asm.JzLabel32(store);        // rel32: prefetch'd K-loop body exceeds rel8 forward range
+        asm.JzLabel32(store);
         int kloop = asm.NewLabel();
         asm.MarkLabel(kloop);
-        // Software prefetch the upcoming B stripe 512 B ahead (8 lines at 64 B/step) — hides
-        // the L2→L1 latency of the next packed panel, the dominant in-context kernel stall.
-        // B-ONLY: the packed-A panel is only Mr=6 floats (24 B) per K-step, already pulled
-        // into L1 by the vbroadcastss loads, so prefetching A is pure redundant load-port
-        // traffic (confirmed by PR #656's review: A+B prefetch −14%, B-only −2%, in the
-        // single-tile kernel). Pure hint, bit-exact. Distinct from PR #656: that prefetches
-        // the SINGLE-TILE kernel where B is already streaming-resident (net loss → opt-in);
-        // here B is cold for the NEXT tile in the panel macro-loop, so it's a real win.
-        asm.Prefetcht0D32(RDX, 512);
         asm.VmovupsLoad(BLO, RDX, 0);
         asm.VmovupsLoad(BHI, RDX, 32);
         for (int r = 0; r < Mr; r++)
@@ -283,7 +319,7 @@ internal static class MachineCodeFmaKernel
         asm.AddRegImm8(RCX, Mr * 4);  // A += 6 floats
         asm.AddRegImm8(RDX, Nr * 4);  // B += 16 floats (→ next stripe after kc steps)
         asm.DecReg(R10);
-        asm.JnzLabel32(kloop);        // rel32: the prefetch'd K-loop body exceeds rel8 range
+        asm.JnzLabel32(kloop);
 
         asm.MarkLabel(store);
         asm.MovRegReg(R11, R8);
