@@ -51,6 +51,24 @@ internal static class StrategyDefaultTable
     {
         var bucket = Bucket(m, n, k);
 
+        // #653: the MediumMWide bucket (m∈[128,256], wide-N, k≥256) spans two regimes for the
+        // NON-transposed shapes that reach here (via PrefersStrategyOverMachineKernel's k>2m
+        // decline): at SHALLOW K (≤512) packing overhead isn't amortized and Streaming wins big
+        // (e.g. 128×256×1536: Streaming 1.5ms vs PackBoth 8.0ms — 5.3×); at DEEP K, PackBoth wins
+        // (the per-hardware arms below). The shallow-K→Streaming win is packing-overhead-driven
+        // (hardware-independent), so gate it here for all hardware. Measured on-box (avx2 cpu≤1).
+        if (bucket == ShapeBucket.MediumMWide && k <= 512)
+            return PackingMode.ForceStreaming;
+        // Deep-K (>512) MediumMWide, resolved by INTERLEAVED min-of-N (two runs, <2% apart —
+        // a reproducible signal, not noise): at VERY-wide-N (≥3072) with m>128, packing B
+        // doesn't pay (huge B, low per-stripe reuse) and PackAOnly beats PackBoth by ~1.2-1.3×.
+        // m=128 is special (PackBoth wins even at N=3072), and N=1536 favors PackBoth — both
+        // fall through to the PackBoth arms below. (Under transB this PackAOnly redirects to
+        // PackBoth, so it only affects the non-transposed large shapes the 8M autotuner ceiling
+        // never measures live.)
+        if (bucket == ShapeBucket.MediumMWide && n >= 3072 && m > 128)
+            return PackingMode.ForcePackAOnly;
+
         // amd-avx2 mid-core (≤16T, this box). Calibrated for the TRANSPOSED shapes that
         // actually reach this table (--prewarm-autotune measurements): small/cube → Streaming
         // wins even transposed; ThinK (e.g. 512×512×64 transB) → PackBoth (Streaming is 2.5×
