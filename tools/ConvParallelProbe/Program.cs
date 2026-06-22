@@ -1,6 +1,8 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 
@@ -30,6 +32,7 @@ internal static class Program
         if (args.Length > 0 && args[0] == "--gemm") return RunGemm(eng, args);
         if (args.Length > 0 && args[0] == "--gemmprofile") return RunGemmProfile(eng, args);
         if (args.Length > 0 && args[0] == "--gpu") return RunGpu(args);
+        if (args.Length > 0 && args[0] == "--trainbench") return RunTrainbench(eng, args);
 
         int maxdop = ArgI(args, "--maxdop", Environment.ProcessorCount);
         int inC = ArgI(args, "--inc", 256);
@@ -165,6 +168,118 @@ internal static class Program
             $"ATTNBLOCK S={S} D={D} H={H} Dh={Dh} blocks={blocks} maxdop={maxdop} procs={Environment.ProcessorCount} " +
             $"warmup_ms={warm:F1} median_ms={times[reps / 2]:F2} min_ms={times[0]:F2} max_ms={times[times.Length - 1]:F2}{u}");
         return 0;
+    }
+
+    // #1662 lever #4 / #1 proof harness: per-step TRAINING cost (fwd + bwd + optimizer step)
+    // for a residual-FFN stack on the autodiff tape. Backward runs through
+    // tape.ComputeGradientsStreaming (the optimizer-in-backward path), so this isolates the
+    // per-step backward ALLOCATION (the audit target) and per-step wall time. Emits one
+    // machine-readable line so trainbench_torch.py (same shape/optimizer) can be diffed
+    // against it to prove AiDotNet beats PyTorch CPU on time / alloc / peak-RSS.
+    //
+    // Shape mirrors the #1624 acceptance model's FFN block (SimCSE dim=384, 10 layers). A
+    // residual MLP stack (TensorMatMul + GELU) deliberately hammers matmul-backward — the
+    // hottest backward op and the primary arena-bypass suspect — and records robustly on the
+    // tape (attention's manual Backward is not a tape op, so it is exercised by the #3 parity
+    // test instead, not here).
+    private static int RunTrainbench(CpuEngine eng, string[] a)
+    {
+        int maxdop = ArgI(a, "--maxdop", Environment.ProcessorCount);
+        int S = ArgI(a, "--s", 128);        // sequence length (rows)
+        int D = ArgI(a, "--d", 384);        // model dim
+        int layers = ArgI(a, "--layers", 10);
+        int reps = ArgI(a, "--reps", 20);
+        int warmup = ArgI(a, "--warmup", 5);
+        if (maxdop < 1 || S < 1 || D < 1 || layers < 1 || reps < 1 || warmup < 0)
+        {
+            Console.Error.WriteLine("trainbench: --maxdop,--s,--d,--layers,--reps must be >= 1 (--warmup >= 0).");
+            return 2;
+        }
+        CpuParallelSettings.MaxDegreeOfParallelism = maxdop;
+
+        var rng = new Random(0);
+        var step = new TrainbenchStep(eng, S, D, layers, rng);
+
+        for (int i = 0; i < warmup; i++) step.RunStep();
+
+        var times = new double[reps];
+        long peakWs = 0;
+        long allocStart = GC.GetAllocatedBytesForCurrentThread();
+        for (int i = 0; i < reps; i++)
+        {
+            var sw = Stopwatch.StartNew();
+            step.RunStep();
+            sw.Stop();
+            times[i] = sw.Elapsed.TotalMilliseconds;
+            peakWs = Math.Max(peakWs, Process.GetCurrentProcess().WorkingSet64);
+        }
+        long allocTotal = GC.GetAllocatedBytesForCurrentThread() - allocStart;
+        Array.Sort(times);
+        double perStepAllocMB = allocTotal / (double)reps / (1024.0 * 1024.0);
+        Console.WriteLine(
+            $"TRAINBENCH engine=aidotnet S={S} D={D} layers={layers} maxdop={maxdop} " +
+            $"procs={Environment.ProcessorCount} median_ms={times[reps / 2]:F3} min_ms={times[0]:F3} " +
+            $"alloc_mb_per_step={perStepAllocMB:F3} peak_ws_mb={peakWs / (1024.0 * 1024.0):F1} " +
+            $"last_loss={step.LastLoss:E3}");
+        return 0;
+    }
+
+    // Owns the residual-FFN weights and runs one fwd+bwd+SGD step on the tape. SGD (not Adam)
+    // so the optimizer step itself contributes ~no allocation — the metric isolates fwd+bwd.
+    private sealed class TrainbenchStep
+    {
+        private readonly CpuEngine _eng;
+        private readonly int _layers;
+        private readonly Tensor<float>[] _w1; // [D, 4D]
+        private readonly Tensor<float>[] _w2; // [4D, D]
+        private readonly Tensor<float> _x;    // [S, D] fixed input
+        private const float Lr = 1e-3f;
+
+        public float LastLoss { get; private set; }
+
+        public TrainbenchStep(CpuEngine eng, int s, int d, int layers, Random rng)
+        {
+            _eng = eng; _layers = layers;
+            _x = Rand(new[] { s, d }, rng);
+            _w1 = new Tensor<float>[layers];
+            _w2 = new Tensor<float>[layers];
+            // Scale weights small so the residual stack stays numerically tame over many steps.
+            for (int l = 0; l < layers; l++)
+            {
+                _w1[l] = Scale(Rand(new[] { d, 4 * d }, rng), 0.02f);
+                _w2[l] = Scale(Rand(new[] { 4 * d, d }, rng), 0.02f);
+            }
+        }
+
+        public void RunStep()
+        {
+            using var tape = new GradientTape<float>();
+            var h = _x;
+            for (int l = 0; l < _layers; l++)
+            {
+                var f = _eng.TensorMatMul(h, _w1[l]);   // [S, 4D]
+                f = _eng.GELU(f);
+                f = _eng.TensorMatMul(f, _w2[l]);        // [S, D]
+                h = _eng.TensorAdd(h, f);                // residual
+            }
+            // Scalar MSE-to-zero loss so the whole stack is on one connected graph.
+            var loss = _eng.ReduceSum(_eng.TensorMultiply(h, h));
+            LastLoss = loss.Length > 0 ? loss[0] : 0f;
+
+            var sources = new List<Tensor<float>>(_layers * 2);
+            for (int l = 0; l < _layers; l++) { sources.Add(_w1[l]); sources.Add(_w2[l]); }
+            tape.ComputeGradientsStreaming(loss, sources, (src, g) =>
+            {
+                if (g is null || g.Length == 0) return;
+                for (int i = 0; i < src.Length; i++) src[i] -= Lr * g[i]; // SGD, in place
+            });
+        }
+
+        private static Tensor<float> Scale(Tensor<float> t, float s)
+        {
+            for (int i = 0; i < t.Length; i++) t[i] *= s;
+            return t;
+        }
     }
 
     // P4 (#653): the elementwise-activation stragglers (GELU/Swish/Tanh/Sigmoid) on a single
