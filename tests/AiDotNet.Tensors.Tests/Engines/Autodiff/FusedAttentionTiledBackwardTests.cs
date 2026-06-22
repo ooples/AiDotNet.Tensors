@@ -34,7 +34,7 @@ public class FusedAttentionTiledBackwardTests
         var v  = RandomTensor(new[] { B, H, S, Dh }, 3);
         var dO = RandomTensor(new[] { B, H, S, Dh }, 4);
 
-        var (refQ, refK, refV) = ReferenceBackward(B, H, S, Dh, dO, q, k, v);
+        var (refQ, refK, refV) = ReferenceBackward(B, H, S, Dh, dO, q, k, v, causal: false, queryOffset: 0);
         var (gQ, gK, gV) = FusedAttention<float>.Backward(dO, q, k, v, engine: engine);
 
         AssertClose(refQ, gQ.AsSpan().ToArray(), 1e-3f, "dQ");
@@ -42,9 +42,32 @@ public class FusedAttentionTiledBackwardTests
         AssertClose(refV, gV.AsSpan().ToArray(), 1e-3f, "dV");
     }
 
+    [Theory]
+    [InlineData(1, 2, 64, 16)]   // causal, full-matrix path (S <= 128)
+    [InlineData(1, 4, 256, 32)]  // causal, tiled path: above-diagonal tiles skipped
+    [InlineData(2, 4, 200, 16)]  // causal, tiled, uneven last tile
+    public void Backward_Causal_MatchesNaiveReference_dQdKdV(int B, int H, int S, int Dh)
+    {
+        var engine = new CpuEngine();
+        var q  = RandomTensor(new[] { B, H, S, Dh }, 11);
+        var k  = RandomTensor(new[] { B, H, S, Dh }, 12);
+        var v  = RandomTensor(new[] { B, H, S, Dh }, 13);
+        var dO = RandomTensor(new[] { B, H, S, Dh }, 14);
+
+        var (refQ, refK, refV) = ReferenceBackward(B, H, S, Dh, dO, q, k, v, causal: true, queryOffset: 0);
+        var cfg = new FlashAttentionConfig { IsCausal = true };
+        var (gQ, gK, gV) = FusedAttention<float>.Backward(dO, q, k, v, config: cfg, engine: engine);
+
+        AssertClose(refQ, gQ.AsSpan().ToArray(), 1e-3f, "dQ");
+        AssertClose(refK, gK.AsSpan().ToArray(), 1e-3f, "dK");
+        AssertClose(refV, gV.AsSpan().ToArray(), 1e-3f, "dV");
+    }
+
     // Naive analytic attention backward over [B,H,S,Dh] row-major tensors. No engine ops.
+    // Causal: key j is visible to query i iff j <= queryOffset + i (matches ApplyCausalMask).
     private static (float[] dQ, float[] dK, float[] dV) ReferenceBackward(
-        int B, int H, int S, int Dh, Tensor<float> dOT, Tensor<float> qT, Tensor<float> kT, Tensor<float> vT)
+        int B, int H, int S, int Dh, Tensor<float> dOT, Tensor<float> qT, Tensor<float> kT, Tensor<float> vT,
+        bool causal, int queryOffset)
     {
         float[] dO = dOT.AsSpan().ToArray();
         float[] q = qT.AsSpan().ToArray();
@@ -74,6 +97,7 @@ public class FusedAttentionTiledBackwardTests
                 float max = float.NegativeInfinity;
                 for (int j = 0; j < S; j++)
                 {
+                    if (causal && j > queryOffset + i) { P[i * S + j] = float.NegativeInfinity; continue; }
                     float s = 0f;
                     for (int d = 0; d < Dh; d++) s += q[o + i * Dh + d] * k[o + j * Dh + d];
                     s *= scale;

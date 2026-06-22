@@ -518,16 +518,18 @@ public static class FusedAttention<T>
 
         // #1662 lever #3: for long key sequences, tile the backward over key blocks so the full
         // [Sq, Sk] score/prob matrices are NEVER materialized — peak extra memory is O(Sq*tile)
-        // instead of O(Sq*Sk). Engages only for unmasked attention; the bias/causal cases keep
-        // the full-matrix path (tiled masking is handled in the same lever, below). Small/medium
-        // Sk also keeps the full path, which is faster when the S^2 matrices fit comfortably.
-        // This is a permanent size-tiered fast path, mirroring the FP32/FP64 split already here.
+        // instead of O(Sq*Sk). Handles both plain and CAUSAL attention (causal fully-masked key
+        // tiles are skipped, which is also where the LLM long-context memory win lands). Additive
+        // attention bias keeps the full-matrix path. Small/medium Sk also keeps the full path,
+        // which is faster when the S^2 matrices fit comfortably. This is a permanent size-tiered
+        // fast path, mirroring the FP32/FP64 split already here.
         const int TileBk = 128;
-        if (attentionBias is null && !config.IsCausal && Sk > TileBk)
+        if (attentionBias is null && Sk > TileBk)
         {
             (gradQ, gradK, gradV) = BackwardTiled(
                 engine, numOps, query, key, value, gradOutput,
-                B, H, Sq, Sk, headDim, Dv, scaleVal, TileBk);
+                B, H, Sq, Sk, headDim, Dv, scaleVal, TileBk,
+                config.IsCausal, config.QueryOffset);
         }
         else
         {
@@ -601,10 +603,15 @@ public static class FusedAttention<T>
     private static (Tensor<T> GradQuery, Tensor<T> GradKey, Tensor<T> GradValue) BackwardTiled(
         IEngine engine, INumericOperations<T> numOps,
         Tensor<T> query, Tensor<T> key, Tensor<T> value, Tensor<T> gradOutput,
-        int B, int H, int Sq, int Sk, int headDim, int Dv, double scaleVal, int tileBk)
+        int B, int H, int Sq, int Sk, int headDim, int Dv, double scaleVal, int tileBk,
+        bool isCausal, int queryOffset)
     {
         int BH = B * H;
         T scaleT = numOps.FromDouble(scaleVal);
+        // Causal: key kg is visible to query i iff kg <= queryOffset + i (matches ApplyCausalMask).
+        // A whole key tile [j0, j0+bk) is fully masked for EVERY query when j0 > queryOffset+(Sq-1);
+        // such tiles are skipped (their dK/dV stay zero, dQ contribution zero).
+        bool TileFullyMasked(int j0) => isCausal && j0 > queryOffset + (Sq - 1);
 
         var qf  = engine.Reshape(query,      new[] { BH, Sq, headDim }); // [BH, Sq, Dh]
         var kf  = engine.Reshape(key,        new[] { BH, Sk, headDim }); // [BH, Sk, Dh]
@@ -618,6 +625,7 @@ public static class FusedAttention<T>
         // ---- Pass 1: online softmax normalizers (m, l) ----
         for (int j0 = 0; j0 < Sk; j0 += tileBk)
         {
+            if (TileFullyMasked(j0)) continue;
             int bk = Math.Min(tileBk, Sk - j0);
             var kt = SliceAxis1(numOps, kf, BH, Sk, headDim, j0, bk);                       // [BH, bk, Dh]
             var sTile = engine.TensorMultiplyScalar(
@@ -626,14 +634,17 @@ public static class FusedAttention<T>
             for (int row = 0; row < BH * Sq; row++)
             {
                 int b0 = row * bk;
+                int i = row % Sq;                       // query position within [0, Sq)
+                int jMax = isCausal ? Math.Min(bk, queryOffset + i - j0 + 1) : bk; // visible cols in this tile
+                if (jMax <= 0) continue;                // this row sees nothing in this tile
                 T tmax = numOps.MinValue;
-                for (int j = 0; j < bk; j++)
+                for (int j = 0; j < jMax; j++)
                     if (numOps.GreaterThan(s[b0 + j], tmax)) tmax = s[b0 + j];
                 T mOld = m[row];
                 T mNew = numOps.GreaterThan(mOld, tmax) ? mOld : tmax;
                 T alpha = numOps.Exp(numOps.Subtract(mOld, mNew)); // 0 on the first (mOld = MinValue) tile
                 T sumExp = numOps.Zero;
-                for (int j = 0; j < bk; j++)
+                for (int j = 0; j < jMax; j++)
                     sumExp = numOps.Add(sumExp, numOps.Exp(numOps.Subtract(s[b0 + j], mNew)));
                 l[row] = numOps.Add(numOps.Multiply(l[row], alpha), sumExp);
                 m[row] = mNew;
@@ -644,6 +655,7 @@ public static class FusedAttention<T>
         var D = new T[BH * Sq]; // zero-init
         for (int j0 = 0; j0 < Sk; j0 += tileBk)
         {
+            if (TileFullyMasked(j0)) continue;
             int bk = Math.Min(tileBk, Sk - j0);
             var kt = SliceAxis1(numOps, kf, BH, Sk, headDim, j0, bk);                       // [BH, bk, Dh]
             var vt = SliceAxis1(numOps, vf, BH, Sk, Dv, j0, bk);                            // [BH, bk, Dv]
@@ -655,7 +667,9 @@ public static class FusedAttention<T>
             for (int row = 0; row < BH * Sq; row++)
             {
                 int b0 = row * bk;
-                for (int j = 0; j < bk; j++)
+                int i = row % Sq;
+                int jMax = isCausal ? Math.Min(bk, queryOffset + i - j0 + 1) : bk;
+                for (int j = 0; j < jMax; j++)
                 {
                     T p = numOps.Divide(numOps.Exp(numOps.Subtract(s[b0 + j], m[row])), l[row]);
                     D[row] = numOps.Add(D[row], numOps.Multiply(p, dp[b0 + j]));
@@ -669,6 +683,7 @@ public static class FusedAttention<T>
         var dVfull = new T[BH * Sk * Dv];
         for (int j0 = 0; j0 < Sk; j0 += tileBk)
         {
+            if (TileFullyMasked(j0)) continue;
             int bk = Math.Min(tileBk, Sk - j0);
             var kt = SliceAxis1(numOps, kf, BH, Sk, headDim, j0, bk);                       // [BH, bk, Dh]
             var vt = SliceAxis1(numOps, vf, BH, Sk, Dv, j0, bk);                            // [BH, bk, Dv]
@@ -678,12 +693,16 @@ public static class FusedAttention<T>
             var s = sTile.GetDataArray();
             var dp = dpTile.GetDataArray();
 
+            // Masked (j >= jMax) entries stay zero-init, so they contribute nothing to the
+            // dV / dK / dQ GEMMs below — exactly the causal mask.
             var pData = new T[BH * Sq * bk];
             var dsData = new T[BH * Sq * bk];
             for (int row = 0; row < BH * Sq; row++)
             {
                 int b0 = row * bk;
-                for (int j = 0; j < bk; j++)
+                int i = row % Sq;
+                int jMax = isCausal ? Math.Min(bk, queryOffset + i - j0 + 1) : bk;
+                for (int j = 0; j < jMax; j++)
                 {
                     T p = numOps.Divide(numOps.Exp(numOps.Subtract(s[b0 + j], m[row])), l[row]);
                     pData[b0 + j] = p;
