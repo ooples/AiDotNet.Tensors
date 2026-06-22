@@ -89,9 +89,9 @@ internal sealed class ConstantFoldingPass : ICpuOptimizationPass
                     {
                         // Benign race under concurrent inference: a double-compute writes the same constant
                         // value into the same buffer, so torn identical writes are harmless.
-                        if (computed) return;
+                        if (Volatile.Read(ref computed)) return;
                         inner.Execute(eng, o);
-                        computed = true;
+                        Volatile.Write(ref computed, true);
                     },
                     step.OutputBuffer,
                     step.Inputs,
