@@ -28,18 +28,12 @@ internal static class Program
         // path) so the end-to-end probes measure the recording-off fast path.
         if (Environment.GetEnvironmentVariable("AIDOTNET_NO_AUTOTRACE") == "1")
         {
-            // FAIL FAST: a silent `?.` no-op (type/property renamed) would leave recording ON
-            // and silently invalidate every downstream probe measurement, so require the set.
-            const System.Reflection.BindingFlags SF = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public;
-            var enabledProp = typeof(CpuEngine).Assembly
-                .GetType("AiDotNet.Tensors.Engines.Compilation.AutoTracer")?.GetProperty("Enabled", SF);
-            if (enabledProp is null)
-            {
-                Console.Error.WriteLine("[probe] ERROR: AIDOTNET_NO_AUTOTRACE=1 but AutoTracer.Enabled not found (renamed?) — refusing to run with recording silently left on.");
-                return 3;
-            }
-            enabledProp.SetValue(null, false);
-            Console.Error.WriteLine("[probe] AutoTracer.Enabled=false");
+            // AutoTracer.ShouldRecord = Enabled && !GraphMode && EnableCompilation && !ThreadTapeActive.
+            // EnableCompilation is the PUBLIC, documented disable knob (AutoTracer.cs), so flip it
+            // directly — no reflection (the property is compile-time-resolved, so it can't silently
+            // no-op the way the old reflected `?.SetValue` could).
+            AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions.Current.EnableCompilation = false;
+            Console.Error.WriteLine("[probe] TensorCodecOptions.EnableCompilation=false (AutoTracer recording off)");
         }
 
         if (args.Length > 0 && args[0] == "--allocbench") return RunAllocBench(eng, args);
@@ -642,7 +636,7 @@ internal static class Program
 
     // #653: measure per-op allocated bytes + time when AutoTracer.ShouldRecord is FALSE (the
     // training / no-compilation hot path) — isolates the autotrace closure allocate-then-discard
-    // overhead. ShouldRecord is forced false by disabling compilation (reflection). Tiny shapes
+    // overhead. ShouldRecord is forced false via the public TensorCodecOptions knob. Tiny shapes
     // so the per-op closure alloc is visible against the (unavoidable) result-tensor alloc.
     private static int RunAllocBench(CpuEngine eng, string[] a)
     {
@@ -654,26 +648,13 @@ internal static class Program
             return 2;
         }
         // ShouldRecord = Enabled && !GraphMode && EnableCompilation && !ThreadTapeActive.
-        // Force AutoTracer.Enabled=false so ShouldRecord is false (mirrors the training hot path
-        // where a live tape makes ShouldRecord false). FAIL FAST: if the reflected type/property
-        // is missing or renamed, the silent `?.` no-op would leave recording ON and produce
-        // invalid benchmark data — so require the set to succeed AND verify ShouldRecord==false.
-        const System.Reflection.BindingFlags SF = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public;
-        var at = typeof(CpuEngine).Assembly.GetType("AiDotNet.Tensors.Engines.Compilation.AutoTracer");
-        var enabledProp = at?.GetProperty("Enabled", SF);
-        var shouldRecProp = at?.GetProperty("ShouldRecord", SF);
-        if (at is null || enabledProp is null || shouldRecProp is null)
-        {
-            Console.Error.WriteLine("allocbench: could not reflect AutoTracer.Enabled/ShouldRecord (renamed?) — refusing to report invalid numbers.");
-            return 3;
-        }
-        enabledProp.SetValue(null, false);
-        if (shouldRecProp.GetValue(null) is not bool rec || rec)
-        {
-            Console.Error.WriteLine("allocbench: AutoTracer.ShouldRecord is still true after disabling — recording would skew the measurement.");
-            return 3;
-        }
-        Console.Error.WriteLine("[probe] AutoTracer.ShouldRecord=False");
+        // Disabling compilation via the PUBLIC, documented knob (AutoTracer.cs) forces
+        // ShouldRecord=false (the training / no-compilation hot path this benchmarks) — no
+        // reflection. It's a one-time set before the timed loop, so it never touches the
+        // per-op measurement; the public property is compile-time-resolved so it can't
+        // silently no-op the way the old reflected `?.SetValue` could.
+        AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions.Current.EnableCompilation = false;
+        Console.Error.WriteLine("[probe] TensorCodecOptions.EnableCompilation=false (AutoTracer.ShouldRecord=false)");
 
         var rng = new Random(0);
         var lhs = Rand(new[] { M, K }, rng);
