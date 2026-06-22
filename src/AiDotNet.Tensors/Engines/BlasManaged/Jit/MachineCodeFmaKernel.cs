@@ -249,6 +249,11 @@ internal static class MachineCodeFmaKernel
         asm.MovRegReg(R10, R12);   // reset kc
 
         // Load 6 C rows (r11 walks from r8 by rax=ldc*4).
+        // DEAD END (measured neutral at DOP 1/4/32, do not re-add): prefetcht0 of the next
+        // N-tile's C here is a no-op — the 6×16 C read-modify-write is already amortized over
+        // kc≈256 K-steps, so cold-C latency isn't on the critical path. The single-thread
+        // ceiling (~66 GF/s in-context, ~76 hot-L1 vs OpenBLAS ~103) is the 6×16 broadcast/FMA
+        // microkernel itself, not C traffic or loop overhead (K-unroll was also only ~+5%).
         asm.MovRegReg(R11, R8);
         for (int r = 0; r < Mr; r++)
         {
