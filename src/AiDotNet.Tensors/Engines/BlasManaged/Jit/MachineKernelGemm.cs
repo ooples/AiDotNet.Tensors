@@ -79,6 +79,29 @@ internal static class MachineKernelGemm
     private static ExecutableMemory? _mem64, _mem32, _memZ64, _memZ32, _memPanel32; // kept alive for the process
     private static nint _kern64, _kern32, _kernZ64, _kernZ32, _kernPanel32;
 
+    // #663: expose the #653 panel kernel to the N-axis path (PackBothStrategy.RunNAxisParallelUnsafe).
+    // Shares _kernPanel32 + TryInitPanelFp32 with the internal RunPacked panel use (both branches
+    // added the same kernel independently; unified here), and respects the same EnablePanelKernel
+    // master switch so disabling the panel disables BOTH consumers.
+    /// <summary>True when the FP32 6×16 PANEL kernel is usable on this process.</summary>
+    internal static bool IsFp32PanelAvailable => Enabled && EnablePanelKernel && TryInitPanelFp32();
+
+    /// <summary>
+    /// Run the FP32 6×16 panel kernel: C[0..6, 0..njr·16] += packedA[Kc×6] · packedB[njr×Kc×16]
+    /// over kc K-steps, looping the Nr=16 tiles internally. C is read-modify-write (pre-zero for
+    /// a fresh result). Caller guarantees the panel kernel is available (IsFp32PanelAvailable).
+    /// </summary>
+    internal static unsafe void RunPanelFp32(
+        ReadOnlySpan<float> packedA, ReadOnlySpan<float> packedB,
+        Span<float> c, int ldc, int kc, int njr)
+    {
+        var kern = (delegate* unmanaged<float*, float*, float*, long, long, long, void>)_kernPanel32;
+        fixed (float* pa = packedA)
+        fixed (float* pb = packedB)
+        fixed (float* pc = c)
+            kern(pa, pb, pc, ldc, kc, njr);
+    }
+
     private static bool IsWindows => RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
 
     // x64 on a supported OS with AVX2+FMA and dynamic code allowed. Windows uses the
@@ -356,6 +379,14 @@ internal static class MachineKernelGemm
     /// <summary>net471 has no x86 intrinsics / function pointers — always defer to managed.</summary>
     internal static bool IsFp64Available => false;
     internal static bool IsFp32Available => false;
+    internal static bool IsFp32PanelAvailable => false;
+    /// <summary>net471 has no JIT panel kernel; callers must gate on <see cref="IsFp32PanelAvailable"/>.
+    /// Reached only by a caller that skipped that gate — fail loud rather than silently leave C unchanged.</summary>
+    internal static void RunPanelFp32(
+        ReadOnlySpan<float> packedA, ReadOnlySpan<float> packedB,
+        Span<float> c, int ldc, int kc, int njr) =>
+        throw new PlatformNotSupportedException(
+            "RunPanelFp32 requires the net5.0+ machine-code JIT path; gate on IsFp32PanelAvailable before calling.");
     internal static int ActiveFp64Nr => Fp64Nr;
     internal static int ActiveFp32Nr => Fp32Nr;
 

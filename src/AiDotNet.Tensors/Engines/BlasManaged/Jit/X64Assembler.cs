@@ -143,6 +143,25 @@ internal sealed class X64Assembler
     /// <summary>vbroadcastsd ymm_dst, [base+disp32].</summary>
     internal void VbroadcastSdD32(int dst, int baseReg, int disp32) => VexMemDisp32(Map0F38, Pp66, 0, 1, 0x19, dst, baseReg, disp32);
 
+    /// <summary>vmovups ymm_dst, [base+disp32] (FP32 256-bit load).</summary>
+    internal void VmovupsLoadD32(int dst, int baseReg, int disp32) => VexMemDisp32(Map0F, PpNone, 0, 1, 0x10, dst, baseReg, disp32);
+
+    /// <summary>vbroadcastss ymm_dst, [base+disp32].</summary>
+    internal void VbroadcastSsD32(int dst, int baseReg, int disp32) => VexMemDisp32(Map0F38, Pp66, 0, 1, 0x18, dst, baseReg, disp32);
+
+    /// <summary>prefetcht0 [base+disp32]. Legacy 0F 18 /1 (reg field = 1), mod=10 (disp32).
+    /// Brings the line into all cache levels — used to hide the L2→L1 latency of the next
+    /// A/B panel (OpenBLAS prefetches A/B ~512 B ahead in its sgemm microkernel).</summary>
+    internal void Prefetcht0D32(int baseReg, int disp32)
+    {
+        if (baseReg >= 8) B(0x41); // REX.B
+        B(0x0F, 0x18);
+        byte modrm = (byte)(0x80 | (1 << 3) | (baseReg & 7)); // mod=10, reg=001 (/1), rm=base
+        _code.Add(modrm);
+        if ((baseReg & 7) == 4) _code.Add(0x24); // SIB for rsp/r12
+        Imm32(disp32);
+    }
+
     internal void Ret() => B(0xC3);
     internal void Vzeroupper() => B(0xC5, 0xF8, 0x77);
 

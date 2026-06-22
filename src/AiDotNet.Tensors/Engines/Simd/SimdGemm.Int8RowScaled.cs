@@ -75,6 +75,15 @@ internal static partial class SimdGemm
     private static readonly object _int8RowScaledPrePackedBCacheLock = new();
 
     /// <summary>
+    /// Upper bound on the col-sub-block parallelism grid baked into the cached prepacked-B
+    /// (see <see cref="BuildInt8RowScaledPrePackedB"/>). The grid is sized to the machine width
+    /// so the int8 GEMM scales regardless of the MaxDegreeOfParallelism at first build; this cap
+    /// keeps it bounded on very-many-core hosts (matches the worker-pool ceiling in
+    /// CooperativeGemmScheduler / PersistentParallelExecutor).
+    /// </summary>
+    private const int Int8RowScaledMaxGridThreads = 64;
+
+    /// <summary>
     /// Compute <c>C = A · dequant(B_int8, rowScales)</c> using a cached
     /// pre-packed form of B. Weights are already int8 with per-row scales,
     /// avoiding the FP32 round-trip the consumer's prior dequant+Sgemm path
@@ -202,7 +211,17 @@ internal static partial class SimdGemm
     {
         int Mc = ChooseAdaptiveMc(m, k, n);
         int numRowBlocks = (m + Mc - 1) / Mc;
-        int maxThreads = Helpers.CpuParallelSettings.MaxDegreeOfParallelism;
+        // Size the col-sub-block grid (→ how many tiles the parallel path can fan out over)
+        // to the MACHINE width, NOT the current MaxDegreeOfParallelism. This prepacked-B is
+        // cached per weight array and BUILT ONCE on the first GEMM; folding in the current
+        // MaxDoP would bake the tile count at first-call time — a DOP=1 first call leaves
+        // NumColSubBlocks=1, so useParallelPath is false and the int8 GEMM stays SEQUENTIAL
+        // for that weight forever (measured: flat 75 GF/s at every DOP vs 7.5× scaling when
+        // the cache is built at full width). The per-call path only fans out to the current
+        // MaxDoP anyway (LightweightParallel honors it), so a machine-width grid scales when
+        // threads are available and costs only a few extra sequential col-block iterations
+        // when they aren't. The ceiling keeps the grid bounded on very-many-core hosts.
+        int maxThreads = Math.Max(1, Math.Min(Environment.ProcessorCount, Int8RowScaledMaxGridThreads));
         int numPcIters = (k + Kc - 1) / Kc;
 
         int nc0 = Math.Min(Nc, n);

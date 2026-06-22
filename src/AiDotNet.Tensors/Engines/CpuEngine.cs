@@ -9354,8 +9354,25 @@ public partial class CpuEngine : ITensorLevelEngine
         if (inChannels >= 256 &&
             !WinogradHelper.ShouldUseWinograd(kernelHeight, kernelWidth, stride, stride, dilation, dilation, outputHeight, outputWidth))
         {
-            Conv2DWithIm2ColGemm(input, kernel, result, batch, inChannels, height, width,
-                outChannels, kernelHeight, kernelWidth, stride, padding, dilation, outputHeight, outputWidth);
+            // Fused (implicit-GEMM) path: block on output rows, im2col each block into a
+            // cache-resident panel, GEMM straight into the output — never materialises the
+            // full [colH, outputH*outputW] im2col matrix. Eliminates the ~2x im2col DRAM
+            // round-trip + the large transient native allocation that the full-matrix
+            // Conv2DWithIm2ColGemm pays. Skip it for 1x1 stride=1 pad=0 (im2col is the
+            // identity there — the existing path already GEMMs the input directly with no
+            // im2col, so blocking would only add per-block overhead). Bit-identical output.
+            bool isPointwiseIdentity = kernelHeight == 1 && kernelWidth == 1
+                && stride == 1 && padding == 0 && dilation == 1;
+            if (isPointwiseIdentity || t_forceFullIm2Col)
+            {
+                Conv2DWithIm2ColGemm(input, kernel, result, batch, inChannels, height, width,
+                    outChannels, kernelHeight, kernelWidth, stride, padding, dilation, outputHeight, outputWidth);
+            }
+            else
+            {
+                Conv2DWithImplicitGemmFloat(input, kernel, result, batch, inChannels, height, width,
+                    outChannels, kernelHeight, kernelWidth, stride, padding, dilation, outputHeight, outputWidth);
+            }
             return;
         }
 
@@ -9551,6 +9568,140 @@ public partial class CpuEngine : ITensorLevelEngine
             pool.Return(im2colArray);
         }
 #endif
+    }
+
+    // Test-only override: forces the high-channel float forward conv onto the full-matrix im2col
+    // path instead of the fused (implicit-GEMM) path, so a parity test can assert the two are
+    // BIT-IDENTICAL (same GEMM, blocked). [ThreadStatic] so it NEVER affects a concurrent
+    // production Conv2D on another thread, and only ever set through ForceFullIm2ColScope() — a
+    // disposable that restores the prior value, so it cannot leak across tests/calls. Not a
+    // process-wide switch.
+    [ThreadStatic]
+    private static bool t_forceFullIm2Col;
+
+    /// <summary>Test-only: scope that forces the full im2col conv path on the CURRENT thread until
+    /// disposed (restoring the prior value). Used by the implicit-GEMM parity test; thread-local so
+    /// it cannot affect concurrent production Conv2D calls.</summary>
+    internal static IDisposable ForceFullIm2ColScope() => new ForceFullIm2ColOverride();
+
+    private sealed class ForceFullIm2ColOverride : IDisposable
+    {
+        private readonly bool _prev;
+        internal ForceFullIm2ColOverride() { _prev = t_forceFullIm2Col; t_forceFullIm2Col = true; }
+        public void Dispose() => t_forceFullIm2Col = _prev;
+    }
+
+    // Target byte budget for the fused conv's reused im2col panel. Sized so the
+    // [colH x ncBlock] panel stays resident in L2/L3 across its per-block GEMM
+    // (it is written then immediately consumed, never spilled to DRAM). 8 MB is
+    // comfortably below typical shared-L3 while leaving N large enough for an
+    // efficient GEMM. Floats, so /4 the byte budget.
+    private const int FusedConvPanelFloatBudget = 2 * 1024 * 1024; // 8 MB of floats
+
+    /// <summary>
+    /// FUSED (implicit-GEMM) Conv2D forward for float: identical math to
+    /// <see cref="Conv2DWithIm2ColGemm"/> but never materialises the full
+    /// <c>[colH, outputH*outputW]</c> im2col matrix. It walks blocks of output rows,
+    /// im2col's each block into a small cache-resident panel, and GEMMs that panel
+    /// straight into the corresponding output columns. This removes the ~2x im2col
+    /// DRAM round-trip (write the whole im2col, then have the GEMM re-read it) and the
+    /// large transient native allocation — the dominant non-compute cost of the
+    /// high-channel 3x3 convs that make up the bulk of a diffusion UNet step — while
+    /// keeping BlasManaged's near-MKL packed GEMM. Bit-identical to the full path:
+    /// each output column block is the exact same kernel·im2col reduction, just issued
+    /// over disjoint column ranges.
+    /// </summary>
+    private void Conv2DWithImplicitGemmFloat(
+        Tensor<float> input, Tensor<float> kernel, Tensor<float> result,
+        int batch, int inChannels, int height, int width,
+        int outChannels, int kernelHeight, int kernelWidth,
+        int stride, int padding, int dilation, int outputHeight, int outputWidth)
+    {
+        // Fail loud on int overflow of the shape products rather than silently wrapping to a
+        // negative/wrong size (which would corrupt the panel Rent and the GEMM bounds below).
+        int colH = checked(inChannels * kernelHeight * kernelWidth);
+        int colW = checked(outputHeight * outputWidth);
+
+        // Block on whole output rows so the stride=1 contiguous-memcpy im2col fast path
+        // stays intact and the panel covers an exact column range [oh0*outW, oh1*outW).
+        long perRowFloats = (long)colH * outputWidth;
+        int ohRows = (int)Math.Max(1, Math.Min(outputHeight, FusedConvPanelFloatBudget / Math.Max(1, perRowFloats)));
+        int maxNcBlock = checked(ohRows * outputWidth);
+
+        var inputSpan = input.AsSpan();
+        var kernelSpan = kernel.AsSpan();
+        var outputSpan = result.Data.Span;
+        int inputSliceSize = checked(inChannels * height * width);
+
+        var pool = System.Buffers.ArrayPool<float>.Shared;
+        float[] panel = pool.Rent(checked(colH * maxNcBlock));
+        try
+        {
+            var panelSpan = panel.AsSpan();
+            for (int b = 0; b < batch; b++)
+            {
+                var inSlice = inputSpan.Slice(b * inputSliceSize, inputSliceSize);
+                int outBatchOffset = b * outChannels * colW;
+                for (int oh0 = 0; oh0 < outputHeight; oh0 += ohRows)
+                {
+                    int oh1 = Math.Min(oh0 + ohRows, outputHeight);
+                    int ncBlock = (oh1 - oh0) * outputWidth;
+                    int colOffset = oh0 * outputWidth; // first output column of this block
+
+                    Helpers.Im2ColHelper.Im2ColRowBlockFloat(
+                        inSlice, panelSpan,
+                        inChannels, height, width,
+                        kernelHeight, kernelWidth, stride, stride, padding, padding, dilation, dilation,
+                        outputHeight, outputWidth, oh0, oh1);
+
+                    // C[oc, colOffset + j] = kernel[oc, :] · panel[:, j]  for j in [0, ncBlock).
+                    // The block's output columns occupy a ncBlock-wide window of each output
+                    // row, so pass ldc = colW (full row stride): the GEMM writes row oc at
+                    // C[oc*colW + j]. The slice base is the block's first output element.
+                    var cWindow = outputSpan.Slice(outBatchOffset + colOffset);
+                    bool usedBlas = Helpers.BlasProvider.TryGemm(
+                        outChannels, ncBlock, colH,
+                        kernelSpan.Slice(0, outChannels * colH), colH, // A = kernel [outChannels x colH], lda=colH
+                        panelSpan.Slice(0, colH * ncBlock), ncBlock,   // B = panel  [colH x ncBlock],     ldb=ncBlock
+                        cWindow, colW);                                // C window, ldc=colW
+
+                    if (!usedBlas)
+                    {
+                        MultiplyMatrixBlockedFloatStrided(
+                            kernelSpan, panelSpan, cWindow,
+                            outChannels, colH, ncBlock, colW);
+                    }
+                }
+            }
+        }
+        finally
+        {
+            pool.Return(panel);
+        }
+    }
+
+    /// <summary>
+    /// Fallback (no BLAS) GEMM for the fused-conv block: C[m, ncBlock] written into a
+    /// destination whose row stride is <paramref name="ldc"/> (the full output width colW),
+    /// so each block fills a ncBlock-wide window of every output row. Used only when
+    /// <see cref="Helpers.BlasProvider"/> is unavailable.
+    /// </summary>
+    private static void MultiplyMatrixBlockedFloatStrided(
+        ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c,
+        int m, int k, int n, int ldc)
+    {
+        for (int i = 0; i < m; i++)
+        {
+            int aRow = i * k;
+            int cRow = i * ldc;
+            for (int j = 0; j < n; j++)
+            {
+                float sum = 0f;
+                for (int kk = 0; kk < k; kk++)
+                    sum += a[aRow + kk] * b[kk * n + j];
+                c[cRow + j] = sum;
+            }
+        }
     }
 
     /// <summary>
