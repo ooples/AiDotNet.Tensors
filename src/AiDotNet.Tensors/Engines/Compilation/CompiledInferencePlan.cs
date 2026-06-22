@@ -53,6 +53,25 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
 
     private bool _disposed;
 
+    // #91/#1650 — inference CUDA-graph capture (the inference analog of #638's training-step capture).
+    // The plan executes into PRE-ALLOCATED, stable buffers with zero allocation during execution (see
+    // Execute), so the kernel-launch sequence AND device addresses are stable across Execute() calls —
+    // exactly the precondition cuStreamBeginCapture needs. After a short warmup we capture the whole
+    // step's launches once and replay it as a single cuGraphLaunch, refreshing the input buffer CONTENTS
+    // in place (same pointers) each call. This collapses hundreds of per-kernel launches into one — the
+    // TensorRT-LLM / vLLM decode-graph lever — which dominates latency at the low batch a diffusion
+    // denoising step runs. Opt-in via AIDOTNET_INFERENCE_CUDA_GRAPH=1; disabled automatically (eager
+    // fallback) if any op issues a non-capturable sync alloc/copy during capture.
+    private IntPtr _graphExec = IntPtr.Zero;
+    private Engines.DirectGpu.CUDA.CudaBackend? _graphBackend;
+    private int _graphWarmupCalls;
+    private bool _graphCaptureDisabled;
+    private static readonly bool s_inferenceCudaGraph =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_INFERENCE_CUDA_GRAPH") == "1";
+    // Eager calls before capture, so lazy uploads / kernel autotune settle into the steady-state
+    // launch sequence the graph records.
+    private const int InferenceGraphWarmup = 2;
+
     // Lazy-initialized execution stream cached across ExecuteAsync /
     // ChainAsync calls. The first call constructs the stream (Channel +
     // long-lived worker on CPU; lightweight wrapper on GPU); every
@@ -737,11 +756,97 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
 
         var steps = _steps;
         var engine = _engine;
+
+        if (s_inferenceCudaGraph && System.Environment.GetEnvironmentVariable("AIDOTNET_INFGRAPH_DIAG") == "1")
+        {
+            try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_infgraph_diag.txt"),
+                $"Execute: enabled={s_inferenceCudaGraph} disabled={_graphCaptureDisabled} backendOk={TryGetGraphBackend(out _)} warmup={_graphWarmupCalls} hasGraph={_graphExec != IntPtr.Zero} steps={steps.Length} engine={_engine.GetType().Name}\n"); } catch { }
+        }
+
+        if (s_inferenceCudaGraph && !_graphCaptureDisabled && TryGetGraphBackend(out var cb))
+        {
+            // REPLAY: refresh the input buffer contents in place (stable pointers) — the caller's
+            // SetInputs already copied this call's data into the captured input tensor's host array —
+            // then run the whole forward as one cuGraphLaunch.
+            if (_graphExec != IntPtr.Zero)
+            {
+                RefreshInferenceInputsInPlace(cb);
+                cb.LaunchCapturedGraph(_graphExec);
+                return _finalOutput;
+            }
+
+            _graphWarmupCalls++;
+            if (_graphWarmupCalls >= InferenceGraphWarmup)
+            {
+                // Refresh the input in place OUTSIDE the captured region (an HtoD upload inside
+                // capture is a non-capturable op that would abort EndCapture), then record the
+                // step launches. Capture RECORDS but does not execute, so launch once afterwards
+                // to produce this call's output.
+                try
+                {
+                    RefreshInferenceInputsInPlace(cb);
+                    var exec = cb.CaptureGraph(() =>
+                    {
+                        for (int i = 0; i < steps.Length; i++)
+                            steps[i].Execute(engine, steps[i].OutputBuffer);
+                    });
+                    if (exec != IntPtr.Zero)
+                    {
+                        _graphExec = exec;
+                        _graphBackend = cb;
+                        cb.LaunchCapturedGraph(exec);
+                        return _finalOutput;
+                    }
+                    _graphCaptureDisabled = true; // a non-capturable op fired during launch — stay eager
+                }
+                catch
+                {
+                    _graphCaptureDisabled = true;
+                }
+            }
+
+            // Warmup call (or capture just failed): run eagerly.
+            for (int i = 0; i < steps.Length; i++)
+                steps[i].Execute(engine, steps[i].OutputBuffer);
+            return _finalOutput;
+        }
+
         for (int i = 0; i < steps.Length; i++)
         {
             steps[i].Execute(engine, steps[i].OutputBuffer);
         }
         return _finalOutput;
+    }
+
+    /// <summary>True when this plan is float + running on a CUDA backend that can capture graphs.</summary>
+    private bool TryGetGraphBackend(out Engines.DirectGpu.CUDA.CudaBackend cb)
+    {
+        cb = null!;
+        if (typeof(T) != typeof(float)) return false;
+        if (_engine is not DirectGpuTensorEngine gte) return false;
+        if (gte.GetBackend() is not Engines.DirectGpu.CUDA.CudaBackend backend) return false;
+        cb = backend;
+        return true;
+    }
+
+    /// <summary>
+    /// Uploads each captured input tensor's current host data into its EXISTING resident GPU buffer
+    /// in place (stable pointer), so a replayed graph — which reads the address captured at record
+    /// time — sees fresh per-call data. Mirrors CompiledTrainingPlan.RefreshGraphInputInPlace.
+    /// </summary>
+    private void RefreshInferenceInputsInPlace(Engines.DirectGpu.CUDA.CudaBackend cb)
+    {
+        var inputs = _compiledInputTensors;
+        for (int i = 0; i < inputs.Length; i++)
+        {
+            var inT = inputs[i];
+            if (inT is null) continue;
+            if (inT._gpuBuffer is not { } buf || !ReferenceEquals(inT._gpuBackend, cb)) continue;
+            var data = inT.GetDataArray();
+            if (buf.Size < data.Length) continue;
+            cb.UploadBufferInPlace((float[])(object)data, buf);
+            inT._gpuBufferVersion = inT.Version;
+        }
     }
 
     /// <inheritdoc/>
@@ -831,6 +936,13 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     {
         if (_disposed) return;
         _disposed = true;
+
+        // Free the captured CUDA graph (if any) before the buffers it references are torn down.
+        if (_graphExec != IntPtr.Zero && _graphBackend is not null)
+        {
+            try { _graphBackend.DestroyCapturedGraph(_graphExec); } catch { }
+            _graphExec = IntPtr.Zero;
+        }
 
         // Tear down the cached execution stream BEFORE freeing pinned
         // handles — the stream's worker thread might still be draining
