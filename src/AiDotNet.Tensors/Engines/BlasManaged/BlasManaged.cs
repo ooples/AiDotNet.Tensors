@@ -44,6 +44,13 @@ public static partial class BlasManaged
     /// </summary>
     internal const long MachineKernelMinWork = 4_000_000;
 
+    // #653 machine-code GEBP investigation: force the machine-code kernel ON even for shapes the
+    // PrefersStrategyOverMachineKernel gate would route to the managed strategy, so the two paths
+    // can be A/B-benchmarked on the SAME shape without trusting stale routing comments. Diagnostic
+    // only (default off); does NOT change production routing.
+    private static readonly bool s_forceMachineKernel =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_FORCE_MK") == "1";
+
     // #653: extend the PackBoth parallelism-floor + wide-N blocking optimizations to the
     // DisableAutotune shim path the forward GEMM uses (CpuEngine.BatchMatMul -> 6-arg
     // SimdGemm.Sgemm -> Gemm{DisableAutotune}). Those optimizations were gated on
@@ -61,6 +68,14 @@ public static partial class BlasManaged
     // affects the DisableAutotune path; direct ForcePackBoth callers already had these.
     private static readonly bool s_forwardPackBothBlocking =
         System.Environment.GetEnvironmentVariable("AIDOTNET_GEMM_FORWARD_PACKBOTH") != "0";
+
+    // #653 wave-quantization mc guard: when the M-axis path's block count lands JUST above the
+    // physical-core count (e.g. numMB=18 on 16 cores → 1 full wave + a 2-block straggler wave that
+    // idles 14 cores), shrink mc so the work splits into ~2 even waves. Catches the catastrophic
+    // numMB ∈ (cores, cores+cores/4] case WITHOUT touching well-quantized shapes (e.g. numMB=26).
+    // Measured: 1024³ FP32 493→~600 GF/s (scaling 7.0×→~8.6×). Opt-in for A/B; default-off.
+    private static readonly bool s_waveMc =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_GEMM_WAVE_MC") == "1";
 
     // #653 cache-blocking sweep hook: env overrides for the PackBoth Mc/Nc/Kc so the
     // cache-residency-optimal blocking can be found empirically (the MKL/BLIS tuning art).
@@ -466,7 +481,7 @@ public static partial class BlasManaged
             var epi409 = options.Epilogue;
             if (mkAvail && m >= mkMr && n >= mkNr
                 && (long)m * n * k >= MachineKernelMinWork
-                && !PrefersStrategyOverMachineKernel(m, n, k, typeof(T) == typeof(float))
+                && (s_forceMachineKernel || !PrefersStrategyOverMachineKernel(m, n, k, typeof(T) == typeof(float)))
                 && EpilogueFlagsCompute.Compute(in epi409) == EpilogueFlags.None)
             {
                 int mAl = m - (m % mkMr); // interior rows (× Mr)
@@ -824,6 +839,20 @@ public static partial class BlasManaged
                     int targetMc = Math.Max(2 * mr, (m + physicalCores - 1) / physicalCores);
                     targetMc = ((targetMc + mr - 1) / mr) * mr; // round up to a whole mr tile
                     if (targetMc < mcFromAutotune) mcFromAutotune = targetMc;
+                }
+                // Wave-quantization guard: numMB just OVER physicalCores (a small straggler wave that
+                // idles most cores). Re-split into ~2 even waves (≈2·physicalCores blocks). Only the
+                // narrow (cores, cores+cores/4] band — wider tails (e.g. numMB=26 on 16) quantize fine
+                // and shrinking mc there over-subscribes the shared B panel (L3 pressure → regression).
+                else if (s_waveMc && mcFromAutotune > 2 * mr)
+                {
+                    int tailBand = Math.Max(1, physicalCores / 4);
+                    if (numMBwide > physicalCores && numMBwide <= physicalCores + tailBand)
+                    {
+                        int targetMc = Math.Max(2 * mr, (m + 2 * physicalCores - 1) / (2 * physicalCores));
+                        targetMc = ((targetMc + mr - 1) / mr) * mr; // round up to a whole mr tile
+                        if (targetMc < mcFromAutotune) mcFromAutotune = targetMc;
+                    }
                 }
             }
         }

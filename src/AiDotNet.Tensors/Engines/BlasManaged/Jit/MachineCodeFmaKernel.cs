@@ -163,6 +163,76 @@ internal static class MachineCodeFmaKernel
     }
 
     /// <summary>
+    /// #653 GEBP panel driver (Windows ABI): computes <c>nTiles</c> consecutive 6×16 tiles in ONE
+    /// call, looping the N-tile dimension INSIDE the machine code. The managed driver then issues
+    /// one indirect call per packed panel instead of one per Nr-tile (the per-tile call throttled
+    /// the kernel ~20% below its raw ~115 GF/s). Signature:
+    ///   <c>void kern(float* packedA, float* packedB, float* c, long ldc, long kc, long nTiles)</c>.
+    /// packedA is the SAME Mr×kc stripe for every tile (rcx reset each iteration); packedB is the
+    /// contiguous [nTiles][kc][Nr] panel — the inner K-loop already advances rdx by kc·Nr, landing
+    /// it on the next tile's B, so it carries forward untouched; c advances Nr·4 bytes per tile.
+    /// Bit-identical to invoking the single-tile kernel nTiles times (same per-tile FMA order).
+    /// Caller must guarantee nTiles ≥ 1.
+    /// </summary>
+    internal static byte[] EmitFp32_6x16_PanelWindows()
+    {
+        var asm = new X64Assembler();
+        // Save nonvolatile rbx/r12/r13 — they hold packedA-base / kc / nTiles across the body,
+        // which clobbers rcx/rdx/r10/r11/rax. The 3 pushes shift the stack args by +24 bytes.
+        asm.PushReg(3); asm.PushReg(12); asm.PushReg(13);   // rbx, r12, r13
+        asm.MovRegFromRsp(12, 0x28 + 24);   // r12 = kc      (5th stack arg, +24 for the pushes)
+        asm.MovRegFromRsp(13, 0x30 + 24);   // r13 = nTiles  (6th stack arg)
+        asm.MovRegReg(3, 1);                // rbx = rcx     (packedA stripe base)
+        asm.SubRsp(0xA0);
+        for (int i = 0; i < 10; i++) asm.VmovupsXmmStoreD32(4, i * 0x10, 6 + i); // save xmm6–15
+        EmitPanelLoop_Fp32_6x16(asm);
+        for (int i = 0; i < 10; i++) asm.VmovupsXmmLoadD32(6 + i, 4, i * 0x10);
+        asm.AddRsp(0xA0);
+        asm.PopReg(13); asm.PopReg(12); asm.PopReg(3);
+        asm.Vzeroupper();
+        asm.Ret();
+        return asm.ToArray();
+    }
+
+    /// <summary>System V AMD64 variant of <see cref="EmitFp32_6x16_PanelWindows"/> (args
+    /// rdi/rsi/rdx/rcx/r8/r9; volatile xmm so no save frame, just the 3 GP pushes).</summary>
+    internal static byte[] EmitFp32_6x16_PanelSysV()
+    {
+        var asm = new X64Assembler();
+        asm.PushReg(3); asm.PushReg(12); asm.PushReg(13);   // rbx, r12, r13
+        asm.MovRegReg(13, 9);   // r13 = nTiles  (r9)
+        asm.MovRegReg(12, 8);   // r12 = kc      (r8)
+        asm.MovRegReg(3, 7);    // rbx = packedA (rdi)
+        asm.MovRegReg(9, 1);    // r9  = ldc     (rcx)  — read before rcx is reused per tile
+        asm.MovRegReg(8, 2);    // r8  = c       (rdx)
+        asm.MovRegReg(2, 6);    // rdx = packedB (rsi)
+        EmitPanelLoop_Fp32_6x16(asm);
+        asm.PopReg(13); asm.PopReg(12); asm.PopReg(3);
+        asm.Vzeroupper();
+        asm.Ret();
+        return asm.ToArray();
+    }
+
+    /// <summary>
+    /// N-tile loop shared by the panel emitters. Pre: rbx=packedA stripe base, r12=kc, r13=nTiles,
+    /// rdx=packedB (first tile), r8=c (first tile), r9=ldc. Each iteration resets rcx=rbx and
+    /// r10=r12, runs one 6×16 tile (advances rcx & rdx, leaves r8/r9/rbx/r12/r13), then advances
+    /// c by Nr·4 and decrements nTiles. r9/rbx/r12/r13 are untouched by the body.
+    /// </summary>
+    private static void EmitPanelLoop_Fp32_6x16(X64Assembler asm)
+    {
+        const int RCX = 1, R8 = 8, R10 = 10, R12 = 12, R13 = 13, RBX = 3, Nr = 16;
+        int ntile = asm.NewLabel();
+        asm.MarkLabel(ntile);
+        asm.MovRegReg(RCX, RBX);            // packedA reset to stripe base (same A for every tile)
+        asm.MovRegReg(R10, R12);            // kc reset
+        EmitBody_Fp32_6x16(asm);            // one 6×16 tile; advances rcx & rdx, r8 untouched
+        asm.AddRegImm8(R8, Nr * 4);         // c += 16 floats → next N-tile column block
+        asm.DecReg(R13);                    // nTiles--
+        asm.JnzLabel32(ntile);              // rel32 near jump: the 6×16 body far exceeds rel8 range
+    }
+
+    /// <summary>
     /// Register-level FP32 6×16 body. Assumes rcx=packedA, rdx=packedB, r8=c,
     /// r9=ldc(elements), r10=kc; clobbers ymm0–15, rax, r11 and advances rcx/rdx/r10.
     /// ABI-agnostic — the caller supplies the prologue/epilogue. ymm6–15 are used as

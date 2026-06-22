@@ -26,6 +26,21 @@ internal static class Program
             Console.Error.WriteLine("[probe] MachineKernelGemm.Enabled=false");
         }
 
+        // #653: force AutoTracer.ShouldRecord=false (the training / inference-without-compile hot
+        // path) so the end-to-end probes measure the recording-off fast path.
+        if (Environment.GetEnvironmentVariable("AIDOTNET_NO_AUTOTRACE") == "1")
+        {
+            // AutoTracer.ShouldRecord = Enabled && !GraphMode && EnableCompilation && !ThreadTapeActive.
+            // EnableCompilation is the PUBLIC, documented disable knob (AutoTracer.cs). Current returns
+            // a FRESH Default copy when the thread has no installed options, so mutating it in place is
+            // lost — take the copy, disable compilation, and install it via SetCurrent so it persists.
+            var codecOpts = AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions.Current;
+            codecOpts.EnableCompilation = false;
+            AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions.SetCurrent(codecOpts);
+            Console.Error.WriteLine("[probe] TensorCodecOptions.EnableCompilation=false (AutoTracer recording off)");
+        }
+
+        if (args.Length > 0 && args[0] == "--allocbench") return RunAllocBench(eng, args);
         if (args.Length > 0 && args[0] == "--resblock") return RunResblock(eng, args);
         if (args.Length > 0 && args[0] == "--attnblock") return RunAttnBlock(eng, args);
         if (args.Length > 0 && args[0] == "--act") return RunAct(eng, args);
@@ -153,21 +168,43 @@ internal static class Program
         sw.Stop();
         double warm = sw.Elapsed.TotalMilliseconds;
 
+        // #653/#657 follow-up: forward caching-allocator. With --arena, ONE TensorArena lives
+        // across the whole rep loop and Reset()s before each full forward — so every per-op
+        // TensorAllocator.Rent inside blk() hits the arena (Tier 0) instead of allocating a
+        // fresh GC array, and the prior forward's intermediates are recycled. Reset is PER
+        // FORWARD (not per block): a block's output is the next block's input, so resetting
+        // mid-forward would recycle a live tensor. x0 is allocated before the arena, so it
+        // survives Reset and is a safe re-entry point each iteration.
+        // #653/#657: --arena runs the forward inside a TensorArena (PyTorch-caching-allocator
+        // equivalent); Reset() per rep recycles the prior iteration's intermediate arrays.
+        // (Resolved against main's AIDOTNET_ARENA env-var variant — kept the more careful flag
+        // version: it warms the arena before measuring and uses the per-thread alloc counter,
+        // which the single-threaded alloc window needs; folded in main's arena={...} reporting.)
+        bool useArena = HasFlag(a, "--arena");
+        TensorArena? arena = useArena ? TensorArena.Create() : null;
         var times = new double[reps];
         using var meter = util ? ParallelUtilizationMeter.Start() : null;   // `using` disposes on exception paths too (#654 review)
+        // Warm the arena (first rep allocates; subsequent reps reuse) before the alloc window.
+        if (arena is not null) { arena.Reset(); yy = x0; for (int b = 0; b < blocks; b++) yy = blk(yy); }
+        GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
+        long allocStart = GC.GetAllocatedBytesForCurrentThread();
         for (int i = 0; i < reps; i++)
         {
+            if (arena is not null) arena.Reset();
             var s = Stopwatch.StartNew();
             yy = x0;
             for (int b = 0; b < blocks; b++) yy = blk(yy);
             s.Stop();
             times[i] = s.Elapsed.TotalMilliseconds;
         }
+        arena?.Dispose();
+        long allocBytes = GC.GetAllocatedBytesForCurrentThread() - allocStart;
         string u = StopMeter(meter, maxdop);
         Array.Sort(times);
         Console.WriteLine(
             $"ATTNBLOCK S={S} D={D} H={H} Dh={Dh} blocks={blocks} maxdop={maxdop} procs={Environment.ProcessorCount} " +
-            $"warmup_ms={warm:F1} median_ms={times[reps / 2]:F2} min_ms={times[0]:F2} max_ms={times[times.Length - 1]:F2}{u}");
+            $"arena={useArena} warmup_ms={warm:F1} median_ms={times[reps / 2]:F2} min_ms={times[0]:F2} max_ms={times[times.Length - 1]:F2} " +
+            $"alloc_MB_per_fwd={allocBytes / 1048576.0 / reps:F3}{u}");
         return 0;
     }
 
@@ -909,6 +946,49 @@ internal static class Program
         }
         catch (Exception ex) { Console.WriteLine($"CAPTURE FAILED: {ex.GetType().Name}: {ex.Message}"); }
         finally { scope.Dispose(); }
+        return 0;
+    }
+
+    // #653: measure per-op allocated bytes + time when AutoTracer.ShouldRecord is FALSE (the
+    // training / no-compilation hot path) — isolates the autotrace closure allocate-then-discard
+    // overhead. ShouldRecord is forced false via the public TensorCodecOptions knob. Tiny shapes
+    // so the per-op closure alloc is visible against the (unavoidable) result-tensor alloc.
+    private static int RunAllocBench(CpuEngine eng, string[] a)
+    {
+        int M = ArgI(a, "--m", 8), K = ArgI(a, "--k", 8), N = ArgI(a, "--n", 8);
+        int reps = ArgI(a, "--reps", 200000);
+        if (M < 1 || K < 1 || N < 1 || reps < 1)
+        {
+            Console.Error.WriteLine("allocbench: --m, --k, --n, --reps must all be >= 1.");
+            return 2;
+        }
+        // ShouldRecord = Enabled && !GraphMode && EnableCompilation && !ThreadTapeActive.
+        // Disabling compilation via the PUBLIC, documented knob (AutoTracer.cs) forces
+        // ShouldRecord=false (the training / no-compilation hot path this benchmarks) — no
+        // reflection. Current returns a FRESH Default copy when the thread has no installed
+        // options, so mutate the copy and install it via SetCurrent (a bare property set on
+        // Current would be discarded). One-time set before the timed loop, so it never touches
+        // the per-op measurement.
+        var codecOpts = AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions.Current;
+        codecOpts.EnableCompilation = false;
+        AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions.SetCurrent(codecOpts);
+        Console.Error.WriteLine("[probe] TensorCodecOptions.EnableCompilation=false (AutoTracer.ShouldRecord=false)");
+
+        var rng = new Random(0);
+        var lhs = Rand(new[] { M, K }, rng);
+        var rhs = Rand(new[] { K, N }, rng);
+        var warm = eng.BatchMatMul(lhs, rhs); float sink = warm[0];
+
+        GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
+        long startBytes = GC.GetAllocatedBytesForCurrentThread();
+        var sw = Stopwatch.StartNew();
+        for (int i = 0; i < reps; i++) { var o = eng.BatchMatMul(lhs, rhs); sink += o[0]; }
+        sw.Stop();
+        long bytes = GC.GetAllocatedBytesForCurrentThread() - startBytes;
+        Console.WriteLine(
+            $"ALLOCBENCH op=BatchMatMul {M}x{K}x{N} reps={reps} " +
+            $"bytes_per_op={(double)bytes / reps:F1} ns_per_op={sw.Elapsed.TotalMilliseconds * 1e6 / reps:F1} " +
+            $"total_MB={bytes / 1048576.0:F1} (sink={sink:E1})");
         return 0;
     }
 
