@@ -613,9 +613,44 @@ public class MachineCodeKernelTests
             try { st1 = MeasureGemm(panel: true); }
             finally { CpuParallelSettings.MaxDegreeOfParallelism = prevMax; }
 
-            _output.WriteLine($"GEMM {m}x{n}x{k}: per-tile {perTile:F1} GF/s, " +
-                $"GEBP panel {panelG:F1} GF/s ({(panelG / perTile - 1) * 100:+0.0;-0.0}%) | " +
-                $"single-thread {st1:F1} GF/s (raw kernel ceiling ~115/core)");
+            // Current production default for large FP32: BlasManaged.Gemm routes ≥250M-work shapes
+            // to PackBoth (the machine kernel is gated off there). Measure it to decide the gate flip.
+            double packBoth;
+            {
+                for (int i = 0; i < 5; i++) { Array.Clear(c); AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.Gemm<float>(a, k, false, b, n, false, c, n, m, n, k); }
+                double best = double.MaxValue;
+                for (int w = 0; w < 7; w++)
+                {
+                    var sw = Stopwatch.StartNew();
+                    for (int i = 0; i < iters; i++) { Array.Clear(c); AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.Gemm<float>(a, k, false, b, n, false, c, n, m, n, k); }
+                    sw.Stop();
+                    best = Math.Min(best, sw.Elapsed.TotalSeconds);
+                }
+                packBoth = 2.0 * m * n * k * iters / best / 1e9;
+            }
+
+            // Native OpenBLAS reference (shipped libopenblas.dll) — the bar to beat.
+            double openblas = 0;
+            if (BlasProvider.HasRawSgemm)
+            {
+                fixed (float* pa = a, pb = b, pc = c)
+                {
+                    for (int i = 0; i < 5; i++) BlasProvider.SgemmRaw(m, n, k, pa, k, pb, n, pc, n);
+                    double best = double.MaxValue;
+                    for (int w = 0; w < 7; w++)
+                    {
+                        var sw = Stopwatch.StartNew();
+                        for (int i = 0; i < iters; i++) BlasProvider.SgemmRaw(m, n, k, pa, k, pb, n, pc, n);
+                        sw.Stop();
+                        best = Math.Min(best, sw.Elapsed.TotalSeconds);
+                    }
+                    openblas = 2.0 * m * n * k * iters / best / 1e9;
+                }
+            }
+
+            _output.WriteLine($"GEMM {m}x{n}x{k}: OpenBLAS {openblas:F0}, PackBoth(ours) {packBoth:F0} " +
+                $"({(packBoth / openblas - 1) * 100:+0.0;-0.0}% vs OpenBLAS), machine-kernel {panelG:F0} GF/s | " +
+                $"per-tile {perTile:F0}, single-thread/core {st1:F0} (raw ceiling ~115)");
         }
     }
 
